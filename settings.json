@@ -1,0 +1,20 @@
+{
+   "alwaysThinkingEnabled" : true,
+   "effortLevel" : "high",
+   "env" : {
+      "DISABLE_AUTOUPDATER" : "1",
+      "MAX_THINKING_TOKENS" : "50000"
+   },
+   "permissions" : {
+      "allow" : [
+         "Read"
+      ],
+      "ask" : [],
+      "defaultMode" : "default",
+      "deny" : []
+   },
+   "statusLine" : {
+      "command" : "perl \"$HOME/.claude/statusline.pl\"",
+      "type" : "command"
+   }
+}

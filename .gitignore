@@ -1,0 +1,7 @@
+# Never commit sensitive data
+*.credentials*
+*.key
+*.pem
+*.secret
+deploy_key*
+.statusline_usage_cache.json
