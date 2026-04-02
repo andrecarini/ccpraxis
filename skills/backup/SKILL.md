@@ -1,9 +1,8 @@
 ---
 name: backup
 description: Sync Claude Code config to the export repo, scan for secrets, commit and push
-disable-model-invocation: true
 user-invocable: true
-allowed-tools: Bash, Read, Write, Edit
+allowed-tools: Bash, Read, Write, Edit, AskUserQuestion
 ---
 
 Sync the Claude Code config between `~/.claude/` (live) and the export repo at `~/.claude/claude-code-config/`.
@@ -42,10 +41,12 @@ For **settings_changed**: regenerate the sanitized settings.json in the export r
 For **conflict** files:
 1. Read BOTH versions (live and export)
 2. Understand what changed on each side
-3. Present a clear summary to the user: what's different, which changes are on which side
-4. Propose a merged version
-5. Ask the user to approve before writing
-6. On approval, write the merged result to BOTH locations
+3. For each conflict, use AskUserQuestion to ask the user how to resolve it:
+   - **"Use live version"** — live overwrites export
+   - **"Use export version"** — export overwrites live
+   - **"Merge"** — present a merged version for approval, then write to BOTH locations
+   If all conflicts have the same obvious cause (e.g., line-ending differences only), batch
+   them into a single AskUserQuestion instead of asking one-by-one.
 
 ## Step 4: Sensitive data scan
 
@@ -67,15 +68,11 @@ git add -A
 git status
 ```
 
-Show the user what will be committed. If they approve:
+Show what will be committed, then use AskUserQuestion as a final confirmation:
+- **"Push it"** — commit, pull --rebase, and push
+- **"Abort"** — discard staged changes and stop
 
-```bash
-git commit -m "<descriptive message>"
-git pull --rebase
-git push
-```
-
-If the repo has no remote configured, skip the pull/push and tell the user to set one up.
+If the repo has no remote configured, commit locally and tell the user to set up a remote.
 
 ## Step 6: Report
 
