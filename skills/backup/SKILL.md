@@ -20,18 +20,21 @@ If the repo has no remote configured, skip this step silently.
 
 After pulling, make sure the local `~/.claude/` is wired up correctly. This catches new skills, updated CLAUDE.md, and settings changes introduced by the pull.
 
-**Skills:** For each subdirectory in `~/.claude/claude-code-config/skills/`, ensure `~/.claude/skills/` has a symlink pointing to it. Remove any existing file/directory first and re-create the link — this handles stale copies (e.g. on Windows where `ln -s` falls back to copying):
+**Skills:** For each subdirectory in `~/.claude/claude-code-config/skills/`, ensure `~/.claude/skills/` has a matching copy or symlink. Remove any existing file/directory first and re-create it — use symlinks on Unix, copies on Windows (where `ln -s` silently falls back to copying and `-L` checks always fail):
 
 ```bash
 mkdir -p ~/.claude/skills
 for skill in ~/.claude/claude-code-config/skills/*/; do
   name="$(basename "$skill")"
   rm -rf ~/.claude/skills/"$name"
-  ln -sf "$skill" ~/.claude/skills/"$name"
+  case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*) cp -r "$skill" ~/.claude/skills/"$name" ;;
+    *) ln -sf "$skill" ~/.claude/skills/"$name" ;;
+  esac
 done
 ```
 
-**CLAUDE.md:** If `~/.claude/CLAUDE.md` is not a symlink to the repo version, flag it for the user but don't change it automatically (they may have intentionally merged content).
+**CLAUDE.md:** On Unix, if `~/.claude/CLAUDE.md` is not a symlink to the repo version, flag it. On Windows, compare content against `~/.claude/claude-code-config/global-config/CLAUDE.md` — if they differ, flag it. Don't change it automatically in either case (the user may have intentionally merged content).
 
 **settings.json:** Run the merge script to pick up any new keys from the repo defaults (preserves local permissions):
 

@@ -9,6 +9,23 @@ set -e
 EXPORT_DIR="${CLAUDE_EXPORT_DIR:-$HOME/.claude/claude-code-config}"
 CLAUDE_DIR="$HOME/.claude"
 
+# Detect Windows (MINGW/MSYS/Cygwin — no real symlinks)
+is_windows() {
+  case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) return 0;; *) return 1;; esac
+}
+
+# Compare file or directory content
+content_matches() {
+  local a="$1" b="$2"
+  if [ -d "$a" ] && [ -d "$b" ]; then
+    diff -rq "$a" "$b" >/dev/null 2>&1
+  elif [ -f "$a" ] && [ -f "$b" ]; then
+    diff -q "$a" "$b" >/dev/null 2>&1
+  else
+    return 1
+  fi
+}
+
 # Repo-owned files (these are the source of truth, not copied)
 REPO_FILES="global-config/CLAUDE.md global-config/settings.json"
 SCRIPT_FILES="scripts/statusline.pl scripts/merge-settings.pl scripts/sync-export.sh scripts/sensitive-check.sh"
@@ -21,17 +38,31 @@ for skill_dir in "$EXPORT_DIR"/skills/*/; do
 done
 CONTAINER_FILES="container-config/Dockerfile container-config/claude-sandbox.sh container-config/claude-sandbox.cmd container-config/CLAUDE.md container-config/settings.json"
 
-# Check symlinks are intact
+# Check symlinks (Unix) or content-matched copies (Windows)
 check_symlink() {
   local name="$1"
   local link="$CLAUDE_DIR/$name"
+  # Map to repo source path
+  local target
+  case "$name" in
+    CLAUDE.md) target="$EXPORT_DIR/global-config/CLAUDE.md" ;;
+    *)         target="$EXPORT_DIR/$name" ;;
+  esac
 
   if [ -L "$link" ]; then
     echo "{\"file\":\"$name\",\"status\":\"linked\"}"
   elif [ -f "$link" ] || [ -d "$link" ]; then
-    echo "{\"file\":\"$name\",\"status\":\"not_linked\",\"note\":\"exists but should be symlink\"}"
+    if is_windows; then
+      if content_matches "$link" "$target"; then
+        echo "{\"file\":\"$name\",\"status\":\"linked\",\"note\":\"copy matches repo\"}"
+      else
+        echo "{\"file\":\"$name\",\"status\":\"not_linked\",\"note\":\"copy differs from repo\"}"
+      fi
+    else
+      echo "{\"file\":\"$name\",\"status\":\"not_linked\",\"note\":\"exists but should be symlink\"}"
+    fi
   else
-    echo "{\"file\":\"$name\",\"status\":\"missing\",\"note\":\"symlink missing from ~/.claude/\"}"
+    echo "{\"file\":\"$name\",\"status\":\"missing\",\"note\":\"missing from ~/.claude/\"}"
   fi
 }
 
