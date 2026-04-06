@@ -8,82 +8,86 @@ allowed-tools: Bash, Read, Write, Edit, Glob, AskUserQuestion
 
 Prepare the current project for running Claude Code in a sandboxed Docker container.
 Do everything end-to-end — build the image, set up the project, configure git access.
-At the very end, output a single command the user can copy-paste to launch the container.
+Skip any step that is already done. At the end, output the launch command.
 
-## Step 1: Ensure Docker image exists
+The container-config lives at `~/.claude/claude-code-config/container-config/`.
+The container has its own CLAUDE.md and settings.json mounted by the launcher scripts — do NOT ask the user about adding container instructions to the project CLAUDE.md.
 
-Check if the `claude-sandbox` image exists:
+## Step 1: Verify container-config exists
 
 ```bash
-docker image inspect claude-sandbox > /dev/null 2>&1 && echo "EXISTS" || echo "MISSING"
+ls "$HOME/.claude/claude-code-config/container-config/Dockerfile" 2>/dev/null && echo "OK" || echo "MISSING"
+```
+
+If MISSING, tell the user the container config repo hasn't been set up yet (they need to install it first — see the repo README) and **stop**.
+
+## Step 2: Build Docker image if needed
+
+```bash
+docker image inspect claude-sandbox:latest > /dev/null 2>&1 && echo "EXISTS" || echo "MISSING"
 ```
 
 If MISSING, build it:
 
 ```bash
-cd "$HOME/.claude/container-config" && docker build -t claude-sandbox .
+HOST_VERSION="$(claude --version 2>/dev/null | awk '{print $1}')"
+docker build --build-arg "CLAUDE_VERSION=$HOST_VERSION" -t "claude-sandbox:$HOST_VERSION" -t "claude-sandbox:latest" "$HOME/.claude/claude-code-config/container-config"
 ```
 
-If the Dockerfile or container-config directory doesn't exist, tell the user the container
-config hasn't been set up yet and stop.
-
-## Step 2: Create .claude-data directory
+## Step 3: Create .claude-data directory
 
 ```bash
 mkdir -p .claude-data
 ```
 
-## Step 3: Update .gitignore
+## Step 4: Update .gitignore
 
-Check if `.gitignore` exists and already contains `.claude-data/`:
-
-```bash
-grep -q "\.claude-data" .gitignore 2>/dev/null && echo "ALREADY_IGNORED" || echo "NEEDS_ADDING"
-```
-
-If NEEDS_ADDING, append `.claude-data/` to `.gitignore`. Create the file if it doesn't exist.
-Also ensure `deploy_key` and `deploy_key.pub` are in `.gitignore` (for Step 4).
-
-## Step 4: Git access setup
-
-Ask the user using AskUserQuestion:
-
-"How should the container access this git repo for push/pull?"
-
-Options:
-1. **"I'll handle git push/pull outside the container"** — skip key setup.
-2. **"Generate a new deploy key"** — generate an ed25519 SSH keypair at `./deploy_key`,
-   display the public key, and tell the user to add it as a deploy key in the repo settings
-   (GitHub: Settings > Deploy keys > Add deploy key, check "Allow write access").
-3. **"I already have a deploy key"** — ask for the path, copy it to `./deploy_key`.
-
-If option 2 or 3: ensure `deploy_key` is in `.gitignore`, set permissions (`chmod 600`),
-and create/update `.claude-data/git-ssh-command.sh`:
+Check and add entries as needed. Run all checks in parallel:
 
 ```bash
-#!/bin/bash
-exec ssh -i /project/deploy_key -o StrictHostKeyChecking=no "$@"
+grep -q "\.claude-data" .gitignore 2>/dev/null && echo "CLAUDE_DATA_OK" || echo "CLAUDE_DATA_NEEDS"
+grep -q "deploy_key" .gitignore 2>/dev/null && echo "DEPLOY_KEY_OK" || echo "DEPLOY_KEY_NEEDS"
 ```
 
-Then tell the user that inside the container, git push/pull will automatically use the deploy key.
+Append any missing entries to `.gitignore`. Create the file if it doesn't exist.
 
-## Step 5: Project-specific CLAUDE.md (optional)
+## Step 5: Git access setup (auto-detect, minimal questions)
 
-Check if the project has a `.claude/CLAUDE.md` or `CLAUDE.md`. If it does, ask the user:
+The launcher scripts support two auth methods:
+- **PAT via GIT_ASKPASS** (for HTTPS remotes) — files: `.claude-data/git-askpass.sh`, `.claude-data/git-pat`
+- **Deploy key via GIT_SSH_COMMAND** (for SSH remotes) — file: `deploy_key` in project root
 
-"This project has a CLAUDE.md. Want to add container-specific instructions to it?"
+**Check what's already configured:**
 
-If yes, help them add relevant instructions (e.g., build commands, test commands, etc.).
+```bash
+[ -f .claude-data/git-askpass.sh ] && echo "PAT_AUTH_OK" || echo "NO_PAT"
+[ -f deploy_key ] && echo "DEPLOY_KEY_OK" || echo "NO_DEPLOY_KEY"
+git remote get-url origin 2>/dev/null || echo "NO_REMOTE"
+```
 
-## Step 6: Add to PATH (first time only)
+**Decision logic:**
+- If `PAT_AUTH_OK` or `DEPLOY_KEY_OK` → git auth is configured, **skip entirely**.
+- If no auth is configured and the remote is HTTPS:
+  - Check if a global PAT exists at `~/.claude/.claude-data/git-pat` or similar locations.
+  - If found, copy it and create the askpass script automatically (no questions).
+  - If not found, ask the user via AskUserQuestion for their GitHub fine-grained PAT.
+  - Create `.claude-data/git-pat` with the token and `.claude-data/git-askpass.sh`:
+    ```bash
+    #!/bin/bash
+    cat /home/claude/.claude/git-pat
+    ```
+- If no auth is configured and the remote is SSH:
+  - Ask the user via AskUserQuestion whether to generate a new deploy key, provide an existing one, or skip.
 
-Check if `claude-sandbox` is already on PATH:
+## Step 6: Add `claude-sandbox` to PATH (first time only)
 
 ```bash
 command -v claude-sandbox > /dev/null 2>&1 && echo "ON_PATH" || echo "NOT_ON_PATH"
 ```
 
-If NOT_ON_PATH, detect the OS and set it up:
+If already on PATH, skip.
+
+If NOT_ON_PATH, detect the OS:
 
 ```bash
 uname -s 2>/dev/null || echo "Windows"
@@ -92,13 +96,13 @@ uname -s 2>/dev/null || echo "Windows"
 **Linux/macOS:**
 ```bash
 mkdir -p ~/.local/bin
-ln -sf ~/.claude/container-config/claude-sandbox.sh ~/.local/bin/claude-sandbox
-chmod +x ~/.claude/container-config/claude-sandbox.sh
+ln -sf ~/.claude/claude-code-config/container-config/claude-sandbox.sh ~/.local/bin/claude-sandbox
+chmod +x ~/.claude/claude-code-config/container-config/claude-sandbox.sh
 ```
 
 **Windows (MINGW/MSYS):**
 ```bash
-cp "$HOME/.claude/container-config/claude-sandbox.cmd" "$HOME/AppData/Local/Microsoft/WindowsApps/claude-sandbox.cmd"
+cp "$HOME/.claude/claude-code-config/container-config/claude-sandbox.cmd" "$HOME/AppData/Local/Microsoft/WindowsApps/claude-sandbox.cmd"
 ```
 
 ## Step 7: Output the launch command

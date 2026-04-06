@@ -123,10 +123,11 @@ The `/sandbox` command prepares any project for containerized Claude Code:
 
 1. Builds the `claude-sandbox` Docker image (if missing)
 2. Creates `.claude-data/` for container-side persistence (memories, conversation history)
-3. Configures git access — supports PATs (recommended), SSH deploy keys, or external management
-4. Validates PAT permissions and writes a capabilities summary to the project's `.claude/CLAUDE.md`
-5. Adds `claude-sandbox` to PATH
-6. Outputs a launch command
+3. Auto-detects existing git auth (PAT or deploy key) and skips if already configured; only prompts when auth is genuinely missing
+4. Adds `claude-sandbox` to PATH
+5. Outputs a launch command
+
+Every step is idempotent — running `/sandbox` on an already-configured project just verifies the setup and outputs the launch command.
 
 The container runs `claude --dangerously-skip-permissions` — full autonomy inside the sandbox. The container-specific `CLAUDE.md` tells Claude it can install and run anything, while still enforcing supply chain rules.
 

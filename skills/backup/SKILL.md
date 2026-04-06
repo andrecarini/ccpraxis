@@ -8,17 +8,33 @@ allowed-tools: Bash, Read, Write, Edit, AskUserQuestion
 
 Sync the Claude Code config between `~/.claude/` (live) and the export repo at `~/.claude/claude-code-config/`.
 
-## Step 1: Pull latest from remote
+## Step 1: Integrate remote
 
 ```bash
-cd "$HOME/.claude/claude-code-config" && git pull --rebase 2>&1 || true
+cd "$HOME/.claude/claude-code-config" && git fetch origin 2>&1 || true
 ```
 
 If the repo has no remote configured, skip this step silently.
 
+If remote has new commits, integrate them now so the repo is fully up to date before syncing:
+
+```bash
+cd "$HOME/.claude/claude-code-config"
+# Stash any uncommitted local changes (from /create-skill, manual edits, etc.)
+git stash 2>&1 || true
+# Merge remote — fast-forward when possible, merge commit when diverged
+git merge origin/main --no-edit 2>&1
+# Re-apply stashed changes
+git stash pop 2>&1 || true
+```
+
+If the merge or stash pop produces conflicts, resolve them automatically by reading both versions and producing a clean merge. Only use AskUserQuestion if both sides made substantial, incompatible changes to the same section and the right resolution is genuinely ambiguous.
+
+After this step, the repo is fully up to date with remote.
+
 ## Step 1.5: Ensure local installation is up to date
 
-After pulling, make sure the local `~/.claude/` is wired up correctly. This catches new skills, updated CLAUDE.md, and settings changes introduced by the pull.
+Make sure the local `~/.claude/` is wired up correctly. This catches new skills, updated CLAUDE.md, and settings changes from remote or local edits.
 
 **Skills:** For each subdirectory in `~/.claude/claude-code-config/skills/`, ensure `~/.claude/skills/` has a matching copy or symlink. Remove any existing file/directory first and re-create it — use symlinks on Unix, copies on Windows (where `ln -s` silently falls back to copying and `-L` checks always fail):
 
@@ -85,7 +101,7 @@ bash "$HOME/.claude/claude-code-config/scripts/sensitive-check.sh" "$HOME/.claud
 
 If it finds anything, show the user what was detected and **do NOT proceed** with git operations until resolved.
 
-## Step 5: Git operations
+## Step 5: Commit and push
 
 Only after the scan passes:
 
@@ -95,9 +111,13 @@ git add -A
 git status
 ```
 
-Show what will be committed, then use AskUserQuestion as a final confirmation:
-- **"Push it"** — commit, pull --rebase, and push
+If nothing to commit and local is up to date with remote: report "Everything is already in sync" and skip to Step 6.
+
+If there are changes to commit, summarize what's being sent (new files, modified files, key changes). Use AskUserQuestion:
+- **"Push it"** — commit and push
 - **"Abort"** — discard staged changes and stop
+
+If confirmed: commit and push. Since Step 1 already integrated remote, pushing is always a clean fast-forward.
 
 If the repo has no remote configured, commit locally and tell the user to set up a remote.
 
