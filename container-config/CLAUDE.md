@@ -36,6 +36,15 @@ Even inside a container, supply chain attacks can exfiltrate project source code
   `GIT_SSH_COMMAND="ssh -i /project/deploy_key -o StrictHostKeyChecking=no" git push`
 - If `$GIT_SSH_COMMAND` or `$GIT_ASKPASS` is already set in the environment, git push/pull should just work
 
+## Network / Ports
+
+Ports **9000–9009** are mapped 1:1 to the host. When serving anything that needs to be accessed from the host browser (web apps, dev servers, emulators, etc.), **bind to one of these ports**. The user can then open `http://localhost:9000` (or whichever port you chose) on the host.
+
+Example: to serve a Flutter web build, use port 9000:
+```bash
+dhttpd --port 9000 --path build/web
+```
+
 ## Persistence
 
 - **This container is persistent** — it survives between sessions. Installed packages (apt, npm global, pip global, runtimes) persist across sessions.

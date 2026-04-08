@@ -306,6 +306,7 @@ if ($LASTEXITCODE -eq 0) {
         'create', '-it'
         '--name', $ContainerName
         '--hostname', 'claude-sandbox'
+        '-p', '9000-9009:9000-9009'
     )
     $DockerArgs += $ExtraEnv
     $DockerArgs += @(

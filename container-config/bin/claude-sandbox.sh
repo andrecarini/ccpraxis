@@ -310,6 +310,7 @@ else
   docker create -it \
     --name "$CONTAINER_NAME" \
     --hostname "claude-sandbox" \
+    -p 9000-9009:9000-9009 \
     "${EXTRA_ENV[@]}" \
     -v "$PROJECT_PATH:/project" \
     -v "$PROJECT_PATH/.claude-data:/home/claude/.claude" \
