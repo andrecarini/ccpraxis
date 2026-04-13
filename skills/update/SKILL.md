@@ -51,13 +51,15 @@ Parse version headers (e.g. `## 2.1.92`) and their changelogs. Build a list of v
 
 If the current version is already the latest, tell the user "You're up to date on vX.Y.Z" and exit.
 
-## Step 4: Get publish dates from GitHub releases
+## Step 4: Get publish dates from GitHub releases and cross-reference with changelog
 
 ```
 WebFetch https://api.github.com/repos/anthropics/claude-code/releases?per_page=20
 ```
 
 Match releases by tag name (e.g. `v2.1.92`) to get `published_at` timestamps.
+
+Cross-reference: identify any GitHub releases that do **not** have a corresponding changelog entry. These are "undocumented" versions — flag them in the report (Step 7) and factor into recommendations.
 
 ## Step 5: Calculate release age and risk
 
@@ -88,28 +90,32 @@ Display a clear report:
    - Version number, release age, risk level
    - Changelog highlights (summarize key additions, fixes, and any breaking changes — don't dump the raw list)
 3. **Community reports:** number of open GitHub issues for the latest version, top issue titles and reaction counts. If zero issues, say so — that's a good sign.
-4. **Recommendation:** based on release age and issue count. If the latest is < 48h old with no track record, recommend the newest version that's > 7 days old instead.
+4. **Undocumented versions:** if any newer GitHub releases lack a changelog entry, list them with a warning that their changes are unknown.
+5. **Recommendation:** based on release age, issue count, and changelog availability. Never recommend a version that has no published changelog — prefer the newest version that has one. If the latest is < 48h old with no track record, recommend the newest version that's > 7 days old instead.
 
 ## Step 8: Ask user what to do
 
 Use AskUserQuestion. Build the options dynamically:
 
-- **"Update to vX.Y.Z (latest)"** — always present. Add risk label if HIGH or MEDIUM.
+- **"Update to vX.Y.Z (latest)"** — always present. Add risk label if HIGH or MEDIUM. If changelog is missing, add "⚠️ no changelog".
+- **"Update to vA.B.C (newest with changelog)"** — present if the latest version lacks a changelog. This is the newest version that has a published changelog entry.
 - For each intermediate version that is > 7 days old (LOW risk) and newer than current, add: **"Update to vA.B.C (X days old, low risk)"**
 - **"Stay on vCurrent"** — always present as the last option.
 
+Record the exact version number the user selects — it will be used in Step 9.
+
 ## Step 9: Execute update
 
-**If user chose the latest version:**
-```bash
-claude update
-```
+**IMPORTANT: Always install the exact version the user selected.** Do NOT use `claude update` — it fetches the absolute latest release, which may differ from what the user chose if a new version was published between research and execution.
 
-**If user chose a specific version:**
+Always use the version-pinned installer:
+
 ```bash
 powershell -Command "& ([scriptblock]::Create((irm https://claude.ai/install.ps1))) <VERSION>"
 ```
 
-After the command completes, verify by running `claude --version` again and report whether the update succeeded.
+Replace `<VERSION>` with the exact version number the user selected in Step 8 (e.g. `2.1.101`).
+
+After the command completes, verify by running `claude --version` again and confirm the installed version matches the selected version. If it doesn't, warn the user.
 
 Tell the user to restart Claude Code for the new version to take effect.

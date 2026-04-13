@@ -1,0 +1,16 @@
+{
+  "claude-plugins-official": {
+    "source": {
+      "source": "github",
+      "repo": "anthropics/claude-plugins-official"
+    },
+    "lastUpdated": "2026-03-03T21:23:48.141Z"
+  },
+  "chrome-devtools-plugins": {
+    "source": {
+      "source": "github",
+      "repo": "ChromeDevTools/chrome-devtools-mcp"
+    },
+    "lastUpdated": "2026-03-03T21:16:59.376Z"
+  }
+}

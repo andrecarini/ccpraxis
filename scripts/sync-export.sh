@@ -36,7 +36,7 @@ for skill_dir in "$EXPORT_DIR"/skills/*/; do
   name="$(basename "$skill_dir")"
   SKILL_FILES="$SKILL_FILES skills/$name/SKILL.md"
 done
-CONTAINER_FILES="container-config/Dockerfile container-config/claude-sandbox.sh container-config/claude-sandbox.cmd container-config/CLAUDE.md container-config/settings.json"
+CONTAINER_FILES="container-config/Dockerfile container-config/bin/claude-sandbox.sh container-config/bin/claude-sandbox.ps1 container-config/claude.json container-config/CLAUDE.md container-config/settings.json"
 
 # Check symlinks (Unix) or content-matched copies (Windows)
 check_symlink() {
@@ -100,29 +100,54 @@ for f in $REPO_FILES $SCRIPT_FILES $SKILL_FILES $CONTAINER_FILES; do
   echo "$RESULT"
 done
 
-# Settings merge check — compare everything except permissions
+# Settings merge check — full semantic comparison
 echo ","
 SETTINGS_LIVE="$CLAUDE_DIR/settings.json"
 SETTINGS_EXPORT="$EXPORT_DIR/global-config/settings.json"
 if [ -f "$SETTINGS_LIVE" ] && [ -f "$SETTINGS_EXPORT" ]; then
-  DIFF=$(perl -MJSON::PP -e '
-    my $read_json = sub {
-      open my $f, "<", $_[0] or die; local $/; decode_json(<$f>);
-    };
-    my $live = $read_json->($ARGV[0]);
-    my $repo = $read_json->($ARGV[1]);
-
-    delete $live->{permissions};
-    delete $repo->{permissions};
-
-    my $codec = JSON::PP->new->canonical;
-    print $codec->encode($live) eq $codec->encode($repo) ? "identical" : "settings_changed";
-  ' "$SETTINGS_LIVE" "$SETTINGS_EXPORT")
-  echo "{\"file\":\"settings.json\",\"status\":\"$DIFF\",\"note\":\"merge (permissions excluded)\"}"
+  if perl "$EXPORT_DIR/scripts/json-diff.pl" "$SETTINGS_LIVE" "$SETTINGS_EXPORT" >/dev/null 2>&1; then
+    DIFF="identical"
+  else
+    DIFF="settings_changed"
+  fi
+  echo "{\"file\":\"settings.json\",\"status\":\"$DIFF\",\"note\":\"full semantic comparison\"}"
 elif [ -f "$SETTINGS_LIVE" ]; then
   echo "{\"file\":\"settings.json\",\"status\":\"settings_changed\",\"note\":\"missing from repo\"}"
 else
   echo "{\"file\":\"settings.json\",\"status\":\"settings_changed\",\"note\":\"missing from live\"}"
+fi
+
+# Container settings — detect shared-key divergence from global-config
+echo ","
+SETTINGS_CONTAINER="$EXPORT_DIR/container-config/settings.json"
+if [ -f "$SETTINGS_CONTAINER" ] && [ -f "$SETTINGS_EXPORT" ]; then
+  if perl "$EXPORT_DIR/scripts/json-diff.pl" "$SETTINGS_CONTAINER" "$SETTINGS_EXPORT" >/dev/null 2>&1; then
+    DIFF="identical"
+  else
+    DIFF="container_settings_diverged"
+  fi
+  echo "{\"file\":\"container-config/settings.json\",\"status\":\"$DIFF\",\"note\":\"shared keys vs global-config\"}"
+elif [ -f "$SETTINGS_CONTAINER" ]; then
+  echo "{\"file\":\"container-config/settings.json\",\"status\":\"tracked\",\"note\":\"no global-config to compare\"}"
+fi
+
+# Marketplace comparison — known_marketplaces.json
+echo ","
+MARKETPLACE_LIVE="$CLAUDE_DIR/plugins/known_marketplaces.json"
+MARKETPLACE_EXPORT="$EXPORT_DIR/global-config/known_marketplaces.json"
+if [ -f "$MARKETPLACE_LIVE" ] && [ -f "$MARKETPLACE_EXPORT" ]; then
+  if perl "$EXPORT_DIR/scripts/json-diff.pl" --deep-exclude installLocation "$MARKETPLACE_LIVE" "$MARKETPLACE_EXPORT" >/dev/null 2>&1; then
+    DIFF="identical"
+  else
+    DIFF="marketplace_changed"
+  fi
+  echo "{\"file\":\"known_marketplaces.json\",\"status\":\"$DIFF\",\"note\":\"marketplace selection\"}"
+elif [ -f "$MARKETPLACE_LIVE" ]; then
+  echo "{\"file\":\"known_marketplaces.json\",\"status\":\"live_only\",\"note\":\"not yet exported to repo\"}"
+elif [ -f "$MARKETPLACE_EXPORT" ]; then
+  echo "{\"file\":\"known_marketplaces.json\",\"status\":\"export_only\",\"note\":\"missing from live\"}"
+else
+  echo "{\"file\":\"known_marketplaces.json\",\"status\":\"missing\",\"note\":\"no marketplace data\"}"
 fi
 
 echo "]"

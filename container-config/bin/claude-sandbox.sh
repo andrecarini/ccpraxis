@@ -264,7 +264,9 @@ done
 
 # --- Extra env for deploy key ---
 EXTRA_ENV=()
-if [ -f "$PROJECT_PATH/deploy_key" ]; then
+if [ -f "$PROJECT_PATH/.claude-data/git-ssh-command.sh" ]; then
+  EXTRA_ENV+=(-e 'GIT_SSH_COMMAND=/home/claude/.claude/git-ssh-command.sh')
+elif [ -f "$PROJECT_PATH/deploy_key" ]; then
   EXTRA_ENV+=(-e 'GIT_SSH_COMMAND=ssh -i /project/deploy_key -o StrictHostKeyChecking=no')
 fi
 
@@ -274,6 +276,11 @@ if [ -f "$PROJECT_PATH/.claude-data/git-askpass.sh" ]; then
   EXTRA_MOUNTS+=(-v "$PROJECT_PATH/.claude-data/git-askpass.sh:/home/claude/.claude/git-askpass.sh:ro")
   EXTRA_ENV+=(-e "GIT_ASKPASS=/home/claude/.claude/git-askpass.sh")
   EXTRA_MOUNTS+=(-v "$PROJECT_PATH/.claude-data/git-pat:/home/claude/.claude/git-pat:ro")
+fi
+
+# --- SSH command script mount (when using git-ssh-command.sh) ---
+if [ -f "$PROJECT_PATH/.claude-data/git-ssh-command.sh" ]; then
+  EXTRA_MOUNTS+=(-v "$PROJECT_PATH/.claude-data/git-ssh-command.sh:/home/claude/.claude/git-ssh-command.sh:ro")
 fi
 
 # --- Fix ownership for UID consistency (dev container creates root-owned files) ---

@@ -1,12 +1,36 @@
 {
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
   "env": {
-    "MAX_THINKING_TOKENS": "50000",
-    "DISABLE_AUTOUPDATER": "1"
+    "DISABLE_AUTOUPDATER": "1",
+    "CLAUDE_AUTO_BACKGROUND_TASKS": "1",
+    "CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR": "0",
+    "CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING": "1",
+    "DISABLE_TELEMETRY": "1",
+    "CLAUDE_CODE_EFFORT_LEVEL": "max",
+    "CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION": "false",
+    "CLAUDE_CODE_IDE_SKIP_AUTO_INSTALL": "true",
+    "CLAUDE_CODE_NEW_INIT": "1",
+    "DISABLE_UPGRADE_COMMAND": "1",
+    "MAX_THINKING_TOKENS": "100000",
+    "DISABLE_LOGIN_COMMAND": "1",
+    "DISABLE_LOGOUT_COMMAND": "1"
   },
-  "alwaysThinkingEnabled": true,
-  "effortLevel": "medium",
+  "permissions": {
+    "skipDangerousModePermissionPrompt": true
+  },
   "statusLine": {
     "type": "command",
     "command": "perl \"$HOME/.claude/statusline.pl\""
-  }
+  },
+  "enabledPlugins": {
+    "frontend-design@claude-plugins-official": true,
+    "feature-dev@claude-plugins-official": true
+  },
+  "alwaysThinkingEnabled": true,
+  "effortLevel": "high",
+  "attribution": {
+    "commit": "",
+    "pr": ""
+  },
+  "showThinkingSummaries": true
 }

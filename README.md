@@ -18,9 +18,11 @@ Supply chain attacks in development dependencies are rampant. A single malicious
 claude-code-config/
 ├── global-config/
 │   ├── CLAUDE.md                    # Global instructions (supply chain rules, response style)
+│   ├── known_marketplaces.json      # Marketplace selections (synced across machines)
 │   └── settings.json                # Base settings (env, statusline, plugins, effort level)
 ├── scripts/
 │   ├── statusline.pl                # Custom two-line status bar (model, context, rate limits)
+│   ├── json-diff.pl                 # Semantic JSON diff (ignores key order, structured report)
 │   ├── merge-settings.pl            # Merges repo settings into existing settings.json
 │   ├── sync-export.sh               # Detects drift between live config and this repo
 │   └── sensitive-check.sh           # Scans for secrets before committing
@@ -101,7 +103,11 @@ done
   perl ~/.claude/claude-code-config/scripts/merge-settings.pl ~/.claude/settings.json ~/.claude/claude-code-config/global-config/settings.json > /tmp/merged-settings.json && mv /tmp/merged-settings.json ~/.claude/settings.json
   ```
 
-**5. Install missing plugins:**
+**5. Add missing marketplaces:**
+
+Read `global-config/known_marketplaces.json` (if it exists). Compare against `~/.claude/plugins/known_marketplaces.json` (if it exists). For each marketplace in the repo but not installed locally, inform the user and offer to add it with `/plugin marketplace add <owner>/<repo>` (for GitHub sources) or the appropriate URL.
+
+**6. Install missing plugins:**
 
 Read the `enabledPlugins` from `global-config/settings.json`. For each plugin, check if it's already installed by reading `~/.claude/plugins/installed_plugins.json` (if it exists). For any plugin not found there, inform the user which plugins are missing and offer to install them. Install with:
 
@@ -109,9 +115,7 @@ Read the `enabledPlugins` from `global-config/settings.json`. For each plugin, c
 /plugin install <plugin-name>@<marketplace-name>
 ```
 
-If the marketplace isn't already added, add it first with `/plugin marketplace add`.
-
-**6. Tell the user to restart Claude Code.**
+**7. Tell the user to restart Claude Code.**
 
 ## Features
 
@@ -153,10 +157,13 @@ Opus 4.6 1M  22% |220k 780k| 5h 15%|3h 46m|  7d 12%|4d 22h|
 
 Bidirectional sync between your live `~/.claude/` config and this repo:
 
-1. Detects drift (identical, live-only, export-only, conflict, settings changes)
-2. Merges conflicts with AI assistance and user approval
-3. Scans all staged files for secrets (API keys, tokens, credentials, private keys)
-4. Commits and pushes (pulls first to avoid conflicts)
+1. Detects drift (identical, live-only, export-only, conflict, settings, marketplace, and container settings changes)
+2. Creates timestamped backups of live settings before any modifications
+3. Three-way settings sync: live host ↔ global-config ↔ container-config (semantic JSON comparison — ignores key order)
+4. Syncs marketplace selections across machines (strips machine-specific paths)
+5. Merges conflicts with AI assistance and user approval
+6. Scans all staged files for secrets (API keys, tokens, credentials, private keys)
+7. Commits and pushes (pulls first to avoid conflicts)
 
 ### Refresh (`/refresh`)
 
@@ -168,9 +175,11 @@ Safe Claude Code updater that researches releases before installing:
 
 1. Fetches the official changelog and GitHub release dates
 2. Calculates release age and risk (< 48h high, 48h–7d medium, > 7d low)
-3. Searches GitHub issues for reports of problems with the release
-4. Presents a summary with changelog highlights, risk assessment, and community reports
-5. Lets you choose: update to latest, pick a safer older version, or stay put
+3. Flags versions without published changelogs
+4. Searches GitHub issues for reports of problems with the release
+5. Presents a summary with changelog highlights, risk assessment, and community reports
+6. Lets you choose: update to latest, pick a safer older version, or stay put
+7. Always installs the exact version you selected (version-pinned, never drifts to a newer release)
 
 Currently fully implements Windows native install updates. On other platforms, it detects the install method and invokes `/create-skill` to generate the update logic.
 
@@ -262,7 +271,7 @@ Inside the container, Claude runs with `--dangerously-skip-permissions` (full au
 
 ## Customization
 
-- **Settings:** Edit `~/.claude/settings.json` for permissions, plugins, and hooks. The repo version is the baseline — `permissions` are always machine-local.
+- **Settings:** Edit `~/.claude/settings.json` for permissions, plugins, and hooks. The repo version is the baseline — all keys including `permissions` are synced.
 - **Global rules:** Edit `global-config/CLAUDE.md` in the repo (symlinked to `~/.claude/CLAUDE.md`).
 - **Container rules:** Edit `container-config/CLAUDE.md` in the repo for in-container behavior.
 - **Statusline:** Edit `scripts/statusline.pl` in the repo to customize the status bar output.

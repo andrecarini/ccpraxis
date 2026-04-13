@@ -1,6 +1,7 @@
 #!/usr/bin/perl
-# Merge repo settings.json into an existing ~/.claude/settings.json.
-# Preserves the existing permissions block; updates everything else from repo defaults.
+# Merge settings.json: starts from <existing>, adds only keys missing from <defaults>.
+# All existing keys/values are preserved — no overwrites.
+# Not run automatically by /backup; available as a manual utility.
 #
 # Usage: perl merge-settings.pl <existing> <defaults>
 # Prints merged JSON to stdout.
@@ -21,11 +22,10 @@ sub read_json {
 my $existing = read_json($ARGV[0]);
 my $defaults = read_json($ARGV[1]);
 
-# Save existing permissions
-my $permissions = $existing->{permissions};
-
-# Start from defaults, overlay existing permissions
-my $merged = { %$defaults };
-$merged->{permissions} = $permissions if $permissions;
+# Start from existing; only add keys from defaults that aren't already present
+my $merged = { %$existing };
+for my $key (keys %$defaults) {
+    $merged->{$key} = $defaults->{$key} unless exists $existing->{$key};
+}
 
 print $codec->encode($merged);

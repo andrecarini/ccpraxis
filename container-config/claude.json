@@ -3,5 +3,6 @@
   "lastOnboardingVersion": "99.0.0",
   "numStartups": 1,
   "hasSeenTasksHint": true,
-  "hasSeenStashHint": true
+  "hasSeenStashHint": true,
+  "editorMode": "vim"
 }
