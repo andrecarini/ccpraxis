@@ -1,12 +1,11 @@
 ---
 name: refresh
 description: Rereads all CLAUDE.md guidelines (global + project) and summarizes key rules. Use when Claude seems to have drifted from guidelines mid-conversation, or when the user says "refresh", "reread instructions", "reload guidelines".
-disable-model-invocation: true
 user-invocable: true
 allowed-tools: Read, Glob
 ---
 
-The user wants you to reread all project guidelines. Do the following:
+Reread all project guidelines and re-anchor on key rules. Do the following:
 
 1. Read the global CLAUDE.md at `~/.claude/CLAUDE.md` (if it exists)
 2. Read the project CLAUDE.md at `CLAUDE.md` or `claude.md` in the current working directory (if it exists)
