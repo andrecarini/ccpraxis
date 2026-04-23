@@ -302,9 +302,13 @@ fi
 
 # --- Launch or reattach ---
 if docker inspect "$CONTAINER_NAME" > /dev/null 2>&1; then
-  # Container exists — reattach
-  echo "Reattaching to existing container: $CONTAINER_NAME"
-  docker start -ai "$CONTAINER_NAME"
+  STATE="$(docker inspect --format '{{.State.Status}}' "$CONTAINER_NAME" 2>/dev/null)"
+  if [ "$STATE" = "running" ]; then
+    echo "Container $CONTAINER_NAME is already running - starting a new session inside it."
+    exec docker exec -it "$CONTAINER_NAME" claude --dangerously-skip-permissions --resume
+  fi
+  # Container exists but stopped — start it below
+  echo "Starting container: $CONTAINER_NAME"
 else
   # Create new container
   echo "Creating new container: $CONTAINER_NAME"
@@ -330,6 +334,7 @@ else
     "${SKILL_MOUNTS[@]}" \
     "${EXTRA_MOUNTS[@]}" \
     claude-sandbox:latest
-
-  docker start -ai "$CONTAINER_NAME"
 fi
+
+docker start "$CONTAINER_NAME" > /dev/null
+exec docker exec -it "$CONTAINER_NAME" claude --dangerously-skip-permissions --continue

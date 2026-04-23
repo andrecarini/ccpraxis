@@ -12,6 +12,22 @@ $ClaudeHostConfig = "$env:USERPROFILE\.claude"
 $ContainerConfig = "$ClaudeHostConfig\claude-code-config\container-config"
 $LauncherDir = "$ProjectPath\.claude-data\.launcher"
 
+# --- Terminal output self-heal ---
+# A child process — most likely the `claude` CLI running under `docker exec -it`
+# in a previous session — can emit a VT sequence that resets Windows Terminal's
+# Line Feed / New Line Mode (LNM). With LNM off, `\n` in output moves the
+# cursor down without an implicit CR, so subsequent lines staircase across the
+# screen. `CSI 20 h` (ESC [ 20 h) sets LNM back on; the effect persists for the
+# terminal window so the fix self-heals any already-broken window on the next
+# run. The TextWriter NewLine and console-mode reassertions are belt-and-
+# suspenders against related regressions we haven't observed in practice.
+function Reset-TerminalOutput {
+    try { [Console]::Out.NewLine = "`r`n" } catch { }
+    try { [Console]::Error.NewLine = "`r`n" } catch { }
+    try { [Console]::Out.Write(([char]0x1B) + "[20h") } catch { }  # the one that matters
+}
+Reset-TerminalOutput
+
 # --- Auto-setup if needed ---
 
 if (-not (Test-Path "$ProjectPath\.claude-data")) {
@@ -27,6 +43,7 @@ if (-not (Test-Path "$ProjectPath\.claude-data")) {
     Pop-Location
     if (-not (Test-Path "$ProjectPath\.claude-data")) {
         Write-Host "Setup was not completed. Aborting."
+        Reset-TerminalOutput
         exit 1
     }
 }
@@ -293,7 +310,14 @@ if (-not (Test-Path $ClaudeJsonProject) -and (Test-Path $ClaudeJsonTemplate)) {
 # --- Create container if needed ---
 $null = docker inspect $ContainerName 2>&1
 if ($LASTEXITCODE -eq 0) {
-    Write-Host "Reattaching to existing container: $ContainerName"
+    $State = (docker inspect --format '{{.State.Status}}' $ContainerName 2>$null | Out-String).Trim()
+    if ($State -eq 'running') {
+        Write-Host "Container $ContainerName is already running - starting a new session inside it."
+        docker exec -it $ContainerName claude --dangerously-skip-permissions --resume
+        Reset-TerminalOutput
+        exit $LASTEXITCODE
+    }
+    Write-Host "Starting container: $ContainerName"
 } else {
     Write-Host "Creating new container: $ContainerName"
 
@@ -326,4 +350,7 @@ if ($LASTEXITCODE -eq 0) {
     & docker @DockerArgs | Out-Null
 }
 
-docker start -ai $ContainerName
+docker start $ContainerName | Out-Null
+docker exec -it $ContainerName claude --dangerously-skip-permissions --continue
+Reset-TerminalOutput
+exit $LASTEXITCODE

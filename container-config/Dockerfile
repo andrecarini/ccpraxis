@@ -10,6 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     unzip \
     openssh-client \
     perl \
+    procps \
     && rm -rf /var/lib/apt/lists/*
 
 # Create non-root user
@@ -34,4 +35,4 @@ RUN git config --global core.autocrlf input \
     && git config --global init.defaultBranch main
 
 WORKDIR /project
-ENTRYPOINT ["/home/claude/.local/bin/claude", "--dangerously-skip-permissions", "--continue"]
+ENTRYPOINT ["/bin/bash", "-c", "START=$SECONDS; while [ $((SECONDS - START)) -lt 15 ] || pgrep -x -u claude claude > /dev/null; do sleep 3; done"]
