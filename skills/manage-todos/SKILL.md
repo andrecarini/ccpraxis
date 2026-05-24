@@ -11,7 +11,7 @@ related:
 
 # Manage Todo Notes
 
-CRUD operations for personal todo notes in `~/.claude/custom-todos/`.
+CRUD operations for personal todo notes in `~/.claude/claude-code-vault/todos/`.
 
 All file creation goes through the Perl script `todo-sync.pl` — it owns the template format. Never write the frontmatter yourself. The script auto-captures the working directory at creation time (`cwd` field in frontmatter).
 
@@ -77,7 +77,7 @@ perl ~/.claude/ccpraxis/scripts/todo-sync.pl sync "Add: $name"
 
 ### Operation: `view`
 
-Read `~/.claude/custom-todos/$1.md` and display:
+Read `~/.claude/claude-code-vault/todos/$1.md` and display:
 - Title and status
 - Tags and created date
 - Full content
@@ -110,7 +110,7 @@ Read the todo's title and status, then confirm with the user:
 If confirmed:
 
 ```bash
-rm ~/.claude/custom-todos/$1.md
+rm ~/.claude/claude-code-vault/todos/$1.md
 perl ~/.claude/ccpraxis/scripts/todo-sync.pl sync "Delete: $1"
 ```
 

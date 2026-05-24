@@ -31,7 +31,19 @@ my $pretty = JSON::PP->new->pretty->canonical;
 
 # Read diff from stdin
 my $diff_json = do { local $/; <STDIN> };
-my $diff = decode_json($diff_json);
+# Tolerate invalid UTF-8 bytes (e.g. Latin-1 paths in settings.json from
+# tools that wrote files without proper UTF-8 encoding). Fallback path
+# substitutes U+FFFD for any malformed byte sequence, allowing the diff
+# to proceed instead of hard-failing the whole backup.
+my $diff;
+eval { $diff = decode_json($diff_json); };
+if ($@) {
+    require Encode;
+    # FB_DEFAULT constant must be imported at runtime (Bareword strict)
+    my $fb = Encode::FB_DEFAULT();
+    my $clean = Encode::decode('UTF-8', $diff_json, $fb);
+    $diff = JSON::PP->new->decode($clean);
+}
 
 # If diff is identical, pass through immediately
 if ($diff->{status} eq 'identical') {

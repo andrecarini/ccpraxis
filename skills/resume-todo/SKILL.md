@@ -11,7 +11,7 @@ related:
 
 # Resume Work on a Todo
 
-Load a todo note from `~/.claude/custom-todos/` and begin working on whatever it describes. Unlike `/resume-plan` (which creates structured session plans with deliverables), this is lightweight — read the note, understand the context, and help the user act on it.
+Load a todo note from `~/.claude/claude-code-vault/todos/` and begin working on whatever it describes. Unlike `/resume-plan` (which creates structured session plans with deliverables), this is lightweight — read the note, understand the context, and help the user act on it.
 
 This skill runs on the main model (no Sonnet override) because the actual work could be complex.
 
@@ -41,7 +41,7 @@ Only report if `STATUS: conflict`.
 
 ### 3. Find and read the todo
 
-If `$0` is provided, read `~/.claude/custom-todos/$0.md`. If it doesn't exist, list available todos:
+If `$0` is provided, read `~/.claude/claude-code-vault/todos/$0.md`. If it doesn't exist, list available todos:
 
 ```bash
 perl ~/.claude/ccpraxis/scripts/todo-sync.pl list

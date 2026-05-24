@@ -5,9 +5,10 @@ A curated [Claude Code](https://docs.anthropic.com/en/docs/claude-code) configur
 
 - **Global instructions** — supply chain security rules, response style, dev tooling restrictions
 - **Custom statusline** — model, context usage, token counts, plan rate limits with reset timers
-- **Slash commands** — `/backup` (sync + push config), `/create-plan` (create persistent plan), `/create-skill` (create new skills), `/create-todo` (save a todo note), `/launch-chrome-puppet` (CDP browser automation), `/manage-plans` (list/view/update/delete/archive plans), `/manage-todos` (CRUD for todos), `/refresh` (reload instructions), `/resume-plan` (resume plan work), `/resume-todo` (work on a todo), `/sandbox` (containerize a project), `/update` (safe Claude Code updater), `/update-skill` (modify existing skills)
+- **Slash commands** — `/backup` (sync config + every registered vault project), `/create-plan` (persistent plan), `/create-skill` (new skills), `/create-todo` (todo note), `/launch-chrome-puppet` (CDP browser automation), `/manage-plans`, `/manage-todos`, `/refresh` (reload instructions), `/register-for-backup` (set up a project for vault backup), `/resume-plan`, `/resume-todo`, `/sandbox` (containerize a project), `/update` (safe updater), `/update-skill`
 - **Docker sandbox** — isolated containers with full Claude autonomy, interactive skill selection, blocked install hooks, 7-day package age minimum
 - **Config sync** — bidirectional drift detection, AI-assisted conflict merging, secret scanning
+- **Vault sync** — your own private GitHub repo (`claude-code-vault`) backs up todos AND project-scoped Claude files (CLAUDE.md, skills, plans, memory) across machines. 3-way merge with per-project cache; locking, journaling, atomic staging; pre-rename sensitive-data scan that keeps the vault clean even if you fat-finger a secret.
 
 ## Fork, don't just clone
 
@@ -34,30 +35,35 @@ ccpraxis/
 │   └── skill-writing-guide.md         # Shared skill authoring guide (folder structure, progressive disclosure, writing tips)
 ├── scripts/
 │   ├── statusline.pl                # Custom two-line status bar (model, context, rate limits)
-│   └── todo-sync.pl                 # Git sync, listing, creation for custom todos
+│   ├── todo-sync.pl                 # Vault todos: list/create/done/sync (git ops scoped to todos/)
+│   └── vault-sync.pl                # Vault project backups: register, sync (3-way merge), conflict resolution, commit-and-push. Locking, journal, atomic staging, pre-rename sensitive-data scan.
 ├── skills/
-│   ├── backup/                      # /backup       — sync config, scan for secrets, push
+│   ├── backup/                      # /backup — sync ccpraxis config + every registered vault project
 │   │   ├── SKILL.md
 │   │   └── scripts/
-│   │       ├── json-diff.pl         # Semantic JSON diff (ignores key order, structured report)
+│   │       ├── json-diff.pl         # Semantic JSON diff (--deep-exclude, structured report)
+│   │       ├── filter-diff.pl       # Filters json-diff output through saved preferences
+│   │       ├── save-preference.pl   # Records "remember this divergence" decisions
+│   │       ├── check-plugins.pl     # Detects missing or stale plugins vs settings.json
 │   │       ├── sync-export.sh       # Detects drift between live config and this repo
 │   │       └── sensitive-check.sh   # Scans for secrets before committing
-│   ├── create-plan/SKILL.md         # /create-plan   — create a persistent multi-session plan
-│   ├── create-skill/SKILL.md        # /create-skill  — create new skill(s) with auto-linking
-│   ├── create-todo/SKILL.md         # /create-todo   — save a todo note
+│   ├── create-plan/SKILL.md         # /create-plan          — create a persistent multi-session plan
+│   ├── create-skill/SKILL.md        # /create-skill         — create new skill(s) with auto-linking
+│   ├── create-todo/SKILL.md         # /create-todo          — save a todo note
 │   ├── launch-chrome-puppet/        # /launch-chrome-puppet — CDP browser automation
 │   │   ├── SKILL.md
 │   │   └── scripts/
 │   │       ├── chrome-puppet.pl     # Subcommand dispatcher (launch, navigate, text, etc.)
 │   │       └── lib/CDPClient.pm     # Pure-Perl WebSocket + CDP client
-│   ├── manage-plans/SKILL.md        # /manage-plans  — list, view, update, delete, archive plans
-│   ├── manage-todos/SKILL.md        # /manage-todos  — CRUD for personal todos
-│   ├── refresh/SKILL.md             # /refresh       — reread CLAUDE.md mid-conversation
-│   ├── resume-plan/SKILL.md         # /resume-plan   — resume work on a persistent plan
-│   ├── resume-todo/SKILL.md         # /resume-todo   — load a todo and work on it
-│   ├── sandbox/SKILL.md             # /sandbox       — set up a project for containerized dev
-│   ├── update/SKILL.md              # /update        — safe Claude Code updater
-│   └── update-skill/SKILL.md       # /update-skill  — modify existing skill(s)
+│   ├── manage-plans/SKILL.md        # /manage-plans         — list, view, update, delete, archive plans
+│   ├── manage-todos/SKILL.md        # /manage-todos         — CRUD for personal todos
+│   ├── refresh/SKILL.md             # /refresh              — reread CLAUDE.md mid-conversation
+│   ├── register-for-backup/SKILL.md # /register-for-backup  — bootstrap a project for vault backup (orphan discovery, slug pick, initial sync)
+│   ├── resume-plan/SKILL.md         # /resume-plan          — resume work on a persistent plan
+│   ├── resume-todo/SKILL.md         # /resume-todo          — load a todo and work on it
+│   ├── sandbox/SKILL.md             # /sandbox              — set up a project for containerized dev
+│   ├── update/SKILL.md              # /update               — safe Claude Code updater
+│   └── update-skill/SKILL.md       # /update-skill         — modify existing skill(s)
 └── container-config/
     ├── Dockerfile                   # Docker image: Debian bookworm + Claude Code CLI + dev tools
     ├── CLAUDE.md                    # Container-specific instructions (full autonomy)
@@ -84,11 +90,15 @@ Optional:
 **Fork first, then install from your fork.** ccpraxis is configuration you'll want to own and customize — forking means your edits live in *your* repo, and you can still pull upstream updates when you want them.
 
 1. Fork this repo on GitHub (`https://github.com/andrecarini/ccpraxis`) under your own account.
-2. Open Claude Code and tell it:
+2. **(Optional but recommended) Create a private vault repo for personal backups.** This holds your todos and per-project Claude files (CLAUDE.md, skills, plans, memory) — it stays out of any project repo and syncs your personal state across machines. Create an **empty private** repo on GitHub, e.g. `https://github.com/<your-user>/claude-code-vault`.
+3. Open Claude Code and tell it:
 
-    > Install ccpraxis from `https://github.com/<your-user>/ccpraxis`
+    > Install ccpraxis from `https://github.com/<your-user>/ccpraxis`. My vault repo is `git@github.com:<your-user>/claude-code-vault.git`.
 
-3. Then restart Claude Code.
+   (You can skip the vault URL if you don't want personal backups yet — set it up later via `perl ~/.claude/ccpraxis/scripts/vault-sync.pl init --url <repo-url>`.)
+4. Then restart Claude Code.
+
+After install, `/backup` keeps everything in sync. To track a specific project's Claude files in the vault, `cd` into it and run `/register-for-backup` (or accept the prompt that `/backup` shows when you're inside an unregistered project with Claude files).
 
 ### Staying up to date
 
@@ -165,7 +175,17 @@ cd ~/.claude/ccpraxis
 git remote add upstream https://github.com/andrecarini/ccpraxis.git
 ```
 
-**8. Tell the user to restart Claude Code.**
+**8. (If user provided a vault URL) Initialize the vault repo:**
+
+```bash
+perl ~/.claude/ccpraxis/scripts/vault-sync.pl init --url "<vault-url>"
+```
+
+This clones the vault to `~/.claude/claude-code-vault/`. If the vault is empty, the init scaffolds `README.md`, `.gitignore` (locks, journal, tmps, machine-local registry), `.gitattributes` (`* -text` to defeat CRLF normalization), and `todos/.gitkeep`, then commits and pushes. If the vault is already populated (e.g. from another machine), the clone preserves its contents.
+
+If the user didn't provide a vault URL, skip this step — they can run the init later.
+
+**9. Tell the user to restart Claude Code.**
 
 ## Features
 
@@ -215,6 +235,47 @@ Bidirectional sync between your live `~/.claude/` config and your ccpraxis repo:
 6. Merges conflicts with AI assistance and user approval
 7. Scans all staged files for secrets (API keys, tokens, credentials, private keys)
 8. Commits and pushes (pulls first to avoid conflicts)
+9. **Iterates every registered vault project** — runs the full sync engine for each (see Vault Sync below), surfacing conflicts interactively
+10. **Offers registration for the current project** if it has Claude files but isn't tracked yet — `Yes` invokes `/register-for-backup`, `Not now` defers, `Don't ask again` writes a `.claude/backup-skip` opt-out marker
+
+### Vault Sync (`/register-for-backup` + `/backup`)
+
+Your private `claude-code-vault` repo holds personal Claude state across machines: todos and project-scoped Claude files. Per-project tracking is opt-in.
+
+**Layout (in the vault repo):**
+
+```
+claude-code-vault/
+├── todos/                    # personal todo notes
+├── projects/<slug>/
+│   ├── metadata.json         # slug, file manifest, source notes per machine
+│   └── files/                # mirror of tracked files (byte-exact via `* -text`)
+├── .registry-local.json      # gitignored: slug → absolute project path on this machine
+├── .gitignore
+├── .gitattributes
+└── README.md
+```
+
+**Default tracked-on per project** (confirmed at registration; user can opt out of any):
+
+- `CLAUDE.md` (project root) and `.claude/CLAUDE.md`
+- `.claude/skills/`, `.claude/agents/`, `.claude/hooks/`, `.claude/commands/`, `.claude/plans/`
+- `.claude-plans/` (custom persistent plans)
+- `.claude-data/memory/` and `.claude-data/plans/` (sandbox state)
+
+**Hard-excluded (never offered):** `.claude/settings.local.json`, `.claude-data/git-pat`, `.claude-data/git-askpass.sh`, `.claude-data/git-ssh-command.sh`, `deploy_key`.
+
+**Sync algorithm (per file):** 3-way comparison using `.claude/backup-cache/<path>` as the merge BASE (mirror of last-synced content). Auto-applies one-sided changes (push/pull/cache-only). Conflicts go through `git merge-file --diff3`; the user resolves each via `AskUserQuestion` with **Use local / Use vault / Show diff / Use merged / Abort sync** — no skip, no remember.
+
+**Robustness:**
+- Two-level locking (vault `.lock` + per-project `.lock`) with PID+ISO-timestamp and 10-min stale reclaim
+- Atomic `.vault-sync.tmp` staging + batch-rename only after sensitive-check passes
+- Journal at `<vault>/projects/<slug>/.sync-journal.json` with phases (`staging` → `awaiting_resolution` → `renaming` → `sensitive_check` → `committing`); reconciliation on every sync start so an interrupted sync recovers cleanly
+- Pre-rename Perl-native sensitive-data scan (works on `.tmp` files regardless of extension) + post-rename `sensitive-check.sh` defense-in-depth
+- File-modified-during-sync rollback (re-hash before final rename)
+- Path safety (no `..`, no absolute paths, no backslashes; symlinks skipped via `File::Find` preprocess)
+
+**Restore on a fresh machine:** clone ccpraxis, run vault init, then `/register-for-backup` inside a project. The skill calls `list-orphans` first; if a slug already exists in the vault from another machine, it offers to link this directory to it — first sync then pulls all vault content locally.
 
 ### Refresh (`/refresh`)
 
@@ -326,6 +387,7 @@ Inside the container, Claude runs with `--dangerously-skip-permissions` (full au
 - **Global rules:** Edit `global-config/CLAUDE.md` in the repo (symlinked to `~/.claude/CLAUDE.md`).
 - **Container rules:** Edit `container-config/CLAUDE.md` in the repo for in-container behavior.
 - **Statusline:** Edit `scripts/statusline.pl` in the repo to customize the status bar output.
+- **Vault tracked-files defaults:** Edit `@DEFAULT_TRACKABLE` and `%HARD_EXCLUDE_EXACT` / `@HARD_EXCLUDE_PREFIXES` at the top of `scripts/vault-sync.pl` to change what `/register-for-backup` offers by default. Per-project selection is captured at registration time in `<project>/.claude/backup-metadata.json → tracked_paths`.
 
 ## Platforms
 

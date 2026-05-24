@@ -1,16 +1,23 @@
 {
-  "claude-plugins-official": {
-    "source": {
-      "source": "github",
-      "repo": "anthropics/claude-plugins-official"
-    },
-    "lastUpdated": "2026-04-24T16:13:28.801Z"
-  },
-  "chrome-devtools-plugins": {
-    "source": {
-      "source": "github",
-      "repo": "ChromeDevTools/chrome-devtools-mcp"
-    },
-    "lastUpdated": "2026-03-03T21:16:59.386Z"
-  }
+   "chrome-devtools-plugins" : {
+      "lastUpdated" : "2026-03-03T21:16:59.376Z",
+      "source" : {
+         "repo" : "ChromeDevTools/chrome-devtools-mcp",
+         "source" : "github"
+      }
+   },
+   "claude-plugins-official" : {
+      "lastUpdated" : "2026-05-23T23:15:45.094Z",
+      "source" : {
+         "repo" : "anthropics/claude-plugins-official",
+         "source" : "github"
+      }
+   },
+   "notion-plugin-marketplace" : {
+      "lastUpdated" : "2026-05-04T00:39:23.763Z",
+      "source" : {
+         "repo" : "makenotion/claude-code-notion-plugin",
+         "source" : "github"
+      }
+   }
 }

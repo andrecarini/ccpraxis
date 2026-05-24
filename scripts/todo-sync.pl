@@ -20,8 +20,9 @@ my $home = $ENV{HOME} // $ENV{USERPROFILE};
 die "Cannot determine home directory\n" unless $home;
 $home =~ s/\\/\//g;
 
-my $TODO_DIR = "$home/.claude/custom-todos";
-my $BRANCH   = "main";
+my $VAULT_DIR = "$home/.claude/claude-code-vault";
+my $TODO_DIR  = "$VAULT_DIR/todos";
+my $BRANCH    = "main";
 
 my $cmd = shift @ARGV // "help";
 
@@ -38,8 +39,9 @@ exit 0;
 # ── Subcommands ──────────────────────────────────────────────────────
 
 sub cmd_init {
-    if (-d "$TODO_DIR/.git") {
-        my $remote = git_output("remote", "get-url", "origin");
+    # Already initialized? Report and exit.
+    if (-d "$VAULT_DIR/.git") {
+        my $remote = git_output("-C", $VAULT_DIR, "remote", "get-url", "origin");
         if ($remote) {
             emit("STATUS", "exists");
             emit("PATH",   $TODO_DIR);
@@ -56,27 +58,26 @@ sub cmd_init {
         exit 1;
     }
 
-    # Verify the remote is reachable (no --exit-code: empty repos have no refs but are still valid)
-    unless (git_ok("ls-remote", $url)) {
+    # v1.1 consolidation: delegate vault scaffolding to vault-sync.pl so there's
+    # exactly ONE canonical vault scaffolder (was: both scripts could initialize,
+    # with subtle differences — gitignore entries, .gitattributes presence).
+    my $vault_sync = "$home/.claude/ccpraxis/scripts/vault-sync.pl";
+    unless (-f $vault_sync) {
         emit("STATUS", "error");
-        emit("ERROR",  "Cannot reach remote: $url. Check the URL and credentials.");
+        emit("ERROR",  "vault-sync.pl not found at $vault_sync — cannot init vault. Ensure ccpraxis is installed.");
         exit 1;
     }
 
-    unless (git_ok("clone", $url, $TODO_DIR)) {
+    my $rc = system('perl', $vault_sync, 'init', '--url', $url);
+    if ($rc != 0) {
         emit("STATUS", "error");
-        emit("ERROR",  "Clone failed for: $url");
+        emit("ERROR",  "vault-sync.pl init failed (exit " . ($rc >> 8) . "). Re-run for full diagnostics.");
         exit 1;
     }
 
-    # Handle empty repo (no commits yet)
-    unless (git_ok("-C", $TODO_DIR, "rev-parse", "HEAD")) {
-        write_file("$TODO_DIR/README.md",
-            "# Custom Todos\n\nPersonal todo notes managed by Claude Code.\n");
-        git_ok("-C", $TODO_DIR, "add", "README.md");
-        git_ok("-C", $TODO_DIR, "commit", "-m", "Initial commit");
-        git_ok("-C", $TODO_DIR, "push", "-u", "origin", $BRANCH);
-    }
+    # Ensure todos/ subdir exists (vault-sync.pl creates it via the scaffold,
+    # but if the user cloned a non-empty vault that lacks todos/, create it now).
+    mkdir $TODO_DIR unless -d $TODO_DIR;
 
     emit("STATUS", "cloned");
     emit("PATH",   $TODO_DIR);
@@ -85,20 +86,20 @@ sub cmd_init {
 }
 
 sub cmd_status {
-    unless (-d "$TODO_DIR/.git") {
+    unless (-d "$VAULT_DIR/.git") {
         emit("STATUS", "missing");
         emit("PATH",   $TODO_DIR);
         return;
     }
 
-    my $remote = git_output("-C", $TODO_DIR, "remote", "get-url", "origin");
+    my $remote = git_output("-C", $VAULT_DIR, "remote", "get-url", "origin");
     unless ($remote) {
         emit("STATUS", "no_remote");
         emit("PATH",   $TODO_DIR);
         return;
     }
 
-    my $can_fetch = git_ok("-C", $TODO_DIR, "fetch", "origin") ? "yes" : "no";
+    my $can_fetch = git_ok("-C", $VAULT_DIR, "fetch", "origin") ? "yes" : "no";
     my $clean     = is_clean() ? "yes" : "no";
     my ($ahead, $behind) = ahead_behind();
 
@@ -115,13 +116,13 @@ sub cmd_status {
 sub cmd_sync {
     my $message = join(" ", @ARGV) || "Update todos";
 
-    unless (-d "$TODO_DIR/.git") {
+    unless (-d "$VAULT_DIR/.git") {
         emit("STATUS", "error");
         emit("ERROR",  "Repo not initialized. Run: todo-sync.pl init");
         exit 1;
     }
 
-    unless (git_ok("-C", $TODO_DIR, "fetch", "origin")) {
+    unless (git_ok("-C", $VAULT_DIR, "fetch", "origin")) {
         emit("STATUS", "error");
         emit("ERROR",  "Cannot fetch from remote. Check connectivity.");
         exit 1;
@@ -134,15 +135,15 @@ sub cmd_sync {
     # Pull if behind
     if ($behind > 0) {
         if ($dirty) {
-            git_ok("-C", $TODO_DIR, "stash", "-u");
+            git_ok("-C", $VAULT_DIR, "stash", "-u");
         }
-        unless (git_ok("-C", $TODO_DIR, "pull", "--rebase", "origin", $BRANCH)) {
+        unless (git_ok("-C", $VAULT_DIR, "pull", "--rebase", "origin", $BRANCH)) {
             emit("STATUS", "conflict");
             emit("ERROR",  "Rebase conflict during pull. Resolve in $TODO_DIR");
             exit 1;
         }
         if ($dirty) {
-            unless (git_ok("-C", $TODO_DIR, "stash", "pop")) {
+            unless (git_ok("-C", $VAULT_DIR, "stash", "pop")) {
                 emit("STATUS", "conflict");
                 emit("ERROR",  "Local changes conflict with remote after pull. Resolve in $TODO_DIR");
                 exit 1;
@@ -153,8 +154,9 @@ sub cmd_sync {
 
     # Commit local changes
     unless (is_clean()) {
-        git_ok("-C", $TODO_DIR, "add", "-A");
-        if (git_ok("-C", $TODO_DIR, "commit", "-m", $message)) {
+        # Scope to todos/ so we don't accidentally commit projects/ or other vault changes.
+        git_ok("-C", $VAULT_DIR, "add", "todos/");
+        if (git_ok("-C", $VAULT_DIR, "commit", "-m", $message)) {
             $committed = "yes";
         }
     }
@@ -162,7 +164,7 @@ sub cmd_sync {
     # Push if ahead
     ($ahead, $behind) = ahead_behind();
     if ($ahead > 0) {
-        if (git_ok("-C", $TODO_DIR, "push", "origin", $BRANCH)) {
+        if (git_ok("-C", $VAULT_DIR, "push", "origin", $BRANCH)) {
             $pushed = "yes";
         } else {
             emit("STATUS", "error");
@@ -364,11 +366,11 @@ sub auth_type {
 }
 
 sub is_clean {
-    return git_output("-C", $TODO_DIR, "status", "--porcelain") eq "";
+    return git_output("-C", $VAULT_DIR, "status", "--porcelain", "--", "todos/") eq "";
 }
 
 sub ahead_behind {
-    my $ab = git_output("-C", $TODO_DIR, "rev-list", "--left-right", "--count",
+    my $ab = git_output("-C", $VAULT_DIR, "rev-list", "--left-right", "--count",
                         "HEAD...origin/$BRANCH");
     return ($ab =~ /^(\d+)\s+(\d+)$/) ? ($1, $2) : (0, 0);
 }

@@ -7,3 +7,8 @@ deploy_key*
 .statusline_usage_cache.json
 .backup-preferences.json
 .claude/settings.local.json
+.claude-plans/
+
+.claude/backup-metadata.json
+
+.claude/backup-cache/

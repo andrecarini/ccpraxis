@@ -1,35 +1,47 @@
 {
-  "$schema": "https://json.schemastore.org/claude-code-settings.json",
-  "env": {
-    "DISABLE_AUTOUPDATER": "1",
-    "CLAUDE_AUTO_BACKGROUND_TASKS": "1",
-    "CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR": "0",
-    "CLAUDE_CODE_IDE_SKIP_AUTO_INSTALL": "true",
-    "CLAUDE_CODE_NEW_INIT": "1",
-    "DISABLE_UPGRADE_COMMAND": "1",
-    "DISABLE_LOGIN_COMMAND": "1",
-    "DISABLE_LOGOUT_COMMAND": "1",
-    "CLAUDE_CODE_NO_FLICKER": "1",
-    "ENABLE_PROMPT_CACHING_1H": "1",
-    "FORCE_AUTOUPDATE_PLUGINS": "1",
-    "CLAUDE_CODE_ENABLE_AWAY_SUMMARY": "1",
-    "DISABLE_INSTALL_GITHUB_APP_COMMAND": "1",
-    "CLAUDE_CODE_SCROLL_SPEED": "3"
-  },
-  "statusLine": {
-    "type": "command",
-    "command": "perl \"$HOME/.claude/statusline.pl\""
-  },
-  "enabledPlugins": {
-    "frontend-design@claude-plugins-official": true,
-    "feature-dev@claude-plugins-official": true
-  },
-  "alwaysThinkingEnabled": true,
-  "effortLevel": "xhigh",
-  "attribution": {
-    "commit": "",
-    "pr": ""
-  },
-  "showThinkingSummaries": true,
-  "skipDangerousModePermissionPrompt": true
+   "$schema" : "https://json.schemastore.org/claude-code-settings.json",
+   "agentPushNotifEnabled" : true,
+   "attribution" : {
+      "commit" : "",
+      "pr" : ""
+   },
+   "autoScrollEnabled" : false,
+   "editorMode" : "vim",
+   "effortLevel" : "xhigh",
+   "enabledPlugins" : {
+      "feature-dev@claude-plugins-official" : true,
+      "frontend-design@claude-plugins-official" : true
+   },
+   "env" : {
+      "CLAUDE_AUTO_BACKGROUND_TASKS" : "1",
+      "CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR" : "0",
+      "CLAUDE_CODE_ENABLE_AWAY_SUMMARY" : "1",
+      "CLAUDE_CODE_IDE_SKIP_AUTO_INSTALL" : "true",
+      "CLAUDE_CODE_NEW_INIT" : "1",
+      "CLAUDE_CODE_NO_FLICKER" : "1",
+      "CLAUDE_CODE_SCROLL_SPEED" : "3",
+      "DISABLE_AUTOUPDATER" : "1",
+      "DISABLE_INSTALL_GITHUB_APP_COMMAND" : "1",
+      "DISABLE_LOGIN_COMMAND" : "1",
+      "DISABLE_LOGOUT_COMMAND" : "1",
+      "DISABLE_UPGRADE_COMMAND" : "1",
+      "ENABLE_PROMPT_CACHING_1H" : "1",
+      "FORCE_AUTOUPDATE_PLUGINS" : "1"
+   },
+   "extraKnownMarketplaces" : {
+      "notion-plugin-marketplace" : {
+         "source" : {
+            "repo" : "makenotion/claude-code-notion-plugin",
+            "source" : "github"
+         }
+      }
+   },
+   "promptSuggestionEnabled" : false,
+   "showClearContextOnPlanAccept" : true,
+   "showThinkingSummaries" : true,
+   "skipDangerousModePermissionPrompt" : true,
+   "statusLine" : {
+      "command" : "perl \"$HOME/.claude/statusline.pl\"",
+      "type" : "command"
+   }
 }

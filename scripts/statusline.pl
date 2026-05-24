@@ -83,8 +83,8 @@ eval {
         push @parts, "${DIM}\x{25C7}\x{200A}${R}${n}" if $n > 0;
     }
 
-    # Todos: non-archived ~/.claude/custom-todos/*.md (global)
-    my $todo_dir = "$ENV{HOME}/.claude/custom-todos";
+    # Todos: non-archived ~/.claude/claude-code-vault/todos/*.md (global)
+    my $todo_dir = "$ENV{HOME}/.claude/claude-code-vault/todos";
     if (-d $todo_dir) {
         opendir(my $dh, $todo_dir) or die;
         my $n = grep { /\.md$/ && !/^README\.md$/ && -f "$todo_dir/$_" } readdir($dh);

@@ -1,12 +1,12 @@
 ---
 name: backup
-description: Syncs ccpraxis between live host and the config repo (global-config + container-config). Backs up live settings, scans for secrets, commits and pushes. Use when the user wants to sync config, back up settings, push config changes, or says "backup", "sync config", "push config".
+description: Syncs everything personal between the live host and your private repos — ccpraxis config (global + container) AND every project registered for vault backup (CLAUDE.md, skills, plans, memory). Scans for secrets before pushing. Resolves vault sync conflicts interactively. If you're in a project that has trackable Claude files but isn't registered for backup, offers to register it. Use when the user wants to sync config, back up settings, push config changes, sync vault projects, or says "backup", "sync config", "push config", "sync everything", "back up my work".
 user-invocable: true
 host-only: true
-allowed-tools: Bash, Read, Write, Edit, AskUserQuestion
+allowed-tools: Bash, Read, Write, Edit, AskUserQuestion, Skill
 ---
 
-Sync your ccpraxis between `~/.claude/` (live) and the export repo at `~/.claude/ccpraxis/`.
+Sync your ccpraxis between `~/.claude/` (live) and the export repo at `~/.claude/ccpraxis/`, then sync every vault-registered project at `~/.claude/claude-code-vault/projects/<slug>/`.
 
 ## Step 1: Integrate remote
 
@@ -239,6 +239,142 @@ If confirmed: commit and push. Since Step 1 already integrated remote, pushing i
 
 If the repo has no remote configured, commit locally and tell the user to set up a remote.
 
+## Step 5.5: Sync registered vault projects
+
+`vault-sync.pl` owns ALL git/file/hash/merge work — your job is to invoke subcommands, parse JSON, and present `AskUserQuestion` for conflicts. Never run `git` against the vault yourself, never `cp`/`mv` files into the vault, never compute hashes yourself.
+
+First check that the vault exists locally:
+
+```bash
+[ -d "$HOME/.claude/claude-code-vault/.git" ] && echo "VAULT_OK" || echo "VAULT_MISSING"
+```
+
+If `VAULT_MISSING`, skip this step (vault not initialized on this machine — covered by setup in the ccpraxis README).
+
+Otherwise list registered projects on this machine:
+
+```bash
+perl "$HOME/.claude/ccpraxis/scripts/vault-sync.pl" list-projects
+```
+
+If `projects` is empty, skip to Step 5.6.
+
+For each entry in `projects` (sequentially — the vault lock serializes them; do NOT parallelize):
+
+### 5.5.a — Sync the project
+
+**Stale-entry check first (fix H7 from red-team):** if the entry's `project_exists` field is `false`, the registered project directory has been moved or deleted. Surface this to the user:
+
+> ⚠ Project `<slug>` is registered but its directory no longer exists at `<path>`. Skipping. Run `perl ~/.claude/ccpraxis/scripts/vault-sync.pl unregister --slug <slug>` to remove the stale entry (vault contents will be preserved as orphans).
+
+Then skip to the next project — do NOT call `sync-project` for a missing path.
+
+For entries with `project_exists: true`:
+
+```bash
+perl "$HOME/.claude/ccpraxis/scripts/vault-sync.pl" sync-project --slug "<slug>"
+```
+
+Capture the `session_id` field from the response — you'll pass it through `resolve-conflict` and `commit-and-push` (fix H2: prevents a parallel invocation from splicing into this session's journal).
+
+Handle the response:
+
+- `status: drift` — vault has uncommitted changes in `projects/<slug>/` outside any known journal (left over from an unclean exit). Surface `dirty_files` to the user; **skip this project** and continue with the next one. The user can clean up manually at `~/.claude/claude-code-vault/` and re-run `/backup`.
+- `status: error` — surface the error; skip this project; continue.
+- `status: synced` — continue.
+
+If the response has `skipped_symlinks` or `skipped_bad_paths` non-empty, mention those (informational, not blocking).
+
+### 5.5.b — Conflict resolution loop
+
+If `conflicts` is non-empty, iterate them in order. For each conflict, use `AskUserQuestion`:
+
+**Question:** `"Conflict on '<path>' in project '<slug>' — local and vault both changed since last sync. How to resolve?"`
+
+**Options** (build dynamically based on the conflict entry):
+
+1. **"Use local version"** — overwrite vault with local. Always offered.
+2. **"Use vault version"** — overwrite local with vault. Always offered.
+3. **"Show diff"** — display merge tmp content, then re-prompt. Offered only when `is_text == true`.
+4. **"Use merged"** — accept the auto-merged result. Offered ONLY when `is_text == true` AND `merge_result.exit_code == 0`.
+5. **"Abort sync"** — stop processing THIS project (do NOT commit-and-push for this slug); move on to the next project. Always offered last.
+
+**Binary files (`is_text == false`):** offer only options 1, 2, and 5. Add a note in the question text: *"This is a binary file — diff and merged-view are not available."*
+
+**"Show diff":** `bash cat "<merge_result.tmp_path>"` to display the `git merge-file --diff3` result (conflict markers, or clean merged file when `exit_code == 0`). Re-ask the SAME conflict's question afterward.
+
+**"Abort sync":** report **explicitly** that any conflicts the user already resolved in this slug's session will be discarded:
+
+> Aborted sync for project `<slug>`. **The N conflict(s) you already resolved in this session will be discarded** — they'll be re-asked on the next `/backup`. Vault is untouched for this project. Continuing with the next project.
+
+Then continue to the next project. Do NOT call commit-and-push for THIS slug.
+
+**"Use local" / "Use vault" / "Use merged":** pass the same `--session-id` captured from `sync-project`:
+
+```bash
+perl "$HOME/.claude/ccpraxis/scripts/vault-sync.pl" resolve-conflict --slug "<slug>" --path "<path>" --action <use-local|use-vault|use-merged> --session-id "<session_id>" [--merged-file "<merge_result.tmp_path>"]
+```
+
+(Pass `--merged-file` only for `use-merged`.)
+
+### 5.5.c — Commit and push
+
+After all conflicts resolved (or if there were none), pass the same `--session-id`:
+
+```bash
+perl "$HOME/.claude/ccpraxis/scripts/vault-sync.pl" commit-and-push --slug "<slug>" --session-id "<session_id>"
+```
+
+Handle the response:
+
+- `committed_and_pushed` — success. Note the `last_synced_at`. If `rolled_back_during_sync` present, mention those paths (their source files changed mid-sync; will be picked up next `/backup`).
+- `sensitive_blocked` — vault was NOT modified; pre-rename scan caught secrets in staged files. Surface `findings` (file/line/pattern) to the user; tell them to remove the secrets and re-run `/backup`.
+- `sensitive_blocked_post_rename` — defense-in-depth scan caught a leak after rename. The script automatically rolls back the rename via `git checkout` and clears the journal, so the vault is restored to its pre-sync state. Surface the `findings` to the user and tell them to fix the source files before re-running `/backup`.
+- `error` — surface error; continue with next project.
+
+Collect per-project results (slug, status, conflict count, rolled-back count, sensitive-blocked status) for Step 7's report.
+
+## Step 5.6: Offer registration for unregistered current project
+
+```bash
+CWD="$(pwd -P)"
+perl "$HOME/.claude/ccpraxis/scripts/vault-sync.pl" is-registered --cwd "$CWD"
+```
+
+If `registered: true`, skip (already handled in Step 5.5).
+
+If `registered: false`, check the opt-out marker:
+
+```bash
+[ -f "$CWD/.claude/backup-skip" ] && echo "SKIP_MARKER"
+```
+
+If `SKIP_MARKER` is present, skip the offer — but **mention it in the Step 7 report** so the user remembers it's there and can delete it if they want to re-enable the prompt (fix M2 from red-team):
+
+> Skipped registration offer for `<cwd>` — `.claude/backup-skip` marker present. Delete it to re-enable the prompt.
+
+Otherwise check whether the cwd has anything worth tracking:
+
+```bash
+perl "$HOME/.claude/ccpraxis/scripts/vault-sync.pl" detect-trackable --cwd "$CWD"
+```
+
+If `trackable` is empty, skip (nothing to back up).
+
+If `trackable` is non-empty, use `AskUserQuestion`:
+
+**Question:** `"This directory has trackable Claude files but isn't registered for vault backup. Found: <list of paths from trackable>. Register now?"`
+
+**Options:**
+
+- **"Yes, register"** — invoke the `/register-for-backup` skill (use the `Skill` tool with `skill: "register-for-backup"`, empty args). Do NOT try to register manually — the skill owns the bootstrap flow.
+- **"Not now"** — skip this time. Mention they can run `/register-for-backup` later.
+- **"Don't ask again for this directory"** — create the opt-out marker so future `/backup` runs skip the offer:
+  ```bash
+  mkdir -p "$CWD/.claude" && : > "$CWD/.claude/backup-skip"
+  ```
+  Tell the user the marker was created (at `<cwd>/.claude/backup-skip`) and that they can delete it to re-enable the offer.
+
 ## Step 6: Check for missing plugins
 
 Run the plugin check script:
@@ -259,4 +395,10 @@ If `status` is `"missing_plugins"`:
 
 ## Step 7: Report
 
-Summarize: what was synced, what was merged, what was committed, whether the push succeeded, whether any marketplaces were added, and whether any plugins were installed.
+Summarize:
+
+- ccpraxis sync: what was merged, what was committed, whether the push succeeded
+- Marketplaces: any added/changed
+- Vault projects (Step 5.5): per-slug status (synced / conflicts-resolved / aborted / sensitive-blocked / error); count of files pushed/pulled per project
+- Current-project registration prompt (Step 5.6): offered? user's choice?
+- Plugins: any installed or missing

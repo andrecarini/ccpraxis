@@ -11,7 +11,7 @@ related:
 
 # Create a Todo Note
 
-Create a new todo note in the personal todo repo (`~/.claude/custom-todos/`). Todos are simple markdown notes synced across machines via git.
+Create a new todo note in the personal vault repo (`~/.claude/claude-code-vault/todos/`). Todos are simple markdown notes synced across machines via git.
 
 All file creation goes through the Perl script `todo-sync.pl` — it owns the template format. Never write the frontmatter yourself. The script auto-captures the working directory at creation time (`cwd` field in frontmatter).
 

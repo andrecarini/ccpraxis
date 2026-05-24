@@ -26,7 +26,11 @@ for pattern in "${PATTERNS[@]}"; do
     --include='*.pl' --include='*.sh' --include='*.md' --include='*.json' \
     2>/dev/null | grep -v '.gitignore' | grep -v 'sensitive-check.sh' | grep -v 'README.md' \
     | grep -v '{accessToken}' | grep -v '>{accessToken}' \
-    | grep -v 'credentials_json.*secrets\.' || true)
+    | grep -v 'credentials_json.*secrets\.' \
+    | grep -v '/vault-sync\.pl:' \
+    | grep -v '/\.claude-plans/' \
+    | grep -v '/\.claude/backup-cache/' \
+    || true)
   if [ -n "$MATCHES" ]; then
     if [ "$FOUND" -eq 0 ]; then
       echo "SENSITIVE DATA DETECTED — do NOT push until resolved:"
