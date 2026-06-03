@@ -37,7 +37,7 @@ for skill_dir in "$EXPORT_DIR"/skills/*/; do
   name="$(basename "$skill_dir")"
   SKILL_FILES="$SKILL_FILES skills/$name/SKILL.md"
 done
-CONTAINER_FILES="container-config/Dockerfile container-config/bin/claude-sandbox.sh container-config/bin/claude-sandbox.ps1 container-config/claude.json container-config/CLAUDE.md container-config/settings.json"
+CONTAINER_FILES="plugins/sandbox/container/Containerfile plugins/sandbox/bin/claude-sandbox.sh plugins/sandbox/bin/claude-sandbox.ps1 plugins/sandbox/container/claude.json plugins/sandbox/container/CLAUDE.md plugins/sandbox/container/settings.json"
 
 # Check symlinks (Unix) or content-matched copies (Windows)
 check_symlink() {
@@ -120,16 +120,16 @@ fi
 
 # Container settings — detect shared-key divergence from global-config
 echo ","
-SETTINGS_CONTAINER="$EXPORT_DIR/container-config/settings.json"
+SETTINGS_CONTAINER="$EXPORT_DIR/plugins/sandbox/container/settings.json"
 if [ -f "$SETTINGS_CONTAINER" ] && [ -f "$SETTINGS_EXPORT" ]; then
   if perl "$SCRIPT_DIR/json-diff.pl" "$SETTINGS_CONTAINER" "$SETTINGS_EXPORT" >/dev/null 2>&1; then
     DIFF="identical"
   else
     DIFF="container_settings_diverged"
   fi
-  echo "{\"file\":\"container-config/settings.json\",\"status\":\"$DIFF\",\"note\":\"shared keys vs global-config\"}"
+  echo "{\"file\":\"plugins/sandbox/container/settings.json\",\"status\":\"$DIFF\",\"note\":\"shared keys vs global-config\"}"
 elif [ -f "$SETTINGS_CONTAINER" ]; then
-  echo "{\"file\":\"container-config/settings.json\",\"status\":\"tracked\",\"note\":\"no global-config to compare\"}"
+  echo "{\"file\":\"plugins/sandbox/container/settings.json\",\"status\":\"tracked\",\"note\":\"no global-config to compare\"}"
 fi
 
 # Marketplace comparison — known_marketplaces.json

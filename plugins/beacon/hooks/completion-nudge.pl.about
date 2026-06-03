@@ -1,0 +1,1 @@
+UserPromptSubmit hook — nudges Claude to offer /beacon:off when the user signals session completion (only if a beacon exists for the current session_id)

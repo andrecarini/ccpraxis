@@ -21,6 +21,7 @@
 #   sync-project     --slug <s>
 #   resolve-conflict --slug <s> --path <p> --action use-local|use-vault|use-merged [--merged-file <f>]
 #   commit-and-push  --slug <s>
+#   sync-beacons                            (vault-root beacons/ — separate from per-project content)
 
 use strict;
 use warnings;
@@ -49,10 +50,11 @@ my $home = $ENV{HOME} // $ENV{USERPROFILE};
 die "Cannot determine home directory\n" unless $home;
 $home = norm_path($home);
 
-my $VAULT_DIR     = "$home/.claude/claude-code-vault";
-my $REGISTRY_PATH = "$VAULT_DIR/.registry-local.json";
-my $VAULT_LOCK    = "$VAULT_DIR/.lock";
-my $BRANCH        = "main";
+my $VAULT_DIR        = "$home/.claude/claude-code-vault";
+my $VAULT_BEACON_DIR = "$VAULT_DIR/beacons";
+my $REGISTRY_PATH    = "$VAULT_DIR/.registry-local.json";
+my $VAULT_LOCK       = "$VAULT_DIR/.lock";
+my $BRANCH           = "main";
 my $TMP_SUFFIX    = ".vault-sync.tmp";
 my $LOCK_STALE_SEC = 30 * 60;  # 30 minutes
 my $REGISTRY_VERSION = 1;
@@ -69,6 +71,7 @@ my @DEFAULT_TRACKABLE = qw(
     .claude-plans
     .claude-data/memory
     .claude-data/plans
+    .claude-data/backpack.json
 );
 
 # Hard-excludes — relative paths. Enforced at walk time AND at register-time.
@@ -143,6 +146,7 @@ elsif ($cmd eq 'status')            { cmd_status() }
 elsif ($cmd eq 'sync-project')      { cmd_sync_project() }
 elsif ($cmd eq 'resolve-conflict')  { cmd_resolve_conflict() }
 elsif ($cmd eq 'commit-and-push')   { cmd_commit_and_push() }
+elsif ($cmd eq 'sync-beacons')      { cmd_sync_beacons() }
 else                                { cmd_help() }
 
 exit 0;
@@ -176,6 +180,9 @@ Sync:
   sync-project     --slug <s>
   resolve-conflict --slug <s> --path <p> --action use-local|use-vault|use-merged [--merged-file <f>]
   commit-and-push  --slug <s>
+
+Beacons (vault-root data, separate from per-project content):
+  sync-beacons                          Pre-flight beacon.pl sync-vault, scan, commit + push beacons/
 EOF
 }
 
@@ -931,6 +938,18 @@ sub cmd_sync_project {
             stage_cache_only($slug, $cwd, $rel, $local_hash);
             $applied++;
             push @auto_applied, { path => $rel, action => 'cache_only' };
+        } elsif ($action eq 'delete_vault') {
+            stage_delete_vault($slug, $cwd, $rel);
+            $applied++;
+            push @auto_applied, { path => $rel, action => 'delete_vault' };
+        } elsif ($action eq 'delete_local') {
+            stage_delete_local($slug, $cwd, $rel);
+            $applied++;
+            push @auto_applied, { path => $rel, action => 'delete_local' };
+        } elsif ($action eq 'clear_cache') {
+            stage_clear_cache($slug, $cwd, $rel);
+            $applied++;
+            push @auto_applied, { path => $rel, action => 'clear_cache' };
         } elsif ($action eq 'conflict') {
             my $local_is_text = (-f $abs_local) ? is_text_file($abs_local) : 1;
             my $vault_is_text = (-f $abs_vault) ? is_text_file($abs_vault) : 1;
@@ -1059,6 +1078,7 @@ sub cmd_commit_and_push {
 
     # Pre-rename sensitive scan: check all staged .tmp files that will become vault content
     # (push ops). On hit, clean up all tmps and abort BEFORE any vault state changes.
+    # Deletion ops have no tmp/source to scan — they remove content, can't add secrets.
     my $j = journal_read($slug);
     my @push_tmps;
     for my $op (@{$j->{ops}}) {
@@ -1195,6 +1215,196 @@ sub finalize_commit {
         $out->{note} = "Committed and pushed, BUT some files were rolled back because their source changed mid-sync. Re-run sync to pick them up.";
     }
     emit_json($out);
+}
+
+# ── sync-beacons ────────────────────────────────────────────────────
+#
+# Commits + pushes vault-root beacons/ as a self-contained step. Beacons are
+# UUID-keyed JSON records written by /beacon:on (host) and ingested from
+# sandboxes by the statusline-triggered background sync. Until D9 they sat
+# orphaned from git; this subcommand bridges that gap.
+#
+# Lock order: VAULT_LOCK first (consistent with cmd_commit_and_push and
+# cmd_resolve_conflict), then beacons/.sync-vault.lock. The beacons sync lock
+# uses RAW flock to mutually exclude with statusline's beacon.pl sync-vault
+# (which also uses raw flock); vault-sync.pl's acquire_lock helper uses a
+# different protocol (metadata file + sibling .flock sentinel) and is NOT
+# mutually visible — that's why this routine opens the lock by hand.
+sub cmd_sync_beacons {
+    parse_opts(\@ARGV);  # no args — call to reject any unexpected flags
+
+    # Pre-lock guards: emit no_op without acquiring anything.
+    unless (-d "$VAULT_DIR/.git") {
+        emit_json({
+            status => 'no_op',
+            reason => 'vault not initialized on this host (no .git dir)',
+        });
+        return;
+    }
+    unless (-d $VAULT_BEACON_DIR) {
+        emit_json({
+            status => 'no_op',
+            reason => 'beacons directory does not exist',
+        });
+        return;
+    }
+
+    # Lock 1: VAULT_LOCK (acquire_lock — tracked by %HELD_LOCKS, auto-released
+    # on SIGINT/SIGTERM/END).
+    acquire_lock($VAULT_LOCK) or emit_error("Vault lock held by another session.");
+
+    # Lock 2: beacons/.sync-vault.lock (RAW flock to match beacon.pl). Held by
+    # this process via $beacon_lock_fh until cmd_sync_beacons returns; OS
+    # releases on process exit (including signal-driven exits), so explicit
+    # cleanup is best-effort but not load-bearing for correctness.
+    my $beacon_sync_lock = "$VAULT_BEACON_DIR/.sync-vault.lock";
+    open my $beacon_lock_fh, '>>', $beacon_sync_lock
+        or emit_error("Cannot open beacon sync lock $beacon_sync_lock: $!");
+
+    my $got_beacon_lock = 0;
+    for (1..100) {  # ~5s @ 50ms — matches beacon.pl's with_lock cadence
+        if (flock($beacon_lock_fh, LOCK_EX | LOCK_NB)) {
+            $got_beacon_lock = 1;
+            last;
+        }
+        select(undef, undef, undef, 0.05);
+    }
+    unless ($got_beacon_lock) {
+        close $beacon_lock_fh;
+        emit_error("Beacon sync lock held by another process after 5s wait.");
+    }
+
+    # Run the work inside an eval so a die() doesn't leak the raw flock —
+    # tighten the cleanup window before re-emitting through emit_error.
+    # Pass $beacon_lock_fh through so the pre-flight subprocess can close it
+    # in the child before exec (prevents fd inheritance into beacon.pl --no-lock).
+    my $result = eval { _sync_beacons_locked($beacon_lock_fh) };
+    my $err = $@;
+    flock($beacon_lock_fh, LOCK_UN);
+    close $beacon_lock_fh;
+
+    if ($err) {
+        chomp $err;
+        emit_error($err);
+    }
+
+    emit_json($result);
+}
+
+# Body of cmd_sync_beacons that runs while BOTH locks are held. Separated so
+# the lock-release path is exception-safe (cmd_sync_beacons evals this).
+# Takes the beacon lock fh so the pre-flight subprocess can close it in the
+# child before exec — keeps the inherited fd out of beacon.pl --no-lock.
+sub _sync_beacons_locked {
+    my $beacon_lock_fh = shift;
+
+    # Pre-flight: drain pending sandbox ingestion + refresh .global-count
+    # cache via beacon.pl sync-vault --no-lock (--no-lock skips beacon.pl's
+    # own flock since we already hold it). Failures are non-fatal — local
+    # vault records can still be committed/pushed even if ingestion broke.
+    my $beacon_script = "$home/.claude/ccpraxis/plugins/beacon/scripts/beacon.pl";
+    my ($ingested, $ingest_skipped) = (0, 0);
+    my @ingest_errors;
+    if (-f $beacon_script) {
+        # Close $beacon_lock_fh in the child before exec so beacon.pl
+        # --no-lock doesn't inherit a writable handle on the lock file. The
+        # parent (cmd_sync_beacons) keeps its own fd, so the OFD-based flock
+        # is retained throughout.
+        my ($out, $exit) = _run_capture_close_fds(
+            [$beacon_lock_fh],
+            'perl', $beacon_script, 'sync-vault', '--no-lock',
+        );
+        for my $line (split /\n/, $out // '') {
+            $ingested       = $1 + 0 if $line =~ /^INGESTED:\s*(\d+)/;
+            $ingest_skipped = $1 + 0 if $line =~ /^INGEST_SKIPPED:\s*(\d+)/;
+            push @ingest_errors, $1 if $line =~ /^INGEST_ERROR:\s*(.+)/;
+        }
+        if ($exit != 0) {
+            push @ingest_errors,
+                "beacon.pl sync-vault --no-lock exited $exit: "
+                . substr($out // '', 0, 200);
+        }
+    } else {
+        push @ingest_errors,
+            "beacon.pl not found at $beacon_script — skipping pre-flight ingestion";
+    }
+
+    # Secret scan. Beacon labels/summaries are user-or-Claude-supplied free
+    # text — scan_dir_for_secrets walks every file (extension-agnostic) and
+    # skips binaries via null-byte detection. Runs BEFORE git add so a hit
+    # leaves the vault git state untouched.
+    my $findings = scan_dir_for_secrets($VAULT_BEACON_DIR);
+    if (@$findings) {
+        return {
+            status   => 'sensitive_blocked',
+            findings => $findings,
+            note     => "Sensitive patterns detected in beacon JSONs. Vault was NOT modified by /backup. Each finding's `file` and `line` point to the offending record — edit it via /beacon:delete or directly, then re-run /backup.",
+        };
+    }
+
+    # Stage beacons/ — -A so deletions (e.g. /beacon:delete between backups)
+    # are captured. Gitignore patterns filter machine-local artifacts
+    # (.global-count, .sync-vault.lock, *.json.lock, *.tmp.<pid>).
+    unless (vault_git_ok('add', '-A', '--', 'beacons/')) {
+        die "git add failed for beacons/\n";
+    }
+
+    my $status = vault_git_output('status', '--porcelain', '--', 'beacons/');
+    my $committed = 0;
+    if (length $status) {
+        my $msg = "Sync beacons: " . iso_now();
+        unless (vault_git_ok('commit', '-m', $msg)) {
+            die "git commit failed\n";
+        }
+        $committed = 1;
+    }
+
+    # Push only when there's something to push. Covers two cases: a fresh
+    # commit just made above, AND a previous run that committed but failed
+    # to push (network/auth) — vault_ahead_behind sees the unpushed commit
+    # and we retry the push now.
+    my ($ahead, undef) = vault_ahead_behind();
+    my $pushed = 0;
+    if ($ahead > 0) {
+        unless (vault_git_ok('push', 'origin', $BRANCH)) {
+            die "git push failed\n";
+        }
+        $pushed = 1;
+    }
+
+    # Count current beacon JSONs. Read from the filesystem rather than
+    # `git ls-files` so the count matches statusline's view (which is also
+    # a directory walk). Hidden machine-local files are excluded by the
+    # leading-dot filter (so .global-count / .sync-vault.lock never count).
+    my $count = 0;
+    if (opendir(my $dh, $VAULT_BEACON_DIR)) {
+        $count = grep { /\.json$/ && !/^\./ } readdir($dh);
+        closedir($dh);
+    }
+
+    # When nothing existed and nothing happened, downgrade to no_op so the
+    # skill body can skip silently. Otherwise report synced with details.
+    if ($count == 0 && !$committed && !$pushed) {
+        my $out = {
+            status         => 'no_op',
+            reason         => 'no beacon records and nothing to push',
+            ingested       => $ingested + 0,
+            ingest_skipped => $ingest_skipped + 0,
+        };
+        $out->{ingest_errors} = \@ingest_errors if @ingest_errors;
+        return $out;
+    }
+
+    my $out = {
+        status         => 'synced',
+        count          => $count + 0,
+        committed      => $committed ? JSON::PP::true : JSON::PP::false,
+        pushed         => $pushed    ? JSON::PP::true : JSON::PP::false,
+        ingested       => $ingested + 0,
+        ingest_skipped => $ingest_skipped + 0,
+    };
+    $out->{ingest_errors} = \@ingest_errors if @ingest_errors;
+    return $out;
 }
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1360,13 +1570,35 @@ sub add_to_inventory {
 # Classify / Sync helpers
 # ═══════════════════════════════════════════════════════════════════════
 
-# Classify a tracked file based on three hashes (empty string = missing).
+# Classify a tracked file based on three hashes (empty string = missing/absent).
 sub classify {
     my ($base, $local, $vault) = @_;
     my $local_changed = $local ne $base;
     my $vault_changed = $vault ne $base;
+    my $local_missing = ($local eq '');
+    my $vault_missing = ($vault eq '');
+    my $base_existed  = ($base ne '');
 
     return 'skip' unless $local_changed || $vault_changed;
+
+    # Deletion cases (base had content; one or both sides went missing).
+    # Handle these BEFORE the push/pull cases below because push/pull assume
+    # both sides have readable content.
+    if ($base_existed && $local_missing && $vault_missing) {
+        # Both sides deleted; just clean the cache entry. No vault op needed.
+        return 'clear_cache';
+    }
+    if ($base_existed && $local_missing) {
+        # Local was deleted. If vault still matches base, propagate the deletion.
+        # If vault diverged AND local is gone, it's a conflict (user has to decide
+        # whether to restore local from vault or remove from vault too).
+        return $vault eq $base ? 'delete_vault' : 'conflict';
+    }
+    if ($base_existed && $vault_missing) {
+        # Vault was deleted (some other machine removed it). If local matches
+        # base, accept the deletion (delete local). Otherwise conflict.
+        return $local eq $base ? 'delete_local' : 'conflict';
+    }
 
     if ($local_changed && !$vault_changed) {
         return 'push';
@@ -1480,6 +1712,45 @@ sub stage_from_path {
     });
 }
 
+# Deletion stage helpers — no tmp file, just record the intent. The actual
+# unlink happens in batch_rename_all so it stays atomic alongside renames.
+sub stage_delete_vault {
+    my ($slug, $cwd, $rel) = @_;
+    my $vault_final = vault_file_path($slug, $rel);
+    my $cache_final = cache_path($cwd, $rel);
+    journal_record_op($slug, {
+        path        => $rel,
+        action      => 'delete_vault',
+        final_path  => $vault_final,
+        cache_path  => $cache_final,
+        status      => 'staged',
+    });
+}
+
+sub stage_delete_local {
+    my ($slug, $cwd, $rel) = @_;
+    my $local_final = "$cwd/$rel";
+    my $cache_final = cache_path($cwd, $rel);
+    journal_record_op($slug, {
+        path        => $rel,
+        action      => 'delete_local',
+        final_path  => $local_final,
+        cache_path  => $cache_final,
+        status      => 'staged',
+    });
+}
+
+sub stage_clear_cache {
+    my ($slug, $cwd, $rel) = @_;
+    my $cache_final = cache_path($cwd, $rel);
+    journal_record_op($slug, {
+        path        => $rel,
+        action      => 'clear_cache',
+        final_path  => $cache_final,
+        status      => 'staged',
+    });
+}
+
 sub batch_rename_all {
     my ($slug, $cwd) = @_;
     my $j = journal_read($slug);
@@ -1488,6 +1759,28 @@ sub batch_rename_all {
 
     for my $op (@{$j->{ops}}) {
         next if $op->{status} eq 'complete' || $op->{status} eq 'rolled_back';
+
+        # Deletion ops have no tmp_path; handle them first.
+        if ($op->{action} eq 'delete_vault') {
+            unlink $op->{final_path} if -f $op->{final_path};
+            unlink $op->{cache_path} if $op->{cache_path} && -f $op->{cache_path};
+            $op->{status} = 'complete';
+            push @renamed, $op->{path};
+            next;
+        }
+        if ($op->{action} eq 'delete_local') {
+            unlink $op->{final_path} if -f $op->{final_path};
+            unlink $op->{cache_path} if $op->{cache_path} && -f $op->{cache_path};
+            $op->{status} = 'complete';
+            push @renamed, $op->{path};
+            next;
+        }
+        if ($op->{action} eq 'clear_cache') {
+            unlink $op->{final_path} if -f $op->{final_path};
+            $op->{status} = 'complete';
+            push @renamed, $op->{path};
+            next;
+        }
 
         # File-modified-during-sync check: for push ops, re-hash source
         if ($op->{action} eq 'push' && -f $op->{source}) {
@@ -2269,6 +2562,38 @@ sub _run_capture_both {
     waitpid $pid, 0;
     $out //= '';
     $out =~ s/[\r\n]+\z//;  # strip ALL trailing newlines (chomp only removes one)
+    return ($out, $? >> 8);
+}
+
+sub _run_capture_close_fds {
+    # Like _run_capture but the child closes the given fds before exec. Use
+    # when the parent holds resources (open file handles backing flocks, in
+    # particular) that the child must not inherit. On Cygwin/MSYS Perl, fork
+    # inherits all fds POSIX-style, so without this the child holds extra
+    # references to the parent's lock files — behaviorally correct (the
+    # parent retains the lock through its own fd) but unhygienic and
+    # potentially confusing on Win32 Perl where flock/inheritance semantics
+    # are platform-specific.
+    my ($close_fds, @args) = @_;
+    my ($r, $w);
+    pipe $r, $w or return ('', -1);
+    my $pid = fork();
+    unless (defined $pid) { close $r; close $w; return ('', -1); }
+    if ($pid == 0) {
+        close $r;
+        close $_ for @$close_fds;
+        open STDOUT, '>&', $w;
+        open STDERR, '>', File::Spec->devnull;
+        exec { $args[0] } @args;
+        exit 127;
+    }
+    close $w;
+    local $/;
+    my $out = <$r>;
+    close $r;
+    waitpid $pid, 0;
+    $out //= '';
+    $out =~ s/[\r\n]+\z//;
     return ($out, $? >> 8);
 }
 

@@ -1,0 +1,1 @@
+Pre-flight for /backup: verifies every backtick-quoted ccpraxis path in README.md exists on disk

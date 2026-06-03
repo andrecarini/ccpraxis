@@ -12,3 +12,9 @@ deploy_key*
 .claude/backup-metadata.json
 
 .claude/backup-cache/
+
+.claude/scheduled_tasks.lock
+.claude/worktrees/
+
+# Transient pre-merge backups created by skills/backup/scripts/ccpraxis-helpers.pl settings-export-merge
+*.pre-merge.*

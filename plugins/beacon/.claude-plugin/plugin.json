@@ -1,0 +1,8 @@
+{
+  "name": "beacon",
+  "version": "0.1.0",
+  "description": "Mark Claude Code sessions as ongoing work and resume them later via the claude-beacon launcher. Bundles /beacon:on, /beacon:off, /beacon:list, /beacon:view, /beacon:delete, the shared beacon.pl + claude-beacon.pl scripts, and a UserPromptSubmit hook that nudges Claude to offer /beacon:off when the user signals session completion.",
+  "author": {
+    "name": "ccpraxis"
+  }
+}

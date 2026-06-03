@@ -1,0 +1,1 @@
+Allowlist for lint-readme-paths.pl — backtick contents that look like ccpraxis paths but are intentional non-host paths (e.g. container-internal)

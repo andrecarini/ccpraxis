@@ -1,0 +1,8 @@
+{
+  "name": "sandbox",
+  "version": "0.1.0",
+  "description": "Prepare a project for running Claude Code in an isolated rootless-Podman dev container. Discoverable as /sandbox:setup from inside a Claude session; the canonical entry point is the claude-sandbox launcher which now auto-prompts for bootstrap on first run.",
+  "author": {
+    "name": "ccpraxis"
+  }
+}

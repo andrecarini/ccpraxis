@@ -9,8 +9,12 @@
    "editorMode" : "vim",
    "effortLevel" : "xhigh",
    "enabledPlugins" : {
+      "backpack@ccpraxis-local" : true,
+      "beacon@ccpraxis-local" : true,
       "feature-dev@claude-plugins-official" : true,
-      "frontend-design@claude-plugins-official" : true
+      "frontend-design@claude-plugins-official" : true,
+      "sandbox@ccpraxis-local" : true,
+      "steward@ccpraxis-local" : true
    },
    "env" : {
       "CLAUDE_AUTO_BACKGROUND_TASKS" : "1",
@@ -28,6 +32,12 @@
       "FORCE_AUTOUPDATE_PLUGINS" : "1"
    },
    "extraKnownMarketplaces" : {
+      "ccpraxis-local" : {
+         "source" : {
+            "path" : "~/.claude/ccpraxis/plugins",
+            "source" : "directory"
+         }
+      },
       "notion-plugin-marketplace" : {
          "source" : {
             "repo" : "makenotion/claude-code-notion-plugin",
@@ -35,23 +45,51 @@
          }
       }
    },
+   "hooks" : {
+      "PreToolUse" : [
+         {
+            "hooks" : [
+               {
+                  "command" : "perl \"$HOME/.claude/ccpraxis/scripts/hooks/block-nul-redirect.pl\"",
+                  "type" : "command"
+               }
+            ],
+            "matcher" : "Bash"
+         }
+      ]
+   },
    "permissions" : {
       "allow" : [
          "Read",
+         "Skill(backup)",
+         "Skill(beacon:delete)",
+         "Skill(beacon:list)",
+         "Skill(beacon:off)",
+         "Skill(beacon:on)",
+         "Skill(beacon:view)",
          "Skill(create-plan)",
          "Skill(create-todo)",
          "Skill(manage-plans)",
          "Skill(manage-todos)",
          "Skill(resume-plan)",
          "Skill(resume-todo)",
+         "Skill(update)",
          "Bash(find *)",
          "Bash(grep *)",
          "Bash(wc *)",
          "Bash(awk *)",
          "Bash(echo *)",
+         "Bash(claude --version)",
+         "Bash(where claude*)",
+         "Bash(which claude*)",
          "Bash(git add *)",
          "Bash(git commit *)",
          "Bash(git rm *)",
+         "Bash(perl ~/.claude/ccpraxis/plugins/beacon/scripts/*)",
+         "Bash(perl ~/.claude/ccpraxis/scripts/*)",
+         "Bash(perl ~/.claude/ccpraxis/skills/backup/scripts/*)",
+         "Bash(perl ~/.claude/skills/backup/scripts/*)",
+         "Bash(bash ~/.claude/skills/backup/scripts/*)",
          "WebFetch",
          "WebSearch"
       ],
@@ -68,5 +106,8 @@
       "command" : "perl \"$HOME/.claude/ccpraxis/scripts/statusline.pl\"",
       "type" : "command"
    },
-   "useAutoModeDuringPlan" : false
+   "useAutoModeDuringPlan" : true,
+   "worktree" : {
+      "baseRef" : "fresh"
+   }
 }

@@ -2,6 +2,7 @@
 name: create-todo
 description: Creates a new todo note synced to a personal git repo. Use when the user wants to jot down a note, save a reminder, create a todo, or says things like "remind me", "save this for later", "create a todo", "note to self".
 user-invocable: true
+host-only: true
 argument-hint: <todo-name> [content]
 allowed-tools: Bash, Read, Write, Edit, AskUserQuestion, Glob
 related:

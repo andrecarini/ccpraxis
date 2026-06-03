@@ -2,6 +2,7 @@
 name: manage-todos
 description: Lists, views, creates, updates, and deletes personal todo notes. Use when the user wants to see their todos, check todo status, edit a todo, create a new todo, delete old todos, mark todos as done, or says things like "show my todos", "list todos", "delete the todo", "mark that todo done".
 user-invocable: true
+host-only: true
 argument-hint: [list|create|view|update|delete|done] [todo-name]
 allowed-tools: Bash, Read, Write, Edit, AskUserQuestion, Glob
 related:

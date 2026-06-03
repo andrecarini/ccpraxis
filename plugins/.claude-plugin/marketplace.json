@@ -1,0 +1,30 @@
+{
+  "name": "ccpraxis-local",
+  "version": "0.1.0",
+  "description": "Local ccpraxis plugin bundle. Plugins are loaded directly from the repo's plugins/ directory; no remote marketplace.",
+  "owner": {
+    "name": "ccpraxis"
+  },
+  "plugins": [
+    {
+      "name": "beacon",
+      "source": "./beacon",
+      "description": "Mark Claude Code sessions as ongoing work; resume them later via claude-beacon."
+    },
+    {
+      "name": "backpack",
+      "source": "./backpack",
+      "description": "What you pack to take into a /sandbox container. Declares tools, runtimes, and project-setup commands so they're auto-restored on every container rebuild."
+    },
+    {
+      "name": "sandbox",
+      "source": "./sandbox",
+      "description": "Prepare a project for running Claude Code in an isolated rootless-Podman dev container. Provides /sandbox:setup; the canonical entry point is the claude-sandbox launcher's auto-prompt."
+    },
+    {
+      "name": "steward",
+      "source": "./steward",
+      "description": "Meta-plugin that audits and maintains ccpraxis itself. Provides /steward:audit, which fans out read-only subagents and aggregates findings into a dated report."
+    }
+  ]
+}

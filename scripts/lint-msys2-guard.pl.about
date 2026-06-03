@@ -1,0 +1,1 @@
+Pre-flight for /backup: walks every .pl that invokes podman natively and asserts the MSYS2_ARG_CONV_EXCL=* guard is set (the bug it prevents: `;C`-suffixed bind-mount targets on Windows)

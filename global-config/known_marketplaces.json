@@ -7,7 +7,7 @@
       }
    },
    "claude-plugins-official" : {
-      "lastUpdated" : "2026-05-23T23:15:45.094Z",
+      "lastUpdated" : "2026-06-03T17:27:34.181Z",
       "source" : {
          "repo" : "anthropics/claude-plugins-official",
          "source" : "github"

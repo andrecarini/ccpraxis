@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "perl \"${CLAUDE_PLUGIN_ROOT}/hooks/completion-nudge.pl\""
+          }
+        ]
+      }
+    ]
+  }
+}

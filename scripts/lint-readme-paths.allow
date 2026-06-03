@@ -1,0 +1,13 @@
+# Allowlist for lint-readme-paths.pl — backtick contents that look like
+# ccpraxis paths but aren't host-side paths and so won't resolve on disk.
+#
+# Format: one literal per line; '#' begins a comment. Whitespace trimmed.
+# Match is exact-string against the raw backtick content (i.e. the text
+# between the backticks in README.md), not a regex.
+
+# Container-internal paths described in prose. backpack.json lives at
+# <project>/.claude-data/backpack.json on the host but appears as
+# ~/.claude/backpack.json from inside the sandbox container (the host's
+# .claude-data/ is bind-mounted at /root/.claude/ — the container runs
+# as root).
+~/.claude/backpack.json

@@ -1,0 +1,1 @@
+Symlinks (Unix) or junctions (Windows: `mklink /J`) every skills/<name>/ into ~/.claude/skills/. plan/apply modes. Called from the install protocol — handles Windows where `ln -s` silently falls back to a file copy.

@@ -1,0 +1,1 @@
+User-invoked CLI lives here; shell-native wrappers are required so users can type `claude-beacon` from any terminal.

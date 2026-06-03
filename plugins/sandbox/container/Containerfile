@@ -1,0 +1,78 @@
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    curl \
+    wget \
+    ca-certificates \
+    build-essential \
+    jq \
+    unzip \
+    openssh-client \
+    perl \
+    procps \
+    socat \
+    && rm -rf /var/lib/apt/lists/*
+
+# Container runs as root.
+#
+# Rationale: this is a rootless-Podman dev sandbox. Container UID 0 (root)
+# is mapped to the host user via Podman's user namespace, so:
+#   - Files written to bind-mounted /project come out owned by the host
+#     user on the host (no chown dance required).
+#   - "root" inside the container is not host root — a container escape
+#     would land as the unprivileged host user.
+#   - The agent gets full power inside (apt-get / npm -g / pip global etc.)
+#     without any sudo workaround.
+# We do NOT create a non-root user.
+
+# Install Claude Code via native installer (installs to /root/.local/bin)
+ARG CLAUDE_VERSION=latest
+RUN curl -fsSL https://claude.ai/install.sh | bash -s -- ${CLAUDE_VERSION}
+ENV PATH="/root/.local/bin:${PATH}"
+
+# Terminal — enable 24-bit color support (matches host terminal)
+ENV TERM=xterm-256color
+ENV COLORTERM=truecolor
+
+# Tell Claude Code this is a sandbox so it allows --dangerously-skip-permissions
+# even though the container runs as root. Without this, Claude Code refuses to
+# start with --dangerously-skip-permissions when uid=0 and the whole "full
+# autonomy" model breaks. See anthropics/claude-code#9184.
+ENV IS_SANDBOX=1
+
+# Supply chain hardening — env vars take effect whenever runtimes are installed
+ENV npm_config_ignore_scripts=true
+ENV NODE_OPTIONS="--dns-result-order=ipv4first"
+
+# Git defaults
+RUN git config --global core.autocrlf input \
+    && git config --global init.defaultBranch main
+
+WORKDIR /project
+# Entrypoint:
+#   1. Spawn socat bridges for ports 9000-9009. Each forwards 0.0.0.0:N ->
+#      127.0.0.1:N so the OAuth callback redirect from the host browser
+#      (Podman has already port-forwarded the host's 9000-9009 to the
+#      container) reaches Claude Code's loopback-bound listener. socat
+#      starts even if nothing is yet listening on 127.0.0.1:N -- early
+#      connections drop until Claude Code's listener appears, then forward
+#      cleanly. Backgrounded; children get SIGHUP and die when the bash
+#      below exits.
+#   2. Wait loop — stay alive while ANY of these holds:
+#        (a) initial 5s grace, just enough for the launcher to touch the
+#            sentinel before the loop checks it,
+#        (b) pgrep -x claude matches (a real user claude session is up), or
+#        (c) /tmp/.launcher-alive was mtime-touched in the last 120s — a
+#            launcher-managed heartbeat that keeps the container alive
+#            during long pre-claude setup (apt-get, backpack install,
+#            Node download). Sync sidecar refreshes it every 60s; the
+#            launcher itself touches it once after `podman start` and rm's
+#            it on clean exit. On launcher crash the sentinel goes stale
+#            and the container shuts down within ~2 minutes — no infinite
+#            zombie containers.
+#      The previous 15s-hard-timeout version killed the container
+#      mid-Node-install whenever the backpack pass downloaded anything
+#      heavy. socat still doesn't match the pgrep filter, so it never
+#      prolongs the loop on its own.
+ENTRYPOINT ["/bin/bash", "-c", "for p in {9000..9009}; do socat TCP-LISTEN:$p,fork,reuseaddr TCP:127.0.0.1:$p 2>/dev/null & done; START=$SECONDS; ALIVE=/tmp/.launcher-alive; HB=120; while true; do EL=$((SECONDS-START)); if [ $EL -lt 5 ]; then sleep 1; continue; fi; if pgrep -x claude > /dev/null; then sleep 3; continue; fi; if [ -f $ALIVE ]; then LAST=$(stat -c %Y $ALIVE 2>/dev/null || echo 0); NOW=$(date +%s); if [ $((NOW-LAST)) -lt $HB ]; then sleep 3; continue; fi; fi; break; done"]

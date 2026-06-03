@@ -8,6 +8,7 @@ description: >-
   finds a free port. Use when the user says "launch chrome", "start chrome puppet",
   "open browser", or needs to automate a real browser for scraping or testing.
 user-invocable: true
+host-only: true
 allowed-tools:
   - Bash
 ---

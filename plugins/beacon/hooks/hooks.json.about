@@ -1,0 +1,1 @@
+Auto-registers the UserPromptSubmit hook when the plugin is enabled (shell-form command, path via ${CLAUDE_PLUGIN_ROOT}, runs through Git Bash on Windows so `perl` resolves correctly)

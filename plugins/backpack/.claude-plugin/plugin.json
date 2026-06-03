@@ -1,0 +1,8 @@
+{
+  "name": "backpack",
+  "version": "0.1.0",
+  "description": "What you pack to take into the /sandbox container. Declares the tools, runtimes, and project-setup commands a project needs so they're automatically restored on every container rebuild. Slash commands: /backpack:add, /backpack:remove, /backpack:list, /backpack:install, /backpack:audit. A PostToolUse hook on Bash detects install commands and proposes pre-filled /backpack:add invocations the agent can decide to keep or skip.",
+  "author": {
+    "name": "ccpraxis"
+  }
+}

@@ -2,6 +2,7 @@
 name: resume-todo
 description: Loads a todo note and begins working on whatever it describes. Use when the user says "work on that todo", "pick up the todo", "resume the todo", or wants to act on a previously saved note.
 user-invocable: true
+host-only: true
 argument-hint: <todo-name>
 allowed-tools: Bash, Read, Write, Edit, AskUserQuestion, Glob
 related:

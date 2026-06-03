@@ -1,0 +1,1 @@
+Install hook — wires plugins/beacon/bin/ into user PATH (delegates to _install-bin-helper.pl)

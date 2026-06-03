@@ -1,0 +1,8 @@
+{
+  "name": "steward",
+  "version": "0.1.0",
+  "description": "Meta-plugin that audits and maintains ccpraxis itself. First skill is /steward:audit, which fans out read-only subagents (per-system red-team + code review, cross-cutting integration checks, fresh-user persona, fresh-Claude install simulator, optional test runner) and aggregates findings into a dated report under <repo>/.claude-plans/audits/.",
+  "author": {
+    "name": "ccpraxis"
+  }
+}
