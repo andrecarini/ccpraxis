@@ -285,8 +285,10 @@ ccpraxis/
 │           │   └── SKILL.md                 # Audits the ccpraxis repo itself — fans out read-only subagents (per-system re…
 │           ├── backup/
 │           │   └── SKILL.md                 # Syncs everything personal between the live host and your private repos — ccpr…
-│           └── setup-project/
-│               └── SKILL.md                 # Onboard the current project to the ccpraxis system — create the local data di…
+│           ├── setup-project/
+│           │   └── SKILL.md                 # Onboard the current project to the ccpraxis system — create the local data di…
+│           └── update/
+│               └── SKILL.md                 # /update               — safe Claude Code updater
 ├── references/
 │   ├── extending-ccpraxis.md                # Extension contract — how plugins/skills/standalone surfaces plug into ccpraxis and what each must provide
 │   └── skill-writing-guide.md               # Shared skill authoring guide (folder structure, progressive disclosure, writing tips)
@@ -321,8 +323,6 @@ ccpraxis/
     │   └── SKILL.md                         # /refresh              — reread CLAUDE.md mid-conversation
     ├── resume-todo/
     │   └── SKILL.md                         # /resume-todo          — load a todo and work on it
-    ├── update/
-    │   └── SKILL.md                         # /update               — safe Claude Code updater
     └── update-skill/
         └── SKILL.md                         # /update-skill         — modify existing skill(s)
 ```
@@ -438,14 +438,14 @@ claude-code-vault/
 
 - `CLAUDE.md` (project root) and `.claude/CLAUDE.md`
 - `.claude/skills/`, `.claude/agents/`, `.claude/hooks/`, `.claude/commands/`, `.claude/plans/`
-- `.claude-plans/` (legacy persistent plans, if any remain)
+- `<.claude-plans/>` (legacy persistent plans, if any remain in a project)
 - `.ccpraxis-local-data/blueprints/` (authored blueprints — see Blueprint plugin; the machine-local `runs/` execution state is hard-excluded)
 - `.claude-data/memory/` and `.claude-data/plans/` (sandbox state)
 - `.claude-data/backpack.json` (per-project sandbox backpack — see Backpack plugin)
 
 **Hard-excluded (never offered):** `.claude/settings.local.json`, `.claude-data/git-pat`, `.claude-data/git-askpass.sh`, `.claude-data/git-ssh-command.sh`, `deploy_key`, `.ccpraxis-local-data/blueprints/<name>/runs/`.
 
-To change what's offered by default, edit `@DEFAULT_TRACKABLE` and `%HARD_EXCLUDE_EXACT` / `@HARD_EXCLUDE_PREFIXES` at the top of `scripts/vault-sync.pl`. Per-project selection is captured at registration time in `<project>/.claude/backup-metadata.json → tracked_paths`.
+To change what's offered by default, edit `@DEFAULT_TRACKABLE` and `%HARD_EXCLUDE_EXACT` / `@HARD_EXCLUDE_PREFIXES` at the top of `plugins/steward/scripts/vault-sync.pl`. Per-project selection is captured at registration time in `<project>/.claude/backup-metadata.json → tracked_paths`.
 
 **Sync algorithm (per file):** 3-way comparison using `.claude/backup-cache/<path>` as the merge BASE (mirror of last-synced content). Auto-applies one-sided changes (push/pull/cache-only). Conflicts go through `git merge-file --diff3`; the user resolves each via `AskUserQuestion` with **Use local / Use vault / Show diff / Use merged / Abort sync** — no skip, no remember.
 

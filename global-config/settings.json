@@ -80,7 +80,7 @@
          "Skill(steward:audit)",
          "Skill(steward:backup)",
          "Skill(steward:setup-project)",
-         "Skill(update)",
+         "Skill(steward:update)",
          "Bash(find *)",
          "Bash(grep *)",
          "Bash(wc *)",

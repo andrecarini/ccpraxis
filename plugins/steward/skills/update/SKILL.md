@@ -132,7 +132,17 @@ Record the exact version number the user selects — it will be used in the inst
 
 If the user picks "Stay on vCurrent", exit — no further steps.
 
-## Step 9: Snapshot current binary (REQUIRED safety net)
+## Step 9: Back up config, then snapshot the binary (REQUIRED safety net)
+
+The user has now committed to installing a specific version (Step 8 didn't exit). Before touching the Claude Code binary, do two safety steps in this order.
+
+### 9a. Back up everything first
+
+Invoke `/steward:backup` via the **Skill** tool. This pushes the user's ccpraxis config and every vault-tracked project to their private repos, so the machine's full personal state is captured *before* a binary install that could go wrong. Wait for it to finish.
+
+If the backup fails or the user aborts it mid-way, **stop the update here** and ask whether to proceed without a backup — do not silently continue to the install.
+
+### 9b. Snapshot the live binary
 
 **Before** invoking any installer, snapshot the live Claude Code binary. This guarantees the user can revert if the installer leaves a broken binary in place (which has happened on real installs — see the Bun 1.3.14 regression of May 2026).
 
