@@ -7,7 +7,7 @@
    },
    "autoScrollEnabled" : false,
    "editorMode" : "vim",
-   "effortLevel" : "xhigh",
+   "effortLevel" : "high",
    "enabledPlugins" : {
       "backpack@ccpraxis-local" : true,
       "beacon@ccpraxis-local" : true,
