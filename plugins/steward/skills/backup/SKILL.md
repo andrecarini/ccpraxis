@@ -29,7 +29,7 @@ If remote has new commits, integrate them now so the repo is fully up to date be
 
 ```bash
 cd "$HOME/.claude/ccpraxis"
-# Stash any uncommitted local changes (from /create-skill, manual edits, etc.)
+# Stash any uncommitted local changes (from /steward:ccpraxis-extend, manual edits, etc.)
 git stash 2>&1 || true
 # Merge remote — fast-forward when possible, merge commit when diverged
 git merge origin/main --no-edit 2>&1

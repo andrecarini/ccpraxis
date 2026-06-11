@@ -31,10 +31,10 @@ Classify based on binary location and OS:
 
 Combine with OS: `windows-native`, `macos-native`, `linux-native`, `npm`, `brew`, `unknown`.
 
-**If method is NOT `windows-native`:** explain what was detected (install method, OS, binary path) and invoke `/create-skill` to extend this skill with update logic for that method:
+**If method is NOT `windows-native`:** explain what was detected (install method, OS, binary path) and invoke `/steward:ccpraxis-extend` to extend this skill with update logic for that method:
 
 ```
-/create-skill update Add an update code path for <detected-method> on <OS>. Binary is at <path>. The skill currently only handles windows-native. Add a conditional branch for this method. For reference — macOS/Linux native: `curl -fsSL https://claude.ai/install.sh | bash -s <VERSION>`, npm: `npm install -g @anthropic-ai/claude-code@<VERSION>`, brew: no version pinning. Test the new code path before finishing.
+/steward:ccpraxis-extend Change the steward:update skill: add an update code path for <detected-method> on <OS>. Binary is at <path>. The skill currently only handles windows-native. Add a conditional branch for this method. For reference — macOS/Linux native: `curl -fsSL https://claude.ai/install.sh | bash -s <VERSION>`, npm: `npm install -g @anthropic-ai/claude-code@<VERSION>`, brew: no version pinning. Test the new code path before finishing.
 ```
 
 Then exit — do not continue with the steps below.

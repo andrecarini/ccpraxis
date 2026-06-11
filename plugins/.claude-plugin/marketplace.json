@@ -24,7 +24,7 @@
     {
       "name": "steward",
       "source": "./steward",
-      "description": "Meta-plugin that audits and maintains ccpraxis itself. Provides /steward:audit, which fans out read-only subagents and aggregates findings into a dated report."
+      "description": "Meta-plugin that maintains ccpraxis itself. Provides /steward:backup (config + vault sync), /steward:setup-project (onboard a project), /steward:ccpraxis-extend (add or change skills/plugins), /steward:update (safe Claude Code updater), and /steward:audit (read-only subagent fan-out into a dated report)."
     },
     {
       "name": "blueprint",

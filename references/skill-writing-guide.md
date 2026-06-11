@@ -1,6 +1,6 @@
 # Skill Writing Guide
 
-Shared reference for authoring Claude Code skills. Read this when designing or reviewing skills in `/create-skill` or `/update-skill`.
+Shared reference for authoring Claude Code skills. Read this when designing or reviewing skills in `/steward:ccpraxis-extend`.
 
 ## Table of Contents
 
@@ -151,7 +151,7 @@ These are not in the official spec but work in practice:
 | Field | Description |
 |-------|-------------|
 | `host-only` | `true` = skill is excluded from sandbox container skill selection. |
-| `related` | YAML list of skill names that should be reviewed together when this skill is updated. Links are followed transitively by `/update-skill`. |
+| `related` | YAML list of skill names that should be reviewed together when this skill is updated. Links are followed transitively by `/steward:ccpraxis-extend` when changing a skill. |
 
 ---
 

@@ -74,9 +74,9 @@ Once installed, here's what you'll actually type day-to-day, grouped by job:
 
 **Driving a browser.** `/launch-chrome-puppet` opens a CDP-controlled Chrome via the included pure-Perl client.
 
-**Authoring or editing a skill.** `/create-skill` scaffolds new skills with auto-linking; `/update-skill` modifies existing ones.
+**Extending or changing ccpraxis.** `/steward:ccpraxis-extend` is the single entrypoint — describe what you want and it decides whether to scaffold a new skill/plugin (applying the packaging rule) or change an existing one, then wires it in (related links, settings, marketplace, README, live mirror).
 
-**Updating Claude Code.** `/update` researches releases (changelog, age, GitHub issues) and presents a risk summary before installing the exact version you pick.
+**Updating Claude Code.** `/steward:update` researches releases (changelog, age, GitHub issues) and presents a risk summary before installing the exact version you pick (backing everything up first).
 
 **Re-reading instructions mid-conversation.** `/refresh` re-reads CLAUDE.md (global + project) and summarizes the key rules. Useful when Claude has drifted from guidelines.
 
@@ -266,13 +266,13 @@ ccpraxis/
 │   │           ├── 18-multi-session-shared-state.t
 │   │           ├── 21-select-session-multiple.t
 │   │           └── 22-mountspec-edge-cases.t
-│   └── steward/                             # Meta-plugin that maintains ccpraxis and owns its backup/onboarding.
+│   └── steward/                             # Meta-plugin that maintains ccpraxis and owns its backup, onboarding, and self-e…
 │       ├── .claude-plugin/
 │       │   └── plugin.json
 │       ├── scripts/
 │       │   ├── ccpraxis-helpers.pl          # Deterministic subcommands for /backup (sync-skills, etc.) — replaces several LLM-driven prose steps with scripted ones; emits JSON the skill consumes
 │       │   ├── check-plugins.pl             # Detects missing or stale plugins vs settings.json
-│       │   ├── claude-binary-backup.pl      # Snapshot / list / restore / prune / verify / detect for the Claude Code binary — gives /update a deterministic safety net before any installer runs
+│       │   ├── claude-binary-backup.pl      # Snapshot / list / restore / prune / verify / detect for the Claude Code binary — gives /steward:update a deterministic safety net before any installer runs
 │       │   ├── filter-diff.pl               # Filters json-diff output through saved preferences
 │       │   ├── json-diff.pl                 # Semantic JSON diff (--deep-exclude, structured report)
 │       │   ├── onboard.pl                   # deterministically prepare a project to use the ccpraxis blueprint
@@ -285,10 +285,12 @@ ccpraxis/
 │           │   └── SKILL.md                 # Audits the ccpraxis repo itself — fans out read-only subagents (per-system re…
 │           ├── backup/
 │           │   └── SKILL.md                 # Syncs everything personal between the live host and your private repos — ccpr…
+│           ├── ccpraxis-extend/
+│           │   └── SKILL.md                 # THE single entrypoint for changing ccpraxis or adding new functionality to it.
 │           ├── setup-project/
 │           │   └── SKILL.md                 # Onboard the current project to the ccpraxis system — create the local data di…
 │           └── update/
-│               └── SKILL.md                 # /update               — safe Claude Code updater
+│               └── SKILL.md                 # Safely updates Claude Code by researching releases before installing.
 ├── references/
 │   ├── extending-ccpraxis.md                # Extension contract — how plugins/skills/standalone surfaces plug into ccpraxis and what each must provide
 │   └── skill-writing-guide.md               # Shared skill authoring guide (folder structure, progressive disclosure, writing tips)
@@ -303,12 +305,10 @@ ccpraxis/
 │   ├── lint-readme-paths.pl                 # Pre-flight for /backup: verifies every backtick-quoted ccpraxis path in README.md exists on disk
 │   ├── statusline.pl                        # Custom two-line status bar (model, context, rate limits)
 │   ├── todo-sync.pl                         # Vault todos: list/create/done/sync (git ops scoped to todos/)
-│   ├── update-bootstrap-monitor.pl          # /update support: versioned archive + drift check for upstream bootstrap.ps1
-│   ├── update-install.pl                    # /update support: direct-binary install pipeline (detect / manifest / install / verify)
-│   └── update-research.pl                   # /update support: fetches GitHub releases + changelog presence + symptom searches against issues
+│   ├── update-bootstrap-monitor.pl          # /steward:update support: versioned archive + drift check for upstream bootstrap.ps1
+│   ├── update-install.pl                    # /steward:update support: direct-binary install pipeline (detect / manifest / install / verify)
+│   └── update-research.pl                   # /steward:update support: fetches GitHub releases + changelog presence + symptom searches against issues
 └── skills/
-    ├── create-skill/
-    │   └── SKILL.md                         # /create-skill         — create new skill(s) with auto-linking
     ├── create-todo/
     │   └── SKILL.md                         # /create-todo          — save a todo note
     ├── launch-chrome-puppet/                # /launch-chrome-puppet — CDP browser automation
@@ -321,10 +321,8 @@ ccpraxis/
     │   └── SKILL.md                         # /manage-todos         — CRUD for personal todos
     ├── refresh/
     │   └── SKILL.md                         # /refresh              — reread CLAUDE.md mid-conversation
-    ├── resume-todo/
-    │   └── SKILL.md                         # /resume-todo          — load a todo and work on it
-    └── update-skill/
-        └── SKILL.md                         # /update-skill         — modify existing skill(s)
+    └── resume-todo/
+        └── SKILL.md                         # /resume-todo          — load a todo and work on it
 ```
 <!-- END-FILE-TREE -->
 
@@ -353,9 +351,8 @@ The orchestrator is two-phase: a bare run prints the plan and exits without touc
 - `/manage-todos` — CRUD for personal todos
 - `/resume-todo` — load a todo and work on it
 
-**Skill authoring**
-- `/create-skill` — create new skill(s) with auto-linking. `host-only`.
-- `/update-skill` — modify existing skill(s)
+**Extending ccpraxis**
+- `/steward:ccpraxis-extend` — single entrypoint to add a new skill/plugin or change an existing one; decides the shape (packaging rule) and wires it in. `host-only`.
 
 **Sandbox**
 - `/sandbox:setup` — confirm `.claude-data/` state and direct the user to run `claude-sandbox` from a terminal. `host-only`.
@@ -378,7 +375,7 @@ The orchestrator is two-phase: a bare run prints the plan and exits without touc
 - `/launch-chrome-puppet` — CDP browser automation via the included pure-Perl client
 
 **Updater**
-- `/update` — safe Claude Code updater (researches releases before installing). `host-only`.
+- `/steward:update` — safe Claude Code updater (researches releases, backs everything up, then installs the version you pick). `host-only`.
 
 **Host CLIs (not slash commands — typed in a terminal):**
 - `claude-sandbox` — launch or reattach to a project's sandbox container
@@ -509,7 +506,7 @@ Available skills for this sandbox:
 Toggle by number (comma-separated), 'a' for all, Enter to confirm:
 ```
 
-- Skills with `host-only: true` in their YAML frontmatter are excluded (e.g. `/steward:backup`, `/create-skill`, `/sandbox:setup`, `/update`)
+- Skills with `host-only: true` in their YAML frontmatter are excluded (e.g. `/steward:backup`, `/steward:ccpraxis-extend`, `/sandbox:setup`, `/steward:update`)
 - Both custom skills and plugin skills are discovered automatically
 - Selections are saved per project in `.claude-data/.launcher/selected-skills.json`
 - The picker only re-appears when new skills are detected; otherwise it uses the saved selection
