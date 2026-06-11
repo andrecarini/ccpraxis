@@ -32,6 +32,31 @@ use File::Path qw(make_path remove_tree);
 use File::Spec;
 use Getopt::Long qw(GetOptionsFromArray);
 use JSON::PP;
+use Encode qw(decode);
+
+# emit_json's structures mix char strings (source_path read from a manifest via
+# decode_json) with raw UTF-8 byte strings (the snapshot dir `path` from catfile).
+# Normalize byte strings up to chars before the ->utf8 encoder so each is encoded
+# exactly once (else the byte path double-encodes "André" -> "AndrÃ©"). NOTE: the
+# manifest-write paths are intentionally left alone — their data is all byte
+# strings (%ENV/@ARGV) written via a ':raw' handle with a utf8-off encoder, which
+# passes the bytes through unchanged (correct UTF-8 on disk).
+sub _decode_strings_recursive {
+    my $x = shift;
+    if (ref $x eq 'HASH') {
+        return { map { $_ => _decode_strings_recursive($x->{$_}) } keys %$x };
+    } elsif (ref $x eq 'ARRAY') {
+        return [ map { _decode_strings_recursive($_) } @$x ];
+    } elsif (ref $x) {
+        return $x;
+    } elsif (defined $x && !utf8::is_utf8($x)) {
+        return $x + 0 if $x =~ /^-?\d+$/;
+        return $x + 0 if $x =~ /^-?\d+\.\d+$/;
+        my $decoded = eval { decode('UTF-8', $x, Encode::FB_QUIET) };
+        return defined $decoded ? $decoded : $x;
+    }
+    return $x;
+}
 use POSIX qw(strftime);
 
 my $VERSION = '1.0.0';
@@ -104,8 +129,10 @@ sub utc_timestamp {
 
 sub emit_json {
     my ($obj) = @_;
-    my $json = JSON::PP->new->canonical->pretty;
-    print $json->encode($obj);
+    # Normalize mixed char/byte strings up to chars, then ->utf8 emits UTF-8
+    # bytes to byte-mode STDOUT — each string encoded exactly once.
+    my $json = JSON::PP->new->utf8->canonical->pretty;
+    print $json->encode(_decode_strings_recursive($obj));
 }
 
 sub die_json {

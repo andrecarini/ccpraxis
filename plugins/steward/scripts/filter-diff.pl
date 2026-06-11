@@ -27,7 +27,11 @@ unless ($prefs_file && $scope) {
     exit 2;
 }
 
-my $pretty = JSON::PP->new->pretty->canonical;
+# ->utf8 makes the encoder emit UTF-8 *bytes* (not wide chars). decode_json /
+# Encode::decode below yield utf8-flagged character strings; without ->utf8 here
+# the encoder would emit wide chars to a byte-mode STDOUT, triggering
+# "Wide character in print" and mangling non-ASCII (e.g. "André" -> "Andr?").
+my $pretty = JSON::PP->new->utf8->pretty->canonical;
 
 # Read diff from stdin
 my $diff_json = do { local $/; <STDIN> };

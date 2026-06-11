@@ -36,6 +36,27 @@ use File::Path qw(make_path remove_tree);
 use File::Spec;
 use File::Basename qw(basename dirname);
 use JSON::PP;
+use Encode qw(decode);
+
+# Output structures mix char strings (decode_json) with raw UTF-8 byte strings
+# (paths from %ENV / catfile). Normalize byte strings up to chars before the
+# ->utf8 encoder so each is encoded once (else non-ASCII paths double-encode).
+sub _decode_strings_recursive {
+    my $x = shift;
+    if (ref $x eq 'HASH') {
+        return { map { $_ => _decode_strings_recursive($x->{$_}) } keys %$x };
+    } elsif (ref $x eq 'ARRAY') {
+        return [ map { _decode_strings_recursive($_) } @$x ];
+    } elsif (ref $x) {
+        return $x;
+    } elsif (defined $x && !utf8::is_utf8($x)) {
+        return $x + 0 if $x =~ /^-?\d+$/;
+        return $x + 0 if $x =~ /^-?\d+\.\d+$/;
+        my $decoded = eval { decode('UTF-8', $x, Encode::FB_QUIET) };
+        return defined $decoded ? $decoded : $x;
+    }
+    return $x;
+}
 
 sub home_dir {
     return $ENV{HOME} if defined $ENV{HOME} && length $ENV{HOME};
@@ -52,8 +73,12 @@ sub ccpraxis_dir { return File::Spec->catdir(home_dir(), '.claude', 'ccpraxis');
 
 sub emit_json {
     my ($obj) = @_;
-    my $json = JSON::PP->new->canonical->pretty;
-    print $json->encode($obj);
+    # Normalize mixed char/byte strings up to chars, then ->utf8 to emit UTF-8
+    # bytes to byte-mode STDOUT — each string encoded exactly once. (The
+    # file-write path above is different: a utf8-off encoder feeds an
+    # ':encoding(UTF-8)' handle, which is already correct.)
+    my $json = JSON::PP->new->utf8->canonical->pretty;
+    print $json->encode(_decode_strings_recursive($obj));
 }
 
 sub die_json {

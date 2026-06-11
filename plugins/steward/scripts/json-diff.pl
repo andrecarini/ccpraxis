@@ -12,6 +12,28 @@ use strict;
 use warnings;
 use JSON::PP;
 use Getopt::Long;
+use Encode qw(decode);
+
+# The output structure mixes char strings (from decode_json) with raw UTF-8 byte
+# strings (the @ARGV file paths in left/right). Normalize byte strings up to chars
+# before the ->utf8 encoder runs, so every string is encoded exactly once. Without
+# this, byte paths containing non-ASCII (e.g. "André") double-encode to "AndrÃ©".
+sub _decode_strings_recursive {
+    my $x = shift;
+    if (ref $x eq 'HASH') {
+        return { map { $_ => _decode_strings_recursive($x->{$_}) } keys %$x };
+    } elsif (ref $x eq 'ARRAY') {
+        return [ map { _decode_strings_recursive($_) } @$x ];
+    } elsif (ref $x) {
+        return $x;
+    } elsif (defined $x && !utf8::is_utf8($x)) {
+        return $x + 0 if $x =~ /^-?\d+$/;
+        return $x + 0 if $x =~ /^-?\d+\.\d+$/;
+        my $decoded = eval { decode('UTF-8', $x, Encode::FB_QUIET) };
+        return defined $decoded ? $decoded : $x;
+    }
+    return $x;
+}
 
 my (@exclude, @deep_exclude);
 GetOptions(
@@ -24,7 +46,11 @@ unless (@ARGV == 2) {
     exit 2;
 }
 
-my $pretty    = JSON::PP->new->pretty->canonical;
+# $pretty is the STDOUT-output encoder → ->utf8 so it emits UTF-8 bytes (read_json
+# below decodes to utf8-flagged chars; without ->utf8 the encoder emits wide chars
+# to byte-mode STDOUT, mangling non-ASCII like "André"). $canonical is only used
+# for equality comparison (both sides encoded the same way), so it's left as-is.
+my $pretty    = JSON::PP->new->utf8->pretty->canonical;
 my $canonical = JSON::PP->new->canonical;
 
 sub read_json {
@@ -114,7 +140,7 @@ for my $k (sort keys %all_keys) {
 
 my $different = %only_left || %only_right || %diverged;
 
-print $pretty->encode({
+print $pretty->encode(_decode_strings_recursive({
     status        => $different ? "different" : "identical",
     left          => $left_path,
     right         => $right_path,
@@ -124,6 +150,6 @@ print $pretty->encode({
     only_left     => \%only_left,
     only_right    => \%only_right,
     diverged      => \%diverged,
-});
+}));
 
 exit($different ? 1 : 0);
