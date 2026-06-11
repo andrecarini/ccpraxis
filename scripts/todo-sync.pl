@@ -1,6 +1,6 @@
 #!/usr/bin/env perl
 # todo-sync.pl — Git sync, listing, and creation for custom todos
-# Used by /create-todo, /manage-todos, /resume-todo skills
+# Used by the todo plugin skills: /todo:create, /todo:manage, /todo:resume
 #
 # Subcommands:
 #   init <repo-url>                          Clone the todo repo from the given URL

@@ -68,7 +68,7 @@ Once installed, here's what you'll actually type day-to-day, grouped by job:
 
 **Planning a multi-session initiative.** `/blueprint:create` interrogates the objective and decomposes it into scoped packages — a durable on-disk *blueprint* — then gates it through a fresh-context auditor; `/blueprint:manage` lists, views, audits, archives, or deletes them. Inside a sandbox, the `butler` plugin executes a blueprint: `/butler:launch` spawns detached coordinator agents (one per package, with hook-enforced scope/git/ledger discipline), and `/butler:status` / `/butler:resume` monitor and recover them.
 
-**Capturing a todo.** `/create-todo` saves a note, `/resume-todo` loads one to work on, `/manage-todos` does CRUD. Todos sync via the vault.
+**Capturing a todo.** `/todo:create` saves a note, `/todo:resume` loads one to work on, `/todo:manage` does CRUD. Todos sync via the vault.
 
 **Recording tooling for sandbox rebuild.** Inside a sandbox, when you install a tool/runtime, the agent gets a pre-filled `/backpack:add` invocation from the auto-declare hook — fill in the rationale and run it. `/backpack:list`, `/backpack:remove`, `/backpack:install`, and `/backpack:audit` round out the surface. On the next container rebuild the launcher replays everything in the backpack automatically.
 
@@ -266,31 +266,41 @@ ccpraxis/
 │   │           ├── 18-multi-session-shared-state.t
 │   │           ├── 21-select-session-multiple.t
 │   │           └── 22-mountspec-edge-cases.t
-│   └── steward/                             # Meta-plugin that maintains ccpraxis and owns its backup, onboarding, and self-e…
+│   ├── steward/                             # Meta-plugin that maintains ccpraxis and owns its backup, onboarding, and self-e…
+│   │   ├── .claude-plugin/
+│   │   │   └── plugin.json
+│   │   ├── scripts/
+│   │   │   ├── ccpraxis-helpers.pl          # Deterministic subcommands for /backup (sync-skills, etc.) — replaces several LLM-driven prose steps with scripted ones; emits JSON the skill consumes
+│   │   │   ├── check-plugins.pl             # Detects missing or stale plugins vs settings.json
+│   │   │   ├── claude-binary-backup.pl      # Snapshot / list / restore / prune / verify / detect for the Claude Code binary — gives /steward:update a deterministic safety net before any installer runs
+│   │   │   ├── filter-diff.pl               # Filters json-diff output through saved preferences
+│   │   │   ├── json-diff.pl                 # Semantic JSON diff (--deep-exclude, structured report)
+│   │   │   ├── onboard.pl                   # deterministically prepare a project to use the ccpraxis blueprint
+│   │   │   ├── save-preference.pl           # Records "remember this divergence" decisions
+│   │   │   ├── sensitive-check.sh           # Scans for secrets before committing
+│   │   │   ├── sync-export.sh               # Detects drift between live config and this repo
+│   │   │   └── vault-sync.pl                # Central engine for claude-code-vault project backups.
+│   │   └── skills/
+│   │       ├── audit/
+│   │       │   └── SKILL.md                 # Audits the ccpraxis repo itself — fans out read-only subagents (per-system re…
+│   │       ├── backup/
+│   │       │   └── SKILL.md                 # Syncs everything personal between the live host and your private repos — ccpr…
+│   │       ├── ccpraxis-extend/
+│   │       │   └── SKILL.md                 # THE single entrypoint for changing ccpraxis or adding new functionality to it.
+│   │       ├── setup-project/
+│   │       │   └── SKILL.md                 # Onboard the current project to the ccpraxis system — create the local data di…
+│   │       └── update/
+│   │           └── SKILL.md                 # Safely updates Claude Code by researching releases before installing.
+│   └── todo/                                # Personal todo notes synced to your private vault repo.
 │       ├── .claude-plugin/
 │       │   └── plugin.json
-│       ├── scripts/
-│       │   ├── ccpraxis-helpers.pl          # Deterministic subcommands for /backup (sync-skills, etc.) — replaces several LLM-driven prose steps with scripted ones; emits JSON the skill consumes
-│       │   ├── check-plugins.pl             # Detects missing or stale plugins vs settings.json
-│       │   ├── claude-binary-backup.pl      # Snapshot / list / restore / prune / verify / detect for the Claude Code binary — gives /steward:update a deterministic safety net before any installer runs
-│       │   ├── filter-diff.pl               # Filters json-diff output through saved preferences
-│       │   ├── json-diff.pl                 # Semantic JSON diff (--deep-exclude, structured report)
-│       │   ├── onboard.pl                   # deterministically prepare a project to use the ccpraxis blueprint
-│       │   ├── save-preference.pl           # Records "remember this divergence" decisions
-│       │   ├── sensitive-check.sh           # Scans for secrets before committing
-│       │   ├── sync-export.sh               # Detects drift between live config and this repo
-│       │   └── vault-sync.pl                # Central engine for claude-code-vault project backups.
 │       └── skills/
-│           ├── audit/
-│           │   └── SKILL.md                 # Audits the ccpraxis repo itself — fans out read-only subagents (per-system re…
-│           ├── backup/
-│           │   └── SKILL.md                 # Syncs everything personal between the live host and your private repos — ccpr…
-│           ├── ccpraxis-extend/
-│           │   └── SKILL.md                 # THE single entrypoint for changing ccpraxis or adding new functionality to it.
-│           ├── setup-project/
-│           │   └── SKILL.md                 # Onboard the current project to the ccpraxis system — create the local data di…
-│           └── update/
-│               └── SKILL.md                 # Safely updates Claude Code by researching releases before installing.
+│           ├── create/
+│           │   └── SKILL.md                 # /todo:create          — save a todo note
+│           ├── manage/
+│           │   └── SKILL.md                 # /todo:manage          — list / view / edit / delete / done
+│           └── resume/
+│               └── SKILL.md                 # /todo:resume          — load a todo and work on it
 ├── references/
 │   ├── extending-ccpraxis.md                # Extension contract — how plugins/skills/standalone surfaces plug into ccpraxis and what each must provide
 │   └── skill-writing-guide.md               # Shared skill authoring guide (folder structure, progressive disclosure, writing tips)
@@ -309,20 +319,14 @@ ccpraxis/
 │   ├── update-install.pl                    # /steward:update support: direct-binary install pipeline (detect / manifest / install / verify)
 │   └── update-research.pl                   # /steward:update support: fetches GitHub releases + changelog presence + symptom searches against issues
 └── skills/
-    ├── create-todo/
-    │   └── SKILL.md                         # /create-todo          — save a todo note
     ├── launch-chrome-puppet/                # /launch-chrome-puppet — CDP browser automation
     │   ├── SKILL.md
     │   └── scripts/
     │       ├── chrome-puppet.pl             # Subcommand dispatcher (launch, navigate, text, etc.)
     │       └── lib/
     │           └── CDPClient.pm             # Pure-Perl WebSocket + CDP client
-    ├── manage-todos/
-    │   └── SKILL.md                         # /manage-todos         — CRUD for personal todos
-    ├── refresh/
-    │   └── SKILL.md                         # /refresh              — reread CLAUDE.md mid-conversation
-    └── resume-todo/
-        └── SKILL.md                         # /resume-todo          — load a todo and work on it
+    └── refresh/
+        └── SKILL.md                         # /refresh              — reread CLAUDE.md mid-conversation
 ```
 <!-- END-FILE-TREE -->
 
@@ -347,9 +351,9 @@ The orchestrator is two-phase: a bare run prints the plan and exits without touc
 - `/blueprint:create` — author a durable multi-package blueprint (interrogate → decompose → auditor gate)
 - `/blueprint:manage` — list, view, audit, archive, or delete blueprints
 - `/butler:launch` — execute a blueprint via detached coordinator agents (sandbox-only); `/butler:status` and `/butler:resume` monitor/recover
-- `/create-todo` — save a todo note
-- `/manage-todos` — CRUD for personal todos
-- `/resume-todo` — load a todo and work on it
+- `/todo:create` — save a todo note
+- `/todo:manage` — CRUD for personal todos
+- `/todo:resume` — load a todo and work on it
 
 **Extending ccpraxis**
 - `/steward:ccpraxis-extend` — single entrypoint to add a new skill/plugin or change an existing one; decides the shape (packaging rule) and wires it in. `host-only`.

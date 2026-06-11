@@ -16,7 +16,8 @@
       "feature-dev@claude-plugins-official" : true,
       "frontend-design@claude-plugins-official" : true,
       "sandbox@ccpraxis-local" : true,
-      "steward@ccpraxis-local" : true
+      "steward@ccpraxis-local" : true,
+      "todo@ccpraxis-local" : true
    },
    "env" : {
       "CLAUDE_AUTO_BACKGROUND_TASKS" : "1",
@@ -74,14 +75,14 @@
          "Skill(butler:launch)",
          "Skill(butler:resume)",
          "Skill(butler:status)",
-         "Skill(create-todo)",
-         "Skill(manage-todos)",
-         "Skill(resume-todo)",
          "Skill(steward:audit)",
          "Skill(steward:backup)",
          "Skill(steward:ccpraxis-extend)",
          "Skill(steward:setup-project)",
          "Skill(steward:update)",
+         "Skill(todo:create)",
+         "Skill(todo:manage)",
+         "Skill(todo:resume)",
          "Bash(find *)",
          "Bash(grep *)",
          "Bash(wc *)",

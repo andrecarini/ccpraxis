@@ -1,0 +1,8 @@
+{
+  "name": "todo",
+  "version": "0.1.0",
+  "description": "Personal todo notes synced to your private vault repo. /todo:create saves a note (auto-capturing the working directory), /todo:manage lists/views/edits/deletes/marks-done, and /todo:resume loads a note and starts working on whatever it describes. Backed by the shared scripts/todo-sync.pl engine; committed and pushed by /steward:backup.",
+  "author": {
+    "name": "ccpraxis"
+  }
+}

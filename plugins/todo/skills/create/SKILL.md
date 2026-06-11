@@ -1,13 +1,13 @@
 ---
-name: create-todo
+name: create
 description: Creates a new todo note synced to a personal git repo. Use when the user wants to jot down a note, save a reminder, create a todo, or says things like "remind me", "save this for later", "create a todo", "note to self".
 user-invocable: true
 host-only: true
-argument-hint: <todo-name> [content]
+argument-hint: "<todo-name> [content]"
 allowed-tools: Bash, Read, Write, Edit, AskUserQuestion, Glob
 related:
-  - manage-todos
-  - resume-todo
+  - manage
+  - resume
 ---
 
 # Create a Todo Note
@@ -40,7 +40,7 @@ perl ~/.claude/ccpraxis/scripts/todo-sync.pl status
 
 ### 2. Create the todo
 
-If the user provided content in the arguments, use it. If they invoked `/create-todo` with no args, ask via AskUserQuestion:
+If the user provided content in the arguments, use it. If they invoked `/todo:create` with no args, ask via AskUserQuestion:
 - What should the todo be called? (becomes the filename)
 - What do you want to capture? (becomes the content)
 - Any tags? (optional)

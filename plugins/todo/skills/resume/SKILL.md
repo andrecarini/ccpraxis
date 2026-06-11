@@ -1,13 +1,13 @@
 ---
-name: resume-todo
+name: resume
 description: Loads a todo note and begins working on whatever it describes. Use when the user says "work on that todo", "pick up the todo", "resume the todo", or wants to act on a previously saved note.
 user-invocable: true
 host-only: true
-argument-hint: <todo-name>
+argument-hint: "<todo-name>"
 allowed-tools: Bash, Read, Write, Edit, AskUserQuestion, Glob
 related:
-  - create-todo
-  - manage-todos
+  - create
+  - manage
 ---
 
 # Resume Work on a Todo
@@ -30,7 +30,7 @@ If no argument given, list open todos and ask which one.
 perl ~/.claude/ccpraxis/scripts/todo-sync.pl status
 ```
 
-If `STATUS: missing`, tell the user there are no todos yet and suggest `/create-todo` to get started (which will handle repo setup).
+If `STATUS: missing`, tell the user there are no todos yet and suggest `/todo:create` to get started (which will handle repo setup).
 
 ### 2. Pull latest
 

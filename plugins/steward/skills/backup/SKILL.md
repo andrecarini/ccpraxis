@@ -282,7 +282,7 @@ If the repo has no remote configured, commit locally and tell the user to set up
 
 ## Step 5.4: Sync todos
 
-Todos live at the vault root in `todos/` (separate from per-project content). They're written locally by `/create-todo` and `/manage-todos`, which no longer self-sync — `/steward:backup` owns committing and pushing them. Run this **before** the project syncs below, so the vault working tree is clean for their `git pull --rebase`.
+Todos live at the vault root in `todos/` (separate from per-project content). They're written locally by `/todo:create` and `/todo:manage`, which no longer self-sync — `/steward:backup` owns committing and pushing them. Run this **before** the project syncs below, so the vault working tree is clean for their `git pull --rebase`.
 
 First check the vault exists (same check as Step 5.5):
 
