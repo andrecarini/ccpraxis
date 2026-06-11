@@ -76,7 +76,7 @@
          "Skill(resume-todo)",
          "Skill(steward:audit)",
          "Skill(steward:backup)",
-         "Skill(steward:setup)",
+         "Skill(steward:setup-project)",
          "Skill(update)",
          "Bash(find *)",
          "Bash(grep *)",

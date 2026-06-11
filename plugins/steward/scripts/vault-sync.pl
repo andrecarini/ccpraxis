@@ -529,7 +529,7 @@ sub register_fresh {
         # doesn't see drift.
         vault_git_ok('reset', '--', "projects/$slug/");
         vault_git_ok('clean', '-fd', '--', "projects/$slug/");
-        emit_error("$why — register rolled back; local and vault state restored. Re-run /steward:setup to try again.");
+        emit_error("$why — register rolled back; local and vault state restored. Re-run /steward:setup-project to try again.");
     };
 
     unless (vault_git_ok('add', '--', "projects/$slug/")) {
@@ -614,7 +614,7 @@ sub register_link {
         registry_remove_project($slug);
         # Vault metadata.json was modified — restore from HEAD so the source_note we added is rolled back.
         vault_git_ok('checkout', '--', "projects/$slug/metadata.json");
-        emit_error("$why — link rolled back; local state restored. Vault is untouched. Re-run /steward:setup to try again.");
+        emit_error("$why — link rolled back; local state restored. Vault is untouched. Re-run /steward:setup-project to try again.");
     };
 
     vault_git_ok('add', '--', "projects/$slug/metadata.json")
@@ -835,7 +835,7 @@ sub cmd_status {
 # ── vault-files ─────────────────────────────────────────────────────
 
 # Lists every file in vault projects/<slug>/files/ with size. Used by the
-# /steward:setup (link mode) to preview what will be pulled
+# /steward:setup-project (link mode) to preview what will be pulled
 # before the user confirms (fix C4 from red-team).
 sub cmd_vault_files {
     my %opts = parse_opts(\@ARGV, qw(slug));

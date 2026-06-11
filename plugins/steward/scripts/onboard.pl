@@ -1,6 +1,6 @@
 #!/usr/bin/env perl
 # onboard.pl — deterministically prepare a project to use the ccpraxis blueprint
-# system. Manual (run via /steward:setup); never auto-triggered.
+# system. Manual (run via /steward:setup-project); never auto-triggered.
 #
 # Usage: onboard.pl <project-root>
 #
@@ -13,7 +13,7 @@
 #
 # Emits a JSON summary. Vault REGISTRATION of a not-yet-registered project is
 # intentionally NOT done here (it pushes to your private vault) — the summary
-# reports registered:false so /steward:setup runs the registration
+# reports registered:false so /steward:setup-project runs the registration
 # flow with you present.
 use strict;
 use warnings;

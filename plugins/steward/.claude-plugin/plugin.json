@@ -1,7 +1,7 @@
 {
   "name": "steward",
   "version": "0.1.0",
-  "description": "Meta-plugin that maintains ccpraxis and owns its backup/onboarding. /steward:backup syncs config + vault projects + beacons to your private repos (secret-scanned), and lists/reverts Claude Code binary snapshots. /steward:setup onboards the current project (local data dir + self-gitignore, migrates legacy .claude-plans into blueprints, registers for vault backup). /steward:audit fans out read-only subagents (red-team + code review, integration checks, fresh-user/fresh-Claude personas, optional test runner) into a dated report. Bundles the vault-sync engine and backup helper scripts.",
+  "description": "Meta-plugin that maintains ccpraxis and owns its backup/onboarding. /steward:backup syncs config + vault projects + beacons to your private repos (secret-scanned), and lists/reverts Claude Code binary snapshots. /steward:setup-project onboards the current project (local data dir + self-gitignore, migrates legacy .claude-plans into blueprints, registers for vault backup). /steward:audit fans out read-only subagents (red-team + code review, integration checks, fresh-user/fresh-Claude personas, optional test runner) into a dated report. Bundles the vault-sync engine and backup helper scripts.",
   "author": {
     "name": "ccpraxis"
   }

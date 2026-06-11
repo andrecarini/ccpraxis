@@ -5,7 +5,7 @@ argument-hint: (none)
 allowed-tools: Bash, Read, AskUserQuestion
 ---
 
-# /steward:setup
+# /steward:setup-project
 
 Manually onboard the **current project** to the ccpraxis system: local blueprint setup **and** vault-backup registration, end to end. Deterministic file/dir work is done by scripts; vault git/merge work goes through `vault-sync.pl`. Your job is to run them, parse JSON, and present `AskUserQuestion` for choices. Idempotent — safe to re-run.
 
@@ -90,4 +90,4 @@ perl "${CLAUDE_PLUGIN_ROOT}/scripts/vault-sync.pl" commit-and-push --slug "<slug
 ## Important
 - This is the **manual** onboarding+registration command — no auto-trigger. `/steward:backup` invokes it for an unregistered cwd; otherwise run it yourself per project.
 - **All** vault git/file/hash/merge work goes through `vault-sync.pl` — never run `git` against the vault, never `cp`/`mv`/`Write` into it, never compute hashes yourself.
-- `onboard.pl`, `bp-migrate-plans`, and the `vault-sync` subcommands are all idempotent — re-invoking `/steward:setup` won't duplicate or clobber anything.
+- `onboard.pl`, `bp-migrate-plans`, and the `vault-sync` subcommands are all idempotent — re-invoking `/steward:setup-project` won't duplicate or clobber anything.
