@@ -169,14 +169,17 @@ ccpraxis/
 │   │   │   └── bp-auditor.md                # bp-auditor agent - fresh-context completeness auditor; reads only the blueprint files and returns gaps as questions before the blueprint is handed to butler.
 │   │   ├── scripts/
 │   │   │   ├── bp-init.sh                   # ensure the ccpraxis local data root exists and self-gitignores.
-│   │   │   └── bp-lib.sh                    # shared helpers for the blueprint (authoring) plugin.
+│   │   │   ├── bp-lib.sh                    # shared helpers for the blueprint (authoring) plugin.
+│   │   │   └── bp-migrate-plans.pl          # deterministically migrate legacy .claude-plans/*.md
 │   │   ├── skills/
 │   │   │   ├── authoring-protocol/
 │   │   │   │   └── SKILL.md                 # Operating protocol for the blueprint author — the interactive Claude Code ses…
 │   │   │   ├── create/
 │   │   │   │   └── SKILL.md                 # Create a new blueprint — a durable multi-package initiative with per-package …
-│   │   │   └── manage/
-│   │   │       └── SKILL.md                 # Manage blueprint lifecycle — list all blueprints with status, view one, re-ru…
+│   │   │   ├── manage/
+│   │   │   │   └── SKILL.md                 # Manage blueprint lifecycle — list all blueprints with status, view one, re-ru…
+│   │   │   └── setup/
+│   │   │       └── SKILL.md                 # Onboard the current project to the blueprint system, deterministically — crea…
 │   │   └── templates/
 │   │       ├── blueprint.md                 # Template for a blueprint's top-level file (objective, decisions, package status table, package blocks); instantiated by /blueprint:create.
 │   │       └── package-ledger.md            # Template for a per-package ledger; its frontmatter (status/model/max_turns/write_set/test_paths) is the contract butler reads at launch.
