@@ -163,7 +163,11 @@ plugins/myplugin/
 **Optional subdirs:**
 
 - `scripts/` — internal helper scripts. Use Perl by convention; matches the rest of the repo.
-- `skills/<skill-name>/SKILL.md` — skills the plugin contributes. They surface as `/<plugin>:<skill>` in Claude Code's slash menu (e.g. `/beacon:on`). The slash-command body references shared scripts via `${CLAUDE_SKILL_DIR}` (NOT `${CLAUDE_PLUGIN_ROOT}` — that variable is not interpolated in SKILL.md content; only `${CLAUDE_SESSION_ID}` and `${CLAUDE_SKILL_DIR}` are).
+- `skills/<skill-name>/SKILL.md` — skills the plugin contributes. They surface as `/<plugin>:<skill>` in Claude Code's slash menu (e.g. `/beacon:on`). The slash-command body references shared scripts two equivalent ways, both of which resolve correctly **inside a bash code block**:
+  - **`${CLAUDE_PLUGIN_ROOT}/scripts/foo.pl`** — `CLAUDE_PLUGIN_ROOT` is a shell environment variable Claude Code sets to the plugin root when a plugin skill runs; bash expands it at execution time. Depth-independent (doesn't care how deeply the skill is nested), so it's the form steward/butler/blueprint use, and the preferred form for new plugin skills.
+  - **`${CLAUDE_SKILL_DIR}/../../scripts/foo.pl`** — `CLAUDE_SKILL_DIR` (and `${CLAUDE_SESSION_ID}`) are Claude Code *template substitutions*, replaced in SKILL.md content before it runs; the relative `../../` climbs from the skill dir to the plugin root. Used by beacon/backpack.
+
+  The distinction only bites outside a bash block: in plain prose (no shell to expand env vars) only the template substitutions resolve, so reference a path in prose with `${CLAUDE_SKILL_DIR}`, not `${CLAUDE_PLUGIN_ROOT}`.
 - `bin/` — user-invocable CLI wrappers. Shell-native (`.sh` + `.ps1`). Tiny shims that exec into Perl logic in `scripts/`.
 - `ccpraxis-install.pl` — only if the plugin needs install-time work (most often: wire `bin/` into PATH).
 
