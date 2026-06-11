@@ -149,6 +149,7 @@ if    ($cmd eq 'init')              { cmd_init() }
 elsif ($cmd eq 'propose-slugs')     { cmd_propose_slugs() }
 elsif ($cmd eq 'detect-trackable')  { cmd_detect_trackable() }
 elsif ($cmd eq 'is-registered')     { cmd_is_registered() }
+elsif ($cmd eq 'ensure-tracked')    { cmd_ensure_tracked() }
 elsif ($cmd eq 'register')          { cmd_register() }
 elsif ($cmd eq 'unregister')        { cmd_unregister() }
 elsif ($cmd eq 'list-projects')     { cmd_list_projects() }
@@ -184,6 +185,7 @@ Discovery:
 Registration:
   register --fresh --cwd <path> --slug <s> --files <comma-list>
   register --link  --cwd <path> --slug <s>
+  ensure-tracked   --slug <s> --path <rel>   (idempotent local add to tracked_paths)
   unregister       --slug <s>
   list-projects
   list-orphans
@@ -342,6 +344,45 @@ sub cmd_detect_trackable {
     emit_json({
         cwd       => $cwd,
         trackable => \@found,
+    });
+}
+
+# ── ensure-tracked ──────────────────────────────────────────────────
+# Idempotently add a relative path to a registered project's LOCAL tracked_paths
+# (.claude/backup-metadata.json), which is what sync-project walks. Local-only by
+# design: no vault git writes, so it can't cause vault drift and needs no network.
+# The path's files get copied into the vault on the next /backup. Use case: a new
+# default-tracked path (e.g. .ccpraxis-local-data/blueprints) added after a project
+# was already registered — the per-project tracked_paths is frozen at registration,
+# so changing @DEFAULT_TRACKABLE alone doesn't reach existing projects.
+sub cmd_ensure_tracked {
+    my %opts = parse_opts(\@ARGV, qw(slug path));
+    my $slug = require_opt(\%opts, 'slug');
+    my $path = require_opt(\%opts, 'path');
+    emit_error("--path must be a relative path inside the project") unless validate_relative_path($path);
+
+    my $reg   = read_registry();
+    my $entry = $reg->{projects}{$slug};
+    emit_error("Slug '$slug' is not registered on this machine.") unless $entry;
+
+    my $pmpath = project_metadata_path($entry->{path});
+    emit_error("Project metadata missing at $pmpath") unless -f $pmpath;
+    my $pmeta = read_json($pmpath);
+    my @tp = @{ $pmeta->{tracked_paths} // [] };
+
+    if (grep { $_ eq $path } @tp) {
+        emit_json({ status => 'already_tracked', slug => $slug, path => $path, tracked_paths => \@tp });
+        return;
+    }
+    push @tp, $path;
+    $pmeta->{tracked_paths} = \@tp;
+    write_json($pmpath, $pmeta);
+    emit_json({
+        status        => 'tracked_added',
+        slug          => $slug,
+        path          => $path,
+        tracked_paths => \@tp,
+        note          => "Added to this machine's project metadata; backed up on the next /backup. Vault-side metadata (cross-machine restore hints) is updated by the normal register/link flow.",
     });
 }
 
