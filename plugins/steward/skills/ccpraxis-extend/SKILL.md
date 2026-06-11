@@ -114,7 +114,11 @@ Only the steps that apply to what you touched:
 
 2. **Settings permission.** For a user-invocable skill, add an allow entry so it doesn't prompt — `Skill(<name>)` for a bare skill, `Skill(<plugin>:<verb>)` for a plugin skill — to the repo source `global-config/settings.json` (and the live `~/.claude/settings.json` so it takes effect now). Keep the list alphabetical.
 
-3. **New plugin only:** register it in `plugins/.claude-plugin/marketplace.json` (`{"name","source":"./<name>","description"}`) and enable it — add `"<name>@ccpraxis-local": true` to `enabledPlugins` in **both** `global-config/settings.json` and `~/.claude/settings.json`. If you added a skill to an existing plugin, update that plugin's `plugin.json` description so it stays accurate.
+3. **New plugin only:** register it in `plugins/.claude-plugin/marketplace.json` (`{"name","source":"./<name>","description"}`) and enable it — add `"<name>@ccpraxis-local": true` to `enabledPlugins` in **both** `global-config/settings.json` and `~/.claude/settings.json`. Then **install it yourself** so it's cached and recorded in `installed_plugins.json` like the other ccpraxis plugins — don't leave the user a manual `/plugin install`:
+   ```bash
+   claude plugin install <name>@ccpraxis-local
+   ```
+   (`claude` is the host CLI; run it from Bash. It copies the plugin into `~/.claude/plugins/cache/` and records it, so the plugin persists across restarts. Enabling in `enabledPlugins` alone is not enough — without the install record a fresh session may not load it.) If you instead added a skill to an **existing** plugin, skip the install and just update that plugin's `plugin.json` description so it stays accurate.
 
 4. **README.** It's generated — never hand-edit the file tree. Run, in order:
    ```bash
@@ -128,7 +132,7 @@ Only the steps that apply to what you touched:
    ```bash
    perl ${CLAUDE_PLUGIN_ROOT}/scripts/ccpraxis-helpers.pl sync-skills
    ```
-   Plugins load live from the repo via the marketplace — no mirror. A **new plugin** or newly-enabled plugin only registers after `/reload-plugins` or a restart; tell the user.
+   Plugins load live from the repo via the marketplace — no mirror. A **new plugin** (already installed in step 3, so it persists) becomes active in the *current* session only after `/reload-plugins` or a restart; tell the user to run `/reload-plugins`.
 
 ## Step 5 — Validate + self-review
 
