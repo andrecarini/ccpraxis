@@ -264,12 +264,16 @@ ccpraxis/
 │   │           ├── 18-multi-session-shared-state.t
 │   │           ├── 21-select-session-multiple.t
 │   │           └── 22-mountspec-edge-cases.t
-│   └── steward/                             # Meta-plugin that audits and maintains ccpraxis itself.
+│   └── steward/                             # Meta-plugin that audits and maintains ccpraxis, and onboards projects to it.
 │       ├── .claude-plugin/
 │       │   └── plugin.json
+│       ├── scripts/
+│       │   └── onboard.pl                   # deterministically prepare a project to use the ccpraxis blueprint
 │       └── skills/
-│           └── audit/
-│               └── SKILL.md                 # Audits the ccpraxis repo itself — fans out read-only subagents (per-system re…
+│           ├── audit/
+│           │   └── SKILL.md                 # Audits the ccpraxis repo itself — fans out read-only subagents (per-system re…
+│           └── setup/
+│               └── SKILL.md                 # Onboard the current project to the ccpraxis blueprint system — create the loc…
 ├── references/
 │   ├── extending-ccpraxis.md                # Extension contract — how plugins/skills/standalone surfaces plug into ccpraxis and what each must provide
 │   └── skill-writing-guide.md               # Shared skill authoring guide (folder structure, progressive disclosure, writing tips)
