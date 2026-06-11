@@ -13,7 +13,7 @@
 #
 # Emits a JSON summary. Vault REGISTRATION of a not-yet-registered project is
 # intentionally NOT done here (it pushes to your private vault) — the summary
-# reports registered:false so /steward:setup can run the register-for-backup
+# reports registered:false so /steward:setup runs the registration
 # flow with you present.
 use strict;
 use warnings;

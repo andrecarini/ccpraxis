@@ -1,37 +1,93 @@
 ---
 name: setup
-description: Onboard the current project to the ccpraxis blueprint system — create the local data dir + self-gitignore, migrate any legacy .claude-plans into blueprints, and (with you present) register the project for vault backup so its blueprints sync across machines. Manual and idempotent; re-runnable any time. Use when starting to use blueprints or backup in a project, or when the user says "set up this project", "onboard this project", "steward setup", or "migrate my plans here".
+description: Onboard the current project to the ccpraxis system — create the local data dir + self-gitignore, migrate any legacy .claude-plans into blueprints, and register the project for vault backup (detect trackables, pick a slug, initial sync; or link/restore an existing vault slug from another machine). Manual, idempotent, host-side. Use when starting to use blueprints or backup in a project, or when the user says "set up this project", "onboard this project", "steward setup", "register for backup", "back up this project", "link to vault", "restore from vault", or "migrate my plans here".
 argument-hint: (none)
-allowed-tools: Bash, Read, AskUserQuestion, Skill
+allowed-tools: Bash, Read, AskUserQuestion
 ---
 
 # /steward:setup
 
-Manually onboard the **current project** to the ccpraxis system. All file/dir work is done by a deterministic script — your job is to run it, report, and (only for vault registration) confirm. Idempotent: safe to re-run.
+Manually onboard the **current project** to the ccpraxis system: local blueprint setup **and** vault-backup registration, end to end. Deterministic file/dir work is done by scripts; vault git/merge work goes through `vault-sync.pl`. Your job is to run them, parse JSON, and present `AskUserQuestion` for choices. Idempotent — safe to re-run.
 
-Determine the **project root**: `git rev-parse --show-toplevel` (fallback: cwd; confirm with the user if ambiguous after prior `cd`s).
+Determine the **project root** / `PROJECT_CWD`: `git rev-parse --show-toplevel` (fallback: `pwd -P`; confirm with the user if ambiguous after prior `cd`s). All `vault-sync.pl` calls take `--cwd "$PROJECT_CWD"`.
 
-## 1. Run the deterministic onboarder
+## 1. Local setup (data dir, gitignore, plan migration)
 ```
-perl "${CLAUDE_PLUGIN_ROOT}/scripts/onboard.pl" "<root>"
+perl "${CLAUDE_PLUGIN_ROOT}/scripts/onboard.pl" "$PROJECT_CWD"
 ```
-It (idempotently, locally — no vault writes): creates `<root>/.ccpraxis-local-data/blueprints/` + self-gitignore, migrates any legacy `.claude-plans/*.md` into blueprints (archive-style, originals removed), and — if the project is already vault-registered — ensures `.ccpraxis-local-data/blueprints` is in its `tracked_paths`.
+Idempotent, local-only: creates `.ccpraxis-local-data/blueprints/` + self-gitignore, migrates any legacy `.claude-plans/*.md` into blueprints (archive-style, originals removed), and — **if already registered** — ensures `.ccpraxis-local-data/blueprints` is tracked. Parse the JSON; tell the user: data dir created/existing, plans migrated (`migration.wrote`/`deleted`), and `registered`.
 
-Parse the JSON summary and tell the user concisely: data dir created vs existing, how many plans were migrated (`migration.wrote`/`deleted`), and the registration status.
+- If `registered: true` → blueprints are now tracked; tell the user to run `/backup` to sync. **Done.**
+- If `registered: false` → continue to registration (steps 2+).
 
-## 2. Vault registration (host only; needs you present)
-Skip this step inside a sandbox (the vault is host-side) — say so and stop.
+## 2. Registration — preconditions (host only)
+Skip everything below inside a sandbox (the vault is host-side) — say so and stop.
 
-- If `registered: true` in the summary → blueprints are now tracked; report done.
-- If `registered: false` → the project's blueprints are **local-only, not backed up**. First check the opt-out marker:
-  ```
-  [ -f "<root>/.claude/backup-skip" ] && echo SKIP
-  ```
-  If `SKIP`, mention the marker (and that deleting it re-enables the offer) and stop.
-  Otherwise ask the user (registration commits + pushes this project's Claude files to your private vault):
-  - **"Register for backup"** → invoke the `register-for-backup` skill via the Skill tool (empty args). It owns slug selection, file detection (incl. `.ccpraxis-local-data/blueprints` via the default trackables), orphan-linking, and the vault push. Don't register by hand.
-  - **"Not now"** → note they can re-run `/steward:setup` later, or drop a `.claude/backup-skip` marker to stop being asked.
+Vault must exist:
+```bash
+[ -d "$HOME/.claude/claude-code-vault/.git" ] && echo VAULT_OK || echo VAULT_MISSING
+```
+If `VAULT_MISSING` → tell the user the vault isn't initialized; run `/backup` first (it prompts for the vault repo URL). Stop.
 
-## Notes
-- This is the **manual** onboarding command — there is intentionally no auto-trigger. Run it per project when you want to start using blueprints/backup there.
-- Deterministic + idempotent: `onboard.pl` and the scripts it calls (`bp-migrate-plans`, `vault-sync ensure-tracked`) are all safe to re-run; re-invoking `/steward:setup` won't duplicate or clobber anything.
+Honor the opt-out marker:
+```bash
+[ -f "$PROJECT_CWD/.claude/backup-skip" ] && echo SKIP
+```
+If `SKIP` → mention the marker (delete it to re-enable) and stop without registering.
+
+## 3. Restore vs fresh (orphan discovery)
+```
+perl "$HOME/.claude/ccpraxis/scripts/vault-sync.pl" list-orphans
+```
+If `orphans` is non-empty, present them via `AskUserQuestion` (one option per orphan — label = slug; description = `"created <created_at>, last from <source_notes[0].basename> on <source_notes[0].machine>, <file_count> files, <KB> KB"`), plus a final **"Create new registration"** option.
+- Orphan picked → **link mode** (3a).
+- "Create new registration" / no orphans → **fresh mode** (3b).
+
+### 3a. Link mode (restore from another machine)
+```
+perl "$HOME/.claude/ccpraxis/scripts/vault-sync.pl" register --link --cwd "$PROJECT_CWD" --slug "<slug>"
+```
+On `error` → surface, stop. On `registered_link` → **preview before first sync** (it writes vault files into the project, overwriting on conflict):
+```
+perl "$HOME/.claude/ccpraxis/scripts/vault-sync.pl" vault-files --slug "<slug>"
+```
+Show paths+sizes; note that files only in vault auto-appear and same-path local files become conflicts. `AskUserQuestion`: **Proceed** → step 4; **Cancel — unregister** → `vault-sync.pl unregister --slug "<slug>"`, report rollback, stop.
+
+### 3b. Fresh mode
+```
+perl "$HOME/.claude/ccpraxis/scripts/vault-sync.pl" detect-trackable --cwd "$PROJECT_CWD"
+```
+If `trackable` empty → report none found, stop. Else present each via `AskUserQuestion` `multiSelect: true` (label = `path`, description = `"<type>, <size>"`), all pre-selected. If user deselects all → abort. Then propose slugs:
+```
+perl "$HOME/.claude/ccpraxis/scripts/vault-sync.pl" propose-slugs --cwd "$PROJECT_CWD"
+```
+Offer `candidates` via `AskUserQuestion` (Other = custom slug). Register (comma-join selected paths):
+```
+perl "$HOME/.claude/ccpraxis/scripts/vault-sync.pl" register --fresh --cwd "$PROJECT_CWD" --slug "<slug>" --files "<files>"
+```
+On slug-collision `error` → tell user the slug is taken, re-run with a different one. On `registered_fresh` → step 4.
+
+## 4. Initial sync
+```
+perl "$HOME/.claude/ccpraxis/scripts/vault-sync.pl" sync-project --slug "<slug>"
+```
+Capture `session_id`. `drift`/`error` → surface, stop. `synced` → if `conflicts` empty, go to step 5; else resolve each (step 4a). Mention non-empty `skipped_symlinks`/`skipped_bad_paths`.
+
+### 4a. Conflict loop
+Per conflict, `AskUserQuestion`: **Use local** / **Use vault** (always); **Show diff** + **Use merged** (only if `is_text` / `merge_result.exit_code==0`); **Abort sync** (last; discards this session's resolutions, no commit). Binary files: offer only Use local / Use vault / Abort.
+```
+perl "$HOME/.claude/ccpraxis/scripts/vault-sync.pl" resolve-conflict --slug "<slug>" --path "<path>" --action <use-local|use-vault|use-merged> --session-id "<session_id>" [--merged-file "<tmp_path>"]
+```
+
+## 5. Commit + push
+```
+perl "$HOME/.claude/ccpraxis/scripts/vault-sync.pl" commit-and-push --slug "<slug>" --session-id "<session_id>"
+```
+- `committed_and_pushed` → "Registered `<slug>` and synced." Mention any `rolled_back_during_sync`. Future syncs go through `/backup`.
+- `sensitive_blocked` / `sensitive_blocked_post_rename` → surface `findings`; tell the user to fix the source and re-run. Vault not pushed.
+- `error` → surface, stop.
+
+## Important
+- This is the **manual** onboarding+registration command — no auto-trigger. `/backup` invokes it for an unregistered cwd; otherwise run it yourself per project.
+- **All** vault git/file/hash/merge work goes through `vault-sync.pl` — never run `git` against the vault, never `cp`/`mv`/`Write` into it, never compute hashes yourself.
+- `onboard.pl`, `bp-migrate-plans`, and the `vault-sync` subcommands are all idempotent — re-invoking `/steward:setup` won't duplicate or clobber anything.

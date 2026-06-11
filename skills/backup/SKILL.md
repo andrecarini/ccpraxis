@@ -435,8 +435,8 @@ If `trackable` is non-empty, use `AskUserQuestion`:
 
 **Options:**
 
-- **"Yes, register"** — invoke the `/register-for-backup` skill (use the `Skill` tool with `skill: "register-for-backup"`, empty args). Do NOT try to register manually — the skill owns the bootstrap flow.
-- **"Not now"** — skip this time. Mention they can run `/register-for-backup` later.
+- **"Yes, register"** — invoke the `/steward:setup` skill (use the `Skill` tool with `skill: "steward:setup"`, empty args). Do NOT try to register manually — the skill owns the bootstrap flow.
+- **"Not now"** — skip this time. Mention they can run `/steward:setup` later.
 - **"Don't ask again for this directory"** — create the opt-out marker so future `/backup` runs skip the offer:
   ```bash
   mkdir -p "$CWD/.claude" && : > "$CWD/.claude/backup-skip"

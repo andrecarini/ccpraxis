@@ -48,7 +48,7 @@ Optional:
 4. **Stay at the terminal during install.** Claude will hit two confirmation gates that need your input: a settings-diff prompt (if you already have a `~/.claude/settings.json`) and an install-plan review for PATH changes. Both take a few seconds each.
 5. Then restart Claude Code.
 
-After install, `/backup` keeps everything in sync. To track a specific project's Claude files in the vault, `cd` into it and run `/register-for-backup` (or accept the prompt that `/backup` shows when you're inside an unregistered project with Claude files).
+After install, `/backup` keeps everything in sync. To track a specific project's Claude files in the vault, `cd` into it and run `/steward:setup` (or accept the prompt that `/backup` shows when you're inside an unregistered project with Claude files).
 
 ### Daily use
 
@@ -56,7 +56,7 @@ Once installed, here's what you'll actually type day-to-day, grouped by job:
 
 **Syncing your config and personal state across machines.** Run `/backup` from anywhere. It pushes drift between your live `~/.claude/` and the ccpraxis repo, then iterates every registered vault project and syncs them too. If you're inside a project that has Claude files but isn't tracked yet, it offers to register it.
 
-**Adding a new project to your personal vault.** `cd` into the project and run `/register-for-backup`. The skill picks a slug, lets you confirm which files to track, and does an initial sync. On a fresh machine, the same command surfaces vault-only "orphan" projects so you can link the local directory back to existing vault state.
+**Adding a new project to your personal vault.** `cd` into the project and run `/steward:setup`. The skill picks a slug, lets you confirm which files to track, and does an initial sync. On a fresh machine, the same command surfaces vault-only "orphan" projects so you can link the local directory back to existing vault state.
 
 **Starting work in a new project that needs dev tooling.** Exit Claude, then run `claude-sandbox` from a terminal in the project root. On first launch it walks you through bootstrap interactively (image build, git auth, `.claude-data/` setup) then drops you into a containerized Claude session. From inside an existing Claude session, `/sandbox:setup` does the same check and tells you what to do next — it can't run the bootstrap itself because the prompts need the controlling tty.
 
@@ -87,7 +87,7 @@ Once installed, here's what you'll actually type day-to-day, grouped by job:
 - **Container rules:** Edit `plugins/sandbox/container/CLAUDE.md` in the repo for in-container behavior.
 - **Statusline:** Edit `scripts/statusline.pl` in the repo to customize the status bar output.
 
-For tweaking what `/register-for-backup` offers by default, see Vault sync in the Reference Manual.
+For tweaking what `/steward:setup` offers by default, see Vault sync in the Reference Manual.
 
 ### Staying up to date
 
@@ -273,7 +273,7 @@ ccpraxis/
 │           ├── audit/
 │           │   └── SKILL.md                 # Audits the ccpraxis repo itself — fans out read-only subagents (per-system re…
 │           └── setup/
-│               └── SKILL.md                 # Onboard the current project to the ccpraxis blueprint system — create the loc…
+│               └── SKILL.md                 # Onboard the current project to the ccpraxis system — create the local data di…
 ├── references/
 │   ├── extending-ccpraxis.md                # Extension contract — how plugins/skills/standalone surfaces plug into ccpraxis and what each must provide
 │   └── skill-writing-guide.md               # Shared skill authoring guide (folder structure, progressive disclosure, writing tips)
@@ -318,8 +318,6 @@ ccpraxis/
     │   └── SKILL.md                         # /manage-todos         — CRUD for personal todos
     ├── refresh/
     │   └── SKILL.md                         # /refresh              — reread CLAUDE.md mid-conversation
-    ├── register-for-backup/
-    │   └── SKILL.md                         # /register-for-backup  — bootstrap a project for vault backup (orphan discovery, slug pick, initial sync)
     ├── resume-todo/
     │   └── SKILL.md                         # /resume-todo          — load a todo and work on it
     ├── update/
@@ -343,7 +341,7 @@ The orchestrator is two-phase: a bare run prints the plan and exits without touc
 
 **Config and sync**
 - `/backup` — sync ccpraxis config + every registered vault project (drift detection, AI-assisted conflict merge, secret scan, push). `host-only`.
-- `/register-for-backup` — bootstrap a project for vault backup (orphan discovery, slug pick, initial sync). `host-only`.
+- `/steward:setup` — bootstrap a project for vault backup (orphan discovery, slug pick, initial sync). `host-only`.
 - `/refresh` — re-read all CLAUDE.md files and summarize key rules.
 
 **Planning and todos**
@@ -415,7 +413,7 @@ Bidirectional sync between your live `~/.claude/` config and your ccpraxis repo:
 8. Commits and pushes (pulls first to avoid conflicts)
 9. **Iterates every registered vault project** — runs the full sync engine for each (see Vault Sync below), surfacing conflicts interactively
 10. **Syncs vault-root beacons** — commits and pushes `beacons/<uuid>.json` records (ingesting any pending sandbox beacons first), with the same secret-scan defense as project content; see the Beacon plugin below for the lifecycle
-11. **Offers registration for the current project** if it has Claude files but isn't tracked yet — `Yes` invokes `/register-for-backup`, `Not now` defers, `Don't ask again` writes a `.claude/backup-skip` opt-out marker
+11. **Offers registration for the current project** if it has Claude files but isn't tracked yet — `Yes` invokes `/steward:setup`, `Not now` defers, `Don't ask again` writes a `.claude/backup-skip` opt-out marker
 
 ### Vault sync
 
@@ -458,7 +456,7 @@ To change what's offered by default, edit `@DEFAULT_TRACKABLE` and `%HARD_EXCLUD
 - File-modified-during-sync rollback (re-hash before final rename)
 - Path safety (no `..`, no absolute paths, no backslashes; symlinks skipped via `File::Find` preprocess)
 
-**Restore on a fresh machine:** clone ccpraxis, run vault init, then `/register-for-backup` inside a project. The skill calls `list-orphans` first; if a slug already exists in the vault from another machine, it offers to link this directory to it — first sync then pulls all vault content locally.
+**Restore on a fresh machine:** clone ccpraxis, run vault init, then `/steward:setup` inside a project. The skill calls `list-orphans` first; if a slug already exists in the vault from another machine, it offers to link this directory to it — first sync then pulls all vault content locally.
 
 ### Sandbox
 
@@ -721,7 +719,7 @@ git remote add upstream https://github.com/andrecarini/ccpraxis.git
 perl ~/.claude/ccpraxis/scripts/vault-sync.pl init --url "<vault-url>"
 ```
 
-The init is cwd-agnostic — it clones to a fixed location (`~/.claude/claude-code-vault/`) regardless of where you run it from. If the vault is empty, the init scaffolds `README.md`, `.gitignore` (locks, journal, tmps, machine-local registry), `.gitattributes` (`* -text` to defeat CRLF normalization), and `todos/.gitkeep`, then commits and pushes. It does NOT pre-create `beacons/` or `projects/<slug>/` — those land lazily on first use (a `/beacon:on` will materialize `beacons/`; a `/register-for-backup` will materialize `projects/<slug>/`). If the vault is already populated (e.g. from another machine), the clone preserves its contents.
+The init is cwd-agnostic — it clones to a fixed location (`~/.claude/claude-code-vault/`) regardless of where you run it from. If the vault is empty, the init scaffolds `README.md`, `.gitignore` (locks, journal, tmps, machine-local registry), `.gitattributes` (`* -text` to defeat CRLF normalization), and `todos/.gitkeep`, then commits and pushes. It does NOT pre-create `beacons/` or `projects/<slug>/` — those land lazily on first use (a `/beacon:on` will materialize `beacons/`; a `/steward:setup` will materialize `projects/<slug>/`). If the vault is already populated (e.g. from another machine), the clone preserves its contents.
 
 If the user didn't provide a vault URL, skip this step — they can run the init later.
 
