@@ -1,6 +1,6 @@
 ---
 name: audit
-description: Audits the ccpraxis repo itself — fans out read-only subagents (per-system red-team + code review, cross-cutting integration checks, fresh-user persona, fresh-Claude install simulator, sandbox-gated test runner) and aggregates their findings into a dated report at `<repo>/.claude-plans/audits/<ISO-timestamp>.md`. User-invocable only (no proactive triggering) — invoke when the user explicitly runs `/steward:audit`, typically as a health check before releasing changes to ccpraxis's skills, plugins, or integration surface.
+description: Audits the ccpraxis repo itself — fans out read-only subagents (per-system red-team + code review, cross-cutting integration checks, fresh-user persona, fresh-Claude install simulator, sandbox-gated test runner) and aggregates their findings into a dated report at `<repo>/.ccpraxis-local-data/audits/<ISO-timestamp>.md`. User-invocable only (no proactive triggering) — invoke when the user explicitly runs `/steward:audit`, typically as a health check before releasing changes to ccpraxis's skills, plugins, or integration surface.
 user-invocable: true
 allowed-tools: Bash
 ---
@@ -21,7 +21,7 @@ The persistent plan (migrated to the archived blueprint `.ccpraxis-local-data/bl
    - **Fresh-user persona** restricted to README + top-level CLAUDE.md + skill descriptions only — must NOT read implementation files.
    - **Fresh-Claude install simulator** given the README's "Instructions for Claude" section plus a fixture prompt; produces a step-by-step walkthrough WITHOUT running or writing anything.
    - **Test runner** (sandbox-only) discovers and runs any tests in the repo.
-4. **Aggregate** — write the combined report to `<repo>/.claude-plans/audits/<ISO-timestamp>.md` and print a one-screen summary with severity counts and section anchors.
+4. **Aggregate** — write the combined report to `<repo>/.ccpraxis-local-data/audits/<ISO-timestamp>.md` (machine-local, gitignored, vault-synced — same root as `blueprints/`) and print a one-screen summary with severity counts and section anchors.
 
 All subagents are read-only (no `Edit`/`Write`/destructive `Bash`) except the test runner, which is sandbox-gated.
 
