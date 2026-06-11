@@ -6,7 +6,7 @@ A curated [Claude Code](https://docs.anthropic.com/en/docs/claude-code) configur
 - **Global instructions** — supply chain security rules, response style, dev tooling restrictions
 - **Custom statusline** — model, context usage, token counts, plan rate limits with reset timers
 - **Config sync** (`/backup`) — bidirectional drift detection, AI-assisted conflict merging, secret scanning
-- **Vault sync** — a private `claude-code-vault` git repo backs up todos and project-scoped Claude files (CLAUDE.md, skills, plans, memory) across machines, with 3-way merge, locking, journaling, atomic staging, and a pre-rename secret scan
+- **Vault sync** — a private `claude-code-vault` git repo backs up todos and project-scoped Claude files (CLAUDE.md, skills, blueprints, memory) across machines, with 3-way merge, locking, journaling, atomic staging, and a pre-rename secret scan
 - **Podman sandbox** (`claude-sandbox`) — isolated rootless containers with full Claude autonomy, interactive skill selection, blocked install hooks, 7-day package age minimum
 - **Backpack plugin** — per-project declarative manifest of tools/runtimes/setup commands that's replayed on every container rebuild
 - **Beacon plugin** — mark sessions as ongoing work and resume them across restarts, terminal crashes, and context switches
@@ -26,10 +26,11 @@ A curated [Claude Code](https://docs.anthropic.com/en/docs/claude-code) configur
 - Perl 5.14+ (usually already installed on macOS/Linux; on Windows it's included with [Git for Windows](https://gitforwindows.org/))
 
 Optional:
-- **Podman** — required for the `claude-sandbox` containerized development feature.
-  - Install: [Podman Desktop](https://podman-desktop.io/) on macOS/Windows, or `apt-get install podman` / `dnf install podman` / `brew install podman` on Linux/macOS.
-  - On Windows and macOS, after installing run `podman machine init && podman machine start` once.
-  - The launcher's first-launch bootstrap (`claude-sandbox` in a project root) prints clear setup guidance if Podman isn't reachable.
+- **Docker OR Podman** — either runtime works for the `claude-sandbox` containerized development feature. The launcher auto-detects which is installed (prefers Docker if both present).
+  - **Docker**: install [Docker Desktop](https://www.docker.com/products/docker-desktop) on macOS/Windows, or Docker Engine on Linux. On Windows, Docker Desktop uses WSL2 by default since 2021 — keep it that way.
+  - **Podman**: install [Podman Desktop](https://podman-desktop.io/) on macOS/Windows, or `apt-get install podman` / `dnf install podman` / `brew install podman` on Linux/macOS. On Windows and macOS, after installing run `podman machine init --provider wsl && podman machine start` once.
+  - The launcher's first-launch bootstrap (`claude-sandbox` in a project root) prints clear setup guidance if neither runtime is reachable.
+  - **⚠ On Windows, DO NOT use the Hyper-V backend** — Microsoft's `Plan9FileServer` silently breaks `O_APPEND` and `utimensat`, which fails `claude --resume` and wedges Bun's lock manager. The bootstrap actively refuses `podman + hyperv`. WSL2 backend only.
 
 > **Note on Perl.** All of ccpraxis's internals — install hooks, the statusline, the launchers, sync logic — are Perl. It's the only language that ships preinstalled on macOS/Linux and inside Git for Windows, which means a fresh `git clone` is enough to run everything; no Node/Python/etc. installs on the host (which is the point — see "Why the sandbox" above). You don't need to know Perl to use ccpraxis; you'd only touch it to customize the internals.
 
@@ -65,7 +66,7 @@ Once installed, here's what you'll actually type day-to-day, grouped by job:
 
 **Browsing or cleaning up beacons.** `/beacon:list` renders them as a Markdown table, `/beacon:view <id>` shows one full record, `/beacon:delete <id>` removes any beacon by ID-or-prefix (with confirmation).
 
-**Capturing a multi-session plan.** `/create-plan` writes a persistent plan to disk you can revisit across sessions; `/resume-plan` loads one back; `/manage-plans` does CRUD.
+**Planning a multi-session initiative.** `/blueprint:create` interrogates the objective and decomposes it into scoped packages — a durable on-disk *blueprint* — then gates it through a fresh-context auditor; `/blueprint:manage` lists, views, audits, archives, or deletes them. Inside a sandbox, the `butler` plugin executes a blueprint: `/butler:launch` spawns detached coordinator agents (one per package, with hook-enforced scope/git/ledger discipline), and `/butler:status` / `/butler:resume` monitor and recover them.
 
 **Capturing a todo.** `/create-todo` saves a note, `/resume-todo` loads one to work on, `/manage-todos` does CRUD. Todos sync via the vault.
 
@@ -111,138 +112,215 @@ Run `/backup` afterwards to resync your live `~/.claude/` with any settings chan
 ```
 ccpraxis/
 ├── global-config/
-│   ├── CLAUDE.md                         # Global instructions (supply chain rules, response style)
-│   ├── known_marketplaces.json           # Marketplace selections (synced across machines)
-│   └── settings.json                     # Base settings (env, statusline, plugins, effort level)
-├── install.pl                            # Top-level setup orchestrator — discovers and runs every surface's ccpraxis-install.pl. Two-phase: bare run = plan only, --confirm = apply.
-├── plugins/                              # Local plugin marketplace ("ccpraxis-local")
+│   ├── CLAUDE.md                            # Global instructions (supply chain rules, response style)
+│   ├── known_marketplaces.json              # Marketplace selections (synced across machines)
+│   └── settings.json                        # Base settings (env, statusline, plugins, effort level)
+├── install.pl                               # Top-level setup orchestrator — discovers and runs every surface's ccpraxis-install.pl. Two-phase: bare run = plan only, --confirm = apply.
+├── plugins/                                 # Local plugin marketplace ("ccpraxis-local")
 │   ├── .claude-plugin/
-│   │   └── marketplace.json              # Lists the plugins below; loaded via extraKnownMarketplaces in settings.json
-│   ├── backpack/                         # Backpack plugin — declarative tool/runtime/setup manifest for sandbox containers
+│   │   └── marketplace.json                 # Lists the plugins below; loaded via extraKnownMarketplaces in settings.json
+│   ├── backpack/                            # Backpack plugin — declarative tool/runtime/setup manifest for sandbox containers
 │   │   ├── .claude-plugin/
 │   │   │   └── plugin.json
 │   │   ├── hooks/
-│   │   │   └── auto-declare.pl           # PostToolUse hook on Bash — detects install commands and proposes /backpack:add
+│   │   │   └── auto-declare.pl              # PostToolUse hook on Bash — detects install commands and proposes /backpack:add
 │   │   ├── scripts/
-│   │   │   └── backpack.pl               # Core helper: validate / list / install / add / remove / audit
+│   │   │   └── backpack.pl                  # Core helper: validate / list / install / add / remove / audit
 │   │   └── skills/
 │   │       ├── add/
-│   │       │   └── SKILL.md              # /backpack:add     — register a new item (with rationale)
+│   │       │   └── SKILL.md                 # /backpack:add     — register a new item (with rationale)
 │   │       ├── audit/
-│   │       │   └── SKILL.md              # /backpack:audit   — surface items missing rationale or whose verify no longer passes
+│   │       │   └── SKILL.md                 # /backpack:audit   — surface items missing rationale or whose verify no longer passes
 │   │       ├── install/
-│   │       │   └── SKILL.md              # /backpack:install — replay install pass (no container rebuild needed)
+│   │       │   └── SKILL.md                 # /backpack:install — replay install pass (no container rebuild needed)
 │   │       ├── list/
-│   │       │   └── SKILL.md              # /backpack:list    — show contents grouped by category
+│   │       │   └── SKILL.md                 # /backpack:list    — show contents grouped by category
 │   │       └── remove/
-│   │           └── SKILL.md              # /backpack:remove  — drop an item
-│   ├── beacon/                           # Beacon plugin — bundles the /beacon:* skills, the UserPromptSubmit completion-nudge hook, the shared beacon scripts, and the claude-beacon host launcher
+│   │           └── SKILL.md                 # /backpack:remove  — drop an item
+│   ├── beacon/                              # Beacon plugin — bundles the /beacon:* skills, the UserPromptSubmit completion-nudge hook, the shared beacon scripts, and the claude-beacon host launcher
 │   │   ├── .claude-plugin/
 │   │   │   └── plugin.json
-│   │   ├── bin/                          # User-invoked CLI lives here; shell-native wrappers are required so users can type `claude-beacon` from any terminal.
-│   │   │   ├── claude-beacon.ps1         # Thin wrapper (Windows/PowerShell)
-│   │   │   └── claude-beacon.sh          # Thin wrapper that execs into claude-beacon.pl (Linux/macOS)
-│   │   ├── ccpraxis-install.pl           # Install hook — wires plugins/beacon/bin/ into user PATH (delegates to _install-bin-helper.pl)
+│   │   ├── bin/                             # User-invoked CLI lives here; shell-native wrappers are required so users can type `claude-beacon` from any terminal.
+│   │   │   ├── claude-beacon.ps1            # Thin wrapper (Windows/PowerShell)
+│   │   │   └── claude-beacon.sh             # Thin wrapper that execs into claude-beacon.pl (Linux/macOS)
+│   │   ├── ccpraxis-install.pl              # Install hook — wires plugins/beacon/bin/ into user PATH (delegates to _install-bin-helper.pl)
 │   │   ├── hooks/
-│   │   │   ├── completion-nudge.pl       # UserPromptSubmit hook — nudges Claude to offer /beacon:off when the user signals session completion (only if a beacon exists for the current session_id)
-│   │   │   └── hooks.json                # Auto-registers the UserPromptSubmit hook when the plugin is enabled (shell-form command, path via ${CLAUDE_PLUGIN_ROOT}, runs through Git Bash on Windows so `perl` resolves correctly)
+│   │   │   ├── completion-nudge.pl          # UserPromptSubmit hook — nudges Claude to offer /beacon:off when the user signals session completion (only if a beacon exists for the current session_id)
+│   │   │   └── hooks.json                   # Auto-registers the UserPromptSubmit hook when the plugin is enabled (shell-form command, path via ${CLAUDE_PLUGIN_ROOT}, runs through Git Bash on Windows so `perl` resolves correctly)
 │   │   ├── scripts/
-│   │   │   ├── beacon.pl                 # Core helper: light/unbeacon/list/get/update-activity/count-{project,global}/sync-vault/scan-sandboxes
-│   │   │   └── claude-beacon.pl          # TUI launcher (logic for `claude-beacon` on the host)
+│   │   │   ├── beacon.pl                    # Core helper: light/unbeacon/list/get/update-activity/count-{project,global}/sync-vault/scan-sandboxes
+│   │   │   ├── claude-beacon.pl             # TUI launcher (logic for `claude-beacon` on the host)
+│   │   │   └── test-encoding.pl             # automated encoding test suite for the beacon plugin.
 │   │   └── skills/
 │   │       ├── delete/
-│   │       │   └── SKILL.md              # /beacon:delete — delete any beacon by id-or-prefix (with confirmation)
+│   │       │   └── SKILL.md                 # /beacon:delete — delete any beacon by id-or-prefix (with confirmation)
 │   │       ├── list/
-│   │       │   └── SKILL.md              # /beacon:list   — render every beacon as a Markdown table (read-only)
+│   │       │   └── SKILL.md                 # /beacon:list   — render every beacon as a Markdown table (read-only)
 │   │       ├── off/
-│   │       │   └── SKILL.md              # /beacon:off    — remove the current session's beacon (with confirmation)
+│   │       │   └── SKILL.md                 # /beacon:off    — remove the current session's beacon (with confirmation)
 │   │       ├── on/
-│   │       │   └── SKILL.md              # /beacon:on     — mark this session as ongoing work
+│   │       │   └── SKILL.md                 # /beacon:on     — mark this session as ongoing work
 │   │       └── view/
-│   │           └── SKILL.md              # /beacon:view   — show one beacon's full record by id-or-prefix (read-only)
-│   ├── sandbox/                          # Sandbox plugin — bundles the claude-sandbox host launcher, the container blueprint, the bootstrap routine, and the /sandbox:setup redirect skill
+│   │           └── SKILL.md                 # /beacon:view   — show one beacon's full record by id-or-prefix (read-only)
+│   ├── blueprint/                           # Authors durable blueprints: interrogates the objective, decomposes it into scop…
+│   │   ├── .claude-plugin/
+│   │   │   └── plugin.json                  # Plugin manifest for blueprint (name, version, description, author).
+│   │   ├── agents/
+│   │   │   └── bp-auditor.md                # bp-auditor agent - fresh-context completeness auditor; reads only the blueprint files and returns gaps as questions before the blueprint is handed to butler.
+│   │   ├── scripts/
+│   │   │   ├── bp-init.sh                   # ensure the ccpraxis local data root exists and self-gitignores.
+│   │   │   └── bp-lib.sh                    # shared helpers for the blueprint (authoring) plugin.
+│   │   ├── skills/
+│   │   │   ├── authoring-protocol/
+│   │   │   │   └── SKILL.md                 # Operating protocol for the blueprint author — the interactive Claude Code ses…
+│   │   │   ├── create/
+│   │   │   │   └── SKILL.md                 # Create a new blueprint — a durable multi-package initiative with per-package …
+│   │   │   └── manage/
+│   │   │       └── SKILL.md                 # Manage blueprint lifecycle — list all blueprints with status, view one, re-ru…
+│   │   └── templates/
+│   │       ├── blueprint.md                 # Template for a blueprint's top-level file (objective, decisions, package status table, package blocks); instantiated by /blueprint:create.
+│   │       └── package-ledger.md            # Template for a per-package ledger; its frontmatter (status/model/max_turns/write_set/test_paths) is the contract butler reads at launch.
+│   ├── butler/                              # Executes blueprints: launches detached headless coordinator sessions (one per p…
+│   │   ├── .claude-plugin/
+│   │   │   └── plugin.json                  # Plugin manifest for butler (name, version, description, author).
+│   │   ├── agents/
+│   │   │   ├── bp-architect.md              # bp-architect worker (opus) - writes the package spec that tests and implementation build from. Report-only.
+│   │   │   ├── bp-implementer.md            # bp-implementer worker - converges code on the immutable tests within the package write_set. Hook-blocked from test files.
+│   │   │   ├── bp-redteam.md                # bp-redteam worker (opus) - adversarial pass over the package. Report-only.
+│   │   │   ├── bp-reviewer.md               # bp-reviewer worker - spec-conformance and conventions review. Report-only.
+│   │   │   ├── bp-scout.md                  # bp-scout worker (haiku) - terrain map with file:line for the package. Report-only.
+│   │   │   ├── bp-test-writer.md            # bp-test-writer worker - writes the immutable test oracle from the spec. May only touch the package test_paths.
+│   │   │   └── bp-ui-prober.md              # bp-ui-prober worker - finder-based UI scenarios and screenshot reads for packages that touch UI.
+│   │   ├── hooks/
+│   │   │   ├── gate-stop.sh                 # Stop hook inside coordinator sessions.
+│   │   │   ├── guard-bash.sh                # PreToolUse hook for Bash inside coordinator sessions.
+│   │   │   ├── guard-writes.sh              # PreToolUse hook for Edit|Write|MultiEdit|NotebookEdit.
+│   │   │   ├── hooks.json                   # Hook registration for butler: PreToolUse (guard-writes/guard-bash/track-dispatch), PostToolUse (log-dispatch), Stop (gate-stop).
+│   │   │   ├── lib.sh                       # shared helpers for blueprint hooks.
+│   │   │   ├── log-dispatch.sh              # PostToolUse hook for Task inside coordinator sessions.
+│   │   │   └── track-dispatch.sh            # PreToolUse hook for Task inside coordinator sessions.
+│   │   ├── scripts/
+│   │   │   ├── bp-init.sh                   # ensure the ccpraxis local data root exists and self-gitignores.
+│   │   │   ├── bp-launch.sh                 # launch (or resume) a headless coordinator session for one package.
+│   │   │   ├── bp-lib.sh                    # shared helpers for the blueprint plugin.
+│   │   │   ├── bp-resume-sweep.sh           # find interrupted coordinators and resume them economically.
+│   │   │   └── bp-status.sh                 # one-line-per-package rollup across blueprints.
+│   │   ├── skills/
+│   │   │   ├── coordinator-protocol/
+│   │   │   │   └── SKILL.md                 # Binding operating protocol for butler coordinators — the headless Claude Code…
+│   │   │   ├── launch/
+│   │   │   │   └── SKILL.md                 # Launch a blueprint's ready packages as detached headless coordinator sessions a…
+│   │   │   ├── orchestrator-protocol/
+│   │   │   │   └── SKILL.md                 # Operating protocol for the butler orchestrator (the interactive Claude Code ses…
+│   │   │   ├── resume/
+│   │   │   │   └── SKILL.md                 # Resume a blueprint after an interruption — session compaction, usage-limit pa…
+│   │   │   └── status/
+│   │   │       └── SKILL.md                 # Show the state of one or all blueprints — package statuses, live coordinator …
+│   │   └── templates/
+│   │       └── dispatch-prompt.md           # Coordinator bootstrap-prompt template; bp-launch.sh fills the placeholders and feeds it to the detached claude -p coordinator.
+│   ├── sandbox/                             # Sandbox plugin — bundles the claude-sandbox host launcher, the container blueprint, the bootstrap routine, and the /sandbox:setup redirect skill
 │   │   ├── .claude-plugin/
 │   │   │   └── plugin.json
-│   │   ├── bin/                          # User-invoked CLI lives here; shell-native wrappers are required so users can type `claude-sandbox` from any terminal.
-│   │   │   ├── claude-sandbox.ps1        # Thin shim — locates Perl + execs launcher.pl (Windows/PowerShell)
-│   │   │   └── claude-sandbox.sh         # Thin shim — execs into plugins/sandbox/scripts/launcher.pl (Linux/macOS)
-│   │   ├── ccpraxis-install.pl           # Install hook — wires plugins/sandbox/bin/ into user PATH (delegates to _install-bin-helper.pl)
-│   │   ├── container/                    # Container blueprint — files that get baked into or mounted into the sandbox container
-│   │   │   ├── CLAUDE.md                 # Container-specific instructions (full autonomy)
-│   │   │   ├── Containerfile             # Podman/OCI container image: Debian bookworm + Claude Code CLI + dev tools (runs as root inside the rootless-Podman user namespace)
-│   │   │   ├── claude.json               # Onboarding bypass for containers
-│   │   │   └── settings.json             # Container-specific settings
+│   │   ├── bin/                             # User-invoked CLI lives here; shell-native wrappers are required so users can type `claude-sandbox` from any terminal.
+│   │   │   ├── claude-sandbox.ps1           # Thin shim — locates Perl + execs launcher.pl (Windows/PowerShell)
+│   │   │   └── claude-sandbox.sh            # Thin shim — execs into plugins/sandbox/scripts/launcher.pl (Linux/macOS)
+│   │   ├── ccpraxis-install.pl              # Install hook — wires plugins/sandbox/bin/ into user PATH (delegates to _install-bin-helper.pl)
+│   │   ├── container/                       # Container blueprint — files that get baked into or mounted into the sandbox container
+│   │   │   ├── CLAUDE.md                    # Container-specific instructions (full autonomy)
+│   │   │   ├── Containerfile                # Podman/OCI container image: Debian bookworm + Claude Code CLI + dev tools (runs as root inside the rootless-Podman user namespace)
+│   │   │   ├── claude.json                  # Onboarding bypass for containers
+│   │   │   └── settings.json                # Container-specific settings
 │   │   ├── scripts/
-│   │   │   ├── bootstrap.pl              # First-launch setup invoked by launcher.pl when .claude-data is missing. 6 steps: verify container blueprint, build image, mkdir .claude-data, append .gitignore, git auth (HTTPS PAT / SSH deploy-key), invoke ccpraxis-install.pl. Fully interactive over the launcher's tty.
-│   │   │   ├── launcher.pl               # The actual claude-sandbox launcher: arg parsing, bootstrap detection, lock + dead-PID cleanup, image build, TUI selector orchestration, staleness check, mount assembly, container create-or-reattach. Wrappers in bin/ are tiny shims that exec into this.
-│   │   │   └── skills.pl                 # Discovery/selection backend for the launcher: enumerates custom + plugin skills + plugins + MCP servers, drives the interactive TUI picker, writes selection state and diff reports the launcher consumes.
-│   │   └── skills/
-│   │       └── setup/
-│   │           └── SKILL.md              # /sandbox:setup — confirms .claude-data state and tells the user to exit Claude and run `claude-sandbox`
-│   └── steward/                          # Meta-plugin that audits and maintains ccpraxis itself.
+│   │   │   ├── MountSpec.pm
+│   │   │   ├── bootstrap.pl                 # First-launch setup invoked by launcher.pl when .claude-data is missing. 6 steps: verify container blueprint, build image, mkdir .claude-data, append .gitignore, git auth (HTTPS PAT / SSH deploy-key), invoke ccpraxis-install.pl. Fully interactive over the launcher's tty.
+│   │   │   ├── launcher.pl                  # The actual claude-sandbox launcher: arg parsing, bootstrap detection, lock + dead-PID cleanup, image build, TUI selector orchestration, staleness check, mount assembly, container create-or-reattach. Wrappers in bin/ are tiny shims that exec into this.
+│   │   │   ├── select-session.pl            # TUI session picker for the claude-sandbox launcher.
+│   │   │   └── skills.pl                    # Discovery/selection backend for the launcher: enumerates custom + plugin skills + plugins + MCP servers, drives the interactive TUI picker, writes selection state and diff reports the launcher consumes.
+│   │   ├── skills/
+│   │   │   ├── setup/
+│   │   │   │   └── SKILL.md                 # /sandbox:setup — confirms .claude-data state and tells the user to exit Claude and run `claude-sandbox`
+│   │   │   └── test/
+│   │   │       └── SKILL.md                 # Run the sandbox plugin's verification suite — proves the bind-mount honors O_…
+│   │   └── tests/
+│   │       ├── lib/
+│   │       │   └── TestSandbox.pm
+│   │       ├── manual/
+│   │       │   └── longrun-freeze-check.sh  # Long-running empirical test: spin up claude in a container with the
+│   │       ├── run-tests.pl                 # Test runner for plugins/sandbox/tests/t/.
+│   │       └── t/
+│   │           ├── 01-bind-honors-append-and-utimensat.t
+│   │           ├── 02-launcher-bind-mount-shape.t
+│   │           ├── 03-claude-json-file-bind.t
+│   │           ├── 04-runtime-detection.t
+│   │           ├── 06-launcher-ro-protection.t
+│   │           ├── 07-mountspec-volume-vs-bind.t
+│   │           ├── 08-launcher-loads-from-any-cwd.t
+│   │           ├── 09-no-stdin-after-podman-start.t
+│   │           ├── 10-select-session-empty-dir.t
+│   │           ├── 11-select-session-parses.t
+│   │           ├── 12-keepalive-heartbeat.t
+│   │           ├── 13-install-pass-heartbeat.t
+│   │           ├── 18-multi-session-shared-state.t
+│   │           ├── 21-select-session-multiple.t
+│   │           └── 22-mountspec-edge-cases.t
+│   └── steward/                             # Meta-plugin that audits and maintains ccpraxis itself.
 │       ├── .claude-plugin/
 │       │   └── plugin.json
 │       └── skills/
 │           └── audit/
-│               └── SKILL.md              # Audits the ccpraxis repo itself — fans out read-only subagents (per-system re…
+│               └── SKILL.md                 # Audits the ccpraxis repo itself — fans out read-only subagents (per-system re…
 ├── references/
-│   ├── extending-ccpraxis.md             # Extension contract — how plugins/skills/standalone surfaces plug into ccpraxis and what each must provide
-│   └── skill-writing-guide.md            # Shared skill authoring guide (folder structure, progressive disclosure, writing tips)
-├── scripts/                              # ccpraxis-wide utility scripts (shared across surfaces)
-│   ├── _install-bin-helper.pl            # Shared PATH/PATHEXT wiring (idempotent). Branches on $^O. Used by per-surface ccpraxis-install.pl hooks.
-│   ├── gen-readme-tree.pl                # Generates the file-tree section of README.md from disk, using per-module metadata (.about > plugin.json > SKILL.md > script header). --check mode wires into /backup as a pre-flight; --bootstrap is a one-shot for adopting on an existing README.
-│   ├── hooks/                            # Host-side PreToolUse hooks installed via global-config/settings.json
-│   │   └── block-nul-redirect.pl         # Blocks bash `> nul` redirects on Windows — without this hook, scripts that target /dev/null on Unix create a stray `nul` file in the cwd, polluting the repo
-│   ├── install-skills.pl                 # Symlinks (Unix) or junctions (Windows: `mklink /J`) every skills/<name>/ into ~/.claude/skills/. plan/apply modes. Called from the install protocol — handles Windows where `ln -s` silently falls back to a file copy.
-│   ├── lint-msys2-guard.pl               # Pre-flight for /backup: walks every .pl that invokes podman natively and asserts the MSYS2_ARG_CONV_EXCL=* guard is set (the bug it prevents: `;C`-suffixed bind-mount targets on Windows)
-│   ├── lint-readme-paths.allow           # Allowlist for lint-readme-paths.pl — backtick contents that look like ccpraxis paths but are intentional non-host paths (e.g. container-internal)
-│   ├── lint-readme-paths.pl              # Pre-flight for /backup: verifies every backtick-quoted ccpraxis path in README.md exists on disk
-│   ├── statusline.pl                     # Custom two-line status bar (model, context, rate limits)
-│   ├── todo-sync.pl                      # Vault todos: list/create/done/sync (git ops scoped to todos/)
-│   ├── update-bootstrap-monitor.pl       # /update support: versioned archive + drift check for upstream bootstrap.ps1
-│   ├── update-install.pl                 # /update support: direct-binary install pipeline (detect / manifest / install / verify)
-│   ├── update-research.pl                # /update support: fetches GitHub releases + changelog presence + symptom searches against issues
-│   └── vault-sync.pl                     # Vault project backups: register, sync (3-way merge), conflict resolution, commit-and-push. Locking, journal, atomic staging, pre-rename sensitive-data scan.
+│   ├── extending-ccpraxis.md                # Extension contract — how plugins/skills/standalone surfaces plug into ccpraxis and what each must provide
+│   └── skill-writing-guide.md               # Shared skill authoring guide (folder structure, progressive disclosure, writing tips)
+├── scripts/                                 # ccpraxis-wide utility scripts (shared across surfaces)
+│   ├── _install-bin-helper.pl               # Shared PATH/PATHEXT wiring (idempotent). Branches on $^O. Used by per-surface ccpraxis-install.pl hooks.
+│   ├── gen-readme-tree.pl                   # Generates the file-tree section of README.md from disk, using per-module metadata (.about > plugin.json > SKILL.md > script header). --check mode wires into /backup as a pre-flight; --bootstrap is a one-shot for adopting on an existing README.
+│   ├── hooks/                               # Host-side PreToolUse hooks installed via global-config/settings.json
+│   │   └── block-nul-redirect.pl            # Blocks bash `> nul` redirects on Windows — without this hook, scripts that target /dev/null on Unix create a stray `nul` file in the cwd, polluting the repo
+│   ├── install-skills.pl                    # Symlinks (Unix) or junctions (Windows: `mklink /J`) every skills/<name>/ into ~/.claude/skills/. plan/apply modes. Called from the install protocol — handles Windows where `ln -s` silently falls back to a file copy.
+│   ├── lint-msys2-guard.pl                  # Pre-flight for /backup: walks every .pl that invokes podman natively and asserts the MSYS2_ARG_CONV_EXCL=* guard is set (the bug it prevents: `;C`-suffixed bind-mount targets on Windows)
+│   ├── lint-readme-paths.allow              # Allowlist for lint-readme-paths.pl — backtick contents that look like ccpraxis paths but are intentional non-host paths (e.g. container-internal)
+│   ├── lint-readme-paths.pl                 # Pre-flight for /backup: verifies every backtick-quoted ccpraxis path in README.md exists on disk
+│   ├── statusline.pl                        # Custom two-line status bar (model, context, rate limits)
+│   ├── todo-sync.pl                         # Vault todos: list/create/done/sync (git ops scoped to todos/)
+│   ├── update-bootstrap-monitor.pl          # /update support: versioned archive + drift check for upstream bootstrap.ps1
+│   ├── update-install.pl                    # /update support: direct-binary install pipeline (detect / manifest / install / verify)
+│   ├── update-research.pl                   # /update support: fetches GitHub releases + changelog presence + symptom searches against issues
+│   └── vault-sync.pl                        # Vault project backups: register, sync (3-way merge), conflict resolution, commit-and-push. Locking, journal, atomic staging, pre-rename sensitive-data scan.
 └── skills/
-    ├── backup/                           # /backup — sync ccpraxis config + every registered vault project
+    ├── backup/                              # /backup — sync ccpraxis config + every registered vault project
     │   ├── SKILL.md
     │   └── scripts/
-    │       ├── ccpraxis-helpers.pl       # Deterministic subcommands for /backup (sync-skills, etc.) — replaces several LLM-driven prose steps with scripted ones; emits JSON the skill consumes
-    │       ├── check-plugins.pl          # Detects missing or stale plugins vs settings.json
-    │       ├── claude-binary-backup.pl   # Snapshot / list / restore / prune / verify / detect for the Claude Code binary — gives /update a deterministic safety net before any installer runs
-    │       ├── filter-diff.pl            # Filters json-diff output through saved preferences
-    │       ├── json-diff.pl              # Semantic JSON diff (--deep-exclude, structured report)
-    │       ├── save-preference.pl        # Records "remember this divergence" decisions
-    │       ├── sensitive-check.sh        # Scans for secrets before committing
-    │       └── sync-export.sh            # Detects drift between live config and this repo
-    ├── create-plan/
-    │   └── SKILL.md                      # /create-plan          — create a persistent multi-session plan
+    │       ├── ccpraxis-helpers.pl          # Deterministic subcommands for /backup (sync-skills, etc.) — replaces several LLM-driven prose steps with scripted ones; emits JSON the skill consumes
+    │       ├── check-plugins.pl             # Detects missing or stale plugins vs settings.json
+    │       ├── claude-binary-backup.pl      # Snapshot / list / restore / prune / verify / detect for the Claude Code binary — gives /update a deterministic safety net before any installer runs
+    │       ├── filter-diff.pl               # Filters json-diff output through saved preferences
+    │       ├── json-diff.pl                 # Semantic JSON diff (--deep-exclude, structured report)
+    │       ├── save-preference.pl           # Records "remember this divergence" decisions
+    │       ├── sensitive-check.sh           # Scans for secrets before committing
+    │       └── sync-export.sh               # Detects drift between live config and this repo
     ├── create-skill/
-    │   └── SKILL.md                      # /create-skill         — create new skill(s) with auto-linking
+    │   └── SKILL.md                         # /create-skill         — create new skill(s) with auto-linking
     ├── create-todo/
-    │   └── SKILL.md                      # /create-todo          — save a todo note
-    ├── launch-chrome-puppet/             # /launch-chrome-puppet — CDP browser automation
+    │   └── SKILL.md                         # /create-todo          — save a todo note
+    ├── launch-chrome-puppet/                # /launch-chrome-puppet — CDP browser automation
     │   ├── SKILL.md
     │   └── scripts/
-    │       ├── chrome-puppet.pl          # Subcommand dispatcher (launch, navigate, text, etc.)
+    │       ├── chrome-puppet.pl             # Subcommand dispatcher (launch, navigate, text, etc.)
     │       └── lib/
-    │           └── CDPClient.pm          # Pure-Perl WebSocket + CDP client
-    ├── manage-plans/
-    │   └── SKILL.md                      # /manage-plans         — list, view, update, delete, archive plans
+    │           └── CDPClient.pm             # Pure-Perl WebSocket + CDP client
     ├── manage-todos/
-    │   └── SKILL.md                      # /manage-todos         — CRUD for personal todos
+    │   └── SKILL.md                         # /manage-todos         — CRUD for personal todos
     ├── refresh/
-    │   └── SKILL.md                      # /refresh              — reread CLAUDE.md mid-conversation
+    │   └── SKILL.md                         # /refresh              — reread CLAUDE.md mid-conversation
     ├── register-for-backup/
-    │   └── SKILL.md                      # /register-for-backup  — bootstrap a project for vault backup (orphan discovery, slug pick, initial sync)
-    ├── resume-plan/
-    │   └── SKILL.md                      # /resume-plan          — resume work on a persistent plan
+    │   └── SKILL.md                         # /register-for-backup  — bootstrap a project for vault backup (orphan discovery, slug pick, initial sync)
     ├── resume-todo/
-    │   └── SKILL.md                      # /resume-todo          — load a todo and work on it
+    │   └── SKILL.md                         # /resume-todo          — load a todo and work on it
     ├── update/
-    │   └── SKILL.md                      # /update               — safe Claude Code updater
+    │   └── SKILL.md                         # /update               — safe Claude Code updater
     └── update-skill/
-        └── SKILL.md                      # /update-skill         — modify existing skill(s)
+        └── SKILL.md                         # /update-skill         — modify existing skill(s)
 ```
 <!-- END-FILE-TREE -->
 
@@ -264,9 +342,9 @@ The orchestrator is two-phase: a bare run prints the plan and exits without touc
 - `/refresh` — re-read all CLAUDE.md files and summarize key rules.
 
 **Planning and todos**
-- `/create-plan` — create a persistent multi-session plan
-- `/manage-plans` — list, view, update, delete, archive plans
-- `/resume-plan` — resume work on a persistent plan
+- `/blueprint:create` — author a durable multi-package blueprint (interrogate → decompose → auditor gate)
+- `/blueprint:manage` — list, view, audit, archive, or delete blueprints
+- `/butler:launch` — execute a blueprint via detached coordinator agents (sandbox-only); `/butler:status` and `/butler:resume` monitor/recover
 - `/create-todo` — save a todo note
 - `/manage-todos` — CRUD for personal todos
 - `/resume-todo` — load a todo and work on it
@@ -356,11 +434,12 @@ claude-code-vault/
 
 - `CLAUDE.md` (project root) and `.claude/CLAUDE.md`
 - `.claude/skills/`, `.claude/agents/`, `.claude/hooks/`, `.claude/commands/`, `.claude/plans/`
-- `.claude-plans/` (custom persistent plans)
+- `.claude-plans/` (legacy persistent plans, if any remain)
+- `.ccpraxis-local-data/blueprints/` (authored blueprints — see Blueprint plugin; the machine-local `runs/` execution state is hard-excluded)
 - `.claude-data/memory/` and `.claude-data/plans/` (sandbox state)
 - `.claude-data/backpack.json` (per-project sandbox backpack — see Backpack plugin)
 
-**Hard-excluded (never offered):** `.claude/settings.local.json`, `.claude-data/git-pat`, `.claude-data/git-askpass.sh`, `.claude-data/git-ssh-command.sh`, `deploy_key`.
+**Hard-excluded (never offered):** `.claude/settings.local.json`, `.claude-data/git-pat`, `.claude-data/git-askpass.sh`, `.claude-data/git-ssh-command.sh`, `deploy_key`, `.ccpraxis-local-data/blueprints/<name>/runs/`.
 
 To change what's offered by default, edit `@DEFAULT_TRACKABLE` and `%HARD_EXCLUDE_EXACT` / `@HARD_EXCLUDE_PREFIXES` at the top of `scripts/vault-sync.pl`. Per-project selection is captured at registration time in `<project>/.claude/backup-metadata.json → tracked_paths`.
 
@@ -433,7 +512,7 @@ Toggle by number (comma-separated), 'a' for all, Enter to confirm:
 
 **Network.** Ports 9000–9009 are mapped 1:1 to the host. When Claude serves a web app, dev server, or any other network service inside the container, it should bind to one of these ports. The user can then access it at `http://localhost:9000` from the host browser.
 
-The container uses Podman's default networking. Services listening on the host machine are reachable from inside the container via `host.containers.internal` (Podman's native alias; Podman Machine on Windows/macOS routes through its VM). This means:
+The container uses the runtime's default networking. Services listening on the host machine are reachable from inside the container via `host.docker.internal` (Docker) or `host.containers.internal` (Podman). Both route through the runtime's WSL2 VM on Windows or Linux VM on macOS. This means:
 
 - A database running on the host (e.g. Postgres on port 5432) is accessible from the container at `host.containers.internal:5432`
 - Chrome DevTools debugging on the host can be reached from the container

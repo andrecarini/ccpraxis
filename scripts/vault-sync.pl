@@ -72,6 +72,7 @@ my @DEFAULT_TRACKABLE = qw(
     .claude-data/memory
     .claude-data/plans
     .claude-data/backpack.json
+    .ccpraxis-local-data/blueprints
 );
 
 # Hard-excludes — relative paths. Enforced at walk time AND at register-time.
@@ -86,6 +87,17 @@ my @HARD_EXCLUDE_PREFIXES = (
     '.claude-data/git-pat',
     '.claude-data/git-askpass.sh',
     '.claude-data/git-ssh-command.sh',
+);
+
+# Hard-exclude regexes — matched (case-insensitively, against the lowercased rel
+# path) when a fixed prefix can't express the rule. The blueprint name is a
+# variable path component, so the machine-local butler execution dir
+# `.ccpraxis-local-data/blueprints/<name>/runs/` (session ids, pids, jsonl stream
+# logs, markers) needs a pattern: it's meaningless on another machine and the
+# stream logs can be large and carry transient secrets. The authored files
+# (blueprint.md, packages/, specs/, reports/) are backed up; runs/ is not.
+my @HARD_EXCLUDE_REGEX = (
+    qr{^\.ccpraxis-local-data/blueprints/[^/]+/runs(?:/|$)},
 );
 
 my $SCRIPT_DIR = abs_path(dirname(__FILE__));
@@ -1472,6 +1484,9 @@ sub is_hard_excluded {
     for my $prefix (@HARD_EXCLUDE_PREFIXES) {
         my $p_lc = lc($prefix);
         return 1 if $rel_lc eq $p_lc || index($rel_lc, "$p_lc/") == 0;
+    }
+    for my $re (@HARD_EXCLUDE_REGEX) {
+        return 1 if $rel_lc =~ $re;
     }
     return 0;
 }

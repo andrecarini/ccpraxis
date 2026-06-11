@@ -1,0 +1,1 @@
+bp-auditor agent - fresh-context completeness auditor; reads only the blueprint files and returns gaps as questions before the blueprint is handed to butler.

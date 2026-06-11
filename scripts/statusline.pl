@@ -81,12 +81,16 @@ eval {
 
     my @parts;
 
-    # Plans: non-archived .claude-plans/*.md (per-project)
-    if ($root && -d "$root/.claude-plans") {
-        opendir(my $dh, "$root/.claude-plans") or die;
-        my $n = grep { /\.md$/ && -f "$root/.claude-plans/$_" } readdir($dh);
+    # Blueprints: non-archived <data>/blueprints/<name>/ (per-project). Count
+    # blueprint dirs (those containing blueprint.md), skipping _archive/ and
+    # dotfiles. Data root mirrors the plugins: $CCPRAXIS_DATA_DIR or the
+    # per-project default <root>/.ccpraxis-local-data.
+    my $bp_root = ($ENV{CCPRAXIS_DATA_DIR} // "$root/.ccpraxis-local-data") . "/blueprints";
+    if ($root && -d $bp_root) {
+        opendir(my $dh, $bp_root) or die;
+        my $n = grep { $_ ne '_archive' && !/^\./ && -f "$bp_root/$_/blueprint.md" } readdir($dh);
         closedir($dh);
-        push @parts, "${DIM}plans ${R}${n}" if $n > 0;
+        push @parts, "${DIM}blueprints ${R}${n}" if $n > 0;
     }
 
     # Todos: non-archived ~/.claude/claude-code-vault/todos/*.md (global)

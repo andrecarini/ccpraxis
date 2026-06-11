@@ -25,6 +25,16 @@
       "name": "steward",
       "source": "./steward",
       "description": "Meta-plugin that audits and maintains ccpraxis itself. Provides /steward:audit, which fans out read-only subagents and aggregates findings into a dated report."
+    },
+    {
+      "name": "blueprint",
+      "source": "./blueprint",
+      "description": "Authors durable blueprints (interrogate → decompose into scoped packages with a dependency DAG → fresh-context auditor gate). Host-usable. Provides /blueprint:create and /blueprint:manage; the blueprints it produces are executed by the sandbox-only butler plugin."
+    },
+    {
+      "name": "butler",
+      "source": "./butler",
+      "description": "Executes blueprints: detached headless coordinator sessions (one per package) driving scoped worker subagents, with hook-enforced discipline (ledger freshness, write-set containment, single-writer, git safety). Sandbox-only; pairs with the host-side blueprint plugin that authors blueprints."
     }
   ]
 }

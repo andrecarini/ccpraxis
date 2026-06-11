@@ -1,0 +1,1 @@
+Template for a per-package ledger; its frontmatter (status/model/max_turns/write_set/test_paths) is the contract butler reads at launch.

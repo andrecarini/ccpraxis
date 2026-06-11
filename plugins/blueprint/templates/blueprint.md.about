@@ -1,0 +1,1 @@
+Template for a blueprint's top-level file (objective, decisions, package status table, package blocks); instantiated by /blueprint:create.

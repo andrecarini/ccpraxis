@@ -1,0 +1,8 @@
+{
+  "name": "butler",
+  "version": "0.1.0",
+  "description": "Executes blueprints: launches detached headless coordinator sessions (one per package), dispatches scoped worker subagents, and enforces discipline with hooks (ledger freshness, write-set containment, single-writer, git safety). Sandbox-only — pairs with the host-side `blueprint` plugin that authors the blueprints it runs.",
+  "author": { "name": "André Carini" },
+  "keywords": ["orchestration", "multi-agent", "planning", "ccpraxis"],
+  "license": "MIT"
+}

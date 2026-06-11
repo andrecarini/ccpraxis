@@ -81,7 +81,7 @@ my $README    = "$REPO_ROOT/README.md";
 
 # Excludes (relative paths or bare names).
 my %EXCLUDE_DIRS = map { $_ => 1 } qw(
-    .git .claude .claude-plans
+    .git .claude .claude-plans .ccpraxis-local-data
 );
 my %EXCLUDE_FILES = map { $_ => 1 } qw(
     LICENSE NOTICE .gitignore README.md nul .backup-preferences.json

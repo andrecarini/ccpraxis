@@ -11,7 +11,7 @@ Audits the ccpraxis repo (`~/.claude/ccpraxis/` or wherever the user is working 
 
 ## Intended flow (full implementation, not v0)
 
-The persistent plan at `.claude-plans/steward-plugin.md` is the source of truth. Summary:
+The persistent plan (migrated to the archived blueprint `.ccpraxis-local-data/blueprints/_archive/steward-plugin/blueprint.md`) is the source of truth. Summary:
 
 1. **Discover subsystems** — enumerate every `skills/*/` and `plugins/*/` from the repo root, parse each one's manifest (`SKILL.md` description, `plugin.json` description, `ccpraxis-install.pl` if present) into a per-subsystem fact sheet.
 2. **Detect sandbox** — read the marker (env var or file) set by `claude-sandbox`. If absent (host run), skip the test-runner pass and record a finding instead.
@@ -31,4 +31,4 @@ All subagents are read-only (no `Edit`/`Write`/destructive `Bash`) except the te
 
 When invoked, output exactly this message to the user and then stop — do NOT attempt to discover subsystems, spawn subagents, or write a report:
 
-> `/steward:audit` v0 — scaffolding placeholder only. The audit orchestrator (subsystem discovery, parallel subagent fan-out, report aggregation) is not yet implemented. Progress is tracked in `.claude-plans/steward-plugin.md` (deliverables 2–8). Re-run after a future session lands the orchestrator.
+> `/steward:audit` v0 — scaffolding placeholder only. The audit orchestrator (subsystem discovery, parallel subagent fan-out, report aggregation) is not yet implemented. Progress is tracked in the archived `steward-plugin` blueprint (deliverables 2–8). Re-run after a future session lands the orchestrator.

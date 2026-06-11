@@ -1,0 +1,1 @@
+Hook registration for butler: PreToolUse (guard-writes/guard-bash/track-dispatch), PostToolUse (log-dispatch), Stop (gate-stop).

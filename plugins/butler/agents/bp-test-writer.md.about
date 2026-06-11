@@ -1,0 +1,1 @@
+bp-test-writer worker - writes the immutable test oracle from the spec. May only touch the package test_paths.

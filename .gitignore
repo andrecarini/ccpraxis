@@ -8,6 +8,7 @@ deploy_key*
 .backup-preferences.json
 .claude/settings.local.json
 .claude-plans/
+.ccpraxis-local-data/
 
 .claude/backup-metadata.json
 
