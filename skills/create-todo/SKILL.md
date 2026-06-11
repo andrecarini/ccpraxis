@@ -38,17 +38,7 @@ perl ~/.claude/ccpraxis/scripts/todo-sync.pl status
   ```
   If init fails (auth/URL issue), report the error and let the user try a different URL.
 
-### 2. Pull latest
-
-Sync before creating to avoid conflicts:
-
-```bash
-perl ~/.claude/ccpraxis/scripts/todo-sync.pl sync
-```
-
-Only report to the user if `STATUS: conflict`. Otherwise proceed silently.
-
-### 3. Create the todo
+### 2. Create the todo
 
 If the user provided content in the arguments, use it. If they invoked `/create-todo` with no args, ask via AskUserQuestion:
 - What should the todo be called? (becomes the filename)
@@ -63,13 +53,7 @@ perl ~/.claude/ccpraxis/scripts/todo-sync.pl create "$name" --title "$title" --t
 EOF
 ```
 
-- `STATUS: created` → proceed to step 4
+- `STATUS: created` → confirm to the user
 - `STATUS: exists` → warn the user and ask whether to use a different name, then retry
 
-### 4. Sync
-
-```bash
-perl ~/.claude/ccpraxis/scripts/todo-sync.pl sync "Add: $name"
-```
-
-Only report sync issues if there's a conflict. Otherwise just confirm the todo was created and synced.
+The todo is written locally into the vault (`~/.claude/claude-code-vault/todos/`). It is **not** pushed here — todos are committed and pushed by `/steward:backup`, which owns all vault syncing. Just confirm it was created and mention it'll be backed up on the next `/steward:backup`.

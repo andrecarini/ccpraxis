@@ -36,15 +36,7 @@ perl ~/.claude/ccpraxis/scripts/todo-sync.pl status
   ```
 - `CAN_FETCH: no` → warn about connectivity but proceed with local data
 
-### 2. Pull latest
-
-```bash
-perl ~/.claude/ccpraxis/scripts/todo-sync.pl sync
-```
-
-Only report if `STATUS: conflict`. Otherwise proceed silently.
-
-### 3. Route to operation
+### 2. Route to operation
 
 ---
 
@@ -68,11 +60,7 @@ perl ~/.claude/ccpraxis/scripts/todo-sync.pl create "$name" --title "$title" --t
 EOF
 ```
 
-If `$1` was provided, use it as the name. Otherwise ask the user for name, content, and optional tags. After creation:
-
-```bash
-perl ~/.claude/ccpraxis/scripts/todo-sync.pl sync "Add: $name"
-```
+If `$1` was provided, use it as the name. Otherwise ask the user for name, content, and optional tags. (The new todo is backed up on the next `/steward:backup`.)
 
 ---
 
@@ -94,11 +82,7 @@ Read the todo file and ask the user what they want to change:
 - Change tags
 - Update status
 
-Use the Edit tool for surgical changes to the file. After editing:
-
-```bash
-perl ~/.claude/ccpraxis/scripts/todo-sync.pl sync "Update: $1"
-```
+Use the Edit tool for surgical changes to the file. (The edit is backed up on the next `/steward:backup`.)
 
 ---
 
@@ -112,8 +96,9 @@ If confirmed:
 
 ```bash
 rm ~/.claude/claude-code-vault/todos/$1.md
-perl ~/.claude/ccpraxis/scripts/todo-sync.pl sync "Delete: $1"
 ```
+
+(The removal is pushed on the next `/steward:backup`.)
 
 ---
 
@@ -123,13 +108,11 @@ Mark the todo as done and archive it. The Perl script handles updating the statu
 
 ```bash
 perl ~/.claude/ccpraxis/scripts/todo-sync.pl done "$1"
-perl ~/.claude/ccpraxis/scripts/todo-sync.pl sync "Done: $1"
 ```
 
 If `STATUS: archived`, confirm to the user that the todo was completed and archived.
 
 ## Important
 
-- Always pull before reading and sync after writing.
-- Only bother the user about sync issues if there's an actual conflict. Routine syncs are silent.
+- This skill edits todos locally; `/steward:backup` owns committing and pushing them to the vault (there is no per-operation sync here).
 - This skill is for managing todos directly. To work *on* what a todo describes, use `/resume-todo`.

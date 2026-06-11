@@ -280,6 +280,28 @@ If confirmed: commit and push. Since Step 1 already integrated remote, pushing i
 
 If the repo has no remote configured, commit locally and tell the user to set up a remote.
 
+## Step 5.4: Sync todos
+
+Todos live at the vault root in `todos/` (separate from per-project content). They're written locally by `/create-todo` and `/manage-todos`, which no longer self-sync — `/steward:backup` owns committing and pushing them. Run this **before** the project syncs below, so the vault working tree is clean for their `git pull --rebase`.
+
+First check the vault exists (same check as Step 5.5):
+
+```bash
+[ -d "$HOME/.claude/claude-code-vault/.git" ] && echo "VAULT_OK" || echo "VAULT_MISSING"
+```
+
+If `VAULT_MISSING`, skip this step. Otherwise:
+
+```bash
+perl "$HOME/.claude/ccpraxis/scripts/todo-sync.pl" sync "backup: sync todos"
+```
+
+`todo-sync.pl` lives in `scripts/` (it's the shared todo engine, not part of steward). Its `sync` `git stash -u`s any uncommitted vault state, rebases onto origin, commits **`todos/` only** (scoped — never `projects/`), pushes, and pops — safe to run on a dirty `todos/`. Parse the `KEY: value` lines:
+
+- `STATUS: synced` → note `PULLED`/`COMMITTED`/`PUSHED` for Step 7's report (e.g. "Todos: committed + pushed" or "no changes").
+- `STATUS: conflict` → a rebase conflict in `todos/`; surface it (resolve under `~/.claude/claude-code-vault/todos/`) and continue with the rest of the backup.
+- `STATUS: error` → surface verbatim; continue.
+
 ## Step 5.5: Sync registered vault projects
 
 `vault-sync.pl` owns ALL git/file/hash/merge work — your job is to invoke subcommands, parse JSON, and present `AskUserQuestion` for conflicts. Never run `git` against the vault yourself, never `cp`/`mv` files into the vault, never compute hashes yourself.
