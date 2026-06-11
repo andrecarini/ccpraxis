@@ -11,6 +11,8 @@
    "enabledPlugins" : {
       "backpack@ccpraxis-local" : true,
       "beacon@ccpraxis-local" : true,
+      "blueprint@ccpraxis-local" : true,
+      "butler@ccpraxis-local" : true,
       "feature-dev@claude-plugins-official" : true,
       "frontend-design@claude-plugins-official" : true,
       "sandbox@ccpraxis-local" : true,
@@ -68,6 +70,7 @@
          "Skill(beacon:view)",
          "Skill(blueprint:create)",
          "Skill(blueprint:manage)",
+         "Skill(blueprint:resume)",
          "Skill(butler:launch)",
          "Skill(butler:resume)",
          "Skill(butler:status)",
