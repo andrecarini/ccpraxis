@@ -61,7 +61,7 @@ sub cmd_init {
     # v1.1 consolidation: delegate vault scaffolding to vault-sync.pl so there's
     # exactly ONE canonical vault scaffolder (was: both scripts could initialize,
     # with subtle differences — gitignore entries, .gitattributes presence).
-    my $vault_sync = "$home/.claude/ccpraxis/scripts/vault-sync.pl";
+    my $vault_sync = "$home/.claude/ccpraxis/plugins/steward/scripts/vault-sync.pl";
     unless (-f $vault_sync) {
         emit("STATUS", "error");
         emit("ERROR",  "vault-sync.pl not found at $vault_sync — cannot init vault. Ensure ccpraxis is installed.");

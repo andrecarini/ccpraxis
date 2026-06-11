@@ -29,7 +29,7 @@ content_matches() {
 
 # Repo-owned files (these are the source of truth, not copied)
 REPO_FILES="global-config/CLAUDE.md global-config/settings.json"
-SCRIPT_FILES="scripts/statusline.pl skills/backup/scripts/json-diff.pl skills/backup/scripts/filter-diff.pl skills/backup/scripts/save-preference.pl skills/backup/scripts/check-plugins.pl skills/backup/scripts/sync-export.sh skills/backup/scripts/sensitive-check.sh"
+SCRIPT_FILES="scripts/statusline.pl plugins/steward/scripts/json-diff.pl plugins/steward/scripts/filter-diff.pl plugins/steward/scripts/save-preference.pl plugins/steward/scripts/check-plugins.pl plugins/steward/scripts/sync-export.sh plugins/steward/scripts/sensitive-check.sh plugins/steward/scripts/vault-sync.pl plugins/steward/scripts/onboard.pl plugins/steward/scripts/ccpraxis-helpers.pl plugins/steward/scripts/claude-binary-backup.pl"
 # Skills are discovered dynamically
 SKILL_FILES=""
 for skill_dir in "$EXPORT_DIR"/skills/*/; do

@@ -61,7 +61,6 @@
    "permissions" : {
       "allow" : [
          "Read",
-         "Skill(backup)",
          "Skill(beacon:delete)",
          "Skill(beacon:list)",
          "Skill(beacon:off)",
@@ -75,6 +74,9 @@
          "Skill(create-todo)",
          "Skill(manage-todos)",
          "Skill(resume-todo)",
+         "Skill(steward:audit)",
+         "Skill(steward:backup)",
+         "Skill(steward:setup)",
          "Skill(update)",
          "Bash(find *)",
          "Bash(grep *)",
@@ -89,9 +91,8 @@
          "Bash(git rm *)",
          "Bash(perl ~/.claude/ccpraxis/plugins/beacon/scripts/*)",
          "Bash(perl ~/.claude/ccpraxis/scripts/*)",
-         "Bash(perl ~/.claude/ccpraxis/skills/backup/scripts/*)",
-         "Bash(perl ~/.claude/skills/backup/scripts/*)",
-         "Bash(bash ~/.claude/skills/backup/scripts/*)",
+         "Bash(perl ~/.claude/ccpraxis/plugins/steward/scripts/*)",
+         "Bash(bash ~/.claude/ccpraxis/plugins/steward/scripts/*)",
          "WebFetch",
          "WebSearch"
       ],

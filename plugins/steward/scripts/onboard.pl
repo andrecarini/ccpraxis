@@ -32,7 +32,7 @@ my $script_dir = dirname(abs_path(__FILE__));        # plugins/steward/scripts
 my $plugins    = abs_path("$script_dir/../..");        # plugins/
 my $ccpraxis   = abs_path("$plugins/..");              # repo root
 my $bp_migrate = "$plugins/blueprint/scripts/bp-migrate-plans.pl";
-my $vault_sync = "$ccpraxis/scripts/vault-sync.pl";
+my $vault_sync = "$script_dir/vault-sync.pl";
 
 my %summary = (root => $root);
 

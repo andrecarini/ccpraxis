@@ -5,7 +5,7 @@ A curated [Claude Code](https://docs.anthropic.com/en/docs/claude-code) configur
 
 - **Global instructions** — supply chain security rules, response style, dev tooling restrictions
 - **Custom statusline** — model, context usage, token counts, plan rate limits with reset timers
-- **Config sync** (`/backup`) — bidirectional drift detection, AI-assisted conflict merging, secret scanning
+- **Config sync** (`/steward:backup`) — bidirectional drift detection, AI-assisted conflict merging, secret scanning
 - **Vault sync** — a private `claude-code-vault` git repo backs up todos and project-scoped Claude files (CLAUDE.md, skills, blueprints, memory) across machines, with 3-way merge, locking, journaling, atomic staging, and a pre-rename secret scan
 - **Podman sandbox** (`claude-sandbox`) — isolated rootless containers with full Claude autonomy, interactive skill selection, blocked install hooks, 7-day package age minimum
 - **Backpack plugin** — per-project declarative manifest of tools/runtimes/setup commands that's replayed on every container rebuild
@@ -44,17 +44,17 @@ Optional:
 
     > Install ccpraxis from `https://github.com/<your-user>/ccpraxis`. My vault repo is `git@github.com:<your-user>/claude-code-vault.git`.
 
-   (You can skip the vault URL if you don't want personal backups yet — set it up later via `perl ~/.claude/ccpraxis/scripts/vault-sync.pl init --url <repo-url>`.)
+   (You can skip the vault URL if you don't want personal backups yet — set it up later via `perl ~/.claude/ccpraxis/plugins/steward/scripts/vault-sync.pl init --url <repo-url>`.)
 4. **Stay at the terminal during install.** Claude will hit two confirmation gates that need your input: a settings-diff prompt (if you already have a `~/.claude/settings.json`) and an install-plan review for PATH changes. Both take a few seconds each.
 5. Then restart Claude Code.
 
-After install, `/backup` keeps everything in sync. To track a specific project's Claude files in the vault, `cd` into it and run `/steward:setup` (or accept the prompt that `/backup` shows when you're inside an unregistered project with Claude files).
+After install, `/steward:backup` keeps everything in sync. To track a specific project's Claude files in the vault, `cd` into it and run `/steward:setup` (or accept the prompt that `/steward:backup` shows when you're inside an unregistered project with Claude files).
 
 ### Daily use
 
 Once installed, here's what you'll actually type day-to-day, grouped by job:
 
-**Syncing your config and personal state across machines.** Run `/backup` from anywhere. It pushes drift between your live `~/.claude/` and the ccpraxis repo, then iterates every registered vault project and syncs them too. If you're inside a project that has Claude files but isn't tracked yet, it offers to register it.
+**Syncing your config and personal state across machines.** Run `/steward:backup` from anywhere. It pushes drift between your live `~/.claude/` and the ccpraxis repo, then iterates every registered vault project and syncs them too. If you're inside a project that has Claude files but isn't tracked yet, it offers to register it.
 
 **Adding a new project to your personal vault.** `cd` into the project and run `/steward:setup`. The skill picks a slug, lets you confirm which files to track, and does an initial sync. On a fresh machine, the same command surfaces vault-only "orphan" projects so you can link the local directory back to existing vault state.
 
@@ -100,7 +100,7 @@ git fetch upstream
 git merge upstream/main   # or: git rebase upstream/main
 ```
 
-Run `/backup` afterwards to resync your live `~/.claude/` with any settings changes.
+Run `/steward:backup` afterwards to resync your live `~/.claude/` with any settings changes.
 
 ---
 
@@ -264,14 +264,25 @@ ccpraxis/
 │   │           ├── 18-multi-session-shared-state.t
 │   │           ├── 21-select-session-multiple.t
 │   │           └── 22-mountspec-edge-cases.t
-│   └── steward/                             # Meta-plugin that audits and maintains ccpraxis, and onboards projects to it.
+│   └── steward/                             # Meta-plugin that maintains ccpraxis and owns its backup/onboarding.
 │       ├── .claude-plugin/
 │       │   └── plugin.json
 │       ├── scripts/
-│       │   └── onboard.pl                   # deterministically prepare a project to use the ccpraxis blueprint
+│       │   ├── ccpraxis-helpers.pl          # Deterministic subcommands for /backup (sync-skills, etc.) — replaces several LLM-driven prose steps with scripted ones; emits JSON the skill consumes
+│       │   ├── check-plugins.pl             # Detects missing or stale plugins vs settings.json
+│       │   ├── claude-binary-backup.pl      # Snapshot / list / restore / prune / verify / detect for the Claude Code binary — gives /update a deterministic safety net before any installer runs
+│       │   ├── filter-diff.pl               # Filters json-diff output through saved preferences
+│       │   ├── json-diff.pl                 # Semantic JSON diff (--deep-exclude, structured report)
+│       │   ├── onboard.pl                   # deterministically prepare a project to use the ccpraxis blueprint
+│       │   ├── save-preference.pl           # Records "remember this divergence" decisions
+│       │   ├── sensitive-check.sh           # Scans for secrets before committing
+│       │   ├── sync-export.sh               # Detects drift between live config and this repo
+│       │   └── vault-sync.pl                # Central engine for claude-code-vault project backups.
 │       └── skills/
 │           ├── audit/
 │           │   └── SKILL.md                 # Audits the ccpraxis repo itself — fans out read-only subagents (per-system re…
+│           ├── backup/
+│           │   └── SKILL.md                 # Syncs everything personal between the live host and your private repos — ccpr…
 │           └── setup/
 │               └── SKILL.md                 # Onboard the current project to the ccpraxis system — create the local data di…
 ├── references/
@@ -290,20 +301,8 @@ ccpraxis/
 │   ├── todo-sync.pl                         # Vault todos: list/create/done/sync (git ops scoped to todos/)
 │   ├── update-bootstrap-monitor.pl          # /update support: versioned archive + drift check for upstream bootstrap.ps1
 │   ├── update-install.pl                    # /update support: direct-binary install pipeline (detect / manifest / install / verify)
-│   ├── update-research.pl                   # /update support: fetches GitHub releases + changelog presence + symptom searches against issues
-│   └── vault-sync.pl                        # Vault project backups: register, sync (3-way merge), conflict resolution, commit-and-push. Locking, journal, atomic staging, pre-rename sensitive-data scan.
+│   └── update-research.pl                   # /update support: fetches GitHub releases + changelog presence + symptom searches against issues
 └── skills/
-    ├── backup/                              # /backup — sync ccpraxis config + every registered vault project
-    │   ├── SKILL.md
-    │   └── scripts/
-    │       ├── ccpraxis-helpers.pl          # Deterministic subcommands for /backup (sync-skills, etc.) — replaces several LLM-driven prose steps with scripted ones; emits JSON the skill consumes
-    │       ├── check-plugins.pl             # Detects missing or stale plugins vs settings.json
-    │       ├── claude-binary-backup.pl      # Snapshot / list / restore / prune / verify / detect for the Claude Code binary — gives /update a deterministic safety net before any installer runs
-    │       ├── filter-diff.pl               # Filters json-diff output through saved preferences
-    │       ├── json-diff.pl                 # Semantic JSON diff (--deep-exclude, structured report)
-    │       ├── save-preference.pl           # Records "remember this divergence" decisions
-    │       ├── sensitive-check.sh           # Scans for secrets before committing
-    │       └── sync-export.sh               # Detects drift between live config and this repo
     ├── create-skill/
     │   └── SKILL.md                         # /create-skill         — create new skill(s) with auto-linking
     ├── create-todo/
@@ -340,7 +339,7 @@ The orchestrator is two-phase: a bare run prints the plan and exits without touc
 ### Slash commands
 
 **Config and sync**
-- `/backup` — sync ccpraxis config + every registered vault project (drift detection, AI-assisted conflict merge, secret scan, push). `host-only`.
+- `/steward:backup` — sync ccpraxis config + every registered vault project (drift detection, AI-assisted conflict merge, secret scan, push). `host-only`.
 - `/steward:setup` — bootstrap a project for vault backup (orphan discovery, slug pick, initial sync). `host-only`.
 - `/refresh` — re-read all CLAUDE.md files and summarize key rules.
 
@@ -399,7 +398,7 @@ Opus 4.6 1M  22% |220k 780k| 5h 15%|3h 46m|  7d 12%|4d 22h|
 - Wraps to 3 lines if terminal is too narrow
 - Requires: git, terminal with 24-bit color (Windows Terminal, iTerm2, WezTerm, Kitty)
 
-### /backup flow
+### /steward:backup flow
 
 Bidirectional sync between your live `~/.claude/` config and your ccpraxis repo:
 
@@ -508,7 +507,7 @@ Available skills for this sandbox:
 Toggle by number (comma-separated), 'a' for all, Enter to confirm:
 ```
 
-- Skills with `host-only: true` in their YAML frontmatter are excluded (e.g. `/backup`, `/create-skill`, `/sandbox:setup`, `/update`)
+- Skills with `host-only: true` in their YAML frontmatter are excluded (e.g. `/steward:backup`, `/create-skill`, `/sandbox:setup`, `/update`)
 - Both custom skills and plugin skills are discovered automatically
 - Selections are saved per project in `.claude-data/.launcher/selected-skills.json`
 - The picker only re-appears when new skills are detected; otherwise it uses the saved selection
@@ -615,7 +614,7 @@ The system is packaged as a local Claude Code **plugin**, bundling every skill w
 
 **Completion-nudge hook — propose, don't auto-act.** `plugins/beacon/hooks/completion-nudge.pl` is registered as a `UserPromptSubmit` hook via the plugin's `hooks/hooks.json` — auto-enabled on host and (when the user selects the beacon plugin in the claude-sandbox TUI) inside the sandbox; no `settings.json` edit needed on either surface. The registration uses shell form (`"command": "perl \"${CLAUDE_PLUGIN_ROOT}/hooks/completion-nudge.pl\""`) rather than exec form: exec form's libuv-based `uv_spawn` does NOT enumerate PATHEXT on Windows, so a bare `perl` can't resolve to `perl.exe`; shell form runs through Git Bash, which handles the extension correctly. Same pattern as the backpack `auto-declare` hook. On every prompt the user submits, the hook does a cheap word-boundary regex over the prompt text against the completion-signal list documented in `/beacon:off`'s SKILL.md description ("done", "shipped", "merged", "deployed", "landed", "PR opened", "lgtm", "looks good", "let's call it", ...). If no signal is present, the hook exits silently — no subprocess spawn, just the perl cold start + a regex match. If a signal IS present AND a beacon exists for the current `session_id`, the hook shells out to sibling `beacon.pl get` via `IPC::Open3` with stdout/stderr drained (otherwise the script's pretty-printed JSON record would leak into the hook's own stdout and Claude Code would silently misread it as plain-text `additionalContext`) and emits a `hookSpecificOutput.additionalContext` nudging Claude to evaluate sub-task-vs-session completion against the SKILL.md anti-trigger examples and offer `/beacon:off`. The hook **never** calls `beacon.pl unbeacon` itself — the `AskUserQuestion` Claude asks BEFORE invoking `/beacon:off` proactively (per the skill description's "ALWAYS confirm" clause) is what gates removal. Direct user invocation of `/beacon:off` skips that ask since the slash command itself is the consent. Same propose-only design as the backpack `auto-declare` hook: cost of a missed signal is one extra cleanup pass via `claude-beacon` or `/beacon:delete`, so the hook casts wide and Claude does the fine-grained call with full conversation context. Always exits 0 — a hook failure must not block the user's prompt.
 
-**Cross-machine sync:** `/backup` includes vault-root `beacons/` in its push step (`vault-sync.pl sync-beacons` — pre-flight sandbox ingestion, secret scan, commit, push), so beacon state survives across machines just like project content.
+**Cross-machine sync:** `/steward:backup` includes vault-root `beacons/` in its push step (`vault-sync.pl sync-beacons` — pre-flight sandbox ingestion, secret scan, commit, push), so beacon state survives across machines just like project content.
 
 ### Platforms
 
@@ -670,7 +669,7 @@ The script is idempotent — re-runs converge from any prior state (plain copy, 
   ```
 - If it already exists: run the semantic diff to compare, then present each difference to the user interactively:
   ```bash
-  perl ~/.claude/ccpraxis/skills/backup/scripts/json-diff.pl ~/.claude/settings.json ~/.claude/ccpraxis/global-config/settings.json
+  perl ~/.claude/ccpraxis/plugins/steward/scripts/json-diff.pl ~/.claude/settings.json ~/.claude/ccpraxis/global-config/settings.json
   ```
   For each key in `only_right` (in repo but not live) or `diverged` (different values), ask the user whether to adopt the repo value or keep their existing value. Keys in `only_left` (in live but not repo) are the user's own additions — keep them.
 
@@ -716,7 +715,7 @@ git remote add upstream https://github.com/andrecarini/ccpraxis.git
 **9. (If user provided a vault URL) Initialize the vault repo:**
 
 ```bash
-perl ~/.claude/ccpraxis/scripts/vault-sync.pl init --url "<vault-url>"
+perl ~/.claude/ccpraxis/plugins/steward/scripts/vault-sync.pl init --url "<vault-url>"
 ```
 
 The init is cwd-agnostic — it clones to a fixed location (`~/.claude/claude-code-vault/`) regardless of where you run it from. If the vault is empty, the init scaffolds `README.md`, `.gitignore` (locks, journal, tmps, machine-local registry), `.gitattributes` (`* -text` to defeat CRLF normalization), and `todos/.gitkeep`, then commits and pushes. It does NOT pre-create `beacons/` or `projects/<slug>/` — those land lazily on first use (a `/beacon:on` will materialize `beacons/`; a `/steward:setup` will materialize `projects/<slug>/`). If the vault is already populated (e.g. from another machine), the clone preserves its contents.

@@ -101,7 +101,7 @@ my @HARD_EXCLUDE_REGEX = (
 );
 
 my $SCRIPT_DIR = abs_path(dirname(__FILE__));
-my $SENSITIVE_CHECK = "$home/.claude/ccpraxis/skills/backup/scripts/sensitive-check.sh";
+my $SENSITIVE_CHECK = "$SCRIPT_DIR/sensitive-check.sh";   # sibling in plugins/steward/scripts/
 
 # Perl-native secret patterns — mirror sensitive-check.sh. Defined here (before the
 # dispatcher) so that the `my` initializer actually runs before any subcommand calls

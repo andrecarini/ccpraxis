@@ -137,7 +137,7 @@ If the user picks "Stay on vCurrent", exit — no further steps.
 **Before** invoking any installer, snapshot the live Claude Code binary. This guarantees the user can revert if the installer leaves a broken binary in place (which has happened on real installs — see the Bun 1.3.14 regression of May 2026).
 
 ```bash
-perl ~/.claude/skills/backup/scripts/claude-binary-backup.pl snapshot --reason "pre-install of v<SELECTED-VERSION>" --mark pre-install
+perl ~/.claude/ccpraxis/plugins/steward/scripts/claude-binary-backup.pl snapshot --reason "pre-install of v<SELECTED-VERSION>" --mark pre-install
 ```
 
 Replace `<SELECTED-VERSION>` with the user's choice from Step 8.
@@ -147,7 +147,7 @@ Replace `<SELECTED-VERSION>` with the user's choice from Step 8.
 Then prune old snapshots so the backup dir doesn't grow without bound. The script keeps the 4 newest by default:
 
 ```bash
-perl ~/.claude/skills/backup/scripts/claude-binary-backup.pl prune --keep 4
+perl ~/.claude/ccpraxis/plugins/steward/scripts/claude-binary-backup.pl prune --keep 4
 ```
 
 Surface the `snapshot.id` returned by Step 9 to the user — they may want to remember it.
@@ -173,14 +173,14 @@ If `claude --version` fails (non-zero exit, no output, crash, hang, or panic) OR
 1. **The install is broken.** Surface the exact error to the user.
 2. List available snapshots so the user can see what's there:
    ```bash
-   perl ~/.claude/skills/backup/scripts/claude-binary-backup.pl list
+   perl ~/.claude/ccpraxis/plugins/steward/scripts/claude-binary-backup.pl list
    ```
 3. Offer to revert to the pre-install snapshot. Use AskUserQuestion with two options:
    - **"Revert to pre-install snapshot (Recommended)"** — runs the restore command below.
    - **"Leave broken install in place"** — do nothing; user will fix manually.
 4. If user picks revert, run:
    ```bash
-   perl ~/.claude/skills/backup/scripts/claude-binary-backup.pl restore --latest
+   perl ~/.claude/ccpraxis/plugins/steward/scripts/claude-binary-backup.pl restore --latest
    ```
    Then verify `claude --version` works again. Tell the user to restart Claude Code.
 
@@ -192,13 +192,13 @@ Even outside `/update`, the user can revert at any time:
 
 ```bash
 # List available snapshots:
-perl ~/.claude/skills/backup/scripts/claude-binary-backup.pl list
+perl ~/.claude/ccpraxis/plugins/steward/scripts/claude-binary-backup.pl list
 
 # Revert to the most recent snapshot:
-perl ~/.claude/skills/backup/scripts/claude-binary-backup.pl restore --latest
+perl ~/.claude/ccpraxis/plugins/steward/scripts/claude-binary-backup.pl restore --latest
 
 # Revert to a specific snapshot by id:
-perl ~/.claude/skills/backup/scripts/claude-binary-backup.pl restore --snapshot <id>
+perl ~/.claude/ccpraxis/plugins/steward/scripts/claude-binary-backup.pl restore --snapshot <id>
 ```
 
 Snapshots live under `~/.claude/backups/claude-code/`. The script keeps the 4 newest by default and takes a fresh "pre-restore" snapshot before any restore op, so restores are themselves reversible.

@@ -65,7 +65,7 @@ Make sure the local `~/.claude/` is wired up correctly. This catches new skills,
 **Skills:** Mirror every skill in `~/.claude/ccpraxis/skills/` to `~/.claude/skills/`. Symlink on Unix, copy on Windows. Idempotent — `unchanged` rows mean nothing was touched.
 
 ```bash
-perl ~/.claude/skills/backup/scripts/ccpraxis-helpers.pl sync-skills
+perl ${CLAUDE_PLUGIN_ROOT}/scripts/ccpraxis-helpers.pl sync-skills
 ```
 
 Parse the JSON. If `status` is `partial`, surface the per-skill errors. Otherwise mention any non-`unchanged` results in the Step 7 report. Do NOT iterate the loop yourself — the script owns the file-system writes.
@@ -73,7 +73,7 @@ Parse the JSON. If `status` is `partial`, surface the per-skill errors. Otherwis
 **CLAUDE.md:**
 
 ```bash
-perl ~/.claude/skills/backup/scripts/ccpraxis-helpers.pl check-claude-md
+perl ${CLAUDE_PLUGIN_ROOT}/scripts/ccpraxis-helpers.pl check-claude-md
 ```
 
 Parse the JSON `status`:
@@ -90,8 +90,8 @@ cp ~/.claude/settings.json "$HOME/.claude/settings.json.$(date +%Y-%m-%dT%H%M%S)
 Do NOT auto-modify the live settings without user approval. Run the semantic diff filtered through saved preferences:
 
 ```bash
-perl "${CLAUDE_SKILL_DIR}/scripts/json-diff.pl" ~/.claude/settings.json ~/.claude/ccpraxis/global-config/settings.json \
-  | perl "${CLAUDE_SKILL_DIR}/scripts/filter-diff.pl" --prefs "$HOME/.claude/ccpraxis/.backup-preferences.json" --scope live_vs_repo
+perl "${CLAUDE_PLUGIN_ROOT}/scripts/json-diff.pl" ~/.claude/settings.json ~/.claude/ccpraxis/global-config/settings.json \
+  | perl "${CLAUDE_PLUGIN_ROOT}/scripts/filter-diff.pl" --prefs "$HOME/.claude/ccpraxis/.backup-preferences.json" --scope live_vs_repo
 ```
 
 This outputs a JSON report with:
@@ -122,7 +122,7 @@ For each key in `needs_decision`, use AskUserQuestion to present the difference 
 For any choice that includes "(remember)", save the preference:
 
 ```bash
-perl "${CLAUDE_SKILL_DIR}/scripts/save-preference.pl" \
+perl "${CLAUDE_PLUGIN_ROOT}/scripts/save-preference.pl" \
   --prefs "$HOME/.claude/ccpraxis/.backup-preferences.json" \
   --scope live_vs_repo --key "<KEY>" --category "<CATEGORY>" --action "<ACTION>"
 ```
@@ -138,7 +138,7 @@ Map each "(remember)" option to its `--category` and `--action`:
 **Marketplaces:** Detect discrepancies between live and repo `known_marketplaces.json` (the script strips `installLocation` before comparing):
 
 ```bash
-perl ~/.claude/skills/backup/scripts/ccpraxis-helpers.pl marketplace-diff
+perl ${CLAUDE_PLUGIN_ROOT}/scripts/ccpraxis-helpers.pl marketplace-diff
 ```
 
 Parse the JSON. If `status` is `identical`, skip silently. Otherwise iterate `live_only`, `repo_only`, and `diverged` — for each discrepancy, use AskUserQuestion to present the difference and let the user choose:
@@ -165,7 +165,7 @@ After all choices, write the reconciled result to `global-config/known_marketpla
 Run the detection script:
 
 ```
-bash "${CLAUDE_SKILL_DIR}/scripts/sync-export.sh"
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/sync-export.sh"
 ```
 
 This outputs JSON describing each file's sync status:
@@ -186,7 +186,7 @@ For **live_only** / **export_only**: copy the file to the missing side.
 For **settings_changed**: run the deterministic merge script (live wins on shared keys; keys only in repo are preserved). Don't hand-merge JSON — the script handles atomic write and post-write verification:
 
 ```bash
-perl ~/.claude/skills/backup/scripts/ccpraxis-helpers.pl settings-export-merge
+perl ${CLAUDE_PLUGIN_ROOT}/scripts/ccpraxis-helpers.pl settings-export-merge
 ```
 
 Surface the result. If `status: error`, stop and report the JSON.
@@ -210,8 +210,8 @@ For **marketplace_changed**, **live_only**, or **export_only** marketplace: alre
 After `global-config/settings.json` is finalized in Step 3, run the semantic diff filtered through saved preferences:
 
 ```bash
-perl "${CLAUDE_SKILL_DIR}/scripts/json-diff.pl" ~/.claude/ccpraxis/global-config/settings.json ~/.claude/ccpraxis/plugins/sandbox/container/settings.json \
-  | perl "${CLAUDE_SKILL_DIR}/scripts/filter-diff.pl" --prefs "$HOME/.claude/ccpraxis/.backup-preferences.json" --scope global_vs_container
+perl "${CLAUDE_PLUGIN_ROOT}/scripts/json-diff.pl" ~/.claude/ccpraxis/global-config/settings.json ~/.claude/ccpraxis/plugins/sandbox/container/settings.json \
+  | perl "${CLAUDE_PLUGIN_ROOT}/scripts/filter-diff.pl" --prefs "$HOME/.claude/ccpraxis/.backup-preferences.json" --scope global_vs_container
 ```
 
 Note: keys whose values are nested objects on both sides (like `env`, `enabledPlugins`) are expanded to dotted sub-keys (e.g., `env.DISABLE_LOGIN_COMMAND`). Present each sub-key as an individual decision.
@@ -237,7 +237,7 @@ For each key in `needs_decision`, use AskUserQuestion to present the difference 
 For any choice that includes "(remember)", save the preference:
 
 ```bash
-perl "${CLAUDE_SKILL_DIR}/scripts/save-preference.pl" \
+perl "${CLAUDE_PLUGIN_ROOT}/scripts/save-preference.pl" \
   --prefs "$HOME/.claude/ccpraxis/.backup-preferences.json" \
   --scope global_vs_container --key "<KEY>" --category "<CATEGORY>" --action "<ACTION>"
 ```
@@ -255,7 +255,7 @@ Map each "(remember)" option to its `--category` and `--action`:
 Before committing, run the sensitive data scanner:
 
 ```
-bash "${CLAUDE_SKILL_DIR}/scripts/sensitive-check.sh" "$HOME/.claude/ccpraxis"
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/sensitive-check.sh" "$HOME/.claude/ccpraxis"
 ```
 
 If it finds anything, show the user what was detected and **do NOT proceed** with git operations until resolved.
@@ -295,7 +295,7 @@ If `VAULT_MISSING`, skip this step (vault not initialized on this machine — co
 Otherwise list registered projects on this machine:
 
 ```bash
-perl "$HOME/.claude/ccpraxis/scripts/vault-sync.pl" list-projects
+perl "${CLAUDE_PLUGIN_ROOT}/scripts/vault-sync.pl" list-projects
 ```
 
 If `projects` is empty, skip to Step 5.6.
@@ -306,21 +306,21 @@ For each entry in `projects` (sequentially — the vault lock serializes them; d
 
 **Stale-entry check first (fix H7 from red-team):** if the entry's `project_exists` field is `false`, the registered project directory has been moved or deleted. Surface this to the user:
 
-> ⚠ Project `<slug>` is registered but its directory no longer exists at `<path>`. Skipping. Run `perl ~/.claude/ccpraxis/scripts/vault-sync.pl unregister --slug <slug>` to remove the stale entry (vault contents will be preserved as orphans).
+> ⚠ Project `<slug>` is registered but its directory no longer exists at `<path>`. Skipping. Run `perl ${CLAUDE_PLUGIN_ROOT}/scripts/vault-sync.pl unregister --slug <slug>` to remove the stale entry (vault contents will be preserved as orphans).
 
 Then skip to the next project — do NOT call `sync-project` for a missing path.
 
 For entries with `project_exists: true`:
 
 ```bash
-perl "$HOME/.claude/ccpraxis/scripts/vault-sync.pl" sync-project --slug "<slug>"
+perl "${CLAUDE_PLUGIN_ROOT}/scripts/vault-sync.pl" sync-project --slug "<slug>"
 ```
 
 Capture the `session_id` field from the response — you'll pass it through `resolve-conflict` and `commit-and-push` (fix H2: prevents a parallel invocation from splicing into this session's journal).
 
 Handle the response:
 
-- `status: drift` — vault has uncommitted changes in `projects/<slug>/` outside any known journal (left over from an unclean exit). Surface `dirty_files` to the user; **skip this project** and continue with the next one. The user can clean up manually at `~/.claude/claude-code-vault/` and re-run `/backup`.
+- `status: drift` — vault has uncommitted changes in `projects/<slug>/` outside any known journal (left over from an unclean exit). Surface `dirty_files` to the user; **skip this project** and continue with the next one. The user can clean up manually at `~/.claude/claude-code-vault/` and re-run `/steward:backup`.
 - `status: error` — surface the error; skip this project; continue.
 - `status: synced` — continue.
 
@@ -346,14 +346,14 @@ If `conflicts` is non-empty, iterate them in order. For each conflict, use `AskU
 
 **"Abort sync":** report **explicitly** that any conflicts the user already resolved in this slug's session will be discarded:
 
-> Aborted sync for project `<slug>`. **The N conflict(s) you already resolved in this session will be discarded** — they'll be re-asked on the next `/backup`. Vault is untouched for this project. Continuing with the next project.
+> Aborted sync for project `<slug>`. **The N conflict(s) you already resolved in this session will be discarded** — they'll be re-asked on the next `/steward:backup`. Vault is untouched for this project. Continuing with the next project.
 
 Then continue to the next project. Do NOT call commit-and-push for THIS slug.
 
 **"Use local" / "Use vault" / "Use merged":** pass the same `--session-id` captured from `sync-project`:
 
 ```bash
-perl "$HOME/.claude/ccpraxis/scripts/vault-sync.pl" resolve-conflict --slug "<slug>" --path "<path>" --action <use-local|use-vault|use-merged> --session-id "<session_id>" [--merged-file "<merge_result.tmp_path>"]
+perl "${CLAUDE_PLUGIN_ROOT}/scripts/vault-sync.pl" resolve-conflict --slug "<slug>" --path "<path>" --action <use-local|use-vault|use-merged> --session-id "<session_id>" [--merged-file "<merge_result.tmp_path>"]
 ```
 
 (Pass `--merged-file` only for `use-merged`.)
@@ -363,21 +363,21 @@ perl "$HOME/.claude/ccpraxis/scripts/vault-sync.pl" resolve-conflict --slug "<sl
 After all conflicts resolved (or if there were none), pass the same `--session-id`:
 
 ```bash
-perl "$HOME/.claude/ccpraxis/scripts/vault-sync.pl" commit-and-push --slug "<slug>" --session-id "<session_id>"
+perl "${CLAUDE_PLUGIN_ROOT}/scripts/vault-sync.pl" commit-and-push --slug "<slug>" --session-id "<session_id>"
 ```
 
 Handle the response:
 
-- `committed_and_pushed` — success. Note the `last_synced_at`. If `rolled_back_during_sync` present, mention those paths (their source files changed mid-sync; will be picked up next `/backup`).
-- `sensitive_blocked` — vault was NOT modified; pre-rename scan caught secrets in staged files. Surface `findings` (file/line/pattern) to the user; tell them to remove the secrets and re-run `/backup`.
-- `sensitive_blocked_post_rename` — defense-in-depth scan caught a leak after rename. The script automatically rolls back the rename via `git checkout` and clears the journal, so the vault is restored to its pre-sync state. Surface the `findings` to the user and tell them to fix the source files before re-running `/backup`.
+- `committed_and_pushed` — success. Note the `last_synced_at`. If `rolled_back_during_sync` present, mention those paths (their source files changed mid-sync; will be picked up next `/steward:backup`).
+- `sensitive_blocked` — vault was NOT modified; pre-rename scan caught secrets in staged files. Surface `findings` (file/line/pattern) to the user; tell them to remove the secrets and re-run `/steward:backup`.
+- `sensitive_blocked_post_rename` — defense-in-depth scan caught a leak after rename. The script automatically rolls back the rename via `git checkout` and clears the journal, so the vault is restored to its pre-sync state. Surface the `findings` to the user and tell them to fix the source files before re-running `/steward:backup`.
 - `error` — surface error; continue with next project.
 
 Collect per-project results (slug, status, conflict count, rolled-back count, sensitive-blocked status) for Step 7's report.
 
 ## Step 5.6: Sync beacon vault data
 
-Beacons live at the vault root in `beacons/<uuid>.json` (separate from per-project content). They're written locally by `/beacon:on` (host) and by the statusline-triggered background sync that ingests sandbox beacons. `/backup` commits and pushes them so they survive across machines.
+Beacons live at the vault root in `beacons/<uuid>.json` (separate from per-project content). They're written locally by `/beacon:on` (host) and by the statusline-triggered background sync that ingests sandbox beacons. `/steward:backup` commits and pushes them so they survive across machines.
 
 First check the vault exists locally (reuse the same check as Step 5.5):
 
@@ -390,15 +390,15 @@ If `VAULT_MISSING`, skip this step.
 Otherwise:
 
 ```bash
-perl "$HOME/.claude/ccpraxis/scripts/vault-sync.pl" sync-beacons
+perl "${CLAUDE_PLUGIN_ROOT}/scripts/vault-sync.pl" sync-beacons
 ```
 
 Parse the JSON `status`:
 
 - `no_op` — no beacons in the vault (empty dir/absent OR nothing to push). Skip silently.
 - `synced` — note the result in Step 7's report. The response includes `count` (current beacon records), `committed` (bool — whether a commit was made this run), `pushed` (bool — whether a push happened), `ingested` (sandbox beacons newly copied into the vault), `ingest_skipped` (sandbox beacons already up-to-date). Summarize as e.g. "Synced N beacons (M ingested from sandboxes; committed; pushed)" or "Synced N beacons (no changes)".
-- `sensitive_blocked` — surface `findings` (each has `file`, `line`, `pattern`). Vault was NOT modified by this run, but the offending content lives in beacon JSONs. Tell the user to fix them (delete the offending beacon via `/beacon:delete <id-or-prefix>` OR open the JSON directly and remove the secret from the label/summary), then re-run `/backup`. Do not auto-redact — beacon labels are user-supplied and should be edited intentionally.
-- `error` — surface the error verbatim; continue with the remaining steps. If the error is "git push failed", reassure the user that the local commit DID succeed and the next `/backup` run will automatically detect the unpushed commit (via `vault_ahead_behind`) and retry the push — no manual git recovery needed.
+- `sensitive_blocked` — surface `findings` (each has `file`, `line`, `pattern`). Vault was NOT modified by this run, but the offending content lives in beacon JSONs. Tell the user to fix them (delete the offending beacon via `/beacon:delete <id-or-prefix>` OR open the JSON directly and remove the secret from the label/summary), then re-run `/steward:backup`. Do not auto-redact — beacon labels are user-supplied and should be edited intentionally.
+- `error` — surface the error verbatim; continue with the remaining steps. If the error is "git push failed", reassure the user that the local commit DID succeed and the next `/steward:backup` run will automatically detect the unpushed commit (via `vault_ahead_behind`) and retry the push — no manual git recovery needed.
 
 If the response has `ingest_errors` (sandbox ingestion partial failures), mention them informationally — the main commit/push still proceeded.
 
@@ -406,7 +406,7 @@ If the response has `ingest_errors` (sandbox ingestion partial failures), mentio
 
 ```bash
 CWD="$(pwd -P)"
-perl "$HOME/.claude/ccpraxis/scripts/vault-sync.pl" is-registered --cwd "$CWD"
+perl "${CLAUDE_PLUGIN_ROOT}/scripts/vault-sync.pl" is-registered --cwd "$CWD"
 ```
 
 If `registered: true`, skip (already handled in Step 5.5).
@@ -424,7 +424,7 @@ If `SKIP_MARKER` is present, skip the offer — but **mention it in the Step 7 r
 Otherwise check whether the cwd has anything worth tracking:
 
 ```bash
-perl "$HOME/.claude/ccpraxis/scripts/vault-sync.pl" detect-trackable --cwd "$CWD"
+perl "${CLAUDE_PLUGIN_ROOT}/scripts/vault-sync.pl" detect-trackable --cwd "$CWD"
 ```
 
 If `trackable` is empty, skip (nothing to back up).
@@ -437,7 +437,7 @@ If `trackable` is non-empty, use `AskUserQuestion`:
 
 - **"Yes, register"** — invoke the `/steward:setup` skill (use the `Skill` tool with `skill: "steward:setup"`, empty args). Do NOT try to register manually — the skill owns the bootstrap flow.
 - **"Not now"** — skip this time. Mention they can run `/steward:setup` later.
-- **"Don't ask again for this directory"** — create the opt-out marker so future `/backup` runs skip the offer:
+- **"Don't ask again for this directory"** — create the opt-out marker so future `/steward:backup` runs skip the offer:
   ```bash
   mkdir -p "$CWD/.claude" && : > "$CWD/.claude/backup-skip"
   ```
@@ -448,7 +448,7 @@ If `trackable` is non-empty, use `AskUserQuestion`:
 Run the plugin check script:
 
 ```bash
-perl "${CLAUDE_SKILL_DIR}/scripts/check-plugins.pl" \
+perl "${CLAUDE_PLUGIN_ROOT}/scripts/check-plugins.pl" \
   --settings "$HOME/.claude/ccpraxis/global-config/settings.json" \
   --installed "$HOME/.claude/plugins/installed_plugins.json" \
   --marketplaces "$HOME/.claude/plugins/known_marketplaces.json"
@@ -466,7 +466,7 @@ If `status` is `"missing_plugins"`:
 List snapshots taken by `/update` (or manually). This is informational only — don't prompt for revert during a regular sync.
 
 ```bash
-perl ~/.claude/skills/backup/scripts/claude-binary-backup.pl list
+perl ${CLAUDE_PLUGIN_ROOT}/scripts/claude-binary-backup.pl list
 ```
 
 Capture the `count` and the newest snapshot's `id` + `version` from the JSON for the report in Step 7. If the script fails or returns count=0, just skip — no snapshots is a normal state.
@@ -481,7 +481,7 @@ Summarize:
 - Beacons (Step 5.6): one line — "N beacons synced (committed/pushed)" or "no changes" or "skipped (vault missing)" or "sensitive_blocked" with the findings if any
 - Current-project registration prompt (Step 5.7): offered? user's choice?
 - Plugins: any installed or missing
-- Claude Code snapshots: count, plus newest id and version (from Step 6.6). One line. Mention the revert command: `perl ~/.claude/skills/backup/scripts/claude-binary-backup.pl restore --latest`.
+- Claude Code snapshots: count, plus newest id and version (from Step 6.6). One line. Mention the revert command: `perl ${CLAUDE_PLUGIN_ROOT}/scripts/claude-binary-backup.pl restore --latest`.
 
 ## Step R: Snapshot/revert mode
 
@@ -490,7 +490,7 @@ When invoked in revert/snapshot intent (not full sync), do ONLY the steps below.
 ### R.1 — List available snapshots
 
 ```bash
-perl ~/.claude/skills/backup/scripts/claude-binary-backup.pl list
+perl ${CLAUDE_PLUGIN_ROOT}/scripts/claude-binary-backup.pl list
 ```
 
 Parse the JSON. Show the user a numbered table: id, version, captured_at_utc, reason (if present), mark (if present), corrupt flag. Newest first.
@@ -500,7 +500,7 @@ If `count` is 0: tell the user no snapshots exist (probably never ran `/update` 
 ### R.2 — Detect current binary state
 
 ```bash
-perl ~/.claude/skills/backup/scripts/claude-binary-backup.pl detect
+perl ${CLAUDE_PLUGIN_ROOT}/scripts/claude-binary-backup.pl detect
 ```
 
 Surface the current binary's path, version, and SHA-256. This helps the user see whether they actually need to revert.
@@ -518,10 +518,10 @@ Use AskUserQuestion:
 
 ```bash
 # Restore latest:
-perl ~/.claude/skills/backup/scripts/claude-binary-backup.pl restore --latest
+perl ${CLAUDE_PLUGIN_ROOT}/scripts/claude-binary-backup.pl restore --latest
 
 # Or restore a specific id:
-perl ~/.claude/skills/backup/scripts/claude-binary-backup.pl restore --snapshot <id>
+perl ${CLAUDE_PLUGIN_ROOT}/scripts/claude-binary-backup.pl restore --snapshot <id>
 ```
 
 The script automatically takes a pre-restore snapshot before swapping the binary, so the restore is itself reversible.
@@ -539,7 +539,7 @@ If `claude --version` fails: surface the error. The pre-restore snapshot id is t
 ### R.5 — Execute verify (if chosen)
 
 ```bash
-perl ~/.claude/skills/backup/scripts/claude-binary-backup.pl verify --snapshot <id>
+perl ${CLAUDE_PLUGIN_ROOT}/scripts/claude-binary-backup.pl verify --snapshot <id>
 ```
 
 Report the JSON. If exit code is 2 (integrity failure), surface the details — the snapshot is corrupt and cannot safely be restored from. Running `prune --keep N` will auto-remove ALL corrupt entries (corrupt entries are dropped regardless of the keep-N window). To force-remove a single corrupt snapshot without touching others, the user can `rm -rf ~/.claude/backups/claude-code/<id>` manually.
