@@ -2464,6 +2464,17 @@ sub scan_dir_for_secrets {
 }
 
 sub scan_files_for_secrets {
+    # ── VAULT SECRET-SCANNING DISABLED (policy decision 2026-06-11) ──────────
+    # The vault is a *private* backup repo: it backs up project + beacon content
+    # verbatim, including secret-shaped strings (a project's CLAUDE.md may
+    # legitimately reference a Sentry DSN, an API key, etc.). Secret-scanning is
+    # the job of the *public* ccpraxis repo only — scripts/sensitive-check.sh,
+    # run at backup Step 4 before the public git push. This is the single leaf
+    # scanner; scan_dir_for_secrets delegates here, so returning empty here
+    # disables the project pre-rename, project post-rename, and beacon scans
+    # all at once. To re-enable vault scanning, delete the next line.
+    return [];
+
     my @files = @_;
     my @findings;
     for my $file (@files) {
