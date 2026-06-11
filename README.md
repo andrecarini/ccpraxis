@@ -277,8 +277,8 @@ ccpraxis/
 │   │   │   ├── json-diff.pl                 # Semantic JSON diff (--deep-exclude, structured report)
 │   │   │   ├── onboard.pl                   # deterministically prepare a project to use the ccpraxis blueprint
 │   │   │   ├── save-preference.pl           # Records "remember this divergence" decisions
-│   │   │   ├── sensitive-check.sh           # Scans for secrets before committing
-│   │   │   ├── sync-export.sh               # Detects drift between live config and this repo
+│   │   │   ├── sensitive-check.pl           # Scans the public ccpraxis repo for secrets before committing
+│   │   │   ├── sync-export.pl               # Detects drift between live config and this repo
 │   │   │   └── vault-sync.pl                # Central engine for claude-code-vault project backups.
 │   │   └── skills/
 │   │       ├── audit/
@@ -452,9 +452,9 @@ To change what's offered by default, edit `@DEFAULT_TRACKABLE` and `%HARD_EXCLUD
 
 **Robustness:**
 - Two-level locking (vault `.lock` + per-project `.lock`) with PID+ISO-timestamp and 10-min stale reclaim
-- Atomic `.vault-sync.tmp` staging + batch-rename only after sensitive-check passes
+- Atomic `.vault-sync.tmp` staging + batch-rename of staged files
 - Journal at `<vault>/projects/<slug>/.sync-journal.json` with phases (`staging` → `awaiting_resolution` → `renaming` → `sensitive_check` → `committing`); reconciliation on every sync start so an interrupted sync recovers cleanly
-- Pre-rename Perl-native sensitive-data scan (works on `.tmp` files regardless of extension) + post-rename `sensitive-check.sh` defense-in-depth
+- Secret-scanning is intentionally **not** applied to the private vault — it's a personal backup, so it stores project/beacon content (CLAUDE.md, blueprints) verbatim. Secret-scanning is the *public* ccpraxis repo's job only (`sensitive-check.pl`, backup Step 4). The vault scan hooks (`scan_files_for_secrets`, the `sensitive_check` journal phase) remain in code but are disabled by policy — re-enable by restoring `scan_files_for_secrets`
 - File-modified-during-sync rollback (re-hash before final rename)
 - Path safety (no `..`, no absolute paths, no backslashes; symlinks skipped via `File::Find` preprocess)
 

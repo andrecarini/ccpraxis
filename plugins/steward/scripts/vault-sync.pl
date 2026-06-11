@@ -101,9 +101,9 @@ my @HARD_EXCLUDE_REGEX = (
 );
 
 my $SCRIPT_DIR = abs_path(dirname(__FILE__));
-my $SENSITIVE_CHECK = "$SCRIPT_DIR/sensitive-check.sh";   # sibling in plugins/steward/scripts/
+my $SENSITIVE_CHECK = "$SCRIPT_DIR/sensitive-check.pl";   # sibling in plugins/steward/scripts/
 
-# Perl-native secret patterns — mirror sensitive-check.sh. Defined here (before the
+# Perl-native secret patterns — mirror sensitive-check.pl. Defined here (before the
 # dispatcher) so that the `my` initializer actually runs before any subcommand calls
 # scan_files_for_secrets. (File-scope `my` runs its initializer in source order.)
 # v1.1.11: prefix-only patterns now require a sufficient suffix run so that
@@ -1203,7 +1203,7 @@ sub finalize_commit {
     my $mid_sync_rollbacks = $rename_report->{rolled_back};
 
     # Defense-in-depth: re-scan the renamed vault content. Use the Perl-native
-    # scanner (extension-agnostic, content-based) instead of sensitive-check.sh
+    # scanner (extension-agnostic, content-based) instead of sensitive-check.pl
     # which has an extension allowlist (H11 from red-team).
     journal_set_phase($slug, 'sensitive_check');
     my $post_findings = scan_dir_for_secrets($vproj);
@@ -2398,16 +2398,16 @@ sub vault_ahead_behind {
 
 sub run_sensitive_check {
     my $dir = shift;
-    # Fix C3 (red-team): fail CLOSED when sensitive-check.sh is missing.
+    # Fix C3 (red-team): fail CLOSED when sensitive-check.pl is missing.
     unless (-f $SENSITIVE_CHECK) {
         return {
             blocked => 1,
-            output  => "FAIL-CLOSED: sensitive-check.sh not found at $SENSITIVE_CHECK. " .
+            output  => "FAIL-CLOSED: sensitive-check.pl not found at $SENSITIVE_CHECK. " .
                        "Restore the ccpraxis install or set SENSITIVE_CHECK=/path/to/scanner. " .
                        "Refusing to push to vault without the defense-in-depth scan.",
         };
     }
-    my ($out, $exit) = _run_capture_both('bash', $SENSITIVE_CHECK, $dir);
+    my ($out, $exit) = _run_capture_both('perl', $SENSITIVE_CHECK, $dir);
     return {
         blocked => ($exit != 0) ? 1 : 0,
         output  => $out,
@@ -2446,7 +2446,7 @@ sub _is_documentation_match {
 
 sub scan_dir_for_secrets {
     # Recursively scan all files in a directory using the Perl-native scanner.
-    # Walks every file regardless of extension (sensitive-check.sh only scans
+    # Walks every file regardless of extension (sensitive-check.pl only scans
     # a fixed extension allowlist — that's the H11 gap). Skips symlinks and
     # binary files (null-byte detection inside scan_files_for_secrets).
     my $dir = shift;
@@ -2468,7 +2468,7 @@ sub scan_files_for_secrets {
     # The vault is a *private* backup repo: it backs up project + beacon content
     # verbatim, including secret-shaped strings (a project's CLAUDE.md may
     # legitimately reference a Sentry DSN, an API key, etc.). Secret-scanning is
-    # the job of the *public* ccpraxis repo only — scripts/sensitive-check.sh,
+    # the job of the *public* ccpraxis repo only — scripts/sensitive-check.pl,
     # run at backup Step 4 before the public git push. This is the single leaf
     # scanner; scan_dir_for_secrets delegates here, so returning empty here
     # disables the project pre-rename, project post-rename, and beacon scans
@@ -2482,7 +2482,7 @@ sub scan_files_for_secrets {
         open my $fh, '<:raw', $file or next;
         my $content = do { local $/; <$fh> };
         close $fh;
-        # Skip binary files (sensitive-check.sh effectively only matches text)
+        # Skip binary files (sensitive-check.pl effectively only matches text)
         next if $content =~ /\0/;
         my @lines = split /\n/, $content;
         my $line_no = 0;

@@ -165,7 +165,7 @@ After all choices, write the reconciled result to `global-config/known_marketpla
 Run the detection script:
 
 ```
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/sync-export.sh"
+perl "${CLAUDE_PLUGIN_ROOT}/scripts/sync-export.pl"
 ```
 
 This outputs JSON describing each file's sync status:
@@ -255,7 +255,7 @@ Map each "(remember)" option to its `--category` and `--action`:
 Before committing, run the sensitive data scanner:
 
 ```
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/sensitive-check.sh" "$HOME/.claude/ccpraxis"
+perl "${CLAUDE_PLUGIN_ROOT}/scripts/sensitive-check.pl" "$HOME/.claude/ccpraxis"
 ```
 
 If it finds anything, show the user what was detected and **do NOT proceed** with git operations until resolved.
