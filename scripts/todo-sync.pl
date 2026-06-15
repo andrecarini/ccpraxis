@@ -375,9 +375,24 @@ sub ahead_behind {
     return ($ab =~ /^(\d+)\s+(\d+)$/) ? ($1, $2) : (0, 0);
 }
 
+# Translate a path arg to a form NATIVE git resolves regardless of MSYS arg-
+# conversion state. We pass git `-C $VAULT_DIR` (a POSIX `/c/...` path); native
+# git.exe cannot resolve a bare `/c/...` when MSYS conversion is OFF (e.g. the
+# global CLAUDE.md sets MSYS2_ARG_CONV_EXCL=*), which surfaced as a spurious
+# "Cannot fetch from remote". `C:/...` (drive-letter forward-slash) is resolved by
+# git in either regime. No-op on real POSIX paths (/home, /tmp) and on any
+# non-path arg (subcommands, flags, `todos/`, refspecs), so it's safe to map over
+# every argument and portable to Linux/macOS.
+sub git_path {
+    my $p = shift;
+    return $p unless defined $p;
+    $p =~ s{^/([a-zA-Z])/}{uc($1) . ":/"}e;
+    return $p;
+}
+
 # Run a git command, capture stdout, suppress stderr. Returns chomped output.
 sub git_output {
-    my @args = @_;
+    my @args = map { git_path($_) } @_;
     my $cmd = "git " . join(" ", map { shell_escape($_) } @args) . " 2>/dev/null";
     my $out = `$cmd`;
     chomp $out if defined $out;
@@ -386,7 +401,7 @@ sub git_output {
 
 # Run a git command silently. Returns true on success.
 sub git_ok {
-    my @args = @_;
+    my @args = map { git_path($_) } @_;
     my $cmd = "git " . join(" ", map { shell_escape($_) } @args) . " >/dev/null 2>&1";
     system($cmd);
     return ($? == 0);
