@@ -12,6 +12,7 @@
 #   init             --url <repo-url>
 #   propose-slugs    --cwd <path>
 #   detect-trackable --cwd <path>
+#   refresh-default-tracked --slug <s>
 #   is-registered    --cwd <path>
 #   register --fresh --cwd <path> --slug <s> --files <comma-list>
 #   register --link  --cwd <path> --slug <s>
@@ -37,6 +38,7 @@ use JSON::PP;
 use Sys::Hostname qw(hostname);
 use Encode qw(decode encode);
 use Fcntl qw(:flock O_CREAT O_RDWR);
+use B ();
 
 # STDOUT stays in raw byte mode. JSON::PP->utf8 below emits UTF-8 bytes directly.
 # All string values are decoded from UTF-8 to Perl chars at JSON emit/write boundaries
@@ -59,20 +61,30 @@ my $TMP_SUFFIX    = ".vault-sync.tmp";
 my $LOCK_STALE_SEC = 30 * 60;  # 30 minutes
 my $REGISTRY_VERSION = 1;
 
-# Default-ON files (relative to project cwd). Order preserved for UX.
-my @DEFAULT_TRACKABLE = qw(
-    CLAUDE.md
-    .claude/CLAUDE.md
-    .claude/skills
-    .claude/agents
-    .claude/hooks
-    .claude/commands
-    .claude/plans
-    .claude-plans
-    .claude-data/memory
-    .claude-data/plans
-    .claude-data/backpack.json
-    .ccpraxis-local-data/blueprints
+# The synthetic tracked path: this machine's HOST-side Claude memory dir, which
+# lives OUTSIDE the project tree at ~/.claude/projects/<encoded(cwd)>/memory.
+# local_abs() remaps it; everything else in @DEFAULT_TRACKABLE is literal and
+# relative to the project cwd. In the vault it is stored like any other tracked
+# path, under projects/<slug>/files/_host-memory/. (Decision #1.)
+my $HOST_MEMORY_REL = '_host-memory';
+
+# Default-ON tracked paths. All are relative to the project cwd EXCEPT
+# $HOST_MEMORY_REL (see above), which local_abs() resolves to the host memory
+# dir. Order preserved for UX.
+my @DEFAULT_TRACKABLE = (
+    'CLAUDE.md',
+    '.claude/CLAUDE.md',
+    '.claude/skills',
+    '.claude/agents',
+    '.claude/hooks',
+    '.claude/commands',
+    '.claude/plans',
+    '.claude-plans',
+    '.claude-data/projects/-project/memory',  # in-container (sandbox) memory
+    '.claude-data/plans',
+    '.claude-data/backpack.json',
+    '.ccpraxis-local-data/blueprints',
+    $HOST_MEMORY_REL,                          # host-side memory (synthetic; see local_abs)
 );
 
 # Hard-excludes — relative paths. Enforced at walk time AND at register-time.
@@ -148,8 +160,10 @@ my $cmd = shift @ARGV // 'help';
 if    ($cmd eq 'init')              { cmd_init() }
 elsif ($cmd eq 'propose-slugs')     { cmd_propose_slugs() }
 elsif ($cmd eq 'detect-trackable')  { cmd_detect_trackable() }
+elsif ($cmd eq 'host-memory-path')  { cmd_host_memory_path() }
 elsif ($cmd eq 'is-registered')     { cmd_is_registered() }
 elsif ($cmd eq 'ensure-tracked')    { cmd_ensure_tracked() }
+elsif ($cmd eq 'refresh-default-tracked') { cmd_refresh_default_tracked() }
 elsif ($cmd eq 'register')          { cmd_register() }
 elsif ($cmd eq 'unregister')        { cmd_unregister() }
 elsif ($cmd eq 'list-projects')     { cmd_list_projects() }
@@ -228,12 +242,12 @@ sub cmd_init {
     }
 
     # Verify remote is reachable
-    unless (git_ok_raw('ls-remote', $url)) {
+    unless (git_ok_raw('ls-remote', git_path($url))) {
         emit_error("Cannot reach remote: $url. Check the URL and credentials.");
     }
 
     # Clone
-    unless (git_ok_raw('clone', $url, $VAULT_DIR)) {
+    unless (git_ok_raw('clone', git_path($url), git_path($VAULT_DIR))) {
         emit_error("Clone failed for: $url");
     }
 
@@ -329,7 +343,7 @@ sub cmd_detect_trackable {
 
     my @found;
     for my $rel (@DEFAULT_TRACKABLE) {
-        my $abs = "$cwd/$rel";
+        my $abs = local_abs($cwd, $rel);
         next unless -e $abs;
         my $is_dir = -d $abs;
         my $size = $is_dir ? dir_size($abs) : (-s $abs // 0);
@@ -383,6 +397,81 @@ sub cmd_ensure_tracked {
         path          => $path,
         tracked_paths => \@tp,
         note          => "Added to this machine's project metadata; backed up on the next /backup. Vault-side metadata (cross-machine restore hints) is updated by the normal register/link flow.",
+    });
+}
+
+# ── host-memory-path ────────────────────────────────────────────────
+# Resolve THIS machine's host memory dir for a project cwd (the synthetic
+# _host-memory entry's local root). Canonicalizes the cwd with the SAME
+# norm_path(abs_path(...)) that cmd_register applies before storing it in the
+# registry, so the probe's encoding matches what sync-project actually resolves
+# via local_abs (abs_path falls back to the raw cwd for paths that don't exist,
+# so the pure encoding is still computable for non-existent vectors). Used by the
+# harness's byte-for-byte encoding assertion and available to the backup skill to
+# show where host memories come from.
+sub cmd_host_memory_path {
+    my %opts = parse_opts(\@ARGV, qw(cwd));
+    my $cwd  = require_opt(\%opts, 'cwd');
+    $cwd = norm_path(abs_path($cwd) // $cwd);
+    my $dir  = host_memory_dir($cwd);
+    emit_json({
+        cwd        => $cwd,
+        encoded    => encode_project_dir($cwd),
+        memory_dir => $dir,
+        exists     => (-d $dir ? JSON::PP::true : JSON::PP::false),
+    });
+}
+
+# ── refresh-default-tracked ─────────────────────────────────────────
+# Idempotently add any @DEFAULT_TRACKABLE path that now EXISTS locally (resolved
+# via local_abs, so the synthetic _host-memory dir is included) but isn't yet in
+# this project's LOCAL tracked_paths. Local-only, like ensure-tracked: the vault
+# tracked_paths converge on the next sync-project via reconcile_vault_tracked_-
+# paths (item 4) within that sync's commit. Wired into the backup skill's Step 5.5
+# as a per-project pre-step, so default paths that didn't exist at registration
+# (e.g. host memories created later) start getting backed up without a re-register.
+sub cmd_refresh_default_tracked {
+    my %opts = parse_opts(\@ARGV, qw(slug));
+    my $slug = require_opt(\%opts, 'slug');
+
+    my $reg   = read_registry();
+    my $entry = $reg->{projects}{$slug};
+    emit_error("Slug '$slug' is not registered on this machine.") unless $entry;
+    my $cwd = $entry->{path};
+
+    my $pmpath = project_metadata_path($cwd);
+    emit_error("Project metadata missing at $pmpath") unless -f $pmpath;
+    my $pmeta = read_json($pmpath);
+    my @tp = @{ $pmeta->{tracked_paths} // [] };
+    my %tracked = map { $_ => 1 } @tp;
+
+    my (@added, @already, @absent);
+    for my $rel (@DEFAULT_TRACKABLE) {
+        next if is_hard_excluded($rel);
+        if ($tracked{$rel}) {
+            push @already, $rel;
+        } elsif (-e local_abs($cwd, $rel)) {
+            push @tp, $rel;
+            $tracked{$rel} = 1;
+            push @added, $rel;
+        } else {
+            push @absent, $rel;
+        }
+    }
+
+    if (@added) {
+        $pmeta->{tracked_paths} = \@tp;
+        write_json($pmpath, $pmeta);
+    }
+
+    emit_json({
+        status          => @added ? 'tracked_added' : 'already_tracked',
+        slug            => $slug,
+        added           => \@added,
+        already_tracked => \@already,
+        absent          => \@absent,
+        tracked_paths   => \@tp,
+        note            => "Local metadata only; vault-side tracked_paths converge on the next sync-project. Re-run is idempotent.",
     });
 }
 
@@ -462,7 +551,7 @@ sub register_fresh {
         if (is_hard_excluded($rel)) {
             emit_error("Tracked path '$rel' is hard-excluded (credentials/machine-specific).");
         }
-        my $abs = "$cwd/$rel";
+        my $abs = local_abs($cwd, $rel);
         unless (-e $abs) {
             emit_error("Tracked path '$rel' does not exist at $cwd.");
         }
@@ -480,7 +569,7 @@ sub register_fresh {
 
     my $now = iso_now();
     my $remote_url = '';
-    my ($_url, $_url_exit) = _run_capture('git', '-C', $cwd, 'remote', 'get-url', 'origin');
+    my ($_url, $_url_exit) = _run_capture('git', '-C', git_path($cwd), 'remote', 'get-url', 'origin');
     $remote_url = $_url if $_url_exit == 0;
 
     my $vmeta = {
@@ -576,7 +665,7 @@ sub register_link {
     my $vmeta = read_json("$vproj/metadata.json");
     my $now = iso_now();
     my $remote_url = '';
-    my ($_url, $_url_exit) = _run_capture('git', '-C', $cwd, 'remote', 'get-url', 'origin');
+    my ($_url, $_url_exit) = _run_capture('git', '-C', git_path($cwd), 'remote', 'get-url', 'origin');
     $remote_url = $_url if $_url_exit == 0;
 
     # Append source_note for this machine
@@ -923,7 +1012,7 @@ sub cmd_sync_project {
             push @skipped_bad_paths, $tp;
             next;
         }
-        my $abs_local = "$cwd/$tp";
+        my $abs_local = local_abs($cwd, $tp);
         my $abs_vault = vault_file_path($slug, $tp);
         my $abs_cache = cache_path($cwd, $tp);
 
@@ -931,7 +1020,7 @@ sub cmd_sync_project {
         if (-l $abs_local) {
             push @skipped_symlinks, $tp;
         } elsif (-d $abs_local) {
-            walk_dir_into_inventory(\%inventory, $cwd, $tp, 'local', \@skipped_symlinks, \@skipped_bad_paths);
+            walk_dir_into_inventory(\%inventory, $abs_local, $tp, 'local', \@skipped_symlinks, \@skipped_bad_paths);
         } elsif (-f $abs_local) {
             add_to_inventory(\%inventory, $tp, 'local') unless is_hard_excluded($tp);
         }
@@ -942,7 +1031,7 @@ sub cmd_sync_project {
         if (-l $abs_vault) {
             push @skipped_symlinks, "vault:$tp";
         } elsif (-d $abs_vault) {
-            walk_dir_into_inventory(\%inventory, $VAULT_DIR . "/projects/$slug/files", $tp, 'vault', \@skipped_symlinks, \@skipped_bad_paths);
+            walk_dir_into_inventory(\%inventory, $abs_vault, $tp, 'vault', \@skipped_symlinks, \@skipped_bad_paths);
         } elsif (-f $abs_vault) {
             add_to_inventory(\%inventory, $tp, 'vault') unless is_hard_excluded($tp);
         }
@@ -951,7 +1040,7 @@ sub cmd_sync_project {
         if (-l $abs_cache) {
             push @skipped_symlinks, "cache:$tp";
         } elsif (-d $abs_cache) {
-            walk_dir_into_inventory(\%inventory, cache_root($cwd), $tp, 'cache', \@skipped_symlinks, \@skipped_bad_paths);
+            walk_dir_into_inventory(\%inventory, $abs_cache, $tp, 'cache', \@skipped_symlinks, \@skipped_bad_paths);
         } elsif (-f $abs_cache) {
             add_to_inventory(\%inventory, $tp, 'cache') unless is_hard_excluded($tp);
         }
@@ -966,7 +1055,7 @@ sub cmd_sync_project {
     for my $rel (sort keys %inventory) {
         next if is_hard_excluded($rel);
 
-        my $abs_local = "$cwd/$rel";
+        my $abs_local = local_abs($cwd, $rel);
         my $abs_vault = vault_file_path($slug, $rel);
         my $abs_cache = cache_path($cwd, $rel);
 
@@ -1077,7 +1166,7 @@ sub cmd_resolve_conflict {
         emit_error("Path '$path' is hard-excluded.");
     }
 
-    my $abs_local = "$cwd/$path";
+    my $abs_local = local_abs($cwd, $path);
     my $abs_vault = vault_file_path($slug, $path);
 
     if ($action eq 'use-local') {
@@ -1201,6 +1290,12 @@ sub finalize_commit {
         $rename_report = batch_rename_all($slug, $cwd);
     }
     my $mid_sync_rollbacks = $rename_report->{rolled_back};
+
+    # Item 4 (vault-metadata rot): converge the vault's tracked_paths with this
+    # machine's local set BEFORE the post-rename scan and the git add below, so
+    # the updated metadata.json is both secret-scanned and committed within this
+    # same projects/<slug>/ sync commit. No-op when local ⊆ vault.
+    reconcile_vault_tracked_paths($slug, $cwd, $vproj);
 
     # Defense-in-depth: re-scan the renamed vault content. Use the Perl-native
     # scanner (extension-agnostic, content-based) instead of sensitive-check.pl
@@ -1475,11 +1570,131 @@ sub norm_path {
     return $p;
 }
 
+# Translate a path into a form NATIVE git resolves regardless of platform or MSYS
+# arg-conversion state. The rest of the script keeps paths in POSIX `/c/...` form
+# (which cygwin/msys *perl* file ops need); but native git.exe cannot resolve a
+# bare `/c/...` when MSYS arg-conversion is OFF (e.g. the global CLAUDE.md sets
+# MSYS2_ARG_CONV_EXCL=* in the shell), giving "cannot change to '/c/...'". We
+# therefore hand git the drive-letter forward-slash form `C:/...`, which git
+# accepts whether or not MSYS later rewrites it (`C:/`→`C:\` is harmless; a lone
+# drive path is never split like a `:`-list). Wrap EVERY absolute path passed to
+# git (and the clone URL) in this.
+#   - On Linux/macOS this is a NO-OP: `/home/...`, `/tmp/...` have no `/<letter>/`
+#     drive prefix, and `scheme://` URLs are left untouched — so git gets the
+#     native path unchanged. Idempotent on already-`C:/` paths.
+sub git_path {
+    my $p = shift;
+    return $p unless defined $p;
+    $p =~ s{^/([a-zA-Z])/}{uc($1) . ":/"}e;
+    return $p;
+}
+
 sub project_metadata_path { my $cwd = shift; "$cwd/.claude/backup-metadata.json" }
 sub cache_root            { my $cwd = shift; "$cwd/.claude/backup-cache"          }
 sub cache_path            { my ($cwd, $rel) = @_; cache_root($cwd) . "/$rel"     }
 sub vault_project_dir     { my $slug = shift; "$VAULT_DIR/projects/$slug"        }
 sub vault_file_path       { my ($slug, $rel) = @_; vault_project_dir($slug) . "/files/$rel" }
+
+# Resolve a tracked rel path to its absolute LOCAL filesystem location.
+# Normal tracked paths live under the project cwd ("$cwd/$rel"). The synthetic
+# $HOST_MEMORY_REL entry (and anything beneath it) maps instead to THIS machine's
+# per-project Claude memory dir, ~/.claude/projects/<encoded(cwd)>/memory — which
+# lives outside the repo. That is what makes host memories backable, and what
+# lets a second machine pull them into ITS OWN encoded dir (computed from ITS
+# cwd, not the originating machine's). The vault and cache sides stay keyed by
+# the logical rel path (_host-memory/...) regardless of machine. (Decision #1.)
+sub local_abs {
+    my ($cwd, $rel) = @_;
+    if ($rel eq $HOST_MEMORY_REL || index($rel, "$HOST_MEMORY_REL/") == 0) {
+        my $base = host_memory_dir($cwd);
+        my $sub  = ($rel eq $HOST_MEMORY_REL) ? '' : substr($rel, length($HOST_MEMORY_REL) + 1);
+        return length($sub) ? "$base/$sub" : $base;
+    }
+    return "$cwd/$rel";
+}
+
+# This machine's Claude memory dir for a given project cwd.
+sub host_memory_dir {
+    my $cwd = shift;
+    return "$home/.claude/projects/" . encode_project_dir($cwd) . "/memory";
+}
+
+# Encode a project cwd the way Claude Code names its per-project state dir under
+# ~/.claude/projects/: every character that is NOT [A-Za-z0-9] becomes '-', on
+# the WINDOWS-style path. The cwd arrives POSIX-style (registry form, e.g.
+# /c/Users/André/...) and as UTF-8/CP1252 *bytes*, so we decode to CHARACTERS
+# first — otherwise multi-byte chars like 'é' would each yield several dashes
+# instead of one (the real dir uses one). Verified byte-for-byte against the six
+# live transcript dirs (see tests/t/encoding). Consecutive dashes are NOT
+# collapsed — the encoding is a literal per-character substitution.
+sub encode_project_dir {
+    my $cwd   = shift;
+    my $chars = decode_fs_chars($cwd);
+    my $win   = posix_to_windows($chars);
+    $win =~ s/[^A-Za-z0-9]/-/g;
+    # The result is pure ASCII [A-Za-z0-9-]. Drop the utf8 flag so it concatenates
+    # as BYTES with the byte-string $home path in host_memory_dir. Without this,
+    # mixing a utf8-flagged char string with a byte string upgrades the byte
+    # string's UTF-8 path bytes as Latin-1 (André -> AndrÃ©), double-encoding the
+    # path so every filesystem op silently misses (the classic é-path trap).
+    utf8::downgrade($win);
+    return $win;
+}
+
+# Decode a filesystem byte string to a Perl character string. UTF-8 first
+# (Git Bash / Linux / macOS), CP1252 fallback (cygwin perl launched from
+# PowerShell hands high bytes as single CP1252 bytes). Mirrors skills.pl from_fs;
+# FB_CROAK (not FB_QUIET) so invalid UTF-8 falls through to CP1252 instead of
+# silently truncating.
+sub decode_fs_chars {
+    my $s = shift;
+    return $s unless defined $s;
+    return $s if utf8::is_utf8($s);
+    my $d = eval { decode('UTF-8', $s, Encode::FB_CROAK) };
+    return defined $d ? $d : decode('cp1252', $s, Encode::FB_DEFAULT);
+}
+
+# POSIX path (/c/Users/...) -> Windows form (C:/Users/...) with backslashes, for
+# encode_project_dir. Inverse of norm_path's drive-letter rewrite. A path with no
+# /<letter>/ drive prefix (e.g. the in-container '/project') keeps its leading
+# slash, which then encodes to a leading dash ('-project') — matching reality.
+sub posix_to_windows {
+    my $p = shift;
+    $p =~ s|^/([a-zA-Z])/|uc($1) . ":/"|e;
+    $p =~ s|/|\\|g;
+    return $p;
+}
+
+# Path of $abs relative to directory $base ('' if they are the same path).
+sub rel_within {
+    my ($base, $abs) = @_;
+    $base = norm_path($base);
+    $abs  = norm_path($abs);
+    return '' if $abs eq $base;
+    return undef unless index($abs, "$base/") == 0;
+    return substr($abs, length($base) + 1);
+}
+
+# Item 4 (vault-metadata rot): converge the vault's tracked_paths with this
+# machine's local set so a cross-machine link never silently drops a path this
+# machine tracks. Writes the UNION (vault order first, then local-only entries)
+# into the vault metadata.json on disk; the caller commits it within the same
+# projects/<slug>/ sync commit. No-op when local ⊆ vault (idempotent).
+sub reconcile_vault_tracked_paths {
+    my ($slug, $cwd, $vproj) = @_;
+    my $vmeta_path = "$vproj/metadata.json";
+    my $pmeta_path = project_metadata_path($cwd);
+    return unless -f $vmeta_path && -f $pmeta_path;
+    my $vmeta = read_json($vmeta_path);
+    my $pmeta = read_json($pmeta_path);
+    my @vault = @{ $vmeta->{tracked_paths} // [] };
+    my @local = @{ $pmeta->{tracked_paths} // [] };
+    my %seen  = map { $_ => 1 } @vault;
+    my @new   = grep { !$seen{$_} } @local;
+    return unless @new;
+    $vmeta->{tracked_paths} = [ @vault, @new ];
+    write_json($vmeta_path, $vmeta);
+}
 
 sub validate_slug {
     my $s = shift;
@@ -1561,11 +1776,15 @@ sub vault_files_stats {
     return ($n, $sz);
 }
 
-# Walk a directory and add files into the inventory hash.
+# Walk a resolved directory and add its files into the inventory hash, keying
+# each by its LOGICAL rel path ("$rel_dir/<path under $abs_dir>"). $abs_dir is
+# the actual filesystem directory (already resolved by the caller via local_abs /
+# vault_file_path / cache_path), while $rel_dir is the logical tracked-path
+# prefix used for inventory keys — these differ for the synthetic _host-memory
+# entry, whose files live outside the project tree but key as _host-memory/...
 # side = 'local' | 'vault' | 'cache'
 sub walk_dir_into_inventory {
-    my ($inv, $root, $rel_dir, $side, $skipped_symlinks, $skipped_bad) = @_;
-    my $abs_dir = "$root/$rel_dir";
+    my ($inv, $abs_dir, $rel_dir, $side, $skipped_symlinks, $skipped_bad) = @_;
     return unless -d $abs_dir;
     # Fix H14 (red-team): refuse to walk INTO a symlinked root. File::Find
     # follows symlinks for the entry point by default; without this check, a
@@ -1575,6 +1794,13 @@ sub walk_dir_into_inventory {
         push @$skipped_symlinks, $rel_dir;
         return;
     }
+
+    # Build the logical rel key for a file found under $abs_dir.
+    my $to_rel = sub {
+        my $sub = rel_within($abs_dir, $_[0]);
+        return undef unless defined $sub;
+        return length($sub) ? "$rel_dir/$sub" : $rel_dir;
+    };
 
     find({
         no_chdir => 1,
@@ -1586,7 +1812,7 @@ sub walk_dir_into_inventory {
                 next if $entry eq '.' || $entry eq '..';
                 my $f = "$File::Find::dir/$entry";
                 if (-l $f) {
-                    my $r = abs_to_rel($root, $f);
+                    my $r = $to_rel->($f);
                     push @$skipped_symlinks, $r if defined $r;
                     next;
                 }
@@ -1597,7 +1823,7 @@ sub walk_dir_into_inventory {
         wanted => sub {
             return if -l $_;
             return unless -f $_;
-            my $rel = abs_to_rel($root, $_);
+            my $rel = $to_rel->($_);
             unless (defined $rel && validate_relative_path($rel)) {
                 push @$skipped_bad, ($rel // $_);
                 return;
@@ -1685,7 +1911,7 @@ sub file_summary {
 
 sub stage_push {
     my ($slug, $cwd, $rel, $hash_before) = @_;
-    my $src = "$cwd/$rel";
+    my $src = local_abs($cwd, $rel);
     my $final = vault_file_path($slug, $rel);
     my $tmp = "$final$TMP_SUFFIX";
     make_path(dirname($tmp));
@@ -1707,7 +1933,7 @@ sub stage_push {
 sub stage_pull {
     my ($slug, $cwd, $rel, $hash_before) = @_;
     my $src = vault_file_path($slug, $rel);
-    my $final = "$cwd/$rel";
+    my $final = local_abs($cwd, $rel);
     my $tmp = "$final$TMP_SUFFIX";
     make_path(dirname($tmp));
     copy_file($src, $tmp);
@@ -1728,7 +1954,7 @@ sub stage_pull {
 sub stage_cache_only {
     # local == vault. Cache from local (same content as vault).
     my ($slug, $cwd, $rel, $hash) = @_;
-    stage_cache_only_from_path($slug, $cwd, $rel, "$cwd/$rel", $hash);
+    stage_cache_only_from_path($slug, $cwd, $rel, local_abs($cwd, $rel), $hash);
 }
 
 sub stage_cache_only_from_path {
@@ -1752,7 +1978,7 @@ sub stage_cache_only_from_path {
 sub stage_from_path {
     # Generic stage. action = 'push' or 'pull'.
     my ($slug, $cwd, $rel, $src, $action) = @_;
-    my $final = ($action eq 'push') ? vault_file_path($slug, $rel) : "$cwd/$rel";
+    my $final = ($action eq 'push') ? vault_file_path($slug, $rel) : local_abs($cwd, $rel);
     my $tmp = "$final$TMP_SUFFIX";
     make_path(dirname($tmp));
     copy_file($src, $tmp);
@@ -1785,7 +2011,7 @@ sub stage_delete_vault {
 
 sub stage_delete_local {
     my ($slug, $cwd, $rel) = @_;
-    my $local_final = "$cwd/$rel";
+    my $local_final = local_abs($cwd, $rel);
     my $cache_final = cache_path($cwd, $rel);
     journal_record_op($slug, {
         path        => $rel,
@@ -1973,7 +2199,7 @@ sub git_merge_attempt {
     # suppress stderr (merge-file emits "warning: conflicts..." which is noise).
     my ($merged_content, $exit) = _run_capture(
         'git', 'merge-file', '-p', '--diff3',
-        $local_arg, $base_arg, $vault_arg
+        git_path($local_arg), git_path($base_arg), git_path($vault_arg)
     );
     if (open my $fh, '>:raw', $merged_tmp) {
         print $fh $merged_content;
@@ -2053,13 +2279,27 @@ sub _decode_strings_recursive {
     } elsif (ref $x) {
         return $x;  # blessed (e.g. JSON booleans) pass through
     } elsif (defined $x && !utf8::is_utf8($x)) {
-        # Numeric scalars: preserve as numbers, not strings
-        return $x + 0 if $x =~ /^-?\d+$/;
-        return $x + 0 if $x =~ /^-?\d+\.\d+$/;
-        my $decoded = eval { decode('UTF-8', $x, Encode::FB_QUIET) };
-        return defined $decoded ? $decoded : $x;
+        # Numeric scalars: preserve genuine JSON numbers as numbers. A
+        # numeric-LOOKING *string* (e.g. "0123" or a numeric slug) carries POK
+        # and must stay a string — never numify it, or emitted JSON silently
+        # changes its type. _json_number distinguishes the two via SV flags.
+        return $x + 0 if _json_number($x);
+        # FB_CROAK (not FB_QUIET): on invalid UTF-8, FB_QUIET returns the
+        # successfully-decoded *prefix* (silently truncating CP1252 "Andr\xE9"
+        # to "Andr"), making the fallback dead code. Croak instead, then fall
+        # back to a CP1252 decode — the from_fs() pattern from sandbox/skills.pl.
+        my $decoded = eval { decode('UTF-8', $x, Encode::FB_CROAK) };
+        return defined $decoded ? $decoded : decode('cp1252', $x, Encode::FB_DEFAULT);
     }
     return $x;
+}
+
+# True only for a genuine JSON number: decode_json sets IOK/NOK on numbers but
+# not POK, while a numeric-looking *string* carries POK. Lets _decode_strings_-
+# recursive numify only real numbers and preserve string types.
+sub _json_number {
+    my $f = B::svref_2object(\$_[0])->FLAGS;
+    return (($f & (B::SVf_IOK | B::SVf_NOK)) && !($f & B::SVf_POK)) ? 1 : 0;
 }
 
 sub emit_kv {
@@ -2361,11 +2601,11 @@ sub cleanup_merge_tmps {
 # ═══════════════════════════════════════════════════════════════════════
 
 sub vault_git_ok {
-    return _run_silent('git', '-C', $VAULT_DIR, @_) == 0;
+    return _run_silent('git', '-C', git_path($VAULT_DIR), @_) == 0;
 }
 
 sub vault_git_output {
-    my ($out, $exit) = _run_capture('git', '-C', $VAULT_DIR, @_);
+    my ($out, $exit) = _run_capture('git', '-C', git_path($VAULT_DIR), @_);
     return $out;
 }
 

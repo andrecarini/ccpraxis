@@ -48,7 +48,10 @@ my @exclude = (
     qr/credentials_json.*secrets\./,
     qr{/vault-sync\.pl:},             # vault-sync.pl also defines secret patterns
     qr{/\.claude-plans/},
+    qr{/\.ccpraxis-local-data/},      # gitignored blueprint/ledger tree — non-public, never committed (successor to .claude-plans/); ledgers legitimately quote patterns + verified creds as documentation
     qr{/\.claude/backup-cache/},
+    qr/username=x-access-token/,       # launcher.pl git-credential-helper printf: `password=%s` is a format placeholder filled from ~/.claude/git-pat at runtime, not a literal secret
+    qr/ensure_credentials_json_host_file/,  # launcher.pl function name, not a `credentials_json` secret key
 );
 
 # Collect candidate files: *.pl *.sh *.md *.json (mirrors grep --include). Prune

@@ -1,6 +1,6 @@
 ---
 name: test
-description: Run the sandbox plugin's verification suite — proves the 9p O_APPEND workaround, named-volume mount strategy, host↔volume sync round-trips, and the session picker still behave correctly. Use when the user wants to verify the sandbox plugin works after changes to launcher.pl / select-session.pl / sync-sidecar.pl, or says things like "test the sandbox", "run sandbox tests", "verify the sandbox plugin", "sanity-check the launcher".
+description: Run the sandbox plugin's verification suite — proves the bind-mount honors O_APPEND + utimensat, blueprint application + .claude.json file bind work, runtime detection picks docker or podman, heartbeat-only container keep-alive behaves correctly, and the session picker works. Use when the user wants to verify the sandbox plugin works after changes to launcher.pl / bootstrap.pl / Containerfile / MountSpec.pm, or says things like "test the sandbox", "run sandbox tests", "verify the sandbox plugin", "sanity-check the launcher".
 user-invocable: true
 host-only: true
 allowed-tools: Bash
@@ -8,21 +8,43 @@ allowed-tools: Bash
 
 # /sandbox:test
 
-Runs `plugins/sandbox/tests/run-tests.pl` against the user's actual Podman + machine. Tests are real integration tests — they spin up debian:bookworm-slim probe containers and exercise the real mount paths, podman volumes, and sync scripts. Expect 1–2 minutes total.
+Runs `plugins/sandbox/tests/run-tests.pl` against the user's actual
+container runtime (auto-detects Docker or Podman). Tests are real
+integration tests — they spin up `debian:bookworm-slim` probe containers
+and exercise the real mount paths, blueprint logic, and the
+heartbeat-only container keep-alive. Expect 1–2 minutes total.
 
 ## Arguments
 
-- `t/02-*.t` (optional) — restrict to a subset by glob. Without args, runs the full suite.
+- `t/02-*.t` (optional) — restrict to a subset by glob. The runner
+  resolves the glob relative to the current directory first, then falls
+  back to the plugin root and the `t/` subdirectory, so the same glob
+  works from both the repo root and `plugins/sandbox/`. Without args,
+  runs the full suite.
 
 ## Steps
 
-### 1. Pre-flight
-
-Confirm Podman is reachable. If not, the tests will all 125-error — better to fail loudly here:
+### 1. Pre-flight: confirm a container runtime is reachable
 
 ```bash
-podman.exe ps -a > /dev/null 2>&1 || {
-  echo "Podman is not reachable. Start the machine (admin PowerShell: 'podman machine start') and try again."
+# Detect the runtime using the same fallback chain as the launcher:
+# docker.exe → docker → podman.exe → podman (Windows probes .exe first).
+RUNTIME=$(
+  for _rt in docker.exe docker podman.exe podman; do
+    if command -v "$_rt" > /dev/null 2>&1; then
+      echo "$_rt"
+      break
+    fi
+  done
+)
+if [ -z "$RUNTIME" ]; then
+  echo "Neither docker nor podman is reachable."
+  echo "Start Docker Desktop OR run 'podman machine start', then try again."
+  exit 1
+fi
+$RUNTIME ps > /dev/null 2>&1 || {
+  echo "Runtime '$RUNTIME' found but daemon is not running."
+  echo "Start Docker Desktop OR run 'podman machine start', then try again."
   exit 1
 }
 ```
@@ -30,9 +52,9 @@ podman.exe ps -a > /dev/null 2>&1 || {
 ### 2. Confirm the probe image is cached locally
 
 ```bash
-podman.exe image exists docker.io/library/debian:bookworm-slim || {
+$RUNTIME image inspect docker.io/library/debian:bookworm-slim > /dev/null 2>&1 || {
   echo "Pulling debian:bookworm-slim (one-time, ~78 MB)..."
-  podman.exe pull docker.io/library/debian:bookworm-slim
+  $RUNTIME pull docker.io/library/debian:bookworm-slim
 }
 ```
 
@@ -46,30 +68,38 @@ perl "$HOME/.claude/ccpraxis/plugins/sandbox/tests/run-tests.pl" $ARGUMENTS
 
 ### 4. Report
 
-The runner emits a per-file pass/fail line and a summary. On failure it also dumps the full TAP output of each failing file. Show that output to the user verbatim — don't paraphrase failures.
+The runner emits a per-file pass/fail line and a summary. On failure it
+also dumps the full output of each failing file. Show that output to the
+user verbatim — don't paraphrase failures.
 
-If everything passed, a one-line confirmation is enough. Optionally point out the headline tests:
+If everything passed, a one-line confirmation is enough. Optionally point
+out the headline tests:
 
-- `02-volume-supports-append.t` — proves the workaround's core claim
-- `06-sidecar-periodic-sync.t` — proves the crash-loss safety net works
-
-## What the tests cover
-
-| File | Claim |
-|---|---|
-| `01-9p-confirms-append-bug.t` | Sanity: 9p host bind rejects O_APPEND |
-| `02-volume-supports-append.t` | Critical: named volume accepts O_APPEND |
-| `03-volume-create-idempotency.t` | `podman volume create` is NOT idempotent (pins the inspect-first pattern) |
-| `04-volume-persists-rm.t` | Volume survives `podman rm` of the container |
-| `05-seed-and-sync-roundtrip.t` | Host → volume seed + container append + volume → host sync preserves data |
-| `06-sidecar-periodic-sync.t` | sync-sidecar.pl mirrors on interval + self-exits when container stops |
-| `10-select-session-empty-dir.t` | Picker emits NEW when no sessions exist |
-| `11-select-session-parses.t` | Picker handles real-shape JSONL; "Start a new session" is option 1 |
+- `01-bind-honors-append-and-utimensat.t` — proves the host bind mount is
+  safe for claude's syscalls (the assumption underlying the whole
+  bind-mount architecture)
+- `02-launcher-bind-mount-shape.t` — confirms no volume-workaround
+  residue snuck back in
+- `04-runtime-detection.t` — confirms docker/podman detection is
+  consistent across all three scripts (launcher, bootstrap, TestSandbox)
 
 ## When tests fail
 
-A failed test isn't a redo signal — read its output. Specific failure shapes mean specific things:
+A failed test isn't a redo signal — read its output. Specific failure
+shapes mean specific things:
 
-- **`01-9p-confirms-append-bug.t` PASSES (i.e. appends succeed):** the 9p bug got fixed upstream. Investigate before treating that as "everything's still fine" — the workaround may be removable.
-- **`02-volume-supports-append.t` fails:** something fundamental broke; the entire mount strategy is dead. Don't paper over it.
-- **`06` fails specifically on the "self-exited" assertion:** the sidecar isn't detecting parent/container death cleanly — risk of leaked processes in production. Fix before shipping.
+- **`01-bind-honors-…` fails on T1 (O_APPEND):** the current backend's
+  host bind doesn't honor `O_APPEND` — likely a regression to a 9p-style
+  share. Reintroduce the xfs-volume workaround OR switch to a healthier
+  backend.
+- **`01-bind-honors-…` fails on T2/T3 (utimensat):** same diagnosis as
+  above but specific to `utimensat`. Bun's lock manager will wedge on
+  this backend without a workaround.
+- **`02-launcher-bind-mount-shape.t` fails:** someone partially
+  reintroduced volume code. Check the mount layout in `launcher.pl`.
+- **`04-runtime-detection.t` fails:** the `_detect_container_cli` helper
+  drifted out of sync across files. Re-paste it.
+- **`12-keepalive-heartbeat.t` fails:** the container's heartbeat-only
+  keep-alive loop is broken (sentinel staleness not detected, or stays
+  alive when it shouldn't). Risk: containers either die mid-session or
+  orphan-leak forever. Fix before shipping.

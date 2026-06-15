@@ -59,6 +59,7 @@ revive() {  # BP_NAME PKG SID PID AGE STATUS
 for BPDIR in "$DATA"/blueprints/*/; do
   [ -d "$BPDIR" ] || continue
   BP_NAME=$(basename "$BPDIR")
+  [ "$BP_NAME" = "_archive" ] && continue
   [ -z "$ONLY_BP" ] || [ "$BP_NAME" = "$ONLY_BP" ] || continue
   for LEDGER in "$BPDIR"packages/*.md; do
     [ -f "$LEDGER" ] || continue

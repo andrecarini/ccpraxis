@@ -31,7 +31,7 @@ Specifically for the backpack system (if the `backpack` plugin is mounted into t
 
 ## ✅ YOU ARE INSIDE A SANDBOXED CONTAINER — FULL AUTONOMY
 
-You are running inside an isolated rootless-Podman container, as root. The project folder is at `/project`.
+You are running inside an isolated dev container (Docker or Podman — auto-detected), as root. The project folder is at `/project`.
 You have full autonomy. No permission prompts. Go fast.
 
 **You CAN and SHOULD install and run dev tooling directly:**
@@ -42,7 +42,7 @@ You have full autonomy. No permission prompts. Go fast.
 - ✅ `firebase`, `gcloud`, `terraform`
 - ✅ ANY build tool, linter, formatter, or compiler
 
-There is no host machine to protect — this container IS the sandbox. Container root is mapped via Podman's user namespace to the unprivileged host user, so a compromise stays contained even with full in-container root.
+There is no host machine to protect — this container IS the sandbox. Under rootless Podman, container root is mapped via Podman's user namespace to the unprivileged host user; under Docker Desktop, a similar isolation boundary applies. Either way, a compromise stays contained even with full in-container root.
 Worst case, the container gets recreated. Project files are bind-mounted and git-recoverable.
 
 ## ⚠️ SUPPLY CHAIN SECURITY (still applies inside the container)
@@ -58,15 +58,30 @@ Even inside a container, supply chain attacks can exfiltrate project source code
 ## Git
 
 - Local git operations (add, commit, diff, log, status, branch, etc.) work normally
-- For push/pull to private repos: if a deploy key exists in the project folder, use:
+- **HTTPS push/pull/fetch to GitHub authenticate automatically.** `/sandbox` configures a git credential helper that reads the PAT mounted at `~/.claude/git-pat`. Just run `git push` / `git pull` — no environment setup needed.
+  - This works **even though Claude Code's Bash tool strips `GIT_ASKPASS`** from the environment (a credential-exfiltration safeguard added in v2.1.128). Do **not** try to roll your own askpass or re-export `GIT_ASKPASS` — it will be scrubbed and won't help; the credential helper already covers it. The PAT itself is readable at `~/.claude/git-pat` if you need it for `gh`/`curl`.
+  - On a `403`, the PAT is simply missing a permission. Name the exact GitHub permission needed so the user can update the token and re-run `/sandbox`.
+- For SSH remotes with a deploy key in the project folder, `GIT_SSH_COMMAND` is set for you when the key is present:
   `GIT_SSH_COMMAND="ssh -i /project/deploy_key -o StrictHostKeyChecking=no" git push`
-- If `$GIT_SSH_COMMAND` or `$GIT_ASKPASS` is already set in the environment, git push/pull should just work
 
 ## Network / Ports
 
-Ports **9000–9009** are mapped 1:1 to the host. When serving anything that needs to be accessed from the host browser (web apps, dev servers, emulators, etc.), **bind to one of these ports**. The user can then open `http://localhost:9000` (or whichever port you chose) on the host.
+Ports **9000–9009** are mapped 1:1 to the host. When serving anything that needs to be accessed from the host browser (web apps, dev servers, emulators, etc.), **bind to one of these ports**.
 
-Example: to serve a Flutter web build, use port 9000:
+### Sharing the URL with the user
+
+When you print the URL for the user to open, prefer `$SANDBOX_HOST_IP` if it's set:
+
+```bash
+HOST=${SANDBOX_HOST_IP:-localhost}
+echo "Open http://${HOST}:9000"
+```
+
+The launcher auto-injects `SANDBOX_HOST_IP` on Windows+Podman, where the host's `localhost:<port>` mirror via WSL2's `wslrelay.exe` is unreliable — it sometimes registers only an IPv6 listener, so IPv4 connects from Firefox/Chrome silently fail even though the container is healthy. The injected value is the WSL distro's directly-reachable IPv4 address and always reaches the published port. On Linux/macOS hosts, or under Docker on any host, the env var is unset and the fallback to `localhost` works as normal.
+
+The env var is captured at container-create time, so if the user runs `wsl --shutdown` or reboots and then re-attaches to an existing sandbox, the value may be stale — a fresh `claude-sandbox` launch (which re-creates if needed) refreshes it.
+
+Example: serve a Flutter web build on port 9000:
 ```bash
 dhttpd --port 9000 --path build/web
 ```
@@ -83,16 +98,24 @@ A `socat` bridge runs at container startup forwarding `0.0.0.0:9000-9009` → `1
   ```
 - **Plugin-installed MCPs**: the callback port is chosen randomly by Claude Code and **cannot be overridden** today. If the random port happens to fall in 9000–9009 the auth flow works; otherwise it times out. Workaround: re-`/auth` until you get a lucky port, or remove the plugin's MCP entry and re-add it manually with `claude mcp add ... --callback-port 9000`.
 
-OAuth tokens authenticated inside this container are written to `~/.claude/.credentials.json` under `mcpOAuth.<key>` and **persist across container rebuilds** — the file is bind-mounted from `<project>/.claude-data/.launcher/credentials.json` on the host. The host's own `~/.claude/.credentials.json` is never modified by anything you do in here.
+OAuth tokens authenticated inside this container are written to `~/.claude/.credentials.json` under `mcpOAuth.<key>` and **persist across container rebuilds** — the file is bind-mounted as a single-file RW bind from `<project>/.claude-data/.launcher/credentials.json` on the host. The host's own `~/.claude/.credentials.json` is never modified by anything you do in here.
+
+The rest of `<project>/.claude-data/.launcher/` (hashes, snapshots, blueprint canonicals, container metadata) is overlaid as RO at `/root/.claude/.launcher/` — you can read it, but writes return EROFS. That's by design: tampering with `backpack-trusted-hash` would bypass approval, and tampering with snapshots would corrupt the launcher's selection logic on next run.
 
 ### Accessing Host Services
 
-Services running on the user's host machine (databases, Chrome DevTools, APIs, etc.) are reachable from inside this container via **`host.containers.internal`** (Podman's native name; Podman Desktop / Podman Machine wires this up automatically). For example:
-- `host.containers.internal:5432` — a Postgres instance on the host
-- `host.containers.internal:9222` — Chrome remote debugging on the host
-- `host.containers.internal:6379` — Redis on the host
+Services running on the user's host machine (databases, Chrome DevTools, APIs, etc.) are reachable from inside this container via a special hostname. The exact name depends on which container runtime is hosting you:
 
-Use `host.containers.internal` instead of `localhost` or `127.0.0.1` when connecting to host services. `localhost` inside the container refers to the container itself, not the host. (Some Podman setups also expose the legacy `host.docker.internal` as an alias, but don't rely on it — use the native name.)
+- **Docker** (Docker Desktop on Windows/macOS, Docker Engine on Linux): `host.docker.internal`
+- **Podman** (Podman Desktop / Podman Machine): `host.containers.internal`
+
+For example, a Postgres instance on the host on port 5432:
+- Under docker: `host.docker.internal:5432`
+- Under podman: `host.containers.internal:5432`
+
+Both names should work transparently on most modern setups (Podman often aliases `host.docker.internal` for compatibility, and Docker sometimes provides `host.containers.internal`), but the canonical name for each runtime is the safer choice. If unsure which runtime is hosting you, try `getent hosts host.docker.internal host.containers.internal` to see which resolves.
+
+Use one of these names instead of `localhost` or `127.0.0.1` when connecting to host services. `localhost` inside the container refers to the container itself, not the host.
 
 ## Persistence
 

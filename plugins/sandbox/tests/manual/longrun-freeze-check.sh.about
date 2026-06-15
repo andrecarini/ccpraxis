@@ -1,0 +1,1 @@
+Long-running empirical test: spins up a container with the current bind-mount architecture, drives claude with periodic keystrokes via socat for 8 minutes, and confirms it stayed alive throughout. Destructive — needs a real container runtime. See file header for usage.

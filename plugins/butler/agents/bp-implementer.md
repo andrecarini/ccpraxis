@@ -1,6 +1,6 @@
 ---
 name: bp-implementer
-description: Implementation worker for blueprint packages. Dispatched by a blueprint coordinator with a spec and a set of failing tests to make pass within a declared write set. Also used for consolidated fix-batches after review. The tests are read-only ground truth for this agent.
+description: Implementation worker for blueprint packages. Dispatched by a butler coordinator with a spec and a set of failing tests to make pass within a declared write set. Also used for consolidated fix-batches after review. The tests are read-only ground truth for this agent.
 model: sonnet
 maxTurns: 40
 tools: Read, Grep, Glob, Write, Edit, Bash

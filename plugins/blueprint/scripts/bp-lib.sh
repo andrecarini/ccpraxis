@@ -1,8 +1,16 @@
 #!/usr/bin/env bash
 # bp-lib.sh — shared helpers for the blueprint (authoring) plugin.
-# Host-safe by design: bash + coreutils + awk only. No jq, no flock, no
+# HOST-SAFE SUBSET: bash + coreutils + awk only. No jq, no flock, no
 # process machinery — authoring runs on the host (where jq may be absent) as
 # well as in the sandbox. The execution-side helpers live in the butler plugin.
+#
+# SUBSET/SUPERSET RELATIONSHIP: This file contains the 7 shared base helpers
+# (bp_project_root, bp_data_dir, bp_dir, bp_ledger, fm_get, iso_now,
+# file_age_min). Its counterpart at plugins/butler/scripts/bp-lib.sh is a
+# SUPERSET — it contains these same 7 base helpers verbatim, plus sandbox-only
+# execution helpers (pid_alive, match_any, registry_*, count_running_global,
+# require_cmd, bp_require_sandbox). Keep the SHARED BASE byte-identical between
+# the two copies; butler adds on top.
 
 # ---------------------------------------------------------------- roots ----
 
@@ -38,12 +46,6 @@ fm_get() {
         sub("^" key ":[[:space:]]*", "", $0); print; exit
       }
     }' "$1"
-}
-
-# fm_set FILE KEY VALUE — in-place edit of a frontmatter line (line must exist).
-fm_set() {
-  local file="$1" key="$2" val="$3"
-  sed -i "0,/^${key}:.*/s||${key}: ${val}|" "$file"
 }
 
 iso_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }

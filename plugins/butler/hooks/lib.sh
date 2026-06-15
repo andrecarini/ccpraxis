@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# lib.sh — shared helpers for blueprint hooks.
+# lib.sh — shared helpers for butler hooks.
 #
 # Scoping mechanism: every hook calls bp_hook_gate first. The env contract
 # (BP_LEDGER etc.) is exported only by bp-launch.sh into coordinator processes,
@@ -15,7 +15,7 @@ bp_hook_gate() {
 bp_hook_require_jq() {
   # Fail-closed: enforcement hooks must not silently degrade.
   command -v jq >/dev/null 2>&1 || {
-    echo "blueprint hook: jq is required but missing — blocking to avoid unenforced operation. Install jq in the container." >&2
+    echo "butler hook: jq is required but missing — blocking to avoid unenforced operation. Install jq in the container." >&2
     exit 2
   }
 }

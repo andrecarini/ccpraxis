@@ -6,12 +6,12 @@ argument-hint: <list|view|audit|archive|delete> [blueprint]
 
 # /blueprint:manage
 
-You are the **blueprint author**. Operation is `$0`, target is `$1`. Data root: `${CCPRAXIS_DATA_DIR:-<project-root>/.ccpraxis-local-data}/blueprints/`.
+You are the **blueprint author**. First read `${CLAUDE_PLUGIN_ROOT}/skills/authoring-protocol/SKILL.md` — it is the doctrine source for all blueprint authoring operations. Operation is `$0`, target is `$1`. Data root: `${CCPRAXIS_DATA_DIR:-<project-root>/.ccpraxis-local-data}/blueprints/`.
 
 This plugin is authoring-side and host-usable; it never manages running coordinator **processes** (those are butler's, and live only inside the sandbox). Read state from files, don't probe or kill processes.
 
 ## list
-Glob `<data>/blueprints/*/blueprint.md` (skip `_archive/`). For each, read the frontmatter `status` and the Package status table; present a per-blueprint digest: blueprint status, packages done/total, anything ⛔ blocked / ⏸ parked. Mention archived ones (under `_archive/`) by name only.
+Glob `<data>/blueprints/*/blueprint.md` (skip `_archive/`). For each, read the metadata block `status` and the Package status table; present a per-blueprint digest: blueprint status, packages done/total, anything ⛔ blocked / ⏸ parked. Mention archived ones (under `_archive/`) by name only.
 
 ## view <name>
 Read `blueprints/<name>/blueprint.md`; summarize Objective, Decisions count, the Package status table, and any open escalations/incidents. Don't dump the whole file unless asked.

@@ -332,7 +332,13 @@ For each entry in `projects` (sequentially — the vault lock serializes them; d
 
 Then skip to the next project — do NOT call `sync-project` for a missing path.
 
-For entries with `project_exists: true`:
+For entries with `project_exists: true`, first **refresh default-tracked paths** so any default-ON path that came into existence since registration — most importantly this machine's host memory dir (`_host-memory`, resolving to `~/.claude/projects/<encoded-cwd>/memory`), but also a newly-created `.ccpraxis-local-data/blueprints` etc. — gets picked up without a re-register:
+
+```bash
+perl "${CLAUDE_PLUGIN_ROOT}/scripts/vault-sync.pl" refresh-default-tracked --slug "<slug>"
+```
+
+This only updates THIS machine's local metadata (idempotent — a second run reports `already_tracked`); the vault-side `tracked_paths` converge inside the `sync-project` commit below. The response's `added` array (if any) is informational — mention it in the summary. Then sync:
 
 ```bash
 perl "${CLAUDE_PLUGIN_ROOT}/scripts/vault-sync.pl" sync-project --slug "<slug>"

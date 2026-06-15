@@ -17,8 +17,19 @@ use File::Basename qw(basename);
 my @files;
 if (@ARGV) {
     for my $arg (@ARGV) {
-        # Allow callers to pass either a path or a bare filename in t/.
-        push @files, sort glob($arg);
+        # Resolve the glob cwd-relative first (so `perl run-tests.pl t/02-*.t`
+        # works when invoked from the plugin root where `t/` is a child).
+        # Fall back to $Bin-relative, then $Bin/t/-relative, so the same
+        # invocation also works from the repo root (where `t/` is several
+        # levels deeper but `plugins/sandbox/tests/t/` resolves via $Bin).
+        my @matched = glob($arg);
+        unless (@matched) {
+            @matched = glob("$Bin/$arg");
+        }
+        unless (@matched) {
+            @matched = glob("$Bin/t/$arg");
+        }
+        push @files, sort @matched;
     }
 } else {
     @files = sort glob("$Bin/t/*.t");

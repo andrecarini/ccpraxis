@@ -7,6 +7,9 @@
 #   2. Role separation while a write-capable worker is in flight:
 #        bp-implementer  may NOT touch BP_TEST_PATHS (tests are the immutable oracle)
 #        bp-test-writer  may ONLY touch BP_TEST_PATHS (and the blueprint dir)
+#        bp-ui-prober    may ONLY touch BP_TEST_PATHS (and the blueprint dir) —
+#                        its screenshots/artifacts are written by test runs (Bash),
+#                        not Edit/Write, so this is safe
 #
 # Exit 0 = allow. Exit 2 = block; stderr is fed back to the model.
 set -u
@@ -53,6 +56,11 @@ fi
 
 if [ "$IN_TESTS" -ne 0 ] && [[ "$WORKER" == *bp-test-writer* ]]; then
   echo "BLOCKED: bp-test-writer may only write under the package's test paths ($BP_TEST_PATHS), not $REL. If implementation scaffolding is genuinely required, report it back instead of writing it." >&2
+  exit 2
+fi
+
+if [ "$IN_TESTS" -ne 0 ] && [[ "$WORKER" == *bp-ui-prober* ]]; then
+  echo "BLOCKED: bp-ui-prober may only write under the package's test paths ($BP_TEST_PATHS), not $REL. Prober artifacts (screenshots, fixtures) are produced by test *runs*, not by Edit/Write. If something else genuinely must change, report it back instead of writing it." >&2
   exit 2
 fi
 

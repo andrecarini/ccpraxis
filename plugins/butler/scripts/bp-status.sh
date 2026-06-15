@@ -16,6 +16,7 @@ FOUND=0
 for BPDIR in "$DATA"/blueprints/*/; do
   [ -d "$BPDIR" ] || continue
   BP_NAME=$(basename "$BPDIR")
+  [ "$BP_NAME" = "_archive" ] && continue
   [ -z "$ONLY_BP" ] || [ "$BP_NAME" = "$ONLY_BP" ] || continue
   echo "== $BP_NAME"
   printf '%-26s %-11s %-10s %-6s %-4s %s\n' PACKAGE STATUS PROC AGE ATT "NEXT ACTION"

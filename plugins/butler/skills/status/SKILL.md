@@ -6,7 +6,9 @@ argument-hint: [blueprint]
 
 # /butler:status
 
-You are the **orchestrator**. Run:
+You are the **orchestrator**. First read `${CLAUDE_PLUGIN_ROOT}/skills/orchestrator-protocol/SKILL.md` — it is the doctrine source for all butler orchestration operations.
+
+Run:
 
 ```
 bash "${CLAUDE_PLUGIN_ROOT}/scripts/bp-status.sh" $0

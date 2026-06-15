@@ -60,13 +60,28 @@ binmode STDERR, ':raw';
 
 my $WINDOWS_FAMILY = $^O =~ /^(MSWin32|cygwin|msys)$/;
 
-# Call podman.exe explicitly on Windows. Defensive: if any installer ever
-# drops an extensionless `podman` shell-wrapper alongside `podman.exe` (as
-# Docker Desktop historically did with `docker`), Git-for-Windows perl's
-# Unix-style PATH search would find the wrapper first and fail when it can't
-# resolve `sh` from the Windows PATH it inherits. Naming the .exe directly
-# sidesteps any such wrapper hijacking.
-my $PODMAN = $WINDOWS_FAMILY ? 'podman.exe' : 'podman';
+# Detect which container CLI is installed: prefer docker (Docker Desktop's
+# `docker.exe` is the more universally installed runtime), fall back to
+# podman. Probing by spawning `<cli> --version` is the only reliable check
+# on Windows — relying on file-existence in $PATH is fragile because of
+# .exe vs extensionless shim hijacks (Docker Desktop historically dropped
+# an extensionless `docker` shell-wrapper alongside `docker.exe` that
+# Git-for-Windows perl's POSIX `PATH` search would find first and fail to
+# spawn). Always name the .exe explicitly on Windows.
+sub _detect_container_cli {
+    for my $candidate ($WINDOWS_FAMILY ? ('docker.exe', 'podman.exe') : ('docker', 'podman')) {
+        my $rc = system("$candidate --version > /dev/null 2>&1");
+        return $candidate if $rc == 0;
+    }
+    return undef;
+}
+my $PODMAN = _detect_container_cli();
+unless (defined $PODMAN) {
+    print STDERR "ERROR: no container CLI on PATH (looked for docker, podman).\n";
+    print STDERR "       Install Docker Desktop (https://docker.com) or Podman Desktop\n";
+    print STDERR "       (https://podman-desktop.io/) and re-run.\n";
+    exit 1;
+}
 
 # Disable MSYS2 argument-path conversion before spawning any subprocess.
 # MSYS2 (Git for Windows) treats every argv element that looks like a POSIX
@@ -121,7 +136,6 @@ my $SANDBOX_PLUGIN    = "$CLAUDE_HOST_CONFIG/ccpraxis/plugins/sandbox";
 my $CONTAINER_CONFIG  = "$SANDBOX_PLUGIN/container";
 my $SANDBOX_SKILLS_PL = "$SANDBOX_PLUGIN/scripts/skills.pl";
 my $SELECT_SESSION_PL = "$SANDBOX_PLUGIN/scripts/select-session.pl";
-my $SYNC_SIDECAR_PL   = "$SANDBOX_PLUGIN/scripts/sync-sidecar.pl";
 my $HOST_PLUGINS_DIR  = "$CLAUDE_HOST_CONFIG/plugins";
 
 # =====================================================================
@@ -182,6 +196,15 @@ my $MCP_SNAPSHOT_FILE         = "$LAUNCHER_DIR/.mcp-snapshot.json";
 my $SETTINGS_LOCAL_FILE       = "$PROJECT_PATH/.claude/settings.local.json";
 my $MATERIALIZED_PLUGINS_FILE = "$LAUNCHER_DIR/installed_plugins.json";
 my $SANDBOX_CREDENTIALS_FILE  = "$LAUNCHER_DIR/credentials.json";
+# known_marketplaces.json lives under .claude-data/plugins/ (NOT .launcher/)
+# so it appears at /root/.claude/plugins/known_marketplaces.json as a real
+# file through the parent .claude-data bind — not as a single-file mount.
+# Claude Code rewrites the file with write-tmp + rename on every load; a
+# file-level bind would reject the rename with EROFS. The parent-bind
+# approach lets the rename land naturally; the launcher regenerates the
+# file on every launch so in-container mutations are ephemeral, which
+# matches the desired "no marketplace state leaks across runs" posture.
+my $MATERIALIZED_MARKETPLACES_FILE = "$PROJECT_PATH/.claude-data/plugins/known_marketplaces.json";
 # Container CLAUDE.md and settings.json: per-project copies (blueprint
 # model). Container can modify these freely; changes never propagate
 # back to ccpraxis. Drift from upstream is detected via stored hash;
@@ -456,15 +479,72 @@ my $CONTAINER_NAME;
     }
 }
 
-# Named volume that backs /root/.claude/projects inside the container.
-# Reason: on Windows Podman/HyperV the host bind mount is a 9p filesystem
-# that rejects O_APPEND writes with EIO. Claude Code's session resume opens
-# the session jsonl in append mode, so resume fails every time. A podman
-# named volume lives in the in-machine xfs filesystem (not 9p) and supports
-# the full POSIX mode set. The launcher syncs host<->volume around each
-# claude run, so the host bind mount remains the source of truth for
-# backup/visibility but isn't on the critical write path.
-my $SESSIONS_VOLUME = "${CONTAINER_NAME}-sessions";
+# =====================================================================
+# Early mode dispatch: CONNECTOR (container already running)
+# =====================================================================
+#
+# If a manager is already up (container is in `running` state), this
+# launcher becomes a CONNECTOR. Connectors skip all setup-time work
+# (skill picker, staleness check, plugin materialize, backpack
+# approval, container create/start, image rebuild prompt) and go
+# straight to: session picker → kill-orphan-claudes → exec claude.
+#
+# The manager terminal is responsible for setup decisions; connectors
+# just attach to whatever container the manager built. This also keeps
+# discovery / TUI / backpack work out of the connector's terminal,
+# where it would be redundant noise (the user already made those
+# choices in the manager terminal).
+{
+    my $state = '';
+    if (_container_exists($CONTAINER_NAME)) {
+        $state = `$PODMAN inspect --format '{{.State.Status}}' "$CONTAINER_NAME" 2>/dev/null`;
+        chomp $state if defined $state;
+        $state //= '';
+    }
+    if ($state eq 'running') {
+        print "Connecting to running sandbox: $CONTAINER_NAME\n";
+        release_lock();
+        my @SESSION_FLAGS;
+        {
+            my ($action, $uuid);
+            if (length $RESUME_SESSION) {
+                ($action, $uuid) = ('resume', $RESUME_SESSION);
+            } else {
+                ($action, $uuid) = pick_session_action();
+            }
+            if ($action eq 'cancel') {
+                print "Cancelled.\n";
+                reset_terminal();
+                exit 0;
+            }
+            push @SESSION_FLAGS, '--resume', $uuid if $action eq 'resume';
+        }
+        # Orphan claudes (in-container processes from a prior connector
+        # that died without releasing /root/.claude lockfiles) block any
+        # new session indefinitely with no error message. Detect + offer
+        # to kill before exec'ing the new claude.
+        kill_orphan_claudes_if_user_confirms();
+        my @cmd = ($PODMAN, 'exec', '-it', $CONTAINER_NAME,
+                   'claude', '--dangerously-skip-permissions',
+                   @SESSION_FLAGS);
+        my $rc = run_claude(@cmd);
+        reset_terminal();
+        exit $rc;
+    }
+
+    # Container missing or stopped. We are the MANAGER for this run.
+    # --resume-session only makes sense in connector mode; if we got
+    # here with the flag set, there's no running container to attach
+    # the resume to.
+    if (length $RESUME_SESSION) {
+        print STDERR "ERROR: --resume-session $RESUME_SESSION requires the sandbox to already be running.\n";
+        print STDERR "       Start the sandbox manager by running `claude-sandbox` in this project (no flags)\n";
+        print STDERR "       in another terminal, then re-run this command to attach to the session.\n";
+        release_lock();
+        reset_terminal();
+        exit 1;
+    }
+}
 
 # =====================================================================
 # Perl + sandbox-skills.pl invocation helpers
@@ -869,8 +949,65 @@ if (-d "$HOST_PLUGINS_DIR/cache") {
     push @PLUGIN_MOUNTS, '-v', "$HOST_PLUGINS_DIR/cache:/root/.claude/plugins/cache:ro";
 }
 push @PLUGIN_MOUNTS, '-v', "$MATERIALIZED_PLUGINS_FILE:/root/.claude/plugins/installed_plugins.json:ro";
+
+# Marketplace registry: materialize a container-shaped copy (paths rewritten,
+# directory-source entries dropped) into .claude-data/plugins/. Lives there
+# as a real file through the parent .claude-data bind so Claude Code's
+# atomic write-tmp+rename pattern works on it — see the
+# $MATERIALIZED_MARKETPLACES_FILE definition above for the rationale.
+# Plus a RO overlay of the host's marketplaces/ data dir so the rewritten
+# installLocation paths resolve to real on-disk marketplace data.
 if (-f "$HOST_PLUGINS_DIR/known_marketplaces.json") {
-    push @PLUGIN_MOUNTS, '-v', "$HOST_PLUGINS_DIR/known_marketplaces.json:/root/.claude/plugins/known_marketplaces.json:ro";
+    make_path("$PROJECT_PATH/.claude-data/plugins")
+        unless -d "$PROJECT_PATH/.claude-data/plugins";
+    run_perl_or_die('materialize-known-marketplaces failed',
+        'materialize-known-marketplaces',
+        '--output', $MATERIALIZED_MARKETPLACES_FILE);
+}
+if (-d "$HOST_PLUGINS_DIR/marketplaces") {
+    push @PLUGIN_MOUNTS, '-v', "$HOST_PLUGINS_DIR/marketplaces:/root/.claude/plugins/marketplaces:ro";
+}
+
+# Bind-mount each directory-source marketplace's source.path INTO the
+# container's /root/.claude/plugins/marketplaces/<name>. These mounts
+# overlay the parent marketplaces mount above with the actual plugin
+# tree, so claude-code can resolve <marketplace>/.claude-plugin/
+# marketplace.json and follow each plugin's relative `source` to the
+# real code. ccpraxis-local is the canonical example: source.path is
+# ~/.claude/ccpraxis/plugins/, which contains .claude-plugin/ +
+# backpack/ + beacon/ + sandbox/ + steward/.
+#
+# materialize-known-marketplaces (above) rewrites these entries'
+# source.path AND installLocation to /root/.claude/plugins/marketplaces/
+# <name> — same target as these binds, so the JSON references match
+# what's on the in-container filesystem.
+if (-f "$HOST_PLUGINS_DIR/known_marketplaces.json") {
+    my $km_data;
+    {
+        local $/;
+        if (open my $fh, '<:raw', "$HOST_PLUGINS_DIR/known_marketplaces.json") {
+            my $raw = <$fh>;
+            close $fh;
+            $km_data = eval { require JSON::PP; JSON::PP::decode_json($raw) };
+        }
+    }
+    if (ref $km_data eq 'HASH') {
+        for my $name (sort keys %$km_data) {
+            my $entry = $km_data->{$name};
+            next unless ref $entry eq 'HASH';
+            my $src = $entry->{source};
+            next unless ref $src eq 'HASH';
+            next unless ($src->{source} // '') eq 'directory';
+            my $host_path = $src->{path};
+            next unless defined $host_path && length $host_path;
+            $host_path =~ s|\\|/|g;
+            $host_path =~ s|/+$||;
+            $host_path = winify_path($host_path);
+            next unless -d $host_path;
+            my $container_path = "/root/.claude/plugins/marketplaces/$name";
+            push @PLUGIN_MOUNTS, '-v', "${host_path}:${container_path}:ro";
+        }
+    }
 }
 
 # =====================================================================
@@ -898,10 +1035,50 @@ if (-f "$PROJECT_PATH/.claude-data/git-askpass.sh") {
     push @EXTRA_MOUNTS, '-v', "$PROJECT_PATH/.claude-data/git-askpass.sh:/root/.claude/git-askpass.sh:ro";
     push @EXTRA_MOUNTS, '-v', "$PROJECT_PATH/.claude-data/git-pat:/root/.claude/git-pat:ro";
     push @EXTRA_ENV,    '-e', 'GIT_ASKPASS=/root/.claude/git-askpass.sh';
+
+    # GIT_ASKPASS alone is no longer enough. Claude Code's Bash tool scrubs
+    # GIT_ASKPASS (and SSH_ASKPASS) from the subprocess environment as a
+    # credential-exfiltration safeguard (v2.1.128+), so any `git` the agent
+    # runs over HTTPS never sees it and fails with "could not read Username for
+    # 'https://github.com'". A git *credential helper* is read by git from a
+    # config FILE, not the environment, so it survives the scrub and is the
+    # reliable path. We materialize a tiny helper + an additive global git
+    # config and mount the config at the XDG path (read IN ADDITION to the
+    # image's ~/.gitconfig, so its autocrlf/defaultBranch settings are NOT
+    # masked). The GIT_ASKPASS env above is kept as harmless belt-and-suspenders
+    # for any non-scrubbed context (e.g. PID 1); the helper takes precedence.
+    # Regenerated every launch so sandboxes created before this fix self-heal
+    # on their next container (re)create.
+    ensure_git_credential_helper();
+    push @EXTRA_MOUNTS, '-v', "$PROJECT_PATH/.claude-data/git-credential-pat.sh:/root/.claude/git-credential-pat.sh:ro";
+    push @EXTRA_MOUNTS, '-v', "$PROJECT_PATH/.claude-data/gitconfig:/root/.config/git/config:ro";
 }
 
 if (-f "$PROJECT_PATH/.claude-data/git-ssh-command.sh") {
     push @EXTRA_MOUNTS, '-v', "$PROJECT_PATH/.claude-data/git-ssh-command.sh:/root/.claude/git-ssh-command.sh:ro";
+}
+
+# =====================================================================
+# SANDBOX_HOST_IP — workaround for Windows wslrelay IPv4 gaps
+# =====================================================================
+# On Windows + Podman, the host-side mirror of published container ports
+# is owned by WSL2's wslrelay.exe, which sometimes registers only an
+# IPv6 loopback listener — so `http://localhost:9000` from a host browser
+# refuses to connect or TCP-RSTs mid-request even though `podman port`
+# reports 0.0.0.0:9000 and the container is healthy. Docker doesn't hit
+# this because Docker Desktop ships its own user-mode proxy. The WSL
+# distro's external IPv4 is always reachable from the host, so we capture
+# it here and expose it in the container as $SANDBOX_HOST_IP; the
+# container's CLAUDE.md tells agents to prefer that URL when emitting
+# user-facing links. Captured at create-time; goes stale only if WSL
+# restarts before the user re-launches.
+if ($WINDOWS_FAMILY && $PODMAN =~ /podman/i) {
+    my $machine = `$PODMAN machine inspect --format "{{.Name}}" 2>/dev/null`;
+    chomp $machine;
+    $machine = 'podman-machine-default' unless $machine;
+    my $ip = `wsl -d $machine -- sh -c "ip -4 addr | grep -oE 'inet [0-9.]+' | grep -v '127.0.0.1' | head -1 | cut -d' ' -f2" 2>/dev/null`;
+    chomp $ip;
+    push @EXTRA_ENV, '-e', "SANDBOX_HOST_IP=$ip" if $ip =~ /^\d+\.\d+\.\d+\.\d+$/;
 }
 
 # =====================================================================
@@ -992,223 +1169,240 @@ sub pick_session_action {
 }
 
 # =====================================================================
-# Sessions-volume helpers (9p O_APPEND workaround)
+# Host data layout (.claude-data) + blueprint application
 # =====================================================================
 #
-# See the SESSIONS_VOLUME comment near the top of this file for why we
-# overlay a named volume on /root/.claude/projects.
+# /root/.claude inside the container is a direct bind mount of the host's
+# <project>/.claude-data/. Session jsonl, tasks/, lockfiles, settings.json,
+# CLAUDE.md, .credentials.json, .launcher/ — all are live host files. No
+# podman cp round-trips, no seed-on-create, no rescue. The host filesystem
+# IS the state.
 #
-# The mount target /root/.claude/projects is INSIDE /root/.claude (which
-# is itself a 9p bind from the host). The volume mount overlays that
-# subdir — claude sees the volume contents at that path, not the host
-# bind contents. We sync host<->volume around each claude run so the host
-# stays the source of truth for backup + inspection.
+# On container create we ensure the launcher's canonical copies of CLAUDE.md
+# / settings.json / .credentials.json live at .claude-data/ on the host so
+# they appear at /root/.claude/{CLAUDE.md,settings.json,.credentials.json}
+# inside the container. Same for /root/.claude.json (which lives at
+# /root/, not /root/.claude/) — bind-mounted as a single-file mount from
+# .claude-data/.claude.json.
 #
-# Same idea for ~/.claude.json: it's a file-level 9p bind and also breaks
-# on O_APPEND. We stop bind-mounting it on container create; instead the
-# launcher seeds the container's copy from host before claude runs and
-# syncs it back after.
+# Historical: from the first sandbox version through 2026-06, /root/.claude
+# was backed by a podman xfs volume to dodge two Hyper-V 9p bugs (O_APPEND
+# EIO + utimensat silent-fail). The WSL2 backend's /mnt/c bind honors both
+# correctly, so the volume + sync-sidecar architecture was retired.
+# Reintroduce ONLY if a future backend's host-bind fails the t/01
+# (O_APPEND, utimensat UTIME_NOW, utimensat explicit-timestamp) probes.
 
-sub ensure_sessions_volume {
-    # `podman volume create` is NOT idempotent — it returns exit 125 with
-    # "volume already exists" on collision. Inspect first; only create when
-    # the volume is genuinely missing. Output of the create call is silenced
-    # so we don't leak a stray volume name into stdout on the create path.
-    `$PODMAN volume inspect "$SESSIONS_VOLUME" 2>&1`;
-    return if $? == 0;
-    my $captured = `$PODMAN volume create "$SESSIONS_VOLUME" 2>&1`;
-    if ($? != 0) {
-        print STDERR "ERROR: failed to create podman volume $SESSIONS_VOLUME: $captured\n";
-        release_lock();
-        reset_terminal();
-        exit 1;
+sub apply_blueprints_to_host_data {
+    my $host_data = "$PROJECT_PATH/.claude-data";
+    make_path($host_data) unless -d $host_data;
+    if (-f $CONTAINER_CLAUDE_MD) {
+        _copy_file($CONTAINER_CLAUDE_MD, "$host_data/CLAUDE.md");
     }
-}
-
-# Probe whether the sessions volume currently has any contents. Run as
-# `podman exec` against the named container, which already has the volume
-# mounted at /root/.claude/projects. Returns 1 = empty, 0 = has content.
-sub sessions_volume_is_empty {
-    my $check = `$PODMAN exec "$CONTAINER_NAME" sh -c "test -z \\"\$(ls -A /root/.claude/projects 2>/dev/null)\\"" 2>/dev/null`;
-    return $? == 0 ? 1 : 0;
-}
-
-# Copy host's .claude-data/projects/. into the container's volume mount.
-# Used only on first container creation when the volume is empty — never
-# during a restart (volume already holds the latest from prior runs) and
-# never mid-session (would clobber in-flight writes).
-sub seed_sessions_volume_from_host {
-    my $host_projects = "$PROJECT_PATH/.claude-data/projects";
-    return unless -d $host_projects;
-    print "Seeding sessions volume from host...\n";
-    my $rc = system($PODMAN, 'cp', "$host_projects/.",
-                    "${CONTAINER_NAME}:/root/.claude/projects/");
-    if ($rc != 0) {
-        print STDERR "WARNING: failed to seed sessions volume (exit @{[$rc >> 8]}). Resume may not find existing sessions.\n";
+    if (-f $CONTAINER_SETTINGS_JSON) {
+        _copy_file($CONTAINER_SETTINGS_JSON, "$host_data/settings.json");
     }
+    # .credentials.json is NOT copied here — it's bind-mounted as a
+    # single-file bind from $LAUNCHER_DIR/credentials.json directly,
+    # so writes from inside the container (mcpOAuth tokens during
+    # `claude mcp add` auth) land on the canonical host file and persist
+    # across container rebuild without a sync step.
 }
 
-# Copy host's ~/.claude.json into the container. We stopped bind-mounting
-# it (since 9p breaks any append claude does on this file). The container's
-# overlay fs holds the file across container restarts; rebuilds wipe it
-# (handled by re-seeding here).
-sub seed_claude_json_from_host {
+# Single-file bind mounts require the host path to exist before podman
+# create — otherwise podman silently creates a directory at the host
+# path and the in-container mount target becomes a directory too.
+# These helpers ensure each single-file bind has a host file to point at.
+
+sub ensure_claude_json_host_file {
     my $host_json = "$PROJECT_PATH/.claude-data/.claude.json";
-    return unless -f $host_json;
-    my $rc = system($PODMAN, 'cp', $host_json, "${CONTAINER_NAME}:/root/.claude.json");
-    if ($rc != 0) {
-        print STDERR "WARNING: failed to seed ~/.claude.json (exit @{[$rc >> 8]}).\n";
+    return if -f $host_json;
+    my $host_data = "$PROJECT_PATH/.claude-data";
+    make_path($host_data) unless -d $host_data;
+    open(my $fh, '>', $host_json) or do {
+        print STDERR "WARNING: couldn't create $host_json: $!\n";
+        return;
+    };
+    close $fh;
+}
+
+sub ensure_credentials_json_host_file {
+    return if -f $SANDBOX_CREDENTIALS_FILE;
+    make_path($LAUNCHER_DIR) unless -d $LAUNCHER_DIR;
+    open(my $fh, '>', $SANDBOX_CREDENTIALS_FILE) or do {
+        print STDERR "WARNING: couldn't create $SANDBOX_CREDENTIALS_FILE: $!\n";
+        return;
+    };
+    # Empty file would fail claude's JSON parse. Seed minimal valid JSON
+    # — claude-code overwrites with full structure on first auth.
+    print $fh "{}\n";
+    close $fh;
+}
+
+# Materialize the git credential helper (+ an additive global git config) used
+# for HTTPS PAT auth. Claude Code's Bash tool scrubs GIT_ASKPASS from the
+# environment, so the env-based askpass is dead for any git the agent runs; a
+# credential helper read from a git CONFIG FILE is immune to that scrub. The
+# helper emits GitHub creds from the PAT mounted at ~/.claude/git-pat. It is
+# scoped to https://github.com in the config (the PAT is a GitHub fine-grained
+# token — never hand it to other hosts) and no-ops when no PAT file is present.
+# Both files live in .claude-data (already bind-mounted to /root/.claude); the
+# config is additionally mounted at the XDG path /root/.config/git/config by
+# the caller. Rewritten every launch so the logic stays current and pre-fix
+# sandboxes heal. The host source files exist before `podman create` so the
+# single-file binds don't auto-create directories.
+sub ensure_git_credential_helper {
+    my $cd = "$PROJECT_PATH/.claude-data";
+    return unless -d $cd;
+
+    my $helper = "$cd/git-credential-pat.sh";
+    if (open(my $h, '>:raw', $helper)) {
+        print $h "#!/bin/sh\n"
+               . "# Auto-generated by the ccpraxis sandbox launcher. Do not edit.\n"
+               . "[ \"\$1\" = get ] || exit 0\n"
+               . "[ -s \"\$HOME/.claude/git-pat\" ] || exit 0\n"
+               . "printf 'username=x-access-token\\npassword=%s\\n' \"\$(cat \"\$HOME/.claude/git-pat\")\"\n";
+        close $h;
+        chmod 0755, $helper or print STDERR "WARNING: chmod 0755 $helper: $!\n";
+    } else {
+        print STDERR "WARNING: couldn't write $helper: $!\n";
+    }
+
+    my $gc = "$cd/gitconfig";
+    if (open(my $g, '>:raw', $gc)) {
+        print $g "[credential \"https://github.com\"]\n"
+               . "\thelper = !sh /root/.claude/git-credential-pat.sh\n";
+        close $g;
+    } else {
+        print STDERR "WARNING: couldn't write $gc: $!\n";
     }
 }
 
-# Mirror volume contents back to host. Called on every clean claude exit —
-# host bind mount remains the durable record. `podman cp` traverses the
-# podman API directly (NOT through the 9p mount), so the post-sync writes
-# don't hit the O_APPEND-broken path.
-sub sync_sessions_volume_to_host {
-    my $host_projects = "$PROJECT_PATH/.claude-data/projects";
-    make_path($host_projects) unless -d $host_projects;
-    my $rc = system($PODMAN, 'cp', "${CONTAINER_NAME}:/root/.claude/projects/.",
-                    "$host_projects/");
-    if ($rc != 0) {
-        print STDERR "WARNING: failed to sync sessions to host (exit @{[$rc >> 8]}). Host's .claude-data/projects/ may be stale until next sync.\n";
+# Detect orphaned in-container claude processes — survivors of a prior
+# session that the user Ctrl+C'd from PowerShell. Ctrl+C only kills the
+# host-side podman.exe client; the disconnect doesn't always propagate
+# through conmon to the in-container claude, so claude stays alive but
+# decoupled from any user terminal. The orphan keeps refreshing its
+# lockfiles in /root/.claude/, which then BLOCKS any new claude session
+# that tries to acquire the same locks.
+#
+# Heuristic: a claude process that has done ZERO read activity over a 2s
+# sample AND has been alive for >=30s is considered orphan. The 30s gate
+# avoids killing freshly-started claudes that just haven't read anything
+# yet (e.g. during their own startup wait).
+#
+# We never kill silently — print the list and ASK the user. (This runs
+# before the session picker / podman start chain, so user-think-time is
+# fine here.)
+sub find_orphan_claudes {
+    return () unless _container_exists($CONTAINER_NAME);
+    my $state = `$PODMAN inspect --format '{{.State.Status}}' "$CONTAINER_NAME" 2>/dev/null`;
+    chomp $state if defined $state;
+    return () unless defined $state && $state eq 'running';
+
+    # Gather (pid, rchar, etime_seconds) for each claude in container.
+    my $listing = `$PODMAN exec "$CONTAINER_NAME" bash -c '
+        for pid in \$(pgrep -x claude 2>/dev/null); do
+            rchar=\$(awk "/^rchar:/{print \\\$2}" /proc/\$pid/io 2>/dev/null)
+            etime=\$(ps -o etimes= -p \$pid 2>/dev/null | tr -d " ")
+            echo "\$pid \$rchar \$etime"
+        done
+    ' 2>/dev/null`;
+    my @candidates;
+    for my $line (split /\n/, ($listing // '')) {
+        my ($pid, $rchar, $etime) = split /\s+/, $line;
+        next unless defined $pid && length $pid && defined $rchar && defined $etime;
+        # Skip claudes too young to know if they're orphans
+        next if $etime < 30;
+        push @candidates, { pid => $pid, rchar => $rchar };
     }
+    return () unless @candidates;
+
+    # Sample again after 2s to see which haven't read anything
+    sleep 2;
+    my @orphans;
+    for my $cand (@candidates) {
+        my $now = `$PODMAN exec "$CONTAINER_NAME" sh -c "awk '/^rchar:/{print \\\$2}' /proc/$cand->{pid}/io 2>/dev/null"`;
+        chomp $now;
+        if (defined $now && length $now && $now eq $cand->{rchar}) {
+            push @orphans, $cand->{pid};
+        }
+    }
+    return @orphans;
 }
 
-sub sync_claude_json_to_host {
-    my $host_json = "$PROJECT_PATH/.claude-data/.claude.json";
-    # Best-effort; absent file in container = nothing to sync.
-    my $rc = system($PODMAN, 'cp', "${CONTAINER_NAME}:/root/.claude.json", $host_json);
-    if ($rc != 0) {
-        print STDERR "WARNING: failed to sync ~/.claude.json to host (exit @{[$rc >> 8]}).\n";
+sub kill_orphan_claudes_if_user_confirms {
+    my @orphans = find_orphan_claudes();
+    return unless @orphans;
+    print "\n";
+    print "Found ", scalar(@orphans), " orphan claude process(es) in the container:\n";
+    print "  PID $_\n" for @orphans;
+    print "\n";
+    print "These are claude processes left over from a previous session — usually because\n";
+    print "you Ctrl+C'd from PowerShell, which kills the local client but doesn't always\n";
+    print "propagate the kill into the container. They hold lockfiles in /root/.claude/\n";
+    print "that will block any new claude session you start.\n";
+    print "\n";
+    print "Kill them now? [Y/n]: ";
+    my $resp = <STDIN>;
+    $resp //= '';
+    chomp $resp;
+    my $first = lc(substr($resp, 0, 1) // '');
+    if ($first eq 'n') {
+        print "Skipping orphan cleanup. If your new session hangs, run:\n";
+        print "  podman.exe exec $CONTAINER_NAME pkill claude\n";
+        return;
     }
+    for my $pid (@orphans) {
+        system($PODMAN, 'exec', $CONTAINER_NAME, 'kill', '-9', $pid);
+    }
+    print "Killed orphan claude(s).\n\n";
 }
 
-# Spawn the periodic sync sidecar as a background child. The sidecar polls
-# `kill 0, parent_pid` so it self-exits if this launcher dies abnormally
-# (terminal force-close, kill -9, etc.) — otherwise stray sidecars would
-# accumulate. Returns the child PID, or 0 if fork failed (in which case we
-# fall back to start/exit syncs only).
-sub spawn_sync_sidecar {
-    my $pid = fork();
-    if (!defined $pid) {
-        print STDERR "WARNING: fork failed: $!. Periodic sync disabled; final sync only.\n";
-        return 0;
-    }
-    if ($pid == 0) {
-        # Child. Exec into the sidecar script so we don't double-up on
-        # launcher state (locks, signal handlers, etc.).
-        exec($^X, $SYNC_SIDECAR_PL,
-            '--container',     $CONTAINER_NAME,
-            '--host-projects', "$PROJECT_PATH/.claude-data/projects",
-            '--host-json',     "$PROJECT_PATH/.claude-data/.claude.json",
-            '--parent-pid',    $$,
-            '--interval',      '60') or do {
-            print STDERR "sidecar exec failed: $!\n";
-            POSIX::_exit(1);
-        };
-    }
-    return $pid;
-}
-
-sub stop_sync_sidecar {
-    my $pid = shift;
-    return unless $pid && $pid > 0;
-    kill 'TERM', $pid;
-    # Brief grace period for clean shutdown before reaping. waitpid with
-    # WNOHANG keeps us from blocking if the sidecar hung; in that case the
-    # END block at process exit cleans it up.
-    require POSIX;
-    for (1 .. 5) {
-        my $r = waitpid($pid, POSIX::WNOHANG());
-        return if $r > 0;
-        sleep 1;
-    }
-    kill 'KILL', $pid;
-    waitpid($pid, 0);
-}
-
-# Run claude inside the container with concurrent periodic sync, then do a
-# final sync on exit. Replaces the prior exec() call sites — we need our
-# perl process alive both DURING the run (to host the sidecar) and AFTER
-# (to do the final sync). Returns claude's exit code.
-sub run_claude_with_sync {
+# Run claude inside the container. Returns claude's exit code.
+#
+# Host's .claude-data IS the live state via the bind mount, so claude's
+# writes land directly — no sync needed after exit.
+#
+# IMPORTANT: do NOT `podman stop` after claude exits. Other connector
+# instances may have their own claude in the same container — stopping
+# would kill them. The container's heartbeat-only keep-alive loop handles
+# cleanup: the container reaps itself within HB(300s)+GRACE(10s) after
+# the manager terminal's last sentinel touch, independent of whether any
+# claude processes are running.
+sub run_claude {
     my @cmd = @_;
-    my $sidecar = spawn_sync_sidecar();
     my $rc = system(@cmd);
-    stop_sync_sidecar($sidecar);
-    # Final guaranteed sync after the sidecar is dead, so we don't race with
-    # it on the same podman cp.
-    sync_sessions_volume_to_host();
-    sync_claude_json_to_host();
-    # Drop the heartbeat sentinel so the container's wait loop exits on
-    # its next poll (~3s) rather than waiting 120s for the sentinel to
-    # go stale. Best-effort: ignore errors (container may already be gone).
-    system($PODMAN, 'exec', $CONTAINER_NAME, 'rm', '-f', '/tmp/.launcher-alive');
     return $rc >> 8;
 }
 
 # =====================================================================
-# Resolve session decision UP-FRONT
+# Container create / start (MANAGER mode)
 # =====================================================================
 #
-# The container's CMD is a bash keep-alive loop that exits ~15s after the
-# last `claude` process leaves. If we ran the picker AFTER `podman start`,
-# user think-time would let that 15s window expire and the subsequent
-# `podman exec` would fail with "container state improper". Pick first,
-# touch the container second — that way the gap between `podman start`
-# (or the existence check) and `podman exec` is sub-second.
-my @SESSION_FLAGS;
-{
-    my ($action, $uuid);
-    if (length $RESUME_SESSION) {
-        ($action, $uuid) = ('resume', $RESUME_SESSION);
-    } else {
-        ($action, $uuid) = pick_session_action();
-    }
-    if ($action eq 'cancel') {
-        print "Cancelled.\n";
-        release_lock();
-        reset_terminal();
-        exit 0;
-    }
-    push @SESSION_FLAGS, '--resume', $uuid if $action eq 'resume';
-    # else 'new' — no flags, claude starts fresh.
-}
-
-# =====================================================================
-# Launch or reattach
-# =====================================================================
-#
-# Tracks whether this run created a new container (incl. via [r]ebuild).
-# The backpack install pass below only fires on fresh creation — on a
-# restart of an existing (stopped) container, tooling state was preserved
-# and re-running the install pass would just be slow no-op (verify-then-
+# By construction the connector dispatch near the top of this file has
+# already exited any launcher invocation that found the container in
+# `running` state, so we know here we're the manager. Tracks whether
+# this run created a new container (incl. via [r]ebuild). The backpack
+# install pass below only fires on fresh creation — on a restart of an
+# existing (stopped) container, tooling state was preserved and
+# re-running the install pass would just be slow no-op (verify-then-
 # skip on every item).
 
 my $CONTAINER_WAS_CREATED = 0;
 
+# At this point we are guaranteed to be in MANAGER mode — the early
+# dispatch near the top of this file already redirected CONNECTOR-mode
+# runs (running container) and rejected --resume-session in that mode.
+# The container is either missing entirely OR exists in a non-running
+# state (stopped/exited/created).
+
 if (_container_exists($CONTAINER_NAME)) {
-    my $state = `$PODMAN inspect --format '{{.State.Status}}' "$CONTAINER_NAME" 2>/dev/null`;
-    chomp $state if defined $state;
-    $state //= '';
-    if ($state eq 'running') {
-        print "Container $CONTAINER_NAME is already running - starting a new session inside it.\n";
-        release_lock();
-        my @cmd = ($PODMAN, 'exec', '-it', $CONTAINER_NAME,
-                   'claude', '--dangerously-skip-permissions',
-                   @SESSION_FLAGS);
-        # Run + post-sync. Can't exec() here anymore: we need the perl
-        # process alive after claude exits so it can mirror the sessions
-        # volume + .claude.json back to host. See run_claude_with_sync.
-        my $rc = run_claude_with_sync(@cmd);
-        reset_terminal();
-        exit $rc;
-    }
-    # Container exists but stopped — start it below.
     print "Starting container: $CONTAINER_NAME\n";
 } else {
     print "Creating new container: $CONTAINER_NAME\n";
+}
+
+if (! _container_exists($CONTAINER_NAME)) {
 
     # Materialize blueprint copies on first create.
     if (! -f $CONTAINER_CLAUDE_MD) {
@@ -1220,10 +1414,13 @@ if (_container_exists($CONTAINER_NAME)) {
         _write_file($SETTINGS_HASH_FILE, md5_of_file("$CONTAINER_CONFIG/settings.json"));
     }
 
-    # Create the named sessions volume before referencing it in `podman
-    # create -v`. Idempotent — exists across container rebuilds, so a fresh
-    # container picks up the prior run's sessions automatically.
-    ensure_sessions_volume();
+    # Materialize blueprint files + single-file-bind placeholders on host
+    # BEFORE the bind mounts go live, so /root/.claude/ inside the
+    # container sees everything at the canonical paths from the first
+    # moment.
+    apply_blueprints_to_host_data();
+    ensure_claude_json_host_file();
+    ensure_credentials_json_host_file();
 
     my @podman_args = (
         $PODMAN, 'create', '-it',
@@ -1238,22 +1435,36 @@ if (_container_exists($CONTAINER_NAME)) {
     push @podman_args, @EXTRA_ENV;
     push @podman_args,
         '-v', "${PROJECT_PATH}:/project",
+        # /root/.claude is a direct bind from host's .claude-data/.
+        # On WSL2 (and Linux/macOS hosts), the bind honors O_APPEND and
+        # utimensat correctly — claude's session jsonl appends, task
+        # store, lock manager, and settings writes all work as expected
+        # with no volume + sync-sidecar workaround. See the "Host data
+        # layout" comment block earlier in this file for history.
         '-v', "${PROJECT_PATH}/.claude-data:/root/.claude",
+        # .launcher is OVERLAID as RO on top of the .claude-data bind.
+        # The directory is launcher-managed metadata (hashes, snapshots,
+        # blueprint canonicals, container-created/-name) — a compromised
+        # in-container process could otherwise fake hashes to bypass
+        # backpack approval or corrupt the launcher's selection state.
+        # statusline.pl + skills/plugins read its contents; nothing
+        # inside the container needs to write to it.
         '-v', "${LAUNCHER_DIR}:/root/.claude/.launcher:ro",
+        # .credentials.json is a single-file RW bind from the canonical
+        # location inside .launcher/. The container DOES need to write
+        # here (mcpOAuth tokens written by `claude mcp add` flows), and
+        # binding the single file lets those writes land on the canonical
+        # path so they survive container rebuild — without exposing the
+        # rest of .launcher/ as writable. ensure_credentials_json_host_file()
+        # seeds an empty {} if missing.
         '-v', "${SANDBOX_CREDENTIALS_FILE}:/root/.claude/.credentials.json",
-        '-v', "${CONTAINER_CLAUDE_MD}:/root/.claude/CLAUDE.md",
-        '-v', "${CONTAINER_SETTINGS_JSON}:/root/.claude/settings.json",
-        '-v', "${CLAUDE_HOST_CONFIG}/ccpraxis/scripts/statusline.pl:/root/.claude/statusline.pl:ro",
-        # 9p-O_APPEND workaround: overlay /root/.claude/projects with a named
-        # volume backed by the machine's xfs filesystem. The host bind below
-        # /root/.claude is still 9p — that's fine for the rest of the tree
-        # (claude rewrites those files via O_TRUNC, not appends). Sessions
-        # specifically use O_APPEND, which 9p rejects with EIO. See the
-        # SESSIONS_VOLUME comment near the top of this file for the chain.
-        # NOTE: ~/.claude.json USED to be a file-level 9p bind here; it was
-        # removed for the same reason (claude appends to it during resume).
-        # Launcher now seeds + syncs it via podman cp instead.
-        '-v', "${SESSIONS_VOLUME}:/root/.claude/projects";
+        # .claude.json lives at /root/.claude.json (NOT inside
+        # /root/.claude/), so it gets its own single-file bind from
+        # .claude-data/.claude.json. ensure_claude_json_host_file() above
+        # guarantees the host file exists so the mount doesn't auto-create
+        # a directory.
+        '-v', "${PROJECT_PATH}/.claude-data/.claude.json:/root/.claude.json",
+        '-v', "${CLAUDE_HOST_CONFIG}/ccpraxis/scripts/statusline.pl:/root/.claude/statusline.pl:ro";
     push @podman_args, @SKILL_MOUNTS;
     push @podman_args, @PLUGIN_MOUNTS;
     push @podman_args, @EXTRA_MOUNTS;
@@ -1338,15 +1549,17 @@ if (_container_exists($CONTAINER_NAME)) {
 # Backpack approval (host-side, BEFORE podman start)
 # =====================================================================
 #
-# The container's keep-alive bash CMD exits 15s after the last `claude`
-# process is gone. If we did validate / list / prompt AFTER `podman
-# start`, the user's read-and-press-y time would burn through that window
-# and the subsequent `podman exec apt-get update` would fail with
-# "container state improper". Run all the interaction up here on the
-# host (using the host's backpack.pl — it's the same script that gets
-# mounted into the container), capture the approval, and only do the
-# in-container install after start. The gap between `podman start` and
-# the first `podman exec` then stays sub-second.
+# The container's heartbeat-only ENTRYPOINT loop exits when the
+# /tmp/.launcher-alive sentinel goes stale (>HB=300s without a touch).
+# There is a 10s startup grace, after which the first missing sentinel
+# check causes rapid reap. If we did validate / list / prompt AFTER
+# `podman start`, the user's read-and-press-y time could push past that
+# grace window and the subsequent `podman exec apt-get update` would
+# fail with "container state improper". Run all the interaction up here
+# on the host (using the host's backpack.pl — it's the same script that
+# gets mounted into the container), capture the approval, and only do
+# the in-container install after start. The gap between `podman start`
+# and the first `podman exec` then stays sub-second.
 
 my $BACKPACK_APPROVED      = 0;
 my $BACKPACK_TRUST_FILE    = "$LAUNCHER_DIR/backpack-trusted-hash";
@@ -1422,33 +1635,36 @@ if ($CONTAINER_WAS_CREATED && -f $BACKPACK_HOST_FILE) {
 release_lock();
 system($PODMAN, 'start', $CONTAINER_NAME);
 
-# Land the keep-alive heartbeat immediately. The container's wait loop
-# starts a 5-second grace timer at boot; after that it requires either
-# `claude` running OR /tmp/.launcher-alive freshly mtime-touched (last
-# 120s). The sync sidecar (started below) refreshes the sentinel every
-# 60s; this touch buys the first window before the sidecar's first tick.
+# Land the first sentinel touch IMMEDIATELY after `podman start`, before
+# anything else (perl/helper probes, apt-get update, backpack install)
+# burns through the container's 10-second startup grace. The container's
+# entrypoint loop checks for /tmp/.launcher-alive at t=GRACE and reaps
+# itself if missing — so any slow operation here would kill the container
+# mid-flight ("container state improper" on the next exec). With the
+# sentinel established first, we now have HB=300s to do the install pass
+# before needing another refresh (and the install pass below maintains
+# its own in-container refresher for installs that exceed that window).
 system($PODMAN, 'exec', $CONTAINER_NAME, 'touch', '/tmp/.launcher-alive');
 
-# --- Seed sessions volume + ~/.claude.json from host (on fresh create only) ---
-# Only seed on fresh container creation. On restart of an existing container,
-# the volume already holds the most-recent sessions from the prior run, and
-# the container's overlay holds the most-recent .claude.json. Re-seeding
-# either would clobber work; only happens when we've definitively just made
-# a new empty container.
-if ($CONTAINER_WAS_CREATED) {
-    if (sessions_volume_is_empty()) {
-        seed_sessions_volume_from_host();
-    } else {
-        print "Sessions volume already populated (carried over from prior container) - skipping seed.\n";
-    }
-    seed_claude_json_from_host();
-}
+# Bind mount of .claude-data → /root/.claude means host filesystem IS
+# the live state. No seed, no rescue, no sync. Blueprint files were
+# already materialized to .claude-data/ before podman create — the bind
+# now exposes them in the container at the canonical paths. Same for
+# .claude.json's single-file bind. Nothing to do here.
 
 # --- Backpack install (container side, only if approved up-front) ---
 # All user interaction (validate, list, prompt) happened on the host
-# before `podman start` to keep the post-start gap sub-second. By this
-# point the decision is made — just commit the trusted hash and run
-# apt + install in the running container, fast and unattended.
+# before `podman start`. By this point the decision is made — commit the
+# trusted hash and run apt + install in the running container.
+#
+# Large backpack installs (e.g. chromium = 289 deps / 221MB) can easily
+# exceed the container's 5-min HB window, which would otherwise let the
+# entrypoint loop reap the container mid-`apt-get install`. We solve
+# that by running apt-get update + the install + a parallel heartbeat
+# refresher all under a single `podman exec bash`. The heartbeat runs as
+# a background subshell tied to the bash's lifetime via `trap EXIT`, so
+# it dies the moment the install completes (or this bash is signalled).
+# Single exec → single lifecycle → no orphan helper to clean up.
 if ($BACKPACK_APPROVED) {
     # Record the trusted hash NOW (before install). If install
     # itself fails some items, the user has still approved this
@@ -1465,16 +1681,26 @@ if ($BACKPACK_APPROVED) {
     if (!$has_helper) {
         print STDERR "WARNING: Backpack found at .claude-data/backpack.json but backpack.pl isn't mounted in the container. Update ccpraxis (the launcher needs the plugin's backpack/scripts/backpack.pl) and rebuild.\n";
     } else {
-        print "Refreshing apt index...\n";
-        # apt-get update is idempotent; we run it once so individual
-        # backpack entries don't each need to. Failure is not fatal —
-        # some entries (e.g. project-setup category) don't need apt.
-        system($PODMAN, 'exec', $CONTAINER_NAME,
-            'apt-get', 'update', '-qq');
-        print "Installing backpack items...\n";
+        # Inline bash script: kick off the heartbeat refresher in the
+        # background, run apt-get update + backpack install in the
+        # foreground, then let the EXIT trap kill the refresher on the
+        # way out. The script's exit status mirrors the install's.
+        # Note: apt-get update failures are not fatal (per the pre-existing
+        # behavior — some backpack entries don't depend on apt), so its
+        # return code is intentionally ignored.
+        my $install_script = <<'BASH';
+HB_PID=""
+cleanup() { [ -n "$HB_PID" ] && kill "$HB_PID" 2>/dev/null; }
+trap cleanup EXIT INT TERM HUP
+( while true; do touch /tmp/.launcher-alive; sleep 60; done ) &
+HB_PID=$!
+echo "Refreshing apt index..."
+apt-get update -qq
+echo "Installing backpack items..."
+perl /root/.claude/backpack.pl install /root/.claude/backpack.json
+BASH
         my $install_rc = system($PODMAN, 'exec', $CONTAINER_NAME,
-            'perl', '/root/.claude/backpack.pl', 'install',
-            '/root/.claude/backpack.json');
+            'bash', '-c', $install_script);
         if ($install_rc != 0) {
             print "\n";
             print "WARNING: Some backpack items failed (see above). Handing off to claude anyway — fix in-session via /backpack:add, /backpack:remove, or by editing the backpack file directly and running /backpack:install.\n";
@@ -1483,11 +1709,62 @@ if ($BACKPACK_APPROVED) {
     }
 }
 
-my @exec_cmd = ($PODMAN, 'exec', '-it', $CONTAINER_NAME,
-                'claude', '--dangerously-skip-permissions',
-                @SESSION_FLAGS);
-# Run + post-sync (mirrors volume + .claude.json back to host). Can't
-# exec() here anymore — see run_claude_with_sync for rationale.
-my $rc = run_claude_with_sync(@exec_cmd);
-reset_terminal();
-exit $rc;
+# =====================================================================
+# Heartbeat loop (manager mode)
+# =====================================================================
+#
+# Container is up + backpack install (if any) is done. This launcher
+# now becomes the heartbeat keeper: refresh /tmp/.launcher-alive every
+# 2 minutes (well within the container's 5-minute HB staleness window).
+# Closing this terminal — or sending Ctrl+C — stops the refresh; the
+# container reaps itself within ~5 minutes.
+#
+# To start a claude session, the user runs `claude-sandbox` in another
+# terminal — that one hits the CONNECTOR branch above.
+
+# Refresh sentinel one more time before entering the BEAT_INTERVAL sleep,
+# so the first $BEAT_INTERVAL window starts from "now" — covers the case
+# where the install pass took a long time and its last in-container
+# refresh was already a while ago.
+system($PODMAN, 'exec', $CONTAINER_NAME, 'touch', '/tmp/.launcher-alive');
+
+print "\n";
+print "=" x 60 . "\n";
+print "Sandbox ready: $CONTAINER_NAME\n";
+print "=" x 60 . "\n";
+print "Open another terminal in this project and run:\n";
+print "    claude-sandbox\n";
+print "to start or resume a claude session.\n";
+print "\n";
+print "Multiple connector terminals can share this sandbox.\n";
+print "This terminal is the manager — keep it open. Closing it stops\n";
+print "the sandbox (~5 minutes after the last heartbeat).\n";
+print "Press Ctrl+C to stop now.\n";
+print "\n";
+
+my $BEAT_INTERVAL = 120;  # Container's HB is 300 (5 min); 120s gives 2.5x margin.
+while (1) {
+    sleep $BEAT_INTERVAL;
+    my $rc = system($PODMAN, 'exec', $CONTAINER_NAME, 'touch', '/tmp/.launcher-alive');
+    if ($rc != 0) {
+        # Heartbeat failed — most likely cause is the container died
+        # (was rm'd from another terminal, podman machine restarted,
+        # something killed conmon). Confirm by inspecting state and
+        # exit cleanly if so.
+        my $state = `$PODMAN inspect --format '{{.State.Status}}' "$CONTAINER_NAME" 2>/dev/null`;
+        chomp $state if defined $state;
+        $state //= '';
+        if ($state ne 'running') {
+            print STDERR "\n";
+            print STDERR "Container $CONTAINER_NAME is no longer running (state: '$state').\n";
+            print STDERR "Manager exiting.\n";
+            reset_terminal();
+            exit 0;
+        }
+        # Container IS still running but exec failed — log and keep trying.
+        printf STDERR "[%s] WARNING: heartbeat refresh failed (exit %d); will retry next tick\n",
+            strftime("%H:%M:%S", localtime), ($rc >> 8);
+        next;
+    }
+    printf "[%s] heartbeat\n", strftime("%H:%M:%S", localtime);
+}

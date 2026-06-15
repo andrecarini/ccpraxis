@@ -1,6 +1,6 @@
 ---
 name: bp-scout
-description: Terrain-mapping scout for blueprint packages. Dispatched by a blueprint coordinator before design or implementation to locate relevant files, call sites, data flows, and existing conventions, and to flag landmines. Use whenever a package's inputs don't already map the code that will be touched.
+description: Terrain-mapping scout for blueprint packages. Dispatched by a butler coordinator before design or implementation to locate relevant files, call sites, data flows, and existing conventions, and to flag landmines. Use whenever a package's inputs don't already map the code that will be touched.
 model: haiku
 maxTurns: 15
 tools: Read, Grep, Glob, Write

@@ -1,19 +1,19 @@
 # **PRAXIS for Claude Code**
 ## **P**rompts, **R**ules, **A**gents, e**X**tensions, **I**ntegrations & **S**kills.
 
-A curated [Claude Code](https://docs.anthropic.com/en/docs/claude-code) configuration: global instructions, custom slash commands, a rich statusline, bidirectional config sync, cross-machine personal-state vault, and a Podman-based sandbox that keeps all development off your host machine.
+A curated [Claude Code](https://docs.anthropic.com/en/docs/claude-code) configuration: global instructions, custom slash commands, a rich statusline, bidirectional config sync, cross-machine personal-state vault, and a Docker-or-Podman sandbox that keeps all development off your host machine.
 
 - **Global instructions** — supply chain security rules, response style, dev tooling restrictions
 - **Custom statusline** — model, context usage, token counts, plan rate limits with reset timers
 - **Config sync** (`/steward:backup`) — bidirectional drift detection, AI-assisted conflict merging, secret scanning
 - **Vault sync** — a private `claude-code-vault` git repo backs up todos and project-scoped Claude files (CLAUDE.md, skills, blueprints, memory) across machines, with 3-way merge, locking, journaling, atomic staging, and a pre-rename secret scan
-- **Podman sandbox** (`claude-sandbox`) — isolated rootless containers with full Claude autonomy, interactive skill selection, blocked install hooks, 7-day package age minimum
+- **Docker/Podman sandbox** (`claude-sandbox`) — isolated containers (Docker or Podman, auto-detected) with full Claude autonomy, interactive skill selection, blocked install hooks, 7-day package age minimum
 - **Backpack plugin** — per-project declarative manifest of tools/runtimes/setup commands that's replayed on every container rebuild
 - **Beacon plugin** — mark sessions as ongoing work and resume them across restarts, terminal crashes, and context switches
 
 **ccpraxis is meant to be forked.** Everything here — skills, settings, instructions — is configuration you'll want to own, tweak, and carry across machines. Fork the repo so your edits live in your own GitHub account, then pull upstream periodically to grab new skills and fixes.
 
-**Why the sandbox.** Supply chain attacks in development dependencies are rampant — a single malicious npm `postinstall` hook or pip `setup.py` can steal credentials, SSH keys, browser sessions, and more. ccpraxis instructs Claude to refuse to run dev tooling on the host and instead run everything in isolated rootless Podman containers with supply chain protections (blocked install hooks, 7-day minimum package age, user-namespace isolation from the host).
+**Why the sandbox.** Supply chain attacks in development dependencies are rampant — a single malicious npm `postinstall` hook or pip `setup.py` can steal credentials, SSH keys, browser sessions, and more. ccpraxis instructs Claude to refuse to run dev tooling on the host and instead run everything in isolated containers (Docker or Podman, auto-detected) with supply chain protections (blocked install hooks, 7-day minimum package age, user-namespace isolation from the host when using rootless Podman).
 
 ---
 
@@ -66,7 +66,7 @@ Once installed, here's what you'll actually type day-to-day, grouped by job:
 
 **Browsing or cleaning up beacons.** `/beacon:list` renders them as a Markdown table, `/beacon:view <id>` shows one full record, `/beacon:delete <id>` removes any beacon by ID-or-prefix (with confirmation).
 
-**Planning a multi-session initiative.** `/blueprint:create` interrogates the objective and decomposes it into scoped packages — a durable on-disk *blueprint* — then gates it through a fresh-context auditor; `/blueprint:manage` lists, views, audits, archives, or deletes them. Inside a sandbox, the `butler` plugin executes a blueprint: `/butler:launch` spawns detached coordinator agents (one per package, with hook-enforced scope/git/ledger discipline), and `/butler:status` / `/butler:resume` monitor and recover them.
+**Planning a multi-session initiative.** `/blueprint:create` interrogates the objective and decomposes it into scoped packages — a durable on-disk *blueprint* — then gates it through a fresh-context auditor; `/blueprint:manage` lists, views, audits, archives, or deletes them; `/blueprint:resume` picks up an in-progress blueprint in the current session (loads blueprint.md, summarizes state, and continues). Inside a sandbox, the `butler` plugin executes a blueprint: `/butler:launch` spawns detached coordinator agents (one per package, with hook-enforced scope/git/ledger discipline), and `/butler:status` / `/butler:resume` monitor and recover them.
 
 **Capturing a todo.** `/todo:create` saves a note, `/todo:resume` loads one to work on, `/todo:manage` does CRUD. Todos sync via the vault.
 
@@ -199,13 +199,13 @@ ccpraxis/
 │   │   │   ├── guard-bash.sh                # PreToolUse hook for Bash inside coordinator sessions.
 │   │   │   ├── guard-writes.sh              # PreToolUse hook for Edit|Write|MultiEdit|NotebookEdit.
 │   │   │   ├── hooks.json                   # Hook registration for butler: PreToolUse (guard-writes/guard-bash/track-dispatch), PostToolUse (log-dispatch), Stop (gate-stop).
-│   │   │   ├── lib.sh                       # shared helpers for blueprint hooks.
+│   │   │   ├── lib.sh                       # shared helpers for butler hooks.
 │   │   │   ├── log-dispatch.sh              # PostToolUse hook for Task inside coordinator sessions.
 │   │   │   └── track-dispatch.sh            # PreToolUse hook for Task inside coordinator sessions.
 │   │   ├── scripts/
 │   │   │   ├── bp-init.sh                   # ensure the ccpraxis local data root exists and self-gitignores.
 │   │   │   ├── bp-launch.sh                 # launch (or resume) a headless coordinator session for one package.
-│   │   │   ├── bp-lib.sh                    # shared helpers for the blueprint plugin.
+│   │   │   ├── bp-lib.sh                    # butler's copy of the shared base helpers PLUS sandbox-only execution helpers.
 │   │   │   ├── bp-resume-sweep.sh           # find interrupted coordinators and resume them economically.
 │   │   │   └── bp-status.sh                 # one-line-per-package rollup across blueprints.
 │   │   ├── skills/
@@ -230,7 +230,7 @@ ccpraxis/
 │   │   ├── ccpraxis-install.pl              # Install hook — wires plugins/sandbox/bin/ into user PATH (delegates to _install-bin-helper.pl)
 │   │   ├── container/                       # Container blueprint — files that get baked into or mounted into the sandbox container
 │   │   │   ├── CLAUDE.md                    # Container-specific instructions (full autonomy)
-│   │   │   ├── Containerfile                # Podman/OCI container image: Debian bookworm + Claude Code CLI + dev tools (runs as root inside the rootless-Podman user namespace)
+│   │   │   ├── Containerfile                # OCI container image: Debian bookworm + Claude Code CLI + dev tools (runs as root; works with Docker or rootless Podman)
 │   │   │   ├── claude.json                  # Onboarding bypass for containers
 │   │   │   └── settings.json                # Container-specific settings
 │   │   ├── scripts/
@@ -248,7 +248,7 @@ ccpraxis/
 │   │       ├── lib/
 │   │       │   └── TestSandbox.pm
 │   │       ├── manual/
-│   │       │   └── longrun-freeze-check.sh  # Long-running empirical test: spin up claude in a container with the
+│   │       │   └── longrun-freeze-check.sh  # Long-running empirical test: spins up a container with the current bind-mount architecture, drives claude with periodic keystrokes via socat for 8 minutes, and confirms it stayed alive throughout. Destructive — needs a real container runtime. See file header for usage.
 │   │       ├── run-tests.pl                 # Test runner for plugins/sandbox/tests/t/.
 │   │       └── t/
 │   │           ├── 01-bind-honors-append-and-utimensat.t
@@ -280,17 +280,29 @@ ccpraxis/
 │   │   │   ├── sensitive-check.pl           # Scans the public ccpraxis repo for secrets before committing
 │   │   │   ├── sync-export.pl               # Detects drift between live config and this repo
 │   │   │   └── vault-sync.pl                # Central engine for claude-code-vault project backups.
-│   │   └── skills/
-│   │       ├── audit/
-│   │       │   └── SKILL.md                 # Audits the ccpraxis repo itself — fans out read-only subagents (per-system re…
-│   │       ├── backup/
-│   │       │   └── SKILL.md                 # Syncs everything personal between the live host and your private repos — ccpr…
-│   │       ├── ccpraxis-extend/
-│   │       │   └── SKILL.md                 # THE single entrypoint for changing ccpraxis or adding new functionality to it.
-│   │       ├── setup-project/
-│   │       │   └── SKILL.md                 # Onboard the current project to the ccpraxis system — create the local data di…
-│   │       └── update/
-│   │           └── SKILL.md                 # Safely updates Claude Code by researching releases before installing.
+│   │   ├── skills/
+│   │   │   ├── audit/
+│   │   │   │   └── SKILL.md                 # Audits the ccpraxis repo itself — fans out read-only subagents (per-system re…
+│   │   │   ├── backup/
+│   │   │   │   └── SKILL.md                 # Syncs everything personal between the live host and your private repos — ccpr…
+│   │   │   ├── ccpraxis-extend/
+│   │   │   │   └── SKILL.md                 # THE single entrypoint for changing ccpraxis or adding new functionality to it.
+│   │   │   ├── setup-project/
+│   │   │   │   └── SKILL.md                 # Onboard the current project to the ccpraxis system — create the local data di…
+│   │   │   └── update/
+│   │   │       └── SKILL.md                 # Safely updates Claude Code by researching releases before installing.
+│   │   └── tests/
+│   │       ├── lib/
+│   │       │   └── StewardTest.pm           # StewardTest — minimal test harness for the steward vault engine.
+│   │       ├── run-tests.pl                 # runner for the steward vault test suite.
+│   │       └── t/
+│   │           ├── 01-encoding.t
+│   │           ├── 02-host-memory-roundtrip.t
+│   │           ├── 03-second-machine-link.t
+│   │           ├── 04-conflict.t
+│   │           ├── 05-hard-exclude.t
+│   │           ├── 06-refresh-idempotent.t
+│   │           └── 07-vault-metadata-rot.t
 │   └── todo/                                # Personal todo notes synced to your private vault repo.
 │       ├── .claude-plugin/
 │       │   └── plugin.json
@@ -338,7 +350,9 @@ The orchestrator is two-phase: a bare run prints the plan and exits without touc
 
 ### Shell-script policy
 
-`.sh` and `.ps1` files exist only for **commands the user runs directly outside Claude** (`claude-sandbox`, `claude-beacon`). Everything else — install logic, plugin internals, statusline rendering — is Perl. One source of truth, no cross-shell duplication.
+`.sh` and `.ps1` files exist only for **commands the user runs directly outside Claude** (`claude-sandbox`, `claude-beacon`). Everything else — install logic, plugin internals, statusline rendering — is Perl. One source of truth for host-side code.
+
+Two deliberate exceptions: the `butler` and `blueprint` plugins each carry a small set of `.sh` scripts (`bp-lib.sh`, `bp-init.sh`, `bp-launch.sh`, `bp-status.sh`, `bp-resume-sweep.sh`, and hook shell scripts). These run **inside the Linux sandbox container**, where Bash is the right tool (POSIX process management, `flock`, `kill`, background jobs). `bp-lib.sh` is intentionally NOT byte-identical across the two plugins — the butler copy is a superset of the blueprint copy, adding sandbox-execution helpers that the blueprint (host-only) side has no need for.
 
 ### Slash commands
 
@@ -350,6 +364,7 @@ The orchestrator is two-phase: a bare run prints the plan and exits without touc
 **Planning and todos**
 - `/blueprint:create` — author a durable multi-package blueprint (interrogate → decompose → auditor gate)
 - `/blueprint:manage` — list, view, audit, archive, or delete blueprints
+- `/blueprint:resume` — resume work on an in-progress blueprint in the current interactive session
 - `/butler:launch` — execute a blueprint via detached coordinator agents (sandbox-only); `/butler:status` and `/butler:resume` monitor/recover
 - `/todo:create` — save a todo note
 - `/todo:manage` — CRUD for personal todos
@@ -441,7 +456,8 @@ claude-code-vault/
 - `.claude/skills/`, `.claude/agents/`, `.claude/hooks/`, `.claude/commands/`, `.claude/plans/`
 - `<.claude-plans/>` (legacy persistent plans, if any remain in a project)
 - `.ccpraxis-local-data/blueprints/` (authored blueprints — see Blueprint plugin; the machine-local `runs/` execution state is hard-excluded)
-- `.claude-data/memory/` and `.claude-data/plans/` (sandbox state)
+- `.claude-data/projects/-project/memory/` (in-sandbox memory; the path where Claude Code lands memory under the `.claude-data:/root/.claude` bind) and `.claude-data/plans/` (sandbox state)
+- `_host-memory` (synthetic path resolving to `~/.claude/projects/<encoded-project-cwd>/memory/` on each machine — backs up the host-side Claude memory for this project)
 - `.claude-data/backpack.json` (per-project sandbox backpack — see Backpack plugin)
 
 **Hard-excluded (never offered):** `.claude/settings.local.json`, `.claude-data/git-pat`, `.claude-data/git-askpass.sh`, `.claude-data/git-ssh-command.sh`, `deploy_key`, `.ccpraxis-local-data/blueprints/<name>/runs/`.
@@ -466,11 +482,11 @@ The canonical entry point is the **`claude-sandbox` host launcher**. The global 
 
 **`/sandbox:setup` (from inside Claude) does NOT run any of this.** It's a thin skill that checks for `.claude-data/` and, depending on state, tells the user to either (a) exit Claude and run `claude-sandbox` from a terminal, or (b) just run `claude-sandbox` since a sandbox is already configured. The actual bootstrap is interactive (it prompts for PAT or SSH key choice) and must own the controlling tty — Claude can't answer the prompts from inside a session.
 
-**Lifecycle.** Each project gets a **persistent Podman container** — installed packages, runtimes, and tools survive between sessions. On every launch, `plugins/sandbox/scripts/launcher.pl`:
+**Lifecycle.** Each project gets a **persistent container** (Docker or Podman, auto-detected by the launcher) — installed packages, runtimes, and tools survive between sessions. On every launch, `plugins/sandbox/scripts/launcher.pl`:
 
-1. **First-time bootstrap** — if `.claude-data/` doesn't exist, prompts `Set up a new sandbox for this project? [Y/n]` and on confirm runs `plugins/sandbox/scripts/bootstrap.pl` (deterministic, perl-driven; no Claude session involved). The bootstrap verifies `plugins/sandbox/container/`, confirms Podman is reachable (and prints platform-specific install / `podman machine start` guidance if not), builds the image if missing, creates `.claude-data/`, appends `.claude-data` + `deploy_key` to `.gitignore`, sets up git auth interactively (HTTPS → PAT, SSH → deploy key; skipped if `git-askpass.sh` or `deploy_key` is already present), and runs the PATH install hook. After it returns, the launcher continues with the rest of the flow in the same invocation.
-2. **Image build** — builds the `claude-sandbox` Podman image if it doesn't exist yet (no-op when bootstrap already built it).
-3. **Skill selection** — discovers available skills (custom + plugin) and plugins/MCPs, presents an interactive picker, saves selections per project (re-prompts only when new skills/plugins/MCPs appear).
+1. **First-time bootstrap** — if `.claude-data/` doesn't exist, prompts `Set up a new sandbox for this project? [Y/n]` and on confirm runs `plugins/sandbox/scripts/bootstrap.pl` (deterministic, perl-driven; no Claude session involved). The bootstrap verifies `plugins/sandbox/container/`, confirms Docker or Podman is reachable (and prints platform-specific install guidance if not), builds the image if missing, creates `.claude-data/`, appends `.claude-data` + `deploy_key` to `.gitignore`, sets up git auth interactively (HTTPS → PAT, SSH → deploy key; skipped if `git-askpass.sh` or `deploy_key` is already present), and runs the PATH install hook. After it returns, the launcher continues with the rest of the flow in the same invocation.
+2. **Image build** — builds the `claude-sandbox` image if it doesn't exist yet (no-op when bootstrap already built it).
+3. **Skill selection** — on every manager-mode launch, discovers available skills (custom + plugin) and plugins/MCPs, and presents an interactive arrow-keys+space TUI picker (`skills.pl select-interactive`). Selections are saved per project; if nothing changed since last launch the TUI is still shown but the previous selection is pre-loaded.
 4. **Staleness check** — detects conditions that may warrant a rebuild:
    - Claude Code version mismatch (host was updated since container was created)
    - Container age > 7 days (base OS packages may be outdated)
@@ -482,38 +498,35 @@ The canonical entry point is the **`claude-sandbox` host launcher**. The global 
 
 Container names are deterministic per project path (hash-based), stored in `.claude-data/.launcher/container-name`.
 
-The container runs `claude --dangerously-skip-permissions` as root — full autonomy inside the sandbox. Rootless Podman maps container root to the unprivileged host user via the kernel's user namespace, so files written to `/project` come out owned by the host user (no chown dance) and a container escape lands as the unprivileged host user, not host root. The container-specific `CLAUDE.md` tells Claude it can install and run anything, while still enforcing supply chain rules.
+The container runs `claude --dangerously-skip-permissions` as root — full autonomy inside the sandbox. With rootless Podman, container root is mapped to the unprivileged host user via the kernel's user namespace, so files written to `/project` come out owned by the host user (no chown dance) and a container escape lands as the unprivileged host user, not host root. Docker Desktop uses a similar VM-isolation model on Windows/macOS. The container-specific `CLAUDE.md` tells Claude it can install and run anything, while still enforcing supply chain rules.
 
 **Mounts:**
 
 | Mount | Access | What |
 |-------|--------|------|
 | Project directory | Read/Write | Code lives at `/project` inside the container |
-| `.claude-data/` | Read/Write | Persists memories, conversation history, plans between sessions |
-| `.claude-data/.claude.json` | Read/Write | Claude settings (onboarding bypass, UI hints) |
-| `.claude-data/.launcher/` | Read-only | Container metadata (version, creation date, skill selection) |
-| `.credentials.json` | Read-only | Auth tokens from host — container can't modify them |
-| `CLAUDE.md`, `settings.json` | Read-only | Container-specific instructions and settings |
-| `statusline.pl` | Read-only | Custom statusline script |
+| `.claude-data/` → `/root/.claude/` | Read/Write | Persists memories, conversation history, plans between sessions (bulk bind) |
+| `.claude-data/.claude.json` → `/root/.claude.json` | Read/Write | Claude settings (onboarding bypass, UI hints) — single-file bind outside `/root/.claude/` |
+| `.claude-data/.launcher/` → `/root/.claude/.launcher/` | Read-only | Launcher-managed metadata (hashes, snapshots, blueprint canonicals, container-name) — overlaid RO on top of the bulk bind |
+| `.claude-data/.launcher/.credentials.json` → `/root/.claude/.credentials.json` | Read/Write | Auth tokens; container writes here so `mcpOAuth.*` tokens persist across rebuilds — single-file RW bind over the RO `.launcher/` overlay |
+| `CLAUDE.md`, `settings.json` | Read/Write | Blueprint copies in `.claude-data/.launcher/` (written on first create; RW via the bulk bind above); the container can freely modify them — drift from upstream is detected via stored hash |
+| `statusline.pl` | Read-only | Custom statusline script (from the ccpraxis repo, not `.claude-data/`) |
 | Selected skills | Read-only | Skills chosen via the interactive picker |
 | `git-askpass.sh`, `git-pat` | Read-only | PAT-based git auth (if configured) |
 | `git-ssh-command.sh` | Read-only | SSH deploy key wrapper (if configured) |
 
-**Interactive skill selection.** On first launch (or when new skills become available), the launcher presents a picker:
+**Interactive skill selection.** On every manager-mode launch, the launcher presents an arrow-keys+space TUI picker (`skills.pl select-interactive`). Navigate with arrow keys, toggle with Space, confirm with Enter:
 
 ```
 Available skills for this sandbox:
-  [ ] 1. refresh (custom)
-  [ ] 2. frontend-design (plugin:frontend-design)
-  [ ] 3. chrome-devtools (plugin:chrome-devtools-mcp)
-
-Toggle by number (comma-separated), 'a' for all, Enter to confirm:
+  [x] refresh (custom)
+  [ ] frontend-design (plugin:frontend-design@ccpraxis-local)
+  [ ] chrome-devtools (plugin:chrome-devtools-mcp)
 ```
 
 - Skills with `host-only: true` in their YAML frontmatter are excluded (e.g. `/steward:backup`, `/steward:ccpraxis-extend`, `/sandbox:setup`, `/steward:update`)
-- Both custom skills and plugin skills are discovered automatically
-- Selections are saved per project in `.claude-data/.launcher/selected-skills.json`
-- The picker only re-appears when new skills are detected; otherwise it uses the saved selection
+- Both custom skills and plugin skills (and MCP servers) are discovered automatically
+- Selections are saved per project in `.claude-data/.launcher/selected-skills.json` and pre-loaded on the next launch
 
 **Network.** Ports 9000–9009 are mapped 1:1 to the host. When Claude serves a web app, dev server, or any other network service inside the container, it should bind to one of these ports. The user can then access it at `http://localhost:9000` from the host browser.
 
@@ -528,15 +541,15 @@ The container uses the runtime's default networking. Services listening on the h
 - The host filesystem outside the project directory
 - Other projects, `~/.ssh`, browser profiles, password managers
 - Host processes (can't read memory, inject code, or kill processes)
-- Other Podman containers (unless on the same network)
+- Other containers (unless on the same network)
 - USB devices, clipboard, display
 
-Podman does not support fine-grained "allow only port X" rules at the container level. Network access is all-or-nothing: the container either has bridge networking (with full host access via `host.containers.internal`) or `--network none` (no network at all). For projects that don't need network access, the Containerfile or launcher could be modified to use `--network none`.
+Container runtimes do not support fine-grained "allow only port X" rules at the container level. Network access is all-or-nothing: the container either has bridge networking (with full host access via `host.containers.internal` / `host.docker.internal`) or `--network none` (no network at all). For projects that don't need network access, the Containerfile or launcher could be modified to use `--network none`.
 
 **Security.** Inside the container, Claude runs with `--dangerously-skip-permissions` (full autonomy) and can freely install packages, run builds, execute tests. The container itself is the security boundary:
 
-- **Contained:** If a malicious package runs, it is trapped in the container. It cannot access the host filesystem (beyond the mounted project), steal SSH keys, browser sessions, or credentials from other applications. Container root is also mapped via Podman's user namespace to the unprivileged host user, so even an in-container privilege escalation lands as the regular host user — never actual host root — if it ever escapes.
-- **Exposed:** The container can reach host network services (see Network above) and has read-only access to Claude API credentials. A compromised container could modify project files (it has read/write access to `/project`), attempt to attack network services listening on the host, and read (but not modify) Claude API credentials.
+- **Contained:** If a malicious package runs, it is trapped in the container. It cannot access the host filesystem (beyond the mounted project), steal SSH keys, browser sessions, or credentials from other applications. With rootless Podman, container root is mapped via the kernel's user namespace to the unprivileged host user, so even an in-container privilege escalation lands as the regular host user — never actual host root — if it ever escapes. Docker Desktop provides equivalent isolation via its VM boundary.
+- **Exposed:** The container can reach host network services (see Network above) and has read/write access to `.credentials.json` (needed for `mcpOAuth.*` token writes). A compromised container could modify project files (it has read/write access to `/project`), attempt to attack network services listening on the host, and read or write Claude API credentials — but writing here affects only in-container MCP OAuth tokens, not the host user's primary API key (which is passed via environment variable, not credentials file).
 - **Supply chain hardening:** `npm_config_ignore_scripts=true` is baked into the container image to block npm postinstall hooks. The container CLAUDE.md enforces a 7-day minimum package age rule. These protections apply even with full autonomy enabled.
 
 ### Backpack plugin
@@ -587,7 +600,7 @@ The hash is written only on user approval.
 4. On confirm: `apt-get update` once, then `backpack.pl install` against `/root/.claude/backpack.json` (the base Containerfile clears `/var/lib/apt/lists/*`, so apt installs would otherwise fail on first run)
 5. Failures don't abort: shows them, hands off to Claude anyway, lets the agent fix in-session
 
-The install pass runs after `release_lock` and before `exec podman exec`, so a second-terminal launcher arriving during the prompt can safely fast-path attach to the running container.
+The install pass runs after `release_lock`. In manager mode the launcher then enters the heartbeat loop (it never `exec`s into claude directly — a second terminal's `claude-sandbox` handles the actual session attach). So a second-terminal launcher arriving during the install prompt can safely fast-path attach to the running container once the manager signals readiness.
 
 **Slash commands** — all sandbox-only, guarded by `[ -n "$CLAUDE_SANDBOX" ]` (the launcher injects `CLAUDE_SANDBOX=1` via `podman create -e`):
 

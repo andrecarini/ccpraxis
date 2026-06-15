@@ -12,7 +12,7 @@
 # automatically after this script returns):
 #
 #   1. Verify container-config (plugins/sandbox/container/) exists.
-#   2. Build the container image if not already built (requires Podman).
+#   2. Build the container image if not already built (requires Docker or Podman — auto-detected).
 #   3. Create the project's `.claude-data/` directory.
 #   4. Append `.claude-data` and `deploy_key` to `.gitignore`.
 #   5. Git auth setup (auto-detect remote, prompt for PAT/SSH key).
@@ -32,12 +32,28 @@ use Cwd qw(abs_path);
 binmode STDOUT, ':raw';
 binmode STDERR, ':raw';
 
-# Call podman.exe explicitly on Windows. Defensive against any future
-# installer dropping an extensionless `podman` shell-wrapper alongside
-# `podman.exe` (Docker Desktop historically did this with `docker`, which
-# broke Git-for-Windows perl's Unix-style PATH search).
+# Detect docker OR podman — both are supported. Prefer docker if both
+# present (more widely installed). Use `<cli> --version` exit code as the
+# probe; PATH-lookup heuristics get fooled on Windows by extensionless
+# shell-wrapper shims (Docker Desktop historically dropped one alongside
+# docker.exe that Git-for-Windows perl's POSIX PATH search would find
+# first and fail to spawn). Always name the .exe explicitly.
 my $WINDOWS_FAMILY = $^O =~ /^(MSWin32|cygwin|msys)$/;
-my $PODMAN = $WINDOWS_FAMILY ? 'podman.exe' : 'podman';
+sub _detect_container_cli {
+    for my $candidate ($WINDOWS_FAMILY ? ('docker.exe', 'podman.exe') : ('docker', 'podman')) {
+        my $rc = system("$candidate --version > /dev/null 2>&1");
+        return $candidate if $rc == 0;
+    }
+    return undef;
+}
+my $PODMAN = _detect_container_cli();
+unless (defined $PODMAN) {
+    print STDERR "ERROR: no container CLI on PATH (looked for docker, podman).\n";
+    print STDERR "       Install Docker Desktop (https://docker.com) or Podman Desktop\n";
+    print STDERR "       (https://podman-desktop.io/) and re-run.\n";
+    exit 1;
+}
+my $RUNTIME_NAME = ($PODMAN =~ /docker/) ? 'docker' : 'podman';
 
 # Disable MSYS2 argument-path conversion (see launcher.pl for full reason).
 # Short version: MSYS2 translates argv elements containing colons as PATH-
@@ -196,42 +212,92 @@ JSON
 }
 
 # =====================================================================
-# Step 2: ensure Podman is available, then build the container image
+# Step 2: ensure container runtime is reachable, then build the image
 # =====================================================================
 
-log_step("Step 2/6: ensure Podman is available and the container image exists");
+log_step("Step 2/6: ensure $RUNTIME_NAME is reachable and the container image exists");
 
-# Preflight: confirm podman is on PATH AND reachable. `podman info` is the
-# canonical "are you actually working?" probe — on Windows it confirms the
-# podman machine is running; on Linux it confirms the user has access to
-# the rootless runtime. Bare `command -v` would pass even if the machine
-# is stopped, leaving the user to discover the failure inside `podman build`.
+# Preflight: confirm the runtime is reachable AND its backend is up.
+# `<cli> info` is the canonical "actually working?" probe — on Windows
+# with Podman it confirms the podman machine is running; with Docker
+# Desktop it confirms the daemon is up; on Linux it confirms the user
+# has access to the runtime. Bare `--version` (already done at detection)
+# would pass even if the backend is stopped.
 {
     my $info_output = `$PODMAN info --format '{{.Host.Arch}}' 2>&1`;
     if ($? != 0) {
         print STDERR "\n";
-        print STDERR "ERROR: podman is not available or not reachable.\n";
+        print STDERR "ERROR: $RUNTIME_NAME is installed but the backend is not reachable.\n";
         print STDERR "       Tried: $PODMAN info\n";
         print STDERR "       Output:\n";
         for my $line (split /\r?\n/, ($info_output // '')) {
             print STDERR "         $line\n";
         }
         print STDERR "\n";
-        if ($WINDOWS_FAMILY) {
-            print STDERR "       On Windows, install Podman Desktop (https://podman-desktop.io/) or\n";
-            print STDERR "       the Podman Windows installer, then run:\n";
-            print STDERR "           podman machine init\n";
+        if ($RUNTIME_NAME eq 'docker') {
+            print STDERR "       Start Docker Desktop (or `systemctl start docker` on Linux), then re-run.\n";
+        } elsif ($WINDOWS_FAMILY) {
+            print STDERR "       On Windows, ensure Podman Desktop is running OR run:\n";
+            print STDERR "           podman machine init --provider wsl   # first time only — USE WSL2, NOT HYPER-V\n";
             print STDERR "           podman machine start\n";
+            print STDERR "\n";
+            print STDERR "       ⚠  HYPER-V BACKEND IS NOT SUPPORTED. Microsoft's 9p host-share silently\n";
+            print STDERR "          breaks O_APPEND (claude session resume fails with EIO) and utimensat\n";
+            print STDERR "          (Bun's lock manager wedges → TUI freezes every ~60s). WSL2 is the\n";
+            print STDERR "          only reliable Windows backend for both docker and podman.\n";
         } else {
-            print STDERR "       Install Podman via your distro's package manager\n";
-            print STDERR "       (e.g. `apt-get install podman`, `dnf install podman`,\n";
-            print STDERR "       `brew install podman` on macOS).\n";
-            print STDERR "       On macOS you'll also need `podman machine init && podman machine start`.\n";
+            print STDERR "       Start the podman backend (`podman machine start` on macOS,\n";
+            print STDERR "       or check the rootless socket on Linux).\n";
         }
         print STDERR "\n";
-        die_bootstrap("podman not available — see above");
+        die_bootstrap("$RUNTIME_NAME backend not reachable — see above");
     }
-    log_ok("podman is reachable");
+    log_ok("$RUNTIME_NAME is reachable");
+
+    # ⚠  Hyper-V backend detection — actively block bootstrap on this
+    # configuration. We learned this the hard way over three days of
+    # debugging "claude resume fails with EIO" and "TUI freezes after
+    # ~60s of work". See the WSL2 migration plan + the sandbox README
+    # historical-context callout for the full autopsy.
+    #
+    # Podman 5+ exposes the provider in `podman info`. Docker doesn't
+    # report its WSL/Hyper-V status the same way, but Docker Desktop on
+    # Windows has used WSL2 by default since 2021 — if someone manages
+    # to put it on Hyper-V they'll have done so knowingly. So we only
+    # block podman + hyperv automatically; we don't try to probe Docker.
+    if ($WINDOWS_FAMILY && $RUNTIME_NAME eq 'podman') {
+        my $machine_list = `$PODMAN machine list --format '{{.Name}} {{.VMType}}' 2>&1`;
+        if ($? == 0 && $machine_list =~ /\bhyperv\b/i) {
+            print STDERR "\n";
+            print STDERR "ERROR: detected a podman machine running on the Hyper-V provider.\n";
+            print STDERR "       Listing:\n";
+            for my $line (split /\r?\n/, ($machine_list // '')) {
+                next unless length $line;
+                print STDERR "         $line\n";
+            }
+            print STDERR "\n";
+            print STDERR "       ⚠  HYPER-V BACKEND IS NOT SUPPORTED. Microsoft's `Plan9FileServer`\n";
+            print STDERR "          (the 9p host-share used by Hyper-V) silently breaks two syscalls\n";
+            print STDERR "          claude/Bun depend on:\n";
+            print STDERR "            - O_APPEND writes return EIO   → `claude --resume` fails\n";
+            print STDERR "            - utimensat silently no-ops    → Bun lock manager wedges, TUI freezes\n";
+            print STDERR "          Symptom: 'claude seems to work but stops responding after ~60s'.\n";
+            print STDERR "\n";
+            print STDERR "       Fix: rebuild the podman machine on WSL2:\n";
+            print STDERR "         podman machine stop   podman-machine-default\n";
+            print STDERR "         podman machine rm -f  podman-machine-default\n";
+            print STDERR "         podman machine init --provider wsl --cpus 4 --memory 3584\n";
+            print STDERR "         podman machine start\n";
+            print STDERR "\n";
+            print STDERR "       Prerequisites for WSL2: in admin PowerShell,\n";
+            print STDERR "         Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Windows-Subsystem-Linux\n";
+            print STDERR "         Enable-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform\n";
+            print STDERR "         (reboot)\n";
+            print STDERR "         wsl --update && wsl --set-default-version 2\n";
+            print STDERR "\n";
+            die_bootstrap("Hyper-V backend detected — see above. Sandbox refuses to bootstrap on this configuration.");
+        }
+    }
 }
 
 my $image_check = `$PODMAN image inspect claude-sandbox:latest 2>&1`;
@@ -248,7 +314,7 @@ if ($? == 0) {
         '-t', "claude-sandbox:$host_version",
         '-t', 'claude-sandbox:latest',
         $CONTAINER_CONFIG);
-    die_bootstrap("podman build failed (exit @{[$rc >> 8]})") if $rc != 0;
+    die_bootstrap("$RUNTIME_NAME build failed (exit @{[$rc >> 8]})") if $rc != 0;
     log_done("built claude-sandbox:$host_version + :latest");
 }
 

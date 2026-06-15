@@ -13,8 +13,9 @@
 #   mounts                  Emit tab-separated host_path<TAB>skill_name for launcher.
 #   record-mount            Set mounted_at_create + mounted_plugins_at_create; write state.
 #   manifest                Emit JSON manifest of mounted skills + plugins for container.
-#   materialize-plugins     Emit a container-shaped installed_plugins.json (paths rewritten).
-#   materialize-credentials Emit sandbox-isolated .credentials.json.
+#   materialize-plugins              Emit a container-shaped installed_plugins.json (paths rewritten).
+#   materialize-credentials          Emit sandbox-isolated .credentials.json.
+#   materialize-known-marketplaces   Emit container-shaped known_marketplaces.json (paths rewritten).
 #   write-mcp-state         Overwrite enabledMcp/disabledMcp lists in settings.local.json.
 #   clone-to-project        Promote a Suggestion to Project (plugin or MCP); idempotent.
 #   help                    Show usage.
@@ -44,13 +45,23 @@ binmode STDOUT, ':encoding(UTF-8)';
 binmode STDERR, ':encoding(UTF-8)';
 binmode STDIN,  ':encoding(UTF-8)';
 
-# Decode a byte string from the filesystem / env as UTF-8.
+# Decode a byte string from the filesystem / env / argv.
 # Returns the input unchanged if it is already a Unicode (decoded) string.
+#
+# Tries UTF-8 first (Git Bash / Linux / macOS), then falls back to CP1252
+# (Windows-1252) — necessary because cygwin perl launched directly from
+# PowerShell receives env vars and argv with CP1252-encoded high bytes
+# (e.g. `é` arrives as the single byte 0xE9, not the UTF-8 two-byte
+# sequence 0xC3 0xA9). Without the fallback, FB_DEFAULT replaces invalid
+# UTF-8 bytes with U+FFFD and every path with a non-ASCII char in the
+# Windows username silently breaks.
 sub from_fs {
     my $s = shift;
     return undef unless defined $s;
     return $s if utf8::is_utf8($s);
-    return decode('UTF-8', $s, Encode::FB_DEFAULT);
+    my $decoded = eval { decode('UTF-8', $s, Encode::FB_CROAK) };
+    return $decoded if defined $decoded;
+    return decode('cp1252', $s, Encode::FB_DEFAULT);
 }
 
 # =====================================================================
@@ -104,6 +115,22 @@ sub read_json {
     # decode_json expects UTF-8 bytes and returns Unicode strings.
     my $data = eval { decode_json($content) };
     return $@ ? undef : $data;
+}
+
+# Variant for files that a concurrent process may be rewriting atomically
+# (write-tmp + rename). The window for a torn read is brief but real on
+# Windows hosts where ~/.claude/.credentials.json rotates while the
+# launcher reads it. Retry 3 times with 100ms between attempts; die loudly
+# if the file is consistently unreadable, since a silent `{}` fallback
+# strips fields callers depend on.
+sub read_json_with_retry {
+    my $file = shift;
+    for my $attempt (1..3) {
+        my $data = read_json($file);
+        return $data if defined $data;
+        select(undef, undef, undef, 0.1) if $attempt < 3;
+    }
+    die "read_json_with_retry: '$file' exists but could not be parsed after 3 attempts (host may be mid-rewrite or file is corrupt)\n";
 }
 
 sub write_json_atomic {
@@ -1458,6 +1485,18 @@ sub cmd_materialize_plugins {
     my $plugins = discover_plugins(%opts);
     my %by_key = map { $_->{key} => $_ } @$plugins;
 
+    # Also load the host installed_plugins.json so we can carry forward
+    # metadata fields (gitCommitSha, installedAt, lastUpdated) that
+    # discover_plugins doesn't surface. Claude Code treats plugins with
+    # missing/empty installedAt as "not recorded" and won't load them.
+    my $host_plugins_file = $opts{plugins_file}
+        // home() . "/.claude/plugins/installed_plugins.json";
+    my $host_data = -f $host_plugins_file ? read_json($host_plugins_file) : {};
+    $host_data = {} unless ref $host_data eq 'HASH';
+    my $host_plugins = (ref $host_data->{plugins} eq 'HASH')
+        ? $host_data->{plugins} : {};
+    my $project_path = normalize_path($opts{project_path});
+
     # The host-side prefix that needs to be replaced with the container's
     # plugin root. Discovery normalizes paths to Git Bash form, e.g.
     # /c/Users/Andre/.claude/plugins/cache/...; we strip everything up to
@@ -1478,6 +1517,34 @@ sub cmd_materialize_plugins {
         return $host_path;
     };
 
+    # For a given plugin key, find the host install entry that best matches
+    # the current project. Same ranking as discover_plugins's chooser:
+    # project-scope-matching > local-scope-matching > user-scope > nothing.
+    my $best_host_install = sub {
+        my $key = shift;
+        my $installs = $host_plugins->{$key};
+        return undef unless ref $installs eq 'ARRAY';
+        my ($best, $best_rank);
+        for my $inst (@$installs) {
+            next unless ref $inst eq 'HASH';
+            my $scope = $inst->{scope} // 'local';
+            my $inst_project = normalize_path($inst->{projectPath} // '');
+            my $matches_project = defined $project_path && length $project_path
+                && length $inst_project
+                && lc($inst_project) eq lc($project_path);
+            my $rank;
+            if    ($scope eq 'project' && $matches_project) { $rank = 1 }
+            elsif ($scope eq 'local'   && $matches_project) { $rank = 2 }
+            elsif ($scope eq 'user')                        { $rank = 3 }
+            else { next }
+            if (!defined $best_rank || $rank <= $best_rank) {
+                $best      = $inst;
+                $best_rank = $rank;
+            }
+        }
+        return $best;
+    };
+
     my %plugins_out;
     my @missing;
     for my $key (@{$state->{selected_plugins}}) {
@@ -1486,16 +1553,21 @@ sub cmd_materialize_plugins {
             push @missing, $key;
             next;
         }
-        # Rebuild the install entry in the shape Claude Code expects.
-        my $entry = {
-            installPath => $rewrite->($p->{install_path}),
-            scope       => $p->{scope},
-            version     => $p->{version},
-        };
-        # projectPath: for local-scope, the container sees the project at /project
+        # Start from the host install entry (preserves gitCommitSha /
+        # installedAt / lastUpdated and anything else the host writes).
+        my $host_inst = $best_host_install->($key);
+        my $entry = $host_inst ? { %$host_inst } : {};
+
+        # Overwrite path + scope fields with container-side values.
+        $entry->{installPath} = $rewrite->($p->{install_path});
+        $entry->{scope}       = $p->{scope};
+        $entry->{version}     = $p->{version};
         if ($p->{scope} eq 'local' || $p->{scope} ne 'user') {
             $entry->{projectPath} = $CONTAINER_PROJECT_PATH;
+        } else {
+            delete $entry->{projectPath};
         }
+
         # Wrap in a single-element installs array (matches host file shape).
         $plugins_out{$key} = [$entry];
     }
@@ -1511,6 +1583,104 @@ sub cmd_materialize_plugins {
     my $tmp = "$output.tmp.$$";
     open my $fh, '>:raw', $tmp or die "write $tmp: $!\n";
     print $fh JSON::PP->new->canonical(1)->pretty->utf8->encode($registry);
+    close $fh or die "close $tmp: $!\n";
+    rename $tmp, $output or do {
+        unlink $tmp;
+        die "rename $tmp -> $output: $!\n";
+    };
+    return 0;
+}
+
+# =====================================================================
+# Subcommand: materialize-known-marketplaces
+# =====================================================================
+#
+# Emits a container-shaped known_marketplaces.json. The host file holds
+# Windows-shaped paths (e.g. C:\Users\Andre\...\marketplaces\foo) inside
+# `installLocation`; inside the Linux container those don't resolve. The
+# host also registers `directory`-source marketplaces whose source path
+# isn't a Linux directory in the container (e.g. ccpraxis-local).
+#
+# Per-entry policy:
+#   - source.source == "github" (or any non-"directory" remote-shaped source):
+#     keep the entry; rewrite `installLocation` to the container-side path
+#     under /root/.claude/plugins/marketplaces/<name>. The launcher
+#     bind-mounts the host's marketplaces/ dir at that container path RO,
+#     so the rewritten installLocation resolves to real data.
+#
+#   - source.source == "directory":
+#     DROP the entry. The current launcher does not bind-mount arbitrary
+#     host directories into the container, so the marketplace's source.path
+#     wouldn't resolve. The launcher would need to learn to bind-mount the
+#     source.path before this entry could be kept. When that lands, swap
+#     this branch for: bind-mount source.path inside the container, then
+#     rewrite source.path AND installLocation to the mount target. See
+#     ccpraxis-local for the canonical "directory" entry shape on Windows.
+#
+# Output is a per-launch file written under .claude-data/plugins/ on the
+# host so it appears at /root/.claude/plugins/known_marketplaces.json as a
+# REAL file (not a single-file bind), letting Claude Code's atomic write
+# pattern (write tmp + rename) succeed when it updates `lastUpdated`.
+# Single-file binds reject rename-over-mount with EROFS.
+#
+# Required: --output FILE [--host-marketplaces FILE]
+sub cmd_materialize_known_marketplaces {
+    my %opts = @_;
+    my $output = $opts{output} or die "--output required\n";
+    my $host_file = $opts{host_marketplaces}
+        // home() . "/.claude/plugins/known_marketplaces.json";
+
+    # Same retry rationale as materialize-credentials: Claude Code on the
+    # host atomically rewrites this file on every marketplace refresh.
+    my $host = -f $host_file ? read_json_with_retry($host_file) : {};
+    $host = {} unless ref $host eq 'HASH';
+
+    my %out;
+    my @dropped;
+    for my $name (sort keys %$host) {
+        my $entry = $host->{$name};
+        next unless ref $entry eq 'HASH';
+        my $src = $entry->{source};
+        next unless ref $src eq 'HASH';
+        my $src_type = $src->{source} // '';
+
+        my $container_install = "$CONTAINER_PLUGINS_ROOT/marketplaces/$name";
+
+        if ($src_type eq 'directory') {
+            # Directory-source marketplace (e.g. ccpraxis-local): plugins
+            # live AT source.path on the host, not in a separate cache
+            # subdir. The launcher bind-mounts source.path into the
+            # container at /root/.claude/plugins/marketplaces/<name>, so
+            # rewrite BOTH source.path AND installLocation to that target.
+            # Claude-code resolves directory-source plugin code by reading
+            # <source.path>/.claude-plugin/marketplace.json and following
+            # each plugin's relative `source` field, so the bind target
+            # must contain that whole tree (which is the host source.path
+            # verbatim — that's what gets mounted).
+            my %rewritten_src = %{$src};
+            $rewritten_src{path} = $container_install;
+            my %rewritten = %$entry;
+            $rewritten{installLocation} = $container_install;
+            $rewritten{source} = \%rewritten_src;
+            $out{$name} = \%rewritten;
+            next;
+        }
+
+        my %rewritten = %$entry;
+        $rewritten{installLocation} = $container_install;
+        $out{$name} = \%rewritten;
+    }
+
+    if (@dropped) {
+        warn "materialize-known-marketplaces: dropped marketplaces not usable inside sandbox:\n",
+            map { "  - $_\n" } @dropped;
+    }
+
+    my $dir = dirname($output);
+    make_path($dir) unless -d $dir;
+    my $tmp = "$output.tmp.$$";
+    open my $fh, '>:raw', $tmp or die "write $tmp: $!\n";
+    print $fh JSON::PP->new->canonical(1)->pretty->utf8->encode(\%out);
     close $fh or die "close $tmp: $!\n";
     rename $tmp, $output or do {
         unlink $tmp;
@@ -2144,10 +2314,20 @@ sub cmd_materialize_credentials {
     my $output = $opts{output} or die "--output required\n";
     my $host_file = $opts{host_credentials} // home() . "/.claude/.credentials.json";
 
-    my $host = -f $host_file ? read_json($host_file) : {};
+    # Host file is concurrently rewritten by the host's Claude session whenever
+    # the Anthropic OAuth token rotates. read_json returns undef on a torn read
+    # mid-rename; the original code silently fell back to `{}` here, which
+    # propagated as a sandbox booting without `claudeAiOauth` (unauthenticated
+    # container). Retry 3x with 100ms backoff covers the race window without
+    # masking a genuinely corrupt host file.
+    my $host = -f $host_file ? read_json_with_retry($host_file) : {};
     $host = {} unless ref $host eq 'HASH';
 
-    my $existing = -f $output ? read_json($output) : {};
+    # Same retry pattern for the per-sandbox accumulator: a torn read here
+    # would silently drop in-container mcpOAuth tokens the user already
+    # authed for. Existence of the output is optional (first launch), but
+    # if it does exist, a parse failure should not be swallowed.
+    my $existing = -f $output ? read_json_with_retry($output) : {};
     $existing = {} unless ref $existing eq 'HASH';
 
     my $merged = {};
@@ -2214,6 +2394,10 @@ Commands:
   materialize-credentials --output FILE             Emit sandbox-isolated .credentials.json:
                                                     claudeAiOauth from host, mcpOAuth from
                                                     previous container state only.
+  materialize-known-marketplaces --output FILE      Emit container-shaped known_marketplaces.json:
+                                                    rewrites Windows installLocation paths to the
+                                                    container mount target; drops directory-source
+                                                    marketplaces whose source.path isn't mounted.
   write-mcp-state     --settings-local FILE --enabled "..." --disabled "..."
                                                     Overwrite enabled/disabled MCP lists in
                                                     settings.local.json. Caller-authoritative
@@ -2271,8 +2455,9 @@ my %DISPATCH = (
     'manifest'            => \&cmd_manifest,
     'discover-mcp'            => \&cmd_discover_mcp,
     'write-mcp-state'         => \&cmd_write_mcp_state,
-    'materialize-plugins'     => \&cmd_materialize_plugins,
-    'materialize-credentials' => \&cmd_materialize_credentials,
+    'materialize-plugins'              => \&cmd_materialize_plugins,
+    'materialize-credentials'          => \&cmd_materialize_credentials,
+    'materialize-known-marketplaces'   => \&cmd_materialize_known_marketplaces,
     'clone-to-project'        => \&cmd_clone_to_project,
     'help'                    => \&cmd_help,
     '--help'              => \&cmd_help,

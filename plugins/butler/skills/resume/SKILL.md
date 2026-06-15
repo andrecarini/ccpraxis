@@ -15,3 +15,5 @@ Steps:
 3. NEEDS-ATTENTION rows: read those ledgers' Escalation + Next action sections, fix what's yours (re-scope, corrected relaunch), batch genuine decisions to the user. Old decisions stay decided — only new blockers get raised.
 4. PENDING rows are wave-scheduling, not recovery: hand them to `/butler:launch` logic if their dependencies are met.
 5. Re-enter the monitoring loop from `/butler:launch`.
+
+> **Recovery note:** the most common reason to `/butler:resume` is a container exit caused by the manager terminal closing or the laptop going to sleep (heartbeat stops → container exits ~5 min later). All ledger state survives on disk. The sweep evaluates each dead coordinator against the warm-resume threshold and picks the cheapest recovery path automatically — no work is lost, just budget on restart.

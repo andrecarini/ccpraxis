@@ -1,6 +1,6 @@
 ---
 name: bp-ui-prober
-description: UI verification worker for blueprint packages. Dispatched by a blueprint coordinator when a package touches user-facing screens, to exercise the affected flows via integration tests, read the resulting screenshots, and apply a visual quality checklist. Use for any package whose done criteria mention UI states, screens, or flows.
+description: UI verification worker for blueprint packages. Dispatched by a butler coordinator when a package touches user-facing screens, to exercise the affected flows via integration tests, read the resulting screenshots, and apply a visual quality checklist. Use for any package whose done criteria mention UI states, screens, or flows.
 model: sonnet
 maxTurns: 40
 tools: Read, Grep, Glob, Write, Edit, Bash
@@ -41,3 +41,4 @@ Return **≤15 lines**: flows covered, pass/fail per flow, findings count by sev
 
 - You write only tests/scenarios — never application code. Bugs get reported, not fixed.
 - Don't fight the runner's documented gotchas; work within them and note friction in the report.
+- Write-outside-test_paths restriction is **hook-enforced** by `guard-writes.sh` (same rule as bp-test-writer): any Edit or Write to a path outside `BP_TEST_PATHS` while you are the active worker will be blocked with exit 2. Screenshot output dirs are written by Bash (the test runner), not Edit/Write, so this is safe.

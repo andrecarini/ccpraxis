@@ -15,7 +15,7 @@
 #     uniformly (this is the robustness an ad-hoc script keeps missing).
 #   - A plan is ACTIVE iff it sits directly in .claude-plans/ AND its body
 #     still carries an incomplete-deliverable marker (U+2B1C white square or
-#     U+1F527 wrench). Active  -> blueprints/<slug>/        (status: running)
+#     U+1F527 wrench). Active  -> blueprints/<slug>/        (status: drafting)
 #     Everything else          -> blueprints/_archive/<slug>/ (status: archived)
 #   - Archive-style: the full original content is preserved verbatim beneath a
 #     blueprint metadata header. No package re-decomposition.
@@ -116,7 +116,7 @@ for my $t (@todo) {
     make_path($t->{dest});
     my $title   = ($t->{content} =~ /^\#\s+(.+)$/m) ? $1 : $t->{slug};
     my $created = strftime('%Y-%m-%d', localtime((stat($t->{f}))[9]));
-    my $status  = $t->{active} ? 'running' : 'archived';
+    my $status  = $t->{active} ? 'drafting' : 'archived';
     my $name    = basename($t->{dest});
     (my $body = $t->{content}) =~ s/^\#\s+.+\n//m;
     my $hdr = "# $title\n\n```\nblueprint: $name\nstatus: $status\ncreated: $created\nlast_updated: $today\nmigrated_from: " . src_label($t->{f}) . "\n```\n\n> **Migrated** from the legacy .claude-plans plan system on $today. Archive-style: full content preserved below, no package re-decomposition.\n\n---\n";

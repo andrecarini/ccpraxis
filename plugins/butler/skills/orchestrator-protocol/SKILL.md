@@ -21,7 +21,7 @@ If a fix touches more than one logical concern, it becomes a package.
 ## Paths and tools
 
 - Data root: `${CCPRAXIS_DATA_DIR:-<project-root>/.ccpraxis-local-data}`; blueprints live at `<data>/blueprints/<name>/`.
-- Scripts (always via `${CLAUDE_PLUGIN_ROOT}/scripts/`): `bp-init.sh`, `bp-launch.sh <bp> <pkg> [--model M] [--max-turns N] [--resume-session SID] [--force]`, `bp-status.sh [bp]`, `bp-resume-sweep.sh [bp] [--apply]`.
+- Scripts (always via `${CLAUDE_PLUGIN_ROOT}/scripts/`): `bp-init.sh` (provisioning; normally already run by `/blueprint:create`), `bp-launch.sh <bp> <pkg> [--model M] [--max-turns N] [--resume-session SID] [--force]`, `bp-status.sh [bp]`, `bp-resume-sweep.sh [bp] [--apply]`.
 
 ## Prerequisite: a blueprint exists
 
@@ -68,6 +68,14 @@ When all packages of a deliverable are ✅, you may dispatch cross-cutting revie
 ## Blueprint file discipline
 
 Update `blueprint.md` every time state changes at YOUR granularity (coordinator launches/returns/escalations, user decisions, incidents, harvest results) — not at the workers' granularity. Refresh `last_updated` each time. A user decision that implies substantial future work becomes a new blueprint, not scope creep on this one.
+
+## Heartbeat lifetime — important for long-running blueprints
+
+The sandbox container lives **only while the host MANAGER terminal's heartbeat continues**. Closing the manager terminal (or letting the laptop sleep) stops the heartbeat; the container exits after the heartbeat timeout (~5 minutes). Detached coordinators inside the container die with it.
+
+**What survives:** ledger state, registry, and all artifacts on disk. **Recovery:** `/butler:resume` re-evaluates every package (warm-resume vs cold-start per the sweep policy) and continues from where the ledger left off — no work is lost.
+
+**Practical implication:** unattended multi-hour runs require the manager terminal to stay open and awake. If you need to step away, leave the manager terminal running (screen/tmux recommended). A died coordinator is not catastrophic — it is recoverable — but it does consume part of the session budget on restart.
 
 ## Transport note (future)
 

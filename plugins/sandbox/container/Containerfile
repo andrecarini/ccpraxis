@@ -59,20 +59,19 @@ WORKDIR /project
 #      connections drop until Claude Code's listener appears, then forward
 #      cleanly. Backgrounded; children get SIGHUP and die when the bash
 #      below exits.
-#   2. Wait loop — stay alive while ANY of these holds:
-#        (a) initial 5s grace, just enough for the launcher to touch the
-#            sentinel before the loop checks it,
-#        (b) pgrep -x claude matches (a real user claude session is up), or
-#        (c) /tmp/.launcher-alive was mtime-touched in the last 120s — a
-#            launcher-managed heartbeat that keeps the container alive
-#            during long pre-claude setup (apt-get, backpack install,
-#            Node download). Sync sidecar refreshes it every 60s; the
-#            launcher itself touches it once after `podman start` and rm's
-#            it on clean exit. On launcher crash the sentinel goes stale
-#            and the container shuts down within ~2 minutes — no infinite
-#            zombie containers.
-#      The previous 15s-hard-timeout version killed the container
-#      mid-Node-install whenever the backpack pass downloaded anything
-#      heavy. socat still doesn't match the pgrep filter, so it never
-#      prolongs the loop on its own.
-ENTRYPOINT ["/bin/bash", "-c", "for p in {9000..9009}; do socat TCP-LISTEN:$p,fork,reuseaddr TCP:127.0.0.1:$p 2>/dev/null & done; START=$SECONDS; ALIVE=/tmp/.launcher-alive; HB=120; while true; do EL=$((SECONDS-START)); if [ $EL -lt 5 ]; then sleep 1; continue; fi; if pgrep -x claude > /dev/null; then sleep 3; continue; fi; if [ -f $ALIVE ]; then LAST=$(stat -c %Y $ALIVE 2>/dev/null || echo 0); NOW=$(date +%s); if [ $((NOW-LAST)) -lt $HB ]; then sleep 3; continue; fi; fi; break; done"]
+#   2. Heartbeat-only keep-alive loop. Container survives while
+#      /tmp/.launcher-alive has been mtime-touched within the last
+#      HB=300 seconds (5 min staleness window). The manager-mode
+#      `claude-sandbox` launcher running on the host refreshes the
+#      sentinel every 2 minutes via `podman/docker exec ... touch ...`.
+#      If the manager terminal closes or the laptop goes to sleep without
+#      refresh, the sentinel goes stale and the container self-reaps
+#      within ~5 min — no orphan containers. A 10s startup grace gives
+#      the manager time to land the FIRST touch immediately after start.
+#
+#      Container does NOT watch claude itself — claude is launched in a
+#      separate connector-mode terminal via a second `claude-sandbox`
+#      invocation, and multiple concurrent connectors (or none at all)
+#      are fine. The container's life is bound to the manager's
+#      heartbeat, not to any claude process.
+ENTRYPOINT ["/bin/bash", "-c", "for p in {9000..9009}; do socat TCP-LISTEN:$p,fork,reuseaddr TCP:127.0.0.1:$p 2>/dev/null & done; START=$SECONDS; ALIVE=/tmp/.launcher-alive; HB=300; GRACE=10; while true; do EL=$((SECONDS-START)); if [ $EL -lt $GRACE ]; then sleep 1; continue; fi; if [ -f $ALIVE ]; then LAST=$(stat -c %Y $ALIVE 2>/dev/null || echo 0); NOW=$(date +%s); if [ $((NOW-LAST)) -lt $HB ]; then sleep 10; continue; fi; fi; break; done"]

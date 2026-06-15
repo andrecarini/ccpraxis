@@ -7,13 +7,15 @@ allowed-tools: Read, Glob, Grep, Bash, Edit, Write, AskUserQuestion, Skill, Todo
 
 # /blueprint:resume
 
+You are the **blueprint author**. First read `${CLAUDE_PLUGIN_ROOT}/skills/authoring-protocol/SKILL.md` — section *Resume* is the doctrine source for this command.
+
 Load a blueprint and **continue working on it interactively in this session**. This is the working-document resume — the interactive analog of picking a plan back up after a break or a context compaction. It is distinct from `/butler:resume`, which restarts detached *coordinator processes* to execute a butler-packaged blueprint headlessly; this skill is you, in the current session, doing the work.
 
 Data root: `${CCPRAXIS_DATA_DIR:-<project-root>/.ccpraxis-local-data}`; blueprints live at `<data>/blueprints/<name>/blueprint.md` (archived ones under `<data>/blueprints/_archive/<name>/`).
 
 ## Steps
 
-1. **Resolve the blueprint.** `$0` is the name. If omitted or it doesn't resolve, Glob `<data>/blueprints/*/blueprint.md` and `<data>/blueprints/_archive/*/blueprint.md`, read each one's `status` from the frontmatter, and present the candidates (name + status + one-line objective) via `AskUserQuestion` so the user picks.
+1. **Resolve the blueprint.** `$0` is the name. If omitted or it doesn't resolve, Glob `<data>/blueprints/*/blueprint.md` and `<data>/blueprints/_archive/*/blueprint.md`, read each one's `status` from the metadata block, and present the candidates (name + status + one-line objective) via `AskUserQuestion` so the user picks.
 
 2. **Load it.** Read `<data>/blueprints/<name>/blueprint.md` in full. If it has `packages/<NN>.md` ledgers, read those too. Read any files it points at under "Key references" / "KEY FACTS" so you actually have the context to continue — don't resume on the summary alone.
 

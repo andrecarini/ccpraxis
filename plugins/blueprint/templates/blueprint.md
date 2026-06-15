@@ -27,7 +27,7 @@ Locked answers from the user. Coordinators treat these as constraints, not sugge
 |-----|-------------|------------|-------|--------|
 | 01-<slug> | <one line> | — | sonnet | ⬜ pending |
 
-Status values: ⬜ pending · 🔧 running · 🔍 reviewing · ✅ done · ⛔ blocked · ⏸ parked · ❌ discarded
+Status values: ⬜ pending · 🔧 running · 🔍 reviewing · ✅ done · ⛔ blocked · ⏸ parked
 
 ## Packages
 

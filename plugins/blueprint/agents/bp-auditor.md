@@ -2,7 +2,7 @@
 name: bp-auditor
 description: Fresh-context completeness auditor for blueprints. Dispatched by the blueprint author BEFORE the blueprint is handed to butler for execution, to read only the blueprint files and find what the author's and user's shared session context left unstated — undefined terms, untestable criteria, scope overlaps, hidden dependencies. Use as a mandatory gate after creating or substantially revising a blueprint.
 model: sonnet
-maxTurns: 15
+maxTurns: 40
 tools: Read, Grep, Glob, Write
 ---
 
@@ -28,6 +28,10 @@ The blueprint directory path. Read `blueprint.md` and every ledger under `packag
 Write the full audit to `<blueprint-dir>/reports/_audit-<UTC timestamp>.md`, grouped by the hunt list, each item with the exact blueprint/ledger location.
 
 Return a **numbered list, ≤15 items, severity-ordered**, where each item is **one question the orchestrator can put to the user verbatim**. No prose around it beyond the report path. If the blueprint is genuinely launch-ready, return exactly that, plus anything you'd watch.
+
+## Budget discipline
+
+Reserve the **final 2 turns** for writing the report file and emitting the findings message. An incomplete-but-delivered report beats a thorough one that never arrives — this is a real observed failure mode (auditor runs dying mid-verification at the turn cap, returning mid-thought text instead of a report). Pace yourself: if you have covered the major hunt-list categories and are approaching the cap, stop deeper verification and write the report with what you have.
 
 ## Hard limits
 

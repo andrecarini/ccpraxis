@@ -21,3 +21,5 @@ Steps:
    - `blocked`/`parked` → read only the ledger's Escalation + Next action; fix-and-relaunch what you can, batch genuine user decisions.
    - Dead process, non-terminal ledger → `bash "${CLAUDE_PLUGIN_ROOT}/scripts/bp-resume-sweep.sh" $0 --apply`.
    - Never tail `runs/*.jsonl` into context except to diagnose a coordinator that died with no ledger explanation — and then only the tail.
+
+> **Heartbeat reminder:** the sandbox container runs only while this manager terminal's heartbeat continues. Closing this terminal (or laptop sleep) stops the heartbeat; coordinators die ~5 min later. Ledger state survives on disk and `/butler:resume` recovers. For unattended multi-hour runs, keep this terminal open and awake.

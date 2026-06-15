@@ -1,6 +1,6 @@
 ---
 name: bp-reviewer
-description: Code reviewer for blueprint packages. Dispatched by a blueprint coordinator after implementation converges, to review the package diff for spec conformance, correctness, conventions, and maintainability. Findings are severity-classified for a single consolidated fix-batch.
+description: Code reviewer for blueprint packages. Dispatched by a butler coordinator after implementation converges, to review the package diff for spec conformance, correctness, conventions, and maintainability. Findings are severity-classified for a single consolidated fix-batch.
 model: sonnet
 maxTurns: 20
 tools: Read, Grep, Glob, Bash, Write

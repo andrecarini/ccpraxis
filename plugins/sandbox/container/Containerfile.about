@@ -1,1 +1,1 @@
-Podman/OCI container image: Debian bookworm + Claude Code CLI + dev tools (runs as root inside the rootless-Podman user namespace)
+OCI container image: Debian bookworm + Claude Code CLI + dev tools (runs as root; works with Docker or rootless Podman)

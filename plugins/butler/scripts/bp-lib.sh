@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
-# bp-lib.sh — shared helpers for the blueprint plugin.
+# bp-lib.sh — butler's copy of the shared base helpers PLUS sandbox-only execution helpers.
 # Sourced by scripts/ and hooks/. Must stay dependency-light: bash, coreutils, jq, flock.
+#
+# SUBSET/SUPERSET RELATIONSHIP: The 7 shared base helpers (bp_project_root,
+# bp_data_dir, bp_dir, bp_ledger, fm_get, iso_now, file_age_min) at the top of
+# this file are kept byte-identical with the counterpart at
+# plugins/blueprint/scripts/bp-lib.sh (the host-safe authoring subset). Butler
+# adds sandbox-only execution helpers on top (pid_alive, match_any, registry_*,
+# count_running_global, require_cmd, bp_require_sandbox) that must NOT be copied
+# to the blueprint side (host lacks jq/flock; authoring must stay host-safe).
 
 # ---------------------------------------------------------------- roots ----
 
@@ -38,12 +46,6 @@ fm_get() {
     }' "$1"
 }
 
-# fm_set FILE KEY VALUE — in-place edit of a frontmatter line (line must exist).
-fm_set() {
-  local file="$1" key="$2" val="$3"
-  sed -i "0,/^${key}:.*/s||${key}: ${val}|" "$file"
-}
-
 iso_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
 file_age_min() {  # minutes since last mtime of $1
@@ -51,6 +53,7 @@ file_age_min() {  # minutes since last mtime of $1
   now=$(date +%s); mt=$(stat -c %Y "$1" 2>/dev/null || echo "$now")
   echo $(( (now - mt) / 60 ))
 }
+# ---------------------- butler-only: sandbox execution helpers ---------------
 
 pid_alive() {
   [ -n "${1:-}" ] || return 1
@@ -119,7 +122,7 @@ registry_get() {  # BLUEPRINT PKG FIELD -> value or empty
   jq -r --arg pkg "$2" --arg f "$3" '.packages[$pkg][$f] // empty' "$reg"
 }
 
-# count running coordinators across ALL blueprints (live pid + non-terminal ledger)
+# count running coordinators across ALL blueprints (live pid only)
 count_running_global() {
   local data n=0 reg pkg pid
   data=$(bp_data_dir)

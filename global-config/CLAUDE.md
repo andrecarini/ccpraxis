@@ -15,6 +15,16 @@ Specifically for the beacon system:
 - **`/beacon:on`** — light proactively when the session has substantive ongoing work: a plan, multi-file edits, or a multi-step task. Skip for one-off questions, trivial lookups, or single-file quick fixes. Idempotent — re-invoking just refreshes the activity timestamp.
 - **`/beacon:off`** — offer when the user signals the session's work is finished ("done", "shipped", "merged", "deployed", "landed", "committed", "PR opened", "let's call it", "wrapping up", "ship it", "lgtm", "all good", "looks good", "finished", "we're good", "that's it for today"). Skip when the signal is scoped to a sub-task ("done with X, now Y"), to thinking/reading ("done reading"), or when substantive work is clearly still in progress. When invoking proactively, ALWAYS ask first via `AskUserQuestion` BEFORE invoking the skill. A direct user invocation (the user typed `/beacon:off`) needs no confirmation — the slash command is the consent.
 
+## House rules learned across projects
+
+Recurring preferences that surfaced in multiple project memories — promoted here so they apply everywhere, not just where they were first observed.
+
+- **No python/pip on the host — use perl.** Python is not installed on this Windows host. For ad-hoc scripting (parsing JSON/HAR, file munging, one-off transformations) reach for `perl` (Git-for-Windows ships it; `JSON::PP` is core) instead of `python`/`python3`/`pip`. Reserve Bash for actual shell operations. (`pip install` is also a host-side dev-tooling install — see the section below.)
+- **Never add `Co-Authored-By` to commits.** Do not append `Co-Authored-By: Claude ...` (or any co-author trailer) to git commit messages. The user does not want Claude credited in the git history.
+- **Don't chain `cd` in git/shell commands.** Never write `cd /path && git ...` — chaining forces a fresh approval prompt every time. Run commands from the working directory directly; if a different directory is genuinely needed, `cd` once in its own call, then run subsequent commands separately.
+- **Delegate heavy mechanical work to cheaper-model subagents.** When a task will burn lots of tokens in the main context (large WebFetches, full-site mirrors, reading big downloaded files, long-output commands, batch reconnaissance), spawn a subagent overridden to a cheaper, faster model rather than running it inline on the session's large model. Only the subagent's summary returns, so the heavy raw content never lands in the expensive context. Keep synthesis, judgement, edits, and final go/no-go calls on the large model; don't subagent trivial work (the overhead beats the saving).
+- **Never conclude a file/dir is missing from a Glob-tool miss alone.** The Glob tool intermittently returns "no files found" for directories that actually exist when their path contains `é` (e.g. `C:\Users\André\...`) — observed repeatedly. Before acting on a path's absence, confirm with Bash `ls` or Grep. A Glob miss under an `é`-path is not proof of absence.
+
 ## ⚠️⚠️⚠️ NEVER RUN DEV TOOLING ON THE HOST ⚠️⚠️⚠️
 
 🚨🚨🚨 **CRITICAL SECURITY RULE** 🚨🚨🚨

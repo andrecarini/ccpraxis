@@ -13,6 +13,7 @@ use warnings;
 use JSON::PP;
 use Getopt::Long;
 use Encode qw(decode);
+use B ();
 
 # The output structure mixes char strings (from decode_json) with raw UTF-8 byte
 # strings (the @ARGV file paths in left/right). Normalize byte strings up to chars
@@ -27,12 +28,28 @@ sub _decode_strings_recursive {
     } elsif (ref $x) {
         return $x;
     } elsif (defined $x && !utf8::is_utf8($x)) {
-        return $x + 0 if $x =~ /^-?\d+$/;
-        return $x + 0 if $x =~ /^-?\d+\.\d+$/;
-        my $decoded = eval { decode('UTF-8', $x, Encode::FB_QUIET) };
-        return defined $decoded ? $decoded : $x;
+        # Preserve JSON value types: a genuine number decoded by JSON::PP keeps
+        # its numeric flags (IOK/NOK, no POK) and is re-emitted as a number; a
+        # numeric-LOOKING *string* (e.g. "0123" or "123") must stay a string,
+        # or the diff would silently equate "123" with 123 and render "0123"
+        # as 123. Only numify genuine numbers.
+        return $x + 0 if _json_number($x);
+        # FB_CROAK (not FB_QUIET): on invalid UTF-8, FB_QUIET returns the
+        # successfully-decoded *prefix* (silently truncating CP1252 "Andr\xE9"
+        # to "Andr"). Croak instead, then fall back to a CP1252 decode of the
+        # whole string — the proven from_fs() pattern from sandbox/skills.pl.
+        my $decoded = eval { decode('UTF-8', $x, Encode::FB_CROAK) };
+        return defined $decoded ? $decoded : decode('cp1252', $x, Encode::FB_DEFAULT);
     }
     return $x;
+}
+
+# True only for a genuine JSON number: decode_json sets IOK/NOK on numbers but
+# not POK, while a numeric-looking *string* carries POK. Lets us numify only
+# real numbers in _decode_strings_recursive and preserve string types.
+sub _json_number {
+    my $f = B::svref_2object(\$_[0])->FLAGS;
+    return (($f & (B::SVf_IOK | B::SVf_NOK)) && !($f & B::SVf_POK)) ? 1 : 0;
 }
 
 my (@exclude, @deep_exclude);

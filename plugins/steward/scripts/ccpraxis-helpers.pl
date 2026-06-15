@@ -52,8 +52,12 @@ sub _decode_strings_recursive {
     } elsif (defined $x && !utf8::is_utf8($x)) {
         return $x + 0 if $x =~ /^-?\d+$/;
         return $x + 0 if $x =~ /^-?\d+\.\d+$/;
-        my $decoded = eval { decode('UTF-8', $x, Encode::FB_QUIET) };
-        return defined $decoded ? $decoded : $x;
+        # FB_CROAK (not FB_QUIET): on invalid UTF-8, FB_QUIET returns the
+        # successfully-decoded *prefix* (silently truncating CP1252 "Andr\xE9"
+        # to "Andr"), making the fallback below dead code. Croak instead, then
+        # fall back to a CP1252 decode — the from_fs() pattern from skills.pl.
+        my $decoded = eval { decode('UTF-8', $x, Encode::FB_CROAK) };
+        return defined $decoded ? $decoded : decode('cp1252', $x, Encode::FB_DEFAULT);
     }
     return $x;
 }

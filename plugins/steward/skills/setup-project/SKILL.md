@@ -57,7 +57,7 @@ Show paths+sizes; note that files only in vault auto-appear and same-path local 
 ```
 perl "${CLAUDE_PLUGIN_ROOT}/scripts/vault-sync.pl" detect-trackable --cwd "$PROJECT_CWD"
 ```
-If `trackable` empty → report none found, stop. Else present each via `AskUserQuestion` `multiSelect: true` (label = `path`, description = `"<type>, <size>"`), all pre-selected. If user deselects all → abort. Then propose slugs:
+If `trackable` empty → report none found, stop. Else present each via `AskUserQuestion` `multiSelect: true` (label = `path`, description = `"<type>, <size>"`), all pre-selected. One entry may be the synthetic `_host-memory` — that is this machine's host-side Claude memory dir (`~/.claude/projects/<encoded-cwd>/memory`), which lives outside the project tree; selecting it backs up your per-project memories alongside the repo files (on another machine it restores into THAT machine's memory dir). If user deselects all → abort. Then propose slugs:
 ```
 perl "${CLAUDE_PLUGIN_ROOT}/scripts/vault-sync.pl" propose-slugs --cwd "$PROJECT_CWD"
 ```

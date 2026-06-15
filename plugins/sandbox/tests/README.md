@@ -1,8 +1,8 @@
 # sandbox plugin tests
 
-Verification suite for the `/sandbox` launcher's mount strategy and the
-9p O_APPEND workaround. Run from the project root or anywhere — paths
-are anchored via `FindBin`.
+Verification suite for the `/sandbox` launcher's mount strategy, runtime
+detection, and container-lifecycle invariants. Run from the project root
+or anywhere — paths are anchored via `FindBin`.
 
 ```bash
 perl ~/.claude/ccpraxis/plugins/sandbox/tests/run-tests.pl
@@ -10,34 +10,86 @@ perl ~/.claude/ccpraxis/plugins/sandbox/tests/run-tests.pl
 perl ~/.claude/ccpraxis/plugins/sandbox/tests/run-tests.pl tests/t/02-*.t
 ```
 
-Each test file (`t/*.t`) is independent — owns its containers, volumes,
-and temp dirs, and cleans up via the END block in `lib/TestSandbox.pm`.
-Concurrent runs are safe (resources tagged with `claude-sandbox-test-$$-…`).
+Each test file (`t/*.t`) is independent — owns its containers and temp
+dirs, and cleans up via the END block in `lib/TestSandbox.pm`. Concurrent
+runs are safe (resources tagged with `claude-sandbox-test-$$-…`).
 
 ## What's covered
 
 | File | Claim |
 |---|---|
-| `01-9p-confirms-append-bug.t` | Sanity: 9p host bind rejects O_APPEND on Podman/HyperV |
-| `02-volume-supports-append.t` | Critical: named volume accepts O_APPEND (the workaround's premise) |
-| `03-volume-create-idempotency.t` | `podman volume create` is NOT idempotent — pins the inspect-first pattern |
-| `04-volume-persists-rm.t` | Volume contents survive `podman rm` of the container |
-| `05-seed-and-sync-roundtrip.t` | Host → volume seed + container append + volume → host sync preserves data |
-| `06-sidecar-periodic-sync.t` | `sync-sidecar.pl` mirrors data on its interval + self-exits when container stops |
+| `01-bind-honors-append-and-utimensat.t` | Current container backend's host bind mount honors O_APPEND, utimensat UTIME_NOW, utimensat explicit timestamp — the assumption replacing the retired xfs-volume workaround |
+| `02-launcher-bind-mount-shape.t` | Launcher mounts `/root/.claude` from `.claude-data` (host bind, not a volume) + single-file bind for `/root/.claude.json`; no `CLAUDE_DATA_VOLUME` residue |
+| `03-claude-json-file-bind.t` | Single-file bind of `.claude-data/.claude.json` → `/root/.claude.json` works RW from both sides; mount target is a file, not an auto-created directory |
+| `04-runtime-detection.t` | Same `_detect_container_cli` helper is present in all three scripts (launcher.pl, bootstrap.pl, TestSandbox.pm); the detected CLI responds to `--version` |
+| `06-launcher-ro-protection.t` | `.launcher` RO overlay enforced at kernel mount level (container reads succeed, writes blocked); `.credentials.json` + `.claude.json` single-file binds remain RW |
+| `07-mountspec-volume-vs-bind.t` | `MountSpec::v_to_mount` correctly classifies path-shaped sources as `type=bind` and bare-identifier sources as `type=volume` |
+| `08-launcher-loads-from-any-cwd.t` | Launcher resolves its own path correctly regardless of caller's cwd |
+| `09-no-stdin-after-podman-start.t` | Structural: all user interaction (skill selector, rebuild prompt, backpack approval) is BEFORE `podman start` — keep-alive window doesn't burn on user-think-time |
 | `10-select-session-empty-dir.t` | Picker emits NEW when no sessions exist (no menu shown) |
 | `11-select-session-parses.t` | Picker handles real-shape JSONL without crashing; "Start a new session" is option 1 |
+| `12-keepalive-heartbeat.t` | Container's ENTRYPOINT heartbeat-only keep-alive loop respects the `/tmp/.launcher-alive` staleness window |
+| `13-install-pass-heartbeat.t` | Backpack install pass keeps the container alive past the HB window via a parallel heartbeat subshell (`trap EXIT` cleanup); control case proves the refresher is load-bearing |
+| `18-multi-session-shared-state.t` | Two concurrent claudes in the same container, sharing `/root/.claude` via bind mount, write to per-session paths without corruption; host filesystem reflects both in real time |
+| `21-select-session-multiple.t` | Picker correctly handles multiple sessions; ordering + numbering stable |
+| `22-mountspec-edge-cases.t` | `MountSpec::v_to_mount` handles drive-letter sources, `:ro` options, paths with embedded `:` |
 
 ## Requirements
 
-- Podman reachable (`podman.exe ps` works)
-- `docker.io/library/debian:bookworm-slim` image cached locally (small,
-  used as the probe image so we don't bake on the heavy `claude-sandbox`
-  image for every test)
-- Perl with `Test::More` (core module — should always be present)
+- A container runtime reachable: `docker.exe ps` OR `podman.exe ps` works (tests auto-detect)
+- `docker.io/library/debian:bookworm-slim` image cached locally (small, the probe image)
+- Perl with `Test::More` (core module — always present)
 
 ## Adding tests
 
 - New tests go in `t/`, named `NN-short-slug.t`
-- Use `TestSandbox` helpers for any podman objects so cleanup is automatic
-- Number prefix groups tests semantically: `0x` = filesystem facts, `1x` =
-  CLI-level behavior, etc. Pick the next free slot.
+- Use `TestSandbox` helpers for any container objects so cleanup is automatic
+- Number prefix groups tests by domain: `0x` = filesystem facts / bind-mount
+  correctness / runtime detection, `1x` = container lifecycle / session
+  management, `2x` = mount-spec parsing. Pick the next free slot in the
+  appropriate decade. (Note: `12` and `13` are lifecycle tests in the `1x`
+  group; `22` is a `2x` parsing test — the decade is the guide, the exact
+  slot within it is arbitrary.)
+
+## Running a subset
+
+Pass glob patterns to `run-tests.pl`. Patterns are resolved cwd-relative
+first; if no files match the cwd, the runner falls back to paths anchored at
+its own directory (and at its own `t/` subdirectory). This means the same
+invocation works from the repo root or from `plugins/sandbox/`:
+
+```bash
+perl plugins/sandbox/tests/run-tests.pl plugins/sandbox/tests/t/12-*.t
+# or from plugins/sandbox/:
+perl tests/run-tests.pl t/12-*.t
+```
+
+Exit code 2 = no matching test files found (pattern mismatch).
+
+## Manual tests
+
+`tests/manual/longrun-freeze-check.sh` — an empirical 5–8 minute sanity
+check that launches claude inside a container (using the launcher's real
+bind-mount shape) and verifies claude stays alive and processing throughout.
+It is NOT part of the automated suite — it requires a container runtime and
+takes minutes to run.
+
+```bash
+bash tests/manual/longrun-freeze-check.sh [PROJECT_DIR]
+```
+
+`PROJECT_DIR` is an optional path to an existing project directory whose
+`.claude-data/` and `.claude-data/.claude.json` are bound into the container
+exactly as the launcher does. If omitted, a scratch project is created under
+`$HOME/.cache/sandbox-tests/` and removed on exit.
+
+Control the run duration with `DURATION=<seconds>` (default 480).
+
+## Historical (pre-WSL2-migration)
+
+A previous version of this suite pinned a podman xfs-volume workaround
+for Hyper-V's 9p O_APPEND / utimensat bugs (tests 01–06, 13, 14).
+That workaround was retired when the sandbox migrated to the WSL2 backend
+(2026-06) — those tests were deleted. If a future backend (e.g. macOS via
+qemu/virtiofs) reintroduces a 9p-style file-share, run `01-bind-honors-…`
+on that backend first; if it fails, restore the volume workaround.

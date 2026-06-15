@@ -44,7 +44,13 @@ Each package ledger's frontmatter (`status`, `model`, `max_turns`, `write_set`, 
 - Assign `model` per package: `sonnet` default; `opus` for packages with gnarly design surface or security weight. `max_turns` is butler's per-coordinator backstop (default 80).
 - Every package block carries `inputs` (file:line where known) and `out_of_scope` (explicit DO-NOT list) — coordinators must not re-discover what you already know.
 
-### 3. Manage (`/blueprint:manage`)
+### 3. Resume (`/blueprint:resume`)
+
+Load a blueprint and continue working on it **interactively in this session** — the author reads the blueprint.md and all package ledgers, summarizes the current state (objective, locked decisions, what is done, what remains, and next actions), and continues the work. This is the interactive, host-side working-document resume.
+
+It is distinct from `/butler:resume`, which restarts **headless detached coordinator processes** inside the sandbox to re-execute a blueprint that was already handed to butler. `/blueprint:resume` is you — in the current session — doing or finishing the authoring and interactive work.
+
+### 4. Manage (`/blueprint:manage`)
 
 `list` / `view` read files only. `audit` re-runs `blueprint:bp-auditor`. `archive` / `delete` are lifecycle ops on the files. This plugin never touches running coordinator processes — those live in the sandbox and are butler's to stop. A user decision that implies substantial new work becomes a **new blueprint**, not scope creep on an existing one.
 

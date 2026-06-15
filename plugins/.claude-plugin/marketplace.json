@@ -19,7 +19,7 @@
     {
       "name": "sandbox",
       "source": "./sandbox",
-      "description": "Prepare a project for running Claude Code in an isolated rootless-Podman dev container. Provides /sandbox:setup; the canonical entry point is the claude-sandbox launcher's auto-prompt."
+      "description": "Prepare a project for running Claude Code in an isolated Docker-or-Podman (auto-detected) dev container. Provides /sandbox:setup and /sandbox:test; the canonical entry point is the claude-sandbox launcher's auto-prompt."
     },
     {
       "name": "steward",
@@ -29,7 +29,7 @@
     {
       "name": "blueprint",
       "source": "./blueprint",
-      "description": "Authors durable blueprints (interrogate → decompose into scoped packages with a dependency DAG → fresh-context auditor gate). Host-usable. Provides /blueprint:create and /blueprint:manage; the blueprints it produces are executed by the sandbox-only butler plugin."
+      "description": "Authors durable blueprints (interrogate → decompose into scoped packages with a dependency DAG → fresh-context auditor gate). Host-usable. Provides /blueprint:create, /blueprint:manage, and /blueprint:resume; the blueprints it produces are executed by the sandbox-only butler plugin."
     },
     {
       "name": "butler",
