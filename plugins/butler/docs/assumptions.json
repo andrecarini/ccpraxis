@@ -1,0 +1,130 @@
+{
+  "_about": "Machine-readable assumptions registry seeded by A0 (de-risk spike). A8's preflight asserts env-support (halt loud + specific on unsupported), and the contract-guard validates Anthropic-side responses + creds shape at runtime (alarm + graceful-pause on drift). Decisions #29/#30/#31. Each entry: id, what, expected_contract, check (how to verify), supported_envs, implement_hint (what to build to support a new env), surface (preflight|contract|both).",
+  "schema_version": 1,
+  "validated_in": {
+    "host": { "os": "win32", "perl": "5.42 (cygwin)", "curl": "8.19 (Schannel)", "claude_code": "2.1.170" },
+    "sandbox": { "os": "linux", "image": "localhost/claude-sandbox:2.1.170", "runtime": "podman 5.8.3" }
+  },
+  "supported_envs": ["win32", "sandbox-linux"],
+  "assumptions": [
+    {
+      "id": "os",
+      "what": "Host platform is one we have validated.",
+      "expected_contract": "$^O in {MSWin32, cygwin, msys} on host; linux inside the sandbox container.",
+      "check": "perl $^O / uname; membership test against supported_envs.",
+      "supported_envs": ["win32", "sandbox-linux"],
+      "implement_hint": "Add a platform-support module entry (paths, shell, exec quoting, keep-awake API) for the new OS; until then preflight must halt loud naming the OS.",
+      "surface": "preflight"
+    },
+    {
+      "id": "bin.curl",
+      "what": "HTTP transport that trusts the system cert store.",
+      "expected_contract": "curl present; on win32 a Schannel build (no CA file needed); HTTPS GET to api.anthropic.com succeeds.",
+      "check": "curl --version (look for Schannel on win32); a probe HTTPS request returns a TLS-valid response.",
+      "supported_envs": ["win32", "sandbox-linux"],
+      "implement_hint": "Ensure curl (or an equivalent HTTPS client) is installed for the platform.",
+      "surface": "preflight"
+    },
+    {
+      "id": "bin.perl",
+      "what": "Perl with HTTPS + JSON for the orchestrator/guard.",
+      "expected_contract": "perl >=5.14 with HTTP::Tiny, IO::Socket::SSL, JSON::PP loadable.",
+      "check": "perl -M<mod> -e1 for each module.",
+      "supported_envs": ["win32", "sandbox-linux"],
+      "implement_hint": "Install perl + the three modules (all core/near-core).",
+      "surface": "preflight"
+    },
+    {
+      "id": "bin.jq",
+      "what": "jq for hook JSON parsing (hooks fail-closed without it).",
+      "expected_contract": "jq present where butler hooks run (the sandbox).",
+      "check": "command -v jq.",
+      "supported_envs": ["sandbox-linux"],
+      "implement_hint": "Install jq in the sandbox image; host hooks do not run by default.",
+      "surface": "preflight"
+    },
+    {
+      "id": "tls.ca",
+      "what": "A CA bundle perl's IO::Socket::SSL can use (host perl lacks a default).",
+      "expected_contract": "A CA file path exists; on host /usr/ssl/certs/ca-bundle.crt.",
+      "check": "stat the candidate CA paths; assert at least one exists.",
+      "supported_envs": ["win32", "sandbox-linux"],
+      "implement_hint": "Point SSL_ca_file at the platform CA bundle (or use a Schannel curl transport instead).",
+      "surface": "preflight"
+    },
+    {
+      "id": "creds.path",
+      "what": "OAuth credentials file location.",
+      "expected_contract": "~/.claude/.credentials.json exists and is readable; mode 0600 (sandbox) / 0644 (cygwin-cosmetic on host).",
+      "check": "stat + parse.",
+      "supported_envs": ["win32", "sandbox-linux"],
+      "implement_hint": "macOS stores creds in Keychain, not this file — a new code path is required there (currently unsupported).",
+      "surface": "preflight"
+    },
+    {
+      "id": "creds.shape",
+      "what": "Shape of the credentials JSON.",
+      "expected_contract": "claudeAiOauth.{accessToken:str, refreshToken:str, expiresAt:int(epoch ms), scopes:[str], subscriptionType:str, rateLimitTier:str}",
+      "check": "parse + assert keys/types; expiresAt is epoch-ms (> 1e12).",
+      "supported_envs": ["win32", "sandbox-linux"],
+      "implement_hint": "If Anthropic renames fields, update the contract + the write-back mapping; alarm on drift.",
+      "surface": "both"
+    },
+    {
+      "id": "api.usage",
+      "what": "Usage telemetry endpoint.",
+      "expected_contract": "GET https://api.anthropic.com/api/oauth/usage with Bearer + 'anthropic-beta: oauth-2025-04-20' + 'User-Agent: claude-code/<ver>' returns 200 with five_hour.{utilization:int 0-100, resets_at:ISO-8601} and seven_day.{...}.",
+      "check": "one probe GET at launch; validate field presence/types; unauth returns 429 (not an auth signal).",
+      "supported_envs": ["win32", "sandbox-linux"],
+      "implement_hint": "If the shape changes (renamed/missing field, non-200), the contract-guard alarms + graceful-pauses; pin the new shape here.",
+      "surface": "both"
+    },
+    {
+      "id": "api.refresh",
+      "what": "OAuth token refresh endpoint (token-keeper).",
+      "expected_contract": "POST https://platform.claude.com/v1/oauth/token (Content-Type: application/json) body {grant_type:'refresh_token', refresh_token, client_id, scope} -> 200 {access_token, expires_in[, refresh_token]}. Premature refresh is rate-limited (429) by design.",
+      "check": "shape verified from Claude Code's own bundle; atomic write-back proven against a fixture; A8 ACTIVELY verifies one real in-band refresh near expiry and asserts 200 + contract.",
+      "supported_envs": ["win32", "sandbox-linux"],
+      "implement_hint": "If the endpoint/domain/grant changes, alarm + pause; never assume success. Treat 429 as expected (backoff, in-band only).",
+      "surface": "both",
+      "status": "mechanism-proven; live-200 from our code not yet observed (blocked by premature-refresh 429); verified indirectly (Claude Code rotated the token)."
+    },
+    {
+      "id": "oauth.client_id",
+      "what": "Public Claude Code OAuth client id.",
+      "expected_contract": "9d1c250a-e61b-44d9-88ed-5944d1962f5e, overridable via $CLAUDE_CODE_OAUTH_CLIENT_ID.",
+      "check": "env override else the pinned default.",
+      "supported_envs": ["win32", "sandbox-linux"],
+      "implement_hint": "If Anthropic rotates the public client id, update here; a 4xx invalid_client on refresh signals drift.",
+      "surface": "preflight"
+    },
+    {
+      "id": "hooks.subagent",
+      "what": "Plugin PreToolUse hooks fire for a worker SUBAGENT's tool calls (containment + A4 gate depend on it).",
+      "expected_contract": "A settings/plugin PreToolUse hook fires on a subagent Edit/Write and can deny it; hook input carries agent_id/agent_type.",
+      "check": "SELF-TEST at preflight: dispatch a throwaway worker that attempts an out-of-scope edit; assert it is DENIED. Fail loud if containment is silently not firing.",
+      "supported_envs": ["win32", "sandbox-linux"],
+      "implement_hint": "If a Claude Code version stops firing plugin hooks for subagents, containment is broken — halt loud; do not run a fleet.",
+      "surface": "preflight",
+      "status": "confirmed via docs + structural evidence; runtime self-assert is the durable proof (Decision #31)."
+    },
+    {
+      "id": "harness.wake",
+      "what": "A long-blocking background command's completion re-invokes the (idle) interactive session.",
+      "expected_contract": "A detached command, on exit, delivers a notification that re-invokes the session (reporter auto-announce).",
+      "check": "PROVEN empirically (Probe 4). Robust fallback: bounded ~9-min long-poll + re-arm regardless.",
+      "supported_envs": ["win32", "sandbox-linux"],
+      "implement_hint": "If re-invocation behavior changes, the bounded long-poll + re-arm still works; surface a warning.",
+      "surface": "preflight"
+    },
+    {
+      "id": "runtime.container",
+      "what": "Container runtime for the sandbox surface.",
+      "expected_contract": "podman (or docker) present; sandbox image tag matches the Claude Code CLI version.",
+      "check": "podman/docker --version; image tag vs `claude --version`.",
+      "supported_envs": ["win32"],
+      "implement_hint": "Detect docker vs podman (already done elsewhere); on a host without either, dispatch-fleet is unsupported — halt loud.",
+      "surface": "preflight"
+    }
+  ]
+}
