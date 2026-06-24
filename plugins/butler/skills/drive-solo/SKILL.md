@@ -16,9 +16,10 @@ sweep folds in); there is no separate `resume`.
 
 It is the counterpart to **`/butler:dispatch-fleet`** (the headless multi-coordinator fleet, sandbox-only).
 Two verbs exist only because of the subagent-depth limit: `dispatch-fleet` gets depth via detached
-coordinators; `drive-solo` accepts a flat one-level worker tree and runs anywhere.
+coordinators; `drive-solo` accepts a flat one-level worker tree and runs anywhere. It absorbs the old
+interactive `/blueprint:resume` working-document role (which has been removed — `blueprint` is now
+plan-only).
 
-**Until A2 lands**, this skill does no work. For interactive blueprint work right now, use
-`/blueprint:resume <name>` (the interactive working-document driver whose role drive-solo will absorb).
-When invoked, report that drive-solo is not yet implemented and point the user there — do not attempt
-to execute packages from this skeleton.
+**Until A2 lands**, this skill does no work. When invoked, report that drive-solo is not yet implemented.
+For headless execution right now use `/butler:dispatch-fleet <name>` inside the sandbox, or
+`/butler:status <name>` to inspect state — do not attempt to execute packages from this skeleton.

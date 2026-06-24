@@ -16,7 +16,9 @@
 #
 # Terminal ledgers (done/blocked/parked) and live processes are reported, not
 # touched. Packages never launched (no registry entry) are reported as PENDING —
-# wave scheduling belongs to /butler:launch, not the sweep.
+# wave scheduling belongs to the deterministic orchestrator (bp-orchestrator.pl),
+# not the sweep. This sweep is the warm-vs-cold recovery helper the orchestrator
+# applies on a start-or-continue; it is no longer a user-facing "resume" verb.
 set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=bp-lib.sh
@@ -79,7 +81,7 @@ for BPDIR in "$DATA"/blueprints/*/; do
         printf '%-28s %-12s NEEDS ATTENTION — %s\n' "$BP_NAME/$PKG" "$STATUS" "${NEXT:-see ledger}" ;;
       pending)
         if [ -z "$SID$PID" ]; then
-          printf '%-28s %-12s PENDING (never launched — use /butler:launch)\n' "$BP_NAME/$PKG" "$STATUS"
+          printf '%-28s %-12s PENDING (never launched — the orchestrator schedules it)\n' "$BP_NAME/$PKG" "$STATUS"
         else
           revive "$BP_NAME" "$PKG" "$SID" "$PID" "$AGE" "$STATUS"
         fi ;;

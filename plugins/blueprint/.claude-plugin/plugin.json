@@ -1,7 +1,7 @@
 {
   "name": "blueprint",
   "version": "0.1.0",
-  "description": "Authors and manages durable blueprints: /blueprint:create interrogates + decomposes into scoped packages (per-package ledgers with write-sets, a dependency DAG, testable done-criteria) gated by a fresh-context auditor; /blueprint:manage lists/views/audits/archives; /blueprint:resume reloads a blueprint and continues it interactively. Host-usable. The blueprints it produces are executed by the sandbox-only butler plugin.",
+  "description": "Authors and manages durable blueprints (plan-only — no execution or resume verbs): /blueprint:create interrogates + decomposes into scoped packages (per-package ledgers with write-sets, a dependency DAG, testable done-criteria) gated by a fresh-context auditor; /blueprint:manage lists/views/audits/archives. Host-usable. The blueprints it produces are executed by the sandbox-only butler plugin (/butler:dispatch-fleet or /butler:drive-solo).",
   "author": { "name": "André Carini" },
   "keywords": ["orchestration", "multi-agent", "planning", "ccpraxis"],
   "license": "MIT"

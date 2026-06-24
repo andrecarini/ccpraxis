@@ -6,7 +6,7 @@ argument-hint: [blueprint]
 
 # /butler:status
 
-You are the **orchestrator**. First read `${CLAUDE_PLUGIN_ROOT}/skills/orchestrator-protocol/SKILL.md` — it is the doctrine source for all butler orchestration operations.
+First read `${CLAUDE_PLUGIN_ROOT}/skills/orchestrator-protocol/SKILL.md` — it is the doctrine source for all butler execution operations. This is a read-only snapshot; it never drives anything.
 
 Run:
 
@@ -18,9 +18,9 @@ bash "${CLAUDE_PLUGIN_ROOT}/scripts/bp-status.sh" $0
 
 Then summarize for the user, and recommend concretely:
 
-- ✅ `done` rows not yet harvested → offer to harvest (verify outputs on disk per protocol) and launch the next wave.
-- ⛔ `blocked` / ⏸ `parked` → read those ledgers' Escalation sections only; present the decisions needed, batched.
-- Dead process + non-terminal ledger → offer `/butler:resume`.
-- Pending packages whose dependencies are met → offer `/butler:launch`.
+- ✅ `done` rows → the deterministic orchestrator harvests + launches dependents itself; just report progress (no manual harvest loop).
+- ⛔ `blocked` / ⏸ `parked` → read those ledgers' Escalation sections only, and check `runs/needs-you/` for queued decisions; present them, batched. To answer and unblock, point the user to `/butler:reporter $0`.
+- A run that should be live but isn't (no `runs/.orchestrator` marker, dead coordinators, non-terminal ledgers) → offer `/butler:dispatch-fleet $0` (sandbox) or `/butler:drive-solo $0` (host/single-session). Both are start-or-continue and recover interrupted work automatically.
+- Pending packages whose dependencies are met → same: `dispatch-fleet` / `drive-solo` picks them up; there is no separate launch/resume verb.
 
 Keep your own context lean: the table plus targeted Escalation reads, nothing more.

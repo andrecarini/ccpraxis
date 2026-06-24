@@ -1,82 +1,87 @@
 ---
 name: orchestrator-protocol
-description: Operating protocol for the butler orchestrator (the interactive Claude Code session that launches, monitors, harvests, and resumes a blueprint's execution). Read this whenever any /butler command runs — the butler skills (launch, status, resume) all defer to this document for doctrine. Authoring a blueprint (create/decompose/audit) is the separate `blueprint` plugin.
+description: Operating doctrine for butler execution — the reporter (the interactive Claude front door) plus the deterministic orchestrator script (no Claude) that actually drives a blueprint's unattended run, and the coordinators / workers / judges beneath them. Read this whenever any /butler command runs; the execute verbs (dispatch-fleet, drive-solo) and status all defer to it. Authoring a blueprint (create/decompose/audit) is the separate, host-side `blueprint` plugin.
 ---
 
-# Butler orchestrator protocol
+# Butler execution protocol
 
-You are the **orchestrator**: the interactive session the user talks to. You are the connective layer between the user and the coordinators. Your context must survive a 6+ hour session, so per-package detail lives in coordinator/worker contexts and on disk — never in yours. You execute a blueprint that already exists on disk (authored by `/blueprint:create`); you do not author it here.
+Butler **executes** a blueprint the `blueprint` plugin already authored on disk (`/blueprint:create`); it never authors one here. The old design had a single thing called "orchestrator" — one Claude session that watched, launched, harvested, and resumed everything. That is now **split**, and getting the cast straight is load-bearing: the driving is done by a **deterministic script with no Claude**, and the only Claude you talk to is a lean **reporter**.
 
-## Role boundary
+## Cast (read this first)
 
-You NEVER implement package work yourself. You edit the working tree directly only for:
+| name | what it is |
+|------|------------|
+| **reporter** | The interactive **Claude** session — the human's front door. Launches a run, answers "how's it going?", relays queued decisions. Stays lean: it reads on-disk state to answer; it does **not** run a monitoring loop and does **not** drive the run. Become it with `/butler:reporter`. |
+| **orchestrator** | The **deterministic Perl script** `bp-orchestrator.pl` — drives a run unattended with **zero Claude**. Watches/launches/relaunches coordinators, polls usage, keeps the OAuth token alive, maintains the busy-lease, fires judges, auto-resumes. You never run it by hand; `dispatch-fleet` starts it via `bp-orchestrate.sh`. |
+| **coordinator** | A headless `claude -p`, one per package, running that package's 8-step pipeline (see `coordinator-protocol`). |
+| **worker** | A Task **subagent** of a coordinator; does one pipeline step, returns a ≤15-line summary. |
+| **judge** | A fresh, **scoped** Claude call the orchestrator fires only for a bounded judgment (verify a finished package; attempt to fix a stuck one). |
+| **dashboard** | The sandbox TUI (no Claude). While open it keeps the container alive and holds keep-awake (B-cluster). |
 
-- One-shot reactive fixes the user explicitly requests inline.
-- Blueprint-file and CLAUDE.md updates.
-- Stash/branch/commit/push mechanics (coordinators and workers are hook-blocked from these).
-- Cosmetic typo-level fixes.
-
-If a fix touches more than one logical concern, it becomes a package.
+**There is no persistent monitoring Claude and no detached host keeper.** The orchestrator *script* does the watching with no Claude; the dashboard window holds the PC awake. If a design pass reintroduces a "you are the orchestrator, sleep-and-poll" Claude loop, it has regressed (Decisions #5/#14).
 
 ## Paths and tools
 
 - Data root: `${CCPRAXIS_DATA_DIR:-<project-root>/.ccpraxis-local-data}`; blueprints live at `<data>/blueprints/<name>/`.
-- Scripts (always via `${CLAUDE_PLUGIN_ROOT}/scripts/`): `bp-init.sh` (provisioning; normally already run by `/blueprint:create`), `bp-launch.sh <bp> <pkg> [--model M] [--max-turns N] [--resume-session SID] [--force]`, `bp-status.sh [bp]`, `bp-resume-sweep.sh [bp] [--apply]`.
+- Scripts (always via `${CLAUDE_PLUGIN_ROOT}/scripts/`):
+  - `bp-orchestrate.sh <bp>` — start (or continue) the detached deterministic orchestrator; sandbox-only, idempotent. **This is what `dispatch-fleet` runs.**
+  - `bp-orchestrator.pl` — the orchestrator loop itself (the script `bp-orchestrate.sh` detaches). You never invoke it directly.
+  - `bp-launch.sh <bp> <pkg> [--resume-session SID] [--force]` — launches one coordinator. **Called by the orchestrator**, not by you.
+  - `bp-status.sh [bp]` — the cheap status snapshot the reporter / `/butler:status` read.
+  - `bp-resume-sweep.sh [bp] [--apply]` — the warm-vs-cold recovery sweep the orchestrator applies on a start-or-continue.
 
 ## Prerequisite: a blueprint exists
 
-Butler executes a blueprint that the `blueprint` plugin already authored on disk (`<data>/blueprints/<name>/blueprint.md` + `packages/<NN-slug>.md` ledgers with real `write_set`/`test_paths`/`model`/`max_turns` frontmatter — that frontmatter is what these scripts and the hooks read). If the blueprint is missing, unaudited, or has empty write sets, stop and direct the user to `/blueprint:create` (or `/blueprint:manage audit`) rather than launching an unscoped coordinator. Butler never authors or re-decomposes a blueprint — that is a scope change the user takes back to the `blueprint` plugin.
+Butler runs a blueprint authored on disk (`<data>/blueprints/<name>/blueprint.md` + `packages/<NN-slug>.md` ledgers with real `write_set`/`test_paths`/`model`/`max_turns` frontmatter — that frontmatter is what the scripts and hooks read). If the blueprint is missing, unaudited, or has empty write sets, stop and send the user to `/blueprint:create` (or `/blueprint:manage audit`) rather than launching an unscoped fleet. Butler never authors or re-decomposes a blueprint.
 
-## Lifecycle
+## The execute verbs (Decisions #2/#3/#4)
 
-### 1. Launch (`/butler:launch`)
+- **`/butler:dispatch-fleet <bp>`** — the headless multi-coordinator fleet, **sandbox-only**. Starts the deterministic orchestrator and hands you to the reporter. Use it when the user wants unattended execution at scale.
+- **`/butler:drive-solo <bp>`** — a single **interactive** session with one flat layer of `bp-*` worker subagents (no detached coordinators), runnable **host or sandbox**. Use it for host-safe / single-session execution. (Absorbs the old interactive working-document resume role.)
+- **`/butler:status [bp]`** — a cheap read-only snapshot; never drives anything.
+- **There is no `resume` verb.** Both execute verbs are idempotent **start-or-continue**: re-running `dispatch-fleet` continues a live or interrupted run (the orchestrator's resume-sweep folds in warm/cold recovery), and `drive-solo` re-reads the ledgers and picks up where they left off. Old decisions stay decided; only genuinely new blockers surface.
 
-1. Compute the current **wave**: packages whose dependencies are ✅ and whose write sets are disjoint from every running package.
-2. Respect the global cap (`BP_MAX_PARALLEL`, default 2 — this is usage-limit protection, load-bearing, not a nicety). Launch each with `bp-launch.sh`; record the launch in the blueprint (status row 🔧 + `last_updated`).
-3. Set the blueprint `status: running`.
+## What the deterministic orchestrator does (so neither you nor a coordinator has to)
 
-### 2. Monitor
+This is **code** (`bp-orchestrator.pl`), unit-tested decision-by-decision — not agent doctrine. The doctrine-level summary so the reporter can explain it:
 
-- Poll with `bp-status.sh <bp>` on a sleep loop (every ~5 minutes is plenty). **Your monitoring surface is ledgers via that script — never tail `runs/*.jsonl` into your context** unless a coordinator died without a ledger explanation, and even then read the tail only.
-- `done` → harvest (below). `blocked`/`parked` → read the ledger's Escalation + Next action sections only; if it needs a user decision, batch it; if it's fixable by re-scoping or a corrected dispatch, fix the blueprint/ledger and relaunch.
-- A dead process with a non-terminal ledger → `bp-resume-sweep.sh <bp> --apply` (it applies the warm/cold policy itself).
-- Keep launching subsequent waves as dependencies complete. Do not stop the session for: style preferences, naming, defensible defaults, review findings with obvious fixes, or stalled coordinators (diagnose + relaunch). Stop only for: architectural decisions with multi-package consequences, destructive-action approval, genuine intent ambiguity, security/credential decisions.
+- **Watch + event-driven launch.** It watches coordinators continuously (PID liveness + `runs/<pkg>.jsonl` growth — free signals) and the *instant* one finishes/dies it computes newly-ready packages off the explicit DAG (dependencies ✅ + write-sets disjoint from everything running) and launches them, cap-bounded by `BP_MAX_PARALLEL`. A periodic timer is only a fallback heartbeat.
+- **Watchdog.** Dead coordinator → relaunch (warm `--resume` within the cache window, else a ledger cold-start); alive but stream-log flat → kill + cold-relaunch; past an attempt cap → mark the package `blocked` and queue a `runs/needs-you/` decision (loop-guard).
+- **Usage governance (Decisions #7–#9).** Burn-rate-adaptive poll of `/api/oauth/usage`; pause the fleet at a **derived trip point BELOW** the 85% (5h) / 90% (7d) ceilings (the remaining headroom is the user's), recorded in `runs/.paused` (epoch `resets_at` + a jittered relaunch time); **auto-resume** after the reset (Decision #12).
+- **Token-keeper (Decision #11).** Refreshes the OAuth token in the 1–2h-remaining band, atomic + cooperative write-back; crossing the 1h floor unrefreshed → graceful pause + a re-login decision.
+- **Fail-safe (Decision #12).** Telemetry loss / un-refreshable token / contract drift → graceful pause, never fly blind. Everything (every poll, refresh, pause, resume) is logged to `runs/orchestrator.log` (Decision #30) — never a secret value.
+- **Busy-lease (Decision #16).** Touches `/tmp/.butler-busy` while work is active or an auto-resume is pending; not while the only outstanding work is parked-for-human.
 
-### 3. Harvest (per completed package)
+### Harvest (Decision #15)
 
-**Disk is truth; agent context is volatile.** Never flip a status row on a coordinator's say-so:
+A coordinator already runs its own tests + review + red-team before it reports `done`. **Default = trust that:** the orchestrator flips the status and launches dependents immediately, and harvest-verification runs as an **async spot-audit judge** (A5), not a gate on every launch. (The alternative — gate each launch on a harvest-judge — is configurable per run; the default favors throughput.) Either way, **disk is truth**: a judge verifies a finished package's declared outputs from disk, never on a coordinator's say-so.
 
-1. Open the ledger's Outputs section. Verify each artifact exists on disk; re-run the recorded validation commands (or spot-check exit-code evidence) yourself.
-2. Record the verification in the blueprint's Harvest log; flip the package row to ✅.
-3. Commit mechanics are yours and follow project CLAUDE.md policy (atomic, non-breaking, PT-BR text rules, one commit per deliverable — squash coordinator-era noise first).
+### Escalation = park-the-branch, never global-halt (Decision #13)
 
-### 4. Resume (`/butler:resume`) — including next-day and post-usage-limit
+A stuck package: (a) the coordinator's own review/red-team/fix loops retry; (b) a deeper **resolve-judge** attempts a fix (re-scope, corrected relaunch, drop an optional criterion); (c) only if it genuinely needs the user's *intent* does the orchestrator **park that package, queue the decision in `runs/needs-you/`, and keep all independent work running**. The user is never a blocking dependency for the whole run.
 
-1. `bp-resume-sweep.sh [bp]` (dry run) → show the plan → `--apply`.
-2. The economics are baked into the sweep: warm `--resume` only within `BP_RESUME_THRESHOLD_MIN` (default 60) of the last ledger touch, because resuming replays the whole transcript and is only cheap while the prompt cache is warm; beyond that a ledger cold-start is an order of magnitude cheaper. Don't override this to "be safe" — the ledger IS the safety.
-3. Then resume monitoring. Only NEW blockers get raised to the user; old decisions stay decided.
+## The reporter (the human's front door)
 
-### 5. Deliverable-level sweeps and archive
+You become the reporter via **`/butler:reporter`** (implemented in package A7). It syncs to current on-disk state (blueprint + registry + ledgers + the `runs/needs-you/` queue — a bounded snapshot, never an accumulating transcript), detects and **attaches** to a live run (via the registry / the `runs/.orchestrator` marker / the busy-lease), answers status from disk in a cheap turn, surfaces queued human-intent decisions, and writes answers back to unblock packages. It does not drive the run and does not poll in a token-burning loop. **Closing the reporter never affects the run; re-running `/butler:reporter` re-attaches.**
 
-When all packages of a deliverable are ✅, you may dispatch cross-cutting review (a `bp-reviewer` over the whole diff, or `bp-ui-prober` across user journeys) as a final package. Then `/blueprint:manage archive <name>`.
+### Role boundary (when you DO edit the tree yourself)
 
-## Context economics (your own)
+As the reporter you NEVER implement package work. You edit the working tree directly only for: one-shot reactive fixes the user explicitly requests inline; blueprint-file and CLAUDE.md updates; stash/branch/commit/push mechanics (coordinators/workers are hook-blocked from these); cosmetic typo-level fixes. Anything touching more than one logical concern is a package, not an inline fix.
 
-- You read: blueprint.md, ledger Status/Next-action/Escalation/Outputs sections, bp-status output. You do not read: worker reports, stream logs, specs — those are coordinator-tier material. If you need a detail from a report, read the specific file once; don't make it a habit.
-- Worker reports live under `<bp>/reports/<pkg>/`; specs under `<bp>/specs/`. They are on disk precisely so nobody holds them in context.
+## Context economics (the reporter's own)
 
-## Blueprint file discipline
-
-Update `blueprint.md` every time state changes at YOUR granularity (coordinator launches/returns/escalations, user decisions, incidents, harvest results) — not at the workers' granularity. Refresh `last_updated` each time. A user decision that implies substantial future work becomes a new blueprint, not scope creep on this one.
+You read: `blueprint.md`, ledger Status / Next-action / Escalation / Outputs sections, `bp-status` output, and the `runs/needs-you/` queue. You do **not** read worker reports, stream logs, or specs — those are coordinator-tier material on disk precisely so nobody holds them in context. If you need one detail from a report, read that one file once; don't make it a habit.
 
 ## Heartbeat lifetime — important for long-running blueprints
 
-The sandbox container lives **only while the host MANAGER terminal's heartbeat continues**. Closing the manager terminal (or letting the laptop sleep) stops the heartbeat; the container exits after the heartbeat timeout (~5 minutes). Detached coordinators inside the container die with it.
+The sandbox container lives **only while the dashboard window's heartbeat continues** (Decision #17; B-cluster owns the dashboard + keep-awake). The deterministic orchestrator is **detached** — it survives you closing the reporter session — but it cannot outlive its container: if the dashboard closes or the laptop sleeps with no keep-awake, the container reaps and the orchestrator (and its coordinators) stop.
 
-**What survives:** ledger state, registry, and all artifacts on disk. **Recovery:** `/butler:resume` re-evaluates every package (warm-resume vs cold-start per the sweep policy) and continues from where the ledger left off — no work is lost.
+**What survives:** ledger state, the registry, `runs/.paused`, and all artifacts on disk. **Recovery:** the next `/butler:dispatch-fleet` (or `bp-orchestrate.sh`) **continues** — it re-acquires the marker, the resume-sweep restarts interrupted coordinators warm-or-cold, and no work is lost (and nothing is double-launched: the flock marker is the single-instance guard). For unattended multi-hour runs, keep the dashboard open and the PC awake.
 
-**Practical implication:** unattended multi-hour runs require the manager terminal to stay open and awake. If you need to step away, leave the manager terminal running (screen/tmux recommended). A died coordinator is not catastrophic — it is recoverable — but it does consume part of the session budget on restart.
+## Blueprint file discipline
+
+The reporter (and the author) updates `blueprint.md` when state changes at *that* granularity — coordinator launches/returns/escalations the user should know about, user decisions, incidents, harvest results — refreshing `last_updated`. The orchestrator maintains the live per-package record (ledgers, registry, `runs/` artifacts). A user decision that implies substantial future work becomes a **new blueprint**, not scope creep on this one.
 
 ## Transport note (future)
 
-Coordinators currently run as detached headless `claude -p` sessions because that is durable by construction (ledger + session id on disk). The worker agents are standard subagent definitions, which Claude Code can also spawn as agent-team teammates; when agent teams stabilize (today they cannot be resumed and task status can lag), the tier-2 transport can switch without touching the protocol, ledgers, or agents.
+Coordinators run as detached headless `claude -p` sessions because that is durable by construction (ledger + session id on disk). The worker agents are standard subagent definitions; when agent teams stabilize (today they cannot be resumed and task status can lag), the tier-2 transport can switch without touching this protocol, the ledgers, or the agents.
