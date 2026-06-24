@@ -8,15 +8,20 @@
 # ONLY perl is exposed (unlike adding all of usr\bin, which would shadow the
 # Windows find/sort/link with their Unix namesakes).
 #
-# The shim points at whatever perl is ALREADY running this hook ($^X — the perl
-# the user invoked install.pl with), converted to a Windows path. We never
-# hardcode an install dir: that dir may not exist on another machine. Detection
-# happens ONCE here at install time; the generated perl.cmd caches the result so
-# `perl ...` per-invoke is a fixed exec (no re-detection cost).
+# The shim points at whatever perl is ALREADY running this hook (its own
+# $Config{perlpath} / $^X), converted to a Windows path. We anchor on the
+# running interpreter rather than searching install dirs ON PURPOSE: searching
+# could cache a DIFFERENT perl than the one actually in use (a mismatch). The
+# search-based resolver lives in exactly one other place — the PowerShell
+# launchers' Get-PerlPath (scripts/_perl-path.ps1) — which needs it because
+# PowerShell has no running-perl to anchor on. Two methods for two moments; no
+# shared list to drift.
+# Detection happens ONCE here at install time; the generated perl.cmd caches the
+# result so `perl ...` per-invoke is a fixed exec (no re-detection cost).
 #
-# Before caching, we VALIDATE the resolved perl meets the minimum version the
-# ccpraxis perl scripts need (5.10 for //, //=, say, state) and refuse to cache
-# a too-old one — "exists" is not "is the perl we need".
+# Before caching, we VALIDATE the resolved perl is a confirmed-working version
+# (Perl 5.x, >= the floor below) and refuse to cache one that isn't — "exists" is
+# not "is the perl we need".
 #
 # Windows-only. On Linux/macOS perl is already on PATH and a .cmd shim is
 # meaningless, so the hook is a friendly no-op there.
@@ -27,6 +32,7 @@
 use strict;
 use warnings;
 use FindBin qw($Bin);
+use Config;   # $Config{perlpath}: the authoritative path of the running perl
 
 # Raw byte I/O: paths are UTF-8 bytes (André); a :utf8 layer would double-encode.
 binmode STDOUT, ':raw';
@@ -57,17 +63,16 @@ my $shim   = "$bindir/perl.cmd";
 my $helper = "$Bin/../scripts/_install-bin-helper.pl";
 -f $helper or die "  perl-shim: shared helper not found at $helper\n";
 
-my ($perl_win, $perl_spawn, $perl_running) = resolve_perl();
-my $perl_ver = defined $perl_win
-    ? ($perl_running ? sprintf('%vd', $^V) : perl_version_str($perl_spawn))
-    : undef;
-my $vclass = !defined $perl_win ? 'unresolved' : classify_ver($perl_ver);
+# The shim always points at the perl running THIS installer ($^X), so its version
+# is simply $^V — no need to spawn anything to ask.
+my $perl_win = resolve_perl();
+my $perl_ver = defined $perl_win ? sprintf('%vd', $^V) : undef;
+my $vclass   = !defined $perl_win ? 'unresolved' : classify_ver($perl_ver);
 
 if ($mode eq 'plan') {
     if    ($vclass eq 'unresolved')  { print "  perl-shim: WARNING could not resolve a Windows perl path (\$^X=$^X) — would SKIP the shim\n"; }
-    elsif ($vclass eq 'unknown')     { print "  perl-shim: WARNING resolved $perl_win but could not determine its version — would warn and still shim\n"; }
     elsif ($vclass eq 'wrong-major') { print "  perl-shim: WARNING resolved $perl_win is perl $perl_ver — ccpraxis needs Perl 5.x — would REFUSE to shim\n"; }
-    elsif ($vclass eq 'too-old')     { print "  perl-shim: WARNING resolved $perl_win is perl $perl_ver (< $MIN_PERL needed) — would REFUSE to shim\n"; }
+    elsif ($vclass eq 'too-old')     { print "  perl-shim: WARNING resolved $perl_win is perl $perl_ver (< $MIN_PERL confirmed) — would REFUSE to shim\n"; }
     else                             { print "  perl-shim: would write $shim  (caches perl $perl_ver at \"$perl_win\")\n"; }
     # Delegate the PATH portion of the plan to the shared helper (idempotent).
     system($^X, $helper, 'plan', $bindir) if -d $bindir;
@@ -76,9 +81,9 @@ if ($mode eq 'plan') {
 
 # ── apply ─────────────────────────────────────────────────────────
 # Never break the rest of the install over a perl-shim problem, and never cache
-# a missing or too-old perl. These are non-fatal skips (exit 0) EXCEPT a
-# resolved-but-too-old perl, which is a real misconfiguration worth flagging
-# (exit nonzero → install.pl prints a "(hook exited N)" warning).
+# an unresolved / unconfirmed perl. The unresolved case is a non-fatal skip
+# (exit 0); a resolved-but-unconfirmed perl is a real misconfiguration worth
+# flagging (exit nonzero → install.pl prints a "(hook exited N)" warning).
 if ($vclass eq 'unresolved') {
     print STDERR "  perl-shim: could not resolve a Windows perl path (\$^X=$^X) — skipping shim, PATH untouched\n";
     exit 0;
@@ -93,15 +98,10 @@ if ($vclass eq 'too-old') {
     print STDERR "  perl-shim: install a confirmed perl (e.g. current Git for Windows) and re-run the installer.\n";
     exit 4;
 }
-if ($vclass eq 'unknown') {
-    # Couldn't probe the version (unusual). The perl resolved and exists, so
-    # proceed, but say so — don't silently claim it was validated.
-    print STDERR "  perl-shim: WARNING could not determine perl version for $perl_win — shimming anyway (unvalidated)\n";
-}
 
 mkdir $bindir unless -d $bindir;
 write_shim($shim, $perl_win);
-print "  perl-shim: wrote $shim  (caches perl ", ($perl_ver // '?'), " at \"$perl_win\")\n";
+print "  perl-shim: wrote $shim  (caches perl $perl_ver at \"$perl_win\")\n";
 
 # Add the bin dir to the user PATH via the shared (base64 round-trip, Unicode-
 # safe) helper. Its exit code becomes ours.
@@ -136,26 +136,27 @@ sub write_shim {
     close $fh;
 }
 
-# Resolve the running perl ($^X) to a Windows path. Returns
-#   ($win_path_for_shim, $spawnable_path, $is_running_perl)
-# or an empty list if nothing resolves. $is_running_perl is true when the
-# resolved perl IS this very process ($^X) — then its version is just $^V (no
-# spawn needed). Anchored on $^X so we point at the perl the user actually uses,
-# never a hardcoded dir.
+# Resolve the perl running THIS installer to a Windows path for the shim. We
+# anchor on the running interpreter itself — its build path $Config{perlpath} and
+# the invocation path $^X. $^X alone is NOT enough: when perl is found on PATH by
+# name it can be the bare string "perl" (observed in some shells), which we can't
+# turn into a path. $Config{perlpath} is the authoritative configured path of
+# THIS perl, so it always names the running interpreter — never a guessed/other
+# one, hence no search and no mismatch. Returns the Windows path, or undef.
 sub resolve_perl {
-    my $px = $^X;
-
-    # (a) Native Win32 perl (Strawberry/ActivePerl): $^X is already a drive path.
-    if ($px =~ m{^[A-Za-z]:[\\/]}) {
-        (my $w = $px) =~ s{/}{\\}g;
-        return ($w, $px, 1);
-    }
-
-    # (b) Git-for-Windows (cygwin/msys) perl: $^X is POSIX (/usr/bin/perl).
-    #     Convert with cygpath -w, found next to perl itself (PowerShell's PATH
-    #     won't have it). MSYS2_ARG_CONV_EXCL keeps the /usr/bin/perl argument
-    #     from being mangled before cygpath can convert it (see global CLAUDE.md).
-    if (-f $px) {
+    # Try $^X first (honours how perl was invoked), then the authoritative build
+    # path; skip any candidate that isn't an absolute path we can convert.
+    for my $px (grep { defined && length } ($^X, $Config{perlpath})) {
+        # (a) already an absolute Windows path (native Win32 perl).
+        if ($px =~ m{^[A-Za-z]:[\\/]}) {
+            (my $w = $px) =~ s{/}{\\}g;
+            return $w;
+        }
+        # (b) absolute POSIX path (Git-for-Windows perl): convert with cygpath -w,
+        #     found next to perl itself (PowerShell's PATH won't have it).
+        #     MSYS2_ARG_CONV_EXCL keeps the POSIX arg from being mangled before
+        #     cygpath converts it (see global CLAUDE.md).
+        next unless $px =~ m{^/} && -f $px;
         (my $dir = $px) =~ s{/[^/]*$}{};
         for my $cp ("$dir/cygpath", "$dir/cygpath.exe") {
             next unless -f $cp || -x $cp;
@@ -163,46 +164,18 @@ sub resolve_perl {
             my $w = `"$cp" -w "$px" 2>/dev/null`;
             next unless defined $w;
             $w =~ s/\s+\z//;
-            return ($w, $px, 1) if length $w && $w =~ /^[A-Za-z]:/;  # probe via POSIX $px
+            return $w if length $w && $w =~ /^[A-Za-z]:/;
         }
     }
-
-    # (c) Fallback: search known install locations (mirrors claude-sandbox.ps1
-    #     Get-PerlPath). Forward slashes are fine for -f and for spawning on
-    #     cygwin/native perl; convert to backslashes for the shim.
-    my @cands = grep { defined && length } (
-        ($ENV{ProgramFiles}        ? "$ENV{ProgramFiles}/Git/usr/bin/perl.exe"        : undef),
-        ($ENV{'ProgramFiles(x86)'} ? "$ENV{'ProgramFiles(x86)'}/Git/usr/bin/perl.exe" : undef),
-        'C:/Program Files/Git/usr/bin/perl.exe',
-        'C:/Program Files (x86)/Git/usr/bin/perl.exe',
-        'C:/Strawberry/perl/bin/perl.exe',
-        'C:/Perl64/bin/perl.exe',
-    );
-    for my $c (@cands) {
-        if (-f $c) { (my $w = $c) =~ s{/}{\\}g; return ($w, $c, 0); }
-    }
-
-    return ();
+    return undef;
 }
 
-# Probe a (non-running) perl's version string by invoking it. `-V:version`
-# prints  version='5.42.2';  — quote-safe (no $ or spaces in the args). Returns
-# the dotted version (e.g. "5.42.2") or undef if it couldn't be determined.
-sub perl_version_str {
-    my $spawn = shift;
-    local $ENV{MSYS2_ARG_CONV_EXCL} = '*';
-    my $out = `"$spawn" -V:version 2>/dev/null`;
-    return undef unless defined $out && $out =~ /version='([^']+)'/;
-    return $1;
-}
-
-# Classify a resolved perl's version against what ccpraxis needs:
-#   'ok' | 'too-old' | 'wrong-major' | 'unknown'
+# Classify the running perl's version against what ccpraxis needs:
+#   'ok' | 'too-old' | 'wrong-major'
 # We need Perl 5.x specifically: "Perl 6" became Raku (a different language) and
 # a future Perl 7 changes defaults enough to warrant a conscious re-validation.
 sub classify_ver {
     my $ver = shift;
-    return 'unknown' unless defined $ver && $ver =~ /^\d/;
     my ($maj) = split /\./, $ver;
     return 'wrong-major' if !defined $maj || $maj != 5;
     return 'too-old' unless vge($ver, $MIN_PERL);

@@ -2,29 +2,15 @@
 # ~/.claude/ccpraxis/plugins/sandbox/scripts/launcher.pl. This file only
 # locates perl + the script, then invokes it with passthrough args.
 
-# PowerShell PATH typically does not include Git Bash's perl, so search
-# the usual install locations. Resolving here means a missing perl fails
-# loudly rather than producing CommandNotFoundException later.
-function Get-PerlPath {
-    $cmd = Get-Command perl -ErrorAction SilentlyContinue
-    if ($cmd) { return $cmd.Source }
-    $git = Get-Command git -ErrorAction SilentlyContinue
-    if ($git) {
-        $gitCmdDir = Split-Path $git.Source -Parent
-        $gitRoot   = Split-Path $gitCmdDir -Parent
-        $candidate = Join-Path $gitRoot 'usr\bin\perl.exe'
-        if (Test-Path $candidate) { return $candidate }
-    }
-    foreach ($p in @(
-        "$env:ProgramFiles\Git\usr\bin\perl.exe",
-        "${env:ProgramFiles(x86)}\Git\usr\bin\perl.exe",
-        'C:\Strawberry\perl\bin\perl.exe',
-        'C:\Perl64\bin\perl.exe'
-    )) {
-        if ($p -and (Test-Path $p)) { return $p }
-    }
-    return $null
+# Locate perl from PowerShell (its PATH typically lacks Git Bash's perl). The
+# resolver is shared with claude-beacon.ps1 — single source of truth, dot-sourced
+# from scripts/_perl-path.ps1 — so the two launchers can't drift apart.
+$perlPathLib = "$env:USERPROFILE\.claude\ccpraxis\scripts\_perl-path.ps1"
+if (-not (Test-Path $perlPathLib)) {
+    Write-Host "ERROR: $perlPathLib not found. Re-run the ccpraxis installer (perl ~\.claude\ccpraxis\install.pl --confirm)." -ForegroundColor Red
+    exit 1
 }
+. $perlPathLib
 
 $perl = Get-PerlPath
 if (-not $perl) {
