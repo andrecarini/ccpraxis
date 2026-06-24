@@ -695,6 +695,7 @@ sub run {
                         _log($log, 'watchdog_block', { package => $pkg, reason => 'wedged past attempt cap', attempts => $att->{$pkg} });
                         kill_pid($pid->{$pkg});
                         _block_and_queue($bpdir, $runs, $log, $bp, $pkg, 'wedged past attempt cap (no log growth)', $now);
+                        $status->{$pkg} = 'blocked';   # so the launch section this tick won't re-launch it
                     }
                 } else {
                     next if $shutdown;          # don't relaunch during a graceful-shutdown-all
@@ -714,6 +715,7 @@ sub run {
                     } elsif ($v eq 'block') {
                         _log($log, 'watchdog_block', { package => $pkg, reason => 'serial failer past attempt cap', attempts => $att->{$pkg} });
                         _block_and_queue($bpdir, $runs, $log, $bp, $pkg, 'serial failer past attempt cap (dead coordinator)', $now);
+                        $status->{$pkg} = 'blocked';   # so the launch section this tick won't re-launch it
                     }
                 }
             }
