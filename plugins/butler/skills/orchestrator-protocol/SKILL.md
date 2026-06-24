@@ -51,6 +51,7 @@ This is **code** (`bp-orchestrator.pl`), unit-tested decision-by-decision — no
 - **Token-keeper (Decision #11).** Refreshes the OAuth token in the 1–2h-remaining band, atomic + cooperative write-back; crossing the 1h floor unrefreshed → graceful pause + a re-login decision.
 - **Fail-safe (Decision #12).** Telemetry loss / un-refreshable token / contract drift → graceful pause, never fly blind. Everything (every poll, refresh, pause, resume) is logged to `runs/orchestrator.log` (Decision #30) — never a secret value.
 - **Busy-lease (Decision #16).** Touches `/tmp/.butler-busy` while work is active or an auto-resume is pending; not while the only outstanding work is parked-for-human.
+- **Graceful-stop gate (Decision #10/#18).** In-flight workers can't be cancelled, so a pause/shutdown reaches *live* coordinators through a **`PreToolUse` gate** (`gate-shutdown.sh`, fires inside each coordinator): when a stop signal is set it denies new work (`Task`, worksite edits) but allows the ledger park-write, so the coordinator drains its current worker (≈ 1 tool-call) and stops cleanly. Three signals share the gate — `runs/.shutdown` (graceful-shutdown-all → terminal **park**, stays down), `runs/.paused` (usage/telemetry → **non-terminal resumable** stop, auto-resumed warm), `runs/<pkg>.force-stop` (per-package). The orchestrator never kills a coordinator for a pause/shutdown; it lets the gate funnel each to a clean stop and then winds down once none are running.
 
 ### Harvest (Decision #15)
 

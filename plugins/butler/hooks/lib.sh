@@ -41,3 +41,42 @@ match_any() {
 marker_path() { printf '%s\n' "$BP_DIR/runs/${BP_PACKAGE:-pkg}.active-worker"; }
 
 ledger_lock() { printf '%s\n' "$BP_DIR/runs/${BP_PACKAGE:-pkg}.ledger.lock"; }
+
+# --- graceful-stop gate (Decision #10/#18, package A4) -----------------------
+
+# bp_active_stop_signal — which fleet stop signal (if any) is in force for THIS
+# coordinator, by precedence (most directive first): a graceful-shutdown-all wins
+# over a per-package force-stop wins over a usage/telemetry pause. Echoes one of
+# "shutdown" | "forcestop" | "paused" | "" (empty = no stop in progress).
+# I/O helper (reads runs/); keep the decision in bp_gate_verdict pure.
+bp_active_stop_signal() {
+  local runs="$BP_DIR/runs"
+  if [ -f "$runs/.shutdown" ]; then printf '%s\n' shutdown; return 0; fi
+  if [ -f "$runs/${BP_PACKAGE:-pkg}.force-stop" ]; then printf '%s\n' forcestop; return 0; fi
+  if [ -f "$runs/.paused" ]; then printf '%s\n' paused; return 0; fi
+  printf '%s\n' ""
+}
+
+# bp_gate_verdict TOOL PATHCLASS SIGNAL_ACTIVE -> echoes "allow" | "deny"
+# Pure decision (no I/O — unit-tested as the allow-park/deny-work matrix). When a
+# fleet stop signal is active, deny NEW work so the coordinator funnels to a clean
+# park; always allow the ledger park-write and non-mutating tools (Decision #10).
+#   TOOL          : Task | Edit | Write | MultiEdit | NotebookEdit | Bash | <read tools>
+#   PATHCLASS     : for edit tools, "ledger" (BP_DIR/tmp park-write) | "worksite"
+#                   (project files = new work); "-"/"" for non-path tools
+#   SIGNAL_ACTIVE : 1 if any stop signal is in force, else 0
+bp_gate_verdict() {
+  local tool="$1" pclass="$2" sig="$3"
+  [ "$sig" = 1 ] || { printf '%s\n' allow; return 0; }
+  case "$tool" in
+    Task)
+      printf '%s\n' deny ;;                       # no new workers while stopping
+    Edit|Write|MultiEdit|NotebookEdit)
+      case "$pclass" in
+        ledger) printf '%s\n' allow ;;            # the park-write is always permitted
+        *)      printf '%s\n' deny ;;             # edits into the worksite are new work
+      esac ;;
+    *)
+      printf '%s\n' allow ;;                       # Bash / read tools: finalize & park
+  esac
+}

@@ -19,7 +19,7 @@ Your process carries (exported by the launcher — if these are missing you were
 | `BP_WRITE_SET` / `BP_TEST_PATHS` | your scope, colon-separated patterns |
 | `BP_PROJECT_ROOT` | project root |
 
-Hooks enforce: write-set containment, implementer/test-writer role separation, one write-capable worker in flight, git/deploy safety, and the stop gate. **A `BLOCKED:` message is protocol feedback. Comply, record it in the ledger, escalate via `status: blocked` if it reveals a scope problem. Never route around a hook.**
+Hooks enforce: write-set containment, implementer/test-writer role separation, one write-capable worker in flight, git/deploy safety, the stop gate, and the **graceful-stop gate** (see "Graceful stop" below). **A `BLOCKED:` message is protocol feedback. Comply, record it in the ledger, escalate via `status: blocked` if it reveals a scope problem. Never route around a hook.**
 
 ## Ledger discipline — medical chart, not diary
 
@@ -80,3 +80,13 @@ If the ledger shows prior progress when you start: this is a resumption. Verify 
 ## Terminal ritual
 
 Before stopping: re-run validation from disk one final time, complete `## Outputs` (every artifact + validation evidence), set status (`done`, or `blocked`/`parked` with Escalation + Next action filled), refresh `last_updated`, then stop. For `blocked`: state what is blocked, what was tried, and the single decision or re-scope needed — the orchestrator reads only that section and acts on it.
+
+## Graceful stop (orchestrator-initiated)
+
+The deterministic orchestrator can stop the fleet mid-package without killing you (in-flight workers can't be cancelled, so it propagates through a **`PreToolUse` graceful-stop gate** instead). When a stop is in force, your **next tool call after the in-flight worker returns is DENIED** — that one drain (≈ a single tool-call) is by design; let it finish, then comply. New work is denied (`Task` dispatch, edits into your write set); the **ledger park-write is always allowed** (writes under the blueprint dir / `/tmp`), as are `Bash` and read tools — so your only forward path is to record where you are and stop. The deny message tells you which of three stops is active; the ritual differs:
+
+- **Graceful-shutdown-all** (`runs/.shutdown`) — the whole run is winding down and **stays down** (no auto-resume). Record the drained result, set a concrete `## Next action`, set frontmatter **`status: parked`**, refresh `last_updated`, then stop. This is a normal terminal park.
+- **Usage / telemetry pause** (`runs/.paused`) — the orchestrator paused the fleet to protect the user's usage reserve (or to weather a telemetry gap) and **WILL auto-resume you**. Record the drained result and a concrete `## Next action`, but **LEAVE `status:` non-terminal** (`running`/`converging` — do **NOT** set `parked` or `done`, or the orchestrator won't relaunch you), refresh `last_updated`, then stop. You are relaunched **warm** after the window resets; treat the relaunch as a normal resumption (verify Outputs on disk, re-run the last validation, execute `## Next action`).
+- **Per-package force-stop** (`runs/<pkg>.force-stop`) — this package is being stopped individually. Record a concrete `## Next action`, then stop.
+
+In all three, `## Next action` must be concrete enough for a fresh coordinator (or your warm-resumed self) to pick up — the Stop gate enforces it. **Don't fight the gate**: keep trying denied work and you just burn the budget the pause exists to protect.

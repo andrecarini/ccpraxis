@@ -4,6 +4,7 @@
       {
         "matcher": "Edit|Write|MultiEdit|NotebookEdit",
         "hooks": [
+          { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/gate-shutdown.sh\"", "timeout": 15 },
           { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/guard-writes.sh\"", "timeout": 15 }
         ]
       },
@@ -16,6 +17,7 @@
       {
         "matcher": "Task",
         "hooks": [
+          { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/gate-shutdown.sh\"", "timeout": 15 },
           { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/track-dispatch.sh\"", "timeout": 15 }
         ]
       }
