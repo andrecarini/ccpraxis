@@ -9,11 +9,13 @@
 # reports which perl + modules are present (informs B2 dashboard + B5 keepawake).
 #
 # HOW TO RUN — in a REAL terminal, via PowerShell (NOT Git Bash), so the console
-# is a native Windows console exactly like the launcher's:
+# is a native Windows console exactly like the launcher's. NOTE: bare `perl` is
+# usually NOT on the PowerShell PATH (Git-for-Windows puts perl in usr\bin, which
+# isn't on PATH — only git's cmd dir is), so invoke perl by full path:
 #
-#     perl C:\Users\André\.claude\ccpraxis\plugins\sandbox\docs\b0-tui-probe.pl
+#     & "C:\Program Files\Git\usr\bin\perl.exe" "C:\Users\André\.claude\ccpraxis\plugins\sandbox\docs\b0-tui-probe.pl"
 #
-#   (or inside a Claude session:  ! perl <that path> )
+#   (if `perl` DOES resolve in your shell, `perl <that path>` is fine too)
 #
 # Try it BOTH in Windows Terminal AND in a plain conhost window if you can — the
 # results may differ. Keys: 'q' quit · 'c' cycle the color test · any other key

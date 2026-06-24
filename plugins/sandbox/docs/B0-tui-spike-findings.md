@@ -14,11 +14,16 @@
 
 In a **real terminal**, via **PowerShell** (NOT Git Bash — the console type is the
 whole point of the spike), ideally both in Windows Terminal and a plain conhost
-window:
+window. **Bare `perl` is not on the PowerShell PATH** on this host (Git-for-Windows
+keeps perl in `usr\bin`, which isn't on PATH — only `cmd` is), so invoke perl by
+full path:
 
 ```
-perl C:\Users\André\.claude\ccpraxis\plugins\sandbox\docs\b0-tui-probe.pl
+& "C:\Program Files\Git\usr\bin\perl.exe" "C:\Users\André\.claude\ccpraxis\plugins\sandbox\docs\b0-tui-probe.pl"
 ```
+
+(The `claude-sandbox.ps1` shim resolves perl this same way via `Get-PerlPath`, so
+the launcher itself is unaffected — this only bites ad-hoc `perl` from a prompt.)
 
 Keys while it runs: `q` quit · `c` cycle the color test · any other key echoes.
 It auto-exits after 60s. On exit it prints a `=== B0 PROBE SUMMARY ===` block —
