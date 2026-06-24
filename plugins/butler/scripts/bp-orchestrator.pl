@@ -405,9 +405,17 @@ sub queue_needs_you {
     }
     my $sid = substr(sprintf('%x%x', ($rec->{created_at} // time), $$), 0, 10);
     my $file = "$dir/$rec->{package}--$sid.json";
-    open my $fh, '>', $file or die "bp-orchestrator: queue needs-you: $!";
+    # Atomic publish (temp in the same dir + rename) so the A7 bp-wait-for-decision
+    # watcher — which polls this dir — never reads a half-written queue file. The
+    # target name is always fresh+unique (the dedupe above returns early when a
+    # package+kind entry already exists), so the rename never clobbers and is
+    # atomic on both POSIX and Windows. Matches the temp+rename discipline every
+    # other writer here uses (ledgers, registry, judge verdicts).
+    my $tmp = "$file.tmp.$$";
+    open my $fh, '>', $tmp or die "bp-orchestrator: queue needs-you: $!";
     print $fh JSON::PP->new->canonical->pretty->encode($rec);
     close $fh;
+    rename $tmp, $file or do { unlink $tmp; die "bp-orchestrator: queue needs-you rename: $!"; };
     return $file;
 }
 
