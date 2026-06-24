@@ -1,0 +1,1 @@
+bp-harvest-judge - verifies a finished package's outputs vs done-criteria from disk. Verdict-to-disk, never fixes.

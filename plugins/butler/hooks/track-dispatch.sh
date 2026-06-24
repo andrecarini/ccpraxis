@@ -10,6 +10,9 @@ HOOK_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=lib.sh
 source "$HOOK_DIR/lib.sh"
 bp_hook_gate
+# Coordinator-only: judges carry the env contract (for guard-writes scoping) but
+# never dispatch workers, so the one-write-capable-worker bookkeeping is not theirs.
+[ "${BP_ROLE:-coordinator}" = "coordinator" ] || exit 0
 # A fleet stop is in force: the graceful-stop gate (gate-shutdown.sh) denies new
 # Task dispatch, so do NOT record an active-worker marker for a worker that won't
 # launch — a phantom marker would survive into the warm resume and wedge the next

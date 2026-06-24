@@ -14,6 +14,11 @@ HOOK_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=lib.sh
 source "$HOOK_DIR/lib.sh"
 bp_hook_gate
+# Coordinator-only discipline. A judge (harvest/resolve) carries the same env
+# contract so guard-writes can scope its writes, but it is a one-shot task that
+# must end when done — holding it to coordinator stop-discipline (terminal ledger
+# status, Next-action, freshness) would wedge it. Skip any non-coordinator role.
+[ "${BP_ROLE:-coordinator}" = "coordinator" ] || exit 0
 
 FORCE="$BP_DIR/runs/${BP_PACKAGE:-pkg}.force-stop"
 if [ -f "$FORCE" ]; then rm -f "$FORCE"; exit 0; fi

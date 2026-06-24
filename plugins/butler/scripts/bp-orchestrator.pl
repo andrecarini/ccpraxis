@@ -54,6 +54,7 @@ require "$DIR/bp-contract.pl";
 require "$DIR/bp-log.pl";
 require "$DIR/bp-http.pl";
 require "$DIR/bp-token-keeper.pl";
+require "$DIR/bp-judge.pl";
 
 our $USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
 our $USER_AGENT = $ENV{BP_USER_AGENT} // 'claude-code/2.1.170';
@@ -410,6 +411,74 @@ sub queue_needs_you {
     return $file;
 }
 
+# --- registry per-package merge (A5). The orchestrator now writes registry fields
+# (resolve_attempts / corrective_attempts / harvest) that bp-launch.sh doesn't, so
+# it must serialize against bp-launch.sh's writes. Use the SAME lock file the shell
+# side uses (bp-lib.sh registry_merge: flock on runs/registry.lock) + same-dir temp
+# + rename so the merge is atomic on the shared registry.json.
+sub update_registry_pkg {
+    my ($runs, $pkg, $fields) = @_;
+    require File::Path; File::Path::make_path($runs) unless -d $runs;
+    my $reg = "$runs/registry.json";
+    open my $lk, '>', "$runs/registry.lock" or return 0;
+    unless (flock($lk, LOCK_EX)) { close $lk; return 0; }
+    my $data = _read_json($reg);
+    $data = { packages => {} } unless ref $data eq 'HASH' && ref $data->{packages} eq 'HASH';
+    $data->{packages}{$pkg} = { %{ $data->{packages}{$pkg} || {} }, %$fields };
+    my $tmp = "$reg.tmp.$$";
+    my $ok = 0;
+    if (open my $w, '>', $tmp) {
+        print $w JSON::PP->new->canonical->pretty->encode($data);
+        close $w;
+        # Honest result: a failed rename means the update was LOST (a cap counter
+        # increment, a harvest=pass) — return 0 so the caller can log/react rather
+        # than silently bypassing resolve_cap / corrective_cap on the next tick (H1).
+        if (rename $tmp, $reg) { $ok = 1; } else { unlink $tmp; }
+    }
+    flock($lk, LOCK_UN); close $lk;
+    return $ok;
+}
+
+# --- judge verdicts (A5): each judge is a detached process that writes a verdict
+# JSON to runs/<kind>/<pkg>.verdict.json. The orchestrator spawns then polls — it
+# never blocks its watch tick on a multi-minute Claude call (kind = harvest|resolve).
+sub judge_verdict_path { my ($runs, $kind, $pkg) = @_; "$runs/$kind/$pkg.verdict.json" }
+sub read_judge_verdict {
+    my ($runs, $kind, $pkg) = @_;
+    my $f = judge_verdict_path($runs, $kind, $pkg);
+    return undef unless -e $f;
+    # File present but unreadable/!JSON -> a sentinel hash so the normalizers
+    # classify it fail-closed (harvest->error, resolve->park) rather than re-polling.
+    return _read_json($f) // { _malformed => 1 };
+}
+sub clear_judge_verdict { my ($runs, $kind, $pkg) = @_; unlink judge_verdict_path($runs, $kind, $pkg); }
+
+# judge IN-FLIGHT state is kept ON DISK (runs/<kind>/<pkg>.inflight, content = the
+# epoch the judge was fired) rather than in orchestrator memory, so it survives an
+# orchestrator restart (a judge fired before a crash isn't double-spawned and its
+# timeout is still honored) and is observable/testable. judge_inflight returns the
+# stored start-epoch (truthy) or undef.
+sub judge_inflight_path { my ($runs, $kind, $pkg) = @_; "$runs/$kind/$pkg.inflight" }
+sub judge_inflight {
+    my ($runs, $kind, $pkg) = @_;
+    my $r = _read_file(judge_inflight_path($runs, $kind, $pkg));
+    return undef unless defined $r;
+    return ($r =~ /^(\d+)/) ? $1 : 0;     # 0 = inflight but no/garbled epoch (still truthy-via-defined)
+}
+sub mark_judge_inflight {
+    my ($runs, $kind, $pkg, $now) = @_;
+    require File::Path; File::Path::make_path("$runs/$kind") unless -d "$runs/$kind";
+    # Atomic temp+rename so a write that fails after truncation can't leave a
+    # zero-length marker (which would read back as epoch 0 -> instant false timeout, C1).
+    my $f = judge_inflight_path($runs, $kind, $pkg);
+    my $tmp = "$f.tmp.$$";
+    open my $fh, '>', $tmp or return 0;
+    print $fh ($now // time); close $fh;
+    rename $tmp, $f or do { unlink $tmp; return 0; };
+    return 1;
+}
+sub clear_judge_inflight { my ($runs, $kind, $pkg) = @_; unlink judge_inflight_path($runs, $kind, $pkg); }
+
 # --- runs/.orchestrator marker (PID + flock; held for the run's lifetime).
 sub acquire_marker {
     my ($path) = @_;
@@ -506,6 +575,11 @@ sub _tunables {
         tele_retry => $ENV{BP_TELEMETRY_RETRIES}  // 3,
         usage_fail => $ENV{BP_USAGE_RETRY_SECS}   // 60,
         busy_path  => $ENV{BP_BUSY_PATH}          // '/tmp/.butler-busy',
+        harvest    => $ENV{BP_HARVEST_MODE}       // 'audit',  # A5 #15: audit | gate
+        resolve_cap=> $ENV{BP_RESOLVE_CAP}        // 1,        # A5 #13: resolve-judge tries/pkg
+        corr_cap   => $ENV{BP_CORRECTIVE_CAP}     // 1,        # A5 Q2: corrective relaunches/pkg
+        judge_to   => $ENV{BP_JUDGE_TIMEOUT_SECS} // 1800,     # A5: crashed/hung-judge fail-safe
+        judge_spawn_cap => $ENV{BP_JUDGE_SPAWN_CAP} // 3,      # A5 H2: park after N harvest-spawn failures
     };
 }
 
@@ -548,6 +622,19 @@ sub run {
         return $rc == 0 ? 0 : ($rc >> 8 || 1);
     };
 
+    # judge seams (A5): spawn a detached judge (default = bp-judge.sh, which runs a
+    # scoped `claude -p` that writes the verdict file); read a completed verdict.
+    # Tests inject a recorder for spawn + seed verdict files for read.
+    my $spawn_judge = $opt->{spawn_judge} || sub {
+        my ($a) = @_;       # { kind, pkg }
+        require File::Path; File::Path::make_path("$runs/$a->{kind}");
+        my @cmd = ('bash', "$DIR/bp-judge.sh", $a->{kind}, $bp, $a->{pkg},
+                   judge_verdict_path($runs, $a->{kind}, $a->{pkg}));
+        my $rc = system(@cmd);
+        return $rc == 0 ? 0 : ($rc >> 8 || 1);
+    };
+    my $read_verdict = $opt->{read_verdict} || sub { my ($k, $p) = @_; read_judge_verdict($runs, $k, $p) };
+
     my $marker_fh = acquire_marker("$runs/.orchestrator");
     unless ($marker_fh) {
         my $other = read_marker_pid("$runs/.orchestrator");
@@ -561,6 +648,8 @@ sub run {
     local $SIG{INT}  = sub { $STOP = 1 };
 
     my %seen;            # pkg => {size,mtime} prior jsonl observation
+    # judge in-flight + start-epoch state lives on disk (judge_inflight*), so nothing
+    # to declare here — it survives an orchestrator restart (A5).
     my (@s5, @s7);       # usage utilization samples [[epoch,pct],...]
     my $next_usage  = 0; # poll immediately at launch (Decision #8: one probe)
     my $next_keeper = 0;
@@ -663,10 +752,139 @@ sub run {
                 }
             }
 
+            # ---- JUDGES (A5): consume completed verdicts, then fire new ones ----
+            my $mode = BpJudge::harvest_mode($t->{harvest});
+            my $reg  = read_registry($runs);
+
+            # (a) RESOLVE verdicts — a stuck package's resolve-judge has returned.
+            for my $pkg (sort keys %$meta) {
+                my $started = judge_inflight($runs, 'resolve', $pkg);
+                next unless defined $started;
+                my $v = $read_verdict->('resolve', $pkg);
+                if (!defined $v) {
+                    # Still running — UNLESS it has blown the timeout (crashed/hung judge):
+                    # then fail-safe to a synthetic verdict so the package can't wedge forever.
+                    # $started==0 means a garbled marker (lost epoch) — let it run to a real
+                    # verdict rather than false-timeout it on the very next tick (C1).
+                    next unless $started && ($now - $started) > $t->{judge_to};
+                    _log($log, 'judge_timeout', { kind => 'resolve', package => $pkg });
+                    $v = { _timeout => 1 };               # normalize_resolve -> park
+                }
+                # Clear markers BEFORE acting (deliberate; rejected the clear-after refactor):
+                # a crash in the gap degrades safely — resolve_attempts was already counted at
+                # fire, so on restart the package parks rather than relaunching atop a still-
+                # alive detached coordinator. Clearing after would risk that double-launch.
+                clear_judge_inflight($runs, 'resolve', $pkg);
+                clear_judge_verdict($runs, 'resolve', $pkg);
+                my $r = BpJudge::normalize_resolve($v);
+                if ($r->{action} eq 'relaunch') {
+                    # The judge applied an intent-clear fix on disk: give the package a
+                    # FRESH coordinator-retry budget and let the launch section relaunch
+                    # it (reset to pending + attempt 0; the corrected ledger is read cold).
+                    _log($log, 'resolve_relaunch', { package => $pkg, reason => $r->{reason}, mutated => $r->{mutated_files} });
+                    _set_ledger_status($bpdir, $pkg, 'pending');
+                    update_registry_pkg($runs, $pkg, { attempt => 0, status => 'pending' });
+                    $status->{$pkg} = 'pending'; $att->{$pkg} = 0; $pid->{$pkg} = undef;
+                } else {
+                    my $q = ($r->{needs_you} && $r->{needs_you}{question})
+                          ? $r->{needs_you}{question}
+                          : "Package '$pkg' is stuck and the resolve-judge could not fix it: $r->{reason}";
+                    _log($log, 'resolve_park', { package => $pkg, reason => $r->{reason} });
+                    _block_and_queue($bpdir, $runs, $log, $bp, $pkg, $r->{reason}, $now, $q,
+                                     ($r->{needs_you} ? $r->{needs_you}{kind} : undef));
+                    $status->{$pkg} = 'blocked';
+                }
+            }
+
+            # (b) HARVEST verdicts — a finished package's audit/gate has returned.
+            for my $pkg (sort keys %$meta) {
+                my $started = judge_inflight($runs, 'harvest', $pkg);
+                next unless defined $started;
+                my $v = $read_verdict->('harvest', $pkg);
+                if (!defined $v) {
+                    next unless $started && ($now - $started) > $t->{judge_to};   # see C1 note above
+                    _log($log, 'judge_timeout', { kind => 'harvest', package => $pkg });
+                    $v = { _timeout => 1 };               # normalize_harvest -> error -> escalate
+                }
+                # Clear before acting — harvest degrades even more safely (a lost verdict just
+                # re-audits next tick, since status stays 'done' + harvest stays '').
+                clear_judge_inflight($runs, 'harvest', $pkg);
+                clear_judge_verdict($runs, 'harvest', $pkg);
+                my $hv = BpJudge::normalize_harvest($v);
+                if ($hv eq 'pass') {
+                    update_registry_pkg($runs, $pkg, { harvest => 'pass' });
+                    $reg->{$pkg}{harvest} = 'pass';
+                    _log($log, 'harvest_pass', { package => $pkg, mode => $mode });
+                } else {
+                    my $corr = $reg->{$pkg}{corrective_attempts} // 0;
+                    my $ao = BpJudge::audit_outcome({ verdict => $hv, corrective_attempts => $corr, corrective_cap => $t->{corr_cap} });
+                    if ($ao eq 'reopen') {
+                        # Failed audit, budget remains: reopen NON-terminal with the audit's
+                        # findings as corrective context (Q2). Dependents that already ran off
+                        # the bad output are FLAGGED for re-verification, never auto-killed.
+                        _log($log, 'harvest_reopen', { package => $pkg, verdict => $hv, corrective_attempts => $corr });
+                        _apply_harvest_findings($bpdir, $pkg, $v);
+                        _set_ledger_status($bpdir, $pkg, 'pending');
+                        update_registry_pkg($runs, $pkg, { attempt => 0, status => 'pending', harvest => '', corrective_attempts => $corr + 1 });
+                        $status->{$pkg} = 'pending'; $att->{$pkg} = 0; $pid->{$pkg} = undef;
+                        $reg->{$pkg}{harvest} = '';   # mirror the disk clear in-memory (M2)
+                        for my $dep (sort keys %$meta) {
+                            next unless grep { $_ eq $pkg } @{ $meta->{$dep}{deps} || [] };
+                            next unless ($reg->{$dep}{harvest} // '') eq 'pass';
+                            update_registry_pkg($runs, $dep, { harvest => '' });
+                            $reg->{$dep}{harvest} = '';
+                            _log($log, 'harvest_flag_dependent', { package => $dep, reason => "depends on reopened $pkg" });
+                        }
+                    } else {  # park: failed twice -> alarm, keep independent work running.
+                        _log($log, 'harvest_park', { package => $pkg, verdict => $hv, corrective_attempts => $corr });
+                        _block_and_queue($bpdir, $runs, $log, $bp, $pkg,
+                            "failed harvest audit ($hv) after a corrective cycle", $now,
+                            "Package '$pkg' failed its harvest audit after a corrective relaunch — its outputs don't meet the done-criteria. Inspect and decide: fix, re-scope, or accept.",
+                            'harvest-failure');
+                        $status->{$pkg} = 'blocked';
+                    }
+                }
+            }
+
+            # (c) FIRE a harvest judge for each newly-finished package (once each).
+            unless ($shutdown) {
+                for my $pkg (sort keys %$meta) {
+                    my $st   = $status->{$pkg} // 'pending';
+                    my $h    = $reg->{$pkg}{harvest};
+                    my $infl = defined(judge_inflight($runs, 'harvest', $pkg)) ? 1 : 0;
+                    my $fire = ($mode eq 'gate')
+                        ? BpJudge::want_harvest_gate({  mode => $mode, status => $st, harvest => $h, inflight => $infl })
+                        : BpJudge::want_harvest_audit({ mode => $mode, status => $st, harvest => $h, inflight => $infl });
+                    next unless $fire;
+                    my $rc = $spawn_judge->({ kind => 'harvest', pkg => $pkg });
+                    if (defined $rc && $rc == 0) {
+                        mark_judge_inflight($runs, 'harvest', $pkg, $now);
+                        update_registry_pkg($runs, $pkg, { harvest_spawn_fail => 0 }) if ($reg->{$pkg}{harvest_spawn_fail} // 0);
+                        _log($log, 'harvest_fire', { package => $pkg, mode => $mode });
+                    } else {
+                        # Bound the retry: a persistently broken spawn (bad bp-judge.sh, no
+                        # claude) must NOT re-fire every tick forever (gate mode would block
+                        # dependents indefinitely). After a cap, park + alarm instead (H2).
+                        my $sf = ($reg->{$pkg}{harvest_spawn_fail} // 0) + 1;
+                        update_registry_pkg($runs, $pkg, { harvest_spawn_fail => $sf });
+                        $reg->{$pkg}{harvest_spawn_fail} = $sf;
+                        _log($log, 'judge_spawn_failed', { kind => 'harvest', package => $pkg, rc => $rc, fails => $sf });
+                        if ($sf >= $t->{judge_spawn_cap}) {
+                            _block_and_queue($bpdir, $runs, $log, $bp, $pkg,
+                                "harvest judge could not be spawned ($sf attempts)", $now,
+                                "Package '$pkg' finished but its harvest judge could not be spawned after $sf tries — check bp-judge.sh / claude in the sandbox, then re-verify and resume.",
+                                'harvest-spawn-failure');
+                            $status->{$pkg} = 'blocked';
+                        }
+                    }
+                }
+            }
+
             # ---- WATCH + WATCHDOG (assess each non-terminal launched package) ----
             my @live;     # packages occupying a coordinator slot now
             for my $pkg (sort keys %$meta) {
                 next if _is_terminal($status->{$pkg});
+                next if defined judge_inflight($runs, 'resolve', $pkg);   # a resolve-judge is editing its ledger; hands off (A5)
                 # A never-launched package (status pending, attempt 0, no pid) is the
                 # LAUNCH section's job, not the watchdog's — skip it here so it isn't
                 # mistaken for a dead coordinator. A crashed package whose ledger still
@@ -694,8 +912,9 @@ sub run {
                     } elsif ($v eq 'block') {
                         _log($log, 'watchdog_block', { package => $pkg, reason => 'wedged past attempt cap', attempts => $att->{$pkg} });
                         kill_pid($pid->{$pkg});
-                        _block_and_queue($bpdir, $runs, $log, $bp, $pkg, 'wedged past attempt cap (no log growth)', $now);
-                        $status->{$pkg} = 'blocked';   # so the launch section this tick won't re-launch it
+                        $status->{$pkg} = _escalate_stuck({ bpdir=>$bpdir, runs=>$runs, log=>$log, bp=>$bp, pkg=>$pkg,
+                            why=>'wedged past attempt cap (no log growth)', now=>$now, reg=>$reg, t=>$t,
+                            spawn_judge=>$spawn_judge, shutdown=>$shutdown });
                     }
                 } else {
                     next if $shutdown;          # don't relaunch during a graceful-shutdown-all
@@ -714,8 +933,9 @@ sub run {
                         }
                     } elsif ($v eq 'block') {
                         _log($log, 'watchdog_block', { package => $pkg, reason => 'serial failer past attempt cap', attempts => $att->{$pkg} });
-                        _block_and_queue($bpdir, $runs, $log, $bp, $pkg, 'serial failer past attempt cap (dead coordinator)', $now);
-                        $status->{$pkg} = 'blocked';   # so the launch section this tick won't re-launch it
+                        $status->{$pkg} = _escalate_stuck({ bpdir=>$bpdir, runs=>$runs, log=>$log, bp=>$bp, pkg=>$pkg,
+                            why=>'serial failer past attempt cap (dead coordinator)', now=>$now, reg=>$reg, t=>$t,
+                            spawn_judge=>$spawn_judge, shutdown=>$shutdown });
                     }
                 }
             }
@@ -724,7 +944,15 @@ sub run {
             unless ($shutdown) {
                 my $slots = cap_slots(scalar @live, $t->{max_par});
                 if ($slots > 0) {
-                    my @ready = ready_packages($meta, $status, \@live);
+                    # Harvest gate (#15): in gate mode a 'done' package whose harvest
+                    # verdict isn't 'pass' is demoted to 'harvesting' so it does NOT yet
+                    # satisfy its dependents (audit mode is an identity passthrough).
+                    my %harvest = map { $_ => ($reg->{$_}{harvest}) } keys %$meta;
+                    my $launch_status = BpJudge::effective_status($mode, $status, \%harvest);
+                    # Hold any package whose resolve-judge is mid-flight out of the
+                    # launchable set (its ledger is being edited — don't race it).
+                    $launch_status->{$_} = 'resolving' for grep { defined judge_inflight($runs, 'resolve', $_) } keys %$launch_status;
+                    my @ready = ready_packages($meta, $launch_status, \@live);
                     my @batch = pick_launch_batch(\@ready, $meta, [ map { $meta->{$_}{write_set} } @live ], $slots);
                     for my $pkg (@batch) {
                         my $rc = $launch->({ pkg => $pkg, args => [], kind => 'fresh' });
@@ -740,7 +968,13 @@ sub run {
 
             # ---- BUSY-LEASE + IDLE-EXIT ----
             my $any_running = (scalar @live) > 0 ? 1 : 0;
-            my $outstanding = has_progressable_work($meta, $status);
+            # A detached judge in flight is active work the run must wait for (C2): in
+            # AUDIT mode a finished package is terminal, so without this the loop could
+            # idle-exit while a harvest audit is still running and silently drop its
+            # verdict (including a fail that should have reopened the package).
+            my $judges_inflight = (grep { defined judge_inflight($runs, 'harvest', $_)
+                                       || defined judge_inflight($runs, 'resolve', $_) } keys %$meta) ? 1 : 0;
+            my $outstanding = has_progressable_work($meta, $status) || $judges_inflight;
             touch_busy($t->{busy_path}) if should_touch_busy({
                 any_running => $any_running, outstanding => $outstanding,
                 resume_pending => $resume_pending, shutdown => $shutdown,
@@ -783,15 +1017,68 @@ sub _enter_pause_manual {
     _log($log, 'pause', { reason => $reason, manual => 1, package => ($decision->{package} // '_fleet'), kind => ($decision->{kind} // '') });
 }
 
-# mark a package blocked in its ledger + queue the decision (loop-guard).
+# mark a package blocked in its ledger + queue the decision (loop-guard). An
+# optional $question/$kind override the defaults (A5: resolve-park surfaces the
+# judge's own needs_you question; harvest-park raises a harvest-failure alarm).
 sub _block_and_queue {
-    my ($bpdir, $runs, $log, $bp, $pkg, $why, $now) = @_;
+    my ($bpdir, $runs, $log, $bp, $pkg, $why, $now, $question, $kind) = @_;
     _set_ledger_status($bpdir, $pkg, 'blocked');
+    # Also persist to the registry (H3): _load_state prefers the ledger, but if the
+    # ledger write above failed, the registry is the fallback — without this a parked
+    # package could re-enter the watchdog and re-escalate after an orchestrator restart.
+    update_registry_pkg($runs, $pkg, { status => 'blocked' });
     queue_needs_you($runs, {
-        package => $pkg, blueprint => $bp, kind => 'stuck-package',
-        question => "Package '$pkg' is blocked: $why. Re-scope, fix, or drop it?",
+        package => $pkg, blueprint => $bp, kind => ($kind // 'stuck-package'),
+        question => ($question // "Package '$pkg' is blocked: $why. Re-scope, fix, or drop it?"),
         context => $why, created_at => ($now // time),
     });
+}
+
+# escalation ladder gate (A5 #13): a package is stuck past the coordinator's own
+# retries. Spend a resolve-judge if the per-package budget remains (and we aren't
+# shutting down), else park the branch. Returns the resulting status string the
+# caller records ('resolving' = judge in flight; 'blocked' = parked).
+sub _escalate_stuck {
+    my ($a) = @_;
+    my ($runs, $log, $pkg) = @{$a}{qw(runs log pkg)};
+    my $resolve_att = $a->{reg}{$pkg}{resolve_attempts} // 0;
+    my $verdict = BpJudge::escalation_verdict({ resolve_attempts => $resolve_att, resolve_cap => $a->{t}{resolve_cap} });
+    if ($verdict eq 'resolve' && !$a->{shutdown}) {
+        my $rc = $a->{spawn_judge}->({ kind => 'resolve', pkg => $pkg });
+        if (defined $rc && $rc == 0) {
+            mark_judge_inflight($runs, 'resolve', $pkg, $a->{now});
+            update_registry_pkg($runs, $pkg, { resolve_attempts => $resolve_att + 1 });
+            _log($log, 'resolve_fire', { package => $pkg, why => $a->{why}, resolve_attempts => $resolve_att + 1 });
+            return 'resolving';
+        }
+        _log($log, 'judge_spawn_failed', { kind => 'resolve', package => $pkg, rc => $rc });
+        # couldn't even spawn the judge -> fall through and park.
+    }
+    _block_and_queue($a->{bpdir}, $runs, $log, $a->{bp}, $pkg, $a->{why}, $a->{now});
+    return 'blocked';
+}
+
+# write the harvest audit's findings into the ledger (A5 Q2) so the reopened
+# coordinator reads them on its corrective relaunch. Idempotent: replaces any prior
+# findings block. Best-effort (atomic temp + rename).
+sub _apply_harvest_findings {
+    my ($bpdir, $pkg, $verdict) = @_;
+    my $f = "$bpdir/packages/$pkg.md";
+    my $txt = _read_file($f);
+    return unless defined $txt;
+    my @fails  = (ref $verdict eq 'HASH' && ref $verdict->{failures} eq 'ARRAY') ? @{ $verdict->{failures} } : ();
+    my $reason = (ref $verdict eq 'HASH' ? $verdict->{reason} : undef) // 'harvest audit failed';
+    $txt =~ s/\n*## Harvest findings \(re-verify\).*?(?=\n## |\z)//s;   # drop any prior block
+    my $sec = "\n\n## Harvest findings (re-verify)\n\n"
+            . "The independent harvest audit FAILED this package after it was reported done: $reason\n"
+            . "Address each finding, then re-run your own tests/review before reporting done again:\n\n"
+            . (@fails ? join("\n", map { "- $_" } @fails)
+                      : "- (no itemized failures recorded; re-verify every done-criterion against disk)")
+            . "\n";
+    $txt .= $sec;
+    open my $w, '>:raw', "$f.tmp.$$" or return;
+    print $w $txt; close $w;
+    rename "$f.tmp.$$", $f;
 }
 
 # rewrite a ledger's frontmatter status: line (+ last_updated). Best-effort.
