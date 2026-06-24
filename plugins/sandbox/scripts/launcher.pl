@@ -45,6 +45,7 @@ BEGIN {
     unshift @INC, $dir;
 }
 use MountSpec qw(winify_path v_to_mount convert_v_to_mount);
+use LaunchLog ();   # B1: durable per-launch diagnostic log (next to us in scripts/)
 use File::Path qw(make_path);
 use File::Spec;
 use Digest::MD5 qw();
@@ -215,6 +216,14 @@ my $CLAUDE_MD_HASH_FILE       = "$LAUNCHER_DIR/.container-CLAUDE-md-hash";
 my $SETTINGS_HASH_FILE        = "$LAUNCHER_DIR/.container-settings-json-hash";
 my $LOCK_DIR                  = "$LAUNCHER_DIR/.launcher.lock";
 
+# B1: per-launch diagnostic log. Opened just after the lock is acquired (below);
+# declared here so the signal handlers / END block can close it. log_ev() is a
+# no-op until the log is open and never throws — instrumentation must not be able
+# to take down the launcher it instruments.
+my $LAUNCH_LOG;
+my $LAUNCH_ID = strftime("%Y%m%dT%H%M%SZ", gmtime()) . "-$$";
+sub log_ev { LaunchLog::event($LAUNCH_LOG, @_) }
+
 # =====================================================================
 # Bootstrap path (no .claude-data yet)
 # =====================================================================
@@ -334,11 +343,18 @@ sub _rmtree {
 
 # Signal handlers + END block — exec at the end skips these, so every
 # exec path calls release_lock explicitly before exec.
-$SIG{INT}  = sub { release_lock(); reset_terminal(); exit 130 };
-$SIG{TERM} = sub { release_lock(); reset_terminal(); exit 143 };
-END { release_lock() }
+$SIG{INT}  = sub { log_ev('signal', { sig => 'INT' });  LaunchLog::close_log($LAUNCH_LOG); release_lock(); reset_terminal(); exit 130 };
+$SIG{TERM} = sub { log_ev('signal', { sig => 'TERM' }); LaunchLog::close_log($LAUNCH_LOG); release_lock(); reset_terminal(); exit 143 };
+END { LaunchLog::close_log($LAUNCH_LOG); release_lock() }
 
 acquire_lock();
+
+# B1: open the per-launch log now that the lock is held. Best-effort — a failure
+# leaves $LAUNCH_LOG undef and every log_ev() becomes a no-op (the launch still
+# runs; it just isn't logged). Manager and connector invocations are separate
+# processes, each with its own uniquely-named log file (no double-open).
+$LAUNCH_LOG = LaunchLog::open_log("$PROJECT_PATH/.claude-data/sandbox-logs/launch-$LAUNCH_ID.log");
+log_ev('launch_start', { project => $PROJECT_PATH, project_name => $PROJECT_NAME, podman => $PODMAN, pid => $$ });
 
 # =====================================================================
 # Get host Claude Code version
@@ -372,7 +388,16 @@ sub md5_of_string {
 }
 
 sub containerfile_hash {
-    return md5_of_file("$CONTAINER_CONFIG/Containerfile");
+    # Hash the Containerfile AND every file it COPYs into the image, so editing a
+    # build input (e.g. the entrypoint script heartbeat.sh) triggers a rebuild on
+    # the next launch. Hashing only the Containerfile would let a changed
+    # heartbeat.sh ship stale in a cached image.
+    my $parts = md5_of_file("$CONTAINER_CONFIG/Containerfile");
+    for my $f ('heartbeat.sh') {
+        my $p = "$CONTAINER_CONFIG/$f";
+        $parts .= ':' . (-f $p ? md5_of_file($p) : 'absent');
+    }
+    return md5_of_string($parts);
 }
 
 sub launcher_hash {
@@ -419,17 +444,21 @@ sub launcher_hash {
 
 sub build_image {
     print "Building claude-sandbox image with Claude Code v${HOST_VERSION}...\n";
+    log_ev('image_build_start', { version => $HOST_VERSION });
     my $rc = system($PODMAN, 'build',
         '--build-arg', "CLAUDE_VERSION=${HOST_VERSION}",
         '-t', "claude-sandbox:${HOST_VERSION}",
         '-t', 'claude-sandbox:latest',
         $CONTAINER_CONFIG);
     if ($rc != 0) {
+        log_ev('image_build_failed', { exit => $rc >> 8 });
         print STDERR "ERROR: podman build failed (exit @{[$rc >> 8]}).\n";
+        LaunchLog::close_log($LAUNCH_LOG);
         release_lock();
         reset_terminal();
         exit 1;
     }
+    log_ev('image_build_ok', { version => $HOST_VERSION });
     _write_file("$LAUNCHER_DIR/containerfile-hash", containerfile_hash());
 }
 
@@ -1484,6 +1513,7 @@ if (! _container_exists($CONTAINER_NAME)) {
     @podman_args = convert_v_to_mount(@podman_args);
 
     my $rc = system(@podman_args);
+    log_ev('container_create', { exit => $rc >> 8, container => $CONTAINER_NAME });
     if ($rc != 0) {
         print STDERR "ERROR: podman create failed (exit @{[$rc >> 8]}) — not committing baseline.\n";
         release_lock();
@@ -1641,7 +1671,8 @@ if ($CONTAINER_WAS_CREATED && -f $BACKPACK_HOST_FILE) {
 # won the create branch — no other writer can be inside the same
 # container's apt/dpkg.
 release_lock();
-system($PODMAN, 'start', $CONTAINER_NAME);
+my $start_rc = system($PODMAN, 'start', $CONTAINER_NAME);
+log_ev('container_start', { exit => $start_rc >> 8, container => $CONTAINER_NAME });
 
 # Land the first sentinel touch IMMEDIATELY after `podman start`, before
 # anything else (perl/helper probes, apt-get update, backpack install)
@@ -1750,6 +1781,8 @@ print "the sandbox (~5 minutes after the last heartbeat).\n";
 print "Press Ctrl+C to stop now.\n";
 print "\n";
 
+log_ev('manager_ready', { container => $CONTAINER_NAME });
+
 my $BEAT_INTERVAL = 120;  # Container's HB is 300 (5 min); 120s gives 2.5x margin.
 while (1) {
     sleep $BEAT_INTERVAL;
@@ -1763,6 +1796,7 @@ while (1) {
         chomp $state if defined $state;
         $state //= '';
         if ($state ne 'running') {
+            log_ev('container_gone', { state => $state, container => $CONTAINER_NAME });
             print STDERR "\n";
             print STDERR "Container $CONTAINER_NAME is no longer running (state: '$state').\n";
             print STDERR "Manager exiting.\n";
@@ -1770,9 +1804,11 @@ while (1) {
             exit 0;
         }
         # Container IS still running but exec failed — log and keep trying.
+        log_ev('heartbeat_fail', { exit => $rc >> 8, state => $state });
         printf STDERR "[%s] WARNING: heartbeat refresh failed (exit %d); will retry next tick\n",
             strftime("%H:%M:%S", localtime), ($rc >> 8);
         next;
     }
+    log_ev('heartbeat', {});
     printf "[%s] heartbeat\n", strftime("%H:%M:%S", localtime);
 }

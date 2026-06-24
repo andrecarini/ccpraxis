@@ -50,32 +50,26 @@ RUN git config --global core.autocrlf input \
     && git config --global init.defaultBranch main
 
 WORKDIR /project
-# Entrypoint:
-#   1. Spawn socat bridges for ports 9000-9009 ONLY. Each forwards
-#      0.0.0.0:N -> 127.0.0.1:N so the OAuth callback redirect from the
-#      host browser (Podman has already port-forwarded the host's
-#      9000-9009 to the container) reaches Claude Code's loopback-bound
-#      listener. socat starts even if nothing is yet listening on
-#      127.0.0.1:N -- early connections drop until Claude Code's listener
-#      appears, then forward cleanly. Backgrounded; children get SIGHUP
-#      and die when the bash below exits.
-#      NOTE: the launcher ALSO publishes 9010-9019, but those are
-#      deliberately left un-bridged here -- a server binds 0.0.0.0:N on
-#      them directly with no socat to collide with. Do not extend this
-#      loop to cover them.
-#   2. Heartbeat-only keep-alive loop. Container survives while
-#      /tmp/.launcher-alive has been mtime-touched within the last
-#      HB=300 seconds (5 min staleness window). The manager-mode
-#      `claude-sandbox` launcher running on the host refreshes the
-#      sentinel every 2 minutes via `podman/docker exec ... touch ...`.
-#      If the manager terminal closes or the laptop goes to sleep without
-#      refresh, the sentinel goes stale and the container self-reaps
-#      within ~5 min — no orphan containers. A 10s startup grace gives
-#      the manager time to land the FIRST touch immediately after start.
-#
-#      Container does NOT watch claude itself — claude is launched in a
-#      separate connector-mode terminal via a second `claude-sandbox`
-#      invocation, and multiple concurrent connectors (or none at all)
-#      are fine. The container's life is bound to the manager's
-#      heartbeat, not to any claude process.
-ENTRYPOINT ["/bin/bash", "-c", "for p in {9000..9009}; do socat TCP-LISTEN:$p,fork,reuseaddr TCP:127.0.0.1:$p 2>/dev/null & done; START=$SECONDS; ALIVE=/tmp/.launcher-alive; HB=300; GRACE=10; while true; do EL=$((SECONDS-START)); if [ $EL -lt $GRACE ]; then sleep 1; continue; fi; if [ -f $ALIVE ]; then LAST=$(stat -c %Y $ALIVE 2>/dev/null || echo 0); NOW=$(date +%s); if [ $((NOW-LAST)) -lt $HB ]; then sleep 10; continue; fi; fi; break; done"]
+# Entrypoint: container/heartbeat.sh (extracted from the former inline one-liner
+# so its reap decision is unit-testable — plugins/sandbox/tests/t/08-reap-decision.t).
+#   1. Spawn socat bridges for ports 9000-9009 ONLY (0.0.0.0:N -> 127.0.0.1:N)
+#      so the host-browser OAuth callback redirect reaches Claude Code's
+#      loopback-bound listener. The launcher ALSO publishes 9010-9019, but those
+#      are deliberately left un-bridged (a server binds 0.0.0.0:N there directly,
+#      no socat to collide with) — heartbeat.sh does NOT bridge them.
+#   2. Heartbeat keep-alive. Container survives while /tmp/.launcher-alive was
+#      mtime-touched within HB=300s (the host manager `claude-sandbox` refreshes
+#      it every 2 min). A 10s startup grace lets the manager land the first touch.
+#      If the sentinel goes stale (manager terminal closed / laptop asleep):
+#        - no live butler run  -> self-reap within ~5 min (no orphan containers),
+#          exactly as before;
+#        - a live run (/tmp/.butler-busy fresh OR a live coordinator) -> signal a
+#          graceful fleet shutdown (touch each blueprint's runs/.shutdown, the A4
+#          gate) and wait GRACE_SHUTDOWN=300s for coordinators to park cleanly,
+#          reaping as soon as the run clears or at the grace deadline (B6).
+#      The container does NOT watch claude itself — its life is bound to the
+#      manager heartbeat, not to any claude process. Multiple (or zero) connector
+#      sessions are fine.
+COPY heartbeat.sh /usr/local/bin/sandbox-heartbeat
+RUN chmod +x /usr/local/bin/sandbox-heartbeat
+ENTRYPOINT ["/usr/local/bin/sandbox-heartbeat"]
