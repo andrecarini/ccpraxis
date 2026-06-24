@@ -363,7 +363,7 @@ sub cmd_detect_trackable {
 
 # ── ensure-tracked ──────────────────────────────────────────────────
 # Idempotently add a relative path to a registered project's LOCAL tracked_paths
-# (.claude/backup-metadata.json), which is what sync-project walks. Local-only by
+# (.ccpraxis-local-data/backup-metadata.json), which is what sync-project walks. Local-only by
 # design: no vault git writes, so it can't cause vault drift and needs no network.
 # The path's files get copied into the vault on the next /backup. Use case: a new
 # default-tracked path (e.g. .ccpraxis-local-data/blueprints) added after a project
@@ -520,7 +520,7 @@ sub cmd_register {
 
     # Already registered?
     if (-f project_metadata_path($cwd)) {
-        emit_error("Project at $cwd is already registered (found .claude/backup-metadata.json).");
+        emit_error("Project at $cwd is already registered (found .ccpraxis-local-data/backup-metadata.json).");
     }
 
     if ($opts{fresh}) {
@@ -597,9 +597,8 @@ sub register_fresh {
     write_json(project_metadata_path($cwd), $pmeta);
     make_path(cache_root($cwd));
 
-    # Gitignore updates (project)
-    ensure_gitignored($cwd, '.claude/backup-metadata.json');
-    ensure_gitignored($cwd, '.claude/backup-cache/');
+    # Self-gitignore the data root so backup-metadata.json / backup-cache/ stay local.
+    ensure_data_root_self_ignore($cwd);
 
     # Registry
     registry_add_project($slug, $cwd, $now);
@@ -689,8 +688,7 @@ sub register_link {
     write_json(project_metadata_path($cwd), $pmeta);
     make_path(cache_root($cwd));
 
-    ensure_gitignored($cwd, '.claude/backup-metadata.json');
-    ensure_gitignored($cwd, '.claude/backup-cache/');
+    ensure_data_root_self_ignore($cwd);
 
     registry_add_project($slug, $cwd, $now);
 
@@ -1589,8 +1587,41 @@ sub git_path {
     return $p;
 }
 
-sub project_metadata_path { my $cwd = shift; "$cwd/.claude/backup-metadata.json" }
-sub cache_root            { my $cwd = shift; "$cwd/.claude/backup-cache"          }
+# Steward's per-project backup state (registration metadata + the 3-way-merge
+# cache base) moved out of the project's <cwd>/.claude/ (Claude Code's own dir)
+# into the single ccpraxis data root <cwd>/.ccpraxis-local-data/, so all
+# ccpraxis-internal state (which Claude never reads) lives in one self-gitignored
+# place. The accessors lazily migrate any legacy layout on first access (once per
+# cwd per run, memoized — no per-file cost in the sync loop).
+our %_LEGACY_MIGRATED;
+sub _migrate_legacy_project_data {
+    my $cwd = shift;
+    return if !defined $cwd || $_LEGACY_MIGRATED{$cwd}++;   # once per cwd per run
+    my $root      = "$cwd/.ccpraxis-local-data";
+    my $old_meta  = "$cwd/.claude/backup-metadata.json";
+    my $new_meta  = "$root/backup-metadata.json";
+    my $old_cache = "$cwd/.claude/backup-cache";
+    my $new_cache = "$root/backup-cache";
+    return unless (-e $old_meta && !-e $new_meta) || (-d $old_cache && !-e $new_cache);
+    ensure_data_root_self_ignore($cwd);
+    rename($old_meta,  $new_meta)  if -e $old_meta  && !-e $new_meta;
+    rename($old_cache, $new_cache) if -d $old_cache && !-e $new_cache;
+}
+
+# ensure_data_root_self_ignore — the project's single ccpraxis data root exists
+# and self-gitignores (inner .gitignore = '*'), matching steward/blueprint
+# onboard + the sandbox bootstrap. So backup-metadata.json / backup-cache/ under
+# it are never committed without per-file .gitignore entries.
+sub ensure_data_root_self_ignore {
+    my $cwd  = shift;
+    my $root = "$cwd/.ccpraxis-local-data";
+    make_path($root) unless -d $root;
+    my $gi = "$root/.gitignore";
+    unless (-f $gi) { if (open my $g, '>', $gi) { print $g "*\n"; close $g } }
+}
+
+sub project_metadata_path { my $cwd = shift; _migrate_legacy_project_data($cwd); "$cwd/.ccpraxis-local-data/backup-metadata.json" }
+sub cache_root            { my $cwd = shift; _migrate_legacy_project_data($cwd); "$cwd/.ccpraxis-local-data/backup-cache"          }
 sub cache_path            { my ($cwd, $rel) = @_; cache_root($cwd) . "/$rel"     }
 sub vault_project_dir     { my $slug = shift; "$VAULT_DIR/projects/$slug"        }
 sub vault_file_path       { my ($slug, $rel) = @_; vault_project_dir($slug) . "/files/$rel" }

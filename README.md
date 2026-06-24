@@ -462,9 +462,9 @@ claude-code-vault/
 
 **Hard-excluded (never offered):** `.claude/settings.local.json`, `.ccpraxis-local-data/claude-home/git-pat`, `.ccpraxis-local-data/claude-home/git-askpass.sh`, `.ccpraxis-local-data/claude-home/git-ssh-command.sh`, `deploy_key`, `.ccpraxis-local-data/blueprints/<name>/runs/`.
 
-To change what's offered by default, edit `@DEFAULT_TRACKABLE` and `%HARD_EXCLUDE_EXACT` / `@HARD_EXCLUDE_PREFIXES` at the top of `plugins/steward/scripts/vault-sync.pl`. Per-project selection is captured at registration time in `<project>/.claude/backup-metadata.json → tracked_paths`.
+To change what's offered by default, edit `@DEFAULT_TRACKABLE` and `%HARD_EXCLUDE_EXACT` / `@HARD_EXCLUDE_PREFIXES` at the top of `plugins/steward/scripts/vault-sync.pl`. Per-project selection is captured at registration time in `<project>/.ccpraxis-local-data/backup-metadata.json → tracked_paths`.
 
-**Sync algorithm (per file):** 3-way comparison using `.claude/backup-cache/<path>` as the merge BASE (mirror of last-synced content). Auto-applies one-sided changes (push/pull/cache-only). Conflicts go through `git merge-file --diff3`; the user resolves each via `AskUserQuestion` with **Use local / Use vault / Show diff / Use merged / Abort sync** — no skip, no remember.
+**Sync algorithm (per file):** 3-way comparison using `.ccpraxis-local-data/backup-cache/<path>` as the merge BASE (mirror of last-synced content). Auto-applies one-sided changes (push/pull/cache-only). Conflicts go through `git merge-file --diff3`; the user resolves each via `AskUserQuestion` with **Use local / Use vault / Show diff / Use merged / Abort sync** — no skip, no remember.
 
 **Robustness:**
 - Two-level locking (vault `.lock` + per-project `.lock`) with PID+ISO-timestamp and 10-min stale reclaim
