@@ -46,6 +46,7 @@ BEGIN {
 }
 use MountSpec qw(winify_path v_to_mount convert_v_to_mount);
 use LaunchLog ();   # B1: durable per-launch diagnostic log (next to us in scripts/)
+use Dashboard ();   # B2: the raw-ANSI TUI dashboard framework
 use File::Path qw(make_path);
 use File::Spec;
 use Digest::MD5 qw();
@@ -138,6 +139,11 @@ my $CONTAINER_CONFIG  = "$SANDBOX_PLUGIN/container";
 my $SANDBOX_SKILLS_PL = "$SANDBOX_PLUGIN/scripts/skills.pl";
 my $SELECT_SESSION_PL = "$SANDBOX_PLUGIN/scripts/select-session.pl";
 my $HOST_PLUGINS_DIR  = "$CLAUDE_HOST_CONFIG/plugins";
+# B2: the canonical entry paths the dashboard spawns for a new claude session,
+# and whether the raw-ANSI TUI is even possible (else the plain heartbeat loop).
+my $LAUNCHER_PL       = "$SANDBOX_PLUGIN/scripts/launcher.pl";
+my $SANDBOX_PS1       = "$SANDBOX_PLUGIN/bin/claude-sandbox.ps1";
+my $READKEY_OK        = eval { require Term::ReadKey; 1 } ? 1 : 0;
 
 # =====================================================================
 # Arg parsing
@@ -150,6 +156,10 @@ my $HOST_PLUGINS_DIR  = "$CLAUDE_HOST_CONFIG/plugins";
 # at end-of-argv is an explicit error.
 
 my $RESUME_SESSION = '';
+my $SESSION_MODE   = 0;   # B2: --session => internal connector entry (Decision #19),
+                          # spawned by the dashboard's launch-claude hotkey in a
+                          # new window. Bare `claude-sandbox` always lands on the
+                          # dashboard instead.
 my @POSITIONAL;
 {
     my @argv = @ARGV;
@@ -160,6 +170,8 @@ my @POSITIONAL;
             $RESUME_SESSION = shift @argv;
         } elsif ($a =~ /^--resume-session=(.*)$/) {
             $RESUME_SESSION = $1;
+        } elsif ($a eq '--session') {
+            $SESSION_MODE = 1;
         } elsif ($a eq '--') {
             push @POSITIONAL, @argv;
             @argv = ();
@@ -509,20 +521,22 @@ my $CONTAINER_NAME;
 }
 
 # =====================================================================
-# Early mode dispatch: CONNECTOR (container already running)
+# Early mode dispatch: CONNECTOR / DASHBOARD (Decision #19)
 # =====================================================================
 #
-# If a manager is already up (container is in `running` state), this
-# launcher becomes a CONNECTOR. Connectors skip all setup-time work
-# (skill picker, staleness check, plugin materialize, backpack
-# approval, container create/start, image rebuild prompt) and go
-# straight to: session picker → kill-orphan-claudes → exec claude.
+# `claude-sandbox` (the only user-typed form) ALWAYS lands on the
+# dashboard (the live TUI / plain heartbeat loop). The dashboard is the
+# manager window: it holds the container alive and exposes a hotkey that
+# spawns a NEW window running the internal connector entry
+# `claude-sandbox --session` — which is what reaches the CONNECTOR branch
+# below. `--resume-session` (used by claude-beacon to resume a specific
+# session directly) is also connector mode.
 #
-# The manager terminal is responsible for setup decisions; connectors
-# just attach to whatever container the manager built. This also keeps
-# discovery / TUI / backpack work out of the connector's terminal,
-# where it would be redundant noise (the user already made those
-# choices in the manager terminal).
+# CONNECTOR: skip all setup-time work (skill picker, staleness check,
+# plugin materialize, backpack approval, container create/start, rebuild
+# prompt) and go straight to: session picker → kill-orphan-claudes →
+# exec claude. The manager (dashboard) terminal already made those setup
+# choices when it built the container.
 {
     my $state = '';
     if (_container_exists($CONTAINER_NAME)) {
@@ -530,7 +544,19 @@ my $CONTAINER_NAME;
         chomp $state if defined $state;
         $state //= '';
     }
-    if ($state eq 'running') {
+
+    my $connector_mode = ($SESSION_MODE || length $RESUME_SESSION);
+
+    if ($connector_mode) {
+        # Connector requires a manager/dashboard to already be up.
+        if ($state ne 'running') {
+            print STDERR "ERROR: no running sandbox to connect to for this project.\n";
+            print STDERR "       Run `claude-sandbox` (no flags) to start the sandbox + dashboard first,\n";
+            print STDERR "       then launch a claude session from the dashboard.\n";
+            release_lock();
+            reset_terminal();
+            exit 1;
+        }
         print "Connecting to running sandbox: $CONTAINER_NAME\n";
         release_lock();
         my @SESSION_FLAGS;
@@ -561,18 +587,18 @@ my $CONTAINER_NAME;
         exit $rc;
     }
 
-    # Container missing or stopped. We are the MANAGER for this run.
-    # --resume-session only makes sense in connector mode; if we got
-    # here with the flag set, there's no running container to attach
-    # the resume to.
-    if (length $RESUME_SESSION) {
-        print STDERR "ERROR: --resume-session $RESUME_SESSION requires the sandbox to already be running.\n";
-        print STDERR "       Start the sandbox manager by running `claude-sandbox` in this project (no flags)\n";
-        print STDERR "       in another terminal, then re-run this command to attach to the session.\n";
+    # Bare `claude-sandbox` with the container ALREADY running: the manager
+    # that built it already did all setup — skip straight to the dashboard.
+    # (Holding the setup lock here would needlessly block a real manager, so
+    # release it first, exactly as a connector does.)
+    if ($state eq 'running') {
         release_lock();
-        reset_terminal();
-        exit 1;
+        enter_dashboard();   # never returns (loops until the user exits)
     }
+
+    # Otherwise the container is missing/stopped: we are the MANAGER. Fall
+    # through to setup (image / create / start); it ends by calling
+    # enter_dashboard() in place of the old scrolling heartbeat loop.
 }
 
 # =====================================================================
@@ -1749,66 +1775,207 @@ BASH
 }
 
 # =====================================================================
-# Heartbeat loop (manager mode)
+# Dashboard (manager mode) — Decision #19
 # =====================================================================
 #
-# Container is up + backpack install (if any) is done. This launcher
-# now becomes the heartbeat keeper: refresh /tmp/.launcher-alive every
-# 2 minutes (well within the container's 5-minute HB staleness window).
-# Closing this terminal — or sending Ctrl+C — stops the refresh; the
-# container reaps itself within ~5 minutes.
-#
-# To start a claude session, the user runs `claude-sandbox` in another
-# terminal — that one hits the CONNECTOR branch above.
+# Container is up + backpack install (if any) is done. This launcher now
+# becomes the manager window: it lands on the dashboard, which holds the
+# container alive via the same /tmp/.launcher-alive heartbeat (every 2
+# minutes, well within the container's 5-minute reap window) and exposes
+# the launch-claude + shutdown-all hotkeys. Closing this window — or the
+# dashboard's [q] — stops the heartbeat; the container reaps itself within
+# ~5 minutes (Decision #17, unchanged). On a non-TTY / no-Term::ReadKey
+# terminal it degrades to the plain scrolling heartbeat loop.
+enter_dashboard();   # never returns (loops until the user exits)
 
-# Refresh sentinel one more time before entering the BEAT_INTERVAL sleep,
-# so the first $BEAT_INTERVAL window starts from "now" — covers the case
-# where the install pass took a long time and its last in-container
-# refresh was already a while ago.
-system($PODMAN, 'exec', $CONTAINER_NAME, 'touch', '/tmp/.launcher-alive');
+# ---------------------------------------------------------------------
+# Dashboard wiring (B2) — these file-scope subs close over $PODMAN /
+# $CONTAINER_NAME / $PROJECT_* / the loggers, supplying the real podman +
+# terminal seams to the generic Dashboard::run loop.
+# ---------------------------------------------------------------------
 
-print "\n";
-print "=" x 60 . "\n";
-print "Sandbox ready: $CONTAINER_NAME\n";
-print "=" x 60 . "\n";
-print "Open another terminal in this project and run:\n";
-print "    claude-sandbox\n";
-print "to start or resume a claude session.\n";
-print "\n";
-print "Multiple connector terminals can share this sandbox.\n";
-print "This terminal is the manager — keep it open. Closing it stops\n";
-print "the sandbox (~5 minutes after the last heartbeat).\n";
-print "Press Ctrl+C to stop now.\n";
-print "\n";
+# enter_dashboard — manager-ready: log it, do an immediate heartbeat so the
+# reap window starts fresh, then run the dashboard (raw-ANSI TUI when the
+# terminal supports it, else the plain heartbeat loop).
+sub enter_dashboard {
+    log_ev('manager_ready', { container => $CONTAINER_NAME });
+    # Act on the first heartbeat: if the container is already gone, don't paint
+    # a dashboard that would just die on its first tick — say so and exit clean.
+    if (_heartbeat_once() eq 'gone') {
+        print STDERR "Container $CONTAINER_NAME is no longer running. Nothing to attach to.\n";
+        reset_terminal();
+        exit 0;
+    }
 
-log_ev('manager_ready', { container => $CONTAINER_NAME });
+    my $is_tty = (-t STDOUT && -t STDIN) ? 1 : 0;
+    my $mode   = Dashboard::decide_mode($is_tty, $READKEY_OK, $ENV{CCPRAXIS_NO_TUI});
+    if ($mode eq 'plain') {
+        plain_heartbeat_loop();   # never returns
+        return;
+    }
 
-my $BEAT_INTERVAL = 120;  # Container's HB is 300 (5 min); 120s gives 2.5x margin.
-while (1) {
-    sleep $BEAT_INTERVAL;
+    require Term::ReadKey;
+    my $log_path = "$PROJECT_PATH/.claude-data/sandbox-logs/launch-$LAUNCH_ID.log";
+    my $cached_status = 'unknown';
+    my $last_inspect  = 0;
+
+    my $rc = Dashboard::run(
+        color     => 1,
+        enter_raw => sub {
+            Term::ReadKey::ReadMode('cbreak');
+            print STDOUT "\e[?1049h\e[?25l";        # alt-screen + hide cursor
+        },
+        leave_raw => sub {
+            print STDOUT "\e[?25h\e[?1049l";        # show cursor + leave alt-screen
+            eval { Term::ReadKey::ReadMode('restore') };
+            reset_terminal();
+        },
+        read_key  => sub { Term::ReadKey::ReadKey(-1) },
+        term_size => sub {
+            my @s = eval { Term::ReadKey::GetTerminalSize() };
+            my $cols = (@s && $s[0]) ? $s[0] : 80;
+            my $rows = (@s && $s[1]) ? $s[1] : 24;
+            return ($cols, $rows);
+        },
+        heartbeat => \&_heartbeat_once,
+        gather    => sub {
+            # podman inspect is comparatively expensive; cache it ~10s so the
+            # input loop stays responsive. The cheap log tail refreshes every
+            # state interval. (B3 may make the inspect fully async.)
+            my $now = time;
+            if ($now - $last_inspect >= 10) {
+                my $s = `$PODMAN inspect --format '{{.State.Status}}' "$CONTAINER_NAME" 2>/dev/null`;
+                chomp $s if defined $s;
+                $cached_status = (defined $s && length $s) ? $s : 'unknown';
+                $last_inspect  = $now;
+            }
+            my @lines = _tail_lines($log_path, 200);
+            return {
+                project_name => $PROJECT_NAME,
+                container    => $CONTAINER_NAME,
+                status       => $cached_status,
+                events       => Dashboard::recent_events(\@lines, 50),
+            };
+        },
+        spawn         => \&_spawn_session,
+        write_signals => sub {
+            my $n = Dashboard::write_shutdown_signals(Dashboard::shutdown_targets($PROJECT_PATH));
+            log_ev('shutdown_all', { signals => $n });
+            return $n;
+        },
+    );
+    exit($rc // 0);
+}
+
+# _heartbeat_once — touch the container's keep-alive sentinel. Returns
+# 'ok' | 'fail' | 'gone' (the dashboard ends its loop on 'gone'). Shared by
+# the TUI seam and the plain loop so the container-gone detection lives once.
+sub _heartbeat_once {
     my $rc = system($PODMAN, 'exec', $CONTAINER_NAME, 'touch', '/tmp/.launcher-alive');
     if ($rc != 0) {
-        # Heartbeat failed — most likely cause is the container died
-        # (was rm'd from another terminal, podman machine restarted,
-        # something killed conmon). Confirm by inspecting state and
-        # exit cleanly if so.
         my $state = `$PODMAN inspect --format '{{.State.Status}}' "$CONTAINER_NAME" 2>/dev/null`;
         chomp $state if defined $state;
         $state //= '';
         if ($state ne 'running') {
             log_ev('container_gone', { state => $state, container => $CONTAINER_NAME });
+            return 'gone';
+        }
+        log_ev('heartbeat_fail', { exit => $rc >> 8, state => $state });
+        return 'fail';
+    }
+    log_ev('heartbeat', {});
+    return 'ok';
+}
+
+# _tail_lines — last $n chomped lines of a file (the B1 launch log), or ().
+# Seek-based + byte-capped: a long-lived dashboard re-reads this every state
+# tick, and the log grows for the whole run, so reading the WHOLE file each time
+# would be unbounded. Read only the last 128 KB (plenty for $n lines), dropping
+# the first partial line when we start mid-file.
+sub _tail_lines {
+    my ($path, $n) = @_;
+    open my $fh, '<', $path or return ();
+    binmode $fh, ':raw';
+    my $size = -s $fh;
+    $size = 0 if !defined $size;
+    my $cap  = 128 * 1024;
+    my $from = $size > $cap ? $size - $cap : 0;
+    seek $fh, $from, 0;
+    local $/;
+    my $blob = <$fh>;
+    close $fh;
+    return () if !defined $blob || !length $blob;
+    $blob =~ s/^[^\n]*\n// if $from > 0;   # drop the partial leading line
+    my @lines = split /\n/, $blob;
+    chomp @lines;
+    return @lines > $n ? @lines[-$n .. -1] : @lines;
+}
+
+# _spawn_session — the dashboard's launch-claude hotkey: open a NEW window
+# running the internal connector entry (`claude-sandbox --session <project>`).
+# wt.exe -> cmd `start` -> in-window fallback ladder (Decision #19). A native
+# wt.exe / start can't exec the .ps1 by bare name, so we drive it through
+# powershell -File; the inline fallback re-uses THIS perl (works in-process).
+sub _spawn_session {
+    my @inner = ('powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass',
+                 '-File', $SANDBOX_PS1, '--session', $PROJECT_PATH);
+    my $wt   = Dashboard::find_exe('wt.exe', $ENV{PATH});
+    my $mode = Dashboard::decide_spawn_mode($wt ? 1 : 0, $ENV{COMSPEC} ? 1 : 0, $^O);
+    my $argv = Dashboard::spawn_argv($mode, { cmd => \@inner, comspec => $ENV{COMSPEC} });
+    log_ev('launch_session', { mode => $mode });
+
+    if (!$argv) {
+        # inline: suspend the dashboard, run the connector in this window,
+        # then ask the loop to repaint.
+        print STDOUT "\e[?25h\e[?1049l";
+        eval { Term::ReadKey::ReadMode('restore') };
+        system($^X, $LAUNCHER_PL, '--session', $PROJECT_PATH);
+        eval { Term::ReadKey::ReadMode('cbreak') };
+        print STDOUT "\e[?1049h\e[?25l";
+        return 'redraw';
+    }
+    my $rc = system(@$argv);   # wt.exe / `start` return immediately (detached window)
+    if ($rc != 0 && $mode eq 'wt') {
+        # Old Windows Terminal (pre-1.7 has no `-w new`) or a wt spawn error:
+        # fall back to a plain new console via cmd `start`, so [c] never
+        # silently does nothing.
+        log_ev('launch_session_retry', { from => 'wt', exit => ($rc >> 8) });
+        my $alt = Dashboard::spawn_argv('start', { cmd => \@inner, comspec => $ENV{COMSPEC} });
+        $rc = system(@$alt) if $alt;
+    }
+    log_ev('launch_session_done', { mode => $mode, exit => ($rc >> 8) });
+    return;
+}
+
+# plain_heartbeat_loop — the non-TTY fallback: the original scrolling manager
+# loop, preserved verbatim in behavior. Touch every 2 min; exit cleanly when
+# the container goes away.
+sub plain_heartbeat_loop {
+    print "\n";
+    print "=" x 60 . "\n";
+    print "Sandbox ready: $CONTAINER_NAME\n";
+    print "=" x 60 . "\n";
+    print "This terminal is the manager — keep it open. Closing it stops\n";
+    print "the sandbox (~5 minutes after the last heartbeat).\n";
+    print "Press Ctrl+C to stop now.\n";
+    print "\n";
+
+    my $BEAT_INTERVAL = 120;  # Container's HB is 300 (5 min); 120s gives 2.5x margin.
+    while (1) {
+        sleep $BEAT_INTERVAL;
+        my $hb = _heartbeat_once();
+        if ($hb eq 'gone') {
             print STDERR "\n";
-            print STDERR "Container $CONTAINER_NAME is no longer running (state: '$state').\n";
+            print STDERR "Container $CONTAINER_NAME is no longer running.\n";
             print STDERR "Manager exiting.\n";
             reset_terminal();
             exit 0;
         }
-        # Container IS still running but exec failed — log and keep trying.
-        log_ev('heartbeat_fail', { exit => $rc >> 8, state => $state });
-        printf STDERR "[%s] WARNING: heartbeat refresh failed (exit %d); will retry next tick\n",
-            strftime("%H:%M:%S", localtime), ($rc >> 8);
-        next;
+        if ($hb eq 'fail') {
+            printf STDERR "[%s] WARNING: heartbeat refresh failed; will retry next tick\n",
+                strftime("%H:%M:%S", localtime);
+            next;
+        }
+        printf "[%s] heartbeat\n", strftime("%H:%M:%S", localtime);
     }
-    log_ev('heartbeat', {});
-    printf "[%s] heartbeat\n", strftime("%H:%M:%S", localtime);
 }
