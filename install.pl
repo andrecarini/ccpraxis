@@ -76,6 +76,13 @@ for my $dir (sort glob("$CCPRAXIS_DIR/skills/*")) {
     push @scripts, $hook if -f $hook;
 }
 
+# Standalone root surface (not a plugin/skill): the host-tools hook that puts
+# `perl` on the user's PATH. Listed explicitly per the discovery note above.
+{
+    my $hook = "$CCPRAXIS_DIR/host-tools/ccpraxis-install.pl";
+    push @scripts, $hook if -f $hook;
+}
+
 unless (@scripts) {
     print "No ccpraxis-install.pl hooks found under $CCPRAXIS_DIR.\n";
     exit 0;

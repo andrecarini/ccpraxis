@@ -1,0 +1,4 @@
+# This dir is added to the user PATH by ../ccpraxis-install.pl and holds the
+# generated `perl.cmd` shim (gitignored — it's machine-specific). Keep the dir
+# tracked so the install hook's plan mode can describe the PATH change on a
+# fresh clone before anything is generated.
