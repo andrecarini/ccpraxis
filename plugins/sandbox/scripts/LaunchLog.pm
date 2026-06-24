@@ -3,7 +3,7 @@ package LaunchLog;
 #
 # One JSON-line-per-event stream, autoflushed, written to a distinct file per
 # launch under the project's gitignored data dir
-# (<project>/.claude-data/sandbox-logs/<launch-id>.log). It is the source of
+# (<project>/.ccpraxis-local-data/claude-home/sandbox-logs/<launch-id>.log). It is the source of
 # truth the TUI dashboard (B2) renders. Line-flushed JSON means killing the
 # launcher mid-run leaves a readable log up to the failure: every event is a
 # complete line on disk the instant it is emitted.

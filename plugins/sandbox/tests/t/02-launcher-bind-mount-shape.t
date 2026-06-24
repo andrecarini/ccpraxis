@@ -1,8 +1,9 @@
 #!/usr/bin/env perl
 # Pins the launcher's post-refactor mount layout: /root/.claude is a
-# host bind of <project>/.claude-data, not a volume. /root/.claude.json
-# is a single-file bind. statusline.pl is the only ro bind remaining
-# inside /root/.claude/. No CLAUDE_DATA_VOLUME references survive.
+# host bind of <project>/.ccpraxis-local-data/claude-home ($CLAUDE_DATA),
+# not a volume. /root/.claude.json is a single-file bind. statusline.pl is
+# the only ro bind remaining inside /root/.claude/. No CLAUDE_DATA_VOLUME
+# references survive.
 
 use strict;
 use warnings;
@@ -18,11 +19,11 @@ open my $fh, '<', $launcher or BAIL_OUT("open: $!");
 my $src = do { local $/; <$fh> };
 close $fh;
 
-# 1. /root/.claude is bound from ${PROJECT_PATH}/.claude-data.
-like($src, qr{'-v',\s*"\$\{PROJECT_PATH\}/\.claude-data:/root/\.claude"}m,
-     '/root/.claude is a host bind mount of .claude-data');
+# 1. /root/.claude is bound from ${CLAUDE_DATA} (.ccpraxis-local-data/claude-home).
+like($src, qr{'-v',\s*"\$\{CLAUDE_DATA\}:/root/\.claude"}m,
+     '/root/.claude is a host bind mount of claude-home');
 
-# 2. .launcher overlays the .claude-data bind as RO. Defense-in-depth:
+# 2. .launcher overlays the claude-home bind as RO. Defense-in-depth:
 # a compromised in-container process can't fake backpack-trusted-hash,
 # corrupt the snapshot files, or scribble on launcher metadata.
 like($src, qr{'-v',\s*"\$\{LAUNCHER_DIR\}:/root/\.claude/\.launcher:ro"}m,
@@ -35,9 +36,9 @@ like($src, qr{'-v',\s*"\$\{LAUNCHER_DIR\}:/root/\.claude/\.launcher:ro"}m,
 like($src, qr{'-v',\s*"\$\{SANDBOX_CREDENTIALS_FILE\}:/root/\.claude/\.credentials\.json"}m,
      'credentials.json is a single-file bind from the .launcher/ canonical');
 
-# 4. /root/.claude.json is a single-file bind from .claude-data/.claude.json.
-like($src, qr{'-v',\s*"\$\{PROJECT_PATH\}/\.claude-data/\.claude\.json:/root/\.claude\.json"}m,
-     '/root/.claude.json is a single-file bind from .claude-data/.claude.json');
+# 4. /root/.claude.json is a single-file bind from claude-home/.claude.json.
+like($src, qr{'-v',\s*"\$\{CLAUDE_DATA\}/\.claude\.json:/root/\.claude\.json"}m,
+     '/root/.claude.json is a single-file bind from claude-home/.claude.json');
 
 # 5. statusline.pl ro bind is still there.
 like($src, qr{statusline\.pl:/root/\.claude/statusline\.pl:ro}m,

@@ -5,7 +5,7 @@
 # in-container process could otherwise fake hashes to bypass backpack
 # approval or corrupt the launcher's selection state.
 #
-# .launcher is overlaid as RO over the .claude-data RW bind. This test
+# .launcher is overlaid as RO over the claude-home RW bind. This test
 # proves the kernel-level enforcement: container can READ from .launcher
 # but writes return EROFS / "Read-only file system".
 #
@@ -23,11 +23,11 @@ use TestSandbox qw(podman_run_capture create_probe_container new_temp_dir);
 
 plan tests => 5;
 
-# Simulate the launcher's mount layout on a tempdir-backed .claude-data:
-#   .claude-data → /root/.claude (RW)
-#   .claude-data/.launcher → /root/.claude/.launcher (RO overlay)
-#   .claude-data/.launcher/credentials.json → /root/.claude/.credentials.json (RW file bind)
-#   .claude-data/.claude.json → /root/.claude.json (RW file bind)
+# Simulate the launcher's mount layout on a tempdir-backed claude-home:
+#   claude-home → /root/.claude (RW)
+#   claude-home/.launcher → /root/.claude/.launcher (RO overlay)
+#   claude-home/.launcher/credentials.json → /root/.claude/.credentials.json (RW file bind)
+#   claude-home/.claude.json → /root/.claude.json (RW file bind)
 my $host_data = new_temp_dir();
 my $launcher_dir = "$host_data/.launcher";
 mkdir $launcher_dir or BAIL_OUT("mkdir $launcher_dir: $!");

@@ -189,7 +189,7 @@ sub cmd_list {
     }
     if ($scope eq 'all' || $scope eq 'sandbox') {
         for my $proj_dir (sandbox_project_dirs()) {
-            my $d = "$proj_dir/.claude-data/beacons";
+            my $d = "$proj_dir/.ccpraxis-local-data/claude-home/beacons";
             push @records, _read_all_beacons($d) if -d $d;
         }
     }
@@ -276,8 +276,8 @@ sub cmd_count_project {
     my $root = $opts->{root} // git_root($cwd) // norm_path($cwd);
     $root = norm_path($root);
 
-    # Local (sandbox-style) beacons under <root>/.claude-data/beacons/
-    my $local_dir = "$root/.claude-data/beacons";
+    # Local (sandbox-style) beacons under <root>/.ccpraxis-local-data/claude-home/beacons/
+    my $local_dir = "$root/.ccpraxis-local-data/claude-home/beacons";
     my $n_local   = -d $local_dir ? _count_json($local_dir) : 0;
 
     # Host-vault beacons attributed to this project (by git_root match)
@@ -435,7 +435,7 @@ sub scan_sandboxes_internal {
     return ($copied, $skipped, \@errors) unless -d $VAULT_BEACON_DIR;
 
     for my $proj_dir (sandbox_project_dirs()) {
-        my $src_dir = "$proj_dir/.claude-data/beacons";
+        my $src_dir = "$proj_dir/.ccpraxis-local-data/claude-home/beacons";
         next unless -d $src_dir;
 
         my $dh;
@@ -564,7 +564,7 @@ sub beacon_dir_for_scope {
     return $VAULT_BEACON_DIR if $scope eq 'host';
     my $cwd  = safe_getcwd();
     my $root = git_root($cwd) // norm_path($cwd);
-    return "$root/.claude-data/beacons";
+    return "$root/.ccpraxis-local-data/claude-home/beacons";
 }
 
 sub git_root {
@@ -670,7 +670,7 @@ sub _all_locations_for {
     push @paths, $local unless grep { $_ eq $local } @paths;
     if (detect_scope() eq 'host') {
         for my $proj_dir (sandbox_project_dirs()) {
-            push @paths, "$proj_dir/.claude-data/beacons/$sid.json";
+            push @paths, "$proj_dir/.ccpraxis-local-data/claude-home/beacons/$sid.json";
         }
     }
     return @paths;

@@ -7,7 +7,7 @@
 #
 # Responsibilities (mirrored from the original .sh/.ps1 line-for-line):
 #   - Arg parsing (positional project-path, --resume-session UUID).
-#   - Bootstrap path: if .claude-data doesn't exist, ask the user whether
+#   - Bootstrap path: if the sandbox home doesn't exist, ask the user whether
 #     to set up a sandbox here; on confirm, invoke bootstrap.pl
 #     (deterministic perl-driven setup — no agent in the loop); re-check
 #     after; abort if still not set up.
@@ -200,7 +200,16 @@ $PROJECT_PATH = winify_path($PROJECT_PATH);
 my $PROJECT_NAME = lc(basename($PROJECT_PATH));
 $PROJECT_NAME =~ s/ /-/g;
 
-my $LAUNCHER_DIR              = "$PROJECT_PATH/.claude-data/.launcher";
+# The project carries a SINGLE ccpraxis data dir at its root:
+# <project>/.ccpraxis-local-data/ (self-gitignored via an inner .gitignore=*).
+# The sandbox's container-home projection (bind source for /root/.claude) lives
+# under it at claude-home/ — historically this was <project>/.claude-data/, now
+# migrated in (see the migration block below). Everything the sandbox persists
+# (sessions, credentials, launcher metadata, logs, beacons) is nested under
+# $CLAUDE_DATA, exactly as it was under .claude-data — only the parent changed.
+my $CCPRAXIS_DATA            = "$PROJECT_PATH/.ccpraxis-local-data";
+my $CLAUDE_DATA              = "$CCPRAXIS_DATA/claude-home";
+my $LAUNCHER_DIR              = "$CLAUDE_DATA/.launcher";
 my $SELECTION_FILE            = "$LAUNCHER_DIR/selected-skills.json";
 my $MANIFEST_FILE             = "$LAUNCHER_DIR/container-manifest.json";
 my $SNAPSHOT_FILE             = "$LAUNCHER_DIR/.discovery-snapshot.json";
@@ -209,15 +218,15 @@ my $MCP_SNAPSHOT_FILE         = "$LAUNCHER_DIR/.mcp-snapshot.json";
 my $SETTINGS_LOCAL_FILE       = "$PROJECT_PATH/.claude/settings.local.json";
 my $MATERIALIZED_PLUGINS_FILE = "$LAUNCHER_DIR/installed_plugins.json";
 my $SANDBOX_CREDENTIALS_FILE  = "$LAUNCHER_DIR/credentials.json";
-# known_marketplaces.json lives under .claude-data/plugins/ (NOT .launcher/)
+# known_marketplaces.json lives under claude-home/plugins/ (NOT .launcher/)
 # so it appears at /root/.claude/plugins/known_marketplaces.json as a real
-# file through the parent .claude-data bind — not as a single-file mount.
+# file through the parent claude-home bind — not as a single-file mount.
 # Claude Code rewrites the file with write-tmp + rename on every load; a
 # file-level bind would reject the rename with EROFS. The parent-bind
 # approach lets the rename land naturally; the launcher regenerates the
 # file on every launch so in-container mutations are ephemeral, which
 # matches the desired "no marketplace state leaks across runs" posture.
-my $MATERIALIZED_MARKETPLACES_FILE = "$PROJECT_PATH/.claude-data/plugins/known_marketplaces.json";
+my $MATERIALIZED_MARKETPLACES_FILE = "$CLAUDE_DATA/plugins/known_marketplaces.json";
 # Container CLAUDE.md and settings.json: per-project copies (blueprint
 # model). Container can modify these freely; changes never propagate
 # back to ccpraxis. Drift from upstream is detected via stored hash;
@@ -236,16 +245,57 @@ my $LAUNCH_LOG;
 my $LAUNCH_ID = strftime("%Y%m%dT%H%M%SZ", gmtime()) . "-$$";
 sub log_ev { LaunchLog::event($LAUNCH_LOG, @_) }
 
+# ensure_ccpraxis_data_dir — the project's single ccpraxis data root exists and
+# self-gitignores (inner .gitignore = '*', matching steward/blueprint onboard).
+# Idempotent; never clobbers an existing .gitignore (butler/blueprint may own it).
+sub ensure_ccpraxis_data_dir {
+    make_path($CCPRAXIS_DATA) unless -d $CCPRAXIS_DATA;
+    my $gi = "$CCPRAXIS_DATA/.gitignore";
+    unless (-f $gi) {
+        if (open my $g, '>', $gi) { print $g "*\n"; close $g }
+    }
+}
+
 # =====================================================================
-# Bootstrap path (no .claude-data yet)
+# One-time migration: .claude-data -> .ccpraxis-local-data/claude-home
+# =====================================================================
+#
+# The per-project sandbox home used to live at <project>/.claude-data so the
+# project root carried TWO ccpraxis data dirs (.claude-data + the blueprint
+# .ccpraxis-local-data). It now nests under the single .ccpraxis-local-data.
+# Move the whole tree intact on first launch after the change — this preserves
+# sessions, credentials, memories, plans (an in-FS rename, atomic + instant).
+# Runs before any container/bootstrap decision so the rest of the launch sees
+# only the new location.
+{
+    my $old = "$PROJECT_PATH/.claude-data";
+    if (-d $old && ! -d $CLAUDE_DATA) {
+        ensure_ccpraxis_data_dir();
+        if (rename($old, $CLAUDE_DATA)) {
+            print "Migrated sandbox home: $old -> $CLAUDE_DATA\n";
+            log_ev('migrate_claude_data', { from => $old, to => $CLAUDE_DATA });
+        } else {
+            print STDERR "ERROR: could not migrate $old -> $CLAUDE_DATA: $!\n";
+            print STDERR "       If a sandbox for this project is still running it bind-mounts the old\n";
+            print STDERR "       .claude-data — stop it first (close its dashboard / `$PODMAN rm -f` the\n";
+            print STDERR "       project's container), then re-run. (Or move it by hand:\n";
+            print STDERR "         mv '$old' '$CLAUDE_DATA')\n";
+            reset_terminal();
+            exit 1;
+        }
+    }
+}
+
+# =====================================================================
+# Bootstrap path (no sandbox home yet)
 # =====================================================================
 #
 # Ask the user whether to set up a new sandbox; on confirm, run the
 # perl-driven bootstrap (no agent in the loop). After it returns,
-# verify .claude-data was created and continue into the normal launch
-# flow.
+# verify the sandbox home was created and continue into the normal
+# launch flow.
 
-if (! -d "$PROJECT_PATH/.claude-data") {
+if (! -d $CLAUDE_DATA) {
     print "\n";
     print "==============================================================\n";
     print "  No sandbox found in this project.\n";
@@ -272,8 +322,8 @@ if (! -d "$PROJECT_PATH/.claude-data") {
         reset_terminal();
         exit ($rc >> 8 || 1);
     }
-    if (! -d "$PROJECT_PATH/.claude-data") {
-        print STDERR "Bootstrap finished but .claude-data not found. Aborting.\n";
+    if (! -d $CLAUDE_DATA) {
+        print STDERR "Bootstrap finished but $CLAUDE_DATA not found. Aborting.\n";
         reset_terminal();
         exit 1;
     }
@@ -365,7 +415,7 @@ acquire_lock();
 # leaves $LAUNCH_LOG undef and every log_ev() becomes a no-op (the launch still
 # runs; it just isn't logged). Manager and connector invocations are separate
 # processes, each with its own uniquely-named log file (no double-open).
-$LAUNCH_LOG = LaunchLog::open_log("$PROJECT_PATH/.claude-data/sandbox-logs/launch-$LAUNCH_ID.log");
+$LAUNCH_LOG = LaunchLog::open_log("$CLAUDE_DATA/sandbox-logs/launch-$LAUNCH_ID.log");
 log_ev('launch_start', { project => $PROJECT_PATH, project_name => $PROJECT_NAME, podman => $PODMAN, pid => $$ });
 
 # =====================================================================
@@ -1006,15 +1056,15 @@ if (-d "$HOST_PLUGINS_DIR/cache") {
 push @PLUGIN_MOUNTS, '-v', "$MATERIALIZED_PLUGINS_FILE:/root/.claude/plugins/installed_plugins.json:ro";
 
 # Marketplace registry: materialize a container-shaped copy (paths rewritten,
-# directory-source entries dropped) into .claude-data/plugins/. Lives there
-# as a real file through the parent .claude-data bind so Claude Code's
+# directory-source entries dropped) into claude-home/plugins/. Lives there
+# as a real file through the parent claude-home bind so Claude Code's
 # atomic write-tmp+rename pattern works on it — see the
 # $MATERIALIZED_MARKETPLACES_FILE definition above for the rationale.
 # Plus a RO overlay of the host's marketplaces/ data dir so the rewritten
 # installLocation paths resolve to real on-disk marketplace data.
 if (-f "$HOST_PLUGINS_DIR/known_marketplaces.json") {
-    make_path("$PROJECT_PATH/.claude-data/plugins")
-        unless -d "$PROJECT_PATH/.claude-data/plugins";
+    make_path("$CLAUDE_DATA/plugins")
+        unless -d "$CLAUDE_DATA/plugins";
     run_perl_or_die('materialize-known-marketplaces failed',
         'materialize-known-marketplaces',
         '--output', $MATERIALIZED_MARKETPLACES_FILE);
@@ -1080,15 +1130,15 @@ run_perl_or_die('materialize-credentials failed',
 my @EXTRA_ENV;
 my @EXTRA_MOUNTS;
 
-if (-f "$PROJECT_PATH/.claude-data/git-ssh-command.sh") {
+if (-f "$CLAUDE_DATA/git-ssh-command.sh") {
     push @EXTRA_ENV, '-e', 'GIT_SSH_COMMAND=/root/.claude/git-ssh-command.sh';
 } elsif (-f "$PROJECT_PATH/deploy_key") {
     push @EXTRA_ENV, '-e', 'GIT_SSH_COMMAND=ssh -i /project/deploy_key -o StrictHostKeyChecking=no';
 }
 
-if (-f "$PROJECT_PATH/.claude-data/git-askpass.sh") {
-    push @EXTRA_MOUNTS, '-v', "$PROJECT_PATH/.claude-data/git-askpass.sh:/root/.claude/git-askpass.sh:ro";
-    push @EXTRA_MOUNTS, '-v', "$PROJECT_PATH/.claude-data/git-pat:/root/.claude/git-pat:ro";
+if (-f "$CLAUDE_DATA/git-askpass.sh") {
+    push @EXTRA_MOUNTS, '-v', "$CLAUDE_DATA/git-askpass.sh:/root/.claude/git-askpass.sh:ro";
+    push @EXTRA_MOUNTS, '-v', "$CLAUDE_DATA/git-pat:/root/.claude/git-pat:ro";
     push @EXTRA_ENV,    '-e', 'GIT_ASKPASS=/root/.claude/git-askpass.sh';
 
     # GIT_ASKPASS alone is no longer enough. Claude Code's Bash tool scrubs
@@ -1105,12 +1155,12 @@ if (-f "$PROJECT_PATH/.claude-data/git-askpass.sh") {
     # Regenerated every launch so sandboxes created before this fix self-heal
     # on their next container (re)create.
     ensure_git_credential_helper();
-    push @EXTRA_MOUNTS, '-v', "$PROJECT_PATH/.claude-data/git-credential-pat.sh:/root/.claude/git-credential-pat.sh:ro";
-    push @EXTRA_MOUNTS, '-v', "$PROJECT_PATH/.claude-data/gitconfig:/root/.config/git/config:ro";
+    push @EXTRA_MOUNTS, '-v', "$CLAUDE_DATA/git-credential-pat.sh:/root/.claude/git-credential-pat.sh:ro";
+    push @EXTRA_MOUNTS, '-v', "$CLAUDE_DATA/gitconfig:/root/.config/git/config:ro";
 }
 
-if (-f "$PROJECT_PATH/.claude-data/git-ssh-command.sh") {
-    push @EXTRA_MOUNTS, '-v', "$PROJECT_PATH/.claude-data/git-ssh-command.sh:/root/.claude/git-ssh-command.sh:ro";
+if (-f "$CLAUDE_DATA/git-ssh-command.sh") {
+    push @EXTRA_MOUNTS, '-v', "$CLAUDE_DATA/git-ssh-command.sh:/root/.claude/git-ssh-command.sh:ro";
 }
 
 # =====================================================================
@@ -1174,9 +1224,9 @@ my @BACKPACK_MOUNTS;
 # fix-up probe needed (the equivalent of the Docker setup's chown pass
 # is structurally unnecessary here).
 
-if (! -f "$PROJECT_PATH/.claude-data/.claude.json"
+if (! -f "$CLAUDE_DATA/.claude.json"
     && -f "$CONTAINER_CONFIG/claude.json") {
-    _copy_file("$CONTAINER_CONFIG/claude.json", "$PROJECT_PATH/.claude-data/.claude.json");
+    _copy_file("$CONTAINER_CONFIG/claude.json", "$CLAUDE_DATA/.claude.json");
 }
 
 # =====================================================================
@@ -1193,7 +1243,7 @@ if (! -f "$PROJECT_PATH/.claude-data/.claude.json"
 # The decision token comes back through a temp file under .launcher/ so
 # we don't need to fight the terminal to read it.
 sub pick_session_action {
-    my $sessions_dir = "$PROJECT_PATH/.claude-data/projects/-project";
+    my $sessions_dir = "$CLAUDE_DATA/projects/-project";
     my $out_file     = "$LAUNCHER_DIR/.session-pick";
     unlink $out_file;
     my $rc = system($^X, $SELECT_SESSION_PL,
@@ -1224,21 +1274,21 @@ sub pick_session_action {
 }
 
 # =====================================================================
-# Host data layout (.claude-data) + blueprint application
+# Host data layout (claude-home) + blueprint application
 # =====================================================================
 #
 # /root/.claude inside the container is a direct bind mount of the host's
-# <project>/.claude-data/. Session jsonl, tasks/, lockfiles, settings.json,
-# CLAUDE.md, .credentials.json, .launcher/ — all are live host files. No
-# podman cp round-trips, no seed-on-create, no rescue. The host filesystem
-# IS the state.
+# <project>/.ccpraxis-local-data/claude-home/ ($CLAUDE_DATA). Session jsonl,
+# tasks/, lockfiles, settings.json, CLAUDE.md, .credentials.json, .launcher/ —
+# all are live host files. No podman cp round-trips, no seed-on-create, no
+# rescue. The host filesystem IS the state.
 #
 # On container create we ensure the launcher's canonical copies of CLAUDE.md
-# / settings.json / .credentials.json live at .claude-data/ on the host so
+# / settings.json / .credentials.json live at claude-home/ on the host so
 # they appear at /root/.claude/{CLAUDE.md,settings.json,.credentials.json}
 # inside the container. Same for /root/.claude.json (which lives at
 # /root/, not /root/.claude/) — bind-mounted as a single-file mount from
-# .claude-data/.claude.json.
+# claude-home/.claude.json.
 #
 # Historical: from the first sandbox version through 2026-06, /root/.claude
 # was backed by a podman xfs volume to dodge two Hyper-V 9p bugs (O_APPEND
@@ -1248,7 +1298,7 @@ sub pick_session_action {
 # (O_APPEND, utimensat UTIME_NOW, utimensat explicit-timestamp) probes.
 
 sub apply_blueprints_to_host_data {
-    my $host_data = "$PROJECT_PATH/.claude-data";
+    my $host_data = "$CLAUDE_DATA";
     make_path($host_data) unless -d $host_data;
     if (-f $CONTAINER_CLAUDE_MD) {
         _copy_file($CONTAINER_CLAUDE_MD, "$host_data/CLAUDE.md");
@@ -1269,9 +1319,9 @@ sub apply_blueprints_to_host_data {
 # These helpers ensure each single-file bind has a host file to point at.
 
 sub ensure_claude_json_host_file {
-    my $host_json = "$PROJECT_PATH/.claude-data/.claude.json";
+    my $host_json = "$CLAUDE_DATA/.claude.json";
     return if -f $host_json;
-    my $host_data = "$PROJECT_PATH/.claude-data";
+    my $host_data = "$CLAUDE_DATA";
     make_path($host_data) unless -d $host_data;
     open(my $fh, '>', $host_json) or do {
         print STDERR "WARNING: couldn't create $host_json: $!\n";
@@ -1300,13 +1350,13 @@ sub ensure_credentials_json_host_file {
 # helper emits GitHub creds from the PAT mounted at ~/.claude/git-pat. It is
 # scoped to https://github.com in the config (the PAT is a GitHub fine-grained
 # token — never hand it to other hosts) and no-ops when no PAT file is present.
-# Both files live in .claude-data (already bind-mounted to /root/.claude); the
+# Both files live in claude-home (already bind-mounted to /root/.claude); the
 # config is additionally mounted at the XDG path /root/.config/git/config by
 # the caller. Rewritten every launch so the logic stays current and pre-fix
 # sandboxes heal. The host source files exist before `podman create` so the
 # single-file binds don't auto-create directories.
 sub ensure_git_credential_helper {
-    my $cd = "$PROJECT_PATH/.claude-data";
+    my $cd = "$CLAUDE_DATA";
     return unless -d $cd;
 
     my $helper = "$cd/git-credential-pat.sh";
@@ -1415,7 +1465,7 @@ sub kill_orphan_claudes_if_user_confirms {
 
 # Run claude inside the container. Returns claude's exit code.
 #
-# Host's .claude-data IS the live state via the bind mount, so claude's
+# Host's claude-home IS the live state via the bind mount, so claude's
 # writes land directly — no sync needed after exit.
 #
 # IMPORTANT: do NOT `podman stop` after claude exits. Other connector
@@ -1498,14 +1548,14 @@ if (! _container_exists($CONTAINER_NAME)) {
     push @podman_args, @EXTRA_ENV;
     push @podman_args,
         '-v', "${PROJECT_PATH}:/project",
-        # /root/.claude is a direct bind from host's .claude-data/.
+        # /root/.claude is a direct bind from host's claude-home/.
         # On WSL2 (and Linux/macOS hosts), the bind honors O_APPEND and
         # utimensat correctly — claude's session jsonl appends, task
         # store, lock manager, and settings writes all work as expected
         # with no volume + sync-sidecar workaround. See the "Host data
         # layout" comment block earlier in this file for history.
-        '-v', "${PROJECT_PATH}/.claude-data:/root/.claude",
-        # .launcher is OVERLAID as RO on top of the .claude-data bind.
+        '-v', "${CLAUDE_DATA}:/root/.claude",
+        # .launcher is OVERLAID as RO on top of the claude-home bind.
         # The directory is launcher-managed metadata (hashes, snapshots,
         # blueprint canonicals, container-created/-name) — a compromised
         # in-container process could otherwise fake hashes to bypass
@@ -1523,10 +1573,10 @@ if (! _container_exists($CONTAINER_NAME)) {
         '-v', "${SANDBOX_CREDENTIALS_FILE}:/root/.claude/.credentials.json",
         # .claude.json lives at /root/.claude.json (NOT inside
         # /root/.claude/), so it gets its own single-file bind from
-        # .claude-data/.claude.json. ensure_claude_json_host_file() above
+        # claude-home/.claude.json. ensure_claude_json_host_file() above
         # guarantees the host file exists so the mount doesn't auto-create
         # a directory.
-        '-v', "${PROJECT_PATH}/.claude-data/.claude.json:/root/.claude.json",
+        '-v', "${CLAUDE_DATA}/.claude.json:/root/.claude.json",
         '-v', "${CLAUDE_HOST_CONFIG}/ccpraxis/scripts/statusline.pl:/root/.claude/statusline.pl:ro";
     push @podman_args, @SKILL_MOUNTS;
     push @podman_args, @PLUGIN_MOUNTS;
@@ -1554,11 +1604,11 @@ if (! _container_exists($CONTAINER_NAME)) {
     # Detect those NOW — before podman start — and bail loudly, so the
     # user discovers the bug immediately instead of an hour later when
     # onboarding screens or missing CLAUDE.md tell them something's off.
-    # We scan the two paths that hold every host-side `-v` target (.claude-data
-    # and .claude-data/.launcher); a `;C` entry in either is unambiguous evidence.
+    # We scan the two paths that hold every host-side `-v` target (claude-home
+    # and claude-home/.launcher); a `;C` entry in either is unambiguous evidence.
     {
         my @stray;
-        for my $dir ("$PROJECT_PATH/.claude-data", $LAUNCHER_DIR) {
+        for my $dir ($CLAUDE_DATA, $LAUNCHER_DIR) {
             next unless -d $dir;
             opendir(my $dh, $dir) or next;
             while (my $entry = readdir $dh) {
@@ -1627,7 +1677,7 @@ if (! _container_exists($CONTAINER_NAME)) {
 
 my $BACKPACK_APPROVED      = 0;
 my $BACKPACK_TRUST_FILE    = "$LAUNCHER_DIR/backpack-trusted-hash";
-my $BACKPACK_HOST_FILE     = "$PROJECT_PATH/.claude-data/backpack.json";
+my $BACKPACK_HOST_FILE     = "$CLAUDE_DATA/backpack.json";
 my $BACKPACK_HOST_HASH;
 my $BACKPACK_HOST_PL       = "$CLAUDE_HOST_CONFIG/ccpraxis/plugins/backpack/scripts/backpack.pl";
 
@@ -1711,9 +1761,9 @@ log_ev('container_start', { exit => $start_rc >> 8, container => $CONTAINER_NAME
 # its own in-container refresher for installs that exceed that window).
 system($PODMAN, 'exec', $CONTAINER_NAME, 'touch', '/tmp/.launcher-alive');
 
-# Bind mount of .claude-data → /root/.claude means host filesystem IS
+# Bind mount of claude-home → /root/.claude means host filesystem IS
 # the live state. No seed, no rescue, no sync. Blueprint files were
-# already materialized to .claude-data/ before podman create — the bind
+# already materialized to claude-home/ before podman create — the bind
 # now exposes them in the container at the canonical paths. Same for
 # .claude.json's single-file bind. Nothing to do here.
 
@@ -1744,7 +1794,7 @@ if ($BACKPACK_APPROVED) {
         && (system($PODMAN, 'exec', $CONTAINER_NAME,
             'test', '-f', '/root/.claude/backpack.pl') == 0);
     if (!$has_helper) {
-        print STDERR "WARNING: Backpack found at .claude-data/backpack.json but backpack.pl isn't mounted in the container. Update ccpraxis (the launcher needs the plugin's backpack/scripts/backpack.pl) and rebuild.\n";
+        print STDERR "WARNING: Backpack found at $BACKPACK_HOST_FILE but backpack.pl isn't mounted in the container. Update ccpraxis (the launcher needs the plugin's backpack/scripts/backpack.pl) and rebuild.\n";
     } else {
         # Inline bash script: kick off the heartbeat refresher in the
         # background, run apt-get update + backpack install in the
@@ -1815,7 +1865,7 @@ sub enter_dashboard {
     }
 
     require Term::ReadKey;
-    my $log_path = "$PROJECT_PATH/.claude-data/sandbox-logs/launch-$LAUNCH_ID.log";
+    my $log_path = "$CLAUDE_DATA/sandbox-logs/launch-$LAUNCH_ID.log";
     my $cached_status = 'unknown';
     my $last_inspect  = 0;
 

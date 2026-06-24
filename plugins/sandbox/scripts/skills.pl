@@ -1617,7 +1617,7 @@ sub cmd_materialize_plugins {
 #     rewrite source.path AND installLocation to the mount target. See
 #     ccpraxis-local for the canonical "directory" entry shape on Windows.
 #
-# Output is a per-launch file written under .claude-data/plugins/ on the
+# Output is a per-launch file written under claude-home/plugins/ on the
 # host so it appears at /root/.claude/plugins/known_marketplaces.json as a
 # REAL file (not a single-file bind), letting Claude Code's atomic write
 # pattern (write tmp + rename) succeed when it updates `lastUpdated`.

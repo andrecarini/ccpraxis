@@ -414,7 +414,7 @@ sub inline_confirm {
 # ── Resolve host project path for sandbox dispatch ───────────
 # Used for legacy sandbox records without host_project_path. Walks the
 # registered sandbox project dirs and returns the first whose
-# .claude-data/beacons/<uuid>.json matches.
+# .ccpraxis-local-data/claude-home/beacons/<uuid>.json matches.
 sub resolve_host_path_via_walk {
     my $uuid = shift;
     return undef unless -f $REGISTRY_LOCAL;
@@ -430,7 +430,7 @@ sub resolve_host_path_via_walk {
         my $p = $reg->{projects}{$slug}{path} // next;
         $p =~ s/\\/\//g;
         $p =~ s{^/([a-zA-Z])/}{$1:/};
-        return $p if -f "$p/.claude-data/beacons/$uuid.json";
+        return $p if -f "$p/.ccpraxis-local-data/claude-home/beacons/$uuid.json";
     }
     return undef;
 }

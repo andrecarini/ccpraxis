@@ -70,4 +70,4 @@ Counts derived from the same array. If X or Y is 0, still show both (e.g. `3 bea
 ## Important
 
 - This skill is read-only. To resume a beaconed session use `claude-beacon` (interactive TUI). To delete a beacon use `/beacon:delete <id-or-prefix>`. To see one beacon's full record use `/beacon:view <id-or-prefix>`.
-- Inside a sandbox, the vault doesn't exist — `beacon.pl list --scope all` falls back to the project's local `.claude-data/beacons/` only. The empty-state message is the same in either environment.
+- Inside a sandbox, the vault doesn't exist — `beacon.pl list --scope all` falls back to the project's local `.ccpraxis-local-data/claude-home/beacons/` only. The empty-state message is the same in either environment.

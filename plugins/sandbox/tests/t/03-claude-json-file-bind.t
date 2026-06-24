@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# Single-file bind mount of host's .claude-data/.claude.json onto
+# Single-file bind mount of host's claude-home/.claude.json onto
 # /root/.claude.json (file, not directory). Tests:
 #   - host write before bind is visible inside container.
 #   - container write is visible on host (RW bind).

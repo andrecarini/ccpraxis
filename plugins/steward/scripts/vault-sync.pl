@@ -80,9 +80,9 @@ my @DEFAULT_TRACKABLE = (
     '.claude/commands',
     '.claude/plans',
     '.claude-plans',
-    '.claude-data/projects/-project/memory',  # in-container (sandbox) memory
-    '.claude-data/plans',
-    '.claude-data/backpack.json',
+    '.ccpraxis-local-data/claude-home/projects/-project/memory',  # in-container (sandbox) memory
+    '.ccpraxis-local-data/claude-home/plans',
+    '.ccpraxis-local-data/claude-home/backpack.json',
     '.ccpraxis-local-data/blueprints',
     $HOST_MEMORY_REL,                          # host-side memory (synthetic; see local_abs)
 );
@@ -96,9 +96,9 @@ my %HARD_EXCLUDE_EXACT = map { $_ => 1 } qw(
 
 # Hard-exclude prefixes — any tracked file whose relative path starts with one of these is dropped.
 my @HARD_EXCLUDE_PREFIXES = (
-    '.claude-data/git-pat',
-    '.claude-data/git-askpass.sh',
-    '.claude-data/git-ssh-command.sh',
+    '.ccpraxis-local-data/claude-home/git-pat',
+    '.ccpraxis-local-data/claude-home/git-askpass.sh',
+    '.ccpraxis-local-data/claude-home/git-ssh-command.sh',
 );
 
 # Hard-exclude regexes — matched (case-insensitively, against the lowercased rel

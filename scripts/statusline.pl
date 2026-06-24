@@ -102,14 +102,14 @@ eval {
         push @parts, "${DIM}todos ${R}${n}" if $n > 0;
     }
 
-    # Beacons: project = local .claude-data/beacons + vault beacons whose
-    # git_root matches $root. Global = cached count file, falling back to
-    # a vault-dir filename walk when the cache hasn't been written yet.
+    # Beacons: project = local .ccpraxis-local-data/claude-home/beacons + vault
+    # beacons whose git_root matches $root. Global = cached count file, falling
+    # back to a vault-dir filename walk when the cache hasn't been written yet.
     # Rendered as a single segment: ◉ <project> <global-dim>.
     my $vault_bdir = "$ENV{HOME}/.claude/claude-code-vault/beacons";
     my $n_project  = 0;
     if ($root) {
-        my $local_bdir = "$root/.claude-data/beacons";
+        my $local_bdir = "$root/.ccpraxis-local-data/claude-home/beacons";
         if (-d $local_bdir && opendir(my $dh, $local_bdir)) {
             $n_project += grep { /\.json$/ && !/^\./ } readdir($dh);
             closedir($dh);

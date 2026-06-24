@@ -2,10 +2,10 @@
 # bootstrap.pl — interactive bootstrap for `claude-sandbox`
 # (plugins/sandbox/scripts/).
 #
-# Invoked by launcher.pl on first launch in a project (when `.claude-data/`
-# is absent and the user confirms the bootstrap prompt). Performs what the
-# old `/sandbox` skill used to do — deterministic, perl-driven, no agent
-# in the loop.
+# Invoked by launcher.pl on first launch in a project (when the sandbox home
+# `.ccpraxis-local-data/claude-home/` is absent and the user confirms the
+# bootstrap prompt). Performs what the old `/sandbox` skill used to do —
+# deterministic, perl-driven, no agent in the loop.
 #
 # Steps (mirrors the legacy skill's 7-step flow, minus the redundant
 # "tell user to run claude-sandbox" since the launcher continues
@@ -13,8 +13,9 @@
 #
 #   1. Verify container-config (plugins/sandbox/container/) exists.
 #   2. Build the container image if not already built (requires Docker or Podman — auto-detected).
-#   3. Create the project's `.claude-data/` directory.
-#   4. Append `.claude-data` and `deploy_key` to `.gitignore`.
+#   3. Create the project's `.ccpraxis-local-data/claude-home/` directory
+#      (self-gitignored via the data root's inner .gitignore = '*').
+#   4. Append `deploy_key` to `.gitignore` (.ccpraxis-local-data self-ignores).
 #   5. Git auth setup (auto-detect remote, prompt for PAT/SSH key).
 #   6. Wire `claude-sandbox` into PATH via the install hook.
 #
@@ -319,13 +320,27 @@ if ($? == 0) {
 }
 
 # =====================================================================
-# Step 3: create .claude-data/
+# Step 3: create the single ccpraxis data root + sandbox home
 # =====================================================================
+#
+# The project carries ONE ccpraxis data dir at its root,
+# <project>/.ccpraxis-local-data/, self-gitignored (inner .gitignore = '*',
+# matching steward/blueprint onboard) so credentials + sandbox state are never
+# committed. The sandbox's container-home (bind source for /root/.claude) nests
+# under it at claude-home/ (was <project>/.claude-data/ before consolidation).
 
-log_step("Step 3/6: create .claude-data/");
-my $claude_data = "$PROJECT_PATH/.claude-data";
+log_step("Step 3/6: create .ccpraxis-local-data/claude-home/");
+my $ccpraxis_data = "$PROJECT_PATH/.ccpraxis-local-data";
+my $claude_data   = "$ccpraxis_data/claude-home";
+make_path($ccpraxis_data) unless -d $ccpraxis_data;
+my $self_gi = "$ccpraxis_data/.gitignore";
+unless (-f $self_gi) {
+    open my $g, '>', $self_gi or die_bootstrap("cannot write $self_gi: $!");
+    print $g "*\n";
+    close $g;
+}
 if (-d $claude_data) {
-    log_skip(".claude-data/ already exists");
+    log_skip("claude-home/ already exists");
 } else {
     make_path($claude_data) or die_bootstrap("mkdir $claude_data: $!");
     log_done("created $claude_data");
@@ -349,7 +364,9 @@ if (-f $gitignore) {
     close $fh;
 }
 
-my @needs = grep { !$existing{$_} } ('.claude-data', 'deploy_key');
+# .ccpraxis-local-data/ self-gitignores (inner .gitignore = '*'), so it needs no
+# root-.gitignore entry; only the project-root deploy_key does.
+my @needs = grep { !$existing{$_} } ('deploy_key');
 if (@needs) {
     open my $fh, '>>:raw', $gitignore
         or die_bootstrap("cannot append to $gitignore: $!");

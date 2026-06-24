@@ -2,7 +2,7 @@
 
 A Docker- or Podman-based isolated dev container for Claude Code.
 Per-project sandbox with explicit mounts for skills, plugins, and a
-host-bind-mounted `.claude-data/` directory for live session storage.
+host-bind-mounted `.ccpraxis-local-data/claude-home/` directory for live session storage.
 
 > ## ⚠  Windows users: do NOT use the Hyper-V backend.
 >
@@ -91,19 +91,19 @@ workaround OR (better) switch off that backend.
 ## Architecture
 
 ```
-HOST                                                  CONTAINER (docker OR podman)
-─────────────────────────────────────────────────────────────────────────────────────
-<project>/                                      ──►  /project                       (bind, RW)
-<project>/.claude-data/                         ──►  /root/.claude                  (bind, RW)
-<project>/.claude-data/.launcher/               ──►  /root/.claude/.launcher        (bind, RO overlay)
-<project>/.claude-data/.launcher/credentials.json ──► /root/.claude/.credentials.json (file bind, RW)
-<project>/.claude-data/.claude.json             ──►  /root/.claude.json             (file bind, RW)
-~/.claude/ccpraxis/scripts/statusline.pl        ──►  /root/.claude/statusline.pl    (file bind, RO)
-<each selected skill dir>                       ──►  /root/.claude/skills/<name>    (bind, RO)
-~/.claude/plugins/cache + manifests             ──►  /root/.claude/plugins/...      (bind, RO)
+HOST                                                                         CONTAINER (docker OR podman)
+─────────────────────────────────────────────────────────────────────────────────────────────────────────
+<project>/                                                               ──►  /project                       (bind, RW)
+<project>/.ccpraxis-local-data/claude-home/                             ──►  /root/.claude                  (bind, RW)
+<project>/.ccpraxis-local-data/claude-home/.launcher/                   ──►  /root/.claude/.launcher        (bind, RO overlay)
+<project>/.ccpraxis-local-data/claude-home/.launcher/credentials.json   ──►  /root/.claude/.credentials.json (file bind, RW)
+<project>/.ccpraxis-local-data/claude-home/.claude.json                 ──►  /root/.claude.json             (file bind, RW)
+~/.claude/ccpraxis/scripts/statusline.pl                                ──►  /root/.claude/statusline.pl    (file bind, RO)
+<each selected skill dir>                                               ──►  /root/.claude/skills/<name>    (bind, RO)
+~/.claude/plugins/cache + manifests                                     ──►  /root/.claude/plugins/...      (bind, RO)
 ```
 
-**Host filesystem is the live state.** `<project>/.claude-data/` is the
+**Host filesystem is the live state.** `<project>/.ccpraxis-local-data/claude-home/` is the
 container's `/root/.claude/` — claude's session jsonl, tasks/, lockfiles,
 settings.json, and CLAUDE.md are all writable host files. No volume,
 no sync sidecar, no `podman cp` round-trips.
@@ -112,10 +112,10 @@ no sync sidecar, no `podman cp` round-trips.
 
 The launcher applies these in order during `podman create`:
 
-1. **`.claude-data` → `/root/.claude` (RW)** — the bulk bind. Sessions,
+1. **`.ccpraxis-local-data/claude-home` → `/root/.claude` (RW)** — the bulk bind. Sessions,
    tasks, lockfiles, blueprint copies (`CLAUDE.md`, `settings.json`) all
    land here. `apply_blueprints_to_host_data` writes the canonicals
-   from `.launcher/` to `.claude-data/` on container create so they
+   from `.launcher/` to `.ccpraxis-local-data/claude-home/` on container create so they
    appear at the standard paths inside.
 
 2. **`.launcher` → `/root/.claude/.launcher:ro` (RO overlay)** — defends
@@ -134,7 +134,7 @@ The launcher applies these in order during `podman create`:
    writes persist across container rebuild without any sync step, and
    the rest of `.launcher/` stays RO.
 
-4. **`.claude-data/.claude.json` → `/root/.claude.json` (RW single-file
+4. **`.ccpraxis-local-data/claude-home/.claude.json` → `/root/.claude.json` (RW single-file
    bind)** — claude-code's outside-`/root/.claude/` config file. Same
    reasoning as #3 (single file, must exist on host before mount —
    `ensure_claude_json_host_file` touches it if missing).
@@ -143,14 +143,14 @@ The launcher applies these in order during `podman create`:
 
 ## Data durability
 
-| Event | Host's `.claude-data/` state |
-|-------|------------------------------|
+| Event | Host's `.ccpraxis-local-data/claude-home/` state |
+|-------|--------------------------------------------------|
 | Container freshly created | Blueprint files written to host before mount; .claude.json placeholder ensured |
 | claude session writes a turn | Host sees it immediately (bind mount) |
 | claude exits cleanly | Host already has everything — no final sync needed |
 | Container crashes | Host already has everything — no rescue needed |
-| User deletes container | Re-create + bind mount gets the same `.claude-data/` back |
-| User deletes `.claude-data/` | All sandbox state for this project is gone (this IS the storage) |
+| User deletes container | Re-create + bind mount gets the same `.ccpraxis-local-data/claude-home/` back |
+| User deletes `.ccpraxis-local-data/claude-home/` | All sandbox state for this project is gone (this IS the storage) |
 | Manager terminal closes or crashes | `/tmp/.launcher-alive` sentinel goes stale; container's heartbeat loop self-reaps within HB(300s)+GRACE(10s) — no orphan containers |
 
 ### Multi-session
@@ -274,7 +274,7 @@ it stays alive + processing throughout.
 │   ├── launcher.pl                    # main entrypoint (manager + connector modes)
 │   ├── MountSpec.pm                   # mount-spec parsing (bind vs volume)
 │   ├── select-session.pl              # picker TUI (used in connector mode)
-│   ├── bootstrap.pl                   # first-time .claude-data setup
+│   ├── bootstrap.pl                   # first-time .ccpraxis-local-data/claude-home setup
 │   └── skills.pl                      # discovery + selection state
 ├── skills/
 │   ├── setup/                         # /sandbox:setup

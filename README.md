@@ -58,7 +58,7 @@ Once installed, here's what you'll actually type day-to-day, grouped by job:
 
 **Adding a new project to your personal vault.** `cd` into the project and run `/steward:setup-project`. The skill picks a slug, lets you confirm which files to track, and does an initial sync. On a fresh machine, the same command surfaces vault-only "orphan" projects so you can link the local directory back to existing vault state.
 
-**Starting work in a new project that needs dev tooling.** Exit Claude, then run `claude-sandbox` from a terminal in the project root. On first launch it walks you through bootstrap interactively (image build, git auth, `.claude-data/` setup) then drops you into a containerized Claude session. From inside an existing Claude session, `/sandbox:setup` does the same check and tells you what to do next — it can't run the bootstrap itself because the prompts need the controlling tty.
+**Starting work in a new project that needs dev tooling.** Exit Claude, then run `claude-sandbox` from a terminal in the project root. On first launch it walks you through bootstrap interactively (image build, git auth, `.ccpraxis-local-data/` setup) then drops you into a containerized Claude session. From inside an existing Claude session, `/sandbox:setup` does the same check and tells you what to do next — it can't run the bootstrap itself because the prompts need the controlling tty.
 
 **Marking a session to resume later.** Run `/beacon:on [label]`. Claude also self-invokes this when the session has substantive ongoing work (a plan, multi-file edits, a multi-step task). When you're done, `/beacon:off` removes the current session's mark.
 
@@ -235,13 +235,13 @@ ccpraxis/
 │   │   │   └── settings.json                # Container-specific settings
 │   │   ├── scripts/
 │   │   │   ├── MountSpec.pm
-│   │   │   ├── bootstrap.pl                 # First-launch setup invoked by launcher.pl when .claude-data is missing. 6 steps: verify container blueprint, build image, mkdir .claude-data, append .gitignore, git auth (HTTPS PAT / SSH deploy-key), invoke ccpraxis-install.pl. Fully interactive over the launcher's tty.
+│   │   │   ├── bootstrap.pl                 # First-launch setup invoked by launcher.pl when .ccpraxis-local-data/claude-home is missing. 6 steps: verify container blueprint, build image, mkdir .ccpraxis-local-data/claude-home, self-gitignore via inner .gitignore, git auth (HTTPS PAT / SSH deploy-key), invoke ccpraxis-install.pl. Fully interactive over the launcher's tty.
 │   │   │   ├── launcher.pl                  # The actual claude-sandbox launcher: arg parsing, bootstrap detection, lock + dead-PID cleanup, image build, TUI selector orchestration, staleness check, mount assembly, container create-or-reattach. Wrappers in bin/ are tiny shims that exec into this.
 │   │   │   ├── select-session.pl            # TUI session picker for the claude-sandbox launcher.
 │   │   │   └── skills.pl                    # Discovery/selection backend for the launcher: enumerates custom + plugin skills + plugins + MCP servers, drives the interactive TUI picker, writes selection state and diff reports the launcher consumes.
 │   │   ├── skills/
 │   │   │   ├── setup/
-│   │   │   │   └── SKILL.md                 # /sandbox:setup — confirms .claude-data state and tells the user to exit Claude and run `claude-sandbox`
+│   │   │   │   └── SKILL.md                 # /sandbox:setup — confirms .ccpraxis-local-data/claude-home state and tells the user to exit Claude and run `claude-sandbox`
 │   │   │   └── test/
 │   │   │       └── SKILL.md                 # Run the sandbox plugin's verification suite — proves the bind-mount honors O_…
 │   │   └── tests/
@@ -374,7 +374,7 @@ Two deliberate exceptions: the `butler` and `blueprint` plugins each carry a sma
 - `/steward:ccpraxis-extend` — single entrypoint to add a new skill/plugin or change an existing one; decides the shape (packaging rule) and wires it in. `host-only`.
 
 **Sandbox**
-- `/sandbox:setup` — confirm `.claude-data/` state and direct the user to run `claude-sandbox` from a terminal. `host-only`.
+- `/sandbox:setup` — confirm `.ccpraxis-local-data/claude-home/` state and direct the user to run `claude-sandbox` from a terminal. `host-only`.
 
 **Beacons** (`beacon@ccpraxis-local` plugin)
 - `/beacon:on [label]` — mark the current session as ongoing work (idempotent — re-invoking refreshes the activity timestamp)
@@ -456,11 +456,11 @@ claude-code-vault/
 - `.claude/skills/`, `.claude/agents/`, `.claude/hooks/`, `.claude/commands/`, `.claude/plans/`
 - `<.claude-plans/>` (legacy persistent plans, if any remain in a project)
 - `.ccpraxis-local-data/blueprints/` (authored blueprints — see Blueprint plugin; the machine-local `runs/` execution state is hard-excluded)
-- `.claude-data/projects/-project/memory/` (in-sandbox memory; the path where Claude Code lands memory under the `.claude-data:/root/.claude` bind) and `.claude-data/plans/` (sandbox state)
+- `.ccpraxis-local-data/claude-home/projects/-project/memory/` (in-sandbox memory; the path where Claude Code lands memory under the `.ccpraxis-local-data/claude-home:/root/.claude` bind) and `.ccpraxis-local-data/claude-home/plans/` (sandbox state)
 - `_host-memory` (synthetic path resolving to `~/.claude/projects/<encoded-project-cwd>/memory/` on each machine — backs up the host-side Claude memory for this project)
-- `.claude-data/backpack.json` (per-project sandbox backpack — see Backpack plugin)
+- `.ccpraxis-local-data/claude-home/backpack.json` (per-project sandbox backpack — see Backpack plugin)
 
-**Hard-excluded (never offered):** `.claude/settings.local.json`, `.claude-data/git-pat`, `.claude-data/git-askpass.sh`, `.claude-data/git-ssh-command.sh`, `deploy_key`, `.ccpraxis-local-data/blueprints/<name>/runs/`.
+**Hard-excluded (never offered):** `.claude/settings.local.json`, `.ccpraxis-local-data/claude-home/git-pat`, `.ccpraxis-local-data/claude-home/git-askpass.sh`, `.ccpraxis-local-data/claude-home/git-ssh-command.sh`, `deploy_key`, `.ccpraxis-local-data/blueprints/<name>/runs/`.
 
 To change what's offered by default, edit `@DEFAULT_TRACKABLE` and `%HARD_EXCLUDE_EXACT` / `@HARD_EXCLUDE_PREFIXES` at the top of `plugins/steward/scripts/vault-sync.pl`. Per-project selection is captured at registration time in `<project>/.claude/backup-metadata.json → tracked_paths`.
 
@@ -480,11 +480,11 @@ To change what's offered by default, edit `@DEFAULT_TRACKABLE` and `%HARD_EXCLUD
 
 The canonical entry point is the **`claude-sandbox` host launcher**. The global `CLAUDE.md` instructs Claude to never run dev tooling on the host — when a project needs it, Claude offers to set up a sandbox and tells the user to exit the session and run `claude-sandbox` in the project.
 
-**`/sandbox:setup` (from inside Claude) does NOT run any of this.** It's a thin skill that checks for `.claude-data/` and, depending on state, tells the user to either (a) exit Claude and run `claude-sandbox` from a terminal, or (b) just run `claude-sandbox` since a sandbox is already configured. The actual bootstrap is interactive (it prompts for PAT or SSH key choice) and must own the controlling tty — Claude can't answer the prompts from inside a session.
+**`/sandbox:setup` (from inside Claude) does NOT run any of this.** It's a thin skill that checks for `.ccpraxis-local-data/claude-home/` and, depending on state, tells the user to either (a) exit Claude and run `claude-sandbox` from a terminal, or (b) just run `claude-sandbox` since a sandbox is already configured. The actual bootstrap is interactive (it prompts for PAT or SSH key choice) and must own the controlling tty — Claude can't answer the prompts from inside a session.
 
 **Lifecycle.** Each project gets a **persistent container** (Docker or Podman, auto-detected by the launcher) — installed packages, runtimes, and tools survive between sessions. On every launch, `plugins/sandbox/scripts/launcher.pl`:
 
-1. **First-time bootstrap** — if `.claude-data/` doesn't exist, prompts `Set up a new sandbox for this project? [Y/n]` and on confirm runs `plugins/sandbox/scripts/bootstrap.pl` (deterministic, perl-driven; no Claude session involved). The bootstrap verifies `plugins/sandbox/container/`, confirms Docker or Podman is reachable (and prints platform-specific install guidance if not), builds the image if missing, creates `.claude-data/`, appends `.claude-data` + `deploy_key` to `.gitignore`, sets up git auth interactively (HTTPS → PAT, SSH → deploy key; skipped if `git-askpass.sh` or `deploy_key` is already present), and runs the PATH install hook. After it returns, the launcher continues with the rest of the flow in the same invocation.
+1. **First-time bootstrap** — if `.ccpraxis-local-data/claude-home/` doesn't exist, prompts `Set up a new sandbox for this project? [Y/n]` and on confirm runs `plugins/sandbox/scripts/bootstrap.pl` (deterministic, perl-driven; no Claude session involved). The bootstrap verifies `plugins/sandbox/container/`, confirms Docker or Podman is reachable (and prints platform-specific install guidance if not), builds the image if missing, creates `.ccpraxis-local-data/claude-home/` (self-gitignored via an inner `.gitignore = *`), sets up git auth interactively (HTTPS → PAT, SSH → deploy key; skipped if `git-askpass.sh` or `deploy_key` is already present), and runs the PATH install hook. After it returns, the launcher continues with the rest of the flow in the same invocation.
 2. **Image build** — builds the `claude-sandbox` image if it doesn't exist yet (no-op when bootstrap already built it).
 3. **Skill selection** — on every manager-mode launch, discovers available skills (custom + plugin) and plugins/MCPs, and presents an interactive arrow-keys+space TUI picker (`skills.pl select-interactive`). Selections are saved per project; if nothing changed since last launch the TUI is still shown but the previous selection is pre-loaded.
 4. **Staleness check** — detects conditions that may warrant a rebuild:
@@ -494,9 +494,9 @@ The canonical entry point is the **`claude-sandbox` host launcher**. The global 
    - Launcher scripts changed since container was created
    - Container-blueprint CLAUDE.md or settings.json drift since last sandbox refresh (plugins/sandbox/container/)
    - Skill / plugin / plugin-path drift since the container was created
-5. **Create or reattach** — creates a new container (with the full skill, plugin, MCP, credential, and git-auth mount set) or reattaches to an existing one. On fresh creation, if `.claude-data/backpack.json` exists, the launcher prompts to run the backpack install pass before handing off to Claude.
+5. **Create or reattach** — creates a new container (with the full skill, plugin, MCP, credential, and git-auth mount set) or reattaches to an existing one. On fresh creation, if `.ccpraxis-local-data/claude-home/backpack.json` exists, the launcher prompts to run the backpack install pass before handing off to Claude.
 
-Container names are deterministic per project path (hash-based), stored in `.claude-data/.launcher/container-name`.
+Container names are deterministic per project path (hash-based), stored in `.ccpraxis-local-data/claude-home/.launcher/container-name`.
 
 The container runs `claude --dangerously-skip-permissions` as root — full autonomy inside the sandbox. With rootless Podman, container root is mapped to the unprivileged host user via the kernel's user namespace, so files written to `/project` come out owned by the host user (no chown dance) and a container escape lands as the unprivileged host user, not host root. Docker Desktop uses a similar VM-isolation model on Windows/macOS. The container-specific `CLAUDE.md` tells Claude it can install and run anything, while still enforcing supply chain rules.
 
@@ -505,12 +505,12 @@ The container runs `claude --dangerously-skip-permissions` as root — full auto
 | Mount | Access | What |
 |-------|--------|------|
 | Project directory | Read/Write | Code lives at `/project` inside the container |
-| `.claude-data/` → `/root/.claude/` | Read/Write | Persists memories, conversation history, plans between sessions (bulk bind) |
-| `.claude-data/.claude.json` → `/root/.claude.json` | Read/Write | Claude settings (onboarding bypass, UI hints) — single-file bind outside `/root/.claude/` |
-| `.claude-data/.launcher/` → `/root/.claude/.launcher/` | Read-only | Launcher-managed metadata (hashes, snapshots, blueprint canonicals, container-name) — overlaid RO on top of the bulk bind |
-| `.claude-data/.launcher/.credentials.json` → `/root/.claude/.credentials.json` | Read/Write | Auth tokens; container writes here so `mcpOAuth.*` tokens persist across rebuilds — single-file RW bind over the RO `.launcher/` overlay |
-| `CLAUDE.md`, `settings.json` | Read/Write | Blueprint copies in `.claude-data/.launcher/` (written on first create; RW via the bulk bind above); the container can freely modify them — drift from upstream is detected via stored hash |
-| `statusline.pl` | Read-only | Custom statusline script (from the ccpraxis repo, not `.claude-data/`) |
+| `.ccpraxis-local-data/claude-home/` → `/root/.claude/` | Read/Write | Persists memories, conversation history, plans between sessions (bulk bind) |
+| `.ccpraxis-local-data/claude-home/.claude.json` → `/root/.claude.json` | Read/Write | Claude settings (onboarding bypass, UI hints) — single-file bind outside `/root/.claude/` |
+| `.ccpraxis-local-data/claude-home/.launcher/` → `/root/.claude/.launcher/` | Read-only | Launcher-managed metadata (hashes, snapshots, blueprint canonicals, container-name) — overlaid RO on top of the bulk bind |
+| `.ccpraxis-local-data/claude-home/.launcher/.credentials.json` → `/root/.claude/.credentials.json` | Read/Write | Auth tokens; container writes here so `mcpOAuth.*` tokens persist across rebuilds — single-file RW bind over the RO `.launcher/` overlay |
+| `CLAUDE.md`, `settings.json` | Read/Write | Blueprint copies in `.ccpraxis-local-data/claude-home/.launcher/` (written on first create; RW via the bulk bind above); the container can freely modify them — drift from upstream is detected via stored hash |
+| `statusline.pl` | Read-only | Custom statusline script (from the ccpraxis repo, not `.ccpraxis-local-data/claude-home/`) |
 | Selected skills | Read-only | Skills chosen via the interactive picker |
 | `git-askpass.sh`, `git-pat` | Read-only | PAT-based git auth (if configured) |
 | `git-ssh-command.sh` | Read-only | SSH deploy key wrapper (if configured) |
@@ -526,7 +526,7 @@ Available skills for this sandbox:
 
 - Skills with `host-only: true` in their YAML frontmatter are excluded (e.g. `/steward:backup`, `/steward:ccpraxis-extend`, `/sandbox:setup`, `/steward:update`)
 - Both custom skills and plugin skills (and MCP servers) are discovered automatically
-- Selections are saved per project in `.claude-data/.launcher/selected-skills.json` and pre-loaded on the next launch
+- Selections are saved per project in `.ccpraxis-local-data/claude-home/.launcher/selected-skills.json` and pre-loaded on the next launch
 
 **Network.** Two ranges are mapped 1:1 to the host. **9010–9019** are published but not bridged — bind `0.0.0.0:N` directly for dev servers/emulators (the common case; nothing squats them). **9000–9009** are published *and* socat-bridged (`0.0.0.0:N → 127.0.0.1:N`) so loopback-bound listeners like Claude Code's OAuth callback receiver are reachable from the host; a wildcard-binding server here collides with the bridge and must evict it first. The user accesses either range at `http://localhost:N` from the host browser.
 
@@ -556,7 +556,7 @@ Container runtimes do not support fine-grained "allow only port X" rules at the 
 
 `backpack@ccpraxis-local` gives every sandbox project a declarative record of what tools, runtimes, and project-setup commands it needs — so on every container rebuild, the inside-sandbox environment is restored automatically without the agent reinstalling everything from scratch.
 
-**Where it lives.** `<project>/.claude-data/backpack.json` on the host. Inside the sandbox container, that's `~/.claude/backpack.json` (which is `/root/.claude/backpack.json` — `.claude-data/` is bind-mounted at `/root/.claude/`). Per-project, host-side, durable across container destruction. Cross-machine sync via vault-sync's `@DEFAULT_TRACKABLE` (added in a follow-up patch); the sibling `.claude-data/.launcher/backpack-trusted-hash` is intentionally *not* tracked so a new machine hits the loud first-time warning on the next rebuild.
+**Where it lives.** `<project>/.ccpraxis-local-data/claude-home/backpack.json` on the host. Inside the sandbox container, that's `~/.claude/backpack.json` (which is `/root/.claude/backpack.json` — `.ccpraxis-local-data/claude-home/` is bind-mounted at `/root/.claude/`). Per-project, host-side, durable across container destruction. Cross-machine sync via vault-sync's `@DEFAULT_TRACKABLE` (added in a follow-up patch); the sibling `.ccpraxis-local-data/claude-home/.launcher/backpack-trusted-hash` is intentionally *not* tracked so a new machine hits the loud first-time warning on the next rebuild.
 
 **Schema (v2).** Validated by `backpack.pl validate`. Top-level:
 
@@ -584,7 +584,7 @@ The `project-setup` category handles project-level setup commands (e.g. `npm ci 
 
 The hook **does not write to backpack.json**. It detects install-shape commands, filters out items already in the backpack, and emits a `hookSpecificOutput.additionalContext` block with pre-filled `/backpack:add` invocations and `<WHY>` placeholders for the rationale. Claude decides per-item whether to commit (replacing `<WHY>` with a real one-line reason) or skip (one-off install). If skipped, no pollution lands; if the agent installs the same thing again later, they get re-prompted. The retry cost is near-zero, the pollution problem (one-off `apt-get install -y jq` to inspect a JSON, then never needed again) is structurally avoided. A safe-name regex `^[\@a-zA-Z0-9][a-zA-Z0-9._/+\-]*$` rejects parsed tokens that don't look like real package names. The hook always exits 0 — failures must not disrupt Claude.
 
-**Trust-hash defense.** `.claude-data/.launcher/backpack-trusted-hash` (host-side, `:ro`-mounted into the container so it's tamper-evident) defends against two attack scenarios: a backpack.json supplied by a third-party project clone, or one overwritten by a compromised in-container agent. Both would otherwise run `install`/`verify` commands as root on the next launcher pass. On every launch:
+**Trust-hash defense.** `.ccpraxis-local-data/claude-home/.launcher/backpack-trusted-hash` (host-side, `:ro`-mounted into the container so it's tamper-evident) defends against two attack scenarios: a backpack.json supplied by a third-party project clone, or one overwritten by a compromised in-container agent. Both would otherwise run `install`/`verify` commands as root on the next launcher pass. On every launch:
 
 - **No stored hash** → loud "FIRST TIME — may have shipped with the project" warning, prompt defaults to `[y/N]`
 - **Stored but mismatched** → soft "changed since last approval" notice, default `[Y/n]` (legitimate in-session adds)
@@ -592,7 +592,7 @@ The hook **does not write to backpack.json**. It detects install-shape commands,
 
 The hash is written only on user approval.
 
-**Launcher integration.** On every container create (fresh first-time setup OR rebuild), if `<project>/.claude-data/backpack.json` exists, the launcher:
+**Launcher integration.** On every container create (fresh first-time setup OR rebuild), if `<project>/.ccpraxis-local-data/claude-home/backpack.json` exists, the launcher:
 
 1. Validates the schema with `backpack.pl validate` (bails cleanly to the exec hand-off if the schema is bad)
 2. Shows the contents with `backpack.pl list`
@@ -612,7 +612,7 @@ The install pass runs after `release_lock`. In manager mode the launcher then en
 
 ### Beacon plugin
 
-`beacon@ccpraxis-local` marks Claude Code sessions as "ongoing meaningful work" so they can be resumed across restarts, terminal crashes, and context switches. Beacon state lives in the vault (host sessions) or `<project>/.claude-data/beacons/` (sandbox sessions, ingested into the vault by a background sync), survives Claude wiping its own session data, and shows up as two counters on the statusline (project-local + global).
+`beacon@ccpraxis-local` marks Claude Code sessions as "ongoing meaningful work" so they can be resumed across restarts, terminal crashes, and context switches. Beacon state lives in the vault (host sessions) or `<project>/.ccpraxis-local-data/claude-home/beacons/` (sandbox sessions, ingested into the vault by a background sync), survives Claude wiping its own session data, and shows up as two counters on the statusline (project-local + global).
 
 The system is packaged as a local Claude Code **plugin**, bundling every skill with the shared scripts at a stable `${CLAUDE_PLUGIN_ROOT}` path. Enable it once via `enabledPlugins` in `~/.claude/settings.json` (already wired in this repo's `global-config/settings.json`). Slash commands all live under the `/beacon:*` namespace; one verb per skill.
 

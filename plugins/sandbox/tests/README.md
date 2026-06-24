@@ -19,8 +19,8 @@ runs are safe (resources tagged with `claude-sandbox-test-$$-…`).
 | File | Claim |
 |---|---|
 | `01-bind-honors-append-and-utimensat.t` | Current container backend's host bind mount honors O_APPEND, utimensat UTIME_NOW, utimensat explicit timestamp — the assumption replacing the retired xfs-volume workaround |
-| `02-launcher-bind-mount-shape.t` | Launcher mounts `/root/.claude` from `.claude-data` (host bind, not a volume) + single-file bind for `/root/.claude.json`; no `CLAUDE_DATA_VOLUME` residue |
-| `03-claude-json-file-bind.t` | Single-file bind of `.claude-data/.claude.json` → `/root/.claude.json` works RW from both sides; mount target is a file, not an auto-created directory |
+| `02-launcher-bind-mount-shape.t` | Launcher mounts `/root/.claude` from `.ccpraxis-local-data/claude-home` (host bind, not a volume) + single-file bind for `/root/.claude.json`; no `CLAUDE_DATA_VOLUME` residue |
+| `03-claude-json-file-bind.t` | Single-file bind of `.ccpraxis-local-data/claude-home/.claude.json` → `/root/.claude.json` works RW from both sides; mount target is a file, not an auto-created directory |
 | `04-runtime-detection.t` | Same `_detect_container_cli` helper is present in all three scripts (launcher.pl, bootstrap.pl, TestSandbox.pm); the detected CLI responds to `--version` |
 | `06-launcher-ro-protection.t` | `.launcher` RO overlay enforced at kernel mount level (container reads succeed, writes blocked); `.credentials.json` + `.claude.json` single-file binds remain RW |
 | `07-mountspec-volume-vs-bind.t` | `MountSpec::v_to_mount` correctly classifies path-shaped sources as `type=bind` and bare-identifier sources as `type=volume` |
@@ -79,7 +79,7 @@ bash tests/manual/longrun-freeze-check.sh [PROJECT_DIR]
 ```
 
 `PROJECT_DIR` is an optional path to an existing project directory whose
-`.claude-data/` and `.claude-data/.claude.json` are bound into the container
+`.ccpraxis-local-data/claude-home/` and `.ccpraxis-local-data/claude-home/.claude.json` are bound into the container
 exactly as the launcher does. If omitted, a scratch project is created under
 `$HOME/.cache/sandbox-tests/` and removed on exit.
 

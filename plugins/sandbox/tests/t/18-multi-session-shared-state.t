@@ -1,7 +1,7 @@
 #!/usr/bin/env perl
 # Multi-session use case: two `claude-sandbox` invocations on the same
 # project share the SAME container and the SAME host bind mount of
-# .claude-data. This test exercises the shared-state guarantees that
+# claude-home. This test exercises the shared-state guarantees that
 # matter on the new bind-mount architecture:
 #
 #   - Both processes see the same files under /root/.claude.

@@ -53,10 +53,10 @@ use_ok('LaunchLog') or BAIL_OUT('LaunchLog.pm did not load');
 # ===========================================================================
 {
     my $root = tempdir(CLEANUP => 1);
-    my $path = "$root/.claude-data/sandbox-logs/launch-x.log";   # nested, must be created
+    my $path = "$root/.ccpraxis-local-data/claude-home/sandbox-logs/launch-x.log";   # nested, must be created
     my $fh = LaunchLog::open_log($path);
     ok($fh, 'open_log: returns a handle');
-    ok(-d "$root/.claude-data/sandbox-logs", 'open_log: created the parent dir');
+    ok(-d "$root/.ccpraxis-local-data/claude-home/sandbox-logs", 'open_log: created the parent dir');
 
     is(LaunchLog::event($fh, 'a', { i => 1 }), 1, 'event: writes (returns 1)');
     is(LaunchLog::event($fh, 'b', { i => 2 }), 1, 'event: writes again');

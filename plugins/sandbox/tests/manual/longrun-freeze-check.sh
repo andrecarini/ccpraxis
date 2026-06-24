@@ -9,14 +9,14 @@
 # USAGE:
 #   bash tests/manual/longrun-freeze-check.sh [PROJECT_DIR]
 #
-#   PROJECT_DIR — optional path to a project directory whose .claude-data/
-#   and .claude-data/.claude.json the test will bind into the container,
+#   PROJECT_DIR — optional path to a project directory whose .ccpraxis-local-data/claude-home/
+#   and .ccpraxis-local-data/claude-home/.claude.json the test will bind into the container,
 #   exactly as the launcher does in production. Defaults to a fresh scratch
 #   project created under $HOME/.cache/sandbox-tests/ (and removed on exit).
 #
 # The mount shape mirrors the launcher exactly:
-#   .claude-data/            → /root/.claude            (bulk RW bind)
-#   .claude-data/.claude.json → /root/.claude.json      (single-file RW bind)
+#   .ccpraxis-local-data/claude-home/            → /root/.claude            (bulk RW bind)
+#   .ccpraxis-local-data/claude-home/.claude.json → /root/.claude.json      (single-file RW bind)
 #
 # DURATION env var (default 480 s) controls how long the test runs.
 # Output (per-sample log + final PASS/FAIL) goes to stdout; redirect as
@@ -71,11 +71,11 @@ if [ -z "$PROJECT_DIR" ]; then
     echo "Created scratch project: $PROJECT_DIR"
 fi
 
-# Ensure .claude-data/ and the single-file bind target exist so podman
+# Ensure .ccpraxis-local-data/claude-home/ and the single-file bind target exist so podman
 # doesn't auto-create a directory instead of a file bind.
-mkdir -p "$PROJECT_DIR/.claude-data"
-if [ ! -f "$PROJECT_DIR/.claude-data/.claude.json" ]; then
-    echo '{}' > "$PROJECT_DIR/.claude-data/.claude.json"
+mkdir -p "$PROJECT_DIR/.ccpraxis-local-data/claude-home"
+if [ ! -f "$PROJECT_DIR/.ccpraxis-local-data/claude-home/.claude.json" ]; then
+    echo '{}' > "$PROJECT_DIR/.ccpraxis-local-data/claude-home/.claude.json"
 fi
 
 TC="claude-longrun-$$"
@@ -99,8 +99,8 @@ echo
 
 # ── Create the container with the launcher's real mount shape ────────────────
 "$RUNTIME" run -dit --name "$TC" \
-    -v "${PROJECT_DIR}/.claude-data:/root/.claude" \
-    -v "${PROJECT_DIR}/.claude-data/.claude.json:/root/.claude.json" \
+    -v "${PROJECT_DIR}/.ccpraxis-local-data/claude-home:/root/.claude" \
+    -v "${PROJECT_DIR}/.ccpraxis-local-data/claude-home/.claude.json:/root/.claude.json" \
     -e CLAUDE_SANDBOX=1 \
     --entrypoint /bin/bash \
     claude-sandbox:latest -c "sleep $((DURATION + 120))" > /dev/null

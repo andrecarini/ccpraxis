@@ -12,7 +12,7 @@ Work like a careful, experienced senior developer. Prioritize correctness and co
 A skill's `description:` is a trigger contract, not just discovery metadata. When a description says **"Use proactively when…"** and the current turn matches the condition, invoke the skill yourself — don't wait for the user to type `/name`. Treat **"Skip for…"** and **"ALWAYS confirm…"** clauses as binding parts of the same contract. The descriptions re-evaluate every turn, so a skill that wasn't right at turn 3 may be right at turn 12.
 
 Specifically for the beacon system (if the `beacon` plugin is mounted into this sandbox):
-- **`/beacon:on`** — light proactively when the session has substantive ongoing work: a plan, multi-file edits, or a multi-step task. Skip for one-off questions, trivial lookups, or single-file quick fixes. Idempotent — re-invoking just refreshes the activity timestamp. Sandbox beacons land in `/project/.claude-data/beacons/` (host-visible).
+- **`/beacon:on`** — light proactively when the session has substantive ongoing work: a plan, multi-file edits, or a multi-step task. Skip for one-off questions, trivial lookups, or single-file quick fixes. Idempotent — re-invoking just refreshes the activity timestamp. Sandbox beacons land in `/project/.ccpraxis-local-data/claude-home/beacons/` (host-visible).
 - **`/beacon:off`** — offer when the user signals the session's work is finished ("done", "shipped", "merged", "deployed", "landed", "committed", "PR opened", "let's call it", "wrapping up", "ship it", "lgtm", "all good", "looks good", "finished", "we're good", "that's it for today"). Skip when the signal is scoped to a sub-task ("done with X, now Y"), to thinking/reading ("done reading"), or when substantive work is clearly still in progress. When invoking proactively, ALWAYS ask first via `AskUserQuestion` BEFORE invoking the skill. A direct user invocation (the user typed `/beacon:off`) needs no confirmation — the slash command is the consent.
 
 Specifically for the backpack system (if the `backpack` plugin is mounted into this sandbox):
@@ -103,9 +103,9 @@ A `socat` bridge runs at container startup forwarding `0.0.0.0:9000-9009` → `1
   ```
 - **Plugin-installed MCPs**: the callback port is chosen randomly by Claude Code and **cannot be overridden** today. If the random port happens to fall in 9000–9009 the auth flow works; otherwise it times out. Workaround: re-`/auth` until you get a lucky port, or remove the plugin's MCP entry and re-add it manually with `claude mcp add ... --callback-port 9000`.
 
-OAuth tokens authenticated inside this container are written to `~/.claude/.credentials.json` under `mcpOAuth.<key>` and **persist across container rebuilds** — the file is bind-mounted as a single-file RW bind from `<project>/.claude-data/.launcher/credentials.json` on the host. The host's own `~/.claude/.credentials.json` is never modified by anything you do in here.
+OAuth tokens authenticated inside this container are written to `~/.claude/.credentials.json` under `mcpOAuth.<key>` and **persist across container rebuilds** — the file is bind-mounted as a single-file RW bind from `<project>/.ccpraxis-local-data/claude-home/.launcher/credentials.json` on the host. The host's own `~/.claude/.credentials.json` is never modified by anything you do in here.
 
-The rest of `<project>/.claude-data/.launcher/` (hashes, snapshots, blueprint canonicals, container metadata) is overlaid as RO at `/root/.claude/.launcher/` — you can read it, but writes return EROFS. That's by design: tampering with `backpack-trusted-hash` would bypass approval, and tampering with snapshots would corrupt the launcher's selection logic on next run.
+The rest of `<project>/.ccpraxis-local-data/claude-home/.launcher/` (hashes, snapshots, blueprint canonicals, container metadata) is overlaid as RO at `/root/.claude/.launcher/` — you can read it, but writes return EROFS. That's by design: tampering with `backpack-trusted-hash` would bypass approval, and tampering with snapshots would corrupt the launcher's selection logic on next run.
 
 ### Accessing Host Services
 
@@ -126,6 +126,6 @@ Use one of these names instead of `localhost` or `127.0.0.1` when connecting to 
 
 - **This container is persistent** — it survives between sessions. Installed packages (apt, npm global, pip global, runtimes) persist across sessions.
 - File changes in `/project` persist (bind-mounted to host)
-- Your memories, conversation history, and plans persist in `/project/.claude-data/`
+- Your memories, conversation history, and plans persist in `/project/.ccpraxis-local-data/claude-home/`
 - Auth tokens: your Claude account token (`claudeAiOauth`) is refreshed from the host on every launch — do not modify it. MCP plugin OAuth tokens (`mcpOAuth.*`) are sandbox-owned, written by the standard `claude` / `claude mcp add` auth flow, and persist across container rebuilds. The host's own `.credentials.json` is never touched.
 - The container may be rebuilt if it becomes stale (Claude Code version mismatch or > 7 days old, Containerfile changed, etc.). The `backpack` plugin handles re-installing tools/runtimes on rebuild — see above. Project-specific files in `/project` persist across rebuilds via the bind mount.
