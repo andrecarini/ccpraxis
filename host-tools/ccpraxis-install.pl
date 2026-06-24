@@ -32,12 +32,14 @@ use FindBin qw($Bin);
 binmode STDOUT, ':raw';
 binmode STDERR, ':raw';
 
-# The perl floor. The bare technical requirement is only 5.14 (JSON::PP core;
-# see plugins/butler/docs/assumptions.json id "bin.perl"). We set the *policy*
-# floor higher — 5.42.2, the version Git-for-Windows currently ships — because
-# GfW is ccpraxis's supported host perl (global CLAUDE.md): anyone on the
-# supported path already has it, and an older GfW just means "update Git for
-# Windows". Lower this toward 5.14 if you ever need to support older/non-GfW perl.
+# The perl floor = the version we've EXPLICITLY CONFIRMED working: 5.42.2 (the
+# Git-for-Windows perl on the validated host). The policy is deliberately
+# "support only confirmed configurations" — we do NOT bless an older perl just
+# because it might work. (For reference the bare technical need is lower, 5.14
+# for JSON::PP per plugins/butler/docs/assumptions.json — but "might work" is not
+# "confirmed".) Widen this only when another perl/platform is actually validated.
+# NOTE: this whole hook is Windows-only (see the $^O guard below), so any
+# GfW-flavoured guidance it prints can only ever reach a Windows user.
 my $MIN_PERL = '5.42.2';
 
 my $mode = $ARGV[0] // 'plan';
@@ -87,8 +89,8 @@ if ($vclass eq 'wrong-major') {
     exit 4;
 }
 if ($vclass eq 'too-old') {
-    print STDERR "  perl-shim: resolved perl is $perl_ver but ccpraxis needs >= $MIN_PERL — REFUSING to shim a too-old perl ($perl_win).\n";
-    print STDERR "  perl-shim: install a newer perl (Git for Windows bundles one) and re-run the installer.\n";
+    print STDERR "  perl-shim: resolved perl $perl_ver is not a confirmed-working version — ccpraxis is validated against perl >= $MIN_PERL. REFUSING to shim ($perl_win).\n";
+    print STDERR "  perl-shim: install a confirmed perl (e.g. current Git for Windows) and re-run the installer.\n";
     exit 4;
 }
 if ($vclass eq 'unknown') {
