@@ -528,7 +528,7 @@ Available skills for this sandbox:
 - Both custom skills and plugin skills (and MCP servers) are discovered automatically
 - Selections are saved per project in `.claude-data/.launcher/selected-skills.json` and pre-loaded on the next launch
 
-**Network.** Ports 9000–9009 are mapped 1:1 to the host. When Claude serves a web app, dev server, or any other network service inside the container, it should bind to one of these ports. The user can then access it at `http://localhost:9000` from the host browser.
+**Network.** Two ranges are mapped 1:1 to the host. **9010–9019** are published but not bridged — bind `0.0.0.0:N` directly for dev servers/emulators (the common case; nothing squats them). **9000–9009** are published *and* socat-bridged (`0.0.0.0:N → 127.0.0.1:N`) so loopback-bound listeners like Claude Code's OAuth callback receiver are reachable from the host; a wildcard-binding server here collides with the bridge and must evict it first. The user accesses either range at `http://localhost:N` from the host browser.
 
 The container uses the runtime's default networking. Services listening on the host machine are reachable from inside the container via `host.docker.internal` (Docker) or `host.containers.internal` (Podman). Both route through the runtime's WSL2 VM on Windows or Linux VM on macOS. This means:
 

@@ -51,14 +51,18 @@ RUN git config --global core.autocrlf input \
 
 WORKDIR /project
 # Entrypoint:
-#   1. Spawn socat bridges for ports 9000-9009. Each forwards 0.0.0.0:N ->
-#      127.0.0.1:N so the OAuth callback redirect from the host browser
-#      (Podman has already port-forwarded the host's 9000-9009 to the
-#      container) reaches Claude Code's loopback-bound listener. socat
-#      starts even if nothing is yet listening on 127.0.0.1:N -- early
-#      connections drop until Claude Code's listener appears, then forward
-#      cleanly. Backgrounded; children get SIGHUP and die when the bash
-#      below exits.
+#   1. Spawn socat bridges for ports 9000-9009 ONLY. Each forwards
+#      0.0.0.0:N -> 127.0.0.1:N so the OAuth callback redirect from the
+#      host browser (Podman has already port-forwarded the host's
+#      9000-9009 to the container) reaches Claude Code's loopback-bound
+#      listener. socat starts even if nothing is yet listening on
+#      127.0.0.1:N -- early connections drop until Claude Code's listener
+#      appears, then forward cleanly. Backgrounded; children get SIGHUP
+#      and die when the bash below exits.
+#      NOTE: the launcher ALSO publishes 9010-9019, but those are
+#      deliberately left un-bridged here -- a server binds 0.0.0.0:N on
+#      them directly with no socat to collide with. Do not extend this
+#      loop to cover them.
 #   2. Heartbeat-only keep-alive loop. Container survives while
 #      /tmp/.launcher-alive has been mtime-touched within the last
 #      HB=300 seconds (5 min staleness window). The manager-mode

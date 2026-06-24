@@ -66,7 +66,12 @@ Even inside a container, supply chain attacks can exfiltrate project source code
 
 ## Network / Ports
 
-Ports **9000–9009** are mapped 1:1 to the host. When serving anything that needs to be accessed from the host browser (web apps, dev servers, emulators, etc.), **bind to one of these ports**.
+Two port ranges are published 1:1 to the host. **Anything you want reachable from the host browser must bind to a port in one of them** — no other ports are forwarded.
+
+- **9010–9019 — published, NOT bridged. Prefer these for dev servers and emulators.** Nothing listens on them at startup, so a server can bind `0.0.0.0:N` directly and it's immediately host-reachable. No socat, nothing to evict. This is the common case — reach for this range first.
+- **9000–9009 — published AND socat-bridged.** At container startup a `socat` forwarder is listening on `0.0.0.0:N` for each port here, forwarding to `127.0.0.1:N` (see the OAuth section below for why). Two consequences:
+  - Use these when a service binds **loopback** (`127.0.0.1:N`) and needs to be reached from the host — chiefly Claude Code's OAuth callback receiver. The bridge carries the host→loopback hop.
+  - A server that binds the **wildcard** `0.0.0.0:N` here will collide with the squatting socat (`EADDRINUSE`, since socat uses `SO_REUSEADDR`, not `SO_REUSEPORT`). You'd have to kill that port's socat first (`pkill -f "TCP-LISTEN:N"`). Avoid the hassle — put wildcard-binding servers on **9010–9019** instead.
 
 ### Sharing the URL with the user
 

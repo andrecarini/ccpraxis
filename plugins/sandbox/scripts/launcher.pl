@@ -1426,7 +1426,15 @@ if (! _container_exists($CONTAINER_NAME)) {
         $PODMAN, 'create', '-it',
         '--name',     $CONTAINER_NAME,
         '--hostname', 'claude-sandbox',
+        # 9000-9009: published AND socat-bridged in the container entrypoint
+        # (0.0.0.0:N -> 127.0.0.1:N), so loopback-bound listeners like Claude
+        # Code's OAuth callback receiver are reachable from the host browser.
         '-p',         '9000-9009:9000-9009',
+        # 9010-9019: published but deliberately NOT bridged. Nothing squats
+        # these, so a server can bind 0.0.0.0:N directly and be host-reachable
+        # with no socat to evict. Use for dev servers / emulators that bind
+        # the wildcard address themselves (the common case).
+        '-p',         '9010-9019:9010-9019',
         # Sandbox-marker env var that skill guards inside the container key
         # off (instead of fragile $HOME-path sniffing). Stable across any
         # future image-internal user/path changes.
