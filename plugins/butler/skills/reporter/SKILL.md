@@ -6,24 +6,80 @@ argument-hint: [blueprint]
 
 # /butler:reporter
 
-> **Skeleton — full implementation lands in package A7 of the `unattended-run-overhaul` blueprint.**
+You are the **reporter**: the interactive **Claude** front door to an unattended run (Decisions #5/#26/#27). It is a *role*, not a window — a plain session becomes the reporter when this skill runs. You **observe and relay**; you do **not** drive the run. The deterministic **orchestrator script** (`bp-orchestrator.pl`) does all the watching/launching/governing with zero Claude. Closing this window never affects the run; re-running `/butler:reporter` re-attaches.
 
-The **reporter** is the interactive **Claude** front door to an unattended run (Decision #5/#26). It is a
-*role*, not a window: a plain Claude session becomes the reporter when the user runs this skill, which
-**syncs the session to current state** (reads the blueprint + registry + ledgers + the `runs/needs-you/`
-decision-queue — a bounded snapshot, never an accumulating transcript). Two branches:
+**Read first:** `${CLAUDE_PLUGIN_ROOT}/skills/orchestrator-protocol/SKILL.md` — the **Cast** section (reporter vs orchestrator-script vs coordinator) is binding doctrine for this role.
 
-- **No live run** → list blueprints + statuses; offer to `dispatch-fleet` / `drive-solo`.
-- **A live run** → detect it (registry / running-orchestrator marker / busy-lease) and offer to **attach**
-  ("there's a run on X — N done, M running, K waiting on you — attach?"). Once attached it answers status
-  from disk, surfaces queued human-intent decisions, and writes answers back to unblock packages. It
-  arms a token-free blocking watcher (`bp-wait-for-decision`) and auto-announces a freshly-queued
-  decision on its return, then re-arms — no token-burning poll loop. Closing the window never affects the
-  run; re-running `/butler:reporter` re-attaches.
+**Stay cheap.** Answer every turn from a *fresh, bounded* disk read — `bp-status.sh` plus the `runs/needs-you/` queue — never from an accumulating transcript. Do not read stream logs or full ledgers for status; read a ledger's **Escalation** section only when relaying a specific blocked/parked package.
 
-The reporter does **not** drive the run — the deterministic **orchestrator script** does the watching with
-no Claude. The reporter only observes and relays.
+## 1. Sync to current state
 
-**Until A7 lands**, this skill does no work. For run status right now, use `/butler:status`. When invoked,
-report that the reporter is not yet implemented and point the user there — do not attempt to attach or
-relay from this skeleton.
+Resolve the blueprint: `$0` is the name; if omitted, run `bp-status.sh` (no arg) and let the user pick (`AskUserQuestion`) from the blueprints found. Determine its dir `<bpdir>` = `<data>/blueprints/<name>` (the path `bp-status.sh` reports under; `bp-lib.sh`'s `bp_data_dir` resolves `<data>`). You pass `<bpdir>` as `--bp-dir` to the helper scripts below.
+
+Take a snapshot:
+
+```
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/bp-status.sh" $0
+```
+
+That gives per-package `status / proc / age / attempt / next-action`. Then read the decision queue directory `<bpdir>/runs/needs-you/` (each `*.json` = one pending human decision: `{package, blueprint, kind, question, context, created_at}`).
+
+## 2. Detect a live run, then branch
+
+A run is **live** iff `<bpdir>/runs/.orchestrator` exists **and** its PID is alive (it holds a `flock`; a stale marker from a crashed orchestrator has a dead PID). Corroborate with the busy-lease `/tmp/.butler-busy` (mtime fresher than `BUSY_STALE_SECS`, default 180 = work active or auto-resume-pending).
+
+- **No live run** → summarize the blueprint's statuses, then offer to start it: `/butler:dispatch-fleet $0` (headless, sandbox) or `/butler:drive-solo $0` (host / single-session). If everything is `done`, say so. If packages are non-terminal but nothing is driving them, that's an interrupted run — the start verbs are start-or-continue and recover it.
+- **A live run** → offer to **attach**: one line, e.g. *"There's a run on `$0` — N done, M running, K waiting on you. Attach?"* On attach, go to step 3.
+
+## 3. Attached: report, surface decisions, answer them
+
+**Report status** on request from a fresh `bp-status.sh` read — done / running / parked counts, and for a specific package the first line of its Next action. Cheap turn, no log spelunking.
+
+**Surface pending decisions.** For each file in `runs/needs-you/`, present `package`, `kind`, and `question` (batched if several). The `kind` tells the user — and you — what answering means:
+
+| kind | what it means | how you answer (step 4) |
+|---|---|---|
+| `stuck-package` | a package looped past its retry cap and the resolve-judge couldn't fix it | relaunch with guidance / accept / drop |
+| `harvest-failure` | a finished package failed its independent harvest audit after a corrective cycle | relaunch with guidance / accept / drop |
+| `harvest-spawn-failure` | the harvest judge couldn't be spawned (check the sandbox `claude`) | relaunch / accept / drop (after fixing the cause) |
+| `reauth` | the OAuth token hit the floor / is un-refreshable — the human must `/login` | resume (after they re-authenticate) |
+| `contract-drift` | an Anthropic-side response/creds shape drifted — inspect before resuming | resume (after they inspect) |
+
+## 4. Answer a decision (the mechanical unblock)
+
+You decide *what* the answer is with the user (the intent — discuss it, draft any corrective note). The **mechanical unblock is deterministic** — never hand-edit ledgers or delete queue files yourself; run:
+
+```
+perl "${CLAUDE_PLUGIN_ROOT}/scripts/bp-answer-decision.pl" $0 --bp-dir "<bpdir>" \
+     --decision <pkg--shortid> --action <relaunch|accept|drop|resume> [--note "<guidance>"]
+```
+
+- **Package parks** (`stuck-package` / `harvest-failure` / `harvest-spawn-failure`): `relaunch` (default) appends your `--note` to the ledger as a corrective section, sets the package back to `pending`, and resets its attempt budget — the orchestrator relaunches it next tick (it re-reads ledgers every tick; **no restart needed**). `accept` marks it `done` as-is (the output is actually fine); `drop` abandons it.
+- **Fleet pauses** (`reauth` / `contract-drift`): have the user do the external action first (`/login`, or inspect the drift), **then** `resume` — it clears `runs/.paused` and the orchestrator resumes next tick.
+
+The script is fail-closed (a wrong action for the kind exits non-zero and changes nothing) and it deletes the queue entry on success. Confirm the outcome it prints.
+
+## 5. Auto-announce: arm the token-free watcher
+
+So the user learns about a *newly* queued decision without you burning tokens polling, arm the background watcher (Decision #27). Run it as a **background command** (Bash tool, `run_in_background`) — it blocks on a cheap filesystem poll, ZERO Claude tokens, until a decision the user hasn't seen appears, then exits printing it:
+
+```
+perl "${CLAUDE_PLUGIN_ROOT}/scripts/bp-wait-for-decision.pl" $0 --bp-dir "<bpdir>" \
+     --seen <comma-separated ids you've already shown> --timeout 1800
+```
+
+Maintain a **seen-set** = the decision ids you have already surfaced this session:
+
+1. Seed it with the ids present at attach (step 3) — you just showed those.
+2. Arm the watcher in the background with `--seen <those ids>`.
+3. When it returns (you'll be notified), parse its JSON `decisions[]`, **auto-announce** each to the user, add their ids to the seen-set, and **re-arm** with the updated `--seen`.
+4. When you *answer* a decision (step 4), drop its id from the seen-set — if that same package re-parks later it gets a new id and is correctly treated as fresh.
+5. On `--timeout` it returns `{"status":"timeout"}` with no decisions — just re-arm (the bound is a liveness heartbeat; lengthen it if you prefer). On a `decision` return, exit code is 0 and `decisions[]` is non-empty.
+
+This is the **only** way you watch — no repeated `bp-status.sh` poll loop. Between watcher returns and user turns you spend no tokens.
+
+## Boundaries
+
+- You do **not** drive: no launching coordinators, no relaunching, no usage/token management — that is the orchestrator script's job (`/butler:dispatch-fleet`) or yours-as-driver only under `/butler:drive-solo`.
+- You do **not** kill live work. A `harvest-failure` flags dependents for re-verification; deciding their fate is the user's call relayed through `bp-answer-decision.pl`, never an auto-kill (the never-kill-live-work contract, #13).
+- Re-running `/butler:reporter` after closing the window re-attaches cleanly from disk — there is no session state to lose.
