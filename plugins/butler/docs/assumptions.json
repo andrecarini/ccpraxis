@@ -18,20 +18,20 @@
     },
     {
       "id": "bin.curl",
-      "what": "HTTP transport that trusts the system cert store.",
-      "expected_contract": "curl present; on win32 a Schannel build (no CA file needed); HTTPS GET to api.anthropic.com succeeds.",
+      "what": "The orchestrator + token-keeper HTTPS transport (usage GET + token-refresh POST), trusting the system cert store.",
+      "expected_contract": "curl present; on win32 a Schannel build (no CA file needed); on the Linux sandbox an OpenSSL build using /etc/ssl/certs; HTTPS GET to api.anthropic.com succeeds. The perl code shells out to curl (bp-http.pl) because the sandbox perl has no IO::Socket::SSL.",
       "check": "curl --version (look for Schannel on win32); a probe HTTPS request returns a TLS-valid response.",
       "supported_envs": ["win32", "sandbox-linux"],
-      "implement_hint": "Ensure curl (or an equivalent HTTPS client) is installed for the platform.",
+      "implement_hint": "Ensure curl is installed for the platform (it is the HTTPS transport — there is no perl-SSL fallback).",
       "surface": "preflight"
     },
     {
       "id": "bin.perl",
-      "what": "Perl with HTTPS + JSON for the orchestrator/guard.",
-      "expected_contract": "perl >=5.14 with HTTP::Tiny, IO::Socket::SSL, JSON::PP loadable.",
-      "check": "perl -M<mod> -e1 for each module.",
+      "what": "Perl with JSON for the orchestrator/guard (HTTPS is curl's job, not perl's).",
+      "expected_contract": "perl >=5.14 with JSON::PP loadable. IO::Socket::SSL / Net::SSLeay are NOT required and are absent from the sandbox image (verified in localhost/claude-sandbox:2.1.170) — the HTTP transport is curl (see bin.curl), so requiring perl-SSL here would falsely fail the supported sandbox.",
+      "check": "perl -MJSON::PP -e1.",
       "supported_envs": ["win32", "sandbox-linux"],
-      "implement_hint": "Install perl + the three modules (all core/near-core).",
+      "implement_hint": "Install perl + JSON::PP (core since 5.14). HTTPS comes from curl; no perl SSL modules are needed.",
       "surface": "preflight"
     },
     {
@@ -45,11 +45,11 @@
     },
     {
       "id": "tls.ca",
-      "what": "A CA bundle perl's IO::Socket::SSL can use (host perl lacks a default).",
-      "expected_contract": "A CA file path exists; on host /usr/ssl/certs/ca-bundle.crt.",
+      "what": "A system CA store the curl transport can validate against (Linux); on win32 curl is Schannel and uses the Windows store.",
+      "expected_contract": "A CA file path exists; on the Linux sandbox /etc/ssl/certs/ca-certificates.crt; on host /usr/ssl/certs/ca-bundle.crt (cygwin).",
       "check": "stat the candidate CA paths; assert at least one exists.",
       "supported_envs": ["win32", "sandbox-linux"],
-      "implement_hint": "Point SSL_ca_file at the platform CA bundle (or use a Schannel curl transport instead).",
+      "implement_hint": "Ensure the platform CA store curl uses is present (Linux: ca-certificates; win32: Schannel needs none).",
       "surface": "preflight"
     },
     {

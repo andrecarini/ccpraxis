@@ -69,8 +69,12 @@ my %CHECK = (
     } },
 
     'bin.perl' => { run => sub {
-        my @miss = grep { !mod_ok($_) } qw(HTTP::Tiny IO::Socket::SSL JSON::PP);
-        return @miss ? ('fail', "missing perl modules: ".join(', ',@miss)) : ('ok', 'HTTP::Tiny+IO::Socket::SSL+JSON::PP');
+        # HTTPS is curl's job (bin.curl) — the sandbox perl has no
+        # IO::Socket::SSL/Net::SSLeay, and the transport deliberately uses curl.
+        # So perl only needs JSON::PP (core) for the scripts; do NOT require the
+        # SSL modules here or the supported sandbox would falsely fail.
+        my @miss = grep { !mod_ok($_) } qw(JSON::PP);
+        return @miss ? ('fail', "missing perl modules: ".join(', ',@miss)) : ('ok', 'JSON::PP present (HTTPS handled by curl)');
     } },
 
     'bin.jq' => { run => sub {
@@ -115,15 +119,15 @@ my %CHECK = (
     } },
 
     'api.usage' => { deep => 1, run => sub {
-        # live single probe — only with --deep. Reuses the contract validator.
+        # live single probe — only with --deep. curl transport (bp-http.pl),
+        # reusing the contract validator.
         my $c = home()."/.claude/.credentials.json";
         my $d = read_json($c) or return ('fail','no creds for usage probe');
         my $tok = $d->{claudeAiOauth}{accessToken} or return ('fail','no accessToken');
-        require HTTP::Tiny;
-        my %ssl; for (qw(/usr/ssl/certs/ca-bundle.crt /etc/ssl/certs/ca-certificates.crt)) { if (-f) { %ssl=(SSL_ca_file=>$_); last } }
-        my $http = HTTP::Tiny->new(timeout=>20, verify_SSL=>1, (%ssl?(SSL_options=>{%ssl}):()));
-        my $res = $http->get('https://api.anthropic.com/api/oauth/usage', { headers=>{
-            'Authorization'=>"Bearer $tok",'anthropic-beta'=>'oauth-2025-04-20','User-Agent'=>'claude-code/preflight'}});
+        require "$Bin/bp-http.pl";
+        my $res = BpHttp::request('GET', 'https://api.anthropic.com/api/oauth/usage', {
+            'Authorization'=>"Bearer $tok",'anthropic-beta'=>'oauth-2025-04-20',
+            'User-Agent'=>'claude-code/preflight','Accept'=>'application/json'});
         return ('fail', "usage GET $res->{status} (expected 200)") unless $res->{status}==200;
         my $parsed = eval { JSON::PP->new->decode($res->{content}) };
         require "$Bin/bp-contract.pl";

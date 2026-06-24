@@ -43,6 +43,14 @@ if [ -n "${PID:-}" ] && pid_alive "$PID"; then
 fi
 if [ "$STATUS_ONLY" -eq 1 ]; then echo "no live orchestrator for $BP_NAME"; exit 0; fi
 
+# A8 preflight (Decision #29): assert the environment supports a real run BEFORE
+# launching the fleet. On any unsupported/failed assumption bp-preflight prints an
+# itemized report and exits non-zero; we refuse to start rather than fly blind.
+if ! perl "$SCRIPT_DIR/bp-preflight.pl" --quiet; then
+  echo "bp-orchestrate: preflight failed — refusing to start the fleet (itemized report above)." >&2
+  exit 5
+fi
+
 export CCPRAXIS_DATA_DIR="$(bp_data_dir)"
 setsid nohup perl "$SCRIPT_DIR/bp-orchestrator.pl" "$BP_NAME" --bp-dir "$BPDIR" >> "$LOG" 2>&1 &
 

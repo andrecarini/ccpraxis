@@ -52,6 +52,7 @@ my $DIR = dirname(abs_path(__FILE__));
 require "$DIR/bp-govern.pl";
 require "$DIR/bp-contract.pl";
 require "$DIR/bp-log.pl";
+require "$DIR/bp-http.pl";
 require "$DIR/bp-token-keeper.pl";
 
 our $USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
@@ -442,12 +443,9 @@ sub touch_busy {
 
 sub _real_http_get {
     my ($url, $headers) = @_;
-    require HTTP::Tiny;
-    my %ssl;
-    for (qw(/usr/ssl/certs/ca-bundle.crt /etc/ssl/certs/ca-certificates.crt)) { if (-f) { %ssl = (SSL_ca_file => $_); last } }
-    my $http = HTTP::Tiny->new(timeout => 30, verify_SSL => 1, (%ssl ? (SSL_options => { %ssl }) : ()));
-    my $res = $http->get($url, { headers => $headers });
-    return { status => $res->{status}, content => $res->{content} };
+    # curl transport (bp-http.pl): the sandbox perl lacks IO::Socket::SSL, so
+    # HTTP::Tiny HTTPS is unavailable there. curl trusts the system cert store.
+    return BpHttp::request('GET', $url, $headers);
 }
 
 # fetch + validate one usage poll. Returns one of:

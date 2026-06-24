@@ -28,6 +28,7 @@ my $DIR = dirname(__FILE__);
 require "$DIR/bp-govern.pl";
 require "$DIR/bp-contract.pl";
 require "$DIR/bp-log.pl";
+require "$DIR/bp-http.pl";
 
 our $TOKEN_URL = 'https://platform.claude.com/v1/oauth/token';
 our $DEFAULT_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
@@ -63,14 +64,12 @@ sub atomic_writeback {
     return 'ok';
 }
 
-# Default real transport (production). Tests inject their own.
+# Default real transport (production), via curl (bp-http.pl). Tests inject their
+# own. curl is used because the sandbox perl has no IO::Socket::SSL/Net::SSLeay,
+# so HTTP::Tiny cannot do HTTPS there; curl trusts the system cert store.
 sub _real_http_post {
     my ($url, $headers, $body) = @_;
-    require HTTP::Tiny;
-    my %ssl; for (qw(/usr/ssl/certs/ca-bundle.crt /etc/ssl/certs/ca-certificates.crt)) { if (-f) { %ssl=(SSL_ca_file=>$_); last } }
-    my $http = HTTP::Tiny->new(timeout=>30, verify_SSL=>1, (%ssl?(SSL_options=>{%ssl}):()));
-    my $res = $http->post($url, { content=>$body, headers=>$headers });
-    return { status=>$res->{status}, content=>$res->{content} };
+    return BpHttp::request('POST', $url, $headers, $body);
 }
 
 sub keeper_tick {
