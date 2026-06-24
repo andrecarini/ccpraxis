@@ -634,6 +634,10 @@ sub run {
         return $rc == 0 ? 0 : ($rc >> 8 || 1);
     };
     my $read_verdict = $opt->{read_verdict} || sub { my ($k, $p) = @_; read_judge_verdict($runs, $k, $p) };
+    # pid-liveness seam: default = the real kill-0 check; the simulation harness (A6)
+    # injects a scripted one so alive/progressing and alive/wedged coordinator paths
+    # can be driven through the real loop (not just the dead-pid path).
+    my $pid_alive = $opt->{pid_alive} || \&pid_alive;
 
     my $marker_fh = acquire_marker("$runs/.orchestrator");
     unless ($marker_fh) {
@@ -893,7 +897,7 @@ sub run {
                             || (defined $pid->{$pkg} && length $pid->{$pkg})
                             || (($status->{$pkg} // 'pending') ne 'pending');
                 next unless $launched;
-                my $alive = pid_alive($pid->{$pkg});
+                my $alive = $pid_alive->($pid->{$pkg});
                 if ($alive) {
                     my ($sz, $mt) = jsonl_stat($runs, $pkg);
                     my $prev = $seen{$pkg};
