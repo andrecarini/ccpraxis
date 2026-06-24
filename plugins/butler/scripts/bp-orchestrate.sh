@@ -52,6 +52,17 @@ if ! perl "$SCRIPT_DIR/bp-preflight.pl" --quiet; then
 fi
 
 export CCPRAXIS_DATA_DIR="$(bp_data_dir)"
+
+# A8 hooks self-test (Decision #31): before launching any worker, assert LIVE that
+# a worker subagent's out-of-scope edit is actually DENIED — the write-containment
+# that A4's graceful-gate depends on. Cached after the first pass (keyed by the
+# hook scripts + claude version), so this only costs a real check when the hooks or
+# claude change. Fail loud: containment unverified ⇒ do not fly the fleet blind.
+if ! bash "$SCRIPT_DIR/bp-hooks-selftest.sh" --quiet; then
+  echo "bp-orchestrate: hooks self-test failed — refusing to start the fleet (subagent write-containment is unverified, #31)." >&2
+  exit 6
+fi
+
 setsid nohup perl "$SCRIPT_DIR/bp-orchestrator.pl" "$BP_NAME" --bp-dir "$BPDIR" >> "$LOG" 2>&1 &
 
 # Confirm it acquired the flock marker (the real single-instance guard lives in
