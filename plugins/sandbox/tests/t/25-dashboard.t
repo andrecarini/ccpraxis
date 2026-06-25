@@ -155,6 +155,29 @@ my %st = (
     like($f->[-1]{text}, qr/Shut down ALL/, 'compose: confirm prompt shown in footer');
 }
 
+# install-failure alert banner (#20): a backpack-install failure must surface in
+# the dashboard (the pre-dashboard stdout warning is wiped by the alt-screen).
+{
+    my %sw = (%st, install_warning => 'backpack install FAILED - run /backpack:install');
+    my $f = Dashboard::compose_frame(\%sw, 10, 80);
+    my @alert = grep { $_->{role} eq 'alert' } @$f;
+    is(scalar(@alert), 1, 'compose: install_warning -> exactly one alert row');
+    is($f->[1]{role}, 'alert', 'compose: alert sits directly under the title');
+    like($f->[1]{text}, qr/backpack install FAILED/, 'compose: alert shows the warning text');
+    is(scalar(@$f), 10, 'compose: alert keeps the frame exactly $rows');
+    my $bad = grep { length($_->{text}) != 80 } @$f;
+    is($bad, 0, 'compose: alert row keeps every row exactly $cols');
+    is($f->[-1]{role}, 'footer', 'compose: footer still last with an alert present');
+
+    my $f2 = Dashboard::compose_frame(\%st, 10, 80);   # %st has no warning
+    is(scalar(grep { $_->{role} eq 'alert' } @$f2), 0, 'compose: no warning -> no alert row');
+
+    my $f3 = Dashboard::compose_frame(\%sw, 3, 80);
+    is(scalar(grep { $_->{role} eq 'alert' } @$f3), 0, 'compose: rows<4 suppresses the alert (no crash)');
+
+    like(Dashboard::sgr_for_role('alert'), qr/\e\[1;37;41m/, 'sgr: alert role -> bold white on red');
+}
+
 # C3 regression: a non-ASCII project name must NOT break the exactly-$cols
 # width invariant (bytes outside printable ASCII map 1:1 to '?').
 {

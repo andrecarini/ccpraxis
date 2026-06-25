@@ -245,6 +245,65 @@ my $LAUNCH_LOG;
 my $LAUNCH_ID = strftime("%Y%m%dT%H%M%SZ", gmtime()) . "-$$";
 sub log_ev { LaunchLog::event($LAUNCH_LOG, @_) }
 
+# A non-empty backpack-install warning (set during the setup pass) that the
+# dashboard renders as a red alert banner — so a failure isn't lost behind the
+# alt-screen the way the pre-dashboard stdout warning is (#20). File-scope so the
+# enter_dashboard gather closure (defined far below) sees the value set up here.
+my $INSTALL_WARNING = '';
+
+# Full launch transcript (#19): the raw combined stdout/stderr of the heavy
+# setup-phase child processes (image build, the backpack summary, the install
+# pass) — the scrolling output the structured JSON log can NOT hold. Together
+# they are "everything from launch start". Interactive pickers run as their own
+# child processes that write straight to the console, so they stay out of the
+# transcript by nature; and we stop teeing before the dashboard, so its ANSI
+# never pollutes the file.
+my $TRANSCRIPT;
+
+# _open_transcript($path) -> fh | undef. Raw bytes (so UTF-8 / André paths pass
+# through untouched, like LaunchLog) + autoflushed; parent dir created. undef on
+# failure so a transcript problem can never block a launch.
+sub _open_transcript {
+    my ($path) = @_;
+    return undef unless defined $path && length $path;
+    (my $dir = $path) =~ s{[\\/][^\\/]+$}{};
+    if (length $dir && !-d $dir) {
+        require File::Path;
+        eval { File::Path::make_path($dir); 1 } or return undef;
+    }
+    open my $fh, '>:raw', $path or return undef;
+    my $old = select($fh); $| = 1; select($old);
+    return $fh;
+}
+
+# _tx(@msg) — append to the transcript only (no console). No-op without a handle.
+sub _tx { return unless $TRANSCRIPT; print {$TRANSCRIPT} @_; }
+
+# _close_transcript — flush + close, tolerant of undef / double-call.
+sub _close_transcript { if ($TRANSCRIPT) { close $TRANSCRIPT; undef $TRANSCRIPT; } }
+
+# _tee_system(@cmd) — run @cmd streaming its combined stdout+stderr LIVE to the
+# console AND into the transcript. system()-style return value ($? convention:
+# 0 ok, child exit = rc>>8). Falls back to a plain system() when there is no
+# transcript or the fork/pipe can't be opened, so capture never blocks a launch.
+sub _tee_system {
+    my @cmd = @_;
+    return system(@cmd) unless $TRANSCRIPT;
+    my $pid = open(my $ph, '-|');
+    return system(@cmd) unless defined $pid;   # fork/pipe failed -> uncaptured run
+    if (!$pid) {                               # child: merge stderr, exec the cmd
+        open(STDERR, '>&', \*STDOUT);
+        # _exit (not exit) on exec failure: skip END so we don't double-close the
+        # parent's log/transcript handles inherited across the fork.
+        exec { $cmd[0] } @cmd
+            or do { print STDERR "exec failed: $cmd[0]: $!\n"; POSIX::_exit(127); };
+    }
+    local $| = 1;
+    while (my $line = <$ph>) { print STDOUT $line; print {$TRANSCRIPT} $line; }
+    close $ph;
+    return $?;
+}
+
 # ensure_ccpraxis_data_dir — the project's single ccpraxis data root exists and
 # self-gitignores (inner .gitignore = '*', matching steward/blueprint onboard).
 # Idempotent; never clobbers an existing .gitignore (butler/blueprint may own it).
@@ -448,9 +507,9 @@ sub _rmtree {
 
 # Signal handlers + END block — exec at the end skips these, so every
 # exec path calls release_lock explicitly before exec.
-$SIG{INT}  = sub { log_ev('signal', { sig => 'INT' });  LaunchLog::close_log($LAUNCH_LOG); release_lock(); reset_terminal(); exit 130 };
-$SIG{TERM} = sub { log_ev('signal', { sig => 'TERM' }); LaunchLog::close_log($LAUNCH_LOG); release_lock(); reset_terminal(); exit 143 };
-END { LaunchLog::close_log($LAUNCH_LOG); release_lock() }
+$SIG{INT}  = sub { log_ev('signal', { sig => 'INT' });  LaunchLog::close_log($LAUNCH_LOG); _close_transcript(); release_lock(); reset_terminal(); exit 130 };
+$SIG{TERM} = sub { log_ev('signal', { sig => 'TERM' }); LaunchLog::close_log($LAUNCH_LOG); _close_transcript(); release_lock(); reset_terminal(); exit 143 };
+END { LaunchLog::close_log($LAUNCH_LOG); _close_transcript(); release_lock() }
 
 acquire_lock();
 
@@ -460,6 +519,11 @@ acquire_lock();
 # processes, each with its own uniquely-named log file (no double-open).
 $LAUNCH_LOG = LaunchLog::open_log("$CLAUDE_DATA/sandbox-logs/launch-$LAUNCH_ID.log");
 log_ev('launch_start', { project => $PROJECT_PATH, project_name => $PROJECT_NAME, podman => $PODMAN, pid => $$ });
+
+# Companion raw-output transcript (#19): the build/install console stream the JSON
+# log can't hold. Best-effort, same naming as the JSON log (.transcript.log).
+$TRANSCRIPT = _open_transcript("$CLAUDE_DATA/sandbox-logs/launch-$LAUNCH_ID.transcript.log");
+_tx("=== claude-sandbox launch $LAUNCH_ID - $PROJECT_PATH ===\n");
 
 # =====================================================================
 # Get host Claude Code version
@@ -550,7 +614,8 @@ sub launcher_hash {
 sub build_image {
     print "Building claude-sandbox image with Claude Code v${HOST_VERSION}...\n";
     log_ev('image_build_start', { version => $HOST_VERSION });
-    my $rc = system($PODMAN, 'build',
+    _tx("\n--- image build (v${HOST_VERSION}) ---\n");
+    my $rc = _tee_system($PODMAN, 'build',
         '--build-arg', "CLAUDE_VERSION=${HOST_VERSION}",
         '-t', "claude-sandbox:${HOST_VERSION}",
         '-t', 'claude-sandbox:latest',
@@ -1726,12 +1791,14 @@ my $BACKPACK_HOST_PL       = "$CLAUDE_HOST_CONFIG/ccpraxis/plugins/backpack/scri
 
 if ($CONTAINER_WAS_CREATED && -f $BACKPACK_HOST_FILE) {
     if (! -f $BACKPACK_HOST_PL) {
+        $INSTALL_WARNING = 'backpack present but host backpack.pl missing - install skipped';
         print STDERR "WARNING: backpack.json present but host backpack.pl missing at $BACKPACK_HOST_PL\n";
         print STDERR "         Skipping install pass; run /backpack:install in-session after fixing.\n";
     } else {
         # Validate using host's perl — same backpack.pl, host-resident file.
-        my $validate_rc = system($^X, $BACKPACK_HOST_PL, 'validate', $BACKPACK_HOST_FILE);
+        my $validate_rc = _tee_system($^X, $BACKPACK_HOST_PL, 'validate', $BACKPACK_HOST_FILE);
         if ($validate_rc != 0) {
+            $INSTALL_WARNING = 'backpack.json failed validation - install skipped (see launch transcript)';
             print STDERR "\n";
             print STDERR "WARNING: backpack.json failed schema validation (see errors above).\n";
             print STDERR "         Skipping install pass. Fix the file (or delete it) and re-launch.\n";
@@ -1748,7 +1815,8 @@ if ($CONTAINER_WAS_CREATED && -f $BACKPACK_HOST_FILE) {
 
             print "\n";
             print "Backpack found for this project:\n";
-            system($^X, $BACKPACK_HOST_PL, 'list', $BACKPACK_HOST_FILE);
+            _tx("\n--- backpack summary ---\n");
+            _tee_system($^X, $BACKPACK_HOST_PL, 'list', $BACKPACK_HOST_FILE);
             print "\n";
 
             if ($is_first_time) {
@@ -1837,6 +1905,7 @@ if ($BACKPACK_APPROVED) {
         && (system($PODMAN, 'exec', $CONTAINER_NAME,
             'test', '-f', '/root/.claude/backpack.pl') == 0);
     if (!$has_helper) {
+        $INSTALL_WARNING = 'backpack.pl not mounted in container - install skipped';
         print STDERR "WARNING: Backpack found at $BACKPACK_HOST_FILE but backpack.pl isn't mounted in the container. Update ccpraxis (the launcher needs the plugin's backpack/scripts/backpack.pl) and rebuild.\n";
     } else {
         # Inline bash script: kick off the heartbeat refresher in the
@@ -1857,12 +1926,17 @@ apt-get update -qq
 echo "Installing backpack items..."
 perl /root/.claude/backpack.pl install /root/.claude/backpack.json
 BASH
-        my $install_rc = system($PODMAN, 'exec', $CONTAINER_NAME,
+        _tx("\n--- backpack install ---\n");
+        my $install_rc = _tee_system($PODMAN, 'exec', $CONTAINER_NAME,
             'bash', '-c', $install_script);
         if ($install_rc != 0) {
+            $INSTALL_WARNING = 'backpack install: some items failed - run /backpack:install in the session to retry';
+            log_ev('backpack_install_failed', { exit => $install_rc >> 8 });
             print "\n";
             print "WARNING: Some backpack items failed (see above). Handing off to claude anyway — fix in-session via /backpack:add, /backpack:remove, or by editing the backpack file directly and running /backpack:install.\n";
             print "\n";
+        } else {
+            log_ev('backpack_install_ok', {});
         }
     }
 }
@@ -1944,10 +2018,11 @@ sub enter_dashboard {
             }
             my @lines = _tail_lines($log_path, 200);
             return {
-                project_name => $PROJECT_NAME,
-                container    => $CONTAINER_NAME,
-                status       => $cached_status,
-                events       => Dashboard::recent_events(\@lines, 50),
+                project_name    => $PROJECT_NAME,
+                container       => $CONTAINER_NAME,
+                status          => $cached_status,
+                events          => Dashboard::recent_events(\@lines, 50),
+                install_warning => $INSTALL_WARNING,
             };
         },
         spawn         => \&_spawn_session,

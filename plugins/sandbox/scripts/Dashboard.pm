@@ -167,6 +167,14 @@ sub _footer_line {
     return clip_pad($legend, $cols);
 }
 
+# _alert_line($msg, $cols) -> a full-width banner row (rendered red via the
+# 'alert' role). Used for the backpack-install-failure warning so it can't be
+# lost behind the alt-screen the way the pre-dashboard stdout warning was.
+sub _alert_line {
+    my ($msg, $cols) = @_;
+    return clip_pad('  !! ' . _safe(defined $msg ? $msg : ''), $cols);
+}
+
 sub _panel_title_line {
     my ($title, $cols) = @_;
     my $s = '-- ' . _safe($title) . ' ';
@@ -218,12 +226,23 @@ sub compose_frame {
         return \@frame;
     }
 
-    my $body_h = $rows - 2;
+    # Optional alert banner directly under the title (e.g. backpack install
+    # failures). Needs room for title + alert + >=1 body + footer, so only when
+    # rows >= 4 — a tiny terminal silently drops it rather than crowding out the
+    # body. The launcher surfaces this where the pre-dashboard stdout warning
+    # would otherwise be wiped by the alt-screen.
+    my @alert;
+    my $warn = $state->{install_warning};
+    if (defined $warn && length $warn && $rows >= 4) {
+        push @alert, { text => _alert_line($warn, $cols), role => 'alert' };
+    }
+
+    my $body_h = $rows - 2 - scalar(@alert);
     my @body = _body_rows($state, $cols, $body_h);
     while (@body < $body_h) {
         push @body, { text => clip_pad('', $cols), role => 'blank' };
     }
-    push @frame, @body;
+    push @frame, @alert, @body;
     push @frame, $footer;
     return \@frame;
 }
@@ -236,6 +255,7 @@ sub sgr_for_role {
     return "\e[1m"        if $role eq 'panel-title';  # bold
     return "\e[2m"        if $role eq 'footer';       # dim
     return "\e[1;33;41m"  if $role eq 'footer-alert'; # bold yellow on red
+    return "\e[1;37;41m"  if $role eq 'alert';        # bold white on red (banner)
     return '';
 }
 
