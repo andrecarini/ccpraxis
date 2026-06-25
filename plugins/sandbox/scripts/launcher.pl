@@ -2004,39 +2004,45 @@ sub _tail_lines {
     return @lines > $n ? @lines[-$n .. -1] : @lines;
 }
 
-# _spawn_session — the dashboard's launch-claude hotkey: open a NEW window
-# running the internal connector entry (`claude-sandbox --session <project>`).
-# wt.exe -> cmd `start` -> in-window fallback ladder (Decision #19). A native
-# wt.exe / start can't exec the .ps1 by bare name, so we drive it through
-# powershell -File; the inline fallback re-uses THIS perl (works in-process).
+# _spawn_session — the dashboard's launch-claude hotkey: open a NEW Windows
+# Terminal window running the internal connector entry
+# (`claude-sandbox --session <project>`). A native wt.exe can't exec the .ps1 by
+# bare name, so we drive it through powershell -File.
+#
+# Windows Terminal is REQUIRED (user directive / Decision #19): there is NO silent
+# degradation to a bare PowerShell console. If wt.exe is not installed we FAIL
+# LOUDLY — suspend the TUI, print a clear, actionable error, wait for a keypress,
+# and return to the dashboard. find_wt asserts availability (PATH + the canonical
+# %LOCALAPPDATA%\Microsoft\WindowsApps app-execution-alias location).
 sub _spawn_session {
     my @inner = ('powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass',
                  '-File', $SANDBOX_PS1, '--session', $PROJECT_PATH);
-    my $wt   = Dashboard::find_exe('wt.exe', $ENV{PATH});
-    my $mode = Dashboard::decide_spawn_mode($wt ? 1 : 0, $ENV{COMSPEC} ? 1 : 0, $^O);
-    my $argv = Dashboard::spawn_argv($mode, { cmd => \@inner, comspec => $ENV{COMSPEC} });
-    log_ev('launch_session', { mode => $mode });
 
-    if (!$argv) {
-        # inline: suspend the dashboard, run the connector in this window,
-        # then ask the loop to repaint.
+    my $wt = Dashboard::find_wt($ENV{PATH}, $ENV{LOCALAPPDATA});
+    if (!$wt) {
+        # Fail loudly: leave the alt-screen, say exactly what's missing + how to
+        # fix it, block for a key, then restore the dashboard.
         print STDOUT "\e[?25h\e[?1049l";
         eval { Term::ReadKey::ReadMode('restore') };
-        system($^X, $LAUNCHER_PL, '--session', $PROJECT_PATH);
+        print STDERR "\n";
+        print STDERR "  ERROR: Windows Terminal (wt.exe) was not found.\n";
+        print STDERR "  [c] launch-claude opens a NEW Windows Terminal window and requires it —\n";
+        print STDERR "  there is no fallback to a plain console (by design).\n";
+        print STDERR "  Fix: install \"Windows Terminal\" from the Microsoft Store, or put wt.exe on\n";
+        print STDERR "  PATH, then press [c] again.\n";
+        print STDERR "  (Searched PATH and %LOCALAPPDATA%\\Microsoft\\WindowsApps.)\n";
+        print STDERR "\n  Press any key to return to the dashboard...";
+        eval { Term::ReadKey::ReadKey(0) };       # block for a key
         eval { Term::ReadKey::ReadMode('cbreak') };
         print STDOUT "\e[?1049h\e[?25l";
+        log_ev('launch_session_failed', { reason => 'wt-not-found' });
         return 'redraw';
     }
-    my $rc = system(@$argv);   # wt.exe / `start` return immediately (detached window)
-    if ($rc != 0 && $mode eq 'wt') {
-        # Old Windows Terminal (pre-1.7 has no `-w new`) or a wt spawn error:
-        # fall back to a plain new console via cmd `start`, so [c] never
-        # silently does nothing.
-        log_ev('launch_session_retry', { from => 'wt', exit => ($rc >> 8) });
-        my $alt = Dashboard::spawn_argv('start', { cmd => \@inner, comspec => $ENV{COMSPEC} });
-        $rc = system(@$alt) if $alt;
-    }
-    log_ev('launch_session_done', { mode => $mode, exit => ($rc >> 8) });
+
+    my $argv = Dashboard::spawn_argv('wt', { cmd => \@inner });   # ['wt.exe','-w','new',…]
+    log_ev('launch_session', { mode => 'wt' });
+    my $rc = system(@$argv);   # returns immediately (detached window)
+    log_ev('launch_session_done', { mode => 'wt', exit => ($rc >> 8) });
     return;
 }
 
