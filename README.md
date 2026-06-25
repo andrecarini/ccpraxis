@@ -565,7 +565,9 @@ Container runtimes do not support fine-grained "allow only port X" rules at the 
 
 Each item:
 - **Required strings:** `category`, `name`, `install`, `verify`
-- **Optional strings:** `version` (informational pin), `rationale` (free-text "why is this in the backpack?"), `added` (ISO date, auto-set on first add)
+- **Optional strings:** `rationale` (free-text "why is this in the backpack?"), `added` (ISO date, auto-set on first add)
+
+> There is **no per-item `version` field** — pin a version inside the `install` command itself (`apt-get install -y jq=1.6`, `npm install -g prettier@3.2.5`), which is the single source of truth; the `verify` command (`X --version`) reflects the live version. A separate stored field duplicated that pin and could silently drift, so it was removed. Existing files that still carry a per-item `version` are tolerated (it's stripped on read and dropped on the next write); `add --version` is rejected with a pointer to install-pinning.
 
 Uniqueness key: `(category, name)`. `add` on an existing key updates in place; updating without `--rationale` preserves the prior rationale (don't blow away context). Allowed categories (warnings on unknown, not errors): `apt`, `npm-global`, `pip`, `cargo`, `gem`, `go-install`, `curl-script`, `snap`, `project-setup`, `other`. v1 files are rejected with a one-line migration message ("rename `tools` to `items`, bump `version` to 2").
 

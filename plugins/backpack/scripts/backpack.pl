@@ -13,7 +13,7 @@
 # Subcommands:
 #   validate <path>                                          Schema-check the file. Exit 0 ok, 1 invalid.
 #   list <path>                                              Pretty-print the contents.
-#   add <path> --category C --name N --install I --verify V [--version X] [--rationale R]
+#   add <path> --category C --name N --install I --verify V [--rationale R]
 #                                                           Add or update entry (idempotent on category+name).
 #   remove <path> --category C --name N                     Drop an entry (idempotent).
 #   install <path>                                           Run verify; if it fails, run install. Reports status per item.
@@ -26,10 +26,16 @@
 #       "name":      "<non-empty string, no newline>",
 #       "install":   "<shell command, no newline>",
 #       "verify":    "<shell command, no newline>",
-#       "version":   "<optional, informational>",
 #       "rationale": "<optional, free-text 'why this is in the backpack'>",
 #       "added":     "<ISO date, auto-set on add>"
 #     } ] }
+#
+# NOTE: a per-item "version" field was REMOVED from the schema (it duplicated the
+# pin already baked into the install command / verify check and could silently
+# drift out of sync — the command is the single source of truth). The top-level
+# "version": 2 above is the SCHEMA version and is unrelated. Existing files that
+# still carry a per-item "version" are tolerated: it is stripped on read (so it
+# never displays) and dropped on the next write. `add --version` is rejected.
 #
 # The schema changed from v1 to v2: the top-level array was renamed `tools` → `items`,
 # and `rationale` was added as an optional field. v1 files are rejected with a clear
@@ -150,6 +156,12 @@ sub load_backpack {
     die_user("backpack 'items' is not an array: $path")
         unless ref $data->{items} eq 'ARRAY';
 
+    # The per-item 'version' field was removed from the schema (it duplicated the
+    # install command's pin and could drift). Tolerate it in existing files but
+    # strip it on read so it never displays and the next write drops it. This is
+    # NOT the top-level $data->{version} schema marker, which stays.
+    delete $_->{version} for grep { ref $_ eq 'HASH' } @{ $data->{items} };
+
     return $data if $opts{skip_full_validate};
 
     my @issues = validate_backpack($data);
@@ -269,8 +281,7 @@ sub cmd_list {
 
     for my $cat (@cat_order) {
         for my $t (@{$by_cat{$cat}}) {
-            my $ver = defined $t->{version} && $t->{version} ne '' ? " ($t->{version})" : "";
-            print "  $cat: $t->{name}$ver\n";
+            print "  $cat: $t->{name}\n";
             print "      install:   $t->{install}\n";
             print "      verify:    $t->{verify}\n";
             if (defined $t->{rationale} && $t->{rationale} ne '') {
@@ -283,14 +294,18 @@ sub cmd_list {
 }
 
 sub cmd_add {
-    my $path = shift @ARGV or die_user("usage: add <path> --category C --name N --install I --verify V [--version X] [--rationale R]");
-    my ($category, $name, $install, $verify, $version, $rationale);
+    my $path = shift @ARGV or die_user("usage: add <path> --category C --name N --install I --verify V [--rationale R]");
+    # The per-item version field was removed from the schema. Reject it loudly
+    # (rather than silently ignore) so callers update to pinning inside --install.
+    die_user("the per-item --version field was removed from the backpack schema; "
+        . "pin the version inside the --install command (e.g. 'apt-get install -y jq=1.6') instead")
+        if grep { /^--version(?:=|$)/ } @ARGV;
+    my ($category, $name, $install, $verify, $rationale);
     GetOptionsFromArray(\@ARGV,
         'category=s'  => \$category,
         'name=s'      => \$name,
         'install=s'   => \$install,
         'verify=s'    => \$verify,
-        'version=s'   => \$version,
         'rationale=s' => \$rationale,
     ) or die_user("invalid options for add");
 
@@ -331,7 +346,6 @@ sub cmd_add {
         install  => $install,
         verify   => $verify,
     };
-    $entry->{version}   = $version   if defined $version   && $version   ne '';
     $entry->{rationale} = $rationale if defined $rationale && $rationale ne '';
 
     if (defined $existing_idx) {
@@ -539,7 +553,7 @@ backpack.pl — what you packed for the /sandbox container
 Subcommands:
   validate <path>                                          Schema-check the file.
   list <path>                                              Pretty-print the contents.
-  add <path> --category C --name N --install I --verify V [--version X] [--rationale R]
+  add <path> --category C --name N --install I --verify V [--rationale R]
                                                            Add or update entry.
   remove <path> --category C --name N                     Drop an entry.
   install <path>                                           Run verify; install if missing.

@@ -2,7 +2,7 @@
 name: add
 description: Record an item in the sandbox backpack so it's restored on every container rebuild. Use when (a) the auto-declare hook's additionalContext surfaces a pre-filled invocation after a successful install — decide whether to run it (with a real rationale) or skip the install as a one-off; (b) the user says "add to the backpack", "declare X", "pack X", "persist this install"; (c) you installed something via an unusual shape the hook can't parse (curl-pipe-bash, custom script) and want to record it manually. Also use to fill in a missing rationale on an existing entry — re-running add with the same category+name updates in place. Skip on the host.
 user-invocable: true
-argument-hint: "[--category C --name N --install I --verify V --version X --rationale R]"
+argument-hint: "[--category C --name N --install I --verify V --rationale R]"
 allowed-tools: Bash, Read, AskUserQuestion
 related:
   - remove
@@ -51,7 +51,7 @@ If outside a sandbox, stop and explain — don't try to fall back to host paths 
 2. **User typed `/backpack:add` bare** — interactive mode: gather everything via `AskUserQuestion`.
 3. **Partial flags** — gather only the missing ones interactively.
 
-Required for any item: `category`, `name`, `install`, `verify`. Optional: `version`, `rationale`.
+Required for any item: `category`, `name`, `install`, `verify`. Optional: `rationale`.
 
 ## Interactive gather (when flags are missing)
 
@@ -61,7 +61,6 @@ Ask via `AskUserQuestion`:
 - **name** — human-readable identifier (e.g. `postgresql-client`, `firebase-tools`, `flutter`, `npm-deps`). Together with category, it's the uniqueness key.
 - **install command** — the exact shell command that should be replayed on rebuild. Pin specific versions; never `latest`. Will run via `bash -c` as root inside the container.
 - **verify command** — fast shell command that exits 0 if the item is already in place, non-zero otherwise. Used to skip re-installing on rebuilds where the state was preserved. For tools: `command -v X` or `X --version`. For project-setup: check the result (e.g. `test -d /project/node_modules`).
-- **version** (optional) — informational version pin.
 - **rationale** (optional but strongly preferred) — one-line "why is this in the backpack? why this specific version? what would the alternative be?" Future-you and the next agent will thank you. **If the install was just performed at the user's request, capture the user's stated reason verbatim.**
 
 ## Run
@@ -72,9 +71,10 @@ perl "${CLAUDE_SKILL_DIR}/../../scripts/backpack.pl" add "$HOME/.claude/backpack
   --name      "<N>" \
   --install   "<I>" \
   --verify    "<V>" \
-  --version   "<X>"   # only if known
   --rationale "<R>"   # only if provided
 ```
+
+To pin a version, bake it into the **install** command (e.g. `apt-get install -y jq=1.6`, `npm install -g prettier@3.2.5`) — that's the single source of truth. There is no separate `--version` field; the verify command (`X --version`) reflects the live version.
 
 **Quoting reminder**: `--install` and `--verify` values are shell strings — quote them in the bash invocation so `$`, backticks, and `;` inside them don't get interpreted by the calling shell. The Perl helper rejects embedded newlines.
 

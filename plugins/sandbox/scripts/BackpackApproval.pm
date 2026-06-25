@@ -36,12 +36,10 @@ sub item_key {
 
 # item_hash($item) -> a content fingerprint over ONLY the fields that actually
 # EXECUTE: install + verify. Everything else is deliberately excluded:
-#   * version   — informational, never executed, and for pinned installs it just
-#                 duplicates what's already in the install URL / verify grep (it
-#                 can drift out of sync with the command). The command is the
-#                 single source of truth; a real version bump changes the install
-#                 command and is caught that way. Hashing version too would be
-#                 non-DRY and would force pointless re-approvals on a label edit.
+#   * version   — REMOVED from the backpack schema (it duplicated the pin already
+#                 in the install command / verify check and could drift). A
+#                 legacy file may still carry one; it is never executed, so it is
+#                 excluded here too — a stray version must not affect approval.
 #   * rationale — prose shown to the human; editing it must not invalidate a
 #                 prior command approval.
 sub item_hash {

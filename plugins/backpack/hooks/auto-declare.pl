@@ -155,7 +155,6 @@ sub build_proposal {
                  . " --name "    . shesc($d->{name})
                  . " --install " . shesc($d->{install})
                  . " --verify "  . shesc($d->{verify});
-        $line .= " --version " . shesc($d->{version}) if defined $d->{version};
         $line .= " --rationale '<WHY: one line — what this is for, why this version>'";
         $msg .= "$line\n";
     }
@@ -204,14 +203,13 @@ sub parse_apt {
             # for the install command so a re-run pins the same version.
             (my $name = $tok) =~ s/=.*//;
             next unless length $name;
-            my $version;
-            $version = $1 if $tok =~ /=(.+)$/;
+            # The version pin (if any) stays baked into $tok / the install
+            # command — the schema no longer stores a separate version field.
             push @results, {
                 category => 'apt',
                 name     => $name,
                 install  => "apt-get install -y $tok",
                 verify   => "dpkg -s $name >/dev/null 2>&1",
-                (defined $version ? (version => $version) : ()),
             };
         }
     }
@@ -230,7 +228,7 @@ sub parse_npm_global {
         for my $tok (@tokens) {
             next if $tok =~ /^-/;
             next if $tok eq '--';
-            my ($name, $version) = npm_split($tok);
+            my ($name) = npm_split($tok);
             next unless defined $name;
             push @results, {
                 category => 'npm-global',
@@ -242,7 +240,6 @@ sub parse_npm_global {
                 # `npm list -g --depth=0 X` is unreliable: it exits 1 on peer-
                 # dep warnings even when X is installed.
                 verify   => "command -v $name >/dev/null 2>&1 || test -d \"\$(npm root -g 2>/dev/null)/$name\"",
-                (defined $version ? (version => $version) : ()),
             };
         }
     }
@@ -261,7 +258,7 @@ sub parse_pnpm_global {
         for my $tok (@tokens) {
             next if $tok =~ /^-/;
             next if $tok eq '--';
-            my ($name, $version) = npm_split($tok);
+            my ($name) = npm_split($tok);
             next unless defined $name;
             push @results, {
                 category => 'npm-global',
@@ -270,7 +267,6 @@ sub parse_pnpm_global {
                 # CLI-shim test plus package-dir fallback (same rationale as
                 # the npm verify above).
                 verify   => "command -v $name >/dev/null 2>&1 || test -d \"\$(pnpm root -g 2>/dev/null)/$name\"",
-                (defined $version ? (version => $version) : ()),
             };
         }
     }
@@ -289,7 +285,7 @@ sub parse_yarn_global {
         for my $tok (@tokens) {
             next if $tok =~ /^-/;
             next if $tok eq '--';
-            my ($name, $version) = npm_split($tok);
+            my ($name) = npm_split($tok);
             next unless defined $name;
             push @results, {
                 category => 'npm-global',
@@ -298,7 +294,6 @@ sub parse_yarn_global {
                 # CLI-shim test plus package-dir fallback. yarn global stores
                 # packages under `yarn global dir`/node_modules/.
                 verify   => "command -v $name >/dev/null 2>&1 || test -d \"\$(yarn global dir 2>/dev/null)/node_modules/$name\"",
-                (defined $version ? (version => $version) : ()),
             };
         }
     }
@@ -343,14 +338,12 @@ sub parse_pip {
             # Strip version operators: ==, >=, <=, !=, ~=, <, >.
             (my $name = $tok) =~ s/[=<>!~].*//;
             next unless length $name;
-            my $version;
-            $version = $1 if $tok =~ /==(.+)$/;
+            # Any version operator stays inside $tok / the install command.
             push @results, {
                 category => 'pip',
                 name     => $name,
                 install  => "$tool install $tok",
                 verify   => "$tool show $name >/dev/null 2>&1",
-                (defined $version ? (version => $version) : ()),
             };
         }
     }
@@ -382,7 +375,6 @@ sub parse_cargo {
             } else {
                 $name = $pkg;
             }
-            my $version = $name_version // $explicit_version;
             my $install = "cargo install $pkg";
             $install .= " --version $explicit_version" if defined $explicit_version && !defined $name_version;
             push @results, {
@@ -390,7 +382,6 @@ sub parse_cargo {
                 name     => $name,
                 install  => $install,
                 verify   => "cargo install --list 2>/dev/null | grep -q '^$name '",
-                (defined $version ? (version => $version) : ()),
             };
         }
     }
