@@ -365,12 +365,13 @@ sub drive {
         sleep_for      => sub { $clock += $_[0]; },     # advance the fake clock
         read_key       => sub { @keys ? shift @keys : undef },
         term_size      => sub { (60, 12) },
-        gather         => sub { $eff{gathers}++; { project_name => 'demo', container => 'c1', status => 'running', events => [] } },
+        gather         => sub { $eff{gathers}++; { project_name => 'demo', container => 'c1', status => 'running', events => [], busy_age => $args{busy_age} } },
         heartbeat      => sub { $eff{heartbeats}++; $args{hb_returns} ? $args{hb_returns}->() : 'ok' },
         spawn          => sub { $eff{spawns}++; undef },
         write_signals  => sub { $eff{signals}++; 1 },
         enter_raw      => sub { $eff{entered} = 1 },
         leave_raw      => sub { $eff{left} = ($eff{left} || 0) + 1 },
+        keepawake      => sub { $eff{keepawake_calls}++; $eff{last_busy_age} = $_[0]{busy_age} },
         out            => sub { $out .= $_[0]; $eff{frames}++ },
     );
     $eff{rc} = $rc;
@@ -392,6 +393,14 @@ sub drive {
     # heartbeat fires on the first tick, then on cadence as the clock advances.
     my $e = drive(keys => [(undef) x 30], beat_interval => 1, max_ticks => 6);
     ok($e->{heartbeats} >= 2, 'loop: heartbeat fires repeatedly on the time cadence');
+}
+
+{
+    # B5: the keepawake seam fires on every state refresh, receiving the freshly
+    # gathered state (busy_age) so the launcher can drive the wake-lock.
+    my $e = drive(keys => [(undef) x 10], busy_age => 42, state_interval => 0, max_ticks => 5);
+    ok($e->{keepawake_calls} >= 1, 'loop: keepawake seam fires on state refresh');
+    is($e->{last_busy_age}, 42, 'loop: keepawake seam receives the gathered busy_age');
 }
 
 {

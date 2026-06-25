@@ -452,7 +452,10 @@ sub write_shutdown_signals {
 # Required seams (launcher.pl supplies the real ones; the test harness supplies
 # fakes): now, sleep_for, read_key, term_size, gather, heartbeat, spawn,
 # write_signals, enter_raw, leave_raw, out. Optional: color, beat_interval,
-# state_interval, tick_interval, max_ticks (bounded run for tests).
+# state_interval, tick_interval, max_ticks (bounded run for tests), and
+# keepawake->(\%state) — B5's hook, called once per state refresh with the freshly
+# gathered state so the launcher can drive the wake-lock off busy_age (the loop
+# itself stays ignorant of the keep-awake decision; that lives in KeepAwake.pm).
 #
 # gather->() returns the base state hashref (project_name, container, status,
 # events); the loop augments it with beat_age, uptime and pending. heartbeat->()
@@ -470,6 +473,7 @@ sub run {
     my $write_sig  = $o{write_signals} || sub { 0 };
     my $enter_raw  = $o{enter_raw}  || sub { };
     my $leave_raw  = $o{leave_raw}  || sub { };
+    my $keepawake  = $o{keepawake}  || sub { };   # B5: drive the wake-lock off fresh state
     my $out        = $o{out}        || sub { print STDOUT $_[0] };
     my $color      = exists $o{color} ? $o{color} : 1;
     my $beat_int   = defined $o{beat_interval}  ? $o{beat_interval}  : 120;
@@ -509,6 +513,9 @@ sub run {
                     my $base = $gather->() || {};
                     %state = %$base;
                     $last_state = $t;
+                    # B5: re-evaluate the wake-lock on the freshly gathered state
+                    # (carries busy_age). The launcher's seam owns the decision.
+                    $keepawake->(\%state);
                 }
                 $state{beat_age} = $t - $last_beat;
                 $state{uptime}   = $t - $start;

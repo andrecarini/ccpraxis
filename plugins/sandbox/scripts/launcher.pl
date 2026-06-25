@@ -49,6 +49,7 @@ use LaunchLog ();   # B1: durable per-launch diagnostic log (next to us in scrip
 use Dashboard ();   # B2: the raw-ANSI TUI dashboard framework
 use BackpackApproval ();  # #21: per-item, machine-local backpack approval memory
 use BackpackReview ();    # #21: the I/O-seam-injected interactive approval walk
+use KeepAwake ();         # B5: dashboard wake-lock decision + lifecycle holder
 use JSON::PP ();          # parse backpack.json + write the approved install-set
 use File::Path qw(make_path);
 use File::Spec;
@@ -285,11 +286,17 @@ sub _tx { return unless $TRANSCRIPT; print {$TRANSCRIPT} @_; }
 # _close_transcript — flush + close, tolerant of undef / double-call.
 sub _close_transcript { if ($TRANSCRIPT) { close $TRANSCRIPT; undef $TRANSCRIPT; } }
 
-# Color for the interactive setup phase (the backpack review, etc.). Off when
-# stdout isn't a TTY or NO_COLOR is set (https://no-color.org). ANSI passes
-# through the :raw STDOUT untouched; the transcript gets the plain text via _tx.
+# Whether to colorize the interactive setup phase. Off when stdout isn't a TTY or
+# NO_COLOR is set (https://no-color.org). Passed to BackpackReview (the #21 walk
+# does its own ANSI); the deferred #21 part-A (colorize the broader build/
+# container output) will reuse this flag.
 my $USE_COLOR = (-t STDOUT && !exists $ENV{NO_COLOR}) ? 1 : 0;
-sub _c { my ($sgr, $s) = @_; $USE_COLOR ? "\e[${sgr}m$s\e[0m" : $s }
+
+# B5 keep-awake holder (set up in enter_dashboard). File-scope so the signal/END
+# teardown can release the wake-lock — a leaked PowerShell helper would keep the
+# machine awake forever. Release is idempotent + tolerant of an unset holder.
+my $KEEPAWAKE;
+sub _keepawake_release_global { eval { $KEEPAWAKE->release if $KEEPAWAKE }; }
 
 # _tee_system(@cmd) — run @cmd streaming its combined stdout+stderr LIVE to the
 # console AND into the transcript. system()-style return value ($? convention:
@@ -516,9 +523,9 @@ sub _rmtree {
 
 # Signal handlers + END block — exec at the end skips these, so every
 # exec path calls release_lock explicitly before exec.
-$SIG{INT}  = sub { log_ev('signal', { sig => 'INT' });  LaunchLog::close_log($LAUNCH_LOG); _close_transcript(); release_lock(); reset_terminal(); exit 130 };
-$SIG{TERM} = sub { log_ev('signal', { sig => 'TERM' }); LaunchLog::close_log($LAUNCH_LOG); _close_transcript(); release_lock(); reset_terminal(); exit 143 };
-END { LaunchLog::close_log($LAUNCH_LOG); _close_transcript(); release_lock() }
+$SIG{INT}  = sub { log_ev('signal', { sig => 'INT' });  _keepawake_release_global(); LaunchLog::close_log($LAUNCH_LOG); _close_transcript(); release_lock(); reset_terminal(); exit 130 };
+$SIG{TERM} = sub { log_ev('signal', { sig => 'TERM' }); _keepawake_release_global(); LaunchLog::close_log($LAUNCH_LOG); _close_transcript(); release_lock(); reset_terminal(); exit 143 };
+END { _keepawake_release_global(); LaunchLog::close_log($LAUNCH_LOG); _close_transcript(); release_lock() }
 
 acquire_lock();
 
@@ -2000,8 +2007,22 @@ sub enter_dashboard {
 
     require Term::ReadKey;
     my $log_path = "$CLAUDE_DATA/sandbox-logs/launch-$LAUNCH_ID.log";
-    my $cached_status = 'unknown';
-    my $last_inspect  = 0;
+    my $cached_status     = 'unknown';
+    my $cached_busy_mtime = undef;   # epoch mtime of /tmp/.butler-busy, or undef
+    my $last_inspect      = 0;
+
+    # B5 keep-awake: hold a wake-lock only while the orchestrator's busy-lease is
+    # fresh (active work / pending auto-resume). Reap any helper orphaned by a
+    # previously-crashed launcher first, then build the seam-driven holder.
+    my $BUSY_STALE   = ($ENV{BUSY_STALE_SECS} && $ENV{BUSY_STALE_SECS} =~ /^\d+$/)
+                       ? $ENV{BUSY_STALE_SECS} : 180;
+    my $ka_helper    = "$SANDBOX_PLUGIN/scripts/keep-awake.ps1";
+    my $ka_pidfile   = "$LAUNCHER_DIR/keepawake.pid";
+    _keepawake_reap_orphan($ka_pidfile);
+    $KEEPAWAKE = KeepAwake->new(
+        start => sub { _keepawake_start($ka_helper, $ka_pidfile) },
+        stop  => sub { _keepawake_stop($_[0], $ka_pidfile) },
+    );
 
     my $rc = Dashboard::run(
         color     => 1,
@@ -2031,6 +2052,12 @@ sub enter_dashboard {
                 my $s = `$PODMAN inspect --format '{{.State.Status}}' "$CONTAINER_NAME" 2>/dev/null`;
                 chomp $s if defined $s;
                 $cached_status = (defined $s && length $s) ? $s : 'unknown';
+                # B5: busy-lease mtime (the orchestrator keeps /tmp/.butler-busy
+                # fresh only while there's active work or a pending auto-resume).
+                # Cache the epoch mtime on the same ~10s cadence; the age is
+                # recomputed against `now` each gather. Absent file -> undef.
+                my $bm = `$PODMAN exec "$CONTAINER_NAME" stat -c %Y /tmp/.butler-busy 2>/dev/null`;
+                $cached_busy_mtime = ($bm && $bm =~ /^(\d+)/) ? $1 : undef;
                 $last_inspect  = $now;
             }
             my @lines = _tail_lines($log_path, 200);
@@ -2040,7 +2067,15 @@ sub enter_dashboard {
                 status          => $cached_status,
                 events          => Dashboard::recent_events(\@lines, 50),
                 install_warning => $INSTALL_WARNING,
+                busy_age        => (defined $cached_busy_mtime ? $now - $cached_busy_mtime : undef),
             };
+        },
+        keepawake => sub {
+            my ($st) = @_;
+            my $want = KeepAwake::should_stay_awake($st->{busy_age}, $BUSY_STALE);
+            my $act  = $KEEPAWAKE->sync($want);
+            log_ev('keepawake', { want => ($want ? 1 : 0), action => $act,
+                                  busy_age => $st->{busy_age} }) if $act ne 'noop';
         },
         spawn         => \&_spawn_session,
         write_signals => sub {
@@ -2049,6 +2084,7 @@ sub enter_dashboard {
             return $n;
         },
     );
+    _keepawake_release_global();   # drop the wake-lock on clean dashboard exit
     exit($rc // 0);
 }
 
@@ -2070,6 +2106,80 @@ sub _heartbeat_once {
     }
     log_ev('heartbeat', {});
     return 'ok';
+}
+
+# ---------------------------------------------------------------------
+# B5 keep-awake helpers — the real spawn/kill seams for the KeepAwake holder.
+# The host perl is Git-for-Windows (cygwin) perl with no Win32::API, so the
+# wake-lock is a dedicated PowerShell child (keep-awake.ps1) whose lifetime IS
+# the lock's lifetime. NOTE: the actual spawn/kill + whether the machine really
+# stays awake is verified on a real desktop (attended); the decision + lifecycle
+# logic is unit-tested in KeepAwake.pm / t/28.
+# ---------------------------------------------------------------------
+
+# _keepawake_start($ps1, $pidfile) -> child pid | undef. fork+exec the PowerShell
+# helper detached (stdio to /dev/null so it can't touch the dashboard alt-screen).
+# Returns the cygwin child pid (the holder's handle, used by _keepawake_stop).
+# The helper self-reports its WINDOWS pid into $pidfile for cross-crash reaping.
+sub _keepawake_start {
+    my ($ps1, $pidfile) = @_;
+    unless (-f $ps1) {
+        log_ev('keepawake_start_failed', { reason => "helper missing: $ps1" });
+        return undef;
+    }
+    my $win_ps1 = winify_path($ps1);
+    my $win_pid = winify_path($pidfile);
+    my $pid = fork();
+    if (!defined $pid) {
+        log_ev('keepawake_start_failed', { reason => "fork: $!" });
+        return undef;
+    }
+    if ($pid == 0) {
+        # child: detach stdio, then exec the helper. _exit (not exit) on failure
+        # so the parent's END handlers don't run in the child.
+        open(STDIN,  '<', '/dev/null');
+        open(STDOUT, '>', '/dev/null');
+        open(STDERR, '>', '/dev/null');
+        local $ENV{MSYS2_ARG_CONV_EXCL} = '*';
+        exec('powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass',
+             '-WindowStyle', 'Hidden', '-File', $win_ps1, '-PidFile', $win_pid)
+            or do { POSIX::_exit(127); };
+    }
+    log_ev('keepawake_started', { pid => $pid });
+    return $pid;
+}
+
+# _keepawake_stop($child_pid, $pidfile) — kill our helper child (releases the
+# wake-lock: process death drops ES_CONTINUOUS) and clear the pidfile. SIGKILL so
+# it's immediate; waitpid reaps the zombie (it's a direct fork of ours).
+sub _keepawake_stop {
+    my ($pid, $pidfile) = @_;
+    if (defined $pid && $pid =~ /^\d+$/ && $pid > 0) {
+        kill('KILL', $pid);
+        waitpid($pid, 0);
+        log_ev('keepawake_stopped', { pid => $pid });
+    }
+    unlink $pidfile if defined $pidfile && -f $pidfile;
+}
+
+# _keepawake_reap_orphan($pidfile) — on dashboard entry, kill a helper left
+# running by a previously-CRASHED launcher (its wake-lock would persist forever).
+# Uses the helper's self-reported WINDOWS pid + taskkill, guarded by a name check
+# so a recycled pid that now belongs to something else is left alone.
+sub _keepawake_reap_orphan {
+    my ($pidfile) = @_;
+    return unless defined $pidfile && -f $pidfile;
+    my $wpid = _read_file($pidfile);
+    chomp $wpid if defined $wpid;
+    unlink $pidfile;
+    return unless defined $wpid && $wpid =~ /^\d+$/;
+    local $ENV{MSYS2_ARG_CONV_EXCL} = '*';
+    my $name = `powershell.exe -NoProfile -Command "(Get-Process -Id $wpid -ErrorAction SilentlyContinue).ProcessName" 2>/dev/null`;
+    chomp $name if defined $name;
+    if (defined $name && $name =~ /powershell/i) {
+        system('taskkill.exe', '/PID', $wpid, '/F', '/T');
+        log_ev('keepawake_orphan_reaped', { pid => $wpid });
+    }
 }
 
 # _tail_lines — last $n chomped lines of a file (the B1 launch log), or ().
