@@ -204,6 +204,72 @@ my %st = (
 }
 
 # ===========================================================================
+# PART 2b — B3 (run / wakefulness) + B4 (backpack) panels
+# ===========================================================================
+{
+    # Run panel: fresh lease + stay_awake -> active / holding; needs-you count.
+    my @p = Dashboard::build_panels({ %st, busy_age => 30, stay_awake => 1, needs_you => 2 });
+    my ($run) = grep { $_->{title} eq 'Run' } @p;
+    ok($run, 'panels: a Run panel is present');
+    my $rtext = join "\n", @{ $run->{lines} };
+    like($rtext, qr/busy-lease.*active/,   'run: fresh lease + stay_awake -> active');
+    like($rtext, qr/keep-awake.*holding/,  'run: stay_awake -> keep-awake holding');
+    like($rtext, qr/needs you.*2 decision/,'run: needs-you count surfaced');
+}
+{
+    # Stale lease (stay_awake false) -> idle / released; zero decisions -> none.
+    my @p = Dashboard::build_panels({ %st, busy_age => 9999, stay_awake => 0, needs_you => 0 });
+    my $rtext = join "\n", @{ (grep { $_->{title} eq 'Run' } @p)[0]->{lines} };
+    like($rtext, qr/busy-lease.*idle/,     'run: stale lease -> idle');
+    like($rtext, qr/keep-awake.*released/, 'run: not awake -> released (PC may sleep)');
+    like($rtext, qr/needs you.*none/,      'run: zero decisions -> none');
+}
+{
+    # No run at all (no busy_age) -> busy-lease none.
+    my @p = Dashboard::build_panels({ %st });
+    my $rtext = join "\n", @{ (grep { $_->{title} eq 'Run' } @p)[0]->{lines} };
+    like($rtext, qr/busy-lease.*none/, 'run: absent lease -> none (no active run)');
+}
+{
+    # Backpack panel present only when a backpack structure was gathered.
+    my @no = grep { $_->{title} eq 'Backpack' } Dashboard::build_panels({ %st });
+    ok(!@no, 'backpack: no panel without a gathered structure');
+
+    my $bp = { total => 3, approved => 2, items => [
+        { key => 'apt:jq',              approved => 1 },
+        { key => 'apt:chromium',        approved => 0 },
+        { key => 'npm-global:prettier', approved => 1 },
+    ] };
+    my ($bk) = grep { $_->{title} eq 'Backpack' } Dashboard::build_panels({ %st, backpack => $bp });
+    ok($bk, 'backpack: panel present when gathered');
+    my $btext = join "\n", @{ $bk->{lines} };
+    like($btext, qr/3 item\(s\) - 2 approved \(\+\), 1 pending \(-\)/, 'backpack: header counts');
+    like($btext, qr/\[\+\] apt:jq/,       'backpack: approved item marked +');
+    like($btext, qr/\[-\] apt:chromium/,  'backpack: pending item marked -');
+}
+{
+    # _backpack_lines: empty + cap-with-"+N more" (cap is never silent).
+    my @empty = Dashboard::_backpack_lines({ total => 0 });
+    like($empty[0], qr/no backpack/, 'backpack: total 0 -> "no backpack"');
+
+    my @items = map { { key => "apt:p$_", approved => 1 } } (1 .. 20);
+    my @l = Dashboard::_backpack_lines({ total => 20, approved => 20, items => \@items });
+    like(join("\n", @l), qr/\.\.\. \+12 more/, 'backpack: caps at 8, shows "+12 more"');
+    is(scalar(grep { /^\[\+\]/ } @l), 8, 'backpack: exactly 8 item lines shown');
+}
+{
+    # End-to-end: compose_frame surfaces the new panels (and stays exactly sized).
+    my $bp = { total => 1, approved => 0, items => [{ key => 'apt:jq', approved => 0 }] };
+    my $f = Dashboard::compose_frame(
+        { %st, busy_age => 5, stay_awake => 1, needs_you => 1, backpack => $bp }, 30, 80);
+    is(scalar(grep { length($_->{text}) != 80 } @$f), 0, 'compose: new panels keep rows exactly $cols');
+    my $joined = join "\n", map { $_->{text} } @$f;
+    like($joined, qr/-- Run /,             'compose: Run panel title rendered');
+    like($joined, qr/-- Backpack /,        'compose: Backpack panel title rendered');
+    like($joined, qr/keep-awake.*holding/, 'compose: keep-awake state surfaced in a frame');
+}
+
+# ===========================================================================
 # PART 3 — render diff (the flicker fix)
 # ===========================================================================
 {

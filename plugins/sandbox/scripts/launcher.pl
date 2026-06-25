@@ -2009,7 +2009,11 @@ sub enter_dashboard {
     my $log_path = "$CLAUDE_DATA/sandbox-logs/launch-$LAUNCH_ID.log";
     my $cached_status     = 'unknown';
     my $cached_busy_mtime = undef;   # epoch mtime of /tmp/.butler-busy, or undef
+    my $cached_needs_you  = 0;       # B3: queued "needs you" decisions
+    my $cached_backpack   = undef;   # B4: backpack items + per-item approval
     my $last_inspect      = 0;
+    my $bp_host_file      = "$CLAUDE_DATA/backpack.json";
+    my $bp_appr_file      = "$LAUNCHER_DIR/backpack-approvals.json";
 
     # B5 keep-awake: hold a wake-lock only while the orchestrator's busy-lease is
     # fresh (active work / pending auto-resume). Reap any helper orphaned by a
@@ -2058,8 +2062,14 @@ sub enter_dashboard {
                 # recomputed against `now` each gather. Absent file -> undef.
                 my $bm = `$PODMAN exec "$CONTAINER_NAME" stat -c %Y /tmp/.butler-busy 2>/dev/null`;
                 $cached_busy_mtime = ($bm && $bm =~ /^(\d+)/) ? $1 : undef;
+                $cached_needs_you  = _count_needs_you($PROJECT_PATH);          # B3
+                $cached_backpack   = _gather_backpack($bp_host_file, $bp_appr_file);  # B4
                 $last_inspect  = $now;
             }
+            my $busy_age = defined $cached_busy_mtime ? $now - $cached_busy_mtime : undef;
+            # B5: the single keep-awake decision, shared by the seam below AND the
+            # Run panel (so the view never re-derives the freshness threshold).
+            my $stay = KeepAwake::should_stay_awake($busy_age, $BUSY_STALE) ? 1 : 0;
             my @lines = _tail_lines($log_path, 200);
             return {
                 project_name    => $PROJECT_NAME,
@@ -2067,14 +2077,16 @@ sub enter_dashboard {
                 status          => $cached_status,
                 events          => Dashboard::recent_events(\@lines, 50),
                 install_warning => $INSTALL_WARNING,
-                busy_age        => (defined $cached_busy_mtime ? $now - $cached_busy_mtime : undef),
+                busy_age        => $busy_age,
+                stay_awake      => $stay,
+                needs_you       => $cached_needs_you,
+                backpack        => $cached_backpack,
             };
         },
         keepawake => sub {
             my ($st) = @_;
-            my $want = KeepAwake::should_stay_awake($st->{busy_age}, $BUSY_STALE);
-            my $act  = $KEEPAWAKE->sync($want);
-            log_ev('keepawake', { want => ($want ? 1 : 0), action => $act,
+            my $act = $KEEPAWAKE->sync($st->{stay_awake} ? 1 : 0);
+            log_ev('keepawake', { want => ($st->{stay_awake} ? 1 : 0), action => $act,
                                   busy_age => $st->{busy_age} }) if $act ne 'noop';
         },
         spawn         => \&_spawn_session,
@@ -2180,6 +2192,56 @@ sub _keepawake_reap_orphan {
         system('taskkill.exe', '/PID', $wpid, '/F', '/T');
         log_ev('keepawake_orphan_reaped', { pid => $wpid });
     }
+}
+
+# ---------------------------------------------------------------------
+# B3/B4 dashboard gather helpers (host-side reads feeding build_panels).
+# ---------------------------------------------------------------------
+
+# _count_needs_you($project) -> count of queued "needs you" decision entries
+# across every blueprint's runs/needs-you/ (Decision #27's dashboard indicator).
+# opendir/readdir (not glob) so project paths with spaces / André bytes are safe.
+sub _count_needs_you {
+    my ($project) = @_;
+    my $base = "$project/.ccpraxis-local-data/blueprints";
+    return 0 unless -d $base;
+    my $n = 0;
+    opendir(my $bd, $base) or return 0;
+    for my $bp (readdir $bd) {
+        next if $bp eq '.' || $bp eq '..';
+        my $nd = "$base/$bp/runs/needs-you";
+        next unless -d $nd;
+        opendir(my $d, $nd) or next;
+        for my $f (readdir $d) {
+            next if $f =~ /^\./ || $f =~ /\.tmp$/;   # skip dotfiles + atomic-write temps
+            $n++ if -f "$nd/$f";
+        }
+        closedir $d;
+    }
+    closedir $bd;
+    return $n;
+}
+
+# _gather_backpack($bp_file, $appr_file) -> { total, approved, items=>[{key,
+# approved}] } for the B4 panel, or undef when there's no backpack. Cheap (two
+# small host JSON reads); reuses BackpackApproval so the panel's approval state
+# matches the #21 gate exactly.
+sub _gather_backpack {
+    my ($bp_file, $appr_file) = @_;
+    return undef unless -f $bp_file;
+    my $data = eval { JSON::PP->new->decode(_read_file($bp_file) // '') };
+    return { total => 0, approved => 0, items => [] }
+        unless ref $data eq 'HASH' && ref $data->{items} eq 'ARRAY';
+    my $appr = BackpackApproval::load($appr_file);
+    my (@items, $napprove);
+    $napprove = 0;
+    for my $it (@{ $data->{items} }) {
+        next unless ref $it eq 'HASH';
+        my $ok = BackpackApproval::is_approved($it, $appr) ? 1 : 0;
+        $napprove++ if $ok;
+        push @items, { key => BackpackApproval::item_key($it), approved => $ok };
+    }
+    return { total => scalar(@items), approved => $napprove, items => \@items };
 }
 
 # _tail_lines — last $n chomped lines of a file (the B1 launch log), or ().

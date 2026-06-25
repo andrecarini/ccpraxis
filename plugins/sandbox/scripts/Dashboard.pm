@@ -140,11 +140,58 @@ sub build_panels {
     push @sb, 'uptime    : ' . (defined $s->{uptime}   ? fmt_hms($s->{uptime})        : 'n/a');
     push @p, { title => 'Sandbox', lines => \@sb };
 
+    # B3: run + wakefulness state. busy-lease freshness (the orchestrator only
+    # refreshes /tmp/.butler-busy while there's active work / pending auto-resume)
+    # drives keep-awake; `stay_awake` is the launcher's single computed decision
+    # (KeepAwake::should_stay_awake) so this view never re-derives the threshold.
+    my @run;
+    my $busy = !defined $s->{busy_age} ? 'none (no active run)'
+             : $s->{stay_awake}        ? 'active (' . fmt_age($s->{busy_age}) . ' ago)'
+             :                           'idle ('   . fmt_age($s->{busy_age}) . ' ago)';
+    push @run, 'busy-lease : ' . $busy;
+    push @run, 'keep-awake : ' . ($s->{stay_awake} ? 'holding (PC stays awake)'
+                                                    : 'released (PC may sleep)');
+    my $ny = (defined $s->{needs_you} && $s->{needs_you} =~ /^\d+$/) ? $s->{needs_you} : 0;
+    push @run, 'needs you  : ' . ($ny > 0 ? "$ny decision(s) waiting" : 'none');
+    push @p, { title => 'Run', lines => \@run };
+
+    # B4: backpack view — per-item approval state (#21). Present only when the
+    # launcher gathered a backpack structure for this project.
+    if (ref $s->{backpack} eq 'HASH') {
+        push @p, { title => 'Backpack', lines => [ _backpack_lines($s->{backpack}) ] };
+    }
+
     my $ev = (ref $s->{events} eq 'ARRAY') ? $s->{events} : [];
     push @p, { title => 'Recent activity',
                lines => (@$ev ? [@$ev] : ['(no events yet)']) };
 
     return @p;
+}
+
+# _backpack_lines(\%backpack) -> body lines for the B4 panel. {total, approved,
+# items=>[{key, approved}]}. Caps the per-item list (the panel is a summary; the
+# full review is #21's job) and shows "+N more" so the cap is never silent.
+sub _backpack_lines {
+    my ($bp) = @_;
+    $bp ||= {};
+    my $total = (defined $bp->{total} && $bp->{total} =~ /^\d+$/) ? $bp->{total} : 0;
+    return ('(no backpack for this project)') if $total == 0;
+    my $appr = (defined $bp->{approved} && $bp->{approved} =~ /^\d+$/) ? $bp->{approved} : 0;
+    my $pend = $total - $appr; $pend = 0 if $pend < 0;
+    my @out = ("$total item(s) - $appr approved (+)"
+               . ($pend > 0 ? ", $pend pending (-)" : ''));
+    my $items = (ref $bp->{items} eq 'ARRAY') ? $bp->{items} : [];
+    my $cap = 8;
+    my $shown = 0;
+    for my $it (@$items) {
+        last if $shown >= $cap;
+        my $mark = $it->{approved} ? '+' : '-';
+        push @out, "[$mark] " . (defined $it->{key} ? $it->{key} : '?');
+        $shown++;
+    }
+    my $more = scalar(@$items) - $shown;
+    push @out, "... +$more more (see /backpack:list)" if $more > 0;
+    return @out;
 }
 
 # _title_line / _footer_line / _panel_title_line — single rows, exactly $cols.
