@@ -47,6 +47,9 @@ BEGIN {
 use MountSpec qw(winify_path v_to_mount convert_v_to_mount);
 use LaunchLog ();   # B1: durable per-launch diagnostic log (next to us in scripts/)
 use Dashboard ();   # B2: the raw-ANSI TUI dashboard framework
+use BackpackApproval ();  # #21: per-item, machine-local backpack approval memory
+use BackpackReview ();    # #21: the I/O-seam-injected interactive approval walk
+use JSON::PP ();          # parse backpack.json + write the approved install-set
 use File::Path qw(make_path);
 use File::Spec;
 use Digest::MD5 qw();
@@ -281,6 +284,12 @@ sub _tx { return unless $TRANSCRIPT; print {$TRANSCRIPT} @_; }
 
 # _close_transcript — flush + close, tolerant of undef / double-call.
 sub _close_transcript { if ($TRANSCRIPT) { close $TRANSCRIPT; undef $TRANSCRIPT; } }
+
+# Color for the interactive setup phase (the backpack review, etc.). Off when
+# stdout isn't a TTY or NO_COLOR is set (https://no-color.org). ANSI passes
+# through the :raw STDOUT untouched; the transcript gets the plain text via _tx.
+my $USE_COLOR = (-t STDOUT && !exists $ENV{NO_COLOR}) ? 1 : 0;
+sub _c { my ($sgr, $s) = @_; $USE_COLOR ? "\e[${sgr}m$s\e[0m" : $s }
 
 # _tee_system(@cmd) — run @cmd streaming its combined stdout+stderr LIVE to the
 # console AND into the transcript. system()-style return value ($? convention:
@@ -647,6 +656,29 @@ sub _read_file {
     my $c = <$fh>;
     close $fh;
     return $c;
+}
+
+# backpack_review($file, $pl, $approvals_path, $legacy_trust, $file_hash)
+#   -> (\@approved_items, $deferred_count)
+#
+# Thin launcher glue over BackpackReview::review (the testable, I/O-seam-injected
+# walk). Wires the launcher's STDIN/STDOUT, color flag, and transcript sink into
+# the module. The per-item approval gate proper — content-hash memory, the
+# approve/remove/quit-defer dispatch, and the legacy-trust migration — all live
+# in BackpackReview.pm + BackpackApproval.pm, where they are unit-tested.
+sub backpack_review {
+    my ($file, $pl, $approvals_path, $legacy_trust, $file_hash) = @_;
+    return BackpackReview::review(
+        file         => $file,
+        pl           => $pl,
+        approvals    => $approvals_path,
+        legacy_trust => $legacy_trust,
+        file_hash    => $file_hash,
+        in           => \*STDIN,
+        out          => \*STDOUT,
+        use_color    => $USE_COLOR,
+        tx           => \&_tx,
+    );
 }
 
 # Ensure base image exists. Capture instead of redirect — `> /dev/null`
@@ -1783,11 +1815,11 @@ if (! _container_exists($CONTAINER_NAME)) {
 # the in-container install after start. The gap between `podman start`
 # and the first `podman exec` then stays sub-second.
 
-my $BACKPACK_APPROVED      = 0;
-my $BACKPACK_TRUST_FILE    = "$LAUNCHER_DIR/backpack-trusted-hash";
-my $BACKPACK_HOST_FILE     = "$CLAUDE_DATA/backpack.json";
-my $BACKPACK_HOST_HASH;
-my $BACKPACK_HOST_PL       = "$CLAUDE_HOST_CONFIG/ccpraxis/plugins/backpack/scripts/backpack.pl";
+my @BACKPACK_APPROVED_ITEMS;
+my $BACKPACK_APPROVALS_FILE = "$LAUNCHER_DIR/backpack-approvals.json";
+my $BACKPACK_TRUST_FILE     = "$LAUNCHER_DIR/backpack-trusted-hash";  # legacy; migrated away on first run
+my $BACKPACK_HOST_FILE      = "$CLAUDE_DATA/backpack.json";
+my $BACKPACK_HOST_PL        = "$CLAUDE_HOST_CONFIG/ccpraxis/plugins/backpack/scripts/backpack.pl";
 
 if ($CONTAINER_WAS_CREATED && -f $BACKPACK_HOST_FILE) {
     if (! -f $BACKPACK_HOST_PL) {
@@ -1804,46 +1836,20 @@ if ($CONTAINER_WAS_CREATED && -f $BACKPACK_HOST_FILE) {
             print STDERR "         Skipping install pass. Fix the file (or delete it) and re-launch.\n";
             print STDERR "\n";
         } else {
-            $BACKPACK_HOST_HASH = md5_of_file($BACKPACK_HOST_FILE);
-            my $trusted_hash;
-            if (-f $BACKPACK_TRUST_FILE) {
-                $trusted_hash = _read_file($BACKPACK_TRUST_FILE);
-                chomp $trusted_hash if defined $trusted_hash;
-            }
-            my $is_first_time = !defined $trusted_hash;
-            my $is_changed    = defined $trusted_hash && $trusted_hash ne $BACKPACK_HOST_HASH;
-
+            # Per-item approval (#21): only NEW/CHANGED items are walked; the rest
+            # install silently. backpack_review returns the approved subset.
             print "\n";
-            print "Backpack found for this project:\n";
-            _tx("\n--- backpack summary ---\n");
-            _tee_system($^X, $BACKPACK_HOST_PL, 'list', $BACKPACK_HOST_FILE);
-            print "\n";
-
-            if ($is_first_time) {
-                print "WARNING: this backpack has not been approved on this machine before — it may have\n";
-                print "         shipped with the cloned project rather than being authored by you.\n";
-                print "WARNING: the install/verify commands above will run AS ROOT inside the container.\n";
-                print "         Review every one before approving.\n";
-                print "\n";
-            } elsif ($is_changed) {
-                print "NOTE: backpack.json changed since last approval (likely via in-session /backpack:add).\n";
-                print "      Re-confirming approval.\n";
-                print "\n";
-            }
-
-            my $default_yes = !$is_first_time;
-            my $prompt = $default_yes
-                ? "Install backpack items now? [Y/n]: "
-                : "Install backpack items now? [y/N]: ";
-            print $prompt;
-            my $choice = <STDIN>;
-            $choice //= '';
-            chomp $choice;
-            my $first = lc(substr($choice, 0, 1) // '');
-            $BACKPACK_APPROVED = $default_yes ? ($first ne 'n') : ($first eq 'y');
-
-            if (!$BACKPACK_APPROVED) {
-                print "Skipping backpack install pass. Re-run anytime in-session via /backpack:install.\n";
+            my ($approved, $deferred) = backpack_review(
+                $BACKPACK_HOST_FILE, $BACKPACK_HOST_PL,
+                $BACKPACK_APPROVALS_FILE, $BACKPACK_TRUST_FILE,
+                md5_of_file($BACKPACK_HOST_FILE));
+            @BACKPACK_APPROVED_ITEMS = @$approved;
+            log_ev('backpack_review',
+                { approved => scalar(@BACKPACK_APPROVED_ITEMS), deferred => $deferred });
+            if (!@BACKPACK_APPROVED_ITEMS) {
+                print "No backpack items approved — skipping install. Run /backpack:install in-session anytime.\n";
+            } elsif ($deferred) {
+                print "$deferred item(s) deferred — you'll be asked again on the next launch.\n";
             }
         }
     }
@@ -1878,27 +1884,23 @@ system($PODMAN, 'exec', $CONTAINER_NAME, 'touch', '/tmp/.launcher-alive');
 # now exposes them in the container at the canonical paths. Same for
 # .claude.json's single-file bind. Nothing to do here.
 
-# --- Backpack install (container side, only if approved up-front) ---
-# All user interaction (validate, list, prompt) happened on the host
-# before `podman start`. By this point the decision is made — commit the
-# trusted hash and run apt + install in the running container.
+# --- Backpack install (container side) — only the approved subset (#21) ---
+# All user interaction (validate, list, per-item approve/remove) happened on the
+# host before `podman start`. By this point @BACKPACK_APPROVED_ITEMS is the set
+# the user OK'd; we install ONLY that subset so an un-approved item can never run
+# as root in the container.
 #
-# Large backpack installs (e.g. chromium = 289 deps / 221MB) can easily
-# exceed the container's 5-min HB window, which would otherwise let the
-# entrypoint loop reap the container mid-`apt-get install`. We solve
-# that by running apt-get update + the install + a parallel heartbeat
-# refresher all under a single `podman exec bash`. The heartbeat runs as
-# a background subshell tied to the bash's lifetime via `trap EXIT`, so
-# it dies the moment the install completes (or this bash is signalled).
-# Single exec → single lifecycle → no orphan helper to clean up.
-if ($BACKPACK_APPROVED) {
-    # Record the trusted hash NOW (before install). If install
-    # itself fails some items, the user has still approved this
-    # specific content — a re-launch shouldn't re-warn.
-    _write_file($BACKPACK_TRUST_FILE, $BACKPACK_HOST_HASH);
-    # Pre-flight: confirm the container has perl + backpack.pl wired in.
-    # If the mount didn't land (older ccpraxis checkout, missing source),
-    # we warn and skip — claude still launches.
+# Large backpack installs (e.g. chromium = 289 deps / 221MB) can easily exceed
+# the container's 5-min HB window, which would otherwise let the entrypoint loop
+# reap the container mid-`apt-get install`. We run apt-get update + the install +
+# a parallel heartbeat refresher under a single `podman exec bash`. The heartbeat
+# is a background subshell tied to the bash's lifetime via `trap EXIT`, so it
+# dies the moment the install completes (or this bash is signalled). Single exec
+# → single lifecycle → no orphan helper to clean up.
+if (@BACKPACK_APPROVED_ITEMS) {
+    # Pre-flight: confirm the container has perl + backpack.pl wired in. If the
+    # mount didn't land (older ccpraxis checkout, missing source), warn and skip
+    # — claude still launches.
     my $has_perl = (system($PODMAN, 'exec', $CONTAINER_NAME,
         'test', '-x', '/usr/bin/perl') == 0);
     my $has_helper = $has_perl
@@ -1908,14 +1910,27 @@ if ($BACKPACK_APPROVED) {
         $INSTALL_WARNING = 'backpack.pl not mounted in container - install skipped';
         print STDERR "WARNING: Backpack found at $BACKPACK_HOST_FILE but backpack.pl isn't mounted in the container. Update ccpraxis (the launcher needs the plugin's backpack/scripts/backpack.pl) and rebuild.\n";
     } else {
-        # Inline bash script: kick off the heartbeat refresher in the
-        # background, run apt-get update + backpack install in the
-        # foreground, then let the EXIT trap kill the refresher on the
-        # way out. The script's exit status mirrors the install's.
-        # Note: apt-get update failures are not fatal (per the pre-existing
-        # behavior — some backpack entries don't depend on apt), so its
-        # return code is intentionally ignored.
-        my $install_script = <<'BASH';
+        # Write the approved subset as a backpack-shaped file into claude-home
+        # (bound at /root/.claude) and point `install` at it — the full
+        # backpack.json is never installed wholesale. The container path is fixed,
+        # so the install script stays a non-interpolating single-quoted heredoc.
+        my $set_host = "$CLAUDE_DATA/.backpack-install-set.json";
+        my $wrote = eval {
+            _write_file($set_host, JSON::PP->new->utf8->canonical(1)->pretty->encode(
+                { version => 2, items => \@BACKPACK_APPROVED_ITEMS }));
+            1;
+        };
+        if (!$wrote) {
+            $INSTALL_WARNING = 'could not write backpack install-set - install skipped';
+            print STDERR "WARNING: could not write backpack install-set ($set_host): $@\n";
+        } else {
+            # Inline bash script: kick off the heartbeat refresher in the
+            # background, run apt-get update + backpack install in the foreground,
+            # then let the EXIT trap kill the refresher on the way out. The
+            # script's exit status mirrors the install's. apt-get update failures
+            # are not fatal (some backpack entries don't depend on apt), so its
+            # return code is intentionally ignored.
+            my $install_script = <<'BASH';
 HB_PID=""
 cleanup() { [ -n "$HB_PID" ] && kill "$HB_PID" 2>/dev/null; }
 trap cleanup EXIT INT TERM HUP
@@ -1924,19 +1939,21 @@ HB_PID=$!
 echo "Refreshing apt index..."
 apt-get update -qq
 echo "Installing backpack items..."
-perl /root/.claude/backpack.pl install /root/.claude/backpack.json
+perl /root/.claude/backpack.pl install /root/.claude/.backpack-install-set.json
 BASH
-        _tx("\n--- backpack install ---\n");
-        my $install_rc = _tee_system($PODMAN, 'exec', $CONTAINER_NAME,
-            'bash', '-c', $install_script);
-        if ($install_rc != 0) {
-            $INSTALL_WARNING = 'backpack install: some items failed - run /backpack:install in the session to retry';
-            log_ev('backpack_install_failed', { exit => $install_rc >> 8 });
-            print "\n";
-            print "WARNING: Some backpack items failed (see above). Handing off to claude anyway — fix in-session via /backpack:add, /backpack:remove, or by editing the backpack file directly and running /backpack:install.\n";
-            print "\n";
-        } else {
-            log_ev('backpack_install_ok', {});
+            _tx("\n--- backpack install (approved subset: @{[scalar @BACKPACK_APPROVED_ITEMS]} items) ---\n");
+            my $install_rc = _tee_system($PODMAN, 'exec', $CONTAINER_NAME,
+                'bash', '-c', $install_script);
+            unlink $set_host;   # transient; don't leave the subset lying in claude-home
+            if ($install_rc != 0) {
+                $INSTALL_WARNING = 'backpack install: some items failed - run /backpack:install in the session to retry';
+                log_ev('backpack_install_failed', { exit => $install_rc >> 8 });
+                print "\n";
+                print "WARNING: Some backpack items failed (see above). Handing off to claude anyway — fix in-session via /backpack:add, /backpack:remove, or by editing the backpack file directly and running /backpack:install.\n";
+                print "\n";
+            } else {
+                log_ev('backpack_install_ok', { installed => scalar @BACKPACK_APPROVED_ITEMS });
+            }
         }
     }
 }

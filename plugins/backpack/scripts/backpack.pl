@@ -213,6 +213,12 @@ sub validate_backpack {
             # the full string in the list display. Reject at validation time.
             push @issues, ['error', "items[$i].$f: must not contain null bytes"]
                 if defined $val && !ref $val && $val =~ /\0/;
+            # Control/escape chars (e.g. ESC 0x1b) are rejected so a hostile
+            # backpack can't emit terminal cursor/clear sequences during the
+            # launcher's per-item approval review to spoof a benign-looking
+            # command (the AS-ROOT install gate, #21 red-team). Tab is allowed.
+            push @issues, ['error', "items[$i].$f: must not contain control/escape characters"]
+                if defined $val && !ref $val && $val =~ /[\x01-\x08\x0b\x0c\x0e-\x1f\x7f]/;
         }
         # Optional rationale: when present, must be a non-ref non-newline string.
         if (defined $t->{rationale}) {
@@ -222,6 +228,8 @@ sub validate_backpack {
                 if !ref $t->{rationale} && $t->{rationale} =~ /[\r\n]/;
             push @issues, ['error', "items[$i].rationale: must not contain null bytes"]
                 if !ref $t->{rationale} && $t->{rationale} =~ /\0/;
+            push @issues, ['error', "items[$i].rationale: must not contain control/escape characters"]
+                if !ref $t->{rationale} && $t->{rationale} =~ /[\x01-\x08\x0b\x0c\x0e-\x1f\x7f]/;
         }
         if (defined $t->{category} && !$ALLOWED_CATEGORY{$t->{category}}) {
             push @issues, ['warn', "items[$i].category '$t->{category}' is not in the known set ("
@@ -314,10 +322,14 @@ sub cmd_add {
         die_user("--$f is required") unless defined $vals{$f} && $vals{$f} ne '';
         die_user("--$f must not contain newlines") if $vals{$f} =~ /[\r\n]/;
         die_user("--$f must not contain null bytes") if $vals{$f} =~ /\0/;
+        die_user("--$f must not contain control/escape characters")
+            if $vals{$f} =~ /[\x01-\x08\x0b\x0c\x0e-\x1f\x7f]/;
     }
     if (defined $rationale) {
         die_user("--rationale must not contain newlines") if $rationale =~ /[\r\n]/;
         die_user("--rationale must not contain null bytes") if $rationale =~ /\0/;
+        die_user("--rationale must not contain control/escape characters")
+            if $rationale =~ /[\x01-\x08\x0b\x0c\x0e-\x1f\x7f]/;
     }
     # Normalize category to lowercase so `apt` and `APT` aren't treated as
     # distinct keys by the (category,name) deduplication. The allowed-set is
