@@ -34,17 +34,22 @@ sub item_key {
     return "$c:$n";
 }
 
-# item_hash($item) -> a content fingerprint over the SECURITY-RELEVANT fields (the
-# commands that execute), plus version so an upgrade re-confirms. rationale is
-# deliberately excluded — it's prose shown to the human, never executed, so an
-# edited rationale must not invalidate a prior command approval.
+# item_hash($item) -> a content fingerprint over ONLY the fields that actually
+# EXECUTE: install + verify. Everything else is deliberately excluded:
+#   * version   — informational, never executed, and for pinned installs it just
+#                 duplicates what's already in the install URL / verify grep (it
+#                 can drift out of sync with the command). The command is the
+#                 single source of truth; a real version bump changes the install
+#                 command and is caught that way. Hashing version too would be
+#                 non-DRY and would force pointless re-approvals on a label edit.
+#   * rationale — prose shown to the human; editing it must not invalidate a
+#                 prior command approval.
 sub item_hash {
     my ($it) = @_;
     $it ||= {};
     my $blob = join("\0",
         defined $it->{install} ? $it->{install} : '',
         defined $it->{verify}  ? $it->{verify}  : '',
-        defined $it->{version} ? $it->{version} : '',
     );
     return md5_hex($blob);
 }

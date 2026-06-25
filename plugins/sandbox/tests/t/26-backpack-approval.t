@@ -37,8 +37,8 @@ isnt(BackpackApproval::item_hash({ %item, install => 'apt-get install -y evil' }
     'item_hash: editing install changes the hash');
 isnt(BackpackApproval::item_hash({ %item, verify  => 'true' }), $h,
     'item_hash: editing verify changes the hash');
-isnt(BackpackApproval::item_hash({ %item, version => '150' }), $h,
-    'item_hash: bumping version changes the hash (re-confirm on upgrade)');
+is(BackpackApproval::item_hash({ %item, version => '150' }), $h,
+    'item_hash: version is informational + duplicates the command (DRY) - NOT hashed');
 
 # ---- is_approved ----------------------------------------------------------
 my %appr = ( 'apt:chromium' => $h );
