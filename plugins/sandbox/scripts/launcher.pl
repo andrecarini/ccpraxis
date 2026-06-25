@@ -271,14 +271,54 @@ sub ensure_ccpraxis_data_dir {
     my $old = "$PROJECT_PATH/.claude-data";
     if (-d $old && ! -d $CLAUDE_DATA) {
         ensure_ccpraxis_data_dir();
+
+        # A container created against the OLD .claude-data path keeps a
+        # bind-mount handle on that directory. On Windows the podman machine
+        # holds that handle alive until the container is REMOVED — merely
+        # stopping it is not enough — so the atomic rename below fails with
+        # EACCES ("Permission denied") even when nothing is "running". That
+        # container is about to be invalidated anyway (its mount source is
+        # moving out from under it), so reap it first. The one case we must
+        # NOT touch is a *running* container: that's a live session, so we
+        # bail and tell the user to close it instead of killing it.
+        {
+            my $name = _read_file("$old/.launcher/container-name");
+            chomp $name if defined $name;
+            $name = '' unless defined $name;
+            unless (length $name) {
+                $name = "claude-${PROJECT_NAME}-"
+                      . substr(md5_of_string($PROJECT_PATH), 0, 8);
+            }
+            if (_container_exists($name)) {
+                my $st = `$PODMAN inspect --format '{{.State.Status}}' "$name" 2>/dev/null`;
+                chomp $st if defined $st;
+                $st = '' unless defined $st;
+                if ($st eq 'running') {
+                    print STDERR "ERROR: a sandbox container ($name) is running and still bind-mounts\n";
+                    print STDERR "       the old .claude-data, which blocks the one-time migration to\n";
+                    print STDERR "       .ccpraxis-local-data/claude-home. Close its dashboard / session\n";
+                    print STDERR "       first, then re-run.\n";
+                    reset_terminal();
+                    exit 1;
+                }
+                # Stopped / exited / created: safe to remove. Only the
+                # container's ephemeral writable layer goes; the host-bound
+                # data tree (the thing we're about to move) is untouched, and
+                # the next launch recreates the container against the new path.
+                print "Reaping stale container holding the old data dir: $name ($st)\n";
+                system($PODMAN, 'rm', '-f', $name);
+                log_ev('migrate_reap_container', { container => $name, state => $st });
+            }
+        }
+
         if (rename($old, $CLAUDE_DATA)) {
             print "Migrated sandbox home: $old -> $CLAUDE_DATA\n";
             log_ev('migrate_claude_data', { from => $old, to => $CLAUDE_DATA });
         } else {
             print STDERR "ERROR: could not migrate $old -> $CLAUDE_DATA: $!\n";
-            print STDERR "       If a sandbox for this project is still running it bind-mounts the old\n";
-            print STDERR "       .claude-data — stop it first (close its dashboard / `$PODMAN rm -f` the\n";
-            print STDERR "       project's container), then re-run. (Or move it by hand:\n";
+            print STDERR "       Something still holds a handle on the old .claude-data (a running\n";
+            print STDERR "       sandbox, a shell open inside it, or an indexer). Close it, then\n";
+            print STDERR "       re-run. (Or move it by hand once nothing holds it:\n";
             print STDERR "         mv '$old' '$CLAUDE_DATA')\n";
             reset_terminal();
             exit 1;
