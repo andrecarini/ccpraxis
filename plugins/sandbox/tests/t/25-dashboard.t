@@ -40,6 +40,14 @@ is(Dashboard::fmt_age(90000),   '1d01h',  'age: 1d01h');
 is(Dashboard::fmt_age(undef),   'n/a',    'age: undef -> n/a (ASCII, width-safe)');
 is(Dashboard::fmt_age(-5),      'n/a',    'age: negative -> n/a');
 
+# fmt_hms: uptime in explicit "Xh Ym Zs", all three components always shown.
+is(Dashboard::fmt_hms(0),       '0h 0m 0s',  'hms: zero');
+is(Dashboard::fmt_hms(13),      '0h 0m 13s', 'hms: seconds only');
+is(Dashboard::fmt_hms(133),     '0h 2m 13s', 'hms: minutes + seconds');
+is(Dashboard::fmt_hms(7509),    '2h 5m 9s',  'hms: hours + minutes + seconds');
+is(Dashboard::fmt_hms(undef),   'n/a',       'hms: undef -> n/a');
+is(Dashboard::fmt_hms(-1),      'n/a',       'hms: negative -> n/a');
+
 is(length(Dashboard::clip_pad('hi', 5)), 5,  'clip_pad: pads up to width');
 is(Dashboard::clip_pad('hi', 5),  'hi   ',   'clip_pad: right-pads with spaces');
 is(Dashboard::clip_pad('hello world', 5), 'hello', 'clip_pad: truncates to width');
@@ -56,6 +64,39 @@ is(Dashboard::clip_pad(undef, 3), '   ',     'clip_pad: undef -> spaces');
         'find_exe: undef when not found');
     is(Dashboard::find_exe('wt.exe', undef, ';'), undef,
         'find_exe: undef PATH -> undef');
+}
+
+# find_exe default separator: ONLY native MSWin32 perl uses ';'. The Git-for-
+# Windows perl that runs the launcher is $^O 'cygwin'/'msys' with a colon-PATH, so
+# the default must be ':' there. Regression: the old `cygwin|msys -> ;` split a
+# colon-PATH into one element -> wt.exe never found -> launch-claude silently
+# opened a bare PowerShell console instead of a Windows Terminal window.
+SKIP: {
+    skip 'native MSWin32 perl uses a ;-separated PATH', 1 if $^O eq 'MSWin32';
+    my $dir = tempdir(CLEANUP => 1);
+    open my $fh, '>', "$dir/wt.exe" or die; print $fh 'x'; close $fh;
+    is(Dashboard::find_exe('wt.exe', "/nope:$dir:/also-nope"), "$dir/wt.exe",
+        'find_exe: default sep is : on cygwin/msys/unix (not ;)');
+}
+
+# find_wt: PATH hit wins; else the %LOCALAPPDATA%\Microsoft\WindowsApps fallback;
+# else undef. This is the "Windows Terminal is required" assertion the launcher
+# uses before launch-claude (it fails loudly when this returns undef).
+{
+    my $pdir = tempdir(CLEANUP => 1);
+    open my $f1, '>', "$pdir/wt.exe" or die; print $f1 'x'; close $f1;
+    is(Dashboard::find_wt($pdir, undef), "$pdir/wt.exe", 'find_wt: located on PATH');
+
+    my $la = tempdir(CLEANUP => 1);
+    my $wa = File::Spec->catdir($la, 'Microsoft', 'WindowsApps');
+    make_path($wa);
+    open my $f2, '>', "$wa/wt.exe" or die; print $f2 'x'; close $f2;
+    is(Dashboard::find_wt('/nope:/also-nope', $la),
+        File::Spec->catfile($wa, 'wt.exe'),
+        'find_wt: falls back to %LOCALAPPDATA%\\Microsoft\\WindowsApps');
+
+    is(Dashboard::find_wt('/nope:/also-nope', undef), undef,
+        'find_wt: undef when WT is installed nowhere (-> launcher fails loudly)');
 }
 
 # ===========================================================================
@@ -86,6 +127,7 @@ my %st = (
     like($joined, qr/container : claude-demo/, 'compose: Sandbox panel body rendered');
     like($joined, qr/-- Recent activity /, 'compose: Activity panel rendered');
     like($joined, qr/\Qlaunch_start\E/,   'compose: B1 event surfaced in Activity');
+    like($joined, qr/uptime    : 1h 1m 0s/, 'compose: uptime rendered as Xh Ym Zs');
 }
 
 # tiny-terminal degradation
@@ -179,6 +221,15 @@ my %st = (
     my $colored = Dashboard::render_frame(undef, $a, { color => 1 });
     like($colored, qr/\e\[1;36m/, 'render: color mode emits title SGR');
     like($colored, qr/\e\[0m/,    'render: color mode resets SGR');
+
+    # regression: a trailing \e[K erased the last cell of a full-width row,
+    # chopping the title's closing "]" (the "[running" bug). \e[K must come
+    # BEFORE the text, never after.
+    my $tf = Dashboard::compose_frame(\%st, 6, 80);
+    like($tf->[0]{text}, qr/\[running\]$/, 'compose: title row ends with the full [running]');
+    my $tr = Dashboard::render_frame(undef, $tf, { color => 0 });
+    like($tr,   qr/\e\[1;1H\e\[K/, 'render: line cleared BEFORE the text (\e[K precedes it)');
+    unlike($tr, qr/\]\e\[K/,       'render: no \e[K right after "]" (last cell preserved)');
 }
 
 # ===========================================================================

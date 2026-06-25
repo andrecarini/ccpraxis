@@ -69,6 +69,20 @@ sub fmt_age {
     return sprintf('%dd%02dh', $d, $h);
 }
 
+# fmt_hms($secs) -> "Xh Ym Zs" with all three components always shown
+# (e.g. "0h 2m 13s", "2h 5m 9s"). undef / negative -> "n/a". Used for uptime,
+# where the explicit hour/minute/second breakdown reads clearer than fmt_age's
+# compact form. ASCII-only, so length() == display width (the render invariant).
+sub fmt_hms {
+    my ($s) = @_;
+    return 'n/a' if !defined $s;
+    $s = int($s);
+    return 'n/a' if $s < 0;
+    my $h = int($s / 3600); $s %= 3600;
+    my $m = int($s / 60);   $s %= 60;
+    return sprintf('%dh %dm %ds', $h, $m, $s);
+}
+
 # clip_pad($str, $w) -> exactly $w characters: truncated if longer, space-padded
 # if shorter. $w <= 0 -> ''. The invariant the renderer relies on: every
 # composed row is exactly the terminal width wide.
@@ -123,7 +137,7 @@ sub build_panels {
     push @sb, 'container : ' . (defined $s->{container} ? $s->{container} : '?')
             . '  [' . (defined $s->{status} ? $s->{status} : '?') . ']';
     push @sb, 'heartbeat : ' . (defined $s->{beat_age} ? fmt_age($s->{beat_age}) . ' ago' : 'n/a');
-    push @sb, 'uptime    : ' . (defined $s->{uptime}   ? fmt_age($s->{uptime})        : 'n/a');
+    push @sb, 'uptime    : ' . (defined $s->{uptime}   ? fmt_hms($s->{uptime})        : 'n/a');
     push @p, { title => 'Sandbox', lines => \@sb };
 
     my $ev = (ref $s->{events} eq 'ARRAY') ? $s->{events} : [];
@@ -226,13 +240,18 @@ sub sgr_for_role {
 }
 
 # _row_ansi($row, \%cell, $color) -> the ANSI to (re)draw one 1-based row.
+# The line is cleared (\e[K) BEFORE the text, never after: every composed row is
+# exactly $cols wide, so writing it parks the cursor in the last cell (deferred
+# auto-wrap). A trailing \e[K would then erase that last cell — invisibly on a
+# dash separator, but visibly chopping the title's closing "]" (the "[running"
+# bug). Clearing first wipes any stale tail (a width-shrink diff) and leaves the
+# final character intact.
 sub _row_ansi {
     my ($row, $cell, $color) = @_;
-    my $s = "\e[${row};1H";
+    my $s = "\e[${row};1H\e[K";
     $s .= sgr_for_role($cell->{role}) if $color;
     $s .= $cell->{text};
     $s .= "\e[0m" if $color;
-    $s .= "\e[K";
     return $s;
 }
 
@@ -285,11 +304,34 @@ sub find_exe {
     my ($name, $path, $sep) = @_;
     return undef if !defined $name || !length $name;
     return undef if !defined $path;
-    $sep = ($^O =~ /^(MSWin32|cygwin|msys)$/) ? ';' : ':' if !defined $sep;
+    # ONLY native Windows perl (Strawberry/ActiveState, $^O eq 'MSWin32') presents
+    # $ENV{PATH} semicolon-separated. The Git-for-Windows perl that actually runs
+    # the launcher reports $^O 'cygwin' (or 'msys') and presents a POSIX
+    # colon-separated PATH (/c/foo:/c/bar) — so it must split on ':', NOT ';'.
+    # (Regression: the old `cygwin|msys -> ;` guess split a colon-PATH into one
+    # element, so find_exe never found wt.exe and launch-claude silently fell back
+    # to a bare PowerShell console instead of a Windows Terminal window.)
+    $sep = ($^O eq 'MSWin32') ? ';' : ':' if !defined $sep;
     for my $dir (split /\Q$sep\E/, $path) {
         next unless length $dir;
         my $cand = File::Spec->catfile($dir, $name);
         return $cand if -f $cand || -x $cand;
+    }
+    return undef;
+}
+
+# find_wt($path, $localappdata) -> the resolved wt.exe path, or undef if Windows
+# Terminal is not installed. wt.exe is normally a per-user app-execution alias on
+# PATH under %LOCALAPPDATA%\Microsoft\WindowsApps; we look there directly too, so a
+# stripped PATH entry can't hide an installed WT. launch-claude REQUIRES Windows
+# Terminal (no silent console fallback), so this is the gate the launcher asserts.
+sub find_wt {
+    my ($path, $localappdata) = @_;
+    my $p = find_exe('wt.exe', $path);
+    return $p if defined $p;
+    if (defined $localappdata && length $localappdata) {
+        my $cand = File::Spec->catfile($localappdata, 'Microsoft', 'WindowsApps', 'wt.exe');
+        return $cand if -e $cand || -x $cand;
     }
     return undef;
 }
