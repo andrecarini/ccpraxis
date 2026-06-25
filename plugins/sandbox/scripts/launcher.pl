@@ -316,9 +316,12 @@ sub ensure_ccpraxis_data_dir {
             log_ev('migrate_claude_data', { from => $old, to => $CLAUDE_DATA });
         } else {
             print STDERR "ERROR: could not migrate $old -> $CLAUDE_DATA: $!\n";
-            print STDERR "       Something still holds a handle on the old .claude-data (a running\n";
-            print STDERR "       sandbox, a shell open inside it, or an indexer). Close it, then\n";
-            print STDERR "       re-run. (Or move it by hand once nothing holds it:\n";
+            print STDERR "       Something holds a handle on the old .claude-data so it can't be\n";
+            print STDERR "       moved. The usual culprit is another editor or Claude Code session\n";
+            print STDERR "       open on THIS project folder — its recursive file-watcher keeps a\n";
+            print STDERR "       handle on the directory (a running sandbox, a shell whose cwd is\n";
+            print STDERR "       inside it, or a file indexer do the same). Close it, then re-run.\n";
+            print STDERR "       (Or move it by hand once nothing holds it:\n";
             print STDERR "         mv '$old' '$CLAUDE_DATA')\n";
             reset_terminal();
             exit 1;
