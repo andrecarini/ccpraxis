@@ -43,14 +43,25 @@
 
 use strict;
 use warnings;
+use utf8;                  # source-literal non-ASCII (e.g. em-dashes in FAIL/usage text) are real chars, encoded exactly once by the :encoding layers below — NOT raw bytes the layer would double-encode
 use JSON::PP;
 use Getopt::Long qw(GetOptionsFromArray);
 use POSIX qw(strftime);
 use File::Basename qw(dirname);
 use File::Path qw(make_path);
+use Encode ();
 
 binmode STDOUT, ':encoding(UTF-8)';
 binmode STDERR, ':encoding(UTF-8)';
+
+# @ARGV arrives as UTF-8 octets (this script runs in the UTF-8 sandbox container,
+# where /backpack:add records entries). Decode to Perl characters up front so any
+# non-ASCII in --rationale / --install / --verify is stored as TEXT and JSON-
+# encoded exactly once on write. Without this, the raw UTF-8 bytes are treated as
+# Latin-1 and re-encoded by JSON::PP's ->utf8, double-mojibaking them (an em-dash
+# 'E2 80 94' landed on disk as 'C3 A2 C2 80 C2 94'). FB_DEFAULT leaves a non-UTF-8
+# arg (e.g. an ASCII path from a host-side `validate`) intact rather than dying.
+@ARGV = map { Encode::decode('UTF-8', $_, Encode::FB_DEFAULT) } @ARGV;
 
 our $SCHEMA_VERSION = 2;
 our @ALLOWED_CATEGORIES = qw(apt npm-global pip cargo gem go-install curl-script snap project-setup other);
@@ -444,6 +455,7 @@ sub cmd_install {
         my $install_rc = run_bash($t->{install});
         if ($install_rc != 0) {
             print STDERR "FAIL: $label — install " . fmt_rc($install_rc) . "\n";
+            print STDERR "      install: $t->{install}\n";
             $n_failed++;
             next;
         }
@@ -455,7 +467,12 @@ sub cmd_install {
             $n_installed++;
             $n_ok++;
         } else {
+            # The verify command is usually self-silencing (e.g. `… 2>/dev/null |
+            # grep -q …`), so its failure prints nothing of its own — leaving the
+            # user with "something failed" and no "what". Echo the exact check that
+            # failed so they can see and re-run it.
             print STDERR "FAIL: $label — verify after install " . fmt_rc($confirm_rc) . "\n";
+            print STDERR "      verify: $t->{verify}\n";
             $n_failed++;
         }
     }
