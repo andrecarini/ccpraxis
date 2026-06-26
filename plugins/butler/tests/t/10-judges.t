@@ -329,6 +329,32 @@ sub seed_verdict { my ($dir,$kind,$pkg,$obj)=@_; my $f=BpOrch::judge_verdict_pat
     is(scalar @{$r->{spawned}}, 0, 'C2: no duplicate harvest fired (already in flight)');
 }
 
+# ---- T2 (#30): a harvest that didn't complete (timed out, no verdict) on a DONE
+#         package RE-AUDITS rather than reopening + re-running the coordinator.
+#         (Models the real bug: the orchestrator/host died mid-harvest, so the
+#         verdict was never written; the completed work must not be re-executed.) -
+{
+    my $dir = mk_bp([['solo','—','done','p/s/']]);
+    BpOrch::mark_judge_inflight("$dir/runs",'harvest','solo',$NOW-99999);   # fired long ago, never returned
+    my $r = run_once($dir, tun => { judge_to=>10, harvest_reaudit_cap=>2 });
+    like(slurp("$dir/runs/orchestrator.log"), qr/"type":"harvest_reaudit"/, 'T2: interrupted harvest is re-audited');
+    like(slurp("$dir/packages/solo.md"),      qr/^status:\s*done/m,        'T2: package stays done (not reopened)');
+    is(scalar @{$r->{launched}}, 0,                                        'T2: no coordinator relaunch (work is complete)');
+    is(scalar(grep { $_->{kind} eq 'harvest' && $_->{pkg} eq 'solo' } @{$r->{spawned}}), 1, 'T2: a fresh harvest audit was re-fired');
+    is(reg_of($dir)->{solo}{harvest_reaudit}, 1,                           'T2: re-audit counter incremented');
+}
+
+# ---- T3 (#30): past the re-audit cap, a still-incomplete harvest escalates
+#         (reopen) instead of re-auditing forever ----------------------------------
+{
+    my $dir = mk_bp([['solo','—','done','p/s/']], { solo=>{status=>'done', harvest_reaudit=>2} });
+    BpOrch::mark_judge_inflight("$dir/runs",'harvest','solo',$NOW-99999);
+    my $r = run_once($dir, tun => { judge_to=>10, harvest_reaudit_cap=>2, corr_cap=>1 });
+    unlike(slurp("$dir/runs/orchestrator.log"), qr/"type":"harvest_reaudit"/, 'T3: no further re-audit past the cap');
+    like(slurp("$dir/runs/orchestrator.log"),   qr/harvest_reopen/,  'T3: escalates via the normal error->reopen path');
+    like(slurp("$dir/packages/solo.md"),        qr/^status:\s*pending/m, 'T3: package reopened (corrective budget remains)');
+}
+
 # ---- H2: a persistently failing harvest spawn is bounded -> park + alarm -------
 {
     my $dir = mk_bp([['solo','—','done','p/s/']]);

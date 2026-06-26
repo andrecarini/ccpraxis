@@ -588,6 +588,7 @@ sub _tunables {
         corr_cap   => $ENV{BP_CORRECTIVE_CAP}     // 1,        # A5 Q2: corrective relaunches/pkg
         judge_to   => $ENV{BP_JUDGE_TIMEOUT_SECS} // 1800,     # A5: crashed/hung-judge fail-safe
         judge_spawn_cap => $ENV{BP_JUDGE_SPAWN_CAP} // 3,      # A5 H2: park after N harvest-spawn failures
+        harvest_reaudit_cap => $ENV{BP_HARVEST_REAUDIT_CAP} // 2,  # #30: re-audit (not reopen) a done pkg whose harvest didn't complete, up to N times
     };
 }
 
@@ -816,7 +817,32 @@ sub run {
                 if (!defined $v) {
                     next unless $started && ($now - $started) > $t->{judge_to};   # see C1 note above
                     _log($log, 'judge_timeout', { kind => 'harvest', package => $pkg });
-                    $v = { _timeout => 1 };               # normalize_harvest -> error -> escalate
+                    # A harvest TIMEOUT (no verdict in the window) is NOT evidence the
+                    # package's work is bad — only a fail VERDICT is. It means the audit
+                    # didn't complete: commonly the orchestrator/host died mid-harvest, or
+                    # the judge hung. RE-AUDIT a done package (re-fire the read-only audit)
+                    # rather than reopening + re-running the whole coordinator over
+                    # already-complete work (#30). Kill any still-alive judge first; bound
+                    # the re-audits so a judge that never completes eventually escalates
+                    # instead of looping forever.
+                    my $st = $status->{$pkg} // 'pending';
+                    my $ra = $reg->{$pkg}{harvest_reaudit} // 0;
+                    if ($st eq 'done' && $ra < ($t->{harvest_reaudit_cap} // 0)) {
+                        my $jpidf = "$runs/harvest/$pkg.pid";
+                        if (-f $jpidf) {
+                            my ($jp) = (_read_file($jpidf) // '') =~ /^(\d+)/;
+                            kill_pid($jp) if defined $jp && pid_alive($jp);
+                            unlink $jpidf;
+                        }
+                        clear_judge_inflight($runs, 'harvest', $pkg);
+                        clear_judge_verdict($runs, 'harvest', $pkg);
+                        update_registry_pkg($runs, $pkg, { harvest => '', harvest_reaudit => $ra + 1 });
+                        $reg->{$pkg}{harvest} = ''; $reg->{$pkg}{harvest_reaudit} = $ra + 1;
+                        _log($log, 'harvest_reaudit', { package => $pkg, attempt => $ra + 1,
+                              reason => 'harvest did not complete (interrupted/hung) — re-auditing, not reopening' });
+                        next;   # section (c) re-fires the harvest this tick
+                    }
+                    $v = { _timeout => 1 };               # cap exhausted (or not done) -> error -> escalate
                 }
                 # Clear before acting — harvest degrades even more safely (a lost verdict just
                 # re-audits next tick, since status stays 'done' + harvest stays '').
@@ -824,8 +850,8 @@ sub run {
                 clear_judge_verdict($runs, 'harvest', $pkg);
                 my $hv = BpJudge::normalize_harvest($v);
                 if ($hv eq 'pass') {
-                    update_registry_pkg($runs, $pkg, { harvest => 'pass' });
-                    $reg->{$pkg}{harvest} = 'pass';
+                    update_registry_pkg($runs, $pkg, { harvest => 'pass', harvest_reaudit => 0 });
+                    $reg->{$pkg}{harvest} = 'pass'; $reg->{$pkg}{harvest_reaudit} = 0;
                     _log($log, 'harvest_pass', { package => $pkg, mode => $mode });
                 } else {
                     my $corr = $reg->{$pkg}{corrective_attempts} // 0;
