@@ -63,6 +63,12 @@ if ! bash "$SCRIPT_DIR/bp-hooks-selftest.sh" --quiet; then
   exit 6
 fi
 
+# Start-or-continue: we confirmed above that no live orchestrator holds the marker,
+# so a .shutdown still sitting in runs/ is a stale terminal signal from a prior
+# graceful-reap (commonly: the host slept and the container reaped the run). Clear
+# it before launching, or the new orchestrator would wind straight back down.
+bp_clear_stale_shutdown "$RUNS"
+
 setsid nohup perl "$SCRIPT_DIR/bp-orchestrator.pl" "$BP_NAME" --bp-dir "$BPDIR" >> "$LOG" 2>&1 &
 
 # Confirm it acquired the flock marker (the real single-instance guard lives in

@@ -159,3 +159,23 @@ bp_require_sandbox() {
     exit 4
   fi
 }
+
+# bp_clear_stale_shutdown RUNS_DIR — remove a leftover terminal .shutdown marker.
+# The container heartbeat (B6) writes runs/.shutdown to wind a run down when the
+# host manager goes away (e.g. the host slept and the run was reaped). It is
+# terminal — the orchestrator that honored it has exited — and nothing else clears
+# it. An explicit (re)dispatch means the user wants to run, so a .shutdown found at
+# start-up is STALE: left in place it makes the freshly-launched orchestrator hit
+# the shutdown gate on tick 1 and wind down without launching anything. Clear it.
+# Caller must already have established that no live orchestrator holds the marker
+# (so we never yank the signal out from under a run that is honoring it). A genuine
+# shutdown is re-signalled by the heartbeat if the manager is actually gone; the
+# usage .paused marker is intentionally left alone (auto-resume honors its window).
+bp_clear_stale_shutdown() {
+  local runs="$1"
+  if [ -e "$runs/.shutdown" ]; then
+    rm -f "$runs/.shutdown"
+    echo "bp-orchestrate: cleared a stale .shutdown marker (prior graceful-reap)"
+  fi
+  return 0
+}
