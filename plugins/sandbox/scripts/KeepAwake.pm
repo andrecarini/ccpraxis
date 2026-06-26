@@ -23,16 +23,20 @@ use warnings;
 # should_stay_awake($lease_age_secs, $stale_secs) -> 1|0
 #   $lease_age_secs = seconds since the busy-lease's mtime, or undef if the lease
 #                     is absent / unreadable. $stale_secs = the freshness window
-#                     (match the orchestrator's BUSY_STALE_SECS, default 180).
-#   Awake iff the lease exists AND is fresh. Absent lease, stale lease, or a
-#   negative/garbage age -> let the machine sleep (fail toward LETTING IT SLEEP:
-#   the cost of a wrong "sleep" is a missed auto-resume that recovers on wake,
-#   vs. a wrong "stay awake" that silently drains a laptop for an absent user).
+#                     (match the orchestrator's BUSY_STALE_SECS).
+#   Awake iff the lease exists AND is fresh. Absent lease (undef) -> sleep.
+#   A NEGATIVE age means the lease mtime is in the "future" — i.e. host/container
+#   clock skew on a lease the orchestrator just wrote, which only happens while a
+#   run is actively touching it. Treat that as fresh and STAY AWAKE: a wrong
+#   "sleep" here lets the host drop into standby and kills the live run (observed),
+#   whereas a wrong "stay awake" only wastes some idle power. (The launcher now
+#   computes the age entirely in container time, so a negative age should be rare;
+#   this is the belt-and-suspenders guard.)
 sub should_stay_awake {
     my ($age, $stale) = @_;
     return 0 unless defined $age;
     $stale = 180 unless defined $stale && $stale =~ /^-?\d+(?:\.\d+)?$/;
-    return 0 if $age < 0;          # clock skew / garbage -> don't trust it
+    return 1 if $age < 0;          # clock-skew on a freshly-touched lease -> stay awake
     return ($age <= $stale) ? 1 : 0;
 }
 

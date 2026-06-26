@@ -2008,7 +2008,8 @@ sub enter_dashboard {
     require Term::ReadKey;
     my $log_path = "$CLAUDE_DATA/sandbox-logs/launch-$LAUNCH_ID.log";
     my $cached_status     = 'unknown';
-    my $cached_busy_mtime = undef;   # epoch mtime of /tmp/.butler-busy, or undef
+    my $cached_busy_age   = undef;   # B5: age (s) of /tmp/.butler-busy in CONTAINER time, or undef
+    my $cached_busy_stamp = 0;       # host time() when $cached_busy_age was measured
     my $cached_needs_you  = 0;       # B3: queued "needs you" decisions
     my $cached_backpack   = undef;   # B4: backpack items + per-item approval
     my $last_inspect      = 0;
@@ -2018,8 +2019,12 @@ sub enter_dashboard {
     # B5 keep-awake: hold a wake-lock only while the orchestrator's busy-lease is
     # fresh (active work / pending auto-resume). Reap any helper orphaned by a
     # previously-crashed launcher first, then build the seam-driven holder.
+    # Keep-awake holds the host awake while the busy-lease was touched within this
+    # window. 10 min (matching the loosened heartbeat HB) so a brief gap / slow
+    # tick never releases the lock mid-run; the host only sleeps once the run has
+    # been genuinely idle or parked this long. Env-overridable.
     my $BUSY_STALE   = ($ENV{BUSY_STALE_SECS} && $ENV{BUSY_STALE_SECS} =~ /^\d+$/)
-                       ? $ENV{BUSY_STALE_SECS} : 180;
+                       ? $ENV{BUSY_STALE_SECS} : 600;
     my $ka_helper    = "$SANDBOX_PLUGIN/scripts/keep-awake.ps1";
     my $ka_pidfile   = "$LAUNCHER_DIR/keepawake.pid";
     _keepawake_reap_orphan($ka_pidfile);
@@ -2056,17 +2061,33 @@ sub enter_dashboard {
                 my $s = `$PODMAN inspect --format '{{.State.Status}}' "$CONTAINER_NAME" 2>/dev/null`;
                 chomp $s if defined $s;
                 $cached_status = (defined $s && length $s) ? $s : 'unknown';
-                # B5: busy-lease mtime (the orchestrator keeps /tmp/.butler-busy
+                # B5: busy-lease freshness (the orchestrator keeps /tmp/.butler-busy
                 # fresh only while there's active work or a pending auto-resume).
-                # Cache the epoch mtime on the same ~10s cadence; the age is
-                # recomputed against `now` each gather. Absent file -> undef.
+                # Compute the age ENTIRELY in container time — read the lease mtime
+                # AND the container clock, both via exec, and subtract here. Doing
+                # `host_now - container_mtime` instead skews the age by the host-vs-
+                # container clock offset (seen as a NEGATIVE busy_age in the wild),
+                # which released keep-awake mid-run and let the host sleep. Read
+                # mtime first, then now, so the inter-exec gap can't read negative.
                 my $bm = `$PODMAN exec "$CONTAINER_NAME" stat -c %Y /tmp/.butler-busy 2>/dev/null`;
-                $cached_busy_mtime = ($bm && $bm =~ /^(\d+)/) ? $1 : undef;
+                my $cn = `$PODMAN exec "$CONTAINER_NAME" date +%s 2>/dev/null`;
+                my ($lmt)  = ($bm && $bm =~ /^(\d+)/) ? ($1) : ();
+                my ($cnow) = ($cn && $cn =~ /^(\d+)/) ? ($1) : ();
+                if (defined $lmt && defined $cnow) {
+                    my $a = $cnow - $lmt;
+                    $cached_busy_age = $a < 0 ? 0 : $a;   # clamp the tiny exec-gap race
+                } else {
+                    $cached_busy_age = undef;
+                }
+                $cached_busy_stamp = $now;
                 $cached_needs_you  = _count_needs_you($PROJECT_PATH);          # B3
                 $cached_backpack   = _gather_backpack($bp_host_file, $bp_appr_file);  # B4
                 $last_inspect  = $now;
             }
-            my $busy_age = defined $cached_busy_mtime ? $now - $cached_busy_mtime : undef;
+            # Advance the skew-free baseline by host-measured elapsed since the
+            # last measurement (elapsed rate matches on both clocks; only the
+            # absolute offset differed, and that's gone now).
+            my $busy_age = defined $cached_busy_age ? $cached_busy_age + ($now - $cached_busy_stamp) : undef;
             # B5: the single keep-awake decision, shared by the seam below AND the
             # Run panel (so the view never re-derives the freshness threshold).
             my $stay = KeepAwake::should_stay_awake($busy_age, $BUSY_STALE) ? 1 : 0;

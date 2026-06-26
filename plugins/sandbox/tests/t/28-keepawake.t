@@ -4,7 +4,8 @@
 # and whether the machine really stays awake are verified on a real desktop
 # (attended); here we pin the deterministic logic:
 #
-#   should_stay_awake   freshness-of-busy-lease decision, failing toward SLEEP
+#   should_stay_awake   freshness-of-busy-lease decision; absent lease -> sleep,
+#                       a negative age (clock skew on a fresh lease) -> stay awake
 #   holder lifecycle    start-when-wanted / stop-when-not / idempotent / release
 use strict;
 use warnings;
@@ -21,7 +22,8 @@ is(KeepAwake::should_stay_awake(60,    180), 1, 'fresh lease (age < stale) -> aw
 is(KeepAwake::should_stay_awake(180,   180), 1, 'lease exactly at stale threshold -> awake');
 is(KeepAwake::should_stay_awake(181,   180), 0, 'stale lease (age > stale) -> sleep');
 is(KeepAwake::should_stay_awake(99999, 180), 0, 'very stale lease -> sleep');
-is(KeepAwake::should_stay_awake(-5,    180), 0, 'negative age (clock skew/garbage) -> sleep (distrust)');
+is(KeepAwake::should_stay_awake(-5,    180), 1, 'negative age (clock skew on a fresh lease) -> stay awake (active-run safety)');
+is(KeepAwake::should_stay_awake(-9999, 180), 1, 'large negative age (big skew) -> still stay awake');
 # stale defaulting / garbage guard
 is(KeepAwake::should_stay_awake(120),        1, 'default stale (180): age 120 -> awake');
 is(KeepAwake::should_stay_awake(120, undef),  1, 'undef stale -> default 180 -> awake');
