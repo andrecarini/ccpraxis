@@ -8,10 +8,12 @@
 # container no longer HARD-kills the run — it signals a fleet-wide graceful
 # shutdown (the A4 gate's `runs/.shutdown`, written into every active blueprint),
 # waits a grace window for coordinators to park cleanly, and reaps as soon as the
-# run clears (or at the grace deadline). No active run → reaps at the same
-# threshold as before. The trigger threshold (HB) is identical to the old loop,
-# so a transient blip (< HB) never triggers anything — B6 only makes the same
-# reap gentler (Decisions #6 / #28).
+# run clears (or at the grace deadline). No active run → reaps at the HB
+# threshold. HB, the grace window, the tick, and the startup grace are all kept
+# deliberately loose (10 min / 10 min / 60s / 10 min) so a transient blip — a
+# host display-off drift, a slow tick, a momentary manager stall — never trips a
+# reap; B6 only makes an actual prolonged-manager-loss reap gentler
+# (Decisions #6 / #28).
 #
 # Sourcing this file (for tests) defines the functions but does NOT run the loop
 # (the `main` guard at the bottom keys off BASH_SOURCE==$0).
@@ -21,10 +23,10 @@ set -u
 # ----- tunables (env-overridable; defaults match the historical entrypoint) ---
 ALIVE="${ALIVE:-/tmp/.launcher-alive}"        # manager heartbeat sentinel (host touches it)
 BUSY="${BUSY:-/tmp/.butler-busy}"             # orchestrator busy-lease (A3)
-HB="${HB:-300}"                               # staleness window (s) — unchanged
-STARTUP_GRACE="${STARTUP_GRACE:-10}"          # startup grace before first check — unchanged
-GRACE_SHUTDOWN="${GRACE_SHUTDOWN:-300}"       # graceful-park window once a stale-with-run is detected
-TICK="${TICK:-10}"                            # loop poll interval (s)
+HB="${HB:-600}"                               # staleness window (s) — 10 min; loose so a host display-off drift / manager stall never trips a reap
+STARTUP_GRACE="${STARTUP_GRACE:-600}"         # startup grace before first check — 10 min (covers long backpack installs before the dashboard takes over)
+GRACE_SHUTDOWN="${GRACE_SHUTDOWN:-600}"       # graceful-park window once a stale-with-run is detected — 10 min
+TICK="${TICK:-60}"                            # loop poll interval (s)
 DATA="${CCPRAXIS_DATA_DIR:-/project/.ccpraxis-local-data}"   # blueprint data root
 
 # =============================================================================
