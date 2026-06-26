@@ -46,7 +46,28 @@ is(BpAnswer::plan_answer('harvest-failure','drop')->{ledger_status}, 'dropped', 
 {
     my $bad = BpAnswer::plan_answer('stuck-package','frobnicate');
     is($bad->{ok}, 0, 'plan: unknown package action -> not ok');
-    like($bad->{error}, qr/relaunch\|accept\|drop/, 'plan: error lists the valid actions');
+    like($bad->{error}, qr/relaunch\|reset\|accept\|drop/, 'plan: error lists the valid actions');
+}
+
+# package: reset (#29) — the stronger relaunch (also resets resolve budget + supersedes)
+{
+    my $p = BpAnswer::plan_answer('stuck-package', 'reset');
+    ok($p->{ok},               'plan: reset ok');
+    is($p->{ledger_status}, 'pending', 'plan: reset -> ledger pending');
+    is($p->{relaunch}, 1,      'plan: reset relaunches');
+    is($p->{reset_attempt}, 1, 'plan: reset clears the attempt budget');
+    is($p->{reset_resolve}, 1, 'plan: reset clears the resolve budget too');
+    is($p->{supersede}, 1,     'plan: reset supersedes in-flight work');
+}
+{   # reset with no kind = direct --package mode -> still package family
+    my $p = BpAnswer::plan_answer(undef, 'reset');
+    ok($p->{ok} && $p->{family} eq 'package', 'plan: reset with undef kind -> package family');
+    is($p->{supersede}, 1, 'plan: direct reset supersedes');
+}
+{   # relaunch is unchanged: leaves the resolve budget and does not supersede
+    my $p = BpAnswer::plan_answer('stuck-package', 'relaunch');
+    ok(!$p->{reset_resolve}, 'plan: relaunch leaves the resolve budget (unchanged)');
+    ok(!$p->{supersede},     'plan: relaunch does not supersede (unchanged)');
 }
 
 # fleet: default resume; anything else rejected
@@ -169,6 +190,57 @@ sub run_cli {
     my ($rc, $out) = run_cli($bpdir, '--decision', $id, '--action', 'frobnicate');
     is($rc, 2, 'guard: unknown package action -> exit 2');
     ok(-f "$bpdir/runs/needs-you/$id.json", 'guard: bad action leaves the queue entry');
+}
+
+# ===========================================================================
+# PART 3 — direct --package reset (#29): supersede in-flight work + fresh budget,
+# with NO queued decision to consume.
+# ===========================================================================
+{
+    my $DEAD  = 2_000_000_000;   # out of range -> kill 0 fails -> never alive (safe)
+    my $bpdir = tempdir(CLEANUP => 1);
+    my $pkg   = 'alpha';
+    write_file("$bpdir/packages/$pkg.md",
+        "---\npackage: $pkg\nstatus: running\nwrite_set: p/$pkg/\n---\n\n# $pkg\n\n## Next action\n\ngo\n");
+    write_file("$bpdir/runs/registry.json",
+        $J->encode({ packages => { $pkg => { status=>'running', attempt=>5, resolve_attempts=>1, pid=>$DEAD, model=>'sonnet' } } }));
+    # an in-flight resolve judge (dead pid -> the kill is a safe no-op) + its markers
+    write_file("$bpdir/runs/resolve/$pkg.pid", "$DEAD\n");
+    write_file("$bpdir/runs/resolve/$pkg.inflight", "100\n");
+    write_file("$bpdir/runs/resolve/$pkg.verdict.json", $J->encode({ verdict=>'park' }));
+    # a stale queued decision for the package (direct reset clears it without an id)
+    write_file("$bpdir/runs/needs-you/$pkg--zzz999.json",
+        $J->encode({ package=>$pkg, kind=>'stuck-package', question=>'?', created_at=>1 }));
+
+    my ($rc, $out) = run_cli($bpdir, '--package', $pkg, '--action', 'reset', '--note', 'Fresh pass please.');
+    is($rc, 0, 'reset: exit 0') or diag($out);
+    like(slurp("$bpdir/packages/$pkg.md"), qr/^status:\s*pending/m, 'reset: ledger -> pending');
+    like(slurp("$bpdir/packages/$pkg.md"), qr/Fresh pass please\./, 'reset: note appended to ledger');
+    my $reg = JSON::PP->new->decode(slurp("$bpdir/runs/registry.json"));
+    is($reg->{packages}{$pkg}{status}, 'pending',        'reset: registry status -> pending');
+    is($reg->{packages}{$pkg}{attempt}, 0,               'reset: attempt budget reset');
+    is($reg->{packages}{$pkg}{resolve_attempts}, 0,      'reset: resolve budget reset');
+    is($reg->{packages}{$pkg}{model}, 'sonnet',          'reset: registry merge preserved other fields');
+    ok(!-e "$bpdir/runs/resolve/$pkg.inflight",     'reset: resolve .inflight cleared');
+    ok(!-e "$bpdir/runs/resolve/$pkg.verdict.json", 'reset: stale resolve verdict cleared');
+    ok(!-e "$bpdir/runs/resolve/$pkg.pid",          'reset: resolve pid file cleared');
+    ok(!-e "$bpdir/runs/needs-you/$pkg--zzz999.json", 'reset: queued decision for the package cleared');
+    my $res = eval { JSON::PP->new->decode($out) };
+    is($res->{action}, 'reset', 'reset: JSON action=reset');
+    ok($res->{ok},              'reset: JSON ok=true');
+}
+
+# guard: --package and --decision together -> exit 2
+{
+    my ($bpdir, $id) = mk_bp(kind => 'stuck-package');
+    my ($rc) = run_cli($bpdir, '--package', 'alpha', '--decision', $id);
+    is($rc, 2, 'guard: --package + --decision -> exit 2');
+}
+# guard: --package for a missing ledger -> exit 2
+{
+    my $bpdir = tempdir(CLEANUP => 1);
+    my ($rc) = run_cli($bpdir, '--package', 'ghost', '--action', 'reset');
+    is($rc, 2, 'guard: reset a nonexistent package -> exit 2');
 }
 
 done_testing();

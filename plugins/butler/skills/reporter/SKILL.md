@@ -51,13 +51,20 @@ You decide *what* the answer is with the user (the intent — discuss it, draft 
 
 ```
 perl "${CLAUDE_PLUGIN_ROOT}/scripts/bp-answer-decision.pl" $0 --bp-dir "<bpdir>" \
-     --decision <pkg--shortid> --action <relaunch|accept|drop|resume> [--note "<guidance>"]
+     --decision <pkg--shortid> --action <relaunch|reset|accept|drop|resume> [--note "<guidance>"]
 ```
 
 - **Package parks** (`stuck-package` / `harvest-failure` / `harvest-spawn-failure`): `relaunch` (default) appends your `--note` to the ledger as a corrective section, sets the package back to `pending`, and resets its attempt budget — the orchestrator relaunches it next tick (it re-reads ledgers every tick; **no restart needed**). `accept` marks it `done` as-is (the output is actually fine); `drop` abandons it.
 - **Fleet pauses** (`reauth` / `contract-drift`): have the user do the external action first (`/login`, or inspect the drift), **then** `resume` — it clears `runs/.paused` and the orchestrator resumes next tick.
 
 The script is fail-closed (a wrong action for the kind exits non-zero and changes nothing) and it deletes the queue entry on success. Confirm the outcome it prints.
+
+**Reset a package with no queued decision (#29).** When a package is wedged at the attempt cap or churning in its resolve-judge and the user wants a *clean retry* — a fresh coordinator with a reset budget rather than the resolve path or waiting on a verdict — do **not** hand-edit the registry, kill processes, or delete markers yourself. Run the deterministic reset: it supersedes any in-flight coordinator/judge for the package (kills it + clears its markers), resets the attempt **and** resolve budgets, sets the package `pending`, and clears any of its queued decisions — so the still-running orchestrator relaunches it fresh on its next tick (no orchestrator restart needed).
+
+```
+perl "${CLAUDE_PLUGIN_ROOT}/scripts/bp-answer-decision.pl" $0 --bp-dir "<bpdir>" \
+     --package <pkg> --action reset [--note "<guidance>"]
+```
 
 ## 5. Auto-announce: arm the token-free watcher
 
