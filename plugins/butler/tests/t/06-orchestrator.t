@@ -13,8 +13,6 @@ use Time::Local qw(timegm);
 
 require "$Bin/../../scripts/bp-orchestrator.pl";
 
-plan tests => 105;
-
 my $J = JSON::PP->new;
 sub near { my ($a,$b,$msg,$eps)=@_; $eps//=1e-6; ok(abs($a-$b) < $eps, $msg) or diag("got $a want $b"); }
 
@@ -131,10 +129,35 @@ ok(!BpOrch::should_touch_busy({}), 'busy: idle / only parked-for-human -> no tou
 ok( BpOrch::run_complete({}), 'complete: nothing running/outstanding/paused -> done');
 ok(!BpOrch::run_complete({any_running=>1}), 'complete: running -> not done');
 ok(!BpOrch::run_complete({paused=>1}), 'complete: paused -> not done');
+ok(!BpOrch::run_complete({awaiting_human=>1}), 'complete: blocked/parked awaiting a human -> stay alive (not done)');
 ok( BpOrch::has_progressable_work({A=>{deps=>[]}}, {A=>'running'}), 'progress: a running package is progressable');
 ok( BpOrch::has_progressable_work({A=>{deps=>[]}, B=>{deps=>['A']}}, {A=>'done', B=>'pending'}), 'progress: pending with done dep is progressable');
 ok(!BpOrch::has_progressable_work({A=>{deps=>[]}, B=>{deps=>['A']}}, {A=>'blocked', B=>'pending'}), 'progress: pending blocked by a blocked dep -> not progressable');
+ok(!BpOrch::has_progressable_work({A=>{deps=>[]}, B=>{deps=>['A']}}, {A=>'dropped', B=>'pending'}), 'progress: pending blocked by a DROPPED dep -> not progressable');
 ok(!BpOrch::has_progressable_work({A=>{deps=>[]}}, {A=>'done'}), 'progress: all terminal -> none');
+ok(!BpOrch::has_progressable_work({A=>{deps=>[]}}, {A=>'dropped'}), 'progress: a dropped package is terminal -> none');
+
+# ---- terminal / awaits-human status semantics (Defect 1 & 3) --------------
+ok( BpOrch::_is_terminal('dropped'), 'terminal: dropped IS terminal (never relaunched by the watchdog)');
+ok( BpOrch::_is_terminal('parked'),  'terminal: parked is terminal');
+ok(!BpOrch::_is_terminal('running'), 'terminal: running is not terminal');
+ok( BpOrch::_awaits_human('blocked'), 'awaits-human: blocked');
+ok( BpOrch::_awaits_human('parked'),  'awaits-human: parked');
+ok(!BpOrch::_awaits_human('done'),    'awaits-human: done does not');
+ok(!BpOrch::_awaits_human('dropped'), 'awaits-human: dropped (human-settled) does not');
+ok(!BpOrch::_awaits_human('pending'), 'awaits-human: pending does not');
+
+# ---- orphan_escalations (Defect 1: coordinator self-park leaves no decision) -
+{
+    my $m = { A=>{}, B=>{}, C=>{}, D=>{}, E=>{} };
+    my $s = { A=>'blocked', B=>'parked', C=>'done', D=>'pending', E=>'dropped' };
+    is_deeply([BpOrch::orphan_escalations($m, $s, { B=>1 })], ['A'],
+        'orphan: blocked A with no decision escalates; parked B already queued is skipped; done/pending/dropped never escalate');
+    is_deeply([BpOrch::orphan_escalations($m, $s, {})], ['A','B'],
+        'orphan: with an empty queue, both awaiting-human packages escalate (sorted)');
+    is_deeply([BpOrch::orphan_escalations($m, $s, { A=>1, B=>1 })], [],
+        'orphan: every awaiting-human package already queued -> nothing to escalate');
+}
 
 # ---- parse_dag ------------------------------------------------------------
 {
@@ -335,3 +358,153 @@ MD
     unlike($log, qr/"type":"launch"/, 'loop(fail): no success-launch event logged');
     ok(!-e "$bpdir/runs/.orchestrator", 'loop(fail): marker cleaned on exit');
 }
+
+# ---- IO: queued_decision_pkgs (any-kind dedupe set for reconciliation) -----
+{
+    my $runs = "$dir/runs-q"; mkdir $runs;
+    is_deeply(BpOrch::queued_decision_pkgs($runs), {}, 'queued-pkgs: missing dir -> {}');
+    BpOrch::queue_needs_you($runs, { package=>'X', blueprint=>'bp', kind=>'stuck-package', question=>'q', context=>'c', created_at=>1 });
+    BpOrch::queue_needs_you($runs, { package=>'Y', blueprint=>'bp', kind=>'harvest-failure', question=>'q', context=>'c', created_at=>2 });
+    # a dotfile + a non-JSON file must be ignored (matches the watcher's scanner).
+    open my $dot, '>', "$runs/needs-you/.cursor" or die; print $dot "x"; close $dot;
+    open my $bad, '>', "$runs/needs-you/notjson.json" or die; print $bad "{ broken"; close $bad;
+    is_deeply([sort keys %{ BpOrch::queued_decision_pkgs($runs) }], ['X','Y'],
+        'queued-pkgs: collects every queued package, any kind; ignores dotfiles/half-written files');
+}
+
+# ---- IO: ledger_next_action (surface the coordinator's handoff note) -------
+{
+    my $bd = "$dir/bp-na"; mkdir $bd; mkdir "$bd/packages";
+    open my $l, '>', "$bd/packages/p1.md" or die;
+    print $l "---\nstatus: blocked\n---\n\n## Outputs\n\nnothing yet\n\n## Next action\n\n"
+           . "Orchestrator: expand this package's write_set + test_paths to include integration_test/.\n"
+           . "Then relaunch me.\n\n## Notes\n\nignore me\n";
+    close $l;
+    my $na = BpOrch::ledger_next_action($bd, 'p1');
+    like($na, qr/expand this package's write_set \+ test_paths/, 'next-action: reads the Next action body');
+    unlike($na, qr/ignore me/, 'next-action: stops at the following heading');
+    open my $l2, '>', "$bd/packages/p2.md" or die; print $l2 "---\nstatus: blocked\n---\n\n# p2\n"; close $l2;
+    is(BpOrch::ledger_next_action($bd, 'p2'), undef, 'next-action: absent section -> undef');
+    # control-byte injection: a coordinator ledger with a raw ESC/BEL must be stripped
+    # before the text reaches a decision the reporter prints (build bytes via chr to
+    # avoid the Edit-tool \uXXXX mangling).
+    my $evil = "do the thing" . chr(0x1b) . "[31mSPOOF" . chr(0x07) . " now";
+    open my $l3, '>:raw', "$bd/packages/p3.md" or die;
+    print $l3 "---\nstatus: blocked\n---\n\n## Next action\n\n$evil\n"; close $l3;
+    my $clean = BpOrch::ledger_next_action($bd, 'p3');
+    like($clean, qr/do the thing/, 'next-action: keeps the legible text');
+    is((() = $clean =~ /[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g), 0, 'next-action: strips C0/DEL control bytes (no ANSI spoof reaches the reporter)');
+}
+
+# ---- ASSEMBLY: a coordinator-self-blocked package is escalated, NOT silently
+#      dropped, and the loop does NOT idle-exit while it awaits a human --------
+{
+    my $bpdir = "$dir/bp-orphan"; mkdir $bpdir; mkdir "$bpdir/packages"; mkdir "$bpdir/runs";
+    open my $b, '>', "$bpdir/blueprint.md" or die;
+    print $b <<'MD';
+# T-orphan
+
+| pkg | deliverable | depends_on | model | status |
+|--|--|--|--|--|
+| pkgA | thing A | — | sonnet | done |
+| pkgB | thing B | pkgA | opus | blocked |
+MD
+    close $b;
+    open my $la, '>', "$bpdir/packages/pkgA.md" or die;
+    print $la "---\npackage: pkgA\nblueprint: T-orphan\nstatus: done\nwrite_set: p/a/\ntest_paths: p/a/\nlast_updated: 2026-06-27T00:00:00Z\n---\n# pkgA\n";
+    close $la;
+    open my $lb, '>', "$bpdir/packages/pkgB.md" or die;
+    print $lb "---\npackage: pkgB\nblueprint: T-orphan\nstatus: blocked\nwrite_set: p/b/\ntest_paths: p/b/\nlast_updated: 2026-06-27T00:00:00Z\n---\n\n## Next action\n\nOrchestrator: expand the write_set to include integration_test/prefeitura/.\n";
+    close $lb;
+    # pkgA already passed its harvest -> the harvest judge does NOT fire (keeps this
+    # an isolated test of the orphan-escalation/idle logic, no judge shell-out).
+    open my $rg, '>', "$bpdir/runs/registry.json" or die;
+    print $rg $J->encode({ packages => { pkgA => { status=>'done', harvest=>'pass' } } }); close $rg;
+    my $NOW = 1_900_000_000;
+    my $creds = "$dir/creds-orphan.json"; write_creds($creds, ($NOW + 5*3600) * 1000);
+    my $ub = $J->encode({ five_hour=>{utilization=>10, resets_at=>'2026-06-22T05:59:59+00:00'},
+                          seven_day=>{utilization=>5,  resets_at=>'2026-06-22T17:59:59+00:00'} });
+    my $t = { ceil5=>85,ceil7=>90,drain=>600,max_par=>2,cap=>5,flat=>600,watch_tick=>0,
+              keeper_int=>600,keeper_bo=>120,thresh_min=>60,jit_lo=>300,jit_hi=>900,
+              tele_retry=>3,usage_fail=>60,busy_path=>"$dir/busy-orphan",
+              harvest=>'audit',resolve_cap=>1,corr_cap=>1,judge_to=>1800,judge_spawn_cap=>3,harvest_reaudit_cap=>2 };
+    my @launched;
+    BpOrch::run({ blueprint=>'T-orphan', bp_dir=>$bpdir, creds_path=>$creds, tunables=>$t,
+        once=>1, now=>sub{$NOW}, sleep=>sub{}, spawn_judge=>sub{ 0 },
+        http_get=>sub{ {status=>200, content=>$ub} }, http_post=>sub{ {status=>200,content=>'{}'} },
+        launch=>sub{ push @launched, $_[0]{pkg}; 0 } });
+
+    is(scalar @launched, 0, 'orphan: nothing launched (pkgA done, pkgB blocked)');
+    opendir my $dh, "$bpdir/runs/needs-you" or die "no needs-you dir: $!";
+    my @j = grep { /^pkgB--.*\.json$/ } readdir $dh; closedir $dh;
+    is(scalar @j, 1, 'orphan: a needs-you decision was filed for the self-blocked pkgB');
+    my $rec = $J->decode(do { local $/; open my $r,'<',"$bpdir/runs/needs-you/$j[0]" or die; <$r> });
+    is($rec->{kind}, 'stuck-package', 'orphan: decision kind is stuck-package');
+    like($rec->{context}, qr/expand the write_set to include integration_test/,
+        'orphan: decision context carries the coordinator\'s own "## Next action" handoff');
+    my $log = do { local $/; open my $r,'<',"$bpdir/runs/orchestrator.log" or die; <$r> };
+    like($log, qr/"package":"pkgB".*"type":"orphan_escalation"/, 'orphan: logged the escalation');
+    unlike($log, qr/"type":"idle_exit"/,
+        'orphan: did NOT idle-exit — a package awaiting a human keeps the orchestrator alive (the bug)');
+}
+
+# ---- ASSEMBLY: an all-done run still idle-exits cleanly (no false stay-alive) -
+{
+    my $bpdir = "$dir/bp-done"; mkdir $bpdir; mkdir "$bpdir/packages"; mkdir "$bpdir/runs";
+    open my $b, '>', "$bpdir/blueprint.md" or die;
+    print $b "# T-done\n\n| pkg | deliverable | depends_on | model | status |\n|--|--|--|--|--|\n| only | x | — | sonnet | done |\n";
+    close $b;
+    open my $l, '>', "$bpdir/packages/only.md" or die;
+    print $l "---\npackage: only\nblueprint: T-done\nstatus: done\nwrite_set: p/o/\ntest_paths: p/o/\nlast_updated: 2026-06-27T00:00:00Z\n---\n# only\n";
+    close $l;
+    open my $rgd, '>', "$bpdir/runs/registry.json" or die;
+    print $rgd $J->encode({ packages => { only => { status=>'done', harvest=>'pass' } } }); close $rgd;
+    my $NOW = 1_900_000_000;
+    my $creds = "$dir/creds-done.json"; write_creds($creds, ($NOW + 5*3600) * 1000);
+    my $ub = $J->encode({ five_hour=>{utilization=>10, resets_at=>'2026-06-22T05:59:59+00:00'},
+                          seven_day=>{utilization=>5,  resets_at=>'2026-06-22T17:59:59+00:00'} });
+    my $t = { ceil5=>85,ceil7=>90,drain=>600,max_par=>2,cap=>5,flat=>600,watch_tick=>0,
+              keeper_int=>600,keeper_bo=>120,thresh_min=>60,jit_lo=>300,jit_hi=>900,
+              tele_retry=>3,usage_fail=>60,busy_path=>"$dir/busy-done",
+              harvest=>'audit',resolve_cap=>1,corr_cap=>1,judge_to=>1800,judge_spawn_cap=>3,harvest_reaudit_cap=>2 };
+    BpOrch::run({ blueprint=>'T-done', bp_dir=>$bpdir, creds_path=>$creds, tunables=>$t,
+        once=>1, now=>sub{$NOW}, sleep=>sub{}, spawn_judge=>sub{ 0 },
+        http_get=>sub{ {status=>200, content=>$ub} }, http_post=>sub{ {status=>200,content=>'{}'} },
+        launch=>sub{ 0 } });
+    my $log = do { local $/; open my $r,'<',"$bpdir/runs/orchestrator.log" or die; <$r> };
+    like($log, qr/"type":"idle_exit"/, 'all-done: idle-exits cleanly (nothing awaiting a human)');
+    ok(!-e "$bpdir/runs/.orchestrator", 'all-done: marker removed on clean exit');
+}
+
+# ---- ASSEMBLY: a human-DROPPED package is terminal — the watchdog must not
+#      resurrect it even with a dead pid recorded (Defect 3) -------------------
+{
+    my $bpdir = "$dir/bp-drop"; mkdir $bpdir; mkdir "$bpdir/packages"; mkdir "$bpdir/runs";
+    open my $b, '>', "$bpdir/blueprint.md" or die;
+    print $b "# T-drop\n\n| pkg | deliverable | depends_on | model | status |\n|--|--|--|--|--|\n| gone | x | — | sonnet | dropped |\n";
+    close $b;
+    open my $l, '>', "$bpdir/packages/gone.md" or die;
+    print $l "---\npackage: gone\nblueprint: T-drop\nstatus: dropped\nwrite_set: p/g/\ntest_paths: p/g/\nlast_updated: 2026-06-27T00:00:00Z\n---\n# gone\n";
+    close $l;
+    # registry: the package ran once (attempt 1) and recorded a pid -> exactly the
+    # shape that, pre-fix, made the watchdog treat a dropped package as a dead
+    # coordinator to relaunch.
+    open my $reg, '>', "$bpdir/runs/registry.json" or die;
+    print $reg $J->encode({ packages => { gone => { attempt=>1, status=>'dropped', pid=>987654, session_id=>'s' } } });
+    close $reg;
+    my $NOW = 1_900_000_000;
+    my $creds = "$dir/creds-drop.json"; write_creds($creds, ($NOW + 5*3600) * 1000);
+    my $ub = $J->encode({ five_hour=>{utilization=>10, resets_at=>'2026-06-22T05:59:59+00:00'},
+                          seven_day=>{utilization=>5,  resets_at=>'2026-06-22T17:59:59+00:00'} });
+    my $t = { ceil5=>85,ceil7=>90,drain=>600,max_par=>2,cap=>5,flat=>600,watch_tick=>0,
+              keeper_int=>600,keeper_bo=>120,thresh_min=>60,jit_lo=>300,jit_hi=>900,
+              tele_retry=>3,usage_fail=>60,busy_path=>"$dir/busy-drop" };
+    my @launched;
+    BpOrch::run({ blueprint=>'T-drop', bp_dir=>$bpdir, creds_path=>$creds, tunables=>$t,
+        once=>1, now=>sub{$NOW}, sleep=>sub{}, pid_alive=>sub{ 0 },   # recorded pid is dead
+        http_get=>sub{ {status=>200, content=>$ub} }, http_post=>sub{ {status=>200,content=>'{}'} },
+        launch=>sub{ push @launched, $_[0]{pkg}; 0 } });
+    is(scalar @launched, 0, 'dropped: a human-dropped package is terminal — never relaunched by the watchdog');
+}
+
+done_testing();

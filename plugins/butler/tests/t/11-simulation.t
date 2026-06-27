@@ -26,6 +26,14 @@ my $ROOT = tempdir(CLEANUP => 1);
 my $NOW  = time;
 
 sub slurp { local $/; open my $f,'<',shift or return ''; <$f> }
+# any package whose ledger is in an awaiting-human terminal state (blocked/parked).
+sub _has_parked {
+    my ($dir) = @_;
+    opendir my $h, "$dir/packages" or return 0;
+    my @f = grep { /\.md$/ } readdir $h; closedir $h;
+    for my $f (@f) { return 1 if slurp("$dir/packages/$f") =~ /^status:\s*(?:blocked|parked)\s*$/m; }
+    return 0;
+}
 sub write_creds {
     # expiry pinned far out so the token-keeper never enters its refresh band during
     # a (possibly long) sim — these scenarios test the loop, not the keeper (t/05 does).
@@ -103,6 +111,14 @@ sub run_sim {
     };
     my $advance = sub {
         $clock += ($_[0] // 0); $tick++;
+        # NEW CONTRACT (post-fix): the orchestrator STAYS ALIVE while a package is
+        # blocked/parked awaiting a human — it would relaunch the instant a human
+        # answers (bp-answer-decision), so it must not idle-exit and strand the run.
+        # A sim has no human, so once nothing is alive, no judge verdict is pending,
+        # and we're not paused, a parked/blocked package means the loop idles forever
+        # BY DESIGN. Treat that drained-but-parked steady state as clean termination
+        # for park scenarios (this is exactly the silent-idle-exit bug, now fixed).
+        die "SIM: parked-steady\n" if !%alive && !%vdue && ! -e "$runs/.paused" && _has_parked($dir);
         die "SIM: exceeded $max ticks\n" if $tick > $max;
         for my $pkg (sort keys %coord) {
             my $c = $coord{$pkg}; next unless $alive{$c->{pid}};
@@ -141,7 +157,12 @@ sub run_sim {
         });
         1;
     } or $err = $@;
+    # A run that drained to a stable awaiting-human state is a CLEAN park, not a
+    # failure or a max-tick blowout — normalize the sentinel away and flag it.
+    my $parked_steady = 0;
+    if (defined $err && $err eq "SIM: parked-steady\n") { $parked_steady = 1; $err = undef; }
     return { dir=>$dir, launched=>\@launched, spawned=>\@spawned, ticks=>$tick, err=>$err,
+             parked_steady=>$parked_steady,
              reg=>BpOrch::read_registry($runs), log=>slurp("$runs/orchestrator.log") };
 }
 sub launched_pkgs { my $r=shift; [ map { $_->{pkg} } @{$r->{launched}} ] }
@@ -235,7 +256,8 @@ sub launched_pkgs { my $r=shift; [ map { $_->{pkg} } @{$r->{launched}} ] }
         tun => { cap=>1 },
         max_ticks => 120,
     });
-    is($r->{err}, undef, 'SIM-5: terminated cleanly (parked branch did not stall the run)');
+    is($r->{err}, undef, 'SIM-5: reached a stable parked-for-human state (no stall, no max-tick blowout)');
+    ok($r->{parked_steady}, 'SIM-5: orchestrator stayed alive awaiting the human — did NOT idle-exit on the parked branch');
     like(slurp("$r->{dir}/packages/A.md"), qr/^status:\s*blocked/m, 'SIM-5: A parked (blocked)');
     is($r->{reg}{C}{harvest}, 'pass', 'SIM-5: independent C completed despite A parking');
     my $nd = "$r->{dir}/runs/needs-you"; my @q; if (-d $nd) { opendir my $h,$nd; @q=grep {/\.json$/} readdir $h; closedir $h; }
@@ -283,7 +305,8 @@ sub launched_pkgs { my $r=shift; [ map { $_->{pkg} } @{$r->{launched}} ] }
         tun => { corr_cap=>2 },
         max_ticks => 150,
     });
-    is($r->{err}, undef, 'SIM-7: terminated cleanly across repeated reopen cycles');
+    is($r->{err}, undef, 'SIM-7: drained to a clean park across repeated reopen cycles (no max-tick blowout)');
+    ok($r->{parked_steady}, 'SIM-7: stayed alive awaiting the human after the corrective cap, did not idle-exit');
     my $led = slurp("$r->{dir}/packages/A.md");
     my $blocks = () = ($led =~ /## Harvest findings \(re-verify\)/g);
     is($blocks, 1, 'SIM-7: harvest findings written idempotently — exactly one block after repeated reopens');

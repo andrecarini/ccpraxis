@@ -63,7 +63,12 @@ our $USER_AGENT = $ENV{BP_USER_AGENT} // 'claude-code/2.1.170';
 # PURE DECISIONS  (no I/O, no globals — unit-tested in t/06-orchestrator.t)
 # ===========================================================================
 
-sub _is_terminal { my $s = shift // ''; $s =~ /^(done|blocked|parked)$/ ? 1 : 0 }
+sub _is_terminal { my $s = shift // ''; $s =~ /^(done|dropped|blocked|parked)$/ ? 1 : 0 }
+# blocked/parked = HALTED AWAITING A HUMAN: a human's answer (bp-answer-decision)
+# flips the package back to pending and the STILL-RUNNING orchestrator relaunches it
+# (the reporter contract is "no restart needed"). 'done'/'dropped' are settled —
+# nothing a human can do reopens them — so they never keep the loop alive.
+sub _awaits_human { my $s = shift // ''; $s =~ /^(blocked|parked)$/ ? 1 : 0 }
 
 # --- coordinator progress (Decision #14: stream-log growth is a free liveness
 # signal). Given the jsonl's current/previous size + its mtime + now, decide if a
@@ -247,18 +252,49 @@ sub has_progressable_work {
         my $dead_dep = 0;
         for my $d (@{ $meta->{$pkg}{deps} || [] }) {
             my $ds = $status->{$d} // 'pending';
-            $dead_dep = 1 if $ds eq 'blocked' || $ds eq 'parked';
+            # a dependency that is terminal-but-not-done (blocked/parked/dropped)
+            # can never satisfy deps_met, so this package is dead-ended, not
+            # progressable. (deps_met requires the dep === 'done'.)
+            $dead_dep = 1 if _is_terminal($ds) && $ds ne 'done';
         }
         return 1 unless $dead_dep;
     }
     return 0;
 }
 
-# --- the orchestrator exits when nothing is running, nothing is progressable, and
-# no auto-resume is pending and we are not paused.
+# --- awaiting-human packages (blocked/parked) that have NO queued needs-you
+# decision. A coordinator can self-block/park in its OWN ledger (gate-stop.sh
+# permits a terminal stop with a '## Next action') WITHOUT the orchestrator ever
+# running its escalation path — so no decision is filed, the reporter's queue-watcher
+# (bp-wait-for-decision) stays silent, and the run goes quiet. The loop reconciles
+# this every tick: every awaiting-human package must leave the human something to
+# act on. $queued = { pkg => 1 } of packages that already have a decision (any kind).
+# Pure.
+sub orphan_escalations {
+    my ($meta, $status, $queued) = @_;
+    $queued ||= {};
+    my @out;
+    for my $pkg (sort keys %$meta) {
+        next unless _awaits_human($status->{$pkg} // '');
+        next if $queued->{$pkg};
+        push @out, $pkg;
+    }
+    return @out;
+}
+
+# --- the orchestrator exits ONLY when there is genuinely nothing left it could do:
+# nothing running, nothing progressable, no auto-resume pending, not paused, AND
+# nothing parked/blocked awaiting a human. The last clause is load-bearing: a
+# blocked/parked package is unblocked by a human's answer (bp-answer-decision flips
+# it to pending), and the documented reporter contract is that the STILL-RUNNING
+# orchestrator relaunches it next tick — "no restart needed". Exiting here strands
+# the run on a dead orchestrator. Awaiting-human work keeps the loop alive (idle-
+# polling) but NOT the busy-lease (should_touch_busy still excludes parked-for-human),
+# so the machine can still sleep while waiting on the human.
 sub run_complete {
     my ($c) = @_;
     return 0 if $c->{any_running} || $c->{outstanding} || $c->{resume_pending} || $c->{paused};
+    return 0 if $c->{awaiting_human};
     return 1;
 }
 
@@ -324,6 +360,28 @@ sub ledger_fm {
         if ($ln =~ /^\Q$key\E:\s*(.*?)\s*$/) { return $1; }
     }
     return undef;
+}
+
+# read a ledger's '## Next action' body (first few non-empty, non-heading lines),
+# collapsed to one bounded line, so an orphan escalation can surface the
+# coordinator's OWN handoff note to the human (e.g. "expand this package's
+# write_set + test_paths…") instead of only a generic prompt. undef if absent.
+sub ledger_next_action {
+    my ($bpdir, $pkg) = @_;
+    my $txt = _read_file("$bpdir/packages/$pkg.md");
+    return undef unless defined $txt;
+    return undef unless $txt =~ /^##\s+Next action\s*\n(.*?)(?=\n##\s|\z)/ims;
+    my @lines = grep { /\S/ && !/^\s*#/ } split /\n/, $1;
+    return undef unless @lines;
+    @lines = @lines[0 .. ($#lines < 4 ? $#lines : 4)];     # cap at first 5 lines
+    my $s = join(' ', map { my $x = $_; $x =~ s/^\s+//; $x =~ s/\s+$//; $x } @lines);
+    # The ledger is coordinator-written (a Claude); this text lands in a decision the
+    # reporter prints to a terminal. Strip C0/DEL control bytes (e.g. a raw ESC that
+    # could spoof the approval UI) at this input seam — display-seam sanitization is
+    # the reporter's job too, but defence in depth (house rule: sanitize untrusted).
+    $s =~ tr/\x00-\x08\x0B\x0C\x0E-\x1F\x7F//d;
+    $s =~ s/\s+/ /g;
+    return length $s ? substr($s, 0, 500) : undef;
 }
 
 sub read_registry {
@@ -417,6 +475,26 @@ sub queue_needs_you {
     close $fh;
     rename $tmp, $file or do { unlink $tmp; die "bp-orchestrator: queue needs-you rename: $!"; };
     return $file;
+}
+
+# --- packages that currently have a queued needs-you decision (any kind). Used to
+# reconcile orphaned blocked/parked packages (orphan_escalations) so the loop never
+# re-files a decision for a package the human can already see. Half-written/non-JSON
+# files and dotfiles are ignored (matches bp-wait-for-decision's scanner).
+sub queued_decision_pkgs {
+    my ($runs) = @_;
+    my %pk;
+    my $dir = "$runs/needs-you";
+    if (opendir my $dh, $dir) {
+        for my $f (grep { /\.json$/ && !/^\./ } readdir $dh) {
+            my $ex = _read_json("$dir/$f");
+            next unless ref $ex eq 'HASH';
+            my $p = $ex->{package};
+            $pk{$p} = 1 if defined $p && length $p;
+        }
+        closedir $dh;
+    }
+    return \%pk;
 }
 
 # --- registry per-package merge (A5). The orchestrator now writes registry fields
@@ -1004,6 +1082,31 @@ sub run {
                 }
             }
 
+            # ---- RECONCILE ORPHANED ESCALATIONS ----
+            # A coordinator can end a package blocked/parked in its OWN ledger
+            # (gate-stop.sh permits a terminal stop) without the orchestrator's
+            # escalation path ever running — so no needs-you decision is filed and
+            # the reporter's watcher stays silent. Enforce the invariant "every
+            # awaiting-human package has a decision the human can act on" so the run
+            # never goes quiet. Skip during a graceful shutdown: those parks are
+            # expected and the human already asked for the stop.
+            unless ($shutdown) {
+                my $queued = queued_decision_pkgs($runs);
+                for my $pkg (orphan_escalations($meta, $status, $queued)) {
+                    my $st = $status->{$pkg} // '';
+                    my $next = ledger_next_action($bpdir, $pkg);
+                    _log($log, 'orphan_escalation', { package => $pkg, status => $st,
+                        detail => 'awaiting-human with no queued decision (coordinator self-park) — escalating' });
+                    queue_needs_you($runs, {
+                        package => $pkg, blueprint => $bp, kind => 'stuck-package',
+                        question => "Package '$pkg' was set to '$st' by its coordinator with no decision filed for you. "
+                                  . "Read its '## Next action' (it may address an instruction to the orchestrator, e.g. a write_set change), then relaunch with guidance / accept / drop.",
+                        context  => ($next // "orphaned '$st' status — no needs-you decision existed; filed by the orchestrator so the run doesn't go silent"),
+                        created_at => $now,
+                    });
+                }
+            }
+
             # ---- BUSY-LEASE + IDLE-EXIT ----
             my $any_running = (scalar @live) > 0 ? 1 : 0;
             # A detached judge in flight is active work the run must wait for (C2): in
@@ -1013,6 +1116,11 @@ sub run {
             my $judges_inflight = (grep { defined judge_inflight($runs, 'harvest', $_)
                                        || defined judge_inflight($runs, 'resolve', $_) } keys %$meta) ? 1 : 0;
             my $outstanding = has_progressable_work($meta, $status) || $judges_inflight;
+            # Awaiting-human work (blocked/parked) keeps the loop ALIVE but is NOT
+            # part of the busy-lease signal (the machine may sleep while we wait on
+            # the human). It IS part of the idle-exit gate (below): exiting would
+            # strand the run on a dead orchestrator when the human answers.
+            my $awaiting_human = (grep { _awaits_human($status->{$_}) } keys %$meta) ? 1 : 0;
             touch_busy($t->{busy_path}) if should_touch_busy({
                 any_running => $any_running, outstanding => $outstanding,
                 resume_pending => $resume_pending, shutdown => $shutdown,
@@ -1022,8 +1130,10 @@ sub run {
                 _log($log, 'shutdown_complete', { detail => 'graceful-shutdown-all: no coordinators left' });
                 last;
             }
-            if (run_complete({ any_running => $any_running, outstanding => $outstanding, resume_pending => $resume_pending, paused => ($paused ? 1 : 0) })) {
-                _log($log, 'idle_exit', { detail => 'no running, no progressable work, not paused' });
+            if (run_complete({ any_running => $any_running, outstanding => $outstanding,
+                               resume_pending => $resume_pending, paused => ($paused ? 1 : 0),
+                               awaiting_human => $awaiting_human })) {
+                _log($log, 'idle_exit', { detail => 'no running, no progressable work, not paused, nothing awaiting a human' });
                 last;
             }
 
