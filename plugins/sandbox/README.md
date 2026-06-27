@@ -96,7 +96,7 @@ HOST                                                                         CON
 <project>/                                                               ──►  /project                       (bind, RW)
 <project>/.ccpraxis-local-data/claude-home/                             ──►  /root/.claude                  (bind, RW)
 <project>/.ccpraxis-local-data/claude-home/.launcher/                   ──►  /root/.claude/.launcher        (bind, RO overlay)
-<project>/.ccpraxis-local-data/claude-home/.launcher/credentials.json   ──►  /root/.claude/.credentials.json (file bind, RW)
+<project>/.ccpraxis-local-data/claude-home/.credentials.json            ──►  /root/.claude/.credentials.json (real file via the claude-home dir bind, RW)
 <project>/.ccpraxis-local-data/claude-home/.claude.json                 ──►  /root/.claude.json             (file bind, RW)
 ~/.claude/ccpraxis/scripts/statusline.pl                                ──►  /root/.claude/statusline.pl    (file bind, RO)
 <each selected skill dir>                                               ──►  /root/.claude/skills/<name>    (bind, RO)
@@ -127,12 +127,19 @@ The launcher applies these in order during `podman create`:
    blueprint re-application. Test `06-launcher-ro-protection.t` pins
    the kernel-level enforcement.
 
-3. **`.launcher/credentials.json` → `/root/.claude/.credentials.json`
-   (RW single-file bind)** — the OAuth file. Container DOES need to
-   write here (mcpOAuth tokens during `claude mcp add` auth flows).
-   Single-file bind from the canonical `.launcher/` location means
-   writes persist across container rebuild without any sync step, and
-   the rest of `.launcher/` stays RO.
+3. **`claude-home/.credentials.json` → `/root/.claude/.credentials.json`
+   (real file via the dir bind, RW)** — the OAuth file. It is NOT a
+   single-file mount: it lives at `claude-home/.credentials.json` and
+   rides the `/root/.claude` directory bind (#1). Why it can't be a
+   single-file bind: on Linux you cannot `rename()` over a single-file
+   bind mountpoint (EBUSY), and both Claude Code and the butler
+   token-keeper persist an OAuth refresh with an atomic temp+rename — so
+   a single-file overlay made the refreshed token un-saveable, the
+   on-disk token went stale, and the user was forced to relaunch. As a
+   real file in the directory bind, both in-place AND rename writes land
+   and persist (the in-session token refresh AND `mcpOAuth` tokens from
+   `claude mcp add`), surviving container rebuild with no sync step.
+   `.launcher/` stays RO — creds were never launcher-integrity metadata.
 
 4. **`.ccpraxis-local-data/claude-home/.claude.json` → `/root/.claude.json` (RW single-file
    bind)** — claude-code's outside-`/root/.claude/` config file. Same

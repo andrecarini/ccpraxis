@@ -221,7 +221,17 @@ my $PLUGINS_SNAPSHOT_FILE     = "$LAUNCHER_DIR/.plugins-snapshot.json";
 my $MCP_SNAPSHOT_FILE         = "$LAUNCHER_DIR/.mcp-snapshot.json";
 my $SETTINGS_LOCAL_FILE       = "$PROJECT_PATH/.claude/settings.local.json";
 my $MATERIALIZED_PLUGINS_FILE = "$LAUNCHER_DIR/installed_plugins.json";
-my $SANDBOX_CREDENTIALS_FILE  = "$LAUNCHER_DIR/credentials.json";
+# .credentials.json lives at claude-home/ (the RW dir bind), NOT inside
+# .launcher/ — so it appears at /root/.claude/.credentials.json as a REAL
+# file through the parent claude-home bind, not as a single-file mount.
+# Why it can't be a single-file bind: on Linux you cannot rename() over a
+# single-file bind mountpoint (EBUSY), and BOTH Claude Code and butler's
+# token-keeper persist an OAuth refresh with the atomic temp+rename pattern.
+# A single-file overlay rejected that rename, so a refreshed token could
+# never be saved — the on-disk token went stale and forced a relaunch. As a
+# real file inside the RW dir bind, both in-place and rename writes land, so
+# in-container token refresh persists with no relaunch.
+my $SANDBOX_CREDENTIALS_FILE  = "$CLAUDE_DATA/.credentials.json";
 # known_marketplaces.json lives under claude-home/plugins/ (NOT .launcher/)
 # so it appears at /root/.claude/plugins/known_marketplaces.json as a real
 # file through the parent claude-home bind — not as a single-file mount.
@@ -1266,6 +1276,28 @@ if (-f "$HOST_PLUGINS_DIR/known_marketplaces.json") {
 # Materialize credentials
 # =====================================================================
 
+# One-time migration (Fix 1): older sandboxes kept the sandbox creds at
+# $LAUNCHER_DIR/credentials.json and bind-mounted that single file at
+# /root/.claude/.credentials.json. That single-file bind rejected rename()
+# over the mountpoint (EBUSY), so an in-container OAuth refresh could never
+# persist. The canonical location is now claude-home/.credentials.json (a
+# real file inside the RW dir bind, rename-safe). If the new file is absent
+# but the legacy one exists, carry it over so accumulated in-container
+# mcpOAuth tokens survive the move (materialize-credentials below re-reads
+# its own output to preserve mcpOAuth). Copy (not move): the legacy file is
+# left in .launcher/ as a harmless RO orphan. Best-effort — a failure here
+# just means materialize re-seeds claudeAiOauth from the host and the
+# container re-auths its MCP servers (re-login of MCP plugins, no token loss).
+if (!-f $SANDBOX_CREDENTIALS_FILE) {
+    my $legacy = "$LAUNCHER_DIR/credentials.json";
+    if (-f $legacy) {
+        make_path($CLAUDE_DATA) unless -d $CLAUDE_DATA;
+        eval { _copy_file($legacy, $SANDBOX_CREDENTIALS_FILE); 1 }
+            or print STDERR "WARNING: legacy credentials migration failed: $@";
+        chmod 0600, $SANDBOX_CREDENTIALS_FILE if -f $SANDBOX_CREDENTIALS_FILE;
+    }
+}
+
 run_perl_or_die('materialize-credentials failed',
     'materialize-credentials',
     '--output', $SANDBOX_CREDENTIALS_FILE);
@@ -1453,11 +1485,13 @@ sub apply_blueprints_to_host_data {
     if (-f $CONTAINER_SETTINGS_JSON) {
         _copy_file($CONTAINER_SETTINGS_JSON, "$host_data/settings.json");
     }
-    # .credentials.json is NOT copied here — it's bind-mounted as a
-    # single-file bind from $LAUNCHER_DIR/credentials.json directly,
-    # so writes from inside the container (mcpOAuth tokens during
-    # `claude mcp add` auth) land on the canonical host file and persist
-    # across container rebuild without a sync step.
+    # .credentials.json is NOT copied here — materialize-credentials
+    # writes it directly at claude-home/.credentials.json (a real file in
+    # the RW dir bind), so writes from inside the container (an OAuth token
+    # refresh, or mcpOAuth tokens during `claude mcp add` auth) land on the
+    # canonical host file and persist across container rebuild with no sync
+    # step. See the $SANDBOX_CREDENTIALS_FILE definition for why this is a
+    # real file and not a single-file mount.
 }
 
 # Single-file bind mounts require the host path to exist before podman
@@ -1477,9 +1511,15 @@ sub ensure_claude_json_host_file {
     close $fh;
 }
 
+# Safety guard only (Fix 1): the canonical sandbox creds now live at
+# claude-home/.credentials.json — a REAL file inside the RW dir bind, no
+# longer a single-file mount, so it need not pre-exist before `podman
+# create`. materialize-credentials always writes a valid file earlier in
+# the launch, so by the time we reach create this is a no-op. Kept as a
+# belt-and-suspenders seed in case materialize was skipped.
 sub ensure_credentials_json_host_file {
     return if -f $SANDBOX_CREDENTIALS_FILE;
-    make_path($LAUNCHER_DIR) unless -d $LAUNCHER_DIR;
+    make_path($CLAUDE_DATA) unless -d $CLAUDE_DATA;
     open(my $fh, '>', $SANDBOX_CREDENTIALS_FILE) or do {
         print STDERR "WARNING: couldn't create $SANDBOX_CREDENTIALS_FILE: $!\n";
         return;
@@ -1488,6 +1528,7 @@ sub ensure_credentials_json_host_file {
     # — claude-code overwrites with full structure on first auth.
     print $fh "{}\n";
     close $fh;
+    chmod 0600, $SANDBOX_CREDENTIALS_FILE;
 }
 
 # Materialize the git credential helper (+ an additive global git config) used
@@ -1710,14 +1751,17 @@ if (! _container_exists($CONTAINER_NAME)) {
         # statusline.pl + skills/plugins read its contents; nothing
         # inside the container needs to write to it.
         '-v', "${LAUNCHER_DIR}:/root/.claude/.launcher:ro",
-        # .credentials.json is a single-file RW bind from the canonical
-        # location inside .launcher/. The container DOES need to write
-        # here (mcpOAuth tokens written by `claude mcp add` flows), and
-        # binding the single file lets those writes land on the canonical
-        # path so they survive container rebuild — without exposing the
-        # rest of .launcher/ as writable. ensure_credentials_json_host_file()
-        # seeds an empty {} if missing.
-        '-v', "${SANDBOX_CREDENTIALS_FILE}:/root/.claude/.credentials.json",
+        # .credentials.json is NOT a single-file bind — it lives at
+        # claude-home/.credentials.json and rides the ${CLAUDE_DATA} dir
+        # bind above as a REAL file at /root/.claude/.credentials.json.
+        # A single-file overlay rejected rename() over the mountpoint
+        # (EBUSY), which blocked the atomic temp+rename write that both
+        # Claude Code and butler's token-keeper use to persist an OAuth
+        # refresh — so the in-container token went stale and forced a
+        # relaunch. As a real file in the RW dir bind, both in-place and
+        # rename writes land and persist, so in-container token refresh
+        # works with no relaunch. mcpOAuth tokens written by `claude mcp
+        # add` persist the same way (claude-home survives rebuild).
         # .claude.json lives at /root/.claude.json (NOT inside
         # /root/.claude/), so it gets its own single-file bind from
         # claude-home/.claude.json. ensure_claude_json_host_file() above

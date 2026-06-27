@@ -10,7 +10,7 @@ use warnings;
 use FindBin qw($Bin);
 use Test::More;
 
-plan tests => 8;
+plan tests => 9;
 
 my $launcher = "$Bin/../../scripts/launcher.pl";
 ok(-f $launcher, 'launcher.pl present') or BAIL_OUT;
@@ -29,12 +29,15 @@ like($src, qr{'-v',\s*"\$\{CLAUDE_DATA\}:/root/\.claude"}m,
 like($src, qr{'-v',\s*"\$\{LAUNCHER_DIR\}:/root/\.claude/\.launcher:ro"}m,
      '.launcher is overlaid as RO over /root/.claude/.launcher');
 
-# 3. credentials.json is a single-file RW bind from $SANDBOX_CREDENTIALS_FILE
-# (== $LAUNCHER_DIR/credentials.json). Container DOES need to write here
-# (mcpOAuth tokens) — the file bind lets those writes land on the canonical
-# host path so they persist across container rebuild.
-like($src, qr{'-v',\s*"\$\{SANDBOX_CREDENTIALS_FILE\}:/root/\.claude/\.credentials\.json"}m,
-     'credentials.json is a single-file bind from the .launcher/ canonical');
+# 3. .credentials.json is NO LONGER a single-file bind (Fix 1). It lives at
+# claude-home/.credentials.json and rides the ${CLAUDE_DATA} dir bind as a
+# real file, so atomic temp+rename writes (how Claude Code / butler persist
+# an OAuth refresh) succeed — a single-file bind rejected rename-over-mount
+# (EBUSY) and the refreshed token could never be saved.
+like($src, qr{\$SANDBOX_CREDENTIALS_FILE\s*=\s*"\$CLAUDE_DATA/\.credentials\.json"}m,
+     'sandbox creds path is claude-home/.credentials.json (rides the RW dir bind)');
+unlike($src, qr{:/root/\.claude/\.credentials\.json"}m,
+       'no single-file bind onto /root/.claude/.credentials.json (rename-safe dir bind instead)');
 
 # 4. /root/.claude.json is a single-file bind from claude-home/.claude.json.
 like($src, qr{'-v',\s*"\$\{CLAUDE_DATA\}/\.claude\.json:/root/\.claude\.json"}m,

@@ -764,10 +764,21 @@ sub run {
                           question => 'OAuth token crossed the 1h floor unrefreshed — re-authenticate with /login.',
                           context => 'token-keeper hit the pause-floor', created_at => $now });
                 } elsif ($act eq 'pause-auth') {
+                    # LOUD divergence alert (hard requirement): a 4xx on the
+                    # sandbox's OWN refresh is distinct from a routine expiry —
+                    # it means the copied token was rejected / the host & sandbox
+                    # grants diverged, the signal to revisit the copy-token
+                    # architecture. Wording is deliberately DIFFERENT from the
+                    # pause-floor re-login case so it stands out in the
+                    # reporter/dashboard. The graceful pause underneath is
+                    # unchanged (nothing collapses silently).
                     _enter_pause_manual($runs, $log, 'token-auth',
-                        { package => '_fleet', blueprint => $bp, kind => 'reauth',
-                          question => 'OAuth token is un-refreshable (4xx) — re-authenticate with /login.',
-                          context => ($k->{detail} // 'refresh returned a 4xx'), created_at => $now });
+                        { package => '_fleet', blueprint => $bp, kind => 'reauth', alert => 1,
+                          question => "!! ALERT: the sandbox's OWN OAuth refresh was REJECTED (4xx). "
+                                    . "The copied token may be invalid OR the host/sandbox token grants have "
+                                    . "DIVERGED -- REVISIT the copy-token architecture. This is NOT a routine "
+                                    . "/login expiry.",
+                          context => ($k->{detail} // 'the sandbox refresh returned a 4xx'), created_at => $now });
                 } elsif ($act eq 'pause-contract' || $act eq 'pause-creds') {
                     _enter_pause_manual($runs, $log, "keeper-$act",
                         { package => '_fleet', blueprint => $bp, kind => 'contract-drift',

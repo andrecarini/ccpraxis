@@ -22,6 +22,7 @@ use strict;
 use warnings;
 use JSON::PP;
 use Fcntl qw(:flock);
+use Errno qw(EBUSY EXDEV);
 use File::Basename qw(dirname);
 
 my $DIR = dirname(__FILE__);
@@ -39,8 +40,12 @@ sub _read_json { my $f=shift; open my $fh,'<:raw',$f or return undef; local $/; 
 
 # Atomic write-back (the A0-proven implementation). Returns 'ok' or 'stand-down'.
 sub atomic_writeback {
-    my ($path, $resp, $expected_old_refresh, $now_ms) = @_;
+    my ($path, $resp, $expected_old_refresh, $now_ms, $rename_fn) = @_;
     $now_ms //= time * 1000;
+    # The rename step is an INJECTABLE seam (like http_post) so the in-place
+    # fallback below is unit-testable without a real single-file bind mount
+    # (which needs root + Linux). Production passes nothing -> real rename.
+    $rename_fn //= sub { rename($_[0], $_[1]) };
     open my $lock, '>', "$path.lock" or die "lock: $!";
     flock($lock, LOCK_EX) or die "flock: $!";
     my $data = _read_json($path) or die "creds unparseable at write-back";
@@ -59,7 +64,31 @@ sub atomic_writeback {
     my $tmp = "$path.tmp.$$";
     open my $w, '>:raw', $tmp or die "tmp: $!"; print $w $out or die; close $w or die;
     chmod $mode, $tmp;
-    rename $tmp, $path or die "rename: $!";
+    unless ($rename_fn->($tmp, $path)) {
+        # Read errno IMMEDIATELY (any later syscall clobbers $!).
+        my $en = $! + 0;
+        my $es = "$!";
+        # A single-file bind mountpoint (e.g. the legacy pre-Fix-1 sandbox
+        # creds overlay at /root/.claude/.credentials.json) rejects a
+        # rename OVER it with EBUSY (Linux bind) / EXDEV (cross-device).
+        # We still hold the flock here, so fall back to an in-place
+        # truncate+rewrite of the existing file — same fully-formed,
+        # already-validated bytes, no rename. This keeps the keeper able to
+        # persist a refresh even on a single-file-bind target. (On Fix-1
+        # sandboxes the creds are a real file in a dir bind and the rename
+        # path is taken; this is the defense-in-depth branch.)
+        if ($en == EBUSY || $en == EXDEV) {
+            unlink $tmp;
+            open my $ow, '>:raw', $path
+                or die "in-place open $path (after rename $es): $!";
+            print $ow $out or die "in-place write $path: $!";
+            close $ow      or die "in-place close $path: $!";
+            chmod $mode, $path;
+        } else {
+            unlink $tmp;
+            die "rename: $es";
+        }
+    }
     close $lock;
     return 'ok';
 }
@@ -119,8 +148,20 @@ sub keeper_tick {
         return {action=>'backoff'};
     }
     if ($status == 400 || $status == 401 || $status == 403) {
-        _log($log,'token_refresh',{result=>$status, action=>'pause-auth', detail=>'token un-refreshable; needs /login'});
-        return {action=>'pause-auth', detail=>"status $status"};
+        # LOUD DIVERGENCE ALERT (hard requirement). A 4xx on the sandbox's
+        # OWN refresh is NOT a routine expiry — it means the copied token was
+        # rejected: the sandbox's copy may be invalid, or the host and sandbox
+        # token grants have diverged (both refreshing the same grant). This is
+        # the signal to revisit the copy-token architecture. Emit a DISTINCT,
+        # high-visibility event (token_unauthorized + alert=1) — never let this
+        # blend into a quiet pause — and return the detail up to the
+        # orchestrator so the queued needs-you decision can name it unmistakably.
+        my $alert = "ALERT: the sandbox's OWN OAuth refresh was REJECTED (HTTP $status). "
+                  . "The copied token may be invalid OR the host/sandbox token grants have "
+                  . "DIVERGED -- this is NOT a routine /login expiry. Revisit the copy-token "
+                  . "architecture before resuming.";
+        _log($log,'token_unauthorized',{result=>$status, action=>'pause-auth', alert=>1, detail=>$alert});
+        return {action=>'pause-auth', alert=>1, status=>$status, detail=>$alert};
     }
     # 5xx / network / 0 -> transient, back off and retry within the runway
     _log($log,'token_refresh',{result=>$status, action=>'backoff', detail=>'transient error; retry'});

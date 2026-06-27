@@ -22,7 +22,7 @@ runs are safe (resources tagged with `claude-sandbox-test-$$-…`).
 | `02-launcher-bind-mount-shape.t` | Launcher mounts `/root/.claude` from `.ccpraxis-local-data/claude-home` (host bind, not a volume) + single-file bind for `/root/.claude.json`; no `CLAUDE_DATA_VOLUME` residue |
 | `03-claude-json-file-bind.t` | Single-file bind of `.ccpraxis-local-data/claude-home/.claude.json` → `/root/.claude.json` works RW from both sides; mount target is a file, not an auto-created directory |
 | `04-runtime-detection.t` | Same `_detect_container_cli` helper is present in all three scripts (launcher.pl, bootstrap.pl, TestSandbox.pm); the detected CLI responds to `--version` |
-| `06-launcher-ro-protection.t` | `.launcher` RO overlay enforced at kernel mount level (container reads succeed, writes blocked); `.credentials.json` + `.claude.json` single-file binds remain RW |
+| `06-launcher-ro-protection.t` | `.launcher` RO overlay enforced at kernel mount level (container reads succeed, writes blocked); `.credentials.json` is a rename-safe real file in the `claude-home` dir bind (in-place AND atomic temp+rename writes land + persist to the host — proves in-container OAuth refresh works); `.claude.json` single-file bind remains RW |
 | `07-mountspec-volume-vs-bind.t` | `MountSpec::v_to_mount` correctly classifies path-shaped sources as `type=bind` and bare-identifier sources as `type=volume` |
 | `08-launcher-loads-from-any-cwd.t` | Launcher resolves its own path correctly regardless of caller's cwd |
 | `09-no-stdin-after-podman-start.t` | Structural: all user interaction (skill selector, rebuild prompt, backpack approval) is BEFORE `podman start` — keep-alive window doesn't burn on user-think-time |
