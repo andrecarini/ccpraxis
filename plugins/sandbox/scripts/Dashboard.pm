@@ -613,8 +613,9 @@ sub run {
                     my $base = $gather->() || {};
                     %state = %$base;
                     @all_events = @{ $base->{events} || [] };   # chronological
-                    $activity_offset = $#all_events if $activity_offset > $#all_events;
-                    $activity_offset = 0            if $activity_offset < 0;
+                    my $max_off = @all_events ? $#all_events : 0;   # 0 when empty (not -1)
+                    $activity_offset = $max_off if $activity_offset > $max_off;
+                    $activity_offset = 0        if $activity_offset < 0;
                     $last_state = $t;
                     # B5: re-evaluate the wake-lock on the freshly gathered state
                     # (carries busy_age). The launcher's seam owns the decision.

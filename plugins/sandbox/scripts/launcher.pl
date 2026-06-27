@@ -2065,6 +2065,9 @@ sub enter_dashboard {
                         return undef;   # other arrows / CSI: ignore
                     }
                 }
+                # ESC + a non-CSI byte (e.g. Alt+key): surface that byte rather
+                # than dropping it. A lone ESC (k2 undef) falls through as inert.
+                return $k2 if defined $k2;
                 return "\e";
             }
             return $k;
@@ -2168,7 +2171,12 @@ sub _heartbeat_once {
             log_ev('container_gone', { state => $state, container => $CONTAINER_NAME, reason => $reason });
             return 'gone';
         }
-        log_ev('heartbeat_fail', { exit => ($rc >> 8), state => $state, reason => $reason });
+        # $? is a wait status: exit code is >>8, low 7 bits are the signal. A
+        # podman reaped by a signal (host waking from standby kills the WSL2 VM)
+        # has exit 0 but a non-zero signal — log both so the field that exists to
+        # diagnose these wakeup failures isn't misleadingly 0.
+        log_ev('heartbeat_fail', { exit => ($rc >> 8), signal => (($rc & 127) || undef),
+                                   state => $state, reason => $reason });
         return 'fail';
     }
     log_ev('heartbeat', {});

@@ -595,12 +595,24 @@ sub diagnose_verify {
     my $pid = open(my $fh, '-|');
     return '' unless defined $pid;
     if ($pid == 0) {
+        open(STDIN,  '<', '/dev/null');   # a verify that reads stdin gets EOF, not a hang
         open(STDERR, '>&', \*STDOUT);     # merge the xtrace (stderr) into the pipe
         exec('bash', '-xc', $cmd);        # $cmd as a literal arg — no shell-quoting
         CORE::exit(127);
     }
-    my @lines = <$fh>;
+    # Hard cap: a pathological verify must never wedge the install run. On timeout
+    # kill the child and salvage nothing (the verify command itself is still shown).
+    my @lines;
+    eval {
+        local $SIG{ALRM} = sub { die "diag-timeout\n" };
+        alarm 15;
+        @lines = <$fh>;
+        alarm 0;
+    };
+    alarm 0;
+    if ($@) { kill 'KILL', $pid; }
     close $fh;
+    waitpid($pid, 0);
     @lines = @lines[-$max_lines .. -1] if @lines > $max_lines;
     my @out;
     for my $ln (@lines) {
