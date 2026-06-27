@@ -473,6 +473,11 @@ sub cmd_install {
             # failed so they can see and re-run it.
             print STDERR "FAIL: $label — verify after install " . fmt_rc($confirm_rc) . "\n";
             print STDERR "      verify: $t->{verify}\n";
+            my $diag = diagnose_verify($t->{verify});
+            if (length $diag) {
+                print STDERR "      why (bash -x, last lines):\n";
+                print STDERR "$diag\n";
+            }
             $n_failed++;
         }
     }
@@ -573,6 +578,37 @@ sub fmt_rc {
     return "fork failed"      if $rc == -1;
     return "killed by signal" if $rc == -2;
     return "exited $rc";
+}
+
+# diagnose_verify($cmd) -> a short, indented multi-line string showing WHY a
+# verify failed. A verify is usually self-silencing (`… 2>/dev/null | grep -q …`),
+# so the failure prints nothing of its own and the user is left with the command
+# but no clue. Re-run it under `bash -x` with stderr merged into stdout: the
+# xtrace exposes the failing pipeline (e.g. a `head -1 | grep` that a tool's
+# first-run banner defeats) and any tool output that slips past the suppression.
+# Bounded to the last few lines. Read-only: verifies are existence/version checks,
+# safe to run twice. Runs in-container (Linux), where fork-pipe + bash -x exist.
+sub diagnose_verify {
+    my ($cmd) = @_;
+    my $max_lines = 12;
+    my $max_cols  = 200;
+    my $pid = open(my $fh, '-|');
+    return '' unless defined $pid;
+    if ($pid == 0) {
+        open(STDERR, '>&', \*STDOUT);     # merge the xtrace (stderr) into the pipe
+        exec('bash', '-xc', $cmd);        # $cmd as a literal arg — no shell-quoting
+        CORE::exit(127);
+    }
+    my @lines = <$fh>;
+    close $fh;
+    @lines = @lines[-$max_lines .. -1] if @lines > $max_lines;
+    my @out;
+    for my $ln (@lines) {
+        chomp $ln;
+        $ln = substr($ln, 0, $max_cols) . '...' if length($ln) > $max_cols;
+        push @out, "        $ln";
+    }
+    return @out ? join("\n", @out) : '';
 }
 
 sub cmd_help {
