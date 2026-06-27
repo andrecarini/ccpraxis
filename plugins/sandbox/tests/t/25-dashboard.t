@@ -178,6 +178,38 @@ my %st = (
     like(Dashboard::sgr_for_role('alert'), qr/\e\[1;37;41m/, 'sgr: alert role -> bold white on red');
 }
 
+# (E) container-status alert banner: a non-running / unreachable / gone container
+# surfaces a loud, actionable banner (the loop no longer exits on death).
+{
+    is(Dashboard::_status_alert({ status => 'running' }), undef,
+       'status_alert: running -> no alert');
+    is(Dashboard::_status_alert({ status => '' }), undef,
+       'status_alert: empty/unknown-yet -> no alert');
+    like(Dashboard::_status_alert({ status => 'exited' }), qr/not running/,
+       'status_alert: exited -> "not running"');
+    like(Dashboard::_status_alert({ status => 'unknown' }), qr/unreachable/,
+       'status_alert: unknown -> "unreachable"');
+    like(Dashboard::_status_alert({ container_gone => 1, status => 'exited' }), qr/not running/,
+       'status_alert: container_gone+exited -> "not running"');
+    like(Dashboard::_status_alert({ container_gone => 1, status => 'unknown' }), qr/unreachable/,
+       'status_alert: container_gone+unknown -> "unreachable"');
+
+    my %dead = (%st, status => 'exited');
+    my $f = Dashboard::compose_frame(\%dead, 12, 80);
+    my @a = grep { $_->{role} eq 'alert' } @$f;
+    is(scalar(@a), 1, 'compose: non-running status -> one alert row');
+    like($f->[1]{text}, qr/not running/, 'compose: status alert sits under the title');
+    is(scalar(@$f), 12, 'compose: status alert keeps the frame exactly $rows');
+
+    # a status alert AND an install_warning coexist as two banners, body intact
+    my %both = (%st, status => 'exited', install_warning => 'backpack install FAILED');
+    my $f2 = Dashboard::compose_frame(\%both, 12, 80);
+    is(scalar(grep { $_->{role} eq 'alert' } @$f2), 2, 'compose: status + install alerts coexist');
+    is(scalar(@$f2), 12, 'compose: two alerts keep the frame exactly $rows');
+    my $bad = grep { length($_->{text}) != 80 } @$f2;
+    is($bad, 0, 'compose: alert rows keep exactly $cols');
+}
+
 # C3 regression: a non-ASCII project name must NOT break the exactly-$cols
 # width invariant (bytes outside printable ASCII map 1:1 to '?').
 {
@@ -336,7 +368,29 @@ my %st = (
     is_deeply([Dashboard::dispatch_key('n', 'shutdown')], ['cancel-shutdown', ''],
         'key: any non-y while pending -> cancel');
     is_deeply([Dashboard::dispatch_key('x', '')],   ['', ''],         'key: unknown -> inert');
-    is_deeply([Dashboard::dispatch_key("\e", '')],  ['', ''],         'key: ESC -> inert (arrows ignored)');
+    is_deeply([Dashboard::dispatch_key("\e", '')],  ['', ''],         'key: lone ESC -> inert');
+    is_deeply([Dashboard::dispatch_key('UP', '')],   ['scroll-up', ''],   'key: UP -> scroll-up');
+    is_deeply([Dashboard::dispatch_key('DOWN', '')], ['scroll-down', ''], 'key: DOWN -> scroll-down');
+    is_deeply([Dashboard::dispatch_key('k', '')],    ['scroll-up', ''],   'key: k -> scroll-up (alias)');
+    is_deeply([Dashboard::dispatch_key('j', '')],    ['scroll-down', ''], 'key: j -> scroll-down (alias)');
+    # scroll keys must not disturb a pending shutdown confirm (any key cancels)
+    is_deeply([Dashboard::dispatch_key('DOWN', 'shutdown')], ['cancel-shutdown', ''],
+        'key: arrow while shutdown-pending still cancels');
+}
+
+# activity_view: newest-first + up/down scroll window
+{
+    my $chrono = ['a', 'b', 'c', 'd'];   # oldest -> newest
+    is_deeply(Dashboard::activity_view($chrono, 0), ['d','c','b','a'],
+        'activity: offset 0 -> newest-first, full list');
+    is_deeply(Dashboard::activity_view($chrono, 1), ['c','b','a'],
+        'activity: offset 1 -> newest scrolled off the top');
+    is_deeply(Dashboard::activity_view($chrono, 3), ['a'],
+        'activity: offset at last -> oldest only');
+    is_deeply(Dashboard::activity_view($chrono, 99), ['a'],
+        'activity: offset clamps past the end');
+    is_deeply(Dashboard::activity_view([], 0), [],
+        'activity: empty list -> empty view');
 }
 
 # ===========================================================================
@@ -430,8 +484,8 @@ sub drive {
         now            => sub { $clock },
         sleep_for      => sub { $clock += $_[0]; },     # advance the fake clock
         read_key       => sub { @keys ? shift @keys : undef },
-        term_size      => sub { (60, 12) },
-        gather         => sub { $eff{gathers}++; { project_name => 'demo', container => 'c1', status => 'running', events => [], busy_age => $args{busy_age} } },
+        term_size      => sub { ($args{cols} // 60, $args{rows} // 12) },
+        gather         => sub { $eff{gathers}++; { project_name => 'demo', container => 'c1', status => ($args{status} // 'running'), events => ($args{events} // []), busy_age => $args{busy_age} } },
         heartbeat      => sub { $eff{heartbeats}++; $args{hb_returns} ? $args{hb_returns}->() : 'ok' },
         spawn          => sub { $eff{spawns}++; undef },
         write_signals  => sub { $eff{signals}++; 1 },
@@ -470,11 +524,35 @@ sub drive {
 }
 
 {
-    # container 'gone' from the heartbeat ends the loop.
-    my $e = drive(keys => [(undef) x 30], hb_returns => sub { 'gone' }, max_ticks => 50);
-    is($e->{heartbeats}, 1, 'loop: a single heartbeat reporting "gone" ...');
-    is($e->{spawns}, 0, '... ends the loop before any further work');
-    is($e->{left}, 1, 'loop: still restores the terminal on container-gone exit');
+    # (E) container 'gone' from the heartbeat must NOT end the loop — the
+    # dashboard stays open so the user can see the dead state and relaunch/quit.
+    my $e = drive(keys => [(undef) x 30], hb_returns => sub { 'gone' },
+                  status => 'exited', beat_interval => 1, max_ticks => 8);
+    ok($e->{heartbeats} >= 2, 'loop: keeps heartbeating after "gone" (does not exit early)');
+    is($e->{rc}, 0, 'loop: runs to max_ticks rather than a gone-exit');
+    like($e->{out}, qr/not running|unreachable/, 'loop: surfaces a container-dead alert');
+    is($e->{left}, 1, 'loop: restores the terminal exactly once at the end');
+}
+
+{
+    # (D) [r] forces a FULL repaint (blank \e[2J + redraw). The first frame is
+    # always a full clear; refresh produces a SECOND one.
+    my $e = drive(keys => [undef, 'r', undef, 'q'], max_ticks => 50);
+    my $clears = () = ($e->{out} =~ /\e\[2J/g);
+    ok($clears >= 2, 'loop: refresh triggers an extra full-screen clear (hard refresh)');
+}
+
+{
+    # Activity: newest-first, and DOWN/q scrolls without crashing (a tall enough
+    # terminal so the Activity panel renders under the Sandbox/Run panels). The
+    # newest-first + offset correctness itself is covered by activity_view tests.
+    my @evs = ('10:00:01  launch_start', '10:00:02  container_start', '10:00:03  manager_ready');
+    my $top = drive(keys => ['q'], events => \@evs, rows => 30, max_ticks => 50);
+    like($top->{out}, qr/manager_ready/, 'activity: newest event is rendered');
+
+    my $scrolled = drive(keys => ['DOWN', 'DOWN', undef, 'q'], events => \@evs, rows => 30, max_ticks => 50);
+    is($scrolled->{rc}, 0, 'activity: DOWN scrolling runs cleanly to quit');
+    like($scrolled->{out}, qr/launch_start/, 'activity: events still render while scrolling');
 }
 
 {

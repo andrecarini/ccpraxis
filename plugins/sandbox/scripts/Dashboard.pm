@@ -210,7 +210,7 @@ sub _footer_line {
     my $pending = defined $s->{pending} ? $s->{pending} : '';
     my $legend = $pending eq 'shutdown'
         ? 'Shut down ALL coordinators in this project? [y] confirm   [any other] cancel'
-        : ' [c] launch claude   [s] shutdown-all   [r] refresh   [q] quit';
+        : ' [c] launch   [s] shutdown-all   [up/down] scroll   [r] refresh   [q] quit';
     return clip_pad($legend, $cols);
 }
 
@@ -220,6 +220,29 @@ sub _footer_line {
 sub _alert_line {
     my ($msg, $cols) = @_;
     return clip_pad('  !! ' . _safe(defined $msg ? $msg : ''), $cols);
+}
+
+# _status_alert(\%state) -> a one-line banner string when the container is no
+# longer running or no longer reachable, else undef. This drives the "dashboard
+# stays open after the container dies" behavior: the loop no longer exits on
+# container death, so this makes the dead/unreachable state loud and tells the
+# user what to do. 'unknown' = inspect couldn't read the container (podman down
+# or the host slept); empty/running/created/restarting are healthy-or-transient
+# and stay quiet.
+sub _status_alert {
+    my ($s) = @_;
+    $s ||= {};
+    my $st = defined $s->{status} ? lc $s->{status} : '';
+    if ($s->{container_gone}) {
+        return ($st && $st ne 'unknown')
+            ? "container is not running ($st) - press [c] to relaunch or [q] to quit"
+            : 'container unreachable - press [r] to retry, [c] to relaunch, or [q] to quit';
+    }
+    return undef if $st eq '' || $st eq '?' || $st eq 'running'
+                 || $st eq 'created' || $st eq 'restarting';
+    return 'container unreachable (podman down or host asleep) - [r] retry, [q] quit'
+        if $st eq 'unknown';
+    return "container is $st (not running) - press [c] to relaunch or [q] to quit";
 }
 
 sub _panel_title_line {
@@ -273,16 +296,20 @@ sub compose_frame {
         return \@frame;
     }
 
-    # Optional alert banner directly under the title (e.g. backpack install
-    # failures). Needs room for title + alert + >=1 body + footer, so only when
-    # rows >= 4 — a tiny terminal silently drops it rather than crowding out the
-    # body. The launcher surfaces this where the pre-dashboard stdout warning
-    # would otherwise be wiped by the alt-screen.
-    my @alert;
-    my $warn = $state->{install_warning};
-    if (defined $warn && length $warn && $rows >= 4) {
-        push @alert, { text => _alert_line($warn, $cols), role => 'alert' };
+    # Optional alert banner(s) directly under the title: a container that is no
+    # longer running / reachable (so the dashboard staying open after a container
+    # death is obvious and actionable) and/or a backpack-install failure. Each
+    # needs room for title + alert + >=1 body + footer; on a tiny terminal we
+    # drop the lowest-priority alerts (install_warning first) rather than crowd
+    # out the body. The launcher surfaces these where a pre-dashboard stdout
+    # warning would otherwise be wiped by the alt-screen.
+    my @msgs = grep { defined && length } (_status_alert($state), $state->{install_warning});
+    my $max_alert = $rows - 3;          # leave title + >=1 body + footer
+    $max_alert = 0 if $max_alert < 0;
+    if (@msgs > $max_alert) {           # drop lowest-priority alerts only when over budget
+        @msgs = $max_alert > 0 ? @msgs[0 .. $max_alert - 1] : ();
     }
+    my @alert = map { { text => _alert_line($_, $cols), role => 'alert' } } @msgs;
 
     my $body_h = $rows - 2 - scalar(@alert);
     my @body = _body_rows($state, $cols, $body_h);
@@ -362,6 +389,10 @@ sub dispatch_key {
     return ('confirm-shutdown', 'shutdown') if $key =~ /^[sS]$/;
     return ('refresh', '')            if $key =~ /^[rR]$/;
     return ('quit', '')               if $key =~ /^[qQ]$/;
+    # Up/down scroll the Activity panel. The read-key seam assembles the arrow
+    # escape sequences into the 'UP'/'DOWN' tokens (also accept k/j as aliases).
+    return ('scroll-up', $pending)    if $key eq 'UP'   || $key eq 'k';
+    return ('scroll-down', $pending)  if $key eq 'DOWN' || $key eq 'j';
     return ('', $pending);
 }
 
@@ -455,6 +486,21 @@ sub recent_events {
     return \@last;
 }
 
+# activity_view(\@events_chrono, $offset) -> the events to DISPLAY in the Activity
+# panel, NEWEST-FIRST (descending), starting $offset items down from the newest.
+# $offset is the up/down scroll position (0 = newest at top); it's clamped to
+# [0, last index] so scrolling can't run off either end. Pure / unit-tested; the
+# loop keeps the offset and feeds the result to the panel each frame.
+sub activity_view {
+    my ($events, $offset) = @_;
+    $events ||= [];
+    my @desc = reverse @$events;
+    return [] unless @desc;
+    $offset = 0       if !defined $offset || $offset < 0;
+    $offset = $#desc  if $offset > $#desc;
+    return [ @desc[$offset .. $#desc] ];
+}
+
 # blueprint_runs_dirs($data_root) -> the runs/ dir of every blueprint under
 # $data_root/blueprints/. opendir (not glob) — safe for spaces / André paths.
 sub blueprint_runs_dirs {
@@ -536,6 +582,9 @@ sub run {
     my $prev;
     my %state;
     my $pending = '';
+    my $hb_state = 'ok';        # last heartbeat result; 'gone' no longer exits the loop
+    my @all_events;             # full chronological event list from the last gather
+    my $activity_offset = 0;    # up/down scroll position in the Activity panel
     my $rc = 0;
     my $ticks = 0;
 
@@ -551,7 +600,11 @@ sub run {
                 if ($t - $last_beat >= $beat_int) {
                     my $hb = $heartbeat->();
                     $last_beat = $t;
-                    if (defined $hb && $hb eq 'gone') { $rc = 0; last; }
+                    # (E) Do NOT exit when the container is gone/unreachable. Keep
+                    # the dashboard open so the user can see the dead state and
+                    # relaunch ([c]) or quit ([q]) — surfaced as a status alert.
+                    # Keep heartbeating: a relaunched container recovers on its own.
+                    $hb_state = $hb if defined $hb;
                 }
 
                 # state refresh (slower cadence than input polling)
@@ -559,14 +612,20 @@ sub run {
                     ($cols, $rows) = $term_size->();
                     my $base = $gather->() || {};
                     %state = %$base;
+                    @all_events = @{ $base->{events} || [] };   # chronological
+                    $activity_offset = $#all_events if $activity_offset > $#all_events;
+                    $activity_offset = 0            if $activity_offset < 0;
                     $last_state = $t;
                     # B5: re-evaluate the wake-lock on the freshly gathered state
                     # (carries busy_age). The launcher's seam owns the decision.
                     $keepawake->(\%state);
                 }
-                $state{beat_age} = $t - $last_beat;
-                $state{uptime}   = $t - $start;
-                $state{pending}  = $pending;
+                $state{beat_age}       = $t - $last_beat;
+                $state{uptime}         = $t - $start;
+                $state{pending}        = $pending;
+                $state{container_gone} = ($hb_state eq 'gone') ? 1 : 0;
+                # Activity newest-first, windowed at the up/down scroll offset.
+                $state{events}         = activity_view(\@all_events, $activity_offset);
 
                 my $frame = compose_frame(\%state, $rows, $cols);
                 $out->(render_frame($prev, $frame, { color => $color }));
@@ -586,7 +645,16 @@ sub run {
                         $write_sig->();
                     }
                     elsif ($action eq 'refresh') {
-                        $last_state = undef;   # force a gather next tick
+                        $last_state      = undef;   # force a gather next tick
+                        $prev            = undef;   # (D) force a FULL repaint: blank
+                                                    # (\e[2J) then redraw every row fresh
+                        $activity_offset = 0;       # back to the newest events
+                    }
+                    elsif ($action eq 'scroll-up') {
+                        $activity_offset-- if $activity_offset > 0;
+                    }
+                    elsif ($action eq 'scroll-down') {
+                        $activity_offset++ if $activity_offset < $#all_events;
                     }
                     # confirm-shutdown / cancel-shutdown only toggle $pending
                 }

@@ -2044,7 +2044,31 @@ sub enter_dashboard {
             eval { Term::ReadKey::ReadMode('restore') };
             reset_terminal();
         },
-        read_key  => sub { Term::ReadKey::ReadKey(-1) },
+        read_key  => sub {
+            my $k = Term::ReadKey::ReadKey(-1);   # non-blocking poll
+            return undef unless defined $k;
+            if ($k eq "\e") {
+                # Assemble an arrow escape sequence into a token the dashboard
+                # understands: UP/DOWN scroll the Activity panel. A lone ESC (no
+                # following bytes) falls through as "\e" (inert in dispatch_key).
+                my $k2 = Term::ReadKey::ReadKey(0.02);
+                if (defined $k2 && ($k2 eq '[' || $k2 eq 'O')) {
+                    my $k3 = Term::ReadKey::ReadKey(0.02);
+                    if (defined $k3) {
+                        return 'UP'   if $k3 eq 'A';
+                        return 'DOWN' if $k3 eq 'B';
+                        if ($k3 =~ /[0-9]/) {   # drain a numeric CSI (e.g. \e[5~)
+                            while (defined(my $d = Term::ReadKey::ReadKey(0.01))) {
+                                last if $d !~ /[0-9;]/;
+                            }
+                        }
+                        return undef;   # other arrows / CSI: ignore
+                    }
+                }
+                return "\e";
+            }
+            return $k;
+        },
         term_size => sub {
             my @s = eval { Term::ReadKey::GetTerminalSize() };
             my $cols = (@s && $s[0]) ? $s[0] : 80;
@@ -2125,20 +2149,42 @@ sub enter_dashboard {
 # 'ok' | 'fail' | 'gone' (the dashboard ends its loop on 'gone'). Shared by
 # the TUI seam and the plain loop so the container-gone detection lives once.
 sub _heartbeat_once {
-    my $rc = system($PODMAN, 'exec', $CONTAINER_NAME, 'touch', '/tmp/.launcher-alive');
+    # CAPTURE (don't inherit) podman's stderr. When the podman machine SSH
+    # connection drops — e.g. the host enters Modern Standby and the WSL2 VM is
+    # suspended — `podman exec` prints a multi-line "Cannot connect to Podman …
+    # wsarecv: An existing connection was forcibly closed …" error. With the
+    # dashboard on the alt-screen, an inherited STDERR would splatter that text
+    # across the live frame (the corruption André saw). Backticks + 2>&1 keep it
+    # off-screen (MSYS2_ARG_CONV_EXCL=* is set, so the /tmp path passes through),
+    # and the captured reason is surfaced in the launch log instead.
+    my $out = `$PODMAN exec "$CONTAINER_NAME" touch /tmp/.launcher-alive 2>&1`;
+    my $rc  = $?;
     if ($rc != 0) {
         my $state = `$PODMAN inspect --format '{{.State.Status}}' "$CONTAINER_NAME" 2>/dev/null`;
         chomp $state if defined $state;
         $state //= '';
+        my $reason = _trim_err($out);
         if ($state ne 'running') {
-            log_ev('container_gone', { state => $state, container => $CONTAINER_NAME });
+            log_ev('container_gone', { state => $state, container => $CONTAINER_NAME, reason => $reason });
             return 'gone';
         }
-        log_ev('heartbeat_fail', { exit => $rc >> 8, state => $state });
+        log_ev('heartbeat_fail', { exit => ($rc >> 8), state => $state, reason => $reason });
         return 'fail';
     }
     log_ev('heartbeat', {});
     return 'ok';
+}
+
+# _trim_err($s) -> $s collapsed to a single, bounded line for a log field: fold
+# whitespace/newlines to single spaces, strip ends, cap length. Keeps a captured
+# multi-line podman error readable as one JSON log value.
+sub _trim_err {
+    my ($s) = @_;
+    return '' unless defined $s;
+    $s =~ s/\s+/ /g;
+    $s =~ s/^\s+|\s+$//g;
+    $s = substr($s, 0, 300) . '...' if length($s) > 300;
+    return $s;
 }
 
 # ---------------------------------------------------------------------
