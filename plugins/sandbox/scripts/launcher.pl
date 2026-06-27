@@ -50,6 +50,7 @@ use Dashboard ();   # B2: the raw-ANSI TUI dashboard framework
 use BackpackApproval ();  # #21: per-item, machine-local backpack approval memory
 use BackpackReview ();    # #21: the I/O-seam-injected interactive approval walk
 use KeepAwake ();         # B5: dashboard wake-lock decision + lifecycle holder
+use ConnectorHold ();     # Fix 3: hold-the-window decision when a connector loses the container
 use JSON::PP ();          # parse backpack.json + write the approved install-set
 use File::Path qw(make_path);
 use File::Spec;
@@ -791,6 +792,15 @@ my $CONTAINER_NAME;
                    @SESSION_FLAGS);
         my $rc = run_claude(@cmd);
         reset_terminal();
+        # Fix 3: distinguish a clean user quit from a LOST container (the podman
+        # engine or the container died mid-session, dropping the exec). On a
+        # loss, hold this window open with an explanation instead of letting the
+        # Windows Terminal tab vanish — the conversation is safe on disk, but the
+        # user otherwise loses the window with no idea why.
+        if (ConnectorHold::should_hold_window($rc, container_status($CONTAINER_NAME))) {
+            print ConnectorHold::lost_message($CONTAINER_NAME);
+            hold_for_keypress();
+        }
         exit $rc;
     }
 
@@ -1666,6 +1676,36 @@ sub run_claude {
     my @cmd = @_;
     my $rc = system(@cmd);
     return $rc >> 8;
+}
+
+# Current podman/docker container state ('running','exited','stopped', or ''
+# when `inspect` finds no such container — it was removed). Mirrors the inline
+# `inspect --format {{.State.Status}}` idiom used elsewhere in this file.
+sub container_status {
+    my $name = shift;
+    my $s = `$PODMAN inspect --format '{{.State.Status}}' "$name" 2>/dev/null`;
+    chomp $s if defined $s;
+    return defined $s ? $s : '';
+}
+
+# Fix 3: block until the user presses a key, so a held-open connector window
+# (Windows Terminal tab) stays visible until the user reads the diagnostic and
+# dismisses it. Prefer a single keypress via Term::ReadKey; degrade to a line
+# read (Enter) when it's unavailable or stdin isn't a TTY.
+sub hold_for_keypress {
+    local $| = 1;
+    print "  Press any key to close this window...";
+    if ($READKEY_OK) {
+        eval {
+            Term::ReadKey::ReadMode('cbreak');
+            Term::ReadKey::ReadKey(0);   # block for one key
+            1;
+        };
+        eval { Term::ReadKey::ReadMode('restore') };
+    } else {
+        my $ignore = <STDIN>;            # press Enter
+    }
+    print "\n";
 }
 
 # =====================================================================

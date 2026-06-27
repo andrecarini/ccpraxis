@@ -33,6 +33,7 @@ runs are safe (resources tagged with `claude-sandbox-test-$$-…`).
 | `18-multi-session-shared-state.t` | Two concurrent claudes in the same container, sharing `/root/.claude` via bind mount, write to per-session paths without corruption; host filesystem reflects both in real time |
 | `21-select-session-multiple.t` | Picker correctly handles multiple sessions; ordering + numbering stable |
 | `22-mountspec-edge-cases.t` | `MountSpec::v_to_mount` handles drive-letter sources, `:ro` options, paths with embedded `:` |
+| `30-connector-hold.t` | `ConnectorHold::should_hold_window` holds a connector's Windows Terminal tab open ONLY on a lost container (nonzero exit + not running), never on a clean quit or a claude error while the container lives; `lost_message` names the container + tells the user the conversation is safe and how to resume |
 
 ## Requirements
 
