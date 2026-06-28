@@ -570,4 +570,81 @@ sub drive {
     is($e2->{signals}, 0, 'loop: s,n -> shutdown cancelled (no signal)');
 }
 
+# ===========================================================================
+# PART 9 — scroll fix: capacity, windowing, overflow hint, drain coalescing
+# ===========================================================================
+
+# _scroll_hint: ASCII-only (no unicode arrows — the renderer maps non-ASCII to ?)
+is(Dashboard::_scroll_hint(0, 5), 'v 5 more below', 'hint: only-below shows v');
+is(Dashboard::_scroll_hint(3, 0), '^ 3 more above', 'hint: only-above shows ^');
+is(Dashboard::_scroll_hint(2, 4), '^ 2 more above    v 4 more below', 'hint: both directions');
+is(Dashboard::_scroll_hint(0, 0), undef, 'hint: nothing hidden -> undef');
+unlike(Dashboard::_scroll_hint(1, 1), qr/[^\x20-\x7E]/, 'hint: pure ASCII (width-safe)');
+
+# activity_capacity: mirrors compose_frame's budget (deterministic for %st).
+# %st has Sandbox(4 lines)+Run(3 lines) fixed = (1+4+1)+(1+3+1)=11; body=rows-2.
+is(Dashboard::activity_capacity(\%st, 24, 80), 10, 'capacity: 24 rows, no alert -> 10 event rows');
+is(Dashboard::activity_capacity({ %st, status => 'exited' }, 24, 80), 9,
+   'capacity: a status alert costs one row');
+is(Dashboard::activity_capacity(\%st, 12, 80), 0,
+   'capacity: too short for the fixed panels -> 0 (no negative)');
+
+# activity_window: fits / overflow / scroll / clamp.
+my @D = ('e5','e4','e3','e2','e1');   # newest-first (already descending)
+{
+    my $w = Dashboard::activity_window(\@D, 0, 10);
+    is_deeply($w->{lines}, \@D, 'window: everything fits -> all shown');
+    is($w->{hint}, undef,       'window: fits -> no hint');
+    is($w->{max_offset}, 0,     'window: fits -> max_offset 0 (no scroll)');
+}
+{
+    my $w = Dashboard::activity_window(\@D, 0, 3);   # cap 3 -> visible 2 + hint
+    is_deeply($w->{lines}, ['e5','e4'], 'window: overflow at top shows newest page');
+    is($w->{hint}{text}, 'v 3 more below', 'window: top -> below-only hint');
+    is($w->{hint}{role}, 'scrollhint',     'window: hint row is dim (scrollhint role)');
+    is($w->{max_offset}, 3, 'window: max_offset = total - visible');
+}
+{
+    my $w = Dashboard::activity_window(\@D, 1, 3);
+    is_deeply($w->{lines}, ['e4','e3'], 'window: scrolled one down');
+    is($w->{hint}{text}, '^ 1 more above    v 2 more below', 'window: middle -> both hints');
+}
+{
+    my $w = Dashboard::activity_window(\@D, 99, 3);  # past the end -> clamp
+    is($w->{offset}, 3, 'window: offset clamped to max_offset (no scrolling past end)');
+    is_deeply($w->{lines}, ['e2','e1'], 'window: clamped view = the oldest page');
+    is($w->{hint}{text}, '^ 3 more above', 'window: at the end -> above-only hint');
+}
+is_deeply(Dashboard::activity_window([], 0, 5)->{lines}, [], 'window: empty -> empty');
+is_deeply(Dashboard::activity_window(\@D, 0, 0)->{lines}, [], 'window: zero capacity -> empty');
+
+is(Dashboard::sgr_for_role('scrollhint'), "\e[2m", 'sgr: scrollhint -> dim (\e[2m, like the footer)');
+
+{
+    # The loop puts windowed event lines + a { text, role => scrollhint } hint
+    # into state.events; compose_frame + render must carry that row through DIM
+    # (the per-line-role plumbing). The windowing that PRODUCES the hint is
+    # covered by activity_window above; the loop integration by the drain test.
+    my %ov = (%st, events => [ 'evt-newest', { text => 'v 7 more below', role => 'scrollhint' } ]);
+    my $f = Dashboard::compose_frame(\%ov, 24, 80);
+    my ($hint) = grep { $_->{role} eq 'scrollhint' } @$f;
+    ok($hint, 'compose: a scrollhint line in events renders as a scrollhint row');
+    like($hint->{text}, qr/more below/, 'compose: the hint text is carried through');
+    is(scalar(grep { length($_->{text}) != 80 } @$f), 0, 'compose: hint row keeps rows exactly $cols');
+    my $rendered = Dashboard::render_frame(undef, $f, { color => 1 });
+    like($rendered, qr/\e\[2m.*more below/, 'render: the hint row is emitted dim');
+}
+
+{
+    # DRAIN coalescing: three DOWN keys in ONE tick advance the offset by three
+    # (not one-per-tick). With 20 events on a 24-row terminal (capacity 10) the
+    # list overflows, so after 3 DOWNs the panel shows "3 more above".
+    my @evs = map { "evt$_" } (1 .. 20);
+    my $e = drive(keys => ['DOWN','DOWN','DOWN', undef, 'q'],
+                  events => \@evs, rows => 24, max_ticks => 50);
+    is($e->{rc}, 0, 'drain: scrolls then quits cleanly');
+    like($e->{out}, qr/3 more above/,
+         'drain: 3 DOWNs in one tick coalesce -> offset advanced by 3');
+}
+
 done_testing();

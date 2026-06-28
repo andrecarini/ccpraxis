@@ -123,11 +123,10 @@ sub _justify {
     return clip_pad($left, $w);
 }
 
-# build_panels(\%state) -> ordered list of { title => str, lines => [str,...] }.
-# THE extension point: B3 adds container/heartbeat/busy/needs-you panels, B4 the
-# backpack panel, simply by appending here. B2 ships a minimal Sandbox panel +
-# an Activity panel (proving the B1 launch-log event stream is read).
-sub build_panels {
+# _fixed_panels(\%state) -> the panels ABOVE the scrollable Activity panel
+# (Sandbox, Run, Backpack). Split out so activity_capacity can measure their
+# total height to compute how many event rows the Activity panel has left.
+sub _fixed_panels {
     my ($s) = @_;
     $s ||= {};
     my @p;
@@ -160,11 +159,21 @@ sub build_panels {
     if (ref $s->{backpack} eq 'HASH') {
         push @p, { title => 'Backpack', lines => [ _backpack_lines($s->{backpack}) ] };
     }
+    return @p;
+}
 
+# build_panels(\%state) -> ordered list of { title => str, lines => [line,...] },
+# where a line is a plain string OR { text, role } (the Activity panel's scroll
+# hint uses the latter to render dim). The Activity panel is always LAST (the
+# scrollable, height-flexible one); the loop fills state.events with the
+# already-windowed lines + optional hint (see activity_window).
+sub build_panels {
+    my ($s) = @_;
+    $s ||= {};
+    my @p = _fixed_panels($s);
     my $ev = (ref $s->{events} eq 'ARRAY') ? $s->{events} : [];
     push @p, { title => 'Recent activity',
                lines => (@$ev ? [@$ev] : ['(no events yet)']) };
-
     return @p;
 }
 
@@ -264,7 +273,11 @@ sub _body_rows {
         push @out, { text => _panel_title_line($p->{title}, $cols), role => 'panel-title' };
         for my $ln (@{ $p->{lines} || [] }) {
             last if @out >= $maxh;
-            push @out, { text => clip_pad('  ' . _safe($ln), $cols), role => 'body' };
+            # A line is a plain string (role 'body') or { text, role } — the
+            # latter lets the Activity panel render its scroll hint dim.
+            my ($txt, $role) = ref $ln eq 'HASH'
+                ? ($ln->{text}, $ln->{role} // 'body') : ($ln, 'body');
+            push @out, { text => clip_pad('  ' . _safe($txt), $cols), role => $role };
         }
         push @out, { text => clip_pad('', $cols), role => 'blank' } if @out < $maxh;
     }
@@ -303,12 +316,7 @@ sub compose_frame {
     # drop the lowest-priority alerts (install_warning first) rather than crowd
     # out the body. The launcher surfaces these where a pre-dashboard stdout
     # warning would otherwise be wiped by the alt-screen.
-    my @msgs = grep { defined && length } (_status_alert($state), $state->{install_warning});
-    my $max_alert = $rows - 3;          # leave title + >=1 body + footer
-    $max_alert = 0 if $max_alert < 0;
-    if (@msgs > $max_alert) {           # drop lowest-priority alerts only when over budget
-        @msgs = $max_alert > 0 ? @msgs[0 .. $max_alert - 1] : ();
-    }
+    my @msgs = _alert_msgs($state, $rows);
     my @alert = map { { text => _alert_line($_, $cols), role => 'alert' } } @msgs;
 
     my $body_h = $rows - 2 - scalar(@alert);
@@ -330,6 +338,7 @@ sub sgr_for_role {
     return "\e[2m"        if $role eq 'footer';       # dim
     return "\e[1;33;41m"  if $role eq 'footer-alert'; # bold yellow on red
     return "\e[1;37;41m"  if $role eq 'alert';        # bold white on red (banner)
+    return "\e[2m"        if $role eq 'scrollhint';   # dim — like the footer command row
     return '';
 }
 
@@ -490,7 +499,8 @@ sub recent_events {
 # panel, NEWEST-FIRST (descending), starting $offset items down from the newest.
 # $offset is the up/down scroll position (0 = newest at top); it's clamped to
 # [0, last index] so scrolling can't run off either end. Pure / unit-tested; the
-# loop keeps the offset and feeds the result to the panel each frame.
+# loop keeps the offset and feeds the result to the panel each frame. (Retained;
+# activity_window is the capacity-aware successor used by the loop.)
 sub activity_view {
     my ($events, $offset) = @_;
     $events ||= [];
@@ -499,6 +509,93 @@ sub activity_view {
     $offset = 0       if !defined $offset || $offset < 0;
     $offset = $#desc  if $offset > $#desc;
     return [ @desc[$offset .. $#desc] ];
+}
+
+# _alert_msgs(\%state, $rows) -> the (priority-capped) alert banner messages a
+# frame will show: the container-status alert and/or the backpack-install
+# warning, trimmed so they never crowd out title + >=1 body + footer. Factored
+# out of compose_frame so activity_capacity can subtract the same alert rows.
+sub _alert_msgs {
+    my ($state, $rows) = @_;
+    $state ||= {};
+    my @msgs = grep { defined && length } (_status_alert($state), $state->{install_warning});
+    my $max_alert = (defined $rows ? $rows : 0) - 3;   # title + >=1 body + footer
+    $max_alert = 0 if $max_alert < 0;
+    if (@msgs > $max_alert) {
+        @msgs = $max_alert > 0 ? @msgs[0 .. $max_alert - 1] : ();
+    }
+    return @msgs;
+}
+
+# activity_capacity(\%state, $rows, $cols) -> how many EVENT rows the Activity
+# panel has room for, mirroring compose_frame's budget: total rows minus the
+# title + footer + alert banners + the fixed panels (each title + lines + blank)
+# + the Activity panel's own title. Used by the loop to clamp the scroll offset
+# and to window the events (so scrolling can't run off the end, and the overflow
+# hint reserves a row). Returns >= 0.
+sub activity_capacity {
+    my ($state, $rows, $cols) = @_;
+    $state ||= {};
+    $rows = 0 if !defined $rows || $rows < 0;
+    my $alerts = scalar(_alert_msgs($state, $rows));
+    my $body_h = $rows - 2 - $alerts;             # 2 = title + footer
+    my $fixed  = 0;
+    for my $p (_fixed_panels($state)) {
+        $fixed += 1 + scalar(@{ $p->{lines} || [] }) + 1;   # title + lines + blank
+    }
+    my $cap = $body_h - $fixed - 1;               # -1 = Activity panel title
+    return $cap > 0 ? $cap : 0;
+}
+
+# _scroll_hint($above, $below) -> a dim, ASCII-only overflow indicator string, or
+# undef when nothing is hidden. ASCII only because the renderer maps any
+# non-ASCII byte to '?' (the width invariant), so no unicode arrows.
+sub _scroll_hint {
+    my ($above, $below) = @_;
+    my @bits;
+    push @bits, "^ $above more above" if $above && $above > 0;
+    push @bits, "v $below more below" if $below && $below > 0;
+    return @bits ? join('    ', @bits) : undef;
+}
+
+# activity_window(\@events_desc, $offset, $capacity) -> the Activity panel's view:
+#   { lines => [event strings, newest-first], hint => undef|{text,role=>scrollhint},
+#     offset => clamped scroll position, max_offset => clamp ceiling }
+# When the events fit in $capacity there's no scroll and no hint. When they
+# overflow, one row is reserved for a dim hint showing how many are hidden above
+# (scrolled past) and below (off the bottom); $offset is clamped to [0,
+# max_offset] so you can't scroll past the last full page. Pure / unit-tested.
+sub activity_window {
+    my ($desc, $offset, $cap) = @_;
+    $desc ||= [];
+    my $total = scalar @$desc;
+    $cap    = 0 if !defined $cap    || $cap < 0;
+    $offset = 0 if !defined $offset || $offset < 0;
+
+    return { lines => [], hint => undef, offset => 0, max_offset => 0 }
+        if $total == 0 || $cap == 0;
+
+    if ($total <= $cap) {                      # everything fits: no scroll/hint
+        return { lines => [ @$desc ], hint => undef, offset => 0, max_offset => 0 };
+    }
+
+    my $visible = $cap - 1;                    # reserve a row for the hint
+    $visible = 1 if $visible < 1;
+    my $max_offset = $total - $visible;
+    $max_offset = 0 if $max_offset < 0;
+    $offset = $max_offset if $offset > $max_offset;
+    my $end = $offset + $visible - 1;
+    $end = $total - 1 if $end > $total - 1;
+
+    my @lines = @{$desc}[$offset .. $end];
+    my $above = $offset;
+    my $below = $total - 1 - $end;
+    my $hint  = _scroll_hint($above, $below);
+    return {
+        lines => \@lines,
+        hint  => (defined $hint ? { text => $hint, role => 'scrollhint' } : undef),
+        offset => $offset, max_offset => $max_offset,
+    };
 }
 
 # blueprint_runs_dirs($data_root) -> the runs/ dir of every blueprint under
@@ -585,6 +682,7 @@ sub run {
     my $hb_state = 'ok';        # last heartbeat result; 'gone' no longer exits the loop
     my @all_events;             # full chronological event list from the last gather
     my $activity_offset = 0;    # up/down scroll position in the Activity panel
+    my $activity_max    = 0;    # scroll ceiling (set each frame by activity_window)
     my $rc = 0;
     my $ticks = 0;
 
@@ -613,9 +711,7 @@ sub run {
                     my $base = $gather->() || {};
                     %state = %$base;
                     @all_events = @{ $base->{events} || [] };   # chronological
-                    my $max_off = @all_events ? $#all_events : 0;   # 0 when empty (not -1)
-                    $activity_offset = $max_off if $activity_offset > $max_off;
-                    $activity_offset = 0        if $activity_offset < 0;
+                    $activity_offset = 0 if $activity_offset < 0;
                     $last_state = $t;
                     # B5: re-evaluate the wake-lock on the freshly gathered state
                     # (carries busy_age). The launcher's seam owns the decision.
@@ -625,19 +721,36 @@ sub run {
                 $state{uptime}         = $t - $start;
                 $state{pending}        = $pending;
                 $state{container_gone} = ($hb_state eq 'gone') ? 1 : 0;
-                # Activity newest-first, windowed at the up/down scroll offset.
-                $state{events}         = activity_view(\@all_events, $activity_offset);
+                # Activity: capacity-aware window (newest-first) + a dim overflow
+                # hint. activity_window clamps the offset to the last page (so you
+                # can't scroll past the end) and tells us the scroll ceiling.
+                my $cap  = activity_capacity(\%state, $rows, $cols);
+                my @desc = reverse @all_events;
+                my $win  = activity_window(\@desc, $activity_offset, $cap);
+                $activity_offset = $win->{offset};
+                $activity_max    = $win->{max_offset};
+                my @ev_lines = @{ $win->{lines} };
+                push @ev_lines, $win->{hint} if $win->{hint};
+                $state{events} = (@ev_lines ? \@ev_lines : ['(no events yet)']);
 
                 my $frame = compose_frame(\%state, $rows, $cols);
                 $out->(render_frame($prev, $frame, { color => $color }));
                 $prev = $frame;
 
-                # input (non-blocking)
-                my $key = $read_key->();
-                if (defined $key && length $key) {
+                # input (non-blocking) — DRAIN all pending keys this tick, not one.
+                # read_key polls non-blocking, so a fast burst of scroll events
+                # (mouse wheel) otherwise queued one-per-tick and took seconds to
+                # settle. Coalescing them into a single frame keeps scrolling
+                # responsive. The cap is a runaway-input backstop.
+                my $quit = 0;
+                my $drained = 0;
+                while ($drained < 256) {
+                    my $key = $read_key->();
+                    last unless defined $key && length $key;
+                    $drained++;
                     my ($action, $np) = dispatch_key($key, $pending);
                     $pending = $np;
-                    if ($action eq 'quit') { $rc = 0; last; }
+                    if ($action eq 'quit') { $rc = 0; $quit = 1; last; }
                     elsif ($action eq 'launch') {
                         my $r = $spawn->();
                         $prev = undef if defined $r && $r eq 'redraw';
@@ -655,10 +768,11 @@ sub run {
                         $activity_offset-- if $activity_offset > 0;
                     }
                     elsif ($action eq 'scroll-down') {
-                        $activity_offset++ if $activity_offset < $#all_events;
+                        $activity_offset++ if $activity_offset < $activity_max;
                     }
                     # confirm-shutdown / cancel-shutdown only toggle $pending
                 }
+                last if $quit;
 
                 $ticks++;
                 last if defined $o{max_ticks} && $ticks >= $o{max_ticks};
