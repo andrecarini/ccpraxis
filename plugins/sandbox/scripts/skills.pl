@@ -1581,7 +1581,10 @@ sub cmd_materialize_plugins {
         $entry->{installPath} = $rewrite->($p->{install_path});
         $entry->{scope}       = $p->{scope};
         $entry->{version}     = $p->{version};
-        if ($p->{scope} eq 'local' || $p->{scope} ne 'user') {
+        # Every non-user scope (local / project / anything unknown) is
+        # project-scoped in the container and gets the container projectPath;
+        # only user-scope is global and omits it.
+        if ($p->{scope} ne 'user') {
             $entry->{projectPath} = $CONTAINER_PROJECT_PATH;
         } else {
             delete $entry->{projectPath};
@@ -1677,13 +1680,13 @@ sub cmd_materialize_plugins {
 #     so the rewritten installLocation resolves to real data.
 #
 #   - source.source == "directory":
-#     DROP the entry. The current launcher does not bind-mount arbitrary
-#     host directories into the container, so the marketplace's source.path
-#     wouldn't resolve. The launcher would need to learn to bind-mount the
-#     source.path before this entry could be kept. When that lands, swap
-#     this branch for: bind-mount source.path inside the container, then
-#     rewrite source.path AND installLocation to the mount target. See
-#     ccpraxis-local for the canonical "directory" entry shape on Windows.
+#     KEEP the entry; rewrite BOTH source.path AND installLocation to the
+#     container mount target /root/.claude/plugins/marketplaces/<name>. The
+#     launcher gives directory-source marketplaces (e.g. ccpraxis-local) a LIVE
+#     read-only bind of their source.path at that target — so they're EXCLUDED
+#     from the copy-plan (the live bind, not a copy) but their JSON references
+#     still resolve. (Historically these were dropped; the launcher now provides
+#     the bind, so they're usable inside the sandbox.)
 #
 # Output is a per-launch file written under claude-home/plugins/ on the
 # host so it appears at /root/.claude/plugins/known_marketplaces.json as a
@@ -1712,7 +1715,6 @@ sub cmd_materialize_known_marketplaces {
     my @mkt_copy_plan;   # [{name, src(host marketplaces/<name>), dest_rel}]
 
     my %out;
-    my @dropped;
     for my $name (sort keys %$host) {
         my $entry = $host->{$name};
         next unless ref $entry eq 'HASH';
@@ -1750,11 +1752,6 @@ sub cmd_materialize_known_marketplaces {
         my $mkt_src = "$host_plugins_dir/marketplaces/$name";
         push @mkt_copy_plan, { name => $name, src => $mkt_src, dest_rel => "marketplaces/$name" }
             if -d $mkt_src;
-    }
-
-    if (@dropped) {
-        warn "materialize-known-marketplaces: dropped marketplaces not usable inside sandbox:\n",
-            map { "  - $_\n" } @dropped;
     }
 
     # Tier-2 merge-preserve (Fix 2): known_marketplaces.json is a real RW file

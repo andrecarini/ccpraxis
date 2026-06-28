@@ -79,10 +79,21 @@ sub atomic_writeback {
         # path is taken; this is the defense-in-depth branch.)
         if ($en == EBUSY || $en == EXDEV) {
             unlink $tmp;
-            open my $ow, '>:raw', $path
+            # In-place rewrite WITHOUT a zero-length window: open for UPDATE
+            # (no O_TRUNC), overwrite from the start with the already-validated
+            # bytes, then truncate to the new length. A kill mid-write then
+            # leaves a new-prefix+old-suffix file (corrupt but NON-EMPTY) rather
+            # than a zero-byte one. Either way the next launcher run
+            # re-materializes creds from the host, so this fallback is
+            # self-healing. (Only runs on a legacy pre-Fix-1 single-file-bind
+            # sandbox; Fix-1 dir-bind creds take the atomic rename path above.)
+            my $ow;
+            open($ow, '+<:raw', $path)
+                or open($ow, '>:raw', $path)   # file absent -> plain create
                 or die "in-place open $path (after rename $es): $!";
-            print $ow $out or die "in-place write $path: $!";
-            close $ow      or die "in-place close $path: $!";
+            print $ow $out                 or die "in-place write $path: $!";
+            truncate($ow, length $out)     or die "in-place truncate $path: $!";
+            close $ow                      or die "in-place close $path: $!";
             chmod $mode, $path;
         } else {
             unlink $tmp;
