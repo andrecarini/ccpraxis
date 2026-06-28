@@ -11,9 +11,10 @@ use lib "$Bin/../../scripts";
 use Test::More;
 use File::Temp qw(tempdir);
 use File::Path qw(make_path);
+use JSON::PP;
 use PluginSync qw(reconcile_copy_plan prune_empty_parents safe_dest_rel);
 
-plan tests => 22;
+plan tests => 25;
 
 my $root = tempdir(CLEANUP => 1);
 sub spew { my ($p,$c)=@_; my ($d)=$p=~m{^(.*)/[^/]+$}; make_path($d) if $d && !-d $d;
@@ -80,6 +81,28 @@ spew("$outside/keep.txt", 'do-not-touch');
 make_path($dest3);
 reconcile_copy_plan([{ src=>"$host/cache/m/A/2.0", dest_rel=>'../OUTSIDE_SENTINEL' }], [], $dest3);
 ok(-e "$outside/keep.txt", 'safe: a ../ dest_rel in the prior plan does NOT delete outside dest_root');
+
+# --- Bug-2 regression: read_copy_plan MUST decode the manifest UTF-8-aware -----
+#     skills.pl writes the manifest with ->utf8->encode. Each `src` embeds the
+#     user's home dir, which can hold non-ASCII bytes (".../André/..."). A plain
+#     (non-utf8) decode splits each é into two Latin-1 chars, so the mangled src
+#     fails every `-d $src` in reconcile and NOTHING copies — the exact bug that
+#     left selected host plugins (e.g. notion) "active but not installed". This
+#     locks the decode invariant (portable: no non-ASCII filename on disk).
+{
+    my $mf = "$root/manifest-utf8.json";
+    my $src_in = "/c/Users/Andr\x{e9}/.claude/plugins/cache/mkt/P/1.0";  # é = U+00E9
+    open my $w, '>:raw', $mf or die "$mf: $!";
+    print $w JSON::PP->new->canonical->utf8->encode(
+        [ { key=>'P', src=>$src_in, dest_rel=>'cache/mkt/P/1.0' } ]);
+    close $w;
+    my $plan = PluginSync::read_copy_plan($mf);
+    is(scalar(@$plan), 1, 'utf8 manifest: one entry decoded');
+    is($plan->[0]{src}, $src_in,
+       'utf8 manifest: non-ASCII src round-trips byte-faithfully (->utf8 decode)');
+    is(length($plan->[0]{src}), length($src_in),
+       'utf8 manifest: src char-length preserved (é not split into two Latin-1 chars)');
+}
 
 # --- symlink defense (red-team MEDIUM-1): a container-planted symlink in the
 #     RW claude-home/plugins tree must not let reconcile escape dest_root.

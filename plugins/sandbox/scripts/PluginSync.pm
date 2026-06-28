@@ -13,9 +13,34 @@ package PluginSync;
 use strict;
 use warnings;
 use File::Path qw(make_path remove_tree);
+use JSON::PP;
 use Exporter qw(import);
 
-our @EXPORT_OK = qw(copy_tree prune_empty_parents reconcile_copy_plan safe_dest_rel);
+our @EXPORT_OK = qw(copy_tree prune_empty_parents reconcile_copy_plan safe_dest_rel read_copy_plan);
+
+# read_copy_plan($path) -> arrayref of {src, dest_rel, ...} — the launcher's
+# copy-plan manifest, which skills.pl writes with ->utf8->encode. Missing /
+# unparseable -> [] (treated as "the launcher placed nothing last launch").
+#
+# The decode MUST be UTF-8-aware. Each `src` is a host plugin path embedding the
+# user's home dir, which can contain non-ASCII bytes (e.g. ".../Users/André/...").
+# Because the manifest is UTF-8 on disk, a plain ->decode would read each UTF-8
+# byte as its own Latin-1 char ("André" -> "AndrÃ©"); the mangled src then fails
+# EVERY `-d $src` test in reconcile_copy_plan, so it silently copies NOTHING.
+# That is the exact bug that left selected host plugins (e.g. notion) "active but
+# not installed" inside the sandbox — the registry listed them but their code
+# never got copied. ASCII dest_rels are unaffected, so this is decode-only.
+sub read_copy_plan {
+    my $path = shift;
+    return [] unless defined $path && -f $path;
+    open my $fh, '<:raw', $path or return [];
+    local $/;
+    my $bytes = <$fh>;
+    close $fh;
+    return [] unless defined $bytes && length $bytes;
+    my $data = eval { JSON::PP->new->utf8->decode($bytes) };
+    return (ref $data eq 'ARRAY') ? $data : [];
+}
 
 # safe_dest_rel($rel) -> 1 iff $rel is a safe RELATIVE path under dest_root: a
 # non-empty `/`-joined chain of plain names, with NO absolute root, NO drive

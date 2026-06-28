@@ -2442,8 +2442,27 @@ sub cmd_materialize_credentials {
     # into the sandbox (host mcpOAuth is intentionally NOT propagated). Refuse to
     # read a symlinked output; the tmp+rename write below replaces the link with
     # a real file regardless.
-    my $existing = (-f $output && !-l $output) ? read_json_with_retry($output) : {};
-    $existing = {} unless ref $existing eq 'HASH';
+    my $existing = {};
+    if (-f $output && !-l $output) {
+        # read_json_with_retry's 3x/100ms backoff absorbs a TORN read (host or
+        # container rewriting mid-rename). But a PERSISTENTLY unparseable
+        # accumulator — a stale 0-byte placeholder, or a write torn by a hard
+        # container kill — must NOT abort the launch: unlike the host token,
+        # mcpOAuth here is REGENERABLE (re-auth'd in-container on next MCP use).
+        # Degrade to empty, but LOUDLY (the sin this guards against was a SILENT
+        # {} that masked real corruption), and let the tmp+rename below write a
+        # fresh valid file. Previously this die() propagated as exit 255 and
+        # bricked the entire sandbox launch.
+        $existing = eval { read_json_with_retry($output) };
+        if (ref $existing ne 'HASH') {
+            my $why = $@ || 'not a JSON object';
+            $why =~ s/\s+\z//;
+            warn "WARNING: sandbox credential accumulator '$output' is unreadable/"
+               . "corrupt ($why); reseeding fresh; any in-container MCP auth "
+               . "(mcpOAuth) will re-prompt on next use.\n";
+            $existing = {};
+        }
+    }
 
     my $merged = {};
     # 1. Claude account OAuth: always from host (rotates as host refreshes).

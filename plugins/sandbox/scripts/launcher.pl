@@ -1326,20 +1326,29 @@ if (-f "$HOST_PLUGINS_DIR/known_marketplaces.json") {
 # over the mountpoint (EBUSY), so an in-container OAuth refresh could never
 # persist. The canonical location is now claude-home/.credentials.json (a
 # real file inside the RW dir bind, rename-safe). If the new file is absent
-# but the legacy one exists, carry it over so accumulated in-container
+# (or a stale 0-byte placeholder, treated as absent below) but the legacy one
+# exists, carry it over so accumulated in-container
 # mcpOAuth tokens survive the move (materialize-credentials below re-reads
 # its own output to preserve mcpOAuth). Copy (not move): the legacy file is
 # left in .launcher/ as a harmless RO orphan. Best-effort — a failure here
 # just means materialize re-seeds claudeAiOauth from the host and the
 # container re-auths its MCP servers (re-login of MCP plugins, no token loss).
-if (!-f $SANDBOX_CREDENTIALS_FILE) {
-    # claude-home is RW from the container: a planted (dangling) symlink at the
-    # creds path makes -f false, and _copy_file would then write THROUGH it to a
-    # host-side target. Drop the link itself first (unlink removes the link, not
-    # its target) so the copy lands on a real file in claude-home.
-    unlink $SANDBOX_CREDENTIALS_FILE if -l $SANDBOX_CREDENTIALS_FILE;
+# claude-home is RW from the container: a planted (dangling) symlink at the
+# creds path makes -f false, and _copy_file would then write THROUGH it to a
+# host-side target. Drop the link itself first (unlink removes the link, not its
+# target) so any copy/seed lands on a real file in claude-home.
+unlink $SANDBOX_CREDENTIALS_FILE if -l $SANDBOX_CREDENTIALS_FILE;
+# A pre-Fix-1 sandbox can already hold a STALE 0-byte placeholder at this exact
+# path (an older era touched claude-home/.credentials.json). An empty file is not
+# "absent", so the old `!-f` guard skipped migration and left it in place — and
+# materialize-credentials below then DIED reading that unparseable accumulator,
+# aborting the whole launch. Treat a 0-byte file as absent: drop it so the legacy
+# creds (with their accumulated in-container mcpOAuth) still migrate over.
+unlink $SANDBOX_CREDENTIALS_FILE
+    if -f $SANDBOX_CREDENTIALS_FILE && -z $SANDBOX_CREDENTIALS_FILE;
+if (!-e $SANDBOX_CREDENTIALS_FILE) {
     my $legacy = "$LAUNCHER_DIR/credentials.json";
-    if (-f $legacy) {
+    if (-f $legacy && !-z $legacy) {
         make_path($CLAUDE_DATA) unless -d $CLAUDE_DATA;
         eval { _copy_file($legacy, $SANDBOX_CREDENTIALS_FILE); 1 }
             or print STDERR "WARNING: legacy credentials migration failed: $@";
@@ -1730,16 +1739,13 @@ sub container_status {
     return defined $s ? $s : '';
 }
 
-# Read a copy-plan manifest (skills.pl wrote it): an arrayref of {src, dest_rel}.
-# Missing / unparseable -> empty list (treated as "placed nothing last launch").
-sub _read_copy_plan {
-    my $path = shift;
-    return [] unless defined $path && -f $path;
-    my $bytes = _read_file($path);
-    return [] unless defined $bytes;
-    my $data = eval { JSON::PP->new->decode($bytes) };
-    return (ref $data eq 'ARRAY') ? $data : [];
-}
+# Read a copy-plan manifest (skills.pl wrote it with ->utf8->encode): an arrayref
+# of {src, dest_rel}. Delegates to PluginSync::read_copy_plan, whose decode is
+# UTF-8-aware — CRITICAL because each `src` embeds the user's home dir, which may
+# contain non-ASCII bytes (".../André/..."). A non-UTF-8 decode mangles those
+# bytes so every `-d $src` in reconcile fails and NOTHING copies (the "selected
+# but not installed" bug). Missing / unparseable -> [] ("placed nothing").
+sub _read_copy_plan { return PluginSync::read_copy_plan($_[0]); }
 
 # Reconcile a host-tier copy-plan into claude-home (Fix 2). Thin wrapper over
 # PluginSync::reconcile_copy_plan (the pure, unit-tested core), passing
