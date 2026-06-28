@@ -11,9 +11,9 @@ use lib "$Bin/../../scripts";
 use Test::More;
 use File::Temp qw(tempdir);
 use File::Path qw(make_path);
-use PluginSync qw(reconcile_copy_plan prune_empty_parents);
+use PluginSync qw(reconcile_copy_plan prune_empty_parents safe_dest_rel);
 
-plan tests => 12;
+plan tests => 22;
 
 my $root = tempdir(CLEANUP => 1);
 sub spew { my ($p,$c)=@_; my ($d)=$p=~m{^(.*)/[^/]+$}; make_path($d) if $d && !-d $d;
@@ -64,3 +64,41 @@ reconcile_copy_plan([], [$X], $dest2);
 ok(-d "$dest2/cache/deep/X/1.0", 'prune setup: X placed');
 reconcile_copy_plan([$X], [], $dest2);
 ok(!-e "$dest2/cache", 'prune: removing the only plugin prunes all now-empty parents up to dest_root');
+
+# --- safe_dest_rel: path-traversal / absolute / drive guard ------------------
+ok( safe_dest_rel('cache/m/A/1.0'), 'safe: a normal relative path is allowed');
+ok(!safe_dest_rel('../etc'),        'safe: leading .. rejected');
+ok(!safe_dest_rel('a/../b'),        'safe: interior .. rejected');
+ok(!safe_dest_rel('/etc/passwd'),   'safe: absolute path rejected');
+ok(!safe_dest_rel('C:/Windows'),    'safe: drive-letter path rejected');
+ok(!safe_dest_rel(''),              'safe: empty rejected');
+
+# A traversal dest_rel must NOT delete/copy outside dest_root.
+my $dest3 = "$root/dest3";
+my $outside = "$root/OUTSIDE_SENTINEL";
+spew("$outside/keep.txt", 'do-not-touch');
+make_path($dest3);
+reconcile_copy_plan([{ src=>"$host/cache/m/A/2.0", dest_rel=>'../OUTSIDE_SENTINEL' }], [], $dest3);
+ok(-e "$outside/keep.txt", 'safe: a ../ dest_rel in the prior plan does NOT delete outside dest_root');
+
+# --- symlink defense (red-team MEDIUM-1): a container-planted symlink in the
+#     RW claude-home/plugins tree must not let reconcile escape dest_root.
+#     Skipped where the perl/FS can't make a followable symlink (Git-for-Windows
+#     turns them into junctions/copies); runs on the Linux sandbox test pass.
+SKIP: {
+    my $sroot   = "$root/sym";
+    my $outside = "$sroot/outside";
+    spew("$outside/secret.txt", 'host-secret');     # lives OUTSIDE the dest_root
+    my $droot = "$sroot/dest";
+    make_path("$droot/cache");
+    my $made = eval { symlink($outside, "$droot/cache/evil"); 1 };
+    skip 'no followable symlinks on this perl/filesystem', 3
+        unless $made && -l "$droot/cache/evil";
+
+    ok(!PluginSync::_safe_parents($droot, 'cache/evil/x/1.0'),
+       'symlink: a symlinked intermediate component is refused');
+    # Reconcile-remove of a leaf symlink must unlink the LINK, never its target.
+    reconcile_copy_plan([{ src=>"$host/cache/m/A/2.0", dest_rel=>'cache/evil' }], [], $droot);
+    ok(!-e "$droot/cache/evil", 'symlink: the planted leaf link is removed');
+    ok(-e "$outside/secret.txt", 'symlink: the target OUTSIDE dest_root is untouched (no escape)');
+}

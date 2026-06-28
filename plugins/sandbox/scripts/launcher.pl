@@ -1333,6 +1333,11 @@ if (-f "$HOST_PLUGINS_DIR/known_marketplaces.json") {
 # just means materialize re-seeds claudeAiOauth from the host and the
 # container re-auths its MCP servers (re-login of MCP plugins, no token loss).
 if (!-f $SANDBOX_CREDENTIALS_FILE) {
+    # claude-home is RW from the container: a planted (dangling) symlink at the
+    # creds path makes -f false, and _copy_file would then write THROUGH it to a
+    # host-side target. Drop the link itself first (unlink removes the link, not
+    # its target) so the copy lands on a real file in claude-home.
+    unlink $SANDBOX_CREDENTIALS_FILE if -l $SANDBOX_CREDENTIALS_FILE;
     my $legacy = "$LAUNCHER_DIR/credentials.json";
     if (-f $legacy) {
         make_path($CLAUDE_DATA) unless -d $CLAUDE_DATA;
@@ -1562,7 +1567,10 @@ sub ensure_claude_json_host_file {
 # the launch, so by the time we reach create this is a no-op. Kept as a
 # belt-and-suspenders seed in case materialize was skipped.
 sub ensure_credentials_json_host_file {
-    return if -f $SANDBOX_CREDENTIALS_FILE;
+    return if -f $SANDBOX_CREDENTIALS_FILE && !-l $SANDBOX_CREDENTIALS_FILE;
+    # Drop a container-planted symlink so the seed write can't follow it to a
+    # host-side target (claude-home is RW from the container).
+    unlink $SANDBOX_CREDENTIALS_FILE if -l $SANDBOX_CREDENTIALS_FILE;
     make_path($CLAUDE_DATA) unless -d $CLAUDE_DATA;
     open(my $fh, '>', $SANDBOX_CREDENTIALS_FILE) or do {
         print STDERR "WARNING: couldn't create $SANDBOX_CREDENTIALS_FILE: $!\n";

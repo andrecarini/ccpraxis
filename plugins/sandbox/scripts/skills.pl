@@ -2438,7 +2438,14 @@ sub cmd_materialize_credentials {
     # would silently drop in-container mcpOAuth tokens the user already
     # authed for. Existence of the output is optional (first launch), but
     # if it does exist, a parse failure should not be swallowed.
-    my $existing = -f $output ? read_json_with_retry($output) : {};
+    #
+    # Security: claude-home is RW from the container, so it could replace this
+    # file with a SYMLINK pointing (host-side) at the host's real
+    # ~/.claude/.credentials.json — reading through it would leak host mcpOAuth
+    # into the sandbox (host mcpOAuth is intentionally NOT propagated). Refuse to
+    # read a symlinked output; the tmp+rename write below replaces the link with
+    # a real file regardless.
+    my $existing = (-f $output && !-l $output) ? read_json_with_retry($output) : {};
     $existing = {} unless ref $existing eq 'HASH';
 
     my $merged = {};
