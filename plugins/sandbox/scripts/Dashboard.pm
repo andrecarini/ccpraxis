@@ -238,20 +238,28 @@ sub _alert_line {
 # user what to do. 'unknown' = inspect couldn't read the container (podman down
 # or the host slept); empty/running/created/restarting are healthy-or-transient
 # and stay quiet.
+#
+# The dead-state banner deliberately does NOT offer [c]: [c] only spawns a
+# connector (`podman exec` into a LIVE container), so on a dead container it
+# opens a Windows Terminal that instantly closes (the exec has nothing to attach
+# to). The real relaunch is to quit ([q]) and re-run `claude-sandbox`, which
+# `podman start`s the exited container — so that is what the banner points at.
+# [r] retry stays for the 'unknown'/unreachable case, where the same container
+# may simply reappear once podman/the host is back.
 sub _status_alert {
     my ($s) = @_;
     $s ||= {};
     my $st = defined $s->{status} ? lc $s->{status} : '';
     if ($s->{container_gone}) {
         return ($st && $st ne 'unknown')
-            ? "container is not running ($st) - press [c] to relaunch or [q] to quit"
-            : 'container unreachable - press [r] to retry, [c] to relaunch, or [q] to quit';
+            ? "container is not running ($st) - [q] quit, then re-run claude-sandbox to relaunch"
+            : 'container unreachable - [r] retry or [q] quit';
     }
     return undef if $st eq '' || $st eq '?' || $st eq 'running'
                  || $st eq 'created' || $st eq 'restarting';
     return 'container unreachable (podman down or host asleep) - [r] retry, [q] quit'
         if $st eq 'unknown';
-    return "container is $st (not running) - press [c] to relaunch or [q] to quit";
+    return "container is $st (not running) - [q] quit, then re-run claude-sandbox to relaunch";
 }
 
 sub _panel_title_line {
@@ -700,8 +708,9 @@ sub run {
                     $last_beat = $t;
                     # (E) Do NOT exit when the container is gone/unreachable. Keep
                     # the dashboard open so the user can see the dead state and
-                    # relaunch ([c]) or quit ([q]) — surfaced as a status alert.
-                    # Keep heartbeating: a relaunched container recovers on its own.
+                    # recover ([q] quit, then re-run claude-sandbox) — surfaced as
+                    # a status alert. Keep heartbeating: if the container comes
+                    # back (podman/host woke), the dashboard recovers on its own.
                     $hb_state = $hb if defined $hb;
                 }
 

@@ -194,6 +194,21 @@ my %st = (
     like(Dashboard::_status_alert({ container_gone => 1, status => 'unknown' }), qr/unreachable/,
        'status_alert: container_gone+unknown -> "unreachable"');
 
+    # A dead container must NOT advertise [c] as a relaunch: [c] only spawns a
+    # connector (`podman exec` into a LIVE container), so on a dead container it
+    # opens a window that instantly closes. The banner points at the real
+    # relaunch path instead (quit, then re-run claude-sandbox).
+    for my $dead ({ status => 'exited' },
+                  { container_gone => 1, status => 'exited' },
+                  { container_gone => 1, status => 'unknown' }) {
+        my $msg = Dashboard::_status_alert($dead);
+        unlike($msg, qr/\[c\]/, "status_alert: dead container does not offer [c] ($msg)");
+        unlike($msg, qr/relaunch.*\[c\]|\[c\].*relaunch/i,
+               'status_alert: [c] is never called the relaunch key');
+    }
+    like(Dashboard::_status_alert({ status => 'exited' }), qr/re-run claude-sandbox/,
+       'status_alert: exited banner names the real relaunch path (re-run claude-sandbox)');
+
     my %dead = (%st, status => 'exited');
     my $f = Dashboard::compose_frame(\%dead, 12, 80);
     my @a = grep { $_->{role} eq 'alert' } @$f;
