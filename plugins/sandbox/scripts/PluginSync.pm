@@ -12,7 +12,8 @@ package PluginSync;
 # in a manifest (plugins installed INSIDE the sandbox) are left untouched.
 use strict;
 use warnings;
-use File::Path qw(make_path remove_tree);
+use File::Path qw(make_path);
+use File::Find qw(finddepth);
 use JSON::PP;
 use Exporter qw(import);
 
@@ -133,6 +134,29 @@ sub prune_empty_parents {
     }
 }
 
+# _force_remove_tree($path) — delete a file/dir tree even when it holds
+# READ-ONLY files. remove_tree's { safe => 1 } refuses to chmod, so it cannot
+# unlink read-only entries (Windows marks git object/pack files read-only) and
+# leaves the parent "Directory not empty" — the marketplace reconcile hit this
+# refreshing a github-source marketplace whose copied tree includes a .git/
+# object store. We walk depth-first (children before parents), clearing the
+# read-only bit before each unlink/rmdir. SYMLINKS are unlinked, never followed
+# or chmod'd THROUGH (claude-home/plugins is container-writable; _safe_parents
+# already barred a symlinked PARENT, and this bars a symlinked entry INSIDE the
+# tree — File::Find does not descend symlinks by default).
+sub _force_remove_tree {
+    my $path = shift;
+    return unless -e $path || -l $path;
+    if (-l $path) { unlink $path; return; }      # top-level leaf link
+    finddepth({ no_chdir => 1, wanted => sub {
+        my $p = $File::Find::name;
+        if (-l $p) { unlink $p; return; }        # never chmod/recurse THROUGH a link
+        chmod 0700, $p;                          # clear read-only (git packs) — best effort
+        if (-d $p) { rmdir $p } else { unlink $p }
+    }}, $path);
+    rmdir $path if -d $path && !-l $path;         # belt-and-suspenders (finddepth visits root last)
+}
+
 # reconcile_copy_plan($prior, $new, $dest_root, %opt) — see the package doc.
 #   $prior, $new : arrayrefs of {src, dest_rel}.
 #   $dest_root   : where dest_rel is rooted (claude-home/plugins).
@@ -155,7 +179,7 @@ sub reconcile_copy_plan {
         next unless _safe_parents($dest_root, $e->{dest_rel}); # no symlinked parent
         my $stale = "$dest_root/$e->{dest_rel}";
         if    (-l $stale) { unlink $stale; }                 # remove the link, NOT its target
-        elsif (-e $stale) { remove_tree($stale, { safe => 1 }); }
+        elsif (-e $stale) { _force_remove_tree($stale); }    # handles read-only git packs
         prune_empty_parents($dest_root, $e->{dest_rel});
     }
     # 2. (re)copy the current host-tier set, host authoritative.
@@ -167,7 +191,7 @@ sub reconcile_copy_plan {
         next unless -d $src && !-l $src;                      # don't follow a symlinked source
         my $dst = "$dest_root/$e->{dest_rel}";
         if    (-l $dst) { unlink $dst; }                     # drop a planted leaf symlink
-        elsif (-e $dst) { remove_tree($dst, { safe => 1 }); } # clean refresh (host wins)
+        elsif (-e $dst) { _force_remove_tree($dst); }        # clean refresh (host wins); read-only-safe
         copy_tree($src, $dst);
     }
 }

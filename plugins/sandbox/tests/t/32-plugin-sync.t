@@ -14,7 +14,7 @@ use File::Path qw(make_path);
 use JSON::PP;
 use PluginSync qw(reconcile_copy_plan prune_empty_parents safe_dest_rel);
 
-plan tests => 25;
+plan tests => 26;
 
 my $root = tempdir(CLEANUP => 1);
 sub spew { my ($p,$c)=@_; my ($d)=$p=~m{^(.*)/[^/]+$}; make_path($d) if $d && !-d $d;
@@ -102,6 +102,22 @@ ok(-e "$outside/keep.txt", 'safe: a ../ dest_rel in the prior plan does NOT dele
        'utf8 manifest: non-ASCII src round-trips byte-faithfully (->utf8 decode)');
     is(length($plan->[0]{src}), length($src_in),
        'utf8 manifest: src char-length preserved (é not split into two Latin-1 chars)');
+}
+
+# --- robust removal of READ-ONLY trees (github marketplace .git object packs) --
+#     remove_tree({safe=>1}) refuses to chmod, so it can't delete read-only files
+#     and leaves "Directory not empty" — reconcile must force-clear the read-only
+#     bit first. Mirrors a copied github-source marketplace's read-only
+#     .git/objects/pack/*.pack files (the exact reconcile failure observed).
+{
+    my $ro = "$root/ro-remove";
+    spew("$ro/repo/.git/objects/pack/p.pack", "packbytes");
+    spew("$ro/repo/.git/HEAD",                "ref: refs/heads/main");
+    spew("$ro/repo/keep.txt",                 "x");
+    chmod 0444, "$ro/repo/.git/objects/pack/p.pack";
+    chmod 0444, "$ro/repo/.git/HEAD";
+    PluginSync::_force_remove_tree("$ro/repo");
+    ok(!-e "$ro/repo", 'force-remove deletes a tree containing read-only files (git packs)');
 }
 
 # --- symlink defense (red-team MEDIUM-1): a container-planted symlink in the
