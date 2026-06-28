@@ -51,6 +51,7 @@ use BackpackApproval ();  # #21: per-item, machine-local backpack approval memor
 use BackpackReview ();    # #21: the I/O-seam-injected interactive approval walk
 use KeepAwake ();         # B5: dashboard wake-lock decision + lifecycle holder
 use ConnectorHold ();     # Fix 3: hold-the-window decision when a connector loses the container
+use PluginSync ();        # Fix 2: copy-model plugin-store reconcile (copy/prune/reconcile)
 use JSON::PP ();          # parse backpack.json + write the approved install-set
 use File::Path qw(make_path);
 use File::Spec;
@@ -221,7 +222,14 @@ my $SNAPSHOT_FILE             = "$LAUNCHER_DIR/.discovery-snapshot.json";
 my $PLUGINS_SNAPSHOT_FILE     = "$LAUNCHER_DIR/.plugins-snapshot.json";
 my $MCP_SNAPSHOT_FILE         = "$LAUNCHER_DIR/.mcp-snapshot.json";
 my $SETTINGS_LOCAL_FILE       = "$PROJECT_PATH/.claude/settings.local.json";
-my $MATERIALIZED_PLUGINS_FILE = "$LAUNCHER_DIR/installed_plugins.json";
+# installed_plugins.json lives under claude-home/plugins/ (Fix 2), NOT
+# .launcher/ — so it appears at /root/.claude/plugins/installed_plugins.json as
+# a REAL RW file through the parent claude-home bind, exactly like
+# known_marketplaces.json below. Claude Code rewrites it (write-tmp + rename)
+# when a plugin is installed INSIDE the sandbox; a single-file RO bind couldn't
+# accept that. The launcher re-materializes it each launch, merge-preserving
+# sandbox-added entries (see cmd_materialize_plugins).
+my $MATERIALIZED_PLUGINS_FILE = "$CLAUDE_DATA/plugins/installed_plugins.json";
 # .credentials.json lives at claude-home/ (the RW dir bind), NOT inside
 # .launcher/ — so it appears at /root/.claude/.credentials.json as a REAL
 # file through the parent claude-home bind, not as a single-file mount.
@@ -242,6 +250,14 @@ my $SANDBOX_CREDENTIALS_FILE  = "$CLAUDE_DATA/.credentials.json";
 # file on every launch so in-container mutations are ephemeral, which
 # matches the desired "no marketplace state leaks across runs" posture.
 my $MATERIALIZED_MARKETPLACES_FILE = "$CLAUDE_DATA/plugins/known_marketplaces.json";
+# Fix 2 host-tier copy-plan manifests (live in .launcher/, RO in the container).
+# skills.pl writes them: which selected-plugin code dirs + marketplace metadata
+# dirs the launcher copied into claude-home this launch. The launcher reads the
+# PRIOR manifest to reconcile (remove what it placed before that's gone now ->
+# no zombies) and the NEW one to copy the current set; materialize reads the
+# plugins manifest back as merge provenance (sandbox-installed vs deselected).
+my $PLUGINS_COPY_MANIFEST      = "$LAUNCHER_DIR/.host-tier-plugins.json";
+my $MARKETPLACES_COPY_MANIFEST = "$LAUNCHER_DIR/.host-tier-marketplaces.json";
 # Container CLAUDE.md and settings.json: per-project copies (blueprint
 # model). Container can modify these freely; changes never propagate
 # back to ccpraxis. Drift from upstream is detected via stored hash;
@@ -1206,53 +1222,66 @@ my @SKILL_MOUNTS;
 }
 
 # =====================================================================
-# Build plugin mounts
+# Build plugin store (Fix 2 copy model) + directory-source marketplace binds
 # =====================================================================
+#
+# Instead of MOUNTING the host plugin dirs into the container, the launcher
+# COPIES the SELECTED host plugins (+ marketplace metadata) into
+# claude-home/plugins/, which rides the RW claude-home bind. The host is never
+# mounted into the container, so a compromised in-container process can't reach
+# or damage host plugins and can't pull in anything the user didn't select; the
+# selection + launcher control metadata stay RO in .launcher/. Each launch the
+# host-tier is RECONCILED to exactly the current selection (refresh selected,
+# remove what was placed before that isn't selected/present now -> no zombies),
+# while plugins installed INSIDE the sandbox are PRESERVED. installed_plugins.json
+# and known_marketplaces.json are real RW files in claude-home, merge-materialized
+# (selection authoritative + sandbox installs preserved). ccpraxis (and any other
+# directory-source marketplace) stays a LIVE read-only bind below.
 
+make_path("$CLAUDE_DATA/plugins") unless -d "$CLAUDE_DATA/plugins";
+
+# Plugins: read the prior copy-plan (for reconcile) BEFORE materialize overwrites
+# it, then materialize (registry merge + fresh copy-plan), then reconcile+copy.
+my $prior_plugins_plan = _read_copy_plan($PLUGINS_COPY_MANIFEST);
 run_perl_or_die('materialize-plugins failed',
     'materialize-plugins',
     '--selection-file',   $SELECTION_FILE,
     '--plugins-snapshot', $PLUGINS_SNAPSHOT_FILE,
     '--project-path',     $PROJECT_PATH,
+    '--manifest',         $PLUGINS_COPY_MANIFEST,
     '--output',           $MATERIALIZED_PLUGINS_FILE);
+sync_copy_plan($prior_plugins_plan, _read_copy_plan($PLUGINS_COPY_MANIFEST),
+               "$CLAUDE_DATA/plugins");
 
 my @PLUGIN_MOUNTS;
-if (-d "$HOST_PLUGINS_DIR/cache") {
-    push @PLUGIN_MOUNTS, '-v', "$HOST_PLUGINS_DIR/cache:/root/.claude/plugins/cache:ro";
-}
-push @PLUGIN_MOUNTS, '-v', "$MATERIALIZED_PLUGINS_FILE:/root/.claude/plugins/installed_plugins.json:ro";
 
-# Marketplace registry: materialize a container-shaped copy (paths rewritten,
-# directory-source entries dropped) into claude-home/plugins/. Lives there
-# as a real file through the parent claude-home bind so Claude Code's
-# atomic write-tmp+rename pattern works on it — see the
-# $MATERIALIZED_MARKETPLACES_FILE definition above for the rationale.
-# Plus a RO overlay of the host's marketplaces/ data dir so the rewritten
-# installLocation paths resolve to real on-disk marketplace data.
+# Marketplaces: same reconcile+copy pattern. The metadata of every host
+# marketplace (the catalogs) is copied so the user can browse + install from
+# them inside the sandbox; only SELECTED plugins are actually installed (above).
+# Directory-source marketplaces are excluded from the copy by skills.pl — they
+# get the LIVE read-only bind below instead.
 if (-f "$HOST_PLUGINS_DIR/known_marketplaces.json") {
-    make_path("$CLAUDE_DATA/plugins")
-        unless -d "$CLAUDE_DATA/plugins";
+    my $prior_mkt_plan = _read_copy_plan($MARKETPLACES_COPY_MANIFEST);
     run_perl_or_die('materialize-known-marketplaces failed',
         'materialize-known-marketplaces',
-        '--output', $MATERIALIZED_MARKETPLACES_FILE);
-}
-if (-d "$HOST_PLUGINS_DIR/marketplaces") {
-    push @PLUGIN_MOUNTS, '-v', "$HOST_PLUGINS_DIR/marketplaces:/root/.claude/plugins/marketplaces:ro";
+        '--manifest', $MARKETPLACES_COPY_MANIFEST,
+        '--output',   $MATERIALIZED_MARKETPLACES_FILE);
+    sync_copy_plan($prior_mkt_plan, _read_copy_plan($MARKETPLACES_COPY_MANIFEST),
+                   "$CLAUDE_DATA/plugins");
 }
 
 # Bind-mount each directory-source marketplace's source.path INTO the
-# container's /root/.claude/plugins/marketplaces/<name>. These mounts
-# overlay the parent marketplaces mount above with the actual plugin
-# tree, so claude-code can resolve <marketplace>/.claude-plugin/
-# marketplace.json and follow each plugin's relative `source` to the
-# real code. ccpraxis-local is the canonical example: source.path is
-# ~/.claude/ccpraxis/plugins/, which contains .claude-plugin/ +
-# backpack/ + beacon/ + sandbox/ + steward/.
+# container's /root/.claude/plugins/marketplaces/<name> as a LIVE read-only
+# bind (so the ccpraxis dev loop never drifts and the container can't modify it).
+# These nest on top of the copied marketplaces/ dir in claude-home, so claude-code
+# can resolve <marketplace>/.claude-plugin/marketplace.json and follow each
+# plugin's relative `source` to the real code. ccpraxis-local is the canonical
+# example: source.path is ~/.claude/ccpraxis/plugins/, which contains
+# .claude-plugin/ + backpack/ + beacon/ + sandbox/ + steward/.
 #
-# materialize-known-marketplaces (above) rewrites these entries'
-# source.path AND installLocation to /root/.claude/plugins/marketplaces/
-# <name> — same target as these binds, so the JSON references match
-# what's on the in-container filesystem.
+# materialize-known-marketplaces (above) rewrites these entries' source.path AND
+# installLocation to /root/.claude/plugins/marketplaces/<name> — same target as
+# these binds, so the JSON references match what's on the in-container filesystem.
 if (-f "$HOST_PLUGINS_DIR/known_marketplaces.json") {
     my $km_data;
     {
@@ -1276,6 +1305,11 @@ if (-f "$HOST_PLUGINS_DIR/known_marketplaces.json") {
             $host_path =~ s|/+$||;
             $host_path = winify_path($host_path);
             next unless -d $host_path;
+            # Ensure the nested mountpoint exists in claude-home (directory-source
+            # marketplaces are excluded from the copy, so claude-home won't
+            # already have this subdir) — podman mounts the live source on top.
+            make_path("$CLAUDE_DATA/plugins/marketplaces/$name")
+                unless -d "$CLAUDE_DATA/plugins/marketplaces/$name";
             my $container_path = "/root/.claude/plugins/marketplaces/$name";
             push @PLUGIN_MOUNTS, '-v', "${host_path}:${container_path}:ro";
         }
@@ -1686,6 +1720,25 @@ sub container_status {
     my $s = `$PODMAN inspect --format '{{.State.Status}}' "$name" 2>/dev/null`;
     chomp $s if defined $s;
     return defined $s ? $s : '';
+}
+
+# Read a copy-plan manifest (skills.pl wrote it): an arrayref of {src, dest_rel}.
+# Missing / unparseable -> empty list (treated as "placed nothing last launch").
+sub _read_copy_plan {
+    my $path = shift;
+    return [] unless defined $path && -f $path;
+    my $bytes = _read_file($path);
+    return [] unless defined $bytes;
+    my $data = eval { JSON::PP->new->decode($bytes) };
+    return (ref $data eq 'ARRAY') ? $data : [];
+}
+
+# Reconcile a host-tier copy-plan into claude-home (Fix 2). Thin wrapper over
+# PluginSync::reconcile_copy_plan (the pure, unit-tested core), passing
+# winify_path so `/c/...` host srcs become `C:/...` for perl file ops on Windows.
+sub sync_copy_plan {
+    my ($prior, $new, $dest_root) = @_;
+    PluginSync::reconcile_copy_plan($prior, $new, $dest_root, winify => \&winify_path);
 }
 
 # Fix 3: block until the user presses a key, so a held-open connector window

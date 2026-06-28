@@ -1471,9 +1471,12 @@ sub cmd_manifest {
 # Subcommand: materialize-plugins
 # =====================================================================
 #
-# Emits a container-shaped installed_plugins.json containing only the
-# user-selected plugins, with all paths rewritten so a Linux container
-# at /root/.claude/plugins/* can resolve them.
+# Emits a container-shaped installed_plugins.json containing the user-selected
+# plugins, with all paths rewritten so a Linux container at
+# /root/.claude/plugins/* can resolve them. Tier-2 (Fix 2): also MERGE-PRESERVES
+# plugins installed INSIDE the sandbox (entries in the prior output that aren't
+# host plugins) so they survive re-materialization; deselected host plugins are
+# dropped. See the merge block below.
 #
 # Required: --selection-file FILE --output FILE [--project-path P]
 sub cmd_materialize_plugins {
@@ -1545,8 +1548,24 @@ sub cmd_materialize_plugins {
         return $best;
     };
 
+    # Prior host-tier manifest (the keys THIS materializer placed last launch).
+    # It's the provenance record that distinguishes a plugin the launcher placed
+    # (host-tier) from one the container installed itself (sandbox-tier) — see
+    # the merge below. Read BEFORE we overwrite it.
+    my $manifest_file = $opts{manifest};
+    my %prior_keys;
+    if ($manifest_file && -f $manifest_file) {
+        my $pj = read_json($manifest_file);
+        if (ref $pj eq 'ARRAY') {
+            for my $e (@$pj) {
+                $prior_keys{$e->{key}} = 1 if ref $e eq 'HASH' && defined $e->{key};
+            }
+        }
+    }
+
     my %plugins_out;
     my @missing;
+    my @copy_plan;   # [{key, src(host path), dest_rel(under plugins/)}] for the launcher to copy
     for my $key (@{$state->{selected_plugins}}) {
         my $p = $by_key{$key};
         if (!$p) {
@@ -1570,10 +1589,42 @@ sub cmd_materialize_plugins {
 
         # Wrap in a single-element installs array (matches host file shape).
         $plugins_out{$key} = [$entry];
+
+        # Copy-plan entry: the launcher copies the host plugin CODE at
+        # $p->{install_path} into claude-home at the container-relative dest, so
+        # the selected plugin is present in the sandbox (the host is never
+        # mounted in). Only when the path rewrote cleanly under the plugins root.
+        if (defined $p->{install_path} && length $p->{install_path}
+            && defined $entry->{installPath}
+            && $entry->{installPath} =~ m{^\Q$CONTAINER_PLUGINS_ROOT\E/(.+)$}) {
+            push @copy_plan, { key => $key, src => $p->{install_path}, dest_rel => $1 };
+        }
     }
 
     if (@missing) {
         warn "Warning: selected plugins not in current discovery; skipping: ", join(", ", @missing), "\n";
+    }
+
+    # Tier-2 merge-preserve (Fix 2). installed_plugins.json is a real RW file in
+    # claude-home that Claude Code rewrites when a plugin is installed INSIDE the
+    # sandbox; re-materializing from the host selection each launch would drop
+    # those entries (and Claude Code won't load a plugin with no registry entry).
+    # Provenance comes from the prior manifest, NOT the host registry: a key in
+    # the prior output but NOT among the keys WE placed last launch
+    # (%prior_keys) was installed in-container -> preserve it. (This is why the
+    # host registry is the wrong test: a plugin can exist on the host AND be a
+    # sandbox install the user never selected — e.g. notion — and that must be
+    # kept, not dropped.) A key WE placed before that isn't selected now was
+    # DESELECTED -> drop it. Host-selected keys always get the fresh
+    # (authoritative) version, so in-container tampering with a host entry is
+    # reverted here.
+    my $existing = -f $output ? read_json($output) : {};
+    $existing = {} unless ref $existing eq 'HASH';
+    my $existing_plugins = (ref $existing->{plugins} eq 'HASH') ? $existing->{plugins} : {};
+    for my $key (sort keys %$existing_plugins) {
+        next if exists $plugins_out{$key};   # host-selected this launch -> fresh wins
+        next if exists $prior_keys{$key};    # we placed it before, now deselected -> drop
+        $plugins_out{$key} = $existing_plugins->{$key};  # sandbox-installed -> preserve
     }
 
     my $registry = { plugins => \%plugins_out };
@@ -1588,6 +1639,23 @@ sub cmd_materialize_plugins {
         unlink $tmp;
         die "rename $tmp -> $output: $!\n";
     };
+
+    # Write the host-tier manifest (the copy-plan): the launcher reads it to
+    # copy each selected plugin's CODE into claude-home and to RECONCILE (remove
+    # the dirs it placed last launch that aren't selected now -> no zombies), and
+    # the NEXT materialize reads it back as %prior_keys for the merge provenance.
+    if ($manifest_file) {
+        my $mdir = dirname($manifest_file);
+        make_path($mdir) unless -d $mdir;
+        my $mtmp = "$manifest_file.tmp.$$";
+        open my $mfh, '>:raw', $mtmp or die "write $mtmp: $!\n";
+        print $mfh JSON::PP->new->canonical(1)->pretty->utf8->encode(\@copy_plan);
+        close $mfh or die "close $mtmp: $!\n";
+        rename $mtmp, $manifest_file or do {
+            unlink $mtmp;
+            die "rename $mtmp -> $manifest_file: $!\n";
+        };
+    }
     return 0;
 }
 
@@ -1635,6 +1703,14 @@ sub cmd_materialize_known_marketplaces {
     my $host = -f $host_file ? read_json_with_retry($host_file) : {};
     $host = {} unless ref $host eq 'HASH';
 
+    # The host plugins dir is the known_marketplaces.json's own directory; each
+    # marketplace's metadata lives at <plugins>/marketplaces/<name>. The launcher
+    # copies that into claude-home (the host is never mounted in) for
+    # non-directory-source marketplaces; directory-source ones (ccpraxis-local)
+    # get a LIVE read-only bind instead, so they're excluded from the copy-plan.
+    my $host_plugins_dir = dirname($host_file);
+    my @mkt_copy_plan;   # [{name, src(host marketplaces/<name>), dest_rel}]
+
     my %out;
     my @dropped;
     for my $name (sort keys %$host) {
@@ -1669,11 +1745,30 @@ sub cmd_materialize_known_marketplaces {
         my %rewritten = %$entry;
         $rewritten{installLocation} = $container_install;
         $out{$name} = \%rewritten;
+
+        # Copy-plan: launcher copies this marketplace's metadata into claude-home.
+        my $mkt_src = "$host_plugins_dir/marketplaces/$name";
+        push @mkt_copy_plan, { name => $name, src => $mkt_src, dest_rel => "marketplaces/$name" }
+            if -d $mkt_src;
     }
 
     if (@dropped) {
         warn "materialize-known-marketplaces: dropped marketplaces not usable inside sandbox:\n",
             map { "  - $_\n" } @dropped;
+    }
+
+    # Tier-2 merge-preserve (Fix 2): known_marketplaces.json is a real RW file
+    # in claude-home; `claude plugin marketplace add` INSIDE the sandbox writes
+    # new entries here. Re-materializing from the host each launch would drop
+    # them. Carry forward any existing marketplace NOT present on the host
+    # ($host) — it was added in-container. Host marketplaces always get the
+    # freshly rewritten (authoritative) version built above.
+    my $existing = -f $output ? read_json($output) : {};
+    $existing = {} unless ref $existing eq 'HASH';
+    for my $name (sort keys %$existing) {
+        next if exists $out{$name};     # host marketplace -> fresh rewrite wins
+        next if exists $host->{$name};  # host marketplace (defensive; already in %out)
+        $out{$name} = $existing->{$name};  # sandbox-added marketplace -> preserve
     }
 
     my $dir = dirname($output);
@@ -1686,6 +1781,22 @@ sub cmd_materialize_known_marketplaces {
         unlink $tmp;
         die "rename $tmp -> $output: $!\n";
     };
+
+    # Write the marketplace copy-plan manifest (non-directory-source). The
+    # launcher reads it to copy each marketplace's metadata into claude-home and
+    # to reconcile (remove dirs it placed last launch that are gone now).
+    if (my $manifest_file = $opts{manifest}) {
+        my $mdir = dirname($manifest_file);
+        make_path($mdir) unless -d $mdir;
+        my $mtmp = "$manifest_file.tmp.$$";
+        open my $mfh, '>:raw', $mtmp or die "write $mtmp: $!\n";
+        print $mfh JSON::PP->new->canonical(1)->pretty->utf8->encode(\@mkt_copy_plan);
+        close $mfh or die "close $mtmp: $!\n";
+        rename $mtmp, $manifest_file or do {
+            unlink $mtmp;
+            die "rename $mtmp -> $manifest_file: $!\n";
+        };
+    }
     return 0;
 }
 

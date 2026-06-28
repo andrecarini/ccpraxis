@@ -100,8 +100,14 @@ HOST                                                                         CON
 <project>/.ccpraxis-local-data/claude-home/.claude.json                 ──►  /root/.claude.json             (file bind, RW)
 ~/.claude/ccpraxis/scripts/statusline.pl                                ──►  /root/.claude/statusline.pl    (file bind, RO)
 <each selected skill dir>                                               ──►  /root/.claude/skills/<name>    (bind, RO)
-~/.claude/plugins/cache + manifests                                     ──►  /root/.claude/plugins/...      (bind, RO)
+<each directory-source marketplace source.path (e.g. ccpraxis)>         ──►  /root/.claude/plugins/marketplaces/<name> (bind, RO, live)
 ```
+
+Plugins are NOT mounted (Fix 2 copy model): the launcher COPIES the selected
+host plugins (+ marketplace metadata) into `claude-home/plugins/` each launch, so
+they ride the RW claude-home bind and the container can install more alongside
+them — without the host plugin dirs ever being mounted in. See "Plugin store"
+below.
 
 **Host filesystem is the live state.** `<project>/.ccpraxis-local-data/claude-home/` is the
 container's `/root/.claude/` — claude's session jsonl, tasks/, lockfiles,
@@ -145,6 +151,41 @@ The launcher applies these in order during `podman create`:
    bind)** — claude-code's outside-`/root/.claude/` config file. Same
    reasoning as #3 (single file, must exist on host before mount —
    `ensure_claude_json_host_file` touches it if missing).
+
+---
+
+## Plugin store (Fix 2 — copy model, two tiers)
+
+The host plugin dirs are **never mounted** into the container. Instead the
+launcher reconciles a copy into `claude-home/plugins/` (which rides the RW
+claude-home bind), so plugins can be installed *inside* the sandbox with zero
+host changes:
+
+- **Tier 1 — host-selected plugins.** The plugins you ticked in the launcher's
+  selection TUI are **copied** in (code at `cache/<mkt>/<plugin>/<ver>` + the
+  marketplace catalogs). Each launch the host-tier is **reconciled to exactly the
+  current selection**: selected plugins are re-copied fresh (host authoritative →
+  no drift, in-container tampering reverted), and anything the launcher placed
+  before that's now deselected *or* removed on the host is deleted (no zombies).
+- **Tier 2 — sandbox-installed plugins.** `claude plugin install` /
+  `marketplace add` inside the sandbox land in the same tree and **persist**;
+  the reconcile never touches a dir it didn't place. Provenance comes from a
+  copy-plan **manifest** in `.launcher/` (RO in the container), which also lets
+  the registry merge tell a sandbox install of an unselected host plugin (keep)
+  from a deselected host plugin (drop).
+- **`installed_plugins.json` / `known_marketplaces.json`** are real RW files in
+  `claude-home/plugins/`, re-materialized each launch (selection authoritative +
+  sandbox installs merge-preserved).
+- **Directory-source marketplaces** (e.g. `ccpraxis-local`) are the one exception
+  — they stay a **live read-only bind** of their `source.path`, so the ccpraxis
+  dev loop is always current and the container can't modify it.
+
+Security posture: because the host plugin dirs are never mounted, a compromised
+in-container process **cannot reach or damage host plugins** (`~/.claude/plugins`
+is only ever a copy *source*), **cannot pull in plugins the user didn't select**
+(only selected code is copied), and **cannot change the selection** (it lives in
+the RO `.launcher/` mount). It may scribble on its own *copy* — reverted next
+launch.
 
 ---
 
