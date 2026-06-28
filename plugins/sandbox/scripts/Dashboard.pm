@@ -217,9 +217,14 @@ sub _title_line {
 sub _footer_line {
     my ($s, $cols) = @_;
     my $pending = defined $s->{pending} ? $s->{pending} : '';
-    my $legend = $pending eq 'shutdown'
-        ? 'Shut down ALL coordinators in this project? [y] confirm   [any other] cancel'
-        : ' [c] launch   [s] shutdown-all   [up/down] scroll   [r] refresh   [q] quit';
+    my $legend;
+    if ($pending eq 'shutdown') {
+        $legend = 'Shut down ALL coordinators in this project? [y] confirm   [any other] cancel';
+    } elsif (defined $s->{footer_flash} && length $s->{footer_flash}) {
+        $legend = ' ' . $s->{footer_flash};   # transient [c]-on-dead-container notice
+    } else {
+        $legend = ' [c] launch   [s] shutdown-all   [up/down] scroll   [r] refresh   [q] quit';
+    }
     return clip_pad($legend, $cols);
 }
 
@@ -260,6 +265,30 @@ sub _status_alert {
     return 'container unreachable (podman down or host asleep) - [r] retry, [q] quit'
         if $st eq 'unknown';
     return "container is $st (not running) - [q] quit, then re-run claude-sandbox to relaunch";
+}
+
+# can_launch(\%state) -> 1 iff the container is in a state where the [c] hotkey
+# can actually attach a connector. [c] spawns `claude-sandbox --session`, which
+# `podman exec`s into the container — and exec needs a RUNNING container. On any
+# other state (exited / stopped / created / restarting / gone / not-yet-known)
+# the exec instantly fails and the spawned Windows Terminal vanishes, so the
+# loop SUPPRESSES the spawn and flashes launch_blocked_msg() instead. This is
+# _status_alert's "is it alive?" judgement seen from the launch side.
+sub can_launch {
+    my ($s) = @_;
+    $s ||= {};
+    return 0 if $s->{container_gone};
+    my $st = defined $s->{status} ? lc $s->{status} : '';
+    return $st eq 'running' ? 1 : 0;
+}
+
+# launch_blocked_msg() -> the transient footer notice shown when [c] is pressed
+# on a non-running container (see can_launch). Names the real relaunch path so
+# the key never feels dead. The "container is down" lead is deliberately
+# distinct from the persistent _status_alert banner wording, so the two never
+# read as one duplicated line and each is independently greppable.
+sub launch_blocked_msg {
+    return 'container is down - [q] quit, then re-run claude-sandbox to relaunch';
 }
 
 sub _panel_title_line {
@@ -308,8 +337,12 @@ sub compose_frame {
     push @frame, { text => _title_line($state, $cols), role => 'title' };
     return \@frame if $rows == 1;
 
-    my $footer_role = (defined $state->{pending} && $state->{pending} eq 'shutdown')
-        ? 'footer-alert' : 'footer';
+    my $footer_role = 'footer';
+    if (defined $state->{pending} && $state->{pending} eq 'shutdown') {
+        $footer_role = 'footer-alert';
+    } elsif (defined $state->{footer_flash} && length $state->{footer_flash}) {
+        $footer_role = 'footer-flash';   # transient launch-blocked notice
+    }
     my $footer = { text => _footer_line($state, $cols), role => $footer_role };
 
     if ($rows == 2) {
@@ -345,6 +378,7 @@ sub sgr_for_role {
     return "\e[1m"        if $role eq 'panel-title';  # bold
     return "\e[2m"        if $role eq 'footer';       # dim
     return "\e[1;33;41m"  if $role eq 'footer-alert'; # bold yellow on red
+    return "\e[1;33m"     if $role eq 'footer-flash'; # bold yellow — transient notice
     return "\e[1;37;41m"  if $role eq 'alert';        # bold white on red (banner)
     return "\e[2m"        if $role eq 'scrollhint';   # dim — like the footer command row
     return '';
@@ -691,6 +725,7 @@ sub run {
     my @all_events;             # full chronological event list from the last gather
     my $activity_offset = 0;    # up/down scroll position in the Activity panel
     my $activity_max    = 0;    # scroll ceiling (set each frame by activity_window)
+    my $flash_until = 0;        # footer-flash expiry (set when [c] hit a dead container)
     my $rc = 0;
     my $ticks = 0;
 
@@ -730,6 +765,10 @@ sub run {
                 $state{uptime}         = $t - $start;
                 $state{pending}        = $pending;
                 $state{container_gone} = ($hb_state eq 'gone') ? 1 : 0;
+                # Transient footer notice when [c] was pressed on a non-running
+                # container (set in the launch branch below). Auto-expires so the
+                # normal command legend returns on its own.
+                $state{footer_flash} = ($t < $flash_until) ? launch_blocked_msg() : undef;
                 # Activity: capacity-aware window (newest-first) + a dim overflow
                 # hint. activity_window clamps the offset to the last page (so you
                 # can't scroll past the end) and tells us the scroll ceiling.
@@ -761,8 +800,16 @@ sub run {
                     $pending = $np;
                     if ($action eq 'quit') { $rc = 0; $quit = 1; last; }
                     elsif ($action eq 'launch') {
-                        my $r = $spawn->();
-                        $prev = undef if defined $r && $r eq 'redraw';
+                        if (can_launch(\%state)) {
+                            my $r = $spawn->();
+                            $prev = undef if defined $r && $r eq 'redraw';
+                        } else {
+                            # Container isn't running: a connector's `podman exec`
+                            # would instantly fail and the spawned Windows Terminal
+                            # would vanish. Suppress the spawn and flash the real
+                            # recovery path in the footer for a couple of seconds.
+                            $flash_until = $t + 2;
+                        }
                     }
                     elsif ($action eq 'shutdown') {
                         $write_sig->();

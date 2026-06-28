@@ -225,6 +225,33 @@ my %st = (
     is($bad, 0, 'compose: alert rows keep exactly $cols');
 }
 
+# can_launch: [c] may only attach a connector to a RUNNING container; every
+# other state suppresses the spawn (else the spawned terminal's `podman exec`
+# fails and the window vanishes — the bug this guards).
+{
+    ok( Dashboard::can_launch({ status => 'running' }), 'can_launch: running -> yes');
+    ok(!Dashboard::can_launch({ status => 'exited' }),  'can_launch: exited -> no');
+    ok(!Dashboard::can_launch({ status => 'stopped' }), 'can_launch: stopped -> no');
+    ok(!Dashboard::can_launch({ status => 'created' }), 'can_launch: created -> no');
+    ok(!Dashboard::can_launch({ status => 'restarting' }), 'can_launch: restarting -> no');
+    ok(!Dashboard::can_launch({ status => '' }),        'can_launch: not-yet-known -> no');
+    ok(!Dashboard::can_launch({ status => 'running', container_gone => 1 }),
+       'can_launch: heartbeat says gone -> no (overrides a stale running status)');
+
+    # When a flash is active the footer shows it (with the footer-flash role),
+    # not the command legend; absent a flash the legend returns.
+    my %fl = (%st, footer_flash => Dashboard::launch_blocked_msg());
+    my $ff = Dashboard::compose_frame(\%fl, 12, 80);
+    is($ff->[-1]{role}, 'footer-flash', 'compose: active flash -> footer row uses footer-flash role');
+    like($ff->[-1]{text}, qr/container is down/, 'compose: flash text occupies the footer');
+    unlike($ff->[-1]{text}, qr/\[s\] shutdown-all/, 'compose: flash replaces the command legend');
+    is(length($ff->[-1]{text}), 80, 'compose: flash footer kept exactly $cols');
+    like(Dashboard::sgr_for_role('footer-flash'), qr/\e\[1;33m/, 'sgr: footer-flash -> bold yellow');
+
+    my $nf = Dashboard::compose_frame(\%st, 12, 80);   # %st has no footer_flash
+    like($nf->[-1]{text}, qr/\[c\] launch/, 'compose: no flash -> normal command legend');
+}
+
 # C3 regression: a non-ASCII project name must NOT break the exactly-$cols
 # width invariant (bytes outside printable ASCII map 1:1 to '?').
 {
@@ -574,6 +601,15 @@ sub drive {
     # 'c' launches a session (spawn), then 'q'.
     my $e = drive(keys => ['c', 'q'], max_ticks => 50);
     is($e->{spawns}, 1, 'loop: c -> exactly one spawn');
+    is($e->{rc}, 0, 'loop: then q exits');
+}
+
+{
+    # 'c' on a NON-running container must NOT spawn (the connector window would
+    # just open and vanish); instead the footer flashes the real recovery path.
+    my $e = drive(keys => ['c', undef, 'q'], status => 'exited', max_ticks => 50);
+    is($e->{spawns}, 0, 'loop: c on a dead container -> no doomed spawn');
+    like($e->{out}, qr/container is down/, 'loop: c on a dead container -> footer flash shown');
     is($e->{rc}, 0, 'loop: then q exits');
 }
 
