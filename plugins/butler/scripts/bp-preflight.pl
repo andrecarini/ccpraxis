@@ -51,6 +51,26 @@ sub read_json { my $f = shift; open my $fh,'<:raw',$f or return undef; local $/;
                 return eval { JSON::PP->new->decode($r) }; }
 sub home { $ENV{USERPROFILE} // $ENV{HOME} // '' }
 
+# ---- oauth_usable($d, $now_ms) — pure predicate (testable without running main) ---
+# Returns ($ok, $reason). $now_ms defaults to time()*1000 (epoch ms).
+sub oauth_usable {
+    my ($d, $now_ms) = @_;
+    $now_ms //= time() * 1000;
+    return (0, 'creds missing/unparseable')  unless ref $d eq 'HASH';
+    my $oa = $d->{claudeAiOauth};
+    return (0, 'claudeAiOauth absent')       unless ref $oa eq 'HASH' && %$oa;
+    if (length($oa->{refreshToken} // '')) {
+        return (1, 'renewable (refreshToken)');
+    }
+    if (length($oa->{accessToken} // '') &&
+        defined $oa->{expiresAt}          &&
+        $oa->{expiresAt} =~ /^\d+$/       &&
+        $oa->{expiresAt} > $now_ms) {
+        return (1, 'accessToken unexpired');
+    }
+    return (0, 'expired with no refreshToken');
+}
+
 # ---- per-assumption checks (id => sub returning ('ok'|'fail'|'skip', detail)) ----
 # 'deep' marks checks that need network or a live claude (only run with --deep).
 my %CHECK = (
@@ -142,9 +162,17 @@ my %CHECK = (
     'harness.wake' => { run => sub {
         ('skip', 'harness property (proven in A0); bounded long-poll + re-arm is the robust fallback');
     } },
+
+    'oauth.sandbox_login' => { run => sub {
+        my $d = read_json(home()."/.claude/.credentials.json");
+        my ($ok, $reason) = oauth_usable($d);
+        return ('fail', "$reason — run \`claude-sandbox\` and \`/login\` first, then re-run dispatch-fleet") unless $ok;
+        ('ok', "sandbox login usable: $reason");
+    } },
 );
 
 # ---- run ------------------------------------------------------------------
+unless (caller) {
 my $plat = detect_platform();
 my $manifest = read_json("$Bin/../docs/assumptions.json")
     or die "bp-preflight: cannot read assumptions.json (the registry must exist)\n";
@@ -198,3 +226,5 @@ if (@fail) {
 }
 print "\nPREFLIGHT OK — environment supported.\n" unless $opt{quiet};
 exit 0;
+} # end unless (caller)
+1;

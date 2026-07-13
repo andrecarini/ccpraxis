@@ -12,6 +12,8 @@ The model: a **deterministic, token-free orchestrator script** (`bp-orchestrator
 
 Sandbox-only: the fleet is detached `claude -p` coordinators (`setsid`/`nohup`/`flock`), which only work inside the rootless-Podman sandbox. `bp-orchestrate.sh` refuses on the host.
 
+> **One-time login required:** log in once interactively (`claude-sandbox` → `/login`) before the first fleet. The preflight checks for a usable sandbox login and refuses without one; thereafter fleets ride the persisted independent token (the keeper refreshes it).
+
 ## Steps
 
 1. **Prerequisite — a blueprint exists, audited, with real ledgers.** Confirm `<data>/blueprints/$0/blueprint.md` plus `packages/<pkg>.md` ledgers exist with non-empty `write_set` frontmatter. If it is missing, unaudited, or has empty write sets, stop and send the user to `/blueprint:create` (or `/blueprint:manage audit`) — never launch an unscoped fleet.

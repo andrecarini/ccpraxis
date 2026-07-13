@@ -128,6 +128,8 @@ Use one of these names instead of `localhost` or `127.0.0.1` when connecting to 
 
 ## Persistence
 
+> **Fleet login:** log in once interactively (`claude-sandbox` → `/login`) before running the first `dispatch-fleet`. Each sandbox owns its own independent OAuth grant (not a copy of the host's token); the keeper refreshes it automatically, so subsequent fleets ride it without re-login. The preflight (`oauth.sandbox_login` check) refuses to dispatch a fleet until a usable sandbox login exists.
+
 - **This container is persistent** — it survives between sessions. Installed packages (apt, npm global, pip global, runtimes) persist across sessions.
 - File changes in `/project` persist (bind-mounted to host)
 - Your memories, conversation history, and plans persist in `/project/.ccpraxis-local-data/claude-home/`

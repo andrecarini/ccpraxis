@@ -125,6 +125,12 @@
       "supported_envs": ["win32"],
       "implement_hint": "Detect docker vs podman (already done elsewhere); on a host without either, dispatch-fleet is unsupported — halt loud.",
       "surface": "preflight"
+    },
+    {
+      "id": "oauth.sandbox_login",
+      "what": "the sandbox has its OWN usable claudeAiOauth (independent /login grant, not a host copy)",
+      "implement_hint": "run `claude-sandbox` and `/login` once inside the sandbox; the grant persists (claude-home RW bind) and the keeper refreshes it, so fleets ride it",
+      "supported_envs": ["sandbox-linux"]
     }
   ]
 }
