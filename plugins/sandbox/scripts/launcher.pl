@@ -53,6 +53,7 @@ use KeepAwake ();         # B5: dashboard wake-lock decision + lifecycle holder
 use ConnectorHold ();     # Fix 3: hold-the-window decision when a connector loses the container
 use ClaudeConfig ();      # self-heal .claude.json onboarding-bypass (0-byte / lost-keys)
 use PluginSync ();        # Fix 2: copy-model plugin-store reconcile (copy/prune/reconcile)
+use PortAlloc ();         # fix-multiple-running-sandboxes: per-container port-block allocation
 use JSON::PP ();          # parse backpack.json + write the approved install-set
 use File::Path qw(make_path);
 use File::Spec;
@@ -1021,6 +1022,47 @@ sub _container_exists {
     return $? == 0;
 }
 
+# _enumerate_inuse_host_ports($self_name) -> @host_port_integers
+#   fix-multiple-running-sandboxes / Decision #2-#3: collect every published
+#   HOST port already claimed by an existing claude-sandbox container (running
+#   OR stopped), so PortAlloc can floor them to occupied bases and hand this new
+#   container a free block. Excludes $self_name (this project's own container,
+#   which is about to be created / recreated). Robust to no-podman / empty
+#   output (returns an empty list -> next_free_base yields the 9000 base).
+sub _enumerate_inuse_host_ports {
+    my ($self_name) = @_;
+    $self_name = defined $self_name ? $self_name : '';
+
+    # Discover sandbox containers by NAME pattern (claude-<project>-<8 hex>), NOT
+    # by `ancestor=claude-sandbox:latest`: after any image rebuild the still-running
+    # OLD containers descend from a superseded image id, so the ancestor filter
+    # would MISS them and their block would be handed out again -> collision.
+    # Name-matching catches them regardless of image; over-matching only wastes a
+    # block (harmless, Decision #4), under-matching collides.
+    my $names_raw = `$PODMAN ps -a --format "{{.Names}}" 2>/dev/null`;
+    return () unless defined $names_raw && length $names_raw;
+
+    my @host_ports;
+    for my $name (split /\s+/, $names_raw) {
+        next unless length $name;
+        next unless $name =~ /^claude-.+-[0-9a-f]{8}$/;   # our sandbox naming
+        next if $name eq $self_name;
+
+        # Read the CREATE-time published host ports via `podman inspect` — this is
+        # STATE-AGNOSTIC (running AND stopped/exited). `podman port <name>` was
+        # WRONG here: it reads the live network namespace and returns EMPTY for a
+        # stopped container (verified, podman 5.8.3), so a stopped sibling's block
+        # would be invisible and handed out again -> EADDRINUSE on its restart,
+        # which Decision #5 then cannot fix. .HostConfig.PortBindings is the
+        # persisted -p mapping and survives stop. ($p/$c are Go-template vars —
+        # backslash-escaped so Perl does not interpolate them.)
+        my $ports_raw = `$PODMAN inspect --format '{{range \$p,\$c := .HostConfig.PortBindings}}{{range \$c}}{{.HostPort}} {{end}}{{end}}' "$name" 2>/dev/null`;
+        next unless defined $ports_raw;
+        push @host_ports, map { $_ + 0 } ($ports_raw =~ /(\d+)/g);
+    }
+    return @host_ports;
+}
+
 # Container-config blueprint drift (CLAUDE.md + settings.json).
 my $CURRENT_CLAUDE_MD_HASH = md5_of_file("$CONTAINER_CONFIG/CLAUDE.md");
 my $CURRENT_SETTINGS_HASH  = md5_of_file("$CONTAINER_CONFIG/settings.json");
@@ -1869,6 +1911,67 @@ if (_container_exists($CONTAINER_NAME)) {
     print _c_step("Creating new container: $CONTAINER_NAME"), "\n";
 }
 
+# -----------------------------------------------------------------------
+# Per-container port-block allocation (fix-multiple-running-sandboxes).
+#
+# Each sandbox owns one 20-port block (base..base+19). On CREATE we pick
+# the lowest block not already published by another claude-sandbox
+# container (running OR stopped) and persist that base to
+# $LAUNCHER_DIR/port-base. On ATTACH we only read the persisted base for
+# messaging — podman baked the -p mapping at create time and `podman
+# start` takes no -p, so we never re-allocate or force-recreate an
+# existing container (Decision #5).
+#
+# These are file-scoped so the port args survive from the CREATE block
+# down to the podman-start retry loop below, where an EADDRINUSE at start
+# re-runs the allocator against a fresh in-use set (Decision #3).
+my $PORT_BASE;                 # the allocated block base (undef => no published ports)
+my @PORT_INUSE_BASES;          # bases already occupied by sibling sandboxes
+my @pub_port_args;         # -p flags fed into @podman_args
+my @PORT_ENV_ARGS;             # -e flags fed into @podman_args (SANDBOX_PORT_BASE, ...)
+my @podman_args;               # the assembled `podman create` command (file-scoped for retry)
+my $build_create_args;         # closure: (re)assemble @podman_args for the current port block
+
+# Rebuild the -p/-e port arg lists for a given base (undef => no ports).
+# Kept as a closure so the create + the EADDRINUSE-retry recreate share
+# one code path.
+my $refresh_port_args = sub {
+    my ($base) = @_;
+    @pub_port_args = ();
+    @PORT_ENV_ARGS     = ();
+    return unless defined $base;
+    # PortAlloc owns the exact -p / -e strings (module 01); we only splice
+    # its result into the podman-create args. The published (-p) and env
+    # (-e) halves come back as two arrayrefs.
+    my ($pub_args, $env_args) = PortAlloc::build_port_args($base);
+    push @pub_port_args, @$pub_args;
+    push @PORT_ENV_ARGS,     @$env_args;
+};
+
+if (! _container_exists($CONTAINER_NAME)) {
+    # CREATE: enumerate sibling-occupied host ports, floor them to block
+    # bases, and pick the lowest free base. Robust to no-podman / empty
+    # output — an empty in-use set yields the 9000 base.
+    @PORT_INUSE_BASES = PortAlloc::bases_from_published(
+        [ _enumerate_inuse_host_ports($CONTAINER_NAME) ]);
+    $PORT_BASE = PortAlloc::next_free_base(\@PORT_INUSE_BASES);
+    if (defined $PORT_BASE) {
+        print _c_ok("Allocated host port block $PORT_BASE-@{[$PORT_BASE + 19]}"), "\n";
+        _write_file("$LAUNCHER_DIR/port-base", $PORT_BASE);
+    } else {
+        print STDERR _c_warn("WARNING:"),
+            " no free host port block available — launching with NO published ports.\n";
+    }
+    $refresh_port_args->($PORT_BASE);
+} else {
+    # ATTACH: read the persisted base for messaging only. Never allocate
+    # or re-publish (podman baked the mapping at create; `podman start`
+    # takes no -p).
+    $PORT_BASE = _read_file("$LAUNCHER_DIR/port-base");
+    chomp $PORT_BASE if defined $PORT_BASE;
+    $PORT_BASE = ($PORT_BASE // '') =~ /^\d+$/ ? $PORT_BASE + 0 : undef;
+}
+
 if (! _container_exists($CONTAINER_NAME)) {
 
     # Materialize blueprint copies on first create.
@@ -1889,26 +1992,32 @@ if (! _container_exists($CONTAINER_NAME)) {
     ensure_claude_json_host_file();
     ensure_credentials_json_host_file();
 
-    my @podman_args = (
-        $PODMAN, 'create', '-it',
-        '--name',     $CONTAINER_NAME,
-        '--hostname', 'claude-sandbox',
-        # 9000-9009: published AND socat-bridged in the container entrypoint
-        # (0.0.0.0:N -> 127.0.0.1:N), so loopback-bound listeners like Claude
-        # Code's OAuth callback receiver are reachable from the host browser.
-        '-p',         '9000-9009:9000-9009',
-        # 9010-9019: published but deliberately NOT bridged. Nothing squats
-        # these, so a server can bind 0.0.0.0:N directly and be host-reachable
-        # with no socat to evict. Use for dev servers / emulators that bind
-        # the wildcard address themselves (the common case).
-        '-p',         '9010-9019:9010-9019',
-        # Sandbox-marker env var that skill guards inside the container key
-        # off (instead of fragile $HOME-path sniffing). Stable across any
-        # future image-internal user/path changes.
-        '-e',         'CLAUDE_SANDBOX=1',
-    );
-    push @podman_args, @EXTRA_ENV;
-    push @podman_args,
+    # Assemble the full `podman create` arg list. Kept as a closure so the
+    # EADDRINUSE-retry loop below (at podman-start time) can rebuild it with
+    # a freshly-allocated port block and recreate the container. Reads the
+    # current @pub_port_args / @PORT_ENV_ARGS, which $refresh_port_args
+    # rewrites on each reallocation.
+    $build_create_args = sub {
+        my @args = (
+            $PODMAN, 'create', '-it',
+            '--name',     $CONTAINER_NAME,
+            '--hostname', 'claude-sandbox',
+            # Sandbox-marker env var that skill guards inside the container
+            # key off (instead of fragile $HOME-path sniffing). Stable across
+            # any future image-internal user/path changes.
+            '-e',         'CLAUDE_SANDBOX=1',
+        );
+        # Published host-port block, allocated above via PortAlloc. The
+        # base's two sub-ranges (base..base+9 bridged, base+10..base+19 open)
+        # are published here in place of the old hardcoded 9000-9019 literals,
+        # so concurrent sandboxes never collide on the same host ports. The
+        # matching SANDBOX_PORT_BASE / SANDBOX_*_PORTS env vars ride alongside
+        # (build_port_args returns both halves). Empty when no free block was
+        # available (fallback: no published ports).
+        push @args, @pub_port_args;
+        push @args, @PORT_ENV_ARGS;
+        push @args, @EXTRA_ENV;
+        push @args,
         '-v', "${PROJECT_PATH}:/project",
         # /root/.claude is a direct bind from host's claude-home/.
         # On WSL2 (and Linux/macOS hosts), the bind honors O_APPEND and
@@ -1943,15 +2052,21 @@ if (! _container_exists($CONTAINER_NAME)) {
         # a directory.
         '-v', "${CLAUDE_DATA}/.claude.json:/root/.claude.json",
         '-v', "${CLAUDE_HOST_CONFIG}/ccpraxis/scripts/statusline.pl:/root/.claude/statusline.pl:ro";
-    push @podman_args, @SKILL_MOUNTS;
-    push @podman_args, @PLUGIN_MOUNTS;
-    push @podman_args, @EXTRA_MOUNTS;
-    push @podman_args, @BACKPACK_MOUNTS;
-    push @podman_args, 'claude-sandbox:latest';
+        push @args, @SKILL_MOUNTS;
+        push @args, @PLUGIN_MOUNTS;
+        push @args, @EXTRA_MOUNTS;
+        push @args, @BACKPACK_MOUNTS;
+        push @args, 'claude-sandbox:latest';
 
-    # Rewrite every `-v HOST:CONTAINER[:opts]` pair into `--mount type=bind,…`
-    # to defeat MSYS2's `:`-as-path-list mangling on Git-for-Windows perl.
-    @podman_args = convert_v_to_mount(@podman_args);
+        # Rewrite every `-v HOST:CONTAINER[:opts]` pair into
+        # `--mount type=bind,…` to defeat MSYS2's `:`-as-path-list mangling on
+        # Git-for-Windows perl. The generated `-p N-M:N-M` args are NOT `-v`
+        # pairs, so convert_v_to_mount leaves them untouched — the MSYS2 guard
+        # at the top of the file remains their sole colon protection.
+        return convert_v_to_mount(@args);
+    };
+
+    @podman_args = $build_create_args->();
 
     my $rc = system(@podman_args);
     log_ev('container_create', { exit => $rc >> 8, container => $CONTAINER_NAME });
@@ -2089,7 +2204,89 @@ if ($CONTAINER_WAS_CREATED && -f $BACKPACK_HOST_FILE) {
 # won the create branch — no other writer can be inside the same
 # container's apt/dpkg.
 release_lock();
+
+# podman binds published host ports at START (not create), so an
+# "address already in use" collision surfaces here. On the CREATE path a
+# racing sandbox may have grabbed our block between enumeration and start;
+# recover by rm'ing the just-created container, marking this base occupied,
+# re-running PortAlloc::next_free_base for a fresh block, rebuilding the
+# create args, and recreating — bounded, then giving up loudly. On the
+# ATTACH path we do NOT force-recreate an existing container (Decision #5):
+# its port mapping is baked in, so we tell the user to rebuild ([r]) for a
+# fresh block.
+#
+# `podman start` returns a non-zero exit on the port-bind failure but
+# system() doesn't hand us its stderr. Only when the start fails do we
+# re-run it under backticks to capture the message and classify whether it
+# is an address-in-use collision (a fresh `podman start` on a container
+# that is still stopped reproduces the same bind error deterministically).
 my $start_rc = system($PODMAN, 'start', $CONTAINER_NAME);
+my $port_in_use = sub {
+    my ($status) = @_;
+    return 0 if $status == 0;
+    my $out = `$PODMAN start "$CONTAINER_NAME" 2>&1`;
+    return (defined $out
+        && $out =~ /EADDRINUSE|address already in use|port is already allocated|already in use/i) ? 1 : 0;
+};
+
+if ($start_rc != 0 && $port_in_use->($start_rc)) {
+
+    if ($CONTAINER_WAS_CREATED) {
+        my $tries = 0;
+        my $max_tries = 5;
+        while ($start_rc != 0 && $tries < $max_tries) {
+            $tries++;
+            print STDERR _c_warn("WARNING:"),
+                " host port block "
+                . (defined $PORT_BASE ? "$PORT_BASE-@{[$PORT_BASE + 19]}" : '(none)')
+                . " is already in use — reallocating (attempt $tries/$max_tries).\n";
+            # Mark the collided base occupied and pick the next free block.
+            push @PORT_INUSE_BASES, $PORT_BASE if defined $PORT_BASE;
+            my $next = PortAlloc::next_free_base(\@PORT_INUSE_BASES);
+            if (!defined $next) {
+                print STDERR _c_err("ERROR:"),
+                    " no free host port block available after $tries attempt(s) — giving up.\n";
+                reset_terminal();
+                exit 1;
+            }
+            $PORT_BASE = $next;
+            _write_file("$LAUNCHER_DIR/port-base", $PORT_BASE);
+            $refresh_port_args->($PORT_BASE);
+            # Recreate with the fresh block, then retry start.
+            system($PODMAN, 'rm', '-f', $CONTAINER_NAME);
+            @podman_args = $build_create_args->();
+            my $recreate_rc = system(@podman_args);
+            if ($recreate_rc != 0) {
+                print STDERR _c_err("ERROR:"),
+                    " podman recreate failed (exit @{[$recreate_rc >> 8]}) during port-collision retry.\n";
+                reset_terminal();
+                exit ($recreate_rc >> 8 || 1);
+            }
+            print _c_ok("Reallocated host port block $PORT_BASE-@{[$PORT_BASE + 19]}"), "\n";
+            $start_rc = system($PODMAN, 'start', $CONTAINER_NAME);
+            last if $start_rc == 0;
+            last unless $port_in_use->($start_rc);
+        }
+        if ($start_rc != 0) {
+            print STDERR _c_err("ERROR:"),
+                " could not find a free host port block after $tries attempt(s) — giving up.\n";
+            reset_terminal();
+            exit ($start_rc >> 8 || 1);   # never exit 0 on a failed/ signal-killed start
+        }
+    } else {
+        # Existing container: its -p mapping was baked at create and cannot
+        # be re-published by `podman start`. Do NOT force-recreate.
+        print STDERR "\n";
+        print STDERR _c_err("ERROR:"),
+            " another sandbox took this container's host ports"
+            . (defined $PORT_BASE ? " (block $PORT_BASE-@{[$PORT_BASE + 19]})" : '') . ".\n";
+        print STDERR "       This container's port mapping is fixed for its lifetime.\n";
+        print STDERR "       Rebuild ([r] at the next prompt) to recreate it with a fresh,\n";
+        print STDERR "       free port block.\n\n";
+        reset_terminal();
+        exit ($start_rc >> 8 || 1);   # never exit 0 on a failed/ signal-killed start
+    }
+}
 log_ev('container_start', { exit => $start_rc >> 8, container => $CONTAINER_NAME });
 
 # Land the first sentinel touch IMMEDIATELY after `podman start`, before
