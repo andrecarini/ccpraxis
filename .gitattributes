@@ -1,0 +1,25 @@
+# ==========================================================================
+# Line-ending policy — FORCE LF on checkout for every text file.
+#
+# Every script here runs in a Linux container (bash/perl), Git Bash, or
+# PowerShell, all of which want LF. bash literally breaks on CRLF:
+#   $'\r': command not found  /  set: -: invalid option  /  syntax error ... in\r
+# and it silently corrupts the sandbox's copy of the butler hooks.
+#
+# The host is Windows with core.autocrlf=true, which would otherwise smudge CRLF
+# into the working tree on every checkout / merge / branch-switch (that is
+# exactly how the butler hooks got broken once). `eol=lf` overrides autocrlf so
+# this can never recur. Binary files are auto-detected by `text=auto` and left
+# untouched.
+# ==========================================================================
+* text=auto eol=lf
+
+# Explicit for the executable / script types that HARD-break on CRLF
+# (defense in depth + documents intent).
+*.sh    text eol=lf
+*.bash  text eol=lf
+*.pl    text eol=lf
+*.pm    text eol=lf
+*.t     text eol=lf
+*.ps1   text eol=lf
+Containerfile text eol=lf
