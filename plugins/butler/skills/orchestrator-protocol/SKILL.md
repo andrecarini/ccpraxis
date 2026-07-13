@@ -37,7 +37,8 @@ Butler runs a blueprint authored on disk (`<data>/blueprints/<name>/blueprint.md
 ## The execute verbs (Decisions #2/#3/#4)
 
 - **`/butler:dispatch-fleet <bp>`** — the headless multi-coordinator fleet, **sandbox-only**. Starts the deterministic orchestrator and hands you to the reporter. Use it when the user wants unattended execution at scale.
-- **`/butler:drive-solo <bp>`** — a single **interactive** session with one flat layer of `bp-*` worker subagents (no detached coordinators), runnable **host or sandbox**. Use it for host-safe / single-session execution. (Absorbs the old interactive working-document resume role.)
+- **`/butler:drive-solo <bp>`** — a single **interactive** session with one flat layer of `bp-*` worker subagents (no detached coordinators), runnable **host or sandbox**. Use it for host-safe / single-session execution of ONE blueprint. (Absorbs the old interactive working-document resume role.)
+- **`/butler:keep-going-solo [bp ...]`** — `drive-solo` in an outer loop over **every** audited blueprint (or a given set), host-safe. Adds a keep-awake lifetime and **in-session usage governance** (polls `bp-usage-gate.pl`, sleeps below the soft ceiling to survive 5h/7d windows, auto-resumes) and **batches every parked decision to the end**. The sandbox-free "run everything while I'm gone" verb; not machine-durable (lives only as long as the session) — for crash-durable unattended scale that is still `dispatch-fleet`.
 - **`/butler:status [bp]`** — a cheap read-only snapshot; never drives anything.
 - **There is no `resume` verb.** Both execute verbs are idempotent **start-or-continue**: re-running `dispatch-fleet` continues a live or interrupted run (the orchestrator's resume-sweep folds in warm/cold recovery), and `drive-solo` re-reads the ledgers and picks up where they left off. Old decisions stay decided; only genuinely new blockers surface.
 
