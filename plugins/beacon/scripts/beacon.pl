@@ -40,7 +40,8 @@ use strict;
 use warnings;
 use utf8;
 use POSIX qw(strftime);
-use Cwd qw(getcwd);
+use Cwd qw(getcwd abs_path);
+use File::Spec ();
 use File::Basename qw(basename);
 use File::Path qw(make_path);
 use JSON::PP;
@@ -188,8 +189,41 @@ sub cmd_list {
         push @records, _read_all_beacons($VAULT_BEACON_DIR);
     }
     if ($scope eq 'all' || $scope eq 'sandbox') {
+        # Build de-duplicated set of beacon dirs to scan.
+        # De-dup key: absolute-normalised path (abs_path when dir exists,
+        # File::Spec->rel2abs otherwise — same normaliser for all sources).
+        my $normalise = sub {
+            my $p = shift;
+            return undef unless defined $p;
+            my $abs = (-e $p) ? (abs_path($p) // File::Spec->rel2abs($p))
+                               : File::Spec->rel2abs($p);
+            $abs =~ s/\\/\//g;   # forward-slash on all platforms
+            return $abs;
+        };
+
+        # Vault beacon dir (normalised) must be excluded from the sandbox
+        # dir-set when --scope all, because vault beacons are already read
+        # above (line 188) — excluding prevents double-listing.
+        my $vault_norm = $normalise->($VAULT_BEACON_DIR);
+
+        my %seen_dirs;
+
+        # 1. Dirs from the registry (empty list when registry absent → sandbox).
         for my $proj_dir (sandbox_project_dirs()) {
             my $d = "$proj_dir/.ccpraxis-local-data/claude-home/beacons";
+            my $k = $normalise->($d) // $d;
+            $seen_dirs{$k} = $d;
+        }
+
+        # 2. Current project's local beacon dir (the sandbox fallback).
+        my $local_d = beacon_dir_for_scope('sandbox');
+        my $local_k = $normalise->($local_d) // $local_d;
+        $seen_dirs{$local_k} = $local_d;
+
+        # 3. Read each unique dir exactly once, excluding the vault beacon dir.
+        for my $k (keys %seen_dirs) {
+            next if defined $vault_norm && $k eq $vault_norm;
+            my $d = $seen_dirs{$k};
             push @records, _read_all_beacons($d) if -d $d;
         }
     }
