@@ -54,6 +54,7 @@ use ConnectorHold ();     # Fix 3: hold-the-window decision when a connector los
 use ClaudeConfig ();      # self-heal .claude.json onboarding-bypass (0-byte / lost-keys)
 use PluginSync ();        # Fix 2: copy-model plugin-store reconcile (copy/prune/reconcile)
 use PortAlloc ();         # fix-multiple-running-sandboxes: per-container port-block allocation
+use SandboxLock ();       # 04-build-race-lock: generalised mkdir lock + global build-race guard
 use JSON::PP ();          # parse backpack.json + write the approved install-set
 use File::Path qw(make_path);
 use File::Spec;
@@ -508,57 +509,6 @@ make_path($LAUNCHER_DIR) unless -d $LAUNCHER_DIR;
 # for this project, we attach directly without lock contention worth
 # noting — but the lock still wraps the TUI + post-TUI work here.
 
-my $LOCK_OWNED = 0;
-
-sub acquire_lock {
-    my $timeout = 10;
-    my $elapsed = 0;
-    while (! mkdir $LOCK_DIR) {
-        # Already exists. Check for dead PID.
-        my $pid_file = "$LOCK_DIR/pid";
-        if (-f $pid_file) {
-            if (open my $fh, '<', $pid_file) {
-                my $owner = <$fh>;
-                close $fh;
-                chomp $owner if defined $owner;
-                if (defined $owner && length $owner) {
-                    my $alive;
-                    if ($WINDOWS_FAMILY) {
-                        # tasklist /FI on Windows; fallback to kill 0 if perl can find the process
-                        $alive = kill(0, $owner) ? 1 : 0;
-                    } else {
-                        $alive = kill(0, $owner) ? 1 : 0;
-                    }
-                    if (!$alive) {
-                        # Stale lock from a crash. Clean up + retry.
-                        _rmtree($LOCK_DIR);
-                        next;
-                    }
-                }
-            }
-        }
-        if ($elapsed >= $timeout) {
-            print STDERR "ERROR: another claude-sandbox is doing setup for this project (lock held > ${timeout}s at $LOCK_DIR).\n";
-            print STDERR "       If you're sure no other launcher is running, delete the lock dir and retry.\n";
-            reset_terminal();
-            exit 1;
-        }
-        sleep 1;
-        $elapsed++;
-    }
-    if (open my $fh, '>', "$LOCK_DIR/pid") {
-        print $fh $$;
-        close $fh;
-    }
-    $LOCK_OWNED = 1;
-}
-
-sub release_lock {
-    return unless $LOCK_OWNED;
-    _rmtree($LOCK_DIR);
-    $LOCK_OWNED = 0;
-}
-
 sub _rmtree {
     my $path = shift;
     return unless -e $path;
@@ -568,12 +518,19 @@ sub _rmtree {
 }
 
 # Signal handlers + END block — exec at the end skips these, so every
-# exec path calls release_lock explicitly before exec.
-$SIG{INT}  = sub { log_ev('signal', { sig => 'INT' });  _keepawake_release_global(); LaunchLog::close_log($LAUNCH_LOG); _close_transcript(); release_lock(); reset_terminal(); exit 130 };
-$SIG{TERM} = sub { log_ev('signal', { sig => 'TERM' }); _keepawake_release_global(); LaunchLog::close_log($LAUNCH_LOG); _close_transcript(); release_lock(); reset_terminal(); exit 143 };
-END { _keepawake_release_global(); LaunchLog::close_log($LAUNCH_LOG); _close_transcript(); release_lock() }
+# exec path calls SandboxLock::release explicitly before exec.
+# release_all() frees BOTH the per-project lock AND the global image-build
+# lock if it happens to be held at signal time.
+$SIG{INT}  = sub { log_ev('signal', { sig => 'INT' });  _keepawake_release_global(); LaunchLog::close_log($LAUNCH_LOG); _close_transcript(); SandboxLock::release_all(); reset_terminal(); exit 130 };
+$SIG{TERM} = sub { log_ev('signal', { sig => 'TERM' }); _keepawake_release_global(); LaunchLog::close_log($LAUNCH_LOG); _close_transcript(); SandboxLock::release_all(); reset_terminal(); exit 143 };
+END { _keepawake_release_global(); LaunchLog::close_log($LAUNCH_LOG); _close_transcript(); SandboxLock::release_all() }
 
-acquire_lock();
+SandboxLock::acquire($LOCK_DIR, windows => $WINDOWS_FAMILY) or do {
+    print STDERR "ERROR: another claude-sandbox is doing setup for this project (lock held > 10s at $LOCK_DIR).\n";
+    print STDERR "       If you're sure no other launcher is running, delete the lock dir and retry.\n";
+    reset_terminal();
+    exit 1;
+};
 
 # B1: open the per-launch log now that the lock is held. Best-effort — a failure
 # leaves $LAUNCH_LOG undef and every log_ev() becomes a no-op (the launch still
@@ -686,7 +643,7 @@ sub build_image {
         log_ev('image_build_failed', { exit => $rc >> 8 });
         print STDERR _c_err("ERROR:"), " podman build failed (exit @{[$rc >> 8]}).\n";
         LaunchLog::close_log($LAUNCH_LOG);
-        release_lock();
+        SandboxLock::release($LOCK_DIR);
         reset_terminal();
         exit 1;
     }
@@ -737,11 +694,22 @@ sub backpack_review {
 # Ensure base image exists. Capture instead of redirect — `> /dev/null`
 # under cmd.exe (native Win32 perl) wouldn't resolve; backticks with
 # `2>&1` discard cleanly on all shells.
+# Global cross-project build lock (Decision #9): prevents two launchers from
+# simultaneously building the same image. Fail-open: if acquire times out (e.g.
+# a crashed previous holder), proceed anyway — a missed lock must never
+# permanently block a launch. After acquiring, RE-CHECK the image (the winner
+# may have already built it); only build if still missing. release() frees this
+# lock; release_all() in END/signals also covers it.
 {
+    my $build_lock = "$CLAUDE_HOST_CONFIG/ccpraxis/.locks/image-build";
+    File::Path::make_path(dirname($build_lock));
+    my $got_build_lock = SandboxLock::acquire($build_lock, timeout => 600, windows => $WINDOWS_FAMILY);
+    # fail-open: proceed even if !$got_build_lock
     `$PODMAN image inspect claude-sandbox:latest 2>&1`;
     if ($? != 0) {
         build_image();
     }
+    SandboxLock::release($build_lock);
 }
 
 # =====================================================================
@@ -796,12 +764,12 @@ my $CONTAINER_NAME;
             print STDERR _c_err("ERROR:"), " no running sandbox to connect to for this project.\n";
             print STDERR "       Run `claude-sandbox` (no flags) to start the sandbox + dashboard first,\n";
             print STDERR "       then launch a claude session from the dashboard.\n";
-            release_lock();
+            SandboxLock::release($LOCK_DIR);
             reset_terminal();
             exit 1;
         }
         print _c_step("Connecting to running sandbox: $CONTAINER_NAME"), "\n";
-        release_lock();
+        SandboxLock::release($LOCK_DIR);
         my @SESSION_FLAGS;
         {
             my ($action, $uuid);
@@ -844,7 +812,7 @@ my $CONTAINER_NAME;
     # (Holding the setup lock here would needlessly block a real manager, so
     # release it first, exactly as a connector does.)
     if ($state eq 'running') {
-        release_lock();
+        SandboxLock::release($LOCK_DIR);
         enter_dashboard();   # never returns (loops until the user exits)
     }
 
@@ -862,7 +830,7 @@ sub run_perl_or_die {
     my $rc = system($^X, $SANDBOX_SKILLS_PL, @args);
     if ($rc != 0) {
         print STDERR "ERROR: $what (perl exit @{[$rc >> 8]})\n";
-        release_lock();
+        SandboxLock::release($LOCK_DIR);
         reset_terminal();
         exit 1;
     }
@@ -886,7 +854,7 @@ sub _capture_or_die {
     my $rc = $?;
     if ($rc != 0) {
         print STDERR "ERROR: $what (perl exit @{[$rc >> 8]})\n";
-        release_lock();
+        SandboxLock::release($LOCK_DIR);
         reset_terminal();
         exit 1;
     }
@@ -938,13 +906,13 @@ run_perl_to_file('MCP discovery snapshot',    $MCP_SNAPSHOT_FILE,    'discover-m
     my $exit = $rc >> 8;
     if ($exit == 2) {
         print "Cancelled.\n";
-        release_lock();
+        SandboxLock::release($LOCK_DIR);
         reset_terminal();
         exit 0;
     }
     if ($exit != 0) {
         print STDERR "ERROR: select-interactive failed (exit $exit)\n";
-        release_lock();
+        SandboxLock::release($LOCK_DIR);
         reset_terminal();
         exit 1;
     }
@@ -1122,7 +1090,16 @@ if (@STALE_REASONS) {
     if ($action eq 'rebuild') {
         # Remove old container if it exists.
         system($PODMAN, 'rm', '-f', $CONTAINER_NAME);
-        build_image();
+        # Forced rebuild — acquire the global build lock but skip the re-check
+        # (the user explicitly chose rebuild, so we always build regardless of
+        # whether a concurrent launcher already built it). Fail-open on timeout.
+        {
+            my $build_lock = "$CLAUDE_HOST_CONFIG/ccpraxis/.locks/image-build";
+            File::Path::make_path(dirname($build_lock));
+            SandboxLock::acquire($build_lock, timeout => 600, windows => $WINDOWS_FAMILY);
+            build_image();
+            SandboxLock::release($build_lock);
+        }
         # Refresh per-project container blueprint copies from upstream
         # (plugins/sandbox/container/). Any in-container modifications get
         # overwritten — that's the explicit opt-in semantic of Rebuild.
@@ -1137,7 +1114,7 @@ if (@STALE_REASONS) {
         _write_file("$LAUNCHER_DIR/container-name", $CONTAINER_NAME);
     } elsif ($action eq 'cancel') {
         print "Cancelled.\n";
-        release_lock();
+        SandboxLock::release($LOCK_DIR);
         reset_terminal();
         exit 0;
     }
@@ -1268,7 +1245,7 @@ my @SKILL_MOUNTS;
     my $output = `$cmd`;
     if ($? != 0) {
         print STDERR "ERROR: failed to enumerate skill mounts (perl exit @{[$? >> 8]})\n";
-        release_lock();
+        SandboxLock::release($LOCK_DIR);
         reset_terminal();
         exit 1;
     }
@@ -2072,7 +2049,7 @@ if (! _container_exists($CONTAINER_NAME)) {
     log_ev('container_create', { exit => $rc >> 8, container => $CONTAINER_NAME });
     if ($rc != 0) {
         print STDERR _c_err("ERROR:"), " podman create failed (exit @{[$rc >> 8]}) — not committing baseline.\n";
-        release_lock();
+        SandboxLock::release($LOCK_DIR);
         reset_terminal();
         exit ($rc >> 8);
     }
@@ -2117,7 +2094,7 @@ if (! _container_exists($CONTAINER_NAME)) {
                 _rmtree($path);
             }
             system($PODMAN, 'rm', '-f', $CONTAINER_NAME);
-            release_lock();
+            SandboxLock::release($LOCK_DIR);
             reset_terminal();
             exit 1;
         }
@@ -2203,7 +2180,7 @@ if ($CONTAINER_WAS_CREATED && -f $BACKPACK_HOST_FILE) {
 # $CONTAINER_WAS_CREATED=1 can only be true for the launcher that just
 # won the create branch — no other writer can be inside the same
 # container's apt/dpkg.
-release_lock();
+SandboxLock::release($LOCK_DIR);
 
 # podman binds published host ports at START (not create), so an
 # "address already in use" collision surfaces here. On the CREATE path a
