@@ -316,9 +316,26 @@ sub _close_transcript { if ($TRANSCRIPT) { close $TRANSCRIPT; undef $TRANSCRIPT;
 
 # Whether to colorize the interactive setup phase. Off when stdout isn't a TTY or
 # NO_COLOR is set (https://no-color.org). Passed to BackpackReview (the #21 walk
-# does its own ANSI); the deferred #21 part-A (colorize the broader build/
-# container output) will reuse this flag.
+# does its own ANSI); #21 part-A (below) reuses this flag for the launcher's own
+# setup-phase status lines.
 my $USE_COLOR = (-t STDOUT && !exists $ENV{NO_COLOR}) ? 1 : 0;
+
+# #21 part-A: colorize the launcher's OWN setup-phase status lines so a long
+# build/create/backpack scroll reads as navigable sections instead of a flat
+# wall. Deliberately NARROW in scope:
+#   - NOT the teed podman output (`_tee_system`) — those are podman's own bytes;
+#     we pass them through verbatim and never inject SGR into them.
+#   - NOT the dashboard — it owns its own raw-ANSI frame after this phase ends.
+#   - NOT the transcript — these are plain `print`s that never reach $TRANSCRIPT,
+#     so no color code ever lands in the on-disk log.
+# All gated on $USE_COLOR, so a non-TTY run / NO_COLOR / a redirect emits the
+# exact same bytes as before (tests run non-TTY → zero behavioral change). Codes
+# match the BackpackReview palette so the whole setup phase is one visual family.
+sub _c { my ($code, $s) = @_; $USE_COLOR ? "\e[${code}m$s\e[0m" : $s }
+sub _c_step { _c('1;36', $_[0]) }   # bold cyan  — a build/container phase landmark
+sub _c_ok   { _c('32',   $_[0]) }   # green      — a setup step succeeded
+sub _c_warn { _c('33',   $_[0]) }   # yellow     — a WARNING: label
+sub _c_err  { _c('1;31', $_[0]) }   # bold red   — an ERROR: label
 
 # B5 keep-awake holder (set up in enter_dashboard). File-scope so the signal/END
 # teardown can release the wake-lock — a leaked PowerShell helper would keep the
@@ -408,14 +425,14 @@ sub ensure_ccpraxis_data_dir {
                 # container's ephemeral writable layer goes; the host-bound
                 # data tree (the thing we're about to move) is untouched, and
                 # the next launch recreates the container against the new path.
-                print "Reaping stale container holding the old data dir: $name ($st)\n";
+                print _c_step("Reaping stale container holding the old data dir: $name ($st)"), "\n";
                 system($PODMAN, 'rm', '-f', $name);
                 log_ev('migrate_reap_container', { container => $name, state => $st });
             }
         }
 
         if (rename($old, $CLAUDE_DATA)) {
-            print "Migrated sandbox home: $old -> $CLAUDE_DATA\n";
+            print _c_ok("Migrated sandbox home: $old -> $CLAUDE_DATA"), "\n";
             log_ev('migrate_claude_data', { from => $old, to => $CLAUDE_DATA });
         } else {
             print STDERR "ERROR: could not migrate $old -> $CLAUDE_DATA: $!\n";
@@ -656,7 +673,7 @@ sub launcher_hash {
 # =====================================================================
 
 sub build_image {
-    print "Building claude-sandbox image with Claude Code v${HOST_VERSION}...\n";
+    print _c_step("Building claude-sandbox image with Claude Code v${HOST_VERSION}..."), "\n";
     log_ev('image_build_start', { version => $HOST_VERSION });
     _tx("\n--- image build (v${HOST_VERSION}) ---\n");
     my $rc = _tee_system($PODMAN, 'build',
@@ -666,7 +683,7 @@ sub build_image {
         $CONTAINER_CONFIG);
     if ($rc != 0) {
         log_ev('image_build_failed', { exit => $rc >> 8 });
-        print STDERR "ERROR: podman build failed (exit @{[$rc >> 8]}).\n";
+        print STDERR _c_err("ERROR:"), " podman build failed (exit @{[$rc >> 8]}).\n";
         LaunchLog::close_log($LAUNCH_LOG);
         release_lock();
         reset_terminal();
@@ -775,14 +792,14 @@ my $CONTAINER_NAME;
     if ($connector_mode) {
         # Connector requires a manager/dashboard to already be up.
         if ($state ne 'running') {
-            print STDERR "ERROR: no running sandbox to connect to for this project.\n";
+            print STDERR _c_err("ERROR:"), " no running sandbox to connect to for this project.\n";
             print STDERR "       Run `claude-sandbox` (no flags) to start the sandbox + dashboard first,\n";
             print STDERR "       then launch a claude session from the dashboard.\n";
             release_lock();
             reset_terminal();
             exit 1;
         }
-        print "Connecting to running sandbox: $CONTAINER_NAME\n";
+        print _c_step("Connecting to running sandbox: $CONTAINER_NAME"), "\n";
         release_lock();
         my @SESSION_FLAGS;
         {
@@ -1732,7 +1749,7 @@ sub kill_orphan_claudes_if_user_confirms {
     for my $pid (@orphans) {
         system($PODMAN, 'exec', $CONTAINER_NAME, 'kill', '-9', $pid);
     }
-    print "Killed orphan claude(s).\n\n";
+    print _c_ok("Killed orphan claude(s)."), "\n\n";
 }
 
 # Run claude inside the container. Returns claude's exit code.
@@ -1839,9 +1856,9 @@ my $CONTAINER_WAS_CREATED = 0;
 # state (stopped/exited/created).
 
 if (_container_exists($CONTAINER_NAME)) {
-    print "Starting container: $CONTAINER_NAME\n";
+    print _c_step("Starting container: $CONTAINER_NAME"), "\n";
 } else {
-    print "Creating new container: $CONTAINER_NAME\n";
+    print _c_step("Creating new container: $CONTAINER_NAME"), "\n";
 }
 
 if (! _container_exists($CONTAINER_NAME)) {
@@ -1931,7 +1948,7 @@ if (! _container_exists($CONTAINER_NAME)) {
     my $rc = system(@podman_args);
     log_ev('container_create', { exit => $rc >> 8, container => $CONTAINER_NAME });
     if ($rc != 0) {
-        print STDERR "ERROR: podman create failed (exit @{[$rc >> 8]}) — not committing baseline.\n";
+        print STDERR _c_err("ERROR:"), " podman create failed (exit @{[$rc >> 8]}) — not committing baseline.\n";
         release_lock();
         reset_terminal();
         exit ($rc >> 8);
@@ -1960,7 +1977,7 @@ if (! _container_exists($CONTAINER_NAME)) {
         if (@stray) {
             my $n = scalar @stray;
             print STDERR "\n";
-            print STDERR "ERROR: MSYS2 path corruption detected after podman create.\n";
+            print STDERR _c_err("ERROR:"), " MSYS2 path corruption detected after podman create.\n";
             print STDERR "       Found $n stray `;C`-suffixed bind-mount target(s):\n";
             print STDERR "         - $_\n" for @stray;
             print STDERR "\n";
@@ -2024,7 +2041,7 @@ my $BACKPACK_HOST_PL        = "$CLAUDE_HOST_CONFIG/ccpraxis/plugins/backpack/scr
 if ($CONTAINER_WAS_CREATED && -f $BACKPACK_HOST_FILE) {
     if (! -f $BACKPACK_HOST_PL) {
         $INSTALL_WARNING = 'backpack present but host backpack.pl missing - install skipped';
-        print STDERR "WARNING: backpack.json present but host backpack.pl missing at $BACKPACK_HOST_PL\n";
+        print STDERR _c_warn("WARNING:"), " backpack.json present but host backpack.pl missing at $BACKPACK_HOST_PL\n";
         print STDERR "         Skipping install pass; run /backpack:install in-session after fixing.\n";
     } else {
         # Validate using host's perl — same backpack.pl, host-resident file.
@@ -2032,7 +2049,7 @@ if ($CONTAINER_WAS_CREATED && -f $BACKPACK_HOST_FILE) {
         if ($validate_rc != 0) {
             $INSTALL_WARNING = 'backpack.json failed validation - install skipped (see launch transcript)';
             print STDERR "\n";
-            print STDERR "WARNING: backpack.json failed schema validation (see errors above).\n";
+            print STDERR _c_warn("WARNING:"), " backpack.json failed schema validation (see errors above).\n";
             print STDERR "         Skipping install pass. Fix the file (or delete it) and re-launch.\n";
             print STDERR "\n";
         } else {
@@ -2108,7 +2125,7 @@ if (@BACKPACK_APPROVED_ITEMS) {
             'test', '-f', '/root/.claude/backpack.pl') == 0);
     if (!$has_helper) {
         $INSTALL_WARNING = 'backpack.pl not mounted in container - install skipped';
-        print STDERR "WARNING: Backpack found at $BACKPACK_HOST_FILE but backpack.pl isn't mounted in the container. Update ccpraxis (the launcher needs the plugin's backpack/scripts/backpack.pl) and rebuild.\n";
+        print STDERR _c_warn("WARNING:"), " Backpack found at $BACKPACK_HOST_FILE but backpack.pl isn't mounted in the container. Update ccpraxis (the launcher needs the plugin's backpack/scripts/backpack.pl) and rebuild.\n";
     } else {
         # Write the approved subset as a backpack-shaped file into claude-home
         # (bound at /root/.claude) and point `install` at it — the full
@@ -2122,7 +2139,7 @@ if (@BACKPACK_APPROVED_ITEMS) {
         };
         if (!$wrote) {
             $INSTALL_WARNING = 'could not write backpack install-set - install skipped';
-            print STDERR "WARNING: could not write backpack install-set ($set_host): $@\n";
+            print STDERR _c_warn("WARNING:"), " could not write backpack install-set ($set_host): $@\n";
         } else {
             # Inline bash script: kick off the heartbeat refresher in the
             # background, run apt-get update + backpack install in the foreground,
@@ -2149,7 +2166,7 @@ BASH
                 $INSTALL_WARNING = 'backpack install: some items failed - run /backpack:install in the session to retry';
                 log_ev('backpack_install_failed', { exit => $install_rc >> 8 });
                 print "\n";
-                print "WARNING: Some backpack items failed (see above). Handing off to claude anyway — fix in-session via /backpack:add, /backpack:remove, or by editing the backpack file directly and running /backpack:install.\n";
+                print _c_warn("WARNING:"), " Some backpack items failed (see above). Handing off to claude anyway — fix in-session via /backpack:add, /backpack:remove, or by editing the backpack file directly and running /backpack:install.\n";
                 print "\n";
             } else {
                 log_ev('backpack_install_ok', { installed => scalar @BACKPACK_APPROVED_ITEMS });
@@ -2564,7 +2581,7 @@ sub _spawn_session {
         print STDOUT "\e[?25h\e[?1049l";
         eval { Term::ReadKey::ReadMode('restore') };
         print STDERR "\n";
-        print STDERR "  ERROR: Windows Terminal (wt.exe) was not found.\n";
+        print STDERR "  ", _c_err("ERROR:"), " Windows Terminal (wt.exe) was not found.\n";
         print STDERR "  [c] launch-claude opens a NEW Windows Terminal window and requires it —\n";
         print STDERR "  there is no fallback to a plain console (by design).\n";
         print STDERR "  Fix: install \"Windows Terminal\" from the Microsoft Store, or put wt.exe on\n";
