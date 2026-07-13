@@ -82,4 +82,16 @@ sub sync {
 # not running. Equivalent to sync(0) but reads clearer at teardown sites.
 sub release { return $_[0]->sync(0) }
 
+# orphan_is_ours($cmdline, $marker) -> 1|0  (Decision #10)
+#   Returns 1 iff both arguments are defined and $marker is a case-insensitive
+#   substring of $cmdline; 0 otherwise. undef or empty $cmdline -> 0, no warning.
+#   Used by _keepawake_reap_orphan to confirm a recycled pid still owns our
+#   keep-awake.ps1 before sending taskkill.
+sub orphan_is_ours {
+    my ($cmdline, $marker) = @_;
+    return 0 unless defined $cmdline && defined $marker;
+    return 0 unless length($cmdline) && length($marker);
+    return index(lc($cmdline), lc($marker)) >= 0 ? 1 : 0;
+}
+
 1;

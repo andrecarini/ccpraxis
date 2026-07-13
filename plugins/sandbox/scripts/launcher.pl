@@ -2653,7 +2653,8 @@ sub _keepawake_stop {
 
 # _keepawake_reap_orphan($pidfile) — on dashboard entry, kill a helper left
 # running by a previously-CRASHED launcher (its wake-lock would persist forever).
-# Uses the helper's self-reported WINDOWS pid + taskkill, guarded by a name check
+# Uses the helper's self-reported WINDOWS pid + taskkill, guarded by a cmdline
+# check (KeepAwake::orphan_is_ours) that confirms the process is our keep-awake.ps1
 # so a recycled pid that now belongs to something else is left alone.
 sub _keepawake_reap_orphan {
     my ($pidfile) = @_;
@@ -2663,9 +2664,9 @@ sub _keepawake_reap_orphan {
     unlink $pidfile;
     return unless defined $wpid && $wpid =~ /^\d+$/;
     local $ENV{MSYS2_ARG_CONV_EXCL} = '*';
-    my $name = `powershell.exe -NoProfile -Command "(Get-Process -Id $wpid -ErrorAction SilentlyContinue).ProcessName" 2>/dev/null`;
-    chomp $name if defined $name;
-    if (defined $name && $name =~ /powershell/i) {
+    my $cmdline = `powershell.exe -NoProfile -Command "(Get-CimInstance Win32_Process -Filter \\"ProcessId=$wpid\\" -ErrorAction SilentlyContinue).CommandLine" 2>/dev/null`;
+    chomp $cmdline if defined $cmdline;
+    if (KeepAwake::orphan_is_ours($cmdline, 'keep-awake.ps1')) {
         system('taskkill.exe', '/PID', $wpid, '/F', '/T');
         log_ev('keepawake_orphan_reaped', { pid => $wpid });
     }

@@ -85,4 +85,48 @@ is(KeepAwake::should_stay_awake(300, 600),    1, 'custom larger stale window res
     is($stops, 1, 'stop seam called once');
 }
 
+# ---- orphan_is_ours($cmdline, $marker) ------------------------------------
+# Decision #10: returns 1 iff $cmdline contains $marker as a case-insensitive
+# substring; 0 otherwise. undef/empty $cmdline -> 0 (must not warn/die).
+SKIP: {
+    skip 'orphan_is_ours not yet defined in KeepAwake', 7
+        unless KeepAwake->can('orphan_is_ours');
+
+    is(KeepAwake::orphan_is_ours(
+            'powershell.exe -NoProfile -File C:\\path\\keep-awake.ps1 -PidFile x',
+            'keep-awake.ps1'),
+        1, 'cmdline containing marker -> 1');
+
+    is(KeepAwake::orphan_is_ours(
+            uc('powershell.exe -NoProfile -File C:\\path\\keep-awake.ps1 -PidFile x'),
+            'keep-awake.ps1'),
+        1, 'uppercased cmdline still matches (case-insensitive) -> 1');
+
+    is(KeepAwake::orphan_is_ours(
+            'powershell.exe -NoProfile -Command Do-Something-Else',
+            'keep-awake.ps1'),
+        0, 'cmdline without marker -> 0');
+
+    is(KeepAwake::orphan_is_ours('', 'keep-awake.ps1'),
+        0, 'empty cmdline -> 0');
+
+    # undef must not die or warn
+    my $result = eval { KeepAwake::orphan_is_ours(undef, 'keep-awake.ps1') };
+    is($@, '', 'undef cmdline does not die');
+    is($result, 0, 'undef cmdline -> 0');
+
+    # marker appears as substring mid-string (not only at end)
+    is(KeepAwake::orphan_is_ours(
+            'C:\\tools\\keep-awake.ps1.bak is not the target',
+            'keep-awake.ps1'),
+        1, 'marker as strict substring mid-string -> 1 (substring match)');
+}
+
+# Announce skipped tests when the sub is missing so the fail reason is visible
+if (!KeepAwake->can('orphan_is_ours')) {
+    # Emit one explicit failure so the test file exits non-zero and the
+    # run-tests.pl harness reports FAIL — right reason: sub not yet defined.
+    fail('orphan_is_ours is not yet defined in KeepAwake — implement Decision #10');
+}
+
 done_testing();
