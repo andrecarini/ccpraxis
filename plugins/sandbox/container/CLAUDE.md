@@ -68,40 +68,56 @@ Even inside a container, supply chain attacks can exfiltrate project source code
 
 Two port ranges are published 1:1 to the host. **Anything you want reachable from the host browser must bind to a port in one of them** — no other ports are forwarded.
 
-- **9010–9019 — published, NOT bridged. Prefer these for dev servers and emulators.** Nothing listens on them at startup, so a server can bind `0.0.0.0:N` directly and it's immediately host-reachable. No socat, nothing to evict. This is the common case — reach for this range first.
-- **9000–9009 — published AND socat-bridged.** At container startup a `socat` forwarder is listening on `0.0.0.0:N` for each port here, forwarding to `127.0.0.1:N` (see the OAuth section below for why). Two consequences:
+The launcher injects the exact ranges into the container via environment variables:
+- **`$SANDBOX_BRIDGED_PORTS`** — the socat-bridged range (e.g. `9020-9029`). When unset, the back-compat default is `9000-9009`.
+- **`$SANDBOX_OPEN_PORTS`** — the published-but-not-bridged range (e.g. `9030-9039`). When unset, the back-compat default is `9010-9019`.
+
+Read your actual assigned ranges from those env vars rather than assuming fixed numbers.
+
+**Bridged range (`$SANDBOX_BRIDGED_PORTS`) — published AND socat-bridged.** At container startup a `socat` forwarder is listening on `0.0.0.0:N` for each port in this range, forwarding to `127.0.0.1:N` (see the OAuth section below for why). Two consequences:
   - Use these when a service binds **loopback** (`127.0.0.1:N`) and needs to be reached from the host — chiefly Claude Code's OAuth callback receiver. The bridge carries the host→loopback hop.
-  - A server that binds the **wildcard** `0.0.0.0:N` here will collide with the squatting socat (`EADDRINUSE`, since socat uses `SO_REUSEADDR`, not `SO_REUSEPORT`). You'd have to kill that port's socat first (`pkill -f "TCP-LISTEN:N"`). Avoid the hassle — put wildcard-binding servers on **9010–9019** instead.
+  - A server that binds the **wildcard** `0.0.0.0:N` here will collide with the squatting socat (`EADDRINUSE`, since socat uses `SO_REUSEADDR`, not `SO_REUSEPORT`). You'd have to kill that port's socat first (`pkill -f "TCP-LISTEN:N"`). Avoid the hassle — put wildcard-binding servers on the open range instead.
+
+**Open range (`$SANDBOX_OPEN_PORTS`) — published, NOT bridged. Prefer these for dev servers and emulators.** Nothing listens on them at startup, so a server can bind `0.0.0.0:N` directly and it's immediately host-reachable. No socat, nothing to evict. This is the common case — reach for this range first.
 
 ### Sharing the URL with the user
 
-When you print the URL for the user to open, prefer `$SANDBOX_HOST_IP` if it's set:
+When you print the URL for the user to open, prefer `$SANDBOX_HOST_IP` if it's set. Pick any port from the published range that fits your use case:
 
 ```bash
 HOST=${SANDBOX_HOST_IP:-localhost}
-echo "Open http://${HOST}:9000"
+# Pick a port from $SANDBOX_OPEN_PORTS or $SANDBOX_BRIDGED_PORTS as appropriate
+echo "Open http://${HOST}:${PORT}"
 ```
 
 The launcher auto-injects `SANDBOX_HOST_IP` on Windows+Podman, where the host's `localhost:<port>` mirror via WSL2's `wslrelay.exe` is unreliable — it sometimes registers only an IPv6 listener, so IPv4 connects from Firefox/Chrome silently fail even though the container is healthy. The injected value is the WSL distro's directly-reachable IPv4 address and always reaches the published port. On Linux/macOS hosts, or under Docker on any host, the env var is unset and the fallback to `localhost` works as normal.
 
 The env var is captured at container-create time, so if the user runs `wsl --shutdown` or reboots and then re-attaches to an existing sandbox, the value may be stale — a fresh `claude-sandbox` launch (which re-creates if needed) refreshes it.
 
-Example: serve a Flutter web build on port 9000:
+Example: serve a Flutter web build on the first port of the open range:
 ```bash
-dhttpd --port 9000 --path build/web
+PORT=$(echo "$SANDBOX_OPEN_PORTS" | cut -d- -f1)
+dhttpd --port "${PORT:-9010}" --path build/web
 ```
 
 ### OAuth Callbacks for MCP Servers
 
 When an MCP server requires OAuth authentication, Claude Code starts a local callback listener on `127.0.0.1:<port>` and opens the OAuth provider's URL in the host browser. The provider then redirects to `http://localhost:<port>/callback?code=...` — which must reach the listener inside this container.
 
-A `socat` bridge runs at container startup forwarding `0.0.0.0:9000-9009` → `127.0.0.1:9000-9009`. So any OAuth listener Claude Code starts on a port in 9000–9009 receives the callback from the host browser via the Podman port map; listeners on any other port do not.
+A `socat` bridge runs at container startup forwarding every port in `$SANDBOX_BRIDGED_PORTS` from `0.0.0.0:N` → `127.0.0.1:N`. So any OAuth listener Claude Code starts on a port in that range receives the callback from the host browser via the Podman port map; listeners on any other port do not.
 
-- **`claude mcp add` (manually-added MCPs)**: pass `--callback-port 9000` (or any port in 9000–9009) to pin the listener onto a bridged port. Example:
+To find the bridged range at runtime:
+```bash
+echo "Bridged ports: $SANDBOX_BRIDGED_PORTS"
+BRIDGE_LO=$(echo "${SANDBOX_BRIDGED_PORTS:-9000-9009}" | cut -d- -f1)  # default 9000-9009 back-compat
+```
+
+- **`claude mcp add` (manually-added MCPs)**: pass `--callback-port <N>` where N is any port in `$SANDBOX_BRIDGED_PORTS` to pin the listener onto a bridged port. Example (using the first bridged port):
   ```bash
-  claude mcp add notion --transport http --callback-port 9000 https://mcp.notion.com/mcp
+  BRIDGE_LO=$(echo "${SANDBOX_BRIDGED_PORTS:-9000-9009}" | cut -d- -f1)  # default 9000-9009 back-compat
+  claude mcp add notion --transport http --callback-port "$BRIDGE_LO" https://mcp.notion.com/mcp
   ```
-- **Plugin-installed MCPs**: the callback port is chosen randomly by Claude Code and **cannot be overridden** today. If the random port happens to fall in 9000–9009 the auth flow works; otherwise it times out. Workaround: re-`/auth` until you get a lucky port, or remove the plugin's MCP entry and re-add it manually with `claude mcp add ... --callback-port 9000`.
+- **Plugin-installed MCPs**: the callback port is chosen randomly by Claude Code and **cannot be overridden** today. If the random port happens to fall in `$SANDBOX_BRIDGED_PORTS` the auth flow works; otherwise it times out. Workaround: re-`/auth` until you get a lucky port, or remove the plugin's MCP entry and re-add it manually with `claude mcp add ... --callback-port "$BRIDGE_LO"`.
 
 ### Installing plugins
 

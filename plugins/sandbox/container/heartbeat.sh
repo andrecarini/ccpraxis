@@ -114,12 +114,39 @@ signal_graceful_shutdown() {
 }
 
 # =============================================================================
+# PURE PORT RANGE (unit-tested — defined at file scope so sourcing exposes it)
+# =============================================================================
+# bridged_ports -> space-separated list of ports to socat-bridge.
+# Priority:
+#   1. SANDBOX_BRIDGED_PORTS=lo-hi  (explicit range from launcher)
+#   2. SANDBOX_PORT_BASE=N          (base; bridges N..N+9)
+#   3. default                      (9000..9009, back-compat)
+bridged_ports() {
+  if [[ -n "${SANDBOX_BRIDGED_PORTS:-}" && "${SANDBOX_BRIDGED_PORTS}" =~ ^[0-9]+-[0-9]+$ ]]; then
+    local lo hi
+    lo="${SANDBOX_BRIDGED_PORTS%-*}"
+    hi="${SANDBOX_BRIDGED_PORTS#*-}"
+    local ports=()
+    local p
+    for (( p=lo; p<=hi; p++ )); do ports+=("$p"); done
+    echo "${ports[*]}"
+  elif [[ -n "${SANDBOX_PORT_BASE:-}" && "${SANDBOX_PORT_BASE}" =~ ^[0-9]+$ ]]; then
+    local ports=()
+    local p
+    for (( p=SANDBOX_PORT_BASE; p<=SANDBOX_PORT_BASE+9; p++ )); do ports+=("$p"); done
+    echo "${ports[*]}"
+  else
+    echo "9000 9001 9002 9003 9004 9005 9006 9007 9008 9009"
+  fi
+}
+
+# =============================================================================
 # MAIN LOOP
 # =============================================================================
 main() {
-  # socat bridges for 9000-9009 only (unchanged; see Containerfile rationale).
+  # socat bridges for the assigned port block (env-driven; default 9000-9009 back-compat).
   local p
-  for p in {9000..9009}; do
+  for p in $(bridged_ports); do
     socat TCP-LISTEN:"$p",fork,reuseaddr TCP:127.0.0.1:"$p" 2>/dev/null &
   done
 
