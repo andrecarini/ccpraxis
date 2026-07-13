@@ -51,6 +51,7 @@ use BackpackApproval ();  # #21: per-item, machine-local backpack approval memor
 use BackpackReview ();    # #21: the I/O-seam-injected interactive approval walk
 use KeepAwake ();         # B5: dashboard wake-lock decision + lifecycle holder
 use ConnectorHold ();     # Fix 3: hold-the-window decision when a connector loses the container
+use ClaudeConfig ();      # self-heal .claude.json onboarding-bypass (0-byte / lost-keys)
 use PluginSync ();        # Fix 2: copy-model plugin-store reconcile (copy/prune/reconcile)
 use JSON::PP ();          # parse backpack.json + write the approved install-set
 use File::Path qw(make_path);
@@ -1461,10 +1462,11 @@ my @BACKPACK_MOUNTS;
 # fix-up probe needed (the equivalent of the Docker setup's chown pass
 # is structurally unnecessary here).
 
-if (! -f "$CLAUDE_DATA/.claude.json"
-    && -f "$CONTAINER_CONFIG/claude.json") {
-    _copy_file("$CONTAINER_CONFIG/claude.json", "$CLAUDE_DATA/.claude.json");
-}
+# Seed/heal it now so a fresh or corrupt config carries the onboarding bypass
+# before we go any further. Re-run at the dashboard entry (every manager path)
+# and before `podman create` so all three entry points self-heal — see
+# ensure_claude_json_onboarded.
+ensure_claude_json_onboarded();
 
 # =====================================================================
 # Session selector helper
@@ -1557,17 +1559,38 @@ sub apply_blueprints_to_host_data {
 # path and the in-container mount target becomes a directory too.
 # These helpers ensure each single-file bind has a host file to point at.
 
-sub ensure_claude_json_host_file {
+# Seed or self-heal claude-home/.claude.json so the in-container claude never
+# lands in the onboarding wizard. Idempotent: writes ONLY when the on-disk file
+# is missing / 0-byte / unparseable (reseed the template) or is valid JSON but
+# missing an onboarding-bypass key (merge it in, preserving every other key).
+# A valid, already-onboarded config is left untouched (heal_claude_json returns
+# undef). The write is IN PLACE (_write_file truncates + rewrites) — never a
+# rename — because .claude.json is a single-file bind mount and a rename would
+# leave the container following the stale inode.
+#
+# Called at three points so every entry path self-heals: at top-level manager
+# setup (above), just before `podman create` (the pre-create host file must
+# exist AND be valid so the single-file bind doesn't auto-create a directory and
+# claude doesn't see a 0-byte file), and at the top of enter_dashboard (which
+# every manager path — fresh create, start-of-stopped, and bare-attach to an
+# already-running container — funnels through). The dashboard process is the
+# single per-project manager and no connector claude is running yet at that
+# point, so it is the safest moment to write the shared file.
+sub ensure_claude_json_onboarded {
     my $host_json = "$CLAUDE_DATA/.claude.json";
-    return if -f $host_json;
-    my $host_data = "$CLAUDE_DATA";
-    make_path($host_data) unless -d $host_data;
-    open(my $fh, '>', $host_json) or do {
-        print STDERR "WARNING: couldn't create $host_json: $!\n";
-        return;
-    };
-    close $fh;
+    make_path($CLAUDE_DATA) unless -d $CLAUDE_DATA;
+    my $cur = _read_file($host_json);                       # undef if missing
+    my $tpl = _read_file("$CONTAINER_CONFIG/claude.json");  # undef if missing
+    my $new = ClaudeConfig::heal_claude_json($cur, $tpl);
+    return unless defined $new;                             # already onboarded
+    eval { _write_file($host_json, $new); 1 }
+        or print STDERR "WARNING: couldn't heal $host_json: $@";
+    chmod 0600, $host_json;
 }
+
+# Belt-and-suspenders alias kept for the pre-create call site: guarantee the
+# single-file-bind source exists AND is a valid onboarding-bypass config.
+sub ensure_claude_json_host_file { ensure_claude_json_onboarded() }
 
 # Safety guard only (Fix 1): the canonical sandbox creds now live at
 # claude-home/.credentials.json — a REAL file inside the RW dir bind, no
@@ -1761,16 +1784,35 @@ sub sync_copy_plan {
 # read (Enter) when it's unavailable or stdin isn't a TTY.
 sub hold_for_keypress {
     local $| = 1;
-    print "  Press any key to close this window...";
+    # claude (the in-container TUI) died without restoring the terminal, so the
+    # mouse/focus-reporting modes it enabled are still on. Turn them off first so
+    # focusing or clicking the tab can't emit an escape sequence that the read
+    # below would mistake for a keypress and close the window. (See
+    # ConnectorHold::terminal_reset_seq.)
+    print STDOUT ConnectorHold::terminal_reset_seq() if -t STDOUT;
+    print "  Press Enter to close this window...";
     if ($READKEY_OK) {
         eval {
             Term::ReadKey::ReadMode('cbreak');
-            Term::ReadKey::ReadKey(0);   # block for one key
+            # Drain anything already queued — a click/focus event that landed
+            # while claude was dying, or leftover keystrokes — so a stale byte
+            # can't dismiss the window before the user has read the message.
+            my $drain = 0;
+            while ($drain++ < 4096) {
+                last unless defined Term::ReadKey::ReadKey(-1);   # non-blocking
+            }
+            # Block until the user presses ENTER specifically; ignore every other
+            # key (and any stray focus/mouse byte that still slips through).
+            while (1) {
+                my $k = Term::ReadKey::ReadKey(0);   # block for one key
+                last if !defined $k;                  # stdin EOF -> stop waiting
+                last if ConnectorHold::is_dismiss_key($k);
+            }
             1;
         };
         eval { Term::ReadKey::ReadMode('restore') };
     } else {
-        my $ignore = <STDIN>;            # press Enter
+        my $ignore = <STDIN>;            # line read already requires Enter
     }
     print "\n";
 }
@@ -2141,6 +2183,13 @@ enter_dashboard();   # never returns (loops until the user exits)
 # terminal supports it, else the plain heartbeat loop).
 sub enter_dashboard {
     log_ev('manager_ready', { container => $CONTAINER_NAME });
+    # Self-heal .claude.json's onboarding bypass on EVERY manager entry (fresh
+    # create, start-of-stopped, or bare-attach to an already-running container).
+    # This is the single chokepoint all manager paths funnel through, and no
+    # connector claude is running yet — the safest point to write the shared,
+    # single-file-bound config. Heals a 0-byte/corrupt file or one that lost its
+    # onboarding keys, so the next [c] never reopens the setup wizard.
+    ensure_claude_json_onboarded();
     # Act on the first heartbeat: if the container is already gone, don't paint
     # a dashboard that would just die on its first tick — say so and exit clean.
     if (_heartbeat_once() eq 'gone') {

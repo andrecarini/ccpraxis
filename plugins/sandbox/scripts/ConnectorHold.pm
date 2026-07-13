@@ -61,4 +61,29 @@ sub lost_message {
     ) . "\n";
 }
 
+# terminal_reset_seq() -> the ANSI bytes to emit BEFORE holding the window open.
+# The connector ran `claude` (a full-screen TUI). When the `podman exec` dropped
+# (engine/container death) claude was killed WITHOUT its normal teardown, so the
+# terminal modes it had turned ON are still on: mouse reporting (?1000 click,
+# ?1002 drag, ?1003 any-motion, plus the ?1006 SGR / ?1015 urxvt encodings) and
+# focus-event reporting (?1004). With those live, merely CLICKING the tab to
+# focus it (or moving the mouse across it) makes the terminal emit an escape
+# sequence — which the hold's key-read consumed, so the window vanished the
+# instant the user touched it. Turn those modes (and bracketed paste ?2004) back
+# off so no stray sequence is generated, then wait for a real Enter. Disabling a
+# mode that wasn't on is a harmless no-op.
+sub terminal_reset_seq {
+    return "\e[?1000l\e[?1002l\e[?1003l\e[?1006l\e[?1015l\e[?1004l\e[?2004l";
+}
+
+# is_dismiss_key($key) -> 1 iff $key should close the held window. Per the user's
+# request the window closes ONLY on Enter (CR or LF) — never on a stray byte from
+# a focus/mouse event or an incidental keypress. undef/empty are non-dismissing
+# (a non-blocking read with nothing pending must not close the window).
+sub is_dismiss_key {
+    my ($k) = @_;
+    return 0 unless defined $k;
+    return ($k eq "\r" || $k eq "\n") ? 1 : 0;
+}
+
 1;
