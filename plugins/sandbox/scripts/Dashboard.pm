@@ -792,6 +792,7 @@ sub run {
                 # responsive. The cap is a runaway-input backstop.
                 my $quit = 0;
                 my $drained = 0;
+                my $scroll_dirty = 0;   # set when a scroll mutates the view
                 while ($drained < 256) {
                     my $key = $read_key->();
                     last unless defined $key && length $key;
@@ -821,14 +822,41 @@ sub run {
                         $activity_offset = 0;       # back to the newest events
                     }
                     elsif ($action eq 'scroll-up') {
-                        $activity_offset-- if $activity_offset > 0;
+                        # Only a view-changing scroll marks the frame dirty; a no-op
+                        # scroll at the top boundary needs no same-tick re-render.
+                        if ($activity_offset > 0) { $activity_offset--; $scroll_dirty = 1; }
                     }
                     elsif ($action eq 'scroll-down') {
-                        $activity_offset++ if $activity_offset < $activity_max;
+                        if ($activity_offset < $activity_max) { $activity_offset++; $scroll_dirty = 1; }
                     }
                     # confirm-shutdown / cancel-shutdown only toggle $pending
                 }
                 last if $quit;
+
+                # Post-drain re-render: if a scroll changed the view, re-compose and
+                # re-render immediately (same tick) using @all_events already in scope —
+                # NO new gather. Update $prev so the next tick diffs against the last
+                # frame actually emitted, not a stale pre-drain baseline.
+                if ($scroll_dirty) {
+                    # Refresh the fields the drain may have mutated, so this same-tick
+                    # re-render matches what the NEXT primary render will show rather
+                    # than their stale pre-drain values: $pending (mutated at :801) and
+                    # the footer flash (set at :812 when [c] was pressed on a non-running
+                    # container during THIS drain). Mirrors the primary path (:766/:771).
+                    $state{pending}      = $pending;
+                    $state{footer_flash} = ($t < $flash_until) ? launch_blocked_msg() : undef;
+                    my $cap2  = activity_capacity(\%state, $rows, $cols);
+                    my @desc2 = reverse @all_events;
+                    my $win2  = activity_window(\@desc2, $activity_offset, $cap2);
+                    $activity_offset = $win2->{offset};
+                    $activity_max    = $win2->{max_offset};
+                    my @ev2 = @{ $win2->{lines} };
+                    push @ev2, $win2->{hint} if $win2->{hint};
+                    $state{events} = (@ev2 ? \@ev2 : ['(no events yet)']);
+                    my $frame2 = compose_frame(\%state, $rows, $cols);
+                    $out->(render_frame($prev, $frame2, { color => $color }));
+                    $prev = $frame2;
+                }
 
                 $ticks++;
                 last if defined $o{max_ticks} && $ticks >= $o{max_ticks};

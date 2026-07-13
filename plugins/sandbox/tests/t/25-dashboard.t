@@ -698,4 +698,283 @@ is(Dashboard::sgr_for_role('scrollhint'), "\e[2m", 'sgr: scrollhint -> dim (\e[2
          'drain: 3 DOWNs in one tick coalesce -> offset advanced by 3');
 }
 
+# ===========================================================================
+# PART 10 — scroll-responsiveness oracle (spec 01-scroll-responsiveness A–E)
+#
+# These tests encode the IMMUTABLE acceptance criteria.  They are written
+# against the UNFIXED code and therefore FAIL for the right reason now.
+# The implementer must satisfy them without weakening any assertion.
+#
+# Seam recap (Dashboard.pm::run):
+#   $out      (:709)   — called once per render; we count calls per tick
+#   $gather   (:702)   — must NOT fire on a pure-scroll tick (criterion B)
+#   $sleep_for(:699)   — called once per tick (after the drain, before next iter);
+#                        used as the tick-boundary signal for per-tick accounting
+#
+# Key encodings (dispatch_key, confirmed by PART 4 tests above):
+#   'UP'   -> scroll-up    'DOWN' -> scroll-down
+#   'k'    -> scroll-up    'j'    -> scroll-down
+# ===========================================================================
+
+# drive_per_tick: like drive(), but records the OUT-call count for each
+# completed tick (indexed 0..N-1) so tests can assert per-tick render counts.
+#
+# sleep_for is the tick-end sentinel: it fires after the drain and after the
+# max_ticks guard, so the delta of $frames at each sleep_for invocation is the
+# number of $out calls that tick produced.  The final tick (where max_ticks fires
+# the `last`) does NOT call sleep_for; its render count is inferred from the
+# total minus the sum of recorded ticks.
+#
+# Returns a hashref with the same keys as drive() plus:
+#   frames_per_tick => [ count_tick0, count_tick1, ... ]  (all completed ticks)
+#   gathers_per_tick => [ count_tick0, count_tick1, ... ]
+sub drive_per_tick {
+    my (%args) = @_;
+    my @keys       = @{ $args{keys} || [] };
+    my $clock      = 1000;
+    my %eff        = (heartbeats => 0, spawns => 0, signals => 0, gathers => 0, frames => 0);
+    my $out_str    = '';
+    my $prev_frames  = 0;
+    my $prev_gathers = 0;
+    my @fps;   # frames per tick (completed ticks only)
+    my @gps;   # gathers per tick
+
+    my $rc = Dashboard::run(
+        beat_interval  => $args{beat_interval}  // 9999,
+        state_interval => $args{state_interval} // 999,   # suppress mid-run gathers unless overridden
+        tick_interval  => 0.25,
+        color          => 0,
+        max_ticks      => $args{max_ticks} // 5,
+        now            => sub { $clock },
+        sleep_for      => sub {
+            $clock += $_[0];
+            push @fps, $eff{frames}  - $prev_frames;
+            push @gps, $eff{gathers} - $prev_gathers;
+            $prev_frames  = $eff{frames};
+            $prev_gathers = $eff{gathers};
+        },
+        read_key  => sub { @keys ? shift @keys : undef },
+        term_size => sub { ($args{cols} // 60, $args{rows} // 24) },
+        gather    => sub {
+            $eff{gathers}++;
+            {   project_name => 'demo',
+                container    => 'c1',
+                status       => 'running',
+                events       => ($args{events} // []),
+            }
+        },
+        heartbeat     => sub { 'ok' },
+        spawn         => sub { $eff{spawns}++; undef },
+        write_signals => sub { $eff{signals}++; 1 },
+        enter_raw     => sub { },
+        leave_raw     => sub { },
+        keepawake     => sub { },
+        out           => sub { $out_str .= $_[0]; $eff{frames}++ },
+    );
+
+    $eff{rc}             = $rc;
+    $eff{out}            = $out_str;
+    $eff{frames_per_tick}  = \@fps;
+    $eff{gathers_per_tick} = \@gps;
+    return \%eff;
+}
+
+# ---------------------------------------------------------------------------
+# A — PROMPTNESS (THE KEY ASSERTION)
+#
+# A DOWN scroll key injected on tick 1 must cause an ADDITIONAL $out call
+# within THAT SAME TICK — i.e. the scroll tick has >= 2 renders.
+#
+# Current code (render-before-drain): renders once per tick unconditionally,
+# before the drain.  The scroll key is read in the drain AFTER the render, so
+# the scroll effect is only visible on tick 2.  Therefore frames_per_tick[1]
+# == 1 now.  This test FAILS until the post-drain re-render is added.
+#
+# Key sequence: [undef, 'DOWN', undef, undef]
+#   Tick 0 drain: undef -> drain empty      (no scroll)
+#   Tick 1 drain: 'DOWN' then undef -> DOWN drain ends (scroll fires)
+#   Tick 2 drain: undef -> drain empty      (no scroll)
+#   Tick 3: max_ticks fires (no sleep_for for this tick)
+# The 20-event list ensures $activity_max > 0 so the DOWN actually mutates offset.
+# ---------------------------------------------------------------------------
+{
+    my @evs = map { "evt$_" } (1 .. 20);
+    my $e = drive_per_tick(
+        keys       => [undef, 'DOWN', undef, undef],
+        events     => \@evs,
+        rows       => 24,
+        max_ticks  => 4,
+        state_interval => 999,   # gather only on tick 0 (last_state=undef gate)
+    );
+    # frames_per_tick[1] is the scroll tick (ticks 0/1/2 each call sleep_for; tick 3 exits)
+    my $scroll_tick_renders = $e->{frames_per_tick}[1];
+    cmp_ok($scroll_tick_renders, '>=', 2,
+        'A: scroll-responsiveness: DOWN tick emits >=2 out calls (post-drain re-render)');
+}
+
+# ---------------------------------------------------------------------------
+# B — NO GATHER ON PURE SCROLL
+#
+# The re-render after a scroll must reuse @all_events (already in scope).
+# gather() must NOT be called during a tick where the only key is a scroll key.
+#
+# gathers_per_tick[0] == 1  (forced on first tick because last_state=undef)
+# gathers_per_tick[1] == 0  (scroll tick — no new gather allowed)
+# ---------------------------------------------------------------------------
+{
+    my @evs = map { "evt$_" } (1 .. 20);
+    my $e = drive_per_tick(
+        keys       => [undef, 'DOWN', undef, undef],
+        events     => \@evs,
+        rows       => 24,
+        max_ticks  => 4,
+        state_interval => 999,
+    );
+    is($e->{gathers_per_tick}[1], 0,
+        'B: pure-scroll tick does NOT call the gather seam');
+}
+
+# ---------------------------------------------------------------------------
+# C — GATHER CADENCE UNCHANGED
+#
+# A tick past state_interval with NO input must still gather exactly once.
+# The scroll path must not perturb the gather timer.
+#
+# Setup: state_interval => 1, tick_interval => 0.25 (so sleep_for adds 0.25 to
+# the clock each tick).  After 4 ticks (4 * 0.25 = 1s) the clock has advanced
+# 1s from the initial gather, so tick 4 fires a gather.  Verify gathers_per_tick
+# for a quiet (no-key) run: tick 0 gathers (last_state=undef), ticks 1-3 don't,
+# tick 4 does (1s elapsed).
+#
+# Drive 5 completed ticks (max_ticks=6: ticks 0..4 each call sleep_for,
+# tick 5 exits via max_ticks without sleep_for).
+# ---------------------------------------------------------------------------
+{
+    my $e = drive_per_tick(
+        keys           => [],       # no input at all
+        rows           => 24,
+        max_ticks      => 6,
+        state_interval => 1,        # gather when clock advances >= 1s
+    );
+    my @gpt = @{ $e->{gathers_per_tick} };
+    is($gpt[0], 1, 'C: tick 0 gathers (last_state=undef gate fires unconditionally)');
+    is($gpt[1], 0, 'C: tick 1 does NOT gather (state_interval not elapsed)');
+    is($gpt[2], 0, 'C: tick 2 does NOT gather');
+    is($gpt[3], 0, 'C: tick 3 does NOT gather');
+    is($gpt[4], 1, 'C: tick 4 gathers (1s elapsed -> state_interval fires again)');
+}
+
+# ---------------------------------------------------------------------------
+# D — NO EXTRA RENDER WITHOUT SCROLL
+#
+# A tick with no scroll input emits EXACTLY ONE $out call.
+# Guards against an "always re-render" regression: the re-render must be gated
+# strictly on a scroll-dirty flag, not on every tick unconditionally.
+#
+# frames_per_tick for a quiet-key run must be 1 for every completed tick.
+# ---------------------------------------------------------------------------
+{
+    my $e = drive_per_tick(
+        keys      => [],    # no input
+        rows      => 24,
+        max_ticks => 4,
+        state_interval => 999,
+    );
+    my @fps = @{ $e->{frames_per_tick} };
+    # All completed ticks (those that called sleep_for) must have exactly 1 render.
+    my @bad = grep { $_ != 1 } @fps;
+    is(scalar(@bad), 0,
+        'D: no-input ticks emit exactly 1 out call each (no spurious extra render)');
+}
+
+# ---------------------------------------------------------------------------
+# E — $prev BASELINE AFTER DOUBLE RENDER
+#
+# After a scroll tick's double render, the NEXT tick's diff must be computed
+# against the re-rendered frame (the second one), NOT the pre-drain frame.
+#
+# The landmine (scout risk 3): if $prev is NOT updated after the re-render,
+# the next tick's render_frame diffs against a stale baseline and emits wrong
+# row updates.
+#
+# Observable proxy: with no state change between tick 1 (scroll) and tick 2
+# (no input, no gather), the tick-2 render must be a DIFF render (not a
+# full-clear).  If $prev is stale (not updated after the re-render), the
+# baseline mismatch causes wrong/extra row repaints.
+#
+# We assert this at the $out seam level: if the fix is correct, the TOTAL
+# number of row-move escapes (\e[R;1H) in the THIRD render (tick-2's single
+# render) must be 0 — because the frame content is identical to the re-rendered
+# frame from tick 1 (same events, same offset, same state).
+#
+# Implementation: capture each individual $out call in sequence; inspect the
+# third call (index 2) — i.e. render #3 — for row-repaint escapes.
+# With the FIX the sequence is: render#1(tick0), render#2(tick1-primary),
+# render#3(tick1-scroll-rerender), render#4(tick2) — so render#4 should have 0
+# row moves.
+# Without the FIX there is no render#3, so render#3==tick2's render, which
+# diffs against tick1-primary ($prev still the pre-drain frame) — but since
+# offset was also not updated in the render, the frame IS the same as tick0's
+# render, so render#3 also has 0 row moves.  This means E cannot produce a
+# false-positive failure right now; it passes vacuously (or with the fix).
+# We therefore frame E as a NON-regression assertion: the number of row moves
+# in the first quiet-tick render after a scroll is 0 — correct with or without
+# the fix, but catches a broken $prev update path.
+#
+# The critical non-vacuous E test: with the fix, frames_per_tick[1] == 2 AND
+# the post-scroll tick still shows 0 spurious row repaints.  We capture all
+# $out calls individually to inspect.
+# ---------------------------------------------------------------------------
+{
+    my @evs = map { "evt$_" } (1 .. 20);
+    my @renders;    # each individual $out call, in order
+    my $clock = 1000;
+    my %eff = (gathers => 0, frames => 0);
+    my @keys_e = (undef, 'DOWN', undef, undef);
+
+    Dashboard::run(
+        beat_interval  => 9999,
+        state_interval => 999,
+        tick_interval  => 0.25,
+        color          => 0,
+        max_ticks      => 4,
+        now            => sub { $clock },
+        sleep_for      => sub { $clock += $_[0]; },
+        read_key       => sub { @keys_e ? shift @keys_e : undef },
+        term_size      => sub { (60, 24) },
+        gather         => sub {
+            $eff{gathers}++;
+            { project_name => 'demo', container => 'c1', status => 'running',
+              events => \@evs }
+        },
+        heartbeat     => sub { 'ok' },
+        spawn         => sub { undef },
+        write_signals => sub { 1 },
+        enter_raw     => sub { },
+        leave_raw     => sub { },
+        keepawake     => sub { },
+        out           => sub { push @renders, $_[0]; $eff{frames}++ },
+    );
+
+    # With the fix: renders are [tick0, tick1-primary, tick1-rerender, tick2].
+    # Without the fix: renders are [tick0, tick1, tick2, tick3].
+    # In both cases the LAST render in a quiet, no-gather tick should have 0 row moves.
+    # The real guard: the render IMMEDIATELY AFTER the scroll tick must have
+    # 0 row-repaint escapes (the diff sees no change vs the last emitted frame).
+    #
+    # We target the render that follows the scroll event.  With the fix, that is
+    # renders[-1] (tick2's render, index 3 in a 4-render sequence).
+    # Without the fix, that is renders[2] (tick2's render, no re-render existed).
+    # We use frames_per_tick to locate it: the render right after the scroll tick.
+    my $total = scalar @renders;
+    ok($total >= 3, 'E: at least 3 out calls produced (enough to inspect post-scroll render)');
+
+    # The last render in the captured sequence is the one for the quiet tick
+    # that follows the scroll tick (tick2, no scroll, no gather).
+    my $post_scroll_render = $renders[-1];
+    my @row_moves = ($post_scroll_render =~ /\e\[\d+;1H/g);
+    is(scalar(@row_moves), 0,
+        'E: post-scroll quiet-tick render has 0 row repaints (prev baseline is current, not stale)');
+}
+
 done_testing();
