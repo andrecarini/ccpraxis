@@ -2224,12 +2224,13 @@ sub enter_dashboard {
 
     require Term::ReadKey;
     my $log_path = "$CLAUDE_DATA/sandbox-logs/launch-$LAUNCH_ID.log";
-    my $cached_status     = 'unknown';
-    my $cached_busy_age   = undef;   # B5: age (s) of /tmp/.butler-busy in CONTAINER time, or undef
-    my $cached_busy_stamp = 0;       # host time() when $cached_busy_age was measured
-    my $cached_needs_you  = 0;       # B3: queued "needs you" decisions
-    my $cached_backpack   = undef;   # B4: backpack items + per-item approval
-    my $last_inspect      = 0;
+    my $cached_status           = 'unknown';
+    my $cached_busy_age         = undef;   # B5: age (s) of /tmp/.butler-busy in CONTAINER time, or undef
+    my $cached_busy_stamp       = 0;       # host time() when $cached_busy_age was measured
+    my $cached_needs_you        = 0;       # B3: queued "needs you" decisions
+    my $cached_backpack         = undef;   # B4: backpack items + per-item approval
+    my $cached_oauth_expires_at = undef;   # 01-oauth: epoch-s when the OAuth token expires
+    my $last_inspect            = 0;
     my $bp_host_file      = "$CLAUDE_DATA/backpack.json";
     my $bp_appr_file      = "$LAUNCHER_DIR/backpack-approvals.json";
 
@@ -2326,6 +2327,7 @@ sub enter_dashboard {
                 $cached_busy_stamp = $now;
                 $cached_needs_you  = _count_needs_you($PROJECT_PATH);          # B3
                 $cached_backpack   = _gather_backpack($bp_host_file, $bp_appr_file);  # B4
+                $cached_oauth_expires_at = _gather_oauth_expiry();
                 $last_inspect  = $now;
             }
             # Advance the skew-free baseline by host-measured elapsed since the
@@ -2344,8 +2346,9 @@ sub enter_dashboard {
                 install_warning => $INSTALL_WARNING,
                 busy_age        => $busy_age,
                 stay_awake      => $stay,
-                needs_you       => $cached_needs_you,
-                backpack        => $cached_backpack,
+                needs_you        => $cached_needs_you,
+                backpack         => $cached_backpack,
+                oauth_expires_at => $cached_oauth_expires_at,
             };
         },
         keepawake => sub {
@@ -2534,6 +2537,22 @@ sub _gather_backpack {
         push @items, { key => BackpackApproval::item_key($it), approved => $ok };
     }
     return { total => scalar(@items), approved => $napprove, items => \@items };
+}
+
+# _gather_oauth_expiry() -> epoch-seconds when the OAuth token expires, or undef.
+# Reads $SANDBOX_CREDENTIALS_FILE (read-only; never writes/refreshes it), decodes
+# JSON, and extracts claudeAiOauth.expiresAt (milliseconds -> seconds). Returns
+# undef when the file is absent, unparseable, or lacks the key.
+sub _gather_oauth_expiry {
+    my $raw = _read_file($SANDBOX_CREDENTIALS_FILE);
+    return undef unless defined $raw && length $raw;
+    my $data = eval { JSON::PP->new->decode($raw) };
+    return undef unless ref $data eq 'HASH';
+    my $oauth = $data->{claudeAiOauth};
+    return undef unless ref $oauth eq 'HASH';
+    my $exp = $oauth->{expiresAt};
+    return undef unless defined $exp && $exp =~ /^\d+$/;
+    return int($exp / 1000);
 }
 
 # _tail_lines — last $n chomped lines of a file (the B1 launch log), or ().

@@ -466,13 +466,17 @@ my %st = (
         '{"ts":"2026-06-24T10:00:09Z","type":"container_gone","state":"exited"}',
         '',
     );
-    my $ev = Dashboard::recent_events(\@lines, 10);
+    # A4: inject \&CORE::gmtime seam so these assertions stay deterministic once
+    # recent_events converts timestamps to local-time.  The 3rd arg is currently
+    # IGNORED by the 2-param implementation, so these tests remain green now and
+    # will continue to pass after the seam is wired (gmtime == UTC == the ts value).
+    my $ev = Dashboard::recent_events(\@lines, 10, \&CORE::gmtime);
     is(scalar(@$ev), 3, 'events: garbage + blank lines skipped');
     is($ev->[0], '10:00:01  launch_start', 'events: ts -> HH:MM:SS + type');
     like($ev->[1], qr/container_start exit=0/, 'events: exit field surfaced');
     like($ev->[2], qr/container_gone state=exited/, 'events: state field surfaced');
 
-    my $last2 = Dashboard::recent_events(\@lines, 2);
+    my $last2 = Dashboard::recent_events(\@lines, 2, \&CORE::gmtime);
     is(scalar(@$last2), 2, 'events: honors the last-N limit');
     like($last2->[-1], qr/container_gone/,  'events: keeps the most recent (last)');
     like($last2->[0],  qr/container_start/, 'events: preserves chronological order (oldest-of-N first)');
@@ -527,7 +531,7 @@ sub drive {
         sleep_for      => sub { $clock += $_[0]; },     # advance the fake clock
         read_key       => sub { @keys ? shift @keys : undef },
         term_size      => sub { ($args{cols} // 60, $args{rows} // 12) },
-        gather         => sub { $eff{gathers}++; { project_name => 'demo', container => 'c1', status => ($args{status} // 'running'), events => ($args{events} // []), busy_age => $args{busy_age} } },
+        gather         => sub { $eff{gathers}++; { project_name => 'demo', container => 'c1', status => ($args{status} // 'running'), events => ($args{events} // []), busy_age => $args{busy_age}, oauth_expires_at => $args{oauth_expires_at} } },
         heartbeat      => sub { $eff{heartbeats}++; $args{hb_returns} ? $args{hb_returns}->() : 'ok' },
         spawn          => sub { $eff{spawns}++; undef },
         write_signals  => sub { $eff{signals}++; 1 },
@@ -975,6 +979,167 @@ sub drive_per_tick {
     my @row_moves = ($post_scroll_render =~ /\e\[\d+;1H/g);
     is(scalar(@row_moves), 0,
         'E: post-scroll quiet-tick render has 0 row repaints (prev baseline is current, not stale)');
+}
+
+# ===========================================================================
+# PART 11 — 01-dashboard-localtime-oauth acceptance criteria
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# A1–A3  _event_time / recent_events with a $localtime_fn seam
+#
+# _event_time($iso_ts, $localtime_fn) does NOT exist yet.  We guard every call
+# with an eval{} so a missing sub causes a per-test FAIL, not a file-level die.
+#
+# The seams are closures over a fixed epoch offset (CORE::gmtime == UTC, so
+# A1 expects unchanged output; +2h and -5h offsets shift the HH:MM:SS).
+#
+# "2026-06-24T10:00:01Z" is epoch 1750759201 (UTC 10:00:01).
+# A gmtime seam returns the UTC breakdown, so HH:MM:SS is still "10:00:01".
+# A +2h seam shifts the epoch forward 7200s before formatting -> "12:00:01".
+# A -5h seam shifts the epoch back 18000s -> "05:00:01".
+# ---------------------------------------------------------------------------
+{
+    my $epoch_10 = 1750759201;   # 2026-06-24T10:00:01Z
+
+    # gmtime seam: returns UTC breakdown unchanged (== A1 oracle)
+    my $gmtime_seam = sub { CORE::gmtime($_[0]) };
+
+    # +2h seam: pretend the local clock is 2 hours ahead of UTC
+    my $plus2h_seam = sub {
+        my @lt = CORE::gmtime($_[0] + 7200);
+        return @lt;
+    };
+
+    # -5h seam: pretend the local clock is 5 hours behind UTC
+    my $minus5h_seam = sub {
+        my @lt = CORE::gmtime($_[0] - 18000);
+        return @lt;
+    };
+
+    my $ts = '2026-06-24T10:00:01Z';
+
+    # A1: gmtime seam -> UTC unchanged -> "10:00:01"
+    my $a1 = eval { Dashboard::_event_time($ts, $gmtime_seam) };
+    is($a1, '10:00:01',
+        'A1: _event_time with gmtime seam (UTC offset 0) -> 10:00:01');
+
+    # A2: +2h seam -> "12:00:01"
+    my $a2 = eval { Dashboard::_event_time($ts, $plus2h_seam) };
+    is($a2, '12:00:01',
+        'A2: _event_time with +2h localtime seam -> 12:00:01');
+
+    # A3: -5h seam -> "05:00:01"
+    my $a3 = eval { Dashboard::_event_time($ts, $minus5h_seam) };
+    is($a3, '05:00:01',
+        'A3: _event_time with -5h localtime seam -> 05:00:01');
+
+    # A1 via recent_events 3rd-param seam (end-to-end path): parse the same ts
+    # through the seam and confirm the event string carries the local HH:MM:SS.
+    my @lines_a1 = ('{"ts":"2026-06-24T10:00:01Z","type":"launch_start","pid":1}');
+    my $ev_a1 = eval { Dashboard::recent_events(\@lines_a1, 1, $gmtime_seam) };
+    if ($ev_a1) {
+        like($ev_a1->[0], qr/^10:00:01\b/,
+            'A1 (recent_events): gmtime seam preserves UTC HH:MM:SS in event string');
+    } else {
+        fail('A1 (recent_events): recent_events 3-arg form not yet wired (expected failure)');
+    }
+
+    # A2 via recent_events
+    my $ev_a2 = eval { Dashboard::recent_events(\@lines_a1, 1, $plus2h_seam) };
+    if ($ev_a2) {
+        like($ev_a2->[0], qr/^12:00:01\b/,
+            'A2 (recent_events): +2h seam yields 12:00:01 in event string');
+    } else {
+        fail('A2 (recent_events): recent_events 3-arg seam not yet wired (expected failure)');
+    }
+
+    # A3 via recent_events
+    my $ev_a3 = eval { Dashboard::recent_events(\@lines_a1, 1, $minus5h_seam) };
+    if ($ev_a3) {
+        like($ev_a3->[0], qr/^05:00:01\b/,
+            'A3 (recent_events): -5h seam yields 05:00:01 in event string');
+    } else {
+        fail('A3 (recent_events): recent_events 3-arg seam not yet wired (expected failure)');
+    }
+}
+
+# ---------------------------------------------------------------------------
+# B1–B5  fmt_oauth($remaining_secs)
+#
+# fmt_oauth does NOT exist yet.  Each call is wrapped in eval{} so the missing
+# sub produces a per-assertion FAIL rather than aborting the file.
+# ---------------------------------------------------------------------------
+{
+    my $have_fmt_oauth = Dashboard->can('fmt_oauth');
+
+    # B1: undef -> 'unknown'
+    my $b1 = eval { Dashboard::fmt_oauth(undef) };
+    is($b1, 'unknown',
+        'B1: fmt_oauth(undef) eq "unknown"');
+
+    # B2: negative -> 'EXPIRED'
+    my $b2 = eval { Dashboard::fmt_oauth(-5) };
+    is($b2, 'EXPIRED',
+        'B2: fmt_oauth(-5) eq "EXPIRED"');
+
+    # B3: zero -> 'EXPIRED'
+    my $b3 = eval { Dashboard::fmt_oauth(0) };
+    is($b3, 'EXPIRED',
+        'B3: fmt_oauth(0) eq "EXPIRED"');
+
+    # B4: 3h12m -> 'expires in 3h12m'
+    my $b4 = eval { Dashboard::fmt_oauth(3*3600 + 12*60) };
+    is($b4, 'expires in 3h12m',
+        'B4: fmt_oauth(3*3600+12*60) eq "expires in 3h12m"');
+
+    # B5: sub-minute -> 'expires in 45s'
+    my $b5 = eval { Dashboard::fmt_oauth(45) };
+    is($b5, 'expires in 45s',
+        'B5: fmt_oauth(45) eq "expires in 45s"');
+
+    # B-ascii: all non-undef returns are ASCII-only (no multi-byte chars)
+    for my $secs (-5, 0, 45, 3*3600+12*60) {
+        my $r = eval { Dashboard::fmt_oauth($secs) };
+        if (defined $r) {
+            unlike($r, qr/[^\x20-\x7E]/,
+                "B-ascii: fmt_oauth($secs) returns ASCII-only string");
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# C1  activity_capacity with oauth_remaining defined -> one extra fixed row
+#
+# When oauth_remaining is defined, _fixed_panels gains an oauth line in the
+# Sandbox panel, reducing the activity row budget by 1 (from 10 to 9).
+# C2 (undef -> 10) is already green at line 641 above; this test encodes C1.
+# ---------------------------------------------------------------------------
+{
+    my %st_oauth = (%st, oauth_remaining => 3*3600 + 12*60);
+    is(Dashboard::activity_capacity(\%st_oauth, 24, 80), 9,
+        'C1: oauth_remaining defined -> Sandbox gains an oauth line -> capacity 9 (not 10)');
+}
+
+# ---------------------------------------------------------------------------
+# D  Loop integration: oauth_expires_at in the gather hash -> "expires in 3h12m"
+#    appears in the rendered Sandbox panel output.
+#
+# drive() already threads oauth_expires_at from %args into the gather hash.
+# With seed clock=1000 and oauth_expires_at=12520, run() must compute
+# oauth_remaining = 12520 - 1000 = 11520 = 3*3600+12*60 and render
+# "expires in 3h12m" in the Sandbox panel.
+# ---------------------------------------------------------------------------
+{
+    my $e = drive(
+        keys           => ['q'],
+        max_ticks      => 50,
+        rows           => 30,
+        oauth_expires_at => 12520,   # 1000 + 3*3600 + 12*60
+    );
+    is($e->{rc}, 0, 'D: loop with oauth_expires_at exits cleanly');
+    like($e->{out}, qr/expires in 3h12m/,
+        'D: rendered Sandbox panel contains "expires in 3h12m" when oauth_expires_at set');
 }
 
 done_testing();

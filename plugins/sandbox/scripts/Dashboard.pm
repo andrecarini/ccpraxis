@@ -36,6 +36,7 @@ use strict;
 use warnings;
 use JSON::PP ();
 use File::Spec ();
+use Time::Local ();
 
 # ===========================================================================
 # PURE CORE
@@ -81,6 +82,29 @@ sub fmt_hms {
     my $h = int($s / 3600); $s %= 3600;
     my $m = int($s / 60);   $s %= 60;
     return sprintf('%dh %dm %ds', $h, $m, $s);
+}
+
+# fmt_oauth($remaining_secs) -> ASCII-only countdown string for the oauth line.
+# undef -> 'unknown'; <= 0 -> 'EXPIRED'; > 0 -> 'expires in <fmt_age>'.
+sub fmt_oauth {
+    my ($s) = @_;
+    return 'unknown' if !defined $s;
+    return 'EXPIRED' if $s <= 0;
+    return 'expires in ' . fmt_age($s);
+}
+
+# _event_time($iso_ts, $localtime_fn) -> 'HH:MM:SS' in local time.
+# Parses YYYY-MM-DDThh:mm:ssZ to epoch via Time::Local::timegm (UTC), then
+# applies $localtime_fn (default real localtime) to get local breakdown.
+sub _event_time {
+    my ($ts, $localtime_fn) = @_;
+    $localtime_fn ||= sub { localtime($_[0]) };
+    return '00:00:00' unless defined $ts && $ts =~ /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})Z/;
+    my ($yr, $mo, $dy, $h, $m, $sec) = ($1, $2, $3, $4, $5, $6);
+    my $epoch = eval { Time::Local::timegm($sec, $m, $h, $dy, $mo - 1, $yr - 1900) };
+    return '00:00:00' unless defined $epoch;
+    my @lt = $localtime_fn->($epoch);
+    return sprintf('%02d:%02d:%02d', $lt[2], $lt[1], $lt[0]);
 }
 
 # clip_pad($str, $w) -> exactly $w characters: truncated if longer, space-padded
@@ -137,6 +161,7 @@ sub _fixed_panels {
             . '  [' . (defined $s->{status} ? $s->{status} : '?') . ']';
     push @sb, 'heartbeat : ' . (defined $s->{beat_age} ? fmt_age($s->{beat_age}) . ' ago' : 'n/a');
     push @sb, 'uptime    : ' . (defined $s->{uptime}   ? fmt_hms($s->{uptime})        : 'n/a');
+    push @sb, 'oauth     : ' . fmt_oauth($s->{oauth_remaining}) if defined $s->{oauth_remaining};
     push @p, { title => 'Sandbox', lines => \@sb };
 
     # B3: run + wakefulness state. busy-lease freshness (the orchestrator only
@@ -513,10 +538,12 @@ sub spawn_argv {
     return undef;   # inline: caller runs the connector in-process
 }
 
-# recent_events(\@json_lines, $n) -> arrayref of the last $n one-line event
-# summaries parsed from B1 launch-log JSON lines. Unparseable lines are skipped.
+# recent_events(\@json_lines, $n, $localtime_fn) -> arrayref of the last $n
+# one-line event summaries parsed from B1 launch-log JSON lines. Unparseable
+# lines are skipped. Optional 3rd arg $localtime_fn is the time seam passed
+# to _event_time; omit for real localtime (2-arg callers unchanged).
 sub recent_events {
-    my ($lines, $n) = @_;
+    my ($lines, $n, $localtime_fn) = @_;
     $lines ||= [];
     $n = 10 if !defined $n || $n < 1;
     my $jp = JSON::PP->new;
@@ -525,8 +552,8 @@ sub recent_events {
         next unless defined $ln && $ln =~ /\S/;
         my $rec = eval { $jp->decode($ln) };
         next unless $rec && ref $rec eq 'HASH';
-        my $ts  = defined $rec->{ts} ? $rec->{ts} : '';
-        my $hms = ($ts =~ /T(\d\d:\d\d:\d\d)/) ? $1 : substr($ts, 0, 8);
+        my $ts   = defined $rec->{ts} ? $rec->{ts} : '';
+        my $hms  = _event_time($ts, $localtime_fn);
         my $type = defined $rec->{type} ? $rec->{type} : 'event';
         my $extra = '';
         $extra .= " exit=$rec->{exit}"   if defined $rec->{exit};
@@ -765,6 +792,8 @@ sub run {
                 $state{uptime}         = $t - $start;
                 $state{pending}        = $pending;
                 $state{container_gone} = ($hb_state eq 'gone') ? 1 : 0;
+                $state{oauth_remaining} = defined $state{oauth_expires_at}
+                    ? $state{oauth_expires_at} - $t : undef;
                 # Transient footer notice when [c] was pressed on a non-running
                 # container (set in the launch branch below). Auto-expires so the
                 # normal command legend returns on its own.
