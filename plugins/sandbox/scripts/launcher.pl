@@ -1349,8 +1349,13 @@ if (-f "$HOST_PLUGINS_DIR/known_marketplaces.json") {
 # mcpOAuth tokens survive the move (materialize-credentials below re-reads
 # its own output to preserve mcpOAuth). Copy (not move): the legacy file is
 # left in .launcher/ as a harmless RO orphan. Best-effort — a failure here
-# just means materialize re-seeds claudeAiOauth from the host and the
-# container re-auths its MCP servers (re-login of MCP plugins, no token loss).
+# just means the container re-auths its MCP servers (re-login of MCP plugins,
+# no token loss). NOTE: materialize-credentials NO LONGER copies claudeAiOauth
+# from the host (blueprint 01-independent-grant, Decision #1). It preserves the
+# CONTAINER's own claudeAiOauth when the reset marker
+# .launcher/oauth-independent-migrated is present, and performs a one-time
+# reset (clears the stale host-copied token, then creates the marker) when it
+# is absent — so a migrated/fresh sandbox with no own grant prompts /login.
 # claude-home is RW from the container: a planted (dangling) symlink at the
 # creds path makes -f false, and _copy_file would then write THROUGH it to a
 # host-side target. Drop the link itself first (unlink removes the link, not its
@@ -1614,7 +1619,10 @@ sub ensure_claude_json_host_file { ensure_claude_json_onboarded() }
 # longer a single-file mount, so it need not pre-exist before `podman
 # create`. materialize-credentials always writes a valid file earlier in
 # the launch, so by the time we reach create this is a no-op. Kept as a
-# belt-and-suspenders seed in case materialize was skipped.
+# belt-and-suspenders seed in case materialize was skipped. This ONLY ensures
+# an empty `{}` placeholder exists; it is NOT a credential copy site and never
+# writes claudeAiOauth/mcpOAuth — the host token is never copied into the
+# sandbox (blueprint 01-independent-grant).
 sub ensure_credentials_json_host_file {
     return if -f $SANDBOX_CREDENTIALS_FILE && !-l $SANDBOX_CREDENTIALS_FILE;
     # Drop a container-planted symlink so the seed write can't follow it to a

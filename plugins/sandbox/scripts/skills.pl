@@ -27,6 +27,7 @@ use Encode qw(decode);
 use Fcntl qw(:flock);
 use File::Basename qw(dirname);
 use File::Path qw(make_path);
+use File::Spec;
 use POSIX qw(strftime);
 
 our $SCHEMA_VERSION = 3;
@@ -2394,11 +2395,16 @@ sub cmd_write_mcp_state {
 # Subcommand: materialize-credentials
 # =====================================================================
 #
-# Generates a sandboxed copy of ~/.claude/.credentials.json that the
-# container can use without inheriting the host's MCP OAuth tokens.
+# Generates the container's OWN sandboxed credentials file. The host's
+# `claudeAiOauth` is NEVER read or injected — each sandbox owns an
+# independent OAuth grant (its own in-container `/login`), so host and
+# sandbox no longer rotate one shared grant into reuse-detection re-logins.
 #
-# - Always copies the host's `claudeAiOauth` (refreshed on every launcher
-#   run, so the container stays in sync with the user's Claude account).
+# - `claudeAiOauth` is PRESERVED from the container's OWN accumulator, gated
+#   by a one-time reset marker (`.launcher/oauth-independent-migrated`): the
+#   first post-change launch drops any stale host-copied token (the container
+#   then prompts `/login`); thereafter the sandbox's own grant persists. The
+#   host token is never a source.
 # - PRESERVES the container's own `mcpOAuth` entries from previous runs,
 #   so plugin auth done inside the sandbox persists across rebuilds.
 # - DOES NOT propagate any host `mcpOAuth` entries. Every MCP server in
@@ -2416,20 +2422,17 @@ sub cmd_write_mcp_state {
 #   read-only bit; the call is harmless and keeps one code path for all
 #   platforms.)
 #
-# Required: --output FILE [--host-credentials FILE]
+# Required: --output FILE   (--host-credentials FILE is accepted for backward
+# compatibility but IGNORED — the host token is never read, see below.)
 sub cmd_materialize_credentials {
     my %opts = @_;
     my $output = $opts{output} or die "--output required\n";
-    my $host_file = $opts{host_credentials} // home() . "/.claude/.credentials.json";
 
-    # Host file is concurrently rewritten by the host's Claude session whenever
-    # the Anthropic OAuth token rotates. read_json returns undef on a torn read
-    # mid-rename; the original code silently fell back to `{}` here, which
-    # propagated as a sandbox booting without `claudeAiOauth` (unauthenticated
-    # container). Retry 3x with 100ms backoff covers the race window without
-    # masking a genuinely corrupt host file.
-    my $host = -f $host_file ? read_json_with_retry($host_file) : {};
-    $host = {} unless ref $host eq 'HASH';
+    # SECURITY (blueprint 01-independent-grant, Decision #1): the host's
+    # claudeAiOauth is NEVER injected into a sandbox. This function no longer
+    # opens the host credentials file at all — the strongest form of "never
+    # inject the host token". --host-credentials is accepted-but-ignored so
+    # older launchers that still pass it don't break.
 
     # Same retry pattern for the per-sandbox accumulator: a torn read here
     # would silently drop in-container mcpOAuth tokens the user already
@@ -2465,11 +2468,51 @@ sub cmd_materialize_credentials {
     }
 
     my $merged = {};
-    # 1. Claude account OAuth: always from host (rotates as host refreshes).
-    #    Strict HASH guard: a null/string/array `claudeAiOauth` is dropped
-    #    so the container sees no token rather than a malformed one.
-    if (exists $host->{claudeAiOauth} && ref $host->{claudeAiOauth} eq 'HASH') {
-        $merged->{claudeAiOauth} = $host->{claudeAiOauth};
+    # 1. Claude account OAuth: preserve-from-CONTAINER, gated by a one-time
+    #    reset marker. The host token is NEVER a source here.
+    #    - Marker PRESENT: the accumulator's claudeAiOauth is the sandbox's OWN
+    #      /login grant -> preserve it verbatim (strict HASH guard, mirroring
+    #      mcpOAuth below).
+    #    - Marker ABSENT: this is the first materialize after the independence
+    #      change -> any accumulator claudeAiOauth is a stale host-copy; DROP it
+    #      (the container will prompt /login) and CREATE the marker so future
+    #      launches preserve the sandbox's own grant.
+    my $marker = File::Spec->catfile(dirname($output), '.launcher',
+                                     'oauth-independent-migrated');
+    if (-e $marker) {
+        if (exists $existing->{claudeAiOauth}
+            && ref $existing->{claudeAiOauth} eq 'HASH') {
+            $merged->{claudeAiOauth} = $existing->{claudeAiOauth};
+        }
+    }
+    else {
+        # One-time reset: drop any stale host-copied claudeAiOauth, then create
+        # the marker. Marker creation is best-effort — warn, never die, so a
+        # failure here cannot abort the launch (mirrors the degrade posture).
+        #
+        # Symlink discipline (mirror the accumulator read's !-l guard above):
+        # claude-home is RW from the container, so never make_path/open THROUGH
+        # a planted symlink at .launcher/ or the marker itself — on Linux that
+        # would write through to a host-side target (a clobber/create primitive).
+        # This path is already unreachable at runtime (.launcher is a :ro overlay
+        # and materialize runs before `podman create`), but guard locally rather
+        # than silently lean on mount ordering + the :ro flag.
+        my $mdir = dirname($marker);
+        unlink $marker if -l $marker;   # drop a symlinked marker (the link, not its target)
+        if (-l $mdir) {
+            warn "WARNING: OAuth reset marker dir '$mdir' is a symlink; refusing to "
+               . "write the reset marker through it (host-copy reset may repeat next launch).\n";
+        }
+        else {
+            eval {
+                make_path($mdir) unless -d $mdir;
+                open my $mf, '>', $marker or die "$!\n";
+                close $mf;
+                1;
+            } or warn "WARNING: couldn't create OAuth reset marker '$marker': "
+                    . ($@ || 'unknown error') . "; the host-copy reset may repeat "
+                    . "on the next launch.\n";
+        }
     }
     # 2. MCP OAuth: preserve whatever the CONTAINER has accumulated; never
     #    inject host entries. First run yields empty mcpOAuth -> container
@@ -2478,6 +2521,13 @@ sub cmd_materialize_credentials {
     #    array, scalar) is dropped so Claude Code's parser doesn't choke.
     if (exists $existing->{mcpOAuth} && ref $existing->{mcpOAuth} eq 'HASH') {
         $merged->{mcpOAuth} = $existing->{mcpOAuth};
+    }
+
+    # Absent-token hint: with no claudeAiOauth in the materialized output the
+    # container will boot unauthenticated. Tell the user how to fix it once,
+    # loudly, rather than leaving a silent /login prompt to puzzle over.
+    unless (exists $merged->{claudeAiOauth}) {
+        warn "this sandbox needs its own login - run /login\n";
     }
 
     my $dir = dirname($output);
@@ -2526,8 +2576,9 @@ Commands:
                                                     enabledMcpjsonServers (MCP) in settings.json.
                                                     Idempotent; only ADDS, never edits existing.
   materialize-credentials --output FILE             Emit sandbox-isolated .credentials.json:
-                                                    claudeAiOauth from host, mcpOAuth from
-                                                    previous container state only.
+                                                    claudeAiOauth + mcpOAuth from previous
+                                                    container state only (host token never
+                                                    injected; one-time reset marker gates it).
   materialize-known-marketplaces --output FILE      Emit container-shaped known_marketplaces.json:
                                                     rewrites Windows installLocation paths to the
                                                     container mount target; drops directory-source
