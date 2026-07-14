@@ -111,10 +111,16 @@ Run `/steward:backup` afterwards to resync your live `~/.claude/` with any setti
 <!-- BEGIN-FILE-TREE -->
 ```
 ccpraxis/
+├── .gitattributes
 ├── global-config/
 │   ├── CLAUDE.md                            # Global instructions (supply chain rules, response style)
 │   ├── known_marketplaces.json              # Marketplace selections (synced across machines)
 │   └── settings.json                        # Base settings (env, statusline, plugins, effort level)
+├── host-tools/
+│   ├── bin/
+│   │   ├── .gitkeep
+│   │   └── perl.cmd
+│   └── ccpraxis-install.pl                  # host-tools install hook: put `perl` on the user's PATH.
 ├── install.pl                               # Top-level setup orchestrator — discovers and runs every surface's ccpraxis-install.pl. Two-phase: bare run = plan only, --confirm = apply.
 ├── plugins/                                 # Local plugin marketplace ("ccpraxis-local")
 │   ├── .claude-plugin/
@@ -126,17 +132,22 @@ ccpraxis/
 │   │   │   └── auto-declare.pl              # PostToolUse hook on Bash — detects install commands and proposes /backpack:add
 │   │   ├── scripts/
 │   │   │   └── backpack.pl                  # Core helper: validate / list / install / add / remove / audit
-│   │   └── skills/
-│   │       ├── add/
-│   │       │   └── SKILL.md                 # /backpack:add     — register a new item (with rationale)
-│   │       ├── audit/
-│   │       │   └── SKILL.md                 # /backpack:audit   — surface items missing rationale or whose verify no longer passes
-│   │       ├── install/
-│   │       │   └── SKILL.md                 # /backpack:install — replay install pass (no container rebuild needed)
-│   │       ├── list/
-│   │       │   └── SKILL.md                 # /backpack:list    — show contents grouped by category
-│   │       └── remove/
-│   │           └── SKILL.md                 # /backpack:remove  — drop an item
+│   │   ├── skills/
+│   │   │   ├── add/
+│   │   │   │   └── SKILL.md                 # /backpack:add     — register a new item (with rationale)
+│   │   │   ├── audit/
+│   │   │   │   └── SKILL.md                 # /backpack:audit   — surface items missing rationale or whose verify no longer passes
+│   │   │   ├── install/
+│   │   │   │   └── SKILL.md                 # /backpack:install — replay install pass (no container rebuild needed)
+│   │   │   ├── list/
+│   │   │   │   └── SKILL.md                 # /backpack:list    — show contents grouped by category
+│   │   │   └── remove/
+│   │   │       └── SKILL.md                 # /backpack:remove  — drop an item
+│   │   └── tests/
+│   │       ├── run-tests.pl                 # Test runner for plugins/backpack/tests/t/.
+│   │       └── t/
+│   │           ├── 01-encoding.t
+│   │           └── 02-install-diagnostics.t
 │   ├── beacon/                              # Beacon plugin — bundles the /beacon:* skills, the UserPromptSubmit completion-nudge hook, the shared beacon scripts, and the claude-beacon host launcher
 │   │   ├── .claude-plugin/
 │   │   │   └── plugin.json
@@ -151,18 +162,22 @@ ccpraxis/
 │   │   │   ├── beacon.pl                    # Core helper: light/unbeacon/list/get/update-activity/count-{project,global}/sync-vault/scan-sandboxes
 │   │   │   ├── claude-beacon.pl             # TUI launcher (logic for `claude-beacon` on the host)
 │   │   │   └── test-encoding.pl             # automated encoding test suite for the beacon plugin.
-│   │   └── skills/
-│   │       ├── delete/
-│   │       │   └── SKILL.md                 # /beacon:delete — delete any beacon by id-or-prefix (with confirmation)
-│   │       ├── list/
-│   │       │   └── SKILL.md                 # /beacon:list   — render every beacon as a Markdown table (read-only)
-│   │       ├── off/
-│   │       │   └── SKILL.md                 # /beacon:off    — remove the current session's beacon (with confirmation)
-│   │       ├── on/
-│   │       │   └── SKILL.md                 # /beacon:on     — mark this session as ongoing work
-│   │       └── view/
-│   │           └── SKILL.md                 # /beacon:view   — show one beacon's full record by id-or-prefix (read-only)
-│   ├── blueprint/                           # Authors and manages durable blueprints: /blueprint:create interrogates + decomp…
+│   │   ├── skills/
+│   │   │   ├── delete/
+│   │   │   │   └── SKILL.md                 # /beacon:delete — delete any beacon by id-or-prefix (with confirmation)
+│   │   │   ├── list/
+│   │   │   │   └── SKILL.md                 # /beacon:list   — render every beacon as a Markdown table (read-only)
+│   │   │   ├── off/
+│   │   │   │   └── SKILL.md                 # /beacon:off    — remove the current session's beacon (with confirmation)
+│   │   │   ├── on/
+│   │   │   │   └── SKILL.md                 # /beacon:on     — mark this session as ongoing work
+│   │   │   └── view/
+│   │   │       └── SKILL.md                 # /beacon:view   — show one beacon's full record by id-or-prefix (read-only)
+│   │   └── tests/
+│   │       ├── run-tests.pl                 # Test runner for plugins/beacon/tests/t/.
+│   │       └── t/
+│   │           └── 01-list-sandbox-fallback.t
+│   ├── blueprint/                           # Authors and manages durable blueprints (plan-only — no execution or resume ve…
 │   │   ├── .claude-plugin/
 │   │   │   └── plugin.json                  # Plugin manifest for blueprint (name, version, description, author).
 │   │   ├── agents/
@@ -176,52 +191,96 @@ ccpraxis/
 │   │   │   │   └── SKILL.md                 # Operating protocol for the blueprint author — the interactive Claude Code ses…
 │   │   │   ├── create/
 │   │   │   │   └── SKILL.md                 # Create a new blueprint — a durable multi-package initiative with per-package …
-│   │   │   ├── manage/
-│   │   │   │   └── SKILL.md                 # Manage blueprint lifecycle — list all blueprints with status, view one, re-ru…
-│   │   │   └── resume/
-│   │   │       └── SKILL.md                 # Resume work on an existing blueprint in THIS interactive session — load its b…
+│   │   │   └── manage/
+│   │   │       └── SKILL.md                 # Manage blueprint lifecycle — list all blueprints with status, view one, re-ru…
 │   │   └── templates/
 │   │       ├── blueprint.md                 # Template for a blueprint's top-level file (objective, decisions, package status table, package blocks); instantiated by /blueprint:create.
 │   │       └── package-ledger.md            # Template for a per-package ledger; its frontmatter (status/model/max_turns/write_set/test_paths) is the contract butler reads at launch.
-│   ├── butler/                              # Executes blueprints: launches detached headless coordinator sessions (one per p…
+│   ├── butler/                              # Executes blueprints.
 │   │   ├── .claude-plugin/
 │   │   │   └── plugin.json                  # Plugin manifest for butler (name, version, description, author).
 │   │   ├── agents/
 │   │   │   ├── bp-architect.md              # bp-architect worker (opus) - writes the package spec that tests and implementation build from. Report-only.
+│   │   │   ├── bp-harvest-judge.md          # bp-harvest-judge - verifies a finished package's outputs vs done-criteria from disk. Verdict-to-disk, never fixes.
 │   │   │   ├── bp-implementer.md            # bp-implementer worker - converges code on the immutable tests within the package write_set. Hook-blocked from test files.
 │   │   │   ├── bp-redteam.md                # bp-redteam worker (opus) - adversarial pass over the package. Report-only.
+│   │   │   ├── bp-resolve-judge.md          # bp-resolve-judge - broad-context fix attempt for a stuck package; applies an intent-clear fix (relaunch) or parks with a question.
 │   │   │   ├── bp-reviewer.md               # bp-reviewer worker - spec-conformance and conventions review. Report-only.
 │   │   │   ├── bp-scout.md                  # bp-scout worker (haiku) - terrain map with file:line for the package. Report-only.
 │   │   │   ├── bp-test-writer.md            # bp-test-writer worker - writes the immutable test oracle from the spec. May only touch the package test_paths.
 │   │   │   └── bp-ui-prober.md              # bp-ui-prober worker - finder-based UI scenarios and screenshot reads for packages that touch UI.
+│   │   ├── docs/
+│   │   │   ├── A0-derisk-findings.md
+│   │   │   └── assumptions.json
 │   │   ├── hooks/
+│   │   │   ├── gate-shutdown.sh             # PreToolUse graceful-stop gate (Decision #10/#18, package A4).
 │   │   │   ├── gate-stop.sh                 # Stop hook inside coordinator sessions.
 │   │   │   ├── guard-bash.sh                # PreToolUse hook for Bash inside coordinator sessions.
 │   │   │   ├── guard-writes.sh              # PreToolUse hook for Edit|Write|MultiEdit|NotebookEdit.
-│   │   │   ├── hooks.json                   # Hook registration for butler: PreToolUse (guard-writes/guard-bash/track-dispatch), PostToolUse (log-dispatch), Stop (gate-stop).
+│   │   │   ├── hooks.json                   # Hook registration for butler: PreToolUse (gate-shutdown/guard-writes on edits, gate-shutdown/track-dispatch on Task, guard-bash on Bash), PostToolUse (log-dispatch), Stop (gate-stop). gate-shutdown is the A4 graceful-stop gate: on a fleet stop signal (runs/.shutdown | runs/.paused | runs/<pkg>.force-stop) it denies new work and lets the coordinator funnel to a clean park.
 │   │   │   ├── lib.sh                       # shared helpers for butler hooks.
 │   │   │   ├── log-dispatch.sh              # PostToolUse hook for Task inside coordinator sessions.
 │   │   │   └── track-dispatch.sh            # PreToolUse hook for Task inside coordinator sessions.
 │   │   ├── scripts/
+│   │   │   ├── bp-answer-decision.pl        # the MECHANICAL unblock the reporter performs once a
+│   │   │   ├── bp-contract.pl               # Anthropic-side + creds CONTRACT validators (Decision #29/#31).
+│   │   │   ├── bp-drive-next.pl             # the mechanical director for /butler:drive-solo.
+│   │   │   ├── bp-govern.pl                 # the deterministic usage-governance decision functions for the
+│   │   │   ├── bp-hooks-selftest.sh         # A8 / Decision #31 startup self-assert.
+│   │   │   ├── bp-http.pl                   # the orchestrator/keeper HTTPS transport, via curl.
 │   │   │   ├── bp-init.sh                   # ensure the ccpraxis local data root exists and self-gitignores.
-│   │   │   ├── bp-drive-next.pl             # deterministic drive-solo "director": emits the next action (run-package/pause/blueprint-done/…) for the interactive session to execute.
+│   │   │   ├── bp-judge.pl                  # the DETERMINISTIC decision core for A5 (the judges).
+│   │   │   ├── bp-judge.sh                  # fire ONE scoped, throwaway judge for a package and detach it.
 │   │   │   ├── bp-launch.sh                 # launch (or resume) a headless coordinator session for one package.
 │   │   │   ├── bp-lib.sh                    # butler's copy of the shared base helpers PLUS sandbox-only execution helpers.
+│   │   │   ├── bp-log.pl                    # structured, line-flushed, crash-safe run logger (Decision #30).
+│   │   │   ├── bp-orchestrate.sh            # start (or report on) the deterministic, token-free
+│   │   │   ├── bp-orchestrator.pl           # the deterministic, TOKEN-FREE orchestrator process-management
+│   │   │   ├── bp-preflight.pl              # environment-support assertion (Decisions #29/#31).
 │   │   │   ├── bp-resume-sweep.sh           # find interrupted coordinators and resume them economically.
-│   │   │   └── bp-status.sh                 # one-line-per-package rollup across blueprints.
+│   │   │   ├── bp-status.sh                 # one-line-per-package rollup across blueprints.
+│   │   │   ├── bp-token-keeper.pl           # the orchestrator's OAuth token-keeper (Decisions #11/#12/#30).
+│   │   │   ├── bp-usage-gate.pl             # ONE host-safe usage-headroom poll for /butler:drive-solo.
+│   │   │   └── bp-wait-for-decision.pl      # the reporter's TOKEN-FREE blocking watcher (A7).
 │   │   ├── skills/
 │   │   │   ├── coordinator-protocol/
 │   │   │   │   └── SKILL.md                 # Binding operating protocol for butler coordinators — the headless Claude Code…
-│   │   │   ├── launch/
-│   │   │   │   └── SKILL.md                 # Launch a blueprint's ready packages as detached headless coordinator sessions a…
+│   │   │   ├── dispatch-fleet/
+│   │   │   │   └── SKILL.md                 # Execute a blueprint as a headless multi-coordinator FLEET (sandbox-only) — st…
+│   │   │   ├── drive-solo/
+│   │   │   │   └── SKILL.md                 # The one interactive execute verb — drive one blueprint, a named set, or ALL a…
 │   │   │   ├── orchestrator-protocol/
-│   │   │   │   └── SKILL.md                 # Operating protocol for the butler orchestrator (the interactive Claude Code ses…
-│   │   │   ├── resume/
-│   │   │   │   └── SKILL.md                 # Resume a blueprint after an interruption — session compaction, usage-limit pa…
+│   │   │   │   └── SKILL.md                 # Operating doctrine for butler execution — the reporter (the interactive Claud…
+│   │   │   ├── reporter/
+│   │   │   │   └── SKILL.md                 # Turn THIS Claude session into the reporter for a blueprint run — sync to curr…
 │   │   │   └── status/
 │   │   │       └── SKILL.md                 # Show the state of one or all blueprints — package statuses, live coordinator …
-│   │   └── templates/
-│   │       └── dispatch-prompt.md           # Coordinator bootstrap-prompt template; bp-launch.sh fills the placeholders and feeds it to the detached claude -p coordinator.
+│   │   ├── templates/
+│   │   │   ├── dispatch-prompt.md           # Coordinator bootstrap-prompt template; bp-launch.sh fills the placeholders and feeds it to the detached claude -p coordinator.
+│   │   │   ├── judge-harvest.md
+│   │   │   └── judge-resolve.md
+│   │   └── tests/
+│   │       ├── run-tests.pl                 # Test runner for plugins/butler/tests/t/.
+│   │       └── t/
+│   │           ├── 01-contract.t
+│   │           ├── 02-preflight.t
+│   │           ├── 03-govern.t
+│   │           ├── 04-log.t
+│   │           ├── 05-keeper.t
+│   │           ├── 06-orchestrator.t
+│   │           ├── 07-http.t
+│   │           ├── 08-orchestrator-scenarios.t
+│   │           ├── 09-gate.t
+│   │           ├── 10-judges.t
+│   │           ├── 11-simulation.t
+│   │           ├── 12-wait-for-decision.t
+│   │           ├── 13-answer-decision.t
+│   │           ├── 14-hooks-selftest.t
+│   │           ├── 15-orchestrate-shutdown-clear.t
+│   │           ├── 16-oauth-sandbox-preflight.t
+│   │           ├── 17-drive-next.t
+│   │           ├── 18-usage-governor.t
+│   │           └── 19-drive-integration.t
 │   ├── sandbox/                             # Sandbox plugin — bundles the claude-sandbox host launcher, the container blueprint, the bootstrap routine, and the /sandbox:setup redirect skill
 │   │   ├── .claude-plugin/
 │   │   │   └── plugin.json
@@ -233,16 +292,32 @@ ccpraxis/
 │   │   │   ├── CLAUDE.md                    # Container-specific instructions (full autonomy)
 │   │   │   ├── Containerfile                # OCI container image: Debian bookworm + Claude Code CLI + dev tools (runs as root; works with Docker or rootless Podman)
 │   │   │   ├── claude.json                  # Onboarding bypass for containers
+│   │   │   ├── heartbeat.sh                 # the sandbox container's entrypoint keep-alive loop (B6).
 │   │   │   └── settings.json                # Container-specific settings
+│   │   ├── docs/
+│   │   │   ├── B0-tui-spike-findings.md
+│   │   │   ├── b0-tui-probe.pl              # B0 TUI viability spike (Decision #18/#19, package B0).
+│   │   │   └── concurrent-config-safety-spike.md
 │   │   ├── scripts/
+│   │   │   ├── BackpackApproval.pm
+│   │   │   ├── BackpackReview.pm
+│   │   │   ├── ClaudeConfig.pm
+│   │   │   ├── ConnectorHold.pm
+│   │   │   ├── Dashboard.pm                 # the raw-ANSI TUI dashboard framework for `claude-sandbox` (B2).
+│   │   │   ├── KeepAwake.pm
+│   │   │   ├── LaunchLog.pm
 │   │   │   ├── MountSpec.pm
-│   │   │   ├── bootstrap.pl                 # First-launch setup invoked by launcher.pl when .ccpraxis-local-data/claude-home is missing. 6 steps: verify container blueprint, build image, mkdir .ccpraxis-local-data/claude-home, self-gitignore via inner .gitignore, git auth (HTTPS PAT / SSH deploy-key), invoke ccpraxis-install.pl. Fully interactive over the launcher's tty.
+│   │   │   ├── PluginSync.pm
+│   │   │   ├── PortAlloc.pm
+│   │   │   ├── SandboxLock.pm
+│   │   │   ├── bootstrap.pl                 # First-launch setup invoked by launcher.pl when .claude-data is missing. 6 steps: verify container blueprint, build image, mkdir .claude-data, append .gitignore, git auth (HTTPS PAT / SSH deploy-key), invoke ccpraxis-install.pl. Fully interactive over the launcher's tty.
+│   │   │   ├── keep-awake.ps1               # hold a Windows wake-lock for as long as THIS process lives.
 │   │   │   ├── launcher.pl                  # The actual claude-sandbox launcher: arg parsing, bootstrap detection, lock + dead-PID cleanup, image build, TUI selector orchestration, staleness check, mount assembly, container create-or-reattach. Wrappers in bin/ are tiny shims that exec into this.
 │   │   │   ├── select-session.pl            # TUI session picker for the claude-sandbox launcher.
 │   │   │   └── skills.pl                    # Discovery/selection backend for the launcher: enumerates custom + plugin skills + plugins + MCP servers, drives the interactive TUI picker, writes selection state and diff reports the launcher consumes.
 │   │   ├── skills/
 │   │   │   ├── setup/
-│   │   │   │   └── SKILL.md                 # /sandbox:setup — confirms .ccpraxis-local-data/claude-home state and tells the user to exit Claude and run `claude-sandbox`
+│   │   │   │   └── SKILL.md                 # /sandbox:setup — confirms .claude-data state and tells the user to exit Claude and run `claude-sandbox`
 │   │   │   └── test/
 │   │   │       └── SKILL.md                 # Run the sandbox plugin's verification suite — proves the bind-mount honors O_…
 │   │   └── tests/
@@ -266,7 +341,23 @@ ccpraxis/
 │   │           ├── 13-install-pass-heartbeat.t
 │   │           ├── 18-multi-session-shared-state.t
 │   │           ├── 21-select-session-multiple.t
-│   │           └── 22-mountspec-edge-cases.t
+│   │           ├── 22-mountspec-edge-cases.t
+│   │           ├── 23-reap-decision.t
+│   │           ├── 24-launch-log.t
+│   │           ├── 25-dashboard.t
+│   │           ├── 26-backpack-approval.t
+│   │           ├── 27-backpack-review.t
+│   │           ├── 28-keepawake.t
+│   │           ├── 29-select-session-viewport.t
+│   │           ├── 30-connector-hold.t
+│   │           ├── 31-plugin-merge.t
+│   │           ├── 32-plugin-sync.t
+│   │           ├── 33-credentials-degrade.t
+│   │           ├── 34-claude-json-seed.t
+│   │           ├── 35-port-alloc.t
+│   │           ├── 36-launcher-port-publish.t
+│   │           ├── 37-heartbeat-bridge-range.t
+│   │           └── 38-global-lock.t
 │   ├── steward/                             # Meta-plugin that maintains ccpraxis and owns its backup, onboarding, and self-e…
 │   │   ├── .claude-plugin/
 │   │   │   └── plugin.json
@@ -303,7 +394,8 @@ ccpraxis/
 │   │           ├── 04-conflict.t
 │   │           ├── 05-hard-exclude.t
 │   │           ├── 06-refresh-idempotent.t
-│   │           └── 07-vault-metadata-rot.t
+│   │           ├── 07-vault-metadata-rot.t
+│   │           └── 08-backup-data-migration.t
 │   └── todo/                                # Personal todo notes synced to your private vault repo.
 │       ├── .claude-plugin/
 │       │   └── plugin.json
@@ -319,6 +411,7 @@ ccpraxis/
 │   └── skill-writing-guide.md               # Shared skill authoring guide (folder structure, progressive disclosure, writing tips)
 ├── scripts/                                 # ccpraxis-wide utility scripts (shared across surfaces)
 │   ├── _install-bin-helper.pl               # Shared PATH/PATHEXT wiring (idempotent). Branches on $^O. Used by per-surface ccpraxis-install.pl hooks.
+│   ├── _perl-path.ps1                       # single source of truth for locating perl from PowerShell.
 │   ├── gen-readme-tree.pl                   # Generates the file-tree section of README.md from disk, using per-module metadata (.about > plugin.json > SKILL.md > script header). --check mode wires into /backup as a pre-flight; --bootstrap is a one-shot for adopting on an existing README.
 │   ├── hooks/                               # Host-side PreToolUse hooks installed via global-config/settings.json
 │   │   └── block-nul-redirect.pl            # Blocks bash `> nul` redirects on Windows — without this hook, scripts that target /dev/null on Unix create a stray `nul` file in the cwd, polluting the repo

@@ -28,7 +28,7 @@ my @patterns = (
     [ 'sk-[a-zA-Z0-9]{20,}',                       qr/sk-[a-zA-Z0-9]{20,}/ ],
     [ 'AIza[a-zA-Z0-9_-]',                         qr/AIza[a-zA-Z0-9_-]/ ],
     [ 'Bearer [a-zA-Z0-9_-]',                      qr/Bearer [a-zA-Z0-9_-]/ ],
-    [ 'accessToken',                               qr/accessToken/ ],
+    [ '"accessToken":',                            qr/"accessToken"\s*:/ ],
     [ 'PRIVATE KEY',                               qr/PRIVATE KEY/ ],
     [ '[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]\s*[:=]',  qr/[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]\s*[:=]/ ],
     [ '[Ss][Ee][Cc][Rr][Ee][Tt]\s*[:=]',          qr/[Ss][Ee][Cc][Rr][Ee][Tt]\s*[:=]/ ],

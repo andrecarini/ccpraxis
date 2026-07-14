@@ -193,7 +193,15 @@ sub _read_json_field {
     my $data = eval { decode_json(<$fh>) };
     close $fh;
     return undef unless ref($data) eq 'HASH';
-    return $data->{$field};
+    my $v = $data->{$field};
+    # decode_json returns DECODED (wide) characters; every other description
+    # source in this script (.about, SKILL.md, script headers, and the README
+    # itself) is read via `<:raw>` as UTF-8 *bytes*. Normalize back to bytes so
+    # that a plugin description containing a non-ASCII char (e.g. an em-dash)
+    # compares equal in --check instead of drifting forever (wide char vs the
+    # UTF-8 bytes --write emitted).
+    utf8::encode($v) if defined $v && !ref $v;
+    return $v;
 }
 
 sub _read_skill_description {
