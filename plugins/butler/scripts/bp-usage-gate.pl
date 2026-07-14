@@ -1,10 +1,11 @@
 #!/usr/bin/env perl
-# bp-usage-gate.pl — ONE host-safe usage-headroom poll for /butler:keep-going-solo.
+# bp-usage-gate.pl — ONE host-safe usage-headroom poll for /butler:drive-solo.
 #
-# keep-going-solo runs in an interactive session that shares the user's OAuth
+# drive-solo runs in an interactive session that shares the user's OAuth
 # token + usage. There is no deterministic orchestrator to govern it, so the
-# driver must govern ITSELF: before each heavy step it calls this gate, and if the
-# gate says PAUSE it sleeps token-cheaply until the window resets, then resumes.
+# drive-solo director (bp-drive-next.pl) governs the session ITSELF: before each
+# heavy step it calls this gate (`bp-usage-gate.pl verdict`), and if the gate says
+# PAUSE the session sleeps token-cheaply until the window resets, then resumes.
 # This is the in-session analogue of the fleet's usage governance (Decisions
 # #7-#9) — deliberately simpler, because a single CLI invocation has only ONE
 # usage sample and so cannot compute a burn rate. Instead of the fleet's

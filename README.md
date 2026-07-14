@@ -66,7 +66,7 @@ Once installed, here's what you'll actually type day-to-day, grouped by job:
 
 **Browsing or cleaning up beacons.** `/beacon:list` renders them as a Markdown table, `/beacon:view <id>` shows one full record, `/beacon:delete <id>` removes any beacon by ID-or-prefix (with confirmation).
 
-**Planning a multi-session initiative.** `/blueprint:create` interrogates the objective and decomposes it into scoped packages — a durable on-disk *blueprint* — then gates it through a fresh-context auditor; `/blueprint:manage` lists, views, audits, archives, or deletes them. The `blueprint` plugin is plan-only. Inside a sandbox, the `butler` plugin executes a blueprint: `/butler:dispatch-fleet` starts a deterministic, token-free orchestrator script (no Claude) that watches, launches, relaunches, and usage-governs detached coordinator agents (one per package, with hook-enforced scope/git/ledger discipline) and auto-resumes across usage/token limits; `/butler:drive-solo` is the host-safe single-session alternative; `/butler:reporter` is the interactive front door you talk to; `/butler:status` reports. Both execute verbs are idempotent start-or-continue (there is no separate resume).
+**Planning a multi-session initiative.** `/blueprint:create` interrogates the objective and decomposes it into scoped packages — a durable on-disk *blueprint* — then gates it through a fresh-context auditor; `/blueprint:manage` lists, views, audits, archives, or deletes them. The `blueprint` plugin is plan-only. Inside a sandbox, the `butler` plugin executes a blueprint: `/butler:dispatch-fleet` starts a deterministic, token-free orchestrator script (no Claude) that watches, launches, relaunches, and usage-governs detached coordinator agents (one per package, with hook-enforced scope/git/ledger discipline) and auto-resumes across usage/token limits; `/butler:drive-solo` is the single interactive execute verb — a thin loop over the deterministic perl director (`bp-drive-next.pl`) that drives one blueprint, a named set, or all audited blueprints to done in one host-or-sandbox session; `/butler:reporter` is the interactive front door you talk to; `/butler:status` reports. Both execute verbs are idempotent start-or-continue (there is no separate resume).
 
 **Capturing a todo.** `/todo:create` saves a note, `/todo:resume` loads one to work on, `/todo:manage` does CRUD. Todos sync via the vault.
 
@@ -204,6 +204,7 @@ ccpraxis/
 │   │   │   └── track-dispatch.sh            # PreToolUse hook for Task inside coordinator sessions.
 │   │   ├── scripts/
 │   │   │   ├── bp-init.sh                   # ensure the ccpraxis local data root exists and self-gitignores.
+│   │   │   ├── bp-drive-next.pl             # deterministic drive-solo "director": emits the next action (run-package/pause/blueprint-done/…) for the interactive session to execute.
 │   │   │   ├── bp-launch.sh                 # launch (or resume) a headless coordinator session for one package.
 │   │   │   ├── bp-lib.sh                    # butler's copy of the shared base helpers PLUS sandbox-only execution helpers.
 │   │   │   ├── bp-resume-sweep.sh           # find interrupted coordinators and resume them economically.
@@ -365,7 +366,7 @@ Two deliberate exceptions: the `butler` and `blueprint` plugins each carry a sma
 - `/blueprint:create` — author a durable multi-package blueprint (interrogate → decompose → auditor gate)
 - `/blueprint:manage` — list, view, audit, archive, or delete blueprints (the blueprint plugin is plan-only)
 - `/butler:dispatch-fleet` — execute a blueprint as a headless fleet: start the deterministic, token-free orchestrator script that drives detached coordinator agents and auto-resumes across usage/token limits (sandbox-only)
-- `/butler:drive-solo` — execute a blueprint in the current interactive session with a flat worker layer (host-safe); `/butler:reporter` observes/relays a run, `/butler:status` reports. Both execute verbs are start-or-continue (no resume verb)
+- `/butler:drive-solo` — drive one blueprint, a named set, or all audited blueprints to done in one interactive session (host or sandbox) as a thin loop over the perl director `bp-drive-next.pl`, with a flat worker layer; `/butler:reporter` observes/relays a run, `/butler:status` reports. Both execute verbs are start-or-continue (no resume verb)
 - `/todo:create` — save a todo note
 - `/todo:manage` — CRUD for personal todos
 - `/todo:resume` — load a todo and work on it

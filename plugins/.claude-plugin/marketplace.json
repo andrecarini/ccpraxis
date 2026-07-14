@@ -34,7 +34,7 @@
     {
       "name": "butler",
       "source": "./butler",
-      "description": "Executes blueprints. /butler:dispatch-fleet starts a deterministic, token-free orchestrator script that drives detached headless coordinators (one per package, scoped worker subagents, hook-enforced discipline) and auto-resumes across usage/token limits; /butler:drive-solo is the host-safe single-session alternative and /butler:keep-going-solo loops it across every audited blueprint with keep-awake + self-governed usage-limit sleep-through; /butler:reporter is the interactive front door; /butler:status reports. Start-or-continue (no resume verb). Fleet is sandbox-only; pairs with the host-side blueprint plugin."
+      "description": "Executes blueprints. /butler:dispatch-fleet starts a deterministic, token-free orchestrator script that drives detached headless coordinators (one per package, scoped worker subagents, hook-enforced discipline) and auto-resumes across usage/token limits; /butler:drive-solo is the single interactive execute verb — a thin loop over the perl director bp-drive-next.pl that drives one blueprint, a named set, or ALL audited blueprints to done in one host-or-sandbox session (flat worker layer, director-managed keep-awake + self-governed usage-limit sleep-through); /butler:reporter is the interactive front door; /butler:status reports. Start-or-continue (no resume verb). Fleet is sandbox-only; pairs with the host-side blueprint plugin."
     },
     {
       "name": "todo",
