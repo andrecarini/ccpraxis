@@ -37,6 +37,8 @@ Run `perl "${CLAUDE_PLUGIN_ROOT}/scripts/bp-preflight.pl"` once, before the loop
 
 Call `bp-drive-next.pl next --scope <scope>` → dispatch the returned action **by name**. The director emits exactly one action per call; execute it and call `next` again.
 
+> **Data root (project-anchored).** The director resolves the blueprint data root the same way `bp-lib.sh` does: `$CCPRAXIS_DATA_DIR` if set, else `<project root>/.ccpraxis-local-data` (project root = `$BP_PROJECT_ROOT` → git top-level → walk-up from cwd for `.ccpraxis-local-data`). It is **never** plugin/script-relative, so a marketplace install resolves the *project*, not the plugin dir. If it can't find a `blueprints/` dir it **fails loud** (nonzero exit, clear stderr) rather than reporting a false `done`. If you ever hit that, export `CCPRAXIS_DATA_DIR=<project>/.ccpraxis-local-data` and re-invoke.
+
 | `action` | Session behavior | Next director call |
 |---|---|---|
 | `need-order` | JUDGE the blueprint order over `candidates` (dependencies / risk / value — a Claude judgment, Decision #3), then persist it. | `bp-drive-next.pl record-order <bp> [<bp> …]`, then `next` again |

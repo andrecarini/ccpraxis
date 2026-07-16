@@ -682,6 +682,59 @@ STATE  (<data>/.drive-solo/, all director-owned)
 END_HELP
 
 # ===========================================================================
+# PROJECT-ANCHORED DATA-DIR RESOLUTION
+# ===========================================================================
+# CRITICAL: the data root MUST be anchored to the PROJECT, never to __FILE__/the
+# plugin dir. A marketplace/plugin install lives OUTSIDE the project tree — e.g.
+# $HOME/.claude/plugins/marketplaces/<mkt>/butler/scripts — so a script-relative
+# "../../../.ccpraxis-local-data" guess resolves an unrelated root (the
+# marketplaces dir) that has no blueprints/. read_state then builds an empty DAG,
+# every blueprint looks settled, and `next` silently emits blueprint-done→done
+# despite pending work. This mirrors bp-lib.sh's bp_project_root()+bp_data_dir()
+# so the perl director and the bash helpers agree on exactly one root.
+#
+# Priority (identical to bp-lib.sh, plus the injected data_dir opt on top for tests):
+#   data_dir opt (--data-dir) > $CCPRAXIS_DATA_DIR
+#     > <project root>/.ccpraxis-local-data
+#   project root = $BP_PROJECT_ROOT > git toplevel
+#     > walk up from cwd for a dir containing .ccpraxis-local-data > cwd
+
+sub _resolve_project_root {
+    return $ENV{BP_PROJECT_ROOT}
+        if defined $ENV{BP_PROJECT_ROOT} && length $ENV{BP_PROJECT_ROOT};
+
+    # git toplevel — trust only a clean exit and a real directory.
+    my $top = `git rev-parse --show-toplevel 2>/dev/null`;
+    if ($? == 0 && defined $top) {
+        chomp $top;
+        return $top if length $top && -d $top;
+    }
+
+    # Walk up from cwd for the first ancestor that already holds .ccpraxis-local-data.
+    my $d = Cwd::getcwd();
+    if (defined $d && length $d) {
+        my %seen;
+        while (!$seen{$d}++) {
+            return $d if -d "$d/.ccpraxis-local-data";
+            my $parent = dirname($d);
+            last if $parent eq $d;    # reached the filesystem / drive root
+            $d = $parent;
+        }
+    }
+
+    return Cwd::getcwd() // '.';
+}
+
+sub _resolve_data_dir {
+    my ($opts) = @_;
+    return $opts->{data_dir}
+        if defined $opts->{data_dir} && length $opts->{data_dir};
+    return $ENV{CCPRAXIS_DATA_DIR}
+        if defined $ENV{CCPRAXIS_DATA_DIR} && length $ENV{CCPRAXIS_DATA_DIR};
+    return _resolve_project_root() . '/.ccpraxis-local-data';
+}
+
+# ===========================================================================
 # TOP-LEVEL run() — the seam entry point (spec §4)
 # ===========================================================================
 
@@ -689,11 +742,38 @@ sub run {
     my ($argv, $opts) = @_;
     $opts //= {};
 
-    # Inject production defaults for each seam
-    my $data_dir = $opts->{data_dir}
-        // ($ENV{CCPRAXIS_DATA_DIR}
-            ? $ENV{CCPRAXIS_DATA_DIR}
-            : do { my $d = abs_path($DIR . '/../../../.ccpraxis-local-data'); $d });
+    my @argv = @{ $argv // [] };
+    my $sub  = shift @argv // '';
+
+    # --help / -h need no data dir — handle before any resolution or shell-out.
+    if ($sub eq '--help' || $sub eq '-h') {
+        print $HELP_TEXT;
+        return 0;
+    }
+
+    # Inject production defaults for each seam. data_dir is PROJECT-anchored
+    # (see _resolve_data_dir) — NEVER __FILE__/plugin-relative.
+    my $data_dir = _resolve_data_dir($opts);
+
+    # Fail loud on an indeterminate / mis-resolved data root — for EVERY subcommand
+    # that reads or writes blueprint state. A missing blueprints/ must NEVER be treated
+    # as valid: for `next` it makes the empty DAG look settled and emits
+    # blueprint-done→done (the silent false-completion bug); for `record-order`/`park`
+    # it would write order/park state under the wrong root where no `next` will ever
+    # read it (silent state loss on a hand-run with a wrong CCPRAXIS_DATA_DIR). Mirror
+    # the siblings (bp-orchestrator / bp-answer-decision / bp-wait-for-decision), which
+    # exit nonzero when the data dir is indeterminate rather than guessing. Runs before
+    # any make_path, so a wrong root never materializes a bogus .drive-solo/.
+    if ($sub eq 'next' || $sub eq 'record-order' || $sub eq 'park') {
+        unless (-d "$data_dir/blueprints") {
+            print STDERR "bp-drive-next: no blueprints/ under the resolved data dir:\n";
+            print STDERR "    $data_dir\n";
+            print STDERR "  Resolution order: --data-dir opt > \$CCPRAXIS_DATA_DIR > \$BP_PROJECT_ROOT\n";
+            print STDERR "                    > git toplevel > walk-up for .ccpraxis-local-data > cwd.\n";
+            print STDERR "  Set CCPRAXIS_DATA_DIR=<project>/.ccpraxis-local-data (or pass --data-dir) and retry.\n";
+            return 2;
+        }
+    }
 
     my $now_fn = $opts->{now} // sub { time };
     my $verdict_fn = $opts->{verdict} // sub {
@@ -718,13 +798,7 @@ sub run {
         powershell_available => $opts->{powershell_available} // sub { _ps_available() },
     );
 
-    my @argv = @{ $argv // [] };
-    my $sub = shift @argv // '';
-
-    if ($sub eq '--help' || $sub eq '-h') {
-        print $HELP_TEXT;
-        return 0;
-    } elsif ($sub eq 'next') {
+    if ($sub eq 'next') {
         return _cmd_next(\@argv, \%full_opts);
     } elsif ($sub eq 'record-order') {
         return _cmd_record_order(\@argv, \%full_opts);
@@ -745,6 +819,12 @@ sub run {
 
 # Detect whether powershell.exe is resolvable (for keep-awake actuation).
 sub _ps_available {
+    # Keep-awake actuation is a Windows-only concern; in the Linux sandbox it is a
+    # documented no-op (doctrine). Probing powershell.exe off-Windows only spams
+    # stderr with "Can't exec \"powershell.exe\": No such file or directory" on every
+    # `next` — harmless (eval'd → 0) but misleading. Short-circuit off-Windows.
+    return 0 unless $^O =~ /^(MSWin32|msys|cygwin)$/;
+
     # List-form system() spawns powershell.exe directly (no shell), so there is no
     # /dev/null-vs-NUL redirect hazard (CLAUDE.md house rule) and the intent is explicit.
     # `-Command "exit 0"` prints nothing; ENOENT (not found) -> system() returns -1.

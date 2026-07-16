@@ -11,6 +11,7 @@ use JSON::PP;
 use File::Temp qw(tempdir);
 use File::Path qw(make_path);
 use File::Basename qw(basename);
+use Cwd qw(getcwd abs_path);
 
 # ── require the not-yet-existing script ─────────────────────────────────────
 # If it doesn't exist this is a compile-time die → caught with eval.
@@ -658,7 +659,10 @@ sub capture_run {
 
 # ── Edge: record-order with zero blueprints → nonzero exit ───────────────────
 {
+    # blueprints/ present (so the mis-resolved-root gate passes) — this pins the
+    # empty-ARGS check specifically, not the data-root gate.
     my $data = tempdir(CLEANUP => 1);
+    make_bp_dir($data, 'bp-present', [{key=>'p1',status=>'pending',write_set=>'p/p1/'}]);
     my ($rc, $out) = eval { capture_run(['record-order'], { data_dir=>$data }) };
     ok($rc != 0, 'Edge(record-order): zero blueprints exits nonzero (spec §2.1)');
 }
@@ -705,6 +709,97 @@ sub capture_run {
     # Dedupe: first-seen order preserved
     my @r6 = BpDrive::resolve_scope('alpha,alpha,beta', \@all);
     is_deeply(\@r6, ['alpha','beta'], 'resolve_scope: deduplication preserves first-seen order');
+}
+
+# ── Regression: mis-resolved / empty data root must FAIL LOUD, never "done" ──
+# The false-completion bug: a marketplace install resolved the WRONG root (no
+# blueprints/), read_state built an empty DAG, every blueprint looked settled, and
+# `next` emitted blueprint-done→done despite pending work. A data dir without a
+# blueprints/ dir must now exit nonzero and print NOTHING to stdout.
+{
+    my $data = tempdir(CLEANUP => 1);   # fresh — deliberately NO blueprints/ subdir
+    my ($rc, $out, $err) = capture_run(['next', '--scope', 'all'], { data_dir => $data });
+    ok($rc != 0, 'Regression: next on a data dir with no blueprints/ exits nonzero');
+    is($out, '', 'Regression: no action JSON emitted to stdout (never a false done/blueprint-done)');
+    unlike($out, qr/blueprint-done|"action"\s*:\s*"done"/,
+        'Regression: stdout carries no done/blueprint-done action');
+    like($err, qr/blueprints/,
+        'Regression: stderr names the missing blueprints/ (fail-loud, mirrors siblings)');
+    ok(!-d "$data/.drive-solo",
+        'Regression: no bogus .drive-solo/ materialized (gate precedes make_path)');
+}
+
+# ── Regression: record-order / park also fail loud on a mis-resolved root ─────
+# A direct hand-run with a wrong CCPRAXIS_DATA_DIR must not silently write order /
+# park state under a root that no `next` will ever read (silent state loss).
+{
+    my $data = tempdir(CLEANUP => 1);   # fresh — no blueprints/
+    my ($rc, $out) = capture_run(['record-order', 'bp-a'], { data_dir => $data });
+    ok($rc != 0, 'Regression: record-order on a rootless data dir exits nonzero');
+    ok(!-e "$data/.drive-solo/order.json",
+        'Regression: no order.json written under a mis-resolved root');
+
+    my ($rc2, $out2) = capture_run(['park', 'bp-a', 'stale'], { data_dir => $data });
+    ok($rc2 != 0, 'Regression: park on a rootless data dir exits nonzero');
+    ok(!-e "$data/.drive-solo/parks.json",
+        'Regression: no parks.json written under a mis-resolved root');
+}
+
+# ── _resolve_data_dir / _resolve_project_root priority (mirrors bp-lib.sh) ────
+# Anchored to the PROJECT, never to __FILE__/the plugin dir. Order:
+#   data_dir opt > $CCPRAXIS_DATA_DIR > $BP_PROJECT_ROOT/.ccpraxis-local-data > …
+{
+    is(BpDrive::_resolve_data_dir({ data_dir => '/explicit/dir' }), '/explicit/dir',
+        '_resolve_data_dir: explicit data_dir opt wins');
+
+    {   # $CCPRAXIS_DATA_DIR is the full data-dir override
+        local $ENV{CCPRAXIS_DATA_DIR} = '/env/data';
+        is(BpDrive::_resolve_data_dir({}), '/env/data',
+            '_resolve_data_dir: $CCPRAXIS_DATA_DIR used when no opt');
+        is(BpDrive::_resolve_data_dir({ data_dir => '/opt/data' }), '/opt/data',
+            '_resolve_data_dir: opt beats $CCPRAXIS_DATA_DIR');
+    }
+
+    {   # $BP_PROJECT_ROOT anchors the data dir (project-anchored, never plugin-relative)
+        delete local $ENV{CCPRAXIS_DATA_DIR};
+        local $ENV{BP_PROJECT_ROOT} = '/some/project';
+        is(BpDrive::_resolve_project_root(), '/some/project',
+            '_resolve_project_root: $BP_PROJECT_ROOT wins over git/walk-up');
+        is(BpDrive::_resolve_data_dir({}), '/some/project/.ccpraxis-local-data',
+            '_resolve_data_dir: falls back to <project root>/.ccpraxis-local-data');
+    }
+}
+
+# ── _resolve_project_root walk-up path (git-absent fallback) ─────────────────
+# Exercises the git-then-walk-up branch: from a deep child dir with no env
+# override, the resolver climbs to the nearest ancestor holding .ccpraxis-local-data.
+# git-toplevel is tried first; a system tempdir isn't a git repo, so it falls
+# through to the walk-up. Guarded for the rare case where the tempdir IS in a repo.
+{
+    my $proj = tempdir(CLEANUP => 1);
+    make_path("$proj/.ccpraxis-local-data");
+    make_path("$proj/a/b/c");
+    delete local $ENV{BP_PROJECT_ROOT};
+    delete local $ENV{CCPRAXIS_DATA_DIR};
+
+    my $saved = getcwd();
+    if (chdir "$proj/a/b/c") {
+        my $git_top = `git rev-parse --show-toplevel 2>/dev/null`;
+        my $in_repo = ($? == 0 && defined $git_top && length $git_top);
+        my $root = BpDrive::_resolve_project_root();
+        my $ddir = BpDrive::_resolve_data_dir({});
+        chdir $saved;    # restore before asserting
+        SKIP: {
+            skip 'tempdir is inside a git repo — walk-up branch not exercised', 2 if $in_repo;
+            is(abs_path($root), abs_path($proj),
+                '_resolve_project_root: walk-up finds nearest ancestor holding .ccpraxis-local-data');
+            is(abs_path($ddir), abs_path("$proj/.ccpraxis-local-data"),
+                '_resolve_data_dir: composes <walked-up root>/.ccpraxis-local-data');
+        }
+    } else {
+        chdir $saved;
+        fail('walk-up test: could not chdir into tempdir');
+    }
 }
 
 done_testing();
