@@ -7,6 +7,9 @@ deploy_key*
 .statusline_usage_cache.json
 .backup-preferences.json
 .claude/settings.local.json
+# Install-specific enabledPlugins (references the local @ccpraxis-local marketplace);
+# Claude Code rewrites it on every plugin toggle — machine state, not shared config.
+.claude/settings.json
 .claude-plans/
 .ccpraxis-local-data/
 
