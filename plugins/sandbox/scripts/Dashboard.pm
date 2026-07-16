@@ -84,11 +84,12 @@ sub fmt_hms {
     return sprintf('%dh %dm %ds', $h, $m, $s);
 }
 
-# fmt_oauth($remaining_secs) -> ASCII-only countdown string for the oauth line.
-# undef -> 'unknown'; <= 0 -> 'EXPIRED'; > 0 -> 'expires in <fmt_age>'.
+# fmt_oauth($remaining_secs) -> ASCII-only status string for the oauth line.
+# undef (no token yet — sandboxes now own an independent login) ->
+# 'not logged in (run /login)'; <= 0 -> 'EXPIRED'; > 0 -> 'expires in <fmt_age>'.
 sub fmt_oauth {
     my ($s) = @_;
-    return 'unknown' if !defined $s;
+    return 'not logged in (run /login)' if !defined $s;
     return 'EXPIRED' if $s <= 0;
     return 'expires in ' . fmt_age($s);
 }
@@ -161,7 +162,10 @@ sub _fixed_panels {
             . '  [' . (defined $s->{status} ? $s->{status} : '?') . ']';
     push @sb, 'heartbeat : ' . (defined $s->{beat_age} ? fmt_age($s->{beat_age}) . ' ago' : 'n/a');
     push @sb, 'uptime    : ' . (defined $s->{uptime}   ? fmt_hms($s->{uptime})        : 'n/a');
-    push @sb, 'oauth     : ' . fmt_oauth($s->{oauth_remaining}) if defined $s->{oauth_remaining};
+    # Always shown: a fresh sandbox has no token until an in-container /login
+    # (each sandbox owns an independent grant), and "not logged in" is exactly
+    # the actionable cue the user needs — so never silently drop the line.
+    push @sb, 'oauth     : ' . fmt_oauth($s->{oauth_remaining});
     push @p, { title => 'Sandbox', lines => \@sb };
 
     # B3: run + wakefulness state. busy-lease freshness (the orchestrator only

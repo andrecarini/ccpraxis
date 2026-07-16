@@ -637,10 +637,12 @@ is(Dashboard::_scroll_hint(0, 0), undef, 'hint: nothing hidden -> undef');
 unlike(Dashboard::_scroll_hint(1, 1), qr/[^\x20-\x7E]/, 'hint: pure ASCII (width-safe)');
 
 # activity_capacity: mirrors compose_frame's budget (deterministic for %st).
-# %st has Sandbox(4 lines)+Run(3 lines) fixed = (1+4+1)+(1+3+1)=11; body=rows-2.
-is(Dashboard::activity_capacity(\%st, 24, 80), 10, 'capacity: 24 rows, no alert -> 10 event rows');
-is(Dashboard::activity_capacity({ %st, status => 'exited' }, 24, 80), 9,
-   'capacity: a status alert costs one row');
+# The Sandbox panel now ALWAYS carries an oauth line (5 lines): even with no
+# token %st renders "not logged in (run /login)". Sandbox(5)+Run(3) fixed =
+# (1+5+1)+(1+3+1)=12; body=rows-2.
+is(Dashboard::activity_capacity(\%st, 24, 80), 9, 'capacity: 24 rows, no alert -> 9 event rows (oauth line always present)');
+is(Dashboard::activity_capacity({ %st, status => 'exited' }, 24, 80), 8,
+   'capacity: a status alert costs one more row');
 is(Dashboard::activity_capacity(\%st, 12, 80), 0,
    'capacity: too short for the fixed panels -> 0 (no negative)');
 
@@ -1073,10 +1075,12 @@ sub drive_per_tick {
 {
     my $have_fmt_oauth = Dashboard->can('fmt_oauth');
 
-    # B1: undef -> 'unknown'
+    # B1: undef (no token yet) -> actionable 'not logged in (run /login)'
     my $b1 = eval { Dashboard::fmt_oauth(undef) };
-    is($b1, 'unknown',
-        'B1: fmt_oauth(undef) eq "unknown"');
+    is($b1, 'not logged in (run /login)',
+        'B1: fmt_oauth(undef) eq "not logged in (run /login)"');
+    unlike($b1 // '', qr/[^\x20-\x7E]/,
+        'B1-ascii: not-logged-in label is ASCII-only (width-safe)');
 
     # B2: negative -> 'EXPIRED'
     my $b2 = eval { Dashboard::fmt_oauth(-5) };
@@ -1109,16 +1113,26 @@ sub drive_per_tick {
 }
 
 # ---------------------------------------------------------------------------
-# C1  activity_capacity with oauth_remaining defined -> one extra fixed row
-#
-# When oauth_remaining is defined, _fixed_panels gains an oauth line in the
-# Sandbox panel, reducing the activity row budget by 1 (from 10 to 9).
-# C2 (undef -> 10) is already green at line 641 above; this test encodes C1.
+# C1  The oauth line is ALWAYS present in the Sandbox panel — whether or not a
+# token expiry is known — so activity capacity is 9 in BOTH cases. A known
+# expiry shows the countdown; no token shows the actionable "not logged in"
+# prompt (never silently dropped).
 # ---------------------------------------------------------------------------
 {
     my %st_oauth = (%st, oauth_remaining => 3*3600 + 12*60);
     is(Dashboard::activity_capacity(\%st_oauth, 24, 80), 9,
-        'C1: oauth_remaining defined -> Sandbox gains an oauth line -> capacity 9 (not 10)');
+        'C1a: known expiry -> oauth line present -> capacity 9');
+    is(Dashboard::activity_capacity(\%st, 24, 80), 9,
+        'C1b: no token (undef) -> oauth line STILL present -> capacity 9');
+
+    my @panels_none = Dashboard::_fixed_panels(\%st);
+    my $panels_none = join("\n", map { @{ $_->{lines} } } @panels_none);
+    like($panels_none, qr{oauth\s*:\s*not logged in \(run /login\)},
+        'C1c: not-logged-in state renders the actionable oauth prompt');
+    my @panels_oauth = Dashboard::_fixed_panels(\%st_oauth);
+    my $panels_oauth = join("\n", map { @{ $_->{lines} } } @panels_oauth);
+    like($panels_oauth, qr{oauth\s*:\s*expires in 3h12m},
+        'C1d: known expiry renders the countdown');
 }
 
 # ---------------------------------------------------------------------------
