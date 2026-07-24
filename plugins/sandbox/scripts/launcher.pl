@@ -45,6 +45,7 @@ BEGIN {
     unshift @INC, $dir;
 }
 use MountSpec qw(winify_path v_to_mount convert_v_to_mount);
+use CcpraxisSelfHost qw(selfhost_route selfhost_decline_outcome);
 use LaunchLog ();   # B1: durable per-launch diagnostic log (next to us in scripts/)
 use Dashboard ();   # B2: the raw-ANSI TUI dashboard framework
 use BackpackApproval ();  # #21: per-item, machine-local backpack approval memory
@@ -208,6 +209,31 @@ $PROJECT_PATH = winify_path($PROJECT_PATH);
 
 my $PROJECT_NAME = lc(basename($PROJECT_PATH));
 $PROJECT_NAME =~ s/ /-/g;
+
+# =====================================================================
+# p01: ccpraxis self-host detection — must run AFTER $PROJECT_PATH is final
+# =====================================================================
+# §9.1: derive the live ccpraxis root from __FILE__ (registry-independent anchor).
+# launcher.pl lives at <ccpraxis>/plugins/sandbox/scripts/launcher.pl
+# so scripts->sandbox->plugins->ccpraxis is three dirname() calls.
+my $LIVE_CCPRAXIS_ROOT = do { my $h = __FILE__; $h =~ s|\\|/|g; my $s = dirname($h); dirname(dirname(dirname($s))); };
+{
+    my $route = selfhost_route($PROJECT_PATH, { registry_path => "$HOST_PLUGINS_DIR/known_marketplaces.json", live_install_hint => $LIVE_CCPRAXIS_ROOT });
+    if ($route eq 'offer') {
+        my $action = prompt_selfhost_action();
+        if ($action eq 'selfhost') {
+            # TODO(p02): hand off to worktree provisioning
+            print "Self-host flow is not yet implemented (p02). Aborting.\n";
+            exit 0;
+        } else {
+            # decline
+            my $o = selfhost_decline_outcome();
+            print STDERR $o->{message}, "\n";
+            exit 1;
+        }
+    }
+    # 'passthrough' → fall through to existing launch flow unchanged
+}
 
 # The project carries a SINGLE ccpraxis data dir at its root:
 # <project>/.ccpraxis-local-data/ (self-gitignored via an inner .gitignore=*).
@@ -1220,6 +1246,100 @@ sub prompt_stale_action {
     $cleanup->();
     print "\n";
     return $result // 'cancel';
+}
+
+# Arrow-key TUI for the ccpraxis self-host prompt (p01).
+# Mirrors prompt_stale_action style. Returns 'selfhost' or 'decline'.
+sub prompt_selfhost_action {
+    my @options = (
+        ['selfhost', "Self-host — provision a worktree sandbox (recommended)"],
+        ['decline',  "Decline — abort (do not sandbox ccpraxis in place)"],
+    );
+
+    my $have_readkey = eval { require Term::ReadKey; 1 };
+    if (!$have_readkey || !-t STDIN || !-t STDOUT) {
+        print "\n";
+        print "You are running claude-sandbox from inside the live ccpraxis repo.\n";
+        print "Sandboxing in place would let the in-sandbox process modify the live launcher code.\n";
+        print "\n";
+        print "Options:\n";
+        print "  [s] $options[0][1]\n";
+        print "  [d] $options[1][1]\n";
+        print "\n";
+        print "Choice [s/d]: ";
+        my $line = <STDIN>;
+        $line //= '';
+        chomp $line;
+        my $first = lc(substr($line, 0, 1) // '');
+        return 'selfhost' if $first eq 's';
+        return 'decline';
+    }
+
+    my $sel = 0;
+    my $printed_lines = 0;
+
+    my $cleanup = sub {
+        print "\e[?25h";
+        print "\e[0m";
+        eval { Term::ReadKey::ReadMode(0) };
+    };
+    local $SIG{INT}  = sub { $cleanup->(); reset_terminal(); exit 130 };
+    local $SIG{TERM} = sub { $cleanup->(); reset_terminal(); exit 143 };
+
+    Term::ReadKey::ReadMode(4);
+    print "\e[?25l";
+
+    my $render = sub {
+        if ($printed_lines) {
+            print "\e[${printed_lines}A";
+            print "\e[J";
+        }
+        my $out = "";
+        $out .= "\n";
+        $out .= "You are running claude-sandbox from inside the live ccpraxis repo.\n";
+        $out .= "Sandboxing in place would let the in-sandbox process modify the live launcher code.\n";
+        $out .= "\n";
+        for my $i (0 .. $#options) {
+            my $label = $options[$i][1];
+            if ($i == $sel) {
+                $out .= "\e[1;36m  > $label\e[0m\n";
+            } else {
+                $out .= "    $label\n";
+            }
+        }
+        $out .= "\n";
+        $out .= "  up/down: select   enter: confirm   s/d: shortcut   q/esc: decline\n";
+        $printed_lines = () = ($out =~ /\n/g);
+        print $out;
+    };
+
+    my $result;
+    $render->();
+    while (1) {
+        my $k = Term::ReadKey::ReadKey(0);
+        last unless defined $k;
+        if ($k eq "\e") {
+            my $k2 = Term::ReadKey::ReadKey(0.05);
+            if (defined $k2 && $k2 eq '[') {
+                my $k3 = Term::ReadKey::ReadKey(0.05);
+                if (defined $k3) {
+                    if ($k3 eq 'A' && $sel > 0)         { $sel--; $render->(); next }
+                    if ($k3 eq 'B' && $sel < $#options) { $sel++; $render->(); next }
+                    next;
+                }
+            }
+            $result = 'decline'; last;
+        }
+        if ($k eq "\n" || $k eq "\r") { $result = $options[$sel][0]; last }
+        if (lc($k) eq 's') { $result = 'selfhost'; last }
+        if (lc($k) eq 'd') { $result = 'decline';  last }
+        if (lc($k) eq 'q') { $result = 'decline';  last }
+        if ($k eq "\x03")  { $result = 'decline';  last }
+    }
+
+    $cleanup->();
+    print "\n";
+    return $result // 'decline';
 }
 
 sub _copy_file {
