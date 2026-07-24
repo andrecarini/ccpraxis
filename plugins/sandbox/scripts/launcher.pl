@@ -45,7 +45,9 @@ BEGIN {
     unshift @INC, $dir;
 }
 use MountSpec qw(winify_path v_to_mount convert_v_to_mount);
-use CcpraxisSelfHost qw(selfhost_route selfhost_decline_outcome);
+use CcpraxisSelfHost qw(selfhost_route selfhost_decline_outcome
+    default_worktree_path worktree_plan blueprint_copy_plan
+    provision_state provision_repair_plan fleet_live);
 use LaunchLog ();   # B1: durable per-launch diagnostic log (next to us in scripts/)
 use Dashboard ();   # B2: the raw-ANSI TUI dashboard framework
 use BackpackApproval ();  # #21: per-item, machine-local backpack approval memory
@@ -53,7 +55,7 @@ use BackpackReview ();    # #21: the I/O-seam-injected interactive approval walk
 use KeepAwake ();         # B5: dashboard wake-lock decision + lifecycle holder
 use ConnectorHold ();     # Fix 3: hold-the-window decision when a connector loses the container
 use ClaudeConfig ();      # self-heal .claude.json onboarding-bypass (0-byte / lost-keys)
-use PluginSync ();        # Fix 2: copy-model plugin-store reconcile (copy/prune/reconcile)
+use PluginSync qw(copy_tree);  # Fix 2: copy-model plugin-store reconcile (copy/prune/reconcile)
 use PortAlloc ();         # fix-multiple-running-sandboxes: per-container port-block allocation
 use SandboxLock ();       # 04-build-race-lock: generalised mkdir lock + global build-race guard
 use JSON::PP ();          # parse backpack.json + write the approved install-set
@@ -222,9 +224,133 @@ my $LIVE_CCPRAXIS_ROOT = do { my $h = __FILE__; $h =~ s|\\|/|g; my $s = dirname(
     if ($route eq 'offer') {
         my $action = prompt_selfhost_action();
         if ($action eq 'selfhost') {
-            # TODO(p02): hand off to worktree provisioning
-            print "Self-host flow is not yet implemented (p02). Aborting.\n";
-            exit 0;
+            # p02: provision a worktree and hand off to it
+            # All provisioning happens before the lock is acquired (no lock held here).
+
+            # 1. Resolve the worktree target path
+            my $wt = default_worktree_path({ live_install_hint => $LIVE_CCPRAXIS_ROOT });
+            unless (defined $wt) {
+                print STDERR "ERROR: cannot determine worktree path (no HOME/USERPROFILE). Aborting.\n";
+                reset_terminal();
+                exit 1;
+            }
+
+            # 2. Compute the container name for the worktree (same keying as the normal launch).
+            # _container_name_for applies the identical normalisation path so the fleet_live
+            # check and the real podman launch always agree on the container name (MAJOR-2 fix).
+            my $wt_container_name = _container_name_for($wt);
+
+            # 3. If a fleet is already live against the worktree, attach/resume without re-provisioning
+            if (fleet_live({
+                    container_name    => $wt_container_name,
+                    container_running => \&_podman_name_running,
+                    marker_probe      => sub { _freshest_marker_mtime($wt) },
+                })) {
+                # Decision #14b: attach/resume — do NOT re-provision (no clobber of in-flight run)
+                _reexec_launcher($wt);
+                exit 1;  # LOW-1: unreachable if exec succeeds; guards against fall-through
+            }
+
+            # 4. Get the current worktree list (list-form git, no shell)
+            my $wl = '';
+            {
+                local $ENV{MSYS2_ARG_CONV_EXCL} = '*';
+                my $pid = open(my $gfh, '-|', 'git', '-C', $LIVE_CCPRAXIS_ROOT, 'worktree', 'list', '--porcelain');
+                if ($pid) { local $/; $wl = <$gfh> // ''; close $gfh; }
+            }
+
+            # 5. Classify the current provisioning state
+            my $state = provision_state({
+                worktree_list => $wl,
+                target        => $wt,
+                branch        => 'ccpraxis-sandbox-workcopy',
+                copy_probe    => sub { _copy_state($LIVE_CCPRAXIS_ROOT, $wt) },
+                lock_probe    => sub { _leftover_lock($LIVE_CCPRAXIS_ROOT, $wt) },
+            });
+
+            # Detect branch-on-wrong-worktree / stray-dir edge cases from state
+            my $branch_wrong = 0;
+            if ($state eq 'partial') {
+                # Check if the branch is wrong (registered at target but on different branch)
+                if ($wl =~ /worktree \Q$wt\E/) {
+                    $branch_wrong = 1 unless $wl =~ /branch refs\/heads\/ccpraxis-sandbox-workcopy/;
+                }
+            }
+
+            # Check for stray non-worktree dir/symlink at target (abort, never force-clobber).
+            # LOW-2: also treat a symlink at $wt as a stray to abort on (a symlink is not a
+            # real git worktree directory and could redirect writes to an unintended location).
+            if ($state eq 'absent' && (-l $wt || -d $wt)) {
+                if (-l $wt) {
+                    print STDERR "ERROR: target worktree path '$wt' exists as a symlink\n";
+                    print STDERR "       but is NOT a registered git worktree. Refusing to follow/overwrite.\n";
+                    print STDERR "       Remove or rename it manually, then re-run.\n";
+                    reset_terminal();
+                    exit 1;
+                }
+                # Real directory: allow an EMPTY dir to proceed (git accepts an empty existing dir).
+                opendir(my $dh, $wt) or do { print STDERR "ERROR: cannot inspect $wt: $!\n"; reset_terminal(); exit 1; };
+                my @entries = grep { $_ ne '.' && $_ ne '..' } readdir $dh;
+                closedir $dh;
+                if (@entries) {
+                    print STDERR "ERROR: target worktree path '$wt' exists as a non-empty directory\n";
+                    print STDERR "       but is NOT a registered git worktree. Refusing to overwrite.\n";
+                    print STDERR "       Remove or rename it manually, then re-run.\n";
+                    reset_terminal();
+                    exit 1;
+                }
+            }
+
+            # 5b. Probe whether the branch already exists (MAJOR-1 fix: a prior
+            # "git worktree remove" leaves the branch behind; re-provisioning with -b
+            # then hard-fails "branch already exists"). List-form git, no shell.
+            my $branch_exists = 0;
+            {
+                local $ENV{MSYS2_ARG_CONV_EXCL} = '*';
+                # List-form: git branch --list ccpraxis-sandbox-workcopy
+                my @branch_check = ('git', '-C', $LIVE_CCPRAXIS_ROOT, 'branch', '--list', 'ccpraxis-sandbox-workcopy');
+                if (open(my $bh, '-|', @branch_check)) {
+                    local $/;
+                    my $bout = <$bh> // '';
+                    close $bh;
+                    $branch_exists = (length($bout =~ s/\s+//gr)) ? 1 : 0;
+                }
+            }
+
+            # 6. Execute the repair plan
+            my $plan = provision_repair_plan($state, {
+                live_root     => $LIVE_CCPRAXIS_ROOT,
+                target        => $wt,
+                branch        => 'ccpraxis-sandbox-workcopy',
+                branch_wrong  => $branch_wrong,
+                lock          => _leftover_lock($LIVE_CCPRAXIS_ROOT, $wt),
+                branch_exists => $branch_exists,
+            });
+
+            for my $step (@{ $plan->{steps} }) {
+                if ($step->{op} eq 'copy_tree') {
+                    my $cp = blueprint_copy_plan($LIVE_CCPRAXIS_ROOT, $wt);
+                    PluginSync::copy_tree($cp->{src}, $cp->{dst});
+                } elsif ($step->{op} eq 'clear_lock') {
+                    # Remove leftover lock/temp files — best effort
+                    my $lock_path = "$wt/.git/worktrees/" . basename($wt) . "/locked";
+                    unlink $lock_path if -f $lock_path;
+                } else {
+                    # git-bearing step: list-form, no shell
+                    local $ENV{MSYS2_ARG_CONV_EXCL} = '*';
+                    my @argv = @{ $step->{argv} };
+                    my $rc = system(@argv);
+                    if ($rc != 0) {
+                        print STDERR "ERROR: provisioning step '$step->{op}' failed (exit @{[$rc >> 8]}): @argv\n";
+                        reset_terminal();
+                        exit ($rc >> 8 || 1);
+                    }
+                }
+            }
+
+            # 7. Hand off to the worktree via re-exec
+            _reexec_launcher($wt);
+            exit 1;  # LOW-1: unreachable if exec succeeds; guards against fall-through
         } else {
             # decline
             my $o = selfhost_decline_outcome();
@@ -751,8 +877,9 @@ my $CONTAINER_NAME;
         $CONTAINER_NAME //= '';
     }
     if (!length $CONTAINER_NAME) {
-        my $path_hash = substr(md5_of_string($PROJECT_PATH), 0, 8);
-        $CONTAINER_NAME = "claude-${PROJECT_NAME}-${path_hash}";
+        # MAJOR-2: use _container_name_for so the fleet_live check and the real
+        # launch always agree on the container name for the same path.
+        $CONTAINER_NAME = _container_name_for($PROJECT_PATH);
         _write_file($name_file, $CONTAINER_NAME);
     }
 }
@@ -1342,6 +1469,159 @@ sub prompt_selfhost_action {
     return $result // 'decline';
 }
 
+# =====================================================================
+# p02 launcher helpers (used by the selfhost accept branch)
+# =====================================================================
+
+# _container_name_for($raw_path) -> container name string
+# Normalises a path using the SAME sequence the main launch applies to
+# $PROJECT_PATH (abs_path -> backslash->slash -> strip trailing slash ->
+# winify_path -> lc(basename) -> space->dash) so fleet_live's container-name
+# check always matches the name the real podman launch uses for the same
+# worktree. Idempotent on already-normalised paths.
+sub _container_name_for {
+    my ($raw_path) = @_;
+    my $p = abs_path($raw_path) // $raw_path;
+    $p =~ s|\\|/|g;
+    $p =~ s|/+$||;
+    $p = winify_path($p);
+    my $n = lc(basename($p));
+    $n =~ s/ /-/g;
+    return "claude-${n}-" . substr(md5_of_string($p), 0, 8);
+}
+
+# _podman_name_running($name) -> 0|1
+# Check whether a named container is currently running (podman ps --filter name).
+# List-form: no shell, no injection even if $name has metacharacters.
+sub _podman_name_running {
+    my ($name) = @_;
+    return 0 unless defined $name && length $name;
+    local $ENV{MSYS2_ARG_CONV_EXCL} = '*';
+    my $pid = open(my $fh, '-|', $PODMAN, 'ps', '--filter', "name=$name", '--format', '{{.Names}}');
+    return 0 unless $pid;
+    local $/;
+    my $out = <$fh>;
+    close $fh;
+    return (defined $out && length($out =~ s/\s+//gr)) ? 1 : 0;
+}
+
+# _freshest_marker_mtime($wt) -> epoch mtime | undef
+# Return the newest mtime among <wt>/.ccpraxis-local-data/blueprints/*/runs/.orchestrator.
+# Uses opendir/readdir, never glob.
+sub _freshest_marker_mtime {
+    my ($wt) = @_;
+    my $base = "$wt/.ccpraxis-local-data/blueprints";
+    return undef unless -d $base;
+    my $newest;
+    opendir(my $bd, $base) or return undef;
+    for my $bp (readdir $bd) {
+        next if $bp eq '.' || $bp eq '..';
+        my $marker = "$base/$bp/runs/.orchestrator";
+        next unless -f $marker;
+        my $mtime = (stat $marker)[9];
+        next unless defined $mtime;
+        $newest = $mtime if !defined $newest || $mtime > $newest;
+    }
+    closedir $bd;
+    return $newest;
+}
+
+# _copy_state($live_root, $wt) -> 'absent' | 'partial' | 'complete'
+# Compare live blueprints/ tree against worktree blueprints/ tree.
+# 'complete' iff every live file exists in the wt with byte-identical content.
+# 'absent' iff the wt blueprints/ dir is missing entirely.
+# 'partial' otherwise.
+# Uses opendir/readdir (never glob); reads :raw for byte comparison.
+sub _copy_state {
+    my ($live_root, $wt) = @_;
+    my $src = "$live_root/.ccpraxis-local-data/blueprints";
+    my $dst = "$wt/.ccpraxis-local-data/blueprints";
+
+    return 'absent' unless -d $src;   # no live tree -> vacuously complete (nothing to copy)
+    return 'absent' unless -d $dst;   # dst missing -> absent
+
+    my $all_ok = 1;
+    my $any    = 0;
+
+    # Recursive compare: accumulate relative paths from live tree
+    my @queue = (['', $src, $dst]);
+    while (@queue) {
+        my ($rel, $s, $d) = @{ shift @queue };
+        opendir(my $dh, $s) or do { $all_ok = 0; last; };
+        my @kids = grep { $_ ne '.' && $_ ne '..' } readdir $dh;
+        closedir $dh;
+        for my $kid (@kids) {
+            my $sp = "$s/$kid";
+            my $dp = "$d/$kid";
+            if (-d $sp && !-l $sp) {
+                push @queue, ["$rel/$kid", $sp, $dp];
+            } elsif (-f $sp && !-l $sp) {
+                $any = 1;
+                unless (-f $dp && !-l $dp) { $all_ok = 0; next; }
+                # Size check first (fast)
+                if (-s $sp != -s $dp) { $all_ok = 0; next; }
+                # Byte content check
+                open my $sfh, '<:raw', $sp or do { $all_ok = 0; next; };
+                open my $dfh, '<:raw', $dp or do { close $sfh; $all_ok = 0; next; };
+                local $/;
+                my $sb = <$sfh>; close $sfh;
+                my $db = <$dfh>; close $dfh;
+                unless (defined $sb && defined $db && $sb eq $db) { $all_ok = 0; next; }
+            }
+        }
+    }
+
+    return 'complete' if $all_ok;
+    return 'partial';
+}
+
+# _leftover_lock($live_root, $wt) -> 0|1
+# Check whether a leftover worktree lock file exists under the wt's git-dir.
+# Also checks for *.tmp files under the dst blueprints tree.
+sub _leftover_lock {
+    my ($live_root, $wt) = @_;
+    # Check for a 'locked' file in the worktree's git-worktrees administrative dir
+    my $wt_name = basename($wt);
+    my $lock_path = "$live_root/.git/worktrees/$wt_name/locked";
+    return 1 if -f $lock_path;
+    # Check for stale .tmp files under the worktree blueprints tree
+    my $bp_dst = "$wt/.ccpraxis-local-data/blueprints";
+    if (-d $bp_dst) {
+        opendir(my $dh, $bp_dst) or return 0;
+        for my $entry (readdir $dh) {
+            next if $entry eq '.' || $entry eq '..';
+            if ($entry =~ /\.tmp$/) { closedir $dh; return 1; }
+        }
+        closedir $dh;
+    }
+    return 0;
+}
+
+# _reexec_launcher($wt) — re-exec this launcher with the worktree as the project.
+# Primary: exec { $^X } $^X, $LAUNCHER_PL, $wt (list-form, mirrors existing claude exec).
+# Fallback on Windows/Unicode: PowerShell delegation exec.
+# This function does not return on success.
+sub _reexec_launcher {
+    my ($wt) = @_;
+    SandboxLock::release_all();   # no lock held at re-exec
+    reset_terminal();
+    # Primary: list-form exec with the same perl interpreter
+    exec { $^X } $^X, $LAUNCHER_PL, $wt;
+    # Fallback: PowerShell-delegation (Unicode path safety on Windows).
+    # MEDIUM-1: double single-quotes so paths with embedded ' cannot inject
+    # PowerShell commands (e.g. André's home directory, unusual project names).
+    if ($WINDOWS_FAMILY) {
+        (my $qx = $^X)          =~ s/'/''/g;
+        (my $ql = $LAUNCHER_PL) =~ s/'/''/g;
+        (my $qw = $wt)          =~ s/'/''/g;
+        exec 'powershell.exe', '-NoProfile', '-Command',
+            "& '$qx' '$ql' '$qw'";
+    }
+    # Should never reach here
+    print STDERR "ERROR: exec launcher failed: $!\n";
+    exit 1;
+}
+
 sub _copy_file {
     my ($src, $dst) = @_;
     my $bytes = _read_file($src);
@@ -1542,7 +1822,7 @@ if (-f "$CLAUDE_DATA/git-askpass.sh") {
 
     # GIT_ASKPASS alone is no longer enough. Claude Code's Bash tool scrubs
     # GIT_ASKPASS (and SSH_ASKPASS) from the subprocess environment as a
-    # credential-exfiltration safeguard (v2.1.128+), so any `git` the agent
+    # credential-exfiltration safeguard (v2.1.128+), so any git invocation the agent
     # runs over HTTPS never sees it and fails with "could not read Username for
     # 'https://github.com'". A git *credential helper* is read by git from a
     # config FILE, not the environment, so it survives the scrub and is the
