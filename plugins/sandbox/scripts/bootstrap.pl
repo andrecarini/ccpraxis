@@ -182,6 +182,41 @@ sub die_bootstrap {
     exit 1;
 }
 
+# Run a command with its stdin detached from the console.
+#
+# Native Windows OpenSSH (C:\Windows\System32\OpenSSH\ssh-keygen.exe — the one on
+# a default PowerShell PATH) reconfigures the console's input mode on startup and
+# does NOT restore it on exit; a long-standing Win32-OpenSSH behavior. When it
+# inherits the interactive console on stdin, the *next* `<STDIN>` line read in this
+# process never completes: Enter arrives as a bare \r and readline keeps waiting
+# for its \n terminator, so the "Press Enter once you've added it" pause hangs
+# forever. Handing the child /dev/null on fd 0 stops it from ever touching the
+# console (GetConsoleMode fails on a non-console handle). We save and restore our
+# own fd 0 around the call so the parent's later console read still works.
+sub _system_no_console_stdin {
+    my @cmd = @_;
+    open(my $saved_stdin, '<&', \*STDIN) or return system(@cmd);   # can't dup -> run as-is
+    unless (open(STDIN, '<', '/dev/null')) {
+        open(STDIN, '<&', $saved_stdin);                           # restore, then run as-is
+        close $saved_stdin;
+        return system(@cmd);
+    }
+    my $rc = system(@cmd);
+    open(STDIN, '<&', $saved_stdin) or die_bootstrap("cannot restore stdin: $!");
+    close $saved_stdin;
+    return $rc;
+}
+
+# Best-effort restore of cooked/line input mode before an interactive read, in
+# case a child left the console in raw/VT mode. The stdin detachment in
+# _system_no_console_stdin is the real fix; this is a silent safety net. MSYS
+# `stty` maps termios back onto the Windows console mode; if stty is absent this
+# no-ops. Windows-only (nothing to undo elsewhere).
+sub _reset_console_input {
+    return unless $WINDOWS_FAMILY;
+    system("stty sane </dev/tty >/dev/null 2>&1");
+}
+
 # =====================================================================
 # Step 1: verify container-config
 # =====================================================================
@@ -467,7 +502,11 @@ sub _setup_ssh_auth {
     );
     return unless defined $choice;
     if ($choice == 0) {
-        my $rc = system('ssh-keygen', '-t', 'ed25519', '-f', $deploy_key_path,
+        # Clear any leftover key from a prior partial run so ssh-keygen never
+        # stops to ask "Overwrite (y/n)?" — with stdin detached (below) that
+        # prompt would read EOF and silently fail the whole step.
+        unlink $deploy_key_path, "$deploy_key_path.pub";
+        my $rc = _system_no_console_stdin('ssh-keygen', '-t', 'ed25519', '-f', $deploy_key_path,
                         '-N', '', '-C', 'claude-sandbox');
         if ($rc != 0) {
             log_error("ssh-keygen failed (exit @{[$rc >> 8]})");
@@ -482,6 +521,7 @@ sub _setup_ssh_auth {
             chomp $pub if defined $pub;
             print "\n>>> Public key (add this to the git host as a deploy key):\n\n";
             print "$pub\n\n";
+            _reset_console_input();   # belt-and-suspenders; detached stdin above is the real fix
             print "    Press Enter once you've added it.";
             <STDIN>;
         }
