@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# Tests for CcpraxisSelfHost — mergeback/discard guard (p03).
+# Tests for CcpraxisWorkCopy — mergeback/discard guard (p03).
 #
 # IMMUTABLE ORACLE: derived from the p03 spec, not from any implementation.
 # All seams injected (no real repo/git/podman) except AC-10 (real fs/git).
@@ -17,7 +17,7 @@
 #   AC-9  : structural ccpraxis-mergeback.pl checks (exists, dispatch, no-qx, guard-first, no-CoAuthor, MSYS2)
 #   AC-10 : production-faithful real git repo under Andre-byte path
 #   AC-11 : structural plugin.json + both SKILL.md frontmatter checks
-#   AC-12 : structural marketplace.json: selfhost entry added, pre-existing entries preserved
+#   AC-12 : structural marketplace.json: selfhost entry removed (folded into steward), pre-existing preserved
 #   AC-13 : EXCLUDED (full-suite regression -- driver step)
 
 use strict;
@@ -29,7 +29,7 @@ use File::Temp qw(tempdir);
 use File::Path qw(make_path);
 use JSON::PP ();
 
-use CcpraxisSelfHost qw(
+use CcpraxisWorkCopy qw(
     mergeback_guard
     mergeback_plan
     discard_plan
@@ -718,33 +718,15 @@ is(mergeback_guard({ container_running => sub { 0 }, marker_probe => sub { undef
 }
 
 # =====================================================================
-# AC-11: structural -- plugin.json + both SKILL.md frontmatter
+# AC-11: structural -- both SKILL.md frontmatter (folded into steward)
 # =====================================================================
 
 {
-    my $plugin_json_path = "$Bin/../../../selfhost/.claude-plugin/plugin.json";
-    my $skill_merge_path = "$Bin/../../../selfhost/skills/mergeback/SKILL.md";
-    my $skill_discard_path = "$Bin/../../../selfhost/skills/discard/SKILL.md";
+    my $skill_merge_path   = "$Bin/../../../steward/skills/mergeback-sandboxed-ccpraxis-workcopy/SKILL.md";
+    my $skill_discard_path = "$Bin/../../../steward/skills/discard-sandboxed-ccpraxis-workcopy/SKILL.md";
 
-    # plugin.json must exist -- FAILS RED until created
-    ok(-f $plugin_json_path, 'AC-11: plugins/selfhost/.claude-plugin/plugin.json exists');
-
-    SKIP: {
-        skip 'AC-11: plugin.json not yet created (expected red)', 5
-            unless -f $plugin_json_path;
-
-        open my $fh, '<:raw', $plugin_json_path or die "cannot open $plugin_json_path: $!";
-        my $raw = do { local $/; <$fh> }; close $fh;
-        my $pj = eval { JSON::PP::decode_json($raw) };
-        ok(!$@, 'AC-11: plugin.json parses as valid JSON');
-        is($pj->{name},            'selfhost', 'AC-11: plugin.json name=selfhost');
-        is($pj->{version},         '0.1.0',    'AC-11: plugin.json version=0.1.0');
-        is($pj->{author}{name},    'ccpraxis', 'AC-11: plugin.json author.name=ccpraxis');
-        ok(length($pj->{description} // ''),   'AC-11: plugin.json has non-empty description');
-    }
-
-    # mergeback/SKILL.md must exist -- FAILS RED until created
-    ok(-f $skill_merge_path, 'AC-11: plugins/selfhost/skills/mergeback/SKILL.md exists');
+    # mergeback SKILL.md must exist under steward
+    ok(-f $skill_merge_path, 'AC-11: plugins/steward/skills/mergeback-sandboxed-ccpraxis-workcopy/SKILL.md exists');
 
     SKIP: {
         skip 'AC-11: mergeback/SKILL.md not yet created (expected red)', 8
@@ -752,7 +734,7 @@ is(mergeback_guard({ container_running => sub { 0 }, marker_probe => sub { undef
 
         my $fm = _parse_skill_frontmatter($skill_merge_path);
         ok(defined $fm, 'AC-11: mergeback/SKILL.md has parseable YAML frontmatter');
-        is($fm->{name},              'mergeback', 'AC-11: mergeback SKILL.md name=mergeback');
+        is($fm->{name}, 'mergeback-sandboxed-ccpraxis-workcopy', 'AC-11: mergeback SKILL.md name=mergeback-sandboxed-ccpraxis-workcopy');
         like($fm->{description} // '', qr/Use when/i,
              'AC-11: mergeback SKILL.md description contains "Use when"');
         like($fm->{description} // '', qr/ALWAYS\s+confirm|always\s+confirm/i,
@@ -765,7 +747,7 @@ is(mergeback_guard({ container_running => sub { 0 }, marker_probe => sub { undef
     }
 
     # discard/SKILL.md must exist -- FAILS RED until created
-    ok(-f $skill_discard_path, 'AC-11: plugins/selfhost/skills/discard/SKILL.md exists');
+    ok(-f $skill_discard_path, 'AC-11: plugins/steward/skills/discard-sandboxed-ccpraxis-workcopy/SKILL.md exists');
 
     SKIP: {
         skip 'AC-11: discard/SKILL.md not yet created (expected red)', 8
@@ -773,7 +755,7 @@ is(mergeback_guard({ container_running => sub { 0 }, marker_probe => sub { undef
 
         my $fm = _parse_skill_frontmatter($skill_discard_path);
         ok(defined $fm, 'AC-11: discard/SKILL.md has parseable YAML frontmatter');
-        is($fm->{name},              'discard', 'AC-11: discard SKILL.md name=discard');
+        is($fm->{name}, 'discard-sandboxed-ccpraxis-workcopy', 'AC-11: discard SKILL.md name=discard-sandboxed-ccpraxis-workcopy');
         like($fm->{description} // '', qr/Use when/i,
              'AC-11: discard SKILL.md description contains "Use when"');
         like($fm->{description} // '', qr/ALWAYS\s+confirm|always\s+confirm/i,
@@ -798,7 +780,7 @@ is(mergeback_guard({ container_running => sub { 0 }, marker_probe => sub { undef
 }
 
 # =====================================================================
-# AC-12: structural -- marketplace.json: selfhost entry + pre-existing preserved
+# AC-12: structural -- marketplace.json: selfhost entry removed (folded into steward) + pre-existing preserved
 # =====================================================================
 
 {
@@ -817,15 +799,11 @@ is(mergeback_guard({ container_running => sub { 0 }, marker_probe => sub { undef
         my @plugins = @{ $mj->{plugins} // [] };
         my %by_name = map { $_->{name} => $_ } @plugins;
 
-        # selfhost entry must be present -- FAILS RED until added
-        ok(exists $by_name{selfhost}, 'AC-12: marketplace.json has selfhost entry (FAILS RED until added)');
-        if (exists $by_name{selfhost}) {
-            is($by_name{selfhost}{source}, './selfhost', 'AC-12: selfhost source=./selfhost');
-            ok(length($by_name{selfhost}{description} // ''), 'AC-12: selfhost has non-empty description');
-        } else {
-            fail('AC-12: selfhost source check (skipped -- entry absent)');
-            fail('AC-12: selfhost description check (skipped -- entry absent)');
-        }
+        # selfhost entry must be ABSENT -- the two verbs were folded into steward's skills
+        ok(!exists $by_name{selfhost}, 'AC-12: marketplace.json has NO selfhost entry (folded into steward)');
+        is($by_name{steward}{source}, './steward', 'AC-12: steward source=./steward (host of the folded skills)');
+        like($by_name{steward}{description} // '', qr/mergeback-sandboxed-ccpraxis-workcopy/,
+             'AC-12: steward description advertises the folded mergeback verb');
 
         # All seven pre-existing entries must still be present (append, not replace)
         for my $name (qw(beacon backpack sandbox steward blueprint butler todo)) {

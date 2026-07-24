@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# Tests for CcpraxisSelfHost — worktree provisioning module (p02).
+# Tests for CcpraxisWorkCopy — worktree provisioning module (p02).
 #
 # IMMUTABLE ORACLE: derived from the p02 spec, not from any implementation.
 # All seams injected (no real repo/git/podman) except AC-13 (real fs) and
@@ -17,7 +17,7 @@
 #   AC-9   : structural — fleet_live no-clobber branch reaches re-exec with no provisioning ops between
 #   AC-10  : André-byte paths round-trip byte-identical (!utf8::is_utf8)
 #   AC-11  : RO-bind source == live_root/plugins, project-independent
-#   AC-12  : selfhost_route(worktree, hint=live_root) eq 'passthrough'
+#   AC-12  : workcopy_route(worktree, hint=live_root) eq 'passthrough'
 #   AC-13  : real PluginSync::copy_tree — André-path, byte-for-byte identity
 #   AC-14  : structural launcher.pl wiring assertions (t/09 grep style)
 #   AC-15  : EXCLUDED (full-suite regression — driver step, not test-writer scope)
@@ -30,14 +30,14 @@ use Test::More;
 use File::Temp qw(tempdir);
 use File::Path qw(make_path);
 
-use CcpraxisSelfHost qw(
+use CcpraxisWorkCopy qw(
     default_worktree_path
     worktree_plan
     blueprint_copy_plan
     provision_state
     provision_repair_plan
     fleet_live
-    selfhost_route
+    workcopy_route
     canon_path
     live_install_dir
 );
@@ -527,7 +527,7 @@ is(fleet_live({
 }
 
 # =====================================================================
-# AC-12: selfhost_route(worktree, hint=live_root) -> 'passthrough'
+# AC-12: workcopy_route(worktree, hint=live_root) -> 'passthrough'
 # =====================================================================
 
 {
@@ -537,14 +537,14 @@ is(fleet_live({
         return 1 if $p eq "$WT/plugins/sandbox/scripts/launcher.pl";
         return 0;
     };
-    my $route = selfhost_route($WT, {
+    my $route = workcopy_route($WT, {
         live_install_hint => $LIVE,
         git_commondir     => sub { "$LIVE/.git" },
         exists            => $exists_wt,
         realpath          => sub { $_[0] },
     });
     is($route, 'passthrough',
-        'AC-12: selfhost_route(worktree, hint=live_root) eq passthrough (re-exec sees passthrough, no re-offer loop, Decision #10)');
+        'AC-12: workcopy_route(worktree, hint=live_root) eq passthrough (re-exec sees passthrough, no re-offer loop, Decision #10)');
 }
 
 # =====================================================================

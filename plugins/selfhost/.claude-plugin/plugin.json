@@ -1,6 +1,0 @@
-{
-  "name": "selfhost",
-  "version": "0.1.0",
-  "description": "Guarded merge-back / discard for the ccpraxis self-host worktree — /selfhost:mergeback and /selfhost:discard, run on the host after reviewing an in-sandbox self-host run. Refuses while a fleet is live; shows the diff; never auto-merges.",
-  "author": { "name": "ccpraxis" }
-}

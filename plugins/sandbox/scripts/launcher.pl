@@ -45,7 +45,7 @@ BEGIN {
     unshift @INC, $dir;
 }
 use MountSpec qw(winify_path v_to_mount convert_v_to_mount);
-use CcpraxisSelfHost qw(selfhost_route selfhost_decline_outcome
+use CcpraxisWorkCopy qw(workcopy_route workcopy_decline_outcome
     default_worktree_path worktree_plan blueprint_copy_plan
     provision_state provision_repair_plan fleet_live);
 use LaunchLog ();   # B1: durable per-launch diagnostic log (next to us in scripts/)
@@ -213,17 +213,17 @@ my $PROJECT_NAME = lc(basename($PROJECT_PATH));
 $PROJECT_NAME =~ s/ /-/g;
 
 # =====================================================================
-# p01: ccpraxis self-host detection — must run AFTER $PROJECT_PATH is final
+# p01: ccpraxis work-copy detection — must run AFTER $PROJECT_PATH is final
 # =====================================================================
 # §9.1: derive the live ccpraxis root from __FILE__ (registry-independent anchor).
 # launcher.pl lives at <ccpraxis>/plugins/sandbox/scripts/launcher.pl
 # so scripts->sandbox->plugins->ccpraxis is three dirname() calls.
 my $LIVE_CCPRAXIS_ROOT = do { my $h = __FILE__; $h =~ s|\\|/|g; my $s = dirname($h); dirname(dirname(dirname($s))); };
 {
-    my $route = selfhost_route($PROJECT_PATH, { registry_path => "$HOST_PLUGINS_DIR/known_marketplaces.json", live_install_hint => $LIVE_CCPRAXIS_ROOT });
+    my $route = workcopy_route($PROJECT_PATH, { registry_path => "$HOST_PLUGINS_DIR/known_marketplaces.json", live_install_hint => $LIVE_CCPRAXIS_ROOT });
     if ($route eq 'offer') {
-        my $action = prompt_selfhost_action();
-        if ($action eq 'selfhost') {
+        my $action = prompt_workcopy_action();
+        if ($action eq 'workcopy') {
             # p02: provision a worktree and hand off to it
             # All provisioning happens before the lock is acquired (no lock held here).
 
@@ -353,7 +353,7 @@ my $LIVE_CCPRAXIS_ROOT = do { my $h = __FILE__; $h =~ s|\\|/|g; my $s = dirname(
             exit 1;  # LOW-1: unreachable if exec succeeds; guards against fall-through
         } else {
             # decline
-            my $o = selfhost_decline_outcome();
+            my $o = workcopy_decline_outcome();
             print STDERR $o->{message}, "\n";
             exit 1;
         }
@@ -1375,11 +1375,11 @@ sub prompt_stale_action {
     return $result // 'cancel';
 }
 
-# Arrow-key TUI for the ccpraxis self-host prompt (p01).
-# Mirrors prompt_stale_action style. Returns 'selfhost' or 'decline'.
-sub prompt_selfhost_action {
+# Arrow-key TUI for the ccpraxis work-copy prompt (p01).
+# Mirrors prompt_stale_action style. Returns 'workcopy' or 'decline'.
+sub prompt_workcopy_action {
     my @options = (
-        ['selfhost', "Self-host — provision a worktree sandbox (recommended)"],
+        ['workcopy', "Sandbox a work-copy — provision an isolated git worktree (recommended)"],
         ['decline',  "Decline — abort (do not sandbox ccpraxis in place)"],
     );
 
@@ -1398,7 +1398,7 @@ sub prompt_selfhost_action {
         $line //= '';
         chomp $line;
         my $first = lc(substr($line, 0, 1) // '');
-        return 'selfhost' if $first eq 's';
+        return 'workcopy' if $first eq 's';
         return 'decline';
     }
 
@@ -1458,7 +1458,7 @@ sub prompt_selfhost_action {
             $result = 'decline'; last;
         }
         if ($k eq "\n" || $k eq "\r") { $result = $options[$sel][0]; last }
-        if (lc($k) eq 's') { $result = 'selfhost'; last }
+        if (lc($k) eq 's') { $result = 'workcopy'; last }
         if (lc($k) eq 'd') { $result = 'decline';  last }
         if (lc($k) eq 'q') { $result = 'decline';  last }
         if ($k eq "\x03")  { $result = 'decline';  last }
@@ -1470,7 +1470,7 @@ sub prompt_selfhost_action {
 }
 
 # =====================================================================
-# p02 launcher helpers (used by the selfhost accept branch)
+# p02 launcher helpers (used by the workcopy accept branch)
 # =====================================================================
 
 # _container_name_for($raw_path) -> container name string
@@ -1605,6 +1605,13 @@ sub _reexec_launcher {
     my ($wt) = @_;
     SandboxLock::release_all();   # no lock held at re-exec
     reset_terminal();
+    # The exec() calls below intentionally fall through to the next fallback if
+    # they FAIL to replace the process (exec only returns on error). That makes
+    # the following statements deliberately reachable, so silence perl's
+    # compile-time "Statement unlikely to be reached" warning (category 'exec')
+    # for this scope — otherwise it prints on every launcher compile, i.e. every
+    # `claude-sandbox` run, regardless of project path.
+    no warnings 'exec';
     # Primary: list-form exec with the same perl interpreter
     exec { $^X } $^X, $LAUNCHER_PL, $wt;
     # Fallback: PowerShell-delegation (Unicode path safety on Windows).

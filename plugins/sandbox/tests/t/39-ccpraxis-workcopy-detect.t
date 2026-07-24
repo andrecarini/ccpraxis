@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# Tests for CcpraxisSelfHost — the detection + routing module (p01).
+# Tests for CcpraxisWorkCopy — the detection + routing module (p01).
 #
 # IMMUTABLE ORACLE: the implementer conforms to the API + behavior here.
 # All seams injected — no real git repo, no dependence on this machine
@@ -10,9 +10,9 @@
 # Criterion mapping:
 #   AC-1..4  : is_ccpraxis_project (live/worktree/clone/unrelated)
 #   AC-5,6   : is_in_place (hint-first anchor, registry fallback, canonicalization)
-#   AC-7,8   : selfhost_route (offer in-place / passthrough else)
+#   AC-7,8   : workcopy_route (offer in-place / passthrough else)
 #   AC-9,10  : structural launcher wiring + decline outcome
-#   AC-12    : selfhost_route fail-safe — ccpraxis identity + NO anchor → offer   (CRIT-1)
+#   AC-12    : workcopy_route fail-safe — ccpraxis identity + NO anchor → offer   (CRIT-1)
 #   AC-13    : poison-immunity — hint overrides a poisoned/wrong registry        (HIGH-3)
 #   AC-14    : abs_path symmetry — realpath-resolved equality                    (HIGH-4)
 #   AC-15    : live_install_dir rejects a bare-root derived install dir          (MED-5)
@@ -25,11 +25,11 @@ use lib "$Bin/../../scripts";
 use Test::More;
 use File::Temp qw(tempdir);
 use Cwd qw(getcwd);
-use CcpraxisSelfHost qw(
+use CcpraxisWorkCopy qw(
     is_ccpraxis_project
     is_in_place
-    selfhost_route
-    selfhost_decline_outcome
+    workcopy_route
+    workcopy_decline_outcome
     canon_path
     live_install_dir
 );
@@ -39,7 +39,7 @@ use CcpraxisSelfHost qw(
 # =====================================================================
 
 my $LIVE      = 'C:/foo/ccpraxis';
-my $WORKTREE  = 'C:/foo/ccpraxis-selfhost';
+my $WORKTREE  = 'C:/foo/ccpraxis-sandbox-workcopy';
 my $CLONE     = 'C:/bar/some-clone';
 my $FOREIGN   = 'C:/other/myproject';
 my $LIVE_GIT  = "$LIVE/.git";
@@ -172,8 +172,8 @@ is(is_in_place($LIVE,     { registry => $REG_EMPTY, realpath => $rp_id }), 0,
 # §3 obs-4 verbatim vectors (registry fallback)
 is(is_in_place('C:/foo/ccpraxis', { registry => { 'ccpraxis-local' => { source => { source => 'directory', path => 'C:/foo/ccpraxis/plugins' } } }, realpath => $rp_id }),
    1, 'AC-5/§3: is_in_place("C:/foo/ccpraxis", registry) → 1');
-is(is_in_place('C:/foo/ccpraxis-selfhost', { registry => { 'ccpraxis-local' => { source => { source => 'directory', path => 'C:/foo/ccpraxis/plugins' } } }, realpath => $rp_id }),
-   0, 'AC-5/§3: is_in_place("C:/foo/ccpraxis-selfhost", registry) → 0');
+is(is_in_place('C:/foo/ccpraxis-sandbox-workcopy', { registry => { 'ccpraxis-local' => { source => { source => 'directory', path => 'C:/foo/ccpraxis/plugins' } } }, realpath => $rp_id }),
+   0, 'AC-5/§3: is_in_place("C:/foo/ccpraxis-sandbox-workcopy", registry) → 0');
 
 # =====================================================================
 # AC-6 — canonicalization in is_in_place (backslash, trailing slash, lc drive, Unicode)
@@ -189,32 +189,32 @@ is(canon_path('C:/Users/André/.claude/ccpraxis'), 'C:/Users/André/.claude/ccpr
    'AC-6: canon_path is idempotent on already-canonical André path');
 
 # =====================================================================
-# AC-7 — selfhost_route → 'offer' for live in-place ccpraxis (hint anchor)
+# AC-7 — workcopy_route → 'offer' for live in-place ccpraxis (hint anchor)
 # =====================================================================
 
-is(selfhost_route($LIVE, { live_install_hint => $LIVE, exists => $exists_live, realpath => $rp_id }),
-   'offer', 'AC-7: selfhost_route="offer" for live in-place ccpraxis (identity via markers, in-place via hint)');
+is(workcopy_route($LIVE, { live_install_hint => $LIVE, exists => $exists_live, realpath => $rp_id }),
+   'offer', 'AC-7: workcopy_route="offer" for live in-place ccpraxis (identity via markers, in-place via hint)');
 
 # =====================================================================
-# AC-8 — selfhost_route → 'passthrough' when anchor is resolvable but ≠ project
+# AC-8 — workcopy_route → 'passthrough' when anchor is resolvable but ≠ project
 # =====================================================================
 
-is(selfhost_route($WORKTREE, { live_install_hint => $LIVE, exists => $exists_wt, realpath => $rp_id }),
+is(workcopy_route($WORKTREE, { live_install_hint => $LIVE, exists => $exists_wt, realpath => $rp_id }),
    'passthrough', 'AC-8a: passthrough for ccpraxis worktree (identity yes, in-place no)');
-is(selfhost_route($CLONE, { live_install_hint => $LIVE, exists => $exists_clone, realpath => $rp_id }),
+is(workcopy_route($CLONE, { live_install_hint => $LIVE, exists => $exists_clone, realpath => $rp_id }),
    'passthrough', 'AC-8b: passthrough for clone (identity yes, ≠ hint)');
-is(selfhost_route($FOREIGN, { live_install_hint => $LIVE, git_commondir => $git_commondir_none, exists => $exists_none, realpath => $rp_id }),
+is(workcopy_route($FOREIGN, { live_install_hint => $LIVE, git_commondir => $git_commondir_none, exists => $exists_none, realpath => $rp_id }),
    'passthrough', 'AC-8c: passthrough for non-git non-ccpraxis project');
-is(selfhost_route($FOREIGN, { live_install_hint => $LIVE, git_commondir => $git_commondir_foreign, exists => $exists_none, realpath => $rp_id }),
+is(workcopy_route($FOREIGN, { live_install_hint => $LIVE, git_commondir => $git_commondir_foreign, exists => $exists_none, realpath => $rp_id }),
    'passthrough', 'AC-8d: passthrough for foreign git repo');
 
 # =====================================================================
 # AC-12 — FAIL-SAFE (CRIT-1): ccpraxis identity + NO anchor resolvable → offer
 # =====================================================================
 
-is(selfhost_route($CLONE, { registry => $REG_EMPTY, git_commondir => $git_commondir_none, exists => $exists_clone, realpath => $rp_id }),
+is(workcopy_route($CLONE, { registry => $REG_EMPTY, git_commondir => $git_commondir_none, exists => $exists_clone, realpath => $rp_id }),
    'offer', 'AC-12: fail-safe — ccpraxis-by-markers with NO hint and empty registry → offer (never silent passthrough)');
-is(selfhost_route($LIVE, { git_commondir => $git_commondir_live, registry => $REG_EMPTY, exists => $exists_live, realpath => $rp_id }),
+is(workcopy_route($LIVE, { git_commondir => $git_commondir_live, registry => $REG_EMPTY, exists => $exists_live, realpath => $rp_id }),
    'offer', 'AC-12b: fail-safe — live repo, empty registry, no hint → offer');
 
 # =====================================================================
@@ -223,7 +223,7 @@ is(selfhost_route($LIVE, { git_commondir => $git_commondir_live, registry => $RE
 
 is(is_in_place($LIVE, { live_install_hint => $LIVE, registry => $REG_POISON, realpath => $rp_id }), 1,
    'AC-13: is_in_place uses the hint, immune to a poisoned registry source.path');
-is(selfhost_route($LIVE, { live_install_hint => $LIVE, registry => $REG_POISON, exists => $exists_live, realpath => $rp_id }),
+is(workcopy_route($LIVE, { live_install_hint => $LIVE, registry => $REG_POISON, exists => $exists_live, realpath => $rp_id }),
    'offer', 'AC-13b: route=offer for live repo despite poisoned registry (hint wins)');
 
 # =====================================================================
@@ -243,7 +243,7 @@ is(is_in_place('C:/other/ccpraxis', { live_install_hint => $LONG, realpath => $r
    'AC-14b: is_in_place=0 when realpath resolutions differ');
 
 # =====================================================================
-# AC-9 — structural: launcher.pl wires selfhost_route after winify_path($PROJECT_PATH)
+# AC-9 — structural: launcher.pl wires workcopy_route after winify_path($PROJECT_PATH)
 # =====================================================================
 
 my $launcher = "$Bin/../../scripts/launcher.pl";
@@ -262,9 +262,9 @@ ok(defined $winify_line_idx, 'AC-9: found winify_path($PROJECT_PATH) line in lau
 
 my $route_line_idx;
 for my $i ($winify_line_idx + 1 .. $#lines) {
-    if ($lines[$i] =~ /selfhost_route\s*\(/) { $route_line_idx = $i; last; }
+    if ($lines[$i] =~ /workcopy_route\s*\(/) { $route_line_idx = $i; last; }
 }
-ok(defined $route_line_idx, 'AC-9: selfhost_route( call exists after the winify_path line');
+ok(defined $route_line_idx, 'AC-9: workcopy_route( call exists after the winify_path line');
 
 # The route call must pass a registry-independent live-install hint (§9.1)
 my $route_passes_hint = 0;
@@ -273,22 +273,22 @@ if (defined $route_line_idx) {
         $route_passes_hint = 1 if $lines[$i] =~ /live_install_hint/;
     }
 }
-ok($route_passes_hint, 'AC-9: launcher passes live_install_hint to selfhost_route (registry-independent anchor)');
+ok($route_passes_hint, 'AC-9: launcher passes live_install_hint to workcopy_route (registry-independent anchor)');
 
-my $has_prompt_selfhost = grep { /prompt_selfhost_action/ } @lines;
-ok($has_prompt_selfhost, 'AC-9: launcher.pl references prompt_selfhost_action for the offer branch');
+my $has_prompt_workcopy = grep { /prompt_workcopy_action/ } @lines;
+ok($has_prompt_workcopy, 'AC-9: launcher.pl references prompt_workcopy_action for the offer branch');
 
 # =====================================================================
-# AC-10 — selfhost_decline_outcome shape + structural decline abort
+# AC-10 — workcopy_decline_outcome shape + structural decline abort
 # =====================================================================
 
-my $outcome = selfhost_decline_outcome({});
-is(ref $outcome, 'HASH', 'AC-10: selfhost_decline_outcome returns a HASH ref');
+my $outcome = workcopy_decline_outcome({});
+is(ref $outcome, 'HASH', 'AC-10: workcopy_decline_outcome returns a HASH ref');
 is($outcome->{warn},   1, 'AC-10: decline outcome has warn=1');
 is($outcome->{launch}, 0, 'AC-10: decline outcome has launch=0');
 ok(defined $outcome->{message} && length $outcome->{message}, 'AC-10: decline outcome has a non-empty message');
 like($outcome->{message}, qr/declin/i, 'AC-10: decline message mentions decline/declined');
-like($outcome->{message}, qr/abort|not .* in.?place|self.?host/i, 'AC-10: decline message mentions abort or self-host context');
+like($outcome->{message}, qr/abort|not .* in.?place|work.?copy/i, 'AC-10: decline message mentions abort or work-copy context');
 
 my ($stderr_after_route, $abort_after_route) = (0, 0);
 if (defined $route_line_idx) {
@@ -305,8 +305,8 @@ ok($abort_after_route,  'AC-10 structural: decline branch aborts (exit/die) befo
 # AC-16 — NO shell interpolation in the git default (CRIT-2 RCE)
 # =====================================================================
 
-my $mod = "$Bin/../../scripts/CcpraxisSelfHost.pm";
-open my $mfh, '<', $mod or BAIL_OUT("cannot open CcpraxisSelfHost.pm: $!");
+my $mod = "$Bin/../../scripts/CcpraxisWorkCopy.pm";
+open my $mfh, '<', $mod or BAIL_OUT("cannot open CcpraxisWorkCopy.pm: $!");
 my $src = do { local $/; <$mfh> };
 close $mfh;
 

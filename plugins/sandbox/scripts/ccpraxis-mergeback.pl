@@ -1,6 +1,6 @@
 #!/usr/bin/env perl
 # ccpraxis-mergeback.pl -- host CLI for merge-back and discard of the
-# ccpraxis self-host worktree.
+# sandboxed ccpraxis work-copy (git worktree).
 #
 # Subcommands:
 #   merge   -- fleet-guarded, confirm-gated merge of the work-copy branch
@@ -27,7 +27,7 @@ use File::Spec ();
 use Cwd qw(abs_path);
 use Digest::MD5 ();
 use MountSpec qw(winify_path);
-use CcpraxisSelfHost qw(
+use CcpraxisWorkCopy qw(
     mergeback_guard
     mergeback_plan
     discard_plan

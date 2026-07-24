@@ -1,11 +1,11 @@
-package CcpraxisSelfHost;
-# Detection + routing for the ccpraxis self-host flow (p01).
+package CcpraxisWorkCopy;
+# Detection + routing for the ccpraxis sandboxed work-copy flow (p01).
 # All external facts are injected via %opts seams so tests need neither
 # a real git repo nor Andre's machine.
 #
 # Security redesign per spec §9 (red-team fix-batch):
 #   §9.1  hint-first anchor (_resolve_install_anchor)
-#   §9.2  selfhost_route fail-safe
+#   §9.2  workcopy_route fail-safe
 #   §9.3  non-shell list-form git (RCE fix)
 #   §9.4  bare-root derived-install-dir rejection
 
@@ -21,8 +21,8 @@ use MountSpec qw(winify_path);
 our @EXPORT_OK = qw(
     is_ccpraxis_project
     is_in_place
-    selfhost_route
-    selfhost_decline_outcome
+    workcopy_route
+    workcopy_decline_outcome
     canon_path
     live_install_dir
     default_worktree_path
@@ -228,10 +228,10 @@ sub is_in_place {
 }
 
 # =====================================================================
-# §2.5 / §9.2 — selfhost_route($path, \%opts) -> 'offer' | 'passthrough'
+# §2.5 / §9.2 — workcopy_route($path, \%opts) -> 'offer' | 'passthrough'
 # Fail-safe: ccpraxis identity + NO resolvable anchor -> offer.
 # =====================================================================
-sub selfhost_route {
+sub workcopy_route {
     my ($path, $opts) = @_;
     $opts //= {};
     return 'offer' if is_ccpraxis_project($path, $opts) && is_in_place($path, $opts);
@@ -242,18 +242,19 @@ sub selfhost_route {
 }
 
 # =====================================================================
-# §2.6 — selfhost_decline_outcome(\%opts) -> HASH ref
+# §2.6 — workcopy_decline_outcome(\%opts) -> HASH ref
 # Pure description of the decline outcome.
 # =====================================================================
-sub selfhost_decline_outcome {
+sub workcopy_decline_outcome {
     my ($opts) = @_;
     $opts //= {};
     return {
         warn    => 1,
         launch  => 0,
         message => "Declined: sandboxing ccpraxis in place was declined and is aborting. "
-                 . "Use the self-host flow (claude-sandbox --selfhost or accept the offer) "
-                 . "to safely provision a worktree sandbox instead of launching in place.",
+                 . "Re-run claude-sandbox from the ccpraxis repo and accept the offer to "
+                 . "safely provision a sandboxed work-copy (git worktree) instead of "
+                 . "launching in place.",
     };
 }
 
@@ -261,7 +262,7 @@ sub selfhost_decline_outcome {
 # p02 — worktree provisioning
 # =====================================================================
 
-# Constant: the fixed branch name for the self-host worktree.
+# Constant: the fixed branch name for the sandboxed work-copy worktree.
 use constant WORKTREE_BRANCH => 'ccpraxis-sandbox-workcopy';
 
 # _utf8_bytes($s) — normalise a path from JSON/registry decode to UTF-8 bytes.
