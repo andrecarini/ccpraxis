@@ -31,6 +31,9 @@ our @EXPORT_OK = qw(
     provision_state
     provision_repair_plan
     fleet_live
+    mergeback_guard
+    mergeback_plan
+    discard_plan
 );
 
 # =====================================================================
@@ -514,18 +517,116 @@ sub fleet_live {
     my $now               = $opts->{now}               // time();
     my $fresh_window      = $opts->{fresh_window}      // 900;
 
-    # Primary: container running
-    if (eval { $container_running->($container_name) }) {
-        return 1;
-    }
+    # Primary: container running. FAIL SAFE (red-team p03): a probe that THROWS
+    # means liveness is UNKNOWN, so assume LIVE (blocked) rather than silently
+    # clearing — this gate guards against clobbering/merging over a live run.
+    my $running = eval { $container_running->($container_name) };
+    return 1 if $@;            # probe error -> assume live
+    return 1 if $running;
 
-    # Secondary: fresh marker
+    # Secondary: fresh marker. A throwing marker probe also fails safe. A marker
+    # probe that legitimately returns undef (no marker) is NOT an error -> not live.
     my $mtime = eval { $marker_probe->() };
+    return 1 if $@;            # probe error -> assume live
     if (defined $mtime && ($now - $mtime) <= $fresh_window) {
         return 1;
     }
 
     return 0;
+}
+
+# =====================================================================
+# p03 — mergeback/discard guard and pure planners
+# =====================================================================
+
+# mergeback_guard(\%opts) -> 'blocked' | 'clear'
+# Thin delegation to fleet_live. All probes forwarded from %opts.
+sub mergeback_guard {
+    my ($opts) = @_;
+    $opts //= {};
+    return fleet_live($opts) ? 'blocked' : 'clear';
+}
+
+# mergeback_plan(\%opts) -> HASH ref
+# Pure ordered planner for a guarded merge-back. No git, no fs, no podman.
+# opts: live (required), worktree (required), branch (default WORKTREE_BRANCH),
+#       plus fleet_live probes (forwarded to mergeback_guard).
+sub mergeback_plan {
+    my ($opts) = @_;
+    $opts //= {};
+
+    my $live     = $opts->{live}     // '';
+    my $worktree = $opts->{worktree} // '';
+    my $branch   = $opts->{branch}   // WORKTREE_BRANCH;
+
+    my $guard = mergeback_guard($opts);
+
+    if ($guard eq 'blocked') {
+        return {
+            guard       => 'blocked',
+            steps       => [],
+            noop        => 1,
+            on_conflict => 'abort',
+        };
+    }
+
+    return {
+        guard       => 'clear',
+        noop        => 0,
+        on_conflict => 'abort',
+        steps       => [
+            { op => 'switch_main',
+              argv => ['git', '-C', $live, 'switch', 'main'] },
+            { op => 'merge_no_ff_no_commit',
+              argv => ['git', '-C', $live, 'merge', '--no-ff', '--no-commit', $branch] },
+            { op => 'show_diff',
+              argv => ['git', '-C', $live, 'diff', '--cached'] },
+            { op => 'confirm',
+              note => 'HOST gate: prompt the user before committing the merge' },
+            { op => 'commit',
+              argv => ['git', '-C', $live, 'commit'] },
+            { op => 'worktree_remove',
+              argv => ['git', '-C', $live, 'worktree', 'remove', $worktree] },
+            { op => 'branch_delete',
+              argv => ['git', '-C', $live, 'branch', '-d', $branch] },
+        ],
+    };
+}
+
+# discard_plan(\%opts) -> HASH ref
+# Pure ordered planner for the guarded discard (remove work-copy without merging).
+# opts: live (required), worktree (required), branch (default WORKTREE_BRANCH),
+#       plus fleet_live probes.
+sub discard_plan {
+    my ($opts) = @_;
+    $opts //= {};
+
+    my $live     = $opts->{live}     // '';
+    my $worktree = $opts->{worktree} // '';
+    my $branch   = $opts->{branch}   // WORKTREE_BRANCH;
+
+    my $guard = mergeback_guard($opts);
+
+    if ($guard eq 'blocked') {
+        return {
+            guard => 'blocked',
+            steps => [],
+            noop  => 1,
+        };
+    }
+
+    return {
+        guard => 'clear',
+        noop  => 0,
+        steps => [
+            { op   => 'confirm',
+              note => 'HOST gate: prompt before discarding the work-copy' },
+            { op   => 'worktree_remove',
+              argv => ['git', '-C', $live, 'worktree', 'remove', $worktree] },
+            { op   => 'branch_force_delete',
+              argv => ['git', '-C', $live, 'branch', '-D', $branch] },
+        ],
+    };
 }
 
 1;

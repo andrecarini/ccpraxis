@@ -40,6 +40,11 @@
       "name": "todo",
       "source": "./todo",
       "description": "Personal todo notes synced to your private vault. Provides /todo:create (save a note), /todo:manage (list/view/edit/delete/done), and /todo:resume (load a note and work on it). Backed by scripts/todo-sync.pl; pushed by /steward:backup."
+    },
+    {
+      "name": "selfhost",
+      "source": "./selfhost",
+      "description": "Guarded merge-back / discard for the ccpraxis self-host worktree — /selfhost:mergeback and /selfhost:discard, run on the host after reviewing an in-sandbox self-host run."
     }
   ]
 }
