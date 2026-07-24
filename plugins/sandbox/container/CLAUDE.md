@@ -55,6 +55,10 @@ Even inside a container, supply chain attacks can exfiltrate project source code
 - **Prefer well-established packages** with many downloads, known maintainers, and active maintenance over obscure alternatives.
 - Same caution applies to `pip install`, `cargo install`, `pub get`, etc.
 
+### Runtime & dependency version policy
+
+Beyond the ≥7-day rule above and the backpack-declaration guidance: default to the **latest LTS/stable** of every runtime, tool, and library, and **never an EOL version** (e.g. Node 20 is EOL). Keep versions mutually compatible with the stack and the task. Version selection is a deliberate, reviewed choice — not improvised. Every runtime/toolchain you install must be **backpack-declared** (per the backpack section) so a container rebuild restores it — an undeclared runtime that vanishes on rebuild stalls an unattended fleet.
+
 ## Git
 
 - Local git operations (add, commit, diff, log, status, branch, etc.) work normally
