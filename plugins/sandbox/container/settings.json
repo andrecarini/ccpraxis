@@ -50,7 +50,9 @@
          }
       ]
    },
+   "inputNeededNotifEnabled" : true,
    "promptSuggestionEnabled" : false,
+   "remoteControlAtStartup" : false,
    "showClearContextOnPlanAccept" : true,
    "showThinkingSummaries" : true,
    "skipDangerousModePermissionPrompt" : true,
