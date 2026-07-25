@@ -119,6 +119,8 @@ For each key in `needs_decision`, use AskUserQuestion to present the difference 
   - **"Keep repo-only (remember)"** — save preference so this key is not asked about again
   - **"Skip"** — will be asked again next sync
 
+**Record every key the user answered "Skip" on** — you pass them to the export merge in Step 3 as `--skip-key`. Without that, "Skip" wouldn't mean what it says: the merge would still push a `only_left` key into the repo, or overwrite a `diverged` one with the live value. Use the key name exactly as the diff reported it, dotted form included (`env.DISABLE_LOGIN_COMMAND`). Passing a skipped `only_right` key too is harmless (the merge preserves repo-only keys anyway), so when in doubt pass them all rather than case-analyzing which ones matter.
+
 For any choice that includes "(remember)", save the preference:
 
 ```bash
@@ -183,13 +185,20 @@ For **identical** files: skip, report as in sync.
 
 For **live_only** / **export_only**: copy the file to the missing side.
 
-For **settings_changed**: run the deterministic merge script (live wins on shared keys; keys only in repo are preserved). Don't hand-merge JSON — the script handles atomic write and post-write verification:
+For **settings_changed**: run the deterministic merge script. Live wins on shared keys and keys only in repo are preserved — except where the user has said otherwise. The script reads `.backup-preferences.json` itself (`live_vs_repo` scope) and honors it: `skip-always` and `right-only` keep the repo's value, `left-only` stays out of the repo entirely. Append one `--skip-key` per key the user answered "Skip" on in Step 1.5. Don't hand-merge JSON — the script handles atomic write and post-write verification:
 
 ```bash
-perl ${CLAUDE_PLUGIN_ROOT}/scripts/ccpraxis-helpers.pl settings-export-merge
+perl ${CLAUDE_PLUGIN_ROOT}/scripts/ccpraxis-helpers.pl settings-export-merge \
+  --skip-key "<KEY>" --skip-key "<KEY>"
 ```
 
-Surface the result. If `status: error`, stop and report the JSON.
+(Drop the `--skip-key` flags entirely when nothing was skipped.)
+
+Surface the result. If `status: error`, stop and report the JSON. Otherwise report, for Step 7:
+
+- `preferences_applied` — what a saved preference or a `--skip-key` protected, with the `effect` string. Worth one line each; this is the user's earlier decisions visibly holding.
+- `preferences_ignored` — preferences whose saved `category` no longer matches the key's actual relation. These are dead entries in `.backup-preferences.json`; surface them so the user can re-decide (answering the key again in a later Step 1.5 with a "(remember)" option overwrites the stale entry).
+- `skip_keys_unmatched` — a `--skip-key` that matched nothing in either file. Almost always a typo on your side; re-check it against the diff's key names rather than reporting it as a user-facing finding.
 
 For **conflict** files:
 1. Read BOTH versions (live and export)
@@ -503,7 +512,7 @@ Capture the `count` and the newest snapshot's `id` + `version` from the JSON for
 
 Summarize:
 
-- ccpraxis sync: what was merged, what was committed, whether the push succeeded
+- ccpraxis sync: what was merged, what was committed, whether the push succeeded; any `preferences_applied` / `preferences_ignored` from the Step 3 export merge
 - Marketplaces: any added/changed
 - Vault projects (Step 5.5): per-slug status (synced / conflicts-resolved / aborted / sensitive-blocked / error); count of files pushed/pulled per project
 - Beacons (Step 5.6): one line — "N beacons synced (committed/pushed)" or "no changes" or "skipped (vault missing)" or "sensitive_blocked" with the findings if any

@@ -17,8 +17,10 @@
 #                           the LLM needs to resolve.
 #   settings-export-merge — Merge live settings.json into the repo's
 #                           global-config/settings.json: live wins on shared
-#                           keys; keys only in repo are preserved. Writes
-#                           result to repo path atomically.
+#                           keys; keys only in repo are preserved — EXCEPT
+#                           where the user's saved backup preferences, or a
+#                           --skip-key flag, say to leave the repo side alone.
+#                           Writes result to repo path atomically.
 #   help
 #
 # All output is JSON on stdout. Exit codes:
@@ -403,31 +405,183 @@ sub cmd_marketplace_diff {
 
 # ─── Subcommand: settings-export-merge ────────────────────────────────────
 # Merge live settings.json into repo's global-config/settings.json.
-# Rule: live wins on shared keys; keys only in repo are preserved.
-# This matches the /backup SKILL.md description.
+#
+# Base rule: live wins on shared keys; keys only in repo are preserved.
+#
+# That base rule is overridden by the user's saved backup preferences
+# (.backup-preferences.json, "live_vs_repo" scope) and by per-run --skip-key
+# flags. Without those overrides the merge destroys the very answers
+# /steward:backup asked the user to record: a "keep different" (skip-always)
+# key gets silently overwritten by live, and a "keep live-only" (left-only)
+# key gets exported into the repo anyway.
+#
+# The key model mirrors json-diff.pl exactly, because json-diff is what
+# produced the categories stored in the preferences file: keys are top-level,
+# EXCEPT a key present on both sides whose values are both hashes and differ,
+# which expands one level into "parent.child" dotted sub-keys (expansion
+# skipped on a dotted-name collision). No preference can exist below that
+# depth, so there the base rule applies unconditionally.
 
+# Category → the only action meaningful for it. Mirrors filter-diff.pl; a
+# preference whose action doesn't match its category is inert in both scripts.
+my %VALID_ACTION = (
+    only_left  => 'left-only',
+    only_right => 'right-only',
+    diverged   => 'skip-always',
+);
+
+# Value comparator for merge decisions. allow_nonref because individual setting
+# values are usually plain scalars — canonical_json() above is only ever handed
+# whole objects and predates this need.
+my $VALUE_CMP = JSON::PP->new->canonical->allow_nonref;
+sub same_value { return $VALUE_CMP->encode($_[0]) eq $VALUE_CMP->encode($_[1]); }
+
+sub prefs_path { return File::Spec->catfile(ccpraxis_dir(), '.backup-preferences.json'); }
+
+# Load the live_vs_repo preference scope. Returns ($scope_hashref, $error).
+# A missing file is fine (no preferences recorded yet); an unparseable one is
+# NOT — the whole point here is to refuse to act without knowing them.
+sub load_export_prefs {
+    my $path = prefs_path();
+    return ({}, undef) unless -f $path;
+    my ($obj, $err) = read_json_file($path);
+    return (undef, $err) if $err;
+    my $scope = $obj->{live_vs_repo};
+    return ((ref $scope eq 'HASH' ? $scope : {}), undef);
+}
+
+# json-diff.pl skips one-level expansion when an expanded "parent.child" name
+# would collide with a real top-level key. Mirrored so both scripts agree on
+# what a key is.
+sub dotted_collision {
+    my ($key, $live_val, $repo_val, $all_keys) = @_;
+    for my $sk (keys %$live_val, keys %$repo_val) {
+        return 1 if exists $all_keys->{"$key.$sk"};
+    }
+    return 0;
+}
+
+# Below the preference depth the base rule applies — but "keys only in repo are
+# preserved" still has to hold all the way down, so recurse instead of taking
+# live's subtree wholesale, which would drop repo-only keys nested deeper.
 sub deep_merge_live_wins_keep_repo_only {
     my ($live, $repo) = @_;
-    # Both must be hashes; if not, just take live
     return $live unless ref($live) eq 'HASH' && ref($repo) eq 'HASH';
 
-    my %out;
-    # Start with repo keys (to preserve only-in-repo)
-    for my $k (keys %$repo) {
-        $out{$k} = $repo->{$k};
-    }
-    # Overlay live keys
+    my %out = %$repo;    # start from repo, so only-in-repo keys survive
     for my $k (keys %$live) {
-        if (exists $out{$k} && ref($live->{$k}) eq 'HASH' && ref($out{$k}) eq 'HASH') {
-            $out{$k} = deep_merge_live_wins_keep_repo_only($live->{$k}, $out{$k});
-        } else {
-            $out{$k} = $live->{$k};
+        $out{$k} = (ref $live->{$k} eq 'HASH' && ref $out{$k} eq 'HASH')
+            ? deep_merge_live_wins_keep_repo_only($live->{$k}, $out{$k})
+            : $live->{$k};
+    }
+    return \%out;
+}
+
+# Recursive merge. $ctx = { prefs, skip, applied, ignored, skip_used }.
+# $depth is 0 for top-level keys and 1 inside an expanded hash; $prefix is the
+# parent key name at depth 1, so preferences are looked up by dotted name.
+sub merge_export_level {
+    my ($live, $repo, $ctx, $prefix, $depth) = @_;
+
+    my %all_keys;
+    $all_keys{$_} = 1 for (keys %$live, keys %$repo);
+
+    my %out;
+    for my $k (sort keys %all_keys) {
+        my $in_live = exists $live->{$k};
+        my $in_repo = exists $repo->{$k};
+        my $lv = $live->{$k};
+        my $rv = $repo->{$k};
+
+        my $rel = !$in_repo              ? 'only_left'
+                : !$in_live              ? 'only_right'
+                : same_value($lv, $rv)   ? 'identical'
+                :                          'diverged';
+
+        my $name = length($prefix) ? "$prefix.$k" : $k;
+
+        # Expand one level, matching json-diff.pl, so dotted preferences apply.
+        if ($depth == 0 && $rel eq 'diverged'
+            && ref($lv) eq 'HASH' && ref($rv) eq 'HASH'
+            && !dotted_collision($k, $lv, $rv, \%all_keys))
+        {
+            $out{$k} = merge_export_level($lv, $rv, $ctx, $k, 1);
+            next;
         }
+
+        # --skip-key: this run's "Skip" answers. Same effect as a preference —
+        # leave the repo side of this key exactly as it is — but not persisted.
+        if ($ctx->{skip}{$name}) {
+            $ctx->{skip_used}{$name} = 1;
+            push @{ $ctx->{applied} }, {
+                key      => $name,
+                relation => $rel,
+                action   => 'skip-run',
+                source   => 'skip-key',
+                effect   => $in_repo ? 'kept repo value' : 'left absent from repo',
+            };
+            $out{$k} = $rv if $in_repo;
+            next;
+        }
+
+        # An 'identical' key needs no decision and filter-diff.pl never surfaces
+        # one, so a preference on it is dormant rather than stale — stay quiet.
+        my $pref = $rel eq 'identical' ? undef : $ctx->{prefs}{$name};
+        if (ref $pref eq 'HASH') {
+            my $cat = $pref->{category} // '';
+            my $act = $pref->{action}   // '';
+            if ($cat eq $rel && defined $VALID_ACTION{$rel} && $act eq $VALID_ACTION{$rel}) {
+                push @{ $ctx->{applied} }, {
+                    key      => $name,
+                    relation => $rel,
+                    action   => $act,
+                    source   => 'preferences',
+                    effect   => $rel eq 'only_left'  ? 'kept out of repo (live-only)'
+                              : $rel eq 'only_right' ? 'kept repo-only value'
+                              :   'kept repo value (sides intentionally differ)',
+                };
+                # only_left omits the key from the repo entirely; the other two
+                # categories mean "whatever the repo already has, stands".
+                $out{$k} = $rv unless $rel eq 'only_left';
+                next;
+            }
+            push @{ $ctx->{ignored} }, {
+                key             => $name,
+                saved_category  => $cat,
+                saved_action    => $act,
+                actual_relation => $rel,
+                reason          => $cat ne $rel
+                    ? "saved category '$cat' no longer matches actual relation '$rel'"
+                    : "saved action '$act' is not the valid action for category '$cat'",
+            };
+        }
+
+        # Base rule. Both-hashes here means either a dotted-name collision blocked
+        # expansion, or we're already at depth 1 — either way no preference can
+        # address the sub-keys, so deep-merge them rather than overwrite.
+        $out{$k} = (ref $lv eq 'HASH' && ref $rv eq 'HASH')
+            ? deep_merge_live_wins_keep_repo_only($lv, $rv)
+            : ($in_live ? $lv : $rv);
     }
     return \%out;
 }
 
 sub cmd_settings_export_merge {
+    # Per-run "Skip" answers from /steward:backup Step 1.5. Repeatable.
+    my %skip;
+    while (@ARGV) {
+        my $arg = shift @ARGV;
+        if ($arg eq '--skip-key') {
+            my $key = shift @ARGV;
+            die_json(3, "--skip-key requires a key name") unless defined $key && length $key;
+            $skip{$key} = 1;
+        } elsif ($arg =~ /^--skip-key=(.+)\z/) {
+            $skip{$1} = 1;
+        } else {
+            die_json(3, "Unknown argument for settings-export-merge: $arg");
+        }
+    }
+
     my $live = File::Spec->catfile(claude_dir(), 'settings.json');
     my $repo = File::Spec->catfile(ccpraxis_dir(), 'global-config', 'settings.json');
 
@@ -441,6 +595,11 @@ sub cmd_settings_export_merge {
         die_json(2, "Cannot parse repo settings: $repo_err");
     }
     $repo_obj //= {};
+
+    my ($prefs, $prefs_err) = load_export_prefs();
+    # Refuse to merge blind: proceeding without the preferences is exactly the
+    # failure mode this subcommand exists to avoid.
+    die_json(2, "Cannot parse backup preferences: $prefs_err") if $prefs_err;
 
     # Pre-flight: backup the repo file before writing (in case caller hasn't).
     # Keep only the 2 most recent pre-merge backups; prune older ones so the
@@ -464,7 +623,15 @@ sub cmd_settings_export_merge {
         }
     }
 
-    my $merged = deep_merge_live_wins_keep_repo_only($live_obj, $repo_obj);
+    my $ctx = {
+        prefs     => $prefs,
+        skip      => \%skip,
+        applied   => [],
+        ignored   => [],
+        skip_used => {},
+    };
+    my $merged = merge_export_level($live_obj, $repo_obj, $ctx, '', 0);
+
     my $err = write_json_file_atomic($repo, $merged);
     die_json(2, "Cannot write merged settings: $err") if $err;
 
@@ -475,11 +642,19 @@ sub cmd_settings_export_merge {
         die_json(2, "Post-write content mismatch");
     }
 
+    # A --skip-key naming something absent from both files is almost always a
+    # typo in the caller's invocation — surface it rather than swallow it.
+    my @unmatched = sort grep { !$ctx->{skip_used}{$_} } keys %skip;
+
     emit_json({
-        status     => 'merged',
-        live       => $live,
-        repo       => $repo,
-        merge_rule => 'live-wins-on-shared-keys-preserve-repo-only',
+        status              => 'merged',
+        live                => $live,
+        repo                => $repo,
+        merge_rule          => 'preference-aware-live-wins-preserve-repo-only',
+        preferences_file    => (-f prefs_path() ? prefs_path() : undef),
+        preferences_applied => $ctx->{applied},
+        preferences_ignored => $ctx->{ignored},
+        skip_keys_unmatched => \@unmatched,
     });
     exit 0;
 }
@@ -504,9 +679,21 @@ Subcommands:
 
   settings-export-merge  Merge live settings.json into repo's
                          global-config/settings.json. Live wins on shared
-                         keys; keys only in repo are preserved.
+                         keys; keys only in repo are preserved. Saved backup
+                         preferences (.backup-preferences.json, live_vs_repo
+                         scope) override that: "keep different" (skip-always)
+                         and "keep repo-only" (right-only) keep the repo's
+                         value; "keep live-only" (left-only) stays out of the
+                         repo entirely.
+                         Options:
+                           --skip-key KEY  Leave the repo side of KEY alone for
+                                           this run only (repeatable). Use for
+                                           the user's per-run "Skip" answers.
+                                           Dotted names (env.FOO) address one
+                                           sub-key, matching json-diff.pl.
 
-All output is JSON on stdout. Exit codes: 0=ok, 1=soft fail, 2=hard fail.
+All output is JSON on stdout. Exit codes: 0=ok, 1=soft fail, 2=hard fail,
+3=usage error.
 EOF
     exit 0;
 }
