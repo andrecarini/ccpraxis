@@ -118,8 +118,7 @@ ccpraxis/
 │   └── settings.json                        # Base settings (env, statusline, plugins, effort level)
 ├── host-tools/
 │   ├── bin/
-│   │   ├── .gitkeep
-│   │   └── perl.cmd
+│   │   └── .gitkeep
 │   └── ccpraxis-install.pl                  # host-tools install hook: put `perl` on the user's PATH.
 ├── install.pl                               # Top-level setup orchestrator — discovers and runs every surface's ccpraxis-install.pl. Two-phase: bare run = plan only, --confirm = apply.
 ├── plugins/                                 # Local plugin marketplace ("ccpraxis-local")
@@ -301,6 +300,7 @@ ccpraxis/
 │   │   ├── scripts/
 │   │   │   ├── BackpackApproval.pm
 │   │   │   ├── BackpackReview.pm
+│   │   │   ├── CcpraxisWorkCopy.pm
 │   │   │   ├── ClaudeConfig.pm
 │   │   │   ├── ConnectorHold.pm
 │   │   │   ├── Dashboard.pm                 # the raw-ANSI TUI dashboard framework for `claude-sandbox` (B2).
@@ -311,6 +311,7 @@ ccpraxis/
 │   │   │   ├── PortAlloc.pm
 │   │   │   ├── SandboxLock.pm
 │   │   │   ├── bootstrap.pl                 # First-launch setup invoked by launcher.pl when .claude-data is missing. 6 steps: verify container blueprint, build image, mkdir .claude-data, append .gitignore, git auth (HTTPS PAT / SSH deploy-key), invoke ccpraxis-install.pl. Fully interactive over the launcher's tty.
+│   │   │   ├── ccpraxis-mergeback.pl        # host CLI for merge-back and discard of the
 │   │   │   ├── keep-awake.ps1               # hold a Windows wake-lock for as long as THIS process lives.
 │   │   │   ├── launcher.pl                  # The actual claude-sandbox launcher: arg parsing, bootstrap detection, lock + dead-PID cleanup, image build, TUI selector orchestration, staleness check, mount assembly, container create-or-reattach. Wrappers in bin/ are tiny shims that exec into this.
 │   │   │   ├── select-session.pl            # TUI session picker for the claude-sandbox launcher.
@@ -357,7 +358,10 @@ ccpraxis/
 │   │           ├── 35-port-alloc.t
 │   │           ├── 36-launcher-port-publish.t
 │   │           ├── 37-heartbeat-bridge-range.t
-│   │           └── 38-global-lock.t
+│   │           ├── 38-global-lock.t
+│   │           ├── 39-ccpraxis-workcopy-detect.t
+│   │           ├── 40-ccpraxis-workcopy-provision.t
+│   │           └── 41-ccpraxis-mergeback-guard.t
 │   ├── steward/                             # Meta-plugin that maintains ccpraxis and owns its backup, onboarding, and self-e…
 │   │   ├── .claude-plugin/
 │   │   │   └── plugin.json
@@ -379,6 +383,10 @@ ccpraxis/
 │   │   │   │   └── SKILL.md                 # Syncs everything personal between the live host and your private repos — ccpr…
 │   │   │   ├── ccpraxis-extend/
 │   │   │   │   └── SKILL.md                 # THE single entrypoint for changing ccpraxis or adding new functionality to it.
+│   │   │   ├── discard-sandboxed-ccpraxis-workcopy/
+│   │   │   │   └── SKILL.md                 # Guarded discard of the sandboxed ccpraxis work-copy WITHOUT merging.
+│   │   │   ├── mergeback-sandboxed-ccpraxis-workcopy/
+│   │   │   │   └── SKILL.md                 # Guarded merge-back of the sandboxed ccpraxis work-copy branch into live main.
 │   │   │   ├── setup-project/
 │   │   │   │   └── SKILL.md                 # Onboard the current project to the ccpraxis system — create the local data di…
 │   │   │   └── update/

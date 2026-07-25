@@ -1,7 +1,8 @@
 #!/usr/bin/perl
 # gen-readme-tree.pl — generate/refresh the file-tree section of README.md
-# from what's actually on disk, resolving descriptions from per-module
-# metadata co-located with each entry.
+# from the git-tracked files on disk (falling back to a raw filesystem walk
+# when git is unavailable), resolving descriptions from per-module metadata
+# co-located with each entry.
 #
 # Metadata resolution (priority order, first non-empty hit wins):
 #
@@ -89,6 +90,31 @@ my %EXCLUDE_FILES = map { $_ => 1 } qw(
 );
 my $EXCLUDE_RE = qr{^\.d5-test-};
 
+# Tracked-file set from git. The tree should reflect what's committed to the
+# repo, not transient on-disk cruft — gitignored backups (*.pre-merge.*),
+# runtime lock dirs (.locks/), or any other untracked file. When git is
+# unavailable or this isn't a work tree, $TRACKED stays undef and we fall back
+# to rendering every on-disk entry (minus the hardcoded excludes above).
+my $TRACKED = load_tracked_set();
+
+sub load_tracked_set {
+    # `git ls-files` lists the index (tracked paths only); -z keeps them
+    # NUL-separated and quotepath=false keeps non-ASCII paths verbatim.
+    my @cmd = ('git', '-C', $REPO_ROOT, '-c', 'core.quotepath=false', 'ls-files', '-z');
+    my $out;
+    my $ok = eval {
+        open my $fh, '-|', @cmd or die "spawn failed\n";
+        binmode $fh;
+        local $/;
+        $out = <$fh>;
+        close $fh;                 # reaps child; sets $? to git's exit status
+        1;
+    };
+    return undef if !$ok || ($? >> 8) != 0 || !defined $out || !length $out;
+    my %tracked = map { $_ => 1 } grep { length } split /\0/, $out;
+    return %tracked ? \%tracked : undef;
+}
+
 # ── Walk ──────────────────────────────────────────────────────────
 sub walk {
     my ($abs, $rel) = @_;
@@ -112,6 +138,10 @@ sub walk {
             # `.about` files are metadata for siblings — never render.
             next if $e eq '.about';
             next if $e =~ /\.about\z/;
+            # Respect git: never render a file it doesn't track (gitignored
+            # backups like *.pre-merge.*, or any other untracked cruft). Only
+            # filters when the tracked set loaded; otherwise old behavior stands.
+            next if $TRACKED && !$TRACKED->{$rel_child};
         }
         push @entries, {
             name   => $e,
@@ -127,10 +157,21 @@ sub walk {
     # at the top of scripts/.
     @entries = sort { $a->{name} cmp $b->{name} } @entries;
 
+    my @kept;
     for my $rec (@entries) {
-        $rec->{children} = $rec->{is_dir} ? walk($rec->{abs}, $rec->{rel}) : [];
+        if ($rec->{is_dir}) {
+            $rec->{children} = walk($rec->{abs}, $rec->{rel});
+            # Prune directories left empty once untracked children are gone —
+            # e.g. runtime lock dirs (.locks/) holding only ignored files, which
+            # git can't track and which wouldn't exist in a fresh clone. Only
+            # prunes when the tracked set loaded; otherwise old behavior stands.
+            next if $TRACKED && !@{ $rec->{children} };
+        } else {
+            $rec->{children} = [];
+        }
+        push @kept, $rec;
     }
-    return \@entries;
+    return \@kept;
 }
 
 # ── Description resolution ────────────────────────────────────────
