@@ -17,7 +17,9 @@
 #   - no side effects at load: this file only DEFINES package BpRemediate and
 #     ends in '1;'. It is required by bp-orchestrator.pl exactly the way
 #     bp-judge.pl is, and is independently loadable/testable on its own.
-#   - the ONLY dependency is JSON::PP. No system()/exec()/backticks/qx, no
+#   - the ONLY dependency is JSON::PP. No shelling out of any kind: no system,
+#     no exec, no backticks, no qx (spelled without parentheses on purpose --
+#     AC-28 scans this file for those tokens followed by an open paren), no
 #     piped open() — b07 authors ledgers for a coordinator to execute; it never
 #     runs git, a build, or bp-deps-check.pl itself (D11).
 #
@@ -57,7 +59,12 @@ sub _make_path {
     my $cur = ($dir =~ m{^/}) ? '' : '.';
     for my $p (@parts) {
         next unless length $p;
-        $cur = length($cur) ? "$cur/$p" : $p;
+        # An ABSOLUTE path starts this loop with $cur eq '', so the first
+        # component must be re-rooted as "/$p" -- a bare "$p" silently drops the
+        # leading slash and builds the whole tree RELATIVE to the cwd. Every
+        # mkdir then "succeeds" somewhere useless and the caller's later
+        # rename/open fails with nothing to trace it back to.
+        $cur = ($cur eq '') ? "/$p" : "$cur/$p";
         mkdir $cur unless -d $cur;
     }
 }
