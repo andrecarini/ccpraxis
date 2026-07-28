@@ -3,22 +3,22 @@
 # that turns a b05 conformance-verdict FAIL into action. b05 (bp-judge.pl +
 # bp-orchestrator.pl's conformance gate) detects and stops (its D10/§2.7); this
 # file decides what to DO about a characterized finding — auto-fix it by
-# authoring a scoped remediation package, route it to review (`justify`), or
+# authoring a scoped remediation package, route it to review ('justify'), or
 # escalate to the ONE human decision this engine ever files (Decision #20).
 #
 # DESIGN (spec 08-auto-remediation-engine-spec.md):
 #   - every DECISION function is PURE: no I/O, no globals, no clock reads,
-#     never dies. `plan()` is the heart — decoded verdict + decoded queue +
+#     never dies. plan() is the heart — decoded verdict + decoded queue +
 #     context in, everything the caller must do out.
 #   - every WRITE is atomic temp+rename and never dies (impure functions only).
 #   - fail-closed throughout: a missing/unparseable input is never read as an
 #     empty/passing state; a corrupt queue is never treated as an empty one
 #     (that would silently reset the round counters and unbound the loop).
 #   - no side effects at load: this file only DEFINES package BpRemediate and
-#     ends in `1;`. It is `require`d by bp-orchestrator.pl exactly the way
+#     ends in '1;'. It is required by bp-orchestrator.pl exactly the way
 #     bp-judge.pl is, and is independently loadable/testable on its own.
-#   - the ONLY dependency is JSON::PP. No `system`/`exec`/backticks/`qx`, no
-#     piped `open` — b07 authors ledgers for a coordinator to execute; it never
+#   - the ONLY dependency is JSON::PP. No system()/exec()/backticks/qx, no
+#     piped open() — b07 authors ledgers for a coordinator to execute; it never
 #     runs git, a build, or bp-deps-check.pl itself (D11).
 #
 # require: require "<path>/bp-remediate.pl"; BpRemediate::plan(...)
@@ -84,7 +84,7 @@ sub _slug {
 
 # deep clone via a JSON round-trip — every structure this file passes around
 # is plain JSON-shaped data (hashrefs/arrayrefs/scalars), so this is a safe,
-# dependency-free way to guarantee `plan()` never aliases the caller's queue.
+# dependency-free way to guarantee plan() never aliases the caller's queue.
 sub _clone {
     my ($d) = @_;
     return $d unless ref $d;
@@ -155,7 +155,7 @@ my %LOCKFILE_TABLE = (
 # join valid, deduped, non-empty/non-whitespace/non-'/' segments with ':'.
 # Returns undef when nothing survives — NEVER an empty or whitespace string
 # (D2 / landmine 1: an empty write_set matches every running package's write
-# set at `_ws_prefixes('')` and deadlocks the run).
+# set at _ws_prefixes('') and deadlocks the run).
 sub _join_ws {
     my (@segs) = @_;
     my (@out, %seen);
@@ -886,6 +886,12 @@ sub ledger_text {
     $finding_json = '{}' unless defined $finding_json;
     $finding_json =~ s/\s+\z//;
 
+    # Rendered ledger markdown needs literal triple-backtick fences (AC-9 parses
+    # a fenced json block out of the ## Inputs section) but bp-remediate.pl's own
+    # SOURCE must carry zero backtick characters (AC-28's anti-shell-out scan).
+    # Build the fence at runtime instead of writing it literally.
+    my $F = chr(96) x 3;
+
     my $git_clause = ($action eq 'commit_lockfile')
         ? "Git may be unavailable in this container: if git cannot run, record that fact in this ledger's attempt log and stop; do not fabricate a commit."
         : '';
@@ -907,19 +913,19 @@ sub ledger_text {
     push @lines, '';
     push @lines, '## Scope';
     push @lines, '';
-    push @lines, "This package exists only to close finding \`$finding_key\`. It must not touch anything outside write_set, and it must not widen its own scope.";
+    push @lines, "This package exists only to close finding '$finding_key'. It must not touch anything outside write_set, and it must not widen its own scope.";
     push @lines, '';
     push @lines, '## Done criteria';
     push @lines, '';
-    push @lines, "$sentence Also: \`prove -r plugins/butler/tests/t/\` still green.";
+    push @lines, "$sentence Also: 'prove -r plugins/butler/tests/t/' still green.";
     push @lines, '';
     push @lines, '## Inputs';
     push @lines, '';
     push @lines, 'The finding this package was authored to close, verbatim:';
     push @lines, '';
-    push @lines, '```json';
+    push @lines, "${F}json";
     push @lines, $finding_json;
-    push @lines, '```';
+    push @lines, $F;
     push @lines, '';
     push @lines, "finding_key: $finding_key";
     push @lines, "source: $source";

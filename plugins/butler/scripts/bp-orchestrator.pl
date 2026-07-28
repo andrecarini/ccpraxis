@@ -2039,41 +2039,134 @@ sub _enter_pause_manual {
 # judge's own needs_you question; harvest-park raises a harvest-failure alarm).
 
 # ===========================================================================
-# b07 STUBS -- INERT PLACEHOLDERS, NOT THE IMPLEMENTATION. DELETE ON RESUME.
-#
-# b07-auto-remediation-engine landed its orchestrator call sites (:1238, :1894,
-# :1969) and the whole pure core in bp-remediate.pl, but its implementer died
-# before defining these two subs. Perl resolves subs at runtime, so perl -c
-# passed, the defect survived review, and sandbox-refuse-in-place's p04 then
-# promoted the working tree wholesale into the live install -- after which every
-# NEWLY-LAUNCHED fleet died on tick 1 with
-#   Undefined subroutine &BpOrch::remediation_merge called at ... line 1238
-# (:1238 is the first statement after _load_state in the per-tick watch loop, so
-# nothing downstream of it ever ran). An already-running orchestrator was immune,
-# because perl loads the script once at process start -- which is why this looked
-# like it was "working on other sandboxes".
-#
-# These stubs restore a runnable orchestrator with remediation INERT: no queue is
-# read, merged or authored, and no gate is held. BpRemediate::remediation_outstanding
-# returns 0 for an empty entries list and BpRemediate::verify_ready returns 1, so
-# run_complete (:1876) and the conformance gate behave exactly as they did before
-# b07 touched them. Nothing silently half-works.
-#
-# b07 MUST REPLACE THESE, NOT BUILD ON THEM. The real contract for both is in
-# spec-08 section 3.1/3.5 and restated step-by-step in b07's ledger under
-# "## Next action". If you are the b07 implementer: delete this entire block
-# first, then write the real subs. A green suite with these stubs still present
-# is NOT b07 done -- t/26-auto-remediation-engine.t is the oracle that says so.
+# b07 — auto-remediation engine: orchestrator seams (spec-08 §3.1, §3.3, §3.5)
 # ===========================================================================
 
+# Per-tick DAG-append merge (spec-08 §3.1, D1): read runs/remediation-queue.json,
+# read each entry's on-disk ledger frontmatter status where the ledger exists,
+# and hand both to BpRemediate::merge_queue to mutate %meta/%status IN PLACE.
+# Returns the queue (read fresh off disk) so the rest of this tick — including
+# both conformance-verdict ingestion sites — sees a consistent view without a
+# second disk read.
 sub remediation_merge {
     my ($bpdir, $runs, $meta, $status) = @_;
-    return { entries => [] };          # STUB (b07) -- never mutates meta/status
+    my $queue = BpRemediate::read_queue("$runs/remediation-queue.json");
+    $queue = BpRemediate::queue_new({}) unless ref $queue eq 'HASH';
+    return $queue if $queue->{_corrupt};   # fail-closed: never merge a corrupt queue
+
+    my %ledger_status;
+    for my $e (@{ (ref $queue->{entries} eq 'ARRAY') ? $queue->{entries} : [] }) {
+        next unless ref $e eq 'HASH';
+        my $id = $e->{id};
+        next unless defined $id && length $id;
+        next unless -f "$bpdir/packages/$id.md";
+        my $st = ledger_fm($bpdir, $id, 'status');
+        $ledger_status{$id} = $st if defined $st && length $st;
+    }
+    BpRemediate::merge_queue($queue, $meta, $status, \%ledger_status);
+    return $queue;
 }
 
+# One verdict-ingestion-time step (spec-08 §3.3 behavior 12, §3.5). $a is the
+# argument hash built at both call sites (:1897ish, :1972ish): bpdir, runs,
+# verdict, meta, status, now, blueprint, tunables, log, queue.
 sub remediation_step {
     my ($a) = @_;
-    return 0;                          # STUB (b07) -- nothing outstanding, ever
+    my $bpdir = $a->{bpdir};
+    my $runs  = $a->{runs};
+    my $now   = $a->{now};
+    my $bp    = $a->{blueprint};
+    my $t     = $a->{tunables} || {};
+    my $log   = $a->{log};
+    my $meta  = $a->{meta}   || {};
+    my $status= $a->{status} || {};
+
+    my $qpath = "$runs/remediation-queue.json";
+    my $queue = $a->{queue};
+    $queue = BpRemediate::read_queue($qpath) unless ref $queue eq 'HASH';
+    $queue = BpRemediate::queue_new({}) unless ref $queue eq 'HASH';
+
+    my %pkg_write_sets = map { $_ => $meta->{$_}{write_set} } grep { defined $meta->{$_}{write_set} } keys %$meta;
+    my %pkg_status     = %$status;
+
+    my %ctx = (
+        now            => $now,
+        iso            => _iso($now),
+        blueprint      => $bp,
+        rounds         => ($t->{remediation_rounds} // 2),
+        cap            => ($t->{remediation_cap}    // 6),
+        pkg_write_sets => \%pkg_write_sets,
+        pkg_status     => \%pkg_status,
+        model          => ($t->{remediation_model} // 'sonnet'),
+        max_turns      => ($t->{remediation_max_turns} // 60),
+        test_paths     => ($t->{remediation_test_paths} // 'plugins/butler/tests/'),
+        backpack_path  => $t->{backpack_path},   # §8.2: no invented default; undef => escalate
+    );
+
+    my $plan = BpRemediate::plan($a->{verdict}, $queue, \%ctx);
+
+    # (i) author every ledger BEFORE the entry is merged/persisted (§2.11 —
+    # a launchable remediation package always has a readable ledger on disk).
+    for my $entry (@{ $plan->{author} || [] }) {
+        BpRemediate::author_ledger($bpdir, $entry, \%ctx);
+    }
+
+    # (ii) persist the queue AFTER the ledgers (§3.5): a crash between them
+    # must leave an inert orphan ledger, never a merged entry with no ledger.
+    BpRemediate::write_queue($qpath, $plan->{queue});
+
+    # (iii) notices — reused b05 channel, source overridden per §2.7.
+    for my $n (@{ $plan->{notices} || [] }) {
+        my $nt = BpJudge::notice_record($n->{subject}, $n->{detail},
+            { generated_at => _iso($now), severity => ($n->{severity} // 'warn'),
+              evidence => (ref $n->{evidence} eq 'HASH' ? $n->{evidence} : {}) });
+        $nt->{source} = 'remediation-engine';
+        _write_json_atomic("$runs/notices/" . (defined $now ? $now : 0)
+            . '-remediation-' . _slug($n->{subject}) . '.json', $nt);
+    }
+
+    # (iv) reviews — a 'justify' finding, unchanged builder.
+    for my $f (@{ $plan->{reviews} || [] }) {
+        my $rec = BpJudge::review_record(
+            { package => $f->{subject}, means => undef, change => $f->{detail}, justification => $f->{detail} },
+            { generated_at => _iso($now) });
+        _write_json_atomic("$runs/review/" . ($rec->{package} // 'unknown') . '-' . _slug($f->{detail} // $f->{subject}) . '.json', $rec);
+    }
+
+    # (v) exactly one blocking decision iff plan.escalate is non-empty (D8).
+    if (@{ $plan->{escalate} || [] }) {
+        my $n = scalar @{ $plan->{escalate} };
+        my @reasons = do { my %seen; grep { !$seen{$_}++ } map { $_->{escalation_reason} // '' } @{ $plan->{escalate} } };
+        queue_needs_you($runs, {
+            kind       => 'remediation-escalation',
+            package    => '_remediation',
+            blueprint  => $bp,
+            reason     => 'auto-remediation could not close one or more characterized findings',
+            ts         => _iso($now),
+            manual     => 0,
+            question   => "$n finding" . ($n == 1 ? '' : 's') . ' could not be auto-remediated',
+            context    => { findings => $plan->{escalate}, rounds_used => $plan->{queue}{rounds_used},
+                             rounds_cap => $ctx{cap}, queue => 'runs/remediation-queue.json' },
+            created_at => $now,
+        });
+    }
+
+    # (vi) rotate the verdict + re-arm b05's gate: only when a round actually
+    # opened this plan AND the global cap wasn't already exhausted opening it
+    # (spec-08 item 9) — bounds gate_firings <= rounds_used <= remediation_cap.
+    if ($plan->{rotate} && ($plan->{queue}{rounds_used} // 0) < $ctx{cap}) {
+        BpRemediate::rotate_verdict($runs, $plan->{queue}, $now);
+        update_registry_pkg($runs, '_run', { conformance_spawns => 0 });
+    }
+
+    _log($log, 'remediation_step', {
+        authored => scalar(@{ $plan->{author}   || [] }),
+        escalated => scalar(@{ $plan->{escalate} || [] }),
+        rotate    => ($plan->{rotate} ? 1 : 0),
+        outstanding => ($plan->{outstanding} ? 1 : 0),
+    });
+
+    return $plan->{outstanding};
 }
 
 sub _block_and_queue {
@@ -2122,6 +2215,9 @@ sub conformance_registry {
     my ($bpdir, $meta, $status) = @_;
     my %pkgs;
     for my $pkg (sort keys %{ $meta || {} }) {
+        # b07 (spec-08 §3.4 behavior 17, D9): remediation packages are never
+        # conformance-judged — excluding them here is the recursion guard.
+        next if $meta->{$pkg}{remediation};
         my $raw = ledger_fm($bpdir, $pkg, 'mandated_means');
         my $mm  = BpJudge::parse_mandated_means($raw);
         $pkgs{$pkg} = { status => ($status->{$pkg} // 'pending'),
