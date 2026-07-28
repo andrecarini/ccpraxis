@@ -1,0 +1,104 @@
+# ccpraxis — project instructions
+
+You are working **on ccpraxis itself**: the plugins, skills, launchers and scripts that Claude Code
+runs. Read `plugins/sandbox/docs/working-on-ccpraxis.md` before changing anything about how the
+sandbox launches.
+
+## Where you are, and where you must not be
+
+| path | what it is |
+|---|---|
+| this repo | your **clone**. Develop here. Sandbox here. |
+| `~/.claude/ccpraxis` | the **live install** — the plugin tree Claude Code is executing. Never develop here. |
+
+`claude-sandbox` refuses to launch against `~/.claude/ccpraxis`, by design. Editing the live install
+means editing tooling while it is in use.
+
+**Promotion is a merge, not an install:**
+
+```bash
+git -C ~/.claude/ccpraxis pull <this-clone> main
+```
+
+`~/.claude/ccpraxis` *is* the installed plugin tree (the `ccpraxis-local` marketplace is a
+`directory` source pointing at its `plugins/`, which is also what is on `PATH`), so the merge alone
+promotes. Run `install.pl` **only** when PATH wiring or the set of plugins changed — it runs each
+surface's `ccpraxis-install.pl` hook and does not copy plugin code. Never treat it as the promotion
+step: a successful-looking install can otherwise mask a merge that never happened.
+
+## Language and runtime
+
+**Everything is Perl.** Install hooks, launchers, the statusline, sync logic. That is deliberate:
+Perl ships with macOS, Linux and Git for Windows, so a fresh `git clone` runs everything with no
+Node/Python/toolchain installs on the host. Do not introduce another runtime without a decision.
+
+**Never run dev tooling on the host** — no `npm install`, `pip`, `cargo`, build tools. If something
+needs a toolchain, it belongs in the sandbox container.
+
+## Tests
+
+Layout: `plugins/<plugin>/tests/t/NN-name.t`, plain `Test::More`, no harness config.
+
+**`prove` does not exist on the Git-for-Windows host** — that perl ships no `TAP::Harness`
+(`Can't locate TAP/Harness/Env.pm`). Run files directly and judge by exit code plus `not ok` count:
+
+```bash
+perl plugins/sandbox/tests/t/42-refuse-in-place.t
+```
+
+**Record a baseline before you change anything.** Both suites carry pre-existing red from
+in-flight work on other tracks; judge your change by red files *attributable to it*, never by an
+absolute count.
+
+**Never let a test spawn `launcher.pl` unguarded.** It will build an image and start a container
+inside your test run. Interlock any such test on the behaviour already being wired (grep the
+launcher source first) and bound it with `timeout`. This has fired repeatedly.
+
+## Windows landmines
+
+These have each cost real debugging time. Details in the user-global `CLAUDE.md`.
+
+- **Never `> NUL` from bash** — it creates a literal file named `NUL` that Explorer cannot delete.
+  Use `/dev/null`. From PowerShell use `$null`.
+- **Never reopen STDOUT/STDERR onto an in-memory scalar** — Git-for-Windows perl fails with
+  "Bad file descriptor", surfacing as a bare `Died at … line N`. Capture via `File::Temp`.
+- **MSYS2 mangles `:`-separated args** passed to native Windows binaries (`podman -v HOST:CONTAINER`
+  becomes `HOST;CONTAINER`). Any perl script spawning a native binary must set
+  `$ENV{MSYS2_ARG_CONV_EXCL} = '*'` on Windows — *or* hand-translate to forward-slash Windows paths,
+  which `podman.exe` and `git.exe` both accept directly. Symptom: stray directories ending in `;C`.
+- **Paths contain non-ASCII** (`André`). Nothing may assume ASCII paths. Round-trip registry values
+  as UTF-8 bytes; never re-encode something already decoded.
+
+## `.ccpraxis-local-data/` — gitignored, and it does not travel
+
+Holds blueprints, `claude-home` (agent memory, session transcripts, credentials, beacons), launcher
+state. Git never carries it. Nor does it carry `deploy_key`, `deploy_key.pub` or `.claude/`.
+
+If you relocate a project, **`git status --ignored` is the authoritative list of what to copy — not
+`.gitignore`**, which lists patterns rather than what actually exists.
+
+**Never copy `claude-home/.launcher/` between project locations.** It encodes container identity
+(`container-name`, `port-base`, `containerfile-hash`); a copied `container-name` makes the launcher
+attach to another project's container and mount the wrong directory at `/project`. It is derived
+state — delete it and it regenerates.
+
+## Commits
+
+- Atomic: one commit per coherent deliverable.
+- **Never add `Co-Authored-By`** or any co-author trailer.
+- Explain *why*, not just what — this repo's history is the main record of its design decisions.
+- If a change cannot be made atomic (intermixed in-flight work), say so in the commit message
+  rather than pretending otherwise.
+
+## Multi-session work
+
+Substantial initiatives are **blueprints**: `/blueprint:create` authors one under
+`.ccpraxis-local-data/blueprints/<name>/`; `/butler:drive-solo <name>` executes it. Blueprints carry
+per-package ledgers with write sets and done criteria. If work spans more than one session, prefer a
+blueprint over ad-hoc edits.
+
+## Do not confuse these two
+
+- `global-config/CLAUDE.md` — a **payload** of this repo, installed to the user's
+  `~/.claude/CLAUDE.md`. Editing it changes what every project sees on this machine.
+- **This file** — instructions for working on ccpraxis itself.
