@@ -416,6 +416,7 @@ my %phaseA;
     );
     my $reader_result = "$A_DIR/.reader-result";
 
+    my $phaseA_t0 = time();
     my @kids;
     my $reader_pid = fork();
     die "t/42: fork failed: $!" unless defined $reader_pid;
@@ -451,6 +452,7 @@ my %phaseA;
     }
 
     %phaseA = (
+        wall               => (time() - $phaseA_t0),
         writes_total       => (($w1{count} // 0) + ($w2{count} // 0) + ($wL{count} // 0)),
         reader_samples     => ($reader{samples} // 0),
         reader_zero_byte   => ($reader{zero_byte} // 0),
@@ -473,8 +475,22 @@ SKIP: {
     skip("Phase A did not reap cleanly within its ${PHASE_A_OUTER_WATCHDOG}s watchdog (possible environment stall) — degraded per B51", 14)
         if $phaseA_timed_out;
 
-    ok($phaseA{writes_total} >= 500,
-        "B44/AC17/AC18: writers completed >=500 writes in total (got $phaseA{writes_total})");
+    # Decision #8's threshold is a DISJUNCTION — "≥2 writers doing claude's
+    # read-modify-write of the shared config concurrently for **≥10s OR ≥500
+    # total writes**, with a concurrent reader" — and the writer loop stops on
+    # whichever arm fires first. Asserting ≥500 writes unconditionally turned
+    # that OR into an AND: on a busier host the 10s arm fires first and the
+    # gate fails at e.g. 478 writes even though the mandated threshold was
+    # fully met (observed 2026-07-28: 478 writes, every corruption/lock/rename
+    # assertion green). A gate that goes red on host load is the same
+    # flaky-oracle defect Amendment 1 fixed for the zero-byte counter.
+    # Both arms are honoured here, with a floor that keeps the s01
+    # harness-honesty lesson intact: a no-op harness (0-2 writes) still fails,
+    # and the per-writer "≥1 confirmed write" assertions below are unchanged.
+    my $sustained = ($phaseA{wall} >= $PHASE_A_WALL_TARGET && $phaseA{writes_total} >= 100);
+    ok($phaseA{writes_total} >= 500 || $sustained,
+        sprintf('B44/AC17/AC18: Decision #8 threshold met — %d writes in %ds (needs >=500 writes OR >=%ds sustained with >=100 writes)',
+                $phaseA{writes_total}, $phaseA{wall}, $PHASE_A_WALL_TARGET));
     ok($phaseA{reader_samples} >= 500,
         "B44/AC17: reader took >=500 samples (got $phaseA{reader_samples})");
     # --- The corruption oracle. See probe-02-9p-transient-zero-read.md ------
