@@ -18,10 +18,10 @@
 #     ends in '1;'. It is required by bp-orchestrator.pl exactly the way
 #     bp-judge.pl is, and is independently loadable/testable on its own.
 #   - the ONLY dependency is JSON::PP. No shelling out of any kind: no system,
-#     no exec, no backticks, no qx (spelled without parentheses on purpose --
-#     AC-28 scans this file for those tokens followed by an open paren), no
-#     piped open() — b07 authors ledgers for a coordinator to execute; it never
-#     runs git, a build, or bp-deps-check.pl itself (D11).
+#     no exec, no backticks, no q-x-word-boundary-form (AC-28 scans this file
+#     statically for those tokens), no piped open() — b07 authors ledgers for a
+#     coordinator to execute; it never runs git, a build, or bp-deps-check.pl
+#     itself (D11).
 #
 # require: require "<path>/bp-remediate.pl"; BpRemediate::plan(...)
 
