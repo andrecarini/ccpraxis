@@ -55,9 +55,17 @@ require "$DIR/bp-log.pl";
 require "$DIR/bp-http.pl";
 require "$DIR/bp-token-keeper.pl";
 require "$DIR/bp-judge.pl";
+require "$DIR/bp-remediate.pl";    # b07: auto-remediation engine (pure decision core)
+require "$DIR/bp-checkpoint.pl";   # b02: durable WIP checkpoint commits
 
 our $USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
 our $USER_AGENT = $ENV{BP_USER_AGENT} // 'claude-code/2.1.170';
+
+# Exec-not-found sentinel context: set ONLY by the DEFAULT launch closure, to the
+# $! of a system() that returned -1 (the child could not be exec'd at all). An
+# injected launch closure (tests/simulation) never sets it, so the broken-env
+# decision falls back to a documented literal. Cleared at the start of every run().
+our $LAST_EXEC_ERROR;
 
 # ===========================================================================
 # PURE DECISIONS  (no I/O, no globals — unit-tested in t/06-orchestrator.t)
@@ -169,6 +177,93 @@ sub watchdog_verdict {
     return ($att < $cap) ? 'relaunch' : 'block';
 }
 
+# --- terminal-event classification. A coordinator that hits --max-turns exits 1
+# and its LAST jsonl line is a result object with subtype 'error_max_turns' /
+# terminal_reason 'max_turns' — indistinguishable from a crash by exit code alone.
+# Total over ANY input (undef, a scalar, an arrayref); never dies. The four keys
+# are always present so callers can read them unconditionally.
+sub terminal_verdict {
+    my ($obj) = @_;
+    my %v = (verdict => 'unknown', subtype => undef, num_turns => undef, session_id => undef);
+    return \%v unless ref $obj eq 'HASH';
+    return \%v unless (defined $obj->{type} && !ref $obj->{type} && $obj->{type} eq 'result');
+    $v{subtype}    = $obj->{subtype}    if defined $obj->{subtype}    && !ref $obj->{subtype};
+    $v{num_turns}  = $obj->{num_turns}  if defined $obj->{num_turns}  && !ref $obj->{num_turns};
+    $v{session_id} = $obj->{session_id} if defined $obj->{session_id} && !ref $obj->{session_id};
+    my $st = (defined $obj->{subtype}         && !ref $obj->{subtype})         ? $obj->{subtype}         : '';
+    my $tr = (defined $obj->{terminal_reason} && !ref $obj->{terminal_reason}) ? $obj->{terminal_reason} : '';
+    $v{verdict} = ($st eq 'error_max_turns' || $tr eq 'max_turns') ? 'max_turns'
+                : ($st eq 'success')                               ? 'success'
+                :                                                    'error';
+    return \%v;
+}
+
+# --- did the package make SEMANTIC progress since the snapshot taken at launch?
+# Deliberately NOT jsonl growth (a max-turns run always appends lines, so growth
+# would make every exhaustion look productive) and NOT a ledger mtime bump (a
+# no-op ledger rewrite touches it). Only: the status advanced, or at least one
+# more pipeline checkbox got ticked. A DECREASE is not progress (strict >).
+sub snapshot_progressed {
+    my ($snap, $cur) = @_;
+    return 0 unless ref $snap eq 'HASH' && ref $cur eq 'HASH';    # no snapshot => cannot prove progress
+    return 1 if ($cur->{status} // '') ne ($snap->{status} // '');
+    return 1 if ($cur->{checkboxes} // 0) > ($snap->{checkboxes} // 0);
+    return 0;
+}
+
+# --- b02: did the package's LEDGER move in a way worth a WIP checkpoint since
+# the previous tick's snapshot? Everything snapshot_progressed calls progress,
+# plus a ledger rewrite (the `## Decisions & attempt log` lives in the same
+# file, so "the attempt log grew" is observed as an mtime bump).
+# jsonl_size is deliberately NOT compared: the coordinator's stream log grows on
+# essentially every turn, so including it would make every tick "meaningful" and
+# produce a commit every watch tick (same rationale as :199-203).
+sub checkpoint_advanced {
+    my ($prev, $cur) = @_;
+    return 0 unless ref $prev eq 'HASH' && ref $cur eq 'HASH';   # no baseline => cannot prove an advance
+    return 1 if snapshot_progressed($prev, $cur);
+    return 1 if ($cur->{ledger_mtime} // 0) > ($prev->{ledger_mtime} // 0);
+    return 0;
+}
+
+# --- absolute ceiling on any turn budget this script will ever hand to
+# `claude -p --max-turns`. The per-package 2x ceiling is anchored on the AUTHOR's
+# intent, which comes off disk (ledger frontmatter `max_turns`, runs/.tunables
+# `default_max_turns`, $BP_DEFAULT_MAX_TURNS) — all three are attacker- or
+# fat-finger-reachable. A `{"default_max_turns": 99999999}` would otherwise
+# propagate initial -> widen -> `--max-turns 149999998`: one unbounded-cost
+# session, no relaunch needed, no cap in the loop to stop it. This is the last
+# line of defence, applied AFTER every other clamp so nothing can out-rank it.
+# Far above every realistic budget (defaults are 80-120), so it never binds in
+# normal operation — it only truncates the absurd.
+our $MAX_TURNS_CEILING = 1000;
+
+# --- adaptive turn budget: 1.5x per productive exhaustion, capped at 2x the
+# author's intent, never shrinking. int() truncates (all values positive => floor).
+sub widen_max_turns {
+    my ($current, $initial) = @_;
+    $current = 0 + ($current // 0);
+    $initial = 0 + (defined $initial ? $initial : $current);
+    my $next = int(1.5 * $current);
+    my $ceil = 2 * $initial;
+    $next = $ceil    if $next > $ceil;
+    $next = $current if $next < $current;
+    # Hard ceiling LAST: it must beat "never shrinks below current" too, because a
+    # $current read back from a poisoned registry is exactly the hostile input.
+    $next = $MAX_TURNS_CEILING if $next > $MAX_TURNS_CEILING;
+    return $next;
+}
+
+# --- give-up cap isolation: bp-launch.sh bumps `attempt` on EVERY launch, incl.
+# orchestrator-granted turn continuations. Subtract the continuations we granted
+# at the watchdog call site so a productive package isn't blocked for being
+# continued (watchdog_verdict itself stays pure and unchanged).
+sub effective_attempts {
+    my ($attempts, $turn_continuations) = @_;
+    my $n = ($attempts // 0) - ($turn_continuations // 0);
+    return $n < 0 ? 0 : $n;
+}
+
 # --- warm-resume vs cold-start economics (mirrors bp-resume-sweep.sh): warm only
 # within the threshold of the last ledger touch AND with a known session id.
 sub resume_mode {
@@ -205,6 +300,23 @@ sub usage_decision {
         };
     }
     return { action => 'ok', cadence => $cadence, util => { five => $u5, seven => $u7 } };
+}
+
+# --- b03: seconds until the next usage re-poll while a creds episode persists.
+#   $n = ordinal of the consecutive creds-failed usage poll (1 = the first).
+# Each knob resolves as $t->{k} // $ENV{BP_...} // pinned default, so a tunables
+# HASH injected by a pre-existing test (t/08 base_tunables, t/11, t/21) that has
+# none of these keys still gets the pinned defaults (spec §5.9).
+# creds_backoff_secs(n) = min(base * mult^(n-1), max); n<=0/undef treated as 1.
+sub creds_backoff_secs {
+    my ($n, $t) = @_;
+    $t ||= {};
+    my $base = $t->{creds_bo_base} // $ENV{BP_CREDS_BACKOFF_BASE_SECS} // 60;
+    my $mult = $t->{creds_bo_mult} // $ENV{BP_CREDS_BACKOFF_MULT}      // 2;
+    my $max  = $t->{creds_bo_max}  // $ENV{BP_CREDS_BACKOFF_MAX_SECS}  // 1800;
+    $n = 1 if !defined $n || $n < 1;
+    my $s = $base; $s *= $mult for 2 .. $n;
+    return $s > $max ? $max : $s;
 }
 
 # --- pause payload (Decision #12 contract: epoch resets_at + jittered relaunch).
@@ -295,6 +407,15 @@ sub run_complete {
     my ($c) = @_;
     return 0 if $c->{any_running} || $c->{outstanding} || $c->{resume_pending} || $c->{paused};
     return 0 if $c->{awaiting_human};
+    # b05: an un-remediated characterizable conformance failure (or a conformance
+    # judge still in flight) keeps the run open. Caller-computed flag ONLY — this sub
+    # stays pure so it remains unit-testable; see conformance_outstanding().
+    return 0 if $c->{conformance_outstanding};
+    # b07: a queued/awaiting_verify remediation entry keeps the run open exactly
+    # like conformance_outstanding above. An ESCALATED entry does NOT hold the
+    # run open — the human is now the blocking dependency and the decision is
+    # already on disk (Decision #20); see remediation_outstanding().
+    return 0 if $c->{remediation_outstanding};
     return 1;
 }
 
@@ -390,6 +511,101 @@ sub read_registry {
     return (ref $r eq 'HASH' && ref $r->{packages} eq 'HASH') ? $r->{packages} : {};
 }
 
+# --- last NON-EMPTY line of a file, read seek-from-end so a multi-GB coordinator
+# stream is never slurped into one scalar. undef on missing/empty/all-blank.
+our $MAX_JSONL_LINE = 1_048_576;      # hard cap on the terminal line we will hold/decode
+
+sub _last_nonempty_line {
+    my ($f) = @_;
+    open my $fh, '<:raw', $f or return undef;
+    my $size = (stat($fh))[7];
+    unless (defined $size && $size > 0) { close $fh; return undef; }
+    my $CHUNK = 65536;
+    my $pos   = $size;
+    my $tail  = '';           # always a suffix of the file
+    my $found;
+    while ($pos > 0) {
+        my $len = $pos < $CHUNK ? $pos : $CHUNK;
+        $pos -= $len;
+        last unless seek($fh, $pos, 0);
+        my $data = '';
+        my $got  = read($fh, $data, $len);
+        last unless defined $got && $got > 0;
+        $tail = $data . $tail;
+        my @lines = split /\n/, $tail, -1;
+        my $lo = $pos > 0 ? 1 : 0;        # element 0 may be a partial line
+        for (my $i = $#lines; $i >= $lo; $i--) {
+            next unless $lines[$i] =~ /\S/;
+            $found = $lines[$i];
+            last;
+        }
+        last if defined $found;
+        $tail = $lo ? $lines[0] : '';
+        # One pathological line (a coordinator that dumped a payload without a
+        # newline) would otherwise pull the whole file into memory — and then
+        # JSON-decode it once per dead package per tick. Give up instead.
+        last if length($tail) > $MAX_JSONL_LINE;
+    }
+    close $fh;
+    return $found;
+}
+
+# --- the JSON-decoded last non-empty line of runs/<pkg>.jsonl (the coordinator's
+# TERMINAL event), or undef when the file is missing/empty/all-blank/truncated or
+# the last line isn't a JSON object. NOTE: `type` is NOT the first key on that
+# line, so the line MUST be decoded — a prefix/regex grep would never match.
+sub _last_jsonl_obj {
+    my ($runs, $pkg) = @_;
+    my $line = _last_nonempty_line("$runs/$pkg.jsonl");
+    return undef unless defined $line && $line =~ /\S/;
+    return undef if length($line) > $MAX_JSONL_LINE;   # never decode an unbounded line
+    my $obj = eval { JSON::PP->new->decode($line) };
+    return (ref $obj eq 'HASH') ? $obj : undef;
+}
+
+# --- ticked pipeline checkboxes in a ledger BODY (frontmatter excluded). The
+# human-meaningful unit of within-attempt progress. Unreadable ledger -> 0.
+sub ledger_checkboxes {
+    my ($bpdir, $pkg) = @_;
+    my $txt = _read_file("$bpdir/packages/$pkg.md");
+    return 0 unless defined $txt;
+    $txt =~ s/\A---\s*\n.*?\n---//s;          # drop frontmatter; count the body only
+    my $n = 0;
+    for my $ln (split /\n/, $txt) { $n++ if $ln =~ /^\s*-\s*\[[xX]\]/ }
+    return $n;
+}
+
+# --- the progress baseline captured immediately BEFORE a launch. status +
+# checkboxes are the progress signal (snapshot_progressed); jsonl_size and
+# ledger_mtime are recorded for the decision context only (see §2.3).
+sub launch_snapshot {
+    my ($bpdir, $runs, $pkg, $now) = @_;
+    my ($sz) = jsonl_stat($runs, $pkg);
+    my @st = stat("$bpdir/packages/$pkg.md");
+    return {
+        status       => (ledger_fm($bpdir, $pkg, 'status') // ''),
+        checkboxes   => ledger_checkboxes($bpdir, $pkg),
+        jsonl_size   => ($sz // 0),
+        ledger_mtime => (@st ? $st[9] : 0),
+        at           => ($now // time),
+    };
+}
+
+# --- the package author's turn budget (ledger frontmatter = intent), else the
+# tunable/env default. The 2x ceiling in widen_max_turns is anchored on THIS, so
+# it stays stable however many continuations were granted.
+sub initial_max_turns {
+    my ($bpdir, $pkg, $t) = @_;
+    # Every source below is off-disk and untrusted, so each accepted value is
+    # clamped to $MAX_TURNS_CEILING (see widen_max_turns): the anchor can never
+    # be absurd, hence neither can 2x the anchor.
+    my $fm = ledger_fm($bpdir, $pkg, 'max_turns');
+    return _clamp_turns($fm + 0) if defined $fm && $fm =~ /^\d+$/ && $fm > 0;
+    my $d = (ref $t eq 'HASH' ? $t->{default_max_turns} : undef) // $ENV{BP_DEFAULT_MAX_TURNS} // 80;
+    return (defined $d && !ref $d && $d =~ /^\d+$/ && $d > 0) ? _clamp_turns($d + 0) : 80;
+}
+sub _clamp_turns { my ($n) = @_; return $n > $MAX_TURNS_CEILING ? $MAX_TURNS_CEILING : $n; }
+
 sub jsonl_stat {
     my ($runs, $pkg) = @_;
     my @st = stat("$runs/$pkg.jsonl");
@@ -420,6 +636,10 @@ sub pid_alive {
 sub kill_pid {
     my ($pid) = @_;
     return unless defined $pid && $pid =~ /^\d+$/ && $pid > 0;
+    # The pid comes off disk and may be stale, forged, or recycled. `kill -1` (pid 1)
+    # signals EVERY process the uid can reach; our own pid or our own pgroup would
+    # take the orchestrator down with the coordinator. Never signal those.
+    return if $pid <= 1 || $pid == $$ || $pid == getpgrp();
     eval { kill 'TERM', -$pid; 1 } or eval { kill 'TERM', $pid; 1 };
     eval { kill 'KILL', -$pid; 1 } or eval { kill 'KILL', $pid; 1 };
 }
@@ -432,23 +652,70 @@ sub read_paused {
     my $d = _read_json($p);
     return (ref $d eq 'HASH') ? $d : { reason => 'unknown', manual => 1 };
 }
+# --- shared failure path for the two ESCALATION writers below (write_paused,
+# queue_needs_you). They must never `die`: they are called precisely when the
+# environment is already suspect (broken-env trip, telemetry loss) — a read-only,
+# full, or badly-mounted runs/ is the expected input, not a surprise. Dying here
+# is caught by the loop's outer eval and re-thrown, killing the orchestrator with
+# NO .paused written and NO decision filed: the fleet stops silently, the worst
+# possible outcome for an escalation path. Returning 0 keeps the loop alive so the
+# next tick can retry (a transient ENOSPC/EROFS may clear) and so the remaining
+# escalation steps still run. Callers use these in void context; the only
+# return-value consumer wants queue_needs_you's path on SUCCESS, which is
+# unchanged, and 0 is reliably false for a failed write.
+sub _escalation_write_failed {
+    my ($runs, $writer, $path, $err) = @_;
+    # BpLog::event writes into runs/ and dies on failure — i.e. the very condition
+    # being reported may also break the report. Guard it, and fall back to STDERR
+    # so a broken runs/ still leaves a trace somewhere.
+    my $detail = defined $err && length "$err" ? "$err" : 'unknown error';
+    eval {
+        _log("$runs/orchestrator.log", 'escalation_write_failed',
+             { writer => $writer, path => $path, error => $detail,
+               detail => 'escalation write failed — loop continues, will retry next tick' });
+        1;
+    } or warn "bp-orchestrator: $writer failed for $path: $detail (orchestrator.log unwritable too)\n";
+    return 0;
+}
+
+# Returns 1 on success, 0 on any write/rename failure (never dies — see above).
 sub write_paused {
     my ($runs, $rec) = @_;
     # atomic: temp + rename, so a crash mid-write can never leave a truncated
     # .paused that would read back as a stuck "unknown" manual pause.
     my $tmp = "$runs/.paused.tmp.$$";
-    open my $fh, '>', $tmp or die "bp-orchestrator: write .paused: $!";
-    print $fh JSON::PP->new->canonical->encode($rec);
-    close $fh;
-    rename $tmp, "$runs/.paused" or die "bp-orchestrator: rename .paused: $!";
+    open my $fh, '>', $tmp
+        or return _escalation_write_failed($runs, 'write_paused', $tmp, $!);
+    unless (print $fh JSON::PP->new->canonical->encode($rec)) {
+        my $e = $!; close $fh; unlink $tmp;
+        return _escalation_write_failed($runs, 'write_paused', $tmp, $e);
+    }
+    # close can be the first place a full filesystem reports ENOSPC.
+    unless (close $fh) {
+        my $e = $!; unlink $tmp;
+        return _escalation_write_failed($runs, 'write_paused', $tmp, $e);
+    }
+    unless (rename $tmp, "$runs/.paused") {
+        my $e = $!; unlink $tmp;
+        return _escalation_write_failed($runs, 'write_paused(rename)', "$runs/.paused", $e);
+    }
+    return 1;
 }
 sub clear_pause { my ($runs) = @_; unlink "$runs/.paused"; }
 
 # --- runs/needs-you/<pkg>--<shortid>.json (decision queue; A3 owns the schema).
+# Returns the decision file path on success (existing one when deduped), 0 on any
+# mkdir/write/rename failure (never dies — see _escalation_write_failed).
 sub queue_needs_you {
     my ($runs, $rec) = @_;
     my $dir = "$runs/needs-you";
-    require File::Path; File::Path::make_path($dir) unless -d $dir;
+    # make_path croaks on failure (read-only / full runs/) — never let that escape.
+    unless (-d $dir) {
+        require File::Path;
+        eval { File::Path::make_path($dir); 1 }
+            or return _escalation_write_failed($runs, 'queue_needs_you(mkdir)', $dir, ($@ || $!));
+        return _escalation_write_failed($runs, 'queue_needs_you(mkdir)', $dir, $!) unless -d $dir;
+    }
     # dedupe: don't re-queue the same package+kind every tick.
     if (opendir my $dh, $dir) {
         for my $f (grep { /\.json$/ } readdir $dh) {
@@ -470,10 +737,20 @@ sub queue_needs_you {
     # atomic on both POSIX and Windows. Matches the temp+rename discipline every
     # other writer here uses (ledgers, registry, judge verdicts).
     my $tmp = "$file.tmp.$$";
-    open my $fh, '>', $tmp or die "bp-orchestrator: queue needs-you: $!";
-    print $fh JSON::PP->new->canonical->pretty->encode($rec);
-    close $fh;
-    rename $tmp, $file or do { unlink $tmp; die "bp-orchestrator: queue needs-you rename: $!"; };
+    open my $fh, '>', $tmp
+        or return _escalation_write_failed($runs, 'queue_needs_you', $tmp, $!);
+    unless (print $fh JSON::PP->new->canonical->pretty->encode($rec)) {
+        my $e = $!; close $fh; unlink $tmp;
+        return _escalation_write_failed($runs, 'queue_needs_you', $tmp, $e);
+    }
+    unless (close $fh) {
+        my $e = $!; unlink $tmp;
+        return _escalation_write_failed($runs, 'queue_needs_you', $tmp, $e);
+    }
+    unless (rename $tmp, $file) {
+        my $e = $!; unlink $tmp;
+        return _escalation_write_failed($runs, 'queue_needs_you(rename)', $file, $e);
+    }
     return $file;
 }
 
@@ -523,6 +800,23 @@ sub update_registry_pkg {
     }
     flock($lk, LOCK_UN); close $lk;
     return $ok;
+}
+
+# update_registry_pkg + an honest log line when the merge was LOST (H1): the tick
+# continues (worst case one continuation is re-granted or a streak increment is
+# dropped next tick) but the loss is never silent.
+sub _upd_pkg {
+    my ($runs, $log, $pkg, $fields) = @_;
+    return 1 if update_registry_pkg($runs, $pkg, $fields);
+    _log($log, 'registry_update_lost', { package => $pkg, fields => join(',', sort keys %$fields) });
+    return 0;
+}
+
+# a registry integer field that survived hand-editing / type drift, else undef.
+sub _reg_int {
+    my ($v) = @_;
+    return undef unless defined $v && !ref $v && $v =~ /^\d+$/ && $v > 0;
+    return $v + 0;
 }
 
 # --- judge verdicts (A5): each judge is a detached process that writes a verdict
@@ -610,8 +904,12 @@ sub fetch_usage {
     my ($args) = @_;
     my $get = $args->{http_get} || \&_real_http_get;
     my $log = $args->{log_path};
+    my $quiet_creds = $args->{quiet_creds_error} // 0;
     my $data = _read_json($args->{creds_path});
-    unless ($data) { _log($log, 'creds_error', { detail => 'unreadable or invalid JSON' }); return { action => 'pause-creds' }; }
+    unless ($data) {
+        _log($log, 'creds_error', { detail => 'unreadable or invalid JSON' }) unless $quiet_creds;
+        return { action => 'pause-creds' };
+    }
     my ($cok, $cprob) = BpContract::validate_creds($data);
     unless ($cok) { _log($log, 'creds_drift', { problems => $cprob }); return { action => 'pause-contract', problems => $cprob }; }
     my $tok = $data->{claudeAiOauth}{accessToken};
@@ -640,11 +938,59 @@ sub fetch_usage {
 
 sub _log { my ($p, $t, $f) = @_; return unless defined $p; BpLog::event($p, $t, $f); }
 
+# b02: the project checkout a blueprint dir belongs to, or undef.
+# <project>/.ccpraxis-local-data/blueprints/<bp> -> <project>. Used as the
+# checkpoint root hint so a commit target never depends on the inherited cwd.
+sub _project_root_of {
+    my ($bpdir) = @_;
+    return undef unless defined $bpdir && !ref $bpdir && length $bpdir;
+    my $d = abs_path($bpdir) // $bpdir;
+    my %seen;
+    while (length $d && !$seen{$d}++) {
+        return $d if -d "$d/.ccpraxis-local-data";
+        my $parent = dirname($d);
+        last if $parent eq $d;                     # filesystem / drive root
+        $d = $parent;
+    }
+    return undef;
+}
+
+# b02: a log `detail` is one trimmed line of at most 200 chars — git output and
+# $@ are both multi-line, and the log is one JSON record per line.
+sub _oneline {
+    my ($txt) = @_;
+    return undef unless defined $txt && !ref $txt;
+    my ($line) = grep { /\S/ } split /\n/, $txt;
+    return undef unless defined $line;
+    $line =~ s/\A\s+//; $line =~ s/\s+\z//;
+    return length($line) > 200 ? substr($line, 0, 200) : $line;
+}
+
 # ===========================================================================
 # THE LOOP
 # ===========================================================================
 
+# Base = env/defaults (unchanged). Then, when a runs dir (or an explicit file) is
+# given, overlay the WHITELISTED keys from runs/.tunables so a live run can be
+# retuned without a restart. Unparseable / non-object / out-of-range values are
+# ignored silently — the overlay can never crash or wedge a tick (§2.6).
+# Back-compatible with the zero-arg call: _tunables() reads no file at all.
 sub _tunables {
+    my ($runs, $file) = @_;
+    my $t = _tunables_base();
+    my $path = defined $file ? $file : (defined $runs ? "$runs/.tunables" : undef);
+    return $t unless defined $path;
+    my $ov = _read_json($path);                  # undef on missing/unparseable; never dies
+    return $t unless ref $ov eq 'HASH';
+    for my $k (qw(max_par default_max_turns)) {  # the whitelist IS the contract (§10)
+        my $v = $ov->{$k};
+        next unless defined $v && !ref $v && $v =~ /^\d+$/ && $v > 0;
+        $t->{$k} = $v + 0;
+    }
+    return $t;
+}
+
+sub _tunables_base {
     return {
         ceil5      => $ENV{BP_CEIL_5H}            // 85,
         ceil7      => $ENV{BP_CEIL_7D}            // 90,
@@ -667,6 +1013,16 @@ sub _tunables {
         judge_to   => $ENV{BP_JUDGE_TIMEOUT_SECS} // 1800,     # A5: crashed/hung-judge fail-safe
         judge_spawn_cap => $ENV{BP_JUDGE_SPAWN_CAP} // 3,      # A5 H2: park after N harvest-spawn failures
         harvest_reaudit_cap => $ENV{BP_HARVEST_REAUDIT_CAP} // 2,  # #30: re-audit (not reopen) a done pkg whose harvest didn't complete, up to N times
+        conformance_spawn_cap => $ENV{BP_CONFORMANCE_SPAWN_CAP} // 2, # b05: whole-blueprint conformance gate firings per run
+        default_max_turns   => $ENV{BP_DEFAULT_MAX_TURNS}   // 80, # b01: turn budget when the ledger states none
+        broken_env_thresh   => $ENV{BP_BROKEN_ENV_THRESH}   // 3,  # b01: consecutive exec-not-found launches -> broken-env
+        turn_starved_thresh => $ENV{BP_TURN_STARVED_THRESH} // 3,  # b01: consecutive fruitless turn exhaustions -> turn-starved
+        ckpt_int            => $ENV{BP_CHECKPOINT_INTERVAL} // 300, # b02: seconds between periodic WIP checkpoints
+        creds_bo_base => $ENV{BP_CREDS_BACKOFF_BASE_SECS} // 60,   # b03: 1st creds re-poll delay
+        creds_bo_mult => $ENV{BP_CREDS_BACKOFF_MULT}      // 2,    # b03: geometric factor
+        creds_bo_max  => $ENV{BP_CREDS_BACKOFF_MAX_SECS}  // 1800, # b03: ceiling
+        remediation_rounds => $ENV{BP_REMEDIATION_ROUNDS} // 2,    # b07: per-finding round budget (Decision #21)
+        remediation_cap    => $ENV{BP_REMEDIATION_CAP}    // 6,    # b07: global rounds opened per run (SYN-7)
     };
 }
 
@@ -695,18 +1051,43 @@ sub run {
     require File::Path; File::Path::make_path($runs) unless -d $runs;
     my $log   = "$runs/orchestrator.log";
     my $creds = $opt->{creds_path} // (($ENV{HOME} // '') . '/.claude/.credentials.json');
-    my $t     = $opt->{tunables} || _tunables();
+    # An INJECTED tunables hash wins entirely: runs/.tunables is then never read,
+    # and the injected literal is frozen for the whole run (§2.6).
+    my $t     = $opt->{tunables} || _tunables($runs, $opt->{tunables_file});
     my $now_fn   = $opt->{now}      || sub { time };
     my $sleep_fn = $opt->{sleep}    || sub { select(undef, undef, undef, $_[0]) };
     my $http_get  = $opt->{http_get};
     my $http_post = $opt->{http_post};
 
     # launch seam: default = bp-launch.sh; tests inject a recorder.
+    $LAST_EXEC_ERROR = undef;      # only the DEFAULT closure below ever sets it
     my $launch = $opt->{launch} || sub {
         my ($a) = @_;
+        # The likeliest broken environment is a missing/unmounted/unreadable
+        # bp-launch.sh — and that does NOT give system() == -1: bash execs fine
+        # and exits 127. Probe the script first so the plugin-dir-not-mounted
+        # case reaches the broken-env trip instead of thrashing forever.
+        unless (-r "$DIR/bp-launch.sh") {
+            $LAST_EXEC_ERROR = "bp-launch.sh not found/readable at $DIR";
+            return -1;
+        }
         my @cmd = ('bash', "$DIR/bp-launch.sh", $bp, $a->{pkg}, @{ $a->{args} || [] });
         my $rc = system(@cmd);
-        return $rc == 0 ? 0 : ($rc >> 8 || 1);
+        # system() returns -1 when the child could not be EXEC'd at all (no bash,
+        # no bp-launch.sh, bad mount). -1 >> 8 is 72057594037927935 in Perl, so the
+        # sentinel MUST be returned before any shift — otherwise a broken run
+        # environment is logged as a garbage rc and relaunched forever.
+        if ($rc == -1) { $LAST_EXEC_ERROR = "$!"; return -1; }
+        my $ec = $rc >> 8;
+        # 127 = command not found, 126 = found but not executable. bp-launch.sh
+        # itself never exits either, so these are the shell reporting that the
+        # script could not be run at all — same class of failure as -1.
+        if ($ec == 126 || $ec == 127) {
+            $LAST_EXEC_ERROR = "bp-launch.sh could not be executed (shell exit $ec)";
+            return -1;
+        }
+        $LAST_EXEC_ERROR = undef;
+        return $rc == 0 ? 0 : ($ec || 1);
     };
 
     # judge seams (A5): spawn a detached judge (default = bp-judge.sh, which runs a
@@ -721,10 +1102,45 @@ sub run {
         return $rc == 0 ? 0 : ($rc >> 8 || 1);
     };
     my $read_verdict = $opt->{read_verdict} || sub { my ($k, $p) = @_; read_judge_verdict($runs, $k, $p) };
+    # b05 build-runner seam: the conformance gate captures a real build/test signal
+    # once per firing. Tests inject a mock; NO real build ever runs under `prove`.
+    # Absent (no command configured) => the gate records build.ran=false and judges
+    # conformance on the mandated-means evidence alone.
+    my $build_runner = exists $opt->{build_runner} ? $opt->{build_runner}
+                     : ($t->{conformance_build_cmd} ? sub {
+                           my ($s) = @_;
+                           my @cmd = @{ $s->{cmd} && @{ $s->{cmd} } ? $s->{cmd} : $t->{conformance_build_cmd} };
+                           my $rc = system(@cmd);
+                           return { ok => ($rc == 0 ? 1 : 0), exit => ($rc >> 8), stdout => '', stderr => '' };
+                       } : undef);
     # pid-liveness seam: default = the real kill-0 check; the simulation harness (A6)
     # injects a scripted one so alive/progressing and alive/wedged coordinator paths
     # can be driven through the real loop (not just the dead-pid path).
     my $pid_alive = $opt->{pid_alive} || \&pid_alive;
+    # checkpoint seam (b02): make one WIP commit of a live package's write set.
+    # The repo root is resolved ONCE per run(), lazily — the first checkpoint is
+    # at least one interval away, and a run that never checkpoints never pays for
+    # it. $opt->{project_root} is the test seam; a wrong root degrades to
+    # 'not-a-repo' (one logged failure per package per interval), never a fatal.
+    #
+    # The hint below $opt->{project_root} is DERIVED FROM $bpdir, not from cwd.
+    # In production nothing sets project_root and bp-orchestrate.sh does not
+    # export BP_PROJECT_ROOT, so resolve_root would otherwise fall through to
+    # `git rev-parse --show-toplevel` run from whatever cwd this detached process
+    # inherited — and this root is a COMMIT TARGET, not a read. $bpdir is
+    # <project>/.ccpraxis-local-data/blueprints/<name> by construction, so
+    # walking it up to the ancestor that holds .ccpraxis-local-data names the
+    # right checkout deterministically. No such ancestor (a temp-dir fixture) =>
+    # undef => the §2.3 chain is used exactly as before.
+    my $ckpt_root;
+    my $checkpoint = $opt->{checkpoint} || sub {
+        my ($a) = @_;          # { pkg, write_set, status, step, now, trigger }
+        $ckpt_root = BpCheckpoint::resolve_root($opt->{project_root} // _project_root_of($bpdir))
+            unless defined $ckpt_root;
+        return BpCheckpoint::checkpoint({ root => $ckpt_root, pkg => $a->{pkg},
+            write_set => $a->{write_set}, status => $a->{status},
+            step => $a->{step}, now => $a->{now} });
+    };
 
     my $marker_fh = acquire_marker("$runs/.orchestrator");
     unless ($marker_fh) {
@@ -739,25 +1155,96 @@ sub run {
     local $SIG{INT}  = sub { $STOP = 1 };
 
     my %seen;            # pkg => {size,mtime} prior jsonl observation
+    # b02 checkpoint bookkeeping: pkg => { at => epoch of the last observation,
+    # snap => the launch_snapshot taken then }. LOOP-SCOPE on purpose, mirroring
+    # %seen and b01's $exec_fail_streak: no registry schema, no per-tick writes,
+    # and the durability given up is worth little (after a restart the periodic
+    # floor simply re-seeds — bounded by one interval).
+    my %ckpt;
+    # pkg => 1 once its unusable write_set has been reported (see the CHECKPOINT
+    # section): a package that can never be checkpointed says so once, not once
+    # per interval for the life of the run.
+    my %ckpt_warned;
     # judge in-flight + start-epoch state lives on disk (judge_inflight*), so nothing
     # to declare here — it survives an orchestrator restart (A5).
     my (@s5, @s7);       # usage utilization samples [[epoch,pct],...]
     my $next_usage  = 0; # poll immediately at launch (Decision #8: one probe)
     my $next_keeper = 0;
     my $tele_fail   = 0;
+    # b03: ONE creds episode = one creds_error + one pause line, then silence
+    # until the episode ends (creds_recovered) or the process restarts (§5.2).
+    # LOOP-SCOPE lexical, mirroring %seen/%ckpt/$tele_fail/$exec_fail_streak:
+    # no registry schema, no per-tick write (Decision #3).
+    my %creds_gate = ( armed => 0, polls => 0 );
+    # Called whenever a poller PROVES the creds file is readable (any action
+    # other than 'pause-creds' implies a successful read). Logs creds_recovered
+    # exactly once per armed episode, then resets the gate.
+    my $creds_ok = sub {
+        my ($now, $source) = @_;
+        if ($creds_gate{armed}) {
+            _log($log, 'creds_recovered', { at => $now, polls => $creds_gate{polls}, source => $source });
+            # b03 redteam MAJOR-4: the pause-creds arm can have parked
+            # $next_usage up to creds_bo_max (1800s) into the future (below,
+            # the `$next_usage = $now + creds_backoff_secs(...)` assignment).
+            # If the KEEPER is the poller that observes the recovery (a fast
+            # keeper_int can win that race), nothing else re-arms the usage
+            # cadence, so the usage poller stays parked with zero 5h/7d
+            # utilization telemetry for the rest of the backoff window --
+            # blinding usage_decision's ceil5/ceil7 guard. Un-park it here so
+            # a poll happens promptly after ANY recovery. Harmless for a
+            # usage-sourced recovery: the usage-poll block below overwrites
+            # $next_usage again two lines later regardless. This does NOT
+            # re-arm %creds_gate -- a recovery is not a creds failure.
+            $next_usage = $now;
+        }
+        %creds_gate = ( armed => 0, polls => 0 );
+    };
+    # CONSECUTIVE exec-not-found launches, fleet-wide, across all three launch
+    # sites. Loop-scope state, not registry (§5.1): the durable artifact of a trip
+    # is .paused + the deduped needs-you file, which a restarted orchestrator
+    # re-reads; a still-broken environment re-accumulates the streak in ~3
+    # attempts. Persisting it would mean a registry write on every launch.
+    my $exec_fail_streak = 0;
+    my %exec_counted;                 # packages already counted THIS tick
+    # One package can legitimately be attempted twice inside a single tick (a failed
+    # watchdog relaunch leaves it out of @live, so the fresh-launch path picks it up
+    # again). That is ONE package's launch failing, not two independent probes of the
+    # environment, so it contributes to the fleet-level streak once per tick — AC-6's
+    # "the streak reaches 3 from ONE -1 from each site". Any non-sentinel rc (a
+    # success or an ordinary non-zero exit) proves exec works and clears everything.
+    my $note_exec = sub {
+        my ($pkg, $rc) = @_;
+        if (defined $rc && $rc == -1) { $exec_fail_streak++ unless $exec_counted{$pkg}++; }
+        else { $exec_fail_streak = 0; %exec_counted = (); }
+    };
 
     my $err;
     eval {
         while (!$STOP) {
             my $now = $now_fn->();
             my $shutdown = -e "$runs/.shutdown" ? 1 : 0;
+            %exec_counted = ();       # the exec-failure dedupe is per tick
+
             my ($meta, $status, $att, $pid, $sid) = _load_state($bpdir, $runs);
+
+            # b07: per-tick DAG-append merge of runs/remediation-queue.json into
+            # %meta/%status (spec-08 §3.1, D1) — no orchestrator restart is ever
+            # needed for a new remediation package to be seen, and blueprint.md
+            # itself is NEVER mutated. $rq is threaded through the rest of THIS
+            # tick (incl. the conformance-gate ingestion sites below) so a
+            # same-tick ledger-status resync (queued -> awaiting_verify, done by
+            # BpRemediate::merge_queue) is visible to remediation_step without a
+            # second disk read.
+            my $rq = remediation_merge($bpdir, $runs, $meta, $status);
+            my $rem_outstanding = BpRemediate::remediation_outstanding($rq);
 
             # ---- TOKEN-KEEPER (runs even while paused, to keep the token alive) ----
             if ($now >= $next_keeper) {
-                my $k = BpKeeper::keeper_tick({ creds_path => $creds, now_ms => $now * 1000, log_path => $log, http_post => $http_post });
+                my $k = BpKeeper::keeper_tick({ creds_path => $creds, now_ms => $now * 1000, log_path => $log,
+                                                 http_post => $http_post, quiet_creds_error => $creds_gate{armed} });
                 my $act = $k->{action} // 'ok';
                 $next_keeper = $now + ($act eq 'backoff' ? $t->{keeper_bo} : $t->{keeper_int});
+                $creds_ok->($now, 'keeper') if $act ne 'pause-creds';
                 if ($act eq 'pause-floor') {
                     _enter_pause_manual($runs, $log, 'token-floor',
                         { package => '_fleet', blueprint => $bp, kind => 'reauth',
@@ -780,10 +1267,13 @@ sub run {
                                     . "/login expiry.",
                           context => ($k->{detail} // 'the sandbox refresh returned a 4xx'), created_at => $now });
                 } elsif ($act eq 'pause-contract' || $act eq 'pause-creds') {
+                    my $is_creds = ($act eq 'pause-creds');
                     _enter_pause_manual($runs, $log, "keeper-$act",
                         { package => '_fleet', blueprint => $bp, kind => 'contract-drift',
                           question => 'Credential/refresh contract drift — inspect before resuming.',
-                          context => JSON::PP->new->canonical->encode($k->{detail} // {}), created_at => $now });
+                          context => JSON::PP->new->canonical->encode($k->{detail} // {}), created_at => $now },
+                        ($is_creds ? { quiet_log => $creds_gate{armed} } : undef));
+                    $creds_gate{armed} = 1 if $is_creds;
                 }
             }
 
@@ -791,8 +1281,10 @@ sub run {
 
             # ---- USAGE POLL (burn-rate-adaptive cadence) ----
             if ($now >= $next_usage) {
-                my $u = fetch_usage({ creds_path => $creds, http_get => $http_get, log_path => $log });
+                my $u = fetch_usage({ creds_path => $creds, http_get => $http_get, log_path => $log,
+                                       quiet_creds_error => $creds_gate{armed} });
                 if (($u->{action} // '') eq 'ok') {
+                    $creds_ok->($now, 'usage');
                     $tele_fail = 0;
                     push @s5, [ $now, $u->{usage}{five_hour}{utilization} ];
                     push @s7, [ $now, $u->{usage}{seven_day}{utilization} ];
@@ -818,6 +1310,7 @@ sub run {
                         clear_pause($runs); $paused = undef;
                     }
                 } elsif (($u->{action} // '') eq 'unavailable') {
+                    $creds_ok->($now, 'usage');
                     $tele_fail++;
                     $next_usage = $now + $t->{usage_fail};
                     if ($tele_fail >= $t->{tele_retry} && !$paused) {
@@ -828,14 +1321,44 @@ sub run {
                     }
                 } else {
                     # pause-creds / pause-contract from fetch_usage
-                    $next_usage = $now + $t->{usage_fail};
-                    _enter_pause_manual($runs, $log, ($u->{action} // 'usage-fail'),
-                        { package => '_fleet', blueprint => $bp, kind => 'contract-drift',
-                          question => 'Credentials/usage contract problem — inspect before resuming.',
-                          context => join('; ', @{ $u->{problems} || [] }), created_at => $now });
+                    if ((($u->{action}) // '') eq 'pause-creds') {
+                        # b03: creds unreadable — the SAME suppressible episode
+                        # as the keeper's pause-creds (Decision #2: one class).
+                        # Back the re-poll off through the pinned schedule
+                        # instead of a flat $t->{usage_fail}.
+                        $creds_gate{polls}++;
+                        $next_usage = $now + creds_backoff_secs($creds_gate{polls}, $t);
+                        _enter_pause_manual($runs, $log, ($u->{action} // 'usage-fail'),
+                            { package => '_fleet', blueprint => $bp, kind => 'contract-drift',
+                              question => 'Credentials/usage contract problem — inspect before resuming.',
+                              context => join('; ', @{ $u->{problems} || [] }), created_at => $now },
+                            { quiet_log => $creds_gate{armed} });
+                        $creds_gate{armed} = 1;
+                    } else {
+                        # pause-contract: the creds file WAS readable, so this is
+                        # not the creds episode — resets the gate (spec §5.5) and
+                        # is never suppressed.
+                        $creds_ok->($now, 'usage');
+                        $next_usage = $now + $t->{usage_fail};
+                        _enter_pause_manual($runs, $log, ($u->{action} // 'usage-fail'),
+                            { package => '_fleet', blueprint => $bp, kind => 'contract-drift',
+                              question => 'Credentials/usage contract problem — inspect before resuming.',
+                              context => join('; ', @{ $u->{problems} || [] }), created_at => $now });
+                    }
                     $paused = read_paused($runs);
                 }
             }
+
+            # ---- LIVE TUNABLES: re-read runs/.tunables every tick so max_par can
+            # be changed on a running fleet. Skipped entirely when a tunables hash
+            # was injected (tests/simulation) — injection wins (§2.6).
+            $t = _tunables($runs, $opt->{tunables_file}) unless $opt->{tunables};
+            # bp-launch.sh enforces its OWN cap from $BP_MAX_PARALLEL (default 2) and
+            # exits 3 above it. Without exporting the live value, a raised max_par
+            # gives extra orchestrator-side slots whose launches the shell then
+            # refuses every tick. `local` is scoped to this tick, so the next
+            # _tunables() re-read above still sees the operator's real environment.
+            local $ENV{BP_MAX_PARALLEL} = $t->{max_par} // 2;
 
             # ---- PAUSE GATING: maybe auto-resume; never launch while paused ----
             my $resume_pending = ($paused && !$paused->{manual}) ? 1 : 0;
@@ -1009,6 +1532,9 @@ sub run {
 
             # ---- WATCH + WATCHDOG (assess each non-terminal launched package) ----
             my @live;     # packages occupying a coordinator slot now
+            my %starved;  # packages parked as turn-starved THIS tick: the pause
+                          # gate stops launches from tick N+1, so hold them out of
+                          # this tick's launchable set too (§3 B8.4 "do not relaunch").
             for my $pkg (sort keys %$meta) {
                 next if _is_terminal($status->{$pkg});
                 next if defined judge_inflight($runs, 'resolve', $pkg);   # a resolve-judge is editing its ledger; hands off (A5)
@@ -1026,15 +1552,19 @@ sub run {
                     my $prev = $seen{$pkg};
                     my $prog = progress_verdict($sz, $mt, ($prev ? $prev->{size} : undef), $now, $t->{flat});
                     $seen{$pkg} = { size => ($sz // 0), mtime => ($mt // $now) };
-                    my $v = watchdog_verdict({ alive => 1, progress => $prog, attempts => $att->{$pkg}, cap => $t->{cap} });
+                    my $v = watchdog_verdict({ alive => 1, progress => $prog,
+                        attempts => effective_attempts($att->{$pkg}, _reg_int($reg->{$pkg}{turn_continuations}) // 0),
+                        cap => $t->{cap} });
                     if ($v eq 'none') {
                         push @live, $pkg;
                     } elsif ($v eq 'cold-relaunch') {
                         next if $shutdown;     # shutdown gate (A4) parks it; we don't relaunch
                         _log($log, 'watchdog_kill_wedged', { package => $pkg, pid => $pid->{$pkg}, attempts => $att->{$pkg} });
                         kill_pid($pid->{$pkg});
+                        my $snap = launch_snapshot($bpdir, $runs, $pkg, $now);
                         my $rc = $launch->({ pkg => $pkg, args => [], kind => 'cold-wedged' });
-                        if (defined $rc && $rc == 0) { push @live, $pkg; }
+                        $note_exec->($pkg, $rc);
+                        if (defined $rc && $rc == 0) { _upd_pkg($runs, $log, $pkg, { launch_snapshot => $snap }); push @live, $pkg; }
                         else { _log($log, 'launch_failed', { package => $pkg, kind => 'cold-wedged', rc => $rc }); }
                     } elsif ($v eq 'block') {
                         _log($log, 'watchdog_block', { package => $pkg, reason => 'wedged past attempt cap', attempts => $att->{$pkg} });
@@ -1045,16 +1575,105 @@ sub run {
                     }
                 } else {
                     next if $shutdown;          # don't relaunch during a graceful-shutdown-all
-                    my $v = watchdog_verdict({ alive => 0, attempts => $att->{$pkg}, cap => $t->{cap} });
+                    # A coordinator that exhausted its turn budget exits 1 exactly
+                    # like a crash — only its TERMINAL jsonl event tells them apart.
+                    # Classify first so a productive package is continued with a
+                    # wider budget instead of burning the give-up cap (§3 B6-B9).
+                    my $tv = terminal_verdict(_last_jsonl_obj($runs, $pkg));
+                    if ($tv->{verdict} eq 'success' && (_reg_int($reg->{$pkg}{turn_exhaust_streak}) // 0)) {
+                        _upd_pkg($runs, $log, $pkg, { turn_exhaust_streak => 0 });   # B9b
+                        $reg->{$pkg}{turn_exhaust_streak} = 0;
+                    }
+                    my $v = watchdog_verdict({ alive => 0,
+                        attempts => effective_attempts($att->{$pkg}, _reg_int($reg->{$pkg}{turn_continuations}) // 0),
+                        cap => $t->{cap} });
                     if ($v eq 'relaunch') {
                         if (@live < $t->{max_par}) {
+                            # Continuation bookkeeping is COMPUTED here (the widened
+                            # budget has to be known before @args is built) but only
+                            # PERSISTED after a successful launch — a relaunch that
+                            # never execs must not burn a continuation, inflate the
+                            # exhaust streak, or leave the stale snapshot behind.
+                            # Without this the counter ratchets on every tick while
+                            # the frozen snapshot keeps reading "progressed", so
+                            # effective_attempts is pinned and the give-up cap can
+                            # never be reached (§3 B7/B8).
+                            my %pending_reg;
+                            my $reg_rollback;      # in-memory max_turns to restore on failure
+                            # Turn-exhaustion fork (only with a free slot: a deferred
+                            # relaunch must not widen or count a continuation).
+                            if ($tv->{verdict} eq 'max_turns') {
+                                my $initial = initial_max_turns($bpdir, $pkg, $t);
+                                my $current = _reg_int($reg->{$pkg}{max_turns}) // $initial;
+                                my $prog = snapshot_progressed($reg->{$pkg}{launch_snapshot},
+                                                               launch_snapshot($bpdir, $runs, $pkg, $now));
+                                if ($prog) {
+                                    # B7 — productive: widen the budget, continue, and
+                                    # count the continuation so effective_attempts is
+                                    # unchanged (the give-up cap is NOT consumed).
+                                    my $next = widen_max_turns($current, $initial);
+                                    my $tc   = (_reg_int($reg->{$pkg}{turn_continuations}) // 0) + 1;
+                                    %pending_reg = (max_turns => $next, turn_continuations => $tc,
+                                                    turn_exhaust_streak => 0);
+                                    $reg_rollback = $current;
+                                    # the widened budget must ride @args below, so the
+                                    # in-memory mirror is set now and rolled back if the
+                                    # launch never happens.
+                                    $reg->{$pkg}{max_turns} = $next;
+                                    _log($log, 'turn_continuation', { package => $pkg, num_turns => $tv->{num_turns},
+                                        from => $current, to => $next, attempts => $att->{$pkg} });
+                                } else {
+                                    # B8 — fruitless: no widening, the attempt burns the
+                                    # cap, and a run of them means a wider budget is not
+                                    # the answer — park for a human instead of thrashing.
+                                    my $streak = (_reg_int($reg->{$pkg}{turn_exhaust_streak}) // 0) + 1;
+                                    $pending_reg{turn_exhaust_streak} = $streak;
+                                    _log($log, 'turn_exhausted_no_progress', { package => $pkg, streak => $streak,
+                                        num_turns => $tv->{num_turns}, attempts => $att->{$pkg} });
+                                    if ($streak >= ($t->{turn_starved_thresh} // 3)) {
+                                        # This arm legitimately never launches, so the
+                                        # streak is persisted inline instead.
+                                        _upd_pkg($runs, $log, $pkg, { turn_exhaust_streak => $streak });
+                                        $reg->{$pkg}{turn_exhaust_streak} = $streak;
+                                        $starved{$pkg} = 1;
+                                        _enter_pause_manual($runs, $log,
+                                            "turn-starved: $pkg exhausted turns ${streak}x with no progress",
+                                            { package => $pkg, blueprint => $bp, kind => 'turn-starved',
+                                              question => "Package '$pkg' hit its turn budget $streak times in a row with no ledger progress. "
+                                                        . 'Widening the budget is not helping — re-scope the package, split it, or give it guidance, then resume '
+                                                        . 'by deleting runs/.paused (`rm runs/.paused`) — this pause is manual and will not lift on its own.',
+                                              context  => "$streak consecutive turn exhaustions with no progress; attempts="
+                                                        . ($att->{$pkg} // 0)
+                                                        . ', turn_continuations=' . (_reg_int($reg->{$pkg}{turn_continuations}) // 0)
+                                                        . ", max_turns=$current, last num_turns=" . ($tv->{num_turns} // '?'),
+                                              created_at => $now });
+                                        next;                     # do NOT relaunch it
+                                    }
+                                }
+                            }
                             my $age = ledger_age_min($bpdir, $pkg, $now);
                             my $mode = resume_mode($age, $sid->{$pkg}, $t->{thresh_min});
                             my @args = ($mode eq 'warm') ? ('--resume-session', $sid->{$pkg}) : ();
+                            # The widened budget rides on the relaunch. Only ever set
+                            # after a continuation, so an ordinary run's @cmd is
+                            # byte-identical to today (bp-launch.sh keeps its own
+                            # ledger fallback when no --max-turns is passed).
+                            my $budget = _reg_int($reg->{$pkg}{max_turns});
+                            push @args, '--max-turns', $budget if defined $budget;
                             _log($log, 'watchdog_relaunch', { package => $pkg, mode => $mode, age_min => $age, attempts => $att->{$pkg} });
+                            my $snap = launch_snapshot($bpdir, $runs, $pkg, $now);
                             my $rc = $launch->({ pkg => $pkg, args => \@args, kind => $mode });
-                            if (defined $rc && $rc == 0) { push @live, $pkg; }
-                            else { _log($log, 'launch_failed', { package => $pkg, kind => $mode, rc => $rc }); }
+                            $note_exec->($pkg, $rc);
+                            if (defined $rc && $rc == 0) {
+                                _upd_pkg($runs, $log, $pkg, { %pending_reg, launch_snapshot => $snap });
+                                $reg->{$pkg}{$_} = $pending_reg{$_} for keys %pending_reg;
+                                push @live, $pkg;
+                            } else {
+                                # nothing was exec'd: roll the widened budget back so the
+                                # next tick recomputes from the persisted value.
+                                $reg->{$pkg}{max_turns} = $reg_rollback if defined $reg_rollback;
+                                _log($log, 'launch_failed', { package => $pkg, kind => $mode, rc => $rc });
+                            }
                         } else {
                             _log($log, 'relaunch_deferred', { package => $pkg, reason => 'parallel cap full' });
                         }
@@ -1065,6 +1684,77 @@ sub run {
                             spawn_judge=>$spawn_judge, shutdown=>$shutdown });
                     }
                 }
+            }
+
+            # ---- CHECKPOINT: durable WIP commits (b02, Decisions #2/#17) ----
+            # Placed here on purpose: @live is complete and authoritative, and a
+            # package the LAUNCH section starts below is not in it yet — so a
+            # just-launched coordinator is never checkpointed on its launch tick.
+            #
+            # Two triggers per live package (a periodic floor and a meaningful
+            # ledger advance) funnel into exactly ONE $checkpoint->() call site
+            # behind one `next unless`, so both firing together is still one
+            # commit. Nothing in this section may end the tick: every outcome is
+            # caught, and the loop falls through to LAUNCH.
+            for my $pkg (sort @live) {
+                # Liveness = THIS package's own coordinator is alive right now,
+                # which is narrower than @live: the watchdog also pushes packages
+                # it relaunched this very tick, and those have no in-flight work
+                # of their own to capture yet. $pid was read at the top of the
+                # tick, so a package the launch seam just registered isn't in it.
+                my $cpid = $pid->{$pkg};
+                next unless defined $cpid && length $cpid && $pid_alive->($cpid);
+
+                # FRESH snapshot — never the registry's launch_snapshot, which is
+                # a *launch* baseline and would read "advanced" on every tick
+                # after the first advance.
+                my $cur = launch_snapshot($bpdir, $runs, $pkg, $now);
+                my $prev = $ckpt{$pkg};
+                # First observation SEEDS and does not commit: no commit storm
+                # across N packages when the orchestrator starts.
+                unless ($prev) { $ckpt{$pkg} = { at => $now, snap => $cur }; next }
+
+                my $due = ($now - ($prev->{at} // $now)) >= ($t->{ckpt_int} // 300) ? 1 : 0;
+                my $adv = checkpoint_advanced($prev->{snap}, $cur) ? 1 : 0;
+                next unless $due || $adv;
+                my $trigger = ($due && $adv) ? 'both' : $adv ? 'ledger' : 'periodic';
+                # Bookkeeping advances on EVERY outcome (committed, clean, error)
+                # and BEFORE the attempt, so a permanently broken repo costs at
+                # most one attempt + one log line per package per interval.
+                $ckpt{$pkg} = { at => $now, snap => $cur };
+
+                my $st_str = $status->{$pkg} // '';
+                my $res = eval { $checkpoint->({ pkg => $pkg, trigger => $trigger,
+                    write_set => ($meta->{$pkg}{write_set} // ''), status => $st_str,
+                    step => $cur->{checkboxes}, now => $now }) };
+                my $ex = $@;
+                # Both _log calls are eval-wrapped (mirroring :629-634): BpLog::event
+                # DIES on an unwritable runs/, and logging a checkpoint failure must
+                # never become the fatal error.
+                if ($ex || ref $res ne 'HASH') {
+                    my $detail = $ex ? _oneline("$ex")
+                               : 'checkpoint returned ' . (defined $res ? (ref($res) || 'a non-hashref') : 'undef');
+                    eval { _log($log, 'checkpoint_failed', { package => $pkg, trigger => $trigger,
+                        reason => 'exception', detail => $detail }); 1 } or 1;
+                } elsif (!$res->{ok}) {
+                    eval { _log($log, 'checkpoint_failed', { package => $pkg, trigger => $trigger,
+                        reason => ($res->{reason} // 'error'), detail => _oneline($res->{detail}) }); 1 } or 1;
+                } elsif ($res->{committed}) {
+                    eval { _log($log, 'checkpoint', { package => $pkg, trigger => $trigger,
+                        sha => $res->{sha}, status => $st_str, step => $cur->{checkboxes},
+                        message => $res->{message} }); 1 } or 1;
+                } elsif (($res->{reason} // '') eq 'no-safe-pathspec' && !$ckpt_warned{$pkg}++) {
+                    # The ONE clean outcome that is not a healthy no-op: every
+                    # write_set entry was rejected as unsafe, so this package can
+                    # NEVER be checkpointed. Silence would make a misconfigured
+                    # ledger indistinguishable from a clean tree, and write-set-only
+                    # staging is this package's core safety property. Logged once
+                    # per package per run, so it cannot spam a long fleet.
+                    eval { _log($log, 'checkpoint_failed', { package => $pkg, trigger => $trigger,
+                        reason => 'no-safe-pathspec', detail => _oneline($res->{detail}) }); 1 } or 1;
+                }
+                # every other 'clean' outcome logs NOTHING: a no-op is not an
+                # event, and it would otherwise spam the log every interval.
             }
 
             # ---- LAUNCH newly-ready packages into free slots (event-driven) ----
@@ -1079,11 +1769,18 @@ sub run {
                     # Hold any package whose resolve-judge is mid-flight out of the
                     # launchable set (its ledger is being edited — don't race it).
                     $launch_status->{$_} = 'resolving' for grep { defined judge_inflight($runs, 'resolve', $_) } keys %$launch_status;
+                    # A package parked as turn-starved this tick must not be picked
+                    # straight back up by the fresh-launch path (its pause only gates
+                    # ticks N+1...).
+                    $launch_status->{$_} = 'turn-starved' for keys %starved;
                     my @ready = ready_packages($meta, $launch_status, \@live);
                     my @batch = pick_launch_batch(\@ready, $meta, [ map { $meta->{$_}{write_set} } @live ], $slots);
                     for my $pkg (@batch) {
+                        my $snap = launch_snapshot($bpdir, $runs, $pkg, $now);
                         my $rc = $launch->({ pkg => $pkg, args => [], kind => 'fresh' });
+                        $note_exec->($pkg, $rc);
                         if (defined $rc && $rc == 0) {
+                            _upd_pkg($runs, $log, $pkg, { launch_snapshot => $snap });
                             _log($log, 'launch', { package => $pkg, kind => 'fresh' });
                             push @live, $pkg;
                         } else {
@@ -1091,6 +1788,25 @@ sub run {
                         }
                     }
                 }
+            }
+
+            # ---- BROKEN-ENV TRIP (fleet-level; once per tick, after every launch
+            # site has had its say). N consecutive exec-not-found launches means
+            # nothing this loop does can succeed — bash, bp-launch.sh or the mount
+            # is gone. Stop the thrash with a MANUAL pause (no auto-resume) and one
+            # deduped decision for the human, then reset the streak.
+            if ($exec_fail_streak >= ($t->{broken_env_thresh} // 3)) {
+                my $n = $exec_fail_streak;
+                my $errno = (defined $LAST_EXEC_ERROR && length "$LAST_EXEC_ERROR")
+                          ? "$LAST_EXEC_ERROR" : 'exec failed (errno unavailable)';
+                _enter_pause_manual($runs, $log, 'broken-env: launcher could not be executed',
+                    { package => '_fleet', blueprint => $bp, kind => 'broken-env',
+                      question => "The launcher could not be executed $n times in a row — the run environment is broken "
+                                . '(missing bash, missing bp-launch.sh, or a bad mount). Fix it, then resume the run '
+                                . 'by deleting runs/.paused (`rm runs/.paused`) — this pause is manual and will not lift on its own.',
+                      context  => "exec of 'bash $DIR/bp-launch.sh' failed on $n consecutive launch attempts; last errno: $errno",
+                      created_at => $now });
+                $exec_fail_streak = 0;
             }
 
             # ---- RECONCILE ORPHANED ESCALATIONS ----
@@ -1141,9 +1857,141 @@ sub run {
                 _log($log, 'shutdown_complete', { detail => 'graceful-shutdown-all: no coordinators left' });
                 last;
             }
+            # ---- b05 CONFORMANCE GATE ----
+            # Fires when the run would otherwise be idle-complete. An in-flight
+            # conformance judge counts as outstanding (mirroring $judges_inflight at
+            # :1808-1810) so the loop stays alive to READ the verdict — exiting at fire
+            # time would strand it unread and no finding could ever reach remediation.
+            my $conf_outstanding = 0;
+            # NB: deliberately NOT gated on $outstanding — that includes
+            # $judges_inflight, and a per-package harvest audit fires for the very same
+            # finished packages on this tick, which would starve the gate forever.
+            # BpJudge::conformance_ready already requires every package terminal and
+            # none awaiting a human, which is the real precondition.
+            #
+            # b07: verify_ready($rq) is the additional conjunct (spec-08 §3.4) — 0
+            # while any remediation entry is still `queued` (authored but not yet
+            # finished), so the gate never re-verifies against a half-remediated
+            # world.
+            if (!$any_running && !$resume_pending && !$paused && BpRemediate::verify_ready($rq)) {
+                my $cpkgs = conformance_registry($bpdir, $meta, $status);
+                my $ready = BpJudge::conformance_ready($cpkgs);
+                my $cinfl = defined judge_inflight($runs, 'conformance', '_run') ? 1 : 0;
+                my $cvpre = -e conformance_verdict_path($runs) ? 1 : 0;
+                if ($cinfl) {
+                    # judge running: ingest its verdict if it landed, else keep waiting
+                    my $raw = $read_verdict->('conformance', '_run');
+                    if (defined $raw) {
+                        clear_judge_inflight($runs, 'conformance', '_run');
+                        my $v = write_conformance_channels({ bpdir => $bpdir, runs => $runs,
+                            raw => $raw, pkgs => $cpkgs, now => $now, blueprint => $bp,
+                            build => $reg->{_run}{build} });
+                        _log($log, 'conformance_verdict', { outcome => $v->{outcome},
+                              findings => scalar @{ $v->{findings} } });
+                        # b07: the :1862-equivalent (later-tick) verdict-ingestion
+                        # site — hooking only ONE of the two sites silently skips
+                        # remediation for whichever runs take the other path.
+                        $rem_outstanding = remediation_step({ bpdir => $bpdir, runs => $runs, verdict => $v,
+                            meta => $meta, status => $status, now => $now, blueprint => $bp, tunables => $t,
+                            log => $log, queue => $rq });
+                    } else {
+                        # No verdict yet. Keep the loop alive and WAIT — the judge is a
+                        # detached `claude -p` that legitimately takes minutes. Only once
+                        # judge_to has elapsed is a missing verdict a real timeout, at
+                        # which point we write the authoritative error verdict (spec
+                        # §3.1.5; never a silent pass). This mirrors the harvest/resolve
+                        # timeout pattern rather than declaring 'error' on tick one, which
+                        # would leave runs/conformance-verdict.json reading outcome=error
+                        # for the judge's entire real run time.
+                        $conf_outstanding = 1;
+                        my $started = judge_inflight($runs, 'conformance', '_run');
+                        my $elapsed = (defined $started && $started =~ /^\d+$/) ? ($now - $started) : 0;
+                        if (!$cvpre && $elapsed > ($t->{judge_to} // 1800)) {
+                            clear_judge_inflight($runs, 'conformance', '_run');
+                            my $v = write_conformance_channels({ bpdir => $bpdir, runs => $runs,
+                                raw => undef, pkgs => $cpkgs, now => $now, blueprint => $bp,
+                                build => $reg->{_run}{build} });
+                            _log($log, 'conformance_timeout', { outcome => $v->{outcome},
+                                  elapsed => $elapsed });
+                            $conf_outstanding = 0;
+                        }
+                    }
+                } elsif (!$ready->{ready}) {
+                    if (!$cvpre && ($ready->{reason} // '') eq 'awaiting_human') {
+                        my $nt = BpJudge::notice_record('conformance gate skipped',
+                            'every package is terminal but some await a human, so the run never actually finished; not judging it',
+                            { generated_at => _iso($now), severity => 'warn',
+                              evidence => { awaiting => $ready->{awaiting} } });
+                        _write_json_atomic("$runs/notices/" . (defined $now ? $now : 0) . "-conformance-gate-skipped.json", $nt);
+                        _log($log, 'conformance_skipped', { reason => $ready->{reason} });
+                    }
+                } elsif (!$cvpre) {
+                    my $spawns = $reg->{_run}{conformance_spawns} // 0;
+                    if (BpJudge::conformance_should_spawn({ inflight => 0, verdict_present => 0,
+                            spawns => $spawns, cap => ($t->{conformance_spawn_cap} // 0) })) {
+                        require File::Path; File::Path::make_path("$runs/conformance");
+                        my $b = $build_runner ? $build_runner->({ cwd => $bpdir, cmd => [] }) : undef;
+                        my $build = (ref $b eq 'HASH')
+                            ? { ran => JSON::PP::true, ok => ($b->{ok} ? JSON::PP::true : JSON::PP::false),
+                                exit => $b->{exit}, stderr => ($b->{stderr} // '') }
+                            : { ran => JSON::PP::false };
+                        update_registry_pkg($runs, '_run', { conformance_spawns => $spawns + 1 });
+                        $reg->{_run}{conformance_spawns} = $spawns + 1;
+                        $reg->{_run}{build} = $build;
+                        my $rc = $spawn_judge->({ kind => 'conformance', pkg => '_run' });
+                        if (defined $rc && $rc == 0) {
+                            mark_judge_inflight($runs, 'conformance', '_run', $now);
+                            _log($log, 'conformance_fire', { packages => scalar keys %$cpkgs });
+                            # An unparseable mandated_means is a property of the LEDGERS,
+                            # not of the verdict, so notice it as soon as the gate fires —
+                            # it must not wait on (or depend on) a judge verdict arriving.
+                            for my $pkg (sort keys %$cpkgs) {
+                                next if $cpkgs->{$pkg}{means_ok};
+                                my $nt = BpJudge::notice_record('unparseable mandated_means',
+                                    "package $pkg has a mandated_means value this reader cannot interpret; treated as an empty list",
+                                    { generated_at => _iso($now), severity => 'warn',
+                                      evidence => { package => $pkg, shape => $cpkgs->{$pkg}{means_shape} } });
+                                _write_json_atomic("$runs/notices/" . (defined $now ? $now : 0)
+                                    . '-unparseable-mandated-means-' . _slug($pkg) . '.json', $nt);
+                            }
+                            my $raw = $read_verdict->('conformance', '_run');
+                            if (defined $raw) {
+                                clear_judge_inflight($runs, 'conformance', '_run');
+                                my $v = write_conformance_channels({ bpdir => $bpdir, runs => $runs,
+                                    raw => $raw, pkgs => $cpkgs, now => $now, blueprint => $bp,
+                                    build => $build });
+                                _log($log, 'conformance_verdict', { outcome => $v->{outcome},
+                                      findings => scalar @{ $v->{findings} } });
+                                # b07: the :1930-equivalent (same-tick) verdict-
+                                # ingestion site — a verdict already present when
+                                # the judge is spawned takes THIS path, not the
+                                # cinfl branch above.
+                                $rem_outstanding = remediation_step({ bpdir => $bpdir, runs => $runs, verdict => $v,
+                                    meta => $meta, status => $status, now => $now, blueprint => $bp, tunables => $t,
+                                    log => $log, queue => $rq });
+                            } else {
+                                # Just spawned and nothing to read yet — normal for a
+                                # detached judge. Keep the loop alive; the timeout branch
+                                # above writes the error verdict if judge_to elapses.
+                                $conf_outstanding = 1;
+                            }
+                        } else {
+                            _log($log, 'conformance_spawn_failed', { rc => $rc });
+                        }
+                    } else {
+                        my $nt = BpJudge::notice_record('conformance spawn cap reached',
+                            'the conformance gate hit its spawn cap for this run; not firing again',
+                            { generated_at => _iso($now), severity => 'warn',
+                              evidence => { spawns => $spawns, cap => ($t->{conformance_spawn_cap} // 0) } });
+                        _write_json_atomic("$runs/notices/" . (defined $now ? $now : 0) . "-conformance-spawn-cap-reached.json", $nt);
+                        _log($log, 'conformance_spawn_cap', { spawns => $spawns });
+                    }
+                }
+            }
             if (run_complete({ any_running => $any_running, outstanding => $outstanding,
                                resume_pending => $resume_pending, paused => ($paused ? 1 : 0),
-                               awaiting_human => $awaiting_human })) {
+                               awaiting_human => $awaiting_human,
+                               conformance_outstanding => $conf_outstanding })) {
                 _log($log, 'idle_exit', { detail => 'no running, no progressable work, not paused, nothing awaiting a human' });
                 last;
             }
@@ -1161,19 +2009,26 @@ sub run {
 }
 
 # write a manual (no-auto-resume) pause + queue a needs-you decision.
+# b03: optional 5th arg $opt = { quiet_log => 0|1 }. INV-P1: a pause that
+# actually WROTE .paused is always logged, regardless of quiet_log — only a
+# repeat call that changed no durable state can be silenced. All pre-existing
+# call sites pass no $opt and are byte-for-byte unaffected.
 sub _enter_pause_manual {
-    my ($runs, $log, $reason, $decision) = @_;
+    my ($runs, $log, $reason, $decision, $opt) = @_;
     # Don't clobber an already-active manual pause's reason: keep the FIRST one in
     # .paused and just add this decision to the needs-you queue. The queue is the
     # authoritative list of everything the human must resolve before resuming, so a
     # second manual reason (e.g. a contract drift after a token-floor reauth) never
     # suppresses the first — both surface there.
     my $existing = read_paused($runs);
+    my $wrote = 0;
     unless ($existing && $existing->{manual}) {
         write_paused($runs, { reason => $reason, manual => 1, created_at => ($decision->{created_at} // time) });
+        $wrote = 1;
     }
     queue_needs_you($runs, $decision) if $decision;
-    _log($log, 'pause', { reason => $reason, manual => 1, package => ($decision->{package} // '_fleet'), kind => ($decision->{kind} // '') });
+    _log($log, 'pause', { reason => $reason, manual => 1, package => ($decision->{package} // '_fleet'), kind => ($decision->{kind} // '') })
+        if $wrote || !($opt && $opt->{quiet_log});
 }
 
 # mark a package blocked in its ledger + queue the decision (loop-guard). An
@@ -1215,6 +2070,169 @@ sub _escalate_stuck {
     }
     _block_and_queue($a->{bpdir}, $runs, $log, $a->{bp}, $pkg, $a->{why}, $a->{now});
     return 'blocked';
+}
+
+# --- b05 conformance gate -------------------------------------------------
+# Build the { pkg => {status, means, means_shape, means_ok} } map the pure
+# BpJudge::conformance_ready consumes. ledger_fm is scalar-only, so mandated_means
+# gets this narrow list-aware read (NOT a general YAML parser — deliberately).
+sub conformance_registry {
+    my ($bpdir, $meta, $status) = @_;
+    my %pkgs;
+    for my $pkg (sort keys %{ $meta || {} }) {
+        my $raw = ledger_fm($bpdir, $pkg, 'mandated_means');
+        my $mm  = BpJudge::parse_mandated_means($raw);
+        $pkgs{$pkg} = { status => ($status->{$pkg} // 'pending'),
+                        means => $mm->{means}, means_shape => $mm->{shape}, means_ok => $mm->{ok} };
+    }
+    return \%pkgs;
+}
+
+sub conformance_verdict_path { my ($runs) = @_; "$runs/conformance-verdict.json" }
+
+# ISO-8601 from the injected clock (never wall-clock, so tests are deterministic).
+sub _iso {
+    my ($epoch) = @_;
+    $epoch = 0 unless defined $epoch;
+    my @t = gmtime($epoch);
+    return sprintf('%04d-%02d-%02dT%02d:%02d:%02dZ',
+                   $t[5] + 1900, $t[4] + 1, $t[3], $t[2], $t[1], $t[0]);
+}
+
+sub _slug {
+    my ($s, $max) = @_;
+    $s = '' unless defined $s;
+    $s = lc $s;
+    $s =~ s/[^a-z0-9]+/-/g;
+    $s =~ s/^-+//; $s =~ s/-+$//;
+    $s = substr($s, 0, ($max || 48));
+    $s =~ s/-+$//;
+    return length($s) ? $s : 'entry';
+}
+
+# atomic temp+rename, best-effort (never fatal) — same contract as _apply_harvest_findings.
+sub _write_json_atomic {
+    my ($path, $data) = @_;
+    require File::Basename;
+    my $dir = File::Basename::dirname($path);
+    require File::Path; File::Path::make_path($dir) unless -d $dir;
+    my $tmp = "$path.tmp.$$";
+    if (open my $w, '>', $tmp) {
+        print $w JSON::PP->new->canonical->pretty->encode($data);
+        close $w;
+        return 1 if rename $tmp, $path;
+        unlink $tmp;
+    }
+    return 0;
+}
+
+# Deterministically turn the RAW judge verdict into the authoritative verdict plus
+# the review/notice channels. The judge never writes these (spec D5) — that is what
+# keeps the whole gate testable through the injected read_verdict seam.
+sub write_conformance_channels {
+    my ($a) = @_;
+    my ($bpdir, $runs, $raw, $pkgs, $now, $bp, $build) =
+        @{$a}{qw(bpdir runs raw pkgs now blueprint build)};
+    my $norm  = BpJudge::normalize_conformance($raw);
+    my @findings = @{ $norm->{findings} || [] };
+    my (@reviews, @notices);
+    my $iso = _iso($now);
+    my $ctx = { generated_at => $iso };
+
+    # a package whose mandated_means could not be parsed gets a notice, never a crash
+    for my $pkg (sort keys %{ $pkgs || {} }) {
+        next if $pkgs->{$pkg}{means_ok};
+        push @notices, BpJudge::notice_record('unparseable mandated_means',
+            "package $pkg has a mandated_means value this reader cannot interpret; treated as an empty list",
+            { %$ctx, severity => 'warn', evidence => { package => $pkg,
+              shape => $pkgs->{$pkg}{means_shape} } });
+    }
+
+    # classify each deviation the judge asserted, against the ledger's marker
+    for my $dev (@{ $norm->{deviations} || [] }) {
+        next unless ref $dev eq 'HASH';
+        my $pkg   = defined $dev->{package} ? $dev->{package} : '';
+        my $means = defined $dev->{means}   ? $dev->{means}   : '';
+        my $declared = ($pkgs && ref $pkgs->{$pkg} eq 'HASH' && ref $pkgs->{$pkg}{means} eq 'ARRAY')
+                       ? $pkgs->{$pkg}{means} : [];
+        # the EXPLICIT list is the only source of mandated means — prose never counts
+        unless (grep { $_ eq $means } @$declared) {
+            push @notices, BpJudge::notice_record('deviation against undeclared means',
+                "the judge asserted a deviation for '$means' in $pkg, which is not in that package's mandated_means list; ignored",
+                { %$ctx, severity => 'info', evidence => { package => $pkg, means => $means } });
+            next;
+        }
+        my $marks = BpJudge::parse_means_deviations(_read_file("$bpdir/packages/$pkg.md"));
+        my $mark  = (ref $marks eq 'HASH' && ref $marks->{$means} eq 'HASH') ? $marks->{$means} : undef;
+        my $verd  = BpJudge::classify_deviation({
+            package => $pkg, means => $means, observed => $dev->{observed},
+            files => $dev->{files},
+            justification_present => ($mark ? 1 : 0),
+            justification         => ($mark ? $mark->{why} : undef) });
+        if ($verd eq 'review') {
+            # who= (when the coordinator recorded one) is the authoritative identity;
+            # fall back to the package name, then 'unknown' (spec §8 open question 1).
+            my $who = (defined $mark->{who} && $mark->{who} =~ /\S/) ? $mark->{who} : $pkg;
+            push @reviews, BpJudge::review_record(
+                { %$dev, change => $mark->{change}, justification => $mark->{why}, who => $who },
+                { %$ctx, coordinator => $who });
+        } elsif ($verd eq 'fail') {
+            push @findings, BpJudge::finding_record($dev, $ctx);
+        }
+    }
+
+    # fold b04's dependency report (read-only; Decision #14)
+    my $depsf = "$runs/deps-check.json";
+    my $rep   = (-e $depsf) ? (_read_json($depsf) // { _malformed => 1 }) : undef;
+    my $fold  = BpJudge::fold_deps_check($rep);
+    push @findings, @{ $fold->{findings} || [] };
+    push @reviews,  map { BpJudge::review_record($_, $ctx); } ();      # shape below
+    for my $rv (@{ $fold->{reviews} || [] }) { push @reviews, { schema => 'review/1', generated_at => $iso, %$rv } }
+    for my $nt (@{ $fold->{notices} || [] }) {
+        push @notices, BpJudge::notice_record($nt->{subject}, $nt->{detail},
+            { %$ctx, severity => ($nt->{severity} || 'warn'), evidence => ($nt->{evidence} || {}) });
+    }
+
+    # a red build is a characterizable failure too
+    if ($build && $build->{ran} && !$build->{ok}) {
+        push @findings, { kind => 'conformance-build-failure', severity => 'block',
+            subject => ($bp // 'run'), detail => 'the project build/test command failed during the conformance gate',
+            evidence => { exit => $build->{exit}, stderr => ($build->{stderr} // '') },
+            remedy => { action => 'remediate-build' }, needs_justification => 0 };
+    }
+
+    my $raw_ok = (ref $raw eq 'HASH' && !$raw->{_malformed}) ? 1 : 0;
+    my $outcome = $norm->{outcome};
+    $outcome = 'fail'  if @findings && $outcome ne 'error';
+    $outcome = 'error' if !$raw_ok;
+    $outcome = 'error' if ($fold->{outcome_hint} // '') eq 'error';
+    $outcome = 'fail'  if $outcome eq 'pass' && @findings;
+
+    for my $rv (@reviews) {
+        my $key = _slug(($rv->{package} // 'unknown') . '-' . ($rv->{original_means} // 'means'));
+        _write_json_atomic("$runs/review/$key.json", $rv);          # deterministic name => idempotent
+    }
+    my $n = 0;
+    for my $nt (@notices) {
+        my $base = _slug($nt->{subject});
+        my $p = "$runs/notices/" . (defined $now ? $now : 0) . "-$base.json";
+        $p = "$runs/notices/" . (defined $now ? $now : 0) . "-$base-" . (++$n + 1) . ".json" if -e $p;
+        _write_json_atomic($p, $nt);
+    }
+
+    my $verdict = {
+        schema => 'conformance-verdict/1', generated_at => $iso, project => ($bp // ''),
+        outcome => $outcome, raw_verdict_path => "runs/conformance/_run.verdict.json",
+        raw_ok => ($raw_ok ? JSON::PP::true : JSON::PP::false),
+        build => ($build || { ran => JSON::PP::false }),
+        packages => [ map { { name => $_, status => $pkgs->{$_}{status},
+                              mandated_means => $pkgs->{$_}{means},
+                              means_shape => $pkgs->{$_}{means_shape} } } sort keys %{ $pkgs || {} } ],
+        findings => \@findings, reviews => \@reviews, notices => \@notices,
+        notes => ($norm->{notes} || []),
+    };
+    _write_json_atomic(conformance_verdict_path($runs), $verdict);
+    return $verdict;
 }
 
 # write the harvest audit's findings into the ledger (A5 Q2) so the reopened

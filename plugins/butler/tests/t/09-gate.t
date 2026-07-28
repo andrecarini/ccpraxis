@@ -58,12 +58,22 @@ sub realpath_m {
     my $o = do { local $/; <$f> }; close $f; $o =~ s/\s+\z//; return $o;
 }
 
+# A hook test must control the hook's environment COMPLETELY. These tests get run
+# by coordinators and harvest judges, which export BP_* into the ambient env — and
+# gate-stop.sh:21 (`[ "${BP_ROLE:-coordinator}" = "coordinator" ] || exit 0`) skips
+# outright for a non-coordinator role. Inheriting an ambient BP_ROLE=judge therefore
+# turned every "blocked" assertion below into a silent pass-through: this file passed
+# in a plain shell and failed 5/38 inside a judge, which is exactly where the harvest
+# audit runs it. Strip ALL ambient BP_* and let each case pass only what it means to
+# test. (Observed 2026-07-25: two consecutive b01 harvest audits failed on this.)
+my %CLEAN_ENV = map { ($_ => $ENV{$_}) } grep { !/^BP_/ } keys %ENV;
+
 # run gate-shutdown.sh with a JSON payload on stdin + a BP_* env; (exit, out)
 sub run_gate {
     my ($payload, %env) = @_;
     my $pf = "$ROOT/payload." . (++$pn) . ".json";
     open my $w, '>', $pf or die; print $w $payload; close $w;
-    local %ENV = (%ENV, %env, GATEPATH => fwd($GATE), PFILE => fwd($pf));
+    local %ENV = (%CLEAN_ENV, %env, GATEPATH => fwd($GATE), PFILE => fwd($pf));
     open(my $f, '-|', 'bash', '-c', '"$GATEPATH" < "$PFILE" 2>&1') or die "bash: $!";
     my $o = do { local $/; <$f> }; close $f;
     return ($? >> 8, $o);
@@ -72,7 +82,7 @@ sub run_gate {
 # run gate-stop.sh (Stop hook, reads no stdin payload) with a BP_* env; (exit, out)
 sub run_gstop {
     my (%env) = @_;
-    local %ENV = (%ENV, %env, GSPATH => fwd($GSTOP));
+    local %ENV = (%CLEAN_ENV, %env, GSPATH => fwd($GSTOP));
     open(my $f, '-|', 'bash', '-c', '"$GSPATH" < /dev/null 2>&1') or die "bash: $!";
     my $o = do { local $/; <$f> }; close $f;
     return ($? >> 8, $o);
@@ -81,7 +91,7 @@ sub run_gstop {
 # run track-dispatch.sh with a BP_* env (its stop-signal early-exit runs before jq)
 sub run_track {
     my (%env) = @_;
-    local %ENV = (%ENV, %env, TKPATH => fwd($TRACK));
+    local %ENV = (%CLEAN_ENV, %env, TKPATH => fwd($TRACK));
     open(my $f, '-|', 'bash', '-c', '"$TKPATH" < /dev/null 2>&1') or die "bash: $!";
     my $o = do { local $/; <$f> }; close $f;
     return ($? >> 8, $o);

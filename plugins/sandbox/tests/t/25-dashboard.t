@@ -114,8 +114,8 @@ my %st = (
 {
     my $f = Dashboard::compose_frame(\%st, 24, 80);
     is(scalar(@$f), 24, 'compose: exactly $rows rows');
-    is(length($f->[0]{text}), 80, 'compose: every row exactly $cols wide (row 0)');
-    my $bad = grep { length($_->{text}) != 80 } @$f;
+    is(Dashboard::display_width($f->[0]{text}), 80, 'compose: every row exactly $cols wide (row 0)');
+    my $bad = grep { Dashboard::display_width($_->{text}) != 80 } @$f;
     is($bad, 0, 'compose: ALL rows exactly $cols wide');
     is($f->[0]{role}, 'title', 'compose: row 0 is the title');
     like($f->[0]{text}, qr/ccpraxis sandbox/, 'compose: title text present');
@@ -128,6 +128,35 @@ my %st = (
     like($joined, qr/-- Recent activity /, 'compose: Activity panel rendered');
     like($joined, qr/\Qlaunch_start\E/,   'compose: B1 event surfaced in Activity');
     like($joined, qr/uptime    : 1h 1m 0s/, 'compose: uptime rendered as Xh Ym Zs');
+
+    # PART 2 additions (s04-render-foundation, AC-8/INV-1): every cell carries
+    # a non-empty spans arrayref whose declared width and concatenated text
+    # agree exactly with cell->{text}, and no cell text ever contains an ESC.
+    my @bad_spans = grep { !$_->{spans} || ref($_->{spans}) ne 'ARRAY' || !@{ $_->{spans} } } @$f;
+    is(scalar(@bad_spans), 0, 'compose (s04): every cell has a non-empty spans arrayref');
+    my @bad_width = grep { Dashboard::spans_width($_->{spans}) != 80 } @$f;
+    is(scalar(@bad_width), 0, 'compose (s04): spans_width(cell->{spans}) == 80 for every row');
+    my @bad_text = grep { $_->{text} ne Dashboard::spans_text($_->{spans}) } @$f;
+    is(scalar(@bad_text), 0, 'compose (s04): cell->{text} eq spans_text(cell->{spans}) for every row');
+    my @has_esc = grep { $_->{text} =~ /\e/ } @$f;
+    is(scalar(@has_esc), 0, 'compose (s04): no cell text contains an ESC byte (INV-4)');
+}
+
+# s05-responsive-layout (AC-7 smoke): the two-column mode boundary is visible
+# right here in the file that owns frame composition -- full unit coverage of
+# the composer lives in t/40-layout-responsive.t.
+{
+    my $f100 = Dashboard::compose_frame(\%st, 24, 100);
+    my $both = grep { $_->{text} =~ /-- Sandbox / && $_->{text} =~ /-- Run / } @$f100;
+    is($both, 1, 'compose (s05): 24x100 -- exactly one row carries BOTH panel titles (two-column mode)');
+
+    my $f99 = Dashboard::compose_frame(\%st, 24, 99);
+    my $both99 = grep { $_->{text} =~ /-- Sandbox / && $_->{text} =~ /-- Run / } @$f99;
+    is($both99, 0, 'compose (s05): 24x99 -- no row carries both panel titles (still stacked)');
+    my ($sb99) = grep { $_->{text} =~ /^-- Sandbox -+$/ } @$f99;
+    ok($sb99, 'compose (s05): 24x99 -- a row matches /^-- Sandbox -+$/ (dash-filled full width)');
+    is(Dashboard::display_width($sb99->{text}), 99, 'compose (s05): that row is exactly 99 display columns')
+        if $sb99;
 }
 
 # tiny-terminal degradation
@@ -144,7 +173,7 @@ my %st = (
     is(scalar(@$f0), 0, 'compose: 0 rows -> empty');
 
     my $ftiny = Dashboard::compose_frame(\%st, 3, 1);
-    is(length($ftiny->[0]{text}), 1, 'compose: width 1 -> 1-char rows (no crash)');
+    is(Dashboard::display_width($ftiny->[0]{text}), 1, 'compose: width 1 -> 1-column rows (no crash)');
 }
 
 # shutdown-confirm footer
@@ -165,7 +194,7 @@ my %st = (
     is($f->[1]{role}, 'alert', 'compose: alert sits directly under the title');
     like($f->[1]{text}, qr/backpack install FAILED/, 'compose: alert shows the warning text');
     is(scalar(@$f), 10, 'compose: alert keeps the frame exactly $rows');
-    my $bad = grep { length($_->{text}) != 80 } @$f;
+    my $bad = grep { Dashboard::display_width($_->{text}) != 80 } @$f;
     is($bad, 0, 'compose: alert row keeps every row exactly $cols');
     is($f->[-1]{role}, 'footer', 'compose: footer still last with an alert present');
 
@@ -221,7 +250,11 @@ my %st = (
     my $f2 = Dashboard::compose_frame(\%both, 12, 80);
     is(scalar(grep { $_->{role} eq 'alert' } @$f2), 2, 'compose: status + install alerts coexist');
     is(scalar(@$f2), 12, 'compose: two alerts keep the frame exactly $rows');
-    my $bad = grep { length($_->{text}) != 80 } @$f2;
+    # s06-panel-semantics: the container-status line now carries a status
+    # glyph, a multi-byte UTF-8 sequence but exactly 2 DISPLAY columns -- the
+    # invariant is display_width == $cols, not byte length() (matches the C3
+    # regression test's idiom above; see Decision #12).
+    my $bad = grep { Dashboard::display_width($_->{text}) != 80 } @$f2;
     is($bad, 0, 'compose: alert rows keep exactly $cols');
 }
 
@@ -253,11 +286,11 @@ my %st = (
 }
 
 # C3 regression: a non-ASCII project name must NOT break the exactly-$cols
-# width invariant (bytes outside printable ASCII map 1:1 to '?').
+# width invariant (non-ASCII characters map 1:1 to '?').
 {
     my %sx = (%st, project_name => "caf\xC3\xA9");   # "café" as UTF-8 bytes
     my $f = Dashboard::compose_frame(\%sx, 10, 40);
-    my $bad = grep { length($_->{text}) != 40 } @$f;
+    my $bad = grep { Dashboard::display_width($_->{text}) != 40 } @$f;
     is($bad, 0, 'compose: non-ASCII project name keeps EVERY row exactly $cols');
     my $joined = join "\n", map { $_->{text} } @$f;
     unlike($joined, qr/\xC3\xA9/, 'compose: raw non-ASCII bytes not emitted (sanitized to ?)');
@@ -270,7 +303,7 @@ my %st = (
     my $events = Dashboard::recent_events(\@lines, 5);
     my %se = (%st, events => $events);
     my $f = Dashboard::compose_frame(\%se, 12, 50);
-    my $bad = grep { length($_->{text}) != 50 } @$f;
+    my $bad = grep { Dashboard::display_width($_->{text}) != 50 } @$f;
     is($bad, 0, 'compose: event with embedded newline keeps rows exactly $cols');
     my $joined = join "\n", map { $_->{text} } @$f;
     is(scalar(() = $joined =~ /\n/g), scalar(@$f) - 1,
@@ -280,12 +313,16 @@ my %st = (
 # ===========================================================================
 # PART 2b — B3 (run / wakefulness) + B4 (backpack) panels
 # ===========================================================================
+# s06-panel-semantics: panel body lines are now arrayrefs-of-spans (dim labels,
+# colored values), not plain strings -- extract text via Dashboard::spans_text
+# before regexing (spec S3 behaviors 1-8; see t/41-panel-semantics.t AC1/AC2/
+# AC8 for the exact per-span role assertions this file no longer duplicates).
 {
     # Run panel: fresh lease + stay_awake -> active / holding; needs-you count.
     my @p = Dashboard::build_panels({ %st, busy_age => 30, stay_awake => 1, needs_you => 2 });
     my ($run) = grep { $_->{title} eq 'Run' } @p;
     ok($run, 'panels: a Run panel is present');
-    my $rtext = join "\n", @{ $run->{lines} };
+    my $rtext = join "\n", map { Dashboard::spans_text($_) } @{ $run->{lines} };
     like($rtext, qr/busy-lease.*active/,   'run: fresh lease + stay_awake -> active');
     like($rtext, qr/keep-awake.*holding/,  'run: stay_awake -> keep-awake holding');
     like($rtext, qr/needs you.*2 decision/,'run: needs-you count surfaced');
@@ -293,7 +330,7 @@ my %st = (
 {
     # Stale lease (stay_awake false) -> idle / released; zero decisions -> none.
     my @p = Dashboard::build_panels({ %st, busy_age => 9999, stay_awake => 0, needs_you => 0 });
-    my $rtext = join "\n", @{ (grep { $_->{title} eq 'Run' } @p)[0]->{lines} };
+    my $rtext = join "\n", map { Dashboard::spans_text($_) } @{ (grep { $_->{title} eq 'Run' } @p)[0]->{lines} };
     like($rtext, qr/busy-lease.*idle/,     'run: stale lease -> idle');
     like($rtext, qr/keep-awake.*released/, 'run: not awake -> released (PC may sleep)');
     like($rtext, qr/needs you.*none/,      'run: zero decisions -> none');
@@ -301,7 +338,7 @@ my %st = (
 {
     # No run at all (no busy_age) -> busy-lease none.
     my @p = Dashboard::build_panels({ %st });
-    my $rtext = join "\n", @{ (grep { $_->{title} eq 'Run' } @p)[0]->{lines} };
+    my $rtext = join "\n", map { Dashboard::spans_text($_) } @{ (grep { $_->{title} eq 'Run' } @p)[0]->{lines} };
     like($rtext, qr/busy-lease.*none/, 'run: absent lease -> none (no active run)');
 }
 {
@@ -309,6 +346,10 @@ my %st = (
     my @no = grep { $_->{title} eq 'Backpack' } Dashboard::build_panels({ %st });
     ok(!@no, 'backpack: no panel without a gathered structure');
 
+    # s06-panel-semantics: Backpack is now a wrapped running paragraph of
+    # space-separated item keys, no per-item bracket-marker rows and no
+    # "(+)"/"(-) " legend suffixes on the header (spec S3 items 10-11; the
+    # exact wrap/cap arithmetic is t/41-panel-semantics.t AC11-14's job).
     my $bp = { total => 3, approved => 2, items => [
         { key => 'apt:jq',              approved => 1 },
         { key => 'apt:chromium',        approved => 0 },
@@ -316,27 +357,35 @@ my %st = (
     ] };
     my ($bk) = grep { $_->{title} eq 'Backpack' } Dashboard::build_panels({ %st, backpack => $bp });
     ok($bk, 'backpack: panel present when gathered');
-    my $btext = join "\n", @{ $bk->{lines} };
-    like($btext, qr/3 item\(s\) - 2 approved \(\+\), 1 pending \(-\)/, 'backpack: header counts');
-    like($btext, qr/\[\+\] apt:jq/,       'backpack: approved item marked +');
-    like($btext, qr/\[-\] apt:chromium/,  'backpack: pending item marked -');
+    my $btext = join "\n", map { Dashboard::spans_text($_) } @{ $bk->{lines} };
+    like($btext, qr/3 item\(s\) - 2 approved, 1 pending/, 'backpack: header counts (no (+)/(-) legend suffixes)');
+    like($btext, qr/\bapt:jq\b/,              'backpack: approved item key present');
+    like($btext, qr/\bapt:chromium\b/,        'backpack: pending item key present');
+    unlike($btext, qr/[\[\]]/,                'backpack: no [+]/[-] bracket markers (paragraph, not itemized rows)');
 }
 {
-    # _backpack_lines: empty + cap-with-"+N more" (cap is never silent).
+    # _backpack_lines: empty stays the unchanged quiet line; a large item list
+    # never exceeds header + 2 paragraph rows and shows "+N more" (cap never
+    # silent) -- exact K/N arithmetic is t/41-panel-semantics.t AC13's job.
     my @empty = Dashboard::_backpack_lines({ total => 0 });
-    like($empty[0], qr/no backpack/, 'backpack: total 0 -> "no backpack"');
+    like(Dashboard::spans_text($empty[0]), qr/no backpack/, 'backpack: total 0 -> "no backpack"');
 
-    my @items = map { { key => "apt:p$_", approved => 1 } } (1 .. 20);
-    my @l = Dashboard::_backpack_lines({ total => 20, approved => 20, items => \@items });
-    like(join("\n", @l), qr/\.\.\. \+12 more/, 'backpack: caps at 8, shows "+12 more"');
-    is(scalar(grep { /^\[\+\]/ } @l), 8, 'backpack: exactly 8 item lines shown');
+    # 40 longer keys guarantee overflow past 2 rows at $w=78 (20 short "apt:pN"
+    # keys comfortably fit in 2 rows and would never exercise the cap at all).
+    my @items = map { { key => sprintf('apt:pkg%02d', $_), approved => 1 } } (1 .. 40);
+    my @l = Dashboard::_backpack_lines({ total => 40, approved => 40, items => \@items }, 78);
+    ok(scalar(@l) <= 3, 'backpack: many items -> at most header + 2 paragraph rows (never one-row-per-item)');
+    like(join("\n", map { Dashboard::spans_text($_) } @l), qr/\+\d+ more/,
+        'backpack: capped item list shows "+N more" (cap is never silent)');
 }
 {
     # End-to-end: compose_frame surfaces the new panels (and stays exactly sized).
     my $bp = { total => 1, approved => 0, items => [{ key => 'apt:jq', approved => 0 }] };
     my $f = Dashboard::compose_frame(
         { %st, busy_age => 5, stay_awake => 1, needs_you => 1, backpack => $bp }, 30, 80);
-    is(scalar(grep { length($_->{text}) != 80 } @$f), 0, 'compose: new panels keep rows exactly $cols');
+    # s06-panel-semantics: the container-status glyph is multi-byte but exactly
+    # 2 display columns -- display_width, not length(), is the invariant.
+    is(scalar(grep { Dashboard::display_width($_->{text}) != 80 } @$f), 0, 'compose: new panels keep rows exactly $cols');
     my $joined = join "\n", map { $_->{text} } @$f;
     like($joined, qr/-- Run /,             'compose: Run panel title rendered');
     like($joined, qr/-- Backpack /,        'compose: Backpack panel title rendered');
@@ -470,16 +519,31 @@ my %st = (
     # recent_events converts timestamps to local-time.  The 3rd arg is currently
     # IGNORED by the 2-param implementation, so these tests remain green now and
     # will continue to pass after the seam is wired (gmtime == UTC == the ts value).
+    #
+    # s06-panel-semantics: recent_events now returns an arrayref-of-spans per
+    # event (dim timestamp + a classified glyph+body), not a plain string --
+    # extract text via Dashboard::spans_text and compute the expected glyph via
+    # Dashboard::event_style (never hardcode it) so this stays in sync with the
+    # classifier (spec S3.14; see t/41-panel-semantics.t AC19 for the full
+    # per-span role assertions this file no longer duplicates).
+    # event_style does not exist pre-implementation -- guard with eval{} (this
+    # file's existing convention, e.g. PART 11) so a not-yet-defined sub fails
+    # these assertions cleanly instead of fatally aborting the whole suite.
     my $ev = Dashboard::recent_events(\@lines, 10, \&CORE::gmtime);
     is(scalar(@$ev), 3, 'events: garbage + blank lines skipped');
-    is($ev->[0], '10:00:01  launch_start', 'events: ts -> HH:MM:SS + type');
-    like($ev->[1], qr/container_start exit=0/, 'events: exit field surfaced');
-    like($ev->[2], qr/container_gone state=exited/, 'events: state field surfaced');
+    my ($role0, $glyph0) = eval { Dashboard::event_style('launch_start', undef, undef) };
+    is(Dashboard::spans_text($ev->[0]), "10:00:01  " . ($glyph0 // '') . " launch_start", 'events: ts -> HH:MM:SS + glyph + type');
+    my ($role1, $glyph1) = eval { Dashboard::event_style('container_start', 0, undef) };
+    like(Dashboard::spans_text($ev->[1]), qr/\Q$glyph1\E container_start exit=0/, 'events: exit field surfaced') if defined $glyph1;
+    fail('events: exit field surfaced (event_style not yet defined)') if !defined $glyph1;
+    my ($role2, $glyph2) = eval { Dashboard::event_style('container_gone', undef, 'exited') };
+    like(Dashboard::spans_text($ev->[2]), qr/\Q$glyph2\E container_gone state=exited/, 'events: state field surfaced') if defined $glyph2;
+    fail('events: state field surfaced (event_style not yet defined)') if !defined $glyph2;
 
     my $last2 = Dashboard::recent_events(\@lines, 2, \&CORE::gmtime);
     is(scalar(@$last2), 2, 'events: honors the last-N limit');
-    like($last2->[-1], qr/container_gone/,  'events: keeps the most recent (last)');
-    like($last2->[0],  qr/container_start/, 'events: preserves chronological order (oldest-of-N first)');
+    like(Dashboard::spans_text($last2->[-1]), qr/container_gone/,  'events: keeps the most recent (last)');
+    like(Dashboard::spans_text($last2->[0]),  qr/container_start/, 'events: preserves chronological order (oldest-of-N first)');
 }
 
 # ===========================================================================
@@ -629,79 +693,100 @@ sub drive {
 # PART 9 — scroll fix: capacity, windowing, overflow hint, drain coalescing
 # ===========================================================================
 
-# _scroll_hint: ASCII-only (no unicode arrows — the renderer maps non-ASCII to ?)
-is(Dashboard::_scroll_hint(0, 5), 'v 5 more below', 'hint: only-below shows v');
-is(Dashboard::_scroll_hint(3, 0), '^ 3 more above', 'hint: only-above shows ^');
-is(Dashboard::_scroll_hint(2, 4), '^ 2 more above    v 4 more below', 'hint: both directions');
-is(Dashboard::_scroll_hint(0, 0), undef, 'hint: nothing hidden -> undef');
-unlike(Dashboard::_scroll_hint(1, 1), qr/[^\x20-\x7E]/, 'hint: pure ASCII (width-safe)');
+# _scroll_hint / the separate hint-row mechanism is REMOVED by s06-panel-semantics
+# (Decision #19): the overflow indicator is now an inline Unicode overlay on the
+# first/last visible Activity row, owned by activity_window + _justify_spans.
+# See t/41-panel-semantics.t AC20-AC26 for the replacement coverage.
+ok(!Dashboard->can('_scroll_hint'), '_scroll_hint no longer exists (s06: replaced by the inline overlay)');
 
 # activity_capacity: mirrors compose_frame's budget (deterministic for %st).
 # The Sandbox panel now ALWAYS carries an oauth line (5 lines): even with no
 # token %st renders "not logged in (run /login)". Sandbox(5)+Run(3) fixed =
 # (1+5+1)+(1+3+1)=12; body=rows-2.
+#
+# s05-responsive-layout: activity_capacity mirrors compose_frame's budget.
+# Below _two_col_min_cols() (100) the fixed panels stack and contribute
+# sum(1+lines+1); at or above it, Sandbox|Run share the top region and
+# contribute max(T_sandbox, T_run). These three oracles are at cols=80 ->
+# stacked -> unchanged.
 is(Dashboard::activity_capacity(\%st, 24, 80), 9, 'capacity: 24 rows, no alert -> 9 event rows (oauth line always present)');
 is(Dashboard::activity_capacity({ %st, status => 'exited' }, 24, 80), 8,
    'capacity: a status alert costs one more row');
 is(Dashboard::activity_capacity(\%st, 12, 80), 0,
    'capacity: too short for the fixed panels -> 0 (no negative)');
 
-# activity_window: fits / overflow / scroll / clamp.
+# s05-responsive-layout (AC-11): the two-column capacity oracles. At
+# cols>=100 (_two_col_min_cols()) Sandbox|Run share the top region and
+# contribute max(T_sandbox, T_run)=7 instead of their stacked sum (12).
+is(Dashboard::activity_capacity(\%st, 24, 100), 14,
+   'capacity: two-column mode (cols>=100) -- Sandbox|Run share the top region -> 14');
+is(Dashboard::activity_capacity(\%st, 12, 120), 2,
+   'capacity: two-column mode, 12 rows -> 2 event rows');
+is(Dashboard::activity_capacity(\%st, 10, 120), 0,
+   'capacity: two-column mode, 10 rows -> 0 (too short)');
+is(Dashboard::activity_capacity(\%st, 8, 120), 0,
+   'capacity: two-column mode, 8 rows -> 0 (clamped from a negative body_h)');
+is(Dashboard::activity_capacity({ %st, status => 'exited' }, 24, 120), 13,
+   'capacity: two-column mode + a status alert costs one more row (13)');
+{
+    # s06-panel-semantics: the Backpack panel's height formula changed --
+    # itemized rows (up to 8, so 3 items -> header+3=4 lines -> panel total
+    # 1+4+1=6, "T_2=6") became a wrapped paragraph capped at header+2 rows.
+    # 3 short keys ("apt:a apt:b apt:c") wrap to ONE paragraph row at
+    # $w=cols-2=118, so the panel total is now 1(title)+2(lines)+1(blank)=4,
+    # not 6. Two-column fixed region = max(T_sandbox=7,T_run=5)=7 + 4 = 11
+    # (was 7+6=13); cap = body_h(22) - 11 - 1 = 10 (was 8). Recomputed via the
+    # coordinator's scratch validation harness, not hand-derived blind.
+    my $bp3 = { total => 3, approved => 0, items => [
+        { key => 'apt:a', approved => 0 },
+        { key => 'apt:b', approved => 0 },
+        { key => 'apt:c', approved => 0 },
+    ] };
+    is(Dashboard::activity_capacity({ %st, backpack => $bp3 }, 24, 120), 10,
+       'capacity: two-column mode with a gathered 3-item backpack (paragraph height, T_2=4) -> 10');
+}
+# boundary pair: cols=99 stays stacked, cols=100 flips to two-column mode.
+is(Dashboard::activity_capacity(\%st, 24, 99), 9,
+   'capacity: boundary -- cols=99 is still stacked -> 9 (unchanged)');
+is(Dashboard::activity_capacity(\%st, 24, 100), 14,
+   'capacity: boundary -- cols=100 flips to two-column mode -> 14');
+
+# activity_window: fits / empty / zero-capacity. The overflow/scroll/clamp +
+# inline-overlay coverage (s06-panel-semantics, Decision #19) moved to
+# t/41-panel-semantics.t AC20-AC26 -- that suite is the current oracle for
+# activity_window's overflow behavior, arithmetic ($visible=$cap, no reserved
+# hint row), and the overlay mechanism; duplicating it here against the OLD
+# (pre-s06) hint-row arithmetic would just rot out of sync.
 my @D = ('e5','e4','e3','e2','e1');   # newest-first (already descending)
 {
     my $w = Dashboard::activity_window(\@D, 0, 10);
     is_deeply($w->{lines}, \@D, 'window: everything fits -> all shown');
-    is($w->{hint}, undef,       'window: fits -> no hint');
+    is($w->{above}, 0,       'window: fits -> above 0 (no overlay)');
+    is($w->{below}, 0,       'window: fits -> below 0 (no overlay)');
     is($w->{max_offset}, 0,     'window: fits -> max_offset 0 (no scroll)');
-}
-{
-    my $w = Dashboard::activity_window(\@D, 0, 3);   # cap 3 -> visible 2 + hint
-    is_deeply($w->{lines}, ['e5','e4'], 'window: overflow at top shows newest page');
-    is($w->{hint}{text}, 'v 3 more below', 'window: top -> below-only hint');
-    is($w->{hint}{role}, 'scrollhint',     'window: hint row is dim (scrollhint role)');
-    is($w->{max_offset}, 3, 'window: max_offset = total - visible');
-}
-{
-    my $w = Dashboard::activity_window(\@D, 1, 3);
-    is_deeply($w->{lines}, ['e4','e3'], 'window: scrolled one down');
-    is($w->{hint}{text}, '^ 1 more above    v 2 more below', 'window: middle -> both hints');
-}
-{
-    my $w = Dashboard::activity_window(\@D, 99, 3);  # past the end -> clamp
-    is($w->{offset}, 3, 'window: offset clamped to max_offset (no scrolling past end)');
-    is_deeply($w->{lines}, ['e2','e1'], 'window: clamped view = the oldest page');
-    is($w->{hint}{text}, '^ 3 more above', 'window: at the end -> above-only hint');
 }
 is_deeply(Dashboard::activity_window([], 0, 5)->{lines}, [], 'window: empty -> empty');
 is_deeply(Dashboard::activity_window(\@D, 0, 0)->{lines}, [], 'window: zero capacity -> empty');
 
-is(Dashboard::sgr_for_role('scrollhint'), "\e[2m", 'sgr: scrollhint -> dim (\e[2m, like the footer)');
-
-{
-    # The loop puts windowed event lines + a { text, role => scrollhint } hint
-    # into state.events; compose_frame + render must carry that row through DIM
-    # (the per-line-role plumbing). The windowing that PRODUCES the hint is
-    # covered by activity_window above; the loop integration by the drain test.
-    my %ov = (%st, events => [ 'evt-newest', { text => 'v 7 more below', role => 'scrollhint' } ]);
-    my $f = Dashboard::compose_frame(\%ov, 24, 80);
-    my ($hint) = grep { $_->{role} eq 'scrollhint' } @$f;
-    ok($hint, 'compose: a scrollhint line in events renders as a scrollhint row');
-    like($hint->{text}, qr/more below/, 'compose: the hint text is carried through');
-    is(scalar(grep { length($_->{text}) != 80 } @$f), 0, 'compose: hint row keeps rows exactly $cols');
-    my $rendered = Dashboard::render_frame(undef, $f, { color => 1 });
-    like($rendered, qr/\e\[2m.*more below/, 'render: the hint row is emitted dim');
-}
+# 'scrollhint' is intentionally left defined in sgr_for_role (spec's own out-of-
+# scope ruling: removing an unused role is churn, not a fix) even though no
+# production code path assigns it anymore (the new overlay uses 'muted').
+is(Dashboard::sgr_for_role('scrollhint'), "\e[2m", 'sgr: scrollhint -> dim (\e[2m, like the footer) -- role kept, unused');
 
 {
     # DRAIN coalescing: three DOWN keys in ONE tick advance the offset by three
-    # (not one-per-tick). With 20 events on a 24-row terminal (capacity 10) the
-    # list overflows, so after 3 DOWNs the panel shows "3 more above".
+    # (not one-per-tick). With 20 events overflowing the capacity, offset=3
+    # after the drain means above=3 regardless of the exact capacity/below
+    # split -- s06-panel-semantics (Decision #19) renders that as an inline
+    # "<UP-TRIANGLE> 3 more" overlay on the first visible row (replaces the
+    # old ASCII "3 more above" hint-row text).
+    my $tri_up = Encode::encode('UTF-8', "\x{25B2}");
     my @evs = map { "evt$_" } (1 .. 20);
     my $e = drive(keys => ['DOWN','DOWN','DOWN', undef, 'q'],
                   events => \@evs, rows => 24, max_ticks => 50);
     is($e->{rc}, 0, 'drain: scrolls then quits cleanly');
-    like($e->{out}, qr/3 more above/,
-         'drain: 3 DOWNs in one tick coalesce -> offset advanced by 3');
+    like($e->{out}, qr/\Q$tri_up\E 3 more/,
+         'drain: 3 DOWNs in one tick coalesce -> offset advanced by 3 (inline overlay shows "<UP-TRIANGLE> 3 more")');
 }
 
 # ===========================================================================
@@ -1037,12 +1122,15 @@ sub drive_per_tick {
         'A3: _event_time with -5h localtime seam -> 05:00:01');
 
     # A1 via recent_events 3rd-param seam (end-to-end path): parse the same ts
-    # through the seam and confirm the event string carries the local HH:MM:SS.
+    # through the seam and confirm the event's TEXT carries the local HH:MM:SS.
+    # s06-panel-semantics: recent_events now returns an arrayref-of-spans per
+    # event (dim timestamp + classified body), not a plain string -- extract
+    # text via Dashboard::spans_text before matching (spec S3.14).
     my @lines_a1 = ('{"ts":"2026-06-24T10:00:01Z","type":"launch_start","pid":1}');
     my $ev_a1 = eval { Dashboard::recent_events(\@lines_a1, 1, $gmtime_seam) };
     if ($ev_a1) {
-        like($ev_a1->[0], qr/^10:00:01\b/,
-            'A1 (recent_events): gmtime seam preserves UTC HH:MM:SS in event string');
+        like(Dashboard::spans_text($ev_a1->[0]), qr/^10:00:01\b/,
+            'A1 (recent_events): gmtime seam preserves UTC HH:MM:SS in event text');
     } else {
         fail('A1 (recent_events): recent_events 3-arg form not yet wired (expected failure)');
     }
@@ -1050,8 +1138,8 @@ sub drive_per_tick {
     # A2 via recent_events
     my $ev_a2 = eval { Dashboard::recent_events(\@lines_a1, 1, $plus2h_seam) };
     if ($ev_a2) {
-        like($ev_a2->[0], qr/^12:00:01\b/,
-            'A2 (recent_events): +2h seam yields 12:00:01 in event string');
+        like(Dashboard::spans_text($ev_a2->[0]), qr/^12:00:01\b/,
+            'A2 (recent_events): +2h seam yields 12:00:01 in event text');
     } else {
         fail('A2 (recent_events): recent_events 3-arg seam not yet wired (expected failure)');
     }
@@ -1059,8 +1147,8 @@ sub drive_per_tick {
     # A3 via recent_events
     my $ev_a3 = eval { Dashboard::recent_events(\@lines_a1, 1, $minus5h_seam) };
     if ($ev_a3) {
-        like($ev_a3->[0], qr/^05:00:01\b/,
-            'A3 (recent_events): -5h seam yields 05:00:01 in event string');
+        like(Dashboard::spans_text($ev_a3->[0]), qr/^05:00:01\b/,
+            'A3 (recent_events): -5h seam yields 05:00:01 in event text');
     } else {
         fail('A3 (recent_events): recent_events 3-arg seam not yet wired (expected failure)');
     }
@@ -1125,12 +1213,14 @@ sub drive_per_tick {
     is(Dashboard::activity_capacity(\%st, 24, 80), 9,
         'C1b: no token (undef) -> oauth line STILL present -> capacity 9');
 
+    # s06-panel-semantics: panel lines are now arrayrefs-of-spans -- extract
+    # text via Dashboard::spans_text before joining/regexing.
     my @panels_none = Dashboard::_fixed_panels(\%st);
-    my $panels_none = join("\n", map { @{ $_->{lines} } } @panels_none);
+    my $panels_none = join("\n", map { Dashboard::spans_text($_) } map { @{ $_->{lines} } } @panels_none);
     like($panels_none, qr{oauth\s*:\s*not logged in \(run /login\)},
         'C1c: not-logged-in state renders the actionable oauth prompt');
     my @panels_oauth = Dashboard::_fixed_panels(\%st_oauth);
-    my $panels_oauth = join("\n", map { @{ $_->{lines} } } @panels_oauth);
+    my $panels_oauth = join("\n", map { Dashboard::spans_text($_) } map { @{ $_->{lines} } } @panels_oauth);
     like($panels_oauth, qr{oauth\s*:\s*expires in 3h12m},
         'C1d: known expiry renders the countdown');
 }

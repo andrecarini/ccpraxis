@@ -140,6 +140,43 @@ is(sanitize_cell("caf\xc3\xa9"), "caf\xc3\xa9", 'printable multi-byte UTF-8 pres
 }
 
 # ---------------------------------------------------------------------
+# s14-session-filter (AC-18 -> DC-3): is_butler tagging on build_options.
+# build_options' signature/return shape is otherwise unchanged (asserted
+# above); requiring the script must still not run main() even though the
+# script body now references the SessionFilter package (only butler_sids(),
+# reached solely from the `unless (caller)` entry point, ever loads it) — the
+# existing `pass('require did not run main() — caller guard holds')` near the
+# top of this file already covers that half of AC-18 and must stay green.
+# ---------------------------------------------------------------------
+{
+    my @opts = build_options();
+    is($opts[0]{action}, 'NEW', 'AC-18 -> DC-3: option 0 is still NEW with no sessions');
+    ok(!exists $opts[0]{is_butler}, 'AC-18 -> DC-3: option 0 carries no is_butler key');
+}
+{
+    my $butler_sess = {
+        uuid      => 'ffffffff-1111-2222-3333-444455556666',
+        mtime     => 1_700_000_000,
+        size      => 10,
+        cwd       => '/project',
+        preview   => 'a butler-spawned session',
+        is_butler => 1,
+    };
+    my $user_sess = {
+        uuid    => '01234567-1111-2222-3333-444455556666',
+        mtime   => 1_700_000_001,
+        size    => 10,
+        cwd     => '/project',
+        preview => 'a regular user session',
+        # no is_butler key at all
+    };
+    my @opts = build_options($butler_sess, $user_sess);
+    is(scalar @opts, 3, 'AC-18 -> DC-3: one NEW + two sessions => 3 options');
+    is($opts[1]{is_butler}, 1, 'AC-18 -> DC-3: a session with is_butler=>1 tags its option is_butler==1');
+    is($opts[2]{is_butler}, 0, 'AC-18 -> DC-3: a session with no is_butler key tags its option is_butler==0');
+}
+
+# ---------------------------------------------------------------------
 # plan_frame($rows, $n) — the frame must NEVER exceed the terminal height
 # (otherwise it scrolls and reintroduces the bug), at any size, with cap >= 1.
 # ---------------------------------------------------------------------

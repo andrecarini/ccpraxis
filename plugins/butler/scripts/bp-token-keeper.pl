@@ -21,7 +21,7 @@ package BpKeeper;
 use strict;
 use warnings;
 use JSON::PP;
-use Fcntl qw(:flock);
+use Fcntl qw(:flock O_WRONLY O_CREAT O_EXCL);
 use Errno qw(EBUSY EXDEV);
 use File::Basename qw(dirname);
 
@@ -36,19 +36,53 @@ our $DEFAULT_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
 our $DEFAULT_SCOPE = 'user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload';
 
 sub _log { my ($p,$t,$f)=@_; return unless defined $p; BpLog::event($p,$t,$f); }
-sub _read_json { my $f=shift; open my $fh,'<:raw',$f or return undef; local $/; my $r=<$fh>; close $fh; return eval { JSON::PP->new->decode($r) }; }
+
+# Raw bytes or undef (missing/unopenable). _read_json is re-expressed on top of
+# it; observable behaviour is IDENTICAL (missing/empty/truncated/malformed ->
+# undef; valid -> decoded ref) — see spec §5.8.
+sub _read_raw { my $f=shift; open my $fh,'<:raw',$f or return undef; local $/; my $r=<$fh>; close $fh; return $r; }
+sub _read_json { my $r = _read_raw($_[0]); return undef unless defined $r; return eval { JSON::PP->new->decode($r) }; }
+
+# NEW private, injectable-open in-place writer (b03). Returns 1; DIES on any
+# failure. $open_fn->($how,$path) -> filehandle | undef ($! set). $how is
+# '+<:raw' (existing file — UPDATE, never truncate-create) or '>:raw' (absent
+# file — plain create). The seam exists ONLY so AC-11 can prove the
+# create-branch is not taken for an existing file (no root, no bind mount).
+# INV-W4: the '>:raw' branch is taken only when -e $path is false — a failed
+# '+<' open on an existing file DIES rather than falling back to a truncating
+# create (fix for defect 6(i), old lines 91-93).
+sub _inplace_overwrite {
+    my ($path, $bytes, $mode, $open_fn) = @_;
+    $open_fn //= sub { my ($how,$p)=@_; open(my $fh,$how,$p) or return undef; return $fh };
+    my $ow;
+    if (-e $path) { $ow = $open_fn->('+<:raw', $path) or die "in-place open $path: $!"; }
+    else          { $ow = $open_fn->('>:raw',  $path) or die "in-place create $path: $!"; }
+    print $ow $bytes             or die "in-place write $path: $!";
+    truncate($ow, length $bytes) or die "in-place truncate $path: $!";
+    close $ow                    or die "in-place close $path: $!";
+    chmod $mode, $path;
+    return 1;
+}
 
 # Atomic write-back (the A0-proven implementation). Returns 'ok' or 'stand-down'.
 sub atomic_writeback {
-    my ($path, $resp, $expected_old_refresh, $now_ms, $rename_fn) = @_;
+    my ($path, $resp, $expected_old_refresh, $now_ms, $rename_fn, $inplace_fn) = @_;
     $now_ms //= time * 1000;
     # The rename step is an INJECTABLE seam (like http_post) so the in-place
     # fallback below is unit-testable without a real single-file bind mount
     # (which needs root + Linux). Production passes nothing -> real rename.
     $rename_fn //= sub { rename($_[0], $_[1]) };
+    # b03: injectable in-place writer, matching $rename_fn's seam style. Default
+    # = the real overwrite. Production passes nothing -> real in-place write.
+    $inplace_fn //= \&_inplace_overwrite;
     open my $lock, '>', "$path.lock" or die "lock: $!";
     flock($lock, LOCK_EX) or die "flock: $!";
-    my $data = _read_json($path) or die "creds unparseable at write-back";
+    # b03: read the ORIGINAL raw bytes once, under the held flock, and retain
+    # them for the duration of the call — they are the rollback source if the
+    # in-place fallback below fails partway through (INV-W2).
+    my $orig_raw = _read_raw($path);
+    my $data = (defined $orig_raw ? eval { JSON::PP->new->decode($orig_raw) } : undef)
+        or die "creds unparseable at write-back";
     my $o = $data->{claudeAiOauth} or die "no claudeAiOauth";
     if (defined $expected_old_refresh && ($o->{refreshToken}//'') ne $expected_old_refresh) {
         close $lock; return 'stand-down';
@@ -62,7 +96,26 @@ sub atomic_writeback {
     defined $o->{$_} or die "missing $_ post-update" for qw(accessToken refreshToken expiresAt);
     my @st = stat($path); my $mode = @st ? ($st[2] & 07777) : 0600;
     my $tmp = "$path.tmp.$$";
-    open my $w, '>:raw', $tmp or die "tmp: $!"; print $w $out or die; close $w or die;
+    # b03 R1 (redteam MAJOR-1): the temp is created with restrictive perms
+    # (0600) via O_EXCL BEFORE a single token byte is written. The old code
+    # opened '>:raw' (0666 & ~umask -- world-readable at a default umask) and
+    # only chmod'd to $mode AFTER a successful close, so (a) there was a real
+    # world-readable window on the happy path, and (b) a print/close failure
+    # on THIS initial write died before reaching either the chmod or an
+    # unlink, orphaning a 0644 file holding the new access+refresh tokens in
+    # plaintext forever. Both are fixed here: the mode is restrictive from
+    # creation, and every failure below unlinks the temp before dying
+    # (O_EXCL also refuses a stale/pre-planted/symlinked temp at this path).
+    sysopen(my $w, $tmp, O_WRONLY | O_CREAT | O_EXCL, 0600) or die "tmp: $!";
+    binmode $w, ':raw';
+    unless (print $w $out) {
+        my $e = $!; close $w; unlink($tmp) or warn "tmp cleanup $tmp: $!";
+        die "tmp write $path: $e";
+    }
+    unless (close $w) {
+        my $e = $!; unlink($tmp) or warn "tmp cleanup $tmp: $!";
+        die "tmp close $path: $e";
+    }
     chmod $mode, $tmp;
     unless ($rename_fn->($tmp, $path)) {
         # Read errno IMMEDIATELY (any later syscall clobbers $!).
@@ -78,7 +131,6 @@ sub atomic_writeback {
         # sandboxes the creds are a real file in a dir bind and the rename
         # path is taken; this is the defense-in-depth branch.)
         if ($en == EBUSY || $en == EXDEV) {
-            unlink $tmp;
             # In-place rewrite WITHOUT a zero-length window: open for UPDATE
             # (no O_TRUNC), overwrite from the start with the already-validated
             # bytes, then truncate to the new length. A kill mid-write then
@@ -87,16 +139,45 @@ sub atomic_writeback {
             # re-materializes creds from the host, so this fallback is
             # self-healing. (Only runs on a legacy pre-Fix-1 single-file-bind
             # sandbox; Fix-1 dir-bind creds take the atomic rename path above.)
-            my $ow;
-            open($ow, '+<:raw', $path)
-                or open($ow, '>:raw', $path)   # file absent -> plain create
-                or die "in-place open $path (after rename $es): $!";
-            print $ow $out                 or die "in-place write $path: $!";
-            truncate($ow, length $out)     or die "in-place truncate $path: $!";
-            close $ow                      or die "in-place close $path: $!";
-            chmod $mode, $path;
+            my $ok = eval { $inplace_fn->($path, $out, $mode); 1 };
+            my $ierr = $@ || 'unknown in-place failure';
+            if ($ok) {
+                unlink($tmp) or warn "tmp cleanup $tmp: $!";
+            } else {
+                # b03 R3 (redteam MAJOR-3): the restore below reuses the SAME
+                # real opener the primary attempt just used, so an open-step
+                # failure (EROFS/EACCES/EMFILE -- nothing ever written) would
+                # hit it identically and produce a false "creds may be
+                # damaged" for a byte-for-byte untouched file. Distinguish
+                # "nothing was written" from "write failed midway" by
+                # comparing the file's CURRENT bytes to the retained
+                # $orig_raw before attempting any restore at all.
+                my $cur_bytes = _read_raw($path);
+                my $untouched = (defined $cur_bytes && defined $orig_raw && $cur_bytes eq $orig_raw) ? 1 : 0;
+                if ($untouched) {
+                    unlink($tmp) or warn "tmp cleanup $tmp: $!";
+                    die "in-place write $path failed: $ierr ($path was never modified -- nothing to restore)";
+                }
+                # A genuine mid-write failure: attempt the restore.
+                # Restore ALWAYS uses the real _inplace_overwrite, never $inplace_fn:
+                # the injected failing writer must not be able to sabotage the rollback.
+                my $rok = eval { _inplace_overwrite($path, $orig_raw, $mode); 1 };
+                my $rerr = $@;
+                unlink($tmp) or warn "tmp cleanup $tmp: $!";
+                # b03 R2 (redteam MAJOR-2): by the time we get here the auth
+                # server has ALREADY rotated the refresh token server-side (the
+                # POST that produced $resp ran before atomic_writeback was ever
+                # called) -- so the just-restored $orig_raw is a KNOWN-STALE
+                # credential even though the restore "succeeded". Say so
+                # explicitly so a later 401 reads as a consequence of THIS
+                # failure, not as a host/sandbox grant-divergence alert.
+                die "in-place write $path failed: $ierr (original creds restored; WARNING: the "
+                  . "just-restored refresh token may already be stale -- the auth server likely "
+                  . "rotated it server-side before this restore ran)" if $rok;
+                die "in-place write $path failed: $ierr (RESTORE FAILED: $rerr - creds may be damaged)";
+            }
         } else {
-            unlink $tmp;
+            unlink($tmp) or warn "tmp cleanup $tmp: $!";
             die "rename: $es";
         }
     }
@@ -118,10 +199,14 @@ sub keeper_tick {
     my $now  = $args->{now_ms}     // (time * 1000);
     my $log  = $args->{log_path};
     my $post = $args->{http_post}  || \&_real_http_post;
+    my $quiet_creds = $args->{quiet_creds_error} // 0;
 
     # 1. creds present + parseable + shape valid
     my $data = _read_json($path);
-    unless ($data) { _log($log,'creds_error',{detail=>'unreadable or invalid JSON'}); return {action=>'pause-creds'}; }
+    unless ($data) {
+        _log($log,'creds_error',{detail=>'unreadable or invalid JSON'}) unless $quiet_creds;
+        return {action=>'pause-creds'};
+    }
     my ($cok,$cprob) = BpContract::validate_creds($data);
     unless ($cok) { _log($log,'creds_drift',{problems=>$cprob}); return {action=>'pause-contract',detail=>$cprob}; }
     my $o = $data->{claudeAiOauth};

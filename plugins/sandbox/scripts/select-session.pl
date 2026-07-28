@@ -28,7 +28,7 @@
 
 use strict;
 use warnings;
-use File::Basename qw(basename);
+use File::Basename qw(basename dirname);
 use POSIX qw(strftime);
 
 binmode STDOUT, ':raw';
@@ -43,8 +43,10 @@ my $WINDOWS_FAMILY = $^O =~ /^(MSWin32|cygwin|msys)$/;
 my $SESSIONS_DIR  = '';
 my $PROJECT_LABEL = '';
 my $OUTPUT_FILE   = '';
+my $BLUEPRINTS_DIR     = '';
+my $BLUEPRINTS_DIR_SET = 0;   # 1 iff --blueprints-dir was supplied (even if empty)
 
-# Parse @ARGV into the three globals above. Split out from the entry point so
+# Parse @ARGV into the globals above. Split out from the entry point so
 # the `unless (caller)` guard at the bottom can run it only when the script is
 # executed directly (not when a test `require`s it to exercise the helpers).
 sub parse_args {
@@ -63,6 +65,10 @@ sub parse_args {
             $OUTPUT_FILE = shift @argv;
         } elsif ($a =~ /^--output=(.*)$/) {
             $OUTPUT_FILE = $1;
+        } elsif ($a eq '--blueprints-dir' && @argv) {
+            $BLUEPRINTS_DIR = shift @argv; $BLUEPRINTS_DIR_SET = 1;
+        } elsif ($a =~ /^--blueprints-dir=(.*)$/) {
+            $BLUEPRINTS_DIR = $1;         $BLUEPRINTS_DIR_SET = 1;
         } else {
             print STDERR "select-session.pl: unknown arg: $a\n";
             exit 1;
@@ -81,6 +87,50 @@ sub parse_args {
     # label can't beep/overwrite/spoof the menu (the TUI path is also guarded
     # by clip_visible, but the line-prompt header prints it raw).
     $PROJECT_LABEL = sanitize_cell($PROJECT_LABEL);
+
+    # --blueprints-dir is OPTIONAL (the s14-session-filter test/override seam,
+    # Decision #3): when not supplied, derive it from --sessions-dir so
+    # launcher.pl (outside this package's write set) needs no new flag.
+    # Supplying it (even as '') disables derivation entirely.
+    $BLUEPRINTS_DIR = derive_blueprints_dir($SESSIONS_DIR) unless $BLUEPRINTS_DIR_SET;
+}
+
+# derive_blueprints_dir($sessions_dir) -> $path_or_empty
+#
+# The real invocation passes
+# <project>/.ccpraxis-local-data/claude-home/projects/-project, which yields
+# <project>/.ccpraxis-local-data/blueprints — the exact tree launcher.pl and
+# bp-lib.sh scan. Accepts / or \ as the separator (the launcher runs
+# host-side, where $PROJECT_PATH may be a Windows path). Requires the
+# .ccpraxis-local-data component to be a strict ancestor (a trailing
+# separator must follow it). Any other shape -> ''. Never dies. Does NOT
+# check existence — collect_butler_sids handles a non-existent root.
+sub derive_blueprints_dir {
+    my ($sd) = @_;
+    return '' unless defined $sd && length $sd;
+    return '' unless $sd =~ m{^(.*\.ccpraxis-local-data)[/\\]};   # greedy: last occurrence
+    return "$1/blueprints";
+}
+
+# =====================================================================
+# SessionFilter integration (fail-open — D4)
+# =====================================================================
+
+my $HAVE_SESSION_FILTER;   # undef = not tried yet
+
+sub load_session_filter {
+    return $HAVE_SESSION_FILTER if defined $HAVE_SESSION_FILTER;
+    my $dir = File::Basename::dirname(__FILE__);
+    $HAVE_SESSION_FILTER = eval { require "$dir/SessionFilter.pm"; 1 } ? 1 : 0;
+    return $HAVE_SESSION_FILTER;
+}
+
+# butler_sids() -> \%sids ({} when the module or the root is unavailable).
+sub butler_sids {
+    return {} unless length $BLUEPRINTS_DIR;
+    return {} unless load_session_filter();
+    my $s = eval { SessionFilter::collect_butler_sids($BLUEPRINTS_DIR) };
+    return (ref $s eq 'HASH') ? $s : {};
 }
 
 sub write_action {
@@ -284,11 +334,64 @@ sub build_options {
         my $short_uuid = substr($s->{uuid}, 0, 8);
         my $label = sprintf("%s  (%s)  %s  %s", $when, $rel, $short_uuid, $prev);
         push @opts, {
-            label  => $label,
-            action => "RESUME $s->{uuid}",
+            label     => $label,
+            action    => "RESUME $s->{uuid}",
+            is_butler => ($s->{is_butler} ? 1 : 0),
         };
     }
     return @opts;
+}
+
+# filter_options($opts_aref, $view) -> @filtered
+#
+# Pure. Option 0 ("Start a new session") is always kept, in every view,
+# unfiltered. $view of undef/''/anything-else is treated as 'user'.
+# Returns the SAME hashrefs (no copies, no mutation of the input array
+# or elements).
+sub filter_options {
+    my ($opts, $view) = @_;
+    return () unless ref $opts eq 'ARRAY' && @$opts;
+    $view = 'user' unless defined $view && $view eq 'butler';
+    my @out = ($opts->[0]);                          # "Start a new session", always
+    for my $i (1 .. $#$opts) {
+        my $b = $opts->[$i]{is_butler} ? 1 : 0;
+        push @out, $opts->[$i] if ($view eq 'butler') ? $b : !$b;
+    }
+    return @out;
+}
+
+# footer_text($view, $short) -> $string
+#
+# The view indicator leads so it survives clip_visible truncation on a
+# narrow terminal. The short form keeps the current short footer's tail
+# verbatim.
+sub footer_text {
+    my ($view, $short) = @_;
+    my $label = (defined $view && $view eq 'butler') ? 'butler' : 'user';
+    my $other = $label eq 'butler' ? 'user' : 'butler';
+    return "  view: $label   [t] $other   up/down  pgup/pgdn  enter  q/esc" if $short;
+    return "  view: $label   [t] show $other sessions   "
+         . "up/down: select   pgup/pgdn/home/end: jump   enter: confirm   q/esc: cancel";
+}
+
+# empty_view_note($view) -> $string
+#
+# Plain text only (no SGR, no indent) — $render wraps it, mirroring the
+# existing "(N more above/below)" hints.
+sub empty_view_note {
+    my ($view) = @_;
+    return (defined $view && $view eq 'butler')
+        ? '(no butler sessions)' : '(no user sessions)';
+}
+
+# show_empty_note($n_view, $shown, $cap) -> 0|1
+#
+# The row-budget guard for the empty-view note, factored out so the
+# "frame never overflows" invariant stays unit-testable without a TTY.
+sub show_empty_note {
+    my ($n_view, $shown, $cap) = @_;
+    return 0 if !defined $n_view || !defined $shown || !defined $cap;
+    return ($n_view <= 1 && $shown < $cap) ? 1 : 0;
 }
 
 # Non-TUI fallback path — prints a numbered list and reads a single line.
@@ -423,14 +526,16 @@ sub scroll_window {
 # width so nothing wraps. Restores the cursor + readmode + main screen on every
 # exit path.
 sub run_tui {
-    my @opts = @_;
+    my @opts = @_;                                   # ALL options
+    my $view = 'user';                               # default view (Decision #10)
+    my @view = filter_options(\@opts, $view);
     my $sel  = 0;      # pre-select option 0 = "Start a new session"
     my $top  = 0;      # index of the first option shown in the viewport
     my $page = 1;      # PageUp/Down step; recomputed from the live window size
 
     my $have_readkey = eval { require Term::ReadKey; 1 };
     if (!$have_readkey || !-t STDIN || !-t STDERR) {
-        return run_line_prompt(@opts);
+        return run_line_prompt(@view);               # D8: default-filtered, no toggle
     }
 
     my $on_alt  = 0;
@@ -461,13 +566,13 @@ sub run_tui {
         # plan_frame guarantees the whole frame fits in $rows at any size, and
         # degrades the chrome (rule/spacers/hints) on tiny terminals so it can
         # never overflow and reintroduce scrolling.
-        my $L   = plan_frame($rows, scalar @opts);
+        my $L   = plan_frame($rows, scalar @view);
         my $cap = $L->{cap};
         $page = $cap;
-        $top  = scroll_window($top, $sel, $cap, scalar @opts);
+        $top  = scroll_window($top, $sel, $cap, scalar @view);
         my $last = $top + $cap - 1;
-        $last = $#opts if $last > $#opts;
-        my $below = $#opts - $last;
+        $last = $#view if $last > $#view;
+        my $below = $#view - $last;
 
         my $row   = sub { clip_visible($_[0], $cols) . "\e[K\n" };  # clip + clear-to-EOL
         my $title = "\e[1mResume a session"
@@ -480,18 +585,22 @@ sub run_tui {
         $out .= $row->(sprintf("\e[2m    (%d more above)\e[0m", $top))
             if $L->{hints} && $top > 0;
         for my $i ($top .. $last) {
-            my $label = $opts[$i]{label};
+            my $label = $view[$i]{label};
             $out .= $row->($i == $sel
                 ? "\e[1;36m  > \e[0m" . $label
                 : "    " . $label);
+        }
+        my $shown = ($last >= $top) ? ($last - $top + 1) : 0;
+        if (show_empty_note(scalar @view, $shown, $cap)) {
+            $out .= $row->("\e[2m    " . empty_view_note($view) . "\e[0m");
         }
         $out .= $row->(sprintf("\e[2m    (%d more below)\e[0m", $below))
             if $L->{hints} && $below > 0;
         if ($L->{foot} >= 2) {
             $out .= $row->("");
-            $out .= $row->("  up/down: select   pgup/pgdn/home/end: jump   enter: confirm   q/esc: cancel");
+            $out .= $row->(footer_text($view, 0));
         } elsif ($L->{foot} >= 1) {
-            $out .= $row->("  up/down  pgup/pgdn  enter  q/esc");
+            $out .= $row->(footer_text($view, 1));
         }
         $out .= "\e[J";     # wipe any rows left over from a previous taller frame
         print STDERR $out;
@@ -508,9 +617,9 @@ sub run_tui {
                 my $k3 = Term::ReadKey::ReadKey(0.05);
                 if (defined $k3) {
                     if    ($k3 eq 'A') { $sel-- if $sel > 0;      $render->(); next }
-                    elsif ($k3 eq 'B') { $sel++ if $sel < $#opts; $render->(); next }
+                    elsif ($k3 eq 'B') { $sel++ if $sel < $#view; $render->(); next }
                     elsif ($k3 eq 'H') { $sel = 0;                $render->(); next }  # Home
-                    elsif ($k3 eq 'F') { $sel = $#opts;           $render->(); next }  # End
+                    elsif ($k3 eq 'F') { $sel = $#view;           $render->(); next }  # End
                     elsif ($k3 =~ /[0-9]/) {
                         # CSI numeric sequences (e.g. PageUp = \e[5~, PageDown =
                         # \e[6~); collect the digits up to the terminating '~'.
@@ -522,7 +631,7 @@ sub run_tui {
                         if    ($digits eq '5') { $sel -= $page }   # PageUp
                         elsif ($digits eq '6') { $sel += $page }   # PageDown
                         $sel = 0      if $sel < 0;
-                        $sel = $#opts if $sel > $#opts;
+                        $sel = $#view if $sel > $#view;
                         $render->(); next;
                     }
                     next;   # other escape: ignore
@@ -530,7 +639,18 @@ sub run_tui {
             }
             $result = 'CANCEL'; last;   # lone ESC cancels
         }
-        if ($k eq "\n" || $k eq "\r") { $result = $opts[$sel]{action}; last }
+        if ($k eq "\n" || $k eq "\r") {
+            $result = @view ? $view[$sel]{action} : 'CANCEL';
+            last;
+        }
+        if (lc($k) eq 't') {
+            $view = ($view eq 'user') ? 'butler' : 'user';
+            @view = filter_options(\@opts, $view);
+            $sel  = 0;                       # D7
+            $top  = 0;
+            $render->();
+            next;
+        }
         if (lc($k) eq 'q')            { $result = 'CANCEL';            last }
         if ($k eq "\x03")             { $result = 'CANCEL';            last }
         # any other key: ignore, no redraw needed
@@ -552,11 +672,17 @@ unless (caller) {
     parse_args(@ARGV);
 
     my @sessions = list_sessions();
+    my $sids     = butler_sids();                      # {} on any failure (D4)
+    SessionFilter::mark_sessions(\@sessions, $sids) if load_session_filter();
+    $_->{is_butler} = ($_->{is_butler} ? 1 : 0) for @sessions;   # key always present
+
     my @opts     = build_options(@sessions);
 
     # Zero-session fast path: nothing to pick from, just emit NEW and exit.
     # Skipping the TUI here avoids a confusing one-option menu on the very
-    # first launch of a fresh sandbox.
+    # first launch of a fresh sandbox. D9: this counts ALL sessions, not just
+    # user-visible ones — if every session is butler, the TUI still opens so
+    # the [t] toggle stays reachable.
     if (@sessions == 0) {
         write_action('NEW');
         exit 0;

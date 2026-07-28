@@ -59,11 +59,17 @@ sub hb_call {
 # AC-b: SANDBOX_BRIDGED_PORTS unset -> default 9000-9009
 # -----------------------------------------------------------------------
 {
-    # Scrub SANDBOX_BRIDGED_PORTS from the environment entirely so we
-    # exercise the unset-variable branch, not an inherited value.
+    # Scrub EVERY variable bridged_ports consults so we exercise the default
+    # branch, not an inherited value. Unsetting SANDBOX_BRIDGED_PORTS alone is
+    # not enough: bridged_ports has a SECOND branch on SANDBOX_PORT_BASE, and
+    # the launcher exports both inside a real sandbox (observed 2026-07-25:
+    # SANDBOX_BRIDGED_PORTS=9020-9029 with SANDBOX_PORT_BASE=9020). Scrubbing
+    # only the first fell through to branch 2 and returned 9020..9029, so this
+    # test failed for everyone running the suite INSIDE a sandbox — which is
+    # exactly where the harvest judge runs it.
     my $out = hb_call(
         {},
-        'unset SANDBOX_BRIDGED_PORTS; bridged_ports'
+        'unset SANDBOX_BRIDGED_PORTS SANDBOX_PORT_BASE; bridged_ports'
     );
     is($out, '9000 9001 9002 9003 9004 9005 9006 9007 9008 9009',
        'AC-b: SANDBOX_BRIDGED_PORTS unset -> default 9000-9009');
