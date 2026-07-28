@@ -249,6 +249,30 @@ cp -a "$WC/.claude" "$NEW/.claude"
 `cp` exit status is checked by `set -e`. Do **not** run C twice: `cp -a src dst` where `dst` exists
 creates `dst/src`, silently nesting.
 
+**C2 — purge the copied container identity. THIS IS NOT OPTIONAL.**
+
+```bash
+rm -rf "$NEW/.ccpraxis-local-data/claude-home/.launcher"
+mkdir -p "$NEW/.ccpraxis-local-data/claude-home/sandbox-logs-from-workcopy"
+mv "$NEW/.ccpraxis-local-data/claude-home/sandbox-logs/"*.log \
+   "$NEW/.ccpraxis-local-data/claude-home/sandbox-logs-from-workcopy/" 2>/dev/null || true
+```
+
+> **Discovered the hard way on 2026-07-28 — this is what made the first Phase D attempt fail.**
+> `.ccpraxis-local-data/` is **not** an indivisible blob. `claude-home/.launcher/` holds
+> machine- and container-specific identity: `container-name`, `container-created`, `port-base`,
+> `containerfile-hash`, `launcher-hash`, `container-manifest.json`. Copying it verbatim carried
+> `container-name` = `claude-ccpraxis-sandbox-workcopy-fb51134b` into the clone, so `claude-sandbox`
+> run **from the clone** attached to the **work copy's** container and bind-mounted the work copy at
+> `/project`. `git -C /project status` then failed with the work copy's worktree pointer, which looks
+> exactly like "the clone is broken" but is nothing of the sort — the clone's `.git` is a real
+> directory. The whole `.launcher/` dir is derived state and is regenerated on the next launch; the
+> only thing lost is the skill-selection preference.
+>
+> **Gate:** `grep -rl "<old container name>" "$NEW/.ccpraxis-local-data/claude-home/"` returns nothing
+> outside `sandbox-logs-from-workcopy/`, and
+> `test ! -e "$NEW/.ccpraxis-local-data/claude-home/.launcher"`.
+
 **GATE — expected literally, ALL of these:**
 
 ```bash
@@ -297,16 +321,33 @@ set -eu
 git -C "$LIVE" status --short                       # must be clean before merging
 git -C "$LIVE" branch --show-current                # expect: main
 git -C "$LIVE" merge --no-ff ccpraxis-sandbox-workcopy
-cd "$LIVE" && perl install.pl
 ```
 
 **Merge BEFORE `branch -d` in F2.** `git branch -d` refuses to delete an unmerged branch — that
 refusal is the safety net, and it only works if E has already merged. Running F before E would
 either lose the branch (with `-D`) or block.
 
-The refusal only takes effect in the **installed** tree: `claude-sandbox` runs
-`~/.claude/plugins/marketplaces/ccpraxis-local/sandbox/scripts/launcher.pl`, a separate copy from any
-repo (B11). Landing `p01` in a repo and stopping there leaves live still offering worktrees.
+> **⚠️ B11 IS WRONG — corrected 2026-07-28 by direct measurement. `install.pl` is NOT the promotion
+> step and is not required.** B11 claims `claude-sandbox` runs an installed copy at
+> `~/.claude/plugins/marketplaces/ccpraxis-local/sandbox/scripts/launcher.pl`, separate from any repo.
+> **That file does not exist.** Measured:
+>
+> ```
+> ~/.claude/plugins/marketplaces/ccpraxis-local/sandbox/scripts/launcher.pl  -> MISSING
+> ~/.claude/ccpraxis/plugins/sandbox/scripts/launcher.pl                     -> 156409 bytes
+> PATH contains                                                              -> ~/.claude/ccpraxis/plugins/sandbox/bin
+> ```
+>
+> The `ccpraxis-local` marketplace is a **`directory` source** whose `installLocation` *is*
+> `~/.claude/ccpraxis/plugins` — the live repo itself. There is no third "installed" tree. B11's
+> "installed 156409 vs repo 175544, different files" was in fact comparing the **live repo** (156409)
+> against the **work copy** (175544) — two repos, not repo-vs-installed.
+>
+> **Consequence:** the `git merge` above lands the new `launcher.pl` exactly where `claude-sandbox`
+> reads it, so the refusal is live the moment the merge completes. `install.pl` only discovers and
+> runs each surface's `ccpraxis-install.pl` hook (PATH / PATHEXT wiring) — nothing `p01` changed. It
+> is harmless and idempotent if you run it, but it must **not** be treated as the promotion step:
+> doing so would let a successful-looking install hide a failed merge.
 
 **GATE — must be OBSERVED DIRECTLY, never inferred from `install.pl` exiting 0:**
 
