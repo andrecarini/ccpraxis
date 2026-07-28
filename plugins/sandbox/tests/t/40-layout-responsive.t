@@ -464,8 +464,8 @@ for my $c (20, 40, 80, 100, 200) {
         [ \%st,     12, 120, 2,  'two-column: 12x120' ],
         [ \%st,     10, 120, 0,  'two-column: 10x120' ],
         [ \%st,     8,  120, 0,  'two-column: 8x120 (clamped from a negative body_h)' ],
-        [ \%stb,    24, 120, 8,  'two-column with a gathered 3-item backpack (T_2=6): 24x120' ],
-        [ \%stb,    24, 80,  3,  'stacked with a gathered 3-item backpack (T_2=6): 24x80' ],
+        [ \%stb,    24, 120, 10, 'two-column with a gathered 3-item backpack (T_2=4): 24x120' ],
+        [ \%stb,    24, 80,  5,  'stacked with a gathered 3-item backpack (T_2=4): 24x80' ],
     );
     for my $row (@table) {
         my ($state, $r, $c, $expect, $label) = @$row;

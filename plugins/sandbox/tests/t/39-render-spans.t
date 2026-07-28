@@ -363,10 +363,16 @@ is(Dashboard::display_width("a\tb"), 2,
 }
 
 # ===========================================================================
-# AC-16 -> DC-2, DC-5: a plain-string panel line composes to the 2-span
-# shape [{'  ','body'}, {<sanitized text + pad>, <row role>}]; its cell role
-# is 'body'; its text is unchanged from the pre-s04 ASCII content. Plus a
-# byte-identical regression guard for the pinned S3.11/S3.12 algorithm.
+# AC-16 -> DC-2, DC-5: a container panel line's cell role is 'body'; its
+# text is unchanged from the pre-s04 ASCII content. Plus a byte-identical
+# regression guard for the pinned S3.11/S3.12 algorithm.
+# RETARGETED by s06-panel-semantics (2026-07-28): the exact-span-count
+# assertion below now expects the 6-span per-field shape (indent, label,
+# value, gap, glyph+status, trailing pad) that s06's own done-criterion #1
+# mandates for this same container line — see t/41-panel-semantics.t AC1/AC5
+# for the superseding, per-field oracle. Every other assertion in this block
+# (row role, indent span, spans_text invariant, no-ESC invariant) still holds
+# unchanged and is untouched.
 # ===========================================================================
 {
     # -- structural shape, via compose_frame + a known ASCII panel value --
@@ -385,8 +391,8 @@ is(Dashboard::display_width("a\tb"), 2,
         skip 'AC-16 structural checks require the container body row to exist', 6
             unless $body_row;
         is($body_row->{role}, 'body', "AC-16: plain-string panel line's row role is 'body'");
-        is(scalar(@{ $body_row->{spans} }), 2,
-            'AC-16: plain-string panel line composes to exactly 2 spans (indent + text)');
+        is(scalar(@{ $body_row->{spans} }), 6,
+            'AC-16: container panel line composes to exactly 6 spans (indent, label, value, gap, glyph+status, pad) per s06 AC1/AC5');
         is($body_row->{spans}[0]{text}, '  ', 'AC-16: first span is the 2-space body indent');
         is($body_row->{spans}[0]{role}, 'body', "AC-16: indent span role is 'body'");
         is(Dashboard::spans_text($body_row->{spans}), $body_row->{text},
