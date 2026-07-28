@@ -85,6 +85,18 @@ Maintain a **seen-set** = the decision ids you have already surfaced this sessio
 
 This is the **only** way you watch — no repeated `bp-status.sh` poll loop. Between watcher returns and user turns you spend no tokens.
 
+## Remediation (what the fleet fixed by itself)
+
+A run can legitimately finish with remediation activity and **no user prompt at all** — that is the autonomy principle working, not something withheld from the user. Report it as completed work, never as a pending action item.
+
+**`runs/remediation-queue.json`** (`schema: remediation-queue/1`) is the authoritative record. Per entry, surface: `finding_key`, `action`, `state` (`queued` / `awaiting_verify` / `verified` / `escalated`), `round`/`max_rounds`, the remediation package `id` and its current status. For the run as a whole, surface `rounds_used`/`rounds_cap`. Its `escalated[]` array is the authoritative list of what the single `_remediation` decision covers — render that, do **not** re-derive it from `runs/needs-you/`.
+
+**`runs/notices/`** — informational only, never an action item. Group by `source`: `remediation-engine` means *"I already fixed this"*, `conformance-gate` means *"I detected this"*. Keeping those apart is the whole point of Decision #20; collapsing them makes a self-heal look like an outstanding problem.
+
+**`runs/review/`** — the end-of-run review the user confirms **at leisure**. These are documented+justified deviations and dependency WARNs. They do **not** block the run and must not be presented as though they do.
+
+The only remediation artifact that genuinely needs the user is a `needs-you` record with `kind=remediation-escalation` and `package=_remediation` — the engine files at most one per run, when it could not characterize a fix, exhausted its round budget, or kept failing re-verification.
+
 ## Boundaries
 
 - You do **not** drive: no launching coordinators, no relaunching, no usage/token management — that is the orchestrator script's job (`/butler:dispatch-fleet`) or yours-as-driver only under `/butler:drive-solo`.

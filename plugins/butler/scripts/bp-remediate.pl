@@ -452,6 +452,15 @@ sub merge_queue {
         };
         my $st = (defined $lst && length $lst) ? $lst : $e->{pkg_status};
         $st = 'pending' unless defined $st && length $st;
+        # An entry past 'queued' has already had its remediation package run to
+        # completion -- that transition is exactly what moved it to
+        # awaiting_verify/terminal. It must never look launchable again: a stale
+        # pkg_status of 'pending' makes ready_packages relaunch it every tick, so
+        # $any_running never falls to 0, the conformance gate never fires, and the
+        # verification pass that would retire the entry can never run. Keep it in
+        # %meta (the remediation flag is what excludes it from conformance_registry)
+        # but report it as finished.
+        $st = 'done' if ($e->{state} // '') ne 'queued' && $st eq 'pending';
         $status->{$id} = $st;
         push @merged, $id;
     }

@@ -98,6 +98,30 @@ Harvest verifies each package against **its own** done-criteria. Nothing in that
 
 **It never pages a human** (Decision #20): no `needs-you` file, no package flipped to `blocked`/`parked`. Findings sit in the authoritative verdict for the b07 remediation engine. Reviews and notices never block completion. Env tunables: `BP_CONFORMANCE_MODEL` (default `opus`), `BP_CONFORMANCE_MAX_TURNS` (default `40`), `BP_CONFORMANCE_SPAWN_CAP` (default `2`). The per-package harvest default is untouched and remains `audit`.
 
+### Auto-remediation (blueprint Decisions #20/#21/#22 — the fleet fixes what it can characterize)
+
+The conformance gate above detects and **stops**. On its own that still leaves a human to notice a red verdict, which is exactly what the autonomy principle forbids: *any problem the fleet can characterize, it fixes itself and merely notifies; it never asks the user to confirm "is this a problem?" for something it already detected.* `bp-remediate.pl` (`package BpRemediate`) is the action half.
+
+**The safety line is `remedy.action`, not a judgement call.** b04/b05 already emit a concrete remedy vocabulary, and the engine dispatches on it — nothing is inferred from prose:
+
+| `remedy.action` | disposition |
+|---|---|
+| `declare_backpack`, `create_lockfile` (known ecosystem), `commit_lockfile` (with `file`), `remediate-conformance`, `remediate-build` (when a write set resolves) | **auto-fix** |
+| `bump_runtime` **with** a `to` field | **auto-fix** |
+| `bump_runtime` **without** `to` (no clear LTS successor) | **escalate** — `ambiguous` |
+| `justify` | **review** — non-blocking, needs a human's written justification at leisure |
+| `none`, absent, or unrecognized | **escalate** — `unfixable` (fail-closed) |
+
+**DAG-append is a queue, never a `blueprint.md` rewrite.** An auto-fix authors a real package ledger into `packages/` whose `write_set` is *the offending files only*, and registers it in **`runs/remediation-queue.json`** (`schema: remediation-queue/1`). `remediation_merge` folds those entries into `%meta`/`%status` immediately after `_load_state`, which runs every tick — so a queued package becomes launchable with **no orchestrator restart**, and `blueprint.md` is never touched. Entries carry their own `deps` (as **full** package ids — `deps_met` is an exact-string compare) and a **non-empty** `write_set`: an empty one would match every running package's prefix and deadlock the run, so it is refused.
+
+**The run is held open while remediation is outstanding.** `remediation_outstanding` is true while any entry is `queued` or `awaiting_verify`, and `run_complete` honours it exactly as it honours `conformance_outstanding`. An **escalated** entry does *not* hold the run open — the human is the blocking dependency at that point and the decision is already on disk, which is what makes termination possible in every branch.
+
+**Re-verification reuses b05's gate rather than duplicating it.** When remediation completes, the engine rotates the verdict into `runs/remediation/round-<n>/` and resets `_run.conformance_spawns`, so the unmodified gate fires again and produces a fresh verdict to compare against.
+
+**Termination is structural, not hopeful.** `BP_REMEDIATION_ROUNDS` (default **2**) bounds rounds per finding; `BP_REMEDIATION_CAP` (default **6**) bounds rounds opened per run and never resets; a no-progress guard escalates immediately when a re-raised finding's signature is byte-identical (the remediation changed nothing observable); `verified`/`escalated` are terminal and never revived; and remediation packages are excluded from the conformance registry so remediation-of-remediation is impossible. **Neither bound is `.tunables`-overridable** — that whitelist is writable by in-run actors, and letting a remediation coordinator raise the budget that bounds it is precisely the self-extension risk this engine is gated on.
+
+**Exactly one human decision, by construction.** Every escalation in a run aggregates into a single `needs-you` record with the constant pair `package=_remediation`, `kind=remediation-escalation`; `queue_needs_you` dedupes on that pair, so N escalations still yield one file. That decision is the *only* path by which this engine asks the user anything.
+
 ## The reporter (the human's front door)
 
 You become the reporter via **`/butler:reporter`** (implemented in package A7). It syncs to current on-disk state (blueprint + registry + ledgers + the `runs/needs-you/` queue — a bounded snapshot, never an accumulating transcript), detects and **attaches** to a live run (via the registry / the `runs/.orchestrator` marker / the busy-lease), answers status from disk in a cheap turn, surfaces queued human-intent decisions, and writes answers back to unblock packages. It does not drive the run and does not poll in a token-burning loop. **Closing the reporter never affects the run; re-running `/butler:reporter` re-attaches.**
