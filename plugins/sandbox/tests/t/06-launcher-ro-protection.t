@@ -16,7 +16,11 @@
 # the refreshed token with an atomic temp+rename, and you cannot rename()
 # over a single-file bind mountpoint (EBUSY). A real file in the dir bind
 # accepts both in-place AND rename writes, and they land on the canonical
-# host path. /root/.claude.json is still its own single-file RW bind.
+# host path. /root/.claude.json is likewise NO LONGER its own single-file
+# bind (s02-config-safety-implement spec B54): it now lives at
+# /root/.claude/.claude.json, an ordinary file inside the claude-home dir
+# bind, reached via CLAUDE_CONFIG_DIR=/root/.claude — the same
+# EBUSY-free atomic-rename story as .credentials.json above.
 
 use strict;
 use warnings;
@@ -32,7 +36,9 @@ plan tests => 7;
 #   claude-home/.launcher → /root/.claude/.launcher (RO overlay)
 #   claude-home/.credentials.json → /root/.claude/.credentials.json
 #       (REAL file in the dir bind — RW + rename-safe, NOT a single-file mount)
-#   claude-home/.claude.json → /root/.claude.json (RW single-file bind)
+#   claude-home/.claude.json → /root/.claude/.claude.json
+#       (REAL file in the dir bind, reached via CLAUDE_CONFIG_DIR=/root/.claude —
+#        NOT a single-file mount; s02-config-safety-implement spec B54)
 my $host_data = new_temp_dir();
 my $launcher_dir = "$host_data/.launcher";
 mkdir $launcher_dir or BAIL_OUT("mkdir $launcher_dir: $!");
@@ -48,7 +54,7 @@ print $h3 qq({"marker":"canonical-claude-json"}\n);    close $h3;
 my $c = create_probe_container(mounts => [
     '-v', "$host_data:/root/.claude",
     '-v', "$launcher_dir:/root/.claude/.launcher:ro",
-    '-v', "$host_data/.claude.json:/root/.claude.json",
+    '-e', 'CLAUDE_CONFIG_DIR=/root/.claude',
 ]);
 
 # 1. Container CAN read launcher metadata (e.g. statusline / skills reads).
@@ -89,7 +95,9 @@ my $creds_after = do { local $/; <$rc2> }; close $rc2;
 like($creds_after, qr/refreshed-via-rename/,
      'renamed .credentials.json content persists to the canonical host file');
 
-# 7. .claude.json single-file bind IS writable (claude writes settings).
+# 7. .claude.json (dir-bind real file) is RW from container (claude
+# writes settings there, reached via CLAUDE_CONFIG_DIR=/root/.claude —
+# NOT a single-file bind; spec B54).
 my ($rc_jw) = podman_run_capture('exec', $c, 'sh', '-c',
-    'echo \'{"hasCompletedOnboarding":true}\' > /root/.claude.json');
-is($rc_jw, 0, '.claude.json single-file bind is RW from container');
+    'echo \'{"hasCompletedOnboarding":true}\' > /root/.claude/.claude.json');
+is($rc_jw, 0, '.claude.json (dir-bind real file) is RW from container');

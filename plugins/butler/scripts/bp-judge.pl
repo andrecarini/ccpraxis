@@ -192,6 +192,279 @@ sub want_harvest_gate {
     return 1;
 }
 
+# ---------------------------------------------------------------------------
+# b05-conformance-gate — pure conformance decision functions (spec §2.1).
+# All pure: no I/O, no globals, never die, fail-closed (missing/empty/
+# unparseable input NEVER yields a silent pass).
+# ---------------------------------------------------------------------------
+
+# --- fire condition: every package terminal AND none awaiting a human (D6).
+# %pkgs: { pkg => { status => $str, ... } }
+# 'awaiting_human' takes precedence over 'not_terminal' when both hold, because a
+# run holding a blocked/parked package never actually finished — judging it would
+# produce a junk verdict.
+sub conformance_ready {
+    my ($pkgs) = @_;
+    $pkgs = {} unless ref $pkgs eq 'HASH';
+    my @names = sort keys %$pkgs;
+    return { ready => 0, reason => 'empty_registry', awaiting => [] } unless @names;
+    my (@awaiting, $nonterm);
+    for my $n (@names) {
+        my $st = '';
+        $st = $pkgs->{$n}{status} if ref $pkgs->{$n} eq 'HASH' && defined $pkgs->{$n}{status};
+        # tolerate sloppy ledger values: a stray space or capital would otherwise read
+        # as non-terminal and silently skip the gate for the whole run.
+        $st =~ s/^\s+//; $st =~ s/\s+$//; $st = lc $st;
+        if    ($st eq 'blocked' || $st eq 'parked')  { push @awaiting, $n }
+        elsif ($st eq 'done'    || $st eq 'dropped') { }
+        else                                         { $nonterm = 1 }
+    }
+    return { ready => 0, reason => 'awaiting_human', awaiting => \@awaiting } if @awaiting;
+    return { ready => 0, reason => 'not_terminal',   awaiting => [] } if $nonterm;
+    return { ready => 1, reason => 'ready',          awaiting => [] };
+}
+
+# --- mandated_means parsing (D8). $raw = verbatim text after 'mandated_means:'
+# in ledger frontmatter, or undef when the key is absent. ledger_fm is scalar-only,
+# so this is the narrow list-aware reader — deliberately NOT a general YAML parser.
+# shape in (flow | flow_empty | block | absent | unknown)
+sub _mm_clean {
+    my ($s) = @_;
+    return '' unless defined $s;
+    $s =~ s/^\s+//; $s =~ s/\s+$//;
+    $s =~ s/^-\s*//;
+    $s =~ s/^\s+//; $s =~ s/\s+$//;
+    $s =~ s/^"(.*)"$/$1/s or $s =~ s/^'(.*)'$/$1/s;
+    $s =~ s/^\s+//; $s =~ s/\s+$//;
+    return $s;
+}
+sub parse_mandated_means {
+    my ($raw) = @_;
+    return { means => [], shape => 'absent', ok => 1 } unless defined $raw && $raw =~ /\S/;
+    my $t = $raw;
+    $t =~ s/^\s+//; $t =~ s/\s+$//;
+    if ($t =~ /^\[(.*)\]$/s) {                       # inline flow list
+        my $inner = $1;
+        return { means => [], shape => 'flow_empty', ok => 1 } unless $inner =~ /\S/;
+        # a nested structure is not a flat list we understand — fail closed
+        return { means => [], shape => 'unknown', ok => 0 } if $inner =~ /[\[\]{}]/;
+        my @m = grep { length } map { _mm_clean($_) } split /,/, $inner;
+        return { means => \@m, shape => 'flow', ok => 1 };
+    }
+    my @lines = grep { /\S/ } split /\n/, $t;        # YAML block list
+    if (@lines && !grep { !/^\s*-\s*\S/ } @lines) {
+        my @m = grep { length } map { _mm_clean($_) } @lines;
+        return { means => \@m, shape => 'block', ok => 1 };
+    }
+    return { means => [], shape => 'unknown', ok => 0 };
+}
+
+# --- deviation classification (spec §3.3): 'review' ONLY on a genuinely non-blank
+# justification. Anything ambiguous is 'fail' — a forged or empty justification
+# must never downgrade a FAIL into a non-blocking review.
+sub classify_deviation {
+    my ($dev) = @_;
+    return 'ignore' unless ref $dev eq 'HASH';
+    return 'ignore' unless defined $dev->{means} && $dev->{means} =~ /\S/;
+    my $why = defined $dev->{justification} ? $dev->{justification} : '';
+    $why =~ s/^\s+//; $why =~ s/\s+$//;
+    return 'review' if $dev->{justification_present} && length $why;
+    return 'fail';
+}
+
+# --- verdict normalization. $raw = decoded verdict JSON, the {_malformed=>1}
+# sentinel from read_judge_verdict, or undef. NEVER returns 'pass' for those.
+sub normalize_conformance {
+    my ($raw) = @_;
+    my %out = (outcome => 'error', findings => [], reviews => [], notices => [],
+               notes => [], deviations => []);
+    unless (ref $raw eq 'HASH') {
+        push @{ $out{notes} }, 'raw conformance verdict absent or not an object';
+        return \%out;
+    }
+    if ($raw->{_malformed}) {
+        push @{ $out{notes} }, 'raw conformance verdict was malformed JSON';
+        return \%out;
+    }
+    for my $k (qw(findings reviews notices deviations)) {
+        $out{$k} = (ref $raw->{$k} eq 'ARRAY') ? [ @{ $raw->{$k} } ] : [];
+    }
+    push @{ $out{notes} }, @{ $raw->{notes} } if ref $raw->{notes} eq 'ARRAY';
+    my $o = defined $raw->{outcome} ? lc $raw->{outcome}
+          : defined $raw->{verdict} ? lc $raw->{verdict} : '';
+    unless ($o eq 'pass' || $o eq 'fail' || $o eq 'error') {
+        push @{ $out{notes} }, 'unrecognized or missing outcome in raw verdict';
+        return \%out;                       # stays 'error' — never a silent pass
+    }
+    $out{outcome} = $o;
+    $out{outcome} = 'fail' if $o eq 'pass' && @{ $out{findings} };
+    return \%out;
+}
+
+# --- deps-check folding (Decision #14, spec §2.10/§3.7).
+# $report = decoded runs/deps-check.json | {_malformed=>1} | undef.
+# b05 NEVER runs bp-deps-check.pl; the on-disk report is the entire interface, so
+# b04's exit-2 is irrelevant here — a BLOCK is detected by reading blocks[].
+sub fold_deps_check {
+    my ($report) = @_;
+    my %out = (findings => [], reviews => [], notices => [], outcome_hint => 'pass', ok => 1);
+    unless (defined $report) {
+        push @{ $out{notices} }, { subject => 'deps-check report absent', severity => 'info',
+            detail => 'no runs/deps-check.json present; dependency policy was not evaluated',
+            evidence => {} };
+        return \%out;
+    }
+    if (ref $report ne 'HASH' || $report->{_malformed}
+        || (exists $report->{blocks} && ref $report->{blocks} ne 'ARRAY')
+        || (exists $report->{warns}  && ref $report->{warns}  ne 'ARRAY')) {
+        $out{ok} = 0;
+        $out{outcome_hint} = 'error';
+        push @{ $out{notices} }, { subject => 'deps-check report malformed', severity => 'warn',
+            detail => 'runs/deps-check.json could not be interpreted; treated as a failure, not a pass',
+            evidence => {} };
+        return \%out;
+    }
+    # Fail-closed on severity as well as position: an entry is blocking if it sits in
+    # blocks[] OR labels itself severity=block. b04 guarantees the two agree, but this
+    # file is just a file — trusting position alone would let a warns[] entry labelled
+    # severity=block be downgraded to a non-blocking review.
+    my @block_entries = @{ $report->{blocks} || [] };
+    my @warn_entries;
+    for my $w (@{ $report->{warns} || [] }) {
+        if (ref $w eq 'HASH' && defined $w->{severity} && lc $w->{severity} eq 'block') {
+            push @block_entries, $w;
+        } else { push @warn_entries, $w }
+    }
+    for my $b (@block_entries) {
+        next unless ref $b eq 'HASH';
+        push @{ $out{findings} }, {
+            kind     => (defined $b->{kind} ? $b->{kind} : 'deps-check-block'),   # PRESERVED for b07
+            severity => 'block',
+            subject  => (defined $b->{subject} ? $b->{subject} : 'unknown'),
+            detail   => (defined $b->{detail}  ? $b->{detail}  : ''),
+            evidence => (ref $b->{evidence} eq 'HASH' ? $b->{evidence} : {}),
+            remedy   => (ref $b->{remedy}   eq 'HASH' ? $b->{remedy}   : { action => 'none' }),
+            needs_justification => 0,
+        };
+        $out{outcome_hint} = 'fail';
+    }
+    for my $w (@warn_entries) {
+        next unless ref $w eq 'HASH';
+        push @{ $out{reviews} }, {
+            package        => 'unknown',
+            coordinator    => 'unknown',
+            original_means => (defined $w->{subject} ? $w->{subject} : 'unknown'),
+            change         => (defined $w->{detail}  ? $w->{detail}  : ''),
+            why            => ((ref $w->{remedy} eq 'HASH' && defined $w->{remedy}{action})
+                                ? $w->{remedy}{action} : 'justify'),
+            ledger_marker  => 'deps-check::warn',
+            evidence       => (ref $w->{evidence} eq 'HASH' ? $w->{evidence} : {}),
+        };
+    }
+    return \%out;
+}
+
+# --- fire-once bookkeeping (D7): inflight | verdict-present | spawn cap.
+sub conformance_should_spawn {
+    my ($s) = @_;
+    return 0 unless ref $s eq 'HASH';
+    return 0 if $s->{inflight};
+    return 0 if $s->{verdict_present};
+    my $spawns = defined $s->{spawns} ? $s->{spawns} : 0;
+    my $cap    = defined $s->{cap}    ? $s->{cap}    : 0;
+    return ($spawns < $cap) ? 1 : 0;
+}
+
+# --- record builders (spec §2.4 finding / §2.5 notice / §2.6 review).
+sub finding_record {
+    my ($dev, $ctx) = @_;
+    $dev ||= {}; $ctx ||= {};
+    return {
+        kind     => ($ctx->{kind} || 'conformance-deviation'),
+        severity => 'block',
+        subject  => (defined $dev->{package} ? $dev->{package} : 'unknown'),
+        detail   => ($ctx->{detail} || ("mandated means '" . (defined $dev->{means} ? $dev->{means} : '?')
+                     . "' not evidenced" . (defined $dev->{observed} ? "; observed: $dev->{observed}" : ''))),
+        evidence => { means    => (defined $dev->{means}    ? $dev->{means}    : ''),
+                      observed => (defined $dev->{observed} ? $dev->{observed} : ''),
+                      files    => (ref $dev->{files} eq 'ARRAY' ? $dev->{files} : []) },
+        remedy   => { action  => 'remediate-conformance',
+                      package => (defined $dev->{package} ? $dev->{package} : 'unknown'),
+                      means   => (defined $dev->{means}   ? $dev->{means}   : '') },
+        needs_justification => 0,
+    };
+}
+sub review_record {
+    my ($dev, $ctx) = @_;
+    $dev ||= {}; $ctx ||= {};
+    return {
+        schema         => 'review/1',
+        generated_at   => ($ctx->{generated_at} || ''),
+        package        => (defined $dev->{package} ? $dev->{package} : 'unknown'),
+        coordinator    => ($ctx->{coordinator} || $dev->{who} || $dev->{package} || 'unknown'),
+        original_means => (defined $dev->{means} ? $dev->{means} : ''),
+        change         => (defined $dev->{change} ? $dev->{change}
+                           : (defined $dev->{observed} ? $dev->{observed} : '')),
+        why            => (defined $dev->{justification} ? $dev->{justification} : ''),
+        ledger_marker  => ($ctx->{ledger_marker} || 'Decisions & attempt log :: MEANS-DEVIATION'),
+        evidence       => { files => (ref $dev->{files} eq 'ARRAY' ? $dev->{files} : []) },
+    };
+}
+sub notice_record {
+    my ($subject, $detail, $ctx) = @_;
+    $ctx ||= {};
+    return {
+        schema       => 'notice/1',
+        generated_at => ($ctx->{generated_at} || ''),
+        source       => 'conformance-gate',
+        subject      => (defined $subject ? $subject : 'notice'),
+        detail       => (defined $detail  ? $detail  : ''),
+        severity     => ($ctx->{severity} || 'warn'),
+        evidence     => (ref $ctx->{evidence} eq 'HASH' ? $ctx->{evidence} : {}),
+    };
+}
+
+# --- MEANS-DEVIATION extraction from ledger TEXT (pure; spec §3.3 + §7.2).
+# Only entries inside '## Decisions & attempt log' count, and a fenced code block
+# never counts: otherwise a forged marker would silently downgrade a FAIL to a
+# non-blocking review and suppress remediation entirely.
+sub parse_means_deviations {
+    my ($txt) = @_;
+    my %out;
+    return \%out unless defined $txt && length $txt;
+    my ($sec) = $txt =~ /^##\s+Decisions\s*&\s*attempt\s+log\s*$(.*?)(?=^##\s|\z)/ms;
+    return \%out unless defined $sec;
+    my $fenced = 0;
+    for my $ln (split /\r?\n/, $sec) {
+        $ln =~ s/\r$//;
+        # BOTH fence styles must count. Only handling ``` left a hole: a ~~~ fence
+        # would hide a forged MEANS-DEVIATION from this filter while still reading
+        # as a code block, downgrading a blocking FAIL to a non-blocking review and
+        # silently suppressing remediation. Found by the coordinator's own red-team.
+        if ($ln =~ /^\s*(?:```|~~~)/) { $fenced = !$fenced; next }
+        next if $fenced;
+        next unless $ln =~ /MEANS-DEVIATION:\s*(.*)$/;
+        my $rest = $1;
+        # Every field's lookahead must name EVERY other field, `who=` included.
+        # Omitting `\s+who=` made `why=` swallow a trailing " who=<id>" into the
+        # justification text (corrupting the review record's `why`) while `who`
+        # itself was never captured, so review_record's $dev->{who} was always
+        # undef and `coordinator` silently fell back to the package name.
+        my $STOP = qr/(?=\s+means=|\s+change=|\s+why=|\s+who=|$)/;
+        my ($means)  = $rest =~ /\bmeans=(.*?)$STOP/;
+        my ($change) = $rest =~ /\bchange=(.*?)$STOP/;
+        my ($why)    = $rest =~ /\bwhy=(.*?)$STOP/;
+        my ($who)    = $rest =~ /\bwho=(.*?)$STOP/;
+        next unless defined $means && $means =~ /\S/;
+        for ($means, $change, $why, $who) { next unless defined $_; s/^\s+//; s/\s+$// }
+        $out{$means} = { change  => (defined $change ? $change : ''),
+                         why     => (defined $why    ? $why    : ''),
+                         who     => (defined $who    ? $who    : ''),
+                         present => 1 };
+    }
+    return \%out;
+}
+
 package main;
 use strict;
 use warnings;

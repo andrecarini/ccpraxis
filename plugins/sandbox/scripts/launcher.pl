@@ -45,9 +45,7 @@ BEGIN {
     unshift @INC, $dir;
 }
 use MountSpec qw(winify_path v_to_mount convert_v_to_mount);
-use CcpraxisWorkCopy qw(workcopy_route workcopy_decline_outcome
-    default_worktree_path worktree_plan blueprint_copy_plan
-    provision_state provision_repair_plan fleet_live);
+use CcpraxisWorkCopy qw(workcopy_route workcopy_refusal_outcome);
 use LaunchLog ();   # B1: durable per-launch diagnostic log (next to us in scripts/)
 use Dashboard ();   # B2: the raw-ANSI TUI dashboard framework
 use BackpackApproval ();  # #21: per-item, machine-local backpack approval memory
@@ -55,12 +53,13 @@ use BackpackReview ();    # #21: the I/O-seam-injected interactive approval walk
 use KeepAwake ();         # B5: dashboard wake-lock decision + lifecycle holder
 use ConnectorHold ();     # Fix 3: hold-the-window decision when a connector loses the container
 use ClaudeConfig ();      # self-heal .claude.json onboarding-bypass (0-byte / lost-keys)
-use PluginSync qw(copy_tree);  # Fix 2: copy-model plugin-store reconcile (copy/prune/reconcile)
+use PluginSync ();  # Fix 2: copy-model plugin-store reconcile (copy/prune/reconcile)
 use PortAlloc ();         # fix-multiple-running-sandboxes: per-container port-block allocation
 use SandboxLock ();       # 04-build-race-lock: generalised mkdir lock + global build-race guard
 use JSON::PP ();          # parse backpack.json + write the approved install-set
 use File::Path qw(make_path);
 use File::Spec;
+use Fcntl qw(O_WRONLY O_CREAT O_EXCL O_NOFOLLOW);  # symlink-safe corrupt-config backup (redteam C1)
 use Digest::MD5 qw();
 use POSIX qw(strftime);
 use Time::Piece;
@@ -218,145 +217,23 @@ $PROJECT_NAME =~ s/ /-/g;
 # §9.1: derive the live ccpraxis root from __FILE__ (registry-independent anchor).
 # launcher.pl lives at <ccpraxis>/plugins/sandbox/scripts/launcher.pl
 # so scripts->sandbox->plugins->ccpraxis is three dirname() calls.
-my $LIVE_CCPRAXIS_ROOT = do { my $h = __FILE__; $h =~ s|\\|/|g; my $s = dirname($h); dirname(dirname(dirname($s))); };
+my $LIVE_CCPRAXIS_ROOT = do {
+    my $h = abs_path(__FILE__);
+    die "ERROR: cannot canonicalise launcher.pl's own path via abs_path(__FILE__) "
+        . "-- refusing to guess the ccpraxis install anchor\n" unless defined $h;
+    $h =~ s|\\|/|g;
+    my $s = dirname($h);
+    dirname(dirname(dirname($s)));
+};
 {
     my $route = workcopy_route($PROJECT_PATH, { registry_path => "$HOST_PLUGINS_DIR/known_marketplaces.json", live_install_hint => $LIVE_CCPRAXIS_ROOT });
     if ($route eq 'offer') {
-        my $action = prompt_workcopy_action();
-        if ($action eq 'workcopy') {
-            # p02: provision a worktree and hand off to it
-            # All provisioning happens before the lock is acquired (no lock held here).
-
-            # 1. Resolve the worktree target path
-            my $wt = default_worktree_path({ live_install_hint => $LIVE_CCPRAXIS_ROOT });
-            unless (defined $wt) {
-                print STDERR "ERROR: cannot determine worktree path (no HOME/USERPROFILE). Aborting.\n";
-                reset_terminal();
-                exit 1;
-            }
-
-            # 2. Compute the container name for the worktree (same keying as the normal launch).
-            # _container_name_for applies the identical normalisation path so the fleet_live
-            # check and the real podman launch always agree on the container name (MAJOR-2 fix).
-            my $wt_container_name = _container_name_for($wt);
-
-            # 3. If a fleet is already live against the worktree, attach/resume without re-provisioning
-            if (fleet_live({
-                    container_name    => $wt_container_name,
-                    container_running => \&_podman_name_running,
-                    marker_probe      => sub { _freshest_marker_mtime($wt) },
-                })) {
-                # Decision #14b: attach/resume — do NOT re-provision (no clobber of in-flight run)
-                _reexec_launcher($wt);
-                exit 1;  # LOW-1: unreachable if exec succeeds; guards against fall-through
-            }
-
-            # 4. Get the current worktree list (list-form git, no shell)
-            my $wl = '';
-            {
-                local $ENV{MSYS2_ARG_CONV_EXCL} = '*';
-                my $pid = open(my $gfh, '-|', 'git', '-C', $LIVE_CCPRAXIS_ROOT, 'worktree', 'list', '--porcelain');
-                if ($pid) { local $/; $wl = <$gfh> // ''; close $gfh; }
-            }
-
-            # 5. Classify the current provisioning state
-            my $state = provision_state({
-                worktree_list => $wl,
-                target        => $wt,
-                branch        => 'ccpraxis-sandbox-workcopy',
-                copy_probe    => sub { _copy_state($LIVE_CCPRAXIS_ROOT, $wt) },
-                lock_probe    => sub { _leftover_lock($LIVE_CCPRAXIS_ROOT, $wt) },
-            });
-
-            # Detect branch-on-wrong-worktree / stray-dir edge cases from state
-            my $branch_wrong = 0;
-            if ($state eq 'partial') {
-                # Check if the branch is wrong (registered at target but on different branch)
-                if ($wl =~ /worktree \Q$wt\E/) {
-                    $branch_wrong = 1 unless $wl =~ /branch refs\/heads\/ccpraxis-sandbox-workcopy/;
-                }
-            }
-
-            # Check for stray non-worktree dir/symlink at target (abort, never force-clobber).
-            # LOW-2: also treat a symlink at $wt as a stray to abort on (a symlink is not a
-            # real git worktree directory and could redirect writes to an unintended location).
-            if ($state eq 'absent' && (-l $wt || -d $wt)) {
-                if (-l $wt) {
-                    print STDERR "ERROR: target worktree path '$wt' exists as a symlink\n";
-                    print STDERR "       but is NOT a registered git worktree. Refusing to follow/overwrite.\n";
-                    print STDERR "       Remove or rename it manually, then re-run.\n";
-                    reset_terminal();
-                    exit 1;
-                }
-                # Real directory: allow an EMPTY dir to proceed (git accepts an empty existing dir).
-                opendir(my $dh, $wt) or do { print STDERR "ERROR: cannot inspect $wt: $!\n"; reset_terminal(); exit 1; };
-                my @entries = grep { $_ ne '.' && $_ ne '..' } readdir $dh;
-                closedir $dh;
-                if (@entries) {
-                    print STDERR "ERROR: target worktree path '$wt' exists as a non-empty directory\n";
-                    print STDERR "       but is NOT a registered git worktree. Refusing to overwrite.\n";
-                    print STDERR "       Remove or rename it manually, then re-run.\n";
-                    reset_terminal();
-                    exit 1;
-                }
-            }
-
-            # 5b. Probe whether the branch already exists (MAJOR-1 fix: a prior
-            # "git worktree remove" leaves the branch behind; re-provisioning with -b
-            # then hard-fails "branch already exists"). List-form git, no shell.
-            my $branch_exists = 0;
-            {
-                local $ENV{MSYS2_ARG_CONV_EXCL} = '*';
-                # List-form: git branch --list ccpraxis-sandbox-workcopy
-                my @branch_check = ('git', '-C', $LIVE_CCPRAXIS_ROOT, 'branch', '--list', 'ccpraxis-sandbox-workcopy');
-                if (open(my $bh, '-|', @branch_check)) {
-                    local $/;
-                    my $bout = <$bh> // '';
-                    close $bh;
-                    $branch_exists = (length($bout =~ s/\s+//gr)) ? 1 : 0;
-                }
-            }
-
-            # 6. Execute the repair plan
-            my $plan = provision_repair_plan($state, {
-                live_root     => $LIVE_CCPRAXIS_ROOT,
-                target        => $wt,
-                branch        => 'ccpraxis-sandbox-workcopy',
-                branch_wrong  => $branch_wrong,
-                lock          => _leftover_lock($LIVE_CCPRAXIS_ROOT, $wt),
-                branch_exists => $branch_exists,
-            });
-
-            for my $step (@{ $plan->{steps} }) {
-                if ($step->{op} eq 'copy_tree') {
-                    my $cp = blueprint_copy_plan($LIVE_CCPRAXIS_ROOT, $wt);
-                    PluginSync::copy_tree($cp->{src}, $cp->{dst});
-                } elsif ($step->{op} eq 'clear_lock') {
-                    # Remove leftover lock/temp files — best effort
-                    my $lock_path = "$wt/.git/worktrees/" . basename($wt) . "/locked";
-                    unlink $lock_path if -f $lock_path;
-                } else {
-                    # git-bearing step: list-form, no shell
-                    local $ENV{MSYS2_ARG_CONV_EXCL} = '*';
-                    my @argv = @{ $step->{argv} };
-                    my $rc = system(@argv);
-                    if ($rc != 0) {
-                        print STDERR "ERROR: provisioning step '$step->{op}' failed (exit @{[$rc >> 8]}): @argv\n";
-                        reset_terminal();
-                        exit ($rc >> 8 || 1);
-                    }
-                }
-            }
-
-            # 7. Hand off to the worktree via re-exec
-            _reexec_launcher($wt);
-            exit 1;  # LOW-1: unreachable if exec succeeds; guards against fall-through
-        } else {
-            # decline
-            my $o = workcopy_decline_outcome();
-            print STDERR $o->{message}, "\n";
-            exit 1;
-        }
+        my $o = workcopy_refusal_outcome({
+            path      => $PROJECT_PATH,
+            live_root => $LIVE_CCPRAXIS_ROOT,
+        });
+        print STDERR $o->{message}, "\n";
+        exit($o->{exit_code} || 1);
     }
     # 'passthrough' → fall through to existing launch flow unchanged
 }
@@ -877,7 +754,7 @@ my $CONTAINER_NAME;
         $CONTAINER_NAME //= '';
     }
     if (!length $CONTAINER_NAME) {
-        # MAJOR-2: use _container_name_for so the fleet_live check and the real
+        # MAJOR-2: use _container_name_for so container-name lookups and the real
         # launch always agree on the container name for the same path.
         $CONTAINER_NAME = _container_name_for($PROJECT_PATH);
         _write_file($name_file, $CONTAINER_NAME);
@@ -908,6 +785,19 @@ my $CONTAINER_NAME;
         chomp $state if defined $state;
         $state //= '';
     }
+
+    # redteam H1: re-enforce the shape check HERE, before either fast path
+    # below can call ensure_claude_json_onboarded() (via the connector's
+    # dashboard requirement, or directly via enter_dashboard()'s
+    # bare-attach fast path) and rename() over the shared host config while
+    # an old-shape container is still attached — the s01 sec 4 ghost-inode
+    # hazard on the ordinary post-upgrade path. The sub re-inspects state
+    # itself, so calling it again here (in addition to the :2547 call,
+    # which stays for the create/attach decision below) is safe and,
+    # on a compliant container, silent. It never returns for a
+    # running+violating container (exit 1); it releases $LOCK_DIR itself in
+    # that case, matching the connector's own error path just below.
+    enforce_container_config_shape($CONTAINER_NAME);
 
     my $connector_mode = ($SESSION_MODE || length $RESUME_SESSION);
 
@@ -1143,6 +1033,109 @@ sub _container_exists {
     return $? == 0;
 }
 
+# Row 22 (spec 02-implement-config-safety-spec.md B12-B18, s01 sec 4). An
+# ALREADY-CREATED container bakes its `-e`/`-v` shape at `podman create` time
+# and keeps it forever; if it still carries the pre-fix single-file bind onto
+# /root/.claude.json, an atomic rename() on the host config (the new
+# ensure_claude_json_onboarded write path) replaces the inode out from under
+# it and that container silently, unrecoverably loses its config. This check
+# forces such a container off the old shape before any create/attach/write
+# decision is made.
+
+# container_config_shape_violations($name) -> @violations
+# Inspects an EXISTING container's baked mounts/env via `podman inspect` and
+# runs them through the SAME MountSpec::parse_inspect_lines + audit_claude_home
+# pipeline t/02 holds accountable (B17). Fail-open (returns ()) when the
+# container doesn't exist, $PODMAN is unset/unusable, or inspect fails or
+# emits unparseable output — a tool error must never block a launch (B16).
+sub container_config_shape_violations {
+    my ($name) = @_;
+    return () unless defined $name && length $name;
+    return () unless defined $PODMAN && length $PODMAN;
+    return () unless _container_exists($name);
+
+    # One MOUNT line per mount and one ENV line per env entry, matching the
+    # line shape MountSpec::parse_inspect_lines expects. Podman's default
+    # inspect JSON already stores Config.Env entries as "KEY=VALUE" strings,
+    # so {{.}} on that range is exactly right.
+    my $format = q{{{range .Mounts}}MOUNT {{.Type}} {{.Source}} {{.Destination}} {{.RW}}}
+        . qq{\n}
+        . q{{{end}}{{range .Config.Env}}ENV {{.}}}
+        . qq{\n}
+        . q{{{end}}};
+    my $out = `$PODMAN inspect --format '$format' "$name" 2>/dev/null`;
+    return () if $? != 0;
+    return () unless defined $out && length $out;
+
+    my @lines = split /\n/, $out;
+    my $parsed = eval { MountSpec::parse_inspect_lines(\@lines) };
+    return () if $@ || !$parsed;
+    my @violations = eval { MountSpec::audit_claude_home($parsed) };
+    return () if $@;
+    return @violations;
+}
+
+# enforce_container_config_shape($name) -> void
+# Non-declinable remediation (B18): NEVER routed through prompt_stale_action
+# or @STALE_REASONS — that prompt defaults to "continue" and returns
+# "continue" on EOF in every non-interactive launch, which would make this
+# fix silently declinable. A compliant or fail-open container is completely
+# silent (B15/B16): no output, no log_ev, no recreate.
+sub enforce_container_config_shape {
+    my ($name) = @_;
+    my @violations = container_config_shape_violations($name);
+    return unless @violations;
+
+    my @codes = map { $_->{code} } @violations;
+    my $st = `$PODMAN inspect --format '{{.State.Status}}' "$name" 2>/dev/null`;
+    my $st_ok = ($? == 0);
+    chomp $st if defined $st;
+    $st = '' unless defined $st;
+
+    # redteam H3: reap (podman rm -f) only on a POSITIVELY CONFIRMED
+    # non-running state. The shape inspect above (container_config_shape_
+    # violations) deliberately fails OPEN (B16: a tool-error must never
+    # block a launch) — this state inspect must fail CLOSED instead,
+    # because its failure mode is a non-declinable `podman rm -f`. A
+    # transient inspect failure, or an engine phrasing this launcher
+    # doesn't recognize (e.g. 'configured', 'paused', 'restarting'), must
+    # route to refusal, not to reap.
+    if (!$st_ok || $st eq 'running' || $st !~ /\A(?:exited|created|stopped|configured)\z/) {
+        # B14: a live (or unconfirmed) session — never kill it. Refuse and
+        # tell the user how to unblock, mirroring the migration reaper's
+        # running-container refusal (see the .claude-data migration block
+        # above).
+        print STDERR _c_err("ERROR:"), " sandbox container ($name) still has the old\n";
+        print STDERR "       claude.json mount shape (@{[join(', ', @codes)]}) and its\n";
+        print STDERR "       running state could not be positively confirmed as safe to\n";
+        print STDERR "       remove (status: '@{[$st_ok ? ($st eq '' ? '(empty)' : $st) : 'inspect failed']}'). Continuing risks silent config\n";
+        print STDERR "       loss (an atomic rename() over the shared host config would\n";
+        print STDERR "       leave a still-attached container following a stale, unlinked\n";
+        print STDERR "       inode) or killing a live session. Close its dashboard /\n";
+        print STDERR "       session first (or re-run once the container engine responds\n";
+        print STDERR "       normally), then re-run.\n";
+        log_ev('config_shape_blocked', { container => $name, violations => \@codes, state => $st, state_ok => $st_ok });
+        # H1: this sub is now also called from the early-dispatch block,
+        # above enter_dashboard()'s fast path, where $LOCK_DIR (the setup
+        # lock) is still held. Release it before exiting so a refusal here
+        # never wedges every later launch. Matches the connector error
+        # path's own release just below in the caller. A no-op (idempotent)
+        # when called from the pre-create call site further down, which
+        # releases $LOCK_DIR itself later on the normal path.
+        SandboxLock::release($LOCK_DIR);
+        reset_terminal();
+        exit 1;
+    }
+
+    # B13: confirmed not running — safe to reap. _container_exists is now
+    # false, so the existing create path below rebuilds it with the new
+    # shape. No prompt.
+    print _c_step("Container config shape is stale ($name, $st): @{[join(', ', @codes)]} — recreating"), "\n";
+    system($PODMAN, 'rm', '-f', $name);
+    log_ev('config_shape_reap_container', { container => $name, state => $st, violations => \@codes });
+    return;
+}
+
 # _enumerate_inuse_host_ports($self_name) -> @host_port_integers
 #   fix-multiple-running-sandboxes / Decision #2-#3: collect every published
 #   HOST port already claimed by an existing claude-sandbox container (running
@@ -1375,109 +1368,15 @@ sub prompt_stale_action {
     return $result // 'cancel';
 }
 
-# Arrow-key TUI for the ccpraxis work-copy prompt (p01).
-# Mirrors prompt_stale_action style. Returns 'workcopy' or 'decline'.
-sub prompt_workcopy_action {
-    my @options = (
-        ['workcopy', "Sandbox a work-copy — provision an isolated git worktree (recommended)"],
-        ['decline',  "Decline — abort (do not sandbox ccpraxis in place)"],
-    );
-
-    my $have_readkey = eval { require Term::ReadKey; 1 };
-    if (!$have_readkey || !-t STDIN || !-t STDOUT) {
-        print "\n";
-        print "You are running claude-sandbox from inside the live ccpraxis repo.\n";
-        print "Sandboxing in place would let the in-sandbox process modify the live launcher code.\n";
-        print "\n";
-        print "Options:\n";
-        print "  [s] $options[0][1]\n";
-        print "  [d] $options[1][1]\n";
-        print "\n";
-        print "Choice [s/d]: ";
-        my $line = <STDIN>;
-        $line //= '';
-        chomp $line;
-        my $first = lc(substr($line, 0, 1) // '');
-        return 'workcopy' if $first eq 's';
-        return 'decline';
-    }
-
-    my $sel = 0;
-    my $printed_lines = 0;
-
-    my $cleanup = sub {
-        print "\e[?25h";
-        print "\e[0m";
-        eval { Term::ReadKey::ReadMode(0) };
-    };
-    local $SIG{INT}  = sub { $cleanup->(); reset_terminal(); exit 130 };
-    local $SIG{TERM} = sub { $cleanup->(); reset_terminal(); exit 143 };
-
-    Term::ReadKey::ReadMode(4);
-    print "\e[?25l";
-
-    my $render = sub {
-        if ($printed_lines) {
-            print "\e[${printed_lines}A";
-            print "\e[J";
-        }
-        my $out = "";
-        $out .= "\n";
-        $out .= "You are running claude-sandbox from inside the live ccpraxis repo.\n";
-        $out .= "Sandboxing in place would let the in-sandbox process modify the live launcher code.\n";
-        $out .= "\n";
-        for my $i (0 .. $#options) {
-            my $label = $options[$i][1];
-            if ($i == $sel) {
-                $out .= "\e[1;36m  > $label\e[0m\n";
-            } else {
-                $out .= "    $label\n";
-            }
-        }
-        $out .= "\n";
-        $out .= "  up/down: select   enter: confirm   s/d: shortcut   q/esc: decline\n";
-        $printed_lines = () = ($out =~ /\n/g);
-        print $out;
-    };
-
-    my $result;
-    $render->();
-    while (1) {
-        my $k = Term::ReadKey::ReadKey(0);
-        last unless defined $k;
-        if ($k eq "\e") {
-            my $k2 = Term::ReadKey::ReadKey(0.05);
-            if (defined $k2 && $k2 eq '[') {
-                my $k3 = Term::ReadKey::ReadKey(0.05);
-                if (defined $k3) {
-                    if ($k3 eq 'A' && $sel > 0)         { $sel--; $render->(); next }
-                    if ($k3 eq 'B' && $sel < $#options) { $sel++; $render->(); next }
-                    next;
-                }
-            }
-            $result = 'decline'; last;
-        }
-        if ($k eq "\n" || $k eq "\r") { $result = $options[$sel][0]; last }
-        if (lc($k) eq 's') { $result = 'workcopy'; last }
-        if (lc($k) eq 'd') { $result = 'decline';  last }
-        if (lc($k) eq 'q') { $result = 'decline';  last }
-        if ($k eq "\x03")  { $result = 'decline';  last }
-    }
-
-    $cleanup->();
-    print "\n";
-    return $result // 'decline';
-}
-
 # =====================================================================
-# p02 launcher helpers (used by the workcopy accept branch)
+# Container-name helper (shared by the launch path)
 # =====================================================================
 
 # _container_name_for($raw_path) -> container name string
 # Normalises a path using the SAME sequence the main launch applies to
 # $PROJECT_PATH (abs_path -> backslash->slash -> strip trailing slash ->
-# winify_path -> lc(basename) -> space->dash) so fleet_live's container-name
-# check always matches the name the real podman launch uses for the same
+# winify_path -> lc(basename) -> space->dash) so any container-name lookup
+# always matches the name the real podman launch uses for the same
 # worktree. Idempotent on already-normalised paths.
 sub _container_name_for {
     my ($raw_path) = @_;
@@ -1488,145 +1387,6 @@ sub _container_name_for {
     my $n = lc(basename($p));
     $n =~ s/ /-/g;
     return "claude-${n}-" . substr(md5_of_string($p), 0, 8);
-}
-
-# _podman_name_running($name) -> 0|1
-# Check whether a named container is currently running (podman ps --filter name).
-# List-form: no shell, no injection even if $name has metacharacters.
-sub _podman_name_running {
-    my ($name) = @_;
-    return 0 unless defined $name && length $name;
-    local $ENV{MSYS2_ARG_CONV_EXCL} = '*';
-    my $pid = open(my $fh, '-|', $PODMAN, 'ps', '--filter', "name=$name", '--format', '{{.Names}}');
-    return 0 unless $pid;
-    local $/;
-    my $out = <$fh>;
-    close $fh;
-    return (defined $out && length($out =~ s/\s+//gr)) ? 1 : 0;
-}
-
-# _freshest_marker_mtime($wt) -> epoch mtime | undef
-# Return the newest mtime among <wt>/.ccpraxis-local-data/blueprints/*/runs/.orchestrator.
-# Uses opendir/readdir, never glob.
-sub _freshest_marker_mtime {
-    my ($wt) = @_;
-    my $base = "$wt/.ccpraxis-local-data/blueprints";
-    return undef unless -d $base;
-    my $newest;
-    opendir(my $bd, $base) or return undef;
-    for my $bp (readdir $bd) {
-        next if $bp eq '.' || $bp eq '..';
-        my $marker = "$base/$bp/runs/.orchestrator";
-        next unless -f $marker;
-        my $mtime = (stat $marker)[9];
-        next unless defined $mtime;
-        $newest = $mtime if !defined $newest || $mtime > $newest;
-    }
-    closedir $bd;
-    return $newest;
-}
-
-# _copy_state($live_root, $wt) -> 'absent' | 'partial' | 'complete'
-# Compare live blueprints/ tree against worktree blueprints/ tree.
-# 'complete' iff every live file exists in the wt with byte-identical content.
-# 'absent' iff the wt blueprints/ dir is missing entirely.
-# 'partial' otherwise.
-# Uses opendir/readdir (never glob); reads :raw for byte comparison.
-sub _copy_state {
-    my ($live_root, $wt) = @_;
-    my $src = "$live_root/.ccpraxis-local-data/blueprints";
-    my $dst = "$wt/.ccpraxis-local-data/blueprints";
-
-    return 'absent' unless -d $src;   # no live tree -> vacuously complete (nothing to copy)
-    return 'absent' unless -d $dst;   # dst missing -> absent
-
-    my $all_ok = 1;
-    my $any    = 0;
-
-    # Recursive compare: accumulate relative paths from live tree
-    my @queue = (['', $src, $dst]);
-    while (@queue) {
-        my ($rel, $s, $d) = @{ shift @queue };
-        opendir(my $dh, $s) or do { $all_ok = 0; last; };
-        my @kids = grep { $_ ne '.' && $_ ne '..' } readdir $dh;
-        closedir $dh;
-        for my $kid (@kids) {
-            my $sp = "$s/$kid";
-            my $dp = "$d/$kid";
-            if (-d $sp && !-l $sp) {
-                push @queue, ["$rel/$kid", $sp, $dp];
-            } elsif (-f $sp && !-l $sp) {
-                $any = 1;
-                unless (-f $dp && !-l $dp) { $all_ok = 0; next; }
-                # Size check first (fast)
-                if (-s $sp != -s $dp) { $all_ok = 0; next; }
-                # Byte content check
-                open my $sfh, '<:raw', $sp or do { $all_ok = 0; next; };
-                open my $dfh, '<:raw', $dp or do { close $sfh; $all_ok = 0; next; };
-                local $/;
-                my $sb = <$sfh>; close $sfh;
-                my $db = <$dfh>; close $dfh;
-                unless (defined $sb && defined $db && $sb eq $db) { $all_ok = 0; next; }
-            }
-        }
-    }
-
-    return 'complete' if $all_ok;
-    return 'partial';
-}
-
-# _leftover_lock($live_root, $wt) -> 0|1
-# Check whether a leftover worktree lock file exists under the wt's git-dir.
-# Also checks for *.tmp files under the dst blueprints tree.
-sub _leftover_lock {
-    my ($live_root, $wt) = @_;
-    # Check for a 'locked' file in the worktree's git-worktrees administrative dir
-    my $wt_name = basename($wt);
-    my $lock_path = "$live_root/.git/worktrees/$wt_name/locked";
-    return 1 if -f $lock_path;
-    # Check for stale .tmp files under the worktree blueprints tree
-    my $bp_dst = "$wt/.ccpraxis-local-data/blueprints";
-    if (-d $bp_dst) {
-        opendir(my $dh, $bp_dst) or return 0;
-        for my $entry (readdir $dh) {
-            next if $entry eq '.' || $entry eq '..';
-            if ($entry =~ /\.tmp$/) { closedir $dh; return 1; }
-        }
-        closedir $dh;
-    }
-    return 0;
-}
-
-# _reexec_launcher($wt) — re-exec this launcher with the worktree as the project.
-# Primary: exec { $^X } $^X, $LAUNCHER_PL, $wt (list-form, mirrors existing claude exec).
-# Fallback on Windows/Unicode: PowerShell delegation exec.
-# This function does not return on success.
-sub _reexec_launcher {
-    my ($wt) = @_;
-    SandboxLock::release_all();   # no lock held at re-exec
-    reset_terminal();
-    # The exec() calls below intentionally fall through to the next fallback if
-    # they FAIL to replace the process (exec only returns on error). That makes
-    # the following statements deliberately reachable, so silence perl's
-    # compile-time "Statement unlikely to be reached" warning (category 'exec')
-    # for this scope — otherwise it prints on every launcher compile, i.e. every
-    # `claude-sandbox` run, regardless of project path.
-    no warnings 'exec';
-    # Primary: list-form exec with the same perl interpreter
-    exec { $^X } $^X, $LAUNCHER_PL, $wt;
-    # Fallback: PowerShell-delegation (Unicode path safety on Windows).
-    # MEDIUM-1: double single-quotes so paths with embedded ' cannot inject
-    # PowerShell commands (e.g. André's home directory, unusual project names).
-    if ($WINDOWS_FAMILY) {
-        (my $qx = $^X)          =~ s/'/''/g;
-        (my $ql = $LAUNCHER_PL) =~ s/'/''/g;
-        (my $qw = $wt)          =~ s/'/''/g;
-        exec 'powershell.exe', '-NoProfile', '-Command',
-            "& '$qx' '$ql' '$qw'";
-    }
-    # Should never reach here
-    print STDERR "ERROR: exec launcher failed: $!\n";
-    exit 1;
 }
 
 sub _copy_file {
@@ -1973,9 +1733,10 @@ sub pick_session_action {
 # On container create we ensure the launcher's canonical copies of CLAUDE.md
 # / settings.json / .credentials.json live at claude-home/ on the host so
 # they appear at /root/.claude/{CLAUDE.md,settings.json,.credentials.json}
-# inside the container. Same for /root/.claude.json (which lives at
-# /root/, not /root/.claude/) — bind-mounted as a single-file mount from
-# claude-home/.claude.json.
+# inside the container. Same for the global claude config: it now lives at
+# /root/.claude/.claude.json — an ordinary file INSIDE the /root/.claude dir
+# bind, reached via CLAUDE_CONFIG_DIR=/root/.claude (an -e literal on
+# `podman create`). No single-file bind exists at /root/.claude.json.
 #
 # Historical: from the first sandbox version through 2026-06, /root/.claude
 # was backed by a podman xfs volume to dodge two Hyper-V 9p bugs (O_APPEND
@@ -2012,32 +1773,251 @@ sub apply_blueprints_to_host_data {
 # is missing / 0-byte / unparseable (reseed the template) or is valid JSON but
 # missing an onboarding-bypass key (merge it in, preserving every other key).
 # A valid, already-onboarded config is left untouched (heal_claude_json returns
-# undef). The write is IN PLACE (_write_file truncates + rewrites) — never a
-# rename — because .claude.json is a single-file bind mount and a rename would
-# leave the container following the stale inode.
+# undef). The write is a temp-file + rename() under an mtime-stale-safe mkdir
+# lock (spec 02-implement-config-safety-spec.md B19-B27) BECAUSE .claude.json
+# is an ordinary file inside the /root/.claude dir bind (CLAUDE_CONFIG_DIR=
+# /root/.claude), where in-container writers (the CLI itself, an mcp
+# add/remove, a token refresh) use the SAME atomic protocol and the SAME lock
+# path — so the two writers interoperate instead of tearing each other's
+# write. This can only land after enforce_container_config_shape (B12-B18,
+# above) forces every already-created container off the old single-file-bind
+# shape: renaming the host file while an old-shape container is still
+# attached would leave that container following a ghost inode and lose its
+# config silently (s01 sec 4 sequencing hazard).
 #
 # Called at three points so every entry path self-heals: at top-level manager
 # setup (above), just before `podman create` (the pre-create host file must
-# exist AND be valid so the single-file bind doesn't auto-create a directory and
-# claude doesn't see a 0-byte file), and at the top of enter_dashboard (which
-# every manager path — fresh create, start-of-stopped, and bare-attach to an
-# already-running container — funnels through). The dashboard process is the
-# single per-project manager and no connector claude is running yet at that
-# point, so it is the safest moment to write the shared file.
+# exist AND be valid so claude doesn't see a 0-byte file), and at the top of
+# enter_dashboard (which every manager path — fresh create, start-of-stopped,
+# and bare-attach to an already-running container — funnels through). The
+# dashboard process is the single per-project manager and no connector claude
+# is running yet at that point, so it is the safest moment to write the
+# shared file.
+
+# Row 5 (B21-B24). mkdir-based, mtime-stale-safe lock, local to launcher.pl
+# (NOT SandboxLock.pm — that module's kill(0,$pid) staleness is meaningless
+# here: the launcher runs on the HOST while the competing writer runs IN the
+# container, across the PID-namespace split). %o: timeout (wall seconds,
+# default 5), poll (default 0.1), stale (seconds, default 30). A lock older
+# than `stale` is taken over — rmdir if it's a directory, unlink if it's a
+# regular file (the CLI's lock artefact kind is not guaranteed) — then
+# re-mkdir'd once; losing that race counts as "still held" (B22). Measured
+# constraint: mtime granularity on this bind is WHOLE SECONDS
+# (reports/s02-config-safety-implement/probe-01-bind-lock-and-cli.md) — no
+# sub-second staleness logic here. Returns 1 on success, 0 on timeout.
+sub _config_lock_acquire {
+    my ($lockpath, %o) = @_;
+    my $timeout = defined $o{timeout} ? $o{timeout} : 5;
+    my $poll    = defined $o{poll}    ? $o{poll}    : 0.1;
+    my $stale   = defined $o{stale}   ? $o{stale}   : 30;
+    my $deadline = time() + $timeout;
+    while (1) {
+        return 1 if mkdir($lockpath);
+        my @st = stat($lockpath);
+        if (@st) {
+            my $mtime = $st[9];
+            if ((time() - $mtime) > $stale) {
+                # redteam H2: the takeover must be ATOMIC. An unconditional
+                # rmdir/unlink here breaks the mutual exclusion it exists to
+                # preserve: two launchers that both see the same stale lock
+                # both proceed — A removes the stale dir and re-mkdirs it
+                # (A now holds the lock), then B, a moment behind, removes
+                # *A's fresh lock* and mkdirs its own. Both then enter the
+                # read-modify-write, and because both writers are atomic the
+                # resulting lost update leaves valid JSON that no oracle can
+                # see. rename() of the lock entry is atomic for a directory
+                # AND for a regular file (the CLI's lock artefact kind is not
+                # guaranteed), so exactly one contender can win the takeover;
+                # the loser falls through and re-polls.
+                #
+                # rename() alone is NOT sufficient, and it is worth being
+                # precise about why: it makes each individual takeover atomic,
+                # but B's staleness DECISION was made before A's takeover, so
+                # B would then blindly rename away A's brand-new lock and both
+                # would hold it anyway. The entry is therefore re-stat'ed
+                # AFTER it has been moved somewhere only this process can see:
+                # if what we grabbed is not actually stale, we lost the race,
+                # so we put it straight back and do NOT claim the lock.
+                my $doomed = "$lockpath.stale.$$." . sprintf('%06x', int(rand(0xffffff)));
+                if (rename($lockpath, $doomed)) {
+                    my @dst = stat($doomed);
+                    if (@dst && (time() - $dst[9]) > $stale) {
+                        rmdir($doomed) or unlink($doomed);
+                        return 1 if mkdir($lockpath);
+                    } else {
+                        # Someone else's FRESH lock — restore it and re-poll.
+                        # If the restore fails, the worst case is a lock that
+                        # ages out via the same staleness window; never a
+                        # second holder.
+                        rename($doomed, $lockpath);
+                    }
+                }
+                # Lost the takeover race -> fall through, treated as held.
+            }
+        }
+        return 0 if time() >= $deadline;
+        select(undef, undef, undef, $poll);   # sub-second sleep, no Time::HiRes dep
+    }
+}
+
+# Best-effort release (B21). rmdir is a no-op if the lock was already taken
+# over by a staleness reaper elsewhere — never dies.
+sub _config_lock_release {
+    my ($lockpath) = @_;
+    rmdir($lockpath);
+    return;
+}
+
+# Row 5 (B25). Temp-file + rename() in the SAME directory as $path (so
+# rename() is atomic and never EXDEV): print, close, chmod 0600, rename.
+# Dies on any I/O failure (the caller wraps this in eval and downgrades to a
+# WARNING, per spec sec 2.5); unlinks the temp file on any failure so a
+# failed write never leaves stray litter.
+sub _write_file_atomic {
+    my ($path, $bytes) = @_;
+    my $tmp = "$path.tmp.$$." . sprintf('%06x', int(rand(0xffffff)));
+    open(my $fh, '>:raw', $tmp) or die "write $tmp: $!\n";
+    print $fh $bytes;
+    unless (close $fh) {
+        my $err = $!;
+        unlink $tmp;
+        die "close $tmp: $err\n";
+    }
+    chmod 0600, $tmp;
+    unless (rename($tmp, $path)) {
+        my $err = $!;
+        unlink $tmp;
+        die "rename $tmp -> $path: $err\n";
+    }
+    return 1;
+}
+
 sub ensure_claude_json_onboarded {
     my $host_json = "$CLAUDE_DATA/.claude.json";
     make_path($CLAUDE_DATA) unless -d $CLAUDE_DATA;
-    my $cur = _read_file($host_json);                       # undef if missing
-    my $tpl = _read_file("$CONTAINER_CONFIG/claude.json");  # undef if missing
-    my $new = ClaudeConfig::heal_claude_json($cur, $tpl);
-    return unless defined $new;                             # already onboarded
-    eval { _write_file($host_json, $new); 1 }
-        or print STDERR "WARNING: couldn't heal $host_json: $@";
-    chmod 0600, $host_json;
+
+    # B19 (symlink guard): a container-planted symlink must not redirect
+    # this write — post-fix the in-container CLI follows symlinks at the
+    # config path by design, so an unguarded link would silently divert
+    # config into the ephemeral layer. Unlinked before any read/write.
+    # (Unlike ensure_credentials_json_host_file's seed-only-if-missing
+    # guard, this function must still self-heal an EXISTING plain file —
+    # that IS the point of this module — so only the unlink-if-symlink half
+    # of that shape applies here.)
+    unlink $host_json if -l $host_json;
+
+    # B20 (directory guard): podman's auto-created-directory failure mode
+    # (a single-file bind whose host source didn't exist before `podman
+    # create`) must be surfaced, not silently deleted.
+    if (-d $host_json) {
+        print STDERR "WARNING: $host_json is a directory, not a file —"
+            . " skipping the .claude.json self-heal this launch.\n";
+        return;
+    }
+
+    # B21/B23/B24: read-modify-write happens INSIDE the lock. Contention
+    # (not stale, not acquired within timeout) skips the heal entirely —
+    # safe because the heal is idempotent and runs at three call sites.
+    my $lockpath = "$CLAUDE_DATA/.claude.json.lock";
+    unless (_config_lock_acquire($lockpath, timeout => 5, poll => 0.1, stale => 30)) {
+        print STDERR "WARNING: couldn't acquire $lockpath within 5s —"
+            . " skipping the .claude.json self-heal this launch.\n";
+        return;
+    }
+
+    my $ok = eval {
+        my $cur = _read_file($host_json);                       # undef if open failed OR missing
+
+        # redteam C2: an open failure against a file that DOES exist is not
+        # "file absent" — probe-02 measured 13/57/74 transient open()
+        # failures per run on this mount class, and an in-container process
+        # can force it deterministically (`chmod 000`). Treating it as
+        # absent would feed heal_claude_json(undef, $tpl), which reseeds
+        # the ~1KB onboarding stub over the user's live config with no
+        # backup (the backup guard below requires readable bytes). Skip
+        # this launch's heal instead — it is idempotent and runs at three
+        # call sites, so the next one retries.
+        if (!defined $cur && -e $host_json) {
+            die "couldn't read $host_json ($!) —"
+                . " skipping the .claude.json self-heal this launch\n";
+        }
+
+        # redteam C2: a zero-length READ against a file whose on-disk SIZE
+        # is nonzero is the same mount-coherency artefact (probe-02: ~0.1%
+        # of samples), not a genuinely empty file. One short retry; if it
+        # is still empty, treat it the same as unreadable above (never
+        # reseed on it) rather than as a legitimately empty/absent file.
+        if (defined $cur && !length $cur && -s $host_json) {
+            select(undef, undef, undef, 0.25);
+            $cur = _read_file($host_json);
+            if (!defined $cur || !length $cur) {
+                die "short/zero-length read of $host_json persisted after retry —"
+                    . " skipping the .claude.json self-heal this launch\n";
+            }
+        }
+
+        my $tpl = _read_file("$CONTAINER_CONFIG/claude.json");  # undef if missing
+
+        # B27: heal_claude_json returns undef for an already-onboarded
+        # config -> no write, no rename, no mtime bump (the overwhelmingly
+        # common path; every needless write is a chance to clobber a
+        # concurrent in-container merge).
+        my $new = ClaudeConfig::heal_claude_json($cur, $tpl);
+
+        # B26 (corrupt backup), widened per redteam C2: back up whenever
+        # the file EXISTS and heal_claude_json is about to REPLACE its
+        # current bytes — not only when the current bytes are
+        # non-empty-and-unparseable. The old, narrower predicate missed
+        # empty/whitespace-only bytes (length check) and valid-JSON-but-
+        # non-object bytes like `[]`/`null`/`3` (is_parseable_json is true
+        # for those), both of which reseed via heal_claude_json's `ref
+        # $cur_obj ne 'HASH'` check with NO recovery artefact under the
+        # old guard. A genuinely absent file (! -e) still needs no backup
+        # — that is the legitimate first-run seed. A failed backup still
+        # ABORTS the reseed (unchanged).
+        if (defined $new && -e $host_json && (!defined $cur || $cur ne $new)) {
+            # redteam C1: this backup must NOT be written with _write_file.
+            # That helper is `open '>'`, which FOLLOWS SYMLINKS and truncates,
+            # and the old filename was predictable to the second inside a
+            # directory the container can write ($CLAUDE_DATA is bind-mounted
+            # RW at /root/.claude). An in-container process could pre-plant
+            # `.claude.json.corrupt-<T+k>` symlinks aimed at any host path,
+            # make the config unparseable, and have the launcher write
+            # attacker-chosen bytes there AS THE HOST USER (e.g. the host's
+            # ~/.claude/settings.json hooks => host code execution). Two
+            # independent defences: an unguessable name (pid + random), and
+            # O_EXCL|O_NOFOLLOW so an existing entry or a symlink makes the
+            # open FAIL rather than follow. O_NOFOLLOW is a no-op on some
+            # Windows perls, which is exactly why the unguessable name is
+            # kept as well rather than relied on alone. A failed backup still
+            # ABORTS the reseed — losing the user's real config silently is
+            # worse than skipping a heal.
+            my $backup = "$CLAUDE_DATA/.claude.json.corrupt-" . time()
+                . ".$$." . sprintf('%06x', int(rand(0xffffff)));
+            eval {
+                sysopen(my $bh, $backup, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600)
+                    or die "open $backup: $!\n";
+                binmode $bh, ':raw';
+                print $bh (defined $cur ? $cur : '');
+                close $bh or die "close $backup: $!\n";
+                1;
+            } or die "couldn't back up corrupt $host_json to $backup: $@";
+        }
+
+        if (defined $new) {
+            _write_file_atomic($host_json, $new);
+            chmod 0600, $host_json;
+        }
+        1;
+    };
+    print STDERR "WARNING: couldn't heal $host_json: $@" unless $ok;
+
+    _config_lock_release($lockpath);
 }
 
-# Belt-and-suspenders alias kept for the pre-create call site: guarantee the
-# single-file-bind source exists AND is a valid onboarding-bypass config.
+# Belt-and-suspenders alias kept for the pre-create call site: the host file
+# must still exist and be valid BEFORE create so the in-container claude
+# never reads a 0-byte config on first launch.
 sub ensure_claude_json_host_file { ensure_claude_json_onboarded() }
 
 # Safety guard only (Fix 1): the canonical sandbox creds now live at
@@ -2332,6 +2312,11 @@ my $refresh_port_args = sub {
     push @PORT_ENV_ARGS,     @$env_args;
 };
 
+# B12: must run BEFORE the create-vs-attach decision below — a container
+# reaped after that decision would be routed down the ATTACH path and never
+# get a port block. Non-declinable; see enforce_container_config_shape above.
+enforce_container_config_shape($CONTAINER_NAME);
+
 if (! _container_exists($CONTAINER_NAME)) {
     # CREATE: enumerate sibling-occupied host ports, floor them to block
     # bases, and pick the lowest free base. Robust to no-podman / empty
@@ -2409,7 +2394,7 @@ if (! _container_exists($CONTAINER_NAME)) {
         # store, lock manager, and settings writes all work as expected
         # with no volume + sync-sidecar workaround. See the "Host data
         # layout" comment block earlier in this file for history.
-        '-v', "${CLAUDE_DATA}:/root/.claude",
+        #
         # .launcher is OVERLAID as RO on top of the claude-home bind.
         # The directory is launcher-managed metadata (hashes, snapshots,
         # blueprint canonicals, container-created/-name) — a compromised
@@ -2417,7 +2402,7 @@ if (! _container_exists($CONTAINER_NAME)) {
         # backpack approval or corrupt the launcher's selection state.
         # statusline.pl + skills/plugins read its contents; nothing
         # inside the container needs to write to it.
-        '-v', "${LAUNCHER_DIR}:/root/.claude/.launcher:ro",
+        #
         # .credentials.json is NOT a single-file bind — it lives at
         # claude-home/.credentials.json and rides the ${CLAUDE_DATA} dir
         # bind above as a REAL file at /root/.claude/.credentials.json.
@@ -2429,13 +2414,24 @@ if (! _container_exists($CONTAINER_NAME)) {
         # rename writes land and persist, so in-container token refresh
         # works with no relaunch. mcpOAuth tokens written by `claude mcp
         # add` persist the same way (claude-home survives rebuild).
-        # .claude.json lives at /root/.claude.json (NOT inside
-        # /root/.claude/), so it gets its own single-file bind from
-        # claude-home/.claude.json. ensure_claude_json_host_file() above
-        # guarantees the host file exists so the mount doesn't auto-create
-        # a directory.
-        '-v', "${CLAUDE_DATA}/.claude.json:/root/.claude.json",
-        '-v', "${CLAUDE_HOST_CONFIG}/ccpraxis/scripts/statusline.pl:/root/.claude/statusline.pl:ro";
+        # .claude.json is likewise NOT a single-file bind: CLAUDE_CONFIG_DIR
+        # (below) moves the CLI's global config into this same dir bind, so
+        # the identical EBUSY-free atomic rename applies (s01 probe-01 Case
+        # A/B). ensure_claude_json_host_file() above still guarantees the
+        # host file exists and is valid before create, so the in-container
+        # claude never reads a 0-byte config.
+        #
+        # The whole claude-home block below — the CLAUDE_CONFIG_DIR -e
+        # literal and the three -v pairs (dir bind, .launcher:ro,
+        # statusline.pl:ro) — is emitted by MountSpec::claude_home_create_args
+        # so this arg list and the t/02 structural guard share one source of
+        # truth (spec 02-implement-config-safety-spec.md sec 2.1/2.2). No
+        # single-file bind onto /root/.claude.json exists anymore.
+        MountSpec::claude_home_create_args(
+            claude_data  => $CLAUDE_DATA,
+            launcher_dir => $LAUNCHER_DIR,
+            statusline   => "${CLAUDE_HOST_CONFIG}/ccpraxis/scripts/statusline.pl",
+        );
         push @args, @SKILL_MOUNTS;
         push @args, @PLUGIN_MOUNTS;
         push @args, @EXTRA_MOUNTS;
@@ -2688,7 +2684,9 @@ system($PODMAN, 'exec', $CONTAINER_NAME, 'touch', '/tmp/.launcher-alive');
 # the live state. No seed, no rescue, no sync. Blueprint files were
 # already materialized to claude-home/ before podman create — the bind
 # now exposes them in the container at the canonical paths. Same for
-# .claude.json's single-file bind. Nothing to do here.
+# .claude.json, which now lives at /root/.claude/.claude.json (an ordinary
+# file inside that same dir bind, reached via CLAUDE_CONFIG_DIR). Nothing
+# to do here.
 
 # --- Backpack install (container side) — only the approved subset (#21) ---
 # All user interaction (validate, list, per-item approve/remove) happened on the
@@ -2792,9 +2790,10 @@ sub enter_dashboard {
     # Self-heal .claude.json's onboarding bypass on EVERY manager entry (fresh
     # create, start-of-stopped, or bare-attach to an already-running container).
     # This is the single chokepoint all manager paths funnel through, and no
-    # connector claude is running yet — the safest point to write the shared,
-    # single-file-bound config. Heals a 0-byte/corrupt file or one that lost its
-    # onboarding keys, so the next [c] never reopens the setup wizard.
+    # connector claude is running yet — the safest point to write the shared
+    # config (an ordinary file in the /root/.claude dir bind). Heals a
+    # 0-byte/corrupt file or one that lost its onboarding keys, so the next
+    # [c] never reopens the setup wizard.
     ensure_claude_json_onboarded();
     # Act on the first heartbeat: if the container is already gone, don't paint
     # a dashboard that would just die on its first tick — say so and exit clean.

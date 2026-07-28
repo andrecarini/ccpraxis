@@ -1,6 +1,8 @@
 package ClaudeConfig;
-# Self-healing for claude-home/.claude.json — the per-sandbox claude config that
-# is bind-mounted to /root/.claude.json inside the container.
+# Self-healing for claude-home/.claude.json — the per-sandbox claude config.
+# It is NOT bind-mounted as its own single-file mount: it lives inside the
+# /root/.claude dir bind (host claude-home/.claude.json), seen in-container
+# at /root/.claude/.claude.json via CLAUDE_CONFIG_DIR=/root/.claude.
 #
 # THE BUG THIS FIXES. The launcher seeds .claude.json from a container-config
 # template whose whole purpose is to carry the onboarding-bypass keys
@@ -53,9 +55,24 @@ sub _onboarding_defaults {
 #   * current valid JSON object already carrying the onboarding keys
 #       -> undef (no rewrite needed).
 #
-# Returning undef when nothing must change lets the caller skip the in-place
-# rewrite — important because .claude.json is a single-file bind mount, so a
-# needless rewrite churns the file the container reads through.
+# Returning undef when nothing must change lets the caller skip the write
+# entirely — undef means "already onboarded, do not touch this file". That
+# matters because concurrent in-container writers (the CLI itself, an mcp
+# add/remove, a token refresh) may be mid read-modify-write on the same
+# shared file; a needless rewrite here is a needless chance to race them,
+# not a mount-shape concern.
+# is_parseable_json($bytes) -> 0|1
+# Pure, path-free predicate so the launcher can distinguish "unparseable ->
+# back up before reseeding" from "valid but needs a merge" without
+# duplicating a JSON decoder. undef / empty / whitespace-only -> 0. Uses
+# the JSON::PP already imported by this module. No file I/O.
+sub is_parseable_json {
+    my ($bytes) = @_;
+    return 0 unless defined $bytes && $bytes =~ /\S/;
+    my $ok = eval { JSON::PP->new->utf8->decode($bytes); 1 };
+    return $ok ? 1 : 0;
+}
+
 sub heal_claude_json {
     my ($cur, $tpl) = @_;
 

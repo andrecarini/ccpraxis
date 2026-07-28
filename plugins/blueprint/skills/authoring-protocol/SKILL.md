@@ -43,6 +43,7 @@ Each package ledger's frontmatter (`status`, `model`, `max_turns`, `write_set`, 
 - `depends_on` forms an explicit DAG. **Parallel-safe = disjoint write sets AND no unmet dependencies.** Overlapping write sets are serialized; only if overlap is unavoidable and serialization too slow, consider worktree isolation — an escalation, not a default.
 - Assign `model` per package: `sonnet` default; `opus` for packages with gnarly design surface or security weight. `max_turns` is butler's per-coordinator backstop (default 80).
 - Every package block carries `inputs` (file:line where known) and `out_of_scope` (explicit DO-NOT list) — coordinators must not re-discover what you already know.
+- **Record runtime/version choices up front.** For every runtime or toolchain a package needs (node, python, pnpm, …), name the version *and the reason* in the package block: latest LTS/stable, **≥7 days old**, mutually compatible, **never EOL**, and **declared in the backpack** so a container rebuild restores it. Version selection is a deliberate, reviewed choice — an undeclared runtime that vanishes on rebuild stalls an unattended fleet. A coordinator that must guess a version at 3am has already lost; `bp-deps-check.pl` enforces the mechanical half of this at execution time.
 
 ### 3. Manage (`/blueprint:manage`)
 
