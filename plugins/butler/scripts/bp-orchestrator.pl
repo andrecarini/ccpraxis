@@ -411,10 +411,13 @@ sub run_complete {
     # judge still in flight) keeps the run open. Caller-computed flag ONLY — this sub
     # stays pure so it remains unit-testable; see conformance_outstanding().
     return 0 if $c->{conformance_outstanding};
-    # b07: a queued/awaiting_verify remediation entry keeps the run open exactly
+    # b07: a queued/awaiting_verify remediation entry keeps the run alive exactly
     # like conformance_outstanding above. An ESCALATED entry does NOT hold the
-    # run open — the human is now the blocking dependency and the decision is
+    # run alive — the human is now the blocking dependency and the decision is
     # already on disk (Decision #20); see remediation_outstanding().
+    # NB (b05 AC-6 / b07 AC-17): this sub's body is scanned for file-I/O tokens by
+    # /(?<![\w:>])open\s*[\(\s]/, so no comment here may write "open" followed by a
+    # space or a paren. Say "alive". b05's own "open." survives only via its period.
     return 0 if $c->{remediation_outstanding};
     return 1;
 }
@@ -2034,6 +2037,45 @@ sub _enter_pause_manual {
 # mark a package blocked in its ledger + queue the decision (loop-guard). An
 # optional $question/$kind override the defaults (A5: resolve-park surfaces the
 # judge's own needs_you question; harvest-park raises a harvest-failure alarm).
+
+# ===========================================================================
+# b07 STUBS -- INERT PLACEHOLDERS, NOT THE IMPLEMENTATION. DELETE ON RESUME.
+#
+# b07-auto-remediation-engine landed its orchestrator call sites (:1238, :1894,
+# :1969) and the whole pure core in bp-remediate.pl, but its implementer died
+# before defining these two subs. Perl resolves subs at runtime, so perl -c
+# passed, the defect survived review, and sandbox-refuse-in-place's p04 then
+# promoted the working tree wholesale into the live install -- after which every
+# NEWLY-LAUNCHED fleet died on tick 1 with
+#   Undefined subroutine &BpOrch::remediation_merge called at ... line 1238
+# (:1238 is the first statement after _load_state in the per-tick watch loop, so
+# nothing downstream of it ever ran). An already-running orchestrator was immune,
+# because perl loads the script once at process start -- which is why this looked
+# like it was "working on other sandboxes".
+#
+# These stubs restore a runnable orchestrator with remediation INERT: no queue is
+# read, merged or authored, and no gate is held. BpRemediate::remediation_outstanding
+# returns 0 for an empty entries list and BpRemediate::verify_ready returns 1, so
+# run_complete (:1876) and the conformance gate behave exactly as they did before
+# b07 touched them. Nothing silently half-works.
+#
+# b07 MUST REPLACE THESE, NOT BUILD ON THEM. The real contract for both is in
+# spec-08 section 3.1/3.5 and restated step-by-step in b07's ledger under
+# "## Next action". If you are the b07 implementer: delete this entire block
+# first, then write the real subs. A green suite with these stubs still present
+# is NOT b07 done -- t/26-auto-remediation-engine.t is the oracle that says so.
+# ===========================================================================
+
+sub remediation_merge {
+    my ($bpdir, $runs, $meta, $status) = @_;
+    return { entries => [] };          # STUB (b07) -- never mutates meta/status
+}
+
+sub remediation_step {
+    my ($a) = @_;
+    return 0;                          # STUB (b07) -- nothing outstanding, ever
+}
+
 sub _block_and_queue {
     my ($bpdir, $runs, $log, $bp, $pkg, $why, $now, $question, $kind) = @_;
     _set_ledger_status($bpdir, $pkg, 'blocked');
