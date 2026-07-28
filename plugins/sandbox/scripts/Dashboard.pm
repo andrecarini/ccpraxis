@@ -825,6 +825,68 @@ sub _backpack_lines {
     return @out;
 }
 
+# _token_lines(\%tokens) -> LIST of body lines for the s08 Token panel.
+# {logged_in, access_present, access_state, access_expires_at,
+# access_seconds_left, refresh_present, refresh_fingerprint, refresh_expires,
+# last_refreshed_at, last_refreshed_age, subscription_type?, rate_limit_tier?}
+# -- the TokenInfo::status struct (spec S2.1), passed through the gather hash
+# with no arithmetic. PRIVATE, pure, mirrors _backpack_lines's style. A
+# non-hashref $tokens -> the empty list (never dies).
+sub _token_lines {
+    my ($t) = @_;
+    return () unless ref $t eq 'HASH';
+
+    my @lines;
+
+    # 1. access — reuses fmt_oauth/oauth_role verbatim (S2.3 a1): no divergent
+    # token classifier. access_state 'absent' covers both "no token" and "a
+    # token whose expiry can't be read" (TokenInfo B4), both of which must
+    # render as the same "not logged in" cue, not a stale countdown.
+    my $access_state = defined $t->{access_state} ? $t->{access_state} : 'absent';
+    my $sec = ($access_state eq 'absent') ? undef : $t->{access_seconds_left};
+    push @lines, [ { text => sprintf('%-11s : ', 'access'), role => 'label' },
+                   { text => fmt_oauth($sec), role => oauth_role($sec) } ];
+
+    # 2. refresh
+    if ($t->{refresh_present}) {
+        my $fp = defined $t->{refresh_fingerprint} ? $t->{refresh_fingerprint} : '';
+        push @lines, [ { text => sprintf('%-11s : ', 'refresh'), role => 'label' },
+                       { text => "present ($fp)", role => 'good' } ];
+    } else {
+        push @lines, [ { text => sprintf('%-11s : ', 'refresh'), role => 'label' },
+                       { text => 'absent', role => 'bad' } ];
+    }
+
+    # 3. refreshed
+    if (defined $t->{last_refreshed_age}) {
+        push @lines, [ { text => sprintf('%-11s : ', 'refreshed'), role => 'label' },
+                       { text => fmt_age($t->{last_refreshed_age}) . ' ago', role => 'value' } ];
+    } else {
+        push @lines, [ { text => sprintf('%-11s : ', 'refreshed'), role => 'label' },
+                       { text => 'n/a', role => 'muted' } ];
+    }
+
+    # 4. refresh-exp — always the struct value verbatim (Decision #18: never
+    # computed here); a missing/undef key falls back to the plain 'n/a'
+    # literal (S5: a future caller passing tokens => {}).
+    my $rexp = defined $t->{refresh_expires} ? $t->{refresh_expires} : 'n/a';
+    push @lines, [ { text => sprintf('%-11s : ', 'refresh-exp'), role => 'label' },
+                   { text => $rexp, role => 'muted' } ];
+
+    # 5. account — optional, present iff at least one of the two pass-through
+    # fields exists with a defined, non-empty value (subscription_type first).
+    my @present;
+    for my $k (qw(subscription_type rate_limit_tier)) {
+        push @present, $t->{$k} if defined $t->{$k} && length $t->{$k};
+    }
+    if (@present) {
+        push @lines, [ { text => sprintf('%-11s : ', 'account'), role => 'label' },
+                       { text => join(' / ', @present), role => 'value' } ];
+    }
+
+    return @lines;
+}
+
 # _title_line / _footer_line / _panel_title_line — single rows, exactly $cols.
 sub _title_line {
     my ($s, $cols) = @_;
