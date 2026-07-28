@@ -272,9 +272,14 @@ sub workcopy_refusal_outcome {
         . "default, which would silently re-couple the clone to this installation.\n"
         . "\n"
         . "That clone is an ordinary project — git works normally inside the container, and\n"
-        . "nothing it does can reach this installation. When you want changes to take\n"
-        . "effect here, pull them into this install and re-run install.pl yourself, from\n"
-        . "the host.\n"
+        . "nothing it does can reach this installation. To bring changes back, merge them\n"
+        . "into this install from the host:\n"
+        . "\n"
+        . "  git -C $live pull <your-clone-dir> main\n"
+        . "\n"
+        . "That alone promotes them: this repo IS the installed plugin tree. Re-run\n"
+        . "install.pl only if the PATH wiring or the set of plugins changed.\n"
+        . "See plugins/sandbox/docs/working-on-ccpraxis.md.\n"
         . "\n"
         . "Aborting.";
     return {
