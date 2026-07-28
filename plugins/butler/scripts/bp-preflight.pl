@@ -51,6 +51,30 @@ sub read_json { my $f = shift; open my $fh,'<:raw',$f or return undef; local $/;
                 return eval { JSON::PP->new->decode($r) }; }
 sub home { $ENV{USERPROFILE} // $ENV{HOME} // '' }
 
+# ---- run_git($root, @args) -> ($rc, $squeezed_output) ---------------------
+# Runs `git -C $root @args`, capturing combined stdout+stderr and collapsing
+# it to a single line (report rows are one line each). $root is normalized to
+# forward slashes first: native git.exe accepts forward-slash Windows paths
+# directly, and this sidesteps two distinct hazards observed empirically on
+# this host — (a) backslash sequences inside a double-quoted shell string
+# being reinterpreted, and (b) MSYS2_ARG_CONV_EXCL=* (the usual fix for the
+# colon-splitting bug with -v-style compound args) instead BREAKING a plain
+# POSIX-style single path arg here, because this script is invoked by a
+# POSIX/MSYS perl whose backticks already auto-translate POSIX paths for a
+# native child correctly — disabling that conversion regresses it. Do NOT set
+# MSYS2_ARG_CONV_EXCL here; it was tried and made things worse for this case.
+sub run_git {
+    my ($root, @args) = @_;
+    (my $slashroot = $root) =~ s{\\}{/}g;
+    my $cmd = join(' ', 'git', '-C', qq{"$slashroot"}, @args, '2>&1');
+    my $out = `$cmd`;
+    my $rc  = $?;
+    $out //= '';
+    $out =~ s/\s+/ /g;
+    $out =~ s/^\s+|\s+$//g;
+    return ($rc, $out);
+}
+
 # ---- oauth_usable($d, $now_ms) — pure predicate (testable without running main) ---
 # Returns ($ok, $reason). $now_ms defaults to time()*1000 (epoch ms).
 sub oauth_usable {
@@ -168,6 +192,59 @@ my %CHECK = (
         my ($ok, $reason) = oauth_usable($d);
         return ('fail', "$reason — run \`claude-sandbox\` and \`/login\` first, then re-run dispatch-fleet") unless $ok;
         ('ok', "sandbox login usable: $reason");
+    } },
+
+    'repo.usable' => { run => sub {
+        # Resolve the project root: BP_PROJECT_ROOT (butler env contract var,
+        # and what makes this testable) -> `git rev-parse --show-toplevel`
+        # from cwd -> cwd itself.
+        my ($root, $source);
+        if (defined $ENV{BP_PROJECT_ROOT} && length $ENV{BP_PROJECT_ROOT}) {
+            $root   = $ENV{BP_PROJECT_ROOT};
+            $source = 'BP_PROJECT_ROOT';
+        } else {
+            my $top = `git rev-parse --show-toplevel 2>/dev/null`;
+            chomp $top;
+            if (length $top) {
+                $root   = $top;
+                $source = "git rev-parse --show-toplevel";
+            } else {
+                require Cwd;
+                $root   = Cwd::getcwd();
+                $source = 'cwd';
+            }
+        }
+
+        # `rev-parse --git-dir` alone is insufficient: the B2 shape (a `.git`
+        # FILE whose `gitdir:` target does not exist) can parse the pointer
+        # while every real operation fails. A second, independent read that
+        # actually touches the object store is required.
+        my $reason;
+        my ($gd_rc, $gd_out) = run_git($root, 'rev-parse', '--git-dir');
+        if ($gd_rc != 0) {
+            $reason = "git -C \"$root\" rev-parse --git-dir failed: $gd_out";
+        } else {
+            my ($head_rc, $head_out) = run_git($root, 'rev-parse', 'HEAD');
+            if ($head_rc != 0) {
+                # A fresh repo with no commits yet has no HEAD — that is
+                # usable, not a failure. Distinguish "no commits yet" from a
+                # genuinely broken repo (e.g. the B2 shape) with a second,
+                # independent read that also touches the object store.
+                my ($st_rc, $st_out) = run_git($root, 'status', '--porcelain');
+                if ($st_rc != 0) {
+                    $reason = "git -C \"$root\" rev-parse HEAD failed ($head_out) and status --porcelain also failed: $st_out";
+                }
+            }
+        }
+
+        if (!defined $reason) {
+            return ('ok', "repo usable at $root (root via $source)");
+        }
+
+        if (($ENV{BP_ALLOW_NO_GIT} // '') eq '1') {
+            return ('ok', "WARNING: BP_ALLOW_NO_GIT=1 override — project root $root is not a usable git repo ($reason)");
+        }
+        return ('fail', "project root $root is not a usable git repo (root via $source): $reason");
     } },
 );
 

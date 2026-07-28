@@ -131,6 +131,15 @@
       "what": "the sandbox has its OWN usable claudeAiOauth (independent /login grant, not a host copy)",
       "implement_hint": "run `claude-sandbox` and `/login` once inside the sandbox; the grant persists (claude-home RW bind) and the keeper refreshes it, so fleets ride it",
       "supported_envs": ["sandbox-linux"]
+    },
+    {
+      "id": "repo.usable",
+      "what": "The project root is a usable git repository — butler's ledgers, checkpoints and commits all assume git works.",
+      "expected_contract": "git -C <project root> resolves a git dir AND a trivial read succeeds. A .git FILE whose gitdir: target does not exist (the worktree-across-a-container-boundary shape) must be treated as unusable.",
+      "check": "Resolve the project root (BP_PROJECT_ROOT, else git rev-parse --show-toplevel, else cwd); run git rev-parse --git-dir and a trivial read; BP_ALLOW_NO_GIT=1 downgrades a failure to a visible warning.",
+      "supported_envs": ["win32", "sandbox-linux"],
+      "implement_hint": "Provide git on PATH and a real repository at the project root; if git is deliberately unavailable, set BP_ALLOW_NO_GIT=1 to accept a degraded, checkpoint-less run.",
+      "surface": "preflight"
     }
   ]
 }
