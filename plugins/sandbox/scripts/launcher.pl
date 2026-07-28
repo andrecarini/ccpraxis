@@ -48,6 +48,7 @@ use MountSpec qw(winify_path v_to_mount convert_v_to_mount);
 use CcpraxisWorkCopy qw(workcopy_route workcopy_refusal_outcome);
 use LaunchLog ();   # B1: durable per-launch diagnostic log (next to us in scripts/)
 use Dashboard ();   # B2: the raw-ANSI TUI dashboard framework
+use TokenInfo ();   # s08: pure access/refresh token status struct for the dashboard
 use BackpackApproval ();  # #21: per-item, machine-local backpack approval memory
 use BackpackReview ();    # #21: the I/O-seam-injected interactive approval walk
 use KeepAwake ();         # B5: dashboard wake-lock decision + lifecycle holder
@@ -2818,6 +2819,7 @@ sub enter_dashboard {
     my $cached_needs_you        = 0;       # B3: queued "needs you" decisions
     my $cached_backpack         = undef;   # B4: backpack items + per-item approval
     my $cached_oauth_expires_at = undef;   # 01-oauth: epoch-s when the OAuth token expires
+    my $cached_tokens           = undef;   # s08: TokenInfo struct
     my $last_inspect            = 0;
     my $bp_host_file      = "$CLAUDE_DATA/backpack.json";
     my $bp_appr_file      = "$LAUNCHER_DIR/backpack-approvals.json";
@@ -2916,6 +2918,7 @@ sub enter_dashboard {
                 $cached_needs_you  = _count_needs_you($PROJECT_PATH);          # B3
                 $cached_backpack   = _gather_backpack($bp_host_file, $bp_appr_file);  # B4
                 $cached_oauth_expires_at = _gather_oauth_expiry();
+                $cached_tokens = _gather_tokens();
                 $last_inspect  = $now;
             }
             # Advance the skew-free baseline by host-measured elapsed since the
@@ -2937,6 +2940,7 @@ sub enter_dashboard {
                 needs_you        => $cached_needs_you,
                 backpack         => $cached_backpack,
                 oauth_expires_at => $cached_oauth_expires_at,
+                tokens           => $cached_tokens,
             };
         },
         keepawake => sub {
@@ -3142,6 +3146,18 @@ sub _gather_oauth_expiry {
     my $exp = $oauth->{expiresAt};
     return undef unless defined $exp && $exp =~ /^\d+$/;
     return int($exp / 1000);
+}
+
+# _gather_tokens() -> the TokenInfo status struct for $SANDBOX_CREDENTIALS_FILE.
+# Read-only: never writes, never refreshes, never logs the file's contents.
+# Always returns a hashref (decode failure/absent file just passes undef
+# through to TokenInfo::status, which degrades to the not-logged-in struct).
+sub _gather_tokens {
+    my $raw   = _read_file($SANDBOX_CREDENTIALS_FILE);
+    my $data  = (defined $raw && length $raw)
+              ? eval { JSON::PP->new->decode($raw) } : undef;
+    my $mtime = (stat($SANDBOX_CREDENTIALS_FILE))[9];
+    return TokenInfo::status($data, $mtime, time);
 }
 
 # _tail_lines — last $n chomped lines of a file (the B1 launch log), or ().

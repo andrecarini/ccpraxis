@@ -744,6 +744,14 @@ sub _fixed_panels {
     if (ref $s->{backpack} eq 'HASH') {
         push @p, { title => 'Backpack', lines => [ _backpack_lines($s->{backpack}, $cols - 2) ] };
     }
+
+    # s08: access/refresh token status view. Present only when the launcher
+    # gathered a TokenInfo struct for this project (I1: that struct itself is
+    # never undef, so the guard here only protects callers that never supply
+    # the key at all -- e.g. the pre-s08 t/25-dashboard.t gather stubs).
+    if (ref $s->{tokens} eq 'HASH') {
+        push @p, { title => 'Token', lines => [ _token_lines($s->{tokens}) ] };
+    }
     return @p;
 }
 
