@@ -1,0 +1,929 @@
+#!/usr/bin/env perl
+# Oracle tests for q03-launcher-refusal, derived from
+#   .ccpraxis-local-data/blueprints/sandbox-butler-overhaul/specs/q03-launcher-refusal-spec.md
+#
+# IMMUTABLE ORACLE: written from the spec BEFORE the implementation exists.
+# launcher.pl does not yet carry the q03:protected-path-decision sentinel
+# region at authoring time -- this file is EXPECTED to show a large block of
+# "not ok" until q03 lands. Do not weaken these assertions to make a future
+# implementation's life easier.
+#
+# FOUR COORDINATOR RULINGS applied here (see the task brief for q03-launcher-
+# refusal step 3; recorded inline at each affected AC too):
+#   R3 -- <live>/plugins reports marketplace-install/exact (AC-15), NOT
+#         "corrected" to ccpraxis-install. Spec is upheld as written.
+#   R4 -- the marketplace-install/marketplace-source advice text in spec
+#         S4.6 ("git clone --no-hardlinks {root} <your-clone-dir>") is
+#         AMENDED: {root} need not be a git repo root (in the flagship
+#         <live>/plugins case it is not -- the repo root is <live>). AC-28's
+#         sentinels for these two reasons assert the AMENDED intent via
+#         stable substrings, not a verbatim paragraph.
+#   R5 -- AC-6 asserts R2 SEMANTICALLY (workcopy_route(/workcopy_refusal_
+#         outcome( calls + the two exit statements, all after the new call
+#         site), NOT as a byte-exact :231-242 literal -- nine later sandbox
+#         packages also edit launcher.pl and a byte-exact pin would go red
+#         for reasons unrelated to q03.
+#   (failure-mode ruling) -- the harness does NOT BAIL_OUT when the sentinel
+#         region is absent (unlike spec S6.2's literal harness). BAIL_OUT
+#         would abort the whole file and hide the other 40+ ACs. Structural
+#         ACs that prove absence (AC-2, AC-10) run as ok(0, ...); ACs that
+#         need the extracted decision sub are gated behind SKIP blocks keyed
+#         off $DECIDE, with a skip reason naming the missing region.
+#
+# All paths in this file are FABRICATED (/home/u/..., /opt/...). Every
+# filesystem/env seam (registry/extra_list/env/exists/read_file/fold_case/
+# windows) is injected. No test in this file touches the real filesystem,
+# the real %ENV, the real $ENV{HOME}, or the real known_marketplaces.json
+# (AC-12, AC-50). The only subprocess this file spawns is `perl -c
+# launcher.pl` (AC-8/AC-9) -- never launcher.pl itself, never a container CLI.
+#
+# Criterion mapping (see also the full AC -> test-name table in
+#   reports/q03-launcher-refusal/test-writer-step3.md):
+#   AC-1..9    : Group A -- wiring/structure (source assertions on launcher.pl)
+#   AC-10..12  : Group B -- extraction harness
+#   AC-13..22  : Group C -- the refusing targets, one per reason code
+#   AC-23..25  : Group D -- precedence (P0/P1/P2)
+#   AC-26..33  : Group E -- message content
+#   AC-34..37  : Group F -- degradation (Decision #6)
+#   AC-38..40  : Group G -- C6 no-regression
+#   AC-41..44  : Group H -- Decision #3, no override
+#   AC-45..48  : Group I -- documentation
+#   AC-49..50  : Group J -- suite hygiene
+
+use strict;
+use warnings;
+use Test::More;
+use FindBin qw($Bin);
+use lib "$Bin/../../scripts";
+use Cwd qw(abs_path);
+use File::Temp qw(tempfile);
+use ProtectedPaths qw(path_relation protected_roots target_self_codes normalize_path);
+use CcpraxisWorkCopy qw(workcopy_route);
+
+# =====================================================================
+# Environment resolution -- BAIL_OUT is reserved for a genuinely broken
+# environment (cannot read launcher.pl, cannot resolve the repo root), never
+# for the expected-absent q03 sentinel region (see ruling above).
+# =====================================================================
+my $repo_root = abs_path("$Bin/../../../..");
+BAIL_OUT("cannot resolve repo root from $Bin/../../../..") unless defined $repo_root;
+
+my $LAUNCHER = "$Bin/../../scripts/launcher.pl";
+open my $lfh, '<:raw', $LAUNCHER or BAIL_OUT("cannot read launcher.pl: $!");
+my @lines = <$lfh>;
+close $lfh;
+my $src = join '', @lines;
+
+# =====================================================================
+# Small local helpers (test scaffolding only).
+# =====================================================================
+
+# Build a regex that matches a phrase with arbitrary whitespace (including a
+# line-wrap newline) between its words, so a step-8 prose re-wrap can't
+# spuriously break a substring assertion (S4.7's own stated rationale).
+sub _sentinel_re {
+    my ($phrase) = @_;
+    my $pat = join('\s+', map { quotemeta $_ } split /\s+/, $phrase);
+    return qr/$pat/;
+}
+
+my $SKIP_REASON = 'q03 protected_path_outcome decision region not found (or failed to eval) '
+                 . 'in launcher.pl -- implementation pending (TDD red phase)';
+
+# =====================================================================
+# Group A -- wiring and structure (source assertions on launcher.pl)
+# =====================================================================
+
+# ---- AC-1 ----
+my $PP_USE_LINE = 'use ProtectedPaths qw(path_relation protected_roots target_self_codes normalize_path);';
+{
+    my $count = () = $src =~ /\Q$PP_USE_LINE\E/g;
+    is($count, 1, "AC-1: launcher.pl contains exactly one line 'use ProtectedPaths qw(path_relation protected_roots target_self_codes normalize_path);'");
+    my $pp_idx = index($src, $PP_USE_LINE);
+    my $wc_use_idx = index($src, 'use CcpraxisWorkCopy qw(');
+    ok(($pp_idx >= 0 && $wc_use_idx >= 0 && $pp_idx > $wc_use_idx),
+       "AC-1: the ProtectedPaths use line's byte offset is greater than 'use CcpraxisWorkCopy qw(' (it comes after)");
+}
+
+# ---- AC-2 ----
+my $BEGIN_SENTINEL = '# >>> q03:protected-path-decision:BEGIN';
+my $END_SENTINEL   = '# <<< q03:protected-path-decision:END';
+my ($begin_idx, $end_idx);
+{
+    my $begin_count = () = $src =~ /\Q$BEGIN_SENTINEL\E/g;
+    my $end_count   = () = $src =~ /\Q$END_SENTINEL\E/g;
+    is($begin_count, 1, "AC-2: the BEGIN sentinel '$BEGIN_SENTINEL' occurs exactly once in launcher.pl");
+    is($end_count, 1,   "AC-2: the END sentinel '$END_SENTINEL' occurs exactly once in launcher.pl");
+    $begin_idx = index($src, $BEGIN_SENTINEL);
+    $end_idx   = index($src, $END_SENTINEL);
+    ok(($begin_idx >= 0 && $end_idx >= 0 && $begin_idx < $end_idx),
+       "AC-2: the BEGIN sentinel appears before the END sentinel");
+}
+
+# ---- AC-3 ----
+my @pp_call_idxs_outside;
+{
+    my @all;
+    my $pos = 0;
+    while ((my $i = index($src, 'protected_path_outcome(', $pos)) >= 0) {
+        push @all, $i;
+        $pos = $i + 1;
+    }
+    @pp_call_idxs_outside = grep {
+        my $i = $_;
+        !(defined $begin_idx && $begin_idx >= 0 && defined $end_idx && $end_idx >= 0
+          && $i >= $begin_idx && $i <= $end_idx);
+    } @all;
+    is(scalar(@pp_call_idxs_outside), 1,
+       "AC-3: exactly one call to protected_path_outcome( exists outside the sentinel region");
+}
+my $workcopy_route_call_idx = index($src, 'workcopy_route(');
+ok((@pp_call_idxs_outside == 1 && $workcopy_route_call_idx >= 0
+    && $pp_call_idxs_outside[0] < $workcopy_route_call_idx),
+   "AC-3: the protected_path_outcome( call site's byte offset is less than the workcopy_route( call's (R1 ordering)");
+
+# ---- AC-4 ----
+like($src,
+     qr/protected_path_outcome\(\s*\$PROJECT_PATH\s*,\s*\{\s*registry_path\s*=>\s*"\$HOST_PLUGINS_DIR\/known_marketplaces\.json"\s*,?\s*\}\s*\)/,
+     'AC-4: the call site passes $PROJECT_PATH first and a hash ref whose only key is registry_path => "$HOST_PLUGINS_DIR/known_marketplaces.json"');
+
+# ---- AC-5 ----
+{
+    my $anchor_idx = index($src, 'my $LIVE_CCPRAXIS_ROOT');
+    ok((@pp_call_idxs_outside == 1 && $anchor_idx >= 0 && $pp_call_idxs_outside[0] > $anchor_idx),
+       'AC-5: the call site\'s byte offset is greater than \'my $LIVE_CCPRAXIS_ROOT\' (it runs after the anchor derivation)');
+}
+
+# ---- AC-6 (R5: semantic check, NOT a byte-exact :231-242 literal -- see
+#       header rationale; nine later packages also write launcher.pl) ----
+like($src, qr/workcopy_route\(/, 'AC-6: launcher.pl still contains the workcopy_route( call (R2 fail-safe)');
+like($src, qr/workcopy_refusal_outcome\(/, 'AC-6: launcher.pl still contains the workcopy_refusal_outcome( call (R2 fail-safe)');
+like($src, qr/print STDERR \$o->\{message\}/, 'AC-6: launcher.pl still contains the statement print STDERR $o->{message}');
+like($src, qr/exit\(\$o->\{exit_code\} \|\| 1\)/, 'AC-6: launcher.pl still contains the statement exit($o->{exit_code} || 1)');
+ok((@pp_call_idxs_outside == 1 && $workcopy_route_call_idx >= 0
+    && $workcopy_route_call_idx > $pp_call_idxs_outside[0]),
+   'AC-6: the retained workcopy_route( call site appears AFTER the new protected_path_outcome( call site (R1/R2 ordering)');
+
+# ---- AC-7 ----
+like($src, qr/print STDERR \$_, "\\n" for \@\{\s*\$pp->\{warnings\}\s*\}/,
+     'AC-7: the call block prints every warnings element to STDERR (print STDERR $_, "\n" for @{ $pp->{warnings} }) before the refusal branch');
+like($src, qr/if\s*\(\s*\$pp->\{refuse\}\s*\)\s*\{\s*print STDERR \$pp->\{message\}, "\\n";\s*exit\(\s*\$pp->\{exit_code\}\s*\|\|\s*1\s*\);\s*\}/s,
+     'AC-7: the refusal branch body is exactly "print STDERR $pp->{message}, \"\\n\"; exit($pp->{exit_code} || 1);"');
+
+# ---- AC-8 / AC-9 -- perl -c, File::Temp capture (never an in-memory scalar
+#       filehandle -- t/42 AC-L1 idiom). The only subprocess this file spawns.
+{
+    my ($tfh, $tfname) = tempfile(UNLINK => 1);
+    close $tfh;
+    my $cmd = sprintf('"%s" -c "%s" > "%s" 2>&1', $^X, $LAUNCHER, $tfname);
+    system($cmd);
+    my $rc = $? >> 8;
+    open my $rfh, '<', $tfname or BAIL_OUT("cannot read perl -c capture file: $!");
+    local $/;
+    my $output = <$rfh>;
+    close $rfh;
+    is($rc, 0, 'AC-8: launcher.pl `perl -c` exits 0') or diag("perl -c output:\n$output");
+
+    my @warnings = grep { /\S/ && !/syntax OK\s*$/ } split /\n/, ($output // '');
+    is_deeply(\@warnings, [], 'AC-9: `perl -c` emits no warnings beyond the "syntax OK" line')
+        or diag("unexpected perl -c output:\n" . join("\n", @warnings));
+}
+
+# =====================================================================
+# Group B -- extraction harness
+# =====================================================================
+
+my ($region) = $src =~ /^\# >>> q03:protected-path-decision:BEGIN\b.*?\n(.*?)^\# <<< q03:protected-path-decision:END\b/ms;
+
+# ---- AC-10 ---- (no BAIL_OUT -- see header ruling; ok(0, ...) proves absence)
+my $DECIDE;
+if (!defined $region) {
+    ok(0, "AC-10: the text between the sentinels evals cleanly into a fresh package under use strict/warnings (sentinel region not found in launcher.pl)");
+    ok(0, "AC-10: the resulting package ->can('protected_path_outcome') (sentinel region not found in launcher.pl)");
+} else {
+    my $harness = "package Q03Decision;\nuse strict;\nuse warnings;\n"
+                . "use ProtectedPaths qw(path_relation protected_roots target_self_codes normalize_path);\n"
+                . $region . "\n1;\n";
+    my $eval_ok = eval $harness;   ## no critic
+    my $eval_err = $@;
+    ok($eval_ok, "AC-10: the text between the sentinels evals cleanly into a fresh package under use strict/warnings")
+        or diag("eval error: $eval_err");
+    if ($eval_ok) {
+        $DECIDE = Q03Decision->can('protected_path_outcome');
+        ok(defined $DECIDE, "AC-10: the resulting package Q03Decision->can('protected_path_outcome')");
+    } else {
+        ok(0, "AC-10: the resulting package Q03Decision->can('protected_path_outcome') (region failed to eval)");
+    }
+}
+
+# ---- AC-11 -- region invariants R-I1..R-I5 ----
+if (!defined $region) {
+    ok(0, "AC-11 (R-I1): extracted region references no launcher file-scope lexical (region not found)");
+    ok(0, "AC-11 (R-I2): extracted region contains no exit/die/warn/print/open/filetest/system/backtick (region not found)");
+    ok(0, 'AC-11 (R-I3): extracted region contains no %ENV / $ENV{ access (region not found)');
+    ok(0, "AC-11 (R-I4): extracted region contains no use/require statement (region not found)");
+    ok(0, "AC-11 (R-I5): every sub defined in the region is protected_path_outcome or _pp_* (region not found)");
+} else {
+    my @forbidden_lexicals = ('$PROJECT_PATH', '$HOST_PLUGINS_DIR', '$LIVE_CCPRAXIS_ROOT',
+                               '$HOME', '$CLAUDE_HOST_CONFIG', '$WINDOWS_FAMILY', '$PODMAN');
+    my @lex_hits = grep { index($region, $_) >= 0 } @forbidden_lexicals;
+    ok(scalar(@lex_hits) == 0, "AC-11 (R-I1): extracted region references no launcher file-scope lexical")
+        or diag('hits: ' . join(', ', @lex_hits));
+
+    my $has_forbidden_call = ($region =~ /\b(exit|die|warn|print|open|system)\s*[\(\s]/
+                               || $region =~ /`/
+                               || $region =~ /(?<![A-Za-z0-9_])-[edf]\s+[\$\(]/) ? 1 : 0;
+    ok(!$has_forbidden_call, "AC-11 (R-I2): extracted region contains no exit/die/warn/print/open/filetest/system/backtick");
+
+    my $has_env = ($region =~ /\$ENV\{/ || $region =~ /\%ENV\b/) ? 1 : 0;
+    ok(!$has_env, 'AC-11 (R-I3): extracted region contains no %ENV / $ENV{ access');
+
+    my $has_use = ($region =~ /^\s*(use|require)\b/m) ? 1 : 0;
+    ok(!$has_use, "AC-11 (R-I4): extracted region contains no use/require statement");
+
+    my @sub_names = $region =~ /^\s*sub\s+(\w+)/mg;
+    my @bad_names = grep { !/^(?:protected_path_outcome|_pp_\w+)$/ } @sub_names;
+    ok((scalar(@sub_names) > 0 && scalar(@bad_names) == 0),
+       "AC-11 (R-I5): every sub defined in the region is named protected_path_outcome or _pp_*")
+        or diag('sub names found: ' . join(', ', @sub_names));
+}
+
+# =====================================================================
+# Shared fixture (spec S3 canonical fixture) -- fabricated paths, injected
+# seams only. Reused across Groups B(AC-12)/C/D/E/F/G below.
+# =====================================================================
+
+my $tripwire = sub { die "test touched the filesystem\n" };
+my $ENVF = sub {
+    my %e = (CLAUDE_CONFIG_DIR => '/home/u/.claude', HOME => '/home/u');
+    return $e{ $_[0] };
+};
+my $REG = {
+    'gh-one'         => { source => { source => 'github', repo => 'o/r' },
+                           installLocation => '/home/u/.claude/plugins/marketplaces/gh-one' },
+    'ccpraxis-local' => { source => { source => 'directory', path => '/home/u/.claude/ccpraxis/plugins' },
+                           installLocation => '/home/u/.claude/ccpraxis/plugins' },
+    'ext-one'        => { source => { source => 'directory', path => '/opt/ext-src' },
+                           installLocation => '/opt/ext-install' },
+};
+my %O = (
+    registry   => $REG,
+    extra_list => ['/opt/protected-one'],
+    env        => $ENVF,
+    exists     => $tripwire,
+    read_file  => $tripwire,
+    fold_case  => 0,
+    windows    => 0,
+);
+
+# The eleven refusing scenarios (B1..B11) + the two C6 passthrough scenarios
+# (B12/B13), each tagged with the AC it primarily serves in Groups C/D/G.
+my @B = (
+    { id => 'B1',  ac => 'AC-13', target => '/home/u/.claude',
+      refuse => 1, reason => 'claude-home', root => '/home/u/.claude', relation => 'exact' },
+    { id => 'B2',  ac => 'AC-14', target => '/home/u/.claude/plugins',
+      refuse => 1, reason => 'claude-home', root => '/home/u/.claude', relation => 'descendant' },
+    { id => 'B3',  ac => 'AC-15', target => '/home/u/.claude/ccpraxis/plugins',
+      refuse => 1, reason => 'marketplace-install', root => '/home/u/.claude/ccpraxis/plugins', relation => 'exact' },
+    { id => 'B4',  ac => 'AC-19', target => '/home/u/.claude/ccpraxis/plugins/sandbox',
+      refuse => 1, reason => 'ccpraxis-install', root => '/home/u/.claude/ccpraxis', relation => 'descendant' },
+    { id => 'B5',  ac => 'AC-18', target => '/home/u/.claude/ccpraxis',
+      refuse => 1, reason => 'ccpraxis-install', root => '/home/u/.claude/ccpraxis', relation => 'exact' },
+    { id => 'B6',  ac => 'AC-16', target => '/opt/ext-install',
+      refuse => 1, reason => 'marketplace-install', root => '/opt/ext-install', relation => 'exact' },
+    { id => 'B7',  ac => 'AC-17', target => '/opt/ext-src',
+      refuse => 1, reason => 'marketplace-source', root => '/opt/ext-src', relation => 'exact' },
+    { id => 'B8',  ac => 'AC-20', target => '/opt/protected-one',
+      refuse => 1, reason => 'user-configured', root => '/opt/protected-one', relation => 'exact' },
+    { id => 'B9',  ac => 'AC-22', target => '/opt',
+      refuse => 1, reason => 'marketplace-install', root => '/opt/ext-install', relation => 'ancestor' },
+    { id => 'B10', ac => 'AC-21', target => '/',
+      refuse => 1, reason => 'drive-root', root => undef, relation => undef },
+    { id => 'B11', ac => 'AC-23', target => '/home/u',
+      refuse => 1, reason => 'user-home', root => undef, relation => undef },
+);
+my @FIXTURE_TARGETS = ((map { $_->{target} } @B), '/home/u/src/ccpraxis', '/home/u/work/myproject');
+
+sub _try_decide {
+    my ($target, $opts) = @_;
+    my $out = eval { $DECIDE->($target, $opts) };
+    my $err = $@;
+    return (($err eq '' && ref($out) eq 'HASH') ? 1 : 0, $out, $err);
+}
+
+# ---- AC-12 ----
+SKIP: {
+    skip "$SKIP_REASON (AC-12)", scalar(@FIXTURE_TARGETS) unless defined $DECIDE;
+    for my $t (@FIXTURE_TARGETS) {
+        my ($ok, undef, $err) = _try_decide($t, \%O);
+        ok($ok, "AC-12: protected_path_outcome('$t') with die-tripwire exists/read_file seams returns without touching the filesystem")
+            or diag("error: $err");
+    }
+}
+
+# =====================================================================
+# Group C (AC-13..22) + Group D AC-23 -- the refusing targets, 4-tuple check
+# =====================================================================
+
+sub check_decision {
+    my ($ac, $id, $target, $want) = @_;
+    my ($ok, $got, $err) = _try_decide($target, \%O);
+    if (!$ok) {
+        ok(0, "$ac: protected_path_outcome('$target') [$id] refuse == $want->{refuse}");
+        ok(0, "$ac: protected_path_outcome('$target') [$id] reason");
+        ok(0, "$ac: protected_path_outcome('$target') [$id] root");
+        ok(0, "$ac: protected_path_outcome('$target') [$id] relation");
+        diag("decision call failed for '$target': $err") if $err;
+        return undef;
+    }
+    is($got->{refuse}, $want->{refuse}, "$ac: protected_path_outcome('$target') [$id] refuse == $want->{refuse}");
+    is($got->{reason}, $want->{reason}, "$ac: protected_path_outcome('$target') [$id] reason");
+    is($got->{root}, $want->{root}, "$ac: protected_path_outcome('$target') [$id] root");
+    is($got->{relation}, $want->{relation}, "$ac: protected_path_outcome('$target') [$id] relation");
+    return $got;
+}
+
+SKIP: {
+    skip "$SKIP_REASON (AC-13..23)", scalar(@B) * 4 unless defined $DECIDE;
+    for my $b (@B) {
+        check_decision($b->{ac}, $b->{id}, $b->{target}, $b);
+    }
+}
+
+# ---- AC-24 (unconditional -- plain path_relation, no launcher region needed) ----
+is(path_relation('/home/u/.claude', '/home/u/.claude/ccpraxis', \%O), 'ancestor',
+   "AC-24: path_relation('/home/u/.claude','/home/u/.claude/ccpraxis') eq 'ancestor' -- a lower-rank root WAS matching (P1 still chose claude-home per AC-13)");
+
+# ---- AC-25 (unconditional -- plain path_relation) ----
+for my $pair (['/home/u/.claude/ccpraxis', 'ccpraxis-install'],
+              ['/home/u/.claude', 'claude-home'],
+              ['/home/u/.claude/ccpraxis/plugins', 'marketplace-install']) {
+    my ($root, $reason) = @$pair;
+    is(path_relation('/home/u/.claude/ccpraxis/plugins/sandbox', $root, \%O), 'descendant',
+       "AC-25: path_relation(AC-19 target, '$root' [$reason]) eq 'descendant' -- all three tied roots relate as descendant; P2 chose the lowest reason rank");
+}
+
+# =====================================================================
+# Group E -- message content (AC-26..33)
+# =====================================================================
+
+my $FIELD_ROOT_PREFIX     = '  ' . 'protected root' . ' : ';
+my $FIELD_RELATION_PREFIX = '  ' . 'relation' . (' ' x 7) . ': ';
+my $FIELD_REASON_PREFIX   = '  ' . 'reason' . (' ' x 9) . ': ';
+my $ROOT_FIELD_MARK       = 'protected root' . ' :';
+my $RELATION_FIELD_MARK   = 'relation' . (' ' x 7) . ':';
+my %RELATION_PHRASE = (
+    exact      => 'exact (the path you gave IS this protected root)',
+    descendant => 'descendant (the path you gave is INSIDE this protected root)',
+    ancestor   => 'ancestor (the path you gave CONTAINS this protected root)',
+);
+
+# ---- AC-26 ----
+SKIP: {
+    skip "$SKIP_REASON (AC-26)", scalar(@B) * 3 unless defined $DECIDE;
+    for my $b (@B) {
+        my ($ok, $got, $err) = _try_decide($b->{target}, \%O);
+        if (!$ok) {
+            ok(0, "AC-26: $b->{id} message is defined and non-empty");
+            ok(0, "AC-26: $b->{id} message has no trailing newline");
+            ok(0, "AC-26: $b->{id} message contains the target verbatim on its own indented line");
+            diag("decision call failed for '$b->{target}': $err") if $err;
+            next;
+        }
+        my $msg = $got->{message};
+        ok((defined $msg && length $msg), "AC-26: $b->{id} ('$b->{target}') message is defined and non-empty");
+        ok((defined $msg && $msg !~ /\n\z/), "AC-26: $b->{id} ('$b->{target}') message has no trailing newline");
+        my $target_line = '  ' . $b->{target};
+        ok((defined $msg && index($msg, $target_line) >= 0),
+           "AC-26: $b->{id} ('$b->{target}') message contains the target verbatim on its own indented line");
+    }
+}
+
+# ---- AC-27 -- 8 targets: all 5 root-based reason codes + all 3 relations ----
+my @AC27_IDS = qw(B1 B2 B3 B4 B5 B7 B8 B9);
+SKIP: {
+    skip "$SKIP_REASON (AC-27)", scalar(@AC27_IDS) * 3 unless defined $DECIDE;
+    for my $id (@AC27_IDS) {
+        my ($b) = grep { $_->{id} eq $id } @B;
+        my ($ok, $got, $err) = _try_decide($b->{target}, \%O);
+        if (!$ok) {
+            ok(0, "AC-27: $id protected-root field line");
+            ok(0, "AC-27: $id relation field line");
+            ok(0, "AC-27: $id reason field line");
+            diag("decision call failed for '$b->{target}': $err") if $err;
+            next;
+        }
+        my $msg = $got->{message} // '';
+        ok(index($msg, $FIELD_ROOT_PREFIX . $b->{root}) >= 0,
+           "AC-27: $id message contains '  protected root : $b->{root}'");
+        ok(index($msg, $FIELD_RELATION_PREFIX . $RELATION_PHRASE{ $b->{relation} }) >= 0,
+           "AC-27: $id message contains the correct S4.2 relation phrase for '$b->{relation}'");
+        ok(index($msg, $FIELD_REASON_PREFIX . $b->{reason}) >= 0,
+           "AC-27: $id message contains '  reason         : $b->{reason}'");
+    }
+}
+
+# ---- AC-28 -- explanation + advice sentinel, one per root-based reason code ----
+my %REASON_TARGET = (
+    'ccpraxis-install'    => '/home/u/.claude/ccpraxis',
+    'claude-home'         => '/home/u/.claude',
+    'marketplace-install' => '/home/u/.claude/ccpraxis/plugins',
+    'marketplace-source'  => '/opt/ext-src',
+    'user-configured'     => '/opt/protected-one',
+    'drive-root'          => '/',
+    'user-home'           => '/home/u',
+);
+my %EXPLANATION_SENTINEL = (
+    'ccpraxis-install'    => 'Its plugins, skills and launcher are in use right now',
+    'claude-home'         => 'Bind-mounting it into a container would expose all of it read-write',
+    'marketplace-install' => 'corrupt the installed plugin tree Claude Code is loading from',
+    'marketplace-source'  => 'Claude Code loads plugins straight out of it',
+    'user-configured'     => 'your own protected-paths list at',
+);
+my %ADVICE_SENTINEL = (
+    'ccpraxis-install' => 'Work on a separate clone instead',
+    'claude-home'      => 'Open the specific project directory you meant to work in',
+    'user-configured'  => 'remove it from',
+);
+
+SKIP: {
+    skip "$SKIP_REASON (AC-28)", 14 unless defined $DECIDE;
+
+    for my $reason (qw(ccpraxis-install claude-home user-configured)) {
+        my ($ok, $got, $err) = _try_decide($REASON_TARGET{$reason}, \%O);
+        if (!$ok || !defined $got->{message}) {
+            ok(0, "AC-28: $reason message contains its S4.5 explanation sentinel");
+            ok(0, "AC-28: $reason message contains its S4.6 advice sentinel");
+            diag("decision call failed for reason '$reason': $err") if $err;
+            next;
+        }
+        like($got->{message}, _sentinel_re($EXPLANATION_SENTINEL{$reason}),
+             "AC-28: $reason message contains its S4.5 explanation sentinel");
+        like($got->{message}, _sentinel_re($ADVICE_SENTINEL{$reason}),
+             "AC-28: $reason message contains its S4.6 advice sentinel");
+    }
+
+    # R4 AMENDED advice for marketplace-install / marketplace-source: the
+    # spec's literal "git clone --no-hardlinks {root} <your-clone-dir>" is
+    # wrong here ({root} need not be a git repo root -- in the flagship
+    # <live>/plugins case the repo root is <live>, not <live>/plugins). The
+    # amended text must point at the repository CONTAINING {root}, keep
+    # --no-hardlinks, and keep the "Open the specific project directory you
+    # meant to work in" line. We assert stable substrings of the amended
+    # intent, not a verbatim paragraph -- the implementer/step-8 write the
+    # final prose.
+    for my $reason (qw(marketplace-install marketplace-source)) {
+        my ($ok, $got, $err) = _try_decide($REASON_TARGET{$reason}, \%O);
+        if (!$ok || !defined $got->{message}) {
+            ok(0, "AC-28: $reason message contains its S4.5 explanation sentinel");
+            ok(0, "AC-28 (R4): $reason advice contains 'Open the specific project directory you meant to work in'");
+            ok(0, "AC-28 (R4): $reason advice contains --no-hardlinks");
+            ok(0, "AC-28 (R4): $reason advice talks about cloning the repository, not the bare subdirectory");
+            diag("decision call failed for reason '$reason': $err") if $err;
+            next;
+        }
+        like($got->{message}, _sentinel_re($EXPLANATION_SENTINEL{$reason}),
+             "AC-28: $reason message contains its S4.5 explanation sentinel");
+        like($got->{message}, _sentinel_re('Open the specific project directory you meant to work in'),
+             "AC-28 (R4): $reason advice contains 'Open the specific project directory you meant to work in'");
+        like($got->{message}, qr/--no-hardlinks/,
+             "AC-28 (R4): $reason advice contains --no-hardlinks");
+        like($got->{message}, qr/\brepository\b/i,
+             "AC-28 (R4): $reason advice talks about cloning the repository, not the bare subdirectory");
+    }
+}
+
+# ---- AC-29 ----
+SKIP: {
+    skip "$SKIP_REASON (AC-29)", 2 unless defined $DECIDE;
+    my ($ok, $got, $err) = _try_decide('/home/u/.claude/ccpraxis', \%O);
+    if (!$ok || !defined $got->{message}) {
+        ok(0, "AC-29: ccpraxis-install message contains 'git clone --no-hardlinks /home/u/.claude/ccpraxis <your-clone-dir>'");
+        ok(0, "AC-29: ccpraxis-install message explains why --no-hardlinks is required");
+        diag("decision call failed: $err") if $err;
+    } else {
+        like($got->{message}, qr/git clone --no-hardlinks \Q\/home\/u\/.claude\/ccpraxis\E\s+<your-clone-dir>/,
+             "AC-29: ccpraxis-install message contains 'git clone --no-hardlinks /home/u/.claude/ccpraxis <your-clone-dir>'");
+        like($got->{message}, _sentinel_re('The --no-hardlinks flag is required'),
+             "AC-29: ccpraxis-install message explains why --no-hardlinks is required");
+    }
+}
+
+# ---- AC-30 ----
+SKIP: {
+    skip "$SKIP_REASON (AC-30)", 2 unless defined $DECIDE;
+    my ($ok, $got, $err) = _try_decide('/home/u/.claude', \%O);
+    if (!$ok || !defined $got->{message}) {
+        ok(0, "AC-30: claude-home message contains the 'Open the specific project directory you meant to work in' advice");
+        ok(0, "AC-30: claude-home message does not contain 'git clone'");
+        diag("decision call failed: $err") if $err;
+    } else {
+        like($got->{message}, _sentinel_re('Open the specific project directory you meant to work in'),
+             "AC-30: claude-home message contains the 'Open the specific project directory you meant to work in' advice");
+        unlike($got->{message}, qr/git clone/, "AC-30: claude-home message does not contain 'git clone'");
+    }
+}
+
+# ---- AC-31 ----
+SKIP: {
+    skip "$SKIP_REASON (AC-31)", 6 unless defined $DECIDE;
+    my ($ok, $got, $err) = _try_decide('/', \%O);
+    if (!$ok || !defined $got->{message}) {
+        ok(0, "AC-31: drive-root message begins 'claude-sandbox will not sandbox a filesystem root:'");
+        ok(0, "AC-31: drive-root message contains 'reason         : drive-root'");
+        ok(0, "AC-31: drive-root message contains the 'Open the specific project directory' advice");
+        ok(0, "AC-31: drive-root message contains no 'protected root :' line");
+        ok(0, "AC-31: drive-root message contains no 'relation       :' line");
+        ok(0, "AC-31: drive-root message contains no 'marketplace' or 'known_marketplaces.json' mention");
+        diag("decision call failed: $err") if $err;
+    } else {
+        my $msg = $got->{message};
+        like($msg, qr/^claude-sandbox will not sandbox a filesystem root:/,
+             "AC-31: drive-root message begins 'claude-sandbox will not sandbox a filesystem root:'");
+        ok(index($msg, $FIELD_REASON_PREFIX . 'drive-root') >= 0,
+           "AC-31: drive-root message contains 'reason         : drive-root'");
+        like($msg, _sentinel_re('Open the specific project directory'),
+             "AC-31: drive-root message contains the 'Open the specific project directory' advice");
+        ok(index($msg, $ROOT_FIELD_MARK) == -1, "AC-31: drive-root message contains no 'protected root :' line");
+        ok(index($msg, $RELATION_FIELD_MARK) == -1, "AC-31: drive-root message contains no 'relation       :' line");
+        ok((index($msg, 'marketplace') == -1 && index($msg, 'known_marketplaces.json') == -1),
+           "AC-31: drive-root message contains no 'marketplace' or 'known_marketplaces.json' mention");
+    }
+}
+
+# ---- AC-32 ----
+SKIP: {
+    skip "$SKIP_REASON (AC-32)", 6 unless defined $DECIDE;
+    my ($ok, $got, $err) = _try_decide('/home/u', \%O);
+    if (!$ok || !defined $got->{message}) {
+        ok(0, "AC-32: user-home message begins 'claude-sandbox will not sandbox your home directory:'");
+        ok(0, "AC-32: user-home message contains 'reason         : user-home'");
+        ok(0, "AC-32: user-home message contains the 'Open the specific project directory' advice");
+        ok(0, "AC-32: user-home message contains no 'protected root :' line");
+        ok(0, "AC-32: user-home message contains no 'relation       :' line");
+        ok(0, "AC-32: user-home message contains no 'marketplace' or 'known_marketplaces.json' mention");
+        diag("decision call failed: $err") if $err;
+    } else {
+        my $msg = $got->{message};
+        like($msg, qr/^claude-sandbox will not sandbox your home directory:/,
+             "AC-32: user-home message begins 'claude-sandbox will not sandbox your home directory:'");
+        ok(index($msg, $FIELD_REASON_PREFIX . 'user-home') >= 0,
+           "AC-32: user-home message contains 'reason         : user-home'");
+        like($msg, _sentinel_re('Open the specific project directory'),
+             "AC-32: user-home message contains the 'Open the specific project directory' advice");
+        ok(index($msg, $ROOT_FIELD_MARK) == -1, "AC-32: user-home message contains no 'protected root :' line");
+        ok(index($msg, $RELATION_FIELD_MARK) == -1, "AC-32: user-home message contains no 'relation       :' line");
+        ok((index($msg, 'marketplace') == -1 && index($msg, 'known_marketplaces.json') == -1),
+           "AC-32: user-home message contains no 'marketplace' or 'known_marketplaces.json' mention");
+    }
+}
+
+# ---- AC-33 ----
+SKIP: {
+    skip "$SKIP_REASON (AC-33)", scalar(@B) * 3 unless defined $DECIDE;
+    for my $b (@B) {
+        my ($ok, $got, $err) = _try_decide($b->{target}, \%O);
+        if (!$ok || !defined $got->{message}) {
+            ok(0, "AC-33: $b->{id} message contains the no-override paragraph");
+            ok(0, "AC-33: $b->{id} message ends with 'Aborting.'");
+            ok(0, "AC-33: $b->{id} message is 7-bit ASCII");
+            diag("decision call failed for '$b->{target}': $err") if $err;
+            next;
+        }
+        my $msg = $got->{message};
+        like($msg, _sentinel_re('There is no override: no flag and no environment variable'),
+             "AC-33: $b->{id} message contains the no-override paragraph");
+        like($msg, qr/Aborting\.\z/, "AC-33: $b->{id} message ends with 'Aborting.'");
+        ok(($msg !~ /[^\x00-\x7f]/), "AC-33: $b->{id} message is 7-bit ASCII");
+    }
+}
+
+# =====================================================================
+# Group F -- degradation (Decision #6) (AC-34..37)
+# =====================================================================
+
+my %O_BROKEN = (%O, registry => undef);   # supplied-but-broken -> registry-shape error
+
+# ---- AC-34 ----
+SKIP: {
+    skip "$SKIP_REASON (AC-34)", 3 unless defined $DECIDE;
+    my ($ok, $got, $err) = _try_decide('/home/u/.claude', \%O_BROKEN);
+    if (!$ok) {
+        ok(0, "AC-34: refuse == 1 with a broken registry"); ok(0, "AC-34: reason eq 'claude-home'"); ok(0, "AC-34: warnings non-empty");
+        diag("decision call failed: $err") if $err;
+    } else {
+        is($got->{refuse}, 1, "AC-34: refuse == 1 with a broken registry, target /home/u/.claude");
+        is($got->{reason}, 'claude-home', "AC-34: reason eq 'claude-home' -- a broken source never shrinks the refusal");
+        ok(scalar(@{ $got->{warnings} // [] }) > 0, "AC-34: warnings is non-empty");
+    }
+}
+
+# ---- AC-35 ----
+SKIP: {
+    skip "$SKIP_REASON (AC-35)", 3 unless defined $DECIDE;
+    my ($ok, $got, $err) = _try_decide('/home/u/work/myproject', \%O_BROKEN);
+    if (!$ok) {
+        ok(0, "AC-35: refuse == 0 with a broken registry"); ok(0, "AC-35: message undef"); ok(0, "AC-35: warnings non-empty");
+        diag("decision call failed: $err") if $err;
+    } else {
+        is($got->{refuse}, 0, "AC-35: refuse == 0 with a broken registry, target /home/u/work/myproject -- errors alone are not fatal");
+        is($got->{message}, undef, "AC-35: message is undef");
+        ok(scalar(@{ $got->{warnings} // [] }) > 0, "AC-35: warnings is non-empty");
+    }
+}
+
+# ---- AC-36 ----
+SKIP: {
+    skip "$SKIP_REASON (AC-36)", 3 unless defined $DECIDE;
+    my ($ok, $got, $err) = _try_decide('/home/u/.claude', \%O_BROKEN);
+    if (!$ok) {
+        ok(0, "AC-36: every warning line matches ^claude-sandbox: and has no embedded newline");
+        ok(0, "AC-36: the last warning line is the 'still enforcing' line");
+        ok(0, "AC-36: N in the still-enforcing line equals scalar \@{ protected_roots(\\%O)->{roots} }");
+        diag("decision call failed: $err") if $err;
+    } else {
+        my @w = @{ $got->{warnings} // [] };
+        my $bad = grep { !/^claude-sandbox: / || /\n/ } @w;
+        is($bad, 0, "AC-36: every warning line matches ^claude-sandbox: and has no embedded newline");
+        my $last = $w[-1] // '';
+        like($last, qr/^claude-sandbox: the protected-path guard is still enforcing the (\d+) protected root\(s\) it did resolve; a failed source never relaxes it\.?\z/,
+             "AC-36: the last warning line is the 'still enforcing the N protected root(s)' line");
+        my ($n) = $last =~ /enforcing the (\d+) protected/;
+        my $actual = scalar @{ protected_roots(\%O_BROKEN)->{roots} };
+        is($n, $actual, "AC-36: N equals scalar \@{ protected_roots(\\%O_BROKEN)->{roots} } (currently $actual)");
+    }
+}
+
+# ---- AC-37 ----
+SKIP: {
+    skip "$SKIP_REASON (AC-37)", 4 unless defined $DECIDE;
+    my $REG15 = { map { ("bad$_" => "not-a-hash-$_") } (1 .. 15) };
+    my %O37 = (%O, registry => $REG15);
+    my ($ok, $got, $err) = _try_decide('/home/u/work/myproject', \%O37);
+    if (!$ok) {
+        ok(0, "AC-37: exactly 12 warning lines (10 + 1 overflow + 1 still-enforcing)");
+        ok(0, "AC-37: exactly 10 per-error WARNING lines");
+        ok(0, "AC-37: exactly one overflow ('...and 5 more...') line, 11th of 12");
+        ok(0, "AC-37: the still-enforcing line is last");
+        diag("decision call failed: $err") if $err;
+    } else {
+        my @w = @{ $got->{warnings} // [] };
+        is(scalar(@w), 12, "AC-37: exactly 12 warning lines (10 + 1 overflow + 1 still-enforcing) for 15 malformed registry entries");
+        my $warn_n = grep { /^claude-sandbox: WARNING: protected-path source \[/ } @w;
+        is($warn_n, 10, "AC-37: exactly 10 per-error WARNING lines");
+        like($w[10] // '', qr/^claude-sandbox: WARNING: \.\.\. and 5 more protected-path source problem\(s\)\.?\z/,
+             "AC-37: exactly one overflow ('...and 5 more...') line, 11th of 12");
+        like($w[11] // '', qr/^claude-sandbox: the protected-path guard is still enforcing/,
+             "AC-37: the still-enforcing line is last");
+    }
+}
+
+# =====================================================================
+# Group G -- C6 no-regression (AC-38..40)
+# =====================================================================
+
+# ---- AC-38 ----
+SKIP: {
+    skip "$SKIP_REASON (AC-38)", 3 unless defined $DECIDE;
+    my ($ok, $got, $err) = _try_decide('/home/u/src/ccpraxis', \%O);
+    if (!$ok) {
+        ok(0, "AC-38: refuse == 0 for a ccpraxis clone outside the install");
+        ok(0, "AC-38: message undef");
+        ok(0, "AC-38: warnings empty");
+        diag("decision call failed: $err") if $err;
+    } else {
+        is($got->{refuse}, 0, "AC-38: refuse == 0 for a ccpraxis clone outside the install (/home/u/src/ccpraxis)");
+        is($got->{message}, undef, "AC-38: message is undef");
+        is(scalar(@{ $got->{warnings} // [] }), 0, "AC-38: warnings is empty");
+    }
+}
+
+# ---- AC-39 ----
+SKIP: {
+    skip "$SKIP_REASON (AC-39)", 3 unless defined $DECIDE;
+    my ($ok, $got, $err) = _try_decide('/home/u/work/myproject', \%O);
+    if (!$ok) {
+        ok(0, "AC-39: refuse == 0 for an ordinary unrelated project");
+        ok(0, "AC-39: message undef");
+        ok(0, "AC-39: warnings empty");
+        diag("decision call failed: $err") if $err;
+    } else {
+        is($got->{refuse}, 0, "AC-39: refuse == 0 for an ordinary unrelated project (/home/u/work/myproject)");
+        is($got->{message}, undef, "AC-39: message is undef");
+        is(scalar(@{ $got->{warnings} // [] }), 0, "AC-39: warnings is empty");
+    }
+}
+
+# ---- AC-40 (unconditional -- CcpraxisWorkCopy::workcopy_route already exists,
+#       does not depend on the q03 launcher region) ----
+is(workcopy_route('/home/u/src/ccpraxis', {
+        live_install_hint => '/home/u/.claude/ccpraxis',
+        exists            => sub { 0 },
+        realpath          => sub { $_[0] },
+    }), 'passthrough',
+    "AC-40: CcpraxisWorkCopy::workcopy_route is still 'passthrough' for the ccpraxis-clone-outside-the-install target (R2 fail-safe)");
+is(workcopy_route('/home/u/work/myproject', {
+        live_install_hint => '/home/u/.claude/ccpraxis',
+        exists            => sub { 0 },
+        realpath          => sub { $_[0] },
+        git_commondir     => sub { undef },
+    }), 'passthrough',
+    "AC-40: CcpraxisWorkCopy::workcopy_route is still 'passthrough' for the ordinary-project target (R2 fail-safe)");
+
+# =====================================================================
+# Group H -- Decision #3, structural proof that no override exists
+# (AC-41..44, all unconditional/source-based)
+# =====================================================================
+
+# ---- AC-41 ----
+unlike($src, qr/(force|override|bypass|unsafe|allow|skip|ignore)[-_ ]?(protect|refus|guard)/i,
+       "AC-41: no match for /(force|override|bypass|unsafe|allow|skip|ignore)[-_ ]?(protect|refus|guard)/i anywhere in launcher.pl");
+unlike($src, qr/(protect|refus|guard)[-_ ]?(force|override|bypass|off|disable)/i,
+       "AC-41: no match for /(protect|refus|guard)[-_ ]?(force|override|bypass|off|disable)/i anywhere in launcher.pl");
+
+# ---- AC-42 -- pinned literal comparison of the while(@argv) arg-parser block
+#       (arg parsing is explicitly out of scope for q03; this block must stay
+#       byte-identical) ----
+{
+    my $ARG_BLOCK = '    while (@argv) {' . "\n"
+                  . '        my $a = shift @argv;' . "\n"
+                  . "        if (\$a eq '--resume-session') {\n"
+                  . '            die "ERROR: --resume-session requires a UUID argument\n" unless @argv;' . "\n"
+                  . '            $RESUME_SESSION = shift @argv;' . "\n"
+                  . '        } elsif ($a =~ /^--resume-session=(.*)$/) {' . "\n"
+                  . '            $RESUME_SESSION = $1;' . "\n"
+                  . "        } elsif (\$a eq '--session') {\n"
+                  . '            $SESSION_MODE = 1;' . "\n"
+                  . "        } elsif (\$a eq '--') {\n"
+                  . '            push @POSITIONAL, @argv;' . "\n"
+                  . '            @argv = ();' . "\n"
+                  . '        } else {' . "\n"
+                  . '            push @POSITIONAL, $a;' . "\n"
+                  . '        }' . "\n"
+                  . '    }' . "\n";
+    ok(index($src, $ARG_BLOCK) >= 0,
+       "AC-42: launcher.pl's while(\@argv) arg-parser block is byte-identical to the pre-q03 baseline (no new -- branch beyond --resume-session/--session/--)");
+}
+
+# ---- AC-43 ----
+{
+    my @env_names;
+    while ($src =~ /\$ENV\{\s*['"]?(\w+)['"]?\s*\}/g) { push @env_names, $1; }
+    my @bad = grep { /PROTECT|REFUS|GUARD|OVERRIDE|FORCE|BYPASS|UNSAFE/i } @env_names;
+    is(scalar(@bad), 0,
+       'AC-43: no $ENV{...} name in launcher.pl matches /PROTECT|REFUS|GUARD|OVERRIDE|FORCE|BYPASS|UNSAFE/i')
+        or diag('matches: ' . join(', ', @bad));
+}
+
+# ---- AC-44 -- the refusal branch is unconditional ----
+{
+    my ($call_line_idx) = grep { $lines[$_] =~ /protected_path_outcome\(\s*\$PROJECT_PATH\b/ } (0 .. $#lines);
+    my ($block_open_idx, $block_close_idx);
+    if (defined $call_line_idx) {
+        for (my $i = $call_line_idx; $i >= 0 && $i >= $call_line_idx - 5; $i--) {
+            if ($lines[$i] =~ /^\{\s*$/) { $block_open_idx = $i; last; }
+        }
+        if (defined $block_open_idx) {
+            for my $i ($block_open_idx + 1 .. $#lines) {
+                if ($lines[$i] =~ /^\}\s*$/) { $block_close_idx = $i; last; }
+            }
+        }
+    }
+    if (defined $block_open_idx && defined $block_close_idx) {
+        my $block_text = join('', @lines[$block_open_idx .. $block_close_idx]);
+        my ($refuse_body) = $block_text =~ /if\s*\(\s*\$pp->\{refuse\}\s*\)\s*\{(.*?)\n\s*\}/s;
+        if (defined $refuse_body) {
+            ok(($refuse_body !~ /\b(if|unless|return|last|next|eval)\b/),
+               "AC-44: the refusal branch body contains no if/unless/return/last/next/eval");
+        } else {
+            ok(0, "AC-44: the refusal branch body contains no if/unless/return/last/next/eval (refusal branch not found)");
+        }
+        my $exit_count = () = $block_text =~ /\bexit\s*\(/g;
+        is($exit_count, 1, "AC-44: exit appears exactly once inside the whole call block");
+    } else {
+        ok(0, "AC-44: the refusal branch body contains no if/unless/return/last/next/eval (call block not found)");
+        ok(0, "AC-44: exit appears exactly once inside the whole call block (call block not found)");
+    }
+}
+
+# =====================================================================
+# Group I -- documentation (AC-45..48)
+# =====================================================================
+
+my $DOC = "$Bin/../../docs/protected-paths.md";
+my $doc_text;
+if (open my $dfh, '<:raw', $DOC) {
+    local $/;
+    $doc_text = <$dfh>;
+    close $dfh;
+}
+
+# ---- AC-45 -- names all four Decision #4 sources ----
+for my $probe (
+    ['installLocation',                        'installLocation'],
+    ["source.path (directory source)",         'source.path'],
+    ['the Claude home (CLAUDE_CONFIG_DIR / ~/.claude)', 'CLAUDE_CONFIG_DIR'],
+    ['the ccpraxis live install anchor',       '(?:ccpraxis|live) install'],
+) {
+    my ($label, $pat) = @$probe;
+    if (defined $doc_text) {
+        like($doc_text, qr/$pat/i, "AC-45: docs/protected-paths.md names the source '$label'");
+    } else {
+        ok(0, "AC-45: docs/protected-paths.md names the source '$label' (doc file does not exist yet)");
+    }
+}
+
+# ---- AC-46 -- names the three refusing relations + unrelated launches ----
+for my $rel (qw(exact descendant ancestor unrelated)) {
+    if (defined $doc_text) {
+        like($doc_text, qr/\b\Q$rel\E\b/, "AC-46: docs/protected-paths.md names the relation '$rel'");
+    } else {
+        ok(0, "AC-46: docs/protected-paths.md names the relation '$rel' (doc file does not exist yet)");
+    }
+}
+
+# ---- AC-47 -- names all seven reason codes ----
+for my $code (qw(ccpraxis-install claude-home marketplace-install marketplace-source
+                 user-configured drive-root user-home)) {
+    if (defined $doc_text) {
+        like($doc_text, qr/\Q$code\E/, "AC-47: docs/protected-paths.md names the reason code '$code'");
+    } else {
+        ok(0, "AC-47: docs/protected-paths.md names the reason code '$code' (doc file does not exist yet)");
+    }
+}
+
+# ---- AC-48 -- documents the extra list ----
+for my $probe (
+    ['the literal extra-list path', qr/\$\{CLAUDE_CONFIG_DIR:-~\/\.claude\}\/ccpraxis-protected-paths\.json/],
+    ['JSON array of absolute paths', qr/JSON array/i],
+    ['absent file is an empty list, not an error', qr/(?:absent|missing).{0,40}(?:not an error|empty list)|empty list.{0,40}(?:absent|missing)/is],
+    ['a malformed file is an error', qr/malformed/i],
+    ['there is no override', qr/no override/i],
+) {
+    my ($label, $re) = @$probe;
+    if (defined $doc_text) {
+        like($doc_text, $re, "AC-48: docs/protected-paths.md documents $label");
+    } else {
+        ok(0, "AC-48: docs/protected-paths.md documents $label (doc file does not exist yet)");
+    }
+}
+
+# =====================================================================
+# Group J -- suite hygiene (AC-49..50)
+# =====================================================================
+
+open my $sfh, '<:raw', $0 or die "cannot reopen own test file $0: $!";
+my @slines = <$sfh>;
+close $sfh;
+my $stext = join('', @slines);
+
+# Scope the "forbidden content" scans to everything BEFORE this Group J
+# section, not the whole file: Group J's own assertions necessarily contain
+# the words "podman"/"docker"/"TestSandbox"/"$ENV{HOME}" in their id strings
+# and regex literals (to describe what they check for), and AC-11's R-I1
+# lexical-name list legitimately contains the literal string '$PODMAN' as
+# DATA (the launcher's own variable name, unrelated to spawning a container
+# CLI). A whole-file substring scan would self-defeat on both. Scanning only
+# the substantive Groups A-I content sidesteps this without weakening what
+# actually matters: that the test LOGIC never spawns a container / never
+# spawns launcher.pl as a program / never reads the real $ENV{HOME}.
+my ($groupj_idx) = grep { $slines[$_] =~ /^\# Group J -- suite hygiene/ } (0 .. $#slines);
+my @scan_lines = defined $groupj_idx ? @slines[0 .. $groupj_idx - 1] : @slines;
+my $scan_text = join('', @scan_lines);
+my @scan_code_lines = map { my $x = $_; $x =~ s/#.*$//; $x } @scan_lines;
+my $scan_code = join('', @scan_code_lines);
+
+# ---- AC-49 ----
+like($scan_text, qr/use FindBin qw\(\$Bin\)/, 'AC-49: t/53 uses "use FindBin qw($Bin);"');
+like($scan_text, qr/use lib "\$Bin\/\.\.\/\.\.\/scripts"/, 'AC-49: t/53 uses "use lib \"$Bin/../../scripts\";"');
+like($scan_text, qr/abs_path\("\$Bin\/\.\.\/\.\.\/\.\.\/\.\."\)/, 'AC-49: t/53 resolves the repo root as abs_path("$Bin/../../../..")');
+like($scan_text, qr/BAIL_OUT/, 'AC-49: t/53 has a BAIL_OUT guard');
+{
+    # The only subprocess call permitted anywhere in this file is the
+    # whitelisted `perl -c launcher.pl` compile check (AC-8/AC-9). Pinning
+    # "exactly one system( call site, and it is the -c one" proves "never
+    # references podman/docker, never spawns launcher.pl as a program,
+    # never a TestSandbox-driven container spawn" all at once, without a
+    # blanket word-ban that would trip over legitimate DATA occurrences
+    # (see the scoping comment above).
+    my @system_calls = ($scan_code =~ /\bsystem\s*\(/g);
+    is(scalar(@system_calls), 1,
+       'AC-49: t/53 contains exactly one system( call site (the whitelisted `perl -c` compile check)');
+    like($scan_code, qr/sprintf\('"%s" -c "%s"[^\n]*\$LAUNCHER/,
+         'AC-49: the sole system( call site is `perl -c` against $LAUNCHER, not a real launch');
+}
+unlike($scan_code, qr/\bpodman\b/, 'AC-49: t/53 never references a container CLI by name (podman) in code');
+unlike($scan_code, qr/\bdocker\b/, 'AC-49: t/53 never references a container CLI by name (docker) in code');
+unlike($scan_code, qr/\bTestSandbox\b/, 'AC-49: t/53 never references a TestSandbox-driven container spawn');
+{
+    my @nonblank = grep { $_ !~ /^\s*$/ } @slines;
+    like($nonblank[-1], qr/^\s*done_testing\(\);\s*$/, 'AC-49: t/53 ends with done_testing() (no fixed plan)');
+}
+
+# ---- AC-50 ----
+unlike($scan_code, qr/\$ENV\{\s*['"]?HOME['"]?\s*\}/, 'AC-50: t/53 never references the real $ENV{HOME}');
+unlike($scan_code, qr/\bglob\s*\(\s*['"]~/, 'AC-50: t/53 never globs the real home directory via ~');
+like($scan_code, qr/exists\s*=>/, 'AC-50: t/53 always supplies an injected exists seam (never the module default)');
+like($scan_code, qr/read_file\s*=>/, 'AC-50: t/53 always supplies an injected read_file seam (never the module default)');
+
+done_testing();
