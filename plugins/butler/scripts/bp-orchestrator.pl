@@ -1886,8 +1886,14 @@ sub run {
             #
             # The relaxation is deliberately asymmetric and covers INGESTION ONLY:
             #   - entering on $cinfl_pre reaches the `if ($cinfl)` branch below,
-            #     which only READS a verdict already produced. It schedules
-            #     nothing and starts nothing.
+            #     which consumes a verdict already produced. It SPAWNS NOTHING
+            #     THIS TICK -- and that, not "no writes", is the real invariant:
+            #     remediation_step does mutate durable state (it authors ledgers
+            #     and persists the queue). Nothing it writes is launched out of
+            #     turn, because the per-package launch sites already ran earlier
+            #     in this same tick and $any_running is recomputed next tick.
+            #     (Both reviewer and red-team flagged the earlier wording here,
+            #     "schedules nothing and starts nothing", as overstating this.)
             #   - the SPAWN branches are structurally unreachable in that case,
             #     because they sit behind `elsif` on $cinfl. When $cinfl_pre is
             #     false we can only have entered via !$any_running, so firing a
@@ -2093,10 +2099,21 @@ sub remediation_merge {
     # (the ONLY transition that can make verify_ready become 1), and it runs
     # every tick, so it is the correct place to detect "the queue's readiness
     # just changed" and rotate the stale verdict out of the way.
+    # F3 (red-team): the cap conjunct MUST live here, at the site that actually
+    # runs. It used to sit beside the authoring-time rotation in remediation_step,
+    # which relocating rotation turned into dead code -- so spec §8.3's stated
+    # bound (total gate firings <= 1 + remediation_cap) was enforced by nothing.
+    # Load-bearing because rotate_verdict resets b05's _run.conformance_spawns,
+    # so b05's own conformance_spawn_cap no longer bounds firings on its own.
     if (@{ $r->{transitioned} || [] }) {
-        BpRemediate::rotate_verdict($runs, $queue, $now);
-        update_registry_pkg($runs, '_run', { conformance_spawns => 0 });
-        BpRemediate::write_queue("$runs/remediation-queue.json", $queue);
+        my $cap = (defined $queue->{rounds_cap} && "$queue->{rounds_cap}" =~ /^\d+$/)
+                ? $queue->{rounds_cap}
+                : (_tunables($runs)->{remediation_cap} // 6);
+        if (($queue->{gate_firings} // 0) < $cap) {
+            BpRemediate::rotate_verdict($runs, $queue, $now);
+            update_registry_pkg($runs, '_run', { conformance_spawns => 0 });
+            BpRemediate::write_queue("$runs/remediation-queue.json", $queue);
+        }
     }
     return $queue;
 }
@@ -2225,13 +2242,13 @@ sub remediation_step {
         _write_json_atomic($path, $rec) if defined $path && -e $path;
     }
 
-    # (vi) rotate the verdict + re-arm b05's gate: only when a round actually
-    # opened this plan AND the global cap wasn't already exhausted opening it
-    # (spec-08 item 9) — bounds gate_firings <= rounds_used <= remediation_cap.
-    if ($plan->{rotate} && ($plan->{queue}{rounds_used} // 0) < $ctx{cap}) {
-        BpRemediate::rotate_verdict($runs, $plan->{queue}, $now);
-        update_registry_pkg($runs, '_run', { conformance_spawns => 0 });
-    }
+    # (vi) rotation deliberately does NOT happen here. It was relocated to the
+    # merge seam (remediation_merge), which is the only place the queued ->
+    # awaiting_verify transition occurs and therefore the only place readiness
+    # can change; the cap conjunct that bounds gate firings lives there with it.
+    # The old block here tested $plan->{rotate}, which is always 0 since the
+    # relocation — it was dead code masquerading as spec §8.3's enforcement
+    # (red-team F3). Removed rather than left to mislead the next reader.
 
     _log($log, 'remediation_step', {
         authored => scalar(@{ $plan->{author}   || [] }),
