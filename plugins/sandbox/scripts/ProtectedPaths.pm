@@ -320,6 +320,70 @@ my $_default_realpath = sub {
     return $r;
 };
 
+# =====================================================================
+# q04 §2.2 -- the default env-independent home probes (notion A only).
+# Returns a LIST OF CODEREFS, each of which returns zero or more home
+# DIRECTORIES; protected_roots evals each one separately so a probe that
+# dies is silently skipped (AC-61). No PowerShell probe is shipped: the host
+# perl has no Win32::* (measured absent -- KeepAwake.pm:13,
+# launcher.pl:3850), and callers that need one inject `home_probes`.
+# =====================================================================
+sub _default_home_probes {
+    my ($exists_fn) = @_;
+    return (
+        # Probe 1 -- the POSIX passwd database. This is the whole point of
+        # finding 2: it reports the OS's own record of the home directory, so
+        # `HOME=/tmp/decoy` cannot make the real `~/.claude` disappear from
+        # `roots`.
+        #
+        # NOT gated on the broad Windows-family test. launcher.pl:78's
+        # $WINDOWS_FAMILY matches MSWin32|cygwin|msys, but only *native*
+        # MSWin32 lacks getpwuid; Git-for-Windows perl is `msys`, a Cygwin
+        # derivative where the passwd database does work -- so the broad gate
+        # would disable this on the project's primary host (spec §8 records
+        # launcher.pl:544's identical over-broad gate for harvest).
+        sub {
+            return () if $^O eq 'MSWin32';
+            my @pw = getpwuid($<);
+            return () unless @pw && defined $pw[7] && length $pw[7];
+            # EXISTENCE-GATED, unlike the env-derived candidates above, and
+            # this asymmetry is deliberate. An env var (or an injected probe)
+            # is a caller DECLARATION that a home exists; the passwd database
+            # is a self-made GUESS about the ambient host -- in a container it
+            # is typically /root, which has no Claude home at all. Adopting an
+            # unverified guess would invent a phantom protected root out of
+            # ambient state, and t/51's AC-24/AC-27/AC-49 pin exactly that:
+            # they assert byte-exact root sets while arming `exists` as a
+            # tripwire, so a candidate the module discovered by itself may only
+            # be adopted after the seam confirms it. A guess about a directory
+            # that does not exist protects nothing anyway.
+            my $ex = eval { $exists_fn->("$pw[7]/.claude") };
+            return () if $@ || !$ex;
+            return ($pw[7]);
+        },
+    );
+}
+
+# =====================================================================
+# q04 §2.3 -- the registry / extra-list SOURCE as a candidate SET.
+# Given a path relative to a claude-home directory, return the additional
+# paths to try under every notion-A home candidate, minus the one the
+# primary acquisition already used (never attempt the same file twice).
+# =====================================================================
+sub _candidate_source_paths {
+    my ($relative, $home_candidates, $primary) = @_;
+    my %seen;
+    $seen{$primary} = 1 if defined $primary && !ref $primary;
+    my @out;
+    for my $h (@$home_candidates) {
+        next unless defined $h && !ref $h && $h !~ /\A\s*\z/;
+        my $p = "$h/$relative";
+        next if $seen{$p}++;
+        push @out, $p;
+    }
+    return @out;
+}
+
 my %REASON_RANK = (
     'ccpraxis-install'    => 0,
     'claude-home'         => 1,
@@ -405,7 +469,16 @@ sub protected_roots {
     # per Decision #6. `$home_raw` itself stays a single, precedence-
     # ordered value -- it is only used below to derive the *default*
     # registry/extra-list paths, which §2.5.1 is unmodified for.
-    my $home_raw;   # unnormalised, used for the default registry/extra paths
+    #
+    # q04 §2.1/§2.2 extend the same argument off the environment entirely.
+    # This is NOTION A ("home_candidates", plural): deliberately MAXIMAL,
+    # because a *missing* candidate SHRINKS the protected set and makes the
+    # guard fail open, which Decision #6 forbids. It is the exact opposite
+    # bias from notion B (`_user_home`, singular, env-derived, unchanged by
+    # q04) used further down to REMOVE roots -- the biases are opposite
+    # because the consequences of error are opposite. Do not conflate them.
+    my $home_raw;          # unnormalised, used for the default registry/extra paths
+    my @home_candidates;   # notion A, hoisted: also feeds the source candidate set (§2.3)
     {
         my $cfg = eval { $env_fn->('CLAUDE_CONFIG_DIR') };
         $cfg = undef if $@;
@@ -414,11 +487,33 @@ sub protected_roots {
         my $userprofile = eval { $env_fn->('USERPROFILE') };
         $userprofile = undef if $@;
 
-        my @home_candidates;
         push @home_candidates, $cfg                  if defined $cfg         && $cfg         !~ /\A\s*\z/;
         push @home_candidates, "$home_env/.claude"    if defined $home_env    && $home_env    !~ /\A\s*\z/;
         push @home_candidates, "$userprofile/.claude" if defined $userprofile && $userprofile !~ /\A\s*\z/;
 
+        # q04 §2.2 -- env-INDEPENDENT probes, additive and best-effort. Each
+        # probe is invoked under its OWN eval: a probe that dies contributes
+        # nothing, is NOT an error, and leaves every other candidate intact
+        # (AC-61, §M5). `home_probes` replaces the default probe list and
+        # returns HOME DIRECTORIES (what getpwuid's pw_dir is); the "/.claude"
+        # suffix is appended here, in one place.
+        my @probes = (defined $opts->{home_probes} && ref $opts->{home_probes} eq 'CODE')
+            ? ($opts->{home_probes})
+            : (_default_home_probes($exists_fn));
+        for my $probe (@probes) {
+            my @got = eval { $probe->() };
+            @got = () if $@;
+            for my $h (@got) {
+                next if ref $h;
+                next unless defined $h && $h !~ /\A\s*\z/;
+                push @home_candidates, "$h/.claude";
+            }
+        }
+
+        # `$home_raw` stays exactly the pre-q04 single precedence-ordered
+        # value (it is what §2.5.1 specifies, and what the *primary*
+        # registry/extra-list default path is derived from). q04 §2.3 does not
+        # widen it -- it adds further source candidates alongside it.
         if (defined $cfg && $cfg !~ /\A\s*\z/) {
             $home_raw = $cfg;
         } elsif (defined $home_env && $home_env !~ /\A\s*\z/) {
@@ -429,7 +524,7 @@ sub protected_roots {
 
         if (@home_candidates) {
             for my $hc (@home_candidates) {
-                my $n = _ingest_path($hc);
+                my $n = _ingest_path($hc, $opts);
                 push @candidates, { path => $n, reason => 'claude-home' } if defined $n;
             }
         } else {
@@ -467,7 +562,11 @@ sub protected_roots {
         push @errors, { code => 'registry-shape', detail => 'registry is not a JSON object' };
     }
 
-    if (defined $reg) {
+    # The per-entry walk is a closure rather than inline code so q04 §2.3 can
+    # apply it to EVERY registry the candidate set discovers (below), without
+    # duplicating any of the hostile-registry hardening it carries.
+    my $ingest_registry = sub {
+        my ($reg) = @_;
         # Never dies (module header §M5): a hostile registry can be a tied
         # or otherwise poisoned hash whose FETCH/keys enumeration dies
         # mid-walk. Wrap the whole per-entry body (including the key
@@ -623,11 +722,38 @@ sub protected_roots {
         }
     }
 
+    # q04 §3 -- the user-home half of the rejection guard. Notion B
+    # (`_user_home`: minimal, precedence-ordered, env-derived) and NOT the
+    # maximal notion-A candidate set: this value is used to REMOVE roots, so
+    # widening it would remove more roots and refuse more legitimate projects
+    # -- the opposite error from finding 2's (§2.1's asymmetry).
+    my $user_home = _user_home($opts);
+
     my @kept;
     for my $c (@resolved) {
         if (_is_bare_root($c->{path})) {
             push @errors, { code => 'root-bare-rejected', detail => "$c->{reason}: $c->{path}" };
             next;
+        }
+        # One malformed installLocation that normalises to the user's home
+        # makes EVERY project on the machine a descendant of a protected root,
+        # and with no override (Decision #3) that is an unrecoverable outage
+        # rather than an inconvenience. So reject it -- but EXACT MATCH ONLY,
+        # never a descendant: `~/.claude` IS a descendant of the home and is
+        # the guard's single highest-value root, so rejecting descendants
+        # would delete the very protection being repaired (AC-64).
+        # Compared through path_relation, which is segment-aware and honours
+        # the platform fold rule (Decision #8), not by string equality
+        # (AC-65). This is a per-candidate rejection, never an abort: the
+        # remaining roots keep protecting normally (AC-63). The code is an
+        # ERROR code and never a root `reason`, so it cannot leak into
+        # `roots` (AC-47/AC-66).
+        if (defined $user_home && $user_home !~ /\A\s*\z/) {
+            my $rel = eval { path_relation($c->{path}, $user_home, $opts) };
+            if (defined $rel && $rel eq 'exact') {
+                push @errors, { code => 'root-home-rejected', detail => "$c->{reason}: $c->{path}" };
+                next;
+            }
         }
         push @kept, $c;
     }
