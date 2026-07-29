@@ -2978,14 +2978,99 @@ sub enter_dashboard {
                                   busy_age => $st->{busy_age} }) if $act ne 'noop';
         },
         spawn         => \&_spawn_session,
-        write_signals => sub {
-            my $n = Dashboard::write_shutdown_signals(Dashboard::shutdown_targets($PROJECT_PATH));
-            log_ev('shutdown_all', { signals => $n });
-            return $n;
-        },
+        stop_runs     => sub { my ($st, $prog) = @_; _lifecycle_run('stop-runs',     $st, $prog) },
+        full_shutdown => sub { my ($st, $prog) = @_; _lifecycle_run('full-shutdown', $st, $prog) },
     );
     _keepawake_release_global();   # drop the wake-lock on clean dashboard exit
     exit($rc // 0);
+}
+
+# _lifecycle_run($mode, \%state, $progress) — s11-lifecycle-stop spec 08 S2.8:
+# the real, impure seams for Dashboard::run_stages. $mode is 'stop-runs' or
+# 'full-shutdown'; $progress is the status_cb coderef the loop built (it
+# repaints the frame on every stage transition). Never called from a unit
+# test (see t/46 PART 9's note) -- covered only by source-text assertions
+# plus review (AC-21).
+sub _lifecycle_run {
+    my ($mode, $state, $progress) = @_;
+    my $plan = ($mode eq 'full-shutdown')
+        ? Dashboard::full_shutdown_plan($state)
+        : Dashboard::stop_runs_plan($state);
+
+    my $busy_stale = ($ENV{BUSY_STALE_SECS} && $ENV{BUSY_STALE_SECS} =~ /^\d+$/)
+                       ? $ENV{BUSY_STALE_SECS} : 600;
+
+    return Dashboard::run_stages(
+        plan            => $plan,
+        mode            => $mode,
+        self_container  => $CONTAINER_NAME,
+        await_timeout   => ($ENV{SANDBOX_STOP_TIMEOUT} // 60),
+        await_interval  => ($ENV{SANDBOX_STOP_INTERVAL} // 1),
+        now             => sub { time },
+        sleep_for       => sub { select undef, undef, undef, $_[0] },
+        status_cb       => $progress,
+        log_cb          => sub { log_ev($_[0], $_[1]) },
+        signal_runs     => sub {
+            return Dashboard::write_shutdown_signals(Dashboard::shutdown_targets($PROJECT_PATH));
+        },
+        quiet_probe     => sub {
+            # Same busy-lease arithmetic as gather() (:2912-2918), read live
+            # (not the cached copy) so a stop cycle sees the freshest lease.
+            my @coords;
+            eval { @coords = @{ RunState::summarize("$PROJECT_PATH/.ccpraxis-local-data/blueprints") }; };
+            my $running = 0;
+            for my $s (@coords) {
+                next unless ref $s eq 'HASH';
+                $running = 1 if ($s->{running_coordinators} || 0) > 0
+                              || (defined $s->{state} && $s->{state} eq 'running');
+            }
+            if ($running) {
+                my $n = 0;
+                $n += ($_->{running_coordinators} || 0) for @coords;
+                return { quiet => 0, detail => "$n coordinator(s) running" };
+            }
+            my $bm = `$PODMAN exec "$CONTAINER_NAME" stat -c %Y /tmp/.butler-busy 2>/dev/null`;
+            my $cn = `$PODMAN exec "$CONTAINER_NAME" date +%s 2>/dev/null`;
+            my ($lmt)  = ($bm && $bm =~ /^(\d+)/) ? ($1) : ();
+            my ($cnow) = ($cn && $cn =~ /^(\d+)/) ? ($1) : ();
+            my $busy_age;
+            if (defined $lmt && defined $cnow) {
+                my $a = $cnow - $lmt;
+                $busy_age = $a < 0 ? 0 : $a;
+            }
+            # An unreadable lease (exec failed / container gone) counts as
+            # released -- we cannot prove busy, and the container may already
+            # be going away.
+            if (KeepAwake::should_stay_awake($busy_age, $busy_stale)) {
+                return { quiet => 0, detail => "busy lease fresh (${busy_age}s)" };
+            }
+            return { quiet => 1, detail => '' };
+        },
+        stop_container  => sub {
+            return { ok => 1, detail => 'already stopped' }
+                unless container_status($CONTAINER_NAME) eq 'running';
+            # Edge case 12: release the wake-lock BEFORE stopping the
+            # container -- a stopped container can never refresh the busy
+            # lease, so the lock must drop first or it leaks.
+            _keepawake_release_global();
+            my $out = `$PODMAN stop "$CONTAINER_NAME" 2>&1`;
+            my $rc  = $? >> 8;
+            return { ok => ($rc == 0 ? 1 : 0), detail => ($rc == 0 ? '' : "exit $rc: $out") };
+        },
+        list_containers => sub {
+            # Decision #15: RUNNING containers only, UNFILTERED -- no -a and
+            # no name/image/label filter of any kind. Any other container
+            # blocks the machine stop.
+            my $out = `$PODMAN ps --format "{{.Names}}" 2>/dev/null`;
+            return undef unless defined $out;
+            return undef if $out eq '' && $? != 0;
+            return [ split /\s+/, $out ];
+        },
+        stop_machine    => sub {
+            my $rc = system($PODMAN, 'machine', 'stop');
+            return { ok => ($rc == 0 ? 1 : 0), detail => ($rc == 0 ? '' : "exit $rc") };
+        },
+    );
 }
 
 # _heartbeat_once — touch the container's keep-alive sentinel. Returns
