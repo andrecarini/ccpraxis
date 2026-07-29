@@ -27,7 +27,7 @@ directly, values masked. **Confirmed fields present:**
 central open question the spike gate was designed to answer, and the answer
 is negative — the live file has no `refreshTokenExpiresAt` (or equivalent)
 key. Consequence for design: `TokenInfo.pm` must show the refresh token's
-expiry as `n/a — not stored`, never fabricate or estimate one.
+expiry as `n/a (not stored)`, never fabricate or estimate one.
 
 ## `subscriptionType` / `rateLimitTier` are optional, not universal
 
@@ -49,7 +49,7 @@ a placeholder that could be mistaken for real data).
 - **Refresh token:** presence only, plus a short, stable **fingerprint**
   (a hash of the token, NOT the token itself) so repeated renders show the
   "same" refresh token consistently without ever exposing token material.
-- **Refresh-token expiry:** always `n/a — not stored` — this is a confirmed
+- **Refresh-token expiry:** always `n/a (not stored)` — this is a confirmed
   fact about the schema, not a placeholder for missing implementation.
 - **Last-refreshed:** the credentials file's **mtime** (Decision #7) — chosen
   because it is party-agnostic: both the Claude Code CLI and

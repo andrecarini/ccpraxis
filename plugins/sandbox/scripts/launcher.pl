@@ -3154,6 +3154,7 @@ sub _gather_oauth_expiry {
 # through to TokenInfo::status, which degrades to the not-logged-in struct).
 sub _gather_tokens {
     my $raw   = _read_file($SANDBOX_CREDENTIALS_FILE);
+    local $@;
     my $data  = (defined $raw && length $raw)
               ? eval { JSON::PP->new->decode($raw) } : undef;
     my $mtime = (stat($SANDBOX_CREDENTIALS_FILE))[9];

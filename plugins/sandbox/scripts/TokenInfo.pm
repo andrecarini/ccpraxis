@@ -39,6 +39,7 @@ sub _uint {
 # PUBLIC, pure, total. An identity marker, not a security primitive.
 sub fingerprint {
     my ($str) = @_;
+    return undef if ref $str;
     return undef unless defined $str && length $str;
     my $bytes = $str;
     utf8::encode($bytes) if utf8::is_utf8($bytes);   # never die on a wide string
@@ -93,18 +94,7 @@ sub status {
     my ($last_refreshed_at, $last_refreshed_age) = _refreshed_fields($mtime, $now);
 
     if (!defined $oauth) {
-        return {
-            logged_in            => 0,
-            access_present       => 0,
-            access_state         => 'absent',
-            access_expires_at    => undef,
-            access_seconds_left  => undef,
-            refresh_present      => 0,
-            refresh_fingerprint  => undef,
-            refresh_expires      => 'n/a (not stored)',
-            last_refreshed_at    => $last_refreshed_at,
-            last_refreshed_age   => $last_refreshed_age,
-        };
+        return _not_logged_in_struct($mtime, $now);
     }
 
     my $access_tok = $oauth->{accessToken};
@@ -157,7 +147,7 @@ sub status {
     for my $pair ( [ subscriptionType => 'subscription_type' ], [ rateLimitTier => 'rate_limit_tier' ] ) {
         my ($src, $dst) = @$pair;
         my $v = $oauth->{$src};
-        $info{$dst} = $v if defined $v && length $v;
+        $info{$dst} = $v if defined $v && !ref $v && length $v;
     }
 
     return \%info;
