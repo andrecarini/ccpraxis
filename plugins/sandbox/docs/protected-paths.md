@@ -19,7 +19,9 @@ Four sources contribute protected roots, plus one user-editable list:
 | b | every `source.path` of a `directory`-source entry in the same registry | `marketplace-source` roots |
 | c | the Claude home: `CLAUDE_CONFIG_DIR`, `$HOME/.claude` and `$USERPROFILE/.claude` — **all three
     unioned**, never a precedence chain | `claude-home` roots |
-| d | the ccpraxis live install anchor, derived from the running launcher's own path | the
+| d | the ccpraxis live install anchor, from **two independent sources**: the `ccpraxis-local`
+    registry entry (the registry entry is what `live_install_dir` resolves), **and** the anchor the
+    launcher derives from its own `abs_path(__FILE__)` and passes in as `live_install_hint` | the
     `ccpraxis-install` root |
 | e | the user-configured extra list (see section 6 below) | `user-configured` roots |
 
@@ -27,6 +29,17 @@ The registry file the launcher reads is pinned to `$HOME/.claude/plugins/known_m
 the same file the launcher treats as authoritative everywhere else, so this guard and the rest of
 the launcher can never disagree about what is installed. Passing `CLAUDE_CONFIG_DIR` does not change
 which registry file is read.
+
+**Known limitation — redirecting `HOME`.** The pin above is relative to `HOME`, so a process that
+launches `claude-sandbox` with `HOME` pointing somewhere else reads a different (or absent) registry
+and loses the `marketplace-install` and `marketplace-source` roots derived from it. Two of the
+highest-value roots are deliberately **not** exposed to this: the `claude-home` root is resolved
+against the OS-authoritative home (`getpwuid` on POSIX) rather than `HOME`, and the
+`ccpraxis-install` root is additionally supplied by the launcher's own `abs_path(__FILE__)` anchor,
+which no environment variable can move. On Windows there is no `getpwuid`, so the `claude-home`
+half of that mitigation does not apply there and only the `abs_path(__FILE__)` anchor holds.
+Closing the remainder requires the root resolver itself to derive a home candidate without trusting
+the environment; that lives in `ProtectedPaths.pm` and is tracked as follow-up work, not fixed here.
 
 The Claude home is a **union**, not a precedence chain: if `CLAUDE_CONFIG_DIR`, `$HOME/.claude` and
 `$USERPROFILE/.claude` all resolve to different paths, all three are protected. A chain would let

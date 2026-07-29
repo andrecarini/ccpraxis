@@ -275,12 +275,19 @@ sub _pp_sanitize {
 }
 
 # CRITICAL-1(b): a pure env-lookup seam. $env_hashref is the raw environment
-# view the caller was handed (e.g. a copy of %ENV); $authoritative_home, when
-# defined and non-empty, is a caller-trusted HOME value that must win over
-# whatever HOME the raw hashref carries -- this is what closes the
-# `HOME=/tmp/decoy claude-sandbox ~/.claude` bypass. Every other key passes
-# through the raw hashref unchanged. Never touches the real environment
-# itself: both inputs arrive as arguments, so this stays closed over nothing.
+# view the caller was handed (a copy of the process environment hash);
+# $authoritative_home, when defined and non-empty, is a caller-trusted HOME
+# value that must win over whatever HOME the raw hashref carries -- this is
+# what closes the redirected-HOME bypass, where pointing HOME at a decoy
+# directory collapsed the protected set and let the real Claude home through.
+# Every other key passes through the raw hashref unchanged. Never touches the
+# real environment itself: both inputs arrive as arguments, so this stays
+# closed over nothing.
+#
+# NOTE on wording: this comment sits inside the sentinel region, whose purity
+# is asserted by a regex scan over the region's TEXT (t/53 AC-11). Naming the
+# environment hash with its sigil, or quoting a shell command in backticks,
+# trips that scan even in prose. Keep both out of this region.
 sub _pp_env_seam {
     my ($env_hashref, $authoritative_home) = @_;
     $env_hashref //= {};

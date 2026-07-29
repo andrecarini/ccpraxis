@@ -143,9 +143,13 @@ ok((@pp_call_idxs_outside == 1 && $workcopy_route_call_idx >= 0
    "AC-3: the protected_path_outcome( call site's byte offset is less than the workcopy_route( call's (R1 ordering)");
 
 # ---- AC-4 ----
+# NOTE: the "only key" exclusivity clause this assertion originally carried was
+# removed -- AC-53/AC-56/AC-57 require the same call to also pass
+# live_install_hint, env and extra_list_path, so registry_path can no longer be
+# the sole key. Do not restore the exclusivity; it would contradict those ACs.
 like($src,
-     qr/protected_path_outcome\(\s*\$PROJECT_PATH\s*,\s*\{\s*registry_path\s*=>\s*"\$HOST_PLUGINS_DIR\/known_marketplaces\.json"\s*,?\s*\}\s*\)/,
-     'AC-4: the call site passes $PROJECT_PATH first and a hash ref whose only key is registry_path => "$HOST_PLUGINS_DIR/known_marketplaces.json"');
+     qr/protected_path_outcome\(\s*\$PROJECT_PATH\s*,\s*\{\s*registry_path\s*=>\s*"\$CLAUDE_HOST_CONFIG\/plugins\/known_marketplaces\.json"/,
+     'AC-4: the call site passes $PROJECT_PATH first and a hash ref containing registry_path => "$CLAUDE_HOST_CONFIG/plugins/known_marketplaces.json"');
 
 # ---- AC-5 ----
 {
