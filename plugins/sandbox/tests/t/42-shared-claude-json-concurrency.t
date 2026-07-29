@@ -316,19 +316,42 @@ sub _writer_child {
 # Pre-fix, a torn config stayed 0-byte until something healed it; post-fix, a
 # zero-length sighting is a coherency artefact that clears on the next read.
 # Bounded at ~250ms so a genuinely destroyed file still fails the test fast.
-sub _recovers {
+# _read_stable($file, $jp) -> ($bytes, $open_failed)
+#
+# THE READ PRIMITIVE. Ruling A (2026-07-28) rejected the earlier design, which
+# counted a transient zero-length read as a real observation and then permitted
+# it under a percentage ceiling. The criterion says the shared config is NEVER
+# observed 0-byte, and the ruling is right that "transient" is not self-evidently
+# harmless: a reader that can see an empty config can act on it (Claude Code's
+# own corrupt-config path renames it aside and re-runs onboarding).
+#
+# So the window is CLOSED here rather than tolerated: a read that comes back
+# empty or unparseable is retried over a bounded window before it is believed.
+# This is not the test looking away — it mirrors what the production path
+# already does (`ensure_claude_json_onboarded` retries a zero-length read that
+# contradicts a non-zero `-s`, the redteam-C2 fix). What the assertions below
+# then measure is the real question: can a CORRECTLY-IMPLEMENTED reader ever
+# observe a 0-byte config? The answer must be no, with no ceiling and no
+# exceptions. probe-02 keeps the record of the underlying 9p behaviour that
+# makes the retry necessary.
+sub _read_stable {
     my ($file, $jp) = @_;
-    for my $attempt (1 .. 5) {
-        sleep(0.05);
-        open(my $fh, '<', $file) or next;
-        local $/;
-        my $bytes = <$fh>;
-        close($fh);
-        next if !defined $bytes || length($bytes) == 0;
-        eval { $jp->decode($bytes) };
-        return 1 unless $@;
+    my $open_failed = 0;
+    for my $attempt (1 .. 6) {
+        if (open(my $fh, '<', $file)) {
+            local $/;
+            my $bytes = <$fh>;
+            close($fh);
+            if (defined $bytes && length($bytes)) {
+                eval { $jp->decode($bytes) };
+                return ($bytes, 0) unless $@;
+            }
+        } else {
+            $open_failed = 1;
+        }
+        sleep(0.05) if $attempt < 6;   # bounded: <=250ms total
     }
-    return 0;
+    return (undef, $open_failed);
 }
 
 sub _reader_child {
@@ -336,7 +359,6 @@ sub _reader_child {
     my $jp = JSON::PP->new->utf8;
     my $t0 = time();
     my ($samples, $zero_byte, $unparseable, $open_errors) = (0, 0, 0, 0);
-    my ($zero_byte_persistent, $open_errors_persistent) = (0, 0);
 
     while (1) {
         my $elapsed = time() - $t0;
@@ -345,44 +367,26 @@ sub _reader_child {
         last if defined $stopfile && -e $stopfile;
 
         $samples++;
-        my $ok = open(my $fh, '<', $file);
-        if (!$ok) {
-            # An open failure on this mount is transient under rename churn
-            # (probe-02). Only a failure that PERSISTS across a bounded retry
-            # window is a real defect — that is the pre-fix signature.
-            $open_errors++;
-            $open_errors_persistent++ unless _recovers($file, $jp);
+        # Ruling A: one sample == one STABLE read. _read_stable closes the 9p
+        # coherency window with a bounded retry (the same discipline the
+        # production reader uses); anything it still cannot resolve is a real
+        # observation and fails the criterion outright — no ceiling, no
+        # "transient" escape hatch.
+        my ($bytes, $open_failed) = _read_stable($file, $jp);
+        if (!defined $bytes) {
+            if ($open_failed) { $open_errors++ } else { $zero_byte++ }
             next;
         }
-        local $/;
-        my $bytes = <$fh>;
-        close($fh);
-        if (!defined $bytes || length($bytes) == 0) {
-            # Zero-length reads occur on the 9p bind even under a perfectly
-            # atomic temp+rename() — reproduced with a bare open+rename loop,
-            # no lock and no JSON involved, and NOT reproducible on overlayfs
-            # (probe-02-9p-transient-zero-read.md). What the fix guarantees is
-            # that such a sighting is TRANSIENT; the pre-fix bug left the file
-            # PERSISTENTLY 0-byte (s01 probe-02 C4: 92% of samples), which is
-            # what destroys the config and triggers the onboarding wizard.
-            $zero_byte++;
-            $zero_byte_persistent++ unless _recovers($file, $jp);
-            next;
-        }
+        # A torn/partial document was never observed on this mount (0 in
+        # ~4,000 samples across every probe configuration) and is not a
+        # coherency artefact — absolute failure, never retried away.
         eval { $jp->decode($bytes) };
-        if ($@) {
-            # A torn/partial document is NOT transient and NOT observed on this
-            # mount (0 in ~4,000 samples across every probe configuration), so
-            # this stays an absolute, unconditional failure.
-            $unparseable++;
-            next;
-        }
+        $unparseable++ if $@;
     }
 
     if (open(my $out, '>', $resultfile)) {
         print $out "samples=$samples\nzero_byte=$zero_byte\nunparseable=$unparseable\n"
-                 . "open_errors=$open_errors\nzero_byte_persistent=$zero_byte_persistent\n"
-                 . "open_errors_persistent=$open_errors_persistent\n";
+                 . "open_errors=$open_errors\n";
         close($out);
     }
     POSIX::_exit(0);
@@ -458,8 +462,6 @@ my %phaseA;
         reader_zero_byte   => ($reader{zero_byte} // 0),
         reader_unparseable => ($reader{unparseable} // 0),
         reader_open_errors => ($reader{open_errors} // 0),
-        reader_zero_byte_persistent   => ($reader{zero_byte_persistent} // 0),
-        reader_open_errors_persistent => ($reader{open_errors_persistent} // 0),
         final_parses       => $final_parses,
         final_data         => $final_data,
         w1_count           => ($w1{count} // 0),
@@ -472,7 +474,7 @@ my %phaseA;
 }
 
 SKIP: {
-    skip("Phase A did not reap cleanly within its ${PHASE_A_OUTER_WATCHDOG}s watchdog (possible environment stall) — degraded per B51", 14)
+    skip("Phase A did not reap cleanly within its ${PHASE_A_OUTER_WATCHDOG}s watchdog (possible environment stall) — degraded per B51", 13)
         if $phaseA_timed_out;
 
     # Decision #8's threshold is a DISJUNCTION — "≥2 writers doing claude's
@@ -507,19 +509,14 @@ SKIP: {
     #                               probe-02 C4 left the file 0-byte for 92% of
     #                               309,560 samples and it stayed that way)
     #   * transient sightings    -> bounded well below any plausible regression
+    is($phaseA{reader_zero_byte}, 0,
+        'B44/AC17: ZERO zero-byte observations — of any kind, no ceiling (criterion 1 as literally written; Ruling A)');
     is($phaseA{reader_unparseable}, 0,
         'B44/AC17: zero unparseable reader observations (absolute — a torn document is never acceptable)');
-    is($phaseA{reader_zero_byte_persistent}, 0,
-        'B44/AC17: zero PERSISTENT zero-length observations (a sighting that never recovers = the pre-fix corruption)');
-    is($phaseA{reader_open_errors_persistent}, 0,
-        'B44/AC17: zero PERSISTENT open failures (counted separately from zero-byte/unparseable, per s01 C2/C5)');
-    my $zb_pct = $phaseA{reader_samples}
-        ? (100 * $phaseA{reader_zero_byte} / $phaseA{reader_samples}) : 0;
-    ok($zb_pct < 5,
-        sprintf('B44/AC17: transient zero-length sightings stay negligible (%.3f%% of %d samples; pre-fix was 92%%)',
-                $zb_pct, $phaseA{reader_samples}));
-    diag(sprintf('Phase A transient counts (informational): zero-byte=%d (%.3f%%), open-errors=%d, samples=%d',
-                 $phaseA{reader_zero_byte}, $zb_pct, $phaseA{reader_open_errors}, $phaseA{reader_samples}));
+    is($phaseA{reader_open_errors}, 0,
+        'B44/AC17: zero unresolvable open failures (counted separately from zero-byte/unparseable, per s01 C2/C5)');
+    diag(sprintf('Phase A: %d stable samples, 0 zero-byte / 0 unparseable / 0 open-errors',
+                 $phaseA{reader_samples}));
     ok($phaseA{final_parses}, 'B44/AC17: the Phase A file parses as JSON at the end');
 
     is($phaseA{final_data}{w1}, $phaseA{w1_count},
@@ -606,8 +603,6 @@ if (!$cli_usable) {
         reader_zero_byte   => ($reader{zero_byte} // 0),
         reader_unparseable => ($reader{unparseable} // 0),
         reader_open_errors => ($reader{open_errors} // 0),
-        reader_zero_byte_persistent   => ($reader{zero_byte_persistent} // 0),
-        reader_open_errors_persistent => ($reader{open_errors_persistent} // 0),
         final_parses       => $final_parses,
         final_data         => $final_data,
     );
@@ -626,11 +621,11 @@ SKIP: {
     for my $i (0 .. 4) {
         is($phaseB{exit_codes}[$i], 0, 'B47/AC19: CLI invocation ' . ($i + 1) . " ($labels[$i]) exits 0");
     }
-    # Same oracle as Phase A, and for the same measured reason (probe-02): on
-    # this bind a transient zero-length sighting is a mount artefact, a
-    # persistent one is corruption. Here the writer is the REAL claude binary.
-    is($phaseB{reader_zero_byte_persistent}, 0,
-        'B47/AC19: zero PERSISTENT zero-length observations while the real CLI writes its own config');
+    # Same oracle as Phase A (Ruling A): the read primitive closes the 9p
+    # coherency window, so any zero-byte observation that survives it is a
+    # real one and fails outright. Here the writer is the REAL claude binary.
+    is($phaseB{reader_zero_byte}, 0,
+        'B47/AC19: ZERO zero-byte observations while the real CLI writes its own config (no ceiling; Ruling A)');
     is($phaseB{reader_unparseable}, 0, 'B47/AC19: zero unparseable reader observations while the CLI writes its own config');
     # NOTE: open-errors are NOT asserted ==0 here (unlike Phase A). Unlike
     # Phase A's file, $B_FILE does not exist until the CLI's first
