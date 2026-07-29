@@ -411,7 +411,8 @@ use_ok('Dashboard') or BAIL_OUT('Dashboard.pm did not load');
         is(R('parse_human_bytes', $in), undef, "AC-3: parse_human_bytes($label) == undef");
     }
     # The decimal/binary distinction is the whole point of B6.
-    isnt(R('parse_human_bytes', '6.214GB'), 6672894525,
+    my $gb = R('parse_human_bytes', '6.214GB');
+    ok(numeric($gb) && $gb != 6672894525,
         'AC-3: parse_human_bytes("6.214GB") is NOT the binary interpretation (B6)');
 }
 
@@ -459,8 +460,12 @@ use_ok('Dashboard') or BAIL_OUT('Dashboard.pm did not load');
 # --- AC-6 -> DC-1 (B4): configured VM memory never reaches the struct. ----
 {
     my $m = R('parse_machine_list', $FX_MACHINE);
-    my @mem_keys = is_hashref($m) ? (grep { /mem/i } keys %$m) : ();
-    is_deeply(\@mem_keys, [], 'AC-6: parse_machine_list result has no /mem/i key at all (B4)');
+    if (is_hashref($m)) {
+        my @mem_keys = grep { /mem/i } keys %$m;
+        is_deeply(\@mem_keys, [], 'AC-6: parse_machine_list result has no /mem/i key at all (B4)');
+    } else {
+        fail('AC-6: parse_machine_list result has no /mem/i key at all (B4) [no hashref returned]');
+    }
 
     my $built = R('build', { machine => $FX_MACHINE, stats => $FX_STATS, df => $FX_DF,
                              cim_mem => $BOM . $FX_CIM_MEM, cim_disk => $BOM . $FX_CIM_DISK,
