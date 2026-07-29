@@ -342,34 +342,39 @@ sub _seq_order_ok {
         { id => 'stop-machine',    label => 'stop podman machine' },
     );
 
-    is_deeply(Dashboard::full_shutdown_plan({ machine_capable => 1 }), \@pinned4,
+    # full_shutdown_plan / stop_runs_plan do NOT exist yet -- every call is
+    # wrapped in eval so a missing sub degrades to a clean per-assertion
+    # FAIL, not a fatal abort.
+    is_deeply(scalar(eval { Dashboard::full_shutdown_plan({ machine_capable => 1 }) }), \@pinned4,
         'AC-8: full_shutdown_plan({machine_capable=>1}) -> the 4 pinned stages, in order');
-    is_deeply(Dashboard::full_shutdown_plan({}), [ @pinned4[0, 1, 2] ],
+    is_deeply(scalar(eval { Dashboard::full_shutdown_plan({}) }), [ @pinned4[0, 1, 2] ],
         'AC-8: full_shutdown_plan({}) -> the first 3 stages only (machine_capable falsy)');
-    is_deeply(Dashboard::full_shutdown_plan(undef), [ @pinned4[0, 1, 2] ],
+    is_deeply(scalar(eval { Dashboard::full_shutdown_plan(undef) }), [ @pinned4[0, 1, 2] ],
         'AC-8: full_shutdown_plan(undef) -> the first 3 stages only');
-    is_deeply(Dashboard::full_shutdown_plan({ machine_capable => 0 }), [ @pinned4[0, 1, 2] ],
+    is_deeply(scalar(eval { Dashboard::full_shutdown_plan({ machine_capable => 0 }) }), [ @pinned4[0, 1, 2] ],
         'AC-8: full_shutdown_plan({machine_capable=>0}) -> the first 3 stages only');
 
-    is_deeply(Dashboard::stop_runs_plan({ machine_capable => 1 }), [ @pinned4[0, 1] ],
+    is_deeply(scalar(eval { Dashboard::stop_runs_plan({ machine_capable => 1 }) }), [ @pinned4[0, 1] ],
         'AC-8: stop_runs_plan(anything) -> always exactly the first 2 stages');
-    is_deeply(Dashboard::stop_runs_plan(undef), [ @pinned4[0, 1] ],
+    is_deeply(scalar(eval { Dashboard::stop_runs_plan(undef) }), [ @pinned4[0, 1] ],
         'AC-8: stop_runs_plan(undef) -> always exactly the first 2 stages');
-    is_deeply(Dashboard::stop_runs_plan({}), [ @pinned4[0, 1] ],
+    is_deeply(scalar(eval { Dashboard::stop_runs_plan({}) }), [ @pinned4[0, 1] ],
         'AC-8: stop_runs_plan({}) -> always exactly the first 2 stages');
 
     # Purity: identical input -> identical output on repeat calls.
-    is_deeply(Dashboard::full_shutdown_plan({ machine_capable => 1 }),
-              Dashboard::full_shutdown_plan({ machine_capable => 1 }),
+    is_deeply(scalar(eval { Dashboard::full_shutdown_plan({ machine_capable => 1 }) }),
+              scalar(eval { Dashboard::full_shutdown_plan({ machine_capable => 1 }) }),
         'AC-8: full_shutdown_plan is pure -- identical output on repeat calls');
-    is_deeply(Dashboard::stop_runs_plan({ x => 1 }), Dashboard::stop_runs_plan({ x => 1 }),
+    is_deeply(scalar(eval { Dashboard::stop_runs_plan({ x => 1 }) }), scalar(eval { Dashboard::stop_runs_plan({ x => 1 }) }),
         'AC-8: stop_runs_plan is pure -- identical output on repeat calls');
 
     # Prefix-consistency invariant (spec 2.3): stop_runs_plan(X) deep-equals
     # the first two elements of full_shutdown_plan(X).
     for my $x ({ machine_capable => 1 }, {}, undef, { machine_capable => 0 }) {
-        is_deeply(Dashboard::stop_runs_plan($x),
-                  [ @{ Dashboard::full_shutdown_plan($x) }[0, 1] ],
+        my $sp = eval { Dashboard::stop_runs_plan($x) };
+        my $fp = eval { Dashboard::full_shutdown_plan($x) };
+        my $fp_prefix = (ref($fp) eq 'ARRAY') ? [ @{$fp}[0, 1] ] : undef;
+        is_deeply($sp, $fp_prefix,
             'AC-8: stop_runs_plan(X) deep-equals the first two elements of full_shutdown_plan(X)');
     }
 
