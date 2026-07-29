@@ -32,10 +32,11 @@ my $HOOKSJSON = "$HOOKS/hooks.json";
 
 my $have_jq = do { my $o = `bash -c 'command -v jq' 2>/dev/null`; $o =~ /\S/ ? 1 : 0 };
 
-# 240 total: 83 unconditional (AC-1,2,3,18,19-pure,21,20) + 157 inside the jq-gated SKIP block
-# (AC-4,5,6..17,19-hook,22, plus F1-F6 red-team-fix assertions from step6/step7). Both halves are
-# fixed-length (no randomness), so this count is stable.
-plan tests => 240;
+# 259 total: 83 unconditional (AC-1,2,3,18,19-pure,21,20) + 176 inside the jq-gated SKIP block
+# (AC-4,5,6..17,19-hook,22, plus F1-F6 red-team-fix assertions from step6/step7 -- several of
+# which assert once after a many-iteration loop, so their real assertion count exceeds their
+# source-line count). Both halves are fixed-length (no randomness), so this count is stable.
+plan tests => 259;
 
 my $J    = JSON::PP->new->canonical;
 my $ROOT = tempdir(CLEANUP => 1);
@@ -385,7 +386,7 @@ is(gate_verdict_call('Edit', 'worksite', 1),  'deny',  'AC-21: regression - bp_g
 # criterion (AC-6..AC-17, AC-19 hook part, AC-22). Mirrors t/09-gate.t:22,223-224.
 # =====================================================================================
 SKIP: {
-    skip "jq not available on this host (repeat-guard is fail-open without it; these tests need jq present to build fixtures/assert the primary behaviour)", 157
+    skip "jq not available on this host (repeat-guard is fail-open without it; these tests need jq present to build fixtures/assert the primary behaviour)", 176
         unless $have_jq;
 
     # ---- PATH with no jq reachable, everything else intact (for AC-13) ----------------
