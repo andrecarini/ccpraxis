@@ -268,7 +268,14 @@ sub _run_live {
     # (a) + (b): manual clock tracking so we know exactly which $t produced
     # each render, independent of any assumption about ticks-per-render.
     my $clock = 0;
-    my $tick_int = 0.25;
+    # tick_interval chosen so max_ticks * tick_interval < 1.0 (clock starts on
+    # an integer second): beat_age/uptime (Dashboard.pm, pre-existing,
+    # unrelated to this package) are formatted via fmt_age/fmt_hms, which
+    # truncate to whole seconds, so crossing a whole-second boundary repaints
+    # rows 5/6 too -- confirmed against the pre-s07 baseline, not caused by
+    # the spinner. Keeping the run's elapsed span under 1s isolates the
+    # title-row-only assertion from that orthogonal effect.
+    my $tick_int = 0.0625;
     my (@renders, @t_at_render);
     Dashboard::run(
         color => 0, beat_interval => 9999, state_interval => 0,
@@ -334,9 +341,13 @@ sub _run_live {
 # ===========================================================================
 {
     my $clock = 1000;
+    # tick_interval reduced so max_ticks * tick_interval < 1.0 -- see the
+    # matching comment above AC-6a: keeps the run's elapsed span inside a
+    # single whole second so the pre-existing beat_age/uptime whole-second
+    # rounding (fmt_age/fmt_hms) never repaints rows 5/6 alongside the title.
     my @calls;                                    # every $out call, in order
     Dashboard::run(
-        color => 0, tick_interval => 0.25, max_ticks => 5,
+        color => 0, tick_interval => 0.15, max_ticks => 5,
         beat_interval => 9999, state_interval => 0,
         now => sub { $clock }, sleep_for => sub { $clock += $_[0] },
         read_key => sub { undef }, term_size => sub { (80, 20) },
