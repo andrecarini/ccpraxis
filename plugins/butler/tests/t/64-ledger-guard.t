@@ -550,7 +550,7 @@ SKIP: {
                'FIXTURE-SANITY: the AC-8 body line is pure ASCII text, not a literal control byte');
         my $content = insert_line_at(kg(), 19, $esc);
         my ($rc, $out) = run_hook(pl_write(ledger_path($bp), $content), %env);
-        is($rc,  0,  'AC-8: the ASCII TEXT "\x00" /   in a body line -> RC 0 (no literal control byte)');
+        is($rc,  0,  'AC-8: a body line SPELLING the escape as ASCII text -> RC 0 (no literal control byte)');
         is($out, '', 'AC-8: emits nothing');
     }
 
