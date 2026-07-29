@@ -1008,6 +1008,16 @@ sub _resources_lines {
 
     # 2. ctr mem — THIS container against the VM's cgroup limit (the real
     # limit, not the cosmetic configured one).
+    #
+    # KNOWN WART: the numerator is per-container, the denominator VM-wide, so
+    # $gauge_row's middle "free" term is VM-free-of-THIS-container — it ignores
+    # every other container and every VM-side process, and therefore overstates
+    # the headroom this container can actually take. used/limit is still the
+    # meaningful pressure ratio, and podman gives us no container-free figure to
+    # print instead (fabricating one would violate "report what is real"). The
+    # honest fix is a label/wording change ('ctr/vm mem', or dropping the free
+    # term for this row) — both are pinned verbatim by t/44-resources.t's B23
+    # table, so it belongs in the package that may amend the oracle.
     push @lines, [ $label->('ctr mem'), $gauge_row->($r->{ctr_mem_used}, $r->{vm_mem_total}) ];
 
     # 3. ctr cpu — no gauge: a container's CPU% is not bounded by 100 on a

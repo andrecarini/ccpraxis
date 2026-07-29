@@ -117,6 +117,14 @@ sub parse_machine_list {
 # Selection is BY NAME, never by position: the host runs one sandbox container
 # per project, and picking [0] would show another sandbox's numbers here. No
 # name, no match, no struct -- there is no positional fallback.
+#
+# SCHEMA: podman has shipped `stats --format json` with a lowercase-tagged
+# spelling (name / mem_usage / cpu_percent) AND a capitalized one (Name /
+# MemUsage / CPUPerc / MemUsageBytes / MemLimit) across versions. Every key is
+# read lowercase-FIRST and capitalized only as a fallback, so the captured
+# fixtures keep byte-for-byte the same path. Without the fallback a capitalized
+# build matched on Name and then returned an all-undef struct -- a healthy
+# container rendering n/a, indistinguishable from a dead probe.
 sub parse_stats {
     my ($raw, $name) = @_;
     return undef if !defined $name || ref $name || !length $name;
@@ -130,6 +138,7 @@ sub parse_stats {
         next unless defined $n && $n eq $name;
         my ($used, $limit);
         my $usage = _str($e->{mem_usage});
+        $usage = _str($e->{MemUsage}) unless defined $usage;
         if (defined $usage && $usage =~ m{/}) {
             my ($u, $l) = split m{/}, $usage, 2;
             for my $part ($u, $l) {
@@ -140,11 +149,18 @@ sub parse_stats {
             $used  = parse_human_bytes($u);
             $limit = parse_human_bytes($l);
         }
+        # The capitalized schema also carries the unambiguous numeric pair.
+        # Consulted ONLY when the human string produced nothing, so it can
+        # never override a parsed value (and never fires on the fixtures).
+        $used  = _uint($e->{MemUsageBytes}) unless defined $used;
+        $limit = _uint($e->{MemLimit})      unless defined $limit;
+        my $pct = $e->{cpu_percent};
+        $pct = $e->{CPUPerc} unless defined $pct;
         return {
             name      => $n,
             mem_used  => $used,
             mem_limit => $limit,
-            cpu_pct   => parse_percent($e->{cpu_percent}),
+            cpu_pct   => parse_percent($pct),
         };
     }
     return undef;
@@ -342,8 +358,21 @@ sub _clock {
 # checked BEFORE each invocation, so one slow probe cannot multiply into six.
 # A probe returning undef, '' or a ref degrades to n/a and is never
 # dereferenced.
+#
+# BUDGET GRANULARITY: the budget bounds when the NEXT probe may start, not how
+# long the round takes -- a probe already running is not interruptible, so the
+# real worst case is budget + one probe's duration. It is also only as precise
+# as the injected clock: the production caller injects `sub { time }`, i.e.
+# INTEGER seconds, so a nominal 4 resolves to somewhere in [3, 5). Read the
+# number as an advisory floor on the round, never as a wall-clock cap. (Tests
+# inject a fractional clock and do get fractional resolution.)
+#
+# `local $@` keeps a dying probe's message from leaking out of gather: without
+# it the last probe's die would still be sitting in $@ at the caller's next
+# `if ($@)`, misfiring on a successful frame.
 sub gather {
     my ($probes, $opts) = @_;
+    local $@;
     $probes = {} unless ref $probes eq 'HASH';
     $opts   = {} unless ref $opts   eq 'HASH';
 

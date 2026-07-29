@@ -2926,9 +2926,15 @@ sub enter_dashboard {
             }
             # s09: the expensive resource probes run on their OWN, slower
             # cadence with their OWN stamp — deliberately NOT nested in the
-            # 10s inspect above, so a slow probe can never delay the inspect
-            # or the 0.2s render, and the two rounds rarely land in the same
-            # frame (23 is coprime with 10).
+            # 10s inspect above. What that buys: the two rounds are decoupled,
+            # so a slow resources round never pushes the 10s inspect out of
+            # phase (its stamp advances independently), and 23 being coprime
+            # with 10 keeps the two rounds rarely landing in the same frame.
+            # What it does NOT buy: the round below runs INLINE, in this same
+            # callback that feeds the ~0.2s render loop, so it DOES stall a
+            # frame — every 23s and on the very first frame. See
+            # _resources_probes: nothing here is portably interruptible, so
+            # the throttle and the elapsed budget only bound the blast radius.
             if (Resources::should_sample($last_resources, $now, Resources::interval())) {
                 $cached_resources = _gather_resources();
                 $last_resources   = $now;
@@ -3174,24 +3180,51 @@ sub _gather_tokens {
     return TokenInfo::status($data, $mtime, time);
 }
 
-# _powershell_json($cmd) -> raw stdout BYTES (BOM included; Resources::_decode
-# strips it), or undef off Windows. s09's one host-probe transport.
+# _ps_commands() -> (key => literal PowerShell command). The CLOSED set of
+# commands _powershell_json is allowed to run, named once so the sink can
+# enforce membership instead of merely documenting it.
+#
+# -OperationTimeoutSec 3 is the one REAL wall-clock cap in this package.
+# -Filter uses single quotes inside the double-quoted -Command so no nested
+# double-quote escaping is needed. Nothing here is interpolated — adding a
+# "$var" to any of these strings is the change this design exists to stop.
+sub _ps_commands {
+    return (
+        cim_mem  => "Get-CimInstance Win32_OperatingSystem -OperationTimeoutSec 3 | Select-Object FreePhysicalMemory,TotalVisibleMemorySize | ConvertTo-Json -Compress",
+        cim_cpu  => "Get-CimInstance Win32_Processor -OperationTimeoutSec 3 | Select-Object LoadPercentage,NumberOfLogicalProcessors | ConvertTo-Json -Compress",
+        cim_disk => "Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' -OperationTimeoutSec 3 | Select-Object DeviceID,FreeSpace,Size | ConvertTo-Json -Compress",
+    );
+}
+
+# _powershell_json($cmd) -> raw stdout BYTES (BOM included; the Resources
+# parsers strip it), or undef off Windows. s09's one host-probe transport.
 #
 # -NoProfile: a profile load is slow and can print noise onto the alt-screen.
 # -NonInteractive: a credential/confirmation prompt would otherwise hang the
 # dashboard FOREVER — this is real hang prevention, not cosmetics.
+# (-ExecutionPolicy is deliberately NOT passed: it governs loading script
+# files, not an inline -Command, so it would relax a machine setting for
+# nothing.)
 # stderr goes to 2>/dev/null, never to a Windows device name (a `> N-U-L`
 # redirect from bash creates a literal file Explorer cannot delete).
 # MSYS2_ARG_CONV_EXCL is set locally, mirroring the precedent above.
 #
-# $cmd is ALWAYS one of the three literal constants in _resources_probes: no
-# project path, container name, user string or probe output is ever
-# interpolated into it, so there is no injection surface here.
+# INJECTION: "$cmd" is interpolated into a backtick (an MSYS sh layer, where
+# $, backtick and \ are live inside double quotes) and THEN into PowerShell's
+# -Command (where ;, |, & and $(...) are operators). Two hostile grammars, one
+# unquoted slot — so the slot is closed by construction: $cmd must be
+# IDENTICAL to one of the _ps_commands strings or the probe returns undef and
+# the panel prints n/a. A future caller that tries to fold the drive letter,
+# the container name or a probe's own output into the command gets n/a, not
+# host command execution from a directory name.
 sub _powershell_json {
     my ($cmd) = @_;
     return undef unless $WINDOWS_FAMILY;
+    return undef unless defined $cmd && !ref $cmd;
+    my %allowed = _ps_commands();
+    return undef unless grep { $_ eq $cmd } values %allowed;
     local $ENV{MSYS2_ARG_CONV_EXCL} = '*';
-    return scalar `powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$cmd" 2>/dev/null`;
+    return scalar `powershell.exe -NoProfile -NonInteractive -Command "$cmd" 2>/dev/null`;
 }
 
 # _resources_probes() -> { key => coderef }, the real I/O half of the s09
@@ -3203,22 +3236,28 @@ sub _powershell_json {
 # absent, gather never invokes them, and those fields degrade to n/a — which
 # is exactly how the panel renders inside the Linux container itself.
 #
-# -OperationTimeoutSec 3 is the one REAL wall-clock cap in this package (it
-# covers the three host probes only; podman's CLI offers no timeout flag for
-# stats / system df / machine list, and a blocking backtick is not portably
-# interruptible — the throttle and the elapsed budget bound the blast radius).
-# -Filter uses single quotes inside the double-quoted -Command so no nested
-# double-quote escaping is needed.
+# The machine probe additionally requires podman: `machine list` does not
+# exist under docker, so spawning it there would burn a subprocess every 23s
+# to produce the same n/a. Guard mirrors the precedent at the SANDBOX_HOST_IP
+# capture above.
+#
+# The CIM commands' -OperationTimeoutSec 3 is the one REAL wall-clock cap in
+# this package (it covers the three host probes only; podman's CLI offers no
+# timeout flag for stats / system df / machine list, and a blocking backtick
+# is not portably interruptible — the throttle and the elapsed budget bound
+# the blast radius).
 sub _resources_probes {
     my %p = (
         stats => sub { scalar `$PODMAN stats --no-stream --format json 2>/dev/null` },
         df    => sub { scalar `$PODMAN system df --format json 2>/dev/null` },
     );
     return \%p unless $WINDOWS_FAMILY;
-    $p{machine}  = sub { scalar `$PODMAN machine list --format json 2>/dev/null` };
-    $p{cim_mem}  = sub { _powershell_json("Get-CimInstance Win32_OperatingSystem -OperationTimeoutSec 3 | Select-Object FreePhysicalMemory,TotalVisibleMemorySize | ConvertTo-Json -Compress") };
-    $p{cim_cpu}  = sub { _powershell_json("Get-CimInstance Win32_Processor -OperationTimeoutSec 3 | Select-Object LoadPercentage,NumberOfLogicalProcessors | ConvertTo-Json -Compress") };
-    $p{cim_disk} = sub { _powershell_json("Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' -OperationTimeoutSec 3 | Select-Object DeviceID,FreeSpace,Size | ConvertTo-Json -Compress") };
+    my %cmd = _ps_commands();
+    $p{machine}  = sub { scalar `$PODMAN machine list --format json 2>/dev/null` }
+        if $PODMAN =~ /podman/i;
+    $p{cim_mem}  = sub { _powershell_json($cmd{cim_mem}) };
+    $p{cim_cpu}  = sub { _powershell_json($cmd{cim_cpu}) };
+    $p{cim_disk} = sub { _powershell_json($cmd{cim_disk}) };
     return \%p;
 }
 
@@ -3233,6 +3272,13 @@ sub _gather_resources {
     if ($WINDOWS_FAMILY) {
         $dev = ($PROJECT_PATH =~ m{^([A-Za-z]):}) ? uc($1) . ':' : 'C:';
     }
+    # budget/now: the clock injected here is core time(), i.e. INTEGER seconds,
+    # so `4` is an advisory floor checked at 1-second resolution before each
+    # probe — the round can legitimately overrun it by the better part of a
+    # second plus however long the probe already running takes. Do not read it
+    # as a 4-second cap (Resources::gather's header states the same contract).
+    # A sub-second clock would tighten the resolution but not the cap, and the
+    # `now => sub { time }` shape is what the oracle pins.
     return Resources::gather(_resources_probes(), {
         container => $CONTAINER_NAME,
         device    => $dev,
