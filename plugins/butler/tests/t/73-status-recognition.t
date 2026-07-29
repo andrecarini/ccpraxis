@@ -30,10 +30,10 @@ use Cwd qw(realpath);
 
 my $have_jq = do { my $o = `bash -c 'command -v jq' 2>/dev/null`; $o =~ /\S/ ? 1 : 0 };
 
-# 78 total: 69 inside the jq-gated SKIP (T1-T18, incl. the T12/T18 stray-name loops of 3 each)
-# + 9 inside the nested live-regression SKIP (T19: 5, T20: 4). Both halves are fixed-length (no
-# randomness), so this count is stable.
-plan tests => 78;
+# 80 total: 71 inside the jq-gated SKIP (T1-T18, incl. the T12/T18 stray-name loops of 3 each,
+# plus the T21 embedded-newline-stray regression of 2) + 9 inside the nested live-regression
+# SKIP (T19: 5, T20: 4). Both halves are fixed-length (no randomness), so this count is stable.
+plan tests => 80;
 
 sub fwd { (my $p = shift) =~ s{\\}{/}g; return $p; }
 
@@ -161,7 +161,7 @@ sub last_index_matching {
 
 # =========================================================================================
 SKIP: {
-    skip "jq not available on this host (bp-status.sh calls require_cmd jq before anything else runs)", 69
+    skip "jq not available on this host (bp-status.sh calls require_cmd jq before anything else runs)", 71
         unless $have_jq;
 
     # =====================================================================================
@@ -230,6 +230,43 @@ SKIP: {
         my $bang_idx = first_index_matching(qr/^!!/, @all_lines);
         my $eq_idx   = last_index_matching(qr/^== /, @all_lines);
         ok($bang_idx > $eq_idx, 'T4e: the !! banner line index is greater than every "== " line index');
+    }
+
+    # =====================================================================================
+    # T21 [AC-4 regression | redteam-step6.md finding] a stray directory whose basename
+    # contains an EMBEDDED NEWLINE must never let the !! section's own invariant slip: every
+    # line from the first "!!" line to EOF must still start with "!!", and specifically no
+    # line may start with "==" (which would look exactly like a real blueprint header). Repro
+    # from the red-team report: mkdir "$(printf 'evil\n== fake-blueprint')" under blueprints/
+    # defeats a naive `printf '%s\n' "!!   $NAME"` because the embedded \n splits the single
+    # intended "!!   evil" line into two lines, the second of which ("== fake-blueprint")
+    # carries no "!!" prefix at all and starts with "==".
+    # =====================================================================================
+    {
+        my $data = mk_datadir();
+        my $evil_name = "evil\n== fake-blueprint";
+        mk_dir("$data/blueprints/$evil_name");
+
+        my ($rc, $out, $err) = run_status($data, undef);
+        my @all_lines = split /\n/, $out;
+
+        # T21a: same shape as T4a -- every line from the first "!!" line to EOF begins with
+        # "!!". Guarded against "no !! line at all" the same way T4a is, so a missing section
+        # fails this assertion directly rather than via Perl's negative-index slice wraparound.
+        my $bang_start = first_index_matching(qr/^!!/, @all_lines);
+        if ($bang_start < 0) {
+            fail('T21a: every line from the first !! line to EOF begins with "!!" (embedded-newline stray) (no !! line found at all)');
+        } else {
+            my @after_bang_start = @all_lines[$bang_start .. $#all_lines];
+            is(scalar(grep { !/^!!/ } @after_bang_start), 0,
+               'T21a: every line from the first !! line to EOF begins with "!!" (embedded-newline stray name)');
+        }
+
+        # T21b: explicitly, no line anywhere in the output starts with "==" and contains the
+        # injected "fake-blueprint" text -- i.e. the embedded newline must never fabricate a
+        # spoofed "== fake-blueprint" header line.
+        ok((!grep { /^==.*fake-blueprint/ } @all_lines),
+           'T21b: no line starting with "==" contains the newline-injected "fake-blueprint" text');
     }
 
     # =====================================================================================
