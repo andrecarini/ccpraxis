@@ -1064,6 +1064,122 @@ for my $t ('/', 'C:', 'C:/', 'C:\\', '/a/../..') {
 }
 
 # =====================================================================
+# q04 step-7 fix-batch regressions (AC-72..75), from the step-6 reviewer and
+# red-team reports. Each of these FAILED against the step-4 implementation and
+# has a measured reproduction in reports/q04-protected-paths-resolution/.
+# =====================================================================
+
+# AC-72 — CRITICAL-1 (found independently by reviewer AND red-team).
+# The §3 home rejection must NEVER discard a root the module DERIVED ITSELF.
+# Rejection keys on notion B (_user_home), which is read straight from the
+# environment, so applying it to `claude-home` hands an attacker a one-env-var
+# delete of the guard's highest-value root: with USERPROFILE pointed at the
+# Claude home on Windows (never hardened by launcher.pl's _pp_env_seam, and
+# tried FIRST under `windows`), ~/.claude/projects, /memory, /todos and the
+# beacon vault all went from REFUSE to LAUNCH. That is blueprint C1 reopened,
+# and it breaks Decision #3 and the D5 criterion this package carries.
+# AC-64 missed it because it only ever tests a `user-configured` candidate.
+{
+    my $r = protected_roots({
+        registry => {}, extra_list => [],
+        env => $env_of->(USERPROFILE => '/Users/u/.claude', HOME => '/Users/u'),
+        windows => 1,
+        exists => $no_fs, read_file => $no_fs, realpath => $rp_id,
+    });
+    ok(has_root($r, '/Users/u/.claude', 'claude-home'),
+        'AC-72: a claude-home root is NOT rejected even when notion B (USERPROFILE) equals it');
+    is(count_error_code($r, 'root-home-rejected'), 0,
+        'AC-72: no root-home-rejected is raised against a module-derived claude-home candidate');
+    is(path_relation('/Users/u/.claude/projects', '/Users/u/.claude'), 'descendant',
+        'AC-72: and everything below the Claude home is therefore still covered by that root');
+}
+
+# AC-73 — MAJOR-3. Done-criterion 3 was only half closed: bare roots and the
+# EXACT home are rejected, but a strict ANCESTOR of the home ('/home',
+# '/Users', 'C:/Users') is adopted and produces an identical machine-wide
+# outage — and with no override (Decision #3) it is unrecoverable.
+{
+    my $reg = { bad => { source => { source => 'github', repo => 'o/r' },
+                         installLocation => '/home' } };
+    my $r = protected_roots({
+        registry => $reg, extra_list => ['/opt/keep'],
+        env => $env_of->(HOME => '/home/u'), windows => 0,
+        exists => $no_fs, read_file => $no_fs, realpath => $rp_id,
+    });
+    is((grep { $_->{path} eq '/home' } @{ $r->{roots} }), 0,
+        'AC-73: a registry root that is a strict ANCESTOR of the user home is rejected');
+    ok(has_error_code($r, 'root-home-rejected'),
+        'AC-73: it is rejected loudly, with the same code as the exact-match case');
+    ok(has_root($r, '/opt/keep', 'user-configured'),
+        'AC-73: unrelated roots still protect normally');
+    # The asymmetry AC-64 protects must survive this widening: a DESCENDANT of
+    # the home is still kept. Ancestor-rejection and descendant-keeping are
+    # opposite directions and must not be collapsed.
+    my $r2 = protected_roots({
+        registry => {}, extra_list => ['/home/u/.claude'],
+        env => $env_of->(HOME => '/home/u'), windows => 0,
+        exists => $no_fs, read_file => $no_fs, realpath => $rp_id,
+    });
+    is((grep { $_->{path} eq '/home/u/.claude' } @{ $r2->{roots} }), 1,
+        'AC-73: widening to ancestors does NOT start rejecting descendants (AC-64 asymmetry holds)');
+}
+
+# AC-74 — MAJOR-1 + MAJOR-2. The §2.3 source fan-out must not treat a
+# directory named by a single environment variable as a trusted SOURCE of
+# protected roots. Setting CLAUDE_CONFIG_DIR and planting one JSON file
+# injected `/home` as a root and refused every project on the machine
+# (fail-closed, unrecoverable); the same fan-out also resurrected a stale
+# registry under a former home and refused a legitimate ccpraxis clone, which
+# is a C6 regression (blueprint.md:176-179). Env-named dirs may still
+# contribute a claude-home ROOT (over-refusal of themselves only, which is
+# safe) — they may not contribute a SOURCE.
+{
+    my $planted_extra = '/evil/ccpraxis-protected-paths.json';
+    my $planted_reg   = '/evil/plugins/known_marketplaces.json';
+    my $r = protected_roots({
+        env => $env_of->(CLAUDE_CONFIG_DIR => '/evil', HOME => '/home/u'),
+        home_probes => sub { return ('/home/u') },
+        exists    => sub { return ($_[0] eq $planted_extra || $_[0] eq $planted_reg) ? 1 : 0 },
+        read_file => sub {
+            return '["/home"]' if $_[0] eq $planted_extra;
+            return '{"evil":{"source":{"source":"github","repo":"o/e"},"installLocation":"/Users"}}'
+                if $_[0] eq $planted_reg;
+            die "unexpected read of $_[0]\n";
+        },
+        realpath => $rp_id,
+    });
+    is((grep { $_->{path} eq '/home' } @{ $r->{roots} }), 0,
+        'AC-74: a protected-paths list planted under an env-named dir is NOT adopted as a source');
+    is((grep { $_->{path} eq '/Users' } @{ $r->{roots} }), 0,
+        'AC-74: a registry planted under an env-named dir is NOT adopted as a source');
+    ok(has_root($r, '/evil', 'claude-home'),
+        'AC-74: the env-named dir is still a claude-home ROOT (self-over-refusal stays safe)');
+}
+
+# AC-75 — MAJOR M2. protected_roots NEVER dies (module header §M5, spec §0
+# C-0.2). The realpath seam CALL was eval-wrapped but the `length $raw` guard
+# on the following line was not, so a returned object with a dying overloaded
+# stringification escaped and killed the whole call.
+{
+    package Q04DyingStr;
+    use overload '""' => sub { die "hostile stringification\n" }, fallback => 1;
+    sub new { return bless {}, shift }
+}
+{
+    my $r = eval { protected_roots({
+        registry => {}, extra_list => ['/opt/one'],
+        env => $env_of->(CLAUDE_CONFIG_DIR => '/home/u/.claude'),
+        exists => $no_fs, read_file => $no_fs,
+        realpath => sub { return Q04DyingStr->new },
+    }) };
+    is($@, '', 'AC-75: a realpath seam returning a dying-stringification object does not kill protected_roots');
+    ok(defined $r && ref $r eq 'HASH' && ref $r->{roots} eq 'ARRAY',
+        'AC-75: it still returns the documented { roots, errors } structure');
+    ok(has_root($r, '/opt/one', 'user-configured'),
+        'AC-75: the candidate degrades to its lexical path rather than vanishing');
+}
+
+# =====================================================================
 # AC-48 — suite hygiene: file ends with done_testing(); zero not-ok is
 # judged by the harness running this file (exit code + not-ok count),
 # not by an assertion inside itself.
