@@ -251,6 +251,22 @@ sub unlike_or_fail {
     else              { fail($name); diag('  (value was undef)'); }
 }
 
+# src_like/src_unlike: like()/unlike() for SOURCE-TEXT assertions. Identical
+# strictness, but a failure does not dump the whole slurped file into the TAP
+# stream (a failing like() against launcher.pl is ~300 KB of diag).
+sub src_like {
+    my ($str, $re, $name) = @_;
+    my $got = (defined $str && $str =~ $re) ? 1 : 0;
+    ok($got, $name) or diag("  source did not match $re");
+    return $got;
+}
+sub src_unlike {
+    my ($str, $re, $name) = @_;
+    my $got = (defined $str && $str =~ $re) ? 1 : 0;
+    ok(!$got, $name) or diag("  source unexpectedly matched $re");
+    return !$got;
+}
+
 # ===========================================================================
 # PART 1 -- dispatch_key: the [l] binding (AC-1..AC-4 / B1-B4)
 # ===========================================================================
@@ -923,15 +939,15 @@ sub alert_of { my ($st) = @_; return eval { Dashboard::_status_alert($st) }; }
 
     for my $i (0 .. 3) {
         my ($ev, $f) = @{ $logs->[1 + $i] || [] };
-        is($ev, 'lifecycle_stage', "AC-19: stage log #$i event name is lifecycle_stage");
-        is($f->{mode},  'recover',        "AC-19: stage log #$i .mode is recover");
-        is($f->{stage}, $plan->[$i]{id},  "AC-19: stage log #$i .stage matches plan order");
-        is($f->{index}, $i + 1,           "AC-19: stage log #$i .index is 1-based");
-        is($f->{total}, $n,               "AC-19: stage log #$i .total == the PLANNED count");
+        is($ev, 'lifecycle_stage', "AC-19: stage log no.$i event name is lifecycle_stage");
+        is($f->{mode},  'recover',        "AC-19: stage log no.$i .mode is recover");
+        is($f->{stage}, $plan->[$i]{id},  "AC-19: stage log no.$i .stage matches plan order");
+        is($f->{index}, $i + 1,           "AC-19: stage log no.$i .index is 1-based");
+        is($f->{total}, $n,               "AC-19: stage log no.$i .total == the PLANNED count");
         ok((grep { ($f->{state} // '') eq $_ } qw(ok fail skipped timeout)),
-            "AC-19: stage log #$i .state is a pinned enum value");
-        ok(defined $f->{detail}, "AC-19: stage log #$i .detail is defined");
-        for my $v (values %$f) { ok(!ref($v), "AC-19: stage log #$i payload values are scalars (no nested refs)"); }
+            "AC-19: stage log no.$i .state is a pinned enum value");
+        ok(defined $f->{detail}, "AC-19: stage log no.$i .detail is defined");
+        for my $v (values %$f) { ok(!ref($v), "AC-19: stage log no.$i payload values are scalars (no nested refs)"); }
     }
 
     my ($lev, $lf) = @{ $logs->[-1] || [] };
@@ -951,7 +967,7 @@ sub alert_of { my ($st) = @_; return eval { Dashboard::_status_alert($st) }; }
     for my $i (0 .. 3) {
         my $pre  = $progress->[2 * $i];
         my $post = $progress->[2 * $i + 1];
-        is(field($pre, 'state'), 'running', "AC-19: progress #" . (2 * $i) . " is the PRE update (state running)");
+        is(field($pre, 'state'), 'running', "AC-19: progress no." . (2 * $i) . " is the PRE update (state running)");
         is(field($pre, 'active'), 1,        "AC-19: the pre update for stage $i has active => 1");
         is(field($pre, 'mode'), 'recover',  "AC-19: the pre update for stage $i has mode => recover");
         is(field($pre, 'reason'), 'in-tui-relaunch', "AC-19: the pre update for stage $i carries the reason");
@@ -961,7 +977,7 @@ sub alert_of { my ($st) = @_; return eval { Dashboard::_status_alert($st) }; }
         is(field($pre, 'total'), $n,                 "AC-19: the pre update for stage $i has total == planned");
         ok(defined field($pre, 'detail'), "AC-19: the pre update for stage $i has a defined detail");
         ok((grep { (field($post, 'state') // '') eq $_ } qw(ok fail skipped timeout)),
-            "AC-19: progress #" . (2 * $i + 1) . " is the POST update (outcome state)");
+            "AC-19: progress no." . (2 * $i + 1) . " is the POST update (outcome state)");
         is(field($post, 'stage'), $plan->[$i]{id}, "AC-19: the post update for stage $i names the same stage id");
         is(field($post, 'index'), $i + 1,          "AC-19: the post update for stage $i has the same index");
     }
@@ -1091,7 +1107,7 @@ sub alert_of { my ($st) = @_; return eval { Dashboard::_status_alert($st) }; }
         or diag("expected at $DASHBOARD_SRC");
     my $ml = extract_call_block($dsrc, '%mode_label');
     if (defined $ml) {
-        like($ml, qr/(['"])recover\1\s*=>/, "AC-21: %mode_label registers a 'recover' key");
+        src_like($ml, qr/(['"])recover\1\s*=>/, "AC-21: %mode_label registers a 'recover' key");
     }
     else {
         fail("AC-21: %mode_label registers a 'recover' key (the %mode_label literal was not found)");
@@ -1256,7 +1272,7 @@ sub seg_has { my ($seg, $tag) = @_; return scalar(grep { $_->[0] eq $tag } @{ $s
     my $segs = segments($e->{events});
     my $R    = seg_index_of($segs, 'recover');
     cmp_ok($R, '>=', 0, 'AC-23: the recover is locatable in the tick stream');
-    cmp_ok(scalar(@$segs), '>', $R + 1, 'AC-23: at least one full tick follows the recover');
+    ok($R >= 0 && scalar(@$segs) > $R + 1, 'AC-23: at least one full tick follows the recover');
 
     if ($R >= 0 && @$segs > $R + 1) {
         # (a) gather on the tick IMMEDIATELY after the recover.
@@ -1422,12 +1438,12 @@ sub seg_has { my ($seg, $tag) = @_; return scalar(grep { $_->[0] eq $tag } @{ $s
         if (defined $body) {
             my $stripped = $body;
             $stripped =~ s/#[^\n]*//g;
-            unlike($stripped, qr/\bsystem\s*\(/, "AC-26: sub $sub_name body contains no system(...)");
-            unlike($stripped, qr/`/,             "AC-26: sub $sub_name body contains no backtick");
-            unlike($stripped, qr/\bqx\b/,        "AC-26: sub $sub_name body contains no qx");
-            unlike($stripped, qr/\bexec\s*\(/,   "AC-26: sub $sub_name body contains no exec(...)");
-            unlike($stripped, qr/\$PODMAN\b/,    "AC-26: sub $sub_name body never references \$PODMAN");
-            unlike($stripped, qr/\bopen\s*\(/,   "AC-26: sub $sub_name body opens no handle (no pipe/process)");
+            src_unlike($stripped, qr/\bsystem\s*\(/, "AC-26: sub $sub_name body contains no system(...)");
+            src_unlike($stripped, qr/`/,             "AC-26: sub $sub_name body contains no backtick");
+            src_unlike($stripped, qr/\bqx\b/,        "AC-26: sub $sub_name body contains no qx");
+            src_unlike($stripped, qr/\bexec\s*\(/,   "AC-26: sub $sub_name body contains no exec(...)");
+            src_unlike($stripped, qr/\$PODMAN\b/,    "AC-26: sub $sub_name body never references \$PODMAN");
+            src_unlike($stripped, qr/\bopen\s*\(/,   "AC-26: sub $sub_name body opens no handle (no pipe/process)");
         }
         else {
             fail("AC-26: sub $sub_name body contains no system(...) [sub not found in Dashboard.pm yet]");
@@ -1444,7 +1460,7 @@ sub seg_has { my ($seg, $tag) = @_; return scalar(grep { $_->[0] eq $tag } @{ $s
         if (defined $body) {
             my $stripped = $body;
             $stripped =~ s/#[^\n]*//g;
-            unlike($stripped, qr/podman/i, "AC-26: sub $sub_name body contains no 'podman' at all");
+            src_unlike($stripped, qr/podman/i, "AC-26: sub $sub_name body contains no 'podman' at all");
         }
         else {
             fail("AC-26: sub $sub_name body contains no 'podman' at all [sub not found]");
@@ -1470,8 +1486,8 @@ my $LSRC = slurp($LAUNCHER_SRC);
     my $run_call = extract_call_block($LSRC, 'Dashboard::run(');
     ok(defined $run_call, 'AC-27(a): the Dashboard::run( ... ) call block is balanced/extractable');
     if (defined $run_call) {
-        like($run_call, qr/\bfull_shutdown\s*=>/, 'AC-27(a): the Dashboard::run( block still wires full_shutdown =>');
-        like($run_call, qr/\brecover\s*=>/,       'AC-27(a): the Dashboard::run( block wires recover =>');
+        src_like($run_call, qr/\bfull_shutdown\s*=>/, 'AC-27(a): the Dashboard::run( block still wires full_shutdown =>');
+        src_like($run_call, qr/\brecover\s*=>/,       'AC-27(a): the Dashboard::run( block wires recover =>');
         my $fi = re_pos($run_call, qr/\bfull_shutdown\s*=>/);
         my $ri = re_pos($run_call, qr/\brecover\s*=>/);
         ok($fi >= 0 && $ri > $fi, 'AC-27(a): recover => appears AFTER full_shutdown => in the seam hashref');
@@ -1487,25 +1503,25 @@ my $LSRC = slurp($LAUNCHER_SRC);
     my $rcb = extract_sub_body($LSRC, 'sub recover_container');
     ok(defined $rcb, 'AC-27(b): sub recover_container exists in launcher.pl');
     if (defined $rcb) {
-        like($rcb, qr/my\s*\(\s*\$\w+\s*\)\s*=\s*\@_/,     'AC-27(b): recover_container takes a single argument');
-        like($rcb, qr/->\s*\{\s*['"]?state['"]?\s*\}/,     'AC-27(b): recover_container reads $args->{state}');
-        like($rcb, qr/->\s*\{\s*['"]?reason['"]?\s*\}/,    'AC-27(b): recover_container reads $args->{reason}');
-        like($rcb, qr/->\s*\{\s*['"]?seams['"]?\s*\}/,     'AC-27(b): recover_container reads $args->{seams}');
-        like($rcb, qr/Dashboard::run_recover_stages/,      'AC-27(b): recover_container calls Dashboard::run_recover_stages');
-        like($rcb, qr/Dashboard::recover_plan/,            'AC-27(b): recover_container gets its plan from Dashboard::recover_plan');
-        like($rcb, qr/status_cb\s*=>/,                     'AC-27(b): recover_container maps emit -> status_cb');
-        like($rcb, qr/log_cb\s*=>/,                        'AC-27(b): recover_container maps log -> log_cb');
-        like($rcb, qr/in-tui-relaunch/,                    'AC-27(b): recover_container defaults reason to the pinned in-tui-relaunch tag');
+        src_like($rcb, qr/my\s*\(\s*\$\w+\s*\)\s*=\s*\@_/,     'AC-27(b): recover_container takes a single argument');
+        src_like($rcb, qr/->\s*\{\s*['"]?state['"]?\s*\}/,     'AC-27(b): recover_container reads $args->{state}');
+        src_like($rcb, qr/->\s*\{\s*['"]?reason['"]?\s*\}/,    'AC-27(b): recover_container reads $args->{reason}');
+        src_like($rcb, qr/->\s*\{\s*['"]?seams['"]?\s*\}/,     'AC-27(b): recover_container reads $args->{seams}');
+        src_like($rcb, qr/Dashboard::run_recover_stages/,      'AC-27(b): recover_container calls Dashboard::run_recover_stages');
+        src_like($rcb, qr/Dashboard::recover_plan/,            'AC-27(b): recover_container gets its plan from Dashboard::recover_plan');
+        src_like($rcb, qr/status_cb\s*=>/,                     'AC-27(b): recover_container maps emit -> status_cb');
+        src_like($rcb, qr/log_cb\s*=>/,                        'AC-27(b): recover_container maps log -> log_cb');
+        src_like($rcb, qr/in-tui-relaunch/,                    'AC-27(b): recover_container defaults reason to the pinned in-tui-relaunch tag');
 
         # (c) no exit, no SandboxLock::release (landmine 2).
-        unlike($rcb, qr/\bexit\b/,                 'AC-27(c): recover_container body contains no exit');
-        unlike($rcb, qr/SandboxLock::release/,     'AC-27(c): recover_container body contains no SandboxLock::release');
+        src_unlike($rcb, qr/\bexit\b/,                 'AC-27(c): recover_container body contains no exit');
+        src_unlike($rcb, qr/SandboxLock::release/,     'AC-27(c): recover_container body contains no SandboxLock::release');
 
         # (d) the production seam set: four seams wired, container_create NOT.
         for my $seam (qw(machine_status machine_start container_start heartbeat_reattach)) {
-            like($rcb, qr/\b\Q$seam\E\s*=>/, "AC-27(d): the production seam set wires $seam =>");
+            src_like($rcb, qr/\b\Q$seam\E\s*=>/, "AC-27(d): the production seam set wires $seam =>");
         }
-        unlike($rcb, qr/\bcontainer_create\s*=>/,
+        src_unlike($rcb, qr/\bcontainer_create\s*=>/,
             'AC-27(d): container_create is NOT wired in production (R1 -- no in-TUI recreate)');
     }
     else {
@@ -1528,22 +1544,22 @@ my $LSRC = slurp($LAUNCHER_SRC);
     }
 
     # (e) gather returns a machine_state key.
-    like($LSRC, qr/\bmachine_state\s*=>/, 'AC-27(e): launcher.pl gather returns a machine_state key');
+    src_like($LSRC, qr/\bmachine_state\s*=>/, 'AC-27(e): launcher.pl gather returns a machine_state key');
 
     # (f) the recover seam closure invalidates the launcher-side gather caches
     #     AFTER the recover_container call (problem 8).
     my $closure = defined $run_call ? block_after($run_call, qr/\brecover\s*=>/) : undef;
     ok(defined $closure, 'AC-27(f): the recover => sub { ... } closure is extractable');
     if (defined $closure) {
-        like($closure, qr/recover_container\s*\(/,        'AC-27(f): the recover closure calls recover_container(');
-        like($closure, qr/\$last_inspect\s*=\s*0/,        'AC-27(f): the recover closure sets $last_inspect = 0');
-        like($closure, qr/\$last_resources\s*=\s*0/,      'AC-27(f): the recover closure sets $last_resources = 0');
+        src_like($closure, qr/recover_container\s*\(/,        'AC-27(f): the recover closure calls recover_container(');
+        src_like($closure, qr/\$last_inspect\s*=\s*0/,        'AC-27(f): the recover closure sets $last_inspect = 0');
+        src_like($closure, qr/\$last_resources\s*=\s*0/,      'AC-27(f): the recover closure sets $last_resources = 0');
         my $ci = re_pos($closure, qr/recover_container\s*\(/);
         my $ii = re_pos($closure, qr/\$last_inspect\s*=\s*0/);
         my $si = re_pos($closure, qr/\$last_resources\s*=\s*0/);
         ok($ci >= 0 && $ii > $ci && $si > $ci,
             'AC-27(f): the cache invalidation happens AFTER the recover_container call');
-        like($closure, qr/in-tui-relaunch/, 'AC-27(f): the recover closure passes the in-tui-relaunch reason tag');
+        src_like($closure, qr/in-tui-relaunch/, 'AC-27(f): the recover closure passes the in-tui-relaunch reason tag');
     }
     else {
         fail('AC-27(f): the recover closure calls recover_container(');
@@ -1560,15 +1576,15 @@ my $LSRC = slurp($LAUNCHER_SRC);
     my $ms = extract_sub_body($LSRC, 'sub _machine_state');
     ok(defined $ms, 'AC-28(a): sub _machine_state exists in launcher.pl');
     if (defined $ms) {
-        like($ms, qr/machine\s+list\s+--format\s+json/, 'AC-28(a): _machine_state runs `machine list --format json`');
-        like($ms, qr/_run_timed\s*\(/,                  'AC-28(a): _machine_state bounds the probe with _run_timed');
-        like($ms, qr/SANDBOX_RECOVER_PROBE_TIMEOUT/,    'AC-28(a): the probe bound is env-overridable');
-        like($ms, qr/eval\s*\{/,                        'AC-28(a): _machine_state wraps its JSON decode in eval');
-        like($ms, qr/decode_json/,                      'AC-28(a): _machine_state decodes with decode_json');
-        like($ms, qr/Running/,                          'AC-28(a): _machine_state reads the Running field');
-        like($ms, qr/State|Status/,                     'AC-28(a): _machine_state also tolerates State/Status field names');
+        src_like($ms, qr/machine\s+list\s+--format\s+json/, 'AC-28(a): _machine_state runs `machine list --format json`');
+        src_like($ms, qr/_run_timed\s*\(/,                  'AC-28(a): _machine_state bounds the probe with _run_timed');
+        src_like($ms, qr/SANDBOX_RECOVER_PROBE_TIMEOUT/,    'AC-28(a): the probe bound is env-overridable');
+        src_like($ms, qr/eval\s*\{/,                        'AC-28(a): _machine_state wraps its JSON decode in eval');
+        src_like($ms, qr/decode_json/,                      'AC-28(a): _machine_state decodes with decode_json');
+        src_like($ms, qr/Running/,                          'AC-28(a): _machine_state reads the Running field');
+        src_like($ms, qr/State|Status/,                     'AC-28(a): _machine_state also tolerates State/Status field names');
         for my $word (qw(running stopped absent unknown), 'n/a') {
-            like($ms, qr/(['"])\Q$word\E\1/, "AC-28(a): _machine_state can return '$word'");
+            src_like($ms, qr/(['"])\Q$word\E\1/, "AC-28(a): _machine_state can return '$word'");
         }
     }
     else {
@@ -1587,10 +1603,10 @@ my $LSRC = slurp($LAUNCHER_SRC);
     my $mstart = defined $rcb ? block_after($rcb, qr/\bmachine_start\s*=>/) : undef;
     ok(defined $mstart, 'AC-28(b): the machine_start production seam block is extractable');
     if (defined $mstart) {
-        like($mstart, qr/_run_timed\s*\(/,                     'AC-28(b): machine_start bounds the start with _run_timed');
-        like($mstart, qr/SANDBOX_RECOVER_MACHINE_TIMEOUT/,     'AC-28(b): the machine-start bound is env-overridable');
-        like($mstart, qr/timeout\s*=>\s*1/,                    'AC-28(b): an undef _run_timed return maps to timeout => 1');
-        like($mstart, qr/machine\s+start/,                     'AC-28(b): machine_start invokes `machine start`');
+        src_like($mstart, qr/_run_timed\s*\(/,                     'AC-28(b): machine_start bounds the start with _run_timed');
+        src_like($mstart, qr/SANDBOX_RECOVER_MACHINE_TIMEOUT/,     'AC-28(b): the machine-start bound is env-overridable');
+        src_like($mstart, qr/timeout\s*=>\s*1/,                    'AC-28(b): an undef _run_timed return maps to timeout => 1');
+        src_like($mstart, qr/machine\s+start/,                     'AC-28(b): machine_start invokes `machine start`');
     }
     else {
         fail('AC-28(b): machine_start bounds the start with _run_timed');
@@ -1615,7 +1631,7 @@ my $LSRC = slurp($LAUNCHER_SRC);
         }
         ok($adjacent,
             'AC-28(c): `touch /tmp/.launcher-alive` is the IMMEDIATELY NEXT podman invocation after the start (10s grace)');
-        like($cstart, qr/log_ev\s*\(\s*['"]container_start['"]/, 'AC-28(c): the container_start seam logs a container_start event');
+        src_like($cstart, qr/log_ev\s*\(\s*['"]container_start['"]/, 'AC-28(c): the container_start seam logs a container_start event');
     }
     else {
         fail('AC-28(c): the container_start seam makes at least two podman invocations');
@@ -1626,7 +1642,7 @@ my $LSRC = slurp($LAUNCHER_SRC);
     # heartbeat_reattach rides _heartbeat_once.
     my $hb = defined $rcb ? block_after($rcb, qr/\bheartbeat_reattach\s*=>/) : undef;
     if (defined $hb) {
-        like($hb, qr/_heartbeat_once/, 'AC-28: the heartbeat_reattach seam calls _heartbeat_once');
+        src_like($hb, qr/_heartbeat_once/, 'AC-28: the heartbeat_reattach seam calls _heartbeat_once');
     }
     else {
         fail('AC-28: the heartbeat_reattach seam calls _heartbeat_once');
@@ -1636,19 +1652,19 @@ my $LSRC = slurp($LAUNCHER_SRC);
     my $ed = extract_sub_body($LSRC, 'sub enter_dashboard');
     ok(defined $ed, 'AC-28(d): sub enter_dashboard exists in launcher.pl');
     if (defined $ed) {
-        like($ed, qr/_heartbeat_once/, 'AC-28(d): enter_dashboard still probes with _heartbeat_once pre-loop');
+        src_like($ed, qr/_heartbeat_once/, 'AC-28(d): enter_dashboard still probes with _heartbeat_once pre-loop');
         my $gi = re_pos($ed, qr/_heartbeat_once\s*\(\s*\)\s*eq\s*['"]gone['"]/);
         if ($gi < 0) { $gi = re_pos($ed, qr/['"]gone['"]/); }
         my $xi = ($gi >= 0) ? index($ed, 'exit', $gi) : -1;
         if ($gi >= 0 && $xi > $gi) {
             my $guard = substr($ed, $gi, $xi - $gi);
-            like($guard, qr/classify_container_state/,
+            src_like($guard, qr/classify_container_state/,
                 'AC-28(d): the pre-loop exit is guarded by Dashboard::classify_container_state');
-            like($guard, qr/_machine_state/,
+            src_like($guard, qr/_machine_state/,
                 'AC-28(d): the pre-loop exit is guarded by a _machine_state reading');
-            like($guard, qr/['"]absent['"]/,
+            src_like($guard, qr/['"]absent['"]/,
                 "AC-28(d): the guard exits only for a genuinely 'absent' container");
-            like($guard, qr/['"]stopped['"]/,
+            src_like($guard, qr/['"]stopped['"]/,
                 "AC-28(d): the guard does NOT exit when the machine is 'stopped'");
         }
         else {
@@ -1657,7 +1673,7 @@ my $LSRC = slurp($LAUNCHER_SRC);
             fail("AC-28(d): the guard exits only for a genuinely 'absent' container");
             fail("AC-28(d): the guard does NOT exit when the machine is 'stopped'");
         }
-        like($ed, qr/recover_available/,
+        src_like($ed, qr/recover_available/,
             'AC-28(d): the fall-through path logs a recover_available event instead of exiting');
     }
     else {
@@ -1673,8 +1689,8 @@ my $LSRC = slurp($LAUNCHER_SRC);
     # -- the non-TTY fallback has no [l] and must keep exiting.
     my $ph = extract_sub_body($LSRC, 'sub plain_heartbeat_loop');
     if (defined $ph) {
-        like($ph, qr/\bexit\b/, 'AC-28: plain_heartbeat_loop keeps its own exit (out of scope, unchanged)');
-        unlike($ph, qr/classify_container_state/,
+        src_like($ph, qr/\bexit\b/, 'AC-28: plain_heartbeat_loop keeps its own exit (out of scope, unchanged)');
+        src_unlike($ph, qr/classify_container_state/,
             'AC-28: plain_heartbeat_loop is NOT retrofitted with the recover guard (out of scope)');
     }
     else {
@@ -1696,17 +1712,17 @@ my $LSRC = slurp($LAUNCHER_SRC);
 {
     my $runner = slurp("$TESTS_DIR/run-tests.pl");
     ok(length($runner) > 0, 'AC-29: tests/run-tests.pl is readable');
-    like($runner, qr/glob\("\$Bin\/t\/\*\.t"\)/,
+    src_like($runner, qr/glob\("\$Bin\/t\/\*\.t"\)/,
         'AC-29: run-tests.pl discovers every t/*.t, so t/47-lifecycle-relaunch.t joins the suite automatically');
     ok(-f "$Bin/47-lifecycle-relaunch.t", 'AC-29: t/47-lifecycle-relaunch.t is on disk under the discovered path');
 
     my $t46 = slurp("$Bin/46-lifecycle-stop.t");
     ok(length($t46) > 0, 'AC-29: t/46-lifecycle-stop.t is still present');
-    like($t46, qr/IMMUTABLE ORACLE/,
+    src_like($t46, qr/IMMUTABLE ORACLE/,
         'AC-29: t/46 still declares itself the immutable oracle for s11 (this package did not rewrite it)');
     my $t25 = slurp("$Bin/25-dashboard.t");
     ok(length($t25) > 0, 'AC-29: t/25-dashboard.t is still present');
-    like($t25, qr/loop: runs to max_ticks rather than a gone-exit/,
+    src_like($t25, qr/loop: runs to max_ticks rather than a gone-exit/,
         'AC-29: t/25 still pins the non-exit-on-gone behaviour this package depends on (spec S2.9)');
 
     ok(-f $DASHBOARD_SRC, 'AC-29: Dashboard.pm is on disk');
