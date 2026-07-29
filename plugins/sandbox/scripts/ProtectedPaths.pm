@@ -290,7 +290,15 @@ sub target_self_codes {
     # target the way path_relation used to. _is_bare_root is the single
     # helper shared with the root-side guard in protected_roots so the two
     # "is this a bare root" checks can never silently diverge (reviewer N2).
-    my $n = _ingest_path($target);
+    #
+    # q04 step 7 (reviewer m3): $opts IS threaded. The earlier one-argument call
+    # was justified as "_is_bare_root's answer is platform-independent", which is
+    # not quite true -- normalize_path's trailing-dot/space strip is
+    # platform-gated, so a target like '/ .' is bare under `windows => 1` and not
+    # under `windows => 0`. Leaving it unthreaded made this function honour
+    # `windows` for its `user-home` code (below) and ignore it for `drive-root`,
+    # i.e. inconsistent with itself within four lines.
+    my $n = _ingest_path($target, $opts);
     push @codes, 'drive-root' if _is_bare_root($n);
 
     my $home = _user_home($opts);
@@ -327,20 +335,40 @@ sub target_self_codes {
 # So: absent  => return the path unchanged (resolved-to-itself; it stays in the
 #                protected set, silently -- there is nothing to resolve, and
 #                lexical containment still guards it);
-#     present but unresolvable (broken symlink, unreadable parent, permissions)
-#             => undef, which warns. That is the case a user can and should fix.
+#     DANGLING SYMLINK => undef, which warns. That is the case a user can and
+#                should fix, and it is the one done-criterion 1 names.
 #
-# The `-e` is deliberately a REAL filesystem test rather than the injectable
-# `exists` seam: this closure IS the "no seam was injected, talk to the real
-# host" branch, and t/51 arms `exists` as a die-ing tripwire, so routing
-# through it here would make the default seam die where it should answer.
-# Callers who inject `realpath` keep full control and are untouched by this --
-# an injected seam returning undef still means "unresolvable" (AC-51/AC-52).
+# q04 step 7 (reviewer M1) -- WHY THE `-l` TEST IS LOAD-BEARING, measured, not
+# assumed. The first shape of this closure asked "did abs_path fail AND does the
+# path exist", and that combination is practically unreachable: `stat(2)` and
+# `realpath(3)` need the same parent traversal, so every input where abs_path
+# returns undef also has `-e` false (measured: absent parent, path through a
+# dangling link). Worse, a dangling symlink does not fail resolution at all --
+# abs_path cheerfully returns the non-existent TARGET -- so the very case the
+# criterion names resolved silently to a directory that is not there. The
+# distinguishing signal is `-l` TRUE while `-e` is FALSE: the path IS a symlink
+# and what it points at is gone. That is reported; a plainly absent path (not a
+# symlink) stays silent, which is what t/53's Group G pins (`warnings` EMPTY for
+# a marketplace directory the user deleted).
+#
+# A symlink that resolves normally is untouched by this and still resolves to
+# its target -- that is C5's whole fix and must not regress.
+#
+# `-e` and `-l` are deliberately REAL filesystem tests rather than the
+# injectable `exists` seam: this closure IS the "no seam was injected, talk to
+# the real host" branch, and t/51 arms `exists` as a die-ing tripwire, so
+# routing through it here would make the default seam die where it should
+# answer. Callers who inject `realpath` keep full control and are untouched by
+# any of this -- an injected seam returning undef still means "unresolvable"
+# (AC-51/AC-52).
 my $_default_realpath = sub {
     my ($p) = @_;
-    my $r = eval { Cwd::abs_path($p) };
-    return $r if defined $r && length $r;
+    my $r      = eval { Cwd::abs_path($p) };
     my $exists = eval { (defined $p && length $p && -e $p) ? 1 : 0 };
+    # Dangling (or looping) symlink => actionable fault, warn. Checked before
+    # $r is trusted, because abs_path reports the dangling target as a success.
+    return undef if !$exists && eval { (defined $p && length $p && -l $p) ? 1 : 0 };
+    return $r if defined $r && length $r;
     return $p if !$exists;          # absent => nothing to resolve, not a fault
     return undef;                   # present but unresolvable => warn
 };
@@ -392,8 +420,13 @@ sub _default_home_probes {
 # =====================================================================
 # q04 §2.3 -- the registry / extra-list SOURCE as a candidate SET.
 # Given a path relative to a claude-home directory, return the additional
-# paths to try under every notion-A home candidate, minus the one the
+# paths to try under every SOURCE-ELIGIBLE home candidate, minus the one the
 # primary acquisition already used (never attempt the same file twice).
+#
+# The caller passes @source_candidates, NOT the full notion-A @home_candidates
+# (q04 step 7, redteam MAJOR-1/MAJOR-2): a directory named verbatim by one
+# environment variable may contribute a root but may not contribute a SOURCE.
+# The reasoning lives at the @source_candidates declaration in protected_roots.
 # =====================================================================
 sub _candidate_source_paths {
     my ($relative, $home_candidates, $primary) = @_;
@@ -532,8 +565,14 @@ sub protected_roots {
     # bias from notion B (`_user_home`, singular, env-derived, unchanged by
     # q04) used further down to REMOVE roots -- the biases are opposite
     # because the consequences of error are opposite. Do not conflate them.
-    my $home_raw;          # unnormalised, used for the default registry/extra paths
-    my @home_candidates;   # notion A, hoisted: also feeds the source candidate set (§2.3)
+    #
+    # q04 step 7 (redteam MAJOR-1/MAJOR-2) draws a THIRD distinction inside
+    # notion A, and it is the one that matters for trust: a home candidate may
+    # always contribute a protected ROOT, but only some of them may name a
+    # SOURCE FILE whose contents become roots. See @source_candidates below.
+    my $home_raw;            # unnormalised base of the *primary* default registry/extra path
+    my @home_candidates;     # notion A: every candidate, roots only
+    my @source_candidates;   # the subset trusted to NAME A SOURCE FILE (§2.3)
     {
         my $cfg = eval { $env_fn->('CLAUDE_CONFIG_DIR') };
         $cfg = undef if $@;
@@ -546,12 +585,46 @@ sub protected_roots {
         push @home_candidates, "$home_env/.claude"    if defined $home_env    && $home_env    !~ /\A\s*\z/;
         push @home_candidates, "$userprofile/.claude" if defined $userprofile && $userprofile !~ /\A\s*\z/;
 
+        # q04 step 7 (redteam MAJOR-1 / MAJOR-2) -- WHICH candidates may act as
+        # a SOURCE, i.e. may have `plugins/known_marketplaces.json` or
+        # `ccpraxis-protected-paths.json` read out of them and their CONTENTS
+        # adopted as protected roots. This is a strictly narrower question than
+        # "may it be a root", and conflating the two was the defect:
+        #
+        #   * a candidate contributing only a ROOT can at worst over-refuse
+        #     ITSELF -- a bounded, self-inflicted, recoverable cost, and the
+        #     safe direction per Decision #6 (AC-74's third assertion requires
+        #     the env-named dir to keep contributing its own root);
+        #   * a candidate acting as a SOURCE contributes ARBITRARY THIRD-PARTY
+        #     PATHS. `CLAUDE_CONFIG_DIR=/tmp/evil` plus one planted JSON file
+        #     naming `["/home"]` refused every project on the machine, and with
+        #     no override (Decision #3) that outage is unrecoverable. The same
+        #     fan-out also RESURRECTED a stale registry under a former home and
+        #     refused a legitimate ccpraxis clone -- a C6 regression
+        #     (blueprint.md:176-179) hitting an ordinary user with no attacker
+        #     involved. It additionally re-opened the hole q03 closed by pinning
+        #     `extra_list_path` (launcher.pl:556).
+        #
+        # So: a directory named VERBATIM by a single environment variable is not
+        # a trusted source. `CLAUDE_CONFIG_DIR` (taken verbatim) and
+        # `USERPROFILE` are dropped from the source set; what remains is
+        # `$HOME/.claude` -- the module's own pre-q04 source, and the one
+        # variable launcher.pl's `_pp_env_seam` hardens (:291-305) -- plus the
+        # env-INDEPENDENT probe results, which is exactly what finding 2's
+        # fan-out was for (AC-58/AC-59 depend on those). Keeping HOME is
+        # therefore not a widening: it is the pre-q04 baseline.
+        push @source_candidates, "$home_env/.claude"
+            if defined $home_env && $home_env !~ /\A\s*\z/;
+
         # q04 §2.2 -- env-INDEPENDENT probes, additive and best-effort. Each
         # probe is invoked under its OWN eval: a probe that dies contributes
         # nothing, is NOT an error, and leaves every other candidate intact
         # (AC-61, §M5). `home_probes` replaces the default probe list and
         # returns HOME DIRECTORIES (what getpwuid's pw_dir is); the "/.claude"
-        # suffix is appended here, in one place.
+        # suffix is appended here, in one place. Probe results are
+        # source-eligible: they come from the OS's own record (or from a caller
+        # that injected the seam deliberately), not from an environment
+        # variable an attacker can point anywhere.
         my @probes = (defined $opts->{home_probes} && ref $opts->{home_probes} eq 'CODE')
             ? ($opts->{home_probes})
             : (_default_home_probes($exists_fn));
@@ -561,20 +634,24 @@ sub protected_roots {
             for my $h (@got) {
                 next if ref $h;
                 next unless defined $h && $h !~ /\A\s*\z/;
-                push @home_candidates, "$h/.claude";
+                push @home_candidates,   "$h/.claude";
+                push @source_candidates, "$h/.claude";
             }
         }
 
-        # `$home_raw` stays exactly the pre-q04 single precedence-ordered
-        # value (it is what §2.5.1 specifies, and what the *primary*
-        # registry/extra-list default path is derived from). q04 §2.3 does not
-        # widen it -- it adds further source candidates alongside it.
-        if (defined $cfg && $cfg !~ /\A\s*\z/) {
-            $home_raw = $cfg;
-        } elsif (defined $home_env && $home_env !~ /\A\s*\z/) {
-            $home_raw = "$home_env/.claude";
-        } elsif (defined $userprofile && $userprofile !~ /\A\s*\z/) {
-            $home_raw = "$userprofile/.claude";
+        # `$home_raw` is the base of the *PRIMARY* default registry/extra-list
+        # path (§2.5.1), so it is a source and obeys the source rule above: the
+        # precedence chain now runs over source-eligible values only, i.e.
+        # `$HOME/.claude` then the first probe candidate. It is deliberately NOT
+        # `CLAUDE_CONFIG_DIR` any more -- the planted-file injection above
+        # arrived through the PRIMARY default, not only through §2.3's fan-out,
+        # so gating the fan-out alone would have left the hole open (measured).
+        # In production this changes nothing: launcher.pl:556 pins both
+        # `registry_path` and `extra_list_path` explicitly, so the module's own
+        # default is not consulted at all.
+        for my $sc (@source_candidates) {
+            $home_raw = $sc;
+            last;
         }
 
         if (@home_candidates) {
@@ -710,7 +787,7 @@ sub protected_roots {
     unless (exists $opts->{registry}) {
         my $primary = exists $opts->{registry_path} ? $opts->{registry_path} : $registry_default;
         for my $path (_candidate_source_paths('plugins/known_marketplaces.json',
-                                              \@home_candidates, $primary)) {
+                                              \@source_candidates, $primary)) {
             my ($raw, $attempted) = _acquire_json_source(
                 opts             => {},
                 data_key         => 'registry',
@@ -806,7 +883,7 @@ sub protected_roots {
     unless (exists $opts->{extra_list}) {
         my $primary = exists $opts->{extra_list_path} ? $opts->{extra_list_path} : $extra_default;
         for my $path (_candidate_source_paths('ccpraxis-protected-paths.json',
-                                              \@home_candidates, $primary)) {
+                                              \@source_candidates, $primary)) {
             my ($raw, $attempted) = _acquire_json_source(
                 opts             => {},
                 data_key         => 'extra_list',
