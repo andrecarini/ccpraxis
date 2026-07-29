@@ -409,6 +409,36 @@ sub _candidate_source_paths {
     return @out;
 }
 
+# =====================================================================
+# q04 §3 / step 7 (reviewer C1, redteam CRITICAL-1) -- WHICH candidate reasons
+# the user-home rejection may act on. THIS SET IS SECURITY-CRITICAL; read the
+# argument before widening it.
+#
+# The rejection compares against notion B (`_user_home`), which is read
+# straight from the environment and is therefore ATTACKER-STEERABLE -- and it
+# is wired to REMOVE roots. Applied to a root the module DERIVED ITSELF, that
+# makes one environment variable a delete button for the guard's highest-value
+# root: `USERPROFILE=C:/Users/u/.claude` on the Windows family (never hardened
+# by launcher.pl's `_pp_env_seam`, and tried FIRST by notion B there) made the
+# real `claude-home` root match `exact`, deleted it, and took
+# `~/.claude/projects`, `/memory`, `/todos` and the beacon vault from REFUSE to
+# LAUNCH. That is blueprint C1 reopened, and it breaks Appendix B Decision #3
+# ("no override, no env var, no flag") and criterion D5.
+#
+# So gate the rejection by candidate REASON. The outage the rejection exists to
+# prevent (finding 3) arrives only through a malformed/hostile registry entry or
+# extra-list element -- i.e. through content, not through the module's own
+# derivation. `claude-home` and `ccpraxis-install` are derived by the module
+# from sources it already trusts, so a "rejected" one is always a LOSS, never a
+# repair. AC-72 pins this; AC-62..AC-66 (every existing rejection assertion) use
+# a reason from this set, so the gate costs the guard nothing.
+my %HOME_REJECTABLE = map { $_ => 1 } qw(
+    marketplace-install
+    marketplace-source
+    user-configured
+);
+# =====================================================================
+
 my %REASON_RANK = (
     'ccpraxis-install'    => 0,
     'claude-home'         => 1,
@@ -823,7 +853,21 @@ sub protected_roots {
         # eval the seam call exactly as CcpraxisWorkCopy::_same_path (:164-165)
         # does: that is what makes a DYING seam behave identically to one
         # returning undef (AC-51 vs AC-52) and keeps §M5's "never dies" true.
-        my $raw = eval { $realpath_fn->($c->{path}) };
+        #
+        # q04 step 7 (reviewer M2 / redteam MINOR-7): the FIRST USE of the
+        # returned value lives inside the SAME eval as the call. Wrapping only
+        # the call left `length $raw` outside it, so a seam returning an object
+        # with an overloaded `""` that dies took protected_roots down with it --
+        # violating the absolute "never dies" contract in the module header
+        # (§M5) and spec §0 C-0.2. `!ref` rejects a ref before anything can
+        # stringify it, and the explicit "$v" forces stringification where an
+        # exception is still caught. (CcpraxisWorkCopy::_same_path:164-166
+        # carries the identical original flaw; fixing it is not in this write
+        # set, so do not copy the shape back from there.) AC-75 pins this.
+        my $raw = eval {
+            my $v = $realpath_fn->($c->{path});
+            (defined $v && !ref $v && length $v) ? "$v" : undef;
+        };
         my $n   = (defined $raw && length $raw) ? _ingest_path($raw, $opts) : undef;
         if (defined $n) {
             $resolved_count++;
@@ -882,9 +926,33 @@ sub protected_roots {
         # remaining roots keep protecting normally (AC-63). The code is an
         # ERROR code and never a root `reason`, so it cannot leak into
         # `roots` (AC-47/AC-66).
-        if (defined $user_home && $user_home !~ /\A\s*\z/) {
+        # ...and ONLY for a reason in %HOME_REJECTABLE (see the comment on that
+        # hash): the right-hand operand is env-derived, so letting it remove a
+        # module-derived root turns one environment variable into an override
+        # (AC-72).
+        if ($HOME_REJECTABLE{ $c->{reason} }
+            && defined $user_home && $user_home !~ /\A\s*\z/) {
             my $rel = eval { path_relation($c->{path}, $user_home, $opts) };
-            if (defined $rel && $rel eq 'exact') {
+            # `exact` is finding 3's original case. `ancestor` -- read per
+            # path_relation's own contract at §2.4, "the FIRST argument CONTAINS
+            # the second", so here: the candidate contains the user home, i.e.
+            # it is a strict ANCESTOR of it (equivalently
+            # `path_relation($user_home, $c->{path}) eq 'descendant'`; the
+            # relation is symmetric, so one call answers both) -- is q04 step 7
+            # (redteam MAJOR-3):
+            # done-criterion 3 was only half closed, because `/home`, `/Users`
+            # and `C:/Users` are neither bare nor exactly the home, so they were
+            # adopted and refused every project on the machine. That is the same
+            # unrecoverable outage as the exact match (Decision #3 forbids an
+            # override), so it gets the same treatment and the same error code.
+            #
+            # THE ASYMMETRY IS THE POINT AND MUST NOT BE COLLAPSED: a candidate
+            # that is a DESCENDANT of the home -- `~/.claude`, the guard's single
+            # highest-value root -- is still KEPT. Only the ancestor direction is
+            # an outage; the descendant direction is the protection itself.
+            # AC-64 pins the exact-match case, AC-73 pins both halves of this
+            # widening.
+            if (defined $rel && ($rel eq 'exact' || $rel eq 'ancestor')) {
                 push @errors, { code => 'root-home-rejected', detail => "$c->{reason}: $c->{path}" };
                 next;
             }
