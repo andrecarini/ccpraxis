@@ -25,10 +25,13 @@ Four sources contribute protected roots, plus one user-editable list:
     `ccpraxis-install` root |
 | e | the user-configured extra list (see section 6 below) | `user-configured` roots |
 
-The registry file the launcher reads is pinned to `$HOME/.claude/plugins/known_marketplaces.json` —
-the same file the launcher treats as authoritative everywhere else, so this guard and the rest of
-the launcher can never disagree about what is installed. Passing `CLAUDE_CONFIG_DIR` does not change
-which registry file is read.
+The registry the launcher treats as **authoritative** is pinned to
+`$HOME/.claude/plugins/known_marketplaces.json` — the same file the launcher uses everywhere else, so
+this guard and the rest of the launcher can never disagree about what is installed. The guard
+*additionally* looks for the same relative filename under the other home candidates it trusts as
+**sources**, and unions whatever it finds. `CLAUDE_CONFIG_DIR` is deliberately **not** one of those
+candidates: passing it can add a protected root, but it cannot make the guard read a file — see "Which
+home candidates may name a source" below.
 
 **Every root is resolved, not merely normalised.** Each candidate root is put through the same
 resolution the target already gets (the launcher `abs_path`s the project path before asking), so a
@@ -42,13 +45,29 @@ two symlinks to one real directory collapse into one root instead of two.
 else used to read a different (or absent) registry and silently lose every `marketplace-install` and
 `marketplace-source` root derived from it. The registry and extra-list *source* is now a **candidate
 set**, not a single path: the guard looks for `plugins/known_marketplaces.json` and
-`ccpraxis-protected-paths.json` under **every** home candidate it knows of — `CLAUDE_CONFIG_DIR`,
-`$HOME/.claude`, `$USERPROFILE/.claude`, and the home the operating system itself reports
-(`getpwuid`, independent of the environment) — and **unions** every root it finds. An explicitly
-supplied registry path (the launcher always supplies one) is still read, and is *added to* rather
-than replaced. A redirected `HOME` can therefore only ever add roots, never remove them, and
-over-refusal is the safe direction. The `ccpraxis-install` root is additionally supplied by the
-launcher's own `abs_path(__FILE__)` anchor, which no environment variable can move.
+`ccpraxis-protected-paths.json` under every home candidate it trusts as a source and **unions** every
+root it finds. An explicitly supplied registry path (the launcher always supplies one) is still read,
+and is *added to* rather than replaced. A redirected `HOME` can therefore only ever add roots, never
+remove them, and over-refusal is the safe direction. The `ccpraxis-install` root is additionally
+supplied by the launcher's own `abs_path(__FILE__)` anchor, which no environment variable can move.
+
+**Which home candidates may name a source.** Contributing a *root* and being trusted as a *source* are
+two different levels of trust, and the guard separates them:
+
+| home candidate | may contribute a `claude-home` root | may have a registry / extra list read out of it |
+|---|---|---|
+| `$HOME/.claude` | yes | **yes** |
+| the home the OS itself reports (`getpwuid`, environment-independent) | yes | **yes** |
+| `CLAUDE_CONFIG_DIR` (a directory named verbatim by one variable) | yes | no |
+| `$USERPROFILE/.claude` | yes | no |
+
+The asymmetry is the point. A candidate that only contributes a root can, at worst, over-refuse
+*itself* — a bounded, self-inflicted cost, and the safe direction. A candidate trusted as a *source*
+contributes whatever paths its file names, which is unbounded: pointing `CLAUDE_CONFIG_DIR` at a
+directory you can write and planting a one-line JSON file used to be enough to protect `/home` and
+refuse **every project on the machine**, with no override to undo it (section 8). The same fan-out also
+resurrected a *stale* registry left behind under a former Claude home and refused a legitimate ccpraxis
+development clone — no attacker required, just a user who had moved their configuration home.
 
 *Residue, stated honestly:* the environment-independent home probe is the POSIX passwd database. It
 works on Linux, macOS **and** Git-for-Windows/MSYS2 perl (a Cygwin derivative, where the passwd
@@ -59,12 +78,20 @@ is shipped, so there the candidate set is only as wide as `CLAUDE_CONFIG_DIR`, `
 the `abs_path(__FILE__)` anchor still holds regardless. The probe is also only adopted when the
 `.claude` directory it points at actually exists, so it invents no phantom roots.
 
-**A root that normalises to your home directory is rejected.** One malformed `installLocation` that
-climbs out of its directory (say `../../..`) can land exactly on `$HOME`, which would make *every*
-project on the machine a descendant of a protected root — and since there is no override (section 8),
-that is an unrecoverable outage rather than an inconvenience. Such a root is dropped with a
-`root-home-rejected` warning. The match is **exact only, never a descendant**: `~/.claude` *is* a
-descendant of your home and remains the guard's highest-value protected root.
+**A root that swallows your home directory is rejected.** One malformed `installLocation` that climbs
+out of its directory can land exactly on `$HOME` — or on `/home`, `/Users`, `C:/Users`, which contain
+it — and either way *every* project on the machine becomes a descendant of a protected root. Since
+there is no override (section 8), that is an unrecoverable outage rather than an inconvenience. Such a
+root is dropped with a `root-home-rejected` warning. Three limits on this rejection, all deliberate:
+
+- It matches your home **exactly, or strictly contains it** — never a *descendant* of it. `~/.claude`
+  *is* a descendant of your home and remains the guard's highest-value protected root.
+- It applies only to roots that came from **content**: a registry `installLocation`, a
+  `directory`-source path, or an entry in your extra list. A root the guard derived itself
+  (`claude-home`, `ccpraxis-install`) is **never** dropped this way. The comparison uses your home as
+  read from the environment, so allowing it to delete a derived root would have made one environment
+  variable a delete button for the guard's most valuable root — an override in all but name.
+- It drops one candidate, never the whole set: every other root keeps protecting normally.
 
 The Claude home is a **union**, not a precedence chain: if `CLAUDE_CONFIG_DIR`, `$HOME/.claude` and
 `$USERPROFILE/.claude` all resolve to different paths, all three are protected. A chain would let
@@ -119,8 +146,8 @@ format.
 | code | what it means | what to do about it |
 |---|---|---|
 | `root-bare-rejected` | a source offered a bare filesystem root (`/`, `C:/`) as a protected root, which would refuse every project on the volume | find the source named in the warning — usually a malformed `installLocation` in `known_marketplaces.json`, or a `"/"` entry in your extra list — and correct it |
-| `root-home-rejected` | a source offered your **home directory itself** as a protected root, which would refuse every project you own. Rejected on exact match only, so `~/.claude` stays protected | fix the offending entry named in the warning; a relative `installLocation` with `../..` segments that climbs out of the plugins directory is the usual cause |
-| `root-unresolved` | a root **exists** but could not be resolved to its real location — typically a broken symlink, or a directory whose parent you cannot traverse. The root is **kept** and still enforced, at its literal path | repair the symlink or the permissions; until then the root is matched literally, so a target reached by a *different* path to the same directory may not be recognised |
+| `root-home-rejected` | a registry entry or extra-list entry offered your **home directory itself, or a directory containing it** (`/home`, `C:/Users`), as a protected root — which would refuse every project you own. Only content-derived roots are rejected this way, and never a *descendant*, so `~/.claude` stays protected | fix the offending entry named in the warning; an `installLocation` with `../..` segments that climbs out of the plugins directory is the usual cause |
+| `root-unresolved` | a root could not be resolved to a real location — in practice a **dangling symlink**: the link is there, what it points at is not. The root is **kept** and still enforced, at its literal path | repoint or remove the symlink; until then the root is matched literally, so a target reached by a *different* path to the same directory may not be recognised |
 
 A path that simply **does not exist** is not reported as `root-unresolved` — see section 6.
 
@@ -164,19 +191,28 @@ broken source did not exist. Conversely, a broken source **alone is never fatal*
 normally for an ordinary project; it just loses the `marketplace-*` and `ccpraxis-install` roots that
 source would have contributed, and says so loudly.
 
-**When a root cannot be resolved.** Resolution (section 2) can fail for an individual root — a broken
-symlink, a parent directory you cannot traverse. When it does, the guard **degrades to the root's
-literal path and warns** (`root-unresolved`), and the root stays in the protected set and stays
-enforced. It is never dropped: dropping it would *shrink* the protected set, which is the one
-direction this guard is not allowed to fail in. The only thing lost is the ability to recognise that
-root under a *different* spelling of the same directory.
+**When a root cannot be resolved.** Resolution (section 2) can fail for an individual root. When it
+does, the guard **degrades to the root's literal path and warns** (`root-unresolved`), and the root
+stays in the protected set and stays enforced. It is never dropped: dropping it would *shrink* the
+protected set, which is the one direction this guard is not allowed to fail in. The only thing lost is
+the ability to recognise that root under a *different* spelling of the same directory.
+
+**The case this actually reports is a dangling symlink** — the root is a symlink and its target is
+gone. That is the failure you can act on (repoint the link), and it is worth telling you about, because
+a dangling `~/.claude` means the root is being enforced at a path that does not exist. If you use
+`stow`, `chezmoi` or `yadm` and have moved your dotfiles, this is the warning you will see. A symlink
+that resolves normally is not reported at all: it simply resolves, which is the whole point of
+section 2.
 
 **A path that does not exist is not an unresolvable path.** Protected roots routinely name
 directories that are simply absent — a marketplace you uninstalled, an extra-list entry for a
 checkout you have not made yet. Those are kept silently, with **no** warning: there is nothing to
-resolve, nothing is broken, and warning about them would nag on every otherwise-clean launch.
-`root-unresolved` is reserved for a path that *is* there and still could not be resolved, which is
-the case you can actually act on.
+resolve, nothing is broken, and warning about them would nag on every otherwise-clean launch. An
+absent path that is not a symlink is therefore never a `root-unresolved`.
+
+*One residue, stated honestly:* a path that runs *through* a dangling symlink (`~/.claude/plugins`
+where `~/.claude` is the dangling link) is treated as merely absent and stays silent — it is not itself
+a symlink. The link at the top of the chain is what gets reported.
 
 ## 7. Using the extra list
 

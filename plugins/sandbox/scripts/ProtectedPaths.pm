@@ -625,9 +625,24 @@ sub protected_roots {
         # source-eligible: they come from the OS's own record (or from a caller
         # that injected the seam deliberately), not from an environment
         # variable an attacker can point anywhere.
+        # q04 step 7 (reviewer m2) -- the DEFAULT probe list is built only when
+        # the caller injected NO `exists` seam. An injected existence oracle
+        # means "do not talk to the ambient host": t/51 guarantees no test
+        # touches the real filesystem (`t/51:11-15`), yet the default passwd
+        # probe made every call there consult the real passwd database, so
+        # fixtures arming `exists => sub { 1 }` adopted a root derived from the
+        # HOST's `/root/.claude` and the suite's results became host-dependent.
+        # This is not a new coupling -- the probe's existence gate already routed
+        # through the seam, so a caller injecting `exists => sub { 0 }` already
+        # disabled it; the gate just makes that explicit one level up, and lets
+        # the probe use the REAL `-e` in the branch that is genuinely ambient.
+        # Production is unaffected: launcher.pl:553-559 injects `env` only, never
+        # `exists`, so finding 2's passwd probe still runs there. A future caller
+        # that injects `exists` AND wants ambient probing must pass `home_probes`
+        # itself -- which is the seam for exactly that.
         my @probes = (defined $opts->{home_probes} && ref $opts->{home_probes} eq 'CODE')
             ? ($opts->{home_probes})
-            : (_default_home_probes($exists_fn));
+            : (exists $opts->{exists} ? () : _default_home_probes($exists_fn));
         for my $probe (@probes) {
             my @got = eval { $probe->() };
             @got = () if $@;
