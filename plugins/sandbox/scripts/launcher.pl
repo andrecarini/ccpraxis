@@ -49,6 +49,7 @@ use CcpraxisWorkCopy qw(workcopy_route workcopy_refusal_outcome);
 use LaunchLog ();   # B1: durable per-launch diagnostic log (next to us in scripts/)
 use Dashboard ();   # B2: the raw-ANSI TUI dashboard framework
 use TokenInfo ();   # s08: pure access/refresh token status struct for the dashboard
+use Resources ();   # s09: pure resource-probe parsers + the injectable probe seam
 use BackpackApproval ();  # #21: per-item, machine-local backpack approval memory
 use BackpackReview ();    # #21: the I/O-seam-injected interactive approval walk
 use KeepAwake ();         # B5: dashboard wake-lock decision + lifecycle holder
@@ -2820,7 +2821,9 @@ sub enter_dashboard {
     my $cached_backpack         = undef;   # B4: backpack items + per-item approval
     my $cached_oauth_expires_at = undef;   # 01-oauth: epoch-s when the OAuth token expires
     my $cached_tokens           = undef;   # s08: TokenInfo struct
+    my $cached_resources        = undef;   # s09: Resources::build struct (never undef after the first round)
     my $last_inspect            = 0;
+    my $last_resources          = 0;       # s09: stamp for the throttled probe cadence
     my $bp_host_file      = "$CLAUDE_DATA/backpack.json";
     my $bp_appr_file      = "$LAUNCHER_DIR/backpack-approvals.json";
 
@@ -2921,6 +2924,15 @@ sub enter_dashboard {
                 $cached_tokens = _gather_tokens();
                 $last_inspect  = $now;
             }
+            # s09: the expensive resource probes run on their OWN, slower
+            # cadence with their OWN stamp — deliberately NOT nested in the
+            # 10s inspect above, so a slow probe can never delay the inspect
+            # or the 0.2s render, and the two rounds rarely land in the same
+            # frame (23 is coprime with 10).
+            if (Resources::should_sample($last_resources, $now, Resources::interval())) {
+                $cached_resources = _gather_resources();
+                $last_resources   = $now;
+            }
             # Advance the skew-free baseline by host-measured elapsed since the
             # last measurement (elapsed rate matches on both clocks; only the
             # absolute offset differed, and that's gone now).
@@ -2941,6 +2953,7 @@ sub enter_dashboard {
                 backpack         => $cached_backpack,
                 oauth_expires_at => $cached_oauth_expires_at,
                 tokens           => $cached_tokens,
+                resources        => $cached_resources,
             };
         },
         keepawake => sub {
@@ -3159,6 +3172,73 @@ sub _gather_tokens {
               ? eval { JSON::PP->new->decode($raw) } : undef;
     my $mtime = (stat($SANDBOX_CREDENTIALS_FILE))[9];
     return TokenInfo::status($data, $mtime, time);
+}
+
+# _powershell_json($cmd) -> raw stdout BYTES (BOM included; Resources::_decode
+# strips it), or undef off Windows. s09's one host-probe transport.
+#
+# -NoProfile: a profile load is slow and can print noise onto the alt-screen.
+# -NonInteractive: a credential/confirmation prompt would otherwise hang the
+# dashboard FOREVER — this is real hang prevention, not cosmetics.
+# stderr goes to 2>/dev/null, never to a Windows device name (a `> N-U-L`
+# redirect from bash creates a literal file Explorer cannot delete).
+# MSYS2_ARG_CONV_EXCL is set locally, mirroring the precedent above.
+#
+# $cmd is ALWAYS one of the three literal constants in _resources_probes: no
+# project path, container name, user string or probe output is ever
+# interpolated into it, so there is no injection surface here.
+sub _powershell_json {
+    my ($cmd) = @_;
+    return undef unless $WINDOWS_FAMILY;
+    local $ENV{MSYS2_ARG_CONV_EXCL} = '*';
+    return scalar `powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$cmd" 2>/dev/null`;
+}
+
+# _resources_probes() -> { key => coderef }, the real I/O half of the s09
+# probe round. Resources::gather invokes these under eval with an elapsed
+# budget; nothing here parses anything.
+#
+# The machine + host probes are Windows-only: `podman machine` is meaningless
+# on Linux and there is no host shell to query, so those keys are simply
+# absent, gather never invokes them, and those fields degrade to n/a — which
+# is exactly how the panel renders inside the Linux container itself.
+#
+# -OperationTimeoutSec 3 is the one REAL wall-clock cap in this package (it
+# covers the three host probes only; podman's CLI offers no timeout flag for
+# stats / system df / machine list, and a blocking backtick is not portably
+# interruptible — the throttle and the elapsed budget bound the blast radius).
+# -Filter uses single quotes inside the double-quoted -Command so no nested
+# double-quote escaping is needed.
+sub _resources_probes {
+    my %p = (
+        stats => sub { scalar `$PODMAN stats --no-stream --format json 2>/dev/null` },
+        df    => sub { scalar `$PODMAN system df --format json 2>/dev/null` },
+    );
+    return \%p unless $WINDOWS_FAMILY;
+    $p{machine}  = sub { scalar `$PODMAN machine list --format json 2>/dev/null` };
+    $p{cim_mem}  = sub { _powershell_json("Get-CimInstance Win32_OperatingSystem -OperationTimeoutSec 3 | Select-Object FreePhysicalMemory,TotalVisibleMemorySize | ConvertTo-Json -Compress") };
+    $p{cim_cpu}  = sub { _powershell_json("Get-CimInstance Win32_Processor -OperationTimeoutSec 3 | Select-Object LoadPercentage,NumberOfLogicalProcessors | ConvertTo-Json -Compress") };
+    $p{cim_disk} = sub { _powershell_json("Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' -OperationTimeoutSec 3 | Select-Object DeviceID,FreeSpace,Size | ConvertTo-Json -Compress") };
+    return \%p;
+}
+
+# _gather_resources() -> the 15-key resource struct for the dashboard panel.
+# The thin wrapper that owns everything impure: the real probe coderefs, the
+# container/drive selectors, and the clock (time() is called HERE, never
+# inside Resources.pm). The drive is derived from the project path and
+# defaults to C: — not a fabrication, because the panel prints the device it
+# measured.
+sub _gather_resources {
+    my $dev;
+    if ($WINDOWS_FAMILY) {
+        $dev = ($PROJECT_PATH =~ m{^([A-Za-z]):}) ? uc($1) . ':' : 'C:';
+    }
+    return Resources::gather(_resources_probes(), {
+        container => $CONTAINER_NAME,
+        device    => $dev,
+        budget    => 4,
+        now       => sub { time },
+    });
 }
 
 # _tail_lines — last $n chomped lines of a file (the B1 launch log), or ().

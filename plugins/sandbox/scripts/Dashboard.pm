@@ -597,6 +597,70 @@ sub oauth_role {
     return 'good';
 }
 
+# ---------------------------------------------------------------------------
+# s09-resources-panel: the pressure classifier, the gauge and the byte
+# formatter. They live HERE, not in Resources.pm, because they emit render
+# vocabulary (role names, glyphs) -- the same family as oauth_role /
+# container_status_style / fmt_age / fmt_oauth above. Keeping them here is
+# what lets Resources.pm stay free of every render concept and Dashboard.pm
+# stay free of any knowledge of Resources.pm (spec S2.5, I4).
+# All three are PUBLIC, pure, total: never die, never warn, on any input.
+# ---------------------------------------------------------------------------
+my $PRESSURE_WARN = 0.75;   # ratio at/above which a resource reads 'warn'
+my $PRESSURE_BAD  = 0.90;   # ratio at/above which a resource reads 'bad'
+my $GAUGE_FULL    = Encode::encode('UTF-8', "\x{2588}");   # already allow-listed
+my $GAUGE_LIGHT   = Encode::encode('UTF-8', "\x{2591}");   # (glyph_table :240-241)
+my $GAUGE_CELLS   = 10;
+
+# pressure_role($used, $total) -> 'good' | 'warn' | 'bad' | 'muted'. An
+# undeterminable ratio (no total, a total <= 0, a negative/non-numeric used)
+# is 'muted', never a fabricated 0%. Boundaries are inclusive on the upper
+# tier: exactly 0.75 is 'warn', exactly 0.90 is 'bad'. Every returned name is
+# already styled by sgr_for_role -- this package introduces no new role.
+sub pressure_role {
+    my ($used, $total) = @_;
+    return 'muted' if !defined $total || ref $total || $total !~ /^-?\d+(?:\.\d+)?$/ || $total <= 0;
+    return 'muted' if !defined $used  || ref $used  || $used  !~ /^-?\d+(?:\.\d+)?$/ || $used < 0;
+    my $r = $used / $total;
+    return 'good' if $r < $PRESSURE_WARN;
+    return 'warn' if $r < $PRESSURE_BAD;
+    return 'bad';
+}
+
+# gauge($used, $total, $cells) -> a UTF-8 BYTE string of $cells glyphs (full
+# block for the filled part, light shade for the rest). $cells defaults to 10
+# and is truncated with int(); an undeterminable ratio renders an all-empty
+# gauge, so the display width is ALWAYS exactly $cells whatever the input.
+# Both glyphs are already in %GLYPH_TABLE at width 1: this package adds none.
+sub gauge {
+    my ($used, $total, $cells) = @_;
+    my $c = (defined $cells && !ref $cells && $cells =~ /^-?\d+(?:\.\d+)?$/ && $cells >= 1)
+          ? int($cells) : $GAUGE_CELLS;
+    return $GAUGE_LIGHT x $c if pressure_role($used, $total) eq 'muted';
+    my $r = $used / $total;
+    $r = 0 if $r < 0;
+    $r = 1 if $r > 1;
+    my $filled = int($r * $c + 0.5);
+    $filled = 0  if $filled < 0;
+    $filled = $c if $filled > $c;
+    return ($GAUGE_FULL x $filled) . ($GAUGE_LIGHT x ($c - $filled));
+}
+
+# fmt_bytes($n) -> 'n/a' | '<N> B' | '<N.N> kB|MB|GB|TB'. DECIMAL units
+# (1000), end to end: podman is the source of half the numbers and emits
+# decimal (go-units), so parse -> format round-trips and every number can be
+# diffed verbatim against `podman stats` / `podman system df`. Plain bytes
+# carry no decimals. ASCII-only, so length() == display width.
+sub fmt_bytes {
+    my ($n) = @_;
+    return 'n/a' if !defined $n || ref $n || $n !~ /^-?\d+(?:\.\d+)?$/ || $n < 0;
+    return sprintf('%d B', $n) if $n < 1000;
+    for my $u ([ 1e12, 'TB' ], [ 1e9, 'GB' ], [ 1e6, 'MB' ], [ 1e3, 'kB' ]) {
+        return sprintf('%.1f %s', $n / $u->[0], $u->[1]) if $n >= $u->[0];
+    }
+    return sprintf('%d B', $n);
+}
+
 # event_style($type, $exit, $state) -> ($role, $glyph) -- spec S2.3, the
 # activity classifier. $type/$exit/$state are already-scalarized values
 # (_ev_scalar); evaluated top to bottom, first match wins. The default is
@@ -752,6 +816,15 @@ sub _fixed_panels {
     if (ref $s->{tokens} eq 'HASH') {
         push @p, { title => 'Token', lines => [ _token_lines($s->{tokens}) ] };
     }
+
+    # s09: podman machine + container + host resources. Present only when the
+    # launcher gathered a Resources struct (I3: that struct is never undef, so
+    # the guard here only protects callers that never supply the key at all).
+    # Appended LAST on purpose: _body_rows pulls only positions 0/1 (always
+    # Sandbox and Run) into the two-column region, so this stacks full-width.
+    if (ref $s->{resources} eq 'HASH') {
+        push @p, { title => 'Resources', lines => [ _resources_lines($s->{resources}) ] };
+    }
     return @p;
 }
 
@@ -883,6 +956,101 @@ sub _token_lines {
         push @lines, [ { text => sprintf('%-11s : ', 'account'), role => 'label' },
                        { text => join(' / ', @present), role => 'value' } ];
     }
+
+    return @lines;
+}
+
+# _resources_lines(\%res) -> LIST of body lines for the s09 Resources panel.
+# The 15-key resource struct the launcher built (machine_*, ctr_*, vm_*,
+# pod_*, host_* -- source-labelled, closed key set),
+# passed through the gather hash with no arithmetic -- every derivation
+# already happened in the launcher. PRIVATE, pure, mirrors _token_lines'
+# style. A non-hashref $res -> the empty list (never dies).
+#
+# ALWAYS exactly 7 lines, whatever the input: an unknown fact renders 'n/a',
+# never a fabricated number and never a vanished row. host_* and vm_*/ctr_*
+# facts are labelled by source and never conflated.
+sub _resources_lines {
+    my ($r) = @_;
+    return () unless ref $r eq 'HASH';
+
+    my @lines;
+    my $label = sub { return { text => sprintf('%-11s : ', $_[0]), role => 'label' }; };
+    my $na    = sub { return { text => 'n/a', role => 'muted' }; };
+
+    # A used/total row: the three numbers (used | free | total) plus a gauge,
+    # both carrying the pressure role. Emitted only when both values are
+    # present; otherwise the single n/a span and NO gauge (never a 0% bar for
+    # a fact we don't have).
+    my $gauge_row = sub {
+        my ($used, $total) = @_;
+        return ($na->()) unless defined $used && defined $total;
+        my $role  = pressure_role($used, $total);
+        my $avail = (!ref $used && !ref $total
+                     && $used  =~ /^-?\d+(?:\.\d+)?$/
+                     && $total =~ /^-?\d+(?:\.\d+)?$/) ? $total - $used : undef;
+        $avail = 0 if defined $avail && $avail < 0;
+        return ( { text => sprintf('%s used | %s free | %s total',
+                                   fmt_bytes($used), fmt_bytes($avail), fmt_bytes($total)),
+                   role => $role },
+                 { text => '  ', role => 'body' },
+                 { text => gauge($used, $total), role => $role } );
+    };
+
+    # 1. machine — the podman VM's lifecycle state, plus its name when known.
+    my %mstate = (running => 'good', starting => 'warn', stopped => 'bad');
+    my $ms = $r->{machine_state};
+    my @m = (defined $ms && !ref $ms && $mstate{$ms})
+          ? ( { text => $ms, role => $mstate{$ms} } ) : ( $na->() );
+    push @m, { text => " ($r->{machine_name})", role => 'muted' }
+        if defined $r->{machine_name} && !ref $r->{machine_name} && length $r->{machine_name};
+    push @lines, [ $label->('machine'), @m ];
+
+    # 2. ctr mem — THIS container against the VM's cgroup limit (the real
+    # limit, not the cosmetic configured one).
+    push @lines, [ $label->('ctr mem'), $gauge_row->($r->{ctr_mem_used}, $r->{vm_mem_total}) ];
+
+    # 3. ctr cpu — no gauge: a container's CPU% is not bounded by 100 on a
+    # multi-core host, so a 0-100 bar would misrepresent it.
+    my $cpct = $r->{ctr_cpu_pct};
+    push @lines, [ $label->('ctr cpu'),
+                   (defined $cpct && !ref $cpct && $cpct =~ /^-?\d+(?:\.\d+)?$/)
+                     ? { text => sprintf('%.1f%%', $cpct), role => 'value' } : $na->() ];
+
+    # 4. podman — the image/container/volume store on disk. Each component
+    # degrades independently; only an all-unknown row collapses to n/a.
+    my ($pi, $pc, $pv) = ($r->{pod_images}, $r->{pod_containers}, $r->{pod_volumes});
+    push @lines, [ $label->('podman'),
+                   (defined $pi || defined $pc || defined $pv)
+                     ? { text => sprintf('images %s | containers %s | volumes %s',
+                                         fmt_bytes($pi), fmt_bytes($pc), fmt_bytes($pv)),
+                         role => 'value' }
+                     : $na->() ];
+
+    # 5. host ram — the Windows host, never summed with the VM's numbers.
+    push @lines, [ $label->('host ram'), $gauge_row->($r->{host_ram_used}, $r->{host_ram_total}) ];
+
+    # 6. host disk — the drive suffix is printed in BOTH branches: the panel
+    # always names the device it measured (or would have measured).
+    my @d = $gauge_row->($r->{host_disk_used}, $r->{host_disk_total});
+    push @d, { text => " ($r->{host_disk_dev})", role => 'muted' }
+        if defined $r->{host_disk_dev} && !ref $r->{host_disk_dev} && length $r->{host_disk_dev};
+    push @lines, [ $label->('host disk'), @d ];
+
+    # 7. host cpu — bounded by 100 by definition, so this one does get a gauge.
+    my $hpct = $r->{host_cpu_pct};
+    my @c;
+    if (defined $hpct && !ref $hpct && $hpct =~ /^-?\d+(?:\.\d+)?$/) {
+        my $role = pressure_role($hpct, 100);
+        @c = ( { text => sprintf('%.1f%%', $hpct), role => $role },
+               { text => '  ', role => 'body' },
+               { text => gauge($hpct, 100), role => $role } );
+    } else {
+        @c = ( $na->() );
+    }
+    push @c, { text => sprintf(' (%d cores)', $r->{host_cores}), role => 'muted' }
+        if defined $r->{host_cores} && !ref $r->{host_cores} && $r->{host_cores} =~ /^\d+$/;
+    push @lines, [ $label->('host cpu'), @c ];
 
     return @lines;
 }
