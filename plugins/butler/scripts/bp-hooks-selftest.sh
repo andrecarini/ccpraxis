@@ -54,13 +54,16 @@ verdict_from_oracle() {
 }
 
 # settings_json HOOKS_DIR -> a --settings JSON blob registering butler's REAL hooks
+# (gate-shutdown.sh, guard-writes.sh, ledger-guard.sh on writes; gate-shutdown.sh,
+# track-dispatch.sh on Task)
 settings_json() {
   local h="$1"
   cat <<JSON
 {"hooks":{"PreToolUse":[
   {"matcher":"Edit|Write|MultiEdit|NotebookEdit","hooks":[
     {"type":"command","command":"bash \"$h/gate-shutdown.sh\"","timeout":15},
-    {"type":"command","command":"bash \"$h/guard-writes.sh\"","timeout":15}]},
+    {"type":"command","command":"bash \"$h/guard-writes.sh\"","timeout":15},
+    {"type":"command","command":"bash \"$h/ledger-guard.sh\"","timeout":15}]},
   {"matcher":"Task","hooks":[
     {"type":"command","command":"bash \"$h/gate-shutdown.sh\"","timeout":15},
     {"type":"command","command":"bash \"$h/track-dispatch.sh\"","timeout":15}]}
