@@ -2964,6 +2964,11 @@ sub enter_dashboard {
                 tokens           => $cached_tokens,
                 resources        => $cached_resources,
                 runs             => $cached_runs,
+                # s11-lifecycle-stop spec 08 S2.8: one notch wider than the
+                # Windows-only guard at _resources_probes (:3268-3271), so a
+                # macOS podman machine is covered too; Linux-native podman has
+                # no machine and must not get the stop-machine stage.
+                machine_capable  => ($PODMAN =~ /podman/i && $^O ne 'linux') ? 1 : 0,
             };
         },
         keepawake => sub {

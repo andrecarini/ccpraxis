@@ -952,8 +952,19 @@ sub drive2 {
         my $f3 = Dashboard::compose_frame(\%st2, $rows, $cols);
         my @alerts = grep { $_->{role} eq 'alert' } @$f3;
         is(scalar(@alerts), 2, "AC-20: lifecycle + status alerts coexist as two rows at cols=$cols");
-        like($alerts[0]{text}, qr/stop container - running/,
+        # Ordering is asserted with a WIDTH-SAFE discriminator. The pinned message
+        # (spec S2.6) is "full shutdown 3/4: stop container - running" = 42 cols, and
+        # _alert_line prefixes "  !! " (5) for 47 -- so at cols=40 clip_pad MUST
+        # truncate it to "  !! full shutdown 3/4: stop container -". Matching the
+        # "- running" tail there would contradict the render invariant asserted 20
+        # lines up (every cell exactly $cols, which passes). "full shutdown 3/4"
+        # fits at every width and still discriminates the lifecycle banner from the
+        # status alert ("container is exited ..."), which is what this AC is about.
+        like($alerts[0]{text}, qr{full shutdown 3/4},
             "AC-20: the lifecycle alert is the FIRST alert row (before the status alert) at cols=$cols") if @alerts;
+        # The full pinned detail is still asserted wherever it actually fits.
+        like($alerts[0]{text}, qr/stop container - running/,
+            "AC-20: the lifecycle alert carries the full pinned detail at cols=$cols") if @alerts && $cols >= 80;
     }
 }
 
