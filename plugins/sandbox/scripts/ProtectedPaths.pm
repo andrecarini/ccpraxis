@@ -58,9 +58,27 @@ sub _probe_windows {
 sub normalize_path {
     my ($p) = @_;
 
+    # Step 0 -- refs are never a path (mirrors _ingest_path's guard so the
+    # two choke points can't silently diverge; a caller bug that hands us a
+    # hash/array ref must fail loudly, not stringify to a memory address).
+    return undef if ref $p;
+
     # Step 1.
     return undef unless defined $p && length $p;
     return undef if $p =~ /\A\s*\z/;
+
+    # Step 1.5 -- Windows extended-length / device-path prefix (\\?\,
+    # \\?\UNC\). This must run on the raw (still-backslash) string, since
+    # canon_path's unconditional backslash->slash rewrite below would
+    # otherwise mangle it into a bogus POSIX-absolute path that loses the
+    # drive letter entirely (redteam M4). Not gated on Windows-family: the
+    # prefix syntax itself is unambiguous device-path notation on any
+    # platform.
+    if ($p =~ s{\A\\\\\?\\UNC\\}{\\\\}i) {
+        # \\?\UNC\server\share -> \\server\share
+    } elsif ($p =~ s{\A\\\\\?\\}{}i) {
+        # \\?\C:\... -> C:\...
+    }
 
     # Step 2 -- all-slash pre-guard (canon_path('//') would otherwise
     # degrade a root to the empty string; see spec §2.1 step 2).
@@ -89,6 +107,18 @@ sub normalize_path {
 
     # Step 6.
     my @segments = grep { length($_) && $_ ne '.' } split m{/}, $c;
+
+    # Step 6.5 -- Windows silently strips trailing dots/spaces from path
+    # components (a well-known Win32 filesystem quirk), so "foo." and
+    # "foo " alias "foo" there. Gated on the Windows-family probe: on
+    # Linux/POSIX, "foo." and "foo " are legitimately distinct directory
+    # names and must stay distinct (redteam M4). `..` is exempted so the
+    # parent-directory marker itself is never touched.
+    if (_windows_family()) {
+        @segments = grep { length $_ }
+                    map  { $_ eq '..' ? $_ : do { (my $s = $_) =~ s/[. ]+\z//; $s } }
+                    @segments;
+    }
 
     # Step 7 -- resolve `..` against a stack.
     my @stack;
@@ -139,13 +169,28 @@ sub _is_bare_root {
 
 # =====================================================================
 # §2.2 -- path_relation($target, $root, \%opts) -> exact|descendant|ancestor|unrelated
+#
+# DIRECTION CONTRACT (read this twice, per spec §2.2): the relation is
+# read as "$target is a ___ of $root". So 'descendant' means the FIRST
+# argument ($target) is inside the SECOND ($root); 'ancestor' means the
+# first argument CONTAINS the second. Getting this backwards silently
+# inverts every containment check downstream -- this is the trap q03 is
+# most likely to hit when wiring the launcher refusal.
 # =====================================================================
 sub path_relation {
     my ($target, $root, $opts) = @_;
     $opts //= {};
 
-    my $t = normalize_path($target);
-    my $r = normalize_path($root);
+    # Route both sides through the same UTF-8-encode choke point as every
+    # other externally-sourced path (§2.5.8's _ingest_path), not the bare
+    # normalize_path. Without this, a wide-character target compared
+    # against a byte-encoded root fails OPEN ('unrelated') instead of
+    # matching -- the measured CcpraxisWorkCopy.pm André bug class
+    # (redteam M1). _ingest_path is a strict superset of normalize_path
+    # (same algorithm, plus the ref-guard and the encode), so this is
+    # never a narrowing for callers who were already passing plain bytes.
+    my $t = _ingest_path($target);
+    my $r = _ingest_path($root);
     return 'unrelated' unless defined $t && defined $r;
 
     my ($tprefix, $tabs, @tsegs) = _decompose($t);
@@ -178,6 +223,14 @@ sub path_relation {
 sub _ingest_path {
     my ($raw) = @_;
     return undef unless defined $raw && !ref $raw;
+    # A control byte (including NUL) inside a segment is never a legitimate
+    # path component on any supported platform, and is legal inside a JSON
+    # string -- left unchecked it lets two genuinely different paths
+    # collide on the same _fold_key (redteam C1: "home/u\0.claude" vs.
+    # "home/u/.claude"), silently evicting the higher-ranked one from
+    # `roots` with no error. Reject it here so it takes the existing loud
+    # registry-entry/extra-list-entry error branch instead.
+    return undef if $raw =~ /[\x00-\x1f]/;
     utf8::encode($raw) if utf8::is_utf8($raw);
     return normalize_path($raw);
 }
@@ -216,11 +269,14 @@ sub target_self_codes {
 
     my @codes;
 
-    my $n = normalize_path($target);
-    if (defined $n) {
-        my ($prefix, $absolute, @segs) = _decompose($n);
-        push @codes, 'drive-root' if $absolute && !@segs;
-    }
+    # _ingest_path, not the bare normalize_path -- same encode/ref-guard
+    # choke point as every other externally-sourced path (redteam M1); a
+    # bare normalize_path call here would fail open on a wide-character
+    # target the way path_relation used to. _is_bare_root is the single
+    # helper shared with the root-side guard in protected_roots so the two
+    # "is this a bare root" checks can never silently diverge (reviewer N2).
+    my $n = _ingest_path($target);
+    push @codes, 'drive-root' if _is_bare_root($n);
 
     my $home = _user_home($opts);
     if (defined $home) {
@@ -307,6 +363,21 @@ sub protected_roots {
     };
 
     # ---- §2.5.2 step 1: claude home -------------------------------------
+    # DELIBERATE DEVIATION FROM SPEC §2.5.1, approved by the coordinator
+    # (redteam M3): the spec prose describes this as a precedence chain --
+    # "$CLAUDE_CONFIG_DIR if set, else ~/.claude" -- but Appendix B
+    # Decision #3 is absolute: "No override. No escape hatch. No env var,
+    # no flag." A precedence chain lets `CLAUDE_CONFIG_DIR=/tmp/decoy`
+    # *remove* the real `~/.claude` from `roots` entirely with a clean
+    # `errors: []`, defeating the refusal it exists to guarantee. So the
+    # candidate set below is a UNION, not a chain: every one of
+    # CLAUDE_CONFIG_DIR, $HOME/.claude and $USERPROFILE/.claude that
+    # resolves contributes its own `claude-home` candidate. Existing
+    # de-duplication (§2.5.8) absorbs the usual overlap when they agree;
+    # the residue when they disagree is over-refusal, the safe direction
+    # per Decision #6. `$home_raw` itself stays a single, precedence-
+    # ordered value -- it is only used below to derive the *default*
+    # registry/extra-list paths, which §2.5.1 is unmodified for.
     my $home_raw;   # unnormalised, used for the default registry/extra paths
     {
         my $cfg = eval { $env_fn->('CLAUDE_CONFIG_DIR') };
@@ -316,6 +387,11 @@ sub protected_roots {
         my $userprofile = eval { $env_fn->('USERPROFILE') };
         $userprofile = undef if $@;
 
+        my @home_candidates;
+        push @home_candidates, $cfg                  if defined $cfg         && $cfg         !~ /\A\s*\z/;
+        push @home_candidates, "$home_env/.claude"    if defined $home_env    && $home_env    !~ /\A\s*\z/;
+        push @home_candidates, "$userprofile/.claude" if defined $userprofile && $userprofile !~ /\A\s*\z/;
+
         if (defined $cfg && $cfg !~ /\A\s*\z/) {
             $home_raw = $cfg;
         } elsif (defined $home_env && $home_env !~ /\A\s*\z/) {
@@ -324,9 +400,11 @@ sub protected_roots {
             $home_raw = "$userprofile/.claude";
         }
 
-        if (defined $home_raw) {
-            my $n = _ingest_path($home_raw);
-            push @candidates, { path => $n, reason => 'claude-home' } if defined $n;
+        if (@home_candidates) {
+            for my $hc (@home_candidates) {
+                my $n = _ingest_path($hc);
+                push @candidates, { path => $n, reason => 'claude-home' } if defined $n;
+            }
         } else {
             push @errors, { code => 'claude-home-unresolved',
                              detail => 'none of CLAUDE_CONFIG_DIR, HOME, USERPROFILE yielded a usable value' };
@@ -335,7 +413,7 @@ sub protected_roots {
 
     # ---- §2.5.2 step 2/3: registry acquisition + entries -----------------
     my $registry_default = defined $home_raw ? "$home_raw/plugins/known_marketplaces.json" : undef;
-    my ($reg_raw, undef) = _acquire_json_source(
+    my ($reg_raw, $reg_attempted) = _acquire_json_source(
         opts             => $opts,
         data_key         => 'registry',
         path_key         => 'registry_path',
@@ -350,44 +428,68 @@ sub protected_roots {
         code_unparseable => 'registry-unparseable',
     );
 
+    # Gate the shape check on "was a source actually attempted" (the second
+    # return value above), not on `defined $reg_raw`. An explicitly-supplied
+    # `registry => undef`, or a registry file that decodes to JSON `null`,
+    # is "supplied but broken" per §2.4/§2.5.5 -- it must raise
+    # registry-shape, not silently vanish as "no registry" (reviewer M1).
     my $reg;
-    if (defined $reg_raw) {
-        if (ref $reg_raw eq 'HASH') {
-            $reg = $reg_raw;
-        } else {
-            push @errors, { code => 'registry-shape', detail => 'registry is not a JSON object' };
-        }
+    if (ref $reg_raw eq 'HASH') {
+        $reg = $reg_raw;
+    } elsif ($reg_attempted) {
+        push @errors, { code => 'registry-shape', detail => 'registry is not a JSON object' };
     }
 
     if (defined $reg) {
-        for my $name (sort keys %$reg) {
-            my $entry = $reg->{$name};
-            if (ref $entry ne 'HASH') {
-                push @errors, { code => 'registry-entry', detail => "entry '$name' is not an object" };
-                next;
-            }
-
-            my $il_n = _ingest_path($entry->{installLocation});
-            if (defined $il_n) {
-                push @candidates, { path => $il_n, reason => 'marketplace-install' };
-            } else {
-                push @errors, { code => 'registry-entry', detail => "entry '$name' installLocation is invalid" };
-            }
-
-            my $src = $entry->{source};
-            if (ref $src eq 'HASH') {
-                if (($src->{source} // '') eq 'directory') {
-                    my $sp_n = _ingest_path($src->{path});
-                    if (defined $sp_n) {
-                        push @candidates, { path => $sp_n, reason => 'marketplace-source' };
+        # Never dies (module header §M5): a hostile registry can be a tied
+        # or otherwise poisoned hash whose FETCH/keys enumeration dies
+        # mid-walk. Wrap the whole per-entry body (including the key
+        # enumeration itself) so one hostile entry raises a loud
+        # registry-entry error and leaves every other entry -- and every
+        # other root source -- intact, rather than propagating a die up
+        # through protected_roots (redteam m1).
+        my @names = eval { sort keys %$reg };
+        if ($@) {
+            push @errors, { code => 'registry-entry', detail => 'registry could not be enumerated' };
+            @names = ();
+        }
+        for my $name (@names) {
+            # NB: a `return` inside a block eval returns from the enclosing
+            # named sub, not just the eval -- so this is deliberately
+            # written as nested if/else falling through to a trailing `1`
+            # rather than early-returning, to avoid silently truncating
+            # protected_roots itself on the happy path.
+            my $ok = eval {
+                my $entry = $reg->{$name};
+                if (ref $entry ne 'HASH') {
+                    push @errors, { code => 'registry-entry', detail => "entry '$name' is not an object" };
+                } else {
+                    my $il_n = _ingest_path($entry->{installLocation});
+                    if (defined $il_n) {
+                        push @candidates, { path => $il_n, reason => 'marketplace-install' };
                     } else {
-                        push @errors, { code => 'registry-entry', detail => "entry '$name' source.path is invalid" };
+                        push @errors, { code => 'registry-entry', detail => "entry '$name' installLocation is invalid" };
+                    }
+
+                    my $src = $entry->{source};
+                    if (ref $src eq 'HASH') {
+                        if (($src->{source} // '') eq 'directory') {
+                            my $sp_n = _ingest_path($src->{path});
+                            if (defined $sp_n) {
+                                push @candidates, { path => $sp_n, reason => 'marketplace-source' };
+                            } else {
+                                push @errors, { code => 'registry-entry', detail => "entry '$name' source.path is invalid" };
+                            }
+                        }
+                        # source.source ne 'directory' (e.g. github) is not an error.
+                    } else {
+                        push @errors, { code => 'registry-entry', detail => "entry '$name' source is invalid" };
                     }
                 }
-                # source.source ne 'directory' (e.g. github) is not an error.
-            } else {
-                push @errors, { code => 'registry-entry', detail => "entry '$name' source is invalid" };
-            }
+                1;
+            };
+            push @errors, { code => 'registry-entry', detail => "entry '$name' could not be read" }
+                unless $ok;
         }
     }
 
@@ -408,7 +510,7 @@ sub protected_roots {
 
     # ---- §2.5.2 step 5: extra list (Decision #5) --------------------------
     my $extra_default = defined $home_raw ? "$home_raw/ccpraxis-protected-paths.json" : undef;
-    my ($extra_raw, undef) = _acquire_json_source(
+    my ($extra_raw, $extra_attempted) = _acquire_json_source(
         opts             => $opts,
         data_key         => 'extra_list',
         path_key         => 'extra_list_path',
@@ -423,19 +525,20 @@ sub protected_roots {
         code_unparseable => 'extra-list-unparseable',
     );
 
-    if (defined $extra_raw) {
-        if (ref $extra_raw eq 'ARRAY') {
-            for my $el (@$extra_raw) {
-                my $n = _ingest_path($el);
-                if (defined $n) {
-                    push @candidates, { path => $n, reason => 'user-configured' };
-                } else {
-                    push @errors, { code => 'extra-list-entry', detail => 'extra-list element is not a usable path' };
-                }
+    # Same "was attempted" gate as the registry block above -- an explicit
+    # `extra_list => undef` is "supplied but broken", not "not supplied"
+    # (reviewer M1's direct sibling for extra-list-shape).
+    if (ref $extra_raw eq 'ARRAY') {
+        for my $el (@$extra_raw) {
+            my $n = _ingest_path($el);
+            if (defined $n) {
+                push @candidates, { path => $n, reason => 'user-configured' };
+            } else {
+                push @errors, { code => 'extra-list-entry', detail => 'extra-list element is not a usable path' };
             }
-        } else {
-            push @errors, { code => 'extra-list-shape', detail => 'extra list is not a JSON array' };
         }
+    } elsif ($extra_attempted) {
+        push @errors, { code => 'extra-list-shape', detail => 'extra list is not a JSON array' };
     }
 
     # ---- §2.5.2 step 6: bare-root guard, de-duplication, sort -------------
