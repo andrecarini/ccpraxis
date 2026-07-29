@@ -176,12 +176,14 @@ my %st = (
     is(Dashboard::display_width($ftiny->[0]{text}), 1, 'compose: width 1 -> 1-column rows (no crash)');
 }
 
-# shutdown-confirm footer
+# stop-runs confirm footer (s11-lifecycle-stop: 'shutdown' pending is retired;
+# 'stop-runs' is the new two-step confirm token -- see spec 08 S2.1/S2.2).
 {
-    my %sc = (%st, pending => 'shutdown');
+    my %sc = (%st, pending => 'stop-runs');
     my $f = Dashboard::compose_frame(\%sc, 10, 80);
-    is($f->[-1]{role}, 'footer-alert', 'compose: pending shutdown -> footer-alert role');
-    like($f->[-1]{text}, qr/Shut down ALL/, 'compose: confirm prompt shown in footer');
+    is($f->[-1]{role}, 'footer-alert', 'compose: pending stop-runs -> footer-alert role');
+    like($f->[-1]{text}, qr/butler runs/i, 'compose: confirm prompt shown in footer (new stop-runs contract)');
+    like($f->[-1]{text}, qr/\[y\] confirm/, 'compose: confirm prompt names [y] confirm');
 }
 
 # install-failure alert banner (#20): a backpack-install failure must surface in
@@ -277,7 +279,7 @@ my %st = (
     my $ff = Dashboard::compose_frame(\%fl, 12, 80);
     is($ff->[-1]{role}, 'footer-flash', 'compose: active flash -> footer row uses footer-flash role');
     like($ff->[-1]{text}, qr/container is down/, 'compose: flash text occupies the footer');
-    unlike($ff->[-1]{text}, qr/\[s\] shutdown-all/, 'compose: flash replaces the command legend');
+    unlike($ff->[-1]{text}, qr/\[s\] stop/, 'compose: flash replaces the command legend (s11: new [s] stop-runs legend)');
     is(length($ff->[-1]{text}), 80, 'compose: flash footer kept exactly $cols');
     like(Dashboard::sgr_for_role('footer-flash'), qr/\e\[1;33m/, 'sgr: footer-flash -> bold yellow');
 
@@ -447,26 +449,45 @@ my %st = (
 # ===========================================================================
 # PART 4 — key dispatch
 # ===========================================================================
+# s11-lifecycle-stop (spec 08 S2.1): 's' is now stop-runs, 'x' is full-shutdown
+# (no longer inert), and the legacy 'shutdown' pending token is retired in
+# favor of the two new tokens 'stop-runs' / 'full-shutdown'. Full behavioral
+# coverage (every key, both confirms, independence, normalization) lives in
+# t/46-lifecycle-stop.t AC-1..AC-4; this block keeps the smoke-level PART 4
+# key table in sync with the new contract so it does not encode stale
+# behavior.
 {
     is_deeply([Dashboard::dispatch_key('c', '')],   ['launch', ''],   'key: c -> launch');
     is_deeply([Dashboard::dispatch_key("\r", '')],  ['launch', ''],   'key: Enter -> launch');
     is_deeply([Dashboard::dispatch_key('q', '')],   ['quit', ''],     'key: q -> quit');
     is_deeply([Dashboard::dispatch_key('r', '')],   ['refresh', ''],  'key: r -> refresh');
-    is_deeply([Dashboard::dispatch_key('s', '')],   ['confirm-shutdown', 'shutdown'],
-        'key: s -> arm shutdown confirm');
-    is_deeply([Dashboard::dispatch_key('y', 'shutdown')], ['shutdown', ''],
-        'key: y while pending -> fire shutdown');
-    is_deeply([Dashboard::dispatch_key('n', 'shutdown')], ['cancel-shutdown', ''],
-        'key: any non-y while pending -> cancel');
-    is_deeply([Dashboard::dispatch_key('x', '')],   ['', ''],         'key: unknown -> inert');
+    is_deeply([Dashboard::dispatch_key('s', '')],   ['confirm-stop-runs', 'stop-runs'],
+        'key: s -> arm stop-runs confirm');
+    is_deeply([Dashboard::dispatch_key('x', '')],   ['confirm-full-shutdown', 'full-shutdown'],
+        'key: x -> arm full-shutdown confirm (no longer inert)');
+    is_deeply([Dashboard::dispatch_key('y', 'stop-runs')], ['stop-runs', ''],
+        'key: y while stop-runs pending -> fire stop-runs');
+    is_deeply([Dashboard::dispatch_key('n', 'stop-runs')], ['cancel-stop-runs', ''],
+        'key: any non-y while stop-runs pending -> cancel-stop-runs');
+    is_deeply([Dashboard::dispatch_key('y', 'full-shutdown')], ['full-shutdown', ''],
+        'key: y while full-shutdown pending -> fire full-shutdown');
+    is_deeply([Dashboard::dispatch_key('n', 'full-shutdown')], ['cancel-full-shutdown', ''],
+        'key: any non-y while full-shutdown pending -> cancel-full-shutdown');
+    # confirm independence: the OTHER control's key cancels rather than firing/re-arming
+    is_deeply([Dashboard::dispatch_key('x', 'stop-runs')], ['cancel-stop-runs', ''],
+        'key: x while stop-runs pending cancels (does not fire/re-arm full-shutdown)');
+    is_deeply([Dashboard::dispatch_key('s', 'full-shutdown')], ['cancel-full-shutdown', ''],
+        'key: s while full-shutdown pending cancels (does not fire/re-arm stop-runs)');
     is_deeply([Dashboard::dispatch_key("\e", '')],  ['', ''],         'key: lone ESC -> inert');
     is_deeply([Dashboard::dispatch_key('UP', '')],   ['scroll-up', ''],   'key: UP -> scroll-up');
     is_deeply([Dashboard::dispatch_key('DOWN', '')], ['scroll-down', ''], 'key: DOWN -> scroll-down');
     is_deeply([Dashboard::dispatch_key('k', '')],    ['scroll-up', ''],   'key: k -> scroll-up (alias)');
     is_deeply([Dashboard::dispatch_key('j', '')],    ['scroll-down', ''], 'key: j -> scroll-down (alias)');
-    # scroll keys must not disturb a pending shutdown confirm (any key cancels)
-    is_deeply([Dashboard::dispatch_key('DOWN', 'shutdown')], ['cancel-shutdown', ''],
-        'key: arrow while shutdown-pending still cancels');
+    # scroll keys must not disturb a pending confirm (any key cancels) -- for BOTH tokens
+    is_deeply([Dashboard::dispatch_key('DOWN', 'stop-runs')], ['cancel-stop-runs', ''],
+        'key: arrow while stop-runs-pending still cancels');
+    is_deeply([Dashboard::dispatch_key('DOWN', 'full-shutdown')], ['cancel-full-shutdown', ''],
+        'key: arrow while full-shutdown-pending still cancels');
 }
 
 # activity_view: newest-first + up/down scroll window
@@ -582,7 +603,7 @@ sub drive {
     my (%args) = @_;
     my @keys = @{ $args{keys} || [] };
     my $clock = 1000;
-    my %eff = (heartbeats => 0, spawns => 0, signals => 0, gathers => 0, frames => 0);
+    my %eff = (heartbeats => 0, spawns => 0, stop_runs => 0, full_shutdown => 0, gathers => 0, frames => 0);
     my $out = '';
 
     my $rc = Dashboard::run(
@@ -598,7 +619,20 @@ sub drive {
         gather         => sub { $eff{gathers}++; { project_name => 'demo', container => 'c1', status => ($args{status} // 'running'), events => ($args{events} // []), busy_age => $args{busy_age}, oauth_expires_at => $args{oauth_expires_at} } },
         heartbeat      => sub { $eff{heartbeats}++; $args{hb_returns} ? $args{hb_returns}->() : 'ok' },
         spawn          => sub { $eff{spawns}++; undef },
-        write_signals  => sub { $eff{signals}++; 1 },
+        stop_runs      => sub {
+            my ($state, $progress) = @_;
+            $eff{stop_runs}++;
+            return { mode => 'stop-runs', ok => 1, timed_out => 0, stages => [],
+                      machine_stopped => 0, others => [], others_known => 0,
+                      summary => 'stop-runs ok' };
+        },
+        full_shutdown  => sub {
+            my ($state, $progress) = @_;
+            $eff{full_shutdown}++;
+            return { mode => 'full-shutdown', ok => 1, timed_out => 0, stages => [],
+                      machine_stopped => 1, others => [], others_known => 1,
+                      summary => 'full shutdown ok' };
+        },
         enter_raw      => sub { $eff{entered} = 1 },
         leave_raw      => sub { $eff{left} = ($eff{left} || 0) + 1 },
         keepawake      => sub { $eff{keepawake_calls}++; $eff{last_busy_age} = $_[0]{busy_age} },
@@ -682,11 +716,21 @@ sub drive {
 }
 
 {
-    # 's' then 'y' fires the shutdown signal; 's' then 'n' does not.
+    # s11-lifecycle-stop: 's' arms stop-runs, 'x' arms full-shutdown; both are
+    # two-step confirms and neither exits the loop (spec 08 #2/#4 -- 'q' is
+    # still required afterward). Full mechanism (order, guard, staged frames)
+    # is t/46-lifecycle-stop.t's job; this is the PART 8 loop-wiring smoke.
     my $e1 = drive(keys => ['s', 'y', 'q'], max_ticks => 50);
-    is($e1->{signals}, 1, 'loop: s,y -> shutdown signal written once');
+    is($e1->{stop_runs}, 1, 'loop: s,y -> stop_runs seam fired once');
+    is($e1->{rc}, 0, 'loop: s,y,q -> rc 0 (q still required to exit)');
     my $e2 = drive(keys => ['s', 'n', 'q'], max_ticks => 50);
-    is($e2->{signals}, 0, 'loop: s,n -> shutdown cancelled (no signal)');
+    is($e2->{stop_runs}, 0, 'loop: s,n -> stop-runs cancelled (seam not fired)');
+
+    my $e3 = drive(keys => ['x', 'y', 'q'], max_ticks => 50);
+    is($e3->{full_shutdown}, 1, 'loop: x,y -> full_shutdown seam fired once');
+    is($e3->{rc}, 0, 'loop: x,y,q -> rc 0 (q still required to exit)');
+    my $e4 = drive(keys => ['x', 'n', 'q'], max_ticks => 50);
+    is($e4->{full_shutdown}, 0, 'loop: x,n -> full-shutdown cancelled (seam not fired)');
 }
 
 # ===========================================================================
@@ -823,7 +867,7 @@ sub drive_per_tick {
     my (%args) = @_;
     my @keys       = @{ $args{keys} || [] };
     my $clock      = 1000;
-    my %eff        = (heartbeats => 0, spawns => 0, signals => 0, gathers => 0, frames => 0);
+    my %eff        = (heartbeats => 0, spawns => 0, stop_runs => 0, full_shutdown => 0, gathers => 0, frames => 0);
     my $out_str    = '';
     my $prev_frames  = 0;
     my $prev_gathers = 0;
@@ -856,7 +900,12 @@ sub drive_per_tick {
         },
         heartbeat     => sub { 'ok' },
         spawn         => sub { $eff{spawns}++; undef },
-        write_signals => sub { $eff{signals}++; 1 },
+        stop_runs     => sub { $eff{stop_runs}++; return { mode => 'stop-runs', ok => 1, timed_out => 0,
+                                  stages => [], machine_stopped => 0, others => [], others_known => 0,
+                                  summary => 'stop-runs ok' }; },
+        full_shutdown => sub { $eff{full_shutdown}++; return { mode => 'full-shutdown', ok => 1, timed_out => 0,
+                                  stages => [], machine_stopped => 1, others => [], others_known => 1,
+                                  summary => 'full shutdown ok' }; },
         enter_raw     => sub { },
         leave_raw     => sub { },
         keepawake     => sub { },
