@@ -576,4 +576,315 @@ sub by_code {
     is($quiet_content, '', 'AC-19: --quiet prints nothing on exit 0');
 }
 
+# =============================================================================
+# CHUNK 2 — AC-20..AC-32
+#   AC-20..AC-25: the bp-preflight.pl DAG gate (subprocess, criterion b)
+#   AC-26:        bp-auditor.md doc assertion (criterion c)
+#   AC-27..AC-32: runtime normalization in BpOrch:: (criterion d)
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Shared subprocess helper for bp-preflight.pl. Captures merged
+# STDOUT+STDERR via an fd-backed File::Temp file (never an in-memory-scalar
+# filehandle -- see house Windows landmines). Never uses a shell string, so
+# there is nothing to quote.
+# ---------------------------------------------------------------------------
+my $PREFLIGHT = "$Bin/../../scripts/bp-preflight.pl";
+my $have_preflight = (-f $PREFLIGHT) ? 1 : 0;
+ok($have_preflight, 'bp-preflight.pl exists') or diag("missing: $PREFLIGHT");
+
+sub run_preflight {
+    my (%opt) = @_;
+    my @args;
+    push @args, "--bp-dir=$opt{bp_dir}" if defined $opt{bp_dir};
+    push @args, '--quiet' if $opt{quiet};
+
+    # Force a clean, explicit environment for every resolution-ladder rung
+    # (restored automatically when this sub returns -- dynamic scope of `local`).
+    delete local $ENV{BP_BLUEPRINT_DIR};
+    delete local $ENV{BP_BLUEPRINT};
+    delete local $ENV{CCPRAXIS_DATA_DIR};
+    delete local $ENV{BP_PROJECT_ROOT};
+    $ENV{BP_BLUEPRINT_DIR}  = $opt{BP_BLUEPRINT_DIR}  if defined $opt{BP_BLUEPRINT_DIR};
+    $ENV{BP_BLUEPRINT}      = $opt{BP_BLUEPRINT}      if defined $opt{BP_BLUEPRINT};
+    $ENV{CCPRAXIS_DATA_DIR} = $opt{CCPRAXIS_DATA_DIR} if defined $opt{CCPRAXIS_DATA_DIR};
+    $ENV{BP_PROJECT_ROOT}   = $opt{BP_PROJECT_ROOT}   if defined $opt{BP_PROJECT_ROOT};
+
+    my ($tfh, $outfile) = tempfile(UNLINK => 1);
+    close $tfh;
+    open(my $save_out, '>&', \*STDOUT) or die "dup STDOUT: $!";
+    open(my $save_err, '>&', \*STDERR) or die "dup STDERR: $!";
+    open(STDOUT, '>', $outfile)        or die "redirect STDOUT: $!";
+    open(STDERR, '>&', \*STDOUT)       or die "redirect STDERR: $!";
+    my $rc = system($^X, $PREFLIGHT, @args);
+    open(STDOUT, '>&', $save_out) or die "restore STDOUT: $!";
+    open(STDERR, '>&', $save_err) or die "restore STDERR: $!";
+    close $save_out; close $save_err;
+
+    my $exit = ($rc == -1) ? -1 : ($rc >> 8);
+    open(my $rf, '<', $outfile) or die "read preflight capture: $!";
+    local $/;
+    my $text = <$rf>;
+    close $rf;
+    return ($exit, defined $text ? $text : '');
+}
+
+my ($amb_dir, $ok_dir, $out_ok_dir);
+SKIP: {
+    skip 'bp-preflight.pl unavailable', 13 unless $have_preflight;
+
+    # ---- AC-20: ambiguous DAG -> exit 2, FAIL row, literal + bracketed code ----
+    $amb_dir = tempdir(CLEANUP => 1);
+    setup_bp($amb_dir,
+        { id => 'b01-alpha' },
+        { id => 'b01-beta' },
+        { id => 'b02-gamma', dep => 'b01' },   # short id resolves to TWO packages
+    );
+    my ($exit20, $out20) = run_preflight(bp_dir => $amb_dir);
+    is($exit20, 2, 'AC-20: bp-preflight.pl exits 2 for an ambiguous DAG');
+    like($out20, qr/\[\s*FAIL\s*\]\s*dag\.integrity/,
+        'AC-20: dag.integrity row carries the FAIL glyph');
+    like($out20, qr/blueprint DAG is broken at .*\[[\w.-]+\]/s,
+        'AC-20: detail has the literal "blueprint DAG is broken at " plus a bracketed code');
+
+    # ---- AC-21: normalizable DAG -> ok row, not attributable to a FAILED block ----
+    $ok_dir = tempdir(CLEANUP => 1);
+    setup_bp($ok_dir, { id => 'b01-alpha' }, { id => 'b02-beta', dep => 'b01' });
+    my ($exit21, $out21) = run_preflight(bp_dir => $ok_dir);
+    $out_ok_dir = $out21;
+    like($out21, qr/\[\s*ok\s*\]\s*dag\.integrity/,
+        'AC-21: dag.integrity row is ok for an auto-normalizable DAG');
+    unlike($out21, qr/-\s*\[dag\.integrity\]/,
+        'AC-21: dag.integrity is not attributable to any *** PREFLIGHT FAILED *** item');
+
+    # ---- AC-22: no --bp-dir / BP_BLUEPRINT_DIR / BP_BLUEPRINT, empty project root -> skip ----
+    my $empty_root = tempdir(CLEANUP => 1);
+    my ($exit22, $out22) = run_preflight(BP_PROJECT_ROOT => $empty_root);
+    like($out22, qr/\[\s*skip\s*\]\s*dag\.integrity\s+\S/,
+        'AC-22: dag.integrity row is skip with a non-empty reason when nothing resolves');
+    unlike($out22, qr/-\s*\[dag\.integrity\]/,
+        'AC-22: the skip contributes no failure');
+
+    # ---- AC-23: --bp-dir names a path with no blueprint.md -> skip names the path ----
+    my $bad_path = tempdir(CLEANUP => 1);
+    my ($exit23, $out23) = run_preflight(bp_dir => $bad_path);
+    like($out23, qr/\[\s*skip\s*\]\s*dag\.integrity/,
+        'AC-23: an explicit --bp-dir with no blueprint.md is a skip, not silent fallthrough');
+    like($out23, qr/\Q$bad_path\E/,
+        'AC-23: the skip reason names the explicit --bp-dir path');
+
+    # ---- AC-24: --quiet still surfaces failure; --quiet is silent on a clean pass ----
+    my ($exitQF, $outQF) = run_preflight(bp_dir => $amb_dir, quiet => 1);
+    is($exitQF, 2, 'AC-24: --quiet with a failing DAG still exits 2');
+    like($outQF, qr/\*\*\* PREFLIGHT FAILED/,
+        'AC-24: --quiet with a failing DAG still prints the *** PREFLIGHT FAILED *** block');
+    my ($exitQP, $outQP) = run_preflight(bp_dir => $ok_dir, quiet => 1);
+    is($outQP, '', 'AC-24: --quiet with a passing DAG prints nothing');
+
+    # ---- AC-25 (row-production half): the gate produced a row without any manifest id ----
+    like($out_ok_dir, qr/dag\.integrity/,
+        'AC-25: the gate produced a dag.integrity row though it is not a manifest id (below)');
+}
+
+# ---- AC-25 (manifest half): dag.integrity is NOT an id in assumptions.json ----
+{
+    my $manifest = "$Bin/../../docs/assumptions.json";
+    ok(-f $manifest, 'AC-25: plugins/butler/docs/assumptions.json exists');
+    my $has_id = 0;
+    if (-f $manifest) {
+        open my $fh, '<', $manifest or die "read assumptions.json: $!";
+        local $/;
+        my $txt = <$fh>;
+        close $fh;
+        $has_id = ($txt =~ /"id"\s*:\s*"dag\.integrity"/) ? 1 : 0;
+    }
+    ok(!$has_id, 'AC-25: dag.integrity does not appear as an id in assumptions.json');
+}
+
+# ---------------------------------------------------------------------------
+# AC-26: bp-auditor.md gets the new DAG-integrity hunt-list bullet; the
+# frontmatter and the pre-existing eight bullets are untouched.
+# ---------------------------------------------------------------------------
+{
+    my $md = "$Bin/../../../blueprint/agents/bp-auditor.md";
+    ok(-f $md, 'AC-26: agent contract plugins/blueprint/agents/bp-auditor.md exists');
+    my $text = '';
+    if (-f $md) {
+        open my $fh, '<', $md or die "read bp-auditor.md: $!";
+        local $/;
+        $text = <$fh>;
+        close $fh;
+    }
+    like($text, qr/^- \*\*DAG integrity\*\* .*REQUIRED pass:/m,
+        'AC-26: bp-auditor.md REQUIRES a DAG-integrity pass (exact §4.3 grep)');
+    like($text, qr/^name:\s*bp-auditor\s*$/m, 'AC-26: frontmatter still declares name: bp-auditor');
+    like($text, qr/^model:/m,    'AC-26: frontmatter still declares model:');
+    like($text, qr/^maxTurns:/m, 'AC-26: frontmatter still declares maxTurns:');
+    like($text, qr/^tools:/m,    'AC-26: frontmatter still declares tools:');
+    like($text, qr/^-\s*\*\*Write-set hazards\*\*/m,
+        'AC-26: pre-existing "Write-set hazards" hunt-list bullet still present');
+    like($text, qr/^-\s*\*\*Hidden dependencies\*\*/m,
+        'AC-26: pre-existing "Hidden dependencies" hunt-list bullet still present');
+}
+
+# ---------------------------------------------------------------------------
+# AC-27: deps_met unchanged for full-name deps.
+# ---------------------------------------------------------------------------
+{
+    is(BpOrch::deps_met(['X'], { X => 'done' }), 1,
+        'AC-27: deps_met true when a full-name dep is done');
+    is(BpOrch::deps_met(['X'], { X => 'pending' }), 0,
+        'AC-27: deps_met false when a full-name dep is pending');
+    is(BpOrch::deps_met([], {}), 1, 'AC-27: deps_met true for an empty dep list');
+    is(BpOrch::deps_met(undef, {}), 1, 'AC-27: deps_met true for an undef dep list');
+}
+
+# ---------------------------------------------------------------------------
+# AC-28: deps_met resolves a short-id token against $status's keys.
+# ---------------------------------------------------------------------------
+{
+    is(BpOrch::deps_met(['b01'], { 'b01-orchestrator-broken-env-turns' => 'done' }), 1,
+        'AC-28: deps_met(short-id) true when the uniquely-resolved package is done');
+    is(BpOrch::deps_met(['b01'], { 'b01-orchestrator-broken-env-turns' => 'pending' }), 0,
+        'AC-28: deps_met(short-id) false when the uniquely-resolved package is pending');
+}
+
+# ---------------------------------------------------------------------------
+# AC-29: deps_met fails closed on a dangling or ambiguous short-id token.
+# ---------------------------------------------------------------------------
+{
+    is(BpOrch::deps_met(['b99'], { 'b01-alpha' => 'done' }), 0,
+        'AC-29: deps_met fails closed on a dangling short-id token');
+    is(BpOrch::deps_met(['b01'], { 'b01-alpha' => 'done', 'b01-beta' => 'done' }), 0,
+        'AC-29: deps_met fails closed when a short-id token matches two packages');
+}
+
+# ---------------------------------------------------------------------------
+# AC-30: normalize_dag canonicalizes short ids, drops self-deps, dedupes,
+# preserves unresolvable tokens verbatim, and preserves the key set.
+# ---------------------------------------------------------------------------
+{
+    my $have_norm = BpOrch->can('normalize_dag') ? 1 : 0;
+    ok($have_norm, 'AC-30: BpOrch::normalize_dag exists')
+        or diag('BpOrch::normalize_dag not implemented yet');
+    SKIP: {
+        skip 'BpOrch::normalize_dag unavailable', 5 unless $have_norm;
+        my $dag = {
+            'b01-alpha' => [],
+            'b02-beta'  => ['b01', 'b01-alpha', 'b01'],   # short id + its own full name + dup
+            'b03-gamma' => ['b03-gamma'],                  # self-dep
+            'b04-delta' => ['bXX-missing'],                # unresolvable, preserved verbatim
+        };
+        my $fixed = eval { BpOrch::normalize_dag($dag) };
+        ok(defined $fixed, 'AC-30: normalize_dag returns a defined result')
+            or diag("normalize_dag died: $@");
+        SKIP: {
+            skip 'normalize_dag unavailable or died', 4 unless defined $fixed;
+            is_deeply([sort keys %$fixed], [sort keys %$dag],
+                'AC-30: keys of the returned hash equal keys of the input');
+            is_deeply($fixed->{'b02-beta'}, ['b01-alpha'],
+                'AC-30: short id canonicalized to the full id, and duplicates deduped');
+            is_deeply($fixed->{'b03-gamma'}, [],
+                'AC-30: self-dep dropped');
+            is_deeply($fixed->{'b04-delta'}, ['bXX-missing'],
+                'AC-30: an unresolvable token is preserved verbatim (fail closed, not dropped)');
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# AC-31: end-to-end. BpOrch::run over a fixture blueprint whose table uses a
+# SHORT id in depends_on launches every package (all reach done) with no
+# decision filed (runs/needs-you/ stays empty).
+# ---------------------------------------------------------------------------
+{
+    my $dir = tempdir(CLEANUP => 1);
+    my $bpdir = "$dir/bp";
+    mkdir $bpdir; mkdir "$bpdir/packages"; mkdir "$bpdir/runs";
+    write_bp_md($bpdir,
+        '# T31', '',
+        '## Package status', '',
+        '| pkg | deliverable | depends_on | model | status |',
+        '|-----|-------------|------------|-------|--------|',
+        '| b01-alpha | thing A | — | sonnet | ⬜ pending |',
+        '| b02-beta  | thing B | b01 | sonnet | ⬜ pending |',
+    );
+    for my $p (['b01-alpha', 'p/a/'], ['b02-beta', 'p/b/']) {
+        open my $l, '>', "$bpdir/packages/$p->[0].md" or die "write ledger: $!";
+        print $l "---\npackage: $p->[0]\nblueprint: T31\nstatus: pending\nmodel: sonnet\n"
+               . "max_turns: 80\nwrite_set: $p->[1]\ntest_paths: $p->[1]\n"
+               . "last_updated: 2026-06-24T00:00:00Z\n---\n\n# $p->[0]\n";
+        close $l;
+    }
+    my $NOW = 1_900_000_000;
+    my $creds = "$dir/creds.json";
+    open my $cf, '>', $creds or die "write creds: $!";
+    print $cf '{"claudeAiOauth":{"accessToken":"sk-ant-TESTTESTTESTTESTTESTTEST",'
+            . '"refreshToken":"sk-ant-REFREFREFREFREFREFREFREF","expiresAt":'
+            . (($NOW + 5 * 3600) * 1000)
+            . ',"scopes":["user:inference"],"subscriptionType":"max","rateLimitTier":"x"}}';
+    close $cf;
+    my $t = {
+        ceil5 => 85, ceil7 => 90, drain => 600, max_par => 2, cap => 5, flat => 600,
+        watch_tick => 0, keeper_int => 600, keeper_bo => 120, thresh_min => 60,
+        jit_lo => 300, jit_hi => 900, tele_retry => 3, usage_fail => 60,
+        busy_path => "$dir/busy",
+        harvest => 'audit', resolve_cap => 1, corr_cap => 1, judge_to => 1800,
+    };
+    my $usage_body = '{"five_hour":{"utilization":10,"resets_at":"2026-06-22T05:59:59+00:00"},'
+                    . '"seven_day":{"utilization":5,"resets_at":"2026-06-22T17:59:59+00:00"}}';
+    my @launched;
+    for (1 .. 6) {
+        eval {
+            BpOrch::run({
+                blueprint => 'T31', bp_dir => $bpdir, creds_path => $creds, tunables => $t,
+                once => 1, now => sub { $NOW }, sleep => sub { },
+                http_get  => sub { { status => 200, content => $usage_body } },
+                http_post => sub { { status => 200, content => '{}' } },
+                spawn_judge => sub { 0 },
+                launch    => sub {
+                    my ($job) = @_;
+                    push @launched, $job->{pkg};
+                    my $lf = "$bpdir/packages/$job->{pkg}.md";
+                    if (open my $rf, '<', $lf) {
+                        local $/;
+                        my $c = <$rf>;
+                        close $rf;
+                        $c =~ s/^status:\s*\S+/status: done/m;
+                        open my $wf, '>', $lf or die "rewrite ledger: $!";
+                        print $wf $c;
+                        close $wf;
+                    }
+                    0;
+                },
+            });
+            1;
+        } or last;
+    }
+    my %final;
+    for my $id ('b01-alpha', 'b02-beta') {
+        open my $rf, '<', "$bpdir/packages/$id.md" or die "read ledger $id: $!";
+        local $/;
+        my $c = <$rf>;
+        close $rf;
+        $final{$id} = ($c =~ /^status:\s*(\S+)/m) ? $1 : '?';
+    }
+    is($final{'b01-alpha'}, 'done', 'AC-31: b01-alpha (no dep) reaches done');
+    is($final{'b02-beta'}, 'done',
+        'AC-31: b02-beta (short-id dep on b01) reaches done -- launched with no decision');
+    my @needs_you = -d "$bpdir/runs/needs-you" ? glob("$bpdir/runs/needs-you/*") : ();
+    is(scalar @needs_you, 0, 'AC-31: runs/needs-you/ stays empty -- no decision was filed');
+}
+
+# ---------------------------------------------------------------------------
+# AC-32: has_progressable_work resolves a short-id dep post-normalization.
+# ---------------------------------------------------------------------------
+{
+    my $meta = { 'b02-beta' => { deps => ['b01'] } };
+    is(BpOrch::has_progressable_work($meta, { 'b02-beta' => 'pending', 'b01-alpha' => 'done' }), 1,
+        'AC-32: has_progressable_work true for a pending pkg whose short-id dep is done');
+    is(BpOrch::has_progressable_work($meta, { 'b02-beta' => 'pending', 'b01-alpha' => 'blocked' }), 0,
+        'AC-32: has_progressable_work false when that short-id dep is blocked');
+}
+
 done_testing();
