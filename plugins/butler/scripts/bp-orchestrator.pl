@@ -1125,6 +1125,7 @@ sub _tunables_base {
         judge_to   => $ENV{BP_JUDGE_TIMEOUT_SECS} // 1800,     # A5: crashed/hung-judge fail-safe
         judge_spawn_cap => $ENV{BP_JUDGE_SPAWN_CAP} // 3,      # A5 H2: park after N harvest-spawn failures
         harvest_reaudit_cap => $ENV{BP_HARVEST_REAUDIT_CAP} // 2,  # #30: re-audit (not reopen) a done pkg whose harvest didn't complete, up to N times
+        harvest_defer_cap => $ENV{BP_HARVEST_DEFER_CAP} // 2,  # b09 spec §2.4: sibling-red defer attempts before reopen/park
         conformance_spawn_cap => $ENV{BP_CONFORMANCE_SPAWN_CAP} // 2, # b05: whole-blueprint conformance gate firings per run
         default_max_turns   => $ENV{BP_DEFAULT_MAX_TURNS}   // 80, # b01: turn budget when the ledger states none
         broken_env_thresh   => $ENV{BP_BROKEN_ENV_THRESH}   // 3,  # b01: consecutive exec-not-found launches -> broken-env
@@ -1781,6 +1782,18 @@ sub run {
                         ? BpJudge::want_harvest_gate({  mode => $mode, status => $st, harvest => $h, inflight => $infl })
                         : BpJudge::want_harvest_audit({ mode => $mode, status => $st, harvest => $h, inflight => $infl });
                     next unless $fire;
+                    # §3 behavior 24: while any harvest_defer_blockers named package is
+                    # still LIVE (not done/dropped/blocked/parked), hold the fire — no
+                    # re-audit, no log line (the harvest_defer event + registry field are
+                    # the durable record; a 10s tick is not worth logging every hold).
+                    my @blockers = grep { length } split /,/, ($reg->{$pkg}{harvest_defer_blockers} // '');
+                    if (@blockers) {
+                        my $still_live = grep {
+                            my $bst = defined $status->{$_} && !ref $status->{$_} ? lc($status->{$_}) : '';
+                            !($bst eq 'done' || $bst eq 'dropped' || $bst eq 'blocked' || $bst eq 'parked');
+                        } @blockers;
+                        next if $still_live;
+                    }
                     my $rc = $spawn_judge->({ kind => 'harvest', pkg => $pkg });
                     if (defined $rc && $rc == 0) {
                         mark_judge_inflight($runs, 'harvest', $pkg, $now);

@@ -61,11 +61,20 @@ elif [ "$KIND" = resolve ]; then
   MODEL="${BP_RESOLVE_MODEL:-opus}";   MAXT="${BP_RESOLVE_MAX_TURNS:-50}"
   ROLE="resolve-judge"; J_WRITE_SET="$WRITE_SET"; J_TEST_PATHS="$TEST_PATHS"
 else
-  MODEL="${BP_HARVEST_MODEL:-sonnet}"; MAXT="${BP_HARVEST_MAX_TURNS:-20}"
+  MODEL="${BP_HARVEST_MODEL:-sonnet}"
+  MAXT="${BP_HARVEST_MAX_TURNS:-}"                       # explicit override WINS
+  if [ -z "$MAXT" ]; then
+    MAXT=$(perl -e 'require $ARGV[0]; print BpJudge::harvest_max_turns($ARGV[1],$ARGV[2])' \
+             "$SCRIPT_DIR/bp-judge.pl" "$WRITE_SET" "$TEST_PATHS" 2>/dev/null || true)
+    case "$MAXT" in ''|*[!0-9]*) MAXT=28 ;; esac       # pinned floor if perl is unavailable
+  fi
   ROLE="harvest-judge"; J_WRITE_SET=""; J_TEST_PATHS=""   # read-only; only the verdict (under BP_DIR) is writable
 fi
 
 mkdir -p "$(dirname "$VERDICT_PATH")" "$BPDIR/dispatch" "$BPDIR/runs/$KIND"
+perl -e 'require $ARGV[0]; BpOrch::archive_judge_verdict($ARGV[1],$ARGV[2],$ARGV[3],time,$ARGV[4])' \
+     "$SCRIPT_DIR/bp-orchestrator.pl" "$BPDIR/runs" "$KIND" "$PKG" "$BPDIR/runs/orchestrator.log" \
+     >/dev/null 2>&1 || true
 rm -f "$VERDICT_PATH"
 
 # -------- build the prompt: inline for conformance (templates/ is unwritable for
