@@ -46,6 +46,7 @@ BEGIN {
 }
 use MountSpec qw(winify_path v_to_mount convert_v_to_mount);
 use CcpraxisWorkCopy qw(workcopy_route workcopy_refusal_outcome);
+use ProtectedPaths qw(path_relation protected_roots target_self_codes normalize_path);
 use LaunchLog ();   # B1: durable per-launch diagnostic log (next to us in scripts/)
 use Dashboard ();   # B2: the raw-ANSI TUI dashboard framework
 use TokenInfo ();   # s08: pure access/refresh token status struct for the dashboard
@@ -228,6 +229,241 @@ my $LIVE_CCPRAXIS_ROOT = do {
     my $s = dirname($h);
     dirname(dirname(dirname($s)));
 };
+
+# >>> q03:protected-path-decision:BEGIN
+#     Pure decision + message design for the protected-path refusal.
+#     CLOSED OVER NOTHING: everything arrives as arguments. t/53 lifts the
+#     text between these sentinels and evals it in its own package, so this
+#     region must never reference a launcher file-scope lexical, must never
+#     load another module (the caller supplies the ProtectedPaths imports),
+#     and must never terminate the process, emit output, or touch the
+#     filesystem directly.
+
+my %_PP_SELF_NOUN = (
+    'drive-root' => 'a filesystem root',
+    'user-home'  => 'your home directory',
+);
+
+my %_PP_RELATION_PHRASE = (
+    exact      => 'exact (the path you gave IS this protected root)',
+    descendant => 'descendant (the path you gave is INSIDE this protected root)',
+    ancestor   => 'ancestor (the path you gave CONTAINS this protected root)',
+);
+
+sub _pp_explanation {
+    my ($reason) = @_;
+    my %text = (
+        'ccpraxis-install' => q{That is the ccpraxis installation Claude Code is running from. Its plugins,
+skills and launcher are in use right now, so sandboxing it would edit the
+tooling while it is running, and git inside the container would not work.},
+        'claude-home' => q{That is Claude Code's own configuration home. It holds your credentials, your
+session transcripts, your memory files and every installed plugin.
+Bind-mounting it into a container would expose all of it read-write.},
+        'marketplace-install' => q{That is where Claude Code installed a plugin marketplace registered in
+known_marketplaces.json. Editing it from inside a container would corrupt the
+installed plugin tree Claude Code is loading from.},
+        'marketplace-source' => q{That is the directory-source of a plugin marketplace registered in
+known_marketplaces.json. Claude Code loads plugins straight out of it, so it
+is live installed code, not a checkout.},
+        'user-configured' => q{That path is in your own protected-paths list at
+${CLAUDE_CONFIG_DIR:-~/.claude}/ccpraxis-protected-paths.json.},
+        'drive-root' => q{A filesystem root contains every file on the volume - your home directory,
+Claude Code's configuration, and every other project on the machine. Putting
+all of that inside a container read-write is never what a sandbox is for, and
+every file operation in the container would crawl.},
+        'user-home' => q{Your home directory contains every project you have, plus Claude Code's
+configuration and your credentials. Putting all of that inside a container
+read-write is never what a sandbox is for.},
+    );
+    return $text{$reason};
+}
+
+sub _pp_advice {
+    my ($reason, $root) = @_;
+
+    if ($reason eq 'ccpraxis-install') {
+        return q{Work on a separate clone instead. Pick any ordinary directory outside this
+install (for example C:/Development/ccpraxis on Windows, or ~/src/ccpraxis on
+macOS or Linux), then run:
+
+  git clone --no-hardlinks } . $root . q{ <your-clone-dir>
+  cd <your-clone-dir>
+  claude-sandbox
+
+The --no-hardlinks flag is required: a local clone hardlinks the object store
+by default, which would silently re-couple the clone to this installation.
+See plugins/sandbox/docs/working-on-ccpraxis.md.};
+    }
+
+    if ($reason eq 'marketplace-install' || $reason eq 'marketplace-source') {
+        return q{Open the specific project directory you meant to work in - cd into it and run
+claude-sandbox there, or pass it explicitly:
+
+  claude-sandbox <your-project-dir>
+
+If you meant to work on the plugin source that lives there, find the git
+repository that contains } . $root . q{ and clone THAT repository instead --
+} . $root . q{ itself need not be the root of a repository. Copy or clone the
+repository somewhere outside it and work from that copy: for a git repo, use
+git clone --no-hardlinks <repository-root> <your-clone-dir>, where
+<repository-root> is the repository containing } . $root . q{.};
+    }
+
+    if ($reason eq 'user-configured') {
+        return q{Open the specific project directory you meant to work in - cd into it and run
+claude-sandbox there, or pass it explicitly:
+
+  claude-sandbox <your-project-dir>
+
+If that entry was added by mistake, remove it from
+${CLAUDE_CONFIG_DIR:-~/.claude}/ccpraxis-protected-paths.json.};
+    }
+
+    return q{Open the specific project directory you meant to work in - cd into it and run
+claude-sandbox there, or pass it explicitly:
+
+  claude-sandbox <your-project-dir>};
+}
+
+sub _pp_message {
+    my ($target, $reason, $root, $relation) = @_;
+
+    my $explanation = _pp_explanation($reason);
+    my $advice      = _pp_advice($reason, $root);
+    my $no_override = q{There is no override: no flag and no environment variable will make
+claude-sandbox act on this path. If this refusal is wrong, the guard itself
+has to be fixed - see plugins/sandbox/docs/protected-paths.md.};
+
+    my $header;
+    my $body;
+    if (exists $_PP_SELF_NOUN{$reason}) {
+        $header = 'claude-sandbox will not sandbox ' . $_PP_SELF_NOUN{$reason} . ':';
+        my $reason_label = '  ' . 'reason' . (' ' x 9) . ': ';
+        $body = "\n  " . $target . "\n\n"
+              . $reason_label . $reason . "\n";
+    } else {
+        $header = 'claude-sandbox will not sandbox a protected path:';
+        my $root_label     = '  ' . 'protected root' . ' : ';
+        my $relation_label = '  ' . 'relation' . (' ' x 7) . ': ';
+        my $reason_label   = '  ' . 'reason' . (' ' x 9) . ': ';
+        my $phrase = $_PP_RELATION_PHRASE{$relation} // $relation;
+        $body = "\n  " . $target . "\n\n"
+              . "That path collides with something Claude Code has installed on this machine:\n\n"
+              . $root_label . $root . "\n"
+              . $relation_label . $phrase . "\n"
+              . $reason_label . $reason . "\n";
+    }
+
+    return $header . "\n" . $body . "\n"
+         . $explanation . "\n\n"
+         . $advice . "\n\n"
+         . $no_override . "\n\n"
+         . 'Aborting.';
+}
+
+sub _pp_warnings {
+    my ($pr, $root_count) = @_;
+    my @errors = @{ $pr->{errors} // [] };
+    my @warnings;
+    my $shown = 0;
+    for my $e (@errors) {
+        last if $shown >= 10;
+        push @warnings, "claude-sandbox: WARNING: protected-path source [$e->{code}]: $e->{detail}";
+        $shown++;
+    }
+    if (@errors > 10) {
+        my $more = scalar(@errors) - 10;
+        push @warnings, "claude-sandbox: WARNING: ... and $more more protected-path source problem(s).";
+    }
+    if (@warnings) {
+        push @warnings,
+            "claude-sandbox: the protected-path guard is still enforcing the $root_count protected root(s) it did resolve; a failed source never relaxes it.";
+    }
+    return @warnings;
+}
+
+sub protected_path_outcome {
+    my ($target, $opts) = @_;
+    $opts //= {};
+
+    my $pr       = protected_roots($opts);
+    my @warnings = _pp_warnings($pr, scalar @{ $pr->{roots} });
+
+    my $codes = target_self_codes($target, $opts);
+    if (@$codes) {
+        my $reason = $codes->[0];
+        return {
+            refuse    => 1,
+            reason    => $reason,
+            root      => undef,
+            relation  => undef,
+            message   => _pp_message($target, $reason, undef, undef),
+            exit_code => 1,
+            warnings  => \@warnings,
+        };
+    }
+
+    if (!defined normalize_path($target)) {
+        push @warnings,
+            'claude-sandbox: WARNING: protected-path guard could not normalize the target path; it was not checked against any protected root.';
+        return {
+            refuse    => 0,
+            reason    => undef,
+            root      => undef,
+            relation  => undef,
+            message   => undef,
+            exit_code => 1,
+            warnings  => \@warnings,
+        };
+    }
+
+    my %CLASS = ( exact => 0, descendant => 1, ancestor => 2 );
+    my ($best_class, $best_root, $best_rel);
+    for my $candidate (@{ $pr->{roots} }) {
+        my $rel = path_relation($target, $candidate->{path}, $opts);
+        next if $rel eq 'unrelated';
+        my $class = $CLASS{$rel};
+        if (!defined $best_class || $class < $best_class) {
+            ($best_class, $best_root, $best_rel) = ($class, $candidate, $rel);
+        }
+    }
+
+    if (!defined $best_root) {
+        return {
+            refuse    => 0,
+            reason    => undef,
+            root      => undef,
+            relation  => undef,
+            message   => undef,
+            exit_code => 1,
+            warnings  => \@warnings,
+        };
+    }
+
+    return {
+        refuse    => 1,
+        reason    => $best_root->{reason},
+        root      => $best_root->{path},
+        relation  => $best_rel,
+        message   => _pp_message($target, $best_root->{reason}, $best_root->{path}, $best_rel),
+        exit_code => 1,
+        warnings  => \@warnings,
+    };
+}
+# <<< q03:protected-path-decision:END
+
+{
+    my $pp = protected_path_outcome($PROJECT_PATH, {
+        registry_path => "$HOST_PLUGINS_DIR/known_marketplaces.json",
+    });
+    print STDERR $_, "\n" for @{ $pp->{warnings} };
+    if ($pp->{refuse}) {
+        print STDERR $pp->{message}, "\n";
+        exit($pp->{exit_code} || 1);
+    }
+    # not refused -> fall through to the workcopy_route fail-safe (R2) below
+}
+
 {
     my $route = workcopy_route($PROJECT_PATH, { registry_path => "$HOST_PLUGINS_DIR/known_marketplaces.json", live_install_hint => $LIVE_CCPRAXIS_ROOT });
     if ($route eq 'offer') {
