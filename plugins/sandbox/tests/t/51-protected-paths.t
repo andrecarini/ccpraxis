@@ -22,6 +22,11 @@
 #   AC-23..42   : protected_roots (Decision #4/#5/#6, G3)
 #   AC-43..47   : target_self_codes (Decision #2, G4 — additive)
 #   AC-48       : suite hygiene
+#   AC-49..71   : q04-protected-paths-resolution — root resolution through the
+#                 realpath seam (49-55), environment-independent home candidates
+#                 (56-61), user-home root rejection + the C6 clone regression
+#                 (62-67), and normalize_path's windows option (68-71). Derived
+#                 from specs/q04-protected-paths-resolution-spec.md.
 
 use strict;
 use warnings;
@@ -41,7 +46,10 @@ for my $sub (qw(path_relation protected_roots target_self_codes normalize_path))
 # Shared fixtures (§7.2) — fabricated paths and injected seams only.
 # =====================================================================
 
-my $rp_id  = sub { $_[0] };                       # identity realpath (t/39 idiom) — accepted, never called
+my $rp_id  = sub { $_[0] };                       # identity realpath (t/39 idiom) — called during root
+                                                  # ingestion (q04 §1.2); identity resolution is a
+                                                  # deliberate no-op, which is why every pre-q04
+                                                  # expectation below is unchanged by that change.
 my $no_fs  = sub { die "test touched the filesystem\n" };   # tripwire
 my $env_of = sub { my %e = @_; return sub { $e{$_[0]} } };
 
@@ -607,6 +615,452 @@ for my $t ('/', 'C:', 'C:/', 'C:\\', '/a/../..') {
     my $r = protected_roots(\%O);
     my @leaked = grep { $_->{reason} eq 'drive-root' || $_->{reason} eq 'user-home' } @{ $r->{roots} };
     is(scalar(@leaked), 0, "AC-47: target-side codes ('drive-root','user-home') never leak into protected_roots roots");
+}
+
+# =====================================================================
+# q04 §1 — the realpath seam (AC-49..55).
+#
+# Resolution happens at ROOT INGESTION inside protected_roots, never inside
+# path_relation (spec §0 C-0.1) — path_relation stays a pure lexical
+# predicate, which is what lets AC-22 above remain true and untouched.
+#
+# ZERO REAL I/O (spec §0 C-0.3): symlinks are SIMULATED by injecting a
+# realpath sub over a fabricated hash. No test here creates a real symlink,
+# uses File::Temp, or touches the real filesystem — the $no_fs tripwires
+# stay armed throughout, and this is also why these tests pass on Windows.
+# =====================================================================
+
+# AC-49 — regression guard for every pre-q04 expectation: with an identity
+# realpath, the AC-24 happy path is byte-identical to its pre-q04 value.
+{
+    my $r = protected_roots(\%O);
+    is_deeply($r->{roots}, $AC24_ROOTS,
+        'AC-49: identity realpath leaves the AC-24 roots byte-identical (regression guard)');
+    is(scalar @{ $r->{errors} }, 0, 'AC-49: identity realpath introduces no errors');
+}
+
+# AC-50 — THE FLAGSHIP BUG. With ~/.claude a symlink to /data/claude,
+# `claude-sandbox ~/.claude` today returns refuse=0 with zero warnings,
+# because the target is abs_path'd by the launcher while the root stays
+# lexical. Resolving the root closes it.
+{
+    my %map = ('/home/u/.claude' => '/data/claude');
+    my $rp  = sub { $map{$_[0]} // $_[0] };
+    my $r   = protected_roots({
+        registry => {}, extra_list => [],
+        env => $env_of->(CLAUDE_CONFIG_DIR => '/home/u/.claude'),
+        exists => $no_fs, read_file => $no_fs, realpath => $rp,
+    });
+    ok(has_root($r, '/data/claude', 'claude-home'),
+        'AC-50: a symlinked claude-home root is ingested as its RESOLVED path /data/claude');
+    is((grep { $_->{path} eq '/home/u/.claude' } @{ $r->{roots} }), 0,
+        'AC-50: the unresolved lexical form is not also kept as a separate root');
+    my ($root) = grep { $_->{reason} eq 'claude-home' } @{ $r->{roots} };
+    is(path_relation('/data/claude', $root->{path}), 'exact',
+        'AC-50: the resolved target now matches the resolved root (was "unrelated" pre-q04)');
+}
+
+# AC-51 — an unresolvable root (broken symlink / missing dir) degrades to its
+# LEXICAL form and warns. Dropping it would shrink the protected set, which
+# is the one direction Decision #6 forbids.
+{
+    my $rp = sub { return $_[0] eq '/opt/gone' ? undef : $_[0] };
+    my $r  = protected_roots({
+        registry => {}, extra_list => ['/opt/gone', '/opt/here'],
+        env => $env_of->(CLAUDE_CONFIG_DIR => '/home/u/.claude'),
+        exists => $no_fs, read_file => $no_fs, realpath => $rp,
+    });
+    ok(has_root($r, '/opt/gone', 'user-configured'),
+        'AC-51: an unresolvable root is KEPT at its lexical path (never dropped)');
+    ok(has_root($r, '/opt/here', 'user-configured'),
+        'AC-51: the resolvable sibling root is unaffected');
+    is(count_error_code($r, 'root-unresolved'), 1,
+        'AC-51: exactly one root-unresolved error, naming the unresolvable candidate');
+    my ($err) = grep { $_->{code} eq 'root-unresolved' } @{ $r->{errors} };
+    like($err->{detail}, qr{/opt/gone},
+        'AC-51: the root-unresolved detail names the offending path (so the launcher can warn about it)');
+}
+
+# AC-52 — a realpath seam that DIES behaves identically to one returning
+# undef, and protected_roots itself never dies (spec §0 C-0.2). The eval
+# wrapping the seam call in CcpraxisWorkCopy::_same_path is the precedent.
+{
+    my $rp = sub { die "boom\n" if $_[0] eq '/opt/gone'; return $_[0] };
+    my $r  = eval { protected_roots({
+        registry => {}, extra_list => ['/opt/gone', '/opt/here'],
+        env => $env_of->(CLAUDE_CONFIG_DIR => '/home/u/.claude'),
+        exists => $no_fs, read_file => $no_fs, realpath => $rp,
+    }) };
+    is($@, '', 'AC-52: protected_roots does not die when the realpath seam dies');
+    ok(defined $r && has_root($r, '/opt/gone', 'user-configured'),
+        'AC-52: a dying seam degrades that candidate to its lexical path');
+    is(count_error_code($r, 'root-unresolved'), 1,
+        'AC-52: a dying seam yields exactly one root-unresolved error (same as undef)');
+    ok(has_root($r, '/opt/here', 'user-configured'),
+        'AC-52: a dying seam for one candidate leaves the others intact');
+}
+
+# AC-53 — ORDER: resolve BEFORE dedup. Two candidates that are different
+# symlinks to the same real directory must collapse to ONE root, and the
+# survivor keeps the higher-ranked reason (%REASON_RANK: claude-home 1 beats
+# user-configured 4). Dedup-before-resolve would leave two roots.
+{
+    my %map = ('/home/u/.claude' => '/real/claude', '/opt/link' => '/real/claude');
+    my $rp  = sub { $map{$_[0]} // $_[0] };
+    my $r   = protected_roots({
+        registry => {}, extra_list => ['/opt/link'],
+        env => $env_of->(CLAUDE_CONFIG_DIR => '/home/u/.claude'),
+        exists => $no_fs, read_file => $no_fs, realpath => $rp,
+    });
+    is((grep { $_->{path} eq '/real/claude' } @{ $r->{roots} }), 1,
+        'AC-53: two symlinks to one real directory collapse to exactly one root');
+    ok(has_root($r, '/real/claude', 'claude-home'),
+        'AC-53: the surviving reason is the higher-ranked one (claude-home over user-configured)');
+}
+
+# AC-54 — ORDER: resolve BEFORE reject. A candidate whose realpath maps it to
+# a bare root must be rejected, not adopted. Reject-before-resolve lets
+# finding 3's machine-wide outage arrive through finding 1's hole.
+{
+    my $rp = sub { return $_[0] eq '/opt/sneaky' ? '/' : $_[0] };
+    my $r  = protected_roots({
+        registry => {}, extra_list => ['/opt/sneaky', '/opt/fine'],
+        env => $env_of->(CLAUDE_CONFIG_DIR => '/home/u/.claude'),
+        exists => $no_fs, read_file => $no_fs, realpath => $rp,
+    });
+    is((grep { $_->{path} eq '/' } @{ $r->{roots} }), 0,
+        'AC-54: a candidate resolving to a bare root does not become a root');
+    ok(has_error_code($r, 'root-bare-rejected'),
+        'AC-54: it is rejected loudly via root-bare-rejected (resolution precedes rejection)');
+    ok(has_root($r, '/opt/fine', 'user-configured'),
+        'AC-54: the well-formed sibling root still protects normally');
+}
+
+# AC-55 — path_relation still never consults realpath. This restates AC-22's
+# invariant as a q04-owned assertion so this package cannot regress it,
+# WITHOUT editing AC-22 (spec §7: zero existing assertions retargeted).
+{
+    my $boom = sub { die "path_relation must not consult realpath\n" };
+    my $rel  = eval { path_relation('/a/b/c', '/a/b', { realpath => $boom }) };
+    is($@, '', 'AC-55: path_relation does not invoke the realpath seam (q04-owned restatement of AC-22)');
+    is($rel, 'descendant', 'AC-55: path_relation remains a pure lexical predicate');
+}
+
+# =====================================================================
+# q04 §2 — environment-independent home candidates (AC-56..61).
+#
+# TWO NOTIONS OF "HOME", opposite bias (spec §2.1) — conflating them is a
+# defect:
+#   notion A  home_candidates : MAXIMAL. Missing a candidate SHRINKS the
+#             protected set (fails open), which Decision #6 forbids. Feeds
+#             claude-home roots and the default registry/extra-list sources.
+#   notion B  _user_home      : MINIMAL, env-derived, EXACTLY as Appendix B
+#             Decision #2 mandates. Feeds the 'user-home' target reason code
+#             and the §3 rejection. Unchanged by q04 — widening it would
+#             remove roots and refuse legitimate projects.
+#
+# The env-independent probes are injected via the `home_probes` seam, which
+# returns zero or more HOME DIRECTORIES (as getpwuid's pw_dir would); the
+# module derives "$home/.claude" from each. Every probe is independently
+# eval-wrapped: a probe that fails contributes nothing and is NOT an error.
+# =====================================================================
+
+# AC-56 — cross-platform half of finding 2: a decoy HOME cannot displace the
+# real home when USERPROFILE still names it (guards the existing union).
+{
+    my $r = protected_roots({
+        registry => {}, extra_list => [],
+        env => $env_of->(HOME => '/tmp/decoy', USERPROFILE => '/real/home'),
+        exists => $no_fs, read_file => $no_fs, realpath => $rp_id,
+    });
+    ok(has_root($r, '/real/home/.claude', 'claude-home'),
+        'AC-56: a decoy HOME does not remove the real home\'s .claude from the protected set');
+    ok(has_root($r, '/tmp/decoy/.claude', 'claude-home'),
+        'AC-56: the decoy contributes an EXTRA root (over-refusal is the safe direction, Decision #6)');
+}
+
+# AC-57 — finding 2's core claim: an env-independent probe still yields its
+# claude-home root when EVERY environment variable the module reads is a
+# decoy. This is the assertion that a redirected environment cannot shrink
+# the protected set.
+{
+    my $r = protected_roots({
+        registry => {}, extra_list => [],
+        env => $env_of->(HOME => '/tmp/decoy', USERPROFILE => '/tmp/decoy2',
+                         CLAUDE_CONFIG_DIR => '/tmp/decoy3'),
+        home_probes => sub { return ('/real/home') },
+        exists => $no_fs, read_file => $no_fs, realpath => $rp_id,
+    });
+    ok(has_root($r, '/real/home/.claude', 'claude-home'),
+        'AC-57: an env-independent home probe yields its claude-home root despite all-decoy environment');
+    ok(has_root($r, '/tmp/decoy3', 'claude-home'),
+        'AC-57: the probe is ADDITIVE — env-derived candidates are still present, not replaced');
+}
+
+# AC-58 — the residue that lives in THIS module: $home_raw (:381) is a single
+# precedence-ordered value and $registry_default (:415) is derived from it, so
+# a redirected HOME poisons the module's OWN default registry path regardless
+# of what the launcher passes. The source must become a candidate SET.
+{
+    my $real_reg = '/real/home/.claude/plugins/known_marketplaces.json';
+    my $r = protected_roots({
+        extra_list => [],
+        env => $env_of->(HOME => '/tmp/decoy'),
+        home_probes => sub { return ('/real/home') },
+        exists     => sub { return $_[0] eq $real_reg ? 1 : 0 },
+        read_file  => sub {
+            return '{"gh":{"source":{"source":"github","repo":"o/r"},'
+                 . '"installLocation":"/real/home/.claude/plugins/marketplaces/gh"}}'
+                if $_[0] eq $real_reg;
+            die "unexpected read of $_[0]\n";
+        },
+        realpath => $rp_id,
+    });
+    ok(has_root($r, '/real/home/.claude/plugins/marketplaces/gh', 'marketplace-install'),
+        'AC-58: a registry found under a non-$home_raw home candidate still contributes its roots');
+}
+
+# AC-59 — an explicitly supplied registry_path (the launcher always supplies
+# one) is honoured AND unioned with any candidate-derived registry, never
+# replaced by it.
+{
+    my $explicit = '/explicit/known_marketplaces.json';
+    my $probe_reg = '/real/home/.claude/plugins/known_marketplaces.json';
+    my $r = protected_roots({
+        registry_path => $explicit,
+        extra_list    => [],
+        env => $env_of->(HOME => '/tmp/decoy'),
+        home_probes => sub { return ('/real/home') },
+        exists    => sub { return ($_[0] eq $explicit || $_[0] eq $probe_reg) ? 1 : 0 },
+        read_file => sub {
+            return '{"a":{"source":{"source":"github","repo":"o/a"},"installLocation":"/roots/from-explicit"}}'
+                if $_[0] eq $explicit;
+            return '{"b":{"source":{"source":"github","repo":"o/b"},"installLocation":"/roots/from-probe"}}'
+                if $_[0] eq $probe_reg;
+            die "unexpected read of $_[0]\n";
+        },
+        realpath => $rp_id,
+    });
+    ok(has_root($r, '/roots/from-explicit', 'marketplace-install'),
+        'AC-59: the explicitly supplied registry_path is still read');
+    ok(has_root($r, '/roots/from-probe', 'marketplace-install'),
+        'AC-59: a candidate-derived registry is UNIONED with it, not replaced by it');
+}
+
+# AC-60 — notion B is UNCHANGED. Appendix B Decision #2 specifies _user_home
+# literally as %USERPROFILE% on Windows else $HOME; q04 must not silently
+# override a user decision. Restates AC-45's guarantee as a q04-owned
+# assertion without editing AC-45.
+{
+    my $env = $env_of->(USERPROFILE => '/Users/w', HOME => '/home/u');
+    is_deeply(target_self_codes('/Users/w', { env => $env, windows => 1 }), ['user-home'],
+        'AC-60: notion B unchanged — windows=>1 still uses %USERPROFILE% (Decision #2)');
+    is_deeply(target_self_codes('/home/u', { env => $env, windows => 0 }), ['user-home'],
+        'AC-60: notion B unchanged — windows=>0 still uses $HOME (Decision #2)');
+}
+
+# AC-61 — a probe that dies contributes nothing, raises NO error, and leaves
+# the rest of the candidate set intact (spec §0 C-0.2: never dies).
+{
+    my $r = eval { protected_roots({
+        registry => {}, extra_list => [],
+        env => $env_of->(CLAUDE_CONFIG_DIR => '/home/u/.claude'),
+        home_probes => sub { die "probe exploded\n" },
+        exists => $no_fs, read_file => $no_fs, realpath => $rp_id,
+    }) };
+    is($@, '', 'AC-61: protected_roots does not die when a home probe dies');
+    ok(defined $r && has_root($r, '/home/u/.claude', 'claude-home'),
+        'AC-61: a dying probe leaves the env-derived candidates intact');
+    is(count_error_code($r, 'home-probe-failed'), 0,
+        'AC-61: a failed probe is not an error (best-effort, additive only)');
+}
+
+# =====================================================================
+# q04 §3 — reject roots that normalise to the user home (AC-62..67).
+#
+# The bare-root half already exists (AC-37 / _is_bare_root). This is the
+# missing user-home half. Without it, ONE malformed installLocation that
+# climbs to the user's home makes EVERY project on the machine a descendant
+# of a protected root — and with no override (Decision #3) that is an
+# unrecoverable outage, not an inconvenience.
+#
+# Rejection uses notion B (minimal, env-derived), NOT notion A: using the
+# maximal candidate set here would reject more roots and weaken the guard.
+# =====================================================================
+
+# AC-62 — the outage reproduction. An installLocation that climbs out of the
+# plugins dir lands exactly on the user home.
+# '/home/u/.claude/plugins/../..' normalises to '/home/u'.
+{
+    my $reg = { bad => { source => { source => 'github', repo => 'o/r' },
+                         installLocation => '/home/u/.claude/plugins/../..' } };
+    my $r = protected_roots({
+        registry => $reg, extra_list => [],
+        env => $env_of->(HOME => '/home/u'), windows => 0,
+        exists => $no_fs, read_file => $no_fs, realpath => $rp_id,
+    });
+    is((grep { $_->{path} eq '/home/u' } @{ $r->{roots} }), 0,
+        'AC-62: a root normalising to the user home is NOT adopted');
+    is(count_error_code($r, 'root-home-rejected'), 1,
+        'AC-62: exactly one root-home-rejected error (loud, never silent)');
+}
+
+# AC-63 — the remaining roots still protect normally: a per-candidate
+# rejection, never an abort of the whole set.
+{
+    my $reg = {
+        bad  => { source => { source => 'github', repo => 'o/r' },
+                  installLocation => '/home/u/.claude/plugins/../..' },
+        good => { source => { source => 'github', repo => 'o/g' },
+                  installLocation => '/home/u/.claude/plugins/marketplaces/good' },
+    };
+    my $r = protected_roots({
+        registry => $reg, extra_list => ['/opt/keep'],
+        env => $env_of->(HOME => '/home/u'), windows => 0,
+        exists => $no_fs, read_file => $no_fs, realpath => $rp_id,
+    });
+    ok(has_root($r, '/home/u/.claude/plugins/marketplaces/good', 'marketplace-install'),
+        'AC-63: a well-formed marketplace root survives alongside the rejected one');
+    ok(has_root($r, '/opt/keep', 'user-configured'),
+        'AC-63: the extra-list root survives too');
+    ok(scalar @{ $r->{roots} } > 0,
+        'AC-63: rejecting a bad root never empties the protected set');
+}
+
+# AC-64 — ANTI-OVER-CORRECTION, the most important assertion in this section.
+# The home itself is rejected, but ~/.claude — a DESCENDANT of the home — is
+# the guard's single highest-value root (C5) and must be KEPT. A fix that
+# rejects descendants deletes the guard it was meant to repair.
+{
+    my $r = protected_roots({
+        registry => {}, extra_list => ['/home/u', '/home/u/.claude'],
+        env => $env_of->(HOME => '/home/u'), windows => 0,
+        exists => $no_fs, read_file => $no_fs, realpath => $rp_id,
+    });
+    is((grep { $_->{path} eq '/home/u' } @{ $r->{roots} }), 0,
+        'AC-64: the user home itself is rejected (exact match)');
+    # Asserted by PATH, not by reason: '/home/u/.claude' is contributed both by
+    # the extra list (user-configured, rank 4) and by the claude-home
+    # derivation from $HOME (rank 1), and dedup keeps the higher-ranked
+    # reason. What matters here is only that the descendant SURVIVES.
+    is((grep { $_->{path} eq '/home/u/.claude' } @{ $r->{roots} }), 1,
+        'AC-64: ~/.claude, a DESCENDANT of the home, is KEPT — rejection is exact-match only');
+    ok(has_root($r, '/home/u/.claude', 'claude-home'),
+        'AC-64: and it survives under its higher-ranked claude-home reason');
+}
+
+# AC-65 — case-folding (Decision #8): the comparison is segment-aware and
+# honours the platform fold rule, not naive string equality.
+{
+    my %args = (
+        registry => {}, extra_list => ['/HOME/U'],
+        env => $env_of->(HOME => '/home/u'), windows => 0,
+        exists => $no_fs, read_file => $no_fs, realpath => $rp_id,
+    );
+    my $rf = protected_roots({ %args, fold_case => 1 });
+    is((grep { $_->{path} eq '/HOME/U' } @{ $rf->{roots} }), 0,
+        'AC-65: fold_case=>1 — a candidate differing from the home only in case is still rejected');
+    my $rs = protected_roots({ %args, fold_case => 0 });
+    ok(has_root($rs, '/HOME/U', 'user-configured'),
+        'AC-65: fold_case=>0 — case-sensitive platforms treat it as a distinct, legitimate root');
+}
+
+# AC-66 — the new code is an ERROR code, never a root reason (extends AC-47's
+# invariant, which forbids target-side codes leaking into roots).
+{
+    my $reg = { bad => { source => { source => 'github', repo => 'o/r' },
+                         installLocation => '/home/u/.claude/plugins/../..' } };
+    my $r = protected_roots({
+        registry => $reg, extra_list => [],
+        env => $env_of->(HOME => '/home/u'), windows => 0,
+        exists => $no_fs, read_file => $no_fs, realpath => $rp_id,
+    });
+    is((grep { $_->{reason} eq 'root-home-rejected' } @{ $r->{roots} }), 0,
+        'AC-66: root-home-rejected never appears as a reason on a returned root');
+}
+
+# AC-67 — MANDATORY C6 REGRESSION (blueprint.md:176-179). An ordinary ccpraxis
+# CLONE outside the install is not a registered marketplace, not the home and
+# not bare, so it must remain unprotected and still launch. THIS BLUEPRINT IS
+# ITSELF EXECUTING FROM SUCH A CLONE — resolving roots must not break it.
+{
+    my $clone = '/work/ccpraxis-clone';
+    my $r = protected_roots({
+        registry => $REG, extra_list => [],
+        env => $env_of->(HOME => '/home/u', CLAUDE_CONFIG_DIR => '/home/u/.claude'),
+        windows => 0,
+        exists => $no_fs, read_file => $no_fs, realpath => $rp_id,
+    });
+    my @related = grep { path_relation($clone, $_->{path}) ne 'unrelated' } @{ $r->{roots} };
+    is(scalar(@related), 0,
+        'AC-67: C6 — an ordinary ccpraxis clone is unrelated to every protected root (must still launch)');
+    is((grep { $_->{path} eq $clone } @{ $r->{roots} }), 0,
+        'AC-67: C6 — the clone is not itself adopted as a protected root');
+    is(count_error_code($r, 'root-home-rejected'), 0,
+        'AC-67: C6 — a legitimate configuration produces no spurious home rejection');
+}
+
+# =====================================================================
+# q04 §4 — normalize_path honours a `windows` option (MINOR-8) (AC-68..71).
+#
+# Narrower than "the module ignores windows": AC-45 above already proves the
+# option IS honoured through target_self_codes/_user_home. The one real defect
+# is that normalize_path takes NO $opts at all, so it calls the argless
+# _windows_family() and the ambient platform probe wins — which makes the
+# Windows-only normalisation rules untestable on a Linux runner. That is the
+# concrete cost, and AC-69 is the assertion that could not be written before.
+# =====================================================================
+
+# AC-68 — the option is accepted and honoured on any host.
+{
+    is(normalize_path('C:/a/b/./c', { windows => 1 }), 'C:/a/b/c',
+        'AC-68: normalize_path honours windows=>1 (drive-letter path normalises)');
+    is(normalize_path('/a/b/./c', { windows => 0 }), '/a/b/c',
+        'AC-68: normalize_path honours windows=>0 (POSIX path normalises)');
+}
+
+# AC-69 — the Windows-only trailing dot/space strip (:111-121) fires under
+# windows=>1 and must NOT fire under windows=>0, ON LINUX. On POSIX "foo." and
+# "foo " are legitimately distinct directory names; on Windows they alias
+# "foo". This pair is what MINOR-8 made impossible to assert on a Linux host.
+{
+    is(normalize_path('/a/foo./b', { windows => 1 }), '/a/foo/b',
+        'AC-69: windows=>1 strips a trailing dot from a segment (Win32 filesystem quirk)');
+    is(normalize_path('/a/foo /b', { windows => 1 }), '/a/foo/b',
+        'AC-69: windows=>1 strips a trailing space from a segment');
+    is(normalize_path('/a/foo./b', { windows => 0 }), '/a/foo./b',
+        'AC-69: windows=>0 PRESERVES a trailing dot — distinct name on POSIX');
+    is(normalize_path('/a/foo /b', { windows => 0 }), '/a/foo /b',
+        'AC-69: windows=>0 PRESERVES a trailing space — distinct name on POSIX');
+    is(normalize_path('/a/../b', { windows => 1 }), '/b',
+        'AC-69: the ".." marker is exempt from the strip and still resolves under windows=>1');
+}
+
+# AC-70 — BACK-COMPAT GUARD. Called with no second argument, behaviour is
+# byte-identical to today. launcher.pl calls normalize_path($x) with one
+# argument at :458 and :487; that must not change meaning.
+{
+    is(normalize_path('/a/b/./c'), '/a/b/c',
+        'AC-70: no-opts call still normalises POSIX paths as before');
+    is(normalize_path('/a/b/../c'), '/a/c',
+        'AC-70: no-opts call still resolves ".." as before');
+    is(normalize_path('//'), '/',
+        'AC-70: no-opts all-slash pre-guard still returns "/"');
+    is(normalize_path(''), undef,
+        'AC-70: no-opts empty string is still undef');
+    is(normalize_path('   '), undef,
+        'AC-70: no-opts whitespace-only is still undef');
+    is(normalize_path({}), undef,
+        'AC-70: no-opts ref is still undef (ref guard intact)');
+}
+
+# AC-71 — path_relation threads its own opts into BOTH ingestions, so a
+# Windows-quirk path pair compares consistently on a Linux host.
+{
+    is(path_relation('/a/foo./b', '/a/foo', { windows => 1 }), 'descendant',
+        'AC-71: windows=>1 threads through path_relation — "foo." aliases "foo", so b is inside');
+    is(path_relation('/a/foo./b', '/a/foo', { windows => 0 }), 'unrelated',
+        'AC-71: windows=>0 threads through — "foo." is a distinct segment, so it is unrelated');
 }
 
 # =====================================================================
