@@ -34,16 +34,21 @@ use JSON::PP ();
 our $MAX_REGISTRY_BYTES = 4 * 1024 * 1024;   # 4 MiB, mirrors SessionFilter
 our $MAX_LEDGER_BYTES   = 65536;             # 64 KiB of a package ledger is plenty for frontmatter
 our $MAX_MARKER_BYTES   = 4096;              # .orchestrator / .paused are tiny
+our $MAX_PACKAGES       = 512;               # a registry with more package keys than this is
+                                              # treated as unreadable (skip the blueprint), same
+                                              # degradation the byte caps above already use
 
 # _read_capped($path, $cap) -> $bytes|undef (private)
 #
 # Reads a plain file, capped at $cap+1 bytes so an over-cap file is detected
-# without slurping it whole. Returns undef for: not a plain file, open
-# failure, empty file, or a file whose length exceeds $cap ("a file larger
-# than its cap is treated exactly as an unreadable file").
+# without slurping it whole. Returns undef for: not a plain file, a symlink
+# (extends blueprint_dirs' -l skip one level down), open failure, empty
+# file, or a file whose length exceeds $cap ("a file larger than its cap is
+# treated exactly as an unreadable file").
 sub _read_capped {
     my ($path, $cap) = @_;
     return undef unless defined $path && -f $path;
+    return undef if -l $path;
     open my $fh, '<:raw', $path or return undef;
     my $blob = '';
     my $n = read($fh, $blob, $cap + 1);
@@ -77,15 +82,21 @@ sub blueprint_dirs {
 # _safe_pkg_name($pkg) -> 0|1 (private)
 #
 # A package key is "safe" (eligible for a packages/<pkg>.md ledger read) iff
-# it is a defined, non-ref scalar containing none of '/', '\', NUL; does not
-# begin with '.'; and is no longer than 128 bytes. Anything else falls
-# through to the registry status without ever attempting an open().
+# it is a defined, non-ref scalar containing none of '/', '\', ':', NUL; does
+# not begin with '.'; is no longer than 128 bytes; and is not a Windows
+# reserved device name (CON/PRN/AUX/NUL/COM1-9/LPT1-9, with or without an
+# extension) -- defense in depth for the repo's documented primary host, in
+# case a future filesystem layer ever makes "$pkg.md" resolve to a device
+# rather than a regular file. Anything else falls through to the registry
+# status without ever attempting an open().
 sub _safe_pkg_name {
     my ($pkg) = @_;
     return 0 unless defined $pkg && !ref($pkg) && length($pkg);
     return 0 if $pkg =~ /[\/\\\x00]/;
     return 0 if $pkg =~ /^\./;
     return 0 if length($pkg) > 128;
+    return 0 if $pkg =~ /:/;
+    return 0 if $pkg =~ /\A(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|\z)/i;
     return 1;
 }
 
@@ -93,11 +104,18 @@ sub _safe_pkg_name {
 #
 # Trims leading/trailing whitespace, lowercases. Accepts only
 # /^[a-z][a-z0-9_-]{0,31}$/; anything else (undef, a ref, '', "12", a 200-
-# char blob) becomes the unknown status ''.
+# char blob) becomes the unknown status ''. Rejects anything over 64 bytes
+# before trimming (the accept regex tops out at 32 chars anyway; the length
+# guard also sidesteps CVE-class quadratic-backtracking risk in the trim
+# below by bounding its input) and uses two anchored, non-/g substitutions
+# rather than a /g-driven alternation, so the trim is O(n) rather than O(n^2)
+# on an interior whitespace run.
 sub _normalize_status {
     my ($raw) = @_;
     return '' if !defined $raw || ref $raw;
-    $raw =~ s/^\s+|\s+$//g;
+    return '' if length($raw) > 64;
+    $raw =~ s/\A\s+//;
+    $raw =~ s/\s+\z//;
     $raw = lc $raw;
     return ($raw =~ /^[a-z][a-z0-9_-]{0,31}$/) ? $raw : '';
 }
@@ -108,8 +126,11 @@ sub _normalize_status {
 # ledger read is skipped entirely (no open attempted) for an unsafe $pkg. The
 # file must begin with a line that is exactly '---'; subsequent lines are
 # scanned until the next line that is exactly '---' or EOF; within that
-# block, the first line matching /^status:\s*(.*?)\s*$/ supplies the raw
-# status, which is then normalised.
+# block, the first line matching /^status:[ \t]*(.*)$/ supplies the raw
+# status (trimming is left to _normalize_status, which does it with two
+# anchored non-/g substitutions rather than the ambiguous-quantifier
+# /^status:\s*(.*?)\s*$/ shape, which is quadratic on an interior
+# whitespace run).
 sub _ledger_status {
     my ($blueprint_dir, $pkg) = @_;
     return '' unless _safe_pkg_name($pkg);
@@ -121,7 +142,8 @@ sub _ledger_status {
     for (my $i = 1; $i <= $#lines; $i++) {
         my $line = $lines[$i];
         last if $line eq '---';
-        if (!defined $raw_status && $line =~ /^status:\s*(.*?)\s*$/) {
+        next if length($line) > 1024;
+        if (!defined $raw_status && $line =~ /^status:[ \t]*(.*)$/) {
             $raw_status = $1;
         }
     }
@@ -144,12 +166,15 @@ sub _effective_status {
 # _orchestrator_pid($path) -> $pid|undef (private)
 #
 # The first integer found in the (capped) file content, or undef when the
-# file is absent, unreadable, over cap, or holds no integer at all.
+# file is absent, unreadable, over cap, or holds no integer at all. The
+# digit run is bounded to 10 characters -- more than any real PID on any
+# supported platform -- so a marker stuffed with thousands of digits can
+# never numify to Inf (S2.2 promises a Perl integer, not a float).
 sub _orchestrator_pid {
     my ($path) = @_;
     my $blob = _read_capped($path, $MAX_MARKER_BYTES);
     return undef unless defined $blob;
-    return ($blob =~ /(\d+)/) ? ($1 + 0) : undef;
+    return ($blob =~ /(\d{1,10})/) ? ($1 + 0) : undef;
 }
 
 # _paused_info($path) -> ($paused_manual, $paused_reason) (private)
@@ -163,6 +188,7 @@ sub _paused_info {
     my ($path) = @_;
     my $blob = _read_capped($path, $MAX_MARKER_BYTES);
     return (0, undef) unless defined $blob;
+    local $@;
     my $data = eval { JSON::PP->new->decode($blob) };
     return (0, undef) unless ref($data) eq 'HASH';
     my $manual = $data->{manual} ? 1 : 0;
@@ -175,10 +201,11 @@ sub _paused_info {
 #
 # opendir $needs_you_dir; counts entries that are plain files, skipping any
 # name beginning with '.' and any name ending in '.tmp'. Missing directory,
-# or opendir failure -> 0. Deliberately identical to launcher.pl's
-# _count_needs_you inner loop (AC-25).
+# a symlinked directory, or opendir failure -> 0. Deliberately identical to
+# launcher.pl's _count_needs_you inner loop (AC-25).
 sub _count_decisions {
     my ($dir) = @_;
+    return 0 if -l $dir;
     return 0 unless -d $dir;
     opendir(my $dh, $dir) or return 0;
     my $n = 0;
@@ -209,21 +236,38 @@ sub summarize_dir {
 
     my $blob = _read_capped("$runs_dir/registry.json", $MAX_REGISTRY_BYTES);
     return undef unless defined $blob;
+    local $@;
     my $data = eval { JSON::PP->new->decode($blob) };
     return undef unless ref($data) eq 'HASH';
 
     my $pkgs = (ref($data->{packages}) eq 'HASH') ? $data->{packages} : {};
-    my $packages_total = scalar keys %$pkgs;
+    # MINOR-5: exclude butler's underscore-prefixed bookkeeping pseudo-keys
+    # (e.g. "_run", written by bp-remediate.pl) from the package count/loop --
+    # they are not packages and inflate the denominator with a status-less
+    # entry.
+    my @pkg_keys = grep { !/\A_/ } keys %$pkgs;
+    my $packages_total = scalar @pkg_keys;
+    # MAJOR-2: a registry whose package count exceeds $MAX_PACKAGES is
+    # treated as unreadable (skip the blueprint) -- the same "over cap ->
+    # unreadable" degradation the byte caps above already use, so a
+    # cap-compliant-by-bytes-but-cardinality-hostile registry cannot force a
+    # 10s-cadence walk of hundreds of thousands of keys.
+    return undef if $packages_total > $MAX_PACKAGES;
 
     my $packages_done = 0;
     my $running_count  = 0;
     my $current_package;
-    for my $pkg (sort keys %$pkgs) {
+    for my $pkg (sort @pkg_keys) {
         my $status = _effective_status($blueprint_dir, $pkg, $pkgs->{$pkg});
         $packages_done++ if $status eq 'done';
         if ($status eq 'running') {
             $running_count++;
-            $current_package = $pkg unless defined $current_package;
+            # MAJOR-3: current_package is a display value (s11 renders the
+            # same struct); bound its length at the producer so an
+            # oversized registry key can never reach a per-character
+            # sanitizer downstream at full length.
+            $current_package = (length($pkg) > 128 ? substr($pkg, 0, 128) : $pkg)
+                unless defined $current_package;
         }
     }
 

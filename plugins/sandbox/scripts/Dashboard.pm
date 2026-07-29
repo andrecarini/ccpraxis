@@ -945,7 +945,11 @@ sub _one_run_line {
     push @spans, { text => sprintf('  %d/%d pkg', $done, $total), role => 'value' };
 
     if (defined($s->{current_package}) && !ref($s->{current_package}) && length($s->{current_package})) {
-        push @spans, { text => "  cur $s->{current_package}", role => 'strong' };
+        # MAJOR-3 (fix-batch): defensive truncation at the renderer, in
+        # addition to RunState.pm's producer-side bound -- never hand _safe
+        # more than a line's worth, regardless of what produced the struct.
+        my $cp = substr($s->{current_package}, 0, 200);
+        push @spans, { text => "  cur $cp", role => 'strong' };
     }
 
     my $coord = _run_int($s->{running_coordinators});
