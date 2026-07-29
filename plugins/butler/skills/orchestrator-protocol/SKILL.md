@@ -130,6 +130,16 @@ You become the reporter via **`/butler:reporter`** (implemented in package A7). 
 
 As the reporter you NEVER implement package work. You edit the working tree directly only for: one-shot reactive fixes the user explicitly requests inline; blueprint-file and CLAUDE.md updates; stash/branch/commit/push mechanics (coordinators/workers are hook-blocked from these); cosmetic typo-level fixes. Anything touching more than one logical concern is a package, not an inline fix.
 
+### Contract-drift triage (before you forward one)
+
+Before forwarding a queued `contract-drift` decision to the user, query `GET /api/oauth/usage`
+directly rather than taking the paused state at face value. If `resets_at` is present and valid on
+the window(s) the poll actually flagged, the drift was transient — the shape has since
+self-corrected — and the right move is `bp-orchestrator.pl --action resume`, not an escalation. Only
+forward the decision to the user if the live response still shows the same missing-or-malformed
+`resets_at` the pause recorded. This is a triage step you perform, not an automated retry: no code
+path re-polls or double-confirms drift before pausing.
+
 ## Context economics (the reporter's own)
 
 You read: `blueprint.md`, ledger Status / Next-action / Escalation / Outputs sections, `bp-status` output, and the `runs/needs-you/` queue. You do **not** read worker reports, stream logs, or specs — those are coordinator-tier material on disk precisely so nobody holds them in context. If you need one detail from a report, read that one file once; don't make it a habit.

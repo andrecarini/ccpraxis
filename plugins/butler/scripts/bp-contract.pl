@@ -36,7 +36,11 @@ sub validate_usage {
         } elsif ($o->{utilization} < 0 || $o->{utilization} > 100) {
             push @p, "usage: $w.utilization out of 0..100 (got $o->{utilization})";
         }
-        push @p, "usage: $w.resets_at missing or not ISO-8601" unless _is_iso8601($o->{resets_at});
+        # An idle window (utilization 0) legitimately has no resets_at — requiring it
+        # here false-positived a contract-drift and paused whole unattended fleets (b28).
+        if (_is_num($o->{utilization}) && $o->{utilization} > 0) {
+            push @p, "usage: $w.resets_at missing or not ISO-8601" unless _is_iso8601($o->{resets_at});
+        }
     }
     return (@p ? 0 : 1, \@p);
 }
