@@ -76,4 +76,70 @@ sub close_log {
     close $fh;
 }
 
+# recent_logs($dir, $n, $exclude) -> @paths (spec S2.1)
+# Enumerate the newest-$n prior "launch-*.log" files in $dir (mtime descending,
+# basename-descending tie-break), excluding $exclude (compared as a basename,
+# BEFORE truncation). TOTAL: never dies/warns; opendir/readdir only, never glob
+# (a project path may contain spaces or non-ASCII bytes).
+sub recent_logs {
+    my ($dir, $n, $exclude) = @_;
+    return () unless defined $dir && length $dir;
+    $n = 5 unless defined $n && $n =~ /^\d+$/ && $n >= 1;
+    (my $base = $dir) =~ s{[\\/]+$}{};
+    my @cand;
+    my $ok = eval {
+        opendir(my $dh, $base) or return 0;
+        my @names = readdir($dh);
+        closedir($dh);
+        for my $name (@names) {
+            next unless defined $name && $name =~ /^launch-[^.]+\.log$/;
+            next if defined $exclude && length $exclude && $name eq $exclude;
+            my $path = "$base/$name";
+            next unless -f $path;
+            my $mtime = (stat($path))[9];
+            next unless defined $mtime;
+            push @cand, [ $mtime, $name, $path ];
+        }
+        1;
+    };
+    return () unless $ok;
+    @cand = sort { $b->[0] <=> $a->[0] || $b->[1] cmp $a->[1] } @cand;
+    splice(@cand, $n) if @cand > $n;
+    return map { $_->[2] } @cand;
+}
+
+# merge_sessions(\@groups, %opts) -> \@merged (spec S2.2)
+# Pure merge of per-session item groups (oldest first, LAST group is the
+# current session) into one chronological list with an optional
+# session-boundary marker and a total cap. Items are OPAQUE -- never
+# inspected, copied or stringified. TOTAL: never dies/warns.
+sub merge_sessions {
+    my ($groups, %opts) = @_;
+    my @g = (ref $groups eq 'ARRAY') ? @$groups : ();
+    @g = map { (ref $_ eq 'ARRAY') ? $_ : [] } @g;
+    return [] unless @g;
+
+    my @cur  = @{ pop @g };
+    my @hist = map { @$_ } @g;
+
+    my $max = $opts{max};
+    $max = 50 unless defined $max && $max =~ /^\d+$/ && $max >= 1;
+
+    my $marker = $opts{marker};
+    my $want_marker = (defined $marker) && @hist && @cur;
+
+    my $room = $max - scalar(@cur);
+    $room -= 1 if $want_marker;
+
+    @hist = () if $room <= 0;
+    @hist = @hist[ -$room .. -1 ] if $room > 0 && @hist > $room;
+
+    $want_marker = 0 unless @hist;
+
+    my @out = (@hist, ($want_marker ? ($marker) : ()), @cur);
+    @out = @out[ -$max .. -1 ] if @out > $max;
+
+    return \@out;
+}
+
 1;

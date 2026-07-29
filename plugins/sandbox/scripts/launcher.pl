@@ -311,6 +311,14 @@ my $LAUNCH_LOG;
 my $LAUNCH_ID = strftime("%Y%m%dT%H%M%SZ", gmtime()) . "-$$";
 sub log_ev { LaunchLog::event($LAUNCH_LOG, @_) }
 
+# s13-activity-history: read-side caps for aggregating recent activity across
+# restarts. See LaunchLog::recent_logs / merge_sessions and _history_events
+# (below) for how these compose (spec S2.4a / S2.6).
+my $HISTORY_LOG_FILES      = 5;    # prior launch logs consulted
+my $HISTORY_TAIL_LINES     = 50;   # lines tailed from EACH prior log
+my $HISTORY_EVENTS_PER_LOG = 10;   # parsed events kept from EACH prior log
+my $ACTIVITY_EVENT_MAX     = 50;   # total events handed to state.events (unchanged ceiling)
+
 # A non-empty backpack-install warning (set during the setup pass) that the
 # dashboard renders as a red alert banner — so a failure isn't lost behind the
 # alt-screen the way the pre-dashboard stdout warning is (#20). File-scope so the
@@ -2859,6 +2867,11 @@ sub enter_dashboard {
 
     require Term::ReadKey;
     my $log_path = "$CLAUDE_DATA/sandbox-logs/launch-$LAUNCH_ID.log";
+    # s13: prior-session activity. Read ONCE, here, not per gather tick -- prior logs
+    # are effectively immutable for this dashboard's lifetime, and an opendir + up to
+    # five file reads per frame would be a real regression in the hot path. Reading it
+    # once also keeps the boundary marker's position stable (no flicker).
+    my @hist_groups = _history_events("$CLAUDE_DATA/sandbox-logs", "launch-$LAUNCH_ID.log");
     my $cached_status           = 'unknown';
     my $cached_machine_state    = 'unknown';   # s12: _machine_state, refreshed on the 10s inspect round
     my $cached_busy_age         = undef;   # B5: age (s) of /tmp/.butler-busy in CONTAINER time, or undef
@@ -3006,6 +3019,7 @@ sub enter_dashboard {
             # Run panel (so the view never re-derives the freshness threshold).
             my $stay = KeepAwake::should_stay_awake($busy_age, $BUSY_STALE) ? 1 : 0;
             my @lines = _tail_lines($log_path, 200);
+            my $cur   = Dashboard::recent_events(\@lines, $ACTIVITY_EVENT_MAX);
             return {
                 project_name    => $PROJECT_NAME,
                 container       => $CONTAINER_NAME,
@@ -3016,7 +3030,11 @@ sub enter_dashboard {
                 # re-probes authoritatively) instead of reporting the stage
                 # skipped off a reading that may be up to 10s out of date.
                 status_stale    => ($probed_now ? 0 : 1),
-                events          => Dashboard::recent_events(\@lines, 50),
+                events          => LaunchLog::merge_sessions(
+                                        [ @hist_groups, $cur ],
+                                        max    => $ACTIVITY_EVENT_MAX,
+                                        marker => Dashboard::session_boundary_row(),
+                                    ),
                 install_warning => $INSTALL_WARNING,
                 busy_age        => $busy_age,
                 stay_awake      => $stay,
@@ -3706,6 +3724,26 @@ sub _tail_lines {
     my @lines = split /\n/, $blob;
     chomp @lines;
     return @lines > $n ? @lines[-$n .. -1] : @lines;
+}
+
+# _history_events($dir, $exclude) -> @groups -- spec S2.4b (s13-activity-history).
+# One span-row group per prior launch log, OLDEST session first, suitable as
+# the leading groups of LaunchLog::merge_sessions. Any failure degrades to no
+# history at all -- the dashboard behaves exactly as it did before this
+# package.
+sub _history_events {
+    my ($dir, $exclude) = @_;
+    my @groups;
+    eval {
+        my @paths = LaunchLog::recent_logs($dir, $HISTORY_LOG_FILES, $exclude);  # newest-first
+        for my $p (reverse @paths) {                                # -> oldest-first
+            my @lines = _tail_lines($p, $HISTORY_TAIL_LINES);
+            my $ev = Dashboard::recent_events(\@lines, $HISTORY_EVENTS_PER_LOG);
+            push @groups, $ev if ref $ev eq 'ARRAY' && @$ev;
+        }
+        1;
+    } or do { @groups = () };      # any failure -> no history, dashboard behaves exactly as today
+    return @groups;
 }
 
 # _spawn_session — the dashboard's launch-claude hotkey: open a NEW Windows

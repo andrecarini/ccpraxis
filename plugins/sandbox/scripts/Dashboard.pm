@@ -730,6 +730,14 @@ sub scroll_indicator {
     return undef;
 }
 
+# session_boundary_row() -> \@spans -- spec S2.3 (s13-activity-history).
+# The muted divider inserted between a prior session's tail and the current
+# session's events. No parameters. Returns a freshly-constructed arrayref on
+# every call so no caller can alias shared state. PUBLIC, pure.
+sub session_boundary_row {
+    return [ { text => '-- previous session --', role => 'muted' } ];
+}
+
 # activity_row_width($cols) -> $w -- spec S2.7. $w = $cols - 2 (the
 # _panel_rows body-indent span), clamped >= 0; undef/non-numeric $cols -> 0.
 # The single place that constant is mirrored, so `run` never open-codes it.
