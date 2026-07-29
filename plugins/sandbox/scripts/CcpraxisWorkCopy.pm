@@ -98,12 +98,25 @@ sub live_install_dir {
     return undef unless defined $install;
 
     # §9.4: reject bare drive/root (e.g. "C:", "/", "C:/")
-    # Matches ^[A-Za-z]:?/?$ or length <= 3
-    if ($install =~ m|^[A-Za-z]:?/?$| || length($install) <= 3) {
+    if (_is_bare_root($install)) {
         return undef;
     }
 
     return $install;
+}
+
+# =====================================================================
+# §9.4 — _is_bare_root($p)
+# Internal helper: true iff $p is a bare drive/filesystem root (e.g. "C:",
+# "/", "C:/") or otherwise too short to be a real install directory.
+# Matches ^[A-Za-z]:?/?$ or length <= 3. Factored out of live_install_dir
+# (frozen — behaviour byte-for-byte identical) so it can also be applied
+# to the caller-supplied hint anchor in _install_anchors (MINOR-3).
+# =====================================================================
+sub _is_bare_root {
+    my ($p) = @_;
+    return 1 if $p =~ m|^[A-Za-z]:?/?$| || length($p) <= 3;
+    return 0;
 }
 
 # =====================================================================
@@ -119,7 +132,7 @@ sub _install_anchors {
     my $h = $opts->{live_install_hint};
     if (defined $h && length $h) {
         my $c = canon_path($h);
-        push @a, $c if defined $c && length $c;
+        push @a, $c if defined $c && length $c && !_is_bare_root($c);
     }
     my $r = live_install_dir($opts);
     push @a, $r if defined $r && length $r;
@@ -169,7 +182,9 @@ sub _same_path {
 # =====================================================================
 # §2.3 — is_ccpraxis_project($path, \%opts) -> 0|1
 # TRUE if path is the ccpraxis repo, a worktree, or a clone.
-# Detection = (A) commondir+registry match OR (B) content-marker fallback.
+# Detection = (A) commondir match against ANY resolved install anchor
+# (hint and/or registry-derived) OR (B) content-marker COUNT fallback
+# (>= 2 distinct markers present, so no single marker's removal disarms it).
 # §9.3: default git seam uses list-form open (no shell).
 # =====================================================================
 sub is_ccpraxis_project {
@@ -182,6 +197,18 @@ sub is_ccpraxis_project {
         $gcd_fn = sub {
             my ($p) = @_;
             local $ENV{MSYS2_ARG_CONV_EXCL} = '*';
+            # MAJOR-3: scrub inherited git-context env vars before spawning.
+            # An inherited GIT_DIR/GIT_COMMON_DIR/etc (leaked from a git hook,
+            # a 'git rebase --exec' invocation, an .envrc, or a stray export)
+            # makes the rev-parse --git-common-dir spawn below answer for the
+            # WRONG repo (or fail outright), permanently disarming branch (A)
+            # identity detection. Delete them for this spawn only (local'd
+            # via the %ENV copy below); never touch PATH.
+            local %ENV = %ENV;
+            delete @ENV{qw(
+                GIT_DIR GIT_COMMON_DIR GIT_WORK_TREE GIT_INDEX_FILE
+                GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+            )};
             my $out;
             # Save and redirect STDERR to devnull (fd-dup; no in-memory scalar — Win-perl caveat)
             open(my $saveerr, '>&', \*STDERR) or return undef;
@@ -212,7 +239,19 @@ sub is_ccpraxis_project {
             my $cg = canon_path($gcd);
             for my $a (@$anchors) {
                 my $expected = canon_path("$a/.git");
-                return 1 if defined $expected && defined $cg && $cg eq $expected;
+                next unless defined $expected && defined $cg;
+                # MINOR-2: fold case on case-insensitive filesystems, same
+                # platform gate _same_path uses (:163) — canon_path only
+                # uppercases the drive letter, so a --git-common-dir output
+                # differing from the anchor only in case (routine: one side
+                # comes from git, the other from abs_path(__FILE__)) must
+                # still match. Do NOT call _same_path itself (frozen; it also
+                # applies the realpath seam, which would change semantics).
+                if ($^O =~ /^(MSWin32|cygwin|msys|darwin)$/) {
+                    return 1 if lc($cg) eq lc($expected);
+                } else {
+                    return 1 if $cg eq $expected;
+                }
             }
         }
     }
@@ -246,12 +285,20 @@ sub _ccpraxis_markers {
         'plugins/sandbox/scripts/MountSpec.pm',         # M4
         'plugins/sandbox/bin/claude-sandbox.sh',        # M5
         'plugins/sandbox/docs/working-on-ccpraxis.md',  # M6
+        # MAJOR-1: repo-root markers sharing no ancestor with M1-M6 above —
+        # every prior marker lives under plugins/ (five under
+        # plugins/sandbox/), so a single `mv plugins plugins.x` dropped the
+        # effective count 6->1. Appended (order load-bearing: t/52 AC-16
+        # indexes @MARKERS[2,3]; nothing before M6 may change).
+        'install.pl',                                   # M7
+        'CLAUDE.md',                                    # M8
     );
 }
 
 # =====================================================================
 # §2.4 / §9.1 — is_in_place($path, \%opts) -> 0|1
-# TRUE iff path resolves to the live install anchor (hint-first).
+# TRUE iff path resolves to ANY member of the install anchor set (hint
+# first, then registry-derived) — match-any, not hint-first-only.
 # =====================================================================
 sub is_in_place {
     my ($path, $opts) = @_;
@@ -268,6 +315,12 @@ sub is_in_place {
 sub workcopy_route {
     my ($path, $opts) = @_;
     $opts //= {};
+    # CRITICAL-1: being the install anchor is SUFFICIENT on its own to
+    # refuse. Marker identity is only a NECESSARY condition upstream (a
+    # weakened/absent identity check must never turn an in-place path into
+    # a passthrough — that bind-mounts the live install read-write). Check
+    # this BEFORE the identity+in-place conjunction below.
+    return 'offer' if is_in_place($path, $opts);
     return 'offer' if is_ccpraxis_project($path, $opts) && is_in_place($path, $opts);
     # fail-safe: identity is ccpraxis but NO anchor is resolvable ->
     # cannot rule out in-place; offering beats a silent in-place launch.
