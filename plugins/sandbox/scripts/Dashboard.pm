@@ -2115,7 +2115,12 @@ sub run_stages {
             }
             elsif ($id eq 'stop-machine') {
                 my ($cstage) = grep { $_->{id} eq 'stop-container' } @stages;
-                if ($cstage && $cstage->{state} eq 'fail') {
+                # ne 'ok' (not eq 'fail'): defence in depth. If stop_container
+                # ever ended anything other than a confirmed 'ok' -- e.g.
+                # 'skipped' because the seam was absent -- this must still
+                # block the machine stop while our own container may still be
+                # running, not just when it explicitly failed.
+                if ($cstage && $cstage->{state} ne 'ok') {
                     $state = 'skipped';
                     $detail = 'container stop failed; podman machine left running';
                 }
@@ -2134,7 +2139,7 @@ sub run_stages {
                     else {
                         $others_known = 1;
                         @others = grep { defined($_) && length($_) && $_ ne $self_container }
-                                  map { my $x = $_; $x =~ s/^\s+|\s+$// if defined $x; $x } @$list;
+                                  map { my $x = $_; $x =~ s/^\s+|\s+$//g if defined $x; $x } @$list;
                         if (@others == 0) {
                             if (ref($o{stop_machine}) eq 'CODE') {
                                 my $r = eval { $o{stop_machine}->() };
@@ -2422,6 +2427,7 @@ sub run {
                     my $key = $read_key->();
                     last unless defined $key && length $key;
                     $drained++;
+                    my $pending_was_armed = ($pending ne '');
                     my ($action, $np) = dispatch_key($key, $pending);
                     $pending = $np;
                     if ($action eq 'quit') { $rc = 0; $quit = 1; last; }
@@ -2460,6 +2466,24 @@ sub run {
                     }
                     # confirm-stop-runs / cancel-stop-runs / confirm-full-shutdown /
                     # cancel-full-shutdown only toggle $pending
+
+                    # s11-lifecycle-stop fix-batch FIX 2: this key just ARMED a
+                    # confirm (pending went '' -> non-empty). Stop draining NOW
+                    # so the normal end-of-tick render below paints the confirm
+                    # banner before any further key can be dispatched against
+                    # it -- otherwise a same-tick 'x','y' (or 's','y') pair
+                    # fires the destructive action with the banner never
+                    # rendered. This only DEFERS the remaining drained input to
+                    # the next tick's drain -- nothing here is flushed,
+                    # discarded, or swallowed, so a scripted/pasted "xy" still
+                    # satisfies the confirm one tick later; the seams these
+                    # tests exercise still fire. It does not fully close the
+                    # pasted-bytes vector (the bytes are still sitting wherever
+                    # $read_key's source buffers them and get read on the very
+                    # next tick) -- a complete fix needs bracketed-paste mode
+                    # or a wall-clock debounce, which would change the input
+                    # contract the oracle pins, so that is deferred.
+                    if (!$pending_was_armed && $pending ne '') { last; }
                 }
                 last if $quit;
 

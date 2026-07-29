@@ -2985,6 +2985,26 @@ sub enter_dashboard {
     exit($rc // 0);
 }
 
+# _run_timed($cmd, $secs) — backtick $cmd but bound it to a wall-clock
+# ceiling so a wedged podman can't hang the caller forever. Best-effort:
+# alarm()/SIGALRM interrupts our wait on POSIX, but (like the resource
+# probes documented at :3348-3352) podman's CLI has no timeout flag of its
+# own and a blocking backtick isn't portably interruptible, so on platforms
+# where SIGALRM doesn't break a pending backtick (e.g. native Windows perl)
+# this degrades to a no-op bound -- the same accepted gap as those probes,
+# not a new one. Returns whatever the backtick produced, or undef on timeout.
+sub _run_timed {
+    my ($cmd, $secs) = @_;
+    my $out;
+    eval {
+        local $SIG{ALRM} = sub { die "timeout\n" };
+        alarm($secs);
+        $out = `$cmd`;
+    };
+    alarm(0);
+    return $@ ? undef : $out;
+}
+
 # _lifecycle_run($mode, \%state, $progress) — s11-lifecycle-stop spec 08 S2.8:
 # the real, impure seams for Dashboard::run_stages. $mode is 'stop-runs' or
 # 'full-shutdown'; $progress is the status_cb coderef the loop built (it
@@ -3029,8 +3049,10 @@ sub _lifecycle_run {
                 $n += ($_->{running_coordinators} || 0) for @coords;
                 return { quiet => 0, detail => "$n coordinator(s) running" };
             }
-            my $bm = `$PODMAN exec "$CONTAINER_NAME" stat -c %Y /tmp/.butler-busy 2>/dev/null`;
-            my $cn = `$PODMAN exec "$CONTAINER_NAME" date +%s 2>/dev/null`;
+            # Bounded (:5s each) -- a wedged podman must not hang await_quiet's
+            # poll loop indefinitely and freeze the TUI (see _run_timed above).
+            my $bm = _run_timed(qq{$PODMAN exec "$CONTAINER_NAME" stat -c %Y /tmp/.butler-busy 2>/dev/null}, 5);
+            my $cn = _run_timed(qq{$PODMAN exec "$CONTAINER_NAME" date +%s 2>/dev/null}, 5);
             my ($lmt)  = ($bm && $bm =~ /^(\d+)/) ? ($1) : ();
             my ($cnow) = ($cn && $cn =~ /^(\d+)/) ? ($1) : ();
             my $busy_age;
@@ -3062,8 +3084,17 @@ sub _lifecycle_run {
             # no name/image/label filter of any kind. Any other container
             # blocks the machine stop.
             my $out = `$PODMAN ps --format "{{.Names}}" 2>/dev/null`;
+            my $rc  = $?;
             return undef unless defined $out;
-            return undef if $out eq '' && $? != 0;
+            # Unconditional: a non-zero exit CAN still carry partial stdout
+            # (truncated enumeration), and a truncated list is indistinguishable
+            # from a complete one that legitimately has few/no entries. Gating
+            # the exit-code check on empty output let a truncated listing that
+            # dropped a sibling project's container be trusted as complete,
+            # which could stop the shared podman machine out from under a
+            # live sibling sandbox. Any non-zero exit -> unusable enumeration
+            # -> fail closed (undef; run_stages skips the machine stop).
+            return undef if $rc != 0;
             return [ split /\s+/, $out ];
         },
         stop_machine    => sub {
