@@ -1158,16 +1158,56 @@ sub _title_line {
     return _justify($left, $right, $cols);
 }
 
+# footer_legend($cols) -> the unpadded command legend, tiered so the pinned
+# "[c] launch Claude Code" wording (Decision #9) survives down to 80 cols
+# before degrading (s11-lifecycle-stop spec 08 S2.2). PURE; the caller
+# (_footer_line) is the only one that pads.
+sub footer_legend {
+    my ($cols) = @_;
+    $cols = 200 if !defined $cols;
+    my @tiers = (
+        ' [c] launch Claude Code  [s] stop runs  [x] full shutdown  [up/down] scroll  [r] refresh  [q] quit',
+        ' [c] launch Claude Code  [s] stop runs  [x] shutdown  [r] refresh  [q] quit',
+        ' [c] launch  [s] stop  [x] shutdown  [r] refresh  [q] quit',
+    );
+    for my $t (@tiers) {
+        return $t if display_width($t) <= $cols;
+    }
+    return $tiers[-1];
+}
+
+# confirm_prompt($pending, $cols) -> the unpadded two-step confirm text for
+# one of the two pinned pending tokens, or undef for anything else (including
+# the retired 'shutdown' token). Two tiers per token, "first that fits, else
+# the short one" (s11-lifecycle-stop spec 08 S2.2). PURE.
+sub confirm_prompt {
+    my ($pending, $cols) = @_;
+    $cols = 200 if !defined $cols;
+    return undef unless defined $pending;
+    if ($pending eq 'stop-runs') {
+        my $L = 'Stop ALL butler runs in this project? The container and podman machine stay UP. [y] confirm   [any other] cancel';
+        my $S = 'Stop ALL butler runs? Container+machine stay up. [y] confirm  [other] cancel';
+        return display_width($L) <= $cols ? $L : $S;
+    }
+    if ($pending eq 'full-shutdown') {
+        my $L = 'Full shutdown: stop ALL butler runs, then STOP THIS CONTAINER, then stop the podman machine if no other container is running. [y] confirm   [any other] cancel';
+        my $S = 'Stop runs + STOP CONTAINER (+ machine if last). [y] confirm  [other] cancel';
+        return display_width($L) <= $cols ? $L : $S;
+    }
+    return undef;
+}
+
 sub _footer_line {
     my ($s, $cols) = @_;
     my $pending = defined $s->{pending} ? $s->{pending} : '';
     my $legend;
-    if ($pending eq 'shutdown') {
-        $legend = 'Shut down ALL coordinators in this project? [y] confirm   [any other] cancel';
+    my $prompt = confirm_prompt($pending, $cols);
+    if (defined $prompt) {
+        $legend = $prompt;
     } elsif (defined $s->{footer_flash} && length $s->{footer_flash}) {
         $legend = ' ' . $s->{footer_flash};   # transient [c]-on-dead-container notice
     } else {
-        $legend = ' [c] launch   [s] shutdown-all   [up/down] scroll   [r] refresh   [q] quit';
+        $legend = footer_legend($cols);
     }
     return clip_pad($legend, $cols);
 }
@@ -1405,7 +1445,8 @@ sub compose_frame {
     return \@frame if $rows == 1;
 
     my $footer_role = 'footer';
-    if (defined $state->{pending} && $state->{pending} eq 'shutdown') {
+    if (defined $state->{pending}
+        && ($state->{pending} eq 'stop-runs' || $state->{pending} eq 'full-shutdown')) {
         $footer_role = 'footer-alert';
     } elsif (defined $state->{footer_flash} && length $state->{footer_flash}) {
         $footer_role = 'footer-flash';   # transient launch-blocked notice
@@ -1558,19 +1599,29 @@ sub render_frame {
 }
 
 # dispatch_key($key, $pending) -> ($action, $new_pending).
-# Single-letter hotkeys; shutdown is a two-step confirm (s -> pending 'shutdown',
-# then y -> fire, any other key -> cancel). Unknown keys are inert.
+# Single-letter hotkeys; [s] stop-runs and [x] full-shutdown are each
+# independent two-step confirms (pending 'stop-runs' / 'full-shutdown'; y/Y
+# fires, any other key cancels WITHOUT re-arming the other control -- s11-
+# lifecycle-stop spec 08 S2.1). The legacy 'shutdown' pending token is
+# retired: any $pending value that isn't one of the two pinned tokens is
+# normalized to '' (no confirm armed). Unknown keys are inert.
 sub dispatch_key {
     my ($key, $pending) = @_;
-    $pending = '' if !defined $pending;
     $key = '' if !defined $key;
+    $pending = '' if !defined $pending;
+    $pending = '' unless $pending eq 'stop-runs' || $pending eq 'full-shutdown';
 
-    if ($pending eq 'shutdown') {
-        return ('shutdown', '')        if $key =~ /^[yY]$/;
-        return ('cancel-shutdown', ''); # any other key cancels
+    if ($pending eq 'stop-runs') {
+        return ('stop-runs', '')          if $key =~ /^[yY]$/;
+        return ('cancel-stop-runs', '');  # any other key cancels; never re-arms full-shutdown
+    }
+    if ($pending eq 'full-shutdown') {
+        return ('full-shutdown', '')          if $key =~ /^[yY]$/;
+        return ('cancel-full-shutdown', '');  # any other key cancels; never re-arms stop-runs
     }
     return ('launch', '')             if $key =~ /^[cC]$/ || $key eq "\r" || $key eq "\n";
-    return ('confirm-shutdown', 'shutdown') if $key =~ /^[sS]$/;
+    return ('confirm-stop-runs',     'stop-runs')     if $key =~ /^[sS]$/;
+    return ('confirm-full-shutdown', 'full-shutdown') if $key =~ /^[xX]$/;
     return ('refresh', '')            if $key =~ /^[rR]$/;
     return ('quit', '')               if $key =~ /^[qQ]$/;
     # Up/down scroll the Activity panel. The read-key seam assembles the arrow
