@@ -10,6 +10,7 @@ package ProtectedPaths;
 use strict;
 use warnings;
 use Exporter qw(import);
+use Cwd ();          # core; the default `realpath` seam only (q04 §1.1)
 use JSON::PP ();
 use CcpraxisWorkCopy qw(canon_path live_install_dir);
 
@@ -52,11 +53,18 @@ sub _probe_windows {
 }
 
 # =====================================================================
-# §2.1 (G1) -- normalize_path($path) -> $normalized | undef
+# §2.1 (G1) -- normalize_path($path, \%opts) -> $normalized | undef
 # Lexical `.`/`..` resolution layered on top of canon_path. Never dies.
+#
+# q04 §4 (MINOR-8): \%opts is OPTIONAL and back-compatibility is mandatory
+# -- called with one argument (as launcher.pl does at :458/:487) the
+# platform decision still comes from the ambient probe, byte-identically to
+# before. Supplying { windows => 0|1 } forces the platform-specific rules
+# below (step 6.5) instead, which is what makes them assertable on a Linux
+# runner at all.
 # =====================================================================
 sub normalize_path {
-    my ($p) = @_;
+    my ($p, $opts) = @_;
 
     # Step 0 -- refs are never a path (mirrors _ingest_path's guard so the
     # two choke points can't silently diverge; a caller bug that hands us a
@@ -114,7 +122,9 @@ sub normalize_path {
     # Linux/POSIX, "foo." and "foo " are legitimately distinct directory
     # names and must stay distinct (redteam M4). `..` is exempted so the
     # parent-directory marker itself is never touched.
-    if (_windows_family()) {
+    # `$opts` (q04 §4) lets the caller force the decision; absent, this is
+    # the pre-q04 ambient probe.
+    if (_windows_family($opts)) {
         @segments = grep { length $_ }
                     map  { $_ eq '..' ? $_ : do { (my $s = $_) =~ s/[. ]+\z//; $s } }
                     @segments;
@@ -189,8 +199,11 @@ sub path_relation {
     # (redteam M1). _ingest_path is a strict superset of normalize_path
     # (same algorithm, plus the ref-guard and the encode), so this is
     # never a narrowing for callers who were already passing plain bytes.
-    my $t = _ingest_path($target);
-    my $r = _ingest_path($root);
+    # BOTH ingestions get the same $opts (q04 §4/AC-71): normalising one side
+    # under the ambient platform and the other under a forced one would make
+    # the comparison meaningless.
+    my $t = _ingest_path($target, $opts);
+    my $r = _ingest_path($root,   $opts);
     return 'unrelated' unless defined $t && defined $r;
 
     my ($tprefix, $tabs, @tsegs) = _decompose($t);
@@ -221,7 +234,7 @@ sub path_relation {
 # through. Guards the measured JSON::PP-wide-char-vs-filesystem-bytes bug.
 # =====================================================================
 sub _ingest_path {
-    my ($raw) = @_;
+    my ($raw, $opts) = @_;
     return undef unless defined $raw && !ref $raw;
     # A control byte (including NUL) inside a segment is never a legitimate
     # path component on any supported platform, and is legal inside a JSON
@@ -232,7 +245,9 @@ sub _ingest_path {
     # registry-entry/extra-list-entry error branch instead.
     return undef if $raw =~ /[\x00-\x1f]/;
     utf8::encode($raw) if utf8::is_utf8($raw);
-    return normalize_path($raw);
+    # q04 §4: forward the caller's platform overrides so an ingested path and
+    # its comparison partner are normalised under the SAME platform rules.
+    return normalize_path($raw, $opts);
 }
 
 sub _fold_key {
@@ -292,6 +307,18 @@ sub target_self_codes {
 # Never dies. Always returns the two-key hash ref. Degrades toward
 # refusing: one broken source never discards another's roots (Decision #6).
 # =====================================================================
+
+# q04 §1.1 -- the default `realpath` seam. Deliberately IDENTICAL in shape to
+# CcpraxisWorkCopy.pm's own $_default_realpath (:149-153) rather than a second
+# invention, because both modules answer the same question: Cwd::abs_path (NOT
+# Cwd::realpath), eval-wrapped, and returning undef for a path that does not
+# exist -- which is exactly the fallback trigger the degrade-to-lexical path
+# below wants.
+my $_default_realpath = sub {
+    my ($p) = @_;
+    my $r = eval { Cwd::abs_path($p) };
+    return $r;
+};
 
 my %REASON_RANK = (
     'ccpraxis-install'    => 0,
@@ -541,9 +568,63 @@ sub protected_roots {
         push @errors, { code => 'extra-list-shape', detail => 'extra list is not a JSON array' };
     }
 
-    # ---- §2.5.2 step 6: bare-root guard, de-duplication, sort -------------
-    my @kept;
+    # ---- §2.5.2 step 6: resolve, reject, de-duplicate, sort ---------------
+    # THE ORDER IS PART OF THE CONTRACT (q04 §1.2) -- resolve -> reject ->
+    # dedup -> sort -- and every edge is a real defect if inverted:
+    #   * resolve BEFORE reject, or a symlink pointing at `/` or at the user
+    #     home escapes both guards below, i.e. finding 3's machine-wide
+    #     outage arrives through finding 1's hole;
+    #   * resolve BEFORE dedup, or two candidates that are different symlinks
+    #     to one real directory survive as two roots with different reason
+    #     ranks instead of collapsing to one.
+    # Do not reorder this to chase a failing assertion.
+    #
+    # Resolution applies to the candidate ROOTS ONLY. The target is already
+    # resolved by the caller (launcher.pl abs_path()s $PROJECT_PATH before
+    # asking), which is why path_relation itself stays a pure lexical
+    # predicate and never consults this seam (§C-0.1, AC-22/AC-55).
+    my $realpath_fn = $opts->{realpath} // $_default_realpath;
+    my @resolved;          # { path, reason, unresolved }
+    my $resolved_count = 0;
     for my $c (@candidates) {
+        # eval the seam call exactly as CcpraxisWorkCopy::_same_path (:164-165)
+        # does: that is what makes a DYING seam behave identically to one
+        # returning undef (AC-51 vs AC-52) and keeps §M5's "never dies" true.
+        my $raw = eval { $realpath_fn->($c->{path}) };
+        my $n   = (defined $raw && length $raw) ? _ingest_path($raw, $opts) : undef;
+        if (defined $n) {
+            $resolved_count++;
+            push @resolved, { path => $n, reason => $c->{reason}, unresolved => 0 };
+        } else {
+            # DEGRADE to the lexical form, never drop (q04 §1.3): dropping it
+            # would SHRINK the protected set, the one direction Decision #6
+            # forbids.
+            push @resolved, { path => $c->{path}, reason => $c->{reason}, unresolved => 1 };
+        }
+    }
+
+    # ...and warn, per candidate, so _pp_source_warnings surfaces it (it is
+    # code-agnostic, so no launcher change is needed).
+    #
+    # DELIBERATE NARROWING of q04 §1.3, forced by the oracle: the warning is
+    # emitted only when the seam resolved at least ONE candidate. A seam that
+    # resolved *nothing* is an unusable seam -- one fact about the host, not N
+    # facts about N roots -- and reporting it N times would burn the launcher's
+    # 10-warning cap (§1.3) on a single cause and drown out the real
+    # diagnostics. t/51's AC-40 pins exactly this: `realpath => $no_fs` (a
+    # seam that dies for everything) must still return the AC-24 structure
+    # with `errors => []`, while AC-51/AC-52 (one candidate of three failing)
+    # must warn. Roots degrade to lexical either way, so the protected set is
+    # never shrunk by this narrowing -- only the diagnostics are.
+    if ($resolved_count) {
+        for my $c (@resolved) {
+            push @errors, { code => 'root-unresolved', detail => "$c->{reason}: $c->{path}" }
+                if $c->{unresolved};
+        }
+    }
+
+    my @kept;
+    for my $c (@resolved) {
         if (_is_bare_root($c->{path})) {
             push @errors, { code => 'root-bare-rejected', detail => "$c->{reason}: $c->{path}" };
             next;
