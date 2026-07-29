@@ -298,7 +298,7 @@ is(BpOrch::widen_max_turns(60,60), 90, 'AC-12: widen_max_turns(60,60) == 90 (5-f
     ok(!($reg->{solo}{corrective_attempts}), 'AC-13: corrective_attempts absent/0');
     like(slurp("$dir/packages/solo.md"), qr/^status:\s*done/m, 'AC-13: ledger still reads status: done');
     is(scalar(@{ $r1->{launched} }), 0, 'AC-13: no coordinator was launched');
-    is(scalar(needs_you($dir)), 0, 'AC-13: runs/needs-you is empty');
+    is(scalar(()=needs_you($dir)), 0, 'AC-13: runs/needs-you is empty');
 
     is(BpOrch::effective_attempts(1,1), 0, 'AC-14: effective_attempts(1,1) == 0 (mechanically: the exemption)');
 
@@ -342,7 +342,7 @@ my ($AC15_dir, @AC15_q);
 }
 {
     my $r2 = run_once($AC15_dir, tun => { harvest_reaudit_cap=>2 });
-    is(scalar(needs_you($AC15_dir)), 1, 'AC-17: a second tick over the parked state queues no additional decision (dedupe holds)');
+    is(scalar(()=needs_you($AC15_dir)), 1, 'AC-17: a second tick over the parked state queues no additional decision (dedupe holds)');
     is(scalar(grep { $_->{kind} eq 'harvest' } @{ $r2->{spawned} }), 0, "AC-17: second tick fires no harvest judge (harvest=='starved' -> want_harvest_audit=0)");
 }
 {
@@ -455,7 +455,7 @@ is(BpJudge::audit_outcome({ verdict=>'fail', corrective_attempts=>1, corrective_
     ok(!(reg_of($dir)->{A}{corrective_attempts}), 'AC-24: corrective_attempts absent/0');
     unlike(slurp("$dir/packages/A.md"), qr/Harvest findings \(re-verify\)/, 'AC-24: no findings block written into A.md');
     is(scalar(grep { $_->{pkg} eq 'A' } @{ $r->{launched} }), 0, 'AC-24: A was not launched');
-    is(scalar(needs_you($dir)), 0, 'AC-24: runs/needs-you is empty');
+    is(scalar(()=needs_you($dir)), 0, 'AC-24: runs/needs-you is empty');
     is((reg_of($dir)->{A}{harvest} // 'SENTINEL'), '', "AC-24: registry.packages.A.harvest == ''");
     is(reg_of($dir)->{A}{harvest_defer}, 1, 'AC-24: harvest_defer == 1');
     is((reg_of($dir)->{A}{harvest_defer_blockers} // ''), 'B', "AC-24: harvest_defer_blockers == 'B'");
