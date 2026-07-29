@@ -1152,6 +1152,10 @@ sub drive3 {
             tick_interval  => $args{tick_interval}  // 0.25,
             color          => 0,
             max_ticks      => $args{max_ticks} // 20,
+            # AC-37 only. Passed through ONLY when the caller supplied it, so
+            # every pre-existing drive3() call site reaches Dashboard::run with
+            # a byte-identical argument list.
+            (exists $args{recover_cooldown} ? (recover_cooldown => $args{recover_cooldown}) : ()),
             now            => sub { $clock },
             sleep_for      => sub { $clock += $_[0]; push @events, ['tick-end']; },   # fake clock
             read_key       => sub { @keys ? shift @keys : undef },
@@ -1615,7 +1619,13 @@ my $LSRC = slurp($LAUNCHER_SRC);
         fail('AC-28(b): machine_start invokes `machine start`');
     }
 
-    # (c) the 10s startup grace: the touch is the NEXT podman invocation after start.
+    # (c) the startup grace: the touch is the NEXT podman invocation after start.
+    #     NOTE (red-team step 6, MINOR-2): the "10s startup grace" this used to
+    #     cite does not exist -- container/heartbeat.sh:26-27 sets HB=600 and
+    #     STARTUP_GRACE=600, i.e. TEN MINUTES, off by 60x. Only the LABEL below
+    #     was corrected; the ordering it pins (touch immediately after start, no
+    #     other podman call in between) is still correct and still required, and
+    #     the assertion is byte-for-byte the one that shipped.
     my $cstart = defined $rcb ? block_after($rcb, qr/\bcontainer_start\s*=>/) : undef;
     ok(defined $cstart, 'AC-28(c): the container_start production seam block is extractable');
     if (defined $cstart) {
@@ -1630,12 +1640,12 @@ my $LSRC = slurp($LAUNCHER_SRC);
             last;
         }
         ok($adjacent,
-            'AC-28(c): `touch /tmp/.launcher-alive` is the IMMEDIATELY NEXT podman invocation after the start (10s grace)');
+            'AC-28(c): `touch /tmp/.launcher-alive` is the IMMEDIATELY NEXT podman invocation after the start (heartbeat.sh:26-27 -- HB=600/STARTUP_GRACE=600, a TEN-MINUTE grace)');
         src_like($cstart, qr/log_ev\s*\(\s*['"]container_start['"]/, 'AC-28(c): the container_start seam logs a container_start event');
     }
     else {
         fail('AC-28(c): the container_start seam makes at least two podman invocations');
-        fail('AC-28(c): `touch /tmp/.launcher-alive` is the IMMEDIATELY NEXT podman invocation after the start (10s grace)');
+        fail('AC-28(c): `touch /tmp/.launcher-alive` is the IMMEDIATELY NEXT podman invocation after the start (heartbeat.sh:26-27 -- HB=600/STARTUP_GRACE=600, a TEN-MINUTE grace)');
         fail('AC-28(c): the container_start seam logs a container_start event');
     }
 
@@ -1728,6 +1738,356 @@ my $LSRC = slurp($LAUNCHER_SRC);
     ok(-f $DASHBOARD_SRC, 'AC-29: Dashboard.pm is on disk');
     ok(-f $LAUNCHER_SRC,  'AC-29: launcher.pl is on disk');
     diag('AC-29: the whole-suite-green gate itself is a coordinator-side check (see this file\'s header).');
+}
+
+# ===========================================================================
+# PART 12 -- red-team follow-up (step 6): the machine-state PARSE, the driver's
+#            tolerance of a non-'stopped' machine reading, the stale-cache
+#            skip, and the [l] cooldown.  (AC-31..AC-38)
+#
+# WHY THIS PART EXISTS. The step-6 red-team review found four MAJOR defects
+# that a 651/651 green suite did not catch. All four live in `_machine_state`'s
+# SELECTION and FIELD-READ logic and the decisions keyed off it -- and
+# AC-28(a) above covers that logic by SOURCE TEXT only. Source text cannot
+# tell `return 'running' if ANY machine is running` from `... if OUR machine
+# is running`, and it cannot tell a `return 'unknown'` fall-through from a
+# `return 'stopped'` one. This part supplies the missing BEHAVIOURAL oracle.
+#
+# ---------------------------------------------------------------------------
+# WHAT THE IMPLEMENTER MUST EXPOSE (a requirement, not a suggestion)
+# ---------------------------------------------------------------------------
+# `_machine_state` lives in launcher.pl, which no test may require (spec
+# S6/E2), so its parse can never be tested behaviourally where it sits. Split
+# it: keep the impure shell (run the bounded probe) in launcher.pl, and move
+# the PURE parse into a loadable helper:
+#
+#     Dashboard::classify_machine_state($raw, $capable) -> $state
+#
+#       $raw     the raw bytes of `podman machine list --format json`.
+#                undef / '' are legal inputs: the probe failed or timed out.
+#       $capable boolean -- does this platform HAVE a podman machine at all?
+#                (false on docker, and on Linux-native podman)
+#       $state   EXACTLY one of: running starting stopped absent unknown n/a
+#
+# The RECOMMENDED implementation is to delegate the selection to
+# Resources::parse_machine_list (Resources.pm:97-114), which already picks the
+# default machine correctly, already reads `Starting`, and already carries its
+# own behavioural oracle in t/44-resources.t -- one parser, one schema
+# assumption, one place to fix when podman renames a field. AC-31's control
+# below demonstrates the precedent answering the killer case correctly today.
+#
+# Note for the implementer: AC-28(a) (unchanged, above) pins the TEXT of
+# `_machine_state` -- `decode_json`, `Running`, `State|Status` and the five
+# vocabulary literals. A delegating shell keeps those assertions green by
+# documenting the delegated contract in its header comment; src_like() matches
+# plain text. Do NOT weaken AC-28(a) to make the split easier.
+# ===========================================================================
+
+# --- machine-list fixtures. Shapes taken from podman's own
+#     `machine list --format json` and from t/44's fixtures (44:62,114,117). --
+my $MJ_DEFAULT_RUNNING =
+    q{[{"Name":"podman-machine-default","Default":true,"Running":true,"Starting":false}]};
+# THE KILLER CASE (MAJOR-1): two machines, the NON-default one running, OUR
+# default one stopped. `podman machine start` (no name) acts on the default,
+# so the reading must describe the default: 'stopped'.
+my $MJ_TWO_DEFAULT_STOPPED =
+    q{[{"Name":"dev","Default":false,"Running":true,"Starting":false},}
+  . q{{"Name":"podman-machine-default","Default":true,"Running":false,"Starting":false}]};
+my $MJ_TWO_DEFAULT_STOPPED_FIRST =
+    q{[{"Name":"podman-machine-default","Default":true,"Running":false,"Starting":false},}
+  . q{{"Name":"dev","Default":false,"Running":true,"Starting":false}]};
+my $MJ_TWO_DEFAULT_RUNNING_LAST =
+    q{[{"Name":"dev","Default":false,"Running":false,"Starting":false},}
+  . q{{"Name":"podman-machine-default","Default":true,"Running":true,"Starting":false}]};
+my $MJ_SINGLE_NO_DEFAULT   = q{[{"Name":"only-one","Running":true,"Starting":false}]};
+my $MJ_NONHASH_FIRST       = q{["junk",{"Name":"m","Default":true,"Running":true}]};
+my $MJ_STARTING            = q{[{"Name":"podman-machine-default","Default":true,"Running":false,"Starting":true}]};
+my $MJ_STARTING_NOT_DEFAULT=
+    q{[{"Name":"dev","Default":false,"Running":true,"Starting":false},}
+  . q{{"Name":"podman-machine-default","Default":true,"Running":false,"Starting":true}]};
+my $MJ_SCHEMA_DRIFT        = q{[{"Name":"m","Default":true,"VMState":"Up","LastUp":"2026-07-29T00:00:00Z"}]};
+my $MJ_RUNNING_STR_FALSE   = q{[{"Name":"m","Default":true,"Running":"false"}]};
+my $MJ_RUNNING_STR_TRUE    = q{[{"Name":"m","Default":true,"Running":"true"}]};
+my $MJ_RUNNING_ZERO        = q{[{"Name":"m","Default":true,"Running":0}]};
+my $MJ_STATE_RUNNING       = q{[{"Name":"m","Default":true,"State":"running"}]};
+my $MJ_STATE_STOPPED       = q{[{"Name":"m","Default":true,"State":"stopped"}]};
+my $MJ_STATUS_RUNNING      = q{[{"Name":"m","Default":true,"Status":"Running"}]};
+my $MJ_STATUS_STOPPED      = q{[{"Name":"m","Default":true,"Status":"Stopped"}]};
+my $MJ_EMPTY               = q{[]};
+my $MJ_OBJECT              = q{{"Name":"m","Running":true}};
+my $MJ_GARBAGE             = qq{Error: cannot connect to the podman socket\n};
+
+# cms($raw,$capable): classify_machine_state does NOT EXIST YET. eval-wrapped
+# (the rr() convention) so a missing sub is a clean per-assertion FAIL rather
+# than a fatal abort, and a non-scalar return can never crash an is().
+sub cms {
+    my ($raw, $capable) = @_;
+    my $v = eval { Dashboard::classify_machine_state($raw, $capable) };
+    return (defined $v && !ref $v) ? $v : undef;
+}
+
+# --- AC-31 (MAJOR-1): the reading describes the DEFAULT machine, never "any". ---
+{
+    ok(defined &Dashboard::classify_machine_state,
+        'AC-31: Dashboard::classify_machine_state is defined -- the PURE, loadable machine-state parse');
+
+    # The killer case, in both element orders: a non-default machine is
+    # running and OUR default machine is stopped.
+    is(cms($MJ_TWO_DEFAULT_STOPPED, 1), 'stopped',
+        "AC-31: two machines, non-default RUNNING + default STOPPED -> 'stopped' (never 'running')");
+    is(cms($MJ_TWO_DEFAULT_STOPPED_FIRST, 1), 'stopped',
+        "AC-31: same, default listed FIRST -> 'stopped' (selection is by Default, not by position)");
+    is(cms($MJ_TWO_DEFAULT_RUNNING_LAST, 1), 'running',
+        "AC-31: two machines, default RUNNING but listed LAST -> 'running' (position is irrelevant)");
+    is(cms($MJ_DEFAULT_RUNNING, 1), 'running',
+        "AC-31: the ordinary single default machine, running -> 'running'");
+    is(cms($MJ_SINGLE_NO_DEFAULT, 1), 'running',
+        "AC-31: no Default flag anywhere -> the FIRST hash element is read");
+    is(cms($MJ_NONHASH_FIRST, 1), 'running',
+        "AC-31: a non-hash list element is skipped when falling back to the first element");
+
+    # Control: the in-repo precedent already answers the killer case
+    # correctly over the identical bytes. This is why delegation is the
+    # recommended fix rather than a second parser.
+    my $have_res = eval { require Resources; 1 } ? 1 : 0;
+    ok($have_res, 'AC-31: Resources.pm loads (the in-repo precedent for machine selection)');
+    if ($have_res) {
+        my $pick = eval { Resources::parse_machine_list($MJ_TWO_DEFAULT_STOPPED) };
+        is(field($pick, 'name'), 'podman-machine-default',
+            'AC-31 [precedent]: Resources::parse_machine_list picks the DEFAULT machine on the killer fixture');
+        is(field($pick, 'running'), 0,
+            'AC-31 [precedent]: ... and reports it NOT running, which is the answer this parse owes too');
+    }
+    else {
+        fail('AC-31 [precedent]: Resources::parse_machine_list picks the DEFAULT machine on the killer fixture');
+        fail('AC-31 [precedent]: ... and reports it NOT running, which is the answer this parse owes too');
+    }
+}
+
+# --- AC-32 (MAJOR-2): the fall-through is 'unknown', and only a boolean-ish
+#     Running is trusted. A confident-but-wrong 'stopped' puts a permanent red
+#     "podman machine is stopped" banner over a healthy sandbox
+#     (Dashboard.pm _status_alert checks the machine first, unconditionally). --
+{
+    is(cms($MJ_SCHEMA_DRIFT, 1), 'unknown',
+        "AC-32: an element with NONE of Running/Starting/State/Status -> 'unknown', NEVER 'stopped'");
+    is(cms($MJ_RUNNING_STR_FALSE, 1), 'stopped',
+        qq{AC-32: Running as the STRING "false" reads as stopped (not Perl truthiness)});
+    is(cms($MJ_RUNNING_STR_TRUE, 1), 'running',
+        qq{AC-32: Running as the STRING "true" reads as running});
+    is(cms($MJ_RUNNING_ZERO, 1), 'stopped',
+        'AC-32: Running == 0 reads as stopped');
+    is(cms($MJ_STATE_RUNNING, 1), 'running',
+        qq{AC-32: a v5-shaped element carrying State:"running" -> 'running'});
+    is(cms($MJ_STATE_STOPPED, 1), 'stopped',
+        qq{AC-32: a v5-shaped element carrying State:"stopped" -> 'stopped'});
+    is(cms($MJ_STATUS_RUNNING, 1), 'running',
+        qq{AC-32: Status:"Running" -> 'running' (the field read is case-insensitive)});
+    is(cms($MJ_STATUS_STOPPED, 1), 'stopped',
+        qq{AC-32: Status:"Stopped" -> 'stopped'});
+
+    is(cms($MJ_EMPTY, 1), 'absent',
+        "AC-32: an EMPTY machine list -> 'absent' (no machine exists)");
+    is(cms($MJ_GARBAGE, 1), 'unknown',
+        "AC-32: undecodable probe output -> 'unknown'");
+    is(cms($MJ_OBJECT, 1), 'unknown',
+        "AC-32: a decodable NON-ARRAY (a JSON object) -> 'unknown'");
+    is(cms('', 1), 'unknown',
+        "AC-32: EMPTY probe output -> 'unknown'");
+    is(cms(undef, 1), 'unknown',
+        "AC-32: an UNDEF probe result (the probe died or timed out) -> 'unknown'");
+
+    # n/a is a property of the PLATFORM, decided before the bytes are read.
+    is(cms($MJ_DEFAULT_RUNNING, 0), 'n/a',
+        "AC-32: a platform with no podman machine (docker / Linux-native) -> 'n/a' even for running-machine JSON");
+    is(cms('', 0), 'n/a',
+        "AC-32: 'n/a' wins over 'unknown' when the platform has no machine at all");
+
+    # The whole vocabulary, and nothing outside it.
+    my %vocab = map { $_ => 1 } qw(running starting stopped absent unknown n/a);
+    my @out_of_vocab = grep { my $v = cms($_->[0], $_->[1]); !defined $v || !$vocab{$v} }
+        ([$MJ_DEFAULT_RUNNING, 1], [$MJ_TWO_DEFAULT_STOPPED, 1], [$MJ_STARTING, 1],
+         [$MJ_SCHEMA_DRIFT, 1], [$MJ_EMPTY, 1], [$MJ_GARBAGE, 1], [$MJ_OBJECT, 1],
+         ['', 1], [undef, 1], [$MJ_DEFAULT_RUNNING, 0]);
+    is(scalar(@out_of_vocab), 0,
+        'AC-32: EVERY reading is one of running/starting/stopped/absent/unknown/n-a -- no other value escapes');
+}
+
+# --- AC-33 (MAJOR-3, probe half): 'starting' is read and is its OWN value. ---
+{
+    is(cms($MJ_STARTING, 1), 'starting',
+        "AC-33: a STARTING default machine -> 'starting' (the host-resume case; Running is false while starting)");
+    is(cms($MJ_STARTING_NOT_DEFAULT, 1), 'starting',
+        "AC-33: the default machine is starting while another runs -> 'starting'");
+    # Defined-checked rather than isnt(): an undef (missing-sub) reading must
+    # FAIL these, not sail through on undef ne 'stopped'.
+    my $st = cms($MJ_STARTING, 1);
+    ok(defined $st && $st ne 'stopped',
+        "AC-33: a starting machine is NEVER read as 'stopped' (that reading makes [l] fail with rc 125)");
+    ok(defined $st && $st ne 'running',
+        "AC-33: ... and NEVER as 'running' either -- 'starting' is a distinct value");
+}
+
+# --- AC-34 (MAJOR-3, driver half): 'starting' skips machine-start exactly as
+#     'running' does. `podman machine start` against a VM that is already
+#     running OR ALREADY STARTING exits 125, and that failure would abort the
+#     whole recovery at stage 2. -------------------------------------------
+{
+    my %state = (machine_capable => 1, status => 'exited');
+    my ($seams, $calls) = build_seams(
+        machine_status => sub { { ok => 1, state => 'starting', detail => 'machine starting' } },
+    );
+    my $r = rr(plan => plan_for(\%state), mode => 'recover', reason => 'in-tui-relaunch',
+               state => \%state, %$seams);
+
+    is_deeply($calls, [qw(machine_status container_start heartbeat_reattach)],
+        "AC-34: a 'starting' machine -- machine_start is NEVER invoked, the sequence continues");
+    my $ms = stage_of($r, 'machine-start');
+    is(field($ms, 'state'), 'skipped', "AC-34: the machine-start stage is 'skipped' (as it is for 'running')");
+    like_or_fail(field($ms, 'detail'), qr/starting/i,
+        'AC-34: the machine-start detail says the machine is already starting');
+    is(field($r, 'ok'), 1, 'AC-34: ok == 1');
+    is(field($r, 'failed_stage'), undef, 'AC-34: failed_stage is undef');
+    is(stage_count($r), 4, 'AC-34: all four planned stages are still recorded');
+    is(field(stage_of($r, 'container-start'), 'state'), 'ok', 'AC-34: container-start actually ran and is ok');
+    is(field(stage_of($r, 'heartbeat-reattach'), 'state'), 'ok', 'AC-34: heartbeat-reattach actually ran and is ok');
+}
+
+# --- AC-35 (MAJOR-3, driver half): a machine-start FAILURE is fatal only on a
+#     CONFIDENT 'stopped' reading. On 'unknown' the recovery must continue --
+#     container-start is the authoritative test of whether the machine is up,
+#     and an uncertain reading must never block the repair. ------------------
+{
+    # (a) 'unknown' + failing machine_start -> NOT fatal, sequence continues.
+    my %state = (machine_capable => 1, status => 'exited');
+    my ($seams, $calls) = build_seams(
+        machine_status => sub { { ok => 1, state => 'unknown', detail => 'machine probe inconclusive' } },
+        machine_start  => sub { { ok => 0, detail => 'MSTARTFAIL rc 125: VM already running or starting' } },
+    );
+    my ($r, $err) = rre(plan => plan_for(\%state), mode => 'recover', reason => 'in-tui-relaunch',
+                        state => \%state, %$seams);
+
+    ok(!$err, 'AC-35(a): the run does not die') or diag("  \$\@ = " . ($err // ''));
+    is_deeply($calls, [qw(machine_status machine_start container_start heartbeat_reattach)],
+        "AC-35(a): 'unknown' machine + FAILED machine start -> container_start and heartbeat_reattach STILL run");
+    my $ms = stage_of($r, 'machine-start');
+    isnt(field($ms, 'state'), 'fail',
+        "AC-35(a): the machine-start stage is NOT 'fail' on an uncertain reading (it must not abort the sequence)");
+    ok(defined field($ms, 'state') && (field($ms, 'state') eq 'skipped' || field($ms, 'state') eq 'ok'),
+        "AC-35(a): the machine-start stage is recorded non-fatally ('skipped' or 'ok')");
+    like_or_fail(field($ms, 'detail'), qr/MSTARTFAIL/,
+        'AC-35(a): the failed start is still REPORTED -- its detail is carried, not swallowed');
+    is(field($r, 'failed_stage'), undef, 'AC-35(a): failed_stage is undef (nothing fatal happened)');
+    is(field($r, 'ok'), 1, 'AC-35(a): ok == 1 -- the container came up, which is what [l] exists for');
+    is(stage_count($r), 4, 'AC-35(a): all four stages are recorded');
+    is(field(stage_of($r, 'container-start'), 'state'), 'ok', 'AC-35(a): container-start ran and is ok');
+
+    # (b) control: a CONFIDENT 'stopped' + failing machine_start IS fatal --
+    #     we know the machine is down and we could not start it.
+    my %state_b = (machine_capable => 1, status => 'exited');
+    my ($seams_b, $calls_b) = build_seams(
+        machine_status => sub { { ok => 1, state => 'stopped', detail => 'machine stopped' } },
+        machine_start  => sub { { ok => 0, detail => 'MSTARTFAIL no machine' } },
+    );
+    my $rb = rr(plan => plan_for(\%state_b), mode => 'recover', reason => 'in-tui-relaunch',
+                state => \%state_b, %$seams_b);
+    is_deeply($calls_b, [qw(machine_status machine_start)],
+        "AC-35(b): a CONFIDENT 'stopped' + failed start still stops the sequence");
+    is(field(stage_of($rb, 'machine-start'), 'state'), 'fail', "AC-35(b): that stage IS 'fail'");
+    is(field($rb, 'failed_stage'), 'machine-start', "AC-35(b): failed_stage eq 'machine-start'");
+    is(field($rb, 'ok'), 0, 'AC-35(b): ok == 0');
+}
+
+# --- AC-36 (MINOR-3): no stale-cache skip. $state->{status} is the launcher's
+#     THROTTLED 10s inspect cache; a container that died inside that window
+#     still reads 'running'. The driver must not skip container-start on a
+#     reading it knows may be out of date -- the seam re-probes authoritatively.
+#
+#     HOW THIS IS EXPRESSED, and why. AC-12 above (immutable, passing) pins the
+#     opposite for a status of 'running' with no freshness marker, so an
+#     unconditional removal of the shortcut cannot be asserted here without
+#     breaking it. The testable form is therefore an EXPLICIT staleness signal:
+#     state->{status_stale} => 1 means "this status is a cache reading, do not
+#     trust it to skip work". An implementer who has launcher.pl set
+#     status_stale => 1 on every cached gather gets MINOR-3's production effect
+#     (always re-probe) while AC-12 -- which passes no such flag -- keeps
+#     passing unchanged. The conflict is reported in testwriter-step7.md. -----
+{
+    my %state = (machine_capable => 1, status => 'running', status_stale => 1);
+    my ($seams, $calls) = build_seams(
+        machine_status  => sub { { ok => 1, state => 'running', detail => 'machine running' } },
+        container_start => sub { { ok => 1, detail => 'container started' } },
+    );
+    my $r = rr(plan => plan_for(\%state), mode => 'recover', reason => 'in-tui-relaunch',
+               state => \%state, %$seams);
+
+    ok((grep { $_ eq 'container_start' } @$calls),
+        'AC-36: a STALE cached status of "running" does NOT skip container-start -- the seam IS invoked');
+    is_deeply($calls, [qw(machine_status container_start heartbeat_reattach)],
+        'AC-36: the full order still holds with the stale marker set');
+    my $cs = stage_of($r, 'container-start');
+    isnt(field($cs, 'state'), 'skipped',
+        'AC-36: the container-start stage is NOT reported skipped off a stale cache');
+    is(field($cs, 'state'), 'ok', 'AC-36: it is reported from the SEAM\'s own outcome instead');
+    like_or_fail(field($cs, 'detail'), qr/container started/i,
+        'AC-36: the detail is the seam\'s, not the cache\'s "container already running"');
+    is(field($r, 'ok'), 1, 'AC-36: ok == 1');
+}
+
+# --- AC-37 (MINOR-1): a wall-clock cooldown on the recover ACTION. "ly" is one
+#     of the commonest digraphs in English (only/really/finally), so a pasted
+#     paragraph fires one full recovery per occurrence, back to back, each
+#     freezing the TUI. The cooldown is what makes the deferred paste-bypass
+#     risk (R3) priced correctly. The window must be INJECTABLE so this test
+#     never sleeps: Dashboard::run takes recover_cooldown => SECONDS, read
+#     through the SAME now() seam the loop already uses (drive3's fake clock).
+{
+    # Control first: with the cooldown disabled, this key sequence really does
+    # deliver TWO confirmed recoveries. Without this control the suppression
+    # assertion below would pass vacuously.
+    my $ctl = drive3(keys => ['l', 'y', undef, 'l', 'y', 'q'], max_ticks => 50,
+                     recover_cooldown => 0);
+    ok(!$ctl->{err}, 'AC-37 [control]: run does not die with recover_cooldown => 0') or diag("  \$\@ = $ctl->{err}");
+    is($ctl->{recover_calls}, 2,
+        'AC-37 [control]: with the cooldown at 0, two confirmed [l][y] pairs fire TWO recoveries');
+
+    # Within the window: the second confirmed recover is a NO-OP.
+    my $near = drive3(keys => ['l', 'y', undef, 'l', 'y', 'q'], max_ticks => 50,
+                      tick_interval => 0.25, recover_cooldown => 30);
+    ok(!$near->{err}, 'AC-37: run does not die with a cooldown set') or diag("  \$\@ = $near->{err}");
+    is($near->{recover_calls}, 1,
+        'AC-37: a second confirmed recover INSIDE the cooldown window is a no-op (the seam is not called again)');
+    is($near->{rc}, 0, 'AC-37: the suppressed recover does not end the loop -- a later q still returns rc 0');
+    is($near->{left}, 1, 'AC-37: the terminal is still restored exactly once');
+
+    # Past the window: it proceeds. Each fake tick advances 20s, so the second
+    # press lands >30s later WITHOUT any real sleeping.
+    my $far = drive3(keys => ['l', 'y', undef, undef, undef, 'l', 'y', 'q'], max_ticks => 50,
+                     tick_interval => 20, recover_cooldown => 30);
+    ok(!$far->{err}, 'AC-37: run does not die across the cooldown boundary') or diag("  \$\@ = $far->{err}");
+    is($far->{recover_calls}, 2,
+        'AC-37: a recover fired AFTER the cooldown has elapsed proceeds normally');
+
+    # And the cooldown is ON by default -- a caller that passes no window at
+    # all still gets amplification protection.
+    my $dflt = drive3(keys => ['l', 'y', undef, 'l', 'y', 'q'], max_ticks => 50, tick_interval => 0.25);
+    is($dflt->{recover_calls}, 1,
+        'AC-37: the cooldown DEFAULT is non-zero -- back-to-back confirms are suppressed without configuring anything');
+}
+
+# --- AC-38: launcher.pl keeps only the impure shell (source-text, PART 10
+#     convention). This is the wiring half of the seam AC-31..AC-33 test. ----
+{
+    my $ms = extract_sub_body($LSRC, 'sub _machine_state');
+    ok(defined $ms, 'AC-38: sub _machine_state still exists in launcher.pl');
+    if (defined $ms) {
+        src_like($ms, qr/Dashboard::classify_machine_state|Resources::parse_machine_list/,
+            'AC-38: _machine_state delegates its PARSE to a loadable pure helper '
+          . '(Dashboard::classify_machine_state, or Resources::parse_machine_list) instead of open-coding a second parser');
+    }
+    else {
+        fail('AC-38: _machine_state delegates its PARSE to a loadable pure helper');
+    }
 }
 
 done_testing();
