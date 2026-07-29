@@ -95,6 +95,7 @@ sub recent_logs {
             next unless defined $name && $name =~ /^launch-[^.]+\.log$/;
             next if defined $exclude && length $exclude && $name eq $exclude;
             my $path = "$base/$name";
+            next if -l $path;
             next unless -f $path;
             my $mtime = (stat($path))[9];
             next unless defined $mtime;
@@ -114,7 +115,8 @@ sub recent_logs {
 # session-boundary marker and a total cap. Items are OPAQUE -- never
 # inspected, copied or stringified. TOTAL: never dies/warns.
 sub merge_sessions {
-    my ($groups, %opts) = @_;
+    my ($groups, @rest) = @_;
+    my %opts = (@rest % 2 == 0) ? @rest : ();
     my @g = (ref $groups eq 'ARRAY') ? @$groups : ();
     @g = map { (ref $_ eq 'ARRAY') ? $_ : [] } @g;
     return [] unless @g;

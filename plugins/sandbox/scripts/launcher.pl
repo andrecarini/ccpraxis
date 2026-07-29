@@ -315,9 +315,14 @@ sub log_ev { LaunchLog::event($LAUNCH_LOG, @_) }
 # restarts. See LaunchLog::recent_logs / merge_sessions and _history_events
 # (below) for how these compose (spec S2.4a / S2.6).
 my $HISTORY_LOG_FILES      = 5;    # prior launch logs consulted
-my $HISTORY_TAIL_LINES     = 50;   # lines tailed from EACH prior log
+my $HISTORY_TAIL_LINES     = 200;  # lines tailed from EACH prior log (bumped from 50: a
+                                    # heartbeat-noise filter removes lines before the
+                                    # events/file cap applies, so more raw lines must be
+                                    # read to reach 10 real events; _tail_lines' own 128 KB
+                                    # cap still bounds worst-case per-file I/O)
 my $HISTORY_EVENTS_PER_LOG = 10;   # parsed events kept from EACH prior log
 my $ACTIVITY_EVENT_MAX     = 50;   # total events handed to state.events (unchanged ceiling)
+my $HISTORY_SPAN_TEXT_MAX  = 200;  # bytes-per-span clamp applied to HISTORY rows only
 
 # A non-empty backpack-install warning (set during the setup pass) that the
 # dashboard renders as a red alert banner — so a failure isn't lost behind the
@@ -3738,7 +3743,25 @@ sub _history_events {
         my @paths = LaunchLog::recent_logs($dir, $HISTORY_LOG_FILES, $exclude);  # newest-first
         for my $p (reverse @paths) {                                # -> oldest-first
             my @lines = _tail_lines($p, $HISTORY_TAIL_LINES);
+            # HISTORY-only: filter heartbeat/tick noise before the events/file cap
+            # applies, so the events kept are the ones that explain the session
+            # rather than N heartbeats from a long-lived run. Current-session live
+            # tail (the gather callback's own @lines / $cur) is untouched.
+            @lines = grep { !/"type"\s*:\s*"(?:heartbeat|tick)"/ } @lines;
             my $ev = Dashboard::recent_events(\@lines, $HISTORY_EVENTS_PER_LOG);
+            if (ref $ev eq 'ARRAY') {
+                # HISTORY-only: clamp bytes-per-span so a planted oversized field
+                # in a prior log can't pin an expensive row for the dashboard's
+                # entire lifetime (one-shot read, never re-read, never pruned).
+                for my $row (@$ev) {
+                    next unless ref $row eq 'ARRAY';
+                    for my $span (@$row) {
+                        next unless ref $span eq 'HASH' && defined $span->{text};
+                        $span->{text} = substr($span->{text}, 0, $HISTORY_SPAN_TEXT_MAX)
+                            if length($span->{text}) > $HISTORY_SPAN_TEXT_MAX;
+                    }
+                }
+            }
             push @groups, $ev if ref $ev eq 'ARRAY' && @$ev;
         }
         1;
