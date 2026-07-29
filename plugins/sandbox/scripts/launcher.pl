@@ -355,9 +355,7 @@ claude-sandbox there, or pass it explicitly:
 
 If you meant to work on the plugin source that lives there, work from a
 clone outside it. That directory is not necessarily a repository root, so
-clone the repository that contains it:
-
-  } . $root . q{
+clone the repository that contains it - not the directory itself:
 
   git clone --no-hardlinks <repository-root> <your-clone-dir>};
     }
