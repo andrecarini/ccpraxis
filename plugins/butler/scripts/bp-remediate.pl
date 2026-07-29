@@ -109,9 +109,24 @@ sub finding_key {
     my $remedy   = (ref $f->{remedy}   eq 'HASH') ? $f->{remedy}   : {};
     my $evidence = (ref $f->{evidence} eq 'HASH') ? $f->{evidence} : {};
 
+    # Build the candidate list with `exists` guards and never let foreach alias a
+    # hash element. `for my $c ($h->{k})` ALIASES $h->{k}, and taking an alias to
+    # a missing key AUTOVIVIFIES it -- so the old form silently mutated the very
+    # finding it was inspecting, stamping `evidence.means => null` onto it. That
+    # made finding_signature() of a "clean" verdict finding differ from the
+    # signature stored when the entry was authored, so the NP-1 no-progress guard
+    # could never see two identical signatures and a stalled remediation kept
+    # opening fresh rounds. This function is documented as pure; keep it pure.
+    my @cands;
+    for my $key (qw(means runtime file ecosystem package)) {
+        push @cands, $remedy->{$key} if exists $remedy->{$key};
+    }
+    push @cands, $evidence->{means} if exists $evidence->{means};
+    push @cands, $evidence->{files}[0]
+        if ref $evidence->{files} eq 'ARRAY' && @{ $evidence->{files} };
+
     my $discriminator = '';
-    for my $cand ($remedy->{means}, $remedy->{runtime}, $remedy->{file}, $remedy->{ecosystem}, $remedy->{package},
-                  $evidence->{means}, (ref $evidence->{files} eq 'ARRAY' ? $evidence->{files}[0] : undef)) {
+    for my $cand (@cands) {
         if (defined $cand && !ref($cand) && length("$cand")) { $discriminator = "$cand"; last; }
     }
 
@@ -646,10 +661,35 @@ sub plan {
     my %by_key;
     for my $x (@fk) { push @{ $by_key{ $x->{key} } }, $x; }
 
+    # An entry's MATCH key is recomputed from the entry's OWN stored finding
+    # whenever it has one, falling back to the stored finding_key. In normal
+    # operation the two are identical (plan() stamps the computed key at
+    # authoring time), but recomputing is what makes re-verification robust: the
+    # live verdict's copy of the same defect is passed through the very same
+    # finding_key(), so the two sides always agree. Matching on a stored
+    # shorthand key instead silently fails to find the entry, which marks a
+    # still-broken finding 'verified' AND lets the new-findings path author a
+    # duplicate round-1 entry for the same defect.
+    my $match_key = sub {
+        my ($e) = @_;
+        return undef unless ref $e eq 'HASH';
+        if (ref $e->{finding} eq 'HASH') {
+            my $k = finding_key($e->{finding});
+            return $k if defined $k && length $k && $k ne 'unclassified';
+        }
+        return $e->{finding_key};
+    };
+
     # finding_keys already tracked by ANY entry (any round/state) are never
     # "new" again — this is what keeps a persistently-failing finding from
     # being re-authored every tick (bounded rounds, §3.7).
-    my %tracked = map { $_->{finding_key} => 1 } grep { ref $_ eq 'HASH' && defined $_->{finding_key} } @entries;
+    my %tracked;
+    for my $e (@entries) {
+        next unless ref $e eq 'HASH';
+        my $k = $match_key->($e);
+        $tracked{$k} = 1 if defined $k;
+        $tracked{$e->{finding_key}} = 1 if defined $e->{finding_key};
+    }
 
     # only the HIGHEST round for a finding_key is ever "live" for verify-pass /
     # regression-check purposes — an older round superseded by a newer one is
@@ -657,14 +697,14 @@ sub plan {
     my %max_round_for_key;
     for my $e (@entries) {
         next unless ref $e eq 'HASH';
-        my $k = $e->{finding_key};
+        my $k = $match_key->($e);
         next unless defined $k;
         my $r = $e->{round} // 0;
         $max_round_for_key{$k} = $r if !exists $max_round_for_key{$k} || $r > $max_round_for_key{$k};
     }
     my $is_live = sub {
         my ($e) = @_;
-        my $k = $e->{finding_key};
+        my $k = $match_key->($e);
         return 1 unless defined $k;
         return (($e->{round} // 0) >= ($max_round_for_key{$k} // 0)) ? 1 : 0;
     };
@@ -673,7 +713,7 @@ sub plan {
     my @snapshot_awaiting = grep { ref $_ eq 'HASH' && ($_->{state} // '') eq 'awaiting_verify' && $is_live->($_) } @entries;
     my @new_from_verify;
     for my $e (@snapshot_awaiting) {
-        my $k = $e->{finding_key};
+        my $k = $match_key->($e);
         my $matches = $by_key{$k} || [];
 
         if (!@$matches) {
@@ -755,7 +795,7 @@ sub plan {
     # ---- step 5: regression check over (live) verified entries ------------
     my @snapshot_verified = grep { ref $_ eq 'HASH' && ($_->{state} // '') eq 'verified' && $is_live->($_) } @entries;
     for my $e (@snapshot_verified) {
-        my $k = $e->{finding_key};
+        my $k = $match_key->($e);
         my $matches = $by_key{$k} || [];
         next unless @$matches;
         _escalate_entry($e, 'regressed', $now_iso, \@notices, \@escalate, $nq);

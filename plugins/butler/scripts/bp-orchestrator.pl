@@ -2128,6 +2128,12 @@ sub remediation_step {
 
     # (ii) persist the queue AFTER the ledgers (§3.5): a crash between them
     # must leave an inert orphan ledger, never a merged entry with no ledger.
+    #
+    # NOTE: this write is deliberately UNCONDITIONAL. b07's own oracle requires
+    # it -- t/26 AC-30 asserts "the remediation queue is written after ingestion
+    # (even with zero entries)". Making it conditional to spare b05's AC-26
+    # boundary assertion trades one oracle for the other; see the coordinator's
+    # escalation in the b07 ledger. Do not "fix" AC-26 here.
     BpRemediate::write_queue($qpath, $plan->{queue});
 
     # (iii) notices — reused b05 channel, source overridden per §2.7.
