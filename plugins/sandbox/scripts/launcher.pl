@@ -2800,10 +2800,24 @@ sub enter_dashboard {
     ensure_claude_json_onboarded();
     # Act on the first heartbeat: if the container is already gone, don't paint
     # a dashboard that would just die on its first tick — say so and exit clean.
+    #
+    # s12: NARROWED, not removed. The bail-out is still right for the one case
+    # the TUI genuinely cannot fix -- a container that was REMOVED, on a live
+    # machine, which needs a rebuild (R1: no in-TUI recreate). For everything
+    # else the dashboard is now the better place to be: [l] relaunch can start a
+    # merely-stopped container, or start a podman machine that is down. Exiting
+    # on those would deny the user the only control that repairs them.
     if (_heartbeat_once() eq 'gone') {
-        print STDERR "Container $CONTAINER_NAME is no longer running. Nothing to attach to.\n";
-        reset_terminal();
-        exit 0;
+        my $m = _machine_state();
+        my $c = Dashboard::classify_container_state(container_status($CONTAINER_NAME), $m);
+        if ($c eq 'absent' && $m ne 'stopped') {
+            print STDERR "Container $CONTAINER_NAME is no longer running. Nothing to attach to.\n"
+                       . "Re-run claude-sandbox to rebuild it.\n";
+            reset_terminal();
+            exit 0;
+        }
+        # Fall through into the dashboard: the dead-state banner plus [l].
+        log_ev('recover_available', { state => $c, machine => $m, container => $CONTAINER_NAME });
     }
 
     my $is_tty = (-t STDOUT && -t STDIN) ? 1 : 0;
@@ -2816,6 +2830,7 @@ sub enter_dashboard {
     require Term::ReadKey;
     my $log_path = "$CLAUDE_DATA/sandbox-logs/launch-$LAUNCH_ID.log";
     my $cached_status           = 'unknown';
+    my $cached_machine_state    = 'unknown';   # s12: _machine_state, refreshed on the 10s inspect round
     my $cached_busy_age         = undef;   # B5: age (s) of /tmp/.butler-busy in CONTAINER time, or undef
     my $cached_busy_stamp       = 0;       # host time() when $cached_busy_age was measured
     my $cached_needs_you        = 0;       # B3: queued "needs you" decisions

@@ -1198,10 +1198,21 @@ sub confirm_prompt {
     # both tiers promise "nothing is deleted" -- the confirm has to read visibly
     # unlike the two destructive ones above or a user trained to fear the
     # red footer banner will cancel the one control that fixes their sandbox.
+    # THREE tiers, not two: the spec's short tier is 88 display columns, so at
+    # the 80-col reference width _footer_line's clip_pad would truncate it
+    # mid-word and the footer would no longer carry a whole prompt. The two
+    # spec-pinned wordings are kept verbatim as T1/T2; T3 is a genuinely-short
+    # tier that survives 80 (and below) intact.
     if ($pending eq 'relaunch') {
-        my $L = 'Relaunch: start the podman machine if it is down, start this container, and re-attach. Nothing is deleted. [y] confirm   [any other] cancel';
-        my $S = 'Start machine + container and re-attach. Nothing is deleted. [y] confirm  [other] cancel';
-        return display_width($L) <= $cols ? $L : $S;
+        my @tiers = (
+            'Relaunch: start the podman machine if it is down, start this container, and re-attach. Nothing is deleted. [y] confirm   [any other] cancel',
+            'Start machine + container and re-attach. Nothing is deleted. [y] confirm  [other] cancel',
+            'Relaunch machine + container. Nothing is deleted. [y] confirm  [other] cancel',
+        );
+        for my $t (@tiers) {
+            return $t if display_width($t) <= $cols;
+        }
+        return $tiers[-1];
     }
     return undef;
 }
@@ -2659,6 +2670,7 @@ sub run {
     # simply ignored, so a caller still passing it is tolerated for free.
     my $stop_runs     = (ref($o{stop_runs})     eq 'CODE') ? $o{stop_runs}     : undef;
     my $full_shutdown = (ref($o{full_shutdown}) eq 'CODE') ? $o{full_shutdown} : undef;
+    my $recover       = (ref($o{recover})       eq 'CODE') ? $o{recover}       : undef;
     my $enter_raw  = $o{enter_raw}  || sub { };
     my $leave_raw  = $o{leave_raw}  || sub { };
     my $keepawake  = $o{keepawake}  || sub { };   # B5: drive the wake-lock off fresh state
@@ -2813,6 +2825,21 @@ sub run {
                     elsif ($action eq 'full-shutdown') {
                         $do_lifecycle->($full_shutdown, 'full-shutdown');
                     }
+                    elsif ($action eq 'relaunch') {
+                        $do_lifecycle->($recover, 'recover');
+                        # Force a heartbeat on the very NEXT tick. $hb_state is
+                        # sticky and beat_interval defaults to 120s, so without
+                        # this a SUCCESSFUL recover leaves container_gone (and
+                        # the dead-container banner it drives) painted for up to
+                        # two minutes -- the user fixes the sandbox and the TUI
+                        # keeps telling them it is broken. $do_lifecycle already
+                        # reset $last_state; this is the other half, and it is
+                        # applied ONLY here: a stop-* action legitimately expects
+                        # the container to go away. Cost: $state{beat_age} reads
+                        # $beat_int for exactly one tick before the forced
+                        # heartbeat corrects it.
+                        $last_beat = $now->() - $beat_int;
+                    }
                     elsif ($action eq 'refresh') {
                         $last_state      = undef;   # force a gather next tick
                         $prev            = undef;   # (D) force a FULL repaint: blank
@@ -2829,7 +2856,8 @@ sub run {
                         if ($activity_offset < $activity_max) { $activity_offset++; $scroll_dirty = 1; }
                     }
                     # confirm-stop-runs / cancel-stop-runs / confirm-full-shutdown /
-                    # cancel-full-shutdown only toggle $pending
+                    # cancel-full-shutdown / confirm-relaunch / cancel-relaunch
+                    # only toggle $pending
 
                     # s11-lifecycle-stop fix-batch FIX 2: this key just ARMED a
                     # confirm (pending went '' -> non-empty). Stop draining NOW
