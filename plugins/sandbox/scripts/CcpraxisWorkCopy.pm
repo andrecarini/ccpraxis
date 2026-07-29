@@ -4,7 +4,7 @@ package CcpraxisWorkCopy;
 # a real git repo nor Andre's machine.
 #
 # Security redesign per spec §9 (red-team fix-batch):
-#   §9.1  hint-first anchor (_resolve_install_anchor)
+#   §9.1  anchor set, hint first then registry (_install_anchors)
 #   §9.2  workcopy_route fail-safe
 #   §9.3  non-shell list-form git (RCE fix)
 #   §9.4  bare-root derived-install-dir rejection
@@ -107,15 +107,26 @@ sub live_install_dir {
 }
 
 # =====================================================================
-# §9.1 — _resolve_install_anchor(\%opts)
-# Internal helper: hint takes precedence over registry.
+# §9.1 — _install_anchors(\%opts)
+# Internal helper: returns an ARRAYREF of canon_path'd install anchors.
+# Never undef, never a bare list. Order: caller hint first, registry-derived
+# second. Deduped by exact string equality on the canon_path'd values.
 # =====================================================================
-sub _resolve_install_anchor {
+sub _install_anchors {
     my ($opts) = @_;
     $opts //= {};
+    my @a;
     my $h = $opts->{live_install_hint};
-    return canon_path($h) if defined $h && length $h;
-    return live_install_dir($opts);
+    if (defined $h && length $h) {
+        my $c = canon_path($h);
+        push @a, $c if defined $c && length $c;
+    }
+    my $r = live_install_dir($opts);
+    push @a, $r if defined $r && length $r;
+    # first-seen-wins dedup on exact string equality
+    my (%seen, @out);
+    for my $x (@a) { push @out, $x unless $seen{$x}++; }
+    return \@out;
 }
 
 # =====================================================================
@@ -193,28 +204,49 @@ sub is_ccpraxis_project {
     # Resolve the exists seam
     my $exists_fn = $opts->{exists} // sub { -e $_[0] };
 
-    # (A) Commondir + registry match
-    my $install = live_install_dir($opts);
-    if (defined $install) {
+    # (A) commondir matches the .git of ANY resolved install anchor
+    my $anchors = _install_anchors($opts);
+    if (@$anchors) {
         my $gcd = eval { $gcd_fn->($path) };
         if (defined $gcd) {
-            my $expected = canon_path("$install/.git");
-            if (defined $expected && canon_path($gcd) eq $expected) {
-                return 1;
+            my $cg = canon_path($gcd);
+            for my $a (@$anchors) {
+                my $expected = canon_path("$a/.git");
+                return 1 if defined $expected && defined $cg && $cg eq $expected;
             }
         }
     }
 
-    # (B) Content-marker fallback. The ccpraxis marketplace manifest lives at
+    # (B) marker-count fallback. The ccpraxis marketplace manifest lives at
     # plugins/.claude-plugin/marketplace.json (the marketplace SOURCE dir is
     # plugins/), NOT at the repo root — checking the root silently missed the real
     # live repo (its only .claude-plugin/marketplace.json is under plugins/).
-    if ($exists_fn->("$path/plugins/.claude-plugin/marketplace.json") &&
-        $exists_fn->("$path/plugins/sandbox/scripts/launcher.pl")) {
-        return 1;
+    # Identity by markers iff at least TWO distinct members exist, so deleting
+    # any single marker cannot disarm detection (MAJOR-3).
+    my $count = 0;
+    for my $marker (_ccpraxis_markers()) {
+        $count++ if $exists_fn->("$path/$marker");
+        last if $count >= 2;
     }
+    return 1 if $count >= 2;
 
     return 0;
+}
+
+# =====================================================================
+# §2.3 — _ccpraxis_markers()
+# Ordered, relative to the project root. Private. Real ccpraxis-repo paths,
+# each verified present in this clone on 2026-07-29.
+# =====================================================================
+sub _ccpraxis_markers {
+    return (
+        'plugins/.claude-plugin/marketplace.json',      # M1 marketplace manifest (SOURCE dir is plugins/)
+        'plugins/sandbox/scripts/launcher.pl',          # M2
+        'plugins/sandbox/.claude-plugin/plugin.json',   # M3
+        'plugins/sandbox/scripts/MountSpec.pm',         # M4
+        'plugins/sandbox/bin/claude-sandbox.sh',        # M5
+        'plugins/sandbox/docs/working-on-ccpraxis.md',  # M6
+    );
 }
 
 # =====================================================================
@@ -224,9 +256,9 @@ sub is_ccpraxis_project {
 sub is_in_place {
     my ($path, $opts) = @_;
     $opts //= {};
-    my $anchor = _resolve_install_anchor($opts);
-    return 0 unless defined $anchor;
-    return _same_path($path, $anchor, $opts);
+    my $anchors = _install_anchors($opts);
+    for my $a (@$anchors) { return 1 if _same_path($path, $a, $opts); }
+    return 0;
 }
 
 # =====================================================================
@@ -239,7 +271,7 @@ sub workcopy_route {
     return 'offer' if is_ccpraxis_project($path, $opts) && is_in_place($path, $opts);
     # fail-safe: identity is ccpraxis but NO anchor is resolvable ->
     # cannot rule out in-place; offering beats a silent in-place launch.
-    return 'offer' if is_ccpraxis_project($path, $opts) && !defined _resolve_install_anchor($opts);
+    return 'offer' if is_ccpraxis_project($path, $opts) && !@{ _install_anchors($opts) };
     return 'passthrough';
 }
 
