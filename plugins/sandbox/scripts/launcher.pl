@@ -2940,6 +2940,11 @@ sub enter_dashboard {
                 $cached_oauth_expires_at = _gather_oauth_expiry();
                 $cached_tokens = _gather_tokens();
                 $cached_runs   = _gather_runs($PROJECT_PATH);   # s10
+                # s12: the podman-machine reading, refreshed on THIS throttled
+                # round rather than per-tick -- it shells out to `podman machine
+                # list`, which is as expensive as the inspect above, so putting
+                # it here keeps the frame budget exactly where it was.
+                $cached_machine_state = _machine_state();
                 $last_inspect  = $now;
             }
             # s09: the expensive resource probes run on their OWN, slower
@@ -2984,6 +2989,10 @@ sub enter_dashboard {
                 # macOS podman machine is covered too; Linux-native podman has
                 # no machine and must not get the stop-machine stage.
                 machine_capable  => ($PODMAN =~ /podman/i && $^O ne 'linux') ? 1 : 0,
+                # s12 spec 09 S2.8: the machine reading classify_container_state
+                # needs to tell "container removed" apart from "machine down, so
+                # the container probe means nothing".
+                machine_state    => $cached_machine_state,
             };
         },
         keepawake => sub {
@@ -2995,6 +3004,26 @@ sub enter_dashboard {
         spawn         => \&_spawn_session,
         stop_runs     => sub { my ($st, $prog) = @_; _lifecycle_run('stop-runs',     $st, $prog) },
         full_shutdown => sub { my ($st, $prog) = @_; _lifecycle_run('full-shutdown', $st, $prog) },
+        # s12 spec 09 S2.8: the [l] relaunch/recover seam. An INLINE closure, not
+        # a file-scope sub, purely because of the cache invalidation below.
+        recover       => sub {
+            my ($st, $prog) = @_;
+            my $r = recover_container({
+                state  => $st,
+                reason => 'in-tui-relaunch',
+                seams  => { emit => $prog, log => sub { log_ev($_[0], $_[1]) } },
+            });
+            # Problem 8 -- BOTH halves of the cache invalidation are required and
+            # neither is sufficient alone. The loop's own $last_state = undef
+            # (Dashboard side) forces a fresh gather CALL; these two force that
+            # call to actually re-probe, instead of serving a <=10s-stale
+            # $cached_status and re-deciding the wake-lock off a stale busy_age.
+            # They are `my` lexicals of enter_dashboard (:2842-2843), reachable
+            # only from a closure -- hence this shape.
+            $last_inspect   = 0;
+            $last_resources = 0;
+            return $r;
+        },
     );
     _keepawake_release_global();   # drop the wake-lock on clean dashboard exit
     exit($rc // 0);
@@ -3018,6 +3047,46 @@ sub _run_timed {
     };
     alarm(0);
     return $@ ? undef : $out;
+}
+
+# _machine_state() -> 'running' | 'stopped' | 'absent' | 'unknown' | 'n/a'
+# (s12 spec 09 S2.8). The podman-machine reading that disambiguates an empty
+# container probe: with the machine up, "no such container" really means the
+# container was removed; with the machine down it means we simply cannot tell,
+# and a recovery must attempt the start rather than declare a rebuild
+# (Dashboard::classify_container_state consumes exactly this vocabulary).
+#
+# NEVER dies and never blocks forever: it is called from enter_dashboard's
+# pre-loop guard AND from the recover sequence's first stage, both of which run
+# on the TUI's own thread of control. A wedged podman must degrade to 'unknown'
+# instead of freezing the dashboard, hence the _run_timed bound.
+#
+# The multi-key read (Running, then State/Status) is deliberate: the field names
+# `podman machine list --format json` emits differ across podman versions and
+# cannot be verified from inside this container, so all three spellings are
+# tolerated and anything unrecognised degrades to 'unknown'.
+sub _machine_state {
+    # Same platform guard gather() uses for machine_capable (:2986): docker, and
+    # Linux-native podman, have no machine at all -- that is not a failure.
+    return 'n/a' unless ($PODMAN =~ /podman/i && $^O ne 'linux');
+    my $probe_timeout = ($ENV{SANDBOX_RECOVER_PROBE_TIMEOUT}
+                         && $ENV{SANDBOX_RECOVER_PROBE_TIMEOUT} =~ /^\d+$/)
+                        ? $ENV{SANDBOX_RECOVER_PROBE_TIMEOUT} : 10;
+    my $out = _run_timed(qq{$PODMAN machine list --format json 2>/dev/null}, $probe_timeout);
+    return 'unknown' unless defined $out && length $out;
+    my $data = eval { require JSON::PP; JSON::PP::decode_json($out) };
+    return 'unknown' if $@ || ref($data) ne 'ARRAY';
+    return 'absent' unless @$data;
+    for my $m (@$data) {
+        next unless ref($m) eq 'HASH';
+        return 'running' if $m->{Running};
+        for my $k (qw(State Status)) {
+            my $v = $m->{$k};
+            next unless defined $v && !ref($v);
+            return 'running' if lc($v) eq 'running';
+        }
+    }
+    return 'stopped';
 }
 
 # _lifecycle_run($mode, \%state, $progress) — s11-lifecycle-stop spec 08 S2.8:
@@ -3116,6 +3185,98 @@ sub _lifecycle_run {
             my $rc = system($PODMAN, 'machine', 'stop');
             return { ok => ($rc == 0 ? 1 : 0), detail => ($rc == 0 ? '' : "exit $rc") };
         },
+    );
+}
+
+# recover_container(\%args) -> \%result — s12 spec 09 S2.8. The impure half of
+# the [l] relaunch/recover sequence, and the shared recovery seam the ledger
+# promises s03 (which will call it at launch time with
+# reason => 'launch-detect-broken'). %args: state (the gathered dashboard
+# state), reason (a pinned tag, default 'in-tui-relaunch'), seams (overrides,
+# plus the caller's emit/log callbacks).
+#
+# Why this is a fresh set of small seams rather than a re-entry into the setup
+# spine: that spine's create/start code terminates the process on failure and
+# drops a SandboxLock that enter_dashboard already released (:818/:861).
+# Re-entering it from inside the TUI would kill the dashboard mid-frame and
+# double-release an already-released lock. Nothing below ever does either -- the
+# stages only ever RETURN, and Dashboard::run_recover_stages eval-wraps each one
+# so even a dying seam cannot escape into the input drain.
+#
+# Injected seams OVERRIDE production. That is how s03 can supply a real
+# container_create later without production growing one: R1 forbids an in-TUI
+# recreate, so container_create is deliberately absent from %seams below and a
+# genuinely removed container reports the gone-diagnosis instead.
+sub recover_container {
+    my ($args) = @_;
+    $args = {} unless ref($args) eq 'HASH';
+    my $state  = ref($args->{state}) eq 'HASH' ? $args->{state} : {};
+    my $reason = (defined $args->{reason} && length $args->{reason})
+                 ? $args->{reason} : 'in-tui-relaunch';
+    my $inj    = ref($args->{seams}) eq 'HASH' ? $args->{seams} : {};
+
+    my %seams = (
+        machine_status => sub {
+            # ok => 1 even for an 'unknown' reading: the container probe may
+            # still resolve on its own, and the driver only treats ok => 0 as
+            # fatal. The reading itself is what the later stages branch on.
+            my $m = _machine_state();
+            return { ok => 1, state => $m, detail => "machine $m" };
+        },
+        machine_start => sub {
+            # Problem 5: `podman machine start` blocks for minutes on a cold
+            # WSL2 VM, synchronously inside the TUI's input drain. _run_timed
+            # bounds it where SIGALRM can break a pending backtick; on native
+            # Windows perl it degrades to a no-op bound (see _run_timed's own
+            # header) and the freeze is instead ANNOUNCED by the pre-stage
+            # frame Dashboard::_recover_pre_detail paints before this runs.
+            my $secs = ($ENV{SANDBOX_RECOVER_MACHINE_TIMEOUT}
+                        && $ENV{SANDBOX_RECOVER_MACHINE_TIMEOUT} =~ /^\d+$/)
+                       ? $ENV{SANDBOX_RECOVER_MACHINE_TIMEOUT} : 180;
+            my $out = _run_timed(qq{$PODMAN machine start 2>&1}, $secs);
+            return { ok => 0, timeout => 1,
+                     detail => "podman machine start did not finish within ${secs}s" }
+                unless defined $out;
+            my $rc = $? >> 8;
+            return { ok => ($rc == 0 ? 1 : 0),
+                     detail => ($rc == 0 ? 'machine started'
+                                         : "rc $rc: " . _trim_err($out)) };
+        },
+        container_start => sub {
+            return { ok => 1, detail => 'already running' }
+                if container_status($CONTAINER_NAME) eq 'running';
+            my $rc = system($PODMAN, 'start', $CONTAINER_NAME);
+            # Problem 6 -- the 10 s startup grace. The container entrypoint reaps
+            # itself ~10 s after start unless /tmp/.launcher-alive is fresh, so
+            # the sentinel refresh below is the VERY NEXT podman invocation: no
+            # status probe, no inspect, nothing in between. The plan then runs
+            # heartbeat-reattach immediately after this stage, which refreshes it
+            # again -- so a recovery cannot start the container and then dawdle
+            # into its own reaping.
+            my $code = $rc >> 8;
+            if ($code == 0) {
+                system($PODMAN, 'exec', $CONTAINER_NAME, 'touch', '/tmp/.launcher-alive');
+            }
+            log_ev('container_start', { rc => $code, container => $CONTAINER_NAME });
+            return { ok => ($code == 0 ? 1 : 0),
+                     detail => ($code == 0 ? 'container started' : "rc $code") };
+        },
+        heartbeat_reattach => sub {
+            my $hb = _heartbeat_once();
+            return { ok => ($hb eq 'ok' ? 1 : 0), detail => "heartbeat $hb" };
+        },
+        %$inj,
+    );
+
+    return Dashboard::run_recover_stages(
+        plan      => Dashboard::recover_plan($state),
+        mode      => 'recover',
+        reason    => $reason,
+        state     => $state,
+        status_cb => $seams{emit},
+        log_cb    => $seams{log},
+        map { $_ => $seams{$_} } qw(machine_status machine_start container_start
+                                    container_create heartbeat_reattach),
     );
 }
 
