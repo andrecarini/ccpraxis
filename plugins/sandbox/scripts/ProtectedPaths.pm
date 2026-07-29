@@ -617,7 +617,13 @@ sub protected_roots {
             push @errors, { code => 'registry-entry', detail => "entry '$name' could not be read" }
                 unless $ok;
         }
-    }
+    };
+
+    # Invoke the walk on the primary registry. This preserves exactly the
+    # pre-q04 behaviour ("run the walk when a registry resolved"); §2.3's
+    # candidate-set fan-out applies the same closure to any ADDITIONAL
+    # registries discovered under other home candidates.
+    $ingest_registry->($reg) if defined $reg;
 
     # ---- §2.5.2 step 4: ccpraxis-install (source d) ----------------------
     {
