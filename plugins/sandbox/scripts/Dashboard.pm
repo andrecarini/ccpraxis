@@ -1775,7 +1775,8 @@ sub activity_view {
 sub _alert_msgs {
     my ($state, $rows) = @_;
     $state ||= {};
-    my @msgs = grep { defined && length } (_status_alert($state), $state->{install_warning});
+    my @msgs = grep { defined && length }
+        ( lifecycle_alert_msg($state), _status_alert($state), $state->{install_warning} );
     my $max_alert = (defined $rows ? $rows : 0) - 3;   # title + >=1 body + footer
     $max_alert = 0 if $max_alert < 0;
     if (@msgs > $max_alert) {
@@ -1922,16 +1923,355 @@ sub write_shutdown_signals {
 }
 
 # ===========================================================================
+# s11-lifecycle-stop: stop-runs / full-shutdown staged driver (spec 08 S2.3-6)
+# ===========================================================================
+
+# _lifecycle_stage_catalog() -> @stages (PRIVATE, pure). The single source of
+# the 4 pinned lifecycle stages (id/label), shared by stop_runs_plan and
+# full_shutdown_plan so the two can never drift apart (spec 08 S2.3). Fresh
+# hashrefs every call -- callers can never mutate a shared structure.
+sub _lifecycle_stage_catalog {
+    return (
+        { id => 'signal-runs',    label => 'signal butler runs' },
+        { id => 'await-quiet',    label => 'wait for runs to wind down' },
+        { id => 'stop-container', label => 'stop container' },
+        { id => 'stop-machine',   label => 'stop podman machine' },
+    );
+}
+
+# stop_runs_plan(\%state) -> \@stages (PUBLIC, pure). Always exactly the first
+# two pinned stages (signal-runs, await-quiet), for ANY input including
+# undef/{} -- spec 08 S2.3. Never dies; no system/qx/backtick/exec (AC-8
+# source scan).
+sub stop_runs_plan {
+    my @all = _lifecycle_stage_catalog();
+    return [ @all[0, 1] ];
+}
+
+# full_shutdown_plan(\%state) -> \@stages (PUBLIC, pure). The first three
+# pinned stages, plus stop-machine iff $state->{machine_capable} is truthy.
+# undef / non-hashref input is treated as {} (never dies) -- spec 08 S2.3.
+sub full_shutdown_plan {
+    my ($state) = @_;
+    $state = {} unless ref($state) eq 'HASH';
+    my @all  = _lifecycle_stage_catalog();
+    my @plan = @all[0, 1, 2];
+    push @plan, $all[3] if $state->{machine_capable};
+    return \@plan;
+}
+
+# _chomp_err($msg) -> a single-line, trailing-whitespace-trimmed error string
+# (PRIVATE, pure). Shared by await_quiet and run_stages so a dying seam's
+# $@ never leaks an embedded newline into a `detail` field.
+sub _chomp_err {
+    my ($e) = @_;
+    return '' unless defined $e;
+    $e =~ s/\n/ /g;
+    $e =~ s/\s+$//;
+    return $e;
+}
+
+# _cap_name_list(\@names, $cap) -> "$name1, $name2, $name3, +N more" (PRIVATE,
+# pure). Caps an offending-container-name list at $cap (default 3) entries.
+sub _cap_name_list {
+    my ($names, $cap) = @_;
+    $cap = 3 unless defined $cap;
+    my @n = @{ $names || [] };
+    return join(', ', @n) if @n <= $cap;
+    my @head = @n[0 .. $cap - 1];
+    my $more = @n - $cap;
+    return join(', ', @head) . ", +$more more";
+}
+
+# await_quiet(%opts) -> \%result (PUBLIC; seam-driven, never dies). Bounded
+# poll loop used by run_stages' await-quiet stage (spec 08 S2.4). No real
+# sleeping happens here -- sleep_for is an injected seam the caller controls.
+# %opts: probe, now, sleep_for, timeout (default 60), interval (default 1).
+sub await_quiet {
+    my (%o) = @_;
+    my $probe     = $o{probe};
+    my $now       = ref($o{now})       eq 'CODE' ? $o{now}       : sub { time };
+    my $sleep_for = ref($o{sleep_for}) eq 'CODE' ? $o{sleep_for} : sub { };
+    my $timeout   = defined $o{timeout}  ? $o{timeout}  : 60;
+    my $interval  = defined $o{interval} ? $o{interval} : 1;
+
+    if (ref($probe) ne 'CODE') {
+        return { ok => 1, outcome => 'no-probe', polls => 0, waited => 0, detail => '' };
+    }
+
+    my $start      = $now->();
+    my $polls      = 0;
+    my $err_detail = '';
+    while (1) {
+        $polls++;
+        my $r = eval { $probe->() };
+        my ($quiet, $detail) = (0, '');
+        if ($@) {
+            $err_detail = _chomp_err($@);
+        }
+        elsif (ref($r) eq 'HASH') {
+            $quiet  = $r->{quiet};
+            $detail = defined $r->{detail} ? $r->{detail} : '';
+        }
+        else {
+            $quiet = $r;
+        }
+
+        my $full_detail = $detail;
+        $full_detail .= ($full_detail ne '' ? ' ' : '') . $err_detail if length $err_detail;
+
+        if ($quiet) {
+            return { ok => 1, outcome => ($polls == 1 ? 'already-quiet' : 'quiet'),
+                     polls => $polls, waited => $now->() - $start, detail => $full_detail };
+        }
+        my $waited = $now->() - $start;
+        if ($waited >= $timeout) {
+            return { ok => 0, outcome => 'timeout', polls => $polls, waited => $waited, detail => $full_detail };
+        }
+        $sleep_for->($interval);
+    }
+}
+
+# run_stages(%opts) -> \%result (PUBLIC; seam-driven, never dies). The staged
+# driver behind stop-runs / full-shutdown (spec 08 S2.5). Every real side
+# effect goes through an injected seam -- no podman call ever appears in this
+# function. The machine guard (Decision #15) is safety-critical and
+# fail-closed: see the stop-machine branch below.
+sub run_stages {
+    my (%o) = @_;
+    my $plan = (ref($o{plan}) eq 'ARRAY') ? $o{plan} : [];
+    my $mode = defined $o{mode} ? $o{mode} : '';
+    my $self_container = defined $o{self_container} ? $o{self_container} : '';
+    my $await_timeout  = defined $o{await_timeout}  ? $o{await_timeout}  : 60;
+    my $await_interval = defined $o{await_interval} ? $o{await_interval} : 1;
+    my $status_cb = (ref($o{status_cb}) eq 'CODE') ? $o{status_cb} : sub { };
+    my $log_cb    = (ref($o{log_cb})    eq 'CODE') ? $o{log_cb}    : sub { };
+
+    my $n = scalar @$plan;
+    my @stages;
+    my $machine_stopped = 0;
+    my @others;
+    my $others_known = 0;
+
+    eval { $log_cb->('lifecycle_start', { mode => $mode, stages => $n }); };
+
+    my $idx = 0;
+    for my $stage_in (@$plan) {
+        $idx++;
+        my $stage = (ref($stage_in) eq 'HASH') ? $stage_in : {};
+        my $id    = defined $stage->{id}    ? $stage->{id}    : 'unknown';
+        my $label = defined $stage->{label} ? $stage->{label} : '';
+
+        eval {
+            $status_cb->({ active => 1, mode => $mode, stage => $id, label => $label,
+                           index => $idx, total => $n, state => 'running', detail => '' });
+        };
+
+        my ($state, $detail) = ('skipped', '');
+
+        eval {
+            if ($id eq 'signal-runs') {
+                if (ref($o{signal_runs}) eq 'CODE') {
+                    my $r = eval { $o{signal_runs}->() };
+                    if ($@) { $state = 'fail'; $detail = _chomp_err($@); }
+                    else {
+                        my $cnt = (defined $r && !ref($r)) ? ($r + 0) : 0;
+                        $state = 'ok'; $detail = "$cnt run(s) signalled";
+                    }
+                }
+                else { $detail = 'signal_runs seam not provided'; }
+            }
+            elsif ($id eq 'await-quiet') {
+                my $r;
+                if (ref($o{await_quiet}) eq 'CODE') {
+                    $r = eval { $o{await_quiet}->() };
+                }
+                else {
+                    $r = eval {
+                        await_quiet(probe => $o{quiet_probe}, now => $o{now}, sleep_for => $o{sleep_for},
+                                    timeout => $await_timeout, interval => $await_interval);
+                    };
+                }
+                if ($@) { $state = 'fail'; $detail = _chomp_err($@); }
+                else {
+                    my $outcome = (ref($r) eq 'HASH') ? ($r->{outcome} // '') : '';
+                    my $rdetail = (ref($r) eq 'HASH') ? ($r->{detail}  // '') : '';
+                    if    ($outcome eq 'timeout')  { $state = 'timeout'; $detail = length($rdetail) ? $rdetail : 'timed out waiting for runs to quiet'; }
+                    elsif ($outcome eq 'no-probe') { $state = 'skipped'; $detail = length($rdetail) ? $rdetail : 'no quiet probe provided'; }
+                    else                           { $state = 'ok';      $detail = $rdetail; }
+                }
+            }
+            elsif ($id eq 'stop-container') {
+                if (ref($o{stop_container}) eq 'CODE') {
+                    my $r = eval { $o{stop_container}->() };
+                    if ($@) { $state = 'fail'; $detail = _chomp_err($@); }
+                    else {
+                        my $rr = (ref($r) eq 'HASH') ? $r : { ok => ($r ? 1 : 0), detail => '' };
+                        if ($rr->{ok}) { $state = 'ok'; $detail = defined $rr->{detail} ? $rr->{detail} : ''; }
+                        else { $state = 'fail'; $detail = (defined $rr->{detail} && length $rr->{detail}) ? $rr->{detail} : 'container stop failed'; }
+                    }
+                }
+                else { $detail = 'stop_container seam not provided'; }
+            }
+            elsif ($id eq 'stop-machine') {
+                my ($cstage) = grep { $_->{id} eq 'stop-container' } @stages;
+                if ($cstage && $cstage->{state} eq 'fail') {
+                    $state = 'skipped';
+                    $detail = 'container stop failed; podman machine left running';
+                }
+                else {
+                    my $list;
+                    my $enum_ok = 0;
+                    if (ref($o{list_containers}) eq 'CODE') {
+                        my $r = eval { $o{list_containers}->() };
+                        if (!$@ && ref($r) eq 'ARRAY') { $list = $r; $enum_ok = 1; }
+                    }
+                    if (!$enum_ok) {
+                        $state = 'skipped';
+                        $detail = 'could not enumerate running containers; podman machine left running';
+                        $others_known = 0;
+                    }
+                    else {
+                        $others_known = 1;
+                        @others = grep { defined($_) && length($_) && $_ ne $self_container }
+                                  map { my $x = $_; $x =~ s/^\s+|\s+$// if defined $x; $x } @$list;
+                        if (@others == 0) {
+                            if (ref($o{stop_machine}) eq 'CODE') {
+                                my $r = eval { $o{stop_machine}->() };
+                                if ($@) { $state = 'fail'; $detail = _chomp_err($@); }
+                                else {
+                                    my $rr = (ref($r) eq 'HASH') ? $r : { ok => ($r ? 1 : 0), detail => '' };
+                                    if ($rr->{ok}) { $state = 'ok'; $detail = defined $rr->{detail} ? $rr->{detail} : ''; $machine_stopped = 1; }
+                                    else { $state = 'fail'; $detail = (defined $rr->{detail} && length $rr->{detail}) ? $rr->{detail} : 'podman machine stop failed'; }
+                                }
+                            }
+                            else { $detail = 'stop_machine seam not provided'; }
+                        }
+                        else {
+                            $state = 'skipped';
+                            $detail = 'other container(s) running: ' . _cap_name_list(\@others, 3);
+                        }
+                    }
+                }
+            }
+            else {
+                $state = 'skipped';
+                $detail = 'unknown stage';
+            }
+        };
+        if ($@) { $state = 'fail'; $detail = _chomp_err($@); }
+
+        push @stages, { id => $id, label => $label, state => $state, detail => $detail };
+
+        eval {
+            $status_cb->({ active => 1, mode => $mode, stage => $id, label => $label,
+                           index => $idx, total => $n, state => $state, detail => $detail });
+        };
+        eval {
+            $log_cb->('lifecycle_stage', { mode => $mode, stage => $id, index => $idx, total => $n,
+                                            state => $state, detail => $detail });
+        };
+    }
+
+    my $ok        = (grep { $_->{state} eq 'fail' } @stages) ? 0 : 1;
+    my $timed_out = (grep { $_->{state} eq 'timeout' } @stages) ? 1 : 0;
+
+    my ($failed) = grep { $_->{state} eq 'fail' } @stages;
+    my @clauses;
+    if ($failed) {
+        push @clauses, "$failed->{id} failed" . (length($failed->{detail}) ? " ($failed->{detail})" : '');
+    }
+    if ($mode eq 'stop-runs') {
+        push @clauses, 'runs stopped' unless $failed;
+        push @clauses, 'container stays up';
+    }
+    else {
+        push @clauses, 'container stopped' if !$failed;
+        if ($machine_stopped) {
+            push @clauses, 'machine stopped';
+        }
+        elsif (@others) {
+            push @clauses, 'machine left running (' . scalar(@others) . ' other container(s) running)';
+        }
+        elsif ($failed) {
+            push @clauses, 'machine left running (container stop failed)';
+        }
+        elsif (!$others_known) {
+            push @clauses, 'machine left running (could not verify other containers)';
+        }
+    }
+    push @clauses, 'timed out' if $timed_out;
+    my $summary = join('; ', @clauses);
+    $summary = 'lifecycle sequence completed' unless length $summary;
+
+    eval {
+        $status_cb->({ active => 0, mode => $mode, stage => undef, label => undef,
+                        index => $n, total => $n, state => 'done', detail => '', summary => $summary });
+    };
+
+    my %done_fields = (mode => $mode, ok => $ok, timed_out => $timed_out, summary => $summary);
+    if ($mode eq 'full-shutdown') {
+        $done_fields{machine_stopped} = $machine_stopped;
+        $done_fields{others}          = scalar(@others);
+        $done_fields{others_known}    = $others_known;
+    }
+    eval { $log_cb->('lifecycle_done', \%done_fields); };
+
+    return {
+        mode            => $mode,
+        ok              => $ok,
+        timed_out       => $timed_out,
+        stages          => \@stages,
+        machine_stopped => $machine_stopped,
+        others          => [ @others ],
+        others_known    => $others_known,
+        summary         => $summary,
+    };
+}
+
+# lifecycle_alert_msg(\%state) -> $string | undef (PUBLIC, pure; never dies).
+# Renders $state->{lifecycle} (the run_stages \%progress the loop stashes
+# verbatim) as a single alert-banner line -- the FIRST message _alert_msgs
+# returns (spec 08 S2.6). Missing keys degrade to '?'. Does not re-cap any
+# name list embedded in summary/detail -- that is run_stages' job (S2.5);
+# this sub only relays what it is given.
+sub lifecycle_alert_msg {
+    my ($state) = @_;
+    return undef unless ref($state) eq 'HASH';
+    my $lc = $state->{lifecycle};
+    return undef unless ref($lc) eq 'HASH';
+
+    my %mode_label = ('stop-runs' => 'stop runs', 'full-shutdown' => 'full shutdown');
+    my $mode  = defined $lc->{mode} ? $lc->{mode} : '';
+    my $label = $mode_label{$mode};
+    $label = (length($mode) ? $mode : '?') unless defined $label;
+
+    if ($lc->{active}) {
+        my $index = defined $lc->{index} ? $lc->{index} : '?';
+        my $total = defined $lc->{total} ? $lc->{total} : '?';
+        my $slabel = defined $lc->{label} ? $lc->{label} : '?';
+        my $sstate = defined $lc->{state} ? $lc->{state} : '?';
+        return "$label $index/$total: $slabel - $sstate";
+    }
+    my $summary = defined $lc->{summary} ? $lc->{summary} : '?';
+    return "$label done: $summary";
+}
+
+# ===========================================================================
 # THE LOOP (seam-injected; every side effect is a coderef)
 # ===========================================================================
 #
 # Required seams (launcher.pl supplies the real ones; the test harness supplies
 # fakes): now, sleep_for, read_key, term_size, gather, heartbeat, spawn,
-# write_signals, enter_raw, leave_raw, out. Optional: color, beat_interval,
-# state_interval, tick_interval, max_ticks (bounded run for tests), and
-# keepawake->(\%state) — B5's hook, called once per state refresh with the freshly
-# gathered state so the launcher can drive the wake-lock off busy_age (the loop
-# itself stays ignorant of the keep-awake decision; that lives in KeepAwake.pm).
+# enter_raw, leave_raw, out. Optional: color, beat_interval, state_interval,
+# tick_interval, max_ticks (bounded run for tests), stop_runs/full_shutdown
+# (s11-lifecycle-stop spec 08 S2.7 -- sub($state,$progress) -> \%result|undef;
+# neither exits the loop, only [q] does), and keepawake->(\%state) — B5's
+# hook, called once per state refresh with the freshly gathered state so the
+# launcher can drive the wake-lock off busy_age (the loop itself stays
+# ignorant of the keep-awake decision; that lives in KeepAwake.pm).
+# write_signals (retired) is tolerated if still passed -- unknown %o keys are
+# simply ignored, as before.
 #
 # gather->() returns the base state hashref (project_name, container, status,
 # events); the loop augments it with beat_age, uptime and pending. heartbeat->()
@@ -1946,7 +2286,10 @@ sub run {
     my $gather     = $o{gather}     || sub { {} };
     my $heartbeat  = $o{heartbeat}  || sub { 'ok' };
     my $spawn      = $o{spawn}      || sub { undef };
-    my $write_sig  = $o{write_signals} || sub { 0 };
+    # write_signals is retired (s11-lifecycle-stop); an unknown %o key is
+    # simply ignored, so a caller still passing it is tolerated for free.
+    my $stop_runs     = (ref($o{stop_runs})     eq 'CODE') ? $o{stop_runs}     : undef;
+    my $full_shutdown = (ref($o{full_shutdown}) eq 'CODE') ? $o{full_shutdown} : undef;
     my $enter_raw  = $o{enter_raw}  || sub { };
     my $leave_raw  = $o{leave_raw}  || sub { };
     my $keepawake  = $o{keepawake}  || sub { };   # B5: drive the wake-lock off fresh state
@@ -1972,6 +2315,41 @@ sub run {
     my $flash_until = 0;        # footer-flash expiry (set when [c] hit a dead container)
     my $rc = 0;
     my $ticks = 0;
+
+    # $progress->(\%p) -- handed to the stop_runs/full_shutdown seams as
+    # run_stages(status_cb => $progress). Stashes the progress hashref
+    # verbatim into $state{lifecycle} and repaints immediately, mirroring the
+    # dirty-scroll same-tick re-render exactly (compose -> render_frame ->
+    # update $prev), so the synchronized-output wrapper and per-row diff are
+    # preserved by construction (spec 08 S2.7).
+    my $progress = sub {
+        my ($p) = @_;
+        $state{lifecycle} = $p;
+        my $frame = compose_frame(\%state, $rows, $cols);
+        $out->(render_frame($prev, $frame, { color => $color }));
+        $prev = $frame;
+    };
+
+    # _lifecycle($seam,$mode) -- inline handler for the stop-runs/full-shutdown
+    # actions (spec 08 S2.7). Never sets $quit, never last's, never touches
+    # $rc -- only [q] quits. A dying seam paints one synthetic failure frame
+    # instead of propagating.
+    my $do_lifecycle = sub {
+        my ($seam, $mode) = @_;
+        return unless ref($seam) eq 'CODE';
+        eval { $seam->(\%state, $progress) };
+        if ($@) {
+            my $err_txt = $@;
+            $err_txt =~ s/\n/ /g;
+            $err_txt =~ s/\s+$//;
+            $state{lifecycle} = { active => 0, mode => $mode, state => 'fail', index => 0, total => 0,
+                                   detail => $err_txt, summary => "$mode failed: $err_txt" };
+            my $frame = compose_frame(\%state, $rows, $cols);
+            $out->(render_frame($prev, $frame, { color => $color }));
+            $prev = $frame;
+        }
+        $last_state = undef;   # force a fresh gather next tick (container status may have changed)
+    };
 
     my $err;
     {
@@ -2059,14 +2437,18 @@ sub run {
                             $flash_until = $t + 2;
                         }
                     }
-                    elsif ($action eq 'shutdown') {
-                        $write_sig->();
+                    elsif ($action eq 'stop-runs') {
+                        $do_lifecycle->($stop_runs, 'stop-runs');
+                    }
+                    elsif ($action eq 'full-shutdown') {
+                        $do_lifecycle->($full_shutdown, 'full-shutdown');
                     }
                     elsif ($action eq 'refresh') {
                         $last_state      = undef;   # force a gather next tick
                         $prev            = undef;   # (D) force a FULL repaint: blank
                                                     # (\e[2J) then redraw every row fresh
                         $activity_offset = 0;       # back to the newest events
+                        delete $state{lifecycle};   # clear the lifecycle banner (spec 08 S2.7)
                     }
                     elsif ($action eq 'scroll-up') {
                         # Only a view-changing scroll marks the frame dirty; a no-op
@@ -2076,7 +2458,8 @@ sub run {
                     elsif ($action eq 'scroll-down') {
                         if ($activity_offset < $activity_max) { $activity_offset++; $scroll_dirty = 1; }
                     }
-                    # confirm-shutdown / cancel-shutdown only toggle $pending
+                    # confirm-stop-runs / cancel-stop-runs / confirm-full-shutdown /
+                    # cancel-full-shutdown only toggle $pending
                 }
                 last if $quit;
 
