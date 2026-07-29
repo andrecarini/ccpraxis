@@ -242,7 +242,7 @@ my $val_b1;
     like($val_b1 // '', qr/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/,
         'AC-06 (B1): stamped value matches the full-seconds ISO shape');
     isnt($val_b1, '2026-06-24T00:00:00Z', 'AC-07 (B1): stamped value replaced the hand-authored fixture value');
-    push @STAMPED_VALUES, $val_b1 if defined $val_b1;
+    push @STAMPED_VALUES, [$val_b1, $t0, $t1] if defined $val_b1;
 }
 
 # =========================================================================
@@ -266,7 +266,7 @@ my $val_b2;
     like($val_b2 // '', qr/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/,
         'AC-06 (B2): stamped value matches the full-seconds ISO shape');
     isnt($val_b2, '2026-06-24T00:00:00Z', 'AC-07 (B2): stamped value replaced the hand-authored fixture value');
-    push @STAMPED_VALUES, $val_b2 if defined $val_b2;
+    push @STAMPED_VALUES, [$val_b2, $t0, $t1] if defined $val_b2;
 }
 
 # =========================================================================
@@ -297,10 +297,12 @@ my $val_b2;
 # =========================================================================
 {
     my ($dir, $led) = mk_bp(status => 'done', next => 'n/a');
+    my $t0 = time;
     my ($rc1) = run_gstop(base_env($dir, $led));
     is($rc1, 0, 'AC-09 (B13): first run exits 0');
     my $after1 = read_lines($led);
     my ($rc2) = run_gstop(base_env($dir, $led));
+    my $t1 = time;
     is($rc2, 0, 'AC-09 (B13): second run exits 0');
     my $after2 = read_lines($led);
     my $diffs = diff_indices($after1, $after2);
@@ -310,7 +312,8 @@ my $val_b2;
         like($after2->[$diffs->[0]], qr/^last_updated:/, 'AC-09 (B13): the differing line is last_updated:');
     }
     is(count_last_updated_in_frontmatter($led), 1, 'AC-09 (B13): no duplicated last_updated: key after two runs');
-    push @STAMPED_VALUES, fm_last_updated($led);
+    my $val_b13 = fm_last_updated($led);
+    push @STAMPED_VALUES, [$val_b13, $t0, $t1] if defined $val_b13;
 }
 
 # =========================================================================
@@ -407,11 +410,6 @@ my $val_b2;
 # captured, plus the two dedicated cases below).
 # =========================================================================
 my @ALL_STDERR;
-{
-    # Re-derive a couple of extra edge combinations purely to broaden B14's
-    # "across every case" coverage: force-stop and judge-role (also needed
-    # standalone for AC-16 below, so captured once and reused).
-}
 
 # =========================================================================
 # AC-16 — B9 (force-stop) and B10 (BP_ROLE=judge)
@@ -485,7 +483,7 @@ my @ALL_STDERR;
     );
     for my $p (@old_phrases) {
         my ($content, $phrase, $name) = @$p;
-        unlike($content, qr/\Q$phrase\E/, "AC-17: $name's bare pre-b27 wording no longer appears verbatim");
+        unlike($content, qr/\Q$phrase\E/, "AC-17: ${name}'s bare pre-b27 wording no longer appears verbatim");
     }
 }
 
