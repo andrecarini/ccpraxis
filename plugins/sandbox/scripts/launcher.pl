@@ -3299,9 +3299,13 @@ sub enter_dashboard {
         color     => 1,
         enter_raw => sub {
             Term::ReadKey::ReadMode('cbreak');
+            print STDOUT "\e[22;0t";                # XTPUSHTITLE: push icon+window title onto the stack
             print STDOUT "\e[?1049h\e[?25l";        # alt-screen + hide cursor
+            print STDOUT "\e]0;" . Dashboard::window_title({ project_name => $PROJECT_NAME }) . "\a";
         },
         leave_raw => sub {
+            print STDOUT "\e]0;\a";                 # neutral: clear our title
+            print STDOUT "\e[23;0t";                # XTPOPTITLE: restore the pushed title
             print STDOUT "\e[?25h\e[?1049l";        # show cursor + leave alt-screen
             eval { Term::ReadKey::ReadMode('restore') };
             reset_terminal();

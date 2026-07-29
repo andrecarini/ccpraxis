@@ -566,6 +566,14 @@ my $GLYPH_WHITE  = Encode::encode('UTF-8', "\x{26AA}");
 my $TRI_UP       = Encode::encode('UTF-8', "\x{25B2}");
 my $TRI_DOWN     = Encode::encode('UTF-8', "\x{25BC}");
 
+# @SPINNER -- the ten braille spinner glyphs already allow-listed at
+# Dashboard.pm:230-239 (dots-1..dots-10 order, per their own comments),
+# ordered here (the hash %GLYPH_TABLE carries no order). s07-live-status
+# spec S2.1. No glyph is added to %GLYPH_TABLE; no width declaration changes.
+my @SPINNER = map { Encode::encode('UTF-8', $_) }
+    ("\x{280B}","\x{2819}","\x{2839}","\x{2838}","\x{283C}",
+     "\x{2834}","\x{2826}","\x{2827}","\x{2807}","\x{280F}");   # dots-1 .. dots-10
+
 my $OAUTH_WARN_SECS   = 900;   # 15 minutes (spec S2.2)
 my $BACKPACK_MAX_ROWS = 2;     # spec S3.12
 
@@ -583,6 +591,49 @@ sub container_status_style {
     return ($GLYPH_RED, 'bad')      if $st =~ /^(?:exited|dead|removing|unknown)$/;
     return ($GLYPH_YELLOW, 'warn')  if $st =~ /^(?:created|restarting|stopping|stopped|paused)$/;
     return ($GLYPH_WHITE, 'muted');
+}
+
+# spinner_frame($idx) -> UTF-8 bytes of one of the 10 braille spinner glyphs
+# in @SPINNER (spec S2.1). PUBLIC, pure, total: never reads the clock -- the
+# caller (Dashboard::run, Decision #21) supplies a wall-clock-derived $idx.
+# undef / non-numeric / any ref -> frame 0. A negative or fractional index is
+# handled by Perl's `%` (period 10 either way): never dies, never warns.
+sub spinner_frame {
+    my ($idx) = @_;
+    $idx = 0 if !defined $idx || ref $idx || $idx !~ /^-?\d+(?:\.\d+)?$/;
+    return $SPINNER[$idx % 10];
+}
+
+# window_title(\%state) -> an ASCII-safe OS window-title string, "<char>
+# <project>" (spec S2.2). Reads ONLY project_name/status/container_gone/
+# needs_you; any other key is ignored. $state undef/non-hashref -> {}.
+# Reuses container_status_style as the sole status vocabulary (S2.3): no
+# status word is re-listed here. Precedence: gone > exited > stopped >
+# needs-you > running > fallback. PUBLIC, pure, total. Guaranteed to match
+# /\A[\x20-\x7E]{1,80}\z/ for any input.
+sub window_title {
+    my ($state) = @_;
+    $state = {} if !defined $state || ref($state) ne 'HASH';
+
+    my (undef, $role) = container_status_style($state->{status}, $state->{container_gone});
+    my $needs_you = $state->{needs_you};
+    $needs_you = 0 if !defined $needs_you || ref $needs_you || $needs_you !~ /^-?\d+(?:\.\d+)?$/;
+
+    my $char;
+    if ($state->{container_gone})            { $char = '?'; }
+    elsif ($role eq 'bad')                   { $char = 'x'; }
+    elsif ($role eq 'warn')                  { $char = '-'; }
+    elsif ($role eq 'good' && $needs_you > 0) { $char = '!'; }
+    elsif ($role eq 'good')                  { $char = '*'; }
+    else                                     { $char = '?'; }
+
+    my $name = _safe($state->{project_name});
+    $name =~ s/[^\x20-\x7E]/?/g;   # hard ASCII pass -- _safe alone lets allow-listed glyphs through
+    $name =~ s/^\s+//;
+    $name =~ s/\s+$//;
+
+    my $title = length($name) ? "$char $name" : $char;
+    return substr($title, 0, 80);
 }
 
 # oauth_role($remaining_secs) -> $role -- spec S2.2. Mirrors fmt_oauth's
@@ -1156,14 +1207,41 @@ sub _resources_lines {
 }
 
 # _title_line / _footer_line / _panel_title_line — single rows, exactly $cols.
+# _title_line returns an ARRAYREF of {text,role} spans (s07-live-status spec
+# S2.4), which make_cell -> spanify already accepts. With $s->{spinner_idx}
+# absent (every pre-existing direct compose_frame call), the emitted text is
+# byte-identical to the pre-s07 plain-string output -- this backward
+# compatibility is load-bearing.
 sub _title_line {
     my ($s, $cols) = @_;
     my $left = 'ccpraxis sandbox';
     $left .= ' - ' . _safe($s->{project_name}) if defined $s->{project_name} && length $s->{project_name};
     my $ctr = _safe(defined $s->{container} ? $s->{container} : '');
     my $st  = _safe(defined $s->{status}    ? $s->{status}    : '?');
-    my $right = length $ctr ? "$ctr [$st]" : "[$st]";
-    return _justify($left, $right, $cols);
+    my (undef, $role) = container_status_style($s->{status}, $s->{container_gone});
+
+    my $spin;
+    my $idx = $s->{spinner_idx};
+    $spin = spinner_frame($idx)
+        if defined $idx && !ref($idx) && $idx =~ /^-?\d+(?:\.\d+)?$/;
+
+    my @right_spans = (
+        { text => (length $ctr ? "$ctr [" : '['), role => 'title' },
+        (defined $spin ? ({ text => "$spin ", role => $role }) : ()),
+        { text => $st, role => $role },
+        { text => ']', role => 'title' },
+    );
+
+    my $lw = display_width($left);
+    my $rw = spans_width(\@right_spans);
+    if ($lw + $rw + 1 <= $cols) {
+        return [
+            { text => $left, role => 'title' },
+            { text => (' ' x ($cols - $lw - $rw)), role => 'title' },
+            @right_spans,
+        ];
+    }
+    return [ { text => clip_pad($left, $cols), role => 'title' } ];
 }
 
 # footer_legend($cols) -> the unpadded command legend, tiered so the pinned
@@ -2837,6 +2915,8 @@ sub run {
     my $last_recover_at;        # now() when the last [l] recovery FINISHED (undef: none yet)
     my $rc = 0;
     my $ticks = 0;
+    my $last_title;                                            # undef => nothing emitted yet
+    my $spin_div = ($tick_int && $tick_int > 0) ? $tick_int : 0.2;   # never divide by zero
 
     # $progress->(\%p) -- handed to the stop_runs/full_shutdown seams as
     # run_stages(status_cb => $progress). Stashes the progress hashref
@@ -2909,6 +2989,7 @@ sub run {
                 $state{uptime}         = $t - $start;
                 $state{pending}        = $pending;
                 $state{container_gone} = ($hb_state eq 'gone') ? 1 : 0;
+                $state{spinner_idx}    = int($t / $spin_div);   # Decision #21: WALL CLOCK, not iteration count
                 $state{oauth_remaining} = defined $state{oauth_expires_at}
                     ? $state{oauth_expires_at} - $t : undef;
                 # Transient footer notice when [c] was pressed on a non-running
@@ -2927,6 +3008,17 @@ sub run {
                 $activity_max    = $win->{max_offset};
                 my @ev_lines = @{ $win->{lines} };
                 $state{events} = (@ev_lines ? \@ev_lines : ['(no events yet)']);
+
+                # OSC window-title emit (s07-live-status S2.5): its OWN out
+                # call, outside the diffed frame, only on change. Only the
+                # PRIMARY render path emits -- $progress/$do_lifecycle/the
+                # recover-cooldown frame/the post-drain scroll re-render do
+                # not gather, so no title-relevant field can have changed.
+                my $title = window_title(\%state);
+                if (!defined $last_title || $title ne $last_title) {
+                    $out->("\e]0;" . $title . "\a");
+                    $last_title = $title;
+                }
 
                 my $frame = compose_frame(\%state, $rows, $cols);
                 $out->(render_frame($prev, $frame, { color => $color }));
