@@ -399,6 +399,61 @@ is(gate_verdict_call('Edit', 'worksite', 1),  'deny',  'AC-21: regression - bp_g
         my $path = "$HOOKS/$f";
         ok(-e $path && -s $path, "AC-20: referenced hook file $f exists and is non-empty");
     }
+
+    # =================================================================================
+    # AC-20d [pure] cmds_contain_in_order discriminating tests (b26 §2.4, D1-D14). Proves
+    # the AC-20 relax at :346-350 still rejects a world where b10's registration is
+    # missing, renamed, or relatively reordered -- it is not a set-membership or
+    # substring/basename check in disguise. Runs unconditionally (no jq, no extra I/O);
+    # D13/D14 mutate the REAL parsed @b0_cmds from above, not hardcoded literals.
+    # =================================================================================
+    my $GS = $cmd_of->('gate-shutdown.sh');
+    my $GW = $cmd_of->('guard-writes.sh');
+    my $LG = $cmd_of->('ledger-guard.sh');
+    my $RG = $cmd_of->('repeat-guard.sh');
+    my $N  = [ $GS, $GW ];
+
+    is(cmds_contain_in_order([ $GS, $GW ], $N), 1,
+       'AC-20d: D1 - positive control: the pre-b12 (b10-era) shape still passes');
+    is(cmds_contain_in_order([ $GS, $GW, $LG ], $N), 1,
+       'AC-20d: D2 - appending ledger-guard.sh (today\'s real shape) is permitted');
+    is(cmds_contain_in_order([ $GS, $LG, $GW ], $N), 1,
+       'AC-20d: D3 - interleaving a foreign command is permitted');
+    is(cmds_contain_in_order([ $RG, $GS, $GW ], $N), 1,
+       'AC-20d: D4 - prepending a foreign command is permitted');
+    is(cmds_contain_in_order([ $GW, $GS, $GW ], $N), 1,
+       'AC-20d: D5 - subsequence semantics, not first-index comparison (a first-index implementation would wrongly fail here)');
+
+    is(cmds_contain_in_order([ $GW, $LG ], $N), 0,
+       'AC-20d: D6 - gate-shutdown.sh missing -> still fails');
+    is(cmds_contain_in_order([ $GS, $LG ], $N), 0,
+       'AC-20d: D7 - guard-writes.sh missing -> still fails');
+    is(cmds_contain_in_order([ $GW, $GS ], $N), 0,
+       'AC-20d: D8 - the two swapped -> still fails');
+    is(cmds_contain_in_order([ $LG, $GW, $GS ], $N), 0,
+       'AC-20d: D9 - swapped with extras present -> still fails');
+    is(cmds_contain_in_order([ $cmd_of->('gate-shutdown2.sh'), $GW ], $N), 0,
+       'AC-20d: D10 - renamed hook -> still fails');
+    is(cmds_contain_in_order([ q{bash "$HOME/hooks/gate-shutdown.sh"}, $GW ], $N), 0,
+       'AC-20d: D11 - right basename, wrong full command string -> still fails (exact match, not substring/basename)');
+    is(cmds_contain_in_order([], $N), 0,
+       'AC-20d: D12 - unparseable/empty hooks.json degrades to a failure, never a silent pass');
+
+    my ($gs_idx) = grep { $b0_cmds[$_] eq $GS } 0 .. $#b0_cmds;
+    my ($gw_idx) = grep { $b0_cmds[$_] eq $GW } 0 .. $#b0_cmds;
+    ok(defined($gs_idx) && defined($gw_idx),
+       'AC-20d: non-vacuity guard - the real parsed block 0 command list contains both gate-shutdown.sh and guard-writes.sh before mutation');
+
+    my @d13 = grep { $_ ne $GS } @b0_cmds;
+    is(cmds_contain_in_order(\@d13, $N), 0,
+       'AC-20d: D13 - real block 0 list with b10\'s gate-shutdown.sh entry removed fails the in-situ predicate');
+
+    my @d14 = @b0_cmds;
+    if (defined($gs_idx) && defined($gw_idx)) {
+        @d14[$gs_idx, $gw_idx] = @d14[$gw_idx, $gs_idx];
+    }
+    is(cmds_contain_in_order(\@d14, $N), 0,
+       'AC-20d: D14 - real block 0 list with b10\'s gate-shutdown.sh/guard-writes.sh positions exchanged fails the in-situ predicate');
 }
 
 # =====================================================================================
