@@ -1194,6 +1194,15 @@ sub confirm_prompt {
         my $S = 'Stop runs + STOP CONTAINER (+ machine if last). [y] confirm  [other] cancel';
         return display_width($L) <= $cols ? $L : $S;
     }
+    # s12-lifecycle-relaunch: [l] is the ONLY constructive lifecycle control, so
+    # both tiers promise "nothing is deleted" -- the confirm has to read visibly
+    # unlike the two destructive ones above or a user trained to fear the
+    # red footer banner will cancel the one control that fixes their sandbox.
+    if ($pending eq 'relaunch') {
+        my $L = 'Relaunch: start the podman machine if it is down, start this container, and re-attach. Nothing is deleted. [y] confirm   [any other] cancel';
+        my $S = 'Start machine + container and re-attach. Nothing is deleted. [y] confirm  [other] cancel';
+        return display_width($L) <= $cols ? $L : $S;
+    }
     return undef;
 }
 
@@ -1231,24 +1240,35 @@ sub _alert_line {
 # The dead-state banner deliberately does NOT offer [c]: [c] only spawns a
 # connector (`podman exec` into a LIVE container), so on a dead container it
 # opens a Windows Terminal that instantly closes (the exec has nothing to attach
-# to). The real relaunch is to quit ([q]) and re-run `claude-sandbox`, which
-# `podman start`s the exited container — so that is what the banner points at.
+# to). Since s12 the banner leads with [l] relaunch (start the machine if it is
+# down, start the container, re-attach — in-TUI, nothing deleted) and keeps
+# "[q] quit, then re-run claude-sandbox" as the fallback for the one case [l]
+# cannot fix (a container that was genuinely removed and needs a rebuild).
 # [r] retry stays for the 'unknown'/unreachable case, where the same container
 # may simply reappear once podman/the host is back.
+#
+# $s->{machine_state} (s12, gather's new key; the _machine_state vocabulary
+# running|stopped|absent|unknown|n/a) is checked FIRST: a stopped podman machine
+# and a removed container both read as "unreachable" from the container probe
+# alone, and only the machine reading tells them apart. Every pre-s12 caller
+# omits the key, so the container rows below are unchanged for them.
 sub _status_alert {
     my ($s) = @_;
     $s ||= {};
-    my $st = defined $s->{status} ? lc $s->{status} : '';
+    my $st = defined $s->{status}        ? lc $s->{status}        : '';
+    my $ms = defined $s->{machine_state} ? lc $s->{machine_state} : '';
+    return 'podman machine is stopped - [l] relaunch to start the machine and container, or [q] quit'
+        if $ms eq 'stopped';
     if ($s->{container_gone}) {
         return ($st && $st ne 'unknown')
-            ? "container is not running ($st) - [q] quit, then re-run claude-sandbox to relaunch"
-            : 'container unreachable - [r] retry or [q] quit';
+            ? "container is not running ($st) - [l] relaunch, or [q] quit and re-run claude-sandbox"
+            : 'container unreachable - [l] relaunch, [r] retry, or [q] quit';
     }
     return undef if $st eq '' || $st eq '?' || $st eq 'running'
                  || $st eq 'created' || $st eq 'restarting';
-    return 'container unreachable (podman down or host asleep) - [r] retry, [q] quit'
+    return 'container unreachable (podman down or host asleep) - [l] relaunch, [r] retry, [q] quit'
         if $st eq 'unknown';
-    return "container is $st (not running) - [q] quit, then re-run claude-sandbox to relaunch";
+    return "container is $st (not running) - [l] relaunch, or [q] quit and re-run claude-sandbox";
 }
 
 # can_launch(\%state) -> 1 iff the container is in a state where the [c] hotkey
@@ -1272,7 +1292,7 @@ sub can_launch {
 # distinct from the persistent _status_alert banner wording, so the two never
 # read as one duplicated line and each is independently greppable.
 sub launch_blocked_msg {
-    return 'container is down - [q] quit, then re-run claude-sandbox to relaunch';
+    return 'container is down - [l] relaunch, or [q] quit and re-run claude-sandbox';
 }
 
 sub _panel_title_line {
@@ -1446,7 +1466,8 @@ sub compose_frame {
 
     my $footer_role = 'footer';
     if (defined $state->{pending}
-        && ($state->{pending} eq 'stop-runs' || $state->{pending} eq 'full-shutdown')) {
+        && ($state->{pending} eq 'stop-runs' || $state->{pending} eq 'full-shutdown'
+            || $state->{pending} eq 'relaunch')) {
         $footer_role = 'footer-alert';
     } elsif (defined $state->{footer_flash} && length $state->{footer_flash}) {
         $footer_role = 'footer-flash';   # transient launch-blocked notice
@@ -1599,17 +1620,23 @@ sub render_frame {
 }
 
 # dispatch_key($key, $pending) -> ($action, $new_pending).
-# Single-letter hotkeys; [s] stop-runs and [x] full-shutdown are each
-# independent two-step confirms (pending 'stop-runs' / 'full-shutdown'; y/Y
-# fires, any other key cancels WITHOUT re-arming the other control -- s11-
-# lifecycle-stop spec 08 S2.1). The legacy 'shutdown' pending token is
-# retired: any $pending value that isn't one of the two pinned tokens is
-# normalized to '' (no confirm armed). Unknown keys are inert.
+# Single-letter hotkeys; [s] stop-runs, [x] full-shutdown and [l] relaunch are
+# each independent two-step confirms (pending 'stop-runs' / 'full-shutdown' /
+# 'relaunch'; y/Y fires, any other key cancels WITHOUT re-arming any other
+# control -- s11-lifecycle-stop spec 08 S2.1, s12 spec 09 S2.1). The legacy
+# 'shutdown' pending token is retired: any $pending value that isn't one of the
+# three pinned tokens is normalized to '' (no confirm armed). Unknown keys are
+# inert.
 sub dispatch_key {
     my ($key, $pending) = @_;
     $key = '' if !defined $key;
     $pending = '' if !defined $pending;
-    $pending = '' unless $pending eq 'stop-runs' || $pending eq 'full-shutdown';
+    # s12-lifecycle-relaunch: 'relaunch' joins the whitelist. A pending token
+    # that is NOT listed here is silently coerced to '' -- so a control whose
+    # token is added to the branch chain below but forgotten HERE arms a
+    # confirm that can never be confirmed (the [l] landmine this comment marks).
+    $pending = '' unless $pending eq 'stop-runs' || $pending eq 'full-shutdown'
+                      || $pending eq 'relaunch';
 
     if ($pending eq 'stop-runs') {
         return ('stop-runs', '')          if $key =~ /^[yY]$/;
@@ -1619,9 +1646,14 @@ sub dispatch_key {
         return ('full-shutdown', '')          if $key =~ /^[yY]$/;
         return ('cancel-full-shutdown', '');  # any other key cancels; never re-arms stop-runs
     }
+    if ($pending eq 'relaunch') {
+        return ('relaunch', '')          if $key =~ /^[yY]$/;
+        return ('cancel-relaunch', '');  # any other key cancels; never re-arms stop-runs/full-shutdown
+    }
     return ('launch', '')             if $key =~ /^[cC]$/ || $key eq "\r" || $key eq "\n";
     return ('confirm-stop-runs',     'stop-runs')     if $key =~ /^[sS]$/;
     return ('confirm-full-shutdown', 'full-shutdown') if $key =~ /^[xX]$/;
+    return ('confirm-relaunch',      'relaunch')      if $key =~ /^[lL]$/;
     return ('refresh', '')            if $key =~ /^[rR]$/;
     return ('quit', '')               if $key =~ /^[qQ]$/;
     # Up/down scroll the Activity panel. The read-key seam assembles the arrow
@@ -2246,7 +2278,11 @@ sub lifecycle_alert_msg {
     my $lc = $state->{lifecycle};
     return undef unless ref($lc) eq 'HASH';
 
-    my %mode_label = ('stop-runs' => 'stop runs', 'full-shutdown' => 'full shutdown');
+    # Registering 'recover' is REQUIRED, not decorative: the fallback below is a
+    # defence against an unknown mode, and an unregistered mode would render the
+    # banner off the raw token rather than a deliberate label.
+    my %mode_label = ('stop-runs' => 'stop runs', 'full-shutdown' => 'full shutdown',
+                      'recover'   => 'recover');
     my $mode  = defined $lc->{mode} ? $lc->{mode} : '';
     my $label = $mode_label{$mode};
     $label = (length($mode) ? $mode : '?') unless defined $label;
@@ -2263,6 +2299,330 @@ sub lifecycle_alert_msg {
 }
 
 # ===========================================================================
+# s12-lifecycle-relaunch-recovery: the [l] relaunch/recover staged driver
+# (spec 09 S2.4-S2.6). Everything below is PURE or seam-driven: NO podman call,
+# no system/exec/qx/backtick, no filesystem, no clock. The impure half lives in
+# launcher.pl's recover_container (the same split s11 uses for run_stages).
+# ===========================================================================
+
+# _recover_stage_catalog() -> @stages (PRIVATE, pure). The single source of the
+# 4 pinned recovery stages (id/label) -- nothing else may hardcode them. Fresh
+# hashrefs every call, so a caller mutating one plan can never poison the next
+# (the _lifecycle_stage_catalog mould).
+sub _recover_stage_catalog {
+    return (
+        { id => 'machine-status',     label => 'check podman machine' },
+        { id => 'machine-start',      label => 'start podman machine' },
+        { id => 'container-start',    label => 'start container' },
+        { id => 'heartbeat-reattach', label => 're-attach heartbeat' },
+    );
+}
+
+# recover_plan(\%state) -> \@stages (PUBLIC, pure; never dies -- undef/non-
+# hashref is treated as {}). All four stages when $state->{machine_capable} is
+# truthy, else stages 3+4 only (docker / Linux-native podman have no machine).
+#
+# The ORDER is load-bearing, not cosmetic. machine-status must precede
+# container-start because an empty container probe is ambiguous (removed vs
+# unreadable) until the machine's liveness is known -- that is exactly what
+# classify_container_state keys off. heartbeat-reattach must follow
+# container-start IMMEDIATELY because the container entrypoint reaps itself ~10s
+# after start unless /tmp/.launcher-alive is touched; a stage inserted between
+# the two would let a recovery start the container and then dawdle into its own
+# reaping.
+sub recover_plan {
+    my ($state) = @_;
+    $state = {} unless ref($state) eq 'HASH';
+    my @all = _recover_stage_catalog();
+    return $state->{machine_capable} ? [ @all ] : [ @all[2, 3] ];
+}
+
+# classify_container_state($raw_status, $machine_state) -> running|stopped|
+# absent|unknown (PUBLIC, pure; never dies).
+#
+# The single normalizer for the TWO "no such container" sentinels the launcher
+# carries for one and the same fact: container_status() returns '' where
+# gather() returns the synthetic 'unknown'. Both -- and undef -- mean "no
+# reading" here, and the machine state is what disambiguates them: with the
+# machine up (or on a platform that has none) an empty probe really does mean
+# the container is gone; with the machine down it means we simply cannot tell,
+# and a recovery must try the start rather than declare a rebuild.
+sub classify_container_state {
+    my ($raw_status, $machine_state) = @_;
+    my $raw = defined $raw_status ? lc $raw_status : '';
+    $raw =~ s/^\s+//;
+    $raw =~ s/\s+$//;
+    my $m = defined $machine_state ? lc $machine_state : '';
+    $m =~ s/^\s+//;
+    $m =~ s/\s+$//;
+    return 'running' if $raw eq 'running';
+    return 'stopped' if length($raw) && $raw ne 'unknown';   # exited/created/paused/dead/...
+    return 'absent'  if $m eq 'running' || $m eq 'n/a';      # probe worked; nothing there
+    return 'unknown';                                        # machine down/absent -> can't tell
+}
+
+# _recover_status_alias($state) -> the ledger's {status} vocabulary (PRIVATE,
+# pure). s11's {state} stays canonical (lifecycle_alert_msg and s11's immutable
+# oracle read it); this alias is what the recovery-seam contract promises s03.
+# 'timeout' has no ledger equivalent and collapses to 'failed'.
+sub _recover_status_alias {
+    my ($st) = @_;
+    $st = '' unless defined $st;
+    return 'ok'      if $st eq 'ok';
+    return 'skipped' if $st eq 'skipped';
+    return 'failed';
+}
+
+# _recover_machine_vocab($s) -> one of running|stopped|absent|unknown|n/a
+# (PRIVATE, pure). Anything a machine_status seam reports outside the vocabulary
+# degrades to 'unknown', which is deliberately NOT fatal -- the machine-start
+# stage then simply attempts the start.
+sub _recover_machine_vocab {
+    my ($s) = @_;
+    $s = '' unless defined $s;
+    $s = lc $s;
+    return $s if $s eq 'running' || $s eq 'stopped' || $s eq 'absent' || $s eq 'n/a';
+    return 'unknown';
+}
+
+# _recover_pre_detail($id) -> the detail carried by a stage's PRE-'running'
+# interface update (PRIVATE, pure). Only machine-start has one, and it is
+# load-bearing rather than decorative: recovery runs synchronously inside the
+# input drain, so on the platform that actually needs a machine start
+# (Windows/WSL2, where _run_timed's SIGALRM bound degrades to a no-op) this
+# frame is the LAST thing painted until podman returns. The freeze is therefore
+# announced by the frame that freezes, instead of looking like a hang.
+sub _recover_pre_detail {
+    my ($id) = @_;
+    $id = '' unless defined $id;
+    return 'this may take a minute; the dashboard is frozen and will not repaint until podman returns'
+        if $id eq 'machine-start';
+    return '';
+}
+
+# run_recover_stages(%opts) -> \%result (PUBLIC; seam-driven, never dies). The
+# recovery engine behind recover_container (spec 09 S2.6). Every side effect
+# goes through an injected seam and every seam/callback call is eval-wrapped, so
+# neither a dying seam nor a dying status_cb/log_cb can abort a run or escape
+# into the TUI's input drain.
+#
+# It STOPS on the first failing stage -- unlike s11's run_stages, which walks
+# the whole plan. A shutdown sequence wants every remaining stage attempted; a
+# recovery is a dependency chain (no machine -> no container -> no heartbeat),
+# so continuing past a failure would only produce a cascade of derived failures
+# that bury the one the user has to act on. Stages that never ran are OMITTED
+# from `stages` (so "did stage N run?" is directly observable); `total` in the
+# emits stays the PLANNED count.
+#
+# %opts: plan, mode ('recover'), reason, state (the gathered dashboard state),
+#        machine_status / machine_start / container_start / container_create /
+#        heartbeat_reattach (seams), status_cb, log_cb.
+sub run_recover_stages {
+    my (%o) = @_;
+    my $plan   = (ref($o{plan}) eq 'ARRAY') ? $o{plan} : [];
+    my $mode   = defined $o{mode}   ? $o{mode}   : 'recover';
+    my $reason = defined $o{reason} ? $o{reason} : '';
+    my $state  = (ref($o{state}) eq 'HASH') ? $o{state} : {};
+    my $status_cb = (ref($o{status_cb}) eq 'CODE') ? $o{status_cb} : sub { };
+    my $log_cb    = (ref($o{log_cb})    eq 'CODE') ? $o{log_cb}    : sub { };
+
+    my $n = scalar @$plan;
+    my @stages;
+    my $mstate = 'n/a';     # machine state observed in THIS run; 'n/a' until probed
+    my $created = 0;        # the container-start stage went through container_create
+    my $failed_stage;
+    my $error;
+
+    eval { $log_cb->('lifecycle_start', { mode => $mode, stages => $n, reason => $reason }); };
+
+    my $idx = 0;
+    for my $stage_in (@$plan) {
+        $idx++;
+        my $stage = (ref($stage_in) eq 'HASH') ? $stage_in : {};
+        my $id    = defined $stage->{id}    ? $stage->{id}    : 'unknown';
+        my $label = defined $stage->{label} ? $stage->{label} : '';
+
+        eval {
+            $status_cb->({ active => 1, mode => $mode, reason => $reason, stage => $id, label => $label,
+                           index => $idx, total => $n, state => 'running',
+                           detail => _recover_pre_detail($id) });
+        };
+
+        my ($st, $detail) = ('skipped', '');
+
+        eval {
+            if ($id eq 'machine-status') {
+                if (ref($o{machine_status}) eq 'CODE') {
+                    my $r = eval { $o{machine_status}->() };
+                    if ($@) { $st = 'fail'; $detail = _chomp_err($@); $mstate = 'unknown'; }
+                    else {
+                        my $rr = (ref($r) eq 'HASH') ? $r : { ok => ($r ? 1 : 0), detail => '' };
+                        $mstate = _recover_machine_vocab($rr->{state});
+                        my $d = (defined $rr->{detail} && length $rr->{detail}) ? $rr->{detail} : '';
+                        # An 'unknown' reading with ok => 1 is NOT fatal: the
+                        # container probe may still resolve on its own.
+                        if ($rr->{ok}) { $st = 'ok';   $detail = "machine $mstate"; }
+                        else           { $st = 'fail'; $detail = length($d) ? $d : 'machine status probe failed'; }
+                    }
+                }
+                else {
+                    $st = 'skipped'; $mstate = 'n/a';
+                    $detail = 'machine_status seam not provided';
+                }
+            }
+            elsif ($id eq 'machine-start') {
+                if    ($mstate eq 'running') { $st = 'skipped'; $detail = 'machine already running'; }
+                elsif ($mstate eq 'n/a')     { $st = 'skipped'; $detail = 'no podman machine on this platform'; }
+                elsif (ref($o{machine_start}) eq 'CODE') {
+                    my $r = eval { $o{machine_start}->() };
+                    if ($@) { $st = 'fail'; $detail = _chomp_err($@); }
+                    else {
+                        my $rr = (ref($r) eq 'HASH') ? $r : { ok => ($r ? 1 : 0), detail => '' };
+                        my $d = (defined $rr->{detail} && length $rr->{detail}) ? $rr->{detail} : '';
+                        if    ($rr->{ok})      { $st = 'ok';      $detail = length($d) ? $d : 'machine started'; }
+                        elsif ($rr->{timeout}) { $st = 'timeout'; $detail = length($d) ? $d : 'podman machine start timed out'; }
+                        else                   { $st = 'fail';    $detail = length($d) ? $d : 'podman machine start failed'; }
+                    }
+                }
+                else { $st = 'fail'; $detail = 'machine_start seam not provided'; }
+            }
+            elsif ($id eq 'container-start') {
+                my $c = classify_container_state($state->{status}, $mstate);
+                if ($c eq 'running') { $st = 'skipped'; $detail = 'container already running'; }
+                elsif ($c eq 'absent') {
+                    # R1: production does NOT wire container_create, so this is
+                    # the branch a genuinely removed container takes in the TUI.
+                    # It is a FAIL, not a skip: the contract only allows ok => 1
+                    # when the container ends up running, and it does not.
+                    if (ref($o{container_create}) eq 'CODE') {
+                        my $r = eval { $o{container_create}->() };
+                        if ($@) { $st = 'fail'; $detail = _chomp_err($@); }
+                        else {
+                            my $rr = (ref($r) eq 'HASH') ? $r : { ok => ($r ? 1 : 0), detail => '' };
+                            my $d = (defined $rr->{detail} && length $rr->{detail}) ? $rr->{detail} : '';
+                            if ($rr->{ok}) { $st = 'ok'; $detail = length($d) ? $d : 'container created'; $created = 1; }
+                            else           { $st = 'fail'; $detail = length($d) ? $d : 'container create failed'; }
+                        }
+                    }
+                    else {
+                        $st = 'fail';
+                        $detail = 'container no longer exists; in-TUI recreate is not available'
+                                . ' - [q] quit, then re-run claude-sandbox to rebuild';
+                    }
+                }
+                elsif (ref($o{container_start}) eq 'CODE') {
+                    my $r = eval { $o{container_start}->() };
+                    if ($@) { $st = 'fail'; $detail = _chomp_err($@); }
+                    else {
+                        my $rr = (ref($r) eq 'HASH') ? $r : { ok => ($r ? 1 : 0), detail => '' };
+                        my $d = (defined $rr->{detail} && length $rr->{detail}) ? $rr->{detail} : '';
+                        if ($rr->{ok}) { $st = 'ok';   $detail = length($d) ? $d : 'container started'; }
+                        else           { $st = 'fail'; $detail = length($d) ? $d : 'container start failed'; }
+                    }
+                }
+                else { $st = 'fail'; $detail = 'container_start seam not provided'; }
+            }
+            elsif ($id eq 'heartbeat-reattach') {
+                if (ref($o{heartbeat_reattach}) eq 'CODE') {
+                    my $r = eval { $o{heartbeat_reattach}->() };
+                    if ($@) { $st = 'fail'; $detail = _chomp_err($@); }
+                    else {
+                        my $rr = (ref($r) eq 'HASH') ? $r : { ok => ($r ? 1 : 0), detail => '' };
+                        my $d = (defined $rr->{detail} && length $rr->{detail}) ? $rr->{detail} : '';
+                        if ($rr->{ok}) { $st = 'ok';   $detail = length($d) ? $d : 'heartbeat ok'; }
+                        else           { $st = 'fail'; $detail = length($d) ? $d : 'heartbeat re-attach failed'; }
+                    }
+                }
+                else { $st = 'fail'; $detail = 'heartbeat_reattach seam not provided'; }
+            }
+            else {
+                $st = 'skipped';
+                $detail = 'unknown stage';
+            }
+        };
+        if ($@) { $st = 'fail'; $detail = _chomp_err($@); }
+
+        # Dual shape (spec 09 E1): s11's {id,label,state,detail} is canonical
+        # (the renderer and s11's oracle read it); {name,status} are aliases on
+        # the SAME hashref, so the ledger's recovery-seam contract is satisfied
+        # without a second structure that could drift.
+        push @stages, { id => $id, label => $label, state => $st, detail => $detail,
+                        name => $id, status => _recover_status_alias($st) };
+
+        eval {
+            $status_cb->({ active => 1, mode => $mode, reason => $reason, stage => $id, label => $label,
+                           index => $idx, total => $n, state => $st, detail => $detail });
+        };
+        eval {
+            $log_cb->('lifecycle_stage', { mode => $mode, stage => $id, index => $idx, total => $n,
+                                            state => $st, detail => $detail });
+        };
+
+        if ($st eq 'fail' || $st eq 'timeout') {
+            $failed_stage = $id;
+            $error        = $detail;
+            last;                      # stop the sequence (the contract's error path)
+        }
+    }
+
+    my $timed_out = (grep { $_->{state} eq 'timeout' } @stages) ? 1 : 0;
+    my $ok        = (grep { $_->{state} eq 'fail' || $_->{state} eq 'timeout' } @stages) ? 0 : 1;
+
+    my $summary;
+    if (defined $failed_stage) {
+        my ($f) = grep { $_->{id} eq $failed_stage } @stages;
+        my $fd  = ($f && defined $f->{detail}) ? $f->{detail} : '';
+        $summary = ($f && $f->{state} eq 'timeout')
+            ? "$failed_stage failed (timed out" . (length($fd) ? ": $fd" : '') . ')'
+            : "$failed_stage failed" . (length($fd) ? " ($fd)" : '');
+    }
+    else {
+        my @clauses;
+        for my $s (@stages) {
+            if ($s->{id} eq 'machine-start') {
+                push @clauses, 'machine started'         if $s->{state} eq 'ok';
+                push @clauses, 'machine already running' if $s->{state} eq 'skipped' && $mstate eq 'running';
+            }
+            elsif ($s->{id} eq 'container-start') {
+                push @clauses, ($created ? 'container created' : 'container started')
+                    if $s->{state} eq 'ok';
+                push @clauses, 'container already running' if $s->{state} eq 'skipped';
+            }
+            elsif ($s->{id} eq 'heartbeat-reattach') {
+                push @clauses, 're-attached' if $s->{state} eq 'ok';
+            }
+        }
+        $summary = join('; ', @clauses);
+        $summary = 'recovery sequence completed' unless length $summary;
+    }
+
+    my $k = scalar @stages;
+    eval {
+        $status_cb->({ active => 0, mode => $mode, reason => $reason, stage => undef, label => undef,
+                       index => $k, total => $n, state => 'done', detail => '', summary => $summary });
+    };
+    # Every payload value is a plain scalar (log_ev's contract): failed_stage
+    # and error become '' rather than undef so the log line never carries a hole.
+    eval {
+        $log_cb->('lifecycle_done', { mode => $mode, ok => $ok, timed_out => $timed_out,
+                                       summary => $summary, reason => $reason,
+                                       failed_stage => (defined $failed_stage ? $failed_stage : ''),
+                                       error        => (defined $error        ? $error        : '') });
+    };
+
+    return {
+        ok           => $ok,
+        stages       => \@stages,
+        failed_stage => $failed_stage,
+        error        => $error,
+        mode         => $mode,
+        reason       => $reason,
+        timed_out    => $timed_out,
+        summary      => $summary,
+    };
+}
+
+# ===========================================================================
 # THE LOOP (seam-injected; every side effect is a coderef)
 # ===========================================================================
 #
@@ -2271,7 +2631,8 @@ sub lifecycle_alert_msg {
 # enter_raw, leave_raw, out. Optional: color, beat_interval, state_interval,
 # tick_interval, max_ticks (bounded run for tests), stop_runs/full_shutdown
 # (s11-lifecycle-stop spec 08 S2.7 -- sub($state,$progress) -> \%result|undef;
-# neither exits the loop, only [q] does), and keepawake->(\%state) — B5's
+# neither exits the loop, only [q] does), recover (s12 spec 09 S2.7 -- same
+# shape, driving the [l] relaunch/recover sequence), and keepawake->(\%state) — B5's
 # hook, called once per state refresh with the freshly gathered state so the
 # launcher can drive the wake-lock off busy_age (the loop itself stays
 # ignorant of the keep-awake decision; that lives in KeepAwake.pm).
@@ -2280,7 +2641,10 @@ sub lifecycle_alert_msg {
 #
 # gather->() returns the base state hashref (project_name, container, status,
 # events); the loop augments it with beat_age, uptime and pending. heartbeat->()
-# returns 'ok' | 'fail' | 'gone' ('gone' ends the loop). spawn->() may return
+# returns 'ok' | 'fail' | 'gone' — 'gone' does NOT end the loop (see (E) in the
+# body: the dashboard stays open on a dead container so [l] can recover it; the
+# old "'gone' ends the loop" wording here described behaviour that no longer
+# exists and that t/25 pins the opposite of). spawn->() may return
 # 'redraw' to force a full repaint (the inline fallback suspends/repaints).
 sub run {
     my (%o) = @_;
