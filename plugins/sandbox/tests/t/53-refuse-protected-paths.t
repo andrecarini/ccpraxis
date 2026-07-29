@@ -926,4 +926,316 @@ unlike($scan_code, qr/\bglob\s*\(\s*['"]~/, 'AC-50: t/53 never globs the real ho
 like($scan_code, qr/exists\s*=>/, 'AC-50: t/53 always supplies an injected exists seam (never the module default)');
 like($scan_code, qr/read_file\s*=>/, 'AC-50: t/53 always supplies an injected read_file seam (never the module default)');
 
+# =====================================================================
+# Group K -- security fix-batch (AC-51..67)
+#
+# Extends the q03 oracle for eight fixes on top of the already-implemented
+# base package (AC-1..50, 267 ok / 0 not ok at authoring time):
+#   CRITICAL-1(a) -- an env-independent 'ccpraxis-install' root, threaded
+#                    into protected_path_outcome via a new live_install_hint
+#                    option (AC-51..53).
+#   CRITICAL-1(b) -- the authoritative-home env seam that closes the
+#                    CLAUDE_CONFIG_DIR/HOME decoy bypass (AC-54..56).
+#   MAJOR-3       -- pin extra_list_path alongside registry_path so
+#                    CLAUDE_CONFIG_DIR cannot silently void the Decision #5
+#                    user list (AC-57..58).
+#   MINOR-5       -- warning-line sanitisation against a hostile registry
+#                    key forging a second claude-sandbox: line or injecting
+#                    ANSI/control bytes (AC-59..61).
+#   MINOR-7       -- _pp_explanation fallback for an unmapped reason code
+#                    (AC-62).
+#   reviewer MINOR -- the "still enforcing" trailer must always be LAST in
+#                    warnings, even when it collides with the
+#                    unnormalizable-target warning (AC-63).
+#   R4 (already ruled) -- marketplace-install/marketplace-source advice:
+#                    at most one 'git clone' occurrence (AC-64, expected to
+#                    already pass -- confirms the earlier ruling landed)
+#                    and no message line over 80 columns (AC-65, new).
+#   reviewer MAJOR -- docs/protected-paths.md's false claim that the
+#                    ccpraxis-install root is derived only from the
+#                    launcher's own path (AC-66..67).
+#
+# As in Group B, a not-yet-existing capability is asserted via an explicit
+# ok(0, ...) fallback, never a SKIP: block -- Test::More's skip() reports as
+# "ok # skip" in TAP, which would NOT show up as red and would defeat the
+# whole point of an oracle written before the implementation.
+# =====================================================================
+
+# Isolate the protected_path_outcome( call block's own source text (from its
+# call site to the retained workcopy_route( call site that follows it, per
+# R1/R2 ordering already pinned by AC-3/AC-6) -- reused by several
+# structural ACs below so each of them inspects exactly the right call site
+# and never accidentally matches the *other* call block (workcopy_route(
+# already legitimately carries live_install_hint => $LIVE_CCPRAXIS_ROOT,
+# and a whole-file grep would false-positive against it).
+my $PP_CALL_BLOCK_TEXT = '';
+if (@pp_call_idxs_outside == 1 && $workcopy_route_call_idx >= 0
+    && $workcopy_route_call_idx > $pp_call_idxs_outside[0]) {
+    $PP_CALL_BLOCK_TEXT = substr($src, $pp_call_idxs_outside[0],
+                                  $workcopy_route_call_idx - $pp_call_idxs_outside[0]);
+}
+
+# ---- AC-51 / AC-52 / AC-53 -- CRITICAL-1(a): live_install_hint ----
+my %O_HINT = (
+    registry          => {},              # resolves NOTHING on its own
+    extra_list        => [],
+    env               => sub { return undef },   # no CLAUDE_CONFIG_DIR/HOME/USERPROFILE
+    exists            => $tripwire,
+    read_file         => $tripwire,
+    fold_case         => 0,
+    windows           => 0,
+    live_install_hint => '/tmp/anchor/ccpraxis',
+);
+{
+    my ($ok, $got, $err) = _try_decide('/tmp/anchor/ccpraxis', \%O_HINT);
+    if (!$ok) {
+        ok(0, "AC-51: protected_path_outcome('/tmp/anchor/ccpraxis') refuses via live_install_hint even though registry => {} resolves nothing");
+        ok(0, "AC-51: reason eq 'ccpraxis-install'");
+        ok(0, "AC-51: root eq the live_install_hint path");
+        ok(0, "AC-51: relation eq 'exact'");
+        diag("decision call failed: $err") if $err;
+    } else {
+        is($got->{refuse}, 1, "AC-51: protected_path_outcome('/tmp/anchor/ccpraxis') refuses via live_install_hint even though registry => {} resolves nothing");
+        is($got->{reason}, 'ccpraxis-install', "AC-51: reason eq 'ccpraxis-install'");
+        is($got->{root}, '/tmp/anchor/ccpraxis', "AC-51: root eq the live_install_hint path");
+        is($got->{relation}, 'exact', "AC-51: relation eq 'exact' for the hint path itself");
+    }
+}
+{
+    my ($ok, $got, $err) = _try_decide('/tmp/anchor/ccpraxis/plugins/sandbox', \%O_HINT);
+    if (!$ok) {
+        ok(0, "AC-52: protected_path_outcome('/tmp/anchor/ccpraxis/plugins/sandbox') refuses via live_install_hint even though registry => {} resolves nothing");
+        ok(0, "AC-52: reason eq 'ccpraxis-install'");
+        ok(0, "AC-52: root eq the live_install_hint path (the reported root is the hint path)");
+        ok(0, "AC-52: relation eq 'descendant'");
+        diag("decision call failed: $err") if $err;
+    } else {
+        is($got->{refuse}, 1, "AC-52: protected_path_outcome('/tmp/anchor/ccpraxis/plugins/sandbox') refuses via live_install_hint even though registry => {} resolves nothing");
+        is($got->{reason}, 'ccpraxis-install', "AC-52: reason eq 'ccpraxis-install'");
+        is($got->{root}, '/tmp/anchor/ccpraxis', "AC-52: root eq the live_install_hint path (the reported root is the hint path)");
+        is($got->{relation}, 'descendant', "AC-52: relation eq 'descendant'");
+    }
+}
+like($PP_CALL_BLOCK_TEXT, qr/live_install_hint\s*=>\s*\$LIVE_CCPRAXIS_ROOT/,
+     "AC-53: the protected_path_outcome( call block in launcher.pl passes live_install_hint => \$LIVE_CCPRAXIS_ROOT");
+
+# ---- AC-54 / AC-55 / AC-56 -- CRITICAL-1(b): the authoritative-home env seam ----
+my $ENV_SEAM_MAKER = eval { Q03Decision->can('_pp_env_seam') };
+if ($ENV_SEAM_MAKER) {
+    my $seam_a = eval { $ENV_SEAM_MAKER->({ HOME => '/tmp/decoy' }, '/tmp/real') };
+    is((ref $seam_a eq 'CODE' ? eval { $seam_a->('HOME') } : undef), '/tmp/real',
+       "AC-54: _pp_env_seam({HOME=>'/tmp/decoy'}, '/tmp/real')->('HOME') eq '/tmp/real' -- the authoritative home wins");
+    my $seam_b = eval { $ENV_SEAM_MAKER->({ HOME => '/tmp/decoy' }, undef) };
+    is((ref $seam_b eq 'CODE' ? eval { $seam_b->('HOME') } : undef), '/tmp/decoy',
+       "AC-54: with the authoritative arg undef, _pp_env_seam falls back to the env hashref's HOME");
+    my $seam_c = eval { $ENV_SEAM_MAKER->({ HOME => '/tmp/decoy' }, '') };
+    is((ref $seam_c eq 'CODE' ? eval { $seam_c->('HOME') } : undef), '/tmp/decoy',
+       "AC-54: with the authoritative arg '' (empty string), _pp_env_seam falls back to the env hashref's HOME");
+    my $seam_d = eval { $ENV_SEAM_MAKER->({ HOME => '/tmp/decoy', USERPROFILE => '/tmp/up' }, '/tmp/real') };
+    is((ref $seam_d eq 'CODE' ? eval { $seam_d->('USERPROFILE') } : undef), '/tmp/up',
+       "AC-54: another key (USERPROFILE) passes through from the env hashref unchanged, not overridden by the authoritative-home arg");
+
+    my $bypass_seam = eval { $ENV_SEAM_MAKER->({ HOME => '/tmp/decoy' }, '/tmp/real') };
+    my %O55 = (
+        registry   => {},
+        extra_list => [],
+        env        => (ref $bypass_seam eq 'CODE' ? $bypass_seam : sub { return undef }),
+        exists     => $tripwire,
+        read_file  => $tripwire,
+        fold_case  => 0,
+        windows    => 0,
+    );
+    my ($ok, $got, $err) = _try_decide('/tmp/real/.claude', \%O55);
+    if (!$ok) {
+        ok(0, "AC-55: refuse == 1 for /tmp/real/.claude when env => _pp_env_seam({HOME=>'/tmp/decoy'}, '/tmp/real') -- the bypass is closed");
+        ok(0, "AC-55: reason eq 'claude-home' -- driven by the authoritative /tmp/real, not the raw hashref's /tmp/decoy");
+        diag("decision call failed: $err") if $err;
+    } else {
+        is($got->{refuse}, 1, "AC-55: refuse == 1 for /tmp/real/.claude even though the raw env hashref says HOME=/tmp/decoy -- driven via the _pp_env_seam coderef (the exact bypass: without the fix this is refuse=0)");
+        is($got->{reason}, 'claude-home', "AC-55: reason eq 'claude-home' -- HOME resolves to /tmp/real per the authoritative seam, not /tmp/decoy");
+    }
+} else {
+    ok(0, "AC-54: _pp_env_seam(\$env_hashref, \$authoritative_home)->('HOME') prefers the authoritative home when defined and non-empty (sub not found in extracted region)");
+    ok(0, "AC-54: _pp_env_seam falls back to the env hashref's HOME when the authoritative arg is undef (sub not found)");
+    ok(0, "AC-54: _pp_env_seam falls back to the env hashref's HOME when the authoritative arg is '' (sub not found)");
+    ok(0, "AC-54: _pp_env_seam passes through a non-HOME key (USERPROFILE) unchanged (sub not found)");
+    ok(0, "AC-55: refuse == 1 for /tmp/real/.claude when driven via _pp_env_seam -- the bypass is closed (sub not found)");
+    ok(0, "AC-55: reason eq 'claude-home' (sub not found)");
+}
+like($PP_CALL_BLOCK_TEXT, qr/\benv\s*=>/,
+     "AC-56: the protected_path_outcome( call block in launcher.pl passes an env => key (the authoritative-home seam)");
+
+# ---- AC-57 / AC-58 -- MAJOR-3: pin extra_list_path ----
+like($PP_CALL_BLOCK_TEXT, qr/extra_list_path\s*=>\s*"[^"]+"/,
+     "AC-57: the protected_path_outcome( call block passes an explicit extra_list_path key (Decision #5 pin, so CLAUDE_CONFIG_DIR cannot silently void the user list)");
+{
+    my ($reg_prefix)   = $PP_CALL_BLOCK_TEXT =~ /registry_path\s*=>\s*"\$\{?(\w+)\}?/;
+    my ($extra_prefix) = $PP_CALL_BLOCK_TEXT =~ /extra_list_path\s*=>\s*"\$\{?(\w+)\}?/;
+    ok((defined $reg_prefix && defined $extra_prefix && $reg_prefix eq $extra_prefix),
+       "AC-58: registry_path and extra_list_path are built from the same authoritative-home prefix variable (not \$HOST_PLUGINS_DIR for one and a module default for the other)")
+        or diag('registry_path prefix: ' . (defined $reg_prefix ? $reg_prefix : '<none>')
+              . ', extra_list_path prefix: ' . (defined $extra_prefix ? $extra_prefix : '<none>'));
+}
+
+# ---- AC-59 / AC-60 / AC-61 -- MINOR-5: warning-line sanitisation ----
+{
+    # A hostile marketplace registry key: embedded LF, CR, an ANSI escape and
+    # a bell byte, plus an attempted forged second "claude-sandbox:" line --
+    # the exact attack class the fix must neutralise.
+    my $HOSTILE_KEY = "evil\nclaude-sandbox: FORGED-LINE-INJECTED\r\x1b[31mFAKE\x07bell";
+    my %O59 = (
+        registry   => { $HOSTILE_KEY => 'not-a-hash' },   # -> one registry-entry error
+        extra_list => [],
+        env        => sub { my %e = (HOME => '/home/u'); return $e{ $_[0] } },
+        exists     => $tripwire,
+        read_file  => $tripwire,
+        fold_case  => 0,
+        windows    => 0,
+    );
+    my ($ok, $got, $err) = _try_decide('/home/u/work/myproject', \%O59);
+    if (!$ok) {
+        ok(0, "AC-59: no warning element contains an embedded newline, carriage return or ESC byte");
+        ok(0, "AC-60: no warning element contains any other control byte in [\\x00-\\x08\\x0b-\\x1f\\x7f]");
+        ok(0, "AC-61: the count of claude-sandbox:-prefixed physical lines equals the number of warning array elements");
+        diag("decision call failed: $err") if $err;
+    } else {
+        my @w = @{ $got->{warnings} // [] };
+        my $has_nl_cr_esc = grep { /\n|\r|\x1b/ } @w;
+        is($has_nl_cr_esc, 0,
+           "AC-59: no warning element contains an embedded newline, carriage return, or ESC byte (hostile registry key: LF/CR/ESC/forged-prefix attempt)")
+            or diag('offending warnings: ' . join(' | ', map { my $x = $_; $x =~ s/[\x00-\x1f\x7f]/./g; $x } @w));
+
+        my $has_ctrl = grep { /[\x00-\x08\x0b-\x1f\x7f]/ } @w;
+        is($has_ctrl, 0,
+           "AC-60: no warning element contains any other control byte in [\\x00-\\x08\\x0b-\\x1f\\x7f] (e.g. the injected bell byte)")
+            or diag('offending warnings: ' . join(' | ', map { my $x = $_; $x =~ s/[\x00-\x1f\x7f]/./g; $x } @w));
+
+        # Simulate what actually lands on STDERR (print STDERR $_, "\n" for
+        # @warnings, per S2.7): join with "\n" and split back into physical
+        # lines. If sanitisation strips embedded newlines, this count equals
+        # scalar(@w); if it does not, the hostile key's embedded
+        # "\nclaude-sandbox: FORGED-LINE-INJECTED" forges an extra line that
+        # also matches the claude-sandbox: prefix, inflating the count.
+        my @printed_lines = split /\n/, join("\n", @w);
+        my $prefixed_count = grep { /^claude-sandbox: / } @printed_lines;
+        is($prefixed_count, scalar(@w),
+           "AC-61: the count of claude-sandbox:-prefixed physical lines equals the number of warning array elements (no forged extra prefix line smuggled inside one element)");
+    }
+}
+
+# ---- AC-62 -- MINOR-7: _pp_explanation fallback ----
+{
+    my $EXPL_FN = eval { Q03Decision->can('_pp_explanation') };
+    if ($EXPL_FN) {
+        my $result = eval { $EXPL_FN->('future-reason') };
+        my $err = $@;
+        ok((defined $result && length $result),
+           "AC-62: _pp_explanation('future-reason') returns a non-empty string for an unknown/unmapped reason code (no undef, no unsubstituted {explanation} placeholder)")
+            or diag('got: ' . (defined $result ? "'$result'" : 'undef') . ($err ? " (eval error: $err)" : ''));
+    } else {
+        ok(0, "AC-62: _pp_explanation('future-reason') returns a non-empty string for an unknown reason code (sub not found)");
+    }
+}
+
+# ---- AC-63 -- reviewer MINOR: the "still enforcing" trailer is always LAST ----
+{
+    my %O63 = (
+        registry   => undef,      # supplied-but-broken -> registry-shape error
+        extra_list => [],
+        env        => sub { my %e = (HOME => '/home/u'); return $e{ $_[0] } },
+        exists     => $tripwire,
+        read_file  => $tripwire,
+        fold_case  => 0,
+        windows    => 0,
+    );
+    # A whitespace-only target: normalize_path returns undef for it (S2.4's
+    # guard), so this ALSO trips the unnormalizable-target warning -- forcing
+    # the registry error and that warning to co-occur, unlike existing AC-36
+    # which only covers the registry-error-alone case.
+    my ($ok, $got, $err) = _try_decide('   ', \%O63);
+    if (!$ok) {
+        ok(0, "AC-63: the final warnings element is the 'still enforcing' line even when a registry error and the unnormalizable-target warning co-occur");
+        diag("decision call failed: $err") if $err;
+    } else {
+        my @w = @{ $got->{warnings} // [] };
+        ok(scalar(@w) >= 2,
+           "AC-63: warnings has multiple elements when a registry error and the unnormalizable-target warning co-occur")
+            or diag('warnings: ' . join(' | ', @w));
+        my $last = $w[-1] // '';
+        like($last, qr/^claude-sandbox: the protected-path guard is still enforcing the \d+ protected root\(s\) it did resolve; a failed source never relaxes it\.?\z/,
+             "AC-63: the final warnings element is the 'still enforcing' line even when a registry error and the unnormalizable-target warning co-occur (existing AC-36 only covers the registry-error-alone case)")
+            or diag('last warning was: ' . $last);
+    }
+}
+
+# ---- AC-64 / AC-65 -- R4 advice prose ----
+{
+    # A moderate (27-char) root: long enough that the CURRENT single-line
+    # advice template (S4.6's marketplace-install/-source branch, which
+    # interpolates {root} mid-sentence with no wrapping) blows past 80
+    # columns, short enough that any reasonably line-wrapped fix (e.g. the
+    # root on its own indented line) would comfortably fit under 80.
+    my $AC64_INSTALL_ROOT = '/home/user/repo/plugin-dir';
+    my $AC64_SOURCE_ROOT  = '/home/user/repo/source-dir';
+    my $REG64 = {
+        'mkt' => { source          => { source => 'directory', path => $AC64_SOURCE_ROOT },
+                   installLocation => $AC64_INSTALL_ROOT },
+    };
+    my %O64 = (
+        registry   => $REG64,
+        extra_list => [],
+        env        => sub { my %e = (HOME => '/h64'); return $e{ $_[0] } },
+        exists     => $tripwire,
+        read_file  => $tripwire,
+        fold_case  => 0,
+        windows    => 0,
+    );
+    for my $case (
+        [ $AC64_INSTALL_ROOT, 'marketplace-install' ],
+        [ $AC64_SOURCE_ROOT,  'marketplace-source'  ],
+    ) {
+        my ($target, $want_reason) = @$case;
+        my ($ok, $got, $err) = _try_decide($target, \%O64);
+        if (!$ok || !defined $got->{message} || ($got->{reason} // '') ne $want_reason) {
+            ok(0, "AC-64: $want_reason advice section contains at most one occurrence of 'git clone'");
+            ok(0, "AC-65: $want_reason message contains no line exceeding 80 characters");
+            diag("decision call failed or reason mismatch for '$target': " . ($err || ($got->{reason} // 'undef')));
+            next;
+        }
+        my $msg = $got->{message};
+        my $gc_count = () = ($msg =~ /git clone/g);
+        ok($gc_count <= 1,
+           "AC-64: $want_reason advice section contains at most one occurrence of 'git clone' (no repeated instruction)");
+
+        my @long_lines = grep { length($_) > 80 } split /\n/, $msg;
+        is(scalar(@long_lines), 0,
+           "AC-65: $want_reason message contains no line exceeding 80 characters (root='$target', " . length($target) . ' chars)')
+            or diag('long lines: ' . join(' | ', map { length($_) . ':' . $_ } @long_lines));
+    }
+}
+
+# ---- AC-66 / AC-67 -- reviewer MAJOR: docs/protected-paths.md is factually wrong ----
+{
+    if (defined $doc_text) {
+        # Scope to source (d)'s own table row (bounded by the next row's "| e
+        # |" marker) so this cannot false-positive against the unrelated
+        # "registry entry" (Decision #6 error code) or "the registry file...
+        # is pinned to" (registry_path-pinning paragraph) text living
+        # elsewhere in the doc -- both measured to sit within a naive
+        # proximity window of this row.
+        my ($row_d) = $doc_text =~ /\|\s*d\s*\|(.*?)\|\s*e\s*\|/s;
+        $row_d //= '';
+        like($row_d, qr/registry entry|registry-derived|from the registry/i,
+             "AC-66: docs/protected-paths.md's source (d) row states the ccpraxis-install root comes from the registry entry");
+        like($row_d, qr/abs_path\(__FILE__\)|__FILE__/,
+             "AC-66: docs/protected-paths.md's source (d) row additionally names the launcher's own abs_path(__FILE__)-derived anchor (so the root survives an unreadable registry)");
+        unlike($doc_text, qr/ccpraxis live install anchor,\s*derived from the running launcher's own path/i,
+               "AC-67: docs/protected-paths.md no longer contains the old single-source claim ('...derived from the running launcher's own path') with no registry mention");
+    } else {
+        ok(0, "AC-66: docs/protected-paths.md's source (d) row states the ccpraxis-install root comes from the registry entry (doc file does not exist yet)");
+        ok(0, "AC-66: docs/protected-paths.md's source (d) row additionally names the launcher's own abs_path(__FILE__)-derived anchor (doc file does not exist yet)");
+        ok(0, "AC-67: docs/protected-paths.md no longer contains the old single-source claim (doc file does not exist yet)");
+    }
+}
+
 done_testing();
