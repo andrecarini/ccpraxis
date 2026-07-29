@@ -174,18 +174,44 @@ my %LOCKFILE_TABLE = (
     pip => 'requirements.txt',  cargo => 'Cargo.lock',    pub => 'pubspec.lock', go => 'go.sum',
 );
 
-# join valid, deduped, non-empty/non-whitespace/non-'/' segments with ':'.
-# Returns undef when nothing survives — NEVER an empty or whitespace string
-# (D2 / landmine 1: an empty write_set matches every running package's write
-# set at _ws_prefixes('') and deadlocks the run).
+# F1 (red-team): a write_set segment licenses ANOTHER agent's write scope —
+# unlike this file's OWN output paths (author_ledger/rotate_verdict), a
+# segment here is taken verbatim from evidence.files[]/remedy.file, which can
+# be influenced by a conformance verdict a coordinator produced after reading
+# repo content. Reject anything that could escape the repo or smuggle extra
+# scope past a later per-element review:
+#   - absolute paths ("/etc/...")            -> starts with '/'
+#   - home expansion ("~/.claude/...")        -> starts with '~'
+#   - traversal ("../../deploy_key")          -> a '..' path component
+#   - colon smuggling ("a:b" -> two segments) -> contains ':'
+#   - '.' / empty after normalization
+# A segment that survives must be repo-relative and have at least one
+# non-'.' path component.
+sub _ws_segment_ok {
+    my ($s) = @_;
+    return 0 unless defined $s && !ref $s;
+    return 0 unless length $s;
+    return 0 if $s =~ /^\s*$/;
+    return 0 if $s eq '/';
+    return 0 if $s =~ m{^/};
+    return 0 if $s =~ m{^~};
+    return 0 if index($s, ':') >= 0;
+    return 0 if $s eq '.';
+    my @parts = split m{/}, $s;
+    for my $p (@parts) { return 0 if $p eq '..'; }
+    return 0 unless grep { length($_) && $_ ne '.' } @parts;
+    return 1;
+}
+
+# join valid, deduped, contained segments with ':'. Returns undef when nothing
+# survives — NEVER an empty or whitespace string (D2 / landmine 1: an empty
+# write_set matches every running package's write set at _ws_prefixes('') and
+# deadlocks the run).
 sub _join_ws {
     my (@segs) = @_;
     my (@out, %seen);
     for my $s (@segs) {
-        next unless defined $s && !ref $s;
-        next unless length $s;
-        next if $s =~ /^\s*$/;
-        next if $s eq '/';
+        next unless _ws_segment_ok($s);
         next if $seen{$s}++;
         push @out, $s;
     }
@@ -412,6 +438,20 @@ sub queue_ok {
         for my $k (@ENTRY_MANDATORY_KEYS) {
             return 0 unless exists $e->{$k};
         }
+        # F2/F5: presence alone is not enough. An empty/whitespace/ref-valued
+        # write_set survives an exists-only check and then merge_queue skips
+        # the entry FOREVER (silent, permanent verify_ready=0/outstanding=1
+        # deadlock — bp-orchestrator.pl:2085/:2096 discards @skipped). A
+        # non-ARRAY history is worse: push @{ $e->{history} }, {...} inside
+        # plan() dies under strict refs, which propagates out of the
+        # un-eval'd remediation_step and kills the whole orchestrator tick.
+        # Type-check every load-bearing key so either class routes into the
+        # existing §3.8 fail-closed branch instead.
+        return 0 unless defined $e->{write_set} && !ref($e->{write_set}) && $e->{write_set} =~ /\S/;
+        for my $k (qw(id state round signature)) {
+            return 0 if ref $e->{$k};
+        }
+        return 0 unless ref $e->{history} eq 'ARRAY';
     }
     return 1;
 }
