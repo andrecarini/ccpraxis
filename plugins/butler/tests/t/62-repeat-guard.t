@@ -22,6 +22,8 @@ use FindBin qw($Bin);
 use Test::More;
 use File::Temp qw(tempdir);
 use JSON::PP;
+use Time::HiRes qw(gettimeofday tv_interval);
+use POSIX qw(mkfifo);
 
 (my $HOOKS = "$Bin/../../hooks") =~ s{\\}{/}g;
 my $LIB       = "$HOOKS/lib.sh";
@@ -30,9 +32,10 @@ my $HOOKSJSON = "$HOOKS/hooks.json";
 
 my $have_jq = do { my $o = `bash -c 'command -v jq' 2>/dev/null`; $o =~ /\S/ ? 1 : 0 };
 
-# 197 total: 83 unconditional (AC-1,2,3,18,19-pure,21,20) + 114 inside the jq-gated SKIP block
-# (AC-4,5,6..17,19-hook,22). Both halves are fixed-length (no randomness), so this count is stable.
-plan tests => 197;
+# 240 total: 83 unconditional (AC-1,2,3,18,19-pure,21,20) + 157 inside the jq-gated SKIP block
+# (AC-4,5,6..17,19-hook,22, plus F1-F6 red-team-fix assertions from step6/step7). Both halves are
+# fixed-length (no randomness), so this count is stable.
+plan tests => 240;
 
 my $J    = JSON::PP->new->canonical;
 my $ROOT = tempdir(CLEANUP => 1);
@@ -162,6 +165,42 @@ sub hash_call {
     local %ENV = %e;
     open(my $f, '-|', 'bash', '-c', 'source "$LIBSH"; bp_repeat_hash < "$SFILE"') or die "bash: $!";
     my $o = do { local $/; <$f> }; close $f; $o =~ s/\s+\z//; return $o;
+}
+
+# hash caller with a wall-clock measurement and a hard `timeout` safety bound (F1: HIGH-1
+# super-linear scrub regression). Returns (hash, elapsed_seconds). The `timeout` wrapper is a
+# safety net only -- it must not be what makes the timing assertion fail; the assertion is on
+# $elapsed, measured from this side.
+sub hash_call_bounded {
+    my ($payload, $timeout_secs) = @_;
+    my $pf = "$ROOT/hashpayload." . (++$pn) . ".json";
+    open my $w, '>', $pf or die "write $pf: $!";
+    print $w $payload;
+    close $w;
+    local %ENV = (%CLEAN_ENV, LIBSH => $LIB, SFILE => fwd($pf));
+    my $t0 = [gettimeofday()];
+    open(my $f, '-|', 'bash', '-c',
+         qq{timeout $timeout_secs bash -c 'source "\$LIBSH"; bp_repeat_hash < "\$SFILE"'})
+        or die "bash: $!";
+    my $o = do { local $/; <$f> }; close $f;
+    my $elapsed = tv_interval($t0);
+    $o =~ s/\s+\z//;
+    return ($o, $elapsed);
+}
+
+# hook runner with a hard `timeout` bound (F4: MEDIUM-3/LOW-4 read-before-typecheck hang). Exit
+# code 124 means the bound was hit (the hook hung); this must never be able to hang the suite.
+sub run_hook_bounded {
+    my ($payload, $timeout_secs, %env) = @_;
+    my $pf = "$ROOT/hookpayload." . (++$pn) . ".json";
+    open my $w, '>', $pf or die "write $pf: $!";
+    print $w $payload;
+    close $w;
+    local %ENV = (%CLEAN_ENV, %env, HOOKPATH => fwd($HOOK), PFILE => fwd($pf));
+    open(my $f, '-|', 'bash', '-c', qq{timeout $timeout_secs "\$HOOKPATH" < "\$PFILE" 2>&1})
+        or die "bash: $!";
+    my $o = do { local $/; <$f> }; close $f;
+    return ($? >> 8, $o);
 }
 
 # =====================================================================================
@@ -346,7 +385,7 @@ is(gate_verdict_call('Edit', 'worksite', 1),  'deny',  'AC-21: regression - bp_g
 # criterion (AC-6..AC-17, AC-19 hook part, AC-22). Mirrors t/09-gate.t:22,223-224.
 # =====================================================================================
 SKIP: {
-    skip "jq not available on this host (repeat-guard is fail-open without it; these tests need jq present to build fixtures/assert the primary behaviour)", 114
+    skip "jq not available on this host (repeat-guard is fail-open without it; these tests need jq present to build fixtures/assert the primary behaviour)", 157
         unless $have_jq;
 
     # ---- PATH with no jq reachable, everything else intact (for AC-13) ----------------
@@ -763,5 +802,230 @@ SKIP: {
         ok(scalar(@lines) > 0, 'AC-22: the state file exists and has at least one entry after the concurrent writes');
         my @bad = grep { !valid_line($_) } @lines;
         is(scalar(@bad), 0, 'AC-22: state file after concurrent writes contains only valid lines (a lost update is fine, corruption is not)');
+    }
+
+    # =================================================================================
+    # F1 [pure] bp_repeat_hash must not be super-linear on large payloads (HIGH-1).
+    # Ref: redteam-step6.md HIGH-1. Fixed version measures ~0.03s on 256KB; current ~59s.
+    # =================================================================================
+    {
+        my $bigcontent = 'word ' x 51200; # ~256KB, exact redteam repro shape
+        my $pbig = mkpayload(tool_name => 'Write', tool_input => { file_path => '/a', content => $bigcontent });
+        my ($hbig, $elapsed) = hash_call_bounded($pbig, 90);
+        ok($elapsed < 2.0,
+           sprintf('F1a: bp_repeat_hash on a ~256KB Write payload completes in under 2s (got %.2fs) [HIGH-1]', $elapsed));
+    }
+    {
+        my $prefix = 'a' x 2048;
+        my $pshort = mkpayload(tool_name => 'Write', tool_input => { file_path => '/a', content => $prefix . ('b' x 10) });
+        my $plong  = mkpayload(tool_name => 'Write', tool_input => { file_path => '/a', content => $prefix . ('b' x 500) });
+        my ($hs) = hash_call_bounded($pshort, 15);
+        my ($hl) = hash_call_bounded($plong, 15);
+        ok(length($hs) && length($hl) && $hs ne $hl,
+           'F1b: two payloads sharing a 2048-char content prefix but differing in total length hash differently [HIGH-1]');
+    }
+    {
+        my $content = 'z' x 65536;
+        my $p = mkpayload(tool_name => 'Write', tool_input => { file_path => '/a', content => $content });
+        my ($h1) = hash_call_bounded($p, 30);
+        my ($h2) = hash_call_bounded($p, 30);
+        ok(length($h1) && length($h2) && $h1 eq $h2,
+           'F1c: two identical large (64KB) payloads still produce the same hash [HIGH-1]');
+    }
+
+    # =================================================================================
+    # F2 [hook] wait/poll tools must be exempt from the guard (HIGH-2).
+    # Ref: redteam-step6.md HIGH-2.
+    # =================================================================================
+    {
+        my $dir = mk_bp(); my %env = default_env($dir);
+        my $payload = mkpayload(tool_name => 'BashOutput', tool_input => { bash_id => 'bash_1' });
+        my @outs;
+        for my $i (1 .. 10) {
+            my ($rc, $out) = run_hook($payload, %env);
+            is($rc, 0, "F2a: BashOutput identical poll $i of 10 -> exit 0 (exempt) [HIGH-2]");
+            push @outs, $out;
+        }
+        unlike(join("\n", @outs), qr/REPEAT-GUARD/, 'F2a: BashOutput polling never emits a REPEAT-GUARD advisory [HIGH-2]');
+    }
+    {
+        my %fixtures = (
+            KillShell  => { shell_id => 'bash_1' },
+            TaskOutput => { task_id  => 'task_1' },
+            TaskGet    => { task_id  => 'task_1' },
+            TaskList   => {},
+            Monitor    => {},
+        );
+        for my $tool (sort keys %fixtures) {
+            my $dir = mk_bp(); my %env = default_env($dir);
+            my $payload = mkpayload(tool_name => $tool, tool_input => $fixtures{$tool});
+            my $any_bad = 0;
+            my @outs;
+            for (1 .. 6) {
+                my ($rc, $out) = run_hook($payload, %env);
+                $any_bad = 1 if $rc != 0;
+                push @outs, $out;
+            }
+            ok(!$any_bad, "F2b: $tool identical calls (6x, past default threshold) never exit nonzero (exempt) [HIGH-2]");
+            unlike(join("\n", @outs), qr/REPEAT-GUARD/, "F2b: $tool never emits a REPEAT-GUARD advisory [HIGH-2]");
+        }
+    }
+    {
+        # exemption must not disable the guard generally -- a non-exempt tool still fires
+        my $dir = mk_bp(); my %env = default_env($dir);
+        my $payload = mkpayload(tool_name => 'Bash', tool_input => { command => 'f2c-non-exempt' });
+        my ($r1) = run_hook($payload, %env); is($r1, 0, 'F2c: non-exempt Bash call 1 of 4 -> exit 0');
+        my ($r2) = run_hook($payload, %env); is($r2, 0, 'F2c: non-exempt Bash call 2 of 4 -> exit 0');
+        my ($r3) = run_hook($payload, %env); is($r3, 0, 'F2c: non-exempt Bash call 3 of 4 -> exit 0');
+        my ($r4, $out4) = run_hook($payload, %env);
+        is($r4, 2, 'F2c: non-exempt Bash still fires at the threshold (exemption is per-tool, not global) [HIGH-2]');
+        like($out4, qr/REPEAT-GUARD/, 'F2c: non-exempt Bash fire stderr contains REPEAT-GUARD');
+    }
+    {
+        # BP_REPEAT_EXEMPT_TOOLS override: widen the exemption to Bash
+        my $dir = mk_bp(); my %env = default_env($dir, BP_REPEAT_EXEMPT_TOOLS => '^Bash$');
+        my $payload = mkpayload(tool_name => 'Bash', tool_input => { command => 'f2d-bash-exempted' });
+        my $any_bad = 0;
+        for (1 .. 6) { my ($rc) = run_hook($payload, %env); $any_bad = 1 if $rc != 0; }
+        ok(!$any_bad, 'F2d: BP_REPEAT_EXEMPT_TOOLS=^Bash$ makes Bash exempt [HIGH-2]');
+    }
+    {
+        # BP_REPEAT_EXEMPT_TOOLS override: narrow the exemption so BashOutput is no longer exempt
+        my $dir = mk_bp(); my %env = default_env($dir, BP_REPEAT_EXEMPT_TOOLS => '^NoSuchTool$');
+        my $payload = mkpayload(tool_name => 'BashOutput', tool_input => { bash_id => 'bash_2' });
+        my ($r1) = run_hook($payload, %env); is($r1, 0, 'F2d: BP_REPEAT_EXEMPT_TOOLS=^NoSuchTool$, BashOutput call 1 of 4 -> exit 0');
+        my ($r2) = run_hook($payload, %env); is($r2, 0, 'F2d: BP_REPEAT_EXEMPT_TOOLS=^NoSuchTool$, BashOutput call 2 of 4 -> exit 0');
+        my ($r3) = run_hook($payload, %env); is($r3, 0, 'F2d: BP_REPEAT_EXEMPT_TOOLS=^NoSuchTool$, BashOutput call 3 of 4 -> exit 0');
+        my ($r4, $out4) = run_hook($payload, %env);
+        is($r4, 2, 'F2d: BP_REPEAT_EXEMPT_TOOLS overridden away from BashOutput -> it fires again at threshold [HIGH-2]');
+        like($out4, qr/REPEAT-GUARD/, 'F2d: BashOutput fire stderr (override case) contains REPEAT-GUARD');
+    }
+    {
+        # empty/unset BP_REPEAT_EXEMPT_TOOLS -> built-in default exemption list still applies
+        my $dir = mk_bp(); my %env = default_env($dir, BP_REPEAT_EXEMPT_TOOLS => '');
+        my $payload = mkpayload(tool_name => 'BashOutput', tool_input => { bash_id => 'bash_3' });
+        my $any_bad = 0;
+        for (1 .. 6) { my ($rc) = run_hook($payload, %env); $any_bad = 1 if $rc != 0; }
+        ok(!$any_bad, 'F2e: empty BP_REPEAT_EXEMPT_TOOLS falls back to the built-in default exemption list [HIGH-2]');
+    }
+    {
+        # malformed ERE must fail open: never crash the hook, never anything but exit 0/2
+        my $dir = mk_bp(); my %env = default_env($dir, BP_REPEAT_EXEMPT_TOOLS => '[', BP_REPEAT_THRESHOLD => 2);
+        my $payload = mkpayload(tool_name => 'Bash', tool_input => { command => 'f2e-malformed-ere' });
+        my @outs;
+        for my $i (1 .. 3) {
+            my ($rc, $out) = run_hook($payload, %env);
+            ok(($rc == 0 || $rc == 2), "F2e: malformed BP_REPEAT_EXEMPT_TOOLS ERE, call $i -> exit 0 or 2, never a crash [HIGH-2]");
+            push @outs, $out;
+        }
+        unlike(join("\n", @outs), qr/syntax error|unexpected EOF|command not found|unbound variable/i,
+               'F2e: malformed ERE never produces a shell error on stderr (fails open)');
+    }
+
+    # =================================================================================
+    # F3 [hook] the fired flag must survive the RETAIN trim -- fire exactly once per run
+    # (MEDIUM-2). NOTE: this deliberately supersedes the un-fixed refire-every-RETAIN+1
+    # behaviour; no pre-existing assertion in this file encoded that behaviour, so none
+    # needed to change.
+    # =================================================================================
+    {
+        my $dir = mk_bp(); my %env = default_env($dir, BP_REPEAT_THRESHOLD => 2, BP_REPEAT_WINDOW => 1);
+        my $payload = mkpayload(tool_name => 'Bash', tool_input => { command => 'f3a-loop' });
+        my $fires = 0;
+        for (1 .. 12) {
+            my ($rc) = run_hook($payload, %env);
+            $fires++ if $rc == 2;
+        }
+        is($fires, 1, 'F3a: THRESHOLD=2/WINDOW=1 (RETAIN=2), 12 identical calls fire exactly once [MEDIUM-2]');
+    }
+    {
+        my $dir = mk_bp(); my %env = default_env($dir);
+        my $payload = mkpayload(tool_name => 'Bash', tool_input => { command => 'f3b-loop' });
+        my $fires = 0;
+        for (1 .. 70) {
+            my ($rc) = run_hook($payload, %env);
+            $fires++ if $rc == 2;
+        }
+        is($fires, 1, 'F3b: default THRESHOLD=4/WINDOW=64, 70 identical calls fire exactly once (current code fires at call 4 and 69) [MEDIUM-2]');
+    }
+    {
+        my $dir = mk_bp(); my %env = default_env($dir, BP_REPEAT_THRESHOLD => 2, BP_REPEAT_WINDOW => 1);
+        my $payloadA = mkpayload(tool_name => 'Bash', tool_input => { command => 'f3c-a' });
+        my $payloadB = mkpayload(tool_name => 'Bash', tool_input => { command => 'f3c-b' });
+        my ($r1) = run_hook($payloadA, %env); is($r1, 0, 'F3c: call 1 of run A -> exit 0');
+        my ($r2) = run_hook($payloadA, %env); is($r2, 2, 'F3c: call 2 of run A reaches threshold -> exit 2 (first fire)');
+        my ($r3) = run_hook($payloadB, %env); is($r3, 0, 'F3c: an intervening different call B breaks the trailing run (genuine reset)');
+        my ($r4) = run_hook($payloadA, %env); is($r4, 0, 'F3c: after reset, call 1 of a fresh run A -> exit 0');
+        my ($r5) = run_hook($payloadA, %env);
+        is($r5, 2, 'F3c: after reset, call 2 of the fresh run A fires again -- the fired flag dies with the broken run, not permanently sticky [MEDIUM-2]');
+    }
+
+    # =================================================================================
+    # F4 [hook] the state path must be type-checked BEFORE it is read (MEDIUM-3/LOW-4).
+    # Both sub-tests are wrapped in `run_hook_bounded` (hard `timeout`), so a regression
+    # here fails loudly instead of hanging this suite.
+    # =================================================================================
+    {
+        my $dir = mk_bp(); my %env = default_env($dir);
+        my $file = state_file_path($dir, 'p', 'nosid');
+        mkfifo($file, 0600) or die "mkfifo $file: $!";
+        my $payload = mkpayload(tool_name => 'Bash', tool_input => { command => 'f4-fifo' });
+        my ($rc, $out) = run_hook_bounded($payload, 10, %env);
+        isnt($rc, 124, 'F4a: FIFO pre-created at the state path -- hook does not hang past a 10s bound [MEDIUM-3/LOW-4]');
+        is($rc, 0, 'F4a: FIFO pre-created at the state path -- hook returns exit 0 (type-checked before read)');
+    }
+    {
+        my $dir = mk_bp(); my %env = default_env($dir);
+        my $file = state_file_path($dir, 'p', 'nosid');
+        symlink('/dev/zero', $file) or die "symlink $file: $!";
+        my $payload = mkpayload(tool_name => 'Bash', tool_input => { command => 'f4-devzero' });
+        my ($rc, $out) = run_hook_bounded($payload, 10, %env);
+        isnt($rc, 124, 'F4b: symlink to /dev/zero at the state path -- hook does not hang past a 10s bound [MEDIUM-3/LOW-4]');
+        is($rc, 0, 'F4b: symlink to /dev/zero at the state path -- hook returns exit 0');
+    }
+
+    # =================================================================================
+    # F5 [hook] the advisory message must be action-aware and self-consistent (MEDIUM-5).
+    # =================================================================================
+    {
+        my $dir = mk_bp(); my %env = default_env($dir);
+        my $payload = mkpayload(tool_name => 'Bash', tool_input => { command => 'f5-nudge-msg' });
+        run_hook($payload, %env) for 1 .. 3;
+        my (undef, $out_nudge) = run_hook($payload, %env);
+        like($out_nudge, qr/REPEAT-GUARD:/, 'F5a: nudge fired message contains "REPEAT-GUARD:"');
+        like($out_nudge, qr/Bash/,          'F5a: nudge fired message names the tool');
+        like($out_nudge, qr/\b4\b/,         'F5a: nudge fired message states the run length');
+
+        my $has_do_not_retry  = ($out_nudge =~ /[Dd]o NOT retry/)   ? 1 : 0;
+        my $has_retry_allowed = ($out_nudge =~ /retry is allowed/) ? 1 : 0;
+        ok(!($has_do_not_retry && $has_retry_allowed),
+           'F5b: message does not simultaneously say "do NOT retry" and "retry is allowed" (self-contradiction) [MEDIUM-5]');
+
+        unlike($out_nudge, qr/BP_REPEAT_ACTION=off/,
+               'F5d: message does not advertise BP_REPEAT_ACTION=off to the nudged agent [MEDIUM-5]');
+        like($out_nudge, qr/wait|poll/i,
+             'F5e: message mentions the waiting/polling carve-out so a wrongly-nudged waiter knows the advisory does not apply [MEDIUM-5]');
+    }
+    {
+        my $dir = mk_bp(); my %env = default_env($dir, BP_REPEAT_ACTION => 'deny');
+        my $payload = mkpayload(tool_name => 'Bash', tool_input => { command => 'f5-deny-msg' });
+        run_hook($payload, %env) for 1 .. 3;
+        my (undef, $out_deny) = run_hook($payload, %env);
+        unlike($out_deny, qr/retry is allowed/i,
+               'F5c: under BP_REPEAT_ACTION=deny the message does not claim a retry will be allowed [MEDIUM-5]');
+    }
+
+    # =================================================================================
+    # F6 [hook] no stray stderr on the clean path (LOW-1).
+    # =================================================================================
+    {
+        my $dir = mk_bp(); my %env = default_env($dir);
+        my $payload = mkpayload(tool_name => 'Bash', tool_input => { command => 'f6-first-call' });
+        my ($rc1, $out1) = run_hook($payload, %env);
+        is($rc1, 0, 'F6a: first-ever call against a fresh empty runs/ -> exit 0');
+        is($out1, '', 'F6a: first-ever call against a fresh empty runs/ produces completely empty stderr/stdout [LOW-1]');
+        my ($rc2, $out2) = run_hook($payload, %env);
+        is($rc2, 0, 'F6b: second (non-firing) call -> exit 0');
+        is($out2, '', 'F6b: second (non-firing) call produces completely empty stderr [LOW-1]');
     }
 }
