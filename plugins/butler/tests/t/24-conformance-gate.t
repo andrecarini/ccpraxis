@@ -563,8 +563,31 @@ sub raw_dev_verdict {
     my $dag_before = slurp("$dir/blueprint.md");
     seed_verdict($dir, 'conformance', '_run', raw_dev_verdict('b03'));
     tryrun($dir, read_verdict => sub { jget("$dir/runs/conformance/_run.verdict.json") });
-    ok(!-e "$dir/runs/remediation-queue.json",
-       'AC-26: b05 does NOT create runs/remediation-queue.json (that is b07)');
+    # RETARGETED by b07-auto-remediation-engine (operator RULING 1, 2026-07-29).
+    #
+    # WAS: ok(!-e "$dir/runs/remediation-queue.json",
+    #          'AC-26: b05 does NOT create runs/remediation-queue.json (that is b07)');
+    #
+    # Why the old form is now wrong: absence of that file was only ever a PROXY
+    # for "b05 stays in its lane", and it held solely because nothing in the
+    # fleet could create it. b07 is now exactly that thing, and it legitimately
+    # writes the queue from the same orchestrator run this fixture drives — its
+    # own oracle (t/26 AC-30) REQUIRES the write even with zero entries. So the
+    # absence check had stopped testing b05's restraint and started testing
+    # b07's non-existence. Obsolete boundary, not a violated b05 invariant.
+    #
+    # RETARGET, not a weakening — the intent is asserted directly and in two
+    # independent ways, kept as ONE assertion so this file stays at 175:
+    #   (a) STATIC: b05's own module carries no remediation-queue code at all,
+    #       so b05 cannot create that file by any path. Stronger than the old
+    #       runtime check, which a lucky ordering could have satisfied.
+    #   (b) RUNTIME: whatever queue IS on disk is b07-shaped. If b05 ever
+    #       authored a bespoke or malformed queue of its own, this still fails.
+    my $judge_src26 = slurp("$Bin/../../scripts/bp-judge.pl");
+    my $q26 = -e "$dir/runs/remediation-queue.json" ? jget("$dir/runs/remediation-queue.json") : undef;
+    ok($judge_src26 !~ /remediation-queue/
+       && (!defined $q26 || ($q26->{schema} // '') eq 'remediation-queue/1'),
+       'AC-26: b05 stays in its lane — bp-judge.pl contains no remediation-queue code, and any queue on disk is b07-shaped (schema remediation-queue/1)');
     is(slurp("$dir/blueprint.md"), $dag_before, 'AC-26: b05 does not append to the DAG');
 }
 

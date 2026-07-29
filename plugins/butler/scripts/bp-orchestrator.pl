@@ -1876,10 +1876,29 @@ sub run {
             # while any remediation entry is still `queued` (authored but not yet
             # finished), so the gate never re-verifies against a half-remediated
             # world.
-            if (!$any_running && !$resume_pending && !$paused && BpRemediate::verify_ready($rq)) {
+            # b07 (operator RULING 2, 2026-07-29): an ALREADY-IN-FLIGHT conformance
+            # judge must have its verdict INGESTED even on a tick where something
+            # is running. Harvest can reopen and relaunch a finished package on the
+            # very tick the verdict lands (orchestrator.log: harvest_reopen ->
+            # launch); $any_running then goes true, this whole block is skipped,
+            # and the verdict is stranded unread — the judge stays inflight
+            # forever and no finding can reach remediation.
+            #
+            # The relaxation is deliberately asymmetric and covers INGESTION ONLY:
+            #   - entering on $cinfl_pre reaches the `if ($cinfl)` branch below,
+            #     which only READS a verdict already produced. It schedules
+            #     nothing and starts nothing.
+            #   - the SPAWN branches are structurally unreachable in that case,
+            #     because they sit behind `elsif` on $cinfl. When $cinfl_pre is
+            #     false we can only have entered via !$any_running, so firing a
+            #     NEW judge still requires a genuinely idle run. The fire
+            #     condition is therefore unchanged.
+            # This DOES touch b05/harvest ordering; flagged to review + red-team.
+            my $cinfl_pre = defined judge_inflight($runs, 'conformance', '_run') ? 1 : 0;
+            if ((!$any_running || $cinfl_pre) && !$resume_pending && !$paused && BpRemediate::verify_ready($rq)) {
                 my $cpkgs = conformance_registry($bpdir, $meta, $status);
                 my $ready = BpJudge::conformance_ready($cpkgs);
-                my $cinfl = defined judge_inflight($runs, 'conformance', '_run') ? 1 : 0;
+                my $cinfl = $cinfl_pre;
                 my $cvpre = -e conformance_verdict_path($runs) ? 1 : 0;
                 if ($cinfl) {
                     # judge running: ingest its verdict if it landed, else keep waiting
