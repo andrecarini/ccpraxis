@@ -250,6 +250,50 @@ my %_PP_RELATION_PHRASE = (
     ancestor   => 'ancestor (the path you gave CONTAINS this protected root)',
 );
 
+# Local mirror of the module's own reason-precedence order (spec S2.5 rule 3:
+# ccpraxis-install < claude-home < marketplace-install < marketplace-source <
+# user-configured). Needed here, not just inside protected_roots, because the
+# live_install_hint candidate (CRITICAL-1a below) is merged into the root set
+# by this region and must be sorted into the same tie-break order.
+my %_PP_REASON_RANK = (
+    'ccpraxis-install'    => 0,
+    'claude-home'         => 1,
+    'marketplace-install' => 2,
+    'marketplace-source'  => 3,
+    'user-configured'     => 4,
+);
+
+# Strip every byte that could forge an extra physical line or an ANSI/control
+# sequence when this text later lands on STDERR (a hostile registry key/value
+# is untrusted input by construction -- MINOR-5). Replaced with a plain
+# space so the surrounding text stays readable rather than being truncated.
+sub _pp_sanitize {
+    my ($s) = @_;
+    return '' unless defined $s;
+    $s =~ s/[\x00-\x1f\x7f]/ /g;
+    return $s;
+}
+
+# CRITICAL-1(b): a pure env-lookup seam. $env_hashref is the raw environment
+# view the caller was handed (e.g. a copy of %ENV); $authoritative_home, when
+# defined and non-empty, is a caller-trusted HOME value that must win over
+# whatever HOME the raw hashref carries -- this is what closes the
+# `HOME=/tmp/decoy claude-sandbox ~/.claude` bypass. Every other key passes
+# through the raw hashref unchanged. Never touches the real environment
+# itself: both inputs arrive as arguments, so this stays closed over nothing.
+sub _pp_env_seam {
+    my ($env_hashref, $authoritative_home) = @_;
+    $env_hashref //= {};
+    return sub {
+        my ($key) = @_;
+        if (defined $key && $key eq 'HOME') {
+            return $authoritative_home
+                if defined $authoritative_home && length $authoritative_home;
+        }
+        return $env_hashref->{$key};
+    };
+}
+
 sub _pp_explanation {
     my ($reason) = @_;
     my %text = (
@@ -275,7 +319,8 @@ every file operation in the container would crawl.},
 configuration and your credentials. Putting all of that inside a container
 read-write is never what a sandbox is for.},
     );
-    return $text{$reason};
+    return $text{$reason}
+        // 'This path collides with something Claude Code has installed on this machine.';
 }
 
 sub _pp_advice {
@@ -301,12 +346,13 @@ claude-sandbox there, or pass it explicitly:
 
   claude-sandbox <your-project-dir>
 
-If you meant to work on the plugin source that lives there, find the git
-repository that contains } . $root . q{ and clone THAT repository instead --
-} . $root . q{ itself need not be the root of a repository. Copy or clone the
-repository somewhere outside it and work from that copy: for a git repo, use
-git clone --no-hardlinks <repository-root> <your-clone-dir>, where
-<repository-root> is the repository containing } . $root . q{.};
+If you meant to work on the plugin source that lives there, work from a
+clone outside it. That directory is not necessarily a repository root, so
+clone the repository that contains it:
+
+  } . $root . q{
+
+  git clone --no-hardlinks <repository-root> <your-clone-dir>};
     }
 
     if ($reason eq 'user-configured') {
@@ -361,100 +407,150 @@ has to be fixed - see plugins/sandbox/docs/protected-paths.md.};
          . 'Aborting.';
 }
 
-sub _pp_warnings {
-    my ($pr, $root_count) = @_;
-    my @errors = @{ $pr->{errors} // [] };
+# One sanitised line per broken source, capped at 10 + one overflow line.
+# Does NOT append the "still enforcing" trailer -- callers must append that
+# themselves, exactly once, as the LAST warning after every other warning
+# (including any unnormalizable-target warning) has already been pushed, per
+# the reviewer MINOR fix (AC-63): the trailer must always be last, even when
+# it collides with the unnormalizable-target case.
+sub _pp_source_warnings {
+    my ($errors) = @_;
     my @warnings;
     my $shown = 0;
-    for my $e (@errors) {
+    for my $e (@$errors) {
         last if $shown >= 10;
-        push @warnings, "claude-sandbox: WARNING: protected-path source [$e->{code}]: $e->{detail}";
+        push @warnings, 'claude-sandbox: WARNING: protected-path source ['
+            . _pp_sanitize($e->{code}) . ']: ' . _pp_sanitize($e->{detail});
         $shown++;
     }
-    if (@errors > 10) {
-        my $more = scalar(@errors) - 10;
+    if (@$errors > 10) {
+        my $more = scalar(@$errors) - 10;
         push @warnings, "claude-sandbox: WARNING: ... and $more more protected-path source problem(s).";
     }
-    if (@warnings) {
-        push @warnings,
-            "claude-sandbox: the protected-path guard is still enforcing the $root_count protected root(s) it did resolve; a failed source never relaxes it.";
-    }
     return @warnings;
+}
+
+sub _pp_enforcing_line {
+    my ($root_count) = @_;
+    return "claude-sandbox: the protected-path guard is still enforcing the $root_count protected root(s) it did resolve; a failed source never relaxes it.";
 }
 
 sub protected_path_outcome {
     my ($target, $opts) = @_;
     $opts //= {};
 
-    my $pr       = protected_roots($opts);
-    my @warnings = _pp_warnings($pr, scalar @{ $pr->{roots} });
+    my $pr    = protected_roots($opts);
+    my @roots = @{ $pr->{roots} };
+
+    # CRITICAL-1(a): an env-independent 'ccpraxis-install' root. The registry
+    # already contributes one (ProtectedPaths.pm's own live_install_dir()
+    # call), but that source vanishes whenever the registry is unreadable or
+    # redirected. live_install_hint, when supplied, adds the same reason
+    # code from the launcher's own abs_path(__FILE__)-derived anchor, in
+    # ADDITION to whatever the registry resolved -- deduped so an identical
+    # registry-derived root is never reported twice.
+    if (defined $opts->{live_install_hint} && length $opts->{live_install_hint}) {
+        my $hint_n = normalize_path($opts->{live_install_hint});
+        if (defined $hint_n) {
+            my $dup = grep { $_->{reason} eq 'ccpraxis-install' && $_->{path} eq $hint_n } @roots;
+            unless ($dup) {
+                push @roots, { path => $hint_n, reason => 'ccpraxis-install' };
+                @roots = sort {
+                    ($_PP_REASON_RANK{$a->{reason}} // 99) <=> ($_PP_REASON_RANK{$b->{reason}} // 99)
+                        || $a->{path} cmp $b->{path}
+                } @roots;
+            }
+        }
+    }
+
+    my @errors   = @{ $pr->{errors} // [] };
+    my @warnings = _pp_source_warnings(\@errors);
+
+    my $result;
 
     my $codes = target_self_codes($target, $opts);
     if (@$codes) {
         my $reason = $codes->[0];
-        return {
+        $result = {
             refuse    => 1,
             reason    => $reason,
             root      => undef,
             relation  => undef,
             message   => _pp_message($target, $reason, undef, undef),
             exit_code => 1,
-            warnings  => \@warnings,
         };
-    }
-
-    if (!defined normalize_path($target)) {
+    } elsif (!defined normalize_path($target)) {
         push @warnings,
             'claude-sandbox: WARNING: protected-path guard could not normalize the target path; it was not checked against any protected root.';
-        return {
+        $result = {
             refuse    => 0,
             reason    => undef,
             root      => undef,
             relation  => undef,
             message   => undef,
             exit_code => 1,
-            warnings  => \@warnings,
         };
-    }
+    } else {
+        my %CLASS = ( exact => 0, descendant => 1, ancestor => 2 );
+        my ($best_class, $best_root, $best_rel);
+        for my $candidate (@roots) {
+            my $rel = path_relation($target, $candidate->{path}, $opts);
+            next if $rel eq 'unrelated';
+            my $class = $CLASS{$rel};
+            if (!defined $best_class || $class < $best_class) {
+                ($best_class, $best_root, $best_rel) = ($class, $candidate, $rel);
+            }
+        }
 
-    my %CLASS = ( exact => 0, descendant => 1, ancestor => 2 );
-    my ($best_class, $best_root, $best_rel);
-    for my $candidate (@{ $pr->{roots} }) {
-        my $rel = path_relation($target, $candidate->{path}, $opts);
-        next if $rel eq 'unrelated';
-        my $class = $CLASS{$rel};
-        if (!defined $best_class || $class < $best_class) {
-            ($best_class, $best_root, $best_rel) = ($class, $candidate, $rel);
+        if (!defined $best_root) {
+            $result = {
+                refuse    => 0,
+                reason    => undef,
+                root      => undef,
+                relation  => undef,
+                message   => undef,
+                exit_code => 1,
+            };
+        } else {
+            $result = {
+                refuse    => 1,
+                reason    => $best_root->{reason},
+                root      => $best_root->{path},
+                relation  => $best_rel,
+                message   => _pp_message($target, $best_root->{reason}, $best_root->{path}, $best_rel),
+                exit_code => 1,
+            };
         }
     }
 
-    if (!defined $best_root) {
-        return {
-            refuse    => 0,
-            reason    => undef,
-            root      => undef,
-            relation  => undef,
-            message   => undef,
-            exit_code => 1,
-            warnings  => \@warnings,
-        };
-    }
-
-    return {
-        refuse    => 1,
-        reason    => $best_root->{reason},
-        root      => $best_root->{path},
-        relation  => $best_rel,
-        message   => _pp_message($target, $best_root->{reason}, $best_root->{path}, $best_rel),
-        exit_code => 1,
-        warnings  => \@warnings,
-    };
+    push @warnings, _pp_enforcing_line(scalar @roots) if @errors;
+    $result->{warnings} = \@warnings;
+    return $result;
 }
 # <<< q03:protected-path-decision:END
 
+# CRITICAL-1(b): the authoritative-home value that closes the
+# `HOME=/tmp/decoy claude-sandbox ~/.claude` bypass (redteam CRITICAL-1). This
+# reads the real OS-level home-directory record (getpwuid), independent of
+# whatever the process environment claims HOME is. POSIX-only: getpwuid is
+# unimplemented on native Windows perl, so this is a guarded no-op there and
+# the seam falls back to the existing $ENV{HOME}-driven behaviour untouched.
+my $CCPRAXIS_AUTH_HOME = eval {
+    if ($WINDOWS_FAMILY) {
+        undef;
+    } else {
+        my @pw = getpwuid($<);
+        (@pw && defined $pw[7] && length $pw[7]) ? $pw[7] : undef;
+    }
+};
+$CCPRAXIS_AUTH_HOME = undef if $@;
+
 {
     my $pp = protected_path_outcome($PROJECT_PATH, {
-        registry_path => "$HOST_PLUGINS_DIR/known_marketplaces.json",
+        registry_path     => "$CLAUDE_HOST_CONFIG/plugins/known_marketplaces.json",
+        extra_list_path   => "$CLAUDE_HOST_CONFIG/ccpraxis-protected-paths.json",
+        live_install_hint => $LIVE_CCPRAXIS_ROOT,
+        env               => _pp_env_seam(\%ENV, $CCPRAXIS_AUTH_HOME),
     });
     print STDERR $_, "\n" for @{ $pp->{warnings} };
     if ($pp->{refuse}) {
