@@ -2189,9 +2189,23 @@ sub run_claude {
 # Current podman/docker container state ('running','exited','stopped', or ''
 # when `inspect` finds no such container — it was removed). Mirrors the inline
 # `inspect --format {{.State.Status}}` idiom used elsewhere in this file.
+#
+# MINOR-5 (red-team step 6): the name is assembled as a QUOTED ARGUMENT LIST via
+# _shell_quote (:906, the same idiom _capture_or_die uses) instead of being
+# interpolated raw into the backtick. _container_name_for's sanitiser only folds
+# spaces, so a project directory carrying shell metacharacters would otherwise
+# reach /bin/sh from a keypress-reachable call site (the recover seams). The
+# sanitiser itself is deliberately NOT tightened: changing it changes every
+# derived container name and would orphan every container that already exists.
+# Backticks are kept rather than a list-form pipe open because `2>/dev/null` is
+# load-bearing -- this is called from inside the alt-screen TUI, and podman's
+# "no such object" must never reach a live frame.
 sub container_status {
     my $name = shift;
-    my $s = `$PODMAN inspect --format '{{.State.Status}}' "$name" 2>/dev/null`;
+    return '' unless defined $name && length $name;
+    my $cmd = join(' ', map { _shell_quote($_) }
+                        ($PODMAN, 'inspect', '--format', '{{.State.Status}}', $name));
+    my $s = `$cmd 2>/dev/null`;
     chomp $s if defined $s;
     return defined $s ? $s : '';
 }
@@ -2912,6 +2926,11 @@ sub enter_dashboard {
             # input loop stays responsive. The cheap log tail refreshes every
             # state interval. (B3 may make the inspect fully async.)
             my $now = time;
+            # MINOR-3 (red-team step 6): did THIS call actually re-probe, or is
+            # the status below a <=10s-old cache reading? The recovery driver
+            # must not skip container-start off a cached 'running' for a
+            # container that died inside the throttle window.
+            my $probed_now = 0;
             if ($now - $last_inspect >= 10) {
                 my $s = `$PODMAN inspect --format '{{.State.Status}}' "$CONTAINER_NAME" 2>/dev/null`;
                 chomp $s if defined $s;
@@ -2946,6 +2965,7 @@ sub enter_dashboard {
                 # it here keeps the frame budget exactly where it was.
                 $cached_machine_state = _machine_state();
                 $last_inspect  = $now;
+                $probed_now    = 1;
             }
             # s09: the expensive resource probes run on their OWN, slower
             # cadence with their OWN stamp — deliberately NOT nested in the
@@ -2974,6 +2994,12 @@ sub enter_dashboard {
                 project_name    => $PROJECT_NAME,
                 container       => $CONTAINER_NAME,
                 status          => $cached_status,
+                # s12 MINOR-3: "the status above is a CACHE reading -- do not
+                # trust it to skip work". Dashboard::run_recover_stages honours
+                # this by always calling the container_start seam (which
+                # re-probes authoritatively) instead of reporting the stage
+                # skipped off a reading that may be up to 10s out of date.
+                status_stale    => ($probed_now ? 0 : 1),
                 events          => Dashboard::recent_events(\@lines, 50),
                 install_warning => $INSTALL_WARNING,
                 busy_age        => $busy_age,
@@ -3242,28 +3268,68 @@ sub recover_container {
                      detail => "podman machine start did not finish within ${secs}s" }
                 unless defined $out;
             my $rc = $? >> 8;
+            # MAJOR-3 (red-team step 6): `podman machine start` against a VM that
+            # is already running OR already starting returns 125 with
+            # "VM already running or starting". That is the state the user is
+            # trying to reach, so it is a SUCCESS here, not a failure -- reporting
+            # it as one used to abort the recovery at stage 2 and leave the
+            # container untouched, in exactly the host-resume case [l] exists for.
+            my $err = _trim_err($out);
+            return { ok => 1, detail => 'machine already running or starting' }
+                if $rc == 125 || $err =~ /already running or starting/i;
             return { ok => ($rc == 0 ? 1 : 0),
-                     detail => ($rc == 0 ? 'machine started'
-                                         : "rc $rc: " . _trim_err($out)) };
+                     detail => ($rc == 0 ? 'machine started' : "rc $rc: $err") };
         },
         container_start => sub {
             return { ok => 1, detail => 'already running' }
                 if container_status($CONTAINER_NAME) eq 'running';
-            my $rc = system($PODMAN, 'start', $CONTAINER_NAME);
-            # Problem 6 -- the 10 s startup grace. The container entrypoint reaps
-            # itself ~10 s after start unless /tmp/.launcher-alive is fresh, so
-            # the sentinel refresh below is the VERY NEXT podman invocation: no
-            # status probe, no inspect, nothing in between. The plan then runs
-            # heartbeat-reattach immediately after this stage, which refreshes it
-            # again -- so a recovery cannot start the container and then dawdle
-            # into its own reaping.
-            my $code = $rc >> 8;
+            # CAPTURE (don't inherit) podman's output -- the same defence, for
+            # the same reason, as _heartbeat_once (:3287-3294) and the
+            # stop_container seam (:3162). This runs synchronously inside the
+            # TUI's input drain, with the terminal in cbreak AND on the
+            # alt-screen, and the renderer is a per-row diff against $prev.
+            # `podman start <name>` echoes the container name ON SUCCESS: that
+            # newline scrolls the alt-screen by one row, every later diff-render
+            # then writes each row one line off, and because only rows whose
+            # CONTENT changed are repainted the misalignment is never repaired
+            # (only [r], which drops $prev, fixes it -- and nothing tells the
+            # user that). The failure path is worse: multi-line `Error: ...`
+            # text straight into the live frame. Capturing also turns the
+            # stage's detail from a bare "rc 125" into podman's own sentence.
+            my $out  = `$PODMAN start "$CONTAINER_NAME" 2>&1`;
+            my $code = $? >> 8;
+            # The sentinel refresh is the VERY NEXT podman invocation after the
+            # start -- no status probe, no inspect, nothing in between -- so the
+            # heartbeat is re-established promptly; the plan then runs
+            # heartbeat-reattach immediately after this stage and refreshes it
+            # again. MINOR-2 (red-team step 6): this used to cite a "10 s startup
+            # grace". That was fiction, off by 60x -- container/heartbeat.sh:26-27
+            # sets HB=600 and STARTUP_GRACE=600, i.e. TEN MINUTES. The adjacency
+            # is kept because touching early is unconditionally correct and free,
+            # NOT because of a ten-second cliff that never existed.
             if ($code == 0) {
-                system($PODMAN, 'exec', $CONTAINER_NAME, 'touch', '/tmp/.launcher-alive');
+                my $touch_out = `$PODMAN exec "$CONTAINER_NAME" touch /tmp/.launcher-alive 2>&1`;
             }
-            log_ev('container_start', { rc => $code, container => $CONTAINER_NAME });
-            return { ok => ($code == 0 ? 1 : 0),
-                     detail => ($code == 0 ? 'container started' : "rc $code") };
+            my $err = _trim_err($out);
+            # MINOR-4: a container removed while the machine was down classifies
+            # 'unknown', so it never reaches run_recover_stages' 'absent' branch
+            # and its gone-diagnosis. Re-probe here: an empty status after a
+            # failed start means the container is genuinely gone, and the user
+            # needs the instruction, not a number.
+            my $detail;
+            if ($code == 0) { $detail = 'container started'; }
+            elsif (container_status($CONTAINER_NAME) eq '') {
+                $detail = 'container no longer exists; in-TUI recreate is not available'
+                        . ' - [q] quit, then re-run claude-sandbox to rebuild';
+            }
+            else { $detail = "rc $code" . (length($err) ? ": $err" : ''); }
+            # The code field is spelled `rc` here on purpose. The setup path
+            # (:2673) emits this SAME container_start event type with the other
+            # common spelling of that field, which AC-27(c) forbids anywhere in
+            # recover_container's body -- so the two emitters differ by
+            # constraint, not by accident. Do not "harmonise" them from this side.
+            log_ev('container_start', { rc => $code, container => $CONTAINER_NAME, reason => $err });
+            return { ok => ($code == 0 ? 1 : 0), detail => $detail };
         },
         heartbeat_reattach => sub {
             my $hb = _heartbeat_once();
