@@ -1238,7 +1238,7 @@ sub run {
             # same-tick ledger-status resync (queued -> awaiting_verify, done by
             # BpRemediate::merge_queue) is visible to remediation_step without a
             # second disk read.
-            my $rq = remediation_merge($bpdir, $runs, $meta, $status);
+            my $rq = remediation_merge($bpdir, $runs, $meta, $status, $now);
             my $rem_outstanding = BpRemediate::remediation_outstanding($rq);
 
             # ---- TOKEN-KEEPER (runs even while paused, to keep the token alive) ----
@@ -2049,7 +2049,7 @@ sub _enter_pause_manual {
 # both conformance-verdict ingestion sites — sees a consistent view without a
 # second disk read.
 sub remediation_merge {
-    my ($bpdir, $runs, $meta, $status) = @_;
+    my ($bpdir, $runs, $meta, $status, $now) = @_;
     my $queue = BpRemediate::read_queue("$runs/remediation-queue.json");
     $queue = BpRemediate::queue_new({}) unless ref $queue eq 'HASH';
     return $queue if $queue->{_corrupt};   # fail-closed: never merge a corrupt queue
@@ -2063,7 +2063,22 @@ sub remediation_merge {
         my $st = ledger_fm($bpdir, $id, 'status');
         $ledger_status{$id} = $st if defined $st && length $st;
     }
-    BpRemediate::merge_queue($queue, $meta, $status, \%ledger_status);
+    my $r = BpRemediate::merge_queue($queue, $meta, $status, \%ledger_status);
+
+    # b07 (deviation from spec-08 §3.5 behavior 21, recorded in the
+    # implementer report): rotation of runs/conformance-verdict.json — the
+    # seam that re-arms b05's gate — happens HERE, at merge time, rather than
+    # at authoring time. Authoring cannot usefully rotate: verify_ready (§3.4)
+    # stays 0 while any entry is 'queued', so the gate can't re-fire yet at
+    # that moment anyway. The merge above is what flips queued -> awaiting_verify
+    # (the ONLY transition that can make verify_ready become 1), and it runs
+    # every tick, so it is the correct place to detect "the queue's readiness
+    # just changed" and rotate the stale verdict out of the way.
+    if (@{ $r->{transitioned} || [] }) {
+        BpRemediate::rotate_verdict($runs, $queue, $now);
+        update_registry_pkg($runs, '_run', { conformance_spawns => 0 });
+        BpRemediate::write_queue("$runs/remediation-queue.json", $queue);
+    }
     return $queue;
 }
 

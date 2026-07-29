@@ -412,7 +412,7 @@ sub merge_queue {
     $meta   ||= {};
     $status ||= {};
     $ledger_status ||= {};
-    my (@merged, @skipped);
+    my (@merged, @skipped, @transitioned);
     my @entries = (ref $queue eq 'HASH' && ref $queue->{entries} eq 'ARRAY') ? @{ $queue->{entries} } : ();
 
     for my $e (@entries) {
@@ -429,6 +429,7 @@ sub merge_queue {
         if (defined $lst && length $lst && (($e->{state} // '') eq 'queued')) {
             if ($lst eq 'done') {
                 $e->{state} = 'awaiting_verify';
+                push @transitioned, $id;
             } elsif ($lst =~ /^(?:dropped|blocked|parked)$/) {
                 $e->{state} = 'escalated';
                 $e->{escalation_reason} = 'remediation_not_done';
@@ -464,7 +465,7 @@ sub merge_queue {
         $status->{$id} = $st;
         push @merged, $id;
     }
-    return { merged => \@merged, skipped => \@skipped };
+    return { merged => \@merged, skipped => \@skipped, transitioned => \@transitioned };
 }
 
 # ===========================================================================
@@ -740,7 +741,6 @@ sub plan {
                           files => [ split /:/, $ws ] },
         };
         $nq->{rounds_used} = ($nq->{rounds_used} // 0) + 1;
-        $rotate = 1;
 
         # the superseded (old-round) entry: terminal, but purely internal
         # bookkeeping — never a user-facing escalation (no entry in
@@ -804,7 +804,6 @@ sub plan {
                           write_set => $ws, round => 1, max_rounds => $rounds_default, files => [ split /:/, $ws ] },
         };
         $nq->{rounds_used} = ($nq->{rounds_used} // 0) + 1;
-        $rotate = 1;
         $tracked{$k} = 1;
     }
 
