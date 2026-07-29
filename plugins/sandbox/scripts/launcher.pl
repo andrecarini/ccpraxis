@@ -2036,6 +2036,44 @@ sub ensure_claude_json_onboarded {
 # never reads a 0-byte config on first launch.
 sub ensure_claude_json_host_file { ensure_claude_json_onboarded() }
 
+# migrate_claude_json_relocation($old, $new, %opt) -> $outcome
+#
+# Decision #10 / Ruling B (2026-07-28). One-time, non-destructive, idempotent
+# migration of the global config off the OLD pre-fix location onto the NEW
+# CLAUDE_CONFIG_DIR-resolved one: COPY old -> new, then rename old aside to
+# "<old>.pre-relocation-bak-<ts>".
+#
+# THE GUARD IS THE POINT. In this project's layout both paths resolve to the
+# SAME host file — claude-home/.claude.json, seen through the (removed)
+# single-file bind and through the dir bind (s01 probe-05: inode
+# 9288674232328321, dev 43 on both). Executing the copy+backup-rename there
+# would rename the ONLY config away from the exact path both the old and the
+# new resolver read: the "migration" would itself be the outage. So a same-file
+# check (dev+inode, NOT string comparison — the two paths are spelled
+# differently) skips the whole operation and logs the skip.
+#
+# It is still written, rather than omitted, because Decision #10 was authored
+# for EXISTING sandboxes whose layout may not match this container's. Cheap
+# insurance that costs one stat() on the common path.
+#
+# Outcomes (all logged via log_ev unless a logger is injected):
+#   'no-source'     old does not exist -> nothing to migrate
+#   'same-file'     old and new are one file -> SKIP (this container's case)
+#   'target-exists' new already holds a non-empty config -> SKIP, touch nothing
+#   'migrated'      copied, verified, old renamed to the timestamped backup
+#   'failed'        copy or verification failed -> old left EXACTLY as it was
+#
+# %opt: logger => sub { $event, \%fields } (tests inject; defaults to log_ev),
+#       now => epoch seconds (tests pin the backup suffix).
+sub migrate_claude_json_relocation {
+    my ($old, $new, %opt) = @_;
+    return ClaudeConfig::relocate_claude_json(
+        $old, $new,
+        logger => ($opt{logger} || sub { log_ev($_[0], $_[1]) }),
+        %opt,
+    );
+}
+
 # Safety guard only (Fix 1): the canonical sandbox creds now live at
 # claude-home/.credentials.json — a REAL file inside the RW dir bind, no
 # longer a single-file mount, so it need not pre-exist before `podman
@@ -2388,6 +2426,17 @@ if (! _container_exists($CONTAINER_NAME)) {
     # container sees everything at the canonical paths from the first
     # moment.
     apply_blueprints_to_host_data();
+    # Decision #10 / Ruling B: migrate the global config off the pre-fix
+    # location before anything reads or heals it. In THIS layout both
+    # arguments resolve to one host file, so the dev+inode guard inside makes
+    # this a logged no-op — running the copy+backup-rename literally would
+    # rename the only config away from the path both resolvers read. It is
+    # called anyway because Decision #10 was written for existing sandboxes
+    # whose layout may differ, where the guard falls through to a real,
+    # verified copy. Must run BEFORE ensure_claude_json_host_file(), which
+    # would otherwise heal/seed the new path and mask a pending migration.
+    migrate_claude_json_relocation("$CLAUDE_DATA/.claude.json",
+                                   "$CLAUDE_DATA/.claude.json");
     ensure_claude_json_host_file();
     ensure_credentials_json_host_file();
 
