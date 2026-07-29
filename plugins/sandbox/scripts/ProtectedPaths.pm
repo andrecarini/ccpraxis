@@ -308,16 +308,41 @@ sub target_self_codes {
 # refusing: one broken source never discards another's roots (Decision #6).
 # =====================================================================
 
-# q04 §1.1 -- the default `realpath` seam. Deliberately IDENTICAL in shape to
-# CcpraxisWorkCopy.pm's own $_default_realpath (:149-153) rather than a second
-# invention, because both modules answer the same question: Cwd::abs_path (NOT
-# Cwd::realpath), eval-wrapped, and returning undef for a path that does not
-# exist -- which is exactly the fallback trigger the degrade-to-lexical path
-# below wants.
+# q04 §1.1 -- the default `realpath` seam. Built from the same primitive as
+# CcpraxisWorkCopy.pm's own $_default_realpath (:149-153) -- Cwd::abs_path
+# (NOT Cwd::realpath), eval-wrapped -- because both modules answer the same
+# question and should not diverge on the primitive.
+#
+# ONE REFINEMENT over the sibling, and it is a product requirement, not a test
+# accommodation: A PATH THAT DOES NOT EXIST IS NOT AN UNRESOLVABLE PATH.
+# abs_path returns undef for any non-existent path, and undef is what the
+# pipeline reads as "unresolvable" and warns about (§1.3). Without this
+# refinement every protected root that is merely absent -- a marketplace
+# directory the user deleted, an extra-list entry pointing at a project they
+# have not created yet -- would emit `root-unresolved` on EVERY launch, so a
+# perfectly clean run would nag. t/53's Group G (AC-38..40, the C6
+# clone-outside-the-install no-regression set) pins that: such a launch must
+# come back with `warnings` EMPTY.
+#
+# So: absent  => return the path unchanged (resolved-to-itself; it stays in the
+#                protected set, silently -- there is nothing to resolve, and
+#                lexical containment still guards it);
+#     present but unresolvable (broken symlink, unreadable parent, permissions)
+#             => undef, which warns. That is the case a user can and should fix.
+#
+# The `-e` is deliberately a REAL filesystem test rather than the injectable
+# `exists` seam: this closure IS the "no seam was injected, talk to the real
+# host" branch, and t/51 arms `exists` as a die-ing tripwire, so routing
+# through it here would make the default seam die where it should answer.
+# Callers who inject `realpath` keep full control and are untouched by this --
+# an injected seam returning undef still means "unresolvable" (AC-51/AC-52).
 my $_default_realpath = sub {
     my ($p) = @_;
     my $r = eval { Cwd::abs_path($p) };
-    return $r;
+    return $r if defined $r && length $r;
+    my $exists = eval { (defined $p && length $p && -e $p) ? 1 : 0 };
+    return $p if !$exists;          # absent => nothing to resolve, not a fault
+    return undef;                   # present but unresolvable => warn
 };
 
 # =====================================================================
@@ -590,7 +615,7 @@ sub protected_roots {
                 if (ref $entry ne 'HASH') {
                     push @errors, { code => 'registry-entry', detail => "entry '$name' is not an object" };
                 } else {
-                    my $il_n = _ingest_path($entry->{installLocation});
+                    my $il_n = _ingest_path($entry->{installLocation}, $opts);
                     if (defined $il_n) {
                         push @candidates, { path => $il_n, reason => 'marketplace-install' };
                     } else {
@@ -600,7 +625,7 @@ sub protected_roots {
                     my $src = $entry->{source};
                     if (ref $src eq 'HASH') {
                         if (($src->{source} // '') eq 'directory') {
-                            my $sp_n = _ingest_path($src->{path});
+                            my $sp_n = _ingest_path($src->{path}, $opts);
                             if (defined $sp_n) {
                                 push @candidates, { path => $sp_n, reason => 'marketplace-source' };
                             } else {
@@ -625,17 +650,80 @@ sub protected_roots {
     # registries discovered under other home candidates.
     $ingest_registry->($reg) if defined $reg;
 
+    # ---- q04 §2.3: the registry SOURCE is a candidate SET -----------------
+    # `$home_raw` is a SINGLE precedence-ordered value, and `$registry_default`
+    # is derived from it, so a redirected HOME poisons the module's OWN default
+    # registry path -- the residue q01 knowingly left (see its comment at step
+    # 1). This applies the very transformation q01 made one layer up for the
+    # claude-home roots, and its recorded rationale holds verbatim: a
+    # precedence chain lets one redirected variable REMOVE a real protected
+    # root while `errors` stays clean.
+    #
+    # So: try the same relative file under EVERY notion-A home candidate and
+    # UNION the roots. An explicitly supplied `registry_path` (the launcher
+    # always supplies one) is still honoured above and is ADDED TO here, never
+    # replaced (AC-59); `_candidate_source_paths` drops the primary so no file
+    # is read twice. Fold-key dedup (step 6) absorbs the overlap when two home
+    # candidates name the same roots.
+    #
+    # `missing_is_error => 0` for these, unlike the primary: the primary is the
+    # file the caller NAMED, so its absence is worth a warning, whereas these
+    # are speculative discovery where absence is the normal case -- one
+    # `registry-missing` per candidate home would be pure noise (and would
+    # break AC-28's "exactly one error"). A registry that IS there but is
+    # unreadable/unparseable/misshapen still reports, since that is a real
+    # broken source.
+    #
+    # Skipped entirely when `registry` is supplied AS DATA: that is the caller
+    # handing us the registry outright, not asking us to find one.
+    my $candidate_reg;   # first candidate-derived registry (step 4 fallback)
+    unless (exists $opts->{registry}) {
+        my $primary = exists $opts->{registry_path} ? $opts->{registry_path} : $registry_default;
+        for my $path (_candidate_source_paths('plugins/known_marketplaces.json',
+                                              \@home_candidates, $primary)) {
+            my ($raw, $attempted) = _acquire_json_source(
+                opts             => {},
+                data_key         => 'registry',
+                path_key         => 'registry_path',
+                default_path     => $path,
+                exists_fn        => $exists_fn,
+                read_fn          => $read_file_fn,
+                missing_is_error => 0,
+                errors           => \@errors,
+                label            => 'registry',
+                code_missing     => undef,
+                code_unreadable  => 'registry-unreadable',
+                code_unparseable => 'registry-unparseable',
+            );
+            next unless $attempted;
+            if (ref $raw eq 'HASH') {
+                $candidate_reg //= $raw;
+                $ingest_registry->($raw);
+            } else {
+                push @errors, { code => 'registry-shape',
+                                detail => "registry is not a JSON object: $path" };
+            }
+        }
+    }
+
     # ---- §2.5.2 step 4: ccpraxis-install (source d) ----------------------
     {
         my $install;
         if (defined $reg) {
             $install = eval { live_install_dir({ registry => $reg }) };
+        } elsif (defined $candidate_reg) {
+            # q04 §2.3: when the primary registry is missing or poisoned but a
+            # candidate home yielded one, derive the ccpraxis-install root from
+            # THAT rather than falling through to the ambient-filesystem
+            # branch. Losing this root is exactly the shrinkage Decision #6
+            # forbids.
+            $install = eval { live_install_dir({ registry => $candidate_reg }) };
         } else {
             $install = eval { live_install_dir({}) };
         }
         $install = undef if $@;
         if (defined $install) {
-            my $n = _ingest_path($install);
+            my $n = _ingest_path($install, $opts);
             push @candidates, { path => $n, reason => 'ccpraxis-install' } if defined $n;
         }
     }
@@ -659,18 +747,58 @@ sub protected_roots {
 
     # Same "was attempted" gate as the registry block above -- an explicit
     # `extra_list => undef` is "supplied but broken", not "not supplied"
-    # (reviewer M1's direct sibling for extra-list-shape).
-    if (ref $extra_raw eq 'ARRAY') {
-        for my $el (@$extra_raw) {
-            my $n = _ingest_path($el);
+    # (reviewer M1's direct sibling for extra-list-shape). Factored into a
+    # closure for the same reason as $ingest_registry: q04 §2.3 applies it to
+    # every extra list the home-candidate set discovers, not only the primary.
+    my $ingest_extra_list = sub {
+        my ($list) = @_;
+        for my $el (@$list) {
+            my $n = _ingest_path($el, $opts);
             if (defined $n) {
                 push @candidates, { path => $n, reason => 'user-configured' };
             } else {
                 push @errors, { code => 'extra-list-entry', detail => 'extra-list element is not a usable path' };
             }
         }
+    };
+
+    if (ref $extra_raw eq 'ARRAY') {
+        $ingest_extra_list->($extra_raw);
     } elsif ($extra_attempted) {
         push @errors, { code => 'extra-list-shape', detail => 'extra list is not a JSON array' };
+    }
+
+    # q04 §2.3, the extra list's half: identical argument to the registry's.
+    # Decision #5's user list must not be voidable by a redirected HOME either
+    # -- the launcher pins an explicit `extra_list_path` precisely because
+    # CLAUDE_CONFIG_DIR could otherwise silently empty it, and this closes the
+    # same hole on the module's own default.
+    unless (exists $opts->{extra_list}) {
+        my $primary = exists $opts->{extra_list_path} ? $opts->{extra_list_path} : $extra_default;
+        for my $path (_candidate_source_paths('ccpraxis-protected-paths.json',
+                                              \@home_candidates, $primary)) {
+            my ($raw, $attempted) = _acquire_json_source(
+                opts             => {},
+                data_key         => 'extra_list',
+                path_key         => 'extra_list_path',
+                default_path     => $path,
+                exists_fn        => $exists_fn,
+                read_fn          => $read_file_fn,
+                missing_is_error => 0,
+                errors           => \@errors,
+                label            => 'extra list',
+                code_missing     => undef,
+                code_unreadable  => 'extra-list-unreadable',
+                code_unparseable => 'extra-list-unparseable',
+            );
+            next unless $attempted;
+            if (ref $raw eq 'ARRAY') {
+                $ingest_extra_list->($raw);
+            } else {
+                push @errors, { code => 'extra-list-shape',
+                                detail => "extra list is not a JSON array: $path" };
+            }
+        }
     }
 
     # ---- §2.5.2 step 6: resolve, reject, de-duplicate, sort ---------------

@@ -30,16 +30,41 @@ the same file the launcher treats as authoritative everywhere else, so this guar
 the launcher can never disagree about what is installed. Passing `CLAUDE_CONFIG_DIR` does not change
 which registry file is read.
 
-**Known limitation — redirecting `HOME`.** The pin above is relative to `HOME`, so a process that
-launches `claude-sandbox` with `HOME` pointing somewhere else reads a different (or absent) registry
-and loses the `marketplace-install` and `marketplace-source` roots derived from it. Two of the
-highest-value roots are deliberately **not** exposed to this: the `claude-home` root is resolved
-against the OS-authoritative home (`getpwuid` on POSIX) rather than `HOME`, and the
-`ccpraxis-install` root is additionally supplied by the launcher's own `abs_path(__FILE__)` anchor,
-which no environment variable can move. On Windows there is no `getpwuid`, so the `claude-home`
-half of that mitigation does not apply there and only the `abs_path(__FILE__)` anchor holds.
-Closing the remainder requires the root resolver itself to derive a home candidate without trusting
-the environment; that lives in `ProtectedPaths.pm` and is tracked as follow-up work, not fixed here.
+**Every root is resolved, not merely normalised.** Each candidate root is put through the same
+resolution the target already gets (the launcher `abs_path`s the project path before asking), so a
+protected root reached through a symlink is matched rather than missed. If `~/.claude` is a symlink
+to `/data/claude`, the root recorded is `/data/claude`, and asking to sandbox `/data/claude` refuses.
+Resolution happens once, when the root is ingested — before the bare-root and home rejections below,
+so a symlink pointing at `/` or at your home cannot slip past them, and before de-duplication, so
+two symlinks to one real directory collapse into one root instead of two.
+
+**Redirecting `HOME` no longer shrinks the protected set.** Launching with `HOME` pointing somewhere
+else used to read a different (or absent) registry and silently lose every `marketplace-install` and
+`marketplace-source` root derived from it. The registry and extra-list *source* is now a **candidate
+set**, not a single path: the guard looks for `plugins/known_marketplaces.json` and
+`ccpraxis-protected-paths.json` under **every** home candidate it knows of — `CLAUDE_CONFIG_DIR`,
+`$HOME/.claude`, `$USERPROFILE/.claude`, and the home the operating system itself reports
+(`getpwuid`, independent of the environment) — and **unions** every root it finds. An explicitly
+supplied registry path (the launcher always supplies one) is still read, and is *added to* rather
+than replaced. A redirected `HOME` can therefore only ever add roots, never remove them, and
+over-refusal is the safe direction. The `ccpraxis-install` root is additionally supplied by the
+launcher's own `abs_path(__FILE__)` anchor, which no environment variable can move.
+
+*Residue, stated honestly:* the environment-independent home probe is the POSIX passwd database. It
+works on Linux, macOS **and** Git-for-Windows/MSYS2 perl (a Cygwin derivative, where the passwd
+database is implemented) — the earlier claim in this document that the mitigation was POSIX-only was
+wrong. On **native Windows perl** (`$^O eq 'MSWin32'`) there is no `getpwuid` and no PowerShell probe
+is shipped, so there the candidate set is only as wide as `CLAUDE_CONFIG_DIR`, `%USERPROFILE%` and
+`HOME` make it; `%USERPROFILE%` is the one a Windows process is least likely to have redirected, and
+the `abs_path(__FILE__)` anchor still holds regardless. The probe is also only adopted when the
+`.claude` directory it points at actually exists, so it invents no phantom roots.
+
+**A root that normalises to your home directory is rejected.** One malformed `installLocation` that
+climbs out of its directory (say `../../..`) can land exactly on `$HOME`, which would make *every*
+project on the machine a descendant of a protected root — and since there is no override (section 8),
+that is an unrecoverable outage rather than an inconvenience. Such a root is dropped with a
+`root-home-rejected` warning. The match is **exact only, never a descendant**: `~/.claude` *is* a
+descendant of your home and remains the guard's highest-value protected root.
 
 The Claude home is a **union**, not a precedence chain: if `CLAUDE_CONFIG_DIR`, `$HOME/.claude` and
 `$USERPROFILE/.claude` all resolve to different paths, all three are protected. A chain would let
