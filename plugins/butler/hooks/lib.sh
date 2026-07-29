@@ -175,7 +175,9 @@ bp_repeat_hash() {
   out=$(jq -S -c '
     def scrub: walk(
       if type == "string"
-      then (gsub("[[:space:]]+"; " ") | sub("^ "; "") | sub(" $"; ""))
+      then (if length > 2048
+            then (.[0:2048] | gsub("[[:space:]]+"; " ")) + "#" + (length|tostring)
+            else (gsub("[[:space:]]+"; " ") | sub("^ "; "") | sub(" $"; "")) end)
       else . end);
     [ (.tool_name // ""), ((.tool_input // {}) | scrub) ]
   ' <<<"$payload" 2>/dev/null)
