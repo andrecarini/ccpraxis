@@ -2174,10 +2174,40 @@ sub remediation_step {
     }
 
     # (v) exactly one blocking decision iff plan.escalate is non-empty (D8).
-    if (@{ $plan->{escalate} || [] }) {
-        my $n = scalar @{ $plan->{escalate} };
-        my @reasons = do { my %seen; grep { !$seen{$_}++ } map { $_->{escalation_reason} // '' } @{ $plan->{escalate} } };
-        queue_needs_you($runs, {
+    #
+    # F4 (red-team, HIGH): queue_needs_you dedupes on (package, kind) and RETURNS
+    # THE EXISTING PATH WITHOUT REWRITING IT. Building the payload from the
+    # per-call $plan->{escalate} DELTA therefore meant the first batch of
+    # escalations permanently owned the decision slot, and since _escalate_entry
+    # makes an entry terminal, every later escalation was silently swallowed --
+    # the fleet would quietly stop telling the operator about new problems while
+    # still looking healthy. Fix: derive the payload from the CUMULATIVE set (all
+    # entries currently in state 'escalated', plus this tick's delta for any
+    # bookkeeping escalation that carries no entry), and rewrite the existing
+    # decision file in place so the pending decision always reflects the CURRENT
+    # escalated set. Still exactly ONE file -- AC-25/AC-28 assert that.
+    my %esc_seen;
+    my @escalated_all;
+    for my $e (@{ (ref $plan->{queue} eq 'HASH' && ref $plan->{queue}{entries} eq 'ARRAY')
+                    ? $plan->{queue}{entries} : [] }) {
+        next unless ref $e eq 'HASH' && ($e->{state} // '') eq 'escalated';
+        next unless defined $e->{escalation_reason} && length $e->{escalation_reason};
+        my $k = $e->{finding_key} // $e->{id} // '';
+        next if $esc_seen{$k}++;
+        push @escalated_all, { finding_key => $e->{finding_key}, id => $e->{id},
+                               escalation_reason => $e->{escalation_reason},
+                               round => $e->{round}, action => $e->{action},
+                               finding => $e->{finding} };
+    }
+    for my $d (@{ $plan->{escalate} || [] }) {
+        next unless ref $d eq 'HASH';
+        my $k = $d->{finding_key} // '';
+        next if $esc_seen{$k}++;
+        push @escalated_all, $d;
+    }
+    if (@escalated_all) {
+        my $n = scalar @escalated_all;
+        my $rec = {
             kind       => 'remediation-escalation',
             package    => '_remediation',
             blueprint  => $bp,
@@ -2185,10 +2215,14 @@ sub remediation_step {
             ts         => _iso($now),
             manual     => 0,
             question   => "$n finding" . ($n == 1 ? '' : 's') . ' could not be auto-remediated',
-            context    => { findings => $plan->{escalate}, rounds_used => $plan->{queue}{rounds_used},
+            context    => { findings => \@escalated_all, rounds_used => $plan->{queue}{rounds_used},
                              rounds_cap => $ctx{cap}, queue => 'runs/remediation-queue.json' },
             created_at => $now,
-        });
+        };
+        my $path = queue_needs_you($runs, $rec);
+        # On a dedupe hit the record was NOT written; refresh it in place so the
+        # operator sees the current set rather than a stale first snapshot.
+        _write_json_atomic($path, $rec) if defined $path && -e $path;
     }
 
     # (vi) rotate the verdict + re-arm b05's gate: only when a round actually
