@@ -72,9 +72,9 @@ is on the wake-lock lifecycle that Candidate 4 depends on.
 
 ### Candidate 2 — native process spawn / console flash
 
-Verdict: EXCLUDED-BY-EVIDENCE
+Verdict: NOT-EXCLUDED
 
-A full census of periodic Windows-native spawns was taken (report Finding D):
+A census of periodic Windows-native spawns was taken (report Finding D):
 
 - `_powershell_json` (`launcher.pl:4045-4052`) — `` powershell.exe -NoProfile -NonInteractive -Command "$cmd" 2>/dev/null ``,
   with **no window-suppression flag**. Driven by three probes (`cim_mem`, `cim_cpu`, `cim_disk`,
@@ -89,18 +89,51 @@ A full census of periodic Windows-native spawns was taken (report Finding D):
   `_keepawake_reap_orphan`) and `taskkill.exe /PID <pid> /F /T` (`:3914`) — no window flag, but
   fires once per dashboard entry, not periodically.
 
-Every one of these spawns lacks `-WindowStyle`. A console child inheriting an existing console does
-not normally create or flash a visible window of its own, and — decisively — none of these
-instructs a `ShowWindow` call on the shared console the way `-WindowStyle Hidden` does. That
-asymmetry is exactly what isolates `launcher.pl:3878` (Candidate 1's spawn) as the interesting site
-and leaves the rest of this census merely frequent but inert with respect to window state. This is
-excluded by an observed fact — the absence of any window-affecting flag across the entire spawn
-census — not by assumption.
+(This census is not, and does not claim to be, a "full" enumeration of every Windows-native spawn in
+the tree: `_spawn_session` (`launcher.pl:4188`) also spawns `powershell.exe -NoProfile
+-ExecutionPolicy Bypass -File $SANDBOX_PS1 --session $PROJECT_PATH` with no `-WindowStyle` either,
+but it is hotkey-triggered rather than periodic, and it deliberately opens a **new** Windows Terminal
+window via `wt.exe` rather than touching the shared console, so it does not bear on "recurring,
+no known trigger" the way the four sites above do; it is out of scope for that reason, not omitted
+by oversight.)
+
+Every one of these spawns lacks `-WindowStyle`. The original draft of this section treated that
+absence as decisive on its own — reasoning that "a console child inheriting an existing console does
+not normally create or flash a visible window of its own" and therefore none of this census could
+affect window state. That premise was uncited, and on inspection this document's own evidence cuts
+against it rather than supporting it: `launcher.pl:3846` states plainly that "the host perl is
+Git-for-Windows (cygwin) perl with no Win32::API", and the file is saturated with
+Cygwin/MSYS2-specific workarounds for exactly this boundary (`MSYS2_ARG_CONV_EXCL`, `:122`, `:3876`,
+`:3910`, `:4035`). A Cygwin/MSYS2 process spawning a native, non-Cygwin Win32 console executable —
+every spawn in this census is one — does not straightforwardly "inherit" a native console the way a
+plain Win32 parent/child pair does, because the Cygwin/MSYS pty layer is not itself a native Win32
+console; this is the exact boundary `winpty` exists to paper over for interactive Cygwin/MSYS
+console-app spawning. That means Windows allocating a **new** console for the child — independent of
+any `-WindowStyle` flag, because none of these call sites pass one — is a live possibility for this
+runtime, not something the absence-of-flag observation rules out.
+
+To be precise about what is and is not being claimed here: this document does **not** now assert
+that a console is confirmed to flash, only that the reasoning previously used to exclude it does not
+hold, so the honest verdict is `NOT-EXCLUDED`, not a new confirmation. Whether an allocated console
+is ever actually **visible** (as opposed to allocated-and-immediately-obscured, or never rendered at
+all under the operator's actual terminal host) is unverified from this container and depends on
+console topology — classic conhost, ConPTY-backed Windows Terminal, or Git Bash's mintty (Limits item
+1) — each of which sits in a different relationship to a natively-spawned child's console. If the
+operator runs Windows Terminal over ConPTY specifically, the topology differs again from the
+mintty/winpty case the Cygwin literature describes, so this candidate's fate is genuinely undecided
+pending that operator input, not merely awaiting confirmation of a foregone conclusion.
+
+This also reorders how the candidates should be weighed pending that input: `_powershell_json` alone
+fires roughly 3 spawns / 23 s, or **~470 spawns/hour**, versus Candidate 4/Finding E's handful of
+multi-hour gaps (three gaps across four multi-hour logs). If Cygwin-spawn console allocation is
+visible on the operator's actual setup, this candidate fits "recurring, no known trigger" markedly
+better than Finding E does, on frequency alone — see `## Conclusion` below.
 
 (Separately, `.ccpraxis-local-data/claude-home/.launcher/keepawake.pid` exists on disk right now —
 a helper recorded its Windows PID and the file outlived it, consistent with a launcher exit that
 skipped the normal `_keepawake_stop` unlink path at `launcher.pl:3895`. This is a housekeeping
-artifact, not evidence of window manipulation, and does not change this verdict.)
+artifact, not evidence of window manipulation one way or the other, and does not change this
+verdict.)
 
 ### Candidate 3 — window-manipulation escape sequences
 
@@ -157,8 +190,10 @@ implements `CSI 2 t` at all) — see `## Operator requests` below.
 
 Verdict: NOT-EXCLUDED
 
-This is the report's leading candidate, built from **Finding E**, and reframes "external Windows
-mechanism" from "not our bug" to "an external mechanism our own bug triggers".
+This is the report's leading candidate **on current evidence** — see the reassessment of Candidate 2
+above, which may fit the recurrence profile better if console allocation proves visible on the
+operator's setup — built from **Finding E**, and reframes "external Windows mechanism" from "not our
+bug" to "an external mechanism our own bug triggers".
 
 `keep-awake.ps1` asserts `ES_DISPLAY_REQUIRED` (`keep-awake.ps1:47`) — it holds the **display**
 awake, not just the system. Every interval in which the helper process is dead is an interval in
@@ -211,7 +246,8 @@ in the same log set (owned by `s17`'s fork-frequency diagnosis). So a transient 
 failure, not idleness, is producing some of the display-sleep windows above — see sub-finding B2
 under `## Follow-on packages`.
 
-**Verdict rationale:** not excluded, and the leading candidate, but it is inference from measured
+**Verdict rationale:** not excluded, and the leading candidate on current evidence (though see
+Candidate 2's reassessment above), but it is inference from measured
 gap durations plus known Windows display-sleep behaviour, not a direct demonstration that a real
 minimize happened inside one of these windows. What would settle it — a single observed minimize
 timestamp checked against these gaps — is Limits item 4, requested below.
@@ -220,22 +256,32 @@ timestamp checked against these gaps — is Limits item 4, requested below.
 
 Cause identified: NO
 
-Narrowed to: the surviving candidates are Candidate 3 (window-manipulation escape sequences —
-Findings A/C, `launcher.pl:3306`/`:3322`, `NOT-EXCLUDED`) and Candidate 4 (external Windows
-mechanism triggered by our own wake-lock gaps — Finding E, `NOT-EXCLUDED` and the leading
-candidate). Candidates 1 (content) and 2 are excluded by direct evidence; Candidate 1's
+Narrowed to: the surviving candidates are Candidate 2 (native process spawn / console flash under
+Cygwin/MSYS2 — Finding D, `NOT-EXCLUDED`; the doc's earlier exclusion rested on an uncited premise
+this document's own evidence contradicts, per `launcher.pl:3846`), Candidate 3 (window-manipulation
+escape sequences — Findings A/C, `launcher.pl:3306`/`:3322`, `NOT-EXCLUDED`), and Candidate 4
+(external Windows mechanism triggered by our own wake-lock gaps — Finding E, `NOT-EXCLUDED`, the
+leading candidate on current evidence but see Candidate 2, which fits the recurrence profile better —
+~470 spawns/hour versus a handful of multi-hour gaps — if console allocation proves visible on the
+operator's setup). Candidate 1 (content) alone is excluded by direct evidence; Candidate 1's
 spawn/lifecycle half remains an unverified hypothesis that, even if true, does not by itself account
-for minimize-to-taskbar (its mechanism, `SW_HIDE`, vanishes windows rather than minimizing them).
+for minimize-to-taskbar (its mechanism, `SW_HIDE`, vanishes windows rather than minimizing them). That
+`keep-awake.ps1` cannot itself manipulate a window (Candidate 1, content) does not remove the script
+from the causal story: its `ES_DISPLAY_REQUIRED` contract (`keep-awake.ps1:47`) is the mechanism
+behind Candidate 4, so the two verdicts describe different causal routes through the same file, not a
+dismissal of it.
 
 Evidence needed: a single operator-observed minimize event, timestamped, cross-checked against (a)
 whether the operator's terminal actually implements `CSI 2 t` iconify at all (Limits item 2 — the
 cheapest, most decisive test available; a negative result excludes Candidate 3 outright), and (b)
 whether the timestamp falls inside or within roughly a minute of one of the measured wake-lock-absent
-windows from Finding E (Limits item 4). Also needed, to fully resolve Candidate 1: which console
-topology (conhost / ConPTY / mintty) the operator's terminal uses (Limits item 1), and whether
-`-WindowStyle Hidden` visibly affects that operator's window at all (Limits item 3). None of these
-four data points can be produced from this container; all four require either the operator's own
-terminal or a real Windows host.
+windows from Finding E (Limits item 4). Also needed, to fully resolve Candidates 1 and 2: which
+console topology (conhost / ConPTY / mintty) the operator's terminal uses (Limits item 1) — this
+single fact both settles whether `-WindowStyle Hidden` can affect Candidate 1's spawn and whether a
+Cygwin-spawned native console (Candidate 2) is ever rendered visible under that topology — and
+whether `-WindowStyle Hidden` visibly affects that operator's window at all (Limits item 3). None of
+these four data points can be produced from this container; all four require either the operator's
+own terminal or a real Windows host.
 
 ## Recommended fix
 

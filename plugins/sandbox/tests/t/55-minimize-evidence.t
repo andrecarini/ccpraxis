@@ -277,16 +277,42 @@ SKIP: {
 }
 
 # =====================================================================
-# AC-9 -- Follow-on packages: >=2 '### Follow-on:' entries, at least one
-# mentioning 'A2', at least one mentioning 'B2'.
+# AC-9 -- Follow-on packages: >=2 '### Follow-on:' entries, and (spec
+# section 2.7) EACH entry individually must carry non-empty 'Defect:',
+# 'Fix sketch:' and 'Files:' lines -- not just the section as a whole,
+# which would let one entry carry both the 'A2'/'B2' markers while a
+# second entry is an empty stub. 'A2'/'B2' are likewise matched per
+# entry, not section-wide, so a stub entry cannot ride along on a
+# marker that actually lives in a different, well-formed entry.
 # =====================================================================
 my ($followon_body) = $content =~ /^## Follow-on packages\s*$(.*?)(?=^##[ \t]|\z)/ms;
 $followon_body //= '';
 
-my $followon_count = () = $followon_body =~ /^### Follow-on:[ \t]*\S/mg;
-ok($followon_count >= 2, "AC-9: '## Follow-on packages' has at least two '### Follow-on:' entries (found $followon_count)");
-like($followon_body, qr/A2/, "AC-9: at least one follow-on entry mentions the literal substring 'A2'");
-like($followon_body, qr/B2/, "AC-9: at least one follow-on entry mentions the literal substring 'B2'");
+my @followon_entries = $followon_body =~ /^(### Follow-on:[ \t]*\S.*?)(?=^### Follow-on:[ \t]*\S|\z)/msg;
+
+ok(scalar(@followon_entries) >= 2,
+    "AC-9: '## Follow-on packages' has at least two '### Follow-on:' entries (found " . scalar(@followon_entries) . ")");
+
+my ($any_a2, $any_b2) = (0, 0);
+for my $i (0 .. $#followon_entries) {
+    my $entry = $followon_entries[$i];
+    my $label = "entry " . ($i + 1);
+
+    my ($defect) = $entry =~ /^Defect:[ \t]*(.+?)\s*$/m;
+    ok(defined $defect && length $defect, "AC-9: Follow-on $label has a non-empty 'Defect:' line");
+
+    my ($sketch) = $entry =~ /^Fix sketch:[ \t]*(.+?)\s*$/m;
+    ok(defined $sketch && length $sketch, "AC-9: Follow-on $label has a non-empty 'Fix sketch:' line");
+
+    my ($files) = $entry =~ /^Files:[ \t]*(.+?)\s*$/m;
+    ok(defined $files && length $files, "AC-9: Follow-on $label has a non-empty 'Files:' line");
+
+    $any_a2 = 1 if $entry =~ /A2/;
+    $any_b2 = 1 if $entry =~ /B2/;
+}
+
+ok($any_a2, "AC-9: at least one well-formed follow-on entry mentions the literal substring 'A2'");
+ok($any_b2, "AC-9: at least one well-formed follow-on entry mentions the literal substring 'B2'");
 
 # =====================================================================
 # AC-10 -- Operator requests: exactly four numbered items (1. .. 4.), at
