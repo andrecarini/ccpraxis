@@ -2337,10 +2337,17 @@ sub _recover_stage_catalog {
 # container-start because an empty container probe is ambiguous (removed vs
 # unreadable) until the machine's liveness is known -- that is exactly what
 # classify_container_state keys off. heartbeat-reattach must follow
-# container-start IMMEDIATELY because the container entrypoint reaps itself ~10s
-# after start unless /tmp/.launcher-alive is touched; a stage inserted between
-# the two would let a recovery start the container and then dawdle into its own
-# reaping.
+# container-start IMMEDIATELY so the heartbeat is re-established promptly: the
+# container entrypoint reaps itself once /tmp/.launcher-alive goes stale, and a
+# stage inserted between the two would let a recovery start the container and
+# then dawdle before re-arming the sentinel it depends on.
+#
+# MINOR-2 (red-team step 6) -- this used to justify the adjacency with a "~10s
+# startup grace". That number was fiction, off by 60x: container/heartbeat.sh:26-27
+# sets HB=600 and STARTUP_GRACE=600, i.e. TEN MINUTES. The ordering is still
+# right (touching early is unconditionally correct and costs nothing); only the
+# cliff it invoked never existed. Do not reason about stage insertion from a
+# 10-second budget.
 sub recover_plan {
     my ($state) = @_;
     $state = {} unless ref($state) eq 'HASH';
@@ -2372,6 +2379,92 @@ sub classify_container_state {
     return 'unknown';                                        # machine down/absent -> can't tell
 }
 
+# _machine_boolish($v) -> 1 | 0 | undef (PRIVATE, pure). The ONE place a
+# podman-machine liveness flag is turned into a decision. undef means "this
+# field was absent or says nothing I recognise" -- deliberately distinct from 0,
+# because the caller must be able to fall through to the next spelling and
+# ultimately to 'unknown' instead of inventing a confident 'stopped'.
+#
+# Perl truthiness alone is NOT good enough here (red-team step 6, MAJOR-2): a
+# podman build emitting the JSON STRING "false" reads as true under `if ($v)`,
+# so a stopped machine would report running. A JSON::PP::Boolean is a blessed
+# ref with an overloaded numification, so it is asked directly.
+sub _machine_boolish {
+    my ($v) = @_;
+    return undef unless defined $v;
+    return ($v ? 1 : 0) if ref $v;                  # JSON::PP::Boolean (overloaded)
+    return 1 if $v =~ /^\s*(?:1|true|yes|on)\s*$/i;
+    return 0 if $v =~ /^\s*(?:0|false|no|off)?\s*$/i;
+    return undef;
+}
+
+# classify_machine_state($raw, $capable) -> running|starting|stopped|absent|
+# unknown|n/a (PUBLIC, pure; never dies, never warns).
+#
+#   $raw      the raw bytes of `podman machine list --format json`. undef and ''
+#             are LEGAL inputs -- the probe failed, timed out, or was never run.
+#   $capable  does this platform HAVE a podman machine at all? (false on docker
+#             and on Linux-native podman, where 'n/a' is the honest answer and
+#             wins over everything the bytes might say).
+#
+# This is the pure half of launcher.pl's _machine_state, split out so it can be
+# tested behaviourally -- launcher.pl is not loadable by a test, which is exactly
+# how four MAJOR defects survived a green suite (red-team step 6).
+#
+# SELECTION (MAJOR-1). `podman machine start` takes no name and acts on the
+# DEFAULT machine, so the reading must describe the default machine, never "any
+# machine that happens to be running". The rule is Resources::parse_machine_list's
+# (Resources.pm:97-114) verbatim: the element with a truthy `Default` wins
+# regardless of position, else the first HASH element. A host with a second,
+# hand-made machine running while ours is down must read 'stopped' -- reading
+# 'running' there routes the user into a rebuild that `rm -f`s a healthy
+# container.
+#
+# FIELD READ (MAJOR-2/MAJOR-3). `Starting` is read FIRST and is its own answer:
+# a machine mid-auto-start after a host resume is neither running nor stopped,
+# and calling it 'stopped' makes [l] fire a `podman machine start` that exits 125.
+# `Running` is next, boolean-ish only. The `State` / `Status` spellings other
+# podman versions emit are the fallback. If NONE of the four is present the
+# answer is 'unknown' -- never a confident 'stopped', which would paint a
+# permanent red "podman machine is stopped" banner over a healthy sandbox.
+sub classify_machine_state {
+    my ($raw, $capable) = @_;
+    return 'n/a' unless $capable;
+    return 'unknown' unless defined $raw && !ref($raw) && length $raw;
+
+    my $data = eval { JSON::PP::decode_json($raw) };
+    return 'unknown' if $@ || ref($data) ne 'ARRAY';
+    return 'absent' unless @$data;
+
+    my ($pick, $first);
+    for my $el (@$data) {
+        next unless ref($el) eq 'HASH';
+        $first = $el unless defined $first;
+        if ($el->{Default}) { $pick = $el; last; }
+    }
+    $pick = $first unless defined $pick;
+    return 'unknown' unless ref($pick) eq 'HASH';   # nothing selectable in the list
+
+    my $starting = _machine_boolish($pick->{Starting});
+    return 'starting' if defined $starting && $starting;
+    my $running = _machine_boolish($pick->{Running});
+    return 'running' if defined $running && $running;
+    return 'stopped' if defined $running;
+
+    for my $k (qw(State Status)) {
+        my $v = $pick->{$k};
+        next unless defined $v && !ref($v);
+        $v = lc $v;
+        $v =~ s/^\s+//;
+        $v =~ s/\s+$//;
+        next unless length $v;
+        return 'running'  if $v eq 'running';
+        return 'starting' if $v eq 'starting';
+        return 'stopped';
+    }
+    return 'unknown';   # unrecognised schema -> say so, do not guess 'stopped'
+}
+
 # _recover_status_alias($state) -> the ledger's {status} vocabulary (PRIVATE,
 # pure). s11's {state} stays canonical (lifecycle_alert_msg and s11's immutable
 # oracle read it); this alias is what the recovery-seam contract promises s03.
@@ -2384,15 +2477,18 @@ sub _recover_status_alias {
     return 'failed';
 }
 
-# _recover_machine_vocab($s) -> one of running|stopped|absent|unknown|n/a
-# (PRIVATE, pure). Anything a machine_status seam reports outside the vocabulary
-# degrades to 'unknown', which is deliberately NOT fatal -- the machine-start
-# stage then simply attempts the start.
+# _recover_machine_vocab($s) -> one of running|starting|stopped|absent|unknown|
+# n/a (PRIVATE, pure). The vocabulary is classify_machine_state's, unchanged.
+# Anything a machine_status seam reports outside it degrades to 'unknown', which
+# is deliberately NOT fatal -- the machine-start stage then simply attempts the
+# start, and a FAILED attempt on that uncertain reading does not abort the
+# recovery either (see the machine-start branch of run_recover_stages).
 sub _recover_machine_vocab {
     my ($s) = @_;
     $s = '' unless defined $s;
     $s = lc $s;
-    return $s if $s eq 'running' || $s eq 'stopped' || $s eq 'absent' || $s eq 'n/a';
+    return $s if $s eq 'running'  || $s eq 'starting' || $s eq 'stopped'
+              || $s eq 'absent'   || $s eq 'n/a';
     return 'unknown';
 }
 
@@ -2482,8 +2578,14 @@ sub run_recover_stages {
                 }
             }
             elsif ($id eq 'machine-start') {
-                if    ($mstate eq 'running') { $st = 'skipped'; $detail = 'machine already running'; }
-                elsif ($mstate eq 'n/a')     { $st = 'skipped'; $detail = 'no podman machine on this platform'; }
+                # 'starting' skips for the SAME reason 'running' does (MAJOR-3):
+                # `podman machine start` against a VM that is already running OR
+                # ALREADY STARTING exits 125, and that failure would abort the
+                # whole recovery at stage 2 -- in the host-resume case the control
+                # exists for.
+                if    ($mstate eq 'running')  { $st = 'skipped'; $detail = 'machine already running'; }
+                elsif ($mstate eq 'starting') { $st = 'skipped'; $detail = 'machine already starting'; }
+                elsif ($mstate eq 'n/a')      { $st = 'skipped'; $detail = 'no podman machine on this platform'; }
                 elsif (ref($o{machine_start}) eq 'CODE') {
                     my $r = eval { $o{machine_start}->() };
                     if ($@) { $st = 'fail'; $detail = _chomp_err($@); }
@@ -2492,6 +2594,19 @@ sub run_recover_stages {
                         my $d = (defined $rr->{detail} && length $rr->{detail}) ? $rr->{detail} : '';
                         if    ($rr->{ok})      { $st = 'ok';      $detail = length($d) ? $d : 'machine started'; }
                         elsif ($rr->{timeout}) { $st = 'timeout'; $detail = length($d) ? $d : 'podman machine start timed out'; }
+                        # A failed start on an UNCERTAIN reading is NOT fatal
+                        # (MAJOR-3). We do not actually know the machine is down;
+                        # container-start is the authoritative test of that, and
+                        # an advisory probe must never gate the repair. The failure
+                        # is still REPORTED -- its text is carried into the detail,
+                        # not swallowed -- it just does not stop the sequence. A
+                        # CONFIDENT 'stopped'/'absent' reading keeps failing hard:
+                        # there we know the machine is down and could not start it.
+                        elsif ($mstate eq 'unknown') {
+                            $st = 'skipped';
+                            $detail = 'machine start not conclusive: '
+                                    . (length($d) ? $d : 'podman machine start failed');
+                        }
                         else                   { $st = 'fail';    $detail = length($d) ? $d : 'podman machine start failed'; }
                     }
                 }
@@ -2499,7 +2614,14 @@ sub run_recover_stages {
             }
             elsif ($id eq 'container-start') {
                 my $c = classify_container_state($state->{status}, $mstate);
-                if ($c eq 'running') { $st = 'skipped'; $detail = 'container already running'; }
+                # MINOR-3: $state->{status} is the launcher's THROTTLED inspect
+                # cache; a container that died inside that window still reads
+                # 'running'. status_stale is the caller's explicit "do not trust
+                # this reading to skip work" signal -- with it set we always call
+                # the seam, which re-probes authoritatively. Without it the plain
+                # 'running' shortcut stands (AC-12 pins that path).
+                my $stale = $state->{status_stale} ? 1 : 0;
+                if ($c eq 'running' && !$stale) { $st = 'skipped'; $detail = 'container already running'; }
                 elsif ($c eq 'absent') {
                     # R1: production does NOT wire container_create, so this is
                     # the branch a genuinely removed container takes in the TUI.
@@ -2679,6 +2801,16 @@ sub run {
     my $beat_int   = defined $o{beat_interval}  ? $o{beat_interval}  : 120;
     my $state_int  = defined $o{state_interval} ? $o{state_interval} : 2;
     my $tick_int   = defined $o{tick_interval}  ? $o{tick_interval}  : 0.2;
+    # MINOR-1 (red-team step 6): a wall-clock cooldown on the recover ACTION.
+    # "ly" is one of the commonest digraphs in English (only/really/finally), so
+    # pasting an ordinary paragraph into the dashboard otherwise fires one full
+    # recovery per occurrence, back to back -- each up to ~190s of a frozen,
+    # unrepainting TUI, each orphaning a `podman machine start` the next one
+    # races. The window is on the ACTION, never on the confirm, so the two-step
+    # [l][y] timing the oracle pins is untouched. Read through the SAME now()
+    # seam the loop uses, so a test never sleeps. Default is non-zero: a caller
+    # that configures nothing still gets amplification protection.
+    my $recover_cooldown = defined $o{recover_cooldown} ? $o{recover_cooldown} : 30;
 
     $enter_raw->();
 
@@ -2694,6 +2826,7 @@ sub run {
     my $activity_offset = 0;    # up/down scroll position in the Activity panel
     my $activity_max    = 0;    # scroll ceiling (set each frame by activity_window)
     my $flash_until = 0;        # footer-flash expiry (set when [c] hit a dead container)
+    my $last_recover_at;        # now() when the last [l] recovery FINISHED (undef: none yet)
     my $rc = 0;
     my $ticks = 0;
 
@@ -2826,7 +2959,28 @@ sub run {
                         $do_lifecycle->($full_shutdown, 'full-shutdown');
                     }
                     elsif ($action eq 'relaunch') {
+                        # MINOR-1: suppress a confirmed recover that lands inside
+                        # the cooldown window. Nothing is queued or retried -- the
+                        # press is simply dropped, with a banner so the key never
+                        # feels dead. The stamp is taken AFTER the sequence
+                        # returns, so the window measures idle time since the last
+                        # recovery FINISHED, not since it started (a 180s machine
+                        # start would otherwise clear a 30s window by itself).
+                        if (defined $last_recover_at
+                            && ($now->() - $last_recover_at) < $recover_cooldown) {
+                            $state{lifecycle} = {
+                                active => 0, mode => 'recover', state => 'skipped',
+                                index => 0, total => 0, detail => '',
+                                summary => 'not run - a recovery just finished'
+                                         . " (cooldown ${recover_cooldown}s); press [l] again in a moment",
+                            };
+                            my $sframe = compose_frame(\%state, $rows, $cols);
+                            $out->(render_frame($prev, $sframe, { color => $color }));
+                            $prev = $sframe;
+                            next;
+                        }
                         $do_lifecycle->($recover, 'recover');
+                        $last_recover_at = $now->();
                         # Force a heartbeat on the very NEXT tick. $hb_state is
                         # sticky and beat_interval defaults to 120s, so without
                         # this a SUCCESSFUL recover leaves container_gone (and

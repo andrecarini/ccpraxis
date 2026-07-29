@@ -3049,11 +3049,11 @@ sub _run_timed {
     return $@ ? undef : $out;
 }
 
-# _machine_state() -> 'running' | 'stopped' | 'absent' | 'unknown' | 'n/a'
-# (s12 spec 09 S2.8). The podman-machine reading that disambiguates an empty
-# container probe: with the machine up, "no such container" really means the
-# container was removed; with the machine down it means we simply cannot tell,
-# and a recovery must attempt the start rather than declare a rebuild
+# _machine_state() -> the podman-machine reading, as one of the six words
+# Dashboard::classify_machine_state defines (s12 spec 09 S2.8). It disambiguates
+# an empty container probe: with the machine up, "no such container" really means
+# the container was removed; with the machine down it means we simply cannot
+# tell, and a recovery must attempt the start rather than declare a rebuild
 # (Dashboard::classify_container_state consumes exactly this vocabulary).
 #
 # NEVER dies and never blocks forever: it is called from enter_dashboard's
@@ -3061,32 +3061,36 @@ sub _run_timed {
 # on the TUI's own thread of control. A wedged podman must degrade to 'unknown'
 # instead of freezing the dashboard, hence the _run_timed bound.
 #
-# The multi-key read (Running, then State/Status) is deliberate: the field names
-# `podman machine list --format json` emits differ across podman versions and
-# cannot be verified from inside this container, so all three spellings are
-# tolerated and anything unrecognised degrades to 'unknown'.
+# This is now only the IMPURE SHELL: run the bounded probe, hand the bytes over.
+# The parse moved to Dashboard.pm because launcher.pl is not loadable by a test
+# (spec S6/E2), so a parser living here can never have a behavioural oracle --
+# which is exactly how four MAJOR defects survived a 651/651 green suite
+# (red-team step 6). t/47 AC-31..AC-33 now cover the parse directly.
 sub _machine_state {
-    # Same platform guard gather() uses for machine_capable (:2986): docker, and
+    # DELEGATED CONTRACT (Dashboard::classify_machine_state, Dashboard.pm; the
+    # parse used to be open-coded right here). That helper decodes these bytes
+    # with decode_json inside its own eval; selects the DEFAULT machine -- the
+    # element with a truthy `Default`, else the first hash element, which is
+    # Resources::parse_machine_list's rule (Resources.pm:97-114) -- because
+    # `podman machine start` takes no name and acts on the default; reads
+    # `Starting` first, then a boolean-ish `Running`, then the `State` / `Status`
+    # spellings other podman versions emit; and answers exactly one of
+    # 'running', 'starting', 'stopped', 'absent', 'unknown' or 'n/a'. An
+    # unrecognised schema, an undecodable body and an empty probe all degrade to
+    # 'unknown' -- never to a confident 'stopped', which would paint a permanent
+    # "podman machine is stopped" banner over a healthy sandbox.
+    #
+    # Same platform guard gather() uses for machine_capable (:2991): docker, and
     # Linux-native podman, have no machine at all -- that is not a failure.
-    return 'n/a' unless ($PODMAN =~ /podman/i && $^O ne 'linux');
+    my $capable = ($PODMAN =~ /podman/i && $^O ne 'linux') ? 1 : 0;
+    return 'n/a' unless $capable;
     my $probe_timeout = ($ENV{SANDBOX_RECOVER_PROBE_TIMEOUT}
                          && $ENV{SANDBOX_RECOVER_PROBE_TIMEOUT} =~ /^\d+$/)
                         ? $ENV{SANDBOX_RECOVER_PROBE_TIMEOUT} : 10;
     my $out = _run_timed(qq{$PODMAN machine list --format json 2>/dev/null}, $probe_timeout);
-    return 'unknown' unless defined $out && length $out;
-    my $data = eval { require JSON::PP; JSON::PP::decode_json($out) };
-    return 'unknown' if $@ || ref($data) ne 'ARRAY';
-    return 'absent' unless @$data;
-    for my $m (@$data) {
-        next unless ref($m) eq 'HASH';
-        return 'running' if $m->{Running};
-        for my $k (qw(State Status)) {
-            my $v = $m->{$k};
-            next unless defined $v && !ref($v);
-            return 'running' if lc($v) eq 'running';
-        }
-    }
-    return 'stopped';
+    my $st  = eval { Dashboard::classify_machine_state($out, $capable) };
+    return 'unknown' if $@ || !defined $st || ref $st;
+    return $st;
 }
 
 # _lifecycle_run($mode, \%state, $progress) — s11-lifecycle-stop spec 08 S2.8:
