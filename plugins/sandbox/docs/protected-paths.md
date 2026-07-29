@@ -109,6 +109,21 @@ relation, a rule that only checked `exact`/`descendant` would leave the single h
 an installed root, so they get their own wording rather than being reported as "contains a
 marketplace" (which is nearly always technically true for `/` and `$HOME`, but useless advice).
 
+### Root-rejection codes
+
+These are **not** refusal reasons — they never appear as the reason a launch was refused, and never
+as a root's `reason`. They are warnings emitted while *building* the protected set, telling you a
+candidate root was thrown away or could not be resolved. They arrive on STDERR in the section 6
+format.
+
+| code | what it means | what to do about it |
+|---|---|---|
+| `root-bare-rejected` | a source offered a bare filesystem root (`/`, `C:/`) as a protected root, which would refuse every project on the volume | find the source named in the warning — usually a malformed `installLocation` in `known_marketplaces.json`, or a `"/"` entry in your extra list — and correct it |
+| `root-home-rejected` | a source offered your **home directory itself** as a protected root, which would refuse every project you own. Rejected on exact match only, so `~/.claude` stays protected | fix the offending entry named in the warning; a relative `installLocation` with `../..` segments that climbs out of the plugins directory is the usual cause |
+| `root-unresolved` | a root **exists** but could not be resolved to its real location — typically a broken symlink, or a directory whose parent you cannot traverse. The root is **kept** and still enforced, at its literal path | repair the symlink or the permissions; until then the root is matched literally, so a target reached by a *different* path to the same directory may not be recognised |
+
+A path that simply **does not exist** is not reported as `root-unresolved` — see section 6.
+
 ## 5. Which reason you get when several match
 
 When more than one protected root relates to the target, the guard picks exactly one `(reason,
@@ -148,6 +163,20 @@ broken source did not exist. Conversely, a broken source **alone is never fatal*
 `known_marketplaces.json` (a fresh Claude Code install with no marketplace registered) still launches
 normally for an ordinary project; it just loses the `marketplace-*` and `ccpraxis-install` roots that
 source would have contributed, and says so loudly.
+
+**When a root cannot be resolved.** Resolution (section 2) can fail for an individual root — a broken
+symlink, a parent directory you cannot traverse. When it does, the guard **degrades to the root's
+literal path and warns** (`root-unresolved`), and the root stays in the protected set and stays
+enforced. It is never dropped: dropping it would *shrink* the protected set, which is the one
+direction this guard is not allowed to fail in. The only thing lost is the ability to recognise that
+root under a *different* spelling of the same directory.
+
+**A path that does not exist is not an unresolvable path.** Protected roots routinely name
+directories that are simply absent — a marketplace you uninstalled, an extra-list entry for a
+checkout you have not made yet. Those are kept silently, with **no** warning: there is nothing to
+resolve, nothing is broken, and warning about them would nag on every otherwise-clean launch.
+`root-unresolved` is reserved for a path that *is* there and still could not be resolved, which is
+the case you can actually act on.
 
 ## 7. Using the extra list
 
