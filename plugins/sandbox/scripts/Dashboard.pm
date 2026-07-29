@@ -800,6 +800,7 @@ sub _fixed_panels {
     my $ny = (defined $s->{needs_you} && $s->{needs_you} =~ /^\d+$/) ? $s->{needs_you} : 0;
     my ($needs_text, $needs_role) = $ny > 0 ? ("$ny decision(s) waiting", 'warn') : ('none', 'muted');
     push @run, [ { text => 'needs you  : ', role => 'label' }, { text => $needs_text, role => $needs_role } ];
+    push @run, _run_lines($s->{runs});   # s10
     push @p, { title => 'Run', lines => \@run };
 
     # B4: backpack view — per-item approval state (#21). Present only when the
@@ -895,6 +896,83 @@ sub _backpack_lines {
         }
     }
     push @out, @{ wrap_spans([ { text => "+$n_words more", role => 'muted' } ], $w) };
+    return @out;
+}
+
+# _run_lines(\@runs) -> LIST of extra Run-panel body lines (possibly empty).
+# @runs is the RunState::summarize struct list (spec 07 S2.2, closed 11-key
+# set), passed through the gather hash with no arithmetic. Dashboard.pm must
+# NOT load the RunState module (no "use"/"require" of it anywhere) -- it
+# only renders the already-computed struct,
+# exactly as it does for tokens/resources. PRIVATE, pure, no file I/O, mirrors
+# _token_lines'/_resources_lines' style. Never dies for any input.
+#
+# $runs not an ARRAYREF, or an empty ARRAYREF (after skipping non-hashref
+# elements) -> the empty list. At most the first $RUN_MAX_ROWS surviving
+# summaries get a line; when more survive, one extra overflow line is
+# appended.
+our $RUN_MAX_ROWS = 3;
+
+# _run_int($v) -> a non-negative Int, or 0 for undef/ref/non-digit input
+# (private helper for _run_lines' numeric fields).
+sub _run_int {
+    my ($v) = @_;
+    return (defined($v) && !ref($v) && $v =~ /^\d+$/) ? ($v + 0) : 0;
+}
+
+# _run_state_role($state) -> the S2.10a role for a run-summary state span.
+my %RUN_STATE_ROLE = ( running => 'good', paused => 'warn', parked => 'warn', idle => 'muted' );
+sub _run_state_role {
+    my ($state) = @_;
+    return $RUN_STATE_ROLE{$state} // 'muted';
+}
+
+# _one_run_line(\%summary) -> \@spans (private) -- the S2.10 exact span
+# composition for one RunState summary.
+sub _one_run_line {
+    my ($s) = @_;
+    my $bp = (defined($s->{blueprint}) && !ref($s->{blueprint}) && length($s->{blueprint}))
+           ? $s->{blueprint} : '?';
+    my @spans;
+    push @spans, { text => "$bp : ", role => 'accent' };
+
+    my $state = (defined($s->{state}) && !ref($s->{state}) && length($s->{state}))
+              ? $s->{state} : '?';
+    push @spans, { text => $state, role => _run_state_role($state) };
+
+    my $done  = _run_int($s->{packages_done});
+    my $total = _run_int($s->{packages_total});
+    push @spans, { text => sprintf('  %d/%d pkg', $done, $total), role => 'value' };
+
+    if (defined($s->{current_package}) && !ref($s->{current_package}) && length($s->{current_package})) {
+        push @spans, { text => "  cur $s->{current_package}", role => 'strong' };
+    }
+
+    my $coord = _run_int($s->{running_coordinators});
+    push @spans, { text => sprintf('  %d coord', $coord), role => 'accent' } if $coord > 0;
+
+    my $waiting = _run_int($s->{decisions_waiting});
+    if ($waiting > 0) {
+        push @spans, { text => sprintf('  %d waiting', $waiting), role => ($state eq 'paused' ? 'bad' : 'warn') };
+    }
+
+    return \@spans;
+}
+
+sub _run_lines {
+    my ($runs) = @_;
+    return () unless ref($runs) eq 'ARRAY';
+    my @summaries = grep { ref($_) eq 'HASH' } @$runs;
+    return () unless @summaries;
+
+    my @out;
+    my $shown = (@summaries < $RUN_MAX_ROWS) ? scalar(@summaries) : $RUN_MAX_ROWS;
+    push @out, _one_run_line($summaries[$_]) for (0 .. $shown - 1);
+
+    if (@summaries > $RUN_MAX_ROWS) {
+        my $extra = @summaries - $RUN_MAX_ROWS;
+        push @out, [ { text => sprintf('  +%d more blueprint(s)', $extra), role => 'muted' } ];
+    }
     return @out;
 }
 

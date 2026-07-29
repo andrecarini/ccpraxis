@@ -50,6 +50,7 @@ use LaunchLog ();   # B1: durable per-launch diagnostic log (next to us in scrip
 use Dashboard ();   # B2: the raw-ANSI TUI dashboard framework
 use TokenInfo ();   # s08: pure access/refresh token status struct for the dashboard
 use Resources ();   # s09: pure resource-probe parsers + the injectable probe seam
+use RunState ();    # s10: pure orchestrator/run-state summarizer for the dashboard
 use BackpackApproval ();  # #21: per-item, machine-local backpack approval memory
 use BackpackReview ();    # #21: the I/O-seam-injected interactive approval walk
 use KeepAwake ();         # B5: dashboard wake-lock decision + lifecycle holder
@@ -2822,6 +2823,7 @@ sub enter_dashboard {
     my $cached_oauth_expires_at = undef;   # 01-oauth: epoch-s when the OAuth token expires
     my $cached_tokens           = undef;   # s08: TokenInfo struct
     my $cached_resources        = undef;   # s09: Resources::build struct (never undef after the first round)
+    my $cached_runs             = [];      # s10: RunState::summarize struct, initialised to [] so the "runs" key is never undef
     my $last_inspect            = 0;
     my $last_resources          = 0;       # s09: stamp for the throttled probe cadence
     my $bp_host_file      = "$CLAUDE_DATA/backpack.json";
@@ -2922,6 +2924,7 @@ sub enter_dashboard {
                 $cached_backpack   = _gather_backpack($bp_host_file, $bp_appr_file);  # B4
                 $cached_oauth_expires_at = _gather_oauth_expiry();
                 $cached_tokens = _gather_tokens();
+                $cached_runs   = _gather_runs($PROJECT_PATH);   # s10
                 $last_inspect  = $now;
             }
             # s09: the expensive resource probes run on their OWN, slower
@@ -2960,6 +2963,7 @@ sub enter_dashboard {
                 oauth_expires_at => $cached_oauth_expires_at,
                 tokens           => $cached_tokens,
                 resources        => $cached_resources,
+                runs             => $cached_runs,
             };
         },
         keepawake => sub {
@@ -3127,6 +3131,16 @@ sub _count_needs_you {
     }
     closedir $bd;
     return $n;
+}
+
+# _gather_runs($project) -> ARRAYREF of RunState summaries (never undef).
+# Read-only; no writes, no spawning, no logging of file contents. Cheap disk
+# reads, so it rides the same 10s cadence as _count_needs_you/_gather_backpack/
+# _gather_tokens above -- deliberately NOT the slower Resources::should_sample
+# cadence, which exists to throttle expensive podman-exec probes (s10).
+sub _gather_runs {
+    my ($project) = @_;
+    return RunState::summarize("$project/.ccpraxis-local-data/blueprints");
 }
 
 # _gather_backpack($bp_file, $appr_file) -> { total, approved, items=>[{key,
