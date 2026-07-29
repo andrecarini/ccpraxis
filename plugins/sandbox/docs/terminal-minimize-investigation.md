@@ -264,7 +264,7 @@ This is a recommendation only; neither `launcher.pl`, `Dashboard.pm`, `KeepAwake
 ## Follow-on packages
 
 ### Follow-on: keep-awake-probe-failure-handling
-Defect: A2 is not this entry's subject, but B2 is — the busy-lease probe (`launcher.pl:3385`)
+Defect: B2 — the busy-lease probe (`launcher.pl:3385`)
 cannot distinguish a transient `podman exec` failure from a genuinely stale lease, so
 `should_stay_awake` (`KeepAwake.pm:37`) SIGKILLs the wake-lock helper on a transient failure alone,
 and the re-spawn (`launcher.pl:3877-3878`, carrying `-WindowStyle Hidden`) occurs seconds later once
