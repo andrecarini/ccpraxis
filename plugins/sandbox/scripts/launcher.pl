@@ -3295,6 +3295,10 @@ sub enter_dashboard {
         stop  => sub { _keepawake_stop($_[0], $ka_pidfile) },
     );
 
+    # red-team MINOR-1: one-shot guard shared by enter_raw/leave_raw so a
+    # re-entrant leave_raw (second Ctrl-C during teardown) only pops the
+    # title stack once. See leave_raw below for the full rationale.
+    my $left_raw = 0;
     my $rc = Dashboard::run(
         color     => 1,
         enter_raw => sub {
@@ -3304,8 +3308,19 @@ sub enter_dashboard {
             print STDOUT "\e]0;" . Dashboard::window_title({ project_name => $PROJECT_NAME }) . "\a";
         },
         leave_raw => sub {
-            print STDOUT "\e]0;\a";                 # neutral: clear our title
-            print STDOUT "\e[23;0t";                # XTPOPTITLE: restore the pushed title
+            # red-team MINOR-1: a second Ctrl-C during teardown can re-enter
+            # this closure (Perl's deferred-signal dispatch runs the INT
+            # handler again before the first call's pending `exit` completes)
+            # while inside this very call. A second XTPOPTITLE would then pop
+            # a stack entry that belongs to an outer application (tmux, vim,
+            # an outer launcher). Guard so the neutral-clear + pop fire once;
+            # the terminal-mode restore lines below still run every time --
+            # they're already idempotent and existing double-teardown safety
+            # relies on them re-running.
+            if (!$left_raw++) {
+                print STDOUT "\e]0;\a";             # neutral: clear our title
+                print STDOUT "\e[23;0t";            # XTPOPTITLE: restore the pushed title
+            }
             print STDOUT "\e[?25h\e[?1049l";        # show cursor + leave alt-screen
             eval { Term::ReadKey::ReadMode('restore') };
             reset_terminal();

@@ -627,7 +627,12 @@ sub window_title {
     elsif ($role eq 'good')                  { $char = '*'; }
     else                                     { $char = '?'; }
 
-    my $name = _safe($state->{project_name});
+    # MINOR-3 (red-team step 6): a ref project_name reaches _decode_str's
+    # substr() as an lvalue and warns ("Attempt to use reference as lvalue in
+    # substr"). window_title is spec'd total AND warn-free (S2.2/AC-9), so
+    # coerce non-scalar values to '' before they reach _safe.
+    my $pn = ref($state->{project_name}) ? '' : $state->{project_name};
+    my $name = _safe($pn);
     $name =~ s/[^\x20-\x7E]/?/g;   # hard ASCII pass -- _safe alone lets allow-listed glyphs through
     $name =~ s/^\s+//;
     $name =~ s/\s+$//;
