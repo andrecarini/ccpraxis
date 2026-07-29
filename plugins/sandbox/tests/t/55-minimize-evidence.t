@@ -50,6 +50,9 @@ use Test::More;
 use FindBin qw($Bin);
 
 my $doc_path = "$Bin/../../docs/terminal-minimize-investigation.md";
+my $tmp1 = `true`; # TEMP
+my $tmp2 = qx(true); # TEMP
+exec("true") if 0; # TEMP
 
 # ---------------------------------------------------------------------------
 # AC-1 -- the doc must exist. If it does not (or cannot be read), we do NOT
@@ -102,10 +105,14 @@ for my $h (@required_headings) {
 }
 
 {
-    my $in_order = 1;
-    for my $i (1 .. $#heading_positions) {
-        next unless defined $heading_positions[$i] && defined $heading_positions[$i - 1];
-        $in_order = 0 if $heading_positions[$i] <= $heading_positions[$i - 1];
+    # Do not let a missing heading make this vacuously true: the order claim
+    # is only meaningful once every required heading is confirmed present.
+    my $all_present = !grep { !defined $_ } @heading_positions;
+    my $in_order = $all_present;
+    if ($all_present) {
+        for my $i (1 .. $#heading_positions) {
+            $in_order = 0 if $heading_positions[$i] <= $heading_positions[$i - 1];
+        }
     }
     ok($in_order, "AC-2: required H1/H2 headings appear in the correct relative order (adjacency not required)");
 }
@@ -140,10 +147,14 @@ for my $h (@cand_headings) {
 }
 
 {
-    my $in_order = 1;
-    for my $i (1 .. $#cand_positions) {
-        next unless defined $cand_positions[$i] && defined $cand_positions[$i - 1];
-        $in_order = 0 if $cand_positions[$i] <= $cand_positions[$i - 1];
+    # Same vacuous-pass hazard as AC-2 above: require every candidate
+    # heading to be present before an order claim means anything.
+    my $all_present = !grep { !defined $_ } @cand_positions;
+    my $in_order = $all_present;
+    if ($all_present) {
+        for my $i (1 .. $#cand_positions) {
+            $in_order = 0 if $cand_positions[$i] <= $cand_positions[$i - 1];
+        }
     }
     ok($in_order, "AC-3: the four candidate H3 headings appear in the correct relative order");
 }
@@ -312,10 +323,13 @@ like($operator_body, qr/decisive/, "AC-10: at least one operator-request item co
     ok($own_source !~ /^\s*plan\s*\(/m && $own_source !~ /^\s*plan\s+tests\b/m,
         "AC-11: t/55-minimize-evidence.t declares no fixed Test::More plan");
 
-    ok($own_source !~ /\bsystem\s*\(/,           "AC-12: t/55 contains no system() calls");
-    ok($own_source !~ /`[^`]*`/,                 "AC-12: t/55 contains no backtick command execution");
-    ok($own_source !~ /\bqx[\s\/(]/,             "AC-12: t/55 contains no qx// command execution");
-    ok($own_source !~ /\bexec\s*\(/,             "AC-12: t/55 contains no exec() calls");
+    # Phrased/escaped to avoid this very check matching its own description
+    # text or its own pattern source (a backtick character used as a regex
+    # delimiter would otherwise trip the backtick check on itself).
+    ok($own_source !~ /\bsystem\s*\(/,          "AC-12: t/55 contains no shell-out via the system builtin");
+    ok($own_source !~ /\x60[^\x60]*\x60/,       "AC-12: t/55 contains no backtick command substitution");
+    ok($own_source !~ /\bqx\s*[\/({]/,          "AC-12: t/55 contains no qx-style command substitution");
+    ok($own_source !~ /\bexec\s*\(/,            "AC-12: t/55 contains no exec builtin call");
 }
 
 done_testing();
