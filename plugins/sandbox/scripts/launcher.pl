@@ -2541,9 +2541,21 @@ if (! _container_exists($CONTAINER_NAME)) {
 # =====================================================================
 #
 # The container's heartbeat-only ENTRYPOINT loop exits when the
-# /tmp/.launcher-alive sentinel goes stale (>HB=300s without a touch).
-# There is a 10s startup grace, after which the first missing sentinel
-# check causes rapid reap. If we did validate / list / prompt AFTER
+# /tmp/.launcher-alive sentinel goes stale without a touch.
+#
+# MINOR-2 (s12 red-team, step 6): the two numbers this comment used to
+# quote -- "HB=300s" and "a 10s startup grace" -- were BOTH wrong, and
+# this comment is where the error originated. container/heartbeat.sh:26-27
+# sets HB=600 and STARTUP_GRACE=600: ten MINUTES each, not 300s and not
+# 10s. Read the real values there rather than trusting a number quoted
+# here; during s12 this one stale comment propagated, in good faith,
+# through a scout report, a spec, a test name and two more code comments
+# before anyone checked it against heartbeat.sh.
+#
+# The ordering below is kept regardless, on its own merits: doing the
+# interaction first keeps the gap between `podman start` and the first
+# `podman exec` sub-second, which is unconditionally correct and free.
+# If we did validate / list / prompt AFTER
 # `podman start`, the user's read-and-press-y time could push past that
 # grace window and the subsequent `podman exec apt-get update` would
 # fail with "container state improper". Run all the interaction up here
@@ -2688,13 +2700,17 @@ log_ev('container_start', { exit => $start_rc >> 8, container => $CONTAINER_NAME
 
 # Land the first sentinel touch IMMEDIATELY after `podman start`, before
 # anything else (perl/helper probes, apt-get update, backpack install)
-# burns through the container's 10-second startup grace. The container's
-# entrypoint loop checks for /tmp/.launcher-alive at t=GRACE and reaps
-# itself if missing — so any slow operation here would kill the container
-# mid-flight ("container state improper" on the next exec). With the
-# sentinel established first, we now have HB=300s to do the install pass
-# before needing another refresh (and the install pass below maintains
-# its own in-container refresher for installs that exceed that window).
+# eats into the container's startup grace. The container's entrypoint loop
+# checks for /tmp/.launcher-alive at t=STARTUP_GRACE and reaps itself if
+# missing — so a slow operation here could kill the container mid-flight
+# ("container state improper" on the next exec).
+#
+# MINOR-2 (s12 red-team, step 6): this comment used to say "10-second
+# startup grace" and "HB=300s". Both were wrong — see
+# container/heartbeat.sh:26-27, which sets HB=600 and STARTUP_GRACE=600
+# (ten MINUTES each). Always read the live values there; do not trust a
+# number quoted in a comment here. Touching the sentinel first is kept
+# regardless: it is unconditionally correct and costs nothing.
 system($PODMAN, 'exec', $CONTAINER_NAME, 'touch', '/tmp/.launcher-alive');
 
 # Bind mount of claude-home → /root/.claude means host filesystem IS

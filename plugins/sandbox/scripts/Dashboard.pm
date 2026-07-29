@@ -2413,8 +2413,8 @@ sub _machine_boolish {
 #
 # SELECTION (MAJOR-1). `podman machine start` takes no name and acts on the
 # DEFAULT machine, so the reading must describe the default machine, never "any
-# machine that happens to be running". The rule is Resources::parse_machine_list's
-# (Resources.pm:97-114) verbatim: the element with a truthy `Default` wins
+# machine that happens to be running". The rule is `parse_machine_list`'s in
+# Resources.pm (:97-114) verbatim: the element with a truthy `Default` wins
 # regardless of position, else the first HASH element. A host with a second,
 # hand-made machine running while ours is down must read 'stopped' -- reading
 # 'running' there routes the user into a rebuild that `rm -f`s a healthy
