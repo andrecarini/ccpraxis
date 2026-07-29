@@ -38,7 +38,7 @@ package BpOrch;
 use strict;
 use warnings;
 use JSON::PP;
-use Fcntl qw(:flock);
+use Fcntl qw(:flock O_WRONLY O_CREAT O_EXCL);
 use File::Basename qw(dirname);
 use Cwd qw(abs_path);
 
@@ -553,17 +553,27 @@ sub _last_nonempty_line {
     return $found;
 }
 
-# --- the JSON-decoded last non-empty line of runs/<pkg>.jsonl (the coordinator's
-# TERMINAL event), or undef when the file is missing/empty/all-blank/truncated or
-# the last line isn't a JSON object. NOTE: `type` is NOT the first key on that
-# line, so the line MUST be decoded — a prefix/regex grep would never match.
-sub _last_jsonl_obj {
-    my ($runs, $pkg) = @_;
-    my $line = _last_nonempty_line("$runs/$pkg.jsonl");
+# --- the JSON-decoded last non-empty line of an arbitrary jsonl FILE (path form),
+# or undef when the file is missing/empty/all-blank/truncated or the last line
+# isn't a JSON object. b09: extracted so a judge's own stream log
+# (runs/<kind>/<pkg>.jsonl) can be read through the same tail-seek/1MiB-guard
+# reader as a coordinator's, without a second implementation.
+sub _last_jsonl_obj_path {
+    my ($file) = @_;
+    my $line = _last_nonempty_line($file);
     return undef unless defined $line && $line =~ /\S/;
     return undef if length($line) > $MAX_JSONL_LINE;   # never decode an unbounded line
     my $obj = eval { JSON::PP->new->decode($line) };
     return (ref $obj eq 'HASH') ? $obj : undef;
+}
+
+# --- the JSON-decoded last non-empty line of runs/<pkg>.jsonl (the coordinator's
+# TERMINAL event). NOTE: `type` is NOT the first key on that line, so the line
+# MUST be decoded — a prefix/regex grep would never match. REFACTOR ONLY (b09):
+# delegates to _last_jsonl_obj_path; b01's call site (:1585-ish) is untouched.
+sub _last_jsonl_obj {
+    my ($runs, $pkg) = @_;
+    return _last_jsonl_obj_path("$runs/$pkg.jsonl");
 }
 
 # --- ticked pipeline checkboxes in a ledger BODY (frontmatter excluded). The
@@ -835,6 +845,105 @@ sub read_judge_verdict {
     return _read_json($f) // { _malformed => 1 };
 }
 sub clear_judge_verdict { my ($runs, $kind, $pkg) = @_; unlink judge_verdict_path($runs, $kind, $pkg); }
+
+# --- b09: a judge's own pid file + stream log (bp-judge.sh :117-118/:132), read
+# so a judge that is PROVABLY dead without a verdict can be classified this tick
+# instead of waiting out judge_to (Ruling 3). judge_pid returns an int or undef
+# (missing/garbled pid file); judge_terminal_verdict reuses terminal_verdict
+# verbatim over the judge's own jsonl via the path-taking tail-seek reader.
+sub judge_pid_path { my ($runs, $kind, $pkg) = @_; "$runs/$kind/$pkg.pid" }
+sub judge_pid {
+    my ($runs, $kind, $pkg) = @_;
+    my $txt = _read_file(judge_pid_path($runs, $kind, $pkg));
+    return undef unless defined $txt && $txt =~ /^(\d+)/;
+    return $1 + 0;
+}
+sub judge_log_path { my ($runs, $kind, $pkg) = @_; "$runs/$kind/$pkg.jsonl" }
+sub judge_terminal_verdict {
+    my ($runs, $kind, $pkg) = @_;
+    return terminal_verdict(_last_jsonl_obj_path(judge_log_path($runs, $kind, $pkg)));
+}
+
+# --- b09: the JUDGE's "author intent" anchor for the 2x widen ceiling (Ruling 5).
+# NOT initial_max_turns (:600) — that reads the COORDINATOR's budget (80-120
+# typical); anchoring a sonnet audit's ceiling on it would license a 240-turn
+# harvest judge. Precedence, pinned: (1) an explicit ambient BP_HARVEST_MAX_TURNS
+# (the orchestrator's own widened re-fire injects it, so it takes this path and
+# the formula is never even computed for a continuation); (2) the size-aware
+# formula over the ledger's write_set/test_paths. Never persisted — recomputed
+# every tick, exactly like b01's anchor, so the 2x ceiling stays stable.
+sub harvest_initial_max_turns {
+    my ($bpdir, $pkg, $t) = @_;
+    my $env = $ENV{BP_HARVEST_MAX_TURNS};
+    return _clamp_turns($env + 0) if defined $env && !ref $env && $env =~ /^\d+$/ && $env > 0;
+    my $ws = ledger_fm($bpdir, $pkg, 'write_set');
+    my $tp = ledger_fm($bpdir, $pkg, 'test_paths');
+    return _clamp_turns(BpJudge::harvest_max_turns($ws, $tp));
+}
+
+# --- b09 Ruling 6: archive a judge's verdict BEFORE it is unlinked (SYN-18 —
+# evidence preservation). No-op returning undef unless the LIVE verdict file
+# exists: this is what structurally excludes a synthetic {_timeout=>1} sentinel
+# (there is no file for it) without any flag plumbing. Append-only via O_EXCL —
+# never rename onto the final name, which would clobber a same-second collision.
+# Never dies; every failure is best-effort + a log line.
+sub archive_judge_verdict {
+    my ($runs, $kind, $pkg, $now, $log) = @_;
+    my $ok = eval {
+        my $live = judge_verdict_path($runs, $kind, $pkg);
+        return undef unless -e $live;
+        my $dir = "$runs/$kind/archive";
+        require File::Path; File::Path::make_path($dir);   # best effort
+        my $text = _read_file($live);
+        $text = '' unless defined $text;
+        my $truncated = 0;
+        if (length($text) > $MAX_JSONL_LINE) {
+            $text = substr($text, 0, $MAX_JSONL_LINE);
+            $truncated = 1;
+        }
+        my $decoded = eval { JSON::PP->new->decode($text) };
+        my %body = (
+            schema      => 'judge-verdict-archive/1',
+            kind        => $kind,
+            package     => $pkg,
+            archived_at => _iso($now),
+            source      => "runs/$kind/$pkg.verdict.json",
+        );
+        if (ref $decoded eq 'HASH') {
+            $body{verdict} = $decoded;
+        } else {
+            $body{raw}       = $text;
+            $body{malformed} = JSON::PP::true;
+        }
+        $body{truncated} = JSON::PP::true if $truncated;
+        my $json = JSON::PP->new->canonical->pretty->encode(\%body);
+        (my $ts = _iso($now)) =~ tr/://d;
+        for my $n (1 .. 99) {
+            my $cand = $n == 1 ? "$dir/$pkg-$ts.verdict.json" : "$dir/$pkg-$ts-$n.verdict.json";
+            if (sysopen(my $fh, $cand, O_WRONLY | O_CREAT | O_EXCL)) {
+                print $fh $json;
+                close $fh;
+                return $cand;
+            }
+            # EEXIST (or any other open failure) -> try the next candidate name.
+        }
+        return undef;   # name space exhausted
+    };
+    if ($@) {
+        _log($log, 'judge_archive_failed', { kind => $kind, package => $pkg, reason => "$@" });
+        return undef;
+    }
+    unless (defined $ok) {
+        # Distinguish "no live file" (silent, structural — behaviors 31/35) from a
+        # genuine 99-collision exhaustion (worth a log line, per spec §2.2).
+        my $live = judge_verdict_path($runs, $kind, $pkg);
+        if (-e $live) {
+            _log($log, 'judge_archive_failed', { kind => $kind, package => $pkg, reason => 'name space exhausted' });
+        }
+        return undef;
+    }
+    return $ok;
+}
 
 # judge IN-FLIGHT state is kept ON DISK (runs/<kind>/<pkg>.inflight, content = the
 # epoch the judge was fired) rather than in orchestrator memory, so it survives an
@@ -1398,11 +1507,20 @@ sub run {
                     _log($log, 'judge_timeout', { kind => 'resolve', package => $pkg });
                     $v = { _timeout => 1 };               # normalize_resolve -> park
                 }
+                # b09 Ruling 7: a genuine-file-but-unparseable verdict is no longer
+                # indistinguishable from a timeout in the log (zero behavior change —
+                # normalize_resolve still parks it; see :2320-ish normalize_resolve).
+                _log($log, 'judge_verdict_malformed', { kind => 'resolve', package => $pkg })
+                    if ref $v eq 'HASH' && $v->{_malformed};
                 # Clear markers BEFORE acting (deliberate; rejected the clear-after refactor):
                 # a crash in the gap degrades safely — resolve_attempts was already counted at
                 # fire, so on restart the package parks rather than relaunching atop a still-
                 # alive detached coordinator. Clearing after would risk that double-launch.
                 clear_judge_inflight($runs, 'resolve', $pkg);
+                # b09 Ruling 6: archive the live verdict BEFORE it is unlinked (a no-op
+                # unless a real verdict landed — the synthetic {_timeout=>1} above has
+                # no backing file, so archive_judge_verdict structurally skips it).
+                archive_judge_verdict($runs, 'resolve', $pkg, $now, $log);
                 clear_judge_verdict($runs, 'resolve', $pkg);
                 my $r = BpJudge::normalize_resolve($v);
                 if ($r->{action} eq 'relaunch') {
@@ -1430,48 +1548,202 @@ sub run {
                 next unless defined $started;
                 my $v = $read_verdict->('harvest', $pkg);
                 if (!defined $v) {
-                    next unless $started && ($now - $started) > $t->{judge_to};   # see C1 note above
-                    _log($log, 'judge_timeout', { kind => 'harvest', package => $pkg });
-                    # A harvest TIMEOUT (no verdict in the window) is NOT evidence the
-                    # package's work is bad — only a fail VERDICT is. It means the audit
-                    # didn't complete: commonly the orchestrator/host died mid-harvest, or
-                    # the judge hung. RE-AUDIT a done package (re-fire the read-only audit)
-                    # rather than reopening + re-running the whole coordinator over
-                    # already-complete work (#30). Kill any still-alive judge first; bound
-                    # the re-audits so a judge that never completes eventually escalates
-                    # instead of looping forever.
+                    # b09 Ruling 3: a judge that is PROVABLY dead without a verdict
+                    # (pid file present, pid dead) is classified THIS tick instead of
+                    # waiting out the wall clock. The jsonl is read LAZILY — only once
+                    # the pid is known dead — via the same tail-seek/1MiB-guard reader
+                    # a coordinator's terminal event uses (behavior 10).
                     my $st = $status->{$pkg} // 'pending';
                     my $ra = $reg->{$pkg}{harvest_reaudit} // 0;
-                    if ($st eq 'done' && $ra < ($t->{harvest_reaudit_cap} // 0)) {
-                        my $jpidf = "$runs/harvest/$pkg.pid";
+                    my $hs = _reg_int($reg->{$pkg}{harvest_starve_continuations}) // 0;
+                    my $pid_present = -f judge_pid_path($runs, 'harvest', $pkg) ? 1 : 0;
+                    my ($jstate, $tv) = ('unknown', undef);
+                    if ($pid_present) {
+                        my $jp = judge_pid($runs, 'harvest', $pkg);
+                        my $alive = (defined $jp) ? $pid_alive->($jp) : 0;
+                        if ($alive) {
+                            $jstate = 'running';
+                        } else {
+                            $tv = judge_terminal_verdict($runs, 'harvest', $pkg);
+                            $jstate = BpJudge::judge_liveness({ pid_present => 1, pid_alive => 0, terminal => $tv });
+                        }
+                    }
+                    my $trigger_now = ($jstate eq 'starved' || $jstate eq 'crashed');
+                    if ($trigger_now) {
+                        if ($jstate eq 'starved') {
+                            _log($log, 'judge_starved', { kind => 'harvest', package => $pkg,
+                                  num_turns => $tv->{num_turns}, subtype => $tv->{subtype},
+                                  budget => (_reg_int($reg->{$pkg}{harvest_max_turns}) // harvest_initial_max_turns($bpdir, $pkg, $t)),
+                                  starvations => $hs });
+                        } else {
+                            _log($log, 'judge_crashed', { kind => 'harvest', package => $pkg, subtype => $tv->{subtype} });
+                        }
+                    } else {
+                        # 'unknown' (no pid file — death cannot be proven, C1) or
+                        # 'running' (still alive — defers to the wall clock, never
+                        # suppresses it): behavior is byte-for-byte today's.
+                        next unless $started && ($now - $started) > $t->{judge_to};   # see C1 note above
+                        _log($log, 'judge_timeout', { kind => 'harvest', package => $pkg });
+                    }
+                    # A harvest TIMEOUT/starvation/crash (no verdict) is NOT evidence the
+                    # package's work is bad — only a fail VERDICT is. RE-AUDIT a done
+                    # package (re-fire the read-only audit) rather than reopening + re-
+                    # running the whole coordinator over already-complete work (#30).
+                    # Ruling 5: the give-up-cap gate is subtractive — a starvation's own
+                    # widened continuation must not consume the same package's ordinary
+                    # timeout/crash re-audit budget (AC-14), so `effective_attempts`
+                    # isolates it, and the second conjunct additionally refuses the
+                    # WIDEN path once already exempted once (that case is handled below,
+                    # by parking instead of widening a second time).
+                    if ($st eq 'done'
+                        && effective_attempts($ra, $hs) < ($t->{harvest_reaudit_cap} // 0)
+                        && !($jstate eq 'starved' && $hs >= 1)) {
+                        my $jpidf = judge_pid_path($runs, 'harvest', $pkg);
                         if (-f $jpidf) {
-                            my ($jp) = (_read_file($jpidf) // '') =~ /^(\d+)/;
-                            kill_pid($jp) if defined $jp && pid_alive($jp);
+                            my ($jp2) = (_read_file($jpidf) // '') =~ /^(\d+)/;
+                            kill_pid($jp2) if defined $jp2 && pid_alive($jp2);
                             unlink $jpidf;
                         }
                         clear_judge_inflight($runs, 'harvest', $pkg);
+                        # No-op here (behavior 31): a starved/crashed/interrupted judge
+                        # never left a verdict file.
+                        archive_judge_verdict($runs, 'harvest', $pkg, $now, $log);
                         clear_judge_verdict($runs, 'harvest', $pkg);
-                        update_registry_pkg($runs, $pkg, { harvest => '', harvest_reaudit => $ra + 1 });
-                        $reg->{$pkg}{harvest} = ''; $reg->{$pkg}{harvest_reaudit} = $ra + 1;
-                        _log($log, 'harvest_reaudit', { package => $pkg, attempt => $ra + 1,
-                              reason => 'harvest did not complete (interrupted/hung) — re-auditing, not reopening' });
+                        if ($jstate eq 'starved') {
+                            # ONE fresh, widened budget — exempt from the give-up cap
+                            # (Ruling 5). anchored on the JUDGE's own intent, never the
+                            # coordinator's (:600's initial_max_turns is the wrong anchor).
+                            my $initial = harvest_initial_max_turns($bpdir, $pkg, $t);
+                            my $current = _reg_int($reg->{$pkg}{harvest_max_turns}) // $initial;
+                            my $widened = widen_max_turns($current, $initial);
+                            # harvest_reaudit keeps its pre-existing IMMEDIATE-persist
+                            # timing (mirrors :1454/T2) even on the widen path — a failed
+                            # re-spawn below still costs one re-audit slot (§6 edge case 5).
+                            update_registry_pkg($runs, $pkg, { harvest_reaudit => $ra + 1 });
+                            $reg->{$pkg}{harvest_reaudit} = $ra + 1;
+                            _log($log, 'harvest_starve_continuation', { package => $pkg, from => $current, to => $widened,
+                                  num_turns => $tv->{num_turns}, starvations => 1 });
+                            # STAGED: mirrored in memory so the re-fire below rides the
+                            # widened budget, persisted only once the re-spawn returns
+                            # rc==0 (mirrors :1670-1677); rolled back in memory otherwise.
+                            $reg->{$pkg}{harvest_max_turns} = $widened;
+                            $reg->{$pkg}{harvest_starve_continuations} = 1;
+                            my $rc = $spawn_judge->({ kind => 'harvest', pkg => $pkg, max_turns => $widened });
+                            if (defined $rc && $rc == 0) {
+                                mark_judge_inflight($runs, 'harvest', $pkg, $now);
+                                update_registry_pkg($runs, $pkg, { harvest_max_turns => $widened, harvest_starve_continuations => 1 });
+                            } else {
+                                $reg->{$pkg}{harvest_max_turns} = $current;
+                                $reg->{$pkg}{harvest_starve_continuations} = $hs;
+                                _log($log, 'judge_spawn_failed', { kind => 'harvest', package => $pkg, rc => $rc });
+                            }
+                        } else {
+                            # existing bounded re-audit — now ALSO reached by immediate
+                            # crash detection, not only the wall-clock timeout.
+                            update_registry_pkg($runs, $pkg, { harvest => '', harvest_reaudit => $ra + 1 });
+                            $reg->{$pkg}{harvest} = ''; $reg->{$pkg}{harvest_reaudit} = $ra + 1;
+                            _log($log, 'harvest_reaudit', { package => $pkg, attempt => $ra + 1,
+                                  reason => 'harvest did not complete (interrupted/hung) — re-auditing, not reopening' });
+                        }
                         next;   # section (c) re-fires the harvest this tick
+                    }
+                    if ($jstate eq 'starved' && $st eq 'done') {
+                        # SECOND starvation of the same package: park the branch (#13's
+                        # park-the-branch, never global-halt) with a decision that says
+                        # the AUDIT did not complete — never that the package failed
+                        # (Ruling 4). Kill/clear as in the widen path above.
+                        my $jpidf = judge_pid_path($runs, 'harvest', $pkg);
+                        if (-f $jpidf) {
+                            my ($jp2) = (_read_file($jpidf) // '') =~ /^(\d+)/;
+                            kill_pid($jp2) if defined $jp2 && pid_alive($jp2);
+                            unlink $jpidf;
+                        }
+                        clear_judge_inflight($runs, 'harvest', $pkg);
+                        archive_judge_verdict($runs, 'harvest', $pkg, $now, $log);
+                        clear_judge_verdict($runs, 'harvest', $pkg);
+                        # 'starved' (non-pass) so gate_admits/effective_status keep
+                        # holding dependents in gate mode; non-empty so
+                        # want_harvest_audit stops re-firing the audit forever.
+                        update_registry_pkg($runs, $pkg, { harvest => 'starved' });
+                        $reg->{$pkg}{harvest} = 'starved';
+                        my $initial = harvest_initial_max_turns($bpdir, $pkg, $t);
+                        my $current = _reg_int($reg->{$pkg}{harvest_max_turns}) // $initial;
+                        _log($log, 'judge_starved_park', { package => $pkg, starvations => $hs + 1, budget => $current });
+                        my $question = "The harvest AUDIT of package '$pkg' did not complete. The audit judge ran out of turns "
+                                  . "twice — once on its normal budget and once on a widened one ($initial then $current "
+                                  . "turns) — so no verdict was ever written and '$pkg' has NOT been independently checked "
+                                  . "either way. This is not a verdict about the package's work: its status is still 'done' "
+                                  . "and its own tests and review stand unchallenged. Do one of: (1) read "
+                                  . "runs/harvest/archive/ and runs/harvest/$pkg.jsonl to see how far the audit got; "
+                                  . "(2) verify '$pkg' yourself against its done criteria; or (3) give the judge more room — "
+                                  . "raise BP_HARVEST_MAX_TURNS, then set packages.$pkg.harvest back to \"\" in "
+                                  . "runs/registry.json to re-arm the audit. The run was NOT paused and other packages keep "
+                                  . "going."
+                                  . ($mode eq 'gate'
+                                      ? " Harvest is in GATE mode, so packages depending on '$pkg' stay held until this is resolved."
+                                      : '');
+                        my $context = "harvest judge exhausted its turn budget twice on '$pkg': last terminal subtype="
+                                  . ($tv->{subtype} // '?') . ", num_turns=" . ($tv->{num_turns} // '?')
+                                  . ", budget $initial -> $current (widened once via the SYN-7 rule), harvest_reaudit=$ra"
+                                  . ", starvations=" . ($hs + 1) . ". No verdict file was ever written. Judge log: "
+                                  . "runs/harvest/$pkg.jsonl; archived verdicts: runs/harvest/archive/.";
+                        queue_needs_you($runs, { package => $pkg, blueprint => $bp, kind => 'judge-starved',
+                            question => $question, context => $context, created_at => $now });
+                        next;
                     }
                     $v = { _timeout => 1 };               # cap exhausted (or not done) -> error -> escalate
                 }
+                # b09 Ruling 7: log BEFORE normalisation so a garbled verdict is no
+                # longer indistinguishable from a timeout in the log (zero behavior
+                # change — normalize_harvest still maps it to 'error').
+                _log($log, 'judge_verdict_malformed', { kind => 'harvest', package => $pkg })
+                    if ref $v eq 'HASH' && $v->{_malformed};
                 # Clear before acting — harvest degrades even more safely (a lost verdict just
                 # re-audits next tick, since status stays 'done' + harvest stays '').
                 clear_judge_inflight($runs, 'harvest', $pkg);
+                # b09 Ruling 6: archive the live verdict BEFORE it is unlinked (a no-op
+                # for the synthetic {_timeout=>1} sentinel — no backing file).
+                archive_judge_verdict($runs, 'harvest', $pkg, $now, $log);
                 clear_judge_verdict($runs, 'harvest', $pkg);
                 my $hv = BpJudge::normalize_harvest($v);
                 if ($hv eq 'pass') {
-                    update_registry_pkg($runs, $pkg, { harvest => 'pass', harvest_reaudit => 0 });
+                    update_registry_pkg($runs, $pkg, { harvest => 'pass', harvest_reaudit => 0,
+                        harvest_defer => 0, harvest_defer_blockers => '', harvest_starve_continuations => 0 });
                     $reg->{$pkg}{harvest} = 'pass'; $reg->{$pkg}{harvest_reaudit} = 0;
+                    $reg->{$pkg}{harvest_defer} = 0; $reg->{$pkg}{harvest_defer_blockers} = '';
+                    $reg->{$pkg}{harvest_starve_continuations} = 0;
                     _log($log, 'harvest_pass', { package => $pkg, mode => $mode });
                 } else {
                     my $corr = $reg->{$pkg}{corrective_attempts} // 0;
-                    my $ao = BpJudge::audit_outcome({ verdict => $hv, corrective_attempts => $corr, corrective_cap => $t->{corr_cap} });
-                    if ($ao eq 'reopen') {
+                    # b09 Ruling 2: a fail whose every cited failure belongs to a
+                    # not-yet-landed sibling defers instead of burning a corrective
+                    # cycle on the audited package's own red (SYN-11 clause (b)).
+                    # Attribution is derived from the write-set ownership record the
+                    # orchestrator already holds — the judge itself never declares a
+                    # blocker (agents/bp-harvest-judge.md is outside this write set).
+                    my $attrib = { attributable => 0, blockers => [] };
+                    if (ref $v eq 'HASH' && ref $v->{failures} eq 'ARRAY' && @{ $v->{failures} }) {
+                        my %write_sets = map { $_ => $meta->{$_}{write_set} } keys %$meta;
+                        $attrib = BpJudge::attribute_failures({ package => $pkg, failures => $v->{failures},
+                                    write_sets => \%write_sets, status => $status });
+                    }
+                    my $defer_att = _reg_int($reg->{$pkg}{harvest_defer}) // 0;
+                    my $ao = BpJudge::audit_outcome({ verdict => $hv, corrective_attempts => $corr, corrective_cap => $t->{corr_cap},
+                                deferrable => ($attrib->{attributable} ? 1 : 0), defer_attempts => $defer_att,
+                                defer_cap => $t->{harvest_defer_cap} });
+                    if ($ao eq 'defer') {
+                        # Never-defer-forever (bounded three ways per §3 behavior 26):
+                        # harvest_defer_cap, LIVE-only blockers, all-or-nothing
+                        # attribution. Not a pass — harvest stays '' so a fresh audit
+                        # runs again once the guard in section (c) lifts.
+                        my $blockers_str = join(',', @{ $attrib->{blockers} || [] });
+                        update_registry_pkg($runs, $pkg, { harvest => '', harvest_defer => $defer_att + 1,
+                            harvest_defer_blockers => $blockers_str });
+                        $reg->{$pkg}{harvest} = ''; $reg->{$pkg}{harvest_defer} = $defer_att + 1;
+                        $reg->{$pkg}{harvest_defer_blockers} = $blockers_str;
+                        _log($log, 'harvest_defer', { package => $pkg, verdict => $hv,
+                              blockers => $attrib->{blockers}, defer_attempts => $defer_att + 1 });
+                    } elsif ($ao eq 'reopen') {
                         # Failed audit, budget remains: reopen NON-terminal with the audit's
                         # findings as corrective context (Q2). Dependents that already ran off
                         # the bad output are FLAGGED for re-verification, never auto-killed.

@@ -142,10 +142,16 @@ sub normalize_harvest {
     return 'error';
 }
 
-# audit_outcome($c) -> 'accept' | 'reopen' | 'park'
+# audit_outcome($c) -> 'accept' | 'defer' | 'reopen' | 'park'      # EXTENDED (b09)
 # What the orchestrator does with a completed harvest verdict (audit mode — the
 # package's dependents may already be running off the trusted output):
-#   pass                             -> accept   (record harvest-verified, done)
+#   pass                                              -> accept  (record harvest-verified, done)
+#   non-pass AND deferrable AND defer_attempts < cap  -> defer   (b09: every cited
+#                                                        failure belongs to a not-yet-
+#                                                        landed sibling — re-check
+#                                                        later instead of burning a
+#                                                        corrective cycle on the
+#                                                        audited package's own red)
 #   non-pass, under corrective cap    -> reopen   (relaunch the package NON-terminal
 #                                                  with the audit's specific failures
 #                                                  as corrective context; one cycle)
@@ -153,12 +159,156 @@ sub normalize_harvest {
 # Park-don't-halt (#13) + demote-don't-panic (#12): a failed audit never auto-kills
 # live dependents — the orchestrator flags them for re-verification, the loop keeps
 # independent work running. corrective_cap default 1 (a single corrective cycle).
+# defer_cap defaults to 2 when the key is absent; deferrable defaults to 0, so every
+# pre-existing call shape (no deferrable/defer_attempts/defer_cap keys) is
+# byte-for-byte unchanged (t/10-judges.t:91-95).
 sub audit_outcome {
     my ($c) = @_;
     return 'accept' if defined $c->{verdict} && $c->{verdict} eq 'pass';
+    my $defer_cap = defined $c->{defer_cap} ? $c->{defer_cap} : 2;
+    my $defer_att = $c->{defer_attempts} // 0;
+    return 'defer' if $c->{deferrable} && $defer_att < $defer_cap;
     my $cap = defined $c->{corrective_cap} ? $c->{corrective_cap} : 1;
     my $att = $c->{corrective_attempts} // 0;
     return ($att < $cap) ? 'reopen' : 'park';
+}
+
+# ===========================================================================
+# b09-judge-starvation-and-verdict-archive — pure decision core additions
+# (harvest turn-budget scaling, immediate starvation/crash classification,
+# sibling-red attribution). All pure: no I/O, no globals, no clock, never die.
+# ===========================================================================
+
+# _split_paths($v) -> @paths      (internal helper; not exported, called by full
+# name from within this package and from bp-orchestrator.pl as BpJudge::_split_paths
+# is NOT part of the public contract, but Perl namespacing makes it reachable —
+# treated as private by convention, mirrored on both write_set and test_paths.)
+# $v: colon-separated string (ledger frontmatter shape), arrayref, or undef.
+# Splits on ':', trims whitespace, drops empties and the placeholder tokens '-',
+# '—', '[]', 'none' (case-insensitive), strips one leading './' and any trailing
+# '/', de-duplicates preserving first-seen order. Never dies.
+sub _split_paths {
+    my ($v) = @_;
+    my @raw;
+    if    (ref $v eq 'ARRAY')        { @raw = @$v; }
+    elsif (defined $v && !ref $v)    { @raw = split /:/, $v; }
+    else                             { return (); }
+    my %placeholder = map { (lc $_) => 1 } ('-', '—', '[]', 'none');
+    my (@out, %seen);
+    for my $p (@raw) {
+        next unless defined $p && !ref $p;
+        $p =~ s/^\s+//; $p =~ s/\s+$//;
+        next unless length $p;
+        next if $placeholder{lc $p};
+        $p =~ s{^\./}{};
+        $p =~ s{/+$}{};
+        next unless length $p;
+        next if $seen{$p}++;
+        push @out, $p;
+    }
+    return @out;
+}
+
+# harvest_max_turns($write_set, $test_paths) -> $int
+# files = count of distinct paths in _split_paths(write_set) UNION _split_paths(test_paths)
+# n     = 20 + 8 * files
+# return 28 if n < 28; return 60 if n > 60; return n
+# Pure, total over undef/empty/garbage. Never returns < 28 or > 60 (Ruling 1).
+sub harvest_max_turns {
+    my ($write_set, $test_paths) = @_;
+    my %union = map { ($_ => 1) } (_split_paths($write_set), _split_paths($test_paths));
+    my $files = scalar keys %union;
+    my $n = 20 + 8 * $files;
+    return 28 if $n < 28;
+    return 60 if $n > 60;
+    return $n;
+}
+
+# judge_liveness($c) -> 'starved' | 'crashed' | 'running' | 'unknown'
+# $c = { pid_present => 0|1, pid_alive => 0|1, terminal => \%tv | undef }
+# %tv is terminal_verdict()'s totalized shape; anything not a HASH is read as
+# { verdict => 'unknown' }. Consulted ONLY when no verdict file exists (Ruling 3).
+# Never dies; total over garbage input.
+sub judge_liveness {
+    my ($c) = @_;
+    $c = {} unless ref $c eq 'HASH';
+    return 'unknown' unless $c->{pid_present};      # pid-file missing: death cannot be proven
+    return 'running' if $c->{pid_alive};             # alive -> keep waiting on the wall clock
+    my $term = $c->{terminal};
+    my $v = (ref $term eq 'HASH' && defined $term->{verdict} && !ref $term->{verdict})
+          ? $term->{verdict} : 'unknown';
+    return 'starved' if $v eq 'max_turns';
+    return 'crashed';                                 # success / error / unknown terminal, pid dead
+}
+
+# _owns($entry, $token) -> 0|1   (internal helper for attribute_failures)
+# $entry is already a _split_paths-normalized write-set entry; $token is a raw
+# candidate path extracted from a failure string, normalized here the same way.
+sub _owns {
+    my ($entry, $token) = @_;
+    return 0 unless defined $entry && length $entry;
+    my ($norm) = _split_paths([$token]);
+    return 0 unless defined $norm && length $norm;
+    return 1 if $norm eq $entry;
+    return 1 if index($norm, "$entry/") == 0;
+    return 0;
+}
+
+# attribute_failures($c) -> { attributable => 0|1, blockers => \@pkgs,
+#                             unattributed => \@failure_strings }
+# $c = { package    => $pkg_under_audit,
+#        failures   => \@strings,                        # verdict->{failures}
+#        write_sets => { pkg => $colon_str|\@ },
+#        status     => { pkg => $status_str } }
+# Algorithm (spec §3 behavior 22): pure; tolerates any garbage input; never dies.
+sub attribute_failures {
+    my ($c) = @_;
+    $c = {} unless ref $c eq 'HASH';
+    my $pkg = defined $c->{package} && !ref $c->{package} ? $c->{package} : '';
+    my @f = grep { defined $_ && !ref $_ && /\S/ }
+            (ref $c->{failures} eq 'ARRAY' ? @{ $c->{failures} } : ());
+    return { attributable => 0, blockers => [], unattributed => [] } unless @f;
+
+    my %write_sets = (ref $c->{write_sets} eq 'HASH') ? %{ $c->{write_sets} } : ();
+    my %status     = (ref $c->{status}     eq 'HASH') ? %{ $c->{status} }     : ();
+
+    # the audited package's OWN write set: its own declared file is its own
+    # responsibility, so a token it owns is disqualified regardless of siblings.
+    my @own = _split_paths($write_sets{$pkg});
+
+    # pre-normalize every sibling's write set once.
+    my %sib_paths;
+    for my $s (keys %write_sets) {
+        next if $s eq $pkg;
+        $sib_paths{$s} = [ _split_paths($write_sets{$s}) ];
+    }
+
+    my %blockers;
+    my @unattributed;
+    for my $fail (@f) {
+        my @tokens = $fail =~ m{([A-Za-z0-9_][A-Za-z0-9_./+-]*/[A-Za-z0-9_.+-]+)}g;
+        my $attributed = 0;
+        for my $tok (@tokens) {
+            $tok =~ s/[.,;:)\]'"]+$//;
+            next unless length $tok;
+            next if grep { _owns($_, $tok) } @own;    # disqualified: A's own file
+            for my $s (sort keys %sib_paths) {
+                next if $s eq $pkg;
+                my $st = defined $status{$s} && !ref $status{$s} ? lc($status{$s}) : '';
+                $st =~ s/^\s+//; $st =~ s/\s+$//;
+                # LIVE == not done/dropped/blocked/parked (a blocked/parked sibling
+                # is not a blocker — the human is already looking at it).
+                next if $st eq 'done' || $st eq 'dropped' || $st eq 'blocked' || $st eq 'parked';
+                if (grep { _owns($_, $tok) } @{ $sib_paths{$s} }) {
+                    $blockers{$s} = 1;
+                    $attributed = 1;
+                }
+            }
+        }
+        push @unattributed, $fail unless $attributed;
+    }
+    my $attributable = @unattributed ? 0 : 1;
+    return { attributable => $attributable, blockers => [ sort keys %blockers ], unattributed => \@unattributed };
 }
 
 # ===========================================================================
