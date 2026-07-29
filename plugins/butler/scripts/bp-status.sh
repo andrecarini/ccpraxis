@@ -3,6 +3,9 @@
 # Usage: bp-status.sh [blueprint]
 # This is the orchestrator's monitoring surface: ledger frontmatter + process
 # liveness + the first line of "Next action". It never reads stream logs.
+# A directory under blueprints/ with no blueprint.md is a stray, never removed,
+# and is reported in a trailing "!!"-prefixed section; a named-arg lookup that
+# resolves to a stray or to nothing fails loudly (exit 3) instead of listing.
 set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=bp-lib.sh
@@ -59,7 +62,13 @@ if [ "${#STRAYS[@]}" -gt 0 ]; then
   echo
   echo "!! UNRECOGNISED DIRECTORIES (no blueprint.md) -- NOT blueprints, NOT running:"
   for NAME in "${STRAYS[@]}"; do
-    printf '%s\n' "!!   $NAME"
+    # A stray directory's basename is untrusted (created by other subprocesses,
+    # possibly malformed). Neutralize embedded newlines/carriage returns so this
+    # name can never split into an extra output line lacking the "!!" prefix --
+    # that would defeat the whole point of this section (redteam-step6.md).
+    SAFE_NAME=${NAME//$'\r'/'\r'}
+    SAFE_NAME=${SAFE_NAME//$'\n'/'\n'}
+    printf '%s\n' "!!   $SAFE_NAME"
   done
   echo "!! Under $DATA/blueprints. Nothing was removed -- inspect and delete by hand if stale."
 fi
