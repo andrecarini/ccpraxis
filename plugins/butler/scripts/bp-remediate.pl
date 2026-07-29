@@ -581,7 +581,7 @@ sub _escalate_entry {
 }
 
 sub _escalate_new_finding {
-    my ($f, $k, $reason, $rounds_used, $notices, $escalate, $nq) = @_;
+    my ($f, $k, $reason, $rounds_used, $notices, $escalate, $nq, $now_iso, $ctx, $sig) = @_;
     push @$escalate, {
         finding_key       => $k,
         kind              => $f->{kind},
@@ -599,6 +599,34 @@ sub _escalate_new_finding {
         evidence => { finding_key => $k, escalation_reason => $reason },
     };
     push @{ $nq->{escalated} }, $k unless grep { $_ eq $k } @{ $nq->{escalated} };
+
+    # F6 (red-team): without a PERSISTED entry, %tracked (rebuilt from
+    # $nq->{entries} at the top of the NEXT plan() call) never sees this
+    # finding_key, so an unfixable/unscopable/capped-out NEW finding
+    # re-escalates on every subsequent ingestion — unbounded runs/notices/
+    # growth and a decision the operator can never dismiss (F4's exact
+    # inverse, from the same asymmetry: entry-sourced escalations already
+    # go terminal via _escalate_entry; this path did not). Append a
+    # terminal, bookkeeping-only entry so it is tracked from here on.
+    # no_package=>1 tells merge_queue (bp-orchestrator.pl:conformance_registry
+    # never sees it either, same as any other remediation=>1 exclusion) that
+    # this id maps to NO ledger and NO write_set — there is none, this finding
+    # was never auto-fixable — so it must never be treated as launchable.
+    # No rounds_used increment: this is not a round opened, it is a permanent
+    # record of "asked and refused".
+    my $entry = _build_entry({
+        id => package_id($k, 1), finding_key => $k, round => 1,
+        max_rounds => (defined $ctx && ref $ctx eq 'HASH' && $ctx->{rounds}) ? $ctx->{rounds} : 2,
+        source => _source_for($f),
+        action => (ref $f->{remedy} eq 'HASH' ? $f->{remedy}{action} : undef),
+        write_set => 'n/a', deps => [], finding => $f, signature => $sig,
+        now_iso => (defined $now_iso ? $now_iso : _iso(undef)), ctx => (ref $ctx eq 'HASH' ? $ctx : {}),
+    });
+    $entry->{state}             = 'escalated';
+    $entry->{escalation_reason} = $reason;
+    $entry->{pkg_status}        = 'done';
+    $entry->{no_package}        = 1;
+    return $entry;
 }
 
 # ===========================================================================
