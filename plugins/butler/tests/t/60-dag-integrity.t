@@ -887,4 +887,408 @@ SKIP: {
         'AC-32: has_progressable_work false when that short-id dep is blocked');
 }
 
+# =============================================================================
+# CHUNK 3 — AC-33..AC-46
+#   Stall detection (dag_stall, pure) and routing (dag_stall_step, glue):
+#   criterion (e) routes a blocked-dependency stall to the b07 remediation
+#   engine; criterion (f) surfaces exactly one dag-stalled decision only when
+#   the stall is structurally unresolvable. See spec-b08 §2.6/§2.7, §5.3-§5.5.
+# =============================================================================
+
+my $have_dag_stall      = BpOrch->can('dag_stall')      ? 1 : 0;
+my $have_dag_stall_step = BpOrch->can('dag_stall_step') ? 1 : 0;
+
+ok($have_dag_stall, 'AC-33: BpOrch::dag_stall is implemented')
+    or diag('dag_stall not yet implemented -- AC-33..AC-36 assertions are skipped');
+ok($have_dag_stall_step, 'AC-37: BpOrch::dag_stall_step is implemented')
+    or diag('dag_stall_step not yet implemented -- AC-37,40,41,42,43,44,45 assertions are skipped');
+
+# ---------------------------------------------------------------------------
+# Chunk-3-local fixture helpers (self-contained; do not depend on chunk 1/2
+# internals we did not read).
+# ---------------------------------------------------------------------------
+sub decode_json_file {
+    my ($path) = @_;
+    return undef unless -f $path;
+    open(my $fh, '<', $path) or return undef;
+    local $/;
+    my $text = <$fh>;
+    close $fh;
+    require JSON::PP;
+    return eval { JSON::PP::decode_json($text) };
+}
+
+sub needs_you_files {
+    my ($runs) = @_;
+    my $dir = "$runs/needs-you";
+    return () unless -d $dir;
+    opendir(my $dh, $dir) or return ();
+    my @files = sort grep { -f "$dir/$_" } readdir($dh);
+    closedir $dh;
+    return map { "$dir/$_" } @files;
+}
+
+sub _dag_stall_queue_entries {
+    my ($runs) = @_;
+    my $data = decode_json_file("$runs/remediation-queue.json");
+    return () unless defined $data;
+    my @all = ref($data) eq 'ARRAY' ? @$data
+            : ref($data) eq 'HASH'  ? values %$data
+            : ();
+    return grep {
+        ref($_) eq 'HASH' && ref($_->{finding}) eq 'HASH'
+            && (($_->{finding}{kind} // '') eq 'dag-stall')
+    } @all;
+}
+
+sub mk_dag_stall_a {
+    my (%over) = @_;
+    my $dir  = tempdir(CLEANUP => 1);
+    my $runs = "$dir/runs";
+    mkdir $runs or die "mkdir $runs: $!";
+    my $log  = "$dir/orchestrator.log";
+    my %a = (
+        bpdir          => $dir,
+        runs           => $runs,
+        log            => $log,
+        blueprint      => 'sandbox-butler-overhaul',
+        meta           => {},
+        status         => {},
+        now            => time(),
+        tunables       => { dag_stall => 1 },
+        queue          => "$runs/remediation-queue.json",
+        live           => [],
+        shutdown       => 0,
+        paused         => 0,
+        resume_pending => 0,
+    );
+    @a{ keys %over } = values %over;
+    return (\%a, $dir, $runs, $log);
+}
+
+# ---- AC-33: the four non-stall reasons, and purity (no I/O) ----------------
+SKIP: {
+    skip 'BpOrch::dag_stall not implemented', 9 unless $have_dag_stall;
+
+    my $purity_dir = tempdir(CLEANUP => 1);
+    opendir(my $dh0, $purity_dir) or die "opendir $purity_dir: $!";
+    my @before = sort readdir($dh0);
+    closedir $dh0;
+
+    my $r_running = BpOrch::dag_stall(
+        { 'b01-a' => { deps => [], write_set => 'x', remediation => 0 } },
+        { 'b01-a' => 'pending' },
+        [ 'b01-a' ],
+    );
+    is($r_running->{stalled}, 0, 'AC-33: a live package -> stalled is 0');
+    is($r_running->{reason}, 'running', "AC-33: reason is exactly 'running'");
+
+    my $r_np = BpOrch::dag_stall(
+        { 'b01-a' => { deps => [], write_set => 'x', remediation => 0 } },
+        { 'b01-a' => 'done' },
+        [],
+    );
+    is($r_np->{stalled}, 0, 'AC-33: nothing pending -> stalled is 0');
+    is($r_np->{reason}, 'no-pending', "AC-33: reason is exactly 'no-pending'");
+
+    my $r_l = BpOrch::dag_stall(
+        { 'b01-a' => { deps => [], write_set => 'x', remediation => 0 } },
+        { 'b01-a' => 'pending' },
+        [],
+    );
+    is($r_l->{stalled}, 0, 'AC-33: a pending package with met deps -> stalled is 0');
+    is($r_l->{reason}, 'launchable', "AC-33: reason is exactly 'launchable'");
+
+    my $r_i = BpOrch::dag_stall(
+        { 'b01-a' => { deps => [], write_set => 'x', remediation => 0 } },
+        { 'b01-a' => 'harvesting' },
+        [],
+    );
+    is($r_i->{stalled}, 0, 'AC-33: a non-terminal, non-pending package -> stalled is 0');
+    is($r_i->{reason}, 'inflight', "AC-33: reason is exactly 'inflight'");
+
+    opendir(my $dh1, $purity_dir) or die "opendir $purity_dir: $!";
+    my @after = sort readdir($dh1);
+    closedir $dh1;
+    is_deeply(\@after, \@before, 'AC-33: dag_stall creates/modifies no files (pure, no I/O)');
+}
+
+# ---- AC-34: blocked dep -> one blockers entry, unresolvable is [] ----------
+SKIP: {
+    skip 'BpOrch::dag_stall not implemented', 6 unless $have_dag_stall;
+    my $meta = {
+        'b02-dependent' => { deps => ['b01-blocker'], write_set => 'x', remediation => 0 },
+        'b01-blocker'   => { deps => [], write_set => 'y', remediation => 0 },
+    };
+    my $status = { 'b02-dependent' => 'pending', 'b01-blocker' => 'blocked' };
+    my $r = BpOrch::dag_stall($meta, $status, []);
+    is($r->{stalled}, 1, 'AC-34: a blocked dependency stalls the run');
+    is(scalar(@{ $r->{blockers} }), 1, 'AC-34: exactly one blockers entry');
+    is($r->{blockers}[0]{blocker}, 'b01-blocker', 'AC-34: blocker is the blocked package');
+    ok(($r->{blockers}[0]{blocker_status} eq 'blocked' || $r->{blockers}[0]{blocker_status} eq 'parked'),
+        "AC-34: blocker_status is 'blocked' or 'parked'");
+    is_deeply($r->{blockers}[0]{dependents}, ['b02-dependent'], 'AC-34: dependents is sorted and non-empty');
+    is_deeply($r->{unresolvable}, [], 'AC-34: unresolvable is [] for a pure blocked-dep stall');
+}
+
+# ---- AC-35: dangling / cycle / dropped -> unresolvable, blockers is [] -----
+SKIP: {
+    skip 'BpOrch::dag_stall not implemented', 12 unless $have_dag_stall;
+
+    my $r_d = BpOrch::dag_stall(
+        { 'b02-x' => { deps => ['nope-does-not-exist'], write_set => 'x', remediation => 0 } },
+        { 'b02-x' => 'pending' },
+        [],
+    );
+    is($r_d->{stalled}, 1, 'AC-35: a dangling dep stalls the run');
+    is(scalar(@{ $r_d->{unresolvable} }), 1, 'AC-35: exactly one unresolvable entry for a dangling dep');
+    is($r_d->{unresolvable}[0]{code}, 'dep-dangling', "AC-35: code is 'dep-dangling'");
+    is_deeply($r_d->{blockers}, [], 'AC-35: blockers is [] for a dangling dep');
+
+    my $r_c = BpOrch::dag_stall(
+        { 'b02-x' => { deps => ['b03-y'], write_set => 'x', remediation => 0 },
+          'b03-y' => { deps => ['b02-x'], write_set => 'y', remediation => 0 } },
+        { 'b02-x' => 'pending', 'b03-y' => 'pending' },
+        [],
+    );
+    is($r_c->{stalled}, 1, 'AC-35: a dependency cycle stalls the run');
+    my @cyc = grep { $_->{code} eq 'dep-cycle' } @{ $r_c->{unresolvable} };
+    is(scalar(@cyc), 1, "AC-35: exactly one 'dep-cycle' entry (per cycle, not per member)");
+    ok(scalar(@{ $cyc[0]{members} }) >= 2, 'AC-35: dep-cycle members lists the rotated cycle');
+    is_deeply($r_c->{blockers}, [], 'AC-35: blockers is [] for a cycle');
+
+    my $r_dr = BpOrch::dag_stall(
+        { 'b02-x'    => { deps => ['b01-gone'], write_set => 'x', remediation => 0 },
+          'b01-gone' => { deps => [], write_set => 'y', remediation => 0 } },
+        { 'b02-x' => 'pending', 'b01-gone' => 'dropped' },
+        [],
+    );
+    is($r_dr->{stalled}, 1, 'AC-35: a dropped dep stalls the run');
+    is(scalar(@{ $r_dr->{unresolvable} }), 1, 'AC-35: exactly one unresolvable entry for a dropped dep');
+    is($r_dr->{unresolvable}[0]{code}, 'dep-dropped', "AC-35: code is 'dep-dropped'");
+    is_deeply($r_dr->{blockers}, [], 'AC-35: blockers is [] for a dropped dep');
+}
+
+# ---- AC-36: recursion exclusion (remediation flag and remediation- prefix) -
+SKIP: {
+    skip 'BpOrch::dag_stall not implemented', 9 unless $have_dag_stall;
+
+    my $meta1 = {
+        'remediation-slug-r1' => { deps => [], write_set => 'x', remediation => 0 },
+        'b02-normal'          => { deps => [], write_set => 'y', remediation => 1 },
+    };
+    my $status1 = { 'remediation-slug-r1' => 'pending', 'b02-normal' => 'pending' };
+    my $r1 = BpOrch::dag_stall($meta1, $status1, []);
+    ok(!(grep { $_ eq 'remediation-slug-r1' } @{ $r1->{pending} }),
+        'AC-36: id-prefixed remediation package excluded from pending');
+    ok(!(grep { $_ eq 'b02-normal' } @{ $r1->{pending} }),
+        'AC-36: flagged (remediation=>1) package excluded from pending');
+    ok(!(grep { $_ eq 'remediation-slug-r1' } @{ $r1->{ready} }),
+        'AC-36: id-prefixed remediation package excluded from ready');
+    ok(!(grep { $_ eq 'b02-normal' } @{ $r1->{ready} }),
+        'AC-36: flagged remediation package excluded from ready');
+    is_deeply($r1->{blockers}, [], 'AC-36: excluded packages produce no blockers');
+    is_deeply($r1->{unresolvable}, [], 'AC-36: excluded packages produce no unresolvable findings');
+
+    my $meta2 = {
+        'b02-normal'          => { deps => ['remediation-slug-r1'], write_set => 'y', remediation => 0 },
+        'remediation-slug-r1' => { deps => [], write_set => 'x', remediation => 0 },
+    };
+    my $status2 = { 'b02-normal' => 'pending', 'remediation-slug-r1' => 'blocked' };
+    my $r2 = BpOrch::dag_stall($meta2, $status2, []);
+    ok(!(grep { $_->{blocker} eq 'remediation-slug-r1' } @{ $r2->{blockers} }),
+        'AC-36: excluded package never appears as a blocker even when blocked and depended upon');
+    ok(!(grep { ($_->{package} // '') eq 'remediation-slug-r1' || ($_->{detail} // '') eq 'remediation-slug-r1' }
+        @{ $r2->{unresolvable} }),
+        'AC-36: excluded package never appears in unresolvable');
+    ok(!(grep { $_ eq 'remediation-slug-r1' } (@{ $r2->{pending} }, @{ $r2->{ready} })),
+        'AC-36: excluded package absent from pending and ready');
+}
+
+# ---- AC-37 (criterion e): blocked-dep stall routes to the b07 engine -------
+SKIP: {
+    skip 'BpOrch::dag_stall_step not implemented', 5 unless $have_dag_stall_step;
+    my $meta = {
+        'b02-dependent' => { deps => ['b01-blocker'], write_set => 'packages/b02-dependent/**', remediation => 0 },
+        'b01-blocker'   => { deps => [], write_set => 'packages/b01-blocker/**', remediation => 0 },
+    };
+    my $status = { 'b02-dependent' => 'pending', 'b01-blocker' => 'blocked' };
+    my ($a, $dir, $runs, $log) = mk_dag_stall_a(meta => $meta, status => $status);
+    BpOrch::dag_stall_step($a);
+    my @entries = _dag_stall_queue_entries($runs);
+    is(scalar(@entries), 1, 'AC-37: remediation-queue.json gains one dag-stall entry');
+    is($entries[0]->{finding}{subject}, 'b01-blocker',
+        'AC-37: finding.subject is the blocker, not the stalled dependent');
+    is($entries[0]->{finding}{remedy}{action}, 'remediate-conformance',
+        "AC-37: finding.remedy.action is 'remediate-conformance'");
+    is(scalar(needs_you_files($runs)), 0, 'AC-37: runs/needs-you gains no file for a mechanical blocker route');
+    my $logtext = '';
+    if (open(my $lfh, '<', $log)) { local $/; $logtext = <$lfh> // ''; close $lfh; }
+    like($logtext, qr/dag_stall_remediation/, 'AC-37: orchestrator.log gains a dag_stall_remediation event');
+}
+
+# ---- AC-38/AC-39: the finding is compatible with the real b07 engine -------
+my $have_remediate = do {
+    my $ok = 1;
+    local $SIG{__WARN__} = sub { warn $_[0] unless $_[0] =~ /Subroutine .* redefined/ };
+    eval { require "$Bin/../../scripts/bp-remediate.pl"; 1 } or $ok = 0;
+    $ok;
+};
+ok($have_remediate, 'AC-38: bp-remediate.pl (classify_finding, write_set_for) is loadable');
+
+SKIP: {
+    skip 'bp-remediate.pl unavailable', 2 unless $have_remediate;
+    my $find = {
+        kind     => 'dag-stall',
+        subject  => 'b01-blocker',
+        detail   => "package 'b01-blocker' is 'blocked' and blocks 1 dependent package(s): "
+                   . "b02-dependent — the run cannot progress until it reaches 'done'",
+        evidence => { blocked_on => 'b01-blocker', blocker_status => 'blocked',
+                      dependents => ['b02-dependent'], files => [] },
+        remedy   => { action => 'remediate-conformance', package => 'b01-blocker' },
+    };
+    my $c = BpRemediate::classify_finding($find,
+        { pkg_write_sets => { 'b01-blocker' => 'packages/b01-blocker/**' } });
+    ok(defined($c) && ref($c) eq 'HASH', 'AC-38: classify_finding returns a disposition hash for the b08 finding shape');
+    is($c->{disposition}, 'auto',
+        "AC-38: remedy.action 'remediate-conformance' is auto-remediable, not fail-closed to 'unfixable'");
+}
+
+SKIP: {
+    skip 'bp-remediate.pl unavailable', 1 unless $have_remediate;
+    my $f2 = {
+        kind     => 'dag-stall',
+        subject  => 'blocker',
+        detail   => "package 'blocker' is 'blocked' and blocks 1 dependent package(s): stalled "
+                   . "— the run cannot progress until it reaches 'done'",
+        evidence => { blocked_on => 'blocker', blocker_status => 'blocked',
+                      dependents => ['stalled'], files => [] },
+        remedy   => { action => 'remediate-conformance', package => 'blocker' },
+    };
+    is(BpRemediate::write_set_for($f2, { pkg_write_sets => { blocker => 'A', stalled => 'B' } }), 'A',
+        "AC-39: the resolved write set is the blocker's declared write set, not the stalled package's");
+}
+
+# ---- AC-40/AC-41: idempotence and registry persistence across ticks --------
+SKIP: {
+    skip 'BpOrch::dag_stall_step not implemented', 4 unless $have_dag_stall_step;
+    my $meta = {
+        'b02-dependent' => { deps => ['b01-blocker'], write_set => 'packages/b02-dependent/**', remediation => 0 },
+        'b01-blocker'   => { deps => [], write_set => 'packages/b01-blocker/**', remediation => 0 },
+    };
+    my $status = { 'b02-dependent' => 'pending', 'b01-blocker' => 'blocked' };
+    my ($a, $dir, $runs, $log) = mk_dag_stall_a(meta => $meta, status => $status);
+    BpOrch::dag_stall_step($a);
+    my $first_count = scalar(_dag_stall_queue_entries($runs));
+
+    my $a2 = { %$a, now => $a->{now} + 60 };
+    BpOrch::dag_stall_step($a2);
+    is(scalar(_dag_stall_queue_entries($runs)), $first_count,
+        'AC-40: an identical second tick performs no second submission (queue non-quiet guard)');
+
+    my $meta3 = { %$meta, 'b03-also-dependent' => { deps => ['b01-blocker'], write_set => 'z', remediation => 0 } };
+    my $status3 = { %$status, 'b03-also-dependent' => 'pending' };
+    my $a3 = { %$a, meta => $meta3, status => $status3, now => $a->{now} + 120 };
+    BpOrch::dag_stall_step($a3);
+    is(scalar(_dag_stall_queue_entries($runs)), $first_count,
+        'AC-40: a widened dependent list on the same blocker still produces no new submission (finding_key guard)');
+
+    ok(-f "$runs/registry.json", 'AC-41: the _dag_stall fact is persisted to runs/registry.json');
+    my $reg = decode_json_file("$runs/registry.json");
+    ok(ref($reg) eq 'HASH' && ref($reg->{_dag_stall}) eq 'HASH' && exists $reg->{_dag_stall}{'b01-blocker'},
+        'AC-41: a fresh read of registry.json (simulating restart) still shows the blocker recorded');
+}
+
+# ---- AC-42 (criterion f): unresolvable -> exactly one _dag decision --------
+SKIP: {
+    skip 'BpOrch::dag_stall_step not implemented', 5 unless $have_dag_stall_step;
+    my $meta = { 'b02-x' => { deps => ['nope-missing'], write_set => 'x', remediation => 0 } };
+    my $status = { 'b02-x' => 'pending' };
+    my ($a, $dir, $runs, $log) = mk_dag_stall_a(meta => $meta, status => $status);
+    BpOrch::dag_stall_step($a);
+    my @ny = needs_you_files($runs);
+    is(scalar(@ny), 1, 'AC-42: exactly one needs-you file after an unresolvable stall');
+    for (1 .. 10) { BpOrch::dag_stall_step($a); }
+    my @ny2 = needs_you_files($runs);
+    is(scalar(@ny2), 1, 'AC-42: ten further ticks add no additional needs-you file');
+    my ($decision) = map { decode_json_file($_) } @ny2;
+    is($decision->{package}, '_dag', "AC-42: decision package is '_dag'");
+    is($decision->{kind}, 'dag-stalled', "AC-42: decision kind is 'dag-stalled'");
+    ok(!-f "$runs/remediation-queue.json",
+        'AC-42: remediation_step is never called (queue file never created) for an unresolvable stall');
+}
+
+# ---- AC-43: mixed blockers+unresolvable -> decision route only ------------
+SKIP: {
+    skip 'BpOrch::dag_stall_step not implemented', 3 unless $have_dag_stall_step;
+    my $meta = {
+        'b02-blocked-dep' => { deps => ['b01-blocker'], write_set => 'x', remediation => 0 },
+        'b01-blocker'     => { deps => [], write_set => 'y', remediation => 0 },
+        'b03-dangling'    => { deps => ['nope-missing'], write_set => 'z', remediation => 0 },
+    };
+    my $status = { 'b02-blocked-dep' => 'pending', 'b01-blocker' => 'blocked', 'b03-dangling' => 'pending' };
+    my ($a, $dir, $runs, $log) = mk_dag_stall_a(meta => $meta, status => $status);
+    BpOrch::dag_stall_step($a);
+    my @ny = needs_you_files($runs);
+    is(scalar(@ny), 1, 'AC-43: a tick with both blockers and unresolvable takes only the decision route');
+    ok(!-f "$runs/remediation-queue.json", 'AC-43: no remediation submission alongside the decision');
+    is(scalar(_dag_stall_queue_entries($runs)), 0, 'AC-43: zero dag-stall remediation-queue entries');
+}
+
+# ---- AC-44: unscopable/exhausted route still ends visibly ------------------
+SKIP: {
+    skip 'BpOrch::dag_stall_step not implemented', 2 unless $have_dag_stall_step;
+    my $meta = {
+        'b02-dependent' => { deps => ['b01-blocker'], write_set => 'packages/b02-dependent/**', remediation => 0 },
+        'b01-blocker'   => { deps => [], write_set => '', remediation => 0 },   # empty write_set -> unscopable
+    };
+    my $status = { 'b02-dependent' => 'pending', 'b01-blocker' => 'blocked' };
+    my ($a, $dir, $runs, $log) = mk_dag_stall_a(meta => $meta, status => $status);
+    BpOrch::dag_stall_step($a);                              # tick 1: submitted, engine escalates (no write set)
+    my $a2 = { %$a, now => $a->{now} + 3600 };
+    BpOrch::dag_stall_step($a2);                              # tick 2: quiesced queue, mechanical route exhausted
+    my @ny = needs_you_files($runs);
+    is(scalar(@ny), 1, 'AC-44: exactly one _dag decision once the remediation route is exhausted');
+    my ($decision) = map { decode_json_file($_) } @ny;
+    is($decision->{context}{class}, 'remediation-exhausted',
+        "AC-44: decision context.class is 'remediation-exhausted'");
+}
+
+# ---- AC-45: tunables.dag_stall == 0 short-circuits, writes nothing --------
+SKIP: {
+    skip 'BpOrch::dag_stall_step not implemented', 4 unless $have_dag_stall_step;
+    my @cases = (
+        { label => 'blocker',
+          meta   => { 'b02-dependent' => { deps => ['b01-blocker'], write_set => 'x', remediation => 0 },
+                      'b01-blocker'   => { deps => [], write_set => 'y', remediation => 0 } },
+          status => { 'b02-dependent' => 'pending', 'b01-blocker' => 'blocked' } },
+        { label => 'unresolvable',
+          meta   => { 'b02-x' => { deps => ['nope-missing'], write_set => 'x', remediation => 0 } },
+          status => { 'b02-x' => 'pending' } },
+    );
+    for my $case (@cases) {
+        my ($a, $dir, $runs, $log) = mk_dag_stall_a(
+            meta => $case->{meta}, status => $case->{status}, tunables => { dag_stall => 0 });
+        my $out = BpOrch::dag_stall_step($a);
+        is_deeply($out, { fired => 0, decided => 0, remediation_outstanding => 0 },
+            "AC-45: dag_stall==0 short-circuits dag_stall_step for a $case->{label} stall");
+        ok(!-f "$runs/remediation-queue.json" && !-d "$runs/needs-you",
+            "AC-45: dag_stall==0 writes nothing for a $case->{label} stall");
+    }
+}
+
+# ---- AC-46: static contract -- every new sub is defined, forbidden require -
+{
+    my $orch_src_path = "$Bin/../../scripts/bp-orchestrator.pl";
+    open(my $sfh, '<', $orch_src_path) or die "cannot read $orch_src_path: $!";
+    local $/;
+    my $src = <$sfh>;
+    close $sfh;
+    for my $sub (qw(resolve_dep_token normalize_dag find_cycles dag_stall dag_stall_step _dag_decision)) {
+        like($src, qr/\bsub\s+\Q$sub\E\b/, "AC-46: bp-orchestrator.pl defines sub $sub");
+    }
+    unlike($src, qr/require\s+.*bp-validate-dag\.pl/,
+        'AC-46: bp-orchestrator.pl contains no require of bp-validate-dag.pl');
+}
+
 done_testing();
