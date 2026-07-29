@@ -20,6 +20,45 @@ bp_hook_gate
 # status, Next-action, freshness) would wedge it. Skip any non-coordinator role.
 [ "${BP_ROLE:-coordinator}" = "coordinator" ] || exit 0
 
+# iso_now() lives in scripts/bp-lib.sh, not hooks/lib.sh. Sourced AFTER the
+# bp_hook_gate/BP_ROLE early-exits so unrelated sessions pay nothing for it.
+# shellcheck source=../scripts/bp-lib.sh
+[ -r "$HOOK_DIR/../scripts/bp-lib.sh" ] && source "$HOOK_DIR/../scripts/bp-lib.sh"
+
+# bp_stamp_last_updated — rewrite the ledger's frontmatter last_updated: from the
+# real clock (bp-lib.sh iso_now()), so the field is measured rather than recalled.
+# BEST-EFFORT AND FAIL-OPEN: returns non-zero and logs one line on any failure, and
+# NEVER exits. A stopping coordinator's ledger write is its only forward move; a gate
+# that died trying to stamp would trap the session (the opposite posture from b12's
+# guard, deliberately). Same-dir tmp + mv, so a failure can never leave a partial
+# ledger. Semantics mirror bp-orchestrator.pl _set_ledger_status (:2609-2626).
+bp_stamp_last_updated() {
+  local ts tmp
+  [ -n "${BP_LEDGER:-}" ] && [ -f "$BP_LEDGER" ] || return 1
+  command -v iso_now >/dev/null 2>&1 || {
+    echo "butler gate-stop: iso_now unavailable (scripts/bp-lib.sh not sourced) — left last_updated as authored." >&2
+    return 1
+  }
+  ts=$(iso_now 2>/dev/null) || ts=""
+  [ -n "$ts" ] || {
+    echo "butler gate-stop: could not read the clock — left last_updated as authored." >&2
+    return 1
+  }
+  tmp="$BP_LEDGER.tmp.$$"
+  if awk -v ts="$ts" '
+        BEGIN { infm = 0; hit = 0 }
+        /^---[[:space:]]*$/            { infm++; print; next }
+        infm == 1 && hit == 0 && /^last_updated:/ { print "last_updated: " ts; hit = 1; next }
+                                      { print }
+        END { if (!hit) exit 3 }
+      ' "$BP_LEDGER" > "$tmp" 2>/dev/null && mv "$tmp" "$BP_LEDGER" 2>/dev/null; then
+    return 0
+  fi
+  rm -f "$tmp" 2>/dev/null
+  echo "butler gate-stop: could not stamp last_updated in $BP_LEDGER — left it as authored (the stop proceeds)." >&2
+  return 1
+}
+
 FORCE="$BP_DIR/runs/${BP_PACKAGE:-pkg}.force-stop"
 if [ -f "$FORCE" ]; then rm -f "$FORCE"; exit 0; fi
 
@@ -56,9 +95,10 @@ if [ -f "$BP_DIR/runs/.paused" ] && [ ! -f "$BP_DIR/runs/.shutdown" ]; then
   PNOW=$(date +%s); PMT=$(stat -c %Y "$BP_LEDGER" 2>/dev/null || echo 0)
   PAGE_MIN=$(( (PNOW - PMT) / 60 )); PFRESH="${BP_LEDGER_FRESH_MIN:-15}"
   if [ "$PAGE_MIN" -gt "$PFRESH" ]; then
-    echo "STOP BLOCKED: a fleet pause is active but the ledger is ${PAGE_MIN}m stale (limit ${PFRESH}m). Refresh '## Next action' and last_updated to the current state so the warm resume is clean, then stop." >&2
+    echo "STOP BLOCKED: a fleet pause is active but the ledger is ${PAGE_MIN}m stale (limit ${PFRESH}m). Refresh '## Next action', and set last_updated with iso_now (or: date -u +%Y-%m-%dT%H:%M:%SZ) — never from memory, you have no clock — so the warm resume is clean, then stop." >&2
     exit 2
   fi
+  bp_stamp_last_updated || true
   exit 0
 fi
 
@@ -75,7 +115,7 @@ STATUS=$(awk '
 case "$STATUS" in
   done|blocked|parked) : ;;
   *)
-    echo "STOP BLOCKED: ledger status is '${STATUS:-unset}', not terminal. Before stopping: finish or park the work, update the ledger (frontmatter status -> done|blocked|parked, last_updated, 'Next action', 'Outputs'), then stop. If genuinely stuck, status: blocked with a precise Next action is a valid terminal state." >&2
+    echo "STOP BLOCKED: ledger status is '${STATUS:-unset}', not terminal. Before stopping: finish or park the work, update the ledger (frontmatter status -> done|blocked|parked, 'Next action', 'Outputs') and set last_updated with iso_now (or: date -u +%Y-%m-%dT%H:%M:%SZ) — never from memory, you have no clock — then stop. If genuinely stuck, status: blocked with a precise Next action is a valid terminal state." >&2
     exit 2 ;;
 esac
 
@@ -83,7 +123,7 @@ NOW=$(date +%s); MT=$(stat -c %Y "$BP_LEDGER" 2>/dev/null || echo 0)
 AGE_MIN=$(( (NOW - MT) / 60 ))
 FRESH="${BP_LEDGER_FRESH_MIN:-15}"
 if [ "$AGE_MIN" -gt "$FRESH" ]; then
-  echo "STOP BLOCKED: ledger status is terminal but the file is ${AGE_MIN}m stale (limit ${FRESH}m). Re-verify the final state on disk, refresh last_updated and the closing summary, then stop." >&2
+  echo "STOP BLOCKED: ledger status is terminal but the file is ${AGE_MIN}m stale (limit ${FRESH}m). Re-verify the final state on disk, refresh the closing summary, and set last_updated with iso_now (or: date -u +%Y-%m-%dT%H:%M:%SZ) — never from memory, you have no clock — then stop." >&2
   exit 2
 fi
 
@@ -107,4 +147,5 @@ if command -v jq >/dev/null 2>&1 && [ -s "$REG" ] && [ -n "${BP_PACKAGE:-}" ]; t
     && mv "$TMP" "$REG" || rm -f "$TMP"
 fi
 
+bp_stamp_last_updated || true
 exit 0

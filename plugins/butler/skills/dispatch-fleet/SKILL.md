@@ -24,7 +24,7 @@ Sandbox-only: the fleet is detached `claude -p` coordinators (`setsid`/`nohup`/`
    ```
    It is **idempotent start-or-continue**: it refuses on the host, detaches the deterministic orchestrator, and — if one is already live (its `runs/.orchestrator` marker PID is alive) — just reports that and exits. The orchestrator's own resume-sweep folds in warm/cold recovery of any interrupted coordinators, so there is **no separate resume verb**. If a prior run was torn down by a graceful-reap (e.g. the host slept and the container reaped it), a terminal `runs/.shutdown` marker can linger; since no live orchestrator holds the marker, dispatch treats it as stale and clears it on start so the fleet actually resumes instead of winding straight back down.
 
-3. **Record the launch** in `blueprint.md`: set `status: running`, refresh `last_updated`. (The per-package status rows are now maintained by the orchestrator + harvest-judge; you set the blueprint-level fields.)
+3. **Record the launch** in `blueprint.md`: set `status: running`, and refresh `last_updated` with `iso_now` (or `date -u +%Y-%m-%dT%H:%M:%SZ`) — do not write it from memory; you have no clock. (The per-package status rows are now maintained by the orchestrator + harvest-judge; you set the blueprint-level fields.)
 
 4. **Hand off to the reporter.** Tell the user the fleet is running **unattended** and that they observe progress and answer queued decisions via:
    ```

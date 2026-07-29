@@ -63,9 +63,9 @@ VERDICT=$(bp_gate_verdict "$TOOL" "$PCLASS" 1)
 # Denied: emit the stop-and-park instruction matching the active signal.
 case "$SIGNAL" in
   shutdown)
-    echo "STOP-AND-PARK: a fleet-wide graceful shutdown is in progress (runs/.shutdown) — new work is denied. Record the in-flight result, set '## Next action' to where a fresh coordinator would resume, set frontmatter status: parked, refresh last_updated, then STOP. The run stays down (no auto-resume) until a human relaunches it." >&2 ;;
+    echo "STOP-AND-PARK: a fleet-wide graceful shutdown is in progress (runs/.shutdown) — new work is denied. Record the in-flight result, set '## Next action' to where a fresh coordinator would resume, set frontmatter status: parked, refresh last_updated with iso_now (or: date -u +%Y-%m-%dT%H:%M:%SZ) — do not write it from memory, you have no clock — then STOP. The run stays down (no auto-resume) until a human relaunches it." >&2 ;;
   paused)
-    echo "STOP-AND-PARK: the fleet is paused to preserve the usage reserve / weather a telemetry gap (runs/.paused) and WILL auto-resume this package — new work is denied. Record the drained worker's result and a concrete '## Next action', LEAVE status non-terminal (running/converging — do NOT set parked or done, or the orchestrator won't resume you), refresh last_updated, then STOP. You are relaunched warm after the window resets." >&2 ;;
+    echo "STOP-AND-PARK: the fleet is paused to preserve the usage reserve / weather a telemetry gap (runs/.paused) and WILL auto-resume this package — new work is denied. Record the drained worker's result and a concrete '## Next action', LEAVE status non-terminal (running/converging — do NOT set parked or done, or the orchestrator won't resume you), refresh last_updated with iso_now (or: date -u +%Y-%m-%dT%H:%M:%SZ) — do not write it from memory, you have no clock — then STOP. You are relaunched warm after the window resets." >&2 ;;
   forcestop)
     echo "STOP-AND-PARK: this package is being force-stopped (runs/${BP_PACKAGE:-pkg}.force-stop) — new work is denied. Record a concrete '## Next action', then STOP." >&2 ;;
 esac
