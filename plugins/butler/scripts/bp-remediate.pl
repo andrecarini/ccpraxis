@@ -109,10 +109,10 @@ sub finding_key {
     my $remedy   = (ref $f->{remedy}   eq 'HASH') ? $f->{remedy}   : {};
     my $evidence = (ref $f->{evidence} eq 'HASH') ? $f->{evidence} : {};
 
-    # Build the candidate list with `exists` guards and never let foreach alias a
-    # hash element. `for my $c ($h->{k})` ALIASES $h->{k}, and taking an alias to
+    # Build the candidate list with exists-guards and never let foreach alias a
+    # hash element. the form 'for my $c ($h->{k})' ALIASES $h->{k}, and taking an alias to
     # a missing key AUTOVIVIFIES it -- so the old form silently mutated the very
-    # finding it was inspecting, stamping `evidence.means => null` onto it. That
+    # finding it was inspecting, stamping an evidence.means => null key onto it. That
     # made finding_signature() of a "clean" verdict finding differ from the
     # signature stored when the entry was authored, so the NP-1 no-progress guard
     # could never see two identical signatures and a stalled remediation kept
