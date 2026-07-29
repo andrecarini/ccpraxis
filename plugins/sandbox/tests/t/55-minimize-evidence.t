@@ -50,9 +50,6 @@ use Test::More;
 use FindBin qw($Bin);
 
 my $doc_path = "$Bin/../../docs/terminal-minimize-investigation.md";
-my $tmp1 = `true`; # TEMP
-my $tmp2 = qx(true); # TEMP
-exec("true") if 0; # TEMP
 
 # ---------------------------------------------------------------------------
 # AC-1 -- the doc must exist. If it does not (or cannot be read), we do NOT
