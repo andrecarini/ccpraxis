@@ -32,11 +32,12 @@ my $HOOKSJSON = "$HOOKS/hooks.json";
 
 my $have_jq = do { my $o = `bash -c 'command -v jq' 2>/dev/null`; $o =~ /\S/ ? 1 : 0 };
 
-# 259 total: 83 unconditional (AC-1,2,3,18,19-pure,21,20) + 176 inside the jq-gated SKIP block
-# (AC-4,5,6..17,19-hook,22, plus F1-F6 red-team-fix assertions from step6/step7 -- several of
-# which assert once after a many-iteration loop, so their real assertion count exceeds their
-# source-line count). Both halves are fixed-length (no randomness), so this count is stable.
-plan tests => 259;
+# NO hardcoded plan, deliberately (b26). A hand-counted `plan tests => 259` is precisely what made
+# this file brittle: registering ONE new PreToolUse hook in hooks.json makes the per-entry loop
+# below (:~344) emit one extra assertion and the plan mismatches, turning a done package's oracle
+# red for a change it has no opinion about. t/64-ledger-guard.t already uses done_testing(); follow
+# it. The jq-gated SKIP block keeps its own `skip ..., 176` count -- that is a skip count, not a
+# plan, and it is not this package's business.
 
 my $J    = JSON::PP->new->canonical;
 my $ROOT = tempdir(CLEANUP => 1);
@@ -44,6 +45,23 @@ my $pn   = 0;
 my $bpn  = 0;
 
 sub fwd { (my $p = shift) =~ s{\\}{/}g; $p }
+
+# b26: block 0's command list is asserted "contains, in relative order" rather than by exact
+# equality. AC-20's real intent (b10-repeat-command-guard.md:52-54) is that b10's own registration
+# is present, correctly named and correctly ordered -- NOT that hooks.json may never gain a hook.
+# Subsequence semantics over EXACT full-command-string matches: every needle must appear, each at a
+# position strictly after the previous needle's match. Appended/interleaved foreign commands are
+# permitted; a missing, renamed or relatively-reordered needle is NOT. Empty haystack -> 0.
+sub cmds_contain_in_order {
+    my ($hay, $needles) = @_;
+    my $i = 0;
+    for my $n (@$needles) {
+        $i++ while $i < @$hay && $hay->[$i] ne $n;
+        return 0 if $i >= @$hay;
+        $i++;
+    }
+    return 1;
+}
 
 sub realpath_m {
     my ($p) = @_; local $ENV{P} = $p;
@@ -325,9 +343,11 @@ is(gate_verdict_call('Edit', 'worksite', 1),  'deny',  'AC-21: regression - bp_g
 
     my $b0 = $pre->[0] // {};
     is($b0->{matcher}, 'Edit|Write|MultiEdit|NotebookEdit', 'AC-20: block 0 matcher unchanged');
-    is_deeply([ map { $_->{command} } @{ $b0->{hooks} // [] } ],
-              [ $cmd_of->('gate-shutdown.sh'), $cmd_of->('guard-writes.sh') ],
-              'AC-20: block 0 command list unchanged, in order');
+    my @b0_cmds = map { $_->{command} } @{ $b0->{hooks} // [] };
+    ok(cmds_contain_in_order(\@b0_cmds,
+                             [ $cmd_of->('gate-shutdown.sh'), $cmd_of->('guard-writes.sh') ]),
+       'AC-20: block 0 still contains b10-era [gate-shutdown.sh, guard-writes.sh] in relative order (later packages may append or interleave)')
+        or diag("block 0 commands: " . join(' | ', @b0_cmds));
 
     my $b1 = $pre->[1] // {};
     is($b1->{matcher}, 'Bash', 'AC-20: block 1 matcher unchanged');
@@ -1030,3 +1050,5 @@ SKIP: {
         is($out2, '', 'F6b: second (non-firing) call produces completely empty stderr [LOW-1]');
     }
 }
+
+done_testing();

@@ -3,7 +3,8 @@
 #   - verdict_from_oracle: the deliberate asymmetry (only a clean, positively-
 #     evidenced denial is a PASS; forbidden-present is always a breach; anything
 #     else fails closed as inconclusive),
-#   - settings_json: a valid --settings blob wiring butler's three real hooks,
+#   - settings_json: a valid --settings blob wiring butler's real hooks (b26 adds a
+#     fourth, ledger-guard.sh, to the write-matcher block),
 #   - selftest_cache_key: stable shape (claude version + hooks hash).
 # The LIVE subagent dispatch itself is proven in the sandbox (needs claude +
 # tokens); this locks the decision logic that gates it. Pure bash — runs anywhere.
@@ -50,6 +51,14 @@ is(ref $parsed->{hooks}{PreToolUse}, 'ARRAY', 'settings_json has a PreToolUse ar
 like($sj, qr{/x/hooks/guard-writes\.sh},  'wires guard-writes.sh');
 like($sj, qr{/x/hooks/gate-shutdown\.sh}, 'wires gate-shutdown.sh');
 like($sj, qr{/x/hooks/track-dispatch\.sh},'wires track-dispatch.sh');
+like($sj, qr{/x/hooks/ledger-guard\.sh}, 'wires ledger-guard.sh');
+
+my ($edit_block) = grep { ($_->{matcher} // '') eq 'Edit|Write|MultiEdit|NotebookEdit' }
+                        @{ $parsed->{hooks}{PreToolUse} // [] };
+ok($edit_block, 'settings_json has the Edit|Write|MultiEdit|NotebookEdit PreToolUse block');
+ok(scalar(grep { ($_->{command} // '') =~ m{/x/hooks/ledger-guard\.sh} }
+               @{ ($edit_block // {})->{hooks} // [] }),
+   'ledger-guard.sh is wired in the write matcher block (so the subagent self-test exercises it)');
 
 # --- cache key: stable shape + deterministic ---------------------------------
 my $k1 = call('selftest_cache_key');
