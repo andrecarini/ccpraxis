@@ -222,6 +222,13 @@ You can protect additional paths yourself by listing them at:
 ${CLAUDE_CONFIG_DIR:-~/.claude}/ccpraxis-protected-paths.json
 ```
 
+**One caveat, and it matters if you set `CLAUDE_CONFIG_DIR`.** The launcher pins the list it reads to
+`$HOME/.claude/ccpraxis-protected-paths.json`, and the guard will not read a list out of a directory
+named by `CLAUDE_CONFIG_DIR` — that is section 2's "may not name a source" rule, and it is what stops a
+writable `CLAUDE_CONFIG_DIR` from adding protected roots you never asked for. So on a machine with
+`CLAUDE_CONFIG_DIR` set, put the file in `~/.claude` (or in the home your OS itself reports, which the
+guard also checks) rather than in the redirected directory.
+
 The file, if present, must be a **JSON array of absolute path strings**, for example:
 
 ```json
@@ -235,10 +242,11 @@ Every entry becomes a `user-configured` protected root. An **absent file is an e
 error** — nothing to configure means nothing extra is protected. A **malformed file (not valid JSON,
 or not a JSON array) is an error**, surfaced as a `claude-sandbox: WARNING: ...` line same as any
 other broken source (see section 6); it does not block the launch of an unrelated project, and it
-does not relax any refusal already in effect. The list is machine-scoped (keyed off
-`CLAUDE_CONFIG_DIR`/`~/.claude`, not per-project), so one list serves every project on the machine.
-An entry that resolves to a bare filesystem root is rejected with a `root-bare-rejected` warning
-rather than being accepted as a protected root.
+does not relax any refusal already in effect. The list is machine-scoped (it lives in your Claude home,
+not per-project), so one list serves every project on the machine. An entry that resolves to a bare
+filesystem root is rejected with a `root-bare-rejected` warning rather than being accepted as a
+protected root, and one that resolves to your home directory — or to a directory containing it — is
+rejected with `root-home-rejected`, since either would refuse every project you own.
 
 ## 8. There is no override
 
