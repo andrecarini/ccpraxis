@@ -588,7 +588,8 @@ SKIP: {
 # =========================================================================
 {
     ok(scalar(@STAMPED_VALUES) >= 1, 'AC-24 setup: at least one gate-stamped value was captured this run');
-    for my $v (@STAMPED_VALUES) {
+    for my $tuple (@STAMPED_VALUES) {
+        my ($v, undef, undef) = @$tuple;
         my $verdict = stamp_verdict($v);
         my $secs_00 = defined($v) && $v =~ /:00Z$/;
         ok($verdict eq '' || ($secs_00 && $verdict eq 'rounded-00'),
