@@ -2972,8 +2972,20 @@ sub remediation_step {
         next if $esc_seen{$k}++;
         push @escalated_all, $d;
     }
-    if (@escalated_all) {
-        my $n = scalar @escalated_all;
+    # b08: a dag-stall-tagged finding's escalation is NOT surfaced through this
+    # generic '_remediation' channel -- dag_stall_step owns that decision under
+    # the '_dag' pseudo-package once its own mechanical route is exhausted
+    # (spec §5.2.3/§5.2.5). Surfacing it here too produced two needs-you files
+    # for a single DAG stall (AC-44); this is the "second write path that
+    # bypasses the dedupe" -- '_remediation'/'remediation-escalation' is a
+    # different (package, kind) key than '_dag'/'dag-stalled', so
+    # queue_needs_you's dedupe never saw them as the same decision.
+    my @escalated_visible = grep {
+        my $k = (ref $_->{finding} eq 'HASH' ? $_->{finding}{kind} : $_->{kind}) // '';
+        $k ne 'dag-stall'
+    } @escalated_all;
+    if (@escalated_visible) {
+        my $n = scalar @escalated_visible;
         my $rec = {
             kind       => 'remediation-escalation',
             package    => '_remediation',
@@ -2982,7 +2994,7 @@ sub remediation_step {
             ts         => _iso($now),
             manual     => 0,
             question   => "$n finding" . ($n == 1 ? '' : 's') . ' could not be auto-remediated',
-            context    => { findings => \@escalated_all, rounds_used => $plan->{queue}{rounds_used},
+            context    => { findings => \@escalated_visible, rounds_used => $plan->{queue}{rounds_used},
                              rounds_cap => $ctx{cap}, queue => 'runs/remediation-queue.json' },
             created_at => $now,
         };
