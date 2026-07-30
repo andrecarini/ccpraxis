@@ -1262,8 +1262,18 @@ sub run {
     # scoped `claude -p` that writes the verdict file); read a completed verdict.
     # Tests inject a recorder for spawn + seed verdict files for read.
     my $spawn_judge = $opt->{spawn_judge} || sub {
-        my ($a) = @_;       # { kind, pkg }
+        my ($a) = @_;       # { kind, pkg, max_turns? }
         require File::Path; File::Path::make_path("$runs/$a->{kind}");
+        # b09 item 8: a widened harvest budget (spec Sec2.5) must actually reach the
+        # child, not just be recorded in the registry as intended. bp-judge.sh reads
+        # BP_HARVEST_MAX_TURNS as its override, so hand it down via a scoped `local`
+        # rather than touching argv (which stays 4 positional args). Validated only
+        # for harvest + a plain positive-integer max_turns, so a malformed/absent
+        # value leaves %ENV untouched (an ambient operator override, if any, survives
+        # unmolested) instead of clobbering it with undef.
+        my $mt = $a->{max_turns};
+        local $ENV{BP_HARVEST_MAX_TURNS} = $mt
+            if $a->{kind} eq 'harvest' && defined $mt && !ref $mt && $mt =~ /^\d+$/ && $mt > 0;
         my @cmd = ('bash', "$DIR/bp-judge.sh", $a->{kind}, $bp, $a->{pkg},
                    judge_verdict_path($runs, $a->{kind}, $a->{pkg}));
         my $rc = system(@cmd);
@@ -1703,7 +1713,17 @@ sub run {
                         }
                         next;   # section (c) re-fires the harvest this tick
                     }
-                    if ($jstate eq 'starved' && $st eq 'done') {
+                    # b09 item 9: this guard used to fire on ANY fallthrough from the
+                    # widen check above, conflating two different reasons the widen was
+                    # skipped: (a) hs>=1, a genuine SECOND starvation (already widened
+                    # once, exhausted again — the real park case), vs (b) hs==0, a FIRST
+                    # starvation whose widen was blocked only because the *ordinary*
+                    # re-audit budget (spent by earlier, unrelated crashes/timeouts) was
+                    # already exhausted — no widen was ever attempted for this package.
+                    # Both must still park (a judge-starved decision — the audit did not
+                    # complete either way) but only (a)'s wording may claim a second
+                    # attempt / a widened budget.
+                    if ($jstate eq 'starved' && $st eq 'done' && $hs >= 1) {
                         # SECOND starvation of the same package: park the branch (#13's
                         # park-the-branch, never global-halt) with a decision that says
                         # the AUDIT did not complete — never that the package failed
@@ -1723,6 +1743,13 @@ sub run {
                         update_registry_pkg($runs, $pkg, { harvest => 'starved' });
                         $reg->{$pkg}{harvest} = 'starved';
                         my $initial = harvest_initial_max_turns($bpdir, $pkg, $t);
+                        # b09 item 10: $current is provably the delivered budget, not
+                        # merely the intended one — it is read back through the SAME
+                        # plain-positive-integer predicate (_reg_int) that item 8's
+                        # closure requires before it will set BP_HARVEST_MAX_TURNS at
+                        # all, AND it was written to the registry (:1690, staged
+                        # in-memory at :1685) from the exact same $widened value that was
+                        # handed to $spawn_judge's max_turns arg — never re-derived.
                         my $current = _reg_int($reg->{$pkg}{harvest_max_turns}) // $initial;
                         _log($log, 'judge_starved_park', { package => $pkg, starvations => $hs + 1, budget => $current });
                         my $question = "The harvest AUDIT of package '$pkg' did not complete. The audit judge ran out of turns "
@@ -1743,6 +1770,55 @@ sub run {
                                   . ", budget $initial -> $current (widened once via the SYN-7 rule), harvest_reaudit=$ra"
                                   . ", starvations=" . ($hs + 1) . ". No verdict file was ever written. Judge log: "
                                   . "runs/harvest/$pkg.jsonl; archived verdicts: runs/harvest/archive/.";
+                        queue_needs_you($runs, { package => $pkg, blueprint => $bp, kind => 'judge-starved',
+                            question => $question, context => $context, created_at => $now });
+                        next;
+                    }
+                    if ($jstate eq 'starved' && $st eq 'done') {
+                        # FIRST starvation (hs == 0): no widen was ever attempted for
+                        # this package — the widen guard above skipped it purely because
+                        # the ordinary re-audit budget was already spent by earlier,
+                        # unrelated crash/timeout re-audits (effective_attempts >= cap).
+                        # This still parks (judge-starved: the audit never completed) but
+                        # the wording must NOT claim a second attempt or a widened
+                        # budget occurred — only one starvation, on the normal budget,
+                        # ever happened. Kill/clear as in the widen path above.
+                        my $jpidf = judge_pid_path($runs, 'harvest', $pkg);
+                        if (-f $jpidf) {
+                            my ($jp2) = (_read_file($jpidf) // '') =~ /^(\d+)/;
+                            kill_pid($jp2) if defined $jp2 && pid_alive($jp2);
+                            unlink $jpidf;
+                        }
+                        clear_judge_inflight($runs, 'harvest', $pkg);
+                        archive_judge_verdict($runs, 'harvest', $pkg, $now, $log);
+                        clear_judge_verdict($runs, 'harvest', $pkg);
+                        update_registry_pkg($runs, $pkg, { harvest => 'starved' });
+                        $reg->{$pkg}{harvest} = 'starved';
+                        my $initial = harvest_initial_max_turns($bpdir, $pkg, $t);
+                        # No widen occurred for this package (item 10): the reported
+                        # budget is the plain normal one, never a $current pulled from
+                        # a registry field that a widen never touched.
+                        _log($log, 'judge_starved_park', { package => $pkg, starvations => 1, budget => $initial });
+                        my $question = "The harvest AUDIT of package '$pkg' did not complete. The audit judge ran out of turns "
+                                  . "once, on its normal budget ($initial turns); a widened retry could not be granted because "
+                                  . "the ordinary re-audit budget (already spent by earlier, unrelated crash/timeout retries, "
+                                  . "harvest_reaudit=$ra) was exhausted — so no verdict was ever written and '$pkg' has NOT "
+                                  . "been independently checked. This is not a verdict about the package's work: its status is "
+                                  . "still 'done' and its own tests and review stand unchallenged. Do one of: (1) read "
+                                  . "runs/harvest/archive/ and runs/harvest/$pkg.jsonl to see how far the audit got; "
+                                  . "(2) verify '$pkg' yourself against its done criteria; or (3) give the judge more room — "
+                                  . "raise BP_HARVEST_MAX_TURNS, then set packages.$pkg.harvest back to \"\" in "
+                                  . "runs/registry.json to re-arm the audit. The run was NOT paused and other packages keep "
+                                  . "going."
+                                  . ($mode eq 'gate'
+                                      ? " Harvest is in GATE mode, so packages depending on '$pkg' stay held until this is resolved."
+                                      : '');
+                        my $context = "harvest judge exhausted its normal turn budget once on '$pkg' (no widen attempted — "
+                                  . "the re-audit budget was already spent by earlier, unrelated crash/timeout retries): "
+                                  . "last terminal subtype=" . ($tv->{subtype} // '?') . ", num_turns=" . ($tv->{num_turns} // '?')
+                                  . ", budget $initial (unchanged, never widened), harvest_reaudit=$ra, starvations=1. "
+                                  . "No verdict file was ever written. Judge log: runs/harvest/$pkg.jsonl; archived verdicts: "
+                                  . "runs/harvest/archive/.";
                         queue_needs_you($runs, { package => $pkg, blueprint => $bp, kind => 'judge-starved',
                             question => $question, context => $context, created_at => $now });
                         next;
