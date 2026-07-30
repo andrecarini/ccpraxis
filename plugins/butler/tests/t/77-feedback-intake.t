@@ -65,6 +65,7 @@ my $SCRIPT    = File::Spec->catfile($REPO_ROOT, qw(plugins butler scripts bp-fee
 my $SKILL     = File::Spec->catfile($REPO_ROOT, qw(plugins butler skills feedback-intake SKILL.md));
 my $REAL_CORRECTIONS = File::Spec->catdir($REPO_ROOT, '.ccpraxis-local-data', 'corrections');
 my $REAL_DECOMPOSED  = File::Spec->catfile($REAL_CORRECTIONS, 'batch-1', 'DECOMPOSED.md');
+my $LIVE_ORCHESTRATOR = File::Spec->catfile($REPO_ROOT, qw(plugins butler scripts bp-orchestrator.pl));
 
 ok(-d $REPO_ROOT, "sanity: repo root resolved ($REPO_ROOT)");
 
