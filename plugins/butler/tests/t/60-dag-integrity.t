@@ -921,24 +921,35 @@ sub decode_json_file {
 sub needs_you_files {
     my ($runs) = @_;
     my $dir = "$runs/needs-you";
-    return () unless -d $dir;
-    opendir(my $dh, $dir) or return ();
+    # NOTE: every exit must `return @out`, never a bare `return ()`. A bare
+    # `return ()` evaluates to undef in SCALAR context, so `scalar(needs_you_files(...))`
+    # would yield undef instead of 0 precisely when the directory correctly
+    # does not exist -- making "expect 0 files" unpassable. `return @out` gives
+    # the count in scalar context and the list in list context.
+    my @out;
+    return @out unless -d $dir;
+    opendir(my $dh, $dir) or return @out;
     my @files = sort grep { -f "$dir/$_" } readdir($dh);
     closedir $dh;
-    return map { "$dir/$_" } @files;
+    @out = map { "$dir/$_" } @files;
+    return @out;
 }
 
 sub _dag_stall_queue_entries {
     my ($runs) = @_;
+    # Same scalar-context rule as needs_you_files above: `return @out`, never a
+    # bare `return ()`, or "expect 0 queue entries" can never pass.
+    my @out;
     my $data = decode_json_file("$runs/remediation-queue.json");
-    return () unless defined $data;
+    return @out unless defined $data;
     my @all = ref($data) eq 'ARRAY' ? @$data
             : ref($data) eq 'HASH'  ? values %$data
             : ();
-    return grep {
+    @out = grep {
         ref($_) eq 'HASH' && ref($_->{finding}) eq 'HASH'
             && (($_->{finding}{kind} // '') eq 'dag-stall')
     } @all;
+    return @out;
 }
 
 sub mk_dag_stall_a {
