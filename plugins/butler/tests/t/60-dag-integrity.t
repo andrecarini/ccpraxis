@@ -35,7 +35,7 @@ sub write_bp_md {
 # One package-status table (header + separator + one row per pkg).
 sub table_lines {
     my (@pkgs) = @_;
-    my @lines = ('| package | status | depends_on |', '|---|---|---|');
+    my @lines = ('| pkg | status | depends_on |', '|---|---|---|');
     for my $p (@pkgs) {
         my $dep = defined $p->{dep} ? $p->{dep} : '';
         push @lines, "| $p->{id} | pending | $dep |";
@@ -350,7 +350,7 @@ sub by_code {
         '| x | y |',                            # 6
         '',                                     # 7
         '## Package Status',                    # 8
-        '| package | status | depends_on |',    # 9  <- real header
+        '| pkg | status | depends_on |',    # 9  <- real header
         '|---|---|---|',                        # 10
         '| b01-alpha | pending |  |',           # 11
     );
@@ -381,7 +381,7 @@ sub by_code {
         '# Blueprint',                        # 1
         '',                                    # 2
         '## Package Status',                   # 3
-        '| package | status | depends_on |',   # 4  <- header
+        '| pkg | status | depends_on |',   # 4  <- header
         '|---|---|---|',                        # 5
         '| b01-alpha | pending |  |',           # 6
         '### Interruption',                    # 7  <- terminates the table
@@ -413,7 +413,7 @@ sub by_code {
         '# Blueprint',
         '',
         '## Package Status',
-        '| package | status | depends_on |',
+        '| pkg | status | depends_on |',
         '|---|---|---|',
         '| b01-alpha | pen|ding |  |',          # raw pipe -> column count mismatch
         '| b02-beta | pending | esc\\|aped |',  # escaped pipe -> lying escape
