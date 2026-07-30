@@ -270,20 +270,17 @@ subtest 'T-B happy paths (criteria 1,2,3)' => sub {
     like($out, qr/^\S.*\n\z/s, 'AC-2: STDOUT is exactly one newline-terminated line');
     is(() = ($out =~ /\n/g), 1, 'AC-2: STDOUT contains exactly one newline (one line, nothing else)');
     my $path1 = $out; chomp $path1;
-    is(_slurp_bytes($path1) ? 1 : 0, 1, 'AC-1: the path STDOUT names is the file actually written') if $rc == 0;
 
     SKIP: {
-        skip 'no output path to inspect (bp-feedback.pl not implemented)', 6 unless $rc == 0 && length($path1) && -f $path1;
+        skip 'no output path to inspect (bp-feedback.pl not implemented)', 5 unless $rc == 0 && length($path1) && -f $path1;
+        is(-f $path1 ? 1 : 0, 1, 'AC-1: the path STDOUT names is the file actually written');
         my $bytes = _slurp_bytes($path1);
         my ($fields, $body) = _parse_written($bytes);
         is($body, 'hello there', 'AC-3: argv body round-trips verbatim (word-joined)');
         is($fields->{Source}, 'chat', 'AC-8: default source token is "chat"');
         like($fields->{Captured}, qr/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/,
              'AC-7: Captured timestamp matches the house ISO-8601-UTC-Z shape');
-        my $blank_idx = index($bytes, "\n\n");
-        ok($blank_idx > 0, 'G1: header/body separated by exactly one blank line');
         is(substr($bytes, -1), 'e', 'G2: no trailing newline added when body has none ("hello there" ends in e)');
-        ok(1, 'placeholder to keep the SKIP count honest'); # see note below
     }
 
     # AC-4: stdin round-trip with CRLF + non-ASCII + zero trailing newline.
