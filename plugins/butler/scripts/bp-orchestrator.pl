@@ -195,6 +195,208 @@ sub ready_packages {
     return @ready;
 }
 
+# --- b08: find every distinct cycle in a { pkg => [dep,...] } sub-DAG. Uses
+# Tarjan's SCC algorithm (any node in a non-trivial strongly-connected
+# component is, by definition, on some cycle) and then recovers ONE concrete
+# elementary cycle per SCC via a backtracking DFS restricted to that SCC's own
+# members (guaranteed to close because the component is strongly connected).
+# Returns a LIST of ARRAYREFs; each is a cycle's members, rotated so the
+# lexicographically-smallest member comes first (determinism -- callers derive
+# a stable `package` from members->[0]). Pure; never dies; total over any
+# well-formed $dag (missing/edges-to-nowhere entries are simply not followed).
+sub find_cycles {
+    my ($dag) = @_;
+    $dag = {} unless ref $dag eq 'HASH';
+    my ($idx, %index, %low, %onstack, @stack, @sccs);
+    $idx = 0;
+    my $strongconnect;
+    $strongconnect = sub {
+        my ($v) = @_;
+        $index{$v} = $idx; $low{$v} = $idx; $idx++;
+        push @stack, $v; $onstack{$v} = 1;
+        for my $w (@{ $dag->{$v} || [] }) {
+            next unless exists $dag->{$w};
+            if (!exists $index{$w}) {
+                $strongconnect->($w);
+                $low{$v} = $low{$w} if $low{$w} < $low{$v};
+            } elsif ($onstack{$w}) {
+                $low{$v} = $index{$w} if $index{$w} < $low{$v};
+            }
+        }
+        if ($low{$v} == $index{$v}) {
+            my @comp;
+            while (1) {
+                my $w = pop @stack;
+                $onstack{$w} = 0;
+                push @comp, $w;
+                last if $w eq $v;
+            }
+            push @sccs, \@comp;
+        }
+    };
+    for my $v (sort keys %$dag) {
+        $strongconnect->($v) unless exists $index{$v};
+    }
+
+    my @cycles;
+    for my $comp (sort { $a->[0] cmp $b->[0] } map { [ sort @$_ ] } @sccs) {
+        next unless @$comp > 1;   # a single node here is not a cycle (self-deps are stripped upstream)
+        my %in_comp = map { $_ => 1 } @$comp;
+        my $start = $comp->[0];   # already lexicographically smallest (sorted above)
+        my (@path, %on_path, $found);
+        my $back;
+        $back = sub {
+            my ($node) = @_;
+            return if $found;
+            push @path, $node; $on_path{$node} = 1;
+            for my $w (sort @{ $dag->{$node} || [] }) {
+                next unless $in_comp{$w};
+                if ($w eq $start && @path > 1) { $found = [ @path ]; last; }
+                next if $on_path{$w};
+                $back->($w);
+                last if $found;
+            }
+            unless ($found) { pop @path; delete $on_path{$node}; }
+        };
+        $back->($start);
+        push @cycles, ($found || $comp);
+    }
+    return @cycles;
+}
+
+# --- b08: BpOrch::dag_stall($meta, $status, $running) -- PURE, total, no I/O.
+# See spec-b08 §2.6. Determines whether the run is genuinely stalled (nothing
+# running, nothing pending-and-ready) and, if so, classifies WHY: a
+# blocked/parked dependency (routable to the b07 remediation engine) or a
+# structurally unresolvable one (dangling token, ambiguous token, a dropped
+# dependency, or a dependency cycle -- none of which any coordinator can fix).
+#
+# Recursion exclusion (load-bearing, mirrors conformance_registry's exclusion):
+# a package flagged `remediation => 1` or named `remediation-*` is invisible to
+# every computation below -- neither pending, nor ready, nor a blocker, nor a
+# member of unresolvable. Without this, a remediation package b08 itself caused
+# to be authored would be seen as stalled/blocking and resubmitted every tick,
+# a self-feeding loop that eats rounds_cap and then goes permanently quiet -- a
+# WORSE silent stall than the one this function removes. A normal package's
+# dependency edge POINTING AT an excluded package is likewise treated as
+# already-satisfied (never a blocker, never unresolvable): that edge is
+# artifact-of-remediation bookkeeping, not a real graph dependency.
+#
+# Exhaustiveness argument: with nothing running, ready_packages returns every
+# pending package whose deps are met. If none are, every pending package has
+# an unmet dep; following unmet deps through a finite set must terminate in a
+# terminal-but-not-done target, an unresolvable token, or a cycle. So
+# stalled == 1 implies @blockers || @unresolvable is non-empty.
+sub dag_stall {
+    my ($meta, $status, $running) = @_;
+    $meta   = {} unless ref $meta   eq 'HASH';
+    $status = {} unless ref $status eq 'HASH';
+
+    my %full = %$meta;
+    my %m;
+    for my $pkg (keys %full) {
+        next if ($full{$pkg}{remediation} ? 1 : 0) || ($pkg =~ /^remediation-/);
+        $m{$pkg} = $full{$pkg};
+    }
+    # Filter every kept package's deps so a token resolving to an EXCLUDED
+    # package is dropped (treated as already-satisfied) before anything else
+    # below ever looks at it -- see the "recursion exclusion" note above.
+    for my $pkg (keys %m) {
+        my @kept;
+        for my $d (@{ $m{$pkg}{deps} || [] }) {
+            my ($how, $name) = resolve_dep_token($d, \%full);
+            next if ($how eq 'exact' || $how eq 'normalized') && !exists $m{$name};
+            push @kept, $d;
+        }
+        $m{$pkg} = { %{ $m{$pkg} }, deps => \@kept };
+    }
+
+    if (ref $running eq 'ARRAY' && @$running) {
+        return { stalled => 0, reason => 'running', pending => [], ready => [], blockers => [], unresolvable => [] };
+    }
+
+    my @pending = sort grep { (($status->{$_} // 'pending') eq 'pending') } keys %m;
+    unless (@pending) {
+        return { stalled => 0, reason => 'no-pending', pending => [], ready => [], blockers => [], unresolvable => [] };
+    }
+
+    for my $pkg (keys %m) {
+        my $st = $status->{$pkg} // 'pending';
+        if (!_is_terminal($st) && $st ne 'pending') {
+            return { stalled => 0, reason => 'inflight', pending => \@pending, ready => [], blockers => [], unresolvable => [] };
+        }
+    }
+
+    my @ready = sort(ready_packages(\%m, $status, []));
+    if (@ready) {
+        return { stalled => 0, reason => 'launchable', pending => \@pending, ready => \@ready, blockers => [], unresolvable => [] };
+    }
+
+    # ---- stalled: classify every pending package's unmet deps -------------
+    my %node_set = map { $_ => 1 } @pending;
+    for my $pkg (@pending) {
+        for my $d (@{ $m{$pkg}{deps} || [] }) {
+            my ($how, $name) = resolve_dep_token($d, \%m);
+            $node_set{$name} = 1 if ($how eq 'exact' || $how eq 'normalized');
+        }
+    }
+    my %subdag;
+    for my $n (keys %node_set) {
+        my @norm;
+        for my $d (@{ $m{$n}{deps} || [] }) {
+            my ($how, $name) = resolve_dep_token($d, \%m);
+            next unless ($how eq 'exact' || $how eq 'normalized');
+            next unless $node_set{$name};
+            push @norm, $name;
+        }
+        $subdag{$n} = \@norm;
+    }
+    my @cycles = find_cycles(\%subdag);
+
+    my %blockers;
+    my @unresolvable;
+    for my $pkg (@pending) {
+        for my $d (@{ $m{$pkg}{deps} || [] }) {
+            my ($how, $name) = resolve_dep_token($d, \%m);
+            if ($how eq 'exact' || $how eq 'normalized') {
+                my $tst = $status->{$name} // 'pending';
+                next if $tst eq 'done';
+                if ($tst eq 'blocked' || $tst eq 'parked') {
+                    $blockers{$name} ||= { blocker_status => $tst, dependents => {} };
+                    $blockers{$name}{dependents}{$pkg} = 1;
+                } elsif ($tst eq 'dropped') {
+                    push @unresolvable, { code => 'dep-dropped', package => $pkg, detail => $name, members => [],
+                        message => "package '$pkg' depends on '$name', which was dropped and can never reach 'done'" };
+                }
+                # else: target is pending -- covered by the cycle pass below, or
+                # transitively by another package's finding further down the chain.
+            } elsif ($how eq 'ambiguous') {
+                push @unresolvable, { code => 'dep-ambiguous', package => $pkg, detail => $d, members => [],
+                    message => "package '$pkg' depends on '$d', which matches more than one package name" };
+            } else {   # 'none'
+                push @unresolvable, { code => 'dep-dangling', package => $pkg, detail => $d, members => [],
+                    message => "package '$pkg' depends on '$d', which does not resolve to any known package" };
+            }
+        }
+    }
+    for my $c (@cycles) {
+        push @unresolvable, { code => 'dep-cycle', package => $c->[0], detail => undef, members => $c,
+            message => 'dependency cycle: ' . join(' -> ', @$c, $c->[0]) };
+    }
+    @unresolvable = sort {
+        $a->{code} cmp $b->{code} || $a->{package} cmp $b->{package} || (($a->{detail} // '') cmp ($b->{detail} // ''))
+    } @unresolvable;
+
+    my @blockers_out = map { {
+        blocker        => $_,
+        blocker_status => $blockers{$_}{blocker_status},
+        dependents     => [ sort keys %{ $blockers{$_}{dependents} } ],
+    } } sort keys %blockers;
+
+    return { stalled => 1, reason => 'stalled', pending => \@pending, ready => [],
+             blockers => \@blockers_out, unresolvable => \@unresolvable };
+}
+
 # --- greedily pick a launch batch (<= slots) whose write-sets are mutually
 # disjoint AND disjoint from what's already running (avoids same-tick clashes).
 sub pick_launch_batch {
@@ -944,6 +1146,10 @@ sub harvest_initial_max_turns {
 # Never dies; every failure is best-effort + a log line.
 sub archive_judge_verdict {
     my ($runs, $kind, $pkg, $now, $log) = @_;
+    unless (defined $pkg && $pkg =~ /^[A-Za-z0-9._-]+\z/) {
+        _log($log, 'judge_archive_failed', { kind => $kind, package => (defined $pkg ? $pkg : ''), reason => 'invalid package id' });
+        return undef;
+    }
     my $ok = eval {
         my $live = judge_verdict_path($runs, $kind, $pkg);
         return undef unless -e $live;
@@ -2544,6 +2750,111 @@ sub remediation_merge {
         }
     }
     return $queue;
+}
+
+# --- b08: the dag-stalled decision record (spec-b08 §5.5). `package => '_dag'`
+# is a fleet-level pseudo-package (like the existing `_run`/`_remediation`) so
+# `queue_needs_you`'s (package, kind) dedupe makes "exactly one" decision
+# structural, no matter how many stalled packages or cycles are involved.
+sub _dag_decision {
+    my ($bp, $now, $class, $r) = @_;
+    my $n = @{ $r->{unresolvable} } ? scalar @{ $r->{unresolvable} } : scalar @{ $r->{blockers} };
+    return {
+        package    => '_dag',
+        blueprint  => $bp,
+        kind       => 'dag-stalled',
+        question   => "The blueprint's dependency graph cannot progress: $n unresolvable dependency "
+                    . "problem(s). No package can launch until the graph resolves. Fix blueprint.md's "
+                    . "depends_on column (or drop the affected packages), then answer this decision.",
+        context    => {
+            class        => $class,          # 'unresolvable' | 'remediation-exhausted'
+            unresolvable => $r->{unresolvable},
+            blockers     => $r->{blockers},
+            pending      => $r->{pending},
+            validator    => 'perl plugins/butler/scripts/bp-validate-dag.pl <blueprint-dir>',
+        },
+        created_at => $now,
+    };
+}
+
+# --- b08: the DAG-stall seam (spec-b08 §2.7/§5.4). This is a NEW submission
+# path into b07: the existing remediation_step call site (conformance gate,
+# below) sits behind BpJudge::conformance_ready, which requires every package
+# terminal -- structurally false whenever a DAG stall exists. $a keys: bpdir,
+# runs, log, blueprint, meta, status, now, tunables, queue, live, shutdown,
+# paused, resume_pending. Returns { fired, decided, remediation_outstanding }.
+sub dag_stall_step {
+    my ($a) = @_;
+    my ($bpdir, $runs, $log, $bp, $meta, $status, $now, $t, $rq, $live)
+        = @{$a}{qw(bpdir runs log blueprint meta status now tunables queue live)};
+    my $out = { fired => 0, decided => 0, remediation_outstanding => 0 };
+    return $out if $a->{shutdown} || $a->{paused} || $a->{resume_pending};
+    return $out unless ($t->{dag_stall} // 1);
+
+    my $r = dag_stall($meta, $status, $live);
+    return $out unless $r->{stalled};
+
+    # queue-quiescence (guard 6, spec §5.2.5): read the CURRENT on-disk queue
+    # regardless of whether $a->{queue} is already a hashref (production, via
+    # remediation_merge) or a bare path (test fixtures) -- mirrors
+    # remediation_step's own tolerance below.
+    my $qpath = "$runs/remediation-queue.json";
+    my $qh = ref $rq eq 'HASH' ? $rq : BpRemediate::read_queue($qpath);
+    $qh = {} unless ref $qh eq 'HASH';
+
+    # ---- (f) structurally unresolvable -> EXACTLY ONE decision, last resort --
+    if (@{ $r->{unresolvable} }) {
+        return $out if queued_decision_pkgs($runs)->{'_dag'};
+        _log($log, 'dag_stalled', { class => 'unresolvable',
+             count => scalar @{ $r->{unresolvable} },
+             codes => join(',', map { $_->{code} } @{ $r->{unresolvable} }) });
+        queue_needs_you($runs, _dag_decision($bp, $now, 'unresolvable', $r));
+        $out->{decided} = 1;
+        return $out;                       # never both routes in one tick
+    }
+
+    # ---- (e) blocked/parked dependency -> the b07 engine ---------------------
+    return $out unless @{ $r->{blockers} };
+    return $out if BpRemediate::remediation_outstanding($qh);   # guard 6
+    my $fired = read_registry($runs)->{_dag_stall} || {};       # guard 7
+    my @new = grep { !$fired->{ $_->{blocker} } } @{ $r->{blockers} };
+
+    unless (@new) {
+        # Every blocker was already handed to b07, the queue has quiesced, and
+        # the stall survived -- including the 'unscopable' escalation case
+        # (spec §5.2.3). The mechanical route is exhausted: escalate-last rung.
+        return $out if queued_decision_pkgs($runs)->{'_dag'};
+        _log($log, 'dag_stalled', { class => 'remediation-exhausted',
+             blockers => join(',', map { $_->{blocker} } @{ $r->{blockers} }) });
+        queue_needs_you($runs, _dag_decision($bp, $now, 'remediation-exhausted', $r));
+        $out->{decided} = 1;
+        return $out;
+    }
+
+    my $v = { outcome => 'fail', findings => [ map { {
+        kind     => 'dag-stall',
+        subject  => $_->{blocker},                       # THE BLOCKER (spec §5.2.2)
+        detail   => "package '$_->{blocker}' is '$_->{blocker_status}' and blocks "
+                  . scalar(@{ $_->{dependents} }) . " dependent package(s): "
+                  . join(', ', @{ $_->{dependents} })
+                  . " — the run cannot progress until it reaches 'done'",
+        evidence => { blocked_on     => $_->{blocker},
+                      blocker_status => $_->{blocker_status},
+                      dependents     => $_->{dependents},
+                      files          => [] },            # EMPTY: skip write_set_for rung 1
+        remedy   => { action => 'remediate-conformance', package => $_->{blocker} },
+    } } @new ] };
+    $out->{remediation_outstanding} = remediation_step({
+        bpdir => $bpdir, runs => $runs, verdict => $v, meta => $meta, status => $status,
+        now => $now, blueprint => $bp, tunables => $t, log => $log, queue => $rq,
+    }) ? 1 : 0;
+    $out->{fired} = 1;
+    # Recorded for EVERY submitted blocker regardless of the engine's
+    # disposition (auto / review / escalate) -- see spec §5.2.3 and §5.2.5.
+    update_registry_pkg($runs, '_dag_stall', { map { $_->{blocker} => $now } @new });
+    _log($log, 'dag_stall_remediation', {
+        blockers => join(',', map { $_->{blocker} } @new), count => scalar @new });
+    return $out;
 }
 
 # One verdict-ingestion-time step (spec-08 §3.3 behavior 12, §3.5). $a is the
