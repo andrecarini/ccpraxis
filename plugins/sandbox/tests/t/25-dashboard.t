@@ -1028,7 +1028,11 @@ sub drive_per_tick {
     # Pinned exactly: WHICH tick deviates, and BY HOW MUCH -- a bare
     # "one tick deviates" would also pass if an unrelated regression added a
     # stray render on a different tick.
-    is(scalar(@fps), 4, 'D: 4 completed ticks were driven (the shape below is not vacuous)');
+    # max_ticks => 4 drives 3 COMPLETED ticks (0,1,2): frames_per_tick is only
+    # appended inside sleep_for, and the 4th (final) tick exits via the
+    # max_ticks guard before calling sleep_for -- same pattern as block C's
+    # "max_ticks=6 -> 5 completed ticks" above.
+    is(scalar(@fps), 3, 'D: 3 completed ticks were driven (the shape below is not vacuous)');
     my @off_shape = grep { $fps[$_] != 1 } 0 .. $#fps;
     is_deeply(\@off_shape, [0],
         'D: exactly ONE tick deviates from 1 out call and it is tick 0 (the one-time initial OSC window-title emit); every later tick is exactly 1 (no spurious extra render)');
