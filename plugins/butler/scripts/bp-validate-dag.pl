@@ -440,14 +440,36 @@ sub report_text {
     return join("\n", @out) . "\n";
 }
 
+# One line (report rows are one line each). Exact format per spec-b08 sec4.4:
+#   blueprint DAG is broken at <bpdir>: <A> ambiguous, <S> structural
+#     -- [<code>] <message>; [<code>] <message>; ... -- fix blueprint.md /
+#     packages/ then re-run dispatch-fleet
+# At most the first 5 findings are inlined; beyond that, a "+K more" tail
+# names this script for the full report. Whitespace in every embedded
+# message is collapsed to single spaces. Stable contract callers (b08
+# preflight gate) may match on: the literal prefix "blueprint DAG is broken
+# at " and the bracketed code form "[<code>]".
 sub fail_detail {
     my ($r) = @_;
     return 'dag integrity: unavailable' unless ref $r eq 'HASH';
     return 'dag integrity: ok' if $r->{ok};
-    my $first = $r->{findings}[0];
-    my $n = scalar @{ $r->{findings} || [] };
-    my $msg = $first ? $first->{message} : 'unknown finding';
-    return "dag integrity: $n finding(s), first: [$first->{code}] $msg";
+    my @findings = @{ $r->{findings} || [] };
+    my $a = scalar @{ $r->{ambiguous} || [] };
+    my $s = scalar @{ $r->{structural} || [] };
+    my @head = @findings[0 .. ($#findings > 4 ? 4 : $#findings)];
+    my @parts = map {
+        my $msg = defined $_->{message} ? $_->{message} : '';
+        $msg =~ s/\s+/ /g;
+        $msg =~ s/^ | $//g;
+        "[" . ($_->{code} // '?') . "] $msg";
+    } @head;
+    my $tail = @findings > 5
+        ? sprintf(' (+%d more; run: perl plugins/butler/scripts/bp-validate-dag.pl %s)',
+                  @findings - 5, $r->{bpdir})
+        : '';
+    return "blueprint DAG is broken at $r->{bpdir}: $a ambiguous, $s structural"
+         . ' — ' . join('; ', @parts) . $tail
+         . ' — fix blueprint.md / packages/ then re-run dispatch-fleet';
 }
 
 # ---------------------------------------------------------------------------

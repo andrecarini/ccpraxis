@@ -19,12 +19,14 @@ use strict;
 use warnings;
 use FindBin qw($Bin);
 use JSON::PP;
+use File::Basename qw(basename);
 
-my %opt = (deep => 0, quiet => 0, platform => undef);
+my %opt = (deep => 0, quiet => 0, platform => undef, bp_dir => undef);
 for (@ARGV) {
     if ($_ eq '--deep')   { $opt{deep}   = 1 }
     elsif ($_ eq '--quiet'){ $opt{quiet} = 1 }
     elsif (/^--platform=(.+)$/) { $opt{platform} = $1 }
+    elsif (/^--bp-dir=(.+)$/)   { $opt{bp_dir} = $1 }
 }
 
 # ---- platform-support abstraction ----------------------------------------
@@ -248,6 +250,99 @@ my %CHECK = (
     } },
 );
 
+# ---- blueprint DAG integrity (b08) ----------------------------------------
+# NOT a %CHECK entry: the manifest loop below only invokes ids present in
+# docs/assumptions.json (that file is outside this package's write set), and
+# DAG integrity is a property of the INPUT being dispatched, not the
+# platform, so it must not inherit assumptions.json's per-OS skip semantics.
+# See spec-b08 sec4.2 for the full rationale.
+
+# main::dag_project_root() -> ($root, $source). Duplicates repo.usable's
+# three-rung ladder (:197-248) rather than refactoring it -- repo.usable must
+# stay byte-identical (t/27-preflight-repo-check.t asserts on its wording).
+sub dag_project_root {
+    if (defined $ENV{BP_PROJECT_ROOT} && length $ENV{BP_PROJECT_ROOT}) {
+        return ($ENV{BP_PROJECT_ROOT}, 'BP_PROJECT_ROOT');
+    }
+    my $top = `git rev-parse --show-toplevel 2>/dev/null`;
+    chomp $top;
+    if (length $top) {
+        return ($top, 'git rev-parse --show-toplevel');
+    }
+    require Cwd;
+    return (Cwd::getcwd(), 'cwd');
+}
+
+# main::dag_data_dir() -> ($data, $source). $CCPRAXIS_DATA_DIR wins outright;
+# otherwise "<project_root>/.ccpraxis-local-data".
+sub dag_data_dir {
+    if (defined $ENV{CCPRAXIS_DATA_DIR} && length $ENV{CCPRAXIS_DATA_DIR}) {
+        return ($ENV{CCPRAXIS_DATA_DIR}, 'CCPRAXIS_DATA_DIR');
+    }
+    my ($root, $rsrc) = dag_project_root();
+    return ("$root/.ccpraxis-local-data", "project root ($rsrc)");
+}
+
+# A rung's candidate path is only accepted if it actually names a blueprint
+# dir. A wrong explicit path is an operator error and must be visible, not
+# silently skipped in favor of the next rung.
+sub _dag_check_bpdir {
+    my ($path, $source) = @_;
+    return (undef, "$source names $path, which has no blueprint.md")
+        unless -f "$path/blueprint.md";
+    return ($path, $source);
+}
+
+# main::dag_bpdir() -> ($bpdir, $source) on success; (undef, $why) on
+# failure. Ladder: --bp-dir -> BP_BLUEPRINT_DIR -> BP_BLUEPRINT -> discovery
+# (exactly one unfinished blueprint under <data>/blueprints). See spec-b08
+# sec4.2 for the full ladder and its "does not fall through" rule.
+sub dag_bpdir {
+    if (defined $opt{bp_dir} && length $opt{bp_dir}) {
+        return _dag_check_bpdir($opt{bp_dir}, '--bp-dir');
+    }
+    if (defined $ENV{BP_BLUEPRINT_DIR} && length $ENV{BP_BLUEPRINT_DIR}) {
+        return _dag_check_bpdir($ENV{BP_BLUEPRINT_DIR}, 'BP_BLUEPRINT_DIR');
+    }
+    if (defined $ENV{BP_BLUEPRINT} && length $ENV{BP_BLUEPRINT}) {
+        my ($data) = dag_data_dir();
+        return _dag_check_bpdir("$data/blueprints/$ENV{BP_BLUEPRINT}", 'BP_BLUEPRINT');
+    }
+    my ($data) = dag_data_dir();
+    my @cands;
+    for my $md (glob("$data/blueprints/*/blueprint.md")) {
+        (my $dir = $md) =~ s{/blueprint\.md$}{};
+        require "$Bin/bp-validate-dag.pl";
+        push @cands, $dir if BpValidateDag::has_unfinished($dir);
+    }
+    return (undef, "no blueprint with unfinished packages under $data/blueprints")
+        if @cands == 0;
+    if (@cands > 1) {
+        my @names = sort map { basename($_) } @cands;
+        return (undef, scalar(@cands) . ' candidate blueprints ('
+                      . join(', ', @names) . ') — cannot tell which is being dispatched');
+    }
+    return ($cands[0], 'discovery');
+}
+
+# main::dag_integrity_gate() -> ($status, $detail) where $status is
+# 'ok'|'fail'|'skip'. Loads the validator as a LIBRARY (require), not a
+# subprocess -- precedent: creds.shape's require of bp-contract.pl above.
+sub dag_integrity_gate {
+    require "$Bin/bp-validate-dag.pl";
+    my ($bpdir, $src) = dag_bpdir();
+    return ('skip', "DAG integrity NOT validated: $src"
+                  . " — pass --bp-dir=<blueprint-dir> or set BP_BLUEPRINT_DIR to gate it")
+        unless defined $bpdir;
+    my $r = eval { BpValidateDag::validate($bpdir) };
+    return ('fail', "blueprint DAG could not be validated at $bpdir: " . ($@ || 'unknown error'))
+        unless ref $r eq 'HASH';
+    return ('fail', BpValidateDag::fail_detail($r)) unless $r->{ok};
+    my $n = scalar @{ $r->{normalized} };
+    return ('ok', "DAG ok at $bpdir (via $src)"
+                . ($n ? "; $n dep token(s) auto-normalized (short->full / self-dep)" : ''));
+}
+
 # ---- run ------------------------------------------------------------------
 unless (caller) {
 my $plat = detect_platform();
@@ -282,6 +377,13 @@ for my $a (@{$manifest->{assumptions}}) {
     if ($@) { $status='fail'; ($detail=$@)=~s/\s+$//; }
     push @rows, [$status, $id, $detail];
     push @fail, [$id, $detail] if $status eq 'fail';
+}
+
+# ---- blueprint DAG integrity (b08). NOT a platform assumption -- see spec 4.2. ----
+{
+    my ($st, $detail) = dag_integrity_gate();
+    push @rows, [$st, 'dag.integrity', $detail];
+    push @fail, ['dag.integrity', $detail] if $st eq 'fail';
 }
 
 unless ($opt{quiet} && !@fail) {

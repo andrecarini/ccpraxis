@@ -19,6 +19,7 @@ The blueprint directory path. Read `blueprint.md` and every ledger under `packag
 - **Untestable done criteria** — anything a coordinator couldn't verify mechanically from disk.
 - **Write-set hazards** — overlaps between packages eligible to run in parallel; write sets that obviously miss files the scope implies.
 - **Hidden dependencies** — package A's inputs are produced by package B without a `depends_on` edge.
+- **DAG integrity** — REQUIRED pass: every `depends_on` token in `blueprint.md`'s package-status table names an existing package row (no dangling refs; a short id like `b01` must resolve to exactly one full package id), the graph has no cycles, every `packages/*.md` ledger has a matching table row and vice versa, and no package declares an empty `write_set`.
 - **Missing inputs** — referenced paths that don't exist; inputs a coordinator would clearly need but isn't given.
 - **Scope ambiguity** — boundaries where two packages could both believe they own a file or behavior.
 - **Contradictions** — constraints, decisions, or criteria that cannot all hold.
