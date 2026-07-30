@@ -3,6 +3,14 @@ use strict;
 use warnings;
 use utf8;   # this source embeds literal em-dash (U+2014) SKILL.md/DECOMPOSED.md literals;
             # see coordinator-corrections.md's own account of the em-dash byte/char bug.
+# Give STDOUT/STDERR a UTF-8 output layer BEFORE Test::More/Test2 initialise
+# (their TAP formatter dups the handle it prints through at import time, so a
+# binmode() issued later as an ordinary runtime statement never reaches it --
+# a plain `binmode(STDOUT, ...)` placed after `use Test::More;` is silently
+# too late no matter where it sits in the source). This is what actually
+# fixes "Wide character in print at .../Test2/Formatter/TAP.pm" for the
+# em-dash/multiplication-sign literals this file prints in test names.
+BEGIN { binmode(STDOUT, ':encoding(UTF-8)'); binmode(STDERR, ':encoding(UTF-8)'); }
 use Test::More;
 use File::Temp qw(tempdir);
 use File::Spec;
@@ -66,12 +74,6 @@ my $SKILL     = File::Spec->catfile($REPO_ROOT, qw(plugins butler skills feedbac
 my $REAL_CORRECTIONS = File::Spec->catdir($REPO_ROOT, '.ccpraxis-local-data', 'corrections');
 my $REAL_DECOMPOSED  = File::Spec->catfile($REAL_CORRECTIONS, 'batch-1', 'DECOMPOSED.md');
 my $LIVE_ORCHESTRATOR = File::Spec->catfile($REPO_ROOT, qw(plugins butler scripts bp-orchestrator.pl));
-
-# This source embeds decoded (use utf8) em-dash literals in test names (SKILL.md/
-# DECOMPOSED.md's own headings use U+2014). Without a UTF-8 output layer, Test::More
-# printing those names trips "Wide character in print"; give STDOUT/STDERR one.
-binmode(STDOUT, ':encoding(UTF-8)');
-binmode(STDERR, ':encoding(UTF-8)');
 
 ok(-d $REPO_ROOT, "sanity: repo root resolved ($REPO_ROOT)");
 
@@ -265,33 +267,27 @@ subtest 'T-A source lint (criteria 1,5,6,7 shape)' => sub {
         ok(index($src, '\x00-\x08\x0B\x0C\x0E-\x1F\x7F') >= 0,
            'AC-24: literal C0/DEL character class is hardcoded verbatim');
 
-        # AC-24 citation integrity (coordinator fix, post-gate): bp-orchestrator.pl
-        # is edited by several live packages -- SYN-23 says its line number is a
-        # HINT, not an anchor -- and it has already drifted once during this run
-        # (measured today at :763, not the :506 this file used to hardcode). A
-        # test that only checks the STRING "bp-orchestrator.pl:506" is present
-        # would force a FALSE citation into shipped code the instant the class
-        # moves again -- the same defect AC-CIT-1 fixed for DECOMPOSED.md:16,
-        # except here the old test *enforced* the staleness instead of merely
-        # failing to catch it. Fix: parse whatever line number bp-feedback.pl
-        # ACTUALLY cites, then verify that live bp-orchestrator.pl line still
-        # contains the C0 class -- the citation is verified, never pinned.
-        like($src, qr/bp-orchestrator\.pl:\d+/,
-             'AC-24: cites bp-orchestrator.pl:<N> as the class origin (Pre-settled #1); N is verified live below, never hardcoded');
-        my ($cited_orch_line) = $src =~ /bp-orchestrator\.pl:(\d+)/;
+        # AC-24 citation (coordinator fix #2, post-gate): content-anchored,
+        # deliberately NOT line-anchored. bp-orchestrator.pl is a live file
+        # edited by several concurrently-running packages -- its C0-class
+        # line moved TWICE inside a single work session (:506 -> :763 -> :764,
+        # touched by b08/b09 mid-run). A verified LINE NUMBER citation would
+        # make t/77 go red every time an unrelated package edits that file --
+        # exactly the failure mode this blueprint's SYN-11 warns against
+        # (a package judged by failures it does not own). So: assert the
+        # FILENAME is cited (no line number required), and separately assert
+        # the live file contains the class literal by CONTENT SEARCH, never
+        # by index. (Contrast AC-CIT-1 just below/in T-K: that one *is*
+        # correctly line-anchored, because DECOMPOSED.md is not edited by
+        # other packages the way bp-orchestrator.pl is, and the skill's own
+        # text names a specific line -- verifying it is the whole point.)
+        like($src, qr/bp-orchestrator\.pl/,
+             'AC-24: cites bp-orchestrator.pl (by filename) as the class origin (Pre-settled #1); no line number is required');
         SKIP: {
-            skip 'bp-feedback.pl does not cite a bp-orchestrator.pl:<N> line number', 1 unless defined $cited_orch_line;
             skip 'live bp-orchestrator.pl is absent', 1 unless -f $LIVE_ORCHESTRATOR;
-            my @orch_lines = split /\n/, _slurp_bytes($LIVE_ORCHESTRATOR);
-            my $cited_orch_text = $orch_lines[$cited_orch_line - 1];
-            my $has_class = defined($cited_orch_text) && index($cited_orch_text, '\x00-\x08\x0B\x0C\x0E-\x1F\x7F') >= 0;
-            ok($has_class,
-                "AC-24/SYN-23: bp-feedback.pl cites bp-orchestrator.pl:$cited_orch_line for the C0 class, "
-              . "and that line still contains it today")
-                or diag("bp-orchestrator.pl:$cited_orch_line reads: "
-                      . (defined $cited_orch_text ? $cited_orch_text : '<line does not exist>')
-                      . "\nThe citation drifted: update bp-feedback.pl's comment to the line grep actually finds "
-                      . "today (this is not a test bug -- update the citation, not this check).");
+            my $orch_src = _slurp_bytes($LIVE_ORCHESTRATOR);
+            ok(index($orch_src, '\x00-\x08\x0B\x0C\x0E-\x1F\x7F') >= 0,
+               'AC-24: the live bp-orchestrator.pl still contains the C0/DEL class literal today (found by content search, not by line index)');
         }
 
         unlike($src, qr/Getopt::Long/, 'AC-lint: does not use Getopt::Long (Pre-settled #5)');
