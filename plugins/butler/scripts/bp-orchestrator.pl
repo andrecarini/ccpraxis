@@ -91,11 +91,61 @@ sub progress_verdict {
     return ($quiet >= $flat_secs) ? 'flat' : 'growing';
 }
 
-# --- DAG: are a package's dependencies all done?
+# --- DAG (b08): resolve ONE raw depends_on token against a full-package-name
+# key space (case-insensitive exact match, then unique short-id prefix match).
+# Returns ($how, $name): 'exact'|'normalized' with the resolved full name, or
+# 'ambiguous'|'none' with undef -- callers MUST fail closed on the latter two.
+sub resolve_dep_token {
+    my ($tok, $names) = @_;
+    my $t = defined $tok ? $tok : '';
+    $t =~ s/^\s+//; $t =~ s/\s+$//;
+    return ('none', undef) if $t eq '';
+    return ('exact', $t) if exists $names->{$t};
+    my $lt = lc $t;
+    my @ci = sort grep { lc($_) eq $lt } keys %$names;
+    return ('normalized', $ci[0]) if @ci == 1;
+    return ('ambiguous', undef) if @ci > 1;
+    my $pfx = $lt . '-';
+    my @pf = sort grep { index(lc($_), $pfx) == 0 } keys %$names;
+    return ('normalized', $pf[0]) if @pf == 1;
+    return ('ambiguous', undef) if @pf > 1;
+    return ('none', undef);
+}
+
+# --- DAG (b08): canonicalize every depends_on token in $dag (pkg => [tok,...])
+# against $dag's own keys -- short id -> full id, drop self-deps, dedupe.
+# A token that cannot be resolved uniquely (ambiguous or no match) is
+# preserved VERBATIM (fail closed: never silently dropped or guessed).
+# Returns a NEW hashref with the same keys as $dag.
+sub normalize_dag {
+    my ($dag) = @_;
+    my %out;
+    for my $pkg (sort keys %$dag) {
+        my @kept;
+        my %seen;
+        for my $tok (@{ $dag->{$pkg} || [] }) {
+            my ($how, $name) = resolve_dep_token($tok, $dag);
+            my $canon = ($how eq 'exact' || $how eq 'normalized') ? $name : $tok;
+            next if $canon eq $pkg;      # self-dep is meaningless
+            next if $seen{$canon}++;     # dedupe
+            push @kept, $canon;
+        }
+        $out{$pkg} = \@kept;
+    }
+    return \%out;
+}
+
+# --- DAG: are a package's dependencies all done? Each token is resolved
+# against $status's keys (full name or unique short-id prefix) before the
+# lookup; a dangling or ambiguous token fails closed (never met).
 sub deps_met {
     my ($deps, $status) = @_;
     return 1 unless ref $deps eq 'ARRAY' && @$deps;
-    for my $d (@$deps) { return 0 unless ($status->{$d} // '') eq 'done'; }
+    for my $d (@$deps) {
+        my ($how, $name) = resolve_dep_token($d, $status);
+        return 0 unless $how eq 'exact' || $how eq 'normalized';
+        return 0 unless ($status->{$name} // '') eq 'done';
+    }
     return 1;
 }
 
@@ -363,7 +413,12 @@ sub has_progressable_work {
         next if _is_terminal($st);
         my $dead_dep = 0;
         for my $d (@{ $meta->{$pkg}{deps} || [] }) {
-            my $ds = $status->{$d} // 'pending';
+            # b08: resolve a short-id dep token against $status's keys before
+            # the lookup, same as deps_met -- so a package whose dep is
+            # written as a short id is not mistaken for dead-ended.
+            my ($how, $name) = resolve_dep_token($d, $status);
+            my $key = ($how eq 'exact' || $how eq 'normalized') ? $name : $d;
+            my $ds = $status->{$key} // 'pending';
             # a dependency that is terminal-but-not-done (blocked/parked/dropped)
             # can never satisfy deps_met, so this package is dead-ended, not
             # progressable. (deps_met requires the dep === 'done'.)
