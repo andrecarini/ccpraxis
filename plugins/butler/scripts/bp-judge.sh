@@ -66,15 +66,31 @@ else
   if [ -z "$MAXT" ]; then
     MAXT=$(perl -e 'require $ARGV[0]; print BpJudge::harvest_max_turns($ARGV[1],$ARGV[2])' \
              "$SCRIPT_DIR/bp-judge.pl" "$WRITE_SET" "$TEST_PATHS" 2>/dev/null || true)
-    case "$MAXT" in ''|*[!0-9]*) MAXT=28 ;; esac       # pinned floor if perl is unavailable
   fi
+  # Validate BOTH the computed value AND an ambient BP_HARVEST_MAX_TURNS override
+  # (moved outside the `[ -z "$MAXT" ]` branch, which used to guard the computed
+  # value only): non-numeric, negative or explicitly 0 must never reach `claude
+  # --max-turns` — a 0 budget starves every judge instantly, and this package's
+  # own operator-facing decision text tells a human to raise this exact variable,
+  # so an unvalidated override here is directly reachable.
+  case "$MAXT" in ''|*[!0-9]*|0) MAXT=28 ;; esac       # pinned floor if perl is unavailable or override is bad
   ROLE="harvest-judge"; J_WRITE_SET=""; J_TEST_PATHS=""   # read-only; only the verdict (under BP_DIR) is writable
 fi
 
 mkdir -p "$(dirname "$VERDICT_PATH")" "$BPDIR/dispatch" "$BPDIR/runs/$KIND"
-perl -e 'require $ARGV[0]; BpOrch::archive_judge_verdict($ARGV[1],$ARGV[2],$ARGV[3],time,$ARGV[4])' \
+# The delete below is a CORRECTNESS requirement (clears the verdict path before
+# the new judge launches, so the orchestrator can never later read a stale
+# verdict and attribute it to this launch) — it stays unconditional even if
+# archiving fails. What was wrong was OBSERVABILITY: archive_judge_verdict's
+# own diagnostics (and any uncaught `require`/runtime failure in this one-liner)
+# were sent to /dev/null. Now stderr lands in orchestrator.log, and a failed
+# archive attempt gets an explicit, greppable line naming kind+package.
+if ! perl -e 'require $ARGV[0]; BpOrch::archive_judge_verdict($ARGV[1],$ARGV[2],$ARGV[3],time,$ARGV[4])' \
      "$SCRIPT_DIR/bp-orchestrator.pl" "$BPDIR/runs" "$KIND" "$PKG" "$BPDIR/runs/orchestrator.log" \
-     >/dev/null 2>&1 || true
+     >/dev/null 2>>"$BPDIR/runs/orchestrator.log"; then
+  printf '%s bp-judge: archive_judge_verdict FAILED kind=%s package=%s (see perl stderr just above in this log)\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$KIND" "$PKG" >> "$BPDIR/runs/orchestrator.log"
+fi
 rm -f "$VERDICT_PATH"
 
 # -------- build the prompt: inline for conformance (templates/ is unwritable for
@@ -125,6 +141,19 @@ fi
 
 LOG="$BPDIR/runs/$KIND/$PKG.jsonl"
 PIDFILE="$BPDIR/runs/$KIND/$PKG.pid"
+
+# b09: a re-fire for the SAME package (the widened GATE/AUDIT re-audit) must not
+# destroy the previous judge's stream log — the starvation-park decision text
+# explicitly tells the operator to read this file to see how far the earlier
+# audit got. Rotate any existing log to a numbered backup ($PKG.1.jsonl,
+# $PKG.2.jsonl, ...) before truncating; $PKG.jsonl always stays the CURRENT
+# attempt, which is the exact path judge_log_path() in bp-orchestrator.pl (and
+# every reader built on it) expects — do not change that path.
+if [ -e "$LOG" ]; then
+  n=1
+  while [ -e "$BPDIR/runs/$KIND/$PKG.$n.jsonl" ]; do n=$((n+1)); done
+  mv -f "$LOG" "$BPDIR/runs/$KIND/$PKG.$n.jsonl"
+fi
 
 # -------- launch detached
 (
