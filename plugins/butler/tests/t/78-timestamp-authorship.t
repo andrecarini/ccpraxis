@@ -205,7 +205,12 @@ my @STAMPED_VALUES;
     }
 
     ok($content =~ /\biso_now\b/, 'AC-02: gate-stop.sh calls iso_now at least once');
-    unlike($content, qr/\bdate\s+-u\b/, 'AC-02: gate-stop.sh introduces no "date -u" formatter');
+    # spec §2.6 S1-S3 mandate the literal text "date -u +%Y-%m-%dT%H:%M:%SZ" inside the
+    # echo "STOP ..." message strings (naming the fallback command to a human reader) —
+    # that is not a second executed clock source. Exclude those message lines before
+    # checking that no NEW "date -u" *invocation* was introduced in the executable code.
+    my $code_only = join "\n", grep { !/^\s*echo "STOP/ } @lines;
+    unlike($code_only, qr/\bdate\s+-u\b/, 'AC-02: gate-stop.sh introduces no "date -u" formatter in executable code (outside the mandated instruction strings)');
     my $date_epoch_count = () = ($content =~ /\bdate\s+\+%s\b/g);
     is($date_epoch_count, 2, 'AC-02: the pre-existing "date +%s" epoch calls are still present exactly twice');
 }
@@ -301,6 +306,12 @@ my $val_b2;
     my ($rc1) = run_gstop(base_env($dir, $led));
     is($rc1, 0, 'AC-09 (B13): first run exits 0');
     my $after1 = read_lines($led);
+    # iso_now() has one-second resolution; two back-to-back subprocess runs can land in
+    # the same wall-clock second (confirmed on this container), which would make the two
+    # stamps legitimately equal and this test's "exactly one differing line" assertion
+    # fail for a timing reason unrelated to stamping correctness. Force the two runs into
+    # different seconds rather than asserting something iso_now's own resolution can't guarantee.
+    sleep 1;
     my ($rc2) = run_gstop(base_env($dir, $led));
     my $t1 = time;
     is($rc2, 0, 'AC-09 (B13): second run exits 0');
@@ -521,7 +532,12 @@ my @ALL_STDERR;
     unlike($content, qr/\bsed\b/, 'AC-20: gate-shutdown.sh contains no sed');
     unlike($content, qr/>\s*"\$BP_LEDGER"/, 'AC-20: gate-shutdown.sh contains no > "$BP_LEDGER" redirection');
     unlike($content, qr/\.tmp\./, 'AC-20: gate-shutdown.sh contains no .tmp. temp-file pattern');
-    unlike($content, qr/\biso_now\b/, 'AC-20: gate-shutdown.sh never calls iso_now (wording only, no stamping)');
+    # spec §2.6 S4/S5 mandate the literal text "iso_now" inside the echo "STOP-AND-PARK ..."
+    # message strings (naming the mechanism to the coordinator) — that is not a call to the
+    # function. Exclude those message lines before checking the executable code never calls it.
+    my @gshut_lines = split /\n/, $content;
+    my $gshut_code_only = join "\n", grep { !/^\s*echo "STOP-AND-PARK/ } @gshut_lines;
+    unlike($gshut_code_only, qr/\biso_now\b/, 'AC-20: gate-shutdown.sh never calls iso_now in executable code (wording only, no stamping)');
 }
 
 # =========================================================================
