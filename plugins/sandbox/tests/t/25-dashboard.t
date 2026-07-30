@@ -1038,6 +1038,8 @@ sub drive_per_tick {
         'D: exactly ONE tick deviates from 1 out call and it is tick 0 (the one-time initial OSC window-title emit); every later tick is exactly 1 (no spurious extra render)');
     is($fps[0], 2,
         'D: tick 0 emits exactly 2 out calls -- initial OSC window-title emit + primary render -- and no more');
+    like($e->{out}, qr/\A\e\]0;[\x20-\x7E]*\a\e\[\?2026h/,
+        'D: tick 0\'s extra out call IS specifically the OSC window-title emit (title text, then immediately a sync-wrapped frame) -- not some other spurious render that happens to also produce a count of 2');
 }
 
 # ---------------------------------------------------------------------------

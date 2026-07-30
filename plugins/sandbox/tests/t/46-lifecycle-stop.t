@@ -856,9 +856,9 @@ sub drive2 {
     # with the OSC introducer but is not a valid title emit (trailing bytes after
     # the BEL).  Both must still be counted bad, and the delta must be exactly 2
     # -- i.e. attributable to the fakes, not to any real call.
-    my $bad_aug = $unwrapped->(@{ $withprog->{out_calls} }, "\e[1;1Hnot a frame", "\e]0;fake\aTRAILING");
-    is($bad_aug, $bad + 2,
-        'AC-18-exception-is-narrow: a deliberately-unwrapped non-OSC $out call AND an OSC-prefixed near-miss are BOTH still caught (the exception is the exact title-emit shape, nothing wider)');
+    my $bad_aug = $unwrapped->(@{ $withprog->{out_calls} }, "\e[1;1Hnot a frame", "\e]0;fake\aTRAILING", "\e]0;\e[1;1Hx\e[Ky\a");
+    is($bad_aug, $bad + 3,
+        'AC-18-exception-is-narrow: a deliberately-unwrapped non-OSC $out call, an OSC-prefixed near-miss, AND an OSC-delimited call whose payload smuggles a render fragment are ALL still caught (pins the [\x20-\x7E] payload class, not just the \z anchor)');
 }
 
 # ===========================================================================
