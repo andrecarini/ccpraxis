@@ -696,4 +696,134 @@ is(BpOrch::_tunables_base()->{harvest_defer_cap}, 2, 'PIN: _tunables_base gains 
 is(BpOrch::_tunables_base()->{harvest_reaudit_cap}, 2, 'PIN: harvest_reaudit_cap default remains 2 (pre-existing, unchanged)');
 is(BpOrch::_tunables_base()->{judge_spawn_cap}, 3, 'PIN: judge_spawn_cap default remains 3 (pre-existing, unchanged)');
 
+
+# ===========================================================================
+# STEP-7 REGRESSION GUARDS (added by the coordinator, 2026-07-30)
+#
+# These guard the step-7 fix-batch against silent reversion. They are NOT new
+# acceptance criteria -- every AC above still stands unchanged. They exist
+# because step 6 found two defects that a 168-assertion green suite could not
+# see, and both are the kind that revert quietly.
+#
+# The first is the important one and it is deliberately a SOURCE-GREP, in the
+# same style as AC-4 and AC-36 above. The default $spawn_judge closure cannot
+# be exercised without spawning a real `claude`, and t/61 (by design, mirroring
+# t/10-judges.t) always injects its own spawn_judge. That is exactly why the
+# headline blocker survived an entire session undetected: the injected seam
+# asserted the orchestrator->launcher CONTRACT (the max_turns payload key) and
+# nothing at all asserted that the DEFAULT closure honours it. A source grep is
+# the only hermetic way to assert the shipping path here.
+# ===========================================================================
+{
+    my $orch = slurp($ORCH_PL);
+
+    # -- item 8: the default closure must actually hand the widened budget to
+    #    the child. Before the fix, BP_HARVEST_MAX_TURNS appeared in this file
+    #    three times and NONE was a write, so the computed budget was dropped.
+    like($orch, qr/local\s+\$ENV\{BP_HARVEST_MAX_TURNS\}\s*=/,
+        'REGRESSION item 8: bp-orchestrator.pl WRITES $ENV{BP_HARVEST_MAX_TURNS} (widened budget reaches the child)');
+    like($orch, qr/local\s+\$ENV\{BP_HARVEST_MAX_TURNS\}\s*=\s*\$mt\s*\n\s*if\s+\$a->\{kind\}\s+eq\s+'harvest'/,
+        'REGRESSION item 8: the export is guarded on the harvest kind (spec 2.5 shape, not an unconditional local)');
+    like($orch, qr/\$mt\s*=~\s*\/\^\\d\+\$\//,
+        'REGRESSION item 8: the export validates max_turns as digits before trusting it');
+
+    # -- the export must live INSIDE the default spawn closure, ahead of the
+    #    system() that launches bp-judge.sh -- a `local` anywhere else would be
+    #    out of scope by the time the child is spawned, i.e. green grep, dead code.
+    my ($closure) = $orch =~ /\$opt->\{spawn_judge\}\s*\|\|\s*sub\s*\{(.*?)\n    \};/s;
+    ok(defined $closure, 'REGRESSION item 8: the default spawn_judge closure is still locatable by pattern');
+    like(($closure // ''), qr/local\s+\$ENV\{BP_HARVEST_MAX_TURNS\}/,
+        'REGRESSION item 8: the export is INSIDE the default spawn_judge closure');
+    if (defined $closure) {
+        my $ienv = index($closure, 'local $ENV{BP_HARVEST_MAX_TURNS}');
+        my $isys = index($closure, 'system(@cmd)');
+        ok($ienv >= 0 && $isys > $ienv,
+            'REGRESSION item 8: the export precedes system(@cmd), so it is in scope for the child');
+    }
+
+    # -- item 9: the second-starvation park must require a second starvation.
+    #    Without the $hs >= 1 conjunct a FIRST starvation whose ordinary
+    #    re-audit budget was already spent by unrelated crashes lands in the
+    #    "ran out of turns twice ... on a widened one" branch, telling the
+    #    operator a widen was tried when none ever was.
+    like($orch, qr/\$jstate\s+eq\s+'starved'\s*&&\s*\$st\s+eq\s+'done'\s*&&\s*\$hs\s*>=\s*1/,
+        'REGRESSION item 9: the second-starvation park is gated on $hs >= 1');
+
+    # -- items 9+10 wording: neither park branch may tell an operator the
+    #    package failed (done-criterion 1), and the first-starvation branch
+    #    must not claim a widened retry happened.
+    unlike($orch, qr/judge-starved[\s\S]{0,400}?\bfail(?:ed|ure|s)?\b/i,
+        'REGRESSION items 9+10: no judge-starved decision text says the package failed');
+}
+
+{
+    # -- item 1 (CRITICAL, batch 1): want_harvest_gate must withhold a re-fire
+    #    for ANY non-empty harvest value, not only 'pass'. The starvation park
+    #    writes harvest => 'starved' precisely so the audit stops re-firing;
+    #    with the old `eq 'pass'` test, GATE mode re-spawned a real judge every
+    #    tick forever and nothing bounded it (judge_spawn_cap counts only
+    #    spawns that FAIL to launch).
+    is(BpJudge::want_harvest_gate({ mode=>'gate', status=>'done', harvest=>'starved' }), 0,
+        'REGRESSION item 1: gate mode does NOT re-fire a judge for harvest => starved');
+    is(BpJudge::want_harvest_gate({ mode=>'gate', status=>'done', harvest=>'pass' }), 0,
+        'REGRESSION item 1: gate mode still withholds on pass (unchanged)');
+    is(BpJudge::want_harvest_gate({ mode=>'gate', status=>'done', harvest=>'' }), 1,
+        'REGRESSION item 1: gate mode still FIRES on an empty harvest (no over-correction)');
+    is(BpJudge::want_harvest_gate({ mode=>'gate', status=>'done' }), 1,
+        'REGRESSION item 1: gate mode still fires when harvest is absent entirely');
+
+    # -- item 2 (batch 1): attribution is AND-over-tokens, so one sibling-owned
+    #    path in a multi-path failure string cannot launder a genuine red.
+    my $ws = { A => 'plugins/butler/scripts/bp-a.pl', B => 'plugins/butler/templates/brief.md' };
+    my $st = { A => 'done', B => 'pending' };
+    my $ok1 = BpJudge::attribute_failures({ package=>'A', write_sets=>$ws, status=>$st,
+        failures=>['AC-26 forbids plugins/butler/templates/brief.md but it exists'] });
+    is($ok1->{attributable}, 1,
+        'REGRESSION item 2: a single live-sibling-owned path is still attributable (b05/b07 shape preserved)');
+    my $bad = BpJudge::attribute_failures({ package=>'A', write_sets=>$ws, status=>$st,
+        failures=>['not ok 4 - plugins/butler/templates/brief.md and plugins/butler/scripts/unowned.pl both wrong'] });
+    is($bad->{attributable}, 0,
+        'REGRESSION item 2: a sibling path PLUS an unowned path is NOT attributable (no laundering)');
+    my $own = BpJudge::attribute_failures({ package=>'A', write_sets=>$ws, status=>$st,
+        failures=>['not ok 5 - plugins/butler/templates/brief.md vs plugins/butler/scripts/bp-a.pl'] });
+    is($own->{attributable}, 0,
+        'REGRESSION item 2: a sibling path PLUS the audited package own file is NOT attributable');
+
+    # -- item 3 (batch 1): path normalisation, without weakening the boundary
+    #    guard that stops foo/bar owning foo/bar2.
+    ok(BpJudge::_owns('plugins/butler/templates/brief.md', '/project/plugins/butler/templates/brief.md'),
+        'REGRESSION item 3: an absolute cited path matches a relative write-set entry');
+    ok(!BpJudge::_owns('foo/bar', 'foo/bar2'),
+        'REGRESSION item 3: the trailing-slash boundary still stops foo/bar owning foo/bar2');
+    ok(!BpJudge::_owns('a/bp-judge', 'a/bp-judge.pl'),
+        'REGRESSION item 3: a/bp-judge still does not own a/bp-judge.pl');
+}
+
+{
+    # -- items 4/5/6 (batch 1, bp-judge.sh): all three are shell-side and are
+    #    asserted by source grep, as AC-4/AC-36 above already do for this file.
+    my $sh = slurp($JUDGE_SH);
+
+    # item 4: the archive failure must be observable, and the rm must stay
+    # unconditional (gating it would let a stale verdict be read as fresh --
+    # a false pass, which the package's scope forbids outright).
+    like($sh, qr/orchestrator\.log/,
+        'REGRESSION item 4: the archive step routes diagnostics to orchestrator.log, not /dev/null');
+    unlike($sh, qr{>/dev/null 2>&1 \|\| true\s*\nrm -f},
+        'REGRESSION item 4: the archive no longer discards all diagnostics immediately before the rm');
+    like($sh, qr/rm -f "\$VERDICT_PATH"/,
+        'REGRESSION item 4: rm -f "$VERDICT_PATH" remains UNCONDITIONAL (stale verdicts must never be re-read as fresh)');
+
+    # item 5: the BP_HARVEST_MAX_TURNS override must be validated too, not just
+    # the computed value -- this package's own decision text tells an operator
+    # to raise that variable, so a bad value there is directly reachable.
+    like($sh, qr/case "\$MAXT" in[^\n]*\|0\)/,
+        'REGRESSION item 5: the MAXT sanity guard rejects 0 as well as non-numeric');
+
+    # item 6: a re-fire must not destroy the previous judge stream log, because
+    # the starvation-park decision tells the operator to read exactly that file.
+    like($sh, qr/\$PKG\.\$n\.jsonl|\$PKG\.\d+\.jsonl/,
+        'REGRESSION item 6: an existing judge jsonl is rotated to a numbered backup rather than truncated');
+}
+
 done_testing();

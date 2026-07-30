@@ -2494,6 +2494,16 @@ sub run {
                 _log($log, 'shutdown_complete', { detail => 'graceful-shutdown-all: no coordinators left' });
                 last;
             }
+            # ---- b08 DAG-STALL DETECTION + ROUTING ----
+            # A stall (nothing running, nothing pending-and-ready) is orthogonal to
+            # the conformance gate below -- it can fire even while packages remain
+            # pending, which conformance_ready would never see as "ready to judge".
+            dag_stall_step({
+                bpdir => $bpdir, runs => $runs, log => $log, blueprint => $bp,
+                meta => $meta, status => $status, now => $now, tunables => $t,
+                queue => $rq, live => \@live, shutdown => $shutdown, paused => $paused,
+                resume_pending => $resume_pending,
+            });
             # ---- b05 CONFORMANCE GATE ----
             # Fires when the run would otherwise be idle-complete. An in-flight
             # conformance judge counts as outstanding (mirroring $judges_inflight at
