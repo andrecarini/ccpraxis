@@ -1013,8 +1013,11 @@ subtest 'T-K drift (criterion 13; AC-47..51)' => sub {
 
         # D-b: the Audit trail records a verdict and a fix count (literals only).
         like($doc, qr/CHANGES REQUIRED/, 'AC-48/D-b: Audit trail records the verdict CHANGES REQUIRED');
-        like($doc, qr/12 omissions/,     'AC-48/D-b: Audit trail records 12 omissions');
-        like($doc, qr/5 distortions/,    'AC-48/D-b: Audit trail records 5 distortions');
+        like($doc, qr/12\s+omissions/,   'AC-48/D-b: Audit trail records 12 omissions');
+        # NB: "5 distortions" wraps across a markdown line break in the real
+        # file ("...and 5\ndistortions."); \s+ tolerates the wrap without
+        # pinning to any particular line number.
+        like($doc, qr/5\s+distortions/,  'AC-48/D-b: Audit trail records 5 distortions (tolerant of the real file\'s line wrap)');
 
         # D-c: every finding (### heading) carries a basis marker, matched
         # UNANCHORED (never ^\*\*Basis -- TUI-01/TUI-02 carry it mid-line,
