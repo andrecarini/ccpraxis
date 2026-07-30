@@ -636,8 +636,241 @@ my $ISO_RE = qr/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/;
 }
 
 # [G2]  AC-7, AC-8, AC-10..AC-13   append-attempt
-# [G2]  AC-7, AC-8, AC-10..AC-13   append-attempt
-# [G3]  AC-14..AC-21          tick-step
+# =====================================================================================
+# [G2] append-attempt -- AC-7, AC-8, AC-10, AC-11, AC-12, AC-13
+# =====================================================================================
+
+my $ENTRY_RE = qr/^- \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z \Q$EMDASH\E /;
+
+{   # ---- AC-7 (B7, B8): ONE contiguous insertion, inside the section, before the next `##`.
+    my $p    = stage_bytes(clean_ledger());
+    my $orig = read_file($p);
+    my ($rc, $out, $err) = run_pl(['append-attempt', '--ledger', $p, '--text', 'did X']);
+    is($rc, 0, "AC-7: append-attempt --text 'did X' exits 0");
+    is($out, '', "AC-7: stdout empty");
+    is($err, '', "AC-7: stderr empty on success");
+    my $new = read_file($p);
+    my $ins = contiguous_insertion($orig, $new);
+    ok(defined $ins, "AC-7: the change is EXACTLY one contiguous insertion (prefix . suffix eq ORIG)");
+    is(defined $ins ? scalar(split /\n/, $ins, -1) - 1 : -1, 1,
+       "AC-7: the insertion is exactly one newline-terminated line");
+    like(defined $ins ? $ins : '', $ENTRY_RE, "AC-7: entry format is `- <ISO> \x{2014} <text>`");
+    like(defined $ins ? $ins : '', qr/did X\n\z/,  "AC-7: entry carries the text and ends with one \\n");
+    # AC-7/B8: the insertion offset lies inside `## Decisions & attempt log`, before the next `##`.
+    my $sec_start = index($new, "## Decisions & attempt log");
+    my $off       = defined $ins ? index($new, $ins) : -1;
+    my $next_hd   = $sec_start >= 0 ? index($new, "\n## ", $sec_start + 1) : -1;
+    ok($sec_start >= 0 && $off > $sec_start && ($next_hd < 0 || $off < $next_hd),
+       "AC-7/B8: insertion point is inside '## Decisions & attempt log', before the next `##` heading");
+    # Nothing else moved: every other section is byte-identical.
+    for my $h (qr/^## Next action/, qr/^##\s+Pipeline\b/, qr/^##\s+Outputs\b/, qr/^##\s+Escalation\b/) {
+        is(section_of($new, $h), section_of($orig, $h), "AC-7: section $h byte-identical after append-attempt");
+    }
+}
+
+{   # ---- AC-8 (B9): b09 -- 4 fence-embedded lookalikes stay byte-identical; entry not in a fence.
+  SKIP: {
+        skip("b09 fixture not locatable in the corpus", 4) unless defined $FX_B09;
+        my $p    = stage_corpus($FX_B09);
+        my $orig = read_file($p);
+        my @orig_fenced = fenced_lines($orig);
+        my ($rc, $out, $err) = run_pl(['append-attempt', '--ledger', $p, '--text', 'b09 fence probe']);
+        is($rc, 0, "AC-8: append-attempt on b09 (fence-embedded lookalikes) exits 0");
+        my $new = read_file($p);
+        my $ins = contiguous_insertion($orig, $new);
+        ok(defined $ins, "AC-8: one contiguous insertion on b09");
+        is_deeply([fenced_lines($new)], [@orig_fenced],
+                  "AC-8: all fence-embedded ##/status:/- [x] lookalike lines byte-identical afterwards");
+        my $off = defined $ins ? index($new, $ins) : -1;
+        ok($off >= 0 && !offset_in_fence($new, $off),
+           "AC-8: the inserted entry is NOT inside any fenced code block");
+    }
+}
+
+{   # ---- AC-10 (B10): multi-line --text collapses to exactly ONE inserted line.
+    my $p    = stage_bytes(clean_ledger());
+    my $orig = read_file($p);
+    my ($rc) = run_pl(['append-attempt', '--ledger', $p, '--text', "line one\nline two\r\nline three"]);
+    is($rc, 0, "AC-10: multi-line --text exits 0");
+    my $new = read_file($p);
+    my $ins = contiguous_insertion($orig, $new);
+    ok(defined $ins, "AC-10: still one contiguous insertion");
+    is(defined $ins ? scalar(split /\n/, $ins, -1) - 1 : -1, 1,
+       "AC-10: exactly one inserted line (\\r\\n+ collapsed to a single space)");
+    like(defined $ins ? $ins : '', qr/line one line two line three\n\z/,
+         "AC-10: newlines collapsed to single spaces, text otherwise intact");
+}
+
+{   # ---- AC-11 (B11): `- [x]` in --text cannot forge the orchestrator's progress signal.
+    my $p    = stage_bytes(clean_ledger());
+    my $orig = read_file($p);
+    my $before = ticked_count($orig);
+    my ($rc) = run_pl(['append-attempt', '--ledger', $p, '--text', '- [x] step 9 done']);
+    is($rc, 0, "AC-11: append-attempt --text '- [x] step 9 done' exits 0 (not an argument fault)");
+    my $new = read_file($p);
+    is(ticked_count($new), $before,
+       "AC-11: the body's /^\\s*-\\s*\\[[xX]\\]/ count is UNCHANGED -- no forged ticked checkbox");
+    my $ins = contiguous_insertion($orig, $new);
+    like(defined $ins ? $ins : '', qr/\Q$EMDASH\E - \[x\] step 9 done\n\z/,
+         "AC-11: the rendered line is `- <ISO> \x{2014} - [x] step 9 done`");
+    ok(defined $ins && $ins !~ /^[ \t]*-[ \t]*\[[xX]\]/,
+       "AC-11: ...which does not itself match the ticked-checkbox pattern");
+}
+
+{   # ---- AC-12 (B13): a lone `_(none)_` placeholder is REPLACED, not appended after.
+    my $p    = stage_bytes(placeholder_ledger());
+    my $orig = read_file($p);
+    my ($rc) = run_pl(['append-attempt', '--ledger', $p, '--text', 'first real entry']);
+    is($rc, 0, "AC-12: append-attempt onto a `_(none)_` placeholder body exits 0");
+    my $new = read_file($p);
+    my $sec = section_of($new, qr/^##\s+Decisions & attempt log\b/);
+    ok(defined $sec && $sec !~ /^_\(none\)_$/m,
+       "AC-12: the italic placeholder line is GONE from the attempt-log section");
+    like(defined $sec ? $sec : '', qr/^- \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z \Q$EMDASH\E first real entry$/m,
+         "AC-12: the entry took its place");
+    my ($rm, $add) = line_diff($orig, $new);
+    is_deeply($rm, ['_(none)_'],
+              "AC-12: exactly the placeholder line was removed (replaced, not appended after)");
+    is(scalar(@$add), 1, "AC-12: exactly one line added");
+}
+
+{   # ---- AC-13 (B14): section ends inside an UNTERMINATED fence -> exit 5, byte-identical.
+    my $p    = stage_bytes(unterminated_fence_ledger());
+    my $orig = read_file($p);
+    my ($rc, $out, $err) = run_pl(['append-attempt', '--ledger', $p, '--text', 'must not land in a fence']);
+    is($rc, 5, "AC-13: unterminated fence in the target section -> exit 5 (region not found)");
+    is($out, '', "AC-13: stdout empty");
+    is(one_stderr_line($err), 1, "AC-13: exactly one stderr line");
+    like($err, qr/^bp-ledger: append-attempt: \Q$p\E: /, "AC-13: `bp-ledger:` framing");
+    is(read_file($p), $orig, "AC-13: file byte-identical -- never inserted into a fence");
+    is(scalar(glob_tmp(dirname_of($p), '*.tmp.*')), 0, "AC-13: no temp file left behind");
+}
+
+# =====================================================================================
+# [G3] tick-step -- AC-14..AC-21
+# =====================================================================================
+
+{   # ---- AC-14 (B15): exactly ONE bracket byte flips; ticked count +1; one changed line.
+    my $p    = stage_bytes(clean_ledger());
+    my $orig = read_file($p);
+    my ($rc, $out, $err) = run_pl(['tick-step', '--ledger', $p, '--step', '3']);
+    is($rc, 0, "AC-14: tick-step --step 3 exits 0");
+    is($out, '', "AC-14: stdout empty");
+    is($err, '', "AC-14: stderr empty on success");
+    my $new = read_file($p);
+    is(length($new), length($orig), "AC-14: file length unchanged (single-byte bracket replacement)");
+    my @off = differing_offsets($orig, $new);
+    is(scalar(@off), 1, "AC-14: EXACTLY one byte differs from ORIG");
+    is((@off == 1 ? substr($orig, $off[0], 1) : '?'), ' ', "AC-14: the byte that changed was a space");
+    is((@off == 1 ? substr($new,  $off[0], 1) : '?'), 'x', "AC-14: ...and it became 'x'");
+    is(ticked_count($new), ticked_count($orig) + 1, "AC-14: ticked-checkbox count rises by exactly 1");
+    my ($rm, $add) = line_diff($orig, $new);
+    is(scalar(@$rm), 1, "AC-14: exactly one line removed in the diff");
+    is($add->[0] // '', '- [x] 3. third step', "AC-14: ...and replaced by the same line with [x]");
+}
+
+{   # ---- AC-15 (B16): SHARED-PREFIX DIGITS. `--step 1` must not match `- [ ] 11.`.
+    my $p1 = stage_bytes(clean_ledger());
+    my $o1 = read_file($p1);
+    my ($rc1) = run_pl(['tick-step', '--ledger', $p1, '--step', '1']);
+    is($rc1, 0, "AC-15: --step 1 exits 0");
+    my $n1 = read_file($p1);
+    like($n1, qr/^- \[x\] 1\. first step$/m,      "AC-15: `- [ ] 1.` flipped");
+    like($n1, qr/^- \[ \] 11\. eleventh step$/m,  "AC-15: `- [ ] 11.` left UNTOUCHED by --step 1");
+    is(scalar(differing_offsets($o1, $n1)), 1,    "AC-15: exactly one byte changed for --step 1");
+
+    my $p2 = stage_bytes(clean_ledger());
+    my $o2 = read_file($p2);
+    my ($rc2) = run_pl(['tick-step', '--ledger', $p2, '--step', '11']);
+    is($rc2, 0, "AC-15: --step 11 exits 0");
+    my $n2 = read_file($p2);
+    like($n2, qr/^- \[x\] 11\. eleventh step$/m, "AC-15: `- [ ] 11.` flipped");
+    like($n2, qr/^- \[ \] 1\. first step$/m,     "AC-15: `- [ ] 1.` left UNTOUCHED by --step 11");
+    is(scalar(differing_offsets($o2, $n2)), 1,   "AC-15: exactly one byte changed for --step 11");
+}
+
+{   # ---- AC-16 (B17): b13's OWN ledger has a wrapped step; continuation lines must be byte-identical.
+  SKIP: {
+        skip("b13 fixture not locatable in the corpus", 4) unless defined $FX_B13;
+        my $p    = stage_corpus($FX_B13);
+        my $orig = read_file($p);
+        # Locate a wrapped, UNticked step by pattern -- never by line number.
+        my ($step) = $orig =~ /^[ \t]*-[ \t]*\[[ ]\][ \t]*(\d+)\..*\n[ \t]+\S/m;
+        skip("b13's ledger currently has no wrapped UNticked pipeline step", 4) unless defined $step;
+        my ($rc) = run_pl(['tick-step', '--ledger', $p, '--step', $step]);
+        is($rc, 0, "AC-16: tick-step --step $step on b13's own (wrapped) ledger exits 0");
+        my $new = read_file($p);
+        is(length($new), length($orig), "AC-16: length unchanged -- no reflow of the wrapped entry");
+        my @off = differing_offsets($orig, $new);
+        is(scalar(@off), 1, "AC-16: exactly one byte differs (the bracket)");
+        is_deeply([indented_lines($new)], [indented_lines($orig)],
+                  "AC-16: EVERY indented continuation line is byte-identical");
+    }
+}
+
+{   # ---- AC-17 (B18): already `[x]` -> exit 0, byte-identical, NO temp file, mtime unchanged.
+    my $p = stage_bytes(clean_ledger(pipeline => "- [x] 3. third step"));
+    my $orig  = read_file($p);
+    my @st0   = stat($p);
+    my ($rc, $out, $err) = run_pl(['tick-step', '--ledger', $p, '--step', '3']);
+    is($rc, 0, "AC-17: tick-step on an already-[x] step is idempotent SUCCESS");
+    is($err, '', "AC-17: stderr empty");
+    is(read_file($p), $orig, "AC-17: file byte-identical");
+    my @st1 = stat($p);
+    is($st1[9], $st0[9], "AC-17: mtime UNCHANGED (step 7: no temp file, no rename)");
+    is(scalar(glob_tmp(dirname_of($p), '*.tmp.*')), 0, "AC-17: no temp file was created");
+}
+
+{   # ---- AC-18 (B19): already `[X]` -> exit 0, NOT normalised to lowercase.
+    my $p = stage_bytes(clean_ledger(pipeline => "- [X] 3. third step"));
+    my $orig = read_file($p);
+    my ($rc) = run_pl(['tick-step', '--ledger', $p, '--step', '3']);
+    is($rc, 0, "AC-18: tick-step on an already-[X] step exits 0");
+    my $new = read_file($p);
+    is($new, $orig, "AC-18: file byte-identical");
+    like($new, qr/^- \[X\] 3\. third step$/m, "AC-18: [X] is NOT normalised to [x] (byte-identity wins)");
+}
+
+{   # ---- AC-19 (B20): absent step -> exit 5, byte-identical.
+    my $p    = stage_bytes(clean_ledger());
+    my $orig = read_file($p);
+    my ($rc, $out, $err) = run_pl(['tick-step', '--ledger', $p, '--step', '9']);
+    is($rc, 5, "AC-19: --step 9 with no such step -> exit 5 (region not found, NOT a validation failure)");
+    is($out, '', "AC-19: stdout empty");
+    is(one_stderr_line($err), 1, "AC-19: exactly one stderr line");
+    like($err, qr/^bp-ledger: tick-step: \Q$p\E: /, "AC-19: `bp-ledger:` framing");
+    is(read_file($p), $orig, "AC-19: file byte-identical");
+}
+
+{   # ---- AC-20 (B21): a FENCED `- [ ] 2.` inside `## Pipeline` is skipped; the real one flips.
+    my $p    = stage_bytes(fenced_pipeline_ledger());
+    my $orig = read_file($p);
+    my ($rc) = run_pl(['tick-step', '--ledger', $p, '--step', '2']);
+    is($rc, 0, "AC-20: tick-step --step 2 with a fenced lookalike present exits 0");
+    my $new = read_file($p);
+    my @off = differing_offsets($orig, $new);
+    is(scalar(@off), 1, "AC-20: exactly one byte changed");
+    like($new, qr/^- \[ \] 2\. fenced lookalike that must never flip$/m,
+         "AC-20: the FENCED `- [ ] 2.` is byte-identical");
+    like($new, qr/^- \[x\] 2\. the REAL second step$/m, "AC-20: the REAL `- [ ] 2.` flipped");
+    ok(@off == 1 && !offset_in_fence($new, $off[0]), "AC-20: the changed byte is outside every fence");
+}
+
+{   # ---- AC-21 (B22): bad / missing --step -> exit 3.
+    for my $case (['0'], ['x'], ['01'], []) {
+        my $p    = stage_bytes(clean_ledger());
+        my $orig = read_file($p);
+        my @args = ('tick-step', '--ledger', $p, (@$case ? ('--step', $case->[0]) : ()));
+        my $lbl  = @$case ? "--step '$case->[0]'" : "missing --step";
+        my ($rc, $out, $err) = run_pl(\@args);
+        is($rc, 3, "AC-21: $lbl -> exit 3");
+        is($out, '', "AC-21: $lbl stdout empty");
+        is(one_stderr_line($err), 1, "AC-21: $lbl exactly one stderr line");
+        is(read_file($p), $orig, "AC-21: $lbl file byte-identical");
+    }
+}
+
+# [G4]  AC-22..AC-27          set-next-action / add-output
 # [G4]  AC-22..AC-27          set-next-action / add-output
 # [G5]  AC-28..AC-30          round-trip, no-touch, framing parity
 # [G6]  AC-31..AC-37, AC-42   validate / delegation / parity
