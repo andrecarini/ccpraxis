@@ -86,12 +86,23 @@ my @positional;
 {
     my @argv = @ARGV;
     my $no_more_opts = 0;
+    # Red-team R1/R2/R4: option words occurring INSIDE the operator's own
+    # feedback text were being recognised as options wherever they appeared
+    # in @ARGV, silently deleting/misfiling the operator's own words (or, for
+    # -h/--help, discarding the entire capture with exit 0). The usage line
+    # ("[options] [--] [text ...]") already documents the conventional POSIX
+    # boundary: options are only recognised BEFORE the first positional
+    # token (or before an explicit --). Once the first positional token is
+    # seen, every remaining token — including one that looks like an option
+    # — is verbatim text. This does not change any invocation that already
+    # puts its options first, which is every case the oracle exercises.
+    my $positional_started = 0;
     my %needs_value = map { ($_ => 1) } ('--source', '--blueprint', '--batch', '--data-dir');
 
     while (@argv) {
         my $a = shift @argv;
 
-        if ($no_more_opts) {
+        if ($no_more_opts || $positional_started) {
             push @positional, $a;
             next;
         }
@@ -132,6 +143,8 @@ my @positional;
         if ($a =~ /^-/) {
             _fail(1, "[unknown option]: $a", usage => 1);
         }
+        # First positional token: option parsing is over from here on.
+        $positional_started = 1;
         push @positional, $a;
     }
 }
