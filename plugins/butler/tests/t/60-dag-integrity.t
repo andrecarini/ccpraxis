@@ -942,8 +942,14 @@ sub _dag_stall_queue_entries {
     my @out;
     my $data = decode_json_file("$runs/remediation-queue.json");
     return @out unless defined $data;
-    my @all = ref($data) eq 'ARRAY' ? @$data
-            : ref($data) eq 'HASH'  ? values %$data
+    # BpRemediate::write_queue emits an ENVELOPE: { entries => [...], escalated =>
+    # [...], schema => 'remediation-queue/1', ... }. The entries live under
+    # ->{entries}; `values %$data` would hand back the envelope's own values
+    # (arrayrefs, counters, the schema string) and match nothing. Sibling
+    # t/26-auto-remediation-engine.t reads ->{entries} for the same reason.
+    my @all = ref($data) eq 'ARRAY'                 ? @$data
+            : ref($data->{entries}) eq 'ARRAY'      ? @{ $data->{entries} }
+            : ref($data) eq 'HASH'                  ? values %$data
             : ();
     @out = grep {
         ref($_) eq 'HASH' && ref($_->{finding}) eq 'HASH'
@@ -1205,8 +1211,13 @@ SKIP: {
         'AC-40: a widened dependent list on the same blocker still produces no new submission (finding_key guard)');
 
     ok(-f "$runs/registry.json", 'AC-41: the _dag_stall fact is persisted to runs/registry.json');
-    my $reg = decode_json_file("$runs/registry.json");
-    ok(ref($reg) eq 'HASH' && ref($reg->{_dag_stall}) eq 'HASH' && exists $reg->{_dag_stall}{'b01-blocker'},
+    # registry.json nests every package under ->{packages}: update_registry_pkg
+    # writes $data->{packages}{$pkg}, and read_registry() returns $r->{packages},
+    # which is why the spec's `read_registry($runs)->{_dag_stall}` resolves to
+    # packages._dag_stall. Reading the raw decode at top level would miss it.
+    my $reg  = decode_json_file("$runs/registry.json");
+    my $pkgs = (ref($reg) eq 'HASH' && ref($reg->{packages}) eq 'HASH') ? $reg->{packages} : {};
+    ok(ref($pkgs->{_dag_stall}) eq 'HASH' && exists $pkgs->{_dag_stall}{'b01-blocker'},
         'AC-41: a fresh read of registry.json (simulating restart) still shows the blocker recorded');
 }
 
