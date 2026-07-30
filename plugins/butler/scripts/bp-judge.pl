@@ -179,10 +179,10 @@ sub audit_outcome {
 # sibling-red attribution). All pure: no I/O, no globals, no clock, never die.
 # ===========================================================================
 
-# _split_paths($v) -> @paths      (internal helper; not exported, called by full
-# name from within this package and from bp-orchestrator.pl as BpJudge::_split_paths
-# is NOT part of the public contract, but Perl namespacing makes it reachable —
-# treated as private by convention, mirrored on both write_set and test_paths.)
+# _split_paths($v) -> @paths      (internal helper; not exported. Not part of
+# the public contract, but Perl namespacing makes BpJudge::_split_paths
+# reachable from bp-orchestrator.pl too — treated as private by convention.
+# Mirrored on both write_set and test_paths.)
 # $v: colon-separated string (ledger frontmatter shape), arrayref, or undef.
 # Splits on ':', trims whitespace, drops empties and the placeholder tokens '-',
 # '—', '[]', 'none' (case-insensitive), strips one leading './' and any trailing
@@ -244,13 +244,47 @@ sub judge_liveness {
 # _owns($entry, $token) -> 0|1   (internal helper for attribute_failures)
 # $entry is already a _split_paths-normalized write-set entry; $token is a raw
 # candidate path extracted from a failure string, normalized here the same way.
+# Two normalizations (b09 item 3), both pure — no filesystem/env access:
+#   (a) a token may be cited absolute (e.g. /project/plugins/butler/x.pl) while
+#       write-set entries are always relative. The actual project root is not
+#       knowable from a pure function, so alignment is structural: find $entry
+#       (or its glob-reduced form, see (b)) as a path-bounded suffix of the
+#       token and strip everything before it.
+#   (b) an entry containing a shell glob metacharacter (e.g. 'scripts/*') never
+#       appears literally in a cited token, so it used to own nothing at all —
+#       including failing to disqualify the AUDITED package's own file, which
+#       laundered its own genuine red into sibling attribution. Reduce such an
+#       entry to its literal directory prefix (everything before the first
+#       metachar, trimmed back to the last full path component) and apply the
+#       ordinary directory-prefix semantics to that prefix instead.
+# The trailing-slash boundary ("foo/bar" must not own "foo/bar2") is preserved
+# in both cases: it lives in the single `index($norm, "$eff_entry/") == 0`
+# check below, unchanged in shape from before this fix.
 sub _owns {
     my ($entry, $token) = @_;
     return 0 unless defined $entry && length $entry;
     my ($norm) = _split_paths([$token]);
     return 0 unless defined $norm && length $norm;
-    return 1 if $norm eq $entry;
-    return 1 if index($norm, "$entry/") == 0;
+
+    my $eff_entry = $entry;
+    if ($entry =~ /[*?\[\]{}]/) {
+        ($eff_entry = $entry) =~ s{[*?\[\]{}].*$}{};
+        $eff_entry =~ s{/[^/]*$}{};
+        return 0 unless length $eff_entry;
+    }
+
+    if ($norm =~ m{^/}) {
+        my $bare = $norm;
+        $bare =~ s{^/+}{};
+        if ($bare eq $eff_entry) {
+            $norm = $bare;
+        } elsif ($bare =~ m{(?:^|/)\Q$eff_entry\E(/.*)?$}) {
+            $norm = $eff_entry . (defined $1 ? $1 : '');
+        }
+    }
+
+    return 1 if $norm eq $eff_entry;
+    return 1 if index($norm, "$eff_entry/") == 0;
     return 0;
 }
 
@@ -261,6 +295,12 @@ sub _owns {
 #        write_sets => { pkg => $colon_str|\@ },
 #        status     => { pkg => $status_str } }
 # Algorithm (spec §3 behavior 22): pure; tolerates any garbage input; never dies.
+# LIVE-default note (item 7b): a sibling present in write_sets but ABSENT from
+# status defaults to status '' below, which matches none of done/dropped/
+# blocked/parked and so is treated as LIVE. This is the intended fail-toward-
+# defer direction — an unknown-status sibling is assumed still in flight
+# rather than assumed finished, so its red is deferred rather than pinned on
+# the package under audit. Not a bug; do not "fix" it to fail-closed.
 sub attribute_failures {
     my ($c) = @_;
     $c = {} unless ref $c eq 'HASH';
