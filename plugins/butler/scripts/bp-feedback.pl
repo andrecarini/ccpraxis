@@ -105,6 +105,12 @@ my @positional;
         }
         if ($needs_value{$a}) {
             unless (@argv) {
+                # Deliberate divergence from the spec's F1-F5 table, which
+                # marks "+ usage" against F1 (unknown option) only: a
+                # missing option value is exactly the moment usage helps
+                # most, and the one-command constraint means the calling
+                # agent should never have to go read anything else to
+                # recover. No test asserts usage is absent here.
                 _fail(1, "[$a requires a value]", usage => 1);
             }
             my $v = shift @argv;
@@ -112,6 +118,7 @@ my @positional;
                 $opt_source = $v;
             } elsif ($a eq '--blueprint') {
                 if (!length $v) {
+                    # See divergence note above; same rationale applies.
                     _fail(1, '[--blueprint requires a value]', usage => 1);
                 }
                 $blueprint_override = $v;
@@ -168,8 +175,12 @@ if ($body !~ /\S/) {
 }
 
 # F7: C0/DEL refusal. Hardcoded class (Pre-settled #1 of the b25 spec);
-# origin located by grep this session: bp-orchestrator.pl:506
-# ($s =~ tr/\x00-\x08\x0B\x0C\x0E-\x1F\x7F//d;). Runs before the UTF-8 check
+# canonical origin is the house C0/DEL rule in plugins/butler/scripts/
+# bp-orchestrator.pl (locate it there by grepping for the class itself,
+# e.g. tr/\x00-\x08\x0B\x0C\x0E-\x1F\x7F//d;) — deliberately NOT cited by
+# line number: that file is edited by several live packages and the line
+# moved twice during this package's own development, so a positional
+# citation rots (SYN-23). Runs before the UTF-8 check
 # so a NUL always reports as a control byte, never as an encoding error.
 if ($body =~ /([\x00-\x08\x0B\x0C\x0E-\x1F\x7F])/) {
     my $byte   = ord($1);
@@ -435,8 +446,17 @@ unless ($write_ok) {
 }
 
 unless (rename($tmp, $final)) {
-    # Permitted ONLY because $final is the zero-byte placeholder this same
-    # process created above at reservation time.
+    # On POSIX, rename() silently replaces an existing destination
+    # regardless of its size, so the first rename above already succeeds
+    # and this branch never runs there. This fallback exists for Windows,
+    # where rename() onto an existing file fails outright. The safety
+    # here does NOT come from the size check below — it comes entirely
+    # from the O_CREAT|O_EXCL reservation at the top of this block: no
+    # other process can hold this name, so $final can only be the
+    # zero-byte placeholder we ourselves created. The -s == 0 check is
+    # just a belt-and-braces assertion of that invariant on the one
+    # platform where this code path can run at all; it is not itself
+    # what makes replacing $final safe.
     if (-f $final && -s $final == 0) {
         unlink $final;
     }
