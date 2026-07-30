@@ -287,11 +287,23 @@ sub attribute_failures {
     my @unattributed;
     for my $fail (@f) {
         my @tokens = $fail =~ m{([A-Za-z0-9_][A-Za-z0-9_./+-]*/[A-Za-z0-9_.+-]+)}g;
-        my $attributed = 0;
+        # AND, not OR (item 2): a failure string is attributable only if EVERY
+        # extracted path token is attributable to a live sibling. A single token
+        # owned by a sibling used to launder the WHOLE failure into a deferral even
+        # when another cited token (e.g. the audited package's own test file) was
+        # genuine own-red. $saw_token tracks whether any path-like token was found
+        # at all (no tokens => unattributed, same as before).
+        my $saw_token = 0;
+        my $all_attributed = 1;
         for my $tok (@tokens) {
             $tok =~ s/[.,;:)\]'"]+$//;
             next unless length $tok;
-            next if grep { _owns($_, $tok) } @own;    # disqualified: A's own file
+            $saw_token = 1;
+            if (grep { _owns($_, $tok) } @own) {      # disqualified: A's own file
+                $all_attributed = 0;                  # not attributable to a sibling
+                next;
+            }
+            my $tok_attributed = 0;
             for my $s (sort keys %sib_paths) {
                 next if $s eq $pkg;
                 my $st = defined $status{$s} && !ref $status{$s} ? lc($status{$s}) : '';
@@ -301,10 +313,12 @@ sub attribute_failures {
                 next if $st eq 'done' || $st eq 'dropped' || $st eq 'blocked' || $st eq 'parked';
                 if (grep { _owns($_, $tok) } @{ $sib_paths{$s} }) {
                     $blockers{$s} = 1;
-                    $attributed = 1;
+                    $tok_attributed = 1;
                 }
             }
+            $all_attributed = 0 unless $tok_attributed;
         }
+        my $attributed = ($saw_token && $all_attributed) ? 1 : 0;
         push @unattributed, $fail unless $attributed;
     }
     my $attributable = @unattributed ? 0 : 1;
@@ -338,7 +352,7 @@ sub want_harvest_gate {
     return 0 unless ($c->{mode} // 'audit') eq 'gate';
     return 0 unless defined $c->{status} && $c->{status} eq 'done';
     return 0 if $c->{inflight};
-    return 0 if defined $c->{harvest} && $c->{harvest} eq 'pass';
+    return 0 if defined $c->{harvest} && length $c->{harvest};   # already verdicted
     return 1;
 }
 
