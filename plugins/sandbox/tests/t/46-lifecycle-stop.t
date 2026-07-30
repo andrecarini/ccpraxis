@@ -836,8 +836,29 @@ sub drive2 {
     cmp_ok($withprog->{frames} - $base->{frames}, '>=', 3,
         'AC-18: 3 mid-sequence progress calls -> at least 3 additional $out writes during the drain');
 
-    my $bad = grep { !/^\e\[\?2026h/ || !/\e\[\?2026l$/ } @{ $withprog->{out_calls} };
-    is($bad, 0, 'AC-18: every single $out call is wrapped in \\e[?2026h ... \\e[?2026l (synchronized output)');
+    # ONE named, documented exception (s07-live-status Decision #8,
+    # Dashboard.pm:3017-3026): the OSC window-title emit is its OWN $out call and
+    # is deliberately NOT wrapped -- an OS window-title escape cannot live inside
+    # a TUI frame-sync marker.  window_title() guarantees
+    # /\A[\x20-\x7E]{1,80}\z/, so the whole call is exactly this shape.  The
+    # pattern is FULLY anchored (\A/\z, not ^/$) so no multi-line render fragment
+    # and no merely-OSC-prefixed string can slip through.  The wrap-check itself
+    # is unchanged; nothing else is excused.
+    my $OSC_TITLE = qr/\A\e\]0;[\x20-\x7E]*\a\z/;
+    my $unwrapped = sub {
+        return scalar grep { $_ !~ $OSC_TITLE && (!/^\e\[\?2026h/ || !/\e\[\?2026l$/) } @_;
+    };
+    my $bad = $unwrapped->(@{ $withprog->{out_calls} });
+    is($bad, 0, 'AC-18: every $out call except the named OSC window-title emit is wrapped in \\e[?2026h ... \\e[?2026l (synchronized output)');
+
+    # The exception must be NARROW.  Feed the SAME check two deliberately
+    # unwrapped synthetic calls: one that is not OSC at all, and one that starts
+    # with the OSC introducer but is not a valid title emit (trailing bytes after
+    # the BEL).  Both must still be counted bad, and the delta must be exactly 2
+    # -- i.e. attributable to the fakes, not to any real call.
+    my $bad_aug = $unwrapped->(@{ $withprog->{out_calls} }, "\e[1;1Hnot a frame", "\e]0;fake\aTRAILING");
+    is($bad_aug, $bad + 2,
+        'AC-18-exception-is-narrow: a deliberately-unwrapped non-OSC $out call AND an OSC-prefixed near-miss are BOTH still caught (the exception is the exact title-emit shape, nothing wider)');
 }
 
 # ===========================================================================

@@ -1021,10 +1021,19 @@ sub drive_per_tick {
         state_interval => 999,
     );
     my @fps = @{ $e->{frames_per_tick} };
-    # All completed ticks (those that called sleep_for) must have exactly 1 render.
-    my @bad = grep { $_ != 1 } @fps;
-    is(scalar(@bad), 0,
-        'D: no-input ticks emit exactly 1 out call each (no spurious extra render)');
+    # s07-live-status Decision #8: the OSC window-title emit is its OWN $out call,
+    # made once on the first primary render ($last_title starts undef) and then
+    # only on change.  So tick 0 legitimately has TWO out calls (title + render)
+    # and every later tick has exactly one (title unchanged -> no re-emit).
+    # Pinned exactly: WHICH tick deviates, and BY HOW MUCH -- a bare
+    # "one tick deviates" would also pass if an unrelated regression added a
+    # stray render on a different tick.
+    is(scalar(@fps), 4, 'D: 4 completed ticks were driven (the shape below is not vacuous)');
+    my @off_shape = grep { $fps[$_] != 1 } 0 .. $#fps;
+    is_deeply(\@off_shape, [0],
+        'D: exactly ONE tick deviates from 1 out call and it is tick 0 (the one-time initial OSC window-title emit); every later tick is exactly 1 (no spurious extra render)');
+    is($fps[0], 2,
+        'D: tick 0 emits exactly 2 out calls -- initial OSC window-title emit + primary render -- and no more');
 }
 
 # ---------------------------------------------------------------------------
@@ -1112,9 +1121,15 @@ sub drive_per_tick {
     # The last render in the captured sequence is the one for the quiet tick
     # that follows the scroll tick (tick2, no scroll, no gather).
     my $post_scroll_render = $renders[-1];
-    my @row_moves = ($post_scroll_render =~ /\e\[\d+;1H/g);
-    is(scalar(@row_moves), 0,
-        'E: post-scroll quiet-tick render has 0 row repaints (prev baseline is current, not stale)');
+    # s07-live-status done-criterion #2 makes an idle tick a 1-ROW update, not a
+    # 0-row update: the title row repaints because the spinner index advanced.
+    # So exactly ONE row move is expected -- and it must be row 1 (the title
+    # row).  A repaint of any OTHER row would still mean a stale $prev baseline.
+    my @row_moves = ($post_scroll_render =~ /\e\[(\d+);1H/g);
+    is(scalar(@row_moves), 1,
+        'E: post-scroll quiet-tick render repaints EXACTLY ONE row (prev baseline is current, not stale)');
+    is_deeply(\@row_moves, ['1'],
+        'E: ...and that one row is row 1, the title row (legitimate spinner advance), not a content row');
 }
 
 # ===========================================================================
