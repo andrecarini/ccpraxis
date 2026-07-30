@@ -663,9 +663,20 @@ subtest 'T-H red-team surface (all criteria; cross-cutting)' => sub {
         my $tmp = tempdir(CLEANUP => 1);
         local $ENV{CCPRAXIS_DATA_DIR} = $tmp;
         _make_open_batch($tmp, 1);
-        my $chunk = ("The operator's words, verbatim, non-ASCII caf\x{e9}. " x 2000); # ASCII-safe repeat, non-ASCII-safe when utf8-encoded below
-        my $huge = $chunk x 20; # comfortably > 2 MiB once UTF-8-encoded
-        utf8::encode($huge) if utf8::is_utf8($huge);
+        # Built via pack('C*', ...) rather than a \x{E9} escape under `use
+        # utf8`, deliberately dodging the Perl UTF8-flag trap: a codepoint
+        # < 256 written as \x{E9} is stored as Latin-1 with the internal
+        # UTF8 flag OFF, so "utf8::encode(...) if utf8::is_utf8(...)" never
+        # fires and the RAW single byte 0xE9 -- an invalid standalone UTF-8
+        # sequence -- ends up on the wire, which trips AC-23's invalid-UTF-8
+        # refusal (exit 5) instead of exercising size handling (exit 0) --
+        # i.e. the fixture would demand both exit 0 (here) and exit 5
+        # (AC-23) for the same bytes, which no implementation can satisfy.
+        # pack('C*', 0xC3, 0xA9) is unambiguously the two valid UTF-8 bytes
+        # for U+00E9 (e-acute), with no flag interpretation involved at all.
+        my $eacute = pack('C*', 0xC3, 0xA9);
+        my $chunk  = "The operator's words, verbatim, non-ASCII caf${eacute}. ";
+        my $huge   = $chunk x 50000; # ~2.3 MiB, valid UTF-8 throughout
         my ($rc, $out, $err) = run_cli(args => ['--data-dir', $tmp, '--batch', 'batch-1'], stdin => $huge);
         is($rc, 0, 'red-team: huge paste (>2 MiB) -> exit 0, no size cap');
         my $path = $out; chomp $path;
