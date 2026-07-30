@@ -316,15 +316,16 @@ sub dag_stall {
     }
 
     my @pending = sort grep { (($status->{$_} // 'pending') eq 'pending') } keys %m;
-    unless (@pending) {
-        return { stalled => 0, reason => 'no-pending', pending => [], ready => [], blockers => [], unresolvable => [] };
-    }
 
     for my $pkg (keys %m) {
         my $st = $status->{$pkg} // 'pending';
         if (!_is_terminal($st) && $st ne 'pending') {
             return { stalled => 0, reason => 'inflight', pending => \@pending, ready => [], blockers => [], unresolvable => [] };
         }
+    }
+
+    unless (@pending) {
+        return { stalled => 0, reason => 'no-pending', pending => [], ready => [], blockers => [], unresolvable => [] };
     }
 
     my @ready = sort(ready_packages(\%m, $status, []));
