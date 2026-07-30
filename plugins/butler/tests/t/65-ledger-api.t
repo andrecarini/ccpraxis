@@ -259,6 +259,46 @@ sub glob_tmp {
     return @f;
 }
 
+sub dirname_of { (my $d = $_[0]) =~ s{/[^/]+\z}{}; return $d }
+
+# ---- fence primitives (§2.11) ------------------------------------------------------
+# A fence toggles on any line whose leading-whitespace-stripped form starts with >=3 backticks or
+# >=3 tildes. Returns the list of lines that are INSIDE a fence (fence delimiters excluded).
+sub fenced_lines {
+    my ($s) = @_;
+    my ($in, @out) = (0);
+    for my $l (split /\n/, $s, -1) {
+        if ($l =~ /^[ \t]*(?:`{3,}|~{3,})/) { $in = !$in; next }
+        push @out, $l if $in;
+    }
+    return @out;
+}
+
+# Is byte offset $off inside a fenced code block?
+sub offset_in_fence {
+    my ($s, $off) = @_;
+    my $pre = substr($s, 0, $off);
+    my @l   = split /\n/, $pre, -1;
+    pop @l;                                # the (partial) line containing $off is not yet closed
+    my $in = 0;
+    for my $l (@l) { $in = !$in if $l =~ /^[ \t]*(?:`{3,}|~{3,})/ }
+    return $in ? 1 : 0;
+}
+
+# Every line beginning with whitespace then a non-space (a wrapped continuation line).
+sub indented_lines {
+    my ($s) = @_;
+    return grep { /^[ \t]+\S/ } split /\n/, $s, -1;
+}
+
+sub count_occ {
+    my ($hay, $needle) = @_;
+    return 0 if !length $needle;
+    my ($n, $pos) = (0, 0);
+    while ((my $i = index($hay, $needle, $pos)) >= 0) { $n++; $pos = $i + length($needle) }
+    return $n;
+}
+
 # ---- fixture dirs ------------------------------------------------------------------
 my $dn = 0;
 sub fresh_dir {
