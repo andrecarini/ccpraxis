@@ -1,0 +1,665 @@
+#!/usr/bin/env perl
+# b13-deterministic-ledger-api oracle. Derived ONLY from
+# .ccpraxis-local-data/blueprints/sandbox-butler-overhaul/specs/b13-deterministic-ledger-api-spec.md
+# §2 (contracts, V1-V5, the five ops), §3 (behaviours B1..B62), §4 (AC-1..AC-63), §6 (edge cases).
+#
+# WRITTEN BLIND TO ANY IMPLEMENTATION. plugins/butler/scripts/bp-ledger.pl does not exist at the
+# time this file was authored. Every AC assertion below must therefore fail on MISSING BEHAVIOUR,
+# never on a bug in this file. Assertions labelled FIXTURE-SANITY: / HARNESS: are deliberate
+# self-checks and are expected to pass with the script absent -- they are the evidence that the red
+# is attributable to the missing implementation and not to broken scaffolding.
+#
+# WHY EVERY exit-2 EXPECTATION ALSO ASSERTS THE STDERR SHAPE: with bp-ledger.pl absent,
+# `perl <missing>` itself exits 2 with a MULTI-line "Can't open perl script" on stderr. An
+# exit-code-only assertion would therefore FALSELY PASS. Each rejection block asserts exit 2 AND
+# exactly one stderr line AND the spec's framing prefix (§2.2), so the missing script cannot fake it.
+#
+# HARNESS RULES (from spec §2.9 and the coordinator's measured terrain; not re-derived):
+#   * done_testing(), NEVER a hand-counted plan.
+#   * %CLEAN_ENV strips every ambient BP_*: this suite is run BY coordinator sessions that export
+#     BP_LEDGER/BP_DIR/BP_PROJECT_ROOT, and an inherited value turns the env-gate tests into false
+#     passes.
+#   * The hook is invoked as `bash "$HOOK"`, never executed directly: a missing exec bit must not
+#     masquerade as a deny.
+#   * NO LIVE LEDGER IS EVER WRITTEN. Corpus files are COPIED into a temp dir and every mutating op
+#     runs on the copy. AC-41 digests every enumerated corpus file before and after the whole run.
+#   * Corpus enumeration is perl `glob` on explicit paths -- NEVER `grep -r`/ripgrep on a directory:
+#     .ccpraxis-local-data/ is gitignored, so a directory-scoped rg searches ZERO files and reports a
+#     FALSE CLEAN. AC-43 proves this test's own method is the non-vacuous one.
+#   * TWO globs, not one: `blueprints/*/packages/*.md` (active) PLUS
+#     `blueprints/_archive/*/packages/*.md` (archived, one level deeper). A single `*` silently omits
+#     every archive file -- the bug that hid two rejects for three corpus counts running.
+#   * NO CORPUS SIZE IS EVER ASSERTED (AC-38). The corpus has grown 32 -> 49 -> 51 -> 115; pinning a
+#     tally guarantees future spurious red. Non-vacuity and shape only.
+#   * Durability assertions run in a temp dir created INSIDE $BP_DIR (v9fs), never /tmp (overlayfs).
+#     A rename/flock assertion on overlayfs proves nothing about the filesystem ledgers live on.
+#   * Output is captured via temp files, never by reopening STDOUT onto an in-memory scalar
+#     (Git-for-Windows perl fails there with "Bad file descriptor"; project CLAUDE.md landmine).
+#
+# NO `use utf8` HERE, DELIBERATELY. The em dash in the append-attempt entry format is written as the
+# raw bytes \xE2\x80\x94, because §2.4 is byte-oriented throughout and nothing is ever decoded.
+#
+# SYN-23: no assertion, fixture or comment in this file cites a line number in bp-orchestrator.pl.
+# Everything about that file is located by grep pattern. AC-58 asserts it against this file itself.
+#
+# OUT-OF-FILE ACs (recorded here rather than asserted weakly):
+#   * AC-54 -- `perl plugins/butler/tests/t/64-ledger-guard.t` exits 0. t/64 is the delegation's
+#     byte-behaviour oracle and is NEVER read, edited or imported by this file (§2.9). Coordinator-
+#     verified by running it.
+#   * AC-55 -- "this file exits 0 with zero not ok" is self-referential. Coordinator-judged.
+#   * AC-56 -- no new red in plugins/butler/tests/t/ attributable to b13; needs a before/after
+#     baseline across the whole suite. Coordinator-verified.
+#   * AC-57 -- `git diff --name-only` equals exactly the four write-set files. Coordinator-verified
+#     (a test asserting it would fail on every unrelated in-flight edit in the working tree).
+
+use strict;
+use warnings;
+use Test::More;
+use FindBin qw($Bin);
+use File::Temp qw(tempdir);
+use File::Copy qw(copy);
+use File::Basename qw(basename);
+use Cwd qw(abs_path);
+use Fcntl qw(:flock);
+use JSON::PP;
+use Digest::MD5 qw(md5_hex);
+
+sub fwd { (my $p = shift) =~ s{\\}{/}g; $p }
+
+my $TESTS   = fwd("$Bin");
+my $BUTLER  = fwd(abs_path("$Bin/../..") // "$Bin/../..");
+my $PROJ    = fwd(abs_path("$Bin/../../../..") // "$Bin/../../../..");
+my $SCRIPT  = "$BUTLER/scripts/bp-ledger.pl";
+my $HOOK    = "$BUTLER/hooks/ledger-guard.sh";
+my $HOOKSJS = "$BUTLER/hooks/hooks.json";
+my $SKILL   = "$BUTLER/skills/coordinator-protocol/SKILL.md";
+my $SELF    = "$TESTS/65-ledger-api.t";
+
+my $BP_ROOT = "$PROJ/.ccpraxis-local-data";
+my $BP_DIR  = "$BP_ROOT/blueprints/sandbox-butler-overhaul";
+
+my $J    = JSON::PP->new->canonical;
+my $ROOT = tempdir(CLEANUP => 1);
+my $pn   = 0;
+
+# A test of a hook/script must control its environment COMPLETELY.
+my %CLEAN_ENV = map { ($_ => $ENV{$_}) } grep { !/^BP_/ } keys %ENV;
+
+diag("subject under test: $SCRIPT "
+     . (-e $SCRIPT
+        ? "(present)"
+        : "(ABSENT -- every AC assertion below is expected to fail on MISSING BEHAVIOUR)"));
+diag("hook under test: $HOOK " . (-e $HOOK ? "(present)" : "(ABSENT)"));
+
+# =====================================================================================
+# Scaffolding
+# =====================================================================================
+
+sub write_file {
+    my ($path, $bytes) = @_;
+    open my $w, '>', $path or die "write $path: $!";
+    binmode $w;
+    print $w $bytes;
+    close $w or die "close $path: $!";
+    return $path;
+}
+
+sub read_file {
+    my ($path) = @_;
+    open my $r, '<', $path or return undef;
+    binmode $r;
+    my $c = do { local $/; <$r> };
+    close $r;
+    return defined $c ? $c : '';
+}
+
+# ---- process runners ---------------------------------------------------------------
+# stdout and stderr are captured SEPARATELY: §2.2 makes "stdout is ALWAYS empty" an interface, and a
+# combined capture cannot assert it.
+sub run_pl {
+    my ($args, %opt) = @_;
+    my $n    = ++$pn;
+    my $inf  = "$ROOT/in.$n";
+    my $outf = "$ROOT/out.$n";
+    my $errf = "$ROOT/err.$n";
+    write_file($inf, defined $opt{stdin} ? $opt{stdin} : '');
+    write_file($outf, '');
+    write_file($errf, '');
+    my %extra = %{ $opt{env} || {} };
+    local %ENV = (%CLEAN_ENV, %extra,
+                  LGT_SCRIPT => fwd($SCRIPT), LGT_IN => fwd($inf),
+                  LGT_OUT    => fwd($outf),   LGT_ERR => fwd($errf));
+    my $rc = system('bash', '-c',
+        'timeout 60 perl "$LGT_SCRIPT" "$@" < "$LGT_IN" > "$LGT_OUT" 2> "$LGT_ERR"',
+        'bp-ledger', @$args);
+    return ($rc >> 8, read_file($outf) // '', read_file($errf) // '');
+}
+
+# payload -> temp file -> `timeout 60 bash "$HOOK" < payload`. Invoked via bash (never executed
+# directly) so a missing exec bit cannot produce a false deny. stderr captured separately.
+sub run_hook {
+    my ($payload, %env) = @_;
+    my $n    = ++$pn;
+    my $pf   = write_file("$ROOT/payload.$n.json", $payload);
+    my $outf = write_file("$ROOT/hout.$n", '');
+    my $errf = write_file("$ROOT/herr.$n", '');
+    local %ENV = (%CLEAN_ENV, %env,
+                  LGT_HOOK => fwd($HOOK), LGT_IN => fwd($pf),
+                  LGT_OUT  => fwd($outf), LGT_ERR => fwd($errf));
+    my $rc = system('bash', '-c',
+        'timeout 60 bash "$LGT_HOOK" < "$LGT_IN" > "$LGT_OUT" 2> "$LGT_ERR"');
+    return ($rc >> 8, read_file($outf) // '', read_file($errf) // '');
+}
+
+sub have_cmd {
+    my ($c) = @_;
+    local %ENV = (%CLEAN_ENV, LGT_C => $c);
+    my $rc = system('bash', '-c', 'command -v "$LGT_C" >/dev/null 2>&1');
+    return ($rc >> 8) == 0 ? 1 : 0;
+}
+
+# ---- byte-level diff primitives (strict, implementation-blind) ----------------------
+# Exactly one contiguous insertion: returns the inserted bytes, or undef if the change is not one
+# contiguous insertion. This IS AC-7's `prefix . suffix eq ORIG`.
+sub contiguous_insertion {
+    my ($orig, $new) = @_;
+    return undef if length($new) <= length($orig);
+    my $p = 0;
+    $p++ while $p < length($orig) && substr($orig, $p, 1) eq substr($new, $p, 1);
+    my $s = 0;
+    while ($s < length($orig) - $p
+           && substr($orig, length($orig) - 1 - $s, 1) eq substr($new, length($new) - 1 - $s, 1)) {
+        $s++;
+    }
+    return undef unless $p + $s == length($orig);
+    return substr($new, $p, length($new) - length($orig));
+}
+
+# Byte offsets at which two EQUAL-LENGTH strings differ.
+sub differing_offsets {
+    my ($a, $b) = @_;
+    return (-1) if length($a) != length($b);
+    my @off;
+    for my $i (0 .. length($a) - 1) {
+        push @off, $i if substr($a, $i, 1) ne substr($b, $i, 1);
+    }
+    return @off;
+}
+
+# Multiset line diff: (\@removed, \@added).
+sub line_diff {
+    my ($a, $b) = @_;
+    my %c;
+    $c{$_}++ for split /\n/, $a, -1;
+    $c{$_}-- for split /\n/, $b, -1;
+    my (@rm, @add);
+    for my $l (sort keys %c) {
+        push @rm,  ($l) x $c{$l}  if $c{$l} > 0;
+        push @add, ($l) x -$c{$l} if $c{$l} < 0;
+    }
+    return (\@rm, \@add);
+}
+
+sub subst_first_line {
+    my ($s, $re, $repl) = @_;
+    my @l = split /\n/, $s, -1;
+    for my $i (0 .. $#l) {
+        if ($l[$i] =~ $re) { $l[$i] = $repl; return join("\n", @l) }
+    }
+    return undef;
+}
+
+sub first_line_matching {
+    my ($s, $re) = @_;
+    for my $l (split /\n/, $s, -1) { return $l if $l =~ $re }
+    return undef;
+}
+
+sub count_re {
+    my ($s, $re) = @_;
+    my $n = 0;
+    $n++ while $s =~ /$re/g;
+    return $n;
+}
+
+sub ticked_count { return count_re($_[0], qr/^[ \t]*-[ \t]*\[[xX]\]/m) }
+
+# Extract a `## <name>` section INCLUDING its heading line, up to (not incl.) the next `##` line.
+# Fence-naive on purpose: only ever used on synthetic fixtures with no fences in the target section.
+sub section_of {
+    my ($s, $head_re) = @_;
+    my @l = split /\n/, $s, -1;
+    my @out;
+    my $in = 0;
+    for my $l (@l) {
+        if (!$in) { if ($l =~ $head_re) { $in = 1; push @out, $l } next }
+        last if $l =~ /^##\s/;
+        push @out, $l;
+    }
+    return $in ? join("\n", @out) : undef;
+}
+
+sub errline_ok {
+    my ($err, $label) = @_;
+    my @l = split /\n/, $err, -1;
+    pop @l if @l && $l[-1] eq '';
+    return (scalar(@l) == 1 && $err =~ /\n\z/) ? 1 : 0;
+}
+
+sub one_stderr_line {
+    my ($err) = @_;
+    my @l = split /\n/, $err, -1;
+    pop @l if @l && $l[-1] eq '';
+    return scalar(@l);
+}
+
+sub glob_tmp {
+    my ($dir, $pat) = @_;
+    my @f = glob("$dir/$pat");
+    return @f;
+}
+
+# ---- fixture dirs ------------------------------------------------------------------
+my $dn = 0;
+sub fresh_dir {
+    my $d = "$ROOT/w" . (++$dn);
+    mkdir $d or die "mkdir $d: $!";
+    return $d;
+}
+
+# Copy bytes into a fresh dir under the temp root and return the copy's path.
+sub stage_bytes {
+    my ($bytes, $name) = @_;
+    $name = 'fixture-pkg.md' unless defined $name;
+    my $d = fresh_dir();
+    return write_file("$d/$name", $bytes);
+}
+
+# Copy a REAL corpus file into a fresh temp dir. The real file is never opened for writing.
+sub stage_corpus {
+    my ($src) = @_;
+    my $d = fresh_dir();
+    my $dst = "$d/" . basename($src);
+    my $bytes = read_file($src);
+    die "stage_corpus: cannot read $src" unless defined $bytes;
+    write_file($dst, $bytes);
+    return $dst;
+}
+
+# =====================================================================================
+# Synthetic fixtures (§2.8)
+# =====================================================================================
+
+my $EMDASH = "\xE2\x80\x94";
+
+# A structurally valid ledger satisfying V1-V5. Every section the ops target is present, plus a
+# `## Dispatch log (auto)` (AC-29) and one-off headings the API must leave alone (§2.3).
+sub clean_ledger {
+    my (%o) = @_;
+    my $status  = defined $o{status}  ? $o{status}  : 'running';
+    my $attempt = exists $o{attempt}  ? $o{attempt} : "- 2026-07-29T10:00:00Z $EMDASH earlier note";
+    my $outputs = exists $o{outputs}  ? $o{outputs} : "- ran something: exit 0";
+    my $nextact = defined $o{next}    ? $o{next}    : "Do the first thing.";
+    my $pipe    = defined $o{pipeline} ? $o{pipeline} : join("\n",
+        '- [ ] 1. first step',
+        '- [ ] 2. second step',
+        '      wrapped continuation for step 2',
+        '- [ ] 3. third step',
+        '- [ ] 11. eleventh step');
+    return join("\n",
+        '---',
+        'package: fixture-pkg',
+        'blueprint: fixture-bp',
+        "status: $status",
+        'write_set:',
+        '  - plugins/butler/scripts/bp-ledger.pl',
+        'mandated_means: none',
+        'last_updated: 2026-07-01T00:00:00Z',
+        '---',
+        '',
+        '# fixture-pkg',
+        '',
+        '## Scope',
+        '',
+        'Prose section no op may touch.',
+        '',
+        '## Next action',
+        '',
+        $nextact,
+        '',
+        '## Pipeline',
+        '',
+        $pipe,
+        '',
+        '## Decisions & attempt log',
+        '',
+        $attempt,
+        '',
+        '## Outputs',
+        '',
+        $outputs,
+        '',
+        '## Escalation (when status: blocked)',
+        '',
+        '_(none)_',
+        '',
+        '## Dispatch log (auto)',
+        '',
+        '- 2026-07-01T00:00:00Z dispatched worker bp-implementer',
+        '',
+    );
+}
+
+# Placeholder-bodied variant: `_(none)_` in the attempt log, `_(none yet)_` in Outputs (AC-12, AC-27).
+sub placeholder_ledger { return clean_ledger(attempt => '_(none)_', outputs => '_(none yet)_') }
+
+# `## Pipeline` carrying a FENCED `- [ ] 2.` lookalike before the real one (AC-20).
+sub fenced_pipeline_ledger {
+    return clean_ledger(pipeline => join("\n",
+        '```text',
+        '- [ ] 2. fenced lookalike that must never flip',
+        '## Fenced heading that must not terminate the section',
+        '```',
+        '- [ ] 1. first step',
+        '- [ ] 2. the REAL second step',
+    ));
+}
+
+# `## Decisions & attempt log` ending inside an UNTERMINATED fence (AC-13, exit 5).
+sub unterminated_fence_ledger {
+    my $l = clean_ledger();
+    $l =~ s/\Q- 2026-07-29T10:00:00Z $EMDASH earlier note\E/"```text\nopened and never closed"/e;
+    return $l;
+}
+
+sub bom_ledger      { return "\xEF\xBB\xBF" . clean_ledger() }
+sub crlf_ledger     { my $l = clean_ledger(); $l =~ s/\n/\r\n/g; return $l }
+sub lone_cr_ledger  { my $l = clean_ledger(); $l =~ s/Do the first thing\./Do the\rfirst thing./; return $l }
+sub nonascii_ledger { my $l = clean_ledger(); $l =~ s/earlier note/earlier note by Andr\xC3\xA9/; return $l }
+
+# Synthetic control-byte fixture: the live corpus has ZERO control bytes (the q01 NUL was cleaned),
+# so this MUST be synthetic or every V1 assertion is vacuous (§2.8, R6).
+sub ctrl_ledger {
+    my ($byte) = @_;
+    my $l = clean_ledger();
+    $l =~ s/Do the first thing\./"Do the first" . $byte . " thing."/e;
+    return $l;
+}
+
+# The line number V1 must report for ctrl_ledger(): 1 + (newlines before the byte).
+sub ctrl_lineno {
+    my ($bytes, $byte) = @_;
+    my $i = index($bytes, $byte);
+    return -1 if $i < 0;
+    my $pre = substr($bytes, 0, $i);
+    return 1 + ($pre =~ tr/\n//);
+}
+
+sub drop_line_matching {
+    my ($s, $re) = @_;
+    my @l = split /\n/, $s, -1;
+    for my $i (0 .. $#l) {
+        if ($l[$i] =~ $re) { splice(@l, $i, 1); return join("\n", @l) }
+    }
+    die "drop_line_matching: nothing matched $re";
+}
+
+# ---- payload builders (hook / --payload seam) --------------------------------------
+sub pl_write {
+    my ($path, $content) = @_;
+    return $J->encode({ tool_name => 'Write', cwd => $PROJ,
+                        tool_input => { file_path => $path, content => $content } });
+}
+sub pl_write_number {   # content is the JSON NUMBER 42 -- the is_str SV-flag case (AC-31)
+    my ($path) = @_;
+    return $J->encode({ tool_name => 'Write', cwd => $PROJ,
+                        tool_input => { file_path => $path, content => 42 } });
+}
+sub pl_edit {
+    my ($path, $old, $new, $all) = @_;
+    return $J->encode({ tool_name => 'Edit', cwd => $PROJ,
+                        tool_input => { file_path => $path, old_string => $old,
+                                        new_string => $new,
+                                        replace_all => ($all ? JSON::PP::true : JSON::PP::false) } });
+}
+
+# =====================================================================================
+# Corpus enumeration -- TWO globs, explicit paths, no counts asserted (§2.7, AC-38)
+# =====================================================================================
+
+my @ACTIVE  = sort glob("$BP_ROOT/blueprints/*/packages/*.md");
+my @ARCHIVE = sort glob("$BP_ROOT/blueprints/_archive/*/packages/*.md");
+my @ALL     = (@ACTIVE, @ARCHIVE);
+
+sub corpus_by_suffix {
+    my ($suffix) = @_;
+    my @m = grep { index($_, $suffix) >= 0 && substr($_, -length($suffix)) eq $suffix } @ALL;
+    return $m[0];
+}
+
+my $FX_S05     = corpus_by_suffix('/packages/s05-responsive-layout.md');
+my $FX_B09     = corpus_by_suffix('/packages/b09-judge-starvation-and-verdict-archive.md');
+my $FX_B28     = corpus_by_suffix('/packages/b28-contract-idle-window.md');
+my $FX_B13     = corpus_by_suffix('/packages/b13-deterministic-ledger-api.md');
+my $FX_LEGACY  = corpus_by_suffix('/_archive/audit-remediation/packages/11-sandbox-rework-finalization.md');
+
+# AC-41 pre-image: digest EVERY enumerated corpus file before anything runs.
+my %CORPUS_DIGEST_BEFORE = map { $_ => md5_hex(read_file($_) // '') } @ALL;
+
+# =====================================================================================
+# TODO groups -- filled in below, one Edit per group
+# =====================================================================================
+
+# =====================================================================================
+# [G0] Harness self-checks + fixture sanity.
+# These are expected to PASS with bp-ledger.pl absent. They are the evidence that the red below is
+# missing behaviour, not broken scaffolding.
+# =====================================================================================
+
+ok(scalar(@ACTIVE)  >= 1, "FIXTURE-SANITY: active glob blueprints/*/packages/*.md is non-empty");
+ok(scalar(@ARCHIVE) >= 1, "FIXTURE-SANITY: archive glob blueprints/_archive/*/packages/*.md is non-empty");
+for my $pair (['s05', $FX_S05], ['b09', $FX_B09], ['b28', $FX_B28],
+              ['b13', $FX_B13], ['legacy 11-sandbox-rework-finalization', $FX_LEGACY]) {
+    ok(defined $pair->[1] && -r $pair->[1],
+       "FIXTURE-SANITY: mandatory corpus fixture located: $pair->[0]");
+}
+{
+    my $s05 = defined $FX_S05 ? read_file($FX_S05) : '';
+    ok(count_re($s05, qr/^## Next action/m) >= 2,
+       "FIXTURE-SANITY: s05 carries more than one '## Next action' heading");
+    my $b09 = defined $FX_B09 ? read_file($FX_B09) : '';
+    ok(count_re($b09, qr/^[ \t]*(?:```|~~~)/m) >= 2,
+       "FIXTURE-SANITY: b09 carries fenced code blocks");
+    my $b13 = defined $FX_B13 ? read_file($FX_B13) : '';
+    ok($b13 =~ /^[ \t]*-[ \t]*\[[ xX]\][ \t]*\d+\..*\n[ \t]+\S/m,
+       "FIXTURE-SANITY: b13's own ledger has a WRAPPED pipeline checkbox (continuation line)");
+}
+{
+    my $c = clean_ledger();
+    ok($c =~ /\A---\s*\n(.*?)\n---/s,      "FIXTURE-SANITY: synthetic clean ledger satisfies V2");
+    ok($c !~ /([\x00-\x08\x0B\x0C\x0E-\x1F\x7F])/, "FIXTURE-SANITY: synthetic clean ledger satisfies V1");
+    for my $h ('^## Next action', '^##\s+Decisions & attempt log\b', '^##\s+Pipeline\b',
+               '^##\s+Outputs\b', '^##\s+Escalation\b') {
+        ok($c =~ /$h/m, "FIXTURE-SANITY: synthetic clean ledger satisfies V5 ($h)");
+    }
+    is(substr($c, -1), "\n", "FIXTURE-SANITY: synthetic clean ledger ends with exactly one newline");
+    ok($c !~ /\n\n\z/,       "FIXTURE-SANITY: ...and not two");
+    my $nul = ctrl_ledger("\x00");
+    ok(index($nul, "\x00") >= 0, "FIXTURE-SANITY: synthetic NUL fixture actually contains 0x00");
+    ok(ctrl_lineno($nul, "\x00") > 1, "FIXTURE-SANITY: NUL fixture's expected V1 line number is computable");
+    ok(unterminated_fence_ledger() =~ /```text\nopened and never closed/,
+       "FIXTURE-SANITY: unterminated-fence fixture built");
+    ok(count_re(fenced_pipeline_ledger(), qr/^- \[ \] 2\./m) == 2,
+       "FIXTURE-SANITY: fenced-pipeline fixture has a fenced AND a real '- [ ] 2.'");
+    ok(placeholder_ledger() =~ /^_\(none\)_$/m && placeholder_ledger() =~ /^_\(none yet\)_$/m,
+       "FIXTURE-SANITY: placeholder fixture carries both italic placeholders");
+}
+{   # HARNESS: contiguous_insertion / differing_offsets are the strictness of half this file.
+    is(contiguous_insertion("ab\ncd\n", "ab\nXX\ncd\n"), "XX\n", "HARNESS: contiguous_insertion finds the insert");
+    is(contiguous_insertion("ab\ncd\n", "ab\ncX\n"), undef,      "HARNESS: contiguous_insertion rejects a non-insertion");
+    is_deeply([differing_offsets("- [ ] 3.", "- [x] 3.")], [3], "HARNESS: differing_offsets pinpoints one byte");
+}
+
+# =====================================================================================
+# [G1] set-status -- AC-1..AC-6, AC-9
+# =====================================================================================
+
+my $ISO_RE = qr/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/;
+
+{   # ---- AC-1 (B1): exit 0, status set, fresh ISO stamp, EXACTLY two changed lines, both in FM.
+    my $p    = stage_bytes(clean_ledger(status => 'running'));
+    my $orig = read_file($p);
+    my ($rc, $out, $err) = run_pl(['set-status', '--ledger', $p, '--status', 'done']);
+    is($rc, 0, "AC-1: set-status --status done exits 0");
+    is($out, '', "AC-1: stdout is empty");
+    is($err, '', "AC-1: stderr is empty on success");
+    my $new = read_file($p);
+    like($new, qr/^status: done$/m, "AC-1: frontmatter status: is now done");
+    my $lu = first_line_matching($new, qr/^last_updated:/);
+    $lu = '' unless defined $lu;
+    my ($luv) = $lu =~ /^last_updated:\s*(.*?)\s*$/;
+    like(defined $luv ? $luv : '', $ISO_RE, "AC-1: last_updated: is a fresh YYYY-MM-DDThh:mm:ssZ");
+    isnt($lu, first_line_matching($orig, qr/^last_updated:/),
+         "AC-1: ...and it actually changed (not the stale value already on disk)");
+    my ($rm, $add) = line_diff($orig, $new);
+    is(scalar(@$rm),  2, "AC-1: exactly two lines removed");
+    is(scalar(@$add), 2, "AC-1: exactly two lines added");
+    my $fm_end = index($new, "\n---", 3);
+    my $ok_fm  = (scalar(@$add) == 2) ? 1 : 0;
+    for my $l (@$add) { $ok_fm = 0 unless $l =~ /^(status|last_updated):/ && index($new, "$l\n") < $fm_end }
+    ok($ok_fm, "AC-1: both changed lines are status:/last_updated: INSIDE the frontmatter block");
+    # Exact: substituting the two original lines back reproduces ORIG byte-for-byte.
+    my $back = subst_first_line($new, qr/^status:/, first_line_matching($orig, qr/^status:/) // '');
+    $back = defined $back
+        ? subst_first_line($back, qr/^last_updated:/, first_line_matching($orig, qr/^last_updated:/) // '')
+        : undef;
+    is(($new eq $orig ? '(FILE WAS NOT MUTATED AT ALL)' : (defined $back ? $back : '(undef)')), $orig,
+       "AC-1: restoring only those two lines reproduces ORIG byte-for-byte (body untouched)");
+}
+
+{   # ---- AC-2 (B1): each of the seven protocol statuses is accepted.
+    for my $s (qw(pending running converging reviewing done blocked parked)) {
+        my $p    = stage_bytes(clean_ledger(status => 'pending'));
+        my $orig = read_file($p);
+        my ($rc, $out, $err) = run_pl(['set-status', '--ledger', $p, '--status', $s]);
+        is($rc, 0, "AC-2: --status $s accepted (exit 0)");
+        my $new = read_file($p);
+        like($new, qr/^status: \Q$s\E$/m, "AC-2: --status $s written to frontmatter");
+        isnt(first_line_matching($new, qr/^last_updated:/),
+             first_line_matching($orig, qr/^last_updated:/),
+             "AC-2: --status $s re-stamped last_updated: in the same operation");
+    }
+}
+
+{   # ---- AC-3 (B3): a value outside the seven -> exit 3, one line naming offered + all seven.
+    for my $bad ('Done', 'finished', '') {
+        my $p    = stage_bytes(clean_ledger());
+        my $orig = read_file($p);
+        my ($rc, $out, $err) = run_pl(['set-status', '--ledger', $p, '--status', $bad]);
+        is($rc, 3, "AC-3: --status '$bad' exits 3 (argument fault, nothing read)");
+        is($out, '', "AC-3: --status '$bad' stdout empty");
+        is(one_stderr_line($err), 1, "AC-3: --status '$bad' emits EXACTLY one stderr line");
+        my $names = 0;
+        $names++ for grep { index($err, $_) >= 0 } qw(pending running converging reviewing done blocked parked);
+        is($names, 7, "AC-3: --status '$bad' stderr names all seven allowed values");
+        ok(length($bad) == 0 || index($err, $bad) >= 0,
+           "AC-3: --status '$bad' stderr names the offered value");
+        is(read_file($p), $orig, "AC-3: --status '$bad' leaves the file byte-identical");
+    }
+}
+
+{   # ---- AC-4 (B2): IDEMPOTENT PARK CASE. Discharges R1: no sixth `stamp` op is needed.
+    my $p    = stage_bytes(clean_ledger(status => 'running'));
+    my $orig = read_file($p);
+    my ($rc, $out, $err) = run_pl(['set-status', '--ledger', $p, '--status', 'running']);
+    is($rc, 0, "AC-4: --status equal to the value on disk is SUCCESS, not an error");
+    is($err, '', "AC-4: stderr empty");
+    my $new = read_file($p);
+    is(first_line_matching($new, qr/^status:/), 'status: running', "AC-4: status: unchanged");
+    isnt(first_line_matching($new, qr/^last_updated:/),
+         first_line_matching($orig, qr/^last_updated:/),
+         "AC-4: last_updated: WAS re-stamped (this is the usage-pause park path)");
+    my ($rm, $add) = line_diff($orig, $new);
+    is(scalar(@$rm), 1, "AC-4: exactly one line removed (the old stamp)");
+    is(scalar(@$add), 1, "AC-4: exactly one line added (the new stamp)");
+    like($add->[0] // '', qr/^last_updated: /, "AC-4: the only changed line is last_updated:");
+}
+
+{   # ---- AC-5 (B5): non-separability by surface. No --no-stamp, no --last-updated, no `stamp` op.
+    my $p = stage_bytes(clean_ledger());
+    my @cases = (
+        [['set-status', '--ledger', $p, '--status', 'done', '--no-stamp'],      '--no-stamp'],
+        [['set-status', '--ledger', $p, '--status', 'done', '--last-updated', '2026-01-01T00:00:00Z'],
+                                                                                '--last-updated'],
+        [['stamp', '--ledger', $p],                                             'stamp subcommand'],
+    );
+    for my $c (@cases) {
+        my $orig = read_file($p);
+        my ($rc, $out, $err) = run_pl($c->[0]);
+        is($rc, 3, "AC-5: $c->[1] is rejected with exit 3");
+        is($out, '', "AC-5: $c->[1] stdout empty");
+        is(one_stderr_line($err), 1, "AC-5: $c->[1] emits exactly one stderr line");
+        is(read_file($p), $orig, "AC-5: $c->[1] leaves the file byte-identical");
+    }
+}
+
+{   # ---- AC-6 (B4): FM lacking last_updated: -> exit 2 with the V3 detail. NO key appended.
+    my $p    = stage_bytes(drop_line_matching(clean_ledger(), qr/^last_updated:/));
+    my $orig = read_file($p);
+    my ($rc, $out, $err) = run_pl(['set-status', '--ledger', $p, '--status', 'done']);
+    is($rc, 2, "AC-6: missing last_updated: -> exit 2 (validation rejection on READ)");
+    is($out, '', "AC-6: stdout empty");
+    is(one_stderr_line($err), 1, "AC-6: exactly one stderr line");
+    like($err, qr/^bp-ledger: set-status: \Q$p\E: /,
+         "AC-6: stderr uses the `bp-ledger: <subcommand>: <path>: <detail>` framing (\xC2\xA72.2)");
+    like($err, qr/last_updated/, "AC-6: the V3 detail names the missing key");
+    is(read_file($p), $orig, "AC-6: file byte-identical -- no key silently appended");
+    unlike(read_file($p), qr/^last_updated:/m, "AC-6: last_updated: was NOT appended");
+}
+
+{   # ---- AC-9 (B6): output stays parseable by gate-stop.sh's awk, which is STRICTER than perl's.
+    my $p    = stage_bytes(clean_ledger());
+    my $orig = read_file($p);
+    my ($rc) = run_pl(['set-status', '--ledger', $p, '--status', 'blocked']);
+    is($rc, 0, "AC-9: set-status exits 0");
+    my $new = read_file($p);
+    my @on  = split /\n/, $orig, -1;
+    my @nn  = split /\n/, $new,  -1;
+    is($nn[0], $on[0], "AC-9: opening --- delimiter line byte-identical to ORIG");
+    my ($oi) = grep { $on[$_] eq '---' && $_ > 0 } 1 .. $#on;
+    my ($ni) = grep { $nn[$_] eq '---' && $_ > 0 } 1 .. $#nn;
+    is($ni, $oi, "AC-9: closing --- delimiter at the same line index");
+    is(defined $ni ? $nn[$ni] : '(none)', '---', "AC-9: closing --- delimiter line byte-identical");
+    like($new, qr/^status: blocked$/m,        "AC-9: status: sits at column 0 (no leading whitespace)");
+    like($new, qr/^last_updated: \S+$/m,      "AC-9: last_updated: sits at column 0");
+    unlike($new, qr/^[ \t]+(status|last_updated):/m, "AC-9: neither key gained leading whitespace");
+}
+
+# [G2]  AC-7, AC-8, AC-10..AC-13   append-attempt
+# [G2]  AC-7, AC-8, AC-10..AC-13   append-attempt
+# [G3]  AC-14..AC-21          tick-step
+# [G4]  AC-22..AC-27          set-next-action / add-output
+# [G5]  AC-28..AC-30          round-trip, no-touch, framing parity
+# [G6]  AC-31..AC-37, AC-42   validate / delegation / parity
+# [G7]  AC-38..AC-41, AC-43   corpus + vacuity traps
+# [G8]  AC-44..AC-49          durability & concurrency
+# [G9]  AC-50..AC-53          SKILL.md prose
+# [G10] AC-58                 SYN-23 line-number prohibition
+# [G11] AC-59..AC-63          reject on write
+
+# =====================================================================================
+# AC-41 (post-image) -- must be the LAST thing to run
+# =====================================================================================
+
+sub assert_corpus_untouched {
+    my $bad = 0;
+    for my $f (@ALL) {
+        my $now = md5_hex(read_file($f) // '');
+        $bad++ if $now ne ($CORPUS_DIGEST_BEFORE{$f} // '');
+    }
+    is($bad, 0, "AC-41: no live corpus file was written -- digest unchanged for every enumerated file");
+}
+
+assert_corpus_untouched();
+
+done_testing();
