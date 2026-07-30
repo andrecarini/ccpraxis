@@ -1882,9 +1882,11 @@ sub run {
                         _log($log, 'harvest_reopen', { package => $pkg, verdict => $hv, corrective_attempts => $corr });
                         _apply_harvest_findings($bpdir, $pkg, $v);
                         _set_ledger_status($bpdir, $pkg, 'pending');
-                        update_registry_pkg($runs, $pkg, { attempt => 0, status => 'pending', harvest => '', corrective_attempts => $corr + 1 });
+                        update_registry_pkg($runs, $pkg, { attempt => 0, status => 'pending', harvest => '', corrective_attempts => $corr + 1,
+                            harvest_defer_blockers => '' });   # a corrective cycle must not carry a stale blocker list forward
                         $status->{$pkg} = 'pending'; $att->{$pkg} = 0; $pid->{$pkg} = undef;
                         $reg->{$pkg}{harvest} = '';   # mirror the disk clear in-memory (M2)
+                        $reg->{$pkg}{harvest_defer_blockers} = '';
                         for my $dep (sort keys %$meta) {
                             next unless grep { $_ eq $pkg } @{ $meta->{$dep}{deps} || [] };
                             next unless ($reg->{$dep}{harvest} // '') eq 'pass';
@@ -1920,8 +1922,18 @@ sub run {
                     my @blockers = grep { length } split /,/, ($reg->{$pkg}{harvest_defer_blockers} // '');
                     if (@blockers) {
                         my $still_live = grep {
-                            my $bst = defined $status->{$_} && !ref $status->{$_} ? lc($status->{$_}) : '';
-                            !($bst eq 'done' || $bst eq 'dropped' || $bst eq 'blocked' || $bst eq 'parked');
+                            unless (exists $meta->{$_} || exists $status->{$_}) {
+                                # A blocker absent from the package set (renamed, ledger
+                                # deleted, orchestrator restarted against a reduced
+                                # packages/) can never resolve to done/dropped/blocked/
+                                # parked — treat as NOT live so the hold releases. This
+                                # only re-fires the harvest audit; it cannot admit a pass.
+                                _log($log, 'harvest_defer_unknown_blocker', { package => $pkg, blocker => $_ });
+                                0;
+                            } else {
+                                my $bst = defined $status->{$_} && !ref $status->{$_} ? lc($status->{$_}) : '';
+                                !($bst eq 'done' || $bst eq 'dropped' || $bst eq 'blocked' || $bst eq 'parked');
+                            }
                         } @blockers;
                         next if $still_live;
                     }
