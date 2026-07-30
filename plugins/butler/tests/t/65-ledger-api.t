@@ -455,12 +455,50 @@ sub pl_write_number {   # content is the JSON NUMBER 42 -- the is_str SV-flag ca
     return $J->encode({ tool_name => 'Write', cwd => $PROJ,
                         tool_input => { file_path => $path, content => 42 } });
 }
+# ---- AC-64: the Edit-payload uniqueness interlock -----------------------------------
+# MEASURED TRAP, not a hypothetical. ledger-guard's fail-closed allow trio (§2.5, AC-36) allows an
+# Edit whose `old_string` occurs 0 times, or >1 times with replace_all=false, because the real Edit
+# tool would itself error. A deny-path payload built on a NON-UNIQUE old_string therefore returns
+# rc=0 and the deny assertion PASSES WHILE TESTING THE OPPOSITE OF WHAT IT CLAIMS.
+#
+# So this helper is the interlock, not the call sites: it reads the target's on-disk bytes, ASSERTS
+# the occurrence count, and REFUSES (dies) to build a replace_all=false payload whose old_string is
+# not unique. The fail-closed-trio cases opt in explicitly with expect_occ => 0 | 2.
+my $edit_n = 0;
 sub pl_edit {
-    my ($path, $old, $new, $all) = @_;
+    my ($path, $old, $new, %o) = @_;
+    my $all  = $o{replace_all} ? 1 : 0;
+    my $want = exists $o{expect_occ} ? $o{expect_occ} : 1;
+    my $bytes = read_file($path);
+    my $occ   = defined $bytes ? count_occ($bytes, $old) : -1;   # -1 == target absent
+    my $n     = ++$edit_n;
+    is($occ, $want,
+       "AC-64: Edit payload #$n -- old_string occurs exactly $want time(s) in the target's on-disk "
+       . "bytes (the uniqueness precondition without which the deny path is vacuous)")
+        unless $o{selftest};
+    if (!$all && $want == 1 && $occ != 1) {
+        die "AC-64 VIOLATION: refusing to build an Edit payload whose old_string occurs "
+          . "$occ time(s) in $path with replace_all=false. Such a payload takes ledger-guard's "
+          . "documented 'would-error-anyway => allow' path (rc=0), so any denial asserted from it "
+          . "would be VACUOUS.\n";
+    }
     return $J->encode({ tool_name => 'Edit', cwd => $PROJ,
                         tool_input => { file_path => $path, old_string => $old,
                                         new_string => $new,
                                         replace_all => ($all ? JSON::PP::true : JSON::PP::false) } });
+}
+
+# HARNESS: prove the AC-64 interlock actually fires. Without this, the interlock could itself be
+# vacuous -- the same class of bug it exists to prevent.
+{
+    my $dup = stage_bytes("---\nstatus: running\n---\ndup\ndup\n", 'dup-fixture.md');
+    my $e = do { local $@; eval { pl_edit($dup, "dup\n", "other\n", selftest => 1) }; $@ };
+    like($e, qr/AC-64 VIOLATION/,
+         "HARNESS/AC-64: the Edit-payload builder REFUSES a non-unique old_string with replace_all=false");
+    my $ok = do { local $@; eval { pl_edit($dup, "status: running", "status: bogus", selftest => 1) }; $@ };
+    is($ok, '', "HARNESS/AC-64: ...and accepts a unique old_string");
+    my $trio = do { local $@; eval { pl_edit($dup, "dup\n", "other\n", selftest => 1, expect_occ => 2) }; $@ };
+    is($trio, '', "HARNESS/AC-64: ...and permits the fail-closed-trio cases via an explicit expect_occ");
 }
 
 # =====================================================================================
