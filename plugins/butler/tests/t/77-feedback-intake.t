@@ -1049,6 +1049,38 @@ subtest 'T-K drift (criterion 13; AC-47..51)' => sub {
         my @sites = ($doc =~ /\*\*\s*Basis\s*:?\s*\*{0,2}\s*REPORTED \(self-caveated\)/g);
         cmp_ok(scalar(@sites), '>=', 2, 'AC-50/D-e: REPORTED (self-caveated) applied at >= 2 sites (never == 2, never == 3)');
 
+        # AC-CIT-1 -- G3 citation integrity (coordinator fix, post-gate):
+        # SKILL.md's L28 literal ("DECOMPOSED.md:16" today) is a citation to a
+        # SPECIFIC LINE. A test that only checks the literal string is present
+        # cannot tell if that line has drifted to mean something else --
+        # exactly LIVE-07's own point ("Line-number citations go stale within
+        # hours in a concurrently-edited tree"). So: parse the cited line
+        # number OUT OF SKILL.md itself (never hardcode 16 here), then verify
+        # THAT line, in the real DECOMPOSED.md, is actually the class
+        # DEFINITION -- structurally distinguished from an application by its
+        # leading "- **Basis: ...**" list-bullet form (the two application
+        # sites read inline, with no leading "- "). This check follows the
+        # citation rather than a fixed number, so it stays meaningful even
+        # after the artifact moves again.
+        SKIP: {
+            skip 'SKILL.md does not exist yet (implementation absent) -- nothing to parse a citation out of', 1
+                unless -f $SKILL;
+            my $skill_text = _slurp_text($SKILL);
+            my ($cited_line) = $skill_text =~ /DECOMPOSED\.md:(\d+)/;
+            SKIP: {
+                skip 'SKILL.md does not cite a DECOMPOSED.md:<N> line number', 1 unless defined $cited_line;
+                my $cited_text = $doclines[$cited_line - 1];
+                my $is_definition = defined($cited_text)
+                    && $cited_text =~ /^\s*-\s*\*\*\s*Basis\s*:\s*REPORTED \(self-caveated\)\s*\*\*/;
+                ok($is_definition,
+                    "AC-CIT-1/G3: SKILL.md cites DECOMPOSED.md:$cited_line for the REPORTED (self-caveated) "
+                  . "class definition, and that line IS the definition today")
+                    or diag("DECOMPOSED.md:$cited_line reads: " . (defined $cited_text ? $cited_text : '<line does not exist>')
+                          . "\nThe artifact drifted: SKILL.md's citation no longer points at the class definition "
+                          . "and needs updating (this is not a test bug -- update the citation, not this check).");
+            }
+        }
+
         # Negative assertions (AC-51): what this test group must NOT find, per
         # G4's "MUST NOT assert" list -- the skill's superset (traceability,
         # explicit not-checked coverage) is absent from THIS artifact today.
