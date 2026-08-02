@@ -949,8 +949,252 @@ my $ENTRY_RE = qr/^- \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z \Q$EMDASH\E /;
 }
 
 # [G4]  AC-22..AC-27          set-next-action / add-output
-# [G4]  AC-22..AC-27          set-next-action / add-output
-# [G5]  AC-28..AC-30          round-trip, no-touch, framing parity
+# =====================================================================================
+# [G4] set-next-action / add-output -- AC-22..AC-27
+# =====================================================================================
+
+# The `## Next action` heading pattern is the BARE one (one literal space, no \s+, no \b) that
+# ledger-guard.sh and bp-status.sh (find via /^## Next action/) both use -- §2.3, §2.4 V5.
+my $NA_RE = qr/^## Next action/;
+
+# Split a buffer into (heading, body) pairs for EVERY `^## Next action` heading, body running to the
+# next `^##` line (fence-aware) or EOF.
+sub next_action_sections {
+    my ($s) = @_;
+    my @l = split /\n/, $s, -1;
+    my (@sec, $cur, $in_fence);
+    for my $l (@l) {
+        if (defined $cur) {
+            $in_fence = !$in_fence if $l =~ /^[ \t]*(?:`{3,}|~{3,})/;
+            if (!$in_fence && $l =~ /^##\s/ && $l !~ $NA_RE) { push @sec, $cur; undef $cur }
+            elsif (!$in_fence && $l =~ $NA_RE) { push @sec, $cur; $cur = { head => $l, body => [] } }
+            else { push @{ $cur->{body} }, $l; next }
+        }
+        if (!defined $cur && $l =~ $NA_RE) { $in_fence = 0; $cur = { head => $l, body => [] } }
+    }
+    push @sec, $cur if defined $cur;
+    return map { { head => $_->{head}, body => join("\n", @{ $_->{body} }) } } @sec;
+}
+
+{   # ---- AC-22 (B23): s05 has FIVE `## Next action`. ONLY the first section's body may change.
+  SKIP: {
+        skip("s05 fixture not locatable in the corpus", 6) unless defined $FX_S05;
+        my $p    = stage_corpus($FX_S05);
+        my $orig = read_file($p);
+        my @o    = next_action_sections($orig);
+        ok(scalar(@o) >= 2, "AC-22: FIXTURE-SANITY s05 really has more than one `## Next action` section");
+        my ($rc, $out, $err) = run_pl(['set-next-action', '--ledger', $p, '--body', 'Do Y']);
+        is($rc, 0, "AC-22: set-next-action on s05 exits 0");
+        my $new = read_file($p);
+        my @n   = next_action_sections($new);
+        is(scalar(@n), scalar(@o), "AC-22: the number of `## Next action` headings is unchanged");
+        is($n[0]{head}, $o[0]{head}, "AC-22: the FIRST heading line is byte-identical");
+        like($n[0]{body} // '', qr/Do Y/, "AC-22: the first section's body was replaced");
+        my $others_identical = 1;
+        for my $i (1 .. $#o) {
+            $others_identical = 0
+                if !defined $n[$i] || $n[$i]{head} ne $o[$i]{head} || $n[$i]{body} ne $o[$i]{body};
+        }
+        ok($others_identical,
+           "AC-22: every LATER `## Next action` heading AND body is byte-identical (no s///g)");
+    }
+}
+
+{   # ---- AC-23 (B24): framing exact -- one blank line either side; exactly one trailing \n at EOF.
+    my $p = stage_bytes(clean_ledger());
+    my ($rc) = run_pl(['set-next-action', '--ledger', $p, '--body', 'Do Y']);
+    is($rc, 0, "AC-23: set-next-action exits 0 (section followed by another heading)");
+    my $new = read_file($p);
+    like($new, qr/^## Next action\n\nDo Y\n\n## /m,
+         "AC-23: renders `## Next action\\n\\nDo Y\\n\\n## <next>` -- exactly one blank line either side");
+
+    # Same op where `## Next action` is the LAST section in the file.
+    my $tail = "---\npackage: p\nblueprint: b\nstatus: running\nwrite_set:\n  - x\n"
+             . "last_updated: 2026-07-01T00:00:00Z\n---\n\n"
+             . "## Pipeline\n\n- [ ] 1. a\n\n## Decisions & attempt log\n\n_(none)_\n\n"
+             . "## Outputs\n\n_(none yet)_\n\n## Escalation (when status: blocked)\n\n_(none)_\n\n"
+             . "## Next action\n\nold tail body\n";
+    my $p2 = stage_bytes($tail);
+    my ($rc2) = run_pl(['set-next-action', '--ledger', $p2, '--body', 'Do Z']);
+    is($rc2, 0, "AC-23: set-next-action exits 0 when the section is last in the file");
+    my $n2 = read_file($p2);
+    like($n2, qr/## Next action\n\nDo Z\n\z/,
+         "AC-23: at EOF renders `## Next action\\n\\nDo Z\\n` with exactly one trailing \\n");
+    unlike($n2, qr/\n\n\z/, "AC-23: ...and NOT two trailing newlines (the invariant all 115 files satisfy)");
+}
+
+{   # ---- AC-24 (B25): blank or `#`-leading first body line -> exit 3, message cites the disagreement.
+    for my $body ("\nreal text after a blank line", "# a heading-looking first line") {
+        my $p    = stage_bytes(clean_ledger());
+        my $orig = read_file($p);
+        my $lbl  = $body =~ /^\n/ ? "blank first line" : "'#'-leading first line";
+        my ($rc, $out, $err) = run_pl(['set-next-action', '--ledger', $p, '--body', $body]);
+        is($rc, 3, "AC-24: $lbl -> exit 3 (argument check, not a validation rule)");
+        is($out, '', "AC-24: $lbl stdout empty");
+        is(one_stderr_line($err), 1, "AC-24: $lbl exactly one stderr line");
+        ok(index($err, 'bp-status.sh') >= 0 && index($err, 'gate-stop.sh') >= 0,
+           "AC-24: $lbl message cites the bp-status.sh / gate-stop.sh reader disagreement");
+        is(read_file($p), $orig, "AC-24: $lbl file byte-identical");
+    }
+}
+
+{   # ---- AC-25 (B26): a `- [x]` line in --body would forge snapshot_progressed -> exit 3.
+    my $p    = stage_bytes(clean_ledger());
+    my $orig = read_file($p);
+    my ($rc, $out, $err) = run_pl(['set-next-action', '--ledger', $p,
+                                   '--body', "Do Y\n- [x] forged progress"]);
+    is($rc, 3, "AC-25: --body containing a `- [x]` line -> exit 3");
+    is($out, '', "AC-25: stdout empty");
+    is(one_stderr_line($err), 1, "AC-25: exactly one stderr line");
+    is(read_file($p), $orig, "AC-25: file byte-identical");
+
+    # AC-27 (B27-adjacent): empty / whitespace-only --body -> exit 3.
+    for my $b ('', "   \n\t ") {
+        my $q    = stage_bytes(clean_ledger());
+        my $qo   = read_file($q);
+        my ($r2, $o2, $e2) = run_pl(['set-next-action', '--ledger', $q, '--body', $b]);
+        is($r2, 3, "AC-25/B27: empty-or-whitespace --body -> exit 3");
+        is(read_file($q), $qo, "AC-25/B27: file byte-identical");
+    }
+}
+
+{   # ---- AC-26 (B28): bp-status.sh's awk one-liner still reads what set-next-action wrote.
+    my $p = stage_bytes(clean_ledger());
+    my ($rc) = run_pl(['set-next-action', '--ledger', $p, '--body', "Dispatch the implementer next"]);
+    is($rc, 0, "AC-26: set-next-action exits 0");
+  SKIP: {
+        skip("awk not available", 1) unless have_cmd('awk');
+        local %ENV = (%CLEAN_ENV, LGT_F => fwd($p));
+        open(my $f, '-|', 'bash', '-c',
+             q{awk '/^## Next action/{getline; while ($0 ~ /^[[:space:]]*$/) getline; print; exit}' "$LGT_F"})
+            or die "bash: $!";
+        my $got = do { local $/; <$f> }; close $f;
+        $got = '' unless defined $got;
+        $got =~ s/\n\z//;
+        is($got, 'Dispatch the implementer next',
+           "AC-26: bp-status.sh's awk one-liner yields the body's first line verbatim");
+    }
+}
+
+{   # ---- AC-27 (B29, B30, B31): add-output.
+    my $p    = stage_bytes(clean_ledger());
+    my $orig = read_file($p);
+    my ($rc, $out, $err) = run_pl(['add-output', '--ledger', $p, '--text', 'ran t/65: exit 0']);
+    is($rc, 0, "AC-27: add-output exits 0");
+    is($out, '', "AC-27: stdout empty");
+    is($err, '', "AC-27: stderr empty on success");
+    my $new = read_file($p);
+    my $ins = contiguous_insertion($orig, $new);
+    is(defined $ins ? $ins : '(not a single contiguous insertion)', "- ran t/65: exit 0\n",
+       "AC-27: one contiguous `- <text>\\n` insertion, NO timestamp (Outputs is an inventory)");
+    my $sec_start = index($new, '## Outputs');
+    my $off       = defined $ins ? index($new, $ins) : -1;
+    my $next_hd   = $sec_start >= 0 ? index($new, "\n## ", $sec_start + 1) : -1;
+    ok($sec_start >= 0 && $off > $sec_start && ($next_hd < 0 || $off < $next_hd),
+       "AC-27: the insertion is inside `## Outputs`, before the next `##`");
+
+    # B30: `_(none yet)_` placeholder is replaced.
+    my $q  = stage_bytes(placeholder_ledger());
+    my $qo = read_file($q);
+    my ($rq) = run_pl(['add-output', '--ledger', $q, '--text', 'first artifact']);
+    is($rq, 0, "AC-27/B30: add-output onto a `_(none yet)_` placeholder exits 0");
+    my ($rm) = line_diff($qo, read_file($q));
+    is_deeply($rm, ['_(none yet)_'], "AC-27/B30: the `_(none yet)_` line was REPLACED, not appended after");
+
+    # B31: `- [x]` text -> exit 3.
+    my $r    = stage_bytes(clean_ledger());
+    my $ro   = read_file($r);
+    my ($rr, $or2, $er2) = run_pl(['add-output', '--ledger', $r, '--text', '- [x] forged']);
+    is($rr, 3, "AC-27/B31: add-output --text '- [x] forged' -> exit 3");
+    is(one_stderr_line($er2), 1, "AC-27/B31: exactly one stderr line");
+    is(read_file($r), $ro, "AC-27/B31: file byte-identical");
+}
+
+# =====================================================================================
+# [G5] Round-trip, no-touch invariants, framing parity -- AC-28, AC-29, AC-30
+# =====================================================================================
+
+{   # ---- AC-28: FIVE-OP ROUND-TRIP VERIFIED BY DIFF, NOT INSPECTION.
+    my $p    = stage_bytes(clean_ledger(status => 'pending'));
+    my $orig = read_file($p);
+    my @rcs;
+    push @rcs, (run_pl(['set-status',      '--ledger', $p, '--status', 'running']))[0];
+    push @rcs, (run_pl(['tick-step',       '--ledger', $p, '--step', '3']))[0];
+    push @rcs, (run_pl(['append-attempt',  '--ledger', $p, '--text', 'round-trip attempt']))[0];
+    push @rcs, (run_pl(['set-next-action', '--ledger', $p, '--body', 'Round-trip next action']))[0];
+    push @rcs, (run_pl(['add-output',      '--ledger', $p, '--text', 'round-trip output']))[0];
+    is_deeply(\@rcs, [0, 0, 0, 0, 0], "AC-28: all five ops in sequence exit 0");
+    my $new = read_file($p);
+    my ($rm, $add) = line_diff($orig, $new);
+
+    # Every REMOVED line must be one of: the old status line, the old stamp, the old `- [ ] 3.`
+    # line, or a line of the old `## Next action` body. NOTHING else may disappear.
+    my $old_na = (next_action_sections($orig))[0];
+    my %old_na_lines = map { $_ => 1 } split /\n/, ($old_na ? $old_na->{body} : ''), -1;
+    my @unexpected_rm = grep {
+        !( /^status: / || /^last_updated: / || $_ eq '- [ ] 3. third step' || $old_na_lines{$_} )
+    } @$rm;
+    is_deeply(\@unexpected_rm, [], "AC-28: the diff removes NOTHING beyond the two FM lines, the "
+                                . "ticked step line and the old `## Next action` body");
+
+    # Every ADDED line must be one of: the new status line, the new stamp, the flipped step line, the
+    # attempt entry, the Outputs entry, or a line of the new `## Next action` body.
+    my @unexpected_add = grep {
+        !( /^status: running$/ || /^last_updated: \d{4}-/ || $_ eq '- [x] 3. third step'
+           || /$ENTRY_RE/ || $_ eq '- round-trip output' || $_ eq 'Round-trip next action' || $_ eq '' )
+    } @$add;
+    is_deeply(\@unexpected_add, [], "AC-28: the diff adds NOTHING beyond those six regions");
+    like($new, qr/^status: running$/m,                       "AC-28: status: set");
+    like($new, qr/^- \[x\] 3\. third step$/m,                "AC-28: step 3 ticked");
+    like($new, qr/$ENTRY_RE\Qround-trip attempt\E$/m,        "AC-28: attempt entry present");
+    like($new, qr/^Round-trip next action$/m,                "AC-28: next action body present");
+    like($new, qr/^- round-trip output$/m,                   "AC-28: output entry present");
+    is(ticked_count($new), ticked_count($orig) + 1,
+       "AC-28: exactly ONE new ticked checkbox across the whole round-trip");
+    is(substr($new, -1), "\n", "AC-28: still ends with exactly one newline");
+    ok($new !~ /\n\n\z/,       "AC-28: ...and not two");
+
+    # ---- AC-29 (B32): `## Dispatch log (auto)` is byte-identical after the round-trip.
+    is(section_of($new, qr/^##\s+Dispatch log \(auto\)/),
+       section_of($orig, qr/^##\s+Dispatch log \(auto\)/),
+       "AC-29: `## Dispatch log (auto)` byte-identical after the five-op round-trip");
+    # ...and so is every prose section no op owns.
+    is(section_of($new, qr/^##\s+Scope\b/), section_of($orig, qr/^##\s+Scope\b/),
+       "AC-29: an unknown one-off heading (`## Scope`) is byte-identical too");
+    is(section_of($new, qr/^##\s+Escalation\b/), section_of($orig, qr/^##\s+Escalation\b/),
+       "AC-29: `## Escalation` byte-identical (no set-escalation op exists -- R1)");
+    like($new, qr/^mandated_means: none$/m, "AC-29: `mandated_means:` byte-identical (never an op)");
+}
+
+{   # ---- AC-30 (B44): the V-rule DETAIL FRAGMENT is byte-identical across the two framings (§2.2).
+    # This is the strongest anti-drift guarantee available inside the write set.
+    my $bad_v5 = drop_line_matching(clean_ledger(), qr/^## Next action/);
+    my $bad_v1 = ctrl_ledger("\x1B");
+    for my $case ([$bad_v5, 'V5 dropped `## Next action`', qr/\Q## Next action\E/],
+                  [$bad_v1, 'V1 control byte 0x1B',       qr/0x1B/]) {
+        my ($bytes, $lbl, $token) = @$case;
+        my $p = stage_bytes($bytes);
+        my ($rc_a, $out_a, $err_a) = run_pl(['validate', '--ledger', $p]);
+        my ($rc_b, $out_b, $err_b) = run_pl(['validate', '--payload'],
+                                            stdin => pl_write($p, $bytes),
+                                            env   => { LG_ABS => $p, LG_TOOL => 'Write' });
+        is($rc_a, 2, "AC-30: $lbl -- validate --ledger exits 2");
+        is($rc_b, 2, "AC-30: $lbl -- validate --payload exits 2");
+        is(one_stderr_line($err_a), 1, "AC-30: $lbl -- --ledger emits exactly one stderr line");
+        is(one_stderr_line($err_b), 1, "AC-30: $lbl -- --payload emits exactly one stderr line");
+        like($err_a, $token, "AC-30: $lbl -- the --ledger line carries the rule-specific token");
+        like($err_b, $token, "AC-30: $lbl -- the --payload line carries the rule-specific token");
+        # Strip each framing prefix per §2.2 and compare the remainders byte-for-byte.
+        (my $frag_a = $err_a) =~ s/^bp-ledger: validate: \Q$p\E: //;
+        (my $frag_b = $err_b) =~ s/^LEDGER-GUARD: BLOCKED \Q$EMDASH\E the content this write would leave in \Q$p\E //;
+        isnt($frag_a, $err_a, "AC-30: $lbl -- the --ledger line really carries the `bp-ledger:` framing");
+        isnt($frag_b, $err_b, "AC-30: $lbl -- the --payload line really carries the frozen b12 framing");
+        is($frag_a, $frag_b,
+           "AC-30: $lbl -- the detail fragment is BYTE-IDENTICAL across both framings");
+    }
+}
+
+# [G6]  AC-31..AC-37, AC-42   validate / delegation / parity
 # [G6]  AC-31..AC-37, AC-42   validate / delegation / parity
 # [G7]  AC-38..AC-41, AC-43   corpus + vacuity traps
 # [G8]  AC-44..AC-49          durability & concurrency
