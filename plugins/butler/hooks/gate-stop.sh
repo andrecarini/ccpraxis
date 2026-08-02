@@ -51,7 +51,9 @@ bp_stamp_last_updated() {
         infm == 1 && hit == 0 && /^last_updated:/ { print "last_updated: " ts; hit = 1; next }
                                       { print }
         END { if (!hit) exit 3 }
-      ' "$BP_LEDGER" > "$tmp" 2>/dev/null && mv "$tmp" "$BP_LEDGER" 2>/dev/null; then
+      ' "$BP_LEDGER" > "$tmp" 2>/dev/null \
+     && [ "$(wc -l < "$tmp")" = "$(wc -l < "$BP_LEDGER")" ] \
+     && mv "$tmp" "$BP_LEDGER" 2>/dev/null; then
     return 0
   fi
   rm -f "$tmp" 2>/dev/null

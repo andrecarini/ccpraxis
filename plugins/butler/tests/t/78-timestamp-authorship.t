@@ -229,6 +229,55 @@ my @STAMPED_VALUES;
 }
 
 # =========================================================================
+# Red-team finding L2 (redteam-1.md), not a numbered spec AC — standing
+# invariant: scripts/bp-lib.sh must contain zero top-level statements (every
+# non-comment, non-blank line lives inside a function body). gate-stop.sh
+# sources bp-lib.sh live, unguarded past a mere "is it readable" check
+# (AC-01), inside a hook that must never abort (spec §2.1/§2.4). That is
+# only safe because bp-lib.sh has no top-level side effects (no bare
+# commands, no top-level `exit`/`set`). Spec §2.1 asserts this as something
+# "verified by reading" at write time; this test turns it into an enforced
+# invariant so a future maintainer adding e.g. a top-level
+# `require_cmd jq flock || exit 1` to bp-lib.sh is caught here rather than
+# silently wedging every coordinator's Stop hook.
+#
+# Method: track bash brace depth line-by-line. A line is a "top-level
+# statement" violation only if it is reached at depth 0 and is neither
+# blank/comment nor itself a function-definition opener ("name() {",
+# optionally prefixed with "function"). This deliberately does not attempt
+# a full bash/awk parse: it relies on the fact that every embedded awk `{
+# ... }` block in this file's actual style is itself brace-balanced within
+# the enclosing shell function, so depth correctly returns to 0 at each
+# function's closing brace, and on `${VAR:-default}`-style parameter
+# expansions being opened and closed on the same line (true throughout this
+# file today).
+# =========================================================================
+{
+    my $BPLIB = "$Bin/../../scripts/bp-lib.sh";
+    ok(-f $BPLIB, "L2: scripts/bp-lib.sh exists at $BPLIB") or BAIL_OUT("missing $BPLIB");
+    my @bplib_lines = split /\n/, slurp($BPLIB);
+    my $depth = 0;
+    my @violations;
+    for my $i (0 .. $#bplib_lines) {
+        my $line = $bplib_lines[$i];
+        (my $stripped = $line) =~ s/^\s+//;
+        next if $stripped eq '';
+        next if $stripped =~ /^#/;
+        if ($depth == 0) {
+            unless ($stripped =~ /^(?:function\s+)?[A-Za-z_][A-Za-z0-9_]*\s*\(\)\s*\{/) {
+                push @violations, $i + 1;
+            }
+        }
+        my $opens  = () = $line =~ /\{/g;
+        my $closes = () = $line =~ /\}/g;
+        $depth += $opens - $closes;
+    }
+    is(scalar(@violations), 0,
+        'L2: scripts/bp-lib.sh has zero top-level statements (violating line(s): '
+        . (@violations ? join(', ', @violations) : 'none') . ')');
+}
+
+# =========================================================================
 # AC-04 / AC-06 / AC-07 — B1: terminal + fresh + Next action => exit 0, stamped
 # =========================================================================
 my $val_b1;
