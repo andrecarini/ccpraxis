@@ -154,17 +154,32 @@ if ($help) {
     exit 0;
 }
 
-# --source token shape (F4).
-if ($opt_source !~ m{^[A-Za-z0-9._:/-]{1,64}$}) {
+# --source token shape (F4). Anchored with \z, not $: Perl's $ matches before
+# a trailing newline, so a token like "file\n" would otherwise pass this
+# check and land the header/body separator one line early (R7).
+if ($opt_source !~ m{^[A-Za-z0-9._:/-]{1,64}\z}) {
     _fail(1, "[invalid source token]: $opt_source");
 }
 
 # --batch name shape (F3): plain component, no path separators, no '.' / '..'.
+# \z, not $ — see the --source comment above (R7/R12: a trailing newline in
+# the batch name broke both F3 rejection and the "one clean line" contract).
 if (defined $batch_override) {
     if ($batch_override eq '.' || $batch_override eq '..'
-        || $batch_override !~ /^[A-Za-z0-9._-]+$/) {
+        || $batch_override !~ /^[A-Za-z0-9._-]+\z/) {
         _fail(1, "[invalid batch name]: $batch_override");
     }
+}
+
+# Shape shared by every value that can land in a header field (R6):
+# --blueprint, $ENV{BP_BLUEPRINT}, and a blueprint *directory* name found on
+# disk. A single-line, printable, filesystem-safe token — deliberately the
+# same charset as --batch. \z (not $) closes the same trailing-newline hole
+# as R7/R12 would otherwise reopen here.
+my $BP_NAME_RE = qr/^[A-Za-z0-9._-]{1,128}\z/;
+
+if (defined $blueprint_override && $blueprint_override !~ $BP_NAME_RE) {
+    _fail(1, "[invalid blueprint name]: $blueprint_override");
 }
 
 # ---------------------------------------------------------------------------
@@ -229,7 +244,15 @@ sub _resolve_data_dir {
     }
 
     if (defined $ENV{CCPRAXIS_DATA_DIR} && length $ENV{CCPRAXIS_DATA_DIR}) {
-        return $ENV{CCPRAXIS_DATA_DIR};
+        # R5: apply the same -d gate --data-dir gets. A stale/typo'd env
+        # var (the relocated-project scenario CLAUDE.md warns about)
+        # otherwise materialises a phantom corrections/ tree elsewhere,
+        # silently, at exit 0.
+        my $env_dir = $ENV{CCPRAXIS_DATA_DIR};
+        unless (-d $env_dir) {
+            _fail(4, "[CCPRAXIS_DATA_DIR is not a directory]: $env_dir");
+        }
+        return $env_dir;
     }
 
     my $top = `git rev-parse --show-toplevel 2>/dev/null`;
@@ -389,7 +412,13 @@ sub _resolve_blueprint {
     return ($override, undef) if defined $override;
 
     if (defined $ENV{BP_BLUEPRINT} && length $ENV{BP_BLUEPRINT}) {
-        return ($ENV{BP_BLUEPRINT}, undef);
+        # R6: a malformed/hostile $ENV{BP_BLUEPRINT} (e.g. embedded
+        # newlines) must never reach the header. This is provenance
+        # metadata, not the operator's own words, so an invalid value is
+        # treated the same as "unset" (fall through to the scan) rather
+        # than failing the whole capture — ambiguity never costs the
+        # feedback (G5).
+        return ($ENV{BP_BLUEPRINT}, undef) if $ENV{BP_BLUEPRINT} =~ $BP_NAME_RE;
     }
 
     my $bp_root = File::Spec->catdir($data_dir, 'blueprints');
@@ -399,6 +428,11 @@ sub _resolve_blueprint {
     my @running;
     for my $ent (readdir $dh) {
         next if $ent eq '.' || $ent eq '..';
+        # R6: a blueprint *directory name* reaches the header verbatim with
+        # no flag or env var involved. Skip anything that doesn't already
+        # look like a safe single-line token rather than trusting the
+        # filesystem.
+        next unless $ent =~ $BP_NAME_RE;
         my $md = File::Spec->catfile($bp_root, $ent, 'blueprint.md');
         next unless -f $md;
         open(my $fh, '<', $md) or next;
@@ -444,8 +478,32 @@ my $header = join("\n", @header_lines) . "\n";
 
 my $tmp = "$final.tmp.$$";
 
+# R16: a signal in the write window (operator Ctrl-C, a harness timeout, an
+# orchestrator killing the turn, or SIGXFSZ from a write-size limit) never
+# returns from print/close, so the eval-based cleanup a few lines down can't
+# run. Catch the everyday signals and perform the same cleanup: unlink the
+# temp file, and unlink $final only if it is still our own zero-byte
+# placeholder. SIGKILL is deliberately left unhandled — that one genuinely
+# cannot be caught, and the spec documents the zero-byte-placeholder-survives
+# degradation for exactly that case.
+my $signal_cleanup = sub {
+    unlink $tmp if -e $tmp;
+    unlink $final if -f $final && !-l $final && -s $final == 0;
+    print STDERR "bp-feedback: [signal] interrupted during write; nothing written\n";
+    exit 4;
+};
+$SIG{INT} = $SIG{TERM} = $SIG{HUP} = $SIG{XFSZ} = $signal_cleanup;
+
 my $write_ok = eval {
-    open(my $fh, '>:raw', $tmp) or die "open $tmp: $!\n";
+    # R3: '>' follows symlinks. A pre-planted symlink at the temp-file path
+    # (guessable/forceable via $$) would make this write clobber an
+    # out-of-tree target, and the rename below would then publish the
+    # symlink itself as the batch member. sysopen with O_EXCL is the same
+    # primitive already used for the $final reservation above: it refuses to
+    # follow a symlink and refuses an existing file, turning a planted or
+    # leftover name into a loud failure instead of a silent clobber.
+    sysopen(my $fh, $tmp, O_WRONLY | O_CREAT | O_EXCL, 0644) or die "open $tmp: $!\n";
+    binmode($fh, ':raw');
     print { $fh } $header, "\n", $body or die "print $tmp: $!\n";
     close($fh) or die "close $tmp: $!\n";
     1;
@@ -458,18 +516,26 @@ unless ($write_ok) {
     _fail(4, "[write] $tmp: $why");
 }
 
+# R17: rename(2) on POSIX replaces the destination unconditionally,
+# regardless of its contents — so the previous check-after-rename below
+# never actually ran on this platform. The O_CREAT|O_EXCL reservation
+# guarantees no OTHER invocation of this tool can hold this name, but it
+# does not stop a third party (a human `cp`/`mv`, a restore script) from
+# writing into the reserved placeholder during this window. Check
+# immediately BEFORE publishing and fail loudly rather than clobber, so the
+# invariant is actually enforced rather than merely asserted in
+# unreachable code.
+if (-e $final && !(-f $final && !-l $final && -s $final == 0)) {
+    unlink $tmp if -e $tmp;
+    _fail(4, "[rename] $tmp -> $final: refused; $final is no longer our empty placeholder");
+}
+
 unless (rename($tmp, $final)) {
-    # On POSIX, rename() silently replaces an existing destination
-    # regardless of its size, so the first rename above already succeeds
-    # and this branch never runs there. This fallback exists for Windows,
-    # where rename() onto an existing file fails outright. The safety
-    # here does NOT come from the size check below — it comes entirely
-    # from the O_CREAT|O_EXCL reservation at the top of this block: no
-    # other process can hold this name, so $final can only be the
-    # zero-byte placeholder we ourselves created. The -s == 0 check is
-    # just a belt-and-braces assertion of that invariant on the one
-    # platform where this code path can run at all; it is not itself
-    # what makes replacing $final safe.
+    # On POSIX this branch is now unreachable: the check just above already
+    # guarantees $final is either absent or our own zero-byte placeholder,
+    # and rename() onto either succeeds unconditionally. This fallback
+    # exists for Windows, where rename() onto an existing file fails
+    # outright even when that file is our own just-verified placeholder.
     if (-f $final && -s $final == 0) {
         unlink $final;
     }
