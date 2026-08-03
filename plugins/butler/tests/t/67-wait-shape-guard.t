@@ -717,12 +717,30 @@ is(action_of('0'),     'deny', 'AC-29 [pure]: bp_ws_action_of "0" -> DENY');
     my $cmd_of = sub { my $f = shift; return qq(bash "\${CLAUDE_PLUGIN_ROOT}/hooks/$f") };
     my $pre = ($H && $H->{hooks}{PreToolUse}) // [];
 
-    # AC-33: the LAST PreToolUse block is b15's, matcher-less, with exactly one entry.
+    # AC-33: b15's block is matcher-less with exactly one entry.
+    #
+    # LOCATED BY COMMAND, not by position (relaxed 2026-08-03, b43). This originally
+    # asserted b15's block was the LAST in the array. That is a positional
+    # over-specification: hooks in a PreToolUse array ALL run, so order carries no
+    # meaning, and "last" simply forbids any later package from appending — which b43
+    # then legitimately did, breaking this oracle for no behavioural reason.
+    # Exactly the shape b26 documented and b15 itself hit on the block COUNT
+    # (`== 4` -> `>= 4`, operator-approved); this is the same lesson one axis over.
+    # Nothing is weakened: every property b15 actually guards — its block exists, is
+    # matcher-less, has exactly one entry, and that entry is byte-exact — is still
+    # asserted, and now cannot be satisfied by some OTHER package's block happening to
+    # sit last.
     ok(scalar(@$pre) >= 5, 'AC-33: PreToolUse carries at least five blocks (b15 appends a fifth)');
-    my $last = $pre->[-1] // {};
-    ok(!exists $last->{matcher},
-       'AC-33: the LAST PreToolUse block has NO matcher key (match-all-by-omission, the in-tree idiom for a universal hook)');
-    is(scalar(@{ $last->{hooks} // [] }), 1, 'AC-33: the last PreToolUse block has exactly one hook entry');
+    my ($b15_block) = grep {
+        scalar(@{ $_->{hooks} // [] }) == 1
+        && ($_->{hooks}[0]{command} // '') eq $cmd_of->('wait-shape-guard.sh')
+    } @$pre;
+    ok(defined $b15_block, "AC-33: b15's wait-shape-guard.sh block is registered in PreToolUse")
+        or diag('no PreToolUse block invokes wait-shape-guard.sh');
+    my $last = $b15_block // {};
+    ok(defined $b15_block && !exists $last->{matcher},
+       'AC-33: b15\'s PreToolUse block has NO matcher key (match-all-by-omission, the in-tree idiom for a universal hook)');
+    is(scalar(@{ $last->{hooks} // [] }), 1, 'AC-33: b15\'s PreToolUse block has exactly one hook entry');
     is_deeply($last->{hooks}[0],
               { type => 'command', command => $cmd_of->('wait-shape-guard.sh'), timeout => 15 },
               'AC-33: the entry is exactly { type: command, command: bash "${CLAUDE_PLUGIN_ROOT}/hooks/wait-shape-guard.sh", timeout: 15 }');
@@ -760,10 +778,16 @@ is(action_of('0'),     'deny', 'AC-29 [pure]: bp_ws_action_of "0" -> DENY');
 
     # AC-35(a): the absence of a matcher key IS the "reached for every tool" evidence. (b) is the
     # behavioural conjunction asserted in the jq-gated group below.
-    ok(!exists $last->{matcher},
+    ok(defined $b15_block && !exists $last->{matcher},
        'AC-35(a): b15\'s block is matcher-less, which is how it is reached for BOTH Bash and TaskOutput');
-    is(scalar(grep { !exists $_->{matcher} } @$pre), 2,
-       'AC-35(a): exactly two PreToolUse blocks are matcher-less -- b10\'s and b15\'s');
+    # `>= 2`, not `== 2`, for the same reason AC-33 no longer says "last": a later
+    # package may legitimately register another matcher-less universal hook, and that
+    # says nothing about whether b10's and b15's are still correct. Both are asserted
+    # individually — b15's immediately above, b10's in t/62 — so this is a floor, not
+    # a licence. An exact count here would forbid extension, which is the standoff
+    # b26 was written to end.
+    cmp_ok(scalar(grep { !exists $_->{matcher} } @$pre), '>=', 2,
+       'AC-35(a): at least two PreToolUse blocks are matcher-less -- b10\'s and b15\'s');
 }
 
 # =====================================================================================
