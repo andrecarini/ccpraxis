@@ -169,7 +169,13 @@ sub base_fixture {
 # =====================================================================================
 
 ok(-e $LIVE_BP, "FIXTURE-SANITY: the live blueprint.md exists at the expected path");
-is(-s $LIVE_BP, 109498, "FIXTURE-SANITY: the live blueprint.md is 109,498 bytes (spec's terrain)");
+# NOT an exact byte count. This oracle belongs to the package whose whole purpose is
+# MUTATING blueprint.md, so pinning its size guarantees the test breaks the first time
+# the API is used for real -- which is exactly what happened (109,498 -> 109,842 after one
+# set-status and one add-package). Assert the property that matters: it is a substantial,
+# real blueprint rather than a stub.
+cmp_ok(-s $LIVE_BP, ">", 50_000,
+   "FIXTURE-SANITY: the live blueprint.md is a substantial real file (>50 KB), not a stub");
 {
     my $b = base_fixture();
     ok($b =~ /depends_on/, "FIXTURE-SANITY: base_fixture carries the depends_on column");
@@ -463,15 +469,19 @@ is(-s $LIVE_BP, 109498, "FIXTURE-SANITY: the live blueprint.md is 109,498 bytes 
     my $p = stage_live_copy();
     my $live_digest = digest_of($p);
     my $dag_before = BpOrch::parse_dag(read_file($p));
-    is(scalar(keys %$dag_before), 70, "G10: the real parse_dag sees exactly 70 packages in the live-copied file");
+    # A FLOOR, not an exact count -- same reason as the size check above. The blueprint gains
+# packages over its life (b46 was added through this very API minutes after this test was
+# written, taking it 70 -> 71). G10 s real claim is the ROUND TRIP below, not the census.
+cmp_ok(scalar(keys %$dag_before), ">=", 60,
+   "G10: the real parse_dag sees a full-size package set in the live-copied file");
 
     # A no-op rewrite: read the current status of a known package and set it to the SAME value.
     my ($rc, $out, $err) = run_pl(['set-status', '--file', $p, '--pkg', 'b13-deterministic-ledger-api', '--status', "$DONE done"]);
-    is($rc, 0, "G10: a no-op set-status against the live-shaped 70-package file exits 0");
+    is($rc, 0, "G10: a no-op set-status against the live-shaped full-size file exits 0");
 
     my $dag_after = BpOrch::parse_dag(read_file($p));
     is_deeply($dag_after, $dag_before,
-       "G10: parse_dag's structural output on the 70-package live copy is unchanged after the no-op rewrite");
+       "G10: parse_dag structural output on the live copy is unchanged after the no-op rewrite");
 }
 
 # =====================================================================================
