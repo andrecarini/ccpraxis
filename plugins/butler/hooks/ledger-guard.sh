@@ -45,6 +45,15 @@ source "$HOOK_DIR/lib.sh"
 bp_hook_gate                        # inert outside a coordinator session, at zero cost
 bp_hook_require_jq                  # fail-CLOSED (lib.sh:15-21), as guard-writes.sh:20
 
+# b19-ledger-timestamp-integrity: the last_updated: VALUE check (monotonicity +
+# future-skew) lives ONCE, in bp-ledger.pl (the b13 API), and this hook `require`s it
+# rather than reimplementing it — two copies would drift, and the failure mode is a
+# sanctioned API write the guard then rejects, leaving a coordinator with no legal
+# move at all. Resolved to an ABSOLUTE path (b43's own landmine: a relative `require`
+# depends on the CALLER's cwd, not this script's location, and this hook can be
+# invoked from any coordinator's cwd).
+LEDGER_PL=$(realpath -m "$HOOK_DIR/../scripts/bp-ledger.pl" 2>/dev/null || printf '%s' "$HOOK_DIR/../scripts/bp-ledger.pl")
+
 PAYLOAD=$(cat)
 
 FILE_PATH=$(jq -r '.tool_input.file_path // empty'     <<<"$PAYLOAD" 2>/dev/null)
@@ -176,9 +185,26 @@ sub splice_bytes {
 
 sub truthy { my ($v) = @_; return $v ? 1 : 0 }
 
+# --- b19: require the shared last_updated_check() from bp-ledger.pl --------
+# FAIL CLOSED if it cannot be loaded, matching this guard's existing discipline for a
+# missing perl/jq (bp_hook_require_jq, lib.sh) -- an unenforced guard is worse than a
+# blocked write. $LEDGER_PL is an ABSOLUTE path computed by the surrounding bash.
+# bp-ledger.pl and this embedded validator share the same (unnamed, so "main") Perl
+# package; a couple of its low-level byte helpers (is_str/as_bytes/count_occ/
+# splice_bytes) are also defined here (a deliberate "pure lift" the other direction,
+# per bp-ledger.pl's own header), so the require would otherwise emit "Subroutine
+# redefined" warnings straight to stderr and break the "exactly one line" contract --
+# silenced here exactly the way GetOptionsFromArray's warnings are silenced there.
+my $LEDGER_PL          = $ENV{LG_LEDGER_PL};
+my $HAVE_SHARED_CHECK  = 0;
+if (defined $LEDGER_PL && length($LEDGER_PL) && -e $LEDGER_PL) {
+    local $SIG{__WARN__} = sub { };
+    $HAVE_SHARED_CHECK = eval { require $LEDGER_PL; 1 } ? 1 : 0;
+}
+
 # --- the validator: V1 -> V5, first failing class wins ----------------------
 sub validate {
-    my ($B) = @_;
+    my ($B, $OLD) = @_;
 
     # V1 control byte. \x7F (DEL) is included, per bp-orchestrator.pl:506.
     if ($B =~ /([\x00-\x08\x0B\x0C\x0E-\x1F\x7F])/) {
@@ -246,6 +272,16 @@ sub validate {
              . q{bp-status.sh:32 locates the next action with a bare awk /^## Next action/ and renders a BLANK CELL rather than an error when it is gone, so the loss is invisible, and the protocol's resumption contract ("execute ## Next action") becomes unsatisfiable. Edit the section BODY; never delete the heading. Restore it and retry.});
     }
 
+    # b19-ledger-timestamp-integrity: last_updated: VALUE monotonicity + future-skew,
+    # via the shared check. Fail CLOSED if it could not be loaded at all.
+    unless ($HAVE_SHARED_CHECK && defined &main::last_updated_check) {
+        deny("LEDGER-GUARD: BLOCKED \xe2\x80\x94 the shared last_updated: integrity check (bp-ledger.pl) could not be loaded, so this write to $ABS cannot be fully validated; blocking rather than allowing an unvalidated ledger write. Ensure bp-ledger.pl is present and requirable at $ENV{LG_LEDGER_PL}, then retry.");
+    }
+    my $lu_detail = main::last_updated_check($OLD, $B);
+    if (defined $lu_detail) {
+        deny('LEDGER-GUARD: BLOCKED ' . "\xe2\x80\x94" . ' the content this write would leave in ' . $ABS . ' ' . $lu_detail);
+    }
+
     allow();
 }
 
@@ -260,10 +296,23 @@ sub run {
     $ti = {} unless ref($ti) eq 'HASH';
 
     if ($TOOL eq 'Write') {
-        # content IS the result; the on-disk state is irrelevant and never read.
+        # content IS the result; the on-disk state was irrelevant to V1-V5, but b19's
+        # monotonicity half needs it if a prior ledger happens to exist at $ABS
+        # (best-effort only -- an absent or unreadable prior file just means there is
+        # nothing to compare the candidate value against).
         my $c = $ti->{content};
         m6('Write payload has no string "content" field') unless is_str($c);
-        validate(as_bytes($c));
+        my $old;
+        if (-e $ABS) {
+            $old = eval {
+                open(my $fh, '<:raw', $ABS) or die "open failed";
+                local $/;
+                my $b = <$fh>;
+                close $fh;
+                defined $b ? $b : '';
+            };
+        }
+        validate(as_bytes($c), $old);
     }
     elsif ($TOOL eq 'Edit') {
         # THE FAIL-CLOSED ASYMMETRY, and a naive reading gets it backwards: where
@@ -285,7 +334,7 @@ sub run {
         my $n   = count_occ($orig, $old);
         allow() if $n == 0;
         allow() if $n > 1 && !$all;
-        validate(splice_bytes($orig, $old, $new, $all));
+        validate(splice_bytes($orig, $old, $new, $all), $orig);
     }
     elsif ($TOOL eq 'MultiEdit') {
         my $edits = $ti->{edits};
@@ -296,7 +345,8 @@ sub run {
                          && is_str($e->{old_string}) && is_str($e->{new_string});
         }
         allow() unless -e $ABS;
-        my $buf = read_bytes($ABS);
+        my $buf  = read_bytes($ABS);
+        my $orig = $buf;
         for my $e (@$edits) {                      # <-- THE UNVERIFIED ASSUMPTION
             my $old = as_bytes($e->{old_string});
             my $new = as_bytes($e->{new_string});
@@ -307,7 +357,7 @@ sub run {
             allow() if $n > 1 && !$all;            # errors, so nothing lands
             $buf = splice_bytes($buf, $old, $new, $all);
         }
-        validate($buf);
+        validate($buf, $orig);
     }
     elsif ($TOOL eq 'NotebookEdit') {
         deny("LEDGER-GUARD: BLOCKED \xe2\x80\x94 NotebookEdit cannot target a package ledger ($ABS): a ledger is markdown, not a notebook. Use Edit or Write.");
@@ -330,5 +380,5 @@ exit 0;
 LG_PERL_PROGRAM
 )
 
-printf '%s' "$PAYLOAD" | LG_ABS="$ABS" LG_TOOL="$TOOL" perl -e "$VALIDATOR"
+printf '%s' "$PAYLOAD" | LG_ABS="$ABS" LG_TOOL="$TOOL" LG_LEDGER_PL="$LEDGER_PL" perl -e "$VALIDATOR"
 exit $?

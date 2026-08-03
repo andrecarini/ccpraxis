@@ -67,6 +67,95 @@ sub iso_now {
 }
 
 # =====================================================================================
+# last_updated VALUE integrity (b19-ledger-timestamp-integrity) — an AUDIT-TRAIL check,
+# not a run-control one (bp-status.sh uses mtime; gate-stop.sh and the watchdog never
+# parse this field at all, per the spec's own retracted impact claim). ONE
+# implementation, enforced at BOTH this API (below) and the b12 hook, which `require`s
+# THIS FILE rather than reimplementing the check — two copies would drift, and the
+# failure mode is specific and nasty: a sanctioned API write the guard then rejects,
+# leaving a coordinator with no legal move at all.
+# =====================================================================================
+
+# Ordinary container/host clock skew is seconds to low single-digit minutes, while the
+# defect this check exists to catch was observed at 25-55 minutes, once ~1 hour. 300s
+# sits an order of magnitude above normal skew and an order of magnitude below the
+# smallest observed defect, so neither bound is close. Verified against the full real
+# ledger corpus at this value (0 of it is future-dated beyond 300s).
+use constant LEDGER_FUTURE_SKEW_S => 300;
+
+# Pull the last_updated: VALUE out of a frontmatter block, byte-wise, exactly as V3
+# above locates keys. Returns undef if there is no parseable frontmatter or no such key
+# (both cases are V3's job to reject; this function is silent about it).
+sub extract_last_updated {
+    my ($B) = @_;
+    return undef unless $B =~ /\A---\s*\n(.*?)\n---/s;
+    my $FM = $1;
+    for my $l (split(/\n/, $FM, -1)) {
+        if ($l =~ /^last_updated:\s*(.*?)\s*$/) { return $1 }
+    }
+    return undef;
+}
+
+# Core-Perl-only (§2.5 forbids adding Time::Local to the allowed-module list): epoch
+# seconds (UTC) from a strict `YYYY-MM-DDTHH:MM:SSZ` stamp, via Howard Hinnant's
+# civil_from_days day-counting algorithm. Returns undef on anything not exactly that
+# shape or out of range — deliberately lenient: a malformed VALUE is not this check's
+# job (V1-V5 above police shape; this function only ever compares two valid stamps).
+sub epoch_from_iso {
+    my ($s) = @_;
+    return undef unless defined $s;
+    return undef unless $s =~ /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})Z$/;
+    my ($Y, $Mo, $D, $H, $Mi, $S) = (int($1), int($2), int($3), int($4), int($5), int($6));
+    return undef if $Mo < 1 || $Mo > 12 || $D < 1 || $D > 31 || $H > 23 || $Mi > 59 || $S > 60;
+    my $y = $Y;
+    $y-- if $Mo <= 2;
+    my $era = int(($y >= 0 ? $y : $y - 399) / 400);
+    my $yoe = $y - $era * 400;                                       # [0, 399]
+    my $mp  = ($Mo + 9) % 12;                                        # Mar=0 .. Feb=11
+    my $doy = int((153 * $mp + 2) / 5) + $D - 1;                     # [0, 365]
+    my $doe = $yoe * 365 + int($yoe / 4) - int($yoe / 100) + $doy;   # [0, 146096]
+    my $days = $era * 146097 + $doe - 719468;                        # days since 1970-01-01
+    return $days * 86400 + $H * 3600 + $Mi * 60 + $S;
+}
+
+# THE check (spec §2). $old_bytes may be undef (nothing on disk to compare against —
+# e.g. a fresh Write, or the static `validate --stdin`/`--ledger` surfaces, which
+# validate one buffer with no notion of a prior write at all). Returns undef (fine) or
+# a one-sentence DETAIL FRAGMENT in the same no-framing-prefix convention as
+# validate_bytes above.
+sub last_updated_check {
+    my ($old_bytes, $new_bytes) = @_;
+
+    my $new_val = extract_last_updated($new_bytes);
+    return undef unless defined $new_val;
+    my $new_ep = epoch_from_iso($new_val);
+    return undef unless defined $new_ep;
+
+    my $now = time;
+    if (($new_ep - $now) > LEDGER_FUTURE_SKEW_S) {
+        return sprintf(
+            'has a last_updated: value that is more than %d seconds ahead of the current time (%s): '
+          . '%s. Clock skew this large is rejected so a coordinator with a wrong clock can correct rather than guess.',
+            LEDGER_FUTURE_SKEW_S, iso_now(), $new_val);
+    }
+
+    if (defined $old_bytes) {
+        my $old_val = extract_last_updated($old_bytes);
+        if (defined $old_val) {
+            my $old_ep = epoch_from_iso($old_val);
+            if (defined $old_ep && $new_ep < $old_ep) {
+                return sprintf(
+                    'has a last_updated: value (%s) OLDER than the value currently on disk (%s); '
+                  . 'a write must never move last_updated: backward (an equal, same-second value is permitted).',
+                    $new_val, $old_val);
+            }
+        }
+    }
+
+    return undef;
+}
+
+# =====================================================================================
 # The validation core — V1..V5, normative (spec §2.4). First failing class wins.
 # Returns undef (valid) or a one-sentence DETAIL FRAGMENT (no framing prefix — the two
 # framings differ only in prefix, per §2.2 / AC-30).
@@ -355,6 +444,9 @@ sub run_op {
 
     my $detail2 = validate_bytes($new);
     reject_error($sub, $path, $detail2) if defined $detail2;
+
+    my $lu_detail = last_updated_check($orig, $new);
+    reject_error($sub, $path, $lu_detail) if defined $lu_detail;
 
     if ($new eq $orig) { $post_cb->($new) if $post_cb; exit 0 }
 
@@ -842,12 +934,34 @@ sub m6_payload {
 }
 
 sub validate_and_exit_payload {
-    my ($abs, $bytes) = @_;
+    my ($abs, $bytes, $old_bytes) = @_;
     my $detail = validate_bytes($bytes);
     if (defined $detail) {
         deny_payload("LEDGER-GUARD: BLOCKED ${EMDASH} the content this write would leave in $abs $detail");
     }
+    my $lu_detail = last_updated_check($old_bytes, $bytes);
+    if (defined $lu_detail) {
+        deny_payload("LEDGER-GUARD: BLOCKED ${EMDASH} the content this write would leave in $abs $lu_detail");
+    }
     exit 0;
+}
+
+# Best-effort read of the CURRENT on-disk bytes at $abs, for the last_updated_check's
+# monotonicity comparison only. Never fatal: an unreadable or absent prior file just
+# means there is nothing to compare a Write's candidate value against (a fresh ledger
+# has no "older" to violate) — reconstruction failures for Edit/MultiEdit are handled
+# separately by read_bytes_or_m6, since THOSE tools need the prior bytes to even know
+# what they would write.
+sub try_read_bytes {
+    my ($path) = @_;
+    return undef unless -e $path;
+    return eval {
+        open(my $fh, '<:raw', $path) or die "open failed";
+        local $/;
+        my $b = <$fh>;
+        close $fh;
+        defined $b ? $b : '';
+    };
 }
 
 sub op_validate_payload {
@@ -867,7 +981,7 @@ sub op_validate_payload {
     if ($TOOL eq 'Write') {
         my $c = $ti->{content};
         m6_payload($ABS, $TOOL, 'Write payload has no string "content" field') unless is_str($c);
-        validate_and_exit_payload($ABS, as_bytes($c));
+        validate_and_exit_payload($ABS, as_bytes($c), try_read_bytes($ABS));
     }
     elsif ($TOOL eq 'Edit') {
         exit 0 unless -e $ABS;
@@ -882,7 +996,7 @@ sub op_validate_payload {
         my $n   = count_occ($orig, $old);
         exit 0 if $n == 0;
         exit 0 if $n > 1 && !$all;
-        validate_and_exit_payload($ABS, splice_bytes($orig, $old, $new, $all));
+        validate_and_exit_payload($ABS, splice_bytes($orig, $old, $new, $all), $orig);
     }
     elsif ($TOOL eq 'MultiEdit') {
         my $edits = $ti->{edits};
@@ -893,7 +1007,8 @@ sub op_validate_payload {
                 unless ref($e) eq 'HASH' && is_str($e->{old_string}) && is_str($e->{new_string});
         }
         exit 0 unless -e $ABS;
-        my $buf = read_bytes_or_m6($ABS, $ABS, $TOOL);
+        my $buf  = read_bytes_or_m6($ABS, $ABS, $TOOL);
+        my $orig = $buf;
         for my $e (@$edits) {
             my $old = as_bytes($e->{old_string});
             my $new = as_bytes($e->{new_string});
@@ -904,7 +1019,7 @@ sub op_validate_payload {
             exit 0 if $n > 1 && !$all;
             $buf = splice_bytes($buf, $old, $new, $all);
         }
-        validate_and_exit_payload($ABS, $buf);
+        validate_and_exit_payload($ABS, $buf, $orig);
     }
     elsif ($TOOL eq 'NotebookEdit') {
         deny_payload("LEDGER-GUARD: BLOCKED ${EMDASH} NotebookEdit cannot target a package ledger ($ABS): "
@@ -949,6 +1064,14 @@ sub op_validate {
         emit_err("bp-ledger: validate: $label: $detail");
         exit 2;
     }
+    # Static surface, no on-disk "before": only the future-skew half of the b19 check
+    # applies here (monotonicity needs a prior value to compare against, which this
+    # single-buffer surface has no notion of).
+    my $lu_detail = last_updated_check(undef, $bytes);
+    if (defined $lu_detail) {
+        emit_err("bp-ledger: validate: $label: $lu_detail");
+        exit 2;
+    }
     exit 0;
 }
 
@@ -966,13 +1089,20 @@ my %DISPATCH = (
     'validate'         => \&op_validate,
 );
 
-my $sub = shift @ARGV;
-if (!defined $sub || $sub eq '') {
-    arg_error('(none)', 'missing subcommand; expected one of: '
-        . join(', ', sort keys %DISPATCH));
+# Guarded so ledger-guard.sh's embedded validator (b19) can `require` this file for
+# its shared last_updated_check() without also running this CLI — the same
+# requirable-module shape bp-orchestrator.pl already uses.
+unless (caller) {
+    my $sub = shift @ARGV;
+    if (!defined $sub || $sub eq '') {
+        arg_error('(none)', 'missing subcommand; expected one of: '
+            . join(', ', sort keys %DISPATCH));
+    }
+    unless (exists $DISPATCH{$sub}) {
+        arg_error($sub, "unknown subcommand '$sub'; expected one of: " . join(', ', sort keys %DISPATCH));
+    }
+    $DISPATCH{$sub}->(@ARGV);
+    exit 0;
 }
-unless (exists $DISPATCH{$sub}) {
-    arg_error($sub, "unknown subcommand '$sub'; expected one of: " . join(', ', sort keys %DISPATCH));
-}
-$DISPATCH{$sub}->(@ARGV);
-exit 0;
+
+1;
