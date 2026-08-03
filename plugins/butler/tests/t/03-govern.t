@@ -28,12 +28,40 @@ near(BpGovern::trip_point(0.01, 600, 85), 79, 'trip: 85 - 0.01*600 = 79');
 is(BpGovern::trip_point(1, 600, 85), 0, 'trip: floored at 0 for huge burn');
 
 # ---- window_cadence / next_cadence (#8) -----------------------------------
-is(BpGovern::window_cadence([[0,50]], 85), 300, 'cadence: <2 samples = 5min');
-is(BpGovern::window_cadence([[0,50],[100,50]], 85), 1800, 'cadence: flat burn = 30min');
-is(BpGovern::window_cadence([[0,52],[100,50]], 85), 1800, 'cadence: decreasing = 30min');
-near(BpGovern::window_cadence([[0,50],[100,52]], 85), 825, 'cadence: headroom 33 / 0.02 * 0.5 = 825s');
+#
+# RETARGETED by b30-usage-poll-cadence-floor, 2026-08-03. These assertions pinned the cadence
+# semantics that CAUSED a live incident: on 2026-07-29 the five-hour window went 78% -> outright
+# API rejection with no pause in between, because the poll had relaxed to its 30-minute floor.
+# The run was dead for 5.6 hours.
+#
+# Every fixture below uses a 100-SECOND span, which is under the new BURN_MIN_SPAN_S (180s). A
+# slope measured over 100s is not evidence about the next thirty minutes, so such a window is now
+# UNKNOWN, and unknown holds the FAST cadence rather than relaxing. Recorded verbatim per b26:
+#
+#   OLD: is(window_cadence([[0,50]], 85), 300, 'cadence: <2 samples = 5min');
+#   NEW: ... CADENCE_MIN_S (60)   -- <2 samples is the least-informed state there is; 300s was
+#                                    the fail-UNSAFE direction and is the defect in miniature.
+#   OLD: is(window_cadence([[0,50],[100,50]], 85), 1800, 'cadence: flat burn = 30min');
+#   NEW: ... 60                   -- a FLAT short window is exactly the incident (78,78 65s apart).
+#   OLD: is(window_cadence([[0,52],[100,50]], 85), 1800, 'cadence: decreasing = 30min');
+#   NEW: ... 60                   -- decreasing over 100s is unmeasured, not falling.
+#   OLD: near(window_cadence([[0,50],[100,52]], 85), 825, 'headroom 33 / 0.02 * 0.5');
+#   NEW: ... 60                   -- the projection needs a trustworthy slope; 100s is not one.
+#   OLD: is(window_cadence([[0,10],[100,10.01]], 85), 1800, 'cadence: tiny burn caps at 30min');
+#   NEW: ... 60                   -- a "tiny burn" over 100s is indistinguishable from noise.
+#
+# The one assertion NOT changed is the 60s near-trip floor below: it already held, and it is the
+# behaviour the fix generalises. The long-span equivalents of the relaxation cases are asserted in
+# t/81 (C4), so "an idle fleet still relaxes to 30min" remains pinned — just at a span where the
+# measurement means something.
+is(BpGovern::window_cadence([[0,50]], 85), 60, 'cadence: <2 samples -> FAST (unknown is never slow)');
+is(BpGovern::window_cadence([[0,50],[100,50]], 85), 60, 'cadence: flat over a SHORT span -> FAST (the incident shape)');
+is(BpGovern::window_cadence([[0,52],[100,50]], 85), 60, 'cadence: decreasing over a SHORT span -> FAST (unmeasured, not falling)');
+is(BpGovern::window_cadence([[0,50],[100,52]], 85), 60, 'cadence: projection needs a trustworthy slope; 100s span -> FAST');
 is(BpGovern::window_cadence([[0,84],[100,84.5]], 85), 60, 'cadence: near trip floors at 60s');
-is(BpGovern::window_cadence([[0,10],[100,10.01]], 85), 1800, 'cadence: tiny burn caps at 30min');
+is(BpGovern::window_cadence([[0,10],[100,10.01]], 85), 60, 'cadence: tiny burn over a SHORT span -> FAST (noise, not signal)');
+# The relaxation property still holds at a span long enough to mean something (t/81 C4 pins this too).
+is(BpGovern::window_cadence([[0,10],[600,10]], 85), 1800, 'cadence: flat over a LONG span at low util -> still relaxes to 30min');
 # min over both windows
 is(BpGovern::next_cadence([[0,84],[100,84.5]], 85, [[0,10],[100,11]], 90), 60,
    'next_cadence: takes the tighter (5h) window');
