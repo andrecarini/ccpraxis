@@ -196,6 +196,7 @@ use strict;
 use warnings;
 use File::Basename qw(dirname);
 use Cwd qw(abs_path);
+use File::Spec ();
 
 my $DIR = dirname(abs_path(__FILE__));
 require "$DIR/bp-orchestrator.pl";   # reuse BpOrch atomic ledger/registry/pause writers
@@ -263,6 +264,56 @@ sub append_human_decision {
     open my $w, '>:raw', "$f.tmp.$$" or return;
     print $w $txt; close $w;
     rename "$f.tmp.$$", $f;
+}
+
+# update_next_action_with_note($bpdir, $pkg, $note, $action) — b18-decision-delivery:
+# the answer to a park must land where the resume prompt actually points ("Re-read
+# your ledger ... then continue from the 'Next action' section" — bp-launch.sh), not
+# only in the "## Human decision (resolve)" audit block appended above. That block is
+# the durable RECORD (SYN-10: archive, never delete); THIS makes it the OPERATIVE
+# instruction too, by REPLACING the stale park text in "## Next action" wholesale —
+# appending beneath it would satisfy "the note is present" while still leaving the
+# stale instruction as the last thing a resuming coordinator reads, which is the
+# actual re-park defect (spec section 0/1).
+#
+# Goes through bp-ledger.pl's sanctioned `set-next-action` op — the ONE section
+# documented as "meant to be rewritten" — as an out-of-process CLI call (list-form
+# system(), no shell, so the note's own quoting/newlines need no escaping) rather
+# than a second raw ledger writer of this script's own: bp-ledger.pl set-next-action
+# does its own byte-level locate/validate/atomic-write, and adding another '>:raw'
+# writer here would both duplicate that logic and break b17's oracle, which pins
+# this script's raw-writer count at exactly one (the audit-record writer above).
+sub update_next_action_with_note {
+    my ($bpdir, $pkg, $note, $action) = @_;
+    return unless defined $note && length $note;
+    my $ledger = "$bpdir/packages/$pkg.md";
+    return unless -f $ledger;
+    my $body = "A human reviewed this package's park and chose to **$action** it. Their guidance:\n\n"
+             . "$note\n\n"
+             . "Apply it, then re-run your own tests/review before reporting done.";
+    my $ledger_pl = "$SELF_DIR/bp-ledger.pl";
+    # Redirect the CHILD's stdout/stderr to the null device around the call (list-form
+    # system(): no shell, so the note's own quoting/newlines/metacharacters need no
+    # escaping and cannot leak into a shell). bp-ledger.pl's stdout is documented as
+    # always empty on this op, but its stderr is not: a ledger fixture that predates
+    # b13's schema (missing frontmatter keys/sections bp-ledger.pl's own V1-V5 requires)
+    # makes set-next-action reject and print one stderr line. Left unredirected, a
+    # caller capturing this script's own combined output (2>&1, as several callers and
+    # tests do) would see that line spliced into what must stay pure JSON on stdout.
+    # A rejection here is a silent no-op for Next-action delivery, not a fatal error --
+    # the audit record (append_human_decision, above) already landed regardless.
+    my $devnull = File::Spec->devnull;
+    my ($saved_out, $saved_err);
+    open($saved_out, '>&', \*STDOUT) or return 0;
+    open($saved_err, '>&', \*STDERR) or return 0;
+    open(STDOUT, '>', $devnull) or do { open(STDOUT, '>&', $saved_out); return 0; };
+    open(STDERR, '>', $devnull) or do { open(STDOUT, '>&', $saved_out); open(STDERR, '>&', $saved_err); return 0; };
+    system($^X, $ledger_pl, 'set-next-action', '--ledger', $ledger, '--body', $body);
+    my $rc = $?;
+    open(STDOUT, '>&', $saved_out);
+    open(STDERR, '>&', $saved_err);
+    close $saved_out; close $saved_err;
+    return ($rc == 0) ? 1 : 0;
 }
 
 # supersede_package_work($runs, $pkg) -> \@superseded
@@ -434,6 +485,9 @@ unless (caller) {
 
     my $superseded = [];
     my $cleared    = 0;
+    # b18: undef when no --note was supplied; 1/0 when one was, so a rejected
+    # set-next-action is reported rather than swallowed.
+    my $next_action_updated;
     if ($plan->{family} eq 'package') {
         unless (defined $pkg && length $pkg && -f "$bpdir/packages/$pkg.md") {
             print STDERR "bp-answer-decision: package ledger not found for '" . ($pkg // '') . "'\n"; exit 2;
@@ -446,6 +500,21 @@ unless (caller) {
         # (defect 4, the worst-shaped of the four: exit 0, note vanished, no warning)
         # is gone. append_human_decision() itself already no-ops when $note is undef.
         append_human_decision($bpdir, $pkg, $note, $plan->{action});
+        # b18: put the answer where the resume prompt actually points (see
+        # update_next_action_with_note's own header) -- must run for every action
+        # that carries a note (relaunch/reset/accept/drop alike), matching b17's
+        # "note persists on every action" rule this package extends.
+        # The return value is USED, not discarded. A rejected set-next-action leaves the
+        # OPERATIVE copy of the answer unwritten while the audit record still lands -- which
+        # is this package's own defect (the coordinator reads `## Next action`, finds stale
+        # park text, and re-parks) reintroduced for any ledger bp-ledger.pl refuses. Silently
+        # swallowing it would repeat b17's defect 4 (accepted, exit 0, wrote nothing) and
+        # b09's item 14 (return discarded at every call site).
+        #
+        # It is surfaced in the JSON on stdout rather than on stderr: callers capture this
+        # script's combined output and parse stdout as JSON, so any stderr line -- including
+        # our own -- would corrupt what it is meant to warn about.
+        $next_action_updated = update_next_action_with_note($bpdir, $pkg, $note, $plan->{action});
         BpOrch::_set_ledger_status($bpdir, $pkg, $plan->{ledger_status});
         my %reg = ( status => $plan->{ledger_status} );
         $reg{attempt}          = 0 if $plan->{reset_attempt};
@@ -472,6 +541,13 @@ unless (caller) {
         ledger_status => $plan->{ledger_status},
         cleared_pause => ($plan->{clear_pause} ? JSON::PP::true() : JSON::PP::false()),
         superseded => $superseded, decisions_cleared => $cleared,
+        # b18: absent when no --note was given. When one was, this says whether the
+        # OPERATIVE copy reached `## Next action` -- the section a resuming coordinator
+        # actually reads. false means the audit record landed but the coordinator will
+        # still see stale park text, which is the re-park loop this package closes.
+        (defined $next_action_updated
+            ? (next_action_updated => ($next_action_updated ? JSON::PP::true() : JSON::PP::false()))
+            : ()),
     });
     exit 0;
 }
