@@ -916,6 +916,15 @@ sub _fixed_panels {
     if (ref $s->{resources} eq 'HASH') {
         push @p, { title => 'Resources', lines => [ _resources_lines($s->{resources}) ] };
     }
+
+    # b37-spend-surfaces: Claude/Go/Zen spend meters. Present only when the
+    # launcher gathered a SpendPanel status() struct for this project (the
+    # launcher computes it -- this file never talks to SpendPanel, per S1).
+    # Appended LAST alongside Resources for the same reason: full-width,
+    # not part of the fixed two-column region _body_rows pulls from.
+    if (ref $s->{spend} eq 'HASH') {
+        push @p, { title => 'Spend', lines => _spend_lines($s->{spend}, $cols - 2) };
+    }
     return @p;
 }
 
@@ -1130,6 +1139,175 @@ sub _token_lines {
     }
 
     return @lines;
+}
+
+# ===========================================================================
+# b37-spend-surfaces: renders SpendPanel's already-computed status() \%info
+# struct. Dashboard.pm does NOT load the SpendPanel module (no use/require,
+# no module-qualified call anywhere in this file) -- exactly the TokenInfo/
+# _token_lines split.
+# PRIVATE, pure, mirrors _token_lines' style. Never dies for any input.
+# ===========================================================================
+
+# _spend_glyph($state) -> ($role, $glyph_bytes), the s06-semantics colour +
+# status-dot pair for a rendered provider/window state.
+sub _spend_glyph {
+    my ($state) = @_;
+    return ('bad',   $GLYPH_RED)    if $state eq 'unreadable' || $state eq 'exhausted';
+    return ('warn',  $GLYPH_YELLOW) if $state eq 'absent';
+    return ('muted', $GLYPH_WHITE)  if $state eq 'disabled';
+    return ('good',  $GLYPH_GREEN);   # 'ok' and any unrecognized state
+}
+
+# _spend_claude_line(\%claude_info) -> (\@spans, $protect). $protect is true
+# iff the line carries a verbatim diagnostic (spec C11: the revisit prompt
+# must survive intact, so a diagnostic-bearing line is exempted from the
+# column-budget clip in _spend_lines rather than risk cutting the prompt).
+# One line for the Claude meter (5-hour + 7-day windows, or the unreadable
+# cue). Claude has only two states in this contract (spec S0.1: it never has
+# an "absent" concept here).
+sub _spend_claude_line {
+    my ($c) = @_;
+    $c = {} unless ref($c) eq 'HASH';
+    my $state = (defined($c->{state}) && $c->{state} eq 'ok') ? 'ok' : 'unreadable';
+    my ($role, $glyph) = _spend_glyph($state);
+    my @spans = ( { text => "$glyph ", role => $role }, { text => 'Claude : ', role => 'label' } );
+
+    if ($state eq 'ok') {
+        my @parts;
+        for my $w (ref($c->{windows}) eq 'ARRAY' ? @{ $c->{windows} } : ()) {
+            next unless ref($w) eq 'HASH' && defined $w->{name} && defined $w->{text};
+            my $tag = $w->{name} eq 'seven_day' ? '7d' : '5h';
+            push @parts, "$tag $w->{text}";
+        }
+        push @spans, { text => (@parts ? join('  ', @parts) : 'no windows reported'), role => 'value' };
+        return (\@spans, 0);
+    }
+    my $diag = (defined $c->{diagnostic} && !ref $c->{diagnostic} && length $c->{diagnostic})
+             ? $c->{diagnostic} : 'usage endpoint unreadable';
+    push @spans, { text => "unreadable -- $diag", role => 'bad' };
+    return (\@spans, 1);
+}
+
+# _spend_go_line(\%go_info) -> (\@spans, $protect) -- one line for the
+# OpenCode Go meter (5-hour/weekly/monthly, dollar-denominated) across its
+# four states (spec S0.1: absent/unreadable/exhausted/ok, none of the non-ok
+# states ever a $0). $protect mirrors _spend_claude_line's (spec C11: an
+# unreadable Go meter's diagnostic may carry b36's revisit prompt verbatim,
+# so it is exempted from the column-budget clip in _spend_lines rather than
+# risk truncating the prompt away).
+sub _spend_go_line {
+    my ($g) = @_;
+    $g = {} unless ref($g) eq 'HASH';
+    my $state = (defined $g->{state} && $g->{state} =~ /^(?:absent|unreadable|exhausted|ok)$/)
+              ? $g->{state} : 'absent';
+    my ($role, $glyph) = _spend_glyph($state);
+    my @spans = ( { text => "$glyph ", role => $role }, { text => 'Go     : ', role => 'label' } );
+
+    if ($state eq 'absent') {
+        push @spans, { text => 'not configured', role => 'muted' };
+    } elsif ($state eq 'unreadable') {
+        my $diag = (defined $g->{diagnostic} && !ref $g->{diagnostic} && length $g->{diagnostic})
+                 ? $g->{diagnostic} : 'meter unreadable';
+        push @spans, { text => "unreadable -- $diag", role => 'bad' };
+        return (\@spans, 1);
+    } else {
+        my @parts;
+        for my $w (ref($g->{windows}) eq 'ARRAY' ? @{ $g->{windows} } : ()) {
+            next unless ref($w) eq 'HASH' && defined $w->{name} && defined $w->{text};
+            my $tag = $w->{name} eq 'weekly' ? 'Wk' : $w->{name} eq 'monthly' ? 'Mo' : '5h';
+            my $exhausted_here = defined($w->{fraction}) && $w->{fraction} >= 1;
+            push @parts, ($exhausted_here ? "$tag $w->{text} EXHAUSTED" : "$tag $w->{text}");
+        }
+        push @spans, { text => (@parts ? join('  ', @parts) : 'no windows reported'),
+                       role => ($state eq 'exhausted' ? 'bad' : 'value') };
+    }
+    return (\@spans, 0);
+}
+
+# _spend_zen_line(\%zen_info) -> (\@spans, $protect) -- one line for the Zen
+# meter. Disabled by default (spec S2/C5): rendered as 'disabled', never as
+# $0 and never as an error. $protect mirrors _spend_go_line's, for the same
+# revisit-prompt-preservation reason (spec C11).
+sub _spend_zen_line {
+    my ($z) = @_;
+    $z = {} unless ref($z) eq 'HASH';
+    my $state = (defined $z->{state} && $z->{state} =~ /^(?:disabled|absent|unreadable|exhausted|ok)$/)
+              ? $z->{state} : 'disabled';
+    my ($role, $glyph) = _spend_glyph($state);
+    my @spans = ( { text => "$glyph ", role => $role }, { text => 'Zen    : ', role => 'label' } );
+
+    if ($state eq 'disabled') {
+        push @spans, { text => 'disabled', role => 'muted' };
+    } elsif ($state eq 'absent') {
+        push @spans, { text => 'not configured', role => 'muted' };
+    } elsif ($state eq 'unreadable') {
+        my $diag = (defined $z->{diagnostic} && !ref $z->{diagnostic} && length $z->{diagnostic})
+                 ? $z->{diagnostic} : 'meter unreadable';
+        push @spans, { text => "unreadable -- $diag", role => 'bad' };
+        return (\@spans, 1);
+    } else {
+        my $bal = (defined $z->{balance_text} && !ref $z->{balance_text}) ? $z->{balance_text} : 'n/a';
+        my $bud = (defined $z->{budget_text} && !ref $z->{budget_text}) ? " / $z->{budget_text}" : '';
+        my $pct = (defined($z->{fraction}) && !ref($z->{fraction}) && $z->{fraction} =~ /^-?\d+(?:\.\d+)?$/)
+                ? sprintf(' (%d%%)', int($z->{fraction} * 100 + 0.5)) : '';
+        my $txt = "$bal$bud$pct" . ($state eq 'exhausted' ? ' EXHAUSTED' : '');
+        push @spans, { text => $txt, role => ($state eq 'exhausted' ? 'bad' : 'value') };
+    }
+    return (\@spans, 0);
+}
+
+# _spend_lines(\%info, $cols) -> \@lines. \%info is the SpendPanel status()
+# output, passed through with no re-derivation (this file never talks to the
+# SpendPanel module). Every returned line's spans_width is <= $cols (never
+# overflows -- s05-responsive-layout, C9): a line only wider than $cols gets
+# clipped via fit_spans (whole-glyph-drop, never mid-glyph). A non-hashref
+# $info -> the empty arrayref (never dies). PUBLIC (mirrors spans_text/
+# spans_width/display_width's visibility -- the oracle calls this directly).
+sub _spend_lines {
+    my ($info, $cols) = @_;
+    return [] unless ref($info) eq 'HASH';
+
+    my $w = (defined $cols && !ref($cols) && $cols =~ /^\d+(?:\.\d+)?$/ && $cols > 0) ? int($cols) : 80;
+
+    # Each _spend_*_line returns (\@spans, $protect): $protect is true iff
+    # the line carries a verbatim diagnostic that may hold b36's revisit
+    # prompt (spec C11), in which case it is exempted from the column-budget
+    # clip below rather than risk truncating the prompt away. Captured
+    # explicitly (not via a flattened list literal) so the protect flags
+    # never leak into @out as spurious extra lines.
+    my ($claude_spans, $claude_protect) = _spend_claude_line($info->{claude});
+    my ($go_spans,     $go_protect)     = _spend_go_line($info->{go});
+    my ($zen_spans,    $zen_protect)    = _spend_zen_line($info->{zen});
+
+    my @entries = (
+        [ $claude_spans, $claude_protect ],
+        [ $go_spans,     $go_protect ],
+        [ $zen_spans,    $zen_protect ],
+    );
+
+    my @out;
+    for my $e (@entries) {
+        my ($line, $protect) = @$e;
+        push @out, ($protect || spans_width($line) <= $w) ? $line : fit_spans($line, $w);
+    }
+
+    # The window nearest exhaustion is visually foremost (spec S2/C6): a
+    # one-line summary prepended, mirroring b36's gate acting on the
+    # tightest remaining headroom -- the panel and the governor must not
+    # disagree about which window matters.
+    if (ref($info->{priority}) eq 'ARRAY' && @{ $info->{priority} }) {
+        my $top = $info->{priority}[0];
+        if (ref($top) eq 'HASH' && defined $top->{provider} && defined $top->{window}) {
+            my $pct = (defined($top->{fraction}) && !ref($top->{fraction}))
+                    ? sprintf('%d%%', int($top->{fraction} * 100 + 0.5)) : '?';
+            my $pline = [ { text => 'nearest : ', role => 'label' },
+                          { text => "$top->{provider}/$top->{window} $pct", role => 'accent' } ];
+            unshift @out, (spans_width($pline) > $w) ? fit_spans($pline, $w) : $pline;
+        }
+    }
+
+    return \@out;
 }
 
 # _resources_lines(\%res) -> LIST of body lines for the s09 Resources panel.

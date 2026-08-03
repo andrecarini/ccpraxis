@@ -50,6 +50,10 @@ use ProtectedPaths qw(path_relation protected_roots target_self_codes normalize_
 use LaunchLog ();   # B1: durable per-launch diagnostic log (next to us in scripts/)
 use Dashboard ();   # B2: the raw-ANSI TUI dashboard framework
 use TokenInfo ();   # s08: pure access/refresh token status struct for the dashboard
+use SpendPanel ();  # b37: pure Claude/Go/Zen spend status struct for the dashboard
+                    # (the LAUNCHER loads it and computes; Dashboard.pm renders the
+                    # already-computed struct and must never load it — same split
+                    # TokenInfo has, and t/54-spend-panel asserts both halves)
 use Resources ();   # s09: pure resource-probe parsers + the injectable probe seam
 use RunState ();    # s10: pure orchestrator/run-state summarizer for the dashboard
 use BackpackApproval ();  # #21: per-item, machine-local backpack approval memory
@@ -3836,6 +3840,11 @@ sub enter_dashboard {
                 tokens           => $cached_tokens,
                 resources        => $cached_resources,
                 runs             => $cached_runs,
+                # b37-spend-surfaces: undef when no run has persisted a spend
+                # snapshot, and Dashboard::build_panels then omits the Spend
+                # panel entirely rather than rendering an empty or zeroed one.
+                # See _gather_spend for why this never fetches from here.
+                spend            => _gather_spend($cached_runs),
                 # s11-lifecycle-stop spec 08 S2.8: one notch wider than the
                 # Windows-only guard at _resources_probes (:3268-3271), so a
                 # macOS podman machine is covered too; Linux-native podman has
@@ -4585,6 +4594,53 @@ sub _gather_orchestrator_events {
         1;
     } or do { $ev = [] };          # any failure -> no orchestrator events, dashboard still renders
     return $ev;
+}
+
+# _gather_spend($runs) -> \%info | undef (b37-spend-surfaces).
+#
+# Reads a spend snapshot the butler run has ALREADY persisted and hands it to
+# SpendPanel::status for rendering. Mirrors _gather_orchestrator_events: locate
+# the active run, read one host-visible file, degrade to nothing on any failure.
+#
+# ⚠ THIS DELIBERATELY MAKES NO NETWORK CALL, and that is the load-bearing
+# decision rather than an omission. BpSpend::fetch reaches for bp-http.pl, the
+# house curl wrapper — a SUBPROCESS, i.e. a fork, and this runs on the dashboard
+# render tick. s17 has just spent an entire package REMOVING the one recurring
+# fork from this path, on the very platform where forking is already failing
+# ("Can't fork, trying again in 5 seconds"). Re-introducing a network fork here
+# would undo that and could block the TUI for the length of a timeout.
+#
+# So the launcher is a READER only. The fleet polls on its own cadence — b36
+# already owns the cadence floor and the TTL cache — and the TUI renders
+# whatever it last wrote.
+#
+# ⚠ KNOWN GAP, ESCALATED, NOT PAPERED OVER: b36 does not currently WRITE such a
+# snapshot. It emits `spend_fetch` events through BpLog (outcome and status, not
+# figures) and returns its struct in-process to its caller. Until b36 persists
+# one, this returns undef and the Spend panel is simply ABSENT — never wrong,
+# never a fabricated zero. Deciding that artifact's location, lifecycle and
+# redaction belongs to b36, whose defining constraint is that the OpenCode
+# session cookie is the broadest secret in the system: a persisted spend
+# snapshot must provably never carry it. That is not a call to make inside a
+# rendering package. See the b37 ledger.
+sub _gather_spend {
+    my ($runs) = @_;
+    my $info;
+    eval {
+        my @candidates = grep { ref($_) eq 'HASH' && defined $_->{runs_dir} } @{ $runs || [] };
+        my ($active) = grep { ($_->{state} || '') eq 'running' } @candidates;
+        ($active) = grep { ($_->{state} || '') eq 'paused' } @candidates if !$active;
+        return unless $active;
+        my $snap = "$active->{runs_dir}/spend.json";
+        return unless -f $snap;
+        my $raw = do { local $/; open my $fh, '<:raw', $snap or return; <$fh> };
+        return unless defined $raw && length $raw;
+        my $spend = JSON::PP->new->decode($raw);
+        return unless ref $spend eq 'HASH';
+        $info = SpendPanel::status($spend, time);
+        1;
+    } or do { $info = undef };     # any failure -> no panel, dashboard still renders
+    return (ref $info eq 'HASH') ? $info : undef;
 }
 
 # _row_time_key($row) -> seconds-since-local-midnight | undef (private helper

@@ -262,8 +262,26 @@ for my $f (@package_files) {
 ok(scalar(@all_citation_instances) > 0,
    "C3: at least one SYN-\\d+ citation was actually enumerated across packages/*.md");
 
-is($citing_file_count, 57,
-   "C3: exactly 57 ledgers cite a SYN- decision (matches the pre-split baseline in step1-inventory.md)");
+# RETARGETED 2026-08-03 (SYN-21). This pinned the count at EXACTLY 57, which is
+# a corpus snapshot and therefore a moving target by construction: every package
+# that later cites a SYN- decision in its own ledger breaks it. It broke the
+# moment coordinator entries citing SYN-21 were appended during normal work
+# (57 -> 58), and that number had ALREADY been corrected once (32 -> 57).
+#
+# It is the same global-snapshot antipattern as t/25's frozen heading count and
+# the four oracles that pinned launcher.pl's literal poll cadence -- an
+# assertion about the whole tree's shape, forbidding every later package from
+# adding to it.
+#
+# What C3 actually protects is stated by the two assertions around it: that
+# citations were genuinely enumerated (the vacuity gate above) and that NONE
+# dangles (below). The count only ever served as a proxy for "the split did not
+# LOSE citations", so assert that directly as a floor -- a drop below the
+# pre-split baseline is a real regression; growth is normal, expected work.
+cmp_ok($citing_file_count, '>=', 57,
+   "C3: at least 57 ledgers cite a SYN- decision -- the pre-split baseline is a FLOOR, "
+ . "not a frozen count (growth is normal; a drop would mean the split lost citations)")
+    or diag("citing ledgers: $citing_file_count (pre-split baseline was 57)");
 
 my @dangling = sort grep { !exists $DEFINED{$_} } keys %cited_ids_seen;
 is(scalar(@dangling), 0, "C3: 0 dangling citations (every cited id resolves to a defined table row)")
