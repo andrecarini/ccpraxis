@@ -1049,6 +1049,24 @@ sub ledger_age_min {
     return int((($now // time) - $st[9]) / 60);
 }
 
+# b11-progress-heuristic-turns-backstop: has b10's mechanical repeat guard
+# (plugins/butler/hooks/lib.sh, repeat-guard.sh) already flagged THIS package
+# recently? The guard's own state lives at runs/<pkg>.repeat-<session-token>.log,
+# one file per coordinator session, each line "TS\tHASH\tFIRED". Read-only, tail
+# only (reuses _last_nonempty_line — no second reader), and best-effort: any glob
+# or read failure is simply "not flagged" (never manufactures a looping verdict).
+sub _repeat_flagged_recently {
+    my ($runs, $pkg) = @_;
+    my @files = eval { glob("$runs/$pkg.repeat-*.log") };
+    return 0 unless @files;
+    for my $f (@files) {
+        my $line = eval { _last_nonempty_line($f) };
+        next unless defined $line;
+        return 1 if $line =~ /^\d+\t[^\t]+\t1\z/;
+    }
+    return 0;
+}
+
 # port of bp-lib.sh pid_alive (kill 0 + /proc zombie check).
 sub pid_alive {
     my ($pid) = @_;
@@ -2491,6 +2509,39 @@ sub run {
                     my $prev = $seen{$pkg};
                     my $prog = progress_verdict($sz, $mt, ($prev ? $prev->{size} : undef), $now, $t->{flat});
                     $seen{$pkg} = { size => ($sz // 0), mtime => ($mt // $now) };
+
+                    # b11-progress-heuristic-turns-backstop: consult the semantic
+                    # progress heuristic (bp-progress.pl) IN ADDITION to the byte-growth
+                    # signal above — progress_verdict scores a same-command loop as
+                    # maximally healthy (spec §0), so a confident looping/stuck verdict
+                    # here acts IMMEDIATELY rather than waiting on the turn cap (§1/§2).
+                    # b10's already-fired mechanical repeat guard is consumed as an input
+                    # (no fresh semantic/model call when it already flagged this package).
+                    # Gated on BP_PROGRESS_MODEL_CMD being configured: with no model seam
+                    # set (every pre-b11 environment, including every other test in this
+                    # suite) bp-progress.pl's own uncertainty rule always returns
+                    # "progressing" (never looping/stuck), so this block is a byte-for-
+                    # byte no-op there — pre-existing watchdog behaviour is unchanged.
+                    if (defined $ENV{BP_PROGRESS_MODEL_CMD} && length $ENV{BP_PROGRESS_MODEL_CMD}) {
+                        my ($sv, $sr) = eval {
+                            require Cwd;
+                            require File::Basename;
+                            my $d = File::Basename::dirname(Cwd::abs_path(__FILE__));
+                            require "$d/bp-progress.pl";
+                            my $flagged = _repeat_flagged_recently($runs, $pkg) ? 1 : 0;
+                            BpProgress::verdict_from_runs($runs, $pkg, $now, $flagged);
+                        };
+                        if (!$@ && defined $sv && $sv =~ /^(?:looping|stuck)$/) {
+                            _log($log, 'progress_heuristic_kill',
+                                { package => $pkg, verdict => $sv, reason => $sr, attempts => $att->{$pkg} });
+                            kill_pid($pid->{$pkg});
+                            $status->{$pkg} = _escalate_stuck({ bpdir=>$bpdir, runs=>$runs, log=>$log, bp=>$bp, pkg=>$pkg,
+                                why=>"progress heuristic: $sv ($sr)", now=>$now, reg=>$reg, t=>$t,
+                                spawn_judge=>$spawn_judge, shutdown=>$shutdown });
+                            next;   # already actioned this tick — skip the byte-growth verdict below
+                        }
+                    }
+
                     my $v = watchdog_verdict({ alive => 1, progress => $prog,
                         attempts => effective_attempts($att->{$pkg}, _reg_int($reg->{$pkg}{turn_continuations}) // 0,
                                                         _reg_int($reg->{$pkg}{rate_limit_discounts}) // 0),
@@ -2597,6 +2648,20 @@ sub run {
                                         _upd_pkg($runs, $log, $pkg, { turn_exhaust_streak => $streak });
                                         $reg->{$pkg}{turn_exhaust_streak} = $streak;
                                         $starved{$pkg} = 1;
+                                        # b11: the turn cap is now a BACKSTOP (spec §2/§3 C7) — reaching
+                                        # it (here, repeatedly) means the semantic progress heuristic
+                                        # above never got a confident looping/stuck read in time. Log
+                                        # that as its own distinct condition (never the package's
+                                        # ledger/registry — bp-progress.pl's `capped` never touches
+                                        # them) ADDITIONALLY to the turn-starved pause filed below, so
+                                        # the guard's own failure is visible apart from the package's.
+                                        eval {
+                                            require Cwd;
+                                            require File::Basename;
+                                            my $d = File::Basename::dirname(Cwd::abs_path(__FILE__));
+                                            require "$d/bp-progress.pl";
+                                            BpProgress::capped_from_runs($runs, $pkg, $now);
+                                        };
                                         _enter_pause_manual($runs, $log,
                                             "turn-starved: $pkg exhausted turns ${streak}x with no progress",
                                             { package => $pkg, blueprint => $bp, kind => 'turn-starved',

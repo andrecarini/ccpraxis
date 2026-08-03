@@ -15,6 +15,15 @@
 # stop-discipline would wedge it). The harvest judge gets an EMPTY write_set
 # (read-only: only its verdict, which lands under BP_DIR, is writable); the resolve
 # judge gets the package's real write_set so its fix is contained.
+#
+# b11-progress-heuristic-turns-backstop: when bp-progress.pl's semantic tail-read
+# (bp-orchestrator.pl's watchdog, gated on BP_PROGRESS_MODEL_CMD) returns a confident
+# `looping`/`stuck` verdict, the orchestrator kills that coordinator and escalates it
+# through the SAME `resolve` path this script already serves (_escalate_stuck ->
+# spawn_judge kind=resolve) — no new judge kind, no change here. `bp-progress.pl`'s
+# OWN `capped` condition (the turn cap reached before the heuristic got a confident
+# read) is a distinct, guard-level log line in runs/orchestrator.log; it never queues
+# a resolve judge and never touches this script's inputs.
 set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 PLUGIN_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
