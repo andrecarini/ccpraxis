@@ -14,6 +14,12 @@ Your contracted slice — read ONLY this, do not wander the repo:
 
 Verify each done-criterion against disk evidence — the file exists and contains what the criterion requires; the package's own tests pass (run them; read-only). A criterion backed by missing evidence, a placeholder, or a test that doesn't actually assert it is **not met**.
 
+Waiting discipline: if you launch any long-running check, use `run_in_background`, end your turn,
+and resume on the completion notification — never re-invoke a tool to poll it, and never loop
+checking a result or sentinel file; read it once. You inherit this discipline on a much thinner
+budget than a coordinator — `max_turns: 20` and a 1800s timeout — and a poll loop here means you
+time out before ever writing a verdict.
+
 When done, Write your verdict — and ONLY your verdict — as the JSON object specified in your contract to this exact path:
 
   `{{VERDICT_PATH}}`

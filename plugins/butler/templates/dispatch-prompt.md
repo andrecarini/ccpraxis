@@ -13,4 +13,9 @@ Operating facts:
 - If the ledger already shows progress, this is a resumption: verify every recorded output actually exists on disk, then continue from "Next action". Never redo verified work; never trust a prior claim you didn't re-verify from disk.
 - Project conventions (validation commands, language rules, commit policy) live in the project's CLAUDE.md — you load it automatically; honor it.
 
+Waiting discipline binds you exactly as it binds the protocol you just read: launch long-running
+work with `run_in_background`, end your turn, and resume on the completion notification — never
+re-invoke a tool to poll it. See the "Waiting discipline" section of `coordinator-protocol/SKILL.md`
+for the prohibited polling shapes `b15`'s hook denies.
+
 Begin now: read the three files, update the ledger status to `running` with a fresh `last_updated`, write your first "Next action", and execute the protocol.

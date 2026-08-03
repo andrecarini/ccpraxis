@@ -108,6 +108,50 @@ than silent**:
 
 Never trust a worker's claim of success. After every write-capable worker returns: confirm the files exist, then **run the validation yourself** (analyzer, targeted tests — the project's CLAUDE.md defines the commands). Record commands + exit codes in `## Outputs`. The same rule protects you after resumption: verify recorded outputs exist before continuing.
 
+### Waiting discipline — the positive pattern
+
+You will spend most of your turns either dispatching long-running work or running validation.
+Getting the *awaiting* half wrong is how a coordinator burns an entire turn budget producing
+nothing: a field package once grep-looped on a sentinel that had existed for over an hour, was
+warm-relaunched four times, and its work was already green the whole time.
+
+**The pattern: launch in the background, end the turn, resume on the notification.** When you
+start work you cannot get an answer from within a few seconds — a long build, a long-running
+script, anything you'd otherwise be tempted to sit and watch — launch it with
+`run_in_background`, then **end your turn**. Do not re-invoke a tool to check on it, do not poll
+its output, do not watch it grow. The completion notification comes back to you on its own, in a
+later turn, and that is when you resume. You are notified when it completes — you never have to
+go looking.
+
+**Foreground is the documented default for validation.** Anything that finishes in a couple of
+minutes or less — your test suite, `bp-ledger.pl` calls, a lint pass — belongs in the
+**foreground**, run inline, its result read once. The arithmetic is why this is the rule rather
+than a style preference: a 160s foreground suite run inline costs exactly **one turn** — invoke
+it, read the exit code, move on. The identical suite, awaited instead by polling, cost one
+coordinator **96 turns of a 100-turn budget** on a repeated `cat .../tasks/<id>.output` against a
+target that never changed. One turn versus 96 turns for the same piece of work: foreground when
+the wait is short, background-plus-notification when it isn't, and a loop in between is never the
+right shape for either.
+
+**The prohibited shapes — named concretely, so you recognize them before you type them:**
+- `while [ ! -s <file> ]; do sleep …; done` — a sentinel spin.
+- `until grep -q <pattern> <file>; do sleep …; done` — a grep spin.
+- `echo "waiting..."` inside any loop.
+- any `sleep`-based spin built around a condition.
+- repeated `cat` or `TaskOutput` calls against the same output or sentinel file, re-reading it to
+  watch it grow.
+
+Every one of these is mechanically DENIED by `b15`'s `wait-shape-guard.sh` hook
+(`plugins/butler/hooks/wait-shape-guard.sh`) before it ever runs — you will get a `BLOCKED:`
+message back. Learn the boundary from this document, not from that message mid-run: once denied,
+the fix is never a cleverer loop, it's launch-and-end-turn instead.
+
+**Check the sentinel once, never in a loop.** Every field instance of this pathology was waiting
+on something **already complete** — a sentinel file that had existed for over an hour, artifacts
+already sitting on disk, a suite that was already green — the whole time it polled. So: read the
+result **once**. If it's there, proceed. If it isn't yet, end the turn and resume on the
+completion notification; never check again in the same turn, and never in a loop.
+
 ## Fast test I/O — heavy artifacts on container-native storage
 
 Your project dir is a **bind mount**. On Windows/WSL2 that is a 9p filesystem, and every per-file syscall costs an order of magnitude more than it does on the container's own overlay FS. `node_modules` is the pathological case — hundreds of thousands of small files, ~95% of them under `node_modules/.pnpm`. It is the difference between a 30-second install and a 15-minute one, on every attempt of your convergence loop.
