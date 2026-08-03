@@ -4,6 +4,16 @@ blueprint: <blueprint-name>
 status: pending
 model: sonnet
 max_turns: 80
+# worker_backend: claude              <!-- optional; claude (default) | opencode -- b32, coordinator's
+#   Task-vs-Bash dispatch choice. Read by bp-worker.pl. -->
+# worker_models:                      <!-- optional; b35. Non-coordinator worker MODEL preference,
+#   distinct from `model:` above (which stays the coordinator's Claude model -- never overload it).
+#   Lists are fallback ladders, most-specific-wins: role-in-this-ledger > default-in-this-ledger >
+#   role-in-blueprint.md > default-in-blueprint.md > built-in (opencode/big-pickle). Resolved by
+#   bp-worker-models.pl; absent/empty is NOT an error. Example:
+#   worker_models:
+#     default:        [opencode/big-pickle]
+#     bp-implementer: [opencode/big-pickle, opencode/some-fallback]
 write_set: <colon-separated patterns, trailing / = prefix>
 test_paths: <colon-separated patterns>
 last_updated: <ISO timestamp>

@@ -370,6 +370,31 @@ my $prompt_file = $opt{prompt_file};
 my $model = $opt{model};
 
 # ---------------------------------------------------------------------------
+# 8a. b35: if the caller did not pin a --model, consult bp-worker-models.pl's
+# worker_models: cascade (package ledger -> blueprint -> built-in) for a
+# default, rather than leaving model selection entirely to the backend.
+# ADDITIVE only: an explicit --model always wins, and any failure to resolve
+# (script absent, ledger/blueprint missing, non-zero exit) is silently
+# ignored -- this must never turn a working dispatch into a failing one.
+# ---------------------------------------------------------------------------
+if (!(defined $model && length $model) && $backend eq 'opencode') {
+    (my $models_bin = "$Bin/bp-worker-models.pl") =~ s{\\}{/}g;
+    if (-f $models_bin) {
+        my $resolved = eval {
+            local $SIG{ALRM} = sub { die "timeout\n" };
+            alarm(5);
+            my $out = `"$^X" "$models_bin" resolve --role "bp-$SHORT" --package-ledger "$PKG_LEDGER_FILE" --blueprint "$BLUEPRINT_FILE" 2>/dev/null`;
+            alarm(0);
+            $out;
+        };
+        alarm(0);
+        if (defined $resolved && $resolved =~ /^model:\s*(\S+)\s*$/m) {
+            $model = $1;
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
 # 8b. --turn-budget (§2.1): materialise a per-dispatch copy of the OpenCode
 # agent file with `steps:` overridden, and point the dispatch at it. Shipped
 # agents already carry a per-role default `steps` (mirroring the Claude
