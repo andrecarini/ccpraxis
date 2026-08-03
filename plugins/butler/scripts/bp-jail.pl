@@ -216,6 +216,37 @@ sub chroot_bin {
          : 'chroot';
 }
 
+# --- b36: environment scrubbing at the jail boundary.
+#
+# The chroot isolates the FILESYSTEM. That is how b33 keeps the Claude credential away
+# from a jailed worker: `claude-home/.credentials.json` is simply unreachable on disk
+# (t/80 C1 asserts exactly that). It does NOT isolate the ENVIRONMENT — exec() inherits
+# the parent's %ENV wholesale, and nothing in this file has ever touched %ENV except to
+# READ BP_PROJECT_ROOT/BP_WRITE_SET.
+#
+# That was harmless while b33's verified premise held: OpenCode needed no credential, so
+# there was no OpenCode secret anywhere to inherit. b36 breaks that premise. It puts a
+# whole-session opencode.ai browser cookie into the coordinator's environment, and a
+# coordinator that polls spend and then dispatches a jailed worker would hand the cookie
+# through verbatim. Spend polling is a coordinator concern; a worker never needs it.
+#
+# ⚠ This is a DENYLIST, and a denylist does not generalise: the next secret added to a
+# coordinator's environment leaks by default, because the default here is "inherit". The
+# general fix is an ALLOWLIST at this boundary. That changes what every existing worker
+# can see — real blast radius across every package — so it is a design decision that is
+# ESCALATED to the operator, not taken here. See the b36 ledger.
+our @JAIL_ENV_DENYLIST = qw(
+    OPENCODE_AUTH_COOKIE
+    OPENCODE_GO_AUTH_COOKIE
+);
+
+# Called in the forked child immediately before exec, so the parent's own environment is
+# untouched — the coordinator still needs the cookie to poll spend.
+sub scrub_jail_env {
+    delete $ENV{$_} for @JAIL_ENV_DENYLIST;
+    return;
+}
+
 sub probe_proc_self_status {
     my ($jail_root) = @_;
     my $pid = fork();
@@ -415,6 +446,7 @@ sub action_run {
     my $pid = fork();
     io_exit("fork: $!") unless defined $pid;
     if ($pid == 0) {
+        scrub_jail_env();
         exec(chroot_bin(), "--userspec=$uid:$gid", $jail_root, @$cmd)
             or POSIX::_exit(127);
         POSIX::_exit(126);
