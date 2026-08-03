@@ -63,6 +63,8 @@ use SandboxLock ();       # 04-build-race-lock: generalised mkdir lock + global 
 use JSON::PP ();          # parse backpack.json + write the approved install-set
 use File::Path qw(make_path);
 use File::Spec;
+use File::Temp ();        # s17: STDERR capture destination while the alt-screen is owned --
+                           # a REAL file (never an in-memory scalar; Git-for-Windows landmine)
 use Fcntl qw(O_WRONLY O_CREAT O_EXCL O_NOFOLLOW);  # symlink-safe corrupt-config backup (redteam C1)
 use Digest::MD5 qw();
 use POSIX qw(strftime);
@@ -761,6 +763,14 @@ my $LAUNCH_LOG;
 my $LAUNCH_ID = strftime("%Y%m%dT%H%M%SZ", gmtime()) . "-$$";
 sub log_ev { LaunchLog::event($LAUNCH_LOG, @_) }
 
+# s17-statusline-and-output-hygiene (spec S3): file-scope so BOTH the
+# enter_dashboard raw-mode closures AND the file-scope $SIG{INT}/$SIG{TERM}/
+# END handlers below can restore the process's own STDERR -- including on
+# the signal/abnormal-exit path, not only the clean leave_raw path.
+my $STDERR_CAPTURE_SAVED;   # dup'd original STDERR filehandle, while redirected
+my $STDERR_CAPTURE_FH;      # File::Temp filehandle currently receiving STDERR
+my $STDERR_CAPTURE_PATH;    # File::Temp path currently receiving STDERR
+
 # s13-activity-history: read-side caps for aggregating recent activity across
 # restarts. See LaunchLog::recent_logs / merge_sessions and _history_events
 # (below) for how these compose (spec S2.4a / S2.6).
@@ -778,6 +788,25 @@ my $HISTORY_SPAN_TEXT_MAX  = 200;  # bytes-per-span clamp applied to HISTORY row
 # orchestrator.log, mirroring the $HISTORY_* idiom immediately above.
 my $ORCH_TAIL_LINES        = 200;  # lines tailed from orchestrator.log per tick
 my $ORCH_EVENTS_PER_LOG    = 10;   # parsed events kept from orchestrator.log per tick
+
+# s17-statusline-and-output-hygiene: the render loop's per-tick container
+# poll (podman inspect + two execs) was the only recurring fork on the
+# render path, firing every 10s. Lengthened and cached behind this named,
+# greppable, tunable constant rather than a bare literal (spec S4) --
+# bounded to <=120s so a container state change is still reflected within
+# one poll interval; "poll never" is not a fix.
+my $CONTAINER_POLL_SECONDS = 20;
+
+# s17-statusline-and-output-hygiene (spec S5): the ONE heartbeat/tick
+# predicate, called from BOTH _history_events (below) and the
+# current-session gather closure inside enter_dashboard. Extracted from
+# _history_events' former inline regex so the two call sites can never
+# drift into independently-maintained copies.
+sub _is_heartbeat_line {
+    my ($line) = @_;
+    return 0 unless defined $line;
+    return $line =~ /"type"\s*:\s*"(?:heartbeat|tick)"/ ? 1 : 0;
+}
 
 # A non-empty backpack-install warning (set during the setup pass) that the
 # dashboard renders as a red alert banner — so a failure isn't lost behind the
@@ -1021,9 +1050,13 @@ sub _rmtree {
 # exec path calls SandboxLock::release explicitly before exec.
 # release_all() frees BOTH the per-project lock AND the global image-build
 # lock if it happens to be held at signal time.
-$SIG{INT}  = sub { log_ev('signal', { sig => 'INT' });  _keepawake_release_global(); LaunchLog::close_log($LAUNCH_LOG); _close_transcript(); SandboxLock::release_all(); reset_terminal(); exit 130 };
-$SIG{TERM} = sub { log_ev('signal', { sig => 'TERM' }); _keepawake_release_global(); LaunchLog::close_log($LAUNCH_LOG); _close_transcript(); SandboxLock::release_all(); reset_terminal(); exit 143 };
-END { _keepawake_release_global(); LaunchLog::close_log($LAUNCH_LOG); _close_transcript(); SandboxLock::release_all() }
+# s17: each of INT/TERM/END also restores STDERR (open() back onto the
+# dup'd original filehandle) if enter_raw had it redirected -- the
+# signal/abnormal-exit path must not leave the terminal with a redirected
+# STDERR after the dashboard closes.
+$SIG{INT}  = sub { open(STDERR, '>&', $STDERR_CAPTURE_SAVED) if $STDERR_CAPTURE_SAVED; log_ev('signal', { sig => 'INT' });  _keepawake_release_global(); LaunchLog::close_log($LAUNCH_LOG); _close_transcript(); SandboxLock::release_all(); reset_terminal(); exit 130 };
+$SIG{TERM} = sub { open(STDERR, '>&', $STDERR_CAPTURE_SAVED) if $STDERR_CAPTURE_SAVED; log_ev('signal', { sig => 'TERM' }); _keepawake_release_global(); LaunchLog::close_log($LAUNCH_LOG); _close_transcript(); SandboxLock::release_all(); reset_terminal(); exit 143 };
+END { open(STDERR, '>&', $STDERR_CAPTURE_SAVED) if $STDERR_CAPTURE_SAVED; _keepawake_release_global(); LaunchLog::close_log($LAUNCH_LOG); _close_transcript(); SandboxLock::release_all() }
 
 SandboxLock::acquire($LOCK_DIR, windows => $WINDOWS_FAMILY) or do {
     print STDERR "ERROR: another claude-sandbox is doing setup for this project (lock held > 10s at $LOCK_DIR).\n";
@@ -3576,6 +3609,22 @@ sub enter_dashboard {
             print STDOUT "\e[22;0t";                # XTPUSHTITLE: push icon+window title onto the stack
             print STDOUT "\e[?1049h\e[?25l";        # alt-screen + hide cursor
             print STDOUT "\e]0;" . Dashboard::window_title({ project_name => $PROJECT_NAME }) . "\a";
+            # s17-statusline-and-output-hygiene (spec S3): while the alt-screen
+            # owns the terminal, a runtime-emitted warn/die (e.g. perl's own
+            # "Can't fork, trying again in 5 seconds") must not splatter across
+            # the live frame. _heartbeat_once's `2>&1` only catches a CHILD's
+            # stderr -- this is the PARENT's OWN STDERR, so redirect the real
+            # filehandle for the duration the alt-screen is owned. Captured
+            # STDERR text is logged (not dropped): a real File::Temp file, NEVER
+            # an in-memory scalar (Git-for-Windows perl: open() onto \$scalar
+            # dies "Bad file descriptor").
+            eval {
+                open($STDERR_CAPTURE_SAVED, '>&', \*STDERR) or die "dup STDERR: $!";
+                ($STDERR_CAPTURE_FH, $STDERR_CAPTURE_PATH) =
+                    File::Temp::tempfile('ccpraxis-stderr-XXXXXX', TMPDIR => 1, UNLINK => 0);
+                open(STDERR, '>', $STDERR_CAPTURE_PATH) or die "redirect STDERR: $!";
+                STDERR->autoflush(1);
+            };
         },
         leave_raw => sub {
             # red-team MINOR-1: a second Ctrl-C during teardown can re-enter
@@ -3593,6 +3642,36 @@ sub enter_dashboard {
             }
             print STDOUT "\e[?25h\e[?1049l";        # show cursor + leave alt-screen
             eval { Term::ReadKey::ReadMode('restore') };
+            # s17: restore the process's own STDERR before the alt-screen
+            # teardown finishes, so the terminal is never left with a
+            # redirected STDERR after the dashboard closes (the
+            # signal/abnormal-exit half is covered separately by
+            # $SIG{INT}/$SIG{TERM}/END at file scope).
+            if ($STDERR_CAPTURE_SAVED) {
+                eval { close(STDERR); open(STDERR, '>&', $STDERR_CAPTURE_SAVED); STDERR->autoflush(1); };
+                close($STDERR_CAPTURE_SAVED) if $STDERR_CAPTURE_SAVED;
+                $STDERR_CAPTURE_SAVED = undef;
+            }
+            # STDERR captured while the alt-screen was up is not lost: it is
+            # logged via the same shared, timestamped log_ev writer, and a
+            # visible-but-non-destructive indicator (a plain post-alt-screen
+            # line, painted only after \e[?1049l above already restored the
+            # normal screen) tells the operator something was captured/logged.
+            if (defined $STDERR_CAPTURE_PATH && -s $STDERR_CAPTURE_PATH) {
+                my $captured = '';
+                if (open(my $rf, '<', $STDERR_CAPTURE_PATH)) {
+                    local $/;
+                    $captured = <$rf> // '';
+                    close($rf);
+                }
+                if (length $captured) {
+                    log_ev('stderr_captured', { text => substr($captured, 0, 4000) });
+                    print STDOUT "\e[33m[output was captured while the dashboard was open -- see launch log]\e[0m\n";
+                }
+                unlink($STDERR_CAPTURE_PATH);
+            }
+            $STDERR_CAPTURE_PATH = undef;
+            $STDERR_CAPTURE_FH   = undef;
             reset_terminal();
         },
         read_key  => sub {
@@ -3649,7 +3728,7 @@ sub enter_dashboard {
         },
         heartbeat => \&_heartbeat_once,
         gather    => sub {
-            # podman inspect is comparatively expensive; cache it ~10s so the
+            # podman inspect is comparatively expensive; cache it ~$CONTAINER_POLL_SECONDS so the
             # input loop stays responsive. The cheap log tail refreshes every
             # state interval. (B3 may make the inspect fully async.)
             my $now = time;
@@ -3658,7 +3737,7 @@ sub enter_dashboard {
             # must not skip container-start off a cached 'running' for a
             # container that died inside the throttle window.
             my $probed_now = 0;
-            if ($now - $last_inspect >= 10) {
+            if ($now - $last_inspect >= $CONTAINER_POLL_SECONDS) {
                 my $s = `$PODMAN inspect --format '{{.State.Status}}' "$CONTAINER_NAME" 2>/dev/null`;
                 chomp $s if defined $s;
                 $cached_status = (defined $s && length $s) ? $s : 'unknown';
@@ -3717,6 +3796,12 @@ sub enter_dashboard {
             # Run panel (so the view never re-derives the freshness threshold).
             my $stay = KeepAwake::should_stay_awake($busy_age, $BUSY_STALE) ? 1 : 0;
             my @lines = _tail_lines($log_path, 200);
+            # s17-statusline-and-output-hygiene (spec S5): the history path's
+            # heartbeat/tick filter was HISTORY-only by design -- absent here,
+            # so a live session showed heartbeat/tick noise (the operator's
+            # screenshot). Same shared predicate as _history_events, applied
+            # BEFORE Dashboard::recent_events sees @lines.
+            @lines = grep { !_is_heartbeat_line($_) } @lines;
             my $cur   = Dashboard::recent_events(\@lines, $ACTIVITY_EVENT_MAX);
             # s16-fleet-event-source: fold the active blueprint run's
             # orchestrator.log into the SAME activity panel (SYN-5 -- not a
@@ -4449,7 +4534,7 @@ sub _history_events {
             # applies, so the events kept are the ones that explain the session
             # rather than N heartbeats from a long-lived run. Current-session live
             # tail (the gather callback's own @lines / $cur) is untouched.
-            @lines = grep { !/"type"\s*:\s*"(?:heartbeat|tick)"/ } @lines;
+            @lines = grep { !_is_heartbeat_line($_) } @lines;
             my $ev = Dashboard::recent_events(\@lines, $HISTORY_EVENTS_PER_LOG);
             if (ref $ev eq 'ARRAY') {
                 # HISTORY-only: clamp bytes-per-span so a planted oversized field

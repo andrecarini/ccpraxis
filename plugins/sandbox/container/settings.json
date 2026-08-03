@@ -14,6 +14,7 @@
       "frontend-design@claude-plugins-official" : true
    },
    "env" : {
+      "CCPRAXIS_SANDBOX" : "1",
       "CLAUDE_AUTO_BACKGROUND_TASKS" : "1",
       "CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR" : "0",
       "CLAUDE_CODE_ENABLE_AWAY_SUMMARY" : "1",

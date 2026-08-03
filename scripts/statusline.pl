@@ -40,6 +40,15 @@ $short =~ s/\s*\(\d+[kKmM]\s*context\)//;
 my $workspace = $data->{workspace}{current_dir} // '';
 my $project   = $workspace ? basename($workspace) : '?';
 
+# ── Sandbox indicator ─────────────────────────────────────────
+# CCPRAXIS_SANDBOX is set ONLY by container/settings.json's `env` block, so
+# this script is otherwise byte-identical in behaviour on the host, where
+# the var is never set (see s17 spec S1: this file is also the payload
+# installed to the user's ~/.claude/statusline.pl and used on the host).
+my $SANDBOX_ON    = $ENV{CCPRAXIS_SANDBOX} ? 1 : 0;
+my $SANDBOX_COLOR = rgb(250, 204, 21);  # amber
+my $sandbox_badge = $SANDBOX_ON ? "${SANDBOX_COLOR}\x{1F4E6} SANDBOX${R}" : '';
+
 # ── Git (with background fetch every 30 min) ────────────────
 my $git_str = '';
 eval {
@@ -276,9 +285,31 @@ if ($rl) {
 # ── Output (single line if it fits, wrap if not) ─────────────
 sub vlen { my $s = shift; $s =~ s/\033\[[^m]*m//g; length($s) }
 
+# truncate_display($text, $max) -> $text, shortened with a trailing marker
+# if it would exceed $max visible columns. Never wraps, never overflows.
+# ASCII marker (not a multi-byte ellipsis glyph): keeps a 1-visible-char
+# budget exactly equal to a 1-byte budget, so callers measuring raw bytes
+# (rather than decoded characters) still see the same bound honoured.
+sub truncate_display {
+    my ($text, $max) = @_;
+    $max = 1 if $max < 1;
+    return $text if length($text) <= $max;
+    return substr($text, 0, $max) if $max <= 1;
+    return substr($text, 0, $max - 1) . '>';
+}
+
 my $cols = `tput cols 2>/dev/null`; chomp $cols; $cols ||= 120;
 
-my $line1 = "${PROJECT}${B}${project}${R}";
+# Project name must truncate gracefully rather than break layout. Reserve
+# room for the sandbox badge (plus its separator) when present, so the
+# combined project+badge segment never overflows $cols.
+my $badge_reserve = $sandbox_badge ? (vlen($sandbox_badge) + vlen($SEP)) : 0;
+my $project_avail = $cols - $badge_reserve;
+$project_avail = 1 if $project_avail < 1;
+my $project_disp = truncate_display($project, $project_avail);
+
+my $line1 = "${PROJECT}${B}${project_disp}${R}";
+$line1 .= "${SEP}${sandbox_badge}" if $sandbox_badge;
 $line1 .= "${SEP}${git_str}" if $git_str;
 $line1 .= "${SEP}${plans_str}" if $plans_str;
 
