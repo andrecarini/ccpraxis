@@ -33,6 +33,45 @@ this guard and the rest of the launcher can never disagree about what is install
 candidates: passing it can add a protected root, but it cannot make the guard read a file — see "Which
 home candidates may name a source" below.
 
+### Where the user-configured extra list is read from (`q05`)
+
+**`~/.claude/ccpraxis-protected-paths.json`, from the authoritative home, and nowhere else.**
+`CLAUDE_CONFIG_DIR` does **not** relocate it.
+
+Earlier help text advertised it as `${CLAUDE_CONFIG_DIR:-~/.claude}/ccpraxis-protected-paths.json`,
+and `q05` initially "fixed" the code to match that promise. That was wrong, and `q03`'s `t/53`
+(AC-57/AC-58) caught it. The corrected promise is what shipped.
+
+The reasoning matters, because the mistake is an easy one to repeat. It is tempting to argue that the
+extra list is **add-only** — it can only ever contribute *more* protected roots — and therefore that
+letting an environment variable name it fails safe. That is true of the list's **contents** and false
+of its **location**. Redirecting *where* the list is read from means the user's real list is never
+read at all: **fewer** protected roots, **fewer** refusals, failing **open**. That is exactly the
+"silently void the user list" failure `q03`'s Decision #5 pinned this path to prevent, and it is why
+`q04` dropped `CLAUDE_CONFIG_DIR` (and `USERPROFILE`) from the trusted **source** set, with
+measurements.
+
+So the asymmetry in this document is deliberate and holds in both directions:
+
+| variable | may contribute a protected **root** | may name a **source** the guard reads |
+|---|---|---|
+| `CLAUDE_CONFIG_DIR` | yes | **no** |
+| `HOME` | yes (hardened via the authoritative-home seam) | yes |
+| `USERPROFILE` | yes | **no** |
+
+### The `HOME` residue is closed (`q05`, supersedes `q04`'s "Known limitation")
+
+`q04` recorded a known limitation: the launcher built `registry_path` and `extra_list_path` from
+`$HOME/.claude` *before* the authoritative-home seam existed, so redirecting `HOME` still dropped
+every `marketplace-install` / `marketplace-source` root and the user's own extra list. That residue is
+now closed — both keys are derived **through** the seam at the call site, so a redirected `HOME`
+cannot move them.
+
+`USERPROFILE` is hardened in the seam **only when `HOME` is absent or empty** — precisely the case
+where `home_dir()` falls through to it and it would otherwise move the whole protected set. When
+`HOME` is present, `USERPROFILE` is an ordinary key and passes through unchanged, which is what
+`q03`'s AC-54 asserts and what `q04`'s source-set design assumes.
+
 **Every root is resolved, not merely normalised.** Each candidate root is put through the same
 resolution the target already gets (the launcher `abs_path`s the project path before asking), so a
 protected root reached through a symlink is matched rather than missed. If `~/.claude` is a symlink

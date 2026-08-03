@@ -293,7 +293,38 @@ sub _pp_env_seam {
     $env_hashref //= {};
     return sub {
         my ($key) = @_;
+        # Item 1 (D5): USERPROFILE is home_dir()'s own fallback for HOME
+        # (see home_dir() above), so a seam that hardened only HOME left a
+        # live variant of the exact CRITICAL-1 bypass it exists to close:
+        # setting USERPROFILE to a decoy on a host with no HOME set would
+        # still collapse the protected set. Every OTHER key still falls
+        # through unchanged to the raw hash below (this must never become a
+        # blanket override).
+        #
+        # NOTE ON WORDING: t/53's AC-11 (R-I2) greps this whole region for a
+        # short list of I/O verbs followed by a space or paren, and for a
+        # backtick, to prove the sentinel region performs no I/O. That grep
+        # cannot tell code from prose, so ordinary English in a COMMENT can
+        # trip it -- it did, twice, while this package was being written.
+        # Keep comments in this region free of those verbs and of backticks.
         if (defined $key && $key eq 'HOME') {
+            return $authoritative_home
+                if defined $authoritative_home && length $authoritative_home;
+        }
+        # USERPROFILE is hardened ONLY when it would actually act as
+        # home_dir()'s fallback -- that is, when HOME is absent or empty in the
+        # supplied hash. That is precisely the exposed case, and no other.
+        #
+        # Scoping it this narrowly is deliberate and reconciles two contracts
+        # that a blanket rule would have put in conflict. q03's AC-54 asserts
+        # USERPROFILE passes through unchanged, and q04 built its source-set
+        # design on the recorded fact that this seam hardens HOME specifically.
+        # Both fixtures supply HOME, so both still hold. Meanwhile the finding
+        # this closes -- USERPROFILE standing in for an absent HOME and moving
+        # the whole protected set -- is closed, because that case is exactly
+        # when HOME is missing.
+        if (defined $key && $key eq 'USERPROFILE'
+            && !(defined $env_hashref->{HOME} && length $env_hashref->{HOME})) {
             return $authoritative_home
                 if defined $authoritative_home && length $authoritative_home;
         }
@@ -317,7 +348,12 @@ installed plugin tree Claude Code is loading from.},
 known_marketplaces.json. Claude Code loads plugins straight out of it, so it
 is live installed code, not a checkout.},
         'user-configured' => q{That path is in your own protected-paths list at
-${CLAUDE_CONFIG_DIR:-~/.claude}/ccpraxis-protected-paths.json.},
+~/.claude/ccpraxis-protected-paths.json.
+
+The guard reads that list from your real home directory only. CLAUDE_CONFIG_DIR
+does not relocate it: a list read from a directory named by one environment
+variable could be pointed elsewhere, and the guard would then silently stop
+reading your real list - fewer protections, not more.},
         'drive-root' => q{A filesystem root contains every file on the volume - your home directory,
 Claude Code's configuration, and every other project on the machine. Putting
 all of that inside a container read-write is never what a sandbox is for, and
@@ -367,7 +403,8 @@ claude-sandbox there, or pass it explicitly:
   claude-sandbox <your-project-dir>
 
 If that entry was added by mistake, remove it from
-${CLAUDE_CONFIG_DIR:-~/.claude}/ccpraxis-protected-paths.json.};
+~/.claude/ccpraxis-protected-paths.json - your real home directory, which is the
+only place this list is read from (CLAUDE_CONFIG_DIR does not relocate it).};
     }
 
     return q{Open the specific project directory you meant to work in - cd into it and run
@@ -457,13 +494,29 @@ sub protected_path_outcome {
     if (defined $opts->{live_install_hint} && length $opts->{live_install_hint}) {
         my $hint_n = normalize_path($opts->{live_install_hint});
         if (defined $hint_n) {
-            my $dup = grep { $_->{reason} eq 'ccpraxis-install' && $_->{path} eq $hint_n } @roots;
-            unless ($dup) {
-                push @roots, { path => $hint_n, reason => 'ccpraxis-install' };
-                @roots = sort {
-                    ($_PP_REASON_RANK{$a->{reason}} // 99) <=> ($_PP_REASON_RANK{$b->{reason}} // 99)
-                        || $a->{path} cmp $b->{path}
-                } @roots;
+            # Item 5 (D5): route the hint through the same bare-root / home
+            # rejection guard every other candidate root gets at ingestion
+            # (protected_roots' own resolve -> reject -> dedup -> sort
+            # pipeline) before it is ever admitted -- reusing
+            # target_self_codes, the very primitive the module itself uses
+            # to answer "is this path a bare root, or exactly the user's
+            # home", so the two checks can never diverge. Without this, a
+            # hint of '/' or of the user's home was admitted with no
+            # rejection at all and would refuse essentially every target.
+            # (Resolution is deliberately not repeated here: $hint_n is the
+            # launcher's own abs_path(__FILE__) anchor, already resolved
+            # before it ever reaches this sentinel region, which must never
+            # touch the filesystem directly.)
+            my $hint_self_codes = target_self_codes($hint_n, $opts);
+            unless (@$hint_self_codes) {
+                my $dup = grep { $_->{reason} eq 'ccpraxis-install' && $_->{path} eq $hint_n } @roots;
+                unless ($dup) {
+                    push @roots, { path => $hint_n, reason => 'ccpraxis-install' };
+                    @roots = sort {
+                        ($_PP_REASON_RANK{$a->{reason}} // 99) <=> ($_PP_REASON_RANK{$b->{reason}} // 99)
+                            || $a->{path} cmp $b->{path}
+                    } @roots;
+                }
             }
         }
     }
@@ -541,7 +594,20 @@ sub protected_path_outcome {
 # unimplemented on native Windows perl, so this is a guarded no-op there and
 # the seam falls back to the existing $ENV{HOME}-driven behaviour untouched.
 my $CCPRAXIS_AUTH_HOME = eval {
-    if ($WINDOWS_FAMILY) {
+    # Item 2 (D5, the highest-severity finding): a separate, named predicate
+    # for the getpwuid capability, keyed on $^O eq 'MSWin32' ALONE -- never on
+    # the broad Windows-family predicate, which also matches cygwin and msys.
+    # getpwuid is unimplemented only on NATIVE Windows perl; it IS implemented
+    # under cygwin and msys, and Git-for-Windows perl -- how this project
+    # actually runs on Windows -- is msys. Gating on the broad family switched
+    # this mitigation off precisely on the host it was written for.
+    #
+    # Deliberately self-contained, referencing no outer lexical, so this block
+    # stays extractable and independently testable by $^O alone. t/56's C4
+    # asserts structurally that the family predicate's NAME does not appear
+    # here at all, so do not reintroduce it even in a comment.
+    my $getpwuid_capable = $^O ne 'MSWin32';
+    if (!$getpwuid_capable) {
         undef;
     } else {
         my @pw = getpwuid($<);
@@ -549,6 +615,53 @@ my $CCPRAXIS_AUTH_HOME = eval {
     }
 };
 $CCPRAXIS_AUTH_HOME = undef if $@;
+
+# Item 3 (D5): re-derive $CLAUDE_HOST_CONFIG THROUGH THE SEAM here, so a
+# redirected HOME or USERPROFILE cannot move the registry_path/extra_list_path
+# keys built from it below -- registry_path and extra_list_path used to be
+# literals built from $CLAUDE_HOST_CONFIG (itself computed from raw $HOME,
+# before this seam even existed), so $CCPRAXIS_AUTH_HOME never applied to
+# them and redirecting HOME still dropped every marketplace-install /
+# marketplace-source root and the user's own extra list. Falls back to the
+# existing $CLAUDE_HOST_CONFIG value when no authoritative home is available
+# (e.g. native Windows perl, where getpwuid is a no-op) -- unchanged
+# behaviour there.
+$CLAUDE_HOST_CONFIG = do {
+    my $h = _pp_env_seam(\%ENV, $CCPRAXIS_AUTH_HOME)->('HOME');
+    defined $h && length $h ? "$h/.claude" : $CLAUDE_HOST_CONFIG;
+};
+
+# Item 4 (D5) -- RULING REVERSED 2026-08-03 after reading q04's recorded
+# reasoning. q05's ledger framed this as "a documented contract the code does
+# not honour": the help text promises the extra list at
+# ${CLAUDE_CONFIG_DIR:-~/.claude}/ccpraxis-protected-paths.json while the code
+# pins it to the authoritative home. The first fix here honoured
+# CLAUDE_CONFIG_DIR. That was WRONG, and t/53 caught it (AC-57, AC-58).
+#
+# ProtectedPaths.pm records the opposite decision, with measurements: a
+# directory named VERBATIM by a single environment variable is NOT a trusted
+# source, so CLAUDE_CONFIG_DIR and USERPROFILE were deliberately dropped from
+# the source set, because trusting them "re-opened the hole q03 closed by
+# pinning extra_list_path" and additionally caused a C6 regression that
+# refused a legitimate ccpraxis clone for an ordinary user with no attacker
+# involved.
+#
+# The reasoning that made honouring it look safe was that the extra list is
+# add-only, so it can only ever ADD refusals. That is true of the list's
+# CONTENTS and false of its LOCATION: redirecting WHERE the list is read from
+# means the user's real list is never read at all -- fewer protected roots,
+# fewer refusals, failing OPEN. That is exactly the "silently void the user
+# list" failure q03's Decision #5 pinned this path to prevent.
+#
+# So the code is right and the PROMISE is what was wrong. The help text and
+# docs/protected-paths.md are corrected instead; the path stays pinned to the
+# authoritative home, which item 3 above now derives through the seam.
+#
+# Kept as a LITERAL in the call block below rather than hoisted into a
+# variable: t/53's AC-57 and AC-58 read the call block's own text to prove
+# both keys are pinned to the same authoritative-home prefix, and a variable
+# defeats that check even when the value is identical. The pin is meant to be
+# visible at the call site.
 
 {
     my $pp = protected_path_outcome($PROJECT_PATH, {
