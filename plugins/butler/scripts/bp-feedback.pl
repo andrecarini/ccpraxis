@@ -33,6 +33,8 @@ use Errno qw(EEXIST);
 use File::Path qw(make_path);
 use File::Spec;
 use Cwd qw(getcwd abs_path);
+use IO::Handle;
+use Encode qw(decode);
 
 # ---------------------------------------------------------------------------
 # Usage / help
@@ -198,8 +200,24 @@ if (@positional) {
 } else {
     binmode STDIN;
     local $/ = undef;
+    $! = 0;
     $body = <STDIN>;
+    # R18: a pipe closing early because its producer died mid-write is
+    # ordinarily indistinguishable from a short, complete message — Perl's
+    # readline can't tell "closed" from "EOF". The one case it CAN surface is
+    # a genuine read error (e.g. EIO), which leaves $body undef/partial with
+    # $! set; a clean EOF (including on an empty pipe) never sets $!. Catch
+    # that one distinguishable case loudly rather than silently keeping
+    # whatever partial bytes arrived.
+    if (!defined($body) && $!) {
+        _fail(4, "[stdin read error]: $!");
+    }
     $body = '' unless defined $body;
+    # R18: emit the captured byte count so a caller piping into this tool has
+    # something to sanity-check the volume against what it sent — the cheap
+    # observability half of the mitigation for the truncation cases (e.g. a
+    # producer killed mid-pipe) that cannot be detected structurally.
+    print STDERR 'bp-feedback: captured ' . length($body) . " bytes from stdin\n";
 }
 
 # F6: no content at all (incl. whitespace-only).
@@ -224,10 +242,16 @@ if ($body =~ /([\x00-\x08\x0B\x0C\x0E-\x1F\x7F])/) {
         $byte, $offset));
 }
 
-# F8: UTF-8 validity, checked on a copy so $body stays the untouched raw bytes.
+# F8: UTF-8 validity, checked on a copy so $body stays the untouched raw
+# bytes. R10: utf8::decode accepts Perl's own extended internal utf8 (lone
+# surrogates, 5/6-byte sequences, code points above U+10FFFF) — a superset of
+# RFC 3629 — so it under-enforces this gate; Encode's FB_CROAK mode is strict
+# RFC 3629 and rejects all of those while still accepting everything
+# utf8::decode already correctly refused (overlong forms, truncated
+# sequences, Latin-1 high bytes).
 {
     my $copy = $body;
-    my $ok = eval { utf8::decode($copy) };
+    my $ok = eval { decode('UTF-8', $copy, Encode::FB_CROAK); 1 };
     unless ($ok) {
         _fail(5, '[input is not valid UTF-8]; nothing written');
     }
@@ -363,6 +387,15 @@ sub _next_start_number {
     opendir(my $dh, $dir) or return 1;
     for my $ent (readdir $dh) {
         next unless $ent =~ /^feedback-(\d+)\.txt$/;
+        # R9: a suffix long enough to overflow into floating point (e.g. a
+        # hand-planted feedback-99999999999999999999.txt) would otherwise
+        # both (a) be re-stringified as "1e+20", writing a filename that
+        # violates this tool's own ^feedback-(\d+)\.txt$ contract, and (b)
+        # make every later $n++ a silent no-op once $n itself is that NV,
+        # permanently denying capture into the batch. 15 digits stays well
+        # inside the exact-integer range of both a 64-bit IV and an NV
+        # (< 2**53), so no realistic count is excluded.
+        next if length($1) > 15;
         my $k = $1 + 0;
         $max = $k if $k > $max;
     }
@@ -397,6 +430,28 @@ while ($tries < 1000) {
 unless ($reserved) {
     _fail(4, "[could not reserve a free feedback-$n.txt] in $batch_dir after 1000 attempts");
 }
+
+my $tmp = "$final.tmp.$$";
+
+# R16: a signal in the write window (operator Ctrl-C, a harness timeout, an
+# orchestrator killing the turn, or SIGXFSZ from a write-size limit) never
+# returns from print/close, so the eval-based cleanup a few lines down can't
+# run. Install the handler immediately after the reservation succeeds — NOT
+# just before the eval — so the reservation-to-header-assembly window (header
+# construction, blueprint scan) is also covered; a signal landing there would
+# otherwise leave the zero-byte placeholder reserved with no handler in
+# place. Catch the everyday signals and perform the same cleanup: unlink the
+# temp file, and unlink $final only if it is still our own zero-byte
+# placeholder. SIGKILL is deliberately left unhandled — that one genuinely
+# cannot be caught, and the spec documents the zero-byte-placeholder-survives
+# degradation for exactly that case.
+my $signal_cleanup = sub {
+    unlink $tmp if -e $tmp;
+    unlink $final if -f $final && !-l $final && -s $final == 0;
+    print STDERR "bp-feedback: [signal] interrupted during write; nothing written\n";
+    exit 4;
+};
+$SIG{INT} = $SIG{TERM} = $SIG{HUP} = $SIG{XFSZ} = $signal_cleanup;
 
 # ---------------------------------------------------------------------------
 # Provenance header — fixed field order Captured / Source / Blueprint, then
@@ -445,8 +500,25 @@ sub _resolve_blueprint {
         my $text = <$fh>;
         close $fh;
         next unless defined $text;
-        if ($text =~ /^\s*status:\s*(.+)$/m) {
-            my $val = $1;
+        # R11: the old check took the FIRST `status:` line anywhere in the
+        # file, in scalar context, with no fence/frontmatter discipline — a
+        # real "status: running" appearing after an earlier example/template
+        # line in the same file was missed entirely (false negative). G5's
+        # authoritative-line intent is: within the file's own fenced
+        # metadata block, the line that actually governs is the LAST one
+        # that matches, not the first. Restrict the scan to the first fenced
+        # code block if one is present (that is where this house format's
+        # metadata lives), then iterate every match with /g and keep the
+        # last one.
+        my $scan = $text;
+        if ($text =~ /^```[^\n]*\n(.*?)\n```/ms) {
+            $scan = $1;
+        }
+        my $val;
+        while ($scan =~ /^\s*status:\s*(.+)$/mg) {
+            $val = $1;
+        }
+        if (defined $val) {
             $val =~ s/#.*$//;
             $val =~ s/^\s+|\s+$//g;
             push @running, $ent if $val eq 'running';
@@ -481,24 +553,6 @@ my $header = join("\n", @header_lines) . "\n";
 # placeholder.
 # ---------------------------------------------------------------------------
 
-my $tmp = "$final.tmp.$$";
-
-# R16: a signal in the write window (operator Ctrl-C, a harness timeout, an
-# orchestrator killing the turn, or SIGXFSZ from a write-size limit) never
-# returns from print/close, so the eval-based cleanup a few lines down can't
-# run. Catch the everyday signals and perform the same cleanup: unlink the
-# temp file, and unlink $final only if it is still our own zero-byte
-# placeholder. SIGKILL is deliberately left unhandled — that one genuinely
-# cannot be caught, and the spec documents the zero-byte-placeholder-survives
-# degradation for exactly that case.
-my $signal_cleanup = sub {
-    unlink $tmp if -e $tmp;
-    unlink $final if -f $final && !-l $final && -s $final == 0;
-    print STDERR "bp-feedback: [signal] interrupted during write; nothing written\n";
-    exit 4;
-};
-$SIG{INT} = $SIG{TERM} = $SIG{HUP} = $SIG{XFSZ} = $signal_cleanup;
-
 my $write_ok = eval {
     # R3: '>' follows symlinks. A pre-planted symlink at the temp-file path
     # (guessable/forceable via $$) would make this write clobber an
@@ -510,6 +564,14 @@ my $write_ok = eval {
     sysopen(my $fh, $tmp, O_WRONLY | O_CREAT | O_EXCL, 0644) or die "open $tmp: $!\n";
     binmode($fh, ':raw');
     print { $fh } $header, "\n", $body or die "print $tmp: $!\n";
+    # R13: nothing forced the temp file's bytes to stable storage before
+    # rename; the caller had already been handed exit 0 and a path on a
+    # system where the write was still only in page cache. sync (fsync(2))
+    # before close closes the one remaining "printed a path, wrote nothing
+    # durable" gap; IO::Handle's sync works on this lexical filehandle
+    # because IO::Handle is loaded above.
+    $fh->flush or die "flush $tmp: $!\n";
+    $fh->sync  or die "sync $tmp: $!\n";
     close($fh) or die "close $tmp: $!\n";
     1;
 };
@@ -551,5 +613,18 @@ unless (rename($tmp, $final)) {
     }
 }
 
-print "$final\n";
+# R8: the capture is durable on disk by this point (rename above has already
+# succeeded) — a broken STDOUT (closed fd, or a downstream reader like
+# `| head -c0` that hangs up early and delivers SIGPIPE) is a reporting
+# failure, not a capture failure, and must not be conflated with the usage
+# error (exit 1) or an undocumented SIGPIPE exit (141) that would make a
+# caller retry and duplicate the capture. Ignore SIGPIPE for this print, and
+# treat any failure to deliver the path as a STDERR-only warning: exit 0
+# either way, because the file is the source of truth by now.
+{
+    local $SIG{PIPE} = 'IGNORE';
+    unless (print "$final\n") {
+        print STDERR "bp-feedback: [stdout] could not print $final: $!\n";
+    }
+}
 exit 0;
