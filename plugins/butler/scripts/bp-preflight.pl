@@ -343,6 +343,106 @@ sub dag_integrity_gate {
                 . ($n ? "; $n dep token(s) auto-normalized (short->full / self-dep)" : ''));
 }
 
+# ---- version-pin drift audit (b46). NOT a platform assumption and NOT a
+# %CHECK entry, for the same reason dag.integrity above isn't one: it's a
+# property of what's pinned right now, not of the platform, so it must not
+# inherit assumptions.json's per-OS skip semantics.
+#
+# REPORTS, NEVER BLOCKS (spec b46 sec1/sec2): a drifted pin must never fail
+# preflight and wedge an unattended fleet over a routine upstream release --
+# so this row is pushed to @rows only, NEVER to @fail, regardless of drift.
+#
+# Env overrides exist so this is testable exactly like repo.usable's
+# BP_PROJECT_ROOT / BP_ALLOW_NO_GIT ladder, without a new CLI flag:
+#   BP_PIN_MANIFEST  - path to a Containerfile-shaped fixture (default: the real one)
+#   BP_PIN_FETCHER   - path to a JSON fixture keyed by package name, each value an
+#                      npm-packument doc ({"time": {...}}) -- see bp-pin.pl's own contract
+#   BP_PIN_NOW       - ISO-8601 or epoch clock override
+# Each pin becomes its OWN `pin.<package>` row (glyph 'ok' for 'current', 'warn'
+# otherwise); a locate/require failure instead falls back to a single `pin.audit` row.
+# Cached live audit. TTL default 24h; BP_PIN_CACHE_TTL=0 forces a live check.
+sub _pin_cache_path {
+    return $ENV{BP_PIN_CACHE} if defined $ENV{BP_PIN_CACHE} && length $ENV{BP_PIN_CACHE};
+    my $tmp = $ENV{TMPDIR} || '/tmp';
+    $tmp =~ s{/+$}{};
+    return "$tmp/.bp-pin-audit-cache.json";
+}
+
+sub pin_audit_rows {
+    my ($deep) = @_;
+    my @rows;
+    my $have_fetcher_override = defined $ENV{BP_PIN_FETCHER} && length $ENV{BP_PIN_FETCHER};
+
+    # A live lookup is 3 HTTP round trips (~14s), which starves any caller that
+    # spawns preflight repeatedly (t/27 runs one subprocess per assertion). The
+    # first fix for that was to gate the live check behind --deep -- but NOTHING
+    # IN PRODUCTION PASSES --deep: bp-orchestrate.sh runs `--quiet` and
+    # drive-solo runs it bare. So every real dispatch reported 'drift-unknown'
+    # and a stale pin could never be noticed, which is exactly the "an unwired
+    # audit is the comment again" failure this package exists to prevent. The
+    # operator's requirement is to not have to REMEMBER; a check that never runs
+    # does not meet it.
+    #
+    # So the live check runs BY DEFAULT and is made cheap by a TTL cache: the
+    # first run per TTL pays the round trips, every run after it is a file read.
+    # The cache is keyed to nothing and deliberately outside the project tree --
+    # it is a pure optimisation, safe to delete, and shared across the repeated
+    # spawns that made this expensive in the first place.
+    my $ttl = defined $ENV{BP_PIN_CACHE_TTL} && $ENV{BP_PIN_CACHE_TTL} =~ /^\d+$/
+        ? $ENV{BP_PIN_CACHE_TTL} : 86_400;
+    my $cache = _pin_cache_path();
+    my $use_cache = !$have_fetcher_override && !$ENV{BP_PIN_MANIFEST} && !$ENV{BP_PIN_NOW};
+
+    if ($use_cache && $ttl > 0 && -f $cache && (time - (stat($cache))[9]) < $ttl) {
+        my $cached = eval { read_json($cache) };
+        if (ref $cached eq 'HASH' && ref $cached->{rows} eq 'ARRAY') {
+            for my $row (@{ $cached->{rows} }) {
+                next unless ref $row eq 'HASH' && defined $row->{package};
+                my $status = (defined $row->{status} && $row->{status} eq 'current') ? 'ok' : 'warn';
+                push @rows, [$status, "pin.$row->{package}", ($row->{detail} // '') . ' [cached]'];
+            }
+            return @rows if @rows;
+        }
+        # Unreadable or empty cache is not an error -- fall through and re-check.
+    }
+
+    my ($report, $rc) = eval {
+        require "$Bin/bp-pin.pl";
+        my %opts;
+        $opts{manifest} = $ENV{BP_PIN_MANIFEST} if defined $ENV{BP_PIN_MANIFEST} && length $ENV{BP_PIN_MANIFEST};
+        $opts{now}      = $ENV{BP_PIN_NOW}      if defined $ENV{BP_PIN_NOW}      && length $ENV{BP_PIN_NOW};
+        $opts{fetcher_path} = $ENV{BP_PIN_FETCHER} if $have_fetcher_override;
+        BpPin::audit(\%opts);
+    };
+
+    # Persist a good live report so the next spawn is free. Best-effort: a
+    # cache that cannot be written must never affect the verdict.
+    if ($use_cache && ref $report eq 'HASH' && !defined $report->{error} && ref $report->{rows} eq 'ARRAY') {
+        eval {
+            open my $cfh, '>:raw', "$cache.tmp.$$" or die;
+            print $cfh JSON::PP->new->canonical->encode({ rows => $report->{rows} });
+            close $cfh;
+            rename "$cache.tmp.$$", $cache;
+            1;
+        } or do { unlink "$cache.tmp.$$" };
+    }
+    if ($@ || ref $report ne 'HASH') {
+        my $err = $@ || 'bp-pin.pl audit returned no report';
+        $err =~ s/\s+$//;
+        push @rows, ['warn', 'pin.audit', "version-pin audit unavailable: $err"];
+        return @rows;
+    }
+    if (defined $report->{error}) {
+        push @rows, ['warn', 'pin.audit', "version-pin audit: $report->{error} (drift-unknown; not blocking)"];
+        return @rows;
+    }
+    for my $row (@{ $report->{rows} || [] }) {
+        my $status = $row->{status} eq 'current' ? 'ok' : 'warn';
+        push @rows, [$status, "pin.$row->{package}", $row->{detail}];
+    }
+    return @rows;
+}
+
 # ---- run ------------------------------------------------------------------
 unless (caller) {
 my $plat = detect_platform();
@@ -386,10 +486,14 @@ for my $a (@{$manifest->{assumptions}}) {
     push @fail, ['dag.integrity', $detail] if $st eq 'fail';
 }
 
+# ---- version-pin drift audit (b46). Rows only -- NEVER pushed to @fail, so
+# preflight's exit code is unchanged by drift (spec b46 sec1/sec2).
+push @rows, eval { pin_audit_rows($opt{deep}) };
+
 unless ($opt{quiet} && !@fail) {
     print "\n=== butler preflight (platform: $plat) ===\n";
     for my $r (@rows) {
-        my %glyph = (ok=>'  ok  ', fail=>' FAIL ', skip=>' skip ');
+        my %glyph = (ok=>'  ok  ', fail=>' FAIL ', skip=>' skip ', warn=>' warn ');
         printf "[%s] %-20s %s\n", $glyph{$r->[0]}, $r->[1], $r->[2]//'';
     }
 }
