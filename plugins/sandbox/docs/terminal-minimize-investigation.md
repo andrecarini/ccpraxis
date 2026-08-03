@@ -7,6 +7,17 @@ no known trigger. This document renders the completed investigation
 `s18-terminal-minimize-spike-spec.md` §2.1–2.8. No new investigation was performed to produce this
 document; every finding, line number, and count below is carried from that report.
 
+**Operator evidence, piece 3 (completing the record; `s20-minimize-evidence-completion`).** `s18`
+recorded pieces 1 and 2 of the operator's evidence but omitted a third, verbatim:
+
+> *"I've seen it happen while I was using the computer, and I've seen it happen after I leave the
+> computer and come back and it's minimized."*
+
+This is not a cosmetic addition. It establishes that the minimize occurs **both** while the
+operator is actively at the machine and while they are away from it, and that single fact excludes
+a candidate and reshapes the list below — see Candidate 2's `wt.exe` sub-finding, the timer-driven
+discussion in the same candidate, and `## Conclusion`.
+
 ## Reproduction status
 
 Status: NOT-REPRODUCED
@@ -90,7 +101,16 @@ A census of periodic Windows-native spawns was taken (report Finding D):
   `:1090`, `:1137`, `:1385`, `:1419`, `:1443`, `:1526`, `:1980` (`podman machine inspect`), `:2497`,
   `:3374`, `:3812`. Of these, `:3374` is the one that matters most for a *recurring* symptom: it
   sits inside the dashboard's `gather` closure, throttled to fire at most once per ~10 s
-  (`launcher.pl:3369-3374`) — the same cadence as the busy-lease probe (`:3385`).
+  (`launcher.pl:3369-3374`) — the same cadence as the busy-lease probe (`:3385`). **Anchored by
+  pattern, not line number** — the line this sits at moves — the guard is the shape
+  `if ($now - $last_inspect >= 10)` in **`launcher.pl`**, with `$last_inspect` initialised to `0`,
+  set to `$now` once the guarded block fires, and reset to `0` on the relevant teardown path. This
+  lives **entirely in `launcher.pl`** — the identifier does not appear anywhere in the dashboard
+  module. `Dashboard.pm` merely consumes the launcher's already-throttled result (`Dashboard.pm:2708`
+  calls it "the launcher's throttled inspect"); it does not itself hold the guard. An earlier version
+  of this record misattributed the per-tick native-binary spawn to `Dashboard.pm`; that attribution
+  is corrected here — the candidate is real, but it belongs to `launcher.pl`, not to the dashboard
+  module.
 - `wsl -d $machine -- sh -c ...` (`launcher.pl:1983`), `podman machine inspect` (`:1980`).
 - `powershell.exe -NoProfile -Command "(Get-CimInstance Win32_Process ...)"` (`:3911`, in
   `_keepawake_reap_orphan`) and `taskkill.exe /PID <pid> /F /T` (`:3914`) — no window flag, but
@@ -117,13 +137,25 @@ log-evidenced — `"mode":"wt"` appears in the `launch_session` event across 8 o
 \&_spawn_session`, never on a timer, so it cannot by itself explain a *spontaneous* minimize (one
 with no action on the operator's part).
 
-Two independent grounds exclude it as that cause:
+Two independent grounds exclude it as that cause, and **both halves** of the operator's piece-3
+testimony (recorded above — active-use and away) contradict this candidate on their own, independent
+of ground 1 below:
 
 1. **Operator testimony.** Asked directly whether a second window appears on top when the terminal
-   goes away, the operator was explicit: *"No window is appearing on top of it."*
+   goes away, the operator was explicit: *"No window is appearing on top of it."* Piece 3 sharpens
+   this further: the minimize happens **while the operator is actively using the computer** — `[c]`
+   was not just-pressed in every one of those instances — and it happens **after the operator has
+   left the computer and comes back to find it minimized**, i.e. with no keypress possible at all
+   during the interval in which it occurred. Both halves of that testimony are incompatible with a
+   hotkey-only mechanism.
 2. **The mechanism requires a keypress.** When `[c]` fires, the operator is deliberately opening a
    window and would plainly see it — the opposite of "no known trigger, nothing visibly in front
    afterwards."
+
+**Retraction.** An earlier reporter note wrongly told `s18` this candidate (`wt.exe -w new`) may
+**outrank** the others. That note is retracted here: on the evidence above (code read plus both
+halves of the operator's testimony), it is excluded as the cause of a spontaneous minimize, not
+merely deprioritized.
 
 This is a verdict, not a hedge — but it is not proven harmless in every respect, so one residual
 sub-case is left explicitly `UNTESTED`: a transient window appearing **elsewhere** (off-screen,
@@ -173,6 +205,19 @@ nothing visibly in front afterwards, with no action on the operator's part, fits
 operator reports. If Cygwin-spawn console allocation is visible on the operator's actual setup, this
 candidate fits "recurring, no known trigger" markedly better than Finding E does, on frequency and
 on this cross-reference to `s17` alike — see `## Conclusion` below.
+
+**Why this must be a failure/retry path, not the normal one.** The `$last_inspect` timer above fires
+on a fixed ~10 s cadence *by design* — that is its normal, successful path, and a normal path firing
+every ~10 s would minimize the window every ~10 s, which is not what is reported (the operator
+describes an intermittent, occasional symptom, not a constant one). So the timer cadence alone
+cannot be the mechanism; **it cannot be the normal path**. What can share its cadence while remaining
+intermittent is a **failure or retry path** riding on top of it — and that is exactly `s17`'s
+verified `Can't fork` diagnosis: the retries perl emits (`Can't fork, trying again in 5 seconds`)
+recur at that same cadence specifically under memory-commit pressure, so they fire only sometimes,
+not on every tick. **Testable prediction:** if this is the mechanism, minimizes should correlate with
+fork-failure events (the `Can't fork` retries), not with ticks of the `$last_inspect` timer in
+general — most ticks succeed silently and should show nothing, while the rarer failing/retrying tick
+should be the one that coincides with a reported minimize.
 
 (Separately, `.ccpraxis-local-data/claude-home/.launcher/keepawake.pid` exists on disk right now —
 a helper recorded its Windows PID and the file outlived it, consistent with a launcher exit that
@@ -351,9 +396,12 @@ measured gap durations plus an unmeasured assumption about the display's actual 
 inside one of these windows. It is **not** the leading candidate on current evidence; Candidate 2
 (see above and `## Conclusion`) fits better on frequency, on the wt.exe exclusion, and on the
 cross-reference to `s17`'s fork diagnosis. What would help settle Finding E specifically: the
-per-host `powercfg` display-timeout value, whether the operator was away from the machine for the
-requisite interval, and — if pursued at all — a bounded-interval correlation test rather than the
-near-coin-flip one this document previously proposed.
+per-host `powercfg` display-timeout value, and — if pursued at all — a bounded-interval correlation
+test rather than the near-coin-flip one this document previously proposed. Piece 3 of the operator's
+evidence (recorded above) already answers the general timing question this document previously asked
+here — the minimize happens both during active use and during absence from the machine — so what
+remains open for this candidate specifically is the timeout value itself, not whether an absence
+ever occurred.
 
 ## Conclusion
 
@@ -382,16 +430,20 @@ from the causal story: its `ES_DISPLAY_REQUIRED` contract (`keep-awake.ps1:47`) 
 behind Candidate 4, so the two verdicts describe different causal routes through the same file, not a
 dismissal of it.
 
-Evidence needed: the single narrowest next step is whether the minimize coincides with something the
-operator did (a keypress, pressing `[c]` to launch a connector) or happens while the dashboard sits
-idle — an idle-time minimize points at Candidate 2's periodic native spawns and away from everything
-hotkey-driven, and a bounded (~2 min) correlation against a `keepawake_started` event would properly
-test Candidate 4 in place of the near-vacuous whole-gap test this document previously proposed. Also
-needed: whether the operator's terminal actually implements `CSI 2 t` iconify at all (Limits item 2
-— the cheapest, most decisive test available; a negative result excludes Candidate 3 for that
-terminal configuration), the operator's `powercfg` display-timeout value (replaces this document's
-previously unsourced "10–15 minutes" assumption and can exclude Candidate 4 outright), and whether
-the operator was away from the machine long enough for that timeout to matter. Also needed, to fully
+Evidence needed: piece 3 of the operator's testimony (recorded above) already establishes that the
+minimize happens both during active use and during absence from the machine, which is the general
+timing question this document previously treated as open here — it no longer discriminates between
+candidates on its own, and re-asking it would only re-ask something already answered. The realistic
+next step is instrumentation, not another operator question (see `## Operator requests`, headline
+item): log every native spawn, every `$last_inspect` timer tick, and every fork failure/retry event
+with a timestamp, so that the next occurrence correlates against that trail directly rather than
+against operator memory. A bounded (~2 min) correlation against a `keepawake_started` event would
+still properly test Candidate 4 in place of the near-vacuous whole-gap test this document previously
+proposed, once such logging exists. Also needed: whether the operator's terminal actually implements
+`CSI 2 t` iconify at all (Limits item 2 — the cheapest, most decisive test available; a negative
+result excludes Candidate 3 for that terminal configuration), and the operator's `powercfg`
+display-timeout value (replaces this document's previously unsourced "10–15 minutes" assumption and
+can exclude Candidate 4 outright). Also needed, to fully
 resolve Candidates 1 and 2: which console topology (conhost / ConPTY / mintty) the operator's
 terminal uses (Limits item 1) — this single fact both settles whether `-WindowStyle Hidden` can
 affect Candidate 1's spawn and whether a Cygwin-spawned native console (Candidate 2) is ever
@@ -479,18 +531,18 @@ Files: launcher.pl
    `-WindowStyle Hidden`-driven flash (Candidate 1), while (b) is `wt.exe -w new` opening a new,
    visible window (already excluded above as the cause of a *spontaneous* minimize, but still worth
    confirming it behaves as expected) — and a single undifferentiated "yes" cannot tell them apart.
-4. **[Headline next step]** Does the minimize coincide with something you did — a keypress, or
-   pressing `[c]` to launch a connector — or does it happen while the dashboard sits idle with no
-   action taken on your part? This is now the single most useful next data point: an idle-time
-   minimize points at the periodic native spawns (Candidate 2) and away from anything hotkey-driven
-   (`wt.exe`, Candidate 1), while an action-coincident minimize points the other way. This supersedes
-   this document's earlier ask to simply note the wall-clock time of the next minimize and correlate
-   it against Finding E's gaps — once the full wake-lock-absent census is counted (see
-   `## Conclusion`), that correlation turns out to hit at a base rate near a coin flip and would not
-   be decisive on its own. Two further, cheap and orthogonal asks that bear specifically on Finding
-   E: (a) run `powercfg /q SCHEME_CURRENT SUB_VIDEO VIDEOIDLE` (and `powercfg /a`) and report the
-   output — this is your actual measured display-sleep timeout, replacing this document's previously
-   unsourced "10–15 minutes" assumption, and a value of `Never` or anything above ~23 minutes
-   excludes Finding E outright; (b) tell us whether you were away from the machine for more than
-   ~10 minutes immediately before it minimized — active input resets the idle timer, so if you were
-   typing or watching at the time, Finding E is excluded entirely, independent of (a).
+4. **[Headline next step]** Piece 3 of your own testimony (recorded above) already answers this
+   document's earlier question about coincidence-with-action versus idle-time timing: you have seen
+   the minimize both while actively using the computer and after leaving and returning to it, so
+   asking you to distinguish those cases again would only re-ask something you have already told us,
+   twice, honestly, as "I don't know" on more precise timing. **The realistic next step is
+   instrumentation, not more operator questions.** Recommended: add a logged event on every native
+   spawn, every `$last_inspect` timer tick (`launcher.pl`), and every fork failure/retry event, each
+   with a timestamp — so the *next* occurrence you report becomes a correlation against that trail
+   (does it line up with a fork-failure retry rather than an ordinary tick? see the failure/retry
+   chain under Candidate 2) instead of another memory test. This is the cheapest, most **decisive**
+   step available precisely because it stops depending on your recall at all. One narrow, orthogonal
+   ask remains useful alongside that instrumentation, specific to Candidate 4: run
+   `powercfg /q SCHEME_CURRENT SUB_VIDEO VIDEOIDLE` (and `powercfg /a`) and report the output — your
+   actual measured display-sleep timeout, replacing this document's previously unsourced "10–15
+   minutes" assumption; a value of `Never` or anything above ~23 minutes excludes Finding E outright.

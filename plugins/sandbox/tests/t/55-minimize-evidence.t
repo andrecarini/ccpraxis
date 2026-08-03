@@ -355,4 +355,201 @@ like($operator_body, qr/decisive/, "AC-10: at least one operator-request item co
     ok($own_source !~ /\bexec\s*\(/,            "AC-12: t/55 contains no exec builtin call");
 }
 
+# =====================================================================
+# s20 EXTENSION -- C1..C6, per
+#   .ccpraxis-local-data/blueprints/sandbox-butler-overhaul/specs/
+#   s20-minimize-evidence-completion-spec.md section 3.
+#
+# s18 documented operator evidence pieces 1 and 2 but omitted piece 3 (the
+# operator has seen the minimize BOTH while actively using the machine AND
+# while away from it), which excludes a candidate (wt.exe -w new) and
+# reshapes the candidate list. This block is ADDITIVE ONLY: it does not
+# touch any assertion above. $content (the whole document, or '' if the
+# doc is missing/unreadable) and $operator_body (the '## Operator requests'
+# section body) are reused from the AC-1..AC-12 block above, in scope here.
+#
+# Vacuity gate (spec section 3, "Vacuity gate"): C1 checks both halves of
+# piece 3, not the bare word "computer"; C3 asserts a negative (Dashboard.pm
+# NOT credited) alongside the positive corrected attribution; C5 asserts
+# the QUESTION FORM is absent, not merely that some "answered" marker
+# string appears. Each assertion names the file it read.
+# =====================================================================
+
+# ---------------------------------------------------------------------
+# C1 -- piece 3 appears in substance: BOTH the active-use half and the
+# away half, not as a passing mention of the word "computer".
+# ---------------------------------------------------------------------
+{
+    my $active_half = ($content =~ /\bwhile\b.{0,60}\busing\s+the\s+computer\b/is);
+    ok($active_half,
+        "C1: piece 3's ACTIVE-use half present in substance (\"...using the computer...\") "
+        . "[plugins/sandbox/docs/terminal-minimize-investigation.md]");
+
+    my $away_half = ($content =~ /\b(?:leave|left)\b.{0,40}\bcomputer\b.{0,60}\bcome\s+back\b.{0,120}\bminimiz\w*/is);
+    ok($away_half,
+        "C1: piece 3's AWAY half present in substance (\"...leave the computer and come back...minimized...\") "
+        . "[plugins/sandbox/docs/terminal-minimize-investigation.md]");
+}
+
+# ---------------------------------------------------------------------
+# C2 -- wt.exe -w new recorded as EXCLUDED, with its basis being BOTH
+# halves of the piece-3 testimony (not just "no window appears on top"),
+# and the earlier reporter note ("this candidate may outrank the others")
+# recorded as RETRACTED. Scoped to $c2_body (already extracted above for
+# AC-4/AC-5) so a match elsewhere in the document -- e.g. the unrelated
+# "both halves" occurring in Finding C's discussion of a byte channel --
+# cannot vacuously satisfy this.
+# ---------------------------------------------------------------------
+{
+    like($c2_body, qr/wt\.exe/i,
+        "C2: the wt.exe sub-finding is present under Candidate 2 "
+        . "[plugins/sandbox/docs/terminal-minimize-investigation.md]");
+    like($c2_body, qr/excluded/i,
+        "C2: wt.exe is recorded as excluded "
+        . "[plugins/sandbox/docs/terminal-minimize-investigation.md]");
+
+    like($c2_body, qr/both\s+halves/i,
+        "C2: the exclusion basis is framed as BOTH halves of the operator's testimony "
+        . "(not merely 'no window on top'), scoped to Candidate 2's own body so the "
+        . "unrelated 'both halves' in Finding C's byte-channel discussion cannot satisfy this "
+        . "[plugins/sandbox/docs/terminal-minimize-investigation.md]");
+
+    like($c2_body, qr/earlier\s+reporter\s+note/i,
+        "C2: an 'earlier reporter note' about wt.exe is named "
+        . "[plugins/sandbox/docs/terminal-minimize-investigation.md]");
+    like($c2_body, qr/outrank/i,
+        "C2: the earlier note's claim ('may outrank the others') is named "
+        . "[plugins/sandbox/docs/terminal-minimize-investigation.md]");
+    like($c2_body, qr/retract/i,
+        "C2: the earlier reporter note is recorded as RETRACTED "
+        . "[plugins/sandbox/docs/terminal-minimize-investigation.md]");
+}
+
+# ---------------------------------------------------------------------
+# C3 -- the timer-driven explanation is anchored to launcher.pl BY
+# PATTERN (the $last_inspect guard shape), not merely by a line number
+# that DECOMPOSED.md warns "moves". Positive: the pattern-anchor appears
+# in the doc, and the guard shape genuinely exists in launcher.pl today.
+# Negative (the corrected-attribution point, per the vacuity gate): the
+# doc does NOT credit Dashboard.pm with this guard, and Dashboard.pm's
+# own source does not define $last_inspect at all -- confirming the
+# correction record's re-verification.
+# ---------------------------------------------------------------------
+{
+    my $launcher_path = "$Bin/../../scripts/launcher.pl";
+    my $launcher_src  = '';
+    if (open my $fh, '<', $launcher_path) {
+        local $/;
+        $launcher_src = <$fh>;
+        close $fh;
+    }
+    ok(defined $launcher_src && length $launcher_src,
+        "C3 sanity: launcher.pl is readable [plugins/sandbox/scripts/launcher.pl]");
+    like($launcher_src, qr/if\s*\(\s*\$now\s*-\s*\$last_inspect\s*>=\s*10\s*\)/,
+        "C3 sanity: the \$last_inspect guard shape genuinely exists in launcher.pl today "
+        . "[plugins/sandbox/scripts/launcher.pl]");
+
+    my $dashboard_path = "$Bin/../../scripts/Dashboard.pm";
+    my $dashboard_src  = '';
+    if (open my $fh, '<', $dashboard_path) {
+        local $/;
+        $dashboard_src = <$fh>;
+        close $fh;
+    }
+    ok(defined $dashboard_src && length $dashboard_src,
+        "C3 sanity: Dashboard.pm is readable [plugins/sandbox/scripts/Dashboard.pm]");
+    unlike($dashboard_src, qr/last_inspect/,
+        "C3 sanity: Dashboard.pm does NOT define \$last_inspect at all -- the guard genuinely "
+        . "lives only in launcher.pl [plugins/sandbox/scripts/Dashboard.pm]");
+
+    # Positive: the document anchors the candidate by PATTERN (the
+    # $last_inspect identifier / guard shape), tied to launcher.pl, not
+    # solely by a bare line-number citation.
+    like($content, qr/last_inspect/,
+        "C3 positive: the document anchors the timer candidate by PATTERN "
+        . "(references \$last_inspect), not merely by a line number that moves "
+        . "[plugins/sandbox/docs/terminal-minimize-investigation.md]");
+    like($content, qr/launcher\.pl.{0,200}last_inspect|last_inspect.{0,200}launcher\.pl/is,
+        "C3 positive: the \$last_inspect pattern anchor is tied to launcher.pl in the document "
+        . "[plugins/sandbox/docs/terminal-minimize-investigation.md]");
+
+    # Negative: the document must NOT attribute the guard/timer candidate
+    # to Dashboard.pm -- that misattribution is exactly the error this
+    # package corrects (DECOMPOSED.md TUI-03's "re-verify by pattern" note).
+    unlike($content, qr/Dashboard\.pm.{0,120}(?:last_inspect|per-tick\s+native-binary\s+spawn|10s?\s*inspect\s+guard)/is,
+        "C3 negative: the document does NOT credit Dashboard.pm with the timer/inspect guard "
+        . "[plugins/sandbox/docs/terminal-minimize-investigation.md]");
+    unlike($content, qr/Dashboard\.pm:3374/,
+        "C3 negative: the document does not cite 'Dashboard.pm:3374' for the timer candidate "
+        . "[plugins/sandbox/docs/terminal-minimize-investigation.md]");
+}
+
+# ---------------------------------------------------------------------
+# C4 -- the "cannot be the normal path -> must be failure/retry -> s17's
+# Can't fork" chain is present, together with the testable prediction
+# (correlate with fork-failure events, not with ticks).
+# ---------------------------------------------------------------------
+{
+    like($content, qr/cannot\s+be\s+the\s+normal\s+path|would\s+minimiz\w*.{0,20}every.{0,10}10\s*s/is,
+        "C4: the document states the timer candidate cannot be the NORMAL path "
+        . "(or the window would minimize every ~10s) "
+        . "[plugins/sandbox/docs/terminal-minimize-investigation.md]");
+
+    like($content, qr/failure(?:\s*\/\s*|\s+or\s+)retry\s+path|failure\s+or\s+retry/is,
+        "C4: the document names it a FAILURE/RETRY path instead "
+        . "[plugins/sandbox/docs/terminal-minimize-investigation.md]");
+
+    like($content, qr/(?:failure\s+or\s+retry|retry\s+path).{0,300}(?:s17|Can't fork)|(?:s17|Can't fork).{0,300}(?:failure\s+or\s+retry|retry\s+path)/is,
+        "C4: the failure/retry attribution is tied to s17's Can't fork diagnosis "
+        . "[plugins/sandbox/docs/terminal-minimize-investigation.md]");
+
+    like($content, qr/correlat\w*.{0,200}fork.failure/is,
+        "C4: a testable prediction is stated -- minimizes correlate with fork-failure events "
+        . "[plugins/sandbox/docs/terminal-minimize-investigation.md]");
+    like($content, qr/correlat\w*.{0,250}\bnot\b.{0,40}\bticks?\b/is,
+        "C4: the testable prediction contrasts fork-failure correlation with TICKS, not just ticks in general "
+        . "[plugins/sandbox/docs/terminal-minimize-investigation.md]");
+}
+
+# ---------------------------------------------------------------------
+# C5 -- the answered questions are gone or marked answered. Per the
+# vacuity gate, this asserts the QUESTION FORM IS ABSENT document-wide
+# (not scoped only to '## Operator requests', since the same question
+# text also currently appears in '## Conclusion'), rather than merely
+# checking for the word "answered" somewhere.
+# ---------------------------------------------------------------------
+{
+    unlike($content, qr/does\s+the\s+minimize\s+coincide\s+with\s+something\s+(?:you\s+did|the\s+operator\s+did)/is,
+        "C5: the document no longer ASKS whether the minimize coincides with something the operator did "
+        . "[plugins/sandbox/docs/terminal-minimize-investigation.md]");
+    unlike($content, qr/(?:or\s+)?does\s+it\s+happen\s+while\s+the\s+dashboard\s+sits\s+idle/is,
+        "C5: the document no longer ASKS whether it happens while the dashboard sits idle "
+        . "[plugins/sandbox/docs/terminal-minimize-investigation.md]");
+    unlike($content, qr/whether\s+(?:you\s+were|the\s+operator\s+was)\s+away\s+from\s+the\s+machine/is,
+        "C5: the document no longer ASKS whether the operator was away from the machine "
+        . "[plugins/sandbox/docs/terminal-minimize-investigation.md]");
+    unlike($content, qr/away\s+from\s+the\s+machine\s+for\s+(?:more\s+than\s+)?~?\s*10\s*min/is,
+        "C5: the document no longer ASKS about the ~10-minute away threshold as an open question "
+        . "[plugins/sandbox/docs/terminal-minimize-investigation.md]");
+}
+
+# ---------------------------------------------------------------------
+# C6 -- the headline next step is INSTRUMENTATION, not another operator
+# question.
+# ---------------------------------------------------------------------
+{
+    my ($headline) = $content =~ /\[Headline next step\](.*?)(?=\n\s*\d+\.[ \t]|\n##|\z)/ms;
+    ok(defined $headline && length $headline,
+        "C6: a '[Headline next step]' item exists in the document "
+        . "[plugins/sandbox/docs/terminal-minimize-investigation.md]");
+
+    my $headline_text = defined $headline ? $headline : '';
+    like($headline_text, qr/instrumentation/i,
+        "C6: the headline next step names INSTRUMENTATION "
+        . "[plugins/sandbox/docs/terminal-minimize-investigation.md]");
+    unlike($headline_text, qr/does\s+the\s+minimize\s+coincide|does\s+it\s+happen\s+while\s+the\s+dashboard\s+sits\s+idle/is,
+        "C6: the headline next step is no longer phrased as the old coincide/idle question "
+        . "[plugins/sandbox/docs/terminal-minimize-investigation.md]");
+}
+
 done_testing();
