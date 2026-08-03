@@ -33,7 +33,7 @@ Hooks enforce: write-set containment, implementer/test-writer role separation, o
 
 **Every structured change to your ledger goes through `plugins/butler/scripts/bp-ledger.pl`.** Free-form `Edit`/`Write` on the ledger is how it gets corrupted: a whole-file rewrite has truncated a ledger to zero bytes in this repo, and hand-edits have landed entries inside fenced code blocks, forged ticked checkboxes, and silently dropped sections. The API is deterministic, atomic (temp + rename), locked, and refuses rather than guesses.
 
-The six operations:
+The seven operations:
 
 ```
 bp-ledger.pl set-status       --ledger P --status S
@@ -41,6 +41,7 @@ bp-ledger.pl tick-step        --ledger P --step N
 bp-ledger.pl append-attempt   --ledger P (--text T | --text-file F | --text -)
 bp-ledger.pl set-next-action  --ledger P --body B
 bp-ledger.pl add-output       --ledger P --text T
+bp-ledger.pl rotate           --ledger P [--keep N] [--budget BYTES] [--dry-run]
 bp-ledger.pl validate         (--ledger P | --stdin | --payload)
 ```
 
@@ -54,10 +55,47 @@ Why each op exists rather than an `Edit`:
 - **`tick-step`** only ever ticks inside `## Pipeline`, so no op can emit a `- [x]` anywhere else.
 - **`set-next-action`** replaces the `## Next action` body wholesale — the one section that is meant to be rewritten.
 - **`add-output`** appends to `## Outputs`, replacing a `_(none yet)_` placeholder if that is all that is there.
+- **`rotate`** moves stale `## Decisions & attempt log` entries out to `reports/ledger-history/<pkg>.md` (a path derived from your ledger's own `.../packages/<pkg>.md` shape — never guess a different location: `bp-resume-sweep.sh` and `bp-status.sh` glob `packages/*.md`, so history must never land there or it gets enumerated as a bogus package). See "Context budget" below for when and why to run it.
 
 **What no op may touch, and neither may you:** `## Dispatch log (auto)` is hook-maintained and never agent-edited. `mandated_means:` has no op and none may be added — rewriting the requirement to match what you built is the one move that defeats the whole mechanism.
 
 Prose sections the API does not model (`## Scope`, `## Inputs`, and your own narrative) are still yours to write with `Edit` — but anchor on a unique string, never rewrite the whole file.
+
+### Context budget — your ledger has one, and a fix when it's blown
+
+Your ledger's `## Decisions & attempt log` is append-only for the life of the package: a fresh
+session must be able to replace you at any moment for roughly **~10k tokens**, and unbounded growth
+defeats that. `bp-ledger.pl` enforces a single named byte budget (`DEFAULT_BUDGET_BYTES`, **40,000
+bytes** — ~10k tokens at this repo's ~4 bytes/token estimate) and makes crossing it **visible rather
+than silent**:
+
+- **`append-attempt` never refuses.** If the append would leave the ledger over budget, it still
+  performs the append (losing the record is worse than exceeding the budget) but prints one warning
+  line to stderr naming the resulting size, the budget, and the fix: `bp-ledger.pl rotate --ledger
+  <your ledger>`.
+- **`rotate` is the fix.** It moves stale attempt-log entries — verbatim, in original order — to a
+  per-package history file at `reports/ledger-history/<pkg>.md`, which is itself append-only and
+  nothing else ever reads. Run it as soon as you see the warning; don't let it accumulate across
+  several attempts.
+- **What can never move, at any budget pressure:**
+  - Every entry containing a `MEANS-DEVIATION:` marker, at any age — the whole-blueprint conformance
+    gate reads only your ledger (never history), so a rotated-out marker would blind it silently.
+  - The most recent `--keep` entries (default **5**) — a hard **floor**, not a target: retention is
+    budget-driven (keep newest-first for as long as the whole ledger fits `--budget`), but rotation
+    never digs into the floor to reach the number, "however large they are," so a replacement
+    coordinator always has recent context.
+- **Not a retention rule, a never-bisect rule:** a fenced code block is never *split* across the
+  ledger/history boundary. An entry containing a complete fence is an ordinary trim candidate and may
+  move as a unit — nothing about a code fence makes an old entry operative. Only the splitting is
+  forbidden, because a bisected fence corrupts both halves and can forge a fence boundary.
+- If the floor and the retained markers together still exceed budget, `rotate` moves everything it
+  legitimately can, exits **0**, and prints one line naming the ledger, the resulting size, and *why*
+  it couldn't reach budget. Landing over budget loudly is an honest outcome; dropping an entry to hit
+  the number is not an option `rotate` will ever take.
+- **Sections `rotate` never touches:** everything except `## Decisions & attempt log` — frontmatter,
+  `## Scope`, `## Done criteria`, `## Inputs`, `## Out of scope`, `## Pipeline`, `## Next action`,
+  `## Outputs`, `## Escalation`, `## Dispatch log (auto)`. `--dry-run` reports what would move without
+  touching either file; `rotate` is idempotent (a repeat run with the same arguments changes nothing).
 
 ## Context economics
 

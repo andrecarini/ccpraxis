@@ -6,11 +6,20 @@
 # same V1-V5 byte-oriented rule set ledger-guard.sh (b12) enforces. See:
 # .ccpraxis-local-data/blueprints/sandbox-butler-overhaul/specs/b13-deterministic-ledger-api-spec.md
 #
+# Plus a sixth op, `rotate` (b45-ledger-context-budget), which moves stale
+# `## Decisions & attempt log` entries out to reports/ledger-history/<pkg>.md so the
+# ledger stays inside a context budget. See:
+# .ccpraxis-local-data/blueprints/sandbox-butler-overhaul/specs/b45-ledger-context-budget-spec.md
+#
 # Exit codes (an interface, fixed): 0 success, 2 validation rejection (byte-identical
 # file), 3 usage/argument error (nothing read), 4 I/O/lock/atomicity failure
 # (byte-identical), 5 target region not found (byte-identical).
 #
-# stdout is ALWAYS empty. stderr on any non-zero exit is EXACTLY ONE line.
+# stdout is ALWAYS empty, EXCEPT `rotate --dry-run`, which is a report-only op by
+# spec (b45 §3) and prints its report to stdout while touching nothing. stderr on any
+# non-zero exit is EXACTLY ONE line. `append-attempt` may ALSO print one budget-warning
+# line to stderr on an otherwise-successful (exit 0) run — see BUDGET_BYTES below; that
+# is not a rejection, just visibility, and the append still happens.
 #
 # Core Perl only: strict, warnings, Getopt::Long, Fcntl(:flock), JSON::PP, B. No
 # other module may be loaded on any path (latency constraint, §2.5).
@@ -22,6 +31,12 @@ use JSON::PP ();
 use B ();
 
 my $EMDASH = "\xE2\x80\x94";
+
+# b45-ledger-context-budget-spec.md §4: a single named constant, ~10k tokens at this
+# repo's ~4 bytes/token estimate. `rotate --budget` may override it for that one call;
+# `append-attempt`'s warning always measures against this default (no CLI override
+# there — the warning is visibility, not policy).
+use constant DEFAULT_BUDGET_BYTES => 40000;
 
 # The injected-rename seam (bp-token-keeper.pl's `rename_fn` shape). When
 # BP_LEDGER_FAIL_RENAME is set and non-empty, simulate a mid-write rename failure
@@ -317,7 +332,7 @@ sub splice_set_next_action {
 # =====================================================================================
 
 sub run_op {
-    my ($sub, $path, $splice_cb) = @_;
+    my ($sub, $path, $splice_cb, $post_cb) = @_;
 
     my $lockpath = "$path.lock";
     open(my $lk, '>', $lockpath) or io_error($sub, $path, "cannot open lock file $lockpath: $!");
@@ -341,7 +356,7 @@ sub run_op {
     my $detail2 = validate_bytes($new);
     reject_error($sub, $path, $detail2) if defined $detail2;
 
-    if ($new eq $orig) { exit 0 }
+    if ($new eq $orig) { $post_cb->($new) if $post_cb; exit 0 }
 
     my $tmp = "$path.tmp.$$";
     open(my $w, '>:raw', $tmp) or io_error($sub, $path, "cannot open temp file $tmp: $!");
@@ -355,6 +370,7 @@ sub run_op {
 
     flock($lk, LOCK_UN);
     close($lk);
+    $post_cb->($new) if $post_cb;
     exit 0;
 }
 
@@ -426,8 +442,19 @@ sub op_append_attempt {
     $text =~ s/[\r\n]+/ /g;
     my $iso   = iso_now();
     my $entry = "- ${iso} ${EMDASH} ${text}";
+    # b45 §4: visibility, never a refusal. The append has already happened (or is a
+    # no-op) by the time this fires; we only ever warn, never block.
+    my $budget_check = sub {
+        my ($bytes) = @_;
+        my $size = length($bytes);
+        if ($size > DEFAULT_BUDGET_BYTES) {
+            emit_err("bp-ledger: append-attempt: $opt{ledger} is $size bytes, exceeding the "
+                . DEFAULT_BUDGET_BYTES . "-byte budget; run: bp-ledger.pl rotate --ledger $opt{ledger}");
+        }
+    };
     run_op('append-attempt', $opt{ledger},
-        sub { return splice_insert_entry($_[0], qr/^##\s+Decisions & attempt log\b/m, $entry) });
+        sub { return splice_insert_entry($_[0], qr/^##\s+Decisions & attempt log\b/m, $entry) },
+        $budget_check);
 }
 
 sub op_tick_step {
@@ -494,6 +521,253 @@ sub op_add_output {
     $text =~ s/[\r\n]+/ /g;
     my $entry = "- ${text}";
     run_op('add-output', $opt{ledger}, sub { return splice_insert_entry($_[0], qr/^##\s+Outputs\b/m, $entry) });
+}
+
+# =====================================================================================
+# `rotate` (b45-ledger-context-budget-spec.md §3) — moves stale
+# `## Decisions & attempt log` entries to reports/ledger-history/<pkg>.md.
+# =====================================================================================
+
+# Split the `## Decisions & attempt log` body [$body_start, $body_end) into ordered,
+# fence-aware "entries". An entry begins at a NOT-in-fence line matching /^-\s/ (the
+# shape every append-attempt/MEANS-DEVIATION entry has, per SKILL.md) and runs up to
+# (but not including) the next such line, or to $body_end. Content before the first
+# entry (placeholder text, blank lines) is "preamble" and is never a rotation
+# candidate. Because entry boundaries are only recognised OUTSIDE a fence, a fence
+# can never be split: any fence-toggle line and everything inside it is absorbed into
+# whichever entry (or the preamble) precedes it, never carved into its own entry.
+sub parse_attempt_entries {
+    my ($B, $body_start, $body_end) = @_;
+    my $infence = 0;
+    my @entries;
+    my $cur_start;
+    each_line_with_offset($B, $body_start, $body_end, sub {
+        my ($line, $off, $len, $has_nl) = @_;
+        if (is_fence_line($line)) { $infence = !$infence; return undef }
+        if (!$infence && $line =~ /^-\s/) {
+            push @entries, { start => $cur_start, end => $off } if defined $cur_start;
+            $cur_start = $off;
+        }
+        return undef;
+    });
+    push @entries, { start => $cur_start, end => $body_end } if defined $cur_start;
+    my $preamble_end = @entries ? $entries[0]{start} : $body_end;
+    return (\@entries, $preamble_end);
+}
+
+# Does this entry span contain a LIVE (non-fenced) MEANS-DEVIATION: marker? Mirrors
+# BpJudge::parse_means_deviations's own fence-skipping exactly (bp-judge.pl:635) —
+# parser and retention rule must agree on what counts, or the gap between them is a
+# forgery window (spec §1 / SKILL.md:159-161).
+sub entry_has_live_marker {
+    my ($B, $start, $end) = @_;
+    my $infence = 0;
+    my $found = 0;
+    each_line_with_offset($B, $start, $end, sub {
+        my ($line, $off, $len, $has_nl) = @_;
+        if (is_fence_line($line)) { $infence = !$infence; return undef }
+        if (!$infence && $line =~ /MEANS-DEVIATION:/) { $found = 1; return 1 }
+        return undef;
+    });
+    return $found;
+}
+
+# reports/ledger-history/<pkg>.md is relative to the BLUEPRINT dir (spec §3), derived
+# from the ledger path's own `.../packages/<pkg>.md` shape — never a second, parallel
+# naming convention. Deliberately requires the packages/ path element: bp-resume-sweep.sh
+# and bp-status.sh glob "packages/*.md" (spec §2), so history must never be reachable
+# by guessing a sibling of the ledger without going through that exact anchor.
+sub derive_history_path {
+    my ($ledger) = @_;
+    return undef unless $ledger =~ m{^(.*)/packages/([^/]+)\.md$};
+    my ($bpdir, $pkg) = ($1, $2);
+    return "$bpdir/reports/ledger-history/$pkg.md";
+}
+
+# mkdir -p, core-Perl only (File::Path is not on the allowed-module list, §2.5).
+sub ensure_dir_exists {
+    my ($dir) = @_;
+    return 1 if -d $dir;
+    my @parts = split(m{/}, $dir);
+    my $cur = ($dir =~ m{^/}) ? '' : '.';
+    for my $p (@parts) {
+        next if $p eq '';
+        $cur .= '/' . $p;
+        next if -d $cur;
+        return 0 unless mkdir($cur, 0755);
+    }
+    return 1;
+}
+
+sub op_rotate {
+    my @args = @_;
+    my %opt;
+    my $ok;
+    { local $SIG{__WARN__} = sub { };
+      $ok = GetOptionsFromArray(\@args, \%opt, 'ledger=s', 'keep=i', 'budget=i', 'dry-run'); }
+    arg_error('rotate', 'unrecognised option') unless $ok;
+    arg_error('rotate', 'unexpected extra arguments: ' . join(' ', @args)) if @args;
+    arg_error('rotate', 'missing required --ledger') unless defined $opt{ledger};
+    my $keep = defined $opt{keep} ? $opt{keep} : 5;
+    arg_error('rotate', "'--keep $opt{keep}' must be a non-negative integer") if $keep !~ /^\d+$/;
+    my $budget = defined $opt{budget} ? $opt{budget} : DEFAULT_BUDGET_BYTES;
+    arg_error('rotate', "'--budget $opt{budget}' must be a positive integer") if $budget !~ /^[1-9]\d*$/;
+    my $dry_run = $opt{'dry-run'} ? 1 : 0;
+    my $ledger  = $opt{ledger};
+
+    my $history = derive_history_path($ledger);
+    arg_error('rotate', "--ledger '$ledger' is not of the form .../packages/<pkg>.md; "
+        . 'cannot derive the blueprint dir and package name for history routing')
+        unless defined $history;
+
+    my $lockpath = "$ledger.lock";
+    open(my $lk, '>', $lockpath) or io_error('rotate', $ledger, "cannot open lock file $lockpath: $!");
+    flock($lk, LOCK_EX) or io_error('rotate', $ledger, "cannot acquire lock on $lockpath: $!");
+
+    my $orig;
+    {
+        open(my $fh, '<:raw', $ledger) or io_error('rotate', $ledger, "cannot read: $!");
+        local $/;
+        $orig = <$fh>;
+        close $fh;
+        $orig = '' unless defined $orig;
+    }
+
+    # Deliberately NO validate_bytes() call here (unlike the other five ops). rotate
+    # is pure byte-preserving surgery, never content synthesis, and the corpus
+    # contains at least one ledger with a raw NUL byte inside an entry (SYN-19: q01)
+    # that V1 would otherwise reject outright — rotating that ledger back under
+    # budget must not itself be blocked by the very check that flags NUL as invalid.
+    my $head_re = qr/^##\s+Decisions & attempt log\b/m;
+    my $loc = locate_section($orig, $head_re);
+    notfound_error('rotate', $ledger, '## Decisions & attempt log section not found') unless $loc;
+    notfound_error('rotate', $ledger,
+        'section ends inside an unterminated fenced code block; refusing to rotate')
+        if $loc->{unterminated};
+
+    my ($entries, $preamble_end) = parse_attempt_entries($orig, $loc->{body_start}, $loc->{body_end});
+    my $total = scalar @$entries;
+
+    # b45 §3 (amended): retention is BUDGET-DRIVEN with a count FLOOR, not count-driven.
+    # Mandatory, absolute, never movable at any budget: every entry with a live
+    # MEANS-DEVIATION marker (any age, §1), and the most recent --keep (floor, default 5)
+    # NON-marker entries, "however large they are" (a replacement coordinator always has
+    # recent context). Above that floor, move as many of the OLDER non-marker entries as
+    # it takes to land the whole ledger under --budget -- never fewer than needed, never
+    # digging into the floor to do it.
+    my @forced;     # entry indices with a live marker -- never movable, any age
+    my @non_forced; # {idx, len} in original order, excluding forced
+    for my $i (0 .. $total - 1) {
+        my $e = $entries->[$i];
+        if (entry_has_live_marker($orig, $e->{start}, $e->{end})) { push @forced, $i }
+        else { push @non_forced, { idx => $i, len => $e->{end} - $e->{start} } }
+    }
+    my $n_nf    = scalar @non_forced;
+    my $floor_k = $keep < $n_nf ? $keep : $n_nf;
+
+    # suffix_len[$j] = total bytes of the LAST $j non-forced entries (by recency).
+    my @suffix_len = (0) x ($n_nf + 1);
+    for my $j (1 .. $n_nf) {
+        $suffix_len[$j] = $suffix_len[$j - 1] + $non_forced[$n_nf - $j]{len};
+    }
+    my $forced_len = 0;
+    $forced_len += ($entries->[$_]{end} - $entries->[$_]{start}) for @forced;
+    my $const_len = $loc->{body_start} + ($preamble_end - $loc->{body_start})
+                  + (length($orig) - $loc->{body_end}) + $forced_len;
+
+    # Prefer the LARGEST k (fewest entries moved) that lands at/under budget, without ever
+    # going below the floor. If even the floor itself is over budget, use the floor anyway
+    # (it is mandatory) and report the shortfall rather than fabricate compliance.
+    my $k = $n_nf;
+    my $unreachable = 0;
+    while ($k > $floor_k && ($const_len + $suffix_len[$k]) > $budget) { $k-- }
+    if (($const_len + $suffix_len[$k]) > $budget) { $unreachable = 1 }
+
+    my %kept_non_forced = map { $non_forced[$n_nf - $_ - 1]{idx} => 1 } (0 .. $k - 1) if $k > 0;
+    my (@moved, @retained);
+    for my $i (0 .. $total - 1) {
+        my $e = $entries->[$i];
+        if ($kept_non_forced{$i} || grep { $_ == $i } @forced) { push @retained, $e }
+        else { push @moved, $e }
+    }
+
+    my $moved_bytes = 0;
+    $moved_bytes += ($_->{end} - $_->{start}) for @moved;
+    my $new_len = $const_len + $suffix_len[$k];
+
+    if ($unreachable) {
+        emit_err("bp-ledger: rotate: $ledger: $new_len bytes, over the $budget-byte budget after "
+            . "rotating everything it legitimately can (floor --keep $floor_k non-marker entries "
+            . "(" . $suffix_len[$k] . " bytes) + " . scalar(@forced) . " MEANS-DEVIATION entry/ies "
+            . "($forced_len bytes) + fixed sections are, together, already over budget). "
+            . 'Not reducible further without either dropping mandated retention or losing the record.');
+    }
+
+    if (!@moved) {
+        if ($dry_run) {
+            print "bp-ledger: rotate: $ledger: 0 of $total entries eligible to move; nothing to do.\n";
+        }
+        flock($lk, LOCK_UN);
+        close($lk);
+        exit 0;
+    }
+
+    my $new_body = substr($orig, $loc->{body_start}, $preamble_end - $loc->{body_start})
+                 . join('', map { substr($orig, $_->{start}, $_->{end} - $_->{start}) } @retained);
+    my $new_ledger = substr($orig, 0, $loc->{body_start}) . $new_body . substr($orig, $loc->{body_end});
+    my $history_append = join('', map { substr($orig, $_->{start}, $_->{end} - $_->{start}) } @moved);
+
+    if ($dry_run) {
+        my $over = $unreachable ? " -- unreachable (see prior stderr line)" : '';
+        print "bp-ledger: rotate: $ledger: would move " . scalar(@moved) . " of $total entries "
+            . "($moved_bytes bytes) to $history: ledger would be $new_len bytes (budget $budget)$over.\n";
+        flock($lk, LOCK_UN);
+        close($lk);
+        exit 0;
+    }
+
+    # History first, ledger second: on ANY failure between here and the final
+    # rename, the ledger (read above, untouched on disk so far) stays byte-identical
+    # (spec §3 "atomic ... any failure at any point leaves the ledger byte-identical").
+    # Writing history first means a crash after it succeeds risks a *duplicate*
+    # history append on retry (the ledger still shows those entries as un-rotated) --
+    # strictly preferable to the alternative order, which risks losing the entries
+    # outright (removed from the ledger, never landed in history).
+    my $hist_dir = $history;
+    $hist_dir =~ s{/[^/]+$}{};
+    ensure_dir_exists($hist_dir) or io_error('rotate', $ledger, "cannot create directory $hist_dir: $!");
+
+    my $hist_orig = '';
+    if (-e $history) {
+        open(my $hfh, '<:raw', $history) or io_error('rotate', $ledger, "cannot read $history: $!");
+        local $/;
+        $hist_orig = <$hfh>;
+        close $hfh;
+        $hist_orig = '' unless defined $hist_orig;
+    }
+    my $hist_new = $hist_orig . $history_append;
+
+    my $hist_tmp = "$history.tmp.$$";
+    open(my $hw, '>:raw', $hist_tmp) or io_error('rotate', $ledger, "cannot open temp file $hist_tmp: $!");
+    print {$hw} $hist_new or do { close $hw; unlink $hist_tmp; io_error('rotate', $ledger, "write to $hist_tmp failed: $!") };
+    close($hw) or do { unlink $hist_tmp; io_error('rotate', $ledger, "close $hist_tmp failed: $!") };
+    unless ($RENAME_FN->($hist_tmp, $history)) {
+        unlink $hist_tmp;
+        io_error('rotate', $ledger, "rename $hist_tmp -> $history failed: $! (ledger untouched)");
+    }
+
+    my $tmp = "$ledger.tmp.$$";
+    open(my $w, '>:raw', $tmp) or io_error('rotate', $ledger, "cannot open temp file $tmp: $!");
+    print {$w} $new_ledger or do { close $w; unlink $tmp; io_error('rotate', $ledger, "write to $tmp failed: $!") };
+    close($w) or do { unlink $tmp; io_error('rotate', $ledger, "close $tmp failed: $!") };
+    unless ($RENAME_FN->($tmp, $ledger)) {
+        unlink $tmp;
+        io_error('rotate', $ledger, "rename $tmp -> $ledger failed: $!");
+    }
+
+    flock($lk, LOCK_UN);
+    close($lk);
+    exit 0;
 }
 
 # =====================================================================================
@@ -688,6 +962,7 @@ my %DISPATCH = (
     'tick-step'        => \&op_tick_step,
     'set-next-action'  => \&op_set_next_action,
     'add-output'       => \&op_add_output,
+    'rotate'           => \&op_rotate,
     'validate'         => \&op_validate,
 );
 
