@@ -121,7 +121,17 @@ exit "${FAKE_EXIT:-0}"
 SH
 chmod 0755, $FAKE_OPENCODE or die "chmod $FAKE_OPENCODE: $!";
 my $PATH_WITH_FAKE    = "$FAKEBIN:$REAL_PATH";
-my $PATH_WITHOUT_FAKE = $REAL_PATH;
+# A16 needs a PATH on which `opencode` genuinely does not resolve. Using the
+# inherited PATH is NOT sufficient and was a latent defect: the moment a real
+# opencode exists anywhere on it, bp-worker.pl finds and RUNS it, and the
+# "binary absent -> exit 8" case silently becomes a live dispatch (observed:
+# rc=124, a timeout, instead of 8). That is not hypothetical — b34 installs the
+# OpenCode CLI into the container by design, so this test would have started
+# failing for everyone the moment b34 landed.
+# So: keep the real PATH (bash and friends must still resolve — an empty PATH
+# breaks the harness itself) but DROP any directory that actually contains an
+# `opencode` executable. Absence is then guaranteed rather than assumed.
+my $PATH_WITHOUT_FAKE = join ':', grep { !-x "$_/opencode" } split /:/, $REAL_PATH;
 
 # =====================================================================================
 # Scaffolding: BP_DIR fixture builders.
