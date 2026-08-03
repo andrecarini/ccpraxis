@@ -1928,13 +1928,66 @@ sub run {
             for my $pkg (sort keys %$meta) {
                 my $started = judge_inflight($runs, 'resolve', $pkg);
                 next unless defined $started;
+
+                # b31 C3: a LIVE judge pid is NEVER timed out, however old its
+                # marker — a restart cannot revive a dead pid, so pid-liveness
+                # alone is the correct signal and takes precedence over elapsed
+                # time entirely. This alone stops the restart storm.
+                my $jp = judge_pid($runs, 'resolve', $pkg);
+                next if defined($jp) && pid_alive($jp);
+
                 my $v = $read_verdict->('resolve', $pkg);
                 if (!defined $v) {
+                    # b31 C4: never let this path touch a package whose OWN
+                    # status is `running` with a live coordinator, regardless
+                    # of how its judge marker classifies — two of the seven
+                    # 2026-07-30 packages were mid-flight when parked. Guard,
+                    # not optimisation.
+                    if (($status->{$pkg} // '') eq 'running' && pid_alive($pid->{$pkg})) {
+                        next;
+                    }
+
                     # Still running — UNLESS it has blown the timeout (crashed/hung judge):
                     # then fail-safe to a synthetic verdict so the package can't wedge forever.
                     # $started==0 means a garbled marker (lost epoch) — let it run to a real
                     # verdict rather than false-timeout it on the very next tick (C1).
                     next unless $started && ($now - $started) > $t->{judge_to};
+
+                    # b31 C1/C2/C5/C6: the judge pid is dead and no verdict landed.
+                    # Distinguish "never ran" (orphan) from "ran and hung" using
+                    # b29's rate-limit-rejection detector pointed at the JUDGE's
+                    # OWN stream (runs/resolve/<pkg>.jsonl — NOT the coordinator's
+                    # runs/<pkg>.jsonl) — reused rather than a third detector.
+                    my $rl_evidence = rate_limit_rejection_evidence("$runs/resolve", $pkg);
+                    my $has_stream  = -e judge_log_path($runs, 'resolve', $pkg);
+                    if (!$has_stream || defined $rl_evidence) {
+                        _log($log, 'judge_marker_orphaned', { kind => 'resolve', package => $pkg,
+                            evidence => ($rl_evidence // 'no judge stream was ever written') });
+                        # Bounded by the SAME resolve_attempts/resolve_cap ladder
+                        # the coordinator-stuck escalation already enforces — not
+                        # a second, parallel counter.
+                        my $resolve_att = $reg->{$pkg}{resolve_attempts} // 0;
+                        my $verdict = BpJudge::escalation_verdict({ resolve_attempts => $resolve_att, resolve_cap => $t->{resolve_cap} });
+                        if ($verdict eq 'resolve' && !$shutdown) {
+                            my $rc = $spawn_judge->({ kind => 'resolve', pkg => $pkg });
+                            if (defined $rc && $rc == 0) {
+                                # Clean the stale marker so the same orphan can't
+                                # be re-detected next tick (C6) before arming the
+                                # fresh one.
+                                unlink judge_pid_path($runs, 'resolve', $pkg);
+                                mark_judge_inflight($runs, 'resolve', $pkg, $now);
+                                update_registry_pkg($runs, $pkg, { resolve_attempts => $resolve_att + 1 });
+                                _log($log, 'resolve_fire', { package => $pkg, why => 'orphaned judge marker on restart', resolve_attempts => $resolve_att + 1 });
+                                next;
+                            }
+                            _log($log, 'judge_spawn_failed', { kind => 'resolve', package => $pkg, rc => $rc });
+                        }
+                        # Re-fire budget exhausted (or the spawn itself failed):
+                        # fall back to the existing park fail-safe below, exactly
+                        # as an ordinary judge timeout — the fail-safe is
+                        # preserved, not removed.
+                    }
+
                     _log($log, 'judge_timeout', { kind => 'resolve', package => $pkg });
                     $v = { _timeout => 1 };               # normalize_resolve -> park
                 }
