@@ -250,13 +250,30 @@ sub fetch {
     }
 
     unless ($cred->{ok}) {
+        # THREE STATES, not two (ledger done-criterion 1). A provider that was
+        # never configured at all is ABSENT -- there is no meter to read, and
+        # saying "unknown" about it would be a claim we cannot support and would
+        # drag the composed verdict to unknown for a provider the operator never
+        # asked us to govern.
+        #
+        # `missing` means no env var AND no usable fallback file: nobody
+        # configured this provider. Anything else (notably `insecure-file`, a
+        # credential that EXISTS but which we refuse to read) means the provider
+        # IS configured and we could not read its meter -- that is genuinely
+        # unknown, and must keep propagating as such.
+        #
+        # Neither ever becomes a number. Absent is not zero-spent.
+        my $absent = (($cred->{reason} // '') eq 'missing') ? 1 : 0;
+        my $status = $absent ? 'absent' : 'unknown';
         my $result = {
-            status     => 'unknown',
+            status     => $status,
             provider   => $provider,
-            diagnostic => "credential unavailable ($cred->{reason}): $cred->{detail}",
+            diagnostic => $absent
+                ? "provider not configured: $cred->{detail}"
+                : "credential unavailable ($cred->{reason}): $cred->{detail}",
         };
         $cache->{$provider} = { fetched_at => $now, result => $result };
-        $_log->('credential-unavailable', { status => 'unknown', reason => $cred->{reason} });
+        $_log->('credential-unavailable', { status => $status, reason => $cred->{reason} });
         return $result;
     }
 
@@ -329,6 +346,12 @@ sub fetch {
 # ---------------------------------------------------------------------------
 sub verdict {
     my @results = @_;
+    # ABSENT providers are skipped, not counted as unknown: nobody configured
+    # them, so there is no meter to be uncertain about, and letting an
+    # unconfigured provider drag the whole verdict to unknown would make the
+    # default (Zen is off by default) permanently unknown for every operator.
+    # Absent is still never zero -- it simply does not participate.
+    @results = grep { !(ref($_) eq 'HASH' && (($_->{status} // '') eq 'absent')) } @results;
     my @unknown = grep { ref($_) eq 'HASH' && (($_->{status} // '') eq 'unknown') } @results;
 
     if (@unknown) {

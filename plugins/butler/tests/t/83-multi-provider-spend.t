@@ -597,4 +597,79 @@ HTML
         'C10: no real HTTP transport (LWP::UserAgent) was ever loaded while running this suite');
 }
 
+# =====================================================================================
+# C11 -- THREE STATES, not two (ledger done-criterion 1: "a provider that is not
+# configured is reported ABSENT, never as zero-spent -- and a provider whose spend is
+# UNMEASURABLE is a third state, distinct from both absent and zero").
+#
+# Added by the coordinator AFTER this package was marked done. The original oracle went
+# green at 62/62 while asserting only two states, `ok` and `unknown`, so an unconfigured
+# provider was indistinguishable from a configured one whose meter could not be read.
+# The green suite was real; its COVERAGE of the done criteria was not checked against
+# them one by one, and this criterion had no assertion at all. Found while scouting b37,
+# whose own criterion 4 needs four visually distinct states and therefore cannot be built
+# on a struct that collapses two of them.
+# =====================================================================================
+{
+    # Not configured at all: no env var, no fallback file.
+    my ($absent_out, $absent_err) = try_call('BpSpend::fetch (unconfigured provider)', sub {
+        BpSpend::fetch(provider => 'zen', http => sub { die "must not be called\n" },
+                        now => NOW_EPOCH, cache => {},
+                        env_var => 'S16_NEVER_SET_ANYWHERE', env => {},
+                        fallback_path => undef);
+    });
+    ok(!defined $absent_err, 'C11 setup: fetch() on an unconfigured provider returns without dying')
+        or diag($absent_err);
+    my $absent = ref($absent_out) eq 'ARRAY' ? $absent_out->[0] : undef;
+    is(($absent // {})->{status}, 'absent',
+       'C11: a provider with no credential and no fallback file is ABSENT -- not unknown, because there is no meter to be uncertain about');
+
+    # Guarded: an undef result must NOT pass this by having no fields to inspect.
+    ok(ref($absent) eq 'HASH', 'C11 gate: the absent result is a real struct (so the no-numeric check below is not vacuous)');
+    my $absent_dump = join(' ', map { "$_=" . (defined $absent->{$_} ? $absent->{$_} : 'undef') }
+                                sort keys %{ ref($absent) eq 'HASH' ? $absent : {} });
+    unlike($absent_dump, qr/=\s*-?\d+(?:\.\d+)?\b/,
+           'C11: the absent result carries NO numeric field -- absent is not zero-spent');
+
+    # Configured but refused (mode 0600 violated): that IS a meter we could not read.
+    my $tmpdir = tempdir(CLEANUP => 1);
+    my $bad = "$tmpdir/cookie.json";
+    write_file($bad, '{"cookie":"x"}');
+    chmod 0644, $bad;
+    my ($refused_out, $refused_err) = try_call('BpSpend::fetch (insecure credential file)', sub {
+        BpSpend::fetch(provider => 'zen', http => sub { die "must not be called\n" },
+                        now => NOW_EPOCH, cache => {},
+                        env_var => 'S16_NEVER_SET_ANYWHERE', env => {},
+                        fallback_path => $bad);
+    });
+    my $refused = ref($refused_out) eq "ARRAY" ? $refused_out->[0] : undef;
+    is(($refused // {})->{status}, 'unknown',
+       'C11 (the distinction): a credential that EXISTS but is refused is UNKNOWN, not absent -- the provider is configured and its meter is unreadable');
+
+    # And the two must not collapse into each other.
+    isnt(($absent // {})->{status}, ($refused // {})->{status},
+         'C11: absent and unknown are genuinely DIFFERENT states, not two labels for one');
+
+    # verdict(): absent does not drag the composed verdict to unknown (Zen is off by
+    # default, so an unconfigured provider must not make every run permanently unknown).
+    my ($v_absent_out, $v_absent_err) = try_call('BpSpend::verdict (ok + absent)', sub {
+        BpSpend::verdict({ provider => 'claude', status => 'ok' },
+                          { provider => 'zen',    status => 'absent' });
+    });
+    my $v_absent = ref($v_absent_out) eq "ARRAY" ? $v_absent_out->[0] : undef;
+    is(($v_absent // {})->{action}, 'ok',
+       'C11: a verdict over [ok, absent] is ok -- an unconfigured provider does not make the run unknown');
+
+    # VACUITY GATE: verdict must still go unknown when a CONFIGURED provider is unreadable,
+    # so the filtering above cannot be an implementation that ignores everything.
+    my ($v_unknown_out, $v_unknown_err) = try_call('BpSpend::verdict (ok + absent + unknown)', sub {
+        BpSpend::verdict({ provider => 'claude', status => 'ok' },
+                          { provider => 'zen',    status => 'absent' },
+                          { provider => 'go',     status => 'unknown' });
+    });
+    my $v_unknown = ref($v_unknown_out) eq "ARRAY" ? $v_unknown_out->[0] : undef;
+    is(($v_unknown // {})->{action}, 'unknown',
+       'C11 VACUITY GATE: a real unknown still propagates even when an absent provider is also present');
+}
+
 done_testing();
