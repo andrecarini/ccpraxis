@@ -50,6 +50,22 @@ TEST_PATHS=$(fm_get "$LEDGER" test_paths)
 [ -n "$MAXT" ]  || MAXT="${BP_DEFAULT_MAX_TURNS:-80}"
 [ -n "$WRITE_SET" ] || { echo "bp-launch: ledger has empty write_set — refusing to launch an unscoped coordinator" >&2; exit 1; }
 
+# -------- effort (b23): opt-in only. Absent -> no --effort flag at all, byte-
+# identical to today's command line; the session then inherits effortLevel from
+# settings.json, which is today's behaviour. Present -> validated against the
+# named list the `claude` CLI itself accepts (2.1.219: low, medium, high,
+# xhigh, max); an unknown value is refused HERE, before anything is launched —
+# no pid file, no registry entry, no exec of claude at all.
+EFFORT=$(fm_get "$LEDGER" effort)
+EFFORT_ARGS=()
+if [ -n "$EFFORT" ]; then
+  case "$EFFORT" in
+    low|medium|high|xhigh|max) ;;
+    *) echo "bp-launch: unknown effort '$EFFORT' in ledger $LEDGER — refusing to launch (valid: low, medium, high, xhigh, max)" >&2; exit 1 ;;
+  esac
+  EFFORT_ARGS=(--effort "$EFFORT")
+fi
+
 # -------- global parallelism cap (usage-limit protection)
 MAX_PAR="${BP_MAX_PARALLEL:-2}"
 if [ "$FORCE" -ne 1 ]; then
@@ -95,12 +111,12 @@ ATTEMPT=$(registry_get "$BP_NAME" "$PKG" attempt); ATTEMPT=$(( ${ATTEMPT:-0} + 1
     setsid nohup claude -p "$PROMPT" --resume "$RESUME_SID" \
       --output-format stream-json --verbose \
       --model "$MODEL" --max-turns "$MAXT" \
-      --dangerously-skip-permissions >> "$LOG" 2>&1 &
+      --dangerously-skip-permissions "${EFFORT_ARGS[@]}" >> "$LOG" 2>&1 &
   else
     setsid nohup claude -p "$PROMPT" \
       --output-format stream-json --verbose \
       --model "$MODEL" --max-turns "$MAXT" \
-      --dangerously-skip-permissions > "$LOG" 2>&1 &
+      --dangerously-skip-permissions "${EFFORT_ARGS[@]}" > "$LOG" 2>&1 &
   fi
   echo $! > "$PIDFILE"
 )

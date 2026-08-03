@@ -280,19 +280,19 @@ sub write_ledger {
     delete local $ENV{BP_DEFAULT_MAX_TURNS};
 
     my $base = sc(sub { BpOrch::_tunables() });
-    is(hv($base, 'max_par'), 2, 'AC-24 zero-arg _tunables() still yields the env/default max_par of 2');
+    is(hv($base, "max_par"), 3, "AC-24 zero-arg _tunables() still yields the env/default max_par of 3");
 
     my $tf = "$runs/.tunables";
     my @bad = ('not json', '[]', '{"max_par":"lots"}', '{"max_par":0}', '{"max_par":-1}',
                '{"totally_unknown":9}', '{"max_par":null}', '{"max_par":2.5}', '', '{"max_par":');
     for my $b (@bad) {
         spit($tf, $b);
-        is(hv(sc(sub { BpOrch::_tunables($runs) }), 'max_par'), 2,
-           "AC-24 .tunables = '$b' leaves max_par at the env/default 2 (never dies)");
+        is(hv(sc(sub { BpOrch::_tunables($runs) }), "max_par"), 3,
+           "AC-24 .tunables = '$b' leaves max_par at the env/default 3 (never dies)");
     }
     unlink $tf;
-    is(hv(sc(sub { BpOrch::_tunables($runs) }), 'max_par'), 2,
-       'AC-24 absent .tunables -> max_par 2, exactly as today');
+    is(hv(sc(sub { BpOrch::_tunables($runs) }), "max_par"), 3,
+       "AC-24 absent .tunables -> max_par 3 (b23 raised the default from 2)");
 
     spit($tf, '{"max_par":4}');
     is(hv(sc(sub { BpOrch::_tunables($runs) }), 'max_par'), 4,
@@ -319,7 +319,7 @@ sub write_ledger {
     spit("$dir/elsewhere.json", '{"max_par":7}');
     is(hv(sc(sub { BpOrch::_tunables($runs, "$dir/elsewhere.json") }), 'max_par'), 7,
        'AC-23 explicit $file arg overrides the default runs/.tunables path');
-    is(hv(sc(sub { BpOrch::_tunables($runs, "$dir/nope.json") }), 'max_par'), 2,
+    is(hv(sc(sub { BpOrch::_tunables($runs, "$dir/nope.json") }), "max_par"), 3,
        'AC-23 explicit $file arg pointing at a missing file -> defaults, never dies');
 }
 
@@ -702,7 +702,7 @@ my $PIPE_2 = "## Pipeline\n- [x] a\n- [x] b\n";
     {
         my $dir = mk_bp([map { ["n$_", '-', 'pending', "n$_/", ''] } 1..5]);
         my ($L, $err) = go(dir => $dir);
-        is(scalar @$L, 2, 'AC-22 with no .tunables and BP_MAX_PARALLEL unset the cap stays 2, exactly as today');
+        is(scalar @$L, 3, "AC-22 with no .tunables and BP_MAX_PARALLEL unset the cap is the default 3 (b23 raised it from 2)");
     }
 
     # ---- AC-23: the re-read happens per TICK, not once at boot -----------
@@ -725,8 +725,8 @@ my $PIPE_2 = "## Pipeline\n- [x] a\n- [x] b\n";
         });
         my $t0 = grep { $_->{tick} == 0 } @rec;
         my $t1 = grep { $_->{tick} == 1 } @rec;
-        is($t0, 2, 'AC-23 tick 1 launches 2 (no .tunables yet -> default max_par 2)');
-        is($t1, 2, 'AC-23 tick 2 launches 2 more — .tunables written between ticks raised max_par to 4');
+        is($t0, 3, "AC-23 tick 1 launches 3 (no .tunables yet -> default max_par 3)");
+        is($t1, 1, 'AC-23 tick 2 launches 1 more — .tunables raised max_par to 4 and 3 are already live');
         is(scalar @rec, 4, 'AC-23 four packages live in total after the mid-run bump');
     }
 
@@ -736,7 +736,7 @@ my $PIPE_2 = "## Pipeline\n- [x] a\n- [x] b\n";
         spit("$dir/runs/.tunables", $bad);
         my ($L, $err) = go(dir => $dir);
         is($err, '', "AC-24 the tick completes with .tunables = '$bad'");
-        is(scalar @$L, 2, "AC-24 .tunables = '$bad' leaves the launch cap at the env/default 2");
+        is(scalar @$L, 3, "AC-24 .tunables = '$bad' leaves the launch cap at the env/default 3");
     }
 
     # ---- AC-25: an injected tunables hash wins entirely (t/08, t/11 shape)
