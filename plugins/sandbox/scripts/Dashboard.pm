@@ -566,6 +566,31 @@ my $GLYPH_WHITE  = Encode::encode('UTF-8', "\x{26AA}");
 my $TRI_UP       = Encode::encode('UTF-8', "\x{25B2}");
 my $TRI_DOWN     = Encode::encode('UTF-8', "\x{25BC}");
 
+# %BUTLER_KIND_STYLE -- s16-fleet-event-source spec S3: butler-fleet and
+# keep-awake event kinds NOT already covered by event_style's pre-existing
+# suffix regexes (those regexes already classify e.g. *_failed/*_error as
+# 'bad' and *_start/*_launch(ed) as 'accent' -- orchestrator_start,
+# fleet_launched, launch, launch_failed, pkg_failed, checkpoint_failed and
+# creds_error all fall through to those unaided; listing checkpoint_failed
+# and creds_error here too is harmless/redundant, not load-bearing). This
+# table is consulted AFTER those regexes and BEFORE the generic fallback, so
+# an unknown kind still reaches the fallback untouched (criterion c).
+my %BUTLER_KIND_STYLE = (
+    watchdog_relaunch => [ 'warn',   $GLYPH_YELLOW ],
+    pkg_finished      => [ 'good',   $GLYPH_GREEN ],
+    pause             => [ 'warn',   $GLYPH_YELLOW ],
+    checkpoint        => [ 'accent', $GLYPH_WHITE ],
+    checkpoint_failed => [ 'bad',    $GLYPH_RED ],
+    creds_error       => [ 'bad',    $GLYPH_RED ],
+    'broken-env'      => [ 'bad',    $GLYPH_RED ],
+    'turn-starved'    => [ 'warn',   $GLYPH_YELLOW ],
+    remediation       => [ 'warn',   $GLYPH_YELLOW ],
+    notice            => [ 'accent', $GLYPH_WHITE ],
+    review            => [ 'warn',   $GLYPH_YELLOW ],
+    acquire           => [ 'good',   $GLYPH_GREEN ],
+    release           => [ 'muted',  $GLYPH_WHITE ],
+);
+
 # @SPINNER -- the ten braille spinner glyphs already allow-listed at
 # Dashboard.pm:230-239 (dots-1..dots-10 order, per their own comments),
 # ordered here (the hash %GLYPH_TABLE carries no order). s07-live-status
@@ -734,6 +759,7 @@ sub event_style {
     return ('good', $GLYPH_GREEN)   if defined $state && $state eq 'ok';
     return ('accent', $GLYPH_WHITE)
         if $type =~ /(?:^|_)(?:start|create|launch)(?:ed)?$/ || $type eq 'launch_session';
+    return @{ $BUTLER_KIND_STYLE{$type} } if exists $BUTLER_KIND_STYLE{$type};
     return ('value', $GLYPH_WHITE);
 }
 
@@ -1856,6 +1882,12 @@ sub _ev_scalar {
     return '<ref>';
 }
 
+# $EVENT_FIELD_MAX_LEN -- s16-fleet-event-source spec S3/C6: a bound on the
+# per-row event text BEFORE _safe sanitization, so an oversized untrusted
+# JSON field (an attacker-influenceable reason/type string) can't paint an
+# unbounded blob into a fixed-height panel.
+my $EVENT_FIELD_MAX_LEN = 500;
+
 sub recent_events {
     my ($lines, $n, $localtime_fn) = @_;
     $lines ||= [];
@@ -1870,16 +1902,26 @@ sub recent_events {
         my $hms  = _event_time($ts, $localtime_fn);
         my $type = _ev_scalar($rec->{type});
         $type = 'event' if !defined $type;
-        my $extra = '';
-        my $exit  = _ev_scalar($rec->{exit});
-        my $state = _ev_scalar($rec->{state});
-        $extra .= " exit=$exit"   if defined $exit;
-        $extra .= " state=$state" if defined $state;
+        my $extra  = '';
+        my $exit   = _ev_scalar($rec->{exit});
+        my $state  = _ev_scalar($rec->{state});
+        # s16-fleet-event-source spec S3: `pause`'s reason (and any other
+        # kind's, generically -- the field isn't pause-specific) must reach
+        # the rendered row, same as exit/state already do.
+        my $reason = _ev_scalar($rec->{reason});
+        $extra .= " exit=$exit"     if defined $exit;
+        $extra .= " state=$state"   if defined $state;
+        $extra .= " reason=$reason" if defined $reason;
         my ($role, $glyph) = event_style($type, $exit, $state);
+        my $body = "$type$extra";
+        # C6: bound an oversized untrusted field BEFORE sanitizing, so a
+        # pathological JSON value can't blow up the row regardless of how
+        # much of it survives control-character stripping.
+        $body = substr($body, 0, $EVENT_FIELD_MAX_LEN) if length($body) > $EVENT_FIELD_MAX_LEN;
         my @spans;
         push @spans, { text => "$hms  ", role => 'muted' } if length $hms;
         push @spans, { text => "$glyph ", role => $role };
-        push @spans, { text => "$type$extra", role => $role };
+        push @spans, { text => _safe($body), role => $role };
         push @ev, \@spans;
     }
     my @last = @ev > $n ? @ev[-$n .. -1] : @ev;

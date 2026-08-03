@@ -774,6 +774,11 @@ my $HISTORY_EVENTS_PER_LOG = 10;   # parsed events kept from EACH prior log
 my $ACTIVITY_EVENT_MAX     = 50;   # total events handed to state.events (unchanged ceiling)
 my $HISTORY_SPAN_TEXT_MAX  = 200;  # bytes-per-span clamp applied to HISTORY rows only
 
+# s16-fleet-event-source: read-side caps for the active blueprint run's
+# orchestrator.log, mirroring the $HISTORY_* idiom immediately above.
+my $ORCH_TAIL_LINES        = 200;  # lines tailed from orchestrator.log per tick
+my $ORCH_EVENTS_PER_LOG    = 10;   # parsed events kept from orchestrator.log per tick
+
 # A non-empty backpack-install warning (set during the setup pass) that the
 # dashboard renders as a red alert banner — so a failure isn't lost behind the
 # alt-screen the way the pre-dashboard stdout warning is (#20). File-scope so the
@@ -3713,6 +3718,15 @@ sub enter_dashboard {
             my $stay = KeepAwake::should_stay_awake($busy_age, $BUSY_STALE) ? 1 : 0;
             my @lines = _tail_lines($log_path, 200);
             my $cur   = Dashboard::recent_events(\@lines, $ACTIVITY_EVENT_MAX);
+            # s16-fleet-event-source: fold the active blueprint run's
+            # orchestrator.log into the SAME activity panel (SYN-5 -- not a
+            # second feed) via the best-effort cross-source interleave, never
+            # a plain sort (spec S1). Within each source, append order is
+            # untouched; only absent/empty orchestrator activity is a no-op.
+            my $orch_ev = _gather_orchestrator_events($cached_runs);
+            $cur = LaunchLog::merge_by_key([ $cur, $orch_ev ],
+                       key => \&_row_time_key, max => $ACTIVITY_EVENT_MAX)
+                if ref $orch_ev eq 'ARRAY' && @$orch_ev;
             return {
                 project_name    => $PROJECT_NAME,
                 container       => $CONTAINER_NAME,
@@ -4455,6 +4469,79 @@ sub _history_events {
         1;
     } or do { @groups = () };      # any failure -> no history, dashboard behaves exactly as today
     return @groups;
+}
+
+# _gather_orchestrator_events($runs) -> ARRAYREF of span-rows -- spec S2
+# (s16-fleet-event-source). Mirrors _history_events' degrade posture exactly:
+# any failure (no active blueprint run, no orchestrator.log, unreadable,
+# malformed JSONL) degrades to no orchestrator events at all -- the dashboard
+# still renders. $runs is the already-gathered RunState::summarize() list
+# (s10's $cached_runs), reused rather than re-walked here, so this stays a
+# single bounded file read per tick: at most one orchestrator.log, tailed at
+# most once, host-visible under the project's .ccpraxis-local-data/ tree
+# (RunState's runs_dir is "<project>/.ccpraxis-local-data/blueprints/<bp>/runs").
+sub _gather_orchestrator_events {
+    my ($runs) = @_;
+    my $ev = [];
+    eval {
+        # RunState's runs_dir is host-visible under the project's
+        # .ccpraxis-local-data/ tree (.ccpraxis-local-data/blueprints/<bp>/runs).
+        my @candidates = grep { ref($_) eq 'HASH' && defined $_->{runs_dir} } @{ $runs || [] };
+        my ($active) = grep { ($_->{state} || '') eq 'running' } @candidates;
+        ($active) = grep { ($_->{state} || '') eq 'paused' } @candidates if !$active;
+        if ($active) {
+            my $log = "$active->{runs_dir}/orchestrator.log";
+            if (-f $log) {
+                my @lines = _tail_lines($log, $ORCH_TAIL_LINES);
+                my $rows  = Dashboard::recent_events(\@lines, $ORCH_EVENTS_PER_LOG);
+                $ev = $rows if ref $rows eq 'ARRAY';
+            }
+        }
+        1;
+    } or do { $ev = [] };          # any failure -> no orchestrator events, dashboard still renders
+    return $ev;
+}
+
+# _row_time_key($row) -> seconds-since-local-midnight | undef (private helper
+# for the s16 cross-source interleave). recent_events rows don't carry a raw
+# epoch, only the already-rendered "HH:MM:SS  " muted span (Dashboard.pm's
+# _event_time), so that is the best-effort comparable key LaunchLog::merge_by_key
+# needs. Unparseable -> undef, which merge_by_key treats as "keep this source's
+# own append order" rather than as an error.
+# _row_time_key($row) -> seconds-since-midnight, or undef.
+#
+# The caller-supplied key extractor for LaunchLog::merge_by_key (s16 spec S1.1).
+# Best-effort by construction: rendered rows carry no raw epoch, only the muted
+# HH:MM:SS span, so this recovers what is there.
+#
+# TWO KNOWN LIMITATIONS, recorded rather than left for the next reader to
+# rediscover. Both are bounded by the spec's ordering ruling (S1): within a
+# source, append order is authoritative and is NEVER violated -- merge_by_key is
+# stable and only ever compares the two sources' HEADS, so neither limitation can
+# reorder a source's own events. Only CROSS-SOURCE placement is affected, which
+# the ruling already declares best-effort.
+#
+#   1. MIDNIGHT WRAP. This key resets to 0 at midnight, so for the rest of that
+#      tick an event at 00:00:05 (key 5) sorts before one at 23:59:55 (key
+#      86395). Unlike clock skew this is systematic, not occasional: any run
+#      crossing midnight hits it, and this blueprint documents 13-hour fleet
+#      runs. The visible symptom is a handful of fleet events appearing slightly
+#      early in the panel around the boundary -- never a scrambled source.
+#      Fixing it properly means carrying a raw epoch on the row, which changes a
+#      structure s06 owns and that t/41's 453 assertions pin; that is a
+#      deliberate escalation, not a silent widening.
+#
+#   2. COUPLING TO RENDERED TEXT. This parses display output to recover a sort
+#      key. s17 is next on this same panel; if it changes the leading timestamp
+#      span, this returns undef, the merge degrades to source-order fallback,
+#      and NOTHING FAILS LOUDLY. Whoever touches that rendering must re-check
+#      here.
+sub _row_time_key {
+    my ($row) = @_;
+    return undef unless ref $row eq 'ARRAY' && @$row && ref $row->[0] eq 'HASH';
+    my $t = $row->[0]{text};
+    return undef unless defined $t && $t =~ /^(\d\d):(\d\d):(\d\d)/;
+    return $1 * 3600 + $2 * 60 + $3;
 }
 
 # _spawn_session — the dashboard's launch-claude hotkey: open a NEW Windows

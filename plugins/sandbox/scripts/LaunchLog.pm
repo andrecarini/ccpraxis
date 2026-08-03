@@ -144,4 +144,78 @@ sub merge_sessions {
     return \@out;
 }
 
+# merge_by_key($sources, key => $keyfn, max => $n) -> \@merged (spec S1/S1.1,
+# s16-fleet-event-source). The cross-source, best-effort-chronological
+# interleave that `merge_sessions` (above) deliberately cannot do, because it
+# never inspects an item. `merge_by_key` doesn't either -- ONLY the caller's
+# `key` coderef does, so s13's opacity guarantee is unaffected.
+#
+# $sources : arrayref of arrayrefs; each inner array is ONE source's items,
+#            already in that source's own authoritative append order (e.g. one
+#            array per log file, oldest-appended first).
+# key      : REQUIRED coderef; given an item, returns a comparable scalar
+#            (epoch seconds) or undef when it cannot be determined. Required
+#            (not defaulted) so a caller can't silently fall back to
+#            append-order-only merging while believing it's time-ordered.
+# max      : optional total cap -- keeps the most recent (trailing) $max items.
+#
+# THE ORDERING RULING (spec S1): within one source, append order is NEVER
+# violated -- a clock that jumps backwards mid-source must not reorder that
+# source's own items. Across sources, ordering is best-effort by timestamp.
+# This holds structurally, not by sorting: at every step we only ever compare
+# the CURRENT HEAD of each source (an N-way merge, like mergesort's merge
+# step) and advance the winning source's cursor by one. Two items from the
+# SAME source are therefore never compared against each other -- one of them
+# is always still "behind" its source's own head when the other is emitted --
+# so no key, however skewed, can ever reorder a source's own sequence. This is
+# also why a single source degenerates to pure append order regardless of its
+# keys (proven by the oracle's C4a).
+#
+# STABLE on ties/undef/skew: when two current heads don't have a strictly
+# smaller key than the running best, the earlier-found head (lower $sources
+# index) keeps precedence, so equal or unknown keys don't reshuffle relative
+# to a deterministic, source-order fallback.
+#
+# TOTAL: never dies, never warns. A $keyfn that dies on some item is caught
+# per-item (that item's key degrades to undef) rather than aborting the merge.
+sub merge_by_key {
+    my ($sources, %opts) = @_;
+    my $keyfn = $opts{key};
+    return [] unless ref $sources eq 'ARRAY';
+    return [] unless ref $keyfn eq 'CODE';
+
+    my @srcs = map { (ref $_ eq 'ARRAY') ? $_ : [] } @$sources;
+    my @pos  = (0) x scalar(@srcs);
+
+    my @out;
+    while (1) {
+        my $best_i;
+        my $best_key;
+        for my $i (0 .. $#srcs) {
+            next if $pos[$i] > $#{ $srcs[$i] };
+            my $item = $srcs[$i][ $pos[$i] ];
+            my $k = eval { $keyfn->($item) };
+            $k = undef if $@;
+            if (!defined $best_i) {
+                $best_i  = $i;
+                $best_key = $k;
+                next;
+            }
+            if (defined $k && (!defined $best_key || $k < $best_key)) {
+                $best_i   = $i;
+                $best_key = $k;
+            }
+        }
+        last unless defined $best_i;
+        push @out, $srcs[$best_i][ $pos[$best_i] ];
+        $pos[$best_i]++;
+    }
+
+    my $max = $opts{max};
+    if (defined $max && $max =~ /^\d+$/ && $max >= 1 && @out > $max) {
+        @out = @out[ -$max .. -1 ];
+    }
+    return \@out;
+}
+
 1;

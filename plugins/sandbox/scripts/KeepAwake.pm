@@ -40,17 +40,26 @@ sub should_stay_awake {
     return ($age <= $stale) ? 1 : 0;
 }
 
-# new(start => \&start, stop => \&stop) — a lifecycle holder.
+# new(start => \&start, stop => \&stop, on_event => \&on_event) — a lifecycle
+# holder.
 #   start->()        spawns the wake-lock helper, returns an opaque handle (PID).
 #   stop->($handle)  releases it (kills the helper).
-# Both default to no-ops so a holder is always safe to construct/sync.
+#   on_event->(%event) — s16-fleet-event-source: an optional emit seam, called
+#     ONLY on a state TRANSITION (acquire/release), never on a repeated sync(1)
+#     while already held nor a repeated sync(0) while already released -- that
+#     would flood the activity panel with duplicates (the exact heartbeat-noise
+#     problem s17 fixes elsewhere). Defaults to a no-op so existing callers that
+#     don't pass it are unaffected. Never dies: a broken on_event coderef must
+#     not take down the keep-awake lifecycle it's merely observing.
+# All three default to no-ops so a holder is always safe to construct/sync.
 sub new {
     my ($class, %a) = @_;
     return bless {
-        start   => $a{start} || sub { undef },
-        stop    => $a{stop}  || sub { },
-        running => 0,
-        handle  => undef,
+        start    => $a{start}    || sub { undef },
+        stop     => $a{stop}     || sub { },
+        on_event => $a{on_event} || sub { },
+        running  => 0,
+        handle   => undef,
     }, $class;
 }
 
@@ -67,12 +76,14 @@ sub sync {
     if ($want && !$self->{running}) {
         $self->{handle}  = $self->{start}->();
         $self->{running} = 1;
+        eval { $self->{on_event}->(kind => 'acquire'); 1 };
         return 'start';
     }
     if (!$want && $self->{running}) {
         $self->{stop}->($self->{handle});
         $self->{handle}  = undef;
         $self->{running} = 0;
+        eval { $self->{on_event}->(kind => 'release'); 1 };
         return 'stop';
     }
     return 'noop';
