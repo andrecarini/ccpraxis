@@ -365,7 +365,7 @@ fi
 say "project        $PROJECT"
 say "store-dir      $STORE"
 say "virtual-store  $VSTORE"
-say ".npmrc         $NPMRC_STATE"
+say "pnpm-workspace $WORKSPACE_STATE"
 if [ "$GI_ADDED" = 1 ]; then
   say ".gitignore     +1 entry"
 else
