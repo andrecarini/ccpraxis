@@ -178,21 +178,96 @@ sub write_sets_overlap {
     return 0;
 }
 
+# --- b22: is a package's requires_clean_tree field the literal string 'true'
+# (whitespace-trimmed)? ledger_fm always hands back a raw string (or undef)
+# from YAML-ish frontmatter text, never a Perl boolean -- so a loose
+# truthiness check would treat the STRING 'false' as constrained, which is
+# wrong. Absent/undef, 'false', and any other malformed text (e.g. 'YES',
+# '1maybe') are all treated as NOT constrained, mirroring b44's
+# malformed-priority handling: never die, default to today's behaviour.
+sub _clean_tree_required {
+    my ($raw) = @_;
+    return 0 unless defined $raw;
+    my $t = "$raw";
+    $t =~ s/^\s+//; $t =~ s/\s+$//;
+    return $t eq 'true' ? 1 : 0;
+}
+
 # --- newly-ready packages: pending, deps all done, write-set disjoint from every
 # currently-running package. $meta = { pkg => {deps=>[...], write_set=>"..."} }.
+#
+# b22: a package declaring requires_clean_tree is additionally gated on
+# "nothing else is running" (never on write-set intersection -- that's the
+# whole point, see spec b22 SS3). This constraint never enters the DAG
+# (parse_dag/deps_met untouched) so it cannot fool b08's deadlock detector,
+# and it gates on the RUNNING set, never the pending/done set, so a
+# conflicting package that never runs at all cannot block it (soft != hard).
+#
+# The drain rule (spec b22 SS3.2): once a requires_clean_tree package is
+# otherwise-ready (pending, deps met, write-set disjoint) but excluded only
+# because something else is currently running, EVERY new launch this round is
+# suppressed -- not just that package's. This is a pure suppression of the
+# return value; no status is mutated, nothing is written, no decision is
+# queued (it must never look like a park -- that's b18's territory).
+#
+# Same-round collision (spec b22 SS3.1): two mutually-constrained packages
+# can both be "otherwise ready" simultaneously when nothing is running yet
+# (nothing to gate on). Launching both in the same round would still run them
+# concurrently, so at most one requires_clean_tree package is admitted per
+# call -- chosen via order_ready (already deterministic; no new tie-break).
+# The rest simply remain pending and are reconsidered next call, once the
+# admitted one shows up in the running set and gates them via the rule above.
 sub ready_packages {
     my ($meta, $status, $running) = @_;
     my @run_ws = map { $meta->{$_}{write_set} } grep { exists $meta->{$_} } @{ $running || [] };
-    my @ready;
+    my $running_nonempty = (ref $running eq 'ARRAY' && @$running) ? 1 : 0;
+
+    # b22 G2: while a requires_clean_tree package is RUNNING, NOTHING else may
+    # become ready -- not just it rejoining, but siblings starting fresh under
+    # it too (this is DAG-01 exactly: 05 editing shared code while 07's e2e
+    # ran). Specific to the constraint: an UNCONSTRAINED running package must
+    # not suppress anything (vacuity gate, spec C11).
+    my $constrained_running = grep {
+        exists $meta->{$_} && _clean_tree_required($meta->{$_}{requires_clean_tree})
+    } @{ $running || [] };
+    return () if $constrained_running;
+
+    my @candidates;
     for my $pkg (sort keys %$meta) {
         my $st = $status->{$pkg} // 'pending';
         next unless $st eq 'pending';
         next unless deps_met($meta->{$pkg}{deps}, $status);
         my $ws = $meta->{$pkg}{write_set};
         next if grep { write_sets_overlap($ws, $_) } @run_ws;
-        push @ready, $pkg;
+        push @candidates, $pkg;
     }
-    return order_ready(\@ready, $meta);
+
+    my $blocked_by_running = 0;
+    my @filtered;
+    for my $pkg (@candidates) {
+        if (_clean_tree_required($meta->{$pkg}{requires_clean_tree}) && $running_nonempty) {
+            $blocked_by_running = 1;
+            next;
+        }
+        push @filtered, $pkg;
+    }
+    return () if $blocked_by_running;   # drain: suppress ALL new launches this round
+
+    # b22 G3: when admitted from an EMPTY running set, a requires_clean_tree
+    # package is admitted ALONE -- launching it beside pending siblings would
+    # violate its own constraint the instant they all became 'running'
+    # together. (Constrained candidates only ever reach this point when the
+    # running set was empty -- G1 above already excludes them otherwise.)
+    # order_ready picks the one to admit (already deterministic; no new
+    # tie-break, spec SS3.1); everything else -- other constrained candidates
+    # AND unconstrained siblings alike -- waits for the next call.
+    my @constrained = grep { _clean_tree_required($meta->{$_}{requires_clean_tree}) } @filtered;
+    if (@constrained) {
+        my @ordered = order_ready(\@constrained, $meta);
+        return ($ordered[0]);
+    }
+
+    return order_ready(\@filtered, $meta);
 }
 
 # --- b44: order an already-eligible ready-set by (priority ascending, package
@@ -1625,7 +1700,7 @@ sub _load_state {
     my (%meta, %status, %att, %pid, %sid);
     for my $pkg (keys %$dag) {
         $status{$pkg} = ledger_fm($bpdir, $pkg, 'status') // ($reg->{$pkg}{status} // 'pending');
-        $meta{$pkg}   = { deps => $dag->{$pkg}, write_set => (ledger_fm($bpdir, $pkg, 'write_set') // ''), priority => ledger_fm($bpdir, $pkg, 'priority') };
+        $meta{$pkg}   = { deps => $dag->{$pkg}, write_set => (ledger_fm($bpdir, $pkg, 'write_set') // ''), priority => ledger_fm($bpdir, $pkg, 'priority'), requires_clean_tree => ledger_fm($bpdir, $pkg, 'requires_clean_tree') };
         $att{$pkg}    = $reg->{$pkg}{attempt} // 0;
         $pid{$pkg}    = $reg->{$pkg}{pid};
         $sid{$pkg}    = $reg->{$pkg}{session_id};

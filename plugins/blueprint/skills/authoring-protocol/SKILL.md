@@ -59,6 +59,42 @@ The chosen profile governs the `model`/`effort` assignment guidance above for ev
 
 `list` / `view` read files only. `audit` re-runs `blueprint:bp-auditor`. `archive` / `delete` are lifecycle ops on the files. This plugin never touches running coordinator processes — those live in the sandbox and are butler's to stop. A user decision that implies substantial new work becomes a **new blueprint**, not scope creep on an existing one.
 
+## Soft ordering vs a hard dependency edge
+
+`depends_on` is not the only ordering tool. Two different needs get confused if you reach for the DAG
+for both:
+
+- **Hard edge (`depends_on`)** — you need the other package's **output**. It must reach `done` before
+  you can start; if it never runs, you must never start either. Use `depends_on`.
+- **Soft constraint (`requires_clean_tree: true`, package-ledger frontmatter)** — you need the tree in
+  a **state** (it compiles, nothing else is mid-edit), and you do not care whether the other package
+  ever runs at all — only that it is not running **right now**. A package declaring
+  `requires_clean_tree: true` will not be launched while *any* other package is running, and this is
+  invisible to write-set disjointness by design: two packages can have completely disjoint `write_set`s
+  and still break each other if one needs the whole tree to build while the other is mid-edit anywhere
+  in it.
+
+Worked example: package `07` needs the repository to compile end-to-end (it runs the full test suite
+against the built tree). Packages `04` and `05` touch unrelated files but leave the tree
+non-compiling for stretches while they work. Naming `04` and `05` in a hand-written "do not run me with
+X" list breaks the moment a third such package, `06`, gets added later in the blueprint — the
+declaration is stale the instant the blueprint grows. `requires_clean_tree: true` on `07` needs no
+names and never goes stale: it derives its conflict set from whatever happens to be running at
+evaluation time.
+
+**Do not turn a soft constraint into a `depends_on` edge as a shortcut.** That silently converts "not
+concurrently with" into "only after `X` reaches `done`" — if `X` is ever skipped, retired, or never
+scheduled, your package would then hang forever waiting on it. `requires_clean_tree` gates on the
+*running* set only, so a conflicting package that never runs at all does not block you.
+
+**Warning — this is real serialization, not a hang, but it costs you parallelism.** If every package in
+a blueprint declares `requires_clean_tree: true`, the whole run becomes fully serial: only one package
+at a time is ever eligible, because each one blocks every other while it runs. That is a correct
+result, not a bug — but it silently opts the blueprint out of parallelism, and an author should learn
+that from this paragraph, not from watching a fleet dispatch run one package at a time. Reach for
+`requires_clean_tree` only on the packages that actually need a compiling tree; leave the rest
+ungated.
+
 ## Blueprint file discipline
 
 `blueprint.md` is the source of truth for the initiative. Keep it current as you author and revise: append (never silently rewrite) Decisions, keep the package status table accurate, refresh `last_updated`. Once butler starts executing, the per-package ledgers become the live record butler maintains; you return to authoring only to re-scope or add packages.
