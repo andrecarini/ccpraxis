@@ -65,6 +65,20 @@ our $VERDICT_RETRY_MAX = 3;
 # Absolute script dir: lets tests `require` from any working dir.
 my $DIR = dirname(abs_path(__FILE__));
 
+# b44: require bp-orchestrator.pl SOLELY to delegate to its one new pure
+# function, BpOrch::order_ready (priority-ordering of an already-eligible ready
+# set). This is deliberately narrow — the other eight functions this file
+# mirrors from BpOrch (see the `# Mirrored from BpOrch::...` comments below)
+# are left as faithful copies on purpose (spec b44-execution-priority §3.1);
+# t/17-drive-next.t asserts BpDrive's own write_sets_overlap behaviour
+# (including its deliberate empty-prefix landmine), so collapsing those
+# mirrors into requires would churn an immutable oracle for no gain here.
+# Measured safe to require: bp-orchestrator.pl is `package BpOrch;` ending
+# `package main; unless (caller) {...} 1;`, requires cleanly in ~0.1s with no
+# side effects, and its whole require-tree is core-Perl only (t/06 already
+# does this same require).
+require "$DIR/bp-orchestrator.pl";
+
 # ===========================================================================
 # PURE DECISION FUNCTIONS (no I/O, no globals, no network — unit-tested in t/17)
 # ===========================================================================
@@ -171,7 +185,9 @@ sub ready_packages {
         next if grep { write_sets_overlap($ws, $_) } @run_ws;
         push @ready, $pkg;
     }
-    return @ready;
+    # b44: delegate ordering to the ONE shared rule (BpOrch::order_ready) rather
+    # than growing a second copy of the priority-sort logic here.
+    return BpOrch::order_ready(\@ready, $meta);
 }
 
 # 4. blueprint_settled($meta, $status, $parked_bool) → 0|1
@@ -355,6 +371,7 @@ sub read_state {
             $meta{$pkg}   = {
                 deps      => $dag->{$pkg},
                 write_set => (ledger_fm($bpdir, $pkg, 'write_set') // ''),
+                priority  => ledger_fm($bpdir, $pkg, 'priority'),
             };
         }
         $bp_meta{$bp}   = \%meta;

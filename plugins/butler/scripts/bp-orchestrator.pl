@@ -192,7 +192,35 @@ sub ready_packages {
         next if grep { write_sets_overlap($ws, $_) } @run_ws;
         push @ready, $pkg;
     }
-    return @ready;
+    return order_ready(\@ready, $meta);
+}
+
+# --- b44: order an already-eligible ready-set by (priority ascending, package
+# name ascending). Pure: no I/O, no globals, no die. DEFAULT_PRIORITY=100 is
+# applied whenever a package's priority is absent/undef/empty/non-integer, so
+# that with no annotations at all this is byte-for-byte `sort keys` — today's
+# exact behaviour (spec §3.2). Negative integers are LEGAL, not malformed.
+# Malformed (non-integer) input is logged once per package per call to STDERR
+# and treated as the default; this function never dies.
+use constant DEFAULT_PRIORITY => 100;
+sub order_ready {
+    my ($ready, $meta) = @_;
+    my %prio;
+    for my $pkg (@$ready) {
+        my $raw = $meta->{$pkg}{priority};
+        my $val = DEFAULT_PRIORITY;
+        if (defined $raw) {
+            my $t = "$raw";
+            $t =~ s/^\s+//; $t =~ s/\s+$//;
+            if ($t =~ /^-?\d+$/) {
+                $val = $t + 0;
+            } else {
+                warn "b44: package '$pkg' has malformed priority '$raw' -- defaulting to " . DEFAULT_PRIORITY . "\n";
+            }
+        }
+        $prio{$pkg} = $val;
+    }
+    return sort { $prio{$a} <=> $prio{$b} || $a cmp $b } @$ready;
 }
 
 # --- b08: find every distinct cycle in a { pkg => [dep,...] } sub-DAG. Uses
@@ -1409,7 +1437,7 @@ sub _load_state {
     my (%meta, %status, %att, %pid, %sid);
     for my $pkg (keys %$dag) {
         $status{$pkg} = ledger_fm($bpdir, $pkg, 'status') // ($reg->{$pkg}{status} // 'pending');
-        $meta{$pkg}   = { deps => $dag->{$pkg}, write_set => (ledger_fm($bpdir, $pkg, 'write_set') // '') };
+        $meta{$pkg}   = { deps => $dag->{$pkg}, write_set => (ledger_fm($bpdir, $pkg, 'write_set') // ''), priority => ledger_fm($bpdir, $pkg, 'priority') };
         $att{$pkg}    = $reg->{$pkg}{attempt} // 0;
         $pid{$pkg}    = $reg->{$pkg}{pid};
         $sid{$pkg}    = $reg->{$pkg}{session_id};
