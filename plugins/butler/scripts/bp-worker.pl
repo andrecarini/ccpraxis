@@ -103,13 +103,16 @@ sub _read_raw {
 
 sub usage_text {
     return <<'USAGE';
-usage: bp-worker.pl --worker <name> --prompt-file <path> [--model <M>] [--help]
+usage: bp-worker.pl --worker <name> --prompt-file <path> [--model <M>]
+                     [--turn-budget <N>] [--help]
 
   --worker <name>       required; one of: implementer, test-writer, ui-prober,
                         scout, architect, reviewer, redteam (any of the
                         bp-<name> / butler:bp-<name> spellings also accepted)
   --prompt-file <path>  required; readable file whose contents are the prompt
   --model <M>           optional; passed through to a non-claude backend
+  --turn-budget <N>     optional; materialises a per-dispatch copy of the
+                        OpenCode agent file with `steps:` overridden to N
   --help                print this message and exit 0
 USAGE
 }
@@ -152,6 +155,13 @@ my %opt;
         }
         elsif ($a =~ /^--model=(.*)$/) {
             $opt{model} = $1;
+        }
+        elsif ($a eq '--turn-budget') {
+            usage_error('--turn-budget requires a value') unless @args;
+            $opt{turn_budget} = shift @args;
+        }
+        elsif ($a =~ /^--turn-budget=(.*)$/) {
+            $opt{turn_budget} = $1;
         }
         else {
             usage_error("unrecognised argument: $a");
@@ -293,7 +303,10 @@ for my $d (@path_dirs) {
     }
 }
 if (!defined $backend_bin) {
-    print STDERR "bp-worker.pl: backend '$backend' not found or not executable on PATH\n";
+    print STDERR "bp-worker.pl: backend '$backend' not found or not executable on PATH."
+        . " Install it (see plugins/sandbox/container/Containerfile's opencode section),"
+        . " check it is backpack-declared (/backpack:list), and confirm PATH includes"
+        . " /usr/bin inside this environment.\n";
     exit 8;
 }
 
@@ -356,6 +369,50 @@ close($create_fh);
 my $prompt_file = $opt{prompt_file};
 my $model = $opt{model};
 
+# ---------------------------------------------------------------------------
+# 8b. --turn-budget (§2.1): materialise a per-dispatch copy of the OpenCode
+# agent file with `steps:` overridden, and point the dispatch at it. Shipped
+# agents already carry a per-role default `steps` (mirroring the Claude
+# twin's maxTurns); this is the dispatch-time override half of that decision.
+# ---------------------------------------------------------------------------
+my $materialised_agent_file;
+my $materialised_agent_dir;
+my $materialised_agent_name;
+# OpenCode discovers agents relative to the directory it runs in. The backend is
+# exec'd without a chdir, so it inherits this process's cwd; BP_PROJECT_ROOT is the
+# contractual project root and is what a jailed or unjailed worker is pointed at.
+(my $run_cwd = ($ENV{BP_PROJECT_ROOT} // '.')) =~ s{\\}{/}g;
+if (defined $opt{turn_budget} && length $opt{turn_budget} && $opt{turn_budget} =~ /^\d+$/) {
+    (my $agent_src = "$Bin/../opencode/bp-$SHORT.md") =~ s{\\}{/}g;
+    if (-r $agent_src) {
+        my $agent_content = _read_raw($agent_src);
+        if (defined $agent_content) {
+            if ($agent_content =~ /^steps:\s*\d+.*$/m) {
+                $agent_content =~ s/^steps:\s*\d+(.*)$/steps: $opt{turn_budget}$1/m;
+            }
+            else {
+                $agent_content =~ s/(\A---\s*\n)/$1steps: $opt{turn_budget}\n/;
+            }
+            # MUST land in the directory OpenCode actually reads. Measured against the
+            # real CLI (1.18.7): an agent .md dropped in `<cwd>/.opencode/agents/<name>.md`
+            # shows up in `opencode agent list` and is selectable with `--agent <name>`;
+            # the singular `.opencode/agent/` is NOT read. Writing it anywhere else
+            # (e.g. straight into reports/) produces a file nothing ever loads, so the
+            # turn budget would silently not apply — exactly the failure this package's
+            # ledger warns would "quietly undo" b09/b10/b11/b23.
+            $materialised_agent_dir  = "$run_cwd/.opencode/agents";
+            make_path($materialised_agent_dir) unless -d $materialised_agent_dir;
+            $materialised_agent_name = "bp-$SHORT-tb-$ts";
+            $materialised_agent_file = "$materialised_agent_dir/$materialised_agent_name.md";
+            sysopen(my $afh, $materialised_agent_file, O_WRONLY | O_CREAT | O_TRUNC, 0644)
+                or die "bp-worker.pl: cannot write materialised agent file $materialised_agent_file: $!";
+            binmode $afh;
+            print $afh $agent_content;
+            close $afh;
+        }
+    }
+}
+
 my $pid = fork();
 die "bp-worker.pl: fork failed: $!" unless defined $pid;
 if ($pid == 0) {
@@ -365,8 +422,19 @@ if ($pid == 0) {
     open(STDOUT, '>&', $ofh) or POSIX::_exit(126);
     open(STDERR, '>&', $ofh) or POSIX::_exit(126);
     my @model_args = (defined $model && length $model) ? ('--model', $model) : ();
-    exec { $backend_bin } ($backend, @model_args);
-    POSIX::_exit(127);
+    my @format_args = ('--format', 'json');
+    # `--agent <name>`, NOT `--agent-file <path>`. Measured: `--agent-file` is not a
+    # real flag — the CLI prints usage and exits 1 on it, so every turn-budgeted
+    # dispatch would have failed outright. `--agent` selects by NAME from the agents
+    # directory the file above was materialised into.
+    my @agent_args  = (defined $materialised_agent_name)
+        ? ('--agent', $materialised_agent_name) : ();
+    # `or` rather than a bare following statement: otherwise perl emits "Statement
+    # unlikely to be reached ... (Maybe you meant system() when you said exec()?)" at
+    # COMPILE time, on every dispatch, into the stderr this script is contractually
+    # required to keep to ≤15 lines. The _exit is reachable — only if exec fails.
+    exec { $backend_bin } ($backend, 'run', @format_args, @model_args, @agent_args)
+        or POSIX::_exit(127);
 }
 $CHILD_PID = $pid;
 waitpid($pid, 0);
@@ -381,6 +449,84 @@ my $backend_rc = ($status == -1) ? 255 : ($status >> 8);
 # TERM/INT/HUP arriving during this idle sleep still fires signal_exit()
 # immediately (Perl signal delivery is not blocked by select()).
 select(undef, undef, undef, 0.3);
+
+# ---------------------------------------------------------------------------
+# 9b. Parse a `--format json` NDJSON event stream (§2 item 3, E6): events are
+# step_start / text / step_finish; the final assistant text is the LAST
+# "text" part. If the report holds at least one such event, replace it with
+# the PARSED final text (not the raw NDJSON) -- this is what lands under
+# reports/$BP_PACKAGE/. Content that is not NDJSON-shaped (e.g. a plain-text
+# or plain-stderr backend) is left byte-for-byte alone.
+# ---------------------------------------------------------------------------
+sub _json_string_field {
+    my ($line, $key) = @_;
+    return undef unless $line =~ /"\Q$key\E"\s*:\s*"/;
+    my $rest = $';
+    my $out = '';
+    while (length $rest) {
+        my $ch = substr($rest, 0, 1, '');
+        if ($ch eq '\\') {
+            my $esc = substr($rest, 0, 1, '');
+            if    ($esc eq 'n')  { $out .= "\n"; }
+            elsif ($esc eq 't')  { $out .= "\t"; }
+            elsif ($esc eq 'r')  { $out .= "\r"; }
+            elsif ($esc eq '"')  { $out .= '"'; }
+            elsif ($esc eq '\\') { $out .= '\\'; }
+            elsif ($esc eq '/')  { $out .= '/'; }
+            else                 { $out .= $esc; }
+            next;
+        }
+        last if $ch eq '"';
+        $out .= $ch;
+    }
+    return $out;
+}
+
+{
+    my $raw = _read_raw($report_file);
+    if (defined $raw && length $raw) {
+        my @lines = split /\n/, $raw;
+        my $last_text;
+        my $saw_event = 0;
+        for my $line (@lines) {
+            next unless $line =~ /^\s*\{.*"type"\s*:\s*"[^"]+"/;
+            my $type = _json_string_field($line, 'type');
+            next unless defined $type;
+            $saw_event = 1;
+            if ($type eq 'text') {
+                my $t = _json_string_field($line, 'text');
+                $last_text = $t if defined $t;
+            }
+        }
+        if ($saw_event && defined $last_text) {
+            sysopen(my $rfh, $report_file, O_WRONLY | O_CREAT | O_TRUNC, 0644)
+                or die "bp-worker.pl: cannot rewrite report file $report_file: $!";
+            binmode $rfh;
+            print $rfh $last_text;
+            print $rfh "\n" unless $last_text =~ /\n\z/;
+            close $rfh;
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 9c. Classify a non-zero backend exit into a distinguishable `reason:` token
+# (§2.1: names PINNED -- `reason:` field; `auth` vs `rate-limit` must be
+# different strings so b35's ladder can respond oppositely -- E14).
+# ---------------------------------------------------------------------------
+my $reason;
+if ($backend_rc != 0) {
+    my $classify_text = (_read_raw($report_file) // '');
+    if ($classify_text =~ /\b401\b|unauthoriz|invalid or missing credentials|not logged in|re-?auth/i) {
+        $reason = 'auth';
+    }
+    elsif ($classify_text =~ /\b429\b|rate.?limit|too many requests|throttle/i) {
+        $reason = 'rate-limit';
+    }
+    else {
+        $reason = 'error';
+    }
+}
 
 # ---------------------------------------------------------------------------
 # 10. Append dispatch-log entry (§2.9, §2.11 step 10). Best-effort.
@@ -458,12 +604,14 @@ sub tail_nonblank {
     return @buf;
 }
 
-my @tail = tail_nonblank($report_file, 10);
+my $fixed_lines = 5 + (defined $reason ? 1 : 0);
+my @tail = tail_nonblank($report_file, 15 - $fixed_lines);
 my @out;
 push @out, "worker: $CANON";
 push @out, "backend: $backend";
 push @out, "model: " . ((defined $model && length $model) ? $model : '-');
 push @out, "exit: $backend_rc";
+push @out, "reason: $reason" if defined $reason;
 push @out, "report: $report_file";
 push @out, map { "| $_" } @tail;
 print join("\n", @out), "\n";

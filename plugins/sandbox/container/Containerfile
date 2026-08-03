@@ -77,6 +77,33 @@ ENV PNPM_CONFIG_MINIMUM_RELEASE_AGE=10080
 ENV PNPM_CONFIG_MINIMUM_RELEASE_AGE_IGNORE_MISSING_TIME=false
 ENV PNPM_CONFIG_MINIMUM_RELEASE_AGE_STRICT=true
 
+# OpenCode worker backend (b34-opencode-worker-runtime).
+#
+# Version: pin 1.18.7 EXACTLY -- measured 2026-08-03 as the newest release
+# >=7 days old (latest 1.18.11 was 2d, 1.18.10 4d, 1.18.9/1.18.8 6d -- all
+# too new for the supply-chain rule). Do NOT "helpfully" bump this without
+# re-running that measurement.
+#
+# Package: the PLATFORM package opencode-linux-x64, NOT the "opencode" + "-ai"
+# meta-package. That meta-package ships a postinstall AND an optionalDependencies
+# fetch for its binary; under PNPM_CONFIG_IGNORE_SCRIPTS=true (kept on, no
+# security-posture exception needed -- the free tier needs no credential)
+# BOTH fail, producing a broken shim that still reports install success
+# ("command -v opencode" passes; "opencode --version" errors). The platform
+# package declares no scripts at all, so ignore-scripts installs it cleanly.
+#
+# Location: /usr/lib + /usr/bin, NOT /usr/local. bp-jail.pl's farm covers
+# only /usr/{bin,sbin,lib,lib64} and deliberately excludes /usr/local (and
+# /usr/share, /usr/include, /usr/src) to keep the farmed set small -- an
+# install under /usr/local is invisible inside a jail (exit 127, "No such
+# file or directory"). The symlink target is resolved at BUILD time
+# (readlink -f) rather than hardcoding the pnpm virtualStoreDir's hashed
+# path, so a future virtualStoreDir layout change cannot dangle it.
+RUN mkdir -p /usr/lib/opencode && cd /usr/lib/opencode \
+    && echo '{"name":"opencode-host","version":"1.0.0","private":true}' > package.json \
+    && PNPM_CONFIG_IGNORE_SCRIPTS=true pnpm add opencode-linux-x64@1.18.7 \
+    && ln -sf "$(readlink -f node_modules/opencode-linux-x64/bin/opencode)" /usr/bin/opencode
+
 # Git defaults
 RUN git config --global core.autocrlf input \
     && git config --global init.defaultBranch main

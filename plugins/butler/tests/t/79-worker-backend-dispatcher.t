@@ -128,10 +128,30 @@ my $PATH_WITH_FAKE    = "$FAKEBIN:$REAL_PATH";
 # rc=124, a timeout, instead of 8). That is not hypothetical — b34 installs the
 # OpenCode CLI into the container by design, so this test would have started
 # failing for everyone the moment b34 landed.
-# So: keep the real PATH (bash and friends must still resolve — an empty PATH
-# breaks the harness itself) but DROP any directory that actually contains an
-# `opencode` executable. Absence is then guaranteed rather than assumed.
-my $PATH_WITHOUT_FAKE = join ':', grep { !-x "$_/opencode" } split /:/, $REAL_PATH;
+# Two wrong answers were tried first, both recorded so they are not retried:
+#   1. An EMPTY PATH — breaks the harness itself ("Can't exec bash").
+#   2. Dropping any DIRECTORY containing an `opencode` executable — works only while
+#      opencode lives somewhere incidental. b34 installs it to /usr/bin BY DESIGN, and
+#      dropping /usr/bin takes bash with it. Same failure as (1), one step later.
+# So mirror PATH into a temp dir as symlinks, omitting exactly one name. Everything
+# else still resolves; `opencode` provably does not.
+sub _mk_path_without_opencode {
+    my ($real_path) = @_;
+    my $dir = File::Temp::tempdir('bp79-noopencode-XXXXXX', TMPDIR => 1, CLEANUP => 1);
+    my %seen;
+    for my $d (split /:/, $real_path) {
+        next unless -d $d;
+        opendir(my $dh, $d) or next;
+        for my $e (readdir $dh) {
+            next if $e eq '.' || $e eq '..' || $e eq 'opencode';
+            next if $seen{$e}++;
+            symlink("$d/$e", "$dir/$e");
+        }
+        closedir $dh;
+    }
+    return $dir;
+}
+my $PATH_WITHOUT_FAKE = _mk_path_without_opencode($REAL_PATH);
 
 # =====================================================================================
 # Scaffolding: BP_DIR fixture builders.
