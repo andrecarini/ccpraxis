@@ -28,8 +28,15 @@ use warnings;
 use Getopt::Long qw(GetOptionsFromArray);
 use Fcntl qw(:flock);
 use File::Basename qw(dirname);
+use Cwd qw(abs_path);
 
-my $DIR = dirname(__FILE__);
+# abs_path, NOT bare dirname(__FILE__): invoked as `perl plugins/butler/scripts/bp-blueprint.pl`
+# from the repo root, __FILE__ is RELATIVE, so $DIR is relative, and `require "$DIR/..."` searches
+# @INC — which has not contained '.' since perl 5.26. The script then dies with
+# "Can't locate plugins/butler/scripts/bp-orchestrator.pl in @INC" for every real invocation.
+# t/86 did not catch it because the harness supplies its own @INC. bp-drive-next.pl already uses
+# this form; bp-validate-dag.pl has the same latent bug, masked by callers passing `-I.`.
+my $DIR = dirname(abs_path(__FILE__));
 
 # The REAL parser/resolver. Never reimplement BpOrch::parse_dag or
 # BpOrch::resolve_dep_token -- this is the b12/b13 lesson restated (spec §2.3).
