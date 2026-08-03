@@ -159,6 +159,38 @@ Rules:
 - A worker that returns garbage or dies: redispatch once with a sharpened prompt. Twice: log the attempt, then either change approach or block — don't loop.
 - You may make small glue edits inside your write set yourself (wiring an export, a one-line fix during validation). Anything resembling a step belongs to a worker.
 
+### Non-Claude worker backends (`bp-worker.pl`)
+
+Everything above describes the **default** path: `worker_backend:` unset means `claude`, and workers are dispatched via **Task** exactly as documented. If you have not configured a backend, nothing in this section applies to you and nothing has changed.
+
+When `worker_backend:` **is** set to something other than `claude`, dispatch that worker through **Bash** instead of Task:
+
+```
+plugins/butler/scripts/bp-worker.pl --worker <bp-name> --prompt-file <path> [--model M]
+```
+
+`<bp-name>` is the bare role — `scout`, `architect`, `test-writer`, `implementer`, `reviewer`, `redteam`, `ui-prober` — not the namespaced `butler:bp-*` form you pass to Task.
+
+The backend is resolved in exactly two places, in this order, falling back to the built-in default:
+
+1. `worker_backend:` in **your package ledger's** frontmatter — overrides for this package only.
+2. `worker_backend:` in **`blueprint.md`**'s metadata block — applies to every package in the blueprint.
+3. Built-in default: **`claude`**.
+
+An unrecognised value **fails loudly** (exit 4) rather than silently falling back — a typo must not quietly route your workers somewhere unintended.
+
+What does **not** change, and why it matters:
+
+- **The same one-write-capable-worker lock applies.** `bp-worker.pl` takes the *same* marker file `track-dispatch.sh` uses for Task workers, so the implementer/test-writer role split holds identically across both paths. A second write-capable dispatch while one is in flight exits **3** and writes nothing. You cannot evade the rule by switching backends.
+- **Read-only workers still run concurrently.** Scout, architect, reviewer and redteam take no marker on either path.
+- **The ≤15-line return contract still applies.** stdout is capped regardless of how much the worker emitted; the full text lands under `$BP_DIR/reports/$BP_PACKAGE/`, and the printed `report:` line names it.
+- **The dispatch log still gets its entry**, in the same format `log-dispatch.sh` writes for Task.
+- **A fleet stop is still honoured.** `bp-worker.pl` checks the stop signals itself and refuses (exit 5), because a subprocess bypasses the `PreToolUse` graceful-stop gate entirely. A stopped fleet does not keep spawning workers through this path.
+
+Exit codes: `0` ok · `2` usage · `3` a write-capable worker is already in flight · `4` unrecognised backend · `5` refused, fleet stop in force · `6` env contract not satisfied · `7` the backend itself exited non-zero · `8` backend binary not found.
+
+**Judges never port.** Harvest, conformance and resolve judges stay on Claude regardless of `worker_backend:`.
+
 ## Resumption
 
 If the ledger shows prior progress when you start: this is a resumption. Verify every artifact in `## Outputs` exists on disk, re-run the last recorded validation, then execute `## Next action`. Never redo verified work; never trust unverified claims — including your predecessor's.
