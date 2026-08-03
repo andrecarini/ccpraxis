@@ -3028,14 +3028,166 @@ SandboxLock::release($LOCK_DIR);
 # re-run it under backticks to capture the message and classify whether it
 # is an address-in-use collision (a fresh `podman start` on a container
 # that is still stopped reproduces the same bind error deterministically).
-my $start_rc = system($PODMAN, 'start', $CONTAINER_NAME);
+#
+# s03-container-health-detect (:3040-ish bug): a NON-port `podman start`
+# failure used to satisfy neither this port-collision branch nor any other,
+# fall through to log_ev, and continue straight into the podman exec chain
+# against a container that never started. s03_run_launch_gate (below, the
+# pure/seam-driven region t/58 pins) plus the real seams wired immediately
+# after it close that gap: a launch-time health probe runs BEFORE the first
+# `podman start` attempt (catching an exited container whose image is gone,
+# or -- for a future running-container caller -- a degraded exec env), and
+# any post-start failure that is NOT a port collision now aborts cleanly
+# instead of falling through.
+my %_s03_port_in_use_cache;
 my $port_in_use = sub {
     my ($status) = @_;
     return 0 if $status == 0;
+    return $_s03_port_in_use_cache{$status} if exists $_s03_port_in_use_cache{$status};
     my $out = `$PODMAN start "$CONTAINER_NAME" 2>&1`;
-    return (defined $out
+    my $r = (defined $out
         && $out =~ /EADDRINUSE|address already in use|port is already allocated|already in use/i) ? 1 : 0;
+    $_s03_port_in_use_cache{$status} = $r;
+    return $r;
 };
+
+# >>> s03:health-detect:BEGIN
+# s03_run_launch_gate(%seams) -> \%result — the pure, seam-driven launch-time
+# health gate (s03-container-health-detect spec). No direct podman-runtime
+# handle, no subprocess call, no direct process-termination call in this
+# region: every effect is one of the six injected seam callbacks below, so
+# this sub can be extracted as source text and eval'd standalone (t/58's
+# harness) with zero real podman/subprocess anywhere. The real wiring
+# immediately following this region binds each seam to its production
+# implementation, so the tested logic and the production logic are the SAME
+# sub, not a parallel reimplementation.
+#
+#   probe()               -> \%state { machine_ok, container_state,
+#                                       image_present, exec_probe_ok }
+#   start()                -> $start_rc (integer, models the real container
+#                              start call)
+#   is_port_failure($rc)   -> bool (models the existing $port_in_use check)
+#   recover($reason)       -> invoked for a rebuild offer; production binds
+#                              this to recover_container(reason => $reason) --
+#                              s12's shared seam, never reimplemented here
+#   abort($rc)             -> invoked for a clean non-port-failure abort;
+#                              production binds this to the existing
+#                              print-then-terminate idiom used elsewhere in
+#                              this file's port-collision handling
+#   exec()                 -> invoked only when nothing aborted/recovered
+#
+# Three distinct causes, three distinct diagnoses (spec 1.3 -- they are
+# different repairs): a podman machine/socket that is unreachable has
+# NOTHING to rebuild (the runtime itself is down, so recover is never
+# called); an exited container whose image is gone, or a running container
+# with a degraded exec env, both DO warrant a rebuild offer through the
+# shared recover_container seam. A non-port start failure aborts instead of
+# falling through into podman exec (the bug this package fixes); a port
+# collision is left untouched for the existing, unchanged handling just
+# below this region (C6) to run exactly as before.
+sub s03_run_launch_gate {
+    my (%seams) = @_;
+
+    my $state = $seams{probe}->();
+    return { diagnosis => 'podman machine/socket unreachable' }
+        unless $state->{machine_ok};
+
+    if ($state->{container_state} eq 'exited' && !$state->{image_present}) {
+        $seams{recover}->('launch-detect-broken');
+        return { diagnosis => 'image missing' };
+    }
+
+    if ($state->{container_state} eq 'running' && !$state->{exec_probe_ok}) {
+        $seams{recover}->('launch-detect-broken');
+        return { diagnosis => 'degraded exec environment' };
+    }
+
+    my $start_rc = $seams{start}->();
+    if ($start_rc != 0) {
+        if ($seams{is_port_failure}->($start_rc)) {
+            return { delegated_port => 1, start_rc => $start_rc };
+        }
+        $seams{abort}->($start_rc);
+        return { aborted => 1, start_rc => $start_rc };
+    }
+
+    $seams{exec}->();
+    return { exec_called => 1, start_rc => $start_rc };
+}
+# <<< s03:health-detect:END
+
+# _s03_probe_state() -> \%state for s03_run_launch_gate's probe seam (the
+# real, impure half): machine reachability (podman-on-non-Linux only, via
+# the same _machine_state() the [l] recover seam trusts), this container's
+# raw `podman inspect` status, whether its image still exists (only checked
+# when 'exited' -- a stopped container whose image was pruned can never
+# restart, which is the exact C1 scenario), and a live bash/curl probe (only
+# checked when 'running' -- by construction the code below never reaches
+# this call with a running container today, since the connector dispatch
+# near the top of this file already redirected that case away, but the
+# gate's contract covers it for future callers, e.g. a periodic health
+# check).
+my $_s03_probe_state = sub {
+    my $capable = ($PODMAN =~ /podman/i && $^O ne 'linux') ? 1 : 0;
+    my $mstate  = $capable ? _machine_state() : 'n/a';
+    my $machine_ok = (!$capable || $mstate eq 'running' || $mstate eq 'n/a') ? 1 : 0;
+    my $raw = container_status($CONTAINER_NAME);
+    my $container_state = (defined $raw && length $raw) ? lc($raw) : 'unknown';
+    my $image_present = 1;
+    if ($container_state eq 'exited') {
+        my $img = `$PODMAN inspect --format '{{.Image}}' "$CONTAINER_NAME" 2>/dev/null`;
+        chomp $img if defined $img;
+        $image_present = (defined $img && length $img
+            && system("$PODMAN image inspect \"$img\" >/dev/null 2>&1") == 0) ? 1 : 0;
+    }
+    my $exec_probe_ok = 1;
+    if ($container_state eq 'running') {
+        my $bash_rc = system("$PODMAN exec \"$CONTAINER_NAME\" /bin/bash -c 'exit 0' >/dev/null 2>&1");
+        my $curl_rc = system("$PODMAN exec \"$CONTAINER_NAME\" curl --version >/dev/null 2>&1");
+        $exec_probe_ok = ($bash_rc == 0 && $curl_rc == 0) ? 1 : 0;
+    }
+    return { machine_ok => $machine_ok, container_state => $container_state,
+             image_present => $image_present, exec_probe_ok => $exec_probe_ok };
+};
+
+# $start_rc stays undef through a pre-flight abort below (machine
+# unreachable / image missing / degraded exec -- none of which ever call the
+# start seam), which is exactly how the code right after the gate call tells
+# a pre-flight diagnosis apart from a post-start one.
+my $start_rc;
+my $gate_result = s03_run_launch_gate(
+    probe           => $_s03_probe_state,
+    start           => sub { $start_rc = system($PODMAN, 'start', $CONTAINER_NAME); return $start_rc; },
+    is_port_failure => $port_in_use,
+    recover         => sub {
+        my ($reason) = @_;
+        # s12's shared seam (:3702), invoked -- never reimplemented (C5).
+        return recover_container({
+            reason => $reason,
+            seams  => { emit => sub { }, log => sub { log_ev($_[0], $_[1]) } },
+        });
+    },
+    abort           => sub {
+        my ($rc) = @_;
+        print STDERR _c_err("ERROR:"),
+            " podman start failed (exit @{[$rc >> 8]}) for a reason other than a"
+            . " port collision — aborting before podman exec.\n";
+        reset_terminal();
+        exit ($rc >> 8 || 1);   # never exit 0 on a failed/ signal-killed start
+    },
+    exec            => sub { 1 },   # the real exec/touch chain runs unconditionally below
+);
+
+if (!defined $start_rc) {
+    # Pre-flight branch: the health probe aborted before `podman start` was
+    # ever attempted (machine unreachable / image missing / degraded exec).
+    # The two rebuild-warranting causes already invoked recover_container
+    # above; the machine-unreachable cause deliberately did not (spec 1.3 --
+    # nothing to rebuild when the runtime itself is down).
+    print STDERR _c_err("ERROR:"), " $gate_result->{diagnosis}\n";
+    reset_terminal();
+    exit 1;
+}
 
 if ($start_rc != 0 && $port_in_use->($start_rc)) {
 
