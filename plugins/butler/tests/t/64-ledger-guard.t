@@ -332,7 +332,16 @@ sub nonblank_lines { return grep { /\S/ } split /\n/, $_[0] }
 
     my $cmd_of = sub { my $f = shift; return qq(bash "\${CLAUDE_PLUGIN_ROOT}/hooks/$f") };
     my $pre = ($H && $H->{hooks}{PreToolUse}) // [];
-    is(scalar(@$pre), 4, 'AC-36: PreToolUse still has exactly 4 blocks');
+    # RELAXED 2026-08-03 (b15-wait-shape-and-pipe-guards, operator-approved).
+    #   OLD: is(scalar(@$pre), 4, 'AC-36: PreToolUse still has exactly 4 blocks');
+    #   NEW: the >= form below.
+    # Same reasoning as the sibling relax in t/62-repeat-guard.t. b12's own
+    # registration remains pinned exactly by the assertions immediately below —
+    # block 0's command list is_deeply [gate-shutdown, guard-writes, ledger-guard]
+    # IN THAT ORDER, and block 0 has exactly 3 entries — so a missing, renamed or
+    # reordered ledger-guard.sh still fails. Only the prohibition on appending a
+    # NEW block is lifted.
+    cmp_ok(scalar(@$pre), '>=', 4, 'AC-36: PreToolUse still has at least the 4 pre-b15 blocks (later packages may append)');
 
     my $b0 = $pre->[0] // {};
     is($b0->{matcher}, 'Edit|Write|MultiEdit|NotebookEdit', 'AC-36: block 0 matcher is Edit|Write|MultiEdit|NotebookEdit');

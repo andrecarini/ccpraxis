@@ -337,7 +337,20 @@ is(gate_verdict_call('Edit', 'worksite', 1),  'deny',  'AC-21: regression - bp_g
     ok(defined $H, 'AC-20: hooks.json parses as valid JSON') or diag("parse error: $@");
 
     my $pre = ($H && $H->{hooks}{PreToolUse}) // [];
-    is(scalar(@$pre), 4, 'AC-20: PreToolUse has exactly 4 blocks');
+    # RELAXED 2026-08-03 (b15-wait-shape-and-pipe-guards, operator-approved).
+    #   OLD: is(scalar(@$pre), 4, 'AC-20: PreToolUse has exactly 4 blocks');
+    #   NEW: the >= form below.
+    # b26 relaxed block 0's command list for b12 and deliberately left this count
+    # alone, while itself recording "It will recur — hooks.json is in the write set
+    # of b15-wait-shape-and-pipe-guards". It recurred, with every registration route
+    # closed: blocks 0/1/2 are is_deeply-pinned, block 3 is pinned to one entry, and
+    # this count forbade a new block. b15's guard needs its own matcher-less block.
+    # This does NOT weaken what b26 protected: b10's registration is still asserted
+    # precisely and separately below (block 3 exists, has no matcher, has exactly one
+    # entry, whose command is repeat-guard.sh with type=command and timeout=15), and
+    # blocks 0-2 keep their own exact assertions. The count only ever forbade
+    # EXTENSION — which is precisely what b26 said later packages should be able to do.
+    cmp_ok(scalar(@$pre), '>=', 4, 'AC-20: PreToolUse has at least the 4 b10-era blocks (later packages may append)');
 
     my $cmd_of = sub { my $f = shift; return qq(bash "\${CLAUDE_PLUGIN_ROOT}/hooks/$f"); };
 

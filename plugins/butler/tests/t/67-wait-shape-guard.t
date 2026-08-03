@@ -379,6 +379,10 @@ my $AC9 = q{echo "=== hooks.json matchers across ALL installed plugins (evidence
 
 # AC-11: the false-green-pipe true positives.
 my $P7 = join("\n", q{perl plugins/butler/tests/t/64-ledger-guard.t 2>&1 | tail -20}, q{echo "EXIT=$?"});
+# Single-quoted on purpose: this must hold a LITERAL `$?`, not the interpolated
+# value of the last exit status. See the AC-11 message assertion below.
+my $CORRECT_FORM = q{cmd > /tmp/out.txt 2>&1; echo "exit=$?"};
+
 my @AC11 = (
     ['t/62 into tail -20 then EXIT=$?',      q{perl plugins/butler/tests/t/62-repeat-guard.t 2>&1 | tail -20; echo "EXIT=$?"}],
     ['t/73 into tail -5 then exit=$?',       q{perl plugins/butler/tests/t/73-status-recognition.t 2>&1 | tail -5; echo "exit=$?"}],
@@ -896,14 +900,25 @@ SKIP: {
             my ($rc, $err, $out) = run_hook(pl_bash($c->[1]), %env);
             is($rc, 2, "AC-11 [$c->[0]]: denied (exit 2)");
             like($err, qr/\Q$PFX\Efalse-green-pipe:/, "AC-11 [$c->[0]]: stderr names the false-green-pipe rule");
-            like($err, qr{\Qcmd > /tmp/out.txt 2>&1; echo "exit=$?"\E},
+            # Coordinator fix: `qr{\Q...exit=$?\E}` did NOT assert what it reads as.
+            # \Q quotes metacharacters but does NOT suppress interpolation, so `$?`
+            # (last exit status) expanded and the pattern compiled to `exit\=0` —
+            # demanding the literal text "exit=0" while the spec mandates the message
+            # carry a verbatim `$?`. No implementation could satisfy both. Build the
+            # literal in a single-quoted variable, then \Q the variable.
+            like($err, qr/\Q$CORRECT_FORM\E/,
                  "AC-11 [$c->[0]]: the message shows the redirect-then-\$? correct form");
             is($out, '', "AC-11 [$c->[0]]: stdout is empty");
         }
         is(scalar(runs_files($bp)), 0, 'AC-20: an R2 denial wrote NO file under $BP_DIR/runs/ (R2 is stateless)');
 
         # AC-12: DC-P1's named alternation is covered by a strict SUPERSET.
-        for my $t (['prove', $AC11[4][1]], ['perl', $AC11[0][1]], ['npm', $AC11[5][1]], ['timeout perl', $AC11[2][1]]) {
+        # Coordinator fix: the fourth pair asserted $AC11[2][1] contains the literal
+        # substring 'timeout perl', but that fixture is `timeout 120 perl ...` — the
+        # two words are never adjacent, so the assertion could never pass regardless
+        # of implementation. Mismatched fixture/assertion pairing; the intent is that
+        # the denied set covers a timeout-wrapped perl invocation.
+        for my $t (['prove', $AC11[4][1]], ['perl', $AC11[0][1]], ['npm', $AC11[5][1]], ['timeout 120 perl', $AC11[2][1]]) {
             like($t->[1], qr/\Q$t->[0]\E/, "AC-12: the denied set includes a '$t->[0]' command from DC-P1's alternation");
         }
 

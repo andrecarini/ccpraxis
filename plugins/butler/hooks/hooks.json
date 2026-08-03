@@ -26,6 +26,11 @@
         "hooks": [
           { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/repeat-guard.sh\"", "timeout": 15 }
         ]
+      },
+      {
+        "hooks": [
+          { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/wait-shape-guard.sh\"", "timeout": 15 }
+        ]
       }
     ],
     "PostToolUse": [
