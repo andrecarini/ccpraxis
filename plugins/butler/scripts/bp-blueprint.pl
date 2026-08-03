@@ -1,8 +1,8 @@
 #!/usr/bin/env perl
 # bp-blueprint.pl — the deterministic blueprint.md write/read API (b43-blueprint-write-api).
 #
-# Five typed, surgical write ops (add-package, set-status, set-deps, add-decision,
-# set-field) plus five read ops (show, deps, status, decisions, ready) over the
+# Six typed, surgical write ops (add-package, set-status, set-deps, add-decision,
+# set-decision, set-field) plus five read ops (show, deps, status, decisions, ready) over the
 # package-status table `bp-orchestrator.pl`'s BpOrch::parse_dag reads. See:
 # .ccpraxis-local-data/blueprints/sandbox-butler-overhaul/specs/b43-blueprint-write-api-spec.md
 #
@@ -145,6 +145,82 @@ sub locate_table {
 }
 
 sub _is_sep_row { return $_[0] =~ /^\s*\|[\s:|-]+\|?\s*$/ }
+
+# =====================================================================================
+# Decisions-section location & shape detection (b42-decision-context-split-spec §4).
+# Header recognition WIDENS to also match "## Synthesis Decisions" -- "## Decisions"
+# behaviour is unchanged, this only broadens what else counts as the same section.
+# Shape is detected by CONTENT, never configuration: a `|`-row immediately followed by
+# a `|---`-style separator row means the section is a markdown TABLE (b42's target
+# shape); anything else is the legacy BULLET list op_add_decision has always assumed.
+# =====================================================================================
+
+my $DECISIONS_HEAD_RE = qr/^##\s+(?:Synthesis\s+)?Decisions\b/i;
+
+# Returns ($start_i, $end_i): $start_i is the header line index, $end_i is the index of
+# the next `## ` line (or EOF). Returns (undef, undef) if no such section exists.
+sub locate_decisions_bounds {
+    my ($lines_ref) = @_;
+    my $start;
+    for my $i (0 .. $#$lines_ref) {
+        if ($lines_ref->[$i] =~ $DECISIONS_HEAD_RE) { $start = $i; last }
+    }
+    return (undef, undef) unless defined $start;
+    my $end = scalar(@$lines_ref);
+    for my $i ($start + 1 .. $#$lines_ref) {
+        if ($lines_ref->[$i] =~ /^##\s/) { $end = $i; last }
+    }
+    return ($start, $end);
+}
+
+# If the Decisions section (bounded by $start/$end, both from locate_decisions_bounds)
+# is table-shaped, returns a hashref describing it: { hdr_i, sep_i, end_i, cols }. Returns
+# undef if the section is bullet-shaped (or empty) -- i.e. no `|`-row + separator pair.
+sub decisions_table_info {
+    my ($lines_ref, $start, $end) = @_;
+    for my $i ($start + 1 .. $end - 1) {
+        next unless $lines_ref->[$i] =~ /^\s*\|/;
+        next unless defined $lines_ref->[$i + 1] && _is_sep_row($lines_ref->[$i + 1]);
+        my $hdr_i = $i;
+        my $sep_i = $i + 1;
+        # The table runs to the END OF THE SECTION, not to the first non-`|` line.
+        # Measured on sandbox-butler-overhaul: its 26 decisions are written as THREE
+        # `|`-row blocks separated by blank lines. Stopping at the first gap saw only the
+        # first 15, so set-decision refused SYN-16..SYN-26 as "not found" -- a migration
+        # driven by it would have rewritten 15 rows and then aborted on a half-migrated
+        # table. Blank lines between blocks are cosmetic in markdown; they do not start a
+        # new table, so a gap must not end this one.
+        my $end_i = $end;
+        return { hdr_i => $hdr_i, sep_i => $sep_i, end_i => $end_i,
+                 cols  => [ _table_cols($lines_ref->[$hdr_i]) ] };
+    }
+    return undef;
+}
+
+# The column that holds the decision's prose: whichever header cell mentions "decision"
+# (case-insensitively, matching the target `| # | Decision |` shape), else the last
+# column of a >=2-column table. Returns undef if neither applies (e.g. a 1-column table).
+sub decisions_text_col {
+    my ($cols) = @_;
+    for my $i (0 .. $#$cols) { return $i if $cols->[$i] =~ /decision/i; }
+    return $#$cols if @$cols >= 2;
+    return undef;
+}
+
+# Row index (into $lines_ref) of the decisions-table row whose first cell trims to
+# exactly $id, or undef. $tbl is a decisions_table_info() result.
+sub decisions_find_row {
+    my ($lines_ref, $tbl, $id) = @_;
+    for my $i ($tbl->{sep_i} + 1 .. $tbl->{end_i} - 1) {
+        next unless defined $lines_ref->[$i] && $lines_ref->[$i] =~ /^\s*\|/;
+        next if _is_sep_row($lines_ref->[$i]);   # a later block may repeat the separator
+        my @c = _table_cols($lines_ref->[$i]);
+        next unless defined $c[0];
+        (my $rid = $c[0]) =~ s/^\s+//; $rid =~ s/\s+$//;
+        return $i if $rid eq $id;
+    }
+    return undef;
+}
 
 # Row index (into $tbl->{lines}) whose first column trims to exactly $pkg, or undef.
 sub find_row_index {
@@ -439,15 +515,103 @@ sub op_add_decision {
     run_write('add-decision', $opt{file}, sub {
         my ($orig) = @_;
         my @lines = split /\n/, $orig, -1;
-        my $head_re = qr/^##\s+Decisions\b/;
-        my $start;
-        for my $i (0 .. $#lines) { if ($lines[$i] =~ $head_re) { $start = $i; last } }
+        my ($start, $end) = locate_decisions_bounds(\@lines);
         return (undef, "no '## Decisions' section found") unless defined $start;
-        my $end = scalar(@lines);
-        for my $i ($start + 1 .. $#lines) { if ($lines[$i] =~ /^##\s/) { $end = $i; last } }
+        # A table-shaped section (b42's target shape) must never receive an appended
+        # bullet -- that would corrupt the table silently. Refuse instead; editing an
+        # existing row is set-decision's job, and creating new rows is out of scope here.
+        if (decisions_table_info(\@lines, $start, $end)) {
+            return (undef, "the Decisions section is table-shaped; add-decision only appends bullets "
+                          . 'and would corrupt the table. Use set-decision to edit an existing row.');
+        }
         my $insert_at = $end;
         $insert_at-- if $insert_at > 0 && $lines[$insert_at - 1] eq '';
         splice(@lines, $insert_at, 0, $entry);
+        return (join("\n", @lines), undef);
+    });
+}
+
+sub op_set_decision {
+    my @args = @_;
+    my %opt;
+    my $ok;
+    { local $SIG{__WARN__} = sub { };
+      $ok = GetOptionsFromArray(\@args, \%opt, 'file=s', 'id=s', 'text=s'); }
+    arg_error('set-decision', 'unrecognised option') unless $ok;
+    arg_error('set-decision', 'unexpected extra arguments: ' . join(' ', @args)) if @args;
+    for my $r (qw(file id text)) {
+        arg_error('set-decision', "missing required --$r") unless defined $opt{$r};
+    }
+    unless (field_safe($opt{id})) {
+        arg_error('set-decision', '--id contains a pipe or newline');
+    }
+    unless (field_safe($opt{text})) {
+        arg_error('set-decision', '--text contains a pipe or newline');
+    }
+    # SYN-14 hazard, identical wording class to op_add_decision (spec §4): the decisions
+    # table sits ABOVE the real depends_on/DAG header, so a --text carrying the literal
+    # token risks becoming (or masquerading as) a second such row and mis-routing parse_dag.
+    if (index($opt{text}, 'depends_on') >= 0) {
+        arg_error('set-decision',
+            "--text contains the literal token 'depends_on' (SYN-14 hazard: parse_dag latches onto the "
+          . 'FIRST |-row containing that token as its table header -- a second one mis-routes the whole '
+          . 'run). Rephrase without the literal token.');
+    }
+
+    # Best-effort pre-check outside the lock: an unknown --id is refused up front (exit 3,
+    # via arg_error, file never opened for writing) rather than only discovered inside the
+    # write transaction. The mutate callback below re-derives this under the lock and is
+    # the actual source of truth -- this pre-check only makes the common case a clean,
+    # argument-validation-style refusal instead of a generic write-transaction rejection.
+    {
+        my $pre = _slurp($opt{file});
+        if (defined $pre) {
+            my @lines = split /\n/, $pre, -1;
+            my ($start, $end) = locate_decisions_bounds(\@lines);
+            if (defined $start) {
+                my $tbl = decisions_table_info(\@lines, $start, $end);
+                if ($tbl && !defined decisions_find_row(\@lines, $tbl, $opt{id})) {
+                    arg_error('set-decision', "no decision with id '$opt{id}' found in the table");
+                }
+            }
+        }
+    }
+
+    run_write('set-decision', $opt{file}, sub {
+        my ($orig) = @_;
+        my @lines = split /\n/, $orig, -1;
+        my ($start, $end) = locate_decisions_bounds(\@lines);
+        return (undef, "no '## Decisions' section found") unless defined $start;
+        my $tbl = decisions_table_info(\@lines, $start, $end);
+        return (undef, "the Decisions section is not table-shaped; set-decision requires a table")
+            unless $tbl;
+        my $ci = decisions_text_col($tbl->{cols});
+        return (undef, "decisions table has no identifiable text column") unless defined $ci;
+        my $ri = decisions_find_row(\@lines, $tbl, $opt{id});
+        return (undef, "no decision with id '$opt{id}' found in the table") unless defined $ri;
+
+        # When the decision text is the LAST column, everything after the preceding `|` IS the
+        # text -- including any unescaped `|` the prose happens to contain. replace_cell splits
+        # on `|` and rewrites one field, so on such a row it overwrote only the first fragment
+        # and left the rest of the old prose trailing behind the new text.
+        #
+        # Measured: SYN-14 of sandbox-butler-overhaul is the one decision of 26 whose text
+        # carries an internal pipe. Replacing its cell produced a 1,338-byte row holding the new
+        # statement AND the tail of the original. Silent corruption of the row this op exists to
+        # rewrite, so it is handled here rather than left to callers to pre-sanitise.
+        my $new_line;
+        if ($ci == $#{ $tbl->{cols} }) {
+            my @c = _table_cols($lines[$ri]);
+            my @keep = @c[0 .. $ci - 1];
+            $new_line = '| ' . join(' | ', @keep, $opt{text}) . ' |';
+        }
+        else {
+            # Interior column: one field, one replacement -- the same helper set-deps uses.
+            $new_line = replace_cell($lines[$ri], $ci, $opt{text});
+        }
+        return (undef, "internal error replacing the decision text cell for '$opt{id}'")
+            unless defined $new_line;
+        $lines[$ri] = $new_line;
         return (join("\n", @lines), undef);
     });
 }
@@ -614,17 +778,47 @@ sub op_decisions {
 
     my $B = _read_or_die('decisions', $opt{file});
     my @lines = split /\n/, $B, -1;
-    my $start;
-    for my $i (0 .. $#lines) { if ($lines[$i] =~ /^##\s+Decisions\b/) { $start = $i; last } }
+    my ($start, $end) = locate_decisions_bounds(\@lines);
     notfound_error('decisions', "no '## Decisions' section found") unless defined $start;
-    my $end = scalar(@lines);
-    for my $i ($start + 1 .. $#lines) { if ($lines[$i] =~ /^##\s/) { $end = $i; last } }
-    for my $i ($start + 1 .. $end - 1) {
-        next unless $lines[$i] =~ /^-\s*(SYN-\S+?):\s*(.*)$/;
-        my ($id, $text) = ($1, $2);
-        next if defined $opt{id} && $id ne $opt{id};
-        print "$id: $text\n";
+
+    # Shape-aware, for the same reason set-decision is: a decisions section may be a bullet list
+    # or a markdown table. Reading only bullets against a table printed nothing and exited 0 --
+    # a silent vacuous success, indistinguishable from "this blueprint has no decisions".
+    my @found;
+    my $tbl = decisions_table_info(\@lines, $start, $end);
+    if ($tbl) {
+        my $col = decisions_text_col($tbl->{cols});
+        notfound_error('decisions', 'decisions table has no column holding the decision text')
+            unless defined $col;
+        for my $i ($tbl->{sep_i} + 1 .. $tbl->{end_i} - 1) {
+            next unless defined $lines[$i] && $lines[$i] =~ /^\s*\|/;
+            next if _is_sep_row($lines[$i]);
+            my @cells = _table_cols($lines[$i]);
+            next unless @cells > $col;
+            my $id = $cells[0];
+            next unless defined $id && $id =~ /^\S+$/;
+            push @found, [ $id, $cells[$col] ];
+        }
     }
+    else {
+        for my $i ($start + 1 .. $end - 1) {
+            next unless $lines[$i] =~ /^-\s*(\S+?):\s*(.*)$/;
+            push @found, [ $1, $2 ];
+        }
+    }
+
+    my @sel = defined $opt{id} ? grep { $_->[0] eq $opt{id} } @found : @found;
+
+    # Never exit 0 having found nothing: an empty result is either a bad --id or a section shape
+    # this op cannot read, and both must be distinguishable from a genuinely empty section.
+    if (!@sel) {
+        notfound_error('decisions', "no decision with id '$opt{id}' found") if defined $opt{id};
+        notfound_error('decisions',
+            'decisions section contains no readable entries (neither `- ID: text` bullets nor a table row)')
+            if !@found;
+    }
+
+    print "$_->[0]: $_->[1]\n" for @sel;
     exit 0;
 }
 
@@ -668,6 +862,7 @@ my %DISPATCH = (
     'set-status'   => \&op_set_status,
     'set-deps'     => \&op_set_deps,
     'add-decision' => \&op_add_decision,
+    'set-decision' => \&op_set_decision,
     'set-field'    => \&op_set_field,
     'show'         => \&op_show,
     'deps'         => \&op_deps,

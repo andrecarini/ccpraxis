@@ -63,7 +63,8 @@ Prose sections the API does not model (`## Scope`, `## Inputs`, and your own nar
 
 - Workers write full reports to `$BP_DIR/reports/$BP_PACKAGE/` and return **≤15 lines**. Hold them to it; if a worker returns a wall of text, use the report file and ignore the excess.
 - You read reports from disk selectively. Never paste a full report into the ledger — reference its path.
-- Read only YOUR package block from `blueprint.md` (plus Objective/Decisions/Constraints). Other packages are not your business.
+- Read only YOUR package block from `blueprint.md` (plus Objective/Constraints, and the Decisions table). Other packages are not your business.
+- **Decisions are stored as binding statement + pointer.** The table in `blueprint.md` gives you the id and what each decision *rules* — that is what binds you, and it is all you normally need. The full argument (evidence, rejected alternatives, history) lives in `reports/decisions/<ID>.md`. **Follow the pointer only when the ruling alone does not settle your question** — you are the reason the split exists, and re-reading every argument re-imports the cost it removed. When a decision is cited by id in your ledger, the statement is the citation's target; the report is its footnote.
 
 ## Disk is truth
 

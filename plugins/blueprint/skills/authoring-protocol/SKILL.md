@@ -52,3 +52,39 @@ Each package ledger's frontmatter (`status`, `model`, `max_turns`, `write_set`, 
 ## Blueprint file discipline
 
 `blueprint.md` is the source of truth for the initiative. Keep it current as you author and revise: append (never silently rewrite) Decisions, keep the package status table accurate, refresh `last_updated`. Once butler starts executing, the per-package ledgers become the live record butler maintains; you return to authoring only to re-scope or add packages.
+
+### Recording a decision — binding statement in, argument out
+
+**Durable rationale and coordinator context are not the same budget.** Everything in `blueprint.md`
+is fixed prefix: every coordinator loads it before its first tool call, re-ingested at cache-**write**
+rates on every relaunch that misses. A decision written to be durable — evidence, measurements,
+alternatives you rejected, history — is worth writing, but it does not belong in every coordinator's
+prefix. Measured on `sandbox-butler-overhaul`: the decisions section reached **32,844 bytes, 29.9% of
+the file**, and three decisions authored in a single session added 9,097 of them. That was a reporter
+following this protocol correctly as it was previously written.
+
+So a decision is recorded in **two halves**:
+
+- **In `blueprint.md`** — the stable id and a **binding statement**: what is ruled, and what it
+  constrains, in one paragraph, ending in a pointer to the full text. **Budget: 400 bytes; hard
+  ceiling 800.** If a decision genuinely rules more than fits in 400, exceed the budget — a lost
+  ruling is a defect, a long statement is only a cost. Needing the ceiling is a signal you are
+  recording several decisions as one; prefer splitting them into separate ids.
+- **In `reports/decisions/<ID>.md`** — the complete argument, verbatim. Nothing is deleted; this is
+  relocation with the original preserved (SYN-10: archive, never delete).
+
+Coordinators load constraints. Auditors, red-teamers and the conformance judge follow the pointer.
+
+Writing a binding statement is compression of *rationale*, never revision of *substance*. The failure
+mode is a plausible summary that quietly drops a constraint: if a decision rules three things, all
+three survive; if it mandates a specific file, id, threshold or forbidden action, that specific is a
+**ruling**, not rationale, and it stays. The test to apply to your own sentence: *if someone obeyed
+only this, could they violate the original?* If yes, it is lossy.
+
+> **Never write the literal token `depends_on` in a decision.** `parse_dag` treats the **first**
+> markdown table row containing that token as the dependency-table header, and the decisions table
+> sits **above** the real one — a single occurrence silently mis-routes the whole run (SYN-14). Say
+> "dependency edges" instead. `bp-blueprint.pl` refuses the token mechanically; do not rely on that
+> as your only guard.
+
+Use `bp-blueprint.pl` (`add-decision`, `set-decision`) rather than editing `blueprint.md` by hand.

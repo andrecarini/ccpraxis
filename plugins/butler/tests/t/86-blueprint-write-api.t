@@ -165,6 +165,67 @@ sub base_fixture {
 }
 
 # =====================================================================================
+# b42-decision-context-split-spec §4 fixtures. ADDITIVE ONLY (per spec §6): these are
+# NEW fixtures for NEW assertions below; nothing above this point is altered.
+# =====================================================================================
+
+# Same package table as base_fixture, but the Decisions section is TABLE-shaped (b42's
+# target shape: a `|`-row header + `|---` separator, then `| ID | text |` rows) instead
+# of the legacy bullet list. $header lets callers exercise the widened header regex
+# (default is the classic literal "## Decisions", proving the widening does not narrow).
+sub table_decisions_fixture {
+    my ($header) = @_;
+    $header = '## Decisions' unless defined $header;
+    return join("\n",
+        '# Blueprint: fixture-bp',
+        '',
+        '## Status legend',
+        '',
+        "$DONE done, $PENDING pending",
+        '',
+        '## Packages',
+        '',
+        '| pkg | deliverable | depends_on | status | model |',
+        '|---|---|---|---|---|',
+        "| b01 | first thing | \xE2\x80\x94 | $DONE done | sonnet |",
+        "| b02 | second thing (path /home/Andr\xC3\xA9/work) | b01 | $PENDING pending | sonnet |",
+        '',
+        $header,
+        '',
+        '| # | Decision |',
+        '|---|---|',
+        '| SYN-01 | an earlier decision, no hazard token here. |',
+        '| SYN-02 | another decision row, also hazard-free. |',
+        '',
+    );
+}
+
+# Same as base_fixture (bullet-shaped Decisions section) but under the WIDER header
+# spelling "## Synthesis decisions" -- proves the widened regex still recognizes a
+# bullet-shaped section exactly as it always has for "## Decisions".
+sub synthesis_bullet_fixture {
+    return join("\n",
+        '# Blueprint: fixture-bp',
+        '',
+        '## Status legend',
+        '',
+        "$DONE done, $PENDING pending",
+        '',
+        '## Packages',
+        '',
+        '| pkg | deliverable | depends_on | status | model |',
+        '|---|---|---|---|---|',
+        "| b01 | first thing | \xE2\x80\x94 | $DONE done | sonnet |",
+        "| b02 | second thing | b01 | $PENDING pending | sonnet |",
+        '',
+        '## Synthesis decisions',
+        '',
+        '- SYN-01: an earlier decision, no hazard token here.',
+        '',
+    );
+}
+
+# =====================================================================================
 # G0: harness self-checks (expected to pass even with bp-blueprint.pl absent).
 # =====================================================================================
 
@@ -511,6 +572,112 @@ cmp_ok(scalar(keys %$dag_before), ">=", 60,
     my $new = read_file($p);
     is(index($new, "Andr\xC3\xA9") >= 0 ? 1 : 0, 1,
        "G11: the Andr\x{e9}-class bytes in the live copy survive the mutation byte-for-byte");
+}
+
+# =====================================================================================
+# b42-decision-context-split-spec §4 (ADDITIVE ONLY -- see spec §6 / file header comment):
+# header widening, table-shape detection, the new set-decision op, its refusals, and
+# add-decision's refusal against a table-shaped section.
+# =====================================================================================
+
+# G12 (header widening): both the classic "## Decisions" and the wider
+# "## Synthesis decisions" (mixed case) spellings are recognised identically.
+for my $header ('## Decisions', '## Synthesis decisions', '## SYNTHESIS DECISIONS') {
+    my $p = stage_bytes(table_decisions_fixture($header));
+    my $orig = read_file($p);
+    my $dag_before = BpOrch::parse_dag($orig);
+    my ($rc, $out, $err) = run_pl(['set-decision', '--file', $p, '--id', 'SYN-02',
+                                    '--text', 'a replaced decision text']);
+    is($rc, 0, "G12: set-decision --id SYN-02 exits 0 under header '$header'");
+    my $new = read_file($p);
+    isnt($new, $orig, "G12: ...and the file actually changed under header '$header'");
+    like($new, qr/\|\s*SYN-02\s*\|\s*a replaced decision text\s*\|/,
+       "G12: SYN-02's row now contains the new text verbatim under header '$header'");
+    unlike($new, qr/another decision row, also hazard-free/,
+       "G12: the old text for SYN-02 is gone under header '$header'");
+    like($new, qr/an earlier decision, no hazard token here\./,
+       "G12: SYN-01's row is untouched under header '$header'");
+    my $dag_after = BpOrch::parse_dag($new);
+    is_deeply($dag_after, $dag_before,
+       "G12: parse_dag's structural output is unchanged by set-decision under header '$header'");
+}
+
+# G13 (widened header still works for the legacy BULLET shape, unchanged behaviour):
+# add-decision and the `decisions` read op both recognise "## Synthesis decisions".
+{
+    my $p = stage_bytes(synthesis_bullet_fixture());
+    my ($rc, $out, $err) = run_pl(['add-decision', '--file', $p, '--id', 'SYN-77',
+                                    '--text', 'a widened-header bullet decision']);
+    is($rc, 0, "G13: add-decision recognises the widened '## Synthesis decisions' header and exits 0");
+    my $new = read_file($p);
+    like($new, qr/SYN-77: a widened-header bullet decision/,
+       "G13: the new bullet was appended under the widened header");
+
+    my ($rc2, $out2, $err2) = run_pl(['decisions', '--file', $p]);
+    is($rc2, 0, "G13: the 'decisions' read op also recognises the widened header and exits 0");
+    like($out2, qr/SYN-77: a widened-header bullet decision/,
+       "G13: ...and lists the newly-added decision");
+}
+
+# G14 (add-decision refuses on a table-shaped section rather than corrupting it).
+{
+    my $p = stage_bytes(table_decisions_fixture());
+    my $before_digest = digest_of($p);
+    my ($rc, $out, $err) = run_pl(['add-decision', '--file', $p, '--id', 'SYN-99',
+                                    '--text', 'an attempted bullet append into a table']);
+    isnt($rc, 0, "G14: add-decision against a table-shaped Decisions section is refused (non-zero exit)");
+    is($out, '', "G14: stdout empty on refusal");
+    ok(length($err) > 0, "G14: stderr names a cause for the refusal");
+    like($err, qr/table/i, "G14: the refusal message names the table shape as the cause");
+    is(digest_of($p), $before_digest, "G14: ...and the file is left byte-identical");
+}
+
+# G15 (set-decision refusal: --text containing the literal 'depends_on', SYN-14 wording
+# class identical to op_add_decision's own check -- spec §4 / §3 of the b42 spec).
+{
+    my $p = stage_bytes(table_decisions_fixture());
+    my $before_digest = digest_of($p);
+    my ($rc, $out, $err) = run_pl(['set-decision', '--file', $p, '--id', 'SYN-01',
+                                    '--text', 'a table with a depends_on column would go here']);
+    isnt($rc, 0, "G15: set-decision whose --text contains the literal 'depends_on' is refused");
+    is($out, '', "G15: stdout empty on refusal");
+    like($err, qr/SYN-14/, "G15: stderr names SYN-14 as the reason for refusal");
+    is(digest_of($p), $before_digest, "G15: ...and the file is left byte-identical");
+}
+
+# G16 (set-decision refusal: --id / --text containing a pipe or newline -- field_safe).
+{
+    my @cases = (
+        [ 'id-with-pipe',    ['--id', 'SYN|01',   '--text', 'harmless text'] ],
+        [ 'id-with-newline', ["--id", "SYN-01\nbogus", '--text', 'harmless text'] ],
+        [ 'text-with-pipe',  ['--id', 'SYN-01',   '--text', 'harmless | text'] ],
+        [ 'text-with-newline', ['--id', 'SYN-01', '--text', "harmless\ntext"] ],
+    );
+    for my $case (@cases) {
+        my ($label, $extra_args) = @$case;
+        my $p = stage_bytes(table_decisions_fixture());
+        my $before_digest = digest_of($p);
+        my ($rc, $out, $err) = run_pl(['set-decision', '--file', $p, @$extra_args]);
+        isnt($rc, 0, "G16: set-decision with $label is refused (non-zero exit)");
+        is(digest_of($p), $before_digest, "G16: ...and the file is left byte-identical ($label)");
+        ok(length($err) > 0, "G16: stderr names a cause for the refusal ($label)");
+    }
+}
+
+# G17 (set-decision refusal: --id not present in the table -- never creates a row).
+{
+    my $p = stage_bytes(table_decisions_fixture());
+    my $before_digest = digest_of($p);
+    my $orig = read_file($p);
+    my $rows_before = () = ($orig =~ /^\|\s*SYN-/mg);
+    my ($rc, $out, $err) = run_pl(['set-decision', '--file', $p, '--id', 'SYN-404',
+                                    '--text', 'this id does not exist']);
+    isnt($rc, 0, "G17: set-decision with an unknown --id is refused (non-zero exit)");
+    like($err, qr/SYN-404/, "G17: stderr names the unknown id as the cause");
+    is(digest_of($p), $before_digest, "G17: ...and the file is left byte-identical");
+    my $new = read_file($p);
+    my $rows_after = () = ($new =~ /^\|\s*SYN-/mg);
+    is($rows_after, $rows_before, "G17: ...and no new row was created (add-decision's job, not set-decision's)");
 }
 
 done_testing();
