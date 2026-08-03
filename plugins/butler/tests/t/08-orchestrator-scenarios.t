@@ -92,8 +92,25 @@ sub needs_you_count { my $d=shift."/runs/needs-you"; return 0 unless -d $d; open
 
 # --- S1: crashed coordinator (dead pid, attempt>0, ledger still 'pending') -> warm relaunch
 {
+    # b41 FIXTURE EXTENSION (assertions below are UNCHANGED). The warm/cold call now derives
+    # from TRANSCRIPT activity, not the ledger's mtime, because the ledger is written by humans,
+    # reporters and judges long after a coordinator dies. This scenario's intent -- "a crashed
+    # coordinator with a warm cache relaunches and passes --resume-session" -- is unchanged; it
+    # just has to supply the input the decision actually reads now. A fresh transcript plus a
+    # recorded cache-hit observation at this age is what "warm" means under b41.
     my $dir = mk_bp([['solo','—','pending','p/s/']],
-                    { solo => { attempt=>1, pid=>$DEAD_PID, session_id=>'sid-x', status=>'running' } });
+                    { solo => { attempt=>1, pid=>$DEAD_PID, session_id=>'sid-x', status=>'running',
+                                cache_observations => [ { age_min => 0, hit => 1 } ] } });
+    {
+        my @t = gmtime(time);
+        my $iso = sprintf('%04d-%02d-%02dT%02d:%02d:%02d.000Z',
+                          $t[5]+1900, $t[4]+1, $t[3], $t[2], $t[1], $t[0]);
+        open my $tr, '>', "$dir/runs/solo.jsonl" or die;
+        print $tr $J->encode({ type => 'assistant', timestamp => $iso,
+                               message => { usage => { cache_read_input_tokens => 12345,
+                                                       cache_creation_input_tokens => 0 } } }), "\n";
+        close $tr;
+    }
     my $l = run_once($dir);
     is(scalar @$l, 1, 'S1 crash: exactly one relaunch');
     is($l->[0]{pkg}, 'solo', 'S1 crash: relaunched the crashed package');

@@ -73,8 +73,21 @@ sub base_tun { my %o=@_; return { ceil5=>85,ceil7=>90,drain=>600,max_par=>2,cap=
     judge_spawn_cap=>3, %o }; }
 
 # --- fake-world helpers -----------------------------------------------------
+# b41 FIDELITY FIX: this wrote a bare "x", so the simulated transcript was not JSON and
+# carried no timestamp — only its mtime meant anything. That was survivable while the
+# warm/cold call read the LEDGER's mtime, but the call now parses the transcript, and an
+# unparseable one correctly yields cold. Emitting a real assistant-usage line makes the
+# simulator model what a coordinator actually appends. The file still GROWS on every call,
+# so the wedge/log-flat detection that depends on growth is unaffected.
 sub _grow_jsonl { my ($runs,$pkg,$clock)=@_; my $f="$runs/$pkg.jsonl";
-    open my $w,'>>',$f or return; print $w "x"; close $w; utime $clock,$clock,$f; }
+    my @t = gmtime($clock);
+    my $iso = sprintf('%04d-%02d-%02dT%02d:%02d:%02d.000Z',
+                      $t[5]+1900, $t[4]+1, $t[3], $t[2], $t[1], $t[0]);
+    open my $w,'>>',$f or return;
+    print $w $J->encode({ type => 'assistant', timestamp => $iso,
+                          message => { usage => { cache_read_input_tokens => 4096,
+                                                  cache_creation_input_tokens => 0 } } }), "\n";
+    close $w; utime $clock,$clock,$f; }
 sub _set_status { my ($dir,$pkg,$st)=@_; my $f="$dir/packages/$pkg.md"; my $t=slurp($f);
     $t =~ s/^status:.*$/status: $st/m; open my $w,'>:raw',$f or return; print $w $t; close $w; }
 sub _seed_verdict { my ($dir,$kind,$pkg,$obj)=@_; require File::Path; File::Path::make_path("$dir/runs/$kind");

@@ -545,11 +545,48 @@ sub effective_attempts {
     return $n < 0 ? 0 : $n;
 }
 
-# --- warm-resume vs cold-start economics (mirrors bp-resume-sweep.sh): warm only
-# within the threshold of the last ledger touch AND with a known session id.
+# --- warm-resume vs cold-start economics: warm only within the threshold of
+# $age_min AND with a known session id. b41: the cache-window policy is now
+# named EXACTLY ONCE, in bp-cache-state.pl (BpCacheState::effective_threshold_min,
+# CACHE_TTL_MIN minus CACHE_SAFETY_MARGIN_MIN) -- this sub no longer hardcodes a
+# second "60". bp-resume-sweep.sh consumes the SAME entry point directly
+# (bp-cache-state.pl verdict <bp> <pkg>, which additionally derives $age_min from
+# the TRANSCRIPT rather than the ledger, per the b41 defect). This function stays
+# a pure (age_min, sid, threshold_min) -> warm|cold decision -- its callers
+# (t/06's direct unit tests, and the watchdog relaunch site below, which still
+# passes $t->{thresh_min} and a ledger/registry-derived $age_min for those
+# already-pinned scenarios) are unchanged; only the DEFAULT threshold, reached
+# when no $threshold_min is supplied, is now sourced from the shared constant
+# instead of a bare literal.
+# b41: record what a launch actually got from the prompt cache, so the NEXT warm/cold
+# decision is measured rather than assumed. Called after EVERY successful launch — not
+# just relaunches — because `verdict` refuses to say warm without a recorded observation,
+# so an unobserved fleet would answer cold forever and the mechanism would never fire.
+#
+# Best-effort by construction: an observation that cannot be written must never affect the
+# run. Failing to record only makes the next verdict cold, which is the safe direction.
+sub _observe_cache {
+    my ($bpdir, $pkg, $now, $log) = @_;
+    local $@;
+    my $ok = eval {
+        require Cwd;
+        require File::Basename;
+        my $d = File::Basename::dirname(Cwd::abs_path(__FILE__));
+        require "$d/bp-cache-state.pl";
+        BpCacheState::observe_from_runs("$bpdir/runs", $pkg, $now);
+        1;
+    };
+    _log($log, 'cache_observe_failed', { package => $pkg }) unless $ok;
+    return;
+}
+
 sub resume_mode {
     my ($age_min, $sid, $threshold_min) = @_;
-    $threshold_min //= 60;
+    unless (defined $threshold_min) {
+        require "$DIR/bp-cache-state.pl";   # lazy: bp-cache-state.pl requires US at its own
+                                             # top level, so this must never run at OUR top level
+        $threshold_min = BpCacheState::effective_threshold_min();
+    }
     return 'warm' if defined $sid && length $sid && defined $age_min && $age_min <= $threshold_min;
     return 'cold';
 }
@@ -2230,7 +2267,8 @@ sub run {
                         my $snap = launch_snapshot($bpdir, $runs, $pkg, $now);
                         my $rc = $launch->({ pkg => $pkg, args => [], kind => 'cold-wedged' });
                         $note_exec->($pkg, $rc);
-                        if (defined $rc && $rc == 0) { _upd_pkg($runs, $log, $pkg, { launch_snapshot => $snap }); push @live, $pkg; }
+                        if (defined $rc && $rc == 0) { _upd_pkg($runs, $log, $pkg, { launch_snapshot => $snap }); push @live, $pkg;
+                                                       _observe_cache($bpdir, $pkg, $now, $log); }
                         else { _log($log, 'launch_failed', { package => $pkg, kind => 'cold-wedged', rc => $rc }); }
                     } elsif ($v eq 'block') {
                         _log($log, 'watchdog_block', { package => $pkg, reason => 'wedged past attempt cap', attempts => $att->{$pkg} });
@@ -2317,8 +2355,40 @@ sub run {
                                     }
                                 }
                             }
-                            my $age = ledger_age_min($bpdir, $pkg, $now);
-                            my $mode = resume_mode($age, $sid->{$pkg}, $t->{thresh_min});
+                            # b41: the warm/cold call is made from TRANSCRIPT activity, not the
+                            # ledger's mtime. The ledger is written by humans, reporters and
+                            # judges long after a coordinator dies -- measured on this blueprint,
+                            # s07's ledger was 71h NEWER than its transcript, so the old
+                            # ledger_age_min() reading here would have called it warm, attempted a
+                            # resume, missed, and re-ingested the whole transcript at cache-WRITE
+                            # rates. That is the single most expensive thing an unattended run does
+                            # by accident, and it is why uncertainty biases cold.
+                            #
+                            # One rule, two callers: bp-resume-sweep.sh consumes the same verdict.
+                            # The require is lazy (inside the loop body, not at file scope) because
+                            # bp-cache-state.pl requires THIS file for _last_nonempty_line.
+                            # Reported in the watchdog log below. Transcript-derived, so the log
+                            # now records the age the decision was ACTUALLY made on rather than the
+                            # ledger's mtime; undef when no transcript activity is readable.
+                            my $age;
+                            my $mode = do {
+                                local $@;
+                                my $v = eval {
+                                    require Cwd;
+                                    require File::Basename;
+                                    my $d = File::Basename::dirname(Cwd::abs_path(__FILE__));
+                                    require "$d/bp-cache-state.pl";
+                                    # verdict_from_runs takes the runs dir directly -- verdict()
+                                    # resolves <root>/blueprints/<bp>/runs, and here we already
+                                    # hold the blueprint dir itself.
+                                    my $act = BpCacheState::last_activity_from_runs("$bpdir/runs", $pkg);
+                                    $age = int(($now - $act) / 60) if defined $act;
+                                    $age = 0 if defined $age && $age < 0;
+                                    BpCacheState::verdict_from_runs("$bpdir/runs", $pkg, $now);
+                                };
+                                # A failure to determine must never manufacture a warm resume.
+                                (defined $v && $v eq 'warm') ? 'warm' : 'cold';
+                            };
                             my @args = ($mode eq 'warm') ? ('--resume-session', $sid->{$pkg}) : ();
                             # The widened budget rides on the relaunch. Only ever set
                             # after a continuation, so an ordinary run's @cmd is
@@ -2334,6 +2404,7 @@ sub run {
                                 _upd_pkg($runs, $log, $pkg, { %pending_reg, launch_snapshot => $snap });
                                 $reg->{$pkg}{$_} = $pending_reg{$_} for keys %pending_reg;
                                 push @live, $pkg;
+                                _observe_cache($bpdir, $pkg, $now, $log);
                             } else {
                                 # nothing was exec'd: roll the widened budget back so the
                                 # next tick recomputes from the persisted value.
@@ -2449,6 +2520,7 @@ sub run {
                             _upd_pkg($runs, $log, $pkg, { launch_snapshot => $snap });
                             _log($log, 'launch', { package => $pkg, kind => 'fresh' });
                             push @live, $pkg;
+                            _observe_cache($bpdir, $pkg, $now, $log);
                         } else {
                             _log($log, 'launch_failed', { package => $pkg, kind => 'fresh', rc => $rc });
                         }

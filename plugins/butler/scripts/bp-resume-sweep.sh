@@ -6,13 +6,18 @@
 # Default is a dry run (prints the plan). --apply executes it.
 #
 # Policy (per non-terminal package whose coordinator process is dead):
-#   gap = minutes since the ledger was last touched
-#   gap <= BP_RESUME_THRESHOLD_MIN (default 60) AND session_id known
-#       -> warm resume:  claude --resume <sid>   (prompt cache plausibly warm)
-#   otherwise
-#       -> cold start:   fresh coordinator seeded from the ledger
-#          (re-ingesting a 100k+ token transcript past the cache window costs
-#           an order of magnitude more than a ledger cold-start)
+#   verdict = bp-cache-state.pl verdict <bp> <pkg>   (warm | cold)
+#       -- derived from the TRANSCRIPT's (runs/<pkg>.jsonl) last API event, NEVER
+#          the ledger's mtime (b41: the ledger is human/reporter/judge-touched and
+#          drifts from the transcript in both directions; a missed warm resume
+#          re-ingests a multi-MB transcript at cache-WRITE rates, so uncertainty
+#          must bias cold — see bp-cache-state.pl's own header for the full case).
+#   warm + session_id known -> warm resume:  claude --resume <sid>
+#   otherwise                -> cold start:   fresh coordinator seeded from the ledger
+#
+# ONE RULE, TWO CALLERS (b41 spec §2): this sweep and bp-orchestrator.pl's
+# resume_mode both consume bp-cache-state.pl's `verdict` — neither keeps a
+# second copy of the warm/cold policy or the cache-TTL window.
 #
 # Terminal ledgers (done/blocked/parked) and live processes are reported, not
 # touched. Packages never launched (no registry entry) are reported as PENDING —
@@ -33,7 +38,6 @@ for a in "$@"; do
   esac
 done
 
-THRESHOLD="${BP_RESUME_THRESHOLD_MIN:-60}"
 DATA=$(bp_data_dir)
 FOUND=0
 
@@ -43,12 +47,13 @@ revive() {  # BP_NAME PKG SID PID AGE STATUS
     printf '%-28s %-12s RUNNING (pid %s, ledger age %sm)\n' "$bp/$pkg" "$status" "$pid" "$age"
     return 0
   fi
-  local mode args=()
-  if [ "$age" -le "$THRESHOLD" ] && [ -n "$sid" ]; then
-    mode="warm-resume (gap ${age}m <= ${THRESHOLD}m)"
+  local verdict mode args=()
+  verdict=$(CCPRAXIS_DATA_DIR="$DATA" perl "$SCRIPT_DIR/bp-cache-state.pl" verdict "$bp" "$pkg" 2>/dev/null || echo cold)
+  if [ "$verdict" = "warm" ] && [ -n "$sid" ]; then
+    mode="warm-resume (bp-cache-state.pl verdict: warm)"
     args=(--resume-session "$sid")
   else
-    mode="cold-start (gap ${age}m > ${THRESHOLD}m or no session id)"
+    mode="cold-start (bp-cache-state.pl verdict: ${verdict}, session_id=${sid:-none})"
     args=()
   fi
   printf '%-28s %-12s DEAD -> %s\n' "$bp/$pkg" "$status" "$mode"

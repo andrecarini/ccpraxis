@@ -751,8 +751,23 @@ my $PIPE_2 = "## Pipeline\n- [x] a\n- [x] b\n";
 
 # ---- AC-26: a normal run is byte-identical to today ----------------------
 {
+    # b41 FIXTURE EXTENSION (assertions unchanged): the warm/cold call now reads transcript
+    # activity plus a recorded cache observation, not the ledger's mtime. This scenario's
+    # point is that a normal run's args are byte-identical to today, so it must still be a
+    # genuinely WARM case — which now means supplying the inputs warm is actually made of.
     my $dir = mk_bp([['norm', '-', 'pending', 'nm/', '']],
-                    { norm => { attempt=>1, pid=>$DEAD_PID, session_id=>'sid-x', status=>'running' } });
+                    { norm => { attempt=>1, pid=>$DEAD_PID, session_id=>'sid-x', status=>'running',
+                                cache_observations => [ { age_min => 0, hit => 1 } ] } });
+    {
+        my @tm = gmtime(time);
+        my $iso = sprintf('%04d-%02d-%02dT%02d:%02d:%02d.000Z',
+                          $tm[5]+1900, $tm[4]+1, $tm[3], $tm[2], $tm[1], $tm[0]);
+        open my $tr, '>', "$dir/runs/norm.jsonl" or die;
+        print $tr $J->encode({ type => 'assistant', timestamp => $iso,
+                               message => { usage => { cache_read_input_tokens => 999,
+                                                       cache_creation_input_tokens => 0 } } }), "\n";
+        close $tr;
+    }
     my ($L, $err) = go(dir => $dir, tunables => tun($dir));
     is($err, '', 'AC-26 a normal tick completes');
     is(scalar @$L, 1, 'AC-26 the normal warm relaunch still happens');
