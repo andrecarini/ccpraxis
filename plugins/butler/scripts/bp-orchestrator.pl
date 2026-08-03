@@ -2711,6 +2711,15 @@ sub run {
                                 # A failure to determine must never manufacture a warm resume.
                                 (defined $v && $v eq 'warm') ? 'warm' : 'cold';
                             };
+                            # b16: a coordinator that died of turn exhaustion is relaunched
+                            # into the EXACT context that contained the loop -- warm is
+                            # correct for a genuine crash and actively harmful here. b41's
+                            # cache-warmth verdict answers "can we resume cheaply?"; this
+                            # answers "should we resume at all?" and overrides it ONLY on
+                            # max_turns. An unknown/unparseable exit reason must never force
+                            # cold -- that would invent new uncertainty this package doesn't
+                            # own (b41's verdict stands untouched for success/error/unknown).
+                            $mode = 'cold' if $tv->{verdict} eq 'max_turns';
                             my @args = ($mode eq 'warm') ? ('--resume-session', $sid->{$pkg}) : ();
                             # The widened budget rides on the relaunch. Only ever set
                             # after a continuation, so an ordinary run's @cmd is
@@ -2718,7 +2727,8 @@ sub run {
                             # ledger fallback when no --max-turns is passed).
                             my $budget = _reg_int($reg->{$pkg}{max_turns});
                             push @args, '--max-turns', $budget if defined $budget;
-                            _log($log, 'watchdog_relaunch', { package => $pkg, mode => $mode, age_min => $age, attempts => $att->{$pkg} });
+                            _log($log, 'watchdog_relaunch', { package => $pkg, mode => $mode, age_min => $age,
+                                attempts => $att->{$pkg}, exit_reason => $tv->{verdict} });
                             my $snap = launch_snapshot($bpdir, $runs, $pkg, $now);
                             my $rc = $launch->({ pkg => $pkg, args => \@args, kind => $mode });
                             $note_exec->($pkg, $rc);
@@ -3725,6 +3735,20 @@ package main;
 use strict;
 use warnings;
 unless (caller) {
+    # b16: a single CLI seam so bp-resume-sweep.sh can classify a dead
+    # coordinator's exit reason through the SAME terminal_verdict the watchdog
+    # uses, rather than re-deriving turn-exhaustion detection in bash.
+    if (@ARGV && $ARGV[0] eq '--exit-reason') {
+        shift @ARGV;
+        my ($bpdir, $pkg) = @ARGV;
+        unless (defined $bpdir && length $bpdir && defined $pkg && length $pkg) {
+            print STDERR "usage: bp-orchestrator.pl --exit-reason <bp-dir> <pkg>\n";
+            exit 2;
+        }
+        my $tv = BpOrch::terminal_verdict(BpOrch::_last_jsonl_obj("$bpdir/runs", $pkg));
+        print "$tv->{verdict}\n";
+        exit 0;
+    }
     my $bp = shift @ARGV;
     unless (defined $bp && length $bp && $bp !~ /^--/) {
         print STDERR "usage: bp-orchestrator.pl <blueprint> [--bp-dir DIR] [--once]\n";

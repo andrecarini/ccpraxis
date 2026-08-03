@@ -19,6 +19,14 @@
 # resume_mode both consume bp-cache-state.pl's `verdict` — neither keeps a
 # second copy of the warm/cold policy or the cache-TTL window.
 #
+# ONE RULE, TWO CALLERS, again (b16 spec §2): a dead coordinator whose own
+# terminal jsonl event classifies as `max_turns` (via bp-orchestrator.pl's
+# shared `terminal_verdict` — reused through its `--exit-reason` CLI seam, NOT
+# re-derived here) is ALWAYS revived cold, regardless of the b41 verdict above:
+# a warm --resume would restore the exact context that contained the loop.
+# Every other exit reason (success, error, unknown) leaves the b41 verdict
+# above untouched.
+#
 # Terminal ledgers (done/blocked/parked) and live processes are reported, not
 # touched. Packages never launched (no registry entry) are reported as PENDING —
 # wave scheduling belongs to the deterministic orchestrator (bp-orchestrator.pl),
@@ -47,13 +55,21 @@ revive() {  # BP_NAME PKG SID PID AGE STATUS
     printf '%-28s %-12s RUNNING (pid %s, ledger age %sm)\n' "$bp/$pkg" "$status" "$pid" "$age"
     return 0
   fi
-  local verdict mode args=()
+  local verdict mode args=() exit_reason bpdir
   verdict=$(CCPRAXIS_DATA_DIR="$DATA" perl "$SCRIPT_DIR/bp-cache-state.pl" verdict "$bp" "$pkg" 2>/dev/null || echo cold)
-  if [ "$verdict" = "warm" ] && [ -n "$sid" ]; then
-    mode="warm-resume (bp-cache-state.pl verdict: warm)"
+  bpdir="$DATA/blueprints/$bp"
+  exit_reason=$(perl "$SCRIPT_DIR/bp-orchestrator.pl" --exit-reason "$bpdir" "$pkg" 2>/dev/null || echo unknown)
+  if [ "$exit_reason" = "max_turns" ]; then
+    # b16: turn exhaustion forces cold, always -- regardless of how warm the
+    # cache measures. b41's verdict is not consulted for this package once
+    # exit_reason is max_turns; the resumed context IS the loop.
+    mode="cold-start (exit_reason: max_turns forces cold, bp-cache-state.pl verdict was: ${verdict})"
+    args=()
+  elif [ "$verdict" = "warm" ] && [ -n "$sid" ]; then
+    mode="warm-resume (bp-cache-state.pl verdict: warm, exit_reason: ${exit_reason})"
     args=(--resume-session "$sid")
   else
-    mode="cold-start (bp-cache-state.pl verdict: ${verdict}, session_id=${sid:-none})"
+    mode="cold-start (bp-cache-state.pl verdict: ${verdict}, exit_reason: ${exit_reason}, session_id=${sid:-none})"
     args=()
   fi
   printf '%-28s %-12s DEAD -> %s\n' "$bp/$pkg" "$status" "$mode"
