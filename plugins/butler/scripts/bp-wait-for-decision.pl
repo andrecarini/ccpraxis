@@ -153,6 +153,175 @@ sub wait_loop {
     }
 }
 
+# ---------------------------------------------------------------------------
+# b24-reporter-autonomy — cadence, idle, progress-table and decide/escalate
+# classification. See plugins/butler/skills/reporter/SKILL.md for the doctrine
+# these implement; this is the pure, testable call surface (t/76 pins it).
+# ---------------------------------------------------------------------------
+
+# The prompt-cache TTL is a property of the model provider, not this machine
+# (spec b24 sec.2) -- it cannot be discovered at runtime, so it is a single-
+# sourced NAMED input, injected as an argument everywhere it is used rather
+# than hardcoded as the literal cap. Callers that don't know a specific TTL
+# use this default (today's known TTL, 60 minutes).
+use constant DEFAULT_TTL_MINUTES => 60;
+
+# The margin subtracted from the TTL to get the safe cadence cap, so cadence
+# never collides with a cache-write boundary.
+use constant CADENCE_TTL_MARGIN_MINUTES => 5;
+
+# The reporter's default poll cadence when nothing more specific is requested.
+use constant DEFAULT_CADENCE_MINUTES => 50;
+
+# cadence_cap_minutes($ttl_minutes) -> cap, DERIVED as $ttl_minutes - margin.
+# Never the literal 55 -- injecting a different TTL must observably change
+# the cap (t/76 C6). Pure.
+sub cadence_cap_minutes {
+    my ($ttl_minutes) = @_;
+    $ttl_minutes = DEFAULT_TTL_MINUTES unless defined $ttl_minutes;
+    return $ttl_minutes - CADENCE_TTL_MARGIN_MINUTES;
+}
+
+# resolve_cadence_minutes(\%opts) -> { minutes => N, clamped => bool }
+# opts: requested_min (optional), reason (optional), ttl_min (default 60).
+#  - No request -> the default (50 minutes).
+#  - A request above the derived cap is CLAMPED to the cap (clamped => 1),
+#    never honoured as-is.
+#  - A request below the default is honoured ONLY when a `reason` is given
+#    (a recorded reason is what stops "shorter" being an unaccountable escape
+#    hatch, spec b24 sec.2); with no reason it falls back to the default.
+#  - A request within [default, cap] is honoured as requested.
+# Pure.
+sub resolve_cadence_minutes {
+    my ($opts) = @_;
+    $opts ||= {};
+    my $ttl_min = defined $opts->{ttl_min} ? $opts->{ttl_min} : DEFAULT_TTL_MINUTES;
+    my $cap     = cadence_cap_minutes($ttl_min);
+    my $default = DEFAULT_CADENCE_MINUTES;
+    my $requested = $opts->{requested_min};
+
+    return { minutes => $default, clamped => 0 } unless defined $requested;
+
+    if ($requested > $cap) {
+        return { minutes => $cap, clamped => 1 };
+    }
+    if ($requested < $default) {
+        my $has_reason = defined $opts->{reason} && length $opts->{reason};
+        return { minutes => $requested, clamped => 0 } if $has_reason;
+        return { minutes => $default, clamped => 0 };
+    }
+    return { minutes => $requested, clamped => 0 };
+}
+
+# Statuses treated as terminal (blueprint sec.3 I1) -- matches bp-judge.pl /
+# bp-orchestrator.pl's existing terminal vocabulary.
+my %TERMINAL_STATUS = map { $_ => 1 } qw(done dropped);
+
+# Statuses treated as "parked awaiting a queued human decision" (sec.3 I2).
+my %AWAITING_DECISION_STATUS = map { $_ => 1 } qw(blocked parked);
+
+# blueprint_terminal(\@packages) -> bool (I1): every package done/dropped.
+# An empty list counts as terminal (vacuously, nothing left to do). Pure.
+sub blueprint_terminal {
+    my ($packages) = @_;
+    for my $pkg (@{ $packages || [] }) {
+        my $status = $pkg->{status} // '';
+        return 0 unless $TERMINAL_STATUS{$status};
+    }
+    return 1;
+}
+
+# all_awaiting_decision(\@packages) -> bool (I2): every NON-terminal package
+# is waiting on a queued decision (blocked/parked). Terminal packages are
+# ignored -- this is asked only once blueprint_terminal is already false, and
+# a blueprint made entirely of terminal packages is I1's case, not I2's, so
+# an all-terminal list here does NOT count as "awaiting decision" (there is
+# nothing non-terminal to be awaiting anything). Pure.
+sub all_awaiting_decision {
+    my ($packages) = @_;
+    my $saw_non_terminal = 0;
+    for my $pkg (@{ $packages || [] }) {
+        my $status = $pkg->{status} // '';
+        next if $TERMINAL_STATUS{$status};
+        $saw_non_terminal = 1;
+        return 0 unless $AWAITING_DECISION_STATUS{$status};
+    }
+    return $saw_non_terminal ? 1 : 0;
+}
+
+# watcher_armed(\@packages) -> bool: NOT I1 and NOT I2. A watcher is armed
+# only when work is genuinely in flight -- the paired positive gate (sec.3)
+# that stops an implementation which never arms anything from trivially
+# satisfying I1/I2. Pure.
+sub watcher_armed {
+    my ($packages) = @_;
+    return 0 if blueprint_terminal($packages);
+    return 0 if all_awaiting_decision($packages);
+    return 1;
+}
+
+# progress_table(\@packages) -> { done_count => N, rows => [ {id,status} ] }
+# done packages collapse to a count (sec.4); every non-terminal package is
+# listed individually with its actual state. `dropped` (also terminal) is
+# listed individually too, since only `done` is the "collapse to a summary"
+# case the spec names -- a dropped package is still worth a row to explain
+# why it isn't progressing. Pure.
+sub progress_table {
+    my ($packages) = @_;
+    my @rows;
+    my $done_count = 0;
+    for my $pkg (@{ $packages || [] }) {
+        my $status = $pkg->{status} // '';
+        if ($status eq 'done') {
+            $done_count++;
+            next;
+        }
+        push @rows, { id => $pkg->{id}, status => $status };
+    }
+    return { done_count => $done_count, rows => \@rows };
+}
+
+# classify_decision(\%case) -> 'escalate' | 'decide'
+# case: action_kind, contradicts_recorded_ruling, groundable_in_disk_evidence,
+# clearly_better_option. The three escalation classes (E1/E2/E3) are a
+# DISJUNCTION evaluated FIRST -- any one forces escalation regardless of how
+# clear the better option looks, including when it is both obviously-better
+# AND irreversible (E1 wins, spec sec.1.2/§5 C3). Pure.
+sub classify_decision {
+    my ($case) = @_;
+    $case ||= {};
+
+    # E1 -- irreversible/destructive: the concrete accept/drop actions.
+    my $action = $case->{action_kind} // '';
+    return 'escalate' if $action eq 'accept' || $action eq 'drop';
+
+    # E2 -- contradicts a recorded operator ruling.
+    return 'escalate' if $case->{contradicts_recorded_ruling};
+
+    # E3 -- not groundable in disk evidence.
+    return 'escalate' unless $case->{groundable_in_disk_evidence};
+
+    # None of E1-E3 held. Decide only when there is a clear better option.
+    return $case->{clearly_better_option} ? 'decide' : 'escalate';
+}
+
+# autonomous_decision_record(\%case) -> record hashref, or undef if 'escalate'.
+# The durable record (spec sec.1.3): reasoning, disk evidence, cost of
+# waiting, and an awaiting-confirmation marker. Absent entirely for an
+# escalated case -- "always writes a record" is explicitly wrong (§5 C4
+# vacuity gate). Pure.
+sub autonomous_decision_record {
+    my ($case) = @_;
+    $case ||= {};
+    return undef unless classify_decision($case) eq 'decide';
+    return {
+        reasoning             => $case->{reasoning},
+        disk_evidence         => $case->{disk_evidence},
+        cost_of_waiting       => $case->{cost_of_waiting},
+        awaiting_confirmation => 1,
+    };
+}
+
 package main;
 use strict;
 use warnings;

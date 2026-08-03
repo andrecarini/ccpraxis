@@ -11,7 +11,7 @@ Butler **executes** a blueprint the `blueprint` plugin already authored on disk 
 
 | name | what it is |
 |------|------------|
-| **reporter** | The interactive **Claude** session — the human's front door. Launches a run, answers "how's it going?", relays queued decisions. Stays lean: it reads on-disk state to answer; it does **not** run a monitoring loop and does **not** drive the run. Become it with `/butler:reporter`. |
+| **reporter** | The interactive **Claude** session — the human's front door. Launches a run, answers "how's it going?", and autonomously resolves the queued decisions it can classify as decidable, batching only what genuinely needs the human. Stays lean: it reads on-disk state to answer; it does **not** run a monitoring loop and does **not** drive the run. Become it with `/butler:reporter`. |
 | **orchestrator** | The **deterministic Perl script** `bp-orchestrator.pl` — drives a run unattended with **zero Claude**. Watches/launches/relaunches coordinators, polls usage, keeps the OAuth token alive, maintains the busy-lease, fires judges, auto-resumes. You never run it by hand; `dispatch-fleet` starts it via `bp-orchestrate.sh`. |
 | **coordinator** | A headless `claude -p`, one per package, running that package's 8-step pipeline (see `coordinator-protocol`). |
 | **worker** | A Task **subagent** of a coordinator; does one pipeline step, returns a ≤15-line summary. |
