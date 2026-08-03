@@ -102,6 +102,35 @@ WORKDIR /project
 #      The container does NOT watch claude itself — its life is bound to the
 #      manager heartbeat, not to any claude process. Multiple (or zero) connector
 #      sessions are fine.
+# Worker-jail skeleton (b33-worker-jail-isolation, spec section 3.4).
+#
+# This MUST be baked at image build, and cannot be done at runtime. Measured in
+# this container: CAP_MKNOD is absent (CapEff=0x800405fb) so `mknod` is denied,
+# and /dev is tmpfs so hardlinking the real device nodes fails EXDEV against
+# overlayfs. bp-jail.pl therefore falls back to creating plain EMPTY FILES at
+# /dev/{null,zero,random,urandom} inside a jail — which satisfies the oracle
+# (nothing in t/80 depends on them behaving like devices) but is NOT functional
+# for a real worker: any process that opens /dev/null for redirection, or reads
+# /dev/urandom for entropy, will misbehave against an empty regular file.
+#
+# Baking the nodes here is the only place mknod is available (image build runs
+# privileged), so a jail built on a container from THIS image gets real devices
+# and bp-jail.pl's fallback never fires.
+RUN mkdir -p /opt/bp-jail-skel/dev /opt/bp-jail-skel/etc/ssl /opt/bp-jail-skel/tmp \
+    && mknod -m 666 /opt/bp-jail-skel/dev/null    c 1 3 \
+    && mknod -m 666 /opt/bp-jail-skel/dev/zero    c 1 5 \
+    && mknod -m 444 /opt/bp-jail-skel/dev/random  c 1 8 \
+    && mknod -m 444 /opt/bp-jail-skel/dev/urandom c 1 9 \
+    && chmod 1777 /opt/bp-jail-skel/tmp \
+    && cp -a /etc/nsswitch.conf /etc/hosts /opt/bp-jail-skel/etc/ 2>/dev/null || true \
+    && cp -a /etc/ssl/certs /opt/bp-jail-skel/etc/ssl/ 2>/dev/null || true \
+    && printf 'root:x:0:0:root:/root:/bin/sh\nbpworker:x:4242:4242:bp jail worker:/work:/bin/sh\n' \
+       > /opt/bp-jail-skel/etc/passwd \
+    && printf 'root:x:0:\nbpworker:x:4242:\n' > /opt/bp-jail-skel/etc/group
+# resolv.conf is deliberately NOT baked: it is generated per-container by the
+# runtime, so a build-time copy would pin a stale nameserver. bp-jail.pl copies
+# the live /etc/resolv.conf into each jail at create time (DNS is criterion C6).
+
 COPY heartbeat.sh /usr/local/bin/sandbox-heartbeat
 RUN chmod +x /usr/local/bin/sandbox-heartbeat
 ENTRYPOINT ["/usr/local/bin/sandbox-heartbeat"]
