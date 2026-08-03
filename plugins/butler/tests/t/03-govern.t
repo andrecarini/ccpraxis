@@ -9,7 +9,7 @@ use Time::Local qw(timegm);
 
 require "$Bin/../../scripts/bp-govern.pl";
 
-plan tests => 25;
+plan tests => 26;
 
 sub near { my ($a,$b,$msg,$eps)=@_; $eps//=1e-6; ok(abs($a-$b) < $eps, $msg) or diag("got $a want $b"); }
 

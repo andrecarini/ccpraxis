@@ -539,9 +539,18 @@ sub widen_max_turns {
 # orchestrator-granted turn continuations. Subtract the continuations we granted
 # at the watchdog call site so a productive package isn't blocked for being
 # continued (watchdog_verdict itself stays pure and unchanged).
+#
+# b29-rate-limit-attempt-isolation: a THIRD discount, $rate_limit_discounts, joins
+# $turn_continuations at the SAME subtraction point (spec's own instruction: "keep
+# one subtraction point; do not add a second cap-evaluation path"). Per b08's
+# established HTTP-529 doctrine ("A 529 does NOT count against the 4-attempt
+# convergence cap. That cap exists to stop a coordinator thrashing on a problem
+# it is misdiagnosing; an overloaded endpoint is not a misdiagnosis."), a launch
+# that died to a rate-limit rejection never ran a turn, so there was nothing to
+# misdiagnose — it is not an attempt, exactly like an overloaded 529 endpoint.
 sub effective_attempts {
-    my ($attempts, $turn_continuations) = @_;
-    my $n = ($attempts // 0) - ($turn_continuations // 0);
+    my ($attempts, $turn_continuations, $rate_limit_discounts) = @_;
+    my $n = ($attempts // 0) - ($turn_continuations // 0) - ($rate_limit_discounts // 0);
     return $n < 0 ? 0 : $n;
 }
 
@@ -897,6 +906,90 @@ sub _last_jsonl_obj_path {
 sub _last_jsonl_obj {
     my ($runs, $pkg) = @_;
     return _last_jsonl_obj_path("$runs/$pkg.jsonl");
+}
+
+# --- b29: bounded seek-from-end reader of the last $max_lines non-empty JSON
+# lines of an arbitrary jsonl FILE. Mirrors _last_nonempty_line's tail-seek
+# discipline (never slurps a multi-GB coordinator stream) but keeps a small
+# ring of recent lines instead of only the last one, because the rate_limit_event
+# marker this package looks for is NOT the terminal line — it precedes the
+# result record that ends the launch.
+our $MAX_JSONL_TAIL_LINES = 200;
+
+sub _tail_jsonl_objs {
+    my ($file, $max_lines) = @_;
+    $max_lines //= $MAX_JSONL_TAIL_LINES;
+    open my $fh, '<:raw', $file or return [];
+    my $size = (stat($fh))[7];
+    unless (defined $size && $size > 0) { close $fh; return []; }
+    my $CHUNK = 65536;
+    my $pos   = $size;
+    my $tail  = '';
+    my $lines_seen = 0;
+    while ($pos > 0) {
+        my $len = $pos < $CHUNK ? $pos : $CHUNK;
+        $pos -= $len;
+        last unless seek($fh, $pos, 0);
+        my $data = '';
+        my $got  = read($fh, $data, $len);
+        last unless defined $got && $got > 0;
+        $tail = $data . $tail;
+        $lines_seen = () = ($tail =~ /\n/g);
+        # Bounded on BOTH lines collected and a hard byte ceiling — a
+        # pathological single-line coordinator dump must not pull the whole
+        # file into memory (same guard rationale as $MAX_JSONL_LINE above).
+        last if $lines_seen >= $max_lines || length($tail) > $MAX_JSONL_LINE * $max_lines;
+    }
+    close $fh;
+    my @lines = grep { /\S/ } split /\n/, $tail;
+    @lines = @lines[-$max_lines .. -1] if @lines > $max_lines;
+    my @objs;
+    for my $l (@lines) {
+        next if length($l) > $MAX_JSONL_LINE;
+        my $o = eval { JSON::PP->new->decode($l) };
+        push @objs, $o if ref $o eq 'HASH';
+    }
+    return \@objs;
+}
+
+# --- b29: classify whether a DEAD coordinator's death was a rate-limit
+# rejection rather than a genuine failure. Returns evidence text (truthy) if
+# either signature (spec §1) is present in the package's recent jsonl tail,
+# else undef so the discount is never silently inferred.
+#
+# Signature (a) reuses b30's already-shipped BpGovern::immediate_pause_trigger
+# rather than a second detector (bp-govern.pl is read-only for this package):
+# the coordinator's actual event nests the verdict as rate_limit_info.status,
+# one level deeper than immediate_pause_trigger's own top-level `status` field,
+# so each rate_limit_event is adapted onto that shape before the call — the
+# shared function still makes the "rejected?" decision, not a reimplementation
+# of it.
+#
+# Signature (b) is the api_error / num_turns<=1 / duration_api_ms:0 shape b12
+# actually produced: a launch refused before a single turn ran.
+sub rate_limit_rejection_evidence {
+    my ($runs, $pkg) = @_;
+    my $objs = _tail_jsonl_objs("$runs/$pkg.jsonl");
+    return undef unless @$objs;
+
+    my @adapted = map {
+        (($_->{type} // '') eq 'rate_limit_event' && ref($_->{rate_limit_info}) eq 'HASH')
+            ? { type => 'rate_limit_event', status => $_->{rate_limit_info}{status} }
+            : $_
+    } @$objs;
+    if (BpGovern::immediate_pause_trigger(\@adapted)) {
+        return 'rate_limit_event: rate_limit_info.status="rejected" observed in coordinator stream';
+    }
+
+    for my $o (@$objs) {
+        next unless ($o->{type} // '') eq 'result';
+        next unless ($o->{terminal_reason} // '') eq 'api_error';
+        my $nt = $o->{num_turns};
+        next unless defined $nt && $nt =~ /^\d+$/ && $nt <= 1;
+        next unless defined($o->{duration_api_ms}) && $o->{duration_api_ms} == 0;
+        return "result: terminal_reason=api_error num_turns=$nt duration_api_ms=0 (launch refused before doing work)";
+    }
+    return undef;
 }
 
 # --- ticked pipeline checkboxes in a ledger BODY (frontmatter excluded). The
@@ -2256,7 +2349,8 @@ sub run {
                     my $prog = progress_verdict($sz, $mt, ($prev ? $prev->{size} : undef), $now, $t->{flat});
                     $seen{$pkg} = { size => ($sz // 0), mtime => ($mt // $now) };
                     my $v = watchdog_verdict({ alive => 1, progress => $prog,
-                        attempts => effective_attempts($att->{$pkg}, _reg_int($reg->{$pkg}{turn_continuations}) // 0),
+                        attempts => effective_attempts($att->{$pkg}, _reg_int($reg->{$pkg}{turn_continuations}) // 0,
+                                                        _reg_int($reg->{$pkg}{rate_limit_discounts}) // 0),
                         cap => $t->{cap} });
                     if ($v eq 'none') {
                         push @live, $pkg;
@@ -2288,8 +2382,28 @@ sub run {
                         _upd_pkg($runs, $log, $pkg, { turn_exhaust_streak => 0 });   # B9b
                         $reg->{$pkg}{turn_exhaust_streak} = 0;
                     }
+                    # b29-rate-limit-attempt-isolation: classify THIS death before the
+                    # cap is evaluated. Gated on the attempt number already discounted
+                    # (rate_limit_discounted_attempt) so a package that sits dead across
+                    # multiple ticks before it is relaunched (e.g. parallel cap full)
+                    # is discounted exactly once per launch, not once per tick.
+                    my $cur_att = _reg_int($att->{$pkg}) // 0;
+                    my $already_disc_att = _reg_int($reg->{$pkg}{rate_limit_discounted_attempt}) // 0;
+                    if ($cur_att > $already_disc_att) {
+                        my $rl_evidence = rate_limit_rejection_evidence($runs, $pkg);
+                        if ($rl_evidence) {
+                            my $rld = (_reg_int($reg->{$pkg}{rate_limit_discounts}) // 0) + 1;
+                            _upd_pkg($runs, $log, $pkg, { rate_limit_discounts => $rld,
+                                rate_limit_discounted_attempt => $cur_att });
+                            $reg->{$pkg}{rate_limit_discounts} = $rld;
+                            $reg->{$pkg}{rate_limit_discounted_attempt} = $cur_att;
+                            _log($log, 'attempt_discounted_rate_limit',
+                                { package => $pkg, evidence => $rl_evidence, attempts => $att->{$pkg} });
+                        }
+                    }
                     my $v = watchdog_verdict({ alive => 0,
-                        attempts => effective_attempts($att->{$pkg}, _reg_int($reg->{$pkg}{turn_continuations}) // 0),
+                        attempts => effective_attempts($att->{$pkg}, _reg_int($reg->{$pkg}{turn_continuations}) // 0,
+                                                        _reg_int($reg->{$pkg}{rate_limit_discounts}) // 0),
                         cap => $t->{cap} });
                     if ($v eq 'relaunch') {
                         if (@live < $t->{max_par}) {

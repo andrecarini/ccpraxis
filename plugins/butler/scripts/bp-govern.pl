@@ -140,8 +140,17 @@ sub immediate_pause_trigger {
     return 0 unless ref $events eq 'ARRAY';
     for my $ev (@$events) {
         next unless ref $ev eq 'HASH';
-        return 1 if ($ev->{type} // '') eq 'rate_limit_event'
-                 && ($ev->{status} // '') eq 'rejected';
+        next unless ($ev->{type} // '') eq 'rate_limit_event';
+        # A REAL coordinator event nests this as rate_limit_info.status:
+        #   {"type":"rate_limit_event","rate_limit_info":{"status":"rejected",...}}
+        # The first cut of this sub only read a TOP-LEVEL $ev->{status}, which no real event
+        # carries — so it matched nothing in production and the immediate-rejection trigger was
+        # inert. Its own oracle passed because the oracle used the flat shape too. Both shapes
+        # are accepted now: nested is what the API emits, flat is what the existing tests use.
+        my $status = $ev->{status};
+        $status = $ev->{rate_limit_info}{status}
+            if !defined $status && ref $ev->{rate_limit_info} eq 'HASH';
+        return 1 if defined $status && $status eq 'rejected';
     }
     return 0;
 }
