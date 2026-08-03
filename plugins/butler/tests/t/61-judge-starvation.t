@@ -826,4 +826,226 @@ is(BpOrch::_tunables_base()->{judge_spawn_cap}, 3, 'PIN: judge_spawn_cap default
         'REGRESSION item 6: an existing judge jsonl is rotated to a numbered backup rather than truncated');
 }
 
+# ===========================================================================
+# ITEM 14 / ITEM 15 REGRESSION GUARDS (added by the coordinator, 2026-08-03)
+#
+# b09's step-7 batch 2b landed items 11-13 and then died on its turn cap
+# mid-item-14; items 14 and 15 (both HIGH from the package's own step-6
+# red-team) were specified in full in this package's ## Next action and
+# implemented in a later session. These guards are NOT new acceptance
+# criteria -- every AC and STEP-7 guard above stands unchanged. Conventions
+# follow the STEP-7 block above: positive assertion before every negative
+# one, no SKIP gated on the failure state, every count re-grepped from disk
+# rather than trusted from ledger prose (the ledger's own item-14/15 counts
+# drifted mid-session for exactly that reason).
+# ===========================================================================
+
+require POSIX;
+
+# ---- shared harness for item 15: forwards the pid_alive / judge_pid_identity_ok
+#      seams that run_once (above) does not, since it predates this package's
+#      item 15 work.
+sub run_seams {
+    my ($dir, %o) = @_;
+    my (@launched, @spawned);
+    BpOrch::run({
+        blueprint=>'T', bp_dir=>$dir, creds_path=>"$dir/creds.json",
+        tunables=>($o{tunables} || my_tun(%{ $o{tun} || {} })),
+        once=>1, now=>($o{now} || sub { $NOW }), sleep=>sub {},
+        http_get  => sub { { status=>200, content=>$USAGE_OK } },
+        http_post => sub { { status=>200, content=>'{}' } },
+        launch    => sub { push @launched, $_[0]; 0 },
+        spawn_judge => ($o{spawn_judge} || sub { push @spawned, $_[0]; 0 }),
+        pid_alive => $o{pid_alive},
+        judge_pid_identity_ok => $o{judge_pid_identity_ok},
+    });
+    return { launched=>\@launched, spawned=>\@spawned };
+}
+
+# A harmless, session-leading dummy process this test can safely signal: it
+# only sleeps, touches nothing, and is its own process group (setsid) so
+# kill_pid's `kill SIG, -$pid` (the whole GROUP) can never reach anything
+# else. POSIX::_exit bypasses Perl's normal exit path (END blocks, DESTROY,
+# Test::More's own plan bookkeeping) so the fork never emits stray TAP output.
+sub spawn_dummy_judge {
+    my $pid = fork();
+    die "fork failed: $!" unless defined $pid;
+    if ($pid == 0) {
+        eval { POSIX::setsid() };
+        sleep 60;
+        POSIX::_exit(0);
+    }
+    return $pid;
+}
+sub pid_gone_within {
+    my ($pid, $secs) = @_;
+    # A killed-but-unreaped child is a zombie: plain kill(0,...) still reports
+    # it as present, so use the same zombie-aware liveness check production
+    # uses (BpOrch::pid_alive) rather than a raw signal probe.
+    for (1 .. int($secs*20)) {
+        return 1 unless BpOrch::pid_alive($pid);
+        select(undef, undef, undef, 0.05);
+    }
+    return !BpOrch::pid_alive($pid);
+}
+# Best-effort cleanup: never leave a sleeping dummy behind, whether or not the
+# assertions around it passed.
+sub reap_dummy {
+    my ($pid) = @_;
+    return unless defined $pid;
+    kill('KILL', $pid) if kill(0, $pid);
+    waitpid($pid, 0);
+}
+
+# ---------------------------------------------------------------------------
+# ITEM 14a: mark_judge_inflight's discarded return -> unbounded refire. The
+# defect: a failed marker write (full/read-only runs/) leaves a judge running
+# but unmarked, so the next tick sees inflight=>0 and fires ANOTHER judge,
+# every tick, unbounded, because $rc==0 each time never trips the ordinary
+# spawn-fail cap. Guarded at all FIVE mark_judge_inflight call sites by
+# routing a failed marker through that site's existing cap-bounded fail path.
+# End-to-end proof on ONE representative site (the ordinary harvest-fire path,
+# bp-orchestrator.pl ~:2444-2467) plus a source check that the same routing
+# literal appears once per call site (so a site silently dropping the routing
+# would be caught by the count, not just by this one behavioral path).
+# ---------------------------------------------------------------------------
+{
+    my $dir = mk_bp([['solo','—','done','p/s/']]);
+    make_path("$dir/runs/harvest");
+    # Block EVERY future mark_judge_inflight rename for this package:
+    # rename(2) onto an existing directory always fails (EISDIR) regardless
+    # of uid/permissions, so this is deterministic even running as root,
+    # unlike a chmod-based trick.
+    mkdir("$dir/runs/harvest/solo.inflight") or die "mkdir: $!";
+
+    my $r1 = run_seams($dir, tun => { judge_spawn_cap => 2 });
+    is(scalar(grep { $_->{kind} eq 'harvest' && $_->{pkg} eq 'solo' } @{ $r1->{spawned} }), 1,
+        'ITEM 14a: tick 1 fires the harvest judge (positive: the spawn actually happens)');
+    # canonical JSON key order is alphabetical, not insertion order, so "rc"
+    # sorts BEFORE "type" -- check the fields, not an assumed order.
+    my ($sf1_line) = grep { /"type":"judge_spawn_failed"/ } split /\n/, slurp("$dir/runs/orchestrator.log");
+    ok(defined $sf1_line, 'ITEM 14a: tick 1 logs judge_spawn_failed (routed as a spawn failure, not swallowed)');
+    like(($sf1_line // ''), qr/"rc":"inflight_marker_failed"/,
+        'ITEM 14a: ...with rc inflight_marker_failed');
+    is(reg_of($dir)->{solo}{harvest_spawn_fail}, 1,
+        'ITEM 14a: harvest_spawn_fail counted to 1 even though $rc==0 (the cap-bounding fix)');
+    like(slurp("$dir/packages/solo.md"), qr/^status:\s*done/m,
+        'ITEM 14a: tick 1 -- package not yet parked (cap not reached)');
+    is(scalar(()=needs_you($dir)), 0, 'ITEM 14a: tick 1 -- no decision queued yet');
+
+    my $r2 = run_seams($dir, tun => { judge_spawn_cap => 2 });
+    is(scalar(grep { $_->{kind} eq 'harvest' && $_->{pkg} eq 'solo' } @{ $r2->{spawned} }), 1,
+        'ITEM 14a: tick 2 fires the harvest judge again (still under cap)');
+    is(reg_of($dir)->{solo}{harvest_spawn_fail}, 2, 'ITEM 14a: harvest_spawn_fail advances to 2 (== cap)');
+    like(slurp("$dir/packages/solo.md"), qr/^status:\s*blocked/m,
+        'ITEM 14a: tick 2 -- cap reached -> package PARKED, not silently retried forever');
+    is(scalar(()=needs_you($dir)), 1, 'ITEM 14a: tick 2 -- exactly one decision queued at the cap');
+
+    my $r3 = run_seams($dir, tun => { judge_spawn_cap => 2 });
+    is(scalar(grep { $_->{kind} eq 'harvest' && $_->{pkg} eq 'solo' } @{ $r3->{spawned} }), 0,
+        'ITEM 14a: tick 3 -- NO further harvest judge fired (the unbounded-refire defect does NOT happen)');
+}
+{
+    my $orch = slurp($ORCH_PL);
+    my $n_sites  = () = ($orch =~ /mark_judge_inflight\(\$runs,/g);
+    my $n_routed = () = ($orch =~ /'inflight_marker_failed'/g);
+    is($n_sites, 5, 'ITEM 14a: exactly five mark_judge_inflight($runs, ...) call sites remain (re-grepped, not trusted from ledger prose)');
+    is($n_routed, 5, "ITEM 14a: all five sites route a failed marker through 'inflight_marker_failed' (1:1 with the call-site count)");
+}
+
+# ---------------------------------------------------------------------------
+# ITEM 14b: mark_judge_inflight must check print/close, not only open/rename.
+# Its own comment used to claim temp+rename made a zero-length marker
+# impossible; that is false under ENOSPC, where the write fails at
+# print/close but the (empty) tmp file still exists to be renamed atomically
+# into place. Simulated via /dev/full, which always fails writes with
+# ENOSPC -- no need for an actually-full disk or a root-defeating chmod.
+# ---------------------------------------------------------------------------
+{
+    ok(-e '/dev/full', 'ITEM 14b: precondition -- /dev/full exists on this host (ENOSPC simulator)');
+
+    # Positive first: an ordinary call actually marks inflight (proves the
+    # sub still works at all before we go looking for its failure path).
+    my $dir = mk_bp([['solo','—','done','p/s/']]);
+    my $ok = BpOrch::mark_judge_inflight("$dir/runs", 'harvest', 'good', $NOW);
+    ok($ok, 'ITEM 14b: a normal mark_judge_inflight call returns true');
+    ok(-e BpOrch::judge_inflight_path("$dir/runs", 'harvest', 'good'), 'ITEM 14b: ...and creates the live marker file');
+    is(BpOrch::judge_inflight("$dir/runs", 'harvest', 'good'), $NOW, 'ITEM 14b: ...with the correct stored epoch');
+
+    # Negative: force the print-or-close half of the write to fail. The tmp
+    # path is deterministic ("$f.tmp.$$") since this call runs in-process (no
+    # fork), so $$ is known ahead of time -- pre-seed a symlink there
+    # pointing at /dev/full before calling the sub.
+    make_path("$dir/runs/harvest");
+    my $f   = BpOrch::judge_inflight_path("$dir/runs", 'harvest', 'bad');
+    my $tmp = "$f.tmp.$$";
+    symlink('/dev/full', $tmp) or die "symlink: $!";
+    my $rc = BpOrch::mark_judge_inflight("$dir/runs", 'harvest', 'bad', $NOW);
+    is($rc, 0, 'ITEM 14b: mark_judge_inflight returns 0 when the write fails at print/close (ENOSPC), not just open/rename');
+    ok(!-e $f, 'ITEM 14b: no zero-length marker was renamed into place -- the live path does not exist at all');
+    ok(!-e $tmp && !-l $tmp, 'ITEM 14b: the tmp symlink was cleaned up (unlinked), not left behind');
+}
+
+# ---------------------------------------------------------------------------
+# ITEM 15: the three judge kill sites must verify pid IDENTITY before
+# signalling a process GROUP, because `.pid`/`.inflight` deliberately survive
+# an orchestrator restart while a fresh container restarts the pid namespace
+# -- a recycled number can belong to the token keeper, a sibling coordinator,
+# or a socat bridge (SYN-19 records a real truncated-ledger instance from
+# exactly this). Proven on real (harmless, session-led, sleeping) child
+# processes so "was it actually killed" is an observable OS fact rather than
+# an inference -- kill_pid itself is deliberately NOT injectable (shared with
+# b01/b11 coordinator callers), so the seam under test is
+# judge_pid_identity_ok, exactly as this package's Next action specifies.
+# ---------------------------------------------------------------------------
+{
+    # Positive: identity check PASSES -> the judge pid IS killed.
+    my $good_pid = spawn_dummy_judge();
+    my $dir = mk_bp([['solo','—','done','p/s/']]);
+    BpOrch::mark_judge_inflight("$dir/runs", 'harvest', 'solo', $NOW - 99999);   # old marker -> wall-clock timeout path
+    mk_pid_file($dir, 'harvest', 'solo', $good_pid);
+    ok(kill(0, $good_pid), 'ITEM 15: precondition -- the dummy judge process is alive before the tick');
+    run_seams($dir, tun => { judge_to => 10 },
+        pid_alive => sub { my $p = shift; return $p == $good_pid ? 1 : BpOrch::pid_alive($p) },
+        judge_pid_identity_ok => sub { 1 });
+    ok(pid_gone_within($good_pid, 2), 'ITEM 15: identity_ok=>1 -> kill_pid actually terminated the (real) process group');
+    reap_dummy($good_pid);
+}
+{
+    # Negative: identity check FAILS (recycled-pid shape) -> NOT killed, and
+    # the refusal is logged so an operator can see why nothing happened.
+    my $bad_pid = spawn_dummy_judge();
+    my $dir = mk_bp([['solo','—','done','p/s/']]);
+    BpOrch::mark_judge_inflight("$dir/runs", 'harvest', 'solo', $NOW - 99999);
+    mk_pid_file($dir, 'harvest', 'solo', $bad_pid);
+    ok(kill(0, $bad_pid), 'ITEM 15: precondition -- the dummy judge process is alive before the tick');
+    run_seams($dir, tun => { judge_to => 10 },
+        pid_alive => sub { my $p = shift; return $p == $bad_pid ? 1 : BpOrch::pid_alive($p) },
+        judge_pid_identity_ok => sub { 0 });
+    # zombie-aware, not a plain kill(0,...): a killed-but-unreaped child still
+    # answers kill(0,...) truthfully as "present" (it's a zombie, not gone),
+    # which would silently hide a bypassed identity check -- caught by the
+    # mutation audit below, which is why this is BpOrch::pid_alive and not a
+    # raw signal probe.
+    ok(BpOrch::pid_alive($bad_pid), 'ITEM 15: identity_ok=>0 -> the process is NOT killed (still genuinely alive, not a zombie, after the tick)');
+    my ($refusal_line) = grep { /"type":"judge_kill_refused"/ } split /\n/, slurp("$dir/runs/orchestrator.log");
+    ok(defined $refusal_line, 'ITEM 15: a judge_kill_refused event was logged');
+    like(($refusal_line // ''), qr/"pid":"?$bad_pid"?\b/, 'ITEM 15: ...naming the refused pid');
+    reap_dummy($bad_pid);
+}
+{
+    # Source check: exactly three judge-site kill_pid($jp2) calls remain,
+    # each still gated on judge_pid_identity_ok and each with a paired
+    # judge_kill_refused log line on the refusal branch -- re-grepped here
+    # rather than trusted from ledger prose, per the ledger's own warning
+    # that this exact count drifted once already this session.
+    my $orch = slurp($ORCH_PL);
+    my $n_kill    = () = ($orch =~ /kill_pid\(\$jp2\)/g);
+    my $n_guarded = () = ($orch =~ /if\s*\(\s*\$judge_pid_identity_ok->\(\$jp2,\s*\$jpidf\)\s*\)\s*\{/g);
+    my $n_refused = () = ($orch =~ /judge_kill_refused/g);
+    is($n_kill, 3, 'ITEM 15: exactly three kill_pid($jp2) judge sites remain');
+    is($n_guarded, 3, 'ITEM 15: all three are gated on judge_pid_identity_ok($jp2, $jpidf)');
+    is($n_refused, 3, 'ITEM 15: all three carry a paired judge_kill_refused log line on refusal');
+}
+
 done_testing();

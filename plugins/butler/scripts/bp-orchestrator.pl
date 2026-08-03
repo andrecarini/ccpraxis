@@ -1073,6 +1073,32 @@ sub kill_pid {
     eval { kill 'KILL', -$pid; 1 } or eval { kill 'KILL', $pid; 1 };
 }
 
+# b09 item 15: `.pid`/`.inflight` deliberately survive an orchestrator restart
+# (b31), while a fresh container restarts the pid namespace — so a number read
+# back from a judge's `<pkg>.pid` can, by the time we act on it, denote an
+# entirely unrelated process: the token keeper, a sibling coordinator, or a
+# socat bridge. `kill_pid` signals the whole process GROUP (`-$pid`); killing
+# a coordinator mid-ledger-write is exactly how a ledger ends up truncated
+# (SYN-19 records a real instance). Before calling kill_pid at a JUDGE site,
+# require BOTH: (a) /proc/$pid/cmdline still names `claude` — a judge is
+# always a `claude -p ...` invocation (bp-judge.sh:128-131) — and (b) the
+# process did not start AFTER the pid file was written (a recycled pid
+# reused by a later, unrelated process would postdate it). Fails CLOSED: any
+# missing/unreadable /proc entry is treated as "not this judge" and the kill
+# is refused rather than risked. Deliberately NOT used by kill_pid's other
+# (coordinator) callers — those are b01/b11 territory and out of scope here.
+sub judge_pid_identity_ok {
+    my ($pid, $pidfile) = @_;
+    return 0 unless defined $pid && $pid =~ /^\d+$/ && $pid > 0;
+    my $cmdline = _read_file("/proc/$pid/cmdline");
+    return 0 unless defined $cmdline && $cmdline =~ /claude/;
+    my @pst = stat("/proc/$pid");
+    my @fst = stat($pidfile);
+    return 0 unless @pst && @fst;
+    return 0 if $pst[9] > $fst[9];    # process start postdates the pid file -> recycled pid
+    return 1;
+}
+
 # --- runs/.paused (usage/telemetry/auth pause signal; epoch fields).
 sub read_paused {
     my ($runs) = @_;
@@ -1380,13 +1406,27 @@ sub judge_inflight {
 sub mark_judge_inflight {
     my ($runs, $kind, $pkg, $now) = @_;
     require File::Path; File::Path::make_path("$runs/$kind") unless -d "$runs/$kind";
-    # Atomic temp+rename so a write that fails after truncation can't leave a
-    # zero-length marker (which would read back as epoch 0 -> instant false timeout, C1).
+    # Atomic temp+rename alone does NOT make a zero-length marker impossible: if
+    # print/close fail after the tmp file is opened (ENOSPC is the common case),
+    # rename() still atomically publishes an EMPTY file, which reads back as epoch
+    # 0 -> instant false timeout (C1). print/close must be checked too, exactly
+    # like write_paused above.
     my $f = judge_inflight_path($runs, $kind, $pkg);
     my $tmp = "$f.tmp.$$";
-    open my $fh, '>', $tmp or return 0;
-    print $fh ($now // time); close $fh;
-    rename $tmp, $f or do { unlink $tmp; return 0; };
+    open my $fh, '>', $tmp
+        or return _escalation_write_failed($runs, 'mark_judge_inflight', $tmp, $!);
+    unless (print $fh ($now // time)) {
+        my $e = $!; close $fh; unlink $tmp;
+        return _escalation_write_failed($runs, 'mark_judge_inflight', $tmp, $e);
+    }
+    unless (close $fh) {
+        my $e = $!; unlink $tmp;
+        return _escalation_write_failed($runs, 'mark_judge_inflight', $tmp, $e);
+    }
+    unless (rename $tmp, $f) {
+        my $e = $!; unlink $tmp;
+        return _escalation_write_failed($runs, 'mark_judge_inflight(rename)', $f, $e);
+    }
     return 1;
 }
 sub clear_judge_inflight { my ($runs, $kind, $pkg) = @_; unlink judge_inflight_path($runs, $kind, $pkg); }
@@ -1660,6 +1700,10 @@ sub run {
     # injects a scripted one so alive/progressing and alive/wedged coordinator paths
     # can be driven through the real loop (not just the dead-pid path).
     my $pid_alive = $opt->{pid_alive} || \&pid_alive;
+    # judge-pid identity seam (b09 item 15): default = the real /proc-based
+    # check; tests inject a scripted one so the recycled-pid refusal path can
+    # be driven without a real /proc/<pid>/cmdline to point at.
+    my $judge_pid_identity_ok = $opt->{judge_pid_identity_ok} || \&judge_pid_identity_ok;
     # checkpoint seam (b02): make one WIP commit of a live package's write set.
     # The repo root is resolved ONCE per run(), lazily — the first checkpoint is
     # at least one interval away, and a run that never checkpoints never pays for
@@ -1975,12 +2019,20 @@ sub run {
                                 # be re-detected next tick (C6) before arming the
                                 # fresh one.
                                 unlink judge_pid_path($runs, 'resolve', $pkg);
-                                mark_judge_inflight($runs, 'resolve', $pkg, $now);
-                                update_registry_pkg($runs, $pkg, { resolve_attempts => $resolve_att + 1 });
-                                _log($log, 'resolve_fire', { package => $pkg, why => 'orphaned judge marker on restart', resolve_attempts => $resolve_att + 1 });
-                                next;
+                                # b09 item 14: a failed marker write (full/read-only
+                                # runs/) must be treated as a SPAWN FAILURE, not
+                                # silently ignored — otherwise the next tick sees
+                                # inflight unset and fires another judge, unbounded,
+                                # because $rc==0 never trips the spawn-fail cap.
+                                if (mark_judge_inflight($runs, 'resolve', $pkg, $now)) {
+                                    update_registry_pkg($runs, $pkg, { resolve_attempts => $resolve_att + 1 });
+                                    _log($log, 'resolve_fire', { package => $pkg, why => 'orphaned judge marker on restart', resolve_attempts => $resolve_att + 1 });
+                                    next;
+                                }
+                                _log($log, 'judge_spawn_failed', { kind => 'resolve', package => $pkg, rc => 'inflight_marker_failed' });
+                            } else {
+                                _log($log, 'judge_spawn_failed', { kind => 'resolve', package => $pkg, rc => $rc });
                             }
-                            _log($log, 'judge_spawn_failed', { kind => 'resolve', package => $pkg, rc => $rc });
                         }
                         # Re-fire budget exhausted (or the spawn itself failed):
                         # fall back to the existing park fail-safe below, exactly
@@ -2085,7 +2137,17 @@ sub run {
                         my $jpidf = judge_pid_path($runs, 'harvest', $pkg);
                         if (-f $jpidf) {
                             my ($jp2) = (_read_file($jpidf) // '') =~ /^(\d+)/;
-                            kill_pid($jp2) if defined $jp2 && pid_alive($jp2);
+                            if (defined $jp2 && $pid_alive->($jp2)) {
+                                # b09 item 15: never kill on the pid number alone —
+                                # verify it still plausibly denotes THIS judge before
+                                # signalling its process group.
+                                if ($judge_pid_identity_ok->($jp2, $jpidf)) {
+                                    kill_pid($jp2);
+                                } else {
+                                    _log($log, 'judge_kill_refused', { kind => 'harvest', package => $pkg, pid => $jp2,
+                                          reason => 'pid no longer identifies a claude judge process (recycled pid?)' });
+                                }
+                            }
                             unlink $jpidf;
                         }
                         clear_judge_inflight($runs, 'harvest', $pkg);
@@ -2113,13 +2175,17 @@ sub run {
                             $reg->{$pkg}{harvest_max_turns} = $widened;
                             $reg->{$pkg}{harvest_starve_continuations} = 1;
                             my $rc = $spawn_judge->({ kind => 'harvest', pkg => $pkg, max_turns => $widened });
-                            if (defined $rc && $rc == 0) {
-                                mark_judge_inflight($runs, 'harvest', $pkg, $now);
+                            # b09 item 14: a failed inflight-marker write is treated
+                            # as a spawn failure, mirroring judge_spawn_failed below —
+                            # otherwise the next tick sees inflight unset (harvest
+                            # still '') and re-fires unboundedly.
+                            if (defined $rc && $rc == 0 && mark_judge_inflight($runs, 'harvest', $pkg, $now)) {
                                 update_registry_pkg($runs, $pkg, { harvest_max_turns => $widened, harvest_starve_continuations => 1 });
                             } else {
                                 $reg->{$pkg}{harvest_max_turns} = $current;
                                 $reg->{$pkg}{harvest_starve_continuations} = $hs;
-                                _log($log, 'judge_spawn_failed', { kind => 'harvest', package => $pkg, rc => $rc });
+                                _log($log, 'judge_spawn_failed', { kind => 'harvest', package => $pkg,
+                                      rc => (defined $rc && $rc == 0) ? 'inflight_marker_failed' : $rc });
                             }
                         } else {
                             # existing bounded re-audit — now ALSO reached by immediate
@@ -2149,7 +2215,17 @@ sub run {
                         my $jpidf = judge_pid_path($runs, 'harvest', $pkg);
                         if (-f $jpidf) {
                             my ($jp2) = (_read_file($jpidf) // '') =~ /^(\d+)/;
-                            kill_pid($jp2) if defined $jp2 && pid_alive($jp2);
+                            if (defined $jp2 && $pid_alive->($jp2)) {
+                                # b09 item 15: never kill on the pid number alone —
+                                # verify it still plausibly denotes THIS judge before
+                                # signalling its process group.
+                                if ($judge_pid_identity_ok->($jp2, $jpidf)) {
+                                    kill_pid($jp2);
+                                } else {
+                                    _log($log, 'judge_kill_refused', { kind => 'harvest', package => $pkg, pid => $jp2,
+                                          reason => 'pid no longer identifies a claude judge process (recycled pid?)' });
+                                }
+                            }
                             unlink $jpidf;
                         }
                         clear_judge_inflight($runs, 'harvest', $pkg);
@@ -2204,7 +2280,17 @@ sub run {
                         my $jpidf = judge_pid_path($runs, 'harvest', $pkg);
                         if (-f $jpidf) {
                             my ($jp2) = (_read_file($jpidf) // '') =~ /^(\d+)/;
-                            kill_pid($jp2) if defined $jp2 && pid_alive($jp2);
+                            if (defined $jp2 && $pid_alive->($jp2)) {
+                                # b09 item 15: never kill on the pid number alone —
+                                # verify it still plausibly denotes THIS judge before
+                                # signalling its process group.
+                                if ($judge_pid_identity_ok->($jp2, $jpidf)) {
+                                    kill_pid($jp2);
+                                } else {
+                                    _log($log, 'judge_kill_refused', { kind => 'harvest', package => $pkg, pid => $jp2,
+                                          reason => 'pid no longer identifies a claude judge process (recycled pid?)' });
+                                }
+                            }
                             unlink $jpidf;
                         }
                         clear_judge_inflight($runs, 'harvest', $pkg);
@@ -2356,8 +2442,11 @@ sub run {
                         next if $still_live;
                     }
                     my $rc = $spawn_judge->({ kind => 'harvest', pkg => $pkg });
-                    if (defined $rc && $rc == 0) {
-                        mark_judge_inflight($runs, 'harvest', $pkg, $now);
+                    # b09 item 14: a failed inflight-marker write must feed the SAME
+                    # harvest_spawn_fail cap as a real spawn failure — $rc==0 alone
+                    # never trips it, so an unmarked judge would otherwise re-fire
+                    # every tick, unbounded (full/read-only runs/).
+                    if (defined $rc && $rc == 0 && mark_judge_inflight($runs, 'harvest', $pkg, $now)) {
                         update_registry_pkg($runs, $pkg, { harvest_spawn_fail => 0 }) if ($reg->{$pkg}{harvest_spawn_fail} // 0);
                         _log($log, 'harvest_fire', { package => $pkg, mode => $mode });
                     } else {
@@ -2367,7 +2456,8 @@ sub run {
                         my $sf = ($reg->{$pkg}{harvest_spawn_fail} // 0) + 1;
                         update_registry_pkg($runs, $pkg, { harvest_spawn_fail => $sf });
                         $reg->{$pkg}{harvest_spawn_fail} = $sf;
-                        _log($log, 'judge_spawn_failed', { kind => 'harvest', package => $pkg, rc => $rc, fails => $sf });
+                        _log($log, 'judge_spawn_failed', { kind => 'harvest', package => $pkg,
+                              rc => (defined $rc && $rc == 0) ? 'inflight_marker_failed' : $rc, fails => $sf });
                         if ($sf >= $t->{judge_spawn_cap}) {
                             _block_and_queue($bpdir, $runs, $log, $bp, $pkg,
                                 "harvest judge could not be spawned ($sf attempts)", $now,
@@ -2879,8 +2969,11 @@ sub run {
                         $reg->{_run}{conformance_spawns} = $spawns + 1;
                         $reg->{_run}{build} = $build;
                         my $rc = $spawn_judge->({ kind => 'conformance', pkg => '_run' });
-                        if (defined $rc && $rc == 0) {
-                            mark_judge_inflight($runs, 'conformance', '_run', $now);
+                        # b09 item 14: a failed inflight-marker write is treated as a
+                        # spawn failure, mirroring judge_spawn_failed below — an
+                        # unmarked judge would otherwise be indistinguishable from
+                        # "not running" next tick.
+                        if (defined $rc && $rc == 0 && mark_judge_inflight($runs, 'conformance', '_run', $now)) {
                             _log($log, 'conformance_fire', { packages => scalar keys %$cpkgs });
                             # An unparseable mandated_means is a property of the LEDGERS,
                             # not of the verdict, so notice it as soon as the gate fires —
@@ -2916,7 +3009,8 @@ sub run {
                                 $conf_outstanding = 1;
                             }
                         } else {
-                            _log($log, 'conformance_spawn_failed', { rc => $rc });
+                            _log($log, 'conformance_spawn_failed',
+                                 { rc => (defined $rc && $rc == 0) ? 'inflight_marker_failed' : $rc });
                         }
                     } else {
                         my $nt = BpJudge::notice_record('conformance spawn cap reached',
@@ -3335,14 +3429,16 @@ sub _escalate_stuck {
     my $verdict = BpJudge::escalation_verdict({ resolve_attempts => $resolve_att, resolve_cap => $a->{t}{resolve_cap} });
     if ($verdict eq 'resolve' && !$a->{shutdown}) {
         my $rc = $a->{spawn_judge}->({ kind => 'resolve', pkg => $pkg });
-        if (defined $rc && $rc == 0) {
-            mark_judge_inflight($runs, 'resolve', $pkg, $a->{now});
+        # b09 item 14: a failed inflight-marker write is treated as a spawn
+        # failure, mirroring judge_spawn_failed below.
+        if (defined $rc && $rc == 0 && mark_judge_inflight($runs, 'resolve', $pkg, $a->{now})) {
             update_registry_pkg($runs, $pkg, { resolve_attempts => $resolve_att + 1 });
             _log($log, 'resolve_fire', { package => $pkg, why => $a->{why}, resolve_attempts => $resolve_att + 1 });
             return 'resolving';
         }
-        _log($log, 'judge_spawn_failed', { kind => 'resolve', package => $pkg, rc => $rc });
-        # couldn't even spawn the judge -> fall through and park.
+        _log($log, 'judge_spawn_failed', { kind => 'resolve', package => $pkg,
+              rc => (defined $rc && $rc == 0) ? 'inflight_marker_failed' : $rc });
+        # couldn't even spawn the judge (or the marker) -> fall through and park.
     }
     _block_and_queue($a->{bpdir}, $runs, $log, $a->{bp}, $pkg, $a->{why}, $a->{now});
     return 'blocked';

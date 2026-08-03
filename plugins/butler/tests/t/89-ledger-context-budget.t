@@ -620,9 +620,22 @@ ok(scalar(@ALL_ENTRIES) == 26, "FIXTURE-SANITY: main fixture has 26 Decisions & 
         }
     }
 
-    is($over_before_count, 16,
-       "FIXTURE-SANITY: exactly 16 of 71 real-corpus ledgers are over the 40,000-byte budget BEFORE rotation "
-       . "(measured baseline for this corpus state)");
+    # RELAXED FROM `is($over_before_count, 16, ...)` BY THE COORDINATOR, 2026-08-03, and the reason is
+    # that the original was the pinned-global-snapshot antipattern this blueprint has a standing rule
+    # against: "assert your own package's contribution, never the whole tree's shape."
+    #
+    # It broke the first time the feature was USED. Rotating b09's ledger in anger (101,821 -> 38,748
+    # bytes) took the over-budget count 16 -> 15, so exercising the very tool under test falsified its
+    # own oracle. Every future rotation would break it again, and so would any package whose ledger
+    # merely grows past 40,000 bytes.
+    #
+    # What actually needs pinning is that the corpus is a MEANINGFUL fixture -- enough over-budget
+    # ledgers for the crossing gate below to prove something -- not a frozen census. The >= 10 crossing
+    # gate and the exact-set unreachable check (b) remain unchanged and are the real assertions; this
+    # one only guarantees they are not being evaluated against an empty or trivial corpus.
+    cmp_ok($over_before_count, '>=', 10,
+       "FIXTURE-SANITY: the real corpus still has enough over-budget ledgers to be a meaningful fixture "
+       . "(measured $over_before_count of 71; a frozen exact count would break every time rotation is used)");
 
     # POSITIVE GATE (vacuity, spec's own closing clause for C7): rotation must have actually pushed a
     # meaningful number of ledgers back under budget -- an implementation that reports every over-
