@@ -17,7 +17,20 @@ package BpValidateDag;
 use File::Basename qw(dirname);
 
 my $DIR = dirname(__FILE__);
-require "$DIR/bp-orchestrator.pl";      # the REAL parser. Never reimplement it.
+
+# b08 step-7 FIX 1 (reviewer, should-fix): this require used to be bare, while
+# every other risky call in this file is eval-wrapped. It runs inside the
+# DISPATCH PREFLIGHT, so a future compile break in that shared ~3300-line file
+# would crash the validator at load time and block ALL fleet dispatch — exactly
+# the failure class this package exists to prevent. It is inert today only
+# because bp-orchestrator.pl's sole top-level side effect is guarded by
+# `unless (caller)`, which is a property of that file, not a guarantee to this
+# one. Degrade into a well-formed structural finding instead: validate() must
+# never die (spec §2.12, AC-17).
+our $ORCH_LOAD_ERROR;
+unless (eval { require "$DIR/bp-orchestrator.pl"; 1 }) {   # the REAL parser. Never reimplement it.
+    $ORCH_LOAD_ERROR = $@ || $! || 'unknown error';
+}
 
 # ---------------------------------------------------------------------------
 # BpOrch:: additions -- resolve_dep_token / normalize_dag / find_cycles.
@@ -201,6 +214,23 @@ sub validate {
         findings   => [],
         summary    => '',
     };
+
+    # b08 step-7 FIX 1: if the shared parser failed to load, report it as a
+    # structural finding rather than having died at require time. Checked before
+    # any BpOrch:: call, since every one of them would be undefined.
+    if (defined $ORCH_LOAD_ERROR) {
+        push @{ $result->{structural} }, {
+            code     => 'orchestrator-unloadable',
+            severity => 'structural',
+            package  => undef,
+            detail   => "$DIR/bp-orchestrator.pl",
+            members  => [],
+            message  => "bp-orchestrator.pl could not be loaded, so the DAG cannot be parsed: $ORCH_LOAD_ERROR",
+        };
+        $result->{findings} = [ @{ $result->{structural} } ];
+        $result->{summary}  = _summary($result);
+        return $result;
+    }
 
     my $bp_file = "$bpdir/blueprint.md";
     my $md = _slurp($bp_file);

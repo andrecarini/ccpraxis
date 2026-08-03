@@ -3031,6 +3031,27 @@ sub remediation_step {
         # operator sees the current set rather than a stale first snapshot.
         _write_json_atomic($path, $rec) if defined $path && -e $path;
     }
+    else {
+        # b08 step-7 FIX 2 (reviewer, minor): when the dag-stall filter above
+        # leaves the visible set empty, the old code simply skipped the write —
+        # so a '_remediation' decision queued on an EARLIER tick was left in
+        # place, showing the operator findings that are no longer outstanding.
+        # Clear it. This is stale content, not a dropped escalation: the
+        # dag-stall path self-escalates via its own '_dag' decision once
+        # remediation_outstanding clears. Deliberately does NOT change which
+        # findings are filtered — that filter is what makes AC-44 pass.
+        my $ny = "$runs/needs-you";
+        if (opendir my $dh, $ny) {
+            for my $f (grep { /\.json$/ } readdir $dh) {
+                my $ex = _read_json("$ny/$f");
+                next unless ref $ex eq 'HASH';
+                next unless ($ex->{package} // '') eq '_remediation'
+                         && ($ex->{kind}    // '') eq 'remediation-escalation';
+                unlink "$ny/$f";
+            }
+            closedir $dh;
+        }
+    }
 
     # (vi) rotation deliberately does NOT happen here. It was relocated to the
     # merge seam (remediation_merge), which is the only place the queued ->
