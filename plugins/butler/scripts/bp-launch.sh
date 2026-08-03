@@ -49,7 +49,13 @@ TEST_PATHS=$(fm_get "$LEDGER" test_paths)
 [ -n "$MODEL" ] || MODEL=$(fm_get "$LEDGER" model)
 [ -n "$MODEL" ] || MODEL="${BP_DEFAULT_MODEL:-sonnet}"
 [ -n "$MAXT" ]  || MAXT=$(fm_get "$LEDGER" max_turns)
-[ -n "$MAXT" ]  || MAXT="${BP_DEFAULT_MAX_TURNS:-80}"
+# b11: the turn cap is the LAST defence against a runaway, not the routine
+# termination condition. It was doing the latter — 12 of 27 packages on this
+# blueprint's own run hit error_max_turns at least once, one of them four
+# times — which is the orchestrator killing healthy long packages, not
+# catching wedged ones. snapshot_progressed() already detects a wedged agent
+# SEMANTICALLY (ledger checkboxes, outputs, mtime), so the cap can be high.
+[ -n "$MAXT" ]  || MAXT="${BP_DEFAULT_MAX_TURNS:-400}"
 [ -n "$WRITE_SET" ] || { echo "bp-launch: ledger has empty write_set — refusing to launch an unscoped coordinator" >&2; exit 1; }
 
 # -------- effort (b23): opt-in only. Absent -> no --effort flag at all, byte-

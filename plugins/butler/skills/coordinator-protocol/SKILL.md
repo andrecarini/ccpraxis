@@ -258,6 +258,18 @@ Workers are dispatched via Task with `subagent_type` set to the **plugin-namespa
 
    ### Validation is scoped to the package's own slice
    This extends SYN-11's per-package "green" doctrine — already defined for *test* reds — explicitly to **lint and build scope** too; it does not amend SYN-11, it applies the same reasoning one layer wider. A package must not fail step 5 because a project-wide lint pass or a project-wide build trips over a sibling package's temporarily-broken in-flight work. Judge your own slice: the files in your write set, the tests that are yours. A project-wide lint/build red attributable to another package in flight is not your red — record it, don't block on it.
+   ### Before you set `status: done` — three checks, all required
+
+   A green suite is not evidence that a package works. **Eight packages in one blueprint went green while doing nothing**, and every one was caught by these, never by a test. Do all three and record the result in `## Outputs`.
+
+   **(a) Reachability — what populates this, and who calls it?** Grep for the caller of every new symbol and the writer of every new state key. `b41` shipped an `observe` nothing called; `b46` shipped a `--deep` gate nothing set; `b37`'s panel read a `spend` key nothing wrote — each was one grep away, and each would otherwise have shipped green. If a thing has no caller and no writer, it is inert regardless of its tests.
+
+   **(b) Execute the code, not the suite.** Run the actual function with real inputs and read the output. This is the only check that caught all eight, because it is the only one that tests the claim the oracle *cannot* make. An oracle bound by the zero-real-I/O rule genuinely cannot assert "this appears in the running dashboard" — so you must. Paste the real output into `## Outputs`; a claim without pasted output is not a result.
+
+   **(c) Diff each done-criterion against the oracle's assertions.** Walk the ledger's numbered criteria **one at a time** and name the assertion covering each. `b36` shipped `done` at 62/62 while its criterion 1 demanded three states and the code had two — the criterion had **no assertion at all**. Green plus non-vacuous is *not* complete: an oracle can be rigorous about everything it covers and still cover the wrong set. This is mechanical and needs judgment only once a gap appears.
+
+   **Do not assert the whole shape of a shared artifact.** Heading counts, key sets, table sizes, "exactly N ledgers", and literal values of tunable constants all forbid every later package from extending the thing. Assert *your* package's contribution, or a floor — see `t/64`'s AC-36 for the shape of the fix. `bp-shape-lint.pl` flags candidates; run it over any oracle you author.
+
 6. **Review ∥ red-team** (`bp-reviewer` ∥ `bp-redteam`). Read-only, safe to run in parallel.
 7. **Fix-batch.** Consolidate ALL findings from both reports into **one** implementer dispatch — never a sequence of single-finding fixes. Re-validate after.
 8. **UI pass** (`bp-ui-prober`), only if the package touches UI. Screenshots get read, the visual checklist applied, findings folded into a final fix-batch if needed.
