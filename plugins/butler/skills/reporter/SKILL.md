@@ -42,8 +42,16 @@ A run is **live** iff `<bpdir>/runs/.orchestrator` exists **and** its PID is ali
 | `stuck-package` | a package looped past its retry cap and the resolve-judge couldn't fix it | relaunch with guidance / accept / drop |
 | `harvest-failure` | a finished package failed its independent harvest audit after a corrective cycle | relaunch with guidance / accept / drop |
 | `harvest-spawn-failure` | the harvest judge couldn't be spawned (check the sandbox `claude`) | relaunch / accept / drop (after fixing the cause) |
+| `judge-starved` | a judge (resolve/harvest) couldn't get scheduled | relaunch with guidance / accept / drop |
+| `turn-starved` | a coordinator ran out of turns without converging | relaunch with guidance / accept / drop |
 | `reauth` | the OAuth token hit the floor / is un-refreshable — the human must `/login` | resume (after they re-authenticate) |
 | `contract-drift` | an Anthropic-side response/creds shape drifted — inspect before resuming | resume (after they inspect) |
+| `broken-env` | a fleet-level environment problem (missing tool, broken sandbox, etc.) — a **fleet**-family pause, not a package park | resume (after they fix the environment) |
+
+`bp-answer-decision.pl` derives this kind list itself from `bp-orchestrator.pl`'s own
+queue call sites (never a hand-typed list), so it cannot silently miss a kind b01/b09/
+b11/b16 add later — an unrecognised kind is refused with a named, actionable message
+rather than treated as `stuck-package` by default.
 
 ## 4. Answer a decision (the mechanical unblock)
 
@@ -59,12 +67,27 @@ perl "${CLAUDE_PLUGIN_ROOT}/scripts/bp-answer-decision.pl" $0 --bp-dir "<bpdir>"
 
 The script is fail-closed (a wrong action for the kind exits non-zero and changes nothing) and it deletes the queue entry on success. Confirm the outcome it prints.
 
+`--note` persists on **every** action — `relaunch`, `reset`, `accept` and `drop` alike. `accept`/`drop` close a package **permanently**, so the guidance you write is often the only record of *why*; always pass `--note` when accepting or dropping against an open concern.
+
+**The cold-start lever (`reset` vs `relaunch`).** `relaunch` re-queues the package with a fresh attempt budget but otherwise leaves its session alone — if it has a `session_id`, the next launch is a **warm resume** (`claude --resume`), continuing the same context. `reset` does everything `relaunch` does **and additionally clears the package's `session_id`**, so `bp-resume-sweep.sh`'s "gap > 60m OR no session id" rule classifies the next launch **cold** — a genuinely fresh coordinator, reading only its ledger. Reach for `reset`, not `relaunch`, when you can see the coordinator is wedged in a way a warm resume would just re-enter (a bad line of reasoning baked into its context, a loop no classifier names). These are deliberately opposite levers: `relaunch` never touches `session_id`; `reset` always clears it.
+
 **Reset a package with no queued decision (#29).** When a package is wedged at the attempt cap or churning in its resolve-judge and the user wants a *clean retry* — a fresh coordinator with a reset budget rather than the resolve path or waiting on a verdict — do **not** hand-edit the registry, kill processes, or delete markers yourself. Run the deterministic reset: it supersedes any in-flight coordinator/judge for the package (kills it + clears its markers), resets the attempt **and** resolve budgets, sets the package `pending`, and clears any of its queued decisions — so the still-running orchestrator relaunches it fresh on its next tick (no orchestrator restart needed).
 
 ```
 perl "${CLAUDE_PLUGIN_ROOT}/scripts/bp-answer-decision.pl" $0 --bp-dir "<bpdir>" \
      --package <pkg> --action reset [--note "<guidance>"]
 ```
+
+**Widen a package's `write_set` (a decision only you are sanctioned to make).** A coordinator or judge sometimes needs to touch a file the package's ledger doesn't already declare — e.g. a shared config it turns out has to change too. The guard hook blocks any write outside the declared `write_set`, and hand-editing the ledger's frontmatter yourself is exactly the move the protocol forbids (the guard would then block *that* write too, or worse, silently drift the ledger and the guard's model of it apart). The sanctioned unblock:
+
+```
+perl "${CLAUDE_PLUGIN_ROOT}/scripts/bp-answer-decision.pl" $0 --bp-dir "<bpdir>" \
+     --package <pkg> --widen-write-set <path>
+```
+
+This ADDS `<path>` to the package's `write_set` — additively only, going through `bp-ledger.pl`'s own byte-level splice/validate/atomic-write engine, never a second frontmatter writer. Every existing path survives untouched; nothing is ever narrowed or replaced (`--set-write-set`, a full-replacement form, is refused outright — there is no supported way to shrink or overwrite `write_set` through this script). Widening is independent of `--action`: it does not touch ledger status, `last_updated`, or the registry, so you can widen and separately relaunch/reset/accept/drop in whatever order makes sense.
+
+**Why this is not the `mandated_means` move.** `mandated_means:` is a *requirement* a package spec sets before implementation begins, and it has (and must keep having) **no op** to change it after the fact — rewriting a requirement to match whatever got built would defeat the entire mechanism the field exists for (it stops being a constraint and becomes a rubber stamp). `write_set`, by contrast, is not a requirement being retrofitted; it is the **scope of an in-flight answer** to a decision — a human, mid-run, sanctioning one additional path because the work genuinely needs it. The two look alike (both are frontmatter fields that bound what a package may do) and it is precisely that resemblance that would let a careless "just widen it" instinct slide into "just edit `mandated_means` to match" — which is the thing this distinction exists to head off. If you ever find yourself wanting to change `mandated_means` post hoc, that is not a decision to answer through this script; it is a sign the spec itself needs revisiting.
 
 ## 5. Auto-announce: arm the token-free watcher
 

@@ -42,22 +42,102 @@
 # tested atomic writers (no duplicated, drift-prone frontmatter/registry logic).
 #
 # CLI: bp-answer-decision.pl <blueprint> --decision <id|file|path>
-#                            [--action relaunch|accept|drop|resume]
-#                            [--note "text"] [--bp-dir DIR]
-#      exit 0 = unblocked; 2 = usage / bad action for the kind / missing decision.
+#                            [--action relaunch|reset|accept|drop|resume]
+#                            [--note "text"]
+#                            [--widen-write-set PATH]   # b17: additive-only write_set
+#                                                       # widening, through bp-ledger.pl
+#                            [--set-write-set VALUE]    # b17: ALWAYS refused (narrowing/
+#                                                       # replacing write_set is not a
+#                                                       # supported move — see below)
+#                            [--bp-dir DIR]
+#      exit 0 = unblocked; 2 = usage / bad action for the kind / missing decision /
+#               unknown decision kind / refused write_set narrow-or-replace / blank
+#               --widen-write-set value.
+#
+# b17-answer-decision-completeness fixes four defects (see the spec of that name):
+#   1. `--action reset` now CLEARS the package's registry `session_id` (plan_answer's
+#      `clear_session`), so bp-resume-sweep.sh's "gap > 60m OR no session id" rule
+#      classifies the next launch COLD. Plain `relaunch` does NOT touch session_id —
+#      these are deliberately opposite levers (a human who wants a genuinely fresh
+#      coordinator context asks for reset, not relaunch).
+#   2. `--widen-write-set PATH` ADDS a path to the package ledger's write_set
+#      frontmatter field, additively, going through bp-ledger.pl's own byte-level
+#      splice/validate/atomic-write engine (run_op) rather than a second, independent
+#      frontmatter writer of this script's own. `--set-write-set` (full replacement)
+#      is always refused with a named cause — see the module doc below for why this
+#      is NOT the same move as rewriting `mandated_means`.
+#   3. Every kind bp-orchestrator.pl's own producers can queue routes to a
+#      deterministic outcome; `known_kinds()` DERIVES that list by parsing
+#      bp-orchestrator.pl's source with the exact same regexes t/69's oracle uses, so
+#      it cannot hand-drift as b01/b09/b11/b16 add more kinds. An unrecognised kind
+#      fails loudly (named in the message) and changes nothing.
+#   4. `--note` now persists on EVERY action (relaunch/reset/accept/drop) — the
+#      `if $plan->{relaunch}` gate that silently dropped it for accept/drop is gone.
+
+use File::Basename qw(dirname);
+use Cwd qw(abs_path);
+my $SELF_DIR = dirname(abs_path(__FILE__));
+my $ORCH_SRC = "$SELF_DIR/bp-orchestrator.pl";
 
 package BpAnswer;
 use strict;
 use warnings;
 
-# kind_family($kind) -> 'fleet' | 'package'
+# known_kinds() -> derives the FULL set of decision kinds bp-orchestrator.pl's own
+# queue_needs_you / _enter_pause_manual / _block_and_queue call sites actually emit,
+# by parsing its source with the IDENTICAL regexes t/69-answer-decision-completeness.t
+# uses for its own C5/C6 derivation (see that file) — so this list is a derivation,
+# never a hand-typed literal that could drift from the real producers as b01/b09/b11/
+# b16 add more. Memoized: the source does not change within one process's lifetime.
+my @KNOWN_KINDS;
+my $KNOWN_KINDS_LOADED = 0;
+sub known_kinds {
+    return @KNOWN_KINDS if $KNOWN_KINDS_LOADED;
+    $KNOWN_KINDS_LOADED = 1;
+    return @KNOWN_KINDS unless open my $fh, '<', $ORCH_SRC;
+    my @lines = <$fh>;
+    close $fh;
+    my %kinds;
+    for my $i (0 .. $#lines) {
+        if ($lines[$i] =~ /\b(?:queue_needs_you|_enter_pause_manual)\s*\(/) {
+            my $end = ($i + 2 <= $#lines) ? $i + 2 : $#lines;
+            my $slice = join('', @lines[$i .. $end]);
+            if ($slice =~ /kind\s*=>\s*(?:\(\s*\$\w+\s*\/\/\s*)?['"]([\w-]+)['"]/) {
+                $kinds{$1}++;
+            }
+        }
+        if ($lines[$i] =~ /\b_block_and_queue\s*\(/) {
+            my $end = ($i + 6 <= $#lines) ? $i + 6 : $#lines;
+            my $slice = join('', @lines[$i .. $end]);
+            if ($slice =~ /['"]([\w-]+)['"]\s*\)\s*;/s) {
+                $kinds{$1}++;
+            }
+        }
+    }
+    @KNOWN_KINDS = sort keys %kinds;
+    return @KNOWN_KINDS;
+}
+
+# kind_family($kind) -> 'fleet' | 'package' | undef (unknown)
 # A fleet pause is resolved by clearing the pause; everything else is a
-# package-level park resolved through the ledger. Unknown kinds default to
-# 'package' (the conservative, recoverable path — relaunch with a note).
+# package-level park resolved through the ledger. `undef` $kind means "direct
+# --package mode" (#29, no queued decision at all) — always 'package', the only
+# family a decision-less direct action can mean. A DEFINED kind not among the real
+# producers' known_kinds() is refused (undef return) rather than silently guessed as
+# 'package' — the defect this closes let an unknown kind succeed as if it were
+# 'stuck-package'.
 sub kind_family {
     my ($k) = @_;
-    return 'fleet' if defined $k && $k =~ /^(reauth|contract-drift)$/;
-    return 'package';
+    return 'package' unless defined $k && length $k;
+    # broken-env, reauth and contract-drift are the fleet-level pauses (b01/b09):
+    # bp-orchestrator.pl queues them via _enter_pause_manual with package '_fleet'.
+    # This subset is deliberately named here rather than derived — telling "which
+    # producer used package => '_fleet'" apart from a per-package park is a semantic
+    # distinction known_kinds()'s source scan does not (and should not) attempt to
+    # infer; only the SET of valid kinds is derived, not their family.
+    return 'fleet' if $k =~ /^(?:reauth|contract-drift|broken-env)$/;
+    return 'package' if grep { $_ eq $k } known_kinds();
+    return undef;   # unknown to every real producer -- caller must refuse, not guess
 }
 
 # plan_answer($kind, $action) -> { ok, family, action, ledger_status, clear_pause,
@@ -68,6 +148,12 @@ sub kind_family {
 sub plan_answer {
     my ($kind, $action) = @_;
     my $fam = kind_family($kind);
+    unless (defined $fam) {
+        return { ok => 0, family => 'unknown',
+                 error => "unknown decision kind '" . ($kind // '') . "' -- not among the kinds "
+                        . "bp-orchestrator.pl's own producers actually queue (known_kinds()); "
+                        . "refusing rather than silently treating it as stuck-package" };
+    }
     if ($fam eq 'fleet') {
         $action = 'resume' unless defined $action && length $action;
         return { ok => 0, family => 'fleet',
@@ -97,6 +183,11 @@ sub plan_answer {
         reset_attempt => $is_relaunch,
         reset_resolve => ($action eq 'reset' ? 1 : 0),
         supersede     => ($action eq 'reset' ? 1 : 0),
+        # b17 C1/C2: `reset` is the ONLY action that clears session_id — the cold-start
+        # lever. A plain `relaunch` MUST preserve it (a warm resume is still legitimate
+        # for a package that simply hit a transient failure). These are the paired
+        # opposites the oracle's vacuity gate asserts together.
+        clear_session => ($action eq 'reset' ? 1 : 0),
     };
 }
 
@@ -108,6 +199,50 @@ use Cwd qw(abs_path);
 
 my $DIR = dirname(abs_path(__FILE__));
 require "$DIR/bp-orchestrator.pl";   # reuse BpOrch atomic ledger/registry/pause writers
+
+# bp-ledger.pl (b17 1.2) declares no `package` of its own, so requiring it installs
+# its subs (run_op, replace_first_key_line, validate_bytes, ...) directly into THIS
+# file's package (main) — the same "requirable module, guarded by `unless (caller)`"
+# shape bp-orchestrator.pl already uses (see its own header). This is how
+# --widen-write-set goes THROUGH bp-ledger.pl's byte-level splice/validate/atomic-
+# write engine rather than this script hand-rolling a second frontmatter writer.
+require "$DIR/bp-ledger.pl";
+
+# _write_set_splice($bytes, $newpath) -> ($new_bytes, undef) | (undef, $reason)
+# The run_op-shaped splice callback (b17 1.2): reads the frontmatter `write_set:`
+# line's colon-separated value (bp-lib.sh's own convention — see registry_get/
+# match_any), and ADDS $newpath if it is not already present. Never removes, never
+# reorders, never touches any other line — additive-only, by construction (there is
+# no code path here that can drop an existing entry).
+sub _write_set_splice {
+    my ($B, $newpath) = @_;
+    return (undef, 'no frontmatter block to update') unless $B =~ /\A---\s*\n(.*?)\n---/s;
+    my ($fs, $fe) = ($-[1], $+[1]);
+    my $region = substr($B, $fs, $fe - $fs);
+    my $cur;
+    for my $line (split(/\n/, $region, -1)) {
+        if ($line =~ /^write_set:\s*(.*?)\s*$/) { $cur = $1; last }
+    }
+    return (undef, 'write_set: key not found in frontmatter') unless defined $cur;
+    my @paths = length($cur) ? split(/:/, $cur) : ();
+    return ($B, undef) if grep { $_ eq $newpath } @paths;   # already present: no-op (byte-identical)
+    push @paths, $newpath;
+    my $new = replace_first_key_line($B, $fs, $fe, 'write_set', 'write_set: ' . join(':', @paths));
+    return (undef, 'write_set: key not found in frontmatter') unless defined $new;
+    return ($new, undef);
+}
+
+# widen_write_set($ledger, $newpath) — never returns: bp-ledger.pl's run_op() (shared
+# by all five typed ops) validates before and after the splice, checks the
+# last_updated monotonicity rule, writes atomically (temp+rename) under its own
+# lockfile, and calls `exit 0` on success or one of arg_error/io_error/reject_error/
+# notfound_error (each a one-line stderr message + a specific non-zero exit) on any
+# rejection or I/O failure. Since this splice never touches status: or last_updated:,
+# a successful widen leaves every other line of the ledger byte-identical.
+sub widen_write_set {
+    my ($ledger, $newpath) = @_;
+    run_op('widen-write-set', $ledger, sub { return _write_set_splice($_[0], $newpath) });
+}
 
 # Append (idempotently) the human's resolution to a package ledger as a corrective
 # section the relaunched coordinator will read. Mirrors BpOrch::_apply_harvest_findings:
@@ -183,7 +318,7 @@ sub clear_pkg_decisions {
 
 unless (caller) {
     require JSON::PP;
-    my ($bp, $bpdir, $decision, $package, $action, $note);
+    my ($bp, $bpdir, $decision, $package, $action, $note, $widen_write_set, $set_write_set);
     my @pos;
     my $need = sub {
         my ($flag) = @_;
@@ -195,12 +330,14 @@ unless (caller) {
     };
     while (@ARGV) {
         my $arg = shift @ARGV;
-        if    ($arg eq '--bp-dir')   { $bpdir    = $need->('--bp-dir'); }
-        elsif ($arg eq '--decision') { $decision = $need->('--decision'); }
-        elsif ($arg eq '--package')  { $package  = $need->('--package'); }
-        elsif ($arg eq '--action')   { $action   = $need->('--action'); }
-        elsif ($arg eq '--note')     { $note     = $need->('--note'); }
-        elsif ($arg =~ /^--/)        { print STDERR "bp-answer-decision: unknown option $arg\n"; exit 2; }
+        if    ($arg eq '--bp-dir')          { $bpdir           = $need->('--bp-dir'); }
+        elsif ($arg eq '--decision')        { $decision        = $need->('--decision'); }
+        elsif ($arg eq '--package')         { $package         = $need->('--package'); }
+        elsif ($arg eq '--action')          { $action          = $need->('--action'); }
+        elsif ($arg eq '--note')            { $note            = $need->('--note'); }
+        elsif ($arg eq '--widen-write-set') { $widen_write_set = $need->('--widen-write-set'); }
+        elsif ($arg eq '--set-write-set')   { $set_write_set   = $need->('--set-write-set'); }
+        elsif ($arg =~ /^--/)               { print STDERR "bp-answer-decision: unknown option $arg\n"; exit 2; }
         else  { push @pos, $arg; }
     }
     $bp = shift @pos if @pos;
@@ -209,7 +346,21 @@ unless (caller) {
         print STDERR "usage: bp-answer-decision.pl <blueprint>\n"
                    . "         --decision <id|file> [--action relaunch|reset|accept|drop|resume]   # answer a queued decision\n"
                    . "         --package <pkg>      [--action reset|accept|drop]                    # act directly on a package (#29)\n"
-                   . "         [--note ...] [--bp-dir DIR]\n";
+                   . "         [--note ...] [--widen-write-set PATH] [--bp-dir DIR]\n"
+                   . "  --widen-write-set PATH   ADD path to the package's write_set (additive only, via bp-ledger.pl)\n"
+                   . "  --set-write-set VALUE    always refused: replacing/narrowing write_set is not supported\n";
+        exit 2;
+    }
+
+    # b17 C4: full-replacement is refused outright, before anything else is touched or
+    # even resolved — this is not "unknown option" (that already exits 2 above with a
+    # different message); it is a NAMED refusal of a specific, deliberately-considered
+    # move. write_set is the *answer* to a human decision (b17 spec §1.2) — additive
+    # widening only. Narrowing or replacing it wholesale is never supported here.
+    if (defined $set_write_set) {
+        print STDERR "bp-answer-decision: --set-write-set would replace write_set wholesale; this is "
+                   . "refused. Replacing or narrowing write_set is not a supported move -- write_set may "
+                   . "only be WIDENED additively (see --widen-write-set PATH), never narrowed or replaced.\n";
         exit 2;
     }
     unless (defined $bpdir) {
@@ -253,6 +404,31 @@ unless (caller) {
         $kind = $rec->{kind};
     }
 
+    # b17 1.2/C3/C8(b): --widen-write-set is its own, standalone, additive mutation —
+    # NOT folded into the relaunch/reset/accept/drop pipeline below. It never touches
+    # ledger status/last_updated or the registry, so it cannot be entangled with
+    # (or clobbered by) whatever --action was also passed; a reporter answering
+    # "you need one more file" does not have to separately reason about which action
+    # verb is "compatible" with widening. widen_write_set() never returns (it exits
+    # via bp-ledger.pl's run_op — 0 on success, a specific non-zero on rejection).
+    if (defined $widen_write_set) {
+        (my $trimmed = $widen_write_set) =~ s/^\s+|\s+\z//g;
+        if ($trimmed eq '') {
+            print STDERR "bp-answer-decision: --widen-write-set requires a non-empty, non-blank path "
+                       . "(got an empty/blank value); refusing rather than silently no-op'ing write_set\n";
+            exit 2;
+        }
+        if ($trimmed =~ /:/) {
+            print STDERR "bp-answer-decision: --widen-write-set path must not itself contain ':' "
+                       . "(write_set's own colon separator, per bp-lib.sh's convention): '$trimmed'\n";
+            exit 2;
+        }
+        unless (defined $pkg && length $pkg && -f "$bpdir/packages/$pkg.md") {
+            print STDERR "bp-answer-decision: package ledger not found for '" . ($pkg // '') . "'\n"; exit 2;
+        }
+        widen_write_set("$bpdir/packages/$pkg.md", $trimmed);   # never returns
+    }
+
     my $plan = BpAnswer::plan_answer($kind, $action);
     unless ($plan->{ok}) { print STDERR "bp-answer-decision: $plan->{error}\n"; exit 2; }
 
@@ -265,11 +441,21 @@ unless (caller) {
         # Supersede live work FIRST (before flipping to pending) so a fresh relaunch
         # can't collide with a coordinator/judge still editing the write-set.
         $superseded = supersede_package_work($runs, $pkg) if $plan->{supersede};
-        append_human_decision($bpdir, $pkg, $note, $plan->{action}) if $plan->{relaunch};
+        # b17 C7/C8(a): --note now persists on EVERY action, including accept/drop —
+        # the `if $plan->{relaunch}` gate that silently dropped it for those two
+        # (defect 4, the worst-shaped of the four: exit 0, note vanished, no warning)
+        # is gone. append_human_decision() itself already no-ops when $note is undef.
+        append_human_decision($bpdir, $pkg, $note, $plan->{action});
         BpOrch::_set_ledger_status($bpdir, $pkg, $plan->{ledger_status});
         my %reg = ( status => $plan->{ledger_status} );
         $reg{attempt}          = 0 if $plan->{reset_attempt};
         $reg{resolve_attempts} = 0 if $plan->{reset_resolve};
+        # b17 C1/C2: the cold-start lever. `reset` clears session_id (set to undef,
+        # which JSON::PP/registry_merge encode as JSON null — bp-resume-sweep.sh's
+        # registry_get treats a null the same as absent via jq's `// empty`), so the
+        # sweep's "gap > 60m OR no session id" rule classifies the next launch COLD.
+        # `relaunch` must NEVER set this key — see plan_answer's clear_session.
+        $reg{session_id}       = undef if $plan->{clear_session};
         BpOrch::update_registry_pkg($runs, $pkg, \%reg);
     } else {
         BpOrch::clear_pause($runs);
