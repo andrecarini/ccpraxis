@@ -14,9 +14,9 @@ source "$SCRIPT_DIR/bp-lib.sh"      # defines require_cmd; no side effects, no e
 # NOTE: bp_project_root is NEVER called (it reads BP_PROJECT_ROOT then git -- see 2.10),
 # and bp_require_sandbox is deliberately not called either (see 2.9).
 
-NPMRC_MARKER='# bp-fast-store: container-native pnpm store (managed lines below; keep .npmrc gitignored)'
+WORKSPACE_MARKER='# bp-fast-store: container-native pnpm store (managed lines below; keep pnpm-workspace.yaml gitignored)'
 GI_HEADER='# Added by bp-fast-store.sh (container-native pnpm store/virtual-store; container-specific paths, never commit)'
-BP_RATIONALE='container-native pnpm store via gitignored .npmrc (bp-fast-store.sh); the /root store and virtual-store are wiped on container rebuild, so node_modules must be re-materialized or its symlink tree dangles'
+BP_RATIONALE='container-native pnpm store via gitignored pnpm-workspace.yaml (bp-fast-store.sh); the /root store and virtual-store are wiped on container rebuild, so node_modules must be re-materialized or its symlink tree dangles'
 
 # --------------------------------------------------------------- helpers ----
 
@@ -24,18 +24,21 @@ usage() {                     # printf only: reachable with an empty PATH (2.2)
   printf '%s\n' \
 'usage: bp-fast-store.sh [--project DIR] [--native-root DIR] [--store DIR] [--virtual-store DIR]' \
 '' \
-"Point pnpm's store-dir + virtual-store-dir at container-native storage (the overlay" \
-'FS) instead of the slow 9p/WSL2 bind mount, via a gitignored project .npmrc.' \
+"Point pnpm's storeDir + virtualStoreDir at container-native storage (the overlay" \
+'FS) instead of the slow 9p/WSL2 bind mount, via a gitignored project pnpm-workspace.yaml.' \
+'NOTE: pnpm 10+ silently IGNORES kebab-case store-dir/virtual-store-dir written to' \
+'.npmrc (confirmed broken, spec b38-node-pnpm-toolchain 1.3) -- the camelCase keys must' \
+'live in pnpm-workspace.yaml, which pnpm actually honours.' \
 '' \
 '  --project DIR          project dir to configure               (default: the current directory)' \
 '  --native-root DIR      parent of the derived native dirs      (default: /root)' \
-'  --store DIR            pnpm store-dir, global CAS             (default: <native-root>/.pnpm-store)' \
-'  --virtual-store DIR    pnpm virtual-store-dir, per project    (default: <native-root>/<slug>-vstore)' \
+'  --store DIR            pnpm storeDir, global CAS               (default: <native-root>/.pnpm-store)' \
+'  --virtual-store DIR    pnpm virtualStoreDir, per project       (default: <native-root>/<slug>-vstore)' \
 '  -h, --help             this help' \
 '' \
-'Writes <project>/.npmrc, ensures the .gitignore entries, creates the native dirs, and' \
-'prints ONE /backpack:add line on stdout (all progress goes to stderr). It never runs' \
-"pnpm install -- that is the backpack item's job on the next container rebuild."
+'Writes <project>/pnpm-workspace.yaml, ensures the .gitignore entries, creates the native' \
+'dirs, and prints ONE /backpack:add line on stdout (all progress goes to stderr). It never' \
+"runs pnpm install -- that is the backpack item's job on the next container rebuild."
 }
 
 say() { printf 'bp-fast-store: %s\n' "$1" >&2; }
@@ -278,18 +281,21 @@ ensure_native() {              # ensure_native DIR LABEL
 ensure_native "$STORE" store
 ensure_native "$VSTORE" virtual-store
 
-# ------------------------------------------------------- 7. write .npmrc ----
+# ------------------------------------------- 7. write pnpm-workspace.yaml ----
+# camelCase storeDir/virtualStoreDir keys -- pnpm 10+ silently IGNORES the
+# kebab-case store-dir/virtual-store-dir keys in .npmrc (confirmed broken,
+# spec 1.3), so those are never written here, to .npmrc or anywhere else.
 
-NPMRC="$PROJECT/.npmrc"
-NPMRC_STATE=created
-[ -f "$NPMRC" ] && NPMRC_STATE=updated
+WORKSPACE="$PROJECT/pnpm-workspace.yaml"
+WORKSPACE_STATE=created
+[ -f "$WORKSPACE" ] && WORKSPACE_STATE=updated
 
-read_lines "$NPMRC"
+read_lines "$WORKSPACE"
 KEEP=()
 for _line in ${LINES[@]+"${LINES[@]}"}; do
   _rstrip "$_line"
-  [ "$RSTRIPPED" = "$NPMRC_MARKER" ] && continue
-  [[ $_line =~ ^[[:space:]]*(store-dir|virtual-store-dir)[[:space:]]*= ]] && continue
+  [ "$RSTRIPPED" = "$WORKSPACE_MARKER" ] && continue
+  [[ $_line =~ ^[[:space:]]*(storeDir|virtualStoreDir)[[:space:]]*: ]] && continue
   KEEP+=("$_line")
 done
 # strip trailing blank lines from the preserved prefix (2.5 step 3)
@@ -299,19 +305,19 @@ while [ ${#KEEP[@]} -gt 0 ]; do
   unset 'KEEP[${#KEEP[@]}-1]'
 done
 
-NPMRC_CONTENT=''
+WORKSPACE_CONTENT=''
 if [ ${#KEEP[@]} -gt 0 ]; then
-  for _line in "${KEEP[@]}"; do NPMRC_CONTENT+="$_line"$'\n'; done
-  NPMRC_CONTENT+=$'\n'
+  for _line in "${KEEP[@]}"; do WORKSPACE_CONTENT+="$_line"$'\n'; done
+  WORKSPACE_CONTENT+=$'\n'
 fi
-NPMRC_CONTENT+="$NPMRC_MARKER"$'\n'"store-dir=$STORE"$'\n'"virtual-store-dir=$VSTORE"$'\n'
+WORKSPACE_CONTENT+="$WORKSPACE_MARKER"$'\n'"storeDir: $STORE"$'\n'"virtualStoreDir: $VSTORE"$'\n'
 
-write_atomic "$NPMRC" "$NPMRC_CONTENT"
+write_atomic "$WORKSPACE" "$WORKSPACE_CONTENT"
 
 # --------------------------------------------------- 8. update .gitignore ----
 
 GITIGNORE="$PROJECT/.gitignore"
-CANDIDATES=('.npmrc' 'node_modules/')
+CANDIDATES=('pnpm-workspace.yaml' 'node_modules/')
 case $STORE in "$PROJECT"/*) CANDIDATES+=("${STORE#"$PROJECT"/}/") ;; esac
 case $VSTORE in "$PROJECT"/*) CANDIDATES+=("${VSTORE#"$PROJECT"/}/") ;; esac
 
@@ -370,7 +376,17 @@ say 'run the line printed on stdout to declare the rebuild re-install'
 
 BP_NAME="pnpm-install-$SLUG"
 BP_INSTALL="cd \"$PROJECT\" && pnpm install --frozen-lockfile"
-BP_VERIFY="test -d \"$PROJECT/node_modules\" && test -d \"$VSTORE\" && test -n \"\$(ls -A \"$VSTORE\" 2>/dev/null)\""
+# Verify BEHAVIOUR, not presence (b38 D6). The previous form was
+#   test -d node_modules && test -d $VSTORE && test -n "$(ls -A $VSTORE)"
+# which only proves some directories exist. That is exactly the defect this
+# package exists to fix: b06 shipped `done` writing store-dir/virtual-store-dir
+# into .npmrc, which pnpm 10+ silently ignores, and a presence check could never
+# have caught it. So ask pnpm ITSELF where its store is and confirm the answer
+# lands under the configured native path, then confirm a real node_modules entry
+# actually resolves into the configured virtual store. Both fail against the old
+# broken implementation, because pnpm would report the default
+# ~/.local/share/pnpm/store instead.
+BP_VERIFY="cd \"$PROJECT\" && test -d node_modules && pnpm store path 2>/dev/null | grep -q \"^$STORE\" && test -n \"\$(find node_modules -mindepth 1 -maxdepth 1 -type l -exec readlink -f {} + 2>/dev/null | grep \"^$VSTORE\" | head -1)\""
 
 printf '/backpack:add --category %s --name %s --install %s --verify %s --rationale %s\n' \
   "$(shq 'project-setup')" "$(shq "$BP_NAME")" "$(shq "$BP_INSTALL")" \

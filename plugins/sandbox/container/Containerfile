@@ -45,6 +45,38 @@ ENV IS_SANDBOX=1
 ENV npm_config_ignore_scripts=true
 ENV NODE_OPTIONS="--dns-result-order=ipv4first"
 
+# Node + pnpm toolchain (b38-node-pnpm-toolchain).
+#
+# Versions are EXACT pins, measured 2026-08-03 against the repo's >=7-day
+# supply-chain rule -- do NOT "helpfully" bump to latest/lts without
+# re-running that measurement:
+#   Node v24.18.1 was 6 days old on 2026-08-03 (too new); v24.18.0 (2026-06-23,
+#   41 days old) is the newest ELIGIBLE Active-LTS release. Node 20 is EOL;
+#   Node 24 "Krypton" is Active LTS.
+#   pnpm 11.19.0 (3d) and 11.18.0/dist-tag latest (5d) were both too new;
+#   11.17.0 (2026-07-23, 11 days old) is the newest ELIGIBLE release.
+# Installed by tarball (not apt/nodesource) so the version is pinned exactly.
+RUN curl -sSL https://nodejs.org/dist/v24.18.0/node-v24.18.0-linux-x64.tar.xz -o /tmp/node.tar.xz \
+    && tar -xf /tmp/node.tar.xz -C /tmp \
+    && mv /tmp/node-v24.18.0-linux-x64 /opt/node24 \
+    && ln -sf /opt/node24/bin/node /usr/local/bin/node \
+    && ln -sf /opt/node24/bin/npm /usr/local/bin/npm \
+    && rm -f /tmp/node.tar.xz \
+    && npm install -g pnpm@11.17.0
+
+# pnpm supply-chain hardening -- separate from the npm_config_ignore_scripts
+# key above (that one governs npm; pnpm reads its own PNPM_CONFIG_* env).
+# MINIMUM_RELEASE_AGE is in MINUTES: 10080 = 7 days, matching the >=7-day
+# rule above (NOT 10080 days -- that would be a different control entirely).
+ENV PNPM_CONFIG_IGNORE_SCRIPTS=true
+ENV PNPM_CONFIG_MINIMUM_RELEASE_AGE=10080
+# Explicitly false: pnpm's documented default for this key is TRUE, which
+# silently SKIPS the minimum-release-age check for any package whose
+# registry metadata lacks a `time` field -- an easy, silent bypass of the
+# whole age control if left unset. Must be pinned explicitly.
+ENV PNPM_CONFIG_MINIMUM_RELEASE_AGE_IGNORE_MISSING_TIME=false
+ENV PNPM_CONFIG_MINIMUM_RELEASE_AGE_STRICT=true
+
 # Git defaults
 RUN git config --global core.autocrlf input \
     && git config --global init.defaultBranch main
