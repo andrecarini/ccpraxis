@@ -55,6 +55,11 @@ bp-feedback.pl [options] [--] [text ...]
 Reads the feedback body from the positional arguments if any are given,
 otherwise from stdin (read to EOF, in binary). Captures verbatim, byte for
 byte; interprets nothing.
+
+When piping into this tool, prefer `set -o pipefail` in the calling shell: a
+producer that dies mid-pipe closes stdin early, which this tool cannot
+distinguish from a short, complete message, and pipefail is what surfaces
+the producer's own exit code to the caller.
 EOF
 }
 
