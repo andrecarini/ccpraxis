@@ -2875,6 +2875,15 @@ sub run {
     my $now        = $o{now}        || sub { time };
     my $sleep_for  = $o{sleep_for}  || sub { select undef, undef, undef, $_[0] };
     my $read_key   = $o{read_key}   || sub { undef };
+    # s15-input-latency: an interruptible wait on input, injected alongside the
+    # other seams (b32 opt-in shape). Default preserves today's behaviour
+    # BYTE-FOR-BYTE -- sleep the full interval via $sleep_for, report no key --
+    # so every existing caller/test that injects only sleep_for is unaffected.
+    # The real seam (launcher.pl) builds this on blocking
+    # Term::ReadKey::ReadKey($timeout), which may consume a single byte to
+    # detect readiness; see the pushback handling at the tail of the loop
+    # below for how that byte is handed back to the drain (Decision #22).
+    my $wait_input = $o{wait_input} || sub { $sleep_for->($_[0]); undef };
     my $term_size  = $o{term_size}  || sub { (80, 24) };
     my $gather     = $o{gather}     || sub { {} };
     my $heartbeat  = $o{heartbeat}  || sub { 'ok' };
@@ -2922,6 +2931,22 @@ sub run {
     my $ticks = 0;
     my $last_title;                                            # undef => nothing emitted yet
     my $spin_div = ($tick_int && $tick_int > 0) ? $tick_int : 0.2;   # never divide by zero
+
+    # s15-input-latency pushback (Decision #22): a single-slot holding cell for
+    # a byte that $wait_input already consumed off the input source in order to
+    # detect readiness. $next_key hands that byte back FIRST, before falling
+    # through to the ordinary non-blocking $read_key poll, so no keystroke is
+    # ever lost to the wait. Declared once, outside the tick loop -- it is only
+    # ever armed and drained within the same tick, never left set across ticks.
+    my $pushback_key;
+    my $next_key = sub {
+        if (defined $pushback_key) {
+            my $k = $pushback_key;
+            $pushback_key = undef;
+            return $k;
+        }
+        return $read_key->();
+    };
 
     # $progress->(\%p) -- handed to the stop_runs/full_shutdown seams as
     # run_stages(status_cb => $progress). Stashes the progress hashref
@@ -3029,16 +3054,27 @@ sub run {
                 $out->(render_frame($prev, $frame, { color => $color }));
                 $prev = $frame;
 
-                # input (non-blocking) — DRAIN all pending keys this tick, not one.
-                # read_key polls non-blocking, so a fast burst of scroll events
+                # input — DRAIN all pending keys available THIS tick, not one.
+                # $next_key polls non-blocking (falling through to $read_key once
+                # any pushback is consumed), so a fast burst of scroll events
                 # (mouse wheel) otherwise queued one-per-tick and took seconds to
                 # settle. Coalescing them into a single frame keeps scrolling
                 # responsive. The cap is a runaway-input backstop.
+                #
+                # s15-input-latency: this drain is now a reusable closure so the
+                # SAME dispatch logic can run twice in one iteration: once here
+                # (the primary, top-of-tick drain) and once more at the tail if
+                # $wait_input hands back a key (a keypress must be drained and
+                # rendered on the SAME tick it arrives in, not the next one) --
+                # without re-running the heartbeat/gather section above, which
+                # would make wall-clock-gated tests observe an extra heartbeat
+                # or gather that never happened in the real timeline.
+                my $do_drain = sub {
                 my $quit = 0;
                 my $drained = 0;
                 my $scroll_dirty = 0;   # set when a scroll mutates the view
                 while ($drained < 256) {
-                    my $key = $read_key->();
+                    my $key = $next_key->();
                     last unless defined $key && length $key;
                     $drained++;
                     my $pending_was_armed = ($pending ne '');
@@ -3136,13 +3172,14 @@ sub run {
                     # contract the oracle pins, so that is deferred.
                     if (!$pending_was_armed && $pending ne '') { last; }
                 }
-                last if $quit;
+                return ($quit, $scroll_dirty);
+                };   # end $do_drain
 
                 # Post-drain re-render: if a scroll changed the view, re-compose and
                 # re-render immediately (same tick) using @all_events already in scope —
                 # NO new gather. Update $prev so the next tick diffs against the last
                 # frame actually emitted, not a stale pre-drain baseline.
-                if ($scroll_dirty) {
+                my $do_rerender = sub {
                     # Refresh the fields the drain may have mutated, so this same-tick
                     # re-render matches what the NEXT primary render will show rather
                     # than their stale pre-drain values: $pending (mutated at :801) and
@@ -3160,11 +3197,66 @@ sub run {
                     my $frame2 = compose_frame(\%state, $rows, $cols);
                     $out->(render_frame($prev, $frame2, { color => $color }));
                     $prev = $frame2;
-                }
+                };
+
+                my ($quit, $scroll_dirty) = $do_drain->();
+                last if $quit;
+                $do_rerender->() if $scroll_dirty;
 
                 $ticks++;
                 last if defined $o{max_ticks} && $ticks >= $o{max_ticks};
-                $sleep_for->($tick_int);
+
+                # s15-input-latency: an interruptible wait replaces the old
+                # unconditional tail sleep. Default $wait_input sleeps the full
+                # interval and reports no key (byte-for-byte today's
+                # behaviour, C6). The real seam wakes immediately on a
+                # keypress; when it does, drain + render it on THIS SAME tick
+                # (C1) rather than falling through to the next iteration's
+                # heartbeat/gather check -- an idle wait still consumes ~the
+                # full interval with one call per tick, so there is no
+                # busy-spin (C2).
+                my $wk = $wait_input->($tick_int);
+                if (defined $wk && length $wk) {
+                    if ($wk eq "\e") {
+                        # Decision #22: the wait may have consumed only the ESC
+                        # byte of an arrow/CSI sequence to detect readiness. The
+                        # remaining bytes ('[' or 'O', then the final letter)
+                        # are still sitting in the input source and must be
+                        # pulled via the ordinary $read_key seam (NOT another
+                        # $wait_input call -- they are already available, not
+                        # awaited) and stitched into the same 'UP'/'DOWN' tokens
+                        # dispatch_key expects, mirroring launcher.pl's own
+                        # ESC-sequence assembly exactly. Applied ONLY here (the
+                        # pushback-originated byte), never to keys $read_key
+                        # returns directly -- launcher.pl's read_key already
+                        # fully assembles those before Dashboard.pm ever sees
+                        # them, so re-assembling here too would risk mis-eating
+                        # an unrelated, later keystroke as if it were part of a
+                        # CSI sequence.
+                        my $k2 = $read_key->();
+                        if (defined $k2 && ($k2 eq '[' || $k2 eq 'O')) {
+                            my $k3 = $read_key->();
+                            if (defined $k3) {
+                                if    ($k3 eq 'A') { $wk = 'UP'; }
+                                elsif ($k3 eq 'B') { $wk = 'DOWN'; }
+                                else               { $wk = undef; }   # unrecognized CSI: drop, like launcher.pl
+                            } else {
+                                $wk = undef;   # incomplete sequence
+                            }
+                        } elsif (defined $k2) {
+                            # ESC + a non-CSI byte (Alt+key): surface that byte
+                            # rather than dropping it, mirroring launcher.pl.
+                            $wk = $k2;
+                        }
+                        # else: lone ESC (no k2) -- $wk stays "\e", inert in dispatch_key.
+                    }
+                    if (defined $wk && length $wk) {
+                        $pushback_key = $wk;
+                        my ($quit2, $scroll_dirty2) = $do_drain->();
+                        last if $quit2;
+                        $do_rerender->() if $scroll_dirty2;
+                    }
+                }
             }
         };
         $err = $@;

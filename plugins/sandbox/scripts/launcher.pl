@@ -3353,6 +3353,24 @@ sub enter_dashboard {
             }
             return $k;
         },
+        # s15-input-latency: the interruptible tail-wait seam. Built on
+        # BLOCKING Term::ReadKey::ReadKey($timeout) with a VARIABLE timeout --
+        # deliberately NOT Perl's 4-arg select(STDIN, ...): select is
+        # socket-only on Windows and cannot watch the console handle there,
+        # and this repo ships on Git for Windows (that is load-bearing, not
+        # theoretical). ReadKey($timeout) blocks up to $timeout waiting for a
+        # single byte, returning undef on timeout (idle tick, no busy-spin)
+        # or that one byte the instant it arrives (a keypress wakes the loop
+        # immediately). It intentionally does NOT try to assemble a full
+        # arrow/CSI sequence itself -- if the byte it consumed to detect
+        # readiness is an ESC, Dashboard::run's own pushback handling pulls
+        # the remaining bytes back through the read_key seam above and
+        # assembles them there (Decision #22): a lost or misassembled
+        # ESC/arrow sequence is a hard failure, not cosmetic.
+        wait_input => sub {
+            my ($timeout) = @_;
+            return Term::ReadKey::ReadKey($timeout);
+        },
         term_size => sub {
             my @s = eval { Term::ReadKey::GetTerminalSize() };
             my $cols = (@s && $s[0]) ? $s[0] : 80;
