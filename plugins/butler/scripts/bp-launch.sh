@@ -10,7 +10,9 @@
 # the prompt cache is warm — the resume-vs-cold decision lives in bp-resume-sweep.sh).
 #
 # The coordinator's discipline is enforced by hooks gated on the env contract
-# exported here: BP_LEDGER, BP_WRITE_SET, BP_TEST_PATHS, BP_DIR, BP_PROJECT_ROOT.
+# exported here: BP_LEDGER, BP_WRITE_SET, BP_TEST_PATHS, BP_DIR, BP_PROJECT_ROOT,
+# BP_REPORT_DIR (this package's reports dir — capture drivers derive their output path from
+# it rather than hardcoding one; see coordinator-protocol/SKILL.md).
 set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 PLUGIN_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
@@ -106,6 +108,7 @@ ATTEMPT=$(registry_get "$BP_NAME" "$PKG" attempt); ATTEMPT=$(( ${ATTEMPT:-0} + 1
   export BP_PROJECT_ROOT="$PROJECT_ROOT" BP_BLUEPRINT="$BP_NAME" BP_PACKAGE="$PKG"
   export BP_DIR="$BPDIR" BP_LEDGER="$LEDGER"
   export BP_WRITE_SET="$WRITE_SET" BP_TEST_PATHS="$TEST_PATHS"
+  export BP_REPORT_DIR="$BPDIR/reports/$PKG"
   export BP_ROLE="coordinator"
   if [ -n "$RESUME_SID" ]; then
     setsid nohup claude -p "$PROMPT" --resume "$RESUME_SID" \

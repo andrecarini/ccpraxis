@@ -21,6 +21,10 @@ Your process carries (exported by the launcher — if these are missing you were
 
 Hooks enforce: write-set containment, implementer/test-writer role separation, one write-capable worker in flight, git/deploy safety, the stop gate, and the **graceful-stop gate** (see "Graceful stop" below). **A `BLOCKED:` message is protocol feedback. Comply, record it in the ledger, escalate via `status: blocked` if it reveals a scope problem. Never route around a hook.**
 
+### `BP_REPORT_DIR` — derive capture output paths, never hardcode one
+
+`BP_REPORT_DIR` is exported by `bp-launch.sh` as `$BP_DIR/reports/$BP_PACKAGE` — absolute, inside `$BP_DIR`, and therefore always in-set. Any capture driver you dispatch (screenshots, generated artifacts, anything a worker writes as evidence) must **derive** its output path from `BP_REPORT_DIR`, never hardcode a literal path string. A hardcoded literal is the actual root cause of a real incident: a package's spec was inherited from a previous blueprint and carried that blueprint's literal reports path, so it outlived the blueprint it belonged to and kept writing into an archived one long after. A path derived from `BP_REPORT_DIR` cannot outlive its blueprint the way a hardcoded one can.
+
 ## Ledger discipline — medical chart, not diary
 
 - Update **before** any long or risky operation ("write the chart entry before treating") and **after** every meaningful result.
@@ -107,6 +111,10 @@ than silent**:
 ## Disk is truth
 
 Never trust a worker's claim of success. After every write-capable worker returns: confirm the files exist, then **run the validation yourself** (analyzer, targeted tests — the project's CLAUDE.md defines the commands). Record commands + exit codes in `## Outputs`. The same rule protects you after resumption: verify recorded outputs exist before continuing.
+
+### A `write-set` bounds the agent, not the subprocesses it spawns
+
+`guard-writes.sh` intercepts `Edit`/`Write`/`MultiEdit`/`NotebookEdit` **tool calls** — that is the entire enforcement surface. Nothing intercepts a subprocess you launch with `Bash`: a script, a build step, a capture driver can write anywhere on disk the OS permissions allow, completely outside `BP_WRITE_SET`, and no hook will see it. Do not treat write-set containment as absolute — it is a contract on you, not a sandbox around everything you run. `plugins/butler/scripts/bp-containment-audit.pl` exists precisely to make out-of-set subprocess writes **visible** (it reports; it does not block) — run it around steps that spawn subprocesses with real write access, and treat any finding as evidence to investigate, not noise.
 
 ### Waiting discipline — the positive pattern
 
@@ -247,6 +255,9 @@ Workers are dispatched via Task with `subagent_type` set to the **plugin-namespa
 3. **Tests** (`bp-test-writer`). Sees the spec, not your implementation files. Sanity-check the returned mapping (criterion → test) against the spec yourself — a cheap read that prevents an expensive convergence on wrong tests. Tests should fail for the right reason before implementation exists.
 4. **Implementation loop** (`bp-implementer`). Tests are the immutable oracle (hook-enforced). After each return: validate from disk, feed back the *exact* failing output excerpts with file:line, redispatch. **Cap: 4 attempts on the same failure → `status: blocked`** with a precise escalation; thrashing burns the budget that monitoring is protecting.
 5. **Validation suite green from disk.** Full project validation per project CLAUDE.md, run by you, recorded in Outputs.
+
+   ### Validation is scoped to the package's own slice
+   This extends SYN-11's per-package "green" doctrine — already defined for *test* reds — explicitly to **lint and build scope** too; it does not amend SYN-11, it applies the same reasoning one layer wider. A package must not fail step 5 because a project-wide lint pass or a project-wide build trips over a sibling package's temporarily-broken in-flight work. Judge your own slice: the files in your write set, the tests that are yours. A project-wide lint/build red attributable to another package in flight is not your red — record it, don't block on it.
 6. **Review ∥ red-team** (`bp-reviewer` ∥ `bp-redteam`). Read-only, safe to run in parallel.
 7. **Fix-batch.** Consolidate ALL findings from both reports into **one** implementer dispatch — never a sequence of single-finding fixes. Re-validate after.
 8. **UI pass** (`bp-ui-prober`), only if the package touches UI. Screenshots get read, the visual checklist applied, findings folded into a final fix-batch if needed.
