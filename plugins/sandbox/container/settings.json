@@ -6,6 +6,7 @@
       "pr" : ""
    },
    "autoScrollEnabled" : false,
+   "cleanupPeriodDays" : 180,
    "editorMode" : "vim",
    "effortLevel" : "high",
    "enabledPlugins" : {

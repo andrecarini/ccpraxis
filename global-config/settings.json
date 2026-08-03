@@ -6,6 +6,7 @@
       "pr" : ""
    },
    "autoScrollEnabled" : false,
+   "cleanupPeriodDays" : 180,
    "editorMode" : "vim",
    "effortLevel" : "high",
    "enabledPlugins" : {
@@ -82,6 +83,7 @@
          "Skill(steward:ccpraxis-extend)",
          "Skill(steward:setup-project)",
          "Skill(steward:update)",
+         "Skill(steward:usage-audit)",
          "Skill(todo:create)",
          "Skill(todo:manage)",
          "Skill(todo:resume)",
