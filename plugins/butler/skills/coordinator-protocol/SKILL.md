@@ -25,9 +25,39 @@ Hooks enforce: write-set containment, implementer/test-writer role separation, o
 
 - Update **before** any long or risky operation ("write the chart entry before treating") and **after** every meaningful result.
 - `## Next action` is ALWAYS current: the exact instruction your replacement executes first. Update it before starting a step, not after finishing it.
-- Status transitions you own (edit frontmatter `status:` + `last_updated:`): `pending → running → converging → reviewing → done | blocked | parked`. Note: `converging` is a **ledger-only (coordinator-internal)** status — it signals the implementation loop is iterating; it is never shown in the blueprint's Package status table, which is maintained above you (by the deterministic orchestrator script + the reporter), not by you.
+- Status transitions you own (**via `bp-ledger.pl set-status`** — see "Editing the ledger" below; never by hand-editing frontmatter): `pending → running → converging → reviewing → done | blocked | parked`. Note: `converging` is a **ledger-only (coordinator-internal)** status — it signals the implementation loop is iterating; it is never shown in the blueprint's Package status table, which is maintained above you (by the deterministic orchestrator script + the reporter), not by you.
 - The Stop hook will refuse to end your session unless status is terminal, the file is fresh, and (for blocked/parked) Next action is concrete. This is by design — satisfy it, don't fight it.
 - Append decisions, attempts, and outcomes to `## Decisions & attempt log` with timestamps. The `## Dispatch log (auto)` section is hook-maintained; add narrative elsewhere, never edit that section.
+
+### Editing the ledger — use `bp-ledger.pl`, not `Edit`
+
+**Every structured change to your ledger goes through `plugins/butler/scripts/bp-ledger.pl`.** Free-form `Edit`/`Write` on the ledger is how it gets corrupted: a whole-file rewrite has truncated a ledger to zero bytes in this repo, and hand-edits have landed entries inside fenced code blocks, forged ticked checkboxes, and silently dropped sections. The API is deterministic, atomic (temp + rename), locked, and refuses rather than guesses.
+
+The six operations:
+
+```
+bp-ledger.pl set-status       --ledger P --status S
+bp-ledger.pl tick-step        --ledger P --step N
+bp-ledger.pl append-attempt   --ledger P (--text T | --text-file F | --text -)
+bp-ledger.pl set-next-action  --ledger P --body B
+bp-ledger.pl add-output       --ledger P --text T
+bp-ledger.pl validate         (--ledger P | --stdin | --payload)
+```
+
+`set-status` refreshes `last_updated:` for you — do not stamp it yourself, and do not stamp it in the same breath as a hook that also stamps (that double-stamping hazard is real).
+
+Exit codes are meaningful and you should branch on them: **0** ok · **2** the write was *rejected* (it would have corrupted the ledger — read the message, do not retry blindly) · **3** argument fault · **4** I/O · **5** the target section or step was not found.
+
+Why each op exists rather than an `Edit`:
+
+- **`append-attempt`** inserts at the end of `## Decisions & attempt log`, always as exactly one line, always outside any fenced code block. The one-line rule is not cosmetic — it is what makes two forgeries structurally impossible: the entry starts `- <ISO>` so it can never open a fence (which would break the fence-scoped `MEANS-DEVIATION:` guard below), and its `-` is followed by a digit so it can never forge a `- [x]` checkbox.
+- **`tick-step`** only ever ticks inside `## Pipeline`, so no op can emit a `- [x]` anywhere else.
+- **`set-next-action`** replaces the `## Next action` body wholesale — the one section that is meant to be rewritten.
+- **`add-output`** appends to `## Outputs`, replacing a `_(none yet)_` placeholder if that is all that is there.
+
+**What no op may touch, and neither may you:** `## Dispatch log (auto)` is hook-maintained and never agent-edited. `mandated_means:` has no op and none may be added — rewriting the requirement to match what you built is the one move that defeats the whole mechanism.
+
+Prose sections the API does not model (`## Scope`, `## Inputs`, and your own narrative) are still yours to write with `Edit` — but anchor on a unique string, never rewrite the whole file.
 
 ## Context economics
 

@@ -264,11 +264,29 @@ sub dirname_of { (my $d = $_[0]) =~ s{/[^/]+\z}{}; return $d }
 # ---- fence primitives (§2.11) ------------------------------------------------------
 # A fence toggles on any line whose leading-whitespace-stripped form starts with >=3 backticks or
 # >=3 tildes. Returns the list of lines that are INSIDE a fence (fence delimiters excluded).
+# CORRECTED 2026-08-03 (coordinator, b13 step 4). These helpers were naive —
+#   if ($l =~ /^[ \t]*(?:`{3,}|~{3,})/) { $in = !$in; next }
+# — which is self-defeating on this suite's own b09 fixture. b09:625 is prose
+# containing an inline ``` `## Next action` ``` aside; the only real fence pair is
+# 925/928. Naive counting sees 3 fence lines (odd), so b09 reads as having an
+# unterminated fence, and spec §2.11 then REQUIRES append-attempt to exit 5 —
+# contradicting AC-8's own "append-attempt on b09 exits 0". Measured: under the
+# naive rule AC-8 fails assertions 125/126/128; no implementation can satisfy it.
+# Corrected to the CommonMark rule the implementation uses (a backtick fence's info
+# string may not itself contain a backtick), so oracle and parser agree on what a
+# fence IS — an agreement the fence-scoped MEANS-DEVIATION guard depends on.
+sub is_fence_delim {
+    my ($l) = @_;
+    if ($l =~ /^[ \t]*(`{3,})(.*)$/s) { return index($2, '`') >= 0 ? 0 : 1 }
+    return 1 if $l =~ /^[ \t]*~{3,}/;
+    return 0;
+}
+
 sub fenced_lines {
     my ($s) = @_;
     my ($in, @out) = (0);
     for my $l (split /\n/, $s, -1) {
-        if ($l =~ /^[ \t]*(?:`{3,}|~{3,})/) { $in = !$in; next }
+        if (is_fence_delim($l)) { $in = !$in; next }
         push @out, $l if $in;
     }
     return @out;
@@ -281,7 +299,7 @@ sub offset_in_fence {
     my @l   = split /\n/, $pre, -1;
     pop @l;                                # the (partial) line containing $off is not yet closed
     my $in = 0;
-    for my $l (@l) { $in = !$in if $l =~ /^[ \t]*(?:`{3,}|~{3,})/ }
+    for my $l (@l) { $in = !$in if is_fence_delim($l) }
     return $in ? 1 : 0;
 }
 
@@ -718,7 +736,14 @@ my $ISO_RE = qr/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/;
 # [G2] append-attempt -- AC-7, AC-8, AC-10, AC-11, AC-12, AC-13
 # =====================================================================================
 
-my $ENTRY_RE = qr/^- \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z \Q$EMDASH\E /;
+# /m CORRECTED 2026-08-03 (coordinator, b13 step 4). A qr// carries its OWN flags:
+# interpolating a non-/m qr into an outer /m pattern does NOT give the inner `^`
+# multiline semantics, so `$new =~ /$ENTRY_RE...$/m` anchored at STRING start and
+# could only have matched if the entry were the first line of the file — impossible.
+# It went unnoticed because the other use is a per-line grep, where each element is a
+# single line and `^` at string start is correct either way. Adding /m fixes the
+# whole-document match and is a no-op for the grep (verified: still finds both lines).
+my $ENTRY_RE = qr/^- \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z \Q$EMDASH\E /m;
 
 {   # ---- AC-7 (B7, B8): ONE contiguous insertion, inside the section, before the next `##`.
     my $p    = stage_bytes(clean_ledger());
