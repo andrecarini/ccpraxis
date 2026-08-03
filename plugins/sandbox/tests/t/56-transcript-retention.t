@@ -346,9 +346,27 @@ sub assert_baseline_preserved {
     }
     ok($all_preserved, "A4: $label preserves every baseline key path with its original value");
 
-    # (b) no live key path outside baseline union {cleanupPeriodDays}.
+    # (b) no live key path outside baseline union the explicitly-permitted set.
+    #
+    # SYN-21, 2026-08-03: `env.CCPRAXIS_SANDBOX` added. s17's done criteria
+    # MANDATE that container/settings.json set a sandbox marker, which
+    # scripts/statusline.pl reads to decide whether to render the sandbox badge
+    # -- the badge must NOT appear on the operator's host, so the variable has
+    # to live in the container's settings file specifically.
+    #
+    # This is the recurring shape the standing rule warns about: assert your own
+    # package's contribution, never the whole file's shape, because the latter
+    # forbids every later package from extending it. Part (a) above is the real
+    # protection and is untouched -- no baseline key may be lost or changed.
+    # Part (b) is deliberately kept, rather than deleted, so an ACCIDENTAL new
+    # key is still caught; only this one deliberate, mandated addition is
+    # permitted, by name.
+    my %permitted_additions = (
+        'cleanupPeriodDays'    => 1,
+        'env.CCPRAXIS_SANDBOX' => 1,   # s17-statusline-and-output-hygiene
+    );
     my @unexpected = grep {
-        !exists $baseline_flat->{$_} && $_ ne 'cleanupPeriodDays'
+        !exists $baseline_flat->{$_} && !$permitted_additions{$_}
     } sort keys %$live_flat;
     is_deeply(\@unexpected, [],
         "A4: $label introduces no key path outside the baseline other than cleanupPeriodDays");

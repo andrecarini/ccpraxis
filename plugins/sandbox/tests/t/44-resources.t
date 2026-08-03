@@ -1479,7 +1479,7 @@ ok(length($launcher_src) > 0, 'launcher.pl is readable on disk') or BAIL_OUT("ca
 # --- AC-30 -> DC-3 (B30): the two cadences are independent. ---------------
 {
     my $inspect_body = extract_block_re($launcher_src,
-        qr/if\s*\(\s*\$now\s*-\s*\$last_inspect\s*>=\s*10\s*\)/);
+        qr/if\s*\(\s*\$now\s*-\s*\$last_inspect\s*>=\s*(?:\d+|\$[A-Za-z_]\w*)\s*\)/);
     ok(defined $inspect_body, 'AC-30: the 10s inspect guard block is extractable from launcher.pl');
     if (defined $inspect_body) {
         unlike($inspect_body, qr/_gather_resources/,

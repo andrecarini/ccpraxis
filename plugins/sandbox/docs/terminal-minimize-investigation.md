@@ -18,6 +18,59 @@ operator is actively at the machine and while they are away from it, and that si
 a candidate and reshapes the list below — see Candidate 2's `wt.exe` sub-finding, the timer-driven
 discussion in the same candidate, and `## Conclusion`.
 
+**Operator evidence, piece 4 — the first DIRECT temporal correlation, 2026-08-03.** Reported live, in
+the operator's words:
+
+> *"Just saw the ccpraxis sandbox launcher Windows Terminal window minimize right now (but you were
+> busy doing something so you are only processing this message later). When it happened, on the
+> `Recent activity` log the latest entry was `keepawake` preceded by `keepawake_started`."*
+
+**This is the decisive observation `s18` asked for and could not obtain**, and it answers its own
+headline question. That question was: *"does the minimize happen while the dashboard sits IDLE, or
+only alongside something the operator did? An idle-time minimize points at the periodic spawns and
+away from every hotkey path."*
+
+The operator was **waiting on an agent turn, not interacting with the sandbox terminal** — an
+idle-time minimize. And it coincided with `keepawake_started`, the log line emitted immediately
+after `_keepawake_start` fork+execs
+`powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File <ps1>`.
+
+Three consequences, none of which this document previously had the evidence to state:
+
+1. **Candidate 1's spawn/lifecycle half and Candidate 2 (native spawn / console flash) are the same
+   mechanism, and it is now directly correlated with the symptom** rather than merely plausible.
+   `-WindowStyle Hidden` remains *the only `-WindowStyle` usage in the entire tree*, and a console
+   child inheriting its parent's console inherits the parent's window handle.
+2. **Findings A and C (title-stack escapes, hotkey paths) are further disfavoured**, because neither
+   runs while the operator is doing nothing.
+3. **Finding E is discriminated AGAINST, and this is the cleanest new signal.** Finding E attributes
+   the symptom to intervals where the wake-lock is *absent* and Windows may power the display off.
+   But a display power-off is not a minimize, and the observed event coincided with
+   `keepawake_started` — the **end** of such a gap, i.e. the moment the helper is **re-spawned**.
+   That points at the spawn itself, not at the gap preceding it.
+
+**The `SW_HIDE` vs `SW_MINIMIZE` counter-evidence is now weaker.** This document recorded it as
+*"real but not decisive, the phrasing may be loose"*. The operator has since twice used the precise
+word *minimize* and once described finding the window *minimized to the taskbar* on returning. Treat
+the counter-evidence as unresolved rather than as an exclusion.
+
+**Interaction with finding B2, already documented below.** B2 established that the helper is
+re-spawned repeatedly and that some re-spawns are **spurious**: `$cached_busy_age` becomes `undef` on
+*any* failure of the busy-lease `podman exec`, `should_stay_awake` returns 0 for `undef`, and the
+wake-lock is SIGKILLed and re-spawned on the next successful tick — observed stop→start pairs 3, 4 and
+12 seconds apart. If the spawn is what minimizes the window, then **B2 is not merely untidy: it is a
+multiplier on the symptom**, converting transient probe failures into repeated window events.
+
+**Still not proven, and worth saying plainly.** This is one correlation, not a controlled experiment.
+It does not establish causation, and the two cheap operator checks named in `## Conclusion` remain
+worth running. What it does do is move Candidate 1 (spawn/lifecycle) and Candidate 2 from
+`UNVERIFIED-HYPOTHESIS` / `NOT-EXCLUDED` to **the leading candidates on direct evidence**, displacing
+Candidate 4.
+
+**Owner:** the fix belongs to the follow-on package `keep-awake-probe-failure-handling` (B2), which
+`s18` specified and deliberately did not build — it touches `launcher.pl` and `KeepAwake.pm`, outside
+`s18`'s write set. This evidence strengthens the case for building it.
+
 ## Reproduction status
 
 Status: NOT-REPRODUCED

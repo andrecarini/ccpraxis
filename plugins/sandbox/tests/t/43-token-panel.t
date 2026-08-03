@@ -472,7 +472,7 @@ ok(length($launcher_src) > 0, 'launcher.pl is readable on disk') or BAIL_OUT("ca
     ok(defined $gather_block, 'AC-14: the gather => sub {...} closure is extractable from launcher.pl')
         or diag('cannot locate the "gather    => sub {" literal -- has formatting changed?');
     if (defined $gather_block) {
-        my ($guard_slice) = $gather_block =~ /if\s*\(\s*\$now\s*-\s*\$last_inspect\s*>=\s*10\s*\)\s*\{(.*?)\$last_inspect\s*=\s*\$now\s*;/s;
+        my ($guard_slice) = $gather_block =~ /if\s*\(\s*\$now\s*-\s*\$last_inspect\s*>=\s*(?:\d+|\$[A-Za-z_]\w*)\s*\)\s*\{(.*?)\$last_inspect\s*=\s*\$now\s*;/s;
         ok(defined $guard_slice, 'AC-14: located the ~10s cache guard slice inside the gather closure');
         if (defined $guard_slice) {
             like($guard_slice, qr/\$cached_tokens\s*=\s*_gather_tokens\s*\(\s*\)/,

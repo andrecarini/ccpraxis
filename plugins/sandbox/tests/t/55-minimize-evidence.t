@@ -445,7 +445,23 @@ like($operator_body, qr/decisive/, "AC-10: at least one operator-request item co
     }
     ok(defined $launcher_src && length $launcher_src,
         "C3 sanity: launcher.pl is readable [plugins/sandbox/scripts/launcher.pl]");
-    like($launcher_src, qr/if\s*\(\s*\$now\s*-\s*\$last_inspect\s*>=\s*10\s*\)/,
+    # RETARGETED 2026-08-03 (SYN-21: a documented, owned consequence of a
+    # mandated feature). This pinned the literal cadence value 10. s17's done criteria
+    # MANDATE replacing that cadence with a named constant precisely so the
+    # value is tunable and greppable, and it now reads
+    # a named constant instead. Pinning the VALUE was the wrong assertion in
+    # the first place -- it is the same global-snapshot mistake that has broken
+    # other oracles in this blueprint, because it forbids the very change
+    # another package was required to make.
+    #
+    # What C3 actually needs is that the guard SHAPE exists, since the document
+    # anchors its claim on the per-tick guard identifier in launcher.pl. So:
+    # accept a literal or a named constant, and keep everything else exact.
+    #
+    # NOTE: this file's own AC-12 greps itself for backtick command
+    # substitution, so comments here must not contain a backtick -- an earlier
+    # version of this note did, and tripped it.
+    like($launcher_src, qr/if\s*\(\s*\$now\s*-\s*\$last_inspect\s*>=\s*(?:\d+|\$[A-Za-z_]\w*)\s*\)/,
         "C3 sanity: the \$last_inspect guard shape genuinely exists in launcher.pl today "
         . "[plugins/sandbox/scripts/launcher.pl]");
 
