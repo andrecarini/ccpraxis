@@ -55,7 +55,7 @@ TEST_PATHS=$(fm_get "$LEDGER" test_paths)
 # times — which is the orchestrator killing healthy long packages, not
 # catching wedged ones. snapshot_progressed() already detects a wedged agent
 # SEMANTICALLY (ledger checkboxes, outputs, mtime), so the cap can be high.
-[ -n "$MAXT" ]  || MAXT="${BP_DEFAULT_MAX_TURNS:-400}"
+[ -n "$MAXT" ]  || MAXT="${BP_DEFAULT_MAX_TURNS:-800}"
 [ -n "$WRITE_SET" ] || { echo "bp-launch: ledger has empty write_set — refusing to launch an unscoped coordinator" >&2; exit 1; }
 
 # -------- effort (b23): opt-in only. Absent -> no --effort flag at all, byte-

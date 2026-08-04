@@ -48,7 +48,7 @@ One subsection per package. These fields are copied into each package ledger's f
 - **write_set:** `lib/<area>/:functions/src/<area>/`        <!-- colon-separated; trailing / = prefix; * crosses / -->
 - **test_paths:** `test/<area>/:integration_test/`
 - **model:** sonnet                                          <!-- coordinator model; opus for gnarly packages -->
-- **max_turns:** 80
+- **max_turns:** 800
 - **inputs:** <files, decisions (#), docs the coordinator needs; inline file:line where known>
 - **out_of_scope:** <explicit DO-NOT list>
 

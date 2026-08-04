@@ -590,9 +590,20 @@ sub checkpoint_advanced {
 # propagate initial -> widen -> `--max-turns 149999998`: one unbounded-cost
 # session, no relaunch needed, no cap in the loop to stop it. This is the last
 # line of defence, applied AFTER every other clamp so nothing can out-rank it.
-# Far above every realistic budget (defaults are 80-120), so it never binds in
-# normal operation — it only truncates the absurd.
-our $MAX_TURNS_CEILING = 1000;
+# Far above every realistic budget, so it never binds in normal operation — it
+# only truncates the absurd.
+#
+# RAISED 1000 -> 4000 (b51). The old comment said "defaults are 80-120", and
+# that stopped being true when the coordinator default became 800: the
+# documented 2x widen of an 800-turn package wants 1600, so a 1000 ceiling was
+# silently truncating the WIDEN POLICY rather than only the absurd — the clamp
+# doing something it was explicitly never meant to do. The security property is
+# unchanged: a poisoned `{"default_max_turns": 99999999}` is still bounded, just
+# bounded above every legitimate budget instead of inside one.
+#
+# CANONICAL SOURCE: plugins/butler/turn-caps.json (`ceiling`). This literal is a
+# derived copy — bp-turn-caps.pl checks it and t/93 fails on drift.
+our $MAX_TURNS_CEILING = 4000;
 
 # --- adaptive turn budget: 1.5x per productive exhaustion, capped at 2x the
 # author's intent, never shrinking. int() truncates (all values positive => floor).
@@ -1105,7 +1116,7 @@ sub initial_max_turns {
     # be absurd, hence neither can 2x the anchor.
     my $fm = ledger_fm($bpdir, $pkg, 'max_turns');
     return _clamp_turns($fm + 0) if defined $fm && $fm =~ /^\d+$/ && $fm > 0;
-    my $d = (ref $t eq 'HASH' ? $t->{default_max_turns} : undef) // $ENV{BP_DEFAULT_MAX_TURNS} // 400;
+    my $d = (ref $t eq 'HASH' ? $t->{default_max_turns} : undef) // $ENV{BP_DEFAULT_MAX_TURNS} // 800;
     return (defined $d && !ref $d && $d =~ /^\d+$/ && $d > 0) ? _clamp_turns($d + 0) : 80;
 }
 sub _clamp_turns { my ($n) = @_; return $n > $MAX_TURNS_CEILING ? $MAX_TURNS_CEILING : $n; }
@@ -1680,7 +1691,7 @@ sub _tunables_base {
         harvest_reaudit_cap => $ENV{BP_HARVEST_REAUDIT_CAP} // 2,  # #30: re-audit (not reopen) a done pkg whose harvest didn't complete, up to N times
         harvest_defer_cap => $ENV{BP_HARVEST_DEFER_CAP} // 2,  # b09 spec §2.4: sibling-red defer attempts before reopen/park
         conformance_spawn_cap => $ENV{BP_CONFORMANCE_SPAWN_CAP} // 2, # b05: whole-blueprint conformance gate firings per run
-        default_max_turns   => $ENV{BP_DEFAULT_MAX_TURNS}   // 400, # b01: turn budget when the ledger states none
+        default_max_turns   => $ENV{BP_DEFAULT_MAX_TURNS}   // 800, # b01: turn budget when the ledger states none
         broken_env_thresh   => $ENV{BP_BROKEN_ENV_THRESH}   // 3,  # b01: consecutive exec-not-found launches -> broken-env
         turn_starved_thresh => $ENV{BP_TURN_STARVED_THRESH} // 3,  # b01: consecutive fruitless turn exhaustions -> turn-starved
         ckpt_int            => $ENV{BP_CHECKPOINT_INTERVAL} // 300, # b02: seconds between periodic WIP checkpoints

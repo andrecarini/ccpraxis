@@ -533,17 +533,37 @@ MD
 # documented in the authoring protocol.
 # ===========================================================================
 {
+    # RETARGETED BY b51 (SYN-21: a mandated later feature invalidating a done
+    # sibling's assertion, owned and updated rather than left red).
+    #
+    # C8 originally required a NUMERIC max_turns default in the authoring prose.
+    # That assertion was itself enforcing the duplication that caused three
+    # silent divergences: b23 raised this prose 80 -> 150 and never touched
+    # templates/package-ledger.md (still 80) or agents/bp-scout.md (still 15).
+    # Prose that restates a number is another copy to drift, so b51 moved the
+    # canonical value into plugins/butler/turn-caps.json and made the prose
+    # POINT at it.
+    #
+    # C8's intent is preserved exactly: the authoring default is above the old
+    # 80, and it is documented. Only the location of the number changed.
     my $auth_txt = read_file($AUTH_SKILL) // '';
-    my ($stated_default) = $auth_txt =~ /max_turns.{0,200}?\bdefault\s+(\d+)\b/is;
-    ok(defined $stated_default,
-        "C8 (setup): authoring-protocol/SKILL.md states a numeric max_turns authoring default")
-        or diag("no '...max_turns...default N...' phrase found in $AUTH_SKILL");
+    my $caps_path = "$Bin/../../turn-caps.json";
+    my $caps_txt  = read_file($caps_path) // '';
+    my ($canonical) = $caps_txt =~ /"coordinator_default"\s*:\s*(\d+)/;
+
+    ok(defined $canonical,
+        "C8 (setup): the canonical source declares a coordinator_default")
+        or diag("no coordinator_default found in $caps_path");
+
     # null-safe sentinel (-1) so an absent match fails the numeric check outright rather than
     # skipping it — a skip here would be exactly the "condition is the failure state" anti-pattern.
-    my $default_for_check = defined $stated_default ? $stated_default : -1;
+    my $default_for_check = defined $canonical ? $canonical : -1;
     cmp_ok($default_for_check, '>', 80,
-        "C8: the documented max_turns authoring default has been raised above today's 80"
-        . (defined $stated_default ? " (found: $stated_default)" : " (no default was found on disk)"));
+        "C8: the canonical max_turns authoring default has been raised above today's 80"
+        . (defined $canonical ? " (found: $canonical)" : " (no default was found on disk)"));
+
+    like($auth_txt, qr/turn-caps\.json/,
+        "C8: the authoring protocol points at the canonical source instead of restating a literal");
 }
 
 done_testing();

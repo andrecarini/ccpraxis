@@ -1,0 +1,26 @@
+{
+  "_about": "CANONICAL turn caps. Every other copy is derived; bp-turn-caps.pl syncs and checks them, t/93 makes drift a red suite. A cap is a RUNAWAY BACKSTOP, not a budget -- it only binds when the agent would otherwise still be working, so a healthy worker costs the same at 40 as at 800 while a starved one costs the whole dispatch. Spend is controlled by scope, model, effort and the token budget. If you are tempted to lower one of these, lower the scope instead.",
+
+  "ceiling": 4000,
+  "_ceiling_why": "Absolute cost backstop applied after every other clamp, guarding against a poisoned default_max_turns propagating into one unbounded session. Must stay FAR above realistic budgets so it truncates only the absurd -- at 1000 it began binding on the documented 2x widen of an 800-turn coordinator, which is the clamp doing something it was never meant to do.",
+
+  "coordinator_default": 800,
+  "_coordinator_why": "A coordinator dispatches several workers plus scouting, validation and ledger work -- strictly more than any single worker it dispatches. It must never be capped below its own subordinates. The old template value of 80 left it 10x below them.",
+
+  "roles": {
+    "bp-scout": 400,
+    "bp-architect": 400,
+    "bp-harvest-judge": 400,
+    "bp-auditor": 400,
+
+    "bp-reviewer": 600,
+    "bp-redteam": 600,
+    "bp-test-writer": 600,
+    "bp-ui-prober": 600,
+    "bp-conformance-judge": 600,
+
+    "bp-implementer": 800,
+    "bp-resolve-judge": 800
+  },
+  "_roles_why": "400 = bounded roles that read a slice and write one artifact. 600 = multi-file roles that must EXECUTE things, not just read. 800 = edit/run/edit convergence loops."
+}

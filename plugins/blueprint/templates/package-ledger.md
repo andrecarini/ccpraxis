@@ -3,7 +3,7 @@ package: <NN-slug>
 blueprint: <blueprint-name>
 status: pending
 model: sonnet
-max_turns: 80
+max_turns: 800
 # worker_backend: claude              <!-- optional; claude (default) | opencode -- b32, coordinator's
 #   Task-vs-Bash dispatch choice. Read by bp-worker.pl. -->
 # worker_models:                      <!-- optional; b35. Non-coordinator worker MODEL preference,
