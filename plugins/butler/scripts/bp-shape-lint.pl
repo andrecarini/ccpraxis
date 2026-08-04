@@ -58,7 +58,14 @@ for my $arg (@ARGV) {
 # draft also matched "package" and "entry" and produced 47 candidates, most of
 # them legitimate per-fixture event counts. Precision matters more than recall
 # here, because a noisy lint is one nobody runs.
-my $SHARED = qr/heading|section|key\s+(?:path|set)|glyph\s*table|citing|corpus|SKILL\.md|settings\.json/xi;
+# `ids? (remain|are) defined` and `decisions table` were added after a SEVENTH
+# instance slipped through: t/87 pinned the blueprint's decisions table at
+# exactly 26 ids, so RECORDING A DECISION failed a test. The lint missed it
+# because the description said "ids", not "headings" or "keys" — a reminder that
+# this list is a heuristic over prose and needs extending whenever a new shape
+# of shared artifact shows up.
+my $SHARED = qr/heading|section|key\s+(?:path|set)|glyph\s*table|citing|corpus|
+                SKILL\.md|settings\.json|ids?\s+(?:remain|are)\s+defined|decisions?\s+table/xi;
 
 # Words that mark a count as local scaffolding, suppressing the flag.
 my $LOCAL  = qr/FIXTURE|fixture|sanity|synthetic|scaffold/;

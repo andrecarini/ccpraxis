@@ -230,9 +230,33 @@ is($c1_bodies_matched, 26, "C1: exactly 26 of 26 relocated files verify byte-for
 # the decisions table, in its original relative order.
 # =====================================================================================
 
-is(scalar(@IDS_IN_ORDER), 26, "C2: exactly 26 ids remain defined in the blueprint.md decisions table");
-is_deeply(\@IDS_IN_ORDER, \@IDS,
-    "C2: the 26 ids appear in the table in their original relative order (SYN-1 .. SYN-26)");
+# RETARGETED 2026-08-04, and this one fired while the operator was RECORDING A
+# DECISION — the seventh instance of an oracle pinning a total over a shared,
+# deliberately-extensible artifact. A decisions table exists to be added to; an
+# assertion that it holds exactly 26 rows makes recording decision 27 a test
+# failure. That is the antipattern in its purest form.
+#
+# What C2 protects is that the split did not LOSE or REORDER an id, and both
+# survive extension: a floor catches loss, an ordered-subsequence match catches
+# reordering and renaming. Growth is the normal, intended case.
+cmp_ok(scalar(@IDS_IN_ORDER), '>=', scalar(@IDS),
+    "C2: every pre-split id is still defined in the blueprint.md decisions table (a FLOOR — later decisions may be added)")
+    or diag("have " . scalar(@IDS_IN_ORDER) . ", pre-split baseline " . scalar(@IDS));
+
+{
+    my @missing;
+    my $cursor = 0;
+    for my $want (@IDS) {
+        my $found = -1;
+        for my $i ($cursor .. $#IDS_IN_ORDER) {
+            if ($IDS_IN_ORDER[$i] eq $want) { $found = $i; last }
+        }
+        if ($found < 0) { push @missing, "$want (absent, or out of order after index $cursor)" }
+        else            { $cursor = $found + 1 }
+    }
+    is_deeply(\@missing, [],
+        "C2: the pre-split ids appear in the table in their original relative order (SYN-1 .. SYN-26), later additions permitted");
+}
 
 # =====================================================================================
 # C3 -- every citation resolves. Enumerate every SYN-\d+ occurrence across all packages/*.md
