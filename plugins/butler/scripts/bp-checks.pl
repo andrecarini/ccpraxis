@@ -215,7 +215,13 @@ unless (caller) {
     }
 
     my $pkgdir = $opt{pkgdir}
-        // File::Spec->catdir(File::Basename::dirname($opt{blueprint}), 'packages');
+        // do {
+            # Normalise separators before dirname: --blueprint may arrive as a
+            # Windows backslash path, which File::Basename::dirname cannot split
+            # (it returns '.'), silently rooting the packages lookup at the CWD.
+            (my $bp = $opt{blueprint}) =~ s{\\}{/}g;
+            File::Spec->catdir(File::Basename::dirname($bp), 'packages');
+        };
     unless (-d $pkgdir) {
         print STDERR "bp-checks: packages dir not found: $pkgdir\n";
         exit 2;

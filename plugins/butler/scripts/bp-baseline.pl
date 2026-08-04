@@ -45,7 +45,18 @@ use Digest::SHA ();
 # `materialize` -- whose only use of BpCheckpoint is the OVERLAY half, well
 # after the destination directory already exists -- doesn't front-load that
 # cost onto the window before its SIGTERM handler has anything to guard.
-my $SELF_DIR = dirname(__FILE__);
+# NORMALISE SEPARATORS BEFORE dirname(). Invoked from PowerShell as
+#   perl C:\Users\X\.claude\ccpraxis\plugins\butler\scripts\bp-baseline.pl
+# __FILE__ is a BACKSLASH path, which File::Basename::dirname cannot split: it
+# returns '.', and rel2abs then turns that into the CALLER'S CWD. Every sibling
+# require and every relative lookup silently resolves against the wrong tree.
+# (Observed for real in bp-turn-caps.pl, whose config lookup became
+# "<cwd>/../turn-caps.json" and reported a missing file rather than the path bug
+# it actually was.) On Unix this substitution is a no-op -- a backslash is an
+# ordinary filename character there -- so the Unix path is byte-identical.
+my $_SELF = __FILE__;
+$_SELF =~ s{\\}{/}g;
+my $SELF_DIR = dirname($_SELF);
 # ...but `require` treats a RELATIVE path as an @INC search key, not a filename.
 # Invoked as `perl plugins/butler/scripts/bp-baseline.pl` (the ordinary CLI case)
 # dirname(__FILE__) is relative, so every require above died with
@@ -58,7 +69,9 @@ my $SELF_DIR = dirname(__FILE__);
 # Absolutise ONLY when relative: an already-absolute $SELF_DIR (including one
 # still carrying unresolved '..' segments, which is exactly what a $Bin-derived
 # caller passes) is left byte-identical, so the no-double-compile property the
-# comment above describes is preserved untouched.
+# lazy requires above depend on is preserved. NOT abs_path, for that same
+# reason: normalising away the '..' would make this file's require key differ
+# from the caller's and compile the sibling twice.
 $SELF_DIR = File::Spec->rel2abs($SELF_DIR) unless File::Spec->file_name_is_absolute($SELF_DIR);
 my ($_HAVE_CHECKPOINT, $_HAVE_JUDGE) = (0, 0);
 sub _require_checkpoint { return if $_HAVE_CHECKPOINT; require "$SELF_DIR/bp-checkpoint.pl"; $_HAVE_CHECKPOINT = 1; }

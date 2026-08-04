@@ -236,11 +236,17 @@ unless (caller) {
     }
 
     require File::Basename;
-    my $self_dir = File::Basename::dirname(__FILE__);
-    # `require` treats a relative path as an @INC search key, not a filename --
-    # the b40 defect. Absolutise before deriving anything from it.
-    $self_dir = File::Spec->rel2abs($self_dir)
-        unless File::Spec->file_name_is_absolute($self_dir);
+    require Cwd;
+    # dirname(abs_path(__FILE__)), matching bp-pin.pl -- and NOT
+    # rel2abs(dirname(__FILE__)), which is what this used to do and which broke
+    # on Windows. Invoked from PowerShell as
+    #   perl C:\Users\X\.claude\ccpraxis\plugins\butler\scripts\bp-turn-caps.pl
+    # __FILE__ is a BACKSLASH path; File::Basename::dirname cannot split it, so
+    # it returns '.', rel2abs turns that into the CWD, and the config lookup
+    # became "<cwd>/../turn-caps.json" -- a file that does not exist, reported as
+    # a missing config rather than as the path bug it was. abs_path normalises
+    # separators first, so it is stable under both invocation styles.
+    my $self_dir = File::Basename::dirname(Cwd::abs_path(__FILE__));
 
     my $root   = $opt{root}   // File::Spec->rel2abs("$self_dir/../../..");
     my $config = $opt{config} // "$self_dir/../turn-caps.json";
