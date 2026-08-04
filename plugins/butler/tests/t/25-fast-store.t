@@ -7,7 +7,7 @@
 # bp-fast-store.sh did not exist when it was authored.
 #
 #   * bp-fast-store.sh — CLI surface (2.1), path/slug resolution (2.3), the
-#     shell-unsafe guard (2.4), the .npmrc rewrite rule (2.5), the .gitignore
+#     shell-unsafe guard (2.4), the pnpm-workspace.yaml rewrite rule (2.5), the .gitignore
 #     append rule (2.6), the /backpack:add rendering (2.7), the exit-code table
 #     and verbatim messages (2.8), the deliberate omissions (2.9), environment
 #     independence (2.10) and the fixed execution order (3.1).
@@ -67,9 +67,15 @@ my $have_bash = do { my $o = `bash -c "printf bashok" 2>/dev/null`; (defined $o 
 # Verbatim strings from the spec (2.5, 2.6, 2.7). Changing any of these is a
 # spec change, not a test change.
 # ---------------------------------------------------------------------------
-my $NPMRC_MARKER = '# bp-fast-store: container-native pnpm store (managed lines below; keep .npmrc gitignored)';
+# RETARGETED 2026-08-04 (operator ruling SYN-27): pnpm 10+ silently IGNORES
+# kebab-case store-dir/virtual-store-dir written to .npmrc (confirmed broken,
+# spec b38-node-pnpm-toolchain 1.3). Layout (storeDir/virtualStoreDir) is
+# project-scoped in a gitignored pnpm-workspace.yaml, which pnpm actually
+# honours; supply-chain policy stays container-global via ENV PNPM_CONFIG_*
+# in the Containerfile. bp-fast-store.sh never writes .npmrc.
+my $WORKSPACE_MARKER = '# bp-fast-store: container-native pnpm store (managed lines below; keep pnpm-workspace.yaml gitignored)';
 my $GI_HEADER    = '# Added by bp-fast-store.sh (container-native pnpm store/virtual-store; container-specific paths, never commit)';
-my $RATIONALE    = 'container-native pnpm store via gitignored .npmrc (bp-fast-store.sh); the /root store and virtual-store are wiped on container rebuild, so node_modules must be re-materialized or its symlink tree dangles';
+my $RATIONALE    = 'container-native pnpm store via gitignored pnpm-workspace.yaml (bp-fast-store.sh); the /root store and virtual-store are wiped on container rebuild, so node_modules must be re-materialized or its symlink tree dangles';
 
 # ---------------------------------------------------------------------------
 # Local scaffolding (the spec is silent on fixture mechanics; these are ours).
@@ -86,7 +92,7 @@ my $ROOT     = abs_path($ROOT_RAW) // $ROOT_RAW;        # pwd -P vs a symlinked 
 # The repo's own .gitignore, snapshotted BEFORE anything runs (AC-19 ii), plus
 # the paths outside $ROOT that a runaway run would plausibly create (AC-19 iii).
 my $REPO_GI_BEFORE = slurp_raw($REPO_GI);
-my @CANARIES       = ('/project/.npmrc', '/project/.gitignore', '/project/node_modules',
+my @CANARIES       = ('/project/pnpm-workspace.yaml', '/project/.gitignore', '/project/node_modules',
                       '/root/.pnpm-store', '/root/my-proj-vstore', '/root/p-vstore');
 my %CANARY_BEFORE  = map { ($_ => (-e $_ ? 1 : 0)) } @CANARIES;
 
@@ -237,20 +243,22 @@ sub slug_of {
     return length $b ? $b : 'project';
 }
 
-# expected .npmrc bytes (spec 2.5 step 4).
-sub npmrc_expected {
+# expected pnpm-workspace.yaml bytes (spec 2.5 step 4, retargeted per SYN-27).
+sub workspace_expected {
     my ($store, $vstore, @prefix) = @_;
     my $c = '';
     $c .= join("\n", @prefix) . "\n\n" if @prefix;
-    return $c . "$NPMRC_MARKER\nstore-dir=$store\nvirtual-store-dir=$vstore\n";
+    return $c . "$WORKSPACE_MARKER\nstoreDir: $store\nvirtualStoreDir: $vstore\n";
 }
 
 # expected /backpack:add line (spec 2.7), including the trailing newline.
+# --verify asks pnpm ITSELF where its store is (behaviour, not presence — b38
+# D6) and confirms a real node_modules entry resolves into the virtual store.
 sub backpack_line {
-    my ($proj, $vstore, $slug) = @_;
+    my ($proj, $store, $vstore, $slug) = @_;
     return "/backpack:add --category 'project-setup' --name 'pnpm-install-$slug'"
          . qq{ --install 'cd "$proj" && pnpm install --frozen-lockfile'}
-         . qq{ --verify 'test -d "$proj/node_modules" && test -d "$vstore" && test -n "\$(ls -A "$vstore" 2>/dev/null)"'}
+         . qq{ --verify 'cd "$proj" && test -d node_modules && pnpm store path 2>/dev/null | grep -q "^$store" && test -n "\$(find node_modules -mindepth 1 -maxdepth 1 -type l -exec readlink -f {} + 2>/dev/null | grep "^$vstore" | head -1)"'}
          . " --rationale '$RATIONALE'\n";
 }
 
@@ -333,7 +341,7 @@ subtest 'AC-1 cli surface: help, unknown flag, missing value, positional, equals
 };
 
 # --- AC-2 -------------------------------------------------------------------
-subtest 'AC-2 npmrc created with store-dir + virtual-store-dir' => sub {
+subtest 'AC-2 workspace created with storeDir + virtualStoreDir' => sub {
     my $proj = mk_proj('alpha');
     my $P    = abs_path($proj);
     my $nat  = mk_native();
@@ -343,21 +351,22 @@ subtest 'AC-2 npmrc created with store-dir + virtual-store-dir' => sub {
 
     my ($rc, $out, $err) = run_fs(args => ['--project', $proj, '--native-root', $nat]);
     is($rc, 0, 'AC-2: exit 0') or diag($err);
-    ok(-f "$P/.npmrc", 'AC-2: <project>/.npmrc exists');
-    my $c = slurp("$P/.npmrc");
-    is($c, npmrc_expected($S, $V),
-       'AC-2: .npmrc is exactly marker + store-dir + virtual-store-dir, one trailing newline');
-    is(count_lines_like($c, qr/^store-dir=/),         1, 'AC-2: exactly one store-dir line');
-    is(count_lines_like($c, qr/^virtual-store-dir=/), 1, 'AC-2: exactly one virtual-store-dir line');
-    is(count_lines_like($c, qr/^\Q$NPMRC_MARKER\E$/), 1, 'AC-2: verbatim marker line present once');
-    unlike($c, qr/^\s*(store-dir|virtual-store-dir)\s+=/m, 'AC-2: no spaces around either =');
-    unlike($c, qr/=\s/, 'AC-2: no space after either =');
+    ok(-f "$P/pnpm-workspace.yaml", 'AC-2: <project>/pnpm-workspace.yaml exists');
+    my $c = slurp("$P/pnpm-workspace.yaml");
+    is($c, workspace_expected($S, $V),
+       'AC-2: pnpm-workspace.yaml is exactly marker + storeDir + virtualStoreDir, one trailing newline');
+    is(count_lines_like($c, qr/^storeDir: /),         1, 'AC-2: exactly one storeDir line');
+    is(count_lines_like($c, qr/^virtualStoreDir: /), 1, 'AC-2: exactly one virtualStoreDir line');
+    is(count_lines_like($c, qr/^\Q$WORKSPACE_MARKER\E$/), 1, 'AC-2: verbatim marker line present once');
+    unlike($c, qr/^\s*(storeDir|virtualStoreDir)\s+:/m, 'AC-2: no space before either colon');
+    like($c, qr/^storeDir: \S/m,         'AC-2: exactly one space after the storeDir colon');
+    like($c, qr/^virtualStoreDir: \S/m,  'AC-2: exactly one space after the virtualStoreDir colon');
 
     done_testing();
 };
 
 # --- AC-3 -------------------------------------------------------------------
-subtest 'AC-3 npmrc rerun is byte-identical' => sub {
+subtest 'AC-3 workspace rerun is byte-identical' => sub {
     my $proj = mk_proj('rerun');
     my $P    = abs_path($proj);
     my $nat  = mk_native();
@@ -365,21 +374,21 @@ subtest 'AC-3 npmrc rerun is byte-identical' => sub {
 
     my ($rc1, undef, $e1) = run_fs(args => \@args);
     is($rc1, 0, 'AC-3: first run exits 0') or diag($e1);
-    my $first = slurp("$P/.npmrc");
+    my $first = slurp("$P/pnpm-workspace.yaml");
 
     my ($rc2, undef, $e2) = run_fs(args => \@args);
     is($rc2, 0, 'AC-3: second run exits 0') or diag($e2);
-    my $second = slurp("$P/.npmrc");
+    my $second = slurp("$P/pnpm-workspace.yaml");
 
-    is($second, $first, 'AC-3: .npmrc is byte-identical after an identical re-run (fixed point)');
-    is(count_lines_like($second, qr/^store-dir=/),         1, 'AC-3: still exactly one store-dir line');
-    is(count_lines_like($second, qr/^virtual-store-dir=/), 1, 'AC-3: still exactly one virtual-store-dir line');
+    is($second, $first, 'AC-3: pnpm-workspace.yaml is byte-identical after an identical re-run (fixed point)');
+    is(count_lines_like($second, qr/^storeDir: /),        1, 'AC-3: still exactly one storeDir line');
+    is(count_lines_like($second, qr/^virtualStoreDir: /), 1, 'AC-3: still exactly one virtualStoreDir line');
 
     done_testing();
 };
 
 # --- AC-4 -------------------------------------------------------------------
-subtest 'AC-4 npmrc updates managed keys and preserves unrelated keys' => sub {
+subtest 'AC-4 workspace updates managed keys and preserves unrelated keys' => sub {
     my $proj = mk_proj('preserve');
     my $P    = abs_path($proj);
     my $nat  = mk_native();
@@ -387,27 +396,27 @@ subtest 'AC-4 npmrc updates managed keys and preserves unrelated keys' => sub {
     my $S    = "$nat/.pnpm-store";
     my $V    = "$nat/$slug-vstore";
 
-    spit("$P/.npmrc", "auto-install-peers=true\nstore-dir=/old/store\n//registry.example.com/:_authToken=xyz\n");
+    spit("$P/pnpm-workspace.yaml", "packages:\n  - 'apps/*'\nstoreDir: /old/store\nlinkWorkspacePackages: true\n");
 
     my @args = ('--project', $proj, '--native-root', $nat);
     my ($rc, undef, $err) = run_fs(args => \@args);
     is($rc, 0, 'AC-4: exit 0') or diag($err);
 
-    my $c = slurp("$P/.npmrc");
-    is($c, npmrc_expected($S, $V, 'auto-install-peers=true', '//registry.example.com/:_authToken=xyz'),
+    my $c = slurp("$P/pnpm-workspace.yaml");
+    is($c, workspace_expected($S, $V, "packages:", "  - 'apps/*'", 'linkWorkspacePackages: true'),
        'AC-4: preserved prefix, blank line, marker, then the two managed keys (2.5 worked example)');
-    is(count_lines_like($c, qr/^store-dir=/),         1, 'AC-4: exactly one store-dir line');
-    is(count_lines_like($c, qr/^virtual-store-dir=/), 1, 'AC-4: exactly one virtual-store-dir line');
-    like($c, qr/^store-dir=\Q$S\E$/m, 'AC-4: store-dir carries the NEW value');
+    is(count_lines_like($c, qr/^storeDir: /),        1, 'AC-4: exactly one storeDir line');
+    is(count_lines_like($c, qr/^virtualStoreDir: /), 1, 'AC-4: exactly one virtualStoreDir line');
+    like($c, qr/^storeDir: \Q$S\E$/m, 'AC-4: storeDir carries the NEW value');
     unlike($c, qr{/old/store}, 'AC-4: the old store value appears nowhere');
-    like($c, qr/^\Qauto-install-peers=true\E$/m, 'AC-4: unrelated key preserved verbatim');
-    like($c, qr{^\Q//registry.example.com/:_authToken=xyz\E$}m, 'AC-4: auth token line preserved verbatim');
-    ok(index($c, 'auto-install-peers=true') < index($c, '//registry.example.com/:_authToken=xyz'),
+    like($c, qr/^\Qpackages:\E$/m, 'AC-4: unrelated key preserved verbatim');
+    like($c, qr{^\QlinkWorkspacePackages: true\E$}m, 'AC-4: second unrelated key preserved verbatim');
+    ok(index($c, 'packages:') < index($c, 'linkWorkspacePackages: true'),
        'AC-4: unrelated lines keep their original relative order');
 
     my ($rc2, undef, $e2) = run_fs(args => \@args);
     is($rc2, 0, 'AC-4: second identical run exits 0') or diag($e2);
-    is(slurp("$P/.npmrc"), $c, 'AC-4: a second identical run is byte-identical');
+    is(slurp("$P/pnpm-workspace.yaml"), $c, 'AC-4: a second identical run is byte-identical');
 
     done_testing();
 };
@@ -422,8 +431,8 @@ subtest 'AC-5 gitignore skips out-of-tree native paths' => sub {
     is($rc, 0, 'AC-5: exit 0') or diag($err);
 
     my $gi = slurp("$P/.gitignore");
-    is($gi, "$GI_HEADER\n.npmrc\nnode_modules/\n",
-       'AC-5: fresh .gitignore is exactly header + .npmrc + node_modules/ (no leading blank line)');
+    is($gi, "$GI_HEADER\npnpm-workspace.yaml\nnode_modules/\n",
+       'AC-5: fresh .gitignore is exactly header + pnpm-workspace.yaml + node_modules/ (no leading blank line)');
     is(count_lines_like($gi, qr/^\Q$GI_HEADER\E$/), 1, 'AC-5: the header appears exactly once');
     unlike($gi, qr/\Q$nat\E/,     'AC-5: no line mentions the out-of-tree native root');
     unlike($gi, qr/\.pnpm-store/, 'AC-5: no out-of-tree store entry');
@@ -442,8 +451,8 @@ subtest 'AC-6 gitignore includes in-tree native paths, project-relative' => sub 
     is($rc, 0, 'AC-6: exit 0') or diag($err);
 
     my $gi = slurp("$P/.gitignore");
-    is($gi, "$GI_HEADER\n.npmrc\nnode_modules/\nnative/.pnpm-store/\nnative/$slug-vstore/\n",
-       'AC-6: header then .npmrc, node_modules/, native/.pnpm-store/, native/<slug>-vstore/ in canonical order');
+    is($gi, "$GI_HEADER\npnpm-workspace.yaml\nnode_modules/\nnative/.pnpm-store/\nnative/$slug-vstore/\n",
+       'AC-6: header then pnpm-workspace.yaml, node_modules/, native/.pnpm-store/, native/<slug>-vstore/ in canonical order');
     unlike($gi, qr{^\./}m,       'AC-6: no leading ./ on any entry');
     unlike($gi, qr{^/}m,         'AC-6: no absolute path in .gitignore');
     unlike($gi, qr/\Q$P\E/,      'AC-6: the project prefix is stripped from the entries');
@@ -475,12 +484,12 @@ subtest 'AC-7 gitignore rerun adds nothing and preserves existing lines' => sub 
     my ($rc3, undef, $e3) = run_fs(args => ['--project', $proj2, '--native-root', $nat2]);
     is($rc3, 0, 'AC-7 (ii): run exits 0') or diag($e3);
     my $gi2 = slurp("$P2/.gitignore");
-    is($gi2, "*.log\nnode_modules\n\n$GI_HEADER\n.npmrc\n",
+    is($gi2, "*.log\nnode_modules\n\n$GI_HEADER\npnpm-workspace.yaml\n",
        'AC-7 (ii): existing bytes, one blank line, header, then only the missing entry (2.6 worked example)');
     is(count_lines_like($gi2, qr/^\Q*.log\E$/),       1, 'AC-7 (ii): *.log preserved verbatim');
     is(count_lines_like($gi2, qr/^node_modules$/),    1, 'AC-7 (ii): the bare node_modules line is preserved');
     is(count_lines_like($gi2, qr{^node_modules/$}),   0, 'AC-7 (ii): node_modules/ was NOT added (bare form counts as present)');
-    is(count_lines_like($gi2, qr/^\.npmrc$/),         1, 'AC-7 (ii): .npmrc WAS added');
+    is(count_lines_like($gi2, qr/^pnpm-workspace\.yaml$/), 1, 'AC-7 (ii): pnpm-workspace.yaml WAS added');
     is(count_lines_like($gi2, qr/^\Q$GI_HEADER\E$/),  1, 'AC-7 (ii): the header appears exactly once');
 
     # (iii) every candidate already present => the file is not written at all
@@ -488,7 +497,7 @@ subtest 'AC-7 gitignore rerun adds nothing and preserves existing lines' => sub 
     my $P3    = abs_path($proj3);
     my $nat3  = mk_native();
     my $gi3p  = "$P3/.gitignore";
-    spit($gi3p, ".npmrc\nnode_modules/\n");
+    spit($gi3p, "pnpm-workspace.yaml\nnode_modules/\n");
     my $before = slurp($gi3p);
     my $stamp  = time - 10_000;
     utime($stamp, $stamp, $gi3p) or diag("utime failed on $gi3p: $!");
@@ -526,11 +535,12 @@ subtest 'AC-9 backpack line renders byte-exact' => sub {
     my $P    = abs_path($proj);
     my $nat  = mk_native();
     my $slug = slug_of($P);
+    my $S    = "$nat/.pnpm-store";
     my $V    = "$nat/$slug-vstore";
 
     my ($rc, $out, $err) = run_fs(args => ['--project', $proj, '--native-root', $nat]);
     is($rc, 0, 'AC-9: exit 0') or diag($err);
-    is($out, backpack_line($P, $V, $slug),
+    is($out, backpack_line($P, $S, $V, $slug),
        'AC-9: stdout equals the 2.7 rendering byte for byte (five flags, canonical order, single-quoted values)');
 
     done_testing();
@@ -542,6 +552,7 @@ subtest 'AC-10 backpack line omits --version and path, verify checks the native 
     my $P    = abs_path($proj);
     my $nat  = mk_native();
     my $slug = slug_of($P);
+    my $S    = "$nat/.pnpm-store";
     my $V    = "$nat/$slug-vstore";
 
     my ($rc, $out, $err) = run_fs(args => ['--project', $proj, '--native-root', $nat]);
@@ -557,8 +568,10 @@ subtest 'AC-10 backpack line omits --version and path, verify checks the native 
     like($line, qr/--category 'project-setup'/,
          "AC-10: the category token is exactly 'project-setup'");
     unlike($line, qr/project_setup/, 'AC-10: not the non-enum spelling project_setup');
+    like($line, qr/\Q$S\E/,   'AC-10: --verify names the native store (pnpm store path check)');
     like($line, qr/\Q$V\E/,   'AC-10: --verify names the native virtual store, not only node_modules');
-    like($line, qr/ls -A /,   'AC-10: --verify includes an ls -A non-empty check');
+    like($line, qr/pnpm store path/, 'AC-10: --verify asks pnpm itself where its store is (behaviour, not presence)');
+    like($line, qr/readlink -f/,     'AC-10: --verify resolves a real node_modules symlink target');
 
     done_testing();
 };
@@ -569,6 +582,7 @@ subtest 'AC-11 backpack line survives shell word-splitting without expansion' =>
     my $P    = abs_path($proj);
     my $nat  = mk_native();
     my $slug = slug_of($P);
+    my $S    = "$nat/.pnpm-store";
     my $V    = "$nat/$slug-vstore";
 
     my ($rc, $out, $err) = run_fs(args => ['--project', $proj, '--native-root', $nat]);
@@ -578,7 +592,7 @@ subtest 'AC-11 backpack line survives shell word-splitting without expansion' =>
 
     my @tok = bash_split($argtext);
     my $install = qq{cd "$P" && pnpm install --frozen-lockfile};
-    my $verify  = qq{test -d "$P/node_modules" && test -d "$V" && test -n "\$(ls -A "$V" 2>/dev/null)"};
+    my $verify  = qq{cd "$P" && test -d node_modules && pnpm store path 2>/dev/null | grep -q "^$S" && test -n "\$(find node_modules -mindepth 1 -maxdepth 1 -type l -exec readlink -f {} + 2>/dev/null | grep "^$V" | head -1)"};
     is(scalar @tok, 10, 'AC-11: word-splitting the argument portion yields exactly 10 tokens');
     is_deeply(\@tok,
               ['--category', 'project-setup',
@@ -587,8 +601,8 @@ subtest 'AC-11 backpack line survives shell word-splitting without expansion' =>
                '--verify',   $verify,
                '--rationale',$RATIONALE],
               'AC-11: the ten tokens are the five flags and their five unmangled values');
-    ok(defined $tok[7] && index($tok[7], '$(ls -A ') >= 0,
-       'AC-11: the --verify token still contains the LITERAL $(ls -A  (no command substitution at paste time)');
+    ok(defined $tok[7] && index($tok[7], '$(find node_modules') >= 0,
+       'AC-11: the --verify token still contains the LITERAL $(find node_modules  (no command substitution at paste time)');
 
     done_testing();
 };
@@ -606,7 +620,7 @@ subtest 'AC-12 pnpm missing aborts with exit 3 and no side effects' => sub {
     like($err, qr/^butler: missing required command: pnpm$/m, 'AC-12: require_cmd house line on stderr');
     like($err, qr/^bp-fast-store: pnpm is required/m,         'AC-12: the bp-fast-store line on stderr');
     is($out, '', 'AC-12: stdout is empty');
-    ok(!-e "$P/.npmrc",    'AC-12: no .npmrc was written');
+    ok(!-e "$P/pnpm-workspace.yaml", 'AC-12: no pnpm-workspace.yaml was written');
     ok(!-e "$P/.gitignore",'AC-12: no .gitignore was written');
     ok(!-e "$nat/.pnpm-store",     'AC-12: the native store dir was not created');
     ok(!-e "$nat/$slug-vstore",    'AC-12: the native virtual-store dir was not created');
@@ -646,7 +660,7 @@ subtest 'AC-14 native store parent is a regular file: exit 5 (ENOTDIR seam)' => 
     is($rc, 5, 'AC-14: exit 5 when mkdir -p on the store path hits ENOTDIR') or diag($err);
     like($err, qr/^bp-fast-store: cannot create native store dir: /m, 'AC-14: verbatim stderr message');
     is($out, '', 'AC-14: stdout is empty');
-    ok(!-e "$P/.npmrc",     'AC-14: no .npmrc was written');
+    ok(!-e "$P/pnpm-workspace.yaml", 'AC-14: no pnpm-workspace.yaml was written');
     ok(!-e "$P/.gitignore", 'AC-14: no .gitignore was written');
     ok(-f $file, 'AC-14: the regular file used as the seam is untouched');
 
@@ -666,7 +680,7 @@ subtest 'AC-15 native virtual-store unusable: exit 5 before any project write' =
     is($rc, 5, 'AC-15: exit 5 when the virtual-store parent is a regular file') or diag($err);
     like($err, qr/cannot create native virtual-store dir/, 'AC-15: verbatim stderr message');
     is($out, '', 'AC-15: stdout is empty');
-    ok(!-e "$P/.npmrc",     'AC-15: .npmrc still does not exist (native validation precedes every project write)');
+    ok(!-e "$P/pnpm-workspace.yaml", 'AC-15: pnpm-workspace.yaml still does not exist (native validation precedes every project write)');
     ok(!-e "$P/.gitignore", 'AC-15: .gitignore still does not exist');
 
     done_testing();
@@ -691,7 +705,7 @@ subtest 'AC-16 shell-unsafe and identical paths rejected with exit 2' => sub {
         is($rc, 2, "AC-16 [$label]: exit 2") or diag($err);
         like($err, $re, "AC-16 [$label]: the matching stderr message");
         is($out, '', "AC-16 [$label]: stdout is empty");
-        ok(!-e "$P/.npmrc",     "AC-16 [$label]: no .npmrc");
+        ok(!-e "$P/pnpm-workspace.yaml", "AC-16 [$label]: no pnpm-workspace.yaml");
         ok(!-e "$P/.gitignore", "AC-16 [$label]: no .gitignore");
         ok(!-e $_, "AC-16 [$label]: no native dir was created at $_") for @$nots;
     }
@@ -780,11 +794,11 @@ subtest 'AC-22 defaults pinned in source; native-root derivation and slug' => su
 
     my ($rc, $out, $err) = run_fs(args => ['--project', $proj, '--native-root', $nat]);
     is($rc, 0, 'AC-22 (ii): exit 0 for a project basename with a space and a bang') or diag($err);
-    my $c = slurp("$P/.npmrc");
-    is($c, npmrc_expected("$nat/.pnpm-store", "$nat/my-proj-vstore"),
-       'AC-22 (ii): .npmrc names <native-root>/.pnpm-store and <native-root>/<slug>-vstore');
-    like($c, qr{^store-dir=\Q$nat\E/\.pnpm-store$}m,           'AC-22 (ii): store-dir derivation');
-    like($c, qr{^virtual-store-dir=\Q$nat\E/my-proj-vstore$}m, 'AC-22 (iii): the virtual store carries the slug');
+    my $c = slurp("$P/pnpm-workspace.yaml");
+    is($c, workspace_expected("$nat/.pnpm-store", "$nat/my-proj-vstore"),
+       'AC-22 (ii): pnpm-workspace.yaml names <native-root>/.pnpm-store and <native-root>/<slug>-vstore');
+    like($c, qr{^storeDir: \Q$nat\E/\.pnpm-store$}m,           'AC-22 (ii): storeDir derivation');
+    like($c, qr{^virtualStoreDir: \Q$nat\E/my-proj-vstore$}m, 'AC-22 (iii): the virtual store carries the slug');
     like($out, qr/--name 'pnpm-install-my-proj'/, 'AC-22 (iii): the backpack item name carries the slug');
 
     done_testing();
@@ -826,16 +840,17 @@ subtest 'AC-29 explicit --project beats BP_PROJECT_ROOT and a spoofed PWD' => su
     my $P    = abs_path($proj);
     my $nat  = mk_native();
     my $slug = slug_of($P);
+    my $S    = "$nat/.pnpm-store";
     my $V    = "$nat/$slug-vstore";
     my ($rc, $out, $err) = run_fs(args => ['--project', $proj, '--native-root', $nat],
                                   env => \%DECOY, pwd => $decoy);
     is($rc, 0, 'AC-29 (i): exit 0 with the decoy env and a spoofed PWD') or diag($err);
-    ok(-f "$P/.npmrc", 'AC-29 (i): the .npmrc lands in the --project dir');
-    is(slurp("$P/.npmrc"), npmrc_expected("$nat/.pnpm-store", $V),
-       'AC-29 (i): .npmrc content is exactly what --project/--native-root dictate');
-    is($out, backpack_line($P, $V, $slug),
+    ok(-f "$P/pnpm-workspace.yaml", 'AC-29 (i): the pnpm-workspace.yaml lands in the --project dir');
+    is(slurp("$P/pnpm-workspace.yaml"), workspace_expected($S, $V),
+       'AC-29 (i): pnpm-workspace.yaml content is exactly what --project/--native-root dictate');
+    is($out, backpack_line($P, $S, $V, $slug),
        'AC-29 (i): the backpack line names the --project dir, not BP_PROJECT_ROOT');
-    ok(!-e "$decoy/.npmrc",     'AC-29 (i): the decoy dir gained no .npmrc');
+    ok(!-e "$decoy/pnpm-workspace.yaml", 'AC-29 (i): the decoy dir gained no pnpm-workspace.yaml');
     ok(!-e "$decoy/.gitignore", 'AC-29 (i): the decoy dir gained no .gitignore');
     unlike($out, qr/\Q$decoy\E/, 'AC-29 (i): no decoy path leaks into the emitted line');
 
@@ -844,16 +859,17 @@ subtest 'AC-29 explicit --project beats BP_PROJECT_ROOT and a spoofed PWD' => su
     my $P2    = abs_path($proj2);
     my $nat2  = mk_native();
     my $slug2 = slug_of($P2);
+    my $S2    = "$nat2/.pnpm-store";
     my $V2    = "$nat2/$slug2-vstore";
     my ($rc2, $out2, $err2) = run_fs(args => ['--native-root', $nat2],
                                      env => \%DECOY, cwd => $proj2, pwd => $decoy);
     is($rc2, 0, 'AC-29 (ii): exit 0 with --project omitted') or diag($err2);
-    ok(-f "$P2/.npmrc", 'AC-29 (ii): the working directory is configured, not BP_PROJECT_ROOT');
-    is(slurp("$P2/.npmrc"), npmrc_expected("$nat2/.pnpm-store", $V2),
-       'AC-29 (ii): .npmrc content matches the cwd project (pwd -P is authoritative)');
-    is($out2, backpack_line($P2, $V2, $slug2),
+    ok(-f "$P2/pnpm-workspace.yaml", 'AC-29 (ii): the working directory is configured, not BP_PROJECT_ROOT');
+    is(slurp("$P2/pnpm-workspace.yaml"), workspace_expected($S2, $V2),
+       'AC-29 (ii): pnpm-workspace.yaml content matches the cwd project (pwd -P is authoritative)');
+    is($out2, backpack_line($P2, $S2, $V2, $slug2),
        'AC-29 (ii): the backpack line names the cwd project, not the spoofed PWD');
-    ok(!-e "$decoy/.npmrc",     'AC-29 (ii): the decoy dir still has no .npmrc');
+    ok(!-e "$decoy/pnpm-workspace.yaml", 'AC-29 (ii): the decoy dir still has no pnpm-workspace.yaml');
     ok(!-e "$decoy/.gitignore", 'AC-29 (ii): the decoy dir still has no .gitignore');
     is_deeply(tree_rel($decoy), [], 'AC-29: nothing at all was written into the decoy dir');
 
@@ -876,12 +892,13 @@ subtest 'AC-19 writes are confined to the project and native dirs' => sub {
     is($rc, 0, 'AC-19: exit 0') or diag($err);
 
     my $tree = tree_rel($P);
-    is_deeply($tree, ['.gitignore', '.npmrc'],
-              'AC-19 (i): the only paths under <project> are .npmrc and .gitignore');
+    is_deeply($tree, ['.gitignore', 'pnpm-workspace.yaml'],
+              'AC-19 (i): the only paths under <project> are pnpm-workspace.yaml and .gitignore');
     is_deeply([ grep { m{(^|/)node_modules(/|$)} } @$tree ], [], 'AC-19 (i): no node_modules created');
     is_deeply([ grep { /\.tmp$/ } @$tree ], [], 'AC-19 (i): no *.tmp leftovers');
-    is_deeply([ grep { /^\.npmrc\..+/ } @$tree ], [], 'AC-19 (i): no .npmrc.* temp file survived');
+    is_deeply([ grep { /^pnpm-workspace\.yaml\..+/ } @$tree ], [], 'AC-19 (i): no pnpm-workspace.yaml.* temp file survived');
     is_deeply([ grep { /^\.gitignore\..+/ } @$tree ], [], 'AC-19 (i): no .gitignore.* temp file survived');
+    is_deeply([ grep { /^\.bp-fast-store\.tmp\./ } @$tree ], [], 'AC-19 (i): no stray .bp-fast-store.tmp.* file survived');
     is_deeply([ grep { /lock/i } @$tree ], [], 'AC-19 (i): no lockfile created');
 
     ok(defined $REPO_GI_BEFORE, 'AC-19 (ii): the repo .gitignore was readable at file start')
@@ -894,8 +911,8 @@ subtest 'AC-19 writes are confined to the project and native dirs' => sub {
     # before this file started.
     my @appeared = grep { !$CANARY_BEFORE{$_} && -e $_ } @CANARIES;
     is_deeply(\@appeared, [], 'AC-19 (iii): no path outside $ROOT was created by any invocation');
-    ok(!-e "$CHILD_CWD/.npmrc",
-       'AC-19 (iii): the scratch cwd gained no .npmrc (no run silently defaulted to its own cwd)');
+    ok(!-e "$CHILD_CWD/pnpm-workspace.yaml",
+       'AC-19 (iii): the scratch cwd gained no pnpm-workspace.yaml (no run silently defaulted to its own cwd)');
 
     done_testing();
 };
@@ -1106,14 +1123,15 @@ subtest 'AC-30 an empty flag value is not treated as an absent flag' => sub {
     # REVIEWER BLOCKER (bp-fast-store.sh:157): `[ -z "$PROJECT_IN" ]` conflated
     # "flag absent" with "flag given empty", so `--project ''` fell back to $PWD
     # and configured the CALLER'S CWD, exit 0. Run from /project (as a coordinator
-    # would) that writes /project/.npmrc + /project/.gitignore — an edit outside
-    # this package's write set, and exactly what spec 3.7 exists to prevent.
+    # would) that writes /project/pnpm-workspace.yaml + /project/.gitignore — an
+    # edit outside this package's write set, and exactly what spec 3.7 exists to
+    # prevent.
     my $victim = mk_proj('victim');
     my ($rc, $out, $err) = run_fs(args => ['--project', ''], cwd => $victim);
     is($rc, 6, 'AC-30: --project "" exits 6 (the -d check runs on the given value)')
         or diag($err);
     is($out, '', 'AC-30: nothing is emitted on stdout');
-    ok(!-e "$victim/.npmrc",    'AC-30: the caller cwd did NOT get a .npmrc');
+    ok(!-e "$victim/pnpm-workspace.yaml", 'AC-30: the caller cwd did NOT get a pnpm-workspace.yaml');
     ok(!-e "$victim/.gitignore",'AC-30: the caller cwd did NOT get a .gitignore');
 
     # Same conflation on the native-path flags: an empty value there silently put
@@ -1123,41 +1141,41 @@ subtest 'AC-30 an empty flag value is not treated as an absent flag' => sub {
         my ($r, $o2, $e2) = run_fs(args => ['--project', $p, $flag, '']);
         is($r, 2, "AC-30: $flag '' is a usage error (exit 2)") or diag($e2);
         is($o2, '', "AC-30: $flag '' emits nothing on stdout");
-        ok(!-e "$p/.npmrc", "AC-30: $flag '' wrote no .npmrc");
+        ok(!-e "$p/pnpm-workspace.yaml", "AC-30: $flag '' wrote no pnpm-workspace.yaml");
     }
     done_testing();
 };
 
 subtest 'AC-31 write_atomic preserves the destination file mode' => sub {
     # REVIEWER MAJOR (bp-fast-store.sh:99-111): mv carried the temp file's umask
-    # mode onto the destination, so a 0600 .npmrc became 0644. Spec 2.5's own
-    # example keeps a registry _authToken in the preserved prefix, so this
-    # world-readabled a credentials file on every run.
+    # mode onto the destination, so a 0600 pnpm-workspace.yaml became 0644. This
+    # would world-readable a project file that (per SYN-27) legitimately embeds
+    # container-specific /root/... paths on every run.
     my $p = mk_proj('mode');
-    spit("$p/.npmrc", "//registry.example.com/:_authToken=SECRET\n");
-    chmod 0600, "$p/.npmrc" or die "chmod: $!";
+    spit("$p/pnpm-workspace.yaml", "packages:\n  - 'SECRET-package-name'\n");
+    chmod 0600, "$p/pnpm-workspace.yaml" or die "chmod: $!";
     spit("$p/.gitignore", "*.log\n");
     chmod 0640, "$p/.gitignore" or die "chmod: $!";
 
     my ($rc, $out, $err) = run_fs(args => ['--project', $p, '--native-root', mk_native()]);
     is($rc, 0, 'AC-31: the run succeeds') or diag($err);
-    is((stat("$p/.npmrc"))[2] & 07777, 0600,
-       'AC-31: a 0600 .npmrc is still 0600 after the rewrite (token not world-readable)');
+    is((stat("$p/pnpm-workspace.yaml"))[2] & 07777, 0600,
+       'AC-31: a 0600 pnpm-workspace.yaml is still 0600 after the rewrite (not world-readable)');
     is((stat("$p/.gitignore"))[2] & 07777, 0640,
        'AC-31: a 0640 .gitignore keeps its mode');
-    like(slurp("$p/.npmrc"), qr/_authToken=SECRET/, 'AC-31: the token is still preserved');
-    unlike($out, qr/SECRET/, 'AC-31: the token never reaches stdout');
-    unlike($err, qr/SECRET/, 'AC-31: the token never reaches stderr');
+    like(slurp("$p/pnpm-workspace.yaml"), qr/SECRET-package-name/, 'AC-31: the preserved content is still there');
+    unlike($out, qr/SECRET/, 'AC-31: the sensitive content never reaches stdout');
+    unlike($err, qr/SECRET/, 'AC-31: the sensitive content never reaches stderr');
     done_testing();
 };
 
 subtest 'AC-32 a config path that is a directory fails loudly, not silently' => sub {
-    # RED-TEAM MEDIUM-1 (bp-fast-store.sh:106, write_atomic): when .npmrc already
-    # existed as a DIRECTORY, `mv -f` moved the temp file INTO it and returned 0,
-    # so the script exited 0 and printed the backpack line while pnpm was left
-    # completely unconfigured — a silent no-op, plus a stray temp file. Spec 2.8 /
-    # 3.1 require exit 6 on a failed write.
-    for my $victim (qw(.npmrc .gitignore)) {
+    # RED-TEAM MEDIUM-1 (bp-fast-store.sh:106, write_atomic): when the config
+    # path already existed as a DIRECTORY, `mv -f` moved the temp file INTO it
+    # and returned 0, so the script exited 0 and printed the backpack line while
+    # pnpm was left completely unconfigured — a silent no-op, plus a stray temp
+    # file. Spec 2.8 / 3.1 require exit 6 on a failed write.
+    for my $victim (qw(pnpm-workspace.yaml .gitignore)) {
         my $p = mk_proj('isdir');
         make_path("$p/$victim");
         my ($rc, $out, $err) = run_fs(args => ['--project', $p, '--native-root', mk_native()]);
