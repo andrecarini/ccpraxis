@@ -26,6 +26,7 @@ use warnings;
 use FindBin qw($Bin);
 use Cwd qw(abs_path);
 use File::Spec;
+use File::Basename ();
 use File::Path qw(remove_tree make_path);
 use MIME::Base64 qw(encode_base64 decode_base64);
 
@@ -46,10 +47,55 @@ my $home = $ENV{HOME} // $ENV{USERPROFILE}
 # $Bin is .../ccpraxis/scripts; one up is the repo root. abs_path collapses
 # the `..` so the path we display (and store inside Windows junctions) is
 # a clean absolute path.
-my $repo_root  = abs_path(File::Spec->catdir($Bin, '..'))
-    // die "ERROR: cannot resolve repo root from $Bin\n";
+#
+# DO NOT TRUST $Bin ALONE. Invoked from PowerShell with a BACKSLASH absolute
+# path (`perl C:\Users\X\.claude\ccpraxis\scripts\install-skills.pl`), FindBin
+# cannot split the directory off $0 and silently falls back to the CWD. With
+# the user cd'd into the repo root, $Bin became the repo root and $Bin/..
+# became ~/.claude — so $skills_src resolved to ~/.claude/skills, THE TARGET.
+# `apply` then enumerated the user's installed skills, removed each one, and
+# failed to recreate it (source and destination being the same path). That
+# really happened, and it deleted three installed skills.
+#
+# So derive the directory from $0 ourselves, normalising separators first, and
+# fall back to $Bin only when that yields nothing usable.
+my $script_dir = $Bin;
+if (defined $0 && length $0) {
+    (my $norm = $0) =~ s{\\}{/}g;
+    if ($norm =~ m{/}) {
+        my $d = File::Basename::dirname($norm);
+        $script_dir = $d if length $d && -d $d;
+    }
+}
+
+my $repo_root  = abs_path(File::Spec->catdir($script_dir, '..'))
+    // die "ERROR: cannot resolve repo root from $script_dir\n";
 my $skills_src = File::Spec->catdir($repo_root, 'skills');
 my $skills_dst = File::Spec->catdir($home, '.claude', 'skills');
+
+# ── Guards. Each one turns a silent mis-resolution into a refusal ──
+#
+# These are the safety net the failure above lacked. apply() is
+# nuke-and-recreate, so a wrong $skills_src is not a no-op: it DELETES.
+
+# 1. Source must not be the target. This alone would have prevented the loss.
+{
+    my $s = abs_path($skills_src) // $skills_src;
+    my $d = abs_path($skills_dst) // $skills_dst;
+    s{/+$}{} for ($s, $d);
+    die "ERROR: refusing to run — source and target resolved to the SAME directory:\n"
+      . "         $s\n"
+      . "       This means the repo root was mis-detected (repo root: $repo_root).\n"
+      . "       Re-run from the repo with a forward-slash or relative path, e.g.\n"
+      . "         cd <repo> && perl scripts/install-skills.pl $mode\n"
+        if lc($s) eq lc($d);
+}
+
+# 2. The resolved repo root must actually look like this repo. Catches every
+#    other way $0/$Bin can point somewhere unexpected, not just the one above.
+die "ERROR: '$repo_root' does not look like the ccpraxis repo (no plugins/ directory).\n"
+  . "       Refusing to touch $skills_dst.\n"
+    unless -d File::Spec->catdir($repo_root, 'plugins');
 
 die "ERROR: $skills_src does not exist\n" unless -d $skills_src;
 
@@ -117,6 +163,15 @@ for my $a (@actions) {
 
     if ($action eq 'ok') {
         $skipped++;
+        next;
+    }
+
+    # Defence in depth, at the destructive step itself. The guards above should
+    # make this unreachable; it exists because the ONE time this went wrong, the
+    # thing that ran was remove_tree on a path that was also the source.
+    if (lc(abs_path($src) // $src) eq lc(abs_path($dst) // $dst)) {
+        warn "  ERROR: refusing to remove $dst — it is the same path as the source.\n";
+        $failed++;
         next;
     }
 
