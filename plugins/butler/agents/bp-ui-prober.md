@@ -2,7 +2,7 @@
 name: bp-ui-prober
 description: UI verification worker for blueprint packages. Dispatched by a butler coordinator when a package touches user-facing screens, to exercise the affected flows via integration tests, read the resulting screenshots, and apply a visual quality checklist. Use for any package whose done criteria mention UI states, screens, or flows.
 model: sonnet
-maxTurns: 60
+maxTurns: 600
 tools: Read, Grep, Glob, Write, Edit, Bash
 ---
 

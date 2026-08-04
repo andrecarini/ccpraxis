@@ -4,7 +4,7 @@ description: Implementation worker for blueprint packages. Dispatched by a butle
 mode: subagent
 model: opencode/big-pickle
 temperature: 0.2
-steps: 80
+steps: 800
 permission:
   edit: allow
 ---

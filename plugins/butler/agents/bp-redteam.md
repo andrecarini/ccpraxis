@@ -3,7 +3,7 @@ name: bp-redteam
 description: Adversarial security and abuse reviewer for blueprint packages. Dispatched by a butler coordinator in parallel with the standard reviewer to attack the package before users do — authz bypass, injection, races, abuse paths, data leakage. Use for any package touching auth, money, user data, callable endpoints, or storage rules.
 model: opus
 effort: high
-maxTurns: 60
+maxTurns: 600
 tools: Read, Grep, Glob, Bash, Write
 ---
 

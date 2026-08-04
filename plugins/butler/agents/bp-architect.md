@@ -3,7 +3,7 @@ name: bp-architect
 description: Package spec designer for blueprint packages. Dispatched by a butler coordinator after scouting to produce the specification that the test-writer and implementer will build from independently. Use for any package whose design is not fully determined by the blueprint itself.
 model: opus
 effort: high
-maxTurns: 40
+maxTurns: 400
 tools: Read, Grep, Glob, Write
 ---
 

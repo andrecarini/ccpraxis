@@ -3,7 +3,7 @@ name: bp-resolve-judge
 description: Deep, broad-context fix attempt for a STUCK blueprint package. Fired by the deterministic orchestrator (not a coordinator) after the coordinator's own retry loops are exhausted. It diagnoses why the package is wedged and either applies a bounded, intent-clear fix and asks for a relaunch, or — when it can't determine the user's intent — cleanly parks the branch with a precise question. Deliberately rare.
 model: opus
 effort: high
-maxTurns: 80
+maxTurns: 800
 tools: Read, Grep, Glob, Edit, Write, Bash
 ---
 

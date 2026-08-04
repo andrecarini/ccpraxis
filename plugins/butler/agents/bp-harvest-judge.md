@@ -2,7 +2,7 @@
 name: bp-harvest-judge
 description: Verification judge for a FINISHED blueprint package. Fired by the deterministic orchestrator (not a coordinator) to confirm a package's declared outputs actually meet its done-criteria, reading only that package's contracted slice. Returns a pass/fail verdict to disk. Default runs as an async spot-audit; configurably as a per-launch gate.
 model: sonnet
-maxTurns: 40
+maxTurns: 400
 tools: Read, Grep, Glob, Bash, Write
 ---
 

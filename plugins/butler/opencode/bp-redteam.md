@@ -4,7 +4,7 @@ description: Adversarial security and abuse reviewer for blueprint packages. Dis
 mode: subagent
 model: opencode/big-pickle
 temperature: 0.1
-steps: 60
+steps: 600
 permission:
   edit: deny
 ---

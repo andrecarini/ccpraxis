@@ -64,8 +64,15 @@ my ($floor) = $proto =~ /no agent definition may declare `maxTurns:` below `(\d+
 ok(defined $floor, 'C1: protocol declares a machine-readable maxTurns floor')
     or BAIL_OUT('floor sentence absent -- C2 has nothing to enforce');
 
-cmp_ok($floor, '>=', 40, 'C1: the declared floor is at least the value b23 '
-    . 'identified as non-starving for the shortest-lived dispatch class');
+# A floor-on-the-floor, so the declared floor cannot be quietly walked back down.
+# 400 is not a spend decision: a cap only binds when the agent would STILL BE
+# WORKING, so a healthy worker costs the same at 40 or 800 while a starved one
+# costs the whole dispatch. The asymmetry always argues upward. For calibration,
+# a COORDINATOR's ledger max_turns default is 150 -- a worker auditing a whole
+# subsystem must not be capped below the thing that dispatches it. Raising the
+# floor keeps this green; lowering it is the regression this guards.
+cmp_ok($floor, '>=', 400, 'C1: the declared floor is high enough to be a runaway '
+    . 'backstop rather than a budget');
 
 # ------------------------------------- C2: every agent file honours the floor ---
 #
