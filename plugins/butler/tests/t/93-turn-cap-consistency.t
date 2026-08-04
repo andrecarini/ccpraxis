@@ -132,4 +132,46 @@ for my $path (sort glob("$ROOT/plugins/*/agents/*.md")) {
     is($rc, 0, 'C7: `check` exits 0 against the real tree') or diag($out);
 }
 
+# ------------------- C8: script-dir resolution, incl. Windows path shapes ----
+#
+# THIS EXACT RESOLUTION HAS FAILED THREE TIMES IN THIS REPO, and every failure
+# needed a Windows host to observe, so none was ever caught here:
+#
+#   1. bp-baseline.pl   — a relative dirname made `require` search @INC, killing
+#                         both `materialize` and `gate`.
+#   2. install-skills.pl — FindBin fell back to the CWD on a backslash $0 and
+#                         `apply` DELETED three installed skills.
+#   3. bp-turn-caps.pl  — abs_path got a raw `C:\...` path, did not recognise it
+#                         as absolute, and pasted the CWD in front:
+#                         /c/Users/X/ccpraxis/C:/Users/X/ccpraxis/plugins/...
+#
+# script_dir_for is pure string/filesystem logic precisely so the Windows shapes
+# can be asserted from Linux. A synthetic path is not a simulation of the bug --
+# it IS the input that broke, and the assertions below fail on the old code.
+
+{
+    my $win = BpTurnCaps::script_dir_for('C:\\Users\\Andr\\.claude\\ccpraxis\\plugins\\butler\\scripts\\bp-turn-caps.pl');
+    is($win, 'C:/Users/Andr/.claude/ccpraxis/plugins/butler/scripts',
+        'C8: a backslash drive-letter path resolves to its own directory');
+    unlike($win, qr/^\Q$ROOT\E/,
+        'C8: and the CWD is NOT pasted in front of it (the observed failure)');
+
+    my $winfwd = BpTurnCaps::script_dir_for('C:/Users/Andr/ccpraxis/plugins/butler/scripts/x.pl');
+    is($winfwd, 'C:/Users/Andr/ccpraxis/plugins/butler/scripts',
+        'C8: a forward-slash drive-letter path is treated as absolute too');
+
+    my $posix = BpTurnCaps::script_dir_for('/project/plugins/butler/scripts/x.pl');
+    is($posix, '/project/plugins/butler/scripts',
+        'C8: a POSIX absolute path is unchanged');
+
+    # A relative path MUST still be absolutised — that was failure 1, where a
+    # relative dirname sent `require` into @INC.
+    my $rel = BpTurnCaps::script_dir_for('plugins/butler/scripts/x.pl');
+    ok(defined $rel && $rel =~ m{^/},
+        'C8: a relative path is absolutised (never left relative for `require`)');
+
+    is(BpTurnCaps::script_dir_for(undef), undef, 'C8: undef in, undef out');
+    is(BpTurnCaps::script_dir_for(''),    undef, 'C8: empty in, undef out');
+}
+
 done_testing();

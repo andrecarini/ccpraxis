@@ -72,7 +72,12 @@ my $SELF_DIR = dirname($_SELF);
 # lazy requires above depend on is preserved. NOT abs_path, for that same
 # reason: normalising away the '..' would make this file's require key differ
 # from the caller's and compile the sibling twice.
-$SELF_DIR = File::Spec->rel2abs($SELF_DIR) unless File::Spec->file_name_is_absolute($SELF_DIR);
+#
+# The drive-letter test is not redundant: under Git-Bash/msys perl,
+# File::Spec's Unix flavour does NOT consider `C:/Users/...` absolute, so
+# rel2abs would paste the CWD in front of an already-absolute Windows path.
+$SELF_DIR = File::Spec->rel2abs($SELF_DIR)
+    unless File::Spec->file_name_is_absolute($SELF_DIR) || $SELF_DIR =~ m{^[A-Za-z]:/};
 my ($_HAVE_CHECKPOINT, $_HAVE_JUDGE) = (0, 0);
 sub _require_checkpoint { return if $_HAVE_CHECKPOINT; require "$SELF_DIR/bp-checkpoint.pl"; $_HAVE_CHECKPOINT = 1; }
 sub _require_judge      { return if $_HAVE_JUDGE;      require "$SELF_DIR/bp-judge.pl";      $_HAVE_JUDGE = 1; }

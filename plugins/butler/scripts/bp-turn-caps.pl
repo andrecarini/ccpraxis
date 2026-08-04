@@ -41,6 +41,34 @@ package BpTurnCaps;
 
 use JSON::PP ();
 use File::Spec ();
+use File::Basename ();
+use Cwd ();
+
+# script_dir_for($path) -> the directory holding $path, absolute, separators
+# normalised. Pure string/filesystem logic so it is TESTABLE ON LINUX with a
+# synthetic Windows path -- which matters, because this exact resolution has now
+# failed three times in this repo and every failure needed a Windows host to
+# observe:
+#
+#   1. bp-baseline.pl  — a relative dirname made `require` search @INC.
+#   2. install-skills.pl — FindBin fell back to the CWD on a backslash $0, and
+#      `apply` DELETED the user's installed skills.
+#   3. bp-turn-caps.pl — abs_path was handed a raw `C:\...` path, did not
+#      recognise it as absolute, and pasted the CWD in front of it.
+#
+# The two rules that make all three go away:
+#   - normalise separators BEFORE anything tries to split or absolutise;
+#   - treat a drive-letter prefix as absolute, because File::Spec's Unix flavour
+#     (which msys/Git-Bash perl uses) does not.
+sub script_dir_for {
+    my ($path) = @_;
+    return undef unless defined $path && length $path;
+    (my $p = $path) =~ s{\\}{/}g;
+    my $dir = File::Basename::dirname($p);
+    return $dir if $dir =~ m{^[A-Za-z]:/};
+    return $dir if File::Spec->file_name_is_absolute($dir);
+    return Cwd::abs_path($dir) // File::Spec->rel2abs($dir);
+}
 
 # ---------------------------------------------------------------- load ---
 
@@ -235,20 +263,18 @@ unless (caller) {
         else { print STDERR "bp-turn-caps: unrecognised argument '$a'\n"; exit 2 }
     }
 
-    require File::Basename;
-    require Cwd;
-    # dirname(abs_path(__FILE__)), matching bp-pin.pl -- and NOT
-    # rel2abs(dirname(__FILE__)), which is what this used to do and which broke
-    # on Windows. Invoked from PowerShell as
-    #   perl C:\Users\X\.claude\ccpraxis\plugins\butler\scripts\bp-turn-caps.pl
-    # __FILE__ is a BACKSLASH path; File::Basename::dirname cannot split it, so
-    # it returns '.', rel2abs turns that into the CWD, and the config lookup
-    # became "<cwd>/../turn-caps.json" -- a file that does not exist, reported as
-    # a missing config rather than as the path bug it was. abs_path normalises
-    # separators first, so it is stable under both invocation styles.
-    my $self_dir = File::Basename::dirname(Cwd::abs_path(__FILE__));
+    # See script_dir_for's header for why this is not inline dirname/abs_path.
+    my $self_dir = BpTurnCaps::script_dir_for(__FILE__);
 
-    my $root   = $opt{root}   // File::Spec->rel2abs("$self_dir/../../..");
+    # rel2abs would paste the CWD in front of a drive-letter path here too, for
+    # exactly the reason script_dir_for documents -- so only absolutise when the
+    # path is not already absolute in either flavour.
+    my $root = $opt{root};
+    unless (defined $root) {
+        $root = "$self_dir/../../..";
+        $root = File::Spec->rel2abs($root)
+            unless $root =~ m{^[A-Za-z]:/} || File::Spec->file_name_is_absolute($root);
+    }
     my $config = $opt{config} // "$self_dir/../turn-caps.json";
 
     if ($verb eq '' || $verb =~ /^(-h|--help|help)$/) {
