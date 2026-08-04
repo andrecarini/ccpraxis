@@ -112,6 +112,7 @@ Run `/steward:backup` afterwards to resync your live `~/.claude/` with any setti
 ```
 ccpraxis/
 ├── .gitattributes
+├── CLAUDE.md
 ├── global-config/
 │   ├── CLAUDE.md                            # Global instructions (supply chain rules, response style)
 │   ├── known_marketplaces.json              # Marketplace selections (synced across machines)
@@ -200,6 +201,7 @@ ccpraxis/
 │   │   │   └── plugin.json                  # Plugin manifest for butler (name, version, description, author).
 │   │   ├── agents/
 │   │   │   ├── bp-architect.md              # bp-architect worker (opus) - writes the package spec that tests and implementation build from. Report-only.
+│   │   │   ├── bp-conformance-judge.md
 │   │   │   ├── bp-harvest-judge.md          # bp-harvest-judge - verifies a finished package's outputs vs done-criteria from disk. Verdict-to-disk, never fixes.
 │   │   │   ├── bp-implementer.md            # bp-implementer worker - converges code on the immutable tests within the package write_set. Hook-blocked from test files.
 │   │   │   ├── bp-redteam.md                # bp-redteam worker (opus) - adversarial pass over the package. Report-only.
@@ -217,13 +219,19 @@ ccpraxis/
 │   │   │   ├── guard-bash.sh                # PreToolUse hook for Bash inside coordinator sessions.
 │   │   │   ├── guard-writes.sh              # PreToolUse hook for Edit|Write|MultiEdit|NotebookEdit.
 │   │   │   ├── hooks.json                   # Hook registration for butler: PreToolUse (gate-shutdown/guard-writes on edits, gate-shutdown/track-dispatch on Task, guard-bash on Bash), PostToolUse (log-dispatch), Stop (gate-stop). gate-shutdown is the A4 graceful-stop gate: on a fleet stop signal (runs/.shutdown | runs/.paused | runs/<pkg>.force-stop) it denies new work and lets the coordinator funnel to a clean park.
+│   │   │   ├── ledger-guard.sh              # PreToolUse package-ledger write-integrity guard (b12).
 │   │   │   ├── lib.sh                       # shared helpers for butler hooks.
 │   │   │   ├── log-dispatch.sh              # PostToolUse hook for Task inside coordinator sessions.
+│   │   │   ├── repeat-guard.sh              # PreToolUse mechanical repeat-command guard (b10).
 │   │   │   └── track-dispatch.sh            # PreToolUse hook for Task inside coordinator sessions.
 │   │   ├── scripts/
 │   │   │   ├── bp-answer-decision.pl        # the MECHANICAL unblock the reporter performs once a
+│   │   │   ├── bp-checkpoint.pl             # durable WIP checkpoint commits (b02, Decisions #2/#17).
 │   │   │   ├── bp-contract.pl               # Anthropic-side + creds CONTRACT validators (Decision #29/#31).
+│   │   │   ├── bp-deps-check.pl             # deterministic dependency/version-policy classifier (Decisions #4, #11, #12, #14…
 │   │   │   ├── bp-drive-next.pl             # the mechanical director for /butler:drive-solo.
+│   │   │   ├── bp-fast-store.sh             # pnpm store-dir + virtual-store-dir on container-native storage
+│   │   │   ├── bp-feedback.pl               # one-command capture of a single piece of operator feedback
 │   │   │   ├── bp-govern.pl                 # the deterministic usage-governance decision functions for the
 │   │   │   ├── bp-hooks-selftest.sh         # A8 / Decision #31 startup self-assert.
 │   │   │   ├── bp-http.pl                   # the orchestrator/keeper HTTPS transport, via curl.
@@ -236,10 +244,12 @@ ccpraxis/
 │   │   │   ├── bp-orchestrate.sh            # start (or report on) the deterministic, token-free
 │   │   │   ├── bp-orchestrator.pl           # the deterministic, TOKEN-FREE orchestrator process-management
 │   │   │   ├── bp-preflight.pl              # environment-support assertion (Decisions #29/#31).
+│   │   │   ├── bp-remediate.pl              # b07-auto-remediation-engine: the DETERMINISTIC decision core
 │   │   │   ├── bp-resume-sweep.sh           # find interrupted coordinators and resume them economically.
 │   │   │   ├── bp-status.sh                 # one-line-per-package rollup across blueprints.
 │   │   │   ├── bp-token-keeper.pl           # the orchestrator's OAuth token-keeper (Decisions #11/#12/#30).
 │   │   │   ├── bp-usage-gate.pl             # ONE host-safe usage-headroom poll for /butler:drive-solo.
+│   │   │   ├── bp-validate-dag.pl           # deterministic blueprint-DAG validator.
 │   │   │   └── bp-wait-for-decision.pl      # the reporter's TOKEN-FREE blocking watcher (A7).
 │   │   ├── skills/
 │   │   │   ├── coordinator-protocol/
@@ -248,6 +258,8 @@ ccpraxis/
 │   │   │   │   └── SKILL.md                 # Execute a blueprint as a headless multi-coordinator FLEET (sandbox-only) — st…
 │   │   │   ├── drive-solo/
 │   │   │   │   └── SKILL.md                 # The one interactive execute verb — drive one blueprint, a named set, or ALL a…
+│   │   │   ├── feedback-intake/
+│   │   │   │   └── SKILL.md                 # Four-phase flow (Batch, Decompose, Verify, Author) that turns raw operator feed…
 │   │   │   ├── orchestrator-protocol/
 │   │   │   │   └── SKILL.md                 # Operating doctrine for butler execution — the reporter (the interactive Claud…
 │   │   │   ├── reporter/
@@ -279,7 +291,26 @@ ccpraxis/
 │   │           ├── 16-oauth-sandbox-preflight.t
 │   │           ├── 17-drive-next.t
 │   │           ├── 18-usage-governor.t
-│   │           └── 19-drive-integration.t
+│   │           ├── 19-drive-integration.t
+│   │           ├── 20-deps-check.t
+│   │           ├── 20-orchestrator-broken-env-turns.t
+│   │           ├── 21-durable-checkpoint-commits.t
+│   │           ├── 22-checkpoint-hardening.t
+│   │           ├── 23-keeper-resilience-antispam.t
+│   │           ├── 24-conformance-gate.t
+│   │           ├── 25-fast-store.t
+│   │           ├── 26-auto-remediation-engine.t
+│   │           ├── 27-preflight-repo-check.t
+│   │           ├── 60-dag-integrity.t
+│   │           ├── 61-judge-starvation.t
+│   │           ├── 62-repeat-guard.t
+│   │           ├── 64-ledger-guard.t
+│   │           ├── 65-ledger-api.t
+│   │           ├── 67-wait-shape-guard.t
+│   │           ├── 73-status-recognition.t
+│   │           ├── 77-feedback-intake.t
+│   │           ├── 78-timestamp-authorship.t
+│   │           └── 79-contract-idle-window.t
 │   ├── sandbox/                             # Sandbox plugin — bundles the claude-sandbox host launcher, the container blueprint, the bootstrap routine, and the /sandbox:setup redirect skill
 │   │   ├── .claude-plugin/
 │   │   │   └── plugin.json
@@ -296,7 +327,12 @@ ccpraxis/
 │   │   ├── docs/
 │   │   │   ├── B0-tui-spike-findings.md
 │   │   │   ├── b0-tui-probe.pl              # B0 TUI viability spike (Decision #18/#19, package B0).
-│   │   │   └── concurrent-config-safety-spike.md
+│   │   │   ├── concurrent-config-safety-spike.md
+│   │   │   ├── migration-record.md
+│   │   │   ├── protected-paths.md
+│   │   │   ├── terminal-minimize-investigation.md
+│   │   │   ├── token-schema-inventory.md
+│   │   │   └── working-on-ccpraxis.md
 │   │   ├── scripts/
 │   │   │   ├── BackpackApproval.pm
 │   │   │   ├── BackpackReview.pm
@@ -309,9 +345,13 @@ ccpraxis/
 │   │   │   ├── MountSpec.pm
 │   │   │   ├── PluginSync.pm
 │   │   │   ├── PortAlloc.pm
+│   │   │   ├── ProtectedPaths.pm
+│   │   │   ├── Resources.pm
+│   │   │   ├── RunState.pm
 │   │   │   ├── SandboxLock.pm
+│   │   │   ├── SessionFilter.pm
+│   │   │   ├── TokenInfo.pm
 │   │   │   ├── bootstrap.pl                 # First-launch setup invoked by launcher.pl when .claude-data is missing. 6 steps: verify container blueprint, build image, mkdir .claude-data, append .gitignore, git auth (HTTPS PAT / SSH deploy-key), invoke ccpraxis-install.pl. Fully interactive over the launcher's tty.
-│   │   │   ├── ccpraxis-mergeback.pl        # host CLI for merge-back and discard of the
 │   │   │   ├── keep-awake.ps1               # hold a Windows wake-lock for as long as THIS process lives.
 │   │   │   ├── launcher.pl                  # The actual claude-sandbox launcher: arg parsing, bootstrap detection, lock + dead-PID cleanup, image build, TUI selector orchestration, staleness check, mount assembly, container create-or-reattach. Wrappers in bin/ are tiny shims that exec into this.
 │   │   │   ├── select-session.pl            # TUI session picker for the claude-sandbox launcher.
@@ -360,8 +400,24 @@ ccpraxis/
 │   │           ├── 37-heartbeat-bridge-range.t
 │   │           ├── 38-global-lock.t
 │   │           ├── 39-ccpraxis-workcopy-detect.t
-│   │           ├── 40-ccpraxis-workcopy-provision.t
-│   │           └── 41-ccpraxis-mergeback-guard.t
+│   │           ├── 39-render-spans.t
+│   │           ├── 40-layout-responsive.t
+│   │           ├── 41-panel-semantics.t
+│   │           ├── 42-refuse-in-place.t
+│   │           ├── 42-shared-claude-json-concurrency.t
+│   │           ├── 42-status-live.t
+│   │           ├── 43-claude-json-relocation-migration.t
+│   │           ├── 43-token-panel.t
+│   │           ├── 44-resources.t
+│   │           ├── 45-run-state.t
+│   │           ├── 46-lifecycle-stop.t
+│   │           ├── 47-lifecycle-relaunch.t
+│   │           ├── 48-activity-history.t
+│   │           ├── 49-session-filter.t
+│   │           ├── 51-protected-paths.t
+│   │           ├── 52-detector-hardening.t
+│   │           ├── 53-refuse-protected-paths.t
+│   │           └── 55-minimize-evidence.t
 │   ├── steward/                             # Meta-plugin that maintains ccpraxis and owns its backup, onboarding, and self-e…
 │   │   ├── .claude-plugin/
 │   │   │   └── plugin.json
@@ -375,6 +431,8 @@ ccpraxis/
 │   │   │   ├── save-preference.pl           # Records "remember this divergence" decisions
 │   │   │   ├── sensitive-check.pl           # Scans the public ccpraxis repo for secrets before committing
 │   │   │   ├── sync-export.pl               # Detects drift between live config and this repo
+│   │   │   ├── usage-audit-rates.json       # Provider rate card (Anthropic / Z.ai / DeepSeek / Kimi) for usage-audit.pl
+│   │   │   ├── usage-audit.pl               # Token-usage + provider-cost engine for /steward:usage-audit
 │   │   │   └── vault-sync.pl                # Central engine for claude-code-vault project backups.
 │   │   ├── skills/
 │   │   │   ├── audit/
@@ -383,14 +441,12 @@ ccpraxis/
 │   │   │   │   └── SKILL.md                 # Syncs everything personal between the live host and your private repos — ccpr…
 │   │   │   ├── ccpraxis-extend/
 │   │   │   │   └── SKILL.md                 # THE single entrypoint for changing ccpraxis or adding new functionality to it.
-│   │   │   ├── discard-sandboxed-ccpraxis-workcopy/
-│   │   │   │   └── SKILL.md                 # Guarded discard of the sandboxed ccpraxis work-copy WITHOUT merging.
-│   │   │   ├── mergeback-sandboxed-ccpraxis-workcopy/
-│   │   │   │   └── SKILL.md                 # Guarded merge-back of the sandboxed ccpraxis work-copy branch into live main.
 │   │   │   ├── setup-project/
 │   │   │   │   └── SKILL.md                 # Onboard the current project to the ccpraxis system — create the local data di…
-│   │   │   └── update/
-│   │   │       └── SKILL.md                 # Safely updates Claude Code by researching releases before installing.
+│   │   │   ├── update/
+│   │   │   │   └── SKILL.md                 # Safely updates Claude Code by researching releases before installing.
+│   │   │   └── usage-audit/
+│   │   │       └── SKILL.md                 # Measures real Claude Code token consumption across every transcript on this mac…
 │   │   └── tests/
 │   │       ├── lib/
 │   │       │   └── StewardTest.pm           # StewardTest — minimal test harness for the steward vault engine.
