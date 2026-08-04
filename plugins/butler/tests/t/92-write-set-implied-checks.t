@@ -200,4 +200,33 @@ like($harvest, qr/slice/i,
 like($coord, qr/bp-ui-prober|visual/i,
     'C9: the shipped doctrine says this does not close the visual class');
 
+# ------------------ C10: a commented-out table is NOT a table (regression) ----
+#
+# blueprint.md's template ships a COMMENTED example table. Without stripping
+# HTML comments before parsing, every blueprint created from that template would
+# silently inherit a JS/TS/Firebase checklist -- the exact stack-agnosticism
+# violation Correction 1 exists to prevent, introduced by the very file meant to
+# teach the feature. Found by running parse_table against the real template,
+# which returned 4 rows.
+#
+# Asserted against the SHIPPED template, not a fixture, because the fixture
+# would not have caught it.
+
+{
+    my $tpl = slurp("$ROOT/plugins/blueprint/templates/blueprint.md");
+    ok(length $tpl, 'C10 HARNESS: the blueprint template was read');
+
+    my $rows = BpChecks::parse_table($tpl);
+    is(scalar(@$rows), 0,
+        'C10: the template\'s COMMENTED example table implies nothing — a new blueprint '
+      . 'does not silently inherit another stack\'s checklist')
+        or diag('parsed rows: ' . join(', ', map { "$_->{pattern} => $_->{check}" } @$rows));
+
+    # Counterpart: an UNcommented table in the same shape still parses, so C10
+    # cannot pass because parsing is simply broken.
+    my $live = BpChecks::parse_table($TABLE);
+    cmp_ok(scalar(@$live), '>', 0,
+        'C10 (counterpart): an uncommented checks-table still parses');
+}
+
 done_testing();

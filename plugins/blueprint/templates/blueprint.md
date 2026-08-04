@@ -49,6 +49,22 @@ One subsection per package. These fields are copied into each package ledger's f
 - **test_paths:** `test/<area>/:integration_test/`
 - **model:** sonnet                                          <!-- coordinator model; opus for gnarly packages -->
 - **max_turns:** 800
+
+<!-- OPTIONAL: this project's check vocabulary. Delete the block if you have none —
+     a blueprint without it implies no checks and behaves exactly as before. Each row
+     maps a write-set pattern to a check name YOU define: trailing `/` matches by path
+     prefix, `*` globs one path segment, anything else is a substring match. A package
+     whose write_set matches a row must name that check in its `checks:` frontmatter,
+     or `bp-checks.pl audit` (run by bp-auditor) fails the blueprint at authoring time.
+
+```checks-table
+*.ts        => typecheck
+*.ts        => lint
+functions/  => prod-build
+*.rules     => rules-emulator
+```
+-->
+
 - **inputs:** <files, decisions (#), docs the coordinator needs; inline file:line where known>
 - **out_of_scope:** <explicit DO-NOT list>
 

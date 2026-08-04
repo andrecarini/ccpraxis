@@ -45,6 +45,12 @@ Each package ledger's frontmatter (`status`, `model`, `max_turns`, `write_set`, 
 
 **Do not write a number here.** The canonical value lives in `plugins/butler/turn-caps.json` (`coordinator_default`), the ledger template is generated from it, and `bp-turn-caps.pl check` / `t/93` fail on drift. This paragraph previously carried its own literal, and that is exactly how the divergence happened: `b23` raised the prose 80 → 150 and never touched `templates/package-ledger.md` (still at the original `80`) or `agents/bp-scout.md` (still at `15`, the value this same paragraph called known-starving). Prose that restates a number becomes another copy to drift.
 
+- Give each package a **`checks:`** list — the *kinds* of verification its write set can break. This is a different question from `test_paths:`, which only limits *which tests run*; a package can be perfectly compliant on `test_paths` and never compile, lint, or load its own output. That gap is where escapes live: one initiative shipped five defects to its closing gate, each because the check that would have caught it was in no package's criteria.
+
+  **The check vocabulary is YOURS, not the plugin's.** Declare it in `blueprint.md` as a ```` ```checks-table ```` block of `<pattern> => <check>` rows (trailing `/` = path prefix, `*` = glob, otherwise substring). There is deliberately no built-in list — this toolchain is stack-agnostic, and a blueprint that declares no table implies nothing and behaves exactly as before. Derive a package's implied set with `bp-checks.pl derive`, and let `bp-auditor` fail the blueprint on omissions via `bp-checks.pl audit`.
+
+  This does **not** cover the visual class — `bp-ui-prober`'s human-read pass is not replaced by any of it.
+
 A cap is a **runaway backstop, not a budget** — it only binds when the coordinator would otherwise still be working, so a healthy one costs the same at 80 as at 800 while a starved one loses the package. Raise per package when its scope needs more; if you are tempted to lower one, lower the scope instead.
 - Assign `effort` per package (opt-in; omit the key entirely for "no flag, inherit `effortLevel` from settings.json" — butler never invents a default here). Under the **higher** quality profile, most packages get no explicit `effort` (i.e. inherit the settings-payload default, today `high`), with `xhigh` reserved for the hardest packages. Under the **normal** profile, prefer `sonnet` more broadly, reserve `opus` for genuinely gnarly packages, and set `effort: medium` on most packages.
 

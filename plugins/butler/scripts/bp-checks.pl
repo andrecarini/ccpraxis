@@ -76,7 +76,19 @@ sub parse_table {
     my ($text) = @_;
     return [] unless defined $text && length $text;
 
-    my ($block) = $text =~ /^```checks-table\s*\n(.*?)^```/ms;
+    # HTML-commented blocks are NOT a table. This is load-bearing, not tidiness:
+    # blueprint.md's own template ships a commented EXAMPLE table, and without
+    # this strip every blueprint created from that template would silently
+    # inherit a JS/TS/Firebase checklist -- precisely the stack-agnosticism this
+    # design exists to protect. (Caught by executing parse_table against the
+    # template, which returned 4 rows.)
+    #
+    # It also gives authors the obvious way to disable their own table
+    # temporarily: comment it out and it stops applying, which is what anyone
+    # would expect.
+    (my $live = $text) =~ s/<!--.*?-->//gs;
+
+    my ($block) = $live =~ /^```checks-table\s*\n(.*?)^```/ms;
     return [] unless defined $block;
 
     my @rows;
