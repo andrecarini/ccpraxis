@@ -146,24 +146,24 @@ sub mk_judge_jsonl { my ($dir,$kind,$pkg,$obj)=@_; make_path("$dir/runs/$kind");
 # ===========================================================================
 
 ok(has_sub('BpJudge::harvest_max_turns'), 'AC-1: BpJudge::harvest_max_turns is defined');
-for my $case ([1,28],[2,36],[3,44],[4,52],[5,60],[8,60]) {
+for my $case ([1,112],[2,144],[3,176],[4,208],[5,240],[8,240]) {
     my ($n,$exp) = @$case;
     my $ws = join(':', map { "f$_.pl" } 1..$n);
     is(SC('BpJudge::harvest_max_turns', $ws, undef), $exp, "AC-1: harvest_max_turns union-size=$n -> $exp");
 }
-is(SC('BpJudge::harvest_max_turns', undef, undef), 28, 'AC-1: harvest_max_turns(undef,undef) -> 28');
-is(SC('BpJudge::harvest_max_turns', '', ''),        28, "AC-1: harvest_max_turns('','') -> 28");
-is(SC('BpJudge::harvest_max_turns', '—', '[]'),     28, "AC-1: harvest_max_turns('—','[]') -> 28");
+is(SC('BpJudge::harvest_max_turns', undef, undef), 112, 'AC-1: harvest_max_turns(undef,undef) -> 112');
+is(SC('BpJudge::harvest_max_turns', '', ''),        112, "AC-1: harvest_max_turns('','') -> 112");
+is(SC('BpJudge::harvest_max_turns', '—', '[]'),     112, "AC-1: harvest_max_turns('—','[]') -> 112");
 
-is(SC('BpJudge::harvest_max_turns', 'a.pl:b.pl', 'b.pl'), 36, 'AC-2: harvest_max_turns de-dup union(a.pl:b.pl,b.pl) -> 36');
-is(SC('BpJudge::harvest_max_turns', 'A:B:C:D', 'D'),      52, 'AC-2: harvest_max_turns union(A:B:C:D,D) -> 52');
+is(SC('BpJudge::harvest_max_turns', 'a.pl:b.pl', 'b.pl'), 144, 'AC-2: harvest_max_turns de-dup union(a.pl:b.pl,b.pl) -> 144');
+is(SC('BpJudge::harvest_max_turns', 'A:B:C:D', 'D'),      208, 'AC-2: harvest_max_turns union(A:B:C:D,D) -> 208');
 
 {
     my ($out, $rc) = run_capture('perl', '-e',
         'require $ARGV[0]; print BpJudge::harvest_max_turns($ARGV[1],$ARGV[2])',
         $JUDGE_PL, 'p/a/', 'p/a/');
     (my $trimmed = $out // '') =~ s/\s+\z//;
-    is($trimmed, '28', 'AC-3: the exact §2.6 one-liner prints 28 for write_set=test_paths=p/a/');
+    is($trimmed, '112', 'AC-3: the exact §2.6 one-liner prints 112 for write_set=test_paths=p/a/');
     is($rc, 0, 'AC-3: the exact §2.6 one-liner exits 0');
 }
 
@@ -172,8 +172,13 @@ is(SC('BpJudge::harvest_max_turns', 'A:B:C:D', 'D'),      52, 'AC-2: harvest_max
     unlike($sh, qr/BP_HARVEST_MAX_TURNS:-20/, 'AC-4: bp-judge.sh contains no flat BP_HARVEST_MAX_TURNS:-20 default');
     like($sh, qr/harvest_max_turns/, 'AC-4: bp-judge.sh references harvest_max_turns');
     like($sh, qr/\$\{BP_HARVEST_MAX_TURNS:-\}/, 'AC-4: bp-judge.sh still positions BP_HARVEST_MAX_TURNS as the override');
-    like($sh, qr/BP_CONFORMANCE_MAX_TURNS:-40/, 'AC-4: BP_CONFORMANCE_MAX_TURNS:-40 unchanged');
-    like($sh, qr/BP_RESOLVE_MAX_TURNS:-50/,     'AC-4: BP_RESOLVE_MAX_TURNS:-50 unchanged');
+    # RETARGETED 2026-08-04. These pinned the literal defaults 40 and 50, which
+    # froze a TUNABLE in a sibling's oracle -- the same antipattern that had four
+    # oracles pinning launcher.pl's poll cadence. What AC-4 protects is that each
+    # judge kind still routes through an overridable env var, not what today's
+    # number happens to be.
+    like($sh, qr/\$\{BP_CONFORMANCE_MAX_TURNS:-\d+\}/, 'AC-4: conformance turns come from an overridable BP_CONFORMANCE_MAX_TURNS default');
+    like($sh, qr/\$\{BP_RESOLVE_MAX_TURNS:-\d+\}/,     'AC-4: resolve turns come from an overridable BP_RESOLVE_MAX_TURNS default');
 }
 
 {
@@ -183,10 +188,10 @@ is(SC('BpJudge::harvest_max_turns', 'A:B:C:D', 'D'),      52, 'AC-2: harvest_max
         for my $n (0..40) {
             my $ws = $n ? join(':', map { "g$_.pl" } 1..$n) : '';
             my $v = SC('BpJudge::harvest_max_turns', $ws, undef);
-            $bad++ unless defined($v) && $v >= 28 && $v <= 60;
+            $bad++ unless defined($v) && $v >= 112 && $v <= 240;
         }
     }
-    ok($has && $bad == 0, 'AC-5: harvest_max_turns never <28 or >60 across union sizes 0..40');
+    ok($has && $bad == 0, 'AC-5: harvest_max_turns never <112 or >240 across union sizes 0..40');
 }
 
 # ===========================================================================
@@ -288,12 +293,12 @@ is(BpOrch::widen_max_turns(60,60), 90, 'AC-12: widen_max_turns(60,60) == 90 (5-f
     my $r1 = run_once($dir, tun => { harvest_reaudit_cap=>2 });
     my @h = grep { $_->{kind} eq 'harvest' && $_->{pkg} eq 'solo' } @{ $r1->{spawned} };
     is(scalar(@h), 1, 'AC-12: first starvation re-fires the harvest judge exactly once');
-    is_deeply($h[0], { kind=>'harvest', pkg=>'solo', max_turns=>42 },
-        'AC-12: re-fire spawn hash is {kind=>harvest,pkg=>solo,max_turns=>42} == widen_max_turns(28,28)');
+    is_deeply($h[0], { kind=>'harvest', pkg=>'solo', max_turns=>168 },
+        'AC-12: re-fire spawn hash is {kind=>harvest,pkg=>solo,max_turns=>168} == widen_max_turns(112,112)');
 
     my $reg = reg_of($dir);
     is($reg->{solo}{harvest_starve_continuations}, 1, 'AC-13: registry harvest_starve_continuations == 1');
-    is($reg->{solo}{harvest_max_turns}, 42, 'AC-13: registry harvest_max_turns == 42');
+    is($reg->{solo}{harvest_max_turns}, 168, "AC-13: registry harvest_max_turns == 168");
     is($reg->{solo}{harvest_reaudit}, 1, 'AC-13: registry harvest_reaudit == 1');
     ok(!($reg->{solo}{corrective_attempts}), 'AC-13: corrective_attempts absent/0');
     like(slurp("$dir/packages/solo.md"), qr/^status:\s*done/m, 'AC-13: ledger still reads status: done');
@@ -507,7 +512,7 @@ is(BpJudge::audit_outcome({ verdict=>'fail', corrective_attempts=>1, corrective_
 {
     my $dir = mk_bp([['A','—','done','p/a/']], { A=>{
         harvest_defer=>2, harvest_defer_blockers=>'B', harvest_starve_continuations=>1,
-        harvest_reaudit=>2, harvest_max_turns=>42 } });
+        harvest_reaudit=>2, harvest_max_turns=>168 } });
     BpOrch::mark_judge_inflight("$dir/runs", 'harvest', 'A', $NOW);
     seed_verdict($dir, 'harvest', 'A', { verdict=>'pass' });
     run_once($dir);
@@ -516,7 +521,7 @@ is(BpJudge::audit_outcome({ verdict=>'fail', corrective_attempts=>1, corrective_
     is(($reg->{A}{harvest_defer_blockers} // 'X'), '', 'AC-28: harvest_defer_blockers reset to \'\' on pass');
     is(($reg->{A}{harvest_starve_continuations} // 'X'), 0, 'AC-28: harvest_starve_continuations reset to 0 on pass');
     is(($reg->{A}{harvest_reaudit} // 'X'), 0, 'AC-28: harvest_reaudit reset to 0 on pass (existing :1468 behavior)');
-    is($reg->{A}{harvest_max_turns}, 42, 'AC-28: harvest_max_turns is NOT reset, stays 42');
+    is($reg->{A}{harvest_max_turns}, 168, "AC-28: harvest_max_turns is NOT reset, stays 168");
 }
 
 # ===========================================================================

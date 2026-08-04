@@ -218,9 +218,13 @@ sub harvest_max_turns {
     my ($write_set, $test_paths) = @_;
     my %union = map { ($_ => 1) } (_split_paths($write_set), _split_paths($test_paths));
     my $files = scalar keys %union;
-    my $n = 20 + 8 * $files;
-    return 28 if $n < 28;
-    return 60 if $n > 60;
+    # Scaled x4 2026-08-04. The old 20+8*files clamped to [28,60] made the turn
+    # cap the routine termination condition for judges, the same pathology b11
+    # identified for coordinators: a cap is a runaway backstop, not a control
+    # loop. Shape and proportionality are unchanged; only the scale moved.
+    my $n = 80 + 32 * $files;
+    return 112 if $n < 112;
+    return 240 if $n > 240;
     return $n;
 }
 

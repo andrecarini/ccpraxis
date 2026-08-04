@@ -64,10 +64,10 @@ if [ "$KIND" = conformance ]; then
   # mandated_means + the delivered code, which is strictly more work than a harvest
   # judge's single contracted slice. Read-only: empty write_set, so only the verdict
   # (which lands under BP_DIR) is writable.
-  MODEL="${BP_CONFORMANCE_MODEL:-opus}"; MAXT="${BP_CONFORMANCE_MAX_TURNS:-40}"
+  MODEL="${BP_CONFORMANCE_MODEL:-opus}"; MAXT="${BP_CONFORMANCE_MAX_TURNS:-160}"
   ROLE="conformance-judge"; J_WRITE_SET=""; J_TEST_PATHS=""
 elif [ "$KIND" = resolve ]; then
-  MODEL="${BP_RESOLVE_MODEL:-opus}";   MAXT="${BP_RESOLVE_MAX_TURNS:-50}"
+  MODEL="${BP_RESOLVE_MODEL:-opus}";   MAXT="${BP_RESOLVE_MAX_TURNS:-200}"
   ROLE="resolve-judge"; J_WRITE_SET="$WRITE_SET"; J_TEST_PATHS="$TEST_PATHS"
 else
   MODEL="${BP_HARVEST_MODEL:-sonnet}"
