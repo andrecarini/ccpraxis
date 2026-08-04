@@ -404,24 +404,58 @@ sub populate_os_skeleton {
 # paths that still exist. No .git anywhere; the gitignored secret directory is
 # excluded BY CONSTRUCTION (--exclude-standard), not by an ad-hoc denylist.
 # ---------------------------------------------------------------------------
+# b40 seam: when BP_BASELINE_TREE names an existing directory, source the work
+# tree from THAT directory instead of $project_root's git index (spec section
+# 6.1). A materialized baseline tree is not a git repository, so enumeration
+# there is a plain recursive File::Find walk rather than `git ls-files`.
+# Unset/empty BP_BASELINE_TREE -> byte-for-byte today's behaviour.
+sub _enumerate_baseline_tree {
+    my ($src_root) = @_;
+    my @rels;
+    File::Find::find({ no_chdir => 1, wanted => sub {
+        return unless -f $_;
+        my $rel = $_;
+        $rel =~ s{\A\Q$src_root\E/?}{};
+        return unless length $rel;
+        return if $rel =~ m{(^|/)\.git(/|$)};
+        return if $rel eq '.bp-baseline-meta.json';
+        push @rels, $rel;
+    } }, $src_root);
+    return @rels;
+}
+
 sub populate_work_tree {
     my ($jail_root, $project_root) = @_;
     my %manifest;
-    my $pid = open(my $fh, '-|');
-    io_exit("fork for git ls-files: $!") unless defined $pid;
-    if ($pid == 0) {
-        exec('git', '-C', $project_root, 'ls-files', '-z',
-             '--cached', '--others', '--exclude-standard')
-            or POSIX::_exit(127);
+
+    my $baseline_tree = $ENV{BP_BASELINE_TREE};
+    my $use_baseline = defined $baseline_tree && length $baseline_tree && -d $baseline_tree;
+
+    my @rels;
+    my $src_root;
+    if ($use_baseline) {
+        $src_root = $baseline_tree;
+        @rels = _enumerate_baseline_tree($src_root);
+    } else {
+        $src_root = $project_root;
+        my $pid = open(my $fh, '-|');
+        io_exit("fork for git ls-files: $!") unless defined $pid;
+        if ($pid == 0) {
+            exec('git', '-C', $project_root, 'ls-files', '-z',
+                 '--cached', '--others', '--exclude-standard')
+                or POSIX::_exit(127);
+        }
+        local $/;
+        my $raw = <$fh>;
+        close $fh;
+        io_exit("git ls-files exited non-zero") if $? != 0;
+        $raw = '' unless defined $raw;
+        @rels = split /\0/, $raw;
     }
-    local $/;
-    my $raw = <$fh>;
-    close $fh;
-    io_exit("git ls-files exited non-zero") if $? != 0;
-    $raw = '' unless defined $raw;
-    for my $rel (split /\0/, $raw) {
+
+    for my $rel (@rels) {
         next unless length $rel;
-        my $src = "$project_root/$rel";
+        my $src = "$src_root/$rel";
         next unless -e $src;   # --cached lists tracked-but-deleted paths too
         next if -d $src;
         my $dst = "$jail_root/work/$rel";

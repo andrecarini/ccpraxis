@@ -125,6 +125,17 @@ sub parse_write_set {
     return $ps;
 }
 
+# --- is_checkpoint_subject($subject) -> 0|1 (b40, spec section 3.1).
+#
+# Recognises a commit subject as one of THIS module's own `wip(<pkg>): ...`
+# checkpoint commits (see commit_message above), so a caller (bp-baseline.pl)
+# never has to re-derive the message format itself. undef input -> 0, never dies.
+sub is_checkpoint_subject {
+    my ($subject) = @_;
+    return 0 unless defined $subject && !ref $subject;
+    return $subject =~ /\A\s*wip\(/ ? 1 : 0;
+}
+
 # --- a package id, as it is allowed to reach a commit subject.
 #
 # `pkg` is ledger content: a `blueprint.md` table cell (LLM-authored) or a bare
