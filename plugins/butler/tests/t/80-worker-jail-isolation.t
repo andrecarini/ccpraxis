@@ -724,4 +724,92 @@ SKIP: {
     }
 }
 
+# =====================================================================================
+# C13 -- THE JAIL'S ENVIRONMENT BOUNDARY, ASSERTED IN BOTH DIRECTIONS.
+#
+# b33's isolation is FILESYSTEM isolation: chroot makes the Claude credential
+# unreachable on disk, which is what C1 above asserts. It performs no ENVIRONMENT
+# isolation -- exec() inherits %ENV wholesale -- and that was harmless only while
+# b33's verified premise held: OpenCode needed no credential, so there was no
+# OpenCode secret to inherit. b36 broke that premise.
+#
+# The obvious fix, an allowlist, is WRONG, and this block exists to keep it wrong
+# on the record. A jailed worker READS six variables out of ~47 inherited, so
+# dropping the other 41 looks like pure gain -- but several of them are SECURITY
+# CONTROLS DELIVERED AS ENVIRONMENT. Dropping npm_config_ignore_scripts
+# re-enables npm postinstall arbitrary code execution; dropping the DISABLE_*
+# set re-enables upgrade / GitHub-app-install / autoupdate inside the jail, which
+# is a privilege INCREASE, not a reduction.
+#
+# So the threat model is bidirectional and both halves are asserted here:
+# secrets must not leak IN, and controls must not fall OUT.
+# =====================================================================================
+{
+    my $secret = 'C13-SENTINEL-MUST-NOT-CROSS-THE-JAIL-7f3a1';
+
+    # The two lists are READ FROM bp-jail.pl's source rather than duplicated
+    # here. bp-jail.pl has no `package` declaration and a bare `require` would
+    # execute its argument parsing, so parse the qw() blocks instead. This also
+    # means the test cannot drift from the implementation: adding a name to
+    # either list in the script automatically extends the assertions below.
+    my $jail_src = read_file($BP_JAIL) // '';
+    my @DENY = $jail_src =~ /our\s+\@JAIL_ENV_DENYLIST\s*=\s*qw\(([^)]*)\)/s ? split ' ', $1 : ();
+    my @REQD = $jail_src =~ /our\s+\@JAIL_ENV_REQUIRED\s*=\s*qw\(([^)]*)\)/s ? split ' ', $1 : ();
+    cmp_ok(scalar(@DENY), '>', 0, 'C13 HARNESS: the denylist was parsed out of bp-jail.pl');
+    cmp_ok(scalar(@REQD), '>', 0, 'C13 HARNESS: the required-present list was parsed out of bp-jail.pl');
+
+    my $proj = tempdir(DIR => '/root', CLEANUP => 1);
+    system('git', '-C', $proj, 'init', '-q');
+    system('git', '-C', $proj, 'config', 'user.email', 'c13@example.invalid');
+    system('git', '-C', $proj, 'config', 'user.name', 'c13');
+    write_file("$proj/keep.txt", "hello\n");
+    system('git', '-C', $proj, 'add', '-A');
+    system('git', '-C', $proj, 'commit', '-q', '-m', 'baseline');
+
+    my $jailroot = tempdir(DIR => '/root', CLEANUP => 0);
+    File::Path::remove_tree($jailroot);
+
+    # Every denied name carries the sentinel; every required name carries a
+    # recognisable value, so the two directions are checked in ONE jailed run.
+    my %env = (
+        BP_PROJECT_ROOT => $proj,
+        BP_WRITE_SET    => 'keep.txt',
+        (map { ($_ => $secret) } @DENY),
+        npm_config_ignore_scripts          => 'true',
+        DISABLE_AUTOUPDATER                => '1',
+        DISABLE_UPGRADE_COMMAND            => '1',
+        DISABLE_INSTALL_GITHUB_APP_COMMAND => '1',
+        IS_SANDBOX                         => '1',
+    );
+
+    run_jail(['create', '--package', 'c13-pkg', '--jail-root', $jailroot], %env);
+    my ($rc, $out, $err) = run_jail(
+        ['run', '--package', 'c13-pkg', '--jail-root', $jailroot, '--', 'env'], %env);
+
+    # ---- direction 1: secrets must not leak IN ----
+    unlike($out, qr/\Q$secret\E/,
+        'C13 (in): no denied credential VALUE reaches the jailed environment');
+    for my $name (@DENY) {
+        unlike($out, qr/^\Q$name\E=/m,
+            "C13 (in): $name is not even NAMED in the jailed environment");
+    }
+
+    # ---- direction 2: controls must not fall OUT ----
+    # This is the half an allowlist would have broken.
+    for my $name (@REQD) {
+        like($out, qr/^\Q$name\E=/m,
+            "C13 (out): $name SURVIVES into the jail -- dropping it would remove a control, not add one");
+    }
+
+    # VACUITY GATE: the probe genuinely saw a populated environment. Without
+    # this, an `env` that produced nothing at all would satisfy every unlike()
+    # above while telling us precisely nothing.
+    cmp_ok(scalar(split /\n/, $out), '>', 3,
+        'C13 VACUITY GATE: the jailed `env` returned a populated environment, so the absence checks above mean something');
+
+    system(qq{"$^X" "$BP_JAIL" teardown --package c13-pkg --jail-root "$jailroot"});
+    File::Path::remove_tree($jailroot) if -e $jailroot;
+    File::Path::remove_tree($proj)     if -e $proj;
+}
+
 done_testing();

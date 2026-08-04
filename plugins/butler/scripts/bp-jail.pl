@@ -238,6 +238,47 @@ sub chroot_bin {
 our @JAIL_ENV_DENYLIST = qw(
     OPENCODE_AUTH_COOKIE
     OPENCODE_GO_AUTH_COOKIE
+    GIT_SSH_COMMAND
+    ANTHROPIC_API_KEY
+    CLAUDE_CODE_OAUTH_TOKEN
+);
+
+# WHY A DENYLIST AND NOT AN ALLOWLIST — the question was asked directly and the
+# obvious answer is wrong.
+#
+# An allowlist looks safer: a jailed worker READS only six variables
+# (BP_DIR, BP_LEDGER, BP_PACKAGE, BP_PROJECT_ROOT, BP_WRITE_SET, PATH) out of
+# ~47 inherited, so dropping the other 41 sounds like pure gain.
+#
+# It is not. Several of those 41 are SECURITY CONTROLS DELIVERED AS ENVIRONMENT,
+# and dropping them does not merely break features — it removes protections and
+# grants capabilities:
+#
+#   npm_config_ignore_scripts=true      dropping it RE-ENABLES npm postinstall
+#                                       arbitrary code execution
+#   DISABLE_UPGRADE_COMMAND=1           }  dropping these RE-ENABLES those
+#   DISABLE_INSTALL_GITHUB_APP_COMMAND=1}  commands inside a jailed worker —
+#   DISABLE_AUTOUPDATER=1               }  a privilege INCREASE
+#   IS_SANDBOX=1 / CLAUDE_SANDBOX=1        code branches on these; without them
+#                                          a worker may behave as if on a host
+#   PNPM_CONFIG_MINIMUM_RELEASE_AGE        the >=7-day supply-chain rule
+#
+# So the threat model is BIDIRECTIONAL: secrets must not leak IN, and controls
+# must not fall OUT. An allowlist defends only the first and actively breaks the
+# second. The denylist defends the first, and t/80's C13 asserts the second by
+# checking the protective variables are still PRESENT inside the jail.
+#
+# GIT_SSH_COMMAND is denied because it is `ssh -i <deploy-key-path> …`, and b33
+# rules that jailed workers get NO git — nothing in the jail needs it. The two
+# API-key names are denied pre-emptively: neither is set today, so this costs
+# nothing now and prevents a future export from leaking silently.
+our @JAIL_ENV_REQUIRED = qw(
+    PATH
+    npm_config_ignore_scripts
+    DISABLE_AUTOUPDATER
+    DISABLE_UPGRADE_COMMAND
+    DISABLE_INSTALL_GITHUB_APP_COMMAND
+    IS_SANDBOX
 );
 
 # Called in the forked child immediately before exec, so the parent's own environment is
