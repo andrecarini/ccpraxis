@@ -495,6 +495,8 @@ ccpraxis/
     │       ├── chrome-puppet.pl             # Subcommand dispatcher (launch, navigate, text, etc.)
     │       └── lib/
     │           └── CDPClient.pm             # Pure-Perl WebSocket + CDP client
+    ├── carry-over/
+    │   └── SKILL.md                         # /carry-over           — hand this session's work to a fresh one (plan-mode handover; not /compact)
     └── refresh/
         └── SKILL.md                         # /refresh              — reread CLAUDE.md mid-conversation
 ```
