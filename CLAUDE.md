@@ -14,6 +14,38 @@ sandbox launches.
 `claude-sandbox` refuses to launch against `~/.claude/ccpraxis`, by design. Editing the live install
 means editing tooling while it is in use.
 
+### ⚠ THE MACHINERY YOU ARE USING IS NOT THE MACHINERY YOU ARE EDITING
+
+**A change you just made is NOT in effect in this session.** You edit the clone; Claude Code executes
+the live install — and inside a sandbox, a *copy* of it at
+`/root/.claude/plugins/marketplaces/ccpraxis-local/`, taken when the container was launched. Your
+edit reaches none of those until you **promote and relaunch**.
+
+This is not a subtle distinction and it is not rare — it bit three times in a single session:
+
+- agent `maxTurns` caps were raised and **stayed inert**, so a fan-out would still have died at the
+  old cap;
+- a new `skills/<name>/` was added and **was not mounted** (skills are bind-mounted per the picker's
+  selection, and a `--session`/`--resume-session` *connector* launch skips the picker entirely);
+- `bp-blueprint.pl` gained verbs that the executing copy **did not have**, so the very command about
+  to be run would have failed exactly as before.
+
+**Before claiming any tooling change is usable — or planning work that depends on it — verify against
+the tree that actually runs:**
+
+```bash
+# what is EXECUTING here (in a sandbox):
+M=/root/.claude/plugins/marketplaces/ccpraxis-local
+perl $M/butler/scripts/bp-blueprint.pl            # verbs the live copy really has
+grep -m1 '^maxTurns:' $M/butler/agents/bp-scout.md
+```
+
+If it differs from your clone, the change is **not live**, and saying "the machinery now works" is
+false. Say instead: *"fixed in the clone; inert until promoted and the sandbox relaunched."*
+
+Prose and skills are subject to the same rule: a `SKILL.md` you just corrected is still being read
+from the live copy, so an agent will keep following the **old** instructions this session.
+
 **Promotion is a merge, not an install:**
 
 ```bash
