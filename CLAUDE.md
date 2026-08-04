@@ -17,9 +17,20 @@ means editing tooling while it is in use.
 ### ⚠ THE MACHINERY YOU ARE USING IS NOT THE MACHINERY YOU ARE EDITING
 
 **A change you just made is NOT in effect in this session.** You edit the clone; Claude Code executes
-the live install — and inside a sandbox, a *copy* of it at
-`/root/.claude/plugins/marketplaces/ccpraxis-local/`, taken when the container was launched. Your
-edit reaches none of those until you **promote and relaunch**.
+the **live install**. Promotion is what closes that gap — but *what* it takes to become effective
+differs per surface, and guessing has been wrong in both directions:
+
+| surface | how it reaches a sandbox | effective when |
+|---|---|---|
+| ccpraxis plugin code (`plugins/**`) | **LIVE ro bind mount — of `~/.claude/ccpraxis/plugins`, i.e. THE LIVE INSTALL, _never_ of your clone** — at `/root/.claude/plugins/marketplaces/ccpraxis-local` (`ccpraxis-local` is a `directory`-source marketplace) | **on promotion alone.** No relaunch: a per-call script (`bp-*.pl`) picks it up immediately. Until you promote, the mount keeps serving the OLD code no matter what your clone says |
+| skills (`skills/<name>/`) | bind-mounted **per the picker's selection**, fixed at container create | a **full manager launch** (`--session`/`--resume-session` is the *connector* path and skips the picker entirely) |
+| other marketplaces (e.g. `claude-plugins-official`) | **copied** into `claude-home`, host-authoritative, re-copied every launch | next launch — and an in-container repair is clobbered by that re-copy |
+
+**The mount is not a shortcut past promotion.** It serves the live install, so it makes *promoted*
+work visible instantly — and makes *unpromoted* work invisible just as reliably. "It's all mounts, so
+it's probably already here" is only true once the merge has happened.
+
+So: **verify, do not assume.** "Relaunch everything" is as wrong as "it's already live".
 
 This is not a subtle distinction and it is not rare — it bit three times in a single session:
 
@@ -41,10 +52,12 @@ grep -m1 '^maxTurns:' $M/butler/agents/bp-scout.md
 ```
 
 If it differs from your clone, the change is **not live**, and saying "the machinery now works" is
-false. Say instead: *"fixed in the clone; inert until promoted and the sandbox relaunched."*
+false. Say instead: *"fixed in the clone; inert until promoted."*
 
-Prose and skills are subject to the same rule: a `SKILL.md` you just corrected is still being read
-from the live copy, so an agent will keep following the **old** instructions this session.
+**Skills and prose have their own trap.** A `SKILL.md` under `plugins/**` rides the live mount like
+any other file — but a skill already loaded into the running session was read at invocation time, and
+a **new** `skills/<name>/` directory is not mounted at all until a full manager launch. So a
+correction can be on disk, live, and still not be what the current session is following.
 
 **Promotion is a merge, not an install:**
 
