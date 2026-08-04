@@ -102,7 +102,7 @@ sub notfound_error { my ($sub, $msg) = @_; emit_err("bp-blueprint: $sub: $msg");
 
 sub _today {
     my @t = gmtime(time);
-    return sprintf('%04d-%02d-%02d',  + 1900,  + 1, );
+    return sprintf('%04d-%02d-%02d', $t[5] + 1900, $t[4] + 1, $t[3]);
 }
 
 sub _slurp {
@@ -541,6 +541,64 @@ sub op_set_section {
         # capture swallowed the blank line that follows and every set-section added
         # another one. Caught by diffing the bytes, not by reading the regex.
         $new =~ s{(^##[ \t]+$q[ \t]*\n)(.*?)(?=^##[ \t]|\z)}{$1\n$body\n\n}ms;
+        return ($new, undef);
+    });
+}
+
+# -------------------------------------------------------------------------------------
+# op_set_meta — set a field in the blueprint's own metadata block.
+#
+# The lifecycle field `status:` (drafting -> audited -> running -> done -> archived) is
+# documented in the template and had NO verb: set-field only edits package-status TABLE
+# rows and rejects these values outright. So advancing a blueprint's own lifecycle -- the
+# last step of /blueprint:create -- required a hand-splice, which is precisely what this
+# API exists to prevent. Found by hitting it while authoring a real blueprint.
+# -------------------------------------------------------------------------------------
+my @BP_LIFECYCLE = qw(drafting audited running done archived);
+my %META_FIELDS  = map { $_ => 1 } qw(blueprint created last_updated status execution_mode);
+
+sub op_set_meta {
+    my @args = @_;
+    my %opt;
+    my $ok;
+    { local $SIG{__WARN__} = sub { };
+      $ok = GetOptionsFromArray(\@args, \%opt, 'file=s', 'field=s', 'value=s'); }
+    arg_error('set-meta', 'unrecognised option') unless $ok;
+    arg_error('set-meta', 'unexpected extra arguments: ' . join(' ', @args)) if @args;
+    for my $r (qw(file field value)) {
+        arg_error('set-meta', "missing required --$r") unless defined $opt{$r};
+    }
+    unless ($META_FIELDS{ $opt{field} }) {
+        arg_error('set-meta', "--field '$opt{field}' is not a metadata field; expected one of: "
+                            . join(', ', sort keys %META_FIELDS));
+    }
+    unless (field_safe($opt{value})) {
+        arg_error('set-meta', '--value contains a pipe or newline');
+    }
+    if ($opt{field} eq 'status' && !grep { $_ eq $opt{value} } @BP_LIFECYCLE) {
+        arg_error('set-meta', "--value '$opt{value}' is not a blueprint lifecycle status; expected one of: "
+                            . join(', ', @BP_LIFECYCLE));
+    }
+
+    run_write('set-meta', $opt{file}, sub {
+        my ($orig) = @_;
+        my $f = quotemeta $opt{field};
+
+        # The metadata block is the fenced ``` block near the top. Only ever touch a
+        # `field:` line inside it -- a `status:` elsewhere (a package ledger quoted in
+        # prose, say) must not be rewritten.
+        unless ($orig =~ /^```\s*\n(?:.*\n)*?^$f:/m) {
+            return (undef, "no `$opt{field}:` line found in the metadata block of $opt{file}");
+        }
+
+        my $new = $orig;
+        my $done = 0;
+        # Preserve any trailing `# comment` the template carries on the line.
+        $new =~ s{^($f:)([ \t]*)([^\n#]*)(#[^\n]*)?$}{
+            $done++ ? "$1$2$3" . ($4 // '')
+                    : $1 . ($2 || ' ') . $opt{value} . (defined $4 ? "        $4" : '')
+        }me;
+        return (undef, "could not rewrite `$opt{field}:`") unless $done;
         return ($new, undef);
     });
 }
@@ -1090,6 +1148,7 @@ sub op_ready {
 
 my %DISPATCH = (
     'init'         => \&op_init,
+    'set-meta'     => \&op_set_meta,
     'set-section'  => \&op_set_section,
     'add-package'  => \&op_add_package,
     'set-status'   => \&op_set_status,
