@@ -243,6 +243,47 @@ our @JAIL_ENV_DENYLIST = qw(
     CLAUDE_CODE_OAUTH_TOKEN
 );
 
+# ===========================================================================
+# b48 — SUPERSEDED, and the original reasoning below is preserved because it is
+# still half right. Read both.
+#
+# The argument below rejects an allowlist on the grounds that dropping
+# controls-delivered-as-environment is a PRIVILEGE INCREASE. That is correct and
+# it still governs. What it gets wrong is treating "allowlist" as necessarily
+# MINIMAL — it compares a six-variable allowlist against the denylist and finds
+# the allowlist wanting. That is a false dichotomy: the protective controls are
+# already enumerated in @JAIL_ENV_REQUIRED below, and an allowlist that NAMES
+# them defends both directions at once.
+#
+# What the denylist could never defend, and what forced this change: it leaks
+# every variable nobody thought to name. Concretely, inherited today —
+#
+#   PERL5OPT      arbitrary code into EVERY perl process, and this toolchain is
+#                 entirely Perl. This alone is decisive.
+#   PERL5LIB      module search path hijack, same reach.
+#   LD_PRELOAD    arbitrary code into every dynamically-linked binary.
+#   NODE_OPTIONS  --require injection into any node process.
+#   GIT_CONFIG_*  GIT_SSH_COMMAND was denied by name; the rest of the family
+#                 was not, and GIT_CONFIG_COUNT/KEY/VALUE reconstruct it.
+#
+# A denylist cannot be completed: every entry is a name someone remembered. The
+# allowlist inverts the default so an unnamed variable is absent BY
+# CONSTRUCTION, which is the only property that survives the next unknown
+# vector.
+#
+# FAIL DIRECTION, the deciding argument. Getting the allowlist wrong breaks the
+# jail — loudly, immediately, and visibly. Getting the denylist wrong grants a
+# capability silently and forever. Fail-closed-and-visible beats
+# fail-open-and-invisible.
+#
+# THE DENYLIST IS KEPT and still applied, as a final subtractive pass after the
+# allowlist. Belt and braces: if a secret ever acquires an allowed prefix (a
+# BP_-named credential, say), it is still removed. Nothing that C13 asserted
+# stops being true.
+#
+# ---------------------------------------------------------------------------
+# ORIGINAL RATIONALE (b33), retained verbatim:
+#
 # WHY A DENYLIST AND NOT AN ALLOWLIST — the question was asked directly and the
 # obvious answer is wrong.
 #
@@ -281,10 +322,65 @@ our @JAIL_ENV_REQUIRED = qw(
     IS_SANDBOX
 );
 
+# The allowlist. Everything the jail legitimately needs, named explicitly:
+#   - what a jailed worker READS (BP_*, PATH)
+#   - the protective controls from @JAIL_ENV_REQUIRED, which MUST be here or
+#     dropping them becomes the privilege increase the rationale above warns of
+#   - the minimum a process needs to run at all (HOME, TMPDIR, locale, TERM).
+#     HOME especially: without it many tools write to '/' or fail obscurely.
+our @JAIL_ENV_ALLOW_EXACT = qw(
+    BP_DIR BP_LEDGER BP_PACKAGE BP_PROJECT_ROOT BP_WRITE_SET
+
+    PATH HOME TMPDIR TERM TZ
+    LANG LC_ALL LC_CTYPE
+    USER LOGNAME SHELL
+
+    npm_config_ignore_scripts
+    DISABLE_AUTOUPDATER
+    DISABLE_UPGRADE_COMMAND
+    DISABLE_INSTALL_GITHUB_APP_COMMAND
+    IS_SANDBOX
+    CLAUDE_SANDBOX
+);
+
+# Prefix-allowed families. Deliberately NARROW, and every entry here is a
+# weakening of "absent by construction" that has to earn its place.
+#
+# There is no CLAUDE_ prefix: that would readmit CLAUDE_CODE_OAUTH_TOKEN, the
+# exact secret the denylist exists to stop.
+#
+# There is no BP_ prefix either, and that is not obvious. It was here, and t/80's
+# canary — BP_JAIL_CANARY, an arbitrary name — SURVIVED the boundary because of
+# it. A prefix readmits every future variable someone names with it, which is
+# the denylist's own failure mode reintroduced from the other side. The five
+# BP_ variables a jailed worker actually reads are enumerated above instead.
+#
+# The two config families are kept: they are genuinely open-ended (npm and pnpm
+# define the names, not us), they carry protective settings including the
+# >=7-day supply-chain rule that @JAIL_ENV_REQUIRED omits, and neither namespace
+# carries a credential.
+our @JAIL_ENV_ALLOW_PREFIX = qw(
+    npm_config_
+    PNPM_CONFIG_
+);
+
 # Called in the forked child immediately before exec, so the parent's own environment is
 # untouched — the coordinator still needs the cookie to poll spend.
+#
+# ORDER MATTERS: build from the allowlist first, then apply the denylist as a
+# subtractive pass. The second step is redundant for every name known today and
+# deliberately kept anyway — it is what catches a future secret that happens to
+# be named with an allowed prefix.
 sub scrub_jail_env {
-    delete $ENV{$_} for @JAIL_ENV_DENYLIST;
+    my %keep;
+    for my $k (keys %ENV) {
+        if (grep { $k eq $_ } @JAIL_ENV_ALLOW_EXACT) { $keep{$k} = 1; next }
+        for my $p (@JAIL_ENV_ALLOW_PREFIX) {
+            if (index($k, $p) == 0) { $keep{$k} = 1; last }
+        }
+    }
+    delete $ENV{$_} for grep { !$keep{$_} } keys %ENV;
+    delete $ENV{$_} for @JAIL_ENV_DENYLIST;      # belt and braces — see above
     return;
 }
 

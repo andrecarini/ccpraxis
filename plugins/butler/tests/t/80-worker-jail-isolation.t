@@ -812,4 +812,106 @@ SKIP: {
     File::Path::remove_tree($proj)     if -e $proj;
 }
 
+# =====================================================================================
+# b48 -- C21..C23: THE BOUNDARY IS AN ALLOWLIST, PROVEN BY A CANARY.
+#
+# C13 above asserts the boundary in both directions, but only over NAMED
+# variables: the denied credentials are absent and the protective controls are
+# present. A denylist passes that test by construction while leaking everything
+# it never thought to name -- PERL5OPT (arbitrary code into EVERY perl process,
+# and this toolchain is entirely Perl), LD_PRELOAD, NODE_OPTIONS, GIT_CONFIG_*.
+#
+# So the assertion that matters is about an ARBITRARY variable, not a known-bad
+# one. Enumerating known-bad names in the test reproduces the denylist bug in
+# the test layer -- the test would pass for exactly the reason the code is wrong.
+#
+# C22 keeps the OTHER direction honest: the recorded argument against an
+# allowlist was that dropping controls-delivered-as-environment is a privilege
+# INCREASE (npm_config_ignore_scripts re-enabling postinstall execution, and so
+# on). That argument is correct, and it is why the allowlist must NAME those
+# controls rather than be minimal.
+# =====================================================================================
+{
+    my $jailroot = File::Temp->newdir(CLEANUP => 1) . "";
+    my $proj     = File::Temp->newdir(CLEANUP => 1) . "";
+
+    my $src = do { open my $fh, '<', $BP_JAIL or die "open bp-jail.pl: $!"; local $/; <$fh> };
+
+    # The allowlist must EXIST as a named construct. Parsed from source rather
+    # than assumed, in the same style as C13's harness.
+    my ($allow_block) = $src =~ /\@JAIL_ENV_ALLOW(?:_EXACT)?\s*=\s*qw\(([^)]*)\)/s;
+    ok(defined $allow_block, 'C21 HARNESS: an env ALLOWLIST was parsed out of bp-jail.pl')
+        or diag('no @JAIL_ENV_ALLOW / @JAIL_ENV_ALLOW_EXACT found -- boundary is still subtractive');
+
+    SKIP: {
+        skip('C21: no allowlist to exercise', 4) unless defined $allow_block;
+
+        my @allow = grep { length } split /\s+/, $allow_block;
+        cmp_ok(scalar(@allow), '>', 0, 'C21: the allowlist is non-empty');
+
+        # The protective controls the recorded rationale names must survive --
+        # otherwise the allowlist is the privilege increase that argument warned
+        # about. Derived from @JAIL_ENV_REQUIRED, never a literal list here.
+        my ($reqd_block) = $src =~ /\@JAIL_ENV_REQUIRED\s*=\s*qw\(([^)]*)\)/s;
+        my @reqd = grep { length } split /\s+/, ($reqd_block // '');
+        my %in_allow = map { $_ => 1 } @allow;
+        my @missing  = grep { !$in_allow{$_} } @reqd;
+        is(scalar(@missing), 0,
+            'C22: every protective control in @JAIL_ENV_REQUIRED is named in the allowlist')
+            or diag("dropped controls would be a PRIVILEGE INCREASE: @missing");
+
+        # --- the canary: an ARBITRARY name nobody thought to deny -------------
+        local $ENV{BP_JAIL_CANARY}  = 'canary-must-not-cross-9c21f';
+        local $ENV{PERL5OPT}        = '-Mstrict';
+        local $ENV{LD_PRELOAD}      = '/tmp/nonexistent-b48.so';
+        local $ENV{NODE_OPTIONS}    = '--max-old-space-size=64';
+        local $ENV{GIT_CONFIG_COUNT} = '1';
+
+        # C23 exercises scrub_jail_env DIRECTLY rather than through `jail run`.
+        # The full path needs chroot and a built jail, which is not available in
+        # every environment -- and a canary that SKIPS is worthless, since the
+        # skip is indistinguishable from the leak it exists to catch ("the
+        # condition is the failure state"). Calling the boundary function in a
+        # child process is deterministic everywhere and tests the same code the
+        # forked child runs immediately before exec.
+        # Written to a file rather than passed via -e: shell quoting has mangled
+        # multi-line perl in this repo before, and a probe that fails to RUN
+        # returns an error string that vacuously satisfies every `unlike` below.
+        # (That is not hypothetical -- it happened while writing this block, and
+        # only the PATH counterpart assertion caught it.)
+        my ($pfh, $pfile) = File::Temp::tempfile('b48-probe-XXXXXX', SUFFIX => '.pl', UNLINK => 1);
+        # bp-jail.pl declares no `package`, so its subs live in main::.
+        print $pfh <<'PROBE';
+require $ARGV[0];
+main::scrub_jail_env();
+print join("\n", sort keys %ENV), "\n";
+PROBE
+        close $pfh;
+
+        # stdout ONLY. A deliberately-nonexistent LD_PRELOAD makes ld.so warn on
+        # stderr, and folding that into the captured text would let the warning
+        # text satisfy the assertions below.
+        my $envout = `"$^X" "$pfile" "$BP_JAIL" 2>/dev/null`;
+        my $rc = $? >> 8;
+
+        is($rc, 0, 'C23 HARNESS: scrub_jail_env is callable in a child process') or diag($envout);
+
+        unlike($envout, qr/^BP_JAIL_CANARY$/m,
+            'C23: an ARBITRARY unnamed variable does not survive the boundary '
+            . '(the assertion a denylist cannot pass)')
+            or diag("survived:\n$envout");
+
+        for my $vector (qw(PERL5OPT LD_PRELOAD NODE_OPTIONS GIT_CONFIG_COUNT)) {
+            unlike($envout, qr/^\Q$vector\E$/m,
+                "C23: $vector does not survive the boundary (named regression anchor)");
+        }
+
+        like($envout, qr/^PATH$/m,
+            'C23 (counterpart): PATH DOES survive -- the allowlist is not simply emptying the environment');
+    }
+
+    File::Path::remove_tree($jailroot) if -e $jailroot;
+    File::Path::remove_tree($proj)     if -e $proj;
+}
+
 done_testing();
