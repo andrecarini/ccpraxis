@@ -71,6 +71,22 @@
 use strict;
 use warnings;
 use FindBin qw($Bin);
+
+# The BP_MAX_PARALLEL default, read from bp-launch.sh rather than hardcoded.
+# b23 raised it 2 -> 3; the operator reversed that on 2026-08-04 and it is 2
+# again. C6 pinned the literal both times, so BOTH the raise and the reversal
+# read as regressions here. What C6 protects is that the orchestrator's two
+# sites agree with bp-launch.sh -- they HAD silently diverged (2 vs 3), which
+# is the bug the literal could never catch. Derive it, and the assertion
+# survives any future tuning while still catching divergence.
+my $DEFAULT_PAR = do {
+    open my $fh, '<', "$Bin/../../scripts/bp-launch.sh" or die "cannot read bp-launch.sh: $!";
+    local $/; my $c = <$fh>; close $fh;
+    my ($n) = $c =~ /BP_MAX_PARALLEL:-(\d+)/;
+    die "no BP_MAX_PARALLEL default in bp-launch.sh\n" unless $n;
+    $n + 0;
+};
+
 use Test::More;
 use JSON::PP;
 use File::Temp qw(tempdir);
@@ -403,8 +419,8 @@ MD
         local %ENV = %ENV;
         delete $ENV{BP_MAX_PARALLEL};
         my $t = BpOrch::_tunables_base();
-        is($t->{max_par}, 3,
-            "C6 (site 1: _tunables_base default): BP_MAX_PARALLEL defaults to 3 with no env override");
+        is($t->{max_par}, $DEFAULT_PAR,
+            "C6 (site 1: _tunables_base default): BP_MAX_PARALLEL matches bp-launch.sh's default with no env override");
     }
     {
         local %ENV = %ENV;
@@ -455,8 +471,8 @@ MD
         } or $err = $@;
         ok(@seen >= 1, "C6 (site 2) setup: the launch seam fired at least once this tick")
             or diag("err=" . ($err // '(none)'));
-        is((@seen ? $seen[0] : undef), 3,
-            "C6 (site 2: per-tick local export): BP_MAX_PARALLEL unset -> bp-launch.sh's own cap sees 3, not 2");
+        is((@seen ? $seen[0] : undef), $DEFAULT_PAR,
+            "C6 (site 2: per-tick local export): BP_MAX_PARALLEL unset -> the per-tick export matches bp-launch.sh's default");
     }
     {
         local %ENV = %ENV;

@@ -19,6 +19,28 @@ use Test::More;
 use JSON::PP;
 use File::Temp qw(tempdir);
 
+# The BP_MAX_PARALLEL default, read from bp-launch.sh rather than hardcoded.
+#
+# AC-22/AC-23/AC-24 below assert what happens when .tunables is absent or
+# malformed: the cap "stays at the default". Twenty-one of those assertions
+# pinned the literal 3, so re-tuning the default (3 -> 2, operator ruling
+# 2026-08-04 reversing AUTHOR-01/b23) read as twenty-one behavioural
+# regressions. The number was never the property; falling back to THE DEFAULT
+# is.
+#
+# Deriving it from bp-launch.sh does double duty: it also makes these tests
+# fail if the two defaults ever diverge again — bp-launch.sh and
+# bp-orchestrator.pl each carry their own, and they HAD silently disagreed
+# (2 vs 3) with nothing asserting they agree.
+my $DEFAULT_PAR = do {
+    my $p = "$Bin/../../scripts/bp-launch.sh";
+    open my $fh, '<', $p or die "cannot read bp-launch.sh: $!";
+    local $/; my $c = <$fh>; close $fh;
+    my ($n) = $c =~ /BP_MAX_PARALLEL:-(\d+)/;
+    die "no BP_MAX_PARALLEL default found in bp-launch.sh\n" unless $n;
+    $n + 0;
+};
+
 require "$Bin/../../scripts/bp-orchestrator.pl";
 
 my $J    = JSON::PP->new->canonical;
@@ -285,19 +307,19 @@ sub write_ledger {
     delete local $ENV{BP_DEFAULT_MAX_TURNS};
 
     my $base = sc(sub { BpOrch::_tunables() });
-    is(hv($base, "max_par"), 3, "AC-24 zero-arg _tunables() still yields the env/default max_par of 3");
+    is(hv($base, "max_par"), $DEFAULT_PAR, "AC-24 zero-arg _tunables() still yields the env/default max_par");
 
     my $tf = "$runs/.tunables";
     my @bad = ('not json', '[]', '{"max_par":"lots"}', '{"max_par":0}', '{"max_par":-1}',
                '{"totally_unknown":9}', '{"max_par":null}', '{"max_par":2.5}', '', '{"max_par":');
     for my $b (@bad) {
         spit($tf, $b);
-        is(hv(sc(sub { BpOrch::_tunables($runs) }), "max_par"), 3,
-           "AC-24 .tunables = '$b' leaves max_par at the env/default 3 (never dies)");
+        is(hv(sc(sub { BpOrch::_tunables($runs) }), "max_par"), $DEFAULT_PAR,
+           "AC-24 .tunables = '$b' leaves max_par at the env/default (never dies)");
     }
     unlink $tf;
-    is(hv(sc(sub { BpOrch::_tunables($runs) }), "max_par"), 3,
-       "AC-24 absent .tunables -> max_par 3 (b23 raised the default from 2)");
+    is(hv(sc(sub { BpOrch::_tunables($runs) }), "max_par"), $DEFAULT_PAR,
+       "AC-24 absent .tunables -> max_par is the bp-launch.sh default");
 
     spit($tf, '{"max_par":4}');
     is(hv(sc(sub { BpOrch::_tunables($runs) }), 'max_par'), 4,
@@ -324,7 +346,7 @@ sub write_ledger {
     spit("$dir/elsewhere.json", '{"max_par":7}');
     is(hv(sc(sub { BpOrch::_tunables($runs, "$dir/elsewhere.json") }), 'max_par'), 7,
        'AC-23 explicit $file arg overrides the default runs/.tunables path');
-    is(hv(sc(sub { BpOrch::_tunables($runs, "$dir/nope.json") }), "max_par"), 3,
+    is(hv(sc(sub { BpOrch::_tunables($runs, "$dir/nope.json") }), "max_par"), $DEFAULT_PAR,
        'AC-23 explicit $file arg pointing at a missing file -> defaults, never dies');
 }
 
@@ -707,7 +729,30 @@ my $PIPE_2 = "## Pipeline\n- [x] a\n- [x] b\n";
     {
         my $dir = mk_bp([map { ["n$_", '-', 'pending', "n$_/", ''] } 1..5]);
         my ($L, $err) = go(dir => $dir);
-        is(scalar @$L, 3, "AC-22 with no .tunables and BP_MAX_PARALLEL unset the cap is the default 3 (b23 raised it from 2)");
+        # RETARGETED 2026-08-04 (operator ruling: default back to 2, reversing
+        # AUTHOR-01/b23 — see the ledger). This used to pin the literal 3.
+        #
+        # The number is not what AC-22 protects, and pinning it hid a REAL bug:
+        # bp-launch.sh and bp-orchestrator.pl each carry their own default, and
+        # they had silently diverged (2 vs 3) with nothing asserting they agree.
+        # A launch through one path got a different cap than through the other.
+        #
+        # So assert the property that actually matters — the two sites agree —
+        # by reading bp-launch.sh's default and requiring the orchestrator to
+        # produce the same cap. Survives tuning; catches divergence, which the
+        # literal never could.
+        my $launch_sh = do {
+            my $p = "$Bin/../../scripts/bp-launch.sh";
+            open my $fh, '<', $p or die "cannot read bp-launch.sh: $!";
+            local $/; my $c = <$fh>; close $fh; $c;
+        };
+        my ($launch_default) = $launch_sh =~ /BP_MAX_PARALLEL:-(\d+)/;
+        ok(defined $launch_default && $launch_default > 0,
+           'AC-22 bp-launch.sh states a positive BP_MAX_PARALLEL default')
+            or diag('could not parse a default out of bp-launch.sh');
+        is(scalar @$L, $launch_default,
+           "AC-22 with no .tunables and BP_MAX_PARALLEL unset, the orchestrator cap MATCHES "
+         . "bp-launch.sh's default ($launch_default) -- the two must never diverge");
     }
 
     # ---- AC-23: the re-read happens per TICK, not once at boot -----------
@@ -730,8 +775,8 @@ my $PIPE_2 = "## Pipeline\n- [x] a\n- [x] b\n";
         });
         my $t0 = grep { $_->{tick} == 0 } @rec;
         my $t1 = grep { $_->{tick} == 1 } @rec;
-        is($t0, 3, "AC-23 tick 1 launches 3 (no .tunables yet -> default max_par 3)");
-        is($t1, 1, 'AC-23 tick 2 launches 1 more — .tunables raised max_par to 4 and 3 are already live');
+        is($t0, $DEFAULT_PAR, "AC-23 tick 1 launches the default cap (no .tunables yet)");
+        is($t1, 4 - $DEFAULT_PAR, "AC-23 tick 2 tops up to 4 -- .tunables raised max_par to 4 and the default were already live");
         is(scalar @rec, 4, 'AC-23 four packages live in total after the mid-run bump');
     }
 
@@ -741,7 +786,7 @@ my $PIPE_2 = "## Pipeline\n- [x] a\n- [x] b\n";
         spit("$dir/runs/.tunables", $bad);
         my ($L, $err) = go(dir => $dir);
         is($err, '', "AC-24 the tick completes with .tunables = '$bad'");
-        is(scalar @$L, 3, "AC-24 .tunables = '$bad' leaves the launch cap at the env/default 3");
+        is(scalar @$L, $DEFAULT_PAR, "AC-24 .tunables = '$bad' leaves the launch cap at the env/default");
     }
 
     # ---- AC-25: an injected tunables hash wins entirely (t/08, t/11 shape)

@@ -1660,7 +1660,7 @@ sub _tunables_base {
         ceil5      => $ENV{BP_CEIL_5H}            // 85,
         ceil7      => $ENV{BP_CEIL_7D}            // 90,
         drain      => $ENV{BP_DRAIN_SECS}         // 600,
-        max_par    => $ENV{BP_MAX_PARALLEL}       // 3,
+        max_par    => $ENV{BP_MAX_PARALLEL}       // 2,
         cap        => $ENV{BP_ATTEMPT_CAP}        // 5,
         flat       => $ENV{BP_FLAT_SECS}          // 600,
         watch_tick => $ENV{BP_WATCH_TICK}         // 10,
@@ -2038,7 +2038,7 @@ sub run {
             # gives extra orchestrator-side slots whose launches the shell then
             # refuses every tick. `local` is scoped to this tick, so the next
             # _tunables() re-read above still sees the operator's real environment.
-            local $ENV{BP_MAX_PARALLEL} = $t->{max_par} // 3;
+            local $ENV{BP_MAX_PARALLEL} = $t->{max_par} // 2;
 
             # ---- PAUSE GATING: maybe auto-resume; never launch while paused ----
             my $resume_pending = ($paused && !$paused->{manual}) ? 1 : 0;
