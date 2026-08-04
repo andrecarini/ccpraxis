@@ -106,6 +106,48 @@ for my $file (@files) {
             push @hits, [$file, $i + 1, "count pinned at $n (\$$var)", $desc] if $desc =~ $SHARED;
         }
 
+        # (d) STRUCTURAL, and deliberately NOUN-INDEPENDENT: a count pinned over
+        #     a DEREFERENCED container -- `scalar(keys %$table)`, `scalar(@$rows)`.
+        #
+        #     Rules (a) and (b) both gate on $SHARED, a whitelist of nouns, and
+        #     that whitelist is precisely what missed the EIGHTH instance:
+        #     t/39 pinned `glyph_table()` at exactly 18 entries, and $SHARED
+        #     carries `glyph\s*table` -- which does NOT match `glyph_table`,
+        #     because `\s*` does not match an underscore. A one-character gap in
+        #     a prose heuristic let a global pin through.
+        #
+        #     So this rule asks a STRUCTURAL question instead of a linguistic
+        #     one: you are counting something you had to DEREFERENCE, which means
+        #     it came from somewhere else -- a function return or shared state --
+        #     rather than a fixture you built in this file. That is the shape of
+        #     a global pin regardless of what the description calls it.
+        #
+        #     $LOCAL still suppresses (a fixture self-check is legitimate), and
+        #     the `# shape-lint: intentional — <reason>` marker still applies, as
+        #     t/00 filters marked lines out of these hits.
+        #     NARROWED TO KEY SETS, and the narrowing was measured rather than
+        #     guessed. Matching `@$rows` as well produced 21 candidates across
+        #     the two suites, nearly all of them legitimate -- "compose: exactly
+        #     $rows rows" counts a frame the test itself built, which is a
+        #     package asserting its own behaviour. A lint at that noise level is
+        #     one nobody runs, which is how the earlier 47-candidate draft died.
+        #
+        #     A KEY SET is different in kind, and it is the doctrine's own
+        #     example: the keys of a returned structure are its SHAPE, and
+        #     pinning them forbids every later package from extending it. Row
+        #     counts are behaviour; key counts are shape.
+        if ($ctx =~ /\bis\s*\(.*?scalar\s*\(\s*keys\s*%\$(\w+)/s) {
+            my $var = $1;
+            if ($ctx =~ /,\s*(\d+)\s*,\s*(['"])(.*?)\2/s) {
+                my ($n, $desc) = ($1, $3);
+                if ($n > 2 && $desc !~ $LOCAL) {
+                    push @hits, [$file, $i + 1, "count pinned at $n (dereferenced \$$var)", $desc]
+                        # do not double-report what (a)/(b) already flagged
+                        unless grep { $_->[0] eq $file && $_->[1] == $i + 1 } @hits;
+                }
+            }
+        }
+
         # (c) a magic integer inside a regex that also names a source-file
         #     identifier — the shape that pinned launcher.pl's poll cadence.
         if ($line =~ /qr\{?\/?[^\n]*\$(\w+)\\s\*>=\\s\*(\d+)/) {

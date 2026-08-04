@@ -221,7 +221,7 @@ criterion('AC-2 -> DC-1: collect_butler_sids returns exactly the 3 expected UUID
 criterion('AC-3 -> DC-1: case + shape normalization; malformed beta entries contribute nothing', sub {
     my $root = build_fixture_registry_root();
     my $sids = SessionFilter::collect_butler_sids($root);
-    is(scalar(keys %$sids), 3, 'exactly 3 keys total (q2/q3/q4/q5/q6 in bp-beta contribute nothing)');
+    is(scalar(keys %$sids), 3, 'exactly 3 keys total (q2/q3/q4/q5/q6 in bp-beta contribute nothing)');   # shape-lint: intentional — $sids is derived from build_fixture_registry_root(), a fixture THIS test builds, so the count asserts this package's own filtering behaviour rather than the shape of a shared artifact; the whole point is that the malformed beta entries contribute nothing, which a floor could not express.
     ok(exists $sids->{'bbbbbbbb-1111-2222-3333-444444444444'},
         'the uppercase BBBBBBBB-... fixture value is stored lowercase');
     is(SessionFilter::is_butler_session('bbbbbbbb-1111-2222-3333-444444444444', $sids), 1,

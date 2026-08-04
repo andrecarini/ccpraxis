@@ -1335,8 +1335,16 @@ my %BACKPACK_FIXTURE = ( total => 1, approved => 1, items => [ { key => 'apt:jq'
 {
     my $table = Dashboard::glyph_table();
     is(ref($table), 'HASH', 'AC-28: glyph_table() returns a hashref');
-    is(ref($table) eq 'HASH' ? scalar(keys %$table) : -1, 18,
-        'AC-28: glyph_table() STILL has exactly 18 entries -- this package adds no glyph (B27)');
+    # SUPERSEDED (s23): `is(... scalar(keys %$table) ..., 18, ...)`.
+    #
+    # The INTENT -- "B27 adds no glyph" -- is a statement about this package's
+    # own diff, and a table-size equality cannot express it: the assertion does
+    # not actually say "B27 added none", it says "nobody has added one since",
+    # which forbids every later package from extending a shared artifact. That
+    # is the shape-pin defect, and B27's own intent is better served by its diff
+    # than by freezing a global count. Floor instead.
+    cmp_ok(ref($table) eq 'HASH' ? scalar(keys %$table) : -1, '>=', 18,
+        'AC-28: glyph_table() still carries the glyphs this package relies on (floor, not a pin)');
 
     for my $cols (80, 120) {
         my @panels = Dashboard::build_panels({ %BASE_STATE, resources => { %B10 } }, $cols);

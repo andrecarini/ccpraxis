@@ -85,7 +85,14 @@ for my $line (split /\n/, $out) {
     # multi-byte dash never matched the class and a properly-reasoned opt-out
     # was still reported. Match the marker, then require >= 3 word characters
     # of actual justification after it, however it is punctuated.
-    if ($src =~ /#\s*shape-lint:\s*intentional\b(.*)$/) {
+    #
+    # /m IS LOAD-BEARING, and its absence was a second instance of the same bug
+    # the paragraph above describes. $src is a THREE-LINE window; without /m,
+    # `$` anchors to the end of that whole string, so the marker was recognised
+    # only when it happened to fall on the window's LAST line. A correctly
+    # marked opt-out one line earlier was still reported as unexcused -- found
+    # by s23 when exactly that happened to t/49-session-filter.t:224.
+    if ($src =~ /#\s*shape-lint:\s*intentional\b(.*)$/m) {
         my $reason = $1;
         $reason =~ s/[^A-Za-z0-9]+//g;
         next if length($reason) >= 3;
