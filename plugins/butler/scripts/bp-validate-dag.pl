@@ -15,8 +15,9 @@ use warnings;
 package BpValidateDag;
 
 use File::Basename qw(dirname);
+use Cwd ();
 
-my $DIR = dirname(__FILE__);
+my $DIR = dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; Cwd::abs_path($f) // $f });
 
 # b08 step-7 FIX 1 (reviewer, should-fix): this require used to be bare, while
 # every other risky call in this file is eval-wrapped. It runs inside the

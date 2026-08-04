@@ -18,6 +18,7 @@ use JSON::PP;
 use File::Find;
 use File::Path  qw(make_path);
 use File::Basename qw(dirname);
+use Cwd ();
 use Time::Local qw(timegm);
 use Getopt::Long;
 
@@ -56,7 +57,7 @@ USAGE
     exit 0;
 }
 
-$rates_path //= dirname(__FILE__) . '/usage-audit-rates.json';
+$rates_path //= dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; Cwd::abs_path($f) // $f }) . '/usage-audit-rates.json';
 my $RATES = do {
     open(my $fh, '<', $rates_path) or die "cannot read rate card $rates_path: $!\n";
     local $/;

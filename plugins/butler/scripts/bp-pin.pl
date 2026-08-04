@@ -72,7 +72,7 @@ use JSON::PP;
 # RELATIVE, so `require "$DIR/..."` searches @INC, which has not contained '.'
 # since perl 5.26 (see 9e85473/d846cfa's bp-blueprint.pl fix for the exact
 # failure shape). abs_path(__FILE__) is stable under both invocation styles.
-my $DIR = dirname(abs_path(__FILE__));
+my $DIR = dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; abs_path($f) // $f });
 
 # The REAL EOL/LTS table. Consumed, never copied (spec b46 sec3/C5).
 require "$DIR/bp-deps-check.pl";

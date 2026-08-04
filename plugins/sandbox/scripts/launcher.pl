@@ -228,10 +228,15 @@ $PROJECT_NAME =~ s/ /-/g;
 # launcher.pl lives at <ccpraxis>/plugins/sandbox/scripts/launcher.pl
 # so scripts->sandbox->plugins->ccpraxis is three dirname() calls.
 my $LIVE_CCPRAXIS_ROOT = do {
-    my $h = abs_path(__FILE__);
+    # NORMALISE BEFORE abs_path, not after. Under Git-Bash/msys perl a raw
+    # `C:\...` path is not recognised as absolute, so abs_path treats it as
+    # RELATIVE and prepends the CWD -- silently anchoring the whole ccpraxis
+    # install detection to wherever the user happened to be standing. The
+    # substitution used to sit one line below, which is too late to help.
+    (my $self = __FILE__) =~ s|\\|/|g;
+    my $h = abs_path($self);
     die "ERROR: cannot canonicalise launcher.pl's own path via abs_path(__FILE__) "
         . "-- refusing to guess the ccpraxis install anchor\n" unless defined $h;
-    $h =~ s|\\|/|g;
     my $s = dirname($h);
     dirname(dirname(dirname($s)));
 };

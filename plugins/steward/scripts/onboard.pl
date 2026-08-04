@@ -28,7 +28,7 @@ my $root = shift @ARGV or die "usage: onboard.pl <project-root>\n";
 $root =~ s{[/\\]+$}{};
 die "onboard: not a directory: $root\n" unless -d $root;
 
-my $script_dir = dirname(abs_path(__FILE__));        # plugins/steward/scripts
+my $script_dir = dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; abs_path($f) // $f });        # plugins/steward/scripts
 my $plugins    = abs_path("$script_dir/../..");        # plugins/
 my $ccpraxis   = abs_path("$plugins/..");              # repo root
 my $bp_migrate = "$plugins/blueprint/scripts/bp-migrate-plans.pl";

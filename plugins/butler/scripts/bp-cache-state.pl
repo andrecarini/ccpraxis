@@ -47,7 +47,7 @@ use Cwd qw(abs_path getcwd);
 # Absolute script dir so `require "$DIR/..."` resolves no matter how this script
 # is invoked (relative CLI path, absolute, or `require`d from a test) — the same
 # convention bp-orchestrator.pl / bp-answer-decision.pl / bp-blueprint.pl already use.
-my $DIR = dirname(abs_path(__FILE__));
+my $DIR = dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; abs_path($f) // $f });
 
 # Reuse bp-orchestrator.pl's seek-from-end reader (BpOrch::_last_nonempty_line) and
 # its atomic, locked registry writer (BpOrch::update_registry_pkg). This require is

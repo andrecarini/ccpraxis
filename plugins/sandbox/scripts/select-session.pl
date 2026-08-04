@@ -29,6 +29,7 @@
 use strict;
 use warnings;
 use File::Basename qw(basename dirname);
+use Cwd ();
 use POSIX qw(strftime);
 
 binmode STDOUT, ':raw';
@@ -120,7 +121,7 @@ my $HAVE_SESSION_FILTER;   # undef = not tried yet
 
 sub load_session_filter {
     return $HAVE_SESSION_FILTER if defined $HAVE_SESSION_FILTER;
-    my $dir = File::Basename::dirname(__FILE__);
+    my $dir = File::Basename::dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; Cwd::abs_path($f) // $f });
     $HAVE_SESSION_FILTER = eval { require "$dir/SessionFilter.pm"; 1 } ? 1 : 0;
     return $HAVE_SESSION_FILTER;
 }

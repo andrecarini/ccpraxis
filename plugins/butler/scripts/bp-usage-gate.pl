@@ -66,7 +66,7 @@ use Cwd qw(abs_path);
 # Absolute script dir so `require "$DIR/..."` resolves no matter how this script
 # is invoked (relative CLI path, absolute, or from another dir) — a relative path
 # would be searched in @INC and fail.
-my $DIR = dirname(abs_path(__FILE__));
+my $DIR = dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; abs_path($f) // $f });
 require "$DIR/bp-govern.pl";
 require "$DIR/bp-http.pl";
 require "$DIR/bp-contract.pl";

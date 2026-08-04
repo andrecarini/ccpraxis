@@ -48,7 +48,7 @@ BEGIN { $ENV{MSYS2_ARG_CONV_EXCL} = '*' if $^O =~ /^(MSWin32|cygwin|msys)$/; }
 
 # Absolute script dir so `require "$DIR/..."` resolves no matter how this script
 # is invoked (relative CLI path, absolute, or `require`d from a test).
-my $DIR = dirname(abs_path(__FILE__));
+my $DIR = dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; abs_path($f) // $f });
 require "$DIR/bp-govern.pl";
 require "$DIR/bp-contract.pl";
 require "$DIR/bp-log.pl";
@@ -670,7 +670,7 @@ sub _observe_cache {
     my $ok = eval {
         require Cwd;
         require File::Basename;
-        my $d = File::Basename::dirname(Cwd::abs_path(__FILE__));
+        my $d = File::Basename::dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; Cwd::abs_path($f) // $f });
         require "$d/bp-cache-state.pl";
         BpCacheState::observe_from_runs("$bpdir/runs", $pkg, $now);
         1;
@@ -2661,7 +2661,7 @@ sub run {
                         my ($sv, $sr) = eval {
                             require Cwd;
                             require File::Basename;
-                            my $d = File::Basename::dirname(Cwd::abs_path(__FILE__));
+                            my $d = File::Basename::dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; Cwd::abs_path($f) // $f });
                             require "$d/bp-progress.pl";
                             my $flagged = _repeat_flagged_recently($runs, $pkg) ? 1 : 0;
                             BpProgress::verdict_from_runs($runs, $pkg, $now, $flagged);
@@ -2793,7 +2793,7 @@ sub run {
                                         eval {
                                             require Cwd;
                                             require File::Basename;
-                                            my $d = File::Basename::dirname(Cwd::abs_path(__FILE__));
+                                            my $d = File::Basename::dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; Cwd::abs_path($f) // $f });
                                             require "$d/bp-progress.pl";
                                             BpProgress::capped_from_runs($runs, $pkg, $now);
                                         };
@@ -2833,7 +2833,7 @@ sub run {
                                 my $v = eval {
                                     require Cwd;
                                     require File::Basename;
-                                    my $d = File::Basename::dirname(Cwd::abs_path(__FILE__));
+                                    my $d = File::Basename::dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; Cwd::abs_path($f) // $f });
                                     require "$d/bp-cache-state.pl";
                                     # verdict_from_runs takes the runs dir directly -- verdict()
                                     # resolves <root>/blueprints/<bp>/runs, and here we already

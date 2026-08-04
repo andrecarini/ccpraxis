@@ -76,7 +76,7 @@
 
 use File::Basename qw(dirname);
 use Cwd qw(abs_path);
-my $SELF_DIR = dirname(abs_path(__FILE__));
+my $SELF_DIR = dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; abs_path($f) // $f });
 my $ORCH_SRC = "$SELF_DIR/bp-orchestrator.pl";
 
 package BpAnswer;
@@ -198,7 +198,7 @@ use File::Basename qw(dirname);
 use Cwd qw(abs_path);
 use File::Spec ();
 
-my $DIR = dirname(abs_path(__FILE__));
+my $DIR = dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; abs_path($f) // $f });
 require "$DIR/bp-orchestrator.pl";   # reuse BpOrch atomic ledger/registry/pause writers
 
 # bp-ledger.pl (b17 1.2) declares no `package` of its own, so requiring it installs

@@ -112,7 +112,7 @@ my @HARD_EXCLUDE_REGEX = (
     qr{^\.ccpraxis-local-data/blueprints/[^/]+/runs(?:/|$)},
 );
 
-my $SCRIPT_DIR = abs_path(dirname(__FILE__));
+my $SCRIPT_DIR = dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; abs_path($f) // $f });
 my $SENSITIVE_CHECK = "$SCRIPT_DIR/sensitive-check.pl";   # sibling in plugins/steward/scripts/
 
 # Perl-native secret patterns — mirror sensitive-check.pl. Defined here (before the

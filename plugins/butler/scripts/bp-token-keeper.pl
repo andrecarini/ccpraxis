@@ -24,8 +24,9 @@ use JSON::PP;
 use Fcntl qw(:flock O_WRONLY O_CREAT O_EXCL);
 use Errno qw(EBUSY EXDEV);
 use File::Basename qw(dirname);
+use Cwd ();
 
-my $DIR = dirname(__FILE__);
+my $DIR = dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; Cwd::abs_path($f) // $f });
 require "$DIR/bp-govern.pl";
 require "$DIR/bp-contract.pl";
 require "$DIR/bp-log.pl";

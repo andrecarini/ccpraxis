@@ -48,7 +48,7 @@ use File::Basename qw(dirname);
 use Cwd qw(abs_path);
 use Fcntl ();
 
-my $DIR = dirname(abs_path(__FILE__));
+my $DIR = dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; abs_path($f) // $f });
 require "$DIR/bp-log.pl";   # mandated_means — loaded unconditionally, no HTTP inside it.
 
 # ---------------------------------------------------------------------------

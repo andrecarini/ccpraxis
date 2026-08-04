@@ -40,7 +40,7 @@ use Cwd qw(abs_path);
 use Fcntl ();
 use JSON::PP;
 
-my $DIR = dirname(abs_path(__FILE__));
+my $DIR = dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; abs_path($f) // $f });
 require "$DIR/bp-spend.pl";   # BpSpend::resolve_credential -- reused for --status parseability, never reimplemented.
 
 sub _home {

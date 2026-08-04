@@ -36,7 +36,7 @@ use Cwd qw(abs_path);
 # "Can't locate plugins/butler/scripts/bp-orchestrator.pl in @INC" for every real invocation.
 # t/86 did not catch it because the harness supplies its own @INC. bp-drive-next.pl already uses
 # this form; bp-validate-dag.pl has the same latent bug, masked by callers passing `-I.`.
-my $DIR = dirname(abs_path(__FILE__));
+my $DIR = dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; abs_path($f) // $f });
 
 # The REAL parser/resolver. Never reimplement BpOrch::parse_dag or
 # BpOrch::resolve_dep_token -- this is the b12/b13 lesson restated (spec §2.3).

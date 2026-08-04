@@ -63,7 +63,7 @@ BEGIN { $ENV{MSYS2_ARG_CONV_EXCL} = '*' if $^O =~ /^(MSWin32|cygwin|msys)$/; }
 our $VERDICT_RETRY_MAX = 3;
 
 # Absolute script dir: lets tests `require` from any working dir.
-my $DIR = dirname(abs_path(__FILE__));
+my $DIR = dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; abs_path($f) // $f });
 
 # b44: require bp-orchestrator.pl SOLELY to delegate to its one new pure
 # function, BpOrch::order_ready (priority-ordering of an already-eligible ready

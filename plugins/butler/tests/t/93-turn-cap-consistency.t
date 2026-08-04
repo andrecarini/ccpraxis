@@ -174,4 +174,75 @@ for my $path (sort glob("$ROOT/plugins/*/agents/*.md")) {
     is(BpTurnCaps::script_dir_for(''),    undef, 'C8: empty in, undef out');
 }
 
+# ---------------- C9: repo-wide lint for the two path landmines --------------
+#
+# C8 proves the CORRECT helper behaves. C9 proves nothing in the tree still uses
+# the BROKEN shapes -- because the bug was never in one file, it was in an idiom
+# copied ~26 times.
+#
+# (b) exists because it bit twice IN THE COURSE OF FIXING (a): rewriting the
+# idiom introduced abs_path() calls into three files that never loaded Cwd, and
+# `perl -c` does NOT catch it -- an undefined subroutine is a RUNTIME error. Two
+# full suite sweeps were needed to find what one assertion states directly.
+
+{
+    my @src;
+    my $walk;
+    $walk = sub {
+        my ($dir) = @_;
+        opendir(my $dh, $dir) or return;
+        for my $e (sort grep { !/^\.\.?$/ } readdir $dh) {
+            my $p = "$dir/$e";
+            next if -l $p;
+            if (-d $p) { next if $e eq 'tests' || $e eq '.git'; $walk->($p); next }
+            push @src, $p if $e =~ /\.(pl|pm)$/;
+        }
+        closedir $dh;
+    };
+    $walk->("$ROOT/plugins");
+    $walk->("$ROOT/scripts");
+
+    cmp_ok(scalar(@src), '>', 0, 'C9 HARNESS: source files were found to lint');
+
+    my (@unsafe, @nocwd);
+    for my $f (@src) {
+        open my $fh, '<', $f or next;
+        my @lines = <$fh>;
+        close $fh;
+
+        my $calls_abs = 0;
+        for my $i (0 .. $#lines) {
+            my $l = $lines[$i];
+            next if $l =~ /^\s*#/;                      # prose may DISCUSS the bug
+            (my $code = $l) =~ s/#.*$//;                # strip trailing comment
+            # Strip string literals: a die/warn message may legitimately NAME
+            # the broken idiom while diagnosing it. Only executable code counts.
+            $code =~ s/"(?:\\.|[^"\\])*"//g;
+            $code =~ s/'(?:\\.|[^'\\])*'//g;
+
+            # (a) a self-directory derived without normalising separators first.
+            push @unsafe, "$f:" . ($i + 1)
+                if $code =~ /(?:dirname|abs_path)\s*\(\s*(?:Cwd::)?(?:abs_path\s*\(\s*)?__FILE__/;
+
+            $calls_abs = 1 if $code =~ /(?:Cwd::)?\babs_path\s*\(/;
+        }
+
+        # (b) abs_path used without Cwd loaded -- a RUNTIME failure perl -c misses.
+        if ($calls_abs) {
+            my $src_text = join '', @lines;
+            push @nocwd, $f unless $src_text =~ /^\s*(?:use|require)\s+Cwd\b/m;
+        }
+    }
+
+    is_deeply(\@unsafe, [],
+        'C9: no source derives its own directory from a raw __FILE__ '
+      . '(separators must be normalised first -- see script_dir_for)')
+        or diag("unsafe sites:\n  " . join("\n  ", @unsafe));
+
+    is_deeply(\@nocwd, [],
+        'C9: every file calling abs_path() also loads Cwd '
+      . '(an undefined sub is a RUNTIME error; perl -c does not catch it)')
+        or diag("missing `use Cwd`:\n  " . join("\n  ", @nocwd));
+}
+
 done_testing();
