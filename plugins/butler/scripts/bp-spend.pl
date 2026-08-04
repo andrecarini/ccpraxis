@@ -46,6 +46,7 @@ use warnings;
 use JSON::PP;
 use File::Basename qw(dirname);
 use Cwd qw(abs_path);
+use Fcntl ();
 
 my $DIR = dirname(abs_path(__FILE__));
 require "$DIR/bp-log.pl";   # mandated_means — loaded unconditionally, no HTTP inside it.
@@ -138,23 +139,21 @@ sub parse_zen {
 }
 
 # ---------------------------------------------------------------------------
-# resolve_credential(%opts) -> env-first, then a fallback file (spec §1.2).
-#   opts: env_var => NAME, env => \%ENV (injectable), fallback_path => PATH
-#   ok:  { ok => 1, cookie => $str, source => 'env'|'file' }
+# resolve_credential(%opts) -> file-only (spec b36-reopen §1: the env path is
+# REMOVED as a supported input, deliberately -- not merely unused. See the
+# reopen spec's ruling: bp-jail.pl performs no environment isolation, exec()
+# inherits %ENV wholesale, so a cookie that is never IN %ENV cannot leak via
+# the jail. env_var/env are still accepted opts for call-site compatibility
+# but are NEVER consulted -- resolution is file-only, unconditionally.
+#   opts: env_var => NAME (ignored), env => \%ENV (ignored), fallback_path => PATH
+#   ok:  { ok => 1, cookie => $str, source => 'file' }
 #   fail:{ ok => 0, reason => 'missing'|'insecure-file', detail => $str }
 # A group/world-readable fallback file is refused outright, naming the path
 # and the required mode (0600) — never silently read.
 # ---------------------------------------------------------------------------
 sub resolve_credential {
     my (%opts) = @_;
-    my $env_var       = $opts{env_var};
-    my $env           = $opts{env} // \%ENV;
     my $fallback_path = $opts{fallback_path};
-
-    if (defined $env_var && exists $env->{$env_var}
-        && defined $env->{$env_var} && length $env->{$env_var}) {
-        return { ok => 1, cookie => $env->{$env_var}, source => 'env' };
-    }
 
     if (defined $fallback_path && -e $fallback_path) {
         my @st = stat($fallback_path);
@@ -188,8 +187,8 @@ sub resolve_credential {
     return {
         ok     => 0,
         reason => 'missing',
-        detail => "no credential found: env var " . ($env_var // '(unset)') . " not set"
-                . (defined $fallback_path ? ", and no fallback file at $fallback_path" : ", and no fallback file configured"),
+        detail => "no credential found: "
+                . (defined $fallback_path ? "no usable fallback file at $fallback_path" : "no fallback file configured"),
     };
 }
 
@@ -363,6 +362,82 @@ sub verdict {
     }
 
     return { action => 'ok', reason => 'all providers reporting real figures' };
+}
+
+# ---------------------------------------------------------------------------
+# write_snapshot(%opts) -> persists the composed spend snapshot so the TUI
+# (launcher.pl's _gather_spend) can render without fetching (b36-reopen §2).
+#
+#   opts: path       => PATH (final destination, e.g. "<active run>/spend.json"),
+#         results    => \@results (each shaped like fetch()'s own return value),
+#         credential => \%opt (OPTIONAL -- accepted only so a caller that still
+#                      has the credential struct in scope cannot accidentally
+#                      leak it in; it is NEVER read, NEVER serialised, below),
+#         now        => epoch (defaults to time).
+#
+# ⚠ REDACTION IS THE BINDING CONSTRAINT (spec §2.1). This sub NEVER serialises
+# a raw result hash -- it builds each snapshot row from an explicit FIELD
+# WHITELIST (provider/status/five_hour/weekly/monthly/balance/budget/
+# diagnostic). Anything else on a result -- a stray `cookie` key, a `_debug`
+# sub-hash carrying request headers, whatever a careless composer bolted on --
+# is dropped on the floor, not merely "not forwarded" but never even looked
+# at for the write. This is what makes the redaction structural rather than
+# a matter of remembering not to pass the credential in.
+#
+# Atomic: write to a temp file in the SAME directory as $path, then rename()
+# over the final path -- a reader can never observe a half-written file.
+# Mode 0600 from creation (sysopen with the mode), never chmod'd after.
+# ---------------------------------------------------------------------------
+my @SNAPSHOT_RESULT_FIELDS = qw(provider status five_hour weekly monthly balance budget diagnostic);
+
+sub _whitelist_result {
+    my ($r) = @_;
+    return {} unless ref($r) eq 'HASH';
+    my %out;
+    for my $f (@SNAPSHOT_RESULT_FIELDS) {
+        next unless exists $r->{$f};
+        my $v = $r->{$f};
+        if (ref($v) eq 'HASH') {
+            # five_hour/weekly/monthly are the only nested shape this file
+            # ever produces (used/limit) -- whitelist those two sub-fields
+            # only, so an unexpected nested key (e.g. a smuggled credential)
+            # can never ride along even inside a field that IS on the list.
+            my %sub;
+            for my $sf (qw(used limit)) {
+                $sub{$sf} = $v->{$sf} if exists $v->{$sf};
+            }
+            $out{$f} = \%sub;
+        } else {
+            $out{$f} = $v;
+        }
+    }
+    return \%out;
+}
+
+sub write_snapshot {
+    my (%opts) = @_;
+    my $path    = $opts{path};
+    my $results = ref($opts{results}) eq 'ARRAY' ? $opts{results} : [];
+    my $now     = defined $opts{now} ? $opts{now} : time;
+
+    die "write_snapshot: path is required\n" unless defined $path && length $path;
+
+    my @clean = map { _whitelist_result($_) } @$results;
+    my $snapshot = { generated_at => BpLog::_iso_now($now), results => \@clean };
+    my $json = JSON::PP->new->canonical->encode($snapshot);
+
+    (my $dir = $path) =~ s{[/\\][^/\\]+$}{};
+    $dir = '.' unless length $dir;
+    if (length $dir && !-d $dir) { require File::Path; File::Path::make_path($dir); }
+
+    my $tmp_path = "$path.tmp.$$." . int(rand(1_000_000));
+    sysopen(my $fh, $tmp_path, Fcntl::O_WRONLY() | Fcntl::O_CREAT() | Fcntl::O_TRUNC(), 0600)
+        or die "write_snapshot: sysopen $tmp_path: $!";
+    print {$fh} $json or die "write_snapshot: write $tmp_path: $!";
+    close $fh or die "write_snapshot: close $tmp_path: $!";
+
+    rename($tmp_path, $path) or die "write_snapshot: rename $tmp_path -> $path: $!";
+    return $path;
 }
 
 package main;

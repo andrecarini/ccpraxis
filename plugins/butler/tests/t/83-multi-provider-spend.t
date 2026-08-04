@@ -75,6 +75,8 @@ my $SCRIPTS  = "$BUTLER/scripts";
 my $SPEND    = "$SCRIPTS/bp-spend.pl";
 my $LOG      = "$SCRIPTS/bp-log.pl";
 my $JAIL     = "$SCRIPTS/bp-jail.pl";
+my $AUTH     = "$SCRIPTS/bp-spend-auth.pl";
+my $DOCS     = "$BUTLER/docs/spend-credentials.md";
 
 diag("subject under test: $SPEND " . (-e $SPEND ? "(present)" : "(ABSENT -- most assertions below are expected to fail on MISSING BEHAVIOUR)"));
 
@@ -100,6 +102,26 @@ sub read_file {
     my $c = <$fh>;
     close $fh;
     return defined $c ? $c : '';
+}
+
+# run_auth($stdin_content, @argv) -> ($combined_stdout_stderr, $exit_code)
+#
+# Runs bp-spend-auth.pl as a REAL external process (never a require -- the whole
+# point of C17 is argv/stdin/echo behaviour of the actual CLI entry point), with
+# $stdin_content piped in via a temp file (never a shell pipe literal, so a cookie
+# value containing shell metacharacters cannot break quoting) and every element of
+# @argv individually double-quoted.
+sub run_auth {
+    my ($stdin_content, @args) = @_;
+    my ($sfh, $spath) = tempfile();
+    print {$sfh} (defined $stdin_content ? $stdin_content : '');
+    close $sfh;
+    my @quoted = map { (my $a = $_) =~ s/"/\\"/g; qq{"$a"} } @args;
+    my $cmd = join(' ', qq{"$^X"}, qq{"$AUTH"}, @quoted, '<', qq{"$spath"}, '2>&1');
+    my $out = `$cmd`;
+    my $rc  = $? >> 8;
+    unlink $spath;
+    return ($out, $rc);
 }
 
 # =====================================================================================
@@ -671,5 +693,352 @@ HTML
     is(($v_unknown // {})->{action}, 'unknown',
        'C11 VACUITY GATE: a real unknown still propagates even when an absent provider is also present');
 }
+
+# =====================================================================================
+# EXTENSION -- b36 REOPENED (spec: b36-spend-persistence-and-auth-spec.md, §5, C12..C20).
+# Everything below is additive to the C1..C11 oracle above, which stayed untouched.
+#
+# WRITTEN BLIND TO ANY IMPLEMENTATION, same as C1..C11. At authoring time
+# bp-spend.pl has NO write_snapshot(), NO read path used by these tests, and
+# bp-spend-auth.pl / docs/spend-credentials.md do not exist at all.
+#
+# FURTHER INVENTED CONTRACT (test-writer's job, same footing as the header block
+# above), inferred from spec §2/§2.1/§3 vocabulary and this repo's own conventions
+# (bp-pin.pl's --manifest/--fetcher override flags for test injectability):
+#
+#   BpSpend::write_snapshot(%opts) -> writes the composed snapshot.
+#     opts: path => PATH, results => \@results (each shaped like fetch()'s return),
+#           credential => \%opt (optional -- exercised only to prove it is NEVER
+#           forwarded into the written bytes, see C14), now => epoch.
+#     Must write JSON as { generated_at => ..., results => [ ...whitelisted fields... ] }
+#     atomically (temp file in the same directory, then rename) at mode 0600.
+#     Only fetch()'s own documented fields (provider/status/five_hour/weekly/
+#     monthly/balance/budget/diagnostic) may appear -- nothing else, at any depth.
+#
+#   bp-spend-auth.pl (CLI, run as a real subprocess, never required):
+#     --provider NAME              store a cookie for NAME, read from STDIN only
+#     --provider NAME --from-firefox   host-side extraction (§3.1), degrades on
+#                                       any non-Windows / no-profile / no-match case
+#     --status [--provider NAME]   report presence/mode/parseability, never the value
+#     --path PATH                  TEST-ONLY override of the credential file location
+#                                   (mirrors bp-pin.pl's --manifest/--fetcher), so this
+#                                   oracle never touches a real credential path.
+#
+# MANDATORY VACUITY GATES (this section's own, mirroring C1..C11's convention):
+#   - C14 gates on "bytes were actually written" BEFORE the negative sentinel check,
+#     so an empty/absent file cannot pass the redaction assertion for free.
+#   - C12 pairs the removed-env assertion with a same-run file-resolves positive.
+#   - C17 pairs the argv-rejection assertion with a same-run STDIN-store positive.
+#   - C18 tests only the degrade path (the happy path is Windows-only, see below);
+#     it is NOT skipped -- its absence-of-a-Windows-host does not change what is
+#     assertable about the degrade behaviour, which is fully exercisable here.
+# =====================================================================================
+
+# =====================================================================================
+# C12 -- the env credential path is GONE, not merely unused. With the env var set and
+# NO file, resolve_credential must report `missing`. Paired positive: a 0600 file
+# resolves regardless of what the (must-be-ignored) env var holds.
+# =====================================================================================
+{
+    my $ENV_SENTINEL = 'ENV-COOKIE-MUST-BE-IGNORED-3c88a1';
+
+    for my $var (qw(OPENCODE_GO_AUTH_COOKIE OPENCODE_AUTH_COOKIE)) {
+        my ($res, $err) = try_call("BpSpend::resolve_credential (env-only, $var)", sub {
+            BpSpend::resolve_credential(env_var => $var, env => { $var => $ENV_SENTINEL },
+                                         fallback_path => undef);
+        });
+        my $r = $res ? $res->[0] : undef;
+        is(ref($r) eq 'HASH' ? $r->{reason} : undef, 'missing',
+           "C12: with $var set in the injected env and NO file, resolve_credential reports reason=missing -- the env path is GONE")
+            or diag($err // (defined $r ? JSON::PP->new->canonical->encode($r) : '(undef)'));
+        is(ref($r) eq 'HASH' ? $r->{ok} : undef, 0, "C12: ...and ok=0 for $var (paired with reason=missing above)");
+    }
+
+    my $tmp = tempdir(CLEANUP => 1);
+    my $file_path = "$tmp/cookie-file-only.json";
+    write_file($file_path, JSON::PP->new->encode({ cookie => 'file-sourced-cookie-value' }));
+    chmod 0600, $file_path;
+
+    my ($res2) = try_call('BpSpend::resolve_credential (file present, env set but must be ignored)', sub {
+        BpSpend::resolve_credential(env_var => 'OPENCODE_GO_AUTH_COOKIE',
+                                     env => { OPENCODE_GO_AUTH_COOKIE => $ENV_SENTINEL },
+                                     fallback_path => $file_path);
+    });
+    my $r2 = $res2 ? $res2->[0] : undef;
+    is(ref($r2) eq 'HASH' ? $r2->{ok} : undef, 1,
+       'C12 positive: with a 0600 file present it resolves from the file (both env-removed and file-still-works, or neither)');
+    is(ref($r2) eq 'HASH' ? $r2->{source} : undef, 'file', 'C12 positive: the resolution source is "file", never "env"');
+    is(ref($r2) eq 'HASH' ? $r2->{cookie} : undef, 'file-sourced-cookie-value',
+       'C12 positive: the resolved cookie is the FILE value, not the must-be-ignored env value');
+}
+
+# =====================================================================================
+# C13 -- snapshot round-trips for ok / unknown / absent alike.
+# =====================================================================================
+{
+    my $tmp  = tempdir(CLEANUP => 1);
+    my $path = "$tmp/spend.json";
+
+    my $ok_result = { provider => 'go', status => 'ok',
+        five_hour => { used => 42, limit => 100 },
+        weekly    => { used => 310, limit => 1000 },
+        monthly   => { used => 2200, limit => 4000 } };
+    my $unknown_result = { provider => 'zen', status => 'unknown',
+        diagnostic => 'credential unavailable (insecure-file): re-copy the cookie into a 0600 file' };
+    my $absent_result = { provider => 'claude', status => 'absent',
+        diagnostic => 'provider not configured: no fallback file and no credential' };
+
+    my ($wres, $werr) = try_call('BpSpend::write_snapshot (C13 round-trip fixture)', sub {
+        BpSpend::write_snapshot(path => $path, results => [ $ok_result, $unknown_result, $absent_result ],
+                                 now => NOW_EPOCH);
+    });
+    ok(defined $wres, 'C13 setup: BpSpend::write_snapshot returns without dying') or diag($werr);
+
+    my $bytes = -e $path ? read_file($path) : undef;
+    ok(defined $bytes && length $bytes, 'C13 setup: write_snapshot actually produced a non-empty file on disk')
+        or diag('snapshot file ' . (defined $bytes ? '(empty)' : '(absent)') . " at $path");
+
+    my $decoded = defined $bytes ? eval { JSON::PP->new->decode($bytes) } : undef;
+    ok(ref($decoded) eq 'HASH', 'C13 setup: the written snapshot decodes as JSON') or diag($@ // '(no bytes)');
+
+    my $results = ref($decoded) eq 'HASH' ? $decoded->{results} : undef;
+    ok(ref($results) eq 'ARRAY' && @$results == 3,
+       "C13 setup: the decoded snapshot carries this test's own 3 fixture results (own fixture count, not a shared-artifact total)");
+
+    my %by_provider = map { (ref($_) eq 'HASH' ? ($_->{provider} // '?') : '?') => $_ }
+                       (ref($results) eq 'ARRAY' ? @$results : ());
+
+    my $rt_ok = $by_provider{go};
+    is(ref($rt_ok) eq 'HASH' ? $rt_ok->{status} : undef, 'ok', "C13: round-tripped 'ok' result keeps status=ok");
+    is(ref($rt_ok) eq 'HASH' ? $rt_ok->{five_hour}{used} : undef, 42, "C13: round-tripped 'ok' result keeps five_hour.used=42");
+    is(ref($rt_ok) eq 'HASH' ? $rt_ok->{monthly}{limit} : undef, 4000, "C13: round-tripped 'ok' result keeps monthly.limit=4000");
+
+    my $rt_unk = $by_provider{zen};
+    is(ref($rt_unk) eq 'HASH' ? $rt_unk->{status} : undef, 'unknown', "C13: round-tripped 'unknown' result keeps status=unknown");
+    like(ref($rt_unk) eq 'HASH' ? ($rt_unk->{diagnostic} // '') : '', qr/re-?copy.*cookie/i,
+         "C13: round-tripped 'unknown' result keeps its diagnostic");
+
+    my $rt_absent = $by_provider{claude};
+    is(ref($rt_absent) eq 'HASH' ? $rt_absent->{status} : undef, 'absent', "C13: round-tripped 'absent' result keeps status=absent");
+}
+
+# =====================================================================================
+# C14 -- THE MOST IMPORTANT ASSERTION IN THIS PACKAGE. Token-shaped sentinel cookie,
+# planted at TWO nesting depths (top-level field and inside a nested sub-hash) plus
+# handed explicitly as `credential`, to prove redaction is structural, not accidental.
+# The sentinel must appear NOWHERE in the written bytes. Paired positive: the real
+# figures ARE present -- an empty/near-empty file must fail BOTH halves, not pass the
+# negative one for free (mandatory vacuity gate, see file header).
+# =====================================================================================
+{
+    my $tmp  = tempdir(CLEANUP => 1);
+    my $path = "$tmp/spend-redaction.json";
+    my $SENTINEL_TOP    = 'SPEND-SNAPSHOT-COOKIE-SENTINEL-TOP-b7f1e9';
+    my $SENTINEL_NESTED = 'SPEND-SNAPSHOT-COOKIE-SENTINEL-NESTED-4d02ac';
+
+    my $leaky_result = {
+        provider  => 'go', status => 'ok',
+        five_hour => { used => 7, limit => 20 },
+        weekly    => { used => 55, limit => 200 },
+        monthly   => { used => 300, limit => 900 },
+        # Must NEVER survive into the written bytes, at two different nesting
+        # depths -- simulates a composer that passes the credential straight
+        # through instead of building an explicit field whitelist.
+        cookie => $SENTINEL_TOP,
+        _debug => { last_request => { headers => { Cookie => "session=$SENTINEL_NESTED" } } },
+    };
+
+    my ($wres, $werr) = try_call('BpSpend::write_snapshot (C14 redaction fixture)', sub {
+        BpSpend::write_snapshot(path => $path, results => [ $leaky_result ],
+                                 credential => { cookie => $SENTINEL_TOP }, now => NOW_EPOCH);
+    });
+    ok(defined $wres, 'C14 setup: write_snapshot(leaky result + explicit credential arg) returns without dying')
+        or diag($werr);
+
+    my $bytes = -e $path ? read_file($path) : undef;
+    ok(defined $bytes && length $bytes,
+       'C14 positive gate: the snapshot file was actually written with content -- an empty/absent file must NOT pass the redaction check for free')
+        or diag('snapshot file ' . (defined $bytes ? '(empty)' : '(absent)') . " at $path");
+
+    if (defined $bytes && length $bytes) {
+        unlike($bytes, qr/\Q$SENTINEL_TOP\E/,
+            'C14 THE MOST IMPORTANT ASSERTION: the top-level cookie sentinel appears NOWHERE in the written snapshot bytes');
+        unlike($bytes, qr/\Q$SENTINEL_NESTED\E/,
+            'C14: a cookie sentinel nested inside a sub-hash ALSO appears nowhere -- redaction holds at any nesting depth');
+        like($bytes, qr/\b7\b/,   'C14 positive pair: the real five_hour.used figure (7) IS present in the snapshot');
+        like($bytes, qr/\b900\b/, 'C14 positive pair: the real monthly.limit figure (900) IS present in the snapshot');
+        like($bytes, qr/go/,      'C14 positive pair: the provider name IS present in the snapshot');
+    } else {
+        fail('C14 THE MOST IMPORTANT ASSERTION: the top-level cookie sentinel appears NOWHERE in the written snapshot bytes');
+        fail('C14: a cookie sentinel nested inside a sub-hash ALSO appears nowhere in the written bytes');
+        fail('C14 positive pair: the real figures ARE present in the snapshot');
+    }
+}
+
+# =====================================================================================
+# C15 -- atomic write: temp-then-rename in the same directory, asserted structurally
+# (source-level, mirroring C8's named-constant check) AND behaviourally (no stray file
+# left in the directory after a successful write).
+# C16 -- mode 0600 on the written snapshot.
+# =====================================================================================
+{
+    my $tmp  = tempdir(CLEANUP => 1);
+    my $path = "$tmp/spend-atomic.json";
+
+    ok(!-e $path, 'C15/C16 setup: the snapshot path does not exist before the write (clean fixture)');
+
+    my ($wres, $werr) = try_call('BpSpend::write_snapshot (C15/C16 fixture)', sub {
+        BpSpend::write_snapshot(path => $path,
+            results => [ { provider => 'go', status => 'ok', five_hour => { used => 1, limit => 2 } } ],
+            now => NOW_EPOCH);
+    });
+    ok(defined $wres, 'C15/C16 setup: write_snapshot returns without dying') or diag($werr);
+
+    ok(-e $path, 'C15/C16: the final spend-atomic.json file exists after write_snapshot returns');
+
+    if (opendir(my $dh, $tmp)) {
+        my @entries = sort grep { !/^\.\.?$/ } readdir($dh);
+        closedir $dh;
+        is_deeply(\@entries, ['spend-atomic.json'],
+            'C15: after write_snapshot returns, the directory holds ONLY the final file -- no leftover temp/partial file from a non-atomic write')
+            or diag('directory entries: ' . join(', ', @entries));
+    } else {
+        fail('C15: after write_snapshot returns, the directory holds ONLY the final file');
+    }
+
+    if (-e $path) {
+        my @st = stat($path);
+        my $mode = @st ? ($st[2] & 07777) : undef;
+        is($mode, 0600, 'C16: the written snapshot file is mode 0600');
+    } else {
+        fail('C16: the written snapshot file is mode 0600');
+    }
+
+    my $src = read_file($SPEND) // '';
+    my ($sub_body) = $src =~ /sub\s+write_snapshot\b(.*?)(?=\nsub\s+\w|\z)/s;
+    if (defined $sub_body) {
+        like($sub_body, qr/\brename\s*\(/,
+            'C15 structural: write_snapshot() calls rename(...) -- not a direct open-and-write to the final path');
+        like($sub_body, qr/tempfile|\.tmp\b|\btmp_|\$\$\D/,
+            'C15 structural: write_snapshot() writes to a temp path in the same directory before renaming');
+    } else {
+        fail('C15 structural: write_snapshot() calls rename(...) -- not a direct open-and-write to the final path');
+        fail('C15 structural: write_snapshot() writes to a temp path in the same directory before renaming');
+    }
+}
+
+# =====================================================================================
+# C17 -- bp-spend-auth.pl never takes the cookie on argv, never echoes it (not even in
+# --status), and creates the file 0600 at creation. Paired positive: a cookie fed on
+# STDIN is stored and afterwards resolvable via the REAL resolve_credential().
+# =====================================================================================
+{
+    diag("subject under test: $AUTH " . (-e $AUTH ? "(present)" : "(ABSENT -- C17 assertions below are expected to fail on MISSING BEHAVIOUR)"));
+
+    my $tmp  = tempdir(CLEANUP => 1);
+    my $path = "$tmp/cookie.json";
+    my $COOKIE = 'AUTH-AGENT-CLI-COOKIE-VALUE-9d21f0';
+
+    # --- positive: STDIN cookie is stored, at 0600, and afterwards resolvable. ---
+    my ($out, $rc) = run_auth($COOKIE, '--provider', 'go', '--path', $path);
+    ok(-e $path, 'C17 positive: bp-spend-auth.pl (STDIN cookie) creates the credential file')
+        or diag("auth output: $out (rc=$rc)");
+
+    if (-e $path) {
+        my @st = stat($path);
+        my $mode = @st ? ($st[2] & 07777) : undef;
+        is($mode, 0600, 'C17 positive: the created credential file is mode 0600 (created that way, per spec 3)');
+
+        my ($res) = try_call('BpSpend::resolve_credential (after bp-spend-auth.pl STDIN store)', sub {
+            BpSpend::resolve_credential(env_var => 'BP_TEST_SPEND_COOKIE_UNSET_ON_PURPOSE', env => {},
+                                         fallback_path => $path);
+        });
+        my $r = $res ? $res->[0] : undef;
+        is(ref($r) eq 'HASH' ? $r->{ok} : undef, 1, 'C17 positive: the STDIN-stored cookie resolves successfully afterwards');
+        is(ref($r) eq 'HASH' ? $r->{cookie} : undef, $COOKIE, 'C17 positive: the resolved cookie value matches what was fed on STDIN');
+    } else {
+        fail('C17 positive: the created credential file is mode 0600');
+        fail('C17 positive: the STDIN-stored cookie resolves successfully afterwards');
+        fail('C17 positive: the resolved cookie value matches what was fed on STDIN');
+    }
+    unlike($out, qr/\Q$COOKIE\E/, 'C17: bp-spend-auth.pl never echoes the cookie to its own stdout/stderr');
+
+    # --- negative: a cookie value handed on argv is never accepted (not stored, not echoed). ---
+    my $path2 = "$tmp/cookie2.json";
+    my $ARGV_SENTINEL = 'ARGV-COOKIE-MUST-NEVER-BE-ACCEPTED-7e42b1';
+    my ($out2, undef) = run_auth('', '--provider', 'go', '--cookie', $ARGV_SENTINEL, '--path', $path2);
+    my $leaked_in_file = 0;
+    if (-e $path2) {
+        my $file_bytes = read_file($path2) // '';
+        $leaked_in_file = (index($file_bytes, $ARGV_SENTINEL) >= 0) ? 1 : 0;
+    }
+    ok(!$leaked_in_file, 'C17: a cookie value supplied on argv is never written to the credential file');
+    unlike($out2, qr/\Q$ARGV_SENTINEL\E/, 'C17: a cookie value supplied on argv is never echoed either');
+
+    # --- --status never echoes the value, using the file stored via STDIN above. ---
+    my ($out3, undef) = run_auth('', '--status', '--provider', 'go', '--path', $path);
+    unlike($out3, qr/\Q$COOKIE\E/, 'C17: --status never echoes the cookie value, not even truncated');
+}
+
+# =====================================================================================
+# C18 -- --from-firefox degrades: no profile / no DB / no matching cookie must exit
+# non-zero, print manual instructions, and write NOTHING (no empty, no partial file).
+# The happy path is Windows-only (winsqlite3.dll, spec §3.1) and is NOT assertable
+# inside this Linux sandbox container -- only the degrade path is tested here.
+# =====================================================================================
+{
+    # HARNESS gate, real assertion not diag-only: without this, "exits non-zero" and
+    # "writes nothing" below would pass VACUOUSLY while bp-spend-auth.pl is simply
+    # absent (a nonexistent script also exits non-zero and also writes nothing) --
+    # exactly the "passes because the feature is ABSENT" trap the spec warns about.
+    ok(-e $AUTH, 'C18 HARNESS: bp-spend-auth.pl exists in this checkout (so the degrade checks below are not vacuous)');
+
+    my $tmp = tempdir(CLEANUP => 1);
+    my $ff_path = "$tmp/cookie-ff.json";   # deliberately does not exist beforehand
+
+    my ($out, $rc) = run_auth('', '--provider', 'go', '--from-firefox', '--path', $ff_path);
+    isnt($rc, 0, 'C18: --from-firefox with no usable browser profile/db/cookie exits non-zero')
+        or diag("auth output: $out");
+    ok(!-e $ff_path, 'C18: --from-firefox degrade writes NOTHING -- no empty/partial credential file');
+    like($out, qr/manual/i, 'C18: --from-firefox degrade prints the manual fallback instructions');
+
+    diag('C18: the --from-firefox HAPPY PATH depends on winsqlite3.dll (Windows 10/11) per spec §3.1 '
+       . 'and cannot be exercised inside this Linux sandbox container; only the degrade path is tested.');
+}
+
+# =====================================================================================
+# C19 -- plugins/butler/docs/spend-credentials.md exists and names the path, the mode,
+# and the expiry behaviour. Each assertion is scoped to its own paragraph (vicinity),
+# never a bare match over the whole file, so unrelated prose elsewhere cannot produce a
+# false pass.
+# =====================================================================================
+{
+    ok(-e $DOCS, 'C19: plugins/butler/docs/spend-credentials.md exists');
+
+    if (-e $DOCS) {
+        my $doc = read_file($DOCS) // '';
+        my @paras = split /\n\s*\n/, $doc;
+
+        my $has_path = grep { /\.claude[\/\\]/ && /path/i } @paras;
+        ok($has_path, 'C19: some paragraph of the docs names BOTH the credential path (under ~/.claude/) and calls it out as "the path"');
+
+        my $has_mode = grep { /\b0?600\b/ && /mode|permission/i } @paras;
+        ok($has_mode, 'C19: some paragraph of the docs names the required mode (0600)');
+
+        my $has_expiry = grep { /expir/i } @paras;
+        ok($has_expiry, 'C19: some paragraph of the docs describes expiry behaviour');
+    } else {
+        fail('C19: docs name the credential path');
+        fail('C19: docs name the required mode (0600)');
+        fail('C19: docs describe expiry behaviour');
+    }
+}
+
+# =====================================================================================
+# C20 -- no regression. Not a new assertion of its own (a self-referential "this file
+# still passes" check would be vacuous) -- it is verified by running this WHOLE file:
+# C1..C11 above are untouched by this extension, and t/80-worker-jail-isolation.t is
+# run and confirmed separately as part of this package's verification, per spec §5.
+# =====================================================================================
 
 done_testing();

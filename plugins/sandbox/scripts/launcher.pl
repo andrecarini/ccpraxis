@@ -801,6 +801,18 @@ my $ORCH_EVENTS_PER_LOG    = 10;   # parsed events kept from orchestrator.log pe
 # one poll interval; "poll never" is not a fix.
 my $CONTAINER_POLL_SECONDS = 20;
 
+# s21-keep-awake-probe-failure-handling (spec S2.3): how many CONSECUTIVE
+# 'probe-failed' busy-lease results KeepAwake::on_probe holds the wake-lock
+# through before releasing it as a sustained failure -- a NAMED constant, not
+# a literal at the call site, and deliberately never asserted-by-value in
+# 60-keepawake-probe.t (that oracle drives its OWN small tolerance to prove
+# the hold/release BEHAVIOUR, never this number). At one probe per
+# $CONTAINER_POLL_SECONDS, this absorbs a run of transient exec hiccups (a
+# dropped SSH session, a brief podman-machine blip) roughly a minute long
+# before falling back to releasing, so a genuinely dead container still
+# releases the lock well within the same launch.
+my $KEEPAWAKE_PROBE_TOLERANCE = 3;
+
 # s17-statusline-and-output-hygiene (spec S5): the ONE heartbeat/tick
 # predicate, called from BOTH _history_events (below) and the
 # current-session gather closure inside enter_dashboard. Extracted from
@@ -3574,6 +3586,7 @@ sub enter_dashboard {
     my $cached_machine_state    = 'unknown';   # s12: _machine_state, refreshed on the 10s inspect round
     my $cached_busy_age         = undef;   # B5: age (s) of /tmp/.butler-busy in CONTAINER time, or undef
     my $cached_busy_stamp       = 0;       # host time() when $cached_busy_age was measured
+    my $cached_probe_result     = { state => 'lease-absent' };   # s21: KeepAwake's pinned probe struct
     my $cached_needs_you        = 0;       # B3: queued "needs you" decisions
     my $cached_backpack         = undef;   # B4: backpack items + per-item approval
     my $cached_oauth_expires_at = undef;   # 01-oauth: epoch-s when the OAuth token expires
@@ -3745,25 +3758,40 @@ sub enter_dashboard {
                 my $s = `$PODMAN inspect --format '{{.State.Status}}' "$CONTAINER_NAME" 2>/dev/null`;
                 chomp $s if defined $s;
                 $cached_status = (defined $s && length $s) ? $s : 'unknown';
-                # B5: busy-lease freshness (the orchestrator keeps /tmp/.butler-busy
-                # fresh only while there's active work or a pending auto-resume).
-                # Compute the age ENTIRELY in container time — read the lease mtime
-                # AND the container clock, both via exec, and subtract here. Doing
-                # `host_now - container_mtime` instead skews the age by the host-vs-
-                # container clock offset (seen as a NEGATIVE busy_age in the wild),
-                # which released keep-awake mid-run and let the host sleep. Read
-                # mtime first, then now, so the inter-exec gap can't read negative.
-                my $bm = `$PODMAN exec "$CONTAINER_NAME" stat -c %Y /tmp/.butler-busy 2>/dev/null`;
-                my $cn = `$PODMAN exec "$CONTAINER_NAME" date +%s 2>/dev/null`;
-                my ($lmt)  = ($bm && $bm =~ /^(\d+)/) ? ($1) : ();
-                my ($cnow) = ($cn && $cn =~ /^(\d+)/) ? ($1) : ();
-                if (defined $lmt && defined $cnow) {
-                    my $a = $cnow - $lmt;
-                    $cached_busy_age = $a < 0 ? 0 : $a;   # clamp the tiny exec-gap race
-                } else {
-                    $cached_busy_age = undef;
+                # B5/s21: busy-lease freshness (the orchestrator keeps
+                # /tmp/.butler-busy fresh only while there's active work or a
+                # pending auto-resume). s21-keep-awake-probe-failure-handling:
+                # the probe now returns KeepAwake's pinned three(+ok)-state
+                # struct instead of collapsing every failure to a bare undef
+                # (the s18-measured defect -- a transient exec hiccup was
+                # indistinguishable from "no lease" or "container gone", and
+                # both released the wake-lock the same way, SIGKILLing and
+                # re-spawning the PowerShell helper on the very next tick).
+                $cached_probe_result = _busy_lease_probe($CONTAINER_NAME);
+                if ($cached_probe_result->{state} eq 'ok') {
+                    $cached_busy_age   = $cached_probe_result->{age};
+                    $cached_busy_stamp = $now;
+                } elsif ($cached_probe_result->{state} ne 'probe-failed') {
+                    # lease-absent / container-gone: no lease to report.
+                    $cached_busy_age   = undef;
+                    $cached_busy_stamp = $now;
                 }
-                $cached_busy_stamp = $now;
+                # else 'probe-failed': HOLD -- deliberately leave
+                # $cached_busy_age/$cached_busy_stamp untouched (spec S2.2,
+                # "the last known age is carried forward, not reset"). The
+                # actual keep-awake decision for this probe is made once,
+                # right here, via on_probe below -- not by re-deriving
+                # staleness from a growing extrapolated age every render
+                # tick, which is what let a transient failure look identical
+                # to a stale/absent lease.
+                my $ka_act = $KEEPAWAKE->on_probe($cached_probe_result, $BUSY_STALE, $KEEPAWAKE_PROBE_TOLERANCE);
+                if ($ka_act ne 'noop') {
+                    log_ev('keepawake', { want   => ($ka_act eq 'start' ? 1 : 0),
+                                           action => $ka_act,
+                                           reason => $cached_probe_result->{state},
+                                           detail => $cached_probe_result->{detail},
+                                           busy_age => $cached_busy_age });
+                }
                 $cached_needs_you  = _count_needs_you($PROJECT_PATH);          # B3
                 $cached_backpack   = _gather_backpack($bp_host_file, $bp_appr_file);  # B4
                 $cached_oauth_expires_at = _gather_oauth_expiry();
@@ -4218,6 +4246,58 @@ sub _heartbeat_once {
     }
     log_ev('heartbeat', {});
     return 'ok';
+}
+
+# _busy_lease_probe($container) -> \%result -- s21: the busy-lease probe now
+# returns KeepAwake's pinned three(+ok)-state struct (spec S2.1) instead of
+# collapsing every failure to a bare undef (the s18-measured defect: a
+# transient exec hiccup was indistinguishable from "no lease" or "container
+# gone", and both released the wake-lock the same way).
+#
+#   { state => 'ok',            age => $seconds }  -- lease read, age known
+#   { state => 'lease-absent'                  }   -- exec ran, file missing
+#   { state => 'probe-failed',  detail => $str }   -- could not ask (transient)
+#   { state => 'container-gone', detail => $str }  -- container not running
+#
+# Discrimination reuses _heartbeat_once's OWN logic (podman inspect) rather
+# than inventing a second one (spec S2.1/S5): stderr is captured (2>&1, no
+# longer discarded), and a non-zero `stat` exit is first checked for the
+# "No such file" signature (exec genuinely ran, the lease is just absent --
+# the ordinary idle case) before falling back to the same
+# `podman inspect --format '{{.State.Status}}'` check _heartbeat_once uses to
+# tell "container gone" apart from "merely could not be asked right now".
+sub _busy_lease_probe {
+    my ($container) = @_;
+    # Read mtime first, then the container's own clock, so the inter-exec gap
+    # can't read negative (matches the prior host/container-clock-skew fix).
+    my $bm = `$PODMAN exec "$container" stat -c %Y /tmp/.butler-busy 2>&1`;
+    my $rc = $?;
+    if ($rc == 0) {
+        my ($lmt) = ($bm =~ /^(\d+)/);
+        unless (defined $lmt) {
+            return { state => 'probe-failed', detail => 'unparsable stat output: ' . _trim_err($bm) };
+        }
+        my $cn = `$PODMAN exec "$container" date +%s 2>/dev/null`;
+        my ($cnow) = ($cn && $cn =~ /^(\d+)/) ? ($1) : ();
+        unless (defined $cnow) {
+            return { state => 'probe-failed', detail => 'could not read container clock' };
+        }
+        my $a = $cnow - $lmt;
+        return { state => 'ok', age => ($a < 0 ? 0 : $a) };
+    }
+    # Non-zero: is this "the lease file genuinely doesn't exist" (exec itself
+    # succeeded, `stat` just failed) or "could not even run the exec"?
+    if ($bm =~ /no such file or directory/i) {
+        return { state => 'lease-absent' };
+    }
+    my $state = `$PODMAN inspect --format '{{.State.Status}}' "$container" 2>/dev/null`;
+    chomp $state if defined $state;
+    $state //= '';
+    my $reason = _trim_err($bm);
+    if ($state ne 'running') {
+        return { state => 'container-gone', detail => ($reason ne '' ? "state=$state; $reason" : "state=$state") };
+    }
+    return { state => 'probe-failed', detail => $reason };
 }
 
 # _trim_err($s) -> $s collapsed to a single, bounded line for a log field: fold
