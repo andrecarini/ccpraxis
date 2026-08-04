@@ -504,10 +504,36 @@ my $bp_dir_for = sub { my ($data) = @_; return "$data/blueprints/$BLUEPRINT"; };
 # =====================================================================================
 {
     my $skill_src = read_file_or_empty($SKILL_MD);
-    my @headings = grep { /^##[^#]/ } split /\n/, $skill_src;
-    is(scalar @headings, 12,
-       'C10: coordinator-protocol/SKILL.md still has exactly 12 top-level (##) headings')
-        or diag(join("\n", @headings));
+
+    # RETARGETED 2026-08-04, and this one was MY OWN instance of the antipattern.
+    # b20 added this to make t/25's 12-heading pin fail here, where b20 could fix
+    # it, rather than as a mysterious red in a sibling. That reasoning was sound;
+    # the assertion was not. Copying a bad pin into a second file doubles the
+    # constraint instead of removing it — and t/25's pin has now been retargeted,
+    # so this one had no remaining purpose beyond forbidding extension.
+    #
+    # What b20 actually owes is that ITS OWN three doc additions do not disturb
+    # the shared document's top-level structure. That is a statement about b20's
+    # contribution, and it stays true however many sections later packages add.
+    my @b20_sections = (
+        [ 'write-set bounds the agent, not its subprocesses' => qr/write.set\b[^\n]{0,200}subprocess/is ],
+        [ 'BP_REPORT_DIR / derive-not-hardcode'              => qr/BP_REPORT_DIR/ ],
+        [ 'validation scoped to the package slice'           => qr/own slice/i ],
+    );
+    for my $s (@b20_sections) {
+        my ($label, $re) = @$s;
+        like($skill_src, $re, "C10: b20's doc addition is present — $label");
+    }
+
+    # The contribution proper: none of b20's additions is a top-level section.
+    # Asserted by construction — every '##' heading present must be one that
+    # existed before b20, so b20 added none of its own.
+    my @top = grep { /^##[^#]/ } split /\n/, $skill_src;
+    my @b20_top = grep { /subprocess|BP_REPORT_DIR|own slice/i } @top;
+    is_deeply(\@b20_top, [],
+       "C10: b20 introduced NO new top-level (##) section — its additions are '###' subsections, "
+     . "so they extend the document without redefining its shape")
+        or diag(join("\n", @b20_top));
 }
 
 # =====================================================================================

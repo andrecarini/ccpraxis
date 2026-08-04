@@ -1016,7 +1016,18 @@ subtest 'AC-26 SKILL.md documents validate-from-native-store and supersedes rsyn
 # --- AC-27 ------------------------------------------------------------------
 subtest 'AC-27 SKILL.md section placement and section-order non-regression' => sub {
     my $h = skill_headings($SKILL_SRC);
-    is(scalar @$h, 12, 'AC-27: 11 pre-existing ## sections plus exactly one insertion')
+    # RETARGETED 2026-08-04. This pinned the file at EXACTLY 12 '## ' headings,
+    # which forbade every later package from adding a top-level section to a
+    # SHARED protocol document. It did not stay theoretical: b14 and b20 both
+    # hit it and demoted their sections to '###' to route around it — a test
+    # dictating document structure it has no stake in.
+    #
+    # Nothing below needs a total. The real content of AC-27 is that the new
+    # section EXISTS, sits between two named neighbours, and that the
+    # pre-existing sections are still present in their original relative order.
+    # All three survive extension; the count did not.
+    cmp_ok(scalar @$h, '>=', 12,
+        'AC-27: the pre-existing sections plus this package\'s insertion are present (a FLOOR — later packages may add more)')
         or diag(join("\n", @$h));
 
     my ($i_native, $i_disk, $i_dep) = (-1, -1, -1);
@@ -1036,13 +1047,24 @@ subtest 'AC-27 SKILL.md section placement and section-order non-regression' => s
                   qr/pipeline/i, qr/worker dispatch/i, qr/resumption/i, qr/terminal ritual/i,
                   qr/graceful stop/i);
     my @rest = grep { !/native storage/i } @$h;
-    is(scalar @rest, 11, 'AC-27: exactly 11 headings remain once the new one is removed');
-    my @mismatch;
-    for my $i (0 .. $#expect) {
-        my $got = defined $rest[$i] ? $rest[$i] : '(missing)';
-        push @mismatch, "[$i] $got !~ $expect[$i]" unless $got =~ $expect[$i];
+    # Matched as an ordered SUBSEQUENCE rather than by exact index. The old form
+    # compared @rest[0..10] positionally, so inserting any new section ANYWHERE
+    # before the last one shifted every index and failed — the same
+    # forbid-all-extension problem as the count above, just less obvious.
+    # A subsequence check still catches a heading that is removed, renamed, or
+    # reordered, which is everything this assertion was actually protecting.
+    my @missing;
+    my $cursor = 0;
+    for my $re (@expect) {
+        my $found = -1;
+        for my $i ($cursor .. $#rest) {
+            if ($rest[$i] =~ $re) { $found = $i; last }
+        }
+        if ($found < 0) { push @missing, "$re (absent, or out of order after index $cursor)" }
+        else            { $cursor = $found + 1 }
     }
-    is_deeply(\@mismatch, [], 'AC-27: the 11 pre-existing headings are unchanged and in their original order');
+    is_deeply(\@missing, [],
+        'AC-27: the pre-existing headings are all still present, in their original relative order');
 
     done_testing();
 };
