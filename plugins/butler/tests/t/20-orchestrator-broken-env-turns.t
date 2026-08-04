@@ -256,20 +256,25 @@ sub write_ledger {
 
     is(sc(sub { BpOrch::initial_max_turns($dir, 'has', {}) }), 100,
        'AC-16 ledger max_turns: 100 -> 100');
-    is(sc(sub { BpOrch::initial_max_turns($dir, 'none', {}) }), 80,
-       'AC-16 no ledger max_turns, no tunable -> 80');
-    is(sc(sub { BpOrch::initial_max_turns($dir, 'zero', {}) }), 80,
-       'AC-16 ledger max_turns: 0 -> falls back to 80 (not 0)');
-    is(sc(sub { BpOrch::initial_max_turns($dir, 'junk', {}) }), 80,
-       'AC-16 ledger max_turns: abc -> falls back to 80');
-    is(sc(sub { BpOrch::initial_max_turns($dir, 'neg', {}) }), 80,
-       'AC-16 ledger max_turns: -5 -> falls back to 80 (must match /^\d+$/)');
+    # RETARGETED 2026-08-04. These pinned the literal 80. The property AC-16
+    # actually tests is that malformed ledger input falls back to THE DEFAULT --
+    # not what the default happens to be. Pinning the number made a routine
+    # tuning of the cap (80 -> 400, b11: the cap is a backstop, not the control
+    # loop) look like five behavioural regressions.
+    my $DEFAULT = sc(sub { BpOrch::initial_max_turns($dir, 'none', {}) });
+    cmp_ok($DEFAULT, '>', 0, 'AC-16 the built-in default is a positive integer');
+    is(sc(sub { BpOrch::initial_max_turns($dir, 'zero', {}) }), $DEFAULT,
+       'AC-16 ledger max_turns: 0 -> falls back to the default (not 0)');
+    is(sc(sub { BpOrch::initial_max_turns($dir, 'junk', {}) }), $DEFAULT,
+       'AC-16 ledger max_turns: abc -> falls back to the default');
+    is(sc(sub { BpOrch::initial_max_turns($dir, 'neg', {}) }), $DEFAULT,
+       'AC-16 ledger max_turns: -5 -> falls back to the default (must match /^\d+$/)');
     is(sc(sub { BpOrch::initial_max_turns($dir, 'none', { default_max_turns => 120 }) }), 120,
-       'AC-16 tunable default_max_turns overrides the hard 80 default');
+       'AC-16 tunable default_max_turns overrides the built-in default');
     is(sc(sub { BpOrch::initial_max_turns($dir, 'has', { default_max_turns => 120 }) }), 100,
        'AC-16 ledger max_turns wins over default_max_turns (author intent)');
-    is(sc(sub { BpOrch::initial_max_turns($dir, 'ghost', {}) }), 80,
-       'AC-16 unknown package (no ledger) -> 80, never dies');
+    is(sc(sub { BpOrch::initial_max_turns($dir, 'ghost', {}) }), $DEFAULT,
+       'AC-16 unknown package (no ledger) -> the default, never dies');
 }
 
 # ---- AC-16 / AC-24: _tunables overlay, whitelist and robustness (§2.6) ----

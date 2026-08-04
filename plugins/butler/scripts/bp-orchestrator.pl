@@ -1105,7 +1105,7 @@ sub initial_max_turns {
     # be absurd, hence neither can 2x the anchor.
     my $fm = ledger_fm($bpdir, $pkg, 'max_turns');
     return _clamp_turns($fm + 0) if defined $fm && $fm =~ /^\d+$/ && $fm > 0;
-    my $d = (ref $t eq 'HASH' ? $t->{default_max_turns} : undef) // $ENV{BP_DEFAULT_MAX_TURNS} // 80;
+    my $d = (ref $t eq 'HASH' ? $t->{default_max_turns} : undef) // $ENV{BP_DEFAULT_MAX_TURNS} // 400;
     return (defined $d && !ref $d && $d =~ /^\d+$/ && $d > 0) ? _clamp_turns($d + 0) : 80;
 }
 sub _clamp_turns { my ($n) = @_; return $n > $MAX_TURNS_CEILING ? $MAX_TURNS_CEILING : $n; }
@@ -1680,7 +1680,7 @@ sub _tunables_base {
         harvest_reaudit_cap => $ENV{BP_HARVEST_REAUDIT_CAP} // 2,  # #30: re-audit (not reopen) a done pkg whose harvest didn't complete, up to N times
         harvest_defer_cap => $ENV{BP_HARVEST_DEFER_CAP} // 2,  # b09 spec §2.4: sibling-red defer attempts before reopen/park
         conformance_spawn_cap => $ENV{BP_CONFORMANCE_SPAWN_CAP} // 2, # b05: whole-blueprint conformance gate firings per run
-        default_max_turns   => $ENV{BP_DEFAULT_MAX_TURNS}   // 80, # b01: turn budget when the ledger states none
+        default_max_turns   => $ENV{BP_DEFAULT_MAX_TURNS}   // 400, # b01: turn budget when the ledger states none
         broken_env_thresh   => $ENV{BP_BROKEN_ENV_THRESH}   // 3,  # b01: consecutive exec-not-found launches -> broken-env
         turn_starved_thresh => $ENV{BP_TURN_STARVED_THRESH} // 3,  # b01: consecutive fruitless turn exhaustions -> turn-starved
         ckpt_int            => $ENV{BP_CHECKPOINT_INTERVAL} // 300, # b02: seconds between periodic WIP checkpoints
