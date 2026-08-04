@@ -10,13 +10,41 @@ use lib "$Bin/../../scripts";
 use Test::More;
 use MountSpec qw(winify_path v_to_mount convert_v_to_mount);
 
-plan tests => 11;
+# done_testing() rather than a hand-counted plan: the SKIP below changes the
+# assertion count by platform, and a hand-counted plan turns that into a plan
+# mismatch — which fails with ZERO `not ok` lines and is therefore invisible to
+# the `grep -c '^not ok'` half of this repo's pass criterion.
 
 # winify_path — drive letter case is preserved (lowercase in, lowercase
 # out); podman.exe is case-insensitive about it so we don't bother
 # normalizing.
-is(winify_path('/c/Users/foo'), 'c:/Users/foo', 'winify: /c/... -> c:/...');
-is(winify_path('/d/data'),      'd:/data',      'winify: /d/... -> d:/...');
+#
+# THESE TWO ARE WINDOWS-ONLY, and ran unconditionally until s22. MountSpec's
+# winify_path opens with `return $p unless $WINDOWS_FAMILY`, so off the Windows
+# family it is a documented no-op and these assertions asserted something the
+# code never claimed. The resulting 2 not-ok were normalised into the sandbox
+# suite's "known baseline red" for an entire 79-package blueprint — which is the
+# real cost: it trained everyone to ignore the one file guarding the MSYS2 `;C`
+# path-mangling landmine.
+SKIP: {
+    skip('winify_path is a documented no-op off the Windows family '
+         . "(\$MountSpec::WINDOWS_FAMILY is false on $^O)", 2)
+        unless $MountSpec::WINDOWS_FAMILY;
+
+    is(winify_path('/c/Users/foo'), 'c:/Users/foo', 'winify: /c/... -> c:/...');
+    is(winify_path('/d/data'),      'd:/data',      'winify: /d/... -> d:/...');
+}
+
+# The POSIX counterpart. A bare SKIP would leave this platform asserting nothing
+# about winify_path's main path, so the no-op is asserted rather than assumed --
+# skipping is not the same as "no behaviour to check", and a skip that hides a
+# regression is how the original red survived so long.
+unless ($MountSpec::WINDOWS_FAMILY) {
+    is(winify_path('/c/Users/foo'), '/c/Users/foo',
+       'winify (POSIX): a /c/... path is returned UNCHANGED — no accidental drive-letter rewrite');
+    is(winify_path('/d/data'), '/d/data',
+       'winify (POSIX): a /d/... path is returned UNCHANGED');
+}
 is(winify_path('C:/already'),   'C:/already',   'winify: already winified -> no-op');
 is(winify_path(''),             '',             'winify: empty -> empty');
 
@@ -53,3 +81,5 @@ is_deeply(\@after,
      '--mount', 'type=bind,source=/host,target=/b,readonly',
      'image', 'cmd'],
     'convert_v_to_mount preserves order, translates only -v pairs, honors :ro');
+
+done_testing();
