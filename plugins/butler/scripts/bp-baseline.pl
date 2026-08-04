@@ -365,7 +365,11 @@ our $BASELINE_SIGNAL_DEST;
 sub _signal_teardown_and_exit {
     my ($name) = @_;
     if (defined $BASELINE_CHILD_PID) {
-        kill('TERM', $BASELINE_CHILD_PID);
+        # Signal the process GROUP, not just the child. cli_materialize makes
+        # the child a group leader precisely so this reaches git and tar too;
+        # a surviving tar re-creates the tree after we remove it. Fall back to
+        # the bare pid if the group signal finds nothing (setpgid lost a race).
+        kill('TERM', -$BASELINE_CHILD_PID) or kill('TERM', $BASELINE_CHILD_PID);
         my $waited = 0;
         while ($waited < 5) {
             my $r = waitpid($BASELINE_CHILD_PID, WNOHANG);
@@ -374,7 +378,7 @@ sub _signal_teardown_and_exit {
             $waited += 0.1;
         }
         if ((waitpid($BASELINE_CHILD_PID, WNOHANG) // 0) != $BASELINE_CHILD_PID) {
-            kill('KILL', $BASELINE_CHILD_PID);
+            kill('KILL', -$BASELINE_CHILD_PID) or kill('KILL', $BASELINE_CHILD_PID);
             waitpid($BASELINE_CHILD_PID, 0);
         }
     }
@@ -440,14 +444,41 @@ sub cli_materialize {
     }
 
     # Create dest (idempotent: a stale prior tree is replaced wholesale).
+    #
+    # ARM THE GUARD BEFORE THE DIRECTORY CAN EXIST. Assigning after make_path
+    # leaves a window in which the tree is on disk but the handler has nothing
+    # to remove -- SIGTERM landing there leaks a stray partial destination.
+    # That window is small but REAL: reproduced 1-in-8 by t/84's C8 probe, which
+    # polls for the destination and kills the instant it appears. The handler
+    # guards on `-e`, so arming early is harmless when make_path never runs.
+    $BASELINE_SIGNAL_DEST = $dest;
     File::Path::remove_tree($dest, { safe => 0 }) if -e $dest;
     File::Path::make_path($dest) or _io_exit("mkdir $dest: $!");
-    $BASELINE_SIGNAL_DEST = $dest;
 
     # Baseline half (spec 4.2.1): extract the baseline commit's full tree.
+    #
+    # Block the teardown signals across fork(). The same class of window sits
+    # between fork() returning and $BASELINE_CHILD_PID being recorded: a signal
+    # there leaves the parent tearing the tree down while an unrecorded child
+    # keeps extracting INTO it -- re-creating the very stray directory the
+    # handler exists to prevent. The mask is inherited across fork, so the child
+    # must clear it before exec.
+    my $sigset = POSIX::SigSet->new(POSIX::SIGTERM(), POSIX::SIGINT(), POSIX::SIGHUP());
+    POSIX::sigprocmask(POSIX::SIG_BLOCK(), $sigset);
     my $pid = fork();
-    _io_exit("fork: $!") unless defined $pid;
+    unless (defined $pid) {
+        POSIX::sigprocmask(POSIX::SIG_UNBLOCK(), $sigset);
+        _io_exit("fork: $!");
+    }
     if ($pid == 0) {
+        # Become a process-group leader so the handler can signal the WHOLE
+        # pipeline. The child is `/bin/sh -c 'git archive | tar -x -C dest'`;
+        # signalling only sh leaves git and tar alive, and tar goes on
+        # extracting into $dest AFTER the handler removed it -- which puts the
+        # stray directory straight back. Set in BOTH processes (the standard
+        # double-setpgid idiom) so neither side races the other.
+        POSIX::setpgid(0, 0);
+        POSIX::sigprocmask(POSIX::SIG_UNBLOCK(), $sigset);
         open(STDIN, '<', '/dev/null');
         exec('/bin/sh', '-c',
              'git -C ' . _shquote($project_root) . ' archive ' . _shquote($sha)
@@ -456,6 +487,8 @@ sub cli_materialize {
         POSIX::_exit(126);
     }
     $BASELINE_CHILD_PID = $pid;
+    POSIX::setpgid($pid, $pid);   # harmless if the child won the race
+    POSIX::sigprocmask(POSIX::SIG_UNBLOCK(), $sigset);
     waitpid($pid, 0);
     my $rc = $?;
     $BASELINE_CHILD_PID = undef;

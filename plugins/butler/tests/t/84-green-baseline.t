@@ -679,7 +679,24 @@ sub baseline_ref_exists {
         kill('TERM', $pid);
         my $status = wait_pid_timeout($pid, 15);
         ok(!pid_alive($pid), 'C8 (SIGTERM): the materialize process is gone after SIGTERM (bounded wait, not a hang)');
-        ok(!-e $dest_term, 'C8 (SIGTERM): the SIGTERM handler tore the partial destination down -- no stray directory survives');
+
+        # The probe polls for $dest_term and kills the instant it appears, so on a
+        # small fixture the run can COMPLETE before the signal lands. A finished
+        # materialize is *supposed* to leave its tree behind, so asserting
+        # `!-e` unconditionally made this assertion fail on correct behaviour --
+        # measured at roughly 1-in-8 standalone. Branch on the exit status, which
+        # was already captured here and then never used: the handler exits
+        # 128+SIGTERM, a completed run exits 0. Both branches assert something
+        # real, so this stays non-vacuous either way.
+        my $code = $status >> 8;
+        if ($code == 0) {
+            ok(-e $dest_term, 'C8 (SIGTERM): the run completed before the signal landed, and its '
+                . 'finished tree is intact (teardown genuinely not exercised on this pass)');
+        }
+        else {
+            ok(!-e $dest_term, 'C8 (SIGTERM): the SIGTERM handler tore the partial destination '
+                . "down -- no stray directory survives (exit $code)");
+        }
         remove_tree($dest_term, { safe => 0 }) if -e $dest_term;
     }
 
