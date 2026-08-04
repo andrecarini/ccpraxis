@@ -4,7 +4,7 @@ description: Terrain-mapping scout for blueprint packages. Dispatched by a butle
 mode: subagent
 model: opencode/big-pickle
 temperature: 0.2
-steps: 15
+steps: 40
 permission:
   edit: deny
 ---

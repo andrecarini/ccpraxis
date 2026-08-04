@@ -286,6 +286,8 @@ Files: <paths, file:line where known>
 Do NOT: <out-of-scope list, incl. anything tempting nearby>
 Acceptance: <how the worker knows it's done>
 Report to: $BP_DIR/reports/$BP_PACKAGE/<worker>-<step>.md
+            — CREATE THIS FILE EARLY, BEFORE THE INVESTIGATION, AND APPEND AS YOU GO.
+              Your final message is NOT a deliverable; the file is.
 Return: ≤15 lines — outcome, validation run + result, report path, anything off-spec.
 ```
 
@@ -294,6 +296,34 @@ Rules:
 - **One write-capable worker in flight** (implementer / test-writer / ui-prober) — hook-enforced; read-only workers may run in parallel.
 - A worker that returns garbage or dies: redispatch once with a sharpened prompt. Twice: log the attempt, then either change approach or block — don't loop.
 - You may make small glue edits inside your write set yourself (wiring an export, a one-line fix during validation). Anything resembling a step belongs to a worker.
+
+### Turn caps — two fields, one concept, and they are NOT the same field
+
+This has already cost one whole review pass: **eleven of eleven** dispatched workers died having written nothing, ~800–900k tokens, zero output.
+
+| field | lives in | governs |
+|---|---|---|
+| `max_turns:` | **ledger** frontmatter | headless `claude -p` coordinators, via `bp-launch.sh` |
+| `maxTurns:` | **agent** frontmatter, `plugins/*/agents/<name>.md` | **Task subagents** — the workers you dispatch |
+| `steps:` | **OpenCode twin**, `plugins/butler/opencode/<name>.md` | the same worker under `worker_backend: opencode` |
+
+There are **three** of them, and the third is easy to miss entirely. `t/81-opencode-worker-runtime.t` keeps `steps:` derived from its Claude twin's `maxTurns:`, so changing a cap without syncing the twin turns that file red — deliberately.
+
+The first two differ only in case and separator. Raising one does **nothing** for the other, and that is not hypothetical: `b23` raised the ledger default 80 → 150 and wrote "`bp-scout` … default 40" into the authoring protocol while `bp-scout.md` kept `maxTurns: 15` — the very number that same paragraph calls known-starving — for another two months.
+
+- **Task exposes no per-dispatch turn override.** You cannot raise a cap from the dispatch call; the agent's own frontmatter is the only control point. So either the cap fits the scope, or the scope must fit the cap.
+- **Floor: no agent definition may declare `maxTurns:` below `40`.** Enforced by `t/91-agent-worker-doctrine.t`, which reads this number from this sentence and checks every `plugins/*/agents/*.md` — so prose and mechanism cannot drift apart again.
+- Caps above the floor are **sized to the role**: bounded read-and-write-one-artifact roles sit at the floor; multi-file roles that must *execute* things sit higher; convergence loops (implementer, resolve-judge) highest. Raising a cap is cheap; a starved worker costs the entire dispatch.
+
+### A dead worker is not a worker that found nothing
+
+A worker whose turns run out returns **its last narration as its result**. That reads exactly like a finished agent reporting a clean bill of health, and it is the most dangerous failure mode in this protocol — strictly worse than a crash, because it looks like success.
+
+Correct caps do not fix this; any worker can still die. Therefore:
+
+- **Require the artifact early.** The dispatch prompt must tell the worker to create its report file *before* investigating and **append** as it goes. A death then leaves partial evidence instead of nothing.
+- **An empty or narration-shaped result is a FAILURE, not a finding of "nothing".** Treat it as a dead dispatch and redispatch per the rules above.
+- **Confirm the artifact exists on disk before accepting any worker's conclusion.** Never record "reviewed, no findings" on the strength of a returned message alone. If the file is absent or stub-sized, the work did not happen — whatever the message says.
 
 ### Non-Claude worker backends (`bp-worker.pl`)
 

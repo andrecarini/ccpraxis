@@ -4,7 +4,7 @@ description: Code reviewer for blueprint packages. Dispatched by a butler coordi
 mode: subagent
 model: opencode/big-pickle
 temperature: 0.1
-steps: 20
+steps: 60
 permission:
   edit: deny
 ---

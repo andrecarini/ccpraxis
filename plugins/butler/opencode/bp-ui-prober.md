@@ -4,7 +4,7 @@ description: UI verification worker for blueprint packages. Dispatched by a butl
 mode: subagent
 model: opencode/big-pickle
 temperature: 0.2
-steps: 40
+steps: 60
 permission:
   edit: allow
 ---

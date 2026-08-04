@@ -4,7 +4,7 @@ description: Test author for blueprint packages. Dispatched by a butler coordina
 mode: subagent
 model: opencode/big-pickle
 temperature: 0.2
-steps: 30
+steps: 60
 permission:
   edit: allow
 ---

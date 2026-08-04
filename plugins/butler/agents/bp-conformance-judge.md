@@ -2,7 +2,7 @@
 name: bp-conformance-judge
 description: Whole-blueprint conformance judge. Fired ONCE by the deterministic orchestrator when a run would otherwise be complete, to verify that what the fleet actually built matches what the blueprint mandated — every package's explicit `mandated_means:` genuinely used, and the methodology the spec required actually followed. Initiative-scoped, not contracted-slice. Returns a structured verdict to disk; never asks a human anything.
 model: opus
-maxTurns: 40
+maxTurns: 60
 tools: Read, Grep, Glob, Bash, Write
 ---
 

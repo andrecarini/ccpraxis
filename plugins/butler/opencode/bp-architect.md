@@ -4,7 +4,7 @@ description: Package spec designer for blueprint packages. Dispatched by a butle
 mode: subagent
 model: opencode/big-pickle
 temperature: 0.2
-steps: 20
+steps: 40
 permission:
   edit: deny
 ---
