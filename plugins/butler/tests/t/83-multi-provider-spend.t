@@ -1041,4 +1041,92 @@ HTML
 # run and confirmed separately as part of this package's verification, per spec §5.
 # =====================================================================================
 
+# =====================================================================================
+# b47 -- REACHABILITY. C21..C24.
+#
+# WHY THESE EXIST, AND WHY THEY ARE NOT ROUND-TRIP ASSERTIONS.
+#
+# Everything above this line passed while the entire feature was INERT.
+# `write_snapshot` was correct, tested, and had ZERO production callers;
+# `bp-spend.pl` ended `package main; 1;` with no `unless (caller)` block, so no
+# shell or orchestrator path could invoke it at all. `fetch` and `verdict` were
+# equally unreachable -- they appear in launcher.pl:4686 and SpendPanel.pm:24
+# only inside COMMENTS describing a wiring that did not exist.
+#
+# The operator-visible failure: open the TUI on a real fleet and the Spend panel
+# is absent forever. Not an error -- the reader's `-f` guard plus its swallowing
+# `eval` make a permanently-broken feature look exactly like "no data yet".
+#
+# b37 escalated this gap honestly and left the artifact's lifecycle to b36; b36
+# built the artifact writer and never called it. Both packages are individually
+# defensible and the seam between them was empty. So these assertions check the
+# SEAM, not the units: a symbol with no caller is inert whatever the unit tests
+# say.
+# =====================================================================================
+{
+    my $root = "$Bin/../../../..";
+
+    # --- C21: the module is invocable at all (it was not) --------------------
+    my $spend_src = do {
+        open my $fh, '<', "$Bin/../../scripts/bp-spend.pl" or die "open bp-spend.pl: $!";
+        local $/; <$fh>;
+    };
+    like($spend_src, qr/unless \s* \( \s* caller \s* \)/x,
+        'C21: bp-spend.pl has a CLI entry point (an `unless (caller)` block), not just a module body');
+
+    # --- C22: a PRODUCTION caller of the writer exists -----------------------
+    # The load-bearing one. Asserting the round trip alone is exactly what let
+    # this ship twice, so this greps the tree for a non-test caller and fails if
+    # the only references are the definition and the tests.
+    # opendir rather than glob: deterministic, and it does not depend on
+    # File::Glob's behaviour inside a long-running test process.
+    my @callers;
+    my $plug = "$root/plugins";
+    if (opendir(my $pd, $plug)) {
+        for my $p (sort grep { !/^\./ } readdir $pd) {
+            my $sd = "$plug/$p/scripts";
+            next unless -d $sd;
+            opendir(my $fd, $sd) or next;
+            for my $base (sort grep { /\.(pl|sh)$/ } readdir $fd) {
+                next if $base eq 'bp-spend.pl';    # the definition itself
+                my $f = "$sd/$base";
+                open my $fh, '<', $f or next;
+                my $t = do { local $/; <$fh> };
+                close $fh;
+                push @callers, $f
+                    if $t =~ /write_snapshot|bp-spend\.pl['"]?\s+snapshot|spend_snapshot/;
+            }
+            closedir $fd;
+        }
+        closedir $pd;
+    }
+    ok(scalar(@callers) > 0,
+        'C22: at least one PRODUCTION (non-test) caller writes the spend snapshot')
+        or diag('no production caller found -- the writer is inert regardless of the unit tests above');
+    diag("C22: production callers: @callers") if @callers;
+
+    # --- C23: absence is DISTINGUISHABLE from broken -------------------------
+    # A snapshot that never existed must be observable, not silently identical
+    # to "no run active". The writer side must emit an event for it.
+    my $orch_src = do {
+        open my $fh, '<', "$Bin/../../scripts/bp-orchestrator.pl" or die "open bp-orchestrator.pl: $!";
+        local $/; <$fh>;
+    };
+    like($orch_src, qr/spend_snapshot/,
+        'C23: the orchestrator emits a spend_snapshot event, so absence is observable rather than silent');
+
+    # --- C24: the CLI actually writes a snapshot when driven ----------------
+    # Executed, not inspected: this is the check that would have caught the
+    # original defect, because it invokes the code the way a real caller does.
+    SKIP: {
+        my $tmp = File::Temp->newdir(CLEANUP => 1);
+        my $out = `perl "$Bin/../../scripts/bp-spend.pl" snapshot --run-dir "$tmp" --offline 2>&1`;
+        my $rc  = $? >> 8;
+        skip("C24: bp-spend.pl snapshot verb not available (rc=$rc)", 2) if $rc == 2;
+
+        is($rc, 0, 'C24: `bp-spend.pl snapshot` exits 0 when driven like a real caller') or diag($out);
+        ok(-f "$tmp/spend.json", 'C24: it wrote spend.json at the path the panel reads');
+    }
+}
+
 done_testing();

@@ -56,6 +56,10 @@ require "$DIR/bp-http.pl";
 require "$DIR/bp-token-keeper.pl";
 require "$DIR/bp-judge.pl";
 require "$DIR/bp-remediate.pl";    # b07: auto-remediation engine (pure decision core)
+require "$DIR/bp-spend.pl";        # b47: BpSpend::fetch/write_snapshot -- the SPEND SNAPSHOT
+                                   # section's writer. Required at load, with its siblings, so a
+                                   # missing file is a startup error rather than a per-tick eval
+                                   # failure logged once every interval and otherwise invisible.
 require "$DIR/bp-checkpoint.pl";   # b02: durable WIP checkpoint commits
 
 our $USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
@@ -1861,6 +1865,11 @@ sub run {
     my (@s5, @s7);       # usage utilization samples [[epoch,pct],...]
     my $next_usage  = 0; # poll immediately at launch (Decision #8: one probe)
     my $next_keeper = 0;
+    my $next_spend  = 0; # b47: write one spend snapshot immediately, so the TUI
+                         # panel has something to render from the first tick.
+    my %spend_cache;     # persists across ticks -- this IS BpSpend::fetch's TTL
+                         # cache, which is in-process by design and was useless
+                         # to anything short-lived.
     my $tele_fail   = 0;
     # b03: ONE creds episode = one creds_error + one pause line, then silence
     # until the episode ends (creds_recovered) or the process restarts (§5.2).
@@ -2038,6 +2047,46 @@ sub run {
                     }
                     $paused = read_paused($runs);
                 }
+            }
+
+            # ---- SPEND SNAPSHOT (b47) ----
+            # THE SEAM THAT WAS EMPTY. b37 escalated the missing snapshot and left
+            # its lifecycle to b36; b36 built write_snapshot and never called it.
+            # Both packages were individually defensible, the suite was green, and
+            # the Spend panel could never render on any real fleet -- the reader's
+            # `-f` guard plus its swallowing `eval` made permanent breakage look
+            # identical to "no data yet".
+            #
+            # In-process on purpose. s17 removed the recurring fork from the
+            # DASHBOARD RENDER TICK and that must stay removed -- but this is the
+            # orchestrator loop, not the render path, so the constraint does not
+            # apply here. Running in-process also lets %spend_cache persist across
+            # ticks, which is exactly the TTL cache BpSpend::fetch was built for.
+            #
+            # Nothing in this section may end the tick: spend is telemetry, and a
+            # billing endpoint being down must never stop the fleet.
+            if ($now >= $next_spend) {
+                my $res = eval {
+                    my @out;
+                    for my $p (qw(go zen)) {
+                        my $r = eval { BpSpend::fetch(provider => $p, now => $now,
+                                                      cache => \%spend_cache, log_path => $log) };
+                        # A provider that dies is `unknown`, never zero and never
+                        # absent: it is configured enough to have failed.
+                        push @out, (ref $r eq 'HASH') ? $r : { provider => $p, status => 'unknown' };
+                    }
+                    BpSpend::write_snapshot(path => "$runs/spend.json", results => \@out, now => $now);
+                };
+                my $err = $@;
+                # ALWAYS re-arm before logging, so a permanently failing endpoint
+                # costs one attempt + one line per interval rather than a hot loop.
+                $next_spend = $now + ($t->{spend_int} // 900);
+                # Emitted on BOTH outcomes. This is what makes an absent panel
+                # DISTINGUISHABLE from a broken one: the operator can see that a
+                # write was attempted and what happened to it.
+                eval { _log($log, 'spend_snapshot', $err
+                    ? { outcome => 'error', detail => _oneline("$err") }
+                    : { outcome => 'wrote', path => "$runs/spend.json" }) };
             }
 
             # ---- LIVE TUNABLES: re-read runs/.tunables every tick so max_par can

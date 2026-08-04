@@ -441,4 +441,102 @@ sub write_snapshot {
 }
 
 package main;
+
+# ===========================================================================
+# CLI (b47). THIS BLOCK'S ABSENCE WAS THE DEFECT.
+#
+# bp-spend.pl previously ended `package main; 1;` with no `unless (caller)`
+# block, so nothing outside a `require` could ever invoke it. Combined with
+# write_snapshot having no production caller, the Spend panel could never
+# render on any real fleet -- and the reader's `-f` guard plus its swallowing
+# `eval` made that permanent breakage look exactly like "no data yet".
+#
+#   bp-spend.pl snapshot --run-dir DIR [--offline] [--now EPOCH] [--log PATH]
+#
+# Writes DIR/spend.json -- the exact path launcher.pl's _gather_spend reads.
+# Exit 0 wrote (or served a still-fresh snapshot) - 2 usage - 4 I/O.
+#
+# CADENCE ACROSS PROCESSES. fetch()'s TTL cache is in-process and therefore
+# useless to a CLI that exits, so this re-derives the floor from the EXISTING
+# snapshot's generated_at. That makes the verb safe to call on any tick: inside
+# $CADENCE_TTL_SECONDS it is a stat plus a read and makes no network call at
+# all. Without this, wiring it to a frequent loop would hammer the providers --
+# the cadence floor would exist in the library and be bypassed by its only
+# caller.
+#
+# --offline performs no fetch and records every provider as `absent`. It exists
+# so the write path can be exercised deterministically (no credentials, no
+# network) -- the check that would have caught the original defect.
+# ===========================================================================
+unless (caller) {
+    my $verb = shift(@ARGV) // '';
+    my %opt;
+    while (@ARGV) {
+        my $a = shift @ARGV;
+        if    ($a =~ /^--run-dir=(.*)$/) { $opt{run_dir} = $1 }
+        elsif ($a eq '--run-dir')        { $opt{run_dir} = shift @ARGV }
+        elsif ($a =~ /^--now=(.*)$/)     { $opt{now}     = $1 }
+        elsif ($a eq '--now')            { $opt{now}     = shift @ARGV }
+        elsif ($a =~ /^--log=(.*)$/)     { $opt{log}     = $1 }
+        elsif ($a eq '--log')            { $opt{log}     = shift @ARGV }
+        elsif ($a eq '--offline')        { $opt{offline} = 1 }
+        elsif ($a eq '--force')          { $opt{force}   = 1 }
+        else { print STDERR "bp-spend: unrecognised argument '$a'\n"; exit 2 }
+    }
+
+    if ($verb ne 'snapshot') {
+        print STDERR "usage: bp-spend.pl snapshot --run-dir DIR [--offline] [--force] [--now EPOCH] [--log PATH]\n";
+        exit 2;
+    }
+    unless (defined $opt{run_dir} && length $opt{run_dir}) {
+        print STDERR "bp-spend: --run-dir is required\n";
+        exit 2;
+    }
+
+    my $now  = defined $opt{now} && $opt{now} =~ /^\d+$/ ? $opt{now} + 0 : time;
+    my $path = "$opt{run_dir}/spend.json";
+
+    # Cross-process cadence floor -- see the header note.
+    if (!$opt{force} && -f $path) {
+        my $fresh = eval {
+            open my $fh, '<:raw', $path or die "read\n";
+            my $raw = do { local $/; <$fh> };
+            close $fh;
+            my $prev = JSON::PP->new->decode($raw);
+            my $gen  = ref $prev eq 'HASH' ? ($prev->{generated_at} // '') : '';
+            # generated_at is ISO; compare via mtime, which is what we control.
+            my @st = stat($path);
+            (@st && ($now - $st[9]) < $BpSpend::CADENCE_TTL_SECONDS) ? 1 : 0;
+        };
+        if ($fresh) { print "$path\n"; exit 0 }
+    }
+
+    my @results;
+    if ($opt{offline}) {
+        @results = map { { provider => $_, status => 'absent' } } qw(go zen);
+    }
+    else {
+        my %cache;
+        for my $p (qw(go zen)) {
+            my $r = eval {
+                BpSpend::fetch(provider => $p, now => $now, cache => \%cache,
+                               log_path => $opt{log});
+            };
+            # A provider that blows up must not lose the whole snapshot: record
+            # it as unknown (never zero, never absent -- it IS configured enough
+            # to have failed) and keep going.
+            push @results, (ref $r eq 'HASH') ? $r
+                         : { provider => $p, status => 'unknown' };
+        }
+    }
+
+    my $written = eval { BpSpend::write_snapshot(path => $path, results => \@results, now => $now) };
+    if ($@ || !defined $written) {
+        print STDERR "bp-spend: could not write $path: " . ($@ || "unknown error\n");
+        exit 4;
+    }
+    print "$written\n";
+    exit 0;
+}
+
 1;
