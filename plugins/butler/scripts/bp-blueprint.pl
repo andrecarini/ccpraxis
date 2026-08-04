@@ -100,6 +100,11 @@ sub notfound_error { my ($sub, $msg) = @_; emit_err("bp-blueprint: $sub: $msg");
 # Byte-level I/O.
 # =====================================================================================
 
+sub _today {
+    my @t = gmtime(time);
+    return sprintf('%04d-%02d-%02d',  + 1900,  + 1, );
+}
+
 sub _slurp {
     my ($path) = @_;
     open(my $fh, '<:raw', $path) or return undef;
@@ -351,6 +356,195 @@ sub run_write {
 # Write ops.
 # =====================================================================================
 
+# -------------------------------------------------------------------------------------
+# op_init — CREATE blueprint.md from a template.
+#
+# WHY THIS EXISTS. `guard-blueprint-write.sh` denies Write/Edit to ANY blueprint.md
+# path -- including one that does not exist yet -- while /blueprint:create step 4 said
+# "Write blueprint.md from templates/blueprint.md". The documented create flow was
+# therefore impossible to execute as written, and every author had to route around the
+# guard via Bash: exactly the hand-splice the guard exists to prevent, through a door
+# the hook cannot see. Prose said one thing, the mechanism enforced another.
+#
+# The template path is a PARAMETER, never derived here. bp-blueprint.pl ships in the
+# butler plugin; the template ships in the blueprint plugin, and installed plugins live
+# in separate cache trees -- so a cross-plugin path would resolve on a dev checkout and
+# break on a real install. The caller (which owns the template) passes it in.
+# -------------------------------------------------------------------------------------
+sub op_init {
+    my @args = @_;
+    my %opt;
+    my $ok;
+    { local $SIG{__WARN__} = sub { };
+      $ok = GetOptionsFromArray(\@args, \%opt,
+            'file=s', 'template=s', 'name=s', 'created=s'); }
+    arg_error('init', 'unrecognised option') unless $ok;
+    arg_error('init', 'unexpected extra arguments: ' . join(' ', @args)) if @args;
+    for my $r (qw(file template name)) {
+        arg_error('init', "missing required --$r") unless defined $opt{$r};
+    }
+    unless (field_safe($opt{name})) {
+        arg_error('init', '--name contains a pipe or newline');
+    }
+    unless ($opt{name} =~ /\A[a-z0-9]+(?:-[a-z0-9]+)*\z/) {
+        arg_error('init', "--name '$opt{name}' is not kebab-case (a-z, 0-9, single hyphens)");
+    }
+
+    my $path = $opt{file};
+
+    # REFUSE rather than overwrite. An existing blueprint is somebody's initiative;
+    # re-running init must never be the thing that destroys it.
+    if (-e $path) {
+        reject_error('init', "$path already exists -- refusing to overwrite an existing blueprint. "
+                           . 'Use the typed verbs (add-package, add-decision, set-section) to modify it.');
+    }
+
+    my $tpl = _slurp($opt{template});
+    defined $tpl or io_error('init', "cannot read template $opt{template}: $!");
+
+    # A template that does not carry the metadata block is not a blueprint template;
+    # substituting into it would silently produce a file parse_dag cannot read.
+    unless ($tpl =~ /^blueprint:\s*\S/m) {
+        reject_error('init', "template $opt{template} has no `blueprint:` metadata line -- "
+                           . 'refusing to guess its shape');
+    }
+
+    my $created = $opt{created};
+    unless (defined $created && length $created) {
+        my @t = gmtime(time);
+        $created = sprintf('%04d-%02d-%02d', $t[5] + 1900, $t[4] + 1, $t[3]);
+    }
+    unless (field_safe($created)) {
+        arg_error('init', '--created contains a pipe or newline');
+    }
+
+    # STRIP TEMPLATE PLACEHOLDER ROWS. The template ships illustrative table rows --
+    # `| 01-<slug> | <one line> | — | sonnet | pending |` and `| 1 | <e.g. ...> |`.
+    # Left in place, BpOrch::parse_dag reads `01-<slug>` as a REAL package with no
+    # ledger, so a brand-new blueprint fails its own DAG validation and every author
+    # has to remember to delete rows by hand. A data row carrying an angle-bracket
+    # placeholder is by definition not real content; header and separator rows are
+    # never touched.
+    {
+        my @keep;
+        for my $ln (split /\n/, $tpl, -1) {
+            if ($ln =~ /^\s*\|/ && !_is_sep_row($ln) && $ln =~ /<[^>]*>/) {
+                next;   # illustrative row from the template
+            }
+            push @keep, $ln;
+        }
+        $tpl = join("\n", @keep);
+    }
+
+    $tpl =~ s/^blueprint:\s*.*$/blueprint: $opt{name}/m;
+    $tpl =~ s/^created:\s*.*$/created: $created/m;
+    $tpl =~ s/^last_updated:\s*.*$/last_updated: $created/m;
+    $tpl =~ s/^status:\s*\S+/status: drafting/m;
+
+    my $dir = dirname($path);
+    if (length $dir && !-d $dir) {
+        require File::Path;
+        File::Path::make_path($dir)
+            or io_error('init', "cannot create directory $dir: $!");
+    }
+
+    # Same atomic discipline as run_write: temp + rename under flock. Not run_write
+    # itself, which slurps the target first and so cannot create one.
+    my $lockpath = "$path.lock";
+    open(my $lk, '>', $lockpath) or io_error('init', "cannot open lock file $lockpath: $!");
+    flock($lk, LOCK_EX) or io_error('init', "cannot acquire lock on $lockpath: $!");
+
+    # Re-check under the lock: two authors racing must not both "create" it.
+    if (-e $path) {
+        close $lk;
+        reject_error('init', "$path already exists (created concurrently) -- refusing to overwrite");
+    }
+
+    my $tmp = "$path.tmp.$$";
+    open(my $w, '>:raw', $tmp) or do { close $lk; io_error('init', "cannot open temp file $tmp: $!") };
+    print {$w} $tpl or do { close $w; unlink $tmp; close $lk; io_error('init', "write to $tmp failed: $!") };
+    close($w) or do { unlink $tmp; close $lk; io_error('init', "close $tmp failed: $!") };
+    unless (rename($tmp, $path)) {
+        unlink $tmp;
+        close $lk;
+        io_error('init', "rename $tmp -> $path failed: $!");
+    }
+    flock($lk, LOCK_UN);
+    close $lk;
+    exit 0;
+}
+
+# -------------------------------------------------------------------------------------
+# op_set_section — replace the BODY of a `## ` prose section.
+#
+# The other write verbs are all typed edits to the package-status table and the
+# decisions table. The NARRATIVE sections (Objective, Constraints & known hazards, Key
+# references, the per-package blocks) had no verb at all -- so an author filling in a
+# freshly-initialised template still had to hand-splice, and the guard still refused.
+# This closes that loop: every mutation of blueprint.md now has a typed, atomic path.
+#
+# Structural sections are REFUSED here on purpose. "Package status" and "Decisions" are
+# tables the orchestrator's parse_dag reads; they have their own validated verbs, and
+# letting free text overwrite them would reintroduce exactly the corruption this API
+# exists to make impossible.
+# -------------------------------------------------------------------------------------
+my %SECTION_REFUSED = map { lc($_) => 1 } (
+    'Package status',   # add-package / set-status / set-field / set-deps own this
+    'Decisions',        # add-decision / set-decision own this
+    'Harvest log',      # orchestrator-only, written during execution
+);
+
+sub op_set_section {
+    my @args = @_;
+    my %opt;
+    my $ok;
+    { local $SIG{__WARN__} = sub { };
+      $ok = GetOptionsFromArray(\@args, \%opt, 'file=s', 'section=s', 'text-file=s'); }
+    arg_error('set-section', 'unrecognised option') unless $ok;
+    arg_error('set-section', 'unexpected extra arguments: ' . join(' ', @args)) if @args;
+    for my $r (qw(file section text-file)) {
+        arg_error('set-section', "missing required --$r") unless defined $opt{$r};
+    }
+
+    my $want = $opt{section};
+    if ($SECTION_REFUSED{ lc $want }) {
+        arg_error('set-section',
+            "section '$want' is structured state with its own typed verbs -- refusing. "
+          . 'Use add-package/set-status/set-field/set-deps or add-decision/set-decision.');
+    }
+
+    my $body = _slurp($opt{'text-file'});
+    defined $body or io_error('set-section', "cannot read --text-file $opt{'text-file'}: $!");
+
+    # New text may not introduce a `## ` heading: that would silently restructure the
+    # document and could manufacture a second "Package status" the parser then latches
+    # onto (the SYN-14 failure shape, one level up).
+    if ($body =~ /^##\s/m) {
+        arg_error('set-section',
+            '--text-file contains a `## ` heading; that would restructure the document. '
+          . 'Set one section at a time.');
+    }
+
+    run_write('set-section', $opt{file}, sub {
+        my ($orig) = @_;
+
+        # Match this `## <section>` up to the next `## ` at line start, or EOF.
+        my $q = quotemeta $want;
+        unless ($orig =~ /^##[ \t]+$q[ \t]*$/m) {
+            return (undef, "no `## $want` section found in $opt{file} -- refusing to invent one. "
+                         . 'Sections come from the template; check the exact heading text.');
+        }
+
+        $body =~ s/\s*\z//;                    # normalise trailing whitespace
+        my $new = $orig;
+        # `[ \t]*` not `\s*` after the heading: `\s*` also matches the newline, so the
+        # capture swallowed the blank line that follows and every set-section added
+        # another one. Caught by diffing the bytes, not by reading the regex.
+        $new =~ s{(^##[ \t]+$q[ \t]*\n)(.*?)(?=^##[ \t]|\z)}{$1\n$body\n\n}ms;
+        return ($new, undef);
+    });
+}
+
 sub op_add_package {
     my @args = @_;
     my %opt;
@@ -488,7 +682,7 @@ sub op_add_decision {
     my %opt;
     my $ok;
     { local $SIG{__WARN__} = sub { };
-      $ok = GetOptionsFromArray(\@args, \%opt, 'file=s', 'id=s', 'text=s'); }
+      $ok = GetOptionsFromArray(\@args, \%opt, 'file=s', 'id=s', 'text=s', 'decided=s', 'date=s'); }
     arg_error('add-decision', 'unrecognised option') unless $ok;
     arg_error('add-decision', 'unexpected extra arguments: ' . join(' ', @args)) if @args;
     for my $r (qw(file id text)) {
@@ -520,9 +714,46 @@ sub op_add_decision {
         # A table-shaped section (b42's target shape) must never receive an appended
         # bullet -- that would corrupt the table silently. Refuse instead; editing an
         # existing row is set-decision's job, and creating new rows is out of scope here.
-        if (decisions_table_info(\@lines, $start, $end)) {
-            return (undef, "the Decisions section is table-shaped; add-decision only appends bullets "
-                          . 'and would corrupt the table. Use set-decision to edit an existing row.');
+        # TABLE-SHAPED: append a ROW, don't refuse.
+        #
+        # This used to refuse outright, which left a hole nobody could get through:
+        # `add-decision` would not append to a table and `set-decision` requires a row
+        # that already exists -- so a table-shaped Decisions section could never receive
+        # a NEW decision. b42 converted the shape and did not update the appender, and
+        # the refusal message pointed at a verb that cannot create rows. A freshly
+        # initialised blueprint (whose template ships the table shape) was therefore
+        # un-authorable through the API, which is what forced hand-splicing.
+        if (my $tbl = decisions_table_info(\@lines, $start, $end)) {
+            my $ci = decisions_text_col($tbl->{cols});
+            return (undef, 'decisions table has no identifiable text column') unless defined $ci;
+
+            return (undef, "a decision with id '$opt{id}' already exists; use set-decision to edit it")
+                if defined decisions_find_row(\@lines, $tbl, $opt{id});
+
+            # Fill by COLUMN HEADER, not by position: the table's shape is the
+            # blueprint author's, and assuming a fixed 4-column layout is how a
+            # generic API silently corrupts a project-specific one.
+            my @cells;
+            for my $i (0 .. $#{ $tbl->{cols} }) {
+                if    ($i == 0)   { push @cells, $opt{id} }
+                elsif ($i == $ci) { push @cells, $opt{text} }
+                elsif ($tbl->{cols}[$i] =~ /decided|by|who/i)  { push @cells, $opt{decided} // 'user' }
+                elsif ($tbl->{cols}[$i] =~ /date|when/i)       { push @cells, $opt{date} // _today() }
+                else                                           { push @cells, '' }
+            }
+            my $row = '| ' . join(' | ', @cells) . ' |';
+
+            # Insert immediately after the last CONTIGUOUS row, not at the section's
+            # end_i. On a freshly initialised blueprint the table is header+separator
+            # followed by a blank line, and appending at end_i put the row AFTER that
+            # blank -- which terminates the table, so the row was orphaned and invisible
+            # to the parser. Found by reading the emitted bytes, not the code.
+            my $ins = $tbl->{sep_i} + 1;
+            $ins++ while defined $lines[$ins]
+                      && $lines[$ins] =~ /^\s*\|/
+                      && !_is_sep_row($lines[$ins]);
+            splice(@lines, $ins, 0, $row);
+            return (join("\n", @lines), undef);
         }
         my $insert_at = $end;
         $insert_at-- if $insert_at > 0 && $lines[$insert_at - 1] eq '';
@@ -858,6 +1089,8 @@ sub op_ready {
 # =====================================================================================
 
 my %DISPATCH = (
+    'init'         => \&op_init,
+    'set-section'  => \&op_set_section,
     'add-package'  => \&op_add_package,
     'set-status'   => \&op_set_status,
     'set-deps'     => \&op_set_deps,

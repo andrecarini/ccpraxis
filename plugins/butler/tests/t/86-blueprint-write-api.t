@@ -619,17 +619,33 @@ for my $header ('## Decisions', '## Synthesis decisions', '## SYNTHESIS DECISION
        "G13: ...and lists the newly-added decision");
 }
 
-# G14 (add-decision refuses on a table-shaped section rather than corrupting it).
+# G14 — RETARGETED (SYN-21: a mandated later change invalidating a done sibling's
+# assertion, owned and updated rather than left red).
+#
+# G14 originally asserted that add-decision REFUSES a table-shaped section. That refusal
+# left a hole nobody could get through: set-decision requires a row that already exists,
+# so a table-shaped section could never receive a NEW decision -- and the template ships
+# that shape, making a freshly initialised blueprint un-authorable through the API. The
+# refusal message even pointed at a verb that cannot create rows.
+#
+# G14's INTENT is preserved exactly and is what is asserted now: add-decision must never
+# CORRUPT the table. It no longer refuses; it appends a well-formed row, and a bullet
+# must never appear in a table-shaped section. (G19 covers contiguity and duplicate ids.)
 {
     my $p = stage_bytes(table_decisions_fixture());
-    my $before_digest = digest_of($p);
     my ($rc, $out, $err) = run_pl(['add-decision', '--file', $p, '--id', 'SYN-99',
-                                    '--text', 'an attempted bullet append into a table']);
-    isnt($rc, 0, "G14: add-decision against a table-shaped Decisions section is refused (non-zero exit)");
-    is($out, '', "G14: stdout empty on refusal");
-    ok(length($err) > 0, "G14: stderr names a cause for the refusal");
-    like($err, qr/table/i, "G14: the refusal message names the table shape as the cause");
-    is(digest_of($p), $before_digest, "G14: ...and the file is left byte-identical");
+                                    '--text', 'an appended row, not a bullet']);
+    is($rc, 0, "G14: add-decision against a table-shaped Decisions section succeeds");
+
+    my $new = read_file($p) // '';
+    like($new, qr/^\|\s*SYN-99\s*\|.*an appended row, not a bullet/m,
+        "G14: ...by appending a well-formed TABLE ROW");
+
+    # The corruption G14 has always existed to prevent: a bullet inside a table.
+    my ($sec) = $new =~ /^##[ \t]+Decisions[ \t]*\n(.*?)(?=^##[ \t]|\z)/ms;
+    $sec = '' unless defined $sec;
+    unlike($sec, qr/^\s*-\s+SYN-99/m,
+        "G14: and NEVER as a bullet inside the table (the original defect)");
 }
 
 # G15 (set-decision refusal: --text containing the literal 'depends_on', SYN-14 wording
@@ -678,6 +694,100 @@ for my $header ('## Decisions', '## Synthesis decisions', '## SYNTHESIS DECISION
     my $new = read_file($p);
     my $rows_after = () = ($new =~ /^\|\s*SYN-/mg);
     is($rows_after, $rows_before, "G17: ...and no new row was created (add-decision's job, not set-decision's)");
+}
+
+# =====================================================================================
+# G18 — A BLUEPRINT CAN BE AUTHORED END TO END THROUGH THIS API.
+#
+# The gap this closes: `guard-blueprint-write.sh` denies Write/Edit to ANY blueprint.md
+# path -- including one that does not exist yet -- while /blueprint:create step 4 said
+# "Write blueprint.md from templates/blueprint.md". The documented create flow was
+# therefore impossible to execute as written, and the only way through was to `cp` a
+# hand-authored file past a hook that cannot see Bash: exactly the hand-splice this API
+# exists to prevent.
+#
+# No single assertion caught it because every existing criterion starts from a blueprint
+# that ALREADY EXISTS. This one starts from nothing, which is the case the author is in.
+# =====================================================================================
+{
+    my $dir  = tempdir(CLEANUP => 1);
+    my $tpl  = "$BUTLER/../blueprint/templates/blueprint.md";
+    my $bp   = "$dir/nested/blueprint.md";      # nested: init must create the parent
+
+    SKIP: {
+        skip('G18: blueprint template not present in this checkout', 9) unless -f $tpl;
+
+        my ($rc) = run_pl([ 'init', '--file', $bp, '--template', $tpl,
+                              '--name', 'g18-demo', '--created', '2026-01-02' ]);
+        is($rc, 0, 'G18: init creates a blueprint from the template (and its parent dir)');
+        ok(-f $bp, 'G18: the file exists afterwards');
+
+        my $txt = read_file($bp) // '';
+        like($txt, qr/^blueprint:\s*g18-demo$/m, 'G18: --name is substituted');
+        like($txt, qr/^status:\s*drafting\b/m,   'G18: a fresh blueprint starts as drafting');
+
+        # The template's illustrative rows must NOT survive: parse_dag would read
+        # `01-<slug>` as a real package with no ledger, so a brand-new blueprint would
+        # fail its own DAG validation.
+        unlike($txt, qr/^\|\s*01-<slug>/m,
+            'G18: template placeholder package row is stripped');
+
+        # Refuse-rather-than-overwrite: an existing blueprint is somebody's initiative.
+        my ($rc2) = run_pl([ 'init', '--file', $bp, '--template', $tpl, '--name', 'g18-demo' ]);
+        isnt($rc2, 0, 'G18: init refuses to overwrite an existing blueprint');
+
+        # Prose has a typed verb, so the author never needs Write.
+        my $body = "$dir/body.md";
+        write_file($body, "A real objective.\n");
+        my ($rc3) = run_pl([ 'set-section', '--file', $bp,
+                               '--section', 'Objective', '--text-file', $body ]);
+        is($rc3, 0, 'G18: set-section fills a prose section');
+        like(read_file($bp) // '', qr/A real objective\./, 'G18: ...and the text landed');
+
+        # Structured sections keep their own verbs -- free text must never overwrite the
+        # table parse_dag reads.
+        my ($rc4) = run_pl([ 'set-section', '--file', $bp,
+                               '--section', 'Package status', '--text-file', $body ]);
+        isnt($rc4, 0, 'G18: set-section refuses a structured section');
+    }
+}
+
+# =====================================================================================
+# G19 — add-decision works on a TABLE-shaped Decisions section.
+#
+# b42 converted that section to a table and did not update the appender: add-decision
+# refused tables, and set-decision requires a row that already exists -- so a
+# table-shaped section could never receive a NEW decision, and the refusal message
+# pointed at a verb that cannot create one. The template ships the table shape, so a
+# freshly initialised blueprint was un-authorable.
+# =====================================================================================
+{
+    my $dir = tempdir(CLEANUP => 1);
+    my $tpl = "$BUTLER/../blueprint/templates/blueprint.md";
+    my $bp  = "$dir/blueprint.md";
+
+    SKIP: {
+        skip('G19: blueprint template not present in this checkout', 4) unless -f $tpl;
+        run_pl([ 'init', '--file', $bp, '--template', $tpl, '--name', 'g19-demo' ]);
+
+        my ($rc1) = run_pl([ 'add-decision', '--file', $bp, '--id', '1',
+                               '--text', 'First decision', '--decided', 'user', '--date', '2026-01-02' ]);
+        is($rc1, 0, 'G19: add-decision appends a ROW to a table-shaped section');
+
+        my ($rc2) = run_pl([ 'add-decision', '--file', $bp, '--id', '2',
+                               '--text', 'Second decision', '--decided', 'user', '--date', '2026-01-02' ]);
+        is($rc2, 0, 'G19: ...and a second one');
+
+        # Contiguity is the real assertion. A blank line between the separator and a row
+        # TERMINATES the table, orphaning the row -- which is exactly what the first
+        # implementation did by appending at the section end rather than after the last row.
+        my $txt = read_file($bp) // '';
+        like($txt, qr/^\|---.*\n\|\s*1\s*\|.*\n\|\s*2\s*\|/m,
+            'G19: rows are contiguous with the separator (a blank line would end the table)');
+
+        my ($rc3) = run_pl([ 'add-decision', '--file', $bp, '--id', '1', '--text', 'dupe' ]);
+        isnt($rc3, 0, 'G19: a duplicate decision id is refused');
+    }
 }
 
 done_testing();
