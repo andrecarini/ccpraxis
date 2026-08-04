@@ -16,6 +16,20 @@ max_turns: 800
 #     bp-implementer: [opencode/big-pickle, opencode/some-fallback]
 write_set: <colon-separated patterns, trailing / = prefix>
 test_paths: <colon-separated patterns>
+checks: <colon-separated check names this write set can break — see below>
+#   `test_paths` is a SCOPE limiter: WHICH tests run. `checks` is a KIND list:
+#   what sorts of verification this write set can break. They are different
+#   questions, and the gap between them is where escapes live — five defects
+#   reached one initiative's closing gate because the check that would have
+#   caught each was in no package's criteria (a production-mode build, a
+#   Firestore index, a route load, a lint error latent for weeks, and a
+#   workspace unbuildable for five days while every package reported green).
+#
+#   The names come from YOUR PROJECT's `checks-table` in blueprint.md. There is
+#   no built-in list: this tool is stack-agnostic, and a blueprint with no table
+#   implies nothing. Derive with:
+#       bp-checks.pl derive --blueprint <blueprint.md> --write-set <SET>
+#   and audit the whole blueprint with `bp-checks.pl audit --blueprint ...`.
 last_updated: <ISO timestamp>
 ---
 

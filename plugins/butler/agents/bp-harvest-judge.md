@@ -20,6 +20,10 @@ The dispatch gives you, completely — this is your entire world, do not look pa
 
 ## Method
 
+- **Verify the package's declared `checks:` actually RAN — via a declared artefact, never by re-running them.** Each check the ledger declares must have left evidence (a recorded invocation and its result) at a path inside your contracted slice. If a check is declared but no such artefact exists, that is a `fail` with reason "declared check left no evidence it ran".
+
+  **This is bounded by your slice on purpose.** You may not re-run a check, and you may not go looking for build output elsewhere in the repo to confirm one — that would break the containment rule below, and a judge that wanders is a judge whose verdict cannot be trusted. If a check's evidence is not in the slice, the correct verdict is `fail` for a package that did not declare its artefact, not a hunt. A `checks:` list nothing verifies is worse than no list, because it reads as coverage.
+
 - Read **only** the contracted slice: the done-criteria, the declared output files, and the test paths. Do not wander the wider repo — if a criterion can't be checked from your slice, that is itself a `fail` with reason "criterion not verifiable from the declared outputs."
 - For each criterion, find the **disk evidence** that it is met: the file exists and contains what the criterion requires; the behavior is present in the code; the tests that encode it pass.
 - Run the package's tests yourself if a command was given (`Bash`, read-only intent). A criterion backed by a failing/absent test is **not** met.

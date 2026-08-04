@@ -318,6 +318,15 @@ The first two differ only in case and separator. Raising one does **nothing** fo
 - Caps above the floor are **sized to the role**: bounded read-and-write-one-artifact roles sit at the floor (400); multi-file roles that must *execute* things at 600; convergence loops (implementer, resolve-judge) at 800. For calibration, the ledger `max_turns:` default for a **coordinator** is 150 — a worker auditing a whole subsystem has no business being capped below the thing that dispatches it.
 - **If you are tempted to lower one of these, you are reading it as a budget again.** Lower the scope instead.
 
+### Run the checks your write set implies — even when the criteria omit one
+
+Your `test_paths` answers *which tests run*. It does not answer **"is everything my write set can break still working?"** Those are different questions, and the gap between them is where escapes live: one 13-package initiative shipped five defects to its closing gate, each because the check that would have caught it was in **no package's** done-criteria — a production-mode build, a Firestore index declaration, a route load, a lint error latent for weeks, and a workspace unbuildable for five days while every package reported green.
+
+- **Before declaring `done`, run the checks your write set implies** — `perl plugins/butler/scripts/bp-checks.pl derive --blueprint <blueprint.md> --write-set "$BP_WRITE_SET"` lists them. Run them **even if your ledger's criteria omit one**: the criteria are the author's best guess, and the whole failure mode is a check nobody thought to write down.
+- **The table is your PROJECT's**, declared as a ```` ```checks-table ```` block in `blueprint.md`. There is no built-in list — this toolchain is stack-agnostic and its own blueprints are pure Perl. A blueprint with no table implies nothing and behaves exactly as before.
+- **Record what you ran.** The harvest judge may only read your contracted slice, so a check that left no artefact inside it cannot be verified — see that agent's contract.
+- **This does NOT cover the visual class, and nothing here should be read as covering it.** In the same initiative an e2e spec asserted a spinner `toBeVisible()` and passed while it rendered 185px outside a clipped dialog: `toBeVisible()` means "has a layout box", not "a human can see it". A person looking at the screenshot found it. Automated checks do not replace `bp-ui-prober`'s human-read pass — keep it.
+
 ### A dead worker is not a worker that found nothing
 
 A worker whose turns run out returns **its last narration as its result**. That reads exactly like a finished agent reporting a clean bill of health, and it is the most dangerous failure mode in this protocol — strictly worse than a crash, because it looks like success.

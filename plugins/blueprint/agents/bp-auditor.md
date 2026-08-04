@@ -19,6 +19,16 @@ The blueprint directory path. Read `blueprint.md` and every ledger under `packag
 - **Untestable done criteria** — anything a coordinator couldn't verify mechanically from disk.
 - **Write-set hazards** — overlaps between packages eligible to run in parallel; write sets that obviously miss files the scope implies.
 - **Hidden dependencies** — package A's inputs are produced by package B without a `depends_on` edge.
+- **Write-set-implied checks** — REQUIRED pass, and **run it, do not eyeball it**:
+
+  ```
+  perl plugins/butler/scripts/bp-checks.pl audit --blueprint <blueprint.md>
+  ```
+
+  Exit 1 means some package omits a check its own write set implies; report each as a finding naming the package and the check. Exit 0 with *"no checks-table"* is **not** a failure — the table is project-supplied by design (this toolchain is stack-agnostic; its own blueprints are pure Perl and declare none), and a blueprint without one implies nothing.
+
+  This moves detection from execution time to **authoring time**, which is where it is cheap. The failure it prevents is a defect that sits latent until the closing gate and surfaces as an ownerless mystery on whichever package happens to run last — long after the package that caused it closed. Attribution for one such lint error needed a `git log -S`.
+
 - **DAG integrity** — REQUIRED pass: every `depends_on` token in `blueprint.md`'s package-status table names an existing package row (no dangling refs; a short id like `b01` must resolve to exactly one full package id), the graph has no cycles, every `packages/*.md` ledger has a matching table row and vice versa, and no package declares an empty `write_set`.
 - **Missing inputs** — referenced paths that don't exist; inputs a coordinator would clearly need but isn't given.
 - **Scope ambiguity** — boundaries where two packages could both believe they own a file or behavior.
