@@ -64,6 +64,23 @@ RUN curl -sSL https://nodejs.org/dist/v24.18.0/node-v24.18.0-linux-x64.tar.xz -o
     && rm -f /tmp/node.tar.xz \
     && npm install -g pnpm@11.17.0
 
+# /opt/node24/bin MUST be on PATH. npm derives its global prefix from the REAL
+# path of the node binary -- dirname(dirname(realpath(process.execPath))) --
+# which resolves through the /usr/local/bin/node symlink to /opt/node24, NOT to
+# /usr/local. So `npm install -g <tool>` drops its bin into /opt/node24/bin,
+# which nothing else puts on PATH: the two `ln -sf` lines above cover exactly
+# node and npm and nothing else.
+#
+# Measured: the build died at the very next step with `/bin/sh: 1: pnpm: not
+# found` immediately after npm reported "added 1 package". The install had
+# succeeded; only the lookup failed.
+#
+# Fixing the CLASS (PATH) rather than the INSTANCE (one more symlink for pnpm)
+# is deliberate: every `npm install -g` an agent or a backpack item runs inside
+# the container hits the same wall, and would "succeed" and then be unreachable
+# -- a silent failure far harder to diagnose than this loud one.
+ENV PATH="/opt/node24/bin:${PATH}"
+
 # pnpm supply-chain hardening -- separate from the npm_config_ignore_scripts
 # key above (that one governs npm; pnpm reads its own PNPM_CONFIG_* env).
 # MINIMUM_RELEASE_AGE is in MINUTES: 10080 = 7 days, matching the >=7-day
