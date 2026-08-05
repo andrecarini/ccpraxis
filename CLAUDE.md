@@ -130,7 +130,8 @@ These have each cost real debugging time. Details in the user-global `CLAUDE.md`
 ## `.ccpraxis-local-data/` — gitignored, and it does not travel
 
 Holds blueprints, `claude-home` (agent memory, session transcripts, credentials, beacons), launcher
-state. Git never carries it. Nor does it carry `deploy_key`, `deploy_key.pub` or `.claude/`.
+state. Git never carries it. Nor does it carry `deploy_key` or `deploy_key.pub`. Most of `.claude/`
+is ignored too — but **not** `.claude/settings.json`; see the next section.
 
 If you relocate a project, **`git status --ignored` is the authoritative list of what to copy — not
 `.gitignore`**, which lists patterns rather than what actually exists.
@@ -139,6 +140,35 @@ If you relocate a project, **`git status --ignored` is the authoritative list of
 (`container-name`, `port-base`, `containerfile-hash`); a copied `container-name` makes the launcher
 attach to another project's container and mount the wrong directory at `/project`. It is derived
 state — delete it and it regenerates.
+
+## `.claude/settings.json` is TRACKED — and that is load-bearing
+
+Claude Code's own model, which this repo now follows rather than fights:
+
+| file | git | holds |
+|---|---|---|
+| `.claude/settings.json` | **tracked** | shared project config: the `hooks` registration, the declared plugin set |
+| `.claude/settings.local.json` | ignored | personal, per-machine: the sandbox picker's per-launch selection |
+
+Precedence is **Local over Project**, so a local entry overrides the shared one — exactly what Claude
+Code writes when you disable a project plugin for yourself alone.
+
+**Why it matters.** `plugins/butler/hooks/guard-git-mutations.sh` is registered *only* from
+`.claude/settings.json`. That guard exists because a prohibited `git stash` destroyed a completed
+fix-batch (`ef272c3`) — its thesis is that a written instruction is not an enforcement mechanism. If
+the file is untracked, a fresh clone gets the guard script and never runs it, and the registration
+survives only as prose in a commit message: the same mistake, one level up. `t/61-settings-scope-split.t`
+C5b fails if the registration goes missing.
+
+**Do not re-ignore it.** It was ignored until 2026-08-06 because `skills.pl` Phase B wrote the
+picker's machine-local plugin selection into it on every launch. That write now targets
+`settings.local.json`; the churn is gone, so the reason is gone. If you find yourself wanting to
+ignore it again, the bug is whatever started writing machine state there — fix that instead.
+
+MCP lists (`enabledMcpjsonServers` / `disabledMcpjsonServers`) deliberately still go to
+`settings.json`: `discover_mcp` already treats presence there as "project" and presence only in
+`settings.local.json` as a promotable "suggestion". Redirecting them would collapse every MCP row to
+a permanent suggestion.
 
 ## Commits
 

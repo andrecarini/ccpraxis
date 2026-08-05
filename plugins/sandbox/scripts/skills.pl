@@ -248,17 +248,21 @@ sub discover_skills {
 #
 # Partition assignment per entry:
 #   "project"    => best install is project-scope-for-this-project AND key
-#                   APPEARS (any value) in <project>/.claude/settings.json
-#                   enabledPlugins. An explicit `false` still counts as
-#                   "project" — the user has made a decision about this
-#                   install, even if that decision is to keep it off.
+#                   APPEARS (any value) in the enabledPlugins of EITHER
+#                   <project>/.claude/settings.json (tracked, shared) or
+#                   <project>/.claude/settings.local.json (personal). An
+#                   explicit `false` still counts as "project" — the user has
+#                   made a decision about this install, even if that decision
+#                   is to keep it off.
 #   "suggestion" => everything else (user-scope, matching-project local-scope,
-#                   or matching-project project-scope with no entry in
-#                   settings.json yet)
+#                   or matching-project project-scope with no entry in either
+#                   settings file yet)
 #
-# The `enabled` field is the truthiness of enabledPlugins[K] (missing/false/
-# null → false; truthy → true). The TUI uses this to set the initial
-# checkbox state for Project rows.
+# The `enabled` field is the truthiness of the EFFECTIVE enabledPlugins[K]
+# after settings.local.json overrides settings.json (missing/false/null →
+# false; truthy → true), matching Claude Code's own "Local overrides Project"
+# precedence. The TUI uses this to set the initial checkbox state for Project
+# rows.
 #
 # Returns: [{ key, label, install_path, scope, project_path, version,
 #             partition, enabled }]
@@ -298,26 +302,43 @@ sub discover_plugins {
         return \@plugins;
     }
 
-    # Read enabledPlugins from <project>/.claude/settings.json. Missing file
-    # or missing key => empty set (everything will partition as suggestion).
-    # settings.local.json is intentionally NOT consulted — settings.json is
-    # the project's source of truth, regardless of whether the project
-    # commits it to git or treats it as a personal file.
+    # Read enabledPlugins from BOTH project settings files, merged in Claude
+    # Code's own precedence order: `.claude/settings.json` is the tracked,
+    # shared project declaration and `.claude/settings.local.json` is the
+    # personal, gitignored override that WINS over it.
+    #
+    # This used to consult settings.json only, reasoning that it was "the
+    # project's source of truth regardless of whether the project commits it
+    # to git or treats it as a personal file". That inverted the tool's model:
+    # Claude Code documents settings.json as the file "checked into source
+    # control and shared with your team", and writes to settings.local.json
+    # precisely when you disable a project plugin for yourself alone. Paired
+    # with a TUI that wrote the per-launch selection straight back into
+    # settings.json, it put machine state in the shared file — so this repo
+    # had to gitignore its own project config to stop the churn, which in turn
+    # left the butler git guard's registration untrackable. Phase B now writes
+    # the selection to settings.local.json, so the read has to see both.
+    #
+    # Missing files or missing key => empty set (everything partitions as a
+    # suggestion), exactly as before.
     #
     # We track presence (any value) separately from truthiness because the
     # partition rule uses presence (so a key set to `false` still partitions
     # as "project" — it's a deliberate user decision) while the `enabled`
     # field uses truthiness (so the TUI's initial checkbox state matches the
-    # current effective state).
+    # current effective state). Presence in EITHER file counts, which is what
+    # keeps a row the user checked in the TUI (recorded locally) in the
+    # Project section instead of demoting it back to a suggestion.
     my %settings_plugins;  # key => raw value (true/false/null/missing)
     if (defined $project_path && length $project_path) {
-        my $settings_file = "$project_path/.claude/settings.json";
-        if (-f $settings_file) {
+        # Order is load-bearing: project first, then local, so local overwrites.
+        for my $settings_file ("$project_path/.claude/settings.json",
+                               "$project_path/.claude/settings.local.json") {
+            next unless -f $settings_file;
             my $s = read_json($settings_file);
-            if (ref $s eq 'HASH' && ref $s->{enabledPlugins} eq 'HASH') {
-                for my $key (keys %{$s->{enabledPlugins}}) {
-                    $settings_plugins{$key} = $s->{enabledPlugins}{$key};
-                }
+            next unless ref $s eq 'HASH' && ref $s->{enabledPlugins} eq 'HASH';
+            for my $key (keys %{$s->{enabledPlugins}}) {
+                $settings_plugins{$key} = $s->{enabledPlugins}{$key};
             }
         }
     }
@@ -1203,11 +1224,31 @@ sub cmd_select_interactive {
         }
     }
 
-    # Phase B — single settings.json read-modify-write.
+    # Phase B — settings writes, split by OWNERSHIP of the state being written:
+    #
+    #   enabledPlugins  ->  .claude/settings.local.json   personal, gitignored
+    #   MCP allow/deny  ->  .claude/settings.json         project,  tracked
+    #
+    # The plugin selection this TUI collects is a per-launch, per-machine
+    # choice. Writing it into settings.json — the file Claude Code documents as
+    # "checked into source control and shared with your team" — is what forced
+    # this repo to gitignore its own shared project config, and that in turn
+    # made it impossible to track the butler git-guard's hook registration.
+    # settings.local.json is what Claude Code itself writes when you disable a
+    # project plugin for yourself alone, so this follows the tool's model
+    # rather than working around it.
+    #
+    # MCP deliberately stays on settings.json. discover_mcp already implements
+    # the two-tier semantic this change gives plugins (present in settings.json
+    # => "project"; present only in settings.local.json => a "suggestion" the
+    # user can promote), so redirecting MCP would collapse every row to a
+    # permanent suggestion. Its writes ARE deliberate promotions — exactly what
+    # a tracked file should record.
     if (defined $project_path_norm && length $project_path_norm) {
-        my $settings_file = "$project_path_norm/.claude/settings.json";
+        my $settings_file  = "$project_path_norm/.claude/settings.json";
+        my $settings_local = "$project_path_norm/.claude/settings.local.json";
 
-        my %ep_changes;     # enabledPlugins[K] = true|false
+        my %ep_changes;     # enabledPlugins[K] = 1 | 0 | undef(delete) -> LOCAL
         my @mcp_add;
         my @mcp_remove;
         my @disabled_add;
@@ -1220,8 +1261,40 @@ sub cmd_select_interactive {
         # explicit `false` if the user toggles the row on — the user is
         # actively interacting with the same setting the explicit false
         # represented, so respecting the click is the right UX.
+        #
+        # An override is written only when the desired state DIFFERS from what
+        # the tracked settings.json already declares, so settings.local.json
+        # stays a genuine override file instead of a full mirror of it. That
+        # matters for more than tidiness: now that settings.json is tracked, a
+        # redundant local `false` left behind after someone flips the shared
+        # declaration would silently keep the plugin off on this machine only,
+        # and the diff that "enabled" it would look like it had no effect.
+        my (%baseline, %baseline_present);
+        if (-f $settings_file) {
+            my $s = read_json($settings_file);
+            if (ref $s eq 'HASH' && ref $s->{enabledPlugins} eq 'HASH') {
+                for my $k (keys %{$s->{enabledPlugins}}) {
+                    $baseline_present{$k} = 1;
+                    $baseline{$k} = $s->{enabledPlugins}{$k} ? 1 : 0;
+                }
+            }
+        }
+        my $want_plugin = sub {
+            my ($key, $desired) = @_;
+            # Drop the override when the tracked file already says the same
+            # thing. When the key is ABSENT from settings.json we keep an
+            # explicit local entry either way — discover_plugins partitions on
+            # PRESENCE, so deleting it would demote the row back to a
+            # suggestion and lose the user's decision.
+            if ($baseline_present{$key} && $baseline{$key} == $desired) {
+                $ep_changes{$key} = undef;      # delete any stale override
+            } else {
+                $ep_changes{$key} = $desired;
+            }
+        };
+
         for my $p (@project_plugins) {
-            $ep_changes{$p->{key}} = $sel_plugin_project{$p->{key}} ? 1 : 0;
+            $want_plugin->($p->{key}, $sel_plugin_project{$p->{key}} ? 1 : 0);
         }
         # Accepted suggestion plugins: enable in settings.json (Phase A
         # already appended the install entry). Gated on Phase A success
@@ -1235,7 +1308,7 @@ sub cmd_select_interactive {
         # deliberate UX choice — checking a Suggestion means "I want this
         # active in the project".
         for my $key (sort keys %accepted_plugin_suggestions) {
-            $ep_changes{$key} = 1 if $phase_a_landed{$key};
+            $want_plugin->($key, 1) if $phase_a_landed{$key};
         }
 
         # Project MCP rows: maintain mutual exclusivity between the two
@@ -1264,9 +1337,22 @@ sub cmd_select_interactive {
             push @disabled_remove, $s->{name};
         }
 
+        # Two writes, two files, two failure messages — a failure has to name
+        # the file that actually failed or the warning sends you to the wrong
+        # one. Neither write creates its file when nothing changed:
+        # _apply_settings_json_changes only writes when its change count is
+        # non-zero, so a no-op launch does not spawn an empty settings.local.json.
+        eval {
+            _apply_settings_json_changes($settings_local,
+                enabledPlugins => \%ep_changes,
+            );
+        };
+        if ($@) {
+            warn "Warning: settings.local.json update failed: $@";
+        }
+
         eval {
             _apply_settings_json_changes($settings_file,
-                enabledPlugins         => \%ep_changes,
                 enabledMcpjsonServers  => { add => \@mcp_add,      remove => \@mcp_remove      },
                 disabledMcpjsonServers => { add => \@disabled_add, remove => \@disabled_remove },
             );

@@ -6,10 +6,15 @@
 deploy_key*
 .statusline_usage_cache.json
 .backup-preferences.json
+# Personal, per-machine overrides — Claude Code's own model for "not checked in".
+# The sandbox picker's per-launch plugin selection lands here (skills.pl Phase B).
 .claude/settings.local.json
-# Install-specific enabledPlugins (references the local @ccpraxis-local marketplace);
-# Claude Code rewrites it on every plugin toggle — machine state, not shared config.
-.claude/settings.json
+# NOTE: .claude/settings.json is deliberately NOT ignored. Claude Code defines it
+# as the project file "checked into source control and shared with your team", and
+# it carries the butler git-guard's hook registration — which has to be tracked or
+# a fresh clone silently runs without the guard. It was ignored until 2026-08-06
+# because skills.pl wrote the picker's machine-local selection into it on every
+# launch; that write now targets settings.local.json instead.
 .claude-plans/
 .ccpraxis-local-data/
 
