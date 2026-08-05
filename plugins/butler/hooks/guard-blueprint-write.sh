@@ -20,24 +20,31 @@
 #
 # Exit 0 = allow. Exit 2 = block; stderr fed back to the model.
 set -u
-
-command -v jq >/dev/null 2>&1 || {
-  echo "BLUEPRINT-GUARD: BLOCKED — jq is required but missing; blocking to avoid unenforced operation. Install jq in the container." >&2
-  exit 2
-}
+HOOK_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=lib.sh
+# Sourced for bp_json_get ONLY. bp_hook_gate is deliberately NOT called here --
+# see the header above; sourcing lib.sh does not call it.
+source "$HOOK_DIR/lib.sh"
 
 PAYLOAD=$(cat)
 
-TOOL=$(jq -r '.tool_name // empty' <<<"$PAYLOAD" 2>/dev/null)
+# bp_json_get prefers jq and falls back to perl+JSON::PP, so this guard also runs
+# on the jq-less Windows host. It used to `command -v jq || exit 2`, which meant
+# that on the host it blocked EVERY Edit/Write in EVERY session rather than
+# guarding blueprint.md. Only the total absence of BOTH parsers still fails closed.
+TOOL=$(bp_json_get "$PAYLOAD" tool_name) || {
+  echo "BLUEPRINT-GUARD: BLOCKED -- no JSON parser available (neither jq nor perl+JSON::PP); blocking to avoid unenforced operation." >&2
+  exit 2
+}
 case "$TOOL" in
   Write|Edit|MultiEdit|NotebookEdit) ;;
   *) exit 0 ;;
 esac
 
-FP=$(jq -r '.tool_input.file_path // .tool_input.notebook_path // empty' <<<"$PAYLOAD" 2>/dev/null)
+FP=$(bp_json_get "$PAYLOAD" tool_input.file_path tool_input.notebook_path)
 [ -n "$FP" ] || exit 0
 
-CWD=$(jq -r '.cwd // empty' <<<"$PAYLOAD" 2>/dev/null)
+CWD=$(bp_json_get "$PAYLOAD" cwd)
 [ -n "$CWD" ] || CWD=$PWD
 case "$FP" in
   /*) ABS="$FP" ;;

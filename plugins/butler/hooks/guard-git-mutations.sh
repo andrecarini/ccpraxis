@@ -25,14 +25,21 @@
 # their own diffs — and pushing them toward `git stash` to "see what changed"
 # is part of how this happened.
 set -u
-
-command -v jq >/dev/null 2>&1 || {
-  echo "guard-git-mutations: jq is required but missing — blocking to avoid unenforced operation." >&2
-  exit 2
-}
+HOOK_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=lib.sh
+# Sourced for bp_json_get ONLY -- NO bp_hook_gate here, by design (see above).
+source "$HOOK_DIR/lib.sh"
 
 PAYLOAD=$(cat)
-CMD=$(jq -r '.tool_input.command // empty' <<<"$PAYLOAD")
+
+# See lib.sh:bp_json_get. This used to hard-require jq, which the Windows host
+# does not have and -- per this repo's Perl-only doctrine -- is never going to
+# get. The result was that it blocked EVERY Bash call on the host instead of
+# guarding anything. Only the absence of BOTH parsers still fails closed.
+CMD=$(bp_json_get "$PAYLOAD" tool_input.command) || {
+  echo "guard-git-mutations: BLOCKED -- no JSON parser available (neither jq nor perl+JSON::PP); blocking to avoid unenforced operation." >&2
+  exit 2
+}
 [ -n "$CMD" ] || exit 0
 
 deny() { echo "BLOCKED: $1 Command: $CMD" >&2; exit 2; }

@@ -20,6 +20,73 @@ bp_hook_require_jq() {
   }
 }
 
+# bp_json_get PAYLOAD KEY [KEY...] -- echo the first non-empty scalar found at
+# any of the dot-separated KEY paths in PAYLOAD (a JSON object). Prints nothing
+# when no path resolves. Returns 2, printing nothing, when NEITHER jq nor
+# perl+JSON::PP is available -- callers MUST treat that as fail-closed.
+#
+# WHY THIS EXISTS. jq is in the container but NOT on the Windows host (Git for
+# Windows ships none), and this repo's premise is that a fresh clone runs with
+# no toolchain installs -- everything is Perl, which ships with Git for Windows,
+# macOS and Linux alike. The two DELIBERATELY UNGATED guards
+# (guard-blueprint-write.sh, guard-git-mutations.sh -- they apply in ANY session,
+# not just a bp-launch.sh coordinator) used to `command -v jq || exit 2`, so on
+# the host they blocked EVERY Edit/Write and EVERY Bash call, in every session,
+# forever. A guard that cannot run on the host is not a guard, it is an outage.
+#
+# jq stays PREFERRED when present, so container behaviour is unchanged.
+#
+# The payload reaches perl on stdin, never argv: a Write tool_input can be
+# megabytes and would blow ARG_MAX.
+bp_json_get() {
+  local payload="$1"; shift
+  [ "$#" -gt 0 ] || return 2
+
+  if command -v jq >/dev/null 2>&1; then
+    local expr="" k
+    for k in "$@"; do
+      [ -z "$expr" ] || expr="$expr // "
+      expr="$expr.$k"
+    done
+    # rc deliberately UNCHECKED, matching the pre-existing `jq ... 2>/dev/null`
+    # callers: malformed JSON yielded empty (allow) before and still does, so
+    # this refactor cannot change what the container decides.
+    jq -r "($expr) // empty" <<<"$payload" 2>/dev/null
+    return 0
+  fi
+
+  if command -v perl >/dev/null 2>&1; then
+    local out rc
+    out=$(perl -MJSON::PP -e '
+      binmode(STDIN, ":raw"); binmode(STDOUT, ":raw");
+      my $raw = do { local $/; <STDIN> };
+      my $doc = eval { JSON::PP->new->utf8->decode($raw) };
+      exit 0 unless ref $doc eq "HASH";          # malformed -> empty, as jq
+      for my $path (@ARGV) {
+        my $v = $doc;
+        for my $k (split /\./, $path) {
+          $v = (ref $v eq "HASH") ? $v->{$k} : undef;
+          last unless defined $v;
+        }
+        next if !defined $v || ref $v || $v eq "";
+        utf8::encode($v);                        # chars back to UTF-8 bytes
+        print $v;
+        last;
+      }
+    ' -- "$@" <<<"$payload" 2>/dev/null)
+    rc=$?
+    # rc IS checked here (unlike the jq branch): the perl program exits 0 on
+    # every data outcome including malformed JSON, so a non-zero rc means the
+    # interpreter itself failed -- JSON::PP absent, perl broken -- which is the
+    # "no parser" case and must fail closed, not silently allow.
+    [ "$rc" -eq 0 ] || return 2
+    printf '%s' "$out"
+    return 0
+  fi
+
+  return 2
+}
+
 # match_any REL_PATH PATTERNS — colon-separated bash-glob patterns,
 # '*' crosses '/', trailing '/' means prefix.
 match_any() {
