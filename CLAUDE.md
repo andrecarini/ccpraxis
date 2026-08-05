@@ -113,6 +113,19 @@ These have each cost real debugging time. Details in the user-global `CLAUDE.md`
   which `podman.exe` and `git.exe` both accept directly. Symptom: stray directories ending in `;C`.
 - **Paths contain non-ASCII** (`André`). Nothing may assume ASCII paths. Round-trip registry values
   as UTF-8 bytes; never re-encode something already decoded.
+- **`podman machine set --disk-size` does not work here** — it exits 125 with *"changing disk size
+  not supported for WSL machines"*. The machine's disk is the WSL distro's `ext4.vhdx`, so growing it
+  is a WSL operation:
+  ```powershell
+  wsl --shutdown
+  wsl --manage podman-machine-default --resize 32212254720   # bytes; 30 GiB. Grow only.
+  ```
+  It runs `e2fsck` + `resize2fs` itself, so the filesystem comes up already grown — verify with
+  `wsl -d podman-machine-default --exec df -h /`. Afterwards `podman machine list` still reports the
+  **original** size: that field is podman's own creation-time record, which podman declines to update
+  for WSL machines. It is stale, not wrong-in-a-way-that-matters — trust `df`, not `podman machine
+  list`. The vhdx is sparse and never shrinks, so its on-disk size tracks the high-water mark rather
+  than current usage; check host free space before growing.
 
 ## `.ccpraxis-local-data/` — gitignored, and it does not travel
 
