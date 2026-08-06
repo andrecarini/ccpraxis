@@ -244,8 +244,41 @@ sub _detail {
 # Exit sentinels, never shifted: -1 fork/exec failed · -2 killed by a signal
 # (`$? >> 8` would read a SIGKILL as a clean 0 and report a commit that never
 # happened) · -3 timed out · 127 git binary missing.
+# _git_path($p) -> a path native git.exe can resolve, on Windows; $p unchanged
+# everywhere else.
+#
+# WHY THIS EXISTS, AND WHY HERE SPECIFICALLY.
+#
+# This file is loaded by bp-orchestrator.pl, whose BEGIN sets
+# MSYS2_ARG_CONV_EXCL='*' — so in that process MSYS argv path-translation is
+# OFF. resolve_root()/BpOrch::_project_root_of hand back POSIX paths
+# (/c/Users/...), and a POSIX path handed to native git.exe with conversion
+# disabled is resolved against the CURRENT DRIVE: git looks for C:\c\Users\...,
+# does not find it, and every checkpoint degrades to not-a-repo. That is the
+# drive-root landmine the user-global CLAUDE.md documents — the one that left
+# 576 stray entries at C:\c\ — and its rule is explicit: opting out of
+# conversion is only safe TOGETHER WITH hand-translating your own paths. The
+# orchestrator opts out; this is the translation half.
+#
+# Deliberately NOT the same as bp-preflight.pl's run_git, which only normalises
+# backslashes and leans on MSYS auto-translation. That is correct THERE because
+# bp-preflight.pl does not disable conversion (its own comment warns against
+# doing so). The two differ because their processes differ, not by oversight.
+#
+# Correct under EITHER conversion state, which is the point: git.exe accepts the
+# forward-slash Windows form directly, and MSYS has nothing left to mangle in a
+# path that no longer starts with a slash. Mirrors vault-sync.pl's git_path().
+sub _git_path {
+    my ($p) = @_;
+    return $p unless defined $p && length $p;
+    return $p unless $^O =~ /^(MSWin32|cygwin|msys)$/;
+    $p =~ s{^/([a-zA-Z])(?=/|\z)}{uc($1) . ':'}e;
+    return $p;
+}
+
 sub _git {
     my ($root, @args) = @_;
+    my $groot = _git_path($root);
     my $pid = open(my $fh, '-|');
     return (undef, -1) unless defined $pid;                # fork failed
     unless ($pid) {                                        # child
@@ -254,8 +287,8 @@ sub _git {
         # `or _exit` (not a following statement): exec failure leaves this child
         # holding the PARENT's END blocks and destructors, and a plain exit()
         # would run them in a process that is only half a copy of the caller.
-        exec('git', '-c', 'core.fsmonitor=', '-c', "core.hooksPath=$root/.git/hooks",
-             '-C', $root, @args) or POSIX::_exit(127);    # git binary missing
+        exec('git', '-c', 'core.fsmonitor=', '-c', "core.hooksPath=$groot/.git/hooks",
+             '-C', $groot, @args) or POSIX::_exit(127);    # git binary missing
     }
 
     my ($out, $timed_out, $errs) = ('', 0, 0);

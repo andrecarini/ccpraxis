@@ -632,31 +632,18 @@ my $LIVE_REG = { livep => { attempt => 1, pid => 777_001, status => 'running', s
     my $r = drive(dir => $bpdir, stop => 2, step => 100, tunables => tun($bpdir, ckpt_int => 5),
                   no_checkpoint => 1);                      # the REAL default closure, no project_root
     is($r->{err}, "STOP\n", 'fix 8: the run ended on the harness sentinel');
-  SKIP: {
     # These three drive the REAL default closure, which derives its root from
-    # bp_dir via BpOrch::_project_root_of -- and that returns an abs_path POSIX
-    # form (/c/Users/.../repoN). bp-orchestrator.pl's BEGIN has already set
-    # MSYS2_ARG_CONV_EXCL='*' for this process, so that POSIX path reaches
-    # native git.exe unconverted and Windows resolves it against the current
-    # drive as C:\c\Users\... . The commit therefore never lands.
-    #
-    # DELIBERATELY NOT FIXED HERE. The fix belongs in production code — a
-    # git_path()-style translation inside BpCheckpoint::_git, which is the
-    # documented house technique — not in the oracle. That is a behaviour change
-    # to live fleet-orchestration code, for a platform butler is not run on
-    # (butler is sandbox-only; t/21 proves the same production path is green the
-    # moment the root is natively spelled). Raising it as a known limitation is
-    # the honest move; quietly patching orchestration internals to turn a test
-    # green is not.
-    skip 'BpOrch::_project_root_of returns a POSIX path that reaches native git.exe unconverted '
-       . '(MSYS2_ARG_CONV_EXCL is set by bp-orchestrator.pl), so the default closure cannot commit '
-       . 'on this host. Real limitation, fix belongs in BpCheckpoint::_git, NOT exercised here.', 3
-        if $^O =~ /^(MSWin32|cygwin|msys)$/;
+    # bp_dir via BpOrch::_project_root_of — an abs_path POSIX form. They used to
+    # be skipped on Windows: bp-orchestrator.pl's BEGIN sets
+    # MSYS2_ARG_CONV_EXCL='*', so that POSIX path reached native git.exe
+    # unconverted, Windows resolved it against the current drive as
+    # C:\c\Users\..., and the commit never landed. BpCheckpoint::_git now
+    # hand-translates (see _git_path there), which is the other half of the
+    # opt-out-plus-translate rule, so these run everywhere again.
     is(count_commits($repo), $before + 1,
        'fix 8: the default closure committed into the blueprint own checkout (root derived from bp_dir)');
     like(head_fmt($repo, '%B'), qr/\A\Qwip(livep): \E/, 'fix 8: ... and it is that package WIP checkpoint');
     is(scalar(log_of($bpdir, 'checkpoint')), 1, 'fix 8: exactly one checkpoint event was logged');
-  }
 }
 
 done_testing();
