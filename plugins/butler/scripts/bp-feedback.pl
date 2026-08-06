@@ -12,7 +12,7 @@
 # writing or appending; write into a batch that already has a DECOMPOSED.md
 # by default (it opens the next one instead — see _resolve_batch_dir below);
 # or read a skill. All of that judgement work belongs to the
-# feedback-intake skill, not to this CLI.
+# feedback skill (plugins/butler/skills/feedback/), not to this CLI.
 #
 # Usage:
 #   bp-feedback.pl [options] [--] [text ...]
@@ -34,7 +34,8 @@ use File::Path qw(make_path);
 use File::Spec;
 use Cwd qw(getcwd abs_path);
 use IO::Handle;
-use Encode qw(decode);
+use Encode qw(decode encode);
+use JSON::PP ();
 
 # ---------------------------------------------------------------------------
 # Usage / help
@@ -44,7 +45,15 @@ sub _usage {
     return <<'EOF';
 bp-feedback.pl [options] [--] [text ...]
 
-  --source <token>     override the source token (default "chat"; e.g. --source file)
+  --source <token>     override the source token (default "chat", or
+                       "transcript" when --from-session supplied the body)
+  --from-session <id>  take the body from that session's transcript instead of
+                       argv/stdin, so the operator's bytes are never retyped by
+                       an agent. Pair with --command to lift the exact
+                       <command-args> payload of a slash-command invocation.
+  --command <name>     with --from-session: the slash command whose arguments
+                       are the feedback (e.g. butler:feedback). Without it, the
+                       last plainly-typed user message is used.
   --blueprint <name>   record this blueprint name; overrides detection
   --batch <name>       target batch directory name
                        (default: the newest OPEN batch, i.e. one with no
@@ -84,6 +93,9 @@ sub _fail {
 # ---------------------------------------------------------------------------
 
 my $opt_source      = 'chat';
+my $source_explicit = 0;
+my $from_session;
+my $opt_command;
 my $blueprint_override;
 my $batch_override;
 my $data_dir_override;
@@ -104,7 +116,8 @@ my @positional;
     # — is verbatim text. This does not change any invocation that already
     # puts its options first, which is every case the oracle exercises.
     my $positional_started = 0;
-    my %needs_value = map { ($_ => 1) } ('--source', '--blueprint', '--batch', '--data-dir');
+    my %needs_value = map { ($_ => 1) } ('--source', '--blueprint', '--batch', '--data-dir',
+                                         '--from-session', '--command');
 
     while (@argv) {
         my $a = shift @argv;
@@ -134,6 +147,11 @@ my @positional;
             my $v = shift @argv;
             if ($a eq '--source') {
                 $opt_source = $v;
+                $source_explicit = 1;
+            } elsif ($a eq '--from-session') {
+                $from_session = $v;
+            } elsif ($a eq '--command') {
+                $opt_command = $v;
             } elsif ($a eq '--blueprint') {
                 if (!length $v) {
                     # See divergence note above; same rationale applies.
@@ -189,13 +207,196 @@ if (defined $blueprint_override && $blueprint_override !~ $BP_NAME_RE) {
     _fail(1, "[invalid blueprint name]: $blueprint_override");
 }
 
+# --from-session takes a session id, which is a filesystem component (the
+# transcript is <root>/projects/<project>/<id>.jsonl). Same \z discipline as
+# every other header/path-bound token above.
+if (defined $from_session && $from_session !~ /^[A-Za-z0-9._-]{1,128}\z/) {
+    _fail(1, "[invalid session id]: $from_session");
+}
+
+# --command names a slash command (e.g. butler:feedback). Colons are legal
+# here -- plugin skills are <plugin>:<verb> -- but nothing path-like is.
+if (defined $opt_command && $opt_command !~ m{^[A-Za-z0-9._:-]{1,64}\z}) {
+    _fail(1, "[invalid command name]: $opt_command");
+}
+
+if (defined $opt_command && !defined $from_session) {
+    _fail(1, '[--command requires --from-session]; it selects WHICH entry of a '
+           . 'transcript to lift, and without a transcript there is nothing to select from');
+}
+
+# Provenance follows the route automatically: a body lifted from a transcript
+# is not "chat" (an agent's paraphrase might be), so unless the caller said
+# otherwise, say where it really came from. Set before the body is acquired so
+# a later fall-back to argv can honestly put it back (see below).
+$opt_source = 'transcript' if defined $from_session && !$source_explicit;
+
 # ---------------------------------------------------------------------------
-# Body acquisition — argv first (word-joined), else all of stdin to EOF.
-# Never probes whether stdin is a terminal (see header comment).
+# Transcript capture (--from-session). The point of this route is that the
+# operator's bytes reach disk WITHOUT passing through an agent that might
+# reflow, summarise or clip them on the way. Claude Code has already done the
+# hard part: a typed slash command is recorded as a user entry whose content is
+#
+#     <command-message>butler:feedback</command-message>
+#     <command-name>/butler:feedback</command-name>
+#     <command-args>...the operator's exact text...</command-args>
+#
+# with the payload stored UNESCAPED and UNTRUNCATED, and nothing after the
+# closing tag. So the command name is already separated from the arguments and
+# no prefix-stripping heuristic is needed -- which matters, because a naive
+# "strip a leading /token" would happily eat the first component of a body that
+# opens with a POSIX path like /c/Users/....
+#
+# Deliberately NOT used: the `last-prompt` entry's `lastPrompt` field. It is
+# truncated (~200 chars) and would silently lose most of a long batch -- the
+# exact failure this route exists to prevent.
+# ---------------------------------------------------------------------------
+
+# Candidate roots holding <project>/<session>.jsonl, most explicit first.
+# Cheap and non-fatal by design: a missing root is skipped, never an error,
+# because the caller can still fall back to argv.
+sub _transcript_roots {
+    my ($data_dir_override) = @_;
+    my @roots;
+
+    push @roots, File::Spec->catdir($ENV{CLAUDE_CONFIG_DIR}, 'projects')
+        if defined $ENV{CLAUDE_CONFIG_DIR} && length $ENV{CLAUDE_CONFIG_DIR};
+    for my $home (grep { defined && length } ($ENV{HOME}, $ENV{USERPROFILE})) {
+        push @roots, File::Spec->catdir($home, '.claude', 'projects');
+    }
+    # In a sandbox the container's ~/.claude/projects IS the bind-mounted
+    # claude-home, so the HOME entry above already covers it; this handles the
+    # host-side view of the same tree (reading a container session's transcript
+    # from outside), which HOME does not reach.
+    for my $d (grep { defined && length } ($data_dir_override, $ENV{CCPRAXIS_DATA_DIR})) {
+        push @roots, File::Spec->catdir($d, 'claude-home', 'projects');
+    }
+    {
+        my $dir = getcwd();
+        while (1) {
+            push @roots, File::Spec->catdir($dir, '.ccpraxis-local-data', 'claude-home', 'projects');
+            my $parent = abs_path(File::Spec->catdir($dir, File::Spec->updir));
+            last if !defined $parent || $parent eq $dir;
+            $dir = $parent;
+        }
+    }
+
+    my (@out, %seen);
+    for my $r (@roots) {
+        next if $seen{$r}++;
+        push @out, $r if -d $r;
+    }
+    return @out;
+}
+
+sub _find_transcript {
+    my ($session_id, $data_dir_override) = @_;
+    for my $root (_transcript_roots($data_dir_override)) {
+        opendir(my $dh, $root) or next;
+        my @projects = grep { $_ ne '.' && $_ ne '..' } readdir $dh;
+        closedir $dh;
+        for my $p (@projects) {
+            my $cand = File::Spec->catfile($root, $p, "$session_id.jsonl");
+            return $cand if -f $cand;
+        }
+    }
+    return undef;
+}
+
+# Returns ($bytes, $route) or (undef, undef). $bytes are UTF-8 ENCODED bytes:
+# JSON::PP hands back character strings, and everything downstream of here
+# (the control-byte scan, the UTF-8 gate, the ':raw' publish) works on bytes.
+sub _extract_from_transcript {
+    my ($path, $command) = @_;
+
+    open(my $fh, '<:raw', $path) or return (undef, undef);
+    my $json = JSON::PP->new->utf8;
+    my ($cmd_args, $typed);
+
+    while (my $line = <$fh>) {
+        # Cheap prefilter: every entry we care about carries "user" as both
+        # type and role. Decoding all ~20k lines of a long transcript would
+        # dominate the runtime of a tool whose whole contract is "one command
+        # and nothing else".
+        next unless index($line, '"user"') >= 0;
+        my $j = eval { $json->decode($line) } or next;
+        next unless ref($j) eq 'HASH';
+        next unless ($j->{type} // '') eq 'user';
+        next if $j->{isMeta} || $j->{isSidechain};
+        next unless ref($j->{message}) eq 'HASH';
+        my $c = $j->{message}{content};
+        next unless defined $c && !ref $c;
+
+        if (defined $command && $c =~ m{<command-name>/\Q$command\E</command-name>}) {
+            # Greedy to the LAST closing tag: nothing follows it in this
+            # format, so greediness is what survives a body that itself
+            # contains the literal string </command-args>.
+            if ($c =~ m{<command-args>(.*)</command-args>}s) {
+                $cmd_args = $1;
+            } else {
+                # Bare invocation with no arguments. Record it as an empty
+                # capture rather than falling through to an OLDER message --
+                # silently capturing the wrong turn is worse than capturing
+                # nothing, because nothing is visible and wrong is not.
+                $cmd_args = '';
+            }
+            next;
+        }
+
+        # A plainly-typed message. `promptSource` marks these; the injected
+        # local-command bookkeeping entries (<command-name>, <command-message>,
+        # <local-command-stdout>) do not carry it. Keep the tag check as a
+        # fallback for transcripts written before that field existed.
+        next if $c =~ m{\A\s*<(?:command-(?:name|message|args)|local-command-)}s;
+        $typed = $c if defined $j->{promptSource} || $c !~ m{\A\s*<[a-z-]+>}s;
+    }
+    close $fh;
+
+    my ($text, $route);
+    if (defined $cmd_args)  { ($text, $route) = ($cmd_args, 'command-args') }
+    elsif (defined $typed)  { ($text, $route) = ($typed,    'typed-message') }
+    else                    { return (undef, undef) }
+
+    return (encode('UTF-8', $text), $route);
+}
+
+# ---------------------------------------------------------------------------
+# Body acquisition — transcript first when asked, else argv (word-joined),
+# else all of stdin to EOF. Never probes whether stdin is a terminal (see
+# header comment).
 # ---------------------------------------------------------------------------
 
 my $body;
-if (@positional) {
+if (defined $from_session) {
+    my $path = _find_transcript($from_session, $data_dir_override);
+    if (!defined $path) {
+        print STDERR "bp-feedback: [transcript] no transcript for session $from_session "
+                   . "under any known root; falling back to argv\n";
+    } else {
+        my ($text, $route) = _extract_from_transcript($path, $opt_command);
+        if (defined $text) {
+            $body = $text;
+            print STDERR "bp-feedback: captured " . length($body)
+                       . " bytes verbatim from $path ($route)\n";
+        } else {
+            print STDERR "bp-feedback: [transcript] $path yielded no usable user entry"
+                       . (defined $opt_command ? " for command /$opt_command" : '')
+                       . "; falling back to argv\n";
+        }
+    }
+    # Deliberately argv-only on fallback, never stdin: --from-session is a
+    # non-interactive route, and dropping into a stdin slurp here would hang a
+    # human who typo'd a session id, which is exactly the hang the header
+    # comment forbids.
+    if (!defined $body) {
+        $body = @positional ? join(' ', @positional) : '';
+        $opt_source = 'chat' if !$source_explicit;   # honest: this is not a transcript capture
+    }
+}
+
+if (defined $body) {
+    # already acquired above
+} elsif (@positional) {
     $body = join(' ', @positional);
 } else {
     binmode STDIN;

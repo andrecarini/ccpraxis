@@ -76,6 +76,7 @@
          "Skill(blueprint:manage)",
          "Skill(butler:dispatch-fleet)",
          "Skill(butler:drive-solo)",
+         "Skill(butler:feedback)",
          "Skill(butler:reporter)",
          "Skill(butler:status)",
          "Skill(steward:audit)",

@@ -18,8 +18,13 @@ use File::Basename qw(dirname);
 use File::Path qw(make_path);
 use Cwd qw(abs_path);
 use Config;
+# T-M builds synthetic transcripts and compares captured bytes. `use utf8`
+# above means the literals in this file are CHARACTER strings, so anything
+# compared against a file's contents has to be encoded first -- hence encode().
+use Encode qw(encode);
+use JSON::PP ();
 
-# 77-feedback-intake.t
+# 77-feedback.t  (was 77-feedback-intake.t)
 #
 # Test oracle for blueprint package b25-feedback-intake, derived from
 # specs/b25-feedback-intake-spec.md (revision 2, gate-passed) and
@@ -27,7 +32,9 @@ use Config;
 #
 # Covers two absent deliverables:
 #   plugins/butler/scripts/bp-feedback.pl        (CLI, R-06)
-#   plugins/butler/skills/feedback-intake/SKILL.md (skill, R-05)
+#   plugins/butler/skills/feedback/SKILL.md (skill, R-05; renamed from
+#     feedback-intake/ when the skill gained the paste-it-as-the-argument
+#     entry point and became /butler:feedback)
 # Neither exists yet, on purpose: this file is the immutable oracle a
 # later implementer works against, authored blind to any implementation.
 #
@@ -70,7 +77,8 @@ use Config;
 my $HERE      = abs_path(__FILE__);
 my $REPO_ROOT = abs_path(File::Spec->catdir(dirname($HERE), ('..') x 4));
 my $SCRIPT    = File::Spec->catfile($REPO_ROOT, qw(plugins butler scripts bp-feedback.pl));
-my $SKILL     = File::Spec->catfile($REPO_ROOT, qw(plugins butler skills feedback-intake SKILL.md));
+my $SKILL     = File::Spec->catfile($REPO_ROOT, qw(plugins butler skills feedback SKILL.md));
+my $VERIFIER  = File::Spec->catfile($REPO_ROOT, qw(plugins butler agents bp-feedback-verifier.md));
 my $REAL_CORRECTIONS = File::Spec->catdir($REPO_ROOT, '.ccpraxis-local-data', 'corrections');
 my $REAL_DECOMPOSED  = File::Spec->catfile($REAL_CORRECTIONS, 'batch-1', 'DECOMPOSED.md');
 my $LIVE_ORCHESTRATOR = File::Spec->catfile($REPO_ROOT, qw(plugins butler scripts bp-orchestrator.pl));
@@ -105,6 +113,49 @@ sub _slurp_text {
     my $d = <$fh>;
     close $fh;
     return defined $d ? $d : '';
+}
+
+# Functional symlink probe. Perl on Windows *implements* symlink() -- so a
+# bare `eval { symlink(...) }` capability check reports "supported" -- but the
+# call still fails at runtime: a dangling target is ENOENT (Windows must know
+# at creation time whether the link is to a file or a directory), and a link
+# that does get created is not reported by -l the way the CLI's own checks
+# assume. The T-H symlink group therefore used to `die "symlink: $!"` on the
+# Windows host, killing the whole FILE mid-subtest and taking T-I, T-J and T-K
+# down with it -- including every SKILL.md assertion. Probe for real behaviour
+# (make a link to a real dir AND to a dangling path, and require -l on both)
+# and SKIP loudly instead, so the coverage gap is visible rather than either
+# faked green or catastrophically red.
+my $SYMLINK_WORKS = do {
+    my $probe = tempdir(CLEANUP => 1);
+    my $real  = File::Spec->catdir($probe, 'real');
+    make_path($real);
+    my $ok = eval {
+        symlink($real, File::Spec->catdir($probe, 'to-real')) or die "to-real: $!\n";
+        symlink(File::Spec->catfile($probe, 'nope'), File::Spec->catdir($probe, 'dangling'))
+            or die "dangling: $!\n";
+        (-l File::Spec->catdir($probe, 'to-real') && -l File::Spec->catdir($probe, 'dangling')) ? 1 : 0;
+    };
+    $ok ? 1 : 0;
+};
+
+# Does $dir have an ancestor containing .ccpraxis-local-data? F9 asserts that
+# <data> resolution FAILS, which presumes the scratch dir has no such ancestor.
+# On the Windows host that presumption is false: Git Bash maps /tmp to
+# C:\Users\<user>\AppData\Local\Temp, so every tempdir() sits under
+# C:\Users\<user>\, and a real ~/.ccpraxis-local-data there makes the walk-up
+# succeed -- turning F9 red AND writing a stray corrections/ tree into the
+# user's home. Detect the broken premise and skip rather than mis-report.
+sub _has_data_ancestor {
+    my ($dir) = @_;
+    $dir = abs_path($dir) // $dir;
+    while (1) {
+        return $dir if -d File::Spec->catdir($dir, '.ccpraxis-local-data');
+        my $parent = abs_path(File::Spec->catdir($dir, File::Spec->updir));
+        last if !defined $parent || $parent eq $dir;
+        $dir = $parent;
+    }
+    return undef;
 }
 
 sub _write_bytes {
@@ -635,10 +686,16 @@ subtest 'T-G failure paths F1..F12 (criterion 7; AC-28,29)' => sub {
     {
         local $ENV{CCPRAXIS_DATA_DIR};
         delete $ENV{CCPRAXIS_DATA_DIR};
-        my $scratch = tempdir(CLEANUP => 1); # under /tmp: not a git repo, no .ccpraxis-local-data ancestor
-        ($rc, $out, $err) = run_cli(args => ['unresolvable data dir'], cwd => $scratch);
-        is($rc, 4, 'F9: <data> unresolvable (no flag, no env, no git toplevel, no walk-up match) -> exit 4');
-        like($err, qr/\[cannot locate <data>\]/, 'F9: message carries the [cannot locate <data>] fragment');
+        my $scratch = tempdir(CLEANUP => 1); # normally: not a git repo, no .ccpraxis-local-data ancestor
+        my $ancestor = _has_data_ancestor($scratch);
+        SKIP: {
+            skip "F9 premise broken on this host: $scratch has a .ccpraxis-local-data ancestor at $ancestor, "
+               . 'so <data> resolution correctly SUCCEEDS via walk-up and there is nothing to fail', 2
+                if defined $ancestor;
+            ($rc, $out, $err) = run_cli(args => ['unresolvable data dir'], cwd => $scratch);
+            is($rc, 4, 'F9: <data> unresolvable (no flag, no env, no git toplevel, no walk-up match) -> exit 4');
+            like($err, qr/\[cannot locate <data>\]/, 'F9: message carries the [cannot locate <data>] fragment');
+        }
     }
 
     # F10: --data-dir path exists but is not a directory.
@@ -736,36 +793,42 @@ subtest 'T-H red-team surface (all criteria; cross-cutting)' => sub {
     }
 
     # Symlinked batch dir resolving to a real directory: accepted, observable note.
-    {
-        my $tmp = tempdir(CLEANUP => 1);
-        local $ENV{CCPRAXIS_DATA_DIR} = $tmp;
-        my $target = File::Spec->catdir($tmp, 'real-storage');
-        make_path($target);
-        make_path(File::Spec->catdir($tmp, 'corrections'));
-        symlink($target, File::Spec->catdir($tmp, 'corrections', 'batch-1'))
-            or die "symlink: $!";
-        my ($rc, $out, $err) = run_cli(args => ['--data-dir', $tmp, 'via a symlinked batch dir']);
-        is($rc, 0, 'red-team: symlinked batch dir resolving to a real dir -> exit 0 (accepted)');
-        like($err, qr/symlink/i, 'red-team: STDERR carries an observability note naming the symlink');
-        ok(-f File::Spec->catfile($target, 'feedback-1.txt'),
-           'red-team: the write lands in the symlink TARGET, not as a broken link at the batch path');
-    }
+    SKIP: {
+        skip 'symlink() does not work functionally on this platform (see $SYMLINK_WORKS probe) '
+           . '-- symlinked-batch-dir coverage NOT exercised here', 5 unless $SYMLINK_WORKS;
+        {
+            my $tmp = tempdir(CLEANUP => 1);
+            local $ENV{CCPRAXIS_DATA_DIR} = $tmp;
+            my $target = File::Spec->catdir($tmp, 'real-storage');
+            make_path($target);
+            make_path(File::Spec->catdir($tmp, 'corrections'));
+            symlink($target, File::Spec->catdir($tmp, 'corrections', 'batch-1'))
+                or die "symlink: $!";
+            my ($rc, $out, $err) = run_cli(args => ['--data-dir', $tmp, 'via a symlinked batch dir']);
+            is($rc, 0, 'red-team: symlinked batch dir resolving to a real dir -> exit 0 (accepted)');
+            like($err, qr/symlink/i, 'red-team: STDERR carries an observability note naming the symlink');
+            ok(-f File::Spec->catfile($target, 'feedback-1.txt'),
+               'red-team: the write lands in the symlink TARGET, not as a broken link at the batch path');
+        }
 
-    # Symlinked batch dir to nothing (dangling): F11, exit 4, nothing written.
-    {
-        my $tmp = tempdir(CLEANUP => 1);
-        local $ENV{CCPRAXIS_DATA_DIR} = $tmp;
-        make_path(File::Spec->catdir($tmp, 'corrections'));
-        symlink(File::Spec->catfile($tmp, 'does-not-exist-anywhere'),
-                File::Spec->catdir($tmp, 'corrections', 'batch-1')) or die "symlink: $!";
-        my ($rc, $out, $err) = run_cli(args => ['--data-dir', $tmp, '--batch', 'batch-1', 'text']);
-        is($rc, 4, 'red-team: batch dir is a dangling symlink -> F11, exit 4');
-        like($err, qr/exists and is not a directory|not a directory/i, 'red-team: dangling-symlink-as-batch-dir message names the problem');
+        # Symlinked batch dir to nothing (dangling): F11, exit 4, nothing written.
+        {
+            my $tmp = tempdir(CLEANUP => 1);
+            local $ENV{CCPRAXIS_DATA_DIR} = $tmp;
+            make_path(File::Spec->catdir($tmp, 'corrections'));
+            symlink(File::Spec->catfile($tmp, 'does-not-exist-anywhere'),
+                    File::Spec->catdir($tmp, 'corrections', 'batch-1')) or die "symlink: $!";
+            my ($rc, $out, $err) = run_cli(args => ['--data-dir', $tmp, '--batch', 'batch-1', 'text']);
+            is($rc, 4, 'red-team: batch dir is a dangling symlink -> F11, exit 4');
+            like($err, qr/exists and is not a directory|not a directory/i, 'red-team: dangling-symlink-as-batch-dir message names the problem');
+        }
     }
 
     # Symlinked (dangling) target filename at the exact n_start slot: never
     # followed, never removed; numbering steps to the next name.
-    {
+    SKIP: {
+        skip 'symlink() does not work functionally on this platform (see $SYMLINK_WORKS probe) '
+           . '-- squatting-dangling-symlink coverage NOT exercised here', 3 unless $SYMLINK_WORKS;
         my $tmp = tempdir(CLEANUP => 1);
         local $ENV{CCPRAXIS_DATA_DIR} = $tmp;
         _make_open_batch($tmp, 1);
@@ -934,16 +997,26 @@ subtest 'T-J SKILL.md content (criteria 8..12; AC-34..46)' => sub {
 
         my $text = _slurp_text($SKILL);
         my @lines = split /\n/, $text;
-        cmp_ok(scalar(@lines), '>=', 150, 'AC-34: SKILL.md is >= 150 lines (house size for a doc-heavy protocol skill)');
-        cmp_ok(scalar(@lines), '<=', 180, 'AC-34: SKILL.md is <= 180 lines');
+        # Range widened from the original 150-180 when the skill absorbed the
+        # invariants, the two entry paths, and the phase 2.5 question round.
+        # The ceiling is the skill-writing guide's 500-line budget with room to
+        # spare; the floor still catches a gutting.
+        cmp_ok(scalar(@lines), '>=', 200, 'AC-34: SKILL.md is >= 200 lines (house size for a doc-heavy protocol skill)');
+        cmp_ok(scalar(@lines), '<=', 400, 'AC-34: SKILL.md is <= 400 lines (guide budget is 500)');
 
         # Frontmatter: exactly three keys.
         my ($fm) = $text =~ /\A---\n(.*?)\n---\n/s;
         ok(defined $fm, 'AC-35: frontmatter block (--- ... ---) present');
         SKIP: {
             skip 'no frontmatter block to inspect', 7 unless defined $fm;
-            like($fm, qr/^name:\s*feedback-intake\s*$/m, 'AC-35: frontmatter name: feedback-intake');
-            like($fm, qr/^argument-hint:\s*\[batch\]\s*$/m, 'AC-35: frontmatter argument-hint: [batch]');
+            like($fm, qr/^name:\s*feedback\s*$/m, 'AC-35: frontmatter name: feedback');
+            # The argument-hint carries the operator's own entry contract: the
+            # command is prefixed to the feedback itself. Assert the paste
+            # affordance is advertised, not a frozen string.
+            like($fm, qr/^argument-hint:.*\bfeedback\b/mi,
+                 'AC-35: argument-hint advertises pasting the feedback (not just a batch name)');
+            like($fm, qr/^argument-hint:.*\bbatch\b/mi,
+                 'AC-35: argument-hint still advertises the resume-a-batch form');
             like($fm, qr/^description:/m, 'AC-35: frontmatter has a description key');
             unlike($fm, qr/^allowed-tools:/m, 'AC-35: no allowed-tools key (spec: exactly three keys, nothing else)');
             unlike($fm, qr/^model:/m, 'AC-35: no model key (spec: exactly three keys, nothing else)');
@@ -979,7 +1052,7 @@ subtest 'T-J SKILL.md content (criteria 8..12; AC-34..46)' => sub {
             ['L17', '## Deduplication discipline'],
             ['L18', 'the divergence is recorded rather than silently resolved'],
             ['L19', 'uniques are named explicitly'],
-            ['L20', '## Verifier brief'],
+            ['L20', '### Verifier brief'],   # moved under Phase 3, where it is used
             ['L21-1', 'Verdict'],
             ['L21-2', 'Omissions'],
             ['L21-3', 'Distortions'],
@@ -1008,6 +1081,59 @@ subtest 'T-J SKILL.md content (criteria 8..12; AC-34..46)' => sub {
             ['L33a', 'operator instruction'],
             ['L33b', 'operator testimony'],
             ['L33c', 'not a closed list'],
+
+            # --- Added when the skill absorbed the practice learned on DAME. ---
+            # Each of these encodes a loss that actually happened; a literal
+            # check is the cheapest thing that fails if one is edited away.
+
+            # Cross-cutting invariants (stated once, near the top).
+            ['L34',  '## Invariants'],
+            ['L35',  'Modality is preserved in both directions'],
+            ['L36',  'is sufficient basis to schedule the work'],
+            ['L37',  'Authorship is tracked separately from evidence'],
+            ['L38',  'Prefer a check that can fail'],
+
+            # The batched question round -- its own phase, because mid-flight
+            # questions are a defect against the operator's working model.
+            ['L39',  '## Phase 2.5 — Question'],
+            ['L40',  'ONE batched round'],
+            # Name the mechanism, not just the discipline: "ask in one round"
+            # without naming AskUserQuestion left the agent free to ask in
+            # prose, which is neither batched nor answerable in seconds.
+            ['L40b', 'AskUserQuestion'],
+            ['L40c', 'at most four questions per call'],
+            ['L41',  '[Q→resolved]'],
+            ['L42',  'provenance table'],
+            ['L43',  'A second round is a process failure'],
+
+            # Per-finding requirements beyond the basis marker.
+            ['L44',  '**Verbatim:**'],
+            ['L45',  'An interrogative is a finding'],
+            ['L46',  'agent-originated flag'],
+            ['L47',  'Three dispositions, not two'],
+            ['L48',  'tracked, out of scope, with the'],
+            ['L49',  'Measured evidence, not recollection'],
+            ['L50',  'inference'],
+            ['L51',  q{grep -c '^### '}],
+
+            # Modality drift: the eighth verifier bucket. Neither an omission
+            # nor a distortion of any single claim -- it inverts the BATCH's
+            # modality while every finding still reads correctly, so without
+            # its own bucket it has nowhere to be reported.
+            ['L52',  'Modality drift'],
+            ['L53',  'refinement, not rejection'],
+            ['L54',  'eight parts'],
+
+            # Verbatim capture route + the two gates after authoring.
+            ['L55',  '--from-session'],
+            ['L56',  'butler:bp-feedback-verifier'],
+            ['L57',  'blueprint:bp-auditor'],
+            ['L58',  'Dispatch only when the operator says so'],
+
+            # The backup gap: gitignored AND only vault-backed. Stated so
+            # nobody reads a clean `git status` as "the evidence is safe".
+            ['L59',  'gitignored'],
+            ['L60',  '/steward:backup'],
         );
         for my $l (@literals) {
             my ($id, $lit) = @$l;
@@ -1020,6 +1146,16 @@ subtest 'T-J SKILL.md content (criteria 8..12; AC-34..46)' => sub {
         for my $bad ('applied to three', '3×', '57 findings') {
             is(index($text, $bad), -1, "SKILL.md never reproduces the corrected-wrong figure: \"$bad\"");
         }
+
+        # No argument-placeholder token. Claude Code substitutes one IN PLACE,
+        # so a placeholder anywhere in this body would splice the operator's
+        # entire pasted batch into the middle of the instructions -- and this
+        # skill's whole entry contract is "the argument IS a long message".
+        # With no placeholder the arguments are appended once at the end,
+        # which is also where the argv fallback wants them.
+        unlike($text, qr/\$ARGUMENTS|\$\{ARGUMENTS|\$\d\b/,
+               'AC-34: SKILL.md carries no argument-placeholder token (it would be substituted in place, '
+             . 'splicing a whole pasted feedback batch into the middle of the instructions)');
     }
 };
 
@@ -1132,6 +1268,175 @@ subtest 'T-K drift (criterion 13; AC-47..51)' => sub {
         # ANYWHERE in this test file -- verified by inspection, not asserted
         # here, since asserting their absence in the artifact would itself
         # be a fragile, spec-violating total/line-number-shaped check.)
+    }
+};
+
+# ===========================================================================
+# T-L -- the verifier agent. Phase 3's whole claim is "read-only": the value
+# of the pass comes from the verifier being unable to quietly fix what it
+# should be reporting. An instruction saying so is not that guarantee -- the
+# TOOL LIST is. These assertions exist so a well-meaning future edit that adds
+# Write "so it can save its report" fails loudly instead of silently converting
+# the gate into another editor.
+# ===========================================================================
+
+subtest 'T-L verifier agent contract (read-only enforced by tools, not by prose)' => sub {
+    ok(-f $VERIFIER, "bp-feedback-verifier.md exists ($VERIFIER)");
+    SKIP: {
+        skip 'verifier agent file absent', 9 unless -f $VERIFIER;
+        my $text = _slurp_text($VERIFIER);
+        my ($fm) = $text =~ /\A---\n(.*?)\n---\n/s;
+        ok(defined $fm, 'verifier has a frontmatter block');
+        SKIP: {
+            skip 'no frontmatter to inspect', 8 unless defined $fm;
+            like($fm, qr/^name:\s*bp-feedback-verifier\s*$/m, 'frontmatter name: bp-feedback-verifier');
+            like($fm, qr/^description:/m, 'frontmatter has a description');
+
+            my ($tools) = $fm =~ /^tools:\s*(.+)$/m;
+            ok(defined $tools, 'frontmatter declares a tools list');
+            SKIP: {
+                skip 'no tools list to inspect', 5 unless defined $tools;
+                my %granted = map { $_ => 1 } grep { length } split /[,\s]+/, $tools;
+                # Read/Grep/Glob are what "read the raw files, re-verify the
+                # cited code" actually needs.
+                ok($granted{Read}, 'verifier is granted Read');
+                ok($granted{Grep}, 'verifier is granted Grep');
+                # The three that would let it mutate anything, including the
+                # decomposition it is judging.
+                for my $forbidden (qw(Write Edit Bash)) {
+                    ok(!$granted{$forbidden},
+                       "verifier is NOT granted $forbidden -- read-only is structural, not requested");
+                }
+            }
+        }
+
+        # The eighth bucket has to be in the agent's own contract, not only in
+        # the skill that dispatches it: a caller who trims the brief must not
+        # be able to silently drop it.
+        ok(index($text, 'Modality drift') >= 0, 'verifier contract names the Modality drift bucket');
+        ok(index($text, 'what I did NOT check') >= 0, 'verifier contract requires an explicit not-checked statement');
+    }
+};
+
+# ===========================================================================
+# T-M -- --from-session: the verbatim-capture route. The point of this route
+# is that the operator's bytes never pass through an agent, so these tests are
+# byte-equality tests, deliberately using bodies that break the obvious
+# shortcuts (a leading POSIX path would be eaten by "strip a leading /token";
+# an embedded closing tag would truncate a non-greedy match).
+# ===========================================================================
+
+subtest 'T-M --from-session verbatim transcript capture' => sub {
+    my $SID = '11111111-2222-3333-4444-555555555555';
+
+    # Build a transcript under <data>/claude-home/projects/<proj>/<sid>.jsonl,
+    # the sandbox-side layout the CLI searches.
+    my $mk = sub {
+        my (@entries) = @_;
+        my $tmp  = tempdir(CLEANUP => 1);
+        my $data = File::Spec->catdir($tmp, '.ccpraxis-local-data');
+        my $proj = File::Spec->catdir($data, 'claude-home', 'projects', 'p');
+        make_path($proj);
+        make_path(File::Spec->catdir($data, 'corrections'));
+        my $json = JSON::PP->new->utf8->canonical;
+        my $body = join '', map { $json->encode($_) . "\n" } @entries;
+        _write_bytes(File::Spec->catfile($proj, "$SID.jsonl"), $body);
+        return $data;
+    };
+    my $cmd_entry = sub {
+        my ($args) = @_;
+        my $c = "<command-message>butler:feedback</command-message>\n"
+              . "<command-name>/butler:feedback</command-name>";
+        $c .= "\n<command-args>$args</command-args>" if defined $args;
+        return { type => 'user', message => { role => 'user', content => $c } };
+    };
+    my $typed_entry = sub {
+        my ($t) = @_;
+        return { type => 'user', promptSource => 'typed',
+                 message => { role => 'user', content => $t } };
+    };
+
+    # A body that defeats both naive shortcuts at once, plus non-ASCII so the
+    # character/byte boundary is exercised rather than assumed.
+    my $tricky = "/c/Users/André/notes.md is wrong.\n"
+               . "1. The header says </command-args> — literally.\n"
+               . "2. At least 5 variants.\nRegressions?";
+    my $tricky_bytes = encode('UTF-8', $tricky);
+
+    {
+        my $data = $mk->($typed_entry->('an OLDER message that must not win'),
+                         { type => 'user', message => { role => 'user',
+                             content => '<local-command-stdout>noise</local-command-stdout>' } },
+                         $cmd_entry->($tricky));
+        my ($rc, $out, $err) = run_cli(args => ['--data-dir', $data,
+            '--from-session', $SID, '--command', 'butler:feedback']);
+        is($rc, 0, 'command-args route -> exit 0');
+        my $path = $out; chomp $path;
+        my $got = _slurp_bytes($path);
+        ok(defined $got, 'capture file written');
+        my ($hdr, $body) = defined $got ? split(/\n\n/, $got, 2) : ('', '');
+        is($body, $tricky_bytes,
+           'body is byte-identical to the operator\'s <command-args> payload '
+         . '(leading POSIX path intact, embedded </command-args> intact, UTF-8 intact)');
+        like($hdr, qr/^\*\*Source:\*\* transcript$/m,
+             'provenance records the transcript route without being told to');
+        like($err, qr/verbatim/, 'STDERR reports the verbatim capture and its byte count');
+    }
+
+    # A bare invocation must NOT silently reach back and capture an older
+    # message: capturing the wrong turn is worse than capturing nothing,
+    # because nothing is visible and wrong is not.
+    {
+        my $data = $mk->($typed_entry->('an older message that must NOT be captured'),
+                         $cmd_entry->(undef));
+        my ($rc, $out, $err) = run_cli(args => ['--data-dir', $data,
+            '--from-session', $SID, '--command', 'butler:feedback']);
+        is($rc, 2, 'bare /butler:feedback (no args) -> exit 2, not a stale capture');
+        ok(!-d File::Spec->catdir($data, 'corrections', 'batch-1'),
+           'bare invocation writes nothing at all');
+    }
+
+    # No --command: fall back to the last plainly-typed message, skipping the
+    # injected local-command bookkeeping entries.
+    {
+        my $data = $mk->($typed_entry->('first'),
+                         { type => 'user', message => { role => 'user',
+                             content => '<command-name>/model</command-name>' } },
+                         $typed_entry->('the last typed message'));
+        my ($rc, $out, $err) = run_cli(args => ['--data-dir', $data, '--from-session', $SID]);
+        is($rc, 0, 'no --command -> typed-message route, exit 0');
+        my $path = $out; chomp $path;
+        my $got = _slurp_bytes($path) // '';
+        my (undef, $body) = split(/\n\n/, $got, 2);
+        is($body, 'the last typed message', 'takes the LAST typed message, ignoring injected command entries');
+    }
+
+    # Unfindable transcript: warn, fall back to argv, and downgrade the
+    # recorded provenance -- a fallback capture must not claim to be verbatim.
+    {
+        my $data = $mk->($cmd_entry->('unused'));
+        my ($rc, $out, $err) = run_cli(args => ['--data-dir', $data,
+            '--from-session', 'no-such-session', 'body from argv']);
+        is($rc, 0, 'unfindable transcript -> falls back to argv, exit 0');
+        like($err, qr/\[transcript\]/, 'STDERR carries a [transcript] diagnostic');
+        my $path = $out; chomp $path;
+        my $got = _slurp_bytes($path) // '';
+        my ($hdr, $body) = split(/\n\n/, $got, 2);
+        is($body, 'body from argv', 'argv body captured');
+        like($hdr, qr/^\*\*Source:\*\* chat$/m,
+             'provenance downgraded to chat -- a fallback never claims Source: transcript');
+    }
+
+    # Shape gates.
+    {
+        my ($rc, $out, $err) = run_cli(args => ['--command', 'butler:feedback', 'x']);
+        is($rc, 1, '--command without --from-session -> usage error');
+        like($err, qr/\[--command requires --from-session\]/, 'message names the missing dependency');
+    }
+    {
+        my ($rc, $out, $err) = run_cli(args => ['--from-session', "bad/../id", 'x']);
+        is($rc, 1, 'path-shaped session id rejected');
+        like($err, qr/\[invalid session id\]/, 'message names the invalid session id');
     }
 };
 

@@ -1,0 +1,1 @@
+bp-feedback-verifier agent - fresh-context, tool-enforced read-only diff of a feedback batch's raw files against its decomposition; reports omissions, distortions and modality drift, and cannot fix anything.
