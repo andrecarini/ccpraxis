@@ -202,6 +202,7 @@ ccpraxis/
 │   │   ├── agents/
 │   │   │   ├── bp-architect.md              # bp-architect worker (opus) - writes the package spec that tests and implementation build from. Report-only.
 │   │   │   ├── bp-conformance-judge.md
+│   │   │   ├── bp-feedback-verifier.md      # bp-feedback-verifier agent - fresh-context, tool-enforced read-only diff of a feedback batch's raw files against its decomposition; reports omissions, distortions and modality drift, and cannot fix anything.
 │   │   │   ├── bp-harvest-judge.md          # bp-harvest-judge - verifies a finished package's outputs vs done-criteria from disk. Verdict-to-disk, never fixes.
 │   │   │   ├── bp-implementer.md            # bp-implementer worker - converges code on the immutable tests within the package write_set. Hook-blocked from test files.
 │   │   │   ├── bp-redteam.md                # bp-redteam worker (opus) - adversarial pass over the package. Report-only.
@@ -212,21 +213,39 @@ ccpraxis/
 │   │   │   └── bp-ui-prober.md              # bp-ui-prober worker - finder-based UI scenarios and screenshot reads for packages that touch UI.
 │   │   ├── docs/
 │   │   │   ├── A0-derisk-findings.md
-│   │   │   └── assumptions.json
+│   │   │   ├── assumptions.json
+│   │   │   └── spend-credentials.md
 │   │   ├── hooks/
 │   │   │   ├── gate-shutdown.sh             # PreToolUse graceful-stop gate (Decision #10/#18, package A4).
 │   │   │   ├── gate-stop.sh                 # Stop hook inside coordinator sessions.
 │   │   │   ├── guard-bash.sh                # PreToolUse hook for Bash inside coordinator sessions.
+│   │   │   ├── guard-blueprint-write.sh     # PreToolUse hook (b43-blueprint-write-api).
+│   │   │   ├── guard-git-mutations.sh       # PreToolUse hook denying git working-tree mutations
 │   │   │   ├── guard-writes.sh              # PreToolUse hook for Edit|Write|MultiEdit|NotebookEdit.
 │   │   │   ├── hooks.json                   # Hook registration for butler: PreToolUse (gate-shutdown/guard-writes on edits, gate-shutdown/track-dispatch on Task, guard-bash on Bash), PostToolUse (log-dispatch), Stop (gate-stop). gate-shutdown is the A4 graceful-stop gate: on a fleet stop signal (runs/.shutdown | runs/.paused | runs/<pkg>.force-stop) it denies new work and lets the coordinator funnel to a clean park.
 │   │   │   ├── ledger-guard.sh              # PreToolUse package-ledger write-integrity guard (b12).
 │   │   │   ├── lib.sh                       # shared helpers for butler hooks.
 │   │   │   ├── log-dispatch.sh              # PostToolUse hook for Task inside coordinator sessions.
 │   │   │   ├── repeat-guard.sh              # PreToolUse mechanical repeat-command guard (b10).
-│   │   │   └── track-dispatch.sh            # PreToolUse hook for Task inside coordinator sessions.
+│   │   │   ├── track-dispatch.sh            # PreToolUse hook for Task inside coordinator sessions.
+│   │   │   └── wait-shape-guard.sh          # PreToolUse guard for four wait/poll pathologies b10's exact-repeat
+│   │   ├── opencode/
+│   │   │   ├── bp-architect.md
+│   │   │   ├── bp-implementer.md
+│   │   │   ├── bp-redteam.md
+│   │   │   ├── bp-reviewer.md
+│   │   │   ├── bp-scout.md
+│   │   │   ├── bp-test-writer.md
+│   │   │   ├── bp-ui-prober.md
+│   │   │   └── guard-writes-plugin.js
 │   │   ├── scripts/
 │   │   │   ├── bp-answer-decision.pl        # the MECHANICAL unblock the reporter performs once a
+│   │   │   ├── bp-baseline.pl               # green-baseline materialization (b40-green-baseline-isolation).
+│   │   │   ├── bp-blueprint.pl              # the deterministic blueprint.md write/read API (b43-blueprint-write-api).
+│   │   │   ├── bp-cache-state.pl            # b41-cache-state-tracking: the ONE place that decides whether
 │   │   │   ├── bp-checkpoint.pl             # durable WIP checkpoint commits (b02, Decisions #2/#17).
+│   │   │   ├── bp-checks.pl                 # derive the checks a package's WRITE SET implies, and fail a
+│   │   │   ├── bp-containment-audit.pl      # post-step subprocess write-containment audit (b20).
 │   │   │   ├── bp-contract.pl               # Anthropic-side + creds CONTRACT validators (Decision #29/#31).
 │   │   │   ├── bp-deps-check.pl             # deterministic dependency/version-policy classifier (Decisions #4, #11, #12, #14…
 │   │   │   ├── bp-drive-next.pl             # the mechanical director for /butler:drive-solo.
@@ -236,21 +255,32 @@ ccpraxis/
 │   │   │   ├── bp-hooks-selftest.sh         # A8 / Decision #31 startup self-assert.
 │   │   │   ├── bp-http.pl                   # the orchestrator/keeper HTTPS transport, via curl.
 │   │   │   ├── bp-init.sh                   # ensure the ccpraxis local data root exists and self-gitignores.
+│   │   │   ├── bp-jail.pl                   # per-dispatch worker jail isolation (b33-worker-jail-isolation).
 │   │   │   ├── bp-judge.pl                  # the DETERMINISTIC decision core for A5 (the judges).
 │   │   │   ├── bp-judge.sh                  # fire ONE scoped, throwaway judge for a package and detach it.
 │   │   │   ├── bp-launch.sh                 # launch (or resume) a headless coordinator session for one package.
+│   │   │   ├── bp-ledger.pl                 # the deterministic ledger API (b13-deterministic-ledger-api).
 │   │   │   ├── bp-lib.sh                    # butler's copy of the shared base helpers PLUS sandbox-only execution helpers.
 │   │   │   ├── bp-log.pl                    # structured, line-flushed, crash-safe run logger (Decision #30).
 │   │   │   ├── bp-orchestrate.sh            # start (or report on) the deterministic, token-free
 │   │   │   ├── bp-orchestrator.pl           # the deterministic, TOKEN-FREE orchestrator process-management
+│   │   │   ├── bp-pin.pl                    # version-pin resolver + drift auditor (b46-version-pin-currency).
 │   │   │   ├── bp-preflight.pl              # environment-support assertion (Decisions #29/#31).
+│   │   │   ├── bp-progress.pl               # b11-progress-heuristic-turns-backstop: a semantic liveness check
 │   │   │   ├── bp-remediate.pl              # b07-auto-remediation-engine: the DETERMINISTIC decision core
 │   │   │   ├── bp-resume-sweep.sh           # find interrupted coordinators and resume them economically.
+│   │   │   ├── bp-shape-lint.pl             # flag oracle assertions that pin the WHOLE SHAPE of a
+│   │   │   ├── bp-spend-auth.pl             # credential UX for the OpenCode Go/Zen spend cookie
+│   │   │   ├── bp-spend.pl                  # normalized OpenCode Go + Zen spend reader, plus the composed
 │   │   │   ├── bp-status.sh                 # one-line-per-package rollup across blueprints.
+│   │   │   ├── bp-statusline.pl             # b37-spend-surfaces C8: the compact spend form for
 │   │   │   ├── bp-token-keeper.pl           # the orchestrator's OAuth token-keeper (Decisions #11/#12/#30).
+│   │   │   ├── bp-turn-caps.pl              # the canonical turn-cap source, and the drift guard over it.
 │   │   │   ├── bp-usage-gate.pl             # ONE host-safe usage-headroom poll for /butler:drive-solo.
 │   │   │   ├── bp-validate-dag.pl           # deterministic blueprint-DAG validator.
-│   │   │   └── bp-wait-for-decision.pl      # the reporter's TOKEN-FREE blocking watcher (A7).
+│   │   │   ├── bp-wait-for-decision.pl      # the reporter's TOKEN-FREE blocking watcher (A7).
+│   │   │   ├── bp-worker-models.pl          # worker model preference resolution + fallback ladder.
+│   │   │   └── bp-worker.pl                 # deterministic non-Task dispatcher for butler workers.
 │   │   ├── skills/
 │   │   │   ├── coordinator-protocol/
 │   │   │   │   └── SKILL.md                 # Binding operating protocol for butler coordinators — the headless Claude Code…
@@ -258,8 +288,8 @@ ccpraxis/
 │   │   │   │   └── SKILL.md                 # Execute a blueprint as a headless multi-coordinator FLEET (sandbox-only) — st…
 │   │   │   ├── drive-solo/
 │   │   │   │   └── SKILL.md                 # The one interactive execute verb — drive one blueprint, a named set, or ALL a…
-│   │   │   ├── feedback-intake/
-│   │   │   │   └── SKILL.md                 # Four-phase flow (Batch, Decompose, Verify, Author) that turns raw operator feed…
+│   │   │   ├── feedback/
+│   │   │   │   └── SKILL.md                 # Turns a batch of raw operator feedback into verified, sourced, basis-marked fin…
 │   │   │   ├── orchestrator-protocol/
 │   │   │   │   └── SKILL.md                 # Operating doctrine for butler execution — the reporter (the interactive Claud…
 │   │   │   ├── reporter/
@@ -270,47 +300,79 @@ ccpraxis/
 │   │   │   ├── dispatch-prompt.md           # Coordinator bootstrap-prompt template; bp-launch.sh fills the placeholders and feeds it to the detached claude -p coordinator.
 │   │   │   ├── judge-harvest.md
 │   │   │   └── judge-resolve.md
-│   │   └── tests/
-│   │       ├── run-tests.pl                 # Test runner for plugins/butler/tests/t/.
-│   │       └── t/
-│   │           ├── 01-contract.t
-│   │           ├── 02-preflight.t
-│   │           ├── 03-govern.t
-│   │           ├── 04-log.t
-│   │           ├── 05-keeper.t
-│   │           ├── 06-orchestrator.t
-│   │           ├── 07-http.t
-│   │           ├── 08-orchestrator-scenarios.t
-│   │           ├── 09-gate.t
-│   │           ├── 10-judges.t
-│   │           ├── 11-simulation.t
-│   │           ├── 12-wait-for-decision.t
-│   │           ├── 13-answer-decision.t
-│   │           ├── 14-hooks-selftest.t
-│   │           ├── 15-orchestrate-shutdown-clear.t
-│   │           ├── 16-oauth-sandbox-preflight.t
-│   │           ├── 17-drive-next.t
-│   │           ├── 18-usage-governor.t
-│   │           ├── 19-drive-integration.t
-│   │           ├── 20-deps-check.t
-│   │           ├── 20-orchestrator-broken-env-turns.t
-│   │           ├── 21-durable-checkpoint-commits.t
-│   │           ├── 22-checkpoint-hardening.t
-│   │           ├── 23-keeper-resilience-antispam.t
-│   │           ├── 24-conformance-gate.t
-│   │           ├── 25-fast-store.t
-│   │           ├── 26-auto-remediation-engine.t
-│   │           ├── 27-preflight-repo-check.t
-│   │           ├── 60-dag-integrity.t
-│   │           ├── 61-judge-starvation.t
-│   │           ├── 62-repeat-guard.t
-│   │           ├── 64-ledger-guard.t
-│   │           ├── 65-ledger-api.t
-│   │           ├── 67-wait-shape-guard.t
-│   │           ├── 73-status-recognition.t
-│   │           ├── 77-feedback-intake.t
-│   │           ├── 78-timestamp-authorship.t
-│   │           └── 79-contract-idle-window.t
+│   │   ├── tests/
+│   │   │   ├── lib/
+│   │   │   │   └── HostCaps.pm
+│   │   │   ├── run-tests.pl                 # Test runner for plugins/butler/tests/t/.
+│   │   │   └── t/
+│   │   │       ├── 00-oracle-hygiene.t
+│   │   │       ├── 01-contract.t
+│   │   │       ├── 02-preflight.t
+│   │   │       ├── 03-govern.t
+│   │   │       ├── 04-log.t
+│   │   │       ├── 05-keeper.t
+│   │   │       ├── 06-orchestrator.t
+│   │   │       ├── 07-http.t
+│   │   │       ├── 08-orchestrator-scenarios.t
+│   │   │       ├── 09-gate.t
+│   │   │       ├── 10-judges.t
+│   │   │       ├── 11-simulation.t
+│   │   │       ├── 12-wait-for-decision.t
+│   │   │       ├── 13-answer-decision.t
+│   │   │       ├── 14-hooks-selftest.t
+│   │   │       ├── 15-orchestrate-shutdown-clear.t
+│   │   │       ├── 16-oauth-sandbox-preflight.t
+│   │   │       ├── 17-drive-next.t
+│   │   │       ├── 18-usage-governor.t
+│   │   │       ├── 19-drive-integration.t
+│   │   │       ├── 20-deps-check.t
+│   │   │       ├── 20-orchestrator-broken-env-turns.t
+│   │   │       ├── 21-durable-checkpoint-commits.t
+│   │   │       ├── 22-checkpoint-hardening.t
+│   │   │       ├── 23-keeper-resilience-antispam.t
+│   │   │       ├── 24-conformance-gate.t
+│   │   │       ├── 25-fast-store.t
+│   │   │       ├── 26-auto-remediation-engine.t
+│   │   │       ├── 27-preflight-repo-check.t
+│   │   │       ├── 60-dag-integrity.t
+│   │   │       ├── 61-judge-starvation.t
+│   │   │       ├── 62-repeat-guard.t
+│   │   │       ├── 63-progress-heuristic.t
+│   │   │       ├── 64-ledger-guard.t
+│   │   │       ├── 65-ledger-api.t
+│   │   │       ├── 66-waiting-discipline.t
+│   │   │       ├── 67-wait-shape-guard.t
+│   │   │       ├── 68-exit-reason-classification.t
+│   │   │       ├── 69-answer-decision-completeness.t
+│   │   │       ├── 70-decision-delivery.t
+│   │   │       ├── 71-ledger-timestamps.t
+│   │   │       ├── 72-subprocess-containment.t
+│   │   │       ├── 73-status-recognition.t
+│   │   │       ├── 74-soft-ordering.t
+│   │   │       ├── 75-effort-and-profiles.t
+│   │   │       ├── 76-reporter-autonomy.t
+│   │   │       ├── 77-feedback.t
+│   │   │       ├── 78-timestamp-authorship.t
+│   │   │       ├── 79-contract-idle-window.t
+│   │   │       ├── 79-worker-backend-dispatcher.t
+│   │   │       ├── 80-rate-limit-attempt-isolation.t
+│   │   │       ├── 80-worker-jail-isolation.t
+│   │   │       ├── 81-opencode-worker-runtime.t
+│   │   │       ├── 81-usage-poll-cadence.t
+│   │   │       ├── 82-orphaned-judge-recovery.t
+│   │   │       ├── 82-worker-model-preference.t
+│   │   │       ├── 83-multi-provider-spend.t
+│   │   │       ├── 84-green-baseline.t
+│   │   │       ├── 85-cache-state.t
+│   │   │       ├── 86-blueprint-write-api.t
+│   │   │       ├── 87-decision-context-split.t
+│   │   │       ├── 88-execution-priority.t
+│   │   │       ├── 89-ledger-context-budget.t
+│   │   │       ├── 90-version-pin-currency.t
+│   │   │       ├── 91-agent-worker-doctrine.t
+│   │   │       ├── 92-write-set-implied-checks.t
+│   │   │       └── 93-turn-cap-consistency.t
+│   │   └── turn-caps.json
 │   ├── sandbox/                             # Sandbox plugin — bundles the claude-sandbox host launcher, the container blueprint, the bootstrap routine, and the /sandbox:setup redirect skill
 │   │   ├── .claude-plugin/
 │   │   │   └── plugin.json
@@ -350,6 +412,7 @@ ccpraxis/
 │   │   │   ├── RunState.pm
 │   │   │   ├── SandboxLock.pm
 │   │   │   ├── SessionFilter.pm
+│   │   │   ├── SpendPanel.pm
 │   │   │   ├── TokenInfo.pm
 │   │   │   ├── bootstrap.pl                 # First-launch setup invoked by launcher.pl when .claude-data is missing. 6 steps: verify container blueprint, build image, mkdir .claude-data, append .gitignore, git auth (HTTPS PAT / SSH deploy-key), invoke ccpraxis-install.pl. Fully interactive over the launcher's tty.
 │   │   │   ├── keep-awake.ps1               # hold a Windows wake-lock for as long as THIS process lives.
@@ -414,10 +477,20 @@ ccpraxis/
 │   │           ├── 47-lifecycle-relaunch.t
 │   │           ├── 48-activity-history.t
 │   │           ├── 49-session-filter.t
+│   │           ├── 50-input-latency.t
 │   │           ├── 51-protected-paths.t
 │   │           ├── 52-detector-hardening.t
 │   │           ├── 53-refuse-protected-paths.t
-│   │           └── 55-minimize-evidence.t
+│   │           ├── 54-spend-panel.t
+│   │           ├── 54-tui-output-hygiene.t
+│   │           ├── 55-minimize-evidence.t
+│   │           ├── 56-launcher-d5-hardening.t
+│   │           ├── 56-transcript-retention.t
+│   │           ├── 57-node-pnpm-toolchain.t
+│   │           ├── 58-container-health-detect.t
+│   │           ├── 59-fleet-event-source.t
+│   │           ├── 60-keepawake-probe.t
+│   │           └── 61-settings-scope-split.t
 │   ├── steward/                             # Meta-plugin that maintains ccpraxis and owns its backup, onboarding, and self-e…
 │   │   ├── .claude-plugin/
 │   │   │   └── plugin.json
@@ -459,7 +532,8 @@ ccpraxis/
 │   │           ├── 05-hard-exclude.t
 │   │           ├── 06-refresh-idempotent.t
 │   │           ├── 07-vault-metadata-rot.t
-│   │           └── 08-backup-data-migration.t
+│   │           ├── 08-backup-data-migration.t
+│   │           └── 09-no-drive-root-strays.t
 │   └── todo/                                # Personal todo notes synced to your private vault repo.
 │       ├── .claude-plugin/
 │       │   └── plugin.json
@@ -489,14 +563,14 @@ ccpraxis/
 │   ├── update-install.pl                    # /steward:update support: direct-binary install pipeline (detect / manifest / install / verify)
 │   └── update-research.pl                   # /steward:update support: fetches GitHub releases + changelog presence + symptom searches against issues
 └── skills/
+    ├── carry-over/
+    │   └── SKILL.md                         # /carry-over           — hand this session's work to a fresh one (plan-mode handover; not /compact)
     ├── launch-chrome-puppet/                # /launch-chrome-puppet — CDP browser automation
     │   ├── SKILL.md
     │   └── scripts/
     │       ├── chrome-puppet.pl             # Subcommand dispatcher (launch, navigate, text, etc.)
     │       └── lib/
     │           └── CDPClient.pm             # Pure-Perl WebSocket + CDP client
-    ├── carry-over/
-    │   └── SKILL.md                         # /carry-over           — hand this session's work to a fresh one (plan-mode handover; not /compact)
     └── refresh/
         └── SKILL.md                         # /refresh              — reread CLAUDE.md mid-conversation
 ```
