@@ -556,7 +556,7 @@ HTML
         require POSIX;
 
         my $secret = 'OPENCODE-COOKIE-MUST-NOT-REACH-JAILED-WORKER-4b19e';
-        my $proj = tempdir(DIR => '/root', CLEANUP => 1);
+        my $proj = tempdir((-d '/root' && -w '/root') ? (DIR => '/root') : (), CLEANUP => 1);
         system('git', '-C', $proj, 'init', '-q');
         system('git', '-C', $proj, 'config', 'user.email', 'bp-spend-test@example.invalid');
         system('git', '-C', $proj, 'config', 'user.name', 'bp-spend-test');
@@ -564,7 +564,7 @@ HTML
         system('git', '-C', $proj, 'add', '-A');
         system('git', '-C', $proj, 'commit', '-q', '-m', 'baseline');
 
-        my $jailroot = tempdir(DIR => '/root', CLEANUP => 0);
+        my $jailroot = tempdir((-d '/root' && -w '/root') ? (DIR => '/root') : (), CLEANUP => 0);
         File::Path::remove_tree($jailroot);
 
         ok(-e $JAIL, 'C9 HARNESS: bp-jail.pl exists in this checkout (the real, unmodified mechanism under test)');

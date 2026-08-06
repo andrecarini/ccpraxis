@@ -75,7 +75,7 @@ my $REAL_PATH = $CLEAN_ENV{PATH} // '/usr/bin:/bin';
 sub fwd { (my $p = shift) =~ s{\\}{/}g; $p }
 
 # TEST_BASE must be overlayfs (chmod honoured), never /project (9p).
-my $TEST_BASE = tempdir(DIR => '/root', CLEANUP => 1);
+my $TEST_BASE = tempdir((-d '/root' && -w '/root') ? (DIR => '/root') : (), CLEANUP => 1);
 my $rn = 0;
 
 # =====================================================================================

@@ -31,6 +31,8 @@
 use strict;
 use warnings;
 use FindBin qw($Bin);
+use lib "$Bin/../lib";
+use HostCaps qw(data_dir_ancestor git_path same_path);
 use Test::More;
 use JSON::PP;
 use File::Temp qw(tempdir);
@@ -42,7 +44,19 @@ require $SCRIPT;
 
 my $J    = JSON::PP->new->canonical;
 my $UJ   = JSON::PP->new->utf8->canonical;
-my $ROOT = tempdir(CLEANUP => 1);
+# Native-resolvable fixture root. See the long note in
+# t/21-durable-checkpoint-commits.t: `require bp-orchestrator.pl` (line 39)
+# disables MSYS argv translation for this process, so a POSIX /tmp/... path
+# reaches native git.exe unconverted and Windows resolves it against the
+# current drive as C:\tmp\... . Anchoring in the native temp dir hand-translates
+# once, at the source, so every path derived from it is correct under either
+# conversion state.
+my $NATIVE_TMP = do {
+    my $t = $ENV{TEMP} // $ENV{TMP};
+    ($^O =~ /^(MSWin32|cygwin|msys)$/ && defined $t && length $t && -d $t)
+        ? do { (my $p = $t) =~ s{\\}{/}g; $p } : undef;
+};
+my $ROOT = tempdir(($NATIVE_TMP ? (DIR => $NATIVE_TMP) : ()), CLEANUP => 1);
 my $NOW  = time;
 use constant EPOCH => 1785000000;                     # 2026-07-25T17:20:00Z
 
@@ -84,18 +98,18 @@ sub run_child {
     close $fh;
     return ((defined $out ? $out : ''), ($? == -1 ? -1 : $? >> 8));
 }
-sub git_out { my ($dir, @args) = @_; return run_child('git', '-C', $dir, @args) }
+sub git_out { my ($dir, @args) = @_; return run_child('git', '-C', git_path($dir), @args) }
 sub run_cli { my (@args) = @_; return run_child($^X, $SCRIPT, @args) }
 
 sub init_git {
     my ($dir, @extra) = @_;
-    system('git', '-C', $dir, 'init', '-q', @extra, '.') == 0 or die "git init failed in $dir";
+    system('git', '-C', git_path($dir), 'init', '-q', @extra, '.') == 0 or die "git init failed in $dir";
 }
 sub git_commit_all {
     my ($dir, $msg) = @_;
     $msg //= 'fixture commit';
-    system('git', '-C', $dir, 'add', '-A') == 0 or die "git add failed in $dir";
-    system('git', '-C', $dir, '-c', 'user.email=t@t', '-c', 'user.name=t',
+    system('git', '-C', git_path($dir), 'add', '-A') == 0 or die "git add failed in $dir";
+    system('git', '-C', git_path($dir), '-c', 'user.email=t@t', '-c', 'user.name=t',
            'commit', '-q', '-m', $msg) == 0 or die "git commit failed in $dir";
 }
 sub write_rel {
@@ -291,7 +305,7 @@ sub mk_shim {
     # (a) detached HEAD: the commit would be on no branch, unreachable and
     #     GC-eligible, while the log advertised it as the recovery point.
     my $dir = mk_repo(files => { 'src/in.txt' => "a\n" });
-    system('git', '-C', $dir, 'checkout', '--detach', '-q', 'HEAD') == 0 or die 'detach failed';
+    system('git', '-C', git_path($dir), 'checkout', '--detach', '-q', 'HEAD') == 0 or die 'detach failed';
     write_rel($dir, 'src/in.txt', "a\ndirty\n");
     my $before = count_commits($dir);
     my $r = ck(root => $dir, pkg => 'p', write_set => 'src/', status => 'running', step => 1, now => EPOCH);
@@ -352,7 +366,7 @@ sub mk_shim {
     make_path("$dir/.git/hooks");
     spit("$dir/.git/hooks/pre-commit", "#!$^X\nopen my \$f, '>', '$good' or exit 0; print \$f 'x'; close \$f; exit 0;\n");
     chmod 0755, "$dir/.git/hooks/pre-commit";
-    system('git', '-C', $dir, 'config', 'core.hooksPath', $evil) == 0 or die 'config failed';
+    system('git', '-C', git_path($dir), 'config', 'core.hooksPath', $evil) == 0 or die 'config failed';
 
     write_rel($dir, 'src/in.txt', "a\nround one\n");
     git_out($dir, 'add', '-A');
@@ -543,8 +557,20 @@ my $LIVE_REG = { livep => { attempt => 1, pid => 777_001, status => 'running', s
     is(sc(sub { BpOrch::_project_root_of(undef) }), undef, 'fix 8: _project_root_of(undef) is undef');
     my $plain = "$ROOT/no-ccpraxis/blueprints/T";
     make_path($plain);
-    is(sc(sub { BpOrch::_project_root_of($plain) }), undef,
-       'fix 8: a bp_dir with no .ccpraxis-local-data ancestor yields no hint (the §2.3 chain is used)');
+    # This asserts the NEGATIVE case, so it needs a path with genuinely no
+    # .ccpraxis-local-data above it. On this host there is no such temp path:
+    # both /tmp and %TEMP% live under C:\Users\<user>\, and a real
+    # ~/.ccpraxis-local-data there makes the walk-up legitimately succeed. The
+    # code is right and the fixture's premise is wrong -- say so instead of
+    # reporting a defect.
+    SKIP: {
+        my $anc = data_dir_ancestor($plain);
+        skip "premise unavailable on this host: $plain has a .ccpraxis-local-data ancestor at $anc, "
+           . 'so _project_root_of CORRECTLY returns a hint and the negative case cannot be staged here', 1
+            if defined $anc;
+        is(sc(sub { BpOrch::_project_root_of($plain) }), undef,
+           'fix 8: a bp_dir with no .ccpraxis-local-data ancestor yields no hint (the §2.3 chain is used)');
+    }
 
     # A blueprint dir in its real shape, inside a throwaway checkout that is NOT
     # the cwd. Without the hint, resolve_root would walk cwd up to /project (whose
@@ -552,7 +578,11 @@ my $LIVE_REG = { livep => { attempt => 1, pid => 777_001, status => 'running', s
     my $repo = mk_repo(files => { 'src/live/w.txt' => "committed\n" });
     my $bpdir = "$repo/.ccpraxis-local-data/blueprints/T";
     make_path($bpdir);
-    is(sc(sub { BpOrch::_project_root_of($bpdir) }), $repo,
+    # same_path, not is(): _project_root_of resolves through abs_path and hands
+    # back /c/Users/André/... while $repo is spelled C:/Users/ANDR~1/... . Same
+    # directory, different spelling -- an eq here tests the spelling, not the
+    # resolution, and reported a defect where there was none.
+    ok(same_path(sc(sub { BpOrch::_project_root_of($bpdir) }), $repo),
        'fix 8: a real <project>/.ccpraxis-local-data/blueprints/<bp> resolves to the project checkout');
 
     write_rel($repo, 'src/live/w.txt', "committed\nin flight\n");

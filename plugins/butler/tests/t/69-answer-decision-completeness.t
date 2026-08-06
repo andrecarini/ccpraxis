@@ -157,7 +157,14 @@ sub mk_bp {
 # =====================================================================================
 {
     my $has_jq = (system('jq --version >/dev/null 2>&1') == 0) ? 1 : 0;
-    ok($has_jq, 'environment has jq (bp-resume-sweep.sh hard-requires it via bp-lib.sh require_cmd)');
+    # See t/64: jq is a container dependency. Its absence means bp-resume-sweep.sh
+    # cannot run here at all (bp-lib.sh's require_cmd hard-exits), so the C1/C2
+    # groups are unexercised -- report that as missing coverage, not as a defect.
+    SKIP: {
+        skip 'jq is not installed on this host -- bp-resume-sweep.sh cannot run, C1/C2 NOT exercised', 1
+            unless $has_jq;
+        pass('environment has jq (bp-resume-sweep.sh hard-requires it via bp-lib.sh require_cmd)');
+    }
 
     sub warm_fixture {
         my (%o) = @_;

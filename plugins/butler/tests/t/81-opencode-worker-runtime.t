@@ -59,7 +59,7 @@ my $REAL_PATH = $CLEAN_ENV{PATH} // '/usr/bin:/bin';
 
 sub fwd { (my $p = shift) =~ s{\\}{/}g; $p }
 
-my $TEST_BASE = tempdir(DIR => '/root', CLEANUP => 1);
+my $TEST_BASE = tempdir((-d '/root' && -w '/root') ? (DIR => '/root') : (), CLEANUP => 1);
 my $rn = 0;
 
 # =====================================================================================
@@ -109,15 +109,30 @@ sub read_frontmatter {
 }
 
 # =====================================================================================
-# E1 (DC-1) -- exactly the seven workers ported, no judge.
+# E1 (DC-1) -- exactly the seven workers ported, no judge, no gate.
+#
+# The taxonomy here used to be binary: `-judge$` was a judge and EVERYTHING ELSE
+# was a pipeline worker owing an OpenCode counterpart. That held only while
+# butler/agents/ contained nothing but workers and judges, and it silently
+# mis-filed the first agent that was neither. bp-feedback-verifier is a GATE: it
+# is dispatched by an interactive skill (/butler:feedback), never by a
+# coordinator, so porting it to the OpenCode worker backend would be exactly as
+# wrong as porting a judge -- there is no coordinator step that would ever call
+# it. (blueprint:bp-auditor is the same shape and only escaped this check by
+# living in a different plugin.)
+#
+# So classify into three buckets by a RULE rather than a name list, and keep the
+# "exactly seven" contract meaning what it says: the agents the OpenCode tree
+# must mirror.
 # =====================================================================================
 {
     my @claude_bp = map { m{/([^/]+)\.md$} ? $1 : () }
         find_files_matching($ROOT_AGENTS, qr{/bp-[a-z-]+\.md$});
-    my @claude_workers = sort grep { !/-judge$/ } @claude_bp;
-    my @claude_judges  = sort grep {  /-judge$/ } @claude_bp;
+    my @claude_judges  = sort grep {  /-judge$/    } @claude_bp;
+    my @claude_gates   = sort grep {  /-verifier$/ } @claude_bp;
+    my @claude_workers = sort grep { !/-judge$/ && !/-verifier$/ } @claude_bp;
 
-    is(scalar(@claude_workers), 7, 'FIXTURE-SANITY: the Claude agent tree has exactly seven non-judge bp-* agents')
+    is(scalar(@claude_workers), 7, 'FIXTURE-SANITY: the Claude agent tree has exactly seven pipeline worker bp-* agents')
         or diag('claude workers found: ' . join(',', @claude_workers));
     is(scalar(@claude_judges), 3, 'FIXTURE-SANITY: the Claude agent tree has exactly three bp-*-judge agents')
         or diag('claude judges found: ' . join(',', @claude_judges));
@@ -126,13 +141,19 @@ sub read_frontmatter {
     my @oc_names = sort map { m{/([^/]+)\.md$} ? $1 : () } @oc_files;
 
     is_deeply(\@oc_names, \@claude_workers,
-        'E1: plugins/butler/opencode/ carries agent files named for EXACTLY the seven non-judge workers, no more, no fewer')
+        'E1: plugins/butler/opencode/ carries agent files named for EXACTLY the seven pipeline workers, no more, no fewer')
         or diag('opencode agent basenames found: ' . join(',', @oc_names));
 
     my @oc_judges = grep { /-judge/ } @oc_names;
     is(scalar(@oc_judges), 0,
         'E1: no bp-*-judge file exists anywhere under plugins/butler/opencode/ (SYN-24: porting a judge is forbidden)')
         or diag('judge-like files found: ' . join(',', @oc_judges));
+
+    my @oc_gates = grep { /-verifier/ } @oc_names;
+    is(scalar(@oc_gates), 0,
+        'E1: no bp-*-verifier file exists under plugins/butler/opencode/ either -- a gate is skill-dispatched, '
+      . 'so no coordinator step would ever reach it')
+        or diag('gate-like files found: ' . join(',', @oc_gates));
 }
 
 # =====================================================================================
@@ -363,19 +384,65 @@ sub _mk_path_without_opencode {
 }
 my $PATH_WITHOUT_OPENCODE = _mk_path_without_opencode($REAL_PATH);
 
+# Short-circuit once the backend dispatch is shown not to work on this host.
+#
+# Each call below is already bounded by `timeout 20`, so nothing hangs forever --
+# but there are dozens of them, and on a host where dispatch never completes the
+# file spends 20s per call and blows past a 900s wall. bp-worker.pl dispatches by
+# fork()+exec(); under MSYS fork is emulated with threads and the parent's
+# waitpid() never reaps, so every dispatch burns the full timeout.
+#
+# After the first timeout, stop paying for the rest: return the same sentinel
+# immediately and say why in the stderr slot, so the diags name the cause instead
+# of showing an empty output with no explanation. The assertions still fail --
+# these groups genuinely are NOT verified here, and pretending otherwise would be
+# the lie this whole sweep exists to remove -- but the file now finishes in
+# seconds and reports a cause rather than a wall-clock timeout.
+#
+# DECLARATIVE, not functional -- the one deliberate exception to this sweep's
+# rule (HostCaps.pm explains why probes are normally functional). You cannot
+# functionally probe a hang: the probe is the hang. Measured on this host,
+# a single dispatch did not complete in 4.5 minutes of mostly system time, with
+# neither the in-command `timeout 20` nor a parent alarm able to reach the
+# wedged emulated-fork child. The limitation is architectural rather than
+# incidental -- bp-worker.pl dispatches with real POSIX fork()+exec(), which is
+# correct for the Linux container it runs in and is not portable to MSYS -- so
+# a platform check states the truth as precisely as a probe would.
+my $DISPATCH_DEAD = ($^O =~ /^(MSWin32|cygwin|msys)$/) ? 1 : 0;
+diag('bp-worker.pl backend dispatch requires real POSIX fork()+exec(); on this platform it '
+   . 'wedges under emulated fork. The E6+ dispatch groups are NOT exercised here -- run them '
+   . 'in the sandbox container.') if $DISPATCH_DEAD;
 sub run_worker {
     my ($args, %envover) = @_;
-    my $errfile = "$TEST_BASE/wstderr." . (++$rn) . ".txt";
+    if ($DISPATCH_DEAD) {
+        return (124, '', "bp-worker.pl dispatch does not complete on this host "
+                       . "(fork()+exec() under emulated fork never reaps); "
+                       . "skipped after the first timeout rather than burning 20s again");
+    }
+    my $n       = ++$rn;
+    my $errfile = "$TEST_BASE/wstderr.$n.txt";
+    my $outfile = "$TEST_BASE/wstdout.$n.txt";
     local %ENV = (%CLEAN_ENV, PATH => $PATH_WITH_FAKE, %envover,
-                  BP_WORKER_BIN => fwd($BP_WORKER), ERRPATH => fwd($errfile));
-    open(my $fh, '-|', 'bash', '-c',
-         'exec timeout 20 "$BP_WORKER_BIN" "$@" 2>"$ERRPATH"', 'bash', @$args)
-        or die "bash: $!";
-    binmode $fh;
-    my $out = do { local $/; <$fh> };
-    close $fh;
+                  BP_WORKER_BIN => fwd($BP_WORKER), ERRPATH => fwd($errfile),
+                  OUTPATH => fwd($outfile));
+    # system() + file redirect, NOT open($fh,'-|',...). The pipe-open form makes
+    # perl fork; under MSYS that fork is emulated with threads and wedges here
+    # permanently -- the parent blocks in <$fh> forever, so the `timeout 20`
+    # inside the command never even starts and cannot bound anything. Observed:
+    # the file ran 5+ minutes without completing a single dispatch, never
+    # reaching E6's first assertion. system() uses spawn instead, so the
+    # in-command timeout is actually reachable and this returns.
+    system('bash', '-c',
+           'exec timeout 20 "$BP_WORKER_BIN" "$@" >"$OUTPATH" 2>"$ERRPATH"', 'bash', @$args);
     my $rc  = $? >> 8;
+    my $out = -e $outfile ? read_file($outfile) : '';
     my $err = -e $errfile ? read_file($errfile) : '';
+    # 124 is `timeout`'s own "I killed it" code.
+    if ($rc == 124) {
+        $DISPATCH_DEAD = 1;
+        diag('backend dispatch timed out on the first attempt -- remaining run_worker() calls '
+           . 'will short-circuit. These groups are NOT verified on this host.');
+    }
     return ($rc, defined $out ? $out : '', $err);
 }
 

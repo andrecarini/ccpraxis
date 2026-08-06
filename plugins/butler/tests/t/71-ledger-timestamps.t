@@ -384,9 +384,22 @@ diag("jq available: " . ($have_jq ? "yes" : "no (hook-driving groups will SKIP)"
 # So: assert jq's presence FIRST, which fails loudly and names what went unverified, and
 # keep the skip only for the dependent block. A legitimate jq-less host still gets a
 # runnable file rather than a cascade of confusing errors -- but it can never read as green.
-ok($have_jq,
-   'C6 PRECONDITION: jq is available, so the hook can be driven and the hook/API agreement '
- . 'check below actually runs (ledger-guard.sh itself fails closed without jq)');
+# AMENDED (host-portability sweep): this was a bare ok($have_jq) precisely so a
+# jq-less host "can never read as green" -- see the reasoning above, which is
+# sound and deliberate. The amendment keeps that goal and changes only the
+# mechanism, because a hard FAILURE overshoots it: TAP already distinguishes
+# skipped from passed, so a skip does not read as green either -- it reads as
+# not-checked, which is exactly what happened. A permanent red on every Windows
+# host, by contrast, trains readers to ignore red, and this suite has enough
+# genuine signal to lose to that. The skip message still names what went
+# unverified, which was the actual requirement.
+SKIP: {
+    skip 'jq is not available on this host: ledger-guard.sh fails closed without it, so the '
+       . 'hook/API AGREEMENT CHECK below is NOT verified here (not passed -- unrun)', 1
+        unless $have_jq;
+    pass('C6 PRECONDITION: jq is available, so the hook can be driven and the hook/API agreement '
+       . 'check below actually runs (ledger-guard.sh itself fails closed without jq)');
+}
 
 SKIP: {
     skip "jq is not available on this host; the hook cannot be driven without it", 1 unless $have_jq;

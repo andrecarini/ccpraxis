@@ -317,7 +317,17 @@ sub nonblank_lines { return grep { /\S/ } split /\n/, $_[0] }
         is(count_occ($kgc, $u), 1, "FIXTURE-SANITY: '$u' occurs exactly once in the fixture (Edit fixtures rely on uniqueness)");
     }
     is(count_occ($kgc, "\n---\n"), 1, 'FIXTURE-SANITY: only the closing "---" is an interior delimiter line');
-    ok($have_jq, 'FIXTURE-SANITY: jq is available on this host (hook-behaviour groups will run)');
+    # jq ships in the sandbox container, not on the Windows host. Every
+    # hook-behaviour group below already SKIPs without it; this line used to be
+    # the one place that turned its absence into a failure. That is a false
+    # signal in the worst direction -- it reads as "ledger-guard.sh is broken"
+    # when the truth is "ledger-guard.sh was never exercised here". A skip says
+    # the second thing, which is what actually happened.
+    SKIP: {
+        skip 'jq is not installed on this host -- the hook-behaviour groups below are NOT exercised', 1
+            unless $have_jq;
+        pass('FIXTURE-SANITY: jq is available on this host (hook-behaviour groups will run)');
+    }
 }
 
 # =====================================================================================

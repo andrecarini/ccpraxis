@@ -58,7 +58,7 @@ sub fwd { (my $p = shift) =~ s{\\}{/}g; $p }
 # TEST_BASE must be overlayfs (chmod honoured), never /project (9p). /root itself is part of the
 # root overlayfs in this container (only /root/.claude is a separate 9p mount) -- verified below
 # as FIXTURE-SANITY, not assumed.
-my $TEST_BASE = tempdir(DIR => '/root', CLEANUP => 1);
+my $TEST_BASE = tempdir((-d '/root' && -w '/root') ? (DIR => '/root') : (), CLEANUP => 1);
 my $rn = 0;
 
 # =====================================================================================
@@ -758,7 +758,7 @@ SKIP: {
     cmp_ok(scalar(@DENY), '>', 0, 'C13 HARNESS: the denylist was parsed out of bp-jail.pl');
     cmp_ok(scalar(@REQD), '>', 0, 'C13 HARNESS: the required-present list was parsed out of bp-jail.pl');
 
-    my $proj = tempdir(DIR => '/root', CLEANUP => 1);
+    my $proj = tempdir((-d '/root' && -w '/root') ? (DIR => '/root') : (), CLEANUP => 1);
     system('git', '-C', $proj, 'init', '-q');
     system('git', '-C', $proj, 'config', 'user.email', 'c13@example.invalid');
     system('git', '-C', $proj, 'config', 'user.name', 'c13');
@@ -766,7 +766,7 @@ SKIP: {
     system('git', '-C', $proj, 'add', '-A');
     system('git', '-C', $proj, 'commit', '-q', '-m', 'baseline');
 
-    my $jailroot = tempdir(DIR => '/root', CLEANUP => 0);
+    my $jailroot = tempdir((-d '/root' && -w '/root') ? (DIR => '/root') : (), CLEANUP => 0);
     File::Path::remove_tree($jailroot);
 
     # Every denied name carries the sentinel; every required name carries a

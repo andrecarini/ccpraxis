@@ -19,6 +19,8 @@
 use strict;
 use warnings;
 use FindBin qw($Bin);
+use lib "$Bin/../lib";
+use HostCaps qw(git_path);
 use Test::More;
 use JSON::PP;
 use File::Temp qw(tempdir);
@@ -28,7 +30,27 @@ require "$Bin/../../scripts/bp-orchestrator.pl";
 
 my $J      = JSON::PP->new->canonical;
 my $UJ     = JSON::PP->new->utf8->canonical;
-my $ROOT   = tempdir(CLEANUP => 1);
+# `require bp-orchestrator.pl` above runs its BEGIN block, which sets
+# MSYS2_ARG_CONV_EXCL='*' on Windows -- so from line 27 onward THIS PROCESS has
+# MSYS argv path-translation disabled. A bare tempdir() yields /tmp/XXXX; perl
+# resolves it fine, but `git -C /tmp/XXXX/repo1` hands native git.exe a POSIX
+# path it resolves against the current DRIVE instead, looking for
+# C:\tmp\XXXX\repo1. Symptom was `fatal: cannot change to '/tmp/...'` and a die
+# that took the whole file down after assertion 45 -- while the directory
+# demonstrably existed (verified by probe: ROOT_exists=1 dir_exists=1).
+#
+# This is the drive-root landmine the user-global CLAUDE.md documents: opting
+# out of conversion is only safe TOGETHER WITH hand-translating your own paths.
+# The orchestrator opts out; this file never translated. HostCaps::git_path is
+# the translation, applied at each git call site.
+# Anchored in the native temp dir, NOT merely translated at the call sites.
+# git_path() below covers this file's OWN git calls, but the code under test
+# (BpOrch::checkpoint) runs git against the root it is handed and does no
+# translation of its own -- correct for the Linux container it ships to. So the
+# root itself has to be natively resolvable, or 58 assertions fail inside the
+# production code rather than in the fixture. Measured both ways: anchoring ->
+# green; call-site translation alone -> 58 failures.
+my $ROOT   = tempdir(HostCaps::tempdir_args(), CLEANUP => 1);
 my $NOW    = time;
 my $SCRIPT = "$Bin/../../scripts/bp-checkpoint.pl";
 my $ORCH   = "$Bin/../../scripts/bp-orchestrator.pl";
@@ -73,22 +95,22 @@ sub run_child {
     close $fh;
     return ((defined $out ? $out : ''), ($? == -1 ? -1 : $? >> 8));
 }
-sub git_out { my ($dir, @args) = @_; return run_child('git', '-C', $dir, @args) }
+sub git_out { my ($dir, @args) = @_; return run_child('git', '-C', git_path($dir), @args) }
 sub run_cli { my (@args) = @_; return run_child($^X, $SCRIPT, @args) }
 
 # ---- git fixture helpers, copied from t/20-deps-check.t:49-63 --------------
 sub init_git {
     my ($dir) = @_;
-    system('git', '-C', $dir, 'init', '-q') == 0
+    system('git', '-C', git_path($dir), 'init', '-q') == 0
         or die "git init failed in $dir";
 }
 
 sub git_commit_all {
     my ($dir, $msg) = @_;
     $msg //= 'fixture commit';
-    system('git', '-C', $dir, 'add', '-A') == 0
+    system('git', '-C', git_path($dir), 'add', '-A') == 0
         or die "git add failed in $dir";
-    system('git', '-C', $dir, '-c', 'user.email=t@t', '-c', 'user.name=t',
+    system('git', '-C', git_path($dir), '-c', 'user.email=t@t', '-c', 'user.name=t',
            'commit', '-q', '-m', $msg) == 0
         or die "git commit failed in $dir";
 }

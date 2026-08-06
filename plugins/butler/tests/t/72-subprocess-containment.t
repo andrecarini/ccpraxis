@@ -42,7 +42,7 @@ diag("subject under test: $AUDIT "
 my %CLEAN_ENV = map { ($_ => $ENV{$_}) } grep { !/^(BP_|CCPRAXIS_)/ } keys %ENV;
 my $REAL_PATH = $CLEAN_ENV{PATH} // '/usr/bin:/bin';
 
-my $TEST_BASE = tempdir(DIR => '/root', CLEANUP => 1);
+my $TEST_BASE = tempdir((-d '/root' && -w '/root') ? (DIR => '/root') : (), CLEANUP => 1);
 my $rn = 0;
 
 # =====================================================================================
