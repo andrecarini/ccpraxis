@@ -84,6 +84,11 @@ my @DEFAULT_TRACKABLE = (
     '.ccpraxis-local-data/claude-home/plans',
     '.ccpraxis-local-data/claude-home/backpack.json',
     '.ccpraxis-local-data/blueprints',
+    # Raw operator feedback + its decomposition (/butler:feedback). Gitignored
+    # like blueprints, so the vault is its ONLY copy off this machine — and
+    # unlike a blueprint it cannot be re-derived from anything: the raw files
+    # are evidence of what was actually said, kept byte-for-byte on purpose.
+    '.ccpraxis-local-data/corrections',
     $HOST_MEMORY_REL,                          # host-side memory (synthetic; see local_abs)
 );
 
