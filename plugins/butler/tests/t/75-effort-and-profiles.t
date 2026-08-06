@@ -94,6 +94,17 @@ use File::Path qw(make_path);
 
 (my $ROOT_BUTLER = "$Bin/../..") =~ s{\\}{/}g;
 my $LAUNCH = "$ROOT_BUTLER/scripts/bp-launch.sh";
+
+# bp-launch.sh hard-requires jq (bp-lib.sh's require_cmd) and exits before doing
+# anything without it. jq ships in the container and not on the Windows host, so
+# on a host run every launch-driven assertion inverts: the positive ones fail
+# because nothing launched, and — worse — the NEGATIVE ones ("no --effort token",
+# "nothing was launched", "no pid file") PASS VACUOUSLY, for the wrong reason.
+# A group that can only pass vacuously is not coverage, so skip the whole thing
+# rather than bank the false green.
+my $HAVE_JQ = do { my $o = `jq --version 2>/dev/null`; (defined $o && $o =~ /jq/) ? 1 : 0 };
+my $NO_JQ   = 'jq is not installed on this host; bp-launch.sh exits at require_cmd, so no launch '
+            . 'happens and neither the positive NOR the negative assertions mean anything here';
 my $ORCH   = "$ROOT_BUTLER/scripts/bp-orchestrator.pl";
 (my $AUTH_SKILL   = "$Bin/../../../blueprint/skills/authoring-protocol/SKILL.md") =~ s{\\}{/}g;
 (my $CREATE_SKILL = "$Bin/../../../blueprint/skills/create/SKILL.md")             =~ s{\\}{/}g;
@@ -248,7 +259,8 @@ sub expected_baseline {   # today's exact command line, no effort anywhere
 # C1 + C2 + C3 (asserted together, per the vacuity gate above) — bp-launch.sh's
 # TWO real invocation sites, driven with a stub claude on PATH.
 # ===========================================================================
-{
+SKIP: {
+    skip $NO_JQ . ' (C1/C2/C3 NOT exercised)', 14 unless $HAVE_JQ;
     # Each of the four invocations below gets its OWN project/data dir (mk_bp_dir()) rather
     # than sharing one: bp-launch.sh's own count_running_global() counts every live PID
     # registered under $CCPRAXIS_DATA_DIR/blueprints/*/runs/registry.json, and the fake
@@ -333,7 +345,9 @@ sub expected_baseline {   # today's exact command line, no effort anywhere
 # ===========================================================================
 # C4 — an unknown effort value is refused, and NOTHING IS LAUNCHED.
 # ===========================================================================
-{
+SKIP: {
+    skip $NO_JQ . ' (C4 NOT exercised — its "nothing was launched" assertions would '
+       . 'pass vacuously, since nothing launches here for an unrelated reason)', 5 unless $HAVE_JQ;
     my ($proj, $data, $bp) = mk_bp_dir();
     mk_ledger($bp, 'p-bad', effort => 'totally-bogus-level-zz');
 

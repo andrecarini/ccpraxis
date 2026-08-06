@@ -24,6 +24,8 @@
 use strict;
 use warnings;
 use FindBin qw($Bin);
+use lib "$Bin/../lib";
+use HostCaps ();
 use Test::More;
 use File::Temp qw(tempdir);
 use File::Path qw(make_path remove_tree);
@@ -42,7 +44,22 @@ diag("subject under test: $AUDIT "
 my %CLEAN_ENV = map { ($_ => $ENV{$_}) } grep { !/^(BP_|CCPRAXIS_)/ } keys %ENV;
 my $REAL_PATH = $CLEAN_ENV{PATH} // '/usr/bin:/bin';
 
-my $TEST_BASE = tempdir((-d '/root' && -w '/root') ? (DIR => '/root') : (), CLEANUP => 1);
+# TEST_BASE must sit OUTSIDE /tmp, and that is a correctness requirement rather
+# than a preference. bp-containment-audit.pl's in_set() opens with
+#
+#     return 1 if $abs =~ m{^/tmp/};
+#
+# a deliberate exemption mirroring guard-writes.sh, so the hook and the audit
+# enforce one boundary. In the container the fixture lives under /root and the
+# exemption never fires. On a host, a bare tempdir() yields /tmp/XXXX -- and
+# then EVERY fixture file is exempt, the audit correctly reports nothing, and 11
+# assertions fail claiming "the audit is not live" when in truth the fixture had
+# placed itself inside the one directory the audit is contractually required to
+# ignore. HostCaps::tempdir_args() anchors in the native temp dir, whose absolute
+# form (C:/Users/.../Temp/...) does not match ^/tmp/.
+my $TEST_BASE = tempdir(
+    (-d '/root' && -w '/root') ? (DIR => '/root') : HostCaps::tempdir_args(),
+    CLEANUP => 1);
 my $rn = 0;
 
 # =====================================================================================

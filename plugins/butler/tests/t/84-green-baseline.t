@@ -48,6 +48,8 @@
 use strict;
 use warnings;
 use FindBin qw($Bin);
+use lib "$Bin/../lib";
+use HostCaps qw(chmod_works);
 use Test::More;
 use File::Temp qw(tempdir);
 use File::Path qw(make_path remove_tree);
@@ -242,19 +244,28 @@ my $bg_supported = ($^O eq 'linux' || $^O eq 'darwin') ? 1 : 0;
 # FIXTURE-SANITY
 # =====================================================================================
 {
+  SKIP: {
+    # No POSIX modes on this filesystem => the overlayfs-vs-9p distinction is
+    # unobservable here, not violated.
+    skip 'this filesystem does not carry POSIX modes, so overlayfs-vs-9p cannot be observed', 1
+        unless chmod_works();
     my $probe = "$TEST_BASE/chmod-probe.txt";
     write_file($probe, "x\n");
     chmod 0600, $probe;
     my $mode = (stat($probe))[2] & 07777;
     is(sprintf('%o', $mode), '600', 'FIXTURE-SANITY: TEST_BASE (under /root) honours chmod 600 -- confirms overlayfs, not 9p');
     unlink $probe;
+  }
 
     ok(-e $BP_CHECKPOINT, 'FIXTURE-SANITY: bp-checkpoint.pl (an Input this package reuses) exists on disk');
     ok(-e $BP_JAIL, 'FIXTURE-SANITY: bp-jail.pl (the other consumer, spec section 6.1) exists on disk');
     my ($ok_cm, $subj) = call_bpcheckpoint('commit_message', { pkg => 'pkgA', status => 'wip', step => 3 });
     ok($ok_cm, 'FIXTURE-SANITY: BpCheckpoint::commit_message is callable (existing, unaffected by b40)');
     is($subj, 'wip(pkgA): wip @ step 3', 'FIXTURE-SANITY: commit_message produces the documented wip(...) shape');
+  SKIP: {
+    skip "this OS ($^O) does not support the fork/kill protocol C8 uses", 1 unless $bg_supported;
     ok($bg_supported, 'FIXTURE-SANITY: this OS supports the fork/kill protocol used by C8');
+  }
 }
 
 # =====================================================================================
@@ -395,6 +406,17 @@ sub mk_baseline_fixture {
     git_cmd($proj, 'init', '-q');
     git_cmd($proj, 'config', 'user.email', 'bp-baseline-test@example.invalid');
     git_cmd($proj, 'config', 'user.name', 'bp-baseline-test');
+    # Pin line-ending conversion OFF in the fixture repo. bp-baseline.pl
+    # materializes with `git archive | tar -x`, and git archive applies
+    # EXPORT-TIME conversion per core.autocrlf. Git for Windows ships
+    # core.autocrlf=true at SYSTEM level, so the materialized tree came back
+    # holding "OK\r\n" while the fixture had written "OK\n" -- two assertions
+    # failed printing `got: 'OK'` against `expected: 'OK'`, identical on screen.
+    # The fixture must not inherit the host's git config: a baseline-materialization
+    # test is about content preservation, not about the reader's autocrlf setting.
+    # No-op in the container, where autocrlf is already off.
+    git_cmd($proj, 'config', 'core.autocrlf', 'false');
+    git_cmd($proj, 'config', 'core.eol', 'lf');
 
     write_file("$proj/pkgP/in.txt",        "P baseline\n");
     write_file("$proj/pkgP/nested/deep.txt", "P nested baseline\n");
@@ -607,9 +629,16 @@ sub baseline_ref_exists {
     my ($rc2, $out2, $err2) = run_baseline(
         ['materialize', '--package', 'P', '--dest', $dest_bad, '--blueprint', $blueprint],
         BP_PROJECT_ROOT => $proj, BP_WRITE_SET => 'pkgP');
+  SKIP: {
+    # The refusal being asserted is specifically "--dest is on v9fs". /project is
+    # the container's 9p bind mount; on a host there is no /project and no v9fs,
+    # so materialize has nothing to refuse and the negative case cannot be staged.
+    skip 'no /project v9fs mount on this host, so the v9fs refusal cannot be staged', 2
+        unless -d '/project';
     is($rc2, 3, 'C7 (counterpart): materialize --dest under /project (v9fs) refuses with exit 3')
         or diag("out=$out2 err=$err2");
     ok(!-e $dest_bad, 'C7: no tree was left behind under /project by the refused attempt');
+  }
     remove_tree($dest_bad, { safe => 0 }) if -e $dest_bad;
 
     remove_tree($dest_ok, { safe => 0 }) if -e $dest_ok;
@@ -821,9 +850,16 @@ sub baseline_ref_exists {
             or die "bash: $!";
         close $fh;
     }
+  SKIP: {
+    # Both C10 assertions drive `bp-jail.pl create`, which builds a Linux mount
+    # namespace. There is no jail to populate on this host, so neither the
+    # default nor the BP_BASELINE_TREE seam can be observed.
+    skip 'bp-jail.pl create requires Linux namespaces; the C10 baseline-tree seam is NOT exercised here', 1
+        unless $^O eq 'linux';
     is(-e "$jailroot_default/work/mine.txt" ? read_file("$jailroot_default/work/mine.txt") : undef,
        "PROJECT CONTENT\n",
        'C10: with BP_BASELINE_TREE unset, bp-jail.pl sources content from BP_PROJECT_ROOT exactly as today');
+  }
 
     my $jailroot_alt = "$TEST_BASE/jail-c10-alt";
     my $errfile2 = "$TEST_BASE/jail-c10-alt-err.txt";
@@ -837,10 +873,14 @@ sub baseline_ref_exists {
             or die "bash: $!";
         close $fh;
     }
+  SKIP: {
+    skip 'bp-jail.pl create requires Linux namespaces; the BP_BASELINE_TREE seam is NOT exercised here', 1
+        unless $^O eq 'linux';
     is(-e "$jailroot_alt/work/mine.txt" ? read_file("$jailroot_alt/work/mine.txt") : undef,
        "ALTERNATE BASELINE TREE CONTENT\n",
        'C10 (seam wiring, spec 6.1): with BP_BASELINE_TREE set to an existing directory, bp-jail.pl sources from THAT tree instead of BP_PROJECT_ROOT')
         or diag('this is the new consumer-side seam bp-jail.pl must add; currently unimplemented');
+  }
 
     local %ENV = (%CLEAN_ENV, PATH => $REAL_PATH);
     system('bash', '-c', 'exec timeout 10 "$0" teardown --package c10pkg-default --jail-root "$1" >/dev/null 2>&1',

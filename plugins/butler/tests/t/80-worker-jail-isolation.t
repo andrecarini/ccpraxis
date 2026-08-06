@@ -34,6 +34,8 @@
 use strict;
 use warnings;
 use FindBin qw($Bin);
+use lib "$Bin/../lib";
+use HostCaps qw(chmod_works);
 use Test::More;
 use File::Temp qw(tempdir);
 use File::Path qw(make_path remove_tree);
@@ -241,6 +243,12 @@ my $bg_supported = ($^O eq 'linux' || $^O eq 'darwin') ? 1 : 0;
 # jail-root assertion in this file).
 # =====================================================================================
 {
+  SKIP: {
+    # On a filesystem that carries no POSIX modes (NTFS via Git-Bash perl) this
+    # cannot distinguish overlayfs from 9p because it cannot observe a mode at
+    # all. That is missing coverage, not a broken fixture.
+    skip 'this filesystem does not carry POSIX modes, so the overlayfs-vs-9p '
+       . 'distinction cannot be observed here', 1 unless chmod_works();
     my $probe = "$TEST_BASE/chmod-probe.txt";
     write_file($probe, "x\n");
     chmod 0600, $probe;
@@ -248,6 +256,7 @@ my $bg_supported = ($^O eq 'linux' || $^O eq 'darwin') ? 1 : 0;
     is(sprintf('%o', $mode), '600', 'FIXTURE-SANITY: TEST_BASE (under /root) honours chmod 600 -- confirms overlayfs, not 9p')
         or diag("TEST_BASE=$TEST_BASE got mode=" . sprintf('%o', $mode));
     unlink $probe;
+  }
 
     my $proj = mk_fake_project();
     ok(-d "$proj/.git", 'FIXTURE-SANITY: mk_fake_project() produces a git repo');
@@ -260,9 +269,30 @@ my $bg_supported = ($^O eq 'linux' || $^O eq 'darwin') ? 1 : 0;
     unlike($status, qr/credentials|deploy_key|\.claude/, 'FIXTURE-SANITY: gitignored paths do not appear in git status at all');
     remove_tree($proj, { safe => 0 });
 
-    ok($bg_supported, 'FIXTURE-SANITY: this OS supports the fork/kill protocol used by C11')
-        or diag("bg_supported=$bg_supported \$^O=$^O");
+  SKIP: {
+    skip "this OS ($^O) does not support the fork/kill protocol C11 uses", 1 unless $bg_supported;
+    ok($bg_supported, 'FIXTURE-SANITY: this OS supports the fork/kill protocol used by C11');
+  }
 }
+
+# =====================================================================================
+# EVERYTHING BELOW EXERCISES bp-jail.pl FOR REAL, and bp-jail.pl is Linux-only by
+# construction: it asserts over uid, CapEff, mount namespaces and POSIX file modes.
+# None of those exist on a Windows host -- `cat` cannot be denied by a permission
+# bit the filesystem does not store, and there is no capability set to be empty.
+#
+# Run here unguarded, C1-C13 produced 49 failures that all said "the jail does not
+# isolate" when the truth was "there is no jail here to test". A single skip states
+# the second thing. The structural groups above still run, so the file keeps its
+# real host-side coverage (46 assertions) instead of being skip_all'd wholesale.
+#
+# The count is nominal -- this file uses done_testing(), not a fixed plan.
+# =====================================================================================
+my $JAIL_RUNNABLE = ($^O eq 'linux') && chmod_works();
+SKIP: {
+    skip 'bp-jail.pl requires Linux namespaces, uid/capability separation and POSIX file '
+       . 'modes; none are available on this host, so C1-C13 are NOT exercised here', 49
+        unless $JAIL_RUNNABLE;
 
 # =====================================================================================
 # C1 (DC-1) -- a jailed command cannot stat/read/glob claude-home/.credentials.json.
@@ -913,5 +943,7 @@ PROBE
     File::Path::remove_tree($jailroot) if -e $jailroot;
     File::Path::remove_tree($proj)     if -e $proj;
 }
+
+}   # end SKIP: the bp-jail.pl behaviour section (C1-C13)
 
 done_testing();

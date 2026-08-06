@@ -63,6 +63,18 @@
 use strict;
 use warnings;
 use FindBin qw($Bin);
+use lib "$Bin/../lib";
+use HostCaps qw(chmod_works);
+
+# The credential-file feature is defined in terms of POSIX permission bits: a
+# 0600 file is trusted, anything looser is refused. On a filesystem that stores
+# no modes (NTFS through Git-Bash perl) chmod 0600 does not take, so the
+# production code CORRECTLY refuses the file and every positive-control
+# assertion inverts. The refusal is right; the property is simply unobservable
+# here. Gate the positive controls rather than reporting a defect.
+my $MODES = chmod_works();
+my $NO_MODES = 'this filesystem stores no POSIX permission bits, so a 0600 credential file '
+             . 'cannot be created or trusted here -- the positive control is unobservable';
 use Test::More;
 use File::Temp qw(tempdir tempfile);
 use File::Spec;
@@ -421,7 +433,10 @@ HTML
                                      env => {}, fallback_path => $insecure_path);
     });
     my $r2 = $res2 ? $res2->[0] : undef;
+  SKIP: {
+    skip $NO_MODES, 1 unless $MODES;
     is(ref($r2) eq 'HASH' ? $r2->{ok} : undef, 1, 'C5 control: the SAME file at mode 0600 is accepted');
+  }
 }
 
 # =====================================================================================
@@ -765,11 +780,14 @@ HTML
                                      fallback_path => $file_path);
     });
     my $r2 = $res2 ? $res2->[0] : undef;
+  SKIP: {
+    skip $NO_MODES, 3 unless $MODES;
     is(ref($r2) eq 'HASH' ? $r2->{ok} : undef, 1,
        'C12 positive: with a 0600 file present it resolves from the file (both env-removed and file-still-works, or neither)');
     is(ref($r2) eq 'HASH' ? $r2->{source} : undef, 'file', 'C12 positive: the resolution source is "file", never "env"');
     is(ref($r2) eq 'HASH' ? $r2->{cookie} : undef, 'file-sourced-cookie-value',
        'C12 positive: the resolved cookie is the FILE value, not the must-be-ignored env value');
+  }
 }
 
 # =====================================================================================
@@ -909,7 +927,10 @@ HTML
     if (-e $path) {
         my @st = stat($path);
         my $mode = @st ? ($st[2] & 07777) : undef;
+      SKIP: {
+        skip $NO_MODES, 1 unless $MODES;
         is($mode, 0600, 'C16: the written snapshot file is mode 0600');
+      }
     } else {
         fail('C16: the written snapshot file is mode 0600');
     }
@@ -947,6 +968,8 @@ HTML
     if (-e $path) {
         my @st = stat($path);
         my $mode = @st ? ($st[2] & 07777) : undef;
+      SKIP: {
+        skip $NO_MODES, 3 unless $MODES;
         is($mode, 0600, 'C17 positive: the created credential file is mode 0600 (created that way, per spec 3)');
 
         my ($res) = try_call('BpSpend::resolve_credential (after bp-spend-auth.pl STDIN store)', sub {
@@ -956,6 +979,7 @@ HTML
         my $r = $res ? $res->[0] : undef;
         is(ref($r) eq 'HASH' ? $r->{ok} : undef, 1, 'C17 positive: the STDIN-stored cookie resolves successfully afterwards');
         is(ref($r) eq 'HASH' ? $r->{cookie} : undef, $COOKIE, 'C17 positive: the resolved cookie value matches what was fed on STDIN');
+      }
     } else {
         fail('C17 positive: the created credential file is mode 0600');
         fail('C17 positive: the STDIN-stored cookie resolves successfully afterwards');
