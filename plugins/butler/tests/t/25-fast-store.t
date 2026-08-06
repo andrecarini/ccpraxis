@@ -49,6 +49,18 @@
 use strict;
 use warnings;
 use FindBin qw($Bin);
+use lib "$Bin/../lib";
+use HostCaps qw(chmod_works);
+
+# Can the script under test even START with $EMPTY_PATH? bp-fast-store.sh's
+# shebang is `#!/usr/bin/env bash`, so an empty PATH has to still let env find
+# bash. VERIFIED BOTH WAYS: inside the sandbox container the script starts and
+# reaches its own require_cmd, giving the documented exit 3; on the Windows host
+# `/usr/bin/env bash` returns 127 and the script never runs, so "aborts with exit
+# 3" describes something that never got the chance to happen. Probe it rather
+# than assume either outcome — the assertions are about the SCRIPT's refusal, and
+# an interpreter that cannot launch is not that.
+my $EMPTY_PATH_STARTS;   # set after $EMPTY_PATH exists; see below
 use Test::More;
 use File::Temp qw(tempdir);
 use File::Path qw(make_path);
@@ -116,6 +128,20 @@ my $STUB_WITNESS = "$ROOT/pnpm-was-executed";
 my $EMPTY_PATH   = "$ROOT/empty-path";                  # AC-12: PATH with nothing in it
 my $CHILD_CWD    = "$ROOT/cwd";                         # every child runs here, never in /project
 make_path($STUB_DIR, $EMPTY_PATH, $CHILD_CWD);
+
+# Probe now that $EMPTY_PATH exists: run a trivial `#!/usr/bin/env bash` script
+# under it. 127 means the interpreter could not be resolved, so nothing the
+# script would have done is observable.
+$EMPTY_PATH_STARTS = do {
+    my $probe = "$ROOT/env-probe.sh";
+    if (open(my $ph, '>', $probe)) {
+        print {$ph} "#!/usr/bin/env bash\nexit 42\n";
+        close $ph;
+    }
+    chmod 0755, $probe;
+    system("PATH=" . quotemeta($EMPTY_PATH) . " " . quotemeta($probe) . " >/dev/null 2>&1");
+    (($? >> 8) == 42) ? 1 : 0;
+};
 
 # --- coordinator adjudication (b06, 2026-07-25) -----------------------------
 # AC-12 specifies a "truly empty" PATH. That is unrunnable as written, for two
@@ -609,6 +635,9 @@ subtest 'AC-11 backpack line survives shell word-splitting without expansion' =>
 
 # --- AC-12 ------------------------------------------------------------------
 subtest 'AC-12 pnpm missing aborts with exit 3 and no side effects' => sub {
+    plan skip_all => 'an empty PATH cannot resolve the #!/usr/bin/env bash interpreter on this host '
+                   . '(127), so the script never runs and its own exit-3 refusal is unobservable'
+        unless $EMPTY_PATH_STARTS;
     my $proj = mk_proj('nopnpm');
     my $P    = abs_path($proj);
     my $nat  = mk_native();
@@ -631,6 +660,8 @@ subtest 'AC-12 pnpm missing aborts with exit 3 and no side effects' => sub {
 
 # --- AC-13 ------------------------------------------------------------------
 subtest 'AC-13 pnpm PATH stub satisfies the real command -v check' => sub {
+    plan skip_all => 'an empty PATH cannot resolve the #!/usr/bin/env bash interpreter on this host (127)'
+        unless $EMPTY_PATH_STARTS;
     my $proj = mk_proj('pathstub');
     my $nat  = mk_native();
     my @args = ('--project', $proj, '--native-root', $nat);
@@ -1159,10 +1190,17 @@ subtest 'AC-31 write_atomic preserves the destination file mode' => sub {
 
     my ($rc, $out, $err) = run_fs(args => ['--project', $p, '--native-root', mk_native()]);
     is($rc, 0, 'AC-31: the run succeeds') or diag($err);
+  SKIP: {
+    # Mode PRESERVATION cannot be observed where modes are not stored: the
+    # fixture's own chmod 0600/0640 does not take, so there is no mode to
+    # preserve and no mode to read back.
+    skip 'this filesystem stores no POSIX permission bits, so mode preservation is unobservable', 2
+        unless chmod_works();
     is((stat("$p/pnpm-workspace.yaml"))[2] & 07777, 0600,
        'AC-31: a 0600 pnpm-workspace.yaml is still 0600 after the rewrite (not world-readable)');
     is((stat("$p/.gitignore"))[2] & 07777, 0640,
        'AC-31: a 0640 .gitignore keeps its mode');
+  }
     like(slurp("$p/pnpm-workspace.yaml"), qr/SECRET-package-name/, 'AC-31: the preserved content is still there');
     unlike($out, qr/SECRET/, 'AC-31: the sensitive content never reaches stdout');
     unlike($err, qr/SECRET/, 'AC-31: the sensitive content never reaches stderr');

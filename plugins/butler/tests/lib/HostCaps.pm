@@ -27,7 +27,7 @@ use warnings;
 
 use Exporter 'import';
 our @EXPORT_OK = qw(
-    same_path
+    same_path signal_status_visible
     symlink_works chmod_works signals_work have_jq
     data_dir_ancestor native_tmp tempdir_args git_path
 );
@@ -185,6 +185,33 @@ sub signals_work {
 }
 # _exit without running END blocks (which would delete the caller's tempdirs).
 sub POSIX_exit { eval { require POSIX; POSIX::_exit(0) }; exit 0 }
+
+# --- signal_status_visible -------------------------------------------------
+#
+# Narrower than signals_work(), and the difference matters. signals_work()
+# probes perl's own fork/kill/waitpid, which SUCCEEDS under MSYS. What several
+# oracles actually depend on is different: spawn a shell-script child that kills
+# ITSELF, and read a signal wait-status back through system(). Under MSYS that
+# round trip does not survive — the parent sees an ordinary non-zero exit rather
+# than ($? & 127), so a "$? >> 8 reads SIGKILL as 0" regression test cannot
+# distinguish the bug from the fix.
+#
+# Probe the exact mechanism, not a nearby one: a self-killing shell script,
+# observed through system().
+sub signal_status_visible {
+    return $cache{sigstat} if exists $cache{sigstat};
+    $cache{sigstat} = 0;
+    my $probe = tempdir(tempdir_args(), CLEANUP => 1);
+    my $sh = File::Spec->catfile($probe, 'selfkill.sh');
+    if (open my $fh, '>', $sh) {
+        print {$fh} "#!/bin/sh\nkill -KILL \$\$\nsleep 5\n";
+        close $fh;
+        chmod 0755, $sh;
+        system('/bin/sh', $sh);
+        $cache{sigstat} = (($? != -1) && (($? & 127) == 9)) ? 1 : 0;
+    }
+    return $cache{sigstat};
+}
 
 # --- have_jq ---------------------------------------------------------------
 #

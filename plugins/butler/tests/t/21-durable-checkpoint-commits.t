@@ -61,6 +61,14 @@ my $TDIR   = "$Bin";
 use constant EPOCH  => 1785000000;              # 2026-07-25T17:20:00Z
 use constant EPOCH_ISO => '2026-07-25T17:20:00Z';
 
+use Config ();
+# Absolute path to this perl, for shebang lines in generated scripts. NOT $^X:
+# on Git-for-Windows perl $^X is the bare string "perl", so `#!perl` is not a
+# resolvable interpreter and git refuses the hook outright with
+# "cannot spawn .git/hooks/pre-commit: No such file or directory". Config's
+# perlpath is absolute on every platform this suite runs on.
+my $PERL = $Config::Config{perlpath};
+
 # ---------------------------------------------------------------------------
 # Call guards (t/20-orchestrator-broken-env-turns.t:30-32)
 # ---------------------------------------------------------------------------
@@ -449,7 +457,7 @@ is(cmsg({ pkg => 'p', status => "run\nning", step => 4 }), 'wip(p): unknown @ st
     my $dir = mk_repo(files => { 'src/in.txt' => "a\n" });
     my $hook = "$dir/.git/hooks/pre-commit";
     make_path("$dir/.git/hooks") unless -d "$dir/.git/hooks";
-    spit($hook, "#!$^X\nprint STDERR \"pre-commit says no\\n\";\nexit 1;\n");   # no bash in this container
+    spit($hook, "#!$PERL\nprint STDERR \"pre-commit says no\\n\";\nexit 1;\n");   # no bash in this container
     chmod 0755, $hook;
     write_rel($dir, 'src/in.txt', "a\ndirty\n");
     my $before = count_commits($dir);

@@ -32,6 +32,8 @@
 use strict;
 use warnings;
 use FindBin qw($Bin);
+use lib "$Bin/../lib";
+use HostCaps ();
 use Test::More;
 use File::Temp qw(tempdir);
 use POSIX qw(WNOHANG);
@@ -151,7 +153,15 @@ sub _mk_path_without_opencode {
     }
     return $dir;
 }
-my $PATH_WITHOUT_FAKE = _mk_path_without_opencode($REAL_PATH);
+# Only attempt the PATH mirror where symlink() works. See the same guard and the
+# same reasoning in t/81: this helper symlinks EVERY entry of EVERY PATH
+# directory, which on Windows means tens of thousands of failing calls against
+# System32 — 15+ minutes at file scope, before a single assertion, looking for
+# all the world like a deadlock. Without symlinks the mirror would be empty
+# anyway, i.e. not a PATH-minus-one-binary but a PATH with nothing on it.
+my $PATH_WITHOUT_FAKE = HostCaps::symlink_works()
+    ? _mk_path_without_opencode($REAL_PATH)
+    : undef;
 
 # =====================================================================================
 # Scaffolding: BP_DIR fixture builders.
@@ -302,9 +312,18 @@ sub nonblank_lines { return grep { /\S/ } split /\n/, $_[0] }
     my $pkgmd = read_file($lp);
     like($pkgmd, qr/\A---\n/, 'FIXTURE-SANITY: package ledger opens with --- frontmatter');
     ok(-x $FAKE_OPENCODE, 'FIXTURE-SANITY: fake opencode is executable');
-    ok($have_jq, 'FIXTURE-SANITY: jq is available on this host (A7 byte-identity group will run)');
-    ok($bg_supported, 'FIXTURE-SANITY: this OS supports the fork/kill protocol used by A7/A13')
-        or diag("bg_supported=$bg_supported \$^O=$^O");
+    # Both of these are preconditions for LATER groups, which already skip
+    # themselves when unmet. Asserting them here turned an absent dependency
+    # into a reported defect; a skip names the coverage that was lost instead.
+  SKIP: {
+    skip 'jq is not installed on this host -- the A7 byte-identity group is NOT exercised', 1
+        unless $have_jq;
+    pass('FIXTURE-SANITY: jq is available on this host (A7 byte-identity group will run)');
+  }
+  SKIP: {
+    skip "this OS ($^O) does not support the fork/kill protocol A7/A13 use", 1 unless $bg_supported;
+    pass('FIXTURE-SANITY: this OS supports the fork/kill protocol used by A7/A13');
+  }
 }
 
 # =====================================================================================
@@ -752,6 +771,15 @@ SKIP: {
     }
 
     # Resolved-but-absent backend binary: worker_backend: opencode, PATH without the fake bin.
+  SKIP: {
+    # Without symlinks there is no opencode-free PATH to hand over; passing the
+    # undef through would set an EMPTY PATH, and the child then cannot find bash
+    # at all ("Can't exec bash"), which killed the file after 141 green
+    # assertions. The scenario under test is "the backend binary is missing from
+    # an otherwise working PATH" — an unusable PATH is a different scenario.
+    skip 'no opencode-free PATH could be built here (symlinks unavailable), so the '
+       . 'resolved-but-absent-binary case is NOT exercised', 5
+        unless defined $PATH_WITHOUT_FAKE;
     my ($bpX, $projX) = mk_bp('opencode');
     my $pkgX = 'b32-a16-nobin';
     my $lpX = add_pkg($bpX, $pkgX, undef);
@@ -761,6 +789,7 @@ SKIP: {
                                           env_for($bpX, $projX, $pkgX), PATH => $PATH_WITHOUT_FAKE);
     is($rcX, 8, 'A16: opencode resolved but absent from PATH -> exit 8');
     assert_a16_no_side_effects('A16 (backend binary absent)', $bpX, $pkgX, $lpX, $ledgerX_before);
+  }
 }
 
 done_testing();

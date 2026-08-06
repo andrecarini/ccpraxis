@@ -35,6 +35,8 @@
 use strict;
 use warnings;
 use FindBin qw($Bin);
+use lib "$Bin/../lib";
+use HostCaps ();
 use Test::More;
 use File::Temp qw(tempdir);
 use File::Path qw(make_path remove_tree);
@@ -382,7 +384,18 @@ sub _mk_path_without_opencode {
     }
     return $dir;
 }
-my $PATH_WITHOUT_OPENCODE = _mk_path_without_opencode($REAL_PATH);
+# Only attempt the PATH mirror where symlink() actually works.
+#
+# This helper walks EVERY directory on PATH and symlinks EVERY entry. On Linux
+# that is a few hundred cheap calls. On Windows the PATH includes System32 and
+# friends — tens of thousands of files — and every symlink() fails slowly. The
+# result was not a hang but a crawl: the file spent 15+ minutes here, at FILE
+# SCOPE, before reaching a single E6 assertion, and looked exactly like a
+# deadlock. (It is also pointless there: without symlinks the mirror would be an
+# empty directory, i.e. a PATH with nothing on it.)
+my $PATH_WITHOUT_OPENCODE = HostCaps::symlink_works()
+    ? _mk_path_without_opencode($REAL_PATH)
+    : undef;
 
 # Short-circuit once the backend dispatch is shown not to work on this host.
 #
@@ -474,6 +487,9 @@ sub run_worker {
     my ($rc, $out, $err) = run_worker(['--worker', 'implementer', '--prompt-file', $pf],
                                        env_for($bp, $proj, $pkg), FAKE_EXIT => 0,
                                        FAKE_NDJSON_FILE => fwd($ndjson_file));
+  SKIP: {
+    skip 'bp-worker.pl dispatch does not run on this platform (see $DISPATCH_DEAD) -- '
+       . 'E6 NDJSON reduction is NOT exercised here', 6 if $DISPATCH_DEAD;
     is($rc, 0, 'E6: the NDJSON-emitting backend still exits 0');
     my @lines = split /\n/, $out;
     ok(scalar(@lines) <= 15, 'E6: stdout is <=15 lines regardless of a 30-event NDJSON stream')
@@ -490,6 +506,7 @@ sub run_worker {
         like($report_content, qr/final answer line 1\b/,
             'E6: the report file contains the final assistant text (the LAST "text" part)');
     }
+  }
 }
 
 # =====================================================================================
@@ -551,11 +568,19 @@ sub run_worker {
     my $pf = write_prompt("e8 prompt\n");
     my ($rc, $out, $err) = run_worker(['--worker', 'implementer', '--prompt-file', $pf],
                                        env_for($bp, $proj, $pkg), PATH => $PATH_WITHOUT_OPENCODE);
+  SKIP: {
+    # Two independent reasons this cannot run here, and either alone is enough:
+    # the dispatch never completes, and $PATH_WITHOUT_OPENCODE is undef because
+    # building it needs working symlinks.
+    skip 'no opencode-free PATH could be built (symlinks unavailable) and dispatch does not run '
+       . 'on this platform -- E8 backend-missing handling is NOT exercised here', 4
+        if $DISPATCH_DEAD || !defined $PATH_WITHOUT_OPENCODE;
     is($rc, 8, 'E8: opencode resolved as backend but absent from PATH -> exit 8');
     like($err, qr/opencode/, 'E8: the message names opencode');
     like($err, qr/install|backpack|Containerfile/i,
         'E8: the message is ACTIONABLE -- it hints how to fix it (install/backpack/Containerfile), not a bare "not found"');
     ok(!-e marker_path_for($bp, $pkg), 'E8: no marker is left behind');
+  }
 }
 
 # =====================================================================================
@@ -789,6 +814,9 @@ sub run_worker {
         ['--worker', 'implementer', '--prompt-file', $pf_auth],
         env_for($bp, $proj, $pkg), FAKE_EXIT => 1,
         FAKE_STDERR_TEXT => 'Error: 401 Unauthorized - invalid or missing credentials for provider anthropic');
+  SKIP: {
+    skip 'bp-worker.pl dispatch does not run on this platform -- E14 failure classification is '
+       . 'NOT exercised here', 6 if $DISPATCH_DEAD;
     is($rc_auth, 7, 'E14: the auth-failure-shaped backend still exits 7 (existing failure contract)');
     like($out_auth . $err_auth, qr/^reason:\s*\S+/mi,
         'E14: a distinguishable `reason:` classification field is present for the auth-failure case')
@@ -818,6 +846,7 @@ sub run_worker {
         like($reason_rate, qr/rate|429|throttle|limit/i,
             'E14: the rate-limit reason token is semantically a rate-limit classification');
     }
+  }
 }
 
 done_testing();

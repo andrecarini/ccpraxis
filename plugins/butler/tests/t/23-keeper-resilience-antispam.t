@@ -16,6 +16,16 @@
 use strict;
 use warnings;
 use FindBin qw($Bin);
+use lib "$Bin/../lib";
+use HostCaps qw(chmod_works);
+
+# The R1 group induces a deterministic close()-time EFBIG by capping RLIMIT_FSIZE
+# with prlimit(1) (util-linux). Without prlimit no cap is set, the write simply
+# SUCCEEDS, and the assertions invert: "atomic_writeback dies" fails because
+# nothing made it die, and "the creds file is byte-identical" fails because the
+# write it was supposed to be protected from went through normally. Probe for the
+# tool rather than the platform — it is the actual dependency.
+my $HAVE_PRLIMIT = do { my $o = `prlimit --version 2>/dev/null`; (defined $o && $o =~ /\S/) ? 1 : 0 };
 use Test::More;
 use JSON::PP;
 use File::Temp qw(tempdir);
@@ -484,7 +494,11 @@ sub bad_creds_fixtures {
 
     ok($ok2, 'AC-11 _inplace_overwrite creates an absent path with the default opener');
     is(slurp_raw($c2), 'CREATED-BYTES-XYZ', 'AC-11 absent path: file created with exactly the given bytes');
+  SKIP: {
+    skip 'this filesystem stores no POSIX permission bits, so the created mode is unobservable', 1
+        unless chmod_works();
     is(mode_of($c2), 0600, 'AC-11 absent path: file created with mode 0600');
+  }
 }
 
 # ===========================================================================
@@ -530,8 +544,12 @@ sub bad_creds_fixtures {
         sub { BpKeeper::atomic_writeback($c, $resp, 'sk-ant-OLDREF-bbbbbbbbbbbbbbbbbbbb', $NOW_MS); },
     );
 
+  SKIP: {
+    skip 'prlimit(1) is unavailable, so no RLIMIT_FSIZE cap was applied and the write did not '
+       . 'fail — the mid-write-failure behaviour is NOT exercised here', 1 unless $HAVE_PRLIMIT;
     is($p->{died}, 1,
        'R1 atomic_writeback dies when the INITIAL temp-file close() fails mid-write (EFBIG via a per-child RLIMIT_FSIZE, never applied to the test runner itself)');
+  }
 
     my ($residue_file) = grep { -f $_ } glob("$c.tmp*");
     ok(!defined($residue_file), 'R1 INV-W1: no $path.tmp.* file survives the failed initial temp write')
@@ -544,7 +562,11 @@ sub bad_creds_fixtures {
     ok(!defined($residue_file) || (mode_of($residue_file) & 077) == 0,
        'R1 SECURITY: any surviving temp residue is not group/world-readable (no wide-mode window survives)');
 
+  SKIP: {
+    skip 'prlimit(1) unavailable: the write SUCCEEDED rather than failing, so "unchanged after a '
+       . 'failed write" has no failed write to be unchanged after', 1 unless $HAVE_PRLIMIT;
     is(slurp_raw($c), $before, 'R1 the real creds file is byte-identical after the failed initial temp write (only the orphan is at risk, not the target)');
+  }
     is(mode_of($c), $before_mode, 'R1 the real creds file mode is unchanged after the failed initial temp write');
 }
 

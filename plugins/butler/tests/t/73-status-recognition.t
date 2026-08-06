@@ -33,7 +33,15 @@ my $have_jq = do { my $o = `bash -c 'command -v jq' 2>/dev/null`; $o =~ /\S/ ? 1
 # 80 total: 71 inside the jq-gated SKIP (T1-T18, incl. the T12/T18 stray-name loops of 3 each,
 # plus the T21 embedded-newline-stray regression of 2) + 9 inside the nested live-regression
 # SKIP (T19: 5, T20: 4). Both halves are fixed-length (no randomness), so this count is stable.
-plan tests => 80;
+# Single source of truth for the count. EVERY assertion in this file lives inside
+# the one jq SKIP block below, so the skip count and the plan must be the same
+# number — and they had drifted: the plan said 80 while the skip said 71, so a
+# jq-less host ran 71 of 80 and died with "planned 80 but ran 71". Nine
+# assertions had been added inside the block without the skip count following.
+# Binding both to $PLANNED makes that particular drift impossible rather than
+# merely fixed once.
+my $PLANNED = 80;
+plan tests => $PLANNED;
 
 sub fwd { (my $p = shift) =~ s{\\}{/}g; return $p; }
 
@@ -161,7 +169,8 @@ sub last_index_matching {
 
 # =========================================================================================
 SKIP: {
-    skip "jq not available on this host (bp-status.sh calls require_cmd jq before anything else runs)", 71
+    skip "jq not available on this host (bp-status.sh calls require_cmd jq before anything else runs)",
+         $PLANNED
         unless $have_jq;
 
     # =====================================================================================

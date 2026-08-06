@@ -633,8 +633,17 @@ sub baseline_ref_exists {
     # The refusal being asserted is specifically "--dest is on v9fs". /project is
     # the container's 9p bind mount; on a host there is no /project and no v9fs,
     # so materialize has nothing to refuse and the negative case cannot be staged.
-    skip 'no /project v9fs mount on this host, so the v9fs refusal cannot be staged', 2
-        unless -d '/project';
+    # -d '/project' is NOT enough: the container image carries a plain /project
+    # directory even when nothing is bind-mounted there, and the refusal under
+    # test is specifically about v9fs. Check the filesystem type, the same way
+    # t/80's C12 does, so this gate is right on a host (no /project at all), in
+    # a real sandbox (/project IS v9fs -> runs), and in a bare container run
+    # (/project exists but is not v9fs -> skips instead of failing).
+    my $proj_fstype = -d '/project' ? `stat -f -c %T /project 2>/dev/null` : '';
+    $proj_fstype =~ s/\s+\z//;
+    skip "no /project v9fs mount here (fstype='" . ($proj_fstype || 'absent')
+       . "'), so the v9fs refusal cannot be staged", 2
+        unless $proj_fstype eq 'v9fs';
     is($rc2, 3, 'C7 (counterpart): materialize --dest under /project (v9fs) refuses with exit 3')
         or diag("out=$out2 err=$err2");
     ok(!-e $dest_bad, 'C7: no tree was left behind under /project by the refused attempt');
