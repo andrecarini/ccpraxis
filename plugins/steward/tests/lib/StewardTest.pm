@@ -137,19 +137,32 @@ sub init_remote {
     return $remote;
 }
 
-# Run vault-sync.pl as a subprocess under the given fake HOME. Returns a hashref
-# { out => raw_stdout, exit => code, json => decoded_or_undef }.
-# Ensure MSYS path conversion is ON for native-git argv, even if the ambient
-# shell set MSYS2_ARG_CONV_EXCL=* (the CLAUDE.md belt-and-suspenders). vault-sync.pl
-# passes git /c/... paths and relies on the /c/->C:\ rewrite; with conversion
-# disabled, native git cannot resolve /c/ at all. We scope the un-set to the child.
+# Force MSYS path conversion ON for the current process, even when the ambient
+# shell set MSYS2_ARG_CONV_EXCL=*. Used by _run() — the harness's OWN native-git
+# calls (init_remote's `git init --bare`, etc.), which pass POSIX /c/... paths
+# straight through. With conversion off, native git resolves the leading `/`
+# against the current drive and SILENTLY CREATES C:\c\Users\... instead of
+# failing; that is the 2026-06-12 drive-root leak, guarded by
+# t/09-no-drive-root-strays.t. Callers scope this with `local %ENV`.
+#
+# NOT used by run_vs — see the note there; vault-sync.pl defends itself by a
+# different mechanism and is deliberately left exposed to the ambient value.
 sub _msys_convert_on { delete $ENV{MSYS2_ARG_CONV_EXCL} }
 
 sub run_vs {
     my ($home, @args) = @_;
-    # NOTE: we deliberately do NOT scrub MSYS2_ARG_CONV_EXCL here — vault-sync.pl
-    # un-sets it itself now (it must, since it passes git POSIX paths). Leaving the
-    # ambient value (which may be '*') in place is what proves the script's own fix.
+    # NOTE: we deliberately do NOT scrub MSYS2_ARG_CONV_EXCL here. Leaving the
+    # ambient value (which may be '*') in place is what proves vault-sync.pl's own
+    # defence — so scrubbing it would hide exactly the regression we care about.
+    #
+    # That defence is git_path() (vault-sync.pl), which rewrites /c/... -> C:/...
+    # before every git call. It does NOT un-set MSYS2_ARG_CONV_EXCL, and an earlier
+    # version of this comment claiming it did was describing a superseded approach.
+    # The distinction matters: git_path() makes the script correct under EITHER
+    # conversion state, whereas un-setting the variable would only work when the
+    # script controls the environment. `git.exe` accepts the C:/ form whether or
+    # not MSYS later rewrites it, and a lone drive path is never split like a
+    # `:`-separated list.
     local $ENV{HOME}              = $home;
     local $ENV{USERPROFILE}       = $home;
     local $ENV{GIT_CONFIG_GLOBAL} = "$home/.gitconfig";

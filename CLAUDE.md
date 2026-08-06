@@ -108,9 +108,16 @@ These have each cost real debugging time. Details in the user-global `CLAUDE.md`
 - **Never reopen STDOUT/STDERR onto an in-memory scalar** — Git-for-Windows perl fails with
   "Bad file descriptor", surfacing as a bare `Died at … line N`. Capture via `File::Temp`.
 - **MSYS2 mangles `:`-separated args** passed to native Windows binaries (`podman -v HOST:CONTAINER`
-  becomes `HOST;CONTAINER`). Any perl script spawning a native binary must set
-  `$ENV{MSYS2_ARG_CONV_EXCL} = '*'` on Windows — *or* hand-translate to forward-slash Windows paths,
-  which `podman.exe` and `git.exe` both accept directly. Symptom: stray directories ending in `;C`.
+  becomes `HOST;CONTAINER`). Symptom: stray directories ending in `;C`.
+  Two fixes, and they are **not** alternatives to pick freely:
+  - **Hand-translate** to forward-slash Windows paths (`/c/x` → `C:/x`), which `podman.exe` and
+    `git.exe` both accept directly. Correct under *either* conversion state — prefer it. See
+    `winify_path` (launcher) and `git_path` (`vault-sync.pl`).
+  - **Set `$ENV{MSYS2_ARG_CONV_EXCL} = '*'`** on Windows — but only *together with* the translation
+    above. Disabling conversion while still passing bare `/c/...` is its own bug with the opposite
+    symptom: Windows resolves the leading `/` against the current drive, so the path is silently
+    created at the **drive root** as `C:\c\...`. That cost 576 stray entries on 2026-06-12; see
+    `plugins/steward/tests/t/09-no-drive-root-strays.t`. Never set the variable shell-wide.
 - **Paths contain non-ASCII** (`André`). Nothing may assume ASCII paths. Round-trip registry values
   as UTF-8 bytes; never re-encode something already decoded.
 - **`podman machine set --disk-size` does not work here** — it exits 125 with *"changing disk size

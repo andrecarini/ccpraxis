@@ -65,15 +65,28 @@ When Git-for-Windows perl (or any MSYS2-based tool) spawns a **native Windows** 
 
 **Symptom to look for:** stray directories on disk with names ending in `;C` (e.g. `.claude.json;C`, `.launcher;C`). They appear next to the file the launcher was trying to mount, and the in-container side of the mount comes up empty or wrong (onboarding screens, missing CLAUDE.md, etc.).
 
+**The opposite symptom — a POSIX path reaching a native binary UNCONVERTED:** directories mirroring
+POSIX paths at the **drive root**, i.e. `C:\c\Users\...` or `C:\tmp\...`. Windows resolves a leading
+`/` against the current drive, so a native binary handed `/c/Users/Public/x` silently creates
+`C:\c\Users\Public\x`. This is what over-applying the prevention below causes, and it is as real as
+the `;C` bug: on 2026-06-12 it left 576 entries at this machine's drive root, including a working
+bare git repo under `C:\c\Users\Public\`.
+
 **Deterministic prevention** (in priority order):
 
 1. **In every perl script that spawns native Windows commands**, set `$ENV{MSYS2_ARG_CONV_EXCL} = '*' if $^O =~ /^(MSWin32|cygwin|msys)$/;` near the top. This disables path translation for the whole process tree. `podman.exe` accepts forward-slash Windows paths (`C:/Users/...`) directly, so nothing downstream needs the MSYS2 layer — we hand-translate POSIX-style host paths to that form ourselves via `winify_path` in the launcher.
 2. **For one-off invocations**, scope it: `local $ENV{MSYS2_ARG_CONV_EXCL} = '*'; system(...);`.
-3. **As a belt-and-suspenders user-level safety net**, the user can also set `MSYS2_ARG_CONV_EXCL=*` in their PowerShell `$PROFILE` and `.bashrc`, so every shell session inherits it. This catches third-party scripts that didn't know to set it themselves.
+3. **⚠️ Do NOT set `MSYS2_ARG_CONV_EXCL=*` shell-wide** — not in PowerShell `$PROFILE`, not in `.bashrc`, not in the Windows user environment.
+
+   This file previously recommended exactly that, as a "belt-and-suspenders safety net" that would "catch third-party scripts that didn't know to set it themselves". **That rationale is backwards.** A script that doesn't know to disable conversion is also a script that doesn't hand-translate its own paths — so it *depends* on the conversion. Disabling it globally does not protect such a script; it is precisely what breaks it. Rules 1 and 2 are safe only because a script that opts out also translates its own paths (`winify_path`, `git_path`). The opt-out and the translation are one technique, and splitting them is the bug.
+
+   Measured on this machine, not hypothetical: with the variable set shell-wide, ccpraxis's own steward suite hands native `git.exe` a POSIX `/c/...` path, which Windows resolves against the current drive. On 2026-06-12 that left 576 entries at the drive root (`C:\c\`, `C:\tmp\`) including a real bare git repo. `plugins/steward/tests/t/09-no-drive-root-strays.t` now runs the vault flow with the variable deliberately set and fails if anything appears at the drive root.
 
 **When NOT to disable conversion:** if a script genuinely needs MSYS2 to translate a POSIX path to a Windows path before passing it to a native command (e.g. piping `find` output to `notepad.exe`), do that translation explicitly with `cygpath -w` or perl logic — don't rely on the implicit MSYS2 magic, because the same magic is what creates the `;C` corruption bug elsewhere.
 
-**Existing ccpraxis files that already have the guard:** `plugins/sandbox/scripts/launcher.pl`, `plugins/sandbox/scripts/bootstrap.pl`. Any new perl script under ccpraxis that calls podman or another native Windows binary with multi-path or `-v`-style args must do the same.
+**Existing ccpraxis files that already have the guard:** `plugins/sandbox/scripts/launcher.pl`, `plugins/sandbox/scripts/bootstrap.pl` (opt out + hand-translate via `winify_path`). Any new perl script under ccpraxis that calls podman or another native Windows binary with multi-path or `-v`-style args must do the same.
+
+**The complementary technique — translate, and stop caring about the variable.** `plugins/steward/scripts/vault-sync.pl`'s `git_path()` rewrites `/c/...` → `C:/...` before every git call. `git.exe` and `podman.exe` both accept that form whether or not MSYS later rewrites it, so the script is correct under *either* conversion state instead of depending on one. Prefer this when you can: it cannot be broken by a caller's environment. Where a harness must control the environment instead, scrub the variable for the child rather than the whole session — see `plugins/steward/tests/lib/StewardTest.pm`'s `_msys_convert_on`.
 
 ## ⚠️ Modifying the Windows User PATH
 
