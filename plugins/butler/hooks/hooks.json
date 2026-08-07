@@ -12,14 +12,16 @@
       {
         "matcher": "Bash",
         "hooks": [
-          { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/guard-bash.sh\"", "timeout": 15 }
+          { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/guard-bash.sh\"", "timeout": 15 },
+          { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/mark-wakeup.sh\"", "timeout": 15 }
         ]
       },
       {
         "matcher": "Task",
         "hooks": [
           { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/gate-shutdown.sh\"", "timeout": 15 },
-          { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/track-dispatch.sh\"", "timeout": 15 }
+          { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/track-dispatch.sh\"", "timeout": 15 },
+          { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/mark-wakeup.sh\"", "timeout": 15 }
         ]
       },
       {
@@ -50,7 +52,8 @@
     "Stop": [
       {
         "hooks": [
-          { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/gate-stop.sh\"", "timeout": 15 }
+          { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/gate-stop.sh\"", "timeout": 15 },
+          { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/gate-drive-loop.sh\"", "timeout": 30 }
         ]
       }
     ]

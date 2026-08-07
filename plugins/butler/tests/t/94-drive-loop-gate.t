@@ -1,0 +1,242 @@
+#!/usr/bin/env perl
+# 94-drive-loop-gate.t — the drive-solo driver's stop discipline.
+#
+# WHAT IS BEING PROTECTED
+#
+# /butler:drive-solo casts the driver as "a thin loop over the director": call
+# bp-drive-next.pl next, dispatch the action, call next again. That is prose,
+# and prose decays over a long context. Observed three times in a single 12-hour
+# run on 2026-08-07: a driver turn ended immediately after a ledger write, its
+# text promising the next step, with nothing scheduled to perform it. A
+# dispatched agent notifies; a finished FOREGROUND Bash call does not. So the
+# run died silently, mid-package, LOOKING finished — the worst property an
+# unattended run can have, because the operator only discovers it by asking.
+#
+# gate-stop.sh already makes this argument one level down, for coordinators:
+# it "converts ledger discipline from a prompt rule (which decays over long
+# contexts) into a mechanical gate". But every butler hook opens with
+# bp_hook_gate, which requires BP_LEDGER — exported only into coordinator
+# processes. The DRIVER, the one participant nothing supervises, therefore had
+# no stop discipline at all.
+#
+# THE RULE, in one line:
+#   A driver turn may end EITHER because something will wake the session,
+#   OR because the director says the run is settled. Never otherwise.
+#
+# The two hooks under test implement it as a pair: mark-wakeup.sh (PreToolUse)
+# records that this turn scheduled a wake-up; gate-drive-loop.sh (Stop) consumes
+# that marker, and blocks the stop when there is none and the director still
+# has work.
+#
+# POSTURE UNDER TEST. A stop gate that misfires traps a human's session, which
+# is strictly worse than the bug it prevents. So the safety properties below
+# (bounded blocking, both escape hatches, fail-open, correct scoping) matter at
+# least as much as the blocking behaviour itself, and each is asserted.
+#
+# Runs standalone: perl plugins/butler/tests/t/94-drive-loop-gate.t
+# (`prove` does not exist on the Git-for-Windows host.) No container, no
+# network, no launcher spawn; every fixture lives under File::Temp.
+
+use strict;
+use warnings;
+use Test::More;
+use FindBin qw($Bin);
+use File::Temp qw(tempdir);
+use File::Path qw(make_path);
+
+my $HOOKS = "$Bin/../../hooks";
+my $MARK  = "$HOOKS/mark-wakeup.sh";
+my $GATE  = "$HOOKS/gate-drive-loop.sh";
+
+# ---------------------------------------------------------------------------
+# A. The hooks exist and are registered. An unregistered hook is inert, and an
+#    inert gate is indistinguishable from no gate at all.
+# ---------------------------------------------------------------------------
+ok(-f $MARK, 'A1: mark-wakeup.sh exists');
+ok(-f $GATE, 'A2: gate-drive-loop.sh exists');
+
+my $hooks_json = do { local (@ARGV, $/) = ("$HOOKS/hooks.json"); <> };
+ok(defined $hooks_json && length $hooks_json, 'A3: hooks.json is readable');
+like($hooks_json, qr/gate-drive-loop\.sh/,
+     'A4: gate-drive-loop.sh is REGISTERED in hooks.json (an unregistered gate is inert)');
+like($hooks_json, qr/mark-wakeup\.sh/,
+     'A5: mark-wakeup.sh is REGISTERED in hooks.json');
+
+# The Stop array must carry the gate, not merely the file mention it somewhere.
+my ($stop_block) = $hooks_json =~ /"Stop"\s*:\s*(\[.*?\])\s*\}\s*\}\s*$/s;
+$stop_block = '' unless defined $stop_block;
+like($stop_block, qr/gate-drive-loop\.sh/,
+     'A6: the gate is registered specifically under the Stop event');
+
+# ---------------------------------------------------------------------------
+# Helpers. Each case gets its own project root so no test can see another's
+# state — the .drive-solo dir IS the hooks' activation signal.
+# ---------------------------------------------------------------------------
+sub new_project {
+    my (%opt) = @_;
+    my $root = tempdir(CLEANUP => 1);
+    my $ds   = "$root/.ccpraxis-local-data/.drive-solo";
+    make_path($ds);
+    # order.json is what marks a run as "in progress"; omit it to model a
+    # project where drive-solo has never run.
+    if ($opt{order}) {
+        open my $fh, '>', "$ds/order.json" or die;
+        print {$fh} '{"order":["x"],"recorded_at":1}';
+        close $fh;
+    }
+    return ($root, $ds);
+}
+
+sub run_hook {
+    my ($script, $payload, %opt) = @_;
+    my $env = '';
+    $env = "CCPRAXIS_DRIVE_STOP_OK=1 " if $opt{stop_ok_env};
+    # Single-quote the payload for sh; payloads here contain no single quotes.
+    my $out = `$env bash "$script" <<'PAYLOAD_EOF' 2>&1
+$payload
+PAYLOAD_EOF`;
+    return ($? >> 8, $out);
+}
+
+sub payload_task { my $cwd = shift; qq({"cwd":"$cwd","tool_name":"Task","tool_input":{}}) }
+sub payload_bash {
+    my ($cwd, $bg) = @_;
+    return $bg
+        ? qq({"cwd":"$cwd","tool_name":"Bash","tool_input":{"command":"ls","run_in_background":true}})
+        : qq({"cwd":"$cwd","tool_name":"Bash","tool_input":{"command":"ls"}});
+}
+sub payload_stop { my $cwd = shift; qq({"cwd":"$cwd"}) }
+
+# ---------------------------------------------------------------------------
+# B. mark-wakeup.sh records exactly the things that schedule a wake-up.
+# ---------------------------------------------------------------------------
+{
+    my ($root, $ds) = new_project(order => 1);
+
+    my ($rc) = run_hook($MARK, payload_task($root));
+    is($rc, 0, 'B1: mark-wakeup never blocks (Task)');
+    ok(-f "$ds/.wakeup-pending", 'B2: a Task dispatch records a pending wake-up');
+
+    unlink "$ds/.wakeup-pending";
+    run_hook($MARK, payload_bash($root, 1));
+    ok(-f "$ds/.wakeup-pending",
+       'B3: a BACKGROUNDED Bash call records a pending wake-up (its exit notifies)');
+
+    unlink "$ds/.wakeup-pending";
+    run_hook($MARK, payload_bash($root, 0));
+    ok(!-f "$ds/.wakeup-pending",
+       'B4: a FOREGROUND Bash call records NOTHING — it returns into the same turn '
+     . 'and schedules no wake-up. (Regression guard: bp_json_get returns EMPTY for '
+     . 'JSON booleans, so reading run_in_background through it silently classified '
+     . 'every backgrounded call as foreground.)');
+
+    unlink "$ds/.wakeup-pending";
+    run_hook($MARK, qq({"cwd":"$root","tool_name":"Read","tool_input":{}}));
+    ok(!-f "$ds/.wakeup-pending", 'B5: an unrelated tool records nothing');
+}
+
+# ---------------------------------------------------------------------------
+# C. Scoping. The gate must be invisible to everyone it does not govern.
+# ---------------------------------------------------------------------------
+{
+    my ($root) = new_project(order => 1);
+
+    my ($rc) = run_hook($GATE, payload_stop($root), stop_ok_env => 1);
+    is($rc, 0, 'C1: CCPRAXIS_DRIVE_STOP_OK=1 always allows the stop (session-wide hatch)');
+
+    # A coordinator carries BP_LEDGER; gate-stop.sh owns that session.
+    my $out = `BP_LEDGER=/tmp/nonexistent bash "$GATE" <<'EOF' 2>&1
+{"cwd":"$root"}
+EOF`;
+    is($? >> 8, 0, 'C2: a COORDINATOR session (BP_LEDGER set) is untouched — gate-stop.sh owns it');
+
+    my ($rc3) = run_hook($GATE, payload_stop("/tmp"));
+    is($rc3, 0, 'C3: a project with no .ccpraxis-local-data is untouched');
+
+    my ($noorder) = new_project(order => 0);
+    my ($rc4) = run_hook($GATE, payload_stop($noorder));
+    is($rc4, 0, 'C4: a project with .drive-solo but NO order.json is untouched '
+              . '(no run has been started, so there is no loop to protect)');
+}
+
+# ---------------------------------------------------------------------------
+# D. The marker is CONSUMED, not merely read. This is what makes the rule
+#    per-turn: one scheduled wake-up buys exactly one turn end.
+# ---------------------------------------------------------------------------
+{
+    my ($root, $ds) = new_project(order => 1);
+    run_hook($MARK, payload_task($root));
+    ok(-f "$ds/.wakeup-pending", 'D1: marker present before the stop');
+
+    my ($rc) = run_hook($GATE, payload_stop($root));
+    is($rc, 0, 'D2: a stop with a pending wake-up is ALLOWED');
+    ok(!-f "$ds/.wakeup-pending",
+       'D3: the marker is CONSUMED — a second turn cannot reuse the first turn\'s '
+     . 'dispatch to justify ending with nothing scheduled');
+}
+
+# ---------------------------------------------------------------------------
+# E. Fail-open. Every path that cannot reach a verdict must ALLOW the stop.
+#    A gate that cannot consult its oracle must never trap the session.
+# ---------------------------------------------------------------------------
+{
+    # order.json present, but the project has no blueprints dir at all, so the
+    # director cannot produce an actionable verdict from this root.
+    my ($root) = new_project(order => 1);
+    my ($rc) = run_hook($GATE, payload_stop($root));
+    is($rc, 0, 'E1: when the director cannot return an actionable verdict, the stop '
+             . 'is ALLOWED (fail-open: a broken gate must not trap a session)');
+}
+
+# ---------------------------------------------------------------------------
+# F. The escape hatch is one-shot, so it cannot silently disable the gate.
+# ---------------------------------------------------------------------------
+{
+    my ($root, $ds) = new_project(order => 1);
+    open my $fh, '>', "$ds/.stop-ok" or die; close $fh;
+    my ($rc) = run_hook($GATE, payload_stop($root));
+    is($rc, 0, 'F1: .stop-ok allows the stop');
+    ok(!-f "$ds/.stop-ok",
+       'F2: .stop-ok is CONSUMED — an operator override applies to one stop, never '
+     . 'permanently, so the gate cannot be switched off by accident');
+}
+
+# ---------------------------------------------------------------------------
+# G. Source-level invariants. These are the properties that keep the gate SAFE,
+#    and each is easy to remove by accident while "simplifying".
+# ---------------------------------------------------------------------------
+{
+    my $src = do { local (@ARGV, $/) = ($GATE); <> };
+    ok(defined $src && length $src, 'G0: gate source readable');
+
+    like($src, qr/MAX_BLOCKS=\d+/,
+         'G1: the gate caps consecutive blocks — it must always yield eventually');
+    like($src, qr/CCPRAXIS_DRIVE_STOP_OK/,  'G2: the session-wide escape hatch survives');
+    like($src, qr/\.stop-ok/,               'G3: the one-shot escape hatch survives');
+    like($src, qr/BP_LEDGER/,               'G4: coordinator sessions are still excluded');
+    like($src, qr/timeout/,
+         'G5: the director call is bounded by a timeout — a hanging oracle must not '
+       . 'hang the stop');
+
+    # The block message has to tell a reader what to DO. A gate that blocks
+    # without a next action is just an obstacle.
+    like($src, qr/bp-drive-next\.pl next/,
+         'G6: the block message names the concrete command that advances the loop');
+
+    my $msrc = do { local (@ARGV, $/) = ($MARK); <> };
+    like($msrc, qr/run_in_background/,
+         'G7: mark-wakeup still distinguishes backgrounded from foreground Bash');
+
+    # G8 reads CODE, not prose. The first draft of this assertion scanned the
+    # whole file and failed on mark-wakeup's own comment explaining why
+    # bp_json_get must not be used here — the comment warning against the bug
+    # matched the pattern looking for it. Blank full-line comments first, the
+    # same way t/62's adapter guard does, or a file that documents its reasoning
+    # is punished for it.
+    my $mcode = join "\n", map { /^\s*#/ ? '' : $_ } split /\n/, $msrc, -1;
+    unlike($mcode, qr/bp_json_get[^\n]*run_in_background/,
+         'G8: run_in_background is NOT read through bp_json_get — it returns empty '
+       . 'for JSON booleans, which silently breaks the distinction G7 asserts');
+}
+
+done_testing();

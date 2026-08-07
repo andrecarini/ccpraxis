@@ -51,6 +51,33 @@ Call `bp-drive-next.pl next --scope <scope>` → dispatch the returned action **
 > The **governor** verdict (`bp-usage-gate.pl verdict`) that produces a `pause` is fetched INTERNALLY by the director — the session never runs it (Decision #13).
 > **Keep-awake** is a director-managed side-effect, never a session action (Decision #7).
 
+## Never end a turn with nothing scheduled — **mechanically enforced**
+
+**A driver turn may end for exactly two reasons: something will wake the session, or
+the run is settled.** Nothing else.
+
+Something will wake you when the turn dispatched a subagent, or started a
+`run_in_background` Bash call — both notify you and the loop resumes. A **foreground**
+Bash call schedules nothing: it returns into the same turn. So a turn whose last act
+was a ledger write, ending with text that promises the next step, is a **dead stop** —
+the run halts mid-package while *appearing* finished, and the operator only discovers
+it by asking. That is the worst failure an unattended run can have.
+
+Observed three times in a single 12-hour run (2026-08-07), each time right after a
+ledger write. So it is no longer prose:
+`plugins/butler/hooks/gate-drive-loop.sh` (Stop) blocks the turn from ending when
+nothing is scheduled and `bp-drive-next.pl next` still returns actionable work;
+`mark-wakeup.sh` (PreToolUse) records the dispatch that earns a legitimate turn end.
+Proven by `plugins/butler/tests/t/94-drive-loop-gate.t`.
+
+- **Do the next thing in the same turn, rather than announcing it.** "Moving on to X"
+  followed by a turn end is precisely the shape the gate exists to catch.
+- Record the ledger **and then** dispatch, in one turn. The ledger write is not a
+  stopping point.
+- The gate yields after 3 consecutive blocks, honours `.drive-solo/.stop-ok`
+  (one-shot) and `CCPRAXIS_DRIVE_STOP_OK=1`, and fails **open** on any internal
+  error — a gate that will not yield is worse than a stalled run.
+
 ## Lean-context
 
 > **lean-context** doctrine (Decision #6): the driver reads only ≤15-line worker summaries, ledgers, and the director's JSON. Workers do the heavy reading. The harness auto-summarizes; the run is idempotent — the director is stateless-from-disk, so a summarize or re-invoke resumes losslessly. Old decisions stay decided.
