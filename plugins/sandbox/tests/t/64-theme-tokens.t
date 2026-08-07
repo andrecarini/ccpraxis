@@ -90,7 +90,15 @@ my @GENERATED_SURFACES = (
 my %EMOJI_PENDING = (
     'scripts/statusline.pl'                   => 'package 10-statusline-rebuild removes this entry',
     'plugins/sandbox/scripts/Dashboard.pm'    => 'package 06-dashboard-screen removes this entry',
-    'plugins/butler/scripts/bp-statusline.pl' => 'no package owns this file; recorded deliberately as the blueprint scope gap (ledger 2026-08-06T23:32:29Z)',
+    # Was 'no package owns this file' when this list was written, which was true
+    # then and is FALSE now: on 2026-08-07 the driver closed that scope gap by
+    # adding bp-statusline.pl to package 10-statusline-rebuild's write set, since
+    # it renders into the same Claude Code statusline surface as scripts/
+    # statusline.pl and Decision 11 ("no emojis anywhere") was otherwise
+    # unachievable. Re-pointed rather than left standing: a waiver whose stated
+    # justification has become false is exactly the rot the stale-waiver rule
+    # exists to prevent -- it would have told a future reader nobody could fix it.
+    'plugins/butler/scripts/bp-statusline.pl' => 'package 10-statusline-rebuild removes this entry; it now owns bp-statusline.pl (driver scope change 2026-08-07)',
 );
 
 # redteam.md M6(c): the verdict above is computed PER SURFACE, not per hit --
