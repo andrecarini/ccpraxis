@@ -56,6 +56,42 @@ use SpendPanel ();  # b37: pure Claude/Go/Zen spend status struct for the dashbo
                     # TokenInfo has, and t/54-spend-panel asserts both halves)
 use Resources ();   # s09: pure resource-probe parsers + the injectable probe seam
 use RunState ();    # s10: pure orchestrator/run-state summarizer for the dashboard
+
+# _pid_alive($pid) -> 1 | 0 | undef
+#
+# Liveness by SIGNAL, never by command-line matching. A probe that greps a
+# process listing for a pattern is wrong by construction -- the prober's own
+# command line contains the pattern (DAME field report, batch 1 #11) -- and it
+# would also need a subprocess, violating adapter-contract Rule 1. kill(0,...)
+# is a bare syscall: no fork, no pipe, no wait, no timeout, and it cannot
+# match the caller. 04-run-panel-ledger-truth (Decision 3 / spec S2.3).
+sub _pid_alive {
+    my ($pid) = @_;
+    return undef unless defined $pid && !ref($pid) && $pid =~ /^\d+$/;
+    return 0 if $pid == 0;          # 0 means "this process group" on POSIX -- never probe it
+    return 1 if $pid == $$;
+    local $!;
+    my $ok = eval { kill(0, $pid) };
+    return undef if $@;             # probe itself failed -> UNKNOWN, not "dead"
+    return 1 if $ok;
+    return 1 if $!{EPERM};          # exists, owned by another user
+    # 04-run-panel-ledger-truth fix-batch (CRITICAL-1): ESRCH on this host's
+    # PID namespace does NOT mean "dead" -- the orchestrator marker can name
+    # a PID written INSIDE the sandbox container (a private PID namespace;
+    # launcher.pl passes no --pid=host), so kill(0,...) here can only ever
+    # prove liveness (EPERM/success) or prove NOTHING (ESRCH may just mean
+    # "not in my namespace"). Never fabricate a confident "dead" for a PID
+    # this host cannot prove is its own to probe -- degrade to UNKNOWN, and
+    # let RunState's "unknown liveness never demotes 'running'" rule (and
+    # quiet_probe's state=='running' OR-clause) fail safe instead.
+    return undef;                   # ESRCH (or any other errno) -> UNKNOWN, never a fabricated "dead"
+}
+
+# Installed at file scope, immediately after `use RunState ()`, because
+# launcher.pl:4111's quiet_probe also calls RunState::summarize directly and
+# must not depend on _gather_runs having run first.
+$RunState::PID_ALIVE = \&_pid_alive;
+
 use BackpackApproval ();  # #21: per-item, machine-local backpack approval memory
 use BackpackReview ();    # #21: the I/O-seam-injected interactive approval walk
 use KeepAwake ();         # B5: dashboard wake-lock decision + lifecycle holder
@@ -65,6 +101,7 @@ use PluginSync ();  # Fix 2: copy-model plugin-store reconcile (copy/prune/recon
 use PortAlloc ();         # fix-multiple-running-sandboxes: per-container port-block allocation
 use SandboxLock ();       # 04-build-race-lock: generalised mkdir lock + global build-race guard
 use JSON::PP ();          # parse backpack.json + write the approved install-set
+use Errno ();              # 04-run-panel-ledger-truth: %! (EPERM) for _pid_alive's kill(0,...) probe
 use File::Path qw(make_path);
 use File::Spec;
 use File::Temp ();        # s17: STDERR capture destination while the alt-screen is owned --

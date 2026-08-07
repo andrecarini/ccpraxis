@@ -293,7 +293,17 @@ sub assert_summary_shape {
     is_deeply([ sort keys %$s ], [ sort @KEYS_11 ], "$label: exactly the 11 S2.2 keys, no more, no fewer");
     ok(defined($s->{blueprint}) && !ref($s->{blueprint}) && length($s->{blueprint}), "$label: blueprint is a non-empty Str");
     ok(defined($s->{runs_dir})  && !ref($s->{runs_dir})  && length($s->{runs_dir}),  "$label: runs_dir is a non-empty Str");
-    ok(defined($s->{state}) && grep { $s->{state} eq $_ } qw(running paused parked idle), "$label: state is one of the 4 enum values");
+    # Widened by blueprint unified-tui-design-system package
+    # 04-run-panel-ledger-truth (driver ruling on escalation E4, 2026-08-07):
+    # RunState::summarize_dir now also emits 'stale' (a run marker exists but
+    # its coordinator PID is checked-dead) and 'solo' (ledgers exist, no
+    # runs/ directory at all -- driven entirely outside the fleet). This
+    # assertion previously pinned only the 4 legacy values and was already
+    # WRONG about the design the moment those two states were specified; it
+    # stayed green only because no fixture in this file constructs them.
+    # Widened here, in the same edit that introduces the states, rather than
+    # left for whoever first constructs one to discover.
+    ok(defined($s->{state}) && grep { $s->{state} eq $_ } qw(running paused parked idle stale solo), "$label: state is one of the 6 enum values");
     ok(!defined($s->{orchestrator_pid}) || ($s->{orchestrator_pid} =~ /^\d+$/), "$label: orchestrator_pid is undef or a non-negative Int");
     ok(defined($s->{paused_manual}) && ($s->{paused_manual} == 0 || $s->{paused_manual} == 1), "$label: paused_manual is 0 or 1");
     ok(!defined($s->{paused_reason}) || (!ref($s->{paused_reason}) && length($s->{paused_reason})), "$label: paused_reason is undef or a non-empty Str");
@@ -373,15 +383,92 @@ use_ok('Dashboard') or BAIL_OUT('Dashboard.pm did not load');
 # ===========================================================================
 
 # --- B1: ordering, skip files, skip symlinks. -----------------------------
+#
+# EDITED by blueprint unified-tui-design-system package
+# 04-run-panel-ledger-truth (driver ruling, 2026-08-07; spec S2.4/AC-23..25).
+# RunState::blueprint_dirs ALREADY has the correct guard
+# ('next if -l "$root/$e"', RunState.pm:74) -- that guard is NOT touched
+# here. What could not work was the FIXTURE: on this Git-for-Windows host,
+# perl's symlink() returns success (1, no errno) but produces a plain
+# directory COPY -- '-l' is false, '-d' is true, readlink returns undef --
+# so the guard has nothing to fire on and the old single-root assertion
+# failed through no fault of RunState.pm. This is the SAME CLASS of
+# platform-blind fixture as package 00's t/51 fix.
+#
+# Split into an ALWAYS-arm (every platform: ordering + plain-file skipping,
+# using a root that contains NO symlink at all) and a PROBED arm (only where
+# this host can construct a symlink '-l' can actually detect). The two arms
+# use SEPARATE fixture roots (architect refinement on top of the driver's
+# ruling): reusing one root would mean that on a copy-making host, the fake
+# "symlink" created for the probed arm becomes a REAL THIRD DIRECTORY sitting
+# in the root the always-arm asserts holds exactly two entries everywhere --
+# breaking the arm that is supposed to be platform-independent.
+#
+# FORBIDDEN (spec, explicit): weakening/removing RunState.pm:74's '-l' guard
+# (it is correct and load-bearing IN THE CONTAINER, where the sandbox
+# actually runs Linux and symlinks are real); asserting that symlink() FAILS
+# on this host (that would pin a platform quirk, not the behaviour under
+# test).
+
+# can_detect_symlink($scratch_dir) -> 1|0
+#
+# Constructs a target dir and a symlink to it under $scratch_dir, then asks
+# whether THIS host can tell the symlink apart from a directory via '-l'.
+# Git-for-Windows perl without MSYS winsymlinks enabled returns success from
+# symlink() and silently produces a plain COPY instead: '-l' false, '-d'
+# true, readlink undef. This probes the CAPABILITY; it deliberately does NOT
+# assert that symlink() fails, which would pin the platform quirk itself
+# rather than the behaviour under test (RunState.pm:74's guard).
+#
+# (Recommended promotion per spec E10: this belongs in
+# tests/lib/TestSandbox.pm as a shared host-capability probe -- this is the
+# second ad-hoc platform probe in this initiative (t/51 was the first,
+# fixed via a $^O branch, a different technique). Left local here because
+# TestSandbox.pm is outside this package's write set.)
+sub can_detect_symlink {
+    my ($scratch_dir) = @_;
+    my $target = "$scratch_dir/probe-target";
+    my $link   = "$scratch_dir/probe-link";
+    make_path($target);
+    my $made = eval { symlink($target, $link) };
+    my $ok = ($made && -l $link) ? 1 : 0;
+    unlink($link)    if -e $link || -l $link;
+    rmdir($target)   if -d $target;
+    return $ok;
+}
+
+# --- B1 always-arm: ordering + plain-file skipping, on EVERY platform. ----
+# This root deliberately contains NO symlink at all -- on a copy-making host
+# a fake "symlink" would land here as a real third directory and break the
+# "exactly two entries" expectation this arm is supposed to hold everywhere.
 {
-    my $root = tempdir(CLEANUP => 1);
-    make_path("$root/zeta/runs");
-    make_path("$root/alpha/runs");
-    write_file("$root/note.md", "just a file\n");
-    eval { symlink("$root/alpha", "$root/link") };
-    my @got = RS_LIST('blueprint_dirs', $root);
-    is_deeply(\@got, [ "$root/alpha", "$root/zeta" ],
-        'B1: blueprint_dirs(root) returns exactly ("$root/alpha","$root/zeta") in that order (files/symlinks skipped)');
+    my $root1 = tempdir(CLEANUP => 1);
+    make_path("$root1/zeta/runs");
+    make_path("$root1/alpha/runs");
+    write_file("$root1/note.md", "just a file\n");
+    my @got1 = RS_LIST('blueprint_dirs', $root1);
+    is_deeply(\@got1, [ "$root1/alpha", "$root1/zeta" ],
+        'B1 always-arm: blueprint_dirs(root) returns exactly ("$root/alpha","$root/zeta") in that order, on every platform (ordering + plain-file skip; no symlink present in this root)');
+}
+
+# --- B1 probed arm: symlink-skipping, only where this host can construct --
+# --- a symlink '-l' can actually detect. Its OWN, separate fixture root. --
+{
+    my $probe_dir = tempdir(CLEANUP => 1);
+    my $detectable = can_detect_symlink($probe_dir);
+
+  SKIP: {
+        skip 'this host\'s symlink() produces an undetectable copy, not a "-l"-true link (Git-for-Windows perl without MSYS winsymlinks) -- cannot construct the scenario B1 needs', 1
+            unless $detectable;
+
+        my $root2 = tempdir(CLEANUP => 1);
+        make_path("$root2/zeta/runs");
+        make_path("$root2/alpha/runs");
+        symlink("$root2/alpha", "$root2/link");
+        my @got2 = RS_LIST('blueprint_dirs', $root2);
+        is_deeply(\@got2, [ "$root2/alpha", "$root2/zeta" ],
+            'B1 probed arm: blueprint_dirs(root) skips a symlinked directory entry ("$root/link") on a host that can construct a detectable symlink');
+    }
 }
 
 # --- B2 -> AC-4: blueprint_dirs(undef/''/nonexistent) -> (). --------------
@@ -710,17 +797,32 @@ use_ok('Dashboard') or BAIL_OUT('Dashboard.pm did not load');
 }
 
 # --- B20 (further): ledger unreadable/oversized/no-status-line fallback. -
+#
+# CORRECTED by blueprint unified-tui-design-system, consolidated fix-batch
+# for package 04-run-panel-ledger-truth (2026-08-07), per redteam.md HIGH-2.
+# These two sub-cases previously pinned the PRE-fix expectation (a ledger
+# FILE THAT EXISTS, but is oversized/statusless, falling back to the
+# registry's status). That is exactly the defect-generator shape HIGH-2
+# closes: "the registry is consulted only when the ledger file is ABSENT --
+# never when it is present but unparseable" / "When a ledger file exists but
+# yields no status, return ''" (redteam.md HIGH-2 mitigation, verbatim).
+# Both dir1 and dir2 below write a REAL packages/p1.md (the file IS
+# present); the corrected expectation is running_coordinators == 0, not 1.
+# redteam.md's blanket claim that "t/45's B20 fixtures have no packages/ dir
+# at all" does not hold for this sub-section (as opposed to the AC-9/B19-B20
+# case a few lines above, which genuinely unlinks the ledger file first) --
+# see test-writer-fixbatch.md's "Discrepancy found" note.
 {
     my $root = tempdir(CLEANUP => 1);
     my $dir1 = make_blueprint($root, 'oversized', orchestrator => "1\n",
         registry => registry_json(p1 => 'running'),
         packages => { p1 => ('x' x (SPEC_MAX_LEDGER_BYTES + 1024)) });
-    is(field(RS('summarize_dir', $dir1), 'running_coordinators'), 1, 'B20: an over-MAX_LEDGER_BYTES ledger falls back to the registry status');
+    is(field(RS('summarize_dir', $dir1), 'running_coordinators'), 0, 'B20 [fix-batch HIGH-2]: an over-MAX_LEDGER_BYTES ledger file that EXISTS must NOT fall back to the registry status -- the ledger is present, just unparseable, so the package is neither done nor a running coordinator');
 
     my $dir2 = make_blueprint($root, 'nostatusline', orchestrator => "1\n",
         registry => registry_json(p1 => 'running'),
         packages => { p1 => ledger_no_status_line() });
-    is(field(RS('summarize_dir', $dir2), 'running_coordinators'), 1, 'B20: a ledger frontmatter with no status: line falls back to the registry status');
+    is(field(RS('summarize_dir', $dir2), 'running_coordinators'), 0, 'B20 [fix-batch HIGH-2]: a ledger frontmatter with no status: line, but whose FILE EXISTS, must NOT fall back to the registry status -- presence, not parseability, is what excludes the registry fallback');
 
     my $dir3 = make_blueprint($root, 'noclosefence', orchestrator => "1\n",
         registry => registry_json(p1 => 'done'),

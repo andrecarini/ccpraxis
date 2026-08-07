@@ -20,9 +20,18 @@ package RunState;
 # so a project path containing spaces or non-ASCII bytes (André) is safe.
 # Nothing is exported; callers use fully-qualified names
 # (RunState::summarize(...)), exactly as launcher.pl calls SessionFilter:: /
-# BackpackApproval::. No time()/localtime/gmtime/clock read. No kill, no
-# process probing — a recorded PID is reported verbatim, never liveness-
-# checked.
+# BackpackApproval::. No time()/localtime/gmtime/clock read.
+#
+# 04-run-panel-ledger-truth (Decision 3): RunState performs NO process probe
+# itself and contains no `kill` -- it delegates coordinator-PID liveness to a
+# caller-injected coderef, $RunState::PID_ALIVE, installed by launcher.pl
+# (the impure kill(0,...) syscall lives there, never here). RunState is total
+# against a prober that dies, returns undef, or returns anything hostile at
+# all -- see _pid_state(). Progress (packages_total/packages_done/
+# current_package) is derived from packages/*.md ledgers whenever at least
+# one candidate ledger exists; runs/registry.json is consulted only as the
+# per-package status fallback and, after a liveness check, for
+# running_coordinators.
 #
 # See specs/07-run-state-panel-spec.md (S2) for the full field-by-field
 # contract; the struct's 11-key set is CLOSED and stable (s11 depends on it).
@@ -34,9 +43,14 @@ use JSON::PP ();
 our $MAX_REGISTRY_BYTES = 4 * 1024 * 1024;   # 4 MiB, mirrors SessionFilter
 our $MAX_LEDGER_BYTES   = 65536;             # 64 KiB of a package ledger is plenty for frontmatter
 our $MAX_MARKER_BYTES   = 4096;              # .orchestrator / .paused are tiny
-our $MAX_PACKAGES       = 512;               # a registry with more package keys than this is
-                                              # treated as unreadable (skip the blueprint), same
-                                              # degradation the byte caps above already use
+our $MAX_PACKAGES       = 512;               # a registry (or ledger set) with more package keys
+                                              # than this is treated as unreadable (falls back /
+                                              # skips the blueprint), same degradation the byte
+                                              # caps above already use
+
+# $PID_ALIVE: CODE ref | undef. Injected by the caller (launcher.pl). NEVER
+# set or probed by RunState itself -- see _pid_state() below.
+our $PID_ALIVE;
 
 # _read_capped($path, $cap) -> $bytes|undef (private)
 #
@@ -44,7 +58,11 @@ our $MAX_PACKAGES       = 512;               # a registry with more package keys
 # without slurping it whole. Returns undef for: not a plain file, a symlink
 # (extends blueprint_dirs' -l skip one level down), open failure, empty
 # file, or a file whose length exceeds $cap ("a file larger than its cap is
-# treated exactly as an unreadable file").
+# treated exactly as an unreadable file"). Used for the registry and the
+# 4 KiB markers, where reject-on-oversize is the WANTED behaviour (an
+# oversized marker is itself suspicious; a truncated JSON blob can't be
+# partially parsed) -- NOT for ledgers, see _read_head below
+# (04-run-panel-ledger-truth consolidated fix-batch).
 sub _read_capped {
     my ($path, $cap) = @_;
     return undef unless defined $path && -f $path;
@@ -55,6 +73,53 @@ sub _read_capped {
     close $fh;
     return undef if !defined $n || $n == 0 || $n > $cap;
     return $blob;
+}
+
+# _read_head($path, $cap) -> $bytes|undef (private)
+#
+# Reads the first $cap bytes of a plain, non-symlink file. Unlike
+# _read_capped, an over-cap file is NOT rejected -- its first $cap bytes are
+# returned instead ("64 KiB of a package ledger is plenty for frontmatter";
+# a ledger grows without bound by design, and the only thing ever needed
+# from it is the frontmatter near the top). Returns '' (defined, not undef)
+# for a genuinely empty file -- the caller needs to distinguish "empty" from
+# "unreadable". Returns undef only for: not a plain file, a symlink, or an
+# open failure. 04-run-panel-ledger-truth consolidated fix-batch (the
+# oversized-ledger defect: reject-on-oversize applied to ledgers silently
+# fell through to the stale registry for any ledger over 64 KiB).
+sub _read_head {
+    my ($path, $cap) = @_;
+    return undef unless defined $path && -f $path;
+    return undef if -l $path;
+    open my $fh, '<:raw', $path or return undef;
+    my $blob = '';
+    read($fh, $blob, $cap);
+    close $fh;
+    return $blob;
+}
+
+# _looks_like_frontmatter($blob) -> 0|1 (private)
+#
+# MEDIUM-5: used ONLY to decide ledger-set MEMBERSHIP (candidacy), never to
+# parse a status -- see _ledger_status, which keeps its own strict, non-
+# tolerant '---' check unchanged (04-run-panel-ledger-truth consolidated
+# fix-batch report explains why the two must diverge). undef/zero-length
+# blob -> 1 (ambiguous/unreadable -> never demote a candidate on that
+# basis). Otherwise: strip a leading UTF-8 BOM, split on "\n", skip leading
+# blank lines (an empty string or a bare "\r"), strip a trailing "\r" from
+# the first non-blank line, and require it to equal exactly '---'.
+sub _looks_like_frontmatter {
+    my ($blob) = @_;
+    return 1 unless defined $blob;
+    return 1 unless length $blob;
+    my $b = $blob;
+    $b =~ s/\A\xEF\xBB\xBF//;
+    my @lines = split /\n/, $b, -1;
+    my $i = 0;
+    $i++ while $i <= $#lines && $lines[$i] =~ /\A\r?\z/;
+    return 0 unless defined $lines[$i];
+    (my $l = $lines[$i]) =~ s/\r\z//;
+    return $l eq '---' ? 1 : 0;
 }
 
 # blueprint_dirs($blueprints_root) -> @dirs
@@ -122,20 +187,25 @@ sub _normalize_status {
 
 # _ledger_status($blueprint_dir, $pkg) -> $status (private, '' when none)
 #
-# Reads "$blueprint_dir/packages/$pkg.md", capped at $MAX_LEDGER_BYTES. The
-# ledger read is skipped entirely (no open attempted) for an unsafe $pkg. The
-# file must begin with a line that is exactly '---'; subsequent lines are
-# scanned until the next line that is exactly '---' or EOF; within that
-# block, the first line matching /^status:[ \t]*(.*)$/ supplies the raw
-# status (trimming is left to _normalize_status, which does it with two
-# anchored non-/g substitutions rather than the ambiguous-quantifier
-# /^status:\s*(.*?)\s*$/ shape, which is quadratic on an interior
-# whitespace run).
+# Reads the first $MAX_LEDGER_BYTES of "$blueprint_dir/packages/$pkg.md" (a
+# HEAD read, not a reject-on-oversize -- see _read_head; 04-run-panel-
+# ledger-truth consolidated fix-batch closed the oversized-ledger defect
+# this way, since _ledger_status already stops at the closing '---', so a
+# truncated tail is harmless). The ledger read is skipped entirely (no open
+# attempted) for an unsafe $pkg. The file must begin with a line that is
+# EXACTLY '---' (deliberately strict, no BOM/CRLF/leading-blank tolerance --
+# that tolerance exists only in _looks_like_frontmatter for MEMBERSHIP, not
+# here, see that sub's comment); subsequent lines are scanned until the next
+# line that is exactly '---' or EOF; within that block, the first line
+# matching /^status:[ \t]*(.*)$/ supplies the raw status (trimming is left
+# to _normalize_status, which does it with two anchored non-/g substitutions
+# rather than the ambiguous-quantifier /^status:\s*(.*?)\s*$/ shape, which is
+# quadratic on an interior whitespace run).
 sub _ledger_status {
     my ($blueprint_dir, $pkg) = @_;
     return '' unless _safe_pkg_name($pkg);
-    my $blob = _read_capped("$blueprint_dir/packages/$pkg.md", $MAX_LEDGER_BYTES);
-    return '' unless defined $blob;
+    my $blob = _read_head("$blueprint_dir/packages/$pkg.md", $MAX_LEDGER_BYTES);
+    return '' unless defined $blob && length $blob;
     my @lines = split /\n/, $blob, -1;
     return '' unless @lines && $lines[0] eq '---';
     my $raw_status;
@@ -150,31 +220,49 @@ sub _ledger_status {
     return _normalize_status($raw_status);
 }
 
-# _effective_status($blueprint_dir, $pkg, $entry) -> $status (private)
+# _effective_status($blueprint_dir, $pkg, $entry, $ledger_present) -> $status (private)
 #
-# S2.5: the ledger's normalised status wins whenever it is non-empty;
-# otherwise the registry entry's 'status' field is used (only when $entry is
-# a HASH), normalised the same way.
+# S2.5 + 04-run-panel-ledger-truth consolidated fix-batch (HIGH-2 governing
+# rule): the ledger's normalised status wins whenever it is non-empty.
+# Otherwise, the registry entry's 'status' field is used -- but ONLY when
+# $ledger_present is false, i.e. the package has NO ledger file at all.
+# When $ledger_present is true and the ledger yielded no status ('' -- over-
+# cap, CRLF, BOM, malformed, no status: line, whatever the cause), the
+# package is honestly '' (neither done nor running) -- the registry is NEVER
+# consulted for a package whose ledger file EXISTS but failed to parse. This
+# is the fix for the reported "77/79" and "0/3" defects: a bound (or a byte-
+# exact frontmatter check) becoming a fabrication via a silent fall-through
+# to stale registry data. Under-reporting is honest; adopting a
+# contradicting registry value is not.
 sub _effective_status {
-    my ($blueprint_dir, $pkg, $entry) = @_;
+    my ($blueprint_dir, $pkg, $entry, $ledger_present) = @_;
     my $ledger_status = _ledger_status($blueprint_dir, $pkg);
     return $ledger_status if length $ledger_status;
+    return '' if $ledger_present;
     my $raw = (ref($entry) eq 'HASH') ? $entry->{status} : undef;
     return _normalize_status($raw);
 }
 
 # _orchestrator_pid($path) -> $pid|undef (private)
 #
-# The first integer found in the (capped) file content, or undef when the
-# file is absent, unreadable, over cap, or holds no integer at all. The
-# digit run is bounded to 10 characters -- more than any real PID on any
-# supported platform -- so a marker stuffed with thousands of digits can
-# never numify to Inf (S2.2 promises a Perl integer, not a float).
+# The leading integer at the very start of the (capped) file content, or
+# undef when the file is absent, unreadable, over cap, or does not itself
+# begin with a bare digit run. Anchored to \A and bounded to 1-10 digits
+# with a trailing (?!\d) so an over-long run is REJECTED rather than
+# truncated to a plausible-looking wrong PID -- 04-run-panel-ledger-truth
+# consolidated fix-batch (HIGH-3 / reviewer MINOR / LOW-15): the previous
+# unanchored /(\d{1,10})/ fabricated PIDs out of ordinary content (a JSON
+# blob's embedded "pid" field, a header comment's date, a negative marker's
+# magnitude with the sign silently dropped), and disagreed with
+# bp-orchestrator.pl's own anchored /^(\d+)/ reader of the SAME file. This
+# matches that reader's domain: undef for anything whose first bytes are not
+# themselves a bare digit run (S2.2 promises a Perl integer, not a float,
+# hence the 10-digit bound rather than an unbounded \d+).
 sub _orchestrator_pid {
     my ($path) = @_;
     my $blob = _read_capped($path, $MAX_MARKER_BYTES);
     return undef unless defined $blob;
-    return ($blob =~ /(\d{1,10})/) ? ($1 + 0) : undef;
+    return ($blob =~ /\A(\d{1,10})(?!\d)/) ? ($1 + 0) : undef;
 }
 
 # _paused_info($path) -> ($paused_manual, $paused_reason) (private)
@@ -218,70 +306,225 @@ sub _count_decisions {
     return $n;
 }
 
+# _pid_state($pid) -> 1 | 0 | undef (private)
+#
+# Delegates liveness to the caller-injected $PID_ALIVE coderef. Total against
+# a hostile/absent/failing prober -- see the table in
+# specs/04-run-panel-ledger-truth-spec.md S2.1:
+#   $pid undef                    -> undef (nothing to check)
+#   $PID_ALIVE not a CODE ref     -> undef (no prober installed -- UNKNOWN)
+#   prober dies                   -> undef (probe failed)
+#   prober returns undef          -> undef (probe could not decide)
+#   prober returns truthy         -> 1     (alive)
+#   prober returns defined-falsy  -> 0     (checked and dead)
+sub _pid_state {
+    my ($pid) = @_;
+    return undef unless defined $pid;
+    return undef unless ref($PID_ALIVE) eq 'CODE';
+    local $@;
+    my $result = eval { $PID_ALIVE->($pid) };
+    return undef if $@;
+    return undef unless defined $result;
+    return $result ? 1 : 0;
+}
+
+# _ledger_packages($blueprint_dir) -> \@names | undef (private)
+#
+# undef ONLY when "$blueprint_dir/packages" is genuinely absent: a symlink,
+# not a directory, or opendir fails -- i.e. there is truly no ledger source,
+# which is what licenses summarize_dir's registry fallback. Otherwise an
+# ascending-sorted, possibly-empty arrayref of package names, REGARDLESS of
+# how large -- the $MAX_PACKAGES cardinality cap is enforced by the caller
+# (summarize_dir), not here. 04-run-panel-ledger-truth consolidated
+# fix-batch (HIGH-4): this used to self-degrade to undef when over cap,
+# which then silently fell through to summarize_dir's registry-fallback
+# branch (the exact "bound became a fabrication" shape this package exists
+# to eliminate, on a much larger scale than the original oversized-ledger
+# defect). An over-cap ledger set must now cause summarize_dir to return
+# undef DIRECTLY -- see there.
+#
+# A directory entry is a candidate ledger iff: the name does not begin with
+# '.'; the name ends in '.md' (case-sensitive); "$dir/packages/$name" is not
+# a symlink and IS a plain file; the name with '.md' stripped passes
+# _safe_pkg_name; and (MEDIUM-5) it is not POSITIVELY confirmed to lack
+# frontmatter -- a small (0 < size <= $MAX_LEDGER_BYTES), fully-readable file
+# whose first non-blank line (BOM/CRLF/leading-blank tolerant, via
+# _looks_like_frontmatter) is not exactly '---' is excluded (a stray
+# README.md/TEMPLATE.md dropped in packages/ must not inflate
+# packages_total forever). A zero-length file, an over-cap file (size >
+# $MAX_LEDGER_BYTES), or one whose stat/open fails is NEVER excluded on this
+# basis -- ambiguous cases stay candidates, so a genuinely malformed-but-
+# real ledger is never silently dropped from the denominator (that would
+# reintroduce HIGH-2 from the other side). This membership check is
+# deliberately independent of _ledger_status's STRICT, non-tolerant parse --
+# see that sub's comment for why the two must not share tolerance.
+#
+# Discovery is opendir/readdir only. glob remains forbidden anywhere in this
+# file (t/45:340-342 / AC-21).
+sub _ledger_packages {
+    my ($blueprint_dir) = @_;
+    return undef unless defined $blueprint_dir && !ref($blueprint_dir) && length($blueprint_dir);
+    my $pkgs_dir = "$blueprint_dir/packages";
+    return undef if -l $pkgs_dir;
+    return undef unless -d $pkgs_dir;
+    opendir(my $dh, $pkgs_dir) or return undef;
+    my @names;
+    for my $e (readdir $dh) {
+        next if $e eq '.' || $e eq '..';
+        next if $e =~ /^\./;
+        next unless $e =~ /\.md\z/;
+        my $full = "$pkgs_dir/$e";
+        next if -l $full;
+        next unless -f $full;
+        (my $name = $e) =~ s/\.md\z//;
+        next unless _safe_pkg_name($name);
+        my $size = -s $full;
+        if (defined($size) && $size > 0 && $size <= $MAX_LEDGER_BYTES) {
+            my $blob = _read_head($full, $MAX_LEDGER_BYTES);
+            next if defined($blob) && !_looks_like_frontmatter($blob);
+        }
+        push @names, $name;
+    }
+    closedir $dh;
+    return [ sort @names ];
+}
+
 # summarize_dir($blueprint_dir) -> \%summary | undef
 #
-# Builds the S2.2 summary for ONE blueprint directory (the directory that
-# *contains* runs/). undef (the blueprint is skipped entirely) when:
-# $blueprint_dir is undef/zero-length/not a directory; runs/ is not a
-# directory; runs/registry.json is not a plain file, is unreadable, is
-# empty, or exceeds $MAX_REGISTRY_BYTES; or the registry body does not
-# decode as a JSON HASH. Never dies.
+# Builds the S2.2 summary for ONE blueprint directory. undef (the blueprint
+# contributes no row -- Rule 4 "no data yet") when: $blueprint_dir is
+# undef/zero-length/not a directory; or NEITHER a usable ledger set (>=1
+# candidate under packages/) NOR a usable registry (a decodable JSON HASH,
+# <= $MAX_PACKAGES non-'_' keys) is available.
+#
+# 04-run-panel-ledger-truth / Decision 3: progress (packages_total /
+# packages_done / current_package) is derived from the LEDGER set whenever
+# packages/ yields at least one candidate; the registry key set is used only
+# as a fallback when packages/ yields none. runs/ (and therefore
+# registry.json) need not exist at all for a ledger-driven blueprint (state
+# 'solo'). A blueprint whose recorded coordinator PID is checked-dead (via
+# the injected $PID_ALIVE) never reports a live coordinator (state 'stale',
+# running_coordinators 0), regardless of what the registry claims. Never
+# dies.
 sub summarize_dir {
     my ($blueprint_dir) = @_;
     return undef unless defined $blueprint_dir && !ref($blueprint_dir)
         && length($blueprint_dir) && -d $blueprint_dir;
 
     my $runs_dir = "$blueprint_dir/runs";
-    return undef unless -d $runs_dir;
+    my $has_runs = (-d $runs_dir) ? 1 : 0;
 
-    my $blob = _read_capped("$runs_dir/registry.json", $MAX_REGISTRY_BYTES);
-    return undef unless defined $blob;
-    local $@;
-    my $data = eval { JSON::PP->new->decode($blob) };
-    return undef unless ref($data) eq 'HASH';
+    my $reg;
+    if ($has_runs) {
+        my $blob = _read_capped("$runs_dir/registry.json", $MAX_REGISTRY_BYTES);
+        if (defined $blob) {
+            # MEDIUM-8: a cap-compliant-BY-BYTES but cardinality-hostile
+            # registry (many small keys) must never reach the multi-second
+            # pure-Perl JSON::PP decode on the 10s gather tick (adapter
+            # Rule 1: never block). Cheap regex pre-count of `"<key>":{`
+            # occurrences in the RAW bytes, before any decode is attempted --
+            # a rough over-estimate is fine (top-level "packages":{ itself
+            # also matches, and nested objects would too, so this can only
+            # ever over-count, never under-count past $MAX_PACKAGES for a
+            # registry shaped like ours). $MAX_REGISTRY_BYTES stays at 4 MiB
+            # (not lowered) -- lowering it would reject legitimate
+            # cap-compliant registries at the byte layer before this guard
+            # even runs.
+            my $rough_key_count = () = $blob =~ /"(?:[^"\\]|\\.)*"\s*:\s*\{/g;
+            if ($rough_key_count <= $MAX_PACKAGES) {
+                local $@;
+                my $data = eval { JSON::PP->new->decode($blob) };
+                $reg = (ref($data) eq 'HASH') ? $data : undef;
+            }
+        }
+    }
 
-    my $pkgs = (ref($data->{packages}) eq 'HASH') ? $data->{packages} : {};
     # MINOR-5: exclude butler's underscore-prefixed bookkeeping pseudo-keys
     # (e.g. "_run", written by bp-remediate.pl) from the package count/loop --
     # they are not packages and inflate the denominator with a status-less
     # entry.
-    my @pkg_keys = grep { !/\A_/ } keys %$pkgs;
-    my $packages_total = scalar @pkg_keys;
+    my $reg_pkgs = (ref($reg) eq 'HASH' && ref($reg->{packages}) eq 'HASH') ? $reg->{packages} : {};
+    my @reg_keys = grep { !/\A_/ } keys %$reg_pkgs;
     # MAJOR-2: a registry whose package count exceeds $MAX_PACKAGES is
-    # treated as unreadable (skip the blueprint) -- the same "over cap ->
-    # unreadable" degradation the byte caps above already use, so a
-    # cap-compliant-by-bytes-but-cardinality-hostile registry cannot force a
-    # 10s-cadence walk of hundreds of thousands of keys.
-    return undef if $packages_total > $MAX_PACKAGES;
+    # treated as unusable -- the same "over cap -> unreadable" degradation
+    # the byte caps above already use, so a cap-compliant-by-bytes-but-
+    # cardinality-hostile registry cannot force a 10s-cadence walk of
+    # hundreds of thousands of keys.
+    my $reg_usable = defined($reg) && (scalar(@reg_keys) <= $MAX_PACKAGES);
 
-    my $packages_done = 0;
+    my $ledgers = _ledger_packages($blueprint_dir);
+
+    # HIGH-4: an over-cap ledger set must degrade HONESTLY -- no row at all
+    # -- rather than silently substituting the (much smaller, contradicting)
+    # registry key set as a fabricated truth. This is enforced HERE, not
+    # inside _ledger_packages, precisely so it can return undef directly
+    # instead of falling into the registry-fallback branch below.
+    return undef if defined($ledgers) && scalar(@$ledgers) > $MAX_PACKAGES;
+
+    my $ledger_mode = (defined($ledgers) && @$ledgers) ? 1 : 0;
+    my @pkgs;
+    if ($ledger_mode) {
+        @pkgs = @$ledgers;
+    }
+    elsif ($reg_usable) {
+        @pkgs = @reg_keys;
+    }
+    else {
+        return undef;   # Rule 4 "no data yet" -- neither source is usable
+    }
+
+    my $packages_total = scalar @pkgs;
+    my $packages_done  = 0;
     my $running_count  = 0;
     my $current_package;
-    for my $pkg (sort @pkg_keys) {
-        my $status = _effective_status($blueprint_dir, $pkg, $pkgs->{$pkg});
+    for my $pkg (sort @pkgs) {
+        my $entry = $reg_pkgs->{$pkg};
+        # HIGH-2 governing rule: the registry is consulted only when the
+        # package has NO ledger file at all ($ledger_mode true means every
+        # $pkg here came from a real, present packages/<pkg>.md).
+        my $status = _effective_status($blueprint_dir, $pkg, $entry, $ledger_mode);
         $packages_done++ if $status eq 'done';
         if ($status eq 'running') {
-            $running_count++;
+            # MEDIUM-7: a per-package registry-recorded coordinator PID is
+            # now liveness-checked too (via the same injected $PID_ALIVE,
+            # no new probe) -- previously ONLY the orchestrator PID was ever
+            # probed, so a crashed per-package coordinator (whose ledger was
+            # written 'running' before the risky step, by design) inflated
+            # running_coordinators forever. Fail-safe: an UNKNOWN per-package
+            # liveness (no pid recorded, non-numeric, or the prober itself
+            # can't decide) still counts -- only a POSITIVELY checked-dead
+            # per-package PID is excluded.
+            my $pkg_pid = (ref($entry) eq 'HASH') ? $entry->{pid} : undef;
+            my $pkg_alive = (defined($pkg_pid) && !ref($pkg_pid) && $pkg_pid =~ /\A\d+\z/)
+                ? _pid_state($pkg_pid + 0) : undef;
+            my $pkg_checked_dead = (defined($pkg_alive) && !$pkg_alive) ? 1 : 0;
+            $running_count++ unless $pkg_checked_dead;
             # MAJOR-3: current_package is a display value (s11 renders the
             # same struct); bound its length at the producer so an
-            # oversized registry key can never reach a per-character
-            # sanitizer downstream at full length.
+            # oversized key can never reach a per-character sanitizer
+            # downstream at full length.
             $current_package = (length($pkg) > 128 ? substr($pkg, 0, 128) : $pkg)
                 unless defined $current_package;
         }
     }
 
-    my $has_shutdown = -e "$runs_dir/.shutdown";
-    my $has_paused   = -e "$runs_dir/.paused";
-    my $has_orch     = -e "$runs_dir/.orchestrator";
-    my $state = $has_shutdown ? 'parked'
-              : $has_paused   ? 'paused'
-              : $has_orch     ? 'running'
-              :                 'idle';
+    my $has_shutdown = $has_runs && -e "$runs_dir/.shutdown";
+    my $has_paused   = $has_runs && -e "$runs_dir/.paused";
+    my $has_orch     = $has_runs && -e "$runs_dir/.orchestrator";
 
-    my $running_coordinators = $has_orch ? $running_count : 0;
+    my $orchestrator_pid = $has_runs ? _orchestrator_pid("$runs_dir/.orchestrator") : undef;
+    my $alive = _pid_state($orchestrator_pid);
+    my $dead  = (defined($alive) && !$alive) ? 1 : 0;   # ONLY a positive "checked and dead"
 
-    my $orchestrator_pid = _orchestrator_pid("$runs_dir/.orchestrator");
+    my $state = $has_shutdown                        ? 'parked'
+              : (($has_orch || $has_paused) && $dead) ? 'stale'
+              : $has_paused                           ? 'paused'
+              : $has_orch                             ? 'running'
+              : !$has_runs                            ? 'solo'
+              :                                         'idle';
+
+    my $running_coordinators = ($has_orch && !$dead && $reg_usable) ? $running_count : 0;
+
     my ($paused_manual, $paused_reason) = _paused_info("$runs_dir/.paused");
     my $decisions_waiting = _count_decisions("$runs_dir/needs-you");
 
