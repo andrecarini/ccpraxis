@@ -235,6 +235,20 @@ my $HOST_BASELINE = {
             'Skill(beacon:on)', 'Skill(beacon:view)',
             'Skill(blueprint:create)', 'Skill(blueprint:manage)',
             'Skill(butler:dispatch-fleet)', 'Skill(butler:drive-solo)',
+            # DELIBERATE DECLARATION, not a sync (00-suite-baseline-green B8/AC-10).
+            # Added by commit 6946510 "feat(butler): /butler:feedback -- byte-exact
+            # capture, one question round, a read-only verifier" (git log -S
+            # 'Skill(butler:feedback)' -- global-config/settings.json). The skill
+            # file it grants, plugins/butler/skills/feedback/SKILL.md, ships in
+            # this repo; butler@ccpraxis-local is already in enabledPlugins above;
+            # and every sibling butler skill (dispatch-fleet, drive-solo, reporter,
+            # status) is already allowlisted here -- this is the same grant class
+            # as its siblings, not a new capability. NOT WebSearch/commit 075b073:
+            # that was this package's own corrected misdiagnosis (see spec §1.2) --
+            # WebSearch was already present in this baseline before this change and
+            # only appeared to move because inserting an entry here shifts every
+            # later index (see $PERMISSION_GATE_NOTICE below, and spec §5.6).
+            'Skill(butler:feedback)',
             'Skill(butler:reporter)', 'Skill(butler:status)',
             'Skill(steward:audit)', 'Skill(steward:backup)',
             'Skill(steward:ccpraxis-extend)', 'Skill(steward:setup-project)',
@@ -327,11 +341,48 @@ my $CONTAINER_BASELINE = {
     worktree => { baseRef => 'fresh' },
 };
 
+# 00-suite-baseline-green B9/AC-12 — taught once, on demand, to the next
+# reader who hits a permissions.allow disagreement here. This gate exists
+# because global-config/settings.json installs to ~/.claude/settings.json
+# and grants its permissions to EVERY project on this machine — the drift
+# that motivated this notice (Skill(butler:feedback) landing at index 10,
+# see $HOST_BASELINE's permissions.allow comment above) was a genuine,
+# undeclared change to that shipped set, and this gate caught it exactly as
+# designed. §5.6 below is why a single mid-list insertion fans out into
+# ~28 "changed" diags plus one surplus key: flatten() keys arrays by
+# INDEX, so everything after the insertion point shifts by one. Read the
+# *position* of the surplus/changed key, not its value, to find the real
+# addition.
+my $PERMISSION_GATE_NOTICE = <<'NOTICE';
+permissions.allow drift detected in global-config/settings.json.
+
+This baseline is a CONSCIOUS-DECLARATION GATE, not a change detector.
+global-config/settings.json installs to ~/.claude/settings.json and grants its
+permissions to EVERY project on this machine, so each entry must be declared by a
+human before it ships.
+
+If the new entry is intended: add it to $HOST_BASELINE's permissions.allow in this
+file, AT THE SAME POSITION as in global-config/settings.json, with a comment naming
+the commit and why the grant is safe.
+
+Do NOT widen this check to accept whatever the live file contains, do NOT auto-sync
+the baseline from the live file, and do NOT delete the entry from the shipped config
+just to turn this test green. Any of those deletes the control.
+NOTICE
+
 sub assert_baseline_preserved {
     my ($label, $baseline, $live) = @_;
 
     my $baseline_flat = flatten($baseline, '');
     my $live_flat      = flatten($live, '');
+    my $notice_shown   = 0;
+    my $maybe_notice   = sub {
+        my ($path) = @_;
+        return unless $path =~ /^permissions\.allow\[/;
+        return if $notice_shown;
+        $notice_shown = 1;
+        diag($PERMISSION_GATE_NOTICE);
+    };
 
     # (a) every baseline key path still present, with an equal value.
     my $all_preserved = 1;
@@ -342,6 +393,7 @@ sub assert_baseline_preserved {
             diag("A4: $label lost or changed baseline key '$path' "
                 . "(expected '$baseline_flat->{$path}', got "
                 . (exists $live_flat->{$path} ? "'$live_flat->{$path}'" : '<missing>') . ")");
+            $maybe_notice->($path);
         }
     }
     ok($all_preserved, "A4: $label preserves every baseline key path with its original value");
@@ -368,6 +420,7 @@ sub assert_baseline_preserved {
     my @unexpected = grep {
         !exists $baseline_flat->{$_} && !$permitted_additions{$_}
     } sort keys %$live_flat;
+    $maybe_notice->($_) for @unexpected;
     is_deeply(\@unexpected, [],
         "A4: $label introduces no key path outside the baseline other than cleanupPeriodDays");
 }

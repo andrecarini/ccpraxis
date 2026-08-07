@@ -100,6 +100,40 @@ sub count_error_code {
 }
 
 # =====================================================================
+# Platform-aware root-escape helpers (00-suite-baseline-green spec §2.1).
+#
+# HAZARD, documented once for future fixture authors: MountSpec::winify_path
+# (called from CcpraxisWorkCopy::canon_path, called from normalize_path)
+# rewrites an absolute path whose FIRST segment is a SINGLE ASCII LETTER,
+# followed by at least one more slash, to a drive root on the Windows
+# family: '/a/b' -> 'A:/b', '/c/Users/x' -> 'C:/Users/x'. This is deliberate
+# and load-bearing (it is how an MSYS-form target like '/c/Users/andre/.claude'
+# resolves to 'C:/Users/andre/.claude' so the protected-path guard recognises
+# it) — it is NOT a defect, and it must never be removed or bypassed here.
+# '/a', '/a/' (trailing slash stripped before winify), '/app/data', '/ab/c'
+# and '/tmp/x' are all left untouched, on every platform, because they don't
+# match that shape.
+#
+# Any NEW fixture in this file whose absolute first segment is a single
+# letter is a landmine: it silently means something different on the two
+# platform families. Unless the drive-letter mapping IS the thing under
+# test (the root-escape assertions immediately below), use a first segment
+# of at least two characters.
+#
+# Read ONCE, at file scope, BEFORE any block localises
+# $ProtectedPaths::WINDOWS_FAMILY (t/51's sole override is far below, at the
+# AC-45 block) — reading it later or inside such a block would silently
+# declare a Linux runner "Windows" for every earlier assertion.
+my $WIN_FAMILY = ProtectedPaths::_windows_family() ? 1 : 0;
+
+# The root that an absolute path whose first segment is the single letter
+# $letter resolves to on THIS host. Mirrors MountSpec::winify_path's
+# documented rule above; it does NOT call normalize_path, so assertions
+# built on it stay independent of the code under test.
+sub host_root_of_letter { my ($l) = @_; return $WIN_FAMILY ? uc($l) . ':/' : '/' }
+sub host_under_letter   { my ($l, $rest) = @_; return host_root_of_letter($l) . $rest }
+
+# =====================================================================
 # AC-2..AC-6 — normalize_path (G1)
 # =====================================================================
 
@@ -114,15 +148,43 @@ for my $in (qw(/ // ///)) {
     is(normalize_path($in), '/', "AC-3: normalize_path('$in') eq '/'");
 }
 is(normalize_path('/.'),    '/', "AC-3: normalize_path('/.') eq '/'");
-is(normalize_path('/a/..'), '/', "AC-3: normalize_path('/a/..') eq '/'");
+
+# --- root-escape clamp: platform-aware expected value (spec 00-suite-baseline-
+# green B1/B2), plus platform-independent security-INTENT guards that fail on
+# ANY traversal surviving above the resolved root, on every platform. The
+# expected value comes from host_root_of_letter's independent model of
+# winify_path's rule, never from calling normalize_path itself. ---
+for my $in ('/a/..', '/a/../..') {
+    my $got = normalize_path($in);
+    is($got, host_root_of_letter('a'),
+        "AC-3/AC-4: normalize_path('$in') eq host_root_of_letter('a') (platform-aware root clamp)");
+    like($got, qr{\A(?:[A-Za-z]:)?/\z},
+        "AC-4: normalize_path('$in') is a bare root — no traversal survived");
+    unlike($got, qr{(?:\A|/)\.\.(?:/|\z)},
+        "AC-4: normalize_path('$in') has no surviving '..' segment");
+    is_deeply(target_self_codes($in, \%O), ['drive-root'],
+        "AC-4: target_self_codes('$in', \\%O) eq ['drive-root'] — public API agrees it's a bare root");
+}
+
+# --- B4: platform-independent restatement, using a MULTI-CHARACTER first
+# segment (which winify_path never touches), proving the CLAMP itself — not
+# the platform branch — is what makes the pair above pass. ---
+is(normalize_path('/aa/..'),    '/', "AC-3 (B4 companion): normalize_path('/aa/..') eq '/' on every platform");
+is(normalize_path('/aa/../..'), '/', "AC-4 (B4 companion): normalize_path('/aa/../..') eq '/' on every platform");
 
 for my $in ('C:', 'C:/', 'C:\\', 'C://') {
     is(normalize_path($in), 'C:/', "AC-3: normalize_path('$in') eq 'C:/'");
 }
 is(normalize_path('C:/a/..'), 'C:/', "AC-3: normalize_path('C:/a/..') eq 'C:/'");
 
-is(normalize_path('/a/../..'),        '/',   "AC-4: normalize_path('/a/../..') eq '/'");
-is(normalize_path('/a/../../../b'),   '/b',  "AC-4: normalize_path('/a/../../../b') eq '/b'");
+# --- clamp-then-append (B3): expected value is host_under_letter's
+# independent model, not a POSIX-only literal. ---
+is(normalize_path('/a/../../../b'), host_under_letter('a', 'b'),
+    "AC-4: normalize_path('/a/../../../b') eq host_under_letter('a','b') (clamp-then-append, platform-aware)");
+unlike(normalize_path('/a/../../../b'), qr{(?:\A|/)\.\.(?:/|\z)},
+    "AC-4: normalize_path('/a/../../../b') has no surviving '..' segment");
+is(normalize_path('/aa/../../../b'), '/b',
+    "AC-4 (B4 companion): normalize_path('/aa/../../../b') eq '/b' on every platform");
 is(normalize_path('C:/a/../..'),      'C:/', "AC-4: normalize_path('C:/a/../..') eq 'C:/'");
 
 is(normalize_path('../a'),      '../a', "AC-5: normalize_path('../a') eq '../a'");
@@ -130,8 +192,11 @@ is(normalize_path('a/b/../c'),  'a/c',  "AC-5: normalize_path('a/b/../c') eq 'a/
 is(normalize_path('.'),         '.',    "AC-5: normalize_path('.') eq '.'");
 is(normalize_path('a/..'),      '.',    "AC-5: normalize_path('a/..') eq '.'");
 
-is(normalize_path('/a/b/'),      '/a/b',   "AC-6: normalize_path('/a/b/') eq '/a/b'");
-is(normalize_path('/a//b///c/'), '/a/b/c', "AC-6: normalize_path('/a//b///c/') eq '/a/b/c'");
+# Renamed first segment 'a' -> 'dir' (>=2 chars, spec B5): the single-letter
+# form is incidental fabricated scaffolding here, not the subject under
+# test, so it must not silently alias a drive root on the Windows family.
+is(normalize_path('/dir/b/'),      '/dir/b',   "AC-6: normalize_path('/dir/b/') eq '/dir/b'");
+is(normalize_path('/dir//b///c/'), '/dir/b/c', "AC-6: normalize_path('/dir//b///c/') eq '/dir/b/c'");
 is(normalize_path('C:\\a\\b\\'), 'C:/a/b', "AC-6: normalize_path('C:\\\\a\\\\b\\\\') eq 'C:/a/b'");
 
 # =====================================================================
@@ -148,10 +213,16 @@ is(path_relation('/a/b/c/d/e', '/a/b'), 'descendant',
    "AC-8: path_relation('/a/b/c/d/e','/a/b') eq 'descendant'");
 
 # ancestor means the FIRST argument (target) CONTAINS the second (root).
-is(path_relation('/a', '/a/b'),      'ancestor',
-   "AC-9: DIRECTION ANCHOR — path_relation('/a','/a/b') eq 'ancestor' (target contains root)");
-is(path_relation('/', '/a/b/c'),     'ancestor',
-   "AC-9: path_relation('/','/a/b/c') eq 'ancestor'");
+# Renamed 'a' -> 'aa' (>=2 chars, spec B5): the ORIGINAL '/a' vs '/a/b' pair
+# had one side map to a drive root on the Windows family and the other not
+# (winify_path requires a trailing slash after the single letter, so '/a'
+# itself stays put while '/a/b' becomes 'A:/b'), which flips the relation to
+# 'unrelated' there. The rename makes the pair platform-invariant by
+# construction, leaving intent/expected/count unchanged.
+is(path_relation('/aa', '/aa/b'),      'ancestor',
+   "AC-9: DIRECTION ANCHOR — path_relation('/aa','/aa/b') eq 'ancestor' (target contains root)");
+is(path_relation('/', '/aa/b/c'),     'ancestor',
+   "AC-9: path_relation('/','/aa/b/c') eq 'ancestor'");
 
 is(path_relation('/a/x', '/b/y'), 'unrelated', "AC-10: path_relation('/a/x','/b/y') eq 'unrelated'");
 
@@ -166,8 +237,13 @@ is(path_relation('/a/./b', '/a/b'),     'exact',     "AC-13: dot segment — /a/
 is(path_relation('/a/b/c/..', '/a/b'),  'exact',     "AC-13: trailing .. — /a/b/c/.. vs /a/b eq 'exact'");
 is(path_relation('/a/b/../c', '/a/b'),  'unrelated', "AC-13: /a/b/../c vs /a/b eq 'unrelated'");
 
-is(path_relation('/a/../..', '/'), 'exact',      "AC-14: clamped .. compares as root — /a/../.. vs / eq 'exact'");
-is(path_relation('/x', '/a/../..'), 'descendant', "AC-14: /x vs clamped /a/../.. eq 'descendant'");
+# Renamed 'a' -> 'aa' and 'x' -> 'xx' (>=2 chars, spec B5): '/a/../..' escapes
+# a single-letter root and mapped to a drive root ('A:/') on the Windows
+# family while its comparison partner '/' did not, flipping 'exact' to
+# 'unrelated' there. Multi-character segments make both assertions
+# platform-invariant by construction.
+is(path_relation('/aa/../..', '/'), 'exact',      "AC-14: clamped .. compares as root — /aa/../.. vs / eq 'exact'");
+is(path_relation('/xx', '/aa/../..'), 'descendant', "AC-14: /xx vs clamped /aa/../.. eq 'descendant'");
 
 # Mixed separators with a MATCHING drive-letter case — platform-independent
 # (no case folding is exercised; both inputs already spell 'C:').
@@ -375,21 +451,25 @@ is(path_relation('/a/b/c', '/a/b', { realpath => sub { die 'no' } }), 'descendan
 }
 
 # AC-32 — bad entries never discard good ones
+# Renamed first segment 'p' -> 'pkg' (>=2 chars, spec B5): '/p/good/src' etc.
+# matched winify_path's single-letter rule and became 'P:/good/src' on the
+# Windows family, breaking has_root's exact-string comparison below. Fixture
+# and assertions renamed together (spec §5.2) so the meaning is unchanged.
 {
     my $reg = {
-        good      => { source => { source => 'directory', path => '/p/good/src' }, installLocation => '/p/good/inst' },
+        good      => { source => { source => 'directory', path => '/pkg/good/src' }, installLocation => '/pkg/good/inst' },
         notahash  => 'scalar',
         noinstall => { source => { source => 'github', repo => 'o/r' } },
-        dirnopath => { source => { source => 'directory' }, installLocation => '/p/dnp/inst' },
+        dirnopath => { source => { source => 'directory' }, installLocation => '/pkg/dnp/inst' },
     };
     my $r = protected_roots({
         registry => $reg, extra_list => [],
         env => $env_of->(CLAUDE_CONFIG_DIR => '/home/u/.claude'),
         exists => $no_fs, read_file => $no_fs, realpath => $rp_id,
     });
-    ok(has_root($r, '/p/good/inst', 'marketplace-install'), 'AC-32: good entry installLocation root present');
-    ok(has_root($r, '/p/good/src',  'marketplace-source'),  'AC-32: good entry source.path root present');
-    ok(has_root($r, '/p/dnp/inst',  'marketplace-install'), 'AC-32: dirnopath entry installLocation root still present');
+    ok(has_root($r, '/pkg/good/inst', 'marketplace-install'), 'AC-32: good entry installLocation root present');
+    ok(has_root($r, '/pkg/good/src',  'marketplace-source'),  'AC-32: good entry source.path root present');
+    ok(has_root($r, '/pkg/dnp/inst',  'marketplace-install'), 'AC-32: dirnopath entry installLocation root still present');
     is(scalar(@{ $r->{errors} }), 3, 'AC-32: exactly three registry-entry errors, one per offending (entry,field)');
     is((grep { $_->{code} eq 'registry-entry' } @{ $r->{errors} }), 3, 'AC-32: all three errors are registry-entry');
 }
@@ -1012,10 +1092,19 @@ for my $t ('/', 'C:', 'C:/', 'C:\\', '/a/../..') {
 # =====================================================================
 
 # AC-68 — the option is accepted and honoured on any host.
+# NOTE (00-suite-baseline-green §5.1): `{ windows => 0|1 }` governs ONLY step
+# 6.5 (the trailing dot/space strip below); it does NOT gate canon_path's
+# drive-letter mapping, which stays keyed to the ambient $^O regardless of
+# this opt (by design — see ProtectedPaths.pm's own docstring). So a
+# single-letter first segment such as '/a/...' still silently aliases a
+# drive root on the Windows family EVEN under windows=>0, and renamed to
+# 'aa' (>=2 chars, spec B5) here — NOT by threading $opts into canon_path,
+# which is explicitly forbidden (that would be a real behaviour change to a
+# security module, made for test convenience).
 {
     is(normalize_path('C:/a/b/./c', { windows => 1 }), 'C:/a/b/c',
         'AC-68: normalize_path honours windows=>1 (drive-letter path normalises)');
-    is(normalize_path('/a/b/./c', { windows => 0 }), '/a/b/c',
+    is(normalize_path('/aa/b/./c', { windows => 0 }), '/aa/b/c',
         'AC-68: normalize_path honours windows=>0 (POSIX path normalises)');
 }
 
@@ -1023,26 +1112,33 @@ for my $t ('/', 'C:', 'C:/', 'C:\\', '/a/../..') {
 # windows=>1 and must NOT fire under windows=>0, ON LINUX. On POSIX "foo." and
 # "foo " are legitimately distinct directory names; on Windows they alias
 # "foo". This pair is what MINOR-8 made impossible to assert on a Linux host.
+# First segment renamed 'a' -> 'aa' throughout (>=2 chars, spec B5) for the
+# same reason as AC-68 above: canon_path's drive mapping is ungated by
+# `windows`, so a single-letter segment would alias a drive root on the
+# Windows family independently of the windows=>0/1 opt under test here.
 {
-    is(normalize_path('/a/foo./b', { windows => 1 }), '/a/foo/b',
+    is(normalize_path('/aa/foo./b', { windows => 1 }), '/aa/foo/b',
         'AC-69: windows=>1 strips a trailing dot from a segment (Win32 filesystem quirk)');
-    is(normalize_path('/a/foo /b', { windows => 1 }), '/a/foo/b',
+    is(normalize_path('/aa/foo /b', { windows => 1 }), '/aa/foo/b',
         'AC-69: windows=>1 strips a trailing space from a segment');
-    is(normalize_path('/a/foo./b', { windows => 0 }), '/a/foo./b',
+    is(normalize_path('/aa/foo./b', { windows => 0 }), '/aa/foo./b',
         'AC-69: windows=>0 PRESERVES a trailing dot — distinct name on POSIX');
-    is(normalize_path('/a/foo /b', { windows => 0 }), '/a/foo /b',
+    is(normalize_path('/aa/foo /b', { windows => 0 }), '/aa/foo /b',
         'AC-69: windows=>0 PRESERVES a trailing space — distinct name on POSIX');
-    is(normalize_path('/a/../b', { windows => 1 }), '/b',
+    is(normalize_path('/aa/../b', { windows => 1 }), '/b',
         'AC-69: the ".." marker is exempt from the strip and still resolves under windows=>1');
 }
 
 # AC-70 — BACK-COMPAT GUARD. Called with no second argument, behaviour is
 # byte-identical to today. launcher.pl calls normalize_path($x) with one
-# argument at :458 and :487; that must not change meaning.
+# argument at :458 and :487; that must not change meaning. First segment
+# renamed 'a' -> 'aa' (>=2 chars, spec B5): the no-opts call still uses the
+# AMBIENT platform probe, so a single-letter segment is just as alias-prone
+# here as under an explicit opt above.
 {
-    is(normalize_path('/a/b/./c'), '/a/b/c',
+    is(normalize_path('/aa/b/./c'), '/aa/b/c',
         'AC-70: no-opts call still normalises POSIX paths as before');
-    is(normalize_path('/a/b/../c'), '/a/c',
+    is(normalize_path('/aa/b/../c'), '/aa/c',
         'AC-70: no-opts call still resolves ".." as before');
     is(normalize_path('//'), '/',
         'AC-70: no-opts all-slash pre-guard still returns "/"');
