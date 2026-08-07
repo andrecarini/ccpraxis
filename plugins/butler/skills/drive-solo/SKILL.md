@@ -78,6 +78,44 @@ Proven by `plugins/butler/tests/t/94-drive-loop-gate.t`.
   (one-shot) and `CCPRAXIS_DRIVE_STOP_OK=1`, and fails **open** on any internal
   error — a gate that will not yield is worse than a stalled run.
 
+## Arm the watchdog — the other half, for **wedged** rather than **stopped**
+
+The gate above catches a turn that ends with nothing scheduled. It cannot catch the
+harder failure: you dispatch a worker, the turn legitimately ends because a wake-up
+*was* scheduled, and **the wake-up never arrives** — the worker hung, died silently,
+or is itself waiting on something that can never happen. No `Stop` event fires, so no
+`Stop` hook can help. The session sits idle, indefinitely, looking exactly like a
+session that is working. That is DAME field report batch-1 #11: an orphaned watcher
+still looping after **seventeen hours**, counted as live the whole time.
+
+So **arm the watchdog at the start of a run, and re-arm it every time it fires**:
+
+```bash
+perl plugins/butler/scripts/bp-watchdog.pl --sleep 1800 --arm    # run_in_background
+```
+
+A backgrounded Bash call notifies the session when it exits, so the watchdog's own
+expiry is a wake-up you control. Even if every other wake-up in the run is lost, the
+session revives on this one. It converts silent death into **at most 30 minutes of
+silence**.
+
+On each firing it prints one of three verdicts — act on it, don't just re-arm blindly:
+
+| verdict | meaning | what to do |
+|---|---|---|
+| `SETTLED` | the director reports no remaining work | stop; do **not** re-arm |
+| `PROGRESS` | the tree moved during the window | re-arm and carry on |
+| `STALLED` | nothing moved, and the director still wants work | **diagnose before re-arming** — it names the wedged package, how long its ledger has been silent, and what to check |
+
+A `STALLED` verdict is not a prompt to wait longer. A wait that has already failed once
+does not improve by being repeated: re-dispatch the wedged worker instead. And treat an
+empty or narration-shaped worker result as a **dead dispatch**, not a finding of
+"nothing" — a worker that runs out of turns returns its last narration, which reads
+exactly like success.
+
+The watchdog observes and reports; it never kills anything and never writes into a
+blueprint. Remediation is a judgment call and stays with you.
+
 ## Lean-context
 
 > **lean-context** doctrine (Decision #6): the driver reads only ≤15-line worker summaries, ledgers, and the director's JSON. Workers do the heavy reading. The harness auto-summarizes; the run is idempotent — the director is stateless-from-disk, so a summarize or re-invoke resumes losslessly. Old decisions stay decided.
