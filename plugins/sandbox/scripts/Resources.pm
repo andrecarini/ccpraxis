@@ -23,10 +23,32 @@ use JSON::PP ();   # core; the only dependency (precedent: SessionFilter.pm)
 # image-store walk last (most expensive, first thing the budget drops).
 my @PROBE_ORDER = qw(stats machine cim_mem cim_cpu cim_disk df);
 
+# The 15 closed keys of the Resources::build / snapshot "resources" struct,
+# in no particular order (unlike @PROBE_ORDER this list has no cadence
+# meaning -- it exists so snapshot_build can extract exactly these keys and
+# no others, per-key, without depending on build()'s internal hash literal).
+my @STRUCT_KEYS = qw(
+    machine_name machine_state
+    ctr_mem_used vm_mem_total ctr_cpu_pct
+    pod_images pod_containers pod_volumes
+    host_ram_used host_ram_total
+    host_disk_dev host_disk_used host_disk_total
+    host_cpu_pct host_cores
+);
+
 my $DEFAULT_BUDGET   = 4;    # elapsed seconds for a whole probe round
 my $SAMPLE_INTERVAL  = 23;   # seconds between probe rounds (coprime with the
                              # 10s inspect cadence, so the two rounds collide
-                             # once every 230s instead of every 50s)
+                             # once every 230s instead of every 50s) -- 03:
+                             # now exclusively the SAMPLER's own probe cadence
+my $READ_INTERVAL    = 5;    # 03: seconds between snapshot READS on the render tick
+my $MAX_AGE          = 60;   # 03: snapshot older than this reads 'stale'.
+                             # 2*interval()=46 < 60 < 3*interval()=69, so one
+                             # missed sampler round is still 'fresh' and two
+                             # consecutive missed rounds are 'stale'. Worst-case
+                             # observed age on a healthy system is
+                             # interval()+read_interval() = 28.
+my $SNAPSHOT_VERSION = 1;    # 03: the one supported snapshot schema version
 my $NUM_RE = qr/^-?\d+(?:\.\d+)?$/;
 
 # ---------------------------------------------------------------------------
@@ -310,9 +332,19 @@ sub build {
 # effects and cannot be require'd by a test).
 # ---------------------------------------------------------------------------
 
-# Resources::interval() -> 23, the single source of truth for the resources
-# cadence. Nothing else may hardcode it. PUBLIC, pure.
+# Resources::interval() -> 23, the single source of truth for the SAMPLER's
+# probe cadence. Nothing else may hardcode it. PUBLIC, pure.
 sub interval { return $SAMPLE_INTERVAL; }
+
+# Resources::read_interval() -> 5, the single source of truth for the render
+# tick's snapshot READ cadence (distinct from interval(), the sampler's probe
+# cadence). PUBLIC, pure.
+sub read_interval { return $READ_INTERVAL; }
+
+# Resources::max_age() -> 60, seconds; a snapshot older than this reads
+# 'stale' rather than 'fresh'. PUBLIC, pure. See $MAX_AGE's declaration
+# comment for the arithmetic rationale.
+sub max_age { return $MAX_AGE; }
 
 # Resources::should_sample($last_at, $now, $interval) -> 0 | 1. PUBLIC, pure,
 # total. An unusable $now means "cannot decide" -> do not sample; an unusable
@@ -394,6 +426,283 @@ sub gather {
     }
 
     return build({ %raw, container => $opts->{container}, device => $opts->{device} });
+}
+
+# ---------------------------------------------------------------------------
+# 03-resources-reader-model -- the sampler's probe-availability seam.
+# ---------------------------------------------------------------------------
+
+# Resources::sampler_probe_opts($container, $device) -> \%opts. The sampler's
+# opts for gather(): EXACTLY { container, device } -- no `now` key and no
+# `budget` key, ever. That absence is what disables gather's elapsed-budget
+# accounting (see gather's own header): every probe in @PROBE_ORDER is
+# invoked exactly once, off the render tick where a frame deadline no longer
+# applies. PUBLIC, pure, total.
+sub sampler_probe_opts {
+    my ($container, $device) = @_;
+    return {
+        container => (defined $container && !ref $container) ? $container : undef,
+        device    => (defined $device    && !ref $device)    ? $device    : undef,
+    };
+}
+
+# Resources::probe_availability($probes) -> { present => \@keys, absent => \@keys }.
+# `present` is every @PROBE_ORDER key for which $probes->{$key} is a CODE
+# ref, in @PROBE_ORDER order; `absent` is the remaining @PROBE_ORDER keys, in
+# @PROBE_ORDER order. Keys of $probes outside @PROBE_ORDER are ignored
+# entirely. A non-hashref $probes -> present => [], absent => the whole
+# @PROBE_ORDER. This is Rule 4's "not applicable on this platform" signal,
+# carried as DATA in the snapshot rather than as a zero. PUBLIC, pure, total.
+sub probe_availability {
+    my ($probes) = @_;
+    my (@present, @absent);
+    if (ref $probes eq 'HASH') {
+        for my $key (@PROBE_ORDER) {
+            if (ref $probes->{$key} eq 'CODE') { push @present, $key; }
+            else                               { push @absent,  $key; }
+        }
+    } else {
+        @absent = @PROBE_ORDER;
+    }
+    return { present => \@present, absent => \@absent };
+}
+
+# _probe_list($v) -> arrayref, $v filtered to @PROBE_ORDER members, in
+# @PROBE_ORDER order (never the input's own order). [] if $v is not an
+# arrayref. PRIVATE, pure, total.
+sub _probe_list {
+    my ($v) = @_;
+    return [] unless ref $v eq 'ARRAY';
+    my %have = map { (defined $_ && !ref $_) ? ($_ => 1) : () } @$v;
+    return [ grep { $have{$_} } @PROBE_ORDER ];
+}
+
+# ---------------------------------------------------------------------------
+# 03-resources-reader-model -- the snapshot: build / encode / parse / status.
+# ---------------------------------------------------------------------------
+
+# Keys of @STRUCT_KEYS that snapshot_build coerces through _num rather than
+# _str (03-resources-reader-model fix-batch, red-team M6). machine_name and
+# host_disk_dev are free strings; machine_state is handled separately below
+# (it is an enum, not a free string, and undef is a MEANINGFUL value -- "no
+# container" -- that must survive, unlike a garbage/ref value).
+my %NUM_STRUCT_KEY = map { $_ => 1 } qw(
+    ctr_mem_used vm_mem_total ctr_cpu_pct
+    pod_images pod_containers pod_volumes
+    host_ram_used host_ram_total
+    host_disk_used host_disk_total
+    host_cpu_pct host_cores
+);
+my %MACHINE_STATE_OK = map { $_ => 1 } qw(running starting stopped unknown);
+
+# Resources::snapshot_build($struct, $meta) -> \%snapshot. $struct is a
+# Resources::build-shaped hashref (or not -- see below); $meta is
+# { now, pid, container, platform, probes_run, probes_absent }. Returns a
+# hashref with EXACTLY eight keys, always all present: v (always 1),
+# written_at (uint|undef), sampler_pid (uint|undef), container (str|undef),
+# platform ('windows'|'posix'), probes_run/probes_absent (arrayrefs,
+# @PROBE_ORDER-filtered and -ordered), resources (the closed 15-key struct --
+# Resources::build({}) if $struct is not a hashref, else exactly the 15
+# @STRUCT_KEYS values taken from it, missing key -> undef, no other key
+# copied in).
+#
+# 03-resources-reader-model fix-batch (red-team M6): on the WRITE path
+# $struct comes from Resources::build, where every value is already
+# _num/_str-coerced -- but on the READ path (snapshot_parse) it comes from
+# arbitrary JSON, and a plain verbatim copy handed a HASH/ARRAY ref or a
+# JSON::PP::Boolean straight to the panel, reopening a Dashboard rendering
+# branch (a gauge bar with no real values behind it) that was previously
+# unreachable. Each value is now coerced the SAME way build() itself would
+# have produced it -- idempotent on already-clean input, so this changes
+# nothing for a real sampler and only tightens the corrupt/hostile-file case.
+# PUBLIC, pure, total.
+sub snapshot_build {
+    my ($struct, $meta) = @_;
+    $meta = {} unless ref $meta eq 'HASH';
+
+    my $resources;
+    if (ref $struct eq 'HASH') {
+        $resources = {};
+        for my $k (@STRUCT_KEYS) {
+            my $v = $struct->{$k};
+            if ($k eq 'machine_state') {
+                $v = 'unknown' if defined $v && (ref $v || !$MACHINE_STATE_OK{$v});
+            } elsif ($NUM_STRUCT_KEY{$k}) {
+                $v = _num($v);
+            } else {
+                $v = _str($v);
+            }
+            $resources->{$k} = $v;
+        }
+    } else {
+        $resources = build({});
+    }
+
+    return {
+        v              => $SNAPSHOT_VERSION,
+        written_at     => _uint($meta->{now}),
+        sampler_pid    => _uint($meta->{pid}),
+        container      => _str($meta->{container}),
+        platform       => (defined $meta->{platform} && $meta->{platform} eq 'windows') ? 'windows' : 'posix',
+        probes_run     => _probe_list($meta->{probes_run}),
+        probes_absent  => _probe_list($meta->{probes_absent}),
+        resources      => $resources,
+    };
+}
+
+# Resources::snapshot_encode($snapshot) -> $bytes | undef. Canonical (sorted
+# key order) JSON::PP encoding, so a round-trip is byte-comparable. undef if
+# $snapshot is not a hashref or the encode fails. PUBLIC, pure, total.
+sub snapshot_encode {
+    my ($snap) = @_;
+    return undef unless ref $snap eq 'HASH';
+    local $@;
+    my $bytes = eval { JSON::PP->new->canonical(1)->encode($snap) };
+    return (defined $bytes && !$@) ? $bytes : undef;
+}
+
+# Resources::snapshot_parse($bytes) -> \%snapshot | undef. Total inverse of
+# snapshot_encode: undef -- NEVER a partial struct -- when $bytes is
+# undef/ref/empty, is not decodable JSON (covers a truncated document),
+# decodes to something other than a hashref, has v != 1, or has a
+# `resources` that is not a hashref. Otherwise returns a NORMALISED snapshot
+# (routed back through snapshot_build, so it carries the same eight keys and
+# coercions, and `resources` is normalised to exactly the 15 @STRUCT_KEYS
+# keys). Goes through _decode (BOM strip, warnings swallowed, never dies).
+# PUBLIC, pure, total.
+sub snapshot_parse {
+    my ($bytes) = @_;
+    return undef if !defined $bytes || ref $bytes || !length $bytes;
+    my $d = _decode($bytes);
+    return undef unless ref $d eq 'HASH';
+    my $v = _uint($d->{v});
+    return undef unless defined $v && $v == $SNAPSHOT_VERSION;
+    return undef unless ref $d->{resources} eq 'HASH';
+    return snapshot_build($d->{resources}, {
+        now           => $d->{written_at},
+        pid           => $d->{sampler_pid},
+        container     => $d->{container},
+        platform      => $d->{platform},
+        probes_run    => $d->{probes_run},
+        probes_absent => $d->{probes_absent},
+    });
+}
+
+# Resources::snapshot_status($parsed, $now, $max_age) -> { state, age,
+# written_at, resources }. $max_age defaults to max_age() when not a usable
+# positive number. `state` is NEVER 'absent' here -- absence is a filesystem
+# fact and belongs to the caller (_gather_resources). On 'stale' and 'failed'
+# the returned `resources` is the all-n/a struct: a stale snapshot's numbers
+# are never handed to the panel as if current. Evaluated in this order:
+#   $parsed not a hashref                      -> failed, age undef, written_at undef, resources build({})
+#   written_at/$now not usable numbers         -> failed, age undef, written_at AS PARSED, resources build({})
+#   $now < written_at (clock went backwards)   -> fresh,  age 0,             resources $parsed->{resources}
+#   $now - written_at <= $max_age              -> fresh,  age (now-written_at), resources $parsed->{resources}
+#   otherwise                                  -> stale,  age (now-written_at), resources build({})
+#
+# H3 (03-resources-reader-model fix-batch, step 7): a $written_at meaningfully
+# AHEAD of $now used to read unconditionally as fresh/age=>0, with no bound on
+# the skew -- one NTP step or DST jump would pin the panel to an arbitrarily
+# old measurement presented as "written just now". The anti-flicker intent
+# (small forward skew should not flicker the panel to n/a) is preserved for
+# skew <= $max_age; beyond that the skew can no longer be told apart from a
+# genuine time machine, so it degrades to 'stale' like any other aged-out
+# snapshot -- never to 'failed', because the record itself is well-formed and
+# the resources it names once existed.
+# Never dies, never warns. PUBLIC, pure, total.
+sub snapshot_status {
+    my ($parsed, $now, $max_age) = @_;
+    my $ma = _num($max_age);
+    $ma = max_age() unless defined $ma && $ma > 0;
+
+    return { state => 'failed', age => undef, written_at => undef, resources => build({}) }
+        unless ref $parsed eq 'HASH';
+
+    my $wa = _num($parsed->{written_at});
+    my $n  = _num($now);
+    return { state => 'failed', age => undef, written_at => $parsed->{written_at}, resources => build({}) }
+        unless defined $wa && defined $n;
+
+    return { state => 'fresh', age => 0, written_at => $wa, resources => $parsed->{resources} }
+        if $n < $wa && ($wa - $n) <= $ma;
+
+    return { state => 'stale', age => 0, written_at => $wa, resources => build({}) }
+        if $n < $wa;
+
+    return { state => 'fresh', age => $n - $wa, written_at => $wa, resources => $parsed->{resources} }
+        if ($n - $wa) <= $ma;
+
+    return { state => 'stale', age => $n - $wa, written_at => $wa, resources => build({}) };
+}
+
+# ---------------------------------------------------------------------------
+# 03-resources-reader-model -- sampler pidfile / orphan-reap decision.
+# ---------------------------------------------------------------------------
+
+# Resources::sampler_reap_decision($text, $now, $interval, $owner_alive) ->
+# { pid, owner, reap }. Parses one sampler pidfile record and decides whether
+# killing that PID is safe. $text must match /^\s*(\d+)\s+(\d+)\s+(\d+)\s*$/
+# -- "sampler_pid owner_pid stamp". No match (including undef/ref/empty
+# $text) -> { pid => undef, owner => undef, reap => 0 }. On match: pid => $1,
+# owner => $2 (03 fix-batch H1: previously DISCARDED via
+# "my ($pid, undef, $stamp) = (...)", which meant nothing downstream could
+# ever tell a live peer's sampler apart from a genuine orphan -- recovering
+# it here is what makes the 4th parameter meaningful).
+#
+# $owner_alive answers a DIFFERENT question than the stamp does: the stamp
+# says "is this record recent"; $owner_alive says "is this process actually
+# an orphan". Only the second question is safe to gate a kill() on --
+# 03 fix-batch H1/H2c:
+#   $owner_alive is TRUE      -> reap => 0 UNCONDITIONALLY. A live recorded
+#                                 owner is BY DEFINITION not orphaned, no
+#                                 matter how stale or fresh the stamp reads
+#                                 (this is what stops a second dashboard's
+#                                 reaper from killing a first dashboard's
+#                                 healthy sampler -- red-team H1).
+#   $owner_alive is FALSE     -> reap => 1 whenever pid > 0, $now is usable,
+#                                 and $stamp <= $now -- REGARDLESS of
+#                                 staleness. A confirmed-dead owner removes
+#                                 the PID-recycling ambiguity that the
+#                                 staleness rule exists to guard against, so
+#                                 a wedged-but-ours sampler (frozen stamp, the
+#                                 exact state a hung probe produces) is now
+#                                 reapable instead of being permanently
+#                                 immortal -- red-team H2c.
+#   $owner_alive is undef     -> falls back to the ORIGINAL freshness-only
+#     (the default when omitted) algorithm: reap => 1 IFF pid > 0 AND $now is usable AND
+#                                 $stamp <= $now AND $now - $stamp <= 3 *
+#                                 $interval. This is the correct fallback for
+#                                 a caller that cannot determine owner
+#                                 liveness -- it is NOT what a caller that CAN
+#                                 determine it should rely on; see
+#                                 _resources_sampler_reap_orphan in
+#                                 launcher.pl, which always computes and
+#                                 passes owner liveness explicitly rather than
+#                                 omitting this argument.
+# pid = 0 always refuses (reap => 0), independent of $owner_alive -- pid
+# remains the load-bearing safety gate. $interval defaults to interval() when
+# unusable. Never dies, never warns. PUBLIC, pure, total.
+sub sampler_reap_decision {
+    my ($text, $now, $iv, $owner_alive) = @_;
+    return { pid => undef, owner => undef, reap => 0 } if !defined $text || ref $text;
+    return { pid => undef, owner => undef, reap => 0 } unless $text =~ /^\s*(\d+)\s+(\d+)\s+(\d+)\s*$/;
+    my ($pid, $owner, $stamp) = ($1, $2, $3);
+
+    my $i = _num($iv);
+    $i = interval() unless defined $i && $i > 0;
+    my $n = _num($now);
+
+    my $reap;
+    if (defined $owner_alive) {
+        if ($owner_alive) {
+            $reap = 0;                                                     # H1: never reap a live owner's sampler
+        } else {
+            $reap = ($pid > 0 && defined $n && $stamp <= $n) ? 1 : 0;       # H2c: dead owner -> reapable regardless of staleness
+        }
+    } else {
+        $reap = ($pid > 0 && defined $n && $stamp <= $n && ($n - $stamp) <= 3 * $i) ? 1 : 0;  # original freshness-only fallback
+    }
+    return { pid => $pid, owner => $owner, reap => $reap };
 }
 
 1;

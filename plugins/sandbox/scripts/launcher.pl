@@ -165,6 +165,12 @@ my $HOST_PLUGINS_DIR  = "$CLAUDE_HOST_CONFIG/plugins";
 my $LAUNCHER_PL       = "$SANDBOX_PLUGIN/scripts/launcher.pl";
 my $SANDBOX_PS1       = "$SANDBOX_PLUGIN/bin/claude-sandbox.ps1";
 my $READKEY_OK        = eval { require Term::ReadKey; 1 } ? 1 : 0;
+# 03-resources-reader-model: THIS FILE's own resolved path, distinct from
+# $LAUNCHER_PL (which points at the live install). The resources sampler
+# re-execs $SELF_PL, not $LAUNCHER_PL, so a dev clone spawns ITS OWN build's
+# sampler rather than the live install's -- otherwise the snapshot contract
+# could mismatch silently between the two.
+my $SELF_PL = do { my $p = abs_path($0) // $0; $p =~ s|\\|/|g; $p };
 
 # =====================================================================
 # Arg parsing
@@ -181,6 +187,14 @@ my $SESSION_MODE   = 0;   # B2: --session => internal connector entry (Decision 
                           # spawned by the dashboard's launch-claude hotkey in a
                           # new window. Bare `claude-sandbox` always lands on the
                           # dashboard instead.
+# 03-resources-reader-model: --resources-sampler => this invocation IS the
+# detached sampler (re-exec'd by _resources_sampler_start), not the launcher
+# manager/connector. --sampler-container / --sampler-owner-pid are its two
+# required companions; no value here may contain a ':' (the drive letter is
+# deliberately NOT passed as an argument -- see $SELF_PL / _resources_sampler_main).
+my $RESOURCES_SAMPLER_MODE = 0;
+my $SAMPLER_CONTAINER;
+my $SAMPLER_OWNER_PID;
 my @POSITIONAL;
 {
     my @argv = @ARGV;
@@ -193,12 +207,36 @@ my @POSITIONAL;
             $RESUME_SESSION = $1;
         } elsif ($a eq '--session') {
             $SESSION_MODE = 1;
+        } elsif ($a eq '--resources-sampler') {
+            $RESOURCES_SAMPLER_MODE = 1;
+        } elsif ($a eq '--sampler-container') {
+            $SAMPLER_CONTAINER = @argv ? shift(@argv) : undef;
+        } elsif ($a =~ /^--sampler-container=(.*)$/) {
+            $SAMPLER_CONTAINER = $1;
+        } elsif ($a eq '--sampler-owner-pid') {
+            $SAMPLER_OWNER_PID = @argv ? shift(@argv) : undef;
+        } elsif ($a =~ /^--sampler-owner-pid=(.*)$/) {
+            $SAMPLER_OWNER_PID = $1;
         } elsif ($a eq '--') {
             push @POSITIONAL, @argv;
             @argv = ();
         } else {
             push @POSITIONAL, $a;
         }
+    }
+}
+
+# A missing or malformed required flag in sampler mode is a hard error --
+# print one line to STDERR and exit 2. Nothing is written (this runs before
+# $PROJECT_PATH is even resolved).
+if ($RESOURCES_SAMPLER_MODE) {
+    if (!defined $SAMPLER_CONTAINER || $SAMPLER_CONTAINER !~ /^[A-Za-z0-9._-]+$/) {
+        print STDERR "ERROR: --resources-sampler requires --sampler-container matching /^[A-Za-z0-9._-]+\$/\n";
+        exit 2;
+    }
+    if (!defined $SAMPLER_OWNER_PID || $SAMPLER_OWNER_PID !~ /^\d+$/) {
+        print STDERR "ERROR: --resources-sampler requires --sampler-owner-pid matching /^\\d+\$/\n";
+        exit 2;
     }
 }
 
@@ -717,6 +755,13 @@ my $MANIFEST_FILE             = "$LAUNCHER_DIR/container-manifest.json";
 my $SNAPSHOT_FILE             = "$LAUNCHER_DIR/.discovery-snapshot.json";
 my $PLUGINS_SNAPSHOT_FILE     = "$LAUNCHER_DIR/.plugins-snapshot.json";
 my $MCP_SNAPSHOT_FILE         = "$LAUNCHER_DIR/.mcp-snapshot.json";
+# 03-resources-reader-model: the detached sampler's one artifact and its
+# liveness pidfile. Declared under the same per-project state dir as every
+# other snapshot above. Deliberately never unlinked by the reaper on launch
+# (see _resources_sampler_reap_orphan) -- a leftover snapshot simply ages
+# past Resources::max_age() and reads 'stale', which IS the mechanism.
+my $RESOURCES_SNAPSHOT_FILE   = "$LAUNCHER_DIR/.resources-snapshot.json";
+my $RESOURCES_SAMPLER_PID     = "$LAUNCHER_DIR/resources-sampler.pid";
 my $SETTINGS_LOCAL_FILE       = "$PROJECT_PATH/.claude/settings.local.json";
 # installed_plugins.json lives under claude-home/plugins/ (Fix 2), NOT
 # .launcher/ — so it appears at /root/.claude/plugins/installed_plugins.json as
@@ -773,9 +818,9 @@ my $LAUNCH_ID = strftime("%Y%m%dT%H%M%SZ", gmtime()) . "-$$";
 sub log_ev { LaunchLog::event($LAUNCH_LOG, @_) }
 
 # s17-statusline-and-output-hygiene (spec S3): file-scope so BOTH the
-# enter_dashboard raw-mode closures AND the file-scope $SIG{INT}/$SIG{TERM}/
-# END handlers below can restore the process's own STDERR -- including on
-# the signal/abnormal-exit path, not only the clean leave_raw path.
+# enter_dashboard raw-mode closures AND the file-scope INT/TERM/END signal
+# handlers below can restore the process's own STDERR -- including on the
+# signal/abnormal-exit path, not only the clean leave_raw path.
 my $STDERR_CAPTURE_SAVED;   # dup'd original STDERR filehandle, while redirected
 my $STDERR_CAPTURE_FH;      # File::Temp filehandle currently receiving STDERR
 my $STDERR_CAPTURE_PATH;    # File::Temp path currently receiving STDERR
@@ -895,6 +940,13 @@ sub _c_err  { _c('1;31', $_[0]) }   # bold red   — an ERROR: label
 my $KEEPAWAKE;
 sub _keepawake_release_global { eval { $KEEPAWAKE->release if $KEEPAWAKE }; }
 
+# 03-resources-reader-model: cygwin pid of our sampler child, or undef. Same
+# file-scope-for-signal-teardown rationale as $KEEPAWAKE above -- a leaked
+# sampler would keep sampling (and podman-spawning) forever after the
+# launcher exits.
+my $RESOURCES_SAMPLER_CHILD;
+sub _resources_sampler_release_global { eval { _resources_sampler_stop($RESOURCES_SAMPLER_CHILD, $RESOURCES_SAMPLER_PID) if $RESOURCES_SAMPLER_CHILD }; }
+
 # _tee_system(@cmd) — run @cmd streaming its combined stdout+stderr LIVE to the
 # console AND into the transcript. system()-style return value ($? convention:
 # 0 ok, child exit = rc>>8). Falls back to a plain system() when there is no
@@ -941,7 +993,17 @@ sub ensure_ccpraxis_data_dir {
 # only the new location.
 {
     my $old = "$PROJECT_PATH/.claude-data";
-    if (-d $old && ! -d $CLAUDE_DATA) {
+    # 03-resources-reader-model fix-batch (red-team M5): this block (and the
+    # bootstrap block just below it) sits BEFORE the --resources-sampler
+    # dispatch (spec B9: sampler mode must never inspect/start/remove a
+    # container and must never reach the TUI). In the ordinary case the
+    # PARENT already evaluated these same conditions moments earlier, so both
+    # are inert for the child by the time it re-execs here -- but that is
+    # true only because $CLAUDE_DATA hasn't changed underneath it. Guard
+    # explicitly rather than rely on that timing coincidence: a background
+    # process with no console must never run an unattended container removal
+    # or bootstrap.
+    if (!$RESOURCES_SAMPLER_MODE && -d $old && ! -d $CLAUDE_DATA) {
         ensure_ccpraxis_data_dir();
 
         # A container created against the OLD .claude-data path keeps a
@@ -1010,7 +1072,12 @@ sub ensure_ccpraxis_data_dir {
 # verify the sandbox home was created and continue into the normal
 # launch flow.
 
-if (! -d $CLAUDE_DATA) {
+# 03-resources-reader-model fix-batch (red-team M5): guarded the same way as
+# the migration block above -- the sampler's STDIN is /dev/null (B1), so
+# <STDIN> here would read undef, fall through the 'n' test, and run a full
+# UNATTENDED bootstrap with all output discarded. Never reachable in sampler
+# mode.
+if (!$RESOURCES_SAMPLER_MODE && ! -d $CLAUDE_DATA) {
     print "\n";
     print "==============================================================\n";
     print "  No sandbox found in this project.\n";
@@ -1051,6 +1118,18 @@ if (! -d $CLAUDE_DATA) {
 make_path($LAUNCHER_DIR) unless -d $LAUNCHER_DIR;
 
 # =====================================================================
+# 03-resources-reader-model: sampler-mode dispatch
+# =====================================================================
+# A re-exec of THIS SAME FILE (spawned by _resources_sampler_start) lands
+# here. MUST run before SandboxLock::acquire and before the INT/TERM/END
+# signal-handler installation below: the sampler never acquires the setup
+# lock, never opens the launch log, never touches the container, and never
+# enters the TUI. exit() never returns.
+if ($RESOURCES_SAMPLER_MODE) {
+    exit(_resources_sampler_main($SAMPLER_CONTAINER, $SAMPLER_OWNER_PID));   # never returns
+}
+
+# =====================================================================
 # Cross-process lock (per-project)
 # =====================================================================
 #
@@ -1075,9 +1154,16 @@ sub _rmtree {
 # dup'd original filehandle) if enter_raw had it redirected -- the
 # signal/abnormal-exit path must not leave the terminal with a redirected
 # STDERR after the dashboard closes.
-$SIG{INT}  = sub { open(STDERR, '>&', $STDERR_CAPTURE_SAVED) if $STDERR_CAPTURE_SAVED; log_ev('signal', { sig => 'INT' });  _keepawake_release_global(); LaunchLog::close_log($LAUNCH_LOG); _close_transcript(); SandboxLock::release_all(); reset_terminal(); exit 130 };
-$SIG{TERM} = sub { open(STDERR, '>&', $STDERR_CAPTURE_SAVED) if $STDERR_CAPTURE_SAVED; log_ev('signal', { sig => 'TERM' }); _keepawake_release_global(); LaunchLog::close_log($LAUNCH_LOG); _close_transcript(); SandboxLock::release_all(); reset_terminal(); exit 143 };
-END { open(STDERR, '>&', $STDERR_CAPTURE_SAVED) if $STDERR_CAPTURE_SAVED; _keepawake_release_global(); LaunchLog::close_log($LAUNCH_LOG); _close_transcript(); SandboxLock::release_all() }
+$SIG{INT}  = sub { open(STDERR, '>&', $STDERR_CAPTURE_SAVED) if $STDERR_CAPTURE_SAVED; log_ev('signal', { sig => 'INT' });  _keepawake_release_global(); _resources_sampler_release_global(); LaunchLog::close_log($LAUNCH_LOG); _close_transcript(); SandboxLock::release_all(); reset_terminal(); exit 130 };
+$SIG{TERM} = sub { open(STDERR, '>&', $STDERR_CAPTURE_SAVED) if $STDERR_CAPTURE_SAVED; log_ev('signal', { sig => 'TERM' }); _keepawake_release_global(); _resources_sampler_release_global(); LaunchLog::close_log($LAUNCH_LOG); _close_transcript(); SandboxLock::release_all(); reset_terminal(); exit 143 };
+# 03-resources-reader-model fix-batch (red-team L15): closing the terminal
+# window -- the single most common way a user ends a dashboard -- sends HUP,
+# not INT/TERM, and perl does not run END blocks on an uncaught terminating
+# signal. Without a handler here, HUP skipped every teardown path (keep-awake
+# release, sampler release, lock release), which is the entry point for H2
+# step 3 (owner dies without ever running _resources_sampler_release_global).
+$SIG{HUP}  = $SIG{TERM};
+END { open(STDERR, '>&', $STDERR_CAPTURE_SAVED) if $STDERR_CAPTURE_SAVED; _keepawake_release_global(); _resources_sampler_release_global(); LaunchLog::close_log($LAUNCH_LOG); _close_transcript(); SandboxLock::release_all() }
 
 SandboxLock::acquire($LOCK_DIR, windows => $WINDOWS_FAMILY) or do {
     print STDERR "ERROR: another claude-sandbox is doing setup for this project (lock held > 10s at $LOCK_DIR).\n";
@@ -3596,7 +3682,7 @@ sub enter_dashboard {
     my $cached_backpack         = undef;   # B4: backpack items + per-item approval
     my $cached_oauth_expires_at = undef;   # 01-oauth: epoch-s when the OAuth token expires
     my $cached_tokens           = undef;   # s08: TokenInfo struct
-    my $cached_resources        = undef;   # s09: Resources::build struct (never undef after the first round)
+    my $cached_resources        = undef;   # s09/03: the reader's return value. undef means the detached sampler has not written a snapshot yet (or fork() failed) -- the panel is deliberately absent, never undef-as-a-bug.
     my $cached_runs             = [];      # s10: RunState::summarize struct, initialised to [] so the "runs" key is never undef
     my $last_inspect            = 0;
     my $last_resources          = 0;       # s09: stamp for the throttled probe cadence
@@ -3619,6 +3705,14 @@ sub enter_dashboard {
         start => sub { _keepawake_start($ka_helper, $ka_pidfile) },
         stop  => sub { _keepawake_stop($_[0], $ka_pidfile) },
     );
+
+    # 03-resources-reader-model: detached resources sampler. Reap any helper
+    # orphaned by a previously-crashed launcher first, then fork+exec our own
+    # (fork-failure degrades honestly: no sampler, no snapshot,
+    # _gather_resources returns undef for the whole session -- the panel is
+    # simply absent, never a fabricated zero).
+    _resources_sampler_reap_orphan($RESOURCES_SAMPLER_PID, time);
+    $RESOURCES_SAMPLER_CHILD = _resources_sampler_start($RESOURCES_SAMPLER_PID, $CONTAINER_NAME);
 
     # red-team MINOR-1: one-shot guard shared by enter_raw/leave_raw so a
     # re-entrant leave_raw (second Ctrl-C during teardown) only pops the
@@ -3810,18 +3904,17 @@ sub enter_dashboard {
                 $last_inspect  = $now;
                 $probed_now    = 1;
             }
-            # s09: the expensive resource probes run on their OWN, slower
-            # cadence with their OWN stamp — deliberately NOT nested in the
-            # 10s inspect above. What that buys: the two rounds are decoupled,
-            # so a slow resources round never pushes the 10s inspect out of
-            # phase (its stamp advances independently), and 23 being coprime
-            # with 10 keeps the two rounds rarely landing in the same frame.
-            # What it does NOT buy: the round below runs INLINE, in this same
-            # callback that feeds the ~0.2s render loop, so it DOES stall a
-            # frame — every 23s and on the very first frame. See
-            # _resources_probes: nothing here is portably interruptible, so
-            # the throttle and the elapsed budget only bound the blast radius.
-            if (Resources::should_sample($last_resources, $now, Resources::interval())) {
+            # 03-resources-reader-model: the probe round no longer runs here at
+            # all. A detached sampler (forked in enter_dashboard, see
+            # _resources_sampler_start/_resources_sampler_round) does the
+            # podman/PowerShell probing off the render tick, on its own
+            # slower sampler-only cadence (23s), and writes a snapshot. This
+            # tick only READS that snapshot, on Resources::read_interval()
+            # (5s) -- one -f test and one file read, never a spawn.
+            # _gather_resources may legitimately return undef (sampler hasn't
+            # written yet, or the fork attempt failed); the panel is then
+            # simply absent, never a fabricated zero.
+            if (Resources::should_sample($last_resources, $now, Resources::read_interval())) {
                 $cached_resources = _gather_resources();
                 $last_resources   = $now;
             }
@@ -4542,19 +4635,32 @@ sub _powershell_json {
 # to produce the same n/a. Guard mirrors the precedent at the SANDBOX_HOST_IP
 # capture above.
 #
-# The CIM commands' -OperationTimeoutSec 3 is the one REAL wall-clock cap in
-# this package (it covers the three host probes only; podman's CLI offers no
-# timeout flag for stats / system df / machine list, and a blocking backtick
-# is not portably interruptible — the throttle and the elapsed budget bound
-# the blast radius).
+# The CIM commands' -OperationTimeoutSec 3 is one wall-clock cap in this
+# package; the OTHER is the literal `timeout 5` below, covering the three
+# podman backticks (stats / system df / machine list). podman's CLI itself
+# offers no timeout flag, and a blocking backtick is not portably
+# interruptible from INSIDE perl -- so the bound comes from wrapping the
+# external command in the in-repo `timeout N cmd` idiom instead (already used
+# at bp-baseline.pl:266; /usr/bin/timeout is present on this host and exits
+# 124 on expiry). The bound is a literal integer, not a variable -- it must
+# appear in the SOURCE TEXT for it to be a real, auditable guarantee.
+#
+# 03-resources-reader-model fix-batch (reviewer MAJOR-1 / red-team H2): a
+# hung podman/WSL backend used to block a probe backtick FOREVER, and because
+# _resources_sampler_main's kill(0,$owner_pid) liveness gate is only checked
+# ONCE PER ROUND (at the top of its loop), a stuck round meant the gate could
+# never fire again -- the sampler became unkillable even after its owning
+# launcher died. Bounding every podman probe here restores the once-per-round
+# gate to being an ACTUALLY-working gate: a round can no longer last forever,
+# so the loop always returns to the kill(0,...) check within a bounded time.
 sub _resources_probes {
     my %p = (
-        stats => sub { scalar `$PODMAN stats --no-stream --format json 2>/dev/null` },
-        df    => sub { scalar `$PODMAN system df --format json 2>/dev/null` },
+        stats => sub { scalar `timeout 5 $PODMAN stats --no-stream --format json 2>/dev/null` },
+        df    => sub { scalar `timeout 5 $PODMAN system df --format json 2>/dev/null` },
     );
     return \%p unless $WINDOWS_FAMILY;
     my %cmd = _ps_commands();
-    $p{machine}  = sub { scalar `$PODMAN machine list --format json 2>/dev/null` }
+    $p{machine}  = sub { scalar `timeout 5 $PODMAN machine list --format json 2>/dev/null` }
         if $PODMAN =~ /podman/i;
     $p{cim_mem}  = sub { _powershell_json($cmd{cim_mem}) };
     $p{cim_cpu}  = sub { _powershell_json($cmd{cim_cpu}) };
@@ -4562,30 +4668,200 @@ sub _resources_probes {
     return \%p;
 }
 
-# _gather_resources() -> the 15-key resource struct for the dashboard panel.
-# The thin wrapper that owns everything impure: the real probe coderefs, the
-# container/drive selectors, and the clock (time() is called HERE, never
-# inside Resources.pm). The drive is derived from the project path and
-# defaults to C: — not a fabrication, because the panel prints the device it
-# measured.
+# _gather_resources() -> \%struct | undef. READER ONLY (tui-adapter-contract
+# Rule 2): the probe round moved off the render tick entirely, into the
+# detached sampler (_resources_sampler_round, forked by
+# _resources_sampler_start in enter_dashboard). This sub performs no spawn of
+# any kind and reaches no sub that does, in this file OR in Resources.pm: one
+# -f test, one literal-mode 3-arg read `open` (the _gather_spend shape at
+# :4721), and a pure parse/status call. Four distinguishable outcomes (spec
+# S2.B/B16-B21), none ever a fabricated zero:
+#   never written (no snapshot file)         -> undef (panel absent)
+#   fresh  (age <= Resources::max_age())     -> the real 15 values + snapshot_state => 'fresh'
+#   stale  (age >  Resources::max_age())     -> the all-n/a struct + snapshot_state => 'stale', real age/written_at
+#   failed (unreadable/corrupt/wrong shape)  -> the all-n/a struct + snapshot_state => 'failed'
 sub _gather_resources {
-    my $dev;
-    if ($WINDOWS_FAMILY) {
-        $dev = ($PROJECT_PATH =~ m{^([A-Za-z]):}) ? uc($1) . ':' : 'C:';
+    return undef unless -f $RESOURCES_SNAPSHOT_FILE;
+    # 03-resources-reader-model fix-batch (red-team M4): $RESOURCES_SNAPSHOT_FILE
+    # lives under a container-writable bind mount ($CLAUDE_DATA/.launcher), so
+    # anything running in the sandbox can replace it with an arbitrarily large
+    # file. Refuse to slurp past a generous cap (a real snapshot is ~450
+    # bytes) -- report 'failed', exactly like any other unreadable/corrupt
+    # snapshot, rather than freezing the render tick decoding a planted
+    # multi-GB document every 5s.
+    my $sz = -s $RESOURCES_SNAPSHOT_FILE;
+    my $st;
+    if (!defined $sz || $sz > 65536) {
+        $st = Resources::snapshot_status(undef, time, Resources::max_age());
+    } else {
+        my $raw = eval { local $/; open my $fh, '<:raw', $RESOURCES_SNAPSHOT_FILE or die; <$fh> };
+        $st = Resources::snapshot_status(Resources::snapshot_parse($raw), time, Resources::max_age());
     }
-    # budget/now: the clock injected here is core time(), i.e. INTEGER seconds,
-    # so `4` is an advisory floor checked at 1-second resolution before each
-    # probe — the round can legitimately overrun it by the better part of a
-    # second plus however long the probe already running takes. Do not read it
-    # as a 4-second cap (Resources::gather's header states the same contract).
-    # A sub-second clock would tighten the resolution but not the cap, and the
-    # `now => sub { time }` shape is what the oracle pins.
-    return Resources::gather(_resources_probes(), {
-        container => $CONTAINER_NAME,
-        device    => $dev,
-        budget    => 4,
-        now       => sub { time },
+    return { %{ $st->{resources} },
+             snapshot_state      => $st->{state},      # 'fresh' | 'stale' | 'failed'
+             snapshot_age        => $st->{age},
+             snapshot_written_at => $st->{written_at} };
+}
+
+# _resources_sampler_start($pidfile, $container) -> child pid | undef.
+# Follows _keepawake_start (:4333-4359) construct for construct: fork, then
+# log-and-degrade with NO retry if fork fails (a real, documented hazard on
+# this platform -- "Can't fork, trying again in 5 seconds" -- the panel must
+# degrade honestly, never fabricate a value), child reopens STDIN/STDOUT/
+# STDERR on /dev/null, sets MSYS2_ARG_CONV_EXCL locally, then exec's. Re-execs
+# $SELF_PL (this same file), NOT $LAUNCHER_PL -- see $SELF_PL's own comment.
+# $pidfile is accepted for call-site symmetry with _keepawake_start / for the
+# stop/reap pairing below; the pidfile itself is written every round by
+# _resources_sampler_main via the global $RESOURCES_SAMPLER_PID, not here.
+sub _resources_sampler_start {
+    my ($pidfile, $container) = @_;
+    my $owner = $$;   # captured BEFORE forking -- in the CHILD, $$ is the child's OWN pid
+    my $pid = fork();
+    if (!defined $pid) {
+        log_ev('resources_sampler_start_failed', { reason => "fork: $!" });
+        return undef;                      # DEGRADE. No retry, no repeated attempts, no loop.
+    }
+    if ($pid == 0) {
+        open(STDIN,  '<', '/dev/null');
+        open(STDOUT, '>', '/dev/null');
+        open(STDERR, '>', '/dev/null');
+        local $ENV{MSYS2_ARG_CONV_EXCL} = '*';
+        exec($^X, $SELF_PL, '--resources-sampler',
+             '--sampler-container', $container,
+             '--sampler-owner-pid', $owner,
+             $PROJECT_PATH)
+            or do { POSIX::_exit(127) };
+    }
+    log_ev('resources_sampler_started', { pid => $pid });
+    return $pid;
+}
+
+# _resources_sampler_stop($child_pid, $pidfile) — mirrors _keepawake_stop
+# (:4364-4372). SIGKILL is immediate; waitpid reaps the zombie (it's a direct
+# fork of ours). Invoked from $SIG{INT}, $SIG{TERM} and END via
+# _resources_sampler_release_global.
+sub _resources_sampler_stop {
+    my ($pid, $pidfile) = @_;
+    if (defined $pid && $pid =~ /^\d+$/ && $pid > 0) {
+        kill('KILL', $pid);
+        waitpid($pid, 0);
+        log_ev('resources_sampler_stopped', { pid => $pid });
+    }
+    unlink $pidfile if defined $pidfile && -f $pidfile;
+}
+
+# _resources_sampler_reap_orphan($pidfile, $now) — mirrors
+# _keepawake_reap_orphan (:4379-4393), deliberately DEVIATING from its
+# cmdline-verification step (spec E3): our sampler is a cygwin perl child
+# with no self-reported WINDOWS pid to verify against, so the anti-PID-
+# recycling defence is Resources::sampler_reap_decision's pure
+# stamp-freshness check instead -- a record whose stamp has not been
+# refreshed within 3*interval() is treated as a recycled PID and never
+# killed UNLESS its recorded owner is confirmed dead (see below).
+#
+# 03-resources-reader-model fix-batch (red-team H1/H2b/H2c). The ACTUAL
+# concurrency safety here -- and the correction to the spec's now-inaccurate
+# "two launchers for one project are prevented upstream by SandboxLock" claim
+# (MINOR-1: SandboxLock is a SETUP lock, released before enter_dashboard) --
+# is owner-PID liveness, computed HERE at every call:
+#   * H1  -- a record whose owner is CONFIRMED ALIVE is never reaped, no
+#            matter how its stamp reads. A live owner is, by definition, not
+#            an orphan; this is what stops a second dashboard's reaper from
+#            killing a first dashboard's healthy sampler.
+#   * H2c -- a record whose owner is CONFIRMED DEAD is reapable regardless of
+#            staleness, closing the gap where a wedged (frozen-stamp) sampler
+#            used to be indistinguishable from a recycled PID and so was
+#            never reaped -- permanently immortal.
+#   * H2b -- the pidfile is unlinked ONLY when the decision says reap: a
+#            record for a process we decline to kill must remain findable by
+#            a LATER call (it used to be destroyed unconditionally, before
+#            the decision was even consulted).
+sub _resources_sampler_reap_orphan {
+    my ($pidfile, $now) = @_;
+    return unless defined $pidfile && -f $pidfile;
+    my $rec = _read_file($pidfile);
+    my $owner = (defined $rec && $rec =~ /^\s*\d+\s+(\d+)\s+\d+\s*$/) ? $1 : undef;
+    my $owner_alive = (defined $owner && $owner > 0) ? (kill(0, $owner) ? 1 : 0) : undef;
+    my $d = Resources::sampler_reap_decision($rec, $now, Resources::interval(), $owner_alive);
+    if ($d->{reap}) {
+        unlink $pidfile;
+        kill('KILL', $d->{pid});          # NOT our child -> no waitpid
+        log_ev('resources_sampler_orphan_reaped', { pid => $d->{pid} });
+    }
+    # L12: sweep any *.tmp.$$.<hex> siblings _write_file_atomic could have left
+    # behind if a prior sampler/dashboard was SIGKILLed between open and
+    # rename. This is the one place that already runs once per dashboard
+    # entry and already owns cleanup here.
+    unlink glob("$RESOURCES_SNAPSHOT_FILE.tmp.*"), glob("$RESOURCES_SAMPLER_PID.tmp.*");
+    return;
+}
+
+# _resources_sampler_round($container, $device, $snapshot_path) — ONE probe
+# round + ONE atomic write. This is where _resources_probes and
+# Resources::gather actually run (off the render tick entirely -- this sub
+# executes only inside the detached sampler process). sampler_probe_opts
+# carries no `now` key, so gather's elapsed-budget accounting is disabled and
+# every probe in @PROBE_ORDER runs exactly once, including the tail pair
+# cim_disk/df that starve under the render-tick budget shape (spec B22/B23).
+#
+# 03-resources-reader-model fix-batch (red-team M7/L11):
+#   * the clock is captured BEFORE the probe round, not after -- a snapshot's
+#     written_at is now the MEASUREMENT time, not the write time. Without
+#     this, a resurrected wedged sampler (H2c) writing a round that took five
+#     minutes would stamp it "now" and overwrite a newer, healthier
+#     dashboard's snapshot while masquerading as fresh (M7). It is also a
+#     strict improvement in the healthy case: written_at no longer overstates
+#     freshness by the round's own duration.
+#   * the write is skipped entirely when snapshot_encode fails (returns
+#     undef on a pathological encode error) -- writing that undef through
+#     _write_file_atomic used to blank a good, still-usable snapshot with a
+#     0-byte file for no reason; doing nothing here lets the existing
+#     snapshot age out to 'stale' honestly instead (L11).
+sub _resources_sampler_round {
+    my ($container, $device, $snapshot_path) = @_;
+    my $t0     = time;   # measurement time, captured before any probe runs
+    my $probes = _resources_probes();
+    my $avail  = Resources::probe_availability($probes);
+    my $res    = Resources::gather($probes, Resources::sampler_probe_opts($container, $device));
+    my $snap   = Resources::snapshot_build($res, {
+        now => $t0, pid => $$, container => $container,
+        platform => ($WINDOWS_FAMILY ? 'windows' : 'posix'),
+        probes_run => $avail->{present}, probes_absent => $avail->{absent},
     });
+    my $bytes = Resources::snapshot_encode($snap);
+    _write_file_atomic($snapshot_path, $bytes) if defined $bytes;
+}
+
+# _resources_sampler_main($container, $owner_pid) -> exit code. The sampler
+# child's whole life, entered ONLY via the --resources-sampler dispatch block
+# near the top of the file (before the setup lock, before the launch log,
+# before the TUI). sleep and a blocking probe are legitimate HERE -- this is
+# not the render tick; Rule 1 binds the tick, and after this package the
+# tick's entire cost is one -f test and one file read (spec E5).
+sub _resources_sampler_main {
+    my ($container, $owner_pid) = @_;
+    # 03-resources-reader-model fix-batch (red-team L8): _resources_sampler_start
+    # sets $ENV{MSYS2_ARG_CONV_EXCL} = '*' with `local` immediately before
+    # exec'ing this process, which -- because `local` on %ENV mutates the
+    # real environment and exec carries it forward -- leaves it set for this
+    # sampler's ENTIRE life and its whole subtree. It bought nothing at the
+    # exec (the target is an MSYS perl, so MSYS argument conversion never
+    # applied there); left set, it is a landmine armed under a long-lived
+    # process, on a project whose own CLAUDE.md documents 576 drive-root
+    # strays from exactly this configuration. Clear it here; the one probe
+    # that genuinely needs it (_powershell_json, for a native powershell.exe
+    # spawn) already `local`s it for itself.
+    delete $ENV{MSYS2_ARG_CONV_EXCL};
+    my $device;
+    $device = ($PROJECT_PATH =~ m{^([A-Za-z]):}) ? uc($1) . ':' : 'C:' if $WINDOWS_FAMILY;
+    while (1) {
+        last unless kill(0, $owner_pid);                     # owner gone -> self-exit within one cadence
+        eval { _write_file_atomic($RESOURCES_SAMPLER_PID, "$$ $owner_pid " . time . "\n"); 1 };
+        eval { _resources_sampler_round($container, $device, $RESOURCES_SNAPSHOT_FILE); 1 };
+        sleep Resources::interval();
+    }
+    unlink $RESOURCES_SAMPLER_PID;
+    return 0;
 }
 
 # _tail_lines — last $n chomped lines of a file (the B1 launch log), or ().

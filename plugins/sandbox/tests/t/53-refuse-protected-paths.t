@@ -745,28 +745,114 @@ unlike($src, qr/(force|override|bypass|unsafe|allow|skip|ignore)[-_ ]?(protect|r
 unlike($src, qr/(protect|refus|guard)[-_ ]?(force|override|bypass|off|disable)/i,
        "AC-41: no match for /(protect|refus|guard)[-_ ]?(force|override|bypass|off|disable)/i anywhere in launcher.pl");
 
-# ---- AC-42 -- pinned literal comparison of the while(@argv) arg-parser block
-#       (arg parsing is explicitly out of scope for q03; this block must stay
-#       byte-identical) ----
+# ---- AC-42 -- Decision #3, REWRITTEN (03-resources-reader-model fix-batch,
+#       step 7) -- see reports/03-resources-reader-model/{reviewer,redteam}.md
+#       and packages/03-resources-reader-model.md's 2026-08-07 ruling.
+#
+#       ORIGINAL FORM (retired): a byte-identical index($src,$ARG_BLOCK)>=0
+#       pin against a literal copy of the while(@argv) block. Its own comment
+#       said "arg parsing is explicitly out of scope for q03" -- it was a
+#       self-discipline check for a package that had already shipped, and it
+#       went red the moment 03-resources-reader-model legitimately added a
+#       --resources-sampler branch (spec E4: the write set forbids new files,
+#       so the detached sampler had to be a re-exec of launcher.pl through a
+#       new arg branch). A byte-identical pin FORBIDS every later package
+#       from ever extending arg parsing again -- package 08 also owns
+#       launcher.pl and will add its own flags -- so simply re-baselining it
+#       with --resources-sampler pasted in would just re-arm the identical
+#       trap one package later. Byte-identity was never the security
+#       property here; it was a change-detector that outlived the package it
+#       was guarding, and it is deliberately NOT restored below.
+#
+#       The actual security intent -- no argument branch can defeat the
+#       protected-path refusal -- is asserted DIRECTLY and durably instead:
+#       (1) no arg branch performs a side-effecting/unsafe action itself (the
+#           block only ever assigns scalars or pushes to @POSITIONAL -- never
+#           exit/system/exec/backtick/unlink/a write-mode open), so no branch
+#           can act before the refusal gate is ever reached; and
+#       (2) the SAME single, unconditional protected_path_outcome( call
+#           governs every mode the arg parser can set -- it is not
+#           conditioned on any mode flag, and it precedes both mode-specific
+#           dispatch points (--session's connector-mode branch and
+#           --resources-sampler's sampler-mode dispatch) by byte offset.
+#       Together these survive a legitimate new --flag exactly the way
+#       AC-41/AC-43/AC-44 already do, while still catching the one thing
+#       AC-42 ever actually needed to catch: a branch that bypasses the gate.
 {
-    my $ARG_BLOCK = '    while (@argv) {' . "\n"
-                  . '        my $a = shift @argv;' . "\n"
-                  . "        if (\$a eq '--resume-session') {\n"
-                  . '            die "ERROR: --resume-session requires a UUID argument\n" unless @argv;' . "\n"
-                  . '            $RESUME_SESSION = shift @argv;' . "\n"
-                  . '        } elsif ($a =~ /^--resume-session=(.*)$/) {' . "\n"
-                  . '            $RESUME_SESSION = $1;' . "\n"
-                  . "        } elsif (\$a eq '--session') {\n"
-                  . '            $SESSION_MODE = 1;' . "\n"
-                  . "        } elsif (\$a eq '--') {\n"
-                  . '            push @POSITIONAL, @argv;' . "\n"
-                  . '            @argv = ();' . "\n"
-                  . '        } else {' . "\n"
-                  . '            push @POSITIONAL, $a;' . "\n"
-                  . '        }' . "\n"
-                  . '    }' . "\n";
-    ok(index($src, $ARG_BLOCK) >= 0,
-       "AC-42: launcher.pl's while(\@argv) arg-parser block is byte-identical to the pre-q03 baseline (no new -- branch beyond --resume-session/--session/--)");
+    # Local brace-balance helper -- t/53 has no shared one (t/44's _balanced,
+    # duplicated here rather than shared across files per each oracle's
+    # self-containment convention).
+    my $_balanced = sub {
+        my ($s, $from) = @_;
+        my $i = index($s, '{', $from);
+        return undef if $i < 0;
+        my $depth = 0; my $len = length($s); my $j = $i;
+        for (; $j < $len; $j++) {
+            my $c = substr($s, $j, 1);
+            if    ($c eq '{') { $depth++; }
+            elsif ($c eq '}') { $depth--; last if $depth == 0; }
+        }
+        return undef if $depth != 0;
+        return substr($s, $i, $j - $i + 1);
+    };
+    my $anchor = index($src, 'while (@argv) {');
+    ok($anchor >= 0, 'AC-42: launcher.pl source contains the while (@argv) { arg-parser block');
+    my $arg_block = $anchor >= 0 ? $_balanced->($src, $anchor) : undef;
+    ok(defined $arg_block, 'AC-42: the while (@argv) { ... } block is brace-balance extractable');
+
+    if (defined $arg_block) {
+        # (1) no branch performs a side-effecting/unsafe action directly.
+        my @forbidden = (
+            [ 'exit',              qr/\bexit\s*\(/ ],
+            [ 'system',            qr/\bsystem\s*\(/ ],
+            [ 'exec',              qr/\bexec\s*\(/ ],
+            [ 'a backtick spawn',  qr/`/ ],
+            [ 'unlink',            qr/\bunlink\b/ ],
+            [ 'a write-mode open', qr/open\s*\([^)]*['"]>{1,2}['"]/ ],
+        );
+        for my $f (@forbidden) {
+            my ($label, $qr) = @$f;
+            unlike($arg_block, $qr,
+                "AC-42: no while(\@argv) branch introduces $label -- the arg parser only ever records intent (scalars / \@POSITIONAL), never acts before the refusal gate");
+        }
+    } else {
+        fail("AC-42: no while(\@argv) branch introduces $_")
+            for ('exit', 'system', 'exec', 'a backtick spawn', 'unlink', 'a write-mode open');
+    }
+
+    # (2) the refusal gate governs every parsed mode: exactly one
+    #     unconditional protected_path_outcome( call site, preceding both
+    #     mode-specific dispatch points by byte offset.
+    my $n_gate_calls = () = $src =~ /\bprotected_path_outcome\s*\(/g;
+    is($n_gate_calls, 1, 'AC-42: protected_path_outcome( appears exactly once -- one gate, not a per-mode alternate');
+
+    my $gate_pos = ($src =~ /\bprotected_path_outcome\s*\(/) ? $-[0] : undef;
+    ok(defined $gate_pos, 'AC-42: the protected_path_outcome( call site is locatable');
+
+    if (defined $gate_pos) {
+        my $win_start = $gate_pos >= 400 ? $gate_pos - 400 : 0;
+        my $before = substr($src, $win_start, $gate_pos - $win_start);
+        unlike($before, qr/\b(SESSION_MODE|RESOURCES_SAMPLER_MODE)\b/,
+            'AC-42: the protected_path_outcome( call is not itself conditioned on any mode flag (SESSION_MODE / RESOURCES_SAMPLER_MODE)');
+    } else {
+        fail('AC-42: the protected_path_outcome( call is not itself conditioned on any mode flag (SESSION_MODE / RESOURCES_SAMPLER_MODE)');
+    }
+
+    my $session_dispatch_pos = ($src =~ /\$SESSION_MODE\s*\|\|\s*length\s+\$RESUME_SESSION/) ? $-[0] : undef;
+    my $sampler_dispatch_pos = ($src =~ /RESOURCES_SAMPLER_MODE[^\n]*\)\s*\{[^\n]*\n[^\n]*_resources_sampler_main/) ? $-[0] : undef;
+
+    if (defined $gate_pos && defined $session_dispatch_pos) {
+        ok($gate_pos < $session_dispatch_pos,
+            'AC-42: protected_path_outcome( precedes the --session connector-mode dispatch by byte offset -- --session cannot skip the refusal gate');
+    } else {
+        fail('AC-42: protected_path_outcome( precedes the --session connector-mode dispatch by byte offset');
+    }
+    if (defined $gate_pos && defined $sampler_dispatch_pos) {
+        ok($gate_pos < $sampler_dispatch_pos,
+            'AC-42: protected_path_outcome( precedes the --resources-sampler dispatch by byte offset -- --resources-sampler cannot skip the refusal gate');
+    } else {
+        fail('AC-42: protected_path_outcome( precedes the --resources-sampler dispatch by byte offset');
+    }
 }
 
 # ---- AC-43 ----
@@ -1239,6 +1325,64 @@ like($PP_CALL_BLOCK_TEXT, qr/extra_list_path\s*=>\s*"[^"]+"/,
         ok(0, "AC-66: docs/protected-paths.md's source (d) row states the ccpraxis-install root comes from the registry entry (doc file does not exist yet)");
         ok(0, "AC-66: docs/protected-paths.md's source (d) row additionally names the launcher's own abs_path(__FILE__)-derived anchor (doc file does not exist yet)");
         ok(0, "AC-67: docs/protected-paths.md no longer contains the old single-source claim (doc file does not exist yet)");
+    }
+}
+
+# =====================================================================
+# Group L -- 03-resources-reader-model fix-batch, step 7 (AC-68)
+#
+# Dispatch item 7 ("sampler mode vs the refusal gate"), found by the driver
+# while diagnosing the AC-42 regression above: --resources-sampler dispatches
+# via $RESOURCES_SAMPLER_MODE, set during arg parsing. AC-42 already proves
+# protected_path_outcome( is unconditional and precedes both mode-specific
+# dispatch points by byte offset; this group adds the complementary half --
+# that nothing capable of WRITING under $LAUNCHER_DIR (make_path,
+# _write_file_atomic, or the sampler entry points themselves) can execute
+# before that same gate. Sampler mode bind-mounts nothing and creates no
+# container, so it carries no containment risk in itself -- the residual
+# concern is narrower: could it still WRITE a snapshot under a
+# project-derived $LAUNCHER_DIR for a project the gate would have refused?
+# This group answers no and records why, rather than leaving it unstated.
+# =====================================================================
+
+# ---- AC-68 ----
+{
+    my $gate_pos = ($src =~ /\bprotected_path_outcome\s*\(/) ? $-[0] : undef;
+    ok(defined $gate_pos, 'AC-68: the protected_path_outcome( call site is locatable (setup for the ordering checks below)');
+
+    my @write_capable = (
+        [ 'make_path($LAUNCHER_DIR)',  qr/make_path\s*\(\s*\$LAUNCHER_DIR\s*\)/ ],
+        [ '_write_file_atomic(',       qr/_write_file_atomic\s*\(/ ],
+        [ '_resources_sampler_main(',  qr/_resources_sampler_main\s*\(/ ],
+        [ '_resources_sampler_start(', qr/_resources_sampler_start\s*\(/ ],
+    );
+    for my $w (@write_capable) {
+        my ($label, $qr) = @$w;
+        my $pos = ($src =~ $qr) ? $-[0] : undef;
+        if (defined $gate_pos && defined $pos) {
+            ok($pos > $gate_pos,
+                "AC-68: the first occurrence of $label is AFTER protected_path_outcome( by byte offset -- nothing that can write under \$LAUNCHER_DIR runs before the refusal gate has had a chance to exit");
+        } elsif (defined $gate_pos && !defined $pos) {
+            pass("AC-68: $label does not appear in launcher.pl at all (vacuously after the gate)");
+        } else {
+            fail("AC-68: the first occurrence of $label is AFTER protected_path_outcome( by byte offset");
+        }
+    }
+
+    # The one thing that DOES run before the gate in sampler mode is the
+    # required-flag validation (missing/malformed --sampler-container or
+    # --sampler-owner-pid => print + exit 2) -- confirmed here to write
+    # nothing: it only prints to STDERR and exits, never touches
+    # $LAUNCHER_DIR / the filesystem.
+    my $pre_gate = defined $gate_pos ? substr($src, 0, $gate_pos) : $src;
+    my ($presampler_block) = $pre_gate =~ /if\s*\(\s*\$RESOURCES_SAMPLER_MODE\s*\)\s*\{(.*?)\n\}/s;
+    ok(defined $presampler_block,
+        'AC-68: the pre-gate $RESOURCES_SAMPLER_MODE required-flag validation block is locatable (the only sampler-mode-specific code that runs before the refusal gate)');
+    if (defined $presampler_block) {
+        unlike($presampler_block, qr/\$LAUNCHER_DIR|_write_file_atomic|make_path/,
+            'AC-68: the pre-gate required-flag validation block never touches $LAUNCHER_DIR / writes a file -- it only validates two flags and may exit(2)');
+    } else {
+        fail('AC-68: the pre-gate required-flag validation block never touches $LAUNCHER_DIR / writes a file');
     }
 }
 

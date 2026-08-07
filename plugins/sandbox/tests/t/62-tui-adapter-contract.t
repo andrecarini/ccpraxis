@@ -683,11 +683,6 @@ for my $name (@raw_gather_names) {
 # Do NOT add an entry to make a new adapter pass. Fix the adapter.
 # ---------------------------------------------------------------------------
 my %WAIVED = (
-    # _gather_resources runs podman/PowerShell probes on the render tick via
-    # _resources_probes/_powershell_json. Package 03-resources-reader-model
-    # replaces them with a background-writer + reader (Decision 2) and DELETES
-    # this entry; t/62 passing without it is 03's proof of landing.
-    _gather_resources => 'package 03-resources-reader-model removes this entry',
 );
 
 # _adapter_verdict($adapter, $subs, $blanked, $all_names, $waived, $reporter)
