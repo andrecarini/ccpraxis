@@ -97,8 +97,17 @@ my %EMOJI_PENDING = (
 # Deliberately NOT an assertion that every recorded codepoint is still
 # present (that would duplicate the stale-entry arm and would redden package
 # 06 mid-flight for a partial cleanup) -- this only catches ADDITIONS.
+# Emptied 2026-08-08. The last row here waived four emoji in Dashboard.pm, and
+# it was dead twice over: package 06 had already removed those codepoints (the
+# file scans clean), and this table is read only inside the `$dirty && $listed`
+# arm below, which %EMOJI_PENDING being empty makes unreachable for every
+# surface. Package 10 correctly left it standing when it cleared the rows it
+# owned -- its spec scoped it to its own surfaces -- so the row survived with no
+# owner and no way to fire, which is precisely the stale-waiver rot this file's
+# own header warns about. Removed rather than re-homed: there is no debt left to
+# waive. The table stays declared, so a future package with real debt has the
+# mechanism ready.
 my %EMOJI_PENDING_CODEPOINTS = (
-    'plugins/sandbox/scripts/Dashboard.pm'    => { 0x1F7E2 => 1, 0x1F534 => 1, 0x1F7E1 => 1, 0x26AA => 1 },
 );
 
 my @EMOJI_SURFACES = (

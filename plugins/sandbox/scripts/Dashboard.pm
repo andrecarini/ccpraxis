@@ -180,10 +180,30 @@ sub _decode_str {
     my ($str) = @_;
     return '' if !defined $str;
     return $str if $str =~ /[^\x00-\xFF]/;   # already decoded (D3)
+    # MODULE-LOAD GUARD. This file's `require tui::Layout / tui::DashboardScreen
+    # / Theme` are RUNTIME statements near the top, while $UTF8_CHAR_RE below is
+    # assigned later -- and subs are installed at COMPILE time. So a failed
+    # require (Theme.pm absent, say) aborts the load with every sub already in
+    # the symbol table and this pattern still undef. A caller that wraps the
+    # require in eval and then probes `defined &Dashboard::fit_spans` sees a
+    # healthy-looking module and calls straight into here.
+    #
+    # That is not hypothetical: on 2026-08-08 it hung bp-statusline.pl -- exit
+    # 124, 250 MB of stderr -- because an undef pattern makes the match below
+    # `(?:)+`, which succeeds on the empty string, so $consumed was 0 and the
+    # loop never advanced. Returning the bytes unchanged is the honest answer
+    # when the decoder is unavailable: no spin, and no fabricated U+FFFD run
+    # standing in for text nobody could actually decode.
+    return $str if !defined $UTF8_CHAR_RE;
     my $bytes = $str;
     my $out = '';
     while (length $bytes) {
-        if ($bytes =~ /\A((?:$UTF8_CHAR_RE)+)/) {
+        # `length($1)` is load-bearing, not belt-and-braces: a zero-length match
+        # consumes nothing, and a loop over a buffer that can consume nothing is
+        # an infinite loop by construction. Any future edit that lets this
+        # pattern match empty re-creates the hang above, so the guard is here
+        # rather than in the caller.
+        if ($bytes =~ /\A((?:$UTF8_CHAR_RE)+)/ && length($1)) {
             my $good = $1;
             # Measure BEFORE decoding: FB_QUIET consumes what it decodes from
             # its source argument in place, so $good is '' afterwards and a

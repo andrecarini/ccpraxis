@@ -1553,4 +1553,73 @@ sub drive_per_tick {
         'D: rendered frame contains "expires in 3h12m" when oauth_expires_at set');
 }
 
+# ---------------------------------------------------------------------------
+# M. _decode_str cannot spin, however this module was loaded.
+#
+#    This module's `require tui::Layout / tui::DashboardScreen / Theme` are
+#    RUNTIME statements near the top; $UTF8_CHAR_RE is assigned further down;
+#    and subs are installed at COMPILE time. So a failed require aborts the load
+#    with every sub already in the symbol table and the pattern still undef. A
+#    caller that wraps the require in eval and then probes
+#    `defined &Dashboard::fit_spans` sees a healthy module and calls in.
+#
+#    With the pattern undef the match becomes `(?:)+`, which succeeds on the
+#    empty string, so nothing is consumed and the while-loop never advances.
+#    Measured on 2026-08-08: bp-statusline.pl exit 124 with 250 MB of stderr,
+#    and a probe against the pre-fix source confirmed exit 124 while the fixed
+#    source exits 0. So the hang was real and the fix is what changed it.
+#
+#    Asserted structurally. The behavioural form needs the module half-loaded,
+#    which cannot be staged in-process ($UTF8_CHAR_RE is a file lexical, so no
+#    caller can localise it), and staging it in a subprocess would put an
+#    unbounded loop inside the suite on the very run where the guard regressed.
+# ---------------------------------------------------------------------------
+{
+    my $dash_src = do {
+        local (@ARGV, $/) = ("$Bin/../../scripts/Dashboard.pm"); <>
+    };
+    ok(defined $dash_src && length $dash_src, 'M1: Dashboard.pm source is readable');
+
+    my ($body) = $dash_src =~ /sub\s+_decode_str\s*\{(.*?)\n\}/s;
+    ok(defined $body, 'M2: located sub _decode_str');
+
+    # ONE checker, applied to the live body AND to the pre-fix shape below.
+    my $cannot_spin = sub {
+        my ($b) = @_;
+        return 0 unless defined $b;
+        my $load_guard = $b =~ /!\s*defined\s+\$UTF8_CHAR_RE/       ? 1 : 0;
+        # Match the guard itself, not what precedes it: the token before `&&` is
+        # the match's closing regex delimiter, not a paren.
+        my $adv_guard  = $b =~ /&&\s*length\s*\(\s*\$1\s*\)/        ? 1 : 0;
+        return ($load_guard && $adv_guard) ? 1 : 0;
+    };
+
+    ok($cannot_spin->($body),
+       'M3: _decode_str carries BOTH guards — it returns the bytes unchanged when '
+     . 'the module never finished loading, and its match must consume at least one '
+     . 'byte before the loop continues');
+
+    # THE COUNTER-FIXTURE: the exact shape that shipped before the fix. If M3 can
+    # pass against this, M3 is measuring nothing.
+    my $prefix_body = <<'PREFIX';
+    my ($str) = @_;
+    return '' if !defined $str;
+    return $str if $str =~ /[^\x00-\xFF]/;
+    my $bytes = $str;
+    my $out = '';
+    while (length $bytes) {
+        if ($bytes =~ /\A((?:$UTF8_CHAR_RE)+)/) {
+            my $good = $1;
+PREFIX
+    ok(!$cannot_spin->($prefix_body),
+       'M4: and the check fires — the pre-fix body, whose loop could consume zero '
+     . 'bytes forever, is rejected by the same checker');
+
+    # The guards must not have broken ordinary decoding.
+    is(Dashboard::_decode_str("caf\xC3\xA9"), "caf\x{E9}",
+       'M5: a valid UTF-8 sequence still decodes (the guards are not a bypass)');
+    is(Dashboard::_decode_str("a\xFFb"), "a\x{FFFD}b",
+       'M6: a malformed byte still becomes exactly one U+FFFD, one per bad byte');
+}
+
 done_testing();

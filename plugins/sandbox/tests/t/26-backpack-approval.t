@@ -96,4 +96,43 @@ is_deeply(BackpackApproval::load($path), {}, 'load: corrupt file -> empty (fail-
 ok(BackpackApproval::save($path, { 'apt:only' => 'x' }), 'save: overwrites an existing store');
 is_deeply(BackpackApproval::load($path), { 'apt:only' => 'x' }, 'save: overwrite took effect');
 
+# ---------------------------------------------------------------------------
+# item_key is INJECTIVE — two different items can never share one store key.
+#
+# It used to join category and name with a bare ':', so {npm-global, 'a:b'} and
+# {'npm-global:a', 'b'} both rendered 'npm-global:a:b'. backpack.pl deduplicates
+# on "$category\0$name" and only WARNS about an unknown category, so both items
+# pass validation and reach the store together. The package 08 red-team drove
+# that collision to a wrong-item deletion in the launch-time triage screen on
+# 2026-08-08; that call site is keyed by position now, but the STORE was still
+# collapsing the two, so forgetting one silently dropped the other's approval.
+# ---------------------------------------------------------------------------
+{
+    my $a = BackpackApproval::item_key({ category => 'npm-global',   name => 'a:b' });
+    my $b = BackpackApproval::item_key({ category => 'npm-global:a', name => 'b'   });
+    isnt($a, $b,
+         'item_key: a colon inside a component cannot forge another item\'s key');
+
+    # A ':' is not the only way to forge one once escaping exists — a literal
+    # backslash must not let a component impersonate an escape sequence either.
+    my $c = BackpackApproval::item_key({ category => 'x\\', name => 'y' });
+    my $d = BackpackApproval::item_key({ category => 'x',   name => '\\y' });
+    isnt($c, $d, 'item_key: a backslash inside a component cannot forge one either');
+
+    # COUNTER-FIXTURE for the assertions above: the pre-fix join, so we know the
+    # collision they guard against was real and that these are not vacuous.
+    my $naive = sub { my ($cat, $nm) = @_; return "$cat:$nm" };
+    is($naive->('npm-global', 'a:b'), $naive->('npm-global:a', 'b'),
+       'item_key: the pre-fix join really did collide (counter-fixture — if this '
+     . 'ever fails, the two assertions above are guarding nothing)');
+
+    # Ordinary keys must be BYTE-IDENTICAL to what they always were: this string
+    # is the on-disk key in backpack-approvals.json, so a changed rendering would
+    # silently invalidate stored approvals and re-prompt the operator for
+    # commands they had already reviewed.
+    is(BackpackApproval::item_key({ category => 'apt', name => 'chromium' }),
+       'apt:chromium',
+       'item_key: an ordinary key is unchanged, so existing approvals still match');
+}
+
 done_testing();

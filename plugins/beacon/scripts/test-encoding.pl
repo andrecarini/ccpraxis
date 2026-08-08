@@ -267,6 +267,71 @@ subtest 'PowerShell -EncodedCommand round-trip preserves Unicode paths' => sub {
 };
 
 # ── Test 5: LIVE PowerShell -EncodedCommand exec (the user-facing test) ──
+# win_path($posix) -> a Windows-shape path a NATIVE binary will resolve.
+#
+# This used to be an inline s{^/([a-zA-Z])/}{$1:/}, which only rewrites a
+# drive-letter path like /c/Users/... . File::Temp on this host returns
+# /tmp/tmp.XXXXXX, which that pattern does NOT match (it needs a single letter
+# followed by a slash), so a POSIX path reached powershell.exe unconverted.
+# Windows then resolves the leading slash against the CURRENT DRIVE -- the
+# drive-root landmine this repo has paid for before -- so `Set-Location` failed
+# silently, `(Get-Location).Path` returned the inherited working directory, and
+# the assertion compared against a path the shell had never visited. The visible
+# symptom was a suite whose result depended on which directory it was started
+# from: green from a temp worktree, red from the repo, deterministically.
+#
+# cygpath is the explicit translation the house rules call for -- the point of
+# that rule is to never rely on implicit MSYS2 magic, in either direction. It
+# ships with Git for Windows. The old pattern is kept as a fallback so the file
+# still behaves on a host without cygpath, where a /c/-shaped path is the only
+# form that could have worked anyway.
+sub win_path {
+    my ($p) = @_;
+    return $p if !defined $p || !length $p;
+    if (has_cygpath()) {
+        # -l forces the LONG name. Without it cygpath hands back whatever form
+        # the environment gave it, and TMPDIR on this host is the 8.3 short form
+        # (C:/Users/ANDR~1/...). PowerShell's -LiteralPath resolves no short
+        # names by design, so Set-Location failed with "An object at the
+        # specified path C:\Users\ANDR~1 does not exist" -- nothing to do with
+        # the accented leaf everyone reached for first. It then left the shell in
+        # its INHERITED directory, which (Get-Location).Path duly reported, so
+        # the assertion compared against wherever the suite happened to start.
+        my $out = `cygpath -m -l "$p" 2>/dev/null`;
+        if (defined $out) {
+            chomp $out;
+            if (length $out) {
+                # DECODE the result. cygpath emits UTF-8 BYTES, and the caller
+                # feeds this string into encode('UTF-16LE', ...) for
+                # -EncodedCommand -- which maps each BYTE to a codepoint. Left as
+                # bytes, an accented directory arrives at PowerShell as the two
+                # characters its UTF-8 encoding spells (e-acute becomes A-tilde
+                # plus copyright-sign), so Set-Location looks for a name that does
+                # not exist, silently fails, and (Get-Location).Path then reports
+                # the INHERITED directory -- which is how this file's result came
+                # to depend on which directory the suite was started from.
+                #
+                # Note the asymmetry that makes this easy to get wrong: perl's
+                # make_path here writes the leaf as UTF-8 bytes on disk, so the
+                # bytes are right and only their interpretation was wrong.
+                my $dec = eval { Encode::decode('UTF-8', $out, Encode::FB_CROAK()) };
+                return defined $dec ? $dec : $out;
+            }
+        }
+    }
+    (my $w = $p) =~ s{^/([a-zA-Z])/}{$1:/};
+    return $w;
+}
+{
+    my $have;
+    sub has_cygpath {
+        return $have if defined $have;
+        my $out = `cygpath --version 2>/dev/null`;
+        $have = (defined $out && length $out) ? 1 : 0;
+        return $have;
+    }
+}
+
 subtest 'LIVE: powershell -EncodedCommand correctly receives Unicode paths' => sub {
     plan skip_all => 'powershell.exe not available' unless has_powershell();
 
@@ -287,7 +352,7 @@ subtest 'LIVE: powershell -EncodedCommand correctly receives Unicode paths' => s
         $UUID_COUNTER++;
 
         # Convert to a Windows-shape path PowerShell understands.
-        (my $win = $dir) =~ s{^/([a-zA-Z])/}{$1:/};
+        my $win = win_path($dir);
 
         # Build the PowerShell command. The output marker (=== ... ===)
         # makes stdout assertion robust against PowerShell preamble noise.

@@ -682,11 +682,32 @@ my %THEME_WIDTH_BY_CP;
         $THEME_WIDTH_BY_CP{ $g->{$name}{cp} } = $g->{$name}{width};
     }
 }
+# Codepoints statusline.pl may declare a width for even though Theme does not
+# carry them, each with the reason it is not drift. An entry here is a DECLARED
+# exception, not a silent one -- which is the whole difference between this and
+# what the guard did before.
+#
+# It used to `next unless exists $THEME_WIDTH_BY_CP{$cp}`, so any entry Theme did
+# not declare was skipped without comment. That is weaker than spec §5.2 claims
+# ("a wide glyph is later added => AC-S5 fails until Theme and the table agree"):
+# the entries most likely to drift are exactly the ones Theme has no opinion on,
+# and those were the ones going unchecked. Found by the package 10 review.
+my %GLYPH_COLS_NOT_IN_THEME = (
+    0x3000 => 'ideographic space, used as row 2 padding; a spacing character '
+            . 'rather than a Theme GLYPH, so Theme has no entry to reconcile with',
+);
 sub glyph_cols_disagreements {
     my ($table) = @_;
     my @bad;
     for my $cp (sort { $a <=> $b } keys %{ $table || {} }) {
-        next unless exists $THEME_WIDTH_BY_CP{$cp};
+        if (!exists $THEME_WIDTH_BY_CP{$cp}) {
+            # Undeclared AND unexcused is now a finding rather than a skip.
+            push @bad, sprintf('U+%04X: width %d declared in the table, but Theme '
+                             . 'carries no entry and it is not on the documented '
+                             . 'exception list', $cp, $table->{$cp})
+                unless exists $GLYPH_COLS_NOT_IN_THEME{$cp};
+            next;
+        }
         push @bad, sprintf('U+%04X: table says %d, Theme says %d',
                            $cp, $table->{$cp}, $THEME_WIDTH_BY_CP{$cp})
             if $table->{$cp} != $THEME_WIDTH_BY_CP{$cp};
@@ -748,6 +769,19 @@ sub glyph_cols_disagreements {
         'AC-S5 (counter-fixture): the drift comparison FIRES on a synthetic table declaring sep.bar as one column');
     ok(scalar(glyph_cols_disagreements({ $SEPBAR_CP => $ORACLE_COLS{$SEPBAR_CP} })) == 0,
         'AC-S5 (counter-fixture): the same comparison is silent when the synthetic table agrees with Theme');
+
+    # The guard used to `next` past any codepoint Theme did not declare, so the
+    # entries most likely to drift -- the ones Theme has no opinion on -- were
+    # exactly the ones going unchecked, while spec 5.2 claimed the opposite.
+    # U+0BAD is not a Theme glyph and is not on the documented exception list.
+    ok(scalar(glyph_cols_disagreements({ 0x0BAD => 2 })) > 0,
+        'AC-S5: a codepoint the table declares that Theme does not carry, and that '
+      . 'is not on the documented exception list, is REPORTED rather than skipped');
+    # ...and the exception list is what makes that survivable, not a blanket pass:
+    # U+3000 is excused with a stated reason, so it must stay silent.
+    ok(scalar(glyph_cols_disagreements({ 0x3000 => 2 })) == 0,
+        'AC-S5 (counter-fixture): a DECLARED exception is still silent, so the '
+      . 'check above is a guard with a documented escape hatch, not a tripwire');
 
     # AC-S6 -- bp-statusline.pl keeps t/54-spend-panel.t:627-628 green.
     unlike($SRC_BP, qr/\blength\s*\(/,

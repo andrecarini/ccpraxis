@@ -26,11 +26,34 @@ use JSON::PP ();
 our $STORE_VERSION = 1;
 
 # item_key($item) -> "category:name" — the stable identity used as the store key.
+#
+# The join is INJECTIVE: a literal ':' or '\' inside either component is escaped
+# first, so distinct items can never collide on one key. Without that,
+# {category => 'npm-global', name => 'a:b'} and {category => 'npm-global:a',
+# name => 'b'} both rendered as 'npm-global:a:b'. backpack.pl de-duplicates on
+# "$category\0$name" and only WARNS about an unknown category, so both survive
+# validation and reach the store together.
+#
+# Found by the package 08 red-team on 2026-08-08, which drove the collision to a
+# wrong-item deletion in the launch-time triage screen. That call site is now
+# keyed by position, so the destructive path is closed there — but the store
+# ITSELF was still collapsing the two, and `forget` on one silently deleted the
+# other's approval. That direction is fail-safe (the item returns to pending and
+# is re-reviewed) rather than destructive, which is why it is a correctness fix
+# rather than an emergency.
+#
+# Escaping rather than switching the delimiter to "\0" is deliberate. This string
+# is the on-disk key in backpack-approvals.json, so changing the rendering of
+# ORDINARY items would invalidate every stored approval and silently re-prompt
+# the operator for commands they had already reviewed. Escaping leaves every key
+# without a ':' or '\' in its components byte-identical — which is all of them in
+# practice — and changes only the pathological ones that were broken anyway.
 sub item_key {
     my ($it) = @_;
     $it ||= {};
     my $c = defined $it->{category} ? $it->{category} : '';
     my $n = defined $it->{name}     ? $it->{name}     : '';
+    for ($c, $n) { s/\\/\\\\/g; s/:/\\:/g; }
     return "$c:$n";
 }
 
