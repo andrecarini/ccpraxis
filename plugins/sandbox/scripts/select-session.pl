@@ -31,6 +31,7 @@ use warnings;
 use File::Basename qw(basename dirname);
 use Cwd ();
 use POSIX qw(strftime);
+use JSON::PP ();   # 08-launcher-screens: --list-json's one output object
 
 binmode STDOUT, ':raw';
 binmode STDERR, ':raw';
@@ -46,6 +47,7 @@ my $PROJECT_LABEL = '';
 my $OUTPUT_FILE   = '';
 my $BLUEPRINTS_DIR     = '';
 my $BLUEPRINTS_DIR_SET = 0;   # 1 iff --blueprints-dir was supplied (even if empty)
+my $LIST_JSON          = 0;   # 08-launcher-screens: data mode, no terminal at all
 
 # Parse @ARGV into the globals above. Split out from the entry point so
 # the `unless (caller)` guard at the bottom can run it only when the script is
@@ -70,6 +72,8 @@ sub parse_args {
             $BLUEPRINTS_DIR = shift @argv; $BLUEPRINTS_DIR_SET = 1;
         } elsif ($a =~ /^--blueprints-dir=(.*)$/) {
             $BLUEPRINTS_DIR = $1;         $BLUEPRINTS_DIR_SET = 1;
+        } elsif ($a eq '--list-json') {
+            $LIST_JSON = 1;
         } else {
             print STDERR "select-session.pl: unknown arg: $a\n";
             exit 1;
@@ -79,7 +83,9 @@ sub parse_args {
         print STDERR "select-session.pl: --sessions-dir is required\n";
         exit 1;
     }
-    if (!length $OUTPUT_FILE) {
+    # --list-json is a DATA mode: it prints the session list and touches no
+    # terminal and no --output file, so that flag is not required for it.
+    if (!length $OUTPUT_FILE && !$LIST_JSON) {
         print STDERR "select-session.pl: --output is required\n";
         exit 1;
     }
@@ -678,6 +684,52 @@ unless (caller) {
     $_->{is_butler} = ($_->{is_butler} ? 1 : 0) for @sessions;   # key always present
 
     my @opts     = build_options(@sessions);
+
+    # 08-launcher-screens: the DATA mode. One JSON object on stdout, exit 0.
+    # No ReadMode, no alt-screen escape, no --output round-trip.
+    #
+    # `error` is a DISTINCT field from an empty session list on purpose: "this
+    # project has no sessions yet" and "the sessions directory could not be
+    # read" are different facts, and rendering the second as the first would
+    # quietly offer a fresh session to someone whose history is simply
+    # unreadable.
+    if ($LIST_JSON) {
+        my $error;
+        if (length $SESSIONS_DIR) {
+            if (!-d $SESSIONS_DIR) {
+                $error = "sessions directory is not readable: $SESSIONS_DIR";
+            }
+            elsif (opendir(my $probe, $SESSIONS_DIR)) {
+                closedir $probe;
+            }
+            else {
+                # PRESENT BUT UNREADABLE. list_sessions() returns () on an
+                # opendir failure exactly as it does for a project with no
+                # history, so without this probe a permission problem arrived
+                # at the launcher as `sessions => []` with error undef -- i.e.
+                # rendered as "no sessions yet" and answered with a cheerful
+                # offer of a fresh one, while the operator's real history sat
+                # there unread. Absent and broken are different facts.
+                $error = "sessions directory could not be read: $SESSIONS_DIR: $!";
+            }
+        }
+        # build_options' rendered label is reused verbatim (minus its SGR), so
+        # the launch screen shows exactly what the interactive picker shows.
+        # @opts[0] is "Start a new session"; @opts[1..] are @sessions in order.
+        my @rows;
+        for my $i (0 .. $#sessions) {
+            my $o = $opts[$i + 1];
+            push @rows, {
+                uuid      => $sessions[$i]{uuid},
+                label     => sanitize_cell(strip_ansi(defined $o ? ($o->{label} // '') : '')),
+                mtime     => $sessions[$i]{mtime},
+                is_butler => ($sessions[$i]{is_butler} ? 1 : 0),
+            };
+        }
+        print JSON::PP->new->utf8->canonical(1)->encode(
+            { sessions => \@rows, error => $error });
+        exit 0;
+    }
 
     # Zero-session fast path: nothing to pick from, just emit NEW and exit.
     # Skipping the TUI here avoids a confusing one-option menu on the very

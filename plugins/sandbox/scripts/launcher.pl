@@ -97,6 +97,10 @@ use BackpackReview ();    # #21: the I/O-seam-injected interactive approval walk
 use BackpackOps ();       # 07-backpack-screen E-A: the [b] screen's real bp_load/
                            # bp_save/bp_remove logic, extracted so it is unit-testable
                            # without spawning this file (review-driver-round M1)
+use tui::LaunchScreens (); # 08-launcher-screens: the launch-phase TUI host,
+                           # capture pipeline, progress screen and list screens.
+                           # Pure and total; every I/O boundary below is a seam
+                           # this file injects.
 use KeepAwake ();         # B5: dashboard wake-lock decision + lifecycle holder
 use ConnectorHold ();     # Fix 3: hold-the-window decision when a connector loses the container
 use ClaudeConfig ();      # self-heal .claude.json onboarding-bypass (0-byte / lost-keys)
@@ -974,6 +978,446 @@ sub _c_ok   { _c('32',   $_[0]) }   # green      — a setup step succeeded
 sub _c_warn { _c('33',   $_[0]) }   # yellow     — a WARNING: label
 sub _c_err  { _c('1;31', $_[0]) }   # bold red   — an ERROR: label
 
+# =====================================================================
+# 08-launcher-screens: the launch-phase emit seam
+# =====================================================================
+#
+# EVERY launch-phase byte reaches the operator through one route. On the
+# plain path that route ends in the plain sink below, whose bytes are
+# byte-for-byte today's (the _c_* helpers survive for exactly that reason and
+# never paint inside a frame). On the TUI path it ends in the capture
+# pipeline, whose raw sink is lossless and whose render ring draws the live
+# tail.
+#
+# The re-plumb of the launch phase replaces ONLY the leading verb of each
+# existing statement: argument lists, interpolations, _c_* calls and message
+# strings are untouched, which is what keeps the many source-scanning oracles
+# that pin those strings green.
+my $LAUNCH_MODE   = 'plain';
+my $LAUNCH_STAGES = tui::LaunchScreens::stages_init(undef);
+my $LAUNCH_HOST;
+
+# _launch_plain_sink(\%rec) — the plain path's terminal. Today's bytes.
+sub _launch_plain_sink {
+    my ($rec) = @_;
+    return 0 unless ref $rec eq 'HASH';
+    my $text = defined $rec->{text} ? $rec->{text} : '';
+    my $stream = defined $rec->{stream} ? $rec->{stream} : 'out';
+    if ($stream eq 'err') { print STDERR $text } else { print STDOUT $text }
+    return 1;
+}
+
+sub _emit_join { return join('', map { defined $_ ? $_ : '' } @_) }
+
+# The four wrappers the re-plumb uses. Each takes a LIST, joins it, and hands
+# it to the one emit seam; the role is either declared (step/ok) or inferred
+# from the text, so an existing message keeps its exact wording.
+sub _emit_out  { return tui::LaunchScreens::emit($LAUNCH_HOST,
+                     { text => _emit_join(@_), role => undef,  stream => 'out' }) }
+sub _emit_err  { return tui::LaunchScreens::emit($LAUNCH_HOST,
+                     { text => _emit_join(@_), role => undef,  stream => 'err' }) }
+sub _emit_step { return tui::LaunchScreens::emit($LAUNCH_HOST,
+                     { text => _emit_join(@_), role => 'step', stream => 'out' }) }
+sub _emit_ok   { return tui::LaunchScreens::emit($LAUNCH_HOST,
+                     { text => _emit_join(@_), role => 'ok',   stream => 'out' }) }
+
+# The host exists from here on, so no message can be emitted into the void.
+# It starts in plain mode; the real mode is decided (through the UNCHANGED
+# three-argument Dashboard::decide_mode gate) once the launch lock is held.
+$LAUNCH_HOST = tui::LaunchScreens::make_host(mode => 'plain', plain => \&_launch_plain_sink);
+
+# _launch_stage_begin / _launch_stage_end — thin glue so the launch phase
+# marks progress without knowing how a stage renders.
+# _launch_suspend / _launch_resume — hand the REAL terminal back for the
+# duration of something that owns it directly, then take it again.
+#
+# The launch phase still contains prompts that were written before the frame
+# existed: prompt_stale_action paints its own in-place menu and calls
+# ReadMode(0), kill_orphan_claudes_if_user_confirms reads <STDIN>. Run inside
+# the alt screen with the host still claiming `active`, each of them painted
+# over the frame AND left the terminal in canonical mode while every later
+# _launch_read_key still assumed cbreak. Suspending drops the alt screen and
+# restores the read mode for real, so the prompt runs on the terminal it was
+# written for and `{active}` tells the truth while it does.
+#
+# Deliberately NOT host_leave/host_enter: host_leave's once-guard would pop
+# the title stack here and host_enter refuses a second entry, so the pair
+# would silently degrade to "leave, then never come back".
+sub _launch_suspend {
+    return 0 unless $LAUNCH_HOST && $LAUNCH_HOST->{mode} eq 'tui' && $LAUNCH_HOST->{active};
+    print STDOUT tui::LaunchScreens::LEAVE_SCREEN_BYTES();
+    eval { Term::ReadKey::ReadMode('restore') };
+    $LAUNCH_HOST->{active} = 0;
+    return 1;
+}
+sub _launch_resume {
+    return 0 unless $LAUNCH_HOST && $LAUNCH_HOST->{mode} eq 'tui'
+                 && $LAUNCH_HOST->{entered} && !$LAUNCH_HOST->{active};
+    eval { Term::ReadKey::ReadMode('cbreak') };
+    print STDOUT tui::LaunchScreens::ENTER_SCREEN_BYTES();
+    $LAUNCH_HOST->{active} = 1;
+    delete $LAUNCH_HOST->{prev};   # the alt buffer is blank again: full repaint
+    _launch_repaint();
+    return 1;
+}
+
+sub _launch_stage_begin { tui::LaunchScreens::stage_begin($LAUNCH_STAGES, $_[0], time); _launch_repaint(); }
+sub _launch_stage_end   { tui::LaunchScreens::stage_end($LAUNCH_STAGES, $_[0], $_[1], time); _launch_repaint(); }
+sub _launch_repaint     { return tui::LaunchScreens::repaint($LAUNCH_HOST) }
+
+# _launch_fail($stage, $message, $exit) — leave the TUI, then write the
+# CAPTURED OUTPUT VERBATIM to the restored normal screen. A fixed-height
+# frame cannot show a 200-line podman build failure without truncating it,
+# and the operator's next action is to read and copy that error out of
+# scroll-back, which requires it to BE in scroll-back.
+sub _launch_fail {
+    my ($stage, $message, $exit_code) = @_;
+    return 0 unless $LAUNCH_HOST && $LAUNCH_HOST->{mode} eq 'tui' && $LAUNCH_HOST->{entered};
+    tui::LaunchScreens::stage_end($LAUNCH_STAGES, $stage, 'failed', time);
+    tui::LaunchScreens::host_leave($LAUNCH_HOST);
+    my $chunks = tui::LaunchScreens::failure_report($LAUNCH_HOST,
+        stage => $stage, message => $message, exit => $exit_code);
+    print STDERR @$chunks;
+    return 1;
+}
+
+# _launch_render_frame(\@prev, \@frame) -> the bytes for a differential
+# repaint. tui::Screen::diff decides WHICH rows changed; tui::Frame::paint_row
+# is the one place a span becomes terminal bytes.
+sub _launch_render_frame {
+    my ($prev, $frame) = @_;
+    return '' unless ref $frame eq 'ARRAY';
+    my $full = !(ref $prev eq 'ARRAY' && @$prev == @$frame);
+    my $rows = $full ? [ 0 .. $#$frame ] : tui::Screen::diff($prev, $frame);
+    my $out = $full ? "\e[H\e[2J" : '';
+    for my $i (@$rows) {
+        $out .= "\e[" . ($i + 1) . ";1H" . tui::Frame::paint_row($frame->[$i], undef);
+    }
+    return $out;
+}
+
+# The keep-alive tick. THROTTLED HERE, not in the screens: the throttle needs
+# a clock and a subprocess, both of which tui/ may not have, so the screens
+# simply call the seam every iteration and this decides whether a real touch
+# fires. The obligation begins only once there is a RUNNING container -- there
+# is no /tmp/.launcher-alive before `podman start` returns 0 -- so this stays
+# a no-op until _launch_heartbeat_arm() is called.
+my $LAUNCH_HEARTBEAT_ARMED = 0;
+my $LAUNCH_HEARTBEAT_LAST  = 0;
+# The reap notice's show-once stamp, held until the notice has demonstrably
+# been on screen for the rest of the launch (see _surface_last_reap).
+my $LAUNCH_REAP_PENDING;
+sub _launch_heartbeat_arm  { $LAUNCH_HEARTBEAT_ARMED = 1; $LAUNCH_HEARTBEAT_LAST = 0; return 1 }
+sub _launch_heartbeat_tick {
+    return 0 unless $LAUNCH_HEARTBEAT_ARMED;
+    my $now = time;
+    return 0 if ($now - $LAUNCH_HEARTBEAT_LAST) < 5;
+    $LAUNCH_HEARTBEAT_LAST = $now;
+    eval { _heartbeat_once() };
+    return 1;
+}
+
+# _launch_raw_sink_seams() -> (raw_write => ..., raw_read => ...) or ().
+#
+# S2.2 puts the raw capture sink's PRODUCTION wiring here, and this is why:
+# the module's default sink is an in-memory closure, and the two things that
+# feed it are `podman build` (unbounded) and the arbitrary install commands a
+# backpack declares (also unbounded). Measured with the in-memory default,
+# 5,000 lines of 1 KiB retained 5,125,000 bytes for the life of the launch and
+# never freed a byte of it. A File::Temp file costs nothing to hold and is
+# byte-exact, which is the contract capture_replay owes failure_report.
+#
+# :raw is load-bearing on Windows: without it a "\n" written here comes back
+# as "\r\n" and the replay is no longer the bytes that went in.
+# UNLINK => 1 so the file dies with the process; nothing reads it afterwards.
+# A failure to make the temp file degrades to the module's own in-memory
+# default rather than losing capture altogether.
+my $LAUNCH_RAW_FH;
+sub _launch_raw_sink_seams {
+    my $fh = eval {
+        my ($h) = File::Temp::tempfile('ccpraxis-launchcap-XXXXXX', TMPDIR => 1, UNLINK => 1);
+        die "no handle\n" unless $h;
+        binmode($h, ':raw');
+        $h->autoflush(1);
+        $h;
+    };
+    return () unless $fh;
+    $LAUNCH_RAW_FH = $fh;
+    return (
+        raw_write => sub {
+            my ($b) = @_;
+            return 0 unless defined $b && !ref $b;
+            print {$LAUNCH_RAW_FH} $b;
+            return 1;
+        },
+        raw_read => sub {
+            return '' unless $LAUNCH_RAW_FH;
+            my $pos = tell($LAUNCH_RAW_FH);
+            return '' unless defined $pos && $pos >= 0;
+            return '' unless seek($LAUNCH_RAW_FH, 0, 0);
+            my $all = do { local $/; <$LAUNCH_RAW_FH> };
+            seek($LAUNCH_RAW_FH, $pos, 0);
+            return defined $all ? $all : '';
+        },
+    );
+}
+
+# _launch_read_key / _launch_wait_key — the screens' input seams. The symbolic
+# vocabulary is skills.pl's own ('UP','DOWN','SPACE','ENTER','q','ESC'), so
+# the launch screens and the existing selector speak one key language.
+sub _launch_map_key {
+    my ($c) = @_;
+    return undef unless defined $c;
+    return 'SPACE' if $c eq ' ';
+    return 'ENTER' if $c eq "\r" || $c eq "\n";
+    return $c;
+}
+sub _launch_read_key {
+    return undef unless $READKEY_OK;
+    my $c = eval { Term::ReadKey::ReadKey(-1) };
+    return undef unless defined $c;
+    return _launch_assemble_key($c);
+}
+sub _launch_wait_key {
+    my ($timeout) = @_;
+    return undef unless $READKEY_OK;
+    my $c = eval { Term::ReadKey::ReadKey(defined $timeout ? $timeout : 0.2) };
+    return undef unless defined $c;
+    return _launch_assemble_key($c);
+}
+# An unassembled CSI sequence must never degrade into an action keystroke, so
+# the escape prefix is read to completion here rather than being handed on as
+# a bare '[' followed by a letter.
+sub _launch_assemble_key {
+    my ($c) = @_;
+    return _launch_map_key($c) unless $c eq "\e";
+    my $b = eval { Term::ReadKey::ReadKey(-1) };
+    return 'ESC' unless defined $b && $b eq '[';
+    my $d = eval { Term::ReadKey::ReadKey(-1) };
+    return 'ESC' unless defined $d;
+    return 'UP'   if $d eq 'A';
+    return 'DOWN' if $d eq 'B';
+    return '';
+}
+
+# _capture_out_err(@cmd) -> ($rc, $stdout, $stderr)
+#
+# LIST FORM, never a shell string: exec'd directly, so there is no quoting to
+# get wrong and no colon-bearing argument for MSYS2 to mangle. BOTH streams
+# are captured, because anything spawned from inside a raw-mode alt-screen
+# with inherited stdio paints straight over the frame. Follows
+# BackpackOps::capture_quiet's dup-and-restore idiom, but keeps the two
+# streams apart so a child's diagnostics cannot corrupt its JSON.
+sub _capture_out_err {
+    my (@cmd) = @_;
+    return (-1, '', 'no command given') unless @cmd;
+
+    my ($err_fh, $err_path) = File::Temp::tempfile('ccpraxis-launch-XXXXXX', TMPDIR => 1, UNLINK => 0);
+    close($err_fh) if $err_fh;
+
+    my $saved;
+    my $redirected = eval {
+        open($saved, '>&', \*STDERR) or die "dup STDERR: $!\n";
+        open(STDERR, '>', $err_path) or die "redirect STDERR: $!\n";
+        STDERR->autoflush(1);
+        1;
+    };
+
+    my ($out, $rc) = ('', -1);
+    my $ok = eval {
+        open(my $fh, '-|', @cmd) or die "spawn failed: $!\n";
+        local $/;
+        $out = <$fh>;
+        $out = '' unless defined $out;
+        close($fh);
+        $rc = $?;
+        1;
+    };
+    $rc = -1 unless $ok;
+
+    if ($redirected) {
+        eval { close(STDERR); open(STDERR, '>&', $saved); STDERR->autoflush(1); };
+        close($saved) if $saved;
+    }
+
+    my $err = '';
+    if (open(my $rf, '<:raw', $err_path)) { local $/; $err = <$rf> // ''; close($rf); }
+    unlink($err_path);
+    $err .= $@ unless $ok;
+    return ($rc, $out, $err);
+}
+
+# _launch_run_list(\%model) -> \%result — every launch list screen runs
+# through here, so the seam wiring (input, size, render, keep-alive) exists
+# exactly once.
+sub _launch_run_list {
+    my ($model) = @_;
+    my $res = tui::LaunchScreens::list_run(
+        model     => $model,
+        read_key  => \&_launch_read_key,
+        wait_key  => \&_launch_wait_key,
+        heartbeat => sub { _launch_heartbeat_tick() },
+        render    => \&_launch_render_frame,
+        out       => sub { print STDOUT $_[0] },
+        term_size => sub {
+            my @s = eval { Term::ReadKey::GetTerminalSize() };
+            return (((@s && $s[0]) ? $s[0] : 80), ((@s && $s[1]) ? $s[1] : 24));
+        },
+    );
+    # The list screen painted over the whole terminal from its OWN prev-frame
+    # ring; the host's prev still holds the PROGRESS frame. Leaving it there
+    # makes the next repaint diff progress-against-progress -- a handful of
+    # changed rows punched into the list screen that is still on the glass,
+    # with the rest of the launch frame never redrawn. Dropping prev forces
+    # the next repaint to be a full clear + paint.
+    delete $LAUNCH_HOST->{prev} if $LAUNCH_HOST;
+    return $res;
+}
+
+# _select_via_screen() -> the same exit code the interactive picker returns
+# (0 confirmed, 2 cancelled, non-zero error), with the pick made in-process.
+sub _select_via_screen {
+    my @snapshots = (
+        '--discovery-snapshot',  $SNAPSHOT_FILE,
+        '--plugins-snapshot',    $PLUGINS_SNAPSHOT_FILE,
+        '--mcp-snapshot',        $MCP_SNAPSHOT_FILE,
+        '--settings-local-file', $SETTINGS_LOCAL_FILE,
+        '--project-path',        $PROJECT_PATH,
+    );
+    my ($rc, $out, $err) = _capture_out_err($^X, $SANDBOX_SKILLS_PL, 'select-model',
+        '--selection-file', $SELECTION_FILE, @snapshots);
+    if ($rc != 0) {
+        _emit_err("ERROR: select-model failed (exit @{[$rc >> 8]})\n");
+        _emit_err($err) if length $err;
+        return ($rc >> 8) || 1;
+    }
+    my $model = eval { JSON::PP->new->utf8->decode($out) };
+    if (ref $model ne 'HASH') {
+        # Broken, not empty: an unparseable model must never render as
+        # "nothing to choose from".
+        _emit_err("ERROR: select-model returned an unreadable model\n");
+        return 1;
+    }
+    my $decision = { confirmed => 1, cancelled => 0, selected => {} };
+    unless ($model->{empty}) {
+        my $res = _launch_run_list($model);
+        $decision = $res->{decision};
+        return 2 unless $decision->{confirmed};
+    }
+    my $dfile = "$LAUNCHER_DIR/.select-decision.json";
+    _write_file($dfile, JSON::PP->new->utf8->canonical(1)->encode($decision));
+    my ($arc, $aout, $aerr) = _capture_out_err($^X, $SANDBOX_SKILLS_PL, 'select-apply',
+        '--decision-file', $dfile, '--selection-file', $SELECTION_FILE, @snapshots);
+    unlink $dfile;
+    _emit_err($aerr) if $arc != 0 && length $aerr;
+    return $arc >> 8;
+}
+
+# _pick_session_via_screen() -> ('new'|'resume'|'cancel', $uuid) with no
+# --output file round-trip. Its plain-path twin is byte-for-byte today's.
+sub _pick_session_via_screen {
+    my ($sessions_dir) = @_;
+    my ($rc, $out, $err) = _capture_out_err($^X, $SELECT_SESSION_PL,
+        '--sessions-dir', $sessions_dir, '--project-label', $PROJECT_NAME, '--list-json');
+    my $data = ($rc == 0) ? eval { JSON::PP->new->utf8->decode($out) } : undef;
+    if (ref $data ne 'HASH') {
+        _emit_err("WARNING: session selector could not list sessions; starting a new session.\n");
+        return ('new', undef);
+    }
+    my @rows = (ref $data->{sessions} eq 'ARRAY') ? @{ $data->{sessions} } : ();
+    return ('new', undef) unless @rows || $data->{error};
+
+    my @items = ( { kind => 'row', id => 'NEW', group => 'sessions',
+                    display => '+ Start a new session', disabled => 0, selected => 0 } );
+    for my $s (@rows) {
+        next unless ref $s eq 'HASH' && defined $s->{uuid};
+        push @items, { kind => 'row', id => $s->{uuid}, group => 'sessions',
+                       display => (defined $s->{label} && length $s->{label}
+                                   ? $s->{label} : $s->{uuid}),
+                       disabled => 0, selected => 0 };
+    }
+    my $res = _launch_run_list({ mode  => 'single',
+                                 label => "resume a session - $PROJECT_NAME",
+                                 error => $data->{error},
+                                 items => \@items });
+    my $d = $res->{decision};
+    return ('cancel', undef) unless $d->{confirmed};
+    my $id = $d->{cursor_id};
+    return ('new', undef) if !defined $id || $id eq 'NEW';
+    return ('resume', $id);
+}
+
+# _backpack_triage_via_screen(...) -> (\@approved, $deferred)
+#
+# The launch-time approval walk as a triage screen. BackpackReview owns the
+# model (plan) and the persistence (commit); this only renders and collects.
+# The remove spawn goes through BackpackOps::capture_quiet -- list form, no
+# shell, CAPTURED stdio -- because it runs while the alt-screen frame is up
+# and inherited output would shred it.
+sub _backpack_triage_via_screen {
+    my ($file, $pl, $approvals, $legacy_trust, $file_hash) = @_;
+    my $plan = BackpackReview::plan(file => $file, approvals => $approvals,
+                                    legacy_trust => $legacy_trust, file_hash => $file_hash);
+    if ($plan->{broken}) {
+        # BROKEN IS NOT EMPTY: an unreadable backpack must never look like a
+        # backpack with nothing to approve.
+        tui::LaunchScreens::add_banner($LAUNCH_HOST,
+            [ 'WARNING: could not parse backpack for review - skipping install.' ], 'err');
+        _launch_repaint();
+        return ([], 0);
+    }
+
+    # Display copies, sanitised through BackpackReview::_safe on the way to
+    # the screen -- the module may not name BackpackReview, so the launcher is
+    # where that sanitising has to happen. The originals are untouched: they
+    # are the items commit() acts on and they must not grow display fields
+    # that would ride into the install-set file.
+    # `+{` and not `{`: at the head of a map BLOCK perl reads a bare `{` as a
+    # nested block, so `map { {...} }` silently yields a FLAT key/value list
+    # instead of hashrefs -- it compiles, and the screen then renders nothing.
+    my @shown = map {
+        my $it = $_;
+        +{ %$it,
+           install   => BackpackReview::_safe($it->{install}),
+           verify    => BackpackReview::_safe($it->{verify}),
+           rationale => BackpackReview::_safe(
+               (defined $it->{rationale} && $it->{rationale} ne '') ? $it->{rationale} : '(none given)'),
+        };
+    } @{ $plan->{pending} };
+
+    # INDEX-KEYED, not key-keyed. BackpackApproval::item_key joins category
+    # and name with ':', so {npm-global, "a:b"} and {"npm-global:a", b} are
+    # two distinct items with ONE key -- and a key-keyed decision map applied
+    # one row's answer to the other. Measured: approve row 0 + remove row 1
+    # removed the item that had just been APPROVED. The inverse (remove row 0,
+    # defer row 1) wrote 'defer' last and made a confirmed, non-undoable
+    # remove silently do nothing and report nothing.
+    my %by_index;
+    if (@shown) {
+        my $res = _launch_run_list(
+            tui::LaunchScreens::triage_model(\@shown, $plan->{ok}, error => $plan->{error}));
+        my $d   = $res->{decision};
+        my $tri = (ref $d->{triage_index} eq 'HASH') ? $d->{triage_index} : {};
+        if ($d->{confirmed}) {
+            for my $state ('approve', 'remove', 'defer') {
+                next unless ref $tri->{$state} eq 'ARRAY';
+                $by_index{$_} = $state for @{ $tri->{$state} };
+            }
+        }
+    }
+
+    return BackpackReview::commit(
+        plan => $plan, approvals => $approvals, decisions_by_index => \%by_index,
+        remove => sub {
+            my ($it) = @_;
+            my ($rc) = BackpackOps::capture_quiet($^X, $pl, 'remove', $file,
+                '--category', $it->{category}, '--name', $it->{name});
+            return $rc;
+        },
+        on_error => sub { _emit_err("WARNING: could not save approvals: $_[0]\n") },
+    );
+}
+
 # B5 keep-awake holder (set up in enter_dashboard). File-scope so the signal/END
 # teardown can release the wake-lock — a leaked PowerShell helper would keep the
 # machine awake forever. Release is idempotent + tolerant of an unset holder.
@@ -991,20 +1435,46 @@ sub _resources_sampler_release_global { eval { _resources_sampler_stop($RESOURCE
 # console AND into the transcript. system()-style return value ($? convention:
 # 0 ok, child exit = rc>>8). Falls back to a plain system() when there is no
 # transcript or the fork/pipe can't be opened, so capture never blocks a launch.
+# _tx_write($fh, $bytes) / _tee_display($bytes) — the two terminal sinks
+# _tee_system fans each captured line out to. They live OUTSIDE _tee_system on
+# purpose: the launch phase's own console writes all route through the emit
+# seam, and these two are the streaming subprocess path's equivalent.
+sub _tx_write    { my ($fh, $b) = @_; return 0 unless $fh; print {$fh} $b; return 1; }
+sub _tee_display { my ($b) = @_; print STDOUT $b; return 1; }
+
 sub _tee_system {
     my @cmd = @_;
-    return system(@cmd) unless $TRANSCRIPT;
+    my $host_active = ($LAUNCH_HOST && $LAUNCH_HOST->{mode} eq 'tui' && $LAUNCH_HOST->{active}) ? 1 : 0;
+    my $has_tx = $TRANSCRIPT ? 1 : 0;
+    # With the frame up we must capture even when there is no transcript: a
+    # child with inherited stdio paints straight over it.
+    return system(@cmd) unless tui::LaunchScreens::tee_should_fork($host_active, $has_tx);
     my $pid = open(my $ph, '-|');
-    return system(@cmd) unless defined $pid;   # fork/pipe failed -> uncaptured run
+    if (!defined $pid) {                       # fork/pipe failed -> uncaptured run
+        if (tui::LaunchScreens::tee_fallback_route($host_active) eq 'plain-after-teardown') {
+            # Tear the TUI down BEFORE the uncaptured run, so the child's
+            # output lands on a restored terminal instead of over the frame.
+            tui::LaunchScreens::host_leave($LAUNCH_HOST);
+            $LAUNCH_HOST->{degraded} = 1;
+        }
+        return system(@cmd);
+    }
     if (!$pid) {                               # child: merge stderr, exec the cmd
         open(STDERR, '>&', \*STDOUT);
         # _exit (not exit) on exec failure: skip END so we don't double-close the
         # parent's log/transcript handles inherited across the fork.
         exec { $cmd[0] } @cmd
-            or do { print STDERR "exec failed: $cmd[0]: $!\n"; POSIX::_exit(127); };
+            or do { syswrite(STDERR, "exec failed: $cmd[0]: $!\n"); POSIX::_exit(127); };
     }
     local $| = 1;
-    while (my $line = <$ph>) { print STDOUT $line; print {$TRANSCRIPT} $line; }
+    my $tx = $TRANSCRIPT;
+    my $tx_sink = sub { _tx_write($tx, $_[0]) };
+    my $display_sink = $host_active
+        ? sub { tui::LaunchScreens::stream_line($LAUNCH_HOST, $_[0]) }
+        : \&_tee_display;
+    # One fanout call, so the transcript and the display are provably fed the
+    # same bytes. The transcript sink is never gated on the launch mode.
+    while (my $line = <$ph>) { tui::LaunchScreens::fanout([ $tx_sink, $display_sink ], $line); }
     close $ph;
     return $?;
 }
@@ -1194,8 +1664,12 @@ sub _rmtree {
 # dup'd original filehandle) if enter_raw had it redirected -- the
 # signal/abnormal-exit path must not leave the terminal with a redirected
 # STDERR after the dashboard closes.
-$SIG{INT}  = sub { open(STDERR, '>&', $STDERR_CAPTURE_SAVED) if $STDERR_CAPTURE_SAVED; log_ev('signal', { sig => 'INT' });  _keepawake_release_global(); _resources_sampler_release_global(); LaunchLog::close_log($LAUNCH_LOG); _close_transcript(); SandboxLock::release_all(); reset_terminal(); exit 130 };
-$SIG{TERM} = sub { open(STDERR, '>&', $STDERR_CAPTURE_SAVED) if $STDERR_CAPTURE_SAVED; log_ev('signal', { sig => 'TERM' }); _keepawake_release_global(); _resources_sampler_release_global(); LaunchLog::close_log($LAUNCH_LOG); _close_transcript(); SandboxLock::release_all(); reset_terminal(); exit 143 };
+# 08-launcher-screens (criterion 3): the launch host is torn down FIRST on
+# every signal path -- alt-screen off, cursor shown, title popped, ReadMode
+# restored -- before the STDERR restore and before reset_terminal(). Its
+# once-guard is what makes a second Ctrl-C during teardown safe.
+$SIG{INT}  = sub { tui::LaunchScreens::host_leave($LAUNCH_HOST) if $LAUNCH_HOST; open(STDERR, '>&', $STDERR_CAPTURE_SAVED) if $STDERR_CAPTURE_SAVED; log_ev('signal', { sig => 'INT' });  _keepawake_release_global(); _resources_sampler_release_global(); LaunchLog::close_log($LAUNCH_LOG); _close_transcript(); SandboxLock::release_all(); reset_terminal(); exit 130 };
+$SIG{TERM} = sub { tui::LaunchScreens::host_leave($LAUNCH_HOST) if $LAUNCH_HOST; open(STDERR, '>&', $STDERR_CAPTURE_SAVED) if $STDERR_CAPTURE_SAVED; log_ev('signal', { sig => 'TERM' }); _keepawake_release_global(); _resources_sampler_release_global(); LaunchLog::close_log($LAUNCH_LOG); _close_transcript(); SandboxLock::release_all(); reset_terminal(); exit 143 };
 # 03-resources-reader-model fix-batch (red-team L15): closing the terminal
 # window -- the single most common way a user ends a dashboard -- sends HUP,
 # not INT/TERM, and perl does not run END blocks on an uncaught terminating
@@ -1203,7 +1677,7 @@ $SIG{TERM} = sub { open(STDERR, '>&', $STDERR_CAPTURE_SAVED) if $STDERR_CAPTURE_
 # release, sampler release, lock release), which is the entry point for H2
 # step 3 (owner dies without ever running _resources_sampler_release_global).
 $SIG{HUP}  = $SIG{TERM};
-END { open(STDERR, '>&', $STDERR_CAPTURE_SAVED) if $STDERR_CAPTURE_SAVED; _keepawake_release_global(); _resources_sampler_release_global(); LaunchLog::close_log($LAUNCH_LOG); _close_transcript(); SandboxLock::release_all() }
+END { tui::LaunchScreens::host_leave($LAUNCH_HOST) if $LAUNCH_HOST; open(STDERR, '>&', $STDERR_CAPTURE_SAVED) if $STDERR_CAPTURE_SAVED; _keepawake_release_global(); _resources_sampler_release_global(); LaunchLog::close_log($LAUNCH_LOG); _close_transcript(); SandboxLock::release_all() }
 
 SandboxLock::acquire($LOCK_DIR, windows => $WINDOWS_FAMILY) or do {
     print STDERR "ERROR: another claude-sandbox is doing setup for this project (lock held > 10s at $LOCK_DIR).\n";
@@ -1211,6 +1685,58 @@ SandboxLock::acquire($LOCK_DIR, windows => $WINDOWS_FAMILY) or do {
     reset_terminal();
     exit 1;
 };
+
+# =====================================================================
+# 08-launcher-screens: open the launch TUI
+# =====================================================================
+#
+# HERE, and nowhere earlier. The in-place / work-copy guard and its refusal
+# message, and the launch lock's own contention message, all belong on the
+# plain terminal: they are what the operator reads when the launch does NOT
+# happen, and an alt-screen would discard them on exit.
+#
+# The mode arrives through a seam bound to the UNCHANGED three-argument
+# Dashboard::decide_mode gate -- the same three inputs enter_dashboard already
+# passes -- so there is exactly one definition of "is this terminal a TUI".
+# The safe degradation is always plain.
+#
+# `-t STDOUT && -t STDIN`, NOT `-t STDOUT` alone: this must be the SAME
+# three inputs enter_dashboard passes at its own decide_mode call, and
+# enter_dashboard has always asked about both handles. With only STDOUT
+# checked, `claude-sandbox </dev/null` opened the alt screen and then ran a
+# key loop against a stdin that can never produce a key -- an unreachable exit
+# and a spinning frame the operator cannot escape. A TUI whose input is closed
+# is not a TUI.
+$LAUNCH_MODE = tui::LaunchScreens::choose_mode(
+    sub { Dashboard::decide_mode($_[0], $_[1], $_[2]) },
+    ((-t STDOUT && -t STDIN) ? 1 : 0), $READKEY_OK, $ENV{CCPRAXIS_NO_TUI});
+
+if ($LAUNCH_MODE eq 'tui') {
+    my %raw_seams = _launch_raw_sink_seams();
+    $LAUNCH_HOST = tui::LaunchScreens::make_host(
+        mode      => 'tui',
+        title     => "claude-sandbox: $PROJECT_NAME",
+        plain     => \&_launch_plain_sink,
+        out       => sub { print STDOUT $_[0] },
+        %raw_seams,
+        read_mode => sub { eval { Term::ReadKey::ReadMode($_[0] eq 'cbreak' ? 'cbreak' : 'restore') } },
+        term_size => sub {
+            my @s = eval { Term::ReadKey::GetTerminalSize() };
+            return (((@s && $s[0]) ? $s[0] : 80), ((@s && $s[1]) ? $s[1] : 24));
+        },
+        # The keep-alive obligation does not begin until there is a RUNNING
+        # container to keep alive (there is no /tmp/.launcher-alive before
+        # `podman start` returns 0), so this starts as a no-op and is
+        # re-bound to the throttled toucher at the s03 gate. The code path is
+        # identical either way -- a screen must not have two shapes.
+        heartbeat => sub { _launch_heartbeat_tick() },
+        render    => \&_launch_render_frame,
+    );
+    $LAUNCH_HOST->{stages} = $LAUNCH_STAGES;
+    tui::LaunchScreens::host_enter($LAUNCH_HOST);
+    _launch_stage_begin('preflight');
+    _launch_stage_end('preflight', 'ok');
+}
 
 # B1: open the per-launch log now that the lock is held. Best-effort — a failure
 # leaves $LAUNCH_LOG undef and every log_ev() becomes a no-op (the launch still
@@ -1311,7 +1837,7 @@ sub launcher_hash {
 # =====================================================================
 
 sub build_image {
-    print _c_step("Building claude-sandbox image with Claude Code v${HOST_VERSION}..."), "\n";
+    _emit_step(_c_step("Building claude-sandbox image with Claude Code v${HOST_VERSION}..."), "\n");
     log_ev('image_build_start', { version => $HOST_VERSION });
     _tx("\n--- image build (v${HOST_VERSION}) ---\n");
     my $rc = _tee_system($PODMAN, 'build',
@@ -1321,7 +1847,8 @@ sub build_image {
         $CONTAINER_CONFIG);
     if ($rc != 0) {
         log_ev('image_build_failed', { exit => $rc >> 8 });
-        print STDERR _c_err("ERROR:"), " podman build failed (exit @{[$rc >> 8]}).\n";
+        _emit_err(_c_err("ERROR:"), " podman build failed (exit @{[$rc >> 8]}).\n");
+        _launch_fail('image', 'podman build failed', $rc >> 8);
         LaunchLog::close_log($LAUNCH_LOG);
         SandboxLock::release($LOCK_DIR);
         reset_terminal();
@@ -1387,7 +1914,12 @@ sub backpack_review {
     # fail-open: proceed even if !$got_build_lock
     `$PODMAN image inspect claude-sandbox:latest 2>&1`;
     if ($? != 0) {
+        _launch_stage_begin('image');
         build_image();
+        _launch_stage_end('image', 'ok');
+    }
+    else {
+        _launch_stage_end('image', 'skipped');
     }
     SandboxLock::release($build_lock);
 }
@@ -1455,15 +1987,23 @@ my $CONTAINER_NAME;
     if ($connector_mode) {
         # Connector requires a manager/dashboard to already be up.
         if ($state ne 'running') {
-            print STDERR _c_err("ERROR:"), " no running sandbox to connect to for this project.\n";
-            print STDERR "       Run `claude-sandbox` (no flags) to start the sandbox + dashboard first,\n";
-            print STDERR "       then launch a claude session from the dashboard.\n";
+            _emit_err(_c_err("ERROR:"), " no running sandbox to connect to for this project.\n");
+            _emit_err("       Run `claude-sandbox` (no flags) to start the sandbox + dashboard first,\n");
+            _emit_err("       then launch a claude session from the dashboard.\n");
             SandboxLock::release($LOCK_DIR);
             reset_terminal();
             exit 1;
         }
-        print _c_step("Connecting to running sandbox: $CONTAINER_NAME"), "\n";
+        _emit_step(_c_step("Connecting to running sandbox: $CONTAINER_NAME"), "\n");
         SandboxLock::release($LOCK_DIR);
+        # S2.12 case (b): the container is ALREADY running, so the keep-alive
+        # obligation has begun -- BEFORE any screen opens, not after. The
+        # session picker below is a key loop that can sit idle for as long as
+        # the operator takes to choose, and container/heartbeat.sh reaps a
+        # container HB seconds after the last touch regardless of what the
+        # host is doing. Without arming here every tick of that loop was a
+        # no-op and the picker could outlive the thing it was picking for.
+        _launch_heartbeat_arm();
         my @SESSION_FLAGS;
         {
             my ($action, $uuid);
@@ -1473,12 +2013,22 @@ my $CONTAINER_NAME;
                 ($action, $uuid) = pick_session_action();
             }
             if ($action eq 'cancel') {
-                print "Cancelled.\n";
+                # Leave FIRST: an emit into a live frame is a byte the
+                # alt-screen restore is about to throw away.
+                tui::LaunchScreens::host_leave($LAUNCH_HOST) if $LAUNCH_HOST;
+                _emit_out("Cancelled.\n");
                 reset_terminal();
                 exit 0;
             }
             push @SESSION_FLAGS, '--resume', $uuid if $action eq 'resume';
         }
+        # The picking is done; everything from here on owns the REAL terminal
+        # directly -- kill_orphan_claudes_if_user_confirms reads <STDIN> with
+        # echo off, `podman exec -it claude` takes the tty outright, and
+        # hold_for_keypress drives its own cbreak loop. Tear the launch frame
+        # down FIRST so none of them paints into a buffer that is about to be
+        # discarded, and so the read mode they each assume is the one they get.
+        tui::LaunchScreens::host_leave($LAUNCH_HOST) if $LAUNCH_HOST;
         # Orphan claudes (in-container processes from a prior connector
         # that died without releasing /root/.claude lockfiles) block any
         # new session indefinitely with no error message. Detect + offer
@@ -1507,6 +2057,10 @@ my $CONTAINER_NAME;
     # release it first, exactly as a connector does.)
     if ($state eq 'running') {
         SandboxLock::release($LOCK_DIR);
+        # The container is ALREADY running, so the keep-alive obligation has
+        # begun on this path too (S2.12's case (b)).
+        _launch_heartbeat_arm();
+        tui::LaunchScreens::host_handover($LAUNCH_HOST) if $LAUNCH_HOST;
         enter_dashboard();   # never returns (loops until the user exits)
     }
 
@@ -1521,9 +2075,10 @@ my $CONTAINER_NAME;
 
 sub run_perl_or_die {
     my ($what, @args) = @_;
-    my $rc = system($^X, $SANDBOX_SKILLS_PL, @args);
+    my $rc = _tee_system($^X, $SANDBOX_SKILLS_PL, @args);
     if ($rc != 0) {
-        print STDERR "ERROR: $what (perl exit @{[$rc >> 8]})\n";
+        _emit_err("ERROR: $what (perl exit @{[$rc >> 8]})\n");
+        _launch_fail('select', $what, $rc >> 8);
         SandboxLock::release($LOCK_DIR);
         reset_terminal();
         exit 1;
@@ -1540,14 +2095,16 @@ sub run_perl_to_file {
 
 sub _capture_or_die {
     my ($what, @cmd) = @_;
-    # Use IPC::Open3-style capture by piping. Simplest portable: backticks
-    # with proper escaping. Building a safe shell command from @cmd is
-    # tricky; use qx// with shell-quoted args.
-    my $cmdstr = join(' ', map { _shell_quote($_) } @cmd);
-    my $captured = `$cmdstr`;
-    my $rc = $?;
+    # LIST FORM with BOTH streams captured. The backtick version captured
+    # stdout only, so the child's stderr was inherited -- and inherited stderr
+    # inside an alt screen paints over the frame and is then destroyed by the
+    # leave bytes, which is exactly the diagnostic you need when this dies.
+    # It also removes the shell (and with it MSYS2's colon mangling).
+    my ($rc, $captured, $errtext) = _capture_out_err(@cmd);
     if ($rc != 0) {
-        print STDERR "ERROR: $what (perl exit @{[$rc >> 8]})\n";
+        _emit_err($errtext) if defined $errtext && length $errtext;
+        _emit_err("ERROR: $what (perl exit @{[$rc >> 8]})\n");
+        _launch_fail('select', $what, $rc >> 8);
         SandboxLock::release($LOCK_DIR);
         reset_terminal();
         exit 1;
@@ -1598,7 +2155,21 @@ run_perl_to_file('MCP discovery snapshot',    $MCP_SNAPSHOT_FILE,    'discover-m
 # The TUI writes selected-skills.json AND the project's
 # .claude/settings.local.json. Needs a real TTY on stdin.
 
+# >>> launch-emit:select:BEGIN
 {
+    _launch_stage_begin('select');
+    my $exit;
+    # {active}, not just $LAUNCH_MODE. _tee_system's plain-after-teardown
+    # fallback tears the host down mid-launch and leaves $LAUNCH_MODE saying
+    # 'tui'; opening a list screen after that paints escapes onto a restored
+    # terminal and runs a key loop no longer in cbreak. The mode is still named
+    # here because it is what decides whether a TUI was ever wanted at all.
+    if ($LAUNCH_MODE ne 'plain' && $LAUNCH_HOST && $LAUNCH_HOST->{active}) {
+        # In-process list screen over the model select-model emits, then the
+        # same persist path via select-apply. Both spawns have CAPTURED stdio.
+        $exit = _select_via_screen();
+    }
+    else {
     my $rc = system($^X, $SANDBOX_SKILLS_PL, 'select-interactive',
         '--selection-file',       $SELECTION_FILE,
         '--discovery-snapshot',   $SNAPSHOT_FILE,
@@ -1606,20 +2177,26 @@ run_perl_to_file('MCP discovery snapshot',    $MCP_SNAPSHOT_FILE,    'discover-m
         '--mcp-snapshot',         $MCP_SNAPSHOT_FILE,
         '--settings-local-file',  $SETTINGS_LOCAL_FILE,
         '--project-path',         $PROJECT_PATH);
-    my $exit = $rc >> 8;
+    $exit = $rc >> 8;
+    }
     if ($exit == 2) {
-        print "Cancelled.\n";
+        _launch_stage_end('select', 'skipped');
+        tui::LaunchScreens::host_leave($LAUNCH_HOST);
+        _emit_out("Cancelled.\n");
         SandboxLock::release($LOCK_DIR);
         reset_terminal();
         exit 0;
     }
     if ($exit != 0) {
-        print STDERR "ERROR: select-interactive failed (exit $exit)\n";
+        _emit_err("ERROR: select-interactive failed (exit $exit)\n");
+        _launch_fail('select', 'the skills/plugins/MCP selection failed', $exit);
         SandboxLock::release($LOCK_DIR);
         reset_terminal();
         exit 1;
     }
+    _launch_stage_end('select', 'ok');
 }
+# <<< launch-emit:select:END
 
 # =====================================================================
 # Staleness reasoning
@@ -1765,15 +2342,18 @@ sub enforce_container_config_shape {
         # tell the user how to unblock, mirroring the migration reaper's
         # running-container refusal (see the .claude-data migration block
         # above).
-        print STDERR _c_err("ERROR:"), " sandbox container ($name) still has the old\n";
-        print STDERR "       claude.json mount shape (@{[join(', ', @codes)]}) and its\n";
-        print STDERR "       running state could not be positively confirmed as safe to\n";
-        print STDERR "       remove (status: '@{[$st_ok ? ($st eq '' ? '(empty)' : $st) : 'inspect failed']}'). Continuing risks silent config\n";
-        print STDERR "       loss (an atomic rename() over the shared host config would\n";
-        print STDERR "       leave a still-attached container following a stale, unlinked\n";
-        print STDERR "       inode) or killing a live session. Close its dashboard /\n";
-        print STDERR "       session first (or re-run once the container engine responds\n";
-        print STDERR "       normally), then re-run.\n";
+        # Leave the frame first: this refusal is the ONLY thing the operator
+        # gets, and an alt screen discards whatever was painted into it.
+        tui::LaunchScreens::host_leave($LAUNCH_HOST) if $LAUNCH_HOST;
+        _emit_err(_c_err("ERROR:"), " sandbox container ($name) still has the old\n");
+        _emit_err("       claude.json mount shape (@{[join(', ', @codes)]}) and its\n");
+        _emit_err("       running state could not be positively confirmed as safe to\n");
+        _emit_err("       remove (status: '@{[$st_ok ? ($st eq '' ? '(empty)' : $st) : 'inspect failed']}'). Continuing risks silent config\n");
+        _emit_err("       loss (an atomic rename() over the shared host config would\n");
+        _emit_err("       leave a still-attached container following a stale, unlinked\n");
+        _emit_err("       inode) or killing a live session. Close its dashboard /\n");
+        _emit_err("       session first (or re-run once the container engine responds\n");
+        _emit_err("       normally), then re-run.\n");
         log_ev('config_shape_blocked', { container => $name, violations => \@codes, state => $st, state_ok => $st_ok });
         # H1: this sub is now also called from the early-dispatch block,
         # above enter_dashboard()'s fast path, where $LOCK_DIR (the setup
@@ -1790,8 +2370,8 @@ sub enforce_container_config_shape {
     # B13: confirmed not running — safe to reap. _container_exists is now
     # false, so the existing create path below rebuilds it with the new
     # shape. No prompt.
-    print _c_step("Container config shape is stale ($name, $st): @{[join(', ', @codes)]} — recreating"), "\n";
-    system($PODMAN, 'rm', '-f', $name);
+    _emit_step(_c_step("Container config shape is stale ($name, $st): @{[join(', ', @codes)]} — recreating"), "\n");
+    _tee_system($PODMAN, 'rm', '-f', $name);
     log_ev('config_shape_reap_container', { container => $name, state => $st, violations => \@codes });
     return;
 }
@@ -1892,10 +2472,17 @@ sub _skill_divergence_msg {
 # =====================================================================
 
 if (@STALE_REASONS) {
+    # prompt_stale_action owns the terminal directly (its own cbreak, its own
+    # in-place redraw, its own ReadMode(0) on the way out), so the frame is
+    # handed back for its duration rather than being painted over and left in
+    # canonical mode behind the launcher's back.
+    my $suspended = _launch_suspend();
     my $action = prompt_stale_action(\@STALE_REASONS, $HOST_VERSION);
+    _launch_resume() if $suspended;
     if ($action eq 'rebuild') {
-        # Remove old container if it exists.
-        system($PODMAN, 'rm', '-f', $CONTAINER_NAME);
+        # Remove old container if it exists. Captured: this runs with the frame
+        # back up, so inherited stdio would paint over it.
+        _tee_system($PODMAN, 'rm', '-f', $CONTAINER_NAME);
         # Forced rebuild — acquire the global build lock but skip the re-check
         # (the user explicitly chose rebuild, so we always build regardless of
         # whether a concurrent launcher already built it). Fail-open on timeout.
@@ -1919,7 +2506,8 @@ if (@STALE_REASONS) {
         $CONTAINER_NAME = "claude-${PROJECT_NAME}-${path_hash}";
         _write_file("$LAUNCHER_DIR/container-name", $CONTAINER_NAME);
     } elsif ($action eq 'cancel') {
-        print "Cancelled.\n";
+        tui::LaunchScreens::host_leave($LAUNCH_HOST) if $LAUNCH_HOST;
+        _emit_out("Cancelled.\n");
         SandboxLock::release($LOCK_DIR);
         reset_terminal();
         exit 0;
@@ -2062,16 +2650,17 @@ sub _copy_file {
 
 my @SKILL_MOUNTS;
 {
-    my $cmd = join(' ',
-        _shell_quote($^X),
-        _shell_quote($SANDBOX_SKILLS_PL),
-        'mounts',
-        '--selection-file',     _shell_quote($SELECTION_FILE),
-        '--discovery-snapshot', _shell_quote($SNAPSHOT_FILE),
-    );
-    my $output = `$cmd`;
-    if ($? != 0) {
-        print STDERR "ERROR: failed to enumerate skill mounts (perl exit @{[$? >> 8]})\n";
+    # LIST FORM, both streams captured: the backtick version let the child's
+    # stderr land straight on the frame (and then be discarded with it), and
+    # its shell round-trip was one more colon-bearing argument for MSYS2 to
+    # mangle.
+    my ($mrc, $output, $merr) = _capture_out_err($^X, $SANDBOX_SKILLS_PL, 'mounts',
+        '--selection-file',     $SELECTION_FILE,
+        '--discovery-snapshot', $SNAPSHOT_FILE);
+    if ($mrc != 0) {
+        _launch_fail('select', 'failed to enumerate skill mounts', $mrc >> 8);
+        _emit_err($merr) if defined $merr && length $merr;
+        _emit_err("ERROR: failed to enumerate skill mounts (perl exit @{[$mrc >> 8]})\n");
         SandboxLock::release($LOCK_DIR);
         reset_terminal();
         exit 1;
@@ -2351,6 +2940,10 @@ ensure_claude_json_onboarded();
 # we don't need to fight the terminal to read it.
 sub pick_session_action {
     my $sessions_dir = "$CLAUDE_DATA/projects/-project";
+    # TUI path: the pick happens in-process from a --list-json snapshot, so
+    # there is no --output round-trip and no child owning the terminal.
+    return _pick_session_via_screen($sessions_dir)
+        if $LAUNCH_HOST && $LAUNCH_HOST->{mode} eq 'tui' && $LAUNCH_HOST->{active};
     my $out_file     = "$LAUNCHER_DIR/.session-pick";
     unlink $out_file;
     my $rc = system($^X, $SELECT_SESSION_PL,
@@ -2364,7 +2957,7 @@ sub pick_session_action {
     if ($exit != 0) {
         # Selector failed for some other reason. Don't block the user —
         # fall through to a fresh session, which is the safest default.
-        print STDERR "WARNING: session selector exited $exit; starting a new session.\n";
+        _emit_err("WARNING: session selector exited $exit; starting a new session.\n");
         return ('new', undef);
     }
     my $token = _read_file($out_file);
@@ -2376,7 +2969,7 @@ sub pick_session_action {
     if ($token =~ /^RESUME\s+([0-9a-fA-F-]+)\s*$/) {
         return ('resume', $1);
     }
-    print STDERR "WARNING: session selector returned unrecognized token '$token'; starting a new session.\n";
+    _emit_err("WARNING: session selector returned unrecognized token '$token'; starting a new session.\n");
     return ('new', undef);
 }
 
@@ -2982,9 +3575,9 @@ my $CONTAINER_WAS_CREATED = 0;
 # state (stopped/exited/created).
 
 if (_container_exists($CONTAINER_NAME)) {
-    print _c_step("Starting container: $CONTAINER_NAME"), "\n";
+    _emit_step(_c_step("Starting container: $CONTAINER_NAME"), "\n");
 } else {
-    print _c_step("Creating new container: $CONTAINER_NAME"), "\n";
+    _emit_step(_c_step("Creating new container: $CONTAINER_NAME"), "\n");
 }
 
 # -----------------------------------------------------------------------
@@ -3027,6 +3620,7 @@ my $refresh_port_args = sub {
 # B12: must run BEFORE the create-vs-attach decision below — a container
 # reaped after that decision would be routed down the ATTACH path and never
 # get a port block. Non-declinable; see enforce_container_config_shape above.
+# >>> launch-emit:ports:BEGIN
 enforce_container_config_shape($CONTAINER_NAME);
 
 if (! _container_exists($CONTAINER_NAME)) {
@@ -3037,11 +3631,11 @@ if (! _container_exists($CONTAINER_NAME)) {
         [ _enumerate_inuse_host_ports($CONTAINER_NAME) ]);
     $PORT_BASE = PortAlloc::next_free_base(\@PORT_INUSE_BASES);
     if (defined $PORT_BASE) {
-        print _c_ok("Allocated host port block $PORT_BASE-@{[$PORT_BASE + 19]}"), "\n";
+        _emit_ok(_c_ok("Allocated host port block $PORT_BASE-@{[$PORT_BASE + 19]}"), "\n");
         _write_file("$LAUNCHER_DIR/port-base", $PORT_BASE);
     } else {
-        print STDERR _c_warn("WARNING:"),
-            " no free host port block available — launching with NO published ports.\n";
+        _emit_err(_c_warn("WARNING:"),
+            " no free host port block available — launching with NO published ports.\n");
     }
     $refresh_port_args->($PORT_BASE);
 } else {
@@ -3052,8 +3646,11 @@ if (! _container_exists($CONTAINER_NAME)) {
     chomp $PORT_BASE if defined $PORT_BASE;
     $PORT_BASE = ($PORT_BASE // '') =~ /^\d+$/ ? $PORT_BASE + 0 : undef;
 }
+# <<< launch-emit:ports:END
 
+# >>> launch-emit:create:BEGIN
 if (! _container_exists($CONTAINER_NAME)) {
+    _launch_stage_begin('create');
 
     # Materialize blueprint copies on first create.
     if (! -f $CONTAINER_CLAUDE_MD) {
@@ -3171,10 +3768,15 @@ if (! _container_exists($CONTAINER_NAME)) {
 
     @podman_args = $build_create_args->();
 
-    my $rc = system(@podman_args);
+    # _tee_system: `podman create`'s diagnostics are the whole content of a
+    # create failure, and a bare system() writes them into the alt buffer that
+    # the teardown is about to throw away. Routed here they reach the raw
+    # capture sink, which is what failure_report replays verbatim.
+    my $rc = _tee_system(@podman_args);
     log_ev('container_create', { exit => $rc >> 8, container => $CONTAINER_NAME });
     if ($rc != 0) {
-        print STDERR _c_err("ERROR:"), " podman create failed (exit @{[$rc >> 8]}) — not committing baseline.\n";
+        _emit_err(_c_err("ERROR:"), " podman create failed (exit @{[$rc >> 8]}) — not committing baseline.\n");
+        _launch_fail('create', 'podman create failed', $rc >> 8);
         SandboxLock::release($LOCK_DIR);
         reset_terminal();
         exit ($rc >> 8);
@@ -3202,20 +3804,21 @@ if (! _container_exists($CONTAINER_NAME)) {
         }
         if (@stray) {
             my $n = scalar @stray;
-            print STDERR "\n";
-            print STDERR _c_err("ERROR:"), " MSYS2 path corruption detected after podman create.\n";
-            print STDERR "       Found $n stray `;C`-suffixed bind-mount target(s):\n";
-            print STDERR "         - $_\n" for @stray;
-            print STDERR "\n";
-            print STDERR "       Cause: the MSYS2_ARG_CONV_EXCL=* guard didn't apply when\n";
-            print STDERR "       podman.exe was invoked. Likely someone edited launcher.pl\n";
-            print STDERR "       or the .sh/.ps1 shim and removed the env-var setup, OR you\n";
-            print STDERR "       invoked launcher.pl directly without the shim.\n";
-            print STDERR "       See global-config/CLAUDE.md \"MSYS2 path-conversion\" for the\n";
-            print STDERR "       full failure mode.\n";
-            print STDERR "\n";
-            print STDERR "       Auto-recovering: removing the stray dirs and the broken\n";
-            print STDERR "       container so the next run can rebuild cleanly.\n";
+            _emit_err("\n");
+            _emit_err(_c_err("ERROR:"), " MSYS2 path corruption detected after podman create.\n");
+            _emit_err("       Found $n stray `;C`-suffixed bind-mount target(s):\n");
+            _emit_err("         - $_\n") for @stray;
+            _emit_err("\n");
+            _emit_err("       Cause: the MSYS2_ARG_CONV_EXCL=* guard didn't apply when\n");
+            _emit_err("       podman.exe was invoked. Likely someone edited launcher.pl\n");
+            _emit_err("       or the .sh/.ps1 shim and removed the env-var setup, OR you\n");
+            _emit_err("       invoked launcher.pl directly without the shim.\n");
+            _emit_err("       See global-config/CLAUDE.md \"MSYS2 path-conversion\" for the\n");
+            _emit_err("       full failure mode.\n");
+            _emit_err("\n");
+            _emit_err("       Auto-recovering: removing the stray dirs and the broken\n");
+            _emit_err("       container so the next run can rebuild cleanly.\n");
+            _launch_fail('create', 'MSYS2 path corruption detected after podman create', undef);
             for my $path (@stray) {
                 _rmtree($path);
             }
@@ -3240,7 +3843,12 @@ if (! _container_exists($CONTAINER_NAME)) {
         '--selection-file',     $SELECTION_FILE,
         '--discovery-snapshot', $SNAPSHOT_FILE,
         '--output',             $MANIFEST_FILE);
+    _launch_stage_end('create', 'ok');
 }
+else {
+    _launch_stage_end('create', 'skipped');
+}
+# <<< launch-emit:create:END
 
 # =====================================================================
 # Backpack approval (host-side, BEFORE podman start)
@@ -3276,39 +3884,53 @@ my $BACKPACK_TRUST_FILE     = "$LAUNCHER_DIR/backpack-trusted-hash";  # legacy; 
 my $BACKPACK_HOST_FILE      = "$CLAUDE_DATA/backpack.json";
 my $BACKPACK_HOST_PL        = "$CLAUDE_HOST_CONFIG/ccpraxis/plugins/backpack/scripts/backpack.pl";
 
+# >>> launch-emit:backpack:BEGIN
 if ($CONTAINER_WAS_CREATED && -f $BACKPACK_HOST_FILE) {
+    _launch_stage_begin('backpack');
     if (! -f $BACKPACK_HOST_PL) {
         $INSTALL_WARNING = 'backpack present but host backpack.pl missing - install skipped';
-        print STDERR _c_warn("WARNING:"), " backpack.json present but host backpack.pl missing at $BACKPACK_HOST_PL\n";
-        print STDERR "         Skipping install pass; run /backpack:install in-session after fixing.\n";
+        _emit_err(_c_warn("WARNING:"), " backpack.json present but host backpack.pl missing at $BACKPACK_HOST_PL\n");
+        _emit_err("         Skipping install pass; run /backpack:install in-session after fixing.\n");
+        _launch_stage_end('backpack', 'skipped');
     } else {
         # Validate using host's perl — same backpack.pl, host-resident file.
         my $validate_rc = _tee_system($^X, $BACKPACK_HOST_PL, 'validate', $BACKPACK_HOST_FILE);
         if ($validate_rc != 0) {
             $INSTALL_WARNING = 'backpack.json failed validation - install skipped (see launch transcript)';
-            print STDERR "\n";
-            print STDERR _c_warn("WARNING:"), " backpack.json failed schema validation (see errors above).\n";
-            print STDERR "         Skipping install pass. Fix the file (or delete it) and re-launch.\n";
-            print STDERR "\n";
+            _emit_err("\n");
+            _emit_err(_c_warn("WARNING:"), " backpack.json failed schema validation (see errors above).\n");
+            _emit_err("         Skipping install pass. Fix the file (or delete it) and re-launch.\n");
+            _emit_err("\n");
+            _launch_stage_end('backpack', 'failed');
         } else {
             # Per-item approval (#21): only NEW/CHANGED items are walked; the rest
             # install silently. backpack_review returns the approved subset.
-            print "\n";
-            my ($approved, $deferred) = backpack_review(
-                $BACKPACK_HOST_FILE, $BACKPACK_HOST_PL,
-                $BACKPACK_APPROVALS_FILE, $BACKPACK_TRUST_FILE,
-                md5_of_file($BACKPACK_HOST_FILE));
+            _emit_out("\n");
+            # {active}, not just $LAUNCH_MODE -- see the select block above:
+            # a torn-down host must fall back to the plain walk, not open a
+            # screen on a terminal that is no longer in raw mode.
+            my ($approved, $deferred) = ($LAUNCH_MODE ne 'plain' && $LAUNCH_HOST && $LAUNCH_HOST->{active})
+                ? _backpack_triage_via_screen(
+                    $BACKPACK_HOST_FILE, $BACKPACK_HOST_PL,
+                    $BACKPACK_APPROVALS_FILE, $BACKPACK_TRUST_FILE,
+                    md5_of_file($BACKPACK_HOST_FILE))
+                : backpack_review(
+                    $BACKPACK_HOST_FILE, $BACKPACK_HOST_PL,
+                    $BACKPACK_APPROVALS_FILE, $BACKPACK_TRUST_FILE,
+                    md5_of_file($BACKPACK_HOST_FILE));
             @BACKPACK_APPROVED_ITEMS = @$approved;
             log_ev('backpack_review',
                 { approved => scalar(@BACKPACK_APPROVED_ITEMS), deferred => $deferred });
             if (!@BACKPACK_APPROVED_ITEMS) {
-                print "No backpack items approved — skipping install. Run /backpack:install in-session anytime.\n";
+                _emit_out("No backpack items approved — skipping install. Run /backpack:install in-session anytime.\n");
             } elsif ($deferred) {
-                print "$deferred item(s) deferred — you'll be asked again on the next launch.\n";
+                _emit_out("$deferred item(s) deferred — you'll be asked again on the next launch.\n");
             }
+            _launch_stage_end('backpack', 'ok');
         }
     }
 }
+# <<< launch-emit:backpack:END
 
 # Release the per-project lock before podman exec — `exec` replaces this
 # perl process and skips END/signal handlers, so we release explicitly.
@@ -3581,10 +4203,45 @@ sub _surface_last_reap {
     chomp $seen;
     return 0 if length $stamp && $seen eq $stamp;
 
-    print STDERR "\n", _c_warn('NOTE:'), " ", shift(@lines), "\n";
-    print STDERR "      $_\n" for map { split /\n/, $_ } @lines;
-    print STDERR "      (recorded at $REAP_RECORD_FILE)\n\n";
+    # With the launch TUI up this becomes a BANNER rather than a pre-TUI
+    # print; on the plain path the bytes are exactly today's.
+    my @notice = (shift(@lines), (map { split /\n/, $_ } @lines),
+                  "(recorded at $REAP_RECORD_FILE)");
+    if ($LAUNCH_HOST && $LAUNCH_HOST->{mode} eq 'tui' && $LAUNCH_HOST->{active}) {
+        tui::LaunchScreens::add_banner($LAUNCH_HOST, \@notice, 'warn');
+        _launch_repaint();
+        # DO NOT burn the show-once marker here. On this path the notice is a
+        # banner inside a frame that host_handover discards a moment later,
+        # and add_banner pushes one banner per line into a compose ladder that
+        # drops surplus banners from the end. Burning the marker now would
+        # spend the one chance to explain a past reap on a frame that may
+        # never have carried the whole notice -- "the record existed but
+        # nothing read it" is the exact failure this notice was added for.
+        # The marker is committed at handover instead (see
+        # _launch_commit_reap_marker), by which point the banner has been on
+        # screen for the whole start + install phase.
+        $LAUNCH_REAP_PENDING = $stamp;
+        return 1;
+    }
 
+    _emit_err("\n", _c_warn('NOTE:'), " ", $notice[0], "\n");
+    _emit_err("      $_\n") for @notice[1 .. $#notice - 1];
+    _emit_err("      (recorded at $REAP_RECORD_FILE)\n\n");
+
+    eval { _write_file($REAP_SHOWN_FILE, "$stamp\n"); 1 };   # best-effort
+    return 1;
+}
+
+# _launch_commit_reap_marker() -- burn the show-once marker for a notice that
+# WAS surfaced. Called only once the launch reached the dashboard handover,
+# i.e. once the banner had been up for the whole remaining launch. A launch
+# that fails or is cancelled before then leaves the marker unwritten, so the
+# next launch explains the reap again -- showing it twice is harmless, losing
+# it is not.
+sub _launch_commit_reap_marker {
+    return 0 unless defined $LAUNCH_REAP_PENDING;
+    my $stamp = $LAUNCH_REAP_PENDING;
+    $LAUNCH_REAP_PENDING = undef;
     eval { _write_file($REAP_SHOWN_FILE, "$stamp\n"); 1 };   # best-effort
     return 1;
 }
@@ -3597,7 +4254,19 @@ _surface_last_reap();
 my $start_rc;
 my $gate_result = s03_run_launch_gate(
     probe           => $_s03_probe_state,
-    start           => sub { $start_rc = system($PODMAN, 'start', $CONTAINER_NAME); return $start_rc; },
+    # S2.12: the keep-alive obligation begins the moment `podman start`
+    # returns 0 -- before that there is no /tmp/.launcher-alive to touch, so
+    # the screens' heartbeat seam is bound to a real (throttled) toucher only
+    # from here on. The seam itself is passed and ticked either way; the code
+    # path does not change shape.
+    # _tee_system, not bare system: with the frame up an inherited-stdio child
+    # paints straight into the alt buffer, which the leave bytes then discard.
+    # Its rc convention is system()'s, so nothing downstream changes.
+    start           => sub { _launch_stage_begin('start');
+                             $start_rc = _tee_system($PODMAN, 'start', $CONTAINER_NAME);
+                             _launch_heartbeat_arm() if defined $start_rc && $start_rc == 0;
+                             _launch_stage_end('start', ($start_rc == 0 ? 'ok' : 'failed'));
+                             return $start_rc; },
     is_port_failure => $port_in_use,
     recover         => sub {
         my ($reason) = @_;
@@ -3609,9 +4278,14 @@ my $gate_result = s03_run_launch_gate(
     },
     abort           => sub {
         my ($rc) = @_;
-        print STDERR _c_err("ERROR:"),
+        # Leave the frame FIRST and replay the captured start output to the
+        # restored screen: this is a failure, and criterion 2 says a failure
+        # shows its error text in full, in scroll-back, where it can be read
+        # and copied. _emit_err then routes to the plain sink.
+        _launch_fail('start', 'podman start failed for a reason other than a port collision', $rc >> 8);
+        _emit_err(_c_err("ERROR:"),
             " podman start failed (exit @{[$rc >> 8]}) for a reason other than a"
-            . " port collision — aborting before podman exec.\n";
+            . " port collision — aborting before podman exec.\n");
         reset_terminal();
         exit ($rc >> 8 || 1);   # never exit 0 on a failed/ signal-killed start
     },
@@ -3624,7 +4298,8 @@ if (!defined $start_rc) {
     # The two rebuild-warranting causes already invoked recover_container
     # above; the machine-unreachable cause deliberately did not (spec 1.3 --
     # nothing to rebuild when the runtime itself is down).
-    print STDERR _c_err("ERROR:"), " $gate_result->{diagnosis}\n";
+    _launch_fail('start', $gate_result->{diagnosis}, undef);
+    _emit_err(_c_err("ERROR:"), " $gate_result->{diagnosis}\n");
     reset_terminal();
     exit 1;
 }
@@ -3636,16 +4311,17 @@ if ($start_rc != 0 && $port_in_use->($start_rc)) {
         my $max_tries = 5;
         while ($start_rc != 0 && $tries < $max_tries) {
             $tries++;
-            print STDERR _c_warn("WARNING:"),
+            _emit_err(_c_warn("WARNING:"),
                 " host port block "
                 . (defined $PORT_BASE ? "$PORT_BASE-@{[$PORT_BASE + 19]}" : '(none)')
-                . " is already in use — reallocating (attempt $tries/$max_tries).\n";
+                . " is already in use — reallocating (attempt $tries/$max_tries).\n");
             # Mark the collided base occupied and pick the next free block.
             push @PORT_INUSE_BASES, $PORT_BASE if defined $PORT_BASE;
             my $next = PortAlloc::next_free_base(\@PORT_INUSE_BASES);
             if (!defined $next) {
-                print STDERR _c_err("ERROR:"),
-                    " no free host port block available after $tries attempt(s) — giving up.\n";
+                _launch_fail('start', 'no free host port block available', undef);
+                _emit_err(_c_err("ERROR:"),
+                    " no free host port block available after $tries attempt(s) — giving up.\n");
                 reset_terminal();
                 exit 1;
             }
@@ -3653,36 +4329,39 @@ if ($start_rc != 0 && $port_in_use->($start_rc)) {
             _write_file("$LAUNCHER_DIR/port-base", $PORT_BASE);
             $refresh_port_args->($PORT_BASE);
             # Recreate with the fresh block, then retry start.
-            system($PODMAN, 'rm', '-f', $CONTAINER_NAME);
+            _tee_system($PODMAN, 'rm', '-f', $CONTAINER_NAME);
             @podman_args = $build_create_args->();
-            my $recreate_rc = system(@podman_args);
+            my $recreate_rc = _tee_system(@podman_args);
             if ($recreate_rc != 0) {
-                print STDERR _c_err("ERROR:"),
-                    " podman recreate failed (exit @{[$recreate_rc >> 8]}) during port-collision retry.\n";
+                _launch_fail('create', 'podman recreate failed during port-collision retry', $recreate_rc >> 8);
+                _emit_err(_c_err("ERROR:"),
+                    " podman recreate failed (exit @{[$recreate_rc >> 8]}) during port-collision retry.\n");
                 reset_terminal();
                 exit ($recreate_rc >> 8 || 1);
             }
-            print _c_ok("Reallocated host port block $PORT_BASE-@{[$PORT_BASE + 19]}"), "\n";
-            $start_rc = system($PODMAN, 'start', $CONTAINER_NAME);
+            _emit_ok(_c_ok("Reallocated host port block $PORT_BASE-@{[$PORT_BASE + 19]}"), "\n");
+            $start_rc = _tee_system($PODMAN, 'start', $CONTAINER_NAME);
             last if $start_rc == 0;
             last unless $port_in_use->($start_rc);
         }
         if ($start_rc != 0) {
-            print STDERR _c_err("ERROR:"),
-                " could not find a free host port block after $tries attempt(s) — giving up.\n";
+            _launch_fail('start', 'no free host port block found', $start_rc >> 8);
+            _emit_err(_c_err("ERROR:"),
+                " could not find a free host port block after $tries attempt(s) — giving up.\n");
             reset_terminal();
             exit ($start_rc >> 8 || 1);   # never exit 0 on a failed/ signal-killed start
         }
     } else {
         # Existing container: its -p mapping was baked at create and cannot
         # be re-published by `podman start`. Do NOT force-recreate.
-        print STDERR "\n";
-        print STDERR _c_err("ERROR:"),
+        _launch_fail('start', "another sandbox took this container's host ports", $start_rc >> 8);
+        _emit_err("\n");
+        _emit_err(_c_err("ERROR:"),
             " another sandbox took this container's host ports"
-            . (defined $PORT_BASE ? " (block $PORT_BASE-@{[$PORT_BASE + 19]})" : '') . ".\n";
-        print STDERR "       This container's port mapping is fixed for its lifetime.\n";
-        print STDERR "       Rebuild ([r] at the next prompt) to recreate it with a fresh,\n";
-        print STDERR "       free port block.\n\n";
+            . (defined $PORT_BASE ? " (block $PORT_BASE-@{[$PORT_BASE + 19]})" : '') . ".\n");
+        _emit_err("       This container's port mapping is fixed for its lifetime.\n");
+        _emit_err("       Rebuild ([r] at the next prompt) to recreate it with a fresh,\n");
+        _emit_err("       free port block.\n\n");
         reset_terminal();
         exit ($start_rc >> 8 || 1);   # never exit 0 on a failed/ signal-killed start
     }
@@ -3702,7 +4381,7 @@ log_ev('container_start', { exit => $start_rc >> 8, container => $CONTAINER_NAME
 # (ten MINUTES each). Always read the live values there; do not trust a
 # number quoted in a comment here. Touching the sentinel first is kept
 # regardless: it is unconditionally correct and costs nothing.
-system($PODMAN, 'exec', $CONTAINER_NAME, 'touch', '/tmp/.launcher-alive');
+_tee_system($PODMAN, 'exec', $CONTAINER_NAME, 'touch', '/tmp/.launcher-alive');
 
 # Bind mount of claude-home → /root/.claude means host filesystem IS
 # the live state. No seed, no rescue, no sync. Blueprint files were
@@ -3726,17 +4405,18 @@ system($PODMAN, 'exec', $CONTAINER_NAME, 'touch', '/tmp/.launcher-alive');
 # dies the moment the install completes (or this bash is signalled). Single exec
 # → single lifecycle → no orphan helper to clean up.
 if (@BACKPACK_APPROVED_ITEMS) {
+    _launch_stage_begin('install');
     # Pre-flight: confirm the container has perl + backpack.pl wired in. If the
     # mount didn't land (older ccpraxis checkout, missing source), warn and skip
     # — claude still launches.
-    my $has_perl = (system($PODMAN, 'exec', $CONTAINER_NAME,
+    my $has_perl = (_tee_system($PODMAN, 'exec', $CONTAINER_NAME,
         'test', '-x', '/usr/bin/perl') == 0);
     my $has_helper = $has_perl
-        && (system($PODMAN, 'exec', $CONTAINER_NAME,
+        && (_tee_system($PODMAN, 'exec', $CONTAINER_NAME,
             'test', '-f', '/root/.claude/backpack.pl') == 0);
     if (!$has_helper) {
         $INSTALL_WARNING = 'backpack.pl not mounted in container - install skipped';
-        print STDERR _c_warn("WARNING:"), " Backpack found at $BACKPACK_HOST_FILE but backpack.pl isn't mounted in the container. Update ccpraxis (the launcher needs the plugin's backpack/scripts/backpack.pl) and rebuild.\n";
+        _emit_err(_c_warn("WARNING:"), " Backpack found at $BACKPACK_HOST_FILE but backpack.pl isn't mounted in the container. Update ccpraxis (the launcher needs the plugin's backpack/scripts/backpack.pl) and rebuild.\n");
     } else {
         # Write the approved subset as a backpack-shaped file into claude-home
         # (bound at /root/.claude) and point `install` at it — the full
@@ -3750,7 +4430,7 @@ if (@BACKPACK_APPROVED_ITEMS) {
         };
         if (!$wrote) {
             $INSTALL_WARNING = 'could not write backpack install-set - install skipped';
-            print STDERR _c_warn("WARNING:"), " could not write backpack install-set ($set_host): $@\n";
+            _emit_err(_c_warn("WARNING:"), " could not write backpack install-set ($set_host): $@\n");
         } else {
             # Inline bash script: kick off the heartbeat refresher in the
             # background, run apt-get update + backpack install in the foreground,
@@ -3776,15 +4456,20 @@ BASH
             if ($install_rc != 0) {
                 $INSTALL_WARNING = 'backpack install: some items failed - run /backpack:install in the session to retry';
                 log_ev('backpack_install_failed', { exit => $install_rc >> 8 });
-                print "\n";
-                print _c_warn("WARNING:"), " Some backpack items failed (see above). Handing off to claude anyway — fix in-session via /backpack:add, /backpack:remove, or by editing the backpack file directly and running /backpack:install.\n";
-                print "\n";
+                _emit_out("\n");
+                _emit_out(_c_warn("WARNING:"), " Some backpack items failed (see above). Handing off to claude anyway — fix in-session via /backpack:add, /backpack:remove, or by editing the backpack file directly and running /backpack:install.\n");
+                _emit_out("\n");
             } else {
                 log_ev('backpack_install_ok', { installed => scalar @BACKPACK_APPROVED_ITEMS });
             }
+            _launch_stage_end('install', ($install_rc == 0 ? 'ok' : 'failed'));
         }
     }
 }
+else {
+    _launch_stage_end('install', 'skipped');
+}
+_launch_stage_begin('dashboard');
 
 # =====================================================================
 # Dashboard (manager mode) — Decision #19
@@ -3798,6 +4483,16 @@ BASH
 # dashboard's [q] — stops the heartbeat; the container reaps itself within
 # ~5 minutes (Decision #17, unchanged). On a non-TTY / no-Term::ReadKey
 # terminal it degrades to the plain scrolling heartbeat loop.
+#
+# 08-launcher-screens: HANDOVER, not teardown. enter_dashboard's own
+# enter_raw re-enters the alt screen, so emitting the leave bytes here and
+# the enter bytes a moment later would show the operator a flash of the
+# normal screen. host_handover releases ownership without emitting anything,
+# leaving the alt screen continuously owned; enter_raw's ReadMode and title
+# push are idempotent in effect.
+_launch_stage_end('dashboard', 'ok');
+_launch_commit_reap_marker();   # the notice rode the frame the whole way here
+tui::LaunchScreens::host_handover($LAUNCH_HOST) if $LAUNCH_HOST;
 enter_dashboard();   # never returns (loops until the user exits)
 
 # ---------------------------------------------------------------------

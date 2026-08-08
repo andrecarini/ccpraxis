@@ -887,6 +887,88 @@ sub tui_current_section {
     return 'skills';  # default
 }
 
+# =====================================================================
+# 08-launcher-screens: the model / apply split
+# =====================================================================
+#
+# `select-interactive` is unchanged and remains the plain-path and non-TTY
+# entry point. The two subcommands below reuse the SAME item builder and the
+# SAME persist path -- they are not a second implementation of either, which
+# is the whole point: a picker whose model and whose writes drift apart from
+# the interactive one is a second source of truth waiting to disagree.
+
+# _select_model_json(\@items, \%sel_by_section, $label, $empty) -> the
+# tui::LaunchScreens list model for this item set.
+sub _select_model_json {
+    my ($items, $sel_by_section, $label, $empty) = @_;
+    my @out;
+    for my $it (@$items) {
+        my $kind = defined $it->{kind} ? $it->{kind} : 'row';
+        if ($kind ne 'row') {
+            push @out, { kind    => $kind,
+                         display => (defined $it->{label} ? $it->{label} : '') };
+            next;
+        }
+        my $group = _sel_key_for_row($it);
+        my $sel   = $sel_by_section->{$group} || {};
+        my $id    = defined $it->{id} ? $it->{id} : '';
+        push @out, {
+            kind     => 'row',
+            id       => $id,
+            group    => $group,
+            display  => (defined $it->{display} ? $it->{display} : $id),
+            badge    => ($it->{is_new} ? 'new' : ($it->{is_stale} ? 'stale' : undef)),
+            disabled => ($it->{disabled} ? 1 : 0),
+            selected => ((length($id) && $sel->{$id}) ? 1 : 0),
+        };
+    }
+    my $title = (defined $label && length $label)
+        ? "$label - skills, plugins and MCP"
+        : 'skills, plugins and MCP';
+    return { mode  => 'multi',
+             label => $title,
+             error => undef,
+             empty => ($empty ? 1 : 0),
+             items => \@out };
+}
+
+# _select_apply_decision(\%decision, \%sel_by_section) -- rebuild the six
+# selection hashes from the screen's decision. The decision carries every id
+# that ended up selected, so clearing first and re-filling reproduces the
+# interactive loop's end state exactly.
+sub _select_apply_decision {
+    my ($decision, $sel_by_section) = @_;
+    for my $k (keys %$sel_by_section) { %{ $sel_by_section->{$k} } = () }
+    my $sel = (ref $decision->{selected} eq 'HASH') ? $decision->{selected} : {};
+    for my $group (keys %$sel) {
+        my $target = $sel_by_section->{$group} or next;
+        next unless ref $sel->{$group} eq 'ARRAY';
+        $target->{$_} = 1 for @{ $sel->{$group} };
+    }
+    return 1;
+}
+
+sub cmd_select_model {
+    my %opts = @_;
+    return cmd_select_interactive(%opts, emit_model => 1);
+}
+
+sub cmd_select_apply {
+    my %opts = @_;
+    my $path = $opts{decision_file} or die "--decision-file required\n";
+    # An unreadable or unparseable decision file is an ERROR EXIT, never a
+    # silent cancel: "the operator chose nothing" and "we could not read what
+    # the operator chose" must not collapse into the same outcome.
+    open my $fh, '<:raw', $path or die "select-apply: cannot read $path: $!\n";
+    local $/;
+    my $blob = <$fh>;
+    close $fh;
+    my $decision = eval { JSON::PP->new->utf8->decode(defined $blob ? $blob : '') };
+    die "select-apply: cannot parse $path\n" unless ref $decision eq 'HASH';
+    return 2 unless $decision->{confirmed};
+    return cmd_select_interactive(%opts, decision => $decision);
+}
+
 # --- The actual subcommand ------------------------------------------
 
 sub cmd_select_interactive {
@@ -1088,29 +1170,6 @@ sub cmd_select_interactive {
         $project_label =~ s|.*/||;  # basename
     }
 
-    # If anything to choose from is empty AND no MCP entries exist, write
-    # selection-file with empty state and exit.
-    if (!@$skills && !@$plugins && !@$mcp) {
-        save_state($file, $state);
-        return 0;
-    }
-
-    # Verify stdin is a TTY; if not, fall back to auto-confirm with whatever's
-    # already in the state file.
-    if (! -t STDIN || ! -t STDOUT) {
-        warn "Note: not a TTY; using existing selection without prompting.\n";
-        $state->{known}         = [ map { $_->{name} } @$skills ];
-        $state->{known_plugins} = [ map { $_->{key}  } @$plugins ];
-        save_state($file, $state);
-        return 0;
-    }
-
-    tui_enter();
-
-    my $cursor = tui_first_row(\@items);
-    my $confirmed = 0;
-    my $cancelled = 0;
-
     # tui_render looks up the right selection hash per row using the
     # _sel_key_for_row helper. Stale rows use 'mcp_stale'; other rows use
     # '<section>_<partition>'.
@@ -1122,6 +1181,56 @@ sub cmd_select_interactive {
         mcp_suggestion     => \%sel_mcp_suggestion,
         mcp_stale          => \%keep_stale_mcp,
     };
+
+    # 08-launcher-screens, the MODEL half of the model/apply split.
+    # `select-model` reuses EXACTLY the item builder above, prints one JSON
+    # object and stops: no ReadMode, no cursor control, no Term::ReadKey, no
+    # write to the selection file. It runs before the empty/TTY early returns
+    # so the caller learns "nothing to choose from" as a field rather than as
+    # an absent screen.
+    if ($opts{emit_model}) {
+        print JSON::PP->new->utf8->canonical(1)->encode(
+            _select_model_json(\@items, $sel_by_section, $project_label,
+                               ((!@$skills && !@$plugins && !@$mcp) ? 1 : 0)));
+        return 0;
+    }
+
+    # If anything to choose from is empty AND no MCP entries exist, write
+    # selection-file with empty state and exit.
+    if (!@$skills && !@$plugins && !@$mcp) {
+        save_state($file, $state);
+        return 0;
+    }
+
+    # Verify stdin is a TTY; if not, fall back to auto-confirm with whatever's
+    # already in the state file. `select-apply` is deliberately exempt: its
+    # decision was already made on a real terminal by the launch screen, and
+    # its own stdio is CAPTURED by the launcher precisely so a child cannot
+    # paint over the frame.
+    if (!$opts{decision} && (! -t STDIN || ! -t STDOUT)) {
+        warn "Note: not a TTY; using existing selection without prompting.\n";
+        $state->{known}         = [ map { $_->{name} } @$skills ];
+        $state->{known_plugins} = [ map { $_->{key}  } @$plugins ];
+        save_state($file, $state);
+        return 0;
+    }
+
+    my $confirmed = 0;
+    my $cancelled = 0;
+
+    # 08-launcher-screens, the APPLY half: the decision arrived from the
+    # in-process launch screen, so the key loop below is skipped entirely and
+    # the SAME persist path runs on the SAME selection hashes.
+    if (ref $opts{decision} eq 'HASH') {
+        _select_apply_decision($opts{decision}, $sel_by_section);
+        $confirmed = $opts{decision}{confirmed} ? 1 : 0;
+        $cancelled = $confirmed ? 0 : 1;
+    }
+    else {
+
+    tui_enter();
+
+    my $cursor = tui_first_row(\@items);
 
     while (1) {
         tui_render(\@items, $cursor, $sel_by_section, $project_label);
@@ -1181,6 +1290,8 @@ sub cmd_select_interactive {
 
     tui_exit();
     print "\n";
+
+    }   # end of the interactive branch
 
     if ($cancelled) {
         # Don't persist anything - launcher should bail.
@@ -2650,6 +2761,12 @@ Commands:
   diff                --selection-file FILE         Compare discovery to mounted baseline.
   select-interactive  --selection-file FILE         TUI selector for skills/plugins/MCP;
                                                     writes selection + settings.local.json.
+  select-model        --selection-file FILE         Print the selector's item model as one
+                                                    JSON object; writes nothing, no terminal.
+  select-apply        --decision-file D --selection-file FILE
+                                                    Apply a decision produced by the launch
+                                                    screen through the same persist path.
+                                                    Exit 2 when the decision was not confirmed.
   mounts              --selection-file FILE         Emit host_path<TAB>name per line.
   record-mount        --selection-file FILE         Set mounted_at_create = selected.
   manifest            --selection-file FILE [--output FILE]
@@ -2721,6 +2838,8 @@ my %DISPATCH = (
     'prune'               => \&cmd_prune,
     'diff'                => \&cmd_diff,
     'select-interactive'  => \&cmd_select_interactive,
+    'select-model'        => \&cmd_select_model,
+    'select-apply'        => \&cmd_select_apply,
     'mounts'              => \&cmd_mounts,
     'record-mount'        => \&cmd_record_mount,
     'manifest'            => \&cmd_manifest,
