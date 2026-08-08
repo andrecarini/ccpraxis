@@ -32,6 +32,15 @@ use Encode qw(encode decode);
 
 use_ok('Dashboard') or BAIL_OUT('Dashboard.pm did not load');
 
+# tui::DashboardScreen is a READ-ONLY dependency here (package
+# 06-dashboard-screen, spec S2.1): AC-4's status/spinner role assertions
+# need theme_role() to map container_status_style's legacy role name
+# ('good'/'warn'/...) onto the Theme role name tui::DashboardScreen actually
+# emits on every span. Same load technique as t/41-panel-semantics.t:87-88.
+my $DASHBOARD_SCREEN_OK = eval { require tui::DashboardScreen; 1 };
+BAIL_OUT("tui::DashboardScreen.pm did not load ($@) -- theme_role() is this oracle's derivation source for the re-pointed AC-4 status/spinner role assertions; nothing below can mean anything without it")
+    unless $DASHBOARD_SCREEN_OK;
+
 # ===========================================================================
 # Fixture: the ten spinner codepoints in dots-1..dots-10 order, taken
 # VERBATIM from spec S2.1's code block (these are the ten codepoints already
@@ -204,19 +213,36 @@ sub _run_live {
                 "AC-4 ($case->{label}): B4 -- display_width(title text) == 80");
             unlike($row0->{text}, qr/[\e\a]/, "AC-4 ($case->{label}): B4 -- title text contains no ESC/BEL");
 
-            my ($expect_role) = (Dashboard::container_status_style($case->{status}, $case->{gone}))[1];
+            my ($expect_legacy_role) = (Dashboard::container_status_style($case->{status}, $case->{gone}))[1];
+            # RETARGETED 2026-08-08 (package 06-dashboard-screen, spec S2.1):
+            # tui::DashboardScreen emits Theme role names only on every span
+            # it produces, so the legacy role container_status_style returns
+            # ('good'/'warn'/...) must be mapped through theme_role() before
+            # comparison -- exactly the wrapping already applied to the
+            # adjacent title->'accent' assertion below (and to t/41:288).
+            # Still a differential against the styler, not a hand-typed
+            # Theme role name, so it cannot drift from container_status_style
+            # or from the mapping table.
+            my $expect_role = tui::DashboardScreen::theme_role($expect_legacy_role);
             my @spans = @{ $row0->{spans} || [] };
             my ($status_span) = grep { $_->{text} eq $case->{status} } @spans;
             ok($status_span, "AC-4 ($case->{label}): B6 -- a span carries the bare status word");
             is($status_span->{role}, $expect_role,
-                "AC-4 ($case->{label}): B6 -- status span role == container_status_style(...)[1] ('$expect_role')")
+                "AC-4 ($case->{label}): B6 -- status span role == theme_role(container_status_style(...)[1]) ('$expect_role')")
                 if $status_span;
             my ($spin_span) = grep { $_->{text} eq "$spin " } @spans;
             ok($spin_span, "AC-4 ($case->{label}): B6 -- a span carries the spinner glyph");
             is($spin_span->{role}, $expect_role,
-                "AC-4 ($case->{label}): B6 -- spinner span role == container_status_style(...)[1] ('$expect_role')")
+                "AC-4 ($case->{label}): B6 -- spinner span role == theme_role(container_status_style(...)[1]) ('$expect_role')")
                 if $spin_span;
-            is($spans[0]{role}, 'title', "AC-4 ($case->{label}): B6 -- the left span keeps role 'title'");
+            # RETARGETED 2026-08-08 (package 06-dashboard-screen, driver scope
+            # grant E-B/E-D): package 02's Theme-token role vocabulary maps
+            # the legacy 'title' role to 'accent' (spec 06 S2.1's mapping
+            # table: "title, accent -> accent"). Subject moved, claim held --
+            # this still asserts the title span keeps its OWN dedicated role,
+            # unmixed with the status/spinner spans' role.
+            is($spans[0]{role}, 'accent',
+                "AC-4 ($case->{label}): B6 -- the left span keeps role 'accent' (was 'title' -- Theme token migration)");
         }
     }
 }

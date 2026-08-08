@@ -26,19 +26,77 @@ use FindBin qw($Bin);
 use lib "$Bin/../../scripts";
 use Test::More;
 use Encode qw(encode);
+use Time::Local qw(timegm);
 
 use_ok('Dashboard') or BAIL_OUT('Dashboard.pm did not load');
 
 # ===========================================================================
-# Glyph literals (spec S2.1/S2.3/S2.6), encoded to UTF-8 bytes -- the
-# module's span `text` contract (spec S2 preamble).
+# Glyph literals (spec S2.1/S2.3/S2.6) -- CORRECTED for blueprint
+# unified-tui-design-system package 06-dashboard-screen (in-scope oracle
+# correction #3; driver escalation E-B, packages/06-dashboard-screen.md
+# 2026-08-07T20:40:59Z, measured at 4 refs here -- the spec's original "36"
+# count was wrong). Package 06 removes Dashboard.pm's four hardcoded
+# emoji-circle constants ($GLYPH_GREEN/$GLYPH_RED/$GLYPH_YELLOW/$GLYPH_WHITE,
+# Dashboard.pm:562-565) entirely (Decision 11, "no emoji anywhere") and
+# replaces them with Theme's four non-emoji status glyphs, resolved lazily
+# inside sub bodies (spec §2.2). The CLAIM this file pins is UNCHANGED --
+# "container_status_style / event_style return glyph G for status/event
+# class X"; the SUBJECT of what G actually IS moves from a hardcoded emoji
+# literal to a live derivation from Theme::glyph('status.*'), per AC-G6's
+# re-derivation rule ("re-derives its subject by selecting from Theme ...
+# and fails loudly if none exists, so it can never silently degrade into a
+# width-1 test" -- here: a stale-emoji test). BAIL_OUT rather than a silent
+# undef if Theme.pm or any of the four status glyphs is missing, since
+# every assertion below this point depends on these four values meaning
+# something real.
 # ===========================================================================
-my $GLYPH_GREEN  = encode('UTF-8', "\x{1F7E2}");
-my $GLYPH_RED    = encode('UTF-8', "\x{1F534}");
-my $GLYPH_YELLOW = encode('UTF-8', "\x{1F7E1}");
-my $GLYPH_WHITE  = encode('UTF-8', "\x{26AA}");
+my $THEME_OK = eval { require Theme; 1 };
+BAIL_OUT("Theme.pm did not load ($@) -- this oracle's glyph expectations are derived from Theme (AC-G6's re-derivation rule); nothing below can mean anything without it")
+    unless $THEME_OK;
+
+my $GLYPH_GREEN  = Theme::glyph('status.ok');
+my $GLYPH_RED    = Theme::glyph('status.crit');
+my $GLYPH_YELLOW = Theme::glyph('status.warn');
+my $GLYPH_WHITE  = Theme::glyph('status.idle');
+for my $pair ( [ 'status.ok', $GLYPH_GREEN ], [ 'status.crit', $GLYPH_RED ],
+               [ 'status.warn', $GLYPH_YELLOW ], [ 'status.idle', $GLYPH_WHITE ] ) {
+    my ($name, $val) = @$pair;
+    ok(defined($val) && length($val) > 0,
+        "AC-G6 re-derivation: Theme::glyph('$name') is defined and non-empty -- the corrected glyph subject exists (fails loudly rather than silently degrading to an untested undef)");
+}
+
 my $TRI_UP       = encode('UTF-8', "\x{25B2}");
 my $TRI_DOWN     = encode('UTF-8', "\x{25BC}");
+
+# ===========================================================================
+# tui::DashboardScreen is a READ-ONLY dependency here (blueprint
+# unified-tui-design-system package 06-dashboard-screen, driver adjudication
+# packages/06-dashboard-screen.md 2026-08-08T00:37:32Z, RULINGs 2/3). Its
+# public surface (spec 06-dashboard-screen-spec.md S2.4) is the authoritative
+# source for two things this file needs but must never hand-type:
+#   - LABEL_GUTTER() == 11, the one label gutter every panel now shares
+#     (S2.4.1) -- replaces the panels' previous ad-hoc per-label literals.
+#   - theme_role($legacy) -> <Theme role name> (S2.1's seventeen-to-nine
+#     mapping), needed wherever a span this file inspects is produced by a
+#     tui::DashboardScreen function (which emits Theme role names only,
+#     S2.1) rather than by a Dashboard.pm legacy-role function.
+# BAIL_OUT rather than a silent undef, same rationale as the Theme guard
+# above: every re-pointed assertion below depends on these meaning something
+# real.
+# ===========================================================================
+my $DASHBOARD_SCREEN_OK = eval { require tui::DashboardScreen; 1 };
+BAIL_OUT("tui::DashboardScreen.pm did not load ($@) -- LABEL_GUTTER()/theme_role() are this oracle's derivation source for the re-pointed Sandbox/Run/header assertions; nothing below can mean anything without it")
+    unless $DASHBOARD_SCREEN_OK;
+
+my $LABEL_GUTTER = tui::DashboardScreen::LABEL_GUTTER();
+ok(defined($LABEL_GUTTER) && $LABEL_GUTTER =~ /^\d+$/ && $LABEL_GUTTER > 0,
+    'AC-G6-style re-derivation: tui::DashboardScreen::LABEL_GUTTER() is a positive integer -- the corrected gutter subject exists');
+
+# _gutter_label($label) -> the ONE shared label-gutter rendering of $label
+# (spec S2.4.1: sprintf('%-*s : ', LABEL_GUTTER(), safe(label))), so every
+# expected label string below is DERIVED from the spec's own constant,
+# never hand-padded.
+sub _gutter_label { return sprintf('%-*s : ', $LABEL_GUTTER, $_[0]); }
 
 # ===========================================================================
 # 4.1 container_status_style (spec S2.1): AC3, AC4
@@ -113,7 +171,57 @@ my $TRI_DOWN     = encode('UTF-8', "\x{25BC}");
 }
 
 # ===========================================================================
-# 4.3 Sandbox + Run panel spans (spec S3 behaviors 1-8): AC1, AC2, AC5, AC7, AC8
+# 4.3 Sandbox (DELETED) + Run panel spans + header (spec S3 behaviors 1-8):
+# AC1, AC2, AC5, AC7, AC8
+#
+# CORRECTED for blueprint unified-tui-design-system package
+# 06-dashboard-screen (in-scope oracle correction; driver adjudication
+# packages/06-dashboard-screen.md 2026-08-08T00:37:32Z, RULINGS 2 and 3).
+# Spec 06-dashboard-screen-spec.md S2.4.3: "The Sandbox panel is deleted."
+# Its five rows are disposed of thus: project/container -> already in the
+# header (S2.4.9: today's header content, unchanged); oauth -> the Token
+# panel's `access` row when $state->{tokens} is a HASH, else the Run panel
+# (S2.4.3's last conditional -- never both, never neither); heartbeat/
+# uptime -> MOVE to Run, ahead of busy-lease/keep-awake/needs-you (S2.4.3's
+# stated Run body order). Per the standing rule ("an assertion may change
+# its subject; it may never lose its claim"), every assertion below keeps
+# ITS ORIGINAL CLAIM; only the panel/row/index it inspects moves. AC8
+# (Run's busy-lease/keep-awake/needs-you role table, immediately below AC7
+# in this same block) is re-indexed for the same reason: heartbeat/uptime
+# now sit ahead of it in Run, so leaving AC8's old indices [0,1,2] in place
+# would silently assert the WRONG rows once the panel dissolves -- an
+# adjacent defect this file must not ship even though AC8 itself was not
+# separately named for re-pointing.
+#
+# The label gutter also unifies (S2.4.1, LABEL_GUTTER()==11): every panel's
+# previous ad-hoc per-label literal ('project   : ', 'busy-lease : ', ...)
+# disappears in favour of one sprintf('%-11s : ', label) gutter. Every
+# label expectation below is therefore built via _gutter_label() (derived
+# from tui::DashboardScreen::LABEL_GUTTER(), never hand-padded).
+#
+# TWO CLAIMS ARE INVERTED, NOT DROPPED (driver ruling, second round,
+# 2026-08-08): the original absent-branch claims "project absent -> a
+# visible '?' placeholder, role muted" and "container absent -> a visible
+# '?' placeholder, role muted" (old lines 271-279) have no PLACEHOLDER
+# analog -- the header's own absence handling (S2.4.9: "today's
+# _title_line unchanged in content") OMITS the clause entirely (" -
+# <project>" / "<container> " simply do not appear) rather than showing a
+# "?". But what those two assertions actually bought was never the glyph
+# "?" itself -- it was that THE ABSENT-PROJECT AND ABSENT-CONTAINER
+# BRANCHES ARE EXERCISED, and the frame degrades in a defined,
+# non-corrupting way. That purpose survives the design change intact, so
+# the OLD SUBJECT (the deleted Sandbox panel's project/container rows,
+# each rendering a "?" placeholder) becomes the NEW SUBJECT (the header,
+# which renders a clean omission): the expected outcome inverts from
+# "a '?' appears" to "the clause omits cleanly -- no dangling separator, no
+# stray artifact, no literal undef, the frame still composes". Dropping
+# these entirely would mean nobody exercises the absent-project path at
+# all, which is exactly how a bare dangling " - ", a stray double space, or
+# an interpolated "undef" ships unnoticed. Each inverted assertion below
+# carries its own counter-fixture (the PRESENT case) so "the clause is
+# absent" cannot pass vacuously against a header that never renders the
+# clause under any input. The heartbeat/uptime absent-branch claims (still
+# row-level facts inside Run) also survive and are re-pointed below.
 # ===========================================================================
 {
     my %full = (
@@ -130,64 +238,182 @@ my $TRI_DOWN     = encode('UTF-8', "\x{25BC}");
     my @panels = Dashboard::_fixed_panels(\%full, 80);
     my ($sandbox) = grep { $_->{title} eq 'Sandbox' } @panels;
     my ($run)     = grep { $_->{title} eq 'Run' } @panels;
-    ok($sandbox, 'AC1: a Sandbox panel is present');
-    ok($run,     'AC1: a Run panel is present');
 
-    is(scalar(@{ $sandbox->{lines} }), 5, 'AC1: Sandbox panel has exactly 5 lines');
-    is(scalar(@{ $run->{lines} }),     3, 'AC1: Run panel has exactly 3 lines');
+    # AC1: the Sandbox panel is gone; Run absorbs heartbeat/uptime.
+    ok(!$sandbox, 'AC1: the Sandbox panel no longer exists (spec S2.4.3: "the Sandbox panel is deleted")');
+    ok($run,      'AC1: a Run panel is present');
 
-    my @slabels = ('project   : ', 'container : ', 'heartbeat : ', 'uptime    : ', 'oauth     : ');
-    for my $i (0 .. 4) {
-        my $line = $sandbox->{lines}[$i];
-        is(ref($line), 'ARRAY', "AC1: Sandbox line $i is an ARRAY ref of spans");
-        is($line->[0]{text}, $slabels[$i], "AC1: Sandbox line $i first span text is the exact label (incl. padding)");
-        is($line->[0]{role}, 'label',      "AC1: Sandbox line $i first span role is 'label'");
-    }
-
-    my @rlabels = ('busy-lease : ', 'keep-awake : ', 'needs you  : ');
-    for my $i (0 .. 2) {
+    # AC1: Run's rows, in spec S2.4.3 order, for a fixture with no backpack
+    # key and no tokens key (so `row()`'s absence rules drop backpack and
+    # the run-summary rows, and oauth lands in RUN, not Token -- exercised
+    # separately by AC7 below). Deliberately NOT a row-count assertion
+    # (Decision 15): each row is checked by name/content at its position,
+    # never by counting scalar(@{ $run->{lines} }).
+    my @rlabels = ('heartbeat', 'uptime', 'busy-lease', 'keep-awake', 'needs you');
+    for my $i (0 .. $#rlabels) {
         my $line = $run->{lines}[$i];
-        is(ref($line), 'ARRAY', "AC1/AC8: Run line $i is an ARRAY ref of spans");
-        is($line->[0]{text}, $rlabels[$i], "AC1/AC8: Run line $i first span text is the exact label (incl. padding)");
-        is($line->[0]{role}, 'label',      "AC1/AC8: Run line $i first span role is 'label'");
+        is(ref($line), 'ARRAY', "AC1: Run line $i ('$rlabels[$i]') is an ARRAY ref of spans");
+        is($line->[0]{text}, _gutter_label($rlabels[$i]),
+            "AC1: Run line $i first span text is '$rlabels[$i]' padded to the one shared LABEL_GUTTER");
+        is($line->[0]{role}, 'label', "AC1: Run line $i first span role is 'label'");
     }
 
-    # AC2: value span roles when every field is defined+non-empty.
-    is($sandbox->{lines}[0][1]{role}, 'strong', 'AC2: project value role is strong when defined+non-empty');
-    is($sandbox->{lines}[0][1]{text}, 'demo',   'AC2: project value text is the project name');
-    is($sandbox->{lines}[1][1]{role}, 'value',  'AC2: container name role is value when defined+non-empty');
-    is($sandbox->{lines}[1][1]{text}, 'claude-demo-abcd1234', 'AC2: container name text');
-    is($sandbox->{lines}[2][1]{role}, 'value', 'AC2: heartbeat value role is value when beat_age defined');
-    is($sandbox->{lines}[2][1]{text}, Dashboard::fmt_age(12) . ' ago',
-        'AC2: heartbeat text is fmt_age(...) . " ago"');
-    is($sandbox->{lines}[3][1]{role}, 'value', 'AC2: uptime value role is value when uptime defined');
-    is($sandbox->{lines}[3][1]{text}, Dashboard::fmt_hms(3660), 'AC2: uptime text is fmt_hms(...)');
+    # AC2: value span roles/text for the two MIGRATED rows (heartbeat,
+    # uptime), now at Run's positions 0/1. Uptime's text is fmt_age, never
+    # fmt_hms (AC-F5/S2.4.7: fmt_hms is off every render path; this is the
+    # exact assertion AC-F5 and this AC used to disagree about -- AC-F5
+    # wins, and re-deriving via Dashboard::fmt_age is how AC2 keeps its
+    # claim without re-pinning a literal).
+    is($run->{lines}[0][1]{role}, 'value', 'AC2: heartbeat value role is value when beat_age defined (now in Run)');
+    is($run->{lines}[0][1]{text}, Dashboard::fmt_age(12) . ' ago',
+        'AC2: heartbeat text is fmt_age(...) . " ago" (now in Run)');
+    is($run->{lines}[1][1]{role}, 'value', 'AC2: uptime value role is value when uptime defined (now in Run)');
+    is($run->{lines}[1][1]{text}, Dashboard::fmt_age(3660),
+        'AC2: uptime text is fmt_age(...), NOT fmt_hms (AC-F5, now in Run)');
 
-    # AC5: composed container line -- the "<glyph> [<status>]" span and the
-    # whole line's spans_text.
-    my ($glyph, $crole) = Dashboard::container_status_style('running', undef);
-    is(Dashboard::spans_text($sandbox->{lines}[1]),
-        "container : claude-demo-abcd1234  $glyph [running]",
-        'AC5: composed container line spans_text matches the exact spec text');
-    my ($status_span) = grep { $_->{text} eq "$glyph [running]" } @{ $sandbox->{lines}[1] };
-    ok($status_span, 'AC5: a span exists whose text is exactly "<glyph> [<status>]"');
-    is($status_span->{role}, $crole, 'AC5: that span carries the container_status_style role');
+    # AC5 (+ AC2's project claim, folded in here for the same reason): the
+    # project fact and the container fact -- the latter WITH its status
+    # style -- reach the frame via the header (S2.4.9), not a panel body.
+    # tui::DashboardScreen::header_spans emits Theme role names only
+    # (S2.1), confirmed empirically (no legacy 'title'/'good'): the status
+    # span's expected role is therefore container_status_style's legacy
+    # role MAPPED through theme_role(), not the legacy role bare. The
+    # header's spec'd content ("<container> [<status>]") carries no glyph
+    # character -- verified against the already-landed header_spans, which
+    # emits only a role-styled status word, matching S2.4.9's "unchanged
+    # content" note. AC5's claim is therefore preserved as "the container
+    # fact, WITH ITS STYLE (theme_role(container_status_style(...))),
+    # reaches the frame" rather than as an invented glyph literal.
+    my ($cglyph, $crole) = Dashboard::container_status_style('running', undef);
+    my $expected_status_role = tui::DashboardScreen::theme_role($crole);
+    my $header = tui::DashboardScreen::header_spans(\%full, 80);
+    my $header_text = Dashboard::spans_text($header);
 
-    # AC7: oauth line for each of the four tiers, always present, never dropped.
+    my $n_project = () = $header_text =~ /\Qdemo\E/g;
+    ok($n_project > 0, 'AC2: the project name reaches the header (present)');
+
+    my $n_container = () = $header_text =~ /\Qclaude-demo-abcd1234\E/g;
+    ok($n_container > 0, 'AC5: the container fact reaches the header (present)');
+    is($n_container, 1,  'AC5: the container fact reaches the header exactly once');
+
+    my ($status_span) = grep { $_->{text} eq 'running' } @$header;
+    ok($status_span, 'AC5: a header span carries the status text "running"');
+    is($status_span->{role}, $expected_status_role,
+        'AC5: that span carries container_status_style\'s role, mapped through Theme (theme_role)')
+        if $status_span;
+
+    # AC2/AC5, INVERTED absent branches (driver ruling, second round): the
+    # branch is exercised and asserted to degrade cleanly, rather than
+    # asserting the now-nonexistent "?" placeholder. Each has a
+    # counter-fixture proving the omission isn't vacuously true.
+    {
+        my %no_project = %full;
+        delete $no_project{project_name};
+        my $h_no_project = tui::DashboardScreen::header_spans(\%no_project, 80);
+        my $t_no_project = Dashboard::spans_text($h_no_project);
+
+        ok(scalar(@$h_no_project) > 0,
+            'AC2 (project absent, inverted): header_spans still returns a non-empty span list');
+        is(Dashboard::display_width($t_no_project), 80,
+            'AC2 (project absent, inverted): the header still composes to exactly $cols -- well-formed, not corrupted');
+        unlike($t_no_project, qr/ - /,
+            'AC2 (project absent, inverted): no dangling " - " separator when project_name is absent');
+        unlike($t_no_project, qr/undef/i,
+            'AC2 (project absent, inverted): no literal "undef" leaks into the header when project_name is absent');
+
+        # counter-fixture: with project_name PRESENT (the %full fixture
+        # already in scope), the " - <project>" clause DOES appear -- so
+        # the "no dangling separator" check above is not testing a
+        # separator that never renders under any input.
+        like($header_text, qr/ - demo\b/,
+            'AC2 (project present, counter-fixture): the " - <project>" clause DOES appear when project_name is present');
+    }
+    {
+        my %no_container = %full;
+        delete $no_container{container};
+        my $h_no_container = tui::DashboardScreen::header_spans(\%no_container, 80);
+        my $t_no_container = Dashboard::spans_text($h_no_container);
+
+        ok(scalar(@$h_no_container) > 0,
+            'AC5 (container absent, inverted): header_spans still returns a non-empty span list');
+        is(Dashboard::display_width($t_no_container), 80,
+            'AC5 (container absent, inverted): the header still composes to exactly $cols -- well-formed, not corrupted');
+        unlike($t_no_container, qr/undef/i,
+            'AC5 (container absent, inverted): no literal "undef" leaks into the header when container is absent');
+        unlike($t_no_container, qr/\[\[|\]\]/,
+            'AC5 (container absent, inverted): no doubled bracket where the container-name prefix would have gone');
+        like($t_no_container, qr/\[running\]\z/,
+            'AC5 (container absent, inverted): the status clause still renders cleanly, with nothing trailing after it');
+
+        # counter-fixture: with container PRESENT (the %full fixture
+        # already in scope), the "<container> [" prefix DOES appear -- so
+        # the checks above are not testing a prefix that never renders
+        # under any input.
+        like($header_text, qr/\Qclaude-demo-abcd1234\E \[/,
+            'AC5 (container present, counter-fixture): the "<container> [" prefix DOES appear when container is present');
+    }
+
+    # AC7: oauth line for each of the four tiers, EXACTLY ONCE across the
+    # frame (S2.4.3's last conditional): in Run when $state->{tokens} is
+    # absent (this arm), in Token when it is a HASH (the second arm,
+    # below) -- never both, never neither.
     for my $r (undef, -1, 450, 11520) {
         my %s2 = (%full, oauth_remaining => $r);
         my @p2 = Dashboard::_fixed_panels(\%s2, 80);
-        my ($sb2) = grep { $_->{title} eq 'Sandbox' } @p2;
-        ok($sb2, "AC7: Sandbox panel present for oauth_remaining=" . (defined $r ? $r : 'undef'));
-        my $oline = $sb2->{lines}[4];
+        my ($run2)   = grep { $_->{title} eq 'Run' }   @p2;
+        my ($token2) = grep { $_->{title} eq 'Token' } @p2;
         my $label = defined $r ? $r : 'undef';
+        ok($run2, "AC7: Run panel present for oauth_remaining=$label (tokens-absent arm)");
+        ok(!$token2, "AC7: no Token panel when \$state->{tokens} is absent, oauth_remaining=$label");
+        my ($oline) = grep { $_->[0]{text} eq _gutter_label('oauth') } @{ $run2->{lines} };
+        ok($oline, "AC7: an oauth row exists in Run for oauth_remaining=$label (tokens-absent arm)");
         is_deeply($oline,
-            [ { text => 'oauth     : ', role => 'label' },
+            [ { text => _gutter_label('oauth'), role => 'label' },
               { text => Dashboard::fmt_oauth($r), role => Dashboard::oauth_role($r) } ],
-            "AC7: oauth line for oauth_remaining=$label matches exactly");
+            "AC7: oauth line for oauth_remaining=$label matches exactly (tokens-absent arm)")
+            if $oline;
     }
 
-    # AC8: Run panel role table across the busy-lease/keep-awake/needs-you tiers.
+    # AC7, the Token arm: with $state->{tokens} a HASH, the oauth fact
+    # moves OUT of Run and into Token instead (S2.4.3: "byte-identical to
+    # the Token panel's access row"), and Run carries no oauth row at all.
+    for my $r (undef, -1, 450, 11520) {
+        my %s2 = (%full, oauth_remaining => $r,
+                   tokens => { access_state => 'present', access_seconds_left => $r });
+        my @p2 = Dashboard::_fixed_panels(\%s2, 80);
+        my ($run2)   = grep { $_->{title} eq 'Run' }   @p2;
+        my ($token2) = grep { $_->{title} eq 'Token' } @p2;
+        my $label = defined $r ? $r : 'undef';
+        ok($token2, "AC7: Token panel present for oauth_remaining=$label (tokens-present arm)");
+        my $run_has_oauth = $run2 ? scalar(grep { $_->[0]{text} eq _gutter_label('oauth') } @{ $run2->{lines} }) : 0;
+        ok(!$run_has_oauth, "AC7: no oauth row in Run when \$state->{tokens} is present, oauth_remaining=$label");
+        my $expected_val = Dashboard::fmt_oauth($r);
+        my $token_text = $token2 ? join("\n", map { Dashboard::spans_text($_) } @{ $token2->{lines} }) : '';
+        my $n = () = $token_text =~ /\Q$expected_val\E/g;
+        is($n, 1, "AC7: fmt_oauth($label) reaches Token exactly once, oauth_remaining=$label (tokens-present arm)");
+    }
+
+    # AC7 non-vacuity: the frame-wide "exactly once" counting technique
+    # used above must be able to report something other than 1. Applied to
+    # a hand-built two-panel structure carrying the SAME nonce text twice,
+    # it must report 2 -- proving the ==1 assertions above are not vacuous.
+    {
+        my @fake_panels = (
+            { title => 'A', lines => [ [ { text => 'zqx-oauth-nonce-7714', role => 'x' } ] ] },
+            { title => 'B', lines => [ [ { text => 'zqx-oauth-nonce-7714', role => 'x' } ] ] },
+        );
+        my $joined = join("\n", map { Dashboard::spans_text($_) } map { @{ $_->{lines} } } @fake_panels);
+        my $n = () = $joined =~ /\Qzqx-oauth-nonce-7714\E/g;
+        is($n, 2, 'AC7 non-vacuity: the frame-wide substring counter reports 2 when the same text appears in two panels');
+    }
+
+    # AC8: Run panel role table across the busy-lease/keep-awake/needs-you
+    # tiers. RE-INDEXED from [0,1,2] to [2,3,4] and re-labeled via
+    # _gutter_label(): heartbeat/uptime (always present for this %full-
+    # derived fixture) now occupy Run's first two positions (see AC1
+    # above), so busy-lease/keep-awake/needs-you shift down by two. Same
+    # claim (the role table itself), same fixture cases, only the
+    # subject's location changes.
     my @run_cases = (
         # [ busy_age, stay_awake, needs_you, busy_text, busy_role, keep_text, keep_role, needs_text, needs_role ]
         [undef, 0, 0, 'none (no active run)', 'muted',
@@ -203,27 +429,26 @@ my $TRI_DOWN     = encode('UTF-8', "\x{25BC}");
         my @p3 = Dashboard::_fixed_panels(\%s3, 80);
         my ($rn) = grep { $_->{title} eq 'Run' } @p3;
         my $tag = 'busy_age=' . (defined $busy_age ? $busy_age : 'undef') . " stay_awake=$stay_awake needs_you=$needs_you";
-        is_deeply($rn->{lines}[0], [ { text => 'busy-lease : ', role => 'label' }, { text => $bt, role => $br } ],
-            "AC8: busy-lease line ($tag)");
-        is_deeply($rn->{lines}[1], [ { text => 'keep-awake : ', role => 'label' }, { text => $kt, role => $kr } ],
-            "AC8: keep-awake line ($tag)");
-        is_deeply($rn->{lines}[2], [ { text => 'needs you  : ', role => 'label' }, { text => $nt, role => $nr } ],
-            "AC8: needs-you line ($tag)");
+        is_deeply($rn->{lines}[2], [ { text => _gutter_label('busy-lease'), role => 'label' }, { text => $bt, role => $br } ],
+            "AC8: busy-lease line, now at Run index 2 ($tag)");
+        is_deeply($rn->{lines}[3], [ { text => _gutter_label('keep-awake'), role => 'label' }, { text => $kt, role => $kr } ],
+            "AC8: keep-awake line, now at Run index 3 ($tag)");
+        is_deeply($rn->{lines}[4], [ { text => _gutter_label('needs you'), role => 'label' }, { text => $nt, role => $nr } ],
+            "AC8: needs-you line, now at Run index 4 ($tag)");
     }
 
-    # AC2 (absent branches): project/container/heartbeat/uptime fall back to
-    # '?'/'n/a' with role muted when their state fields are absent.
+    # AC2 (absent branches): heartbeat/uptime fall back to 'n/a' with role
+    # muted when their state fields are absent -- re-pointed to Run's
+    # positions 0/1 (project/container's absent-branch claims are the two
+    # INVERTED claims tested above, alongside AC5).
     my %sparse = (status => 'running');
     my @ps = Dashboard::_fixed_panels(\%sparse, 80);
-    my ($sb_sparse) = grep { $_->{title} eq 'Sandbox' } @ps;
-    is_deeply($sb_sparse->{lines}[0], [ { text => 'project   : ', role => 'label' }, { text => '?', role => 'muted' } ],
-        'AC2: project absent -> "?" + muted');
-    is($sb_sparse->{lines}[1][1]{text}, '?',    'AC2: container name absent -> "?"');
-    is($sb_sparse->{lines}[1][1]{role}, 'muted', 'AC2: container name absent -> muted role');
-    is($sb_sparse->{lines}[2][1]{text}, 'n/a',  'AC2: heartbeat absent (beat_age undef) -> "n/a"');
-    is($sb_sparse->{lines}[2][1]{role}, 'muted', 'AC2: heartbeat absent -> muted role');
-    is($sb_sparse->{lines}[3][1]{text}, 'n/a',  'AC2: uptime absent (uptime undef) -> "n/a"');
-    is($sb_sparse->{lines}[3][1]{role}, 'muted', 'AC2: uptime absent -> muted role');
+    my ($run_sparse) = grep { $_->{title} eq 'Run' } @ps;
+    ok($run_sparse, 'AC2 (absent branches): a Run panel is present for the sparse fixture');
+    is($run_sparse->{lines}[0][1]{text}, 'n/a',  'AC2: heartbeat absent (beat_age undef) -> "n/a" (now in Run)');
+    is($run_sparse->{lines}[0][1]{role}, 'muted', 'AC2: heartbeat absent -> muted role (now in Run)');
+    is($run_sparse->{lines}[1][1]{text}, 'n/a',  'AC2: uptime absent (uptime undef) -> "n/a" (now in Run)');
+    is($run_sparse->{lines}[1][1]{role}, 'muted', 'AC2: uptime absent -> muted role (now in Run)');
 
     # spec S2.8 / S5.6: _fixed_panels($state) with NO $cols must default to 80
     # and must not die (old call sites keep working).
@@ -395,18 +620,39 @@ my $TRI_DOWN     = encode('UTF-8', "\x{25BC}");
         ok(Dashboard::spans_width($row) <= 38, 'AC14: narrow paragraph row width <= $w (38)');
     }
 
-    # End-to-end via build_panels($state,$cols): the $cols -> $w=$cols-2 wiring.
+    # End-to-end via build_panels($state,$cols). RE-POINTED (package
+    # 06-dashboard-screen, spec S2.4.3/S2.4.8, Decision 9, driver report
+    # item 1): the Backpack panel is deleted; the backpack fact now reaches
+    # the frame as a single summary ROW inside Run
+    # (tui::DashboardScreen::backpack_summary_spans), which does not wrap
+    # with $cols at all -- so the "row count varies with $cols" half of
+    # this AC has no surviving analog (a one-line summary never wraps).
+    # That half is NOT re-pointed to a new count -- doing so would just
+    # reintroduce the same whole-shape pin Decision 15 / t/00-oracle-
+    # hygiene.t already forbids elsewhere in this package. What survives:
+    # the backpack fact reaches the frame at EVERY width tested, and it is
+    # a SUMMARY, not an item listing -- it never contains the fixture's
+    # item keys, at any width.
     my %state5 = (status => 'running', backpack => $bp5);
-    my ($bpanel_wide)   = grep { $_->{title} eq 'Backpack' } Dashboard::build_panels(\%state5, 120);
-    my ($bpanel_narrow) = grep { $_->{title} eq 'Backpack' } Dashboard::build_panels(\%state5, 40);
-    ok($bpanel_wide,   'AC14 (end-to-end): Backpack panel present at cols=120');
-    ok($bpanel_narrow, 'AC14 (end-to-end): Backpack panel present at cols=40');
-    my @wp = @{ $bpanel_wide->{lines} }[1 .. $#{ $bpanel_wide->{lines} }];
-    my @np = @{ $bpanel_narrow->{lines} }[1 .. $#{ $bpanel_narrow->{lines} }];
-    isnt(scalar(@wp), scalar(@np),
-        'AC14 (end-to-end): build_panels($state,$cols) backpack row count differs between cols=120 and cols=40');
-    for my $row (@wp) { ok(Dashboard::spans_width($row) <= 118, 'AC14 (end-to-end): wide row width <= $cols-2'); }
-    for my $row (@np) { ok(Dashboard::spans_width($row) <= 38,  'AC14 (end-to-end): narrow row width <= $cols-2'); }
+    my $bp_label14 = _gutter_label('backpack');
+    my $expected_value14 = tui::DashboardScreen::backpack_summary_spans($bp5);
+
+    for my $cols (120, 40) {
+        my @panels14 = Dashboard::build_panels(\%state5, $cols);
+        my ($run14) = grep { $_->{title} eq 'Run' } @panels14;
+        ok($run14, "AC14 (end-to-end): a Run panel is present at cols=$cols (subject moved off the deleted Backpack panel)");
+        my ($bprow14) = $run14 ? (grep { $_->[0]{text} eq $bp_label14 } @{ $run14->{lines} }) : ();
+        ok($bprow14, "AC14 (end-to-end): a backpack summary row exists in Run at cols=$cols");
+        is_deeply([ @{ $bprow14 }[1 .. $#$bprow14] ], $expected_value14,
+            "AC14 (end-to-end): the row's value spans equal backpack_summary_spans(\$bp5) exactly, unaffected by \$cols=$cols")
+            if $bprow14;
+
+        for my $item (@items5) {
+            unlike(Dashboard::spans_text($bprow14), qr/\Q$item->{key}\E/,
+                "AC14 (end-to-end): the backpack row at cols=$cols is a summary, not an item listing (item key '$item->{key}' absent)")
+                if $bprow14;
+        }
+    }
 }
 {
     # AC15: total==0 (incl. items absent) -> exactly one line, verbatim text.
@@ -489,7 +735,45 @@ my $TRI_DOWN     = encode('UTF-8', "\x{25BC}");
 }
 
 # ===========================================================================
-# 4.7 recent_events spans (spec S3.14): AC19
+# 4.7 recent_events spans (spec S3.14 / 06-dashboard-screen-spec.md S2.4.6): AC19
+#
+# CORRECTED for blueprint unified-tui-design-system package
+# 06-dashboard-screen (in-scope oracle correction; driver adjudication
+# packages/06-dashboard-screen.md 2026-08-08T00:37:32Z, RULING 3).
+# recent_events gained an OPTIONAL 4th arg: Dashboard::recent_events
+# ($lines, $n, $localtime_fn, $now). Per spec S2.4.6 step 4 the render
+# stage now produces, in order: an optional TIME span -- emitted ONLY when
+# $now is defined and numeric, text sprintf('%-6s  ', fmt_duration($now -
+# $epoch)), role 'text.muted' (a THEME role name -- a deliberately new
+# span, distinct from the glyph/body spans below) -- then the GLYPH span,
+# then the BODY span (both STILL deriving their role from
+# Dashboard::event_style(...) exactly as before: that half of the claim is
+# UNCHANGED, per the driver's explicit instruction to keep deriving
+# glyph/role from event_style "as it already does"), then a COUNT span
+# when count>=2. $localtime_fn (3rd arg, \&CORE::gmtime here) is retained
+# for call-site compatibility and is UNUSED by the new time field (AC-F5:
+# fmt_hms/_event_time are off the render path; the one duration grammar is
+# fmt_duration, reachable here via the retained Dashboard::fmt_age alias,
+# S2.4.7).
+#
+# The original assertions here pinned an ABSOLUTE "HH:MM:SS" first span
+# with legacy role 'muted', produced by calling recent_events with NO
+# $now (3 args only). That subject no longer exists: with $now undef, NO
+# time span renders at all (S2.4.6 "Degradation when $now is absent" /
+# S5), so a bare 3-arg call's first span is now the GLYPH span, not a
+# timestamp. The CLAIM ("the timestamp is muted even though the event
+# itself is good/bad", "the row carries glyph + type + extra, with the
+# classified glyph") is preserved; its SUBJECT moves from an absolute
+# clock time to a $now-relative duration, observed by injecting $now as a
+# 4th argument (determinism: the clock is ALWAYS an argument, never
+# time() -- same principle t/25's A1-A3 assert for compose_frame).
+#
+# A NEW arm is added (not in the original 8 reds, but spec'd and untested
+# here until now): the "honest absence" degradation -- with $now absent,
+# NO time span is produced at all. This is the counter-fixture that proves
+# the time-span detector above can also NOT fire; a detector that always
+# fires is not a detector (binding rule: every detector needs a
+# counter-fixture proving it can fire).
 # ===========================================================================
 {
     my @lines = (
@@ -499,40 +783,103 @@ my $TRI_DOWN     = encode('UTF-8', "\x{25BC}");
         '{"ts":"2026-06-24T10:00:09Z","type":"container_gone","state":"exited"}',
         '',
     );
-    my $ev = Dashboard::recent_events(\@lines, 10, \&CORE::gmtime);
+
+    # Independently derive each event's epoch via plain UTC arithmetic
+    # (Time::Local::timegm on the fixture's own "ts" strings) -- this is a
+    # standard, unambiguous ISO-8601-Z -> epoch conversion, not a coupling
+    # to Dashboard.pm's internals. $now is chosen 500s after the newest
+    # event so every delta is positive and none is zero.
+    my $epoch0 = timegm(1, 0, 10, 24, 5, 126);   # event 0: launch_start    2026-06-24T10:00:01Z
+    my $epoch1 = timegm(5, 0, 10, 24, 5, 126);   # event 1: container_start 2026-06-24T10:00:05Z
+    my $epoch2 = timegm(9, 0, 10, 24, 5, 126);   # event 2: container_gone  2026-06-24T10:00:09Z
+    my $now = $epoch2 + 500;
+
+    my $TIME_ROLE = tui::DashboardScreen::theme_role('muted');   # 'text.muted' (S2.1 table)
+
+    # ---- with $now supplied: the time span renders, at the new Theme
+    # ---- role, and everything else keeps its pre-existing claim.
+    my $ev = Dashboard::recent_events(\@lines, 10, \&CORE::gmtime, $now);
     is(scalar(@$ev), 3, 'AC19: garbage + blank lines skipped (unchanged)');
 
     for my $i (0 .. 2) {
         is(ref($ev->[$i]), 'ARRAY', "AC19: event $i is an ARRAY ref of spans");
-        is($ev->[$i][0]{role}, 'muted', "AC19: event $i -- FIRST span (timestamp) is always role muted");
+        is($ev->[$i][0]{role}, $TIME_ROLE,
+            "AC19: event $i -- FIRST span (timestamp) is always role '$TIME_ROLE' when \$now is supplied");
     }
 
     # event 0: launch_start, no exit/state -> event_style classifies (rule 6: accent).
     my ($role0, $glyph0) = Dashboard::event_style('launch_start', undef, undef);
-    is(Dashboard::spans_text($ev->[0]), "10:00:01  $glyph0 launch_start",
-        'AC19: event 0 spans_text == "$hms  $glyph $type$extra"');
-    my @nonts0 = grep { $_->{role} ne 'muted' } @{ $ev->[0] };
-    ok((grep { $_->{role} eq $role0 } @nonts0),
-        "AC19: event 0's non-timestamp spans carry event_style's role ($role0), even though it's not muted");
+    is(Dashboard::spans_text($ev->[0]),
+        sprintf('%-6s  ', Dashboard::fmt_age($now - $epoch0)) . "$glyph0 launch_start",
+        'AC19: event 0 spans_text == "$duration  $glyph $type$extra"');
+    # RE-POINTED (fix-batch, unified-tui-design-system package
+    # 06-dashboard-screen, NO_COLOR regression item): recent_events now maps
+    # glyph/body span roles through tui::DashboardScreen::theme_role(...) at
+    # the span (same as the time span already did), so a non-timestamp
+    # span's role is the THEME name, not event_style's legacy name directly.
+    # The claim is unchanged -- "event 0's non-timestamp spans carry the
+    # role the event styler assigned" -- only the vocabulary the span
+    # actually carries moves, exactly as $TIME_ROLE already does above.
+    # Derived, never hand-typed (never 'state.accent' etc. literally).
+    my $expected_role0 = tui::DashboardScreen::theme_role($role0);
+    my @nonts0 = grep { $_->{role} ne $TIME_ROLE } @{ $ev->[0] };
+    ok((grep { $_->{role} eq $expected_role0 } @nonts0),
+        "AC19: event 0's non-timestamp spans carry event_style's role mapped through Theme ($expected_role0), even though it's not muted");
 
     # event 1: container_start exit=0 -> good; the exit= extra is carried in the text.
     my ($role1, $glyph1) = Dashboard::event_style('container_start', 0, undef);
-    is(Dashboard::spans_text($ev->[1]), "10:00:05  $glyph1 container_start exit=0",
+    is(Dashboard::spans_text($ev->[1]),
+        sprintf('%-6s  ', Dashboard::fmt_age($now - $epoch1)) . "$glyph1 container_start exit=0",
         'AC19: event 1 spans_text carries the exit= extra text, with the classified glyph');
-    is($ev->[1][0]{role}, 'muted', 'AC19: event 1 timestamp span is muted even though the event itself is good');
+    is($ev->[1][0]{role}, $TIME_ROLE, 'AC19: event 1 timestamp span is muted even though the event itself is good');
+    # RE-POINTED (same rationale/derivation as event 0 above), and load-
+    # bearing here in a way event 0's check is NOT: 'good' -> 'state.ok'
+    # actually changes under theme_role() (unlike 'accent', which collides
+    # with its own Theme name), so this assertion, unlike event 0's, WOULD
+    # fail if the span still carried the bare legacy role.
+    my $expected_role1 = tui::DashboardScreen::theme_role($role1);
+    my @nonts1 = grep { $_->{role} ne $TIME_ROLE } @{ $ev->[1] };
+    ok((grep { $_->{role} eq $expected_role1 } @nonts1),
+        "AC19: event 1's non-timestamp spans carry event_style's role mapped through Theme ($expected_role1)");
 
     # event 2: container_gone state=exited -> bad; the state= extra is carried.
     my ($role2, $glyph2) = Dashboard::event_style('container_gone', undef, 'exited');
-    is(Dashboard::spans_text($ev->[2]), "10:00:09  $glyph2 container_gone state=exited",
+    is(Dashboard::spans_text($ev->[2]),
+        sprintf('%-6s  ', Dashboard::fmt_age($now - $epoch2)) . "$glyph2 container_gone state=exited",
         'AC19: event 2 spans_text carries the state= extra text, with the classified glyph');
     is($role2, 'bad', 'AC19: container_gone classifies as bad (sanity check on the fixture)');
-    is($ev->[2][0]{role}, 'muted', 'AC19: event 2 timestamp span is muted even though the event itself is bad');
+    is($ev->[2][0]{role}, $TIME_ROLE, 'AC19: event 2 timestamp span is muted even though the event itself is bad');
+    # RE-POINTED, same rationale as event 1 above ('bad' -> 'state.crit' is
+    # also NOT an identity mapping, so this discriminates the fix too).
+    my $expected_role2 = tui::DashboardScreen::theme_role($role2);
+    my @nonts2 = grep { $_->{role} ne $TIME_ROLE } @{ $ev->[2] };
+    ok((grep { $_->{role} eq $expected_role2 } @nonts2),
+        "AC19: event 2's non-timestamp spans carry event_style's role mapped through Theme ($expected_role2)");
 
     # Ordering + last-N slice + skip-unparsable are unchanged.
-    my $last2 = Dashboard::recent_events(\@lines, 2, \&CORE::gmtime);
+    my $last2 = Dashboard::recent_events(\@lines, 2, \&CORE::gmtime, $now);
     is(scalar(@$last2), 2, 'AC19: honors the last-N limit (unchanged)');
     like(Dashboard::spans_text($last2->[-1]), qr/container_gone/,  'AC19: keeps the most recent (last) (unchanged)');
     like(Dashboard::spans_text($last2->[0]),  qr/container_start/, 'AC19: preserves chronological order (unchanged)');
+
+    # ---- AC19 honest-absence arm (counter-fixture, S2.4.6 "Degradation
+    # ---- when $now is absent" / S5): with NO $now, no time span is
+    # ---- produced at all -- the row starts at the glyph span.
+    my $ev_no_now = Dashboard::recent_events(\@lines, 10, \&CORE::gmtime);
+    is(scalar(@$ev_no_now), 3, 'AC19 (honest absence): garbage + blank lines still skipped with no $now');
+    for my $i (0 .. 2) {
+        isnt($ev_no_now->[$i][0]{role}, $TIME_ROLE,
+            "AC19 (honest absence): event ${i}'s FIRST span is NOT the muted time span when \$now is undef");
+    }
+    my ($role0b, $glyph0b) = Dashboard::event_style('launch_start', undef, undef);
+    # RE-POINTED, same rationale as the with-$now arm above: the span's
+    # role is now event_style's role mapped through theme_role(), not the
+    # legacy name bare.
+    my $expected_role0b = tui::DashboardScreen::theme_role($role0b);
+    is($ev_no_now->[0][0]{text}, "$glyph0b ",
+        'AC19 (honest absence): event 0 starts at the glyph span, not a time span, when $now is undef');
+    is($ev_no_now->[0][0]{role}, $expected_role0b,
+        'AC19 (honest absence): event 0 first span role is event_style\'s role mapped through Theme, not the time role, when $now is undef');
 }
 
 # ===========================================================================

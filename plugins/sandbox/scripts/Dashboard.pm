@@ -58,6 +58,15 @@ use File::Spec ();
 use Time::Local ();
 use Encode ();
 
+# tui:: consumption (blueprint unified-tui-design-system, package
+# 06-dashboard-screen, Obligations 1-3): the width core and the composed-
+# frame content vocabulary now live in the shared render library / this
+# module's own tui::DashboardScreen. The arrow points ONE way -- tui/*.pm
+# never names this package (05's/06's AC-P4).
+require tui::Layout;
+require tui::DashboardScreen;
+require Theme;
+
 # ===========================================================================
 # PURE CORE
 # ===========================================================================
@@ -75,25 +84,27 @@ sub decide_mode {
 }
 
 # fmt_age($secs) -> compact human duration ("12s", "3m", "1h04m", "2d03h").
-# undef / negative -> "—".
+# undef / negative -> "n/a". DELEGATING ALIAS (blueprint unified-tui-design-
+# system, package 06-dashboard-screen, criterion 4 -- "one duration format"):
+# the grammar now lives at exactly one place, tui::DashboardScreen::
+# fmt_duration; kept here so out-of-write-set callers (and every existing pin
+# of this name) keep working unchanged.
 sub fmt_age {
     my ($s) = @_;
-    return 'n/a' if !defined $s;
-    $s = int($s);
-    return 'n/a' if $s < 0;
-    return "${s}s"               if $s < 60;
-    my $m = int($s / 60);
-    return "${m}m"               if $m < 60;
-    my $h = int($m / 60); $m %= 60;
-    return sprintf('%dh%02dm', $h, $m) if $h < 24;
-    my $d = int($h / 24); $h %= 24;
-    return sprintf('%dd%02dh', $d, $h);
+    return tui::DashboardScreen::fmt_duration($s);
 }
 
 # fmt_hms($secs) -> "Xh Ym Zs" with all three components always shown
-# (e.g. "0h 2m 13s", "2h 5m 9s"). undef / negative -> "n/a". Used for uptime,
-# where the explicit hour/minute/second breakdown reads clearer than fmt_age's
-# compact form. ASCII-only, so length() == display width (the render invariant).
+# (e.g. "0h 2m 13s", "2h 5m 9s"). undef / negative -> "n/a".
+#
+# RETAINED, REMOVED FROM EVERY RENDER PATH (package 06, criterion 4 / AC-F5):
+# criterion 4 requires ONE duration format across a rendered frame
+# (fmt_age's/fmt_duration's compact grammar); this function's own three-
+# component grammar is a second one, so no span-producing code calls it
+# anymore. Deleting it outright would redden files outside this package's
+# write set (its only remaining callers are elsewhere in the codebase, per
+# spec S2.4.7 / S6 item 8), so it stays, unused, exactly as
+# _event_time/_backpack_lines/wrap_spans do below.
 sub fmt_hms {
     my ($s) = @_;
     return 'n/a' if !defined $s;
@@ -117,6 +128,11 @@ sub fmt_oauth {
 # _event_time($iso_ts, $localtime_fn) -> 'HH:MM:SS' in local time.
 # Parses YYYY-MM-DDThh:mm:ssZ to epoch via Time::Local::timegm (UTC), then
 # applies $localtime_fn (default real localtime) to get local breakdown.
+#
+# RETAINED, REMOVED FROM THE render_events PATH (package 06, AC-F5): the
+# event-time column is now rendered by fmt_duration($now - $epoch) (criterion
+# 4's one duration format), never by this clock-time string. Kept, unused,
+# for out-of-write-set callers (spec S2.4.7 / S6 item 8).
 sub _event_time {
     my ($ts, $localtime_fn) = @_;
     $localtime_fn ||= sub { localtime($_[0]) };
@@ -195,85 +211,72 @@ sub _strip_sgr {
     return $s;
 }
 
-# _char_cols($c) -> the display width of one DECODED character: 0 for C0
-# control / DEL, combining marks (\p{Mn}/\p{Me}), U+200B, U+200D, U+FE0F; the
-# allow-listed glyph width if $c is in glyph_table(); else 1 (printable ASCII or
-# an unlisted non-ASCII character, which _safe will render as a single '?').
-# PRIVATE.
-#
-# Perf note (F3, s04 fix-batch): reads the package-level %GLYPH_TABLE directly
-# via _glyph_table_ref() (no copy) -- this runs ONCE PER CHARACTER measured, so
-# the previous `glyph_table()` call here made a fresh 18-key hash copy per
-# character (~80x per-frame regression on hostile/large input). glyph_table()
-# itself is untouched and still returns a defensive copy for external callers.
+# _char_cols($c) -> the display width of one DECODED character. DELEGATING
+# ALIAS (package 06, Obligation 2): the width core now lives at exactly one
+# place, tui::Layout::char_cols, which itself sources its width table from
+# Theme::glyphs() (see _glyph_table_ref() below, the SAME source). PRIVATE.
 sub _char_cols {
     my ($c) = @_;
-    return 0 if !defined $c || $c eq '';
-    my $cp = ord($c);
-    return 0 if $cp < 0x20 || $cp == 0x7F;
-    return 0 if $cp == 0x200B || $cp == 0x200D || $cp == 0xFE0F;
-    return 0 if $c =~ /\p{Mn}|\p{Me}/;
-    my $gt = _glyph_table_ref();
-    return $gt->{$c} if exists $gt->{$c};
-    return 1;
+    return tui::Layout::char_cols($c);
 }
 
-# glyph_table() -> \%table, the pinned 18-entry allow-list mapping each
-# decoded single-character glyph to its declared display width (status dots,
-# braille spinners, gauge blocks, scroll arrows). Read-only; callers must not
-# mutate the returned hashref. PUBLIC.
-my %GLYPH_TABLE = (
-    "\x{1F7E2}" => 2,   # status: green circle
-    "\x{1F534}" => 2,   # status: red circle
-    "\x{1F7E1}" => 2,   # status: yellow circle
-    "\x{26AA}"  => 2,   # status: white circle
-    "\x{280B}"  => 1,   # spinner: braille dots-1
-    "\x{2819}"  => 1,   # spinner: braille dots-2
-    "\x{2839}"  => 1,   # spinner: braille dots-3
-    "\x{2838}"  => 1,   # spinner: braille dots-4
-    "\x{283C}"  => 1,   # spinner: braille dots-5
-    "\x{2834}"  => 1,   # spinner: braille dots-6
-    "\x{2826}"  => 1,   # spinner: braille dots-7
-    "\x{2827}"  => 1,   # spinner: braille dots-8
-    "\x{2807}"  => 1,   # spinner: braille dots-9
-    "\x{280F}"  => 1,   # spinner: braille dots-10
-    "\x{2588}"  => 1,   # gauge: full block
-    "\x{2591}"  => 1,   # gauge: light shade
-    "\x{25B2}"  => 1,   # scroll: up triangle
-    "\x{25BC}"  => 1,   # scroll: down triangle
-);
-# _glyph_table_ref() -> \%GLYPH_TABLE, the canonical table with NO copy.
-# Internal hot-path accessor (F3): every per-character caller (_char_cols,
-# _safe_char) MUST use this, never glyph_table(), or the per-char hash-copy
-# regression comes right back. Callers here never mutate it. PRIVATE.
+# glyph_table() -> \%table, mapping each decoded single-character glyph to
+# its declared display width. WRITE-ONCE DERIVED FROM Theme::glyphs()
+# (package 06, Obligation 3): the four emoji status circles (U+1F7E2 green /
+# U+1F534 red / U+1F7E1 yellow / U+26AA white, width 2) are GONE -- Theme's
+# glyph table carries no emoji at all (Decision 11) -- and U+FF5C (sep.bar)
+# enters at width 2, which is exactly Obligation 5b's requirement, obtained
+# by derivation rather than a hand-added literal. Every other glyph this
+# module allow-lists (braille spinners, gauge blocks, scroll arrows, the
+# four non-emoji status glyphs) enters at Theme's declared width, which for
+# every one of them is unchanged from before. Memoized once, like
+# Theme::glyphs()'s own defensive-copy discipline this mirrors -- load-
+# bearing for the same performance reason the old per-char hash-copy note
+# below used to warn about. PUBLIC.
+my $GLYPH_TABLE_MEMO;
+
+# _glyph_table_ref() -> the canonical (write-once memoized) table with NO
+# copy. Internal hot-path accessor: every per-character caller (_char_cols
+# used to use this directly; now _safe_char alone does, since _char_cols
+# itself delegates to tui::Layout) MUST use this, never glyph_table(), or
+# the per-char hash-copy performance regression comes right back. Callers
+# here never mutate it. PRIVATE.
 sub _glyph_table_ref {
-    return \%GLYPH_TABLE;
+    return $GLYPH_TABLE_MEMO if $GLYPH_TABLE_MEMO;
+    my %table;
+    my $glyphs = Theme::glyphs();
+    for my $name (keys %$glyphs) {
+        my $rec = $glyphs->{$name};
+        next unless ref($rec) eq 'HASH' && defined $rec->{char};
+        $table{ $rec->{char} } = $rec->{width};
+    }
+    $GLYPH_TABLE_MEMO = \%table;
+    return $GLYPH_TABLE_MEMO;
 }
 sub glyph_table {
-    return { %GLYPH_TABLE };
+    return { %{ _glyph_table_ref() } };
 }
 
-# glyph_width($char) -> the declared width if $char (a decoded character OR its
-# UTF-8 byte encoding, per D3) is allow-listed, else undef. PUBLIC.
+# glyph_width($char) -> the declared width if $char (a decoded character OR
+# its UTF-8 byte encoding, per D3) is allow-listed, else undef. DELEGATING
+# ALIAS (package 06, Obligation 2/3): tui::Layout::glyph_width consults the
+# SAME Theme-derived table. PUBLIC.
 sub glyph_width {
     my ($c) = @_;
-    return undef if !defined $c || $c eq '';
-    my $decoded = _decode_str($c);
-    return undef if length($decoded) != 1;
-    my $gt = _glyph_table_ref();
-    return exists $gt->{$decoded} ? $gt->{$decoded} : undef;
+    return tui::Layout::glyph_width($c);
 }
 
-# display_width($str) -> the number of terminal display columns $str occupies.
-# undef/'' -> 0. Never dies, never warns. Decodes per D3, strips SGR/ESC (S3.0,
-# shared with _safe), then sums _char_cols over what remains. PUBLIC.
+# display_width($str) -> the number of terminal display columns $str
+# occupies. undef/'' -> 0. Never dies, never warns. DELEGATING ALIAS
+# (package 06, Obligation 2): tui::Layout::display_width is now the single
+# width implementation; this module's own copy of the decode/strip/sum
+# pipeline (_decode_str/_strip_sgr/_char_cols) is retained ONLY because
+# _safe/_safe_char (below) still need it for sanitisation, per spec S2.2 --
+# they keep their own bodies but consult the SAME derived glyph table.
+# PUBLIC.
 sub display_width {
     my ($str) = @_;
-    return 0 if !defined $str || $str eq '';
-    my $s = _strip_sgr(_decode_str($str));
-    my $w = 0;
-    $w += _char_cols($_) for split //, $s;
-    return $w;
+    return tui::Layout::display_width($str);
 }
 
 # _safe_char($c) -> the sanitized DECODED form of one character: itself if
@@ -559,10 +562,18 @@ sub _justify_spans {
 # function here is PURE and TOTAL (INV-8): never die/warn on any input,
 # including undef, empty string, non-numeric, arrayref, or blessed-ref input.
 # ---------------------------------------------------------------------------
-my $GLYPH_GREEN  = Encode::encode('UTF-8', "\x{1F7E2}");
-my $GLYPH_RED    = Encode::encode('UTF-8', "\x{1F534}");
-my $GLYPH_YELLOW = Encode::encode('UTF-8', "\x{1F7E1}");
-my $GLYPH_WHITE  = Encode::encode('UTF-8', "\x{26AA}");
+# The four emoji circle constants are GONE (package 06, Obligation 5a --
+# Decision 11, "no emoji anywhere"). Replaced by _status_glyph(), a lazy
+# accessor onto Theme's four non-emoji status glyphs, resolved INSIDE the
+# sub bodies that use it (container_status_style, event_style, the spend
+# styler) -- never at file scope, so this module's %INC/load path never
+# needs Theme::glyph before it is actually rendering a frame. spec S2.2.
+sub _status_glyph {              # 'ok' | 'warn' | 'crit' | 'idle'
+    my ($k) = @_;
+    my $g = Theme::glyph("status.$k");
+    return defined($g) ? $g : '?';
+}
+
 my $TRI_UP       = Encode::encode('UTF-8', "\x{25B2}");
 my $TRI_DOWN     = Encode::encode('UTF-8', "\x{25BC}");
 
@@ -575,26 +586,32 @@ my $TRI_DOWN     = Encode::encode('UTF-8', "\x{25BC}");
 # and creds_error here too is harmless/redundant, not load-bearing). This
 # table is consulted AFTER those regexes and BEFORE the generic fallback, so
 # an unknown kind still reaches the fallback untouched (criterion c).
+#
+# The second element of each pair is now a STATUS KEY ('ok'/'warn'/'crit'/
+# 'idle'), not a glyph literal (package 06, Obligation 5a): this table is a
+# plain data literal with no Theme:: call, so _status_glyph resolves the
+# actual glyph lazily, inside event_style's own sub body, at the moment a
+# frame is actually rendered.
 my %BUTLER_KIND_STYLE = (
-    watchdog_relaunch => [ 'warn',   $GLYPH_YELLOW ],
-    pkg_finished      => [ 'good',   $GLYPH_GREEN ],
-    pause             => [ 'warn',   $GLYPH_YELLOW ],
-    checkpoint        => [ 'accent', $GLYPH_WHITE ],
-    checkpoint_failed => [ 'bad',    $GLYPH_RED ],
-    creds_error       => [ 'bad',    $GLYPH_RED ],
-    'broken-env'      => [ 'bad',    $GLYPH_RED ],
-    'turn-starved'    => [ 'warn',   $GLYPH_YELLOW ],
-    remediation       => [ 'warn',   $GLYPH_YELLOW ],
-    notice            => [ 'accent', $GLYPH_WHITE ],
-    review            => [ 'warn',   $GLYPH_YELLOW ],
-    acquire           => [ 'good',   $GLYPH_GREEN ],
-    release           => [ 'muted',  $GLYPH_WHITE ],
+    watchdog_relaunch => [ 'warn',   'warn' ],
+    pkg_finished      => [ 'good',   'ok' ],
+    pause             => [ 'warn',   'warn' ],
+    checkpoint        => [ 'accent', 'idle' ],
+    checkpoint_failed => [ 'bad',    'crit' ],
+    creds_error       => [ 'bad',    'crit' ],
+    'broken-env'      => [ 'bad',    'crit' ],
+    'turn-starved'    => [ 'warn',   'warn' ],
+    remediation       => [ 'warn',   'warn' ],
+    notice            => [ 'accent', 'idle' ],
+    review            => [ 'warn',   'warn' ],
+    acquire           => [ 'good',   'ok' ],
+    release           => [ 'muted',  'idle' ],
 );
 
-# @SPINNER -- the ten braille spinner glyphs already allow-listed at
-# Dashboard.pm:230-239 (dots-1..dots-10 order, per their own comments),
-# ordered here (the hash %GLYPH_TABLE carries no order). s07-live-status
-# spec S2.1. No glyph is added to %GLYPH_TABLE; no width declaration changes.
+# @SPINNER -- the ten braille spinner glyphs (dots-1..dots-10 order, per
+# their own comments), ordered here (the derived glyph table carries no
+# order). s07-live-status spec S2.1. No glyph is added; no width declaration
+# changes.
 my @SPINNER = map { Encode::encode('UTF-8', $_) }
     ("\x{280B}","\x{2819}","\x{2839}","\x{2838}","\x{283C}",
      "\x{2834}","\x{2826}","\x{2827}","\x{2807}","\x{280F}");   # dots-1 .. dots-10
@@ -611,11 +628,11 @@ sub container_status_style {
     my $st = defined $status ? $status : '';
     $st =~ s/^\s+//;
     $st =~ s/\s+$//;
-    return ($GLYPH_RED, 'bad')      if $container_gone;
-    return ($GLYPH_GREEN, 'good')   if $st eq 'running';
-    return ($GLYPH_RED, 'bad')      if $st =~ /^(?:exited|dead|removing|unknown)$/;
-    return ($GLYPH_YELLOW, 'warn')  if $st =~ /^(?:created|restarting|stopping|stopped|paused)$/;
-    return ($GLYPH_WHITE, 'muted');
+    return (_status_glyph('crit'), 'bad')   if $container_gone;
+    return (_status_glyph('ok'), 'good')    if $st eq 'running';
+    return (_status_glyph('crit'), 'bad')   if $st =~ /^(?:exited|dead|removing|unknown)$/;
+    return (_status_glyph('warn'), 'warn')  if $st =~ /^(?:created|restarting|stopping|stopped|paused)$/;
+    return (_status_glyph('idle'), 'muted');
 }
 
 # spinner_frame($idx) -> UTF-8 bytes of one of the 10 braille spinner glyphs
@@ -750,17 +767,20 @@ sub fmt_bytes {
 sub event_style {
     my ($type, $exit, $state) = @_;
     $type = '' if !defined $type;
-    return ('bad', $GLYPH_RED)      if $type =~ /(?:^|_)(?:failed|failure|error|gone|dead)$/;
-    return ('muted', $GLYPH_WHITE)  if $type =~ /^(?:heartbeat|tick)$/;
+    return ('bad', _status_glyph('crit'))   if $type =~ /(?:^|_)(?:failed|failure|error|gone|dead)$/;
+    return ('muted', _status_glyph('idle')) if $type =~ /^(?:heartbeat|tick)$/;
     if (defined $exit) {
-        return ('bad', $GLYPH_RED)  if $exit !~ /^0+$/;
-        return ('good', $GLYPH_GREEN);
+        return ('bad', _status_glyph('crit'))  if $exit !~ /^0+$/;
+        return ('good', _status_glyph('ok'));
     }
-    return ('good', $GLYPH_GREEN)   if defined $state && $state eq 'ok';
-    return ('accent', $GLYPH_WHITE)
+    return ('good', _status_glyph('ok'))    if defined $state && $state eq 'ok';
+    return ('accent', _status_glyph('idle'))
         if $type =~ /(?:^|_)(?:start|create|launch)(?:ed)?$/ || $type eq 'launch_session';
-    return @{ $BUTLER_KIND_STYLE{$type} } if exists $BUTLER_KIND_STYLE{$type};
-    return ('value', $GLYPH_WHITE);
+    if (exists $BUTLER_KIND_STYLE{$type}) {
+        my ($role, $key) = @{ $BUTLER_KIND_STYLE{$type} };
+        return ($role, _status_glyph($key));
+    }
+    return ('value', _status_glyph('idle'));
 }
 
 # wrap_spans(\@words, $w, $sep_role) -> \@lines -- spec S2.4. Greedy word-wrap
@@ -832,73 +852,103 @@ sub activity_row_width {
 }
 
 # _fixed_panels(\%state, $cols) -> the panels ABOVE the scrollable Activity
-# panel (Sandbox, Run, Backpack). Split out so activity_capacity can measure
-# their total height to compute how many event rows the Activity panel has
-# left. s06-panel-semantics: body lines are now spans-arrayrefs (dim labels,
-# colored values; spec S3 behaviors 1-8) and $cols (undef/<1 -> 80, matching
-# run's term_size fallback) is threaded through to _backpack_lines so its
-# wrapped-paragraph height agrees with the width actually composed.
+# panel (Run, Token, Resources, Spend). s06-panel-semantics: body lines are
+# now spans-arrayrefs (dim labels, colored values; spec S3 behaviors 1-8) and
+# $cols (undef/<1 -> 80, matching run's term_size fallback) is threaded
+# through to the Spend panel so its wrapping agrees with the width actually
+# composed.
+#
+# RETAINED, OFF THE RENDER PATH (package 06 fix-batch): its ONLY caller,
+# build_panels (below), is itself unreachable from compose_frame --
+# activity_capacity (the function this doc used to say consumed
+# _fixed_panels' total height) was rewritten for package 06 to call
+# tui::DashboardScreen::panels()/_fixed_region_height directly and never
+# calls _fixed_panels or build_panels at all (grep confirms zero other
+# callers). Kept, unused, per spec S6 item 8 -- do NOT delete.
+#
+# THE SANDBOX PANEL IS DISSOLVED (package 06, spec S2.4.3): `project` and
+# `container` now reach the frame via the header
+# (tui::DashboardScreen::header_spans), never a panel body, so they are not
+# rendered here at all. `heartbeat`/`uptime` move to the FRONT of Run.
+# `oauth` moves to Run too, but ONLY when $state->{tokens} is absent -- when
+# present, the byte-identical fact already lives in the Token panel's
+# 'access' row (_token_lines), so this conditional is what keeps it exactly
+# once (never in both, never in neither). Every row's label now goes through
+# the ONE shared label gutter (tui::DashboardScreen::LABEL_GUTTER(), == 11)
+# rather than each row hand-padding its own literal width.
+#
+# THE BACKPACK PANEL IS ALSO GONE (spec S2.4.3/S2.4.8, criterion 6,
+# Decision 9): it is no longer a panel of its own. It is now a one-line
+# summary row inside Run (see the `backpack` row built below, via
+# tui::DashboardScreen::row/backpack_summary_spans -- the same helpers the
+# actual render path's tui::DashboardScreen::_run_body uses), which vanishes
+# entirely when there is nothing to summarise. The full item listing
+# (_backpack_lines) is retained, unused by any render path -- package 07's
+# job (spec S6 items 3 and 8).
 sub _fixed_panels {
     my ($s, $cols) = @_;
     $s ||= {};
     $cols = 80 if !defined $cols || $cols !~ /^-?\d+(?:\.\d+)?$/ || $cols < 1;
     my @p;
 
-    my @sb;
-    push @sb, defined($s->{project_name}) && length($s->{project_name})
-        ? [ { text => 'project   : ', role => 'label' }, { text => $s->{project_name}, role => 'strong' } ]
-        : [ { text => 'project   : ', role => 'label' }, { text => '?', role => 'muted' } ];
-
-    my ($cglyph, $crole) = container_status_style($s->{status}, $s->{container_gone});
-    my $cname_ok  = defined($s->{container}) && length($s->{container});
-    my $cstatus   = (defined($s->{status}) && length($s->{status})) ? $s->{status} : '?';
-    push @sb, [ { text => 'container : ', role => 'label' },
-                { text => ($cname_ok ? $s->{container} : '?'), role => ($cname_ok ? 'value' : 'muted') },
-                { text => '  ', role => 'body' },
-                { text => "$cglyph [$cstatus]", role => $crole } ];
-
-    push @sb, defined($s->{beat_age})
-        ? [ { text => 'heartbeat : ', role => 'label' }, { text => fmt_age($s->{beat_age}) . ' ago', role => 'value' } ]
-        : [ { text => 'heartbeat : ', role => 'label' }, { text => 'n/a', role => 'muted' } ];
-
-    push @sb, defined($s->{uptime})
-        ? [ { text => 'uptime    : ', role => 'label' }, { text => fmt_hms($s->{uptime}), role => 'value' } ]
-        : [ { text => 'uptime    : ', role => 'label' }, { text => 'n/a', role => 'muted' } ];
-
-    # Always shown: a fresh sandbox has no token until an in-container /login
-    # (each sandbox owns an independent grant), and "not logged in" is exactly
-    # the actionable cue the user needs — so never silently drop the line.
-    push @sb, [ { text => 'oauth     : ', role => 'label' },
-                { text => fmt_oauth($s->{oauth_remaining}), role => oauth_role($s->{oauth_remaining}) } ];
-    push @p, { title => 'Sandbox', lines => \@sb };
+    my $gutter = tui::DashboardScreen::LABEL_GUTTER();
+    my $gl = sub { sprintf('%-*s : ', $gutter, $_[0]) };
 
     # B3: run + wakefulness state. busy-lease freshness (the orchestrator only
     # refreshes /tmp/.butler-busy while there's active work / pending auto-resume)
     # drives keep-awake; `stay_awake` is the launcher's single computed decision
     # (KeepAwake::should_stay_awake) so this view never re-derives the threshold.
     my @run;
+
+    push @run, defined($s->{beat_age})
+        ? [ { text => $gl->('heartbeat'), role => 'label' }, { text => fmt_age($s->{beat_age}) . ' ago', role => 'value' } ]
+        : [ { text => $gl->('heartbeat'), role => 'label' }, { text => 'n/a', role => 'muted' } ];
+
+    # Uptime renders through fmt_age (criterion 4's one duration format /
+    # AC-F5), NOT fmt_hms -- fmt_hms is retained but off every render path
+    # (see its own doc comment above).
+    push @run, defined($s->{uptime})
+        ? [ { text => $gl->('uptime'), role => 'label' }, { text => fmt_age($s->{uptime}), role => 'value' } ]
+        : [ { text => $gl->('uptime'), role => 'label' }, { text => 'n/a', role => 'muted' } ];
+
     my ($busy_text, $busy_role);
     if (!defined $s->{busy_age})  { ($busy_text, $busy_role) = ('none (no active run)', 'muted'); }
     elsif ($s->{stay_awake})     { ($busy_text, $busy_role) = ('active (' . fmt_age($s->{busy_age}) . ' ago)', 'good'); }
     else                          { ($busy_text, $busy_role) = ('idle ('   . fmt_age($s->{busy_age}) . ' ago)', 'warn'); }
-    push @run, [ { text => 'busy-lease : ', role => 'label' }, { text => $busy_text, role => $busy_role } ];
+    push @run, [ { text => $gl->('busy-lease'), role => 'label' }, { text => $busy_text, role => $busy_role } ];
 
     my ($keep_text, $keep_role) = $s->{stay_awake}
         ? ('holding (PC stays awake)', 'good') : ('released (PC may sleep)', 'muted');
-    push @run, [ { text => 'keep-awake : ', role => 'label' }, { text => $keep_text, role => $keep_role } ];
+    push @run, [ { text => $gl->('keep-awake'), role => 'label' }, { text => $keep_text, role => $keep_role } ];
 
     my $ny = (defined $s->{needs_you} && $s->{needs_you} =~ /^\d+$/) ? $s->{needs_you} : 0;
     my ($needs_text, $needs_role) = $ny > 0 ? ("$ny decision(s) waiting", 'warn') : ('none', 'muted');
-    push @run, [ { text => 'needs you  : ', role => 'label' }, { text => $needs_text, role => $needs_role } ];
-    push @run, _run_lines($s->{runs});   # s10
-    push @p, { title => 'Run', lines => \@run };
+    push @run, [ { text => $gl->('needs you'), role => 'label' }, { text => $needs_text, role => $needs_role } ];
 
-    # B4: backpack view — per-item approval state (#21). Present only when the
-    # launcher gathered a backpack structure for this project. s06: a wrapped
-    # paragraph, so its width (hence height) must agree with $cols.
-    if (ref $s->{backpack} eq 'HASH') {
-        push @p, { title => 'Backpack', lines => [ _backpack_lines($s->{backpack}, $cols - 2) ] };
+    # backpack: a ONE-LINE summary row, not a panel (package 06, spec
+    # S2.4.3/S2.4.8, criterion 6, Decision 9). Reuses
+    # tui::DashboardScreen::backpack_summary_spans/row verbatim -- the same
+    # helpers tui::DashboardScreen::_run_body already uses on the actual
+    # render path -- rather than re-deriving the total/approved/pending/
+    # "[b] manage" grammar a second time. row() itself suppresses the line
+    # (returns []) when there is nothing to summarise (total == 0 or
+    # $s->{backpack} isn't a hashref). The full item listing (_backpack_lines)
+    # stays defined, off this render path -- package 07's job (spec S6 item 3).
+    my $bp_row = tui::DashboardScreen::row({
+        label => 'backpack',
+        value => tui::DashboardScreen::backpack_summary_spans($s->{backpack}),
+    });
+    push @run, $bp_row if @$bp_row;
+
+    push @run, _run_lines($s->{runs});   # s10
+
+    # oauth: only when $state->{tokens} is absent (else the Token panel's
+    # 'access' row already carries this exact fact -- spec S2.4.3).
+    if (ref($s->{tokens}) ne 'HASH') {
+        push @run, [ { text => $gl->('oauth'), role => 'label' },
+                     { text => fmt_oauth($s->{oauth_remaining}), role => oauth_role($s->{oauth_remaining}) } ];
     }
+    push @p, { title => 'Run', lines => \@run };
 
     # s08: access/refresh token status view. Present only when the launcher
     # gathered a TokenInfo struct for this project (I1: that struct itself is
@@ -932,8 +982,13 @@ sub _fixed_panels {
 # lines => [line,...] }, where a line is a spans-arrayref (or, for the
 # Activity panel, a plain string / spans-arrayref per event -- see
 # recent_events). The Activity panel is always LAST (the scrollable,
-# height-flexible one); the loop fills state.events with the already-windowed
-# lines (see activity_window). $cols forwards to _fixed_panels (s06).
+# height-flexible one); $cols forwards to _fixed_panels (s06).
+#
+# RETAINED, OFF THE RENDER PATH (package 06 fix-batch): the actual render
+# path builds the panel list via tui::DashboardScreen::panels() (compose_frame
+# delegates to tui::DashboardScreen::compose entirely); this function's only
+# remaining caller is _body_rows (also below, also unreachable -- see its own
+# doc comment). Kept, unused, per spec S6 item 8 -- do NOT delete.
 sub build_panels {
     my ($s, $cols) = @_;
     $s ||= {};
@@ -952,6 +1007,13 @@ sub build_panels {
 # list doesn't fit -- K is the largest prefix of items whose wrap (plus the
 # "+N more" word) still fits in BACKPACK_MAX_ROWS rows. $w (paragraph wrap
 # width) undef/<1 -> 78.
+#
+# RETAINED, REMOVED FROM THE DASHBOARD RENDER PATH (package 06, criterion 6 /
+# Decision 9): the dashboard's backpack panel is now a one-line summary
+# (tui::DashboardScreen::backpack_summary_spans, rendered inside the Run
+# panel) with no item-key listing. This full listing -- and wrap_spans below,
+# which it depends on -- moves to package 07's backpack screen; both are
+# kept here, unused by compose_frame, so that package can lift them.
 sub _backpack_lines {
     my ($bp, $w) = @_;
     $bp ||= {};
@@ -1153,10 +1215,10 @@ sub _token_lines {
 # status-dot pair for a rendered provider/window state.
 sub _spend_glyph {
     my ($state) = @_;
-    return ('bad',   $GLYPH_RED)    if $state eq 'unreadable' || $state eq 'exhausted';
-    return ('warn',  $GLYPH_YELLOW) if $state eq 'absent';
-    return ('muted', $GLYPH_WHITE)  if $state eq 'disabled';
-    return ('good',  $GLYPH_GREEN);   # 'ok' and any unrecognized state
+    return ('bad',   _status_glyph('crit')) if $state eq 'unreadable' || $state eq 'exhausted';
+    return ('warn',  _status_glyph('warn')) if $state eq 'absent';
+    return ('muted', _status_glyph('idle')) if $state eq 'disabled';
+    return ('good',  _status_glyph('ok'));    # 'ok' and any unrecognized state
 }
 
 # _spend_claude_line(\%claude_info) -> (\@spans, $protect). $protect is true
@@ -1310,17 +1372,31 @@ sub _spend_lines {
     return \@out;
 }
 
-# _resources_lines(\%res) -> LIST of body lines for the s09 Resources panel.
-# The 15-key resource struct the launcher built (machine_*, ctr_*, vm_*,
-# pod_*, host_* -- source-labelled, closed key set),
-# passed through the gather hash with no arithmetic -- every derivation
-# already happened in the launcher. PRIVATE, pure, mirrors _token_lines'
-# style. A non-hashref $res -> the empty list (never dies).
+# _resources_lines(\%res) -> LIST of body lines for the Resources panel. The
+# 15-key resource struct the launcher built (machine_*, ctr_*, vm_*, pod_*,
+# host_* -- source-labelled, closed key set), passed through the gather hash
+# with no arithmetic -- every derivation already happened in the launcher.
+# PRIVATE, pure, mirrors _token_lines' style. A non-hashref $res -> the
+# empty list (never dies).
 #
-# ALWAYS exactly 7 lines, whatever the input: an unknown fact renders 'n/a',
-# never a fabricated number and never a vanished row. host_* and vm_*/ctr_*
-# facts are labelled by source and never conflated.
+# TWO PATHS (package 06, Obligation 4 / adapter contract Rule 4):
+#   - $res carries a snapshot_state key (package 03's adapter contract) --
+#     rendered through tui::DashboardScreen's row()-based suppression, so
+#     "no data yet" / "stale" / "the sampler died" are visibly distinct and
+#     an absent fact does not fabricate a row (see _resources_lines_v2,
+#     delegating to tui::DashboardScreen::_resources_body).
+#   - $res has no snapshot_state key at all (a pre-03 caller) -- the ORIGINAL
+#     behaviour below is preserved BYTE-IDENTICAL: always exactly 7 lines,
+#     an unknown fact renders 'n/a', never a vanished row. t/44-resources.t's
+#     B23/B24/B25 tables pin this legacy shape verbatim and are unaffected.
 sub _resources_lines {
+    my ($r) = @_;
+    return () unless ref $r eq 'HASH';
+    return @{ tui::DashboardScreen::_resources_body($r) } if exists $r->{snapshot_state};
+    return _resources_lines_legacy($r);
+}
+
+sub _resources_lines_legacy {
     my ($r) = @_;
     return () unless ref $r eq 'HASH';
 
@@ -1608,24 +1684,26 @@ sub _panel_title_line {
     return clip_pad($s, $cols);
 }
 
-# _two_col_min_cols() -> 100 (PRIVATE, pure). The pinned two-column threshold
-# (s05 D1); the single source of truth -- nothing else may hardcode it.
+# _two_col_min_cols() -> tui::Layout::BREAKPOINT_TWO_COL() (PRIVATE, pure).
+# DELEGATING ALIAS (package 06, Obligation 1, Decision 14): the single
+# source of truth for the responsive breakpoint is now exactly ONE literal
+# in the whole repository, tui::Layout.pm's own BREAKPOINT_TWO_COL constant
+# (90). This function is retained because _fixed_region_height/
+# activity_capacity and existing tests call it by name; it no longer states
+# the value itself.
 sub _two_col_min_cols {
-    return 100;
+    return tui::Layout::BREAKPOINT_TWO_COL();
 }
 
 # _two_col_mode($cols) -> 0|1 (PRIVATE, pure). Mode depends on $cols ONLY (D2):
 # never rows, alerts, panel count or state. Never dies, never warns -- undef,
-# 0, and negative all fall through to stacked (0). A non-numeric $cols (never
-# seen from a real caller -- activity_capacity/compose_frame only ever pass
-# integers/undef) is guarded via a string-context regex check rather than
-# handed raw to the numeric `>=`, so it degrades to stacked (0) instead of
-# tripping perl's "isn't numeric" warning under `use warnings` (F1).
+# 0, and negative all fall through to stacked (0). DELEGATING (package 06,
+# Obligation 1): tui::Layout::arrangement already returns 'single-column' for
+# undef/non-numeric/0/negative, so this degradation ladder is inherited, not
+# re-implemented.
 sub _two_col_mode {
     my ($cols) = @_;
-    return 0 if !defined $cols;
-    return 0 if $cols !~ /^-?\d+(?:\.\d+)?$/;
-    return ($cols >= _two_col_min_cols()) ? 1 : 0;
+    return (tui::Layout::arrangement($cols) eq 'two-column') ? 1 : 0;
 }
 
 # _col_widths($cols) -> ($lw, $rw) (PRIVATE, pure). Right column absorbs the
@@ -1729,12 +1807,19 @@ sub _two_col_rows {
 # { role, spans => [...] } (s05+'s seam; forwarded to spanify) -- the two-space
 # body indent is a leading { text => '  ', role => 'body' } span in every case.
 #
-# s05: at or above _two_col_min_cols(), the first two _fixed_panels entries
-# (Sandbox, Run -- unconditionally positions 0/1, D7) are pulled off and
-# rendered as a joined two-column region via _two_col_rows; every remaining
-# panel (Backpack when present, Recent activity always last) stacks
-# full-width below it via _panel_rows, exactly as today. Below the threshold
-# this is byte-identical to the pre-s05 stacked loop. PRIVATE.
+# s05: at or above _two_col_min_cols(), the first two build_panels entries
+# are pulled off and rendered as a joined two-column region via
+# _two_col_rows; every remaining panel stacks full-width below it via
+# _panel_rows.
+#
+# RETAINED, OFF THE RENDER PATH (package 06 fix-batch): this function has ZERO
+# callers anywhere in the repository (grep confirms it) -- compose_frame
+# delegates entirely to tui::DashboardScreen::compose, which does its own
+# two-column reflow via tui::Layout::place, not this function or build_panels
+# (whose original "positions 0/1 are always Sandbox and Run" premise is
+# itself stale -- the Sandbox panel no longer even exists; see
+# _fixed_panels' doc comment above). Kept, unused, per spec S6 item 8 --
+# do NOT delete. PRIVATE.
 sub _body_rows {
     my ($state, $cols, $maxh) = @_;
     my @out;
@@ -1755,62 +1840,56 @@ sub _body_rows {
 
 # compose_frame(\%state, $rows, $cols) -> arrayref of EXACTLY $rows
 # { text, role, spans } cells (every cell built via make_cell, so
-# display_width($cell->{text}) == $cols for every row). Layout: title row, a
-# body region of stacked panels, and a footer legend reserved on the last row.
-# Degrades cleanly to tiny terminals (1xN -> title only; 2xN -> title+footer).
-# PUBLIC, cells extended (F9: s04 fix-batch doc-tag pass).
+# display_width($cell->{text}) == $cols for every row). DELEGATES to
+# tui::DashboardScreen::compose (package 06, spec S2.4): the content
+# vocabulary -- panel set, density suppression, the two-column reflow --
+# now lives there, composed through package 05's tui::Screen/Layout/Frame/
+# Meter. This module's own argument normalisation ($rows < 0 -> 0, $cols < 1
+# -> 1) is preserved here, ahead of the delegation, exactly as before.
+# PUBLIC.
 sub compose_frame {
     my ($state, $rows, $cols) = @_;
     $state ||= {};
-    $rows = 0 if !defined $rows || $rows < 0;
-    $cols = 1 if !defined $cols || $cols < 1;
-    my @frame;
-    return \@frame if $rows < 1;
-
-    push @frame, make_cell(_title_line($state, $cols), 'title', $cols);
-    return \@frame if $rows == 1;
-
-    my $footer_role = 'footer';
-    if (defined $state->{pending}
-        && ($state->{pending} eq 'stop-runs' || $state->{pending} eq 'full-shutdown'
-            || $state->{pending} eq 'relaunch')) {
-        $footer_role = 'footer-alert';
-    } elsif (defined $state->{footer_flash} && length $state->{footer_flash}) {
-        $footer_role = 'footer-flash';   # transient launch-blocked notice
-    }
-    my $footer = make_cell(_footer_line($state, $cols), $footer_role, $cols);
-
-    if ($rows == 2) {
-        push @frame, $footer;
-        return \@frame;
-    }
-
-    # Optional alert banner(s) directly under the title: a container that is no
-    # longer running / reachable (so the dashboard staying open after a container
-    # death is obvious and actionable) and/or a backpack-install failure. Each
-    # needs room for title + alert + >=1 body + footer; on a tiny terminal we
-    # drop the lowest-priority alerts (install_warning first) rather than crowd
-    # out the body. The launcher surfaces these where a pre-dashboard stdout
-    # warning would otherwise be wiped by the alt-screen.
-    my @msgs = _alert_msgs($state, $rows);
-    my @alert = map { make_cell(_alert_line($_, $cols), 'alert', $cols) } @msgs;
-
-    my $body_h = $rows - 2 - scalar(@alert);
-    my @body = _body_rows($state, $cols, $body_h);
-    while (@body < $body_h) {
-        push @body, make_cell('', 'blank', $cols);
-    }
-    push @frame, @alert, @body;
-    push @frame, $footer;
-    return \@frame;
+    # Fix batch (package 06, red-team finding, latent/low): guard ref/non-
+    # numeric $rows/$cols the same way _fixed_region_height's own cols
+    # normalisation does (below), rather than a bare `< 0`/`< 1` comparison
+    # that would warn under `use warnings` (and mis-compare) on a ref or a
+    # non-numeric string.
+    $rows = 0 if !defined $rows || ref($rows) || $rows !~ /^-?\d+(?:\.\d+)?$/ || $rows < 0;
+    $cols = 1 if !defined $cols || ref($cols) || $cols !~ /^-?\d+(?:\.\d+)?$/ || $cols < 1;
+    return tui::DashboardScreen::compose($state, $rows, $cols);
 }
 
 # sgr_for_role($role) -> the SGR escape for a role (row role or span role;
 # color mode only). '' for unknown roles, 'body', 'blank' and undef.
 # PUBLIC, extended (F9: s04 fix-batch doc-tag pass).
+#
+# THEME ROLES RESOLVE FIRST (package 06, spec S2.1; driver ruling
+# 2026-08-08, resolving the spec's own self-contradiction over 'accent').
+# sgr_for_role has exactly one caller in the whole repository -- _row_ansi,
+# below, this file's own render path -- and that caller now feeds it ONLY
+# the role names tui::DashboardScreen emits, which are Theme's nine role
+# names exclusively (spec S2.1: "tui::DashboardScreen emits Theme role
+# names only"). 'accent' is the single name that collides between the
+# legacy seventeen and Theme's nine; resolving Theme FIRST is what lets the
+# live caller's 'accent' spans (the title row) paint in Theme's actual
+# accent colour instead of being permanently shadowed by the legacy cyan
+# branch below, which a legacy-first order would make unreachable for the
+# one caller that exists. The other fourteen legacy names are not Theme
+# role names, so they are untouched by this reordering and stay byte-
+# identical (spec S6 item 8 retains every legacy branch -- only the
+# resolution ORDER changes, nothing is deleted).
+my $THEME_ROLE_NAMES_MEMO;
+sub _theme_role_names {
+    return $THEME_ROLE_NAMES_MEMO if $THEME_ROLE_NAMES_MEMO;
+    $THEME_ROLE_NAMES_MEMO = Theme::roles();
+    return $THEME_ROLE_NAMES_MEMO;
+}
+
 sub sgr_for_role {
     my ($role) = @_;
     $role = '' if !defined $role;
+    return Theme::sgr($role, undef) if exists _theme_role_names()->{$role};
     return "\e[1;36m"     if $role eq 'title';        # bold cyan
     return "\e[1m"        if $role eq 'panel-title';  # bold
     return "\e[2m"        if $role eq 'footer';       # dim
@@ -1825,8 +1904,11 @@ sub sgr_for_role {
     return "\e[32m"       if $role eq 'good';         # green
     return "\e[33m"       if $role eq 'warn';         # yellow
     return "\e[31m"       if $role eq 'bad';          # red
-    return "\e[36m"       if $role eq 'accent';       # cyan
-    return '';
+    return "\e[36m"       if $role eq 'accent';       # cyan -- UNREACHABLE: 'accent' is
+                                                       # also a Theme role name and is now
+                                                       # resolved by the Theme-first check
+                                                       # above; kept, not deleted (S6 item 8).
+    return Theme::sgr($role, undef);
 }
 
 # _cell_spans(\%cell) -> \@spans: $cell->{spans} when present, else the
@@ -2037,12 +2119,18 @@ sub spawn_argv {
 
 # recent_events(\@json_lines, $n, $localtime_fn) -> arrayref of the last $n
 # events parsed from B1 launch-log JSON lines. Unparseable lines are skipped.
-# Optional 3rd arg $localtime_fn is the time seam passed to _event_time; omit
-# for real localtime (2-arg callers unchanged). s06-panel-semantics (spec
-# S3.14): each accepted record is now a spans-arrayref -- dim timestamp +
-# severity glyph + semantically-colored body (classified by event_style),
-# not an opaque string. The timestamp span is ALWAYS role 'muted', regardless
-# of classification.
+# s06-panel-semantics (spec S3.14): each accepted record is now a
+# spans-arrayref -- dim timestamp + severity glyph + semantically-colored
+# body (classified by event_style), not an opaque string. The timestamp span
+# is ALWAYS role 'muted', regardless of classification.
+#
+# RESTRUCTURED (package 06, spec S2.4.6): parse -> collapse -> tail-slice ->
+# render, in that order, so $n bounds RENDERED rows (after collapsing, not
+# before -- criterion 5). Optional 4th arg $now enables the per-event time
+# column (fmt_duration($now - $epoch)); $localtime_fn (3rd arg) is retained
+# for signature compatibility with existing callers but is UNUSED by the new
+# time field -- _event_time (the old HH:MM:SS clock-time renderer) is no
+# longer on this render path (AC-F5, criterion 4's one duration format).
 # _ev_scalar($json_value) -> a safe display string, or undef to omit the field.
 # F6 (s04 fix-batch, redteam-01.md MINOR): a launch-log line is untrusted input,
 # and a JSON object/array value interpolated straight into an event string
@@ -2066,18 +2154,28 @@ sub _ev_scalar {
 # unbounded blob into a fixed-height panel.
 my $EVENT_FIELD_MAX_LEN = 500;
 
+# _event_epoch($iso_ts) -> the epoch (seconds), or undef when $ts is missing
+# or unparseable. Pure UTC arithmetic (Time::Local::timegm) -- never touches
+# the clock, never calls localtime, unlike the retired _event_time. PRIVATE.
+sub _event_epoch {
+    my ($ts) = @_;
+    return undef unless defined $ts && $ts =~ /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})Z/;
+    my ($yr, $mo, $dy, $h, $m, $sec) = ($1, $2, $3, $4, $5, $6);
+    return eval { Time::Local::timegm($sec, $m, $h, $dy, $mo - 1, $yr - 1900) };
+}
+
 sub recent_events {
-    my ($lines, $n, $localtime_fn) = @_;
+    my ($lines, $n, $localtime_fn, $now) = @_;
     $lines ||= [];
     $n = 10 if !defined $n || $n < 1;
     my $jp = JSON::PP->new;
-    my @ev;
+    my @records;
     for my $ln (@$lines) {
         next unless defined $ln && $ln =~ /\S/;
         my $rec = eval { $jp->decode($ln) };
         next unless $rec && ref $rec eq 'HASH';
-        my $ts   = defined $rec->{ts} ? $rec->{ts} : '';
-        my $hms  = _event_time($ts, $localtime_fn);
+        my $ts    = defined $rec->{ts} ? $rec->{ts} : '';
+        my $epoch = _event_epoch($ts);
         my $type = _ev_scalar($rec->{type});
         $type = 'event' if !defined $type;
         my $extra  = '';
@@ -2096,14 +2194,42 @@ sub recent_events {
         # pathological JSON value can't blow up the row regardless of how
         # much of it survives control-character stripping.
         $body = substr($body, 0, $EVENT_FIELD_MAX_LEN) if length($body) > $EVENT_FIELD_MAX_LEN;
+        push @records, { epoch => $epoch, body => $body, role => $role, glyph => $glyph };
+    }
+
+    # Collapse BEFORE the tail-slice, so $n bounds RENDERED rows (criterion
+    # 5, spec S2.4.6 step 3).
+    my $collapsed = tui::DashboardScreen::collapse_records(\@records);
+    my @last = @$collapsed > $n ? @{$collapsed}[ -$n .. -1 ] : @$collapsed;
+
+    my $now_numeric = defined($now) && !ref($now) && $now =~ /^-?\d+(?:\.\d+)?$/;
+    my @ev;
+    for my $rec (@last) {
         my @spans;
-        push @spans, { text => "$hms  ", role => 'muted' } if length $hms;
-        push @spans, { text => "$glyph ", role => $role };
-        push @spans, { text => _safe($body), role => $role };
+        if ($now_numeric && defined $rec->{epoch}) {
+            # AC19 (t/41): the time span's role is the THEME token
+            # (theme_role('muted') == 'text.muted').
+            push @spans, { text => sprintf('%-6s  ', fmt_age($now - $rec->{epoch})), role => tui::DashboardScreen::theme_role('muted') };
+        }
+        # Fix batch (package 06, review finding "Fix 1"): event_style still
+        # returns a LEGACY role name (good/bad/muted/accent/value) -- that
+        # classifier's own return value is pinned by t/41 AC17/AC18 and by
+        # the driver's ruling that theme_role is the single translation
+        # point, so it stays legacy. But this is a SPAN on the render path,
+        # and sgr_for_role only honours NO_COLOR/capability for Theme role
+        # names (Theme::sgr) -- a legacy name falls through to a hard-coded
+        # escape that ignores both. Route through theme_role() here, at the
+        # point the span is built, exactly like the time span above, so
+        # NO_COLOR=1 actually degrades every span in an activity row, not
+        # just the timestamp.
+        my $ev_role = tui::DashboardScreen::theme_role($rec->{role});
+        push @spans, { text => "$rec->{glyph} ", role => $ev_role };
+        push @spans, { text => _safe($rec->{body}), role => $ev_role };
+        push @spans, { text => " x$rec->{count}", role => tui::DashboardScreen::theme_role('muted') }
+            if defined($rec->{count}) && $rec->{count} >= 2;
         push @ev, \@spans;
     }
-    my @last = @ev > $n ? @ev[-$n .. -1] : @ev;
-    return \@last;
+    return \@ev;
 }
 
 # activity_view(\@events_chrono, $offset) -> the events to DISPLAY in the Activity
@@ -2139,22 +2265,50 @@ sub _alert_msgs {
     return @msgs;
 }
 
-# _fixed_region_height(\%state, $cols) -> $h (PRIVATE, pure, s05 s2.8). The
-# single arithmetic mirror of the fixed (non-Activity) region's height, shared
-# by activity_capacity so it agrees with _body_rows' mode split exactly.
-# Stacked: plain sum of (1 + lines + 1) over every fixed panel -- identical to
-# the pre-s05 inline loop. Two-column: the first two panels (Sandbox, Run)
-# contribute max(total_0, total_1) instead of their sum; every later fixed
-# panel (e.g. Backpack) still contributes its own (1 + lines + 1).
+# _fixed_region_height(\%state, $cols) -> $h (PRIVATE, pure). The single
+# arithmetic mirror of the fixed (non-Activity) region's height, shared by
+# activity_capacity so it agrees with what compose_frame actually renders.
+#
+# REBUILT (package 06, spec S2.4.9): derives panel heights from
+# tui::DashboardScreen::panels() and simulates the SAME tui::Layout::place
+# band-row assignment compose() makes, summing the height of every band-row
+# STRICTLY BEFORE the one containing 'Recent activity' -- rather than a
+# fixed "first two panels join" assumption, because tui::Layout::place's
+# band width (package 05) GROWS with $cols above the breakpoint (more than
+# two panels can share a row on a wide terminal), so Activity itself can
+# join the same band-row as an earlier panel rather than always starting a
+# fresh one. Simulating the actual placement is what keeps this in exact
+# agreement with compose_frame regardless of how many panels are present.
 sub _fixed_region_height {
     my ($state, $cols) = @_;
-    my @h = map { 1 + scalar(@{ $_->{lines} || [] }) + 1 } _fixed_panels($state, $cols);
-    if (_two_col_mode($cols) && @h >= 2) {
-        my ($a, $b) = splice(@h, 0, 2);
-        unshift @h, (($a > $b) ? $a : $b);
+    # AC-10 (t/40): $cols undef/non-numeric/<1 must degrade to the SAME
+    # stacked-layout value any other sub-breakpoint width produces (matching
+    # _two_col_mode's total degradation ladder), not to 0 -- tui::Layout::
+    # place() itself returns [] for an out-of-range $cols (it has no
+    # "default to stacked" notion, only "cannot place at all"), so the
+    # normalisation has to happen HERE, one level up, exactly as
+    # _fixed_panels already normalises $cols before use.
+    $cols = 80 if !defined $cols || ref($cols) || $cols !~ /^-?\d+(?:\.\d+)?$/ || $cols < 1;
+    my $panels = tui::DashboardScreen::panels($state, $cols);
+    return 0 unless ref($panels) eq 'ARRAY' && @$panels;
+    my $band_rows = tui::Layout::place($panels, $cols);
+    my $total = 0;
+    for my $row (@$band_rows) {
+        my $has_activity = grep {
+            ref($_) eq 'HASH' && ref($_->{panel}) eq 'HASH'
+                && defined($_->{panel}{title}) && $_->{panel}{title} eq 'Recent activity'
+        } @$row;
+        last if $has_activity;
+        my $row_h = 0;
+        for my $cell (@$row) {
+            my $panel = (ref($cell) eq 'HASH') ? $cell->{panel} : undef;
+            my $lines = (ref($panel) eq 'HASH' && ref($panel->{lines}) eq 'ARRAY') ? $panel->{lines} : [];
+            my $h = 1 + scalar(@$lines) + 1;
+            $row_h = $h if $h > $row_h;
+        }
+        $total += $row_h;
     }
-    my $t = 0; $t += $_ for @h;
-    return $t;
+    return $total;
 }
 
 # activity_capacity(\%state, $rows, $cols) -> how many EVENT rows the Activity
@@ -2168,7 +2322,11 @@ sub _fixed_region_height {
 sub activity_capacity {
     my ($state, $rows, $cols) = @_;
     $state ||= {};
-    $rows = 0 if !defined $rows || $rows < 0;
+    # Fix batch (package 06, red-team finding, latent/low): same guard as
+    # _fixed_region_height's cols normalisation and compose_frame's own
+    # rows/cols normalisation above -- a ref or non-numeric $rows would
+    # otherwise warn under `use warnings` on the bare `< 0` comparison.
+    $rows = 0 if !defined $rows || ref($rows) || $rows !~ /^-?\d+(?:\.\d+)?$/ || $rows < 0;
     my $alerts = scalar(_alert_msgs($state, $rows));
     my $body_h = $rows - 2 - $alerts;             # 2 = title + footer
     my $fixed  = _fixed_region_height($state, $cols);

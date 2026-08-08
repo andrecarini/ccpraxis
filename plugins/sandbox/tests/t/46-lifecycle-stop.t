@@ -315,11 +315,19 @@ sub _seq_order_ok {
         "AC-6: confirm_prompt('shutdown', 80) (legacy token) is undef");
 
     # AC-7 (B7): compose_frame footer role selection.
+    # RETARGETED 2026-08-08 (package 06-dashboard-screen, driver scope grant
+    # E-B/E-D): package 02's Theme-token role vocabulary (spec 06 S2.1's
+    # mapping table) moves 'footer-alert' -> 'state.crit' ("bad, alert,
+    # footer-alert -> state.crit") and 'footer' -> 'text.faint' ("footer,
+    # scrollhint -> text.faint"). Subject moved, claim held: this still
+    # asserts the footer carries the ATTENTION role while a confirm prompt is
+    # pending, and the ordinary/muted role otherwise.
     my %base = (project_name => 'demo', container => 'c1', status => 'running', events => []);
     for my $tok ('stop-runs', 'full-shutdown') {
         my %s = (%base, pending => $tok);
         my $f = Dashboard::compose_frame(\%s, 10, 80);
-        is($f->[-1]{role}, 'footer-alert', "AC-7: pending='$tok' -> footer role is footer-alert");
+        is($f->[-1]{role}, 'state.crit',
+            "AC-7: pending='$tok' -> footer role is state.crit (was footer-alert -- Theme token migration)");
         my $prompt = eval { Dashboard::confirm_prompt($tok, 80) };
         like($f->[-1]{text}, qr/\Q$prompt\E/, "AC-7: pending='$tok' -> footer text carries the confirm prompt")
             if defined $prompt;
@@ -327,7 +335,8 @@ sub _seq_order_ok {
     }
     my %none = (%base, pending => '');
     my $f2 = Dashboard::compose_frame(\%none, 10, 80);
-    is($f2->[-1]{role}, 'footer', 'AC-7: no pending -> footer role');
+    is($f2->[-1]{role}, 'text.faint',
+        'AC-7: no pending -> footer role is text.faint (was footer -- Theme token migration)');
     like($f2->[-1]{text}, qr/\[q\] quit/, 'AC-7: no pending -> legend text shown');
 }
 
@@ -969,9 +978,16 @@ sub drive2 {
         like($diff, qr/\e\[\?2026l$/, "AC-20: diff render still closes with the sync-output wrapper at cols=$cols");
 
         # lifecycle alert renders BEFORE a coexisting status alert.
+        # RETARGETED 2026-08-08 (package 06-dashboard-screen, driver scope
+        # grant E-B/E-D): the CELL-level 'alert' role also moves under Theme
+        # token adoption -- spec 06 S2.1's mapping table ("bad, alert,
+        # footer-alert -> state.crit") applies to banner/alert rows just as
+        # it does to spans; confirmed against tui::Screen's screen()
+        # composition (spec 06 S2.4.9: banner_role => 'state.crit'). Subject
+        # moved, claim held: still counting the banner rows by role.
         my %st2 = (%st, status => 'exited');
         my $f3 = Dashboard::compose_frame(\%st2, $rows, $cols);
-        my @alerts = grep { $_->{role} eq 'alert' } @$f3;
+        my @alerts = grep { $_->{role} eq 'state.crit' } @$f3;
         is(scalar(@alerts), 2, "AC-20: lifecycle + status alerts coexist as two rows at cols=$cols");
         # Ordering is asserted with a WIDTH-SAFE discriminator. The pinned message
         # (spec S2.6) is "full shutdown 3/4: stop container - running" = 42 cols, and

@@ -89,7 +89,6 @@ my @GENERATED_SURFACES = (
 
 my %EMOJI_PENDING = (
     'scripts/statusline.pl'                   => 'package 10-statusline-rebuild removes this entry',
-    'plugins/sandbox/scripts/Dashboard.pm'    => 'package 06-dashboard-screen removes this entry',
     # Was 'no package owns this file' when this list was written, which was true
     # then and is FALSE now: on 2026-08-07 the driver closed that scope gap by
     # adding bp-statusline.pl to package 10-statusline-rebuild's write set, since
@@ -123,7 +122,6 @@ my @EMOJI_SURFACES = (
 );
 
 my %PENDING_GLYPH_REGISTRATION = (
-    'sep.bar' => 'package 06-dashboard-screen adds U+FF5C to Dashboard::glyph_table at width 2 and removes this entry',
 );
 
 # ===========================================================================
@@ -1484,14 +1482,48 @@ is_deeply(Theme::x256_rgb(196), [255, 0, 0],     'x256_rgb(196) == [255,0,0] (B-
 }
 
 {
+    # B-E7 CORRECTED for package 06 (driver ruling E-F, packages/06-dashboard-screen.md
+    # 2026-08-07T20:40:59Z): the original claim here was "Theme::display_width delegates to
+    # Dashboard::display_width". 06's mandate makes Dashboard delegate its OWN width core to
+    # tui::Layout, and the driver ruled that merely repointing Theme.pm:395 at
+    # `require tui::Layout;` would only trade a Theme<->Dashboard 2-cycle for a
+    # Theme<->tui::Layout 2-cycle (tui::Layout does `use Theme;` at compile time for its glyph
+    # table) -- not a DAG. So `Theme::display_width` is deleted OUTRIGHT, not repointed: it has
+    # exactly one caller in the repository, this assertion. The CLAIM survives unchanged --
+    # glyph-width measurement agrees across the width core -- its SUBJECT moves from
+    # `Theme::display_width` (now gone) to `tui::Layout::display_width` measured directly
+    # against each glyph's own declared width (which is itself Theme's declaration, so this
+    # is still a real cross-check, not a tautology against Theme's own table).
+    ok(!Theme->can('display_width'),
+        "Theme.pm no longer defines display_width -- deleted outright per driver ruling E-F, not repointed to tui::Layout (B-E7)");
+
+    my $LAYOUT_OK = eval { require tui::Layout; 1 };
+    ok($LAYOUT_OK, 'plugins/sandbox/scripts/tui/Layout.pm loads (precondition for the corrected B-E7 width-agreement cross-check)')
+        or diag("  require tui::Layout failed: $@");
+
     my $glyphs = Theme::glyphs();
   SKIP: {
-        skip('Dashboard.pm did not load', 1) unless $DASHBOARD_OK;
+        skip('tui::Layout.pm did not load', scalar(keys %$glyphs)) unless $LAYOUT_OK;
         for my $name (sort keys %$glyphs) {
             my $g = $glyphs->{$name};
-            is(Theme::display_width($g->{bytes}), Dashboard::display_width($g->{bytes}),
-                "glyph '$name': Theme::display_width delegates to Dashboard::display_width -- values agree (B-E7, AC-11)");
+            is(tui::Layout::display_width($g->{bytes}), $g->{width},
+                "glyph '$name': tui::Layout::display_width agrees with Theme's own declared width -- direct measurement, no Theme::display_width/Dashboard delegation involved (B-E7, AC-11; corrected for package 06)");
         }
+    }
+}
+
+{
+    # NEW (correction #5, driver ruling E-F): Theme.pm's source must name no `Dashboard`
+    # identifier anywhere -- not `require Dashboard`, not a qualified `Dashboard::` call, not
+    # a bare mention -- which is what makes the dependency graph a genuine DAG rather than the
+    # "inert 2-cycle" the driver flagged. (The Theme<->tui::Layout `use`-time cycle survives
+    # regardless of this assertion; what this closes is the last back-edge OUT of Theme that
+    # named Dashboard specifically.)
+    my $src = slurp($THEME_PM);
+  SKIP: {
+        skip('Theme.pm not present on disk', 1) unless defined $src;
+        unlike($src, qr/\bDashboard\b/,
+            "Theme.pm's source names no 'Dashboard' identifier anywhere -- the last Theme->Dashboard back-edge is gone, not merely repointed (B-E7 cycle-closure, driver ruling E-F)");
     }
 }
 

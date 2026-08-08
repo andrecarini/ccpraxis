@@ -157,6 +157,15 @@ my $SCHEMA_DOC_PATH = "$Bin/../../docs/token-schema-inventory.md";
 use_ok('TokenInfo');
 use_ok('Dashboard') or BAIL_OUT('Dashboard.pm did not load');
 
+# tui::DashboardScreen is a READ-ONLY dependency here (blueprint
+# unified-tui-design-system package 06-dashboard-screen): LABEL_GUTTER() is
+# this file's derivation source for the re-pointed oauth-row label
+# assertions below (spec 06-dashboard-screen-spec.md S2.4.1), so every
+# expected label string is DERIVED, never hand-padded.
+my $DASHBOARD_SCREEN_OK43 = eval { require tui::DashboardScreen; 1 };
+BAIL_OUT("tui::DashboardScreen.pm did not load ($@) -- LABEL_GUTTER() is this file's derivation source for the re-pointed oauth-row assertions; nothing below can mean anything without it")
+    unless $DASHBOARD_SCREEN_OK43;
+
 # ===========================================================================
 # TokenInfo::status -- pure, total. AC-2..AC-12.
 # ===========================================================================
@@ -514,7 +523,20 @@ ok(length($launcher_src) > 0, 'launcher.pl is readable on disk') or BAIL_OUT("ca
     # (Dashboard.pm is loadable, so prefer exercising it over grepping it).
     my $dash_src = slurp($DASHBOARD_PATH);
     like($dash_src, qr/\$state\{oauth_remaining\}\s*=/, 'AC-16: Dashboard.pm source still derives $state{oauth_remaining}');
-    like($dash_src, qr/'oauth     : '/, 'AC-16: Dashboard.pm source still has the "oauth     : " label literal');
+    # RE-POINTED (package 06-dashboard-screen, spec S2.4.1, driver report
+    # item 3): the hand-padded label literal 'oauth     : ' is GONE, in
+    # favour of the ONE shared gutter (tui::DashboardScreen::LABEL_GUTTER()
+    # == 11) -- every row's label is now built by calling a gutter helper
+    # with the bare label name, never spelled out as a pre-padded string.
+    # Scanning for a hard-coded padding width would just re-pin the stale
+    # mechanism this package deliberately deleted. What survives: the
+    # source still builds an oauth row from the bare label 'oauth' --
+    # scanned generically (not coupled to the helper's own variable name)
+    # -- and the label TEXT that construct produces is re-derived through
+    # LABEL_GUTTER() itself for the stronger behavioral check just below,
+    # never hand-padded.
+    like($dash_src, qr/\(\s*'oauth'\s*\)/,
+        'AC-16: Dashboard.pm source still builds an oauth row from the bare label \'oauth\' (padding now comes from the shared LABEL_GUTTER(), not a hand-padded literal)');
 
     my %base = (
         project_name => 'demo', container => 'c1', status => 'running',
@@ -525,19 +547,39 @@ ok(length($launcher_src) > 0, 'launcher.pl is readable on disk') or BAIL_OUT("ca
         [ 'no tokens key',     {} ],
         [ 'tokens key present', { tokens => { logged_in => 0 } } ],
     );
+    # RE-POINTED (package 06-dashboard-screen, spec S2.4.3, driver report
+    # item 3). The Sandbox panel is deleted, so "Sandbox panel present" /
+    # "Sandbox oauth row unaffected by tokens" have no surviving subject as
+    # written. The real claim underneath was never "the oauth row always
+    # renders identically regardless of tokens" -- per S2.4.3's own
+    # conditional it is the OPPOSITE: the oauth fact lives in Run when
+    # $state->{tokens} is absent, and in the Token panel's 'access' row
+    # when it is a HASH -- EXACTLY ONCE, never both, never neither. Both
+    # arms are asserted below (an untested arm is where this breaks).
+    my $oauth_label43 = sprintf('%-*s : ', tui::DashboardScreen::LABEL_GUTTER(), 'oauth');
     for my $variant (@variants) {
         my ($label, $extra) = @$variant;
         my %s = (%base, %$extra);
         my @panels = Dashboard::_fixed_panels(\%s, 80);
-        my ($sandbox) = grep { $_->{title} eq 'Sandbox' } @panels;
-        ok($sandbox, "AC-16: Sandbox panel present ($label)");
-        if ($sandbox) {
-            is_deeply($sandbox->{lines}[4],
-                [ { text => 'oauth     : ', role => 'label' },
+        my ($run)   = grep { $_->{title} eq 'Run' } @panels;
+        my ($token) = grep { $_->{title} eq 'Token' } @panels;
+        my ($run_oauth_row) = $run ? (grep { $_->[0]{text} eq $oauth_label43 } @{ $run->{lines} }) : ();
+
+        if (!exists $extra->{tokens}) {
+            # arm 1: tokens absent -> oauth lives in Run (moved off the
+            # deleted Sandbox panel), byte-identical to the old row.
+            ok(!$token, "AC-16 (re-pointed): no Token panel when tokens is absent ($label)");
+            ok($run_oauth_row, "AC-16 (re-pointed): an oauth row exists in Run when tokens is absent ($label)");
+            is_deeply($run_oauth_row,
+                [ { text => $oauth_label43, role => 'label' },
                   { text => Dashboard::fmt_oauth(11520), role => Dashboard::oauth_role(11520) } ],
-                "AC-16: Sandbox oauth row renders exactly as before, unaffected by tokens ($label)");
+                "AC-16 (re-pointed): the Run oauth row renders exactly as the deleted Sandbox oauth row did ($label)")
+                if $run_oauth_row;
         } else {
-            fail("AC-16: Sandbox oauth row unaffected by tokens ($label) -- no Sandbox panel found");
+            # arm 2: tokens present -> the SAME fact moves to Token's
+            # 'access' row instead; Run must carry no oauth row at all.
+            ok($token, "AC-16 (re-pointed): a Token panel exists when tokens is present ($label)");
+            ok(!$run_oauth_row, "AC-16 (re-pointed): Run carries no oauth row when tokens is present ($label)");
         }
     }
 }
@@ -567,8 +609,10 @@ ok(length($launcher_src) > 0, 'launcher.pl is readable on disk') or BAIL_OUT("ca
     my @p_no_tokens = Dashboard::build_panels(\%base, 80);
     my @titles_no_tokens = map { $_->{title} } @p_no_tokens;
     ok(!(grep { $_ eq 'Token' } @titles_no_tokens), 'AC-18: build_panels with no tokens key -> no Token panel (B16)');
-    is_deeply(\@titles_no_tokens, [ 'Sandbox', 'Run', 'Recent activity' ],
-        'AC-18: the panel list is otherwise unchanged for a state without tokens (B16)');
+    # RE-POINTED (spec S2.4.3): the Sandbox panel is deleted, so the panel
+    # list without tokens is now ['Run', 'Recent activity'] -- Run leads.
+    is_deeply(\@titles_no_tokens, [ 'Run', 'Recent activity' ],
+        'AC-18: the panel list is otherwise unchanged for a state without tokens (B16) -- re-pointed: Sandbox is deleted, Run leads');
 
     my %with_tokens = (%base, tokens => {
         logged_in => 1, access_present => 1, access_state => 'valid',
@@ -590,10 +634,26 @@ ok(length($launcher_src) > 0, 'launcher.pl is readable on disk') or BAIL_OUT("ca
         items => [ { key => 'apt:jq', approved => 1 } ] });
     my @p_both = Dashboard::build_panels(\%with_bp_and_tokens, 80);
     my @titles_both = map { $_->{title} } @p_both;
-    my ($bi)  = grep { $titles_both[$_] eq 'Backpack' } 0 .. $#titles_both;
-    my ($ti2) = grep { $titles_both[$_] eq 'Token' } 0 .. $#titles_both;
-    ok(defined($bi) && defined($ti2) && $bi < $ti2,
-        'AC-18: Token panel is ordered after Backpack when both are present (B17, pinned order)');
+    # RE-POINTED (spec S2.4.3/S2.4.8, Decision 9, driver report item 3):
+    # the Backpack panel is deleted -- backpack data now renders as a
+    # summary ROW inside Run, never a titled panel of its own, so "ordered
+    # after Backpack" has no surviving panel-title subject. What survives:
+    # with backpack data present, no NEW panel appears and Token's
+    # position relative to Run/Recent-activity is unaffected; the backpack
+    # fact still reaches the frame (as a Run row -- the counter-fixture
+    # proving this isn't vacuously true because backpack rendering
+    # vanished entirely).
+    ok(!(grep { $_ eq 'Backpack' } @titles_both),
+        'AC-18 (re-pointed): no Backpack panel exists even with backpack data present (Decision 9)');
+    my ($run_i)   = grep { $titles_both[$_] eq 'Run' } 0 .. $#titles_both;
+    my ($token_i) = grep { $titles_both[$_] eq 'Token' } 0 .. $#titles_both;
+    my ($act_i)   = grep { $titles_both[$_] eq 'Recent activity' } 0 .. $#titles_both;
+    ok(defined($run_i) && defined($token_i) && defined($act_i) && $run_i < $token_i && $token_i < $act_i,
+        'AC-18 (re-pointed): Token panel still sits between Run and Recent activity when backpack data is also present (position unaffected)');
+    my ($run_both) = grep { $_->{title} eq 'Run' } @p_both;
+    my $bp_label43 = sprintf('%-*s : ', tui::DashboardScreen::LABEL_GUTTER(), 'backpack');
+    ok(($run_both && grep { $_->[0]{text} eq $bp_label43 } @{ $run_both->{lines} }),
+        'AC-18 (re-pointed) counter-fixture: the backpack fact DOES reach the frame in this fixture -- as a row inside Run, not as the deleted panel');
 }
 
 # --- AC-19 -> DC-3 (B18/B19): the state -> line table, verbatim. ----------

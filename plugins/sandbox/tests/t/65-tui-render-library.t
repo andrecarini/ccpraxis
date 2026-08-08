@@ -445,15 +445,36 @@ for my $mod (qw(tui::Frame tui::Meter tui::Screen)) {
 }
 
 # ===========================================================================
-# AC-D1 — Dashboard.pm is untouched: no tui:: reference anywhere in it.
+# AC-D1 CORRECTED for package 06 (in-scope oracle correction; driver
+# escalation E-C, packages/06-dashboard-screen.md 2026-08-07T20:40:59Z): the
+# original claim here was "Dashboard.pm contains no tui:: reference" --
+# correct for package 05, which deliberately extracted-and-added without
+# rewriting Dashboard.pm (spec §1.3). Package 06's entire mandate is the
+# opposite: make Dashboard.pm CONSUME tui::, so that claim is now the exact
+# negation of what 06 must do. The REAL invariant this file exists to
+# police is the DEPENDENCY DIRECTION, not which side names the other: a
+# tui:: library module may never name Dashboard -- that would invert the
+# DAG by making the library depend on the 3,490-line legacy module it
+# exists to replace. That is 06 spec's AC-P4, unaffected by anything 06
+# does to Dashboard.pm, so it is what stays pinned here; the obsolete
+# reverse-direction claim is dropped rather than kept alongside a
+# contradiction (06 spec §1.3 also confirms t/65's scans enumerate the
+# library's four modules BY NAME, so this scan does not reach the fifth
+# file, tui/DashboardScreen.pm -- that one is t/66's AC-P4).
 # ===========================================================================
-{
-    my $src = slurp($DASHBOARD_PM);
-    ok(defined($src), 'AC-D1: precondition -- Dashboard.pm is readable as text');
+for my $mod (@TUI_MODULES) {
+    my $path = $MODULE_FILE{$mod};
+    my $src  = slurp($path);
+    ok(defined($src), "AC-D1 (corrected for 06): precondition -- $path is readable as text");
   SKIP: {
-        skip('Dashboard.pm unreadable', 2) unless defined $src;
-        unlike($src, qr/\btui::/, 'AC-D1: Dashboard.pm contains no tui:: reference (extract-and-add, not a rewrite)');
-        unlike($src, qr/\buse\s+tui\b/, 'AC-D1: Dashboard.pm contains no "use tui"');
+        skip("$path unreadable", 1) unless defined $src;
+        # Comment-stripped first (blank comments before any source scan -- prose
+        # is allowed to discuss Dashboard, e.g. this very file's own header and
+        # tui::Layout.pm's "never Dashboard" design-intent comment; only CODE
+        # references would invert the DAG).
+        my $scanned = _comment_stripped($src);
+        unlike($scanned, qr/\bDashboard\b/,
+            "AC-D1 (corrected for 06): $mod names no 'Dashboard' identifier in code -- the tui:: library must never depend on the module it exists to replace (dependency-direction invariant; was package 05's AC-D1, re-scoped for 06's E-C)");
     }
 }
 

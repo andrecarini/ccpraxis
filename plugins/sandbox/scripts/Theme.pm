@@ -5,7 +5,7 @@ use Encode ();   # core; used only for UTF-8 encoding of declared glyphs
 
 # =============================================================================
 # Theme.pm -- the single source of colour and glyph truth for every ccpraxis
-# terminal surface (statusline, Dashboard, beacon, launcher). A call site
+# terminal surface (statusline, the sandbox dashboard, beacon, launcher). A call site
 # never sees a hex literal or a raw SGR escape: it names a semantic ROLE
 # (Theme::sgr / Theme::paint) or a GLYPH NAME (Theme::glyph / glyph_width)
 # and gets back an escape string or UTF-8 bytes for the terminal's detected
@@ -52,8 +52,9 @@ use Encode ();   # core; used only for UTF-8 encoding of declared glyphs
 # (mirrored, deliberately, in the test oracle) and none of them fall in an
 # emoji range. Richer non-ASCII glyphs (box-drawing, geometric shapes,
 # braille) are used freely -- only emoji are excluded. Surfaces that still
-# carry emoji today (scripts/statusline.pl, Dashboard.pm, bp-statusline.pl)
-# are a recorded, tracked debt for the packages that own those files; this
+# carry emoji today (scripts/statusline.pl, the sandbox dashboard module,
+# bp-statusline.pl) are a recorded, tracked debt for the packages that own
+# those files; this
 # module's own glyph table is clean on arrival.
 #
 # -----------------------------------------------------------------------
@@ -78,7 +79,7 @@ use Encode ();   # core; used only for UTF-8 encoding of declared glyphs
 #   * Core modules only -- no CPAN.
 #   * No "use utf8" -- every glyph below is declared with a "\x{...}" escape,
 #     which yields a decoded character in a non-utf8 source file. This is
-#     the same convention Dashboard.pm's own glyph table uses.
+#     the same convention the sandbox dashboard module's own glyph table uses.
 #   * No top-level side effects: loading this file performs no I/O, opens no
 #     file, spawns nothing, reads no environment variable, and emits nothing
 #     to the terminal. The capability lookup below is the ONLY place the
@@ -106,8 +107,8 @@ use Encode ();   # core; used only for UTF-8 encoding of declared glyphs
 # Theme::paint($role, $text) scrubs $text through _scrub() (below, near
 # paint()'s definition) before emitting it, in BOTH the known-role and the
 # unknown-role-passthrough arms. This mirrors, at the token layer, the
-# INV-3 guarantee Dashboard.pm's _safe/_safe_char family already
-# established for fit_spans/clip_pad -- see Dashboard.pm:279-299, and
+# INV-3 guarantee the sandbox dashboard module's _safe/_safe_char family
+# already established for fit_spans/clip_pad, and
 # redteam-01.md MAJOR-2, which is the finding that closed this exact class
 # of bug ONE layer down. paint() is the primitive packages 05/09/10 adopt
 # wholesale for untrusted-ish strings (container names, git branches,
@@ -123,12 +124,13 @@ use Encode ();   # core; used only for UTF-8 encoding of declared glyphs
 # who hand-composes sgr($role) . $text . reset() instead of calling
 # paint() gets NONE of this protection -- _scrub() only runs inside
 # paint().
-#   * Theme::display_width() is the one deliberate exception to "Theme
-#     reimplements nothing": it is a THIN, LAZY delegation to
-#     Dashboard::display_width -- lazy ("require Dashboard;" inside the
-#     function body, not a top-level "use Dashboard") because package 06
-#     later rewrites Dashboard.pm to consume Theme, and a compile-time "use"
-#     in both directions would be a load cycle.
+#   * Theme::display_width() PREVIOUSLY existed here as a thin, lazy
+#     delegation into the legacy sandbox dashboard's own width core. Package
+#     06 (unified-tui-design-system) deleted it outright rather than
+#     repointing it at tui::Layout: tui::Layout itself loads Theme at compile
+#     time, so a repoint would only have traded one 2-cycle for another
+#     (driver ruling E-F). display_width now lives at exactly one place,
+#     tui::Layout::display_width -- callers here use that directly.
 # =============================================================================
 
 # ---------------------------------------------------------------------------
@@ -158,7 +160,7 @@ my $ROLES_DATA;   # memoized canonical table; never populated at load time
 # "accent hues at a common perceptual lightness so they read as one
 # family"). The "ok" role's meaning is deliberately narrow: a healthy
 # state, NEVER "a value is present" -- that distinction is the fix for the
-# collision the scout measured between Dashboard's ad-hoc "good" role and
+# collision the scout measured between the sandbox dashboard's ad-hoc "good" role and
 # statusline's green (which meant both "usage is low" and "a git-ahead
 # count is nonzero"). "A value is present" belongs to text.primary. This
 # module can only STATE that rule (there are no call sites yet); enforcing
@@ -274,16 +276,18 @@ sub accent_lightness_band {
 # system may use, each with a DECLARED (not computed) display width. Theme
 # contains NO width logic of its own: it never inspects codepoint ranges,
 # never consults combining-mark properties, never implements a wcwidth.
-# display_width() below is a thin, lazy delegation to the one width
-# implementation that already exists (Dashboard::display_width).
+# Width MEASUREMENT lives at tui::Layout::display_width, which sources this
+# very table (via glyphs() below) for its own width lookups (package 06,
+# unified-tui-design-system) -- Theme declares identity and width; it never
+# measures.
 #
 # Built lazily and memoized by _glyphs_data() below (see the MODULE SHAPE
 # note near the top of this file). The first nineteen entries are the
 # spec's required minimum set. The ten "spinner.N" entries exist ONLY so
-# this table is a superset of Dashboard::glyph_table()'s non-emoji entries
-# at the same declared widths (spec §2.5's completeness rule) -- Dashboard's
-# own glyph table carries ten braille spinner frames this table must also
-# name.
+# this table is a superset of the sandbox dashboard's own glyph table's
+# non-emoji entries at the same declared widths (spec §2.5's completeness
+# rule) -- the dashboard's own glyph table carries ten braille spinner
+# frames this table must also name.
 #
 # NO EMOJI: every codepoint below was checked against the emoji-range test
 # in t/64-theme-tokens.t's own detector (mirroring spec §2.6.1) and none
@@ -317,8 +321,8 @@ sub _glyphs_data {
         'status.crit' => { cp => 0x00D7, desc => 'multiplication sign -- critical state, replaces an emoji circle' },
         'status.idle' => { cp => 0x25CB, desc => 'white circle -- idle/absent state, replaces an emoji circle' },
         # Braille spinner frames -- present so this table is a superset of
-        # Dashboard::glyph_table()'s non-emoji entries (spec §2.5
-        # completeness rule). All width 1, matching Dashboard's own
+        # the sandbox dashboard's glyph_table()'s non-emoji entries (spec
+        # §2.5 completeness rule). All width 1, matching the dashboard's own
         # declaration.
         'spinner.1'  => { cp => 0x280B, desc => 'braille spinner, frame 1 of 10' },
         'spinner.2'  => { cp => 0x2819, desc => 'braille spinner, frame 2 of 10' },
@@ -386,15 +390,16 @@ sub glyph_width {
     return $rec->{width};
 }
 
-# display_width($str) -- thin, LAZY delegation. The lazy require (rather
-# than a top-level "use Dashboard") is load-bearing: package 06 rewrites
-# Dashboard.pm to consume Theme, and a compile-time "use" in both
-# directions would be a load cycle (spec §2.0 rule 4).
-sub display_width {
-    my ($str) = @_;
-    require Dashboard;
-    return Dashboard::display_width($str);
-}
+# display_width($str) DELETED (package 06, unified-tui-design-system, driver
+# ruling E-F). It previously existed as a thin, lazy delegation into the
+# legacy sandbox dashboard's own width core -- but tui::Layout (the module
+# that took over that width core) itself loads Theme at compile time, so
+# merely repointing this function at tui::Layout would only have traded one
+# 2-cycle (Theme<->the sandbox dashboard) for another (Theme<->tui::Layout),
+# not produced a DAG. Deleting it outright removes the last back-edge out of
+# Theme; width measurement now lives at exactly one place,
+# tui::Layout::display_width, and every caller (including the legacy
+# dashboard module) calls that directly.
 
 # =============================================================================
 # COLOUR MATHS (spec §2.4) -- WCAG 2.1 relative luminance / contrast ratio,
@@ -532,8 +537,8 @@ sub reset {
 # "ESC '['" step 1 already strips (so "before" . chr(0x9B) . "2Jafter" is
 # still a screen-clear on such a terminal); U+009D/U+009C/U+0090/U+0085 are
 # likewise OSC/ST/DCS/NEL. This is the C1 half of the exact leak
-# Dashboard.pm's _safe/_safe_char family already closed one layer down
-# (Dashboard.pm:279-299's own comment names it "the live-C1/control-byte
+# the sandbox dashboard module's _safe/_safe_char family already closed one
+# layer down (that module's own comment names it "the live-C1/control-byte
 # leak", redteam-01.md MAJOR-2, INV-3) -- paint() reopening it here would be
 # the same bug one layer up (redteam.md H1).
 #
@@ -563,11 +568,11 @@ sub reset {
 #     character-level policy directly (_scrub_chars) -- no conversion
 #     needed. This is the case the round-2 character-mode C1 sweep proves
 #     and remains untouched.
-#   - A raw byte string that IS valid UTF-8: this is Dashboard.pm's
-#     calling convention (Encode::encode('UTF-8', $out) at Dashboard.pm:313,
-#     encoded spans pushed at :446/:461 -- package 06 wiring Dashboard to
-#     Theme is exactly where this fires). Decode it, apply the SAME
-#     character-level policy, then re-encode -- this is the fix.
+#   - A raw byte string that IS valid UTF-8: this is the sandbox dashboard
+#     module's calling convention (Encode::encode('UTF-8', $out) on its own
+#     span text) -- package 06 wiring that module to Theme is exactly where
+#     this fires). Decode it, apply the SAME character-level policy, then
+#     re-encode -- this is the fix.
 #   - A raw byte string that is NOT valid UTF-8 (not decodable text at all
 #     -- e.g. a lone C1 byte with no multi-byte context, which is what the
 #     byte-mode C1 sweep corpus exercises): fall back to the byte-ordinal

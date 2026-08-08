@@ -19,8 +19,64 @@ use lib "$Bin/../../scripts";
 use Test::More;
 use File::Temp qw(tempdir);
 use File::Path qw(make_path);
+use Time::Local qw(timegm);
 
 use_ok('Dashboard') or BAIL_OUT('Dashboard.pm did not load');
+
+# ===========================================================================
+# BREAKPOINT MIGRATED 100 -> 90 (package 06-dashboard-screen, in-scope oracle
+# correction #4; Decision 14 is an operator decision dated 2026-08-06 and
+# WINS over the prior 100; driver ruling packages/06-dashboard-screen.md
+# 2026-08-07T17:56:38Z / 2026-08-07T20:40:59Z, spec §7 E-D). $BP is declared
+# ONCE (spec AC-B4) and reused by every migrated assertion below so the
+# breakpoint itself is never re-typed as a bare literal here. Claims at
+# :149/:153/:765 are preserved verbatim; only the column SUBJECT moves.
+# ===========================================================================
+require tui::Layout;
+my $BP = tui::Layout::BREAKPOINT_TWO_COL();
+
+# ===========================================================================
+# ROLE VOCABULARY + RULE-FILL GLYPH RE-POINTED (package 06 in-scope oracle
+# correction, driver ruling 2026-08-08, Family 2): compose_frame now
+# composes through tui::DashboardScreen, which emits ONLY Theme role names
+# on every cell/span it produces (spec S2.1), and title/panel rules are now
+# filled with Theme's declared 'rule.h' glyph instead of a literal ASCII
+# '-' repeat (spec S2.1: "every glyph tui::DashboardScreen emits comes from
+# Theme::glyph(...)"). Every legacy bare-role assertion below ('title',
+# 'footer', 'alert', 'footer-alert', 'footer-flash') is asserted against
+# these DERIVED role names -- never hand-typed -- so they cannot drift from
+# the authoritative legacy->Theme mapping table (spec S2.1). The claim each
+# assertion makes ("row 0 is the title", "an alert row carries the alert
+# role", ...) is unchanged; only the role-name vocabulary is.
+# ===========================================================================
+require Theme;
+require tui::DashboardScreen;
+my $TITLE_ROLE        = tui::DashboardScreen::theme_role('title');
+my $FOOTER_ROLE       = tui::DashboardScreen::theme_role('footer');
+my $ALERT_ROLE        = tui::DashboardScreen::theme_role('alert');
+my $FOOTER_ALERT_ROLE = tui::DashboardScreen::theme_role('footer-alert');
+my $FOOTER_FLASH_ROLE = tui::DashboardScreen::theme_role('footer-flash');
+my $RULE_FILL_RE      = quotemeta(Theme::glyph('rule.h'));
+
+# ===========================================================================
+# activity_capacity DERIVATION HELPER (package 06, spec S5 ":756-774", Family
+# 3), shared by PART 9 and PART 11/C1a-C1b below. Claim preserved verbatim --
+# "capacity mirrors compose_frame's budget" -- but every literal number that
+# used to sit next to a call site assumed the (now-deleted) Sandbox panel's
+# fixed-region height AND the old 100-column breakpoint; BOTH moved the
+# fixed region's size, so no literal survives unmigrated. Per spec S5's own
+# worked formula:
+#   capacity == max(0, rows - 2(title+footer) - _fixed_region_height(state,cols) - 1)
+# A live status alert is asserted as a DIFFERENTIAL against the non-alert
+# derivation at each call site (preserving this file's own comment, "a
+# status alert costs one more row", as a relative claim) rather than folded
+# into this formula as a guessed absolute term.
+# ===========================================================================
+sub _cap_expect {
+    my ($state, $r, $c) = @_;
+    my $raw = $r - 2 - Dashboard::_fixed_region_height($state, $c) - 1;
+    return $raw > 0 ? $raw : 0;
+}
 
 # ===========================================================================
 # PART 1 — pure helpers
@@ -117,17 +173,31 @@ my %st = (
     is(Dashboard::display_width($f->[0]{text}), 80, 'compose: every row exactly $cols wide (row 0)');
     my $bad = grep { Dashboard::display_width($_->{text}) != 80 } @$f;
     is($bad, 0, 'compose: ALL rows exactly $cols wide');
-    is($f->[0]{role}, 'title', 'compose: row 0 is the title');
+    is($f->[0]{role}, $TITLE_ROLE, "compose: row 0 is the title (role: $TITLE_ROLE, Theme-derived, spec S2.1)");
     like($f->[0]{text}, qr/ccpraxis sandbox/, 'compose: title text present');
     like($f->[0]{text}, qr/\Qclaude-demo-abcd1234\E.*\[running\]/, 'compose: container+status right-justified');
-    is($f->[-1]{role}, 'footer', 'compose: last row is the footer');
+    is($f->[-1]{role}, $FOOTER_ROLE, "compose: last row is the footer (role: $FOOTER_ROLE, Theme-derived, spec S2.1)");
     like($f->[-1]{text}, qr/\[q\] quit/, 'compose: footer legend present');
     my $joined = join "\n", map { $_->{text} } @$f;
-    like($joined, qr/-- Sandbox /,        'compose: Sandbox panel title rendered');
-    like($joined, qr/container : claude-demo/, 'compose: Sandbox panel body rendered');
+    # RE-POINTED (spec S5 ":126"): the Sandbox panel is deleted (spec
+    # S2.4.3); claim "a panel title renders" moves subject to "-- Run ".
+    like($joined, qr/-- Run /,        'compose: Run panel title rendered (subject moved from the deleted Sandbox panel)');
+    # RE-POINTED (spec S5 ":127"): the Sandbox panel's own "container : ..."
+    # body row is gone -- the container fact now lives ONLY in the header,
+    # already asserted two lines above. This becomes Criterion 2/AC-D1's
+    # exactly-once count instead of a second (now-impossible) body-row check.
+    my $container_count = () = ($joined =~ /\Qclaude-demo-abcd1234\E/g);
+    is($container_count, 1,
+        'compose: the container name appears exactly once in the frame (moved from the deleted Sandbox panel body -- Criterion 2/AC-D1)');
     like($joined, qr/-- Recent activity /, 'compose: Activity panel rendered');
     like($joined, qr/\Qlaunch_start\E/,   'compose: B1 event surfaced in Activity');
-    like($joined, qr/uptime    : 1h 1m 0s/, 'compose: uptime rendered as Xh Ym Zs');
+    # RE-POINTED (spec S5 ":130", S2.4.7/Criterion 4): the one duration
+    # format is fmt_duration/fmt_age, never fmt_hms's "Xh Ym Zs" -- re-derive
+    # the expected text by CALLING fmt_age(3660), never re-pin "1h 1m 0s" or
+    # its replacement "1h01m" as a literal.
+    my $expected_uptime = Dashboard::fmt_age(3660);
+    like($joined, qr/uptime\s*:\s*\Q$expected_uptime\E/,
+        "compose: uptime renders via the one duration format (fmt_age(3660) == $expected_uptime, never fmt_hms)");
 
     # PART 2 additions (s04-render-foundation, AC-8/INV-1): every cell carries
     # a non-empty spans arrayref whose declared width and concatenated text
@@ -144,30 +214,45 @@ my %st = (
 
 # s05-responsive-layout (AC-7 smoke): the two-column mode boundary is visible
 # right here in the file that owns frame composition -- full unit coverage of
-# the composer lives in t/40-layout-responsive.t.
+# the composer lives in t/40-layout-responsive.t. BREAKPOINT MIGRATED (see
+# file-header note): claims preserved verbatim; 100/99 -> $BP+10/$BP-1 (spec
+# S5 ":149-151/:153-159" -- the "at/above" subject is explicitly $BP+10, not
+# bare $BP, in the spec's own migration table for this exact region).
+#
+# SUBJECT ALSO RE-POINTED (Family 1, driver ruling 2026-08-08): the Sandbox
+# panel is deleted (spec S2.4.3), so the pair that can now share the lead
+# row is Run and Token, not Sandbox and Run ("Two-column assertions that
+# named Sandbox|Run as the pair now name Run and Token"). The fixture gains
+# a `tokens` hashref so the Token panel actually renders (spec S2.4.3:
+# present when `ref $state->{tokens} eq 'HASH'`) -- otherwise there is no
+# second lead panel to pair with. The dash-fill regex is rewritten against
+# the DERIVED $RULE_FILL_RE (Theme's rule.h glyph), not a literal '-', per
+# the file-header role/glyph note.
 {
-    my $f100 = Dashboard::compose_frame(\%st, 24, 100);
-    my $both = grep { $_->{text} =~ /-- Sandbox / && $_->{text} =~ /-- Run / } @$f100;
-    is($both, 1, 'compose (s05): 24x100 -- exactly one row carries BOTH panel titles (two-column mode)');
+    my %st_pair = (%st, tokens => {});
+    my $fat = Dashboard::compose_frame(\%st_pair, 24, $BP + 10);
+    my $both = grep { $_->{text} =~ /-- Run / && $_->{text} =~ /-- Token / } @$fat;
+    is($both, 1, "compose (s05): 24x@{[ $BP + 10 ]} -- exactly one row carries BOTH panel titles (two-column mode)");
 
-    my $f99 = Dashboard::compose_frame(\%st, 24, 99);
-    my $both99 = grep { $_->{text} =~ /-- Sandbox / && $_->{text} =~ /-- Run / } @$f99;
-    is($both99, 0, 'compose (s05): 24x99 -- no row carries both panel titles (still stacked)');
-    my ($sb99) = grep { $_->{text} =~ /^-- Sandbox -+$/ } @$f99;
-    ok($sb99, 'compose (s05): 24x99 -- a row matches /^-- Sandbox -+$/ (dash-filled full width)');
-    is(Dashboard::display_width($sb99->{text}), 99, 'compose (s05): that row is exactly 99 display columns')
-        if $sb99;
+    my $below = $BP - 1;
+    my $fbelow = Dashboard::compose_frame(\%st_pair, 24, $below);
+    my $both_below = grep { $_->{text} =~ /-- Run / && $_->{text} =~ /-- Token / } @$fbelow;
+    is($both_below, 0, "compose (s05): 24x$below -- no row carries both panel titles (still stacked)");
+    my ($run_below) = grep { $_->{text} =~ /^-- Run (?:$RULE_FILL_RE)+$/ } @$fbelow;
+    ok($run_below, "compose (s05): 24x$below -- a row matches /^-- Run <rule.h fill>\$/ (dash-filled full width)");
+    is(Dashboard::display_width($run_below->{text}), $below, "compose (s05): that row is exactly $below display columns")
+        if $run_below;
 }
 
 # tiny-terminal degradation
 {
     my $f1 = Dashboard::compose_frame(\%st, 1, 40);
     is(scalar(@$f1), 1, 'compose: 1 row -> title only');
-    is($f1->[0]{role}, 'title', 'compose: 1-row frame is the title');
+    is($f1->[0]{role}, $TITLE_ROLE, "compose: 1-row frame is the title (role: $TITLE_ROLE)");
 
     my $f2 = Dashboard::compose_frame(\%st, 2, 40);
     is(scalar(@$f2), 2, 'compose: 2 rows -> title + footer');
-    is($f2->[1]{role}, 'footer', 'compose: 2-row frame ends in footer');
+    is($f2->[1]{role}, $FOOTER_ROLE, "compose: 2-row frame ends in footer (role: $FOOTER_ROLE)");
 
     my $f0 = Dashboard::compose_frame(\%st, 0, 40);
     is(scalar(@$f0), 0, 'compose: 0 rows -> empty');
@@ -181,7 +266,7 @@ my %st = (
 {
     my %sc = (%st, pending => 'stop-runs');
     my $f = Dashboard::compose_frame(\%sc, 10, 80);
-    is($f->[-1]{role}, 'footer-alert', 'compose: pending stop-runs -> footer-alert role');
+    is($f->[-1]{role}, $FOOTER_ALERT_ROLE, "compose: pending stop-runs -> footer-alert role (role: $FOOTER_ALERT_ROLE)");
     like($f->[-1]{text}, qr/butler runs/i, 'compose: confirm prompt shown in footer (new stop-runs contract)');
     like($f->[-1]{text}, qr/\[y\] confirm/, 'compose: confirm prompt names [y] confirm');
 }
@@ -191,20 +276,20 @@ my %st = (
 {
     my %sw = (%st, install_warning => 'backpack install FAILED - run /backpack:install');
     my $f = Dashboard::compose_frame(\%sw, 10, 80);
-    my @alert = grep { $_->{role} eq 'alert' } @$f;
-    is(scalar(@alert), 1, 'compose: install_warning -> exactly one alert row');
-    is($f->[1]{role}, 'alert', 'compose: alert sits directly under the title');
+    my @alert = grep { $_->{role} eq $ALERT_ROLE } @$f;
+    is(scalar(@alert), 1, "compose: install_warning -> exactly one alert row (role: $ALERT_ROLE)");
+    is($f->[1]{role}, $ALERT_ROLE, "compose: alert sits directly under the title (role: $ALERT_ROLE)");
     like($f->[1]{text}, qr/backpack install FAILED/, 'compose: alert shows the warning text');
     is(scalar(@$f), 10, 'compose: alert keeps the frame exactly $rows');
     my $bad = grep { Dashboard::display_width($_->{text}) != 80 } @$f;
     is($bad, 0, 'compose: alert row keeps every row exactly $cols');
-    is($f->[-1]{role}, 'footer', 'compose: footer still last with an alert present');
+    is($f->[-1]{role}, $FOOTER_ROLE, "compose: footer still last with an alert present (role: $FOOTER_ROLE)");
 
     my $f2 = Dashboard::compose_frame(\%st, 10, 80);   # %st has no warning
-    is(scalar(grep { $_->{role} eq 'alert' } @$f2), 0, 'compose: no warning -> no alert row');
+    is(scalar(grep { $_->{role} eq $ALERT_ROLE } @$f2), 0, 'compose: no warning -> no alert row');
 
     my $f3 = Dashboard::compose_frame(\%sw, 3, 80);
-    is(scalar(grep { $_->{role} eq 'alert' } @$f3), 0, 'compose: rows<4 suppresses the alert (no crash)');
+    is(scalar(grep { $_->{role} eq $ALERT_ROLE } @$f3), 0, 'compose: rows<4 suppresses the alert (no crash)');
 
     like(Dashboard::sgr_for_role('alert'), qr/\e\[1;37;41m/, 'sgr: alert role -> bold white on red');
 }
@@ -242,15 +327,15 @@ my %st = (
 
     my %dead = (%st, status => 'exited');
     my $f = Dashboard::compose_frame(\%dead, 12, 80);
-    my @a = grep { $_->{role} eq 'alert' } @$f;
-    is(scalar(@a), 1, 'compose: non-running status -> one alert row');
+    my @a = grep { $_->{role} eq $ALERT_ROLE } @$f;
+    is(scalar(@a), 1, "compose: non-running status -> one alert row (role: $ALERT_ROLE)");
     like($f->[1]{text}, qr/not running/, 'compose: status alert sits under the title');
     is(scalar(@$f), 12, 'compose: status alert keeps the frame exactly $rows');
 
     # a status alert AND an install_warning coexist as two banners, body intact
     my %both = (%st, status => 'exited', install_warning => 'backpack install FAILED');
     my $f2 = Dashboard::compose_frame(\%both, 12, 80);
-    is(scalar(grep { $_->{role} eq 'alert' } @$f2), 2, 'compose: status + install alerts coexist');
+    is(scalar(grep { $_->{role} eq $ALERT_ROLE } @$f2), 2, 'compose: status + install alerts coexist');
     is(scalar(@$f2), 12, 'compose: two alerts keep the frame exactly $rows');
     # s06-panel-semantics: the container-status line now carries a status
     # glyph, a multi-byte UTF-8 sequence but exactly 2 DISPLAY columns -- the
@@ -277,7 +362,7 @@ my %st = (
     # not the command legend; absent a flash the legend returns.
     my %fl = (%st, footer_flash => Dashboard::launch_blocked_msg());
     my $ff = Dashboard::compose_frame(\%fl, 12, 80);
-    is($ff->[-1]{role}, 'footer-flash', 'compose: active flash -> footer row uses footer-flash role');
+    is($ff->[-1]{role}, $FOOTER_FLASH_ROLE, "compose: active flash -> footer row uses footer-flash role (role: $FOOTER_FLASH_ROLE)");
     like($ff->[-1]{text}, qr/container is down/, 'compose: flash text occupies the footer');
     unlike($ff->[-1]{text}, qr/\[s\] stop/, 'compose: flash replaces the command legend (s11: new [s] stop-runs legend)');
     is(length($ff->[-1]{text}), 80, 'compose: flash footer kept exactly $cols');
@@ -348,22 +433,62 @@ my %st = (
     my @no = grep { $_->{title} eq 'Backpack' } Dashboard::build_panels({ %st });
     ok(!@no, 'backpack: no panel without a gathered structure');
 
-    # s06-panel-semantics: Backpack is now a wrapped running paragraph of
-    # space-separated item keys, no per-item bracket-marker rows and no
-    # "(+)"/"(-) " legend suffixes on the header (spec S3 items 10-11; the
-    # exact wrap/cap arithmetic is t/41-panel-semantics.t AC11-14's job).
+    # RE-POINTED (package 06-dashboard-screen, spec S2.4.3/S2.4.8, Decision
+    # 9, driver report item 2). The Backpack panel is deleted entirely; the
+    # backpack fact now reaches the frame as a single summary ROW inside
+    # Run (tui::DashboardScreen::backpack_summary_spans, the same helper
+    # Dashboard::_fixed_panels's render path uses). The original assertions
+    # here found a titled 'Backpack' panel and asserted its joined text
+    # contained the literal item keys 'apt:jq'/'apt:chromium' -- exactly
+    # what done-criterion 6 now forbids ("Backpack renders as a summary
+    # line only; no item listing appears on the dashboard"). The surviving
+    # claim ("the backpack fact, with its counts, reaches the frame") moves
+    # subject from the deleted panel to the `backpack` row inside Run; the
+    # item-key assertions INVERT from "present" to "absent from the whole
+    # frame" per done-criterion 6, each with a counter-fixture (the summary
+    # row itself, with its non-zero total) so "no item keys" cannot pass
+    # merely because backpack rendering vanished entirely.
     my $bp = { total => 3, approved => 2, items => [
         { key => 'apt:jq',              approved => 1 },
         { key => 'apt:chromium',        approved => 0 },
         { key => 'npm-global:prettier', approved => 1 },
     ] };
-    my ($bk) = grep { $_->{title} eq 'Backpack' } Dashboard::build_panels({ %st, backpack => $bp });
-    ok($bk, 'backpack: panel present when gathered');
-    my $btext = join "\n", map { Dashboard::spans_text($_) } @{ $bk->{lines} };
-    like($btext, qr/3 item\(s\) - 2 approved, 1 pending/, 'backpack: header counts (no (+)/(-) legend suffixes)');
-    like($btext, qr/\bapt:jq\b/,              'backpack: approved item key present');
-    like($btext, qr/\bapt:chromium\b/,        'backpack: pending item key present');
-    unlike($btext, qr/[\[\]]/,                'backpack: no [+]/[-] bracket markers (paragraph, not itemized rows)');
+    my @panels = Dashboard::build_panels({ %st, backpack => $bp });
+    my ($run) = grep { $_->{title} eq 'Run' } @panels;
+    ok($run, 'backpack (re-pointed): a Run panel is present when a backpack structure is gathered');
+
+    my $bp_label = sprintf('%-*s : ', tui::DashboardScreen::LABEL_GUTTER(), 'backpack');
+    my ($bprow) = $run ? (grep { $_->[0]{text} eq $bp_label } @{ $run->{lines} }) : ();
+    ok($bprow, 'backpack (re-pointed): a backpack summary row exists in Run when gathered (subject moved off the deleted Backpack panel)');
+
+    # Derive the expected value spans by CALLING the same helper the real
+    # render path uses (tui::DashboardScreen::backpack_summary_spans),
+    # never by hand-typing the summary grammar -- so this cannot drift from
+    # the implementation's own summary-text contract.
+    my $expected_value_spans = tui::DashboardScreen::backpack_summary_spans($bp);
+    is_deeply([ @{ $bprow }[1 .. $#$bprow] ], $expected_value_spans,
+        'backpack (re-pointed): the row\'s value spans equal backpack_summary_spans($bp) exactly')
+        if $bprow;
+    my $expected_summary_text = Dashboard::spans_text($expected_value_spans);
+    ok(length($expected_summary_text) > 0,
+        'backpack (re-pointed) sanity: backpack_summary_spans($bp) is non-empty for a non-zero total');
+
+    # done-criterion 6, INVERTED: the individual item KEYS must not appear
+    # anywhere in the whole rendered panel set, even though the summary
+    # (with its non-zero total) does.
+    my $frame_text = join("\n", map {
+        my $p = $_;
+        join("\n", map { ref($_) eq 'ARRAY' ? Dashboard::spans_text($_) : (defined($_) ? "$_" : '') } @{ $p->{lines} });
+    } @panels);
+    unlike($frame_text, qr/\bapt:jq\b/,       'backpack (inverted, done-criterion 6): the approved item KEY does not appear anywhere on the dashboard');
+    unlike($frame_text, qr/\bapt:chromium\b/, 'backpack (inverted, done-criterion 6): the pending item KEY does not appear anywhere on the dashboard');
+
+    # Counter-fixture (required alongside the inversion): with backpack
+    # items configured, the summary row STILL appears and STILL reports a
+    # non-zero total -- so "no item keys" above cannot pass merely because
+    # backpack rendering vanished entirely.
+    like($frame_text, qr/\Q$expected_summary_text\E/,
+        'backpack (inverted, counter-fixture): the summary row (with its non-zero total) IS present in the frame even though the item keys are not');
 }
 {
     # _backpack_lines: empty stays the unchanged quiet line; a large item list
@@ -390,7 +515,13 @@ my %st = (
     is(scalar(grep { Dashboard::display_width($_->{text}) != 80 } @$f), 0, 'compose: new panels keep rows exactly $cols');
     my $joined = join "\n", map { $_->{text} } @$f;
     like($joined, qr/-- Run /,             'compose: Run panel title rendered');
-    like($joined, qr/-- Backpack /,        'compose: Backpack panel title rendered');
+    # RE-POINTED (spec S2.4.8, Decision 9): the Backpack panel dissolves into
+    # a single summary ROW inside Run ("Rendered through row(label =>
+    # 'backpack', ...) inside the Run panel -- not as a panel of its own"),
+    # so it no longer has a title row to match. Claim preserved: the
+    # backpack fact still reaches a composed frame -- subject moves from the
+    # "-- Backpack " title to the summary text itself.
+    like($joined, qr/1 item\(s\)/, 'compose: backpack summary reaches the frame (as a Run-panel row, not a titled panel -- Decision 9)');
     like($joined, qr/keep-awake.*holding/, 'compose: keep-awake state surfaced in a frame');
 }
 
@@ -431,9 +562,18 @@ my %st = (
     my @wmoves = ($wdiff =~ /\e\[(\d+);1H/g);
     is(scalar(@wmoves), 10, 'render: width-only resize repaints all rows (all text changed)');
 
-    # color mode emits SGR for the title row
+    # color mode emits SGR for the title row -- RE-DERIVED (spec S2.1): the
+    # title cell's role is now the Theme role $TITLE_ROLE ('accent'), and
+    # spec S2.1 states that role's SGR resolves through Theme::sgr($role,
+    # undef), NOT the legacy bare-'title' bold-cyan escape. The source of
+    # truth used here is Theme::sgr directly (not Dashboard::sgr_for_role),
+    # because sgr_for_role is merely spec'd to DELEGATE to it -- deriving
+    # against Theme::sgr catches sgr_for_role's delegation being incomplete
+    # instead of trivially agreeing with whatever it currently returns.
     my $colored = Dashboard::render_frame(undef, $a, { color => 1 });
-    like($colored, qr/\e\[1;36m/, 'render: color mode emits title SGR');
+    my $expected_title_sgr = Theme::sgr($TITLE_ROLE, undef);
+    like($colored, qr/\Q$expected_title_sgr\E/,
+        "render: color mode emits the Theme-derived title SGR (role $TITLE_ROLE, via Theme::sgr -- spec S2.1)");
     like($colored, qr/\e\[0m/,    'render: color mode resets SGR');
 
     # regression: a trailing \e[K erased the last cell of a full-width row,
@@ -550,10 +690,32 @@ my %st = (
     # event_style does not exist pre-implementation -- guard with eval{} (this
     # file's existing convention, e.g. PART 11) so a not-yet-defined sub fails
     # these assertions cleanly instead of fatally aborting the whole suite.
-    my $ev = Dashboard::recent_events(\@lines, 10, \&CORE::gmtime);
+    #
+    # RE-POINTED (package 06, spec S2.4.6, Family 4): recent_events's OLD 3rd
+    # argument (a $localtime_fn) no longer reaches the render path at all --
+    # the time span now needs the NEW 4th argument, $now, and renders
+    # fmt_duration($now - $epoch), never an absolute HH:MM:SS clock time
+    # (spec: "$localtime_fn is retained for signature compatibility ... and
+    # is unused by the new time field"). The claim "an event row carries a
+    # time, a glyph and a type" survives; only the time's grammar changes.
+    # $now is injected (the line's own epoch + 3660s, DERIVED via
+    # Time::Local::timegm rather than a hand-typed literal -- see the note
+    # in PART 11 below on why a hand-typed epoch for this exact timestamp is
+    # a proven bug trap) so the expected time text is re-derived by CALLING
+    # fmt_age, never re-pinned as a literal.
+    my $epoch_pt6 = timegm(1, 0, 10, 24, 5, 2026);   # 2026-06-24T10:00:01Z
+    my $now_pt6   = $epoch_pt6 + 3660;
+    my $ev = Dashboard::recent_events(\@lines, 10, \&CORE::gmtime, $now_pt6);
     is(scalar(@$ev), 3, 'events: garbage + blank lines skipped');
     my ($role0, $glyph0) = eval { Dashboard::event_style('launch_start', undef, undef) };
-    is(Dashboard::spans_text($ev->[0]), "10:00:01  " . ($glyph0 // '') . " launch_start", 'events: ts -> HH:MM:SS + glyph + type');
+    # Dashboard::fmt_age is the delegating alias for the one duration format
+    # (spec S2.4.7: "Dashboard::fmt_age becomes a delegating alias"); there
+    # is no Dashboard::fmt_duration -- that name lives only on
+    # tui::DashboardScreen (confirmed: Dashboard->can('fmt_duration') is
+    # false, Dashboard->can('fmt_age') is true).
+    my $expected_time0 = sprintf('%-6s  ', Dashboard::fmt_age($now_pt6 - $epoch_pt6));
+    is(Dashboard::spans_text($ev->[0]), $expected_time0 . ($glyph0 // '') . " launch_start",
+        'events: fmt_age($now-$epoch) + glyph + type (spec S2.4.6 render step 4; time grammar re-derived, "row carries time+glyph+type" preserved)');
     my ($role1, $glyph1) = eval { Dashboard::event_style('container_start', 0, undef) };
     like(Dashboard::spans_text($ev->[1]), qr/\Q$glyph1\E container_start exit=0/, 'events: exit field surfaced') if defined $glyph1;
     fail('events: exit field surfaced (event_style not yet defined)') if !defined $glyph1;
@@ -744,56 +906,64 @@ sub drive {
 ok(!Dashboard->can('_scroll_hint'), '_scroll_hint no longer exists (s06: replaced by the inline overlay)');
 
 # activity_capacity: mirrors compose_frame's budget (deterministic for %st).
-# The Sandbox panel now ALWAYS carries an oauth line (5 lines): even with no
-# token %st renders "not logged in (run /login)". Sandbox(5)+Run(3) fixed =
-# (1+5+1)+(1+3+1)=12; body=rows-2.
-#
-# s05-responsive-layout: activity_capacity mirrors compose_frame's budget.
-# Below _two_col_min_cols() (100) the fixed panels stack and contribute
-# sum(1+lines+1); at or above it, Sandbox|Run share the top region and
-# contribute max(T_sandbox, T_run). These three oracles are at cols=80 ->
-# stacked -> unchanged.
-is(Dashboard::activity_capacity(\%st, 24, 80), 9, 'capacity: 24 rows, no alert -> 9 event rows (oauth line always present)');
-is(Dashboard::activity_capacity({ %st, status => 'exited' }, 24, 80), 8,
-   'capacity: a status alert costs one more row');
-is(Dashboard::activity_capacity(\%st, 12, 80), 0,
-   'capacity: too short for the fixed panels -> 0 (no negative)');
+# RE-DERIVED (package 06, spec S5 ":756-774", Family 3): the Sandbox panel
+# that the old comment's "Sandbox(5)+Run(3)" arithmetic depended on is
+# deleted (spec S2.4.3), and the breakpoint moved 100 -> $BP==90 (Decision
+# 14) -- BOTH independently changed the fixed region's size, so every
+# literal number below is replaced by _cap_expect() (declared once near the
+# top of this file), which calls the spec's own migration formula:
+#   capacity == max(0, rows - 2(title+footer) - _fixed_region_height(state,cols) - 1)
+# Claim preserved verbatim: "capacity mirrors compose_frame's budget." A
+# live status alert is asserted as a DIFFERENTIAL against the non-alert
+# derivation (preserving this file's own original comment, "a status alert
+# costs one more row", as a relative claim rather than a guessed absolute
+# term folded into the formula).
+is(Dashboard::activity_capacity(\%st, 24, 80), _cap_expect(\%st, 24, 80),
+   'capacity: 24 rows, no alert -- rows - 2 - _fixed_region_height - 1 (derivation, spec S5)');
+is(Dashboard::activity_capacity({ %st, status => 'exited' }, 24, 80),
+   Dashboard::activity_capacity(\%st, 24, 80) - 1,
+   'capacity: a status alert costs one more row (differential, this file\'s own original claim)');
+is(Dashboard::activity_capacity(\%st, 12, 80), _cap_expect(\%st, 12, 80),
+   'capacity: too short for the fixed panels -- derivation (clamped at 0 if negative)');
 
-# s05-responsive-layout (AC-11): the two-column capacity oracles. At
-# cols>=100 (_two_col_min_cols()) Sandbox|Run share the top region and
-# contribute max(T_sandbox, T_run)=7 instead of their stacked sum (12).
-is(Dashboard::activity_capacity(\%st, 24, 100), 14,
-   'capacity: two-column mode (cols>=100) -- Sandbox|Run share the top region -> 14');
-is(Dashboard::activity_capacity(\%st, 12, 120), 2,
-   'capacity: two-column mode, 12 rows -> 2 event rows');
-is(Dashboard::activity_capacity(\%st, 10, 120), 0,
-   'capacity: two-column mode, 10 rows -> 0 (too short)');
-is(Dashboard::activity_capacity(\%st, 8, 120), 0,
-   'capacity: two-column mode, 8 rows -> 0 (clamped from a negative body_h)');
-is(Dashboard::activity_capacity({ %st, status => 'exited' }, 24, 120), 13,
-   'capacity: two-column mode + a status alert costs one more row (13)');
+# s05-responsive-layout (AC-11): the two-column capacity oracles. RE-DERIVED
+# for the same two reasons (Sandbox dissolution + Decision 14's breakpoint
+# move) -- the OLD "max(T_sandbox, T_run)" arithmetic named a panel that no
+# longer exists; _fixed_region_height(state,cols) is the single function
+# both this file and t/40-layout-responsive.t's AC-11 now derive against.
+is(Dashboard::activity_capacity(\%st, 24, $BP), _cap_expect(\%st, 24, $BP),
+   "capacity: two-column mode (cols>=\$BP=$BP) -- derivation (Sandbox dissolved; formula, not the old max(T_sandbox,T_run))");
+is(Dashboard::activity_capacity(\%st, 12, 120), _cap_expect(\%st, 12, 120),
+   'capacity: two-column mode, 12 rows -- derivation');
+is(Dashboard::activity_capacity(\%st, 10, 120), _cap_expect(\%st, 10, 120),
+   'capacity: two-column mode, 10 rows -- derivation (0, too short)');
+is(Dashboard::activity_capacity(\%st, 8, 120), _cap_expect(\%st, 8, 120),
+   'capacity: two-column mode, 8 rows -- derivation (clamped from a non-positive body_h)');
+is(Dashboard::activity_capacity({ %st, status => 'exited' }, 24, 120),
+   Dashboard::activity_capacity(\%st, 24, 120) - 1,
+   'capacity: two-column mode + a status alert costs one more row (differential)');
 {
-    # s06-panel-semantics: the Backpack panel's height formula changed --
-    # itemized rows (up to 8, so 3 items -> header+3=4 lines -> panel total
-    # 1+4+1=6, "T_2=6") became a wrapped paragraph capped at header+2 rows.
-    # 3 short keys ("apt:a apt:b apt:c") wrap to ONE paragraph row at
-    # $w=cols-2=118, so the panel total is now 1(title)+2(lines)+1(blank)=4,
-    # not 6. Two-column fixed region = max(T_sandbox=7,T_run=5)=7 + 4 = 11
-    # (was 7+6=13); cap = body_h(22) - 11 - 1 = 10 (was 8). Recomputed via the
-    # coordinator's scratch validation harness, not hand-derived blind.
+    # s06-panel-semantics + package 06 (Decision 9): the Backpack panel is no
+    # longer a panel at all -- it is one summary ROW inside Run (spec
+    # S2.4.8), so the old itemized/paragraph-height arithmetic this comment
+    # used to carry (T_2=4/6) is moot. _fixed_region_height(state,cols)
+    # reflects the backpack row's contribution to Run's own height
+    # automatically, by construction, needing no special-casing here.
     my $bp3 = { total => 3, approved => 0, items => [
         { key => 'apt:a', approved => 0 },
         { key => 'apt:b', approved => 0 },
         { key => 'apt:c', approved => 0 },
     ] };
-    is(Dashboard::activity_capacity({ %st, backpack => $bp3 }, 24, 120), 10,
-       'capacity: two-column mode with a gathered 3-item backpack (paragraph height, T_2=4) -> 10');
+    is(Dashboard::activity_capacity({ %st, backpack => $bp3 }, 24, 120),
+       _cap_expect({ %st, backpack => $bp3 }, 24, 120),
+       'capacity: two-column mode with a gathered 3-item backpack (now a Run-panel row, not a panel -- Decision 9) -- derivation');
 }
-# boundary pair: cols=99 stays stacked, cols=100 flips to two-column mode.
-is(Dashboard::activity_capacity(\%st, 24, 99), 9,
-   'capacity: boundary -- cols=99 is still stacked -> 9 (unchanged)');
-is(Dashboard::activity_capacity(\%st, 24, 100), 14,
-   'capacity: boundary -- cols=100 flips to two-column mode -> 14');
+# boundary pair: cols=$BP-1 stays stacked, cols=$BP flips to two-column mode.
+# RE-DERIVED (duplicate of the boundary pair above, same reasoning).
+is(Dashboard::activity_capacity(\%st, 24, $BP - 1), _cap_expect(\%st, 24, $BP - 1),
+   "capacity: boundary -- cols=@{[ $BP - 1 ]} is still stacked -- derivation");
+is(Dashboard::activity_capacity(\%st, 24, $BP), _cap_expect(\%st, 24, $BP),
+   "capacity: boundary -- cols=$BP flips to two-column mode -- derivation");
 
 # activity_window: fits / empty / zero-capacity. The overflow/scroll/clamp +
 # inline-overlay coverage (s06-panel-semantics, Decision #19) moved to
@@ -1151,13 +1321,21 @@ sub drive_per_tick {
 # The seams are closures over a fixed epoch offset (CORE::gmtime == UTC, so
 # A1 expects unchanged output; +2h and -5h offsets shift the HH:MM:SS).
 #
-# "2026-06-24T10:00:01Z" is epoch 1750759201 (UTC 10:00:01).
-# A gmtime seam returns the UTC breakdown, so HH:MM:SS is still "10:00:01".
-# A +2h seam shifts the epoch forward 7200s before formatting -> "12:00:01".
-# A -5h seam shifts the epoch back 18000s -> "05:00:01".
+# "2026-06-24T10:00:01Z" is a fixed UTC instant. A gmtime seam returns the
+# UTC breakdown unchanged, so HH:MM:SS is still "10:00:01". A +2h seam
+# shifts the epoch forward 7200s before formatting -> "12:00:01". A -5h seam
+# shifts the epoch back 18000s -> "05:00:01".
 # ---------------------------------------------------------------------------
 {
-    my $epoch_10 = 1750759201;   # 2026-06-24T10:00:01Z
+    # DERIVED via Time::Local::timegm, not a hand-typed literal (a
+    # pre-existing comment here previously asserted this instant's epoch as
+    # 1750759201, which is WRONG -- timegm(1,0,10,24,5,2026) is 1782295201;
+    # the stale literal was never numerically exercised until package 06's
+    # Family 4 arithmetic below needed a real epoch to subtract $now
+    # against, at which point it produced silently-wrong, indistinguishable
+    # "n/a" results for every $now offset. Computing it removes the
+    # possibility of that class of bug recurring.
+    my $epoch_10 = timegm(1, 0, 10, 24, 5, 2026);   # 2026-06-24T10:00:01Z, month is 0-indexed (5 == June)
 
     # gmtime seam: returns UTC breakdown unchanged (== A1 oracle)
     my $gmtime_seam = sub { CORE::gmtime($_[0]) };
@@ -1191,36 +1369,55 @@ sub drive_per_tick {
     is($a3, '05:00:01',
         'A3: _event_time with -5h localtime seam -> 05:00:01');
 
-    # A1 via recent_events 3rd-param seam (end-to-end path): parse the same ts
-    # through the seam and confirm the event's TEXT carries the local HH:MM:SS.
-    # s06-panel-semantics: recent_events now returns an arrayref-of-spans per
-    # event (dim timestamp + classified body), not a plain string -- extract
-    # text via Dashboard::spans_text before matching (spec S3.14).
-    my @lines_a1 = ('{"ts":"2026-06-24T10:00:01Z","type":"launch_start","pid":1}');
-    my $ev_a1 = eval { Dashboard::recent_events(\@lines_a1, 1, $gmtime_seam) };
-    if ($ev_a1) {
-        like(Dashboard::spans_text($ev_a1->[0]), qr/^10:00:01\b/,
-            'A1 (recent_events): gmtime seam preserves UTC HH:MM:SS in event text');
+    # A1-A3 VIA recent_events -- REDESIGNED (package 06, spec S2.4.6, Family
+    # 4). recent_events's OLD 3rd-arg $localtime_fn seam no longer reaches
+    # the render path: "$localtime_fn is retained for signature
+    # compatibility ... and is unused by the new time field" (spec S2.4.6).
+    # An absolute HH:MM:SS can therefore never appear again -- the premise
+    # "the gmtime/+2h/-5h seam produces a given clock-time string" is simply
+    # false under the new design, so re-pointing the OLD assertions at the
+    # SAME seams would be asserting behaviour the spec explicitly retired.
+    #
+    # THE CLAIM THAT SURVIVES is what A1-A3 were always really testing:
+    # DETERMINISM -- the clock reaching a rendered event is an INJECTED
+    # value, never a live call to time(). Re-derived against the NEW seam,
+    # recent_events's 4th argument $now: two different injected $now values
+    # must produce two different time texts, and each text must be exactly
+    # Dashboard::fmt_age($now - $epoch) (spec S2.4.6 render step 4), never a
+    # hardcoded/re-pinned format. The old +2h/-5h seam OFFSETS become two
+    # different $now values instead of two different localtime functions.
+    my @lines_now = ('{"ts":"2026-06-24T10:00:01Z","type":"launch_start","pid":1}');
+    my $now_a = $epoch_10 + 5;      # A1's stand-in: 5s after the event
+    my $now_b = $epoch_10 + 7200;   # A2's stand-in: 2h after the event (was the +2h seam)
+
+    my $ev_a = eval { Dashboard::recent_events(\@lines_now, 1, undef, $now_a) };
+    my $ev_b = eval { Dashboard::recent_events(\@lines_now, 1, undef, $now_b) };
+    if ($ev_a && $ev_b) {
+        my $text_a = Dashboard::spans_text($ev_a->[0]);
+        my $text_b = Dashboard::spans_text($ev_b->[0]);
+        isnt($text_a, $text_b,
+            'A1/A2-seam (recent_events): two different injected $now values produce two different event time texts (determinism -- the clock is injected, never live)');
+        like($text_a, qr/\Q@{[ Dashboard::fmt_age($now_a - $epoch_10) ]}\E/,
+            'A1-seam (recent_events): the time text is exactly Dashboard::fmt_age($now - $epoch), never a hardcoded/re-pinned format');
+        like($text_b, qr/\Q@{[ Dashboard::fmt_age($now_b - $epoch_10) ]}\E/,
+            'A2-seam (recent_events): ...and again for the second injected $now (re-derives per-call, not once)');
     } else {
-        fail('A1 (recent_events): recent_events 3-arg form not yet wired (expected failure)');
+        fail('A1/A2-seam (recent_events): recent_events 4-arg $now form not yet wired (expected failure)');
     }
 
-    # A2 via recent_events
-    my $ev_a2 = eval { Dashboard::recent_events(\@lines_a1, 1, $plus2h_seam) };
-    if ($ev_a2) {
-        like(Dashboard::spans_text($ev_a2->[0]), qr/^12:00:01\b/,
-            'A2 (recent_events): +2h seam yields 12:00:01 in event text');
+    # A3-seam: THE HONEST-ABSENCE COUNTER-FIXTURE (spec S2.4.6/escalation
+    # E-E): "the time field is omitted, not filled with n/a or 00:00:00"
+    # when $now is undefined. Without $now, the row must carry FEWER spans
+    # than the same event WITH $now (no fabricated time field), and its text
+    # must not begin with a digit (no muted duration prefix at all).
+    my $ev_bare = eval { Dashboard::recent_events(\@lines_now, 1) };   # no $localtime_fn, no $now at all
+    if ($ev_bare && $ev_a) {
+        cmp_ok(scalar(@{ $ev_bare->[0] }), '<', scalar(@{ $ev_a->[0] }),
+            'A3-seam (honest absence, spec E-E): recent_events called WITHOUT $now emits FEWER spans than the same event WITH $now -- no fabricated time field');
+        unlike(Dashboard::spans_text($ev_bare->[0]), qr/^\d/,
+            'A3-seam (honest absence): without $now, the event text does not begin with a digit (no time span, muted or otherwise)');
     } else {
-        fail('A2 (recent_events): recent_events 3-arg seam not yet wired (expected failure)');
-    }
-
-    # A3 via recent_events
-    my $ev_a3 = eval { Dashboard::recent_events(\@lines_a1, 1, $minus5h_seam) };
-    if ($ev_a3) {
-        like(Dashboard::spans_text($ev_a3->[0]), qr/^05:00:01\b/,
-            'A3 (recent_events): -5h seam yields 05:00:01 in event text');
-    } else {
-        fail('A3 (recent_events): recent_events 3-arg seam not yet wired (expected failure)');
+        fail('A3-seam (honest absence): recent_events without $now not yet wired (expected failure)');
     }
 }
 
@@ -1277,11 +1474,18 @@ sub drive_per_tick {
 # prompt (never silently dropped).
 # ---------------------------------------------------------------------------
 {
+    # RE-DERIVED (package 06, Family 3, same reasoning/formula as PART 9's
+    # _cap_expect): the literal 9 assumed the deleted Sandbox panel's fixed
+    # height. Claim preserved verbatim -- "the oauth line is present whether
+    # or not a token expiry is known, so the two capacities agree" -- by
+    # asserting EQUALITY between the two derivations directly, which is
+    # exactly that claim, rather than re-pinning whatever number the
+    # dissolution happens to produce.
     my %st_oauth = (%st, oauth_remaining => 3*3600 + 12*60);
-    is(Dashboard::activity_capacity(\%st_oauth, 24, 80), 9,
-        'C1a: known expiry -> oauth line present -> capacity 9');
-    is(Dashboard::activity_capacity(\%st, 24, 80), 9,
-        'C1b: no token (undef) -> oauth line STILL present -> capacity 9');
+    is(Dashboard::activity_capacity(\%st_oauth, 24, 80), _cap_expect(\%st_oauth, 24, 80),
+        'C1a: known expiry -> oauth line present -> capacity == the derivation (spec S5)');
+    is(Dashboard::activity_capacity(\%st, 24, 80), Dashboard::activity_capacity(\%st_oauth, 24, 80),
+        'C1b: no token (undef) -> oauth line STILL present -> capacity EQUALS the known-expiry case (the row always renders, just with a different value)');
 
     # s06-panel-semantics: panel lines are now arrayrefs-of-spans -- extract
     # text via Dashboard::spans_text before joining/regexing.
@@ -1313,7 +1517,12 @@ sub drive_per_tick {
     );
     is($e->{rc}, 0, 'D: loop with oauth_expires_at exits cleanly');
     like($e->{out}, qr/expires in 3h12m/,
-        'D: rendered Sandbox panel contains "expires in 3h12m" when oauth_expires_at set');
+        # Names the FRAME, not a panel: this matches the whole rendered output,
+        # and the Sandbox panel it used to name was deleted by package 06
+        # (spec S2.4.3). The mechanism was always frame-wide, so only the
+        # description was wrong -- but a description naming a panel that no
+        # longer exists sends the next reader looking for it.
+        'D: rendered frame contains "expires in 3h12m" when oauth_expires_at set');
 }
 
 done_testing();

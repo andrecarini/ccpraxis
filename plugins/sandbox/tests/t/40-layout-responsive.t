@@ -34,6 +34,40 @@ use Test::More;
 use_ok('Dashboard') or BAIL_OUT('Dashboard.pm did not load');
 
 # ===========================================================================
+# BREAKPOINT MIGRATED 100 -> 90 (package 06-dashboard-screen, in-scope oracle
+# correction #4; Decision 14 is an operator decision dated 2026-08-06 and
+# WINS over the prior 100; driver ruling packages/06-dashboard-screen.md
+# 2026-08-07T17:56:38Z / 2026-08-07T20:40:59Z). $BP is declared ONCE here
+# (spec AC-B4) and reused by every migrated assertion below, so the breakpoint
+# itself is never re-typed as a bare literal in this file. Per AC-B4's
+# migration rule: a width chosen BECAUSE it sits at/above the breakpoint
+# becomes $BP or $BP+k; a width chosen BECAUSE it sits just below becomes
+# $BP-1; a width chosen for an UNRELATED reason (an arbitrary "wide frame" or
+# a maxh/row-height parameter, which this file also uses 99/100 for) STAYS
+# that literal and is commented as such at first use. No assertion's CLAIM
+# changes here; only the SUBJECT of the breakpoint-testing ones does.
+# ===========================================================================
+require tui::Layout;
+require tui::Meter;
+my $BP = tui::Layout::BREAKPOINT_TWO_COL();
+
+# ===========================================================================
+# RULE-FILL GLYPH RE-POINTED (package 06 in-scope oracle correction): a
+# title row's fill used to be literal ASCII '-' repeated to width; compose_frame
+# now composes through tui::DashboardScreen/tui::Frame, which fill title rules
+# with Theme's declared 'rule.h' glyph (U+2500) instead (spec S2.1: every
+# glyph tui::DashboardScreen emits comes from Theme::glyph(...)). Every
+# assertion below that previously matched a FULL dash-filled title row with
+# a bare `-+` is rewritten against this DERIVED pattern -- never a hardcoded
+# '-' or a hardcoded codepoint -- so it cannot drift from Theme's own
+# declaration. The literal "-- " prefix stays ASCII (that part of the title
+# text is unchanged; only the FILL differs).
+# ===========================================================================
+require Theme;
+my $RULE_FILL_RE      = quotemeta(Theme::glyph('rule.h'));                    # UTF-8 BYTES, for byte-string row text
+my $RULE_FILL_CHAR_RE = quotemeta(Theme::glyphs()->{'rule.h'}{char});         # decoded CHARACTER, for utf8::decode()d text
+
+# ===========================================================================
 # Fixture: the same %st shape t/25-dashboard.t uses (PART 2, :105-112) so the
 # derived oracles (Sandbox L_0=5 -> T_0=7; Run L_1=3 -> T_1=5; no backpack)
 # agree with spec S2.9's worked table.
@@ -48,24 +82,38 @@ my %st = (
 );
 
 # The full size matrix (spec S4.2 AC-9), reused by AC-9, AC-10 and AC-12.
+# The three near-boundary samples migrate with the breakpoint ($BP-1/$BP/
+# $BP+1 replace 99/100/101); 79/80 stay literal (generically-below samples,
+# still below 90) and so do 120/200 (generically-above, still above 90) --
+# none of AC-9/AC-10/AC-12 hardcode an expected NUMBER keyed to a specific
+# column here (they compare Dashboard's own output against itself/derived
+# invariants), so this migration is a like-for-like re-centring, not a
+# behaviour change.
 my @ROWS = (0, 1, 2, 3, 4, 5, 10, 12, 24, 50);
-my @COLS = (1, 20, 39, 40, 50, 79, 80, 99, 100, 101, 120, 200);
+my @COLS = (1, 20, 39, 40, 50, 79, 80, $BP - 1, $BP, $BP + 1, 120, 200);
 
 # ===========================================================================
 # 4.1 The composer (DC-1): AC-1 .. AC-8, AC-17
 # ===========================================================================
 
 # ---------------------------------------------------------------------------
-# AC-1 -> DC-1: _two_col_min_cols() == 100; _two_col_mode returns 0 for
-# undef/-5/0/1/40/79/80/99 and 1 for 100/101/120/200/1000. Table-driven.
+# AC-1 -> DC-1 -- BREAKPOINT MIGRATED (see file-header note): claim preserved
+# verbatim -- "_two_col_min_cols() returns THE single-source-of-truth
+# breakpoint; _two_col_mode returns 0 below it and 1 at/above it." Subject
+# changed: the literal 100 -> the DERIVATION tui::Layout::BREAKPOINT_TWO_COL()
+# (spec AC-B2), so this cannot drift from 05's constant. The boundary-adjacent
+# probes (99 "just below", 100 "at") move to $BP-1/$BP; 40/79/80 stay literal
+# (chosen as clearly-below samples, still < 90) and so do 101/120/200/1000
+# (clearly-above, still > 90).
 # ---------------------------------------------------------------------------
-is(Dashboard::_two_col_min_cols(), 100, 'AC-1: _two_col_min_cols() == 100');
+is(Dashboard::_two_col_min_cols(), $BP,
+    'AC-1: _two_col_min_cols() == tui::Layout::BREAKPOINT_TWO_COL() (single-source-of-truth derivation, Decision 14)');
 
-for my $c (undef, -5, 0, 1, 40, 79, 80, 99) {
+for my $c (undef, -5, 0, 1, 40, 79, 80, $BP - 1) {
     my $label = defined $c ? $c : 'undef';
     is(Dashboard::_two_col_mode($c), 0, "AC-1: _two_col_mode($label) == 0");
 }
-for my $c (100, 101, 120, 200, 1000) {
+for my $c ($BP, 101, 120, 200, 1000) {
     is(Dashboard::_two_col_mode($c), 1, "AC-1: _two_col_mode($c) == 1");
 }
 
@@ -82,7 +130,7 @@ for my $c (100, 101, 120, 200, 1000) {
     my $died  = 0;
     my $warns = 0;
     local $SIG{__WARN__} = sub { $warns++ };
-    for my $c (undef, -5, 0, 1, 40, 79, 80, 99, 100, 101, 120, 200, 1000) {
+    for my $c (undef, -5, 0, 1, 40, 79, 80, $BP - 1, $BP, 101, 120, 200, 1000) {
         eval { Dashboard::_two_col_mode($c) };
         $died++ if $@;
     }
@@ -93,6 +141,11 @@ for my $c (100, 101, 120, 200, 1000) {
 # ---------------------------------------------------------------------------
 # AC-2 -> DC-1: _col_widths: (100)->(50,50), (101)->(50,51), (200)->(100,100),
 # (201)->(100,101); and for every $c in 100..201, lw+rw==$c and rw-lw is 0/1.
+# UNRELATED to the breakpoint migration (AC-B4): _col_widths just splits a
+# GIVEN total column count in half once the caller has already decided to be
+# in two-column mode -- it has no opinion on what that decision threshold is.
+# 100/101/200/201 stay literal, no longer meaning "the breakpoint" (Decision
+# 14 moved that to 90).
 # ---------------------------------------------------------------------------
 {
     my @cases = ([100, 50, 50], [101, 50, 51], [200, 100, 100], [201, 100, 101]);
@@ -135,8 +188,22 @@ for my $c (100, 101, 120, 200, 1000) {
     unlike($j->{text}, qr/\e/, 'AC-3: joined text contains no ESC');
 }
 {
-    # 2-column allow-listed glyph (s04 glyph table) in the left half.
-    my $glyph_line = [ { text => "\x{1F7E2}", role => 'accent' }, { text => 'ok', role => 'body' } ];
+    # 2-column glyph -- FIXTURE RE-POINTED (package 06 in-scope oracle
+    # correction). The old \x{1F7E2} emoji circle is no longer on ANY render
+    # path (spec S2.2 Obligation 3: the four emoji circles leave
+    # Dashboard::glyph_table() entirely and now measure width 1 via
+    # tui::Layout, so this fixture's premise -- "a 2-column glyph reaches a
+    # cell" -- silently went false without this change). Claim preserved
+    # verbatim: "the join is measured in display columns, not bytes."
+    # Re-derived via Theme::glyph('sep.bar') (spec S2.2/Obligation 5b: U+FF5C
+    # is the package 06 replacement 2-column glyph, declared width 2 by
+    # Theme, never hand-typed as a codepoint here) rather than any hardcoded
+    # emoji literal -- per spec AC-G6's migration rule.
+    require Theme;
+    my $glyph_char = Theme::glyph('sep.bar');
+    ok(defined $glyph_char, 'AC-3 (glyph): Theme declares a sep.bar glyph to derive the fixture from (AC-G6)');
+    is(Theme::glyph_width('sep.bar'), 2, 'AC-3 (glyph): Theme declares sep.bar at width 2 (the 2-column case this AC needs)');
+    my $glyph_line = [ { text => $glyph_char, role => 'accent' }, { text => 'ok', role => 'body' } ];
     my $l = Dashboard::make_cell($glyph_line, 'label', 30);
     my $r = Dashboard::make_cell('right side content here', 'value', 50);
     is(Dashboard::display_width($l->{text}), 30, 'AC-3 (glyph): left half is exactly 30 display columns');
@@ -145,13 +212,15 @@ for my $c (100, 101, 120, 200, 1000) {
     is(Dashboard::display_width($j->{text}), 80, 'AC-3 (glyph): joined display_width == 80');
     is(Dashboard::spans_width($j->{spans}), 80, 'AC-3 (glyph): joined spans_width == 80');
     isnt(length($j->{text}), 80,
-        'AC-3 (glyph): joined BYTE length() != 80 (the join is measured in display columns, not bytes)');
+        'AC-3 (glyph): joined BYTE length() != 80 (the join is measured in display columns, not bytes -- a multi-byte UTF-8 glyph makes byte length and display width genuinely differ)');
 }
 
 # ---------------------------------------------------------------------------
 # AC-4 -> DC-1: _panel_rows({title=>'T', lines=>['a','b']}, 20, 99) returns 4
 # cells with the pinned shape; maxh of 3/2/1 drops the blank first, then body
-# lines; maxh of 0/-1 returns ().
+# lines; maxh of 0/-1 returns (). UNRELATED to the breakpoint migration: this
+# 99 is a generously-large MAX-HEIGHT (a ROW count), not a column width, so
+# it never interacts with the two-column decision at all. Stays literal.
 # ---------------------------------------------------------------------------
 {
     my $panel = { title => 'T', lines => [ 'a', 'b' ] };
@@ -180,7 +249,12 @@ for my $c (100, 101, 120, 200, 1000) {
 # ---------------------------------------------------------------------------
 # AC-5, AC-6 -> DC-1: _two_col_rows -- exact composition, then truncation.
 # Shared fixture: L has 5 lines (natural height 7), R has 1 line (natural
-# height 3).
+# height 3). UNRELATED to the breakpoint migration: the 100 passed as the
+# TOTAL column width below is an arbitrary "wide enough to split" sample --
+# this helper is only ever called once the caller (compose_frame, via
+# _two_col_mode) has already decided two-column mode applies, so it has no
+# opinion on where that boundary sits. The 99/5/1/0/-3 values are all
+# MAX-HEIGHT (row) parameters, likewise column-breakpoint-unrelated.
 # ---------------------------------------------------------------------------
 my $ac56_L = { title => 'L', lines => [ 'l1', 'l2', 'l3', 'l4', 'l5' ] };
 my $ac56_R = { title => 'R', lines => [ 'r1' ] };
@@ -235,27 +309,39 @@ my $ac56_R = { title => 'R', lines => [ 'r1' ] };
 }
 
 # ---------------------------------------------------------------------------
-# AC-7 -> DC-1 (narrow fallback, asserted): compose_frame(\%st,24,99) never
-# joins Sandbox+Run on one row; compose_frame(\%st,24,100) joins them on
-# EXACTLY one row. Both frames stay exactly $rows x $cols.
+# AC-7 -> DC-1 (narrow fallback, asserted) -- BREAKPOINT MIGRATED (see
+# file-header note) AND SUBJECT RE-POINTED (package 06, driver ruling
+# 2026-08-08, Family 1): claim preserved verbatim -- "just below the
+# breakpoint, no row joins the two lead panels; at/above it, exactly one row
+# does." 99/100 -> $BP-1/$BP (unchanged from the earlier migration). The PAIR
+# itself also moves: the Sandbox panel is deleted (spec S2.4.3) and its
+# rows are absorbed elsewhere, so the two panels that can now share the lead
+# row are Run and Token (the driver's explicit re-pointing: "Two-column
+# assertions that named Sandbox|Run as the pair now name Run and Token").
+# The fixture gains a `tokens` hashref so the Token panel actually renders
+# (spec S2.4.3: present when `ref $state->{tokens} eq 'HASH'`) -- without it
+# there is no second lead panel to pair with at all. Both frames stay
+# exactly $rows x $cols.
 # ---------------------------------------------------------------------------
 {
-    my $f99 = Dashboard::compose_frame(\%st, 24, 99);
-    is(scalar(@$f99), 24, 'AC-7: compose_frame(24,99) returns exactly 24 rows');
-    is(scalar(grep { Dashboard::display_width($_->{text}) != 99 } @$f99), 0,
-        'AC-7: compose_frame(24,99) -- every row is exactly 99 display columns');
-    my $both99 = grep { $_->{text} =~ /-- Sandbox / && $_->{text} =~ /-- Run / } @$f99;
-    is($both99, 0, 'AC-7: 24x99 -- no single row contains BOTH "-- Sandbox" and "-- Run" (still stacked)');
-    my ($sb99) = grep { $_->{text} =~ /^-- Sandbox -+$/ } @$f99;
-    ok($sb99, 'AC-7: 24x99 -- some row matches /^-- Sandbox -+$/');
-    is(Dashboard::display_width($sb99->{text}), 99, 'AC-7: that row is exactly 99 display columns') if $sb99;
+    my %st_pair = (%st, tokens => {});
+    my $below = $BP - 1;
+    my $fbelow = Dashboard::compose_frame(\%st_pair, 24, $below);
+    is(scalar(@$fbelow), 24, "AC-7: compose_frame(24,$below) returns exactly 24 rows");
+    is(scalar(grep { Dashboard::display_width($_->{text}) != $below } @$fbelow), 0,
+        "AC-7: compose_frame(24,$below) -- every row is exactly $below display columns");
+    my $both_below = grep { $_->{text} =~ /-- Run / && $_->{text} =~ /-- Token / } @$fbelow;
+    is($both_below, 0, "AC-7: 24x$below -- no single row contains BOTH \"-- Run\" and \"-- Token\" (still stacked)");
+    my ($run_below) = grep { $_->{text} =~ /^-- Run (?:$RULE_FILL_RE)+$/ } @$fbelow;
+    ok($run_below, "AC-7: 24x$below -- some row matches /^-- Run <rule.h fill>\$/");
+    is(Dashboard::display_width($run_below->{text}), $below, "AC-7: that row is exactly $below display columns") if $run_below;
 
-    my $f100 = Dashboard::compose_frame(\%st, 24, 100);
-    is(scalar(@$f100), 24, 'AC-7: compose_frame(24,100) returns exactly 24 rows');
-    is(scalar(grep { Dashboard::display_width($_->{text}) != 100 } @$f100), 0,
-        'AC-7: compose_frame(24,100) -- every row is exactly 100 display columns');
-    my $both100 = grep { $_->{text} =~ /-- Sandbox / && $_->{text} =~ /-- Run / } @$f100;
-    is($both100, 1, 'AC-7: 24x100 -- EXACTLY one row contains BOTH "-- Sandbox " and "-- Run " (two-column mode)');
+    my $fat = Dashboard::compose_frame(\%st_pair, 24, $BP);
+    is(scalar(@$fat), 24, "AC-7: compose_frame(24,$BP) returns exactly 24 rows");
+    is(scalar(grep { Dashboard::display_width($_->{text}) != $BP } @$fat), 0,
+        "AC-7: compose_frame(24,$BP) -- every row is exactly $BP display columns");
+    my $both_at = grep { $_->{text} =~ /-- Run / && $_->{text} =~ /-- Token / } @$fat;
+    is($both_at, 1, "AC-7: 24x$BP -- EXACTLY one row contains BOTH \"-- Run \" and \"-- Token \" (two-column mode)");
 }
 
 # ---------------------------------------------------------------------------
@@ -272,29 +358,126 @@ my $ac56_R = { title => 'R', lines => [ 'r1' ] };
     is(scalar(grep { Dashboard::display_width($_->{text}) != 120 } @$f), 0,
         'AC-8: every row of the composed frame is exactly 120 display columns');
 
-    my ($i_sb) = grep { $f->[$_]{text} =~ /-- Sandbox / } 0 .. $#$f;
-    my ($i_bp) = grep { $f->[$_]{text} =~ /^-- Backpack -+$/ } 0 .. $#$f;
-    my ($i_ra) = grep { $f->[$_]{text} =~ /^-- Recent activity -+$/ } 0 .. $#$f;
-    ok(defined $i_sb, 'AC-8: a row containing "-- Sandbox " was found');
-    ok(defined $i_bp, 'AC-8: a full-width "-- Backpack" title row was found (no second column)');
-    ok(defined $i_ra, 'AC-8: a full-width "-- Recent activity" title row was found (no second column)');
+    # AC-8 RE-POINTED (package 06, spec S2.4.3/S2.4.8, Decision 9): TWO
+    # subjects dissolved here, not one. The Sandbox panel is deleted (its
+    # rows move to the header or to Run -- spec S2.4.3's disposition table),
+    # AND the Backpack panel dissolves into a single summary ROW inside Run
+    # rather than remaining a titled panel of its own (spec S2.4.8: "Rendered
+    # through row(label => 'backpack', ...) inside the Run panel -- not as a
+    # panel of its own"). Neither can serve as a "-- Title --" landmark any
+    # more. Claim preserved: the fixed/lead panel(s) precede the trailing
+    # full-width "Recent activity" panel, which spec S2.4.3 places LAST
+    # unconditionally -- subject "-- Sandbox " -> "-- Run ". The deleted
+    # Backpack-title landmark's underlying FACT (the one-item backpack is
+    # visible in the frame) is preserved separately below, as a text check
+    # rather than a title-row landmark, since it no longer has a title row.
+    #
+    # THE "NO SECOND COLUMN" HALF OF THE ORIGINAL CLAIM IS RETIRED, REPORTED
+    # RATHER THAN INVENTED, driver ruling 2026-08-08 (ACCEPTED): measured
+    # directly, compose_frame(...,30,120) here now puts "-- Run " and
+    # "-- Recent activity " on the SAME row (Run pairs with whatever panel
+    # comes next when Token/Resources/Spend are absent, rather than only ever
+    # pairing with a second designated "fixed" panel). That packing decision
+    # now lives in tui::Layout::place's own algorithm (package 05,
+    # plugins/sandbox/scripts/tui/Layout.pm -- out of this package's write
+    # set and spec's explicit "escalate; do not patch it here", S6 item 2),
+    # and 06's own spec never commits Recent activity to always being
+    # full-width -- only to being placed LAST (spec S2.4.3). The ordering
+    # claim that IS spec-backed survives, weakened from strict "<" to "<="
+    # because sharing a row is now a legitimate outcome: Run's row index
+    # never comes AFTER Recent activity's.
+    my ($i_run) = grep { $f->[$_]{text} =~ /-- Run / } 0 .. $#$f;
+    my ($i_ra)  = grep { $f->[$_]{text} =~ /-- Recent activity / } 0 .. $#$f;
+    ok(defined $i_run, 'AC-8: a row containing "-- Run " was found');
+    ok(defined $i_ra, 'AC-8: a row containing "-- Recent activity " was found');
   SKIP: {
-        skip 'AC-8 ordering requires all three landmark rows to exist', 2
-            unless defined $i_sb && defined $i_bp && defined $i_ra;
-        cmp_ok($i_sb, '<', $i_bp, 'AC-8: the Sandbox row index precedes the Backpack title row index');
-        cmp_ok($i_bp, '<', $i_ra, 'AC-8: the Backpack title row index precedes the Recent-activity title row index');
+        skip 'AC-8 ordering requires both landmark rows to exist', 1
+            unless defined $i_run && defined $i_ra;
+        cmp_ok($i_run, '<=', $i_ra,
+            "AC-8: the Run row index does not come after the Recent-activity title row index (Recent activity is placed LAST, spec S2.4.3; it may now share Run's row instead of dash-filling the full width alone)");
     }
+
+    my $joined = join("\n", map { $_->{text} } @$f);
+    like($joined, qr/1 item\(s\)/,
+        'AC-8: the one-item backpack summary still reaches the frame (as a Run-panel row, not a titled panel -- Decision 9)');
 }
 
 # ---------------------------------------------------------------------------
-# AC-17 -> DC-1: pairing guard. (_fixed_panels)[0]/[1] are unconditionally
-# Sandbox/Run (D7); _two_col_rows/_body_rows must not die on a degenerate
-# (empty-lines) panel pair.
+# AC-8 (continued) -- THE MIN_COLS DISCIPLINE, replacing the retired "no
+# second column" pin (driver ruling 2026-08-08). That old assertion was a
+# crude proxy for the real discipline that now governs placement: spec
+# S2.4.3 gives the Resources and Spend panels `min_cols =>
+# tui::Meter::min_width()` (75) "so tui::Layout::place demotes their band
+# row to full width rather than truncating their meters." The surviving,
+# spec-backed property is exactly that -- a panel declaring min_cols is
+# NEVER placed in a band narrower than it -- asserted directly against
+# tui::Layout::place's own return value (package 05,
+# plugins/sandbox/scripts/tui/Layout.pm), never a hard-coded width.
+# ---------------------------------------------------------------------------
+{
+    # Shared violation-detector, used on BOTH the real place() output below
+    # AND the hand-built counter-fixture, so the two are provably the same
+    # check (standing rule: a partition/discipline assertion that cannot
+    # fail is worse than the pin it replaced).
+    my $min_cols_violations = sub {
+        my ($band_rows) = @_;
+        my @violations;
+        for my $row (@$band_rows) {
+            for my $band (@$row) {
+                if (ref($band->{panel}) eq 'HASH'
+                    && defined $band->{panel}{min_cols}
+                    && !ref($band->{panel}{min_cols})
+                    && $band->{w} < $band->{panel}{min_cols}) {
+                    push @violations, "x=$band->{x} w=$band->{w} min_cols=$band->{panel}{min_cols}";
+                }
+            }
+        }
+        return \@violations;
+    };
+
+    my $min_cols = tui::Meter::min_width();
+    for my $c ($BP, $BP + 10, 120, 150, 200) {
+        my $band_rows = tui::Layout::place([ { min_cols => $min_cols }, {} ], $c);
+        my $violations = $min_cols_violations->($band_rows);
+        is(scalar(@$violations), 0,
+            "AC-8: tui::Layout::place(...,$c) never places a min_cols=$min_cols panel in a band narrower than that (@$violations)");
+    }
+
+    # COUNTER-FIXTURE: a hand-built band assignment that DOES violate
+    # min_cols must be reported as a violation by the SAME detector used
+    # above -- proves the check can fail, not just always read zero.
+    my $fake_bad_rows = [ [ { panel => { min_cols => $min_cols }, x => 0, w => $min_cols - 1 } ] ];
+    my $bad_violations = $min_cols_violations->($fake_bad_rows);
+    is(scalar(@$bad_violations), 1,
+        'AC-8 counter-fixture: a hand-built band one column narrower than its panel\'s min_cols IS detected as a violation (proves the min_cols check can fail)');
+}
+
+# ---------------------------------------------------------------------------
+# AC-17 -> DC-1: pairing guard. (_fixed_panels)[0]/[1] are the fixed panels
+# in the SPECIFIED ORDER at the head of the list (D7); _two_col_rows/
+# _body_rows must not die on a degenerate (empty-lines) panel pair.
+# UNRELATED to the breakpoint migration: the 100 below is an arbitrary total
+# column width for the join arithmetic (see the AC-5/AC-6 note above), not
+# the breakpoint itself. Stays literal.
+#
+# RETARGETED 2026-08-08 (package 06-dashboard-screen, spec S2.4.3, same
+# ruling as AC-7 above): the Sandbox panel is deleted, so the claim's
+# subject moves -- Run is now first. Claim preserved: the fixed panels
+# appear in the specified order at the head of the list. Plain %st (no
+# tokens/resources/spend) yields only ONE always-present fixed panel, so
+# index [1] has nothing to name under that fixture; the AC-7 block above
+# already established the fixture pattern for pairing Run with a second
+# panel (`tokens => {}` makes the Token panel present per spec S2.4.3), so
+# it is reused here to keep the two-panel-order claim testable.
 # ---------------------------------------------------------------------------
 {
     my @fp = Dashboard::_fixed_panels(\%st);
-    is($fp[0]{title}, 'Sandbox', "AC-17: (_fixed_panels)[0]{title} eq 'Sandbox'");
-    is($fp[1]{title}, 'Run', "AC-17: (_fixed_panels)[1]{title} eq 'Run'");
+    is($fp[0]{title}, 'Run', "AC-17: (_fixed_panels)[0]{title} eq 'Run' (Sandbox dissolved per spec 06 S2.4.3)");
+
+    my %st_pair17 = (%st, tokens => {});
+    my @fp_pair = Dashboard::_fixed_panels(\%st_pair17);
+    is($fp_pair[0]{title}, 'Run', "AC-17: with tokens present, (_fixed_panels)[0]{title} is still 'Run'");
+    is($fp_pair[1]{title}, 'Token', "AC-17: (_fixed_panels)[1]{title} eq 'Token' (the specified order's next panel once tokens are present)");
 
     my $empty_panel = { title => 'Empty', lines => [] };
     my @rows = eval { Dashboard::_two_col_rows($empty_panel, $empty_panel, 100, 10) };
@@ -378,51 +561,146 @@ for my $r (@ROWS) {
         }
     }
 }
+# UNRELATED to the breakpoint migration: -1 rows always yields 0 regardless
+# of the mode/column count (the row-count clamp fires before any column
+# arithmetic), so 100 here is an arbitrary "any" column value. Stays literal.
 is(Dashboard::activity_capacity(\%st, -1, 100), 0, 'AC-10: activity_capacity(-1,100) == 0');
-is(Dashboard::activity_capacity(\%st, 24, undef), 9, 'AC-10: activity_capacity(24,undef) == 9 (undef cols -> stacked)');
+# RE-DERIVED (package 06, Family 3): the old literal 9 assumed the
+# (now-deleted) Sandbox panel's fixed-region height. Claim preserved
+# verbatim -- "undef cols degrades to stacked mode" -- by comparing against
+# a KNOWN sub-breakpoint column count (80 < $BP) rather than re-pinning
+# whatever number the dissolution happens to produce.
+is(Dashboard::activity_capacity(\%st, 24, undef), Dashboard::activity_capacity(\%st, 24, 80),
+    'AC-10: activity_capacity(24,undef) == activity_capacity(24,80) (undef cols degrades to stacked mode, same as any other sub-breakpoint width)');
 
 # ---------------------------------------------------------------------------
 # AC-18 -> DC-2: odd widths. For $c in (101,121,201) at rows=24, every row is
-# exactly $c display columns, and the joined region's split point is
-# int($c/2) (for ASCII content, the left half matches the standalone left
-# half-cell text).
+# exactly $c display columns. UNRELATED to the breakpoint migration: these
+# three values exercise ODD-width splitting, not the mode boundary -- all
+# three remain comfortably above 90 (as they were above the old 100), so
+# their role as "two-column, odd width" samples is unchanged. Stay literal.
+#
+# SUBJECT RE-POINTED (package 06, Family 1/AC-B4): "-- Sandbox " -> "-- Run "
+# (the Sandbox panel is deleted, spec S2.4.3). The fixture gains a `tokens`
+# hashref so a second lead panel (Token) exists to pair with Run and
+# actually trigger the two-column split this AC probes (spec S2.4.3: the
+# Token panel renders only when `ref $state->{tokens} eq 'HASH'`).
+#
+# THE "split point is int($c/2)" SUB-CLAIM IS RETIRED, REPORTED RATHER THAN
+# INVENTED, driver ruling 2026-08-08 (ACCEPTED): measured directly against
+# the real render path, it is FALSE under the new architecture. At c=201
+# the Run title cell measured 67 display columns wide, not int(201/2)==100.
+# The old claim assumed compose_frame's real two-column split used the same
+# 50/50-ish rule as the legacy Dashboard::_col_widths helper (still
+# independently, correctly tested by AC-2 above, unchanged) -- true under
+# the OLD architecture because the old compose_frame literally called
+# _col_widths internally. The NEW compose_frame delegates entirely to
+# tui::DashboardScreen -> tui::Layout::place's own algorithm (package 05,
+# plugins/sandbox/scripts/tui/Layout.pm -- out of this package's write set
+# and spec S6 item 2 says "if one of them is wrong, escalate; do not patch
+# it here"), which is free to allocate column widths by a different rule --
+# 06's own spec never commits to a specific split ratio, only to
+# arrangement (one column below the breakpoint, two at/above it -- spec
+# S2.4.9).
+#
+# THE SURVIVING PROPERTY (driver ruling: what the 50/50 pin was a crude
+# proxy for, and criterion 7's direct concern): whatever partition
+# tui::Layout::place chooses, it must account for the FULL width exactly --
+# nothing overflows past $c, no dead space is left unaccounted. Derived
+# from place()'s OWN return value (never a hard-coded width like 67), then
+# cross-checked against the REAL rendered row so this is an integration
+# check, not a restatement of place()'s own arithmetic. Run/Token declare
+# no min_cols (spec S2.4.3 gives that only to Resources/Spend), so two bare
+# panel hashrefs are a faithful, minimal stand-in for what decides their
+# partition.
 # ---------------------------------------------------------------------------
-for my $c (101, 121, 201) {
-    my $f = Dashboard::compose_frame(\%st, 24, $c);
-    is(scalar(grep { Dashboard::display_width($_->{text}) != $c } @$f), 0,
-        "AC-18: compose_frame(24,$c) -- every row is exactly $c display columns");
-    my ($sb_row) = grep { $_->{text} =~ /^-- Sandbox / } @$f;
-    ok($sb_row, "AC-18: compose_frame(24,$c) -- a Sandbox title row was found");
-  SKIP: {
-        skip "no Sandbox row found for cols=$c", 1 unless $sb_row;
-        my $lw = int($c / 2);
-        my ($sandbox_panel) = Dashboard::_fixed_panels(\%st);
-        my @left_alone = Dashboard::_panel_rows($sandbox_panel, $lw, 99);
-        is(substr($sb_row->{text}, 0, $lw), $left_alone[0]{text},
-            "AC-18: compose_frame(24,$c) -- split point is int($c/2)==$lw (left half matches the standalone cell text)");
+{
+    my %st_pair = (%st, tokens => {});
+    for my $c (101, 121, 201) {
+        my $f = Dashboard::compose_frame(\%st_pair, 24, $c);
+        is(scalar(grep { Dashboard::display_width($_->{text}) != $c } @$f), 0,
+            "AC-18: compose_frame(24,$c) -- every row is exactly $c display columns");
+        my ($run_row) = grep { $_->{text} =~ /^-- Run / && $_->{text} =~ /-- Token / } @$f;
+        ok($run_row, "AC-18: compose_frame(24,$c) -- a row carries BOTH \"-- Run \" and \"-- Token \" (odd width still triggers two-column mode)");
+      SKIP: {
+            skip "no paired row found for cols=$c", 1 unless $run_row;
+            is(Dashboard::display_width($run_row->{text}), $c,
+                "AC-18: compose_frame(24,$c) -- the paired row is exactly $c display columns wide (no overflow/underflow at an odd width)");
+
+            my $band_rows = tui::Layout::place([ {}, {} ], $c);
+          SKIP: {
+                skip "place([{},{}],$c) did not return the expected 1-row/2-band shape", 2
+                    unless @$band_rows == 1 && @{ $band_rows->[0] } == 2;
+                my ($b1, $b2) = @{ $band_rows->[0] };
+                is($b1->{w} + $b2->{w}, $c,
+                    "AC-18: compose_frame(24,$c) -- place()'s own bands account for the full width exactly ($b1->{w} + $b2->{w} == $c)");
+
+                # CHARACTER-decode before slicing (same reasoning as the old
+                # split-point check): every glyph on this row is display-width
+                # 1, so a character offset is a display-column offset once
+                # decoded.
+                my $chars = $run_row->{text};
+                utf8::decode($chars) unless utf8::is_utf8($chars);
+                my $left  = substr($chars, $b1->{x}, $b1->{w});
+                my $right = substr($chars, $b2->{x}, $b2->{w});
+                is(Dashboard::display_width($left) + Dashboard::display_width($right), $c,
+                    "AC-18: compose_frame(24,$c) -- the REAL rendered row's content at place()'s own band offsets/widths accounts for the full width exactly (nothing overflows, no dead space)");
+            }
+        }
     }
+
+    # COUNTER-FIXTURE (standing rule: a partition assertion that cannot fail
+    # is worse than the pin it replaced): a hand-built row whose left
+    # segment is deliberately 5 columns wider than place() says must NOT
+    # satisfy the same width-sum check.
+    my $c = 101;
+    my $band_rows = tui::Layout::place([ {}, {} ], $c);
+    my ($b1, $b2) = @{ $band_rows->[0] };
+    my $bad_left  = ('L' x ($b1->{w} + 5));
+    my $bad_right = ('R' x $b2->{w});
+    my $bad_total = Dashboard::display_width($bad_left) + Dashboard::display_width($bad_right);
+    isnt($bad_total, $c,
+        'AC-18 counter-fixture: a deliberately mis-partitioned row (left band 5 columns too wide) is correctly detected as NOT accounting for the full width -- proves the partition check can fail');
 }
 
 # ---------------------------------------------------------------------------
 # AC-13 -> DC-2, DC-3: degradation ladder preserved at BOTH modes. For $c in
 # (20,40,80,100,200): 0 rows -> []; 1 row -> title; 2 rows -> title+footer;
 # 3 rows -> 3 cells, last is the footer. compose_frame(...,3,1) -> width 1.
+# UNRELATED to the breakpoint migration: this list's job is "some clearly-
+# stacked widths (20/40/80, all < 90) and some clearly-two-column widths
+# (100/200, both still > 90)" -- 100 is no longer THE breakpoint value
+# (Decision 14 moved that to $BP==90) but it is still unambiguously above it,
+# so the ladder claim this AC makes is unaffected. Stays literal.
+#
+# ROLE VOCABULARY RE-POINTED (package 06, Family 2, spec S2.1): the claim
+# ("row 0 carries the title role; the last row of a short frame carries the
+# footer role") survives verbatim -- only the role NAME's vocabulary moved,
+# because compose_frame now composes through tui::DashboardScreen, which
+# emits Theme role names exclusively (spec S2.1: "tui::DashboardScreen emits
+# Theme role names only on every span it produces"). Derived via
+# tui::DashboardScreen::theme_role(), never hand-typed, so this cannot drift
+# from the authoritative legacy->Theme mapping table.
 # ---------------------------------------------------------------------------
+require tui::DashboardScreen;
+my $TITLE_ROLE  = tui::DashboardScreen::theme_role('title');
+my $FOOTER_ROLE = tui::DashboardScreen::theme_role('footer');
+
 for my $c (20, 40, 80, 100, 200) {
     my $f0 = Dashboard::compose_frame(\%st, 0, $c);
     is(scalar(@$f0), 0, "AC-13: compose_frame(0,$c) -> 0 cells");
 
     my $f1 = Dashboard::compose_frame(\%st, 1, $c);
     is(scalar(@$f1), 1, "AC-13: compose_frame(1,$c) -> 1 cell");
-    is($f1->[0]{role}, 'title', "AC-13: compose_frame(1,$c) -- cell[0] role eq title");
+    is($f1->[0]{role}, $TITLE_ROLE, "AC-13: compose_frame(1,$c) -- cell[0] role eq the Theme title role ($TITLE_ROLE)");
 
     my $f2 = Dashboard::compose_frame(\%st, 2, $c);
     is(scalar(@$f2), 2, "AC-13: compose_frame(2,$c) -> 2 cells");
-    is($f2->[1]{role}, 'footer', "AC-13: compose_frame(2,$c) -- cell[1] role eq footer");
+    is($f2->[1]{role}, $FOOTER_ROLE, "AC-13: compose_frame(2,$c) -- cell[1] role eq the Theme footer role ($FOOTER_ROLE)");
 
     my $f3 = Dashboard::compose_frame(\%st, 3, $c);
     is(scalar(@$f3), 3, "AC-13: compose_frame(3,$c) -> 3 cells");
-    is($f3->[-1]{role}, 'footer', "AC-13: compose_frame(3,$c) -- last cell is the footer");
+    is($f3->[-1]{role}, $FOOTER_ROLE, "AC-13: compose_frame(3,$c) -- last cell is the footer role ($FOOTER_ROLE)");
 }
 {
     my $ftiny = Dashboard::compose_frame(\%st, 3, 1);
@@ -434,12 +712,35 @@ for my $c (20, 40, 80, 100, 200) {
 # ===========================================================================
 
 # ---------------------------------------------------------------------------
-# AC-11 -> DC-3: every row of spec S2.9's oracle table, asserted literally.
-# The three unchanged stacked values, the boundary pair, every two-column
-# value, and both backpack cases (T_2=6 for a gathered 3-item backpack).
-# (The canonical home for these oracles is t/25-dashboard.t PART 9; this is a
-# cross-check per spec S4.6.)
+# AC-11 -> DC-3: every row of spec S2.9's oracle table. RE-DERIVED (package
+# 06, spec S5 ":756-774", Family 3): claim preserved verbatim -- "capacity is
+# total rows minus the fixed region" -- but every literal expected NUMBER in
+# the old table assumed the (now-deleted) Sandbox panel's fixed-region
+# height AND the old 100-column breakpoint, BOTH of which moved the fixed
+# region's size, so no literal survives unchanged. Per spec S5's own
+# migration formula:
+#   capacity == max(0, rows - 2(title+footer) - _fixed_region_height(state,cols) - 1)
+# A live status alert is NOT folded into that formula (the spec's own worked
+# example omits it); it is instead asserted as a DIFFERENTIAL against the
+# non-alert derivation, preserving the ORIGINAL table's own comment ("a
+# status alert costs one more row") as a relative claim rather than a
+# guessed absolute term -- this also means the alert term cannot silently
+# hide a bug inside _fixed_region_height itself. The backpack rows (T_2=4/6
+# in the old comments) need NO special-casing any more: the backpack summary
+# is now just one more row INSIDE the Run panel (spec S2.4.8), so
+# _fixed_region_height(\%stb, $cols) already reflects it by construction.
+# This derivation is anchored to real content by AC-12 below, which counts
+# actually-rendered event rows against activity_capacity's return value --
+# AC-11 alone would be a tautology-shaped restatement of the same formula
+# activity_capacity itself presumably uses, but AC-12 is untouched by this
+# migration and still cross-checks it against genuine rendered text.
 # ---------------------------------------------------------------------------
+sub _ac11_expect {
+    my ($state, $r, $c) = @_;
+    my $raw = $r - 2 - Dashboard::_fixed_region_height($state, $c) - 1;
+    return $raw > 0 ? $raw : 0;
+}
+
 {
     my %exited = (%st, status => 'exited');
     my $bp3    = {
@@ -454,23 +755,30 @@ for my $c (20, 40, 80, 100, 200) {
     my %stb = (%st, backpack => $bp3);
 
     my @table = (
-        [ \%st,     24, 80,  9,  'stacked: 24x80 (unchanged)' ],
-        [ \%exited, 24, 80,  8,  'stacked: 24x80, status=exited (unchanged)' ],
-        [ \%st,     12, 80,  0,  'stacked: 12x80 (unchanged)' ],
-        [ \%st,     24, 99,  9,  'boundary: 24x99 (stacked)' ],
-        [ \%st,     24, 100, 14, 'boundary: 24x100 (two-column)' ],
-        [ \%st,     24, 120, 14, 'two-column: 24x120' ],
-        [ \%exited, 24, 120, 13, 'two-column: 24x120, status=exited' ],
-        [ \%st,     12, 120, 2,  'two-column: 12x120' ],
-        [ \%st,     10, 120, 0,  'two-column: 10x120' ],
-        [ \%st,     8,  120, 0,  'two-column: 8x120 (clamped from a negative body_h)' ],
-        [ \%stb,    24, 120, 10, 'two-column with a gathered 3-item backpack (T_2=4): 24x120' ],
-        [ \%stb,    24, 80,  5,  'stacked with a gathered 3-item backpack (T_2=4): 24x80' ],
+        [ \%st,  24, 80,      'stacked: 24x80' ],
+        [ \%st,  12, 80,      'stacked: 12x80' ],
+        [ \%st,  24, $BP - 1, "boundary: 24x@{[ $BP - 1 ]} (stacked)" ],
+        [ \%st,  24, $BP,     "boundary: 24x$BP (two-column)" ],
+        [ \%st,  24, 120,     'two-column: 24x120' ],
+        [ \%st,  12, 120,     'two-column: 12x120' ],
+        [ \%st,  10, 120,     'two-column: 10x120' ],
+        [ \%st,  8,  120,     'two-column: 8x120 (clamped from a non-positive body_h)' ],
+        [ \%stb, 24, 120,     'two-column with a gathered 3-item backpack (now a Run-panel row, not a panel): 24x120' ],
+        [ \%stb, 24, 80,      'stacked with a gathered 3-item backpack (now a Run-panel row, not a panel): 24x80' ],
     );
     for my $row (@table) {
-        my ($state, $r, $c, $expect, $label) = @$row;
+        my ($state, $r, $c, $label) = @$row;
+        my $expect = _ac11_expect($state, $r, $c);
         is(Dashboard::activity_capacity($state, $r, $c), $expect,
-            "AC-11: activity_capacity($label) == $expect");
+            "AC-11: activity_capacity($label) == $expect (derived: rows - 2 - _fixed_region_height - 1, clamped at 0)");
+    }
+
+    for my $pair ([24, 80, 'stacked: 24x80'], [24, 120, 'two-column: 24x120']) {
+        my ($r, $c, $label) = @$pair;
+        my $cap_plain  = Dashboard::activity_capacity(\%st, $r, $c);
+        my $cap_exited = Dashboard::activity_capacity(\%exited, $r, $c);
+        is($cap_exited, $cap_plain - 1,
+            "AC-11: activity_capacity($label, status=exited) == activity_capacity($label) - 1 (a status alert costs exactly one more row -- claim preserved from the original table's own comment)");
     }
 }
 

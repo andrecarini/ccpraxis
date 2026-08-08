@@ -1131,8 +1131,14 @@ my %BACKPACK_FIXTURE = ( total => 1, approved => 1, items => [ { key => 'apt:jq'
     my @titles_none = map { $_->{title} } @none;
     ok(!(grep { $_ eq 'Resources' } @titles_none),
         'AC-24: build_panels with no resources key -> NO Resources panel (B21)');
-    is_deeply(\@titles_none, [ 'Sandbox', 'Run', 'Recent activity' ],
-        'AC-24: the panel list is otherwise unchanged for a state without resources (B21)');
+    # RETARGETED 2026-08-08 (package 06-dashboard-screen, spec S2.4.3): the
+    # Sandbox panel is deleted (its rows move to the header / Run / Token),
+    # so the panel list for a state with no resources/tokens/backpack/spend
+    # is Run followed by Recent activity. Subject moved, claim held: the
+    # panel list is otherwise unchanged (still exactly Run + Recent activity,
+    # nothing extra) when resources is absent.
+    is_deeply(\@titles_none, [ 'Run', 'Recent activity' ],
+        'AC-24: the panel list is otherwise unchanged for a state without resources (B21) -- Sandbox dissolved per spec 06 S2.4.3');
 
     for my $bad ( [ 'undef', undef ], [ "'x'", 'x' ], [ '[]', [] ] ) {
         my ($label, $val) = @$bad;
@@ -1163,11 +1169,25 @@ my %BACKPACK_FIXTURE = ( total => 1, approved => 1, items => [ { key => 'apt:jq'
         tokens    => { %TOKENS_FIXTURE },
         resources => { %B10 },
     }, 80);
+    # RETARGETED 2026-08-08 (package 06-dashboard-screen, spec S2.4.3 panel
+    # table + Decision 9): the Sandbox panel is deleted and Backpack is no
+    # longer a panel of its own -- it renders as a summary row inside Run
+    # (spec S2.4.8). The pinned order's subject moves to the panel set this
+    # design actually produces, derived from the spec's numbered table (Run,
+    # Token, Resources, Spend, Recent activity) rather than from a snapshot
+    # of prior behaviour. The fixture here supplies no 'spend' key, so Spend
+    # is absent; the claim (a specified, pinned order) is preserved.
     is_deeply([ map { $_->{title} } @all ],
-        [ 'Sandbox', 'Run', 'Backpack', 'Token', 'Resources', 'Recent activity' ],
-        'AC-24: the pinned full panel order is Sandbox, Run, Backpack, Token, Resources, Recent activity');
+        [ 'Run', 'Token', 'Resources', 'Recent activity' ],
+        'AC-24: the pinned full panel order is Run, Token, Resources, Recent activity (Sandbox dissolved, Backpack moved into Run per Decision 9)');
 
     # _fixed_panels order (Recent activity is appended by build_panels).
+    # RETARGETED 2026-08-08: same panel-set change as above. This claim is
+    # specifically about LAYOUT PLACEMENT -- that Resources never lands in
+    # the two-column region's positions 0/1 -- and that claim survives
+    # unchanged even though its subject (the panel list preceding it) does
+    # not. This is an order pin (already was one); it gains no count, per
+    # Decision 15.
     my @fixed = Dashboard::_fixed_panels({
         %BASE_STATE,
         backpack  => { %BACKPACK_FIXTURE },
@@ -1175,7 +1195,7 @@ my %BACKPACK_FIXTURE = ( total => 1, approved => 1, items => [ { key => 'apt:jq'
         resources => { %B10 },
     }, 80);
     is_deeply([ map { $_->{title} } @fixed ],
-        [ 'Sandbox', 'Run', 'Backpack', 'Token', 'Resources' ],
+        [ 'Run', 'Token', 'Resources' ],
         'AC-24: _fixed_panels ends with Resources, so it never enters the two-column region (positions 0/1)');
 }
 
@@ -2493,16 +2513,66 @@ FAKE_MODULE
     }
 }
 
-# --- AC-20 -> DC-3: never-written yields no lines; superset renders identically. --
+# --- AC-20 -> DC-3 CORRECTED for package 06 (in-scope oracle correction #1;
+# driver escalation E-A, packages/06-dashboard-screen.md 2026-08-07T20:40:59Z,
+# and the 06 spec's own §7 E-A). Never-written still yields no lines
+# (unchanged, preserved verbatim below). The OLD claim on the superset struct
+# was that it "renders IDENTICALLY to the plain 15-key struct" -- that is the
+# literal NEGATION of Obligation 4 (adapter contract Rule 4: "absence must be
+# distinguishable from broken"). It was correct for package 03, which
+# deliberately did not touch Dashboard.pm/_resources_lines (03's ledger
+# records this explicitly); it became false the instant 06 is required to
+# render snapshot_state. Per the package-04 ruling on changing an oracle's
+# subject without losing its claim: CLAIM preserved ("a snapshot-carrying
+# struct renders coherently, and never-written stays panel-absent"); SUBJECT
+# changed (from "identical to the plain struct" to "distinct across
+# fresh/stale/failed, and distinct from the plain/no-snapshot-state struct,
+# and never a fabricated zero-duration").
+# --------------------------------------------------------------------------
 {
     my @none = dlines(undef);
     is_deeply(\@none, [], 'AC-20: Dashboard::_resources_lines(undef) yields no lines (never-written -> panel absent)');
 
-    my %superset = ( %ALL_NA, snapshot_state => 'fresh', snapshot_age => 5, snapshot_written_at => $NOW );
-    my @super_lines = dlines(\%superset);
-    my @plain_lines = dlines({ %ALL_NA });
-    is_deeply(\@super_lines, \@plain_lines,
-        'AC-20: a superset struct (15 keys + snapshot_state/snapshot_age/snapshot_written_at) renders IDENTICALLY to the plain 15-key struct -- no row-count assertion (Decision 15), just the two renderings compared to each other');
+    my %fresh  = ( %ALL_NA, snapshot_state => 'fresh',  snapshot_age => 5,     snapshot_written_at => $NOW );
+    my %stale  = ( %ALL_NA, snapshot_state => 'stale',  snapshot_age => 900,   snapshot_written_at => $NOW - 900 );
+    my %failed = ( %ALL_NA, snapshot_state => 'failed', snapshot_age => undef, snapshot_written_at => undef );
+
+    my $fresh_text  = join("\n", map { line_text($_) } dlines(\%fresh));
+    my $stale_text  = join("\n", map { line_text($_) } dlines(\%stale));
+    my $failed_text = join("\n", map { line_text($_) } dlines(\%failed));
+    my $plain_text  = join("\n", map { line_text($_) } dlines({ %ALL_NA }));
+
+    # The six pairwise comparisons across the four renderings (fresh/stale/
+    # failed/plain) -- "plain" stands in for "a pre-03 caller with nothing to
+    # say about snapshot_state", which the never-written arm above already
+    # covers as a wholly absent panel; this arm covers the case where a
+    # caller's struct simply lacks the key while still having real values.
+    isnt($fresh_text,  $stale_text,
+        'AC-20: a fresh-snapshot struct renders DISTINCTLY from a stale-snapshot struct -- "no data yet" vs "stale" must be tellable apart by a human (Obligation 4, adapter contract Rule 4)');
+    isnt($fresh_text,  $failed_text,
+        'AC-20: a fresh-snapshot struct renders DISTINCTLY from a failed-snapshot struct -- "no data yet" vs "the sampler died" must be tellable apart (Obligation 4, adapter contract Rule 4)');
+    isnt($stale_text,  $failed_text,
+        'AC-20: a stale-snapshot struct renders DISTINCTLY from a failed-snapshot struct -- "stale" vs "the sampler died" must be tellable apart (Obligation 4, adapter contract Rule 4)');
+    isnt($fresh_text,  $plain_text,
+        'AC-20: a fresh-snapshot struct renders DISTINCTLY from the plain (no snapshot_state key) struct (Obligation 4)');
+    isnt($stale_text,  $plain_text,
+        'AC-20: a stale-snapshot struct renders DISTINCTLY from the plain struct (Obligation 4)');
+    isnt($failed_text, $plain_text,
+        'AC-20: a failed-snapshot struct renders DISTINCTLY from the plain struct (Obligation 4)');
+
+    # Never a fabricated zero (Rule 4, spec §2.4.5): a stale snapshot with an
+    # UNDEF age must not render '0s'/'0m'/'0h'/'0d' anywhere -- the age
+    # clause is omitted entirely rather than fabricated.
+    my %stale_no_age      = ( %ALL_NA, snapshot_state => 'stale', snapshot_age => undef, snapshot_written_at => undef );
+    my $stale_no_age_text = join("\n", map { line_text($_) } dlines(\%stale_no_age));
+    unlike($stale_no_age_text, qr/\b0[smhd]\b/,
+        'AC-20: a stale snapshot with an undef age renders no fabricated zero-duration clause (Obligation 4, adapter contract Rule 4)');
+
+    # Non-vacuity: the same live-detector regex fires on a hand-built string
+    # containing a fabricated zero, so the unlike() above cannot be passing
+    # merely because the regex never matches anything.
+    like('stale, 0s ago', qr/\b0[smhd]\b/,
+        'AC-20 non-vacuity: the fabricated-zero detector DOES fire on a hand-built "stale, 0s ago" string -- proves the unlike() above is a live guard, not a vacuous one');
 }
 
 # --- AC-21 -> DC-4: starvation contrast, starved arm vs sampler arm. -----

@@ -374,12 +374,17 @@ sub src_unlike {
 }
 
 # --- AC-6 (B6): compose_frame's footer role for pending => 'relaunch'. ---
+# RETARGETED 2026-08-08 (package 06-dashboard-screen, driver scope grant
+# E-B/E-D): package 02's Theme-token role vocabulary (spec 06 S2.1's mapping
+# table) moves 'footer-alert' -> 'state.crit' and 'footer' -> 'text.faint'.
+# Subject moved, claim held.
 {
     my %base = (project_name => 'demo', container => 'c1', status => 'running', events => []);
 
     my %sr = (%base, pending => 'relaunch');
     my $fr = Dashboard::compose_frame(\%sr, 12, 80);
-    is($fr->[-1]{role}, 'footer-alert', "AC-6: pending='relaunch' -> footer role is footer-alert");
+    is($fr->[-1]{role}, 'state.crit',
+        "AC-6: pending='relaunch' -> footer role is state.crit (was footer-alert -- Theme token migration)");
     my $prompt = eval { Dashboard::confirm_prompt('relaunch', 80) };
     if (defined $prompt) {
         like($fr->[-1]{text}, qr/\Q$prompt\E/,
@@ -393,13 +398,15 @@ sub src_unlike {
     for my $tok ('stop-runs', 'full-shutdown') {
         my %s = (%base, pending => $tok);
         my $f = Dashboard::compose_frame(\%s, 12, 80);
-        is($f->[-1]{role}, 'footer-alert', "AC-6: pending='$tok' -> footer role is still footer-alert");
+        is($f->[-1]{role}, 'state.crit',
+            "AC-6: pending='$tok' -> footer role is still state.crit (was footer-alert -- Theme token migration)");
     }
 
     # No pending -> the ordinary footer role.
     my %none = (%base, pending => '');
     my $fn = Dashboard::compose_frame(\%none, 12, 80);
-    is($fn->[-1]{role}, 'footer', 'AC-6: no pending -> footer role');
+    is($fn->[-1]{role}, 'text.faint',
+        'AC-6: no pending -> footer role is text.faint (was footer -- Theme token migration)');
     like($fn->[-1]{text}, qr/\[q\] quit/, 'AC-6: no pending -> the command legend is shown');
 
     # NO NEW ROLE: the set of roles a relaunch frame uses must be exactly the
@@ -1392,7 +1399,10 @@ sub seg_has { my ($seg, $tag) = @_; return scalar(grep { $_->[0] eq $tag } @{ $s
         my @bad_spans = grep { !$_->{spans} || ref($_->{spans}) ne 'ARRAY' || !@{ $_->{spans} } } @$f;
         is(scalar(@bad_spans), 0, "AC-25: every cell has a non-empty spans arrayref at cols=$cols");
 
-        is($f->[-1]{role}, 'footer-alert', "AC-25: the armed relaunch confirm owns the footer row at cols=$cols");
+        # RETARGETED 2026-08-08 (package 06-dashboard-screen, driver scope
+        # grant E-B/E-D): 'footer-alert' -> 'state.crit' (spec 06 S2.1).
+        is($f->[-1]{role}, 'state.crit',
+            "AC-25: the armed relaunch confirm owns the footer row at cols=$cols (was footer-alert -- Theme token migration)");
 
         my $full = Dashboard::render_frame(undef, $f, { color => 0 });
         like($full, qr/^\e\[\?2026h/, "AC-25: render_frame (no prev) opens with the sync-output wrapper at cols=$cols");
@@ -1417,9 +1427,14 @@ sub seg_has { my ($seg, $tag) = @_; return scalar(grep { $_->[0] eq $tag } @{ $s
             "AC-25: the recover/relaunch frame introduces NO new row role at cols=$cols");
 
         # The banner rides the existing alert row and is the FIRST alert.
+        # RETARGETED 2026-08-08 (package 06-dashboard-screen, driver scope
+        # grant E-B/E-D): the cell-level 'alert' role moves to 'state.crit'
+        # under Theme token adoption (spec 06 S2.1: "bad, alert,
+        # footer-alert -> state.crit"; confirmed against tui::Screen's
+        # screen() composition, spec 06 S2.4.9: banner_role => 'state.crit').
         my %st2 = (%st, status => 'exited');
         my $f3 = Dashboard::compose_frame(\%st2, $rows, $cols);
-        my @alerts = grep { $_->{role} eq 'alert' } @$f3;
+        my @alerts = grep { $_->{role} eq 'state.crit' } @$f3;
         cmp_ok(scalar(@alerts), '>=', 2, "AC-25: the recover banner + status alert coexist as rows at cols=$cols");
         like($alerts[0]{text}, qr{recover 2/4},
             "AC-25: the recover banner is the FIRST alert row at cols=$cols") if @alerts;
