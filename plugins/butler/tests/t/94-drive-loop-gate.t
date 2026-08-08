@@ -239,4 +239,65 @@ EOF`;
        . 'for JSON booleans, which silently breaks the distinction G7 asserts');
 }
 
+# ---------------------------------------------------------------------------
+# H. A package already owned by a worker is IN FLIGHT, not finished.
+#
+#    The gate consults the director and allows the stop when the answer is
+#    'done'. For a long time the director ALSO answered 'done' whenever nothing
+#    happened to be dispatchable — including the very ordinary case of a driver
+#    holding packages open across concurrent workers. Every package non-terminal,
+#    the run very much alive, and the one mechanism guarding an unattended run
+#    waved the stop through. The run then died mid-package while looking
+#    finished, which is precisely the failure this hook exists to prevent, and
+#    the hook was the thing being lied to rather than the thing at fault.
+#
+#    Observed 2026-08-08 on this repo; the director now answers 'in-flight'.
+#    These assertions are here so the distinction cannot quietly collapse back
+#    into 'done' — the gate needs no change to honour it, which is exactly why
+#    nothing else would notice if it regressed.
+# ---------------------------------------------------------------------------
+sub project_with_package {
+    my (%opt) = @_;
+    my ($root, $ds) = new_project(order => 1);
+    my $bpdir = "$root/.ccpraxis-local-data/blueprints/x";
+    make_path("$bpdir/packages");
+    # The package set comes from the DAG table in blueprint.md, NOT from the
+    # packages/ directory — a fixture without this table parses as a blueprint
+    # with zero packages, which then reads as settled and tests nothing.
+    open my $b, '>', "$bpdir/blueprint.md" or die;
+    print {$b} "# x\n\n| pkg | depends_on |\n|---|---|\n| p1 |  |\n";
+    close $b;
+    open my $p, '>', "$bpdir/packages/p1.md" or die;
+    print {$p} "---\npackage: p1\nstatus: $opt{status}\n---\n\nbody\n";
+    close $p;
+    if ($opt{announced}) {
+        open my $a, '>', "$ds/announced.json" or die;
+        print {$a} '{"announced":["x"]}';
+        close $a;
+    }
+    return ($root, $ds);
+}
+
+{
+    my ($root) = project_with_package(status => 'running');
+    my ($rc, $out) = run_hook($GATE, payload_stop($root));
+    is($rc, 2, 'H1: a stop is BLOCKED while a package is still marked running — '
+             . '"nothing to hand out right now" is not "the work is finished", and '
+             . 'only the second one makes it safe to end the turn');
+    like($out, qr/in-flight/,
+         'H2: and the block names the action, so the driver is told what is still '
+       . 'open rather than merely being refused');
+}
+
+{
+    # THE COUNTER-FIXTURE. H1 is only evidence of a working gate if the same
+    # gate lets a genuinely finished run stop. Announced, so the director has
+    # no blueprint-done left to report and answers 'done' outright.
+    my ($root) = project_with_package(status => 'done', announced => 1);
+    my ($rc) = run_hook($GATE, payload_stop($root));
+    is($rc, 0, 'H3: counter-fixture — the same gate ALLOWS the stop once the package '
+             . 'is genuinely done; H1 detects work in flight rather than simply '
+             . 'refusing every stop');
+}
+
 done_testing();

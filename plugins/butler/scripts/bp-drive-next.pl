@@ -28,6 +28,11 @@
 #   {"action":"pause","until_epoch":E,"reason":"usage"} timed auto-resume at epoch E
 #   {"action":"pause","until_epoch":null,"reason":"token"} TERMINAL relogin park (re-login, re-invoke)
 #   {"action":"blueprint-done","blueprint":B,"pending":[…]} B settled; pending = remaining bps to re-eval
+#   {"action":"in-flight","blueprint":B,"packages":[…],"running":[…]}
+#                                                      nothing dispatchable right now, but B still
+#                                                      holds non-terminal packages (typically owned by
+#                                                      a concurrent worker). NOT completion: stopping
+#                                                      here kills the run mid-package.
 #   {"action":"done"}                                  every in-scope blueprint is done-or-parked
 #
 #   Keep-awake is a director-managed SIDE EFFECT (started when work is runnable or a
@@ -504,6 +509,11 @@ sub _cmd_next {
         return 0;
     }
 
+    # Blueprints that are NOT settled but have nothing dispatchable right now.
+    # Collected rather than swallowed: emitting 'done' for these is the bug
+    # documented at the in-flight branch below.
+    my @in_flight;
+
     # B3: walk recorded order
     for my $bp (@$order) {
         my $is_parked   = $parked{$bp} ? 1 : 0;
@@ -575,9 +585,59 @@ sub _cmd_next {
             return 0;
         }
 
-        # No ready packages but also not settled: should not normally happen,
-        # but treat as settled-pending (no progressable work right now).
-        # Continue to next blueprint.
+        # No ready packages, but the blueprint is NOT settled. The comment here
+        # used to read "should not normally happen", and treated the state as
+        # settled-pending by falling through to 'done'. It happens constantly:
+        # any package marked 'running' is non-terminal, so the blueprint is not
+        # settled, while ready_packages() correctly refuses to hand out a
+        # package that is already owned or whose write set overlaps one. A
+        # driver dispatching two workers concurrently reaches this on every
+        # call.
+        #
+        # Record it instead of swallowing it. Falling through to 'done' asserts
+        # "every in-scope blueprint is done-or-parked" (the documented contract
+        # at the top of this file), which is simply false while work is in
+        # flight -- and two safety mechanisms believe that assertion:
+        #
+        #   * gate-drive-loop.sh, the Stop hook that keeps an unattended driver
+        #     from ending a turn with nothing scheduled to continue the run,
+        #     treats 'done' as "run settled" and allows the stop. So the run
+        #     dies silently mid-package, looking finished -- the exact failure
+        #     that hook was written to prevent.
+        #   * bp-watchdog.pl short-circuits to VERDICT: SETTLED on 'done',
+        #     ahead of its own movement analysis, so an armed watchdog reports
+        #     all-clear over a wedged run.
+        #
+        # Both were observed on 2026-08-08 in a single run, from this one
+        # cause. Neither needs changing: 'in-flight' is not 'done', so the gate
+        # blocks and the watchdog falls through to measuring movement, which is
+        # what each already does for every other action.
+        my @nonterminal = grep { !_is_terminal($status->{$_} // 'pending') } sort keys %$meta;
+        my @running_now = grep { ($status->{$_} // '') eq 'running' } @nonterminal;
+        push @in_flight, {
+            blueprint => $bp,
+            packages  => \@nonterminal,
+            running   => \@running_now,
+        } if @nonterminal;
+    }
+
+    # B6a: nothing is dispatchable, but at least one blueprint still holds
+    # non-terminal packages. Distinct from 'done' on purpose -- "nothing to
+    # hand out right now" and "the work is finished" are different statements,
+    # and only the second one makes it safe to stop.
+    if (@in_flight) {
+        my $f = $in_flight[0];
+        _append_run_log($dsdir, "IN-FLIGHT $f->{blueprint}"
+            . ' running=' . (join(',', @{ $f->{running} }) || '-')
+            . ' nonterminal=' . join(',', @{ $f->{packages} }));
+        print _encode_action({
+            action    => 'in-flight',
+            blueprint => $f->{blueprint},
+            packages  => $f->{packages},
+            running   => $f->{running},
+        }), "\n";
+        keepawake_apply('active', $dsdir, $opts);
+        return 0;
     }
 
     # B6: all blueprints in the order are settled+announced (or parked)
