@@ -854,6 +854,25 @@ sub run {
 
     my $now_fn = $opts->{now} // sub { time };
     my $verdict_fn = $opts->{verdict} // sub {
+        # TEST / DIAGNOSTIC SEAM, honoured only for well-formed JSON carrying an
+        # 'action'. The production path below shells out to bp-usage-gate.pl,
+        # which reads the host's REAL OAuth state -- so every consumer of the
+        # director inherits that state, including gate-drive-loop.sh and any
+        # assertion about it. On 2026-08-08 t/94's stop-gate assertions went red
+        # for exactly this reason: the host token aged under the relogin floor
+        # mid-run, the director began answering pause/token, the gate correctly
+        # allowed the stop, and a test that had passed an hour earlier failed
+        # without a line of code changing. A test whose result tracks a token
+        # clock is a false red, and this repo has already paid for that shape
+        # once in t/95 (a child resolving its own data dir from the cwd).
+        #
+        # Deliberately NOT a general "skip governance" switch: it is read only
+        # here, it must parse, and it must carry an action. It cannot be set by
+        # accident, and nothing in the production launch path sets it.
+        if (defined $ENV{CCPRAXIS_USAGE_VERDICT_JSON} && length $ENV{CCPRAXIS_USAGE_VERDICT_JSON}) {
+            my $ov = eval { JSON::PP->new->decode($ENV{CCPRAXIS_USAGE_VERDICT_JSON}) };
+            return $ov if ref $ov eq 'HASH' && defined $ov->{action};
+        }
         # Production: shell out to bp-usage-gate.pl verdict in the same dir
         my $gate = "$DIR/bp-usage-gate.pl";
         my $out  = eval { `"$^X" "$gate" verdict 2>/dev/null` };

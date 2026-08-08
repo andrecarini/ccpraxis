@@ -91,6 +91,13 @@ sub run_hook {
     my ($script, $payload, %opt) = @_;
     my $env = '';
     $env = "CCPRAXIS_DRIVE_STOP_OK=1 " if $opt{stop_ok_env};
+    # Pin the usage verdict for any case that depends on the director's answer.
+    # Without it the director shells out to bp-usage-gate.pl and reads the
+    # HOST's real OAuth state, so these assertions would track a token clock:
+    # once the token ages under the relogin floor the director answers
+    # pause/token, the gate correctly allows the stop, and a green test turns
+    # red with no code change. Observed exactly that on 2026-08-08.
+    $env .= "CCPRAXIS_USAGE_VERDICT_JSON='{\"action\":\"ok\"}' " if $opt{verdict_ok};
     # Single-quote the payload for sh; payloads here contain no single quotes.
     my $out = `$env bash "$script" <<'PAYLOAD_EOF' 2>&1
 $payload
@@ -280,7 +287,7 @@ sub project_with_package {
 
 {
     my ($root) = project_with_package(status => 'running');
-    my ($rc, $out) = run_hook($GATE, payload_stop($root));
+    my ($rc, $out) = run_hook($GATE, payload_stop($root), verdict_ok => 1);
     is($rc, 2, 'H1: a stop is BLOCKED while a package is still marked running — '
              . '"nothing to hand out right now" is not "the work is finished", and '
              . 'only the second one makes it safe to end the turn');
@@ -294,7 +301,7 @@ sub project_with_package {
     # gate lets a genuinely finished run stop. Announced, so the director has
     # no blueprint-done left to report and answers 'done' outright.
     my ($root) = project_with_package(status => 'done', announced => 1);
-    my ($rc) = run_hook($GATE, payload_stop($root));
+    my ($rc) = run_hook($GATE, payload_stop($root), verdict_ok => 1);
     is($rc, 0, 'H3: counter-fixture — the same gate ALLOWS the stop once the package '
              . 'is genuinely done; H1 detects work in flight rather than simply '
              . 'refusing every stop');
