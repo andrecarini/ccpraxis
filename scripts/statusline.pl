@@ -1,33 +1,252 @@
 #!/usr/bin/perl
-# Claude Code status line — Perl core modules only, no external deps.
-# Shows: project | model | context usage | plan rate limits
+# Claude Code status line -- Perl core modules only, no external deps.
+#
+# Row 1: marker, project name, full working directory, git, plans.
+# Row 2: model, context window, plan usage.
+#
+# THIS FILE IS A STANDALONE INSTALLED PAYLOAD. It is bind-mounted read-only
+# into the sandbox container at /root/.claude/statusline.pl and installed to
+# ~/.claude/statusline.pl on the host, so it must import NOTHING from this
+# repo -- core modules only, no search-path manipulation, no path require.
+# Shared truth reaches it two other ways instead:
+#   * colours, through the GENERATED token block below (the block records
+#     its own regeneration command);
+#   * glyph widths, through the inline %GLYPH_COLS table, which a drift
+#     guard in the test suite compares against the canonical width table.
+# Neither is a dependency: both are checked, not imported.
 use strict;
 use warnings;
 use JSON::PP;
 use Time::Piece;
 use File::Basename;
+use constant MIN_CWD_COLS     => 2;
+use constant MIN_PROJECT_COLS => 2;
 
 binmode STDOUT, ':utf8';
 
-my $raw  = do { local $/; <STDIN> };
-my $data = decode_json($raw);
+my $raw  = do { local $/; my $r = <STDIN>; defined($r) ? $r : '' };
+# Malformed or truncated stdin must not cost the user their statusline. An
+# unguarded decode dies with exit 255 and prints the exception where the two
+# rows belong -- worse than a statusline with empty fields. Degrade to an
+# empty payload instead; every read below already tolerates a missing key.
+my $data = eval { decode_json($raw) };
+$data = {} unless ref($data) eq 'HASH';
 
+# ── Colours ──────────────────────────────────────────────────
+# Every colour in this file is derived from %THEME_RGB by ROLE NAME. No
+# numeric colour literal survives anywhere. %THEME_X256 and %THEME_ATTR are
+# part of the byte-exact generated payload and are deliberately left unused
+# -- do not "tidy" them away, the block is compared byte-for-byte.
+# >>> BEGIN GENERATED FROM Theme.pm -- DO NOT EDIT BY HAND >>>
+# THEME TOKENS -- generated from plugins/sandbox/scripts/Theme.pm.
+# Regenerate: perl -Iplugins/sandbox/scripts -MTheme -e "print Theme::generated_block()"
+my %THEME_RGB = (
+  'accent' => [66,148,250],
+  'rule' => [60,70,85],
+  'state.crit' => [255,90,90],
+  'state.idle' => [110,126,148],
+  'state.ok' => [26,168,74],
+  'state.warn' => [214,128,16],
+  'text.faint' => [100,116,139],
+  'text.muted' => [148,163,184],
+  'text.primary' => [230,230,230],
+);
+my %THEME_X256 = (
+  'accent' => 69,
+  'rule' => 238,
+  'state.crit' => 203,
+  'state.idle' => 244,
+  'state.ok' => 35,
+  'state.warn' => 172,
+  'text.faint' => 243,
+  'text.muted' => 248,
+  'text.primary' => 254,
+);
+my %THEME_ATTR = (
+  'accent' => '1',
+  'rule' => '2',
+  'state.crit' => '1',
+  'state.idle' => '2',
+  'state.ok' => '1',
+  'state.warn' => '1',
+  'text.faint' => '2',
+  'text.muted' => '2',
+  'text.primary' => '',
+);
+# <<< END GENERATED FROM Theme.pm <<<
 
-# ── Colors (24-bit RGB) ─────────────────────────────────────
-sub rgb { "\033[38;2;$_[0];$_[1];$_[2]m" }
+# rgb($role) -> the truecolor SGR string for a semantic role, or '' for an
+# unknown role. The only place an escape is composed from channel values,
+# and those values come from the generated table, never from a literal.
+sub rgb {
+    my ($role) = @_;
+    my $t = defined($role) ? $THEME_RGB{$role} : undef;
+    return '' unless ref($t) eq 'ARRAY';
+    my ($r, $g, $b) = @$t;
+    return "\033[38;2;$r;$g;${b}m";
+}
 
-my $R        = "\033[0m";
-my $B        = "\033[1m";
-my $D        = "\033[2m";
-my $PROJECT  = rgb(59,  130, 246);  # Accent blue
-my $MODEL    = rgb(148, 163, 184);  # Slate gray
-my $BAR_USED = rgb(99,  102, 241);  # Indigo
-my $CTX_OK   = rgb(16,  185, 129);  # Green
-my $CTX_WARN = rgb(245, 158, 11);   # Amber
-my $CTX_CRIT = rgb(239, 68,  68);   # Red
-my $DIM      = rgb(100, 116, 139);  # Muted slate
-my $VDIM     = rgb(60,  70,  85);   # Very dim
-my $SEP      = " ${VDIM}\x{FF5C}${R} ";
+my $R       = "\033[0m";
+my $B       = "\033[1m";
+my $ACCENT  = rgb('accent');
+my $RULE    = rgb('rule');
+my $PRIMARY = rgb('text.primary');
+my $MUTED   = rgb('text.muted');
+my $FAINT   = rgb('text.faint');
+my $OK      = rgb('state.ok');
+my $WARN    = rgb('state.warn');
+my $CRIT    = rgb('state.crit');
+my $SEP     = " ${RULE}\x{FF5C}${R} ";
+
+# ── Display width ────────────────────────────────────────────
+# %GLYPH_COLS declares the display width of every non-single-column glyph
+# this file can emit. U+FF5C (the segment separator) is FULL-WIDTH: two
+# columns, not one. Anything absent from the table counts one column. A
+# drift guard in the suite fails if a declared width disagrees with the
+# canonical glyph table, so this stays honest without an import.
+my %GLYPH_COLS = (
+    0xFF5C => 2,
+    0x3000 => 2,
+    0x2191 => 1,
+    0x2193 => 1,
+);
+
+# row_cost($fragment) -> the budget a rendered fragment consumes.
+# SGR escapes are stripped first; the result is the LARGER of the column sum
+# and the UTF-8 byte length. Both terms are kept deliberately: a terminal
+# budgets in columns, but the output-hygiene oracle measures the raw byte
+# stream, so honouring both means a row that fits one always fits the other.
+# For this alphabet the byte term usually dominates, which makes truncation
+# start marginally early -- declared conservatism, not a defect.
+sub row_cost {
+    my ($s) = @_;
+    return 0 unless defined $s;
+    $s =~ s/\033\[[^m]*m//g;
+    my $cols = 0;
+    $cols += ($GLYPH_COLS{ ord($_) } // 1) for split //, $s;
+    my $bytes = $s;
+    utf8::encode($bytes) if utf8::is_utf8($bytes);
+    my $n = length($bytes);
+    return $cols > $n ? $cols : $n;
+}
+
+# ── Elision, and the non-ambiguity guarantee ─────────────────
+# THE ELISION MARKER IS NON-NEGOTIABLE. A shortened field that dropped its
+# '>' / '<' would be presented to the reader as if it were whole -- exactly
+# the ambiguity criterion 4 exists to forbid. So no path through either
+# primitive below returns a bare fragment of the text:
+#
+#   * $max < 1              -> '' (the field does not render at all);
+#   * the text fits         -> the text, verbatim, with no marker;
+#   * $max < 2              -> the BARE MARKER. Nothing else can be shown in
+#                              one column, and the fit ladder's bottom rungs
+#                              ask for exactly this;
+#   * $max >= 2 but not one
+#     whole character fits
+#     beside the marker     -> marker PLUS one whole character anyway.
+#
+# That last case is a deliberate, BOUNDED overrun of $max (at most three
+# columns, the excess of one 4-byte character) and it is safe because $max is
+# a FIELD budget, not the row's: the ladder re-measures the whole row after
+# every rung and answers an overrun with the next rung. The alternative --
+# a bare marker while the project field is still on the row -- would discard
+# the very text the field exists to carry and would break §2.4.4's N1/N2,
+# which require a NON-EMPTY prefix/suffix beside the marker.
+
+# fit_head($text, $max) -> $text if it fits, else a NON-EMPTY PREFIX of it
+# with an ASCII '>' appended. The head of a name is what identifies it, so
+# the head is what a shortened name keeps.
+sub fit_head {
+    my ($text, $max) = @_;
+    $text = '' unless defined $text;
+    return '' unless length($text);
+    return '' if $max < 1;
+    return $text if row_cost($text) <= $max;
+    return '>' if $max < 2;
+    my $out = '';
+    for my $c (split //, $text) {
+        last if row_cost($out . $c) > $max - 1;
+        $out .= $c;
+    }
+    $out = substr($text, 0, 1) unless length($out);
+    return $out . '>';
+}
+
+# fit_tail($text, $max) -> $text if it fits, else an ASCII '<' followed by a
+# NON-EMPTY SUFFIX of it. The tail of a path is what says where you are; the
+# head is the part a reader can infer.
+sub fit_tail {
+    my ($text, $max) = @_;
+    $text = '' unless defined $text;
+    return '' unless length($text);
+    return '' if $max < 1;
+    return $text if row_cost($text) <= $max;
+    return '<' if $max < 2;
+    my @ch  = split //, $text;
+    my $out = '';
+    while (@ch) {
+        my $c = pop @ch;
+        last if row_cost($c . $out) > $max - 1;
+        $out = $c . $out;
+    }
+    $out = substr($text, -1) unless length($out);
+    return '<' . $out;
+}
+
+# ── Spawning, without a shell ────────────────────────────────
+# $workspace arrives from stdin JSON and is a DIRECTORY NAME: on POSIX it may
+# legally contain '"', ';', a backtick or '$( )', and this script runs inside
+# the Linux container. Interpolating it into a backtick or system() string
+# therefore hands an attacker-controlled string to /bin/sh AS CODE -- a
+# current_dir of `/tmp"; echo pwned 1>&2; git #` really did execute. Every
+# spawn below is LIST-FORM: perl execs the binary directly, so no argument of
+# ours can ever be reparsed as a command.
+#
+# The shell was also what supplied `2>/dev/null`, so stderr is silenced
+# explicitly instead. ('nul' is perl's null device on Win32; this is an
+# open() call, not a shell redirect, so the usual NUL-file hazard does not
+# apply.)
+my $DEVNULL = ($^O eq 'MSWin32') ? 'nul' : '/dev/null';
+
+# quiet_stderr() -> a coderef that puts STDERR back. Between the two, the
+# process's stderr goes to the null device, so a spawned child's diagnostics
+# (`fatal: not a git repository`) never reach the terminal.
+sub quiet_stderr {
+    my $saved;
+    return sub { } unless open($saved, '>&', \*STDERR);
+    open(STDERR, '>', $DEVNULL);
+    return sub { open(STDERR, '>&', $saved); close($saved); };
+}
+
+# cmd_out(@argv) -> the command's stdout, or '' if it could not be run.
+sub cmd_out {
+    my (@argv) = @_;
+    my $restore = quiet_stderr();
+    my $out;
+    if (open(my $fh, '-|', @argv)) {
+        $out = do { local $/; <$fh> };
+        close($fh);
+    }
+    $restore->();
+    return defined($out) ? $out : '';
+}
+
+# spawn_detached(@argv) -> fire-and-forget, never waited on. The trailing '&'
+# that used to background these needed a shell, which is precisely what the
+# list form removes; fork + exec is the shell-free equivalent. A platform
+# without fork simply skips the spawn -- both callers are opportunistic
+# refreshes whose absence costs nothing this render.
+sub spawn_detached {
+    my (@argv) = @_;
+    my $pid = fork();
+    return unless defined $pid;
+    return if $pid;
+    open(STDIN,  '<', $DEVNULL);
+    open(STDOUT, '>', $DEVNULL);
+    open(STDERR, '>', $DEVNULL);
+    { no warnings 'exec'; exec { $argv[0] } @argv; }
+    CORE::exit(127);
+}
 
 # ── Model ────────────────────────────────────────────────────
 my $display  = $data->{model}{display_name} // '';
@@ -36,24 +255,75 @@ my $short    = $display || $model_id;
 $short =~ s/^Claude //;
 $short =~ s/\s*\(\d+[kKmM]\s*context\)//;
 
-# ── Project ──────────────────────────────────────────────────
+# ── Project identity and location ────────────────────────────
+# The project ROOT is computed once, here, and reused by the plans lookup
+# below -- it used to be computed inside that lookup, after row 1 had
+# already taken its project name from the working directory basename, which
+# is why `cd plugins/sandbox/scripts` used to display "scripts".
+# Name and location resolve INDEPENDENTLY: the name always comes from the
+# git toplevel (falling back to the working directory outside a repo), the
+# location is always the full current_dir verbatim, even when the two are
+# unrelated.
 my $workspace = $data->{workspace}{current_dir} // '';
-my $project   = $workspace ? basename($workspace) : '?';
+my $toplevel  = '';
+if (length $workspace) {
+    my $t = cmd_out('git', '-C', $workspace, 'rev-parse', '--show-toplevel');
+    chomp $t;
+    # git writes UTF-8 bytes; decode once so basename and the beacon
+    # git_root comparisons below (which see JSON-decoded text) agree.
+    utf8::decode($t) if length($t) && !utf8::is_utf8($t);
+    $toplevel = $t;
+}
+my $root    = length($toplevel) ? $toplevel : $workspace;
+my $project = length($root) ? basename($root) : '?';
+my $cwd     = $workspace;
 
-# ── Sandbox indicator ─────────────────────────────────────────
+# Both DISPLAY fields are sanitised before they can reach row 1. current_dir
+# comes from stdin JSON and a POSIX directory name may legally contain any
+# byte but '/' and NUL -- including a newline, which would split one row into
+# three, and ESC, which would repaint the terminal from a component nobody
+# audited while row_cost's SGR strip removed it from the budget, desynchro-
+# nising the accounting from what is painted. Rendering the FULL path (rather
+# than only its basename, as this file used to) is what opened that door, so
+# it is closed here. Only the display copies are scrubbed: $root stays
+# verbatim because the plans lookup uses it as a filesystem path and as the
+# beacon git_root key, where a rewritten value would silently miscount.
+$project =~ s/[\x00-\x1f\x7f]//g;
+$cwd     =~ s/[\x00-\x1f\x7f]//g;
+
+# ── Environment marker ───────────────────────────────────────
 # CCPRAXIS_SANDBOX is set ONLY by container/settings.json's `env` block, so
 # this script is otherwise byte-identical in behaviour on the host, where
-# the var is never set (see s17 spec S1: this file is also the payload
-# installed to the user's ~/.claude/statusline.pl and used on the host).
-my $SANDBOX_ON    = $ENV{CCPRAXIS_SANDBOX} ? 1 : 0;
-my $SANDBOX_COLOR = rgb(250, 204, 21);  # amber
-my $sandbox_badge = $SANDBOX_ON ? "${SANDBOX_COLOR}\x{1F4E6} SANDBOX${R}" : '';
+# the var is never set (this file is also the payload installed to the
+# user's ~/.claude/statusline.pl and used on the host).
+#
+# BOTH environments render a marker, in the same role and padded to a common
+# slot, so the row never reflows between them and an absent marker can never
+# be mistaken for a broken statusline. The slot width is derived from the
+# table at run time -- never written down as a number.
+my $SANDBOX_ON = $ENV{CCPRAXIS_SANDBOX} ? 1 : 0;
+my %MARKER = (
+    sandbox => 'SANDBOX',
+    host    => 'HOST',
+);
+my $MARKER_SLOT = 0;
+for my $name (sort keys %MARKER) {
+    my $w = row_cost($MARKER{$name});
+    $MARKER_SLOT = $w if $w > $MARKER_SLOT;
+}
+my $marker = $MARKER{ $SANDBOX_ON ? 'sandbox' : 'host' };
+$marker .= ' ' while row_cost($marker) < $MARKER_SLOT;
 
 # ── Git (with background fetch every 30 min) ────────────────
 my $git_str = '';
 eval {
-    my $branch = `git -C "$workspace" rev-parse --abbrev-ref HEAD 2>/dev/null`;
+    my $branch = cmd_out('git', '-C', $workspace, 'rev-parse', '--abbrev-ref', 'HEAD');
     chomp $branch;
+    # Decoded for the same reason $toplevel is: git writes UTF-8 BYTES, and
+    # the adjacent \x{2325}/\x{200A} upgrade $git_str to a character string,
+    # which would Latin-1-upgrade those bytes and render `feature/Andre'` as
+    # `feature/AndrA(c)`. The sibling call got this treatment; this one did not.
+    utf8::decode($branch) if length($branch) && !utf8::is_utf8($branch);
     if ($branch) {
         # Fetch remote if stale (>30 min since last fetch)
         my $fetch_stamp = "$workspace/.git/FETCH_HEAD";
@@ -63,31 +333,25 @@ eval {
         }
         if ($stale) {
             # Fire-and-forget background fetch (no blocking)
-            system("git -C \"$workspace\" fetch --quiet >/dev/null 2>&1 &");
+            spawn_detached('git', '-C', $workspace, 'fetch', '--quiet');
         }
 
-        my $ahead  = `git -C "$workspace" rev-list --count \@{upstream}..HEAD 2>/dev/null`; chomp $ahead;
-        my $behind = `git -C "$workspace" rev-list --count HEAD..\@{upstream} 2>/dev/null`; chomp $behind;
+        my $ahead  = cmd_out('git', '-C', $workspace, 'rev-list', '--count', '@{upstream}..HEAD'); chomp $ahead;
+        my $behind = cmd_out('git', '-C', $workspace, 'rev-list', '--count', 'HEAD..@{upstream}'); chomp $behind;
         $ahead  = 0 unless $ahead  =~ /^\d+$/;
         $behind = 0 unless $behind =~ /^\d+$/;
 
-        $git_str = "${DIM}\x{2325}\x{200A}${branch}${R}";
-        $git_str .= " ${CTX_OK}\x{2191}${ahead}${R}"  if $ahead  > 0;
-        $git_str .= " ${CTX_WARN}\x{2193}${behind}${R}" if $behind > 0;
+        # The counts are VALUES, not health states -- text.primary, never a
+        # green/amber state role. "A value is present" is not "healthy".
+        $git_str = "${MUTED}\x{2325}\x{200A}${branch}${R}";
+        $git_str .= " ${PRIMARY}\x{2191}${ahead}${R}"  if $ahead  > 0;
+        $git_str .= " ${PRIMARY}\x{2193}${behind}${R}" if $behind > 0;
     }
 };
 
 # ── Plans, Todos & Beacons ───────────────────────────────────
 my $plans_str = '';
 eval {
-    # Project root: git toplevel, falling back to workspace. Decode UTF-8
-    # bytes (from git's stdout) to a Unicode string so beacon git_root
-    # comparisons below (which see JSON-decoded Unicode) match correctly.
-    my $root = `git -C "$workspace" rev-parse --show-toplevel 2>/dev/null`;
-    chomp $root;
-    $root = $workspace unless $root;
-    utf8::decode($root) if defined $root && length $root && !utf8::is_utf8($root);
-
     my @parts;
 
     # Blueprints: non-archived <data>/blueprints/<name>/ (per-project). Count
@@ -99,7 +363,7 @@ eval {
         opendir(my $dh, $bp_root) or die;
         my $n = grep { $_ ne '_archive' && !/^\./ && -f "$bp_root/$_/blueprint.md" } readdir($dh);
         closedir($dh);
-        push @parts, "${DIM}blueprints ${R}${n}" if $n > 0;
+        push @parts, "${MUTED}blueprints ${R}${PRIMARY}${n}${R}" if $n > 0;
     }
 
     # Todos: non-archived ~/.claude/claude-code-vault/todos/*.md (global)
@@ -108,13 +372,12 @@ eval {
         opendir(my $dh, $todo_dir) or die;
         my $n = grep { /\.md$/ && !/^README\.md$/ && -f "$todo_dir/$_" } readdir($dh);
         closedir($dh);
-        push @parts, "${DIM}todos ${R}${n}" if $n > 0;
+        push @parts, "${MUTED}todos ${R}${PRIMARY}${n}${R}" if $n > 0;
     }
 
     # Beacons: project = local .ccpraxis-local-data/claude-home/beacons + vault
     # beacons whose git_root matches $root. Global = cached count file, falling
     # back to a vault-dir filename walk when the cache hasn't been written yet.
-    # Rendered as a single segment: ◉ <project> <global-dim>.
     my $vault_bdir = "$ENV{HOME}/.claude/claude-code-vault/beacons";
     my $n_project  = 0;
     if ($root) {
@@ -152,7 +415,7 @@ eval {
         closedir($dh);
     }
 
-    # Debounced async refresh — fire beacon.pl sync-vault in background when
+    # Debounced async refresh -- fire beacon.pl sync-vault in background when
     # the cache is stale or missing. Two-tier debounce: a .sync-vault.last-fired
     # sentinel limits spawn rate to ~1 every 5s regardless of render rate,
     # then LOCK_NB inside sync-vault dedupes any spawns that still overlap.
@@ -176,24 +439,24 @@ eval {
             # them), but the sentinel must move forward or we'd fire forever.
             if (open(my $ts, '>>', $fired_stamp)) { close $ts; }
             utime(undef, undef, $fired_stamp);
-            system("perl \"$beacon_script\" sync-vault >/dev/null 2>&1 &");
+            spawn_detached($^X, $beacon_script, 'sync-vault');
         }
     }
 
     if ($n_project > 0 || $n_global > 0) {
-        my $s = "${DIM}beacons ${R}";
+        my $s = "${MUTED}beacons ${R}";
         if ($n_project > 0 && $n_global > 0) {
-            # `<proj> / <vdim global>` — project bright; slash and global
-            # count both very-dim so they recede as one unit. Spaces give
+            # `<proj> / <faint global>` -- project bright; slash and global
+            # count both faint so they recede as one unit. Spaces give
             # visual breathing room.
-            $s .= "${n_project} ${VDIM}/ ${n_global}${R}";
+            $s .= "${PRIMARY}${n_project}${R} ${FAINT}/ ${n_global}${R}";
         } elsif ($n_project > 0) {
-            $s .= "${n_project}";
+            $s .= "${PRIMARY}${n_project}${R}";
         } else {
-            # Only global beacons (none in this project) — render as 0 / N so
+            # Only global beacons (none in this project) -- render as 0 / N so
             # the asymmetry is explicit and the bare number isn't misread
             # as a project count.
-            $s .= "0 ${VDIM}/ ${n_global}${R}";
+            $s .= "${PRIMARY}0${R} ${FAINT}/ ${n_global}${R}";
         }
         push @parts, $s;
     }
@@ -217,14 +480,14 @@ sub fmt {
 }
 
 my $pct_i       = int($pct + 0.5);
-my $pc          = $pct_i >= 90 ? $CTX_CRIT : $pct_i >= 67 ? $CTX_WARN : $CTX_OK;
+my $pc          = $pct_i >= 90 ? $CRIT : $pct_i >= 67 ? $WARN : $OK;
 my $used_tokens = int($size * $pct / 100 + 0.5);
 my $free_tokens = $size - $used_tokens;
 
 # ── Plan usage ──────────────────────────────────────────────
 sub usage_color {
     my $p = shift;
-    return $p >= 80 ? $CTX_CRIT : $p >= 50 ? $CTX_WARN : $CTX_OK;
+    return $p >= 80 ? $CRIT : $p >= 50 ? $WARN : $OK;
 }
 
 sub time_until {
@@ -273,55 +536,121 @@ if ($rl) {
 
     my $h5_reset = time_until($h5->{resets_at}, 'hm');
     my $d7_reset = time_until($d7->{resets_at});
-    my $h5_r     = $h5_reset ? "${VDIM}\x{FF5C}${h5_reset}\x{FF5C}${R}" : '';
-    my $d7_r     = $d7_reset ? "${VDIM}\x{FF5C}${d7_reset}\x{FF5C}${R}" : '';
+    my $h5_r     = $h5_reset ? "${FAINT}\x{FF5C}${h5_reset}\x{FF5C}${R}" : '';
+    my $d7_r     = $d7_reset ? "${FAINT}\x{FF5C}${d7_reset}\x{FF5C}${R}" : '';
 
-    $plan_full  = "${DIM}5h ${R}" . usage_color($h5_pct) . "${h5_pct}%${R}${h5_r}"
-                . "\x{3000}${DIM}7d ${R}" . usage_color($d7_pct) . "${d7_pct}%${R}${d7_r}";
-    $plan_short = "${DIM}5h ${R}" . usage_color($h5_pct) . "${h5_pct}%${R}"
-                . "\x{3000}${DIM}7d ${R}" . usage_color($d7_pct) . "${d7_pct}%${R}";
+    $plan_full  = "${MUTED}5h ${R}" . usage_color($h5_pct) . "${h5_pct}%${R}${h5_r}"
+                . "\x{3000}${MUTED}7d ${R}" . usage_color($d7_pct) . "${d7_pct}%${R}${d7_r}";
+    $plan_short = "${MUTED}5h ${R}" . usage_color($h5_pct) . "${h5_pct}%${R}"
+                . "\x{3000}${MUTED}7d ${R}" . usage_color($d7_pct) . "${d7_pct}%${R}";
 }
 
-# ── Output (single line if it fits, wrap if not) ─────────────
-sub vlen { my $s = shift; $s =~ s/\033\[[^m]*m//g; length($s) }
+# ── Row 1 ────────────────────────────────────────────────────
+my $cols = cmd_out('tput', 'cols');
+chomp $cols if defined $cols;
+$cols = 120 unless defined($cols) && $cols =~ /^\d+$/ && $cols > 0;
 
-# truncate_display($text, $max) -> $text, shortened with a trailing marker
-# if it would exceed $max visible columns. Never wraps, never overflows.
-# ASCII marker (not a multi-byte ellipsis glyph): keeps a 1-visible-char
-# budget exactly equal to a 1-byte budget, so callers measuring raw bytes
-# (rather than decoded characters) still see the same bound honoured.
-sub truncate_display {
-    my ($text, $max) = @_;
-    $max = 1 if $max < 1;
-    return $text if length($text) <= $max;
-    return substr($text, 0, $max) if $max <= 1;
-    return substr($text, 0, $max - 1) . '>';
+# row1(...) -- render the five fields in their binding order. A field with
+# no text contributes neither itself nor its separator.
+sub row1 {
+    my ($m, $p, $d, $g, $b) = @_;
+    my $row = "${MUTED}${m}${R}";
+    $row .= "${SEP}${ACCENT}${B}${p}${R}" if length $p;
+    $row .= "${SEP}${FAINT}${d}${R}"      if length $d;
+    $row .= "${SEP}${g}"                  if length $g;
+    $row .= "${SEP}${b}"                  if length $b;
+    return $row;
 }
 
-my $cols = `tput cols 2>/dev/null`; chomp $cols; $cols ||= 120;
+# The fit ladder. The WHOLE row is budgeted, never one field of it: the old
+# code truncated the project name to the full column budget and then
+# appended the separator, git and plans segments on top, overflowing the row
+# by whatever those segments cost.
+#
+# Strict priority, stopping the moment the row fits. Order is
+# identity-before-location: the working directory yields all the way to its
+# floor before the project name gives up a single character, because the
+# name is what says WHICH project and the path only says where in it. git
+# and plans are dropped whole, never elided -- they carry embedded SGR and
+# cutting one mid-escape would emit garbage.
+my $f_marker  = $marker;
+my $f_project = $project;
+my $f_cwd     = $cwd;
+my $f_git     = $git_str;
+my $f_plans   = $plans_str;
+my $sep_cost  = row_cost($SEP);
+my $line1;
 
-# Project name must truncate gracefully rather than break layout. Reserve
-# room for the sandbox badge (plus its separator) when present, so the
-# combined project+badge segment never overflows $cols.
-my $badge_reserve = $sandbox_badge ? (vlen($sandbox_badge) + vlen($SEP)) : 0;
-my $project_avail = $cols - $badge_reserve;
-$project_avail = 1 if $project_avail < 1;
-my $project_disp = truncate_display($project, $project_avail);
+FIT: {
+    $line1 = row1($f_marker, $f_project, $f_cwd, $f_git, $f_plans);
+    last FIT if row_cost($line1) <= $cols;
 
-my $line1 = "${PROJECT}${B}${project_disp}${R}";
-$line1 .= "${SEP}${sandbox_badge}" if $sandbox_badge;
-$line1 .= "${SEP}${git_str}" if $git_str;
-$line1 .= "${SEP}${plans_str}" if $plans_str;
+    # 2. plans, and its separator.
+    $f_plans = '';
+    $line1 = row1($f_marker, $f_project, $f_cwd, $f_git, $f_plans);
+    last FIT if row_cost($line1) <= $cols;
 
-my $line2 = "${MODEL}${short}${R} "
-          . "${DIM}" . fmt($size) . "${R}\x{3000}"
+    # 3. git, and its separator.
+    $f_git = '';
+    $line1 = row1($f_marker, $f_project, $f_cwd, $f_git, $f_plans);
+    last FIT if row_cost($line1) <= $cols;
+
+    # 4. left-elide the working directory, down to its floor.
+    if (length $f_cwd) {
+        my $fixed = row_cost($f_marker)
+                  + (length($f_project) ? $sep_cost + row_cost($f_project) : 0)
+                  + $sep_cost;
+        my $avail = $cols - $fixed;
+        $avail = MIN_CWD_COLS if $avail < MIN_CWD_COLS;
+        $f_cwd = fit_tail($cwd, $avail);
+        $line1 = row1($f_marker, $f_project, $f_cwd, $f_git, $f_plans);
+        last FIT if row_cost($line1) <= $cols;
+    }
+
+    # 5. right-elide the project name, down to its floor.
+    if (length $f_project) {
+        my $fixed = row_cost($f_marker) + $sep_cost
+                  + (length($f_cwd) ? $sep_cost + row_cost($f_cwd) : 0);
+        my $avail = $cols - $fixed;
+        $avail = MIN_PROJECT_COLS if $avail < MIN_PROJECT_COLS;
+        $f_project = fit_head($project, $avail);
+        $line1 = row1($f_marker, $f_project, $f_cwd, $f_git, $f_plans);
+        last FIT if row_cost($line1) <= $cols;
+    }
+
+    # 6. the project, and its separator.
+    $f_project = '';
+    $line1 = row1($f_marker, $f_project, $f_cwd, $f_git, $f_plans);
+    last FIT if row_cost($line1) <= $cols;
+
+    # 7. the working directory down to a bare marker, then gone entirely.
+    if (length $f_cwd) {
+        $f_cwd = fit_tail($cwd, 1);
+        $line1 = row1($f_marker, $f_project, $f_cwd, $f_git, $f_plans);
+        last FIT if row_cost($line1) <= $cols;
+        $f_cwd = '';
+        $line1 = row1($f_marker, $f_project, $f_cwd, $f_git, $f_plans);
+        last FIT if row_cost($line1) <= $cols;
+    }
+
+    # 8. the marker itself. Below the common slot the symmetry guarantee is
+    # void by declaration -- nothing can hold there -- but the budget
+    # invariant still does.
+    (my $bare = $f_marker) =~ s/\s+\z//;
+    $f_marker = fit_head($bare, $cols);
+    $line1 = row1($f_marker, '', '', '', '');
+}
+
+# ── Row 2 (single line if it fits, wrap if not) ──────────────
+my $line2 = "${MUTED}${short}${R} "
+          . "${MUTED}" . fmt($size) . "${R}\x{3000}"
           . "${pc}${pct_i}%${R} "
-          . "${VDIM}\x{FF5C}${R}${BAR_USED}" . fmt($used_tokens) . "${R} "
-          . "${CTX_OK}" . fmt($free_tokens) . "${R}${VDIM}\x{FF5C}${R}";
+          . "${FAINT}\x{FF5C}${R}${ACCENT}" . fmt($used_tokens) . "${R} "
+          . "${PRIMARY}" . fmt($free_tokens) . "${R}${FAINT}\x{FF5C}${R}";
 
 if ($plan_full) {
     my $oneline2 = "${line2} ${plan_full}";
-    if (vlen($oneline2) <= $cols) {
+    if (row_cost($oneline2) <= $cols) {
         print "${line1}\n${oneline2}";
     } else {
         print "${line1}\n${line2}\n${plan_full}";

@@ -83,21 +83,10 @@ my $END_RE       = qr/^\Q$END_MARKER\E$/m;
 # or non-emptiness — later packages legitimately empty them (AC-18, E-2, E-3).
 # ===========================================================================
 my @GENERATED_SURFACES = (
-    { path    => $STATUSLINE_REL,
-      pending => 'package 10-statusline-rebuild adds the GENERATED block and clears this marker' },
+    { path    => $STATUSLINE_REL },
 );
 
 my %EMOJI_PENDING = (
-    'scripts/statusline.pl'                   => 'package 10-statusline-rebuild removes this entry',
-    # Was 'no package owns this file' when this list was written, which was true
-    # then and is FALSE now: on 2026-08-07 the driver closed that scope gap by
-    # adding bp-statusline.pl to package 10-statusline-rebuild's write set, since
-    # it renders into the same Claude Code statusline surface as scripts/
-    # statusline.pl and Decision 11 ("no emojis anywhere") was otherwise
-    # unachievable. Re-pointed rather than left standing: a waiver whose stated
-    # justification has become false is exactly the rot the stale-waiver rule
-    # exists to prevent -- it would have told a future reader nobody could fix it.
-    'plugins/butler/scripts/bp-statusline.pl' => 'package 10-statusline-rebuild removes this entry; it now owns bp-statusline.pl (driver scope change 2026-08-07)',
 );
 
 # redteam.md M6(c): the verdict above is computed PER SURFACE, not per hit --
@@ -109,9 +98,7 @@ my %EMOJI_PENDING = (
 # present (that would duplicate the stale-entry arm and would redden package
 # 06 mid-flight for a partial cleanup) -- this only catches ADDITIONS.
 my %EMOJI_PENDING_CODEPOINTS = (
-    'scripts/statusline.pl'                   => { 0x1F4E6 => 1 },
     'plugins/sandbox/scripts/Dashboard.pm'    => { 0x1F7E2 => 1, 0x1F534 => 1, 0x1F7E1 => 1, 0x26AA => 1 },
-    'plugins/butler/scripts/bp-statusline.pl' => { 0x1F7E2 => 1, 0x1F534 => 1, 0x1F7E1 => 1, 0x26AA => 1 },
 );
 
 my @EMOJI_SURFACES = (

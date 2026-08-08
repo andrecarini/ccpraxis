@@ -33,8 +33,47 @@ binmode STDOUT, ':raw';
 # in the BUTLER plugin's scripts/, so there is no shared @INC entry to rely
 # on.
 my $SANDBOX_SCRIPTS = "$Bin/../../sandbox/scripts";
-eval { require "$SANDBOX_SCRIPTS/SpendPanel.pm"; 1 } or warn "bp-statusline.pl: SpendPanel.pm unavailable: $@";
-eval { require "$SANDBOX_SCRIPTS/Dashboard.pm"; 1 }   or warn "bp-statusline.pl: Dashboard.pm unavailable: $@";
+
+# Theme is loaded FIRST, and through a localised @INC rather than by absolute
+# path. Both of those are load-bearing. %INC is keyed by the exact string a
+# require names, so `require "$SANDBOX_SCRIPTS/Theme.pm"` keys an ABSOLUTE
+# path while Dashboard.pm's own `require Theme` keys 'Theme.pm' -- the two
+# never match, so Theme.pm compiled TWICE per invocation and emitted ~4 KB of
+# "Subroutine ... redefined" warnings on every render of a statusline.
+# Naming the file relative to a @INC entry keys 'Theme.pm', which is the key
+# the sibling module will look for, so the second require is the no-op it
+# should be. The load still comes from $SANDBOX_SCRIPTS, still sits inside an
+# eval, and still degrades with a warn rather than ending the render.
+my $HAVE_THEME = eval {
+    local @INC = ($SANDBOX_SCRIPTS, @INC);
+    require "Theme.pm";
+    1;
+} ? 1 : 0;
+$HAVE_THEME or warn "bp-statusline.pl: Theme.pm unavailable: $@";
+
+# Each load's SUCCESS is captured, not merely warned about. `defined
+# &Dashboard::fit_spans` is not a health check: a module that fails part-way
+# through its own top-level statements leaves every sub installed and its
+# file-scoped state uninitialised, so the sub exists and is unusable. Gating
+# on the eval is the only test that distinguishes the two.
+#
+# The same localised @INC serves a second purpose for Dashboard.pm, which is
+# not cosmetic: Dashboard's own top-level `require tui::Layout` /
+# `require tui::DashboardScreen` go through @INC, so loading Dashboard by
+# absolute path alone made it die on any run that did not happen to have
+# PERL5LIB pointing here -- i.e. every real one.
+my $HAVE_SPENDPANEL = eval {
+    local @INC = ($SANDBOX_SCRIPTS, @INC);
+    require "SpendPanel.pm";
+    1;
+} ? 1 : 0;
+$HAVE_SPENDPANEL or warn "bp-statusline.pl: SpendPanel.pm unavailable: $@";
+my $HAVE_DASHBOARD = eval {
+    local @INC = ($SANDBOX_SCRIPTS, @INC);
+    require "Dashboard.pm";
+    1;
+} ? 1 : 0;
+$HAVE_DASHBOARD or warn "bp-statusline.pl: Dashboard.pm unavailable: $@";
 
 my $raw  = do { local $/; my $r = <STDIN>; defined $r ? $r : '' };
 my $data = eval { decode_json($raw) };
@@ -46,22 +85,41 @@ my $width = (defined $data->{width} && !ref($data->{width}) && $data->{width} =~
           ? int($data->{width}) : 40;
 
 my $info = {};
-if (defined &SpendPanel::status) {
+if ($HAVE_SPENDPANEL && defined &SpendPanel::status) {
     my $got = eval { SpendPanel::status($spend, $now) };
     $info = $got if ref($got) eq 'HASH';
 }
 
-# Status-dot glyphs, matching Dashboard's own s06 palette (grep _spend_glyph
-# in Dashboard.pm) -- kept as a local literal table rather than reaching
-# into Dashboard's PRIVATE _spend_glyph, since this script's contract is
-# "render b37's own compact form", not "reuse the panel's internals".
-my %GLYPH = (
-    ok         => encode('UTF-8', "\x{1F7E2}"),
-    exhausted  => encode('UTF-8', "\x{1F534}"),
-    unreadable => encode('UTF-8', "\x{1F534}"),
-    absent     => encode('UTF-8', "\x{1F7E1}"),
-    disabled   => encode('UTF-8', "\x{26AA}"),
+# Status glyphs, sourced from the SHARED token vocabulary by role name
+# rather than from private literals: Theme::glyph() already returns UTF-8
+# BYTES, which is exactly this script's output contract. The four emoji
+# these replace are gone by design (no emoji anywhere on a ccpraxis
+# terminal surface) -- a state is carried by a geometric glyph plus colour,
+# never by a coloured picture whose width the terminal disagrees about.
+my %GLYPH_ROLE = (
+    ok         => 'status.ok',
+    exhausted  => 'status.crit',
+    unreadable => 'status.crit',
+    absent     => 'status.warn',
+    disabled   => 'status.idle',
 );
+
+# The DEGRADE path, for a tree where Theme.pm cannot be loaded: pairwise
+# distinct ASCII, one byte and one column each, so the script still prints
+# at most one line and still never dies.
+my %GLYPH_FALLBACK = (
+    ok         => 'o',
+    exhausted  => 'x',
+    unreadable => 'x',
+    absent     => '!',
+    disabled   => '-',
+);
+
+my %GLYPH;
+for my $state (sort keys %GLYPH_ROLE) {
+    my $g = ($HAVE_THEME && defined &Theme::glyph) ? Theme::glyph($GLYPH_ROLE{$state}) : undef;
+    $GLYPH{$state} = (defined($g) && $g ne '') ? $g : $GLYPH_FALLBACK{$state};
+}
 sub _glyph_for {
     my ($state) = @_;
     return (defined $state && exists $GLYPH{$state}) ? $GLYPH{$state} : $GLYPH{disabled};
@@ -91,7 +149,7 @@ for my $spec ([ 'claude', 'C' ], [ 'go', 'G' ], [ 'zen', 'Z' ]) {
 }
 
 my $out;
-if (defined &Dashboard::fit_spans && defined &Dashboard::spans_text) {
+if ($HAVE_DASHBOARD && defined &Dashboard::fit_spans && defined &Dashboard::spans_text) {
     my $fitted = Dashboard::fit_spans(\@spans, $width, 'body');
     $out = Dashboard::spans_text($fitted);
 } else {
