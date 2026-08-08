@@ -3445,6 +3445,139 @@ my $_s03_probe_state = sub {
              image_present => $image_present, exec_probe_ok => $exec_probe_ok };
 };
 
+# ===========================================================================
+# WHY THE LAST CONTAINER STOPPED
+#
+# container/heartbeat.sh reaps its own container when the host manager stops
+# touching /tmp/.launcher-alive. That is usually right, and it used to be
+# entirely silent: podman would report "Exited (0)" and nothing else. On
+# 2026-08-08 an operator left a fleet running, Windows entered connected
+# standby for five hours forty minutes, and the container reaped itself two
+# seconds after the resume -- with a clean exit code, because from the loop's
+# point of view it had shut down correctly. There was nothing to read.
+#
+# heartbeat.sh now writes a record to .launcher/last-reap.txt (on the bind
+# mount, so it outlives the container) BEFORE breaking. This is the host end:
+# the next launch reads that record and says, in words, why the operator came
+# back to a stopped container.
+#
+# Shown ONCE per record. The marker stores the record's own `when=` stamp, so
+# a NEW reap re-arms the notice while the old one stays on disk for forensics
+# -- deleting the record to silence the notice would throw away the evidence
+# the record exists to preserve.
+# ===========================================================================
+my $REAP_RECORD_FILE = "$LAUNCHER_DIR/last-reap.txt";
+my $REAP_SHOWN_FILE  = "$LAUNCHER_DIR/last-reap.shown";
+
+# >>> s-reap-notice:BEGIN
+# parse_reap_record TEXT -> \%fields. PURE.
+#
+# The record is `key=value` lines written by heartbeat.sh. Split on the FIRST
+# '=' only: the `why=` sentence is prose and contains '=' in no controlled
+# way, so a greedy split would silently truncate the one field a human
+# actually reads. Unknown keys are kept rather than dropped, so a future
+# heartbeat.sh field is not lost by an older launcher.
+sub parse_reap_record {
+    my ($text) = @_;
+    my %f;
+    return \%f unless defined $text;
+    for my $line (split /\r?\n/, $text) {
+        next unless $line =~ /\A([A-Za-z0-9_]+)=(.*)\z/;
+        $f{$1} = $2;
+    }
+    return \%f;
+}
+
+# reap_notice_lines \%fields -> @lines (no colour, no trailing newlines). PURE.
+#
+# Returns the empty list for a record with no verdict -- an unreadable or
+# absent record must produce NO notice rather than a half-empty box, because
+# a launcher that shouts about a file it could not parse is worse than one
+# that stays quiet.
+sub reap_notice_lines {
+    my ($f) = @_;
+    return () unless ref $f eq 'HASH' && defined $f->{verdict} && length $f->{verdict};
+
+    my $verdict = $f->{verdict};
+    my @out = ($verdict eq 'hardstop'
+        ? 'The previous container was stopped after a graceful-shutdown window expired.'
+        : 'The previous container shut itself down.');
+
+    # The sentence heartbeat.sh composed. It is authored next to the decision
+    # it describes, so it cannot drift from it -- prefer it to anything
+    # reconstructed here.
+    push @out, _reap_wrap($f->{why}) if defined $f->{why} && length $f->{why};
+
+    # The facts, compactly, for a reader who wants to check the sentence.
+    my @facts;
+    push @facts, "when $f->{when}" if defined $f->{when} && length $f->{when};
+    push @facts, "verdict $verdict";
+    if (defined $f->{heartbeat_age_s} && length $f->{heartbeat_age_s}) {
+        my $age = "heartbeat $f->{heartbeat_age_s}s old";
+        $age .= " (limit $f->{heartbeat_limit_s}s)"
+            if defined $f->{heartbeat_limit_s} && length $f->{heartbeat_limit_s};
+        push @facts, $age;
+    }
+    push @facts, "run_active $f->{run_active}"
+        if defined $f->{run_active} && length $f->{run_active};
+    push @facts, "host suspends $f->{host_suspends_detected}"
+        if defined $f->{host_suspends_detected} && length $f->{host_suspends_detected};
+    push @out, join(' · ', @facts) if @facts;
+
+    # A suspend-shaped reap has a specific, actionable cause, and the operator
+    # cannot infer it from the numbers alone. Say what to do about it.
+    if (($f->{host_suspends_detected} || 0) > 0) {
+        push @out, _reap_wrap(
+            'The machine slept while the container was up. keep-awake.ps1 holds it '
+          . 'out of connected standby, but it only runs while a butler run is active '
+          . '-- so an idle sandbox is still exposed to a long suspend.');
+    }
+    return @out;
+}
+
+# _reap_wrap TEXT -> one wrapped string. PURE. Greedy word wrap at 76 columns;
+# a word longer than the limit is emitted whole rather than broken, since
+# breaking a path or an identifier makes it uncopyable.
+sub _reap_wrap {
+    my ($text) = @_;
+    my @lines; my $cur = '';
+    for my $w (split /\s+/, ($text // '')) {
+        next unless length $w;
+        if (!length $cur)              { $cur = $w }
+        elsif (length($cur) + 1 + length($w) <= 76) { $cur .= " $w" }
+        else                           { push @lines, $cur; $cur = $w }
+    }
+    push @lines, $cur if length $cur;
+    return join("\n", @lines);
+}
+# >>> s-reap-notice:END
+
+# _surface_last_reap() -- the impure edge: read, de-duplicate against the
+# marker, print, remember. Best-effort throughout; explaining a past death
+# must never be able to prevent this launch.
+sub _surface_last_reap {
+    my $text = _read_file($REAP_RECORD_FILE);
+    return 0 unless defined $text && length $text;
+
+    my $f = parse_reap_record($text);
+    my @lines = reap_notice_lines($f);
+    return 0 unless @lines;
+
+    my $stamp = $f->{when} // '';
+    my $seen  = _read_file($REAP_SHOWN_FILE);
+    $seen = '' unless defined $seen;
+    chomp $seen;
+    return 0 if length $stamp && $seen eq $stamp;
+
+    print STDERR "\n", _c_warn('NOTE:'), " ", shift(@lines), "\n";
+    print STDERR "      $_\n" for map { split /\n/, $_ } @lines;
+    print STDERR "      (recorded at $REAP_RECORD_FILE)\n\n";
+
+    eval { _write_file($REAP_SHOWN_FILE, "$stamp\n"); 1 };   # best-effort
+    return 1;
+}
+_surface_last_reap();
+
 # $start_rc stays undef through a pre-flight abort below (machine
 # unreachable / image missing / degraded exec -- none of which ever call the
 # start seam), which is exactly how the code right after the gate call tells

@@ -179,6 +179,141 @@ is(hb_call({}, 'reap_decision 1 1 1 1'), 'hardstop', 'stale + active, grace expi
          'record: a hardstop must NOT claim no run was active — it fires precisely when one was');
 }
 
+# ===========================================================================
+# PART 5 — the HOST end of the same story: launcher.pl surfaces the record
+#
+# heartbeat.sh writing last-reap.txt is only half a fix. A record nobody reads
+# leaves the operator exactly where the incident left them: a stopped
+# container and "Exited (0)". These assertions cover the launcher's pure
+# formatting region, extracted by sentinel and eval'd into a throwaway package
+# (the t/58 precedent) -- launcher.pl is NEVER require'd or run, because doing
+# so builds an image and starts a container inside the test run.
+# ===========================================================================
+{
+    my $LAUNCHER = "$Bin/../../scripts/launcher.pl";
+    ok(-f $LAUNCHER, 'launcher.pl exists');
+
+    my $src = do { local (@ARGV, $/) = ($LAUNCHER); <> };
+    $src = '' unless defined $src;
+
+    my $BEGIN_S = '# >>> s-reap-notice:BEGIN';
+    my $END_S   = '# >>> s-reap-notice:END';
+    my $nbegin  = () = $src =~ /\Q$BEGIN_S\E/g;
+    is($nbegin, 1, "sentinel: BEGIN '$BEGIN_S' occurs exactly once in launcher.pl");
+
+    my ($region) = $src =~ /\Q$BEGIN_S\E.*?\n(.*?)\Q$END_S\E/s;
+
+    SKIP: {
+        skip "reap-notice region not found in launcher.pl", 20 unless defined $region;
+
+        # Purity: the region must be formatting only. Anything that shells out
+        # or exits belongs in _surface_last_reap, outside the sentinels --
+        # otherwise a failure to EXPLAIN a past death could prevent a launch.
+        #
+        # Scan CODE, not prose. A comment that quotes a backtick or writes the
+        # word "system" is documenting the rule, not breaking it; punishing a
+        # file for explaining itself has cost this repo five separate debugging
+        # sessions (t/62, t/94, t/95, t/65 AC-M2, t/66). Blank every full-line
+        # and trailing comment first. Quote-aware enough for this region, whose
+        # string literals contain no '#'.
+        my $code = join "\n", map {
+            my $l = $_; $l =~ s/(?<!\$)#.*$//; $l;
+        } split /\n/, $region;
+
+        unlike($code, qr/\$PODMAN\b/,
+            'purity: the notice region never touches podman');
+        unlike($code, qr/\bsystem\s*\(|`[^`]*`|\bexit\s*\(/,
+            'purity: the notice region has no subprocess or exit path');
+        unlike($code, qr/\b_read_file\b|\b_write_file\b|\bopen\s+my\b/,
+            'purity: the notice region does no file I/O -- the impure edge is its caller');
+
+        # Counter-fixture for the scanner itself: the blanking must not be so
+        # eager that it hides real code. A line that genuinely calls system()
+        # has to survive it, or all three assertions above are vacuous.
+        {
+            my $probe = join "\n", map {
+                my $l = $_; $l =~ s/(?<!\$)#.*$//; $l;
+            } split /\n/, "# a comment mentioning system( and \$PODMAN\nsystem(\$PODMAN);";
+            like($probe, qr/\bsystem\s*\(/,
+                'counter-fixture: comment-blanking still leaves real system() calls visible');
+            unlike($probe, qr/comment mentioning/,
+                'counter-fixture: comment-blanking does remove prose');
+        }
+
+        my $pkg = 'ReapNotice';
+        my $ok  = eval "package $pkg; use strict; use warnings;\n$region\n1;";  ## no critic
+        ok($ok, 'extraction: the reap-notice region evals cleanly under strict/warnings')
+            or diag("eval error: $@");
+
+        my $parse  = $pkg->can('parse_reap_record');
+        my $notice = $pkg->can('reap_notice_lines');
+        ok(defined $parse && defined $notice,
+            'extraction: the region defines parse_reap_record and reap_notice_lines');
+
+        SKIP: {
+            skip 'region did not eval', 13 unless defined $parse && defined $notice;
+
+            # Round-trip the EXACT bytes heartbeat.sh writes, produced by
+            # heartbeat.sh itself rather than hand-typed here -- a hand-typed
+            # fixture would keep passing after the writer's format drifted.
+            my $dir = tempdir(CLEANUP => 1);
+            my $rec = "$dir/last-reap.txt";
+            hb_call({ REAP_RECORD => $rec, HB => 600 },
+                    'write_reap_record reap 20402 0 1');
+            my $txt = do { local (@ARGV, $/) = ($rec); <> };
+            $txt = '' unless defined $txt;
+
+            my $f = $parse->($txt);
+            is($f->{verdict}, 'reap',
+                'parse: reads the verdict written by the real writer');
+            is($f->{heartbeat_age_s}, '20402', 'parse: reads the heartbeat age');
+            is($f->{host_suspends_detected}, '1', 'parse: reads the suspend count');
+            like($f->{why}, qr/asleep, not because the manager died/,
+                'parse: keeps the why= sentence WHOLE -- splitting on every "=" '
+              . 'would truncate the one field a human actually reads');
+
+            my $out = join "\n", $notice->($f);
+            like($out, qr/shut itself down/,
+                'notice: says the container stopped on its own, not that it crashed');
+            like($out, qr/asleep, not because the manager died/,
+                "notice: carries heartbeat.sh's own sentence rather than reconstructing one");
+            like($out, qr/20402s old/,        'notice: shows how stale the sentinel was');
+            like($out, qr/limit 600s/,        'notice: and the limit it was judged against');
+            like($out, qr/keep-awake/,
+                'notice: a suspend-shaped reap names the remedy -- the numbers alone '
+              . 'do not tell the operator what to change');
+
+            # Counter-fixture: the suspend advice must be able NOT to fire.
+            my $rec2 = "$dir/nosuspend.txt";
+            hb_call({ REAP_RECORD => $rec2, HB => 600 },
+                    'write_reap_record reap 700 0 0');
+            my $t2 = do { local (@ARGV, $/) = ($rec2); <> };
+            my $o2 = join "\n", $notice->($parse->($t2 // ''));
+            unlike($o2, qr/keep-awake/,
+                'counter-fixture: no suspend detected -> no keep-awake advice, so the '
+              . 'advice above is evidence and not a constant');
+
+            # A hardstop is a different death and must read as one.
+            my $rec3 = "$dir/hard.txt";
+            hb_call({ REAP_RECORD => $rec3, HB => 600 },
+                    'write_reap_record hardstop 700 1 0');
+            my $t3 = do { local (@ARGV, $/) = ($rec3); <> };
+            my $o3 = join "\n", $notice->($parse->($t3 // ''));
+            like($o3, qr/graceful-shutdown window expired/,
+                'notice: a hardstop is told as a hardstop, not as a self-reap');
+
+            # An unreadable or absent record must be silent. A launcher that
+            # shouts about a file it could not parse is worse than a quiet one.
+            my @empty = $notice->($parse->(''));
+            is(scalar(@empty), 0,
+                'notice: an empty record produces no notice at all');
+            my @junk = $notice->($parse->("garbage without any fields\n"));
+            is(scalar(@junk), 0,
+                'notice: an unparseable record produces no notice at all');
+        }
+    }
+}
+
 done_testing();
 
 sub spew { my ($p,$c)=@_; open my $fh,'>:raw',$p or die "$p: $!"; print $fh $c; close $fh; }
