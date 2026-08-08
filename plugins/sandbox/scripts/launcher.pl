@@ -4102,7 +4102,15 @@ sub enter_dashboard {
             # screenshot). Same shared predicate as _history_events, applied
             # BEFORE Dashboard::recent_events sees @lines.
             @lines = grep { !_is_heartbeat_line($_) } @lines;
-            my $cur   = Dashboard::recent_events(\@lines, $ACTIVITY_EVENT_MAX);
+            # 06-dashboard-screen E-E, granted by the driver 2026-08-08.
+            # recent_events renders a per-event time ONLY when $now is defined
+            # ("no fabricated clock" -- an unknown value renders no field). A
+            # two-argument call therefore ships a dashboard with the time
+            # column silently gone. Passing the clock explicitly here is the
+            # one-line fix that avoids that regression; the 3rd argument stays
+            # undef because the new renderer measures an age and never
+            # formats a wall-clock time.
+            my $cur   = Dashboard::recent_events(\@lines, $ACTIVITY_EVENT_MAX, undef, time);
             # s16-fleet-event-source: fold the active blueprint run's
             # orchestrator.log into the SAME activity panel (SYN-5 -- not a
             # second feed) via the best-effort cross-source interleave, never
@@ -5075,7 +5083,9 @@ sub _history_events {
             # rather than N heartbeats from a long-lived run. Current-session live
             # tail (the gather callback's own @lines / $cur) is untouched.
             @lines = grep { !_is_heartbeat_line($_) } @lines;
-            my $ev = Dashboard::recent_events(\@lines, $HISTORY_EVENTS_PER_LOG);
+            # E-E (see the activity call site): pass the clock, or these rows
+            # lose their time field too.
+            my $ev = Dashboard::recent_events(\@lines, $HISTORY_EVENTS_PER_LOG, undef, time);
             if (ref $ev eq 'ARRAY') {
                 # HISTORY-only: clamp bytes-per-span so a planted oversized field
                 # in a prior log can't pin an expensive row for the dashboard's
@@ -5118,7 +5128,8 @@ sub _gather_orchestrator_events {
             my $log = "$active->{runs_dir}/orchestrator.log";
             if (-f $log) {
                 my @lines = _tail_lines($log, $ORCH_TAIL_LINES);
-                my $rows  = Dashboard::recent_events(\@lines, $ORCH_EVENTS_PER_LOG);
+                # E-E (see the activity call site): pass the clock.
+                my $rows  = Dashboard::recent_events(\@lines, $ORCH_EVENTS_PER_LOG, undef, time);
                 $ev = $rows if ref $rows eq 'ARRAY';
             }
         }
