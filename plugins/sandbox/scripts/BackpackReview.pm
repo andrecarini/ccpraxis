@@ -121,7 +121,9 @@ sub review {
     # Persist the store regardless: a migration may have seeded it, and prune may
     # have dropped vanished entries — both must survive to the next launch.
     unless (@$pending) {
-        BackpackApproval::save($approvals, $appr);
+        my %e;
+        BackpackApproval::save($approvals, $appr, \%e)
+            or $p->("WARNING: could not save approvals: " . ($e{message} // $e{errno} // 'no detail') . "\n");
         return (\@items, 0);
     }
 
@@ -180,7 +182,11 @@ sub review {
         }
     }
 
-    BackpackApproval::save($approvals, $appr);
+    {
+        my %e;
+        BackpackApproval::save($approvals, $appr, \%e)
+            or $p->("WARNING: could not save approvals: " . ($e{message} // $e{errno} // 'no detail') . "\n");
+    }
 
     # Approved set, in backpack-file order: pre-approved (still present) + newly
     # approved. Removed items are gone from the file and never approved here, so

@@ -94,6 +94,9 @@ $RunState::PID_ALIVE = \&_pid_alive;
 
 use BackpackApproval ();  # #21: per-item, machine-local backpack approval memory
 use BackpackReview ();    # #21: the I/O-seam-injected interactive approval walk
+use BackpackOps ();       # 07-backpack-screen E-A: the [b] screen's real bp_load/
+                           # bp_save/bp_remove logic, extracted so it is unit-testable
+                           # without spawning this file (review-driver-round M1)
 use KeepAwake ();         # B5: dashboard wake-lock decision + lifecycle holder
 use ConnectorHold ();     # Fix 3: hold-the-window decision when a connector loses the container
 use ClaudeConfig ();      # self-heal .claude.json onboarding-bypass (0-byte / lost-keys)
@@ -1551,6 +1554,15 @@ sub _capture_or_die {
     }
     return defined $captured ? $captured : '';
 }
+
+# HIGH-3: the shell-quoted _capture_quiet that used to live here (built a
+# command line via _shell_quote and ran it through backticks) is GONE. Its
+# only caller was bp_remove, which now goes through BackpackOps::remove ->
+# BackpackOps::capture_quiet -- a list-form `open $fh, '-|', @cmd` with no
+# shell involved at all, so there is no quoting problem to get right or
+# wrong (BackpackOps.pm has the full rationale). Kept out of this file
+# entirely, per the structural fix: the [b] screen's persistence logic is
+# unit-tested directly, without spawning launcher.pl (AC-P7).
 
 sub _shell_quote {
     my $s = shift;
@@ -4188,6 +4200,28 @@ sub enter_dashboard {
             $last_inspect   = 0;
             $last_resources = 0;
             return $r;
+        },
+        # 07-backpack-screen S2.3/E-A: the three persistence seams the [b]
+        # screen needs. Without these it still lists/scrolls/reflows (the
+        # thin {key,approved} gather already covers that), but approve/drop
+        # render 'unavailable' -- that degradation is specified (S1, E-A) and
+        # this is the patch that lifts it. backpack_screen itself is left at
+        # Dashboard::run's default (lazily requires tui::BackpackScreen only
+        # once [b] is actually pressed).
+        # 07-backpack-screen review-driver-round M1: these three are now thin
+        # wrappers over BackpackOps (BackpackOps.pm), which holds the real
+        # logic -- the absent-vs-broken precedence fix (HIGH-2), the
+        # STATUS: noop-is-a-failure fix (HIGH-1) and the no-shell subprocess
+        # capture (HIGH-3) -- and is unit-tested directly, without spawning
+        # this file (AC-P7). Nothing but paths crosses this boundary.
+        bp_load   => sub {
+            return BackpackOps::load(host_file => $bp_host_file, appr_file => $bp_appr_file);
+        },
+        bp_save   => sub {
+            return BackpackOps::save($_[0], appr_file => $bp_appr_file);
+        },
+        bp_remove => sub {
+            return BackpackOps::remove($_[0], host_file => $bp_host_file, backpack_pl => $BACKPACK_HOST_PL);
         },
     );
     _keepawake_release_global();   # drop the wake-lock on clean dashboard exit

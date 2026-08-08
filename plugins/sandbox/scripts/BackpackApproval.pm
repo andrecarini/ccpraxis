@@ -102,34 +102,112 @@ sub prune {
     return $n;
 }
 
-# load($path) -> \%approvals ({key=>hash}); {} when missing/unreadable/malformed
+# load($path, \%err) -> \%approvals ({key=>hash}); {} when missing/unreadable/malformed
 # (a corrupt store degrades to "nothing approved", i.e. re-review — fail safe).
+#
+# \%err is an OPTIONAL second argument, backward compatible: existing one-argument
+# callers (t/26-backpack-approval.t, BackpackReview.pm) are unaffected. When
+# supplied as a hashref it is cleared at entry and, on failure, filled in with
+# { op, broken, errno, path, message } so the caller can tell *absent* (broken=>0)
+# from *broken* (broken=>1) — the distinction criterion 5 needs.
 sub load {
-    my ($path) = @_;
-    return {} unless defined $path && -f $path;
-    open my $fh, '<:raw', $path or return {};
+    my ($path, $err) = @_;
+    $err = {} unless ref $err eq 'HASH';
+    %$err = ();
+    unless (defined $path && -f $path) {
+        %$err = (
+            op => 'absent', broken => 0, errno => '',
+            path => (defined $path ? $path : ''),
+            message => 'absent',
+        );
+        return {};
+    }
+    open my $fh, '<:raw', $path or do {
+        my $errno = $!;
+        %$err = (
+            op => 'open', broken => 1, errno => "$errno", path => $path,
+            message => "open failed: $errno",
+        );
+        return {};
+    };
     local $/; my $blob = <$fh>; close $fh;
     my $d = eval { JSON::PP->new->decode($blob) };
-    return (ref $d eq 'HASH' && ref $d->{approved} eq 'HASH') ? $d->{approved} : {};
+    if ($@) {
+        my $msg = $@; $msg =~ s/\n.*//s;
+        %$err = (op => 'decode', broken => 1, errno => '', path => $path, message => $msg);
+        return {};
+    }
+    return $d->{approved} if ref $d eq 'HASH' && ref $d->{approved} eq 'HASH';
+    %$err = (op => 'schema', broken => 1, errno => '', path => $path, message => 'unexpected schema');
+    return {};
 }
 
-# save($path, \%approvals) -> 1|0. Atomic-ish: write a temp sibling then rename,
-# with the Windows unlink-then-rename fallback (rename won't clobber on Win32).
+# save($path, \%approvals, \%err) -> 1|0. Atomic-ish: write a temp sibling then
+# rename, with the Windows unlink-then-rename fallback (rename won't clobber on
+# Win32).
+#
+# \%err is an OPTIONAL third argument, backward compatible for the same reason as
+# load()'s. On failure it is filled with { op, broken, errno, path, message }; on
+# success it is left empty. `errno` is captured from $! IMMEDIATELY at the failing
+# call, before any cleanup unlink can overwrite it.
 sub save {
-    my ($path, $appr) = @_;
-    return 0 unless defined $path;
+    my ($path, $appr, $err) = @_;
+    $err = {} unless ref $err eq 'HASH';
+    %$err = ();
+    unless (defined $path) {
+        %$err = (op => 'no-path', broken => 0, errno => '', path => '', message => 'no path given');
+        return 0;
+    }
     $appr ||= {};
-    my $json = JSON::PP->new->canonical(1)->pretty->encode(
-        { version => $STORE_VERSION, approved => $appr });
+    my $json = eval {
+        JSON::PP->new->canonical(1)->pretty->encode(
+            { version => $STORE_VERSION, approved => $appr });
+    };
+    if ($@) {
+        my $msg = $@; $msg =~ s/\n.*//s;
+        %$err = (op => 'encode', broken => 1, errno => '', path => $path, message => $msg);
+        return 0;
+    }
     my $tmp = "$path.tmp.$$";
-    open my $fh, '>:raw', $tmp or return 0;
+    open my $fh, '>:raw', $tmp or do {
+        my $errno = $!;
+        %$err = (
+            op => 'open', broken => 1, errno => "$errno", path => $tmp,
+            message => "open failed: $errno",
+        );
+        return 0;
+    };
     print $fh $json;
-    close $fh or do { unlink $tmp; return 0 };
+    unless (close $fh) {
+        my $errno = $!;
+        %$err = (
+            op => 'close', broken => 1, errno => "$errno", path => $tmp,
+            message => "close failed: $errno",
+        );
+        unlink $tmp;
+        return 0;
+    }
     unless (rename $tmp, $path) {
         if (-e $path) {
-            unlink $path or do { unlink $tmp; return 0 };
+            unless (unlink $path) {
+                my $errno = $!;
+                %$err = (
+                    op => 'unlink', broken => 1, errno => "$errno", path => $path,
+                    message => "unlink failed: $errno",
+                );
+                unlink $tmp;
+                return 0;
+            }
         }
-        rename($tmp, $path) or do { unlink $tmp; return 0 };
+        unless (rename $tmp, $path) {
+            my $errno = $!;
+            %$err = (
+                op => 'rename', broken => 1, errno => "$errno", path => $path,
+                message => "rename failed: $errno",
+            );
+            unlink $tmp;
+            return 0;
+        }
     }
     return 1;
 }

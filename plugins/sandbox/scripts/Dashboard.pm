@@ -2044,6 +2044,13 @@ sub dispatch_key {
     return ('confirm-relaunch',      'relaunch')      if $key =~ /^[lL]$/;
     return ('refresh', '')            if $key =~ /^[rR]$/;
     return ('quit', '')               if $key =~ /^[qQ]$/;
+    # 07-backpack-screen S2.2: 'b' opens the backpack screen. Lowercase-only,
+    # deliberately -- an uppercase alias would risk an unassembled CSI byte
+    # ('B' is the DOWN arrow's final letter) firing this action by accident.
+    # The second element is the LITERAL '', not $pending: no new pending
+    # token is introduced, so the :2024 whitelist above needs no entry and
+    # has nothing to forget.
+    return ('backpack', '')           if $key eq 'b';
     # Up/down scroll the Activity panel. The read-key seam assembles the arrow
     # escape sequences into the 'UP'/'DOWN' tokens (also accept k/j as aliases).
     return ('scroll-up', $pending)    if $key eq 'UP'   || $key eq 'k';
@@ -3248,6 +3255,36 @@ sub run_recover_stages {
 # old "'gone' ends the loop" wording here described behaviour that no longer
 # exists and that t/25 pins the opposite of). spawn->() may return
 # 'redraw' to force a full repaint (the inline fallback suspends/repaints).
+
+# _assemble_esc($key, $read_key) -> $key' -- a behaviour-preserving extraction
+# (07-backpack-screen S2.3) of run()'s ESC-sequence assembly, so the backpack
+# modal seam can receive already-assembled arrow tokens via the same logic
+# without depending on Dashboard's internals. $key ne "\e" passes through
+# unchanged; "\e" peeks $read_key for '['/'O' then a final letter: 'A' ->
+# 'UP', 'B' -> 'DOWN', any other final letter -> undef, an incomplete
+# sequence -> undef, ESC + a non-CSI byte (Alt+key) -> that byte, a lone ESC
+# (nothing more to read) -> "\e". No branch's outcome changed by the
+# extraction; the call site below is now a one-line call.
+sub _assemble_esc {
+    my ($key, $read_key) = @_;
+    return $key unless defined $key && $key eq "\e";
+    my $k2 = $read_key->();
+    if (defined $k2 && ($k2 eq '[' || $k2 eq 'O')) {
+        my $k3 = $read_key->();
+        if (defined $k3) {
+            if    ($k3 eq 'A') { return 'UP'; }
+            elsif ($k3 eq 'B') { return 'DOWN'; }
+            else               { return undef; }   # unrecognized CSI: drop, like launcher.pl
+        }
+        return undef;   # incomplete sequence
+    } elsif (defined $k2) {
+        # ESC + a non-CSI byte (Alt+key): surface that byte rather than
+        # dropping it, mirroring launcher.pl.
+        return $k2;
+    }
+    return "\e";   # lone ESC (no k2): stays inert in dispatch_key.
+}
+
 sub run {
     my (%o) = @_;
     my $now        = $o{now}        || sub { time };
@@ -3271,6 +3308,17 @@ sub run {
     my $stop_runs     = (ref($o{stop_runs})     eq 'CODE') ? $o{stop_runs}     : undef;
     my $full_shutdown = (ref($o{full_shutdown}) eq 'CODE') ? $o{full_shutdown} : undef;
     my $recover       = (ref($o{recover})       eq 'CODE') ? $o{recover}       : undef;
+    # 07-backpack-screen S2.3: the [b] modal seam, plus its three optional
+    # persistence seams. Every default preserves today's behaviour
+    # byte-for-byte for a caller that passes none -- backpack_screen's
+    # default lazily requires tui::BackpackScreen only when actually
+    # invoked, so a caller that never presses [b] never loads it.
+    my $backpack_screen = (ref($o{backpack_screen}) eq 'CODE') ? $o{backpack_screen}
+        : sub { require tui::BackpackScreen; tui::BackpackScreen::run(%{$_[0]}) };
+    my $bp_load       = (ref($o{bp_load})   eq 'CODE') ? $o{bp_load}   : undef;
+    my $bp_save       = (ref($o{bp_save})   eq 'CODE') ? $o{bp_save}   : undef;
+    my $bp_remove     = (ref($o{bp_remove}) eq 'CODE') ? $o{bp_remove} : undef;
+    my $bp_max_ticks  = $o{bp_max_ticks};
     my $enter_raw  = $o{enter_raw}  || sub { };
     my $leave_raw  = $o{leave_raw}  || sub { };
     my $keepawake  = $o{keepawake}  || sub { };   # B5: drive the wake-lock off fresh state
@@ -3338,6 +3386,27 @@ sub run {
         my $frame = compose_frame(\%state, $rows, $cols);
         $out->(render_frame($prev, $frame, { color => $color }));
         $prev = $frame;
+    };
+
+    # MEDIUM-1 (07-backpack-screen fix-batch): the [b] modal blocks this
+    # loop synchronously for its whole lifetime, so nothing below touches
+    # the container's keep-alive sentinel while it's open -- an operator
+    # who opens the screen and walks away for HB (container/heartbeat.sh,
+    # 600s idle) loses the container. This is the exact failure class the
+    # heartbeat exists to prevent. Hand the modal a heartbeat tick it can
+    # call on every iteration of ITS OWN loop; the throttle ($last_beat /
+    # $beat_int -- the SAME bookkeeping the tick loop below uses, so the
+    # two never double-count or drift) lives in THIS closure, never inside
+    # tui::BackpackScreen -- that module may not call time() (spec S2.0),
+    # so it stays pure/testable and a caller that never wires `heartbeat`
+    # gets tui::BackpackScreen's no-op default.
+    my $modal_heartbeat = sub {
+        my $t = $now->();
+        if ($t - $last_beat >= $beat_int) {
+            my $hb = $heartbeat->();
+            $last_beat = $t;
+            $hb_state = $hb if defined $hb;
+        }
     };
 
     # _lifecycle($seam,$mode) -- inline handler for the stop-runs/full-shutdown
@@ -3520,6 +3589,41 @@ sub run {
                         $activity_offset = 0;       # back to the newest events
                         delete $state{lifecycle};   # clear the lifecycle banner (spec 08 S2.7)
                     }
+                    elsif ($action eq 'backpack') {
+                        # 07-backpack-screen S2.2: the [b] modal owns the screen
+                        # for the duration of the call -- every I/O boundary it
+                        # needs is injected here, so the arrow stays one-way
+                        # (Dashboard -> tui::BackpackScreen, never back).
+                        # $quit is never set, $rc is never touched, leave_raw
+                        # is never called here -- only [q] quits.
+                        my $items = (ref($state{backpack}) eq 'HASH'
+                                     && ref($state{backpack}{items}) eq 'ARRAY')
+                            ? $state{backpack}{items} : [];
+                        my $ctx = {
+                            items     => $items,
+                            load      => $bp_load,  save => $bp_save,  remove => $bp_remove,
+                            read_key  => $next_key,
+                            wait_key  => sub { _assemble_esc($wait_input->($_[0]), $read_key) },
+                            term_size => $term_size,  out => $out,
+                            render    => sub { render_frame($_[0], $_[1], { color => $color }) },
+                            tick      => $tick_int,   max_ticks => $bp_max_ticks,
+                            # MEDIUM-1: keeps the container alive while the modal
+                            # blocks this loop -- see $modal_heartbeat above.
+                            heartbeat => $modal_heartbeat,
+                        };
+                        eval { $backpack_screen->($ctx) };
+                        if ($@) {
+                            my $e = $@; $e =~ s/\s+/ /g;
+                            $state{lifecycle} = { active => 0, mode => 'backpack', index => 0, total => 0,
+                                                   detail => $e, summary => "screen failed - $e" };
+                        }
+                        $prev       = undef;   # the modal owned the screen: the next paint must be FULL
+                        $last_state = undef;   # approvals/backpack may have changed: re-gather next tick
+                        my $bframe = compose_frame(\%state, $rows, $cols);
+                        $out->(render_frame($prev, $bframe, { color => $color }));
+                        $prev = $bframe;
+                        last;   # stop draining; keys pressed after the modal wait for the next tick
+                    }
                     elsif ($action eq 'scroll-up') {
                         # Only a view-changing scroll marks the frame dirty; a no-op
                         # scroll at the top boundary needs no same-tick re-render.
@@ -3595,39 +3699,23 @@ sub run {
                 # busy-spin (C2).
                 my $wk = $wait_input->($tick_int);
                 if (defined $wk && length $wk) {
-                    if ($wk eq "\e") {
-                        # Decision #22: the wait may have consumed only the ESC
-                        # byte of an arrow/CSI sequence to detect readiness. The
-                        # remaining bytes ('[' or 'O', then the final letter)
-                        # are still sitting in the input source and must be
-                        # pulled via the ordinary $read_key seam (NOT another
-                        # $wait_input call -- they are already available, not
-                        # awaited) and stitched into the same 'UP'/'DOWN' tokens
-                        # dispatch_key expects, mirroring launcher.pl's own
-                        # ESC-sequence assembly exactly. Applied ONLY here (the
-                        # pushback-originated byte), never to keys $read_key
-                        # returns directly -- launcher.pl's read_key already
-                        # fully assembles those before Dashboard.pm ever sees
-                        # them, so re-assembling here too would risk mis-eating
-                        # an unrelated, later keystroke as if it were part of a
-                        # CSI sequence.
-                        my $k2 = $read_key->();
-                        if (defined $k2 && ($k2 eq '[' || $k2 eq 'O')) {
-                            my $k3 = $read_key->();
-                            if (defined $k3) {
-                                if    ($k3 eq 'A') { $wk = 'UP'; }
-                                elsif ($k3 eq 'B') { $wk = 'DOWN'; }
-                                else               { $wk = undef; }   # unrecognized CSI: drop, like launcher.pl
-                            } else {
-                                $wk = undef;   # incomplete sequence
-                            }
-                        } elsif (defined $k2) {
-                            # ESC + a non-CSI byte (Alt+key): surface that byte
-                            # rather than dropping it, mirroring launcher.pl.
-                            $wk = $k2;
-                        }
-                        # else: lone ESC (no k2) -- $wk stays "\e", inert in dispatch_key.
-                    }
+                    # Decision #22: the wait may have consumed only the ESC byte
+                    # of an arrow/CSI sequence to detect readiness. The remaining
+                    # bytes ('[' or 'O', then the final letter) are still sitting
+                    # in the input source and must be pulled via the ordinary
+                    # $read_key seam (NOT another $wait_input call -- they are
+                    # already available, not awaited) and stitched into the same
+                    # 'UP'/'DOWN' tokens dispatch_key expects, mirroring
+                    # launcher.pl's own ESC-sequence assembly exactly. Applied
+                    # ONLY here (the pushback-originated byte), never to keys
+                    # $read_key returns directly -- launcher.pl's read_key
+                    # already fully assembles those before Dashboard.pm ever
+                    # sees them, so re-assembling here too would risk mis-eating
+                    # an unrelated, later keystroke as if it were part of a CSI
+                    # sequence. 07-backpack-screen S2.3: this is now the
+                    # extracted _assemble_esc, unchanged in outcome, so the
+                    # backpack modal's wait_key seam can reuse the same logic.
+                    $wk = _assemble_esc($wk, $read_key);
                     if (defined $wk && length $wk) {
                         $pushback_key = $wk;
                         my ($quit2, $scroll_dirty2) = $do_drain->();
