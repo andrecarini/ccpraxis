@@ -373,14 +373,42 @@ my %st = (
 }
 
 # C3 regression: a non-ASCII project name must NOT break the exactly-$cols
-# width invariant (non-ASCII characters map 1:1 to '?').
+# width invariant. That is the claim, and it is unchanged.
+#
+# What changed is the mechanism it used to rely on. This block previously also
+# asserted that non-ASCII mapped 1:1 to '?', which was true when tui::Frame
+# replaced every character outside printable ASCII and the Theme glyph table.
+# Commit 17693a6 narrowed that: Latin-1 Supplement and Latin Extended-A/B now
+# pass through, because tui::Layout::char_cols() already returned their correct
+# width of 1 and substituting a character whose width is known was losing
+# information for nothing. This machine's own home directory is accented, so
+# every project path here was rendering with a '?' in it.
+#
+# So the byte-level assertion is RE-POINTED, not dropped: an accented letter is
+# now expected to survive, while a character whose width the library genuinely
+# cannot claim must still be replaced. Both halves are asserted below, and the
+# width invariant is checked for each — which is the claim that actually
+# protects the frame.
 {
     my %sx = (%st, project_name => "caf\xC3\xA9");   # "café" as UTF-8 bytes
     my $f = Dashboard::compose_frame(\%sx, 10, 40);
     my $bad = grep { Dashboard::display_width($_->{text}) != 40 } @$f;
     is($bad, 0, 'compose: non-ASCII project name keeps EVERY row exactly $cols');
     my $joined = join "\n", map { $_->{text} } @$f;
-    unlike($joined, qr/\xC3\xA9/, 'compose: raw non-ASCII bytes not emitted (sanitized to ?)');
+    like($joined, qr/\xC3\xA9/,
+         'compose: an accented Latin letter SURVIVES rather than becoming "?" '
+       . '(17693a6 — its column width was always known, so the substitution was pure loss)');
+
+    # Counter-fixture. Without this, the assertion above cannot distinguish
+    # "the whitelist was widened correctly" from "the sanitiser stopped working".
+    my %sw = (%st, project_name => "zh\xE4\xB8\xAD");   # U+4E2D, width this table cannot claim
+    my $fw = Dashboard::compose_frame(\%sw, 10, 40);
+    my $badw = grep { Dashboard::display_width($_->{text}) != 40 } @$fw;
+    is($badw, 0, 'compose: an unknown-width character still keeps EVERY row exactly $cols');
+    my $joinedw = join "\n", map { $_->{text} } @$fw;
+    unlike($joinedw, qr/\xE4\xB8\xAD/,
+           'compose: a character whose width the library cannot claim IS still '
+         . 'sanitized — the widening was bounded, not a removal of the guard');
 }
 
 # H3 regression: a control char (newline) smuggled into a B1 log field must not
