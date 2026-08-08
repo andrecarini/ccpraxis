@@ -364,14 +364,20 @@ is(gate_verdict_call('Edit', 'worksite', 1),  'deny',  'AC-21: regression - bp_g
 
     my $b1 = $pre->[1] // {};
     is($b1->{matcher}, 'Bash', 'AC-20: block 1 matcher unchanged');
+    # b46 (drive-loop dead-man's switch, 559379c) deliberately appended
+    # mark-wakeup.sh to the Bash and Task blocks: it has to see every tool call
+    # that could schedule a wake-up. The claim here is unchanged -- b10 must not
+    # append to a block it does not own -- so the expected list grows by exactly
+    # the entry that was registered on purpose, and this still fails if
+    # repeat-guard.sh ever shows up here.
     is_deeply([ map { $_->{command} } @{ $b1->{hooks} // [] } ],
-              [ $cmd_of->('guard-bash.sh') ],
+              [ $cmd_of->('guard-bash.sh'), $cmd_of->('mark-wakeup.sh') ],
               'AC-20: block 1 command list unchanged');
 
     my $b2 = $pre->[2] // {};
     is($b2->{matcher}, 'Task', 'AC-20: block 2 matcher unchanged');
     is_deeply([ map { $_->{command} } @{ $b2->{hooks} // [] } ],
-              [ $cmd_of->('gate-shutdown.sh'), $cmd_of->('track-dispatch.sh') ],
+              [ $cmd_of->('gate-shutdown.sh'), $cmd_of->('track-dispatch.sh'), $cmd_of->('mark-wakeup.sh') ],
               'AC-20: block 2 command list unchanged, in order');
 
     my $n = 0;
@@ -404,9 +410,11 @@ is(gate_verdict_call('Edit', 'worksite', 1),  'deny',  'AC-21: regression - bp_g
     my $stop = ($H && $H->{hooks}{Stop}) // [];
     is(scalar(@$stop), 1, 'AC-20: Stop has exactly one block');
     ok(!exists $stop->[0]{matcher}, 'AC-20: Stop block has NO "matcher" key');
+    # b46 also registered gate-drive-loop.sh on Stop (559379c). Same reasoning:
+    # the claim is that b10 did not touch the Stop block, and it still holds.
     is_deeply([ map { $_->{command} } @{ $stop->[0]{hooks} // [] } ],
-              [ $cmd_of->('gate-stop.sh') ],
-              'AC-20: Stop hook list is [gate-stop.sh]');
+              [ $cmd_of->('gate-stop.sh'), $cmd_of->('gate-drive-loop.sh') ],
+              'AC-20: Stop hook list is [gate-stop.sh, gate-drive-loop.sh]');
 
     for my $f (qw(gate-shutdown.sh guard-writes.sh guard-bash.sh track-dispatch.sh log-dispatch.sh gate-stop.sh repeat-guard.sh)) {
         my $path = "$HOOKS/$f";

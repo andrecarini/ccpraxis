@@ -761,12 +761,18 @@ is(action_of('0'),     'deny', 'AC-29 [pure]: bp_ws_action_of "0" -> DENY');
               'AC-34: block 0 command list unchanged, in order');
     my $b1 = $pre->[1] // {};
     is($b1->{matcher}, 'Bash', 'AC-34: block 1 matcher is still Bash');
-    is_deeply([ map { $_->{command} } @{ $b1->{hooks} // [] } ], [ $cmd_of->('guard-bash.sh') ],
+    # b46 (drive-loop dead-man's switch, 559379c) deliberately appended
+    # mark-wakeup.sh to the Bash and Task blocks. The claim these two assertions
+    # make is "b15 must NOT append here", and it survives verbatim: the expected
+    # list grows only by the entry another package registered on purpose, and
+    # wait-shape-guard.sh appearing in either block still fails.
+    is_deeply([ map { $_->{command} } @{ $b1->{hooks} // [] } ],
+              [ $cmd_of->('guard-bash.sh'), $cmd_of->('mark-wakeup.sh') ],
               'AC-34: block 1 command list unchanged (b15 must NOT append here)');
     my $b2 = $pre->[2] // {};
     is($b2->{matcher}, 'Task', 'AC-34: block 2 matcher unchanged');
     is_deeply([ map { $_->{command} } @{ $b2->{hooks} // [] } ],
-              [ $cmd_of->('gate-shutdown.sh'), $cmd_of->('track-dispatch.sh') ],
+              [ $cmd_of->('gate-shutdown.sh'), $cmd_of->('track-dispatch.sh'), $cmd_of->('mark-wakeup.sh') ],
               'AC-34: block 2 command list unchanged, in order');
     my $b3 = $pre->[3] // {};
     ok(!exists $b3->{matcher}, 'AC-34: block 3 (b10 repeat-guard) still has NO matcher key');
@@ -781,7 +787,8 @@ is(action_of('0'),     'deny', 'AC-29 [pure]: bp_ws_action_of "0" -> DENY');
     my $stop = ($H && $H->{hooks}{Stop}) // [];
     is(scalar(@$stop), 1, 'AC-34: Stop still has exactly one block');
     ok(!exists $stop->[0]{matcher}, 'AC-34: Stop block still has no matcher key');
-    is_deeply([ map { $_->{command} } @{ $stop->[0]{hooks} // [] } ], [ $cmd_of->('gate-stop.sh') ],
+    is_deeply([ map { $_->{command} } @{ $stop->[0]{hooks} // [] } ],
+              [ $cmd_of->('gate-stop.sh'), $cmd_of->('gate-drive-loop.sh') ],
               'AC-34: Stop hook list unchanged');
 
     # AC-35(a): the absence of a matcher key IS the "reached for every tool" evidence. (b) is the

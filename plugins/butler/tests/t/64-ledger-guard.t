@@ -370,12 +370,17 @@ sub nonblank_lines { return grep { /\S/ } split /\n/, $_[0] }
 
     my $b1 = $pre->[1] // {};
     is($b1->{matcher}, 'Bash', 'AC-36: block 1 matcher unchanged');
-    is_deeply([ map { $_->{command} } @{ $b1->{hooks} // [] } ], [ $cmd_of->('guard-bash.sh') ],
+    # b46 (drive-loop dead-man's switch, 559379c) deliberately appended
+    # mark-wakeup.sh to the Bash and Task blocks: it must see every tool call
+    # that could schedule a wake-up. The claim -- b12 appended only to its own
+    # block 0 -- is untouched, and ledger-guard.sh appearing here still fails.
+    is_deeply([ map { $_->{command} } @{ $b1->{hooks} // [] } ],
+              [ $cmd_of->('guard-bash.sh'), $cmd_of->('mark-wakeup.sh') ],
               'AC-36: block 1 command list unchanged');
     my $b2 = $pre->[2] // {};
     is($b2->{matcher}, 'Task', 'AC-36: block 2 matcher unchanged');
     is_deeply([ map { $_->{command} } @{ $b2->{hooks} // [] } ],
-              [ $cmd_of->('gate-shutdown.sh'), $cmd_of->('track-dispatch.sh') ],
+              [ $cmd_of->('gate-shutdown.sh'), $cmd_of->('track-dispatch.sh'), $cmd_of->('mark-wakeup.sh') ],
               'AC-36: block 2 command list unchanged, in order');
     my $b3 = $pre->[3] // {};
     ok(!exists $b3->{matcher}, 'AC-36: block 3 (b10 repeat-guard) still has NO matcher key');
@@ -390,7 +395,8 @@ sub nonblank_lines { return grep { /\S/ } split /\n/, $_[0] }
     my $stop = ($H && $H->{hooks}{Stop}) // [];
     is(scalar(@$stop), 1, 'AC-36: Stop still has exactly one block');
     ok(!exists $stop->[0]{matcher}, 'AC-36: Stop block still has no matcher key');
-    is_deeply([ map { $_->{command} } @{ $stop->[0]{hooks} // [] } ], [ $cmd_of->('gate-stop.sh') ],
+    is_deeply([ map { $_->{command} } @{ $stop->[0]{hooks} // [] } ],
+              [ $cmd_of->('gate-stop.sh'), $cmd_of->('gate-drive-loop.sh') ],
               'AC-36: Stop hook list unchanged');
 
     ok(-e $HOOK,  'AC-36: plugins/butler/hooks/ledger-guard.sh exists');
