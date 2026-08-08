@@ -164,4 +164,53 @@ sub run_wd {
          'E2: and tells it what to do with the verdict');
 }
 
+# ---------------------------------------------------------------------------
+# F. The director consultation is scoped to the data dir we were pointed at.
+#
+#    Sections B and C already fail if it is not — that is how this defect was
+#    found on 2026-08-08. But they only fail while the REAL repo's director
+#    happens to answer 'done', which it does only when every remaining package
+#    is owned or gated. For most of a run it answers 'run-package', the
+#    short-circuit below the consultation never fires, and C2..C7 pass whether
+#    or not the child was ever scoped. That is a detector that reports green by
+#    luck, so the claim gets a second, state-independent expression here.
+#
+#    Structural, deliberately: the behavioural form would need a fixture the
+#    director parses as a real blueprint, which couples this file to that
+#    script's schema — a heavier dependency than the claim is worth.
+# ---------------------------------------------------------------------------
+{
+    # ONE checker, applied to the live source AND to a specimen of the broken
+    # form. A detector nobody has watched fire is not known to be able to.
+    my $scopes_child = sub {
+        my ($body) = @_;
+        return 0 unless defined $body;
+        return 1 if $body =~ /\$ENV\{\s*['"]?CCPRAXIS_DATA_DIR['"]?\s*\}\s*=/;
+        return 1 if $body =~ /--data-dir/;
+        return 0;
+    };
+
+    my ($body) = $src =~ /sub\s+director_action\s*\{(.*?)\n\}/s;
+    ok(defined $body && length $body, 'F1: located sub director_action');
+
+    ok($scopes_child->($body),
+       'F2: director_action scopes the child to this watchdog\'s own data dir — '
+     . 'without it the parent snapshots the tree it was pointed at while the '
+     . 'child answers about whatever repo the cwd resolves to, and the '
+     . '\'done\' short-circuit lets the child\'s answer decide the verdict');
+
+    # The counter-fixture: the exact shape this file shipped before the fix.
+    # If F2 can pass against this, F2 is measuring nothing.
+    my $unscoped = <<'BROKEN';
+    my $script = __FILE__;
+    $script =~ s{[^/\\]+$}{bp-drive-next.pl};
+    return 'unknown' unless -r $script;
+    my $out = `perl "$script" next 2>/dev/null`;
+    return 'unknown' unless defined $out && length $out;
+BROKEN
+    ok(!$scopes_child->($unscoped),
+       'F3: and the check actually fires — the pre-fix body, which let the '
+     . 'child resolve its data dir from cwd, is rejected by the same checker');
+}
+
 done_testing();

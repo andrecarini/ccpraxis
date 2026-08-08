@@ -154,6 +154,36 @@ sub director_action {
     my $script = __FILE__;
     $script =~ s{[^/\\]+$}{bp-drive-next.pl};
     return 'unknown' unless -r $script;
+    # Scope the child to OUR data dir -- the one --data / $CCPRAXIS_DATA_DIR /
+    # the upward search resolved above. Without this the override stops at
+    # snapshot(): the director resolves its own data dir from the CURRENT
+    # WORKING DIRECTORY, so the parent reads the directory it was pointed at
+    # while the child answers about whatever repo the process happens to be
+    # standing in. The two then disagree, and because the 'done' branch below
+    # short-circuits ahead of every movement check, the child's answer wins the
+    # whole verdict. Observed on 2026-08-08: t/95 built a fixture holding one
+    # package marked 'running' and got VERDICT: SETTLED, with the snapshot
+    # correctly naming the fixture and the verdict line reporting the real
+    # repo's state -- the two halves of one output describing two different
+    # trees. Left unfixed this is worse than a wrong answer in a test: an armed
+    # watchdog would report SETTLED over a genuinely wedged run, and a
+    # dead-man's switch that reports all-clear is the defect it exists to catch.
+    #
+    # Passed through the ENVIRONMENT, not as an argument, for two reasons.
+    # First, the flag names differ -- this script spells it --data, the director
+    # spells it --data-dir -- and this repo has repeatedly been bitten by pairs
+    # of near-identical names. Second, an absolute data dir on Windows contains
+    # a colon, which is exactly the argv shape MSYS2 mangles into a ';'-joined
+    # path list. The env var sidesteps both, and it sits above every cwd-derived
+    # guess in the director's own resolution order (--data-dir > $CCPRAXIS_DATA_DIR
+    # > $BP_PROJECT_ROOT > git toplevel > walk-up > cwd), which is precisely the
+    # guess it has to beat.
+    #
+    # $DATA is forwarded verbatim rather than absolutised: the child inherits
+    # this process's working directory, so a relative value resolves to the same
+    # place on both sides, and rewriting it risks converting a Windows path into
+    # a POSIX one for no gain.
+    local $ENV{CCPRAXIS_DATA_DIR} = $DATA;
     my $out = `perl "$script" next 2>/dev/null`;
     return 'unknown' unless defined $out && length $out;
     return ($out =~ /"action"\s*:\s*"([a-z-]+)"/) ? $1 : 'unknown';
