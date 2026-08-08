@@ -98,6 +98,87 @@ is(hb_call({}, 'reap_decision 1 1 1 1'), 'hardstop', 'stale + active, grace expi
     ok(-f "$data/blueprints/beta/runs/.shutdown",  'signal: .shutdown written for beta');
 }
 
+# ===========================================================================
+# HOST SUSPEND — incident 2026-08-08.
+#
+# A dispatch fleet was left running unattended. Windows entered connected
+# standby at 20:23:33 and resumed at 02:03:50 (5h40m). This loop reaped the
+# container at 02:03:52 — TWO SECONDS after the resume, before the manager
+# could re-touch the sentinel. The operator came back to a dead container.
+#
+# The sentinel's mtime cannot distinguish "the manager died an hour ago" from
+# "the entire machine was frozen for an hour", and reaping on that ambiguity
+# destroys a container whose manager is alive and about to check in. The loop's
+# OWN overshoot is the disambiguator: it knows how long it meant to sleep.
+# ===========================================================================
+{
+    is(hb_call({}, 'suspend_detected 61 60 120'), '0',
+       'suspend: a normal 61s tick is not a suspend');
+    is(hb_call({}, 'suspend_detected 150 60 120'), '0',
+       'suspend: a merely slow 150s tick is not a suspend (inside the slack)');
+    is(hb_call({}, 'suspend_detected 180 60 120'), '1',
+       'suspend: TICK + SLACK is the boundary, and it counts');
+    is(hb_call({}, 'suspend_detected 20400 60 120'), '1',
+       'suspend: the incident itself — a 5h40m gap between ticks is a suspended machine, '
+     . 'not a slow one');
+
+    # The decision must invert on exactly this input, or the incident recurs.
+    is(hb_call({}, 'reap_decision 1 0 0 0 0'), 'reap',
+       'post-wake: stale + no run WITHOUT the post-wake window still reaps (unchanged)');
+    is(hb_call({}, 'reap_decision 1 0 0 0 1'), 'keep',
+       'post-wake: the SAME inputs inside the post-wake window keep the container — '
+     . 'this single flip is what the 2026-08-08 incident turns on');
+    is(hb_call({}, 'reap_decision 1 1 1 1 1'), 'keep',
+       'post-wake: the window outranks even an expired grace — a resume is not evidence '
+     . 'about the manager, so nothing downstream of staleness should fire on it');
+
+    # Every pre-existing 4-arg call must keep its exact meaning: the 5th
+    # argument is optional precisely so this file's other 22 assertions, and
+    # any other caller, are untouched.
+    is(hb_call({}, 'reap_decision 1 0 0 0'), 'reap',
+       'post-wake: a 4-arg call behaves exactly as before (optional 5th arg)');
+}
+
+# ===========================================================================
+# THE REAP MUST BE LOUD.
+#
+# Before this, the loop simply `break`s: the container exits 0 and podman
+# reports "Exited (0)". A clean exit code on a container that was supposed to
+# still be running is the least useful true statement available, and it was
+# the ONLY thing the operator had.
+# ===========================================================================
+{
+    my $dir = tempdir(CLEANUP => 1);
+    my $rec = "$dir/last-reap.txt";
+    hb_call({ REAP_RECORD => $rec }, 'write_reap_record reap 20402 0 1');
+    ok(-s $rec, 'record: a reap leaves a durable note behind');
+
+    my $txt = do { local (@ARGV, $/) = ($rec); <> };
+    $txt = '' unless defined $txt;
+    like($txt, qr/verdict=reap/,              'record: names which branch fired');
+    like($txt, qr/heartbeat_age_s=20402/,     'record: reports how stale the sentinel was');
+    like($txt, qr/heartbeat_limit_s=/,        'record: and the limit it was measured against');
+    like($txt, qr/run_active=0/,              'record: whether a butler run was live');
+    like($txt, qr/host_suspends_detected=1/,  'record: whether the machine slept — the fact that '
+                                            . 'reframes a stale sentinel from "manager died" to '
+                                            . '"world was frozen"');
+    like($txt, qr/why=\S/,                    'record: carries a human sentence, not just fields');
+    like($txt, qr/asleep, not because the manager died/,
+         'record: when a suspend was seen, the note says so IN WORDS — the reader is someone '
+       . 'who came back to a stopped container with no other evidence');
+
+    # A hardstop is a different story and must not be told as a reap.
+    my $rec2 = "$dir/hard.txt";
+    hb_call({ REAP_RECORD => $rec2 }, 'write_reap_record hardstop 700 1 0');
+    my $t2 = do { local (@ARGV, $/) = ($rec2); <> };
+    $t2 = '' unless defined $t2;
+    like($t2, qr/verdict=hardstop/,        'record: a hardstop is recorded as a hardstop');
+    like($t2, qr/graceful shutdown was signalled/,
+         'record: and explains that coordinators were given a window to park first');
+    unlike($t2, qr/no butler run was active/,
+         'record: a hardstop must NOT claim no run was active — it fires precisely when one was');
+}
+
 done_testing();
 
 sub spew { my ($p,$c)=@_; open my $fh,'>:raw',$p or die "$p: $!"; print $fh $c; close $fh; }
