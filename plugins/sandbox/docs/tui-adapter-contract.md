@@ -100,6 +100,34 @@ written" from "something broke while reading" from "this metric doesn't apply he
 conforming, even if it never actually forks — this rule is about honesty of the rendered state, not
 just about Rule 1's subprocess concern.
 
+## Rule 5 — Anything that takes over the render loop still owes the heartbeat
+
+The container is kept alive by the host manager touching `/tmp/.launcher-alive`. `Dashboard::run`'s
+loop is what does the touching, and `container/heartbeat.sh` reaps the container — cleanly, exit 0 —
+once that sentinel is `HB` seconds stale (600 at time of writing; read the live value there, never a
+number quoted in a comment). So **a modal screen, a confirm prompt, a picker, a progress view, or any
+other flow that suspends the dashboard's tick is a liveness hazard**, not merely a rendering choice.
+Suspend the loop for longer than `HB` and the operator returns to a container that shut itself down
+with nothing to explain why.
+
+A screen that takes over the loop must therefore keep the sentinel warm — take a `heartbeat` seam
+like every other I/O boundary, default it to a no-op so the module stays pure and unit-testable, and
+tick it once per iteration. Bounding the takeover with a tick cap is not a substitute: it only moves
+the surprise from "the container died" to "my screen closed itself".
+
+This rule exists because the same failure has now arrived from two unrelated directions. On
+2026-08-08 a fleet was left running, the host entered connected standby for 5h40m, and the container
+reaped itself two seconds after the resume — fixed in `heartbeat.sh` by detecting the suspend
+(`suspend_detected`) and opening a post-wake grace window. Hours later, in the same session, package
+`07`'s backpack modal reintroduced the identical outcome by suspending the loop with no time bound at
+all. Neither author was careless; the contract simply was not written down anywhere a screen author
+would look. It is now.
+
+Note the interaction with Rule 1: a modal that shells out (package `07`'s `backpack.pl remove`) is
+blocking the tick *and* not touching the sentinel for the duration of the subprocess. Bound the
+subprocess, capture its output rather than streaming it into a raw-mode frame, and tick the heartbeat
+either side of it.
+
 ## Enforcement
 
 `plugins/sandbox/tests/t/62-tui-adapter-contract.t` is the automated guard for the **fork/spawn half**
