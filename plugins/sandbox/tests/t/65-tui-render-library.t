@@ -1464,4 +1464,65 @@ SKIP: {
     is($overflow, 0, 'AC-S5(08): no cell is wider than the band width (70 cols)');
 }
 
+# ---------------------------------------------------------------------------
+# L. Accented Latin survives the sanitiser.
+#
+#    safe() used to fall through to '?' for every non-ASCII character that was
+#    not a declared Theme glyph. Latin-1 was collateral: this machine's home
+#    directory carries an accented letter, so every project path on it lost
+#    that letter in every frame the library draws — dashboard, backpack screen,
+#    and each launcher screen built on them. It had already been written into a
+#    package spec as an accepted limitation before anyone checked whether the
+#    width was actually unknown. It was not: char_cols() returns 1 for these,
+#    correctly, so the substitution was discarding information the layout
+#    arithmetic already had.
+#
+#    Input is UTF-8 BYTES throughout, which is safe()'s documented contract
+#    (its own header: "safe($str) -> a UTF-8 BYTE string"). A decoded string
+#    whose codepoints all sit at or below 0xFF is genuinely indistinguishable
+#    from raw bytes, which is why the contract is bytes and why these fixtures
+#    honour it rather than papering over the ambiguity.
+# ---------------------------------------------------------------------------
+{
+    my $accented = decode('UTF-8', tui::Frame::safe(encode('UTF-8', "Andr\x{e9}")));
+    is($accented, "Andr\x{e9}",
+       'L1: safe() preserves an accented Latin letter — the project rule is that '
+     . 'nothing may assume ASCII paths, and the home directory this repo runs '
+     . 'from is itself non-ASCII');
+
+    my $mixed = decode('UTF-8', tui::Frame::safe(encode('UTF-8', "caf\x{e9} na\x{ef}ve \x{142}\x{f3}d\x{17a}")));
+    is($mixed, "caf\x{e9} na\x{ef}ve \x{142}\x{f3}d\x{17a}",
+       'L2: and across the whole narrow-Latin range, not just Latin-1 '
+     . '(U+0142/U+017A are Latin Extended-A)');
+
+    # Width is the thing being claimed, so assert the claim rather than trusting
+    # that it renders: an accented name must occupy the same columns as its
+    # unaccented twin, or every frame built on it is silently one column out.
+    is(tui::Layout::display_width(encode('UTF-8', "caf\x{e9}")),
+       tui::Layout::display_width('cafe'),
+       'L3: an accented name measures the same width as its ASCII twin — the '
+     . 'column arithmetic was always right, which is why the substitution was '
+     . 'pure loss');
+
+    # THE COUNTER-FIXTURES. Widening the allowed set is only safe because it
+    # stopped short of characters whose width this library cannot claim. If
+    # these pass through too, L1..L3 are not evidence of a careful boundary —
+    # they are evidence the sanitiser stopped sanitising.
+    my $wide = decode('UTF-8', tui::Frame::safe(encode('UTF-8', "\x{4e2d}\x{6587}")));
+    is($wide, '??',
+       'L4: counter-fixture — a character whose column width this library does '
+     . 'NOT know is still replaced; the fix widened the whitelist, it did not '
+     . 'remove it');
+
+    my $ctrl = decode('UTF-8', tui::Frame::safe("a\x{9b}b"));
+    unlike($ctrl, qr/\x{9b}/,
+       'L5: counter-fixture — a C1 control byte is still not passed through; '
+     . 'the escape-injection guard is untouched by the Latin widening');
+
+    my $zero = decode('UTF-8', tui::Frame::safe(encode('UTF-8', "x\x{300}")));
+    is($zero, 'x',
+       'L6: counter-fixture — a zero-width combining mark is still deleted '
+     . 'rather than admitted as a narrow character');
+}
+
 done_testing();

@@ -69,6 +69,25 @@ sub _strip_sgr {
 # safe_char($c) -> the sanitised DECODED form of one character: itself if
 # printable ASCII or a Theme-declared glyph; '' (deleted) if zero-width;
 # else exactly one '?'. PUBLIC.
+# _is_narrow_latin($cp) -- true for the non-ASCII Latin letters and marks that
+# occupy exactly one column in every terminal: Latin-1 Supplement, Latin
+# Extended-A and Latin Extended-B (U+00A0..U+024F). Soft hyphen is excluded:
+# terminals disagree about whether it renders at all, so its width is not
+# something this table can honestly claim.
+#
+# The range stops at U+024F on purpose. Greek and Cyrillic are also narrow,
+# but the first genuinely ambiguous-width block is not far beyond, and
+# char_cols() falls back to 1 for anything it does not know -- so widening
+# this range is a promise about column arithmetic, not a display preference.
+# Latin covers the paths this project actually runs on; extend it only with
+# a width table to back it. PRIVATE.
+sub _is_narrow_latin {
+    my ($cp) = @_;
+    return 0 if $cp < 0x00A0 || $cp > 0x024F;
+    return 0 if $cp == 0x00AD;
+    return 1;
+}
+
 sub safe_char {
     my ($c) = @_;
     return '' if !defined $c || $c eq '';
@@ -76,6 +95,22 @@ sub safe_char {
     return $c if $cp >= 0x20 && $cp <= 0x7E;
     return $c if defined tui::Layout::glyph_width($c);
     return '' if tui::Layout::char_cols($c) == 0;
+    # An accented Latin letter is not an unknown character. Before this arm
+    # existed the ladder fell through to '?', so this machine's own home
+    # directory -- the one every project path on it starts with -- rendered
+    # with a '?' in place of its accented letter, in every frame the render
+    # library draws: the dashboard, the backpack screen, and every launcher
+    # screen built on them. That is a direct breach of the project rule that
+    # nothing may assume ASCII paths, and it had already reached the point of
+    # being written into a package spec as an accepted limitation before
+    # anyone checked whether the width was genuinely unknown.
+    #
+    # It was not. char_cols() already returns 1 for these, correctly. The '?'
+    # was never protecting the column arithmetic here -- it was a whitelist
+    # that simply had no entry for Latin text, while the layout maths was
+    # right all along. Substituting a character whose width you already know
+    # loses information and buys nothing.
+    return $c if _is_narrow_latin($cp);
     return '?';
 }
 
