@@ -791,8 +791,30 @@ sub list_init {
     my $notice = $model->{notice};
     $notice = (defined $notice && !ref $notice && length "$notice") ? "$notice" : undef;
 
+    # SHORTCUTS (package 12): { 'r' => '<row id>' } -- a single-keystroke alias
+    # for "move the cursor to that row and choose it", used by single-mode
+    # screens converted from hand-rolled menus that already advertised letter
+    # keys. Normalised here so list_dispatch_key never has to think about
+    # shape: lowercased, single printable characters only, non-scalar values
+    # dropped. An id that names no landable row is NOT rejected at init (the
+    # rows can legitimately be built later) -- the dispatch looks it up and
+    # ignores a miss.
+    my %short;
+    if (ref $model->{shortcuts} eq 'HASH') {
+        for my $k (keys %{ $model->{shortcuts} }) {
+            next if ref $k;
+            my $lk = lc "$k";
+            next unless length($lk) == 1;
+            my $id = $model->{shortcuts}{$k};
+            next if ref $id;
+            next unless defined($id) && length "$id";
+            $short{$lk} = "$id";
+        }
+    }
+
     my $ls = {
         mode        => $mode,
+        shortcuts   => \%short,
         notice      => $notice,
         notice_role => _str($model->{notice_role}),
         label     => _str($model->{label}),
@@ -951,6 +973,26 @@ sub list_dispatch_key {
             $cur->{selected} = $cur->{selected} ? 0 : 1;
         }
         return 'toggle';
+    }
+
+    # Single-keystroke row aliases, checked BEFORE the a/n/r blocks below:
+    # each of those returns '' for single mode, so a shortcut sharing one of
+    # those letters would otherwise be swallowed as inert. Deliberately AFTER
+    # cancel and movement, so 'q' stays cancel and 'j'/'k' stay movement no
+    # matter what a caller declares -- a screen must not be able to redefine
+    # the keys every other screen shares.
+    if ($mode eq 'single' && ref $ls->{shortcuts} eq 'HASH' && length($k) == 1) {
+        my $want = $ls->{shortcuts}{ lc $k };
+        if (defined $want && length $want) {
+            my $items = _ls_items($ls);
+            for my $i (0 .. $#$items) {
+                next unless _landable($items, $i);
+                next unless _str($items->[$i]{id}) eq $want;
+                $ls->{cursor} = $i;
+                _select_only_cursor($ls);
+                return 'confirm';
+            }
+        }
     }
 
     if ($k eq 'a') {
@@ -1447,6 +1489,84 @@ sub triage_model {
         notice_role => 'state.crit',
         items       => \@items,
     };
+}
+
+# ===========================================================================
+# Package 12 -- the single-choice menu model.
+#
+# The launch flow had three hand-rolled menus that package 08 deliberately
+# left alone (spec 08 section 6): the stale/rebuild prompt, the orphan-claude kill
+# confirm, and the connector's lost-container hold. Each painted its own
+# highlight, drove its own cbreak, and redrew in place with \e[<n>A -- so the
+# launcher had to tear the TUI frame DOWN and hand the real terminal back for
+# their duration. This builder replaces all three with one model, which is
+# the point: three menus meant three chances to get teardown wrong, and the
+# operator saw three different visual languages in a single launch.
+#
+# menu_model(%opts) -> a single-mode list model.
+#   label    -- the screen title
+#   detail   -- \@lines of context ABOVE the options (the stale reasons, the
+#               orphan list, the reason a container was lost). Non-landable:
+#               the cursor skips them, so they read as annotation.
+#   options  -- \@[ { id, display, key } ] in presentation order. `key` is
+#               optional; when given it becomes a single-keystroke alias so a
+#               converted menu keeps the letter shortcut it used to advertise.
+#   notice   -- optional one-line banner, with notice_role for its colour.
+#
+# The display string is left to the caller INCLUDING any "[r] " prefix: the
+# shortcut letter has to be visible on the row, and only the caller knows
+# whether it declared one.
+sub menu_model {
+    my %o = %{ _pairs(@_) };
+
+    my @items;
+    for my $line (@{ ref $o{detail} eq 'ARRAY' ? $o{detail} : [] }) {
+        next if ref $line;
+        next unless defined $line;
+        push @items, { kind => 'subheader', disabled => 1, display => _str($line) };
+    }
+
+    my %short;
+    for my $opt (@{ ref $o{options} eq 'ARRAY' ? $o{options} : [] }) {
+        next unless ref $opt eq 'HASH';
+        my $id = _str($opt->{id});
+        next unless length $id;
+        my $disp = _str($opt->{display});
+        $disp = $id unless length $disp;
+        push @items, { kind => 'row', id => $id, group => 'menu', display => $disp };
+        my $key = _str($opt->{key});
+        $short{ lc $key } = $id if length($key) == 1;
+    }
+
+    return {
+        mode        => 'single',
+        label       => _str($o{label}),
+        notice      => (defined $o{notice} && !ref $o{notice} && length "$o{notice}")
+                        ? "$o{notice}" : undef,
+        notice_role => _str($o{notice_role}),
+        error       => undef,
+        empty       => (@items ? 0 : 1),
+        shortcuts   => \%short,
+        items       => \@items,
+    };
+}
+
+# menu_choice(\%result, $default) -> the chosen option id.
+#
+# A CANCEL IS NOT A CHOICE. It returns $default, and every caller passes the
+# conservative option -- the legacy menus all treated q/ESC as "do the
+# non-destructive thing", and a converted screen that instead returned the
+# cursor's row would silently rebuild a container because the operator hit
+# escape.
+sub menu_choice {
+    my ($res, $default) = @_;
+    $default = _str($default);
+    return $default unless ref $res eq 'HASH';
+    my $d = ref $res->{decision} eq 'HASH' ? $res->{decision} : {};
+    return $default if $d->{cancelled};
+    return $default unless $d->{confirmed};
+    my $id = _str($d->{cursor_id});
+    return length($id) ? $id : $default;
 }
 
 # ===========================================================================

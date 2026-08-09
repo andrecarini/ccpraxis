@@ -1028,38 +1028,21 @@ $LAUNCH_HOST = tui::LaunchScreens::make_host(mode => 'plain', plain => \&_launch
 
 # _launch_stage_begin / _launch_stage_end — thin glue so the launch phase
 # marks progress without knowing how a stage renders.
-# _launch_suspend / _launch_resume — hand the REAL terminal back for the
-# duration of something that owns it directly, then take it again.
+# _launch_suspend / _launch_resume ARE GONE (package 12), deliberately, and
+# this note is here so they are not reinvented.
 #
-# The launch phase still contains prompts that were written before the frame
-# existed: prompt_stale_action paints its own in-place menu and calls
-# ReadMode(0), kill_orphan_claudes_if_user_confirms reads <STDIN>. Run inside
-# the alt screen with the host still claiming `active`, each of them painted
-# over the frame AND left the terminal in canonical mode while every later
-# _launch_read_key still assumed cbreak. Suspending drops the alt screen and
-# restores the read mode for real, so the prompt runs on the terminal it was
-# written for and `{active}` tells the truth while it does.
+# They existed to hand the REAL terminal back for the duration of a prompt
+# written before the frame existed — prompt_stale_action painted its own
+# in-place menu and called ReadMode(0); kill_orphan_claudes_if_user_confirms
+# read <STDIN>. Both now render as screens through tui::LaunchScreens, so
+# there is nothing left that needs the frame dropped mid-launch and the pair
+# had no callers.
 #
-# Deliberately NOT host_leave/host_enter: host_leave's once-guard would pop
-# the title stack here and host_enter refuses a second entry, so the pair
-# would silently degrade to "leave, then never come back".
-sub _launch_suspend {
-    return 0 unless $LAUNCH_HOST && $LAUNCH_HOST->{mode} eq 'tui' && $LAUNCH_HOST->{active};
-    print STDOUT tui::LaunchScreens::LEAVE_SCREEN_BYTES();
-    eval { Term::ReadKey::ReadMode('restore') };
-    $LAUNCH_HOST->{active} = 0;
-    return 1;
-}
-sub _launch_resume {
-    return 0 unless $LAUNCH_HOST && $LAUNCH_HOST->{mode} eq 'tui'
-                 && $LAUNCH_HOST->{entered} && !$LAUNCH_HOST->{active};
-    eval { Term::ReadKey::ReadMode('cbreak') };
-    print STDOUT tui::LaunchScreens::ENTER_SCREEN_BYTES();
-    $LAUNCH_HOST->{active} = 1;
-    delete $LAUNCH_HOST->{prev};   # the alt buffer is blank again: full repaint
-    _launch_repaint();
-    return 1;
-}
+# If you find yourself wanting them back, that is the signal a new prompt is
+# being written against the raw terminal instead of as a screen. Suspending
+# the frame is not the fix — converting the prompt is. The suspend/resume
+# dance was itself the tell that the launch flow had two visual languages,
+# which is the defect this package closed.
 
 sub _launch_stage_begin { tui::LaunchScreens::stage_begin($LAUNCH_STAGES, $_[0], time); _launch_repaint(); }
 sub _launch_stage_end   { tui::LaunchScreens::stage_end($LAUNCH_STAGES, $_[0], $_[1], time); _launch_repaint(); }
@@ -1744,6 +1727,19 @@ if ($LAUNCH_MODE eq 'tui') {
 # processes, each with its own uniquely-named log file (no double-open).
 $LAUNCH_LOG = LaunchLog::open_log("$CLAUDE_DATA/sandbox-logs/launch-$LAUNCH_ID.log");
 log_ev('launch_start', { project => $PROJECT_PATH, project_name => $PROJECT_NAME, podman => $PODMAN, pid => $$ });
+# The mode, and the three inputs that produced it. Package 12 added this
+# because an operator reported a screen "still using the old layout" and the
+# logs could not say whether the launch had been in TUI mode at all — the two
+# candidate causes (a plain-mode fallback vs a defect in the TUI path) have
+# completely different fixes, and neither was distinguishable after the fact.
+# A launch that renders differently must leave behind WHY.
+log_ev('launch_mode', {
+    mode    => $LAUNCH_MODE,
+    tty     => ((-t STDOUT && -t STDIN) ? 1 : 0),
+    readkey => $READKEY_OK,
+    no_tui  => ((defined $ENV{CCPRAXIS_NO_TUI} && length $ENV{CCPRAXIS_NO_TUI}) ? 1 : 0),
+    pid     => $$,
+});
 
 # Companion raw-output transcript (#19): the build/install console stream the JSON
 # log can't hold. Best-effort, same naming as the JSON log (.transcript.log).
@@ -2022,18 +2018,26 @@ my $CONTAINER_NAME;
             }
             push @SESSION_FLAGS, '--resume', $uuid if $action eq 'resume';
         }
-        # The picking is done; everything from here on owns the REAL terminal
-        # directly -- kill_orphan_claudes_if_user_confirms reads <STDIN> with
-        # echo off, `podman exec -it claude` takes the tty outright, and
-        # hold_for_keypress drives its own cbreak loop. Tear the launch frame
-        # down FIRST so none of them paints into a buffer that is about to be
-        # discarded, and so the read mode they each assume is the one they get.
-        tui::LaunchScreens::host_leave($LAUNCH_HOST) if $LAUNCH_HOST;
         # Orphan claudes (in-container processes from a prior connector
         # that died without releasing /root/.claude lockfiles) block any
         # new session indefinitely with no error message. Detect + offer
         # to kill before exec'ing the new claude.
-        kill_orphan_claudes_if_user_confirms();
+        #
+        # Package 12: the offer RENDERS AS A SCREEN, so the frame must still be
+        # up when it runs — the unconditional host_leave that used to precede
+        # this line now follows it. It is handed the teardown as a callback and
+        # runs it after the operator has answered but before the `podman exec
+        # ... kill` spawns, which inherit stdio. The host_leave below still runs
+        # unconditionally (it is idempotent: the title pop is once-only and the
+        # screen/read-mode restores are safe to repeat), so the no-orphans path
+        # and the plain path tear down exactly as before.
+        kill_orphan_claudes_if_user_confirms(
+            sub { tui::LaunchScreens::host_leave($LAUNCH_HOST) if $LAUNCH_HOST });
+        # Everything from here on owns the REAL terminal directly: `podman exec
+        # -it claude` takes the tty outright and hold_for_keypress drives its
+        # own cbreak loop. Nothing may paint into a buffer about to be
+        # discarded, and the read mode they assume must be the one they get.
+        tui::LaunchScreens::host_leave($LAUNCH_HOST) if $LAUNCH_HOST;
         my @cmd = ($PODMAN, 'exec', '-it', $CONTAINER_NAME,
                    'claude', '--dangerously-skip-permissions',
                    @SESSION_FLAGS);
@@ -2472,13 +2476,11 @@ sub _skill_divergence_msg {
 # =====================================================================
 
 if (@STALE_REASONS) {
-    # prompt_stale_action owns the terminal directly (its own cbreak, its own
-    # in-place redraw, its own ReadMode(0) on the way out), so the frame is
-    # handed back for its duration rather than being painted over and left in
-    # canonical mode behind the launcher's back.
-    my $suspended = _launch_suspend();
+    # Package 12: this used to _launch_suspend() the frame so the hand-rolled
+    # menu could own the terminal, then resume. It renders as a screen now, so
+    # there is nothing to hand back — prompt_stale_action picks the TUI or the
+    # plain path itself, exactly as the skills picker at the select stage does.
     my $action = prompt_stale_action(\@STALE_REASONS, $HOST_VERSION);
-    _launch_resume() if $suspended;
     if ($action eq 'rebuild') {
         # Remove old container if it exists. Captured: this runs with the frame
         # back up, so inherited stdio would paint over it.
@@ -2515,10 +2517,19 @@ if (@STALE_REASONS) {
     # else 'continue' — fall through to launch as-is
 }
 
-# Arrow-key TUI for the stale-container prompt — matches the visual style
-# of the skills/plugins/MCP picker. Single-key shortcuts ('r', 'c', 'q')
-# also work. Falls back to a line-read prompt if Term::ReadKey is missing
-# or stdin/stdout aren't tty (so CI / non-interactive uses keep working).
+# The stale-container prompt. Three paths, in descending order of capability:
+#
+#   1. TUI      — a single-choice screen through tui::LaunchScreens, sharing
+#                 the launch frame, the seams and the keep-alive with every
+#                 other launch screen (package 12).
+#   2. cbreak   — the pre-package-12 in-place menu, still used when a TTY is
+#                 available but the launch never opened a frame (CCPRAXIS_NO_TUI,
+#                 or a teardown that dropped us back to plain mid-launch).
+#   3. line-read — no TTY or no Term::ReadKey at all, so CI keeps working.
+#
+# 'r' and 'c' keep working on paths 1 and 2 alike: path 1 declares them as
+# model shortcuts and prints them on the rows, so the affordance the old menu
+# advertised in its footer survives the conversion rather than being dropped.
 sub prompt_stale_action {
     my ($reasons_ref, $host_version) = @_;
     my @reasons = @$reasons_ref;
@@ -2526,6 +2537,30 @@ sub prompt_stale_action {
         ['rebuild',  "Rebuild — fresh container with Claude Code v$host_version"],
         ['continue', "Continue as-is"],
     );
+
+    # Path 1: render as a screen. Gated on {active}, not just $LAUNCH_MODE, for
+    # the same reason the select stage is: _tee_system's plain-after-teardown
+    # fallback can tear the host down mid-launch while the mode still says
+    # 'tui', and opening a screen after that paints escapes onto a restored
+    # terminal and reads keys that are no longer in cbreak.
+    if ($LAUNCH_MODE ne 'plain' && $LAUNCH_HOST && $LAUNCH_HOST->{active}) {
+        my $model = tui::LaunchScreens::menu_model(
+            label   => 'Sandbox may be stale',
+            detail  => \@reasons,
+            options => [
+                { id => 'rebuild',  key => 'r', display => "[r] $options[0][1]" },
+                { id => 'continue', key => 'c', display => "[c] $options[1][1]" },
+            ],
+        );
+        my $res = _launch_run_list($model);
+        # q/ESC is 'cancel' — IDENTICAL to the hand-rolled menu, which mapped
+        # both to cancel and let the caller exit cleanly. Not 'continue' and
+        # certainly not the cursor's row: a screen that returned the row under
+        # the cursor would rebuild a container because the operator pressed
+        # escape, which is exactly the class of bug this conversion must not
+        # introduce.
+        return tui::LaunchScreens::menu_choice($res, 'cancel');
+    }
 
     # Non-tty / Term::ReadKey unavailable → degrade to a single-line prompt.
     my $have_readkey = eval { require Term::ReadKey; 1 };
@@ -3429,24 +3464,58 @@ sub find_orphan_claudes {
     return @orphans;
 }
 
+# $teardown is an OPTIONAL coderef run after the decision and before anything
+# that writes to the real terminal or spawns with inherited stdio (package 12).
+# The ordering is the whole point: the confirm now renders as a screen, so it
+# needs the frame UP, while the `podman exec ... kill` calls below inherit
+# stdio and would paint straight over that frame. Decide inside the frame,
+# tear down, then act. Callers that have already torn down pass nothing.
 sub kill_orphan_claudes_if_user_confirms {
+    my ($teardown) = @_;
     my @orphans = find_orphan_claudes();
     return unless @orphans;
-    print "\n";
-    print "Found ", scalar(@orphans), " orphan claude process(es) in the container:\n";
-    print "  PID $_\n" for @orphans;
-    print "\n";
-    print "These are claude processes left over from a previous session — usually because\n";
-    print "you Ctrl+C'd from PowerShell, which kills the local client but doesn't always\n";
-    print "propagate the kill into the container. They hold lockfiles in /root/.claude/\n";
-    print "that will block any new claude session you start.\n";
-    print "\n";
-    print "Kill them now? [Y/n]: ";
-    my $resp = <STDIN>;
-    $resp //= '';
-    chomp $resp;
-    my $first = lc(substr($resp, 0, 1) // '');
-    if ($first eq 'n') {
+
+    my @explain = (
+        "Found " . scalar(@orphans) . " orphan claude process(es) in the container:",
+        (map { "  PID $_" } @orphans),
+        '',
+        'Left over from a previous session — usually a Ctrl+C from PowerShell, which',
+        'kills the local client but does not always propagate into the container. They',
+        'hold lockfiles in /root/.claude/ that will block any new claude session.',
+    );
+
+    my $kill;
+    if ($LAUNCH_MODE ne 'plain' && $LAUNCH_HOST && $LAUNCH_HOST->{active}) {
+        my $model = tui::LaunchScreens::menu_model(
+            label   => 'Orphan claude processes',
+            detail  => \@explain,
+            options => [
+                { id => 'kill', key => 'y', display => '[y] Kill them now' },
+                { id => 'skip', key => 'n', display => '[n] Leave them running' },
+            ],
+        );
+        my $res = _launch_run_list($model);
+        # ESC/q => 'skip'. The line prompt below defaults to KILL on a bare
+        # Enter ([Y/n]) and the screen preserves that — the cursor starts on
+        # 'kill', so Enter still kills. But an ESCAPE is not an answer, and it
+        # must never be the thing that fires an irreversible kill -9.
+        $kill = (tui::LaunchScreens::menu_choice($res, 'skip') eq 'kill') ? 1 : 0;
+        $teardown->() if ref $teardown eq 'CODE';
+    }
+    else {
+        $teardown->() if ref $teardown eq 'CODE';
+        print "\n";
+        print "$_\n" for @explain;
+        print "\n";
+        print "Kill them now? [Y/n]: ";
+        my $resp = <STDIN>;
+        $resp //= '';
+        chomp $resp;
+        my $first = lc(substr($resp, 0, 1) // '');
+        $kill = ($first eq 'n') ? 0 : 1;
+    }
+
+    unless ($kill) {
         print "Skipping orphan cleanup. If your new session hangs, run:\n";
         print "  podman.exe exec $CONTAINER_NAME pkill claude\n";
         return;
