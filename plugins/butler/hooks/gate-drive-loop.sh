@@ -48,23 +48,53 @@ MAX_BLOCKS=3          # never nag more than this many times in a row
 [ -n "${BP_LEDGER:-}" ] && exit 0
 [ "${CCPRAXIS_DRIVE_STOP_OK:-}" = "1" ] && exit 0
 
+# --- SCOPING, and it must be cheap for the 99% who are not driving ----------
+#
+# THE OLD TEST WAS WRONG AND EXPENSIVE. It asked "does an ancestor of my cwd
+# contain .ccpraxis-local-data/.drive-solo/order.json". That is yes for every
+# session in a tree where drive-solo has EVER run — order.json was never
+# deleted when a run finished — and yes for sessions that are not the driver
+# at all. Worse, the ancestor walk did not terminate on a Windows drive-letter
+# cwd (dirname("C:") == "C:"), so an unrelated session hung here until the
+# hook timeout on every single stop.
+#
+# The right question is "is THIS session driving", and mark-wakeup.sh answers
+# it by registering a session the moment it calls the director. Two stats and
+# no subprocess when nothing is driving anywhere.
+bp_drive_any_active || exit 0
+
 PAYLOAD=$(cat 2>/dev/null || true)
 
-CWD=$(bp_json_get "$PAYLOAD" cwd 2>/dev/null || true); CWD=${CWD:-$PWD}
-DATA="${CCPRAXIS_DATA_DIR:-}"
-if [ -z "$DATA" ]; then
-  d=$CWD
-  while [ -n "$d" ] && [ "$d" != "/" ]; do
-    [ -d "$d/.ccpraxis-local-data" ] && { DATA="$d/.ccpraxis-local-data"; break; }
-    d=$(dirname "$d")
-  done
+SID=$(bp_json_get "$PAYLOAD" session_id 2>/dev/null || true)
+[ -n "$SID" ] || exit 0
+MARK=$(bp_drive_marker "$SID" 2>/dev/null) || exit 0
+[ -f "$MARK" ] || exit 0
+
+# --- staleness: a driver that died must not gate its session id forever -----
+# Belt to the disarm-on-settle braces below. A crashed or killed driver leaves
+# its marker behind, and without a TTL that id would be gated until someone
+# noticed. Refreshed on every stop of a live driver, so only genuine silence
+# ages it out.
+TTL_H="${CCPRAXIS_DRIVE_TTL_H:-12}"
+case "$TTL_H" in ''|*[!0-9]*) TTL_H=12 ;; esac
+MNOW=$(date +%s 2>/dev/null || echo 0)
+MMT=$(stat -c %Y "$MARK" 2>/dev/null || echo 0)
+if [ "$MNOW" -gt 0 ] && [ "$MMT" -gt 0 ] \
+   && [ $(( (MNOW - MMT) / 3600 )) -ge "$TTL_H" ]; then
+  rm -f "$MARK" 2>/dev/null
+  exit 0
 fi
-# No drive-solo state dir => no run in progress here => not our business.
-[ -n "$DATA" ] && [ -d "$DATA/.drive-solo" ] || exit 0
+
+# The marker holds the data dir the driver was working in, so this hook needs
+# no path walk of its own — the walk that used to be here is the one that hung.
+DATA=$(head -n 1 "$MARK" 2>/dev/null || true)
+[ -n "$DATA" ] && [ -d "$DATA/.drive-solo" ] || { rm -f "$MARK" 2>/dev/null; exit 0; }
 DS="$DATA/.drive-solo"
 
 # A drive-solo run is only "in progress" once an order has been recorded.
 [ -f "$DS/order.json" ] || exit 0
+
+touch "$MARK" 2>/dev/null || true
 
 # --- escape hatch: one-shot file, consumed ----------------------------------
 if [ -f "$DS/.stop-ok" ]; then
@@ -97,9 +127,52 @@ DRIVE="$HOOK_DIR/../scripts/bp-drive-next.pl"
 [ -r "$DRIVE" ] || exit 0
 command -v perl >/dev/null 2>&1 || exit 0
 
-RUNNER=""
-command -v timeout >/dev/null 2>&1 && RUNNER="timeout 20"
-OUT=$(cd "$CWD" 2>/dev/null && $RUNNER perl "$DRIVE" next 2>/dev/null) || exit 0
+# Run the director in the PROJECT the marker recorded, not in whatever the
+# payload's cwd happens to be. The marker is the authoritative statement of
+# which project this session is driving; a driver that has cd'd into a
+# subdirectory (or anywhere else) must still get its own run's verdict. The
+# payload cwd is kept only as a fallback for a marker written before this
+# field existed.
+RUN_DIR=$(dirname "$DATA" 2>/dev/null || true)
+if [ -z "$RUN_DIR" ] || [ ! -d "$RUN_DIR" ]; then
+  RUN_DIR=$(bp_json_get "$PAYLOAD" cwd 2>/dev/null || true)
+fi
+[ -n "$RUN_DIR" ] && [ -d "$RUN_DIR" ] || exit 0
+
+# THE DIRECTOR CALL IS ALWAYS BOUNDED. It used to be `timeout 20` when timeout
+# existed and UNBOUNDED when it did not — and stock macOS ships no `timeout`
+# (only `gtimeout`, via coreutils). An unbounded subprocess inside a Stop hook
+# is precisely the shape that hung this hook in the first place, so it must not
+# be reachable on any platform.
+#
+# The fallback bounds it in perl, which this whole project already requires.
+#
+# ⚠ IT MUST FORK, NOT EXEC. The obvious one-liner —
+#     perl -e 'alarm 20; exec @ARGV' perl "$DRIVE" next
+# — DOES NOT BOUND ANYTHING HERE, despite alarm() being nominally a process
+# property that survives exec. Measured on this host: a 60-second child ran all
+# 60 seconds and exited 0. Git-for-Windows perl emulates exec by spawning and
+# waiting, so the alarm applies to a wrapper that is merely waiting. Forking and
+# killing the child from the parent's SIGALRM handler bounds it correctly (3s,
+# exit 124, verified). Recorded because the exec form LOOKS right and silently
+# does nothing.
+if command -v timeout >/dev/null 2>&1; then
+  OUT=$(cd "$RUN_DIR" 2>/dev/null && timeout 20 perl "$DRIVE" next 2>/dev/null) || exit 0
+elif command -v gtimeout >/dev/null 2>&1; then
+  OUT=$(cd "$RUN_DIR" 2>/dev/null && gtimeout 20 perl "$DRIVE" next 2>/dev/null) || exit 0
+else
+  OUT=$(cd "$RUN_DIR" 2>/dev/null && perl -e '
+      my $pid = fork();
+      exit 127 unless defined $pid;
+      if ($pid == 0) { exec @ARGV; exit 127 }
+      $SIG{ALRM} = sub { kill 9, $pid };
+      alarm 20;
+      waitpid($pid, 0);
+      my $rc = $?;
+      alarm 0;
+      exit($rc == 0 ? 0 : 124);
+    ' perl "$DRIVE" next 2>/dev/null) || exit 0
+fi
 [ -n "$OUT" ] || exit 0
 
 ACTION=$(printf '%s' "$OUT" | perl -ne 'print $1 if /"action"\s*:\s*"([a-z-]+)"/' 2>/dev/null || true)
@@ -107,12 +180,22 @@ ACTION=$(printf '%s' "$OUT" | perl -ne 'print $1 if /"action"\s*:\s*"([a-z-]+)"/
 
 case "$ACTION" in
   done)
-    # Run settled. Clean up our own state so a later run starts fresh.
-    rm -f "$DS/.stop-blocks" "$DS/.wakeup-pending" 2>/dev/null
+    # Run settled. DISARM: drop this session's marker as well as the run state.
+    # Leaving it is exactly how the old design rotted — a finished run kept the
+    # gate armed for every later session in the tree, forever, because nothing
+    # ever cleaned up after success. A later /butler:drive-solo re-arms on its
+    # first director call, so re-arming costs nothing and staying armed costs
+    # every unrelated session a director spawn on every stop.
+    rm -f "$DS/.stop-blocks" "$DS/.wakeup-pending" "$MARK" 2>/dev/null
     exit 0 ;;
   pause)
     # A usage pause is waited out with Monitor/ScheduleWakeup (its own wake-up);
     # a token pause is a terminal relogin park. Both are legitimate stops.
+    #
+    # The marker STAYS: a usage pause is resumed by this same session once the
+    # window rolls over, so disarming here would drop the gate for the rest of
+    # a run that is still very much in progress. The TTL above is what reaps it
+    # if the session never comes back.
     rm -f "$DS/.stop-blocks" 2>/dev/null
     exit 0 ;;
 esac

@@ -41,18 +41,51 @@ PAYLOAD=$(cat 2>/dev/null || true)
 # Resolve the drive-solo state dir exactly as bp-drive-next.pl does: an explicit
 # CCPRAXIS_DATA_DIR wins, else <project>/.ccpraxis-local-data. No .drive-solo dir
 # means no drive-solo run is in progress here and this hook is irrelevant.
+#
+# ⚠ bp_find_data_dir, NOT a local while-loop. The loop that used to live here
+# did not terminate on Windows: dirname("C:") is "C:", which is neither empty
+# nor "/", so any session whose cwd had no .ccpraxis-local-data ancestor spun
+# until the 15s hook timeout — on EVERY Bash call and EVERY Task dispatch, in
+# every unrelated project on the machine. See bp_find_data_dir in lib.sh.
 CWD=$(bp_json_get "$PAYLOAD" cwd 2>/dev/null || true); CWD=${CWD:-$PWD}
-DATA="${CCPRAXIS_DATA_DIR:-}"
-if [ -z "$DATA" ]; then
-  d=$CWD
-  while [ -n "$d" ] && [ "$d" != "/" ]; do
-    [ -d "$d/.ccpraxis-local-data" ] && { DATA="$d/.ccpraxis-local-data"; break; }
-    d=$(dirname "$d")
-  done
-fi
+DATA=$(bp_find_data_dir "$CWD" 2>/dev/null || true)
 [ -n "$DATA" ] && [ -d "$DATA/.drive-solo" ] || exit 0
 
 TOOL=$(bp_json_get "$PAYLOAD" tool_name 2>/dev/null || true)
+
+# ---------------------------------------------------------------------------
+# ARMING: this hook is what registers a session as a drive-solo DRIVER.
+#
+# A driver is not "a session in a directory where drive-solo once ran" — that
+# was the old, wrong test, and it armed the Stop gate permanently for every
+# session in the tree. A driver is a session that CALLS THE DIRECTOR. Nothing
+# else does, and a session that never calls it is not driving no matter where
+# it is running. So: see bp-drive-next.pl in a Bash command, register this
+# session id; gate-drive-loop.sh then gates exactly that session and no other.
+#
+# Self-arming, so no skill or script has to remember to do it, and impossible
+# to arm a session that never drove. The marker holds the data dir so the Stop
+# hook needs no path walk of its own.
+# The match requires the script AND one of its subcommands, so a command that
+# merely NAMES the file -- a grep for it, an ls of the scripts dir, a sed over
+# the source -- does not arm a session that is only reading about the director.
+# The script rejects an empty subcommand ("usage: next|record-order|park"), so
+# every real invocation carries one and nothing is lost by requiring it.
+#
+# The bias is deliberate and one-directional: a false POSITIVE arms a session
+# that is not driving, which costs it one director call per stop and then
+# disarms itself the moment the director answers 'done'. A false NEGATIVE
+# leaves a real driver ungated, which is the silent mid-run death this whole
+# pair exists to prevent. When in doubt, arm.
+SID=$(bp_json_get "$PAYLOAD" session_id 2>/dev/null || true)
+if [ "$TOOL" = "Bash" ] && [ -n "$SID" ]; then
+  if printf '%s' "$PAYLOAD" | grep -Eq 'bp-drive-next\.pl[^"]*(next|record-order|park)'; then
+    if MARK=$(bp_drive_marker "$SID" 2>/dev/null); then
+      mkdir -p "$(dirname "$MARK")" 2>/dev/null \
+        && printf '%s\n' "$DATA" > "$MARK" 2>/dev/null || true
+    fi
+  fi
+fi
 
 case "$TOOL" in
   Task)

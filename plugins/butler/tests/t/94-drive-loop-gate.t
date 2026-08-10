@@ -72,17 +72,39 @@ like($stop_block, qr/gate-drive-loop\.sh/,
 # Helpers. Each case gets its own project root so no test can see another's
 # state — the .drive-solo dir IS the hooks' activation signal.
 # ---------------------------------------------------------------------------
+# The ACTIVE-DRIVER REGISTRY for the project under test. The gate is scoped by
+# SESSION now, not by directory: it asks "is this session driving", answered by
+# a marker that mark-wakeup.sh writes when a session calls the director.
+#
+# RE-POINTED, NOT WEAKENED. These fixtures used to arm the gate merely by
+# creating .drive-solo/order.json, which is exactly the defect that scoping
+# change fixed — that test was true for every session in the tree, including
+# ones that had never driven anything, and it never became false when a run
+# finished. Every claim below is unchanged; only the way a fixture declares
+# "this session is the driver" has moved.
+our $ACTIVE  = '';
+our $SESSION = 'sess-under-test';
+
 sub new_project {
     my (%opt) = @_;
     my $root = tempdir(CLEANUP => 1);
     my $ds   = "$root/.ccpraxis-local-data/.drive-solo";
     make_path($ds);
+    $ACTIVE = "$root/.active-drivers";
+    make_path($ACTIVE);
     # order.json is what marks a run as "in progress"; omit it to model a
     # project where drive-solo has never run.
     if ($opt{order}) {
         open my $fh, '>', "$ds/order.json" or die;
         print {$fh} '{"order":["x"],"recorded_at":1}';
         close $fh;
+        # ... and arm THIS session as the driver, unless the case is
+        # specifically about an unarmed one.
+        unless ($opt{unarmed}) {
+            open my $m, '>', "$ACTIVE/$SESSION" or die;
+            print {$m} "$root/.ccpraxis-local-data\n";
+            close $m;
+        }
     }
     return ($root, $ds);
 }
@@ -98,6 +120,9 @@ sub run_hook {
     # pause/token, the gate correctly allows the stop, and a green test turns
     # red with no code change. Observed exactly that on 2026-08-08.
     $env .= "CCPRAXIS_USAGE_VERDICT_JSON='{\"action\":\"ok\"}' " if $opt{verdict_ok};
+    # Point the hooks at THIS case's driver registry, so no case can see
+    # another's arming and nothing touches the real one under $HOME.
+    $env .= "CCPRAXIS_DRIVE_ACTIVE_DIR='$ACTIVE' " if length $ACTIVE;
     # Single-quote the payload for sh; payloads here contain no single quotes.
     my $out = `$env bash "$script" <<'PAYLOAD_EOF' 2>&1
 $payload
@@ -105,14 +130,14 @@ PAYLOAD_EOF`;
     return ($? >> 8, $out);
 }
 
-sub payload_task { my $cwd = shift; qq({"cwd":"$cwd","tool_name":"Task","tool_input":{}}) }
+sub payload_task { my $cwd = shift; qq({"session_id":"$SESSION","cwd":"$cwd","tool_name":"Task","tool_input":{}}) }
 sub payload_bash {
     my ($cwd, $bg) = @_;
     return $bg
-        ? qq({"cwd":"$cwd","tool_name":"Bash","tool_input":{"command":"ls","run_in_background":true}})
-        : qq({"cwd":"$cwd","tool_name":"Bash","tool_input":{"command":"ls"}});
+        ? qq({"session_id":"$SESSION","cwd":"$cwd","tool_name":"Bash","tool_input":{"command":"ls","run_in_background":true}})
+        : qq({"session_id":"$SESSION","cwd":"$cwd","tool_name":"Bash","tool_input":{"command":"ls"}});
 }
-sub payload_stop { my $cwd = shift; qq({"cwd":"$cwd"}) }
+sub payload_stop { my $cwd = shift; qq({"session_id":"$SESSION","cwd":"$cwd"}) }
 
 # ---------------------------------------------------------------------------
 # B. mark-wakeup.sh records exactly the things that schedule a wake-up.

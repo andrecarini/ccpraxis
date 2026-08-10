@@ -317,3 +317,143 @@ bp_repeat_action_of() {
     *)        printf '%s\n' off ;;
   esac
 }
+
+# ---------------------------------------------------------------------------
+# Path walking and drive-solo session scoping.
+# ---------------------------------------------------------------------------
+
+# bp_find_data_dir CWD -> echoes the .ccpraxis-local-data path, or nothing (rc 1).
+#
+# ⚠ TERMINATION IS THE WHOLE POINT OF THIS FUNCTION. It replaces two hand-rolled
+# copies of
+#
+#     while [ -n "$d" ] && [ "$d" != "/" ]; do ... d=$(dirname "$d"); done
+#
+# which DID NOT TERMINATE on Windows. Claude Code puts a drive-letter cwd in the
+# hook payload ("C:/Development/indocs"), and dirname walks that to "C:" and then
+# returns "C:" forever — a fixed point that is neither empty nor "/". Any session
+# whose cwd had no .ccpraxis-local-data ancestor therefore spun here until the
+# hook timeout: 30s on every Stop, and — because mark-wakeup.sh is PreToolUse on
+# Bash and Task — 15s on EVERY tool call, in EVERY unrelated project on the
+# machine. Reported as an agent hanging at "running stop hooks… 1/2 · 56s".
+#
+# Two independent stops, because one is a promise and two is a guarantee:
+#   * the loop ends at a FIXED POINT (d == prev), which covers "/", "C:", ".",
+#     "//server" and anything else dirname converges on, and
+#   * a hard depth cap, so even a pathological dirname cannot spin.
+bp_find_data_dir() {
+  local start="${1:-}" d prev n
+  if [ -n "${CCPRAXIS_DATA_DIR:-}" ]; then
+    printf '%s' "$CCPRAXIS_DATA_DIR"
+    return 0
+  fi
+  [ -n "$start" ] || return 1
+  d=$start; prev=''; n=0
+  while [ -n "$d" ] && [ "$d" != "$prev" ] && [ "$n" -lt 64 ]; do
+    if [ -d "$d/.ccpraxis-local-data" ]; then
+      printf '%s' "$d/.ccpraxis-local-data"
+      return 0
+    fi
+    prev=$d
+    d=$(dirname "$d" 2>/dev/null) || return 1
+    n=$((n + 1))
+  done
+  return 1
+}
+
+# bp_drive_active_dir -> echoes the machine-level registry of ACTIVE drive-solo
+# driver sessions. One file per session, named by session_id.
+#
+# WHY A REGISTRY, replacing "is there a .drive-solo/order.json above my cwd".
+# That question is wrong twice over. It says YES for every session in a tree
+# that has ever run drive-solo — order.json was never deleted when a run
+# finished, so two settled runs on this machine armed the Stop gate for every
+# future session in those trees, forever. And it says yes for sessions that are
+# not the driver at all: a second terminal in the same project inherited the
+# gate. The registry answers the question actually being asked — "is THIS
+# session driving?" — and answers it in one stat().
+bp_drive_active_dir() {
+  if [ -n "${CCPRAXIS_DRIVE_ACTIVE_DIR:-}" ]; then
+    printf '%s' "$CCPRAXIS_DRIVE_ACTIVE_DIR"
+    return 0
+  fi
+  printf '%s' "${HOME:-$PWD}/.claude/ccpraxis/.drive-solo-active"
+}
+
+# bp_drive_any_active -> rc 0 if ANY driver session is registered.
+# The cheap pre-check: when nothing is driving anywhere (the overwhelmingly
+# common case) a hook can return before parsing its payload, so an unrelated
+# session pays two stats and spawns nothing at all.
+# bp_drive_ttl_hours -> the staleness limit, sanitised.
+bp_drive_ttl_hours() {
+  local h="${CCPRAXIS_DRIVE_TTL_H:-12}"
+  case "$h" in ''|*[!0-9]*) h=12 ;; esac
+  [ "$h" -gt 0 ] 2>/dev/null || h=12
+  printf '%s' "$h"
+}
+
+# bp_drive_any_active -> rc 0 if ANY driver session is registered, AFTER reaping
+# expired markers.
+#
+# THE REAP HAS TO LIVE HERE, not in the per-session TTL check. That check only
+# ever runs for the session whose id MATCHES a marker — and a dead driver never
+# comes back to match its own, so its marker was immortal. Measured before this:
+# three markers 55h old survived three consecutive stops by another session and
+# were still there afterwards.
+#
+# It never hung anything (an unmatched marker is only read by the session that
+# owns it), but it defeated the entire point of the design: one leaked marker
+# keeps this function true forever, so every session on the machine goes on to
+# parse its payload and spawn a JSON reader on every stop instead of returning
+# after two stats. A registry that only grows is a slow reintroduction of the
+# bug this replaced.
+#
+# Pure stat + rm, no subprocess, over a directory that holds one entry per
+# CONCURRENT driver — single digits in the worst realistic case.
+bp_drive_any_active() {
+  local dir now ttl mt f live=1
+  dir=$(bp_drive_active_dir)
+  [ -d "$dir" ] || return 1
+
+  now=$(date +%s 2>/dev/null || echo 0)
+  ttl=$(bp_drive_ttl_hours)
+
+  # Positional params are function-scoped in bash, so this cannot disturb the
+  # calling hook. "${1:-}" rather than "$1": every hook runs under `set -u`,
+  # and with nullglob enabled anywhere in the environment an unmatched glob
+  # leaves $1 UNSET, which under set -u is a fatal "unbound variable" — the
+  # hook would die instead of returning "nothing active". Verified: with
+  # `shopt -s nullglob; set -u`, the bare "$1" form aborts.
+  set -- "$dir"/*
+  [ -e "${1:-}" ] || return 1
+
+  live=0
+  for f in "$@"; do
+    [ -f "$f" ] || continue
+    if [ "$now" -gt 0 ]; then
+      mt=$(stat -c %Y "$f" 2>/dev/null || echo 0)
+      if [ "$mt" -gt 0 ] && [ $(( (now - mt) / 3600 )) -ge "$ttl" ]; then
+        rm -f "$f" 2>/dev/null
+        continue
+      fi
+    fi
+    live=$((live + 1))
+  done
+
+  [ "$live" -gt 0 ] || return 1
+  return 0
+}
+
+# bp_drive_marker SESSION_ID -> echoes the marker path for that session.
+# Session ids come from the hook payload, so refuse anything with a path
+# separator or traversal in it rather than letting it address another directory.
+bp_drive_marker() {
+  local sid="${1:-}" dir
+  [ -n "$sid" ] || return 1
+  case "$sid" in
+    */*|*\*|.|..|*..*) return 1 ;;
+  esac
+  dir=$(bp_drive_active_dir)
+  printf '%s/%s' "$dir" "$sid"
+  return 0
+}
