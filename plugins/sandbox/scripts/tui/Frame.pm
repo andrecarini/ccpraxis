@@ -88,6 +88,38 @@ sub _is_narrow_latin {
     return 1;
 }
 
+# _is_safe_punct($cp) -> 1|0 -- typographic punctuation this codebase actually
+# WRITES, every one of which tui::Layout::char_cols already measures as a
+# single column.
+#
+# Same defect as _is_narrow_latin, one Unicode block further along, and found
+# the same way: from a live launch. "Rebuild - fresh container with Claude Code
+# v2.1.219" reached the operator's screen as "Rebuild ? fresh container",
+# because the em dash fell off the end of the ladder into '?'. It is not one
+# string -- there are 32 of these characters in non-comment code in
+# launcher.pl, Dashboard.pm and BackpackReview.pm alone, so every one of those
+# messages has been rendering with a '?' punched through it in every frame the
+# library draws.
+#
+# An EXPLICIT LIST, not a block range: U+2000-U+206F also holds zero-width
+# joiners, bidi overrides and word joiners, none of which may reach a terminal
+# from here. The width re-check in safe_char is belt-and-braces on top -- it
+# makes a future addition to this list unable to become a column-arithmetic
+# bug even if someone adds a wide character by mistake.
+my %SAFE_PUNCT = map { $_ => 1 } (
+    0x2010, 0x2011, 0x2012, 0x2013, 0x2014, 0x2015,   # hyphen .. horizontal bar
+    0x2018, 0x2019, 0x201A, 0x201B,                   # single quotes
+    0x201C, 0x201D, 0x201E, 0x201F,                   # double quotes
+    0x2022, 0x2023,                                   # bullets
+    0x2026,                                           # ellipsis
+    0x2039, 0x203A,                                   # single guillemets
+    0x2032, 0x2033,                                   # prime, double prime
+);
+sub _is_safe_punct {
+    my ($cp) = @_;
+    return $SAFE_PUNCT{$cp} ? 1 : 0;
+}
+
 sub safe_char {
     my ($c) = @_;
     return '' if !defined $c || $c eq '';
@@ -111,6 +143,9 @@ sub safe_char {
     # right all along. Substituting a character whose width you already know
     # loses information and buys nothing.
     return $c if _is_narrow_latin($cp);
+    # The width re-check is deliberate: it makes it impossible for an addition
+    # to %SAFE_PUNCT to become a column-arithmetic bug.
+    return $c if _is_safe_punct($cp) && tui::Layout::char_cols($c) == 1;
     return '?';
 }
 

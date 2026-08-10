@@ -1525,4 +1525,66 @@ SKIP: {
      . 'rather than admitted as a narrow character');
 }
 
+
+# ===========================================================================
+# M. Typographic punctuation survives the sanitiser.
+#
+# The same defect as L, one Unicode block along, and found the same way — from
+# a live launch, not from a test. The stale-container menu rendered
+# "Rebuild — fresh container with Claude Code v2.1.219" as "Rebuild ? fresh
+# container": the em dash fell off the end of safe_char's ladder into '?',
+# even though tui::Layout::char_cols already measured it as one column.
+#
+# It is not one string. There are 32 of these characters in NON-COMMENT code
+# in launcher.pl, Dashboard.pm and BackpackReview.pm alone, so every one of
+# those messages had a '?' punched through it in every frame the library drew.
+# ===========================================================================
+{
+    my @keep = (
+        [ "\x{2014}", 'em dash'      ],
+        [ "\x{2013}", 'en dash'      ],
+        [ "\x{2018}", 'left single quote'  ],
+        [ "\x{2019}", 'right single quote' ],
+        [ "\x{201C}", 'left double quote'  ],
+        [ "\x{201D}", 'right double quote' ],
+        [ "\x{2026}", 'ellipsis'     ],
+        [ "\x{2022}", 'bullet'       ],
+    );
+    for my $pair (@keep) {
+        my ($ch, $name) = @$pair;
+        my $got = decode('UTF-8', tui::Frame::safe(encode('UTF-8', "a${ch}b")));
+        is($got, "a${ch}b", "M1: a $name survives rather than becoming '?'");
+    }
+
+    # The real string from the launch that exposed this.
+    my $line = "Rebuild \x{2014} fresh container with Claude Code v2.1.219";
+    my $got  = decode('UTF-8', tui::Frame::safe(encode('UTF-8', $line)));
+    is($got, $line, 'M2: the exact menu row that rendered with a "?" is now intact');
+    unlike($got, qr/\?/, 'M3: ... and carries no question mark at all');
+
+    # WIDTH IS THE WHOLE JUSTIFICATION for admitting these: char_cols already
+    # measured them as one column, so keeping them cannot move any column
+    # arithmetic. Assert that rather than assume it.
+    is(tui::Layout::display_width($line),
+       tui::Layout::display_width("Rebuild - fresh container with Claude Code v2.1.219"),
+       'M4: the em-dash row is exactly as wide as its ASCII-hyphen twin');
+
+    # COUNTER-FIXTURES: the whitelist is an explicit LIST, not the block range
+    # U+2000-U+206F, because that block also holds zero-width joiners and bidi
+    # overrides. If these ever pass through, the list has been replaced by a
+    # range and the guard is gone.
+    my $bidi = decode('UTF-8', tui::Frame::safe(encode('UTF-8', "a\x{202E}b")));
+    unlike($bidi, qr/\x{202E}/,
+       'M5: counter-fixture — a right-to-left OVERRIDE from the same block is '
+     . 'still refused (it can reorder a whole line on a terminal)');
+
+    my $wj = decode('UTF-8', tui::Frame::safe(encode('UTF-8', "a\x{2060}b")));
+    unlike($wj, qr/\x{2060}/,
+       'M6: counter-fixture — a word joiner from the same block is still refused');
+
+    my $zwsp = decode('UTF-8', tui::Frame::safe(encode('UTF-8', "a\x{200B}b")));
+    is($zwsp, 'ab',
+       'M7: counter-fixture — a zero-width space is still dropped, not admitted');
+}
+
 done_testing();
