@@ -15,6 +15,7 @@ use warnings;
 use FindBin qw($Bin);
 use lib "$Bin/../../scripts";
 use Test::More;
+use Encode ();
 
 my $LAUNCHER = "$Bin/../../scripts/launcher.pl";
 my $LSPM     = "$Bin/../../scripts/tui/LaunchScreens.pm";
@@ -277,6 +278,101 @@ sub extract_sub_body {
     ok($ticks >= 1,
        'C2-8 the heartbeat ticks even when the operator presses nothing — an idle '
      . 'operator is exactly the case the container keep-alive exists for');
+}
+
+
+# ===========================================================================
+# C3. A MENU MUST NOT WEAR MULTI-SELECT CHROME.
+#
+# Reported from a live launch: the converted stale prompt rendered as
+#
+#     -- items ---------------------------------------------------
+#           - Containerfile has changed since last build
+#         [ ] [r] Rebuild ? fresh container with Claude Code v2.1.219
+#       > [x] [c] Continue as-is
+#       2 item(s), 1 selected
+#
+# "It's not a select-multiple step and shouldn't have the semantics of one."
+# Correct: a checkbox invites a second tick that this mode cannot accept (the
+# first choice closes the screen), and "N item(s), M selected" is a running
+# tally on a screen with no tally. This asserts against the RENDERED FRAME,
+# not the model — the model was right the whole time and every unit assertion
+# passed while the screen was wrong.
+# ===========================================================================
+{
+    my $ls = tui::LaunchScreens::list_init(model => tui::LaunchScreens::menu_model(
+        label   => 'Sandbox may be stale',
+        detail  => [ 'Containerfile has changed since last build' ],
+        options => [
+            { id => 'rebuild',  key => 'r', display => '[r] Rebuild' },
+            { id => 'continue', key => 'c', display => '[c] Continue as-is' },
+        ],
+    ));
+    my $frame = tui::LaunchScreens::compose_list($ls, 24, 100);
+    my $text  = join "\n", map { tui::Frame::spans_text($_->{spans} || []) } @$frame;
+
+    unlike($text, qr/\[ \]/, 'C3-1 no empty checkbox on a single-choice menu');
+    unlike($text, qr/\[x\]/, 'C3-2 no ticked checkbox either');
+    unlike($text, qr/item\(s\)/,
+           'C3-3 no "N item(s), M selected" tally — the count is always '
+         . '"one, eventually", so the line says nothing');
+    unlike($text, qr/\bselected\b/, 'C3-4 no multi-select vocabulary anywhere in the frame');
+
+    # The options are still THERE and still distinguishable.
+    like($text, qr/\[r\] Rebuild/,      'C3-5 the rebuild option still renders');
+    like($text, qr/\[c\] Continue/,     'C3-6 the continue option still renders');
+    like($text, qr/Sandbox may be stale/, 'C3-7 the title still renders');
+    like($text, qr/Containerfile has changed/, 'C3-8 the reason still renders');
+
+    # The cursor is what shows the choice now, so it had better be visible.
+    my $cursor = Theme::glyph('cursor');
+    like($text, qr/\Q$cursor\E/,
+         'C3-9 the cursor glyph renders — with the checkbox gone it is the '
+       . 'ONLY thing indicating which option is selected');
+
+    # The footer must not advertise multi-select keys.
+    unlike($text, qr/all in group|toggle/,
+           'C3-10 the footer legend does not offer multi-select actions');
+
+    # COUNTER-FIXTURE: multi mode still HAS the chrome, so C3-1..C3-4 are
+    # proving single-mode differs rather than that the boxes vanished for all.
+    my $multi = tui::LaunchScreens::list_init(model => {
+        mode  => 'multi',
+        items => [ { kind => 'row', id => 'a', display => 'alpha' } ],
+    });
+    my $mtext = join "\n",
+        map { tui::Frame::spans_text($_->{spans} || []) }
+        @{ tui::LaunchScreens::compose_list($multi, 24, 100) };
+    like($mtext, qr/\[ \]/,
+         'C3-11 counter-fixture: multi mode STILL renders checkboxes '
+       . '(if this ever fails, C3-1 is guarding nothing)');
+    like($mtext, qr/item\(s\)/,
+         'C3-12 counter-fixture: multi mode still renders the tally');
+}
+
+# The em dash in a real option label must reach the frame intact. This is the
+# '?' in "Rebuild ? fresh container" from the live report — fixed in
+# tui::Frame::safe_char, asserted here at the level the operator actually sees.
+{
+    my $ls = tui::LaunchScreens::list_init(model => tui::LaunchScreens::menu_model(
+        options => [ { id => 'rebuild', key => 'r',
+                       display => "[r] Rebuild \x{2014} fresh container with Claude Code v2.1.219" } ],
+    ));
+    my $text = join "\n",
+        map { tui::Frame::spans_text($_->{spans} || []) }
+        @{ tui::LaunchScreens::compose_list($ls, 24, 120) };
+
+    # Compare in ONE domain. The frame comes back as UTF-8 BYTES while a
+    # \x{2014} in this file's source is a CHARACTER, so a naive `like` fails
+    # against a frame that is perfectly correct — which is exactly what
+    # happened on the first run of this assertion. Normalise, then compare.
+    my $dtext = eval { Encode::decode('UTF-8', $text, Encode::FB_CROAK()) };
+    $dtext = $text unless defined $dtext;
+
+    like($dtext, qr/Rebuild \x{2014} fresh container/,
+         'C3-13 an em dash in an option label survives to the rendered frame');
+    unlike($dtext, qr/Rebuild \? fresh/,
+           'C3-14 ... and specifically is not the "?" the operator was shown');
 }
 
 

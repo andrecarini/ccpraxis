@@ -1184,15 +1184,27 @@ sub _row_spans {
                    : $st eq 'remove'  ? 'state.crit'
                    :                    'text.muted';
     }
+    elsif ($mode eq 'single') {
+        # NO CHECKBOX. A single-choice menu has exactly one answer and the
+        # cursor already IS that answer, so a '[x]'/'[ ]' column states the
+        # same fact twice while promising something it cannot deliver: a
+        # checkbox is an invitation to tick more than one, and in this mode
+        # the first tick closes the screen. Rendering multi-select chrome on
+        # a menu is a UX lie, not a cosmetic wrinkle -- it was reported from
+        # a live launch as "it's not a select-multiple step and shouldn't
+        # have the semantics of one".
+        $mark = '';
+        $mark_role = 'text.faint';
+    }
     else {
         $mark = $it->{selected} ? '[x]' : '[ ]';
         $mark_role = $it->{selected} ? 'state.ok' : 'text.faint';
     }
 
     my @spans = (
-        { text => $marker,      role => 'accent' },
-        { text => $mark . ' ',  role => $mark_role },
-        { text => $disp,        role => ($it->{disabled} ? 'text.muted' : 'text.primary') },
+        { text => $marker, role => 'accent' },
+        (length($mark) ? { text => $mark . ' ', role => $mark_role } : ()),
+        { text => $disp,   role => ($it->{disabled} ? 'text.muted' : 'text.primary') },
     );
     my $badge = _str($it->{badge});
     push @spans, { text => ' (' . $badge . ')', role => 'text.faint' } if length $badge;
@@ -1245,12 +1257,22 @@ sub list_screen {
         else                   { $nsel++ if $it->{selected} }
     }
 
-    my @summary = ( { text => $nrows . ' item(s), ' . $nsel . ' selected', role => 'text.muted' } );
+    # "N item(s), M selected" is MULTI-SELECT LANGUAGE and belongs only to a
+    # screen where a count is a real quantity the operator is accumulating. On
+    # a single-choice menu the count is always "one, eventually", so the line
+    # says nothing and actively miscommunicates -- it reads as a running tally
+    # on a screen that has no tally. Single mode keeps the scroll hints, which
+    # are still true and still useful, and drops the counter.
+    my @summary;
+    push @summary, { text => $nrows . ' item(s), ' . $nsel . ' selected', role => 'text.muted' }
+        unless $mode eq 'single';
     my @extra;
     push @extra, '+' . $vp->{above} . ' above' if $vp->{above};
     push @extra, '+' . $vp->{below} . ' below' if $vp->{below};
-    push @summary, { text => '   ' . join(', ', @extra), role => 'text.faint' } if @extra;
-    push @lines, \@summary;
+    if (@extra) {
+        push @summary, { text => (@summary ? '   ' : '') . join(', ', @extra), role => 'text.faint' };
+    }
+    push @lines, \@summary if @summary;
 
     my $label = _str($ls->{label});
     $label = 'select' unless length $label;
@@ -1260,7 +1282,11 @@ sub list_screen {
         title_role  => 'accent',
         banners     => $banners,
         banner_role => 'state.warn',
-        panels      => [ { title => 'items', lines => \@lines, body => \@lines } ],
+        # 'items' is inventory language; a menu offers OPTIONS. The divider is
+        # the one piece of panel chrome the operator cannot switch off, so it
+        # should at least name what it is dividing.
+        panels      => [ { title => ($mode eq 'single' ? 'options' : 'items'),
+                           lines => \@lines, body => \@lines } ],
         footer      => LIST_FOOTER_LEGEND($mode),
         footer_role => 'text.faint',
     };
