@@ -46,9 +46,17 @@ FP=$(bp_json_get "$PAYLOAD" tool_input.file_path tool_input.notebook_path)
 
 CWD=$(bp_json_get "$PAYLOAD" cwd)
 [ -n "$CWD" ] || CWD=$PWD
+# A Windows absolute path (`C:/x`, `C:\x`) is NOT matched by `/*`, so it used to
+# fall through to the relative branch and get $CWD prepended. The guard still
+# fired — the `*/blueprint.md` test below survives the mangling — but every
+# refusal message named a nonsense doubled path like
+# `C:/proj/.../bp/C:/proj/.../bp/blueprint.md`, which sends the reader looking
+# for a file that does not exist. Recognise the drive-letter form too.
 case "$FP" in
-  /*) ABS="$FP" ;;
-  *)  ABS="$CWD/$FP" ;;
+  /*)          ABS="$FP" ;;
+  [A-Za-z]:/*) ABS="$FP" ;;
+  [A-Za-z]:\\*) ABS="$FP" ;;
+  *)           ABS="$CWD/$FP" ;;
 esac
 ABS=$(realpath -m "$ABS" 2>/dev/null || printf '%s' "$ABS")
 
