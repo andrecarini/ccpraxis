@@ -280,6 +280,25 @@ sub run_statusline {
 }
 sub statusline_line1 { my ($out) = run_statusline(@_); return first_line($out) }
 
+# The working directory moved OFF row 1 onto its own final row, at the
+# operator's request: a full path is the one field with no natural width, so on
+# row 1 it was permanently in contention with every other field and the fit
+# ladder spent four of its eight steps eliding it. On its own row it is simply
+# rendered in full, and is never elided at any width.
+#
+# These two helpers exist so the ACs below say WHICH ROW they mean. The old
+# tests asked "is the cwd in line 1", which is now the wrong question rather
+# than a failing one.
+sub statusline_path_row {
+    my ($out) = run_statusline(@_);
+    my @rows = split /\n/, (defined $out ? $out : '');
+    return @rows ? $rows[-1] : '';
+}
+sub statusline_rows {
+    my ($out) = run_statusline(@_);
+    return split /\n/, (defined $out ? $out : '');
+}
+
 ok(-f $STATUSLINE, 'setup: scripts/statusline.pl exists at the expected path')
     or BAIL_OUT("cannot find statusline.pl at $STATUSLINE");
 ok(-f $BP_STATUSLINE, 'setup: plugins/butler/scripts/bp-statusline.pl exists at the expected path')
@@ -304,25 +323,31 @@ ok(length($SRC_BP) > 0, 'setup: bp-statusline.pl was read as raw source bytes');
 
     for my $mode (['sandbox', 1, 'SANDBOX'], ['host', 0, 'HOST']) {
         my ($label, $sb, $marker) = @$mode;
-        my $line = statusline_line1(payload_for(current_dir => $cwd),
+        my @args = (payload_for(current_dir => $cwd),
             cols => 200, sandbox => $sb, toplevel => $top, branch => $branch);
+        my $line = statusline_line1(@args);
         my $vis  = strip_sgr($line);
+        my $path_vis = strip_sgr(statusline_path_row(@args));
 
         my $i_marker  = index($vis, $marker);
         my $i_project = index($vis, 'proj-alpha');
-        my $i_cwd     = index($vis, $cwd);
         my $i_branch  = index($vis, $branch);
 
-        ok($i_marker >= 0 && $i_project >= 0 && $i_cwd >= 0 && $i_branch >= 0,
-            "AC-O1 setup ($label): marker, project name, full cwd and branch all appear in the first line")
-            or diag("  marker=$i_marker project=$i_project cwd=$i_cwd branch=$i_branch line=[$vis]");
+        ok($i_marker >= 0 && $i_project >= 0 && $i_branch >= 0,
+            "AC-O1 setup ($label): marker, project name and branch all appear in the first line")
+            or diag("  marker=$i_marker project=$i_project branch=$i_branch line=[$vis]");
 
         ok($i_marker >= 0 && $i_project > $i_marker,
             "AC-O1 ($label): the marker precedes the project name");
-        ok($i_project >= 0 && $i_cwd > $i_project,
-            "AC-O1 ($label): the project name precedes the full working directory");
-        ok($i_cwd >= 0 && $i_branch > $i_cwd,
-            "AC-O1 ($label): the working directory precedes the git branch");
+        ok($i_project >= 0 && $i_branch > $i_project,
+            "AC-O1 ($label): the project name precedes the git branch");
+
+        # The path is no longer ON row 1 -- and must NOT be, or it would still
+        # be competing for that row's width.
+        is(index($vis, $cwd), -1,
+            "AC-O1 ($label): the working directory does NOT appear on row 1");
+        is($path_vis, $cwd,
+            "AC-O1 ($label): the LAST row is the working directory, complete and alone");
 
         is($i_marker, 0,
             "AC-O2 ($label): the marker sits at offset 0 -- nothing is rendered to its left");
@@ -460,7 +485,12 @@ my $ANDRE_NAME = 'Andr' . chr(0xC3) . chr(0xA9) . '-projekt';
                 'AC-P2 (P-b): the project field is NOT the deep working directory basename -- the mislabelled-project defect is gone');
         }
         if ($id eq 'P-d') {
-            ok(index(strip_sgr($line), '/elsewhere/scratch-area') >= 0,
+            # The location lives on the path row now; the name lives on row 1.
+            # That they resolve INDEPENDENTLY is exactly what this asserts, and
+            # it is if anything more visible now that they are on separate rows.
+            my $path_vis = strip_sgr(statusline_path_row(payload_for(current_dir => $c->{cwd}),
+                                cols => 200, sandbox => 0, toplevel => $c->{toplevel}));
+            is($path_vis, '/elsewhere/scratch-area',
                 'AC-P4 (P-d): a working directory OUTSIDE the reported toplevel still renders in full -- name and location resolve independently');
         }
     }
@@ -505,38 +535,35 @@ my $ANDRE_NAME = 'Andr' . chr(0xC3) . chr(0xA9) . '-projekt';
     my $short    = '/w/proj-alpha';
     my $long     = '/w/proj-alpha/' . ('x' x 200);
 
-    # AC-D1 / AC-D2 -- generous width, short path.
+    # AC-D1 / AC-D2 -- the path row renders the path verbatim.
     {
-        my $line = statusline_line1(payload_for(current_dir => $short),
-                        cols => 200, sandbox => 0, toplevel => $top);
-        ok(index(strip_sgr($line), $short) >= 0,
-            'AC-D1: at a generous width the COMPLETE working directory renders verbatim')
-            or diag('  first line = [' . strip_sgr($line) . ']');
+        my @args = (payload_for(current_dir => $short),
+                    cols => 200, sandbox => 0, toplevel => $top);
+        my $line = statusline_line1(@args);
+        is(strip_sgr(statusline_path_row(@args)), $short,
+            'AC-D1: the COMPLETE working directory renders verbatim on its own row');
 
         my $proj = field_at($line, 1);
-        my $cwd  = field_at($line, 2);
         ok(defined($proj) && index($proj, '>') < 0 && index($proj, '<') < 0,
             'AC-D2: at a generous width the project field carries no elision marker -- truncation is conditional, not universal')
             or diag('  project field = ' . (defined $proj ? "[$proj]" : '(none)'));
-        ok(defined($cwd) && index($cwd, '<') < 0 && index($cwd, '>') < 0,
-            'AC-D2: at a generous width the working-directory field carries no elision marker')
-            or diag('  cwd field = ' . (defined $cwd ? "[$cwd]" : '(none)'));
     }
 
-    # AC-D3 -- N2: the cwd keeps its TAIL.
+    # AC-D3 -- REPLACES the old left-elision AC. The path used to be elided from
+    # its head at a forcing width because it shared row 1; alone on its own row
+    # it is never elided at all. That is the point of the move: a truncated path
+    # is a path you cannot act on, and the terminal's own wrapping shows all of
+    # it rather than hiding the head behind a marker.
     {
-        my $line = statusline_line1(payload_for(current_dir => $long),
-                        cols => 40, sandbox => 0, toplevel => $top);
-        my $cwd  = field_at($line, 2);
-        my $ok_shape = defined($cwd) && length($cwd) > 1 && substr($cwd, 0, 1) eq '<';
-        ok($ok_shape,
-            'AC-D3 (N2): at a forcing width the cwd field is a left-elision marker followed by retained text')
-            or diag('  cwd field = ' . (defined $cwd ? "[$cwd]" : '(none)')
-                  . "\n  first line = [" . strip_sgr($line) . ']');
-        my $suffix = $ok_shape ? substr($cwd, 1) : '';
-        ok(length($suffix) && substr($long, -length($suffix)) eq $suffix,
-            'AC-D3 (N2): the retained text is a non-empty SUFFIX of the true working directory')
-            or diag("  retained = [$suffix]");
+        for my $cols (40, 80, 200) {
+            my @args = (payload_for(current_dir => $long),
+                        cols => $cols, sandbox => 0, toplevel => $top);
+            is(strip_sgr(statusline_path_row(@args)), $long,
+                "AC-D3: at width $cols the path row is the COMPLETE path -- never elided, at any width");
+            my $vis1 = strip_sgr(statusline_line1(@args));
+            is(index($vis1, 'xxxxx'), -1,
+                "AC-D3: at width $cols no part of the path leaks onto row 1");
+        }
     }
 
     # AC-D4 -- N1: the project keeps its HEAD.
@@ -562,12 +589,12 @@ my $ANDRE_NAME = 'Andr' . chr(0xC3) . chr(0xA9) . '-projekt';
     # differing only in their FIRST characters must too.
     {
         my $stem = '/w/proj-alpha/' . ('d' x 150) . '/deep';
-        my $a = statusline_line1(payload_for(current_dir => "$stem/alpha"),
+        my $a = statusline_path_row(payload_for(current_dir => "$stem/alpha"),
                     cols => 40, sandbox => 0, toplevel => $top);
-        my $b = statusline_line1(payload_for(current_dir => "$stem/beta"),
+        my $b = statusline_path_row(payload_for(current_dir => "$stem/beta"),
                     cols => 40, sandbox => 0, toplevel => $top);
         isnt(strip_sgr($a), strip_sgr($b),
-            'AC-D5: two long paths differing only in their FINAL component render different rows -- the retained tail still discriminates');
+            'AC-D5: two long paths differing only in their FINAL component render different path rows');
 
         my $tail = 'z' x 120;
         my $ta = "/w/alpha-$tail";
@@ -989,10 +1016,15 @@ sub glyph_cols_disagreements {
     # to take effect would make every width assertion below vacuous. Hard ok(),
     # never a skip.
     {
-        my $narrow = statusline_line1(payload_for(current_dir => $long),
-                        cols => 40, sandbox => 0, toplevel => $top, branch => 'main');
-        my $wide   = statusline_line1(payload_for(current_dir => $long),
-                        cols => 200, sandbox => 0, toplevel => $top, branch => 'main');
+        # The probe must force row 1 to differ across widths. It used to rely on
+        # the working directory being elided there; the path has its own row now
+        # and is never elided, so the payload has to make row 1 itself overflow.
+        # A long PROJECT NAME does that -- it is what row 1 elides last.
+        my $ltop = '/w/proj-' . ('n' x 120);
+        my $narrow = statusline_line1(payload_for(current_dir => "$ltop/deep"),
+                        cols => 40, sandbox => 0, toplevel => $ltop, branch => 'main');
+        my $wide   = statusline_line1(payload_for(current_dir => "$ltop/deep"),
+                        cols => 200, sandbox => 0, toplevel => $ltop, branch => 'main');
         ok(length($narrow) && length($wide) && $narrow ne $wide,
             'AC-B0 (non-vacuity gate): the width-40 and width-200 renders of the same payload differ -- the tput shim really drives the layout');
     }
@@ -1088,6 +1120,82 @@ sub glyph_cols_disagreements {
         ok(length($vis) && index('SANDBOX', substr($vis, 0, 1)) == 0,
             'AC-B6 (cols=8): whatever survives begins with the head of the declared sandbox marker')
             or diag("  first line = [$vis]");
+    }
+}
+
+# ===========================================================================
+# AC-N -- the project name inside a sandbox.
+#
+# The project is bind-mounted at /project, so in-container `git rev-parse
+# --show-toplevel` returns `/project` and basename() yields the literal word
+# "project" -- for EVERY project on the machine. The field whose whole job is to
+# say which project you are in was the one field that could never say it.
+#
+# The launcher writes the real name to claude-home/project-name, which is a live
+# bind mount and therefore lands at $HOME/.claude/project-name immediately, in
+# containers created before the fix as well. An env var would have been the
+# obvious choice and the wrong one -- `podman create` bakes env at creation, so
+# it would have fixed only containers made afterwards.
+# ===========================================================================
+{
+    my $home = tempdir(CLEANUP => 1);
+    mkdir "$home/.claude";
+
+    # Without the name file we can only report what the mount says. Asserting
+    # this pins WHY the file is needed rather than leaving it as decoration.
+    {
+        my $line = statusline_line1(payload_for(current_dir => '/project/plugins'),
+                        cols => 200, sandbox => 1, toplevel => '/project', home => $home);
+        is(field_at($line, 1), 'project',
+            'AC-N0: with no name file the mount point is all there is -- the defect, reproduced');
+    }
+
+    spew_raw("$home/.claude/project-name", "gsa-superapp\n");
+    {
+        my $line = statusline_line1(payload_for(current_dir => '/project/plugins'),
+                        cols => 200, sandbox => 1, toplevel => '/project', home => $home);
+        is(field_at($line, 1), 'gsa-superapp',
+            'AC-N1: the name file supplies the real project name in place of the mount point');
+    }
+
+    # Non-ASCII survives the round trip: this machine's paths carry them.
+    spew_raw("$home/.claude/project-name", encode('UTF-8', "caf\x{e9}-app") . "\n");
+    {
+        my $line = statusline_line1(payload_for(current_dir => '/project'),
+                        cols => 200, sandbox => 1, toplevel => '/project', home => $home);
+        ok(index($line, encode('UTF-8', "caf\x{e9}-app")) >= 0,
+            'AC-N2: a non-ASCII project name survives the file round trip unmangled')
+            or diag('  first line = [' . strip_sgr($line) . ']');
+    }
+
+    # An empty or whitespace-only file must not blank the field.
+    spew_raw("$home/.claude/project-name", "\n\n");
+    {
+        my $line = statusline_line1(payload_for(current_dir => '/project'),
+                        cols => 200, sandbox => 1, toplevel => '/project', home => $home);
+        is(field_at($line, 1), 'project',
+            'AC-N3: an empty name file falls back rather than rendering an empty project field');
+    }
+
+    # Control bytes are scrubbed like every other display field read off disk.
+    spew_raw("$home/.claude/project-name", "evil\nSECOND ROW\n");
+    {
+        my ($out) = run_statusline(payload_for(current_dir => '/project'),
+                        cols => 200, sandbox => 1, toplevel => '/project', home => $home);
+        my $line = first_line($out);
+        is(field_at($line, 1), 'evilSECOND ROW',
+            'AC-N4: an embedded newline is scrubbed, not honoured -- the file cannot inject an extra row');
+        is(index(strip_sgr($line), "\n"), -1,
+            'AC-N4: and no newline reaches the rendered row');
+    }
+
+    # The HOST must be untouched by all of this: there, the toplevel basename is
+    # already right and the file does not exist.
+    {
+        my $line = statusline_line1(payload_for(current_dir => '/w/proj-alpha/x'),
+                        cols => 200, sandbox => 0, toplevel => '/w/proj-alpha', home => $home);
+        is(field_at($line, 1), 'proj-alpha',
+            'AC-N5: on the host the name still comes from the git toplevel -- the fix is sandbox-shaped only');
     }
 }
 

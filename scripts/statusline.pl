@@ -278,6 +278,40 @@ my $root    = length($toplevel) ? $toplevel : $workspace;
 my $project = length($root) ? basename($root) : '?';
 my $cwd     = $workspace;
 
+# Inside the sandbox the project is bind-mounted at /project, so the git
+# toplevel IS `/project` and basename() yields the literal word "project" for
+# every project on the machine. The field that exists to say WHICH project you
+# are in was the one field that could never say it.
+#
+# The launcher writes the real name into claude-home/project-name on every
+# launch. claude-home is a LIVE bind mount, so that file appears at
+# /root/.claude/project-name immediately — including in containers created
+# before this existed. An env var would have been the obvious choice and is the
+# wrong one: `podman create` bakes env at creation, so it would fix only
+# containers made after the change and silently leave every existing sandbox
+# still displaying "project".
+#
+# Host behaviour is untouched: the file is only consulted when the mount shape
+# actually indicates the sandbox.
+if ($root eq '/project' || $project eq 'project') {
+    my $home = $ENV{HOME} // '';
+    my $name_file = length($home) ? "$home/.claude/project-name" : '';
+    if (length($name_file) && -f $name_file && open my $nfh, '<:raw', $name_file) {
+        my $n = do { local $/; <$nfh> };
+        close $nfh;
+        if (defined $n) {
+            $n =~ s/\s+\z//;
+            $n =~ s/\A\s+//;
+            # Same provenance as any other display field read off disk: it is
+            # written by the launcher from a host directory name, which may
+            # legally hold control bytes.
+            $n =~ s/[\x00-\x1f\x7f]//g;
+            utf8::decode($n) if length($n) && !utf8::is_utf8($n);
+            $project = $n if length $n;
+        }
+    }
+}
+
 # Both DISPLAY fields are sanitised before they can reach row 1. current_dir
 # comes from stdin JSON and a POSIX directory name may legally contain any
 # byte but '/' and NUL -- including a newline, which would split one row into
@@ -550,8 +584,18 @@ my $cols = cmd_out('tput', 'cols');
 chomp $cols if defined $cols;
 $cols = 120 unless defined($cols) && $cols =~ /^\d+$/ && $cols > 0;
 
-# row1(...) -- render the five fields in their binding order. A field with
+# row1(...) -- render the four fields in their binding order. A field with
 # no text contributes neither itself nor its separator.
+#
+# The working directory USED to be the third field here. The operator asked for
+# it on its own line, and it is the right shape for it: a full path is the one
+# field with no natural width, so on row 1 it was permanently in contention with
+# every other field, and the fit ladder spent four of its eight steps eliding it.
+# Given its own line it is simply shown in full, and row 1 becomes four
+# bounded-width fields that essentially always fit.
+#
+# The $d parameter is retained rather than removed so the ladder's shape and
+# every call site stay recognisable against the tests; it is always passed ''.
 sub row1 {
     my ($m, $p, $d, $g, $b) = @_;
     my $row = "${MUTED}${m}${R}";
@@ -560,6 +604,17 @@ sub row1 {
     $row .= "${SEP}${g}"                  if length $g;
     $row .= "${SEP}${b}"                  if length $b;
     return $row;
+}
+
+# The path line. Its own row, nothing else on it, never elided from the left the
+# way it had to be when it shared row 1 -- if it exceeds the terminal width the
+# terminal wraps it, which shows the whole path rather than hiding its head
+# behind an ellipsis. A path you cannot read all of is the failure this move is
+# meant to prevent.
+sub path_row {
+    my ($d) = @_;
+    return '' unless defined $d && length $d;
+    return "${FAINT}${d}${R}";
 }
 
 # The fit ladder. The WHOLE row is budgeted, never one field of it: the old
@@ -573,9 +628,14 @@ sub row1 {
 # name is what says WHICH project and the path only says where in it. git
 # and plans are dropped whole, never elided -- they carry embedded SGR and
 # cutting one mid-escape would emit garbage.
+# $f_cwd is now permanently '' on row 1: the working directory has its own row.
+# The ladder keeps its cwd steps rather than deleting them, because they are
+# unreachable-but-correct and deleting them would make a future "put it back"
+# a rewrite instead of a one-line change. Steps 4 and 7 are no-ops while
+# $f_cwd is empty -- both are already guarded by `if (length $f_cwd)`.
 my $f_marker  = $marker;
 my $f_project = $project;
-my $f_cwd     = $cwd;
+my $f_cwd     = '';
 my $f_git     = $git_str;
 my $f_plans   = $plans_str;
 my $sep_cost  = row_cost($SEP);
@@ -648,13 +708,18 @@ my $line2 = "${MUTED}${short}${R} "
           . "${FAINT}\x{FF5C}${R}${ACCENT}" . fmt($used_tokens) . "${R} "
           . "${PRIMARY}" . fmt($free_tokens) . "${R}${FAINT}\x{FF5C}${R}";
 
+# ── Assemble ─────────────────────────────────────────────────
+# The path is the LAST row, alone, per the operator's request: everything above
+# it is bounded-width status, and the one unbounded field sits by itself where
+# its length cannot push anything else off a row.
+my @rows;
 if ($plan_full) {
     my $oneline2 = "${line2} ${plan_full}";
-    if (row_cost($oneline2) <= $cols) {
-        print "${line1}\n${oneline2}";
-    } else {
-        print "${line1}\n${line2}\n${plan_full}";
-    }
+    if (row_cost($oneline2) <= $cols) { push @rows, $line1, $oneline2 }
+    else                              { push @rows, $line1, $line2, $plan_full }
 } else {
-    print "${line1}\n${line2}";
+    push @rows, $line1, $line2;
 }
+my $path_row = path_row($cwd);
+push @rows, $path_row if length $path_row;
+print join("\n", @rows);
