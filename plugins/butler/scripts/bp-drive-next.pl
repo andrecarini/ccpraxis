@@ -642,6 +642,43 @@ sub _cmd_next {
 
     # B6: all blueprints in the order are settled+announced (or parked)
     _append_run_log($dsdir, 'DONE');
+
+    # Close the books before announcing done.
+    #
+    # Reaching here means nothing in scope can progress without a human, so this
+    # is the one moment in the drive loop where no blueprint is being executed
+    # and reconciliation cannot race anything. Two things happen:
+    #   * derived state (blueprint.md's own `status:`, its package-status table,
+    #     runs/registry.json, a stale runs/.orchestrator) is repaired against the
+    #     ledgers, which are the truth;
+    #   * a blueprint whose packages are ALL delivered is advanced to `done` and
+    #     filed into blueprints/_archive/.
+    #
+    # Archiving is enabled HERE and nowhere else in the automatic path. It is a
+    # directory move, so it must only run where nothing holds the directory —
+    # true at this point and not true inside the orchestrator (which lives in it)
+    # or during a status read (which may be observing a run about to relaunch).
+    # The director's own state lives in <data>/.drive-solo/, outside every
+    # blueprint, so moving one cannot disturb it.
+    #
+    # A blueprint that is merely settled — parked or blocked awaiting a human —
+    # is NOT all-delivered and is therefore left exactly where it is. bp-lifecycle
+    # enforces that; the drive loop does not need to re-decide it.
+    #
+    # Best-effort: the run is over and reported done either way. A reconciliation
+    # failure must not manufacture a failed drive.
+    {
+        my $lifecycle = "$DIR/bp-lifecycle.pl";
+        if (-f $lifecycle) {
+            my $rc = eval {
+                system($^X, $lifecycle, 'reconcile', '--all',
+                       '--data-dir', $data, '--archive', '--quiet');
+            };
+            _append_run_log($dsdir, 'LIFECYCLE-RECONCILE '
+                . ((!$@ && defined $rc && $rc == 0) ? 'ok' : 'failed (non-fatal)'));
+        }
+    }
+
     print _encode_action({ action => 'done' }), "\n";
     keepawake_apply('settled', $dsdir, $opts);
     return 0;

@@ -3247,6 +3247,42 @@ sub run {
     } or $err = $@;
 
     release_marker($marker_fh, "$runs/.orchestrator");
+
+    # Record that the initiative finished, not merely that this process did.
+    #
+    # Until this call existed, an orchestrator that reached run_complete released
+    # its marker and exited while `blueprint.md` still said `status: running`.
+    # Nothing anywhere advanced a blueprint's own lifecycle, so a finished
+    # initiative stayed indistinguishable from a live one until a human read all
+    # the ledgers by hand — which is exactly how `sandbox-butler-overhaul` sat at
+    # `running` with 77/77 packages done, and how its registry.json kept claiming
+    # six running coordinators that had not existed for days.
+    #
+    # AFTER release_marker, deliberately: bp-lifecycle.pl refuses to touch a
+    # blueprint whose marker names a live pid (a live run owns its own state), so
+    # calling it while we still held the marker would correctly do nothing.
+    #
+    # --no-archive: this process's cwd and open files live under the blueprint
+    # directory. Moving it out from under ourselves is not a risk worth taking
+    # for a filing step that any later observation performs safely.
+    #
+    # Best-effort by construction. A reconciliation failure must never turn a
+    # completed run into a failed one, so the exit status is ignored and any
+    # exception is swallowed after logging.
+    {
+        my $lifecycle = "$DIR/bp-lifecycle.pl";
+        if (-f $lifecycle) {
+            my $rc = eval {
+                system($^X, $lifecycle, 'reconcile', '--blueprint', $bpdir,
+                       '--no-archive', '--quiet');
+            };
+            _log($log, 'lifecycle_reconcile', {
+                ok  => (!$@ && defined $rc && $rc == 0) ? 1 : 0,
+                err => ($@ ? "$@" : undef),
+            });
+        }
+    }
+
     _log($log, 'orchestrator_stop', { err => ($err ? "$err" : undef) });
     die $err if $err;
     return 0;

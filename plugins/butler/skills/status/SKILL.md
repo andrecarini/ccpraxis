@@ -14,7 +14,11 @@ Run:
 bash "${CLAUDE_PLUGIN_ROOT}/scripts/bp-status.sh" $0
 ```
 
-(no argument → all blueprints). The script is the cheap monitoring surface: ledger frontmatter + process liveness + first line of Next action. Do not read stream logs or full ledgers for a status check.
+(no argument → all blueprints). The script is the cheap monitoring surface: ledger frontmatter + process liveness + first line of Next action. Do not read stream logs or full ledgers for a status check. It runs on the **host** as well as in the sandbox — jq is optional, and without it only the `PROC`/`ATT` columns degrade to `?`.
+
+It **reconciles before it reports** (`bp-lifecycle.pl reconcile --all --no-archive`): a stale `runs/.orchestrator`, a package-status table that disagrees with its ledger, and a `registry.json` left behind by a run that ended any way other than the orchestrator's clean exit are all repaired against the ledgers. It does **not** archive — filing a finished blueprint away is not a side effect of asking for status. Report a `blueprint status: done` row as ready to archive and offer `/blueprint:manage archive <name>`.
+
+**Liveness is the marker's pid, never the marker's existence, and never the registry.** The header line says `[orchestrator pid N LIVE]` or `[stale orchestrator marker pid N]` — trust that. `sandbox-butler-overhaul` carried a marker for eleven days after its container was reaped, and a registry claiming six running coordinators, while every one of its 79 package ledgers said `done`.
 
 Then summarize for the user, and recommend concretely:
 
