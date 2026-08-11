@@ -793,6 +793,12 @@ $CLAUDE_HOST_CONFIG = do {
 # $CLAUDE_DATA, exactly as it was under .claude-data — only the parent changed.
 my $CCPRAXIS_DATA            = "$PROJECT_PATH/.ccpraxis-local-data";
 my $CLAUDE_DATA              = "$CCPRAXIS_DATA/claude-home";
+
+# How many launches' logs to keep under claude-home/sandbox-logs/. Operator's
+# call: the last 10. Env-overridable for debugging a long-tail problem.
+my $LOG_RETENTION_LAUNCHES   = ($ENV{CCPRAXIS_LOG_RETENTION} && $ENV{CCPRAXIS_LOG_RETENTION} =~ /\A\d+\z/
+                                && $ENV{CCPRAXIS_LOG_RETENTION} >= 1)
+                             ? $ENV{CCPRAXIS_LOG_RETENTION} + 0 : 10;
 my $LAUNCHER_DIR              = "$CLAUDE_DATA/.launcher";
 my $SELECTION_FILE            = "$LAUNCHER_DIR/selected-skills.json";
 my $MANIFEST_FILE             = "$LAUNCHER_DIR/container-manifest.json";
@@ -1727,6 +1733,46 @@ if ($LAUNCH_MODE eq 'tui') {
 # processes, each with its own uniquely-named log file (no double-open).
 $LAUNCH_LOG = LaunchLog::open_log("$CLAUDE_DATA/sandbox-logs/launch-$LAUNCH_ID.log");
 log_ev('launch_start', { project => $PROJECT_PATH, project_name => $PROJECT_NAME, podman => $PODMAN, pid => $$ });
+
+# The project's real name, for anything running INSIDE the container.
+#
+# The project is bind-mounted at /project, so in-container `git rev-parse
+# --show-toplevel` returns `/project` and every name derived from it is the
+# literal word "project" — which is what the statusline was displaying for every
+# project on the machine.
+#
+# claude-home is a live bind mount, so writing here lands at
+# /root/.claude/project-name immediately, including for containers created
+# before this file existed. That is why this is a file and not a `podman create
+# -e` env var: env is baked at creation, so an env-var fix would have left every
+# existing sandbox still showing "project" until it was recreated.
+#
+# Rewritten every launch (the directory can be renamed between launches).
+# Best-effort: a cosmetic label must never be able to fail a launch.
+{
+    my $pn = "$CLAUDE_DATA/project-name";
+    if (open my $pfh, '>:raw', $pn) {
+        print {$pfh} "$PROJECT_NAME\n";
+        close $pfh;
+    }
+}
+
+# Retention: keep the last $LOG_RETENTION_LAUNCHES launches, drop older ones.
+# Nothing pruned this directory before, so it grew forever — two files per
+# launch, plus a bootstrap log. Pruning is keyed on the launch ID so a launch's
+# JSON log and its raw transcript are kept or dropped together; half a record
+# reads as a whole one and is worse than none.
+#
+# Done here, right after the current launch's log exists, so the current launch
+# is always among the kept and a crash later in the launch cannot skip the prune.
+# Best-effort: prune_logs never dies, and its result is logged rather than acted
+# on — housekeeping must not be able to fail a launch.
+{
+    my @dropped = LaunchLog::prune_logs("$CLAUDE_DATA/sandbox-logs",
+                                        $LOG_RETENTION_LAUNCHES, $LAUNCH_ID);
+    log_ev('log_retention', { keep => $LOG_RETENTION_LAUNCHES, removed => scalar @dropped })
+        if @dropped;
+}
 # The mode, and the three inputs that produced it. Package 12 added this
 # because an operator reported a screen "still using the old layout" and the
 # logs could not say whether the launch had been in TUI mode at all — the two

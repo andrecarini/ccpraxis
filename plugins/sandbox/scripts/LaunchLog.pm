@@ -109,6 +109,115 @@ sub recent_logs {
     return map { $_->[2] } @cand;
 }
 
+# ---------------------------------------------------------------------------
+# Retention.
+#
+# Nothing ever removed anything from sandbox-logs/, so it grew without bound —
+# one JSON log plus one raw transcript per launch, forever. The operator asked
+# for the last 10 launches and nothing older.
+#
+# Retention is keyed on the LAUNCH ID, not on individual files, because one
+# launch owns several: `launch-<id>.log`, `launch-<id>.transcript.log`, and now
+# `launch-<id>.bootstrap.log`. Pruning file-by-file would happily keep a
+# transcript whose JSON log had already been deleted — half a launch record,
+# which is worse than none because it reads as complete.
+#
+# `bootstrap-<stamp>-<pid>.log` files are written by bootstrap.pl before any
+# launch id exists, so they are retained as their own newest-$keep series.
+
+# _launch_id_of($basename) -> id | undef
+# `launch-20260806T000150Z-1860.transcript.log` -> `20260806T000150Z-1860`.
+sub _launch_id_of {
+    my ($name) = @_;
+    return undef unless defined $name;
+    return undef unless $name =~ /\Alaunch-([^.\\\/]+)\./;
+    return $1;
+}
+
+# group_launch_files(\@names) -> { id => [names...] }, plus a BOOTSTRAP key for
+# the standalone bootstrap logs. PURE, so the grouping rule is testable without
+# a filesystem.
+sub group_launch_files {
+    my ($names) = @_;
+    my %g;
+    for my $name (@{ $names || [] }) {
+        next unless defined $name && length $name;
+        if (my $id = _launch_id_of($name)) { push @{ $g{$id} }, $name; next }
+        if ($name =~ /\Abootstrap-([^.\\\/]+)\.log\z/) { push @{ $g{"\0bootstrap:$1"} }, $name }
+    }
+    return \%g;
+}
+
+# prune_logs($dir, $keep, $current_id) -> @removed
+# Keep the newest $keep launch-id groups (the current launch is ALWAYS kept and
+# always counts as one of them) and the newest $keep bootstrap logs; unlink the
+# rest. TOTAL: never dies. A retention failure must never take down a launch, so
+# every error path simply stops pruning.
+sub prune_logs {
+    my ($dir, $keep, $current_id) = @_;
+    return () unless defined $dir && length $dir;
+    $keep = 10 unless defined $keep && $keep =~ /\A\d+\z/ && $keep >= 1;
+    (my $base = $dir) =~ s{[\\/]+\z}{};
+
+    my @removed;
+    my $ok = eval {
+        opendir(my $dh, $base) or return 0;
+        my @names = readdir($dh);
+        closedir($dh);
+
+        my $groups = group_launch_files(\@names);
+
+        # Rank a group by its newest member's mtime, with the group key as a
+        # deterministic tie-break (ids embed a UTC stamp, so key order is
+        # chronological and a same-second tie still resolves stably).
+        my @ranked;
+        for my $key (keys %$groups) {
+            my $newest = 0;
+            my $any = 0;
+            for my $n (@{ $groups->{$key} }) {
+                my $p = "$base/$n";
+                next if -l $p;
+                next unless -f $p;
+                my $m = (stat($p))[9];
+                next unless defined $m;
+                $any = 1;
+                $newest = $m if $m > $newest;
+            }
+            next unless $any;
+            push @ranked, [ $newest, $key ];
+        }
+
+        # Bootstrap logs are their own series; a first-time setup record must not
+        # be evicted just because ten ordinary launches happened afterwards.
+        my @launch    = grep { $_->[1] !~ /\A\0bootstrap:/ } @ranked;
+        my @bootstrap = grep { $_->[1] =~ /\A\0bootstrap:/ } @ranked;
+
+        for my $set (\@launch, \@bootstrap) {
+            my @s = sort { $b->[0] <=> $a->[0] || $b->[1] cmp $a->[1] } @$set;
+            my $kept = 0;
+            for my $entry (@s) {
+                my $key = $entry->[1];
+                # The launch writing right now is never a candidate: its handles
+                # are open and its record is the one being created.
+                if (defined $current_id && length $current_id && $key eq $current_id) {
+                    $kept++;
+                    next;
+                }
+                if ($kept < $keep) { $kept++; next }
+                for my $n (@{ $groups->{$key} }) {
+                    my $p = "$base/$n";
+                    next if -l $p;
+                    next unless -f $p;
+                    push @removed, $p if unlink $p;
+                }
+            }
+        }
+        1;
+    };
+    return () unless $ok;
+    return @removed;
+}
+
 # merge_sessions(\@groups, %opts) -> \@merged (spec S2.2)
 # Pure merge of per-session item groups (oldest first, LAST group is the
 # current session) into one chronological list with an optional

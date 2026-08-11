@@ -165,21 +165,101 @@ sub prompt_line {
     }
 }
 
+# ---------------------------------------------------------------------------
+# Durable log.
+#
+# Bootstrap runs BEFORE the launcher's transcript exists — the transcript lives
+# under claude-home/, which is the very directory bootstrap is here to create.
+# So a first-time setup failure used to exist only in terminal scrollback: the
+# one launch where the most can go wrong (image build, git auth, PATH wiring)
+# was the one launch that left no record.
+#
+# The launcher cannot fix this by capturing our stdout. Bootstrap is
+# INTERACTIVE — it prompts for git auth and reads STDIN — and putting a pipe on
+# its stdout would break prompt ordering and TTY detection. So we mirror our own
+# output to a file instead of having it captured. Console behaviour is
+# byte-for-byte unchanged.
+#
+# Lines emitted before claude-home/ exists are buffered and flushed the moment
+# the log opens, so step 1 and 2 failures are recorded too. If we die before it
+# ever opens, the buffer is written next to the project's data root — the one
+# place guaranteed to be writable that early.
+my @LOG_BUFFER;
+my $LOG_FH;
+my $LOG_PATH;
+
+sub _blog {
+    my ($line) = @_;
+    if ($LOG_FH) { print {$LOG_FH} $line }
+    else         { push @LOG_BUFFER, $line }
+}
+
+# Open the durable log and flush anything buffered. Best-effort by design: a
+# logging failure must never abort a bootstrap.
+sub bootstrap_log_open {
+    my ($dir) = @_;
+    return if $LOG_FH;
+    my @t = gmtime(time);
+    my $stamp = sprintf('%04d%02d%02dT%02d%02d%02dZ',
+                        $t[5] + 1900, $t[4] + 1, $t[3], $t[2], $t[1], $t[0]);
+    my $path = "$dir/bootstrap-$stamp-$$.log";
+    eval {
+        make_path($dir) unless -d $dir;
+        open my $fh, '>:raw', $path or die "$!";
+        my $old = select($fh); $| = 1; select($old);
+        $LOG_FH   = $fh;
+        $LOG_PATH = $path;
+        print {$LOG_FH} @LOG_BUFFER;
+        @LOG_BUFFER = ();
+        1;
+    } or return;
+    return $path;
+}
+
+sub bootstrap_log_path { $LOG_PATH }
+
+# Last-resort flush for a failure that happened before the real log could open.
+sub _blog_emergency_flush {
+    return if $LOG_FH || !@LOG_BUFFER;
+    for my $dir ("$PROJECT_PATH/.ccpraxis-local-data", $PROJECT_PATH) {
+        next unless defined $dir && -d $dir;
+        my $path = "$dir/bootstrap-failed-$$.log";
+        if (open my $fh, '>:raw', $path) {
+            print {$fh} @LOG_BUFFER;
+            close $fh;
+            print STDERR "Bootstrap log written to: $path\n";
+            $LOG_PATH = $path;
+            return $path;
+        }
+    }
+    return undef;
+}
+
 sub log_step {
     my $msg = shift;
     print "\n>>> $msg\n";
+    _blog("\n>>> $msg\n");
 }
 
-sub log_ok    { print "    OK    $_[0]\n" }
-sub log_skip  { print "    SKIP  $_[0]\n" }
-sub log_done  { print "    DONE  $_[0]\n" }
-sub log_warn  { print STDERR "    WARN  $_[0]\n" }
-sub log_error { print STDERR "    ERROR $_[0]\n" }
+sub log_ok    { print "    OK    $_[0]\n";        _blog("    OK    $_[0]\n") }
+sub log_skip  { print "    SKIP  $_[0]\n";        _blog("    SKIP  $_[0]\n") }
+sub log_done  { print "    DONE  $_[0]\n";        _blog("    DONE  $_[0]\n") }
+sub log_warn  { print STDERR "    WARN  $_[0]\n"; _blog("    WARN  $_[0]\n") }
+sub log_error { print STDERR "    ERROR $_[0]\n"; _blog("    ERROR $_[0]\n") }
 
 sub die_bootstrap {
     my $msg = shift;
     print STDERR "\nBOOTSTRAP FAILED: $msg\n";
+    _blog("\nBOOTSTRAP FAILED: $msg\n");
+    if ($LOG_FH) { print STDERR "Bootstrap log: $LOG_PATH\n" }
+    else         { _blog_emergency_flush() }
     exit 1;
+}
+
+END {
+    # A die() or an exit that bypassed die_bootstrap still leaves a record.
+    _blog_emergency_flush();
+    close $LOG_FH if $LOG_FH;
 }
 
 # Run a command with its stdin detached from the console.
@@ -379,6 +459,15 @@ if (-d $claude_data) {
 } else {
     make_path($claude_data) or die_bootstrap("mkdir $claude_data: $!");
     log_done("created $claude_data");
+}
+
+# claude-home/ now exists, so the durable log can live where every other launch
+# record lives. Everything emitted by steps 1-2 was buffered and is flushed here
+# — those steps (container-config check, image build) are exactly the ones that
+# fail on a fresh machine, so they must not be the ones that go unrecorded.
+{
+    my $p = bootstrap_log_open("$claude_data/sandbox-logs");
+    log_ok("bootstrap log: $p") if defined $p;
 }
 
 # =====================================================================
