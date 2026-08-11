@@ -398,7 +398,8 @@ my $ac56_R = { title => 'R', lines => [ 'r1' ] };
     }
 
     my $joined = join("\n", map { $_->{text} } @$f);
-    like($joined, qr/1 item\(s\)/,
+    # Pluralised: a total of 1 renders the SINGULAR "1 item".
+    like($joined, qr/\b1 item\b/,
         'AC-8: the one-item backpack summary still reaches the frame (as a Run-panel row, not a titled panel -- Decision 9)');
 }
 

@@ -70,6 +70,32 @@ sub theme_role {
 }
 
 # ===========================================================================
+# Pluralisation.
+#
+# The dashboard was littered with `item(s)`, `decision(s)`, `blueprint(s)`,
+# `fact(s)` -- the shape you write when you do not know the count at authoring
+# time. But every one of those call sites HAS the count in hand; the parenthesis
+# was pure laziness, and the operator called it out. There is no ambiguity to
+# hedge: 1 item, 2 items.
+#
+# Irregular plurals are passed explicitly rather than guessed. A rule-based
+# pluraliser is a well-known tar pit and this vocabulary is a dozen words.
+# ===========================================================================
+sub plural {
+    my ($n, $singular, $plural) = @_;
+    $n = 0 unless defined $n && !ref($n) && $n =~ /\A-?\d+\z/;
+    return $singular if $n == 1 || $n == -1;
+    return defined($plural) ? $plural : "${singular}s";
+}
+
+# count_of(3, 'item') -> "3 items"; count_of(1, 'item') -> "1 item".
+sub count_of {
+    my ($n, $singular, $plural) = @_;
+    my $shown = (defined $n && !ref($n) && $n =~ /\A-?\d+\z/) ? $n : 0;
+    return $shown . ' ' . plural($shown, $singular, $plural);
+}
+
+# ===========================================================================
 # The one duration format (criterion 4, spec S2.4.7). Identical grammar to
 # the legacy Dashboard::fmt_age (Dashboard::fmt_age becomes a delegating
 # alias to this).
@@ -223,7 +249,7 @@ sub snapshot_spans {
         $text = 'fresh';
         $text .= ', ' . fmt_duration($age) . ' old' if $age_numeric;
         my $n = scalar(grep { !defined $res->{$_} } @RESOURCE_FACT_KEYS);
-        $text .= ", $n fact(s) unavailable" if $n > 0;
+        $text .= ", " . count_of($n, "fact") . " unavailable" if $n > 0;
         $role = 'state.ok';
     } elsif ($state eq 'stale') {
         $text = 'STALE - last written';
@@ -267,7 +293,7 @@ sub backpack_summary_spans {
         $pending = 0 if $pending < 0;
     }
 
-    my @spans = ( { text => "$total item(s), $approved approved", role => 'text.primary' } );
+    my @spans = ( { text => count_of($total, "item") . ", $approved approved", role => "text.primary" } );
     push @spans, { text => ", $pending pending", role => 'state.warn' } if $pending > 0;
     push @spans, { text => '   [b] manage', role => 'text.muted' };
     return \@spans;
@@ -427,20 +453,32 @@ sub _one_run_summary_spans {
     return \@spans;
 }
 
+# _run_summary_lines(\@runs, $max_rows) -- one row per blueprint.
+#
+# $max_rows used to be the literal 3, unconditionally, with no relationship to
+# the space available. The operator's dashboard had twelve blueprints, three
+# rows, "+9 more blueprint(s)", and most of the screen empty underneath -- the
+# cap was hiding information there was ample room to show.
+#
+# It is now a BUDGET the caller derives from the actual terminal height (see
+# compose), not a constant. Undef means no cap at all, which is what the pure
+# unit tests want; a short terminal still gets a bounded panel rather than one
+# that crowds out everything below it.
 sub _run_summary_lines {
-    my ($runs) = @_;
+    my ($runs, $max_rows) = @_;
     return [] unless ref($runs) eq 'ARRAY';
     my @summaries = grep { ref($_) eq 'HASH' } @$runs;
     return [] unless @summaries;
 
-    my $max_rows = 3;
+    $max_rows = scalar(@summaries)
+        unless defined($max_rows) && !ref($max_rows) && $max_rows =~ /\A\d+\z/ && $max_rows >= 1;
     my @out;
     my $shown = (@summaries < $max_rows) ? scalar(@summaries) : $max_rows;
     push @out, _one_run_summary_spans($summaries[$_]) for (0 .. $shown - 1);
 
     if (@summaries > $max_rows) {
         my $extra = @summaries - $max_rows;
-        push @out, [ { text => sprintf('  +%d more blueprint(s)', $extra), role => 'text.muted' } ];
+        push @out, [ { text => "  +" . count_of($extra, "more blueprint"), role => 'text.muted' } ];
     }
     return \@out;
 }
@@ -482,7 +520,7 @@ sub _run_body {
 
     my $ny = (defined($state->{needs_you}) && !ref($state->{needs_you}) && $state->{needs_you} =~ /^\d+$/) ? $state->{needs_you} : 0;
     if ($ny > 0) {
-        my $ny_row = row({ label => 'needs you', value => "$ny decision(s) waiting", role => 'state.warn' });
+        my $ny_row = row({ label => 'needs you', value => count_of($ny, "decision") . " waiting", role => 'state.warn' });
         push @lines, $ny_row if @$ny_row;
     }
 
@@ -490,7 +528,7 @@ sub _run_body {
     my $bp_row = row({ label => 'backpack', value => $bp_val });
     push @lines, $bp_row if @$bp_row;
 
-    push @lines, @{ _run_summary_lines($state->{runs}) };
+    push @lines, @{ _run_summary_lines($state->{runs}, $state->{run_rows_max}) };
 
     if (ref($state->{tokens}) ne 'HASH') {
         my $sec = $state->{oauth_remaining};
@@ -947,6 +985,24 @@ sub screen {
 
 sub compose {
     my ($state, $rows, $cols) = @_;
+
+    # Derive the Run panel's row budget from the ACTUAL terminal height. This is
+    # the only place in the module that knows $rows, and screen()'s signature is
+    # deliberately left alone (its callers and tests are many), so the budget
+    # travels the one way it can: as a derived key on a shallow copy of state.
+    #
+    # A third of the height, floor 3: enough that a normal terminal shows every
+    # blueprint (the operator had twelve, saw three, and had most of a screen
+    # empty below them), while a short terminal still gets a Run panel that
+    # cannot crowd out everything beneath it. A caller that has already set
+    # run_rows_max wins -- this only supplies a default.
+    if (ref($state) eq 'HASH' && !defined $state->{run_rows_max}) {
+        my $h = (defined($rows) && !ref($rows) && $rows =~ /\A\d+\z/) ? $rows : 0;
+        my $budget = int($h / 3);
+        $budget = 3 if $budget < 3;
+        $state = { %$state, run_rows_max => $budget };
+    }
+
     return tui::Screen::compose(screen($state, $cols), $rows, $cols);
 }
 

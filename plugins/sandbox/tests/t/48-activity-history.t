@@ -613,10 +613,19 @@ sub src_like {
         'AC19b: LaunchLog::merge_sessions is called as the events => value');
 
     # (c) Dashboard::session_boundary_row is passed as the marker.
+    #
+    # It now takes an EPOCH argument. Activity rows carry a wall-clock time
+    # rather than an age, and a bare "23:41" on the far side of a session
+    # boundary says nothing about which day it belongs to -- so the divider
+    # dates the session it introduces. The AC is about which function supplies
+    # the marker, not its arity, so the argument list is left open.
     my $merge_call_block = extract_call_block($src, 'LaunchLog::merge_sessions');
     src_like(defined($merge_call_block) ? $merge_call_block : '',
-        qr/marker\s*=>\s*Dashboard::session_boundary_row\s*\(\s*\)/,
-        'AC19c: marker => Dashboard::session_boundary_row()');
+        qr/marker\s*=>\s*Dashboard::session_boundary_row\s*\(/,
+        'AC19c: marker => Dashboard::session_boundary_row(...)');
+    src_like(defined($merge_call_block) ? $merge_call_block : '',
+        qr/marker\s*=>\s*Dashboard::session_boundary_row\s*\(\s*\$\w+\s*\)/,
+        'AC19c: ...and it is passed an epoch, so the divider can name its date');
 
     # (d) the surviving current-session read is still _tail_lines($log_path, 200).
     src_like($src, qr/_tail_lines\s*\(\s*\$log_path\s*,\s*200\s*\)/,
@@ -670,5 +679,66 @@ sub src_like {
 # ===========================================================================
 pass('AC22: this file lives under t/ and matches run-tests.pl\'s t/*.t glob; '
     . 'the cross-file baseline-diff half of AC22 is verified externally (see report)');
+
+# ===========================================================================
+# AC-T -- the activity time column is a WALL CLOCK, and midnight is visible.
+#
+# The column used to read "5m", "11m", "7d16h". A relative age answers "how
+# long ago" but never "when", so an event could not be lined up against
+# anything outside the panel -- a log line, a commit, a memory of what you were
+# doing. The operator asked for real times.
+#
+# That creates a new failure mode the age never had: 00:14 renders below 23:58
+# and reads as sixteen minutes later when it is sixteen minutes into the NEXT
+# DAY. So the column change and the date dividers are one feature, and are
+# tested as one.
+# ===========================================================================
+{
+    my $UTC = \&CORE::gmtime;
+    my @ts = ('2026-08-10T21:58:00Z', '2026-08-10T22:41:00Z',
+              '2026-08-11T00:14:00Z', '2026-08-11T00:31:00Z');
+    my @ty = qw(launch_start image_build_ok container_create manager_ready);
+    my @lines = map { qq({"ts":"$ts[$_]","type":"$ty[$_]"}) } (0 .. 3);
+
+    my $ev = Dashboard::recent_events(\@lines, 20, $UTC, time);
+    my @text = map { Dashboard::spans_text($_) } @$ev;
+
+    like($text[0], qr/^21:58\s/, 'AC-T1: the time column is the event wall-clock time, HH:MM');
+    unlike(join("\n", @text), qr/\b\d+[dhms]\b\s+\x{25cf}|\b\d+d\d\dh\b/,
+        'AC-T1: and no relative age survives in the column');
+
+    my ($divider_i) = grep { $text[$_] =~ /^--/ } (0 .. $#text);
+    ok(defined $divider_i, 'AC-T2: a divider row is emitted where the events cross midnight')
+        or diag('  rows: ' . join(' | ', @text));
+    if (defined $divider_i) {
+        like($text[$divider_i], qr/11 Aug/,
+            'AC-T2: the divider names the date the following rows belong to');
+        like($text[ $divider_i - 1 ], qr/^22:41/,
+            'AC-T2: the row above the divider is the last of the previous day');
+        like($text[ $divider_i + 1 ], qr/^00:14/,
+            'AC-T2: the row below it is the first of the new day');
+    }
+
+    # One day, no divider. A separator that appears when nothing was crossed is
+    # as misleading as a missing one.
+    my @same_day = map { qq({"ts":"2026-08-11T0$_:00:00Z","type":"t$_"}) } (1 .. 4);
+    my $ev1 = Dashboard::recent_events(\@same_day, 20, $UTC, time);
+    my @t1  = map { Dashboard::spans_text($_) } @$ev1;
+    is(scalar(grep { /^--/ } @t1), 0,
+        'AC-T3: events all on one day produce NO date divider');
+
+    # The session divider carries its date, for the same reason.
+    my $epoch = Dashboard::_event_epoch('2026-08-04T17:08:03Z');
+    my $row   = Dashboard::session_boundary_row($epoch, $UTC);
+    like(Dashboard::spans_text($row), qr/previous session/,
+        'AC-T4: the session divider still says what it is');
+    like(Dashboard::spans_text($row), qr/4 Aug/,
+        'AC-T4: and now names the date, which a bare HH:MM row cannot imply');
+
+    # No epoch -> no invented date. Same honesty rule as everywhere else here.
+    my $bare = Dashboard::session_boundary_row(undef, $UTC);
+    like(Dashboard::spans_text($bare), qr/^-- previous session --$/,
+        'AC-T4: with no epoch the divider degrades to its old text rather than inventing a date');
+}
 
 done_testing();

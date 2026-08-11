@@ -764,9 +764,9 @@ sub _dlines_text {
     unlike($failed_text, qr/\bn\/a\b/i, 'AC-S5: the failed panel contains no n/a row');
     unlike($fresh_full,  qr/\bn\/a\b/i, 'AC-S3: fresh-with-every-value panel renders no n/a row');
     unlike($fresh_full,  qr/unavailable/i, 'AC-S3: fresh-with-every-value panel names no unavailable clause');
-    like($fresh_gaps, qr/(\d+)\s*fact\(s\)\s*unavailable/i, 'AC-S5: the fresh-with-gaps panel names a count of suppressed facts')
+    like($fresh_gaps, qr/(\d+)\s*facts?\s*unavailable/i, 'AC-S5: the fresh-with-gaps panel names a count of suppressed facts, pluralised')
         or diag("  rendered: $fresh_gaps");
-    if ($fresh_gaps =~ /(\d+)\s*fact\(s\)\s*unavailable/i) {
+    if ($fresh_gaps =~ /(\d+)\s*facts?\s*unavailable/i) {
         is($1, 13, 'AC-S5: the fresh-with-gaps count equals the number of suppressed rows (13 of 15 keys undef)');
     }
 }
@@ -895,10 +895,10 @@ sub _dlines_text {
     my $j3 = (defined $f3) ? join("\n", map { $_->{text} } @$f3) : '';
     unlike($j0, qr/needs you/, 'AC-E3/Behavior13: needs_you==0 -> "needs you" row absent from the frame');
     like($j3, qr/needs you/, 'AC-E3/Behavior13: needs_you==3 -> "needs you" row present');
-    like($j3, qr/3\s*decision\(s\)\s*waiting/, 'AC-E3: needs_you==3 row carries the count');
+    like($j3, qr/3\s*decisions\s*waiting/, 'AC-E3: needs_you==3 row carries the count, pluralised');
   SKIP: {
         skip('tui::DashboardScreen did not load', 1) unless $DS_OK;
-        my $ny_row = tui::DashboardScreen::row(label => 'needs you', value => '3 decision(s) waiting', role => 'state.warn');
+        my $ny_row = tui::DashboardScreen::row(label => 'needs you', value => "3 decisions waiting", role => 'state.warn');
         my ($attention_span) = grep { ref($_) eq 'HASH' && defined($_->{role}) && $_->{role} =~ /^state\.(warn|crit)$/ } @$ny_row;
         ok(defined($attention_span), 'AC-E3: the needs-you value span carries a Theme ATTENTION role (state.warn/state.crit), asserted on the span not emitted bytes');
     }
@@ -1054,7 +1054,10 @@ sub _dlines_text {
         my $no_pending = tui::DashboardScreen::backpack_summary_spans({ total => 5, approved => 5, pending => 0 });
         my $txt_np = join('', map { $_->{text} } @$no_pending);
         unlike($txt_np, qr/pending/, 'AC-K4: pending==0 -> no pending clause');
-        like($txt_np, qr/5 item\(s\)/, 'AC-K4 precondition: total renders as "5 item(s)"');
+        like($txt_np, qr/5 items/, q{AC-K4 precondition: total renders as "5 items" -- pluralised});
+        my $one = tui::DashboardScreen::backpack_summary_spans({ total => 1, approved => 1, pending => 0 });
+        like(join('', map { $_->{text} } @$one), qr/\b1 item\b/,
+             q{AC-K4: a count of 1 renders the SINGULAR "1 item" -- the whole point of dropping "(s)"});
         my $with_pending = tui::DashboardScreen::backpack_summary_spans({ total => 5, approved => 2, pending => 3 });
         my $txt_wp = join('', map { $_->{text} } @$with_pending);
         like($txt_wp, qr/pending/, 'AC-K4: pending>0 -> pending clause present');
@@ -1065,12 +1068,13 @@ sub _dlines_text {
     my $f = eval { Dashboard::compose_frame(\%STATE_WITH_TOKENS, $RICH_ROWS, 120) };
     ok(!$@, 'AC-K1 precondition: compose_frame(7-item backpack fixture) does not die') or diag($@);
     my $joined = (defined $f) ? join("\n", map { $_->{text} } @$f) : '';
-    my $n_total = () = $joined =~ /7 item\(s\)/g;
-    cmp_ok($n_total, '>', 0, 'AC-D4-style guard: "7 item(s)" appears at least once');
+    my $n_total = () = $joined =~ /7 items/g;
+    cmp_ok($n_total, '>', 0, q{AC-D4-style guard: "7 items" appears at least once});
     my @leaked = grep { $joined =~ /\Q$_\E/ } map { "zqxitem-$_" } ('a' .. 'g');
     is(scalar(@leaked), 0, 'AC-K1/Behavior18: none of the 7 backpack item keys appear anywhere in the rendered frame')
         or diag("  leaked: " . join(',', @leaked));
-    like($joined, qr/7 item\(s\)/, 'AC-K1: the frame contains "7 item(s)"');
+    like($joined, qr/7 items/, q{AC-K1: the frame contains "7 items"});
+    unlike($joined, qr/\bitem\(s\)/, q{AC-K1: and never the lazy "item(s)" form the operator called out});
 }
 {
     my $hand_built = "some frame text mentioning zqxitem-c in a row\n";

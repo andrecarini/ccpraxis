@@ -810,7 +810,7 @@ sub _gutter_label { return sprintf('%-*s : ', $LABEL_GUTTER, $_[0]); }
     # event 0: launch_start, no exit/state -> event_style classifies (rule 6: accent).
     my ($role0, $glyph0) = Dashboard::event_style('launch_start', undef, undef);
     is(Dashboard::spans_text($ev->[0]),
-        sprintf('%-6s  ', Dashboard::fmt_age($now - $epoch0)) . "$glyph0 launch_start",
+        sprintf("%-6s  ", Dashboard::_local_hhmm($epoch0, \&CORE::gmtime)) . "$glyph0 launch_start",
         'AC19: event 0 spans_text == "$duration  $glyph $type$extra"');
     # RE-POINTED (fix-batch, unified-tui-design-system package
     # 06-dashboard-screen, NO_COLOR regression item): recent_events now maps
@@ -829,7 +829,7 @@ sub _gutter_label { return sprintf('%-*s : ', $LABEL_GUTTER, $_[0]); }
     # event 1: container_start exit=0 -> good; the exit= extra is carried in the text.
     my ($role1, $glyph1) = Dashboard::event_style('container_start', 0, undef);
     is(Dashboard::spans_text($ev->[1]),
-        sprintf('%-6s  ', Dashboard::fmt_age($now - $epoch1)) . "$glyph1 container_start exit=0",
+        sprintf("%-6s  ", Dashboard::_local_hhmm($epoch1, \&CORE::gmtime)) . "$glyph1 container_start exit=0",
         'AC19: event 1 spans_text carries the exit= extra text, with the classified glyph');
     is($ev->[1][0]{role}, $TIME_ROLE, 'AC19: event 1 timestamp span is muted even though the event itself is good');
     # RE-POINTED (same rationale/derivation as event 0 above), and load-
@@ -845,7 +845,7 @@ sub _gutter_label { return sprintf('%-*s : ', $LABEL_GUTTER, $_[0]); }
     # event 2: container_gone state=exited -> bad; the state= extra is carried.
     my ($role2, $glyph2) = Dashboard::event_style('container_gone', undef, 'exited');
     is(Dashboard::spans_text($ev->[2]),
-        sprintf('%-6s  ', Dashboard::fmt_age($now - $epoch2)) . "$glyph2 container_gone state=exited",
+        sprintf("%-6s  ", Dashboard::_local_hhmm($epoch2, \&CORE::gmtime)) . "$glyph2 container_gone state=exited",
         'AC19: event 2 spans_text carries the state= extra text, with the classified glyph');
     is($role2, 'bad', 'AC19: container_gone classifies as bad (sanity check on the fixture)');
     is($ev->[2][0]{role}, $TIME_ROLE, 'AC19: event 2 timestamp span is muted even though the event itself is bad');
@@ -862,24 +862,26 @@ sub _gutter_label { return sprintf('%-*s : ', $LABEL_GUTTER, $_[0]); }
     like(Dashboard::spans_text($last2->[-1]), qr/container_gone/,  'AC19: keeps the most recent (last) (unchanged)');
     like(Dashboard::spans_text($last2->[0]),  qr/container_start/, 'AC19: preserves chronological order (unchanged)');
 
-    # ---- AC19 honest-absence arm (counter-fixture, S2.4.6 "Degradation
-    # ---- when $now is absent" / S5): with NO $now, no time span is
-    # ---- produced at all -- the row starts at the glyph span.
+    # ---- RE-POINTED (operator request): the time column is a WALL CLOCK, not
+    # ---- an age, so it no longer depends on $now at all.
+    #
+    # The old arm asserted "no $now => no time span", on the reasoning that a
+    # time computed without a clock would be fabricated. That reasoning applied
+    # to an AGE, which is a function of (event, now) and genuinely cannot be
+    # computed without the clock. A wall-clock time is a function of the EVENT'S
+    # OWN timestamp alone -- it is data the row already carries. Rendering it
+    # without $now is therefore strictly MORE honest than suppressing it, and
+    # the property worth pinning is that the two arms agree.
     my $ev_no_now = Dashboard::recent_events(\@lines, 10, \&CORE::gmtime);
-    is(scalar(@$ev_no_now), 3, 'AC19 (honest absence): garbage + blank lines still skipped with no $now');
+    is(scalar(@$ev_no_now), 3, 'AC19 (clock-free): garbage + blank lines still skipped with no $now');
     for my $i (0 .. 2) {
-        isnt($ev_no_now->[$i][0]{role}, $TIME_ROLE,
-            "AC19 (honest absence): event ${i}'s FIRST span is NOT the muted time span when \$now is undef");
+        is($ev_no_now->[$i][0]{role}, $TIME_ROLE,
+            "AC19 (clock-free): event ${i}'s FIRST span is still the muted time span with no \$now -- the time comes from the EVENT, not the clock");
     }
-    my ($role0b, $glyph0b) = Dashboard::event_style('launch_start', undef, undef);
-    # RE-POINTED, same rationale as the with-$now arm above: the span's
-    # role is now event_style's role mapped through theme_role(), not the
-    # legacy name bare.
-    my $expected_role0b = tui::DashboardScreen::theme_role($role0b);
-    is($ev_no_now->[0][0]{text}, "$glyph0b ",
-        'AC19 (honest absence): event 0 starts at the glyph span, not a time span, when $now is undef');
-    is($ev_no_now->[0][0]{role}, $expected_role0b,
-        'AC19 (honest absence): event 0 first span role is event_style\'s role mapped through Theme, not the time role, when $now is undef');
+    is(Dashboard::spans_text($ev_no_now->[0]), Dashboard::spans_text($ev->[0]),
+        'AC19 (clock-free): the row is byte-identical with and without $now -- $now cannot influence a wall-clock column');
+    is($ev_no_now->[0][0]{text}, sprintf('%-6s  ', Dashboard::_local_hhmm($epoch0, \&CORE::gmtime)),
+        'AC19 (clock-free): and that column is the event timestamp rendered HH:MM');
 }
 
 # ===========================================================================

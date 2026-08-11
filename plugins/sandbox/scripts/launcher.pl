@@ -4664,7 +4664,8 @@ sub enter_dashboard {
     # are effectively immutable for this dashboard's lifetime, and an opendir + up to
     # five file reads per frame would be a real regression in the hot path. Reading it
     # once also keeps the boundary marker's position stable (no flicker).
-    my @hist_groups = _history_events("$CLAUDE_DATA/sandbox-logs", "launch-$LAUNCH_ID.log");
+    my ($hist_groups_ref, $hist_last_epoch) = _history_events("$CLAUDE_DATA/sandbox-logs", "launch-$LAUNCH_ID.log");
+    my @hist_groups = @{ $hist_groups_ref || [] };
     my $cached_status           = 'unknown';
     my $cached_machine_state    = 'unknown';   # s12: _machine_state, refreshed on the 10s inspect round
     my $cached_busy_age         = undef;   # B5: age (s) of /tmp/.butler-busy in CONTAINER time, or undef
@@ -4955,7 +4956,7 @@ sub enter_dashboard {
                 events          => LaunchLog::merge_sessions(
                                         [ @hist_groups, $cur ],
                                         max    => $ACTIVITY_EVENT_MAX,
-                                        marker => Dashboard::session_boundary_row(),
+                                        marker => Dashboard::session_boundary_row($hist_last_epoch),
                                     ),
                 install_warning => $INSTALL_WARNING,
                 busy_age        => $busy_age,
@@ -5918,6 +5919,7 @@ sub _tail_lines {
 sub _history_events {
     my ($dir, $exclude) = @_;
     my @groups;
+    my $newest_hist_epoch;
     eval {
         my @paths = LaunchLog::recent_logs($dir, $HISTORY_LOG_FILES, $exclude);  # newest-first
         for my $p (reverse @paths) {                                # -> oldest-first
@@ -5943,11 +5945,25 @@ sub _history_events {
                     }
                 }
             }
-            push @groups, $ev if ref $ev eq 'ARRAY' && @$ev;
+            if (ref $ev eq 'ARRAY' && @$ev) {
+                push @groups, $ev;
+                # The newest timestamp in this group. Only the LAST group's
+                # value survives the loop, which is the one wanted: it dates the
+                # "previous session" divider that sits directly above the
+                # current session's events. Needed because activity rows show a
+                # wall clock now instead of an age, and a bare "23:41" on the
+                # far side of a session boundary says nothing about WHICH day.
+                for my $ln (@lines) {
+                    my $e = Dashboard::_event_epoch_of_line($ln);
+                    next unless defined $e;
+                    $newest_hist_epoch = $e
+                        if !defined($newest_hist_epoch) || $e > $newest_hist_epoch;
+                }
+            }
         }
         1;
-    } or do { @groups = () };      # any failure -> no history, dashboard behaves exactly as today
-    return @groups;
+    } or do { @groups = (); $newest_hist_epoch = undef };   # any failure -> no history, dashboard behaves exactly as today
+    return (\@groups, $newest_hist_epoch);
 }
 
 # _gather_orchestrator_events($runs) -> ARRAYREF of span-rows -- spec S2

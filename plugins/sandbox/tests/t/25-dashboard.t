@@ -549,7 +549,10 @@ my %st = (
     # so it no longer has a title row to match. Claim preserved: the
     # backpack fact still reaches a composed frame -- subject moves from the
     # "-- Backpack " title to the summary text itself.
-    like($joined, qr/1 item\(s\)/, 'compose: backpack summary reaches the frame (as a Run-panel row, not a titled panel -- Decision 9)');
+    # RE-POINTED again: counts are pluralised properly now, so a total of 1
+    # renders "1 item" rather than "1 item(s)". That the SINGULAR form is what a
+    # count of one produces is the assertion worth making here.
+    like($joined, qr/\b1 item\b/, 'compose: backpack summary reaches the frame (as a Run-panel row, not a titled panel -- Decision 9)');
     like($joined, qr/keep-awake.*holding/, 'compose: keep-awake state surfaced in a frame');
 }
 
@@ -741,9 +744,12 @@ my %st = (
     # is no Dashboard::fmt_duration -- that name lives only on
     # tui::DashboardScreen (confirmed: Dashboard->can('fmt_duration') is
     # false, Dashboard->can('fmt_age') is true).
-    my $expected_time0 = sprintf('%-6s  ', Dashboard::fmt_age($now_pt6 - $epoch_pt6));
+    # RE-POINTED (operator request): the time column is the event's own WALL
+    # CLOCK time, not its age. "row carries time + glyph + type" is preserved;
+    # only what "time" means changes, and it no longer depends on $now.
+    my $expected_time0 = sprintf('%-6s  ', Dashboard::_local_hhmm($epoch_pt6, \&CORE::gmtime));
     is(Dashboard::spans_text($ev->[0]), $expected_time0 . ($glyph0 // '') . " launch_start",
-        'events: fmt_age($now-$epoch) + glyph + type (spec S2.4.6 render step 4; time grammar re-derived, "row carries time+glyph+type" preserved)');
+        'events: HH:MM + glyph + type (spec S2.4.6 render step 4; time grammar re-derived, "row carries time+glyph+type" preserved)');
     my ($role1, $glyph1) = eval { Dashboard::event_style('container_start', 0, undef) };
     like(Dashboard::spans_text($ev->[1]), qr/\Q$glyph1\E container_start exit=0/, 'events: exit field surfaced') if defined $glyph1;
     fail('events: exit field surfaced (event_style not yet defined)') if !defined $glyph1;
@@ -1420,32 +1426,59 @@ sub drive_per_tick {
 
     my $ev_a = eval { Dashboard::recent_events(\@lines_now, 1, undef, $now_a) };
     my $ev_b = eval { Dashboard::recent_events(\@lines_now, 1, undef, $now_b) };
-    if ($ev_a && $ev_b) {
+    # RE-POINTED (operator request). The seam being probed was "the clock is
+    # injected, never live", demonstrated by two different $now values producing
+    # two different AGE texts. The column is a wall clock now, so $now cannot
+    # move it -- and the equivalent, stronger property is that it is INVARIANT
+    # under $now while still varying with the event's own timestamp. That is the
+    # same determinism claim, pointed at the input that actually drives it.
+    my @lines_later = ('{"ts":"2026-06-24T12:34:01Z","type":"launch_start","pid":1}');
+    my $ev_c = eval { Dashboard::recent_events(\@lines_later, 1, \&CORE::gmtime, $now_a) };
+    if ($ev_a && $ev_b && $ev_c) {
         my $text_a = Dashboard::spans_text($ev_a->[0]);
         my $text_b = Dashboard::spans_text($ev_b->[0]);
-        isnt($text_a, $text_b,
-            'A1/A2-seam (recent_events): two different injected $now values produce two different event time texts (determinism -- the clock is injected, never live)');
-        like($text_a, qr/\Q@{[ Dashboard::fmt_age($now_a - $epoch_10) ]}\E/,
-            'A1-seam (recent_events): the time text is exactly Dashboard::fmt_age($now - $epoch), never a hardcoded/re-pinned format');
-        like($text_b, qr/\Q@{[ Dashboard::fmt_age($now_b - $epoch_10) ]}\E/,
-            'A2-seam (recent_events): ...and again for the second injected $now (re-derives per-call, not once)');
+        is($text_a, $text_b,
+            'A1/A2-seam (recent_events): two different injected $now values produce the SAME row -- a wall clock is a function of the event, not of now');
+        isnt($text_a, Dashboard::spans_text($ev_c->[0]),
+            'A1/A2-seam (recent_events): but a different event TIMESTAMP does change it -- the column is live data, not a constant');
+        like(Dashboard::spans_text($ev_c->[0]), qr/\Q@{[ Dashboard::_local_hhmm(Dashboard::_event_epoch('2026-06-24T12:34:01Z'), \&CORE::gmtime) ]}\E/,
+            'A1-seam (recent_events): the time text is exactly the event timestamp rendered HH:MM, never a hardcoded format');
     } else {
         fail('A1/A2-seam (recent_events): recent_events 4-arg $now form not yet wired (expected failure)');
     }
 
-    # A3-seam: THE HONEST-ABSENCE COUNTER-FIXTURE (spec S2.4.6/escalation
-    # E-E): "the time field is omitted, not filled with n/a or 00:00:00"
-    # when $now is undefined. Without $now, the row must carry FEWER spans
-    # than the same event WITH $now (no fabricated time field), and its text
-    # must not begin with a digit (no muted duration prefix at all).
+    # A3-seam, RE-POINTED. The original claim was "the time field is omitted,
+    # not filled with n/a or 00:00:00, when $now is undefined" -- correct for an
+    # AGE, which genuinely cannot be computed without a clock, so rendering one
+    # anyway would have been fabrication.
+    #
+    # A wall-clock time is not in that position: it is a function of the event's
+    # OWN timestamp, which the row already carries. Suppressing it for want of
+    # $now would be withholding data we have, so the honest behaviour inverts.
+    # What stays load-bearing is the real absence case -- an event with no
+    # usable `ts` still gets NO time field rather than a fabricated one.
     my $ev_bare = eval { Dashboard::recent_events(\@lines_now, 1) };   # no $localtime_fn, no $now at all
     if ($ev_bare && $ev_a) {
-        cmp_ok(scalar(@{ $ev_bare->[0] }), '<', scalar(@{ $ev_a->[0] }),
-            'A3-seam (honest absence, spec E-E): recent_events called WITHOUT $now emits FEWER spans than the same event WITH $now -- no fabricated time field');
-        unlike(Dashboard::spans_text($ev_bare->[0]), qr/^\d/,
-            'A3-seam (honest absence): without $now, the event text does not begin with a digit (no time span, muted or otherwise)');
+        is(scalar(@{ $ev_bare->[0] }), scalar(@{ $ev_a->[0] }),
+            'A3-seam: without $now the row is unchanged -- a wall-clock column needs no clock, so there is nothing to omit');
     } else {
-        fail('A3-seam (honest absence): recent_events without $now not yet wired (expected failure)');
+        fail('A3-seam: recent_events without $now not yet wired (expected failure)');
+    }
+
+    # The genuine honest-absence case, which survives the re-point intact: an
+    # event whose timestamp is missing or unparseable has no time to render, and
+    # must not be given one.
+    my $ev_nots = eval { Dashboard::recent_events(['{"type":"launch_start"}'], 1, \&CORE::gmtime, $now_a) };
+    my $ev_badts = eval { Dashboard::recent_events(['{"ts":"not-a-timestamp","type":"launch_start"}'], 1, \&CORE::gmtime, $now_a) };
+    if ($ev_nots && $ev_badts && $ev_a) {
+        cmp_ok(scalar(@{ $ev_nots->[0] }), '<', scalar(@{ $ev_a->[0] }),
+            'A3-seam (honest absence): an event with NO ts emits fewer spans -- no fabricated time field');
+        unlike(Dashboard::spans_text($ev_nots->[0]), qr/^\d/,
+            'A3-seam (honest absence): and its text does not begin with a digit');
+        unlike(Dashboard::spans_text($ev_badts->[0]), qr/^\d/,
+            'A3-seam (honest absence): an UNPARSEABLE ts is treated as absent, not rendered as 00:00');
+    } else {
+        fail('A3-seam (honest absence): missing-timestamp fixtures did not render');
     }
 }
 

@@ -857,7 +857,57 @@ sub scroll_indicator {
 # session's events. No parameters. Returns a freshly-constructed arrayref on
 # every call so no caller can alias shared state. PUBLIC, pure.
 sub session_boundary_row {
-    return [ { text => '-- previous session --', role => 'muted' } ];
+    my ($epoch, $localtime_fn) = @_;
+    # The label carries the DATE of the session it introduces. Activity rows
+    # show a wall-clock time (17:43) rather than an age, and a bare time is
+    # ambiguous the moment the list spans more than one day -- which this
+    # divider is the definition of. Without a date here, "7d16h" became "23:41"
+    # with nothing saying which 23:41.
+    my $date = _local_date_label($epoch, $localtime_fn);
+    return [ { text => (defined $date ? "-- previous session ($date) --"
+                                      : '-- previous session --'), role => 'muted' } ];
+}
+
+# _local_parts($epoch, $localtime_fn) -> (hh, mm, ymd, "Www DD Mon") | ()
+# The one place an epoch becomes local wall-clock text. $localtime_fn is
+# injectable so every caller stays testable without touching the machine clock.
+sub _local_parts {
+    my ($epoch, $localtime_fn) = @_;
+    return () unless defined $epoch && !ref($epoch) && $epoch =~ /^-?\d+(?:\.\d+)?$/;
+    my $lt = (ref($localtime_fn) eq 'CODE') ? $localtime_fn : sub { localtime($_[0]) };
+    my @t = eval { $lt->(int($epoch)) };
+    return () unless @t >= 6;
+    my @MON = qw(Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec);
+    my @DOW = qw(Sun Mon Tue Wed Thu Fri Sat);
+    my $ymd = sprintf('%04d-%02d-%02d', $t[5] + 1900, $t[4] + 1, $t[3]);
+    my $pretty = sprintf('%s %d %s', $DOW[ $t[6] % 7 ], $t[3], $MON[ $t[4] % 12 ]);
+    return ($t[2], $t[1], $ymd, $pretty);
+}
+
+# _local_hhmm / _local_date_label / _local_ymd -- thin readers over _local_parts.
+sub _local_hhmm {
+    my @p = _local_parts(@_);
+    return undef unless @p;
+    return sprintf('%02d:%02d', $p[0], $p[1]);
+}
+sub _local_ymd {
+    my @p = _local_parts(@_);
+    return @p ? $p[2] : undef;
+}
+sub _local_date_label {
+    my @p = _local_parts(@_);
+    return @p ? $p[3] : undef;
+}
+
+# day_boundary_row($epoch, $localtime_fn) -> \@spans
+# Inserted wherever consecutive activity rows fall on different local dates.
+# Once the time column shows a clock rather than an age, crossing midnight is
+# invisible without this -- 00:14 sorts below 23:58 and reads as fourteen
+# minutes later when it is fourteen minutes into the NEXT DAY.
+sub day_boundary_row {
+    my ($epoch, $localtime_fn) = @_;
+    my $label = _local_date_label($epoch, $localtime_fn);
+    return [ { text => (defined $label ? "-- $label --" : '-- new day --'), role => 'muted' } ];
 }
 
 # activity_row_width($cols) -> $w -- spec S2.7. $w = $cols - 2 (the
@@ -2191,6 +2241,18 @@ sub _event_epoch {
     return eval { Time::Local::timegm($sec, $m, $h, $dy, $mo - 1, $yr - 1900) };
 }
 
+# _event_epoch_of_line($json_line) -> epoch | undef. The line-level companion to
+# _event_epoch, so a caller that only has raw log lines (the launcher's history
+# reader) can date a group without re-implementing the JSON decode or the
+# timestamp grammar. PUBLIC-ish, pure, total: any malformed input -> undef.
+sub _event_epoch_of_line {
+    my ($ln) = @_;
+    return undef unless defined $ln && $ln =~ /\S/;
+    my $rec = eval { JSON::PP->new->decode($ln) };
+    return undef unless $rec && ref $rec eq 'HASH' && defined $rec->{ts};
+    return _event_epoch($rec->{ts});
+}
+
 sub recent_events {
     my ($lines, $n, $localtime_fn, $now) = @_;
     $lines ||= [];
@@ -2231,12 +2293,32 @@ sub recent_events {
 
     my $now_numeric = defined($now) && !ref($now) && $now =~ /^-?\d+(?:\.\d+)?$/;
     my @ev;
+    my $prev_ymd;
     for my $rec (@last) {
+        # WALL-CLOCK, NOT AN AGE (operator request). The column used to read
+        # "5m", "11m", "7d16h" -- a relative age answers "how long ago" but
+        # never "when", so two events could not be lined up against anything
+        # outside this panel (a log line, a commit, a memory of what you were
+        # doing). "17:43" answers both: the age is still obvious for anything
+        # recent, and the absolute time is there for everything else.
+        #
+        # A clock makes midnight invisible, though: 00:14 renders below 23:58
+        # and reads as sixteen minutes later when it is sixteen minutes into the
+        # NEXT DAY. So a date divider is emitted wherever consecutive rows fall
+        # on different local dates, and the session divider carries its date too.
+        my $ymd = defined($rec->{epoch}) ? _local_ymd($rec->{epoch}, $localtime_fn) : undef;
+        if (defined($ymd) && defined($prev_ymd) && $ymd ne $prev_ymd) {
+            push @ev, day_boundary_row($rec->{epoch}, $localtime_fn);
+        }
+        $prev_ymd = $ymd if defined $ymd;
+
         my @spans;
-        if ($now_numeric && defined $rec->{epoch}) {
+        if (defined $rec->{epoch}) {
+            my $hhmm = _local_hhmm($rec->{epoch}, $localtime_fn);
             # AC19 (t/41): the time span's role is the THEME token
             # (theme_role('muted') == 'text.muted').
-            push @spans, { text => sprintf('%-6s  ', fmt_age($now - $rec->{epoch})), role => tui::DashboardScreen::theme_role('muted') };
+            $hhmm = ($now_numeric ? fmt_age($now - $rec->{epoch}) : '') unless defined $hhmm;
+            push @spans, { text => sprintf('%-6s  ', $hhmm), role => tui::DashboardScreen::theme_role('muted') };
         }
         # Fix batch (package 06, review finding "Fix 1"): event_style still
         # returns a LEGACY role name (good/bad/muted/accent/value) -- that

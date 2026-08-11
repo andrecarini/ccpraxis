@@ -583,8 +583,8 @@ SKIP: {
     my $dash_spans = tui::DashboardScreen::backpack_summary_spans($counts);
     my $dash_text  = tui::Frame::spans_text($dash_spans);
 
-    like($summary_joined, qr/\Q$counts->{total}\E item\(s\)/, 'AC-L7: the screen summary row states the total count');
-    like($dash_text, qr/\Q$counts->{total}\E item\(s\)/, "AC-L7: tui::DashboardScreen::backpack_summary_spans states the SAME total, from the SAME counts");
+    like($summary_joined, qr/\Q$counts->{total}\E items/, 'AC-L7: the screen summary row states the total count');
+    like($dash_text, qr/\Q$counts->{total}\E items/, "AC-L7: tui::DashboardScreen::backpack_summary_spans states the SAME total, from the SAME counts");
     like($dash_text, qr/\Q$counts->{approved}\E approved/, 'AC-L7: both surfaces state the same approved count');
 }
 

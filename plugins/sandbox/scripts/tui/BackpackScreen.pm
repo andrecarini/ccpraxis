@@ -591,7 +591,10 @@ sub _list_row_spans {
 sub _summary_row {
     my ($rows_ref, $vp) = @_;
     my $c = counts($rows_ref);
-    my $text = "$c->{total} item(s), $c->{approved} approved";
+    # Pluralised through the one helper, not hand-written: this row and the
+    # dashboard's backpack summary state the SAME counts and are asserted
+    # against each other (t/67 AC-L7), so they must also share the grammar.
+    my $text = tui::DashboardScreen::count_of($c->{total}, 'item') . ", $c->{approved} approved";
     $text .= ", $c->{pending} pending" if $c->{pending} > 0;
     my @spans = ( { text => $text, role => 'text.muted' } );
     my @extra;
