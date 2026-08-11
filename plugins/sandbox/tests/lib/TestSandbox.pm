@@ -8,8 +8,12 @@ package TestSandbox;
 # test harness silently corrupts every podman command on Windows.
 #
 # All resources (containers, volumes, temp dirs) are tagged with the
-# current PID + a counter so concurrent runs don't collide and the END
-# block cleans up reliably even if a test aborts mid-flight.
+# current PID + a counter so concurrent runs don't collide. Cleanup is
+# three-layered: an END block for normal exit and `die`, signal handlers
+# for the abort paths END does NOT cover (Ctrl-C, `timeout`), and a
+# load-time sweep of containers whose creating PID is already dead, which
+# is the only layer that can recover from a SIGKILL or an earlier run.
+# See the "Orphan reaping" block below for why all three are needed.
 
 use strict;
 use warnings;
@@ -31,6 +35,9 @@ our @EXPORT_OK = qw(
     register_cleanup_container
     register_cleanup_dir
     cleanup_all
+    sweep_orphan_containers
+    test_container_prefix
+    orphan_container_names
 );
 
 our $WINDOWS_FAMILY = $^O =~ /^(MSWin32|cygwin|msys)$/;
@@ -157,6 +164,108 @@ sub cleanup_all {
     }
     @CLEANUP_DIRS = ();
 }
+
+# ---------------------------------------------------------------------------
+# Orphan reaping — why this exists, and why END was never enough.
+#
+# The header of this file used to claim the END block "cleans up reliably even
+# if a test aborts mid-flight". That is true for `die` and for a normal exit,
+# and FALSE for the way these tests most often actually stop: a signal. Perl
+# does not run END blocks when the process takes an unhandled SIGINT/SIGTERM/
+# SIGHUP, and this suite is routinely run under `timeout` (project CLAUDE.md
+# mandates it for anything that could reach launcher.pl) and interrupted by
+# hand with Ctrl-C. Every one of those paths left `sleep 600` probe containers
+# behind, and because each run tags names with its own PID they accumulate
+# silently rather than colliding — the operator found a pile of them in
+# `podman ps -a` long after the runs were gone.
+#
+# Two layers, because neither alone is sufficient:
+#   1. Signal handlers, so the common abort paths clean up their OWN containers
+#      the way an ordinary exit does. Handlers re-raise with the default
+#      disposition afterwards, so the exit status still reports the signal
+#      rather than silently becoming 0.
+#   2. A sweeper for containers whose creating process is already gone. Layer 1
+#      cannot help a run that was SIGKILLed, that crashed the interpreter, or
+#      that predates this change. The name carries the creating PID, so
+#      liveness is decidable without any extra state: a test container whose
+#      PID is not alive owns nothing and is safe to remove. A LIVE PID's
+#      containers are never touched, which is what keeps concurrent runs safe.
+# ---------------------------------------------------------------------------
+
+sub test_container_prefix { 'claude-sandbox-test-' }
+
+# Parse a container name back to the PID that created it, or undef if the name
+# is not ours. Deliberately strict: only `claude-sandbox-test-<pid>-<counter>`
+# plus an optional suffix matches, so an unrelated container that merely starts
+# with the prefix is left alone rather than removed on a loose match.
+sub _pid_from_test_container_name {
+    my ($name) = @_;
+    return undef unless defined $name;
+    my $p = test_container_prefix();
+    return undef unless $name =~ /\A\Q$p\E([0-9]+)-[0-9]+(?:-.*)?\z/;
+    return $1;
+}
+
+# Is $pid alive? kill 0 is the portable probe; on Windows perl it answers for
+# the emulated process table, which is where these PIDs come from. An undef or
+# non-numeric pid is reported NOT alive so a malformed name is reapable rather
+# than immortal.
+sub _pid_alive {
+    my ($pid) = @_;
+    return 0 unless defined $pid && $pid =~ /\A[0-9]+\z/ && $pid > 0;
+    return kill(0, $pid) ? 1 : 0;
+}
+
+# orphan_container_names(\@all_names, $alive_fn) -> @orphans
+# Pure and total, so the reaping RULE is unit-testable without a container
+# runtime: names not ours are skipped, ours-but-live are skipped, ours-and-dead
+# are returned. $alive_fn is injectable purely for the tests.
+sub orphan_container_names {
+    my ($names, $alive_fn) = @_;
+    $alive_fn ||= \&_pid_alive;
+    my @out;
+    for my $n (@{ $names || [] }) {
+        next unless defined $n && length $n;
+        my $pid = _pid_from_test_container_name($n);
+        next unless defined $pid;
+        next if $alive_fn->($pid);
+        next if $pid == $$;        # never reap our own, even mid-run
+        push @out, $n;
+    }
+    return @out;
+}
+
+# Remove every test container whose creating process is gone. Returns the list
+# actually reaped. Best-effort by construction: a podman that is absent, slow
+# or erroring must never fail a test run, so every failure path returns empty
+# rather than dying.
+sub sweep_orphan_containers {
+    my ($rc, $out) = eval { podman_run_capture('ps', '-a', '--format', '{{.Names}}') };
+    return () if $@ || !defined $rc || $rc != 0;
+    my @names = grep { length } map { s/\s+\z//r } split /\n/, ($out // '');
+    my @orphans = orphan_container_names(\@names);
+    for my $c (@orphans) {
+        system("$PODMAN rm -f " . _arg_quote($c) . " > /dev/null 2>&1");
+    }
+    return @orphans;
+}
+
+# Signal-path cleanup. Restore the default disposition and re-raise so the
+# waiting shell still sees "killed by SIGTERM" — swallowing the signal here
+# would turn an interrupted run into an apparently successful one.
+for my $sig (qw(INT TERM HUP)) {
+    $SIG{$sig} = sub {
+        my ($caught) = @_;
+        cleanup_all();
+        $SIG{$caught} = 'DEFAULT';
+        kill $caught, $$;
+    };
+}
+
+# Reap other runs' leftovers once at load, before this run creates anything.
+# Skippable via CCPRAXIS_TEST_NO_SWEEP=1 for the tests that exercise the
+# sweeper itself (and for anyone debugging a container by hand).
+sweep_orphan_containers() unless $ENV{CCPRAXIS_TEST_NO_SWEEP};
 
 END { cleanup_all() }
 
