@@ -30,6 +30,7 @@ use File::Copy qw(copy);
 use Cwd qw(abs_path);
 use JSON::PP;
 use Digest::MD5 qw(md5_hex);
+use File::Basename ();
 
 sub fwd { (my $p = shift) =~ s{\\}{/}g; $p }
 
@@ -42,8 +43,32 @@ my $VALDAG = "$BUTLER/scripts/bp-validate-dag.pl";
 my $HOOKSJ = "$BUTLER/hooks/hooks.json";
 
 my $BP_ROOT = "$PROJ/.ccpraxis-local-data";
-my $BP_DIR  = "$BP_ROOT/blueprints/sandbox-butler-overhaul";
-my $LIVE_BP = "$BP_DIR/blueprint.md";
+# The "live" fixture is a REAL, substantial blueprint.md -- the point is to exercise the
+# API against a genuine file rather than a synthetic stub. It must NOT be pinned to one
+# blueprint NAME: sandbox-butler-overhaul was hardcoded here, then archived, and because
+# stage_live_copy `die`d rather than skipped, the whole file aborted after G7 -- G8..G19
+# silently stopped running while the suite still looked like it was only "one red". A
+# fixture that names a specific initiative is a fixture with an expiry date.
+#
+# Resolve instead by PROPERTY: the original path, then the archive, then the largest
+# blueprint.md anywhere under .ccpraxis-local-data/blueprints. Every criterion that uses
+# it SKIPs when nothing qualifies.
+my $BP_ROOT_DIRS = "$BP_ROOT/blueprints";
+my $LIVE_BP = do {
+    my @cands = grep { defined && -f && -s $_ > 50_000 } (
+        "$BP_ROOT_DIRS/sandbox-butler-overhaul/blueprint.md",
+        "$BP_ROOT_DIRS/_archive/sandbox-butler-overhaul/blueprint.md",
+    );
+    unless (@cands) {
+        @cands = sort { -s $b <=> -s $a }
+                 grep { -f && -s $_ > 50_000 }
+                 (glob("$BP_ROOT_DIRS/*/blueprint.md"), glob("$BP_ROOT_DIRS/_archive/*/blueprint.md"));
+    }
+    $cands[0];
+};
+my $BP_DIR  = defined $LIVE_BP ? fwd(File::Basename::dirname($LIVE_BP)) : "$BP_ROOT_DIRS/(none)";
+my $HAVE_LIVE = defined $LIVE_BP && -f $LIVE_BP;
+$LIVE_BP //= "$BP_ROOT_DIRS/(no substantial blueprint found)/blueprint.md";
 
 diag("subject under test: $SCRIPT "
      . (-e $SCRIPT ? "(present)"
@@ -97,8 +122,12 @@ sub stage_bytes {
 sub stage_live_copy {
     my $d = fresh_dir();
     my $dst = "$d/blueprint.md";
-    my $bytes = read_file($LIVE_BP);
-    die "stage_live_copy: cannot read $LIVE_BP" unless defined $bytes;
+    # Returns undef rather than dying. A `die` here does not fail ONE criterion -- it
+    # aborts the whole file, so every criterion below it stops running while the suite
+    # still reports a single red. That is how G8..G19 went dark when the pinned fixture
+    # blueprint was archived.
+    my $bytes = defined $LIVE_BP ? read_file($LIVE_BP) : undef;
+    return undef unless defined $bytes;
     write_file($dst, $bytes);
     return $dst;
 }
@@ -462,7 +491,8 @@ cmp_ok(-s $LIVE_BP, ">", 50_000,
 # whole-file size.
 # =====================================================================================
 
-{
+SKIP: {
+    skip('G8: no substantial blueprint.md available as a live fixture', 3) unless $HAVE_LIVE;
     my $p = stage_live_copy();
     my ($rc, $out, $err) = run_pl(['show', '--file', $p, '--pkg', 'b13-deterministic-ledger-api']);
     is($rc, 0, "G8: show --pkg b13-deterministic-ledger-api exits 0 against the live-shaped file");
@@ -526,7 +556,8 @@ cmp_ok(-s $LIVE_BP, ">", 50_000,
 # G10 (DC-10): round-trip on the LIVE 70-package file: parse -> no-op rewrite -> digest unchanged.
 # =====================================================================================
 
-{
+SKIP: {
+    skip('G10: no substantial blueprint.md available as a live fixture', 3) unless $HAVE_LIVE;
     my $p = stage_live_copy();
     my $live_digest = digest_of($p);
     my $dag_before = BpOrch::parse_dag(read_file($p));
@@ -560,9 +591,10 @@ cmp_ok(scalar(keys %$dag_before), ">=", 60,
     ok(index($new, $DONE) >= 0 || index($new, $PENDING) >= 0,
        "G11: multi-byte status glyphs survive byte-for-byte after the mutation");
 }
-{
+SKIP: {
     # The live file itself is the strongest instance of this criterion (spec: "the live file carries
     # Andr\x{e9}-class paths"). Prove that too, on a COPY, never the live path.
+    skip('G11: no substantial blueprint.md available as a live fixture', 3) unless $HAVE_LIVE;
     my $p = stage_live_copy();
     my $orig = read_file($p);
     ok(index($orig, "Andr\xC3\xA9") >= 0,
@@ -787,6 +819,55 @@ for my $header ('## Decisions', '## Synthesis decisions', '## SYNTHESIS DECISION
 
         my ($rc3) = run_pl([ 'add-decision', '--file', $bp, '--id', '1', '--text', 'dupe' ]);
         isnt($rc3, 0, 'G19: a duplicate decision id is refused');
+    }
+}
+
+# =====================================================================================
+# G20 -- the Harvest log must be REACHABLE by some typed verb.
+#
+# Same hole shape as G19, one section over. `set-section` refuses "Harvest log" as
+# orchestrator-owned, the PreToolUse guard refuses a direct Edit, and for a long time no
+# orchestrator verb existed -- so the section was writable by NO path at all and every
+# blueprint's harvest log stayed empty. That silently voids any package done-criterion
+# phrased "recorded in the harvest log" (unified-tui-design-system's
+# 11-operator-visual-signoff, criterion 2, is exactly that). Found 2026-08-12.
+#
+# The assertion is deliberately about REACHABILITY plus table integrity, not about the
+# template's specific 4 columns -- the table's shape belongs to the blueprint author.
+# =====================================================================================
+{
+    my $dir = tempdir(CLEANUP => 1);
+    my $tpl = "$BUTLER/../blueprint/templates/blueprint.md";
+    my $bp  = "$dir/blueprint.md";
+
+    SKIP: {
+        skip('G20: blueprint template not present in this checkout', 5) unless -f $tpl;
+        run_pl([ 'init', '--file', $bp, '--template', $tpl, '--name', 'g20-demo' ]);
+
+        my ($rcs) = run_pl([ 'set-section', '--file', $bp, '--section', 'Harvest log',
+                             '--text-file', $tpl ]);
+        isnt($rcs, 0, 'G20: set-section still refuses Harvest log (it is typed-verb territory)');
+
+        my ($rc1) = run_pl([ 'add-harvest', '--file', $bp, '--pkg', '01-alpha',
+                             '--outputs', 'specs/01-alpha-spec.md; suite green',
+                             '--by', 'orchestrator', '--date', '2026-01-02' ]);
+        is($rc1, 0, 'G20: add-harvest appends a row -- the section is reachable');
+
+        my ($rc2) = run_pl([ 'add-harvest', '--file', $bp, '--pkg', '02-beta',
+                             '--outputs', 'reports/02-beta/review.md',
+                             '--by', 'orchestrator', '--date', '2026-01-03' ]);
+        is($rc2, 0, 'G20: ...and a second one');
+
+        # Contiguity, exactly as G19: a blank line between the separator and a row ends
+        # the table and orphans the row.
+        my $txt = read_file($bp) // '';
+        like($txt, qr/^\|-+.*\n\|\s*01-alpha\s*\|.*\n\|\s*02-beta\s*\|/m,
+            'G20: rows are contiguous with the separator');
+
+        # The template ships a placeholder `| | | |`; leaving it above real rows renders
+        # a permanently empty leading row.
+        unlike($txt, qr/^\|(?:\s*\|)+\s*$/m,
+            'G20: the placeholder blank row is dropped once a real row exists');
     }
 }
 

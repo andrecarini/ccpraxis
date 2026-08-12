@@ -1,8 +1,9 @@
 #!/usr/bin/env perl
 # bp-blueprint.pl — the deterministic blueprint.md write/read API (b43-blueprint-write-api).
 #
-# Six typed, surgical write ops (add-package, set-status, set-deps, add-decision,
-# set-decision, set-field) plus five read ops (show, deps, status, decisions, ready) over the
+# Typed, surgical write ops (add-package, set-status, set-deps, add-decision,
+# set-decision, set-field, add-harvest, set-meta, set-section, init) plus five read ops
+# (show, deps, status, decisions, ready) over the
 # package-status table `bp-orchestrator.pl`'s BpOrch::parse_dag reads. See:
 # .ccpraxis-local-data/blueprints/sandbox-butler-overhaul/specs/b43-blueprint-write-api-spec.md
 #
@@ -491,7 +492,7 @@ sub op_init {
 my %SECTION_REFUSED = map { lc($_) => 1 } (
     'Package status',   # add-package / set-status / set-field / set-deps own this
     'Decisions',        # add-decision / set-decision own this
-    'Harvest log',      # orchestrator-only, written during execution
+    'Harvest log',      # orchestrator-only; add-harvest owns it
 );
 
 sub op_set_section {
@@ -510,7 +511,8 @@ sub op_set_section {
     if ($SECTION_REFUSED{ lc $want }) {
         arg_error('set-section',
             "section '$want' is structured state with its own typed verbs -- refusing. "
-          . 'Use add-package/set-status/set-field/set-deps or add-decision/set-decision.');
+          . 'Use add-package/set-status/set-field/set-deps, add-decision/set-decision, '
+          . 'or add-harvest.');
     }
 
     my $body = _slurp($opt{'text-file'});
@@ -816,6 +818,105 @@ sub op_add_decision {
         my $insert_at = $end;
         $insert_at-- if $insert_at > 0 && $lines[$insert_at - 1] eq '';
         splice(@lines, $insert_at, 0, $entry);
+        return (join("\n", @lines), undef);
+    });
+}
+
+my $HARVEST_HEAD_RE = qr/^##\s+Harvest\s+log\b/i;
+
+# Same contract as locate_decisions_bounds, for the Harvest log section.
+sub locate_harvest_bounds {
+    my ($lines_ref) = @_;
+    my $start;
+    for my $i (0 .. $#$lines_ref) {
+        if ($lines_ref->[$i] =~ $HARVEST_HEAD_RE) { $start = $i; last }
+    }
+    return (undef, undef) unless defined $start;
+    my $end = scalar(@$lines_ref);
+    for my $i ($start + 1 .. $#$lines_ref) {
+        if ($lines_ref->[$i] =~ /^##\s/) { $end = $i; last }
+    }
+    return ($start, $end);
+}
+
+# Append one row to the Harvest log table.
+#
+# WHY THIS VERB EXISTS. The Harvest log was unwritable by ANY path: set-section refuses
+# it as "orchestrator-only, written during execution", the guard hook refuses a direct
+# Edit, and no orchestrator verb was ever written -- so "written during execution" named
+# a writer that does not exist. Every blueprint's harvest log was therefore empty, which
+# quietly voids any done-criterion phrased as "recorded in the harvest log" (this was
+# caught by 11-operator-visual-signoff, whose criterion 2 is exactly that). This is the
+# same hole shape the add-decision comment above documents: a section owned by typed
+# verbs, with no typed verb that can reach it. Found 2026-08-12.
+sub op_add_harvest {
+    my @args = @_;
+    my %opt;
+    my $ok;
+    { local $SIG{__WARN__} = sub { };
+      $ok = GetOptionsFromArray(\@args, \%opt,
+                                'file=s', 'pkg=s', 'outputs=s', 'by=s', 'date=s'); }
+    arg_error('add-harvest', 'unrecognised option') unless $ok;
+    arg_error('add-harvest', 'unexpected extra arguments: ' . join(' ', @args)) if @args;
+    for my $r (qw(file pkg outputs)) {
+        arg_error('add-harvest', "missing required --$r") unless defined $opt{$r};
+    }
+    for my $f (qw(pkg outputs by date)) {
+        next unless defined $opt{$f};
+        arg_error('add-harvest', "--$f contains a pipe or newline; would break the table row")
+            unless field_safe($opt{$f});
+    }
+    # SYN-14, same hazard as add-decision: parse_dag latches onto the FIRST `|`-row
+    # containing the literal token as the package-status header. A harvest row carrying
+    # it could masquerade as that table and mis-route the whole run.
+    if (index($opt{outputs}, 'depends_on') >= 0) {
+        arg_error('add-harvest',
+            "--outputs contains the literal token 'depends_on' (SYN-14 hazard). Rephrase without it.");
+    }
+
+    run_write('add-harvest', $opt{file}, sub {
+        my ($orig) = @_;
+        my @lines = split /\n/, $orig, -1;
+        my ($start, $end) = locate_harvest_bounds(\@lines);
+        return (undef, "no '## Harvest log' section found") unless defined $start;
+        my $tbl = decisions_table_info(\@lines, $start, $end);
+        return (undef, "the Harvest log section is not table-shaped (no `|`-row + separator pair)")
+            unless $tbl;
+
+        # Fill by COLUMN HEADER, never by position -- the table's shape belongs to the
+        # blueprint author, and assuming the template's 4 columns is how a generic API
+        # silently corrupts a project-specific one.
+        my @cells;
+        for my $i (0 .. $#{ $tbl->{cols} }) {
+            my $h = $tbl->{cols}[$i];
+            if    ($i == 0)                       { push @cells, $opt{pkg} }
+            elsif ($h =~ /output|verified\s+what/i){ push @cells, $opt{outputs} }
+            elsif ($h =~ /by|who/i)               { push @cells, $opt{by} // 'orchestrator' }
+            elsif ($h =~ /date|when/i)            { push @cells, $opt{date} // _today() }
+            else                                   { push @cells, '' }
+        }
+        my $row = '| ' . join(' | ', @cells) . ' |';
+
+        # Walk to the end of the contiguous row block (see add-decision: appending at the
+        # section's end_i lands AFTER the trailing blank line, which terminates the table
+        # and orphans the row).
+        my $ins = $tbl->{sep_i} + 1;
+        my @blank_rows;
+        while (defined $lines[$ins] && $lines[$ins] =~ /^\s*\|/) {
+            # The template ships a placeholder `| | | |`, and _is_sep_row matches it --
+            # its character class is [\s:|-], which an all-blank row satisfies. So the
+            # placeholder READS AS A SEPARATOR and stops the walk, which is why the first
+            # cut inserted above it and never removed it. Discriminate first: an all-empty
+            # row is a placeholder; a separator is what is left that still matches.
+            my $blank = (join('', _table_cols($lines[$ins])) =~ /^\s*$/);
+            last if !$blank && _is_sep_row($lines[$ins]);
+            push @blank_rows, $ins if $blank;
+            $ins++;
+        }
+        splice(@lines, $ins, 0, $row);
+        # Remove placeholders AFTER inserting, so the recorded indices stay valid (they
+        # are all below $ins), and highest-first so earlier removals don't shift later ones.
+        splice(@lines, $_, 1) for reverse @blank_rows;
         return (join("\n", @lines), undef);
     });
 }
@@ -1155,6 +1256,7 @@ my %DISPATCH = (
     'set-deps'     => \&op_set_deps,
     'add-decision' => \&op_add_decision,
     'set-decision' => \&op_set_decision,
+    'add-harvest'  => \&op_add_harvest,
     'set-field'    => \&op_set_field,
     'show'         => \&op_show,
     'deps'         => \&op_deps,
