@@ -1007,8 +1007,10 @@ sub run {
         data_dir => $data_dir,
         now      => $now_fn,
         verdict  => $verdict_fn,
-        spawn    => $opts->{spawn}                // sub { },
-        kill_pid => $opts->{kill_pid}             // sub { },
+        # These defaults used to be empty subs, which made the whole keep-awake
+        # mechanism inert in production while still looking wired. See _ka_spawn.
+        spawn    => $opts->{spawn}                // sub { _ka_spawn(@_) },
+        kill_pid => $opts->{kill_pid}             // sub { _ka_kill(@_) },
         powershell_available => $opts->{powershell_available} // sub { _ps_available() },
     );
 
@@ -1029,6 +1031,77 @@ sub run {
         print STDERR "usage: bp-drive-next.pl next|record-order|park|--help\n";
         return 2;
     }
+}
+
+# --------------------------------------------------------------------------
+# Keep-awake ACTUATION.
+#
+# WHY THIS EXISTS: the production defaults for `spawn` and `kill_pid` were both
+# `sub { }` — empty. Every other part of the keep-awake mechanism was real and
+# working (the powershell probe, the pid file, the idempotency check, the
+# run-log WARN, the stop-on-settle path), all of it wired to a no-op. The
+# director therefore REPORTED managing a wake-lock while holding none, which is
+# the "detection is fine, delivery is the defect" shape this blueprint exists
+# to eliminate — here in the drive loop itself.
+#
+# Observed 2026-08-12, not theorised: the host suspended mid-run and a watchdog
+# armed for 1800s reported 7962s elapsed (2h13m). An unattended run is exactly
+# what this loop is for, and a suspended host stops it dead.
+#
+# Actuation reuses the sandbox plugin's keep-awake.ps1 rather than re-deriving
+# the P/Invoke here. That helper is battle-tested and documents the non-obvious
+# part: ES_DISPLAY_REQUIRED is load-bearing on Modern Standby (S0) machines,
+# where ES_SYSTEM_REQUIRED alone does NOT hold the box out of connected standby.
+# Both plugins ship from the same tree, so the relative path holds in the clone,
+# in the live install, and under the container's marketplace mount.
+#
+# We deliberately do NOT pass the helper's -PidFile: it would write its own
+# Windows pid over ours, and keepawake_apply's liveness check is perl's
+# kill(0,$pid) against the pid WE forked. The fork child execs powershell, so
+# that one pid is the wake-lock's whole lifetime — killing it releases the lock
+# (ES_CONTINUOUS is tied to the calling thread, so no explicit undo is needed).
+#
+# Degrades honestly and silently-but-loggably: no Windows, no helper, or a
+# failed fork means no lock and a WARN in run.md — never a false claim of one.
+sub _ka_helper_path { return "$DIR/../../sandbox/scripts/keep-awake.ps1" }
+
+# POSIX -> forward-slash Windows form. MSYS2_ARG_CONV_EXCL is set process-wide
+# in this file's BEGIN block, so the translation MUST be done by hand: the
+# opt-out and the translation are one technique, and splitting them is how you
+# get paths created at the drive root (house rule; see CLAUDE.md).
+sub _ka_winify {
+    my ($p) = @_;
+    $p = abs_path($p) // $p;
+    $p =~ s{\\}{/}g;
+    $p =~ s{^/([a-zA-Z])/}{\u$1:/};
+    return $p;
+}
+
+sub _ka_spawn {
+    my ($pid_f) = @_;
+    return undef unless $^O =~ /^(MSWin32|msys|cygwin)$/;
+    my $ps1 = _ka_helper_path();
+    unless (-f $ps1) { die "keep-awake helper missing: $ps1\n" }
+    require POSIX;
+    my $pid = fork();
+    die "fork: $!\n" unless defined $pid;
+    if ($pid == 0) {
+        open(STDIN,  '<', '/dev/null');
+        open(STDOUT, '>', '/dev/null');
+        open(STDERR, '>', '/dev/null');
+        exec('powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass',
+             '-WindowStyle', 'Hidden', '-File', _ka_winify($ps1))
+            or POSIX::_exit(127);
+    }
+    if (open my $w, '>', $pid_f) { print $w "$pid\n"; close $w }
+    return $pid;
+}
+
+sub _ka_kill {
+    my ($pid) = @_;
+    return unless defined $pid && $pid =~ /^\d+$/ && $pid > 0;
+    kill('KILL', $pid);
+    waitpid($pid, 0);
 }
 
 # Detect whether powershell.exe is resolvable (for keep-awake actuation).

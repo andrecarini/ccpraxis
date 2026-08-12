@@ -876,4 +876,71 @@ sub capture_run {
     is($rc3, 0, 'AC-41: a fully-terminal blueprint may be omitted without refusal');
 }
 
+# ── AC-42: the keep-awake PRODUCTION defaults must actuate, not no-op ────────
+#
+# `spawn` and `kill_pid` both defaulted to `sub { }`. Everything around them was
+# real — the powershell probe, the pid file, the idempotency check, the WARN, the
+# stop-on-settle path — so the director reported holding a wake-lock while
+# holding none. The host then suspended mid-run on 2026-08-12 and a watchdog
+# armed for 1800s reported 7962s elapsed.
+#
+# THIS IS WHY IT SURVIVED: every other test in this file injects a `spawn` seam,
+# so the DEFAULT was never once exercised. The assertion therefore has to go
+# through run() with no seam injected, and stub the actuator underneath instead.
+{
+    my $data = tempdir(CLEANUP => 1);
+    make_bp_dir($data, 'bp-ka', [ {key=>'p1', status=>'pending', write_set=>'ka/p1/'} ]);
+    make_path("$data/.drive-solo");
+    write_json("$data/.drive-solo/order.json", { order => ['bp-ka'], recorded_at => 1 });
+
+    my $spawned = 0;
+    no warnings 'redefine';
+    local *BpDrive::_ka_spawn = sub { $spawned++; return 4242 };
+    use warnings 'redefine';
+
+    # NOT capture_run(): run_director() injects `spawn => sub { }` as a "safe
+    # default for every seam", so going through it would stub the exact default
+    # under test. That injection is precisely how this defect stayed invisible —
+    # the harness's safety default and the production default were both empty,
+    # and no test could tell them apart. Call BpDrive::run directly.
+    my ($rc, $out);
+    {
+        my ($ofh, $opath) = File::Temp::tempfile('t17-kaXXXXXX', TMPDIR => 1); close $ofh;
+        open my $oldout, '>&STDOUT' or die "dup STDOUT: $!";
+        open STDOUT, '>:raw', $opath or do { open STDOUT, '>&', $oldout; die "reopen: $!" };
+        $| = 1;
+        $rc = eval { BpDrive::run(['next', '--scope', 'bp-ka'],
+                                  { data_dir => $data, now => sub { $NOW },
+                                    verdict  => sub { { action => 'ok' } } }) };
+        open STDOUT, '>&', $oldout or die "restore STDOUT: $!"; close $oldout;
+        $out = read_file($opath) // '';
+    }
+    is($rc, 0, 'AC-42: next exits 0');
+    chomp(my $line = $out);
+    my $act = eval { $J->decode($line) };
+    is($act->{action}, 'run-package', 'AC-42: fixture yields runnable work (keep-awake should be ON)');
+
+    SKIP: {
+        skip('AC-42: no powershell on this platform — keep-awake is a documented no-op here', 1)
+            unless BpDrive::_ps_available();
+        ok($spawned > 0,
+            'AC-42: the production default ACTUATES the wake-lock (it was an empty sub, so the '
+          . 'director claimed a lock it never held)');
+    }
+}
+
+# ── AC-43: the actuator resolves a real helper and hand-translates its path ───
+#
+# MSYS2_ARG_CONV_EXCL is set process-wide in bp-drive-next.pl's BEGIN block, so
+# the POSIX→Windows translation MUST be done by hand. Getting this wrong is the
+# documented drive-root-stray bug: a bare /c/... handed to a native binary is
+# created as C:\c\... (576 strays on 2026-06-12).
+{
+    my $p = BpDrive::_ka_helper_path();
+    ok(defined $p && length $p, 'AC-43: a keep-awake helper path is resolved');
+    my $w = BpDrive::_ka_winify('/c/Development/ccpraxis/x.ps1');
+    like($w, qr{^[A-Z]:/}, 'AC-43: winify yields a drive-letter Windows path');
+    unlike($w, qr{^/}, 'AC-43: ...and never a leading slash (that is the drive-root-stray shape)');
+}
+
 done_testing();
