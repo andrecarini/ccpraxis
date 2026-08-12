@@ -309,15 +309,18 @@ sub capture_run {
         { data_dir => $data,
           verdict  => sub { { action=>'pause-token', until_epoch=>undef, reason=>'token' } } }
     );
+    # SOLO DOES NOT PAUSE FOR TOKEN EXPIRY (operator decision 2026-08-12,
+    # superseding Decision #15's terminal relogin park for the solo path only).
+    # The floor guards the UNATTENDED fleet against mid-flight death; solo has a
+    # human present and commits incrementally, so parking cost a whole session
+    # and bought nothing. The fleet path still honours pause-token.
     is($rc, 0, 'AC-4(pause-token): exits 0');
     chomp(my $line = $out);
     my $act = eval { $J->decode($line) };
-    is($act->{action}, 'pause', 'AC-4(pause-token): action=pause');
-    is($act->{reason}, 'token', 'AC-4(pause-token): reason=token');
-    ok(!defined $act->{until_epoch},
-        'AC-4(pause-token): until_epoch is JSON null (terminal relogin, Decision #15)');
-    like($out, qr/"until_epoch"\s*:\s*null/,
-        'AC-4(pause-token): until_epoch is literal JSON null in the output');
+    isnt($act->{action}, 'pause',
+        'AC-4(pause-token): solo does NOT pause for token expiry');
+    is($act->{action}, 'run-package',
+        'AC-4(pause-token): solo proceeds to the ready package instead');
 }
 
 {   # unavailable ×3 → degrade-and-proceed; counting fake asserts retry bound
@@ -492,10 +495,19 @@ sub capture_run {
     is($pu_v->{until_epoch}, $EPOCH,
         'AC-8/verdict: pause-usage carries until_epoch');
 
-    my $pt_v  = BpDrive::verdict_to_action(
-        { action=>'pause-token', until_epoch=>undef }, $NOW);
-    ok(!defined $pt_v->{until_epoch},
-        'AC-8/verdict: pause-token -> until_epoch=undef (null)');
+    # pause-token maps to proceed in solo — see AC-4. Asserted for both the old
+    # null-carrying verdict and the new timed-wait one, because the gate now
+    # emits an until_epoch and solo must ignore it either way.
+    for my $ue (undef, $NOW + 600) {
+        my $pt_v = BpDrive::verdict_to_action(
+            { action=>'pause-token', until_epoch=>$ue }, $NOW);
+        ok($pt_v->{ok},
+            'AC-8/verdict: pause-token -> proceed in solo'
+            . (defined $ue ? ' (timed-wait verdict)' : ' (legacy null verdict)'));
+        ok(!exists $pt_v->{action},
+            'AC-8/verdict: pause-token yields no pause action in solo'
+            . (defined $ue ? ' (timed-wait verdict)' : ' (legacy null verdict)'));
+    }
 
     my $un_v  = BpDrive::verdict_to_action({ action=>'unavailable' }, $NOW);
     ok($un_v->{unavailable},
@@ -586,9 +598,11 @@ sub capture_run {
             ['next','--scope','bx'],
             { data_dir=>$data,
               verdict=>sub{ {action=>'pause-token',until_epoch=>undef,reason=>'x'} } });
-        my $d = assert_json_shape('pause-token', $out, ['action','until_epoch','reason']);
-        ok(!defined $d->{until_epoch},
-            'AC-9(pause-token): until_epoch is JSON null (undef in perl)');
+        # Solo turns pause-token into forward progress, so the emitted shape is
+        # a run-package order, not a pause envelope (see AC-4).
+        my $d = assert_json_shape('pause-token', $out, ['action']);
+        is($d->{action}, 'run-package',
+            'AC-9(pause-token): solo emits a run-package order, not a pause');
     }
 
     # blueprint-done shape

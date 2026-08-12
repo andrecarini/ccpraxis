@@ -286,8 +286,14 @@ sub decode_verdict {
 # AC-3: token floor → pause-token; evaluated BEFORE poll; no poll call made
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 {
-    # expires_ms exactly at floor (1h remaining): life_h = 1 ≤ floor_h=1 → pause-floor
-    my $exp_ms = ($NOW + 1*3600) * 1000;   # exactly 1h → life_h = 1.0 → pause-floor
+    # 5 minutes remaining. This is deliberately under BOTH the injected
+    # tunables() floor and the shipped default floor (10 min, operator decision
+    # 2026-08-12), so the case trips on the pure path and the CLI path alike.
+    # It used to be exactly 1h, calibrated to the old 1-hour default — with a
+    # 10-minute floor that is comfortably ABOVE the floor, so the old fixture
+    # stopped exercising this branch at all and the CLI half silently began
+    # testing the ok-path instead.
+    my $exp_ms = ($NOW + 300) * 1000;
     my $creds  = { ok => 1, expires_ms => $exp_ms, detail => '' };
     # poll would give ok, but it should never be reached
     my $parsed = {
@@ -300,7 +306,10 @@ sub decode_verdict {
 
     is($v->{action},      'pause-token', 'AC-3: token at floor → pause-token');
     is($v->{reason},      'token',       'AC-3: reason=token');
-    is($v->{until_epoch}, undef,         'AC-3: until_epoch=undef for pause-token');
+    # until_epoch is no longer undef. A token pause is a TIMED WAIT that
+    # resumes on its own (expiry + 90s grace), not a terminal relogin park.
+    is($v->{until_epoch}, int($exp_ms/1000) + 90,
+       'AC-3: until_epoch = expiry + refresh grace (self-resuming pause)');
 
     # No-poll assertion: inject an http_get that dies if called
     my $poll_called = 0;

@@ -78,7 +78,17 @@ my $USER_AGENT = $ENV{BP_USER_AGENT} // 'claude-code/2.1.170';
 # The verdict path uses the $t tunables injected by run().
 my $SOFT5   = defined $ENV{BP_KGS_SOFT_5H}       ? $ENV{BP_KGS_SOFT_5H} + 0       : 80;
 my $SOFT7   = defined $ENV{BP_KGS_SOFT_7D}       ? $ENV{BP_KGS_SOFT_7D} + 0       : 85;
-my $FLOOR_H = defined $ENV{BP_KGS_TOKEN_FLOOR_H} ? $ENV{BP_KGS_TOKEN_FLOOR_H} + 0 : 1;
+# Default floor: 10 MINUTES, not 1 hour. Operator decision (2026-08-12).
+# A 1-hour floor parked runs for an hour of perfectly usable token life on the
+# theory that nothing can refresh in-session. The pause is now a TIMED WAIT that
+# resumes by itself (see verdict_decision), so the floor only needs to cover the
+# refresh itself — 10 minutes does that without throwing away the other 50.
+use constant TOKEN_FLOOR_DEFAULT_H => 10 / 60;
+# Seconds past token expiry before a token-pause wakes. The refresh happens at
+# or before expiry; the margin absorbs clock skew between this host and the
+# issuer, which is why it is not zero.
+use constant TOKEN_REFRESH_GRACE_S => 90;
+my $FLOOR_H = defined $ENV{BP_KGS_TOKEN_FLOOR_H} ? $ENV{BP_KGS_TOKEN_FLOOR_H} + 0 : TOKEN_FLOOR_DEFAULT_H;
 
 # ---------------------------------------------------------------------------
 # verdict_decision — PURE: no I/O, no network, no exit. Deterministic.
@@ -99,12 +109,29 @@ sub verdict_decision {
         return { action => 'unavailable', until_epoch => undef, reason => 'creds' };
     }
 
-    # (2) Token floor → pause-token (BEFORE poll; no refresh in-session)
+    # (2) Token floor → pause-token, as a TIMED WAIT that resumes by itself.
+    #
+    # This used to return until_epoch => undef, which every consumer reads as a
+    # hard-stop relogin park: the run halted and stayed halted until a human
+    # noticed and re-authenticated. That was wrong in the common case. The
+    # access token is refreshed for us (Claude Code holds a refreshToken); the
+    # floor exists to avoid starting work that would die MID-FLIGHT, not to
+    # demand human intervention.
+    #
+    # So the pause now carries a wake time — expiry plus a grace margin, by
+    # which point the refresh has happened — and the consumer waits and then
+    # continues normally, with nobody asked to do anything. A run that pauses
+    # here should be a blip in a log, not the end of the session.
     if (defined $creds->{expires_ms}) {
         my $state = BpGovern::refresh_state($creds->{expires_ms}, $now * 1000,
                                              $t->{floor_h}, undef);
         if ($state eq 'pause-floor') {
-            return { action => 'pause-token', until_epoch => undef, reason => 'token' };
+            my $wake = int($creds->{expires_ms} / 1000) + TOKEN_REFRESH_GRACE_S;
+            # Never hand back a wake time already in the past: expiry may have
+            # passed while we were deciding, and a past wake makes a waiting
+            # consumer spin. Floor it just ahead of now.
+            $wake = $now + TOKEN_REFRESH_GRACE_S if $wake <= $now;
+            return { action => 'pause-token', until_epoch => $wake, reason => 'token' };
         }
     }
 
@@ -231,7 +258,7 @@ END_HELP
             ceil5   => defined $ENV{BP_KGS_SOFT_5H}       ? $ENV{BP_KGS_SOFT_5H} + 0       : 80,
             ceil7   => defined $ENV{BP_KGS_SOFT_7D}       ? $ENV{BP_KGS_SOFT_7D} + 0       : 85,
             drain   => 600,
-            floor_h => defined $ENV{BP_KGS_TOKEN_FLOOR_H} ? $ENV{BP_KGS_TOKEN_FLOOR_H} + 0 : 1,
+            floor_h => defined $ENV{BP_KGS_TOKEN_FLOOR_H} ? $ENV{BP_KGS_TOKEN_FLOOR_H} + 0 : TOKEN_FLOOR_DEFAULT_H,
             jit_lo  => 0,
             jit_hi  => 0,
             rand    => $rand_fn,

@@ -236,7 +236,19 @@ sub verdict_to_action {
     } elsif ($act eq 'pause-usage') {
         return { action => 'pause', reason => 'usage', until_epoch => $verdict->{until_epoch} };
     } elsif ($act eq 'pause-token') {
-        return { action => 'pause', reason => 'token', until_epoch => undef };
+        # DRIVE-SOLO DOES NOT STOP FOR TOKEN EXPIRY. Operator decision
+        # (2026-08-12): the token floor is a safeguard for the UNATTENDED fleet,
+        # where a mid-flight death strands headless coordinators nobody is
+        # watching. Solo is different in the way that matters — a human is in
+        # the session, the work is committed incrementally, and the access token
+        # is refreshed underneath us. Parking here bought no safety and cost the
+        # whole session, which had to be restarted by hand afterwards.
+        #
+        # This is deliberately NOT a shorter pause. It is no pause: solo
+        # proceeds and lets the refresh happen underneath it. The fleet path
+        # (bp-orchestrator.pl) still honours pause-token, and that verdict now
+        # carries an until_epoch so even there it resumes without a human.
+        return { ok => 1 };
     } else {
         # unavailable or unknown
         return { unavailable => 1 };
