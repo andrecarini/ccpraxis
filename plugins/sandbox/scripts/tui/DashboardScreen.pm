@@ -827,18 +827,76 @@ sub panels {
         push @out, { title => 'Token', lines => _token_body($state->{tokens}) };
     }
 
+    # RESOURCES IS ALWAYS PRESENT, for the same reason the geometry is fixed.
+    #
+    # The sampler is a DETACHED process: it starts as the dashboard opens and
+    # writes its first snapshot seconds later. While the key was undef the panel
+    # did not exist, so it appeared mid-session and pushed every panel after it
+    # down -- a scheduled, guaranteed reflow a few seconds into every launch,
+    # and a direct contributor to the screen not settling.
+    #
+    # Reserving it costs nothing when data never arrives (the sampler failed to
+    # fork, say) and it states that outright rather than vanishing.
     if (ref($state->{resources}) eq 'HASH') {
         push @out, { title => 'Resources', lines => _resources_body($state->{resources}), min_cols => tui::Meter::min_width() };
+    } else {
+        push @out, { title => "Resources",
+                     lines => [ row({ label => "snapshot", value => "sampling - no reading yet",
+                                      role => "text.muted", force => 1 }) ],
+                     min_cols => tui::Meter::min_width() };
     }
 
+    # SPEND IS ALWAYS PRESENT. It used to be omitted whenever no snapshot had
+    # been read, which is ALWAYS -- the fleet writes its spend figures to its
+    # own log and returns them in-process, and has never persisted the
+    # runs/spend.json this reads. So a panel the operator relied on had silently
+    # not existed for the life of the feature, and its absence was
+    # indistinguishable from "this launch has no runs".
+    #
+    # Absent-vs-empty was a real decision (never fabricate a zero) and it is
+    # kept: what changes is that "we have no figures" is now SAID, in the panel,
+    # instead of being expressed by the panel not being there. A missing panel
+    # is not an honest absence -- it is no statement at all.
     if (ref($state->{spend}) eq 'HASH') {
         push @out, { title => 'Spend', lines => _spend_body($state->{spend}, $cols), min_cols => tui::Meter::min_width() };
+    } else {
+        push @out, { title => "Spend", lines => _spend_unavailable_body($state), min_cols => tui::Meter::min_width() };
     }
 
+    # Recent activity is the FLEX panel (tui::Screen H6) and is always last.
+    #
+    # It absorbs the body height the other panels do not use, which does two
+    # things at once: the screen stops being mostly empty, and -- because the
+    # panel's height no longer tracks its content -- a newly-arrived event fills
+    # a row that was already reserved instead of growing the panel and reflowing
+    # everything around it. Activity is the right panel to carry this: it is
+    # already the scrolling one, it is always last, and state.events supplies
+    # far more rows than fit, so extra height is always spent on real content.
     my $ev = (ref($state->{events}) eq 'ARRAY') ? $state->{events} : [];
-    push @out, { title => 'Recent activity', lines => (@$ev ? [ @$ev ] : [ '(no events yet)' ]) };
+    push @out, { title => 'Recent activity',
+                 lines => (@$ev ? [ @$ev ] : [ '(no events yet)' ]),
+                 flex  => 1 };
 
     return \@out;
+}
+
+# _spend_unavailable_body(\%state) -> \@lines
+# What the Spend panel says when no snapshot has been read. Names the reason
+# rather than showing blank rows or zeroes -- an operator must be able to tell
+# "nothing has spent anything" from "nobody has told me".
+sub _spend_unavailable_body {
+    my ($state) = @_;
+    my @runs = (ref($state->{runs}) eq 'ARRAY') ? @{ $state->{runs} } : ();
+    my $active = grep { ref($_) eq 'HASH' && defined($_->{state})
+                        && ($_->{state} eq 'running' || $_->{state} eq 'paused') } @runs;
+    return [
+        row({ label => 'claude', value => 'no snapshot', role => 'text.muted', force => 1 }),
+        row({ label => 'go',     value => 'no snapshot', role => 'text.muted', force => 1 }),
+        row({ label => 'zen',    value => 'no snapshot', role => 'text.muted', force => 1 }),
+        [ { text => ($active ? '  a run is active but has not written runs/spend.json yet'
+                             : '  no active run to report spend for'),
+            role => 'text.faint' } ],
+    ];
 }
 
 # ===========================================================================

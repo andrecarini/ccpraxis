@@ -109,24 +109,136 @@ sub _join_row_cells {
 # @panels via tui::Layout::place, rendering each band row's lines as joined
 # cells (padding the shorter bands with blank cells), emitted in order until
 # $body_height is exhausted. PRIVATE.
+# _place_and_render(\@panels, $cols, $body_height) -> @cells
+#
+# FLEX (H6). Every panel used to render at its NATURAL content height, and
+# whatever body height was left over became blank padding at the bottom of the
+# screen. That single decision produced both of the operator's complaints about
+# the dashboard, and they are the same defect seen twice:
+#
+#   * WASTED SPACE. A 55-row terminal drew ~15 rows of content and ~35 rows of
+#     nothing. "Look at all the empty space."
+#
+#   * A SCREEN THAT WOULD NOT SIT STILL. Because every panel's height was its
+#     content's height, ANY content change moved everything after it. In the
+#     first seconds of a launch the activity log is being actively written --
+#     launch_start, image_build, container_create, manager_ready all land within
+#     a few seconds -- so the activity panel grew a row at a time and the whole
+#     frame reflowed on each one. "Characters jumping around, many seconds until
+#     it settled."
+#
+# A panel marked `flex => 1` absorbs the leftover rows instead. Its band is
+# pinned to the height the terminal actually offers, so the space is used AND
+# the geometry stops depending on how much content has arrived yet -- new events
+# fill a row that was already reserved rather than pushing the layout around.
+#
+# Only the FIRST flex panel's band expands. Splitting slack across several would
+# reintroduce exactly the coupling this removes: each band's height would again
+# depend on the others' content.
+# flex_reserve($body_height) -> rows held back for the flex band.
+#
+# PUBLIC and pure, and public for a specific reason: Dashboard::activity_capacity
+# independently predicts how many activity rows will fit, and the launcher's
+# scroll arithmetic is driven by that prediction. If the reservation were a
+# literal in this file and a second literal there, the two would agree only
+# until one of them changed -- which is the exact class of duplication this
+# session has spent its time removing. One function, two callers.
+#
+# Title plus a few content rows: below this the panel says nothing useful and
+# the space is better spent above. Never more than half the body, so a short
+# terminal degrades by sharing rather than by starving the top.
+sub flex_reserve {
+    my ($body_height) = @_;
+    return 0 if !defined $body_height || ref($body_height)
+             || $body_height !~ /^-?\d+(?:\.\d+)?$/ || $body_height < 1;
+    my $reserve = 4;
+    my $half = int($body_height / 2);
+    $reserve = $half if $reserve > $half;
+    return $reserve < 1 ? 0 : $reserve;
+}
+
 sub _place_and_render {
     my ($panels, $cols, $body_height) = @_;
     my @out;
     return @out if !defined $body_height || $body_height < 1 || !@$panels;
 
     my $band_rows = tui::Layout::place($panels, $cols);
-    for my $row (@$band_rows) {
-        last if @out >= $body_height;
-        my $remaining = $body_height - @out;
+
+    # Which band carries the flex panel, and how much must be held back for it.
+    #
+    # Without a reservation the flex panel can be squeezed out ENTIRELY: the
+    # bands above it render at natural height, and if they happen to consume the
+    # body the loop below simply stops before reaching it. That is not
+    # hypothetical -- it is what happens the moment the panels above gain a row,
+    # which is exactly the situation this whole mechanism exists to survive. A
+    # layout that drops its largest panel when something above it grows is worse
+    # than the reflow it replaced.
+    my $flex_band;
+    for my $i (0 .. $#$band_rows) {
+        next unless grep { ref($_->{panel}) eq 'HASH' && $_->{panel}{flex} } @{ $band_rows->[$i] };
+        $flex_band = $i;
+        last;
+    }
+    my $reserve = defined($flex_band) ? flex_reserve($body_height) : 0;
+
+    # Pass 1 -- natural heights, bounded by what is left (less the reservation,
+    # for the bands that precede the flex one).
+    my @bands;
+    my $used = 0;
+    for my $i (0 .. $#$band_rows) {
+        my $row = $band_rows->[$i];
+        my $pre_flex = (defined($flex_band) && $i < $flex_band) ? 1 : 0;
+        my $remaining = $body_height - $used;
+        $remaining -= $reserve if $pre_flex;
+
+        if ($remaining < 1) {
+            # A PRE-FLEX band that does not fit is SKIPPED, not a stopping
+            # point. Breaking out here would drop the flex band too, and with it
+            # the reservation that exists precisely to stop that happening --
+            # on a short terminal a tall Run panel would swallow the body and
+            # the activity panel would silently not exist. Bands after the flex
+            # one genuinely have nothing left, so those still end the loop.
+            next if $pre_flex;
+            last;
+        }
+
         my @rendered = map { [ _render_panel($_->{panel}, $_->{w}, $remaining) ] } @$row;
         my $h = 0;
         for my $r (@rendered) { $h = @$r if @$r > $h; }
+        push @bands, { row => $row, rendered => \@rendered, h => $h };
+        $used += $h;
+    }
+
+    # Pass 2 -- hand the slack to the first band that holds a flex panel, and
+    # re-render that band with the bigger budget so the panel can actually USE
+    # the rows rather than just be padded to them.
+    my $slack = $body_height - $used;
+    if ($slack > 0) {
+        my $fi;
+        for my $i (0 .. $#bands) {
+            next unless grep { ref($_->{panel}) eq 'HASH' && $_->{panel}{flex} } @{ $bands[$i]{row} };
+            $fi = $i;
+            last;
+        }
+        if (defined $fi) {
+            my $target = $bands[$fi]{h} + $slack;
+            $bands[$fi]{rendered} =
+                [ map { [ _render_panel($_->{panel}, $_->{w}, $target) ] } @{ $bands[$fi]{row} } ];
+            # Pin the band to $target even if its content came up short: the
+            # point is a geometry that does not move, so the shortfall is padded
+            # inside the band rather than left as slack that shifts later.
+            $bands[$fi]{h} = $target;
+        }
+    }
+
+    for my $band (@bands) {
+        my ($row, $rendered, $h) = @{$band}{qw(row rendered h)};
         for my $i (0 .. $h - 1) {
+            last if @out >= $body_height;
             my @cells;
             for my $j (0 .. $#$row) {
-                my $band = $row->[$j];
-                my $cell = $rendered[$j][$i];
-                $cell = tui::Frame::make_cell('', 'text.primary', $band->{w}) if !defined $cell;
+                my $cell = $rendered->[$j][$i];
+                $cell = tui::Frame::make_cell('', 'text.primary', $row->[$j]{w}) if !defined $cell;
                 push @cells, $cell;
             }
             push @out, _join_row_cells(@cells);

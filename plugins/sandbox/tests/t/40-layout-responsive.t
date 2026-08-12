@@ -738,7 +738,16 @@ for my $c (20, 40, 80, 100, 200) {
 # ---------------------------------------------------------------------------
 sub _ac11_expect {
     my ($state, $r, $c) = @_;
-    my $raw = $r - 2 - Dashboard::_fixed_region_height($state, $c) - 1;
+    my $body = $r - 2;
+    my $raw  = $body - Dashboard::_fixed_region_height($state, $c) - 1;
+    # The Activity panel is tui::Screen's FLEX band and is guaranteed a
+    # reservation the fixed region cannot eat, so the old
+    # "clamped at 0" floor is now the flex floor. Still DERIVED -- read from
+    # tui::Screen rather than restated -- for the same reason the fixed-region
+    # term is: a literal here would agree with the renderer only until one of
+    # them changed.
+    my $floor = tui::Screen::flex_reserve($body) - 1;   # -1 = the panel title
+    $raw = $floor if $raw < $floor;
     return $raw > 0 ? $raw : 0;
 }
 

@@ -2440,6 +2440,19 @@ sub activity_capacity {
     my $body_h = $rows - 2 - $alerts;             # 2 = title + footer
     my $fixed  = _fixed_region_height($state, $cols);
     my $cap = $body_h - $fixed - 1;               # -1 = Activity panel title
+
+    # The Activity panel is tui::Screen's FLEX band, so it is guaranteed a
+    # reservation the fixed region cannot eat. Without this floor, capacity
+    # under-reports on a short terminal (or one with a tall Run panel) while
+    # compose_frame goes on rendering the reserved rows — and the launcher's
+    # scroll arithmetic runs off a number that disagrees with the screen.
+    #
+    # The reservation is READ from tui::Screen, never restated here. The
+    # comment above this function has always claimed it "agrees with what
+    # compose_frame actually renders"; a second copy of the constant is how
+    # that claim quietly stops being true.
+    my $floor = tui::Screen::flex_reserve($body_h) - 1;   # -1 = the panel title
+    $cap = $floor if $cap < $floor;
     return $cap > 0 ? $cap : 0;
 }
 

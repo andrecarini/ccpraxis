@@ -74,7 +74,14 @@ my $RULE_FILL_RE      = quotemeta(Theme::glyph('rule.h'));
 # ===========================================================================
 sub _cap_expect {
     my ($state, $r, $c) = @_;
-    my $raw = $r - 2 - Dashboard::_fixed_region_height($state, $c) - 1;
+    my $body = $r - 2;
+    my $raw  = $body - Dashboard::_fixed_region_height($state, $c) - 1;
+    # Flex floor -- see tui::Screen::flex_reserve. The Activity panel is the
+    # flex band, so it is guaranteed rows the fixed region cannot take; read
+    # the reservation rather than restating it, so this oracle cannot drift
+    # away from the renderer it claims to mirror.
+    my $floor = tui::Screen::flex_reserve($body) - 1;   # -1 = the panel title
+    $raw = $floor if $raw < $floor;
     return $raw > 0 ? $raw : 0;
 }
 
