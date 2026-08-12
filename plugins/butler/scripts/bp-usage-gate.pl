@@ -119,9 +119,20 @@ sub verdict_decision {
     # demand human intervention.
     #
     # So the pause now carries a wake time — expiry plus a grace margin, by
-    # which point the refresh has happened — and the consumer waits and then
-    # continues normally, with nobody asked to do anything. A run that pauses
-    # here should be a blip in a log, not the end of the session.
+    # which point the refresh has happened — and a consumer that waits can
+    # continue without anyone being asked to do anything.
+    #
+    # KNOW WHAT CONSUMES THIS, because it is not what an earlier version of this
+    # comment claimed. `bp-drive-next.pl` is the ONLY caller of this script; the
+    # fleet orchestrator does not read this gate at all — it governs the token
+    # through `bp-token-keeper.pl` instead. And drive-next no longer waits on
+    # pause-token: it attempts a refresh and either continues or stops.
+    #
+    # So `until_epoch` currently has NO consumer that sleeps on it. It is
+    # emitted because it is true and cheap, and because a future waiting
+    # consumer should not have to re-derive it — not because anything waits
+    # today. Do not write "the fleet resumes by itself" on the strength of this
+    # field; nothing in the fleet reads it.
     if (defined $creds->{expires_ms}) {
         my $state = BpGovern::refresh_state($creds->{expires_ms}, $now * 1000,
                                              $t->{floor_h}, undef);

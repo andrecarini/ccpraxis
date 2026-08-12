@@ -2199,7 +2199,7 @@ sub run {
                 if ($act eq 'pause-floor') {
                     _enter_pause_manual($runs, $log, 'token-floor',
                         { package => '_fleet', blueprint => $bp, kind => 'reauth',
-                          question => 'OAuth token crossed the 1h floor unrefreshed — re-authenticate with /login.',
+                          question => 'OAuth token crossed the refresh floor unrefreshed — re-authenticate with /login.',
                           context => 'token-keeper hit the pause-floor', created_at => $now });
                 } elsif ($act eq 'pause-auth') {
                     # LOUD divergence alert (hard requirement): a 4xx on the

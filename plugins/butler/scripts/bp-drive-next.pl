@@ -236,19 +236,24 @@ sub verdict_to_action {
     } elsif ($act eq 'pause-usage') {
         return { action => 'pause', reason => 'usage', until_epoch => $verdict->{until_epoch} };
     } elsif ($act eq 'pause-token') {
-        # DRIVE-SOLO DOES NOT STOP FOR TOKEN EXPIRY. Operator decision
-        # (2026-08-12): the token floor is a safeguard for the UNATTENDED fleet,
-        # where a mid-flight death strands headless coordinators nobody is
-        # watching. Solo is different in the way that matters — a human is in
-        # the session, the work is committed incrementally, and the access token
-        # is refreshed underneath us. Parking here bought no safety and cost the
-        # whole session, which had to be restarted by hand afterwards.
+        # DRIVE-SOLO DOES NOT PAUSE FOR TOKEN EXPIRY, but it does not ignore it
+        # either. Operator decision (2026-08-12).
         #
-        # This is deliberately NOT a shorter pause. It is no pause: solo
-        # proceeds and lets the refresh happen underneath it. The fleet path
-        # (bp-orchestrator.pl) still honours pause-token, and that verdict now
-        # carries an until_epoch so even there it resumes without a human.
-        return { ok => 1 };
+        # The token floor is a safeguard for the UNATTENDED fleet, where a
+        # mid-flight death strands headless coordinators nobody is watching.
+        # Solo is different in the way that matters: a human is in the session
+        # and the work is committed incrementally. Parking here bought no safety
+        # and cost the whole session, which then had to be picked up by hand --
+        # exactly the cost the floor was meant to avoid.
+        #
+        # So the caller does not pause and does not blindly proceed. It attempts
+        # a REFRESH (see _token_recover), and the outcome decides:
+        #   refreshed  -> carry on, nobody is told anything
+        #   failed     -> STOP cleanly: release the wake-lock, log the error
+        # The failure branch matters because the alternative is worse than a
+        # pause: proceeding on a dead token means the next API call 401s and the
+        # session dies mid-write, holding a wake-lock, with no record of why.
+        return { token_floor => 1 };
     } else {
         # unavailable or unknown
         return { unavailable => 1 };
@@ -449,6 +454,64 @@ sub keepawake_apply {
 }
 
 # ===========================================================================
+# TOKEN RECOVERY (operator decision 2026-08-12)
+# ===========================================================================
+#
+# When the governor reports the access token is under the floor, solo does not
+# park and wait for a human. It attempts the refresh ITSELF, using the refresh
+# token, and only stops if that genuinely fails.
+#
+# The refresh is not re-derived here. `bp-token-keeper.pl` already implements
+# it -- the OAuth token endpoint, the request shape, atomic write-back under
+# flock with a re-read stand-down, temp+rename, JSON validation, mode
+# preservation and 429 backoff. Re-implementing any of that would be a second,
+# less-tested writer for the credential store, which is the last file in the
+# system that should have two.
+#
+# Returns ($recovered, $detail). $detail is always a short human string; it goes
+# to the run log and, on failure, out in the action, so a run that stops for
+# this reason explains itself without anyone reading code.
+#
+# The `refresh` opt is the test seam. Production default calls the keeper.
+sub _token_recover {
+    my ($opts, $now) = @_;
+
+    if (my $fn = $opts->{refresh}) {
+        my $r = eval { $fn->($now) };
+        return (0, "refresh seam died: $@") if $@;
+        return (0, 'refresh seam returned nothing') unless ref $r eq 'HASH';
+        my $act = $r->{action} // '';
+        return (1, $act) if $act eq 'refreshed' || $act eq 'ok';
+        return (0, "keeper said '$act'" . (defined $r->{detail} && !ref $r->{detail}
+                                            ? ": $r->{detail}" : ''));
+    }
+
+    my $creds = $opts->{creds_path}
+             // ($ENV{BP_CREDS_PATH} || (($ENV{HOME} // $ENV{USERPROFILE} // '.')
+                                          . '/.claude/.credentials.json'));
+    return (0, "no credentials file at $creds") unless -f $creds;
+
+    my $keeper = "$DIR/bp-token-keeper.pl";
+    return (0, "token-keeper missing at $keeper") unless -f $keeper;
+
+    my $r = eval {
+        require $keeper;
+        BpKeeper::keeper_tick({ creds_path => $creds, now_ms => $now * 1000 });
+    };
+    return (0, "keeper_tick died: $@") if $@;
+    return (0, 'keeper_tick returned nothing') unless ref $r eq 'HASH';
+
+    my $act = $r->{action} // '';
+    # 'ok' means the keeper looked and the token did not need refreshing -- which
+    # can happen if it was refreshed between the governor's verdict and now.
+    # Treat it as recovered: re-checking would only race again.
+    return (1, $act) if $act eq 'refreshed' || $act eq 'ok';
+
+    my $d = $r->{detail};
+    return (0, "keeper said '$act'" . (defined $d && !ref $d ? ": $d" : ''));
+}
+
+# ===========================================================================
 # VERDICT RETRY / DEGRADE LOOP (wraps the verdict seam; §2.5 / Decision #14)
 # ===========================================================================
 
@@ -613,6 +676,25 @@ sub _cmd_next {
         # Blueprint not settled: fetch verdict + compute action
         my ($verdict, $degraded) = _fetch_verdict_with_retry($verdict_fn, $dsdir);
         my $mapped = verdict_to_action($verdict, $now);
+
+        # Token floor: try to recover it ourselves before deciding anything.
+        if ($mapped->{token_floor}) {
+            my ($recovered, $detail) = _token_recover($opts, $now);
+            if (!$recovered) {
+                # Terminal, and deliberately NOT a pause. A pause implies
+                # "resume later"; there is nothing to resume to until a human
+                # re-authenticates, and waiting would hold the wake-lock while
+                # achieving nothing. Release it and say why, once.
+                _append_run_log($dsdir,
+                    "ERROR token refresh failed — stopping. $detail");
+                my $action = { action => 'stop', reason => 'token-refresh-failed',
+                               detail => $detail };
+                print _encode_action($action), "\n";
+                keepawake_apply('settled', $dsdir, $opts);
+                return 0;
+            }
+            _append_run_log($dsdir, "token refreshed — continuing ($detail)");
+        }
 
         if ($mapped->{action} && $mapped->{action} eq 'pause') {
             my $until = $mapped->{until_epoch};

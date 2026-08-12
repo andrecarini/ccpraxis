@@ -304,23 +304,93 @@ sub capture_run {
     my $dsdir = "$data/.drive-solo"; make_path($dsdir);
     write_json("$dsdir/order.json", { order => ['bp-x'], recorded_at => $NOW });
 
+    # SOLO DOES NOT PAUSE FOR TOKEN EXPIRY (operator decision 2026-08-12,
+    # superseding Decision #15's terminal relogin park for the solo path only).
+    # It attempts the refresh itself and the outcome decides: refreshed ->
+    # carry on; failed -> stop cleanly, releasing the wake-lock. Never a pause,
+    # because a pause implies a resume that cannot happen without a human.
     my ($rc, $out) = capture_run(
         ['next', '--scope', 'bp-x'],
         { data_dir => $data,
-          verdict  => sub { { action=>'pause-token', until_epoch=>undef, reason=>'token' } } }
+          verdict  => sub { { action=>'pause-token', until_epoch=>undef, reason=>'token' } },
+          refresh  => sub { { action => 'refreshed' } } }
     );
-    # SOLO DOES NOT PAUSE FOR TOKEN EXPIRY (operator decision 2026-08-12,
-    # superseding Decision #15's terminal relogin park for the solo path only).
-    # The floor guards the UNATTENDED fleet against mid-flight death; solo has a
-    # human present and commits incrementally, so parking cost a whole session
-    # and bought nothing. The fleet path still honours pause-token.
     is($rc, 0, 'AC-4(pause-token): exits 0');
     chomp(my $line = $out);
     my $act = eval { $J->decode($line) };
     isnt($act->{action}, 'pause',
         'AC-4(pause-token): solo does NOT pause for token expiry');
     is($act->{action}, 'run-package',
-        'AC-4(pause-token): solo proceeds to the ready package instead');
+        'AC-4(pause-token): a successful refresh carries the run on');
+}
+
+{   # pause-token + FAILED refresh → stop, release the wake-lock, log the error
+    #
+    # This is the branch that matters. The alternative behaviours were both
+    # tried and both wrong: parking cost the whole session, and proceeding on a
+    # dead token means the next API call 401s and the run dies mid-write, still
+    # holding a wake-lock, with nothing in the log saying why.
+    my $data = tempdir(CLEANUP => 1);
+    make_bp_dir($data, 'bp-x', [{key=>'p1',status=>'pending',write_set=>'x/p1/'}]);
+    my $dsdir = "$data/.drive-solo"; make_path($dsdir);
+    write_json("$dsdir/order.json", { order => ['bp-x'], recorded_at => $NOW });
+
+    # A live wake-lock that the stop MUST release.
+    my $pid_f = "$dsdir/keepawake.pid";
+    open(my $pf, '>', $pid_f) or die $!; print $pf "424242\n"; close $pf;
+    my @killed;
+
+    my ($rc, $out) = capture_run(
+        ['next', '--scope', 'bp-x'],
+        { data_dir => $data,
+          verdict  => sub { { action=>'pause-token', until_epoch=>undef, reason=>'token' } },
+          refresh  => sub { { action => 'pause-auth', detail => 'refresh returned 400' } },
+          kill_pid => sub { push @killed, $_[0]; 1 },
+          powershell_available => sub { 1 } }
+    );
+    is($rc, 0, 'AC-4(token-refresh-failed): exits 0');
+    chomp(my $line = $out);
+    my $act = eval { $J->decode($line) };
+    is($act->{action}, 'stop',
+        'AC-4(token-refresh-failed): stops rather than pausing');
+    is($act->{reason}, 'token-refresh-failed',
+        'AC-4(token-refresh-failed): reason names the cause');
+    like($act->{detail} // '', qr/pause-auth/,
+        'AC-4(token-refresh-failed): detail carries the keeper verdict');
+    like($act->{detail} // '', qr/400/,
+        'AC-4(token-refresh-failed): detail carries the keeper detail');
+
+    is_deeply(\@killed, ['424242'],
+        'AC-4(token-refresh-failed): the wake-lock is released, not left held');
+    ok(!-e $pid_f,
+        'AC-4(token-refresh-failed): the keepawake pid file is cleared');
+
+    my $runlog = -e "$dsdir/run.md" ? do { open my $r,'<',"$dsdir/run.md"; local $/; <$r> } : '';
+    like($runlog, qr/ERROR token refresh failed/,
+        'AC-4(token-refresh-failed): the error is logged, not silent');
+}
+
+{   # pause-token + refresh seam that DIES → still a clean stop, never a crash.
+    # A refresh path that throws must not take the director down with it; the
+    # run has to end saying why.
+    my $data = tempdir(CLEANUP => 1);
+    make_bp_dir($data, 'bp-x', [{key=>'p1',status=>'pending',write_set=>'x/p1/'}]);
+    my $dsdir = "$data/.drive-solo"; make_path($dsdir);
+    write_json("$dsdir/order.json", { order => ['bp-x'], recorded_at => $NOW });
+
+    my ($rc, $out) = capture_run(
+        ['next', '--scope', 'bp-x'],
+        { data_dir => $data,
+          verdict  => sub { { action=>'pause-token', until_epoch=>undef, reason=>'token' } },
+          refresh  => sub { die "network unreachable\n" } }
+    );
+    is($rc, 0, 'AC-4(token-refresh-died): exits 0 rather than crashing');
+    chomp(my $line = $out);
+    my $act = eval { $J->decode($line) };
+    is($act->{action}, 'stop',
+        'AC-4(token-refresh-died): a dying refresh still stops cleanly');
+    like($act->{detail} // '', qr/network unreachable/,
+        'AC-4(token-refresh-died): the cause survives into the action');
 }
 
 {   # unavailable ×3 → degrade-and-proceed; counting fake asserts retry bound
@@ -501,11 +571,14 @@ sub capture_run {
     for my $ue (undef, $NOW + 600) {
         my $pt_v = BpDrive::verdict_to_action(
             { action=>'pause-token', until_epoch=>$ue }, $NOW);
-        ok($pt_v->{ok},
-            'AC-8/verdict: pause-token -> proceed in solo'
+        ok($pt_v->{token_floor},
+            'AC-8/verdict: pause-token -> token_floor (attempt recovery) in solo'
             . (defined $ue ? ' (timed-wait verdict)' : ' (legacy null verdict)'));
         ok(!exists $pt_v->{action},
             'AC-8/verdict: pause-token yields no pause action in solo'
+            . (defined $ue ? ' (timed-wait verdict)' : ' (legacy null verdict)'));
+        ok(!$pt_v->{ok},
+            'AC-8/verdict: pause-token is NOT a bare proceed — recovery is not optional'
             . (defined $ue ? ' (timed-wait verdict)' : ' (legacy null verdict)'));
     }
 
@@ -597,9 +670,15 @@ sub capture_run {
         my (undef,$out) = capture_run(
             ['next','--scope','bx'],
             { data_dir=>$data,
-              verdict=>sub{ {action=>'pause-token',until_epoch=>undef,reason=>'x'} } });
-        # Solo turns pause-token into forward progress, so the emitted shape is
-        # a run-package order, not a pause envelope (see AC-4).
+              verdict=>sub{ {action=>'pause-token',until_epoch=>undef,reason=>'x'} },
+              # The refresh seam is MANDATORY in any test that reaches the token
+              # floor. Without it _token_recover falls through to the production
+              # default, which loads the real bp-token-keeper.pl and POSTs the
+              # real refresh token from the real credential store. A unit test
+              # must never touch the user's live credentials.
+              refresh=>sub{ {action=>'refreshed'} } });
+        # Solo turns a recovered token floor into forward progress, so the
+        # emitted shape is a run-package order, not a pause envelope (see AC-4).
         my $d = assert_json_shape('pause-token', $out, ['action']);
         is($d->{action}, 'run-package',
             'AC-9(pause-token): solo emits a run-package order, not a pause');
