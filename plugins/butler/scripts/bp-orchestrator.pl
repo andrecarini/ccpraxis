@@ -61,6 +61,7 @@ require "$DIR/bp-spend.pl";        # b47: BpSpend::fetch/write_snapshot -- the S
                                    # missing file is a startup error rather than a per-tick eval
                                    # failure logged once every interval and otherwise invisible.
 require "$DIR/bp-checkpoint.pl";   # b02: durable WIP checkpoint commits
+require "$DIR/bp-write-guard.pl";  # a01: BpWrite::guarded_write -- lock/re-read/read-back
 
 our $USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
 our $USER_AGENT = $ENV{BP_USER_AGENT} // 'claude-code/2.1.170';
@@ -70,6 +71,33 @@ our $USER_AGENT = $ENV{BP_USER_AGENT} // 'claude-code/2.1.170';
 # injected launch closure (tests/simulation) never sets it, so the broken-env
 # decision falls back to a documented literal. Cleared at the start of every run().
 our $LAST_EXEC_ERROR;
+
+# a01 §8 seam: every coordinator-liveness check reachable from the write guards
+# routes through this, defaulting to \&pid_alive, so a test can make "the
+# coordinator is alive" deterministic without spawning a process.
+our $PID_ALIVE_FN;
+
+# a01 §8: package-scoped kind -> refusal-status-set table consulted by
+# queue_needs_you (S2). Default-permit: a kind absent from this table is ALWAYS
+# queued regardless of status (Decision 5 -- unknown kinds are never silenced).
+# 'stuck-package' refuses only 'done'/'dropped' ("delivered", Decision 14) --
+# NOT 'blocked'/'parked', which is what _block_and_queue itself sets before
+# queuing (edge case 1: it must never refuse its own escalation).
+our %DECISION_VALIDITY = ( 'stuck-package' => ['done', 'dropped'] );
+
+# fixbatch step7 / BLOCKER 2: bare pid_alive() is not evidence of a LIVE
+# coordinator -- pids recycle, and registry `pid` is set once at launch and
+# never cleared for a coordinator that exits non-terminally (the only clearer,
+# bp-lifecycle.pl, only fires for already-TERMINAL packages and is outside this
+# write set). Corroborate with `launched_at` (written by bp-launch.sh alongside
+# `pid`, spec §2.6): a pid that is nominally "alive" but whose coordinator was
+# launched longer ago than any real coordinator run has ever taken is far more
+# likely a recycled pid than a genuinely long-running process, and refusing
+# forever on that is worse than the narrow risk of proceeding. Fixtures that
+# predate `launched_at` (no such key) keep today's conservative behavior --
+# still refuse -- so this narrows false-positives without weakening the
+# existing (tested) coordinator-alive contract. Overridable for ops tuning.
+our $COORDINATOR_MAX_RUNTIME_SECS = $ENV{BP_COORDINATOR_MAX_RUNTIME_SECS} || (24 * 3600);
 
 # ===========================================================================
 # PURE DECISIONS  (no I/O, no globals — unit-tested in t/06-orchestrator.t)
@@ -1269,36 +1297,16 @@ sub clear_pause { my ($runs) = @_; unlink "$runs/.paused"; }
 # --- runs/needs-you/<pkg>--<shortid>.json (decision queue; A3 owns the schema).
 # Returns the decision file path on success (existing one when deduped), 0 on any
 # mkdir/write/rename failure (never dies — see _escalation_write_failed).
-sub queue_needs_you {
-    my ($runs, $rec) = @_;
-    my $dir = "$runs/needs-you";
-    # make_path croaks on failure (read-only / full runs/) — never let that escape.
-    unless (-d $dir) {
-        require File::Path;
-        eval { File::Path::make_path($dir); 1 }
-            or return _escalation_write_failed($runs, 'queue_needs_you(mkdir)', $dir, ($@ || $!));
-        return _escalation_write_failed($runs, 'queue_needs_you(mkdir)', $dir, $!) unless -d $dir;
-    }
-    # dedupe: don't re-queue the same package+kind every tick.
-    if (opendir my $dh, $dir) {
-        for my $f (grep { /\.json$/ } readdir $dh) {
-            my $ex = _read_json("$dir/$f");
-            next unless ref $ex eq 'HASH';
-            if (($ex->{package} // '') eq ($rec->{package} // '')
-             && ($ex->{kind}    // '') eq ($rec->{kind}    // '')) {
-                closedir $dh; return "$dir/$f";
-            }
-        }
-        closedir $dh;
-    }
+# the raw temp+rename publish, unchanged from the pre-a01 shape (atomic: temp in
+# the same dir + rename, so the A7 bp-wait-for-decision watcher never reads a
+# half-written queue file). Factored out so both the direct path (kind not in
+# %DECISION_VALIDITY) and the guarded path (kind IS in the table, called from
+# INSIDE guarded_write's own `mutate`, i.e. still under the ledger's lock) share
+# one writer.
+sub _queue_needs_you_write {
+    my ($runs, $dir, $rec) = @_;
     my $sid = substr(sprintf('%x%x', ($rec->{created_at} // time), $$), 0, 10);
     my $file = "$dir/$rec->{package}--$sid.json";
-    # Atomic publish (temp in the same dir + rename) so the A7 bp-wait-for-decision
-    # watcher — which polls this dir — never reads a half-written queue file. The
-    # target name is always fresh+unique (the dedupe above returns early when a
-    # package+kind entry already exists), so the rename never clobbers and is
-    # atomic on both POSIX and Windows. Matches the temp+rename discipline every
-    # other writer here uses (ledgers, registry, judge verdicts).
     my $tmp = "$file.tmp.$$";
     open my $fh, '>', $tmp
         or return _escalation_write_failed($runs, 'queue_needs_you', $tmp, $!);
@@ -1315,6 +1323,108 @@ sub queue_needs_you {
         return _escalation_write_failed($runs, 'queue_needs_you(rename)', $file, $e);
     }
     return $file;
+}
+
+# a01/S2: before committing a decision, re-read the TARGET PACKAGE's ledger status
+# under the ledger's own lock (`<bpdir>/packages/<pkg>.md.lock` -- the same lock
+# name bp-ledger.pl::run_op uses, so the orchestrator and bp-ledger.pl serialise
+# against each other rather than each holding a private lock, spec §5 edge case 5)
+# immediately before publishing the decision file. Refusal is per-KIND
+# (%DECISION_VALIDITY), default-permit: a kind absent from the table is ALWAYS
+# queued regardless of status (Decision 5 -- never silence an unlisted escalation).
+#
+# Implementation note: this uses BpWrite::guarded_write ONCE, locking the LEDGER
+# (not the decision file) -- the decision file's own write happens as a side
+# effect INSIDE `mutate`, which runs under that same lock, after `valid` has
+# already refused a stale world. A second, nested guarded_write on the decision
+# file itself is deliberately not used: nesting is refused by design (AC7), and
+# there is nothing here that needs its OWN separate lock/re-read/read-back --
+# the decision-file write is a plain atomic temp+rename, as it always was.
+# `mutate` always returns the ledger's own bytes unchanged, so guarded_write's
+# short-circuit ("new eq state -> unchanged") fires and the ledger itself is
+# never rewritten by this call.
+sub queue_needs_you {
+    my ($runs, $rec, $bpdir, $force) = @_;
+    $bpdir //= dirname($runs);
+    my $dir = "$runs/needs-you";
+    # make_path croaks on failure (read-only / full runs/) — never let that escape.
+    unless (-d $dir) {
+        require File::Path;
+        eval { File::Path::make_path($dir); 1 }
+            or return _escalation_write_failed($runs, 'queue_needs_you(mkdir)', $dir, ($@ || $!));
+        return _escalation_write_failed($runs, 'queue_needs_you(mkdir)', $dir, $!) unless -d $dir;
+    }
+    # dedupe: don't re-queue the same package+kind every tick. Unchanged --
+    # still short-circuits before any locking (spec behavior 23).
+    if (opendir my $dh, $dir) {
+        for my $f (grep { /\.json$/ } readdir $dh) {
+            my $ex = _read_json("$dir/$f");
+            next unless ref $ex eq 'HASH';
+            if (($ex->{package} // '') eq ($rec->{package} // '')
+             && ($ex->{kind}    // '') eq ($rec->{kind}    // '')) {
+                closedir $dh; return "$dir/$f";
+            }
+        }
+        closedir $dh;
+    }
+
+    my $kind = $rec->{kind} // '';
+    my $refusal_set = (%DECISION_VALIDITY && ref $DECISION_VALIDITY{$kind} eq 'ARRAY')
+                     ? $DECISION_VALIDITY{$kind} : undef;
+    unless ($refusal_set) {
+        # unlisted kind (or an empty/undefined table): default-permit, no gate at all.
+        return _queue_needs_you_write($runs, $dir, $rec);
+    }
+    if ($force) {
+        # fixbatch step7 / MAJOR 6: the caller already knows its own ledger write
+        # was lost (e.g. _block_and_queue's lock-timeout) -- re-reading that SAME
+        # ledger here to decide whether to deliver would gate the escalation on
+        # the very write that just failed, silencing it entirely. Skip the gate.
+        _log("$runs/orchestrator.log", 'escalation_forced', { package => $rec->{package}, kind => $kind,
+              reason => 'caller-observed ledger write loss; gate bypassed to guarantee delivery' });
+        return _queue_needs_you_write($runs, $dir, $rec);
+    }
+    my %refuse = map { $_ => 1 } @$refusal_set;
+    my $pkg    = $rec->{package};
+    my $ledger = "$bpdir/packages/$pkg.md";
+    my $log    = "$runs/orchestrator.log";
+    # The lock file lives beside the ledger (spec §5 edge case 5); make sure that
+    # directory exists so a genuinely missing ledger degrades to "unreadable"
+    # (handled below, queues anyway) rather than an unrelated lock-open failure.
+    # A no-op in every real deployment, where packages/ already holds the ledger.
+    unless (-d "$bpdir/packages") {
+        require File::Path;
+        eval { File::Path::make_path("$bpdir/packages") };
+    }
+    my $wrote;
+    BpWrite::guarded_write({
+        site  => 'queue_needs_you',
+        path  => $ledger,
+        log   => $log,
+        valid => sub {
+            my ($txt) = @_;
+            # Unreadable/missing ledger: uncertainty resolves toward DELIVERY, not
+            # silence (Decision 6, applied to escalations per spec §5 edge case 10)
+            # -- never refuse here; `mutate` records the degradation instead.
+            return undef unless defined $txt;
+            return undef unless $txt =~ /^status:\s*(\S+)/m;
+            my $status = $1;
+            return "target-status:$status" if $refuse{$status};
+            return undef;
+        },
+        mutate => sub {
+            my ($txt) = @_;
+            unless (defined $txt) {
+                _log($log, 'validity_unknown', { package => $pkg, kind => $kind,
+                      reason => 'ledger unreadable or missing frontmatter; queuing anyway '
+                              . '(uncertainty resolves toward delivery, never toward silence)' });
+            }
+            $wrote = _queue_needs_you_write($runs, $dir, $rec);
+            my $bytes = defined $txt ? $txt : '';
+            return ($bytes, undef);   # never actually rewrites the ledger (byte-identical)
+        },
+    });
+    return $wrote // 0;
 }
 
 # --- packages that currently have a queued needs-you decision (any kind). Used to
@@ -1346,23 +1456,47 @@ sub update_registry_pkg {
     my ($runs, $pkg, $fields) = @_;
     require File::Path; File::Path::make_path($runs) unless -d $runs;
     my $reg = "$runs/registry.json";
-    open my $lk, '>', "$runs/registry.lock" or return 0;
-    unless (flock($lk, LOCK_EX)) { close $lk; return 0; }
-    my $data = _read_json($reg);
-    $data = { packages => {} } unless ref $data eq 'HASH' && ref $data->{packages} eq 'HASH';
-    $data->{packages}{$pkg} = { %{ $data->{packages}{$pkg} || {} }, %$fields };
-    my $tmp = "$reg.tmp.$$";
-    my $ok = 0;
-    if (open my $w, '>', $tmp) {
-        print $w JSON::PP->new->canonical->pretty->encode($data);
-        close $w;
-        # Honest result: a failed rename means the update was LOST (a cap counter
-        # increment, a harvest=pass) — return 0 so the caller can log/react rather
-        # than silently bypassing resolve_cap / corrective_cap on the next tick (H1).
-        if (rename $tmp, $reg) { $ok = 1; } else { unlink $tmp; }
-    }
-    flock($lk, LOCK_UN); close $lk;
-    return $ok;
+    # a01/S1b: goes through BpWrite::guarded_write. Keeps the SAME lock file the
+    # shell side (bp-lib.sh registry_merge) uses -- decoupled from `path` via an
+    # explicit lock_path (spec §5 edge case 5) -- and gains the read-back this site
+    # was missing (the scout's S1b finding: "the lock is released BEFORE the write
+    # is confirmed on disk"). Contract unchanged: 1/0 (0 now additionally covers
+    # refused/lock-timeout/readback-failed; detail in $BpWrite::LAST_RESULT).
+    # BLOCKER 1 (fixbatch step7): the old `read`/`mutate` pair here FABRICATED an
+    # empty registry (`'{"packages":{}}'`) whenever the real pre-state could not be
+    # obtained -- `read` on a failed open, `mutate` on a failed decode (e.g. a
+    # Notepad-added UTF-8 BOM, or a transient sharing-violation open failure). The
+    # mutation was then computed against that fiction and the read-back compared
+    # the file to the mutation's OWN output, so it passed by construction: every
+    # OTHER package's fields were silently wiped while the guard reported
+    # ok=1/outcome=written. ABSENT (the file genuinely doesn't exist yet -- a brand
+    # new blueprint) is legitimate and must proceed; UNREADABLE/UNDECODABLE is not
+    # and must refuse rather than wipe.
+    my $r = BpWrite::guarded_write({
+        site      => 'update_registry_pkg',
+        path      => $reg,
+        lock_path => "$runs/registry.lock",
+        log       => "$runs/orchestrator.log",
+        read      => sub {
+            my ($p) = @_;
+            return _read_file($p);   # undef on either absence or open failure; `valid` tells them apart
+        },
+        valid => sub {
+            my ($txt) = @_;
+            return undef unless -e $reg;   # genuinely absent -> fine; `mutate` starts a fresh registry
+            return 'registry-unreadable' unless defined $txt;
+            return 'registry-undecodable' unless eval { JSON::PP->new->decode($txt); 1 };
+            return undef;
+        },
+        mutate => sub {
+            my ($txt) = @_;
+            my $data = (defined $txt && length $txt) ? eval { JSON::PP->new->decode($txt) } : undef;
+            $data = { packages => {} } unless ref $data eq 'HASH' && ref $data->{packages} eq 'HASH';
+            $data->{packages}{$pkg} = { %{ $data->{packages}{$pkg} || {} }, %$fields };
+            return (JSON::PP->new->canonical->pretty->encode($data), undef);
+        },
+    });
+    return ($r->{ok} && ($r->{outcome} eq 'written' || $r->{outcome} eq 'unchanged')) ? 1 : 0;
 }
 
 # update_registry_pkg + an honest log line when the merge was LOST (H1): the tick
@@ -1504,6 +1638,57 @@ sub archive_judge_verdict {
 # orchestrator restart (a judge fired before a crash isn't double-spawned and its
 # timeout is still honored) and is observable/testable. judge_inflight returns the
 # stored start-epoch (truthy) or undef.
+# a01/S4 (spec §3 behaviors 28-30): before WRITING a judge outcome (a judge-starved
+# decision + registry counter increments) off a death classification made earlier
+# this tick, re-read -- under `runs/<kind>/<pkg>.lock` -- the SAME two signals the
+# classification was made from: the inflight marker's epoch and whether a verdict
+# file has appeared since. `$classified_epoch` is what judge_inflight() returned
+# BEFORE clear_judge_inflight ran (the caller's own `$started`). Used purely as a
+# lock+re-read+refuse GATE (mutate returns the state unchanged, same shape as
+# _harvest_verdict_still_applies) -- MUST be called before this tick's own
+# clear_judge_inflight/clear_judge_verdict, or the re-read would see nothing to
+# compare against. Returns 1 if the outcome still applies, 0 if refused (logs a
+# write_guard event with reason `judge-state-moved`).
+#
+# HONEST LIMIT (fixbatch step7 / red-team MAJOR 5, reasoned not demonstrated): this
+# lock is released once THIS function returns. Every side effect the caller then
+# performs (kill_pid, clear_judge_inflight, archive_judge_verdict, update_registry_pkg,
+# queue_needs_you) runs AFTER the release, so the classic gate-then-act race is
+# narrowed (whole-tick -> gate-return-to-act) but not eliminated. Closing it fully
+# would mean folding every one of those side effects into this gate's own `mutate`
+# (the `queue_needs_you` S2 pattern), which is a substantially larger, riskier change
+# than this fix-batch's budget allows without jeopardizing the pinned t/98-100
+# oracle. Left open, and named here rather than only in the fix-batch report, per
+# the same "never leave the current shape while comments claim the window is
+# closed" instruction that flagged it. Also: this lock excludes nothing else in the
+# tree (grepped -- no other writer takes `runs/<kind>/<pkg>.lock`); its value is the
+# re-read, not mutual exclusion.
+sub _judge_outcome_still_applies {
+    my ($runs, $kind, $pkg, $classified_epoch, $log) = @_;
+    my $inflight_f = judge_inflight_path($runs, $kind, $pkg);
+    my $verdict_f  = judge_verdict_path($runs, $kind, $pkg);
+    my $r = BpWrite::guarded_write({
+        site      => "_judge_outcome_${kind}",
+        path      => $inflight_f,
+        lock_path => "$runs/$kind/$pkg.lock",
+        log       => $log,
+        valid     => sub {
+            my ($txt) = @_;
+            return 'judge-state-moved' if -e $verdict_f;   # a verdict landed since classification
+            my $epoch = (defined $txt && $txt =~ /^(\d+)/) ? $1 : undef;
+            if (defined $classified_epoch) {
+                return 'judge-state-moved' unless defined $epoch && $epoch == $classified_epoch;
+            }
+            return undef;
+        },
+        mutate => sub {
+            my ($txt) = @_;
+            return (defined $txt ? $txt : '', undef);   # never rewrites -- gate only
+        },
+    });
+    return $r->{ok} ? 1 : 0;
+}
+
 sub judge_inflight_path { my ($runs, $kind, $pkg) = @_; "$runs/$kind/$pkg.inflight" }
 sub judge_inflight {
     my ($runs, $kind, $pkg) = @_;
@@ -2217,7 +2402,13 @@ sub run {
                     # FRESH coordinator-retry budget and let the launch section relaunch
                     # it (reset to pending + attempt 0; the corrected ledger is read cold).
                     _log($log, 'resolve_relaunch', { package => $pkg, reason => $r->{reason}, mutated => $r->{mutated_files} });
-                    _set_ledger_status($bpdir, $pkg, 'pending');
+                    # fixbatch step7 / MAJOR 4: consume the return + pass `log` (not
+                    # `runs` -- this is an internal write, edge case 4 keeps the
+                    # liveness gate off for it) so a lock-timeout/io-error here is
+                    # observed and logged rather than a silent no-op.
+                    _log($log, 'ledger_status_lost', { package => $pkg, target => 'pending',
+                          reason => ($BpWrite::LAST_RESULT && $BpWrite::LAST_RESULT->{reason}) || '?' })
+                        unless _set_ledger_status($bpdir, $pkg, 'pending', { log => $log });
                     update_registry_pkg($runs, $pkg, { attempt => 0, status => 'pending' });
                     $status->{$pkg} = 'pending'; $att->{$pkg} = 0; $pid->{$pkg} = undef;
                 } else {
@@ -2287,6 +2478,17 @@ sub run {
                     if ($st eq 'done'
                         && effective_attempts($ra, $hs) < ($t->{harvest_reaudit_cap} // 0)
                         && !($jstate eq 'starved' && $hs >= 1)) {
+                        # fixbatch step7 / reviewer MAJOR-1: this widen/re-audit branch is
+                        # one of the five sites the spec named by line number for the S4
+                        # re-read gate (behaviors 28-29); it kills the judge pid, clears
+                        # inflight, archives/clears the verdict, bumps registry counters
+                        # and re-spawns a judge, off the SAME tick-start classification as
+                        # the two starvation-park branches below -- which already carry
+                        # this gate. Driver ruling (step7 dispatch): close it here too,
+                        # rather than leave the narrowing recorded only in rmw-audit.md.
+                        unless (_judge_outcome_still_applies($runs, 'harvest', $pkg, $started, $log)) {
+                            next;
+                        }
                         my $jpidf = judge_pid_path($runs, 'harvest', $pkg);
                         if (-f $jpidf) {
                             my ($jp2) = (_read_file($jpidf) // '') =~ /^(\d+)/;
@@ -2361,6 +2563,15 @@ sub run {
                     # complete either way) but only (a)'s wording may claim a second
                     # attempt / a widened budget.
                     if ($jstate eq 'starved' && $st eq 'done' && $hs >= 1) {
+                        # a01/S4: re-read, under the inflight lock, whether the death
+                        # classification this outcome is about to act on has since moved
+                        # (a fresh judge run reappeared, or a verdict landed) -- BEFORE
+                        # any kill/clear/queue side effect (spec behavior 28-29). `next`s
+                        # out of the whole per-package iteration on refusal so neither
+                        # this branch nor the first-starvation branch below can fire.
+                        unless (_judge_outcome_still_applies($runs, 'harvest', $pkg, $started, $log)) {
+                            next;
+                        }
                         # SECOND starvation of the same package: park the branch (#13's
                         # park-the-branch, never global-halt) with a decision that says
                         # the AUDIT did not complete — never that the package failed
@@ -2422,6 +2633,10 @@ sub run {
                         next;
                     }
                     if ($jstate eq 'starved' && $st eq 'done') {
+                        # a01/S4: same re-read gate as the second-starvation branch above.
+                        unless (_judge_outcome_still_applies($runs, 'harvest', $pkg, $started, $log)) {
+                            next;
+                        }
                         # FIRST starvation (hs == 0): no widen was ever attempted for
                         # this package — the widen guard above skipped it purely because
                         # the ordinary re-audit budget was already spent by earlier,
@@ -2494,6 +2709,14 @@ sub run {
                 # for the synthetic {_timeout=>1} sentinel — no backing file).
                 archive_judge_verdict($runs, 'harvest', $pkg, $now, $log);
                 clear_judge_verdict($runs, 'harvest', $pkg);
+                # a01/S3: re-read, under the ledger's own lock, whether the world the
+                # audit was fired against has since moved -- status left 'done', and
+                # last_updated no newer than the epoch captured in $started BEFORE
+                # clear_judge_inflight ran above (spec behavior 24). A refused verdict
+                # is STILL archived/cleared (already happened, above) and registry
+                # `harvest` is left '' (never set here) so a later tick re-audits the
+                # package rather than losing its audit (behavior 26).
+                next unless _harvest_verdict_still_applies($bpdir, $pkg, $started, $log);
                 my $hv = BpJudge::normalize_harvest($v);
                 if ($hv eq 'pass') {
                     update_registry_pkg($runs, $pkg, { harvest => 'pass', harvest_reaudit => 0,
@@ -2538,7 +2761,15 @@ sub run {
                         # the bad output are FLAGGED for re-verification, never auto-killed.
                         _log($log, 'harvest_reopen', { package => $pkg, verdict => $hv, corrective_attempts => $corr });
                         _apply_harvest_findings($bpdir, $pkg, $v);
-                        _set_ledger_status($bpdir, $pkg, 'pending');
+                        # fixbatch step7 / MAJOR 4: consume the return + pass `log`.
+                        # A dropped write here (lock-timeout/io-error) used to be
+                        # completely silent -- the registry below would still flip to
+                        # pending/harvest='' while the ledger (which _load_state
+                        # prefers) stayed 'done', so the next tick re-fires the audit
+                        # forever with zero corrective work ever performed.
+                        _log($log, 'ledger_status_lost', { package => $pkg, target => 'pending',
+                              reason => ($BpWrite::LAST_RESULT && $BpWrite::LAST_RESULT->{reason}) || '?' })
+                            unless _set_ledger_status($bpdir, $pkg, 'pending', { log => $log });
                         update_registry_pkg($runs, $pkg, { attempt => 0, status => 'pending', harvest => '', corrective_attempts => $corr + 1,
                             harvest_defer_blockers => '' });   # a corrective cycle must not carry a stale blocker list forward
                         $status->{$pkg} = 'pending'; $att->{$pkg} = 0; $pid->{$pkg} = undef;
@@ -3652,16 +3883,32 @@ sub remediation_step {
 
 sub _block_and_queue {
     my ($bpdir, $runs, $log, $bp, $pkg, $why, $now, $question, $kind) = @_;
-    _set_ledger_status($bpdir, $pkg, 'blocked');
+    # fixbatch step7 / MAJOR 4 + MAJOR 6: observe the ledger write's own return.
+    # A dropped write (lock-timeout/io-error) here used to be silent AND compound
+    # with queue_needs_you's own S2 gate (:1358-ish): registry still flips to
+    # 'blocked' below (different lock, different file, usually succeeds), but the
+    # ledger (which _load_state prefers) is left 'done' -- so the S2 gate, working
+    # correctly on its own terms, refuses `target-status:done` and NO decision is
+    # ever queued. Net: registry=blocked, ledger=done, queue=empty, the run
+    # idle-exits, and the human is never told. Demonstrated (red-team probe_compound.pl).
+    my $ledger_ok = _set_ledger_status($bpdir, $pkg, 'blocked', { log => $log });
+    _log($log, 'block_ledger_write_lost', { package => $pkg,
+          reason => ($BpWrite::LAST_RESULT && $BpWrite::LAST_RESULT->{reason}) || '?' })
+        unless $ledger_ok;
     # Also persist to the registry (H3): _load_state prefers the ledger, but if the
     # ledger write above failed, the registry is the fallback — without this a parked
     # package could re-enter the watchdog and re-escalate after an orchestrator restart.
     update_registry_pkg($runs, $pkg, { status => 'blocked' });
+    # `force => 1` when the ledger write above was lost: this call IS the human's
+    # only notification that the package is blocked, and it must never be silenced
+    # by a gate reading a ledger that this very function just failed to update --
+    # uncertainty resolves toward delivery here (the package's own stated rule,
+    # applied to the one path it previously missed).
     queue_needs_you($runs, {
         package => $pkg, blueprint => $bp, kind => ($kind // 'stuck-package'),
         question => ($question // "Package '$pkg' is blocked: $why. Re-scope, fix, or drop it?"),
         context => $why, created_at => ($now // time),
-    });
+    }, $bpdir, ($ledger_ok ? 0 : 1));
 }
 
 # escalation ladder gate (A5 #13): a package is stuck past the coordinator's own
@@ -3856,47 +4103,168 @@ sub write_conformance_channels {
     return $verdict;
 }
 
+# a01/S3 (spec §3 behaviors 24-27): re-read, UNDER THE LEDGER'S LOCK, whether a
+# harvest verdict's premise on disk has since moved -- (a) status is still 'done'
+# and (b) last_updated has not moved past the epoch the judge was fired against
+# ($started, captured by the caller BEFORE clear_judge_inflight ran). Uses
+# BpWrite::guarded_write purely as a lock+re-read+refuse GATE: `mutate` returns
+# the ledger's own bytes unchanged, so the primitive's own "new eq state ->
+# unchanged" short-circuit fires and the ledger is never rewritten by this call
+# (the real ledger write, if the verdict still applies, happens afterwards via
+# the ordinary _set_ledger_status call, itself separately guarded). Returns 1 if
+# the verdict still applies, 0 if refused (and reason `verdict-stale` was logged
+# as a write_guard event).
+#
+# HONEST LIMIT (fixbatch step7 / red-team MAJOR 5): same caveat as
+# _judge_outcome_still_applies above -- the lock releases when this gate returns,
+# and the caller's real side effects (_apply_harvest_findings, _set_ledger_status,
+# update_registry_pkg) run after that release. Narrowed, not eliminated; see that
+# function's header for the full accounting and why a full close is out of this
+# fix-batch's budget.
+sub _harvest_verdict_still_applies {
+    my ($bpdir, $pkg, $started, $log) = @_;
+    my $f = "$bpdir/packages/$pkg.md";
+    my $r = BpWrite::guarded_write({
+        site  => '_apply_harvest_findings',
+        path  => $f,
+        log   => $log,
+        valid => sub {
+            my ($txt) = @_;
+            return undef unless defined $txt;   # unreadable -> not this gate's call; let the write proceed
+            my ($status) = $txt =~ /^status:\s*(\S+)/m;
+            return 'verdict-stale' unless defined $status && $status eq 'done';
+            if (defined $started) {
+                my ($lu) = $txt =~ /^last_updated:\s*(\S+)/m;
+                my $lu_epoch = defined $lu ? BpGovern::iso_to_epoch($lu) : undef;
+                return 'verdict-stale' if defined $lu_epoch && $lu_epoch > $started;
+            }
+            return undef;
+        },
+        mutate => sub {
+            my ($txt) = @_;
+            my $bytes = defined $txt ? $txt : '';
+            return ($bytes, undef);   # never rewrites the ledger -- gate only
+        },
+    });
+    return $r->{ok} ? 1 : 0;
+}
+
 # write the harvest audit's findings into the ledger (A5 Q2) so the reopened
 # coordinator reads them on its corrective relaunch. Idempotent: replaces any prior
-# findings block. Best-effort (atomic temp + rename).
+# findings block.
+#
+# fixbatch step7 / MAJOR (reviewer) + MAJOR 3 (red-team): this used to be a plain
+# read-modify-write, unlocked, one line before the now-guarded _set_ledger_status
+# call on the SAME file (:2694/:2352-ish) -- demonstrated to lose its own findings
+# block under a lock held by a concurrent bp-ledger.pl op, and, in the other
+# interleaving, to make bp-ledger.pl's own new read-back falsely report "value did
+# not survive the write" for a write that actually landed. Routed through
+# BpWrite::guarded_write, the same lock a plain `bp-ledger.pl` op on this ledger
+# takes ("$f.lock", the default lock_path), so the two can never interleave.
 sub _apply_harvest_findings {
     my ($bpdir, $pkg, $verdict) = @_;
     my $f = "$bpdir/packages/$pkg.md";
-    my $txt = _read_file($f);
-    return unless defined $txt;
     my @fails  = (ref $verdict eq 'HASH' && ref $verdict->{failures} eq 'ARRAY') ? @{ $verdict->{failures} } : ();
     my $reason = (ref $verdict eq 'HASH' ? $verdict->{reason} : undef) // 'harvest audit failed';
-    $txt =~ s/\n*## Harvest findings \(re-verify\).*?(?=\n## |\z)//s;   # drop any prior block
-    my $sec = "\n\n## Harvest findings (re-verify)\n\n"
-            . "The independent harvest audit FAILED this package after it was reported done: $reason\n"
-            . "Address each finding, then re-run your own tests/review before reporting done again:\n\n"
-            . (@fails ? join("\n", map { "- $_" } @fails)
-                      : "- (no itemized failures recorded; re-verify every done-criterion against disk)")
-            . "\n";
-    $txt .= $sec;
-    open my $w, '>:raw', "$f.tmp.$$" or return;
-    print $w $txt; close $w;
-    rename "$f.tmp.$$", $f;
+    BpWrite::guarded_write({
+        site   => '_apply_harvest_findings',
+        path   => $f,
+        mutate => sub {
+            my ($txt) = @_;
+            return (undef, 'ledger unreadable or missing') unless defined $txt;
+            $txt =~ s/\n*## Harvest findings \(re-verify\).*?(?=\n## |\z)//s;   # drop any prior block
+            my $sec = "\n\n## Harvest findings (re-verify)\n\n"
+                    . "The independent harvest audit FAILED this package after it was reported done: $reason\n"
+                    . "Address each finding, then re-run your own tests/review before reporting done again:\n\n"
+                    . (@fails ? join("\n", map { "- $_" } @fails)
+                              : "- (no itemized failures recorded; re-verify every done-criterion against disk)")
+                    . "\n";
+            return ($txt . $sec, undef);
+        },
+    });
+    return;
 }
 
-# rewrite a ledger's frontmatter status: line (+ last_updated). Best-effort.
+# rewrite a ledger's frontmatter status: line (+ last_updated). a01: goes through
+# BpWrite::guarded_write (lock -> re-read -> mutate -> temp+rename -> read-back),
+# closing the drop-AND-force bug the source report named for this exact site (this
+# sub's old shape ignored a failed rename entirely). Returns 1 on `written`/
+# `unchanged`, 0 otherwise (io-error/refused/lock-timeout/readback-failed) --
+# ALL existing internal callers (:2220, :2541, :3655) are void context, so this
+# new return can never be misread as success by a caller that ignores it.
+#
+# %opt: `runs` enables the coordinator-liveness refusal (S1, spec §2.6) -- absent
+# `runs` means no liveness check, so the orchestrator writing its OWN packages'
+# ledgers (internal callers) never refuses itself (edge case 4). `supersede => 1`
+# skips the liveness check even when `runs` is given (the --action reset shape,
+# which already kills the coordinator before calling this -- bp-answer-decision.pl
+# :497). `log` overrides the default log path (`$runs/orchestrator.log`).
+# fixbatch step7: the coordinator-alive check factored out of _set_ledger_status's
+# `valid` closure so bp-answer-decision.pl can run it as a cheap, best-effort PRE-
+# check before it writes anything at all (see that script's header comment on the
+# ordering this enables). This is advisory only -- the AUTHORITATIVE check remains
+# the one still run under the ledger's own lock inside _set_ledger_status itself;
+# this just lets a caller avoid the "write the note, then discover the gate refuses
+# the status flip" half-applied shape in the common (non-racing) case.
+sub _coordinator_alive_refusal {
+    my ($runs, $pkg) = @_;
+    return undef unless defined $runs;
+    my $alive_fn = $PID_ALIVE_FN || \&pid_alive;
+    my $reg = _read_json("$runs/registry.json");
+    my $pkgreg = (ref $reg eq 'HASH') ? $reg->{packages}{$pkg} : undef;
+    my $cpid = (ref $pkgreg eq 'HASH') ? $pkgreg->{pid} : undef;
+    if ($alive_fn->($cpid)) {
+        my $launched_at = (ref $pkgreg eq 'HASH') ? $pkgreg->{launched_at} : undef;
+        my $launched_epoch = defined $launched_at ? BpGovern::iso_to_epoch($launched_at) : undef;
+        my $too_old = defined $launched_epoch
+                    && (time - $launched_epoch) > $COORDINATOR_MAX_RUNTIME_SECS;
+        return 'coordinator-alive' unless $too_old;
+    }
+    return undef;
+}
+
 sub _set_ledger_status {
-    my ($bpdir, $pkg, $st) = @_;
+    my ($bpdir, $pkg, $st, $opt) = @_;
+    $opt //= {};
     my $f = "$bpdir/packages/$pkg.md";
-    my $txt = _read_file($f);
-    return unless defined $txt;
-    return unless $txt =~ /\A---\s*\n(.*?)\n---/s;
-    my $fm = $1;
-    my $newfm = $fm;
-    if ($newfm =~ /^status:.*$/m) { $newfm =~ s/^status:.*$/status: $st/m; }
-    else { $newfm .= "\nstatus: $st"; }
-    my @t = gmtime(time);
-    my $iso = sprintf "%04d-%02d-%02dT%02d:%02d:%02dZ", $t[5]+1900, $t[4]+1, $t[3], $t[2], $t[1], $t[0];
-    if ($newfm =~ /^last_updated:.*$/m) { $newfm =~ s/^last_updated:.*$/last_updated: $iso/m; }
-    $txt =~ s/\A---\s*\n.*?\n---/---\n$newfm\n---/s;
-    open my $w, '>:raw', "$f.tmp.$$" or return;
-    print $w $txt; close $w;
-    rename "$f.tmp.$$", $f;
+    my $runs = $opt->{runs};
+    my $log  = $opt->{log} // (defined $runs ? "$runs/orchestrator.log" : undef);
+
+    my $r = BpWrite::guarded_write({
+        site  => '_set_ledger_status',
+        path  => $f,
+        log   => $log,
+        valid => sub {
+            my ($txt) = @_;
+            return 'ledger unreadable or missing frontmatter'
+                unless defined $txt && $txt =~ /\A---\s*\n(.*?)\n---/s;
+            if (defined $runs && !$opt->{supersede}) {
+                # $alive_fn (inside _coordinator_alive_refusal) is called even with an
+                # undef pid: the real pid_alive() correctly reports "not alive" for
+                # undef, but the injected test seam ($BpOrch::PID_ALIVE_FN) represents
+                # "the coordinator is alive" as a simple boolean independent of which
+                # pid backs it (t/99 S1/behavior13 exercises a fixture with no
+                # registry.json at all).
+                my $reason = _coordinator_alive_refusal($runs, $pkg);
+                return $reason if defined $reason;
+            }
+            return undef;
+        },
+        mutate => sub {
+            my ($txt) = @_;
+            return (undef, 'no frontmatter block to update') unless $txt =~ /\A---\s*\n(.*?)\n---/s;
+            my $fm = $1;
+            my $newfm = $fm;
+            if ($newfm =~ /^status:.*$/m) { $newfm =~ s/^status:.*$/status: $st/m; }
+            else { $newfm .= "\nstatus: $st"; }
+            my @t = gmtime(time);
+            my $iso = sprintf "%04d-%02d-%02dT%02d:%02d:%02dZ", $t[5]+1900, $t[4]+1, $t[3], $t[2], $t[1], $t[0];
+            if ($newfm =~ /^last_updated:.*$/m) { $newfm =~ s/^last_updated:.*$/last_updated: $iso/m; }
+            (my $new = $txt) =~ s/\A---\s*\n.*?\n---/---\n$newfm\n---/s;
+            return ($new, undef);
+        },
+    });
+    return ($r->{ok} && ($r->{outcome} eq 'written' || $r->{outcome} eq 'unchanged')) ? 1 : 0;
 }
 
 # ===========================================================================

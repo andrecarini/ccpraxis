@@ -197,6 +197,7 @@ use warnings;
 use File::Basename qw(dirname);
 use Cwd qw(abs_path);
 use File::Spec ();
+use Fcntl qw(LOCK_EX LOCK_UN);
 
 my $DIR = dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; abs_path($f) // $f });
 require "$DIR/bp-orchestrator.pl";   # reuse BpOrch atomic ledger/registry/pause writers
@@ -246,24 +247,46 @@ sub widen_write_set {
 }
 
 # Append (idempotently) the human's resolution to a package ledger as a corrective
-# section the relaunched coordinator will read. Mirrors BpOrch::_apply_harvest_findings:
-# drop any prior block, append a fresh one, atomic temp+rename.
+# section the relaunched coordinator will read. Mirrors BpOrch::_apply_harvest_findings
+# in shape.
+#
+# fixbatch step7 / MAJOR (reviewer) + MAJOR 3 (red-team): this used to read-modify-
+# rename the SAME ledger S1 (_set_ledger_status) guards, with NO lock at all -- a
+# lost-update race against a live coordinator or a concurrent bp-ledger.pl op on
+# this file. Now takes the SAME lock those other writers take (BpWrite::lock_path,
+# "$f.lock") around the read-modify-rename, so the three can never interleave.
+#
+# Deliberately NOT routed through BpWrite::guarded_write (unlike
+# BpOrch::_apply_harvest_findings, which was): this must run BEFORE the ledger's
+# status flips (see the call site in `unless (caller)` below) because bp-ledger.pl's
+# own protocol `@STATUSES` list does not include "dropped" -- reordering the note-
+# writers to run only after a successful status commit would make bp-ledger.pl's
+# `set-next-action` (the sibling call, `update_next_action_with_note`) reject the
+# ledger outright for `--action drop`. Kept as a plain, locked, in-this-file writer
+# instead; t/69's own oracle (C3) also pins this file to exactly ONE raw ">:raw"
+# writer, guarding against write-set widening growing a second independent one.
 sub append_human_decision {
     my ($bpdir, $pkg, $note, $action) = @_;
     return unless defined $note && length $note;
     my $f = "$bpdir/packages/$pkg.md";
-    open my $r, '<:raw', $f or return;
+    my $lock_p = BpWrite::lock_path($f);
+    open(my $lk, '>', $lock_p) or return;
+    flock($lk, LOCK_EX) or do { close $lk; return };
+    open my $r, '<:raw', $f or do { flock($lk, LOCK_UN); close $lk; return };
     local $/; my $txt = <$r>; close $r;
-    return unless defined $txt;
+    unless (defined $txt) { flock($lk, LOCK_UN); close $lk; return; }
     $txt =~ s/\n*## Human decision \(resolve\).*?(?=\n## |\z)//s;   # drop any prior block
     my $sec = "\n\n## Human decision (resolve)\n\n"
             . "A human reviewed this package's park and chose to **$action** it with this guidance:\n\n"
             . "$note\n\n"
             . "Apply it, then re-run your own tests/review before reporting done.\n";
     $txt .= $sec;
-    open my $w, '>:raw', "$f.tmp.$$" or return;
+    open my $w, '>:raw', "$f.tmp.$$" or do { flock($lk, LOCK_UN); close $lk; return };
     print $w $txt; close $w;
     rename "$f.tmp.$$", $f;
+    flock($lk, LOCK_UN);
+    close $lk;
+    return;
 }
 
 # update_next_action_with_note($bpdir, $pkg, $note, $action) — b18-decision-delivery:
@@ -331,6 +354,13 @@ sub supersede_package_work {
     if (defined $cpid && BpOrch::pid_alive($cpid)) {
         BpOrch::kill_pid($cpid);
         push @killed, "coordinator:$cpid";
+        # BLOCKER 2 (fixbatch step7): nothing else in this write set ever clears
+        # registry `pid` for a coordinator that exits non-terminally, so a stale
+        # pid can strand later relaunch/accept/drop refusals (_set_ledger_status's
+        # coordinator-alive gate) once the OS recycles it. This path just killed
+        # the coordinator we know about -- clear the identity so the NEXT gate
+        # check never mistakes a recycled pid for this one.
+        BpOrch::update_registry_pkg($runs, $pkg, { pid => undef });
     }
     for my $kind (qw(resolve harvest)) {
         my $pidf = "$runs/$kind/$pkg.pid";
@@ -493,8 +523,42 @@ unless (caller) {
             print STDERR "bp-answer-decision: package ledger not found for '" . ($pkg // '') . "'\n"; exit 2;
         }
         # Supersede live work FIRST (before flipping to pending) so a fresh relaunch
-        # can't collide with a coordinator/judge still editing the write-set.
+        # can't collide with a coordinator/judge still editing the write-set. This also
+        # clears registry `pid` when it actually kills something (BLOCKER 2 mitigation
+        # in supersede_package_work itself), so a subsequent gate check never mistakes
+        # a just-killed coordinator's pid, recycled later, for still being it.
         $superseded = supersede_package_work($runs, $pkg) if $plan->{supersede};
+        # fixbatch step7 / BLOCKER 2 aggravating factor: a refused answer (exit 6)
+        # used to leave the ledger HALF-applied -- append_human_decision and
+        # update_next_action_with_note ran unconditionally BEFORE the coordinator-
+        # alive gate inside _set_ledger_status, so the human's note landed while
+        # `status:` (and the queued decision) stayed untouched. reporter/SKILL.md
+        # promises a refused answer "changes nothing"; that must be true in the
+        # common (non-racing) case, not just eventually-consistent.
+        #
+        # This PRE-check runs the SAME coordinator-alive logic _set_ledger_status
+        # will authoritatively re-check under the lock, but BEFORE any write at all
+        # -- so the ordinary case (a genuinely alive/genuinely dead coordinator) exits
+        # 6 with nothing touched. The two ledger-note writers below then keep their
+        # ORIGINAL ordering (before the status flip): bp-ledger.pl's own protocol
+        # `@STATUSES` list does not include "dropped", so update_next_action_with_note
+        # (routed through bp-ledger.pl set-next-action) must run while the ledger's
+        # status is still whatever it was BEFORE this answer, never after a flip to
+        # `dropped` -- reordering that too would make bp-ledger.pl reject the ledger
+        # outright on the very next call. The authoritative gate inside
+        # _set_ledger_status (below, still first among the actual WRITES) remains the
+        # real enforcement point for the narrow residual race (coordinator becomes
+        # alive between this pre-check and that call).
+        if (defined $runs && !$plan->{supersede}) {
+            my $reason = BpOrch::_coordinator_alive_refusal($runs, $pkg);
+            if (defined $reason) {
+                print JSON::PP->new->canonical->pretty->encode({
+                    ok => JSON::PP::false(), package => $pkg, kind => $kind,
+                    family => $plan->{family}, action => $plan->{action}, refused => $reason,
+                });
+                exit 6;
+            }
+        }
         # b17 C7/C8(a): --note now persists on EVERY action, including accept/drop —
         # the `if $plan->{relaunch}` gate that silently dropped it for those two
         # (defect 4, the worst-shaped of the four: exit 0, note vanished, no warning)
@@ -515,7 +579,31 @@ unless (caller) {
         # script's combined output and parse stdout as JSON, so any stderr line -- including
         # our own -- would corrupt what it is meant to warn about.
         $next_action_updated = update_next_action_with_note($bpdir, $pkg, $note, $plan->{action});
-        BpOrch::_set_ledger_status($bpdir, $pkg, $plan->{ledger_status});
+        # a01/S1+S1b: the ledger write and the registry write are both now guarded
+        # (BpWrite::guarded_write) -- the ledger write additionally refuses while the
+        # registry-recorded coordinator pid is alive, UNLESS this plan already
+        # superseded it above (`--action reset`, spec behavior 14). This is the
+        # AUTHORITATIVE gate (the pre-check above is best-effort only); a refusal
+        # here means "the write no longer applies": the decision file is left queued
+        # (not unlinked below) and we exit 6 with a machine-readable refusal token on
+        # stdout (never stderr -- callers parse this script's combined output as
+        # JSON, spec §2.5). In the ordinary case this was already caught by the
+        # pre-check above with NOTHING written; this call only re-fires it in the
+        # narrow race window between that pre-check and here, in which case the two
+        # note-writers above (append_human_decision, update_next_action_with_note)
+        # will have landed even though the status flip below did not -- the same
+        # residual half-applied shape as before this fix-batch, now narrowed to that
+        # window rather than present on every refusal.
+        my $set_ok = BpOrch::_set_ledger_status($bpdir, $pkg, $plan->{ledger_status},
+            { runs => $runs, supersede => ($plan->{supersede} ? 1 : 0) });
+        unless ($set_ok) {
+            my $reason = ($BpWrite::LAST_RESULT && $BpWrite::LAST_RESULT->{reason}) || 'write-refused';
+            print JSON::PP->new->canonical->pretty->encode({
+                ok => JSON::PP::false(), package => $pkg, kind => $kind,
+                family => $plan->{family}, action => $plan->{action}, refused => $reason,
+            });
+            exit 6;
+        }
         my %reg = ( status => $plan->{ledger_status} );
         $reg{attempt}          = 0 if $plan->{reset_attempt};
         $reg{resolve_attempts} = 0 if $plan->{reset_resolve};
@@ -525,7 +613,15 @@ unless (caller) {
         # sweep's "gap > 60m OR no session id" rule classifies the next launch COLD.
         # `relaunch` must NEVER set this key — see plan_answer's clear_session.
         $reg{session_id}       = undef if $plan->{clear_session};
-        BpOrch::update_registry_pkg($runs, $pkg, \%reg);
+        my $reg_ok = BpOrch::update_registry_pkg($runs, $pkg, \%reg);
+        unless ($reg_ok) {
+            my $reason = ($BpWrite::LAST_RESULT && $BpWrite::LAST_RESULT->{reason}) || 'write-refused';
+            print JSON::PP->new->canonical->pretty->encode({
+                ok => JSON::PP::false(), package => $pkg, kind => $kind,
+                family => $plan->{family}, action => $plan->{action}, refused => $reason,
+            });
+            exit 6;
+        }
     } else {
         BpOrch::clear_pause($runs);
     }

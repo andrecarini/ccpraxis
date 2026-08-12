@@ -102,18 +102,48 @@ registry_init() {
   [ -s "$reg" ] || echo '{"packages":{}}' > "$reg"
 }
 
+# a01: single source of truth for the registry lock timeout is BpWrite (Perl side,
+# bp-write-guard.pl); this derives from it once per shell process (cached in
+# ${_BP_REGISTRY_LOCK_TIMEOUT:-}, lazily -- no top-level assignment, so sourcing
+# this file has zero top-level statements/side effects), rather than hardcoding
+# the literal a second time and risking cross-language drift.
+#
+# fixbatch step7 / MINOR 7: MUST be invoked as a plain statement (never inside a
+# `$(...)` command substitution) -- command substitution always forks a subshell,
+# and the `_BP_REGISTRY_LOCK_TIMEOUT=...` assignment below would land in THAT
+# subshell and vanish the instant it exits, defeating the cache every single call
+# (measured: ~85ms/call, all of it perl startup). Callers read the global directly
+# after calling this with no output captured.
+_bp_registry_lock_timeout() {
+  if [ -z "${_BP_REGISTRY_LOCK_TIMEOUT:-}" ]; then
+    local libdir; libdir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    _BP_REGISTRY_LOCK_TIMEOUT="$(perl "$libdir/bp-write-guard.pl" --lock-timeout 2>/dev/null)"
+    [[ "$_BP_REGISTRY_LOCK_TIMEOUT" =~ ^[0-9]+$ ]] || _BP_REGISTRY_LOCK_TIMEOUT=10
+  fi
+}
+
 # registry_merge BLUEPRINT PKG JSON_OBJECT — shallow-merges fields into pkg entry.
+# Returns the subshell's own exit status (a01 behavior 32): a lock-timeout or a
+# failed jq/mv is no longer swallowed -- it propagates out of registry_merge itself,
+# not only onto its subshell's own (unobserved) exit. (fixbatch step7 / MINOR 8: the
+# trailing `return $?` below is a deliberate no-op left in place -- a bash function
+# already returns its last command's exit status, so behavior 32 was already true
+# the moment `( … ) 9>"$lock"` became the last statement; the explicit `return $?`
+# documents that intent for the next reader rather than changing anything.)
 registry_merge() {
   local bp="$1" pkg="$2" obj="$3"
   registry_init "$bp"
-  local reg lock; reg=$(registry_path "$bp"); lock="${reg%.json}.lock"
+  local reg lock to; reg=$(registry_path "$bp"); lock="${reg%.json}.lock"
+  _bp_registry_lock_timeout
+  to="$_BP_REGISTRY_LOCK_TIMEOUT"
   (
-    flock -w 10 9 || { echo "bp-lib: registry lock timeout" >&2; exit 1; }
+    flock -w "$to" 9 || { echo "bp-lib: registry lock timeout" >&2; exit 1; }
     local tmp; tmp=$(mktemp)
     jq --arg pkg "$pkg" --argjson obj "$obj" \
        '.packages[$pkg] = ((.packages[$pkg] // {}) + $obj)' "$reg" > "$tmp" \
       && mv "$tmp" "$reg"
   ) 9>"$lock"
+  return $?
 }
 
 registry_get() {  # BLUEPRINT PKG FIELD -> value or empty

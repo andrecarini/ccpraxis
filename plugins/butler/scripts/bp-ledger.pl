@@ -460,6 +460,24 @@ sub run_op {
         io_error($sub, $path, "rename $tmp -> $path failed: $!");
     }
 
+    # a01 §7 / behavior 33: the read-back is not optional even in the house
+    # precedent -- still under the lock, still routed through the EXISTING
+    # io_error/exit-4 path (no new exit-code vocabulary, per spec §6 "Changing
+    # run_op's exit-code vocabulary ... is out of scope"). A rename that reports
+    # success but whose bytes don't read back is exactly the DROP shape this
+    # package exists to close.
+    my $after;
+    {
+        open(my $rfh, '<:raw', $path) or io_error($sub, $path, "read-back: cannot read: $!");
+        local $/;
+        $after = <$rfh>;
+        close $rfh;
+        $after = '' unless defined $after;
+    }
+    unless ($after eq $new) {
+        io_error($sub, $path, "value did not survive the write");
+    }
+
     flock($lk, LOCK_UN);
     close($lk);
     $post_cb->($new) if $post_cb;
