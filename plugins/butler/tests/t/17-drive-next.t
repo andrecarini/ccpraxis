@@ -802,4 +802,78 @@ sub capture_run {
     }
 }
 
+# ── AC-40: a stale order.json must never be reported as 'done' ───────────────
+#
+# The `next` walk iterates the RECORDED ORDER, so an in-scope blueprint absent
+# from it is never looked at -- and the walk fell through to {"action":"done"},
+# which asserts "every in-scope blueprint is done-or-parked". Two mechanisms
+# believe that assertion and both stop the run on it: gate-drive-loop.sh lets
+# the turn end, and bp-watchdog.pl short-circuits to SETTLED.
+#
+# Observed 2026-08-12: `next --scope butler-and-dashboard-overhaul` returned
+# done on a 22-package blueprint with every package pending, because order.json
+# still held one now-archived name from the previous run. Same false-settled
+# class as the in-flight branch, reached from the other direction.
+{
+    my $data = tempdir(CLEANUP => 1);
+    make_bp_dir($data, 'bp-old',  [ {key=>'p1', status=>'done',    write_set=>'old/p1/'} ]);
+    make_bp_dir($data, 'bp-new',  [ {key=>'q1', status=>'pending', write_set=>'new/q1/'} ]);
+
+    make_path("$data/.drive-solo");
+    write_json("$data/.drive-solo/order.json", { order => ['bp-old'], recorded_at => 1 });
+
+    my ($rc, $out) = capture_run(['next', '--scope', 'bp-new'], { data_dir => $data });
+    is($rc, 0, 'AC-40: next exits 0 with a stale order');
+    chomp(my $line = $out);
+    my $act = eval { $J->decode($line) };
+    ok(defined $act, 'AC-40: stdout is valid JSON');
+    isnt($act->{action}, 'done',
+        'AC-40: a blueprint the order never mentions is NOT reported as done');
+    is($act->{action}, 'need-order',
+        'AC-40: the session is asked to re-judge the order instead');
+    ok((grep { $_ eq 'bp-new' } @{ $act->{missing} || [] }),
+        'AC-40: the uncovered blueprint is named in `missing`');
+
+    # A parked blueprint is settled by definition and must NOT re-trigger this.
+    write_json("$data/.drive-solo/parks.json",
+               [ { blueprint => 'bp-new', reason => 'moot', at => 1 } ]);
+    my (undef, $out2) = capture_run(['next', '--scope', 'bp-new'], { data_dir => $data });
+    chomp(my $l2 = $out2);
+    my $a2 = eval { $J->decode($l2) };
+    isnt($a2->{action}, 'need-order',
+        'AC-40: a PARKED uncovered blueprint does not re-ask for an order');
+}
+
+# ── AC-41: record-order refuses to drop live work (AC-40's anti-livelock) ────
+#
+# AC-40 re-asks for an order whenever the recorded one misses an in-scope
+# candidate. If a session could answer by re-recording the same incomplete
+# order, the two would loop forever. So the incomplete answer fails loudly, and
+# says how to exclude a blueprint on purpose: park it.
+{
+    my $data = tempdir(CLEANUP => 1);
+    make_bp_dir($data, 'bp-keep', [ {key=>'p1', status=>'pending', write_set=>'keep/p1/'} ]);
+    make_bp_dir($data, 'bp-drop', [ {key=>'q1', status=>'pending', write_set=>'drop/q1/'} ]);
+
+    my ($rc, $out, $err) = capture_run(['record-order', 'bp-keep'], { data_dir => $data });
+    isnt($rc, 0, 'AC-41: recording an order that omits a live blueprint is refused');
+    like($err, qr/bp-drop/, 'AC-41: the refusal names the omitted blueprint');
+    like($err, qr/park/,    'AC-41: ...and points at the sanctioned way to exclude it');
+    ok(!-f "$data/.drive-solo/order.json", 'AC-41: no order was written by the refused call');
+
+    # Parked → legitimately omittable.
+    make_path("$data/.drive-solo");
+    write_json("$data/.drive-solo/parks.json",
+               [ { blueprint => 'bp-drop', reason => 'superseded', at => 1 } ]);
+    my ($rc2) = capture_run(['record-order', 'bp-keep'], { data_dir => $data });
+    is($rc2, 0, 'AC-41: once parked, omitting it is accepted');
+
+    # A blueprint whose packages are all terminal is not live work either.
+    my $data3 = tempdir(CLEANUP => 1);
+    make_bp_dir($data3, 'bp-a', [ {key=>'p1', status=>'pending', write_set=>'a/p1/'} ]);
+    make_bp_dir($data3, 'bp-fin', [ {key=>'z1', status=>'done',  write_set=>'fin/z1/'} ]);
+    my ($rc3) = capture_run(['record-order', 'bp-a'], { data_dir => $data3 });
+    is($rc3, 0, 'AC-41: a fully-terminal blueprint may be omitted without refusal');
+}
+
 done_testing();

@@ -509,6 +509,44 @@ sub _cmd_next {
         return 0;
     }
 
+    # B2a: an order EXISTS but does not cover every in-scope candidate.
+    #
+    # The walk below iterates `@$order`, so a candidate absent from it is never
+    # looked at -- and the walk then falls through to 'done', which asserts
+    # "every in-scope blueprint is done-or-parked". That assertion is false, and
+    # it is believed by the two mechanisms named at the in-flight branch below:
+    # gate-drive-loop.sh allows the turn to end, and bp-watchdog.pl short-circuits
+    # to SETTLED. So the run reports finished having never considered the work.
+    #
+    # This is the same false-settled class as the in-flight bug documented there,
+    # reached from the other direction, and it is NOT hypothetical: on 2026-08-12
+    # `next --scope butler-and-dashboard-overhaul` returned {"action":"done"} on a
+    # 22-package blueprint with every package still `pending`, because order.json
+    # held a single now-archived name from the previous run.
+    #
+    # The header's "once order.json exists it is the authoritative scope+order and
+    # --scope is ignored" still holds for ORDERING. It cannot be allowed to mean
+    # "silently drop work the caller asked for": a stale order is a reason to ask
+    # the session to re-judge, never a reason to claim completion. Excluding a
+    # blueprint is what `park` is for -- and _cmd_record_order enforces exactly
+    # that, so this cannot livelock on a session that re-records the same order.
+    {
+        my %in_order = map { $_ => 1 } @$order;
+        my @missing  = grep { !$in_order{$_} && !$parked{$_} } @candidates;
+        if (@missing) {
+            _append_run_log($dsdir, 'NEED-ORDER (scope extends recorded order): '
+                                  . join(',', @missing));
+            print _encode_action({
+                action     => 'need-order',
+                candidates => \@candidates,
+                missing    => \@missing,
+                reason     => 'scope-extends-order',
+            }), "\n";
+            keepawake_apply('active', $dsdir, $opts);
+            return 0;
+        }
+    }
+
     # Blueprints that are NOT settled but have nothing dispatchable right now.
     # Collected rather than swallowed: emitting 'done' for these is the bug
     # documented at the in-flight branch below.
@@ -698,6 +736,49 @@ sub _cmd_record_order {
     my $now   = $opts->{now}->();
     my $dsdir = "$data/.drive-solo";
     make_path($dsdir) unless -d $dsdir;
+
+    # An order that OMITS a blueprint still holding non-terminal packages silently
+    # drops that work: the `next` walk iterates the order, so an omitted blueprint
+    # is never looked at. Refuse instead of accepting it.
+    #
+    # This is also what stops B2a from livelocking. B2a re-asks for an order
+    # whenever the recorded one does not cover an in-scope candidate; if a session
+    # could answer by re-recording the same incomplete order, the two would loop
+    # forever. Here the incomplete answer fails loudly, and the message names the
+    # sanctioned way to exclude a blueprint deliberately: park it.
+    {
+        my $bpbase = "$data/blueprints";
+        my %given  = map { $_ => 1 } @$bps;
+        my $parks  = _read_json_file("$dsdir/parks.json", $dsdir);
+        my %parked = map  { $_->{blueprint} => 1 }
+                     grep { ref $_ eq 'HASH' && $_->{blueprint} }
+                     (ref $parks eq 'ARRAY' ? @$parks : ());
+
+        my @dropped;
+        if (-d $bpbase && opendir(my $dh, $bpbase)) {
+            my @dirs = sort grep { $_ ne '.' && $_ ne '..' && $_ ne '_archive'
+                                   && -f "$bpbase/$_/blueprint.md" } readdir $dh;
+            closedir $dh;
+            for my $bp (@dirs) {
+                next if $given{$bp} || $parked{$bp};
+                my $dag = parse_dag(_read_file("$bpbase/$bp/blueprint.md"));
+                my @live = grep { !_is_terminal(ledger_fm("$bpbase/$bp", $_, 'status') // 'pending') }
+                           keys %$dag;
+                push @dropped, "$bp (" . scalar(@live) . ' non-terminal package(s))' if @live;
+            }
+        }
+        if (@dropped) {
+            print STDERR "bp-drive-next record-order: refusing an order that omits blueprint(s)\n"
+                       . "still holding non-terminal packages -- the `next` walk iterates the\n"
+                       . "recorded order, so an omitted blueprint is never driven and the run\n"
+                       . "reports 'done' over work it never looked at:\n";
+            print STDERR "  - $_\n" for @dropped;
+            print STDERR "Include them in the order, or exclude them deliberately with:\n"
+                       . "  bp-drive-next.pl park <blueprint> <reason...>\n";
+            return 2;
+        }
+    }
+
     _write_json_atomic("$dsdir/order.json", { order => $bps, recorded_at => $now });
     _append_run_log($dsdir, "order recorded: " . join(',', @$bps));
     return 0;
