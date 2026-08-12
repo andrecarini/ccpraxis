@@ -21,6 +21,25 @@ Your process carries (exported by the launcher — if these are missing you were
 
 Hooks enforce: write-set containment, implementer/test-writer role separation, one write-capable worker in flight, git/deploy safety, the stop gate, and the **graceful-stop gate** (see "Graceful stop" below). **A `BLOCKED:` message is protocol feedback. Comply, record it in the ledger, escalate via `status: blocked` if it reveals a scope problem. Never route around a hook.**
 
+#### …but only inside a butler-LAUNCHED coordinator
+
+That sentence is true of *this* session — a coordinator started by `bp-launch.sh` — and false
+almost everywhere else. Every butler hook but one begins with `bp_hook_gate` (`hooks/lib.sh:9`),
+which **exits 0 (allow) unless `BP_LEDGER`, `BP_DIR` and `BP_PROJECT_ROOT` are all set**. Those are
+exported by `bp-launch.sh` only. So in a `/butler:drive-solo` run, in a manually-dispatched
+`Task`/Agent subagent, and in any ordinary interactive session, write-set containment, role
+separation and the one-write-capable-worker lock are **convention, not enforcement** — nothing will
+stop a violation, and nothing will report one.
+
+The single exception is **`guard-git-mutations.sh`**, which deliberately carries no `bp_hook_gate`
+and applies everywhere (see its header). It exists because the gate opening in a manual drive is
+not hypothetical: a prohibited `git stash` swept away a completed, uncommitted fix-batch that the
+ledger had already recorded as done.
+
+**What this means for you:** never infer "a hook would have caught it" from the list above. If you
+are driving without the `BP_*` contract, `git status` after every write-capable worker is the only
+containment check you actually have.
+
 ### `BP_REPORT_DIR` — derive capture output paths, never hardcode one
 
 `BP_REPORT_DIR` is exported by `bp-launch.sh` as `$BP_DIR/reports/$BP_PACKAGE` — absolute, inside `$BP_DIR`, and therefore always in-set. Any capture driver you dispatch (screenshots, generated artifacts, anything a worker writes as evidence) must **derive** its output path from `BP_REPORT_DIR`, never hardcode a literal path string. A hardcoded literal is the actual root cause of a real incident: a package's spec was inherited from a previous blueprint and carried that blueprint's literal reports path, so it outlived the blueprint it belonged to and kept writing into an archived one long after. A path derived from `BP_REPORT_DIR` cannot outlive its blueprint the way a hardcoded one can.
@@ -293,7 +312,7 @@ Return: ≤15 lines — outcome, validation run + result, report path, anything 
 
 Rules:
 
-- **One write-capable worker in flight** (implementer / test-writer / ui-prober) — hook-enforced; read-only workers may run in parallel.
+- **One write-capable worker in flight** (implementer / test-writer / ui-prober) — hook-enforced *inside a `bp-launch.sh` coordinator only* (see "…but only inside a butler-LAUNCHED coordinator" above); elsewhere it is your discipline. Read-only workers may run in parallel.
 - A worker that returns garbage or dies: redispatch once with a sharpened prompt. Twice: log the attempt, then either change approach or block — don't loop.
 - You may make small glue edits inside your write set yourself (wiring an export, a one-line fix during validation). Anything resembling a step belongs to a worker.
 
