@@ -54,6 +54,7 @@ require "$DIR/bp-contract.pl";
 require "$DIR/bp-log.pl";
 require "$DIR/bp-http.pl";
 require "$DIR/bp-token-keeper.pl";
+require "$DIR/bp-keepawake.pl";    # the shared wake-lock (also used by solo)
 require "$DIR/bp-judge.pl";
 require "$DIR/bp-remediate.pl";    # b07: auto-remediation engine (pure decision core)
 require "$DIR/bp-spend.pl";        # b47: BpSpend::fetch/write_snapshot -- the SPEND SNAPSHOT
@@ -2230,6 +2231,25 @@ sub run {
 
             my $paused = read_paused($runs);
 
+            # ---- WAKE-LOCK ----
+            # The fleet held NO wake-lock at all until now, which is backwards:
+            # solo has a human present who would notice a suspended host, while
+            # the fleet runs headless coordinators for hours with nobody
+            # watching. A suspend there is unrecoverable AND unwitnessed. Not
+            # hypothetical — 3c661a0 records a host suspending mid-run, with a
+            # watchdog armed for 1800s reporting 7962s elapsed; that fix reached
+            # only the solo director.
+            #
+            # A MANUAL pause releases the lock deliberately: it is waiting on a
+            # human, and holding the machine awake for an absent person is the
+            # cost without the benefit. A timed pause keeps it — the entire
+            # point is to still be awake when the window reopens.
+            my $ka_phase = !$paused              ? 'active'
+                         : $paused->{manual}     ? 'settled'
+                         :                         'pause-pending';
+            BpKeepAwake::apply($ka_phase, $runs,
+                { log => sub { _log($log, 'keepawake', { detail => $_[0] }) } });
+
             # ---- USAGE POLL (burn-rate-adaptive cadence) ----
             if ($now >= $next_usage) {
                 my $u = fetch_usage({ creds_path => $creds, http_get => $http_get, log_path => $log,
@@ -3542,6 +3562,14 @@ sub run {
         }
         1;
     } or $err = $@;
+
+    # Release the wake-lock on EVERY exit path, including the error one: $err is
+    # captured by the eval above rather than rethrown here, so this line is
+    # reached whether the loop ended cleanly, hit `once`, or died. A fleet that
+    # crashed while holding the machine awake would keep it awake indefinitely,
+    # with no process left to ever release it.
+    BpKeepAwake::apply('settled', $runs,
+        { log => sub { _log($log, 'keepawake', { detail => $_[0] }) } });
 
     release_marker($marker_fh, "$runs/.orchestrator");
 

@@ -26,7 +26,11 @@
 #   {"action":"need-order","candidates":[…]}          no order yet; session must judge+record
 #   {"action":"run-package","blueprint":B,"package":P} drive this package next
 #   {"action":"pause","until_epoch":E,"reason":"usage"} timed auto-resume at epoch E
-#   {"action":"pause","until_epoch":null,"reason":"token"} TERMINAL relogin park (re-login, re-invoke)
+#   {"action":"stop","reason":"token-refresh-failed","detail":…} token could not be
+#                                                      refreshed; the wake-lock is released and the
+#                                                      run ends. NOT a pause: a pause promises a
+#                                                      resume, and there is none until a human
+#                                                      re-authenticates.
 #   {"action":"blueprint-done","blueprint":B,"pending":[…]} B settled; pending = remaining bps to re-eval
 #   {"action":"in-flight","blueprint":B,"packages":[…],"running":[…]}
 #                                                      nothing dispatchable right now, but B still
@@ -42,7 +46,9 @@
 #   {"action":"ok"|"pause-usage"|"pause-token"|"unavailable","until_epoch":E|null,"reason":…}
 #   ok           → proceed
 #   pause-usage  → pause reason=usage, until_epoch=E
-#   pause-token  → pause reason=token, until_epoch=null (hard-stop relogin)
+#   pause-token  → attempt a refresh (bp-token-keeper). Recovered → proceed;
+#                  failed → action=stop, wake-lock released, error logged.
+#                  Solo NEVER pauses for token expiry — see _token_recover.
 #   unavailable  → retry a few times, then degrade-and-proceed (log "governance degraded")
 #
 # STATE  (<data>/.drive-solo/, all director-owned)
@@ -83,6 +89,7 @@ my $DIR = dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; abs_path($f) // $f });
 # side effects, and its whole require-tree is core-Perl only (t/06 already
 # does this same require).
 require "$DIR/bp-orchestrator.pl";
+require "$DIR/bp-keepawake.pl";    # the shared wake-lock (also used by the fleet)
 
 # ===========================================================================
 # PURE DECISION FUNCTIONS (no I/O, no globals, no network — unit-tested in t/17)
@@ -210,9 +217,12 @@ sub blueprint_settled {
 
 # 7. keepawake_should_be_on($run_phase) → 0|1
 # active/pause-pending → 1; settled → 0.
+# Delegates to BpKeepAwake — ONE definition of the wake-lock, shared with the
+# fleet orchestrator (see bp-keepawake.pl's header for why it is not copied).
+# The name stays here because it is part of this module's tested surface.
 sub keepawake_should_be_on {
     my ($phase) = @_;
-    return ($phase eq 'active' || $phase eq 'pause-pending') ? 1 : 0;
+    return BpKeepAwake::should_be_on($phase);
 }
 
 # 8. pending_blueprints(\@order, $done_or_parked_href) → @pending
@@ -427,30 +437,12 @@ sub mark_announced {
 
 sub keepawake_apply {
     my ($phase, $dsdir, $opts) = @_;
-    my $spawn  = $opts->{spawn}                // sub {};
-    my $killp  = $opts->{kill_pid}             // sub {};
-    my $ps_ok  = $opts->{powershell_available} // sub { 0 };
-    my $pid_f  = "$dsdir/keepawake.pid";
-
-    if (keepawake_should_be_on($phase)) {
-        return unless $ps_ok->();
-        # idempotent: skip if already live
-        if (-e $pid_f) {
-            my $pid = do { my $t = _read_file($pid_f); $t && $t =~ /^(\d+)/ ? $1 : undef };
-            return if defined $pid && kill(0, $pid);
-        }
-        eval { $spawn->($pid_f) };
-        if ($@) { _append_run_log($dsdir, "WARN keepawake spawn failed: $@"); }
-    } else {
-        if (-e $pid_f) {
-            my $pid = do { my $t = _read_file($pid_f); $t && $t =~ /^(\d+)/ ? $1 : undef };
-            if (defined $pid) {
-                eval { $killp->($pid) };
-                _append_run_log($dsdir, "WARN keepawake kill failed: $@") if $@;
-            }
-            unlink $pid_f;
-        }
-    }
+    # The seam shape (spawn / kill_pid / powershell_available in %$opts) is
+    # preserved verbatim so injected fakes keep working; only the body moved.
+    BpKeepAwake::apply($phase, $dsdir, {
+        %{ $opts // {} },
+        log => sub { _append_run_log($dsdir, $_[0]) },
+    });
 }
 
 # ===========================================================================
@@ -1101,11 +1093,15 @@ sub run {
         data_dir => $data_dir,
         now      => $now_fn,
         verdict  => $verdict_fn,
-        # These defaults used to be empty subs, which made the whole keep-awake
-        # mechanism inert in production while still looking wired. See _ka_spawn.
-        spawn    => $opts->{spawn}                // sub { _ka_spawn(@_) },
-        kill_pid => $opts->{kill_pid}             // sub { _ka_kill(@_) },
-        powershell_available => $opts->{powershell_available} // sub { _ps_available() },
+        # Keep-awake actuation is NOT defaulted here any more: BpKeepAwake::apply
+        # supplies the real spawn/kill/probe when the opts omit them, and an
+        # injected fake still overrides because keepawake_apply passes %$opts
+        # straight through. Defaulting here as well meant this file carried its
+        # own copy of the actuation — the duplication t/111 now forbids.
+        #
+        # (These were once empty subs, which made the whole mechanism inert in
+        # production while still looking wired — see 3c661a0. The module's
+        # defaults are real; that is the point of them living in one place.)
     );
 
     if ($sub eq 'next') {
@@ -1125,92 +1121,6 @@ sub run {
         print STDERR "usage: bp-drive-next.pl next|record-order|park|--help\n";
         return 2;
     }
-}
-
-# --------------------------------------------------------------------------
-# Keep-awake ACTUATION.
-#
-# WHY THIS EXISTS: the production defaults for `spawn` and `kill_pid` were both
-# `sub { }` — empty. Every other part of the keep-awake mechanism was real and
-# working (the powershell probe, the pid file, the idempotency check, the
-# run-log WARN, the stop-on-settle path), all of it wired to a no-op. The
-# director therefore REPORTED managing a wake-lock while holding none, which is
-# the "detection is fine, delivery is the defect" shape this blueprint exists
-# to eliminate — here in the drive loop itself.
-#
-# Observed 2026-08-12, not theorised: the host suspended mid-run and a watchdog
-# armed for 1800s reported 7962s elapsed (2h13m). An unattended run is exactly
-# what this loop is for, and a suspended host stops it dead.
-#
-# Actuation reuses the sandbox plugin's keep-awake.ps1 rather than re-deriving
-# the P/Invoke here. That helper is battle-tested and documents the non-obvious
-# part: ES_DISPLAY_REQUIRED is load-bearing on Modern Standby (S0) machines,
-# where ES_SYSTEM_REQUIRED alone does NOT hold the box out of connected standby.
-# Both plugins ship from the same tree, so the relative path holds in the clone,
-# in the live install, and under the container's marketplace mount.
-#
-# We deliberately do NOT pass the helper's -PidFile: it would write its own
-# Windows pid over ours, and keepawake_apply's liveness check is perl's
-# kill(0,$pid) against the pid WE forked. The fork child execs powershell, so
-# that one pid is the wake-lock's whole lifetime — killing it releases the lock
-# (ES_CONTINUOUS is tied to the calling thread, so no explicit undo is needed).
-#
-# Degrades honestly and silently-but-loggably: no Windows, no helper, or a
-# failed fork means no lock and a WARN in run.md — never a false claim of one.
-sub _ka_helper_path { return "$DIR/../../sandbox/scripts/keep-awake.ps1" }
-
-# POSIX -> forward-slash Windows form. MSYS2_ARG_CONV_EXCL is set process-wide
-# in this file's BEGIN block, so the translation MUST be done by hand: the
-# opt-out and the translation are one technique, and splitting them is how you
-# get paths created at the drive root (house rule; see CLAUDE.md).
-sub _ka_winify {
-    my ($p) = @_;
-    $p = abs_path($p) // $p;
-    $p =~ s{\\}{/}g;
-    $p =~ s{^/([a-zA-Z])/}{\u$1:/};
-    return $p;
-}
-
-sub _ka_spawn {
-    my ($pid_f) = @_;
-    return undef unless $^O =~ /^(MSWin32|msys|cygwin)$/;
-    my $ps1 = _ka_helper_path();
-    unless (-f $ps1) { die "keep-awake helper missing: $ps1\n" }
-    require POSIX;
-    my $pid = fork();
-    die "fork: $!\n" unless defined $pid;
-    if ($pid == 0) {
-        open(STDIN,  '<', '/dev/null');
-        open(STDOUT, '>', '/dev/null');
-        open(STDERR, '>', '/dev/null');
-        exec('powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass',
-             '-WindowStyle', 'Hidden', '-File', _ka_winify($ps1))
-            or POSIX::_exit(127);
-    }
-    if (open my $w, '>', $pid_f) { print $w "$pid\n"; close $w }
-    return $pid;
-}
-
-sub _ka_kill {
-    my ($pid) = @_;
-    return unless defined $pid && $pid =~ /^\d+$/ && $pid > 0;
-    kill('KILL', $pid);
-    waitpid($pid, 0);
-}
-
-# Detect whether powershell.exe is resolvable (for keep-awake actuation).
-sub _ps_available {
-    # Keep-awake actuation is a Windows-only concern; in the Linux sandbox it is a
-    # documented no-op (doctrine). Probing powershell.exe off-Windows only spams
-    # stderr with "Can't exec \"powershell.exe\": No such file or directory" on every
-    # `next` — harmless (eval'd → 0) but misleading. Short-circuit off-Windows.
-    return 0 unless $^O =~ /^(MSWin32|msys|cygwin)$/;
-
-    # List-form system() spawns powershell.exe directly (no shell), so there is no
-    # /dev/null-vs-NUL redirect hazard (CLAUDE.md house rule) and the intent is explicit.
-    # `-Command "exit 0"` prints nothing; ENOENT (not found) -> system() returns -1.
-    my $rc = eval { system('powershell.exe', '-NoProfile', '-NonInteractive', '-Command', 'exit 0') };
-    return (defined $rc && $rc == 0 && !$@) ? 1 : 0;
 }
 
 # ===========================================================================

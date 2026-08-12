@@ -988,7 +988,9 @@ sub capture_run {
 
     my $spawned = 0;
     no warnings 'redefine';
-    local *BpDrive::_ka_spawn = sub { $spawned++; return 4242 };
+    # The actuator moved to BpKeepAwake (one definition, shared with the fleet —
+    # t/111). Stub it THERE; BpDrive no longer defines one, which is the point.
+    local *BpKeepAwake::spawn = sub { $spawned++; return 4242 };
     use warnings 'redefine';
 
     # NOT capture_run(): run_director() injects `spawn => sub { }` as a "safe
@@ -1014,8 +1016,12 @@ sub capture_run {
     is($act->{action}, 'run-package', 'AC-42: fixture yields runnable work (keep-awake should be ON)');
 
     SKIP: {
+        # The actuation moved to BpKeepAwake (ONE definition, shared with the
+        # fleet — see t/111). What AC-42 pins is unchanged: the PRODUCTION
+        # default must really actuate, because it was once an empty sub and the
+        # director claimed a wake-lock it never held.
         skip('AC-42: no powershell on this platform — keep-awake is a documented no-op here', 1)
-            unless BpDrive::_ps_available();
+            unless BpKeepAwake::ps_available();
         ok($spawned > 0,
             'AC-42: the production default ACTUATES the wake-lock (it was an empty sub, so the '
           . 'director claimed a lock it never held)');
@@ -1029,9 +1035,9 @@ sub capture_run {
 # documented drive-root-stray bug: a bare /c/... handed to a native binary is
 # created as C:\c\... (576 strays on 2026-06-12).
 {
-    my $p = BpDrive::_ka_helper_path();
+    my $p = BpKeepAwake::helper_path();
     ok(defined $p && length $p, 'AC-43: a keep-awake helper path is resolved');
-    my $w = BpDrive::_ka_winify('/c/Development/ccpraxis/x.ps1');
+    my $w = BpKeepAwake::winify('/c/Development/ccpraxis/x.ps1');
     like($w, qr{^[A-Z]:/}, 'AC-43: winify yields a drive-letter Windows path');
     unlike($w, qr{^/}, 'AC-43: ...and never a leading slash (that is the drive-root-stray shape)');
 }
