@@ -9,7 +9,7 @@ use Time::Local qw(timegm);
 
 require "$Bin/../../scripts/bp-govern.pl";
 
-plan tests => 26;
+plan tests => 30;
 
 sub near { my ($a,$b,$msg,$eps)=@_; $eps//=1e-6; ok(abs($a-$b) < $eps, $msg) or diag("got $a want $b"); }
 
@@ -70,8 +70,28 @@ is(BpGovern::next_cadence([[0,84],[100,84.5]], 85, [[0,10],[100,11]], 90), 60,
 my $H = 3_600_000;
 is(BpGovern::refresh_state(3*$H, 0), 'ok',          'refresh: 3h life = ok (too early)');
 is(BpGovern::refresh_state(1.5*$H, 0), 'refresh',   'refresh: 1.5h life = refresh (in band)');
-is(BpGovern::refresh_state(0.5*$H, 0), 'pause-floor','refresh: 0.5h life = pause-floor');
-is(BpGovern::refresh_state(1*$H, 0), 'pause-floor', 'refresh: exactly 1h = pause-floor (<=floor)');
+# The DEFAULT floor is 10 minutes, not 1 hour (BpGovern::TOKEN_FLOOR_H,
+# operator decision 2026-08-12). These two used to assert 0.5h and exactly 1h
+# were under the floor, which was true only of the old default. Keeping them
+# unchanged would have re-pinned the very value the change moved.
+is(BpGovern::refresh_state(0.5*$H, 0), 'refresh',
+   'refresh: 0.5h life = refresh — above the 10-minute floor, still in band');
+is(BpGovern::refresh_state(1*$H, 0), 'refresh',
+   'refresh: exactly 1h = refresh — the old floor is now well inside the band');
+
+# The floor itself, at and just either side of it.
+my $FL = BpGovern::TOKEN_FLOOR_H() * $H;
+is(BpGovern::refresh_state($FL, 0), 'pause-floor',
+   'refresh: exactly at the floor = pause-floor (<=, not <)');
+is(BpGovern::refresh_state($FL - 60_000, 0), 'pause-floor',
+   'refresh: a minute under the floor = pause-floor');
+is(BpGovern::refresh_state($FL + 60_000, 0), 'refresh',
+   'refresh: a minute over the floor = refresh, not pause');
+
+# An explicit lo_h still overrides, so callers that need a different floor
+# (the keeper's tests do) are not forced onto the default.
+is(BpGovern::refresh_state(0.5*$H, 0, 1), 'pause-floor',
+   'refresh: an explicit 1h floor still puts 0.5h under it');
 
 # ---- iso_to_epoch (A0) ----------------------------------------------------
 is(BpGovern::iso_to_epoch('1970-01-01T00:00:00Z'), 0, 'iso: epoch zero (Z)');

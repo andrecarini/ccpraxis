@@ -213,14 +213,34 @@ sub keeper_tick {
     my $o = $data->{claudeAiOauth};
 
     # 2. timing decision
-    my $state = BpGovern::refresh_state($o->{expiresAt}, $now);
-    if ($state eq 'ok')          { return {action=>'ok'}; }
-    if ($state eq 'pause-floor') {
-        _log($log,'token_floor',{detail=>'crossed 1h floor unrefreshed', expiresAt=>$o->{expiresAt}});
-        return {action=>'pause-floor'};
-    }
+    #
+    # FLOOR = 10 MINUTES, and crossing it is no longer an instant surrender.
+    # Operator decision 2026-08-12.
+    #
+    # This used to return pause-floor here, WITHOUT EVER ATTEMPTING A REFRESH:
+    # once the token dropped under the (then 1-hour) floor the keeper gave up
+    # and queued a re-login for a human, never once trying the refresh token it
+    # was holding. That is backwards. The refresh is cheap, it is the only thing
+    # that can actually rescue the run, and an unattended fleet has nobody to
+    # answer the re-login it raises instead.
+    #
+    # So the floor no longer decides whether to TRY; it decides what a FAILURE
+    # means. Above the floor a transient failure is worth backing off into the
+    # remaining runway. Below it there is no runway left, so the same failure is
+    # terminal and the fleet stops for a human — which is what the floor was
+    # always really for.
+    # The floor is BpGovern's, not ours — see BpGovern::TOKEN_FLOOR_H. Passing
+    # it explicitly only so the log and the tests can name the value in force.
+    my $floor_h = $args->{floor_h} // BpGovern::TOKEN_FLOOR_H();
+    my $state = BpGovern::refresh_state($o->{expiresAt}, $now, $floor_h);
+    if ($state eq 'ok') { return {action=>'ok'}; }
 
-    # 3. state eq 'refresh' -> attempt the refresh
+    # Below the floor: still attempt the refresh, but a failure is terminal.
+    my $below_floor = ($state eq 'pause-floor');
+    _log($log,'token_floor',{detail=>'under the refresh floor — attempting refresh anyway',
+                             floor_h=>$floor_h, expiresAt=>$o->{expiresAt}}) if $below_floor;
+
+    # 3. attempt the refresh
     my $body = JSON::PP->new->encode({
         grant_type    => 'refresh_token',
         refresh_token => $o->{refreshToken},
@@ -241,6 +261,13 @@ sub keeper_tick {
         return {action=>'refreshed', detail=>{writeback=>$wb, expiresAt=>$new_exp}};
     }
     if ($status == 429) {
+        # Backing off is only meaningful if there is runway left to back off
+        # INTO. Under the floor there is not, so the same 429 is terminal.
+        if ($below_floor) {
+            _log($log,'token_floor',{result=>429, action=>'pause-floor',
+                                     detail=>'rate-limited under the floor; no runway left to retry within'});
+            return {action=>'pause-floor', detail=>'refresh rate-limited (429) with no runway left'};
+        }
         _log($log,'token_refresh',{result=>429, action=>'backoff', detail=>'rate-limited; retry within runway'});
         return {action=>'backoff'};
     }
@@ -260,7 +287,15 @@ sub keeper_tick {
         _log($log,'token_unauthorized',{result=>$status, action=>'pause-auth', alert=>1, detail=>$alert});
         return {action=>'pause-auth', alert=>1, status=>$status, detail=>$alert};
     }
-    # 5xx / network / 0 -> transient, back off and retry within the runway
+    # 5xx / network / 0 -> transient, back off and retry within the runway.
+    # Same reasoning as the 429 arm: under the floor there is no runway, so a
+    # transient failure has nowhere left to retry into and stops the fleet
+    # rather than spinning until the token dies on its own.
+    if ($below_floor) {
+        _log($log,'token_floor',{result=>$status, action=>'pause-floor',
+                                 detail=>'transient refresh failure under the floor; no runway left'});
+        return {action=>'pause-floor', detail=>"refresh failed (status $status) with no runway left"};
+    }
     _log($log,'token_refresh',{result=>$status, action=>'backoff', detail=>'transient error; retry'});
     return {action=>'backoff', detail=>"status $status"};
 }

@@ -11,7 +11,7 @@ use Errno qw(EBUSY EXDEV EACCES);
 
 require "$Bin/../../scripts/bp-token-keeper.pl";
 
-plan tests => 36;
+plan tests => 40;
 
 my $J   = JSON::PP->new;
 my $dir = tempdir(CLEANUP => 1);
@@ -38,14 +38,57 @@ sub mock { my ($resp,$calls)=@_; return sub { push @$calls, {@_ ? (body=>$_[2]) 
     is(scalar @calls, 0,   'ok: no refresh attempted');
 }
 
-# 2. pause-floor (0.5h) -> no http call, logs token_floor
+# 2. UNDER THE FLOOR -> the refresh IS attempted; the floor only decides what a
+#    FAILURE means. Operator decision 2026-08-12.
+#
+#    This block previously asserted the opposite -- "no refresh attempted past
+#    the floor" -- and that assertion was the defect, not the guard. The keeper
+#    held a refresh token, never tried it, and queued a re-login for a human
+#    that an unattended fleet has nobody to answer. The floor is also 10 minutes
+#    now, not an hour, so the old 0.5h fixture sits ABOVE it and no longer
+#    exercises this path at all.
 {
-    my $c = "$dir/floor.json"; make_creds($c, $NOW + 0.5*$H); my $log = "$dir/floor.log";
-    my @calls; my $r = BpKeeper::keeper_tick({ creds_path=>$c, now_ms=>$NOW, log_path=>$log, http_post=>mock({},\@calls) });
-    is($r->{action}, 'pause-floor', 'floor: 0.5h life -> pause-floor');
-    is(scalar @calls, 0,            'floor: no refresh attempted past the floor');
+    # 5 minutes of life: under the 10-minute floor.
+    my $c = "$dir/floor.json"; make_creds($c, $NOW + 5*60*1000); my $log = "$dir/floor.log";
+    my @calls;
+    my $r = BpKeeper::keeper_tick({ creds_path=>$c, now_ms=>$NOW, log_path=>$log,
+                                    http_post=>mock({status=>200, content=>$J->encode({
+                                        access_token=>'sk-ant-FLOOR-eeeeeeeeeeeeeeeeeeee',
+                                        refresh_token=>'sk-ant-FLOORREF-ffffffffffffffffffff',
+                                        expires_in=>28800, scope=>'user:inference user:profile' })},\@calls) });
+    is($r->{action}, 'refreshed',
+       'floor: under the floor, a refresh that SUCCEEDS rescues the run');
+    is(scalar @calls, 1,
+       'floor: the refresh is attempted under the floor, not skipped');
     my $logtxt = do { local $/; open my $f,'<',$log or die; <$f> };
-    like($logtxt, qr/token_floor/,  'floor: logs token_floor event');
+    like($logtxt, qr/token_floor/,
+       'floor: crossing the floor is still logged');
+}
+
+# 2b. Under the floor + a refresh that FAILS -> terminal pause-floor, because
+#     there is no runway left to back off into.
+{
+    my $c = "$dir/floor-fail.json"; make_creds($c, $NOW + 5*60*1000); my $log = "$dir/floor-fail.log";
+    my @calls;
+    my $r = BpKeeper::keeper_tick({ creds_path=>$c, now_ms=>$NOW, log_path=>$log,
+                                    http_post=>mock({status=>500, content=>''},\@calls) });
+    is($r->{action}, 'pause-floor',
+       'floor: under the floor, a FAILED refresh is terminal, not a backoff');
+    is(scalar @calls, 1,
+       'floor: it still tried before giving up');
+    like($r->{detail} // '', qr/no runway/,
+       'floor: the verdict says why it did not retry');
+}
+
+# 2c. The SAME transient failure ABOVE the floor still backs off -- the floor
+#     changes the meaning of a failure, not the failure itself.
+{
+    my $c = "$dir/above.json"; make_creds($c, $NOW + 1.5*$H); my $log = "$dir/above.log";
+    my @calls;
+    my $r = BpKeeper::keeper_tick({ creds_path=>$c, now_ms=>$NOW, log_path=>$log,
+                                    http_post=>mock({status=>500, content=>''},\@calls) });
+    is($r->{action}, 'backoff',
+       'above floor: a transient failure still backs off into the remaining runway');
 }
 
 # 3. refresh band (1.5h) + 200 -> refreshed, creds rotated, logged, no secret leak

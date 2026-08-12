@@ -159,9 +159,22 @@ sub immediate_pause_trigger {
 #   life > hi(2h)      -> 'ok'         (too early; premature refresh is 429'd, A0)
 #   floor(1h) < life<=hi -> 'refresh'  (the band)
 #   life <= floor(1h)  -> 'pause-floor'(crossed the floor unrefreshed -> graceful pause)
+# THE token floor, in hours: 10 minutes (operator decision 2026-08-12).
+#
+# It lives HERE, next to its only consumer, because it previously did not live
+# anywhere: bp-usage-gate.pl and bp-token-keeper.pl each carried their own
+# notion of it, and refresh_state defaulted to a third value (1 hour) for any
+# caller that passed none. That is exactly how the keeper ended up silently
+# running an hour-long floor after the gate had been moved to ten minutes --
+# two constants and a default, one of them invisible.
+#
+# Callers may still override per-call (tests do). What they must not do is
+# re-declare the default; import it from here.
+use constant TOKEN_FLOOR_H => 10 / 60;
+
 sub refresh_state {
     my ($expires_ms, $now_ms, $lo_h, $hi_h) = @_;
-    $lo_h //= 1; $hi_h //= 2;
+    $lo_h //= TOKEN_FLOOR_H; $hi_h //= 2;
     my $life_h = ($expires_ms - $now_ms) / 3_600_000;
     return 'pause-floor' if $life_h <= $lo_h;
     return 'refresh'     if $life_h <= $hi_h;

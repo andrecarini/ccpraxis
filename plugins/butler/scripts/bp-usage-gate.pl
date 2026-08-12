@@ -80,10 +80,18 @@ my $SOFT5   = defined $ENV{BP_KGS_SOFT_5H}       ? $ENV{BP_KGS_SOFT_5H} + 0     
 my $SOFT7   = defined $ENV{BP_KGS_SOFT_7D}       ? $ENV{BP_KGS_SOFT_7D} + 0       : 85;
 # Default floor: 10 MINUTES, not 1 hour. Operator decision (2026-08-12).
 # A 1-hour floor parked runs for an hour of perfectly usable token life on the
-# theory that nothing can refresh in-session. The pause is now a TIMED WAIT that
-# resumes by itself (see verdict_decision), so the floor only needs to cover the
-# refresh itself — 10 minutes does that without throwing away the other 50.
-use constant TOKEN_FLOOR_DEFAULT_H => 10 / 60;
+# theory that nothing can refresh in-session. That theory was wrong -- the token
+# refreshes, and the keeper can force it -- so the floor only needs to cover the
+# refresh itself.
+#
+# The VALUE is BpGovern's (see BpGovern::TOKEN_FLOOR_H); this is an alias, not a
+# second declaration. Three copies of this number is how the keeper silently
+# kept running a 1-hour floor after the gate moved to ten minutes.
+#
+# A sub rather than `use constant` on purpose: `use constant` is evaluated at
+# BEGIN, and bp-govern.pl is require'd at RUNTIME, so the constant form
+# resolves before the value exists and dies as an undeclared bareword.
+sub TOKEN_FLOOR_DEFAULT_H { BpGovern::TOKEN_FLOOR_H() }
 # Seconds past token expiry before a token-pause wakes. The refresh happens at
 # or before expiry; the margin absorbs clock skew between this host and the
 # issuer, which is why it is not zero.
