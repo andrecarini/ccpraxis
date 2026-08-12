@@ -116,11 +116,20 @@ sub _slurp {
 }
 
 # =====================================================================================
-# Table location -- mirrors BpOrch::parse_dag's own latch/terminator EXACTLY (spec §1.1):
-# the first `|`-row containing the literal "depends_on" is the header; the table ends
-# at the first subsequent non-`|` line. split(..., -1) keeps a trailing empty element
-# so join("\n", @lines) round-trips a file byte-for-byte when nothing in it changes.
+# Table location -- DIVERGES from BpOrch::parse_dag's latch on purpose (a02 defect 7 /
+# spec §2.4, §5.3). parse_dag (the READER) still latches onto the first `|`-row anywhere
+# containing "depends_on"; that is unchanged here and is s03's decision to revisit.
+# This WRITER anchors on the "## Package status" heading and searches only inside that
+# section, so an ordinary prose table above it (which may itself name "depends_on" in a
+# header) can never be captured. If the heading is present but its section has no
+# depends_on row, this REFUSES (returns undef) rather than falling back to a global
+# re-scan -- a re-scan is exactly the bug this fixes. If the heading is absent entirely,
+# this falls back to today's whole-document scan (legacy documents, spec observable 35).
+# split(..., -1) keeps a trailing empty element so join("\n", @lines) round-trips a file
+# byte-for-byte when nothing in it changes.
 # =====================================================================================
+
+my $PKG_STATUS_HEAD_RE = qr/^##\s+Package\s+status\b/i;
 
 sub _table_cols {
     my ($ln) = @_;
@@ -130,14 +139,76 @@ sub _table_cols {
     return @c;
 }
 
+my $FENCE_RE = qr/^\s*(?:`{3,}|~{3,})/;
+
 sub locate_table {
     my ($B) = @_;
     my @lines = split /\n/, $B, -1;
-    my $hdr_i;
+
+    # 1. Anchor on the heading; search only inside that section. Absent -> legacy
+    #    whole-document fallback.
+    #
+    # step-6 red-team MAJOR-6: $PKG_STATUS_HEAD_RE previously matched the
+    # FIRST "## Package status"-shaped line anywhere, including inside a
+    # fenced code block -- a blueprint documenting its own format (authoring
+    # guidance actively encourages this) bricks EVERY typed write for the
+    # whole document, since the "section" it computes ends at the REAL
+    # heading (also `^##\s`) with no depends_on row in the empty span between
+    # them. Fixed two ways: (a) skip fenced regions (``` / ~~~) entirely when
+    # collecting heading candidates, so a documentation fence can never be
+    # mistaken for the real section start; (b) collect EVERY unfenced
+    # candidate and try them in document order, refusing only after every
+    # candidate's section has been searched and none has a depends_on row --
+    # not just the first candidate found, per the same reasoning.
+    my @candidates;
+    my $in_fence = 0;
     for my $i (0 .. $#lines) {
+        if ($lines[$i] =~ $FENCE_RE) { $in_fence = !$in_fence; next }
+        next if $in_fence;
+        push @candidates, $i if $lines[$i] =~ $PKG_STATUS_HEAD_RE;
+    }
+
+    my ($lo, $hi);
+    if (@candidates) {
+        for my $sec (@candidates) {
+            $lo = $sec + 1;
+            $hi = $#lines;
+            for my $j ($sec + 1 .. $#lines) {
+                if ($lines[$j] =~ /^##\s/) { $hi = $j - 1; last }
+            }
+            my $hdr_i;
+            for my $i ($lo .. $hi) {
+                if ($lines[$i] =~ /^\s*\|/ && $lines[$i] =~ /depends_on/) { $hdr_i = $i; last }
+            }
+            next unless defined $hdr_i;
+            # 3. Terminator: first subsequent non-`|` line WITHIN this section, else
+            #    the section's own end (secondary fix: previously unbounded, ran to
+            #    EOF regardless of $hi -- harmless in practice since a `## ` heading
+            #    is never a `|`-row, but the two bounds should agree).
+            my $end_i = $hi + 1;
+            for my $i ($hdr_i + 1 .. $hi) {
+                if ($lines[$i] !~ /^\s*\|/) { $end_i = $i; last }
+            }
+            return {
+                lines => \@lines,
+                hdr_i => $hdr_i,
+                end_i => $end_i,
+                cols  => [ _table_cols($lines[$hdr_i]) ],
+            };
+        }
+        return undef;   # REFUSE; no legacy re-scan once ANY heading was found
+    }
+
+    ($lo, $hi) = (0, $#lines);
+
+    # 2. Header row = first `|`-row containing "depends_on" WITHIN [$lo..$hi].
+    my $hdr_i;
+    for my $i ($lo .. $hi) {
         if ($lines[$i] =~ /^\s*\|/ && $lines[$i] =~ /depends_on/) { $hdr_i = $i; last }
     }
     return undef unless defined $hdr_i;
+
+    # 3. Terminator unchanged: first subsequent non-`|` line, else EOF.
     my $end_i = scalar(@lines);
     for my $i ($hdr_i + 1 .. $#lines) {
         if ($lines[$i] !~ /^\s*\|/) { $end_i = $i; last }
@@ -151,6 +222,31 @@ sub locate_table {
 }
 
 sub _is_sep_row { return $_[0] =~ /^\s*\|[\s:|-]+\|?\s*$/ }
+
+# step-6 reviewer M1 / red-team MAJOR-5: locate_table (this WRITER, above) is
+# heading-anchored; BpOrch::parse_dag (the READER, bp-orchestrator.pl) is
+# deliberately left on its old global first-match latch -- it still returns
+# the FIRST `|`-row anywhere in the document containing "depends_on", fenced
+# or not, heading or not (s03's decision to revisit, not this package's).
+# When a document also carries a prose table above "## Package status" whose
+# own header cell happens to say "depends_on", the two now disagree about
+# which table is real: the writer correctly ignores the prose table, but the
+# reader latches onto it and returns an EMPTY dag -- silently, since
+# add-package still reports success. Detects that divergence at write time
+# so at least the write call is LOUD about it (bp-validate-dag.pl's own
+# header-hijack check only runs at drive-solo preflight, not on every typed
+# write -- see M1). Returns true iff the reader's own latch point differs
+# from the line this write actually targeted.
+sub _reader_hijack_risk {
+    my ($orig, $hdr_i) = @_;
+    my @lines = split /\n/, $orig, -1;
+    for my $i (0 .. $#lines) {
+        if ($lines[$i] =~ /^\s*\|/ && $lines[$i] =~ /depends_on/) {
+            return $i != $hdr_i;
+        }
+    }
+    return 0;   # no depends_on row anywhere -- reader and writer cannot diverge
+}
 
 # =====================================================================================
 # Decisions-section location & shape detection (b42-decision-context-split-spec §4).
@@ -641,6 +737,13 @@ sub op_add_package {
         my $tbl = locate_table($orig);
         return (undef, "no package-status table found (no 'depends_on' column header)") unless $tbl;
 
+        if (_reader_hijack_risk($orig, $tbl->{hdr_i})) {
+            print STDERR "bp-blueprint: add-package: WARNING: header-hijack risk -- a depends_on-bearing "
+                        . "prose table elsewhere in this document will make the orchestrator's DAG reader "
+                        . "(parse_dag) latch onto a DIFFERENT table than this write targeted; it may see an "
+                        . "empty or wrong dag for this package. Run bp-validate-dag.pl before relying on it.\n";
+        }
+
         return (undef, "package '$pkg' already exists in the table") if defined find_row_index($tbl, $pkg);
 
         my $dag = BpOrch::parse_dag($orig);
@@ -660,6 +763,16 @@ sub op_add_package {
 
         my @lines = @{ $tbl->{lines} };
         splice(@lines, $tbl->{end_i}, 0, $row);
+
+        # a02 defect 5 §2.6: no refusal (blueprint authoring adds every row before any
+        # ledger exists) -- just a loud stderr notice naming what the orchestrator will
+        # do about it. Fires only here, at the tail of an otherwise-valid add.
+        my $ledger_path = dirname($opt{file}) . "/packages/$pkg.md";
+        unless (-f $ledger_path) {
+            print STDERR "bp-blueprint: add-package: notice: no ledger at $ledger_path -- the orchestrator "
+                        . "will HOLD this package (logged as awaiting_ledger) and not launch it until one exists.\n";
+        }
+
         return (join("\n", @lines), undef);
     });
 }
@@ -737,6 +850,81 @@ sub op_set_deps {
     });
 }
 
+# -------------------------------------------------------------------------------------
+# op_set_test_paths — full-replacement write of a PACKAGE LEDGER's `test_paths:`
+# frontmatter field (a02 defect 2 / spec §2.2). `--widen-write-set`
+# (bp-answer-decision.pl, outside this write set) is the precedent for `write_set`;
+# there was no counterpart for `test_paths` before this. Operates on a package
+# ledger, NOT blueprint.md -- shape-validated so it cannot be mis-aimed at the wrong
+# file. Full replacement only; there is deliberately no additive/widen mode (spec
+# out-of-scope).
+# -------------------------------------------------------------------------------------
+sub op_set_test_paths {
+    my @args = @_;
+    my %opt;
+    my $ok;
+    { local $SIG{__WARN__} = sub { };
+      $ok = GetOptionsFromArray(\@args, \%opt, 'file=s', 'paths=s'); }
+    arg_error('set-test-paths', 'unrecognised option') unless $ok;
+    arg_error('set-test-paths', 'unexpected extra arguments: ' . join(' ', @args)) if @args;
+    for my $r (qw(file paths)) {
+        arg_error('set-test-paths', "missing required --$r") unless defined $opt{$r};
+    }
+
+    my $paths = $opt{paths};
+    if ($paths !~ /\S/) {
+        arg_error('set-test-paths',
+            'refusing to clear test_paths: an empty scope would remove the oracle boundary the guard enforces');
+    }
+    unless (field_safe($paths)) {
+        arg_error('set-test-paths', '--paths contains a pipe or newline');
+    }
+    for my $entry (split /:/, $paths, -1) {
+        if ($entry eq '') {
+            arg_error('set-test-paths', "--paths has an empty entry; repo-relative paths only (colon-separated)");
+        }
+        if ($entry =~ m{^/}) {
+            arg_error('set-test-paths',
+                "--paths entry '$entry' is absolute; repo-relative paths only");
+        }
+        if ($entry =~ m{(^|/)\.\.(/|$)}) {
+            arg_error('set-test-paths',
+                "--paths entry '$entry' contains '..'; repo-relative paths only");
+        }
+        # step-6 red-team MAJOR-3: a pattern this broad LOSES every specificity
+        # comparison in guard-writes.sh (its own character length is 1-4,
+        # shorter than virtually any write_set entry), which silently flips
+        # the whole-package implementer guard from "everything looks like a
+        # test" (loud, HEAD's own over-broad-test_paths failure mode) to
+        # "nothing does" (silent) under the new ranking. Refuse pure-wildcard
+        # or project-root-equivalent entries explicitly rather than accepting
+        # a value that is syntactically valid but functionally disables the
+        # oracle boundary this verb exists to protect.
+        if ($entry =~ m{\A(?:\*+|\*\*/\*|\.|\./|/)\z}) {
+            arg_error('set-test-paths',
+                "--paths entry '$entry' is a pure wildcard or project-root-equivalent scope; it would functionally disable the test-oracle guard for this package");
+        }
+    }
+
+    run_write('set-test-paths', $opt{file}, sub {
+        my ($orig) = @_;
+        unless ($orig =~ /\A---\s*\n(.*?)\n---/s) {
+            return (undef, "$opt{file} is not a package ledger (no frontmatter block at byte 0)");
+        }
+        my $fm = $1;
+        unless ($fm =~ /^package:\s*\S/m) {
+            return (undef, "--file must be a package ledger, not blueprint.md (no `package:` line in frontmatter)");
+        }
+        unless ($fm =~ /^test_paths:\s*/m) {
+            return (undef, "no `test_paths:` key in the frontmatter -- refusing to invent one");
+        }
+        my $new = $orig;
+        my $replaced = ($new =~ s/^test_paths:.*$/test_paths: $paths/m);
+        return (undef, "internal error: could not locate test_paths: line to replace") unless $replaced;
+        return ($new, undef);
+    });
+}
+
 sub op_add_decision {
     my @args = @_;
     my %opt;
@@ -762,8 +950,15 @@ sub op_add_decision {
           . 'run). Rephrase without the literal token.');
     }
 
+    for my $f (qw(text decided date)) {
+        next unless defined $opt{$f};
+        arg_error('add-decision',
+            "--$f contains a pipe or newline; a decisions row is ONE line and `|` delimits its cells "
+          . '(the same constraint field_safe already enforces for --id). Pass a single line.')
+            unless field_safe($opt{$f});
+    }
+
     my $text = $opt{text};
-    $text =~ s/[\r\n]+/ /g;
     my $entry = "- $opt{id}: $text";
 
     run_write('add-decision', $opt{file}, sub {
@@ -1254,6 +1449,7 @@ my %DISPATCH = (
     'add-package'  => \&op_add_package,
     'set-status'   => \&op_set_status,
     'set-deps'     => \&op_set_deps,
+    'set-test-paths' => \&op_set_test_paths,
     'add-decision' => \&op_add_decision,
     'set-decision' => \&op_set_decision,
     'add-harvest'  => \&op_add_harvest,

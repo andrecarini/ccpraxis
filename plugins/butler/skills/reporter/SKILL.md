@@ -107,9 +107,19 @@ rather than treated as `stuck-package` by default.
 
 You decide *what* the answer is with the user (the intent — discuss it, draft any corrective note). The **mechanical unblock is deterministic** — never hand-edit ledgers or delete queue files yourself; run:
 
+Bind `--note` from a **single-quoted heredoc**, never an inline double-quoted literal: an
+inline guidance string containing backticks or `$(...)` gets command-substituted by the shell
+**before the script ever sees the argument**, so a mandate can reach the ledger with a silent
+hole in it. A single-quoted heredoc delimiter (`<<` followed by `'EOF'`) closes that hole; an
+unquoted delimiter reopens it, so always quote it.
+
 ```
+NOTE=$(cat <<'EOF'
+...guidance, backticks and all, safe...
+EOF
+)
 perl "${CLAUDE_PLUGIN_ROOT}/scripts/bp-answer-decision.pl" $0 --bp-dir "<bpdir>" \
-     --decision <pkg--shortid> --action <relaunch|reset|accept|drop|resume> [--note "<guidance>"]
+     --decision <pkg--shortid> --action <relaunch|reset|accept|drop|resume> --note "$NOTE"
 ```
 
 - **Package parks** (`stuck-package` / `harvest-failure` / `harvest-spawn-failure`): `relaunch` (default) appends your `--note` to the ledger as a corrective section, sets the package back to `pending`, and resets its attempt budget — the orchestrator relaunches it next tick (it re-reads ledgers every tick; **no restart needed**). `accept` marks it `done` as-is (the output is actually fine); `drop` abandons it.
@@ -124,8 +134,12 @@ The script is fail-closed (a wrong action for the kind exits non-zero and change
 **Reset a package with no queued decision (#29).** When a package is wedged at the attempt cap or churning in its resolve-judge and the user wants a *clean retry* — a fresh coordinator with a reset budget rather than the resolve path or waiting on a verdict — do **not** hand-edit the registry, kill processes, or delete markers yourself. Run the deterministic reset: it supersedes any in-flight coordinator/judge for the package (kills it + clears its markers), resets the attempt **and** resolve budgets, sets the package `pending`, and clears any of its queued decisions — so the still-running orchestrator relaunches it fresh on its next tick (no orchestrator restart needed).
 
 ```
+NOTE=$(cat <<'EOF'
+...guidance, backticks and all, safe...
+EOF
+)
 perl "${CLAUDE_PLUGIN_ROOT}/scripts/bp-answer-decision.pl" $0 --bp-dir "<bpdir>" \
-     --package <pkg> --action reset [--note "<guidance>"]
+     --package <pkg> --action reset --note "$NOTE"
 ```
 
 **Widen a package's `write_set` (a decision only you are sanctioned to make).** A coordinator or judge sometimes needs to touch a file the package's ledger doesn't already declare — e.g. a shared config it turns out has to change too. The guard hook blocks any write outside the declared `write_set`, and hand-editing the ledger's frontmatter yourself is exactly the move the protocol forbids (the guard would then block *that* write too, or worse, silently drift the ledger and the guard's model of it apart). The sanctioned unblock:
@@ -136,6 +150,15 @@ perl "${CLAUDE_PLUGIN_ROOT}/scripts/bp-answer-decision.pl" $0 --bp-dir "<bpdir>"
 ```
 
 This ADDS `<path>` to the package's `write_set` — additively only, going through `bp-ledger.pl`'s own byte-level splice/validate/atomic-write engine, never a second frontmatter writer. Every existing path survives untouched; nothing is ever narrowed or replaced (`--set-write-set`, a full-replacement form, is refused outright — there is no supported way to shrink or overwrite `write_set` through this script). Widening is independent of `--action`: it does not touch ledger status, `last_updated`, or the registry, so you can widen and separately relaunch/reset/accept/drop in whatever order makes sense.
+
+**Replace a package's `test_paths` (the `write_set` verb's counterpart for the test-scope field).** `bp-blueprint.pl set-test-paths` is the `test_paths` sibling of `--widen-write-set` above, but it lives in `bp-blueprint.pl` (not `bp-answer-decision.pl`) and it is a **full replacement**, not additive:
+
+```
+perl "${CLAUDE_PLUGIN_ROOT}/scripts/bp-blueprint.pl" set-test-paths \
+     --file <bpdir>/packages/<pkg>.md --paths <colon-separated repo-relative paths>
+```
+
+It rewrites only the ledger's `test_paths:` line (every other byte, including `last_updated:`, is untouched), refuses an empty or malformed `--paths` list, and refuses a file that is not shaped like a package ledger. There is no additive `--widen-test-paths` mode; pass the full desired list.
 
 **Why this is not the `mandated_means` move.** `mandated_means:` is a *requirement* a package spec sets before implementation begins, and it has (and must keep having) **no op** to change it after the fact — rewriting a requirement to match whatever got built would defeat the entire mechanism the field exists for (it stops being a constraint and becomes a rubber stamp). `write_set`, by contrast, is not a requirement being retrofitted; it is the **scope of an in-flight answer** to a decision — a human, mid-run, sanctioning one additional path because the work genuinely needs it. The two look alike (both are frontmatter fields that bound what a package may do) and it is precisely that resemblance that would let a careless "just widen it" instinct slide into "just edit `mandated_means` to match" — which is the thing this distinction exists to head off. If you ever find yourself wanting to change `mandated_means` post hoc, that is not a decision to answer through this script; it is a sign the spec itself needs revisiting.
 

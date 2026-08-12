@@ -268,6 +268,7 @@ sub ready_packages {
     for my $pkg (sort keys %$meta) {
         my $st = $status->{$pkg} // 'pending';
         next unless $st eq 'pending';
+        next if $meta->{$pkg}{ledger_missing};
         next unless deps_met($meta->{$pkg}{deps}, $status);
         my $ws = $meta->{$pkg}{write_set};
         next if grep { write_sets_overlap($ws, $_) } @run_ws;
@@ -468,6 +469,23 @@ sub dag_stall {
         return { stalled => 0, reason => 'launchable', pending => \@pending, ready => \@ready, blockers => [], unresolvable => [] };
     }
 
+    # step-6 red-team MAJOR-4: ready_packages() (:271) also excludes a pending
+    # package whose ledger file is missing (`ledger_missing`), even when its
+    # deps are otherwise met. That is a SECOND reason ready_packages can
+    # return empty, on top of "every pending package has an unmet dep" -- the
+    # only reason this function's own exhaustiveness comment (:421-425)
+    # documents. Left unaccounted for, `stalled == 1` could hold with BOTH
+    # @blockers and @unresolvable empty, breaking that invariant and leaving
+    # the hold with no artefact this function's callers can route anywhere.
+    # Surface each such package as its own `unresolvable` entry (a distinct
+    # `held-no-ledger` code, not folded into `dep-*`, since nothing about its
+    # DEPENDENCY graph is unresolved -- only its own ledger file is absent) so
+    # dag_stall_step (the caller that turns this into a `queue_needs_you`
+    # decision) has something to route.
+    my @held = grep {
+        $m{$_}{ledger_missing} && deps_met($m{$_}{deps}, $status)
+    } @pending;
+
     # ---- stalled: classify every pending package's unmet deps -------------
     my %node_set = map { $_ => 1 } @pending;
     for my $pkg (@pending) {
@@ -518,6 +536,10 @@ sub dag_stall {
     for my $c (@cycles) {
         push @unresolvable, { code => 'dep-cycle', package => $c->[0], detail => undef, members => $c,
             message => 'dependency cycle: ' . join(' -> ', @$c, $c->[0]) };
+    }
+    for my $pkg (@held) {
+        push @unresolvable, { code => 'held-no-ledger', package => $pkg, detail => undef, members => [],
+            message => "package '$pkg' has met dependencies but no ledger file (packages/$pkg.md) -- held until one is added" };
     }
     @unresolvable = sort {
         $a->{code} cmp $b->{code} || $a->{package} cmp $b->{package} || (($a->{detail} // '') cmp ($b->{detail} // ''))
@@ -1900,7 +1922,7 @@ sub _load_state {
     my (%meta, %status, %att, %pid, %sid);
     for my $pkg (keys %$dag) {
         $status{$pkg} = ledger_fm($bpdir, $pkg, 'status') // ($reg->{$pkg}{status} // 'pending');
-        $meta{$pkg}   = { deps => $dag->{$pkg}, write_set => (ledger_fm($bpdir, $pkg, 'write_set') // ''), priority => ledger_fm($bpdir, $pkg, 'priority'), requires_clean_tree => ledger_fm($bpdir, $pkg, 'requires_clean_tree') };
+        $meta{$pkg}   = { deps => $dag->{$pkg}, write_set => (ledger_fm($bpdir, $pkg, 'write_set') // ''), priority => ledger_fm($bpdir, $pkg, 'priority'), requires_clean_tree => ledger_fm($bpdir, $pkg, 'requires_clean_tree'), ledger_missing => (-f "$bpdir/packages/$pkg.md" ? 0 : 1) };
         $att{$pkg}    = $reg->{$pkg}{attempt} // 0;
         $pid{$pkg}    = $reg->{$pkg}{pid};
         $sid{$pkg}    = $reg->{$pkg}{session_id};
@@ -2103,6 +2125,12 @@ sub run {
         else { $exec_fail_streak = 0; %exec_counted = (); }
     };
 
+    # a02 defect 5 / spec §2.5: a package row with no packages/<pkg>.md ledger on
+    # disk is HELD (never launched, never counted as launch_failed). Dedupe hash
+    # for the 'awaiting_ledger' log event -- ONE per package per run, cleared when
+    # the flag goes away so a recurrence (ledger deleted again) is reported again.
+    my %awaiting;
+
     my $err;
     eval {
         while (!$STOP) {
@@ -2111,6 +2139,44 @@ sub run {
             %exec_counted = ();       # the exec-failure dedupe is per tick
 
             my ($meta, $status, $att, $pid, $sid) = _load_state($bpdir, $runs);
+
+            for my $pkg (sort keys %$meta) {
+                if ($meta->{$pkg}{ledger_missing}) {
+                    unless ($awaiting{$pkg}) {
+                        _log($log, 'awaiting_ledger', {
+                            package => $pkg, ledger => "packages/$pkg.md",
+                            detail  => 'blueprint.md lists this package but no ledger exists on disk; '
+                                     . 'held (not launched) until one does',
+                        });
+                        $awaiting{$pkg} = 1;
+                    }
+                    # step-6 red-team MAJOR-4: the log line above is the ONLY
+                    # artefact of a ledger_missing hold, and nothing reads the
+                    # log (grepped across plugins/ by the red-team). Without
+                    # this, a permanent hold is a silent infinite poll: no
+                    # queued decision, no idle-exit (has_progressable_work
+                    # sees a 'pending' package and keeps the loop alive), no
+                    # operator-visible signal after the first tick. Route it
+                    # to the same runs/needs-you/ surface every other
+                    # operator-facing stall uses. queue_needs_you dedupes
+                    # persistently on (package, kind), so calling it every
+                    # tick is safe -- it becomes a no-op after the first.
+                    queue_needs_you($runs, {
+                        package    => $pkg,
+                        blueprint  => $bp,
+                        kind       => 'awaiting-ledger',
+                        question   => "Package '$pkg' is listed in blueprint.md's package-status table "
+                                    . "but has no ledger file (packages/$pkg.md). It is held -- never "
+                                    . "launched, no attempt burned -- until one exists. Run "
+                                    . "'bp-blueprint.pl add-package' (or otherwise create the ledger) "
+                                    . "then answer this decision.",
+                        context    => { ledger => "packages/$pkg.md" },
+                        created_at => $now,
+                    }, $bpdir);
+                } else {
+                    delete $awaiting{$pkg};
+                }
+            }
 
             # b07: per-tick DAG-append merge of runs/remediation-queue.json into
             # %meta/%status (spec-08 §3.1, D1) — no orchestrator restart is ever
