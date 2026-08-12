@@ -17,9 +17,13 @@
 #
 # stdout is ALWAYS empty, EXCEPT `rotate --dry-run`, which is a report-only op by
 # spec (b45 §3) and prints its report to stdout while touching nothing. stderr on any
-# non-zero exit is EXACTLY ONE line. `append-attempt` may ALSO print one budget-warning
-# line to stderr on an otherwise-successful (exit 0) run — see BUDGET_BYTES below; that
-# is not a rejection, just visibility, and the append still happens.
+# non-zero exit is EXACTLY ONE line. `append-attempt` may ALSO print one budget-notice
+# line to stderr on an otherwise-successful (exit 0) run — see DEFAULT_BUDGET_BYTES
+# below; that is not a rejection, just visibility, and the append still happens.
+# `rotate` may likewise print one LEDGER_IRREDUCIBLE notice to stderr on an otherwise-
+# successful (exit 0) run when it determines the ledger cannot be reduced further
+# (a03-ledger-budget-irreducible spec §2.1/§2.5) — same non-error notice shape, same
+# one-line discipline.
 #
 # Core Perl only: strict, warnings, Getopt::Long, Fcntl(:flock), JSON::PP, B. No
 # other module may be loaded on any path (latency constraint, §2.5).
@@ -60,6 +64,99 @@ sub arg_error      { my ($sub, $msg)          = @_; emit_err("bp-ledger: $sub: $
 sub io_error       { my ($sub, $path, $msg)   = @_; emit_err("bp-ledger: $sub: $path: $msg"); exit 4 }
 sub reject_error   { my ($sub, $path, $detail)= @_; emit_err("bp-ledger: $sub: $path: $detail"); exit 2 }
 sub notfound_error { my ($sub, $path, $msg)   = @_; emit_err("bp-ledger: $sub: $path: $msg"); exit 5 }
+
+# A NOTICE is a state of the ledger, never an outcome of the call (a03 spec §2.1): it
+# must NOT reuse the `bp-ledger: <sub>: <path>: <msg>` shape the four error helpers
+# above emit (that shape is indistinguishable from a real rejection), and it must carry
+# a stable, greppable, machine-readable TOKEN right after the op prefix (spec §2.2) so a
+# caller can tell the three budget outcomes apart without parsing English. Exit code is
+# whatever the caller was already going to exit with (0, always, for a notice) — this
+# never calls exit itself.
+sub emit_notice {
+    my ($sub, $token, $msg) = @_;
+    $msg =~ s/[\r\n]+/ /g;
+    print STDERR "bp-ledger: $sub: $token: $msg\n";
+}
+
+# =====================================================================================
+# Budget-notice marker (a03 spec §2.1) — cross-process suppression for the ONE-TIME
+# "this ledger is irreducible" fact. A sidecar file next to the ledger, so it survives
+# across processes (a per-process flag is explicitly NOT acceptable — each bp-ledger.pl
+# invocation is a fresh process). `rotate` writes it when it determines irreducibility
+# and clears it the moment a rotate finds the ledger reducible again; `append-attempt`
+# clears it the moment the ledger is genuinely back under budget. Either clearing means
+# the NEXT over-budget notice starts fresh, so suppression can never go stale (spec's
+# own bullet: "stale suppression is a worse defect than the noise it replaces").
+# =====================================================================================
+
+sub budget_marker_path { return "$_[0].budget-state" }
+
+# Trust window for a "notified, stop repeating" marker (red-team step6 MAJOR-1): the
+# sidecar lives in the same directory as the ledger, outside ledger-guard.sh's
+# `packages/*.md` glob, so anything with ordinary write access to that directory can
+# plant one without ever running a genuine `rotate`. This file cannot cheaply re-derive
+# rotate's own floor/forced-entry computation to *prove* a marker's claim, so instead it
+# bounds how long a "notified" marker is trusted before append-attempt re-asserts the
+# notice regardless of what the marker says. A forged or stale marker therefore fails
+# toward NOISY, never toward permanently silent -- the worst a forgery/staleness can do
+# is delay one re-notification by at most this many seconds, not suppress forever.
+# Override for tests only (mirrors the BP_LEDGER_FAIL_RENAME test-only seam above).
+my $BUDGET_MARKER_TTL_SECONDS = 3600;
+if (defined $ENV{BP_LEDGER_BUDGET_MARKER_TTL} && $ENV{BP_LEDGER_BUDGET_MARKER_TTL} =~ /^\d+$/) {
+    $BUDGET_MARKER_TTL_SECONDS = $ENV{BP_LEDGER_BUDGET_MARKER_TTL};
+}
+
+# Deliberately a plain truncate-and-write, not the tmp+rename+read-back ceremony the
+# ledger/history writes use elsewhere in this file (reviewer step6 MINOR): the marker is
+# a single short advisory line, its own worst-case torn-read is "treat it as absent/
+# stale and re-notify" (see budget_marker_fresh above), which is already the fail-safe
+# this file wants -- the ceremony would add real complexity for no correctness gain here.
+sub mark_irreducible {
+    my ($ledger) = @_;
+    open(my $fh, '>', budget_marker_path($ledger)) or return;
+    print {$fh} "irreducible pending " . time() . "\n";
+    close $fh;
+}
+
+sub mark_irreducible_notified {
+    my ($ledger) = @_;
+    open(my $fh, '>', budget_marker_path($ledger)) or return;
+    print {$fh} "irreducible notified " . time() . "\n";
+    close $fh;
+}
+
+sub clear_budget_marker {
+    my ($ledger) = @_;
+    my $p = budget_marker_path($ledger);
+    unlink $p if -e $p;
+}
+
+sub read_budget_marker {
+    my ($ledger) = @_;
+    my $p = budget_marker_path($ledger);
+    return undef unless -e $p;
+    open(my $fh, '<', $p) or return undef;
+    my $line = <$fh>;
+    close $fh;
+    return undef unless defined $line;
+    chomp $line;
+    my ($state, $flag, $ts) = split(' ', $line);
+    return undef unless defined $state;
+    return { state => $state, flag => ($flag // ''), ts => $ts };
+}
+
+# Was this marker's "notified" claim stamped recently enough (by a real bp-ledger.pl
+# process, in the past, within the trust window) to still be honoured? A missing,
+# non-numeric, or future timestamp is exactly what a hand-planted forgery looks like
+# (the demonstrated attack wrote no timestamp at all) -- treat any of those as already
+# expired rather than trusting them, so the fail-safe direction is always toward noise.
+sub budget_marker_fresh {
+    my ($ts) = @_;
+    return 0 unless defined $ts && $ts =~ /^\d+$/;
+    my $now = time();
+    return 0 if $ts > $now;
+    return ($now - $ts) < $BUDGET_MARKER_TTL_SECONDS;
+}
 
 sub iso_now {
     my @t = gmtime(time);
@@ -478,9 +575,17 @@ sub run_op {
         io_error($sub, $path, "value did not survive the write");
     }
 
+    # a03-ledger-budget-irreducible spec: $post_cb (the budget-marker read/mutate) must
+    # run under the SAME lock discipline on every path through run_op -- the no-op path
+    # above already calls it before releasing the lock (it never explicitly unlocks;
+    # process exit does that). Calling it here, before flock(LOCK_UN), keeps this path
+    # consistent with that one and with op_rotate's own $finalize_budget_state (always
+    # called before its flock(LOCK_UN)) -- all three marker-mutation sites now agree.
+    # Reviewer step6 MAJOR / red-team MINOR-2: previously this ran AFTER the unlock,
+    # opening a race window against a concurrent invocation on the same lockfile.
+    $post_cb->($new) if $post_cb;
     flock($lk, LOCK_UN);
     close($lk);
-    $post_cb->($new) if $post_cb;
     exit 0;
 }
 
@@ -557,10 +662,34 @@ sub op_append_attempt {
     my $budget_check = sub {
         my ($bytes) = @_;
         my $size = length($bytes);
-        if ($size > DEFAULT_BUDGET_BYTES) {
-            emit_err("bp-ledger: append-attempt: $opt{ledger} is $size bytes, exceeding the "
-                . DEFAULT_BUDGET_BYTES . "-byte budget; run: bp-ledger.pl rotate --ledger $opt{ledger}");
+        if ($size <= DEFAULT_BUDGET_BYTES) {
+            # Genuinely back under budget: any prior suppression is stale now, and any
+            # prior "reducible" notice state is moot -- clear the marker so the NEXT
+            # over-budget encounter (whatever it turns out to be) starts fresh (spec
+            # §2.1's own bullet on staleness).
+            clear_budget_marker($opt{ledger});
+            return;
         }
+        my $marker = read_budget_marker($opt{ledger});
+        if ($marker && $marker->{state} eq 'irreducible') {
+            # A rotate already determined this ledger cannot be reduced further.
+            # Say it once (the marker's own "notified" flag), not on every append --
+            # but only while that "notified" claim is still within its trust window
+            # (red-team step6 MAJOR-1). A forged or stale marker falls through here and
+            # re-notifies rather than staying silent forever.
+            return if $marker->{flag} eq 'notified' && budget_marker_fresh($marker->{ts});
+            emit_notice('append-attempt', 'LEDGER_IRREDUCIBLE',
+                "$opt{ledger} is $size bytes, over the " . DEFAULT_BUDGET_BYTES
+                . '-byte budget; a prior rotate already determined this ledger cannot be reduced '
+                . 'further -- see that rotate run for the diagnosis. Not repeated on subsequent appends.');
+            mark_irreducible_notified($opt{ledger});
+            return;
+        }
+        # b45 §4: visibility, never a refusal. The append has already happened (or is a
+        # no-op) by the time this fires; we only ever notify, never block.
+        emit_notice('append-attempt', 'BUDGET_OVER',
+            "$opt{ledger} is $size bytes, exceeding the " . DEFAULT_BUDGET_BYTES
+            . "-byte budget; run: bp-ledger.pl rotate --ledger $opt{ledger}");
     };
     run_op('append-attempt', $opt{ledger},
         sub { return splice_insert_entry($_[0], qr/^##\s+Decisions & attempt log\b/m, $entry) },
@@ -698,8 +827,30 @@ sub derive_history_path {
 sub ensure_dir_exists {
     my ($dir) = @_;
     return 1 if -d $dir;
-    my @parts = split(m{/}, $dir);
-    my $cur = ($dir =~ m{^/}) ? '' : '.';
+    # Drive-RELATIVE (red-team step6 MAJOR-2): "C:foo" (a colon with NO separator
+    # right after it) is a distinct, legal Windows path form that resolves against
+    # that drive's own process-specific "current directory" -- something this function
+    # has no way to know or safely guess. Falling through to the generic branches below
+    # would silently rebuild the whole path as a literally-named "C:foo" directory
+    # relative to the CWD (demonstrated) -- the exact stray-directory class §2.4 exists
+    # to close, just for an input shape the drive-absolute fix didn't cover. Refuse
+    # outright rather than guess; the caller already treats a false return as io_error.
+    return 0 if $dir =~ m{^[A-Za-z]:(?![\\/])};
+    my @parts = split(m{[\\/]}, $dir);
+    my $cur;
+    if ($dir =~ m{^([A-Za-z]:)[\\/]}) {
+        # Windows drive-absolute (a03 spec §2.4/§1c): the walk must start AT the drive
+        # root (e.g. "C:"), never be treated as relative -- the bug this fixes rebuilt
+        # the whole tree under the process cwd as a stray "./C:/..." directory.
+        $cur = $1;
+        shift @parts; # the split's first element is the same "C:" already in $cur
+    }
+    elsif ($dir =~ m{^[\\/]}) {
+        $cur = '';
+    }
+    else {
+        $cur = '.';
+    }
     for my $p (@parts) {
         next if $p eq '';
         $cur .= '/' . $p;
@@ -805,17 +956,46 @@ sub op_rotate {
     $moved_bytes += ($_->{end} - $_->{start}) for @moved;
     my $new_len = $const_len + $suffix_len[$k];
 
-    if ($unreachable) {
-        emit_err("bp-ledger: rotate: $ledger: $new_len bytes, over the $budget-byte budget after "
-            . "rotating everything it legitimately can (floor --keep $floor_k non-marker entries "
-            . "(" . $suffix_len[$k] . " bytes) + " . scalar(@forced) . " MEANS-DEVIATION entry/ies "
-            . "($forced_len bytes) + fixed sections are, together, already over budget). "
-            . 'Not reducible further without either dropping mandated retention or losing the record.');
-    }
+    # a03 spec §2.1/§2.3: the irreducible fact is a STATE, reported via emit_notice's
+    # distinct, non-error-shaped, machine-readable-token line -- never emit_err's
+    # `bp-ledger: <sub>: <path>: <msg>` shape. Diagnosis wording is preserved verbatim
+    # (done-criterion 4); only the framing (prefix/token) changes.
+    my $irreducible_msg = $unreachable
+        ? "$ledger is $new_len bytes, over the $budget-byte budget after rotating everything it "
+          . "legitimately can (floor --keep $floor_k non-marker entries (" . $suffix_len[$k]
+          . " bytes) + " . scalar(@forced) . " MEANS-DEVIATION entry/ies ($forced_len bytes) + "
+          . 'fixed sections are, together, already over budget). Not reducible further without '
+          . 'either dropping mandated retention or losing the record.'
+        : undef;
+
+    # a03 spec §2.5: exactly one stderr line on any non-zero exit. Deferring the notice
+    # to right before each SUCCESS exit point (never called on a path that is about to
+    # io_error) is how this file satisfies that invariant -- by the time this runs, every
+    # fallible step on that path has already succeeded. `touch_marker` is off for
+    # --dry-run, which is a report-only op that touches nothing on disk (header comment,
+    # bp-ledger.pl:18-19) -- the marker is disk state, so writing it would violate that.
+    my $finalize_budget_state = sub {
+        my (%o) = @_;
+        my $touch_marker = exists $o{touch_marker} ? $o{touch_marker} : 1;
+        if ($unreachable) {
+            emit_notice('rotate', 'LEDGER_IRREDUCIBLE', $irreducible_msg);
+            mark_irreducible($ledger) if $touch_marker;
+        }
+        elsif ($touch_marker) {
+            # A rotate call that finds the ledger reducible (or already fine) is exactly
+            # the "new rotate finds it reducible again" case spec §2.1 says must clear
+            # any earlier irreducible suppression.
+            clear_budget_marker($ledger);
+        }
+    };
 
     if (!@moved) {
         if ($dry_run) {
+            $finalize_budget_state->(touch_marker => 0);
             print "bp-ledger: rotate: $ledger: 0 of $total entries eligible to move; nothing to do.\n";
+        }
+        else {
+            $finalize_budget_state->();
         }
         flock($lk, LOCK_UN);
         close($lk);
@@ -828,6 +1008,7 @@ sub op_rotate {
     my $history_append = join('', map { substr($orig, $_->{start}, $_->{end} - $_->{start}) } @moved);
 
     if ($dry_run) {
+        $finalize_budget_state->(touch_marker => 0);
         my $over = $unreachable ? " -- unreachable (see prior stderr line)" : '';
         print "bp-ledger: rotate: $ledger: would move " . scalar(@moved) . " of $total entries "
             . "($moved_bytes bytes) to $history: ledger would be $new_len bytes (budget $budget)$over.\n";
@@ -874,6 +1055,11 @@ sub op_rotate {
         unlink $tmp;
         io_error('rotate', $ledger, "rename $tmp -> $ledger failed: $!");
     }
+
+    # Every fallible step on this path has now succeeded -- safe to finalize/notify
+    # (a03 spec §2.5's one-stderr-line invariant: deferred to here, so an earlier
+    # failure above never reaches this line at all).
+    $finalize_budget_state->();
 
     flock($lk, LOCK_UN);
     close($lk);
