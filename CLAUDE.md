@@ -164,8 +164,16 @@ Code writes when you disable a project plugin for yourself alone.
 `.claude/settings.json`. That guard exists because a prohibited `git stash` destroyed a completed
 fix-batch (`ef272c3`) — its thesis is that a written instruction is not an enforcement mechanism. If
 the file is untracked, a fresh clone gets the guard script and never runs it, and the registration
-survives only as prose in a commit message: the same mistake, one level up. `t/61-settings-scope-split.t`
-C5b fails if the registration goes missing.
+survives only as prose in a commit message: the same mistake, one level up.
+`t/112-subagent-stall-guard.t` asserts both registrations (this one and the subagent stall gate)
+against the real `.claude/settings.json`, and fails if either goes missing.
+
+> This paragraph previously cited `t/61-settings-scope-split.t`. **No such file exists** — `t/61`
+> is `61-judge-starvation.t`, and `t/14-hooks-selftest.t` only checks a *generated* settings blob
+> for the subagent self-test, never this repo's real `.claude/settings.json`. So the protection
+> this section relied on was itself imaginary for as long as the claim stood: exactly the
+> "a written instruction is not an enforcement mechanism" failure the section is about. If you
+> move the assertions, update this line in the same commit.
 
 **Do not re-ignore it.** It was ignored until 2026-08-06 because `skills.pl` Phase B wrote the
 picker's machine-local plugin selection into it on every launch. That write now targets

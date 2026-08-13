@@ -11,6 +11,17 @@
       "sandbox@ccpraxis-local" : true
    },
    "hooks" : {
+      "PostToolUse" : [
+         {
+            "hooks" : [
+               {
+                  "command" : "\"$CLAUDE_PROJECT_DIR\"/plugins/butler/hooks/guard-subagent-stall.sh",
+                  "type" : "command"
+               }
+            ],
+            "matcher" : "Task|Bash"
+         }
+      ],
       "PreToolUse" : [
          {
             "hooks" : [
@@ -20,6 +31,16 @@
                }
             ],
             "matcher" : "Bash"
+         }
+      ],
+      "Stop" : [
+         {
+            "hooks" : [
+               {
+                  "command" : "\"$CLAUDE_PROJECT_DIR\"/plugins/butler/hooks/guard-subagent-stall.sh",
+                  "type" : "command"
+               }
+            ]
          }
       ]
    }
