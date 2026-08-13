@@ -220,6 +220,18 @@ sub mk_entry {
     };
 }
 
+# r02: author_ledger now refuses unless a real originating verdict file exists
+# under $bpdir/runs/ (spec §2.4). Every direct author_ledger() call site below
+# needs this fixture created first, or the new gate makes it return undef and
+# every downstream assertion in that block dies/fails for the WRONG reason.
+sub mk_runs_verdict {
+    my ($bpdir) = @_;
+    make_path("$bpdir/runs");
+    open(my $fh, '>', "$bpdir/runs/conformance-verdict.json") or die "cannot write conformance-verdict.json: $!";
+    print $fh '{}';
+    close $fh;
+}
+
 # ===========================================================================
 # PART 1 — pure decision core (§2.2, §2.3, §2.4)
 # ===========================================================================
@@ -383,7 +395,7 @@ sub mk_entry {
 # ---- AC-8: author_ledger writes a ledger_fm-parseable ledger, status pending,
 #           with all body headings in template order ------------------------
 {
-    my $bpdir = "$ROOT/ledger-ac8"; make_path("$bpdir/packages");
+    my $bpdir = "$ROOT/ledger-ac8"; make_path("$bpdir/packages"); mk_runs_verdict($bpdir);
     my $finding = mk_finding(kind => 'eol_runtime', subject => 'node', detail => 'node 20 is EOL',
         remedy => { action => 'bump_runtime', runtime => 'node', from => '20', to => '22' }, evidence => {});
     my $entry = mk_entry(id => 'remediation-eol-runtime-node-r1', finding_key => 'eol-runtime-node',
@@ -411,7 +423,7 @@ sub mk_entry {
 
 # ---- AC-9: the ## Inputs section carries the finding verbatim --------------
 {
-    my $bpdir = "$ROOT/ledger-ac9"; make_path("$bpdir/packages");
+    my $bpdir = "$ROOT/ledger-ac9"; make_path("$bpdir/packages"); mk_runs_verdict($bpdir);
     my $finding = mk_finding(kind => 'conformance-deviation', subject => 'b03', detail => 'means libX not evidenced',
         evidence => { means => 'libX', files => ['src/chat/Bubble.tsx'] },
         remedy => { action => 'remediate-conformance', package => 'b03', means => 'libX' });
@@ -437,7 +449,7 @@ sub mk_entry {
 
 # ---- AC-10: mandated_means rendering shape ---------------------------------
 {
-    my $bpdir = "$ROOT/ledger-ac10"; make_path("$bpdir/packages");
+    my $bpdir = "$ROOT/ledger-ac10"; make_path("$bpdir/packages"); mk_runs_verdict($bpdir);
     my $e1 = mk_entry(id => 'remediation-b03-conf-r1', action => 'remediate-conformance', mandated_means => ['libX']);
     my $p1 = try1(sub { BpRemediate::author_ledger($bpdir, $e1, mk_ctx()) });
     if (died($p1)) { fail('AC-10: remediate-conformance ledger is authored'); diag(died($p1)); }
@@ -834,7 +846,7 @@ sub mk_entry {
     }
 }
 {
-    my $bpdir = "$ROOT/ac26c"; make_path("$bpdir/packages");
+    my $bpdir = "$ROOT/ac26c"; make_path("$bpdir/packages"); mk_runs_verdict($bpdir);
     my $any_authored = 0;
     for my $action (qw(bump_runtime declare_backpack create_lockfile commit_lockfile remediate-conformance remediate-build)) {
         (my $id = "remediation-check-$action-r1") =~ s/[^a-z0-9-]/-/g;
@@ -871,7 +883,7 @@ sub mk_entry {
             is($e->{source}, 'deps', "AC-27: entry for finding_key=$e->{finding_key} has source=deps");
             ok(defined $e->{write_set} && length($e->{write_set}) && $e->{write_set} !~ /^\s*$/,
                "AC-27: entry for finding_key=$e->{finding_key} has a non-empty write_set");
-            my $bpdir = "$ROOT/ac27-" . $e->{finding_key}; make_path("$bpdir/packages");
+            my $bpdir = "$ROOT/ac27-" . $e->{finding_key}; make_path("$bpdir/packages"); mk_runs_verdict($bpdir);
             my $path = try1(sub { BpRemediate::author_ledger($bpdir, $e, $ctx) });
             ok(!died($path) && defined $path && -f $path, "AC-27: a valid ledger is authored for finding_key=$e->{finding_key}");
         }
@@ -880,7 +892,7 @@ sub mk_entry {
 
 # ---- AC-28: git tolerance ----------------------------------------------------
 {
-    my $bpdir = "$ROOT/ac28"; make_path("$bpdir/packages");
+    my $bpdir = "$ROOT/ac28"; make_path("$bpdir/packages"); mk_runs_verdict($bpdir);
     my $finding = { kind => 'lockfile_uncommitted', subject => 'npm', detail => 'package-lock.json untracked', evidence => {},
                     remedy => { action => 'commit_lockfile', file => 'package-lock.json' }, needs_justification => 0 };
     my $entry = mk_entry(id => 'remediation-lockfile-uncommitted-npm-r1', finding_key => 'lockfile-uncommitted-npm',

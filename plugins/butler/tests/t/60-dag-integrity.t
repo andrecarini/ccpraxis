@@ -1167,8 +1167,15 @@ SKIP: {
     my $c = BpRemediate::classify_finding($find,
         { pkg_write_sets => { 'b01-blocker' => 'packages/b01-blocker/**' } });
     ok(defined($c) && ref($c) eq 'HASH', 'AC-38: classify_finding returns a disposition hash for the b08 finding shape');
-    is($c->{disposition}, 'auto',
-        "AC-38: remedy.action 'remediate-conformance' is auto-remediable, not fail-closed to 'unfixable'");
+    # r02 DC4: a dag-stall finding is a SCHEDULING STATE, not a code defect --
+    # even though its wrapped remedy (action=remediate-conformance) is fully
+    # resolvable, classify_finding must escalate it unconditionally, before
+    # the per-action dispatch table ever sees it. This oracle previously
+    # asserted the bug's own behaviour (disposition=auto); r02 reverses it.
+    is($c->{disposition}, 'escalate',
+        "AC-38: a kind='dag-stall' finding is escalated as a scheduling state, not dispatched as a defect");
+    is($c->{reason}, 'scheduling_state',
+        "AC-38: the escalation reason for a dag-stall finding is 'scheduling_state'");
 }
 
 SKIP: {

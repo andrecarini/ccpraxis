@@ -270,6 +270,21 @@ sub write_set_for {
 # §2.3 — dispatch table (the SYN-6 safety line; pure, total, never dies)
 # ===========================================================================
 
+sub _is_scheduling_state_kind {
+    my ($kind) = @_;
+    # closed, named set -- the ONLY member observed anywhere in the codebase
+    # (bp-orchestrator.pl:3778, dag_stall_step's synthetic finding). Extend by
+    # adding to this set; never by pattern-matching kind text.
+    return (defined $kind && !ref $kind && "$kind" eq 'dag-stall') ? 1 : 0;
+}
+
+sub _test_paths_ok {
+    my ($ctx) = @_;
+    return 0 unless ref $ctx eq 'HASH';
+    my $tp = $ctx->{test_paths};
+    return (defined $tp && !ref $tp && "$tp" =~ /\S/) ? 1 : 0;
+}
+
 sub classify_finding {
     my ($f, $ctx) = @_;
     $f   = {} unless ref $f   eq 'HASH';
@@ -284,46 +299,70 @@ sub classify_finding {
         return { disposition => 'escalate', action => $action, reason => 'unfixable' };
     }
 
+    # A scheduling state (a DAG stall) is not a code defect -- refuse before
+    # any per-action dispatch, regardless of how resolvable its remedy looks.
+    if (_is_scheduling_state_kind($f->{kind})) {
+        return { disposition => 'escalate', action => $action, reason => 'scheduling_state' };
+    }
+
+    my $result;
     if ($action eq 'bump_runtime') {
         my $to = $remedy->{to};
-        return (defined $to && !ref $to && length("$to"))
+        $result = (defined $to && !ref $to && length("$to"))
             ? { disposition => 'auto', action => $action, reason => '' }
             : { disposition => 'escalate', action => $action, reason => 'ambiguous' };
     }
-    if ($action eq 'declare_backpack') {
+    elsif ($action eq 'declare_backpack') {
         my $ws = write_set_for($f, $ctx);
-        return defined $ws ? { disposition => 'auto', action => $action, reason => '' }
-                            : { disposition => 'escalate', action => $action, reason => 'unscopable' };
+        $result = defined $ws ? { disposition => 'auto', action => $action, reason => '' }
+                               : { disposition => 'escalate', action => $action, reason => 'unscopable' };
     }
-    if ($action eq 'create_lockfile') {
+    elsif ($action eq 'create_lockfile') {
         my $ws = write_set_for($f, $ctx);
-        return defined $ws ? { disposition => 'auto', action => $action, reason => '' }
-                            : { disposition => 'escalate', action => $action, reason => 'ambiguous' };
+        $result = defined $ws ? { disposition => 'auto', action => $action, reason => '' }
+                               : { disposition => 'escalate', action => $action, reason => 'ambiguous' };
     }
-    if ($action eq 'commit_lockfile') {
+    elsif ($action eq 'commit_lockfile') {
         my $file = $remedy->{file};
-        return (defined $file && !ref $file && length("$file"))
+        $result = (defined $file && !ref $file && length("$file"))
             ? { disposition => 'auto', action => $action, reason => '' }
             : { disposition => 'escalate', action => $action, reason => 'unscopable' };
     }
-    if ($action eq 'remediate-conformance') {
+    elsif ($action eq 'remediate-conformance') {
+        my $means = $remedy->{means};
+        unless (defined $means && !ref $means && length("$means")) {
+            $result = { disposition => 'escalate', action => $action, reason => 'means_missing' };
+        }
+        else {
+            my $ws = write_set_for($f, $ctx);
+            $result = defined $ws ? { disposition => 'auto', action => $action, reason => '' }
+                                   : { disposition => 'escalate', action => $action, reason => 'unscopable' };
+        }
+    }
+    elsif ($action eq 'remediate-build') {
         my $ws = write_set_for($f, $ctx);
-        return defined $ws ? { disposition => 'auto', action => $action, reason => '' }
-                            : { disposition => 'escalate', action => $action, reason => 'unscopable' };
+        $result = defined $ws ? { disposition => 'auto', action => $action, reason => '' }
+                               : { disposition => 'escalate', action => $action, reason => 'unscopable' };
     }
-    if ($action eq 'remediate-build') {
-        my $ws = write_set_for($f, $ctx);
-        return defined $ws ? { disposition => 'auto', action => $action, reason => '' }
-                            : { disposition => 'escalate', action => $action, reason => 'unscopable' };
+    elsif ($action eq 'justify') {
+        $result = { disposition => 'review', action => $action, reason => '' };
     }
-    if ($action eq 'justify') {
-        return { disposition => 'review', action => $action, reason => '' };
+    elsif ($action eq 'none') {
+        $result = { disposition => 'escalate', action => $action, reason => 'unfixable' };
     }
-    if ($action eq 'none') {
-        return { disposition => 'escalate', action => $action, reason => 'unfixable' };
+    else {
+        # unrecognized action — fail-closed (D4).
+        $result = { disposition => 'escalate', action => $action, reason => 'unfixable' };
     }
-    # unrecognized action — fail-closed (D4).
-    return { disposition => 'escalate', action => $action, reason => 'unfixable' };
+
+    # Uniform post-check, applied after ANY action resolves to 'auto': a
+    # package that will not know what to run/verify against is unsatisfiable
+    # no matter how resolvable its write_set/means looked.
+    if (($result->{disposition} // '') eq 'auto' && !_test_paths_ok($ctx)) {
+        $result = { disposition => 'escalate', action => $action, reason => 'test_paths_unresolved' };
+    }
+
+    return $result;
 }
 
 # ===========================================================================
@@ -383,7 +422,7 @@ sub _build_entry {
         pkg_status        => 'pending',
         ledger_path       => "packages/$id.md",
         write_set         => $a->{write_set},
-        test_paths        => ($ctx->{test_paths} // 'plugins/butler/tests/'),
+        test_paths        => $ctx->{test_paths},
         deps              => (ref $a->{deps} eq 'ARRAY' ? [ @{ $a->{deps} } ] : []),
         model             => ($ctx->{model} // 'sonnet'),
         max_turns         => ($ctx->{max_turns} // 60),
@@ -884,16 +923,19 @@ sub plan {
             next;
         }
         if ($disp ne 'auto') {
-            _escalate_new_finding($f, $k, ($cls->{reason} || 'unfixable'), ($nq->{rounds_used} // 0), \@notices, \@escalate, $nq);
+            push @entries, _escalate_new_finding($f, $k, ($cls->{reason} || 'unfixable'), ($nq->{rounds_used} // 0),
+                \@notices, \@escalate, $nq, $now_iso, $ctx, $x->{sig});
             next;
         }
         unless ( ($nq->{rounds_used} // 0) < $cap ) {
-            _escalate_new_finding($f, $k, 'global_cap', ($nq->{rounds_used} // 0), \@notices, \@escalate, $nq);
+            push @entries, _escalate_new_finding($f, $k, 'global_cap', ($nq->{rounds_used} // 0),
+                \@notices, \@escalate, $nq, $now_iso, $ctx, $x->{sig});
             next;
         }
         my $ws = write_set_for($f, $ctx);
         unless (defined $ws) {
-            _escalate_new_finding($f, $k, 'unscopable', ($nq->{rounds_used} // 0), \@notices, \@escalate, $nq);
+            push @entries, _escalate_new_finding($f, $k, 'unscopable', ($nq->{rounds_used} // 0),
+                \@notices, \@escalate, $nq, $now_iso, $ctx, $x->{sig});
             next;
         }
 
@@ -991,7 +1033,8 @@ sub ledger_text {
     my $model      = defined $entry->{model}      ? $entry->{model}      : ($ctx->{model}      // 'sonnet');
     my $max_turns  = defined $entry->{max_turns}  ? $entry->{max_turns}  : ($ctx->{max_turns}  // 60);
     my $write_set  = defined $entry->{write_set}  ? $entry->{write_set}  : '';
-    my $test_paths = defined $entry->{test_paths} ? $entry->{test_paths} : ($ctx->{test_paths} // 'plugins/butler/tests/');
+    my $test_paths = $entry->{test_paths};
+    return undef unless defined $test_paths && !ref $test_paths && "$test_paths" =~ /\S/;
     my $mm         = (ref $entry->{mandated_means} eq 'ARRAY') ? $entry->{mandated_means} : [];
     my $mm_flow    = '[' . join(', ', @$mm) . ']';
     my $now_iso    = defined $ctx->{iso} ? $ctx->{iso} : _iso($ctx->{now});
@@ -1040,7 +1083,7 @@ sub ledger_text {
     push @lines, '';
     push @lines, '## Done criteria';
     push @lines, '';
-    push @lines, "$sentence Also: 'prove -r plugins/butler/tests/t/' still green.";
+    push @lines, $sentence;
     push @lines, '';
     push @lines, '## Inputs';
     push @lines, '';
@@ -1053,7 +1096,9 @@ sub ledger_text {
     push @lines, "finding_key: $finding_key";
     push @lines, "source: $source";
     push @lines, "round $round of $max_rounds";
-    push @lines, "originating verdict: runs/conformance-verdict.json";
+    if (defined $entry->{verdict_path} && length $entry->{verdict_path}) {
+        push @lines, "originating verdict: $entry->{verdict_path}";
+    }
     if (length $git_clause) { push @lines, ''; push @lines, $git_clause; }
     push @lines, '';
     push @lines, '## Pipeline';
@@ -1084,16 +1129,32 @@ sub ledger_text {
     return join("\n", @lines);
 }
 
+sub _resolve_verdict_path {
+    my ($bpdir) = @_;
+    return undef unless defined $bpdir && length $bpdir;
+    my $runs = "$bpdir/runs";
+    for my $rel ('conformance-verdict.json', 'conformance/_run.verdict.json') {
+        my $p = "$runs/$rel";
+        return $p if -e $p;
+    }
+    return undef;
+}
+
 sub author_ledger {
     my ($bpdir, $entry, $ctx) = @_;
     return undef unless defined $bpdir && ref $entry eq 'HASH';
     my $id = $entry->{id};
     return undef unless defined $id && length $id;
+
+    my $verdict_path = _resolve_verdict_path($bpdir);
+    return undef unless defined $verdict_path;
+
     my $dir = "$bpdir/packages";
     _make_path($dir) unless -d $dir;
     my $path = "$dir/$id.md";
     my $tmp  = "$path.tmp.$$";
-    my $text = eval { ledger_text($entry, $ctx) };
+    my $entry_for_render = { %$entry, verdict_path => $verdict_path };
+    my $text = eval { ledger_text($entry_for_render, $ctx) };
     return undef unless defined $text;
     my $ok = 0;
     if (open my $fh, '>', $tmp) {
