@@ -62,15 +62,28 @@ sub parse_seen {
     return \%seen;
 }
 
-# fresh_decisions(\@decisions, \%seen) -> \@fresh   (THE decision function)
+# fresh_decisions(\@decisions, \%seen, \%category_filter) -> \@fresh   (THE decision function)
 # Of the decisions currently in the queue, the ones the reporter has not yet
 # announced (id not in seen). Returned in a stable announce order: oldest
 # created_at first, ties broken by id, so the reporter announces in the order
 # the orchestrator queued them and the order is deterministic for tests. Pure.
+#
+# e02 §2.6: optional 3rd arg $category_filter (hashref of wanted category
+# values). Omitted/empty -> NO filtering, today's behavior, byte-identical --
+# every existing caller (the reporter skill) passes no 3rd arg and is
+# unaffected. Matching rule: a decision matches only if its `category` is
+# DEFINED and present in the filter -- a legacy (no-category) record never
+# matches ANY filter, regardless of the values requested (the concrete
+# backward-tolerance mechanism, spec §2.8/criterion 6). This deliberately does
+# NOT default a missing category to anything, so it can never be swept into a
+# category-scoped watch on the strength of a field it never had.
 sub fresh_decisions {
-    my ($decisions, $seen) = @_;
+    my ($decisions, $seen, $category_filter) = @_;
     $seen ||= {};
     my @fresh = grep { !$seen->{ $_->{id} // '' } } @{ $decisions || [] };
+    if ($category_filter && %$category_filter) {
+        @fresh = grep { defined $_->{category} && $category_filter->{ $_->{category} } } @fresh;
+    }
     return [ sort {
         ($a->{created_at} // 0) <=> ($b->{created_at} // 0)
             or ($a->{id} // '') cmp ($b->{id} // '')
@@ -111,6 +124,9 @@ sub scan {
             question  => $rec->{question},
             context   => $rec->{context},
             created_at=> $rec->{created_at},
+            # e02 §2.6: surfaced as-is -- undef/absent for a legacy record
+            # (written before this change), NEVER defaulted to any real value.
+            category  => $rec->{category},
         };
     }
     return \@out;
@@ -133,10 +149,12 @@ sub wait_loop {
     my $now     = $a->{now}   || sub { time };
     my $sleep   = $a->{sleep} || sub { select(undef, undef, undef, $_[0]) };
     my $scan    = $a->{scan}  || sub { scan($dir) };
+    # e02 §2.6: optional; omitted/empty -> no filtering (unchanged behavior).
+    my $category_filter = $a->{category_filter};
 
     my $start = $now->();
     while (1) {
-        my $fresh = fresh_decisions($scan->(), $seen);
+        my $fresh = fresh_decisions($scan->(), $seen, $category_filter);
         return { status => 'decision', decisions => $fresh } if @$fresh;
         if ($timeout > 0) {
             my $waited = $now->() - $start;
@@ -328,7 +346,7 @@ use warnings;
 
 unless (caller) {
     require JSON::PP;
-    my ($runs, $bp, $bpdir, $seen_csv, $timeout, $poll);
+    my ($runs, $bp, $bpdir, $seen_csv, $timeout, $poll, $category_csv);
     my @pos;
     # Consume an option's value, rejecting a missing value or one that is itself
     # a flag (so `--seen --timeout 60` errors loudly instead of silently eating
@@ -348,6 +366,7 @@ unless (caller) {
         elsif ($arg eq '--seen')    { $seen_csv= $need->('--seen'); }
         elsif ($arg eq '--timeout') { $timeout = $need->('--timeout'); }
         elsif ($arg eq '--poll')    { $poll    = $need->('--poll'); }
+        elsif ($arg eq '--category'){ $category_csv = $need->('--category'); }
         elsif ($arg =~ /^--/)       { print STDERR "bp-wait-for-decision: unknown option $arg\n"; exit 2; }
         else  { push @pos, $arg; }
     }
@@ -382,11 +401,19 @@ unless (caller) {
         $runs = "$bpdir/runs";
     }
 
+    # e02 §2.6: --category cat1,cat2,... (comma-separated, parsed like --seen).
+    # Omitted -> no filtering, byte-identical to today.
+    my $category_filter;
+    if (defined $category_csv && length $category_csv) {
+        $category_filter = { map { $_ => 1 } grep { length } split /,/, $category_csv };
+    }
+
     my $res = BpWait::wait_loop({
         dir     => "$runs/needs-you",
         seen    => BpWait::parse_seen($seen_csv),
         timeout => (defined $timeout ? $timeout + 0 : 0),
         poll    => (defined $poll ? $poll + 0 : undef),
+        category_filter => $category_filter,
     });
 
     print JSON::PP->new->canonical->pretty->encode($res);

@@ -327,31 +327,19 @@ sub mk_bp {
 # bp-orchestrator.pl's actual queue_needs_you / _enter_pause_manual / _block_and_queue call sites
 # -- never hand-typed -- so it cannot drift from the real producers as b01/b09/b11/b16 add more.
 # =====================================================================================
-sub derive_queued_kinds {
-    open my $fh, '<', $ORCH_SRC or die "cannot read $ORCH_SRC: $!";
-    my @lines = <$fh>;
-    close $fh;
-    my %kinds;
-    for my $i (0 .. $#lines) {
-        if ($lines[$i] =~ /\b(?:queue_needs_you|_enter_pause_manual)\s*\(/) {
-            my $end = ($i + 2 <= $#lines) ? $i + 2 : $#lines;
-            my $slice = join('', @lines[$i .. $end]);
-            if ($slice =~ /kind\s*=>\s*(?:\(\s*\$\w+\s*\/\/\s*)?['"]([\w-]+)['"]/) {
-                $kinds{$1}++;
-            }
-        }
-        if ($lines[$i] =~ /\b_block_and_queue\s*\(/) {
-            my $end = ($i + 6 <= $#lines) ? $i + 6 : $#lines;
-            my $slice = join('', @lines[$i .. $end]);
-            if ($slice =~ /['"]([\w-]+)['"]\s*\)\s*;/s) {
-                $kinds{$1}++;
-            }
-        }
-    }
-    return sort keys %kinds;
-}
-
-my @KINDS = derive_queued_kinds();
+# e02 §4 AC5 / done-criterion 5: this used to duplicate known_kinds()'s OWN
+# source-scanning regex here as a second, independent copy -- a second copy of
+# the exact bug e02 closes (both blind to 'dag-stalled', built via a builder
+# function outside any scanned window; and, worse, e02's own addition of a
+# 10th positional `category` literal at every _block_and_queue call site made
+# this duplicate regex start capturing the CATEGORY string instead of the
+# KIND string, since its `_block_and_queue` branch simply grabs the LAST
+# quoted literal before `);` -- a live drift this local copy could never have
+# caught on its own). MOVE, don't duplicate: call BpAnswer::known_kinds()
+# directly (already `require`d above) so C5/C6 exercise the real, registry-
+# backed derivation -- including 'dag-stalled' -- instead of a second,
+# drift-prone copy of it.
+my @KINDS = BpAnswer::known_kinds();
 ok(scalar(@KINDS) >= 6, 'C5: the derived kind list is non-trivial (derivation actually found producers)')
     or diag('derived kinds: ' . join(',', @KINDS));
 diag('C5/C6: kinds derived from bp-orchestrator.pl producers: ' . join(', ', @KINDS));

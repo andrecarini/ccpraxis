@@ -789,7 +789,7 @@ sub mk_entry {
                     ts => $ISO, manual => 0, question => '3 findings could not be auto-remediated',
                     context => { findings => $plan->{escalate}, rounds_used => $plan->{queue}{rounds_used},
                                  rounds_cap => $ctx->{cap}, queue => 'runs/remediation-queue.json' },
-                    created_at => $NOW };
+                    created_at => $NOW, category => 'conformance' };
         my $p1 = BpOrch::queue_needs_you($runs, $rec);
         my $p2 = BpOrch::queue_needs_you($runs, $rec);
         is($p1, $p2, 'AC-25: a second call in the same run returns the SAME file (package+kind dedupe, :718-719)');
@@ -1043,7 +1043,7 @@ sub mk_entry {
                 reason => 'auto-remediation could not close one or more characterized findings',
                 ts => $ISO, manual => 0, question => 'adversarial escalation',
                 context => { findings => $plan33->{escalate}, rounds_used => $queue33->{rounds_used}, rounds_cap => $cap, queue => 'runs/remediation-queue.json' },
-                created_at => $NOW }) });
+                created_at => $NOW, category => 'conformance' }) });
         }
     }
 

@@ -245,7 +245,7 @@ sub run_answer_cli {
         write_file($f, $txt);
     };
     my $ret = BpOrch::queue_needs_you($runs,
-        { package => $pkg, blueprint => 'bp', kind => 'stuck-package', question => 'q', context => 'c', created_at => 10 },
+        { package => $pkg, blueprint => 'bp', kind => 'stuck-package', question => 'q', context => 'c', created_at => 10, category => 'unclassified' },
         $bpdir);
     is($ret, 0, 'S2/AC11/behavior17-18: stuck-package refused once the re-read (under the ledger lock) finds status done');
     my @files = glob("$runs/needs-you/*.json");
@@ -265,7 +265,7 @@ sub run_answer_cli {
         write_file($f, $txt);
     };
     my $ret = BpOrch::queue_needs_you($runs,
-        { package => $pkg, blueprint => 'bp', kind => 'totally-unlisted-kind', question => 'q', context => 'c', created_at => 11 },
+        { package => $pkg, blueprint => 'bp', kind => 'totally-unlisted-kind', question => 'q', context => 'c', created_at => 11, category => 'unclassified' },
         $bpdir);
     ok($ret, 'S2/AC12/behavior19: an unlisted kind still queues no matter the re-read status');
     my @f19 = glob("$runs/needs-you/*.json");
@@ -277,7 +277,7 @@ for my $kind (qw(judge-starved judge-fail harvest-failure)) {
     my $runs = "$bpdir/runs";
     local %BpOrch::DECISION_VALIDITY = ('stuck-package' => ['done', 'dropped']);
     my $ret = BpOrch::queue_needs_you($runs,
-        { package => $pkg, blueprint => 'bp', kind => $kind, question => 'q', context => 'c', created_at => 12 },
+        { package => $pkg, blueprint => 'bp', kind => $kind, question => 'q', context => 'c', created_at => 12, category => 'oracle' },
         $bpdir);
     ok($ret, "S2/AC12/behavior21: kind=$kind queues against a done package (harvest audits only run on done packages)");
 }
@@ -287,7 +287,7 @@ for my $st (qw(blocked parked)) {
     my $runs = "$bpdir/runs";
     local %BpOrch::DECISION_VALIDITY = ('stuck-package' => ['done', 'dropped']);
     my $ret = BpOrch::queue_needs_you($runs,
-        { package => $pkg, blueprint => 'bp', kind => 'stuck-package', question => 'q', context => 'c', created_at => 13 },
+        { package => $pkg, blueprint => 'bp', kind => 'stuck-package', question => 'q', context => 'c', created_at => 13, category => 'unclassified' },
         $bpdir);
     ok($ret, "S2/AC12/behavior20: stuck-package still queues when status is $st (not in stuck-package's refusal set)");
 }
@@ -300,7 +300,7 @@ for my $st (qw(blocked parked)) {
     my $runs = "$bpdir/runs";
     local %BpOrch::DECISION_VALIDITY = ('stuck-package' => ['done', 'dropped']);
     my $ret = BpOrch::queue_needs_you($runs,
-        { package => $pkg, blueprint => 'bp', kind => 'stuck-package', question => 'q', context => 'c', created_at => 14 },
+        { package => $pkg, blueprint => 'bp', kind => 'stuck-package', question => 'q', context => 'c', created_at => 14, category => 'unclassified' },
         $bpdir);
     ok($ret, 'S2/AC12/behavior22: an unreadable ledger still queues (uncertainty resolves toward delivery)');
     my $log = slurp("$runs/orchestrator.log");
@@ -314,10 +314,10 @@ for my $st (qw(blocked parked)) {
     my $runs = "$bpdir/runs";
     local %BpOrch::DECISION_VALIDITY = ('stuck-package' => ['done', 'dropped']);
     my $ret1 = BpOrch::queue_needs_you($runs,
-        { package => $pkg, blueprint => 'bp', kind => 'stuck-package', question => 'q', context => 'c', created_at => 15 },
+        { package => $pkg, blueprint => 'bp', kind => 'stuck-package', question => 'q', context => 'c', created_at => 15, category => 'unclassified' },
         $bpdir);
     my $ret2 = BpOrch::queue_needs_you($runs,
-        { package => $pkg, blueprint => 'bp', kind => 'stuck-package', question => 'q', context => 'c', created_at => 16 },
+        { package => $pkg, blueprint => 'bp', kind => 'stuck-package', question => 'q', context => 'c', created_at => 16, category => 'unclassified' },
         $bpdir);
     is($ret2, $ret1, 'S2/AC12/behavior23: a repeat (package,kind) call returns the SAME existing path');
     my @f23 = glob("$runs/needs-you/*.json");
@@ -504,7 +504,7 @@ sub bump_last_updated {
         write_file($f, $txt);
     };
     my $ret = BpOrch::queue_needs_you($runs,
-        { package => $pkg, blueprint => 'bp', kind => 'stuck-package', question => 'q', context => 'c', created_at => 20 },
+        { package => $pkg, blueprint => 'bp', kind => 'stuck-package', question => 'q', context => 'c', created_at => 20, category => 'unclassified' },
         $bpdir);
     ok(!$ret, 'AC16 channel 1: falsy return on refusal');
     my @f16 = glob("$runs/needs-you/*.json");

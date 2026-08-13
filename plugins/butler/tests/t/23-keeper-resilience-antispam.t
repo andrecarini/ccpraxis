@@ -336,7 +336,7 @@ sub needs_you_count_runs { my $runs = shift; my $d = "$runs/needs-you"; return 0
     my $runs = "$ROOT/ac6-runs"; mkdir $runs;
     my $log  = "$ROOT/ac6.log";
     my $dec  = { package=>'_fleet', blueprint=>'T', kind=>'contract-drift', question=>'creds unreadable',
-                 context=>'c', created_at=>$NOW };
+                 context=>'c', created_at=>$NOW, category=>'operational' };
 
     BpOrch::_enter_pause_manual($runs, $log, 'pause-creds', $dec, { quiet_log=>1 });
     ok(-e "$runs/.paused", 'AC-6 first call (no existing pause) writes .paused despite quiet_log=>1');

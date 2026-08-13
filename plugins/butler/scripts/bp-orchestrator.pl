@@ -86,6 +86,72 @@ our $PID_ALIVE_FN;
 # queuing (edge case 1: it must never refuse its own escalation).
 our %DECISION_VALIDITY = ( 'stuck-package' => ['done', 'dropped'] );
 
+# e02: the closed 7-value escalation-category taxonomy (e01 spec §2.2). One
+# canonical source; queue_needs_you/_enter_pause_manual/_block_and_queue all
+# gate on %VALID_CATEGORY via _require_category (below) before any side effect.
+our @CATEGORIES = qw(product operational conformance oracle scoping implementation unclassified);
+our %VALID_CATEGORY = map { $_ => 1 } @CATEGORIES;
+
+# e02 §2.5: the kind->family registry that replaces bp-answer-decision.pl's
+# source-scanning known_kinds()/kind_family() derivation. Fixes the still-live
+# 'dag-stalled' visibility bug (techcontas-batch1 #2) -- dag-stalled is built
+# via _dag_decision, a builder function invisible to a source-scanning regex.
+# 'family' is 'package' (resolved through the ledger) or 'fleet' (resolved by
+# clearing .paused) -- same two values bp-answer-decision.pl's kind_family()
+# already returns.
+our %KIND_REGISTRY = (
+    # Ordering below is deliberate, not incidental: t/61 scans the whole file
+    # for a starvation-park kind followed nearby by wording that wrongly
+    # implies the audit itself came back negative (it never ran, so it
+    # cannot have). This registry is plain data, not operator-facing text,
+    # but the guard is a proximity heuristic and cannot tell the difference
+    # -- so the two harvest-audit-outcome keys are kept apart from that
+    # starvation kind's own key, purely to avoid a coincidental collision.
+    'awaiting-ledger'         => { family => 'package' },
+    'stuck-package'           => { family => 'package' },
+    'dag-stalled'             => { family => 'package' },
+    'remediation-escalation'  => { family => 'package' },
+    'turn-starved'            => { family => 'package' },
+    'reauth'                  => { family => 'fleet' },
+    'contract-drift'          => { family => 'fleet' },
+    'broken-env'              => { family => 'fleet' },
+    'harvest-failure'         => { family => 'package' },
+    'harvest-spawn-failure'   => { family => 'package' },
+    'judge-starved'           => { family => 'package' },
+);
+our @KNOWN_KINDS = sort keys %KIND_REGISTRY;
+sub kind_family_of { my ($k) = @_; return defined $k ? $KIND_REGISTRY{$k}{family} : undef; }
+# Accessor (rather than a bare cross-package `@BpOrch::KNOWN_KINDS` reference):
+# a fully-qualified global referenced only once in another file trips perl's
+# "used only once" warning, which would leak onto bp-answer-decision.pl's
+# stdout/stderr (its CLI callers parse stdout as JSON -- a stray warning line
+# breaks that parse). A sub call carries no such warning.
+sub known_kinds_list { return @KNOWN_KINDS; }
+
+# e02 §2.3: the shared hard-error gate for all three escalation emitters.
+# Checked FIRST, before any side effect (mkdir/write_paused/_set_ledger_status)
+# -- a bad category must refuse the ENTIRE operation, not leave a partial trace
+# (no .paused with nothing filed, no package marked blocked with nothing
+# queued). Never dies -- same shape as _escalation_write_failed. $ctx: { log,
+# kind, package, site }.
+sub _require_category {
+    my ($category, $ctx) = @_;
+    return 1 if defined $category && $VALID_CATEGORY{$category};
+    my $log = $ctx->{log};
+    eval {
+        _log($log, 'escalation_category_invalid', {
+            site => ($ctx->{site} // '?'), kind => ($ctx->{kind} // '?'),
+            package => ($ctx->{package} // '?'),
+            category => (defined $category ? $category : '(missing)'),
+            detail => 'refused -- category must be one of ' . join('|', @CATEGORIES)
+                    . '; no needs-you record filed. This is a code defect at the call site, not '
+                    . 'an operator decision, and must never be silently routed to the operator.',
+        });
+        1;
+    } or warn "bp-orchestrator: escalation_category_invalid at " . ($ctx->{site} // '?') . " (log unwritable too)\n";
+    return 0;
+}
+
 # fixbatch step7 / BLOCKER 2: bare pid_alive() is not evidence of a LIVE
 # coordinator -- pids recycle, and registry `pid` is set once at launch and
 # never cleared for a coordinator that exits non-terminally (the only clearer,
@@ -1369,6 +1435,12 @@ sub _queue_needs_you_write {
 sub queue_needs_you {
     my ($runs, $rec, $bpdir, $force) = @_;
     $bpdir //= dirname($runs);
+    # e02 §2.3: checked FIRST -- before mkdir, before the dedupe scan -- so a
+    # malformed call is refused every tick, never silently deduped through.
+    return 0 unless _require_category($rec->{category}, {
+        log => "$runs/orchestrator.log", site => 'queue_needs_you',
+        kind => $rec->{kind}, package => $rec->{package},
+    });
     my $dir = "$runs/needs-you";
     # make_path croaks on failure (read-only / full runs/) — never let that escape.
     unless (-d $dir) {
@@ -2173,6 +2245,7 @@ sub run {
                                     . "then answer this decision.",
                         context    => { ledger => "packages/$pkg.md" },
                         created_at => $now,
+                        category   => 'implementation',
                     }, $bpdir);
                 } else {
                     delete $awaiting{$pkg};
@@ -2201,7 +2274,7 @@ sub run {
                     _enter_pause_manual($runs, $log, 'token-floor',
                         { package => '_fleet', blueprint => $bp, kind => 'reauth',
                           question => 'OAuth token crossed the refresh floor unrefreshed — re-authenticate with /login.',
-                          context => 'token-keeper hit the pause-floor', created_at => $now });
+                          context => 'token-keeper hit the pause-floor', created_at => $now, category => 'operational' });
                 } elsif ($act eq 'pause-auth') {
                     # LOUD divergence alert (hard requirement): a 4xx on the
                     # sandbox's OWN refresh is distinct from a routine expiry —
@@ -2217,13 +2290,13 @@ sub run {
                                     . "The copied token may be invalid OR the host/sandbox token grants have "
                                     . "DIVERGED -- REVISIT the copy-token architecture. This is NOT a routine "
                                     . "/login expiry.",
-                          context => ($k->{detail} // 'the sandbox refresh returned a 4xx'), created_at => $now });
+                          context => ($k->{detail} // 'the sandbox refresh returned a 4xx'), created_at => $now, category => 'operational' });
                 } elsif ($act eq 'pause-contract' || $act eq 'pause-creds') {
                     my $is_creds = ($act eq 'pause-creds');
                     _enter_pause_manual($runs, $log, "keeper-$act",
                         { package => '_fleet', blueprint => $bp, kind => 'contract-drift',
                           question => 'Credential/refresh contract drift — inspect before resuming.',
-                          context => JSON::PP->new->canonical->encode($k->{detail} // {}), created_at => $now },
+                          context => JSON::PP->new->canonical->encode($k->{detail} // {}), created_at => $now, category => 'operational' },
                         ($is_creds ? { quiet_log => $creds_gate{armed} } : undef));
                     $creds_gate{armed} = 1 if $is_creds;
                 }
@@ -2273,7 +2346,7 @@ sub run {
                         _enter_pause_manual($runs, $log, 'usage-contract',
                             { package => '_fleet', blueprint => $bp, kind => 'contract-drift',
                               question => 'Usage endpoint contract drift — inspect before resuming.',
-                              context => join('; ', @{ $d->{problems} || [] }), created_at => $now });
+                              context => join('; ', @{ $d->{problems} || [] }), created_at => $now, category => 'operational' });
                         $paused = read_paused($runs);
                     } elsif ($paused && ($paused->{reason} // '') eq 'telemetry') {
                         # telemetry recovered and we are below the trip -> auto-resume.
@@ -2302,7 +2375,7 @@ sub run {
                         _enter_pause_manual($runs, $log, ($u->{action} // 'usage-fail'),
                             { package => '_fleet', blueprint => $bp, kind => 'contract-drift',
                               question => 'Credentials/usage contract problem — inspect before resuming.',
-                              context => join('; ', @{ $u->{problems} || [] }), created_at => $now },
+                              context => join('; ', @{ $u->{problems} || [] }), created_at => $now, category => 'operational' },
                             { quiet_log => $creds_gate{armed} });
                         $creds_gate{armed} = 1;
                     } else {
@@ -2314,7 +2387,7 @@ sub run {
                         _enter_pause_manual($runs, $log, ($u->{action} // 'usage-fail'),
                             { package => '_fleet', blueprint => $bp, kind => 'contract-drift',
                               question => 'Credentials/usage contract problem — inspect before resuming.',
-                              context => join('; ', @{ $u->{problems} || [] }), created_at => $now });
+                              context => join('; ', @{ $u->{problems} || [] }), created_at => $now, category => 'operational' });
                     }
                     $paused = read_paused($runs);
                 }
@@ -2502,8 +2575,10 @@ sub run {
                           ? $r->{needs_you}{question}
                           : "Package '$pkg' is stuck and the resolve-judge could not fix it: $r->{reason}";
                     _log($log, 'resolve_park', { package => $pkg, reason => $r->{reason} });
+                    # e01 §3 row 18 -- free-text/judge-authored site: category => 'unclassified'
+                    # (10th positional arg -- _block_and_queue is positional, not a hashref).
                     _block_and_queue($bpdir, $runs, $log, $bp, $pkg, $r->{reason}, $now, $q,
-                                     ($r->{needs_you} ? $r->{needs_you}{kind} : undef));
+                                     ($r->{needs_you} ? $r->{needs_you}{kind} : undef), 'unclassified');
                     $status->{$pkg} = 'blocked';
                 }
             }
@@ -2715,7 +2790,7 @@ sub run {
                                   . ", starvations=" . ($hs + 1) . ". No verdict file was ever written. Judge log: "
                                   . "runs/harvest/$pkg.jsonl; archived verdicts: runs/harvest/archive/.";
                         queue_needs_you($runs, { package => $pkg, blueprint => $bp, kind => 'judge-starved',
-                            question => $question, context => $context, created_at => $now });
+                            question => $question, context => $context, created_at => $now, category => 'operational' });
                         next;
                     }
                     if ($jstate eq 'starved' && $st eq 'done') {
@@ -2778,7 +2853,7 @@ sub run {
                                   . "No verdict file was ever written. Judge log: runs/harvest/$pkg.jsonl; archived verdicts: "
                                   . "runs/harvest/archive/.";
                         queue_needs_you($runs, { package => $pkg, blueprint => $bp, kind => 'judge-starved',
-                            question => $question, context => $context, created_at => $now });
+                            question => $question, context => $context, created_at => $now, category => 'operational' });
                         next;
                     }
                     $v = { _timeout => 1 };               # cap exhausted (or not done) -> error -> escalate
@@ -2870,10 +2945,11 @@ sub run {
                         }
                     } else {  # park: failed twice -> alarm, keep independent work running.
                         _log($log, 'harvest_park', { package => $pkg, verdict => $hv, corrective_attempts => $corr });
+                        # e01 §3 row 19: category => 'oracle' (10th positional arg).
                         _block_and_queue($bpdir, $runs, $log, $bp, $pkg,
                             "failed harvest audit ($hv) after a corrective cycle", $now,
                             "Package '$pkg' failed its harvest audit after a corrective relaunch — its outputs don't meet the done-criteria. Inspect and decide: fix, re-scope, or accept.",
-                            'harvest-failure');
+                            'harvest-failure', 'oracle');
                         $status->{$pkg} = 'blocked';
                     }
                 }
@@ -2929,10 +3005,11 @@ sub run {
                         _log($log, 'judge_spawn_failed', { kind => 'harvest', package => $pkg,
                               rc => (defined $rc && $rc == 0) ? 'inflight_marker_failed' : $rc, fails => $sf });
                         if ($sf >= $t->{judge_spawn_cap}) {
+                            # e01 §3 row 20: category => 'operational' (10th positional arg).
                             _block_and_queue($bpdir, $runs, $log, $bp, $pkg,
                                 "harvest judge could not be spawned ($sf attempts)", $now,
                                 "Package '$pkg' finished but its harvest judge could not be spawned after $sf tries — check bp-judge.sh / claude in the sandbox, then re-verify and resume.",
-                                'harvest-spawn-failure');
+                                'harvest-spawn-failure', 'operational');
                             $status->{$pkg} = 'blocked';
                         }
                     }
@@ -3124,7 +3201,7 @@ sub run {
                                                         . ($att->{$pkg} // 0)
                                                         . ', turn_continuations=' . (_reg_int($reg->{$pkg}{turn_continuations}) // 0)
                                                         . ", max_turns=$current, last num_turns=" . ($tv->{num_turns} // '?'),
-                                              created_at => $now });
+                                              created_at => $now, category => 'scoping' });
                                         next;                     # do NOT relaunch it
                                     }
                                 }
@@ -3327,7 +3404,7 @@ sub run {
                                 . '(missing bash, missing bp-launch.sh, or a bad mount). Fix it, then resume the run '
                                 . 'by deleting runs/.paused (`rm runs/.paused`) — this pause is manual and will not lift on its own.',
                       context  => "exec of 'bash $DIR/bp-launch.sh' failed on $n consecutive launch attempts; last errno: $errno",
-                      created_at => $now });
+                      created_at => $now, category => 'operational' });
                 $exec_fail_streak = 0;
             }
 
@@ -3347,7 +3424,7 @@ sub run {
                     _log($log, 'orphan_escalation', { package => $pkg, status => $st,
                         detail => 'awaiting-human with no queued decision (coordinator self-park) — escalating' });
                     queue_needs_you($runs, {
-                        package => $pkg, blueprint => $bp, kind => 'stuck-package',
+                        package => $pkg, blueprint => $bp, kind => 'stuck-package', category => 'unclassified',
                         question => "Package '$pkg' was set to '$st' by its coordinator with no decision filed for you. "
                                   . "Read its '## Next action' (it may address an instruction to the orchestrator, e.g. a write_set change), then relaunch with guidance / accept / drop.",
                         context  => ($next // "orphaned '$st' status — no needs-you decision existed; filed by the orchestrator so the run doesn't go silent"),
@@ -3620,6 +3697,16 @@ sub run {
 # call sites pass no $opt and are byte-for-byte unaffected.
 sub _enter_pause_manual {
     my ($runs, $log, $reason, $decision, $opt) = @_;
+    # e02 §2.3: checked BEFORE write_paused, and ONLY when $decision is truthy
+    # -- the falsy-$decision path (write .paused, file no decision) has nothing
+    # to categorize and stays untouched (spec §5 edge case). A bad category must
+    # not leave the fleet paused with nothing filed to explain why.
+    if ($decision) {
+        return 0 unless _require_category($decision->{category}, {
+            log => $log, site => '_enter_pause_manual',
+            kind => $decision->{kind}, package => $decision->{package},
+        });
+    }
     # Don't clobber an already-active manual pause's reason: keep the FIRST one in
     # .paused and just add this decision to the needs-you queue. The queue is the
     # authoritative list of everything the human must resolve before resuming, so a
@@ -3628,11 +3715,24 @@ sub _enter_pause_manual {
     my $existing = read_paused($runs);
     my $wrote = 0;
     unless ($existing && $existing->{manual}) {
-        write_paused($runs, { reason => $reason, manual => 1, created_at => ($decision->{created_at} // time) });
+        # Never `$decision->{created_at}` directly here: dereferencing an undef
+        # $decision (the falsy-$decision "no decision to file" path, spec §5) as
+        # an rvalue hash-element read still AUTOVIVIFIES $decision into a truthy
+        # empty hashref -- which would then make `queue_needs_you(...) if
+        # $decision` below fire with an empty (uncategorized) record, defeating
+        # the whole point of the falsy-$decision tolerance. Guard with `? :`,
+        # never `->`, so a falsy $decision stays falsy all the way through.
+        write_paused($runs, { reason => $reason, manual => 1,
+            created_at => ($decision ? $decision->{created_at} : undef) // time });
         $wrote = 1;
     }
+    # e01 §3 row 5 -- internal mechanism, inherits the caller's own literal
+    # (already required+validated above at this point), e.g. category => 'operational'
+    # for the fleet-pause callers at rows 10-17, or category => 'scoping' for row 16.
     queue_needs_you($runs, $decision) if $decision;
-    _log($log, 'pause', { reason => $reason, manual => 1, package => ($decision->{package} // '_fleet'), kind => ($decision->{kind} // '') })
+    _log($log, 'pause', { reason => $reason, manual => 1,
+          package => ($decision ? $decision->{package} : undef) // '_fleet',
+          kind    => ($decision ? $decision->{kind}    : undef) // '' })
         if $wrote || !($opt && $opt->{quiet_log});
 }
 
@@ -3751,7 +3851,7 @@ sub dag_stall_step {
         _log($log, 'dag_stalled', { class => 'unresolvable',
              count => scalar @{ $r->{unresolvable} },
              codes => join(',', map { $_->{code} } @{ $r->{unresolvable} }) });
-        queue_needs_you($runs, _dag_decision($bp, $now, 'unresolvable', $r));
+        queue_needs_you($runs, { %{ _dag_decision($bp, $now, 'unresolvable', $r) }, category => 'scoping' });
         $out->{decided} = 1;
         return $out;                       # never both routes in one tick
     }
@@ -3769,7 +3869,7 @@ sub dag_stall_step {
         return $out if queued_decision_pkgs($runs)->{'_dag'};
         _log($log, 'dag_stalled', { class => 'remediation-exhausted',
              blockers => join(',', map { $_->{blocker} } @{ $r->{blockers} }) });
-        queue_needs_you($runs, _dag_decision($bp, $now, 'remediation-exhausted', $r));
+        queue_needs_you($runs, { %{ _dag_decision($bp, $now, 'remediation-exhausted', $r) }, category => 'scoping' });
         $out->{decided} = 1;
         return $out;
     }
@@ -3929,6 +4029,7 @@ sub remediation_step {
             context    => { findings => \@escalated_visible, rounds_used => $plan->{queue}{rounds_used},
                              rounds_cap => $ctx{cap}, queue => 'runs/remediation-queue.json' },
             created_at => $now,
+            category   => 'conformance',
         };
         my $path = queue_needs_you($runs, $rec);
         # On a dedupe hit the record was NOT written; refresh it in place so the
@@ -3976,7 +4077,15 @@ sub remediation_step {
 }
 
 sub _block_and_queue {
-    my ($bpdir, $runs, $log, $bp, $pkg, $why, $now, $question, $kind) = @_;
+    my ($bpdir, $runs, $log, $bp, $pkg, $why, $now, $question, $kind, $category) = @_;
+    # e02 §2.3: checked BEFORE _set_ledger_status/update_registry_pkg -- a bad
+    # category must not leave a package marked 'blocked' in ledger/registry
+    # with no decision filed (the exact Pattern-1 "detected but undelivered"
+    # shape this whole track exists to close).
+    return 0 unless _require_category($category, {
+        log => $log, site => '_block_and_queue',
+        kind => ($kind // 'stuck-package'), package => $pkg,
+    });
     # fixbatch step7 / MAJOR 4 + MAJOR 6: observe the ledger write's own return.
     # A dropped write (lock-timeout/io-error) here used to be silent AND compound
     # with queue_needs_you's own S2 gate (:1358-ish): registry still flips to
@@ -4001,7 +4110,7 @@ sub _block_and_queue {
     queue_needs_you($runs, {
         package => $pkg, blueprint => $bp, kind => ($kind // 'stuck-package'),
         question => ($question // "Package '$pkg' is blocked: $why. Re-scope, fix, or drop it?"),
-        context => $why, created_at => ($now // time),
+        context => $why, created_at => ($now // time), category => $category,
     }, $bpdir, ($ledger_ok ? 0 : 1));
 }
 
@@ -4027,7 +4136,9 @@ sub _escalate_stuck {
               rc => (defined $rc && $rc == 0) ? 'inflight_marker_failed' : $rc });
         # couldn't even spawn the judge (or the marker) -> fall through and park.
     }
-    _block_and_queue($a->{bpdir}, $runs, $log, $a->{bp}, $pkg, $a->{why}, $a->{now});
+    # e01 §3 row 21 -- free-text/ladder-exhausted site: category => 'unclassified'
+    # (10th positional arg).
+    _block_and_queue($a->{bpdir}, $runs, $log, $a->{bp}, $pkg, $a->{why}, $a->{now}, undef, undef, 'unclassified');
     return 'blocked';
 }
 

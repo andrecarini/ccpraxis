@@ -83,61 +83,31 @@ package BpAnswer;
 use strict;
 use warnings;
 
-# known_kinds() -> derives the FULL set of decision kinds bp-orchestrator.pl's own
-# queue_needs_you / _enter_pause_manual / _block_and_queue call sites actually emit,
-# by parsing its source with the IDENTICAL regexes t/69-answer-decision-completeness.t
-# uses for its own C5/C6 derivation (see that file) — so this list is a derivation,
-# never a hand-typed literal that could drift from the real producers as b01/b09/b11/
-# b16 add more. Memoized: the source does not change within one process's lifetime.
-my @KNOWN_KINDS;
-my $KNOWN_KINDS_LOADED = 0;
+# known_kinds() -> the FULL set of decision kinds bp-orchestrator.pl's own
+# queue_needs_you / _enter_pause_manual / _block_and_queue call sites actually
+# emit. e02 §2.5: this used to source-scan bp-orchestrator.pl's text with a
+# narrow line-window regex, which is invisible to 'dag-stalled' (built via the
+# _dag_decision builder function, whose `kind => 'dag-stalled'` literal lives
+# outside any scanned window) -- the still-live techcontas-batch1 #2 defect.
+# Delegates to BpOrch::%KIND_REGISTRY (a shared, tested, data-driven registry
+# both scripts load) instead, closing that blind spot for good rather than
+# widening the window again.
 sub known_kinds {
-    return @KNOWN_KINDS if $KNOWN_KINDS_LOADED;
-    $KNOWN_KINDS_LOADED = 1;
-    return @KNOWN_KINDS unless open my $fh, '<', $ORCH_SRC;
-    my @lines = <$fh>;
-    close $fh;
-    my %kinds;
-    for my $i (0 .. $#lines) {
-        if ($lines[$i] =~ /\b(?:queue_needs_you|_enter_pause_manual)\s*\(/) {
-            my $end = ($i + 2 <= $#lines) ? $i + 2 : $#lines;
-            my $slice = join('', @lines[$i .. $end]);
-            if ($slice =~ /kind\s*=>\s*(?:\(\s*\$\w+\s*\/\/\s*)?['"]([\w-]+)['"]/) {
-                $kinds{$1}++;
-            }
-        }
-        if ($lines[$i] =~ /\b_block_and_queue\s*\(/) {
-            my $end = ($i + 6 <= $#lines) ? $i + 6 : $#lines;
-            my $slice = join('', @lines[$i .. $end]);
-            if ($slice =~ /['"]([\w-]+)['"]\s*\)\s*;/s) {
-                $kinds{$1}++;
-            }
-        }
-    }
-    @KNOWN_KINDS = sort keys %kinds;
-    return @KNOWN_KINDS;
+    return BpOrch::known_kinds_list();
 }
 
 # kind_family($kind) -> 'fleet' | 'package' | undef (unknown)
 # A fleet pause is resolved by clearing the pause; everything else is a
 # package-level park resolved through the ledger. `undef` $kind means "direct
 # --package mode" (#29, no queued decision at all) — always 'package', the only
-# family a decision-less direct action can mean. A DEFINED kind not among the real
-# producers' known_kinds() is refused (undef return) rather than silently guessed as
-# 'package' — the defect this closes let an unknown kind succeed as if it were
-# 'stuck-package'.
+# family a decision-less direct action can mean. A DEFINED kind not among
+# BpOrch::%KIND_REGISTRY is refused (undef return) rather than silently guessed
+# as 'package' — the defect this closes let an unknown kind succeed as if it
+# were 'stuck-package'.
 sub kind_family {
     my ($k) = @_;
     return 'package' unless defined $k && length $k;
-    # broken-env, reauth and contract-drift are the fleet-level pauses (b01/b09):
-    # bp-orchestrator.pl queues them via _enter_pause_manual with package '_fleet'.
-    # This subset is deliberately named here rather than derived — telling "which
-    # producer used package => '_fleet'" apart from a per-package park is a semantic
-    # distinction known_kinds()'s source scan does not (and should not) attempt to
-    # infer; only the SET of valid kinds is derived, not their family.
-    return 'fleet' if $k =~ /^(?:reauth|contract-drift|broken-env)$/;
-    return 'package' if grep { $_ eq $k } known_kinds();
-    return undef;   # unknown to every real producer -- caller must refuse, not guess
+    return BpOrch::kind_family_of($k);   # undef -- unknown to every real producer
 }
 
 # plan_answer($kind, $action) -> { ok, family, action, ledger_status, clear_pause,
@@ -400,6 +370,8 @@ sub clear_pkg_decisions {
 unless (caller) {
     require JSON::PP;
     my ($bp, $bpdir, $decision, $package, $action, $note, $widen_write_set, $set_write_set);
+    # e02 §2.7: --list is a new, standalone, READ-ONLY surface (mutates nothing).
+    my ($list_mode, $category_arg);
     my @pos;
     my $need = sub {
         my ($flag) = @_;
@@ -418,6 +390,8 @@ unless (caller) {
         elsif ($arg eq '--note')            { $note            = $need->('--note'); }
         elsif ($arg eq '--widen-write-set') { $widen_write_set = $need->('--widen-write-set'); }
         elsif ($arg eq '--set-write-set')   { $set_write_set   = $need->('--set-write-set'); }
+        elsif ($arg eq '--list')            { $list_mode       = 1; }
+        elsif ($arg eq '--category')        { $category_arg    = $need->('--category'); }
         elsif ($arg =~ /^--/)               { print STDERR "bp-answer-decision: unknown option $arg\n"; exit 2; }
         else  { push @pos, $arg; }
     }
@@ -453,6 +427,42 @@ unless (caller) {
 
     if (defined $package && defined $decision) {
         print STDERR "bp-answer-decision: use --package OR --decision, not both\n"; exit 2;
+    }
+
+    # e02 §2.7: --list is mutually exclusive with --decision/--package (same
+    # "use X or Y, not both" pattern as above), refused BEFORE either is
+    # resolved. Read-only: scans runs/needs-you/*.json, prints one JSON object
+    # per matching record, sorted oldest-created_at first (ties by id, mirroring
+    # BpWait::fresh_decisions's order), and mutates nothing.
+    if ($list_mode) {
+        if (defined $package || defined $decision) {
+            print STDERR "bp-answer-decision: use --list OR --decision/--package, not both\n"; exit 2;
+        }
+        my %filter;
+        if (defined $category_arg) {
+            %filter = map { $_ => 1 } grep { length } split /,/, $category_arg;
+        }
+        my @recs;
+        my $dir = "$runs/needs-you";
+        if (opendir my $dh, $dir) {
+            for my $f (grep { /\.json$/ } readdir $dh) {
+                my $rec = BpOrch::_read_json("$dir/$f");
+                next unless ref $rec eq 'HASH';
+                my $cat = $rec->{category};
+                next if %filter && !(defined $cat && $filter{$cat});
+                (my $id = $f) =~ s/\.json$//i;
+                push @recs, { id => $id, package => $rec->{package}, kind => $rec->{kind},
+                              category => $cat, question => $rec->{question},
+                              created_at => $rec->{created_at} };
+            }
+            closedir $dh;
+        }
+        @recs = sort {
+            (($a->{created_at} // 0) <=> ($b->{created_at} // 0))
+                || (($a->{id} // '') cmp ($b->{id} // ''))
+        } @recs;
+        print JSON::PP->new->canonical->encode($_), "\n" for @recs;
+        exit 0;
     }
 
     my ($pkg, $kind, $file);

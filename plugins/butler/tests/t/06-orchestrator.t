@@ -208,14 +208,14 @@ my $dir = tempdir(CLEANUP => 1);
 # ---- IO: needs-you queue (schema + dedupe) --------------------------------
 {
     my $runs = "$dir/runs2"; mkdir $runs;
-    my $f = BpOrch::queue_needs_you($runs, { package=>'A3', blueprint=>'bp', kind=>'stuck-package', question=>'q?', context=>'c', created_at=>100 });
+    my $f = BpOrch::queue_needs_you($runs, { package=>'A3', blueprint=>'bp', kind=>'stuck-package', question=>'q?', context=>'c', created_at=>100, category=>'unclassified' });
     ok(-e $f, 'needs-you: file written');
     like($f, qr{needs-you/A3--[0-9a-f]+\.json$}, 'needs-you: filename pattern <pkg>--<shortid>.json');
     my $rec = $J->decode(do { local $/; open my $r,'<',$f or die; <$r> });
     is($rec->{package}, 'A3', 'needs-you: package field');
     is($rec->{kind}, 'stuck-package', 'needs-you: kind field');
     ok(exists $rec->{question} && exists $rec->{context} && exists $rec->{created_at}, 'needs-you: full schema');
-    my $f2 = BpOrch::queue_needs_you($runs, { package=>'A3', blueprint=>'bp', kind=>'stuck-package', question=>'again', context=>'c2', created_at=>200 });
+    my $f2 = BpOrch::queue_needs_you($runs, { package=>'A3', blueprint=>'bp', kind=>'stuck-package', question=>'again', context=>'c2', created_at=>200, category=>'unclassified' });
     is($f2, $f, 'needs-you: same package+kind deduped to the existing file');
     opendir my $dh, "$runs/needs-you"; my @j = grep { /\.json$/ } readdir $dh; closedir $dh;
     is(scalar @j, 1, 'needs-you: dedupe leaves exactly one file');
@@ -321,9 +321,9 @@ MD
 {
     my $runs = "$dir/runs3"; mkdir $runs;
     BpOrch::_enter_pause_manual($runs, undef, 'token-floor',
-        { package=>'_fleet', blueprint=>'bp', kind=>'reauth', question=>'re-login', context=>'floor', created_at=>10 });
+        { package=>'_fleet', blueprint=>'bp', kind=>'reauth', question=>'re-login', context=>'floor', created_at=>10, category=>'operational' });
     BpOrch::_enter_pause_manual($runs, undef, 'usage-contract',
-        { package=>'_fleet', blueprint=>'bp', kind=>'contract-drift', question=>'drift', context=>'c', created_at=>20 });
+        { package=>'_fleet', blueprint=>'bp', kind=>'contract-drift', question=>'drift', context=>'c', created_at=>20, category=>'operational' });
     my $p = BpOrch::read_paused($runs);
     is($p->{reason}, 'token-floor', 'manual pause: first reason preserved (no clobber)');
     ok($p->{manual}, 'manual pause: stays manual');
@@ -363,8 +363,8 @@ MD
 {
     my $runs = "$dir/runs-q"; mkdir $runs;
     is_deeply(BpOrch::queued_decision_pkgs($runs), {}, 'queued-pkgs: missing dir -> {}');
-    BpOrch::queue_needs_you($runs, { package=>'X', blueprint=>'bp', kind=>'stuck-package', question=>'q', context=>'c', created_at=>1 });
-    BpOrch::queue_needs_you($runs, { package=>'Y', blueprint=>'bp', kind=>'harvest-failure', question=>'q', context=>'c', created_at=>2 });
+    BpOrch::queue_needs_you($runs, { package=>'X', blueprint=>'bp', kind=>'stuck-package', question=>'q', context=>'c', created_at=>1, category=>'unclassified' });
+    BpOrch::queue_needs_you($runs, { package=>'Y', blueprint=>'bp', kind=>'harvest-failure', question=>'q', context=>'c', created_at=>2, category=>'oracle' });
     # a dotfile + a non-JSON file must be ignored (matches the watcher's scanner).
     open my $dot, '>', "$runs/needs-you/.cursor" or die; print $dot "x"; close $dot;
     open my $bad, '>', "$runs/needs-you/notjson.json" or die; print $bad "{ broken"; close $bad;
