@@ -15,16 +15,30 @@
 # written instruction was supposed to protect. The thesis there applies here —
 # A WRITTEN INSTRUCTION IS NOT AN ENFORCEMENT MECHANISM. So this is a gate.
 #
-# HOW IT WORKS (three events, one script)
+# HOW IT WORKS — A STATE MACHINE, NOT A DETECTOR
 #
-#   PostToolUse/Task  — a background dispatch marks the turn UNGUARDED.
-#   PostToolUse/Bash  — a command containing the token BP_STALL_GUARD clears it.
-#   Stop              — if the turn is still UNGUARDED, DENY the stop and say so.
+# Two earlier versions of this gate were detectors, and both were wrong in the
+# same way. The first cleared the alarm when a Bash command merely CONTAINED a
+# token, so a guard that died on launch satisfied it. The second read the
+# closing prose for "next I'll ...", which can be sidestepped by rephrasing a
+# sentence. A detector is only ever as good as its guesses.
 #
-# The token is the contract, and it is deliberately explicit rather than clever:
-# a heuristic that tried to recognise "looks like a guard" would either miss real
-# guards or accept things that never wake anyone. An armed guard must literally
-# say BP_STALL_GUARD, and that string is what this hook counts.
+# So the default is inverted. The gate is INERT until a run demonstrably
+# starts, and from then on the turn may not end until the agent RESOLVES the
+# run — explicitly, with a verb:
+#
+#   PostToolUse/Task  — a background dispatch ACTIVATES the run (and is
+#                       recorded by name, so the denial can name it).
+#   PostToolUse/Bash  — a director tick whose RESPONSE handed back work also
+#                       activates. Activation is never something the agent must
+#                       remember to do.
+#   Stop              — state active? DENY. Only `bp-runstate.pl finish` or a
+#                       verified `bp-runstate.pl pause` resolves it.
+#
+# Silence is not a resolution, and neither is a plausible sentence. A pause
+# must name a watcher pid that is RUNNING and a deadline in the FUTURE, both
+# verified at read time; a pause whose watcher dies reverts to active by
+# itself, so it cannot hold the gate open after it stops meaning anything.
 #
 # DELIBERATELY NOT GATED. There is no bp_hook_gate call here, by design and for
 # the same reason guard-git-mutations.sh has none: bp_hook_gate exits 0 unless
@@ -92,6 +106,13 @@ case "$EVENT" in
         [ "$BG" = "false" ] && exit 0
         DESC=$(bp_json_get "$PAYLOAD" tool_input.description) || DESC="(unnamed)"
         printf '%s\n' "$DESC" >> "$STATE" 2>/dev/null || true
+        # ACTIVATE on the observable fact that a run started. Activation must
+        # never be a thing the agent remembers to do -- anything it must
+        # remember is a thing it will eventually forget, which is the entire
+        # reason this gate exists.
+        [ -f "$HOOK_DIR/../scripts/bp-runstate.pl" ] && \
+          perl "$HOOK_DIR/../scripts/bp-runstate.pl" activate --root "$ROOT" \
+               --reason "background subagent dispatched: $DESC" >/dev/null 2>&1
         exit 0
         ;;
       Bash)
@@ -105,10 +126,23 @@ case "$EVENT" in
         # for -- a check that cannot fail (see bp-ledger.pl's
         # INSTALLED+SKIPPED+FAILED==ITEMS identity, package a03).
         #
-        # A guard now proves itself instead: it writes its OWN pid and deadline
-        # into $STATE_DIR/armed, and the Stop branch below verifies that process
-        # is ALIVE and that deadline is in the FUTURE. A guard that died on
-        # launch cannot satisfy that, no matter what its text said.
+        # A guard now proves itself instead, through bp-runstate.pl's `pause`,
+        # which refuses a watcher pid that is not running or a deadline that is
+        # not in the future. Ceremony cannot satisfy it.
+        #
+        # What DOES happen here is the second activation trigger: a director
+        # tick that handed back work means a run is underway, whether or not a
+        # subagent was dispatched. Reading the RESPONSE (not the command) is
+        # deliberate -- the command only says what was asked, the response says
+        # what came back.
+        RESP=$(bp_json_get "$PAYLOAD" tool_response.stdout tool_response) || RESP=""
+        case "$RESP" in
+          *'"action":"run-package"'*|*'"action":"need-order"'*)
+            [ -f "$HOOK_DIR/../scripts/bp-runstate.pl" ] && \
+              perl "$HOOK_DIR/../scripts/bp-runstate.pl" activate --root "$ROOT" \
+                   --reason "director handed back work" >/dev/null 2>&1
+            ;;
+        esac
         exit 0
         ;;
       *) exit 0 ;;
@@ -116,148 +150,50 @@ case "$EVENT" in
     ;;
 
   Stop)
-    # ---- (a) ANNOUNCED-BUT-DIDN'T: ending a turn by promising work ----------
-    #
-    # "Next I'll commit these" as a closing line silently kills an unattended
-    # run: nothing is scheduled, so the promise is never kept and the session
-    # just stops. This is a SEPARATE failure from the unguarded-dispatch one
-    # below -- no subagent is involved, so that marker is empty and the branch
-    # below never fires.
-    #
-    # HONEST LIMIT: this half is a HEURISTIC over prose, unlike the structural
-    # check below. It reads the last assistant message and looks for a
-    # first-person promise of imminent work. It can misfire on a legitimate
-    # "I'll pick this up when the worker reports" -- which is why it only fires
-    # when NOTHING is scheduled to wake the session, and why it is bounded by
-    # the same TTL and force-stop as everything else here. A misfire costs one
-    # extra turn; the failure it prevents costs the whole run.
-    if [ -z "${BP_NO_PROMISE_GATE:-}" ] && [ ! -f "$STATE_DIR/force-stop" ]; then
-      TP=$(bp_json_get "$PAYLOAD" transcript_path) || TP=""
-      # A live guard or a pending dispatch means something WILL wake us, so a
-      # forward-looking sentence is fine. Only an unscheduled promise is a bug.
-      SCHEDULED=0
-      if [ -f "$STATE_DIR/armed" ]; then
-        A_PID=$(sed -n '1p' "$STATE_DIR/armed" 2>/dev/null | tr -d ' \r')
-        case "$A_PID" in ''|*[!0-9]*) A_PID="" ;; esac
-        [ -n "$A_PID" ] && kill -0 "$A_PID" 2>/dev/null && SCHEDULED=1
-      fi
-      if [ "$SCHEDULED" = "0" ] && [ -n "$TP" ] && [ -f "$TP" ] && [ ! -f "$STATE_DIR/promise-denied" ]; then
-        PROMISE=$(perl -MJSON::PP -e '
-            my ($tp) = @ARGV;
-            open my $fh, "<", $tp or exit 0;
-            my $last = "";
-            while (my $l = <$fh>) {
-                my $j = eval { JSON::PP->new->decode($l) } or next;
-                next unless ($j->{type} // "") eq "assistant";
-                my $c = eval { $j->{message}{content} } or next;
-                next unless ref $c eq "ARRAY";
-                my $t = join " ", map { $_->{text} // "" } grep { ($_->{type}//"") eq "text" } @$c;
-                $last = $t if length $t;
-            }
-            close $fh;
-            exit 0 unless length $last;
-            # Only the CLOSING stretch matters: a promise mid-message that the
-            # message then fulfils is not the failure.
-            my $tail = length($last) > 400 ? substr($last, -400) : $last;
-            my @pat = (
-                qr/\bnext(?:,| I| step)?[^.]{0,40}\bI(?:\x27ll| will)\b/i,
-                qr/\bI(?:\x27ll| will)\s+(?:now\s+)?(?:commit|run|dispatch|fix|write|implement|continue|start|kick off|re-?run|take|pick up|proceed)\b/i,
-                qr/\b(?:then|after that|once .{0,30} lands?)\s+I(?:\x27ll| will)\b/i,
-                qr/\bdoing (?:it|that) now\b/i,
-                qr/\bon it now\b/i,
-            );
-            for my $p (@pat) { if ($tail =~ $p) { print "1"; exit 0 } }
-            exit 0;
-        ' "$TP" 2>/dev/null) || PROMISE=""
-        if [ "$PROMISE" = "1" ]; then
-          : > "$STATE_DIR/promise-denied" 2>/dev/null || true
-          cat >&2 <<'PEOF'
-BLOCKED: this turn ends by announcing work it did not do, and nothing is scheduled to continue.
+    # THE GATE. Inert until a run starts; once active, the turn may not end
+    # until the agent RESOLVES it. See bp-runstate.pl for why this is a state
+    # machine rather than a detector: the two previous attempts both asked
+    # "does anything look wrong?", and a detector is only as good as its
+    # guesses -- one accepted a guard that had already died, the other could be
+    # sidestepped by rephrasing a sentence.
+    [ -f "$STATE_DIR/force-stop" ] && exit 0
 
-"Next I'll ..." as a closing line is how an unattended run dies: the turn ends,
-nothing wakes the session, and the promised work never happens. If you are about
-to do it, DO IT NOW in this turn. If it genuinely must wait on something, arm a
-guard so the session actually resumes, or ask the operator a direct question and
-stop on that instead.
+    RS="$HOOK_DIR/../scripts/bp-runstate.pl"
+    [ -f "$RS" ] || exit 0                      # fail open: no state machine, no gate
+    ST=$(perl "$RS" status --root "$ROOT" 2>/dev/null) || exit 0
+    case "$ST" in
+      *'"state":"active"'*) ;;                 # fall through to the denial
+      *) exit 0 ;;                              # inert / paused / finished -> allow
+    esac
 
-This fires once; stopping again is allowed, so it corrects rather than traps.
-Set BP_NO_PROMISE_GATE=1 to disable, or touch force-stop to override.
-PEOF
-          exit 2
-        fi
-      fi
-    fi
-    rm -f "$STATE_DIR/promise-denied" 2>/dev/null || true
+    PENDING=""
+    [ -s "$STATE" ] && PENDING=$(tr '\n' ';' < "$STATE" 2>/dev/null | sed 's/;$//')
+    STALE=""
+    case "$ST" in *'"stale_pause":1'*) STALE=" (a previous pause went stale: its watcher is gone)";; esac
 
-    # ---- (b) UNGUARDED BACKGROUND DISPATCH ---------------------------------
-    [ -s "$STATE" ] || exit 0
-
-    # Escape hatch, mirroring gate-stop.sh's force-stop: a gate that cannot be
-    # overridden is a gate that can strand the operator.
-    if [ -f "$STATE_DIR/force-stop" ]; then
-      rm -f "$STATE" 2>/dev/null || true
-      exit 0
-    fi
-
-    # TTL. The marker is NOT cleared on deny — clearing meant one missed guard
-    # was caught once and every retry sailed through, which is advice, not
-    # enforcement. Instead it expires, so it can neither be bypassed by simply
-    # stopping again nor wedge the session forever.
-    TTL="${BP_STALL_GUARD_TTL_S:-900}"
-    AGE=$(perl -e 'my @s = stat($ARGV[0]); print defined $s[9] ? (time - $s[9]) : 0' "$STATE" 2>/dev/null) || AGE=0
-    case "$AGE" in ''|*[!0-9]*) AGE=0 ;; esac
-    if [ "$AGE" -gt "$TTL" ]; then
-      rm -f "$STATE" 2>/dev/null || true
-      exit 0
-    fi
-
-    # Is a guard genuinely ARMED — a live process with a deadline still ahead?
-    # This is the check the token-matching version could not make.
-    ARMED="$STATE_DIR/armed"
-    if [ -f "$ARMED" ]; then
-      G_PID=$(sed -n '1p' "$ARMED" 2>/dev/null | tr -d ' \r')
-      G_DL=$(sed -n '2p' "$ARMED" 2>/dev/null | tr -d ' \r')
-      case "$G_PID" in ''|*[!0-9]*) G_PID="" ;; esac
-      case "$G_DL"  in ''|*[!0-9]*) G_DL=0  ;; esac
-      NOW=$(date +%s 2>/dev/null || echo 0)
-      if [ -n "$G_PID" ] && kill -0 "$G_PID" 2>/dev/null && [ "$G_DL" -gt "$NOW" ]; then
-        rm -f "$STATE" 2>/dev/null || true
-        exit 0
-      fi
-      # A registration whose process is gone, or whose deadline has passed, is
-      # WORSE than none: it looks like cover while watching nothing. Say so.
-      rm -f "$ARMED" 2>/dev/null || true
-    fi
-
-    PENDING=$(wc -l < "$STATE" 2>/dev/null | tr -d ' ') || PENDING="?"
-    NAMES=$(tr '\n' ';' < "$STATE" 2>/dev/null | sed 's/;$//')
     cat >&2 <<EOF
-BLOCKED: $PENDING background subagent dispatch(es) this turn with no LIVE stall guard: $NAMES
+BLOCKED: a run is ACTIVE and this turn did not resolve it.$STALE
+${PENDING:+Unguarded background dispatch(es) this turn: $PENDING
+}
+A turn that ends mid-run without resolving it is how an unattended run dies:
+nothing is scheduled, nothing wakes the session, and the work simply stops.
+Silence is not a resolution. There are exactly two, and you must pick one:
 
-A background subagent that hangs or dies silently NEVER wakes this session. The
-harness notifies on completion; it does not notify on "never completed". Ending
-the turn here is how an unattended run stops dead and is found hours later.
+  1. The run is FINISHED -- nothing is pending:
 
-Arm a real guard before you stop: one Bash call with run_in_background: true.
-It must REGISTER ITSELF (pid + deadline) so this gate can verify it is alive --
-a command that merely mentions a guard proves nothing, and a guard that died on
-launch must not pass. It must also exit on EITHER outcome, so silence is never
-mistaken for progress:
+       perl plugins/butler/scripts/bp-runstate.pl finish --reason "<why>"
 
-  REPORT="<the worker's report path>"
-  DEADLINE=\$(( \$(date +%s) + 1500 ))
-  printf '%s\n%s\n' "\$\$" "\$DEADLINE" > "$STATE_DIR/armed"
-  while [ ! -f "\$REPORT" ] && [ "\$(date +%s)" -lt "\$DEADLINE" ]; do sleep 15; done
-  rm -f "$STATE_DIR/armed"
-  if [ -f "\$REPORT" ]; then echo "GUARD: REPORT-PRESENT"; else
-    echo "GUARD: STALL-DEADLINE, no report on disk"
-    find plugins -type f -mmin -25 -not -path '*/.git/*' -printf '  %TH:%TM %p\n' | head
-    echo "(no lines above = the worker is dead, not slow)"
-  fi
+  2. The run CONTINUES but something live will wake it. Arm a watcher first
+     (Bash, run_in_background: true), then declare the pause. The pid must be
+     RUNNING and the deadline in the FUTURE -- this is verified, not trusted:
 
-This marker is NOT cleared by being denied -- stopping again will be denied too.
-It expires on its own after ${TTL}s so it cannot wedge the session, and
-touching $STATE_DIR/force-stop overrides it outright.
+       perl plugins/butler/scripts/bp-runstate.pl pause \
+            --watcher-pid <pid> --until \$(( \$(date +%s) + 1800 )) \
+            --reason "<what will wake us>"
+
+If instead you are about to do the work, DO IT NOW in this turn.
+A pause whose watcher dies reverts to active by itself, so a stale pause cannot
+hold the gate open. touch $STATE_DIR/force-stop to override entirely.
 EOF
     exit 2
     ;;

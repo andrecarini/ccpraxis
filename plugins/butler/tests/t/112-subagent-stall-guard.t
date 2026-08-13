@@ -1,27 +1,27 @@
 #!/usr/bin/env perl
-# t/112-subagent-stall-guard.t — the turn cannot end with an unguarded
-# background subagent.
+# t/112-subagent-stall-guard.t — the stop gate is a STATE MACHINE.
 #
-# WHY THIS GATE EXISTS, AND WHY A TEST GUARDS THE GATE.
+# THE FAILURE. A turn that ends mid-run schedules nothing: no notification is
+# pending, nothing wakes the session, and an unattended run simply stops until
+# someone notices hours later. It recurred all evening, and each time the
+# remedy was written down as guidance. Guidance did not hold — the same lesson
+# guard-git-mutations.sh was born from, where a prohibited command destroyed a
+# completed fix-batch that an instruction was supposed to protect.
 #
-# A background subagent that hangs or dies silently never wakes the session: the
-# harness notifies on completion, not on "never completed". So a run dispatches
-# a worker, ends the turn, and stops dead until someone notices hours later.
-# This recurred, and the remedy was repeatedly recorded as guidance. Guidance did
-# not hold — which is the same lesson guard-git-mutations.sh was born from, where
-# a prohibited command destroyed a completed fix-batch that an instruction was
-# supposed to protect. A written instruction is not an enforcement mechanism.
+# TWO DETECTORS WERE TRIED FIRST, AND BOTH WERE WRONG IN THE SAME WAY.
+#   1. "A Bash command containing the token BP_STALL_GUARD clears the alarm."
+#      A guard that died on launch contains the token just as well as a live
+#      one. It verified ceremony, not function.
+#   2. "Deny if the closing prose promises work." Sidestepped by rephrasing a
+#      sentence — a gate the guarded party can talk its way out of.
+# A detector is only as good as its guesses. So the default is inverted:
 #
-# The properties pinned here are the ones that make it enforcement rather than
-# decoration:
-#   * a background dispatch followed by a bare stop is DENIED (exit 2)
-#   * arming a guard (a Bash command containing BP_STALL_GUARD) permits the stop
-#   * a SYNCHRONOUS dispatch never blocks — it holds the turn open, so a hang is
-#     already visible, and blocking it would be noise
-#   * the hook is NOT bp_hook_gate'd, so it applies in drive-solo, which is the
-#     exact context the failure happens in
-#   * the deny CLEARS its marker, so one missed guard cannot wedge every
-#     subsequent stop
+#   INERT until a run demonstrably starts; then DENY until the agent RESOLVES
+#   it, with exactly two resolutions and no third:
+#       finish — nothing pending
+#       pause  — a LIVE watcher will wake us (verified pid + future deadline)
+#
+# Silence is not a resolution, and neither is a plausible sentence.
 use strict;
 use warnings;
 use FindBin qw($Bin);
@@ -29,352 +29,255 @@ use Test::More;
 use File::Temp qw(tempdir);
 use JSON::PP;
 
-(my $HOOKS = "$Bin/../../hooks") =~ s{\\}{/}g;
+(my $HOOKS   = "$Bin/../../hooks")   =~ s{\\}{/}g;
+(my $SCRIPTS = "$Bin/../../scripts") =~ s{\\}{/}g;
 my $GUARD = "$HOOKS/guard-subagent-stall.sh";
+my $RS    = "$SCRIPTS/bp-runstate.pl";
 
 ok(-f $GUARD, 'guard-subagent-stall.sh exists') or BAIL_OUT('hook missing');
 ok(-x $GUARD, 'guard-subagent-stall.sh is executable');
+ok(-f $RS,    'bp-runstate.pl exists')          or BAIL_OUT('state machine missing');
 
 my $J = JSON::PP->new->canonical;
 
-# fire($root, \%payload) -> ($exit, $stderr)
-sub fire {
-    my ($root, $payload) = @_;
-    my $json = $J->encode($payload);
-    my ($tmp_fh, $tmp) = File::Temp::tempfile('t112-XXXXXX', TMPDIR => 1);
-    print {$tmp_fh} $json; close $tmp_fh;
-    my $err = "$tmp.err";
-    my $rc = system(qq{CLAUDE_PROJECT_DIR="$root" bash "$GUARD" < "$tmp" 2> "$err"});
-    my $stderr = do { open my $f, '<', $err or return ($rc >> 8, ''); local $/; <$f> // '' };
-    unlink $tmp, $err;
-    return ($rc >> 8, $stderr);
+sub rs {                      # run the state machine CLI -> (exit, stdout)
+    my ($root, @args) = @_;
+    my $cmd = qq{perl "$RS" } . join(' ', @args) . qq{ --root "$root" 2>/dev/null};
+    my $out = `$cmd`;
+    return ($? >> 8, $out // '');
 }
-
-sub dispatch { my ($bg, $desc) = @_;
+sub state_of {
+    my ($root) = @_;
+    my (undef, $out) = rs($root, 'status');
+    my $j = eval { JSON::PP->new->decode($out) } || {};
+    return $j->{state} // 'inert';
+}
+sub fire {                    # feed a payload to the hook -> (exit, stderr)
+    my ($root, $payload) = @_;
+    my ($fh, $tmp) = File::Temp::tempfile('t112-XXXXXX', TMPDIR => 1);
+    print {$fh} $J->encode($payload); close $fh;
+    my $err = "$tmp.err";
+    my $rc  = system(qq{CLAUDE_PROJECT_DIR="$root" bash "$GUARD" < "$tmp" 2> "$err"});
+    my $se  = do { open my $f, '<', $err or return ($rc >> 8, ''); local $/; <$f> // '' };
+    unlink $tmp, $err;
+    return ($rc >> 8, $se);
+}
+sub dispatch {
+    my ($bg, $desc) = @_;
     my %ti = (description => ($desc // 'a worker'), prompt => 'x');
     $ti{run_in_background} = $bg if defined $bg;
-    return { hook_event_name => 'PostToolUse', session_id => 'sess-t112',
-             tool_name => 'Task', tool_input => \%ti };
+    return { hook_event_name=>'PostToolUse', session_id=>'sess-t112',
+             tool_name=>'Task', tool_input=>\%ti };
 }
-sub bash_cmd { my ($cmd) = @_;
-    return { hook_event_name => 'PostToolUse', session_id => 'sess-t112',
-             tool_name => 'Bash', tool_input => { command => $cmd } };
+sub bash_ev {
+    my ($cmd, $resp) = @_;
+    return { hook_event_name=>'PostToolUse', session_id=>'sess-t112', tool_name=>'Bash',
+             tool_input=>{ command=>$cmd }, tool_response=>{ stdout=>($resp // '') } };
 }
-sub stop { return { hook_event_name => 'Stop', session_id => 'sess-t112' } }
+sub stop { { hook_event_name=>'Stop', session_id=>'sess-t112' } }
+sub newroot { my $r = tempdir(CLEANUP => 1); mkdir "$r/.ccpraxis-local-data"; return $r }
 
-# ---- 1. The core gate: dispatch then stop -> DENIED --------------------------
+# ============================ THE STATE MACHINE ============================
+
 {
-    my $root = tempdir(CLEANUP => 1);
-    my ($rc) = fire($root, dispatch(JSON::PP::true, 'b01 test-writer'));
-    is($rc, 0, 'recording a background dispatch is silent and allows the tool');
+    my $r = newroot();
+    is(state_of($r), 'inert', 'a fresh project is INERT — the gate costs nothing until a run starts');
 
-    my ($src, $serr) = fire($root, stop());
-    is($src, 2, 'stopping with an unguarded background dispatch is DENIED');
-    like($serr, qr/BLOCKED/, 'the denial says BLOCKED');
-    like($serr, qr/b01 test-writer/, 'the denial names the unguarded worker');
-    like($serr, qr/REGISTER ITSELF/, 'the denial explains that a guard must prove itself, not merely exist');
-    like($serr, qr/armed/,           'the denial names the registration file');
+    rs($r, 'activate', '--reason', '"x"');
+    is(state_of($r), 'active', 'activate -> active');
+
+    # A pause is a CLAIM about the world, and the machine checks it.
+    my ($rc1) = rs($r, 'pause', '--watcher-pid', 999999, '--until', time + 600);
+    isnt($rc1, 0, 'pause REFUSED when the watcher pid is not running');
+    is(state_of($r), 'active', '...and the state is unchanged by a refused pause');
+
+    my ($rc2) = rs($r, 'pause', '--watcher-pid', $$, '--until', time - 5);
+    isnt($rc2, 0, 'pause REFUSED when the deadline is already past');
+
+    my ($rc3) = rs($r, 'pause', '--watcher-pid', $$);
+    isnt($rc3, 0, 'pause REFUSED with no deadline — an unbounded pause never resumes');
+
+    my ($rc4) = rs($r, 'pause', '--watcher-pid', $$, '--until', time + 600);
+    is($rc4, 0, 'pause ACCEPTED with a live pid and a future deadline');
+    is(state_of($r), 'paused', '...and the state is paused');
+
+    rs($r, 'finish', '--reason', '"done"');
+    is(state_of($r), 'finished', 'finish -> finished');
 }
 
-# arm($root, %opt) — write a guard registration like a real guard would.
-#   pid      : defaults to $$ (this process, definitely alive)
-#   deadline : defaults to 10 minutes out
-sub arm {
-    my ($root, %o) = @_;
-    my $dir = "$root/.ccpraxis-local-data/.subagent-guard";
-    mkdir $_ for ("$root/.ccpraxis-local-data", $dir);
-    open my $f, '>', "$dir/armed" or die $!;
-    printf {$f} "%s\n%s\n", ($o{pid} // $$), ($o{deadline} // (time + 600));
-    close $f;
-}
-
-# ---- 2. A LIVE registered guard permits the stop ----------------------------
+# A pause whose watcher DIED reverts to active by itself. Without this, a pause
+# outlives its meaning and holds the gate open over an abandoned run — which is
+# precisely the failure the gate exists to prevent, reintroduced through the
+# resolution path.
 {
-    my $root = tempdir(CLEANUP => 1);
-    fire($root, dispatch(JSON::PP::true, 'w'));
-    arm($root);
-    my ($src) = fire($root, stop());
-    is($src, 0, 'a live guard (running pid, future deadline) permits the stop');
+    my $r = newroot();
+    rs($r, 'activate');
+    my ($rc) = rs($r, 'pause', '--watcher-pid', $$, '--until', time + 600);
+    is($rc, 0, 'pause granted against a live watcher');
+    is(state_of($r), 'paused', 'state is paused while the watcher lives');
+
+    # Now make the SAME record stale by hand, rather than by killing a process.
+    # Deliberate: perl's fork on this host is emulated and its pid semantics are
+    # exactly what bit the wake-lock (see bp-keepawake.pl), so a test that killed
+    # a child would be testing Windows process lifetime, not this reversion.
+    # Editing the record isolates the property under test.
+    my $sp = "$r/.ccpraxis-local-data/.subagent-guard/run-state.json";
+    my $rec = JSON::PP->new->decode(do { open my $f,'<',$sp or die; local $/; <$f> });
+    $rec->{watcher_pid} = 999999;                       # a pid that is not running
+    open my $w, '>', $sp or die; print {$w} $J->encode($rec); close $w;
+    is(state_of($r), 'active',
+       'watcher gone -> the pause is STALE and reverts to ACTIVE on its own');
+
+    # ...and the same for a deadline that has simply run out.
+    $rec->{watcher_pid} = $$; $rec->{until} = time - 1;
+    open my $w2, '>', $sp or die; print {$w2} $J->encode($rec); close $w2;
+    is(state_of($r), 'active',
+       'deadline passed -> the pause is STALE even though the watcher still lives');
 }
 
-# ---- 3. FUNCTION, NOT CEREMONY ----------------------------------------------
-#
-# These are the cases the first design of this hook got WRONG. It cleared the
-# pending set whenever a Bash command merely CONTAINED the token
-# BP_STALL_GUARD — so a guard that died on launch, or watched nothing, or was
-# never really a guard at all, satisfied it completely. That is the same
-# can't-fail check this repo keeps paying for (a03's
-# INSTALLED+SKIPPED+FAILED==ITEMS identity). A guard must now PROVE itself.
+# ================================ THE GATE =================================
+
 {
-    my $root = tempdir(CLEANUP => 1);
-    fire($root, dispatch(JSON::PP::true, 'w'));
-    fire($root, bash_cmd('echo "arming BP_STALL_GUARD now"'));   # says it; is not one
-    my ($src) = fire($root, stop());
-    is($src, 2, 'merely MENTIONING the guard token does not satisfy the gate');
-}
-{
-    my $root = tempdir(CLEANUP => 1);
-    fire($root, dispatch(JSON::PP::true, 'w'));
-    # pid 999999 is not running: a guard that died the moment it launched.
-    arm($root, pid => 999999);
-    my ($src, $serr) = fire($root, stop());
-    is($src, 2, 'a registration whose process is DEAD does not satisfy the gate');
-    like($serr, qr/BLOCKED/, '...and it is reported, not silently tolerated');
-}
-{
-    my $root = tempdir(CLEANUP => 1);
-    fire($root, dispatch(JSON::PP::true, 'w'));
-    arm($root, deadline => time - 60);   # alive, but its watch already ended
-    my ($src) = fire($root, stop());
-    is($src, 2, 'a registration whose deadline has PASSED does not satisfy the gate');
-}
-{
-    my $root = tempdir(CLEANUP => 1);
-    fire($root, dispatch(JSON::PP::true, 'w'));
-    fire($root, bash_cmd('git status --short'));
-    my ($src) = fire($root, stop());
-    is($src, 2, 'unrelated Bash calls do NOT satisfy the gate');
+    my $r = newroot();
+    my ($rc) = fire($r, stop());
+    is($rc, 0, 'INERT: stopping is allowed and nothing is in the way');
 }
 
-# ---- 4. Synchronous dispatches never block ----------------------------------
 {
-    my $root = tempdir(CLEANUP => 1);
-    fire($root, dispatch(JSON::PP::false, 'sync worker'));
-    my ($src) = fire($root, stop());
-    is($src, 0, 'a SYNCHRONOUS dispatch does not require a guard (the turn stays open)');
+    my $r = newroot();
+    my ($rc) = fire($r, dispatch(JSON::PP::true, 'b01 test-writer'));
+    is($rc, 0, 'a background dispatch is recorded silently');
+    is(state_of($r), 'active',
+       'ACTIVATION IS AUTOMATIC — dispatching a background subagent starts the run');
+
+    my ($src, $serr) = fire($r, stop());
+    is($src, 2, 'ACTIVE: stopping is DENIED');
+    like($serr, qr/BLOCKED/,          'the denial says BLOCKED');
+    like($serr, qr/b01 test-writer/,  'the denial names the unresolved worker');
+    like($serr, qr/bp-runstate\.pl finish/, 'the denial gives the finish verb');
+    like($serr, qr/bp-runstate\.pl pause/,  'the denial gives the pause verb');
 }
 
-# ---- 5. Absent run_in_background counts as background -----------------------
-#
-# The Agent tool defaults to background, so omitting the field must be treated
-# as the dangerous case, not the safe one.
-{
-    my $root = tempdir(CLEANUP => 1);
-    fire($root, dispatch(undef, 'defaulted worker'));
-    my ($src) = fire($root, stop());
-    is($src, 2, 'omitting run_in_background is treated as BACKGROUND and requires a guard');
+{   # A director tick that hands back work activates too — no subagent needed.
+    my $r = newroot();
+    fire($r, bash_ev('perl plugins/butler/scripts/bp-drive-next.pl next',
+                     '{"action":"run-package","blueprint":"bp","package":"p1"}'));
+    is(state_of($r), 'active', 'a director response of run-package ACTIVATES the run');
+    my ($rc) = fire($r, stop());
+    is($rc, 2, '...and the turn may not simply end');
 }
 
-# ---- 6. Several dispatches, one guard ---------------------------------------
-{
-    my $root = tempdir(CLEANUP => 1);
-    fire($root, dispatch(JSON::PP::true, 'reviewer'));
-    fire($root, dispatch(JSON::PP::true, 'redteam'));
-    my ($src, $serr) = fire($root, stop());
-    is($src, 2, 'two unguarded dispatches deny the stop');
-    like($serr, qr/reviewer/ , 'the denial names the first');
-    like($serr, qr/redteam/,   'the denial names the second');
-
-    fire($root, dispatch(JSON::PP::true, 'reviewer'));
-    fire($root, dispatch(JSON::PP::true, 'redteam'));
-    arm($root);
-    my ($ok) = fire($root, stop());
-    is($ok, 0, 'one live guard may cover several dispatches (it can watch several report paths)');
+{   # Reading the RESPONSE, not the command: asking is not the same as being
+    # handed work. A tick that returns done must not start a run.
+    my $r = newroot();
+    fire($r, bash_ev('perl plugins/butler/scripts/bp-drive-next.pl next', '{"action":"done"}'));
+    is(state_of($r), 'inert', 'a director response of done does NOT activate');
+    my ($rc) = fire($r, stop());
+    is($rc, 0, '...so stopping stays allowed');
 }
 
-# ---- 7. Retrying the stop does NOT bypass the gate --------------------------
-#
-# The first design cleared the marker as it denied, so stopping twice sailed
-# through — enforcement a retry defeats is advice. The marker now survives the
-# denial. It cannot wedge the session because it EXPIRES, and because
-# force-stop overrides it outright.
+{   # The two resolutions, end to end.
+    my $r = newroot();
+    fire($r, dispatch(JSON::PP::true, 'w'));
+    is((fire($r, stop()))[0], 2, 'denied before resolving');
+    rs($r, 'finish', '--reason', '"nothing pending"');
+    is((fire($r, stop()))[0], 0, 'FINISH resolves it — stopping is allowed');
+}
 {
-    my $root = tempdir(CLEANUP => 1);
-    fire($root, dispatch(JSON::PP::true, 'w'));
-    my ($first)  = fire($root, stop());
-    is($first,  2, 'first stop denied');
-    my ($second) = fire($root, stop());
-    is($second, 2, 'stopping AGAIN is denied too — a retry does not bypass the gate');
-
-    # ...but it is bounded. With a zero TTL the marker is already stale.
-    my ($rc3) = do {
-        local $ENV{BP_STALL_GUARD_TTL_S} = 0;
-        my $json = $J->encode(stop());
-        my ($fh, $tmp) = File::Temp::tempfile('t112-XXXXXX', TMPDIR => 1);
-        print {$fh} $json; close $fh;
-        my $r = system(qq{CLAUDE_PROJECT_DIR="$root" BP_STALL_GUARD_TTL_S=0 bash "$GUARD" < "$tmp" 2>/dev/null});
-        unlink $tmp;
-        ($r >> 8);
-    };
-    is($rc3, 0, 'an EXPIRED marker stops denying — the gate cannot wedge the session forever');
+    my $r = newroot();
+    fire($r, dispatch(JSON::PP::true, 'w'));
+    rs($r, 'pause', '--watcher-pid', $$, '--until', time + 600, '--reason', '"watcher"');
+    is((fire($r, stop()))[0], 0, 'PAUSE resolves it — stopping is allowed while the watcher lives');
 }
 
-# ---- 7b. force-stop is an explicit override ---------------------------------
-{
-    my $root = tempdir(CLEANUP => 1);
-    fire($root, dispatch(JSON::PP::true, 'w'));
-    my $dir = "$root/.ccpraxis-local-data/.subagent-guard";
-    open my $f, '>', "$dir/force-stop" or die $!; close $f;
-    my ($src) = fire($root, stop());
-    is($src, 0, 'force-stop overrides the gate outright (mirrors gate-stop.sh)');
+{   # Retrying does not wear the gate down. The prose version cleared its marker
+    # on denial, so a second stop sailed through; enforcement a retry defeats is
+    # advice.
+    my $r = newroot();
+    fire($r, dispatch(JSON::PP::true, 'w'));
+    is((fire($r, stop()))[0], 2, 'first stop denied');
+    is((fire($r, stop()))[0], 2, 'second stop denied too — retrying does not bypass it');
+    is((fire($r, stop()))[0], 2, 'and a third');
 }
 
-# ---- 8. Sessions do not contaminate each other ------------------------------
-{
-    my $root = tempdir(CLEANUP => 1);
-    my $d = dispatch(JSON::PP::true, 'other-session worker');
-    $d->{session_id} = 'sess-other';
-    fire($root, $d);
-    my ($src) = fire($root, stop());   # session sess-t112
-    is($src, 0, "another session's pending dispatch does not block this one");
+{   # Synchronous dispatches hold the turn open, so a hang is already visible.
+    my $r = newroot();
+    fire($r, dispatch(JSON::PP::false, 'sync worker'));
+    is(state_of($r), 'inert', 'a SYNCHRONOUS dispatch does not activate a run');
+    is((fire($r, stop()))[0], 0, '...and does not block the stop');
+}
+{   # The Agent tool defaults to background, so an absent field is the dangerous
+    # case and must be treated as such.
+    my $r = newroot();
+    fire($r, dispatch(undef, 'defaulted worker'));
+    is(state_of($r), 'active', 'omitting run_in_background counts as BACKGROUND');
 }
 
-# ---- 9. NOT gated: it must fire in drive-solo -------------------------------
-#
-# Every butler hook but guard-git-mutations.sh opens with bp_hook_gate, which
-# exits 0 unless BP_LEDGER/BP_DIR/BP_PROJECT_ROOT are all set. Those come from
-# bp-launch.sh, so a gated hook is INERT in a drive-solo run -- which is exactly
-# where subagents are dispatched by hand and exactly where this failure bites.
-{
+{   # force-stop: a gate with no override can strand the operator.
+    my $r = newroot();
+    fire($r, dispatch(JSON::PP::true, 'w'));
+    my $d = "$r/.ccpraxis-local-data/.subagent-guard";
+    open my $f, '>', "$d/force-stop" or die $!; close $f;
+    is((fire($r, stop()))[0], 0, 'force-stop overrides the gate outright');
+}
+
+{   # NOT bp_hook_gate'd: it must fire in drive-solo, which is where subagents
+    # are dispatched by hand and where this failure actually happens.
     my $src = do { open my $f, '<', $GUARD or die; local $/; <$f> };
     unlike($src, qr/^\s*bp_hook_gate\s*$/m,
         'the hook does NOT call bp_hook_gate (it would be inert in drive-solo)');
     like($src, qr/NO bp_hook_gate here, by design/,
-        '...and says so, so it is not "fixed" by someone adding one');
+        '...and says so, so nobody "fixes" it by adding one');
 
-    # Proven behaviourally, not just by reading: no BP_* env set here at all.
-    my $root = tempdir(CLEANUP => 1);
-    fire($root, dispatch(JSON::PP::true, 'ungated worker'));
-    my ($rc) = fire($root, stop());
-    is($rc, 2, 'it denies with no BP_* contract in the environment');
+    my $r = newroot();
+    fire($r, dispatch(JSON::PP::true, 'ungated worker'));
+    is((fire($r, stop()))[0], 2, 'it denies with no BP_* contract in the environment');
 }
 
-# ---- 10. THE REGISTRATION IS THE LOAD-BEARING HALF --------------------------
-#
-# A hook script that nothing invokes is prose with a shebang. CLAUDE.md makes
-# exactly this argument about guard-git-mutations.sh -- "if the file is
-# untracked, a fresh clone gets the guard script and never runs it" -- and cites
-# `t/61-settings-scope-split.t` as the test that fails if the registration goes
-# missing.
-#
-# THAT FILE DOES NOT EXIST. t/61 is 61-judge-starvation.t, and t/14 only checks a
-# GENERATED settings blob for the subagent self-test (/x/hooks paths), never the
-# repo's real .claude/settings.json. So the protection CLAUDE.md relies on was
-# itself imaginary -- the same "claimed enforcement that isn't" this hook was
-# written to end. Both registrations are asserted here instead.
-{
-    my $root = "$Bin/../../../..";
-    my $sj   = "$root/.claude/settings.json";
-    ok(-f $sj, '.claude/settings.json exists and is tracked') or BAIL_OUT('no settings.json');
+{   # No prose anywhere in the DECISION. The gate must not be talkable-out-of.
+    #
+    # Comments are stripped first, on purpose: the header explains at length why
+    # the token and prose-matching designs were wrong, so it legitimately
+    # contains both strings. What must not contain them is the executable part.
+    my $src = do { open my $f, '<', $GUARD or die; local $/; <$f> };
+    my $code = join "\n", grep { !/^\s*#/ } split /\n/, $src;
 
-    my $raw = do { open my $f, '<', $sj or die; local $/; <$f> };
-    my $cfg = eval { JSON::PP->new->decode($raw) };
-    ok($cfg, '.claude/settings.json is valid JSON') or diag($raw);
+    unlike($code, qr/\bnext\b.{0,20}I\x27ll/i,
+        'the executable gate does not pattern-match the assistant\'s prose (the sidesteppable design)');
+    unlike($code, qr/BP_STALL_GUARD/,
+        'the executable gate does not accept a magic token in a command (the ceremony design)');
+    like($code, qr/bp-runstate\.pl/,
+        'the decision is delegated to the state machine');
+}
+
+# ---- THE REGISTRATION IS THE LOAD-BEARING HALF ------------------------------
+#
+# A hook nothing invokes is prose with a shebang. CLAUDE.md makes this argument
+# about guard-git-mutations.sh and cited t/61-settings-scope-split.t as its
+# protection — a file that DOES NOT EXIST (t/61 is 61-judge-starvation.t, and
+# t/14 only checks a generated blob for the subagent self-test). The protection
+# was itself imaginary. Both registrations are asserted here instead.
+{
+    my $sj = "$Bin/../../../../.claude/settings.json";
+    ok(-f $sj, '.claude/settings.json exists and is tracked') or BAIL_OUT('no settings.json');
+    my $cfg = eval { JSON::PP->new->decode(do { open my $f,'<',$sj or die; local $/; <$f> }) };
+    ok($cfg, '.claude/settings.json is valid JSON');
 
     my @cmds;
     for my $ev (keys %{ $cfg->{hooks} || {} }) {
         for my $blk (@{ $cfg->{hooks}{$ev} || [] }) {
-            push @cmds, map { +{ event => $ev, matcher => ($blk->{matcher} // ''), cmd => ($_->{command} // '') } }
+            push @cmds, map { +{ event=>$ev, matcher=>($blk->{matcher}//''), cmd=>($_->{command}//'') } }
                         @{ $blk->{hooks} || [] };
         }
     }
-
     ok(scalar(grep { $_->{cmd} =~ /guard-git-mutations\.sh/ && $_->{event} eq 'PreToolUse' } @cmds),
-       'guard-git-mutations.sh is registered PreToolUse (a prohibited command once destroyed a fix-batch)');
-
+       'guard-git-mutations.sh is registered PreToolUse');
     ok(scalar(grep { $_->{cmd} =~ /guard-subagent-stall\.sh/ && $_->{event} eq 'Stop' } @cmds),
-       'guard-subagent-stall.sh is registered as a Stop hook — without this it can never deny');
-
+       'guard-subagent-stall.sh is registered Stop — without this it can never deny');
     my ($post) = grep { $_->{cmd} =~ /guard-subagent-stall\.sh/ && $_->{event} eq 'PostToolUse' } @cmds;
-    ok($post, 'guard-subagent-stall.sh is registered PostToolUse — without this it never learns a dispatch happened');
-    like(($post // {})->{matcher} // '', qr/Task/,
-         '...and its matcher covers Task (the dispatch it must notice)');
-    like(($post // {})->{matcher} // '', qr/Bash/,
-         '...and Bash (the guard-arming it must notice)');
-}
-
-# ---- 11. ANNOUNCED-BUT-DIDN'T ------------------------------------------------
-#
-# The other half of the same disease: a turn that ends "Next I'll commit these"
-# schedules nothing, so the promise is never kept and an unattended run simply
-# stops. No subagent is involved, so the dispatch marker is empty and the gate
-# above never fires.
-#
-# This half is a HEURISTIC over prose and is tested as such — the
-# false-POSITIVE cases below matter as much as the true ones, because a gate
-# that fires on every forward-looking sentence would be turned off within a day.
-{
-    # transcript($root, $text) -> path to a one-message JSONL transcript
-    my $tn = 0;
-    my $mk = sub {
-        my ($root, $text) = @_;
-        my $p = "$root/t" . (++$tn) . ".jsonl";
-        open my $f, '>', $p or die $!;
-        print {$f} $J->encode({ type => 'assistant',
-                                message => { content => [ { type => 'text', text => $text } ] } }), "\n";
-        close $f;
-        return $p;
-    };
-    my $stop_with = sub {
-        my ($root, $text) = @_;
-        my $s = stop();
-        $s->{transcript_path} = $mk->($root, $text);
-        return (fire($root, $s))[0];
-    };
-
-    # -- true positives: a promise with nothing scheduled --
-    for my $t (
-        'All committed. Next I\'ll commit the stall gate and then continue.',
-        'Verified from disk. I\'ll dispatch the implementer for b01.',
-        'That is done. Doing it now.',
-        'Once the sweep lands I\'ll run the full suite and commit.',
-    ) {
-        my $root = tempdir(CLEANUP => 1);
-        is($stop_with->($root, $t), 2, "denied: promise with nothing scheduled — '" . substr($t,0,38) . "...'");
-    }
-
-    # -- false positives it must NOT fire on --
-    for my $t (
-        'Both suites are green and everything is committed. Nothing needs you.',
-        'I could not determine the mechanism; criterion 1 sanctions saying so.',
-        'Which would you prefer — the synthetic table, or the real backpack.json?',
-        'The fleet holds no wake-lock. That is a defect and I have filed it.',
-    ) {
-        my $root = tempdir(CLEANUP => 1);
-        is($stop_with->($root, $t), 0, "allowed: no promise — '" . substr($t,0,38) . "...'");
-    }
-
-    # -- a promise is FINE when something is scheduled to wake the session --
-    {
-        my $root = tempdir(CLEANUP => 1);
-        arm($root);   # live guard: the run will resume on its own
-        is($stop_with->($root, 'I\'ll pick this up when the worker reports.'), 0,
-           'allowed: a promise is fine when a LIVE guard will resume the session');
-    }
-
-    # -- corrects, does not trap --
-    {
-        my $root = tempdir(CLEANUP => 1);
-        my $txt  = 'Next I\'ll commit these.';
-        is($stop_with->($root, $txt), 2, 'first stop denied');
-        is($stop_with->($root, $txt), 0, 'stopping again is allowed — it corrects rather than traps');
-    }
-
-    # -- escape hatches --
-    {
-        my $root = tempdir(CLEANUP => 1);
-        my $dir  = "$root/.ccpraxis-local-data/.subagent-guard";
-        mkdir $_ for ("$root/.ccpraxis-local-data", $dir);
-        open my $f, '>', "$dir/force-stop" or die $!; close $f;
-        is($stop_with->($root, 'Next I\'ll commit these.'), 0, 'force-stop overrides the promise gate');
-    }
-    {
-        my $root = tempdir(CLEANUP => 1);
-        my $s = stop(); $s->{transcript_path} = $mk->($root, 'Next I\'ll commit these.');
-        my $json = $J->encode($s);
-        my ($fh, $tmp) = File::Temp::tempfile('t112-XXXXXX', TMPDIR => 1);
-        print {$fh} $json; close $fh;
-        my $rc = system(qq{CLAUDE_PROJECT_DIR="$root" BP_NO_PROMISE_GATE=1 bash "$GUARD" < "$tmp" 2>/dev/null});
-        unlink $tmp;
-        is($rc >> 8, 0, 'BP_NO_PROMISE_GATE=1 disables the heuristic half outright');
-    }
-
-    # -- missing/unreadable transcript must fail OPEN --
-    {
-        my $root = tempdir(CLEANUP => 1);
-        my $s = stop(); $s->{transcript_path} = "$root/does-not-exist.jsonl";
-        is((fire($root, $s))[0], 0, 'an unreadable transcript fails open, never blocks');
-    }
+    ok($post, 'guard-subagent-stall.sh is registered PostToolUse — without this it never activates');
+    like(($post//{})->{matcher}//'', qr/Task/, '...its matcher covers Task');
+    like(($post//{})->{matcher}//'', qr/Bash/, '...and Bash');
 }
 
 done_testing();
