@@ -322,26 +322,33 @@ my $ac56_R = { title => 'R', lines => [ 'r1' ] };
 # (spec S2.4.3: present when `ref $state->{tokens} eq 'HASH'`) -- without it
 # there is no second lead panel to pair with at all. Both frames stay
 # exactly $rows x $cols.
+#
+# RE-POINTED AGAIN (package t01-providers-panel, spec §6): the Token panel is
+# deleted outright and replaced by the always-present Blueprints panel as
+# Run's new pairing partner (Behavior 17) -- Blueprints is the panel
+# immediately following Run in panels()'s order and, unlike Token, needs no
+# fixture augmentation to exist at all, so the `tokens => {}` augmentation is
+# dropped. Claim preserved verbatim; only the SUBJECT (Token -> Blueprints)
+# and the fixture (no augmentation needed) move.
 # ---------------------------------------------------------------------------
 {
-    my %st_pair = (%st, tokens => {});
     my $below = $BP - 1;
-    my $fbelow = Dashboard::compose_frame(\%st_pair, 24, $below);
+    my $fbelow = Dashboard::compose_frame(\%st, 24, $below);
     is(scalar(@$fbelow), 24, "AC-7: compose_frame(24,$below) returns exactly 24 rows");
     is(scalar(grep { Dashboard::display_width($_->{text}) != $below } @$fbelow), 0,
         "AC-7: compose_frame(24,$below) -- every row is exactly $below display columns");
-    my $both_below = grep { $_->{text} =~ /-- Run / && $_->{text} =~ /-- Token / } @$fbelow;
-    is($both_below, 0, "AC-7: 24x$below -- no single row contains BOTH \"-- Run\" and \"-- Token\" (still stacked)");
+    my $both_below = grep { $_->{text} =~ /-- Run / && $_->{text} =~ /-- Blueprints / } @$fbelow;
+    is($both_below, 0, "AC-7: 24x$below -- no single row contains BOTH \"-- Run\" and \"-- Blueprints\" (still stacked)");
     my ($run_below) = grep { $_->{text} =~ /^-- Run (?:$RULE_FILL_RE)+$/ } @$fbelow;
     ok($run_below, "AC-7: 24x$below -- some row matches /^-- Run <rule.h fill>\$/");
     is(Dashboard::display_width($run_below->{text}), $below, "AC-7: that row is exactly $below display columns") if $run_below;
 
-    my $fat = Dashboard::compose_frame(\%st_pair, 24, $BP);
+    my $fat = Dashboard::compose_frame(\%st, 24, $BP);
     is(scalar(@$fat), 24, "AC-7: compose_frame(24,$BP) returns exactly 24 rows");
     is(scalar(grep { Dashboard::display_width($_->{text}) != $BP } @$fat), 0,
         "AC-7: compose_frame(24,$BP) -- every row is exactly $BP display columns");
-    my $both_at = grep { $_->{text} =~ /-- Run / && $_->{text} =~ /-- Token / } @$fat;
-    is($both_at, 1, "AC-7: 24x$BP -- EXACTLY one row contains BOTH \"-- Run \" and \"-- Token \" (two-column mode)");
+    my $both_at = grep { $_->{text} =~ /-- Run / && $_->{text} =~ /-- Blueprints / } @$fat;
+    is($both_at, 1, "AC-7: 24x$BP -- EXACTLY one row contains BOTH \"-- Run \" and \"-- Blueprints \" (two-column mode)");
 }
 
 # ---------------------------------------------------------------------------
@@ -587,6 +594,11 @@ is(Dashboard::activity_capacity(\%st, 24, undef), Dashboard::activity_capacity(\
 # actually trigger the two-column split this AC probes (spec S2.4.3: the
 # Token panel renders only when `ref $state->{tokens} eq 'HASH'`).
 #
+# RE-POINTED AGAIN (package t01-providers-panel, spec §6): Token is deleted;
+# Blueprints is Run's new, unconditional pairing partner (Behavior 17), so
+# the `tokens => {}` fixture augmentation is no longer needed to force a
+# second lead panel into existence -- it exists regardless of input.
+#
 # THE "split point is int($c/2)" SUB-CLAIM IS RETIRED, REPORTED RATHER THAN
 # INVENTED, driver ruling 2026-08-08 (ACCEPTED): measured directly against
 # the real render path, it is FALSE under the new architecture. At c=201
@@ -616,13 +628,12 @@ is(Dashboard::activity_capacity(\%st, 24, undef), Dashboard::activity_capacity(\
 # partition.
 # ---------------------------------------------------------------------------
 {
-    my %st_pair = (%st, tokens => {});
     for my $c (101, 121, 201) {
-        my $f = Dashboard::compose_frame(\%st_pair, 24, $c);
+        my $f = Dashboard::compose_frame(\%st, 24, $c);
         is(scalar(grep { Dashboard::display_width($_->{text}) != $c } @$f), 0,
             "AC-18: compose_frame(24,$c) -- every row is exactly $c display columns");
-        my ($run_row) = grep { $_->{text} =~ /^-- Run / && $_->{text} =~ /-- Token / } @$f;
-        ok($run_row, "AC-18: compose_frame(24,$c) -- a row carries BOTH \"-- Run \" and \"-- Token \" (odd width still triggers two-column mode)");
+        my ($run_row) = grep { $_->{text} =~ /^-- Run / && $_->{text} =~ /-- Blueprints / } @$f;
+        ok($run_row, "AC-18: compose_frame(24,$c) -- a row carries BOTH \"-- Run \" and \"-- Blueprints \" (odd width still triggers two-column mode)");
       SKIP: {
             skip "no paired row found for cols=$c", 1 unless $run_row;
             is(Dashboard::display_width($run_row->{text}), $c,
@@ -783,13 +794,98 @@ sub _ac11_expect {
             "AC-11: activity_capacity($label) == $expect (derived: rows - 2 - _fixed_region_height - 1, clamped at 0)");
     }
 
-    for my $pair ([24, 80, 'stacked: 24x80'], [24, 120, 'two-column: 24x120']) {
+    # RE-POINTED (package t01-providers-panel, operator ruling 2026-08-13):
+    # the Providers+Blueprints panels this package adds make the fixed region
+    # taller, so at 24 rows the Activity panel is now PINNED AT THE FLEX
+    # FLOOR at BOTH 80 and 120 columns -- it was not before this package.
+    # Below the floor, a status alert costs NOTHING (both plain and exited
+    # clamp to the same floor value), so asserting the differential at 24
+    # rows was asserting an invariant at a row count where it structurally
+    # cannot be observed. The claim itself ("an alert costs exactly one more
+    # row") is TRUE and preserved verbatim; only the row count moves, to one
+    # with slack above the floor (measured exhaustively -- see the THRESHOLD
+    # block below). 24-row coverage is NOT dropped: see the SATURATION block
+    # below, which pins the new floor-pinned behaviour explicitly instead of
+    # leaving it an untested accident.
+    for my $pair ([31, 80, 'stacked: 31x80'], [28, 120, 'two-column: 28x120']) {
         my ($r, $c, $label) = @$pair;
         my $cap_plain  = Dashboard::activity_capacity(\%st, $r, $c);
         my $cap_exited = Dashboard::activity_capacity(\%exited, $r, $c);
         is($cap_exited, $cap_plain - 1,
-            "AC-11: activity_capacity($label, status=exited) == activity_capacity($label) - 1 (a status alert costs exactly one more row -- claim preserved from the original table's own comment)");
+            "AC-11: activity_capacity($label, status=exited) == activity_capacity($label) - 1 (a status alert costs exactly one more row -- claim preserved from the original table's own comment; row count chosen to sit above the flex floor)");
     }
+}
+
+# ---------------------------------------------------------------------------
+# AC-11 SATURATION (rows=24, cols=80/120) -- operator ruling 2026-08-13
+# (t01-providers-panel): ACCEPT the taller fixed region, do NOT shrink
+# mandated panel content, and assert the new floor-pinned behaviour at 24
+# rows explicitly rather than leave it an untested side effect of moving the
+# differential assertions above to a taller terminal.
+#
+# The floor value (3) is HAND-DERIVED from tui::Screen::flex_reserve's own
+# documented formula (plugins/sandbox/scripts/tui/Screen.pm:164-172:
+# reserve = min(4, floor(body_h/2)), floored at 0) applied to THIS fixture's
+# own dimensions -- rows=24 -> body_h = 24-2 = 22 -> half = floor(22/2) = 11
+# -> reserve = min(4,11) = 4 -> activity floor = reserve-1 = 3 (the -1 is the
+# panel's own title row, per the existing _ac11_expect/_cap_expect
+# convention in this file and t/25-dashboard.t) -- NEVER by calling
+# flex_reserve() or activity_capacity() itself, so a future change that
+# quietly lowers the reservation (e.g. 4 -> 3, which would drop this floor
+# to 2) is caught by this literal going red, not silently re-derived away.
+# ---------------------------------------------------------------------------
+{
+    my $floor24 = 3;
+    my %exited24 = (%st, status => 'exited');
+    is(Dashboard::activity_capacity(\%st, 24, 80), $floor24,
+        "AC-11 saturation: 24x80 (stacked) -- capacity == the hand-derived flex floor ($floor24)");
+    is(Dashboard::activity_capacity(\%exited24, 24, 80), $floor24,
+        "AC-11 saturation: 24x80 with a status alert -- capacity is STILL $floor24 (the floor absorbs the alert row; no differential at this row count)");
+    is(Dashboard::activity_capacity(\%st, 24, 120), $floor24,
+        "AC-11 saturation: 24x120 (two-column) -- capacity == the hand-derived flex floor ($floor24)");
+    is(Dashboard::activity_capacity(\%exited24, 24, 120), $floor24,
+        "AC-11 saturation: 24x120 with a status alert -- capacity is STILL $floor24 (the floor absorbs the alert row; no differential at this row count)");
+}
+
+# ---------------------------------------------------------------------------
+# AC-11 THRESHOLD -- the exact row count where the differential resumes,
+# pinned as a permanent guarantee (not just a one-time implementer
+# measurement). Measured exhaustively (row 11-80 scan, both 80 and 120
+# columns): diff=0 throughout the dead band with no exceptions, diff=1 from
+# the threshold onward with no exceptions. This is the assertion most likely
+# to catch a future regression in tui::Screen::flex_reserve's arithmetic,
+# because it pins the BOUNDARY itself, not a value comfortably past it.
+# ---------------------------------------------------------------------------
+{
+    my $floor24 = 3; # same hand-derived value as the SATURATION block above;
+                      # body_h keeps rising with $r, but the reserve stays
+                      # clamped at its max (4) well past row 30, so the floor
+                      # is still 3 at every row count probed here.
+    my %exited = (%st, status => 'exited');
+
+    my $below80 = Dashboard::activity_capacity(\%st, 30, 80);
+    is($below80, $floor24,
+        'AC-11 threshold precondition: 30x80 -- one row below the differential threshold, capacity is still exactly at the floor (proves the dead band, not a coincidence)');
+    is(Dashboard::activity_capacity(\%exited, 30, 80), $below80,
+        'AC-11 threshold: 30x80 -- one row BELOW the threshold, a status alert costs NOTHING (still inside the dead band)');
+
+    my $at80 = Dashboard::activity_capacity(\%st, 31, 80);
+    cmp_ok($at80, '>', $floor24,
+        'AC-11 threshold precondition: 31x80 -- capacity has genuinely left the floor (not still clamped)');
+    is(Dashboard::activity_capacity(\%exited, 31, 80), $at80 - 1,
+        'AC-11 threshold: 31x80 -- the FIRST row count where a status alert costs exactly one more row again');
+
+    my $below120 = Dashboard::activity_capacity(\%st, 27, 120);
+    is($below120, $floor24,
+        'AC-11 threshold precondition: 27x120 -- one row below the differential threshold (two-column), capacity is still exactly at the floor');
+    is(Dashboard::activity_capacity(\%exited, 27, 120), $below120,
+        'AC-11 threshold: 27x120 -- one row BELOW the threshold (two-column), a status alert costs NOTHING');
+
+    my $at120 = Dashboard::activity_capacity(\%st, 28, 120);
+    cmp_ok($at120, '>', $floor24,
+        'AC-11 threshold precondition: 28x120 -- capacity has genuinely left the floor (not still clamped)');
+    is(Dashboard::activity_capacity(\%exited, 28, 120), $at120 - 1,
+        'AC-11 threshold: 28x120 -- the FIRST row count where a status alert costs exactly one more row again (two-column)');
 }
 
 # ---------------------------------------------------------------------------

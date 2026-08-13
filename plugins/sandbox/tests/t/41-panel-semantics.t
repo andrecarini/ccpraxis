@@ -675,8 +675,17 @@ sub _gutter_label { return sprintf('%-*s : ', $LABEL_GUTTER, $_[0]); }
     my $bp5 = { total => 5, approved => 5, items => \@items5 };
     my %state16 = (status => 'running', backpack => $bp5);
 
+    # $rows is passed to BOTH sides deliberately. _fixed_region_height's third
+    # argument is what lets it model the flex reserve and the cap/skip that
+    # compose_frame actually applies; without it the predictor is being asked to
+    # match a 30-row render using information it was never given, and the
+    # comparison is not a predictor-vs-renderer check at all. Measured at
+    # cols=40: 2-arg returns 25, 3-arg returns 24, the real render is 24 -- the
+    # 3-arg form is exact, including the access row's 2-cell wrap. The 2-arg
+    # path is test-only (production's sole caller always supplies $rows), so
+    # asserting on it pinned the accuracy of a shape nothing ships.
     for my $cols (120, 40) {
-        my $expected_h = Dashboard::_fixed_region_height(\%state16, $cols);
+        my $expected_h = Dashboard::_fixed_region_height(\%state16, $cols, 30);
         my $f = Dashboard::compose_frame(\%state16, 30, $cols);
         my $activity_title_idx;
         for my $i (1 .. $#$f) {

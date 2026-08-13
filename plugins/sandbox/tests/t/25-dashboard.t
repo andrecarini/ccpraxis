@@ -235,15 +235,19 @@ my %st = (
 # second lead panel to pair with. The dash-fill regex is rewritten against
 # the DERIVED $RULE_FILL_RE (Theme's rule.h glyph), not a literal '-', per
 # the file-header role/glyph note.
+#
+# RE-POINTED AGAIN (package t01-providers-panel, spec §6): Token is deleted;
+# Blueprints is Run's new unconditional pairing partner (Behavior 17). The
+# `tokens => {}` fixture augmentation is no longer needed -- Blueprints
+# exists regardless of input, so plain %st is enough to trigger the pairing.
 {
-    my %st_pair = (%st, tokens => {});
-    my $fat = Dashboard::compose_frame(\%st_pair, 24, $BP + 10);
-    my $both = grep { $_->{text} =~ /-- Run / && $_->{text} =~ /-- Token / } @$fat;
+    my $fat = Dashboard::compose_frame(\%st, 24, $BP + 10);
+    my $both = grep { $_->{text} =~ /-- Run / && $_->{text} =~ /-- Blueprints / } @$fat;
     is($both, 1, "compose (s05): 24x@{[ $BP + 10 ]} -- exactly one row carries BOTH panel titles (two-column mode)");
 
     my $below = $BP - 1;
-    my $fbelow = Dashboard::compose_frame(\%st_pair, 24, $below);
-    my $both_below = grep { $_->{text} =~ /-- Run / && $_->{text} =~ /-- Token / } @$fbelow;
+    my $fbelow = Dashboard::compose_frame(\%st, 24, $below);
+    my $both_below = grep { $_->{text} =~ /-- Run / && $_->{text} =~ /-- Blueprints / } @$fbelow;
     is($both_below, 0, "compose (s05): 24x$below -- no row carries both panel titles (still stacked)");
     my ($run_below) = grep { $_->{text} =~ /^-- Run (?:$RULE_FILL_RE)+$/ } @$fbelow;
     ok($run_below, "compose (s05): 24x$below -- a row matches /^-- Run <rule.h fill>\$/ (dash-filled full width)");
@@ -961,9 +965,15 @@ ok(!Dashboard->can('_scroll_hint'), '_scroll_hint no longer exists (s06: replace
 # term folded into the formula).
 is(Dashboard::activity_capacity(\%st, 24, 80), _cap_expect(\%st, 24, 80),
    'capacity: 24 rows, no alert -- rows - 2 - _fixed_region_height - 1 (derivation, spec S5)');
-is(Dashboard::activity_capacity({ %st, status => 'exited' }, 24, 80),
-   Dashboard::activity_capacity(\%st, 24, 80) - 1,
-   'capacity: a status alert costs one more row (differential, this file\'s own original claim)');
+# RE-POINTED (package t01-providers-panel, operator ruling 2026-08-13): at 24
+# rows the Providers+Blueprints panels this package adds pin Activity at the
+# flex floor for BOTH plain and alert states, so the differential cannot be
+# observed there any more -- see the SATURATION and THRESHOLD blocks below
+# (declared once, shared with t/40-layout-responsive.t's identical claim)
+# for the 24-row coverage this move would otherwise drop.
+is(Dashboard::activity_capacity({ %st, status => 'exited' }, 31, 80),
+   Dashboard::activity_capacity(\%st, 31, 80) - 1,
+   'capacity: a status alert costs one more row (differential, this file\'s own original claim; row count chosen above the flex floor -- see AC-11 THRESHOLD below)');
 is(Dashboard::activity_capacity(\%st, 12, 80), _cap_expect(\%st, 12, 80),
    'capacity: too short for the fixed panels -- derivation (clamped at 0 if negative)');
 
@@ -980,9 +990,74 @@ is(Dashboard::activity_capacity(\%st, 10, 120), _cap_expect(\%st, 10, 120),
    'capacity: two-column mode, 10 rows -- derivation (0, too short)');
 is(Dashboard::activity_capacity(\%st, 8, 120), _cap_expect(\%st, 8, 120),
    'capacity: two-column mode, 8 rows -- derivation (clamped from a non-positive body_h)');
-is(Dashboard::activity_capacity({ %st, status => 'exited' }, 24, 120),
-   Dashboard::activity_capacity(\%st, 24, 120) - 1,
-   'capacity: two-column mode + a status alert costs one more row (differential)');
+# RE-POINTED (package t01-providers-panel, operator ruling 2026-08-13): same
+# reasoning as the 80-column differential above -- 24 rows now saturates the
+# floor in two-column mode too.
+is(Dashboard::activity_capacity({ %st, status => 'exited' }, 28, 120),
+   Dashboard::activity_capacity(\%st, 28, 120) - 1,
+   'capacity: two-column mode + a status alert costs one more row (differential; row count chosen above the flex floor -- see AC-11 THRESHOLD below)');
+
+# ---------------------------------------------------------------------------
+# AC-11 SATURATION (rows=24, cols=80/120) -- operator ruling 2026-08-13
+# (t01-providers-panel): ACCEPT the taller fixed region, do NOT shrink
+# mandated panel content, and assert the new floor-pinned behaviour at 24
+# rows explicitly (mirrors t/40-layout-responsive.t's identical block).
+#
+# The floor value (3) is HAND-DERIVED from tui::Screen::flex_reserve's own
+# documented formula (plugins/sandbox/scripts/tui/Screen.pm:164-172:
+# reserve = min(4, floor(body_h/2)), floored at 0) applied to THIS fixture's
+# own dimensions -- rows=24 -> body_h = 24-2 = 22 -> half = floor(22/2) = 11
+# -> reserve = min(4,11) = 4 -> activity floor = reserve-1 = 3 -- NEVER by
+# calling flex_reserve() or activity_capacity() itself, so a future change
+# that quietly lowers the reservation is caught by this literal going red.
+# ---------------------------------------------------------------------------
+{
+    my $floor24 = 3;
+    my %exited24 = (%st, status => 'exited');
+    is(Dashboard::activity_capacity(\%st, 24, 80), $floor24,
+        "AC-11 saturation: 24x80 (stacked) -- capacity == the hand-derived flex floor ($floor24)");
+    is(Dashboard::activity_capacity(\%exited24, 24, 80), $floor24,
+        "AC-11 saturation: 24x80 with a status alert -- capacity is STILL $floor24 (the floor absorbs the alert row; no differential at this row count)");
+    is(Dashboard::activity_capacity(\%st, 24, 120), $floor24,
+        "AC-11 saturation: 24x120 (two-column) -- capacity == the hand-derived flex floor ($floor24)");
+    is(Dashboard::activity_capacity(\%exited24, 24, 120), $floor24,
+        "AC-11 saturation: 24x120 with a status alert -- capacity is STILL $floor24 (the floor absorbs the alert row; no differential at this row count)");
+}
+
+# ---------------------------------------------------------------------------
+# AC-11 THRESHOLD -- the exact row count where the differential resumes,
+# pinned as a permanent guarantee. Measured exhaustively (row 11-80 scan,
+# both 80 and 120 columns): diff=0 throughout the dead band with no
+# exceptions, diff=1 from the threshold onward with no exceptions.
+# ---------------------------------------------------------------------------
+{
+    my $floor24 = 3;
+    my %exited = (%st, status => 'exited');
+
+    my $below80 = Dashboard::activity_capacity(\%st, 30, 80);
+    is($below80, $floor24,
+        'AC-11 threshold precondition: 30x80 -- one row below the differential threshold, capacity is still exactly at the floor (proves the dead band, not a coincidence)');
+    is(Dashboard::activity_capacity(\%exited, 30, 80), $below80,
+        'AC-11 threshold: 30x80 -- one row BELOW the threshold, a status alert costs NOTHING (still inside the dead band)');
+
+    my $at80 = Dashboard::activity_capacity(\%st, 31, 80);
+    cmp_ok($at80, '>', $floor24,
+        'AC-11 threshold precondition: 31x80 -- capacity has genuinely left the floor (not still clamped)');
+    is(Dashboard::activity_capacity(\%exited, 31, 80), $at80 - 1,
+        'AC-11 threshold: 31x80 -- the FIRST row count where a status alert costs exactly one more row again');
+
+    my $below120 = Dashboard::activity_capacity(\%st, 27, 120);
+    is($below120, $floor24,
+        'AC-11 threshold precondition: 27x120 -- one row below the differential threshold (two-column), capacity is still exactly at the floor');
+    is(Dashboard::activity_capacity(\%exited, 27, 120), $below120,
+        'AC-11 threshold: 27x120 -- one row BELOW the threshold (two-column), a status alert costs NOTHING');
+
+    my $at120 = Dashboard::activity_capacity(\%st, 28, 120);
+    cmp_ok($at120, '>', $floor24,
+        'AC-11 threshold precondition: 28x120 -- capacity has genuinely left the floor (not still clamped)');
+    is(Dashboard::activity_capacity(\%exited, 28, 120), $at120 - 1,
+        'AC-11 threshold: 28x120 -- the FIRST row count where a status alert costs exactly one more row again (two-column)');
+}
 {
     # s06-panel-semantics + package 06 (Decision 9): the Backpack panel is no
     # longer a panel at all -- it is one summary ROW inside Run (spec

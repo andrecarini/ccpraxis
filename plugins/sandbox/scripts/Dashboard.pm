@@ -938,6 +938,16 @@ sub activity_row_width {
 # calls _fixed_panels or build_panels at all (grep confirms zero other
 # callers). Kept, unused, per spec S6 item 8 -- do NOT delete.
 #
+# SUPERSEDED (package t01-providers-panel, D3): this function describes the
+# PRE-t01 panel vocabulary -- titles 'Token'/'Spend', a standalone
+# 'refresh-exp' row, blueprint-run rows still inside Run's own body -- exactly
+# as it existed before that package. It is historical, not tracking, the
+# current tui::DashboardScreen::panels() shape (Run, Blueprints, Resources,
+# Providers, Recent activity). It must NOT be updated to follow that package's
+# changes: doing so would resurrect a second panel vocabulary that has to be
+# kept in permanent lockstep with the first, which is the exact problem
+# TUI-01a exists to flag.
+#
 # THE SANDBOX PANEL IS DISSOLVED (package 06, spec S2.4.3): `project` and
 # `container` now reach the frame via the header
 # (tui::DashboardScreen::header_spans), never a panel body, so they are not
@@ -1061,6 +1071,10 @@ sub _fixed_panels {
 # delegates to tui::DashboardScreen::compose entirely); this function's only
 # remaining caller is _body_rows (also below, also unreachable -- see its own
 # doc comment). Kept, unused, per spec S6 item 8 -- do NOT delete.
+#
+# SUPERSEDED (package t01-providers-panel, D3): via _fixed_panels, this
+# describes the PRE-t01 panel set. Historical, not tracking the current
+# tui::DashboardScreen::panels() shape.
 sub build_panels {
     my ($s, $cols) = @_;
     $s ||= {};
@@ -1196,6 +1210,13 @@ sub _one_run_line {
     return \@spans;
 }
 
+# SUPERSEDED (package t01-providers-panel, D3): _run_lines describes the
+# PRE-t01 vocabulary -- a hardcoded $RUN_MAX_ROWS = 3 (see above) and an
+# un-pluralised '+%d more blueprint(s)' string, both feeding Run's own body.
+# It is historical, off the render path, and must not be updated to track
+# tui::DashboardScreen::_blueprints_body/_run_summary_lines, which now own
+# this fact for the live panel set (Blueprints, not Run, with a derived
+# budget renamed blueprint_rows_max).
 sub _run_lines {
     my ($runs) = @_;
     return () unless ref($runs) eq 'ARRAY';
@@ -1220,6 +1241,13 @@ sub _run_lines {
 # -- the TokenInfo::status struct (spec S2.1), passed through the gather hash
 # with no arithmetic. PRIVATE, pure, mirrors _backpack_lines's style. A
 # non-hashref $tokens -> the empty list (never dies).
+#
+# SUPERSEDED (package t01-providers-panel, D3): this function describes the
+# PRE-t01 Token panel -- a standalone 'refreshed' row and a 'refresh-exp' row,
+# neither of which exist on the live render path any more (refresh-exp is
+# gone; refreshed folds into access). It is historical, off the render path,
+# and must not be updated to track tui::DashboardScreen::_claude_code_block,
+# which now owns this fact inside the Providers panel.
 sub _token_lines {
     my ($t) = @_;
     return () unless ref $t eq 'HASH';
@@ -1398,6 +1426,13 @@ sub _spend_zen_line {
 # clipped via fit_spans (whole-glyph-drop, never mid-glyph). A non-hashref
 # $info -> the empty arrayref (never dies). PUBLIC (mirrors spans_text/
 # spans_width/display_width's visibility -- the oracle calls this directly).
+#
+# SUPERSEDED (package t01-providers-panel, D3): this function describes the
+# PRE-t01 Spend panel -- a standalone panel titled 'Spend', separate from
+# Token. It is historical, off the render path, and must not be updated to
+# track tui::DashboardScreen::_providers_body, which now merges this fact
+# into the Providers panel's OpenCode Go/Zen blocks (and Claude Code's, via
+# _spend_claude_spans).
 sub _spend_lines {
     my ($info, $cols) = @_;
     return [] unless ref($info) eq 'HASH';

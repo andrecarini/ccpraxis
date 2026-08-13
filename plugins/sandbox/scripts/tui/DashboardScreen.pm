@@ -544,8 +544,6 @@ sub _run_body {
     my $bp_row = row({ label => 'backpack', value => $bp_val });
     push @lines, $bp_row if @$bp_row;
 
-    push @lines, @{ _run_summary_lines($state->{runs}, $state->{run_rows_max}) };
-
     if (ref($state->{tokens}) ne 'HASH') {
         my $sec = $state->{oauth_remaining};
         my $oauth_row = row({ label => 'oauth', value => [ { text => _fmt_oauth_like($sec), role => _oauth_like_role($sec) } ], force => 1 });
@@ -556,50 +554,20 @@ sub _run_body {
 }
 
 # ===========================================================================
-# The Token panel body (spec S2.4.3): access, refresh, refreshed,
-# refresh-exp, account -- via row(), so absent ones vanish except the two in
-# ALWAYS_SHOWN.
+# _blueprints_body(\%state) -- the Blueprints panel body (package
+# t01-providers-panel, criteria 6/7). Relocated from the tail of _run_body:
+# the row budget that used to bound Run (run_rows_max) is renamed
+# blueprint_rows_max (D5) and now bounds THIS panel, never Run. Blueprints is
+# unconditionally present (D4, same reasoning as Resources/Providers), so an
+# empty/absent/non-array $state->{runs} renders one honest no-data line
+# rather than an empty panel.
 # ===========================================================================
-sub _token_body {
-    my ($t) = @_;
-    return [] unless ref($t) eq 'HASH';
-    my @lines;
-
-    my $access_state = defined($t->{access_state}) ? $t->{access_state} : 'absent';
-    my $sec = ($access_state eq 'absent') ? undef : $t->{access_seconds_left};
-    my $access_row = row({ label => 'access', value => [ { text => _fmt_oauth_like($sec), role => _oauth_like_role($sec) } ], force => 1 });
-    push @lines, $access_row if @$access_row;
-
-    my @refresh_spans;
-    if ($t->{refresh_present}) {
-        my $fp = defined($t->{refresh_fingerprint}) ? $t->{refresh_fingerprint} : '';
-        @refresh_spans = ( { text => "present ($fp)", role => 'state.ok' } );
-    } else {
-        @refresh_spans = ( { text => 'absent', role => 'state.crit' } );
-    }
-    my $refresh_row = row({ label => 'refresh', value => \@refresh_spans, force => 1 });
-    push @lines, $refresh_row if @$refresh_row;
-
-    my @refreshed_spans = defined($t->{last_refreshed_age})
-        ? ( { text => fmt_duration($t->{last_refreshed_age}) . ' ago', role => 'text.primary' } )
-        : ( { text => 'n/a', role => 'text.muted' } );
-    my $refreshed_row = row({ label => 'refreshed', value => \@refreshed_spans });
-    push @lines, $refreshed_row if @$refreshed_row;
-
-    my $rexp = defined($t->{refresh_expires}) ? $t->{refresh_expires} : 'n/a';
-    my $rexp_row = row({ label => 'refresh-exp', value => [ { text => $rexp, role => 'text.muted' } ] });
-    push @lines, $rexp_row if @$rexp_row;
-
-    my @present;
-    for my $k (qw(subscription_type rate_limit_tier)) {
-        push @present, $t->{$k} if defined($t->{$k}) && !ref($t->{$k}) && length($t->{$k});
-    }
-    if (@present) {
-        my $acc_row = row({ label => 'account', value => [ { text => join(' / ', @present), role => 'text.primary' } ] });
-        push @lines, $acc_row if @$acc_row;
-    }
-
-    return \@lines;
+sub _blueprints_body {
+    my ($state) = @_;
+    $state = {} unless ref($state) eq 'HASH';
+    my $lines = _run_summary_lines($state->{runs}, $state->{blueprint_rows_max});
+    return $lines if @$lines;
+    return [ row({ label => 'blueprints', value => 'no active runs', role => 'text.muted', force => 1 }) ];
 }
 
 # ===========================================================================
@@ -790,24 +758,137 @@ sub _spend_zen_spans {
     return (\@spans, 0);
 }
 
-sub _spend_body {
-    my ($info, $cols) = @_;
-    return [] unless ref($info) eq 'HASH';
-    my $w = (defined($cols) && !ref($cols) && $cols =~ /^\d+(?:\.\d+)?$/ && $cols > 0) ? int($cols) : 80;
+# ===========================================================================
+# _providers_body(\%state, $cols) -- the Providers panel body (package
+# t01-providers-panel, criterion 2). Replaces the old _token_body/_spend_body/
+# _spend_unavailable_body trio with ONE builder that nests each provider's
+# facts under its own heading, so which provider a fact belongs to is
+# discoverable from the frame itself (the operator's actual complaint --
+# ambiguity of referent -- not merely screen economy).
+#
+# Referent clarity is mechanical (Behavior 3): a heading line carries no
+# ' : ' label-gutter and is indented LESS than the fact rows nested beneath
+# it (_HEADING_INDENT < _FACT_INDENT), so a reader (and a test) can tell a
+# heading from a fact by shape alone, never just by position.
+#
+# refresh-exp (TUI-03) has no successor row anywhere below -- it is gone, not
+# relocated. refreshed folds into access as ONE row (TUI-04): the same
+# _fmt_oauth_like/access-state text, plus the last-refreshed duration
+# appended to the SAME row when last_refreshed_age is defined -- both changes
+# land in this one builder, not as two sequential edits (criteria 3 and 4).
+#
+# The 'nearest' row (D1, criterion 5) is unchanged in wording/logic from the
+# old _spend_body :777-792 above, but is now unshifted PANEL-LEVEL, outside
+# every provider block -- it summarises a cross-provider fact, so nesting it
+# under any one provider would misattribute it (reintroducing the exact
+# ambiguity this package removes).
+# ===========================================================================
+use constant _HEADING_INDENT => 0;
+use constant _FACT_INDENT    => 2;
 
-    my ($claude_spans, $claude_protect) = _spend_claude_spans($info->{claude});
-    my ($go_spans,     $go_protect)     = _spend_go_spans($info->{go});
-    my ($zen_spans,    $zen_protect)    = _spend_zen_spans($info->{zen});
+sub _indent_line {
+    my ($n, $line) = @_;
+    return $line unless ref($line) eq 'ARRAY' && @$line;
+    return [ { text => (' ' x $n), role => 'text.primary' }, @$line ];
+}
 
-    my @entries = ( [ $claude_spans, $claude_protect ], [ $go_spans, $go_protect ], [ $zen_spans, $zen_protect ] );
-    my @out;
-    for my $e (@entries) {
-        my ($line, $protect) = @$e;
-        push @out, ($protect || tui::Frame::spans_width($line) <= $w) ? $line : tui::Frame::fit_spans($line, $w);
+sub _provider_heading {
+    my ($text) = @_;
+    return _indent_line(_HEADING_INDENT(), [ { text => $text, role => 'accent' } ]);
+}
+
+sub _clip_line {
+    my ($line, $protect, $w) = @_;
+    return $line if $protect || tui::Frame::spans_width($line) <= $w;
+    return tui::Frame::fit_spans($line, $w);
+}
+
+sub _claude_code_block {
+    my ($tokens, $claude_spend, $spend_present, $w) = @_;
+    my $t = (ref($tokens) eq 'HASH') ? $tokens : {};
+    my @lines = ( _provider_heading('Claude Code') );
+
+    my $access_state = defined($t->{access_state}) ? $t->{access_state} : 'absent';
+    my $sec = ($access_state eq 'absent') ? undef : $t->{access_seconds_left};
+    my @access_spans = ( { text => _fmt_oauth_like($sec), role => _oauth_like_role($sec) } );
+    if (defined $t->{last_refreshed_age}) {
+        push @access_spans, { text => ', refreshed ' . fmt_duration($t->{last_refreshed_age}) . ' ago', role => 'text.primary' };
+    }
+    my $access_row = row({ label => 'access', value => \@access_spans, force => 1 });
+    push @lines, _indent_line(_FACT_INDENT(), $access_row) if @$access_row;
+
+    my @refresh_spans;
+    if ($t->{refresh_present}) {
+        my $fp = defined($t->{refresh_fingerprint}) ? $t->{refresh_fingerprint} : '';
+        @refresh_spans = ( { text => "present ($fp)", role => 'state.ok' } );
+    } else {
+        @refresh_spans = ( { text => 'absent', role => 'state.crit' } );
+    }
+    my $refresh_row = row({ label => 'refresh', value => \@refresh_spans, force => 1 });
+    push @lines, _indent_line(_FACT_INDENT(), $refresh_row) if @$refresh_row;
+
+    my @present;
+    for my $k (qw(subscription_type rate_limit_tier)) {
+        push @present, $t->{$k} if defined($t->{$k}) && !ref($t->{$k}) && length($t->{$k});
+    }
+    if (@present) {
+        my $acc_row = row({ label => 'account', value => [ { text => join(' / ', @present), role => 'text.primary' } ] });
+        push @lines, _indent_line(_FACT_INDENT(), $acc_row) if @$acc_row;
     }
 
-    if (ref($info->{priority}) eq 'ARRAY' && @{ $info->{priority} }) {
-        my $top = $info->{priority}[0];
+    my $spend_line;
+    if ($spend_present) {
+        my ($spans, $protect) = _spend_claude_spans($claude_spend);
+        $spend_line = _clip_line($spans, $protect, $w);
+    } else {
+        $spend_line = [ { text => _status_glyph('warn') . ' ', role => 'state.warn' },
+                        { text => 'Claude : no snapshot', role => 'text.muted' } ];
+    }
+    push @lines, _indent_line(_FACT_INDENT(), $spend_line);
+
+    return \@lines;
+}
+
+sub _opencode_go_block {
+    my ($go_spend, $spend_present, $w) = @_;
+    my @lines = ( _provider_heading('OpenCode Go') );
+    my $spend_line;
+    if ($spend_present) {
+        my ($spans, $protect) = _spend_go_spans($go_spend);
+        $spend_line = _clip_line($spans, $protect, $w);
+    } else {
+        $spend_line = [ { text => _status_glyph('warn') . ' ', role => 'state.warn' },
+                        { text => 'Go     : no snapshot', role => 'text.muted' } ];
+    }
+    push @lines, _indent_line(_FACT_INDENT(), $spend_line);
+    return \@lines;
+}
+
+sub _opencode_zen_block {
+    my ($zen_spend, $spend_present, $w) = @_;
+    my @lines = ( _provider_heading('OpenCode Zen') );
+    my $spend_line;
+    if ($spend_present) {
+        my ($spans, $protect) = _spend_zen_spans($zen_spend);
+        $spend_line = _clip_line($spans, $protect, $w);
+    } else {
+        $spend_line = [ { text => _status_glyph('warn') . ' ', role => 'state.warn' },
+                        { text => 'Zen    : no snapshot', role => 'text.muted' } ];
+    }
+    push @lines, _indent_line(_FACT_INDENT(), $spend_line);
+    return \@lines;
+}
+
+sub _providers_body {
+    my ($state, $cols) = @_;
+    $state = {} unless ref($state) eq 'HASH';
+    my $w = (defined($cols) && !ref($cols) && $cols =~ /^\d+(?:\.\d+)?$/ && $cols > 0) ? int($cols) : 80;
+    my $spend = (ref($state->{spend}) eq 'HASH') ? $state->{spend} : undef;
+
+    my @lines;
+
+    if ($spend && ref($spend->{priority}) eq 'ARRAY' && @{ $spend->{priority} }) {
+        my $top = $spend->{priority}[0];
         if (ref($top) eq 'HASH' && defined $top->{provider} && defined $top->{window}) {
             # Fix batch (package 06, red-team finding, latent/low): the prior
             # guard checked only `!ref`, not "is actually numeric" -- a
@@ -819,18 +900,39 @@ sub _spend_body {
                     ? sprintf('%d%%', int($top->{fraction} * 100 + 0.5)) : '?';
             my $pline = [ { text => 'nearest : ', role => 'text.muted' },
                           { text => "$top->{provider}/$top->{window} $pct", role => 'accent' } ];
-            unshift @out, (tui::Frame::spans_width($pline) > $w) ? tui::Frame::fit_spans($pline, $w) : $pline;
+            push @lines, (tui::Frame::spans_width($pline) > $w) ? tui::Frame::fit_spans($pline, $w) : $pline;
         }
     }
 
-    return \@out;
+    push @lines, @{ _claude_code_block($state->{tokens}, $spend ? $spend->{claude} : undef, $spend ? 1 : 0, $w) };
+    push @lines, @{ _opencode_go_block($spend ? $spend->{go} : undef, $spend ? 1 : 0, $w) };
+    push @lines, @{ _opencode_zen_block($spend ? $spend->{zen} : undef, $spend ? 1 : 0, $w) };
+
+    # D6: once, at the end -- the absent-vs-empty distinction _spend_unavailable_body
+    # used to make (a run active with no snapshot yet, vs. no active run at all).
+    unless ($spend) {
+        my @runs = (ref($state->{runs}) eq 'ARRAY') ? @{ $state->{runs} } : ();
+        my $active = grep { ref($_) eq 'HASH' && defined($_->{state})
+                            && ($_->{state} eq 'running' || $_->{state} eq 'paused') } @runs;
+        push @lines, [ { text => ($active ? 'a run is active but has not written runs/spend.json yet'
+                                          : 'no active run to report spend for'),
+                        role => 'text.faint' } ];
+    }
+
+    return \@lines;
 }
 
 # ===========================================================================
 # panels(\%state, $cols) -- the panel set (spec S2.4.3, criteria 2 and 6).
 # The Sandbox panel is dissolved: project/container reach the header,
-# oauth reaches Token when present or Run when absent (never both, never
-# neither), heartbeat/uptime move to Run.
+# oauth reaches Providers' Claude Code block when tokens are present or Run
+# when absent (never both, never neither), heartbeat/uptime move to Run.
+#
+# BLUEPRINTS IS ALWAYS PRESENT, a sibling of Run (package t01-providers-panel,
+# criterion 6/D4) -- the blueprint-run list used to live inside Run's own
+# body; it is now its own titled panel so a restructure that saves rows never
+# leaves it unclear which panel a fact belongs to, and (D4) it cannot pop
+# into existence mid-session the way a conditionally-present panel would.
 # ===========================================================================
 sub panels {
     my ($state, $cols) = @_;
@@ -838,10 +940,7 @@ sub panels {
     my @out;
 
     push @out, { title => 'Run', lines => _run_body($state) };
-
-    if (ref($state->{tokens}) eq 'HASH') {
-        push @out, { title => 'Token', lines => _token_body($state->{tokens}) };
-    }
+    push @out, { title => 'Blueprints', lines => _blueprints_body($state) };
 
     # RESOURCES IS ALWAYS PRESENT, for the same reason the geometry is fixed.
     #
@@ -862,22 +961,23 @@ sub panels {
                      min_cols => tui::Meter::min_width() };
     }
 
-    # SPEND IS ALWAYS PRESENT. It used to be omitted whenever no snapshot had
-    # been read, which is ALWAYS -- the fleet writes its spend figures to its
-    # own log and returns them in-process, and has never persisted the
-    # runs/spend.json this reads. So a panel the operator relied on had silently
-    # not existed for the life of the feature, and its absence was
-    # indistinguishable from "this launch has no runs".
+    # PROVIDERS IS ALWAYS PRESENT (renamed from Spend, package
+    # t01-providers-panel, criterion 1). It used to be omitted whenever no
+    # snapshot had been read, which is ALWAYS -- the fleet writes its spend
+    # figures to its own log and returns them in-process, and has never
+    # persisted the runs/spend.json this reads. So a panel the operator relied
+    # on had silently not existed for the life of the feature, and its
+    # absence was indistinguishable from "this launch has no runs".
     #
     # Absent-vs-empty was a real decision (never fabricate a zero) and it is
     # kept: what changes is that "we have no figures" is now SAID, in the panel,
     # instead of being expressed by the panel not being there. A missing panel
     # is not an honest absence -- it is no statement at all.
-    if (ref($state->{spend}) eq 'HASH') {
-        push @out, { title => 'Spend', lines => _spend_body($state->{spend}, $cols), min_cols => tui::Meter::min_width() };
-    } else {
-        push @out, { title => "Spend", lines => _spend_unavailable_body($state), min_cols => tui::Meter::min_width() };
-    }
+    #
+    # It also now carries Claude Code's token facts (Token panel merged in,
+    # criterion 2) nested under their own heading, alongside the OpenCode
+    # Go/Zen spend facts each under theirs -- see _providers_body.
+    push @out, { title => 'Providers', lines => _providers_body($state, $cols), min_cols => tui::Meter::min_width() };
 
     # Recent activity is the FLEX panel (tui::Screen H6) and is always last.
     #
@@ -894,25 +994,6 @@ sub panels {
                  flex  => 1 };
 
     return \@out;
-}
-
-# _spend_unavailable_body(\%state) -> \@lines
-# What the Spend panel says when no snapshot has been read. Names the reason
-# rather than showing blank rows or zeroes -- an operator must be able to tell
-# "nothing has spent anything" from "nobody has told me".
-sub _spend_unavailable_body {
-    my ($state) = @_;
-    my @runs = (ref($state->{runs}) eq 'ARRAY') ? @{ $state->{runs} } : ();
-    my $active = grep { ref($_) eq 'HASH' && defined($_->{state})
-                        && ($_->{state} eq 'running' || $_->{state} eq 'paused') } @runs;
-    return [
-        row({ label => 'claude', value => 'no snapshot', role => 'text.muted', force => 1 }),
-        row({ label => 'go',     value => 'no snapshot', role => 'text.muted', force => 1 }),
-        row({ label => 'zen',    value => 'no snapshot', role => 'text.muted', force => 1 }),
-        [ { text => ($active ? '  a run is active but has not written runs/spend.json yet'
-                             : '  no active run to report spend for'),
-            role => 'text.faint' } ],
-    ];
 }
 
 # ===========================================================================
@@ -1060,21 +1141,23 @@ sub screen {
 sub compose {
     my ($state, $rows, $cols) = @_;
 
-    # Derive the Run panel's row budget from the ACTUAL terminal height. This is
-    # the only place in the module that knows $rows, and screen()'s signature is
+    # Derive the Blueprints panel's row budget from the ACTUAL terminal height
+    # (renamed from run_rows_max, D5 -- it bounds Blueprints, never Run, now
+    # that the blueprint-run list lives in its own panel). This is the only
+    # place in the module that knows $rows, and screen()'s signature is
     # deliberately left alone (its callers and tests are many), so the budget
     # travels the one way it can: as a derived key on a shallow copy of state.
     #
     # A third of the height, floor 3: enough that a normal terminal shows every
     # blueprint (the operator had twelve, saw three, and had most of a screen
-    # empty below them), while a short terminal still gets a Run panel that
-    # cannot crowd out everything beneath it. A caller that has already set
-    # run_rows_max wins -- this only supplies a default.
-    if (ref($state) eq 'HASH' && !defined $state->{run_rows_max}) {
+    # empty below them), while a short terminal still gets a Blueprints panel
+    # that cannot crowd out everything beneath it. A caller that has already
+    # set blueprint_rows_max wins -- this only supplies a default.
+    if (ref($state) eq 'HASH' && !defined $state->{blueprint_rows_max}) {
         my $h = (defined($rows) && !ref($rows) && $rows =~ /\A\d+\z/) ? $rows : 0;
         my $budget = int($h / 3);
         $budget = 3 if $budget < 3;
-        $state = { %$state, run_rows_max => $budget };
+        $state = { %$state, blueprint_rows_max => $budget };
     }
 
     return tui::Screen::compose(screen($state, $cols), $rows, $cols);

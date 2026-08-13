@@ -166,19 +166,30 @@ sub blank_tail {
 # and writes its first snapshot seconds later. While its key was undef the panel
 # did not exist at all, so it materialised mid-session and pushed everything
 # after it down -- a scheduled reflow a few seconds into every launch. Same for
-# Spend, whose snapshot is never written at all today.
+# Providers (t01-providers-panel's successor to Spend, whose snapshot is never
+# written at all today), and for Blueprints (t01's new sibling panel for the
+# blueprint-run list, unconditional for the identical reason -- D4).
+#
+# RETARGETED (package t01-providers-panel, spec §6): the panel title `Spend`
+# no longer exists -- its direct successor `Providers` is the claim's new
+# subject, the CLAIM ITSELF ("the panel exists before any snapshot is read")
+# is unchanged. `Blueprints` is an ADDITION (recommended by spec §6, not a
+# correction) closing the gap this package opens: it is now equally
+# unconditional (D4) and this is exactly the oracle that would catch a
+# future regression reintroducing a conditional panel.
 # ============================================================================
 {
     my $g_absent = geometry(Dashboard::compose_frame(state(), 40, 110));
-    like($g_absent, qr/Resources/, 'the Resources panel exists BEFORE the sampler has written anything');
-    like($g_absent, qr/Spend/,     'the Spend panel exists even though no snapshot is ever written today');
+    like($g_absent, qr/Resources/,  'the Resources panel exists BEFORE the sampler has written anything');
+    like($g_absent, qr/Providers/,  'the Providers panel exists even though no spend snapshot is ever written today');
+    like($g_absent, qr/Blueprints/, 'the Blueprints panel exists even with zero blueprint runs (D4: unconditional like Resources/Providers)');
 
     my $f = Dashboard::compose_frame(state(), 40, 110);
     my $txt = join("\n", map { plain($_) } @$f);
     like($txt, qr/sampling - no reading yet/,
         'and Resources SAYS it has no reading rather than silently not being there');
     like($txt, qr/no snapshot/,
-        'and Spend states the absence rather than expressing it by being missing');
+        'and Providers states the absence rather than expressing it by being missing (D6 footnote preserved)');
     unlike($txt, qr/\b0\.0\b|\b0%/,
         'neither fabricates a zero -- absent-vs-empty is preserved, only how it is communicated changed');
 }
