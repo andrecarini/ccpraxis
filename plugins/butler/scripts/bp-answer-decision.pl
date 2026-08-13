@@ -607,6 +607,35 @@ unless (caller) {
         my %reg = ( status => $plan->{ledger_status} );
         $reg{attempt}          = 0 if $plan->{reset_attempt};
         $reg{resolve_attempts} = 0 if $plan->{reset_resolve};
+        # SETTLE THE HARVEST on accept, or the acceptance is not durable.
+        #
+        # `accept` set the ledger to `done` and stopped there. But
+        # want_harvest_audit fires on (status done, harvest EMPTY, none in
+        # flight) — so a package whose harvest never produced a verdict was
+        # immediately re-armed on the next tick. Reported from a live GSA fleet
+        # run: 8 consecutive re-fires of the same harvest-failure decision, each
+        # one re-accepted by hand, because accepting never recorded that the
+        # question was settled. Worse where it started: the judge itself could
+        # not complete (the one-shot deadlock fixed in 0841130), so there was no
+        # verdict coming and the loop had no exit.
+        #
+        # 'pass' specifically, not a truthier-looking 'accepted': gate mode
+        # admits a package's dependents only on `harvest eq 'pass'`
+        # (bp-judge.pl:52), so any other value would stall them forever. The
+        # honesty is preserved in a separate field rather than by weakening the
+        # one the gate reads.
+        #
+        # The four companion resets mirror what a real pass writes
+        # (bp-orchestrator.pl:2808) — leaving a stale defer/starve counter behind
+        # would let a later cycle resurrect the audit this is meant to close.
+        if (($plan->{action} // '') eq 'accept') {
+            $reg{harvest}                     = 'pass';
+            $reg{harvest_reaudit}             = 0;
+            $reg{harvest_defer}               = 0;
+            $reg{harvest_defer_blockers}      = '';
+            $reg{harvest_starve_continuations}= 0;
+            $reg{harvest_settled_by}          = 'human-accept';
+        }
         # b17 C1/C2: the cold-start lever. `reset` clears session_id (set to undef,
         # which JSON::PP/registry_merge encode as JSON null — bp-resume-sweep.sh's
         # registry_get treats a null the same as absent via jq's `// empty`), so the

@@ -137,6 +137,15 @@ Never trust a worker's claim of success. After every write-capable worker return
 
 ### Waiting discipline — the positive pattern
 
+> **This section is for MULTI-TURN sessions only — coordinators and interactive drivers.** It is
+> the exact opposite of what a one-shot worker needs. A judge is a fresh headless `claude -p`
+> (`bp-judge.sh:8`) with no next turn: when it ends its turn awaiting a background task the process
+> EXITS, the notification has nowhere to arrive, and no verdict is ever written. This paragraph was
+> copied near-verbatim into `judge-harvest.md` and `judge-resolve.md` and deadlocked both judges in
+> a live run — packages parked reading "its outputs don't meet the done-criteria" when no judge had
+> assessed anything. If you are writing a prompt for a one-shot process, mandate FOREGROUND
+> execution and give it an out for a check too slow to finish (see those templates, and t/113).
+
 You will spend most of your turns either dispatching long-running work or running validation.
 Getting the *awaiting* half wrong is how a coordinator burns an entire turn budget producing
 nothing: a field package once grep-looped on a sentinel that had existed for over an hour, was
