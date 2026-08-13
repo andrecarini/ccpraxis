@@ -171,10 +171,26 @@ sub row {
     if (ref($value) eq 'ARRAY') {
         for my $sp (@$value) {
             if (ref($sp) eq 'HASH') {
-                push @value_spans, {
+                my %span = (
                     text => (defined($sp->{text}) ? $sp->{text} : ''),
                     role => (defined($sp->{role}) ? $sp->{role} : $default_role),
-                };
+                );
+                # PRESERVE `atomic`. This rebuild used to copy only text+role,
+                # silently dropping the marker that Frame.pm goes out of its way
+                # to carry through spanify (:189-192) and honour in fit_spans
+                # (:265,279). Harmless while nothing wrapped; the moment t02
+                # introduced wrapping it became a live spec violation -- meter
+                # gauges (declared atomic at :609/:611/:673) shattered mid-bar,
+                # reproduced at width 40 by the step-8 UI pass.
+                #
+                # Worth recording HOW it was missed: both the reviewer and the
+                # red-team probed wrap_line/fit_spans DIRECTLY with atomic spans,
+                # where the exclusion works perfectly, and concluded it was
+                # structural. Neither exercised the production path, which strips
+                # the flag before wrap_line ever sees it. Only composing a real
+                # frame and looking at it found this.
+                $span{atomic} = 1 if $sp->{atomic};
+                push @value_spans, \%span;
             } else {
                 push @value_spans, { text => (defined($sp) ? "$sp" : ''), role => $default_role };
             }

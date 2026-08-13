@@ -65,6 +65,13 @@ use tui::Frame;
 # private-by-convention name; called like the constant it replaces).
 sub _ROLE_ATTENTION { return 'state.warn'; }
 
+# WRAP_CONTINUATION_INDENT -- fixed, uniform continuation-line indent for a
+# wrapped body row (spec S2.4/S3.2, package t02-wrap-on-overflow). Additional
+# to the row's own existing 2-space body indent baked into the line handed
+# to wrap_line below -- net 2 (existing) + 2 (new) = 4 leading spaces on a
+# continuation line.
+use constant WRAP_CONTINUATION_INDENT => 2;
+
 # _render_panel(\%panel, $w, $maxh) -> up to $maxh cells: a title line
 # followed by (indented) body lines, clipped to $maxh. PRIVATE.
 sub _render_panel {
@@ -88,7 +95,14 @@ sub _render_panel {
         } else {
             @elems = ($ln);
         }
-        push @out, tui::Frame::make_cell([ { text => '  ', role => 'text.primary' }, @elems ], $role, $w);
+        my $cells = tui::Frame::wrap_line(
+            [ { text => '  ', role => 'text.primary' }, @elems ],
+            $role, $w, WRAP_CONTINUATION_INDENT()
+        );
+        for my $c (@$cells) {
+            last if @out >= $maxh;
+            push @out, $c;
+        }
     }
     push @out, tui::Frame::make_cell('', 'text.primary', $w) if @out < $maxh;
     return @out;

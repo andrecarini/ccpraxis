@@ -319,6 +319,259 @@ sub make_cell {
     return { text => spans_text($spans), role => $role, spans => $spans };
 }
 
+# wrap_line($line, $role, $w, $continuation_indent) -> \@cells, a NON-EMPTY
+# arrayref of cells (each shaped exactly like make_cell's return), each
+# exactly $w display columns wide. See specs/t02-wrap-on-overflow-spec.md
+# S2.1. Never dies, never warns.
+#
+# Priority order, per spec: (1) an atomic span (Meter gauge bar / percent
+# figure) fully excludes the row from wrapping -- delegate to today's
+# truncate-or-drop-whole make_cell, unchanged (S2.3: Layout::wrap cannot
+# carry the atomic marker through a rebuild, so a partially-cut gauge is a
+# real risk, not a hypothetical one). (2) a row that already fits its column
+# budget returns byte-identical output to today (the common case). (3)
+# otherwise, word-wrap: flatten to words, pre-split any word wider than the
+# continuation-aware content width at a decoded-character boundary (mirrors
+# beacon's own workaround, claude-beacon.pl:551-554, reimplemented here
+# because that copy is outside this file), hand the word list to the
+# EXISTING, UNMODIFIED tui::Layout::wrap, then re-pad each returned line via
+# make_cell/fit_spans -- which is what guarantees "exactly $w columns, never
+# mid-glyph" for every wrapped line using already-tested code. PUBLIC.
+sub wrap_line {
+    my ($line, $role, $w, $continuation_indent) = @_;
+    $role = DEFAULT_ROLE() if !defined $role;
+    $continuation_indent = 0
+        if !defined $continuation_indent || ref($continuation_indent)
+        || $continuation_indent !~ /^-?\d+(?:\.\d+)?$/;
+    $continuation_indent = int($continuation_indent);
+    $continuation_indent = 0 if $continuation_indent < 0;
+
+    my $spans = spanify($line, $role);
+
+    # (1) Atomic carve-out -- never wrap a row carrying a gauge bar/percent
+    # figure span; delegate whole to today's truncate-or-drop-whole path.
+    for my $sp (@$spans) {
+        return [ make_cell($line, $role, $w) ] if ref($sp) eq 'HASH' && $sp->{atomic};
+    }
+
+    # (2) Fast path -- no overflow, byte-identical to today.
+    return [ make_cell($line, $role, $w) ] if spans_width($spans) <= (defined $w ? $w : 0);
+
+    my $w_num = (!defined $w || ref($w) || $w !~ /^-?\d+(?:\.\d+)?$/) ? 0 : int($w);
+
+    # (3a-pre) Capture the row's own LEADING indent before it is lost.
+    # Step (3a) below splits every span's text on runs of spaces and drops
+    # empty tokens -- a pure-whitespace span (the 2-column body indent
+    # Screen.pm bakes into every row, e.g. { text => '  ', ... }) produces
+    # ZERO words and silently vanishes. Both the first line AND every
+    # continuation line need it restored: the first line so it keeps the
+    # SAME leading gutter as an unwrapped sibling row (step-8 UI-pass
+    # Finding 2 -- it was rendering flush against the panel border), and
+    # continuation lines so their own added indent (WRAP_CONTINUATION_INDENT,
+    # Screen.pm) reads as genuinely MORE indented than line 0, not merely
+    # equal to it (existing 2 + new 2 = 4, per spec S2.4). Recover it by
+    # walking the spans from the front and collecting any purely-whitespace
+    # run before the first span carrying real content.
+    my $leading_indent_text = '';
+    my $leading_indent_role;
+    for my $sp (@$spans) {
+        my $t = defined $sp->{text} ? $sp->{text} : '';
+        last if $t !~ /^ *$/;
+        next if $t eq '';
+        $leading_indent_text .= $t;
+        $leading_indent_role = $sp->{role} if !defined $leading_indent_role;
+    }
+    $leading_indent_role = DEFAULT_ROLE() if !defined $leading_indent_role;
+    my $leading_indent_w = tui::Layout::display_width($leading_indent_text);
+
+    # Content budget: reserve room for the leading indent (paid by every
+    # line, first included) PLUS the continuation indent (paid only by
+    # continuation lines) so that once both indents are re-added below, no
+    # line's total width (indent + words) can exceed $w_num. Uniform across
+    # every line of a wrapping row, per S2.1d -- line 0 simply doesn't spend
+    # the continuation-indent share of that reservation, which make_cell's
+    # own right-pad silently absorbs.
+    my $content_w = $w_num - $continuation_indent - $leading_indent_w;
+    # Degenerate case (S2.1d/behavior 6): continuation indent (+ leading
+    # indent) >= column width. Falling back to a full-width content budget
+    # without ALSO dropping the indents used to build the lines below would
+    # still burn the whole budget on leading spaces, leaving zero columns
+    # for the words those lines exist to carry -- an implementer's own
+    # regression, not one the spec asked for. $effective_indent tracks the
+    # continuation-only delta actually applied on top of the leading indent;
+    # $effective_leading tracks the leading indent itself.
+    my $effective_indent  = $continuation_indent;
+    my $effective_leading = $leading_indent_w;
+    if ($content_w < 1) {
+        $content_w         = $w_num;
+        $effective_indent  = 0;
+        $effective_leading = 0;
+    }
+
+    # (3a) Flatten spans into a word list, splitting on runs of a single
+    # ASCII space -- safe on UTF-8 BYTE text because a continuation byte is
+    # always >= 0x80, so 0x20 never appears mid-sequence.
+    #
+    # A span boundary is not necessarily a word boundary: callers routinely
+    # glue two spans directly together with no space (e.g. "...approved"
+    # then ", 3 pending" -- the comma belongs immediately after "approved",
+    # no separator). Splitting each span's text INDEPENDENTLY and rejoining
+    # every resulting token with a space (as tui::Layout::wrap always does
+    # between distinct words) invents a space the source never had. Track
+    # whether the previous span's text ended in a space and this span's
+    # text starts with one; if NEITHER does, this span's first token is not
+    # a new word -- it is the tail of the previous span's last word, and is
+    # appended to it in place rather than pushed as its own entry. The
+    # merged word keeps the role of its earlier (first) fragment; losing a
+    # color boundary on the one glued token is the accepted tradeoff for
+    # byte-exact text, which is what content fidelity requires here.
+    my @words;
+    my $prev_span_text;
+    for my $sp (@$spans) {
+        my $text     = defined $sp->{text} ? $sp->{text} : '';
+        my $sp_role  = defined $sp->{role} ? $sp->{role} : $role;
+        next if $text eq '';
+        my $glued_to_prev = defined($prev_span_text)
+            && $prev_span_text !~ / $/
+            && $text !~ /^ /;
+        $prev_span_text = $text;
+        my $first_tok = 1;
+        for my $tok (split / +/, $text) {
+            if ($tok eq '') { $first_tok = 0; next; }
+            if ($first_tok && $glued_to_prev && @words) {
+                $words[-1]{text} .= $tok;
+            } else {
+                push @words, { text => $tok, role => $sp_role };
+            }
+            $first_tok = 0;
+        }
+    }
+
+    # (3b) Overlong-word pre-split at decoded-character boundaries.
+    my @pre_split;
+    for my $word (@words) {
+        my $text = $word->{text};
+        if (tui::Layout::display_width($text) > $content_w) {
+            my $decoded = _strip_sgr(_decode_str($text));
+            my @chars   = split //, $decoded;
+            my @chunks;
+            my $cur   = '';
+            my $cur_w = 0;
+            for my $c (@chars) {
+                my $cw = tui::Layout::char_cols($c);
+                if ($cur_w > 0 && $cur_w + $cw > $content_w) {
+                    push @chunks, $cur;
+                    $cur   = $c;
+                    $cur_w = $cw;
+                } else {
+                    $cur .= $c;
+                    $cur_w += $cw;
+                }
+            }
+            push @chunks, $cur if length $cur;
+            for my $chunk (@chunks) {
+                push @pre_split, { text => Encode::encode('UTF-8', $chunk), role => $word->{role} };
+            }
+        } else {
+            push @pre_split, $word;
+        }
+    }
+
+    # (3c/3e) Delegate to the existing, unmodified tui::Layout::wrap.
+    my $sep_role   = $role;
+    my $out_lines  = tui::Layout::wrap(\@pre_split, $content_w, $sep_role);
+
+    # (3f) All-empty-words fallback -- never return zero cells.
+    return [ make_cell($line, $role, $w) ] if !@$out_lines;
+
+    # (3g) Re-pad each line via make_cell/fit_spans; continuation lines get
+    # a fixed-width leading indent span ($effective_indent, not the raw
+    # $continuation_indent -- see the degenerate-case note above).
+    my @cells;
+    for my $i (0 .. $#$out_lines) {
+        my $line_words = $out_lines->[$i];
+        my $line_spans;
+        if ($i == 0) {
+            # Restore the row's own leading indent captured in (3a-pre) --
+            # this is what gives line 0 the SAME leading gutter as an
+            # unwrapped sibling row (step-8 UI-pass Finding 2). Same
+            # overflow guard as the continuation-line indent below: only
+            # pay for it if it still fits within $w_num, so a pathological
+            # row can never be pushed past its column budget by an indent
+            # it cannot afford.
+            if ($effective_leading > 0
+                    && $effective_leading + spans_width($line_words) <= $w_num) {
+                $line_spans = [ { text => $leading_indent_text, role => $leading_indent_role }, @$line_words ];
+            } else {
+                $line_spans = $line_words;
+            }
+        } else {
+            # Per-LINE indent guard (redteam step-6 Finding 1): a
+            # forced-progress chunk (below) is, by definition, already wider
+            # than $content_w = $w_num - $continuation_indent. Prepending the
+            # row's indent unconditionally therefore ALWAYS pushed
+            # indent + chunk_width past $w_num for every such line -- not
+            # only in the whole-row degenerate case ($effective_indent
+            # already handles that one, above). Mirror that same fallback
+            # per line: only pay the indent on a continuation line if doing
+            # so still fits within $w_num; otherwise drop it for this line
+            # alone so the emitted width is never inflated by an indent the
+            # line cannot afford. This still satisfies AC3's "continuation
+            # lines get the fixed indent" for the overwhelming common case
+            # (indent + content fits) -- it only backs off when the row's
+            # own forced-progress content already needs the room.
+            # Continuation lines pay BOTH indents: the restored leading
+            # indent (same as line 0) plus the additional continuation
+            # delta -- existing 2 + new 2 = 4, per spec S2.4 -- so a
+            # continuation line reads as genuinely more indented than line
+            # 0, not merely equal to it.
+            my $total_indent_w = $effective_leading + $effective_indent;
+            if ($total_indent_w > 0
+                    && $total_indent_w + spans_width($line_words) > $w_num) {
+                $total_indent_w = 0;
+            }
+            if ($total_indent_w > 0) {
+                my @indent_spans;
+                push @indent_spans, { text => $leading_indent_text, role => $leading_indent_role }
+                    if $effective_leading > 0;
+                push @indent_spans, { text => (' ' x $effective_indent), role => DEFAULT_ROLE() }
+                    if $effective_indent > 0;
+                $line_spans = [ @indent_spans, @$line_words ];
+            } else {
+                $line_spans = $line_words;
+            }
+        }
+        # Forced-progress exception (DC5, behavior 4's degenerate case): a
+        # single decoded character wider than the WHOLE content budget was
+        # still emitted alone by the (3b) pre-split loop rather than being
+        # silently skipped -- but re-padding it through fit_spans/make_cell
+        # here would immediately undo that: fit_spans DROPS a glyph that
+        # cannot fit in the remaining width rather than half-emitting it
+        # (Frame.pm's own atomic-truncation contract, by design, for the
+        # normal case). For this one line shape -- content itself wider
+        # than $w, and (per the per-line indent guard above) already
+        # indent-free when an indent would have made it worse -- that same
+        # drop-on-overflow behavior would erase the only content the line
+        # carries, achieving the opposite of "the character still gets
+        # emitted, never dropped" (spec behavior 4). Bypass fit_spans's
+        # width clamp for this line ONLY; every other line (the
+        # overwhelming common case) still goes through make_cell/fit_spans
+        # unchanged, so "exactly $w columns" still holds for every line
+        # that can actually fit it. $line_spans is already a well-formed
+        # span array (its words came from spanify()'d, already-safe()d
+        # text via the pre-split/wrap pipeline above), so building the cell
+        # directly here -- rather than re-running spanify()/safe() a second
+        # time -- is not a behavior change, only the removal of a
+        # provably-idempotent redundant pass (reviewer step-6 NIT 1).
+        if (spans_width($line_spans) > $w_num) {
+            push @cells, { text => spans_text($line_spans), role => $role, spans => $line_spans };
+        } else {
+            push @cells, make_cell($line_spans, $role, $w);
+        }
+    }
+    return \@cells;
+}
+
 # clip_pad($str, $w) -> exactly $w display columns. PUBLIC.
 sub clip_pad {
     my ($s, $w) = @_;

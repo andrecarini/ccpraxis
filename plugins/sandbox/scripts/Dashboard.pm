@@ -65,6 +65,8 @@ use Encode ();
 # never names this package (05's/06's AC-P4).
 require tui::Layout;
 require tui::DashboardScreen;
+require tui::Frame;
+require tui::Screen;
 require Theme;
 
 # ===========================================================================
@@ -2388,8 +2390,43 @@ sub _alert_msgs {
 # join the same band-row as an earlier panel rather than always starting a
 # fresh one. Simulating the actual placement is what keeps this in exact
 # agreement with compose_frame regardless of how many panels are present.
+#
+# REBUILT AGAIN (package t02-wrap-on-overflow): a panel body row is no
+# longer always exactly one rendered row -- tui::Screen::_render_panel now
+# runs every logical line through tui::Frame::wrap_line, which emits MORE
+# THAN ONE cell for a row that overflows its band's own width $w (S2.4 of
+# specs/t02-wrap-on-overflow-spec.md). "1 + scalar(@$lines) + 1" (title +
+# one-row-per-line + trailing blank) silently assumed a row can never grow
+# taller than its own logical-line count, which stopped being true the
+# moment wrapping shipped. This simulates the EXACT SAME wrap_line call
+# _render_panel makes (same synthesized 2-space-indent line shape, same
+# role selection, same WRAP_CONTINUATION_INDENT) using each band-row cell's
+# OWN placed width ($cell->{w}, from tui::Layout::place) rather than $cols,
+# because a panel sharing a band-row with another is narrower than the full
+# terminal width -- the same width difference that made the 'backpack :
+# ... manage' Run-panel row wrap only at cols=40, not at cols=120.
+#
+# REBUILT A THIRD TIME (fix-batch step 7, red-team Finding 2): the two
+# rebuilds above still summed every pre-Activity band's NATURAL (unclamped)
+# height, never modelling two things the real renderer (_place_and_render,
+# tui/Screen.pm) does: (a) `tui::Screen::flex_reserve($body_height)` is held
+# back from every PRE-flex band, and (b) a pre-flex band that would not fit
+# in what is left is SKIPPED outright, not counted at its natural height.
+# Both require knowing $body_height, which this function did not previously
+# take. $rows is now an OPTIONAL third parameter -- callers that supply it
+# (activity_capacity, below) get the capped/reserve-aware total that agrees
+# with compose_frame at realistic terminal sizes (verified:
+# t/77-wrap-width-regressions.t, rows=30 cols=90/120). Callers that omit it
+# (t/25, t/40, t/41's direct 2-arg AC16 calls -- pre-existing, untouched
+# tests) fall back to the OLD natural/uncapped total, exactly as before this
+# fix-batch: not because the cap doesn't apply to them, but because without
+# $rows there is no $body_height to cap against, and guessing one would risk
+# a WORSE (silently wrong) prediction for those call sites rather than a
+# knowingly-approximate one. This is the one part of Finding 2 this
+# fix-batch leaves unmodelled: a 2-arg caller still gets the pre-existing
+# (uncapped, over-estimating) approximation, not the exact renderer match.
 sub _fixed_region_height {
-    my ($state, $cols) = @_;
+    my ($state, $cols, $rows) = @_;
     # AC-10 (t/40): $cols undef/non-numeric/<1 must degrade to the SAME
     # stacked-layout value any other sub-breakpoint width produces (matching
     # _two_col_mode's total degradation ladder), not to 0 -- tui::Layout::
@@ -2401,21 +2438,85 @@ sub _fixed_region_height {
     my $panels = tui::DashboardScreen::panels($state, $cols);
     return 0 unless ref($panels) eq 'ARRAY' && @$panels;
     my $band_rows = tui::Layout::place($panels, $cols);
-    my $total = 0;
-    for my $row (@$band_rows) {
+
+    # $body_height (only when $rows was supplied) -- the SAME formula
+    # activity_capacity/compose_frame use: rows - 2 (title+footer) - alert
+    # banner rows. Mirrors tui::Screen::compose's own `$body_height = $rows
+    # - 2; ... $body_height -= scalar(@banner_cells);`.
+    my $body_height;
+    if (defined $rows && !ref($rows) && $rows =~ /^-?\d+(?:\.\d+)?$/) {
+        my $alerts = scalar(_alert_msgs($state, $rows));
+        $body_height = int($rows) - 2 - $alerts;
+    }
+
+    # Which band-row carries the 'Recent activity' (flex) panel -- mirrors
+    # _place_and_render's own $flex_band scan, one level removed (there we
+    # scan for `panel->{flex}`; here, as in every prior rebuild of this
+    # function, for the Activity panel's title, since Activity is the one
+    # flex panel this dashboard ever places).
+    my $flex_band;
+    for my $i (0 .. $#$band_rows) {
         my $has_activity = grep {
             ref($_) eq 'HASH' && ref($_->{panel}) eq 'HASH'
                 && defined($_->{panel}{title}) && $_->{panel}{title} eq 'Recent activity'
-        } @$row;
-        last if $has_activity;
+        } @{ $band_rows->[$i] };
+        if ($has_activity) { $flex_band = $i; last; }
+    }
+    my $reserve = (defined($body_height) && defined($flex_band))
+        ? tui::Screen::flex_reserve($body_height) : 0;
+
+    my $total = 0;
+    my $used  = 0;
+    for my $i (0 .. $#$band_rows) {
+        last if defined($flex_band) && $i >= $flex_band;
+        my $row = $band_rows->[$i];
+
+        # Cap/skip (only modelled when $body_height is known): mirrors
+        # _place_and_render's `$remaining = $body_height - $used - $reserve`
+        # (every band here is pre-flex by construction, since the loop
+        # stops at $flex_band above) and its "a pre-flex band that does not
+        # fit is SKIPPED" rule.
+        my $remaining;
+        if (defined $body_height) {
+            $remaining = $body_height - $used - $reserve;
+            next if $remaining < 1;
+        }
+
         my $row_h = 0;
         for my $cell (@$row) {
             my $panel = (ref($cell) eq 'HASH') ? $cell->{panel} : undef;
+            my $w     = (ref($cell) eq 'HASH' && defined $cell->{w}
+                          && !ref($cell->{w}) && $cell->{w} =~ /^-?\d+(?:\.\d+)?$/)
+                      ? int($cell->{w}) : $cols;
             my $lines = (ref($panel) eq 'HASH' && ref($panel->{lines}) eq 'ARRAY') ? $panel->{lines} : [];
-            my $h = 1 + scalar(@$lines) + 1;
+            my $h = 1;    # panel title row
+            for my $ln (@$lines) {
+                my $role = (ref($ln) eq 'HASH' && defined $ln->{role}) ? $ln->{role} : 'text.primary';
+                my @elems;
+                if (ref($ln) eq 'ARRAY') {
+                    @elems = @$ln;
+                } elsif (ref($ln) eq 'HASH' && ref($ln->{spans}) eq 'ARRAY') {
+                    @elems = @{ $ln->{spans} };
+                } else {
+                    @elems = ($ln);
+                }
+                my $cells = tui::Frame::wrap_line(
+                    [ { text => '  ', role => 'text.primary' }, @elems ],
+                    $role, $w, tui::Screen::WRAP_CONTINUATION_INDENT()
+                );
+                $h += (ref($cells) eq 'ARRAY') ? scalar(@$cells) : 1;
+            }
+            $h += 1;      # trailing blank row (_render_panel's own padding)
             $row_h = $h if $h > $row_h;
         }
+        # _render_panel bounds EVERY cell's rendered length at $remaining
+        # (its own $maxh argument), so the row's actual rendered height --
+        # the max across its cells -- is exactly min(natural, $remaining),
+        # never the uncapped natural value. Only enforced when $remaining is
+        # known (i.e. $rows was supplied).
+        $row_h = $remaining if defined($remaining) && $row_h > $remaining;
         $total += $row_h;
+        $used  += $row_h;
     }
     return $total;
 }
@@ -2438,7 +2539,7 @@ sub activity_capacity {
     $rows = 0 if !defined $rows || ref($rows) || $rows !~ /^-?\d+(?:\.\d+)?$/ || $rows < 0;
     my $alerts = scalar(_alert_msgs($state, $rows));
     my $body_h = $rows - 2 - $alerts;             # 2 = title + footer
-    my $fixed  = _fixed_region_height($state, $cols);
+    my $fixed  = _fixed_region_height($state, $cols, $rows);
     my $cap = $body_h - $fixed - 1;               # -1 = Activity panel title
 
     # The Activity panel is tui::Screen's FLEX band, so it is guaranteed a
