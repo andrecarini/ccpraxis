@@ -1,6 +1,25 @@
 #!/usr/bin/env perl
 # bp-watchdog.pl — the drive-solo run's dead-man's switch.
 #
+# SUPERSEDED by bp-watch.pl (w01-bp-watch), for the drive-solo "wedged
+# worker" role this file's own header used to describe below. Neither
+# reporter/SKILL.md nor drive-solo/SKILL.md arms this file any more, as of
+# that package. Why: snapshot() below (:102-136) has NO subject-scoping
+# argument at all -- it walks the ENTIRE .ccpraxis-local-data/blueprints
+# tree with File::Find, so a driver's own ledger edit is indistinguishable
+# from a worker's progress. That is not historical: it fired live in this
+# very repo's session history, reporting VERDICT: PROGRESS three times
+# during a real four-hour stall, and it is structurally incapable of being
+# fixed by scoping it "a bit better" -- bp-watch.pl's artifact_snapshot()/
+# artifact_changed() close the same gap correctly, scoped to exactly the
+# paths a caller configures, and additionally poll on a real condition
+# rather than a fixed --sleep. This file's CODE below is intentionally
+# UNCHANGED (this is a header-only edit) and t/95-watchdog.t stays green,
+# byte-for-byte, because nothing it exercises changed -- superseding in
+# doctrine is the chosen fix, not a rewrite of internals nothing calls
+# again. See .ccpraxis-local-data/blueprints/butler-and-dashboard-overhaul/
+# specs/w01-bp-watch-spec.md §2.3/§3.6 for the full ruling.
+#
 # WHAT PROBLEM THIS SOLVES, AND WHY THE STOP GATE IS NOT ENOUGH
 #
 # gate-drive-loop.sh (Stop hook) catches a driver turn that ends with nothing

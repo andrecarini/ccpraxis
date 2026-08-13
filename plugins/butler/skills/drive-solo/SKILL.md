@@ -82,7 +82,7 @@ Proven by `plugins/butler/tests/t/94-drive-loop-gate.t`.
   (one-shot) and `CCPRAXIS_DRIVE_STOP_OK=1`, and fails **open** on any internal
   error — a gate that will not yield is worse than a stalled run.
 
-## Arm the watchdog — the other half, for **wedged** rather than **stopped**
+## Arm the watcher — the other half, for **wedged** rather than **stopped**
 
 The gate above catches a turn that ends with nothing scheduled. It cannot catch the
 harder failure: you dispatch a worker, the turn legitimately ends because a wake-up
@@ -92,33 +92,57 @@ or is itself waiting on something that can never happen. No `Stop` event fires, 
 session that is working. That is DAME field report batch-1 #11: an orphaned watcher
 still looping after **seventeen hours**, counted as live the whole time.
 
-So **arm the watchdog at the start of a run, and re-arm it every time it fires**:
+So **arm `bp-watch.pl` for the dispatch you just made, sized to that dispatch's own
+expected budget** (see `w02` for the first-class notion of a per-dispatch budget) —
+`bp-watchdog.pl` is **superseded** by this (see its own header) and is no longer
+armed here: it used to print one of `SETTLED`/`PROGRESS`/`STALLED` on a fixed
+30-minute tick, but its progress scan
+walked the whole blueprint tree with no subject-scoping at all, so a driver's own
+ledger edit read as the worker's progress and manufactured false `PROGRESS` verdicts
+during a real four-hour stall. One arm here covers the **whole** dispatch — there is
+no routine 30-minute tick to forget, unlike the old universal-timer habit that
+produced dozens of forgettable re-arms across a single long run (2026-08-06 #11):
 
 ```bash
-perl plugins/butler/scripts/bp-watchdog.pl --sleep 1800 --arm    # run_in_background
+perl plugins/butler/scripts/bp-watch.pl --arm --package <bp>/<pkg-just-dispatched> \
+     --max-seconds <this dispatch's own expected budget — see w02> \
+     --keepawake        # run_in_background
 ```
 
-A backgrounded Bash call notifies the session when it exits, so the watchdog's own
-expiry is a wake-up you control. Even if every other wake-up in the run is lost, the
-session revives on this one. It converts silent death into **at most 30 minutes of
-silence**.
+A backgrounded Bash call notifies the session when it exits — `mark-wakeup.sh`
+matches any backgrounded Bash call by shape, not by binary name, so this satisfies
+"registers as a legitimate wake-up" for free, no new wiring needed. `--keepawake`
+refreshes the *existing* `bp-keepawake.pl` lease (the same `.drive-solo/keepawake.pid`
+`bp-drive-next.pl` already manages) once per poll tick — closing the gap where that
+900s lease is refreshed only when the director runs, and the director is skipped
+whenever a wakeup is already pending.
 
-On each firing it prints one of three verdicts — act on it, don't just re-arm blindly:
+On exit it prints one of five verdicts — act on it, don't just re-arm blindly:
 
-| verdict | meaning | what to do |
+| verdict (exit code) | meaning | what to do |
 |---|---|---|
-| `SETTLED` | the director reports no remaining work | stop; do **not** re-arm |
-| `PROGRESS` | the tree moved during the window | re-arm and carry on |
-| `STALLED` | nothing moved, and the director still wants work | **diagnose before re-arming** — it names the wedged package, how long its ledger has been silent, and what to check |
+| `TERMINAL` (0) | the watched package's ledger reached `done`/`dropped`/`blocked`/`parked` | stop; assess the result — does not imply "never re-arm anything else" |
+| `BOUND` (1) | `--max-seconds` elapsed, nothing resolved; liveness is **unknown** | investigate, or widen the budget and re-arm — never assume dead or done |
+| `WORKERS-GONE` (2) | every configured pid died with no terminal status observed | likely crash — **re-dispatch the wedged worker instead**, don't wait longer |
+| `ARTIFACT` (3) | a watched path's mtime advanced, or it appeared | re-arm and carry on |
+| `STATUS-CHANGE` (4) | the ledger status changed to a **non-terminal** value | re-arm and carry on |
 
-A `STALLED` verdict is not a prompt to wait longer. A wait that has already failed once
-does not improve by being repeated: re-dispatch the wedged worker instead. And treat an
+A `WORKERS-GONE` (or a `BOUND` where you have independent reason to believe the worker
+died) is not a prompt to wait longer. A wait that has already failed once does not
+improve by being repeated: **re-dispatch the wedged worker instead**. And treat an
 empty or narration-shaped worker result as a **dead dispatch**, not a finding of
 "nothing" — a worker that runs out of turns returns its last narration, which reads
 exactly like success.
 
-The watchdog observes and reports; it never kills anything and never writes into a
+`bp-watch.pl` observes and reports; it never kills anything and never writes into a
 blueprint. Remediation is a judgment call and stays with you.
+
+**Known residual (not closed by `bp-watch.pl` alone):** a `BOUND` exit still means the
+dispatch may genuinely still be running, and nothing today *forces* you to re-arm a
+fresh watcher for the continuation — only routine forgetting (dozens of ticks across
+one run) is eliminated, not the single re-arm after a real `BOUND`. Closing that
+residual needs `gate-drive-loop.sh` to refuse a Stop when work remains and no live
+watcher can be confirmed; tracked as a `w02` item.
 
 ## Lean-context
 

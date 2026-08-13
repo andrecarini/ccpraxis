@@ -179,7 +179,25 @@ Maintain a **seen-set** = the decision ids you have already surfaced this sessio
 4. When you *answer* a decision (step 4), drop its id from the seen-set — if that same package re-parks later it gets a new id and is correctly treated as fresh.
 5. On `--timeout` it returns `{"status":"timeout"}` with no decisions — just re-arm (the bound is a liveness heartbeat; lengthen it if you prefer). On a `decision` return, exit code is 0 and `decisions[]` is non-empty.
 
-This is the **only** way you watch — no repeated `bp-status.sh` poll loop. Between watcher returns and user turns you spend no tokens.
+This is the **only** way you watch for a *queued decision* — no repeated `bp-status.sh` poll loop. Between watcher returns and user turns you spend no tokens.
+
+**`bp-wait-for-decision.pl` only wakes on a queued decision.** Four things never queue
+one, so none of them was ever noticed: the orchestrator process dying, the container
+being reaped, a clean idle-exit with everything `done`, or a single package flipping
+to `done`. Arm `bp-watch.pl` **alongside** it, in Mode B (blueprint-wide, no
+`--package`), as a second `run_in_background` Bash call:
+
+```
+perl plugins/butler/scripts/bp-watch.pl --arm --blueprint $0 \
+     --pid-file "<bpdir>/runs/.orchestrator" --max-seconds 1800   # run_in_background
+```
+
+A `WORKERS-GONE` (exit 2, the orchestrator's pid died) or a `TERMINAL`/`SETTLED` exit
+(exit 0, every package reached `done`/`dropped`/`blocked`/`parked`) is the trigger to
+**auto-announce to the user**, the same auto-announce doctrine this section already
+uses for decisions — not a silent re-arm. A `BOUND` exit (nothing changed within the
+window) just means re-arm and keep watching. No wake-lock flag here: the reporter
+surface holds no wake-lock today and this does not add one to it.
 
 ## Remediation (what the fleet fixed by itself)
 
