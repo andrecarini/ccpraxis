@@ -1898,6 +1898,20 @@ sub fetch_usage {
 
 sub _log { my ($p, $t, $f) = @_; return unless defined $p; BpLog::event($p, $t, $f); }
 
+# r01 fix-batch step7 item 2: a %last_relaunch_at entry that is somehow AHEAD
+# of $now (host suspend/resume, wall-clock correction, or an injected `now`
+# seam going backwards then forwards across ticks) must not wedge the package
+# until real time catches up to the stale future value -- that is the mirror
+# failure of the storm this package exists to prevent (never relaunching,
+# instead of relaunching forever). Treat a future $last as stale: it does not
+# gate the relaunch.
+sub _min_interval_gate {
+    my ($last, $now, $min) = @_;
+    return 0 unless defined $last;
+    return 0 if $last > $now;   # future timestamp -- stale, does not throttle
+    return ($now - $last) < $min;
+}
+
 # b02: the project checkout a blueprint dir belongs to, or undef.
 # <project>/.ccpraxis-local-data/blueprints/<bp> -> <project>. Used as the
 # checkpoint root hint so a commit target never depends on the inherited cwd.
@@ -1984,9 +1998,31 @@ sub _tunables_base {
         creds_bo_max  => $ENV{BP_CREDS_BACKOFF_MAX_SECS}  // 1800, # b03: ceiling
         remediation_rounds => $ENV{BP_REMEDIATION_ROUNDS} // 2,    # b07: per-finding round budget (Decision #21)
         remediation_cap    => $ENV{BP_REMEDIATION_CAP}    // 6,    # b07: global rounds opened per run (SYN-7)
-        min_relaunch => $ENV{BP_MIN_RELAUNCH_SECS} // 30,  # r01: floor between two watchdog
-                                                             # relaunches of the SAME package
+        min_relaunch => _min_relaunch_secs(),  # r01: floor between two watchdog
+                                                # relaunches of the SAME package
     };
+}
+
+# r01 fix-batch step7 item 1: BP_MIN_RELAUNCH_SECS gates the ONE safeguard this
+# package exists to add. Unlike every other _tunables_base() key (house
+# convention: unvalidated env passthrough), this one must not be silently
+# defeatable -- a malformed value (non-numeric, negative, zero, float,
+# whitespace-padded, empty) is a foot-gun that reproduces the exact storm this
+# spec was written to prevent (measured: min_relaunch=0 -> 7 launches in 48s
+# vs 2 at the documented default). So: only a strictly-positive integer is
+# honoured; anything else falls back to the documented default (30) and warns,
+# naming the rejected value, rather than clamping or silently accepting it.
+# 0 is deliberately NOT given a special "disabled" meaning -- an operator who
+# wants a negligible floor can set 1.
+sub _min_relaunch_secs {
+    return 30 unless exists $ENV{BP_MIN_RELAUNCH_SECS};   # truly unset -> quiet default, no warning
+    my $raw = $ENV{BP_MIN_RELAUNCH_SECS};
+    $raw = '' unless defined $raw;
+    if ($raw =~ /^[0-9]+$/ && $raw > 0) { return $raw + 0; }
+    warn "bp-orchestrator: BP_MIN_RELAUNCH_SECS='$raw' is not a positive integer -- "
+       . "falling back to the default (30s). A malformed value here silently "
+       . "disables the watchdog relaunch-storm floor.\n";
+    return 30;
 }
 
 # Build { pkg => {deps, write_set} } and { pkg => status } from disk.
@@ -3104,7 +3140,7 @@ sub run {
                         # r01 Fix B: never kill a still-alive coordinator you've decided not to
                         # replace this tick — check the min-interval floor BEFORE kill_pid.
                         my $last = $last_relaunch_at{$pkg};
-                        if (defined $last && ($now - $last) < $t->{min_relaunch}) {
+                        if (_min_interval_gate($last, $now, $t->{min_relaunch})) {
                             _log($log, 'relaunch_deferred', { package => $pkg, reason => 'min_interval',
                                 since_last => $now - $last, min_relaunch => $t->{min_relaunch} });
                             push @live, $pkg;
@@ -3162,7 +3198,7 @@ sub run {
                         cap => $t->{cap} });
                     if ($v eq 'relaunch') {
                         my $last = $last_relaunch_at{$pkg};
-                        if (defined $last && ($now - $last) < $t->{min_relaunch}) {
+                        if (_min_interval_gate($last, $now, $t->{min_relaunch})) {
                             _log($log, 'relaunch_deferred', { package => $pkg, reason => 'min_interval',
                                 since_last => $now - $last, min_relaunch => $t->{min_relaunch} });
                         } elsif (@live < $t->{max_par}) {

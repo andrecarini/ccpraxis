@@ -486,4 +486,89 @@ sub fmt_offsets { my ($a) = @_; return join(',', @$a) }
         'BLOCK F: reverts to the 30 default once the env override is removed (not sticky/cached)');
 }
 
+# =====================================================================================
+# BLOCK G — fixbatch-step7 item 1: BP_MIN_RELAUNCH_SECS is the ONE
+# _tunables_base() key that must NOT be silently defeatable -- the red-team
+# reproduced the field storm exactly via min_relaunch=0 (7 launches in 48s,
+# vs 2 at the documented default). Every malformed form falls back to the
+# documented default (30) AND warns, naming the rejected value. 0 is
+# deliberately NOT special-cased as "disabled".
+# =====================================================================================
+for my $bad ('0', '-1', '', 'abc', '0.5', ' 5', '5 ') {
+    local $ENV{BP_MIN_RELAUNCH_SECS} = $bad;
+    my $warned;
+    local $SIG{__WARN__} = sub { $warned = $_[0]; };
+    my $got = BpOrch::_tunables_base()->{min_relaunch};
+    is($got, 30, "BLOCK G: BP_MIN_RELAUNCH_SECS='$bad' falls back to the default (30), not accepted/clamped");
+    like($warned // '', qr/\Q$bad\E/, "BLOCK G: BP_MIN_RELAUNCH_SECS='$bad' emits a warning naming the rejected value")
+        or diag("no warning captured for '$bad'");
+}
+{
+    local $ENV{BP_MIN_RELAUNCH_SECS} = '12';
+    my $warned;
+    local $SIG{__WARN__} = sub { $warned = $_[0]; };
+    is(BpOrch::_tunables_base()->{min_relaunch}, 12,
+        'BLOCK G: a valid positive integer (12) is honoured exactly');
+    ok(!defined $warned, 'BLOCK G: a valid positive integer emits NO warning');
+}
+
+# =====================================================================================
+# BLOCK H — fixbatch-step7 item 2: a %last_relaunch_at entry that is AHEAD of
+# $now (a forward clock jump, then a correction back to normal cadence) must
+# NOT wedge the package forever waiting for real time to catch up to the
+# stale future value -- the inverse failure of the storm (never relaunching).
+# Multi-tick, single run() invocation, same house pattern as BLOCK D. The
+# jump (3000s) is kept well under the fixture's credential expiry window
+# (5h) so it does not also trip an unrelated token-floor refresh/pause path.
+# =====================================================================================
+{
+    my $pkg = 'rem-clockjump';
+    my $reg = { $pkg => { attempt => 1, pid => $DEAD_PID, status => 'running', session_id => 'sid-jump' } };
+    my $dir = mk_bp([], $reg);
+    write_ledger($dir, $pkg, 'running');
+    write_queue($dir, id => $pkg, pkg_status => 'running');
+    spit(transcript_path($dir, $pkg), jline(result_line(reason => 'error', epoch => $NOW - 300, sid => 'sid-jump')));
+
+    # t=0 (unconditional first relaunch, sets last=0), t=3000 (a forward jump --
+    # unconditionally past min_relaunch=30, sets last=3000), then a CORRECTED
+    # clock walking t=40..96 -- all strictly LESS than the stale last=3000, so
+    # $now - $last is negative throughout this window. A buggy guard treats a
+    # negative delta as "< min_relaunch" (true) and defers every one of these
+    # ticks forever; the fix treats last > now as stale and relaunches at the
+    # first corrected tick.
+    my @offsets = (0, 3000, 40, 48, 56, 64, 72, 80, 88, 96);
+    my $tick = 0;
+    my (@L, $err);
+    my $seam = sub {
+        my ($a) = @_;
+        push @L, { pkg => $a->{pkg}, at_offset => $offsets[$tick] };
+        return 0;
+    };
+    my $now_fn   = sub { return $NOW + ($offsets[$tick] // $offsets[-1]) };
+    my $sleep_fn = sub {
+        $tick++;
+        if ($tick >= scalar(@offsets)) { spit("$dir/runs/.shutdown", ''); }
+    };
+    eval {
+        BpOrch::run({
+            blueprint => 'T', bp_dir => $dir, creds_path => "$dir/creds.json",
+            tunables => tun(min_relaunch => 30),
+            now => $now_fn, sleep => $sleep_fn,
+            http_get  => sub { { status => 200, content => $USAGE_OK } },
+            http_post => sub { { status => 200, content => '{}' } },
+            spawn_judge => sub { 0 },
+            launch => $seam,
+        });
+        1;
+    } or $err = $@;
+    is($err // '', '', 'BLOCK H: multi-tick go() ran without a Perl exception') or diag($err);
+
+    my @launch_offsets = map { $_->{at_offset} } grep { $_->{pkg} eq $pkg } @L;
+    ok((grep { $_ > 40 - 1 && $_ < 3000 } @launch_offsets) || (grep { $_ >= 40 && $_ <= 96 } @launch_offsets),
+        'BLOCK H: at least one relaunch reaches the seam DURING the corrected-clock window (t=40..96) -- '
+      . 'the future-dated last_relaunch_at does not wedge the package until real time catches up to it')
+        or diag('launch offsets: ' . fmt_offsets(\@launch_offsets));
+    ok(!(grep { $_ < 0 } @launch_offsets), 'BLOCK H sanity: no launch recorded at a negative/impossible offset');
+}
+
 done_testing();
