@@ -309,6 +309,29 @@ Check off pipeline steps in the ledger as you go. Steps may be skipped only with
 
 ## Worker dispatch contract
 
+**Bracket every `Task`/`Agent` worker dispatch with `bp-dispatch-log.pl start`/
+`finish`, foreground, from your own clock — never a worker's self-report** (the
+same per-dispatch budget/elapsed-time mechanism `drive-solo/SKILL.md`'s "Arm the
+watcher" section documents for the interactive driver; both surfaces share the same
+blind spot — a dispatched worker has no elapsed-time signal independent of its own
+self-report, regardless of which one dispatched it):
+
+```bash
+perl "${CLAUDE_PLUGIN_ROOT}"/scripts/bp-dispatch-log.pl start \
+     --id <bp>-<pkg>-<epoch-or-short-tag> --worker-type <bp-implementer|bp-test-writer|...> \
+     --budget-seconds <this dispatch's own expected budget>
+...
+perl "${CLAUDE_PLUGIN_ROOT}"/scripts/bp-dispatch-log.pl finish --id <id> --status done
+```
+
+**Interrupt-and-report is dispatch-shape-agnostic** — once `bp-dispatch-log.pl
+elapsed --id <id>` shows `over_budget: true`, "interrupt" always means "send the
+dispatch a message asking it to stop iterating and report," never a process kill,
+whether the caller is an interactive driver or a semi-autonomous coordinator. The
+canonical prompt is documented once, in `drive-solo/SKILL.md`'s "Arm the watcher"
+section (step 4) — read it there rather than duplicating it here, so there is one
+canonical wording and one place it can drift out of sync.
+
 Every dispatch prompt contains, explicitly:
 
 ```

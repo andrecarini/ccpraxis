@@ -200,6 +200,36 @@ case "$ACTION" in
     exit 0 ;;
 esac
 
+# --- w02 fold: a VERIFIED live pause escapes the BLOCK below -----------------
+# ADDITIVE ONLY. Touches no existing branch above (.stop-ok, .wakeup-pending,
+# MAX_BLOCKS, done, pause) and no other file. bp-runstate.pl's `status`
+# already computes exactly the checkable claim: state is "paused" IFF a
+# specific pid, recorded at the moment someone called
+# `pause --watcher-pid P --until U`, is alive RIGHT NOW and U has not yet
+# passed (effective() re-verifies both and reverts a stale pause to "active"
+# on its own). This adds NO new liveness logic — it only reads that already-
+# verified answer, immediately before the unconditional BLOCK below.
+#
+# PROVABLY INERT against t/94-drive-loop-gate.t section H's own fixture: that
+# fixture has no .subagent-guard/run-state.json at all, so bp-runstate.pl
+# status returns "inert", never "paused" — the case arm below matches
+# nothing and execution falls through to the unchanged BLOCK.
+RS="$HOOK_DIR/../scripts/bp-runstate.pl"
+if [ -r "$RS" ] && command -v perl >/dev/null 2>&1; then
+  RST=$(perl "$RS" status --root "$RUN_DIR" 2>/dev/null) || RST=""
+  case "$RST" in
+    *'"state":"paused"'*)
+      # A live watcher is CONFIRMED. Allow the stop; do not fall through
+      # to BLOCK. Any failure of the status call itself (perl missing,
+      # unreadable file, malformed JSON) leaves RST empty/unparseable, so
+      # the case matches nothing and falls through to BLOCK — the safe
+      # direction: an error in this check must never silently grant an
+      # escape it did not earn.
+      rm -f "$DS/.stop-blocks" 2>/dev/null
+      exit 0 ;;
+  esac
+fi
+
 # --- still actionable, and nothing will wake us: BLOCK ----------------------
 DETAIL=$(printf '%s' "$OUT" | perl -ne 'my @m; while (/"(?:blueprint|package)"\s*:\s*"([^"]+)"/g) { push @m, $1 } print join " / ", @m' 2>/dev/null || true)
 echo $((BLOCKS + 1)) > "$DS/.stop-blocks" 2>/dev/null

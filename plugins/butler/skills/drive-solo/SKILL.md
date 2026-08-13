@@ -93,8 +93,20 @@ or is itself waiting on something that can never happen. No `Stop` event fires, 
 session that is working. That is DAME field report batch-1 #11: an orphaned watcher
 still looping after **seventeen hours**, counted as live the whole time.
 
-So **arm `bp-watch.pl` for the dispatch you just made, sized to that dispatch's own
-expected budget** (see `w02` for the first-class notion of a per-dispatch budget) —
+**Step 1 — stamp the dispatch, foreground, before backgrounding anything.** Elapsed
+time is measured DRIVER-SIDE, from the driver's own clock at launch (Decision 7) —
+never from the worker's own self-report: a dispatch that ran roughly four hours once
+self-reported 47 minutes, and any detector built on that self-report is built on
+sand.
+
+```bash
+perl "${CLAUDE_PLUGIN_ROOT}"/scripts/bp-dispatch-log.pl start \
+     --id <bp>-<pkg>-<epoch-or-short-tag> --worker-type <bp-implementer|bp-test-writer|...> \
+     --budget-seconds <this dispatch's own expected budget — the SAME number used below>
+```
+
+**Step 2 — arm `bp-watch.pl` for the dispatch you just made, sized to that dispatch's
+own expected budget** (the SAME number as step 1's `--budget-seconds`) —
 `bp-watchdog.pl` is **superseded** by this (see its own header) and is no longer
 armed here: it used to print one of `SETTLED`/`PROGRESS`/`STALLED` on a fixed
 30-minute tick, but its progress scan
@@ -106,7 +118,7 @@ produced dozens of forgettable re-arms across a single long run (2026-08-06 #11)
 
 ```bash
 perl "${CLAUDE_PLUGIN_ROOT}"/scripts/bp-watch.pl --arm --package <bp>/<pkg-just-dispatched> \
-     --max-seconds <this dispatch's own expected budget — see w02> \
+     --max-seconds <this dispatch's own expected budget — SAME number as step 1> \
      --keepawake        # run_in_background
 ```
 
@@ -120,7 +132,17 @@ whenever a wakeup is already pending. It never creates a second, independent
 lease: if no lease is currently held, `--keepawake` is a no-op for that tick — the
 director remains the only thing that ever spawns the first one.
 
-On exit it prints one of five verdicts — act on it, don't just re-arm blindly:
+**Step 3 — one `pause` call satisfies BOTH gates.** `guard-subagent-stall.sh`
+already blocks this turn's own Stop until you call `finish` or a verified `pause` on
+`bp-runstate.pl`, and its own denial text already spells out the exact
+`pause --watcher-pid <pid> --until <epoch>` call. That SAME call —
+`bp-runstate.pl pause --watcher-pid <the backgrounded watcher's own pid> --until
+<launch-epoch + N>` — is also the exact state `gate-drive-loop.sh`'s runstate fold
+(below) now reads on a LATER turn while the dispatch is still in flight. This is
+reuse, not new plumbing: w02 adds no new state machine.
+
+On exit `bp-watch.pl` prints one of five verdicts — act on it, don't just re-arm
+blindly:
 
 | verdict (exit code) | meaning | what to do |
 |---|---|---|
@@ -129,6 +151,35 @@ On exit it prints one of five verdicts — act on it, don't just re-arm blindly:
 | `WORKERS-GONE` (2) | any ONE configured pid died with no terminal status observed | likely crash — **re-dispatch the wedged worker instead**, don't wait longer |
 | `ARTIFACT` (3) | a watched path's mtime advanced, or it appeared | re-arm and carry on |
 | `STATUS-CHANGE` (4) | the ledger status changed to a **non-terminal** value | re-arm and carry on |
+
+**Step 4 — before killing, and before waiting again: interrupt and ask for a
+report.** Once `bp-dispatch-log.pl elapsed --id <id>` shows `over_budget: true`,
+**do not defer again.** State it as the instruction, not merely as an observation:
+the 2026-08-12 report is explicit that a driver deferring "this has been too long"
+four consecutive times is a design that will fail the same way again. Send the
+dispatch this canonical prompt, adapted to what it is actually running:
+
+> *"STOP ITERATING AND REPORT NOW. Do not start another verification/build/test
+> cycle. Let anything currently in flight finish, then report immediately: what you
+> changed, what state each file is in, what you were iterating on, and how you were
+> verifying it. If something is currently failing, do NOT keep trying to fix it —
+> leave the file as-is and report the failure verbatim."*
+
+This is carried from the 2026-08-12 report's own prompt (structure preserved
+exactly: stop iterating, let in-flight work finish, report state verbatim, do not
+keep trying to fix), generalised from its verbatim `flutter test` wording to any
+verification loop. It demonstrably worked once: the worker returned promptly with a
+complete, accurate accounting and nothing was lost. Record the outcome:
+
+```bash
+perl "${CLAUDE_PLUGIN_ROOT}"/scripts/bp-dispatch-log.pl finish --id <id> --status interrupted \
+     --note "<one line: what the report said>"
+```
+
+The dispatch is **not** killed by this move — it is asked to stop iterating and hand
+back what it has. Deciding whether to then re-dispatch, accept partial work, or
+escalate is a judgment call that stays with you, same as `bp-watch.pl`'s own
+"observes and reports; never kills" posture.
 
 A `WORKERS-GONE` (or a `BOUND` where you have independent reason to believe the worker
 died) is not a prompt to wait longer. A wait that has already failed once does not
@@ -140,12 +191,14 @@ exactly like success.
 `bp-watch.pl` observes and reports; it never kills anything and never writes into a
 blueprint. Remediation is a judgment call and stays with you.
 
-**Known residual (not closed by `bp-watch.pl` alone):** a `BOUND` exit still means the
-dispatch may genuinely still be running, and nothing today *forces* you to re-arm a
-fresh watcher for the continuation — only routine forgetting (dozens of ticks across
-one run) is eliminated, not the single re-arm after a real `BOUND`. Closing that
-residual needs `gate-drive-loop.sh` to refuse a Stop when work remains and no live
-watcher can be confirmed; tracked as a `w02` item.
+**The residual named by w01 is closed by the fold, contingent on `gate-drive-loop.sh`
+being in w02's write set.** A `BOUND` exit with a live, verified pause in place no
+longer risks a silent block-then-nag on the next Stop — `bp-runstate.pl status`
+reporting `paused` is exactly the signal `gate-drive-loop.sh`'s fold now consults. A
+`BOUND` exit with **no** verified pause (the watcher died, or nobody ever called
+`pause`) correctly still blocks: the gate cannot tell the difference between "forgot
+to re-arm" and "nothing was ever watching," and per `t/94` section H it must not
+guess in the permissive direction.
 
 ## Lean-context
 
