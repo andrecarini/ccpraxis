@@ -129,9 +129,36 @@ SKIP: {
     #    harvest-judge. Non-vacuity: these must NOT be denied, or the guard
     #    is broader than the spec's deliberately narrow scope.
     for my $cmd ('pnpm run typecheck', 'pnpm install', 'pytest', 'make test',
-                 'go test ./...', 'pnpm run lint:fix', 'echo pnpm run lint') {
+                 'go test ./...') {
         my ($rc) = run_guard($cmd, BP_LEDGER => '/fake/ledger.md', BP_ROLE => 'harvest-judge');
         is($rc, 0, "D: '$cmd' as a harvest-judge => exit 0 (outside the deliberately narrow shape)");
+    }
+
+    # D2. 'pnpm run lint:fix' DOES match the denylist shape (\b matches at the
+    # word boundary before ':', so "lint" is found inside "lint:fix") — and
+    # per fix-batch step 7's driver ruling, that is correct, not a false
+    # positive: lint:fix is a MUTATING re-run, not verification, and a
+    # harvest judge has no business running it either. The rule being
+    # enforced is "verify a declared check via its recorded evidence, never
+    # by re-running it" — lint:fix is a re-run regardless of what it mutates.
+    {
+        my ($rc) = run_guard('pnpm run lint:fix', BP_LEDGER => '/fake/ledger.md', BP_ROLE => 'harvest-judge');
+        is($rc, 2, "D2: 'pnpm run lint:fix' as a harvest-judge => exit 2 (a mutating re-run is still a re-run)");
+    }
+
+    # D3. 'echo pnpm run lint' also matches the denylist shape today: the
+    # regex has no notion of "echo" as a no-op prefix, so it fires on the
+    # literal substring inside the echoed text too. This is a genuine false
+    # positive (echoing a string is not running it) — but it fails CLOSED,
+    # costs one refused command with a self-explanatory message, and
+    # complicating the regex to parse shell semantics (recognising `echo`,
+    # or any other command that merely mentions the shape in its arguments)
+    # is far more likely to open a bypass than to prevent a nuisance. Per
+    # fix-batch step 7's driver ruling, this is accepted deliberately, not an
+    # oversight left unfixed.
+    {
+        my ($rc) = run_guard('echo pnpm run lint', BP_LEDGER => '/fake/ledger.md', BP_ROLE => 'harvest-judge');
+        is($rc, 2, "D3: 'echo pnpm run lint' as a harvest-judge => exit 2 (accepted fail-closed false positive; see comment)");
     }
 
     # E. Behavior 9, re-confirmed with jq actually parsing the command (the

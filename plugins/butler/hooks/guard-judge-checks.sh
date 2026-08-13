@@ -41,7 +41,19 @@ CMD=$(jq -r '.tool_input.command // empty' <<<"$PAYLOAD" 2>/dev/null)
 # Deliberately narrow: the exact re-run shape named in the incident evidence
 # (sources/2026-08-11-gsa-fleet-collapse.md:125 — "pnpm run lint, pnpm run
 # build and pnpm test"). NOT a general artefact verifier — see header.
-if printf '%s' "$CMD" | grep -Eq '(^|[;&|[:space:]])(pnpm|npm|yarn)[[:space:]]+(run[[:space:]]+)?(lint|build|test)\b'; then
+#
+# Boundary class includes "(" so `result=$(pnpm run lint 2>&1)` (command
+# substitution — capturing a check's own output, the exact shape a re-running
+# judge would write) is caught. The optional path-prefix group before the
+# binary name catches `/usr/bin/pnpm run lint` and
+# `./node_modules/.bin/pnpm test` (a judge reaching for an absolute/relative
+# path around a PATH problem). Deliberately NOT extended to quote characters
+# (`'`/`"`) to also catch `bash -c 'pnpm test'`: that shape requires
+# deliberate wrapping (closer to evasion than habit) and adding quotes to the
+# boundary class produces false positives on ordinary commands that merely
+# mention the words in a quoted string, e.g. a commit message — see h01
+# fix-batch step 7 report. Left open per spec §2.2's narrow-by-design scope.
+if printf '%s' "$CMD" | grep -Eq '(^|[;&|[:space:](])([^[:space:];&|]*/)?(pnpm|npm|yarn)[[:space:]]+(run[[:space:]]+)?(lint|build|test)\b'; then
   echo "BLOCKED: harvest judges verify a declared \`checks:\` entry via its recorded evidence, never by re-running it (bp-harvest-judge.md Method: 'via a declared artefact, never by re-running them'). Command: $CMD. Look for the check's recorded invocation+result inside your contracted slice instead." >&2
   exit 2
 fi
