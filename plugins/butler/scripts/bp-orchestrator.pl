@@ -1441,8 +1441,27 @@ my $DECISION_SEQ = 0;
 #      escalation, never a dedupe hit. Retry with a bumped sequence; a
 #      persistent collision after a generous bounded retry REFUSES (returns
 #      undef) rather than ever renaming over an existing file.
+
+# fixbatch step7 / LOW: $rec->{package} used to be interpolated straight into
+# a filesystem path with no sanitization at all -- pre-existing (confirmed by
+# `git show 0984fa2`, not introduced by e03), but e03's own
+# _bump_chronic_scoping_counter (bp-resolve.pl) is a genuinely NEW caller of
+# BpOrch::queue_needs_you(), which is what made this newly reachable, so it
+# is e03's to close here rather than carry forward again. Strips only path
+# separators and NUL -- deliberately NOT touching anything else, because
+# this host's own paths are legitimately non-ASCII (CLAUDE.md) and package
+# identifiers may contain Unicode; only '/', '\' and NUL can escape the
+# intended directory, so only those are neutralized.
+sub _safe_path_component {
+    my ($s) = @_;
+    return '' unless defined $s;
+    $s =~ s{[\\/\x00]+}{_}g;
+    return $s;
+}
+
 sub _unique_decision_path {
     my ($dir, $rec) = @_;
+    my $safe_pkg = _safe_path_component($rec->{package});
     for (1 .. 50) {
         $DECISION_SEQ++;
         # No separators between the three hex parts (t/06's own immutable
@@ -1451,7 +1470,7 @@ sub _unique_decision_path {
         # boundary between the three parts; only the WHOLE string needs to be
         # unique, which it now structurally is (see this function's header).
         my $sid = sprintf('%x%x%x', ($rec->{created_at} // time), $$, $DECISION_SEQ);
-        my $file = "$dir/$rec->{package}--$sid.json";
+        my $file = "$dir/$safe_pkg--$sid.json";
         return $file unless -e $file;
     }
     return undef;   # exhausted the retry budget -- refuse rather than ever overwrite

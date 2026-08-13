@@ -74,12 +74,20 @@ Write exactly one JSON object to **verdict_path** (and nothing else to it):
 {
   "category": "product | operational | conformance | oracle | scoping | implementation",
   "action": "relaunch | widen-write-set | edit-depends-on | author-ledger",
+  "path": "<REQUIRED when action is widen-write-set — the exact write_set entry to add, e.g. a directory or file path such as p/blk9/. Never a citation, never a file:line, never anything containing ':'>",
   "confidence": "high | low",
   "evidence": "<citation resolving the SPECIFIC disputed fact — file:line, ledger section, or Decisions row>",
   "rationale": "<one-line: why this classifies where it does>"
 }
 ```
 
+- `path` is a **dedicated field, distinct from `evidence`**. `evidence` is always a prose citation (a
+  `file:line`, a ledger section, a Decisions row — it may legitimately contain a colon). `path` is
+  always a literal write-set entry (a directory or file path) and must never contain a colon. Do not
+  put the widen target in `evidence` and do not put a citation in `path` — the deterministic apply-step
+  reads `path` ONLY for `widen-write-set` and refuses the action outright (no partial/fallback
+  behavior) if `path` is missing, blank, or contains a `:`. Omit `path` entirely for every other
+  action — it is meaningless outside `widen-write-set` and is ignored there.
 - Omit `action` and `rationale` entirely when `category` is `product` or `operational` — a
   product/operational verdict must never also carry a mutation; including one there is a contract
   violation the deterministic apply-step refuses outright, not a shortcut that gets acted on anyway.

@@ -298,8 +298,17 @@ run_group('A2 (AC1: unclassified resolved to scoping+widen-write-set -> act)', s
     my $runs = "$bpdir/runs";
     my ($id, $path, $filed) = file_decision($runs, pkg => $pkg, kind => 'stuck-package',
         category => 'unclassified', question => 'ambiguous free-text park');
+    # `path` is the dedicated, validated key for widen-write-set; `evidence` is
+    # a file:line CITATION and must never double as the mutation target. This
+    # fixture originally supplied only `evidence` and relied on the fallback
+    # that used it as the path -- which meant this very prose string ("cites
+    # the exact missing file path...") was accepted as a write-set grant,
+    # because it happens to contain no colon. Step 7 removed that fallback; the
+    # group's intent (an unclassified record, once resolved by the verdict,
+    # reaches `act`) is unchanged and is what the assertions below still test.
     my $verdict = { category => 'scoping', action => 'widen-write-set', confidence => 'high',
-                     evidence => 'cites the exact missing file path from the ledger', rationale => 'a narrow, additive widen closes it' };
+                     path => 'plugins/butler/scripts/',
+                     evidence => 'plugins/butler/scripts/bp-resolve.pl:412', rationale => 'a narrow, additive widen closes it' };
     my $outcome = BpResolve::apply_verdict($verdict, $filed, $id,
         { bpdir => $bpdir, runs => $runs, bp => 'bp', log => "$runs/orchestrator.log" });
     is($outcome->{outcome}, 'act', 'A2: unclassified, once resolved by the verdict, reaches act');

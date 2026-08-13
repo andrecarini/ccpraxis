@@ -28,6 +28,7 @@
 package BpResolve;
 use strict;
 use warnings;
+use Fcntl qw(:flock);
 # @BpOrch::CATEGORIES is read exactly once from this file -- perl's "used
 # only once" heuristic would otherwise print a warning to STDERR on every
 # load, and the CLI below (unless (caller)) is parsed as stdout+stderr JSON
@@ -194,6 +195,62 @@ sub _rlog {
     return;
 }
 
+# fixbatch step7 / CRITICAL + HIGH, one root cause: apply_verdict used to act
+# on the CALLER-SUPPLIED $rec snapshot with no re-read at all, at any point,
+# under any lock, before committing. The resolver judge's own wall-clock
+# budget is up to 1800s (BP_JUDGE_TIMEOUT_SECS) -- easily enough time for an
+# operator to independently answer the same decision via
+# bp-answer-decision.pl while the judge is still thinking. Per spec §2.1b,
+# the operator's own answer deletes runs/needs-you/<id>.json with no archive
+# entry -- THAT deletion is itself the record of what happened. Committing
+# the stale snapshot afterward silently UNDID the operator's own action
+# (tag-only: resurrected the deleted file, resolver-tagged) or FORGED a
+# resolved-escalations archive entry claiming the resolver decided an id the
+# operator had already disposed of (act).
+#
+# This is the a01 re-read-under-lock convention (package a01,
+# BpWrite::guarded_write), applied here rather than reinvented: lock ->
+# re-read the queue record -> compare to the snapshot the caller was handed
+# -> if it is GONE or has CHANGED, ABORT before any write. An operator's
+# disposal must win every race. bp-answer-decision.pl's own final unlink
+# (line ~682) does not itself take this lock -- that file is outside this
+# package's write set -- so this narrows the staleness window from the
+# resolver's full ~1800s wall-clock budget down to the few milliseconds
+# between this re-read and the commit that follows it in the SAME locked
+# section, rather than claiming to close the cross-process race completely.
+sub _same_queued_record {
+    my ($a, $b) = @_;
+    return 0 unless ref $a eq 'HASH' && ref $b eq 'HASH';
+    my $j = JSON::PP->new->canonical;
+    my $ea = eval { $j->encode($a) };
+    my $eb = eval { $j->encode($b) };
+    return (defined $ea && defined $eb && $ea eq $eb) ? 1 : 0;
+}
+
+# Runs $code->() under an exclusive lock on "$qpath.lock" (BpWrite's own
+# lock-path convention, so this serialises against anything else that took
+# that same lock). Returns whatever $code->() returns; on a lock-open/
+# lock-timeout failure returns (undef, 'lock-error') instead of running
+# $code at all -- callers must treat that as "could not prove freshness",
+# never as "proven fresh".
+sub _with_qpath_lock {
+    my ($qpath, $code) = @_;
+    my $lock_p = "$qpath.lock";
+    open(my $lk, '>', $lock_p) or return (undef, 'lock-open-failed');
+    my $timeout  = 10;
+    my $deadline = time + $timeout;
+    until (flock($lk, LOCK_EX | LOCK_NB)) {
+        if (time >= $deadline) { close $lk; return (undef, 'lock-timeout'); }
+        select(undef, undef, undef, 0.05);
+    }
+    my @r = eval { $code->() };
+    my $err = $@;
+    flock($lk, LOCK_UN);
+    close $lk;
+    return (undef, "internal error: $err") if $err;
+    return @r;
+}
+
 # list-form system() with the child's stdout/stderr redirected around the
 # call -- the same discipline bp-answer-decision.pl's own
 # update_next_action_with_note already uses, for the same reason: a caller of
@@ -235,13 +292,25 @@ sub _dispatch_action {
             '--decision', $id, '--action', 'relaunch', '--note', $rationale, '--bp-dir', $bpdir);
     }
     if ($action eq 'widen-write-set') {
-        # No dedicated 'path' key is mandated by verdict_shape_ok (spec §2.6) --
-        # an agent citing the exact missing path puts it in 'evidence' (the
-        # confidence-citation field already required for a resolver-owned
-        # verdict); an optional 'path'/'target' key wins if present.
-        my $path = $verdict->{path} // $verdict->{target} // $verdict->{evidence} // '';
+        # fixbatch step7 / MEDIUM (red-team) + SHOULD-FIX (reviewer), one root
+        # cause found twice independently: this used to fall back to
+        # $verdict->{evidence}, but the agent's own output contract documents
+        # 'evidence' as a PROSE CITATION ("file:line, ledger section, or
+        # Decisions row" -- bp-escalation-resolver.md), and
+        # bp-answer-decision.pl's --widen-write-set handler unconditionally
+        # REJECTS any value containing a colon. A 'file:line' citation --
+        # exactly the format the agent's own prompt suggests first -- made
+        # this fail EVERY TIME for a fully compliant agent, with no forward
+        # progress (the decision just loops back through resolver dispatch).
+        # Fix: a DEDICATED, validated 'path' key (now documented in the
+        # agent's output contract), never a silent repurposing of 'evidence'.
+        # A missing/blank/colon-bearing path is a clean refusal, not a
+        # fallback to the wrong field.
+        my $path = $verdict->{path};
+        return 1 unless defined $path;
         $path =~ s/^\s+|\s+$//g;
         return 1 unless length $path;
+        return 1 if $path =~ /:/;   # same guard bp-answer-decision.pl enforces -- refuse here, don't shell out to fail there
         return _run_quiet($^X, "$SELF_DIR/bp-answer-decision.pl", $bp,
             '--decision', $id, '--widen-write-set', $path, '--bp-dir', $bpdir);
     }
@@ -305,7 +374,11 @@ sub _author_ledger {
     $depends_on = '' if $depends_on eq '—' || $depends_on eq '-';
     return 0 unless length $deliverable;   # no template source -> never invent content
 
-    my $ledger  = "$bpdir/packages/$pkg.md";
+    # fixbatch step7 / LOW: sanitize $pkg the same way _unique_decision_path
+    # now does (BpOrch::_safe_path_component) -- strips only path separators
+    # and NUL, never touching legitimate non-ASCII (this host's own paths
+    # are Unicode, CLAUDE.md).
+    my $ledger  = "$bpdir/packages/" . BpOrch::_safe_path_component($pkg) . ".md";
     my $now_iso = _iso_now();
     my $body =
         "---\npackage: $pkg\nblueprint: " . ($ctx->{bp} // '') . "\nstatus: pending\n"
@@ -406,15 +479,26 @@ sub apply_verdict {
     }
 
     if ($gate eq 'tag-only') {
-        my %tagged = (%$rec);
-        $tagged{category}    = $verdict->{category};
-        $tagged{resolved_by} = 'bp-escalation-resolver';
-        $tagged{confidence}  = $verdict->{confidence};
-        $tagged{evidence}    = $verdict->{evidence};
-        $tagged{resolution}  = $verdict->{resolution} // $verdict->{rationale} // '';
-        my $ok = _atomic_write_json($qpath, \%tagged);
+        my $stale = 0;
+        my ($ok) = _with_qpath_lock($qpath, sub {
+            my $fresh = BpOrch::_read_json($qpath);
+            unless (_same_queued_record($fresh, $rec)) { $stale = 1; return 0; }
+            my %tagged = (%$rec);
+            $tagged{category}    = $verdict->{category};
+            $tagged{resolved_by} = 'bp-escalation-resolver';
+            $tagged{confidence}  = $verdict->{confidence};
+            $tagged{evidence}    = $verdict->{evidence};
+            $tagged{resolution}  = $verdict->{resolution} // $verdict->{rationale} // '';
+            return _atomic_write_json($qpath, \%tagged);
+        });
+        if ($stale) {
+            _rlog($log, 'escalation_resolve_stale', { decision => $id, package => (ref $rec eq 'HASH' ? $rec->{package} : undef) });
+            return { outcome => 'stale', applied => 0, archived => 0,
+                     reason => 'queued record changed or was removed before the verdict could be applied -- '
+                             . 'the operator likely disposed of it already; nothing written' };
+        }
         unless ($ok) {
-            _rlog($log, 'escalation_resolve_tag_failed', { decision => $id, package => $rec->{package} });
+            _rlog($log, 'escalation_resolve_tag_failed', { decision => $id, package => (ref $rec eq 'HASH' ? $rec->{package} : undef) });
             return { outcome => 'refuse', applied => 0, archived => 0, reason => 'in-place tag write failed' };
         }
         return { outcome => 'tag-only', applied => 0, archived => 0, reason => undef };
@@ -422,37 +506,103 @@ sub apply_verdict {
 
     # $gate eq 'act'
     my $archive_path = "$runs/resolved-escalations/$id.json";
-    my $arc = {
-        original    => $rec,
-        resolved_by => 'bp-escalation-resolver',
-        action      => $verdict->{action},
-        rationale   => $verdict->{rationale},
-        confidence  => $verdict->{confidence},
-        evidence    => $verdict->{evidence},
-        resolved_at => time,
-        applied     => JSON::PP::false,
-    };
-    unless (_atomic_write_json($archive_path, $arc)) {
+
+    # fixbatch step7 / MEDIUM (crash window): if a prior run already got as
+    # far as durably recording applied=>true for this id (the second archive
+    # write below succeeded) but was killed before the unlink that follows
+    # it, the queue file is still sitting in runs/needs-you/ and would
+    # otherwise be picked up and RE-DISPATCHED by a later tick -- re-running
+    # work (e.g. relaunch) that already landed. Detect that up front and
+    # finish the interrupted cleanup instead of re-dispatching.
+    my $prior_arc = BpOrch::_read_json($archive_path);
+    if (ref $prior_arc eq 'HASH' && $prior_arc->{applied}) {
+        unlink $qpath if -e $qpath;
+        return { outcome => 'act', applied => 1, archived => 1,
+                 reason => 'already applied in a prior run (archive already marked applied=true); '
+                         . 'finished the interrupted cleanup without re-dispatching' };
+    }
+
+    my $stale = 0;
+    my ($archived_ok) = _with_qpath_lock($qpath, sub {
+        my $fresh = BpOrch::_read_json($qpath);
+        unless (_same_queued_record($fresh, $rec)) { $stale = 1; return 0; }
+        my $arc = {
+            original    => $rec,
+            resolved_by => 'bp-escalation-resolver',
+            action      => $verdict->{action},
+            rationale   => $verdict->{rationale},
+            confidence  => $verdict->{confidence},
+            evidence    => $verdict->{evidence},
+            resolved_at => time,
+            applied     => JSON::PP::false,
+        };
+        return _atomic_write_json($archive_path, $arc);
+    });
+    if ($stale) {
+        _rlog($log, 'escalation_resolve_stale', { decision => $id, package => (ref $rec eq 'HASH' ? $rec->{package} : undef) });
+        return { outcome => 'stale', applied => 0, archived => 0,
+                 reason => 'queued record changed or was removed before the verdict could be applied -- '
+                         . 'the operator likely disposed of it already; nothing archived, nothing dispatched' };
+    }
+    unless ($archived_ok) {
         # HIGHEST-VALUE #2: a failed archive write must ABORT the deletion --
         # dispatch never runs, the queue file is never touched.
-        _rlog($log, 'escalation_resolve_archive_failed', { decision => $id, package => $rec->{package} });
+        _rlog($log, 'escalation_resolve_archive_failed', { decision => $id, package => (ref $rec eq 'HASH' ? $rec->{package} : undef) });
         return { outcome => 'act', applied => 0, archived => 0, reason => 'archive write failed -- deletion aborted' };
     }
 
     my $dispatch_rc = _dispatch_action($verdict, $rec, $id, $ctx);
     my $applied = ($dispatch_rc == 0) ? 1 : 0;
 
-    # Re-write the archive with the REAL applied outcome. If this second write
-    # somehow fails, the archive still holds applied=false from the first
-    # write (never silently upgraded to look successful) -- degrade-safe.
-    $arc->{applied} = $applied ? JSON::PP::true : JSON::PP::false;
-    _atomic_write_json($archive_path, $arc);
+    # Re-write the archive with the REAL applied outcome, return value now
+    # CHECKED (fixbatch step7 / MEDIUM: it used to be silently ignored). If
+    # this second write fails and dispatch did NOT succeed, the archive
+    # still holds applied=false from the first write (never silently
+    # upgraded to look successful) and the queue file is left in place, same
+    # as before, so a later tick can still discover and re-attempt it. If
+    # dispatch DID succeed but only this bookkeeping write failed, the queue
+    # file is still unlinked anyway -- the crash-window guard above (checking
+    # $prior_arc->{applied}) exists precisely because RE-DISPATCHING an
+    # action that already landed is a worse outcome than an under-reporting
+    # archive record, and the failure is logged either way, not swallowed.
+    {
+        my $arc2 = {
+            original    => $rec,
+            resolved_by => 'bp-escalation-resolver',
+            action      => $verdict->{action},
+            rationale   => $verdict->{rationale},
+            confidence  => $verdict->{confidence},
+            evidence    => $verdict->{evidence},
+            resolved_at => time,
+            applied     => $applied ? JSON::PP::true : JSON::PP::false,
+        };
+        my $arc2_ok = _atomic_write_json($archive_path, $arc2);
+        unless ($arc2_ok) {
+            _rlog($log, 'escalation_resolve_archive_update_failed',
+                { decision => $id, package => (ref $rec eq 'HASH' ? $rec->{package} : undef), applied => $applied });
+            if ($applied) {
+                # Dispatch really happened but the durable record could not be
+                # updated to say so -- log it, but do NOT re-queue-visible this
+                # id for re-dispatch either: unlink it anyway, same as the
+                # applied=>true path below, since re-running an action that
+                # already succeeded is the harm this fix targets, not a stale
+                # applied=>false archive record (which is already logged).
+                unlink $qpath if -e $qpath;
+                _bump_chronic_scoping_counter($rec, $id, $verdict, $ctx) if ($verdict->{category} // '') eq 'scoping';
+            } else {
+                _rlog($log, 'escalation_resolve_apply_failed', { decision => $id, package => (ref $rec eq 'HASH' ? $rec->{package} : undef), rc => $dispatch_rc });
+            }
+            return { outcome => 'act', applied => $applied, archived => 1,
+                     reason => ($applied ? 'dispatch succeeded but the archive update failed -- logged, queue file unlinked anyway'
+                                          : "dispatch failed, rc=$dispatch_rc; archive update also failed") };
+        }
+    }
 
     if ($applied) {
         unlink $qpath if -e $qpath;
         _bump_chronic_scoping_counter($rec, $id, $verdict, $ctx) if ($verdict->{category} // '') eq 'scoping';
     } else {
-        _rlog($log, 'escalation_resolve_apply_failed', { decision => $id, package => $rec->{package}, rc => $dispatch_rc });
+        _rlog($log, 'escalation_resolve_apply_failed', { decision => $id, package => (ref $rec eq 'HASH' ? $rec->{package} : undef), rc => $dispatch_rc });
     }
 
     return { outcome => 'act', applied => $applied, archived => 1,

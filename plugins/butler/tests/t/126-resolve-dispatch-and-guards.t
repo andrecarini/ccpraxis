@@ -138,9 +138,16 @@ sub slurp { my ($p) = @_; open my $fh, '<:raw', $p or return undef; local $/; my
 # call shape is unchanged -- calling it with EXACTLY the current 10-arg form
 # still produces the exact same field-for-field result t/115's own D3 already
 # asserts, so a future implementer who inserts a NEW argument anywhere in the
-# middle of that list (shifting every argument after it into the wrong slot)
-# breaks THIS test even without anyone running a literal `git diff`; and
-# (b) t/115 itself, byte-for-byte, is untouched by this package.
+# MIDDLE of that list (shifting every argument after it into the wrong slot)
+# breaks BQ1/BQ2 even without anyone running a literal `git diff`; and (b)
+# t/115 itself, byte-for-byte, is untouched by this package. BQ1/BQ2 alone do
+# NOT go red for a purely TRAILING, optional argument appended to the
+# signature (fixbatch step7 / MEDIUM, red-team) -- BQ3 below covers that case
+# separately, by asserting the signature's arity directly from source, since
+# BQ1's text-match and BQ2's positional call are both structurally blind to
+# an appended-and-unused trailing parameter. The spec's own git-diff check
+# (§4, AC-BQ) already catches either shape; BQ3 exists so the SUITE alone
+# does too, without relying on a reviewer separately running that diff.
 # ═══════════════════════════════════════════════════════════════════════════
 {
     # BQ1: t/115 (this package's neighbor, IMMUTABLE per the dispatch prompt)
@@ -191,6 +198,26 @@ sub slurp { my ($p) = @_; open my $fh, '<:raw', $p or return undef; local $/; my
             'BQ2: the queued decision carries category=scoping in the RIGHT slot -- a shifted 11th argument would break this specific field');
     } else {
         fail('BQ2: no decision file to inspect category on');
+    }
+
+    # BQ3 (fixbatch step7 / MEDIUM, red-team): BQ1/BQ2 alone only go red for a
+    # MID-LIST insertion (every argument after it shifts slot). A future
+    # implementer who instead APPENDS a new, optional TRAILING parameter --
+    # an ordinary way to widen a function without disturbing existing call
+    # sites -- leaves the old 10-argument call above populating all ten
+    # existing parameters identically, the new parameter simply undef, and
+    # both BQ1 (text match) and BQ2 (positional call) stay green despite the
+    # signature having genuinely changed. Assert the ARITY of the `my (...)
+    # = @_;` signature line directly, from source, so a trailing append is
+    # caught here even though it cannot be caught by BQ1/BQ2's own technique.
+    my $orch_src = slurp($ORCH_SCRIPT) // '';
+    if ($orch_src =~ /sub\s+_block_and_queue\s*\{.*?my\s*\(([^)]*)\)\s*=\s*\@_;/s) {
+        my @params = ($1 =~ /\$\w+/g);
+        is(scalar(@params), 10,
+            'BQ3: _block_and_queue\'s my (...) = @_; signature line has exactly 10 parameters -- '
+          . 'a trailing appended parameter (not just a mid-list insertion) goes red here');
+    } else {
+        fail('BQ3: could not locate the my (...) = @_; signature line for _block_and_queue to check its arity');
     }
 }
 
