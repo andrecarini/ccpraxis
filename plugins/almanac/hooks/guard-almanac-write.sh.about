@@ -1,0 +1,1 @@
+PreToolUse guard: denies Edit/Write on bug-reports/*.md so the state machine cannot be bypassed
