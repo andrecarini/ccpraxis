@@ -99,3 +99,9 @@ the `sandbox-refuse-in-place` blueprint for the full reasoning.
   explicitly — `git status --ignored` is the authoritative list, not `.gitignore`.
 - **The clone is not a registered marketplace**, so it is not protected and launches normally. If
   you ever register it as one, `claude-sandbox` will start refusing it — by design.
+- **The container's Claude Code version tracks the HOST's — it is not insulated from it.** At build
+  time `bootstrap.pl` reads the host's `claude --version` and passes it as `--build-arg
+  CLAUDE_VERSION`; the `Containerfile` installs exactly that; `launcher.pl` marks a container stale
+  on a version mismatch and rebuilds. So any runtime risk tied to the bundled Claude/Bun version
+  reaches the in-container butler fleet too. One caveat when comparing reports: the container runs
+  Linux-x64 Bun against the host's Windows-x64, so platform-specific symptoms can differ.

@@ -51,6 +51,20 @@ From Bash, redirecting to `NUL` creates a literal file of that name which Explor
 
 **This is hook-enforced** — `~/.claude/ccpraxis/scripts/hooks/block-nul-redirect.pl` denies the Bash call before it runs, in every project on this machine, so the mistake is not available to make. Kept as one line only because the *right* form is worth knowing; the rule itself needs no teaching. If a stray `NUL` file already exists, remove it from Bash (`rm -- NUL`) — PowerShell resolves the device name instead of the file.
 
+## Check the version before bug-hunting third-party software
+
+As soon as a third-party app is implicated in a bug, check its version against the vendor's current release and say so immediately — offer to update first. An eM Client hang was fully diagnosed on 10.4.5642 and turned out to be already fixed in 10.4.5647, shipped ten days earlier with no mention in the release notes. If you do diagnose before updating, take version-stamped, repeatable measurements so the evidence survives the update. Note the in-app updater can lag a direct installer download.
+
+## ⚠️ Write `.ps1` files as ASCII only
+
+The Write tool saves UTF-8 without a BOM; PowerShell 5.1 reads a BOM-less script as CP1252. A multi-byte character like `—` or `→` decodes into stray bytes — one of them (0x94) is a smart quote, which PowerShell treats as a **string delimiter**. That opens a phantom string, swallows the following braces, and reports `Missing closing '}'` at a line far from the real problem.
+
+Use `--` and `->`. If non-ASCII is genuinely required, prepend a UTF-8 BOM. Check with `perl -nle 'print "L$.: $_" if /[^\x00-\x7f]/' file.ps1` — no output means clean. `.sh` files are unaffected; Git Bash handles UTF-8 fine.
+
+## ⚠️ Path-scoped `Bash(...)` permissions do not work in skill frontmatter
+
+`permissions.allow` entries like `Bash(perl ~/.claude/scripts/*)` match correctly in `settings.json`, but silently fail to match when written into a skill's `allowed-tools:` frontmatter — only the broadest form (`Bash(perl *)`) takes effect there, which is too permissive to want. To pre-approve a specific command a skill invokes, add it to `settings.json` (use the `update-config` skill) and leave the frontmatter as bare `Bash, Read, Write, …`.
+
 ## ⚠️ MSYS2 path-conversion mangles `:`-separated args (Git-for-Windows perl + podman)
 
 When Git-for-Windows perl (or any MSYS2-based tool) spawns a **native Windows** binary, MSYS2 silently translates argv elements that look like POSIX paths into Windows paths. For arguments that **contain a colon**, MSYS2 treats them as `:`-separated PATH-style lists, converts each piece independently, and **re-joins them with `;`** (Windows's PATH separator). This silently corrupts:
