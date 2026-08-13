@@ -16,7 +16,6 @@
 #   materialize-plugins              Emit a container-shaped installed_plugins.json (paths rewritten).
 #   materialize-credentials          Emit sandbox-isolated .credentials.json.
 #   materialize-known-marketplaces   Emit container-shaped known_marketplaces.json (paths rewritten).
-#   write-mcp-state         Overwrite enabledMcp/disabledMcp lists in settings.local.json.
 #   clone-to-project        Promote a Suggestion to Project (plugin or MCP); idempotent.
 #   help                    Show usage.
 
@@ -1475,8 +1474,12 @@ sub cmd_select_interactive {
 
     # Phase C — settings.local.json cleanup, scoped to stale drops only.
     # No other writes ever target this file under the new model. The legacy
-    # `write-mcp-state` subcommand keeps the wholesale-overwrite behavior
-    # for any external caller.
+    # `write-mcp-state` subcommand, which wrote the MCP lists HERE rather than
+    # to settings.json, has been removed: it had no callers, no test, and its
+    # only behaviour was to put MCP state in the one file the partition says it
+    # must not live in (discover_mcp reads presence in settings.local.json as a
+    # promotable "suggestion", so an MCP list written there collapses every row
+    # to a suggestion nothing can promote).
     if (my $settings_local = $opts{settings_local_file}) {
         my %drop_names;
         for my $s (@stale_mcp) {
@@ -2545,48 +2548,6 @@ sub cmd_discover_mcp {
     return 0;
 }
 
-# =====================================================================
-# Subcommand: write-mcp-state
-# =====================================================================
-#
-# Updates `enabledMcpjsonServers` + `disabledMcpjsonServers` in the project's
-# `.claude/settings.local.json`. Preserves all other keys. Atomic write.
-# Also prunes stale entries (names not present in .mcp.json) — the user
-# asked for stale cleanup as part of this work.
-#
-# Required: --settings-local FILE --enabled "a,b,c" --disabled "d,e"
-#           --project-path PATH (needed to find .mcp.json for prune)
-sub cmd_write_mcp_state {
-    my %opts = @_;
-    my $file = $opts{settings_local} or die "--settings-local required\n";
-    my $enabled_csv  = $opts{enabled}  // '';
-    my $disabled_csv = $opts{disabled} // '';
-
-    my @enabled  = grep { length } split /,/, $enabled_csv;
-    my @disabled = grep { length } split /,/, $disabled_csv;
-
-    # Trust the caller (the TUI) for the exact list contents - it handles
-    # the keep/prune decision per stale entry explicitly. No auto-pruning here.
-
-    # Read existing settings.local.json (preserve everything except the two
-    # MCP arrays). Create empty hash if file doesn't exist.
-    my $existing = -f $file ? read_json($file) : {};
-    $existing = {} unless ref $existing eq 'HASH';
-
-    # Deterministic ordering - sort alphabetically so the file diff is stable.
-    @enabled  = sort { $a cmp $b } @enabled;
-    @disabled = sort { $a cmp $b } @disabled;
-
-    $existing->{enabledMcpjsonServers}  = \@enabled;
-    $existing->{disabledMcpjsonServers} = \@disabled;
-
-    # Make sure the directory exists (first-time write).
-    my $dir = dirname($file);
-    make_path($dir) unless -d $dir;
-
-    write_json_atomic($file, $existing);
-    return 0;
-}
 
 # =====================================================================
 # Subcommand: materialize-credentials
@@ -2786,10 +2747,6 @@ Commands:
                                                     rewrites Windows installLocation paths to the
                                                     container mount target; drops directory-source
                                                     marketplaces whose source.path isn't mounted.
-  write-mcp-state     --settings-local FILE --enabled "..." --disabled "..."
-                                                    Overwrite enabled/disabled MCP lists in
-                                                    settings.local.json. Caller-authoritative
-                                                    (no auto-pruning); TUI decides.
   help                                              Show this help.
 
 Common options:
@@ -2844,7 +2801,6 @@ my %DISPATCH = (
     'record-mount'        => \&cmd_record_mount,
     'manifest'            => \&cmd_manifest,
     'discover-mcp'            => \&cmd_discover_mcp,
-    'write-mcp-state'         => \&cmd_write_mcp_state,
     'materialize-plugins'              => \&cmd_materialize_plugins,
     'materialize-credentials'          => \&cmd_materialize_credentials,
     'materialize-known-marketplaces'   => \&cmd_materialize_known_marketplaces,
