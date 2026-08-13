@@ -118,6 +118,11 @@ our %KIND_REGISTRY = (
     'harvest-failure'         => { family => 'package' },
     'harvest-spawn-failure'   => { family => 'package' },
     'judge-starved'           => { family => 'package' },
+    # e03-autonomous-resolution §2.2: the ONE new kind this package introduces.
+    # A one-line DATA addition, not a signature change to any emitter --
+    # _block_and_queue is never called for it (queue_needs_you files it
+    # directly, from bp-resolve.pl, exactly like every other producer).
+    'chronic-scoping'         => { family => 'package' },
 );
 our @KNOWN_KINDS = sort keys %KIND_REGISTRY;
 sub kind_family_of { my ($k) = @_; return defined $k ? $KIND_REGISTRY{$k}{family} : undef; }
@@ -1392,10 +1397,72 @@ sub clear_pause { my ($runs) = @_; unlink "$runs/.paused"; }
 # %DECISION_VALIDITY) and the guarded path (kind IS in the table, called from
 # INSIDE guarded_write's own `mutate`, i.e. still under the ledger's lock) share
 # one writer.
+# r01-fixbatch/e03: an in-process, ever-incrementing, NEVER-reset disambiguator
+# folded into every decision id below. Loop/process-scope, mirroring %seen/
+# %ckpt/$exec_fail_streak's own "no registry schema, cheap, lives for the life
+# of this process" convention elsewhere in this file. This is what makes two
+# escalations filed by the SAME process structurally unable to collide, no
+# matter how the epoch/pid portions of the id truncate -- see
+# _unique_decision_path's own header for why widening the old substr() budget
+# alone was not enough.
+my $DECISION_SEQ = 0;
+
+# _unique_decision_path($dir, $rec) -> $file | undef
+#
+# The OLD id, `substr(sprintf('%x%x', created_at, $$), 0, 10)`, silently
+# discarded almost all of the pid: hex(epoch) alone is 8 hex chars, so the
+# 10-char substr left room for only 2 hex digits of pid. Two escalations for
+# the SAME package filed within the SAME second -- whether by the same
+# process twice, or by two processes whose pids share their low 2 hex digits
+# (e.g. 12345 and 12346, or any pid pair congruent mod 256) -- produced the
+# IDENTICAL filename. Because the id *is* the filename, the second write's
+# rename() clobbered the first with no error and no warning: a real
+# escalation simply ceased to exist. e03's own provenance design (a deleted
+# id with no archive entry means a human answered it) depends entirely on an
+# id genuinely naming ONE escalation -- a collision breaks that invariant
+# silently, which is worse than a blocked run.
+#
+# Merely widening the substr() budget would only make a collision RARER, not
+# impossible -- a truncated, finite-width id can always collide given enough
+# volume, and "rare" is not the bar for something the provenance/audit trail
+# depends on. Two layers, deliberately not one:
+#   1. IMPOSSIBLE within a single process: $DECISION_SEQ is monotonic and
+#      never reset, so two calls from the SAME process can never produce the
+#      same sid regardless of what the epoch/pid portions do -- there is no
+#      value of created_at or $$ that can make two DIFFERENT $DECISION_SEQ
+#      values collide.
+#   2. DETECTED, not silently overwritten, for the residual cross-process
+#      case (two different orchestrator/coordinator processes racing to file
+#      for the same package in the same second with congruent pid+seq bits):
+#      the dedupe scan in queue_needs_you (its own caller, ABOVE this
+#      function) already ran and returned early for a legitimate re-file of
+#      the same package+kind, so anything this function finds already sitting
+#      at its computed path is a GENUINE collision with a different
+#      escalation, never a dedupe hit. Retry with a bumped sequence; a
+#      persistent collision after a generous bounded retry REFUSES (returns
+#      undef) rather than ever renaming over an existing file.
+sub _unique_decision_path {
+    my ($dir, $rec) = @_;
+    for (1 .. 50) {
+        $DECISION_SEQ++;
+        # No separators between the three hex parts (t/06's own immutable
+        # oracle pins the filename shape to needs-you/<pkg>--[0-9a-f]+\.json --
+        # pure hex, no punctuation inside the sid). Nothing anywhere parses a
+        # boundary between the three parts; only the WHOLE string needs to be
+        # unique, which it now structurally is (see this function's header).
+        my $sid = sprintf('%x%x%x', ($rec->{created_at} // time), $$, $DECISION_SEQ);
+        my $file = "$dir/$rec->{package}--$sid.json";
+        return $file unless -e $file;
+    }
+    return undef;   # exhausted the retry budget -- refuse rather than ever overwrite
+}
+
 sub _queue_needs_you_write {
     my ($runs, $dir, $rec) = @_;
-    my $sid = substr(sprintf('%x%x', ($rec->{created_at} // time), $$), 0, 10);
-    my $file = "$dir/$rec->{package}--$sid.json";
+    my $file = _unique_decision_path($dir, $rec);
+    return _escalation_write_failed($runs, 'queue_needs_you',
+        "$dir/$rec->{package}--(exhausted)", 'could not allocate a unique decision id after 50 attempts')
+        unless defined $file;
     my $tmp = "$file.tmp.$$";
     open my $fh, '>', $tmp
         or return _escalation_write_failed($runs, 'queue_needs_you', $tmp, $!);
@@ -3070,6 +3137,116 @@ sub run {
                                 'harvest-spawn-failure', 'operational');
                             $status->{$pkg} = 'blocked';
                         }
+                    }
+                }
+            }
+
+            # ---- (d) ESCALATION-RESOLVE (e03-autonomous-resolution, DC4): a fourth
+            # judge kind, dispatched through the SAME generic judge-marker machinery
+            # as resolve/harvest/conformance above (mark_judge_inflight/
+            # clear_judge_inflight/clear_judge_verdict/judge_pid/judge_inflight/
+            # judge_verdict_path -- none of them hardcode a kind value, so
+            # 'escalation-resolve' is a new VALUE here, not new code, per e03 spec
+            # §2.5). At most one in flight per PACKAGE at a time -- the reused
+            # marker functions enforce that structurally, the same way they already
+            # cap resolve/harvest. This block only decides WHEN to dispatch/consume;
+            # the actual verdict interpretation, provenance archive, and mutation
+            # all live in bp-resolve.pl (e03's own write set), invoked here as a
+            # subprocess exactly like bp-judge.sh already is for the other three
+            # kinds -- never a bypass, the same reuse discipline as everywhere else
+            # in this file.
+            unless ($shutdown) {
+                require File::Path;
+                for my $pkg (sort keys %$meta) {
+                    my $started = judge_inflight($runs, 'escalation-resolve', $pkg);
+                    if (defined $started) {
+                        my $jp = judge_pid($runs, 'escalation-resolve', $pkg);
+                        next if defined($jp) && $pid_alive->($jp);
+                        my $v = $read_verdict->('escalation-resolve', $pkg);
+                        if (!defined $v) {
+                            # Wall-clock bound (DC4): the SAME $t->{judge_to}
+                            # mechanism already checked per-tick for resolve/
+                            # harvest/conformance (bp-orchestrator.pl:2495/:2626/
+                            # :3543 as of e03's spec).
+                            next unless $started && ($now - $started) > $t->{judge_to};
+                            # Timeout/crash: degrade-safe, no default action (e01
+                            # §9 / e03 §2.5) -- the queued record is left EXACTLY
+                            # as filed. Clear the marker so a later tick can retry.
+                            # Never tag, never archive, never act on a timeout.
+                            _log($log, 'judge_timeout', { kind => 'escalation-resolve', package => $pkg });
+                            clear_judge_inflight($runs, 'escalation-resolve', $pkg);
+                            unlink "$runs/escalation-resolve/$pkg.decision";
+                            next;
+                        }
+                        clear_judge_inflight($runs, 'escalation-resolve', $pkg);
+                        archive_judge_verdict($runs, 'escalation-resolve', $pkg, $now, $log);
+                        clear_judge_verdict($runs, 'escalation-resolve', $pkg);
+                        my $decf = "$runs/escalation-resolve/$pkg.decision";
+                        my $did  = _read_file($decf);
+                        unlink $decf;
+                        if (defined $did && length $did) {
+                            $did =~ s/\s+$//;
+                            my $vtmp = "$runs/escalation-resolve/$pkg.verdict.landed.json";
+                            if (open my $fh, '>', $vtmp) {
+                                print $fh JSON::PP->new->canonical->encode($v);
+                                close $fh;
+                                # Invoke bp-resolve.pl's own CLI, exactly the same
+                                # reuse pattern this file already applies to
+                                # bp-judge.sh -- e03's script performs the archive-
+                                # before-delete apply, this block never mutates a
+                                # decision record itself.
+                                my $rc = system($^X, "$DIR/bp-resolve.pl", $bp, '--apply-verdict', $vtmp,
+                                                 '--decision', $did, '--bp-dir', $bpdir);
+                                _log($log, 'escalation_resolve_apply_failed', { package => $pkg, decision => $did, rc => $rc })
+                                    if $rc != 0;
+                                unlink $vtmp;
+                            } else {
+                                _log($log, 'escalation_resolve_apply_failed', { package => $pkg, decision => $did, error => "$!" });
+                            }
+                        } else {
+                            _log($log, 'escalation_resolve_orphan_verdict', { package => $pkg,
+                                detail => 'verdict landed with no recorded decision id' });
+                        }
+                        next;
+                    }
+
+                    # No judge in flight -- is there an eligible decision queued for
+                    # this package? Oldest created_at first (§2.5: serialize, never
+                    # dispatch two for the same package concurrently -- the reused
+                    # marker functions enforce that structurally; this only decides
+                    # which queued decision a fresh dispatch names).
+                    my $dir = "$runs/needs-you";
+                    next unless -d $dir;
+                    opendir(my $dh, $dir) or next;
+                    my @cands;
+                    for my $f (readdir $dh) {
+                        next unless $f =~ /^\Q$pkg\E--.*\.json$/;
+                        my $rec = _read_json("$dir/$f");
+                        next unless ref $rec eq 'HASH';
+                        my $cat = $rec->{category} // '';
+                        next unless $cat eq 'unclassified' || $cat =~ /^(?:conformance|oracle|scoping|implementation)$/;
+                        (my $id = $f) =~ s/\.json$//i;
+                        push @cands, { id => $id, created_at => ($rec->{created_at} // 0) };
+                    }
+                    closedir $dh;
+                    next unless @cands;
+                    @cands = sort { $a->{created_at} <=> $b->{created_at} } @cands;
+                    my $pick = $cands[0];
+
+                    my $rc = $spawn_judge->({ kind => 'escalation-resolve', pkg => $pkg });
+                    if (defined $rc && $rc == 0 && mark_judge_inflight($runs, 'escalation-resolve', $pkg, $now)) {
+                        File::Path::make_path("$runs/escalation-resolve");
+                        my $decf = "$runs/escalation-resolve/$pkg.decision";
+                        my $dtmp = "$decf.tmp.$$";
+                        if (open my $fh, '>', $dtmp) {
+                            print $fh $pick->{id};
+                            close $fh;
+                            rename $dtmp, $decf;
+                        }
+                        _log($log, 'escalation_resolve_fire', { package => $pkg, decision => $pick->{id} });
+                    } else {
+                        _log($log, 'judge_spawn_failed', { kind => 'escalation-resolve', package => $pkg,
+                              rc => (defined $rc && $rc == 0) ? 'inflight_marker_failed' : $rc });
                     }
                 }
             }
