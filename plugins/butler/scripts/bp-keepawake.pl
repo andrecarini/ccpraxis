@@ -141,6 +141,28 @@ sub ps_available {
 sub spawn {
     my ($pid_f) = @_;
     return undef unless $^O =~ /^(MSWin32|msys|cygwin)$/;
+
+    # A TEST MUST NEVER SPAWN A REAL, IMMORTAL OS WAKE-LOCK.
+    #
+    # Measured 2026-08-14, on the operator's machine, mid-session: 67 live
+    # powershell.exe, 53 of them keep-awake.ps1 helpers whose -PidFile pointed
+    # into TEST fixture directories (bp/, bp2/, bp-orphan/, bp-done/ under a
+    # File::Temp root). bp-orchestrator.pl:2250 calls apply() with only a `log`
+    # seam -- no `spawn` seam -- so the REAL spawn runs, and t/06-orchestrator.t
+    # drives that path. Every run of the butler suite leaked several helpers that
+    # then slept forever. Running the suite repeatedly is what filled the machine.
+    #
+    # This is the same rule CLAUDE.md already states for launcher.pl ("never let
+    # a test spawn it unguarded"), one level over: the wake-lock helper is an OS
+    # process that outlives the test that made it.
+    #
+    # $0 is the script perl is running, and every test here is a .t run directly
+    # (there is no prove on this host). Tests that legitimately exercise spawning
+    # inject their own seam and never reach this sub, so nothing is lost -- and a
+    # test that DID reach the real spawn was, by definition, leaking.
+    return undef if $ENV{CCPRAXIS_NO_WAKELOCK};
+    return undef if defined $0 && $0 =~ /\.t\z/;
+
     my $ps1 = helper_path();
     unless (-f $ps1) { die "keep-awake helper missing: $ps1\n" }
     require POSIX;
@@ -150,9 +172,18 @@ sub spawn {
         open(STDIN,  '<', '/dev/null');
         open(STDOUT, '>', '/dev/null');
         open(STDERR, '>', '/dev/null');
+        # -LeaseSeconds: butler's callers (the orchestrator's per-tick apply(),
+        # and drive-solo's) REFRESH the pid file on every tick that finds a live
+        # lock, so this path is safe to lease -- and leasing it means an orphan
+        # from a crashed driver, a forced restart or a WSL VM kill self-expires
+        # within the lease instead of holding the display awake until reboot.
+        #
+        # The lease is opt-in precisely because launcher.pl's dashboard holder
+        # does NOT refresh; it passes no lease and keeps hold-until-killed.
         exec('powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass',
              '-WindowStyle', 'Hidden', '-File', winify($ps1),
-             '-PidFile', winify_out($pid_f))
+             '-PidFile', winify_out($pid_f),
+             '-LeaseSeconds', '900')
             or POSIX::_exit(127);
     }
     # The parent writes NOTHING. Writing perl's fork return value here is the
@@ -248,7 +279,23 @@ sub apply {
         # only moment its answer can change what we do.
         if (-e $pid_f) {
             my $pid = _read_pid($pid_f);
-            return if _pid_alive($pid);
+            if (_pid_alive($pid)) {
+                # REFRESH THE LEASE. The pid file is a heartbeat as well as an
+                # identity: keep-awake.ps1 polls its mtime and exits once it goes
+                # stale (-LeaseSeconds, default 900). Touching it here -- on the
+                # very tick that finds a live lock and leaves it alone -- is what
+                # says "a run still wants this".
+                #
+                # Without this the lease would be a bug, not a safety net: it
+                # would reap perfectly healthy locks mid-run. With it, the ONLY
+                # locks that expire are the ones nobody is refreshing, which is
+                # exactly the orphan case -- a driver that crashed, a forced
+                # restart, a WSL VM kill. Before the lease, such a lock held
+                # ES_DISPLAY_REQUIRED and kept the machine awake until reboot.
+                my $now = time;
+                utime($now, $now, $pid_f);
+                return;
+            }
         }
         return unless $ps_ok->();
         eval { $spawn->($pid_f) };

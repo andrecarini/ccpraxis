@@ -172,4 +172,36 @@ SKIP: {
     is($killed[0], '424242', 'A5: even when it is not a running process');
 }
 
+# ---------------------------------------------------------------------------
+# A6 -- a TEST must never spawn a real, immortal OS wake-lock.
+#
+# Measured on the operator machine 2026-08-14, mid-session: 67 live
+# powershell.exe, 53 of them keep-awake.ps1 helpers whose -PidFile pointed into
+# TEST fixture dirs (bp/, bp2/, bp-orphan/, bp-done/). bp-orchestrator.pl calls
+# apply() with only a `log` seam -- no `spawn` seam -- so the REAL spawn runs,
+# and t/06-orchestrator.t drives that path. Each butler-suite run leaked several
+# helpers that then slept forever; repeated runs filled the machine.
+#
+# Same rule CLAUDE.md already states for launcher.pl, one level over: a test may
+# not create an OS process that outlives it.
+# ---------------------------------------------------------------------------
+{
+    my $src = do {
+        open my $fh, q{<:raw}, qq{$S/bp-keepawake.pl} or die qq{read: $!};
+        local $/; <$fh>;
+    };
+    my ($body) = $src =~ /sub\s+spawn\s*\{(.*?)\n\}/s;
+    ok(defined $body, q{A6: spawn() is locatable});
+    like($body // q{}, qr/\$0\s*=~/,
+        q{A6: spawn() refuses when $0 is a .t -- a test cannot leak a real wake-lock});
+    like($body // q{}, qr/CCPRAXIS_NO_WAKELOCK/,
+        q{A6: and honours an explicit opt-out env var});
+
+    # Behavioural: we ARE a .t, so the real spawn must decline.
+    my $dir = tempdir(CLEANUP => 1);
+    my $rc = BpKeepAwake::spawn(qq{$dir/keepawake.pid});
+    ok(!defined $rc, q{A6: calling the REAL spawn from inside a test returns undef, spawning nothing});
+    ok(!-e qq{$dir/keepawake.pid}, q{A6: and writes no pid file});
+}
+
 done_testing();
