@@ -1,10 +1,13 @@
 #!/usr/bin/env perl
 # bp-blueprint.pl — the deterministic blueprint.md write/read API (b43-blueprint-write-api).
 #
-# Typed, surgical write ops (add-package, set-status, set-deps, add-decision,
-# set-decision, set-field, add-harvest, set-meta, set-section, init) plus five read ops
-# (show, deps, status, decisions, ready) over the
-# package-status table `bp-orchestrator.pl`'s BpOrch::parse_dag reads. See:
+# Typed, surgical write ops (add-package, set-deps, add-decision,
+# set-decision, set-field, add-harvest, set-meta, set-section, set-test-paths, init) plus
+# four read ops (show, deps, status, decisions) over the
+# package-status table `bp-orchestrator.pl`'s BpOrch::parse_dag reads. `set-status` is
+# retired (Decision 11/s03: the table has no `status` column any more) -- it still
+# dispatches, but only to refuse loudly; `set-field --field status` refuses the same way.
+# `ready` was a read op and no longer exists. See:
 # .ccpraxis-local-data/blueprints/sandbox-butler-overhaul/specs/b43-blueprint-write-api-spec.md
 #
 # WHY THIS EXISTS: every hand-splice of blueprint.md to date has been correct by luck,
@@ -330,6 +333,25 @@ sub col_index {
     my @cols = @{ $tbl->{cols} };
     for my $i (0 .. $#cols) { return $i if lc($cols[$i]) eq lc($name) }
     return undef;
+}
+
+# step-7 fix-batch HIGH: a column index computed from the HEADER only identifies the
+# right cell when the row has exactly as many cells as the header does. On a
+# partially-migrated table (Decision-13 coexistence -- a table this API is required to
+# tolerate, not just a hypothetical), a row can carry a stale leftover cell the header
+# no longer has. In that shape $col_idx still passes replace_cell's `$col_idx > $#cells`
+# bounds check, but lands in the WRONG cell -- the write silently succeeds (exit 0) while
+# the real value for that column sits untouched and invisible one cell over. Refusing a
+# row/header arity mismatch outright is the safe half; silently renumbering or dropping
+# the stale cell is a repair decision this op does not get to make on the caller's
+# behalf.
+sub row_cell_count {
+    my ($line) = @_;
+    my $inner = $line;
+    $inner =~ s/^\s*\|//;
+    $inner =~ s/\|\s*$//;
+    my @cells = split /\|/, $inner, -1;
+    return scalar @cells;
 }
 
 # Replace ONE cell of a `|`-delimited row by column index, preserving every other
@@ -798,6 +820,11 @@ sub op_set_deps {
         return (undef, "--deps names package id(s) that do not resolve: " . join(', ', @$bad)) if @$bad;
 
         my @lines = @{ $tbl->{lines} };
+        my $ncols = scalar @{ $tbl->{cols} };
+        my $nrow  = row_cell_count($lines[$ri]);
+        return (undef, "row for '$pkg' has $nrow cell(s) but the header has $ncols column(s); "
+              . 'refusing to write into a row of mismatched arity rather than guess which cell is depends_on')
+            if $nrow != $ncols;
         my $new_line = replace_cell($lines[$ri], $ci, deps_cell_text(@$canon));
         return (undef, "internal error replacing the depends_on cell for '$pkg'") unless defined $new_line;
         $lines[$ri] = $new_line;
@@ -1189,6 +1216,11 @@ sub op_set_field {
         return (undef, "no such package '$pkg' in the table") unless defined $ri;
 
         my @lines = @{ $tbl->{lines} };
+        my $ncols = scalar @{ $tbl->{cols} };
+        my $nrow  = row_cell_count($lines[$ri]);
+        return (undef, "row for '$pkg' has $nrow cell(s) but the header has $ncols column(s); "
+              . "refusing to write into a row of mismatched arity rather than guess which cell is '$field'")
+            if $nrow != $ncols;
         my $new_line = replace_cell($lines[$ri], $ci, $value);
         return (undef, "internal error replacing the '$field' cell for '$pkg'") unless defined $new_line;
         $lines[$ri] = $new_line;

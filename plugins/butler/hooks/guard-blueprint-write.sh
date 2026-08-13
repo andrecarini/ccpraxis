@@ -3,9 +3,11 @@
 #
 # Denies a direct Write/Edit/MultiEdit/NotebookEdit targeting any blueprint.md path,
 # forcing every mutation through bp-blueprint.pl's typed, validated, atomic write API
-# (add-package/set-status/set-deps/add-decision/set-field). Every hand-splice of
+# (add-package/set-deps/add-decision/set-field). Every hand-splice of
 # blueprint.md to date has been correct by luck, never by construction (b43 spec
 # preamble) — this hook is what makes "correct by construction" the only legal path.
+# `set-status` is retired (s03: the table has no `status` column any more) — do not
+# point remediation advice at a verb that only refuses.
 #
 # Deliberately UNLIKE ledger-guard.sh/guard-writes.sh: this hook does NOT call
 # bp_hook_gate and is NOT scoped to a coordinator session. A hand-edit to
@@ -62,7 +64,7 @@ ABS=$(realpath -m "$ABS" 2>/dev/null || printf '%s' "$ABS")
 
 case "$ABS" in
   */blueprint.md)
-    printf '%s\n' "BLUEPRINT-GUARD: BLOCKED — a direct $TOOL to $ABS is not permitted; blueprint.md must be mutated only through plugins/butler/scripts/bp-blueprint.pl (add-package, set-status, set-deps, add-decision, set-field), which validates and writes atomically under flock. Use bp-blueprint.pl via Bash instead, then retry." >&2
+    printf '%s\n' "BLUEPRINT-GUARD: BLOCKED — a direct $TOOL to $ABS is not permitted; blueprint.md must be mutated only through plugins/butler/scripts/bp-blueprint.pl (add-package, set-deps, add-decision, set-field), which validates and writes atomically under flock. Use bp-blueprint.pl via Bash instead, then retry." >&2
     exit 2
     ;;
   *) exit 0 ;;

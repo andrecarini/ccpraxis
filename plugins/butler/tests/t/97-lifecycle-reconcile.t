@@ -287,14 +287,11 @@ sub bp_status_of {
     like($md, qr/\|\s*01-a\s*\|[^\n]*pending/,
            'the stale table row can no longer be repaired (set-status is retired) -- it stays pending');
     # The two lists have DIFFERENT element types -- actions are hashrefs, errors
-    # are plain strings -- so each arm must be guarded by ref(). Written without
-    # the guard, `$_->{kind}` dies with "Can't use string as HASH ref" the moment
-    # the grep reaches the errors list, and the file aborts instead of asserting.
-    # The spec wrote this construct as "-shaped" (illustrative); it was
-    # implemented literally. Guarding is not a weakening: both arms still have to
-    # find the failed repair recorded somewhere.
-    ok((grep { (ref($_) eq 'HASH' && defined $_->{kind} && $_->{kind} eq 'errors')
-               || (!ref($_) && $_ =~ /could not set table status/) }
+    # are plain strings. bp-lifecycle.pl never pushes an action with
+    # `kind => 'errors'`, so a HASH-shaped arm testing for that can never match --
+    # dead weight that only masked an oracle able to falsify on a synthetic
+    # silent-success case. The string arm alone carries the whole assertion.
+    ok((grep { !ref($_) && $_ =~ /could not set table status/ }
               (@{ $data->[0]{actions} || [] }, @{ $data->[0]{errors} || [] })),
        'the failed repair attempt is recorded as an error, not silently dropped or reported as success');
     is(bp_status_of("$dir/blueprint.md"), 'done',
