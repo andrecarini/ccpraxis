@@ -259,7 +259,17 @@ sub last_updated_check {
 # =====================================================================================
 
 my @REQUIRED_KEYS = qw(package blueprint status write_set last_updated);
-my @STATUSES      = qw(pending running converging reviewing done blocked parked);
+# `dropped` added 2026-08-13, the THIRD home of the same defect (07d28a2 fixed
+# bp-blueprint.pl, 8cc98d8 fixed ledger-guard.sh and gate-stop.sh). This is the
+# sanctioned WRITER of package ledgers, so without it a coordinator that
+# legitimately dropped its package could not record that through the typed API
+# at all -- while bp-drive-next.pl and bp-orchestrator.pl both read the field and
+# call `dropped` terminal. Filed as 2026-08-06 batch2 #12.
+#
+# `converging` belongs here and NOT in bp-blueprint.pl's vocabulary: this is the
+# package ledger's mid-flight value, which the blueprint.md summary table has no
+# use for. Two vocabularies on purpose -- do not "unify" them.
+my @STATUSES      = qw(pending running converging reviewing done blocked parked dropped);
 
 sub validate_bytes {
     my ($B) = @_;

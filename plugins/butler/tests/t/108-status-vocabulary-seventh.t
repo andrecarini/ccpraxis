@@ -206,4 +206,74 @@ cmp_ok(scalar @gs_terminal, '>=', 2,
 unlike($gs, qr/^\s*done\|blocked\|parked\)\s*:/m,
     'A7: no gate-stop.sh terminal arm omits `dropped`');
 
+# ---------------------------------------------------------------------------
+# A8 -- bp-ledger.pl, the sanctioned WRITER of package ledgers.
+#
+# The third home of this same defect, found by the s01 architect after two
+# previous passes each believed the fix complete. Without `dropped` here, a
+# coordinator that legitimately dropped its package could not record it through
+# the typed API at all -- while bp-drive-next.pl and bp-orchestrator.pl read that
+# very field and call `dropped` terminal.
+#
+# Asserted END TO END rather than by grepping the source, because a source-shape
+# assertion is what let the earlier passes look complete: @STATUSES feeds two
+# separate call sites (validate and set-status) and only a real invocation proves
+# both accept it.
+# ---------------------------------------------------------------------------
+my $LEDGER_PL = "$BUTLER/scripts/bp-ledger.pl";
+ok(-f $LEDGER_PL, 'A8: bp-ledger.pl exists');
+
+my $ldir = tempdir(CLEANUP => 1);
+my $led  = "$ldir/p01-probe.md";
+open my $lfh, '>:raw', $led or die "cannot write ledger fixture: $!";
+# bp-ledger.pl validates STRUCTURE before it validates the status, so a fixture
+# missing any required heading fails for the wrong reason and would make this
+# assertion vacuous. The first draft of this fixture did exactly that -- it went
+# red for `converging`, a value that was already accepted, which is what exposed
+# the mistake.
+print {$lfh} <<'LED';
+---
+package: p01-probe
+blueprint: vocab-fixture
+status: pending
+write_set: plugins/nowhere/
+last_updated: 2026-08-13T00:00:00Z
+---
+
+# Package p01-probe
+
+## Pipeline
+
+- [ ] 1. Nothing
+
+## Decisions & attempt log
+
+- none
+
+## Next action
+
+Nothing.
+
+## Outputs
+
+none
+
+## Escalation (when status: blocked)
+
+none
+LED
+close $lfh;
+
+for my $word (qw(dropped converging done parked)) {
+    my $o = `perl "$LEDGER_PL" set-status --ledger "$led" --status $word 2>&1`;
+    my $r = $?;
+    is($r, 0, "A8: bp-ledger.pl set-status accepts `$word`")
+        or diag("output: $o");
+}
+
+my $bogus = `perl "$LEDGER_PL" set-status --ledger "$led" --status nonsense 2>&1`;
+isnt($?, 0, 'A8: bp-ledger.pl still refuses an unrecognised status');
+like($bogus, qr/\bdropped\b/,
+    'A8: and its refusal message lists `dropped` among the allowed values');
+
 done_testing();
