@@ -193,6 +193,11 @@ sub list_records {
 package main;
 use strict;
 use warnings;
+use File::Basename qw(dirname);
+use Cwd ();
+
+my $MAIN_DIR = dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; Cwd::abs_path($f) // $f });
+require "$MAIN_DIR/bp-write-guard.pl";   # fixbatch step7 / MEDIUM-3: BpWrite::guarded_write
 
 my $ID_RE = qr/^[A-Za-z0-9._-]+$/;
 
@@ -218,34 +223,124 @@ unless (caller) {
         else { usage_error("unknown option '$a'") }
     }
     my $root = $o{root};
-    my $now  = defined $o{now} ? ($o{now} + 0) : time;
+
+    # fixbatch step7 / MEDIUM-1: validated ONCE, uniformly, for every command
+    # that takes --id — not just `start`. The file's own header/comment
+    # claims `record_path` is only ever reached with an already-validated
+    # id; that was true for `start` and false for `elapsed`/`finish`, which
+    # is a path-traversal hole (demonstrated: --id ../../../outside/secret
+    # reads an arbitrary *.json file). Checked before ANY --id-derived path
+    # is touched, for any command.
+    usage_error("--id '$o{id}' has an invalid shape")
+        if defined $o{id} && $o{id} !~ $ID_RE;
+
+    # fixbatch step7 / MEDIUM-2: --now is a TEST-ONLY seam (see file header).
+    # Nothing previously distinguished a test invocation from a production
+    # one, so any caller — including a dispatched worker with Bash access
+    # that knows its own --id — could fabricate elapsed time and defeat the
+    # one guarantee this file exists to provide (elapsed time is the
+    # DRIVER's own clock, never a self-report). Gated behind an explicit env
+    # marker rather than removed outright: the pure library functions
+    # already take $now as a plain argument (never sleeping in real time is
+    # how every test in this family is built), so removing the CLI seam
+    # entirely would force every test to fake time some other way for no
+    # real security gain — a caller willing to set an env var to fabricate
+    # its own clock could just as easily edit history.jsonl directly. The
+    # marker's value is that a production call which includes --now BY
+    # MISTAKE OR MALICE is rejected instead of silently honored.
+    my $now;
+    if (defined $o{now}) {
+        if (($ENV{CCPRAXIS_DISPATCH_LOG_TEST_NOW} // '') eq '1') {
+            $now = $o{now} + 0;
+        } else {
+            usage_error("--now is a test-only seam gated behind "
+                       . "CCPRAXIS_DISPATCH_LOG_TEST_NOW=1 — a production caller must never "
+                       . "fabricate the driver's own clock");
+        }
+    } else {
+        $now = time;
+    }
 
     if ($cmd eq 'start') {
         usage_error('--id is required') unless defined $o{id};
-        usage_error("--id '$o{id}' has an invalid shape") unless $o{id} =~ $ID_RE;
         usage_error('--worker-type is required') unless defined $o{worker_type};
 
-        my $budget = defined $o{budget_seconds} ? ($o{budget_seconds} + 0) : 1800;
-
-        my $existing = BpDispatchLog::read_record($root, $o{id});
-        if ($existing && defined $existing->{status} && $existing->{status} eq 'running') {
-            print STDERR "bp-dispatch-log: refused: a running record already exists for --id "
-                        . "'$o{id}' (started_at=$existing->{started_at}) — finish it before "
-                        . "starting a fresh one under the same id\n";
-            exit 3;
+        # fixbatch step7 / NIT (elevated to required): a bare `+0` coercion
+        # silently turns a non-numeric --budget-seconds into 0, and 0 is not
+        # "unlimited" here — every dispatch would read as immediately over
+        # budget. This is the identical shape as r01's BP_MIN_RELAUNCH_SECS
+        # defect, which a real field incident (7 relaunches in 48s against a
+        # cap of 2) traced back to exactly this kind of unvalidated
+        # coercion. Require a positive integer; anything else falls back to
+        # the documented default and WARNS naming the rejected value, rather
+        # than silently becoming a budget of zero.
+        my $budget;
+        if (defined $o{budget_seconds}) {
+            if ($o{budget_seconds} =~ /^\d+$/ && $o{budget_seconds} > 0) {
+                $budget = $o{budget_seconds} + 0;
+            } else {
+                print STDERR "bp-dispatch-log: warning: --budget-seconds '$o{budget_seconds}' "
+                           . "is not a positive integer; falling back to the default (1800)\n";
+                $budget = 1800;
+            }
+        } else {
+            $budget = 1800;
         }
 
-        my $rec = {
-            id             => $o{id},
-            worker_type    => $o{worker_type},
-            started_at     => $now,
-            budget_seconds => $budget,
-            status         => 'running',
-            note           => $o{note},
-        };
-        BpDispatchLog::write_record($root, $rec)
-            or do { print STDERR "bp-dispatch-log: could not write record for '$o{id}'\n"; exit 4 };
-        print "started $o{id} (worker_type=$o{worker_type} budget_seconds=$budget)\n";
+        # fixbatch step7 / MEDIUM-3: routed through BpWrite::guarded_write
+        # (the a01-write-integrity-reread-under-lock primitive) rather than
+        # a bare check-then-write. Two racing `start` calls on the same
+        # fresh --id could previously both pass the "already running" check
+        # (neither sees the other's not-yet-written record) and both
+        # proceed to write — the later rename() wins silently, with no
+        # error surfaced to either caller. Unlike bp-watch.pl's accepted
+        # "no lock, duplicate is wasted cost" stance, this race can RESET a
+        # live dispatch's own clock (masking over_budget for a genuinely
+        # stalled worker), which is the a01 pattern this primitive exists
+        # for — reused here, not reinvented.
+        BpDispatchLog::_mkdir_p(BpDispatchLog::log_dir($root))
+            or do { print STDERR "bp-dispatch-log: could not create the log directory\n"; exit 4 };
+        my $rec_path = BpDispatchLog::record_path($root, $o{id});
+        my $id       = $o{id};
+        my $wt       = $o{worker_type};
+        my $note     = $o{note};
+        my $result = BpWrite::guarded_write({
+            site  => 'bp-dispatch-log.start',
+            path  => $rec_path,
+            valid => sub {
+                my ($raw) = @_;
+                return undef unless defined $raw && length $raw;
+                my $existing = eval { JSON::PP->new->decode($raw) };
+                if (ref $existing eq 'HASH' && defined $existing->{status}
+                    && $existing->{status} eq 'running') {
+                    return "a running record already exists for --id '$id' "
+                         . "(started_at=$existing->{started_at}) — finish it before starting "
+                         . "a fresh one under the same id";
+                }
+                return undef;
+            },
+            mutate => sub {
+                my $rec = {
+                    id             => $id,
+                    worker_type    => $wt,
+                    started_at     => $now,
+                    budget_seconds => $budget,
+                    status         => 'running',
+                    note           => $note,
+                };
+                return JSON::PP->new->canonical->encode($rec);
+            },
+        });
+        unless ($result->{ok}) {
+            if (($result->{outcome} // '') eq 'refused') {
+                print STDERR "bp-dispatch-log: refused: $result->{reason}\n";
+                exit 3;
+            }
+            print STDERR "bp-dispatch-log: could not write record for '$id': "
+                       . ($result->{reason} // 'unknown error') . "\n";
+            exit 4;
+        }
+        print "started $id (worker_type=$wt budget_seconds=$budget)\n";
         exit 0;
     }
     elsif ($cmd eq 'elapsed') {

@@ -69,6 +69,69 @@ sub pid_alive {
     return ($out =~ /\b\Q$pid\E\b/) ? 1 : 0;
 }
 
+# pid_fingerprint($pid) -> string | undef  (fixbatch step7 / HIGH-2)
+#
+# WHY THIS EXISTS. pid_alive() answers "does SOME process exist at this
+# number right now" -- it has no memory of WHICH process was alive when the
+# pause was granted. Once the real watcher exits (its whole purpose --
+# bp-watch.pl "exits and is gone by design"), the OS is free to hand that
+# same number to literally anything, and a bare pid_alive() check cannot
+# tell the difference. The red-team demonstrated this concretely: an
+# unrelated `sleep &` occupying the recorded watcher_pid made `status`
+# report a verified pause with nothing actually watching.
+#
+# This returns a value that identifies THIS SPECIFIC PROCESS INSTANCE, not
+# merely "some process at this number" -- it changes when the OS recycles a
+# pid to a different process, because it is derived from data the OS
+# assigns once, at that process's own creation, and never touches again.
+#
+# TWO PROCESS DOMAINS, NEITHER TOOL SEES BOTH (same split pid_alive already
+# lives with): an MSYS/cygwin-spawned process (what every perl process in
+# this whole family is, including every test's own $$) exposes a virtual
+# /proc/$pid/stat -- readable cross-process, even from a bp-runstate.pl
+# child querying a DIFFERENT, still-live perl process -- whose 20th
+# whitespace-separated field after the ")" is the kernel's own start-time
+# counter for that specific process instance. A genuinely native Windows
+# process (invisible to /proc) is fingerprinted instead via `wmic ... get
+# CreationDate`, which native tooling CAN see.
+#
+# undef means "could not be determined" and callers MUST treat that as
+# UNVERIFIED -- never as a match. An unfingerprintable pid must fail toward
+# NOT-paused, the same direction pid_alive itself already fails when it
+# cannot signal a process it did not create.
+sub pid_fingerprint {
+    my ($pid) = @_;
+    return undef unless defined $pid && $pid =~ /^\d+$/ && $pid > 0;
+
+    if (open my $fh, '<', "/proc/$pid/stat") {
+        local $/;
+        my $raw = <$fh>;
+        close $fh;
+        if (defined $raw && $raw =~ /\)\s*(.*)$/s) {
+            my @f = split ' ', $1;
+            return "proc:$f[19]" if defined $f[19] && $f[19] =~ /^\d+$/;
+        }
+        return undef;
+    }
+
+    if ($^O =~ /^(MSWin32|msys|cygwin)$/) {
+        my $out = do {
+            local $ENV{MSYS2_ARG_CONV_EXCL} = '*';
+            `wmic process where "ProcessId=$pid" get CreationDate 2>/dev/null`;
+        };
+        return undef unless defined $out;
+        $out =~ s/\x00//g;   # wmic's console output is UTF-16LE seen through the pipe
+        return "wmic:$1" if $out =~ /(\d{14}\.\d+[+-]\d+)/;
+        return undef;
+    }
+
+    # macOS/BSD fallback: no /proc, not Windows.
+    my $out = `ps -o lstart= -p $pid 2>/dev/null`;
+    return undef unless defined $out && length $out;
+    $out =~ s/^\s+|\s+$//g;
+    return length($out) ? "ps:$out" : undef;
+}
+
 sub _read {
     my ($root) = @_;
     my $p = state_path($root);
@@ -122,6 +185,18 @@ sub effective {
     return ($st, $rec) unless $st eq 'paused';
 
     my $ok = pid_alive($rec->{watcher_pid});
+    if ($ok) {
+        # fixbatch step7 / HIGH-2: a live pid at the recorded number is
+        # NECESSARY but not SUFFICIENT -- it must still be the SAME process
+        # `pause` verified, not one the OS handed the number to afterward.
+        # `pause` always stores the fingerprint it captured at grant time;
+        # its absence (or a live-recompute that cannot be determined, or one
+        # that no longer matches) is UNVERIFIABLE, and an unverifiable
+        # identity must resolve to NOT-paused -- never to paused.
+        my $want = $rec->{watcher_fingerprint};
+        my $have = pid_fingerprint($rec->{watcher_pid});
+        $ok = (defined $want && defined $have && $want eq $have) ? 1 : 0;
+    }
     $ok = 0 if $ok && defined $rec->{until} && $rec->{until} =~ /^\d+$/ && $rec->{until} <= time;
     return ('active', { %$rec, stale_pause => 1 }) unless $ok;
     return ('paused', $rec);
@@ -144,13 +219,23 @@ sub pause {
         unless defined $pid && $pid =~ /^\d+$/;
     return (0, "watcher pid $pid is not running — a dead watcher cannot resume anything")
         unless pid_alive($pid);
+    # fixbatch step7 / HIGH-2: captured NOW, while we know this pid really is
+    # the live watcher that just asked for the pause. If this process cannot
+    # be fingerprinted, we could never re-verify it later either -- refusing
+    # here (rather than granting an unverifiable pause) is the same
+    # safe-direction discipline effective() applies on the read side.
+    my $fp = pid_fingerprint($pid);
+    return (0, "could not verify the identity of watcher pid $pid — a bare pid is not enough to "
+             . "hold a pause open against; refusing rather than trusting it blindly")
+        unless defined $fp;
     my $until = $o{until};
     return (0, 'a pause needs --until (epoch seconds): an unbounded pause never resumes')
         unless defined $until && $until =~ /^\d+$/;
     return (0, "--until $until is in the past")
         unless $until > time;
     _write($root, { state => 'paused', reason => ($o{reason} // 'waiting on a watcher'),
-                    watcher_pid => $pid + 0, until => $until + 0, updated_at => time })
+                    watcher_pid => $pid + 0, watcher_fingerprint => $fp,
+                    until => $until + 0, updated_at => time })
         or return (0, 'could not write the run state');
     return (1, "paused until $until, watched by pid $pid");
 }

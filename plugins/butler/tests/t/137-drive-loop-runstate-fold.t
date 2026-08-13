@@ -49,8 +49,9 @@ use File::Temp qw(tempdir);
 use File::Path qw(make_path);
 use File::Basename qw(dirname);
 
-my $HOOKS = "$Bin/../../hooks";
-my $GATE  = "$HOOKS/gate-drive-loop.sh";
+my $HOOKS   = "$Bin/../../hooks";
+my $GATE    = "$HOOKS/gate-drive-loop.sh";
+my $RUNSTATE = "$Bin/../../scripts/bp-runstate.pl";
 
 ok(-f $GATE, 'A0: gate-drive-loop.sh exists (sanity — this file assumes it, per spec §2.1: '
            . 'the fold is additive to an EXISTING file, never a new one)');
@@ -145,16 +146,68 @@ sub write_runstate {
 # already consumed, director says in-flight, bp-runstate says paused with a
 # live watcher and a future deadline. Today (pre-fold) this BLOCKS (rc==2,
 # identical to I1) — that is the RED this file exists to turn GREEN.
+#
+# fixbatch step7 / HIGH-2: the record is now established through the REAL
+# `pause` verb rather than hand-written JSON. bp-runstate.pl's identity fix
+# (a fingerprint captured at pause time and re-verified on every read, see
+# bp-runstate.pl::pid_fingerprint) means a bare `{state, watcher_pid,
+# until}` triple with no fingerprint is no longer sufficient to verify a
+# pause — by design, that is exactly the shape the HIGH-2 exploit crafted by
+# hand. Going through the real CLI is what a genuine watcher does, and is
+# the only way to produce a record this fold will now actually honor.
+# ===========================================================================
+{
+    my ($root) = project_with_package(status => 'running');
+    my $until = time() + 300;
+    my $rc_pause = system(qq{perl "$RUNSTATE" pause --watcher-pid $$ --until $until }
+                         . qq{--root "$root" >/dev/null 2>&1});
+    is($rc_pause, 0, 'I2 setup: a real `pause --watcher-pid $$` call succeeds against this '
+                    . 'test process\'s own live pid');
+    my ($rc, $out) = run_hook($GATE, payload_stop($root), verdict_ok => 1);
+    is($rc, 0, 'I2 CANONICAL (behavior 10 / AC9 acceptance case): in-flight + a VERIFIED live '
+             . 'pause (live pid, future deadline, genuine fingerprint) ALLOWS the stop — same '
+             . 'director answer as I1, only the runstate differs. This is the exact turn shape '
+             . 'that has blocked this driver session repeatedly; it must stop blocking once the '
+             . 'fold lands.');
+}
+
+# ===========================================================================
+# I8 (fixbatch step7 / HIGH-2 regression) — the red-team's literal
+# reproduction: a run-state.json hand-crafted with a LIVE, but completely
+# UNRELATED, process's pid (this test's own $$ stands in for "some live
+# process the attacker does not control the meaning of") and no fingerprint
+# at all. Before the HIGH-2 fix this ALLOWED the stop with nothing actually
+# watching — the worst outcome this package can produce. It must now BLOCK:
+# a bare pid, alive or not, is no longer sufficient without the identity
+# bp-runstate.pl::pause alone can attach.
 # ===========================================================================
 {
     my ($root) = project_with_package(status => 'running');
     my $until = time() + 300;
     write_runstate($root, qq({"state":"paused","watcher_pid":$$,"until":$until}));
     my ($rc, $out) = run_hook($GATE, payload_stop($root), verdict_ok => 1);
-    is($rc, 0, 'I2 CANONICAL (behavior 10 / AC9 acceptance case): in-flight + a VERIFIED live '
-             . 'pause (live pid, future deadline) ALLOWS the stop — same director answer as '
-             . 'I1, only the runstate differs. This is the exact turn shape that has blocked '
-             . 'this driver session repeatedly; it must stop blocking once the fold lands.');
+    is($rc, 2, 'I8 (HIGH-2 regression): a hand-crafted "paused" record with a live pid but NO '
+             . 'watcher_fingerprint — the exact shape an attacker (or a recycled pid) produces '
+             . '— still BLOCKS. Liveness alone is no longer proof of identity.');
+}
+
+# ===========================================================================
+# I9 (fixbatch step7 / HIGH-2 regression) — a record with a live pid AND a
+# fingerprint field, but one that does not match what pid_fingerprint($$)
+# actually computes right now (a forged/stale value). Must BLOCK exactly
+# like I8 — the fingerprint is re-verified on every read, not merely
+# required to be present.
+# ===========================================================================
+{
+    my ($root) = project_with_package(status => 'running');
+    my $until = time() + 300;
+    write_runstate($root, qq({"state":"paused","watcher_pid":$$,)
+                           . qq("watcher_fingerprint":"forged:not-a-real-value",)
+                           . qq("until":$until}));
+    my ($rc, $out) = run_hook($GATE, payload_stop($root), verdict_ok => 1);
+    is($rc, 2, 'I9 (HIGH-2 regression): a live pid with a FORGED/mismatched watcher_fingerprint '
+             . 'still BLOCKS — the fingerprint is re-verified against the live process, not '
+             . 'just checked for presence.');
 }
 
 # ===========================================================================

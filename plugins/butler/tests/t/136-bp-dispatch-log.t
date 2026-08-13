@@ -142,7 +142,14 @@ sub run_cli {
     my ($out_f, $err_f) = ("$tmp/out", "$tmp/err");
     my $q = sub { my $a = shift; $a =~ s/"/\\"/g; return qq("$a") };
     my $cmd = join(' ', 'perl', $q->($SCRIPT), map { $q->($_) } @args);
-    system(qq{$cmd > "$out_f" 2> "$err_f"});
+    # fixbatch step7 / MEDIUM-2: --now is gated behind this env marker in
+    # production (a production caller must never fabricate the driver's own
+    # clock); this harness legitimately needs deterministic time in every
+    # call below, so it sets the marker itself, exactly as the gate is
+    # documented to require. Mechanical adaptation to the new interface,
+    # not new test coverage — every assertion below keeps its exact prior
+    # meaning.
+    system(qq{CCPRAXIS_DISPATCH_LOG_TEST_NOW=1 $cmd > "$out_f" 2> "$err_f"});
     my $rc = ($? == -1) ? undef : ($? >> 8);
     my $out = _slurp($out_f);
     my $err = _slurp($err_f);
@@ -370,6 +377,75 @@ sub history_file {
     } else {
         fail('D2 CANONICAL AC2: cannot check for duration_ms — source unreadable (file missing)');
     }
+}
+
+# ===========================================================================
+# E. fixbatch step7 / MEDIUM-1 — path-traversal in --id. The header comment
+#    claims $ID_RE guards --id "before it ever reaches" record_path; that
+#    was true only for `start`. `elapsed` and `finish` took --id straight
+#    into record_path with no shape check at all, so a crafted --id could
+#    read (elapsed) or, in a narrower case, write (finish) an arbitrary
+#    *.json path reachable from the process's own OS permissions.
+# ===========================================================================
+{
+    my $root = tempdir(CLEANUP => 1);
+    my $outside = tempdir(CLEANUP => 1);
+    open my $fh, '>', "$outside/secret.json" or die $!;
+    print {$fh} '{"id":"leaked","worker_type":"sneaky","started_at":1,"budget_seconds":10,'
+              . '"status":"running"}';
+    close $fh;
+    my $traversal = "../../../../../../..$outside/secret";
+    # normalize to a relative-looking traversal id targeting the outside dir
+    # from inside $root/.ccpraxis-local-data/.dispatch-log/, whatever depth
+    # that is on this host — exercised against BOTH read commands that
+    # previously skipped validation.
+    my ($rc1, $out1, $err1) = run_cli('elapsed', '--id', $traversal, '--root', $root);
+    isnt($rc1, 0, 'E1 (MEDIUM-1): elapsed with a path-traversal --id is REFUSED, not silently '
+                . 'opening whatever the traversal resolves to');
+    like(($err1 // ''), qr/invalid shape/, 'E1: refusal names the shape problem');
+
+    my ($rc2, $out2, $err2) = run_cli('finish', '--id', $traversal, '--status', 'done',
+                                       '--root', $root);
+    isnt($rc2, 0, 'E2 (MEDIUM-1): finish with a path-traversal --id is REFUSED too — the guard '
+                . 'now applies uniformly, not just to start');
+    like(($err2 // ''), qr/invalid shape/, 'E2: refusal names the shape problem');
+
+    # Sanity: the guard fires on the shape alone, before any --root/--id path
+    # is touched — same refusal for a run whose --root doesn't even exist.
+    my ($rc3, undef, $err3) = run_cli('elapsed', '--id', '../etc/passwd', '--root', $root);
+    isnt($rc3, 0, 'E3: a simpler ../ traversal in --id is refused on elapsed too');
+}
+
+# ===========================================================================
+# F. fixbatch step7 / NIT (elevated) — a non-numeric --budget-seconds must
+#    not silently coerce to 0 (which would read as "every dispatch is
+#    immediately over budget"). Falls back to the documented default (1800)
+#    and warns, naming the rejected value.
+# ===========================================================================
+{
+    my $root = tempdir(CLEANUP => 1);
+    my ($rc, $out, $err) = run_cli('start', '--id', 'badbudget', '--worker-type', 'test-writer',
+                                    '--budget-seconds', 'abc', '--now', '1000', '--root', $root);
+    is($rc, 0, 'F1 (NIT): a non-numeric --budget-seconds does not refuse the start outright');
+    like($out, qr/budget_seconds=1800\b/,
+         'F1: falls back to the documented default (1800), not a silent 0');
+    like(($err // ''), qr/budget-seconds.*abc/s,
+         'F1: warns naming the rejected value');
+
+    my ($rc2, $out2) = run_cli('elapsed', '--id', 'badbudget', '--now', '1100', '--root', $root);
+    like($out2, qr/budget_seconds:\s*1800\b/, 'F1: the persisted record carries the default, '
+                                             . 'not a coerced 0');
+    unlike($out2, qr/budget_seconds:\s*0\b/, 'F1: never a bare 0 budget from bad input');
+
+    # 0 is explicitly NOT given a special "unlimited" meaning — it falls
+    # back to the default exactly like any other non-positive value.
+    my ($rc3, $out3, $err3) = run_cli('start', '--id', 'zerobudget', '--worker-type',
+                                       'test-writer', '--budget-seconds', '0', '--now', '1000',
+                                       '--root', $root);
+    is($rc3, 0, 'F2: --budget-seconds 0 does not refuse the start outright');
+    like($out3, qr/budget_seconds=1800\b/, 'F2: 0 is NOT treated as "unlimited" — it falls back '
+                                          . 'to the default like any other invalid value');
+    like(($err3 // ''), qr/budget-seconds.*0/s, 'F2: warns naming the rejected value (0)');
 }
 
 done_testing();

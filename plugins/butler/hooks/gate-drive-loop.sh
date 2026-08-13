@@ -214,20 +214,58 @@ esac
 # fixture has no .subagent-guard/run-state.json at all, so bp-runstate.pl
 # status returns "inert", never "paused" — the case arm below matches
 # nothing and execution falls through to the unchanged BLOCK.
+#
+# fixbatch step7 / HIGH-1: BOUNDED, the same way the director call four
+# lines above this comment block is bounded, and for the identical reason —
+# `bp-runstate.pl status` does a plain blocking open()/read() with no
+# timeout of its own, and this file has already been bitten once by "this
+# I/O is normally fast" turning into an unbounded hang (see the comment
+# above the director call). A FIFO in place of run-state.json reproduced a
+# genuine indefinite hang here; a timeout expiry falls through to BLOCK,
+# the same safe direction every other failure path in this fold already
+# takes.
+#
+# fixbatch step7 / driver recommendation: PARSED, not substring-matched.
+# JSON::PP escapes embedded quotes, so a crafted --reason containing the
+# literal text `"state":"paused"` does NOT defeat a bash `case` substring
+# match today — verified empirically — but that safety is INCIDENTAL to the
+# encoder's escaping, and no oracle pins it. Decoding the JSON and testing
+# the parsed `state` field removes the dependency on that incidental
+# behaviour entirely, at the cost of one more perl invocation we are
+# already paying for (perl is already required to reach this branch).
 RS="$HOOK_DIR/../scripts/bp-runstate.pl"
 if [ -r "$RS" ] && command -v perl >/dev/null 2>&1; then
-  RST=$(perl "$RS" status --root "$RUN_DIR" 2>/dev/null) || RST=""
-  case "$RST" in
-    *'"state":"paused"'*)
-      # A live watcher is CONFIRMED. Allow the stop; do not fall through
-      # to BLOCK. Any failure of the status call itself (perl missing,
-      # unreadable file, malformed JSON) leaves RST empty/unparseable, so
-      # the case matches nothing and falls through to BLOCK — the safe
-      # direction: an error in this check must never silently grant an
-      # escape it did not earn.
-      rm -f "$DS/.stop-blocks" 2>/dev/null
-      exit 0 ;;
-  esac
+  if command -v timeout >/dev/null 2>&1; then
+    RST=$(timeout 10 perl "$RS" status --root "$RUN_DIR" 2>/dev/null) || RST=""
+  elif command -v gtimeout >/dev/null 2>&1; then
+    RST=$(gtimeout 10 perl "$RS" status --root "$RUN_DIR" 2>/dev/null) || RST=""
+  else
+    RST=$(perl -e '
+        my $pid = fork();
+        exit 127 unless defined $pid;
+        if ($pid == 0) { exec @ARGV; exit 127 }
+        $SIG{ALRM} = sub { kill 9, $pid };
+        alarm 10;
+        waitpid($pid, 0);
+        my $rc = $?;
+        alarm 0;
+        exit($rc == 0 ? 0 : 124);
+      ' perl "$RS" status --root "$RUN_DIR" 2>/dev/null) || RST=""
+  fi
+  RSTATE=$(printf '%s' "$RST" | perl -MJSON::PP -0777 -ne '
+      my $j = eval { JSON::PP->new->decode($_) };
+      print(($j && ref($j) eq "HASH" && defined $j->{state}) ? $j->{state} : "");
+    ' 2>/dev/null || true)
+  if [ "$RSTATE" = "paused" ]; then
+    # A live watcher is CONFIRMED. Allow the stop; do not fall through to
+    # BLOCK. Any failure of the status call itself (perl missing, unreadable
+    # file, malformed JSON, a timeout) leaves RST/RSTATE empty, so this
+    # branch is not taken and execution falls through to BLOCK — the safe
+    # direction: an error in this check must never silently grant an escape
+    # it did not earn.
+    rm -f "$DS/.stop-blocks" 2>/dev/null
+    exit 0
+  fi
 fi
 
 # --- still actionable, and nothing will wake us: BLOCK ----------------------
