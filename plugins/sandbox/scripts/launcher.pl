@@ -1935,7 +1935,99 @@ sub launcher_hash {
 # Image build
 # =====================================================================
 
+# _fail_visibly(@lines) -- leave the TUI FIRST, then print, then hold.
+#
+# THE SECOND BUG, and it is independent of whatever went wrong underneath
+# (operator, 2026-08-14): "the launcher dropping out when something goes wrong
+# and me being unable to see the error."
+#
+# Every failure path printed its message and THEN tore the terminal down. While
+# the TUI is up the alternate screen buffer is active, and leaving it restores
+# the pre-TUI screen -- which erases everything printed into it. So the error was
+# genuinely emitted, briefly rendered, and then wiped by the teardown. From the
+# operator's side that is a flash and a bare prompt, i.e. indistinguishable from
+# printing nothing at all.
+#
+# Order is the whole fix: leave the alt screen, drain the captured STDERR, and
+# only then print. The hold at the end is what makes it un-missable -- an error
+# that scrolls past on the way back to the shell has not really been shown.
+sub _fail_visibly {
+    my (@lines) = @_;
+    # 1. Out of the alt buffer, so nothing we print can be erased by the restore.
+    eval { tui::LaunchScreens::host_leave($LAUNCH_HOST) if $LAUNCH_HOST };
+    $LAUNCH_HOST = undef;
+    # 2. Anything the TUI captured belongs on screen too, above our own message.
+    eval { _stderr_capture_drain() };
+    eval { reset_terminal() };
+    # 3. Now print, to a terminal that will keep it.
+    eval { print STDERR "\n" };
+    eval { print STDERR "$_\n" for grep { defined } @lines };
+    # 4. Hold, so it cannot flash past on the way back to the shell. Only when a
+    #    human is actually there -- never in a pipe, a hook, or the sampler.
+    if (-t STDIN && -t STDOUT && !$ENV{CCPRAXIS_NO_PAUSE}) {
+        eval {
+            print STDERR "\nPress Enter to return to the shell...";
+            my $ignored = <STDIN>;
+        };
+    }
+    eval { print STDERR "\n" };
+}
+
+# _ensure_machine_ready() -> 1 ok / 0 could not
+#
+# THE STAGE THAT ACTUALLY FAILS FIRST. s03_run_launch_gate gained a machine-start
+# step on 2026-08-14, but that gate runs LATE -- the image build happens well
+# before it, and on a cold host the build is what dies:
+#
+#   image_build_failed exit 125
+#   unable to connect to Podman socket: failed to connect: dial tcp
+#   127.0.0.1:62310: connectex: No connection could be made
+#
+# Measured from the operator's own launch transcript (gsa-superapp,
+# 2026-08-13T13:45:25Z) after the gate fix had already shipped and did nothing
+# for them, because nothing reached the gate. Fixing the late stage while the
+# early one still aborts is how a fix looks applied and changes nothing.
+#
+# Idempotent and cheap on the happy path: one `podman machine list` probe, and
+# for docker / Linux-native podman it is a no-op ('n/a').
+sub _ensure_machine_ready {
+    my $state = eval { _machine_state() } // 'unknown';
+    return 1 if $state eq 'n/a' || $state eq 'running';
+
+    # 'unknown' degrades toward TRYING rather than aborting: _machine_state
+    # answers 'unknown' for an unparseable probe, and refusing to launch on an
+    # unrecognised schema would be worse than attempting a start that reports
+    # "already running or starting" and costs a second.
+    _emit_step(_c_step("Podman machine is not running ($state) -- starting it (this can take a minute)..."), "\n");
+    log_ev('machine_autostart_begin', { state => $state });
+    my $r = eval { _machine_start_bounded() } // { ok => 0, detail => "probe failed: $@" };
+    log_ev('machine_autostart_end', { ok => ($r->{ok} ? 1 : 0), detail => ($r->{detail} // '') });
+
+    if ($r->{ok}) {
+        _emit_step(_c_step("Podman machine ready (" . ($r->{detail} // 'started') . ")."), "\n");
+        return 1;
+    }
+    _fail_visibly(
+        "ERROR: the podman machine is not running and could not be started.",
+        "  reason: " . ($r->{detail} // 'unknown error'),
+        "",
+        "  Try, in a terminal:   podman machine start",
+        "  Then run claude-sandbox again.",
+    );
+    return 0;
+}
+
 sub build_image {
+    # Before the build, not after it fails: a cold machine makes `podman build`
+    # exit 125 with a socket error that reads like a broken install.
+    unless (_ensure_machine_ready()) {
+        log_ev('image_build_failed', { exit => 125, reason => 'podman machine unavailable' });
+        _launch_fail('image', 'podman machine unavailable', 125);
+        LaunchLog::close_log($LAUNCH_LOG);
+        SandboxLock::release($LOCK_DIR);
+        reset_terminal();
+        exit 1;
+    }
     _emit_step(_c_step("Building claude-sandbox image with Claude Code v${HOST_VERSION}..."), "\n");
     log_ev('image_build_start', { version => $HOST_VERSION });
     _tx("\n--- image build (v${HOST_VERSION}) ---\n");
@@ -1946,11 +2038,19 @@ sub build_image {
         $CONTAINER_CONFIG);
     if ($rc != 0) {
         log_ev('image_build_failed', { exit => $rc >> 8 });
-        _emit_err(_c_err("ERROR:"), " podman build failed (exit @{[$rc >> 8]}).\n");
         _launch_fail('image', 'podman build failed', $rc >> 8);
+        # _fail_visibly BEFORE closing the log: it drains the TUI's captured
+        # STDERR onto the screen, and podman's own explanation of the failure
+        # (socket refused, disk full, bad Containerfile) lives in that capture.
+        # Printing "build failed (exit N)" alone is what sent the operator to the
+        # transcript file to find out why.
+        _fail_visibly(
+            "ERROR: podman build failed (exit @{[$rc >> 8]}).",
+            "  The output above is podman's own explanation.",
+            "  Full transcript: $CLAUDE_DATA/sandbox-logs/launch-$LAUNCH_ID.transcript.log",
+        );
         LaunchLog::close_log($LAUNCH_LOG);
         SandboxLock::release($LOCK_DIR);
-        reset_terminal();
         exit 1;
     }
     log_ev('image_build_ok', { version => $HOST_VERSION });

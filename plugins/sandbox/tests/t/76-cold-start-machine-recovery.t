@@ -181,4 +181,70 @@ for my $ctx ('END', '$SIG{INT}', '$SIG{TERM}') {
 unlike($src, qr/open\(STDERR, '>&', \$STDERR_CAPTURE_SAVED\) if \$STDERR_CAPTURE_SAVED;/,
     'A4: no bare restore-without-drain survives anywhere');
 
+# ---------------------------------------------------------------------------
+# A5 -- the machine is checked BEFORE the image build, not only in the gate.
+#
+# The gate fix (A1-A3) shipped first and did nothing for the operator, because
+# on a cold host `podman build` dies long before the gate is reached:
+#
+#   image_build_failed exit 125
+#   unable to connect to Podman socket ... connectex: No connection could be made
+#
+# Measured from their own launch transcript. Fixing a late stage while an earlier
+# one still aborts is how a fix looks applied and changes nothing -- so the check
+# has to sit at the first podman operation that can hit a cold machine.
+# ---------------------------------------------------------------------------
+like($src, qr/sub\s+_ensure_machine_ready\b/,
+    'A5: a pre-build machine readiness check exists');
+
+my ($build_body) = $src =~ /sub\s+build_image\s*\{(.*?)\n\}/s;
+ok(defined $build_body, 'A5: build_image is locatable');
+like($build_body // '', qr/_ensure_machine_ready/,
+    'A5: build_image consults it BEFORE running podman build');
+
+# Ordering, not merely presence: the check must precede the build invocation.
+if (defined $build_body) {
+    my $check_at = index($build_body, '_ensure_machine_ready');
+    my $build_at = index($build_body, "'build'");
+    ok($check_at >= 0 && $build_at >= 0 && $check_at < $build_at,
+        'A5: and it precedes the podman build call, not follows it');
+}
+
+# ---------------------------------------------------------------------------
+# A6 -- a failure is shown AFTER the TUI is torn down, and then held.
+#
+# The operator's second, independent complaint: "the launcher dropping out when
+# something goes wrong and me being unable to see the error." The message was
+# printed while the alternate screen buffer was still active; leaving that buffer
+# restores the pre-TUI screen and ERASES it. Emitted, rendered, wiped -- which
+# from the outside is identical to printing nothing.
+#
+# So the contract is an ORDER: leave the alt screen, drain the capture, print,
+# then hold. Asserted structurally because it lives at file scope, outside the
+# extractable region.
+# ---------------------------------------------------------------------------
+like($src, qr/sub\s+_fail_visibly\b/, 'A6: _fail_visibly exists');
+
+my ($fv) = $src =~ /sub\s+_fail_visibly\s*\{(.*?)\n\}/s;
+ok(defined $fv, 'A6: its body is locatable');
+
+if (defined $fv) {
+    my $leave = index($fv, 'host_leave');
+    my $drain = index($fv, '_stderr_capture_drain');
+    my $print = index($fv, 'print STDERR "$_\\n"');
+    $print = index($fv, 'print STDERR') if $print < 0;
+    ok($leave >= 0, 'A6: it leaves the TUI host');
+    ok($drain >= 0, 'A6: it drains the captured STDERR');
+    ok(($leave < $drain), 'A6: leaves the alt screen BEFORE draining');
+    ok(($drain < $print), 'A6: and prints only AFTER both -- nothing can be erased by the restore');
+    like($fv, qr/-t STDIN/,
+        'A6: the hold is gated on an interactive terminal, never in a pipe or hook');
+    like($fv, qr/CCPRAXIS_NO_PAUSE/,
+        'A6: and is overridable, so it cannot wedge an automated run');
+}
+
+# The build failure path must use it -- that is the path the operator actually hit.
+like($build_body // '', qr/_fail_visibly/,
+    'A6: the image-build failure path reports through _fail_visibly');
+
 done_testing();
