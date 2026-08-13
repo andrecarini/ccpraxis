@@ -51,10 +51,6 @@ From Bash, redirecting to `NUL` creates a literal file of that name which Explor
 
 **This is hook-enforced** — `~/.claude/ccpraxis/scripts/hooks/block-nul-redirect.pl` denies the Bash call before it runs, in every project on this machine, so the mistake is not available to make. Kept as one line only because the *right* form is worth knowing; the rule itself needs no teaching. If a stray `NUL` file already exists, remove it from Bash (`rm -- NUL`) — PowerShell resolves the device name instead of the file.
 
-## Check the version before bug-hunting third-party software
-
-As soon as a third-party app is implicated in a bug, check its version against the vendor's current release and say so immediately — offer to update first. An eM Client hang was fully diagnosed on 10.4.5642 and turned out to be already fixed in 10.4.5647, shipped ten days earlier with no mention in the release notes. If you do diagnose before updating, take version-stamped, repeatable measurements so the evidence survives the update. Note the in-app updater can lag a direct installer download.
-
 ## ⚠️ Write `.ps1` files as ASCII only
 
 The Write tool saves UTF-8 without a BOM; PowerShell 5.1 reads a BOM-less script as CP1252. A multi-byte character like `—` or `→` decodes into stray bytes — one of them (0x94) is a smart quote, which PowerShell treats as a **string delimiter**. That opens a phantom string, swallows the following braces, and reports `Missing closing '}'` at a line far from the real problem.
