@@ -32,15 +32,6 @@ it's probably already here" is only true once the merge has happened.
 
 So: **verify, do not assume.** "Relaunch everything" is as wrong as "it's already live".
 
-This is not a subtle distinction and it is not rare — it bit three times in a single session:
-
-- agent `maxTurns` caps were raised and **stayed inert**, so a fan-out would still have died at the
-  old cap;
-- a new `skills/<name>/` was added and **was not mounted** (skills are bind-mounted per the picker's
-  selection, and a `--session`/`--resume-session` *connector* launch skips the picker entirely);
-- `bp-blueprint.pl` gained verbs that the executing copy **did not have**, so the very command about
-  to be run would have failed exactly as before.
-
 **Before claiming any tooling change is usable — or planning work that depends on it — verify against
 the tree that actually runs:**
 
@@ -54,22 +45,13 @@ grep -m1 '^maxTurns:' $M/butler/agents/bp-scout.md
 If it differs from your clone, the change is **not live**, and saying "the machinery now works" is
 false. Say instead: *"fixed in the clone; inert until promoted."*
 
-**Skills and prose have their own trap.** A `SKILL.md` under `plugins/**` rides the live mount like
-any other file — but a skill already loaded into the running session was read at invocation time, and
-a **new** `skills/<name>/` directory is not mounted at all until a full manager launch. So a
-correction can be on disk, live, and still not be what the current session is following.
+A skill already loaded this session was read at invocation time, so a fix on disk — even a promoted
+one — may not be what you are currently following. A **new** `skills/<name>/` is not mounted at all
+until a full manager launch.
 
-**Promotion is a merge, not an install:**
-
-```bash
-git -C ~/.claude/ccpraxis pull <this-clone> main
-```
-
-`~/.claude/ccpraxis` *is* the installed plugin tree (the `ccpraxis-local` marketplace is a
-`directory` source pointing at its `plugins/`, which is also what is on `PATH`), so the merge alone
-promotes. Run `install.pl` **only** when PATH wiring or the set of plugins changed — it runs each
-surface's `ccpraxis-install.pl` hook and does not copy plugin code. Never treat it as the promotion
-step: a successful-looking install can otherwise mask a merge that never happened.
+**Promotion is a merge:** `git -C ~/.claude/ccpraxis pull <this-clone> main`. `install.pl` only
+re-wires PATH and plugin registration; it never copies plugin code, so a clean install run does not
+mean promotion happened. Full mechanics: `plugins/sandbox/docs/working-on-ccpraxis.md`.
 
 ## Language and runtime
 
@@ -120,33 +102,38 @@ These have each cost real debugging time. Details in the user-global `CLAUDE.md`
     `plugins/steward/tests/t/09-no-drive-root-strays.t`. Never set the variable shell-wide.
 - **Paths contain non-ASCII** (`André`). Nothing may assume ASCII paths. Round-trip registry values
   as UTF-8 bytes; never re-encode something already decoded.
-- **`podman machine set --disk-size` does not work here** — it exits 125 with *"changing disk size
-  not supported for WSL machines"*. The machine's disk is the WSL distro's `ext4.vhdx`, so growing it
-  is a WSL operation:
-  ```powershell
-  wsl --shutdown
-  wsl --manage podman-machine-default --resize 32212254720   # bytes; 30 GiB. Grow only.
-  ```
-  It runs `e2fsck` + `resize2fs` itself, so the filesystem comes up already grown — verify with
-  `wsl -d podman-machine-default --exec df -h /`. Afterwards `podman machine list` still reports the
-  **original** size: that field is podman's own creation-time record, which podman declines to update
-  for WSL machines. It is stale, not wrong-in-a-way-that-matters — trust `df`, not `podman machine
-  list`. The vhdx is sparse and never shrinks, so its on-disk size tracks the high-water mark rather
-  than current usage; check host free space before growing.
+- **`podman machine set --disk-size` fails on WSL machines** (exit 125). Grow via WSL instead:
+  `wsl --shutdown`, then `wsl --manage podman-machine-default --resize <bytes>` (grow only; it runs
+  `e2fsck`/`resize2fs` itself). Verify with `df -h /` inside the machine — `podman machine list`
+  keeps reporting the creation-time size and is not the truth.
+- **The WSL VM's memory cap is a real failure mode.** `~/.wslconfig`'s `memory=` is what `vmmem`
+  will consume; when the host runs low on commit, Windows terminates the VM and every container in
+  it dies at once, with no reap record. A missing `.launcher/last-reap.txt` is the signature of a
+  hard kill rather than a graceful reap.
 
 ## `.ccpraxis-local-data/` — gitignored, and it does not travel
 
-Holds blueprints, `claude-home` (agent memory, session transcripts, credentials, beacons), launcher
-state. Git never carries it. Nor does it carry `deploy_key` or `deploy_key.pub`. Most of `.claude/`
-is ignored too — but **not** `.claude/settings.json`; see the next section.
+Holds blueprints, `claude-home` (transcripts, credentials, beacons), launcher state, and the
+`guidance/` notes indexed below. Git never carries it, nor `deploy_key*`. Most of `.claude/` is
+ignored too — but **not** `.claude/settings.json`; see the next section.
 
-If you relocate a project, **`git status --ignored` is the authoritative list of what to copy — not
-`.gitignore`**, which lists patterns rather than what actually exists.
+On relocation, **`git status --ignored` is the authoritative copy-list** — `.gitignore` lists
+patterns, not what exists. Full gotchas, including the `claude-home/.launcher/` container-identity
+trap: `plugins/sandbox/docs/working-on-ccpraxis.md`.
 
-**Never copy `claude-home/.launcher/` between project locations.** It encodes container identity
-(`container-name`, `port-base`, `containerfile-hash`); a copied `container-name` makes the launcher
-attach to another project's container and mount the wrong directory at `/project`. It is derived
-state — delete it and it regenerates.
+## Guidance notes — read on demand
+
+Claude Code's built-in auto-memory is **disabled** (`autoMemoryEnabled: false` in every settings
+layer, plus a `permissions.deny` on the memory path). Durable guidance lives here instead, read only
+when the trigger applies:
+
+| note | read it when |
+|---|---|
+| `.ccpraxis-local-data/guidance/push-straight-to-main.md` | pushing, or about to flag a "Bypassed rule violations" warning |
+| `.ccpraxis-local-data/guidance/escalate-product-decisions-only.md` | about to ask the operator anything mid-run |
+| `.ccpraxis-local-data/guidance/fix-ccpraxis-defects-in-place.md` | a real defect surfaces outside the current package's write set |
+
+Nothing that a hook already enforces belongs here — the hook is the instruction.
 
 ## `.claude/settings.json` is TRACKED — and that is load-bearing
 
@@ -165,15 +152,12 @@ Code writes when you disable a project plugin for yourself alone.
 fix-batch (`ef272c3`) — its thesis is that a written instruction is not an enforcement mechanism. If
 the file is untracked, a fresh clone gets the guard script and never runs it, and the registration
 survives only as prose in a commit message: the same mistake, one level up.
-`t/112-subagent-stall-guard.t` asserts both registrations (this one and the subagent stall gate)
-against the real `.claude/settings.json`, and fails if either goes missing.
+Two tests fail if the registration goes missing:
+`plugins/sandbox/tests/t/61-settings-scope-split.t` and
+`plugins/butler/tests/t/112-subagent-stall-guard.t`.
 
-> This paragraph previously cited `t/61-settings-scope-split.t`. **No such file exists** — `t/61`
-> is `61-judge-starvation.t`, and `t/14-hooks-selftest.t` only checks a *generated* settings blob
-> for the subagent self-test, never this repo's real `.claude/settings.json`. So the protection
-> this section relied on was itself imaginary for as long as the claim stood: exactly the
-> "a written instruction is not an enforcement mechanism" failure the section is about. If you
-> move the assertions, update this line in the same commit.
+**Path-qualify test citations** — `t/NN` collides across plugins, and a bare number has already
+produced a confident "no such file exists" about a file that was there.
 
 **Do not re-ignore it.** It was ignored until 2026-08-06 because `skills.pl` Phase B wrote the
 picker's machine-local plugin selection into it on every launch. That write now targets

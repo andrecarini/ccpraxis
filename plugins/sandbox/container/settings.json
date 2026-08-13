@@ -5,6 +5,7 @@
       "commit" : "",
       "pr" : ""
    },
+   "autoMemoryEnabled" : false,
    "autoScrollEnabled" : false,
    "cleanupPeriodDays" : 180,
    "editorMode" : "vim",
@@ -17,6 +18,7 @@
       "CCPRAXIS_SANDBOX" : "1",
       "CLAUDE_AUTO_BACKGROUND_TASKS" : "1",
       "CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR" : "0",
+      "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY" : "1",
       "CLAUDE_CODE_ENABLE_AWAY_SUMMARY" : "1",
       "CLAUDE_CODE_IDE_SKIP_AUTO_INSTALL" : "true",
       "CLAUDE_CODE_NEW_INIT" : "1",
@@ -28,8 +30,7 @@
       "DISABLE_LOGOUT_COMMAND" : "0",
       "DISABLE_UPGRADE_COMMAND" : "1",
       "ENABLE_PROMPT_CACHING_1H" : "1",
-      "FORCE_AUTOUPDATE_PLUGINS" : "1",
-      "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1"
+      "FORCE_AUTOUPDATE_PLUGINS" : "1"
    },
    "extraKnownMarketplaces" : {
       "notion-plugin-marketplace" : {
@@ -42,17 +43,22 @@
    "hooks" : {
       "PostToolUse" : [
          {
-            "matcher" : "Bash",
             "hooks" : [
                {
                   "command" : "[ -f \"$HOME/.claude/auto-declare.pl\" ] && perl \"$HOME/.claude/auto-declare.pl\" || true",
                   "type" : "command"
                }
-            ]
+            ],
+            "matcher" : "Bash"
          }
       ]
    },
    "inputNeededNotifEnabled" : true,
+   "permissions" : {
+      "deny" : [
+         "Read(~/.claude/projects/**/memory/**)"
+      ]
+   },
    "promptSuggestionEnabled" : false,
    "remoteControlAtStartup" : false,
    "showClearContextOnPlanAccept" : true,

@@ -5,6 +5,7 @@
       "commit" : "",
       "pr" : ""
    },
+   "autoMemoryEnabled" : false,
    "autoScrollEnabled" : false,
    "cleanupPeriodDays" : 180,
    "editorMode" : "vim",
@@ -39,7 +40,7 @@
    "extraKnownMarketplaces" : {
       "ccpraxis-local" : {
          "source" : {
-            "path" : "C:/Users/André/.claude/ccpraxis/plugins",
+            "path" : "C:/Users/AndrÃ©/.claude/ccpraxis/plugins",
             "source" : "directory"
          }
       },
@@ -108,7 +109,9 @@
       ],
       "ask" : [],
       "defaultMode" : "default",
-      "deny" : [],
+      "deny" : [
+         "Read(~/.claude/projects/**/memory/**)"
+      ],
       "disableBypassPermissionsMode" : "disable"
    },
    "promptSuggestionEnabled" : false,
