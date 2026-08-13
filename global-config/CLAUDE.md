@@ -47,13 +47,9 @@ This includes but is not limited to:
 
 ## ⚠️ `NUL` is a Windows device name — never redirect to it from Bash
 
-On Windows, `NUL` is a reserved device name in `cmd.exe` / PowerShell — `command > NUL` there discards output. But from Bash / Git Bash, `> NUL` creates a literal **file named `NUL`** in the current directory, because Bash doesn't know about the Windows device-name namespace. The file is then nearly impossible to remove from Explorer (Windows refuses to open or rename device-named paths) and clutters every repo it's spawned in. This has bitten this machine repeatedly.
+From Bash, redirecting to `NUL` creates a literal file of that name which Explorer cannot delete. Use `/dev/null` from Bash and `$null` from PowerShell.
 
-**Rules:**
-- From Bash (any tool call that uses Bash / Git Bash): **never** use `> NUL`, `2> NUL`, `&> NUL`, `>NUL`, `>> NUL`, etc. Always use `/dev/null` instead (`> /dev/null`, `2>&1 > /dev/null`, etc.). Git Bash maps `/dev/null` to the device correctly.
-- From PowerShell: use `$null` (`*> $null`, `2> $null`) — never `> NUL`.
-- Case doesn't matter: Windows treats `NUL`, `nul`, `Nul`, etc. as the same device. The corresponding files-in-cwd also collide case-insensitively, so just avoid the literal string `NUL` in any redirect target on Windows shells.
-- If you find a stray `NUL` / `nul` file in a repo, delete it from Bash (`rm -- NUL`) — `del`/`rm` from PowerShell can fail because PowerShell tries to address the device first.
+**This is hook-enforced** — `~/.claude/ccpraxis/scripts/hooks/block-nul-redirect.pl` denies the Bash call before it runs, in every project on this machine, so the mistake is not available to make. Kept as one line only because the *right* form is worth knowing; the rule itself needs no teaching. If a stray `NUL` file already exists, remove it from Bash (`rm -- NUL`) — PowerShell resolves the device name instead of the file.
 
 ## ⚠️ MSYS2 path-conversion mangles `:`-separated args (Git-for-Windows perl + podman)
 

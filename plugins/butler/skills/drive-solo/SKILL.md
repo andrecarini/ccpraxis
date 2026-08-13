@@ -26,7 +26,11 @@ Pass the raw scope straight through as `next --scope <arg>`; the director resolv
 ## What drive-solo is NOT
 
 - **No deterministic orchestrator** and **no `bp-launch.sh` / `bp-orchestrate.sh`** — those are the fleet's. You are the driver.
-- **No parallel coordinators.** Packages run **sequentially** with one write-capable worker in flight at a time (hook-enforced).
+- **No parallel coordinators.** Packages run **sequentially** with one write-capable worker in flight
+  at a time — **your discipline, not a hook.** `track-dispatch.sh` maintains that lock but opens with
+  `bp_hook_gate`, which needs `BP_LEDGER`/`BP_DIR`/`BP_PROJECT_ROOT` — exported only into a
+  `bp-launch.sh` coordinator, never into this session. Check `git status` after every write-capable
+  worker; see coordinator-protocol, "…but only inside a butler-LAUNCHED coordinator".
 - **You do NOT poll usage or manage keep-awake.** The director does both — you simply dispatch the actions it returns.
 
 ## Preflight
