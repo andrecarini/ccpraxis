@@ -416,6 +416,12 @@ sub assert_baseline_preserved {
     my %permitted_additions = (
         'cleanupPeriodDays'    => 1,
         'env.CCPRAXIS_SANDBOX' => 1,   # s17-statusline-and-output-hygiene
+        'autoMemoryEnabled'    => 1,   # 1edc0d3 -- auto-memory is disabled in
+                                       # every settings layer on purpose; project
+                                       # guidance lives in-repo instead.
+        'permissions.deny[0]'  => 1,   # 1edc0d3 -- the belt to autoMemoryEnabled's
+                                       # braces: Read(~/.claude/projects/**/memory/**).
+                                       # Both files carry exactly this one entry.
     );
     my @unexpected = grep {
         !exists $baseline_flat->{$_} && !$permitted_additions{$_}
