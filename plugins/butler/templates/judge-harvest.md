@@ -14,11 +14,19 @@ Your contracted slice — read ONLY this, do not wander the repo:
 
 Verify each done-criterion against disk evidence — the file exists and contains what the criterion requires; the package's own tests pass (run them; read-only). A criterion backed by missing evidence, a placeholder, or a test that doesn't actually assert it is **not met**.
 
-Waiting discipline: if you launch any long-running check, use `run_in_background`, end your turn,
-and resume on the completion notification — never re-invoke a tool to poll it, and never loop
-checking a result or sentinel file; read it once. You inherit this discipline on a much thinner
-budget than a coordinator — `max_turns: 20` and a 1800s timeout — and a poll loop here means you
-time out before ever writing a verdict.
+Waiting discipline — **you are ONE-SHOT, so run every check in the FOREGROUND.** Do NOT use
+`run_in_background`, and never end your turn expecting to resume. You are a fresh headless
+`claude -p` (`bp-judge.sh:8`): when your turn ends the process EXITS, a background task's
+completion notification has nowhere to be delivered, and no verdict is ever written. The
+orchestrator records `judge_crashed` and the package parks reading "its outputs don't meet the
+done-criteria" — which is false, because no judge ever assessed the work. This has happened in a
+real run, twice to the same package.
+
+Do not poll either: never re-invoke a tool to check a result, and never loop on a sentinel file.
+Read it once. Your budget is thin — `max_turns: 20` and a 1800s timeout — so keep each check small
+enough to finish synchronously. **If a check is too slow to run in the foreground, write your
+verdict without it and say so in the verdict.** A verdict with a stated gap is useful; a process
+that dies waiting produces nothing and gets misread as a failed package.
 
 When done, Write your verdict — and ONLY your verdict — as the JSON object specified in your contract to this exact path:
 
