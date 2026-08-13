@@ -116,6 +116,80 @@ case "$EVENT" in
     ;;
 
   Stop)
+    # ---- (a) ANNOUNCED-BUT-DIDN'T: ending a turn by promising work ----------
+    #
+    # "Next I'll commit these" as a closing line silently kills an unattended
+    # run: nothing is scheduled, so the promise is never kept and the session
+    # just stops. This is a SEPARATE failure from the unguarded-dispatch one
+    # below -- no subagent is involved, so that marker is empty and the branch
+    # below never fires.
+    #
+    # HONEST LIMIT: this half is a HEURISTIC over prose, unlike the structural
+    # check below. It reads the last assistant message and looks for a
+    # first-person promise of imminent work. It can misfire on a legitimate
+    # "I'll pick this up when the worker reports" -- which is why it only fires
+    # when NOTHING is scheduled to wake the session, and why it is bounded by
+    # the same TTL and force-stop as everything else here. A misfire costs one
+    # extra turn; the failure it prevents costs the whole run.
+    if [ -z "${BP_NO_PROMISE_GATE:-}" ] && [ ! -f "$STATE_DIR/force-stop" ]; then
+      TP=$(bp_json_get "$PAYLOAD" transcript_path) || TP=""
+      # A live guard or a pending dispatch means something WILL wake us, so a
+      # forward-looking sentence is fine. Only an unscheduled promise is a bug.
+      SCHEDULED=0
+      if [ -f "$STATE_DIR/armed" ]; then
+        A_PID=$(sed -n '1p' "$STATE_DIR/armed" 2>/dev/null | tr -d ' \r')
+        case "$A_PID" in ''|*[!0-9]*) A_PID="" ;; esac
+        [ -n "$A_PID" ] && kill -0 "$A_PID" 2>/dev/null && SCHEDULED=1
+      fi
+      if [ "$SCHEDULED" = "0" ] && [ -n "$TP" ] && [ -f "$TP" ] && [ ! -f "$STATE_DIR/promise-denied" ]; then
+        PROMISE=$(perl -MJSON::PP -e '
+            my ($tp) = @ARGV;
+            open my $fh, "<", $tp or exit 0;
+            my $last = "";
+            while (my $l = <$fh>) {
+                my $j = eval { JSON::PP->new->decode($l) } or next;
+                next unless ($j->{type} // "") eq "assistant";
+                my $c = eval { $j->{message}{content} } or next;
+                next unless ref $c eq "ARRAY";
+                my $t = join " ", map { $_->{text} // "" } grep { ($_->{type}//"") eq "text" } @$c;
+                $last = $t if length $t;
+            }
+            close $fh;
+            exit 0 unless length $last;
+            # Only the CLOSING stretch matters: a promise mid-message that the
+            # message then fulfils is not the failure.
+            my $tail = length($last) > 400 ? substr($last, -400) : $last;
+            my @pat = (
+                qr/\bnext(?:,| I| step)?[^.]{0,40}\bI(?:\x27ll| will)\b/i,
+                qr/\bI(?:\x27ll| will)\s+(?:now\s+)?(?:commit|run|dispatch|fix|write|implement|continue|start|kick off|re-?run|take|pick up|proceed)\b/i,
+                qr/\b(?:then|after that|once .{0,30} lands?)\s+I(?:\x27ll| will)\b/i,
+                qr/\bdoing (?:it|that) now\b/i,
+                qr/\bon it now\b/i,
+            );
+            for my $p (@pat) { if ($tail =~ $p) { print "1"; exit 0 } }
+            exit 0;
+        ' "$TP" 2>/dev/null) || PROMISE=""
+        if [ "$PROMISE" = "1" ]; then
+          : > "$STATE_DIR/promise-denied" 2>/dev/null || true
+          cat >&2 <<'PEOF'
+BLOCKED: this turn ends by announcing work it did not do, and nothing is scheduled to continue.
+
+"Next I'll ..." as a closing line is how an unattended run dies: the turn ends,
+nothing wakes the session, and the promised work never happens. If you are about
+to do it, DO IT NOW in this turn. If it genuinely must wait on something, arm a
+guard so the session actually resumes, or ask the operator a direct question and
+stop on that instead.
+
+This fires once; stopping again is allowed, so it corrects rather than traps.
+Set BP_NO_PROMISE_GATE=1 to disable, or touch force-stop to override.
+PEOF
+          exit 2
+        fi
+      fi
+    fi
+    rm -f "$STATE_DIR/promise-denied" 2>/dev/null || true
+
+    # ---- (b) UNGUARDED BACKGROUND DISPATCH ---------------------------------
     [ -s "$STATE" ] || exit 0
 
     # Escape hatch, mirroring gate-stop.sh's force-stop: a gate that cannot be

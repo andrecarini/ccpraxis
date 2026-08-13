@@ -283,4 +283,98 @@ sub arm {
          '...and Bash (the guard-arming it must notice)');
 }
 
+# ---- 11. ANNOUNCED-BUT-DIDN'T ------------------------------------------------
+#
+# The other half of the same disease: a turn that ends "Next I'll commit these"
+# schedules nothing, so the promise is never kept and an unattended run simply
+# stops. No subagent is involved, so the dispatch marker is empty and the gate
+# above never fires.
+#
+# This half is a HEURISTIC over prose and is tested as such — the
+# false-POSITIVE cases below matter as much as the true ones, because a gate
+# that fires on every forward-looking sentence would be turned off within a day.
+{
+    # transcript($root, $text) -> path to a one-message JSONL transcript
+    my $tn = 0;
+    my $mk = sub {
+        my ($root, $text) = @_;
+        my $p = "$root/t" . (++$tn) . ".jsonl";
+        open my $f, '>', $p or die $!;
+        print {$f} $J->encode({ type => 'assistant',
+                                message => { content => [ { type => 'text', text => $text } ] } }), "\n";
+        close $f;
+        return $p;
+    };
+    my $stop_with = sub {
+        my ($root, $text) = @_;
+        my $s = stop();
+        $s->{transcript_path} = $mk->($root, $text);
+        return (fire($root, $s))[0];
+    };
+
+    # -- true positives: a promise with nothing scheduled --
+    for my $t (
+        'All committed. Next I\'ll commit the stall gate and then continue.',
+        'Verified from disk. I\'ll dispatch the implementer for b01.',
+        'That is done. Doing it now.',
+        'Once the sweep lands I\'ll run the full suite and commit.',
+    ) {
+        my $root = tempdir(CLEANUP => 1);
+        is($stop_with->($root, $t), 2, "denied: promise with nothing scheduled — '" . substr($t,0,38) . "...'");
+    }
+
+    # -- false positives it must NOT fire on --
+    for my $t (
+        'Both suites are green and everything is committed. Nothing needs you.',
+        'I could not determine the mechanism; criterion 1 sanctions saying so.',
+        'Which would you prefer — the synthetic table, or the real backpack.json?',
+        'The fleet holds no wake-lock. That is a defect and I have filed it.',
+    ) {
+        my $root = tempdir(CLEANUP => 1);
+        is($stop_with->($root, $t), 0, "allowed: no promise — '" . substr($t,0,38) . "...'");
+    }
+
+    # -- a promise is FINE when something is scheduled to wake the session --
+    {
+        my $root = tempdir(CLEANUP => 1);
+        arm($root);   # live guard: the run will resume on its own
+        is($stop_with->($root, 'I\'ll pick this up when the worker reports.'), 0,
+           'allowed: a promise is fine when a LIVE guard will resume the session');
+    }
+
+    # -- corrects, does not trap --
+    {
+        my $root = tempdir(CLEANUP => 1);
+        my $txt  = 'Next I\'ll commit these.';
+        is($stop_with->($root, $txt), 2, 'first stop denied');
+        is($stop_with->($root, $txt), 0, 'stopping again is allowed — it corrects rather than traps');
+    }
+
+    # -- escape hatches --
+    {
+        my $root = tempdir(CLEANUP => 1);
+        my $dir  = "$root/.ccpraxis-local-data/.subagent-guard";
+        mkdir $_ for ("$root/.ccpraxis-local-data", $dir);
+        open my $f, '>', "$dir/force-stop" or die $!; close $f;
+        is($stop_with->($root, 'Next I\'ll commit these.'), 0, 'force-stop overrides the promise gate');
+    }
+    {
+        my $root = tempdir(CLEANUP => 1);
+        my $s = stop(); $s->{transcript_path} = $mk->($root, 'Next I\'ll commit these.');
+        my $json = $J->encode($s);
+        my ($fh, $tmp) = File::Temp::tempfile('t112-XXXXXX', TMPDIR => 1);
+        print {$fh} $json; close $fh;
+        my $rc = system(qq{CLAUDE_PROJECT_DIR="$root" BP_NO_PROMISE_GATE=1 bash "$GUARD" < "$tmp" 2>/dev/null});
+        unlink $tmp;
+        is($rc >> 8, 0, 'BP_NO_PROMISE_GATE=1 disables the heuristic half outright');
+    }
+
+    # -- missing/unreadable transcript must fail OPEN --
+    {
+        my $root = tempdir(CLEANUP => 1);
+        my $s = stop(); $s->{transcript_path} = "$root/does-not-exist.jsonl";
+        is((fire($root, $s))[0], 0, 'an unreadable transcript fails open, never blocks');
+    }
+}
+
 done_testing();
