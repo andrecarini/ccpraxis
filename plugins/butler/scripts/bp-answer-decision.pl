@@ -143,12 +143,19 @@ sub plan_answer {
     }
     if ($pseudo && $fam eq 'package') {
         $action = 'acknowledge' unless defined $action && length $action;
+        # fixbatch step7 / reviewer NIT: the remediation hint used to be
+        # DAG-cycle-flavored example text ("bp-blueprint.pl set-deps"), reused
+        # verbatim for every pseudo-package kind including remediation-escalation,
+        # where it does not apply. Branch it on $kind instead.
+        my $hint = (defined $kind && $kind eq 'remediation-escalation')
+            ? "(e.g. fix the failing check/test manually, or raise the remediation attempt cap)"
+            : "(e.g. 'bp-blueprint.pl set-deps' for a DAG cycle)";
         return { ok => 0, family => 'package', pseudo => 1,
                  error => "'" . ($kind // '') . "' is filed against a pseudo-package with no ledger to "
-                        . "relaunch/reset/accept/drop. Fix the underlying condition externally (e.g. "
-                        . "'bp-blueprint.pl set-deps' for a DAG cycle), then run --action acknowledge "
-                        . "to clear this decision. If the condition is not actually fixed, the "
-                        . "orchestrator will re-file the same decision on its next tick." }
+                        . "relaunch/reset/accept/drop. Fix the underlying condition externally $hint, "
+                        . "then run --action acknowledge to clear this decision. If the condition is "
+                        . "not actually fixed, the orchestrator will re-file the same decision on its "
+                        . "next tick." }
             unless $action eq 'acknowledge';
         return { ok => 1, family => 'package', pseudo => 1, action => 'acknowledge',
                  ledger_status => undef, clear_pause => 0, relaunch => 0, reset_attempt => 0 };
@@ -548,7 +555,23 @@ unless (caller) {
     # --decision mode (package comes from the decision record) and direct
     # --package mode (package comes straight from --package), free symmetry
     # from the same check rather than a separate design.
-    my $is_pseudo = defined $pkg && $pkg =~ /^_/;
+    #
+    # fixbatch step7 / red-team MEDIUM: a bare `$pkg =~ /^_/` is spoofable. The
+    # *official* creation path (bp-blueprint.pl's $PKG_ID_RE) forbids a leading
+    # underscore, but bp-orchestrator.pl's parse_dag never validates package ids
+    # read from blueprint.md at all -- a hand-edited DAG row (or any tool that
+    # writes one without going through bp-blueprint.pl) can name a REAL package
+    # '_weird-name', with a genuine ledger at packages/_weird-name.md. Under the
+    # old check, every decision filed against it was silently treated as
+    # pseudo: relaunch/reset/accept/drop were refused with a message claiming
+    # "no ledger to relaunch/reset/accept/drop" (false -- the ledger exists),
+    # and --action acknowledge SUCCEEDED without ever touching that ledger,
+    # silently faking resolution -- exactly the disease this package cures.
+    # Require ledger ABSENCE too: a name that merely looks pseudo but has a
+    # real ledger on disk falls back to the ordinary package path below,
+    # including its own honest "ledger not found" refusal for the cases that
+    # genuinely lack one.
+    my $is_pseudo = defined $pkg && $pkg =~ /^_/ && !-f "$bpdir/packages/$pkg.md";
 
     # b17 1.2/C3/C8(b): --widen-write-set is its own, standalone, additive mutation —
     # NOT folded into the relaunch/reset/accept/drop pipeline below. It never touches

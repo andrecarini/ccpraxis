@@ -86,19 +86,27 @@ sub mk_ledger_bp {
 # ═══════════════════════════════════════════════════════════════════════════
 # NEGATIVE cases — one per newly-required kind, ledger status already 'done'.
 # ═══════════════════════════════════════════════════════════════════════════
-# `judge-starved` is DELIBERATELY ABSENT from this list, and from %DECISION_VALIDITY.
-# Driver-authorised correction: the spec's §2.3 worked table asked for it, and the
-# spec was wrong for that one row. Both of its emission sites sit inside guards that
-# REQUIRE the ledger status to be 'done' already (bp-orchestrator.pl:2900 and :2970,
-# `$jstate eq 'starved' && $st eq 'done'`), so it cannot structurally fire under any
-# other status. Gating it on ['done','dropped'] would therefore not narrow a race
-# window -- it would refuse the kind UNCONDITIONALLY, converting this table's rule
-# ("never queue against an already-terminal package") into "never queue this kind at
-# all". Demonstrated live: adding the row regressed must-stay-green
-# plugins/butler/tests/t/99-write-guard-sites.t's own S4/AC14 control, which asserts
-# an unmoved state still queues judge-starved -- i.e. status genuinely 'done' while
-# the harvest audit is unresolved is the ORDINARY call shape, not a race.
-# The omission is asserted positively below rather than left implicit.
+# `judge-starved` is DELIBERATELY ABSENT from this list, and from %DECISION_VALIDITY
+# -- but NOT because it cannot race. Both of its emission sites sit inside guards
+# that check the ledger status against a once-per-tick SNAPSHOT (`$jstate eq
+# 'starved' && $st eq 'done'`, bp-orchestrator.pl ~:2933/:2998), and a concurrent
+# `bp-answer-decision.pl` can flip the LIVE ledger after that snapshot but before
+# either branch runs (fixbatch step7 / red-team MAJOR: the "cannot structurally
+# fire under any other status" claim was true only of the stale snapshot, not the
+# live ledger -- the race was real). Adding a ['done','dropped'] row here would
+# still be the wrong fix regardless: it would refuse the kind UNCONDITIONALLY
+# (every judge-starved call site is already snapshot-gated to 'done'), converting
+# this table's rule ("never queue against an already-terminal package") into
+# "never queue this kind at all" -- and it regresses must-stay-green
+# plugins/butler/tests/t/99-write-guard-sites.t's own S4/AC14 control, which pins
+# that an unmoved 'done' state (the ORDINARY case: status genuinely still 'done'
+# while the harvest audit is unresolved, not a race) still queues judge-starved.
+# The actual fix closes the race at its source instead: `_judge_outcome_still_
+# applies` (bp-orchestrator.pl) now re-reads the ledger's live status, under the
+# ledger's own lock, immediately before either branch commits to queuing --
+# a01's re-read-under-the-lock convention, applied to the resource this gate was
+# missing. The omission from this table is asserted positively below rather than
+# left implicit.
 my @NEW_KINDS = qw(turn-starved harvest-failure harvest-spawn-failure);
 my $n = 0;
 for my $kind (@NEW_KINDS) {
@@ -203,14 +211,20 @@ for my $kind (@NEW_KINDS) {
     # THE OMISSION IS A GUARANTEE, NOT AN OVERSIGHT -- asserted positively so a
     # future edit that "completes" the spec's §2.3 table turns this red and has to
     # read the reasoning first. judge-starved's only emission sites are guarded by
-    # `$st eq 'done'` (bp-orchestrator.pl:2900, :2970), so a ['done','dropped'] row
-    # would refuse it unconditionally rather than narrowing a race -- and doing so
-    # regressed must-stay-green t/99-write-guard-sites.t's S4/AC14 control, which
-    # pins that an unmoved 'done' state still queues judge-starved as it does today.
+    # a snapshot check (`$st eq 'done'`, bp-orchestrator.pl ~:2933/:2998), so a
+    # ['done','dropped'] row would refuse it unconditionally rather than narrowing
+    # a race -- and doing so regressed must-stay-green t/99-write-guard-sites.t's
+    # S4/AC14 control, which pins that an unmoved 'done' state still queues
+    # judge-starved as it does today. The race the table would have closed is
+    # real (a concurrent bp-answer-decision.pl can flip the live ledger after the
+    # snapshot, fixbatch step7 / red-team MAJOR) -- it is closed instead at
+    # `_judge_outcome_still_applies`, which now re-reads the ledger's live status
+    # under its own lock immediately before either branch queues.
     ok(!exists $BpOrch::DECISION_VALIDITY{'judge-starved'},
-        'AC3/table: judge-starved is NOT in the table -- it can only fire when status is '
-      . 'ALREADY done, so a done/dropped row would refuse it unconditionally (driver ruling, '
-      . 'spec §2.3 corrected; see t/99 S4/AC14)');
+        'AC3/table: judge-starved is NOT in the table -- its emission sites are '
+      . 'snapshot-gated to status=done and the live-status race that gate cannot see is '
+      . 'closed by _judge_outcome_still_applies\'s own re-read-under-lock instead (fixbatch '
+      . 'step7; see t/99 S4/AC14)');
 }
 
 done_testing();

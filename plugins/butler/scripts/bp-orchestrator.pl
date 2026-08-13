@@ -95,20 +95,28 @@ our $PID_ALIVE_FN;
 #
 # e04 implementer's own deviation from the spec's literal table, flagged for
 # driver review (see implementer-step4.md): 'judge-starved' is DELIBERATELY
-# OMITTED, unlike the spec's §2.3 worked table. Its one and only call site
-# (bp-orchestrator.pl, the second-starvation harvest-park branch) is guarded
-# by `$st eq 'done'` as a PRECONDITION for reaching the queue_needs_you call
-# at all -- judge-starved cannot structurally fire with any OTHER ledger
-# status. Gating it on ['done','dropped'] does not narrow a race window; it
-# refuses the decision UNCONDITIONALLY, every time, which is not "never queue
-# against an already-terminal package" (the criterion this table exists to
-# satisfy) but "never queue this kind at all". Demonstrated live: adding this
-# row regressed the MUST-STAY-GREEN t/99-write-guard-sites.t's own pre-existing
-# oracle (S4/AC14 control, "an unmoved state still queues judge-starved exactly
-# as today"), which is the actual real-world call shape (status genuinely
-# 'done' while the harvest audit is unresolved -- not a race, the ordinary
-# case). t/129's judge-starved-specific assertions are left red as a result;
-# this is a genuine spec/oracle conflict, not an implementer shortcut.
+# OMITTED, unlike the spec's §2.3 worked table -- but NOT for the reason first
+# given. Its two call sites (bp-orchestrator.pl, the two harvest-starvation
+# park branches) are guarded by `$st eq 'done'` as a precondition for reaching
+# the queue_needs_you call -- but `$st` is a once-per-tick SNAPSHOT
+# (`_load_state`, read once at tick-start), never re-read for the rest of the
+# tick. A human running `bp-answer-decision.pl` mid-tick can flip the ledger's
+# real status after the snapshot but before either branch runs, so the
+# precondition being "structural" was never true of the LIVE ledger, only of
+# the stale value the tick captured (fixbatch step7 / red-team MAJOR). Gating
+# on `['done','dropped']` here would still be wrong, unconditionally refusing
+# the ORDINARY case (status genuinely still 'done' while the harvest audit is
+# unresolved, which is what the MUST-STAY-GREEN t/99-write-guard-sites.t S4/
+# AC14 control pins) -- the table row was never the right tool for a
+# freshness problem. Instead, `_judge_outcome_still_applies` (below) now ALSO
+# re-reads the ledger's live `status:` immediately before either branch
+# commits to queuing, under the same lock bp-answer-decision.pl's status
+# writes take, and refuses if it no longer reads 'done' -- a01's
+# re-read-under-the-lock convention, applied to the resource (the ledger)
+# this gate was missing rather than to this table (which cannot express a
+# freshness check, only a status-membership one). judge-starved stays absent
+# from %DECISION_VALIDITY because the race it exists to close is now closed
+# elsewhere, not because the race was never real.
 our %DECISION_VALIDITY = (
     'stuck-package'          => ['done', 'dropped'],
     'turn-starved'           => ['done', 'dropped'],
@@ -1861,7 +1869,7 @@ sub archive_judge_verdict {
 # compare against. Returns 1 if the outcome still applies, 0 if refused (logs a
 # write_guard event with reason `judge-state-moved`).
 #
-# HONEST LIMIT (fixbatch step7 / red-team MAJOR 5, reasoned not demonstrated): this
+# HONEST LIMIT (a01's own MAJOR 5, reasoned not demonstrated): this
 # lock is released once THIS function returns. Every side effect the caller then
 # performs (kill_pid, clear_judge_inflight, archive_judge_verdict, update_registry_pkg,
 # queue_needs_you) runs AFTER the release, so the classic gate-then-act race is
@@ -1874,8 +1882,23 @@ sub archive_judge_verdict {
 # closed" instruction that flagged it. Also: this lock excludes nothing else in the
 # tree (grepped -- no other writer takes `runs/<kind>/<pkg>.lock`); its value is the
 # re-read, not mutual exclusion.
+#
+# e04 fixbatch step7 / red-team MAJOR: the judge-state gate above proves the JUDGE
+# hasn't moved (a fresh inflight epoch, or a verdict landing) -- it says nothing
+# about the PACKAGE'S LEDGER STATUS, which every caller's `$st` is a once-per-tick
+# snapshot of (`_load_state`, never re-read again this tick). A human running
+# `bp-answer-decision.pl` mid-tick can flip that status after the snapshot but
+# before this function is reached, and this gate used to let the outcome through
+# anyway. When `$expected_status` is supplied, ALSO re-read the ledger's `status:`
+# field -- under the ledger's OWN lock, the same lock bp-answer-decision.pl's
+# status writes take (`BpWrite::lock_path("$bpdir/packages/$pkg.md")`) -- and
+# refuse (reason `ledger-status-moved`) if it no longer matches. Same shape as
+# `_harvest_verdict_still_applies`'s status check below: a gate-only guarded_write
+# whose `mutate` never rewrites the ledger. This is what closes the terminal-race
+# `judge-starved`'s exclusion from `%DECISION_VALIDITY` depends on -- see that
+# table's comment above.
 sub _judge_outcome_still_applies {
-    my ($runs, $kind, $pkg, $classified_epoch, $log) = @_;
+    my ($bpdir, $runs, $kind, $pkg, $classified_epoch, $expected_status, $log) = @_;
     my $inflight_f = judge_inflight_path($runs, $kind, $pkg);
     my $verdict_f  = judge_verdict_path($runs, $kind, $pkg);
     my $r = BpWrite::guarded_write({
@@ -1897,7 +1920,27 @@ sub _judge_outcome_still_applies {
             return (defined $txt ? $txt : '', undef);   # never rewrites -- gate only
         },
     });
-    return $r->{ok} ? 1 : 0;
+    return 0 unless $r->{ok};
+    if (defined $bpdir && defined $expected_status) {
+        my $lr = BpWrite::guarded_write({
+            site  => "_judge_outcome_ledger_status_${kind}",
+            path  => "$bpdir/packages/$pkg.md",
+            log   => $log,
+            valid => sub {
+                my ($txt) = @_;
+                return undef unless defined $txt;   # unreadable -> not this gate's call
+                my ($status) = $txt =~ /^status:\s*(\S+)/m;
+                return 'ledger-status-moved' unless defined $status && $status eq $expected_status;
+                return undef;
+            },
+            mutate => sub {
+                my ($txt) = @_;
+                return (defined $txt ? $txt : '', undef);   # never rewrites -- gate only
+            },
+        });
+        return 0 unless $lr->{ok};
+    }
+    return 1;
 }
 
 sub judge_inflight_path { my ($runs, $kind, $pkg) = @_; "$runs/$kind/$pkg.inflight" }
@@ -2821,7 +2864,7 @@ sub run {
                         # the two starvation-park branches below -- which already carry
                         # this gate. Driver ruling (step7 dispatch): close it here too,
                         # rather than leave the narrowing recorded only in rmw-audit.md.
-                        unless (_judge_outcome_still_applies($runs, 'harvest', $pkg, $started, $log)) {
+                        unless (_judge_outcome_still_applies($bpdir, $runs, 'harvest', $pkg, $started, 'done', $log)) {
                             next;
                         }
                         my $jpidf = judge_pid_path($runs, 'harvest', $pkg);
@@ -2904,7 +2947,7 @@ sub run {
                         # any kill/clear/queue side effect (spec behavior 28-29). `next`s
                         # out of the whole per-package iteration on refusal so neither
                         # this branch nor the first-starvation branch below can fire.
-                        unless (_judge_outcome_still_applies($runs, 'harvest', $pkg, $started, $log)) {
+                        unless (_judge_outcome_still_applies($bpdir, $runs, 'harvest', $pkg, $started, 'done', $log)) {
                             next;
                         }
                         # SECOND starvation of the same package: park the branch (#13's
@@ -2969,7 +3012,7 @@ sub run {
                     }
                     if ($jstate eq 'starved' && $st eq 'done') {
                         # a01/S4: same re-read gate as the second-starvation branch above.
-                        unless (_judge_outcome_still_applies($runs, 'harvest', $pkg, $started, $log)) {
+                        unless (_judge_outcome_still_applies($bpdir, $runs, 'harvest', $pkg, $started, 'done', $log)) {
                             next;
                         }
                         # FIRST starvation (hs == 0): no widen was ever attempted for

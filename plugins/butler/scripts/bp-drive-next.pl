@@ -584,7 +584,14 @@ sub _cmd_next {
         my @pruned = grep { $exists{$_} } @$order;
         if (@pruned != @$order) {
             my @dropped = grep { !$exists{$_} } @$order;
-            _append_run_log($dsdir, 'ORDER-PRUNE (blueprint no longer on disk): ' . join(',', @dropped));
+            # fixbatch step7 / red-team MEDIUM: "no longer on disk" asserts the
+            # archived/deleted case this criterion was written for, but the same
+            # branch also fires during bp-blueprint.pl init's genuine mkdir-then-
+            # rename TOCTOU window (a blueprint dir exists before blueprint.md is
+            # renamed into place) -- mislabelling a blueprint mid-creation as gone.
+            # Effect stays safe either way (in-memory only, recomputed next call),
+            # but the wording must not assert something that may be false.
+            _append_run_log($dsdir, 'ORDER-PRUNE (absent from disk -- archived, or not yet fully created): ' . join(',', @dropped));
             $order = \@pruned;
         }
     }
