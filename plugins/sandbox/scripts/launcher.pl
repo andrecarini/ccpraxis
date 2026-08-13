@@ -4562,15 +4562,31 @@ HB_PID=$!
 echo "Refreshing apt index..."
 apt-get update -qq
 echo "Installing backpack items..."
-perl /root/.claude/backpack.pl install /root/.claude/.backpack-install-set.json
+perl /root/.claude/backpack.pl install /root/.claude/.backpack-install-set.json --declared /root/.claude/backpack.json
 BASH
             _tx("\n--- backpack install (approved subset: @{[scalar @BACKPACK_APPROVED_ITEMS]} items) ---\n");
             my $install_rc = _tee_system($PODMAN, 'exec', $CONTAINER_NAME,
                 'bash', '-c', $install_script);
             unlink $set_host;   # transient; don't leave the subset lying in claude-home
-            if ($install_rc != 0) {
+            # backpack.pl's exit code distinguishes "an item's install/verify
+            # actually failed" (1) from "everything installed fine but
+            # --declared reconciliation found a MISMATCH" (2) -- a declared
+            # item silently dropped from the install-set with no dependents,
+            # exactly the original incident's shape. Surfacing both alike as
+            # a generic "some items failed" would defeat the whole point of
+            # this package: the operator-facing WARNING banner, the
+            # dashboard stage status, and the logged event all need to say
+            # WHICH failure mode this was (BLOCKER-2 fix).
+            my $install_exit = $install_rc >> 8;
+            if ($install_exit == 2) {
+                $INSTALL_WARNING = 'backpack install: declared items never reached install - run /backpack:install in the session to reconcile';
+                log_ev('backpack_install_reconcile_mismatch', { exit => $install_exit });
+                _emit_out("\n");
+                _emit_out(_c_warn("WARNING:"), " Some declared backpack items never reached install (see RECONCILE/NOTICE/ABSENT/EXTRA above). Handing off to claude anyway — fix in-session via /backpack:add, /backpack:remove, or by editing the backpack file directly and running /backpack:install.\n");
+                _emit_out("\n");
+            } elsif ($install_rc != 0) {
                 $INSTALL_WARNING = 'backpack install: some items failed - run /backpack:install in the session to retry';
-                log_ev('backpack_install_failed', { exit => $install_rc >> 8 });
+                log_ev('backpack_install_failed', { exit => $install_exit });
                 _emit_out("\n");
                 _emit_out(_c_warn("WARNING:"), " Some backpack items failed (see above). Handing off to claude anyway — fix in-session via /backpack:add, /backpack:remove, or by editing the backpack file directly and running /backpack:install.\n");
                 _emit_out("\n");
