@@ -58,9 +58,14 @@ sub _now { time }
 sub _iso { my @t = gmtime($_[0] // time);
            sprintf('%04d-%02d-%02dT%02d:%02d:%02dZ', $t[5]+1900,$t[4]+1,$t[3],$t[2],$t[1],$t[0]) }
 
+# NOT under ~/.claude/ccpraxis — that path is the LIVE INSTALL, a git working
+# tree, and an index file written there shows up as an untracked change that
+# blocks `git pull` during promotion. Caught within an hour of shipping: the
+# first two real reports left the live install dirty. State belongs beside the
+# repo, never inside it.
 sub index_path {
     my $home = $ENV{ALMANAC_HOME} // $ENV{HOME} // $ENV{USERPROFILE} // '.';
-    return "$home/.claude/ccpraxis/bug-index.jsonl";
+    return "$home/.claude/almanac/bug-index.jsonl";
 }
 sub reports_dir { my ($root) = @_; return "$root/.ccpraxis-local-data/bug-reports" }
 

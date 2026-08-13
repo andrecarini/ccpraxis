@@ -132,6 +132,7 @@ when the trigger applies:
 | `.ccpraxis-local-data/guidance/push-straight-to-main.md` | pushing, or about to flag a "Bypassed rule violations" warning |
 | `.ccpraxis-local-data/guidance/escalate-product-decisions-only.md` | about to ask the operator anything mid-run |
 | `.ccpraxis-local-data/guidance/fix-ccpraxis-defects-in-place.md` | a real defect surfaces outside the current package's write set |
+| `docs/design-conventions.md` (tracked) | making a design call — packaging, approval flows, what to enforce in code — or hitting a Windows/Perl oddity that smells environmental |
 
 Nothing that a hook already enforces belongs here — the hook is the instruction.
 
