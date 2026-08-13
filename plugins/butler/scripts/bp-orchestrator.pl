@@ -84,7 +84,37 @@ our $PID_ALIVE_FN;
 # 'stuck-package' refuses only 'done'/'dropped' ("delivered", Decision 14) --
 # NOT 'blocked'/'parked', which is what _block_and_queue itself sets before
 # queuing (edge case 1: it must never refuse its own escalation).
-our %DECISION_VALIDITY = ( 'stuck-package' => ['done', 'dropped'] );
+# e04 §2.3: extends a01's original single-row table to every package-scoped
+# kind that carries a real package name (not a pseudo-package). Deliberately
+# EXCLUDES dag-stalled/remediation-escalation (pseudo-packages, no ledger --
+# the existing "unreadable -> queue anyway" branch already does the honest
+# thing) and awaiting-ledger (the ledger genuinely doesn't exist yet, not a
+# terminal-race case). The refusal set stays exactly ['done','dropped'] for
+# every row -- "a human already settled this a different way" -- never the
+# broader terminal/blocked set.
+#
+# e04 implementer's own deviation from the spec's literal table, flagged for
+# driver review (see implementer-step4.md): 'judge-starved' is DELIBERATELY
+# OMITTED, unlike the spec's §2.3 worked table. Its one and only call site
+# (bp-orchestrator.pl, the second-starvation harvest-park branch) is guarded
+# by `$st eq 'done'` as a PRECONDITION for reaching the queue_needs_you call
+# at all -- judge-starved cannot structurally fire with any OTHER ledger
+# status. Gating it on ['done','dropped'] does not narrow a race window; it
+# refuses the decision UNCONDITIONALLY, every time, which is not "never queue
+# against an already-terminal package" (the criterion this table exists to
+# satisfy) but "never queue this kind at all". Demonstrated live: adding this
+# row regressed the MUST-STAY-GREEN t/99-write-guard-sites.t's own pre-existing
+# oracle (S4/AC14 control, "an unmoved state still queues judge-starved exactly
+# as today"), which is the actual real-world call shape (status genuinely
+# 'done' while the harvest audit is unresolved -- not a race, the ordinary
+# case). t/129's judge-starved-specific assertions are left red as a result;
+# this is a genuine spec/oracle conflict, not an implementer shortcut.
+our %DECISION_VALIDITY = (
+    'stuck-package'          => ['done', 'dropped'],
+    'turn-starved'           => ['done', 'dropped'],
+    'harvest-failure'        => ['done', 'dropped'],
+    'harvest-spawn-failure'  => ['done', 'dropped'],
+);
 
 # e02: the closed 7-value escalation-category taxonomy (e01 spec §2.2). One
 # canonical source; queue_needs_you/_enter_pause_manual/_block_and_queue all
@@ -3023,12 +3053,23 @@ sub run {
                 # package rather than losing its audit (behavior 26).
                 next unless _harvest_verdict_still_applies($bpdir, $pkg, $started, $log);
                 my $hv = BpJudge::normalize_harvest($v);
+                # e04 AC1: a crashed/malformed judge ('error') must not be reported as
+                # a real failed audit ('fail') -- track how many times, in a row, the
+                # judge has failed to render a verdict, so the eventual park text can
+                # name the count instead of asserting an assessment that never happened.
+                if ($hv eq 'error') {
+                    my $n = (_reg_int($reg->{$pkg}{harvest_error_count}) // 0) + 1;
+                    update_registry_pkg($runs, $pkg, { harvest_error_count => $n });
+                    $reg->{$pkg}{harvest_error_count} = $n;
+                }
                 if ($hv eq 'pass') {
                     update_registry_pkg($runs, $pkg, { harvest => 'pass', harvest_reaudit => 0,
-                        harvest_defer => 0, harvest_defer_blockers => '', harvest_starve_continuations => 0 });
+                        harvest_defer => 0, harvest_defer_blockers => '', harvest_starve_continuations => 0,
+                        harvest_error_count => 0 });
                     $reg->{$pkg}{harvest} = 'pass'; $reg->{$pkg}{harvest_reaudit} = 0;
                     $reg->{$pkg}{harvest_defer} = 0; $reg->{$pkg}{harvest_defer_blockers} = '';
                     $reg->{$pkg}{harvest_starve_continuations} = 0;
+                    $reg->{$pkg}{harvest_error_count} = 0;
                     _log($log, 'harvest_pass', { package => $pkg, mode => $mode });
                 } else {
                     my $corr = $reg->{$pkg}{corrective_attempts} // 0;
@@ -3089,10 +3130,28 @@ sub run {
                         }
                     } else {  # park: failed twice -> alarm, keep independent work running.
                         _log($log, 'harvest_park', { package => $pkg, verdict => $hv, corrective_attempts => $corr });
+                        # e04 AC1: branch the operator-facing text on $hv. 'error' means
+                        # the judge never rendered a verdict at all -- nobody assessed
+                        # this work, so the text must not claim otherwise. 'fail' means a
+                        # real verdict WAS rendered; that text is unchanged.
+                        my $question;
+                        if ($hv eq 'error') {
+                            my $n = _reg_int($reg->{$pkg}{harvest_error_count}) // 1;   # floor 1: IN an error right now
+                            $question = "Package '$pkg' could not be audited: the harvest judge failed to render a verdict "
+                                      . "$n time(s) (crashed, timed out, or wrote something unreadable — never a substantive "
+                                      . "answer). This work has NOT been assessed: nobody has judged whether '$pkg' meets "
+                                      . "its done-criteria either way, and its own tests/review stand unchallenged. Read "
+                                      . "runs/harvest/$pkg.jsonl and runs/harvest/archive/ to see why the judge didn't complete, "
+                                      . "then either: (1) verify '$pkg' yourself against its done criteria and accept, "
+                                      . "(2) relaunch to re-audit with more room, or (3) drop.";
+                        } else {   # 'fail' -- unchanged text, a real verdict WAS rendered
+                            $question = "Package '$pkg' failed its harvest audit after a corrective relaunch — its outputs "
+                                      . "don't meet the done-criteria. Inspect and decide: fix, re-scope, or accept.";
+                        }
                         # e01 §3 row 19: category => 'oracle' (10th positional arg).
                         _block_and_queue($bpdir, $runs, $log, $bp, $pkg,
                             "failed harvest audit ($hv) after a corrective cycle", $now,
-                            "Package '$pkg' failed its harvest audit after a corrective relaunch — its outputs don't meet the done-criteria. Inspect and decide: fix, re-scope, or accept.",
+                            $question,
                             'harvest-failure', 'oracle');
                         $status->{$pkg} = 'blocked';
                     }

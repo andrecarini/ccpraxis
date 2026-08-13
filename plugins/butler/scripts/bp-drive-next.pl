@@ -568,6 +568,27 @@ sub _cmd_next {
     my %bp_meta   = %{ $state->{bp_meta} };
     my %bp_status = %{ $state->{bp_status} };
 
+    # e04 §2.4/AC4: prune, IN MEMORY, any order.json entry whose blueprint no
+    # longer exists on disk -- before B2a's coverage check and the B3 walk see
+    # it. B2a's own coverage check requires FULL coverage (a superset of "any
+    # ordered blueprint absent"), but a dead name that sits ALONGSIDE a live,
+    # correctly-covered one slips past B2a and reaches the B3 walk unfiltered,
+    # where parse_dag(undef) => {} makes blueprint_settled trivially true --
+    # a false terminal report ("blueprint-done"/"done") for a blueprint never
+    # touched this run. order.json on disk is NEVER rewritten here (only
+    # record-order writes it) -- recomputed and re-logged on every `next` call
+    # for as long as the stale name persists, matching this file's existing
+    # convention for repeated, non-deduped WARN logging.
+    if (defined $order && @$order) {
+        my %exists = map { $_ => 1 } @all_bps;
+        my @pruned = grep { $exists{$_} } @$order;
+        if (@pruned != @$order) {
+            my @dropped = grep { !$exists{$_} } @$order;
+            _append_run_log($dsdir, 'ORDER-PRUNE (blueprint no longer on disk): ' . join(',', @dropped));
+            $order = \@pruned;
+        }
+    }
+
     # B2: no order recorded → need-order
     unless (defined $order && @$order) {
         my $action = { action => 'need-order', candidates => \@candidates };
@@ -940,8 +961,17 @@ NEXT-ACTION JSON  (exactly one per `next`)
   {"action":"need-order","candidates":[…]}          no order yet; session must judge+record
   {"action":"run-package","blueprint":B,"package":P} drive this package next
   {"action":"pause","until_epoch":E,"reason":"usage"} timed auto-resume at epoch E
-  {"action":"pause","until_epoch":null,"reason":"token"} TERMINAL relogin park (re-login, re-invoke)
+  {"action":"stop","reason":"token-refresh-failed","detail":…} token could not be
+                                                     refreshed; the wake-lock is released and the
+                                                     run ends. NOT a pause: a pause promises a
+                                                     resume, and there is none until a human
+                                                     re-authenticates.
   {"action":"blueprint-done","blueprint":B,"pending":[…]} B settled; pending = remaining bps to re-eval
+  {"action":"in-flight","blueprint":B,"packages":[…],"running":[…]}
+                                                     nothing dispatchable right now, but B still
+                                                     holds non-terminal packages (typically owned by
+                                                     a concurrent worker). NOT completion: stopping
+                                                     here kills the run mid-package.
   {"action":"done"}                                  every in-scope blueprint is done-or-parked
 
   Keep-awake is a director-managed SIDE EFFECT (started when work is runnable or a
@@ -951,7 +981,9 @@ GOVERNOR VERDICT CONSUMED  (from bp-usage-gate.pl verdict — pkg-02)
   {"action":"ok"|"pause-usage"|"pause-token"|"unavailable","until_epoch":E|null,"reason":…}
   ok           → proceed
   pause-usage  → pause reason=usage, until_epoch=E
-  pause-token  → pause reason=token, until_epoch=null (hard-stop relogin)
+  pause-token  → attempt a refresh (bp-token-keeper). Recovered → proceed;
+                 failed → action=stop, wake-lock released, error logged.
+                 Solo NEVER pauses for token expiry — see _token_recover.
   unavailable  → retry a few times, then degrade-and-proceed (log "governance degraded")
 
 STATE  (<data>/.drive-solo/, all director-owned)

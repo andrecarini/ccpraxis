@@ -46,7 +46,12 @@ BEGIN { $ENV{MSYS2_ARG_CONV_EXCL} = '*' if $^O =~ /^(MSWin32|cygwin|msys)$/; }
 # GOVERNOR VERDICT CONSUMED (director contract — Decision #12/#13):
 #   {"action":"ok","until_epoch":null,"reason":"ok"}
 #   {"action":"pause-usage","until_epoch":<epoch_secs>,"reason":"usage"}
-#   {"action":"pause-token","until_epoch":null,"reason":"token"}
+#   {"action":"pause-token","until_epoch":<epoch_secs>,"reason":"token"}
+#     Not a hard-stop: until_epoch is a real wake time (expiry + grace). This
+#     gate reports a TIMED condition, not a demand for human intervention --
+#     the access token auto-refreshes. Its only consumer (bp-drive-next.pl)
+#     does not wait on the epoch; it refreshes immediately and treats success
+#     as recovery, failure as a separate, genuinely terminal `stop`.
 #   {"action":"unavailable","until_epoch":null,"reason":"telemetry"|"creds"}
 #
 # Tunables (env):
@@ -246,10 +251,14 @@ LEGACY TEXT PATH (no arg) — one line + exit code:
 
 VERDICT SUBCOMMAND (bp-usage-gate.pl verdict) — always exit 0, ONE single-line JSON:
   {"action":"ok"|"pause-usage"|"pause-token"|"unavailable","until_epoch":E|null,"reason":"..."}
-    ok           until_epoch=null         reason="ok"
-    pause-usage  until_epoch=<epoch secs>  reason="usage"   (timed auto-resume)
-    pause-token  until_epoch=null         reason="token"    (hard-stop relogin)
-    unavailable  until_epoch=null         reason="telemetry"|"creds"  (degrade-and-proceed)
+    ok           until_epoch=null            reason="ok"
+    pause-usage  until_epoch=<epoch secs>    reason="usage"   (timed auto-resume)
+    pause-token  until_epoch=<epoch secs>    reason="token"   (timed condition, not a hard-stop --
+                                                                 the only consumer refreshes immediately
+                                                                 rather than waiting on the epoch;
+                                                                 success=recovery, failure=a separate
+                                                                 stop/token-refresh-failed)
+    unavailable  until_epoch=null            reason="telemetry"|"creds"  (degrade-and-proceed)
 END_HELP
         return 0;
     }

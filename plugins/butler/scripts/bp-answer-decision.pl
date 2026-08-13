@@ -110,13 +110,22 @@ sub kind_family {
     return BpOrch::kind_family_of($k);   # undef -- unknown to every real producer
 }
 
-# plan_answer($kind, $action) -> { ok, family, action, ledger_status, clear_pause,
+# plan_answer($kind, $action, $pseudo) -> { ok, family, action, ledger_status, clear_pause,
 #                                  relaunch, reset_attempt, error }
 # The pure mapping the CLI executes. Fail-CLOSED on a nonsensical (kind, action)
 # pair: returns ok=0 with an explanatory error rather than guessing, so a
 # mistyped action can never, say, mark a stuck package 'done'.
+#
+# e04 §2.2: optional 3rd arg $pseudo (boolean; omitted/undef = today's exact
+# behavior, backward-compatible with every existing 2-arg call). When true AND
+# the kind is family 'package', there is NO ledger to relaunch/reset/accept/
+# drop -- 'dag-stalled'/'remediation-escalation' are filed against pseudo-
+# packages ('_dag'/'_remediation'). The only action that makes sense is
+# 'acknowledge': clear the current queued alert without touching a ledger that
+# does not exist. This does not assert the underlying condition is fixed --
+# see spec §2.2's "Honesty property".
 sub plan_answer {
-    my ($kind, $action) = @_;
+    my ($kind, $action, $pseudo) = @_;
     my $fam = kind_family($kind);
     unless (defined $fam) {
         return { ok => 0, family => 'unknown',
@@ -131,6 +140,18 @@ sub plan_answer {
             unless $action eq 'resume';
         return { ok => 1, family => 'fleet', action => 'resume',
                  ledger_status => undef, clear_pause => 1, relaunch => 0, reset_attempt => 0 };
+    }
+    if ($pseudo && $fam eq 'package') {
+        $action = 'acknowledge' unless defined $action && length $action;
+        return { ok => 0, family => 'package', pseudo => 1,
+                 error => "'" . ($kind // '') . "' is filed against a pseudo-package with no ledger to "
+                        . "relaunch/reset/accept/drop. Fix the underlying condition externally (e.g. "
+                        . "'bp-blueprint.pl set-deps' for a DAG cycle), then run --action acknowledge "
+                        . "to clear this decision. If the condition is not actually fixed, the "
+                        . "orchestrator will re-file the same decision on its next tick." }
+            unless $action eq 'acknowledge';
+        return { ok => 1, family => 'package', pseudo => 1, action => 'acknowledge',
+                 ledger_status => undef, clear_pause => 0, relaunch => 0, reset_attempt => 0 };
     }
     $action = 'relaunch' unless defined $action && length $action;
     my %status_for = ( relaunch => 'pending', reset => 'pending', accept => 'done', drop => 'dropped' );
@@ -367,6 +388,20 @@ sub clear_pkg_decisions {
     return $n;
 }
 
+# _log_pseudo_ack($runs, $pkg, $kind, $note) — e04 §2.2: a pseudo-package
+# acknowledge has no ledger to carry --note (there is nothing to append to),
+# so the note is not fabricated into a location that doesn't exist. Best-
+# effort logged to orchestrator.log instead, so the resolution is not silently
+# dropped. Never fatal: a log write failure here must not block the
+# acknowledge itself.
+sub _log_pseudo_ack {
+    my ($runs, $pkg, $kind, $note) = @_;
+    return unless defined $runs;
+    eval { BpOrch::_log("$runs/orchestrator.log", 'pseudo_package_acknowledge',
+        { package => $pkg, kind => $kind, note => $note }); 1 };
+    return;
+}
+
 unless (caller) {
     require JSON::PP;
     my ($bp, $bpdir, $decision, $package, $action, $note, $widen_write_set, $set_write_set);
@@ -507,6 +542,14 @@ unless (caller) {
         $kind = $rec->{kind};
     }
 
+    # e04 §2.2: 'dag-stalled'/'remediation-escalation' are filed against
+    # pseudo-packages ('_dag'/'_remediation') with no ledger to act on. Keyed
+    # on the package name starting with '_' -- works identically for both
+    # --decision mode (package comes from the decision record) and direct
+    # --package mode (package comes straight from --package), free symmetry
+    # from the same check rather than a separate design.
+    my $is_pseudo = defined $pkg && $pkg =~ /^_/;
+
     # b17 1.2/C3/C8(b): --widen-write-set is its own, standalone, additive mutation —
     # NOT folded into the relaunch/reset/accept/drop pipeline below. It never touches
     # ledger status/last_updated or the registry, so it cannot be entangled with
@@ -532,15 +575,26 @@ unless (caller) {
         widen_write_set("$bpdir/packages/$pkg.md", $trimmed);   # never returns
     }
 
-    my $plan = BpAnswer::plan_answer($kind, $action);
-    unless ($plan->{ok}) { print STDERR "bp-answer-decision: $plan->{error}\n"; exit 2; }
+    my $plan = BpAnswer::plan_answer($kind, $action, $is_pseudo);
+    unless ($plan->{ok}) {
+        # e04/e02 seam: name the specific pseudo-package target in the CLI's
+        # own stderr, on top of plan_answer's kind-only message -- a
+        # ledger-targeted refusal, not merely a generic kind-shaped one.
+        my $suffix = ($is_pseudo && defined $pkg && length $pkg) ? " (package '$pkg')" : '';
+        print STDERR "bp-answer-decision: $plan->{error}$suffix\n"; exit 2;
+    }
 
     my $superseded = [];
     my $cleared    = 0;
     # b18: undef when no --note was supplied; 1/0 when one was, so a rejected
     # set-next-action is reported rather than swallowed.
     my $next_action_updated;
-    if ($plan->{family} eq 'package') {
+    if ($plan->{family} eq 'package' && $plan->{pseudo}) {
+        # No ledger exists -- nothing to supersede, mutate, or gate on
+        # coordinator liveness. --note has no ledger to land in; best-effort
+        # logged rather than silently dropped (spec §2.2/§7 edge case 2).
+        _log_pseudo_ack($runs, $pkg, $kind, $note) if defined $note && length $note;
+    } elsif ($plan->{family} eq 'package') {
         unless (defined $pkg && length $pkg && -f "$bpdir/packages/$pkg.md") {
             print STDERR "bp-answer-decision: package ledger not found for '" . ($pkg // '') . "'\n"; exit 2;
         }

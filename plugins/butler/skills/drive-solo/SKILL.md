@@ -48,12 +48,13 @@ Call `bp-drive-next.pl next --scope <scope>` → dispatch the returned action **
 | `need-order` | JUDGE the blueprint order over `candidates` (dependencies / risk / value — a Claude judgment, Decision #3), then persist it. | `bp-drive-next.pl record-order <bp> [<bp> …]`, then `next` again |
 | `run-package` | Drive `action.package` of `action.blueprint` through its pipeline per **`coordinator-protocol` VERBATIM** — flat plugin-namespaced `bp-*` worker tree, ledger kept current, disk-is-truth verify each worker. | `next` again |
 | `pause` (reason=`usage`) | Wait **token-cheaply** until `action.until_epoch` — **Monitor** with an until-condition, or **ScheduleWakeup** to the epoch under `/loop`; never busy-poll, never spin tokens. | `next` again (after the epoch) |
-| `pause` (reason=`token`) | **TERMINAL relogin park:** tell the user to `/login` and re-invoke `drive-solo`; add to the end-batch (Decision #15). NOT an auto-resume. | *(none — stop; user re-invokes)* |
+| `stop` (reason=`token-refresh-failed`) | **Genuinely terminal:** the director already tried and failed to refresh the token (via `bp-token-keeper.pl`). Tell the user to `/login` and re-invoke `drive-solo`; add to the end-batch (Decision #15). NOT an auto-resume. | *(none — stop; user re-invokes)* |
 | `blueprint-done` | RE-EVALUATE the still-`pending` blueprints' validity (semantic Claude judgment, Decision #3/#4/#17); PARK the stale/moot ones. | `bp-drive-next.pl park <blueprint> <reason…>` for each stale bp, then `next` again |
 | `done` | Present ALL batched decisions/parks in ONE pass (Decision #5): per-blueprint done/total, every accumulated park with its one-line decision + verify command, any governance-degraded note, any relogin. | *(none — run settled; stop)* |
 
 > The **governor** verdict (`bp-usage-gate.pl verdict`) that produces a `pause` is fetched INTERNALLY by the director — the session never runs it (Decision #13).
 > **Keep-awake** is a director-managed side-effect, never a session action (Decision #7).
+> A merely-**stale** token (still refreshable) is recovered **transparently** before any action ever surfaces to the session — the director attempts the refresh on-demand inside `next` the moment the governor reports the token floor, and proceeds silently on success. No session-visible row exists for that path by design; `stop`/`token-refresh-failed` above fires only once that refresh attempt has actually failed.
 
 ## Never end a turn with nothing scheduled — **mechanically enforced**
 
