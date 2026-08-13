@@ -1984,6 +1984,8 @@ sub _tunables_base {
         creds_bo_max  => $ENV{BP_CREDS_BACKOFF_MAX_SECS}  // 1800, # b03: ceiling
         remediation_rounds => $ENV{BP_REMEDIATION_ROUNDS} // 2,    # b07: per-finding round budget (Decision #21)
         remediation_cap    => $ENV{BP_REMEDIATION_CAP}    // 6,    # b07: global rounds opened per run (SYN-7)
+        min_relaunch => $ENV{BP_MIN_RELAUNCH_SECS} // 30,  # r01: floor between two watchdog
+                                                             # relaunches of the SAME package
     };
 }
 
@@ -2140,6 +2142,12 @@ sub run {
     # section): a package that can never be checkpointed says so once, not once
     # per interval for the life of the run.
     my %ckpt_warned;
+    # r01: pkg => epoch of the last watchdog-issued relaunch THIS process. LOOP-SCOPE
+    # and deliberately NOT persisted to registry.json — see spec §5: persisting this
+    # would silently break t/68-exit-reason-classification.t's C4 oracle, which drives
+    # four SEPARATE go() calls at a fixed $now to simulate four restarts. Same
+    # convention/rationale as %seen/%ckpt above.
+    my %last_relaunch_at;
     # judge in-flight + start-epoch state lives on disk (judge_inflight*), so nothing
     # to declare here — it survives an orchestrator restart (A5).
     my (@s5, @s7);       # usage utilization samples [[epoch,pct],...]
@@ -2464,6 +2472,20 @@ sub run {
             # ---- JUDGES (A5): consume completed verdicts, then fire new ones ----
             my $mode = BpJudge::harvest_mode($t->{harvest});
             my $reg  = read_registry($runs);
+
+            # r01: %att/%pid/%sid are built by _load_state from keys %$dag only (blueprint.md's
+            # table). remediation_merge (above, in this same tick) adds remediation-queue package
+            # ids into %meta strictly AFTER that read, so those ids were never DAG keys and are
+            # missing from %att/%pid/%sid -- not 0-then-incrementing, but undef forever. Backfill
+            # from the SAME registry read every other package already uses, keyed by package name
+            # exactly like bp-launch.sh's own increment (bp-launch.sh:110) -- no second counter,
+            # no new schema field, no change to remediation_merge's signature.
+            for my $pkg (keys %$meta) {
+                next if exists $att->{$pkg};        # already populated by _load_state's DAG loop
+                $att->{$pkg} = $reg->{$pkg}{attempt} // 0;
+                $pid->{$pkg} = $reg->{$pkg}{pid};
+                $sid->{$pkg} = $reg->{$pkg}{session_id};
+            }
 
             # (a) RESOLVE verdicts — a stuck package's resolve-judge has returned.
             for my $pkg (sort keys %$meta) {
@@ -3079,12 +3101,22 @@ sub run {
                         push @live, $pkg;
                     } elsif ($v eq 'cold-relaunch') {
                         next if $shutdown;     # shutdown gate (A4) parks it; we don't relaunch
+                        # r01 Fix B: never kill a still-alive coordinator you've decided not to
+                        # replace this tick — check the min-interval floor BEFORE kill_pid.
+                        my $last = $last_relaunch_at{$pkg};
+                        if (defined $last && ($now - $last) < $t->{min_relaunch}) {
+                            _log($log, 'relaunch_deferred', { package => $pkg, reason => 'min_interval',
+                                since_last => $now - $last, min_relaunch => $t->{min_relaunch} });
+                            push @live, $pkg;
+                            next;
+                        }
                         _log($log, 'watchdog_kill_wedged', { package => $pkg, pid => $pid->{$pkg}, attempts => $att->{$pkg} });
                         kill_pid($pid->{$pkg});
                         my $snap = launch_snapshot($bpdir, $runs, $pkg, $now);
                         my $rc = $launch->({ pkg => $pkg, args => [], kind => 'cold-wedged' });
                         $note_exec->($pkg, $rc);
                         if (defined $rc && $rc == 0) { _upd_pkg($runs, $log, $pkg, { launch_snapshot => $snap }); push @live, $pkg;
+                                                       $last_relaunch_at{$pkg} = $now;
                                                        _observe_cache($bpdir, $pkg, $now, $log); }
                         else { _log($log, 'launch_failed', { package => $pkg, kind => 'cold-wedged', rc => $rc }); }
                     } elsif ($v eq 'block') {
@@ -3129,7 +3161,11 @@ sub run {
                                                         _reg_int($reg->{$pkg}{rate_limit_discounts}) // 0),
                         cap => $t->{cap} });
                     if ($v eq 'relaunch') {
-                        if (@live < $t->{max_par}) {
+                        my $last = $last_relaunch_at{$pkg};
+                        if (defined $last && ($now - $last) < $t->{min_relaunch}) {
+                            _log($log, 'relaunch_deferred', { package => $pkg, reason => 'min_interval',
+                                since_last => $now - $last, min_relaunch => $t->{min_relaunch} });
+                        } elsif (@live < $t->{max_par}) {
                             # Continuation bookkeeping is COMPUTED here (the widened
                             # budget has to be known before @args is built) but only
                             # PERSISTED after a successful launch — a relaunch that
@@ -3265,6 +3301,7 @@ sub run {
                                 _upd_pkg($runs, $log, $pkg, { %pending_reg, launch_snapshot => $snap });
                                 $reg->{$pkg}{$_} = $pending_reg{$_} for keys %pending_reg;
                                 push @live, $pkg;
+                                $last_relaunch_at{$pkg} = $now;
                                 _observe_cache($bpdir, $pkg, $now, $log);
                             } else {
                                 # nothing was exec'd: roll the widened budget back so the
