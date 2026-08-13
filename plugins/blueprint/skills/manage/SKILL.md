@@ -22,10 +22,10 @@ This is not optional bookkeeping — it is what makes the listing true. The ledg
 
 `--archive` is on here deliberately: the operator should never have to ask for a finished blueprint to be closed out. Report what it moved rather than staying silent about it.
 
-Then glob `<data>/blueprints/*/blueprint.md` (skip `_archive/`). For each, read the metadata block `status` and the Package status table; present a per-blueprint digest: blueprint status, packages done/total, anything ⛔ blocked / ⏸ parked. Mention archived ones (under `_archive/`) by name only.
+Then glob `<data>/blueprints/*/blueprint.md` (skip `_archive/`). For each, read the metadata block `status`; per-package done/total and anything blocked/parked comes from the ledger-sourced rollup (`BpState`/`bp-status.sh`), not from the table — the table no longer carries a status column (Decision 11). Present a per-blueprint digest: blueprint status, packages done/total, anything blocked/parked. Mention archived ones (under `_archive/`) by name only.
 
 ## view <name>
-Read `blueprints/<name>/blueprint.md`; summarize Objective, Decisions count, the Package status table, and any open escalations/incidents. Don't dump the whole file unless asked.
+Read `blueprints/<name>/blueprint.md`; summarize Objective, Decisions count, the Package status table (pkg/deliverable/depends_on/model — it carries no status column), and any open escalations/incidents. Per-package status comes from the same ledger-sourced rollup as `list`. Don't dump the whole file unless asked.
 
 ## audit <name>
 Dispatch the auditor via Task with `subagent_type: blueprint:bp-auditor`, pointed at the blueprint dir. Present its numbered questions to the user in one batched `AskUserQuestion` pass, fold answers into the blueprint, and refresh `last_updated`. Use after substantial revisions or before handing a blueprint to butler.

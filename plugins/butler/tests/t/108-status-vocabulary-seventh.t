@@ -49,43 +49,43 @@ sub slurp_raw {
 my $G_DROPPED = "\xF0\x9F\x97\x91";
 
 # ---------------------------------------------------------------------------
-# A1 -- the vocabulary itself
+# A1-A5 -- RETARGETED for s03-drop-table-status-column (spec §2.6).
+#
+# A1-A5 tested bp-blueprint.pl's glyph/legend/set-status TABLE vocabulary,
+# which s03 deletes outright (Decision 11: the table carries no status at
+# all, so it needs no vocabulary to validate against). That deletion is
+# CORRECT and not a regression of the defect this file exists to pin --
+# `dropped` remains a valid LEDGER status with live guards (A6-A8, UNTOUCHED
+# below: bp-drive-next.pl, bp-orchestrator.pl, ledger-guard.sh, gate-stop.sh,
+# bp-ledger.pl); it simply stops being a TABLE concept.
+#
+# This block replaces A1-A5 with the deletion verification the spec asks
+# for: every symbol A1-A5 used to test is actually gone from
+# bp-blueprint.pl's source, the retired verbs fail with the new ledger-
+# pointer message (not a generic error, not a silent success), and the
+# shipped template no longer carries a "Status values:" line to seed any
+# vocabulary bug in the first place.
 # ---------------------------------------------------------------------------
 my $src = slurp_raw($SCRIPT);
-ok(defined $src, 'A1: bp-blueprint.pl is readable');
+ok(defined $src, 'A1-A5(retargeted): bp-blueprint.pl is readable');
 
-# The source writes every glyph as a \x escape, not as raw bytes, so that the
-# script itself stays ASCII on disk. Assert that form, not the decoded bytes.
-like($src, qr/\$G_DROPPED\s*=\s*"\\xF0\\x9F\\x97\\x91"/i,
-    'A1: $G_DROPPED is defined as the wastebasket escape');
-like($src, qr/"\$G_DROPPED dropped"/,
-    'A1: @STATUS_VALUES carries a glyph-prefixed `dropped` entry');
-like($src, qr/dropped\s*=>\s*\$G_DROPPED/,
-    'A1: %WORD2GLYPH maps the bare word `dropped` to its glyph');
+unlike($src, qr/\$G_DROPPED\b/,        'A1-A5(retargeted): $G_DROPPED is gone');
+unlike($src, qr/\@STATUS_VALUES\b/,    'A1-A5(retargeted): @STATUS_VALUES is gone');
+unlike($src, qr/%WORD2GLYPH\b|\bWORD2GLYPH\b/, 'A1-A5(retargeted): %WORD2GLYPH is gone');
+unlike($src, qr/\bstatus_help\b/,      'A1-A5(retargeted): status_help is gone');
+unlike($src, qr/\bnormalize_status\b/, 'A1-A5(retargeted): normalize_status is gone');
+unlike($src, qr/\bop_refresh_legend\b/, 'A1-A5(retargeted): op_refresh_legend is gone');
+unlike($src, qr/'refresh-legend'/,     'A1-A5(retargeted): the refresh-legend dispatch entry is gone');
 
-# The count and the vocabulary must not be transcribed anywhere. Three call
-# sites each had their own copy and all three still said "six" after the
-# seventh status landed -- accepting `dropped` while denying it was a status.
-unlike($src, qr/recognised statuses/ && qr/\bsix\b[^\n]*recognised statuses/,
-    'A1: no message still claims there are six recognised statuses');
-my @help_sites = $src =~ /status_help\(\)/g;
-cmp_ok(scalar @help_sites, '>=', 3,
-    'A1: every status-validation message is rendered via status_help(), not transcribed');
-
-# ---------------------------------------------------------------------------
-# A2 -- set-status ACCEPTS dropped, on a real copy
-#
-# This is the assertion that fails against the old code: normalize_status
-# returned undef for `dropped` and set-status called arg_error.
-# ---------------------------------------------------------------------------
 my $dir = tempdir(CLEANUP => 1);
 my $bp  = "$dir/blueprint.md";
 
 my $tpl = slurp_raw($TEMPLATE);
-ok(defined $tpl && length $tpl, 'A2: template is readable and non-empty');
+ok(defined $tpl && length $tpl, 'A1-A5(retargeted): template is readable and non-empty');
 
 # A minimal blueprint with one package row, satisfying parse_dag's contract:
-# a header row naming depends_on, contiguous rows beneath it.
+# a header row naming depends_on, contiguous rows beneath it. New shape (no
+# status column), matching the edited template.
 my $fixture = <<"BP";
 ---
 blueprint: vocab-fixture
@@ -94,11 +94,9 @@ status: audited
 
 ## Package status
 
-| package | objective | depends_on | model | status |
-|---|---|---|---|---|
-| p01-alpha | does a thing | - | sonnet | \xE2\xAC\x9C pending |
-
-Status values: \xE2\xAC\x9C pending \xC2\xB7 \xF0\x9F\x94\xA7 running
+| package | objective | depends_on | model |
+|---|---|---|---|
+| p01-alpha | does a thing | - | sonnet |
 
 ## Packages
 BP
@@ -106,60 +104,24 @@ BP
 open my $fh, '>:raw', $bp or die "cannot write fixture: $!";
 print {$fh} $fixture;
 close $fh;
+my $before_digest = slurp_raw($bp);
 
 my $out = `perl "$SCRIPT" set-status --file "$bp" --pkg p01-alpha --status dropped 2>&1`;
 my $rc  = $?;
-is($rc, 0, 'A2: set-status --status dropped exits 0')
-    or diag("output: $out");
-unlike($out, qr/not one of the/,
-    'A2: set-status does not reject `dropped` as unrecognised');
+isnt($rc, 0, 'A1-A5(retargeted): set-status --status dropped is refused (retirement is unconditional -- not even a real vocabulary word survives)');
+like($out, qr/Decision 11/, 'A1-A5(retargeted): set-status refusal cites Decision 11');
+like($out, qr/bp-ledger\.pl\s+set-status/, 'A1-A5(retargeted): set-status refusal points at bp-ledger.pl set-status');
+is(slurp_raw($bp), $before_digest, 'A1-A5(retargeted): set-status refusal leaves the file byte-identical');
 
-my $after = slurp_raw($bp);
-like($after, qr/\Q$G_DROPPED\E dropped/,
-    'A2: the package row now carries the canonical glyph-prefixed `dropped`');
+my $out2 = `perl "$SCRIPT" set-field --file "$bp" --pkg p01-alpha --field status --value dropped 2>&1`;
+my $rc2  = $?;
+isnt($rc2, 0, 'A1-A5(retargeted): set-field --field status is refused identically');
+like($out2, qr/Decision 11/, 'A1-A5(retargeted): set-field --field status refusal cites Decision 11');
+is(slurp_raw($bp), $before_digest, 'A1-A5(retargeted): set-field --field status refusal leaves the file byte-identical');
 
-# ---------------------------------------------------------------------------
-# A3 -- refresh-legend RENDERS the legend from the vocabulary
-#
-# The fixture's legend deliberately lists only two of the seven values, so a
-# verb that merely preserved the line would fail here.
-# ---------------------------------------------------------------------------
-my $lout = `perl "$SCRIPT" refresh-legend --file "$bp" 2>&1`;
-is($?, 0, 'A3: refresh-legend exits 0') or diag("output: $lout");
-
-my $legended = slurp_raw($bp);
-my ($legend) = $legended =~ /^(Status values:.*)$/m;
-ok(defined $legend, 'A3: a `Status values:` line survives the rewrite');
-
-for my $word (qw(done pending running reviewing blocked parked dropped)) {
-    like($legend, qr/\b\Q$word\E\b/, "A3: legend names `$word`");
-}
-
-# The point of rendering rather than transcribing: the legend cannot list a
-# value the vocabulary does not have, nor omit one it does.
-my @legend_words = $legend =~ /\b(done|pending|running|reviewing|blocked|parked|dropped)\b/g;
-is(scalar @legend_words, 7, 'A3: legend lists exactly the seven statuses, no more');
-
-# ---------------------------------------------------------------------------
-# A4 -- refusal, not invention
-# ---------------------------------------------------------------------------
-my $noleg = "$dir/no-legend.md";
-open my $nfh, '>:raw', $noleg or die $!;
-print {$nfh} "---\nblueprint: x\n---\n\n## Package status\n\nnothing here\n";
-close $nfh;
-
-my $nout = `perl "$SCRIPT" refresh-legend --file "$noleg" 2>&1`;
-isnt($?, 0, 'A4: refresh-legend fails when there is no legend line');
-like($nout, qr/refusing to\s+invent one/,
-    'A4: it refuses to invent a legend rather than appending one');
-
-# ---------------------------------------------------------------------------
-# A5 -- the shipped template no longer seeds the six-value bug
-# ---------------------------------------------------------------------------
-my ($tpl_legend) = $tpl =~ /^(Status values:.*)$/m;
-ok(defined $tpl_legend, 'A5: the template has a legend line');
-like($tpl_legend, qr/\bdropped\b/,
-    'A5: the template legend names `dropped`, so new blueprints do not inherit the defect');
+# The shipped template no longer carries a "Status values:" legend line at all.
+unlike($tpl, qr/^\s*Status values:/m,
+    'A1-A5(retargeted): the template has no "Status values:" legend line');
 
 # ---------------------------------------------------------------------------
 # A6 -- the other two scripts still agree `dropped` is terminal.

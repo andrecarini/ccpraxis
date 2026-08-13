@@ -48,7 +48,7 @@ containment check you actually have.
 
 - Update **before** any long or risky operation ("write the chart entry before treating") and **after** every meaningful result.
 - `## Next action` is ALWAYS current: the exact instruction your replacement executes first. Update it before starting a step, not after finishing it.
-- Status transitions you own (**via `bp-ledger.pl set-status`** — see "Editing the ledger" below; never by hand-editing frontmatter): `pending → running → converging → reviewing → done | blocked | parked`. Note: `converging` is a **ledger-only (coordinator-internal)** status — it signals the implementation loop is iterating; it is never shown in the blueprint's Package status table, which is maintained above you (by the deterministic orchestrator script + the reporter), not by you.
+- Status transitions you own (**via `bp-ledger.pl set-status`** — see "Editing the ledger" below; never by hand-editing frontmatter): `pending → running → converging → reviewing → done | blocked | parked`. Note: `converging` is a **ledger-only (coordinator-internal)** status — it signals the implementation loop is iterating; it is never shown in blueprint.md's Package status table at all — that table carries no status column; per-package progress is read from ledgers via `/butler:status`, never authored by you into blueprint.md.
 - The Stop hook will refuse to end your session unless status is terminal, the file is fresh, and (for blocked/parked) Next action is concrete. This is by design — satisfy it, don't fight it.
 - Append decisions, attempts, and outcomes to `## Decisions & attempt log` with timestamps. The `## Dispatch log (auto)` section is hook-maintained; add narrative elsewhere, never edit that section.
 

@@ -168,7 +168,13 @@ sub run_hook {
 # A minimal blueprint.md-shaped fixture: legend prose (no `depends_on` token anywhere above the
 # table -- SYN-14 clean), then a package-status table `parse_dag` can latch onto, contiguous rows,
 # then a trailing decisions section. Carries one non-ASCII path (Andr\x{e9}-class) and one multi-byte
-# status glyph, per G11.
+# glyph pair, per G11.
+#
+# RETARGETED for s03-drop-table-status-column (spec §4, G0 row): the table is now the
+# 4-column new shape (pkg | deliverable | depends_on | model) -- no `status` column, matching
+# the edited template. G11's byte-survival intent (multi-byte, non-ASCII bytes must survive a
+# mutation byte-for-byte) is preserved by moving the same glyph bytes into the DELIVERABLE cell
+# text instead of a status cell -- they are now arbitrary non-ASCII payload, not a status glyph.
 my $DONE    = "\xE2\x9C\x85"; # U+2705 white heavy check mark
 my $PENDING = "\xE2\xAC\x9C"; # U+2B1C white large square
 sub base_fixture {
@@ -177,14 +183,14 @@ sub base_fixture {
         '',
         '## Status legend',
         '',
-        "$DONE done, $PENDING pending",
+        "$DONE done, $PENDING pending -- prose only, not read by any typed verb",
         '',
         '## Packages',
         '',
-        '| pkg | deliverable | depends_on | status | model |',
-        '|---|---|---|---|---|',
-        "| b01 | first thing | \xE2\x80\x94 | $DONE done | sonnet |",
-        "| b02 | second thing (path /home/Andr\xC3\xA9/work) | b01 | $PENDING pending | sonnet |",
+        '| pkg | deliverable | depends_on | model |',
+        '|---|---|---|---|',
+        "| b01 | first thing $DONE | \xE2\x80\x94 | sonnet |",
+        "| b02 | second thing $PENDING (path /home/Andr\xC3\xA9/work) | b01 | sonnet |",
         '',
         '## Decisions',
         '',
@@ -210,14 +216,14 @@ sub table_decisions_fixture {
         '',
         '## Status legend',
         '',
-        "$DONE done, $PENDING pending",
+        "$DONE done, $PENDING pending -- prose only, not read by any typed verb",
         '',
         '## Packages',
         '',
-        '| pkg | deliverable | depends_on | status | model |',
-        '|---|---|---|---|---|',
-        "| b01 | first thing | \xE2\x80\x94 | $DONE done | sonnet |",
-        "| b02 | second thing (path /home/Andr\xC3\xA9/work) | b01 | $PENDING pending | sonnet |",
+        '| pkg | deliverable | depends_on | model |',
+        '|---|---|---|---|',
+        "| b01 | first thing $DONE | \xE2\x80\x94 | sonnet |",
+        "| b02 | second thing $PENDING (path /home/Andr\xC3\xA9/work) | b01 | sonnet |",
         '',
         $header,
         '',
@@ -238,14 +244,14 @@ sub synthesis_bullet_fixture {
         '',
         '## Status legend',
         '',
-        "$DONE done, $PENDING pending",
+        "$DONE done, $PENDING pending -- prose only, not read by any typed verb",
         '',
         '## Packages',
         '',
-        '| pkg | deliverable | depends_on | status | model |',
-        '|---|---|---|---|---|',
-        "| b01 | first thing | \xE2\x80\x94 | $DONE done | sonnet |",
-        "| b02 | second thing | b01 | $PENDING pending | sonnet |",
+        '| pkg | deliverable | depends_on | model |',
+        '|---|---|---|---|',
+        "| b01 | first thing $DONE | \xE2\x80\x94 | sonnet |",
+        "| b02 | second thing $PENDING | b01 | sonnet |",
         '',
         '## Synthesis decisions',
         '',
@@ -270,7 +276,7 @@ cmp_ok(-s $LIVE_BP, ">", 50_000,
     my $b = base_fixture();
     ok($b =~ /depends_on/, "FIXTURE-SANITY: base_fixture carries the depends_on column");
     ok($b =~ /Andr\xC3\xA9/, "FIXTURE-SANITY: base_fixture carries a non-ASCII (Andr\x{e9}-class) byte sequence");
-    ok($b =~ /$DONE/ && $b =~ /$PENDING/, "FIXTURE-SANITY: base_fixture carries multi-byte status glyphs");
+    ok($b =~ /$DONE/ && $b =~ /$PENDING/, "FIXTURE-SANITY: base_fixture carries multi-byte non-ASCII bytes (deliverable text, not a status glyph -- s03 dropped the status column)");
     my $dag = BpOrch::parse_dag($b);
     ok(exists $dag->{b01} && exists $dag->{b02}, "FIXTURE-SANITY: the real parse_dag sees both fixture packages");
     is_deeply($dag->{b02}, ['b01'], "FIXTURE-SANITY: parse_dag resolves b02's dependency on b01");
@@ -284,17 +290,21 @@ cmp_ok(-s $LIVE_BP, ">", 50_000,
 
 # =====================================================================================
 # G1 (DC-1): every write round-trips -- parse_dag output byte-identical (structurally) before/after
-# a mutation that should not change the DAG (set-status, add-decision).
+# a mutation that should not change the DAG (set-field on a non-dependency column, add-decision).
+#
+# RETARGETED for s03-drop-table-status-column (spec §4, G1 first block): set-status is retired
+# and the table carries no status column to mutate. `set-field --field model` is the live verb
+# exercising the identical "non-DAG mutation, DAG unchanged" property.
 # =====================================================================================
 
 {
     my $p = stage_bytes(base_fixture());
     my $dag_before = BpOrch::parse_dag(read_file($p));
-    my ($rc, $out, $err) = run_pl(['set-status', '--file', $p, '--pkg', 'b02', '--status', 'done']);
-    is($rc, 0, "G1: set-status --pkg b02 --status done exits 0");
+    my ($rc, $out, $err) = run_pl(['set-field', '--file', $p, '--pkg', 'b02', '--field', 'model', '--value', 'opus']);
+    is($rc, 0, "G1: set-field --pkg b02 --field model --value opus exits 0");
     my $dag_after = BpOrch::parse_dag(read_file($p));
     is_deeply($dag_after, $dag_before,
-       "G1: parse_dag's structural output is unchanged by a status-only mutation (set-status)");
+       "G1: parse_dag's structural output is unchanged by a non-dependency-column mutation (set-field model)");
 }
 {
     my $p = stage_bytes(base_fixture());
@@ -374,23 +384,23 @@ cmp_ok(-s $LIVE_BP, ">", 50_000,
 }
 
 # =====================================================================================
-# G4 (DC-4): status values validate against the six-glyph vocabulary; unknown status refused.
+# G4 (DC-4 -- RETARGETED for s03-drop-table-status-column, spec §4 G4 row): status-value
+# validation no longer exists (there is no status column, no vocabulary to validate against).
+# set-status is now unconditionally refused, REGARDLESS of the value's validity -- this block's
+# new subject: prove the refusal does not depend on value validity by showing a REAL word
+# ('done') and GARBAGE ('bogus-status') are refused identically, same exit code, same message.
+# Comprehensive criterion-2 coverage of the retirement lives in t/118-table-has-no-status.t;
+# this block is t/86's own regression lock against set-status ever being reintroduced.
 # =====================================================================================
 
-{
-    for my $glyph ("$DONE done", "$PENDING pending", "\xF0\x9F\x94\xA7 running",
-                   "\xF0\x9F\x94\x8D reviewing", "\xE2\x9B\x94 blocked", "\xE2\x8F\xB8 parked") {
-        my $p = stage_bytes(base_fixture());
-        my ($rc, $out, $err) = run_pl(['set-status', '--file', $p, '--pkg', 'b02', '--status', $glyph]);
-        is($rc, 0, "G4: --status '$glyph' (one of the six live glyphs) is accepted");
-    }
-}
-{
+for my $value ('done', 'bogus-status') {
     my $p = stage_bytes(base_fixture());
     my $orig = read_file($p);
-    my ($rc, $out, $err) = run_pl(['set-status', '--file', $p, '--pkg', 'b02', '--status', 'bogus-status']);
-    isnt($rc, 0, "G4: an unknown status value is refused (non-zero exit)");
-    is(read_file($p), $orig, "G4: ...and the file is left byte-identical");
+    my ($rc, $out, $err) = run_pl(['set-status', '--file', $p, '--pkg', 'b02', '--status', $value]);
+    is($rc, 3, "G4: set-status --status '$value' is refused unconditionally (exit 3), value validity irrelevant");
+    like($err, qr/Decision 11/, "G4: refusal for '$value' cites Decision 11");
+    like($err, qr/bp-ledger\.pl\s+set-status/, "G4: refusal for '$value' points at bp-ledger.pl set-status");
+    is(read_file($p), $orig, "G4: ...and the file is left byte-identical for '$value'");
 }
 
 # =====================================================================================
@@ -422,6 +432,9 @@ cmp_ok(-s $LIVE_BP, ">", 50_000,
 
 # =====================================================================================
 # G6 (DC-6): concurrent writers serialise or one fails loudly; never partially written.
+#
+# RETARGETED for s03-drop-table-status-column (spec §4, G6 row): set-status -> set-field
+# --field model --value opus. Same locking/atomicity property, exercised via a live verb.
 # =====================================================================================
 
 {
@@ -436,7 +449,7 @@ cmp_ok(-s $LIVE_BP, ">", 50_000,
             local %ENV = (%CLEAN_ENV,
                           BWA_SCRIPT => fwd($SCRIPT), BWA_PKG => "b0$i");
             exec('bash', '-c',
-                'timeout 30 perl "$BWA_SCRIPT" set-status --file "$0" --pkg "$BWA_PKG" --status done '
+                'timeout 30 perl "$BWA_SCRIPT" set-field --file "$0" --pkg "$BWA_PKG" --field model --value opus '
               . '>/dev/null 2>/dev/null', $p);
             exit(127);
         }
@@ -445,7 +458,7 @@ cmp_ok(-s $LIVE_BP, ">", 50_000,
     my @rc;
     for my $pid (@kids) { waitpid($pid, 0); push @rc, ($? >> 8) }
     ok((grep { $_ == 0 } @rc) >= 1,
-       "G6: at least one of two concurrent set-status invocations succeeds (proves both actually ran)");
+       "G6: at least one of two concurrent set-field invocations succeeds (proves both actually ran)");
     my $after = read_file($p);
     ok(defined $after && length($after) > 0, "G6: the file exists and is non-empty after concurrent writers");
     my @lines = split /\n/, $after;
@@ -460,12 +473,18 @@ cmp_ok(-s $LIVE_BP, ">", 50_000,
 
 # =====================================================================================
 # G7 (DC-7): a refused operation leaves the file byte-identical -- asserted on a DIGEST.
+#
+# RETARGETED for s03-drop-table-status-column (spec §4, G7 first block): the original
+# exemplar was a status-value refusal, which no longer exists as a concept (set-status now
+# refuses UNCONDITIONALLY, regardless of value -- see G4). Swapped for a byte-identical-
+# refusal exemplar unrelated to status: add-package with a DUPLICATE pkg id (b01 already
+# exists in base_fixture -- verified independently as an already-refused path).
 # =====================================================================================
 
 {
     my $p = stage_bytes(base_fixture());
     my $before_digest = digest_of($p);
-    my ($rc, $out, $err) = run_pl(['set-status', '--file', $p, '--pkg', 'b02', '--status', 'not-a-real-status']);
+    my ($rc, $out, $err) = run_pl(['add-package', '--file', $p, '--pkg', 'b01', '--deliverable', 'a duplicate row']);
     isnt($rc, 0, "G7: the refusing operation itself exits non-zero (proves the op actually ran and was refused)");
     # `isnt($rc,0)` alone is NOT enough and would leave this criterion vacuous: a MISSING
     # script also exits non-zero ("Can't open perl script", rc=2), and then "digest
@@ -473,8 +492,8 @@ cmp_ok(-s $LIVE_BP, ">", 50_000,
     # tool, so G7 can only pass once refusal is really implemented.
     unlike($err, qr/Can't open perl script|No such file or directory/,
            "G7: the non-zero exit is a REFUSAL, not the script being absent");
-    like($err, qr/not-a-real-status/,
-         "G7: the refusal names the offending value (a real diagnostic, not a bare failure)");
+    like($err, qr/b01/,
+         "G7: the refusal names the offending duplicate pkg id (a real diagnostic, not a bare failure)");
     my $after_digest = digest_of($p);
     is($after_digest, $before_digest, "G7: the file's MD5 digest is unchanged by the refused operation");
 }
@@ -545,8 +564,12 @@ SKIP: {
         my ($rc1, $out1, $err1) = run_hook($hook_path, $deny_payload);
         isnt($rc1, 0, "G9: the hook DENIES a direct Write targeting the live blueprint.md path");
 
+        # Cosmetic swap only (s03-drop-table-status-column, spec §4 G9 row): the hook
+        # (guard-blueprint-write.sh) exits 0 for ANY non-Write/Edit/MultiEdit/NotebookEdit
+        # tool_name before ever inspecting the command string -- behaviour is unaffected
+        # either way. set-status is retired; use a live verb for prose accuracy.
         my $allow_payload = $J->encode({ tool_name => 'Bash', cwd => $PROJ,
-                            tool_input => { command => "perl $SCRIPT set-status --file $LIVE_BP --pkg x --status done" } });
+                            tool_input => { command => "perl $SCRIPT set-field --file $LIVE_BP --pkg x --field model --value opus" } });
         my ($rc2, $out2, $err2) = run_hook($hook_path, $allow_payload);
         is($rc2, 0, "G9: the hook does NOT deny a Bash invocation of the API's own writer (bp-blueprint.pl)");
     }
@@ -554,6 +577,11 @@ SKIP: {
 
 # =====================================================================================
 # G10 (DC-10): round-trip on the LIVE 70-package file: parse -> no-op rewrite -> digest unchanged.
+#
+# RETARGETED for s03-drop-table-status-column (spec §4, G10 row): set-status's no-op form
+# is gone. Read the package's CURRENT depends_on value via the unaffected `deps` read verb,
+# then feed it back through `set-deps` -- a genuine no-op on a live verb whose DAG-structural-
+# preservation is its own tested contract (G5).
 # =====================================================================================
 
 SKIP: {
@@ -567,9 +595,13 @@ SKIP: {
 cmp_ok(scalar(keys %$dag_before), ">=", 60,
    "G10: the real parse_dag sees a full-size package set in the live-copied file");
 
-    # A no-op rewrite: read the current status of a known package and set it to the SAME value.
-    my ($rc, $out, $err) = run_pl(['set-status', '--file', $p, '--pkg', 'b13-deterministic-ledger-api', '--status', "$DONE done"]);
-    is($rc, 0, "G10: a no-op set-status against the live-shaped full-size file exits 0");
+    my ($rc0, $depsout, $err0) = run_pl(['deps', '--file', $p, '--pkg', 'b13-deterministic-ledger-api']);
+    is($rc0, 0, "G10: deps --pkg b13-deterministic-ledger-api exits 0 (reads its current dependency value)");
+    (my $current_deps = $depsout) =~ s/\s+\z//;
+
+    # A no-op rewrite: write the SAME dependency value straight back.
+    my ($rc, $out, $err) = run_pl(['set-deps', '--file', $p, '--pkg', 'b13-deterministic-ledger-api', '--deps', $current_deps]);
+    is($rc, 0, "G10: a no-op set-deps against the live-shaped full-size file exits 0");
 
     my $dag_after = BpOrch::parse_dag(read_file($p));
     is_deeply($dag_after, $dag_before,
@@ -577,19 +609,24 @@ cmp_ok(scalar(keys %$dag_before), ">=", 60,
 }
 
 # =====================================================================================
-# G11 (DC-11): non-ASCII survives byte-for-byte -- Andr\x{e9}-class paths and multi-byte glyphs.
+# G11 (DC-11): non-ASCII survives byte-for-byte -- Andr\x{e9}-class paths and multi-byte bytes.
+#
+# RETARGETED for s03-drop-table-status-column (spec §4, G11 row): set-status -> set-field
+# --field model --value opus, both blocks. Non-ASCII survival is independently exercised by
+# the fixture text (Andr\x{e9}-class bytes) and the relocated glyph bytes now living in the
+# deliverable cell (G0's fixture change), so the mutating verb itself need not touch them.
 # =====================================================================================
 
 {
     my $p = stage_bytes(base_fixture());
     my $orig = read_file($p);
     ok(index($orig, "Andr\xC3\xA9") >= 0, "G11: fixture carries the raw UTF-8 bytes for 'Andr\x{e9}'");
-    my ($rc, $out, $err) = run_pl(['set-status', '--file', $p, '--pkg', 'b01', '--status', "$PENDING pending"]);
-    is($rc, 0, "G11: set-status against a non-ASCII-bearing file exits 0");
+    my ($rc, $out, $err) = run_pl(['set-field', '--file', $p, '--pkg', 'b01', '--field', 'model', '--value', 'opus']);
+    is($rc, 0, "G11: set-field against a non-ASCII-bearing file exits 0");
     my $new = read_file($p);
     ok(index($new, "Andr\xC3\xA9") >= 0, "G11: the Andr\x{e9}-class byte sequence survives byte-for-byte after the mutation");
     ok(index($new, $DONE) >= 0 || index($new, $PENDING) >= 0,
-       "G11: multi-byte status glyphs survive byte-for-byte after the mutation");
+       "G11: multi-byte non-ASCII bytes (relocated into the deliverable cell) survive byte-for-byte after the mutation");
 }
 SKIP: {
     # The live file itself is the strongest instance of this criterion (spec: "the live file carries
@@ -599,7 +636,7 @@ SKIP: {
     my $orig = read_file($p);
     ok(index($orig, "Andr\xC3\xA9") >= 0,
        "G11: the live blueprint.md (copied) actually contains the raw UTF-8 bytes for 'Andr\x{e9}'");
-    my ($rc) = run_pl(['set-status', '--file', $p, '--pkg', 'b13-deterministic-ledger-api', '--status', "$DONE done"]);
+    my ($rc) = run_pl(['set-field', '--file', $p, '--pkg', 'b13-deterministic-ledger-api', '--field', 'model', '--value', 'opus']);
     is($rc, 0, "G11: a mutation against the live-shaped copy exits 0");
     my $new = read_file($p);
     is(index($new, "Andr\xC3\xA9") >= 0 ? 1 : 0, 1,

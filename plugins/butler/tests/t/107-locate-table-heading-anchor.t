@@ -144,21 +144,35 @@ sub stage { my ($bytes) = @_; my $n = ++$pn; my $d = "$ROOT/w$n"; mkdir $d or di
     unlike($out, qr/\bledger\b/, 'AC-21(status): output does NOT name the prose table\'s "ledger" row');
 }
 
-# ── AC-21: `set-status` mutates the REAL row; the prose table's bytes are unchanged ──
+# ── AC-21: `set-field` (deliverable) mutates the REAL row; the prose table's bytes
+#           are unchanged ─────────────────────────────────────────────────────
+#
+# RETARGETED for s03-drop-table-status-column (spec §2.6): set-status is retired.
+# The spec's suggested `set-deps` substitute turned out to land on a DIFFERENT,
+# already-documented defect on this exact fixture (ORACLE-GAP MAJOR-5 below:
+# BpOrch::parse_dag -- the READER used by set-deps's own dependency-resolution
+# check -- sees an EMPTY dag on prose_above_fixture, so `--deps real01` cannot
+# resolve even though real01 genuinely exists in the WRITER's table). That is
+# an orthogonal, already-pinned defect, not this block's subject. `set-field`
+# on a field OTHER than the one already exercised in the third sub-block
+# (`model`) hits `locate_table` identically without going through dependency
+# resolution, keeping this block's failure isolated to the writer-anchoring
+# defect it exists to catch.
 {
     my $path = stage(prose_above_fixture());
     my $before = read_file($path);
     my ($prose_before) = $before =~ /(\| system \| depends_on \| note \|.*?)\n\n## Package status/s;
 
-    my ($rc, $out, $err) = run_pl(['set-status', '--file', $path, '--pkg', 'real02', '--status', 'done']);
-    is($rc, 0, 'AC-21(set-status): exits 0 mutating the real table') or diag("stderr: $err");
+    my ($rc, $out, $err) = run_pl(['set-field', '--file', $path, '--pkg', 'real02',
+                                    '--field', 'deliverable', '--value', 'second real thing (edited)']);
+    is($rc, 0, 'AC-21(set-field deliverable): exits 0 mutating the real table') or diag("stderr: $err");
 
     my $after = read_file($path);
     my ($prose_after) = $after =~ /(\| system \| depends_on \| note \|.*?)\n\n## Package status/s;
-    is($prose_after, $prose_before, 'AC-21(set-status): the prose table\'s bytes are byte-identical after the mutation');
+    is($prose_after, $prose_before, 'AC-21(set-field deliverable): the prose table\'s bytes are byte-identical after the mutation');
 
-    like($after, qr/\| real02 \| second real thing \| real01 \| $DONE done \| sonnet \|/,
-        'AC-21(set-status): the REAL row for real02 now reads done');
+    like($after, qr/\| real02 \| second real thing \(edited\) \| real01 \| $PENDING pending \| sonnet \|/,
+        'AC-21(set-field deliverable): the REAL row for real02 now carries the edited deliverable text');
 }
 
 # ── AC-21: set-field / add-package also hit the real table (not batched with the
@@ -190,13 +204,16 @@ sub stage { my ($bytes) = @_; my $n = ++$pn; my $d = "$ROOT/w$n"; mkdir $d or di
 # 34); `status` is a READ op that already exits 5 ("no such column") rather than
 # 2 on ANY table lacking a status column, pre- and post-fix alike, so it is not
 # the right seam for this criterion and is deliberately not asserted here.
+# RETARGETED for s03-drop-table-status-column (spec §2.6): set-status --status ...
+# expecting rc=2 -> set-deps, which hits locate_table identically and produces the
+# same refusal.
 {
     my $path = stage(prose_above_no_depends_on_in_section_fixture());
     my $before = read_file($path);
-    my ($rc, $out, $err) = run_pl(['set-status', '--file', $path, '--pkg', 'billing', '--status', 'done']);
-    is($rc, 2, 'AC-22(set-status): exits 2 -- refuses, never mutates the prose table under a different name');
-    is(read_file($path), $before, 'AC-22(set-status): file byte-identical');
-    like($err, qr/no package-status table found/i, 'AC-22(set-status): the existing "no package-status table found" message is used');
+    my ($rc, $out, $err) = run_pl(['set-deps', '--file', $path, '--pkg', 'billing', '--deps', 'ledger']);
+    is($rc, 2, 'AC-22(set-deps): exits 2 -- refuses, never mutates the prose table under a different name');
+    is(read_file($path), $before, 'AC-22(set-deps): file byte-identical');
+    like($err, qr/no package-status table found/i, 'AC-22(set-deps): the existing "no package-status table found" message is used');
 }
 {
     my $path = stage(prose_above_no_depends_on_in_section_fixture());
@@ -311,11 +328,17 @@ sub stage { my ($bytes) = @_; my $n = ++$pn; my $d = "$ROOT/w$n"; mkdir $d or di
         '',
     );
     my $path = stage($fixture);
-    my ($rc, $out, $err) = run_pl(['set-status', '--file', $path, '--pkg', 'real01', '--status', 'done']);
-    is($rc, 0, 'ORACLE-GAP(MAJOR-6): set-status does NOT brick when a fenced code block containing "## Package status" precedes the real heading')
+    # RETARGETED for s03-drop-table-status-column (spec §2.6): set-status --status done
+    # -> set-field --field model --value opus, asserting the MODEL cell (not the status
+    # cell, which no longer exists in intent for a new-shape write path). This fixture is
+    # old-shape (has a status column), so the row's existing status glyph is left
+    # untouched in the `like(...)` below -- the model cell change is what proves the real
+    # row (below the fence) was hit, not the fenced text.
+    my ($rc, $out, $err) = run_pl(['set-field', '--file', $path, '--pkg', 'real01', '--field', 'model', '--value', 'opus']);
+    is($rc, 0, 'ORACLE-GAP(MAJOR-6): set-field does NOT brick when a fenced code block containing "## Package status" precedes the real heading')
         or diag("stderr: $err");
-    like(read_file($path), qr/\| real01 \| first real thing \| \xE2\x80\x94 \| $DONE done \| sonnet \|/,
-        'ORACLE-GAP(MAJOR-6): the real row was actually updated, not the fenced text');
+    like(read_file($path), qr/\| real01 \| first real thing \| \xE2\x80\x94 \| $PENDING pending \| opus \|/,
+        'ORACLE-GAP(MAJOR-6): the real row\'s model cell was actually updated, not the fenced text');
 }
 
 done_testing();

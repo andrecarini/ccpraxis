@@ -50,66 +50,22 @@ require "$DIR/bp-orchestrator.pl";
 require "$DIR/bp-validate-dag.pl";
 
 # =====================================================================================
-# The SEVEN-glyph status vocabulary.
-#
-# It was six until 2026-08-13, and that was a live defect, not a simplification:
-# `dropped` is written as a terminal status by bp-drive-next.pl (`_is_terminal`,
-# :100) and bp-orchestrator.pl (:107), while THIS script -- the only sanctioned
-# writer of blueprint.md -- rejected it. A status one script writes and another
-# refuses was filed twice from opposite ends: as 2026-08-06 batch2 item #12 from
-# the field, and as Decision 14 of butler-and-dashboard-overhaul from the audit.
-# The six-value vocabulary was inherited from the template and never caught up.
-#
-# `dropped` is TERMINAL. "Delivered" means done OR dropped.
+# Package status is no longer a blueprint.md TABLE concern (Decision 11,
+# s03-drop-table-status-column). It is written and read via the package LEDGER
+# (packages/<pkg>.md `status:`, guarded by ledger-guard.sh) and BpState.pm /
+# /butler:status -- never via this script's write verbs. The seven-glyph
+# vocabulary that used to live here (and its legend/help/normalize machinery) is
+# retired along with the table column; `dropped` remains a live LEDGER status
+# (bp-drive-next.pl, bp-orchestrator.pl, ledger-guard.sh, gate-stop.sh,
+# bp-ledger.pl all still enforce it there -- none of those files are touched by
+# this retirement).
 # =====================================================================================
 
-my $G_DONE      = "\xE2\x9C\x85"; # U+2705 white heavy check mark
-my $G_PENDING   = "\xE2\xAC\x9C"; # U+2B1C white large square
-my $G_RUNNING   = "\xF0\x9F\x94\xA7"; # U+1F527 wrench
-my $G_REVIEWING = "\xF0\x9F\x94\x8D"; # U+1F50D magnifying glass
-my $G_BLOCKED   = "\xE2\x9B\x94"; # U+26D4 no entry
-my $G_PARKED    = "\xE2\x8F\xB8"; # U+23F8 pause
-my $G_DROPPED   = "\xF0\x9F\x97\x91"; # U+1F5D1 wastebasket
-
-my @STATUS_VALUES = (
-    "$G_DONE done", "$G_PENDING pending", "$G_RUNNING running",
-    "$G_REVIEWING reviewing", "$G_BLOCKED blocked", "$G_PARKED parked",
-    "$G_DROPPED dropped",
-);
-my %WORD2GLYPH = (
-    done => $G_DONE, pending => $G_PENDING, running => $G_RUNNING,
-    reviewing => $G_REVIEWING, blocked => $G_BLOCKED, parked => $G_PARKED,
-    dropped => $G_DROPPED,
-);
-
-# The legend line printed under the package table. DERIVED from @STATUS_VALUES on
-# purpose: the six-value legend and the six-value enum drifted apart from the
-# seven-value reality independently, so a legend that is rendered rather than
-# transcribed cannot go stale a second time.
-sub legend_line {
-    return 'Status values: ' . join(' ' . "\xC2\xB7" . ' ', @STATUS_VALUES);
-}
-
-# The "not a valid status" complaint, rendered from the vocabulary for the same
-# reason the legend is. Three call sites had transcribed it independently and all
-# three still said "six" after the seventh status was added -- accepting `dropped`
-# while telling the caller it was not a status.
-sub status_help {
-    my @words = map { (split ' ', $_, 2)[1] } @STATUS_VALUES;
-    return 'is not one of the ' . scalar(@words) . ' recognised statuses ('
-         . join(', ', @words) . ' -- glyph-prefixed or bare)';
-}
-
-# Accepts either the full "GLYPH word" form (one of @STATUS_VALUES, exact byte match)
-# or the bare word alone (normalized to its canonical glyph form). Returns the
-# canonical string, or undef if $raw matches neither.
-sub normalize_status {
-    my ($raw) = @_;
-    return undef unless defined $raw;
-    return $raw if grep { $_ eq $raw } @STATUS_VALUES;
-    return "$WORD2GLYPH{$raw} $raw" if exists $WORD2GLYPH{$raw};
-    return undef;
-}
+my $STATUS_RETIRED_MSG =
+    "package status no longer lives in blueprint.md's table (Decision 11) -- write it via "
+  . "bp-ledger.pl set-status against the package ledger (packages/<pkg>.md 'status:', guarded "
+  . "by ledger-guard.sh); read it via BpState::package_status / all_package_statuses "
+  . "(plugins/butler/scripts/BpState.pm) or /butler:status.";
 
 my $PKG_ID_RE = qr/^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
 my $DEP_TOK_RE = qr/^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
@@ -617,7 +573,7 @@ sub op_init {
 # exists to make impossible.
 # -------------------------------------------------------------------------------------
 my %SECTION_REFUSED = map { lc($_) => 1 } (
-    'Package status',   # add-package / set-status / set-field / set-deps own this
+    'Package status',   # add-package / set-field / set-deps own this
     'Decisions',        # add-decision / set-decision own this
     'Harvest log',      # orchestrator-only; add-harvest owns it
 );
@@ -638,7 +594,7 @@ sub op_set_section {
     if ($SECTION_REFUSED{ lc $want }) {
         arg_error('set-section',
             "section '$want' is structured state with its own typed verbs -- refusing. "
-          . 'Use add-package/set-status/set-field/set-deps, add-decision/set-decision, '
+          . 'Use add-package/set-field/set-deps, add-decision/set-decision, '
           . 'or add-harvest.');
     }
 
@@ -670,45 +626,6 @@ sub op_set_section {
         # capture swallowed the blank line that follows and every set-section added
         # another one. Caught by diffing the bytes, not by reading the regex.
         $new =~ s{(^##[ \t]+$q[ \t]*\n)(.*?)(?=^##[ \t]|\z)}{$1\n$body\n\n}ms;
-        return ($new, undef);
-    });
-}
-
-# -------------------------------------------------------------------------------------
-# op_refresh_legend — rewrite the `Status values:` line from @STATUS_VALUES.
-#
-# WHY THIS VERB EXISTS. The legend lives inside `## Package status`, which
-# set-section refuses because the package TABLE is structured state owned by the
-# typed verbs. But the typed verbs only ever touch table ROWS, so the legend line
-# had no writer at all: guard-blueprint-write.sh (correctly) denies a direct Edit,
-# and every verb (correctly) declined the job. Decision 14 then required the legend
-# to change, and there was no sanctioned way to do it -- the same gap op_set_meta
-# was added to close for the lifecycle field, one section over.
-#
-# It RENDERS rather than accepts text, so the legend cannot drift from the
-# vocabulary again. That drift is not hypothetical: a six-value legend and a
-# six-value enum both sat next to a seven-value reality for months.
-# -------------------------------------------------------------------------------------
-sub op_refresh_legend {
-    my @args = @_;
-    my %opt;
-    my $ok;
-    { local $SIG{__WARN__} = sub { };
-      $ok = GetOptionsFromArray(\@args, \%opt, 'file=s'); }
-    arg_error('refresh-legend', 'unrecognised option') unless $ok;
-    arg_error('refresh-legend', 'unexpected extra arguments: ' . join(' ', @args)) if @args;
-    arg_error('refresh-legend', 'missing required --file') unless defined $opt{file};
-
-    run_write('refresh-legend', $opt{file}, sub {
-        my ($orig) = @_;
-        my $want = legend_line();
-        unless ($orig =~ /^Status values:.*$/m) {
-            return (undef, "no `Status values:` line found in $opt{file} -- refusing to "
-                         . 'invent one. The legend comes from the template; check that this '
-                         . 'file was created by `bp-blueprint.pl init`.');
-        }
-        my $new = $orig;
-        $new =~ s/^Status values:.*$/$want/m;
         return ($new, undef);
     });
 }
@@ -783,6 +700,9 @@ sub op_add_package {
     for my $r (qw(file pkg deliverable)) {
         arg_error('add-package', "missing required --$r") unless defined $opt{$r};
     }
+    if (defined $opt{status}) {
+        arg_error('add-package', "--status is not accepted here -- " . $STATUS_RETIRED_MSG);
+    }
 
     my $pkg = $opt{pkg};
     unless (field_safe($pkg) && $pkg =~ $PKG_ID_RE) {
@@ -793,10 +713,6 @@ sub op_add_package {
         arg_error('add-package', '--deliverable contains a pipe or newline; would break the table row');
     }
 
-    my $status = defined $opt{status} ? normalize_status($opt{status}) : "$G_PENDING pending";
-    unless (defined $status) {
-        arg_error('add-package', "--status '$opt{status}' " . status_help());
-    }
     if (defined $opt{model} && !field_safe($opt{model})) {
         arg_error('add-package', '--model contains a pipe or newline; would break the table row');
     }
@@ -824,7 +740,6 @@ sub op_add_package {
             pkg         => $pkg,
             deliverable => $opt{deliverable},
             depends_on  => deps_cell_text(@$canon),
-            status      => $status,
             model       => defined $opt{model} ? $opt{model} : '',
         );
         my @row_cells = map { $fields{lc $_} // '' } @{ $tbl->{cols} };
@@ -846,39 +761,12 @@ sub op_add_package {
     });
 }
 
+# Retired unconditionally (Decision 11) -- args are NEVER inspected, the file is
+# NEVER touched. A silent no-op here is how a caller keeps believing it wrote
+# something; this fails loudly instead, every time, regardless of table shape.
 sub op_set_status {
     my @args = @_;
-    my %opt;
-    my $ok;
-    { local $SIG{__WARN__} = sub { };
-      $ok = GetOptionsFromArray(\@args, \%opt, 'file=s', 'pkg=s', 'status=s'); }
-    arg_error('set-status', 'unrecognised option') unless $ok;
-    arg_error('set-status', 'unexpected extra arguments: ' . join(' ', @args)) if @args;
-    for my $r (qw(file pkg status)) {
-        arg_error('set-status', "missing required --$r") unless defined $opt{$r};
-    }
-
-    my $status = normalize_status($opt{status});
-    unless (defined $status) {
-        arg_error('set-status', "--status '$opt{status}' " . status_help());
-    }
-    my $pkg = $opt{pkg};
-
-    run_write('set-status', $opt{file}, sub {
-        my ($orig) = @_;
-        my $tbl = locate_table($orig);
-        return (undef, "no package-status table found (no 'depends_on' column header)") unless $tbl;
-        my $ci = col_index($tbl, 'status');
-        return (undef, "table has no 'status' column") unless defined $ci;
-        my $ri = find_row_index($tbl, $pkg);
-        return (undef, "no such package '$pkg' in the table") unless defined $ri;
-
-        my @lines = @{ $tbl->{lines} };
-        my $new_line = replace_cell($lines[$ri], $ci, $status);
-        return (undef, "internal error replacing the status cell for '$pkg'") unless defined $new_line;
-        $lines[$ri] = $new_line;
-        return (join("\n", @lines), undef);
-    });
+    arg_error('set-status', $STATUS_RETIRED_MSG);
 }
 
 sub op_set_deps {
@@ -1282,10 +1170,7 @@ sub op_set_field {
     my ($pkg, $field, $value) = @opt{qw(pkg field value)};
 
     if (lc($field) eq 'status') {
-        my $status = normalize_status($value);
-        arg_error('set-field', "--value '$value' " . status_help())
-            unless defined $status;
-        return op_set_status_direct($opt{file}, $pkg, $status);
+        arg_error('set-field', $STATUS_RETIRED_MSG);
     }
     if (lc($field) eq 'depends_on') {
         return op_set_deps('--file', $opt{file}, '--pkg', $pkg, '--deps', $value);
@@ -1306,25 +1191,6 @@ sub op_set_field {
         my @lines = @{ $tbl->{lines} };
         my $new_line = replace_cell($lines[$ri], $ci, $value);
         return (undef, "internal error replacing the '$field' cell for '$pkg'") unless defined $new_line;
-        $lines[$ri] = $new_line;
-        return (join("\n", @lines), undef);
-    });
-}
-
-# set-field's status arm reuses set-status's own write op (already-normalized status).
-sub op_set_status_direct {
-    my ($file, $pkg, $status) = @_;
-    run_write('set-field', $file, sub {
-        my ($orig) = @_;
-        my $tbl = locate_table($orig);
-        return (undef, "no package-status table found (no 'depends_on' column header)") unless $tbl;
-        my $ci = col_index($tbl, 'status');
-        return (undef, "table has no 'status' column") unless defined $ci;
-        my $ri = find_row_index($tbl, $pkg);
-        return (undef, "no such package '$pkg' in the table") unless defined $ri;
-        my @lines = @{ $tbl->{lines} };
-        my $new_line = replace_cell($lines[$ri], $ci, $status);
-        return (undef, "internal error replacing the status cell for '$pkg'") unless defined $new_line;
         $lines[$ri] = $new_line;
         return (join("\n", @lines), undef);
     });
@@ -1474,37 +1340,6 @@ sub op_decisions {
     exit 0;
 }
 
-sub op_ready {
-    my @args = @_;
-    my %opt;
-    my $ok;
-    { local $SIG{__WARN__} = sub { }; $ok = GetOptionsFromArray(\@args, \%opt, 'file=s'); }
-    arg_error('ready', 'unrecognised option') unless $ok;
-    arg_error('ready', 'missing required --file') unless defined $opt{file};
-
-    my $B = _read_or_die('ready', $opt{file});
-    my $tbl = locate_table($B);
-    notfound_error('ready', "no package-status table found") unless $tbl;
-    my $sci = col_index($tbl, 'status');
-    notfound_error('ready', "table has no 'status' column") unless defined $sci;
-
-    my $dag = BpOrch::parse_dag($B);
-    my %status;
-    for my $i ($tbl->{hdr_i} + 1 .. $tbl->{end_i} - 1) {
-        next if _is_sep_row($tbl->{lines}[$i]);
-        my @c = _table_cols($tbl->{lines}[$i]);
-        next unless defined $c[0] && length $c[0];
-        $status{ $c[0] } = ($c[$sci] // '') =~ /\bdone\b/ ? 'done' : 'pending';
-    }
-    for my $pkg (sort keys %$dag) {
-        next unless ($status{$pkg} // '') ne 'done';
-        my $deps_ok = 1;
-        for my $d (@{ $dag->{$pkg} }) { $deps_ok = 0 unless ($status{$d} // '') eq 'done'; }
-        print "$pkg\n" if $deps_ok;
-    }
-    exit 0;
-}
-
 # =====================================================================================
 # Main.
 # =====================================================================================
@@ -1513,7 +1348,6 @@ my %DISPATCH = (
     'init'         => \&op_init,
     'set-meta'     => \&op_set_meta,
     'set-section'  => \&op_set_section,
-    'refresh-legend' => \&op_refresh_legend,
     'add-package'  => \&op_add_package,
     'set-status'   => \&op_set_status,
     'set-deps'     => \&op_set_deps,
@@ -1526,7 +1360,6 @@ my %DISPATCH = (
     'deps'         => \&op_deps,
     'status'       => \&op_status,
     'decisions'    => \&op_decisions,
-    'ready'        => \&op_ready,
 );
 
 my $sub = shift @ARGV;

@@ -258,6 +258,21 @@ sub bp_status_of {
 # ============================================================================
 # 5. Table drift: ledger done, table pending. This exact shape hid five
 #    delivered packages for days in the 2026-07-28 incident.
+#
+# RETARGETED for s03-drop-table-status-column (spec §2.6): bp-lifecycle.pl's
+# table-drift repair step shells every blueprint.md mutation through
+# bp-blueprint.pl (bp-lifecycle.pl:91,224), whose set-status is now retired
+# unconditionally (Decision 11) -- the repair this block used to assert CAN
+# NO LONGER SUCCEED, by design. This is the permanently-dead drift-repair
+# path package s05-retire-reconciler-drift-paths is chartered to remove
+# later; this retarget is the minimal honest fix, not a pre-emptive s05
+# implementation. Two assertions change:
+#   - the stale table cell can no longer be repaired -> stays `pending`
+#   - the repair ATTEMPT is recorded as an error ("could not set table
+#     status"), not as a successful `table_drift` action
+# `bp_status_of` unlike above (line below) is UNCHANGED -- all_delivered is
+# ledger-sourced only (bp-lifecycle.pl:469), independent of table-repair
+# success, so the blueprint still advances to `done`.
 # ============================================================================
 {
     my $root = tempdir(CLEANUP => 1);
@@ -269,12 +284,21 @@ sub bp_status_of {
     my ($rc, $data) = run_lifecycle('reconcile', '--blueprint', 'table-drift',
                                     '--data-dir', $root, '--no-archive');
     my $md = slurp("$dir/blueprint.md");
-    unlike($md, qr/\|\s*01-a\s*\|[^\n]*pending/,
-           'the table row that disagreed with its ledger is repaired to the ledger');
-    ok((grep { $_->{kind} eq 'table_drift' } @{ $data->[0]{actions} }),
-       'table drift is reported');
+    like($md, qr/\|\s*01-a\s*\|[^\n]*pending/,
+           'the stale table row can no longer be repaired (set-status is retired) -- it stays pending');
+    # The two lists have DIFFERENT element types -- actions are hashrefs, errors
+    # are plain strings -- so each arm must be guarded by ref(). Written without
+    # the guard, `$_->{kind}` dies with "Can't use string as HASH ref" the moment
+    # the grep reaches the errors list, and the file aborts instead of asserting.
+    # The spec wrote this construct as "-shaped" (illustrative); it was
+    # implemented literally. Guarding is not a weakening: both arms still have to
+    # find the failed repair recorded somewhere.
+    ok((grep { (ref($_) eq 'HASH' && defined $_->{kind} && $_->{kind} eq 'errors')
+               || (!ref($_) && $_ =~ /could not set table status/) }
+              (@{ $data->[0]{actions} || [] }, @{ $data->[0]{errors} || [] })),
+       'the failed repair attempt is recorded as an error, not silently dropped or reported as success');
     is(bp_status_of("$dir/blueprint.md"), 'done',
-       'and with the table repaired the blueprint advances');
+       'and the blueprint STILL advances (all_delivered is ledger-sourced only, independent of table repair)');
 }
 
 # ============================================================================

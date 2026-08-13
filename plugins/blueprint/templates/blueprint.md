@@ -30,11 +30,9 @@ Locked answers from the user. Coordinators treat these as constraints, not sugge
 
 ## Package status
 
-| pkg | deliverable | depends_on | model | status |
-|-----|-------------|------------|-------|--------|
-| 01-<slug> | <one line> | — | sonnet | ⬜ pending |
-
-Status values: ✅ done · ⬜ pending · 🔧 running · 🔍 reviewing · ⛔ blocked · ⏸ parked · 🗑 dropped
+| pkg | deliverable | depends_on | model |
+|-----|-------------|------------|-------|
+| 01-<slug> | <one line> | — | sonnet |
 
 ## Packages
 

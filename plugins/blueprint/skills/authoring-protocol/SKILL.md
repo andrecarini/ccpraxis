@@ -20,7 +20,7 @@ Everything butler needs to execute lives on disk, authored here:
 
 ```
 <data>/blueprints/<name>/
-├── blueprint.md            # objective, decisions, package status table, package blocks
+├── blueprint.md            # objective, decisions, package table (pkg/deliverable/depends_on/model), package blocks
 └── packages/<NN-slug>.md   # one ledger per package; FRONTMATTER is the contract
 ```
 
@@ -107,7 +107,7 @@ ungated.
 
 ## Blueprint file discipline
 
-`blueprint.md` is the source of truth for the initiative. Keep it current as you author and revise: append (never silently rewrite) Decisions, keep the package status table accurate, refresh `last_updated`. Once butler starts executing, the per-package ledgers become the live record butler maintains; you return to authoring only to re-scope or add packages.
+`blueprint.md` is the source of truth for the initiative. Keep it current as you author and revise: append (never silently rewrite) Decisions, keep the package table's authored columns (pkg/deliverable/depends_on/model) accurate, refresh `last_updated`. The table carries no status column (Decision 11) — per-package progress is read from ledgers, never authored into this table. Once butler starts executing, the per-package ledgers become the live record butler maintains; you return to authoring only to re-scope or add packages.
 
 ### Recording a decision — binding statement in, argument out
 
