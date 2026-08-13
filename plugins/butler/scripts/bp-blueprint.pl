@@ -50,7 +50,17 @@ require "$DIR/bp-orchestrator.pl";
 require "$DIR/bp-validate-dag.pl";
 
 # =====================================================================================
-# The six-glyph status vocabulary (spec §1, counted from the live file 2026-08-03).
+# The SEVEN-glyph status vocabulary.
+#
+# It was six until 2026-08-13, and that was a live defect, not a simplification:
+# `dropped` is written as a terminal status by bp-drive-next.pl (`_is_terminal`,
+# :100) and bp-orchestrator.pl (:107), while THIS script -- the only sanctioned
+# writer of blueprint.md -- rejected it. A status one script writes and another
+# refuses was filed twice from opposite ends: as 2026-08-06 batch2 item #12 from
+# the field, and as Decision 14 of butler-and-dashboard-overhaul from the audit.
+# The six-value vocabulary was inherited from the template and never caught up.
+#
+# `dropped` is TERMINAL. "Delivered" means done OR dropped.
 # =====================================================================================
 
 my $G_DONE      = "\xE2\x9C\x85"; # U+2705 white heavy check mark
@@ -59,15 +69,36 @@ my $G_RUNNING   = "\xF0\x9F\x94\xA7"; # U+1F527 wrench
 my $G_REVIEWING = "\xF0\x9F\x94\x8D"; # U+1F50D magnifying glass
 my $G_BLOCKED   = "\xE2\x9B\x94"; # U+26D4 no entry
 my $G_PARKED    = "\xE2\x8F\xB8"; # U+23F8 pause
+my $G_DROPPED   = "\xF0\x9F\x97\x91"; # U+1F5D1 wastebasket
 
 my @STATUS_VALUES = (
     "$G_DONE done", "$G_PENDING pending", "$G_RUNNING running",
     "$G_REVIEWING reviewing", "$G_BLOCKED blocked", "$G_PARKED parked",
+    "$G_DROPPED dropped",
 );
 my %WORD2GLYPH = (
     done => $G_DONE, pending => $G_PENDING, running => $G_RUNNING,
     reviewing => $G_REVIEWING, blocked => $G_BLOCKED, parked => $G_PARKED,
+    dropped => $G_DROPPED,
 );
+
+# The legend line printed under the package table. DERIVED from @STATUS_VALUES on
+# purpose: the six-value legend and the six-value enum drifted apart from the
+# seven-value reality independently, so a legend that is rendered rather than
+# transcribed cannot go stale a second time.
+sub legend_line {
+    return 'Status values: ' . join(' ' . "\xC2\xB7" . ' ', @STATUS_VALUES);
+}
+
+# The "not a valid status" complaint, rendered from the vocabulary for the same
+# reason the legend is. Three call sites had transcribed it independently and all
+# three still said "six" after the seventh status was added -- accepting `dropped`
+# while telling the caller it was not a status.
+sub status_help {
+    my @words = map { (split ' ', $_, 2)[1] } @STATUS_VALUES;
+    return 'is not one of the ' . scalar(@words) . ' recognised statuses ('
+         . join(', ', @words) . ' -- glyph-prefixed or bare)';
+}
 
 # Accepts either the full "GLYPH word" form (one of @STATUS_VALUES, exact byte match)
 # or the bare word alone (normalized to its canonical glyph form). Returns the
@@ -644,6 +675,45 @@ sub op_set_section {
 }
 
 # -------------------------------------------------------------------------------------
+# op_refresh_legend — rewrite the `Status values:` line from @STATUS_VALUES.
+#
+# WHY THIS VERB EXISTS. The legend lives inside `## Package status`, which
+# set-section refuses because the package TABLE is structured state owned by the
+# typed verbs. But the typed verbs only ever touch table ROWS, so the legend line
+# had no writer at all: guard-blueprint-write.sh (correctly) denies a direct Edit,
+# and every verb (correctly) declined the job. Decision 14 then required the legend
+# to change, and there was no sanctioned way to do it -- the same gap op_set_meta
+# was added to close for the lifecycle field, one section over.
+#
+# It RENDERS rather than accepts text, so the legend cannot drift from the
+# vocabulary again. That drift is not hypothetical: a six-value legend and a
+# six-value enum both sat next to a seven-value reality for months.
+# -------------------------------------------------------------------------------------
+sub op_refresh_legend {
+    my @args = @_;
+    my %opt;
+    my $ok;
+    { local $SIG{__WARN__} = sub { };
+      $ok = GetOptionsFromArray(\@args, \%opt, 'file=s'); }
+    arg_error('refresh-legend', 'unrecognised option') unless $ok;
+    arg_error('refresh-legend', 'unexpected extra arguments: ' . join(' ', @args)) if @args;
+    arg_error('refresh-legend', 'missing required --file') unless defined $opt{file};
+
+    run_write('refresh-legend', $opt{file}, sub {
+        my ($orig) = @_;
+        my $want = legend_line();
+        unless ($orig =~ /^Status values:.*$/m) {
+            return (undef, "no `Status values:` line found in $opt{file} -- refusing to "
+                         . 'invent one. The legend comes from the template; check that this '
+                         . 'file was created by `bp-blueprint.pl init`.');
+        }
+        my $new = $orig;
+        $new =~ s/^Status values:.*$/$want/m;
+        return ($new, undef);
+    });
+}
+
+# -------------------------------------------------------------------------------------
 # op_set_meta — set a field in the blueprint's own metadata block.
 #
 # The lifecycle field `status:` (drafting -> audited -> running -> done -> archived) is
@@ -725,8 +795,7 @@ sub op_add_package {
 
     my $status = defined $opt{status} ? normalize_status($opt{status}) : "$G_PENDING pending";
     unless (defined $status) {
-        arg_error('add-package',
-            "--status '$opt{status}' is not one of the six recognised statuses");
+        arg_error('add-package', "--status '$opt{status}' " . status_help());
     }
     if (defined $opt{model} && !field_safe($opt{model})) {
         arg_error('add-package', '--model contains a pipe or newline; would break the table row');
@@ -791,9 +860,7 @@ sub op_set_status {
 
     my $status = normalize_status($opt{status});
     unless (defined $status) {
-        arg_error('set-status',
-            "--status '$opt{status}' is not one of the six recognised statuses "
-          . '(done, pending, running, reviewing, blocked, parked -- glyph-prefixed or bare)');
+        arg_error('set-status', "--status '$opt{status}' " . status_help());
     }
     my $pkg = $opt{pkg};
 
@@ -1216,7 +1283,7 @@ sub op_set_field {
 
     if (lc($field) eq 'status') {
         my $status = normalize_status($value);
-        arg_error('set-field', "--value '$value' is not one of the six recognised statuses")
+        arg_error('set-field', "--value '$value' " . status_help())
             unless defined $status;
         return op_set_status_direct($opt{file}, $pkg, $status);
     }
@@ -1446,6 +1513,7 @@ my %DISPATCH = (
     'init'         => \&op_init,
     'set-meta'     => \&op_set_meta,
     'set-section'  => \&op_set_section,
+    'refresh-legend' => \&op_refresh_legend,
     'add-package'  => \&op_add_package,
     'set-status'   => \&op_set_status,
     'set-deps'     => \&op_set_deps,

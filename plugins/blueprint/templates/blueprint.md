@@ -34,7 +34,7 @@ Locked answers from the user. Coordinators treat these as constraints, not sugge
 |-----|-------------|------------|-------|--------|
 | 01-<slug> | <one line> | — | sonnet | ⬜ pending |
 
-Status values: ⬜ pending · 🔧 running · 🔍 reviewing · ✅ done · ⛔ blocked · ⏸ parked
+Status values: ✅ done · ⬜ pending · 🔧 running · 🔍 reviewing · ⛔ blocked · ⏸ parked · 🗑 dropped
 
 ## Packages
 

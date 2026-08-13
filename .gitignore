@@ -34,3 +34,6 @@ host-tools/bin/perl.cmd
 
 # Added by claude-sandbox bootstrap
 deploy_key
+
+# transient lock written beside a file mutated through bp-blueprint.pl
+plugins/blueprint/templates/*.lock
