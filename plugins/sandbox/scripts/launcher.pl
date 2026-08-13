@@ -875,6 +875,48 @@ my $STDERR_CAPTURE_SAVED;   # dup'd original STDERR filehandle, while redirected
 my $STDERR_CAPTURE_FH;      # File::Temp filehandle currently receiving STDERR
 my $STDERR_CAPTURE_PATH;    # File::Temp path currently receiving STDERR
 
+# _stderr_capture_drain() -- restore STDERR *and show what was captured*.
+#
+# THE BUG IT CLOSES (operator, 2026-08-14): "it just takes me to the TUI and then
+# back to the console" with nothing to read. While the TUI is up STDERR is
+# redirected into a temp file. The clean teardown replayed it; the END block and
+# the INT/TERM handlers only ever RESTORED the handle and left the temp file
+# unread. So every abnormal exit between capture-start and clean-teardown --
+# which includes the pre-flight aborts, the exact ones a cold boot hits --
+# printed its diagnosis into a file nobody opens, then vanished.
+#
+# Restoring the filehandle is not the same as delivering the message, and only
+# the second one is what the operator needs.
+#
+# Idempotent: the clean path clears both globals, so calling this afterwards is a
+# no-op. Safe in END, where nothing may die.
+sub _stderr_capture_drain {
+    if ($STDERR_CAPTURE_SAVED) {
+        eval { close(STDERR); open(STDERR, '>&', $STDERR_CAPTURE_SAVED); STDERR->autoflush(1); };
+        eval { close($STDERR_CAPTURE_SAVED) };
+        $STDERR_CAPTURE_SAVED = undef;
+    }
+    if (defined $STDERR_CAPTURE_PATH && -s $STDERR_CAPTURE_PATH) {
+        my $captured = '';
+        if (open(my $rf, '<', $STDERR_CAPTURE_PATH)) {
+            local $/;
+            $captured = <$rf> // '';
+            close($rf);
+        }
+        if (length $captured) {
+            # Printed in full, not summarised as "see the log": on an abnormal
+            # exit there may be no usable log to consult, and the whole failure
+            # mode here was an operator left with nothing on screen.
+            eval { print STDERR "\n[claude-sandbox] output captured while the TUI was open:\n" };
+            eval { print STDERR $captured };
+            eval { print STDERR "\n" };
+        }
+        eval { unlink($STDERR_CAPTURE_PATH) };
+    }
+    $STDERR_CAPTURE_PATH = undef;
+    $STDERR_CAPTURE_FH   = undef;
+}
+
 # s13-activity-history: read-side caps for aggregating recent activity across
 # restarts. See LaunchLog::recent_logs / merge_sessions and _history_events
 # (below) for how these compose (spec S2.4a / S2.6).
@@ -1657,8 +1699,8 @@ sub _rmtree {
 # every signal path -- alt-screen off, cursor shown, title popped, ReadMode
 # restored -- before the STDERR restore and before reset_terminal(). Its
 # once-guard is what makes a second Ctrl-C during teardown safe.
-$SIG{INT}  = sub { tui::LaunchScreens::host_leave($LAUNCH_HOST) if $LAUNCH_HOST; open(STDERR, '>&', $STDERR_CAPTURE_SAVED) if $STDERR_CAPTURE_SAVED; log_ev('signal', { sig => 'INT' });  _keepawake_release_global(); _resources_sampler_release_global(); LaunchLog::close_log($LAUNCH_LOG); _close_transcript(); SandboxLock::release_all(); reset_terminal(); exit 130 };
-$SIG{TERM} = sub { tui::LaunchScreens::host_leave($LAUNCH_HOST) if $LAUNCH_HOST; open(STDERR, '>&', $STDERR_CAPTURE_SAVED) if $STDERR_CAPTURE_SAVED; log_ev('signal', { sig => 'TERM' }); _keepawake_release_global(); _resources_sampler_release_global(); LaunchLog::close_log($LAUNCH_LOG); _close_transcript(); SandboxLock::release_all(); reset_terminal(); exit 143 };
+$SIG{INT}  = sub { tui::LaunchScreens::host_leave($LAUNCH_HOST) if $LAUNCH_HOST; _stderr_capture_drain(); log_ev('signal', { sig => 'INT' });  _keepawake_release_global(); _resources_sampler_release_global(); LaunchLog::close_log($LAUNCH_LOG); _close_transcript(); SandboxLock::release_all(); reset_terminal(); exit 130 };
+$SIG{TERM} = sub { tui::LaunchScreens::host_leave($LAUNCH_HOST) if $LAUNCH_HOST; _stderr_capture_drain(); log_ev('signal', { sig => 'TERM' }); _keepawake_release_global(); _resources_sampler_release_global(); LaunchLog::close_log($LAUNCH_LOG); _close_transcript(); SandboxLock::release_all(); reset_terminal(); exit 143 };
 # 03-resources-reader-model fix-batch (red-team L15): closing the terminal
 # window -- the single most common way a user ends a dashboard -- sends HUP,
 # not INT/TERM, and perl does not run END blocks on an uncaught terminating
@@ -1666,7 +1708,7 @@ $SIG{TERM} = sub { tui::LaunchScreens::host_leave($LAUNCH_HOST) if $LAUNCH_HOST;
 # release, sampler release, lock release), which is the entry point for H2
 # step 3 (owner dies without ever running _resources_sampler_release_global).
 $SIG{HUP}  = $SIG{TERM};
-END { tui::LaunchScreens::host_leave($LAUNCH_HOST) if $LAUNCH_HOST; open(STDERR, '>&', $STDERR_CAPTURE_SAVED) if $STDERR_CAPTURE_SAVED; _keepawake_release_global(); _resources_sampler_release_global(); LaunchLog::close_log($LAUNCH_LOG); _close_transcript(); SandboxLock::release_all() }
+END { tui::LaunchScreens::host_leave($LAUNCH_HOST) if $LAUNCH_HOST; _stderr_capture_drain(); _keepawake_release_global(); _resources_sampler_release_global(); LaunchLog::close_log($LAUNCH_LOG); _close_transcript(); SandboxLock::release_all() }
 
 SandboxLock::acquire($LOCK_DIR, windows => $WINDOWS_FAMILY) or do {
     print STDERR "ERROR: another claude-sandbox is doing setup for this project (lock held > 10s at $LOCK_DIR).\n";
@@ -1791,6 +1833,21 @@ log_ev('launch_mode', {
 # log can't hold. Best-effort, same naming as the JSON log (.transcript.log).
 $TRANSCRIPT = _open_transcript("$CLAUDE_DATA/sandbox-logs/launch-$LAUNCH_ID.transcript.log");
 _tx("=== claude-sandbox launch $LAUNCH_ID - $PROJECT_PATH ===\n");
+
+# Pointer to this launch's transcript, left under .launcher/ (BPK-07). That
+# directory is RO-overlaid inside the container while sandbox-logs/ (same
+# claude-home bind) is not -- so an agent inspecting .launcher/ and finding
+# no log there reasonably (but wrongly) concludes none was kept. Content is
+# the IN-CONTAINER path, since the reader is an agent running inside the
+# container. Best-effort, same reasoning as the project-name write above: a
+# cosmetic pointer must never be able to fail a launch.
+{
+    my $ptr = "$LAUNCHER_DIR/last-transcript.txt";
+    if (open my $pfh, '>:raw', $ptr) {
+        print {$pfh} "/root/.claude/sandbox-logs/launch-$LAUNCH_ID.transcript.log\n";
+        close $pfh;
+    }
+}
 
 # =====================================================================
 # Get host Claude Code version
@@ -4133,6 +4190,34 @@ sub s03_run_launch_gate {
     my (%seams) = @_;
 
     my $state = $seams{probe}->();
+
+    # A STOPPED MACHINE IS NOT A DEAD END -- START IT.
+    #
+    # This used to return the diagnosis below immediately, which is how a cold
+    # boot became "the TUI appears, then you are back at the console with nothing
+    # to read" (operator, 2026-08-14). Two things made it silent rather than
+    # merely unhelpful: the gate never tried the one obvious remedy, and the
+    # diagnosis was raised while STDERR was redirected into the TUI capture, so
+    # it went to a temp file nobody reads. The capture half is fixed separately
+    # in _stderr_capture_drain.
+    #
+    # The machine_start seam already existed -- it was bound only into the
+    # interactive [l] recover flow, so the remedy was reachable by keypress after
+    # a failure but never on the path that hit the failure first.
+    #
+    # Bounded and re-probed, never assumed: machine_start reports its own
+    # timeout, and we believe the RE-PROBE rather than its return value, because
+    # "started" and "reachable" are different claims.
+    if (!$state->{machine_ok} && $seams{machine_start}) {
+        my $r = eval { $seams{machine_start}->() } || {};
+        $seams{notify} && $seams{notify}->(
+            $r->{ok} ? "podman machine was not running -- started it ("
+                       . ($r->{detail} // 'ok') . ")"
+                     : "podman machine was not running and could not be started: "
+                       . ($r->{detail} // 'unknown error'));
+        $state = $seams{probe}->() if $r->{ok};
+    }
+
     return { diagnosis => 'podman machine/socket unreachable' }
         unless $state->{machine_ok};
 
@@ -4369,6 +4454,12 @@ _surface_last_reap();
 my $start_rc;
 my $gate_result = s03_run_launch_gate(
     probe           => $_s03_probe_state,
+    # 2026-08-14: a stopped podman machine used to end the launch here, and the
+    # reason was swallowed by the TUI's STDERR capture -- the operator saw the
+    # TUI flash and then a bare prompt. Same remedy the [l] recover flow already
+    # had; it just was not reachable from the path that needs it first.
+    machine_start   => \&_machine_start_bounded,
+    notify          => sub { _emit_err(($_[0] // ''), "\n") },
     # S2.12: the keep-alive obligation begins the moment `podman start`
     # returns 0 -- before that there is no /tmp/.launcher-alive to touch, so
     # the screens' heartbeat seam is bound to a real (throttled) toucher only
@@ -5092,6 +5183,41 @@ sub _run_timed {
 # (spec S6/E2), so a parser living here can never have a behavioural oracle --
 # which is exactly how four MAJOR defects survived a 651/651 green suite
 # (red-team step 6). t/47 AC-31..AC-33 now cover the parse directly.
+# _machine_start_bounded() -> { ok => 0|1, detail => ..., timeout => 1? }
+#
+# ONE implementation, two callers: the interactive [l] recover flow and the
+# cold-start launch gate (s03_run_launch_gate). It lived inline in the recover
+# seam until 2026-08-14, which is why the gate had no way to start a stopped
+# machine and simply gave up instead -- the remedy existed but only downstream of
+# the failure it remedies.
+sub _machine_start_bounded {
+    # Problem 5: `podman machine start` blocks for minutes on a cold
+    # WSL2 VM, synchronously inside the TUI's input drain. _run_timed
+    # bounds it where SIGALRM can break a pending backtick; on native
+    # Windows perl it degrades to a no-op bound (see _run_timed's own
+    # header) and the freeze is instead ANNOUNCED by the pre-stage
+    # frame Dashboard::_recover_pre_detail paints before this runs.
+    my $secs = ($ENV{SANDBOX_RECOVER_MACHINE_TIMEOUT}
+                && $ENV{SANDBOX_RECOVER_MACHINE_TIMEOUT} =~ /^\d+$/)
+               ? $ENV{SANDBOX_RECOVER_MACHINE_TIMEOUT} : 180;
+    my $out = _run_timed(qq{$PODMAN machine start 2>&1}, $secs);
+    return { ok => 0, timeout => 1,
+             detail => "podman machine start did not finish within ${secs}s" }
+        unless defined $out;
+    my $rc = $? >> 8;
+    # MAJOR-3 (red-team step 6): `podman machine start` against a VM that
+    # is already running OR already starting returns 125 with
+    # "VM already running or starting". That is the state the user is
+    # trying to reach, so it is a SUCCESS here, not a failure -- reporting
+    # it as one used to abort the recovery at stage 2 and leave the
+    # container untouched, in exactly the host-resume case [l] exists for.
+    my $err = _trim_err($out);
+    return { ok => 1, detail => 'machine already running or starting' }
+        if $rc == 125 || $err =~ /already running or starting/i;
+    return { ok => ($rc == 0 ? 1 : 0),
+             detail => ($rc == 0 ? 'machine started' : "rc $rc: $err") };
+}
+
 sub _machine_state {
     # DELEGATED CONTRACT (Dashboard::classify_machine_state, Dashboard.pm; the
     # parse used to be open-coded right here). That helper decodes these bytes
@@ -5253,33 +5379,10 @@ sub recover_container {
             my $m = _machine_state();
             return { ok => 1, state => $m, detail => "machine $m" };
         },
-        machine_start => sub {
-            # Problem 5: `podman machine start` blocks for minutes on a cold
-            # WSL2 VM, synchronously inside the TUI's input drain. _run_timed
-            # bounds it where SIGALRM can break a pending backtick; on native
-            # Windows perl it degrades to a no-op bound (see _run_timed's own
-            # header) and the freeze is instead ANNOUNCED by the pre-stage
-            # frame Dashboard::_recover_pre_detail paints before this runs.
-            my $secs = ($ENV{SANDBOX_RECOVER_MACHINE_TIMEOUT}
-                        && $ENV{SANDBOX_RECOVER_MACHINE_TIMEOUT} =~ /^\d+$/)
-                       ? $ENV{SANDBOX_RECOVER_MACHINE_TIMEOUT} : 180;
-            my $out = _run_timed(qq{$PODMAN machine start 2>&1}, $secs);
-            return { ok => 0, timeout => 1,
-                     detail => "podman machine start did not finish within ${secs}s" }
-                unless defined $out;
-            my $rc = $? >> 8;
-            # MAJOR-3 (red-team step 6): `podman machine start` against a VM that
-            # is already running OR already starting returns 125 with
-            # "VM already running or starting". That is the state the user is
-            # trying to reach, so it is a SUCCESS here, not a failure -- reporting
-            # it as one used to abort the recovery at stage 2 and leave the
-            # container untouched, in exactly the host-resume case [l] exists for.
-            my $err = _trim_err($out);
-            return { ok => 1, detail => 'machine already running or starting' }
-                if $rc == 125 || $err =~ /already running or starting/i;
-            return { ok => ($rc == 0 ? 1 : 0),
-                     detail => ($rc == 0 ? 'machine started' : "rc $rc: $err") };
-        },
+        # Delegates to the file-scope implementation so the [l] recover flow and
+        # the cold-start launch gate cannot drift apart -- they are the same
+        # remedy for the same condition, reached from two different directions.
+        machine_start => \&_machine_start_bounded,
         container_start => sub {
             return { ok => 1, detail => 'already running' }
                 if container_status($CONTAINER_NAME) eq 'running';
