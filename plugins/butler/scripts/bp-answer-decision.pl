@@ -441,6 +441,18 @@ unless (caller) {
         my %filter;
         if (defined $category_arg) {
             %filter = map { $_ => 1 } grep { length } split /,/, $category_arg;
+            # fixbatch step7 / red-team NIT 1: a --category flag that IS given
+            # but CSV-splits to only empty tokens (e.g. "--category ,,") must
+            # not silently degrade to "no filtering" -- see the twin fix in
+            # bp-wait-for-decision.pl for the full rationale. Only a genuinely
+            # omitted --category keeps the "no filtering" meaning.
+            unless (%filter) {
+                no warnings 'once';   # cross-package global, referenced exactly once here
+                print STDERR "bp-answer-decision: --category '$category_arg' has no usable "
+                    . "category value; valid categories are: "
+                    . join(', ', @BpOrch::CATEGORIES) . "\n";
+                exit 2;
+            }
         }
         my @recs;
         my $dir = "$runs/needs-you";

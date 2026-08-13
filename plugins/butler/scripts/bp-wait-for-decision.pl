@@ -343,6 +343,8 @@ sub autonomous_decision_record {
 package main;
 use strict;
 use warnings;
+use File::Basename qw(dirname);
+use Cwd qw(abs_path);
 
 unless (caller) {
     require JSON::PP;
@@ -402,10 +404,27 @@ unless (caller) {
     }
 
     # e02 §2.6: --category cat1,cat2,... (comma-separated, parsed like --seen).
-    # Omitted -> no filtering, byte-identical to today.
+    # Omitted (flag not given at all) -> no filtering, byte-identical to today.
+    # fixbatch step7 / red-team NIT 1: a flag that IS given but CSV-splits to
+    # only empty tokens (e.g. "--category ,," or "--category ,") must not
+    # silently degrade to "no filtering" -- that fails a deliberate filter
+    # request open (the caller sees everything, not the narrowed set they
+    # asked for). Only a genuinely-omitted flag keeps the "no filtering"
+    # meaning; a present-but-empty-after-parsing value is a loud error naming
+    # the valid categories, sourced from BpOrch::@CATEGORIES (the single
+    # definition, e02 spec §2.1) rather than duplicated here.
     my $category_filter;
-    if (defined $category_csv && length $category_csv) {
+    if (defined $category_csv) {
         $category_filter = { map { $_ => 1 } grep { length } split /,/, $category_csv };
+        unless (%$category_filter) {
+            my $dir = dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; abs_path($f) // $f });
+            require "$dir/bp-orchestrator.pl";
+            no warnings 'once';   # cross-package global, referenced exactly once here
+            print STDERR "bp-wait-for-decision: --category '$category_csv' has no usable "
+                . "category value; valid categories are: "
+                . join(', ', @BpOrch::CATEGORIES) . "\n";
+            exit 2;
+        }
     }
 
     my $res = BpWait::wait_loop({

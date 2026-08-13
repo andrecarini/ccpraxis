@@ -4077,6 +4077,15 @@ sub remediation_step {
 }
 
 sub _block_and_queue {
+    # fixbatch step7 / reviewer SHOULD-FIX 2: NOT converted to a hashref -- see
+    # fixbatch-step7.md. t/115-escalation-categories.t (immutable, MUST STAY
+    # GREEN) calls this sub directly with the current 9/10-positional-arg
+    # signature at 4 sites (D1/D2/D3/E3), including deliberately testing the
+    # "old 9-arg call" (no category) refusal shape by arity. A hashref-only
+    # conversion breaks that test; a dual-mode (positional-or-hashref) shim
+    # was rejected by the dispatch as reintroducing the transposition hazard
+    # it exists to remove. Left positional, unconverted, flagged for the
+    # driver to resolve (test update vs. signature change) outside this pass.
     my ($bpdir, $runs, $log, $bp, $pkg, $why, $now, $question, $kind, $category) = @_;
     # e02 §2.3: checked BEFORE _set_ledger_status/update_registry_pkg -- a bad
     # category must not leave a package marked 'blocked' in ledger/registry
