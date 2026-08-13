@@ -1640,7 +1640,27 @@ my $LSRC = slurp($LAUNCHER_SRC);
     my $rcb = extract_sub_body($LSRC, 'sub recover_container');
 
     # (b) the machine_start seam's bound.
-    my $mstart = defined $rcb ? block_after($rcb, qr/\bmachine_start\s*=>/) : undef;
+    #
+    # FOLLOWS ONE LEVEL OF INDIRECTION (2026-08-14). The seam used to hold this
+    # logic inline. It now delegates to the file-scope _machine_start_bounded(),
+    # because the cold-start launch gate needs the SAME remedy: a stopped machine
+    # was aborting the launch at image-build time while the only code that could
+    # start one lived inside the interactive recover flow. Two copies of a
+    # bounded subprocess call would have drifted, so there is exactly one.
+    #
+    # The assertions below are unchanged and still assert the real body -- they
+    # just resolve the delegation first. If the seam ever goes back to inline,
+    # this still works: block_after returns the inline body and the fallback is
+    # never used.
+    # Detect the delegation on the ENCLOSING body: `machine_start => \&name,` has
+    # no brace block, so block_after cannot see it (it would run on to the next
+    # `{` it finds, i.e. a different seam entirely).
+    my $mstart;
+    if (defined $rcb && $rcb =~ /\bmachine_start\s*=>\s*\\&\s*(\w+)/) {
+        $mstart = extract_sub_body($LSRC, "sub $1");
+    }
+    $mstart = block_after($rcb, qr/\bmachine_start\s*=>/)
+        if !defined($mstart) && defined($rcb);
     ok(defined $mstart, 'AC-28(b): the machine_start production seam block is extractable');
     if (defined $mstart) {
         src_like($mstart, qr/_run_timed\s*\(/,                     'AC-28(b): machine_start bounds the start with _run_timed');

@@ -371,9 +371,23 @@ for my $cols (40, 80, 120) {
             or diag("  cannot locate \$SIG{$label}/END -- the assertion below did not run");
         SKIP: {
             skip("$label handler not found", 1) unless defined $line;
-            src_like($line, qr/\bSTDERR\b/,
-                "C7: the $label handler (abnormal/signal exit path) also touches STDERR -- restoring it, "
-              . 'not leaving the terminal with a redirected STDERR after the dashboard closes');
+            # Accepts either the inline STDERR manipulation this originally
+            # matched, or a call to _stderr_capture_drain(), which is where that
+            # work moved on 2026-08-14. The intent is unchanged and the bar is
+            # HIGHER, not lower: the old inline form only reattached the
+            # filehandle, while the drain reattaches AND prints what the TUI
+            # captured -- the handlers used to leave that text in a temp file
+            # nobody reads, which is how an operator got a vanished TUI and a
+            # bare prompt with no error.
+            #
+            # A6 in plugins/sandbox/tests/t/76-cold-start-machine-recovery.t
+            # pins the drain's own contract (leave the alt screen, drain, print,
+            # hold), so this assertion does not have to re-verify it -- it only
+            # has to confirm each handler still reaches it.
+            src_like($line, qr/\bSTDERR\b|_stderr_capture_drain\s*\(/,
+                "C7: the $label handler (abnormal/signal exit path) still handles STDERR -- "
+              . 'reattaching AND draining it, not leaving the terminal with a redirected '
+              . 'STDERR (or an unread capture file) after the dashboard closes');
         }
     }
 }
