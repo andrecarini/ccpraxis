@@ -5829,6 +5829,16 @@ sub _ps_commands {
         cim_mem  => "Get-CimInstance Win32_OperatingSystem -OperationTimeoutSec 3 | Select-Object FreePhysicalMemory,TotalVisibleMemorySize | ConvertTo-Json -Compress",
         cim_cpu  => "Get-CimInstance Win32_Processor -OperationTimeoutSec 3 | Select-Object LoadPercentage,NumberOfLogicalProcessors | ConvertTo-Json -Compress",
         cim_disk => "Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' -OperationTimeoutSec 3 | Select-Object DeviceID,FreeSpace,Size | ConvertTo-Json -Compress",
+        # ONE invocation for all three, added 2026-08-14. See _cim_all() below
+        # for why. Same closed-allowlist discipline as its siblings: a literal
+        # string with nothing interpolated, and no double quotes anywhere (the
+        # whole command is interpolated into "$cmd" inside a backtick, where sh
+        # treats $, backtick and backslash as live).
+        # NOTE the escaped \@ sigils: PowerShell's @{...} hashtable and @(...)
+        # array syntax are ALSO perl's dereference syntax, so an unescaped @
+        # here interpolates a perl array into the command and the file does not
+        # even compile. \@ yields a literal @.
+        cim_all  => "ConvertTo-Json -Compress -Depth 4 -InputObject \@{mem=(Get-CimInstance Win32_OperatingSystem -OperationTimeoutSec 3 | Select-Object FreePhysicalMemory,TotalVisibleMemorySize);cpu=(Get-CimInstance Win32_Processor -OperationTimeoutSec 3 | Select-Object LoadPercentage,NumberOfLogicalProcessors);disk=\@(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' -OperationTimeoutSec 3 | Select-Object DeviceID,FreeSpace,Size)}",
     );
 }
 
@@ -5860,7 +5870,17 @@ sub _powershell_json {
     my %allowed = _ps_commands();
     return undef unless grep { $_ eq $cmd } values %allowed;
     local $ENV{MSYS2_ARG_CONV_EXCL} = '*';
-    return scalar `powershell.exe -NoProfile -NonInteractive -Command "$cmd" 2>/dev/null`;
+    # BOUNDED, like every sibling probe in _resources_probes (which all use
+    # `timeout 5 $PODMAN ...`). This one was the odd unbounded backtick.
+    #
+    # -OperationTimeoutSec 3 caps the CIM QUERY, not powershell.exe itself, so a
+    # wedged host WMI/CIM subsystem could leave the process alive indefinitely --
+    # and because the sampler pulls this synchronously, a single hang both
+    # stranded a powershell.exe (plus its conhost.exe) forever AND stalled every
+    # later sample round. That is the shape a "processes linger forever"
+    # complaint actually takes: not the healthy calls, which exit at once, but
+    # the one that never returns.
+    return scalar `timeout 5 powershell.exe -NoProfile -NonInteractive -Command "$cmd" 2>/dev/null`;
 }
 
 # _resources_probes() -> { key => coderef }, the real I/O half of the s09
@@ -5904,10 +5924,81 @@ sub _resources_probes {
     my %cmd = _ps_commands();
     $p{machine}  = sub { scalar `timeout 5 $PODMAN machine list --format json 2>/dev/null` }
         if $PODMAN =~ /podman/i;
-    $p{cim_mem}  = sub { _powershell_json($cmd{cim_mem}) };
-    $p{cim_cpu}  = sub { _powershell_json($cmd{cim_cpu}) };
-    $p{cim_disk} = sub { _powershell_json($cmd{cim_disk}) };
+    # ONE powershell.exe per sample round, not three.
+    #
+    # This was the largest periodic Windows-native spawn in the whole system and
+    # the repo's own terminal-minimize investigation had already measured it:
+    # three powershell.exe per round at a 23s interval, ~470/hour, each with the
+    # conhost.exe Windows attaches to it. Roughly 940 process creations an hour,
+    # for as long as a dashboard is open. The operator had to force-restart this
+    # machine TWICE with the process list full of powershell and conhost; the
+    # earlier keep-awake fix (e13cc03) was real but an order of magnitude
+    # smaller, and fixing it alone did not stop the second restart.
+    #
+    # The three CIM queries are independent and were already sampled together,
+    # so they collapse into one invocation with no loss of data. The per-key
+    # probe interface is kept EXACTLY as-is -- Resources::gather still asks for
+    # cim_mem/cim_cpu/cim_disk and its three parsers still receive the same JSON
+    # shapes they always did -- so nothing downstream changes.
+    $p{cim_mem}  = sub { _cim_all()->{mem} };
+    $p{cim_cpu}  = sub { _cim_all()->{cpu} };
+    $p{cim_disk} = sub { _cim_all()->{disk} };
     return \%p;
+}
+
+# _cim_all() -> { mem => $json, cpu => $json, disk => $json }, each a JSON TEXT
+# in exactly the shape its existing parser expects.
+#
+# Memoized for a few seconds so one sample round costs one spawn no matter which
+# order the three probes are pulled in, and WITHOUT depending on that order --
+# Resources::gather's @PROBE_ORDER is its business, not ours. The TTL is far
+# below the 23s sample interval, so consecutive rounds never share a result.
+#
+# Degrades to the three separate commands if the combined probe fails or returns
+# something unparseable: a resources panel that reads n/a is a cosmetic loss, but
+# silently reporting stale or wrong memory would not be.
+{
+    my ($cim_cache, $cim_cache_at);
+    sub _cim_all {
+        my $now = time;
+        return $cim_cache if $cim_cache && defined $cim_cache_at && ($now - $cim_cache_at) < 5;
+
+        my %cmd = _ps_commands();
+        my %out;
+        my $raw = _powershell_json($cmd{cim_all});
+        my $ok  = 0;
+        if (defined $raw && length $raw) {
+            my $j = eval { JSON::PP->new->utf8(0)->decode(_strip_bom($raw)) };
+            if (ref $j eq 'HASH' && exists $j->{mem} && exists $j->{cpu} && exists $j->{disk}) {
+                my $enc = JSON::PP->new->canonical(1);
+                $out{mem}  = eval { $enc->encode($j->{mem})  };
+                $out{cpu}  = eval { $enc->encode($j->{cpu})  };
+                $out{disk} = eval { $enc->encode($j->{disk}) };
+                $ok = (defined $out{mem} && defined $out{cpu} && defined $out{disk}) ? 1 : 0;
+            }
+        }
+        unless ($ok) {
+            # Fall back to the original three-spawn form rather than reporting
+            # nothing. Costs what it always cost, only when the cheap path fails.
+            %out = (
+                mem  => _powershell_json($cmd{cim_mem}),
+                cpu  => _powershell_json($cmd{cim_cpu}),
+                disk => _powershell_json($cmd{cim_disk}),
+            );
+        }
+        $cim_cache    = \%out;
+        $cim_cache_at = $now;
+        return $cim_cache;
+    }
+}
+
+# _strip_bom($s) -> $s without a leading UTF-8 BOM. powershell.exe emits one and
+# JSON::PP will not decode past it.
+sub _strip_bom {
+    my ($s) = @_;
+    return $s unless defined $s;
+    $s =~ s/\A\x{ef}\x{bb}\x{bf}//;
+    return $s;
 }
 
 # _gather_resources() -> \%struct | undef. READER ONLY (tui-adapter-contract
