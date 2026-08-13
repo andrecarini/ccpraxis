@@ -51,7 +51,23 @@ If outside a sandbox, stop and explain — don't try to fall back to host paths 
 2. **User typed `/backpack:add` bare** — interactive mode: gather everything via `AskUserQuestion`.
 3. **Partial flags** — gather only the missing ones interactively.
 
-Required for any item: `category`, `name`, `install`, `verify`. Optional: `rationale`.
+Required for any item: `category`, `name`, `install`, `verify`. Optional: `rationale`, `--bin_dirs` (repeatable).
+
+## PATH — entries no longer need a hand-rolled preamble
+
+`backpack.pl install` owns PATH. If your `install` command drops a binary into a directory that isn't
+already on the container's PATH (e.g. `/opt/tools/flutter/bin`, `/opt/tools/google-cloud-sdk/bin`, or
+any other non-standard install location), declare it with one or more `--bin_dirs <absolute dir>`
+flags. Entries no longer need a hand-rolled `export PATH="...:$PATH" && …` preamble inside
+`install`/`verify` at all — every `install` pass aggregates the floor (`/opt/tools/bin`) plus every
+item's `bin_dirs` into a PATH profile fragment AND applies it to the running process's `$ENV{PATH}`
+before running any verify/install command, so a bare command name (`command -v gh`, not an absolute
+path) is enough for `verify`.
+
+`--bin_dirs` semantics: repeat the flag to declare multiple directories (`--bin_dirs /a --bin_dirs /b`
+→ both). Given at all (even once) on an update, it **replaces** the entry's whole `bin_dirs` array.
+Omitted on an update, the existing array is preserved unchanged. Each directory must be an absolute
+path and must not contain `:`, `"`, `` ` ``, `$`, or whitespace (validated by `add`/`validate`).
 
 ## Interactive gather (when flags are missing)
 
@@ -71,7 +87,8 @@ perl "${CLAUDE_SKILL_DIR}/../../scripts/backpack.pl" add "$HOME/.claude/backpack
   --name      "<N>" \
   --install   "<I>" \
   --verify    "<V>" \
-  --rationale "<R>"   # only if provided
+  --rationale "<R>" \  # only if provided
+  --bin_dirs  "<D>"    # repeatable; only if the item's binaries land outside the existing PATH
 ```
 
 To pin a version, bake it into the **install** command (e.g. `apt-get install -y jq=1.6`, `npm install -g prettier@3.2.5`) — that's the single source of truth. There is no separate `--version` field; the verify command (`X --version`) reflects the live version.

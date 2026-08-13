@@ -25,6 +25,12 @@
 #                                                           Exit codes: 0 clean (and fully reconciled, if --declared);
 #                                                           1 an item's install/verify actually failed; 2 every item
 #                                                           installed/skipped fine but --declared reconciliation MISMATCHed.
+#                                                           A bin_dirs entry outside the backpack's install root is
+#                                                           reported per item (REJECTED lines, BIN_DIRS_REJECTED count)
+#                                                           and excluded from the PATH profile fragment, but does NOT
+#                                                           change the exit code -- see the comment above install_root()
+#                                                           for why that's a deliberate compatibility choice, not an
+#                                                           oversight.
 #   audit <path>                                             Audit each item: runs verify (no install) + checks rationale.
 #   deps <path> --note TEXT                                  Print a depends_on dependency/ordering audit table (a cycle
 #                                                           member is reported as load_bearing: CYCLE, not folded into
@@ -41,6 +47,14 @@
 #       "verify":    "<shell command, no newline>",
 #       "rationale": "<optional, free-text 'why this is in the backpack'>",
 #       "depends_on":"<optional array of 'category:name' refs to other items in the SAME file that must install first>",
+#       "bin_dirs":  "<optional array of absolute directory paths this item's binaries land in;
+#                     `install` aggregates these (plus the standing /opt/tools/bin floor) into a
+#                     PATH profile fragment AND applies them to $ENV{PATH} in-process, so verify/
+#                     install commands can use a bare command name instead of a hand-rolled
+#                     `export PATH=...` preamble. `add` rejects any entry outside the backpack's
+#                     own install root (the /opt/tools prefix the floor lives under) -- an
+#                     unconstrained bin_dirs entry would otherwise ride into the PATH of every
+#                     future login shell in the container>",
 #       "added":     "<ISO date, auto-set on add>"
 #     } ] }
 #
@@ -80,6 +94,34 @@ binmode STDERR, ':encoding(UTF-8)';
 our $SCHEMA_VERSION = 2;
 our @ALLOWED_CATEGORIES = qw(apt npm-global pip cargo gem go-install curl-script snap project-setup other);
 our %ALLOWED_CATEGORY = map { $_ => 1 } @ALLOWED_CATEGORIES;
+
+# The standing floor: every install/audit pass puts this directory on PATH
+# regardless of any item's own bin_dirs. Concrete directories named in
+# individual items are NOT hardcoded here -- see aggregate_bin_dirs. Assigned
+# here (before dispatch) rather than down among the other subs, because a
+# top-level statement only runs when program flow actually reaches it --
+# dispatch below calls straight into cmd_install/cmd_audit, which would see
+# an empty @PATH_FLOOR_DIRS if this assignment sat textually later in the file.
+our @PATH_FLOOR_DIRS = ('/opt/tools/bin');
+
+# Snapshot the PROCESS's inherited PATH exactly once, before anything below
+# has a chance to mutate $ENV{PATH}. apply_path_env (fix-batch step7,
+# CRITICAL-2 fix) is now called PER ITEM inside cmd_install's/cmd_audit's
+# loops -- if it prepended onto the CURRENT $ENV{PATH} each time (as a naive
+# implementation would), every item's dirs would silently accumulate onto
+# every SUBSEQUENT item's scope across the loop, reopening exactly the
+# cross-item contamination CRITICAL-2 exists to close. Always rebuilding
+# from this one fixed snapshot makes each call's result depend only on that
+# item's own dirs, never on how many items were processed before it.
+our $ORIGINAL_PATH = $ENV{PATH} // '';
+
+# bin_dirs content-rule bounds (fix-batch step7, MEDIUM finding Part B): a
+# single pathological entry (observed: 100KB on this dev host) broke every
+# subsequent `bash -c` spawn by blowing an OS environment-block limit. These
+# are generous but bounded -- 1024 bytes is far beyond any real directory
+# path, 65536 aggregate covers a backpack with hundreds of entries.
+our $BIN_DIRS_MAX_ENTRY_LEN = 1024;
+our $BIN_DIRS_MAX_TOTAL_LEN = 65536;
 
 my $cmd = shift @ARGV // "help";
 
@@ -154,6 +196,167 @@ sub write_json_atomic {
 
 sub today_iso {
     return strftime('%Y-%m-%d', gmtime);
+}
+
+# write_text_atomic($file, $content) -- mirrors write_json_atomic (make_path
+# the parent dir, write to a .tmp.$$ sibling, rename over the destination).
+# Used only by cmd_install for the PATH profile fragment; failures are caught
+# by the caller (non-fatal there), so this sub is allowed to die -- the
+# caller wraps it in an eval.
+sub write_text_atomic {
+    my ($file, $content) = @_;
+    my $dir = dirname($file);
+    make_path($dir) unless -d $dir;
+    my $tmp = "$file.tmp.$$";
+    open my $fh, '>:raw', $tmp or die "write $tmp: $!\n";
+    print $fh $content;
+    close $fh or die "close $tmp: $!\n";
+    unless (rename $tmp, $file) {
+        if (-e $file) {
+            unlink $file or do { unlink $tmp; die "unlink $file failed: $!\n"; };
+            rename $tmp, $file or do { unlink $tmp; die "rename $tmp -> $file (after unlink): $!\n"; };
+        } else {
+            unlink $tmp;
+            die "rename $tmp -> $file: $!\n";
+        }
+    }
+    eval { chmod 0644, $file };
+}
+
+# @PATH_FLOOR_DIRS is declared near the top of the file (before dispatch) --
+# see the comment there for why.
+
+# apply_path_env(@dirs) -- sets $ENV{PATH} in-process (this same backpack.pl
+# process, not a child shell) so every subsequent run_bash/run_bash_silent
+# call -- a fresh `bash -c` child that inherits %ENV -- can find binaries in
+# @dirs by bare command name. This is independent of whether the on-disk
+# profile fragment was written or will ever be sourced by anything; it is
+# what actually closes the reinstall loop (DC3).
+sub apply_path_env {
+    my (@dirs) = @_;
+    # Always rebuild from the fixed $ORIGINAL_PATH snapshot, never from the
+    # (possibly already-mutated-by-a-previous-call) current $ENV{PATH} -- see
+    # the comment above $ORIGINAL_PATH's declaration for why that matters
+    # now that this is called per item in a loop.
+    $ENV{PATH} = join(':', @dirs) . ":$ORIGINAL_PATH";
+}
+
+# item_bin_dirs($item) -> floor + THAT item's own bin_dirs only, deduped
+# (fix-batch step7, CRITICAL-2 fix). Scoping install/verify PATH to a single
+# item's own declared directories -- never the union of every item in the
+# file -- is what stops an unrelated item's bin_dirs binary from making a
+# never-installed item falsely report itself present (redteam-step6
+# CRITICAL-2 reproducer: two items independently checking for the same
+# command name).
+sub item_bin_dirs {
+    my ($item) = @_;
+    my (@dirs, %seen);
+    for my $d (@PATH_FLOOR_DIRS, @{ $item->{bin_dirs} // [] }) {
+        next if $seen{$d}++;
+        push @dirs, $d;
+    }
+    return @dirs;
+}
+
+# apply_path_env_for_item($item) -- sets $ENV{PATH} to THAT item's own scope
+# (see item_bin_dirs) immediately before running its verify/install. Called
+# once per item, at the top of each iteration, so every other item's
+# commands run under their OWN scope instead of a shared aggregate.
+sub apply_path_env_for_item {
+    my ($item) = @_;
+    apply_path_env(item_bin_dirs($item));
+}
+
+# ── install-root containment (fix-batch step7, CRITICAL-1) ────────────
+#
+# bin_dirs was an unconstrained absolute directory, prepended ahead of
+# root's PATH for the WHOLE container's remaining life via the persisted
+# profile fragment -- invisible to both the approval-hash gate (bin_dirs is
+# not an item_hash input) and the human review screen (BackpackReview.pm
+# never prints it). Both of those live outside this package's write set
+# (BackpackApproval.pm / BackpackReview.pm are explicitly off-limits here --
+# see the fix-batch dispatch and z01 residual note in the fix-batch report).
+# The fix INSIDE this write set: constrain what actually reaches the
+# PERSISTENT fragment to directories inside the backpack's own install root
+# -- collapsing "prepend an arbitrary attacker-chosen directory to root's
+# PATH" down to "reorder within directories the backpack itself already owns
+# and populates". install_root() derives the root from the SAME
+# @PATH_FLOOR_DIRS constant the floor itself uses (its parent directory) so
+# there is exactly one place that names "/opt/tools" -- not a second,
+# independently-maintained copy that could drift.
+#
+# Deliberately NOT applied to item_bin_dirs/apply_path_env_for_item (an
+# item's own scope, used to run ITS OWN install/verify): an item already
+# runs arbitrary shell as root via its own install/verify text, so an
+# out-of-root bin_dirs entry used only within that item's own scope grants
+# it no capability it didn't already have. What matters is stopping it from
+# (a) contaminating OTHER items' scope (closed by CRITICAL-2's per-item
+# scoping) and (b) persisting into the on-disk fragment sourced by every
+# future login shell for the rest of the container's life -- (b) is what
+# install_root()/dir_within_root() below actually gates.
+sub install_root {
+    return dirname($PATH_FLOOR_DIRS[0]);
+}
+
+# normalize_path($p) -> a lexically-normalized absolute path: collapses
+# duplicate/trailing slashes and resolves '..'/'.' segments WITHOUT touching
+# the filesystem (no symlink resolution -- that would be a TOCTOU trap for a
+# root-owned check). "/opt/tools/../../etc" normalizes to "/etc" and is
+# correctly seen as escaping the root by dir_within_root below.
+sub normalize_path {
+    my ($p) = @_;
+    my @parts = split m{/+}, $p;
+    my @stack;
+    for my $part (@parts) {
+        next if $part eq '' || $part eq '.';
+        if ($part eq '..') {
+            pop @stack if @stack;
+        } else {
+            push @stack, $part;
+        }
+    }
+    return '/' . join('/', @stack);
+}
+
+# dir_within_root($dir, $root) -> true iff $dir, after lexical normalization,
+# IS $root or is nested under it. String comparison after normalization, not
+# a filesystem check.
+sub dir_within_root {
+    my ($dir, $root) = @_;
+    my $nd = normalize_path($dir);
+    my $nr = normalize_path($root);
+    return 1 if $nd eq $nr;
+    return index($nd, "$nr/") == 0;
+}
+
+# aggregate_bin_dirs_filtered(\@items, $root) -> (\@dirs, \@rejected).
+# @dirs: floor first, then each item's bin_dirs entries that pass
+# dir_within_root, deduped, floor-then-file order -- exactly what
+# cmd_install writes into the PERSISTENT profile fragment (the thing that
+# outlives this process and is sourced by every future login shell).
+# @rejected: [label, dir] pairs for entries that failed the root check --
+# EXCLUDED from the fragment, but reported per-item (not silently dropped),
+# and NOT treated as a whole-file abort (MEDIUM fix: the offending item
+# still installs/verifies normally via its own scope, see item_bin_dirs).
+sub aggregate_bin_dirs_filtered {
+    my ($items_ref, $root) = @_;
+    my (@dirs, %seen, @rejected);
+    for my $d (@PATH_FLOOR_DIRS) {
+        next if $seen{$d}++;
+        push @dirs, $d;
+    }
+    for my $t (@$items_ref) {
+        my $label = "$t->{category}:$t->{name}";
+        for my $d (@{ $t->{bin_dirs} // [] }) {
+            if (dir_within_root($d, $root)) {
+                next if $seen{$d}++;
+                push @dirs, $d;
+            } else {
+                push @rejected, [$label, $d];
+            }
+        }
+    }
+    return (\@dirs, \@rejected);
 }
 
 # cycle_line(\@labels, $prefix) -> a bounded "CYCLE: <prefix><labels>\n" line
@@ -267,6 +470,43 @@ sub push_text_issues {
         if $val =~ /[\x01-\x08\x0b\x0c\x0e-\x1f\x7f]/;
 }
 
+# bin_dirs_entry_problem($d) -> undef if $d is a well-formed bin_dirs entry,
+# else a short problem description (no "items[N].bin_dirs entry: " prefix --
+# callers add that). Covers every CONTENT rule a bin_dirs entry must satisfy
+# (null/type/newline/null-byte/control-char/whitespace-only/length/absolute/
+# forbidden-char) in one place, shared between validate_backpack (the hard,
+# authoring-time gate used by `validate`/`add`/the initial `install` load)
+# and cmd_add's own inline check. Deliberately does NOT include the
+# install-root containment rule (dir_within_root) -- that one is enforced
+# separately (hard at `add`-time via install_root()/dir_within_root() below,
+# soft/per-item at `install`-time via aggregate_bin_dirs_filtered) because a
+# root violation must NOT abort the whole install pass the way every rule
+# here does (MEDIUM fix, fix-batch step7) -- see the comment above
+# install_root() for the full reasoning, including why t/10's oracle fixture
+# is legitimately outside /opt/tools and must still install cleanly.
+#
+# LOW fix (fix-batch step7): the null check closes the one gap the red-team
+# confirmed -- push_text_issues used to return silently on undef, and the
+# caller's own `next unless defined $d` compounded it, letting a null
+# element reach join(':', @dirs) as an empty PATH segment (a POSIX shell
+# reads "" as the current directory -- in a file sourced by root).
+sub bin_dirs_entry_problem {
+    my ($d) = @_;
+    return "must not be null" unless defined $d;
+    return "must be a string" if ref $d;
+    return "must not contain newlines" if $d =~ /[\r\n]/;
+    return "must not contain null bytes" if $d =~ /\0/;
+    return "must not contain control/escape characters"
+        if $d =~ /[\x01-\x08\x0b\x0c\x0e-\x1f\x7f]/;
+    return "must not be empty or whitespace-only" if $d =~ /^\s*$/;
+    return "exceeds maximum length ($BIN_DIRS_MAX_ENTRY_LEN bytes)"
+        if length($d) > $BIN_DIRS_MAX_ENTRY_LEN;
+    return "must be an absolute path (starting with '/')" unless $d =~ m{^/};
+    return "must not contain ':', '\"', '\$', backtick, or whitespace"
+        if $d =~ /[:"\$`\s]/;
+    return undef;
+}
+
 # Returns a list of (severity, message) tuples. severity is 'error' or 'warn'.
 sub validate_backpack {
     my $bp = shift;
@@ -285,6 +525,7 @@ sub validate_backpack {
     return @issues unless ref $items eq 'ARRAY';
 
     my %seen;
+    my $bin_dirs_total_len = 0;
     for my $i (0 .. $#$items) {
         my $t = $items->[$i];
         unless (ref $t eq 'HASH') {
@@ -320,6 +561,28 @@ sub validate_backpack {
                 }
             }
         }
+        # Optional bin_dirs: when present, an array of absolute directory paths
+        # this item's binaries land in. Every entry is validated by the
+        # shared bin_dirs_entry_problem() (null/type/newline/null-byte/
+        # control-char/whitespace-only/length/absolute/forbidden-char --
+        # fix-batch step7 folded the null/whitespace/length rules into the
+        # same shared check the pre-existing absolute/forbidden-char rules
+        # already used). The install-root containment rule is DELIBERATELY
+        # NOT here -- see the comment above install_root() for why.
+        if (defined $t->{bin_dirs}) {
+            if (ref $t->{bin_dirs} ne 'ARRAY') {
+                push @issues, ['error', "items[$i].bin_dirs: must be an array"];
+            } else {
+                for my $d (@{ $t->{bin_dirs} }) {
+                    my $problem = bin_dirs_entry_problem($d);
+                    if (defined $problem) {
+                        push @issues, ['error', "items[$i].bin_dirs entry: $problem"];
+                    } else {
+                        $bin_dirs_total_len += length($d);
+                    }
+                }
+            }
+        }
         if (defined $t->{category} && !$ALLOWED_CATEGORY{$t->{category}}) {
             push @issues, ['warn', "items[$i].category '$t->{category}' is not in the known set ("
                 . join(",", @ALLOWED_CATEGORIES) . ")"];
@@ -330,6 +593,13 @@ sub validate_backpack {
                 if $seen{$key}++;
         }
     }
+
+    # MEDIUM Part B fix: an aggregate cap across every valid bin_dirs entry
+    # in the whole file, in addition to the per-entry cap above -- guards
+    # against many small-but-not-individually-huge entries collectively
+    # producing a pathological PATH value.
+    push @issues, ['error', "bin_dirs: aggregate length across all entries exceeds maximum ($BIN_DIRS_MAX_TOTAL_LEN bytes)"]
+        if $bin_dirs_total_len > $BIN_DIRS_MAX_TOTAL_LEN;
 
     return @issues;
 }
@@ -397,13 +667,14 @@ sub cmd_add {
     die_user("the per-item --version field was removed from the backpack schema; "
         . "pin the version inside the --install command (e.g. 'apt-get install -y jq=1.6') instead")
         if grep { /^--version(?:=|$)/ } @ARGV;
-    my ($category, $name, $install, $verify, $rationale);
+    my ($category, $name, $install, $verify, $rationale, $bin_dirs_raw);
     GetOptionsFromArray(\@ARGV,
         'category=s'  => \$category,
         'name=s'      => \$name,
         'install=s'   => \$install,
         'verify=s'    => \$verify,
         'rationale=s' => \$rationale,
+        'bin_dirs=s@' => \$bin_dirs_raw,
     ) or die_user("invalid options for add");
 
     for my $f (qw(category name install verify)) {
@@ -419,6 +690,22 @@ sub cmd_add {
         die_user("--rationale must not contain null bytes") if $rationale =~ /\0/;
         die_user("--rationale must not contain control/escape characters")
             if $rationale =~ /[\x01-\x08\x0b\x0c\x0e-\x1f\x7f]/;
+    }
+    if (defined $bin_dirs_raw) {
+        # Shares bin_dirs_entry_problem() with validate_backpack (see that
+        # sub's comment) for the content rules, PLUS the install-root
+        # containment check (CRITICAL-1 fix, fix-batch step7): `add` is the
+        # sanctioned authoring path, so this is where a hostile or mistaken
+        # out-of-root directory gets stopped BEFORE it can ever be written
+        # to the file at all -- closing the attack at its source rather than
+        # only downstream at `install` time.
+        my $root = install_root();
+        for my $d (@$bin_dirs_raw) {
+            my $problem = bin_dirs_entry_problem($d);
+            die_user("--bin_dirs entry ($d): $problem") if defined $problem;
+            die_user("--bin_dirs entry ($d): must be inside the backpack's install root ($root)")
+                unless dir_within_root($d, $root);
+        }
     }
     # Normalize category to lowercase so `apt` and `APT` aren't treated as
     # distinct keys by the (category,name) deduplication. The allowed-set is
@@ -448,6 +735,10 @@ sub cmd_add {
         verify   => $verify,
     };
     $entry->{rationale} = $rationale if defined $rationale && $rationale ne '';
+    # bin_dirs: given (even a single occurrence) -> replaces the entry's whole
+    # array wholesale; omitted -> preserved on update, absent entirely on a
+    # new entry (mirrors rationale's preserve-if-omitted pattern below).
+    $entry->{bin_dirs} = $bin_dirs_raw if defined $bin_dirs_raw;
 
     if (defined $existing_idx) {
         # Update: preserve original added timestamp + preserve prior rationale
@@ -455,6 +746,9 @@ sub cmd_add {
         $entry->{added} = $items->[$existing_idx]{added} // today_iso();
         if (!defined $entry->{rationale} && defined $items->[$existing_idx]{rationale}) {
             $entry->{rationale} = $items->[$existing_idx]{rationale};
+        }
+        if (!defined $bin_dirs_raw && defined $items->[$existing_idx]{bin_dirs}) {
+            $entry->{bin_dirs} = $items->[$existing_idx]{bin_dirs};
         }
         $items->[$existing_idx] = $entry;
         emit("STATUS", "updated");
@@ -516,8 +810,10 @@ sub cmd_install {
     # header comment history / the b01 spec). Omitting --declared reproduces
     # today's output byte-for-byte: every new line below is gated on it.
     my $declared_path;
+    my $profile_path = '/etc/profile.d/backpack-path.sh';
     GetOptionsFromArray(\@ARGV,
-        'declared=s' => \$declared_path,
+        'declared=s'     => \$declared_path,
+        'profile-path=s' => \$profile_path,
     ) or die_user("invalid options for install");
 
     my $bp = load_backpack($path);
@@ -616,6 +912,52 @@ sub cmd_install {
     emit("DECLARED", scalar @declared_items) if defined $declared_path;
     emit("ITEMS", scalar @$items);
 
+    # ── PATH: profile fragment + in-process PATH (b02, DC1/DC3) ───────────
+    #
+    # Aggregation source: the FULL declared backpack when --declared was
+    # given (a previously installed item outside this run's subset still
+    # needs its dir on PATH), otherwise the handed file (the common case for
+    # a direct/manual `install` call).
+    my $bin_dirs_source = defined $declared_path ? \@declared_items : $items;
+    my $bp_install_root = install_root();
+    my ($path_dirs_ref, $bin_dirs_rejected_ref) = aggregate_bin_dirs_filtered($bin_dirs_source, $bp_install_root);
+    my @path_dirs = @$path_dirs_ref;
+    my @bin_dirs_rejected = @$bin_dirs_rejected_ref;
+
+    my $fragment = "# Managed by backpack.pl -- regenerated on every `install` pass. Do not edit by\n"
+        . "# hand; edits are lost on the next install. Source of truth: bin_dirs on backpack\n"
+        . "# items, plus a standing floor directory for tools with no declared bin_dirs.\n"
+        . "export PATH=\"" . join(':', @path_dirs) . ":\$PATH\"\n";
+    eval { write_text_atomic($profile_path, $fragment) };
+    if ($@) {
+        my $reason = $@;
+        $reason =~ s/\s+$//;
+        print STDERR "WARNING: could not write profile fragment ($profile_path): $reason\n";
+    }
+    emit("PROFILE_PATH", $profile_path);
+    emit("PATHDIRS", scalar @path_dirs);
+
+    # CRITICAL-1 fix (fix-batch step7): any bin_dirs entry outside the
+    # backpack's own install root is excluded from the PERSISTENT fragment
+    # above -- named here, per item, rather than silently dropped. This does
+    # NOT abort the pass (MEDIUM fix) and does NOT affect the offending
+    # item's OWN in-process PATH scope below (see item_bin_dirs / the
+    # comment above install_root() for why that distinction is safe).
+    emit("BIN_DIRS_REJECTED", scalar @bin_dirs_rejected);
+    for my $r (@bin_dirs_rejected) {
+        my ($rlabel, $rdir) = @$r;
+        print "REJECTED: $rlabel bin_dirs entry '$rdir' is outside the install root"
+            . " ($bp_install_root) -- excluded from the PATH profile fragment\n";
+    }
+
+    # NOTE: no global apply_path_env() call here (unlike the pre-fix-batch
+    # shape). CRITICAL-2 fix: PATH is now set PER ITEM, inside the loop
+    # below, scoped to that item's own bin_dirs only -- never the union of
+    # every item in the file. A single shared aggregate PATH applied to
+    # every item's verify was what let one item's bin_dirs binary make an
+    # unrelated, never-installed item falsely report itself present
+    # (redteam-step6 CRITICAL-2).
+
     # Every declared item that never made it into this install-set gets its
     # own loud disposition line -- the exact thing that was silently invisible
     # before this package (criterion 2). And the converse (BLOCKER-1 fix): an
@@ -645,6 +987,12 @@ sub cmd_install {
 
     for my $t (@ordered_items) {
         my $label = "$t->{category}:$t->{name}";
+
+        # CRITICAL-2 fix: scope PATH to THIS item's own bin_dirs (plus the
+        # floor) before running any of its commands -- never the union of
+        # every item's bin_dirs. Set once per iteration; both verify calls
+        # and the install call for this item see the same scope.
+        apply_path_env_for_item($t);
 
         # Verify first: if already installed, skip.
         my $verify_rc = run_bash($t->{verify});
@@ -869,6 +1217,15 @@ sub cmd_audit {
     for my $t (@$items) {
         my $label = "$t->{category}:$t->{name}";
         my $has_rationale = defined $t->{rationale} && $t->{rationale} ne '';
+        # CRITICAL-2 fix (fix-batch step7): PATH augmentation is now PER
+        # ITEM, scoped to that item's own bin_dirs only (see item_bin_dirs) --
+        # not a single aggregate applied to every item's verify. The old
+        # global aggregate let one item's bin_dirs binary make an unrelated,
+        # never-installed item falsely report itself present here too
+        # (redteam-step6 CRITICAL-2, confirmed against cmd_audit
+        # specifically: it reproduced "[v] ... verify ok" for a tool that
+        # was never installed).
+        apply_path_env_for_item($t);
         # Silence the verify command's stdout/stderr for audit — we only care
         # about the exit code. Done at the Perl level (not via a `{ cmd; }
         # >/dev/null` shell wrapper) so a literal `}` or `)` inside the verify

@@ -42,6 +42,11 @@ The script emits per-item lines plus a summary:
 - `OK: <category>:<name>` — install + reverify succeeded.
 - `FAIL: <category>:<name> — install <reason>` — install command exited non-zero.
 - `FAIL: <category>:<name> — verify after install <reason>` — install succeeded but verify still fails.
+- `PROFILE_PATH: <path>` — where the PATH profile fragment was (intended to be) written, default
+  `/etc/profile.d/backpack-path.sh` (production never overrides this; tests pass `--profile-path`).
+- `PATHDIRS: <n>` — how many directories are now on PATH for this run: the standing `/opt/tools/bin`
+  floor plus every declared item's `bin_dirs`, deduped. A write failure at `PROFILE_PATH` degrades to
+  a non-fatal `WARNING:` line on stderr — PATH is still applied in-process for this run either way.
 - Summary: `INSTALLED: <n>`, `SKIPPED: <n>`, `FAILED: <n>`.
 
 If `FAILED > 0`, surface the failing items prominently and ask the user how to proceed — usually the `install` or `verify` command needs a small fix via `/backpack:add` (re-adding overwrites the entry).

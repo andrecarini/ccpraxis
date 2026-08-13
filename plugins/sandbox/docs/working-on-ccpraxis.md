@@ -93,6 +93,12 @@ the `sandbox-refuse-in-place` blueprint for the full reasoning.
   machine- and container-specific identity (`container-name`, `port-base`, `containerfile-hash`).
   A copied `container-name` makes the launcher attach to *another project's* container and mount the
   wrong directory at `/project`. It is derived state — delete it and it regenerates.
+- **`.launcher/last-transcript.txt`** is a one-line, best-effort pointer `launcher.pl` writes on every
+  launch (immediately after opening the launch transcript), holding the in-container path to that
+  launch's raw console transcript (`/root/.claude/sandbox-logs/launch-<id>.transcript.log`).
+  `.launcher/` is RO-overlaid inside the container while `sandbox-logs/` is not, so an agent that
+  inspects only `.launcher/` and finds no log there would otherwise reasonably (but wrongly) conclude
+  none was kept — this pointer exists to redirect it to the real, writable location (BPK-07).
 - **`.ccpraxis-local-data/` is gitignored and never travels via git.** Blueprints, `claude-home`
   (agent memory, session transcripts, credentials, beacons) move only by file copy. So do
   `deploy_key`, `deploy_key.pub` and `.claude/`. If you ever relocate a project, copy those
