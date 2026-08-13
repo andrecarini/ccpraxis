@@ -110,7 +110,7 @@ isnt($rc_term, 0, 'resolved is TERMINAL — no transitions out of it');
     chomp(my $p3 = $o); my ($id3) = $p3 =~ m{/([^/]+)\.md$};
     run('set-status', $id3, '--project', $PROJ, '--to', 'reviewing');
 
-    is((run('verify'))[0], 0, 'verify: clean while nothing has been tampered with');
+    is((run('verify', '--project', $PROJ))[0], 0, 'verify: clean while nothing has been tampered with');
 
     # Write straight past the script and the hook, the way a determined Bash
     # call would. Neither can stop this; the digest is what catches it.
@@ -118,10 +118,11 @@ isnt($rc_term, 0, 'resolved is TERMINAL — no transitions out of it');
     $raw =~ s/original body/tampered body/;
     open my $w, '>:raw', $p3 or die; print {$w} $raw; close $w;
 
-    my ($rc_v, $out_v) = run('verify');
+    my ($rc_v, $out_v) = run('verify', '--project', $PROJ);
     isnt($rc_v, 0, 'verify: DETECTS an out-of-band edit to a frozen report');
     like($out_v, qr/TAMPERED/, '...and says so unmistakably');
-    like((run('collect'))[1], qr/TAMPERED|!!/, 'collect: surfaces the integrity failure too');
+    like((run('collect', '--project', $PROJ))[1], qr/TAMPERED|!!/,
+         'collect: surfaces the integrity failure too');
 }
 
 # ---- listing ---------------------------------------------------------------
@@ -134,13 +135,60 @@ isnt($rc_term, 0, 'resolved is TERMINAL — no transitions out of it');
     my (undef, $lo) = run('list', '--project', $PROJ, '--status', 'open');
     unlike($lo, qr/judge deadlocks/, 'list --status open: filters out the resolved one');
 
-    # collect spans projects via the index, which exists precisely so nothing
-    # has to reconstruct project paths from Claude Code's lossy slugs.
-    my $OTHER = tempdir(CLEANUP => 1);
-    run('file', '--project', $OTHER, '--title', '"from another project"', '--body', '"x"');
-    my (undef, $c) = run('collect');
-    like($c, qr/judge deadlocks/,        'collect: includes the first project');
-    like($c, qr/from another project/,   'collect: includes a DIFFERENT project');
+    # collect always includes the CURRENT project even when it is not in the
+    # registry — a report filed from an unregistered project must still be
+    # visible to the person standing in it. Cross-project discovery is covered
+    # by the registry block below.
+    my (undef, $c) = run('collect', '--project', $PROJ);
+    like($c, qr/judge deadlocks/, 'collect: includes the current project unconditionally');
+}
+
+# ---- discovery: the registry, not an index, and not glob -------------------
+#
+# The first design kept an append-only index under the writer's $HOME. That is
+# broken for the primary filer: inside a sandbox, $HOME/.claude IS the project's
+# own claude-home (bind-mounted at /root/.claude), so the index write lands in
+# that one project and never reaches the host — the machine-wide index would
+# silently miss exactly the reports it exists to collect. Discovery now walks
+# steward's machine-local project registry, the same one /steward:backup uses.
+{
+    my $HOME2 = tempdir(CLEANUP => 1);
+    my $P1 = tempdir(CLEANUP => 1);
+    my $P2 = tempdir(CLEANUP => 1);
+    # A path with a SPACE. Perl's built-in glob splits its argument on
+    # whitespace, so "/…/Personal Files/Job search/…" came back as fragments and
+    # the directory was never read. Two of this machine's registered projects
+    # have spaces, so this silently missed real reports.
+    my $P3 = "$P2/proj with spaces";
+    mkdir $P3 or die;
+
+    my $reg = "$HOME2/.claude/claude-code-vault";
+    for my $d ("$HOME2/.claude", $reg) { mkdir $d or die "mkdir $d: $!" }
+    open my $rf, '>:raw', "$reg/.registry-local.json" or die;
+    print {$rf} JSON::PP->new->canonical->encode({ version => 1, projects => {
+        one     => { path => $P1 },
+        spaced  => { path => $P3 },
+    }});
+    close $rf;
+
+    my $run2 = sub {
+        my (@a) = @_;
+        my $c = qq{ALMANAC_HOME="$HOME2" perl "$A" } . join(' ', @a) . ' 2>&1';
+        my $o = `$c`; return ($? >> 8, $o // '');
+    };
+
+    $run2->('file', '--project', qq{"$P1"}, '--title', '"in project one"', '--body', '"b"');
+    $run2->('file', '--project', qq{"$P3"}, '--title', '"in the spaced project"', '--body', '"b"');
+
+    my (undef, $out2) = $run2->('collect');
+    like($out2, qr/in project one/,
+         'collect finds a report via the registry, with no index anywhere');
+    like($out2, qr/in the spaced project/,
+         'collect finds one in a project whose PATH CONTAINS A SPACE (glob split these away)');
+
+    # And nothing was written outside the projects themselves.
+    ok(!-e "$HOME2/.claude/almanac", 'no index directory is created under $HOME');
+    ok(!-e "$HOME2/.claude/ccpraxis/bug-index.jsonl", 'nothing is written into the live install');
 }
 
 done_testing();

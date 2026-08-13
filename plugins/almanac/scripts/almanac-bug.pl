@@ -27,13 +27,11 @@
 #      write.
 #
 # WHERE THINGS LIVE. Reports sit in the project they were filed from, so they
-# travel with the context that produced them:
+# travel with the context that produced them, and with nothing else:
 #   <project>/.ccpraxis-local-data/bug-reports/<id>.md
-# and every state change appends to a machine-level index:
-#   ~/.claude/ccpraxis/bug-index.jsonl
-# The index exists so `collect` never has to guess project paths from Claude
-# Code's slugs, which are lossy (separators and hyphens are ambiguous — that
-# ambiguity already produced a wrong conclusion during this system's design).
+# There is NO index — see the note above known_projects(). Cross-project
+# discovery walks steward's machine-local project registry, the same one
+# /steward:backup walks, so a sandboxed filer needs no access to the host.
 
 package AlmanacBug;
 use strict;
@@ -58,14 +56,42 @@ sub _now { time }
 sub _iso { my @t = gmtime($_[0] // time);
            sprintf('%04d-%02d-%02dT%02d:%02d:%02dZ', $t[5]+1900,$t[4]+1,$t[3],$t[2],$t[1],$t[0]) }
 
-# NOT under ~/.claude/ccpraxis — that path is the LIVE INSTALL, a git working
-# tree, and an index file written there shows up as an untracked change that
-# blocks `git pull` during promotion. Caught within an hour of shipping: the
-# first two real reports left the live install dirty. State belongs beside the
-# repo, never inside it.
-sub index_path {
+# THERE IS NO INDEX, and the reason is worth keeping.
+#
+# The first design wrote an append-only index under the writer's $HOME so
+# `collect` could find reports across projects. That is broken for the primary
+# filer. A sandboxed agent's $HOME/.claude IS the project's own
+# .ccpraxis-local-data/claude-home (bind-mounted to /root/.claude), so its index
+# write lands inside that one project and never reaches the host at all — the
+# machine-wide index would silently miss exactly the reports it exists to
+# collect. It also wrote into ~/.claude/ccpraxis, the live install's git tree,
+# which blocked a promotion pull.
+#
+# The report FILE in the project is the only durable state, and steward already
+# solves discovery: ~/.claude/claude-code-vault/.registry-local.json maps slug ->
+# absolute project path on this machine, and is deliberately gitignored inside
+# the vault because those paths are machine-local. That registry is what
+# /steward:backup walks, so `collect` walks it too.
+sub registry_path {
     my $home = $ENV{ALMANAC_HOME} // $ENV{HOME} // $ENV{USERPROFILE} // '.';
-    return "$home/.claude/almanac/bug-index.jsonl";
+    return "$home/.claude/claude-code-vault/.registry-local.json";
+}
+
+# known_projects() -> list of absolute project roots on THIS machine.
+sub known_projects {
+    my $p = registry_path();
+    open my $fh, '<:raw', $p or return ();
+    local $/;
+    my $j = eval { JSON::PP->new->decode(<$fh>) };
+    close $fh;
+    return () unless ref $j eq 'HASH' && ref $j->{projects} eq 'HASH';
+    my @out;
+    for my $slug (sort keys %{ $j->{projects} }) {
+        my $path = $j->{projects}{$slug}{path} or next;
+        $path =~ s{\\}{/}g; $path =~ s{/+$}{};
+        push @out, $path if length $path;
+    }
+    return @out;
 }
 sub reports_dir { my ($root) = @_; return "$root/.ccpraxis-local-data/bug-reports" }
 
@@ -139,28 +165,31 @@ sub verify {
     return (0, "TAMPERED: body digest $now != recorded $f->{content_sha256}");
 }
 
-sub append_index {
-    my ($rec) = @_;
-    my $p = index_path();
-    _mkpath(dirname($p)) or return 0;
-    open my $fh, '>>:raw', $p or return 0;
-    print {$fh} JSON::PP->new->canonical->encode($rec), "\n";
-    close $fh;
-    return 1;
+# all_report_paths(\@extra_roots) -> sorted absolute paths of every report on
+# this machine. Disk is the truth; there is nothing to keep in sync.
+sub all_report_paths {
+    my ($extra) = @_;
+    my %seen;
+    my @roots = grep { !$seen{$_}++ } (@{ $extra // [] }, known_projects());
+    my @paths;
+    for my $r (@roots) {
+        push @paths, list_reports_in($r);
+    }
+    my %u; return sort grep { !$u{$_}++ } @paths;
 }
 
-# The index is append-only, so the LAST line for an id is its current state.
-sub read_index {
-    my $p = index_path();
-    open my $fh, '<:raw', $p or return {};
-    my %by_id;
-    while (my $l = <$fh>) {
-        my $j = eval { JSON::PP->new->decode($l) } or next;
-        next unless ref $j eq 'HASH' && defined $j->{id};
-        $by_id{ $j->{id} } = { %{ $by_id{$j->{id}} // {} }, %$j };
-    }
-    close $fh;
-    return \%by_id;
+# opendir, NOT glob. Perl's built-in glob splits its argument on WHITESPACE, so
+# "/c/Users/André/Personal Files/Job search/..." came back as three fragments
+# and the real directory was never read — silently missing every report in any
+# project whose path contains a space. Two of this machine's registered
+# projects do. opendir has no quoting semantics at all.
+sub list_reports_in {
+    my ($root) = @_;
+    my $dir = reports_dir($root);
+    opendir(my $dh, $dir) or return ();
+    my @f = sort grep { /\.md\z/ && -f "$dir/$_" } readdir($dh);
+    closedir $dh;
+    return map { "$dir/$_" } @f;
 }
 
 sub new_id {
@@ -226,8 +255,7 @@ unless (caller) {
         );
         AlmanacBug::_write_atomic($path, AlmanacBug::_render(\%f, $body))
             or die "almanac-bug file: could not write $path\n";
-        AlmanacBug::append_index({ id=>$id, path=>$path, project=>$root, title=>$title,
-                                   status=>'open', at=>AlmanacBug::_iso($now) });
+
         print "$path\n";
         exit 0;
     }
@@ -237,9 +265,12 @@ unless (caller) {
         my ($id) = @_;
         my $local = AlmanacBug::reports_dir($root) . "/$id.md";
         return $local if -f $local;
-        my $idx = AlmanacBug::read_index();
-        my $rec = $idx->{$id} or return undef;
-        return (defined $rec->{path} && -f $rec->{path}) ? $rec->{path} : undef;
+        # Not here — look across the registered projects. Cheap: one glob per
+        # project, and it needs no index to have been kept honest.
+        for my $p (AlmanacBug::all_report_paths([$root])) {
+            return $p if $p =~ m{/\Q$id\E\.md$};
+        }
+        return undef;
     };
 
     if ($cmd eq 'update') {
@@ -261,8 +292,7 @@ unless (caller) {
         $f{updated_at} = AlmanacBug::_iso(time);
         AlmanacBug::_write_atomic($path, AlmanacBug::_render(\%f, $body))
             or die "almanac-bug update: could not write $path\n";
-        AlmanacBug::append_index({ id=>$id, path=>$path, project=>$f{project}//$root,
-                                   title=>$f{title}, status=>$st, at=>$f{updated_at} });
+
         print "$path\n";
         exit 0;
     }
@@ -290,8 +320,7 @@ unless (caller) {
         $f{resolution} = $o{note}   if defined $o{note} && !ref $o{note};
         AlmanacBug::_write_atomic($path, AlmanacBug::_render(\%f, $rep->{body}))
             or die "almanac-bug set-status: could not write $path\n";
-        AlmanacBug::append_index({ id=>$id, path=>$path, project=>$f{project}//$root,
-                                   title=>$f{title}, status=>$to, at=>$now });
+
         print "$id: $from -> $to\n";
         exit 0;
     }
@@ -301,11 +330,9 @@ unless (caller) {
         # collect = every project (from the index, then re-read each file)
         my @paths;
         if ($cmd eq 'list') {
-            my $dir = AlmanacBug::reports_dir($root);
-            @paths = sort glob("$dir/*.md");
+            @paths = AlmanacBug::list_reports_in($root);   # opendir, not glob — see list_reports_in
         } else {
-            my $idx = AlmanacBug::read_index();
-            @paths = sort map { $_->{path} } grep { defined $_->{path} } values %$idx;
+            @paths = AlmanacBug::all_report_paths([$root]);
         }
         my @out;
         for my $p (@paths) {
@@ -334,17 +361,22 @@ unless (caller) {
     }
 
     if ($cmd eq 'verify') {
-        my $idx = AlmanacBug::read_index();
         my @bad;
         my $n = 0;
-        for my $rec (sort { ($a->{id}//'') cmp ($b->{id}//'') } values %$idx) {
-            my $p = $rec->{path} or next;
-            unless (-f $p) { push @bad, "$rec->{id}: MISSING from disk ($p)"; next }
-            my $rep = AlmanacBug::load($p) or do { push @bad, "$rec->{id}: unreadable/malformed"; next };
+        my @skipped;
+        for my $p (AlmanacBug::all_report_paths([$root])) {
+            my $rep = AlmanacBug::load($p);
+            # A .md in this directory that has no almanac frontmatter is not a
+            # report — typically a hand-written file that predates the state
+            # machine, or one imported from it. Calling that "malformed" buries
+            # the real signal, so it is counted separately and quietly.
+            unless ($rep && defined $rep->{fields}{id}) { push @skipped, $p; next }
             $n++;
             my ($ok, $note) = AlmanacBug::verify($rep);
-            push @bad, "$rec->{id}: $note" unless $ok;
+            push @bad, ($rep->{fields}{id} . ": $note") unless $ok;
         }
+        printf "skipped %d non-report file(s) in bug-reports/ (no almanac frontmatter)\n",
+               scalar @skipped if @skipped;
         print "checked $n report(s)\n";
         print "  $_\n" for @bad;
         exit(@bad ? 2 : 0);

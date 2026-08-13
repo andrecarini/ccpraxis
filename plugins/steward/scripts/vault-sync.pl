@@ -89,6 +89,11 @@ my @DEFAULT_TRACKABLE = (
     # unlike a blueprint it cannot be re-derived from anything: the raw files
     # are evidence of what was actually said, kept byte-for-byte on purpose.
     '.ccpraxis-local-data/corrections',
+    # ccpraxis bug reports filed from this project (/almanac:bug-report). Same
+    # reasoning as corrections: gitignored, so the vault is their only copy off
+    # this machine, and a report frozen at `taken` is evidence of what was
+    # actually claimed — not re-derivable from anything.
+    '.ccpraxis-local-data/bug-reports',
     $HOST_MEMORY_REL,                          # host-side memory (synthetic; see local_abs)
 );
 
