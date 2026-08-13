@@ -26,11 +26,25 @@
 # plugins ship from the same tree, so the relative path holds in the clone, in
 # the live install, and under the container's marketplace mount.
 #
-# We deliberately do NOT pass the helper's -PidFile: it would write its own
-# Windows pid over ours, and the liveness check is perl's kill(0,$pid) against
-# the pid WE forked. The fork child execs powershell, so that one pid is the
-# wake-lock's whole lifetime — killing it releases the lock (ES_CONTINUOUS is
-# tied to the calling thread, so no explicit undo is needed).
+# WE PASS -PidFile, AND THE REASON MATTERS — the opposite choice leaked 2.7 GB.
+#
+# The original comment here said we deliberately did NOT pass it, because "it
+# would write its own Windows pid over ours". That is exactly backwards, and it
+# was measured on 2026-08-13: 52 orphaned keep-awake PowerShells, ~52 MB each,
+# holding 2.7 GB and 52 simultaneous ES_CONTINUOUS wake-locks.
+#
+# On Git-for-Windows perl, fork() is EMULATED with threads and returns a
+# PSEUDO-process id (447298, say) that is meaningful only inside the perl
+# process that created it. Every `bp-drive-next.pl next` is a FRESH perl
+# process, so its `kill(0, $pid)` against a pseudo-pid written by some earlier
+# process always fails. The idempotency check therefore never fired: each
+# invocation concluded "no live lock" and spawned another one, and the release
+# path could not kill the old one either, for the same reason. The mechanism
+# leaked one PowerShell per invocation, forever.
+#
+# The helper's own $PID is a REAL Windows pid, valid across processes, and
+# keep-awake.ps1 removes the file on exit — so a stale file means a dead helper
+# and correctly triggers a respawn. That is the identity we need. Ours never was.
 #
 # Degrades honestly: no Windows, no helper, or a failed fork means no lock and a
 # logged warning — never a false claim of holding one. That failure mode is the
@@ -71,6 +85,22 @@ sub winify {
     return $p;
 }
 
+# winify for a path that does NOT exist yet (an output file). abs_path returns
+# undef for a missing leaf, which would leave a POSIX "/c/..." string to hand a
+# native binary — and Windows resolves a leading "/" against the current drive,
+# creating it at the DRIVE ROOT. That is the 576-stray incident in CLAUDE.md, so
+# resolve the parent directory (which does exist) and re-attach the basename.
+sub winify_out {
+    my ($p) = @_;
+    $p =~ s{\\}{/}g;
+    my ($dir, $leaf) = $p =~ m{^(.*)/([^/]+)$} ? ($1, $2) : ('.', $p);
+    my $abs = Cwd::abs_path($dir);
+    return winify($p) unless defined $abs;   # parent missing too: best effort
+    $abs =~ s{\\}{/}g;
+    $abs =~ s{^/([a-zA-Z])/}{\u$1:/};
+    return "$abs/$leaf";
+}
+
 # Detect whether powershell.exe is resolvable.
 sub ps_available {
     # Windows-only concern; in the Linux sandbox this is a documented no-op.
@@ -96,10 +126,14 @@ sub spawn {
         open(STDOUT, '>', '/dev/null');
         open(STDERR, '>', '/dev/null');
         exec('powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass',
-             '-WindowStyle', 'Hidden', '-File', winify($ps1))
+             '-WindowStyle', 'Hidden', '-File', winify($ps1),
+             '-PidFile', winify_out($pid_f))
             or POSIX::_exit(127);
     }
-    if (open my $w, '>', $pid_f) { print $w "$pid\n"; close $w }
+    # The parent writes NOTHING. Writing perl's fork return value here is the
+    # leak described in the header: it is a pseudo-pid no other process can
+    # validate, so every later invocation respawns. The helper writes its own
+    # real Windows pid into $pid_f a moment from now, and removes it on exit.
     return $pid;
 }
 
@@ -108,6 +142,44 @@ sub kill_pid {
     return unless defined $pid && $pid =~ /^\d+$/ && $pid > 0;
     kill('KILL', $pid);
     waitpid($pid, 0);
+}
+
+# _pid_alive($pid) -> 0|1
+#
+# perl's kill(0,$pid) is NOT a usable liveness test on Windows for a process
+# perl did not create. Git-for-Windows perl can signal its own children and
+# pseudo-processes; against an unrelated native pid — which is exactly what the
+# keep-awake helper is — it reports "dead" for a perfectly healthy process.
+#
+# That was the second half of the 2026-08-13 leak, and it hid behind the first:
+# fixing the recorded pid alone changed nothing, because the CHECK was broken
+# too. Measured directly — with a real, running helper pid in the file, two
+# further invocations still spawned two more locks.
+#
+# So on Windows, ask Windows. tasklist costs one process per invocation, which
+# at this cadence (once per director tick) is nothing next to leaking a 52 MB
+# PowerShell forever.
+sub _pid_alive {
+    my ($pid) = @_;
+    return 0 unless defined $pid && $pid =~ /^\d+$/ && $pid > 0;
+    return kill(0, $pid) ? 1 : 0 unless $^O =~ /^(MSWin32|msys|cygwin)$/;
+    return 1 if kill(0, $pid);                 # own child / pseudo-process
+    # MSYS2 path conversion rewrites the SWITCHES: `/FI` arrives at tasklist as
+    # `C:/Program Files/Git/FI` and it exits with "Invalid argument/option".
+    # Measured, not guessed. Scope the opt-out to this one call (CLAUDE.md's
+    # sanctioned form) — safe here because we pass no paths at all, so there is
+    # nothing for the conversion to have been protecting.
+    #
+    # NO stderr redirect on purpose either: Git-for-Windows perl runs backticks
+    # through sh, where `2>NUL` creates a literal file named NUL that Explorer
+    # cannot delete (house rule), and `2>/dev/null` would be wrong if backticks
+    # ever went through cmd.exe instead. tasklist's stderr is harmless.
+    my $out = do {
+        local $ENV{MSYS2_ARG_CONV_EXCL} = '*';
+        `tasklist /FI "PID eq $pid" /NH`;
+    };
+    return 0 unless defined $out;
+    return ($out =~ /\b\Q$pid\E\b/) ? 1 : 0;
 }
 
 sub _read_pid {
@@ -137,7 +209,7 @@ sub apply {
         # Idempotent: a live lock is left alone rather than doubled.
         if (-e $pid_f) {
             my $pid = _read_pid($pid_f);
-            return if defined $pid && kill(0, $pid);
+            return if _pid_alive($pid);
         }
         eval { $spawn->($pid_f) };
         $log->("WARN keepawake spawn failed: $@") if $@;

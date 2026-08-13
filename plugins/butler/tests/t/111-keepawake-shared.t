@@ -124,4 +124,53 @@ is(BpKeepAwake::should_be_on('nonsense'),      0, 'unknown phase -> released (fa
         'a MANUAL fleet pause releases the lock; a timed one keeps it');
 }
 
+# ---- THE LEAK: the recorded pid must be valid to OTHER processes -------------
+#
+# Measured 2026-08-13: 52 orphaned keep-awake PowerShells, ~52 MB each, holding
+# 2.7 GB and 52 simultaneous ES_CONTINUOUS wake-locks on the operator's host,
+# very plausibly the difference that tipped Windows into the low-virtual-memory
+# condition that killed the podman VM and both of their sandboxes.
+#
+# CAUSE: spawn() wrote perl's fork() return value into keepawake.pid. On
+# Git-for-Windows perl fork is EMULATED and returns a PSEUDO-pid (e.g. 447298)
+# meaningful only inside the process that forked. Every `bp-drive-next.pl next`
+# is a fresh process, so its kill(0,$pid) always failed, the idempotency check
+# never fired, and each invocation spawned another lock it could never release.
+#
+# The fix hands keep-awake.ps1 -PidFile so the HELPER records its own real
+# Windows pid. These assertions pin that, because the symptom is invisible in a
+# single process: a pseudo-pid validates fine inside the process that made it,
+# which is exactly why this survived.
+{
+    my $src = do { open my $f,'<',"$S/bp-keepawake.pl" or die; local $/; <$f> };
+
+    like($src, qr/-PidFile/,
+        'spawn hands keep-awake.ps1 -PidFile so the HELPER records a real Windows pid');
+    unlike($src, qr/print\s+\$w\s+"\$pid/,
+        'spawn does NOT write perl\'s fork pid — that pseudo-pid is the leak');
+    like($src, qr/winify_out/,
+        'the -PidFile path is winified for a not-yet-existing file (a bare /c/... would be created at the drive root)');
+
+    # winify_out must not hand a native binary a POSIX path. CLAUDE.md records
+    # 576 drive-root strays from exactly that.
+    my $dir  = tempdir(CLEANUP => 1);
+    my $out  = BpKeepAwake::winify_out("$dir/keepawake.pid");
+    unlike($out, qr{^/},      'winify_out never yields a leading-slash POSIX path');
+    like($out,   qr{^[A-Za-z]:/}, 'winify_out yields a drive-letter path even though the file does not exist');
+    like($out,   qr{/keepawake\.pid$}, '...and preserves the basename');
+
+    # Behavioural: a pid file holding a pid from ANOTHER process must be
+    # honoured. $$ is this test's pid — a real OS pid, not a pseudo one — so a
+    # correct implementation treats the lock as live and does not respawn.
+    my $d2 = tempdir(CLEANUP => 1);
+    open my $w, '>', "$d2/keepawake.pid" or die; print $w "$$\n"; close $w;
+    my @spawned;
+    BpKeepAwake::apply('active', $d2, {
+        spawn                => sub { push @spawned, 1 },
+        powershell_available => sub { 1 },
+    });
+    is(scalar @spawned, 0,
+       'a pid file holding a REAL, cross-process-valid pid suppresses the respawn');
+}
+
 done_testing();
