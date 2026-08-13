@@ -274,8 +274,15 @@ sub _is_scheduling_state_kind {
     my ($kind) = @_;
     # closed, named set -- the ONLY member observed anywhere in the codebase
     # (bp-orchestrator.pl:3778, dag_stall_step's synthetic finding). Extend by
-    # adding to this set; never by pattern-matching kind text.
-    return (defined $kind && !ref $kind && "$kind" eq 'dag-stall') ? 1 : 0;
+    # adding to this set; never by pattern-matching kind text. This is a
+    # SAFETY gate (deciding "must not be routed as a defect"), so matching
+    # a near-miss (surrounding whitespace, differing case) is the fail-closed
+    # direction -- a stray space or a capitalised variant must still be
+    # caught, not waved through as an ordinary code defect.
+    return 0 unless defined $kind && !ref $kind;
+    my $k = "$kind";
+    $k =~ s/^\s+|\s+$//g;
+    return (lc($k) eq 'dag-stall') ? 1 : 0;
 }
 
 sub _test_paths_ok {
@@ -283,6 +290,21 @@ sub _test_paths_ok {
     return 0 unless ref $ctx eq 'HASH';
     my $tp = $ctx->{test_paths};
     return (defined $tp && !ref $tp && "$tp" =~ /\S/) ? 1 : 0;
+}
+
+# Guards every value ledger_text() interpolates into the '---' YAML
+# frontmatter block: a newline or carriage return would inject an extra
+# 'key: value' line, and a value that (after trimming) starts with '---'
+# could forge a block boundary. See ledger_text's own comment for why this
+# is a refusal, not an escape.
+sub _fm_value_ok {
+    my ($v) = @_;
+    return 0 unless defined $v && !ref $v;
+    my $s = "$v";
+    return 0 if $s =~ /[\r\n]/;
+    (my $trimmed = $s) =~ s/^\s+//;
+    return 0 if $trimmed =~ /^---/;
+    return 1;
 }
 
 sub classify_finding {
@@ -330,7 +352,7 @@ sub classify_finding {
     }
     elsif ($action eq 'remediate-conformance') {
         my $means = $remedy->{means};
-        unless (defined $means && !ref $means && length("$means")) {
+        unless (defined $means && !ref $means && "$means" =~ /\S/) {
             $result = { disposition => 'escalate', action => $action, reason => 'means_missing' };
         }
         else {
@@ -1039,6 +1061,20 @@ sub ledger_text {
     my $mm_flow    = '[' . join(', ', @$mm) . ']';
     my $now_iso    = defined $ctx->{iso} ? $ctx->{iso} : _iso($ctx->{now});
     my $action     = defined $entry->{action} ? $entry->{action} : 'none';
+
+    # Every value interpolated into the '---' YAML frontmatter block below
+    # (directly, or via mandated_means) must be refused -- not escaped -- if
+    # it could inject additional 'key: value' lines that bp-orchestrator.pl's
+    # ledger_fm() would then parse as real fields (e.g. a forged
+    # last_updated/status/write_set). REFUSE, do not escape: this package's
+    # thesis is that declining to author is better than authoring something
+    # a downstream parser can misread. A newline, a carriage return, or a
+    # value that (after trimming leading whitespace) starts with '---' is an
+    # authoring-time validity failure, exactly like the other unsatisfiability
+    # gates in this file.
+    for my $v ($id, $bp, $model, $max_turns, $write_set, $test_paths, $now_iso, @$mm) {
+        return undef unless _fm_value_ok($v);
+    }
     my $finding_key = defined $entry->{finding_key} ? $entry->{finding_key} : 'unclassified';
     my $round      = defined $entry->{round}      ? $entry->{round}      : 1;
     my $max_rounds = defined $entry->{max_rounds} ? $entry->{max_rounds} : 2;
