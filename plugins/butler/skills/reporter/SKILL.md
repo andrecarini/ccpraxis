@@ -188,7 +188,7 @@ to `done`. Arm `bp-watch.pl` **alongside** it, in Mode B (blueprint-wide, no
 `--package`), as a second `run_in_background` Bash call:
 
 ```
-perl plugins/butler/scripts/bp-watch.pl --arm --blueprint $0 \
+perl "${CLAUDE_PLUGIN_ROOT}"/scripts/bp-watch.pl --arm --blueprint $0 \
      --pid-file "<bpdir>/runs/.orchestrator" --max-seconds 1800   # run_in_background
 ```
 

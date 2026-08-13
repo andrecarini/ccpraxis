@@ -378,6 +378,46 @@ sub new_bp {
     );
     is($rc, 65, 'H3: a blueprint dir that does not exist at all -> 65, not 0');
 }
+{
+    # step-7 fix-batch addition (BLOCKER B1 / CRITICAL, reviewer+redteam
+    # step6): Mode B against a blueprint dir that EXISTS but whose packages/
+    # subdir does not exist yet (the ordinary startup race between the
+    # blueprint dir being created and the first package ledger being
+    # written) must be UNVERIFIABLE (65) — the denominator itself is
+    # unreadable, never a vacuous SETTLED (0). Deliberately does NOT use
+    # new_bp(), which always pre-creates packages/.
+    my $root = tempdir(CLEANUP => 1);
+    my $data = "$root/.ccpraxis-local-data";
+    make_path("$data/blueprints/nopkgsdir");   # blueprint dir exists...
+    my ($rc, $out) = run_watch(
+        '--arm', '--blueprint', 'nopkgsdir', '--max-seconds', '3',
+        '--poll', '1', '--data', $data
+    );                                          # ...packages/ subdir does NOT
+    is($rc, 65, 'H4 BLOCKER-B1 CANONICAL: blueprint dir exists but packages/ subdir does not '
+              . '-> exit 65 (UNVERIFIABLE), never 0 (TERMINAL/SETTLED) — the denominator is '
+              . 'unreadable, not confirmed zero');
+    isnt($rc, 0, 'H4b: never a false SETTLED for an unreadable denominator');
+    unlike($out, qr/TERMINAL|SETTLED/i,
+       'H4c: stdout never claims TERMINAL/SETTLED for a missing packages/ dir');
+}
+{
+    # Companion case: packages/ subdir EXISTS but is genuinely empty (zero
+    # *.md entries) — same "denominator unreadable/unknown" verdict, not the
+    # spec's vacuous-true convention (which applies once a real, observed
+    # zero-entry state is confirmed, not to "nothing written yet").
+    my $root = tempdir(CLEANUP => 1);
+    my $data = "$root/.ccpraxis-local-data";
+    make_path("$data/blueprints/emptypkgs/packages");   # exists, 0 *.md files
+    my ($rc, $out) = run_watch(
+        '--arm', '--blueprint', 'emptypkgs', '--max-seconds', '3',
+        '--poll', '1', '--data', $data
+    );
+    is($rc, 65, 'H5 BLOCKER-B1 CANONICAL: packages/ subdir exists but is genuinely empty -> '
+              . 'exit 65 (UNVERIFIABLE), never 0 (TERMINAL/SETTLED)');
+    isnt($rc, 0, 'H5b: never a false SETTLED for a zero-entry packages/ dir at arm time');
+    unlike($out, qr/TERMINAL|SETTLED/i,
+       'H5c: stdout never claims TERMINAL/SETTLED for an empty packages/ dir');
+}
 
 # ===========================================================================
 # I. AC1 — token-free: no LLM/claude invocation anywhere in the poll path.

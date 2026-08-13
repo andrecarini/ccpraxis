@@ -64,7 +64,7 @@
 #                         invariant-1 allowlist. Does not imply "never re-arm".
 #   1  BOUND              --max-seconds elapsed, nothing resolved. Liveness
 #                         is UNKNOWN -- never treat as dead or done.
-#   2  WORKERS-GONE       every configured pid confirmed dead, no terminal
+#   2  WORKERS-GONE       any ONE configured pid confirmed dead, no terminal
 #                         status observed. Likely crash; investigate.
 #   3  ARTIFACT           a watched path's mtime advanced, or it appeared.
 #   4  STATUS-CHANGE      ledger status changed to a NON-terminal value (a
@@ -365,12 +365,37 @@ unless (caller) {
         exit 64;
     }
 
-    my $poll = (defined $opt{poll} && $opt{poll} =~ /^\d+(?:\.\d+)?$/ && $opt{poll} > 0)
-             ? $opt{poll} + 0 : 5;
+    if (defined $opt{poll}
+        && !($opt{poll} =~ /^\d+(?:\.\d+)?$/ && $opt{poll} > 0)) {
+        print STDERR "bp-watch: --poll must be a positive number if given "
+                    . "(got '$opt{poll}')\n";
+        usage();
+        exit 64;
+    }
+    my $poll = defined $opt{poll} ? $opt{poll} + 0 : 5;
 
     my @expect_pids;
     if (defined $opt{expect_pids}) {
-        @expect_pids = grep { /^\d+$/ } split /,/, $opt{expect_pids};
+        # Every comma-separated entry MUST be a strictly positive integer.
+        # "0" is not a real pid -- BpRunState::pid_alive treats pid 0 as
+        # unconditionally dead, so silently accepting it turned a caller's
+        # bug (a failed pgrep, a $?/$! mix-up) into an instant, false
+        # WORKERS-GONE verdict. A malformed entry (whitespace, non-numeric,
+        # 0, negative) is a USAGE error (64) here -- never silently dropped,
+        # which would just as silently reduce liveness coverage below what
+        # the caller asked for.
+        my @raw = split /,/, $opt{expect_pids}, -1;
+        my @bad;
+        for my $p (@raw) {
+            if ($p =~ /^[1-9]\d*$/) { push @expect_pids, $p }
+            else                    { push @bad, $p }
+        }
+        if (@bad) {
+            print STDERR "bp-watch: --expect-pids entries must be positive integers "
+                        . "(bad: " . join(',', map { "'$_'" } @bad) . ")\n";
+            usage();
+            exit 64;
+        }
     }
 
     my @art_paths = defined $opt{artifact} ? _split_artifact_paths($opt{artifact}) : ();
@@ -403,6 +428,29 @@ unless (caller) {
         unless ($entry) {
             print "UNVERIFIABLE: package '$pkgid' not found in $bpname/packages -- "
                 . "liveness unknown, never treat as done\n";
+            exit 65;
+        }
+    }
+    else {
+        # Mode B startup check (umbrella rule, driver ruling on B1/CRITICAL):
+        # blueprint_settled([]) is vacuously true BY DESIGN for a genuinely
+        # empty packages/ dir (spec §2.1, pinned by t/133 C6/C7) -- but a
+        # MISSING or not-yet-populated packages/ dir is a different question:
+        # the denominator itself is unreadable, not "confirmed zero". Both
+        # shapes must be UNVERIFIABLE (65) here, checked once before the
+        # first tick, mirroring Mode A's missing-package-entry check above --
+        # never let an unreadable denominator be handed to blueprint_settled
+        # as if it were a real, observed empty set.
+        my $pkgdir = "$bpdir/packages";
+        unless (-d $pkgdir) {
+            print "UNVERIFIABLE: blueprint '$bpname' has no packages/ directory -- "
+                . "liveness unknown, never treat as done\n";
+            exit 65;
+        }
+        my $pkgs = BpWatch::read_packages_dir($bpdir);
+        unless (@$pkgs) {
+            print "UNVERIFIABLE: blueprint '$bpname' packages/ directory has no *.md entries "
+                . "yet -- liveness unknown, never treat as done\n";
             exit 65;
         }
     }
@@ -491,15 +539,39 @@ unless (caller) {
         }
 
         if ($opt{keepawake}) {
-            eval {
-                require "$DIR/bp-keepawake.pl";
-                BpKeepAwake::apply('active', "$DATA/.drive-solo", {});
-            };
+            # --keepawake REFRESHES the EXISTING bp-keepawake.pl lease (the
+            # same .drive-solo/keepawake.pid bp-drive-next.pl already
+            # manages) -- it must never become a second, independent
+            # lock-holder. BpKeepAwake::apply() alone can't guarantee that:
+            # with no pid file present (or a stale one), its own
+            # idempotence check falls through to spawn() and creates a
+            # FRESH wake-lock. Gate the call here: only refresh a lease that
+            # is already held by a genuinely live pid; a missing/stale
+            # lease is a no-op for this flag, never a spawn trigger. The
+            # director (bp-drive-next.pl) remains the only thing that ever
+            # creates the FIRST lease.
+            my $lease_f      = "$DATA/.drive-solo/keepawake.pid";
+            my $existing_pid = _read_pidfile($lease_f);
+            if (defined $existing_pid && BpRunState::pid_alive($existing_pid)) {
+                eval {
+                    require "$DIR/bp-keepawake.pl";
+                    BpKeepAwake::apply('active', "$DATA/.drive-solo", {});
+                };
+            }
         }
 
         $prior_status = $status if $mode eq 'package';
 
-        select(undef, undef, undef, $poll);
+        # Clamp the sleep to what's left of --max-seconds -- a single sleep
+        # must never carry the process past its own bound (AC2). A --poll
+        # larger than --max-seconds previously meant the FIRST sleep alone
+        # overshot the deadline (measured: --max-seconds 3 --poll 12 took
+        # 12s, not ~3s) and sat on an already-fired condition for up to a
+        # full oversized tick. 0.1s floor keeps the loop from busy-spinning
+        # once the remaining budget is nearly exhausted.
+        my $remaining = $max_seconds - (time - $t0);
+        my $this_poll = $remaining < $poll ? ($remaining > 0.1 ? $remaining : 0.1) : $poll;
+        select(undef, undef, undef, $this_poll);
     }
 }
 

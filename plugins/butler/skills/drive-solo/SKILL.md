@@ -104,7 +104,7 @@ no routine 30-minute tick to forget, unlike the old universal-timer habit that
 produced dozens of forgettable re-arms across a single long run (2026-08-06 #11):
 
 ```bash
-perl plugins/butler/scripts/bp-watch.pl --arm --package <bp>/<pkg-just-dispatched> \
+perl "${CLAUDE_PLUGIN_ROOT}"/scripts/bp-watch.pl --arm --package <bp>/<pkg-just-dispatched> \
      --max-seconds <this dispatch's own expected budget — see w02> \
      --keepawake        # run_in_background
 ```
@@ -115,7 +115,9 @@ matches any backgrounded Bash call by shape, not by binary name, so this satisfi
 refreshes the *existing* `bp-keepawake.pl` lease (the same `.drive-solo/keepawake.pid`
 `bp-drive-next.pl` already manages) once per poll tick — closing the gap where that
 900s lease is refreshed only when the director runs, and the director is skipped
-whenever a wakeup is already pending.
+whenever a wakeup is already pending. It never creates a second, independent
+lease: if no lease is currently held, `--keepawake` is a no-op for that tick — the
+director remains the only thing that ever spawns the first one.
 
 On exit it prints one of five verdicts — act on it, don't just re-arm blindly:
 
@@ -123,7 +125,7 @@ On exit it prints one of five verdicts — act on it, don't just re-arm blindly:
 |---|---|---|
 | `TERMINAL` (0) | the watched package's ledger reached `done`/`dropped`/`blocked`/`parked` | stop; assess the result — does not imply "never re-arm anything else" |
 | `BOUND` (1) | `--max-seconds` elapsed, nothing resolved; liveness is **unknown** | investigate, or widen the budget and re-arm — never assume dead or done |
-| `WORKERS-GONE` (2) | every configured pid died with no terminal status observed | likely crash — **re-dispatch the wedged worker instead**, don't wait longer |
+| `WORKERS-GONE` (2) | any ONE configured pid died with no terminal status observed | likely crash — **re-dispatch the wedged worker instead**, don't wait longer |
 | `ARTIFACT` (3) | a watched path's mtime advanced, or it appeared | re-arm and carry on |
 | `STATUS-CHANGE` (4) | the ledger status changed to a **non-terminal** value | re-arm and carry on |
 
