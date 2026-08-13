@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# mark-wakeup.sh — PreToolUse hook for Task and Bash, in a DRIVE-SOLO DRIVER
-# session (never in a coordinator).
+# mark-wakeup.sh — PreToolUse hook for Task, Agent and Bash, in a DRIVE-SOLO
+# DRIVER session (never in a coordinator).
 #
 # Records that this turn started something that will wake the session up again:
-#   * any Task dispatch (a subagent; its completion notification comes back), or
+#   * any Task or Agent dispatch (a subagent; its completion notification
+#     comes back), or
 #   * a Bash call with run_in_background=true (its exit notification comes back).
 #
 # gate-drive-loop.sh (Stop) CONSUMES this marker. The pair encodes one rule:
@@ -88,8 +89,13 @@ if [ "$TOOL" = "Bash" ] && [ -n "$SID" ]; then
 fi
 
 case "$TOOL" in
-  Task)
-    : ;;                                  # always a wake-up
+  Task|Agent)
+    : ;;                                  # always a wake-up -- unchanged for Task, NEW for Agent.
+                                           # Deliberately reads NO field off the payload (e.g. no
+                                           # subagent_type): that field is verified present for
+                                           # Task (track-dispatch.sh:24 and others) but UNVERIFIED
+                                           # for Agent (h01 spec §2.3/§6), so this arm is a wake-up
+                                           # purely by virtue of the tool name matching.
   Bash)
     # Only a BACKGROUNDED Bash call schedules a wake-up. A foreground command
     # returns into the same turn and schedules nothing, so it must not count.

@@ -37,6 +37,7 @@ Return **≤15 lines**: counts per severity, CRITICAL/HIGH items one line each, 
 
 ## Hard limits
 
+- Foreground only for validation/checks: never `run_in_background`, and never end a turn expecting a later one to resume it — you have no guaranteed follow-up turn. `gate-headless-background.sh` enforces this mechanically wherever `BP_LEDGER` is set (every headless judge, and every worker a coordinator dispatches).
 - Read-only on the codebase; `Write` is for your report.
 - No exploit tooling, no traffic against deployed environments.
 - Severity discipline: CRITICAL means exploitable now with real impact — don't inflate.

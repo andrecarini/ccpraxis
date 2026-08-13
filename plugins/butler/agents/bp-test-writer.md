@@ -28,6 +28,7 @@ Return **≤15 lines**: test files written, run result ("N tests, all failing on
 
 ## Hard limits
 
+- Foreground only for validation/checks: never `run_in_background`, and never end a turn expecting a later one to resume it — you have no guaranteed follow-up turn. `gate-headless-background.sh` enforces this mechanically wherever `BP_LEDGER` is set (every headless judge, and every worker a coordinator dispatches).
 - Writes only under the package test paths — hook-enforced.
 - If a criterion is untestable as written, report it; never invent behavior the spec doesn't state.
 - Never weaken an assertion to make a future implementation's life easier. Strictness here is the point.

@@ -46,6 +46,7 @@ Write exactly this JSON object to **verdict_path** (and nothing else to it):
 
 ## Hard limits
 
+- Foreground only for validation/checks: never `run_in_background`, and never end a turn expecting a later one to resume it — you have no guaranteed follow-up turn. `gate-headless-background.sh` enforces this mechanically wherever `BP_LEDGER` is set (every headless judge, and every worker a coordinator dispatches).
 - Edits are confined to the declared write-set — hook-enforced. A `BLOCKED:` response means the fix is out of bounds: that's a `park`, not a workaround.
 - **Never drop a criterion that isn't explicitly tagged optional.** Changing what "done" means without that tag is an intent change → `park`.
 - **Never** make a destructive or irreversible change (deleting user work, force-anything, schema/data drops) — `park` and ask.

@@ -39,6 +39,7 @@ Return **≤15 lines**: flows covered, pass/fail per flow, findings count by sev
 
 ## Hard limits
 
+- Foreground only for validation/checks: never `run_in_background`, and never end a turn expecting a later one to resume it — you have no guaranteed follow-up turn. `gate-headless-background.sh` enforces this mechanically wherever `BP_LEDGER` is set (every headless judge, and every worker a coordinator dispatches).
 - You write only tests/scenarios — never application code. Bugs get reported, not fixed.
 - Don't fight the runner's documented gotchas; work within them and note friction in the report.
 - Write-outside-test_paths restriction is **hook-enforced** by `guard-writes.sh` (same rule as bp-test-writer): any Edit or Write to a path outside `BP_TEST_PATHS` while you are the active worker will be blocked with exit 2. Screenshot output dirs are written by Bash (the test runner), not Edit/Write, so this is safe.

@@ -151,13 +151,16 @@ Getting the *awaiting* half wrong is how a coordinator burns an entire turn budg
 nothing: a field package once grep-looped on a sentinel that had existed for over an hour, was
 warm-relaunched four times, and its work was already green the whole time.
 
-**The pattern: launch in the background, end the turn, resume on the notification.** When you
-start work you cannot get an answer from within a few seconds — a long build, a long-running
+**The pattern: for coordinators and interactive drivers only (never a one-shot worker or judge —
+see above), launch in the background, end the turn, resume on the notification.** When
+you start work you cannot get an answer from within a few seconds — a long build, a long-running
 script, anything you'd otherwise be tempted to sit and watch — launch it with
 `run_in_background`, then **end your turn**. Do not re-invoke a tool to check on it, do not poll
 its output, do not watch it grow. The completion notification comes back to you on its own, in a
 later turn, and that is when you resume. You are notified when it completes — you never have to
-go looking.
+go looking. This is a multi-turn pattern only: a headless one-shot process (a judge, a
+Task-dispatched worker) has no later turn, so `gate-headless-background.sh` denies
+`run_in_background` mechanically whenever `BP_LEDGER` is set.
 
 **Foreground is the documented default for validation.** Anything that finishes in a couple of
 minutes or less — your test suite, `bp-ledger.pl` calls, a lint pass — belongs in the

@@ -31,6 +31,19 @@
                }
             ],
             "matcher" : "Bash"
+         },
+         {
+            "hooks" : [
+               {
+                  "command" : "\"$CLAUDE_PROJECT_DIR\"/plugins/butler/hooks/gate-headless-background.sh",
+                  "type" : "command"
+               },
+               {
+                  "command" : "\"$CLAUDE_PROJECT_DIR\"/plugins/butler/hooks/guard-judge-checks.sh",
+                  "type" : "command"
+               }
+            ],
+            "matcher" : "Bash"
          }
       ],
       "Stop" : [

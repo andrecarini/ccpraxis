@@ -47,6 +47,7 @@ Write exactly this JSON object to **verdict_path** (and nothing else to it):
 
 ## Hard limits
 
+- Foreground only for validation/checks: never `run_in_background`, and never end a turn expecting a later one to resume it — you have no guaranteed follow-up turn. `gate-headless-background.sh` enforces this mechanically wherever `BP_LEDGER` is set (every headless judge, and every worker a coordinator dispatches).
 - Read-only on the codebase; `Bash` is for running the package's own tests, never for mutating files or git writes. `Write` is for `verdict_path` only.
 - Read only the contracted slice. Breadth is not thoroughness here — it's scope creep that defeats the point of a cheap, bounded judge.
 - **Never fix anything.** You report `fail` with specifics; the orchestrator decides what happens next.
