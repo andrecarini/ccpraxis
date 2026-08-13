@@ -102,14 +102,39 @@ sub winify_out {
 }
 
 # Detect whether powershell.exe is resolvable.
+#
+# BY SEARCHING PATH, NOT BY RUNNING IT. The previous form answered this question
+# by actually spawning `powershell.exe -Command "exit 0"` -- so the act of asking
+# cost a powershell.exe plus the conhost.exe Windows attaches to it. Combined
+# with the ordering bug in apply() (probe before idempotence check), that is what
+# buried the operator's machine in processes on 2026-08-13 and forced a restart.
+#
+# Resolvability is a property of PATH, and PATH can be read. Nothing needs to be
+# executed to answer it.
+#
+# Memoized: within one process the answer cannot change, and this is called from
+# a path that runs on every director tick.
+my $_PS_AVAILABLE;
 sub ps_available {
     # Windows-only concern; in the Linux sandbox this is a documented no-op.
-    # Probing off-Windows only spams stderr with "Can't exec" on every tick.
     return 0 unless $^O =~ /^(MSWin32|msys|cygwin)$/;
-    # List-form system() spawns powershell.exe directly (no shell), so there is
-    # no /dev/null-vs-NUL redirect hazard (CLAUDE.md house rule).
-    my $rc = eval { system('powershell.exe', '-NoProfile', '-NonInteractive', '-Command', 'exit 0') };
-    return (defined $rc && $rc == 0 && !$@) ? 1 : 0;
+    return $_PS_AVAILABLE if defined $_PS_AVAILABLE;
+
+    # PATHEXT is irrelevant here -- we look for an explicit .exe. Split on the
+    # host separator: MSYS perl reports a ';'-joined PATH on Windows, but a
+    # ':'-joined one is possible under some shells, so accept either.
+    my $path = $ENV{PATH} // '';
+    my @dirs = split /;/, $path;
+    @dirs = split /:/, $path if @dirs <= 1;
+    for my $d (@dirs) {
+        next unless length $d;
+        $d =~ s{\\}{/}g;
+        $d =~ s{/+$}{};
+        if (-x "$d/powershell.exe" || -e "$d/powershell.exe") {
+            return $_PS_AVAILABLE = 1;
+        }
+    }
+    return $_PS_AVAILABLE = 0;
 }
 
 # spawn($pid_file) -> pid | undef. DIES if the helper is missing or fork fails.
@@ -205,17 +230,48 @@ sub apply {
     my $pid_f = "$dir/keepawake.pid";
 
     if (should_be_on($phase)) {
-        return unless $ps_ok->();
-        # Idempotent: a live lock is left alone rather than doubled.
+        # ORDER IS LOAD-BEARING: idempotence FIRST, availability probe second.
+        #
+        # It used to be the other way round, and that cost the operator a forced
+        # machine restart on 2026-08-13 -- "a zillion powershell processes and
+        # conhost processes", terminals unusable. ps_available() is not a cheap
+        # predicate: it SPAWNS `powershell.exe -Command "exit 0"`, and Windows
+        # gives every one of those its own conhost.exe. Probing before the
+        # idempotence check meant the steady state -- lock already alive, nothing
+        # to do -- still paid two process creations per call, and _pid_alive's
+        # tasklist adds two more. The Stop hook calls the director on EVERY turn
+        # end, so "per call" is not rare.
+        #
+        # Reordering makes the common path spawn nothing at all: if a live lock
+        # exists we return before asking whether powershell is even present. The
+        # probe now runs only when we are actually about to spawn, which is the
+        # only moment its answer can change what we do.
         if (-e $pid_f) {
             my $pid = _read_pid($pid_f);
             return if _pid_alive($pid);
         }
+        return unless $ps_ok->();
         eval { $spawn->($pid_f) };
         $log->("WARN keepawake spawn failed: $@") if $@;
     } else {
         if (-e $pid_f) {
             my $pid = _read_pid($pid_f);
+            # NOT liveness-checked before the kill, deliberately, and this was
+            # reconsidered on 2026-08-14 rather than assumed.
+            #
+            # A stale pid file is the normal residue of a hard kill (the helper
+            # removes its own file on exit), and Windows reuses pids -- so the
+            # recorded number can belong to an unrelated process. That argues for
+            # checking liveness first. Two things outweigh it. Perl cannot signal
+            # a native Windows process it did not create -- the same asymmetry
+            # _pid_alive exists to work around -- so an unconditional kill against
+            # a reused pid is very nearly a no-op here. And _pid_alive costs a
+            # tasklist spawn, which is exactly the process pressure the rest of
+            # this file was just fixed to stop paying.
+            #
+            # t/111 and t/17 both pin "release kills the recorded pid" with a
+            # synthetic pid; adding the check silently broke both. Changing that
+            # contract needs to be a decision, not a side effect of a perf fix.
             if (defined $pid) {
                 eval { $killp->($pid) };
                 $log->("WARN keepawake kill failed: $@") if $@;
