@@ -82,8 +82,10 @@ if [ -f "$BP_DIR/runs/.paused" ] && [ ! -f "$BP_DIR/runs/.shutdown" ]; then
   # non-terminal here (don't merely instruct it): a terminal status under a pause
   # would strand this package — never relaunched, never resumed.
   PSTATUS=$(awk 'BEGIN{infm=0} /^---[[:space:]]*$/{infm++; if(infm==2)exit; next} infm==1 && /^status:/{sub(/^status:[[:space:]]*/,""); print; exit}' "$BP_LEDGER")
+  # `dropped` is terminal too (2026-08-13) -- a dropped package is never
+  # relaunched, so under a fleet pause it strands exactly like done/blocked/parked.
   case "$PSTATUS" in
-    parked|done|blocked)
+    parked|done|blocked|dropped)
       echo "STOP BLOCKED: a fleet pause is active and WILL auto-resume this package, but the ledger status is '$PSTATUS' (terminal) — a terminal package is never relaunched and would be stranded. Set status back to a non-terminal value (running/converging) with a concrete '## Next action', then stop." >&2
       exit 2 ;;
   esac
@@ -115,7 +117,10 @@ STATUS=$(awk '
   infm==1 && /^status:/ { sub(/^status:[[:space:]]*/, ""); print; exit }' "$BP_LEDGER")
 
 case "$STATUS" in
-  done|blocked|parked) : ;;
+  # `dropped` accepted as terminal 2026-08-13 -- bp-drive-next.pl:_is_terminal and
+  # bp-orchestrator.pl:_is_terminal already settle on it, so blocking the stop here
+  # made a valid terminal state unreachable for a coordinator.
+  done|blocked|parked|dropped) : ;;
   *)
     echo "STOP BLOCKED: ledger status is '${STATUS:-unset}', not terminal. Before stopping: finish or park the work, update the ledger (frontmatter status -> done|blocked|parked, 'Next action', 'Outputs') and set last_updated with iso_now (or: date -u +%Y-%m-%dT%H:%M:%SZ) — never from memory, you have no clock — then stop. If genuinely stuck, status: blocked with a precise Next action is a valid terminal state." >&2
     exit 2 ;;

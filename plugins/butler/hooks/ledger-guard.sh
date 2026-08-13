@@ -102,7 +102,16 @@ my $ABS  = defined $ENV{LG_ABS}  ? $ENV{LG_ABS}  : '';
 my $TOOL = defined $ENV{LG_TOOL} ? $ENV{LG_TOOL} : '';
 
 my @KEYS     = qw(package blueprint status write_set last_updated);
-my @STATUSES = qw(pending running converging reviewing done blocked parked);
+# `dropped` added 2026-08-13. bp-drive-next.pl and bp-orchestrator.pl both read
+# THIS field and treat `dropped` as terminal in _is_terminal, so refusing to let a
+# coordinator write it made a settled status unreachable through the only guarded
+# path. Same defect as 07d28a2 fixed in bp-blueprint.pl, two hooks further out.
+#
+# `converging` is deliberately here and deliberately NOT in bp-blueprint.pl's
+# vocabulary: this is the PACKAGE LEDGER's frontmatter, which has a mid-flight
+# value the blueprint.md summary table has no use for. Two vocabularies on
+# purpose -- do not "unify" them.
+my @STATUSES = qw(pending running converging reviewing done blocked parked dropped);
 
 # --- message emission -------------------------------------------------------
 # Exactly ONE line on stderr, ever. Nothing on stdout, ever.

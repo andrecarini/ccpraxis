@@ -174,4 +174,36 @@ for my $s (qw(bp-drive-next.pl bp-orchestrator.pl)) {
         "A6: $s still treats `dropped` as terminal");
 }
 
+# ---------------------------------------------------------------------------
+# A7 -- the HOOKS that gate writing a status must accept `dropped` too.
+#
+# Found by the s01 scout AFTER the first pass of this fix shipped: bp-blueprint.pl
+# had been corrected while two hooks kept their own hardcoded vocabularies, so a
+# coordinator writing `status: dropped` to its ledger was still denied by the
+# write guard and still refused permission to stop. A settled status that the
+# only guarded write path rejects is not settled in any useful sense.
+#
+# NOTE the deliberate asymmetry: the LEDGER vocabulary carries `converging` and
+# bp-blueprint.pl's does not, because the package ledger has a mid-flight value
+# the blueprint.md summary table has no use for. These are two vocabularies on
+# purpose; asserting them separately is the point, not an oversight.
+# ---------------------------------------------------------------------------
+my $lg = slurp_raw("$PROJ/plugins/butler/hooks/ledger-guard.sh");
+ok(defined $lg, 'A7: ledger-guard.sh is readable');
+like($lg, qr/\@STATUSES\s*=\s*qw\([^)]*\bdropped\b[^)]*\)/,
+    'A7: ledger-guard.sh accepts `dropped` as a ledger frontmatter status');
+like($lg, qr/\@STATUSES\s*=\s*qw\([^)]*\bconverging\b[^)]*\)/,
+    'A7: ledger-guard.sh still accepts `converging` (ledger-only, by design)');
+
+my $gs = slurp_raw("$PROJ/plugins/butler/hooks/gate-stop.sh");
+ok(defined $gs, 'A7: gate-stop.sh is readable');
+
+# Both terminal-status case arms must list dropped. Counting them separately
+# matters: the first pass of this very fix corrected one site of three.
+my @gs_terminal = $gs =~ /^\s*(?:parked\|done\|blocked|done\|blocked\|parked)\|dropped\)/mg;
+cmp_ok(scalar @gs_terminal, '>=', 2,
+    'A7: BOTH of gate-stop.sh terminal-status arms list `dropped`');
+unlike($gs, qr/^\s*done\|blocked\|parked\)\s*:/m,
+    'A7: no gate-stop.sh terminal arm omits `dropped`');
+
 done_testing();
