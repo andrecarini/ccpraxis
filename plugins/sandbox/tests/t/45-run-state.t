@@ -750,9 +750,13 @@ sub can_detect_symlink {
     my $s = RS('summarize_dir', $dir);
     is(field($s, 'state'), 'running', 'AC-1: state eq "running" (8 pkgs, 3 done, 2 running, .orchestrator present)');
     is(field($s, 'packages_total'), 8, 'AC-1: packages_total == 8');
-    is(field($s, 'packages_done'), 3, 'AC-1: packages_done == 3');
-    is(field($s, 'current_package'), 'p4', 'AC-1: current_package is the alphabetically-first running package (p4 before p5)');
-    is(field($s, 'running_coordinators'), 2, 'AC-1: running_coordinators == 2');
+    # s02/Decision 13: no ledger file exists for ANY of these 8 packages, so
+    # every status came exclusively from the now-removed registry fallback.
+    # _effective_status must return '' (never adopt the registry's claim),
+    # so nothing counts as done and nothing counts as running.
+    is(field($s, 'packages_done'), 0, 's02/AC-1 flagship [corrected]: packages_done == 0 -- the registry fallback is gone, so a ledger-absent package is never "done" no matter what the registry claims');
+    is(field($s, 'current_package'), undef, 's02/AC-1 flagship [corrected]: current_package undef -- no ledger-absent package is ever adopted as "running" from the registry');
+    is(field($s, 'running_coordinators'), 0, 's02/AC-1 flagship [corrected]: running_coordinators == 0 -- same reason');
 }
 
 # --- B17 (uncited by any single AC, S2.7 rationale): .orchestrator absent. -
@@ -764,7 +768,10 @@ sub can_detect_symlink {
     is(field($s, 'state'), 'idle', 'B17: same registry, .orchestrator ABSENT -> state eq "idle"');
     is(field($s, 'running_coordinators'), 0, 'B17: ... -> running_coordinators == 0 (a stale registry "running" is never reported live)');
     is(field($s, 'packages_total'), 8, 'B17: ... -> packages_total unchanged (8)');
-    is(field($s, 'packages_done'), 3, 'B17: ... -> packages_done unchanged (3)');
+    # s02/Decision 13 [corrected]: no ledger file exists for any of these 8
+    # packages either, so packages_done can no longer come from the
+    # registry's "done" claims -- 0, not 3.
+    is(field($s, 'packages_done'), 0, 's02/B17 [corrected]: packages_done == 0 -- registry fallback removed, no ledger present for any package');
 }
 
 # --- B18 (uncited): no package running -> current_package undef. ---------
@@ -782,9 +789,12 @@ sub can_detect_symlink {
         registry => registry_json(p1 => 'running', p2 => 'parked', p3 => 'done'));
     my $s = RS('summarize_dir', $dir);
     is(field($s, 'packages_total'), 3, 'AC-3: a parked-status package counts in packages_total');
-    is(field($s, 'packages_done'), 1, 'AC-3: a parked-status package is excluded from packages_done');
-    is(field($s, 'running_coordinators'), 1, 'AC-3: a parked-status package is excluded from running_coordinators');
-    is(field($s, 'current_package'), 'p1', 'AC-3: a parked-status package is never current_package');
+    # s02/Decision 13 [corrected]: no ledger file exists for p1/p2/p3 in this
+    # fixture, so p1's registry "running" claim and p3's registry "done" claim
+    # are both now ignored outright -- 0/0/undef, not 1/1/'p1'.
+    is(field($s, 'packages_done'), 0, 's02/AC-3 [corrected]: packages_done == 0 -- registry fallback removed, p3 was only "done" via the now-dead fallback');
+    is(field($s, 'running_coordinators'), 0, 's02/AC-3 [corrected]: running_coordinators == 0 -- p1 was only "running" via the now-dead fallback');
+    is(field($s, 'current_package'), undef, 's02/AC-3 [corrected]: current_package undef -- same reason');
 }
 
 # --- AC-9 (B19, B20): ledger authority over registry. ---------------------
@@ -800,9 +810,17 @@ sub can_detect_symlink {
 
     unlink("$dir/packages/p1.md") or die "unlink: $!";
     my $s2 = RS('summarize_dir', $dir);
-    is(field($s2, 'packages_done'), 0, 'AC-9: with the ledger file removed, the registry value ("running") is used (B20)');
-    is(field($s2, 'running_coordinators'), 1, 'AC-9: ... -> counts as a running coordinator');
-    is(field($s2, 'current_package'), 'p1', 'AC-9: ... -> is current_package');
+    # s02/Decision 13 [corrected]: this sub-case used to prove "the registry
+    # value is used when the ledger file is absent" -- that is now exactly
+    # the forbidden fallback. It now proves the OPPOSITE: with the ledger
+    # gone, the registry's "running" claim for p1 is never adopted. The
+    # packages_done value (0) is numerically unchanged from before, but its
+    # meaning has flipped -- it is no longer evidence the fallback fired
+    # (registry never said "done" here), it is now evidence registry status
+    # is never consulted at all, full stop.
+    is(field($s2, 'packages_done'), 0, 's02/AC-9 second half [corrected, meaning flipped]: packages_done == 0 -- value unchanged, but this no longer proves the registry fallback fired; it proves the registry is never consulted');
+    is(field($s2, 'running_coordinators'), 0, 's02/AC-9 second half [corrected]: running_coordinators == 0 -- with the ledger file removed, the registry status ("running") is NEVER adopted (Decision 13)');
+    is(field($s2, 'current_package'), undef, 's02/AC-9 second half [corrected]: current_package undef -- same reason');
 }
 
 # --- B20 (further): ledger unreadable/oversized/no-status-line fallback. -
@@ -848,7 +866,10 @@ sub can_detect_symlink {
     my $s = RS('summarize_dir', $dir);
     is(field($s, 'packages_total'), 4, 'B22: non-HASH per-package registry values (string/null/array) still count toward packages_total');
     is(field($s, 'packages_done'), 0, 'B22: ... but count nowhere else (packages_done)');
-    is(field($s, 'running_coordinators'), 1, 'B22: ... running_coordinators reflects only the one real HASH entry (p1)');
+    # s02/Decision 13 [corrected]: no ledger file exists for p1 either, so its
+    # registry "running" claim (a real HASH entry, unlike p2/p3/p4) is now
+    # ignored just like every other ledger-absent package -- 0, not 1.
+    is(field($s, 'running_coordinators'), 0, 's02/B22 [corrected]: running_coordinators == 0 -- p1 had no ledger file, so its registry HASH entry\'s "running" status is never adopted (Decision 13), not merely "the only real HASH entry among decoys"');
 }
 
 # --- B23 (uncited): {} and {"packages":{}} -> included, all-zero. --------
@@ -890,9 +911,18 @@ sub can_detect_symlink {
     # package will wrongly count as done instead of running.
     write_file("$dir/decoy.md", ledger_with_status('done'));
     my $s = RS('summarize_dir', $dir);
-    is(field($s, 'running_coordinators'), 1,
-        "B24: a package key containing '/' skips the ledger read entirely and uses the registry status (running) -- the decoy ledger one path segment above packages/ is never consulted");
-    is(field($s, 'packages_done'), 0, 'B24: ... -- the decoy "done" status is NOT picked up');
+    # s02/Decision 13 [corrected]: the traversal decoy has no ledger at
+    # "$dir/packages/../decoy.md" (skipped as unsafe) -- and since s02 removes
+    # the registry fallback entirely, the "safe" outcome is no longer "falls
+    # back to the registry status (running)", it is "resolves to no status at
+    # all". running_coordinators must NOT count this package.
+    is(field($s, 'running_coordinators'), 0,
+        "s02/B24 [corrected]: a package key containing '/' skips the ledger read entirely AND is never adopted from the registry (Decision 13) -- the decoy ledger one path segment above packages/ is never consulted, and the registry's \"running\" claim is never consulted either");
+    # This assertion is now B24's WHOLE safety property (unchanged 0, but its
+    # job has changed): with running_coordinators no longer able to
+    # distinguish "read the registry correctly" from "read nothing", THIS is
+    # the only remaining proof the decoy's "done" claim was never adopted.
+    is(field($s, 'packages_done'), 0, 's02/B24 [unchanged, now load-bearing]: packages_done == 0 -- the decoy ledger\'s "done" status is NOT picked up (this is now the only assertion in this block proving the traversal-safe path, not merely a companion to running_coordinators)');
 
     # Companion unsafe-key cases (S2.5 step 1's other three clauses): NUL
     # byte, leading dot, and length > 128. All fall through to step 2.
@@ -901,7 +931,40 @@ sub can_detect_symlink {
     my $dir2 = make_blueprint($root2, 'unsafekeys', orchestrator => "1\n",
         registry => registry_json("p\x00q" => 'running', '.hidden' => 'running', $long_key => 'running'));
     my $s2 = RS('summarize_dir', $dir2);
-    is(field($s2, 'running_coordinators'), 3, 'B24: NUL-byte / leading-dot / >128-char package keys all skip the ledger read and fall back to the registry status');
+    is(field($s2, 'running_coordinators'), 0, 's02/B24 [corrected]: NUL-byte / leading-dot / >128-char package keys all skip the ledger read AND are never adopted from the registry (Decision 13) -- 0, not 3');
+}
+
+# ===========================================================================
+# s02-registry-runtime-only / RunState.pm regression -- Decision 13, Decision
+# 16, spec §2.4 (behaviors 9, 10). `_effective_status`'s registry fallback
+# (the `return _normalize_status($raw)` branch that read `$entry->{status}`
+# when `$ledger_present` was false) is DELETED by this package. These two
+# assertions pin `_effective_status` DIRECTLY, independent of `summarize_dir`
+# (which the corrected §5 table above pins indirectly), so a future refactor
+# of `summarize_dir`'s call shape cannot silently resurrect the fallback
+# while still passing the higher-level assertions above.
+# ===========================================================================
+{
+    my $root = tempdir(CLEANUP => 1);
+
+    # Behavior 9: no ledger file at all for 'p1' ($ledger_present == 0), and
+    # a registry entry claiming status "done". Pre-s02 this returned 'done'
+    # (the fallback). Post-s02 it must return '' -- the registry carries no
+    # authority, present or absent, per-package-ledger-exists or not.
+    my $dir9 = make_blueprint($root, 'behavior9-no-ledger', registry => registry_json());
+    is(RS('_effective_status', $dir9, 'p1', { status => 'done' }, 0), '',
+        "s02/behavior9: _effective_status(no ledger file, \$entry={status=>'done'}, \$ledger_present=0) -> '' -- NOT 'done'; the removed registry fallback, pinned directly");
+
+    # Behavior 10: a ledger file that EXISTS but is unparseable (over
+    # SPEC_MAX_LEDGER_BYTES, same shape as the B20 'oversized' fixture above),
+    # so $ledger_present == 1 and _ledger_status(...) returns ''. This case
+    # was ALREADY correct pre-s02 (the fallback only fired when
+    # $ledger_present was false) -- this is a regression guard, not a new fix.
+    my $dir10 = make_blueprint($root, 'behavior10-unparseable-ledger',
+        registry => registry_json(),
+        packages => { p1 => ('x' x (SPEC_MAX_LEDGER_BYTES + 1024)) });
+    is(RS('_effective_status', $dir10, 'p1', { status => 'done' }, 1), '',
+        "s02/behavior10: _effective_status(ledger present but unparseable, \$entry={status=>'done'}, \$ledger_present=1) -> '' -- unchanged from pre-s02 behavior, regression guard only");
 }
 
 # ===========================================================================
