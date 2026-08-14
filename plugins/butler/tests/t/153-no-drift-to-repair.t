@@ -183,9 +183,19 @@ sub run_lifecycle {
 # Anchoring on $ under /m matches the row's own line, and the trailing
 # optional | consumes the closing pipe of a markdown table row so the capture
 # is the last CELL rather than whatever follows it.
+# AMENDED AGAIN 2026-08-14, same session, after the step-6 red-team: the
+# driver's own \z-under-/m fix above still matched the package id ANYWHERE in
+# the row, so an id that is a SUBSTRING of another package's id read the wrong
+# row -- searching '01-a' against a table containing '01-a-extra' returned that
+# other package's status. Verified by probe before and after.
+#
+# Now anchored to the id's own CELL (^| id |), which is the only form a markdown
+# table row can take here. Twice-corrected because each fix addressed the
+# failure in front of it rather than the shape of the matcher; the anchor is
+# the actual invariant.
 sub table_cell_of {
     my ($md, $pkg) = @_;
-    return undef unless $md =~ /^[^\n]*\Q$pkg\E[^\n]*?\|\s*([^\|\n]*?)\s*\|?[ \t]*$/m;
+    return undef unless $md =~ /^\|\s*\Q$pkg\E\s*\|[^\n]*?\|\s*([^\|\n]*?)\s*\|?[ \t]*$/m;
     my $v = $1;
     $v =~ s/^\s+|\s+\z//g;
     return $v;
