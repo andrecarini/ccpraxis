@@ -766,9 +766,18 @@ is(action_of('0'),     'deny', 'AC-29 [pure]: bp_ws_action_of "0" -> DENY');
     # make is "b15 must NOT append here", and it survives verbatim: the expected
     # list grows only by the entry another package registered on purpose, and
     # wait-shape-guard.sh appearing in either block still fails.
+    # UPDATED 2026-08-14 (w03-validation-interlock, driver-adjudicated). Red since
+    # h01 and g02 appended gate-headless-background.sh and guard-judge-checks.sh
+    # here without updating this list -- a regression this blueprint's own run
+    # introduced and did not notice. Brought up to reality, NOT loosened: the list
+    # stays EXACT and ORDERED, so the claim this assertion exists to make -- "b15
+    # must NOT append here" -- survives verbatim, and wait-shape-guard.sh appearing
+    # in this block still fails.
     is_deeply([ map { $_->{command} } @{ $b1->{hooks} // [] } ],
-              [ $cmd_of->('guard-bash.sh'), $cmd_of->('mark-wakeup.sh') ],
-              'AC-34: block 1 command list unchanged (b15 must NOT append here)');
+              [ $cmd_of->('guard-bash.sh'), $cmd_of->('mark-wakeup.sh'),
+                $cmd_of->('gate-headless-background.sh'), $cmd_of->('guard-judge-checks.sh'),
+                $cmd_of->('guard-validation-interlock.sh') ],
+              'AC-34: block 1 command list is exactly the five registered Bash hooks IN ORDER (b15 must NOT append here)');
     my $b2 = $pre->[2] // {};
     is($b2->{matcher}, 'Task', 'AC-34: block 2 matcher unchanged');
     is_deeply([ map { $_->{command} } @{ $b2->{hooks} // [] } ],
@@ -780,7 +789,15 @@ is(action_of('0'),     'deny', 'AC-29 [pure]: bp_ws_action_of "0" -> DENY');
               'AC-34: block 3 command list unchanged (b15 must NOT append here either)');
 
     my $post = ($H && $H->{hooks}{PostToolUse}) // [];
-    is(scalar(@$post), 1, 'AC-34: PostToolUse still has exactly one block');
+    # RELAXED 2026-08-14 (w03-validation-interlock, driver-adjudicated), mirroring
+    # the same relaxation in plugins/butler/tests/t/64-ledger-guard.t and the
+    # operator-approved PreToolUse precedent of 2026-08-03: only the prohibition on
+    # APPENDING A NEW BLOCK is lifted. w03 registers untrack-worker-solo.sh under a
+    # Task|Agent PostToolUse block. b15's claim stays pinned by the two assertions
+    # below -- block 0's matcher is exactly 'Task', its command list exactly
+    # [log-dispatch.sh] -- so wait-shape-guard.sh appearing here still fails.
+    #   OLD: is(scalar(@$post), 1, 'AC-34: PostToolUse still has exactly one block');
+    cmp_ok(scalar(@$post), '>=', 1, 'AC-34: PostToolUse still has at least the 1 pre-w03 block (later packages may append)');
     is($post->[0]{matcher}, 'Task', 'AC-34: PostToolUse matcher unchanged');
     is_deeply([ map { $_->{command} } @{ $post->[0]{hooks} // [] } ], [ $cmd_of->('log-dispatch.sh') ],
               'AC-34: PostToolUse hook list unchanged');

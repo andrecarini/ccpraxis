@@ -190,6 +190,106 @@ bp_require_sandbox() {
   fi
 }
 
+# bp_strip_shell_noise -- reads a raw shell command on STDIN, echoes it back
+# with every single-quoted span, double-quoted span, '#'-comment (only when
+# '#' starts a new word -- preceded by whitespace, a command separator, or
+# the start of the string, exactly like bash's own lexer), and heredoc body
+# replaced by same-length whitespace. A substring/regex match run against the
+# RESULT only ever sees text bash would actually treat as live, unquoted,
+# un-commented command text -- never text sitting inert inside a string,
+# comment, or heredoc body.
+#
+# fixbatch step7 / w03 F2. BYTE-IDENTICAL algorithm to the one
+# mark-wakeup.sh authored first (fixbatch step7 / g03 F1, verified live
+# against three independent bypass techniques: a bash comment, a
+# single-quoted string, a heredoc body). Lifted here so a THIRD copy of this
+# logic is never written: hooks/guard-validation-interlock.sh is the second
+# consumer of this one implementation. mark-wakeup.sh's own inline copy is
+# deliberately left as-is rather than refactored to call this -- it is
+# already shipped and tested (t/98 and siblings), and routing it through here
+# too is a real improvement but not required to avoid the "fourth copy"
+# defect this comment warns against; only a genuinely NEW caller needs to
+# reuse rather than reinvent.
+#
+# NOT a shell parser: command substitution ($(...)), variable expansion, and
+# backtick spans are not resolved, so text built through one of those still
+# slips past filtering -- an accepted, documented residual, same direction
+# every caller of this helper already accepts for its own analogous gap.
+#
+# Returns EMPTY (not the original text) if perl is unavailable or the input
+# was empty -- callers MUST treat empty as "could not determine" and choose
+# their own fail-open/fail-safe fallback; this helper does not decide that
+# for them.
+bp_strip_shell_noise() {
+  perl -0777 -ne '
+      my $s = $_;
+      my @c = split //, $s, -1;
+      my $n = scalar @c;
+      my $filtered = "";
+      my $state = "none";      # none | squote | dquote | comment | heredoc
+      my $hd = ""; my $hd_tabs = 0; my $hd_pending = 0; my $line = "";
+      my $i = 0;
+      while ($i < $n) {
+        my $ch = $c[$i];
+        if ($state eq "heredoc") {
+          if ($ch eq "\n") {
+            my $chk = $line; $chk =~ s/^\t+// if $hd_tabs;
+            $state = "none" if $chk eq $hd;
+            $filtered .= (" " x length($line))."\n"; $line = "";
+          } else { $line .= $ch }
+          $i++; next;
+        }
+        if ($state eq "comment") {
+          $filtered .= ($ch eq "\n" ? "\n" : " ");
+          $state = "none" if $ch eq "\n";
+          $i++; next;
+        }
+        if ($state eq "squote") {
+          $state = "none" if $ch eq "\x27";
+          $filtered .= ($ch eq "\n" ? "\n" : " ");
+          $i++; next;
+        }
+        if ($state eq "dquote") {
+          if ($ch eq "\\" && $i+1 < $n) { $filtered .= "  "; $i += 2; next }
+          $state = "none" if $ch eq q{"};
+          $filtered .= ($ch eq "\n" ? "\n" : " ");
+          $i++; next;
+        }
+        if ($hd_pending && $ch eq "\n") {
+          $filtered .= "\n"; $i++; $state = "heredoc"; $hd_pending = 0; $line = ""; next;
+        }
+        if ($ch eq "\x27") { $state = "squote"; $filtered .= " "; $i++; next }
+        if ($ch eq q{"})   { $state = "dquote"; $filtered .= " "; $i++; next }
+        if ($ch eq "\\" && $i+1 < $n) { $filtered .= "  "; $i += 2; next }
+        if ($ch eq "#") {
+          my $p = $filtered; $p =~ s/[ \t]+$//;
+          my $last = length($p) ? substr($p, -1) : "";
+          if ($last eq "" || $last =~ /[;&|(\n]/) {
+            $state = "comment"; $filtered .= " "; $i++; next;
+          }
+          $filtered .= "#"; $i++; next;
+        }
+        if ($ch eq "<" && $i+1 < $n && $c[$i+1] eq "<") {
+          my $j = $i+2; my $tabs = 0;
+          if ($j < $n && $c[$j] eq "-") { $tabs = 1; $j++ }
+          $j++ while ($j < $n && $c[$j] =~ /[ \t]/);
+          my $q = "";
+          if ($j < $n && ($c[$j] eq "\x27" || $c[$j] eq q{"})) { $q = $c[$j]; $j++ }
+          my $delim = "";
+          $delim .= $c[$j++] while ($j < $n && $c[$j] =~ /[A-Za-z0-9_]/);
+          $j++ if (length($q) && $j < $n && $c[$j] eq $q);
+          if (length($delim)) {
+            $filtered .= (" " x ($j - $i)); $i = $j;
+            $hd = $delim; $hd_tabs = $tabs; $hd_pending = 1;
+            next;
+          }
+        }
+        $filtered .= $ch; $i++;
+      }
+      print $filtered;
+  ' 2>/dev/null
+}
+
 # bp_clear_stale_shutdown RUNS_DIR — remove a leftover terminal .shutdown marker.
 # The container heartbeat (B6) writes runs/.shutdown to wind a run down when the
 # host manager goes away (e.g. the host slept and the run was reaped). It is

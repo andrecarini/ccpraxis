@@ -374,9 +374,20 @@ sub nonblank_lines { return grep { /\S/ } split /\n/, $_[0] }
     # mark-wakeup.sh to the Bash and Task blocks: it must see every tool call
     # that could schedule a wake-up. The claim -- b12 appended only to its own
     # block 0 -- is untouched, and ledger-guard.sh appearing here still fails.
+    # UPDATED 2026-08-14 (w03-validation-interlock, driver-adjudicated). This
+    # assertion had been RED since h01 and g02 appended gate-headless-background.sh
+    # and guard-judge-checks.sh to this block without updating it here -- a
+    # regression this blueprint's own run introduced and did not notice, found
+    # only when w03 added a fifth entry and its implementer flagged the conflict
+    # instead of editing the oracle. The expected list is brought up to reality
+    # rather than loosened: it stays EXACT and ORDERED, so b12's claim -- that it
+    # appended only to its own block 0 -- still fails the moment ledger-guard.sh
+    # appears here, which is the whole point of pinning it.
     is_deeply([ map { $_->{command} } @{ $b1->{hooks} // [] } ],
-              [ $cmd_of->('guard-bash.sh'), $cmd_of->('mark-wakeup.sh') ],
-              'AC-36: block 1 command list unchanged');
+              [ $cmd_of->('guard-bash.sh'), $cmd_of->('mark-wakeup.sh'),
+                $cmd_of->('gate-headless-background.sh'), $cmd_of->('guard-judge-checks.sh'),
+                $cmd_of->('guard-validation-interlock.sh') ],
+              'AC-36: block 1 command list is exactly the five registered Bash hooks IN ORDER (ledger-guard.sh appearing here still fails)');
     my $b2 = $pre->[2] // {};
     is($b2->{matcher}, 'Task', 'AC-36: block 2 matcher unchanged');
     is_deeply([ map { $_->{command} } @{ $b2->{hooks} // [] } ],
@@ -388,7 +399,15 @@ sub nonblank_lines { return grep { /\S/ } split /\n/, $_[0] }
               'AC-36: block 3 command list unchanged');
 
     my $post = ($H && $H->{hooks}{PostToolUse}) // [];
-    is(scalar(@$post), 1, 'AC-36: PostToolUse still has exactly one block');
+    # RELAXED 2026-08-14 (w03-validation-interlock, driver-adjudicated), exactly
+    # mirroring the PreToolUse relaxation above and its stated reasoning: only the
+    # prohibition on APPENDING A NEW BLOCK is lifted. w03 registers
+    # untrack-worker-solo.sh under a Task|Agent PostToolUse block. b12's own claim
+    # stays pinned by the two assertions immediately below -- block 0's matcher is
+    # exactly 'Task' and its command list is exactly [log-dispatch.sh] -- so a
+    # missing, renamed or reordered log-dispatch.sh still fails.
+    #   OLD: is(scalar(@$post), 1, 'AC-36: PostToolUse still has exactly one block');
+    cmp_ok(scalar(@$post), '>=', 1, 'AC-36: PostToolUse still has at least the 1 pre-w03 block (later packages may append)');
     is($post->[0]{matcher}, 'Task', 'AC-36: PostToolUse matcher unchanged');
     is_deeply([ map { $_->{command} } @{ $post->[0]{hooks} // [] } ], [ $cmd_of->('log-dispatch.sh') ],
               'AC-36: PostToolUse hook list unchanged');

@@ -32,6 +32,11 @@ Pass the raw scope straight through as `next --scope <arg>`; the director resolv
   `bp-launch.sh` coordinator, never into this session. Check `git status` after every write-capable
   worker; see coordinator-protocol, "…but only inside a butler-LAUNCHED coordinator".
 - **You do NOT poll usage or manage keep-awake.** The director does both — you simply dispatch the actions it returns.
+- **Validation can be denied while a write-capable worker is live.** `guard-validation-interlock.sh`
+  (PreToolUse, mechanically enforced — not this doc) blocks a test/build/lint-shaped `Bash` command
+  whenever a write-capable worker's marker is fresh, so you don't read its live/leftover temp state
+  as a false red. The denial (exit 2) says so itself and names the wait/retry remedy — nothing further
+  to memorize here; just wait for the worker to return (or the marker to age out) and re-run.
 
 ## Preflight
 

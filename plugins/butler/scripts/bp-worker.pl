@@ -438,6 +438,103 @@ if (defined $opt{turn_budget} && length $opt{turn_budget} && $opt{turn_budget} =
     }
 }
 
+# ---------------------------------------------------------------------------
+# 8c. Per-invocation TMPDIR (spec §2.2, done criterion 2 -- opencode backend
+# only; see spec §0 for why coordinator-level (bp-launch.sh) isolation is
+# unreachable inside this write_set). Applied to EVERY dispatch, writer or
+# read-only: a read-only worker's toolchain can equally contend for /tmp.
+# sweep_stale runs BEFORE creating this invocation's own directory, so a
+# crashed dispatch's leftover cannot itself accumulate forever, and cannot
+# collide with the one this invocation is about to make.
+#
+# fixbatch step7 / F3: sweep_stale_tmp was mtime-only, no liveness check --
+# reviewer SF2 / red-team MEDIUM-1, verified by reading the code: a dispatch
+# whose toolchain writes only INTO subdirectories (never touching
+# $DISPATCH_TMP's own top level again) leaves its parent mtime frozen at
+# creation time, so a long-running-but-genuinely-live dispatch past the
+# default 240-minute TTL could have its OWN live scratch directory swept by a
+# CONCURRENT, unrelated bp-worker.pl invocation. Fixed by recording an OWNER
+# (this invocation's own pid + a process-instance fingerprint, via
+# bp-runstate.pl's pid_alive/pid_fingerprint -- the exact precedent named in
+# the finding, already solving the identical "is the pid at this number the
+# SAME process, or one the OS recycled the number to" problem for the stop
+# gate) in a sidecar file inside DISPATCH_TMP at creation time. A stale-by-
+# mtime directory is only swept if its owner cannot be verified alive AND
+# the same instance -- never on mtime alone once an owner sidecar exists. A
+# directory with NO owner sidecar (pre-fix leftovers, or the fixture-built
+# "leftover from a crashed dispatch" case t/147 section C exercises) has
+# nothing to verify and sweeps exactly as before -- this is what keeps that
+# existing counter-fixture green.
+# ---------------------------------------------------------------------------
+my $WORKER_TMP_TTL_MIN = $ENV{CCPRAXIS_WORKER_TMP_TTL_MIN};
+if (!defined $WORKER_TMP_TTL_MIN || $WORKER_TMP_TTL_MIN !~ /^\d+$/ || $WORKER_TMP_TTL_MIN <= 0) {
+    $WORKER_TMP_TTL_MIN = 240;
+}
+my $TMPROOT = "$BP_DIR/tmp";
+
+# _dispatch_tmp_owner_alive(DIR) -> 1 if DIR carries an owner sidecar (.owner,
+# "PID:FINGERPRINT") whose pid is alive AND fingerprints identically to the
+# one recorded at creation time -- i.e. verifiably the SAME still-running
+# bp-worker.pl invocation, not merely "some process at that number now".
+# Any ambiguity (no sidecar, unparsceable, pid dead, fingerprint mismatch or
+# unobtainable) returns 0 -- fails toward "sweep it", the pre-existing
+# best-effort-cleanup posture this file already documents everywhere else.
+sub _dispatch_tmp_owner_alive {
+    my ($dir) = @_;
+    my $owner_file = "$dir/.owner";
+    return 0 unless -f $owner_file;
+    open(my $fh, '<', $owner_file) or return 0;
+    my $line = <$fh>;
+    close($fh);
+    return 0 unless defined $line;
+    chomp $line;
+    my ($pid, $fp) = split(/:/, $line, 2);
+    return 0 unless defined $pid && $pid =~ /^\d+$/;
+    return 0 unless defined $fp && length $fp;
+    require "$Bin/bp-runstate.pl";
+    return 0 unless BpRunState::pid_alive($pid);
+    my $have = BpRunState::pid_fingerprint($pid);
+    return (defined $have && $have eq $fp) ? 1 : 0;
+}
+
+sub sweep_stale_tmp {
+    my ($root, $ttl_min) = @_;
+    return unless -d $root;
+    my $now = time();
+    opendir(my $dh, $root) or return;
+    my @entries = grep { $_ ne '.' && $_ ne '..' } readdir($dh);
+    closedir($dh);
+    for my $e (@entries) {
+        my $p = "$root/$e";
+        next unless -d $p;
+        my @st = stat($p);
+        next unless @st;
+        my $age_min = ($now - $st[9]) / 60;
+        next unless $age_min > $ttl_min;
+        next if _dispatch_tmp_owner_alive($p);   # verified still-live: never sweep, however stale the mtime
+        require File::Path;
+        File::Path::remove_tree($p, { error => \my $err });
+    }
+}
+make_path($TMPROOT) unless -d $TMPROOT;
+sweep_stale_tmp($TMPROOT, $WORKER_TMP_TTL_MIN);
+my $DISPATCH_TMP = "$TMPROOT/$BP_PACKAGE.$SHORT.$ts.$$";
+make_path($DISPATCH_TMP);
+{
+    require "$Bin/bp-runstate.pl";
+    my $owner_fp = BpRunState::pid_fingerprint($$);
+    if (defined $owner_fp && length $owner_fp) {
+        if (open(my $ownfh, '>', "$DISPATCH_TMP/.owner")) {
+            print {$ownfh} "$$:$owner_fp\n";
+            close($ownfh);
+        }
+    }
+    # No fingerprint obtainable (e.g. neither /proc nor wmic resolved): the
+    # directory is left with no owner sidecar, which is exactly the
+    # "unverifiable -> sweep as before" fallback _dispatch_tmp_owner_alive
+    # already implements -- never a wedge, just a lost liveness guarantee.
+}
+
 my $pid = fork();
 die "bp-worker.pl: fork failed: $!" unless defined $pid;
 if ($pid == 0) {
@@ -446,6 +543,11 @@ if ($pid == 0) {
     sysopen(my $ofh, $report_file, O_WRONLY | O_APPEND) or POSIX::_exit(126);
     open(STDOUT, '>&', $ofh) or POSIX::_exit(126);
     open(STDERR, '>&', $ofh) or POSIX::_exit(126);
+    # Child-only: never mutates the parent's own %ENV. bp-worker.pl itself
+    # does no temp-file work that needs isolating; mutating the parent would
+    # leak into anything it does after waitpid returns (report writes,
+    # ledger append) for no benefit.
+    $ENV{TMPDIR} = $DISPATCH_TMP;
     my @model_args = (defined $model && length $model) ? ('--model', $model) : ();
     my @format_args = ('--format', 'json');
     # `--agent <name>`, NOT `--agent-file <path>`. Measured: `--agent-file` is not a
@@ -464,6 +566,15 @@ if ($pid == 0) {
 $CHILD_PID = $pid;
 waitpid($pid, 0);
 my $status = $?;
+# Best-effort cleanup, mirroring the existing marker cleanup's posture --
+# never fatal, never blocks the report. A failure here (permissions, a
+# slow-exiting child still holding a file open on Windows) is caught by the
+# next invocation's sweep_stale_tmp once this directory's mtime ages past
+# WORKER_TMP_TTL_MIN.
+if (-d $DISPATCH_TMP) {
+    require File::Path;
+    eval { File::Path::remove_tree($DISPATCH_TMP, { error => \my $err }) };
+}
 $CHILD_PID = undef;
 my $backend_rc = ($status == -1) ? 255 : ($status >> 8);
 

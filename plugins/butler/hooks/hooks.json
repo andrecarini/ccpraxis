@@ -15,7 +15,8 @@
           { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/guard-bash.sh\"", "timeout": 15 },
           { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/mark-wakeup.sh\"", "timeout": 15 },
           { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/gate-headless-background.sh\"", "timeout": 15 },
-          { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/guard-judge-checks.sh\"", "timeout": 15 }
+          { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/guard-judge-checks.sh\"", "timeout": 15 },
+          { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/guard-validation-interlock.sh\"", "timeout": 15 }
         ]
       },
       {
@@ -47,6 +48,12 @@
         "hooks": [
           { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/mark-wakeup.sh\"", "timeout": 15 }
         ]
+      },
+      {
+        "matcher": "Task|Agent",
+        "hooks": [
+          { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/track-worker-solo.sh\"", "timeout": 15 }
+        ]
       }
     ],
     "PostToolUse": [
@@ -54,6 +61,12 @@
         "matcher": "Task",
         "hooks": [
           { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/log-dispatch.sh\"", "timeout": 15 }
+        ]
+      },
+      {
+        "matcher": "Task|Agent",
+        "hooks": [
+          { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/untrack-worker-solo.sh\"", "timeout": 15 }
         ]
       }
     ],
