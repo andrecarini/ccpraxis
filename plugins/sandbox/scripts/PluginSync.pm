@@ -250,7 +250,17 @@ sub prune_orphaned_dirs {
             push @results, { name => $name, removed => 0 };
         } else {
             _force_remove_tree($path);
-            push @results, { name => $name, removed => 1 };
+            # Verify the removal actually happened before reporting success --
+            # _force_remove_tree's unlink/rmdir calls are best-effort (a locked
+            # file on Windows, e.g. held open by another process, silently
+            # leaves entries behind). Report removed => 0 with a distinguishing
+            # `error` key rather than claiming success we cannot back up.
+            if (-e $path || -l $path) {
+                push @results, { name => $name, removed => 0,
+                                  error => 'removal incomplete (path still present after removal attempt)' };
+            } else {
+                push @results, { name => $name, removed => 1 };
+            }
         }
     }
     return @results;
@@ -287,19 +297,39 @@ sub prune_orphaned_dirs {
 # A name in $names that doesn't exist, is a symlink, or is not a directory is
 # silently skipped (not reported) — this function only reports what it
 # actually removed, same discipline as prune_orphaned_dirs.
+#
+# Defense-in-depth (not currently reachable — the sole call site passes a
+# static literal list): every entry in $names (and, belt-and-suspenders, in
+# $keep_names) is required to pass safe_dest_rel — the SAME single-plain-
+# component traversal guard reconcile_copy_plan already applies to dest_rel.
+# Without it, a future caller that reuses this exported sub with a
+# less-trusted source (a config file, another manifest, a predicate) could be
+# tricked into deleting a directory OUTSIDE $dest_root via a name like
+# '../../victim'. A rejected name is silently skipped, same as any other
+# name this function declines to touch.
 sub remove_named_legacy_dirs {
     my ($dest_root, $names, $keep_names) = @_;
     return () unless defined $dest_root && -d $dest_root && !-l $dest_root;
-    my %keep = map { $_ => 1 } @{ $keep_names || [] };
+    my %keep = map { $_ => 1 } grep { safe_dest_rel($_) } @{ $keep_names || [] };
 
     my @results;
     for my $name (@{ $names || [] }) {
+        next unless safe_dest_rel($name);  # no ../, no absolute, no multi-component path
         next if $keep{$name};              # currently selected -- never touched
         my $path = "$dest_root/$name";
         next if -l $path;                  # symlink: never removed by this pass
         next unless -d $path;              # not a directory: never removed by this pass
         _force_remove_tree($path);
-        push @results, { name => $name, removed => 1 };
+        # Verify before reporting success -- see prune_orphaned_dirs's identical
+        # guard above; this function deletes CONTENT-BEARING directories (unlike
+        # prune_orphaned_dirs's empty-only target), so a silent partial removal
+        # here is a worse outcome, not just an equally-bad one.
+        if (-e $path || -l $path) {
+            push @results, { name => $name, removed => 0,
+                              error => 'removal incomplete (path still present after removal attempt)' };
+        } else {
+            push @results, { name => $name, removed => 1 };
+        }
     }
     return @results;
 }

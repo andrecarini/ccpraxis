@@ -2936,43 +2936,65 @@ my @this_launch_skill_names;
     }
 }
 
-# One-time legacy cleanup: only fires the launch where $SKILLS_COPY_MANIFEST
-# doesn't exist YET (no host-tier skill manifest history at all -- see
-# $skills_manifest_existed above). Never fires again once that manifest is on
-# disk, even if its contents are later an empty array. Standing policy
-# (mirrored here, not just for this one pass): a content-bearing directory
-# this repo cannot prove it owns is warned about, never deleted -- see
-# PluginSync::prune_orphaned_dirs.
-unless ($skills_manifest_existed) {
-    # Operator-authorised, ONE-TIME removal of two NAMED pre-manifest legacy
-    # skill specimens: `plan` and `work-plan`. This is NOT the standing policy
-    # (PluginSync::prune_orphaned_dirs, called below, still warns rather than
-    # removes any content-bearing directory it finds on its own) -- it is a
-    # single explicit exception the operator authorised for these two exact
-    # names, because no provenance record predating this fix could otherwise
-    # tell "leftover from the retired copy-skills era" apart from "an operator
-    # wrote this by hand in the container" (blueprint p01-sandbox-plugin-
-    # provisioning decision log, 2026-08-14T00:50:44Z: "ONE-TIME REMOVAL OF
-    # THESE TWO, THEN WARN-ONLY"). The names are hard-coded here, not derived
-    # from any predicate over disk contents -- see PluginSync::remove_named_legacy_dirs's
-    # own comment for why a computed list would be the wrong shape for this.
-    # Runs before prune_orphaned_dirs below so these two, once removed, are
-    # simply absent for that pass rather than producing a contradictory
-    # "leaving it in place" warning for a directory this block just removed.
-    my @LEGACY_ONE_TIME_REMOVE = ('plan', 'work-plan');
-    my @removed_specimens = PluginSync::remove_named_legacy_dirs(
-        "$CLAUDE_DATA/skills", \@LEGACY_ONE_TIME_REMOVE, \@this_launch_skill_names);
-    for my $r (@removed_specimens) {
-        _emit_err("Removed pre-manifest legacy skill directory '$r->{name}' ".
-                   "(operator-authorised one-time removal of a named pre-manifest ".
-                   "specimen predating any host-tier manifest -- not the standing policy).\n");
-    }
-
+# One-time legacy cleanup, gated on TWO signals, either of which suppresses it:
+#
+#   1. $skills_manifest_existed -- PER-PROJECT (see above): once this project
+#      has host-tier skill history, the standing reconcile below (sync_copy_plan)
+#      takes over and this pass never needs to run again for THIS project.
+#   2. $LEGACY_SKILLS_CLEANUP_MARKER -- MACHINE-SCOPED (below): a flag file
+#      under the HOST USER'S REAL ~/.claude (i.e. $CLAUDE_HOST_CONFIG, computed
+#      from home_dir() at the top of this file -- NEVER $CLAUDE_DATA, which is
+#      THIS PROJECT's claude-home and is what gets bind-mounted to /root/.claude
+#      inside a container). Signal 1 ALONE was the original bug: on a machine
+#      with many projects, every NEW project's first post-upgrade launch has no
+#      manifest yet, so "one-time" re-fired forever, once per project, including
+#      projects that did not exist yet at fix time. Signal 2 makes it fire AT
+#      MOST ONCE ON THIS MACHINE, which is what the operator's "one-time
+#      removal of these two, then warn-only" authorisation actually meant.
+#
+# CONTAINER VS HOST: launcher.pl is a HOST-side orchestrator -- it is the
+# process that invokes podman to CREATE the container in the first place, and
+# it never runs inside one (the code that runs inside the container lives
+# under plugins/sandbox/container/, a disjoint execution context). So $HOME /
+# $CLAUDE_HOST_CONFIG here is unconditionally the real host user's ~/.claude
+# (e.g. C:/Users/<user>/.claude on Windows), never /root's. /root/.claude only
+# exists INSIDE a container, as a bind mount of THIS PROJECT's claude-home --
+# a different, per-project directory this marker deliberately does not use.
+# There is no host/container inconsistency to reconcile for this specific
+# marker because this code path is host-only, by construction.
+#
+# The marker lives directly under $CLAUDE_HOST_CONFIG (a SIBLING of, not
+# inside, .../ccpraxis) so that promoting/reinstalling the live plugin tree
+# (a `git pull` into ~/.claude/ccpraxis) can never erase "already ran" state,
+# and so a container rebuild -- which never touches host ~/.claude at all --
+# can't either.
+my $LEGACY_SKILLS_CLEANUP_MARKER = "$CLAUDE_HOST_CONFIG/.sandbox-legacy-skills-cleanup-v1";
+my $legacy_cleanup_marker_present = -e $LEGACY_SKILLS_CLEANUP_MARKER;
+#
+# This is the STANDING content-based policy (PluginSync::prune_orphaned_dirs):
+# a directory holding zero regular files anywhere in its subtree is removed
+# outright; a content-bearing directory this repo cannot prove it owns is
+# warned about and left in place, always. Layered on top of it, gated on the
+# SAME two signals, is the operator-authorised ONE-TIME removal of the two
+# specific, already-inspected, pre-manifest specimens named `plan` and
+# `work-plan` (PluginSync::remove_named_legacy_dirs) -- see blueprint
+# p01-sandbox-plugin-provisioning, fix-batch report step 7, finding F1. This
+# is a hard-coded two-name list, never a computed/predicate-derived one (see
+# remove_named_legacy_dirs's own doc comment for why); it must never grow
+# without a fresh, equally explicit operator authorisation.
+unless ($skills_manifest_existed || $legacy_cleanup_marker_present) {
     my @results = PluginSync::prune_orphaned_dirs("$CLAUDE_DATA/skills", \@this_launch_skill_names);
     for my $r (@results) {
         if ($r->{removed}) {
             _emit_err("Removed stale host-tier skill directory '$r->{name}' ".
                        "(empty, not selected, predates any host-tier manifest -- one-time cleanup).\n");
+        } elsif ($r->{error}) {
+            # _force_remove_tree is best-effort (e.g. a file locked by another
+            # process on Windows) -- verified incomplete, never reported as a
+            # false success. See PluginSync::prune_orphaned_dirs.
+            _emit_err("Could not fully remove stale host-tier skill directory '$r->{name}': ".
+                       "$r->{error}. It may be left partially deleted; check it manually ".
+                       "before relying on its contents.\n");
         } else {
             _emit_err("Skill directory '$r->{name}' is not selected and has no manifest record, ".
                        "but is NOT empty; leaving it in place (removing it would be unrecoverable ".
@@ -2980,6 +3002,57 @@ unless ($skills_manifest_existed) {
                        "container if it is confirmed stale.\n");
         }
     }
+
+    my @named_results = PluginSync::remove_named_legacy_dirs(
+        "$CLAUDE_DATA/skills", ['plan', 'work-plan'], \@this_launch_skill_names);
+    for my $r (@named_results) {
+        if ($r->{removed}) {
+            _emit_err("Removed legacy skill directory '$r->{name}' ".
+                       "(operator-authorised one-time removal of a specific, already-inspected ".
+                       "pre-manifest specimen -- see p01-sandbox-plugin-provisioning finding F1).\n");
+        } elsif ($r->{error}) {
+            _emit_err("Could not fully remove legacy skill directory '$r->{name}': $r->{error}. ".
+                       "It may be left partially deleted; check it manually before relying on its ".
+                       "contents.\n");
+        }
+    }
+
+    # Write the marker AFTER the pass has run, and unconditionally of whether
+    # anything was actually found/removed -- writing only-if-something-was-
+    # removed would mean a machine with zero legacy specimens (e.g. every
+    # project created after this fix shipped) retries this pass forever,
+    # which defeats the whole point of a one-time gate. Writing it only after
+    # (rather than before) the pass runs means a process killed mid-launch
+    # can never leave a marker claiming "done" for a pass that never actually
+    # executed.
+    #
+    # FAILURE MODE, chosen deliberately: if this write fails (permissions,
+    # read-only $HOME), we fail toward RETRY on a future qualifying launch,
+    # not toward SKIP. A true machine-scoped "skip" requires SOME persisted
+    # state; if $CLAUDE_HOST_CONFIG genuinely cannot be written to, no
+    # filesystem-based marker anywhere can honestly claim machine-scoped
+    # persistence, and inventing a per-project surrogate here would just
+    # silently reintroduce the original per-project bug this fix exists to
+    # remove. What retry actually costs on a machine in this broken state:
+    # THIS project is still fully protected from re-firing regardless (its
+    # own $SKILLS_COPY_MANIFEST is written unconditionally, below, so
+    # $skills_manifest_existed alone suppresses it here from the next launch
+    # onward); the only residual exposure is prune_orphaned_dirs / (redundant
+    # first-launch reruns of) remove_named_legacy_dirs on OTHER projects'
+    # first qualifying launch, both of which are individually idempotent
+    # no-ops against anything already removed (`next unless -d $path`), and
+    # remove_named_legacy_dirs's blast radius stays capped at the same
+    # hard-coded two names either way. The error is surfaced loudly rather
+    # than swallowed so the operator can fix the underlying permissions
+    # problem.
+    eval {
+        _write_file($LEGACY_SKILLS_CLEANUP_MARKER, "1\n");
+        1;
+    } or _emit_err("Could not write the machine-scoped legacy skills cleanup marker at ".
+                    "'$LEGACY_SKILLS_CLEANUP_MARKER': $@Without it, this one-time legacy skill ".
+                    "cleanup pass may run again on a future launch of a DIFFERENT project on this ".
+                    "machine (safe -- see code comment above); fix the permissions on ".
+                    "'$CLAUDE_HOST_CONFIG' to stop it recurring.\n");
 }
 
 # Ordinary reconcile: remove what we placed last launch that's not selected
