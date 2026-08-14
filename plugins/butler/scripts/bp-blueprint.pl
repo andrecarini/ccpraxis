@@ -661,7 +661,10 @@ sub op_set_section {
 # last step of /blueprint:create -- required a hand-splice, which is precisely what this
 # API exists to prevent. Found by hitting it while authoring a real blueprint.
 # -------------------------------------------------------------------------------------
-my @BP_LIFECYCLE = qw(drafting audited running done archived);
+my @BP_LIFECYCLE_AUTHORED = qw(drafting audited archived);
+my @BP_LIFECYCLE_DERIVED  = qw(running done);
+my %BP_LIFECYCLE_DERIVED  = map { $_ => 1 } @BP_LIFECYCLE_DERIVED;
+my %BP_LIFECYCLE_AUTHORED = map { $_ => 1 } @BP_LIFECYCLE_AUTHORED;
 my %META_FIELDS  = map { $_ => 1 } qw(blueprint created last_updated status execution_mode);
 
 sub op_set_meta {
@@ -682,9 +685,18 @@ sub op_set_meta {
     unless (field_safe($opt{value})) {
         arg_error('set-meta', '--value contains a pipe or newline');
     }
-    if ($opt{field} eq 'status' && !grep { $_ eq $opt{value} } @BP_LIFECYCLE) {
-        arg_error('set-meta', "--value '$opt{value}' is not a blueprint lifecycle status; expected one of: "
-                            . join(', ', @BP_LIFECYCLE));
+    if ($opt{field} eq 'status') {
+        if ($BP_LIFECYCLE_DERIVED{$opt{value}}) {
+            reject_error('set-meta',
+                "--value '$opt{value}' is a DERIVED blueprint state, not something set-meta writes -- "
+              . "'running' is derived from a live runs/.orchestrator marker (BpState::run_is_live) and "
+              . "'done' from every package ledger reaching done/dropped (BpState::blueprint_lifecycle); "
+              . "authored values are: " . join(', ', @BP_LIFECYCLE_AUTHORED));
+        }
+        unless ($BP_LIFECYCLE_AUTHORED{$opt{value}}) {
+            arg_error('set-meta', "--value '$opt{value}' is not a blueprint lifecycle status; expected one of: "
+                                . join(', ', @BP_LIFECYCLE_AUTHORED));
+        }
     }
 
     run_write('set-meta', $opt{file}, sub {

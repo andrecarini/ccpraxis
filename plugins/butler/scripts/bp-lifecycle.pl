@@ -90,17 +90,13 @@ my $SCRIPT_DIR = do {
 };
 my $BP_BLUEPRINT = "$SCRIPT_DIR/bp-blueprint.pl";
 
+require "$SCRIPT_DIR/BpState.pm";
+
 # ---------------------------------------------------------------- statuses ---
 # The six package statuses bp-blueprint.pl recognises. `dropped` is accepted as
 # terminal-but-not-delivered because bp-drive-next.pl emits it.
 my %TERMINAL   = map { $_ => 1 } qw(done dropped blocked parked);
 my %DELIVERED  = map { $_ => 1 } qw(done dropped);
-
-# Blueprint lifecycle states we are willing to ADVANCE from. `drafting` is
-# excluded on purpose: a blueprint nobody has audited must not be declared done
-# just because it happens to contain no unfinished packages (an empty or
-# half-authored one would qualify).
-my %ADVANCEABLE = map { $_ => 1 } qw(audited running);
 
 sub die_usage {
     my ($msg) = @_;
@@ -391,6 +387,9 @@ sub reconcile_one {
     $r{live} = $live;
     $r{orchestrator_pid} = $pid;
 
+    my $lifecycle = BpState::blueprint_lifecycle($bpdir, \&pid_alive);
+    $r{lifecycle} = $lifecycle;
+
     if ($live) {
         push @{ $r{actions} }, { kind => 'skipped', detail => "orchestrator pid $pid is alive; state belongs to the run" };
         return \%r;
@@ -485,31 +484,21 @@ sub reconcile_one {
         }
     }
 
-    # --- 4. lifecycle advance ----------------------------------------------
+    # --- 4. lifecycle advance (report-only; nothing is ever written here) --
     my $all_delivered = (@ledgers > 0) && !grep { !$DELIVERED{ $_->{status} } } @ledgers;
     $r{all_delivered} = $all_delivered ? 1 : 0;
 
-    if ($all_delivered && $ADVANCEABLE{$bp_status}) {
-        if ($opt->{dry_run}) {
-            push @{ $r{actions} }, { kind => 'lifecycle', detail => "would set blueprint status '$bp_status' -> 'done' (all $r{packages} packages delivered)", applied => 0 };
-            $r{status_after} = 'done';
-        } else {
-            my ($ok, $out) = bp_call_out('set-meta', '--file', $bpmd,
-                                         '--field', 'status', '--value', 'done');
-            if ($ok) {
-                bp_call('set-meta', '--file', $bpmd, '--field', 'last_updated', '--value', iso_now());
-                push @{ $r{actions} }, { kind => 'lifecycle', detail => "blueprint status '$bp_status' -> 'done' (all $r{packages} packages delivered)", applied => 1 };
-                $bp_status = 'done';
-                $r{status_after} = 'done';
-            } else {
-                push @{ $r{errors} }, 'could not advance blueprint status to done'
-                                    . (length $out ? ": $out" : '');
-            }
-        }
+    if ($lifecycle eq 'done') {
+        push @{ $r{actions} }, {
+            kind    => 'lifecycle',
+            detail  => "blueprint is done (derived; all $r{packages} packages delivered) -- "
+                     . "status: is never written for this transition (Decision 13)",
+            applied => 0,
+        };
     }
 
-    # --- 5. archive ---------------------------------------------------------
-    if ($opt->{archive} && $bp_status eq 'done' && !@{ $r{errors} }) {
+    # --- 5. archive -----------------------------------------------------------
+    if ($opt->{archive} && $lifecycle eq 'done' && !@{ $r{errors} }) {
         my $blueprints = $bpdir;
         $blueprints =~ s{[\\/][^\\/]+\z}{};
         my $dst = "$blueprints/_archive/$name";
@@ -520,19 +509,29 @@ sub reconcile_one {
         } else {
             make_path("$blueprints/_archive") unless -d "$blueprints/_archive";
             # Flip the recorded status BEFORE moving: a directory that lands in
-            # _archive/ still saying `done` is a blueprint whose own file
-            # contradicts where it lives, and that is the class of drift this
-            # whole script exists to remove.
+            # _archive/ still saying the derived word is a blueprint whose own
+            # file contradicts where it lives, and that is the class of drift
+            # this whole script exists to remove.
             bp_call('set-meta', '--file', $bpmd, '--field', 'status', '--value', 'archived');
             bp_call('set-meta', '--file', $bpmd, '--field', 'last_updated', '--value', iso_now());
             my ($ok, $how) = move_dir($bpdir, $dst);
             if ($ok) {
                 push @{ $r{actions} }, { kind => 'archive', detail => "archived to _archive/$name ($how)", applied => 1 };
                 $r{status_after} = 'archived';
+                $r{lifecycle}    = 'archived';
                 $r{dir} = $dst;
             } else {
-                # Put the status back: it is not archived, so it must not say so.
-                bp_call('set-meta', '--file', $bpmd, '--field', 'status', '--value', 'done');
+                # Roll back the write above -- but NEVER to a literal 'done'
+                # (DC3 forbids it, and op_set_meta now REJECTS it outright).
+                # The two possible prior authored words were 'audited' or
+                # 'running' (blueprint_lifecycle's own precedence for 'done'
+                # requires exactly one of those); 'running' is also now a hard
+                # refusal, so "restore exactly what was there" cannot be
+                # satisfied for both. 'audited' is always legal and always an
+                # honest description of "human-approved, not yet filed away,
+                # still all-delivered" regardless of which prior word it
+                # replaces (spec §5.1).
+                bp_call('set-meta', '--file', $bpmd, '--field', 'status', '--value', 'audited');
                 push @{ $r{errors} }, "archive failed: $how";
             }
         }

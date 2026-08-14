@@ -15,17 +15,17 @@ This plugin is authoring-side and host-usable; it never manages running coordina
 **Reconcile first, then read.** Run:
 
 ```
-perl plugins/butler/scripts/bp-lifecycle.pl reconcile --all --archive
+perl plugins/butler/scripts/bp-lifecycle.pl reconcile --all --archive --json
 ```
 
-This is not optional bookkeeping — it is what makes the listing true. The ledgers are the only record written by the thing that does the work; `blueprint.md`'s own `status:`, its package-status table, `runs/registry.json` and `runs/.orchestrator` are all derived and have each been observed stale. Reconciling repairs them, advances a blueprint whose packages are all delivered to `done`, and files it into `_archive/`. A live run (marker present **and** its pid alive) is left completely untouched.
+This is not optional bookkeeping — it is what makes the listing true. The ledgers are the only record written by the thing that does the work; `blueprint.md`'s own `status:`, its package-status table, `runs/registry.json` and `runs/.orchestrator` are all derived and have each been observed stale. Reconciling repairs them, and files an all-delivered blueprint into `_archive/`. Since s04-lifecycle-derived, `running`/`done` are never written to `status:` — they are only ever the reconciler's derived `lifecycle` field in its `--json` output. A live run (marker present **and** its pid alive) is left completely untouched.
 
 `--archive` is on here deliberately: the operator should never have to ask for a finished blueprint to be closed out. Report what it moved rather than staying silent about it.
 
-Then glob `<data>/blueprints/*/blueprint.md` (skip `_archive/`). For each, read the metadata block `status`; per-package done/total and anything blocked/parked comes from the ledger-sourced rollup (`BpState`/`bp-status.sh`), not from the table — the table no longer carries a status column (Decision 11). Present a per-blueprint digest: blueprint status, packages done/total, anything blocked/parked. Mention archived ones (under `_archive/`) by name only.
+Then, for each blueprint's JSON result, read its `lifecycle` field for the blueprint's own status — not `blueprint.md`'s raw metadata `status:` line, which after s04 can be stale (a blueprint that is genuinely live or done right now can still carry an old authored word on disk, because nothing ever writes `running`/`done` into it). Per-package done/total and anything blocked/parked comes from the ledger-sourced rollup (`BpState`/`bp-status.sh`), not from the table — the table no longer carries a status column (Decision 11). Present a per-blueprint digest: blueprint status (from `lifecycle`), packages done/total, anything blocked/parked. Mention archived ones (under `_archive/`) by name only.
 
 ## view <name>
-Read `blueprints/<name>/blueprint.md`; summarize Objective, Decisions count, the Package status table (pkg/deliverable/depends_on/model — it carries no status column), and any open escalations/incidents. Per-package status comes from the same ledger-sourced rollup as `list`. Don't dump the whole file unless asked.
+Run `perl plugins/butler/scripts/bp-lifecycle.pl reconcile --blueprint <name> --no-archive --dry-run --json` (read-only — no archive side effect for a single-blueprint view) and present its `lifecycle` field, not a raw read of `blueprint.md`'s metadata `status:` line. Also read `blueprints/<name>/blueprint.md` directly to summarize Objective, Decisions count, the Package status table (pkg/deliverable/depends_on/model — it carries no status column), and any open escalations/incidents. Per-package status comes from the same ledger-sourced rollup as `list`. Don't dump the whole file unless asked.
 
 ## audit <name>
 Dispatch the auditor via Task with `subagent_type: blueprint:bp-auditor`, pointed at the blueprint dir. Present its numbered questions to the user in one batched `AskUserQuestion` pass, fold answers into the blueprint, and refresh `last_updated`. Use after substantial revisions or before handing a blueprint to butler.

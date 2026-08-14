@@ -283,9 +283,29 @@ sub blueprint_lifecycle {
         return 'done';
     }
 
+    # The authored word survives when the work is not all delivered. Note the
+    # shape of these three lines: EVERY authored value keeps itself here. The
+    # running branch was missing until 2026-08-14 (s04, driver-adjudicated), so
+    # running was the one authored value with no branch of its own and it fell
+    # through to the catch-all below -- silently DEMOTING a blueprint the author
+    # had marked running, with real work in flight, to drafting, i.e. to "not
+    # started".
+    #
+    # Found when s04 wired this function in as the single authority and its
+    # oracle asserted "an undelivered package keeps lifecycle at the authored
+    # word" (t/101, observable-6). The implementer read the disagreement the
+    # other way -- test wrong, code right -- and flagged it rather than editing
+    # the immutable oracle, which is why it was caught. The asymmetry is the
+    # tell: drafting and audited each kept themselves, running did not.
+    #
+    # No backticks anywhere in this file, including comments: t/98's DC1 scans
+    # the whole source for them, because this module must never shell out.
     return 'drafting' if $authored eq 'drafting';
     return 'audited'  if $authored eq 'audited';
+    return 'running'  if $authored eq 'running';
 
+    # Unknown or absent authored value. Not a demotion -- there is nothing to
+    # demote, because nothing legible was authored.
     return 'drafting';
 }
 

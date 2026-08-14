@@ -18,6 +18,8 @@ bash "${CLAUDE_PLUGIN_ROOT}/scripts/bp-status.sh" $0
 
 It **reconciles before it reports** (`bp-lifecycle.pl reconcile --all --no-archive`): a stale `runs/.orchestrator`, and a `registry.json` left behind by a run that ended any way other than the orchestrator's clean exit are repaired against the ledgers. It does **not** archive — filing a finished blueprint away is not a side effect of asking for status. Report a `blueprint status: done` row as ready to archive and offer `/blueprint:manage archive <name>`.
 
+Known gap, not a regression: `bp-status.sh` itself is out of s04-lifecycle-derived's package write set and still prints `blueprint.md`'s raw stored `status:` word rather than the reconciler's derived `lifecycle` field. Until package `s05-retire-reconciler-drift-paths` updates it, a freshly-all-delivered blueprint keeps showing its pre-existing authored word (`running` or `audited`) here instead of `done`, even though `bp-lifecycle.pl reconcile` (which this script already shells to) now correctly computes `done`/`archived` internally.
+
 **Liveness is the marker's pid, never the marker's existence, and never the registry.** The header line says `[orchestrator pid N LIVE]` or `[stale orchestrator marker pid N]` — trust that. `sandbox-butler-overhaul` carried a marker for eleven days after its container was reaped, and a registry claiming six running coordinators, while every one of its 79 package ledgers said `done`.
 
 Then summarize for the user, and recommend concretely:
