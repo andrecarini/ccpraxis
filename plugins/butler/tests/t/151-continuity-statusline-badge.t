@@ -324,4 +324,46 @@ sub mkdir_p_test {
     ok(scalar(@rows) >= 2, 'I3: still renders both rows -- no crash, no reflow');
 }
 
+# ===========================================================================
+# J. NARROW-WIDTH TRUNCATION MUST NOT SPLIT AN ANSI ESCAPE.
+#
+# Added by the driver from g01's step-8 UI pass, which found a defect this
+# file could not have caught: every other section here runs at the harness's
+# hardcoded make_tput(120), so the truncation ladder's last rung was never
+# exercised at all. At <= 14 columns, fit_head() sliced the WATCHED badge's
+# colour escape in half and emitted a malformed CSI -- observed "\e[38;>" at
+# cols=14 and "\e>" at cols=10. That is not merely ugly: "\e>" is a real
+# control (Normal Keypad mode), so a truncated sequence can leave the
+# operator's terminal in an unintended state.
+#
+# NON-VACUITY: this asserts on the RAW BYTES of stdout, and the widths below
+# straddle the rung that broke -- 120 and 20 rendered correctly before the
+# fix, 14/10/6/3/1 did not. Reverting fit_head()'s escape-atomic tokenisation
+# turns the narrow cases red while leaving 120 and 20 green, so the assertion
+# discriminates rather than passing for a shape-of-the-input reason.
+# ===========================================================================
+{
+    my $cdir = tempdir(CLEANUP => 1);
+    plant_marker($cdir, 'sess-j-armed');
+
+    # A well-formed escape is either a CSI (ESC [ ... final) or a two-byte
+    # ESC + @-_ sequence. Any other ESC is a sequence that got cut.
+    my $well_formed = qr/\e(?:\[[0-9;:?]*[ -\/]*[\@-~]|[\@-_])/;
+
+    for my $cols (120, 20, 14, 10, 6, 3, 1) {
+        make_tput($cols);
+        my ($out, $rc) = run_statusline(payload_for(session_id => 'sess-j-armed'), cdir => $cdir);
+        is($rc, 0, "J: statusline.pl exits 0 at cols=$cols");
+
+        my $scan = $out;
+        $scan =~ s/$well_formed//g;
+        ok(index($scan, "\e") < 0,
+           "J: no truncated/malformed ANSI escape survives at cols=$cols "
+         . '(fit_head must treat an escape as atomic and zero-width)')
+            or diag('offending bytes: ' . join('', map { sprintf('\\x%02x', ord) } split //, $scan));
+    }
+
+    make_tput(120);   # restore the harness default for any later section
+}
+
 done_testing();

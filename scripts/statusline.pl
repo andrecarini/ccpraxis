@@ -163,12 +163,33 @@ sub fit_head {
     return '' if $max < 1;
     return $text if row_cost($text) <= $max;
     return '>' if $max < 2;
+    # AN ANSI ESCAPE IS ATOMIC AND ZERO-WIDTH HERE (g01 step-8 UI pass).
+    # This used to `split //` and accumulate per character, which was correct
+    # while every caller passed plain text -- but g01's WATCHED badge put colour
+    # escapes into the marker field, and at <=14 columns rung 8 sliced one in
+    # half and emitted a malformed CSI to the terminal (observed:
+    # "\e[38;>" at cols=14, "\e>" at cols=10 -- and \e> is a real control,
+    # Normal Keypad mode, so this could leave a terminal in an unintended state
+    # rather than merely looking wrong). row_cost already strips SGR before
+    # measuring, so an escape costs nothing and is always safe to carry whole.
     my $out = '';
-    for my $c (split //, $text) {
-        last if row_cost($out . $c) > $max - 1;
-        $out .= $c;
+    my $kept_visible = 0;
+    my $ESC_TOK = qr/\e\[[0-9;:?]*[ -\/]*[\@-~]|\e[\@-_]/;
+    for my $tok ($text =~ /($ESC_TOK|.)/gs) {
+        if ($tok =~ /\A\e/) { $out .= $tok; next; }
+        last if row_cost($out . $tok) > $max - 1;
+        $out .= $tok;
+        $kept_visible++;
     }
-    $out = substr($text, 0, 1) unless length($out);
+    unless ($kept_visible) {
+        # Keep any leading escapes with the first visible character, so the
+        # fallback cannot split one either.
+        ($out) = $text =~ /\A((?:$ESC_TOK)*.)/s;
+        $out = '' unless defined $out;
+    }
+    # Close any colour we opened but did not close, so a truncated field cannot
+    # bleed into the rest of the row.
+    $out .= "\033[0m" if $out =~ /\e\[/ && $out !~ /\e\[0m\z/;
     return $out . '>';
 }
 
