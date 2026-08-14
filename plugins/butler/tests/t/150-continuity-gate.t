@@ -36,7 +36,7 @@ use strict;
 use warnings;
 use Test::More;
 use FindBin qw($Bin);
-use File::Temp qw(tempdir);
+use File::Temp qw(tempdir tempfile);
 use File::Path qw(make_path);
 use JSON::PP;
 
@@ -342,6 +342,61 @@ sub plant_marker {
              . 'than the TTL is ALLOWED to stop');
     ok(!-f marker_path($cdir, 'sess-j-self-stale'),
        'J2: ...and its own now-expired marker is removed too');
+}
+
+# ===========================================================================
+# K. fix-batch F1: with CCPRAXIS_CONTINUITY_ACTIVE_DIR unset AND $HOME/
+#    $USERPROFILE also unset for the gate's own process, bp_continuity_active_dir
+#    (lib.sh) cannot resolve a directory at all. The gate must FAIL SAFE --
+#    exit 0, no crash, no block -- rather than either guessing $PWD (the
+#    pre-fix behavior) or dying. This is the READ-side half of F1's rule:
+#    unresolvable degrades to "nothing armed", never a hard failure.
+# ===========================================================================
+{
+    my $root = new_project();
+    local %ENV = %ENV;
+    delete $ENV{CCPRAXIS_CONTINUITY_ACTIVE_DIR};
+    delete $ENV{HOME};
+    delete $ENV{USERPROFILE};
+    my $payload = stop_payload($root, 'sess-k-unresolvable');
+    my $out = `bash "$GATE" <<'PAYLOAD_EOF' 2>&1
+$payload
+PAYLOAD_EOF`;
+    my $rc = $? >> 8;
+    is($rc, 0, 'K1 CANONICAL (-> fix-batch F1): gate-continuity.sh with no resolvable registry '
+             . 'directory anywhere (CCPRAXIS_CONTINUITY_ACTIVE_DIR, $HOME, $USERPROFILE all '
+             . 'unset) exits 0 -- fails safe, never blocks, never crashes');
+}
+
+# ===========================================================================
+# K2. fix-batch F1, DISCRIMINATING probe: K1 alone cannot distinguish "truly
+#    unresolvable" from "silently resolved under $PWD, which happened to be
+#    empty" -- both exit 0. Call bp_continuity_active_dir DIRECTLY (source
+#    lib.sh) with the same env and assert it returns 1 with EMPTY stdout --
+#    proves the function itself refuses to guess $PWD, not merely that the
+#    gate's overall behavior happens to still be harmless.
+# ===========================================================================
+{
+    local %ENV = %ENV;
+    delete $ENV{CCPRAXIS_CONTINUITY_ACTIVE_DIR};
+    delete $ENV{HOME};
+    delete $ENV{USERPROFILE};
+    my ($pfh, $ppath) = tempfile(SUFFIX => '.sh');
+    print {$pfh} <<"PROBE_EOF";
+set -u
+source '$HOOKS/lib.sh' 2>/dev/null || exit 3
+out=\$(bp_continuity_active_dir)
+rc=\$?
+printf 'RC=%s OUT=[%s]\\n' "\$rc" "\$out"
+PROBE_EOF
+    close $pfh;
+    my $out = `bash "$ppath" 2>&1`;
+    unlink $ppath;
+    like($out, qr/RC=1 OUT=\[\]/,
+       'K2 CANONICAL (-> fix-batch F1): bp_continuity_active_dir itself returns 1 with EMPTY '
+     . 'stdout when CCPRAXIS_CONTINUITY_ACTIVE_DIR, $HOME and $USERPROFILE are all unset -- an '
+     . 'implementation that falls back to $PWD (the pre-fix behavior) would print a non-empty '
+     . 'path and return 0 here, passing K1 by accident while still failing this');
 }
 
 done_testing();

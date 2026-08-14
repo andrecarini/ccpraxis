@@ -20,6 +20,7 @@ use Test::More;
 use FindBin qw($Bin);
 use File::Temp qw(tempdir);
 use File::Path qw(make_path);
+use Cwd ();
 
 my $SCRIPT = "$Bin/../../scripts/bp-continuity.pl";
 
@@ -277,6 +278,91 @@ sub marker_path { my ($reg, $sid) = @_; return "$reg/$sid"; }
     is($drc, 1, 'L4: disarm ALSO refuses the dotted id with exit 1, not exit 2 (not_armed)');
     is(kv($dout, 'STATUS'), 'error', 'L5: STATUS: error, distinguishing "invalid id" from '
                                     . '"valid id, simply not armed"');
+}
+
+# ===========================================================================
+# N. fix-batch F3: a session id containing a literal backslash is refused by
+#    arm/disarm alike, matching scripts/statusline.pl's own read-side sid
+#    check. On this Windows/Git-for-Windows host both bash coreutils and this
+#    host's Perl treat '\' inside a path string as a directory separator, so
+#    an unrefused backslash id would resolve NESTED under the registry root
+#    -- permanently invisible to the top-level-only reap sweep (red-team
+#    MEDIUM-1). Proven here at the CLI boundary: no marker of any kind
+#    appears anywhere under the registry, nested or not.
+# ===========================================================================
+{
+    my $reg = new_registry();
+    my ($aout, $arc) = run_cli(
+        ['arm', '--session', 'evilsub\\evilfile', '--by', 'agent'],
+        { CCPRAXIS_CONTINUITY_ACTIVE_DIR => $reg, BP_LEDGER => undef },
+    );
+    is($arc, 1, 'N1 CANONICAL (-> fix-batch F3): arm refuses a session id containing a literal '
+              . 'backslash -- exit 1');
+    is(kv($aout, 'STATUS'), 'error', 'N2: STATUS: error for the backslash id');
+    ok(!-e "$reg/evilsub", 'N3 CANONICAL: no subdirectory was created under the registry at all '
+                         . '-- the id was refused before any filesystem write was attempted, not '
+                         . 'merely refused to CREATE THE PARENT (which would still leave a '
+                         . 'reap-invisible nested marker if a parent happened to pre-exist)');
+
+    my ($dout, $drc) = run_cli(
+        ['disarm', '--session', 'evilsub\\evilfile'],
+        { CCPRAXIS_CONTINUITY_ACTIVE_DIR => $reg },
+    );
+    is($drc, 1, 'N4 CANONICAL: disarm ALSO refuses the backslash id with exit 1 (invalid id), '
+              . 'not exit 2 (not_armed)');
+    is(kv($dout, 'STATUS'), 'error', 'N5: STATUS: error');
+}
+
+# ===========================================================================
+# O. fix-batch F1: with CCPRAXIS_CONTINUITY_ACTIVE_DIR, $HOME AND $USERPROFILE
+#    ALL unset, arm/disarm/status must FAIL LOUDLY (STATUS: error, exit 1)
+#    rather than silently resolve under $PWD or '.' -- the exact divergence
+#    the three components previously had (lib.sh fell back to $PWD,
+#    bp-continuity.pl to $USERPROFILE-then-'.', statusline.pl to '.').
+#    Run from a scratch cwd so a REVERT of this fix (which would silently
+#    write under './.claude/ccpraxis/.continuity-active') cannot pollute
+#    this repo's own working directory.
+# ===========================================================================
+{
+    my $scratch_cwd = tempdir(CLEANUP => 1);
+    my $orig_cwd = Cwd::getcwd();
+    chdir($scratch_cwd) or die "chdir $scratch_cwd: $!";
+    my ($out, $rc) = run_cli(
+        ['arm', '--session', 'sess-o-unresolvable', '--by', 'agent'],
+        { CCPRAXIS_CONTINUITY_ACTIVE_DIR => undef, HOME => undef, USERPROFILE => undef, BP_LEDGER => undef },
+    );
+    chdir($orig_cwd) or die "chdir back to $orig_cwd: $!";
+    is($rc, 1, 'O1 CANONICAL (-> fix-batch F1): arm with CCPRAXIS_CONTINUITY_ACTIVE_DIR, $HOME '
+             . 'AND $USERPROFILE all unset exits 1 -- refuses to guess -- rather than silently '
+             . 'writing under $PWD or \'.\'');
+    is(kv($out, 'STATUS'), 'error', 'O2: STATUS: error');
+    like(kv($out, 'ERROR') // '', qr/HOME|USERPROFILE/,
+       'O3 CANONICAL: the error names the unresolved variables, not a generic message -- proves '
+     . 'this is the path-resolution refusal, not some other unrelated exit-1 path');
+    ok(!-e "$scratch_cwd/.claude", 'O4 CANONICAL: no .claude directory was created under the '
+                                  . 'scratch cwd -- confirms no $PWD-relative fallback happened');
+}
+
+# ===========================================================================
+# P. fix-batch F1 continued: with CCPRAXIS_CONTINUITY_ACTIVE_DIR unset and
+#    $HOME unset but $USERPROFILE set (a fixture tempdir, never the real
+#    user profile), arm resolves under
+#    $USERPROFILE/.claude/ccpraxis/.continuity-active -- proving the
+#    documented fallback ORDER (override, HOME, USERPROFILE) is followed,
+#    not merely that unset-both fails.
+# ===========================================================================
+{
+    my $userprofile = tempdir(CLEANUP => 1);
+    my ($out, $rc) = run_cli(
+        ['arm', '--session', 'sess-p-userprofile', '--by', 'agent'],
+        { CCPRAXIS_CONTINUITY_ACTIVE_DIR => undef, HOME => undef,
+          USERPROFILE => $userprofile, BP_LEDGER => undef },
+    );
+    is($rc, 0, 'P1 CANONICAL (-> fix-batch F1): arm succeeds with only $USERPROFILE set');
+    is(kv($out, 'STATUS'), 'armed', 'P2: STATUS: armed');
+    ok(-f "$userprofile/.claude/ccpraxis/.continuity-active/sess-p-userprofile",
+       'P3 CANONICAL: the marker was written under $USERPROFILE-derived path, matching lib.sh'."'"
+     . 's documented fallback order exactly');
 }
 
 # ===========================================================================

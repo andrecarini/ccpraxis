@@ -359,12 +359,27 @@ $marker .= ' ' while row_cost($marker) < $MARKER_SLOT;
 # a standalone installed payload (no require of anything under plugins/). The
 # three must resolve identically for a given environment; AC-13 pins that
 # parity directly, so drift is caught rather than assumed away.
+#
+# PATH RESOLUTION (fix-batch F1) -- same single rule as lib.sh's
+# bp_continuity_active_dir (see that function's comment for the full
+# rationale): override, else $HOME, else $USERPROFILE, else UNRESOLVABLE.
+# This file is a READ path only (it never writes a marker), so unlike
+# bp-continuity.pl it must never hard-fail the statusline over this --
+# "unresolvable" degrades to "badge renders unarmed", which is truthful
+# rather than a fourth guess: if the directory can never be resolved here,
+# bp-continuity.pl could never have resolved it either (same rule), so it
+# could never have written a live marker for this badge to miss.
 my $sid = $data->{session_id};
 $sid = '' unless defined $sid && !ref($sid) && $sid =~ m{\A[^/\\\0]+\z} && $sid !~ /\.\./;
 my $continuity_dir = $ENV{CCPRAXIS_CONTINUITY_ACTIVE_DIR};
-$continuity_dir = ($ENV{HOME} // '.') . '/.claude/ccpraxis/.continuity-active'
-    unless defined $continuity_dir && length $continuity_dir;
-my $armed = (length $sid && -f "$continuity_dir/$sid") ? 1 : 0;
+if (!defined $continuity_dir || !length $continuity_dir) {
+    my $home = $ENV{HOME};
+    $home = $ENV{USERPROFILE} unless defined $home && length $home;
+    $continuity_dir = (defined $home && length $home)
+        ? "$home/.claude/ccpraxis/.continuity-active"
+        : undef;
+}
+my $armed = (defined $continuity_dir && length $sid && -f "$continuity_dir/$sid") ? 1 : 0;
 
 my $BADGE_SLOT = row_cost('WATCHED');
 my $badge = $armed ? "${OK}WATCHED${R}" : (' ' x $BADGE_SLOT);

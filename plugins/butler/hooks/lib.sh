@@ -468,12 +468,43 @@ bp_drive_marker() {
 # bp_continuity_active_dir -> echoes the machine-level registry of ARMED
 # continuity sessions. One flat dir; primary markers named by session id,
 # companions dot-suffixed (see bp_continuity_marker).
+#
+# ── THE SINGLE PATH-RESOLUTION RULE (fix-batch F1, spec SS2.6/AC-13) ────────
+# Three components resolve this same registry path: this function (bash,
+# gate-continuity.sh's caller), bp-continuity.pl's continuity_active_dir
+# (perl, the arm/disarm/status CLI), and scripts/statusline.pl's own inline
+# copy (perl, standalone, cannot require this file). They previously diverged
+# on what "$HOME is unset" means (`$PWD`, `$USERPROFILE`, and `.`
+# respectively) — three plausible-but-different guesses that could silently
+# disagree about whether a session is watched, which is the worst possible
+# failure for a feature whose entire point is "know that you are being
+# watched". ALL THREE now follow this exact order and must not drift again:
+#   1. CCPRAXIS_CONTINUITY_ACTIVE_DIR, if set and non-empty — wins outright.
+#   2. else $HOME, if set and non-empty.
+#   3. else $USERPROFILE (the Windows fallback), if set and non-empty.
+#   4. else: NO resolvable directory. This function returns 1 with NOTHING
+#      on stdout — it refuses to guess (no $PWD, no '.'). The two WRITE
+#      paths (bp-continuity.pl arm/disarm/status) must fail LOUDLY on this
+#      (STATUS: error, exit 1) rather than silently write/read a marker
+#      under an unpredictable path. The two READ paths that must never hard
+#      -fail a Stop/statusline (this function's callers in
+#      bp_continuity_marker/bp_continuity_any_active, and
+#      scripts/statusline.pl's badge) instead FAIL SAFE: "unresolvable"
+#      means "treat as nothing armed" (gate never blocks; badge never shows
+#      WATCHED). This is not a fourth divergent guess — it is consistent
+#      with rule 4's write-side refusal: if the directory could never be
+#      resolved, arm() could never have written a marker there either, so
+#      there is never a live marker for these fail-safe reads to miss.
 bp_continuity_active_dir() {
   if [ -n "${CCPRAXIS_CONTINUITY_ACTIVE_DIR:-}" ]; then
     printf '%s' "$CCPRAXIS_CONTINUITY_ACTIVE_DIR"
     return 0
   fi
-  printf '%s' "${HOME:-$PWD}/.claude/ccpraxis/.continuity-active"
+  local base="${HOME:-}"
+  [ -n "$base" ] || base="${USERPROFILE:-}"
+  [ -n "$base" ] || return 1
+  printf '%s' "$base/.claude/ccpraxis/.continuity-active"
+  return 0
 }
 
 # bp_continuity_ttl_hours -> the staleness limit, sanitised exactly like
@@ -490,13 +521,23 @@ bp_continuity_ttl_hours() {
 # the id — companions are dot-suffixed off the primary marker's own path, so
 # a dotted session id would be indistinguishable from a companion file by
 # bp_continuity_any_active's own basename-has-no-dot sweep discrimination.
+# PLUS (fix-batch F3): a literal '\' anywhere in the id. On this project's
+# Windows/Git-for-Windows host, both bash coreutils and this host's Perl
+# treat '\' inside a path string as a directory separator, not a literal
+# character — an id like 'evilsub\evilfile' resolves ONE LEVEL NESTED under
+# the registry root, which bp_continuity_any_active's top-level-only `"$dir"/*`
+# sweep never descends into: a marker placed that way would be PERMANENTLY
+# INVISIBLE to the owner-independent reap, exactly the "arming is bounded"
+# guarantee (done-criterion 2) this package exists to provide. Matches
+# scripts/statusline.pl's own read-side sid check, which already excluded
+# '\' for the same reason (red-team MEDIUM-1).
 bp_continuity_marker() {
   local sid="${1:-}" dir
   [ -n "$sid" ] || return 1
   case "$sid" in
-    */*|*\*|.|..|*..*|*.*) return 1 ;;
+    */*|*\\*|*\**|.|..|*..*|*.*) return 1 ;;
   esac
-  dir=$(bp_continuity_active_dir)
+  dir=$(bp_continuity_active_dir) || return 1
   printf '%s/%s' "$dir" "$sid"
   return 0
 }
@@ -513,7 +554,7 @@ bp_continuity_marker() {
 # directory on every caller's behalf, unconditionally, is what closes it.
 bp_continuity_any_active() {
   local dir now ttl mt f base live=1
-  dir=$(bp_continuity_active_dir)
+  dir=$(bp_continuity_active_dir) || return 1
   [ -d "$dir" ] || return 1
 
   now=$(date +%s 2>/dev/null || echo 0)

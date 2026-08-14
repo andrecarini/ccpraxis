@@ -17,6 +17,20 @@
 # and reads BP_LEDGER in exactly one place, below, as a top-of-file
 # short-circuit — never as a branching signal for block/allow.
 #
+# WHY THERE IS NO bp_hook_gate CALL HERE (fix-batch F2) — this is DELIBERATE,
+# not an omission to "fix" by adding one. Every butler hook begins with
+# bp_hook_gate, which requires BP_LEDGER — exported only into coordinator
+# processes (see gate-drive-loop.sh's own header for the identical argument
+# one level down, for the driver). This gate exists PRECISELY for the
+# opposite case: a session with NO blueprint, NO drive-solo, NO reporter —
+# i.e. one bp_hook_gate would refuse outright. Adding a bp_hook_gate call
+# here would make this file live ONLY inside a coordinator process, which is
+# the one class of session that arm already refuses to watch (cmd_arm's
+# BP_LEDGER check, and the defense-in-depth BP_LEDGER check a few lines
+# below) — i.e. it would silently disable this entire package for every
+# session it was built to cover, while still compiling, still registered,
+# still "correct" by every check that doesn't actually invoke it live.
+#
 # POSTURE: FAIL OPEN, ALWAYS BOUNDED — same discipline as gate-drive-loop.sh.
 # `source lib.sh 2>/dev/null || exit 0`: a Stop gate cannot function at all
 # without the registry helpers, so failing open explicitly here is correct.

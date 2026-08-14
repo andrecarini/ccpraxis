@@ -261,4 +261,67 @@ sub mkdir_p_test {
     File::Path::make_path($path);
 }
 
+# ===========================================================================
+# H. fix-batch F1: registry path resolution follows the SAME single rule as
+#    lib.sh's bp_continuity_active_dir and bp-continuity.pl's
+#    continuity_active_dir -- override, else $HOME, else $USERPROFILE. (a)
+#    $HOME unset but $USERPROFILE set (a fixture tempdir, never the real
+#    user profile) resolves under $USERPROFILE.
+# ===========================================================================
+{
+    my $userprofile = tempdir(CLEANUP => 1);
+    my $default_dir = "$userprofile/.claude/ccpraxis/.continuity-active";
+    mkdir_p_test($default_dir);
+    plant_marker($default_dir, 'sess-h-userprofile');
+
+    my ($infh, $inpath) = tempfile(DIR => $TMPROOT);
+    binmode $infh, ':raw';
+    print {$infh} encode_json(payload_for(session_id => 'sess-h-userprofile'));
+    close $infh;
+
+    local %ENV = %ENV;
+    $ENV{PATH} = "$SHIM_DIR:$ENV{PATH}";
+    delete $ENV{HOME};
+    $ENV{USERPROFILE} = $userprofile;
+    delete $ENV{CCPRAXIS_CONTINUITY_ACTIVE_DIR};
+    my $out = `timeout 20 perl "$STATUSLINE" < "$inpath" 2>/dev/null`;
+    my $rc  = $? >> 8;
+    is($rc, 0, 'H1 setup: exits 0 with $HOME unset, $USERPROFILE set');
+    ok(index($out, 'WATCHED') >= 0,
+       'H2 CANONICAL (-> fix-batch F1): with $HOME unset and $USERPROFILE pointed at a fixture, '
+     . 'the badge renders from a marker under $USERPROFILE/.claude/ccpraxis/.continuity-active '
+     . '-- matches lib.sh'."'".'s and bp-continuity.pl'."'".'s documented fallback order '
+     . 'exactly, closing the three-way divergence fix-batch F1 was filed to fix');
+}
+
+# ===========================================================================
+# I. fix-batch F1 continued: (b) NEITHER $HOME NOR $USERPROFILE set (and no
+#    override) -- the badge must degrade SAFELY to "not armed" (no WATCHED,
+#    no crash, exit 0), never guess '.' (the pre-fix behavior) and never die.
+#    This is the READ-side half of F1's rule: an unresolvable directory here
+#    is truthful, because bp-continuity.pl could never have written a marker
+#    under an unresolvable path either (it fails loudly instead).
+# ===========================================================================
+{
+    my ($infh, $inpath) = tempfile(DIR => $TMPROOT);
+    binmode $infh, ':raw';
+    print {$infh} encode_json(payload_for(session_id => 'sess-i-unresolvable'));
+    close $infh;
+
+    local %ENV = %ENV;
+    $ENV{PATH} = "$SHIM_DIR:$ENV{PATH}";
+    delete $ENV{HOME};
+    delete $ENV{USERPROFILE};
+    delete $ENV{CCPRAXIS_CONTINUITY_ACTIVE_DIR};
+    my $out = `timeout 20 perl "$STATUSLINE" < "$inpath" 2>/dev/null`;
+    my $rc  = $? >> 8;
+    is($rc, 0, 'I1 CANONICAL (-> fix-batch F1): statusline.pl does not crash when '
+             . 'CCPRAXIS_CONTINUITY_ACTIVE_DIR, $HOME and $USERPROFILE are all unset');
+    ok(index($out, 'WATCHED') < 0,
+       'I2 CANONICAL: badge renders unarmed (no WATCHED) rather than guessing \'.\' as a '
+     . 'registry root -- the pre-fix fallback');
+    my @rows = grep { length } split /\n/, $out;
+    ok(scalar(@rows) >= 2, 'I3: still renders both rows -- no crash, no reflow');
+}
+
 done_testing();

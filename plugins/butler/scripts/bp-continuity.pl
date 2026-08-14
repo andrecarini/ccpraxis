@@ -21,6 +21,17 @@
 # duplicated from lib.sh's bp_continuity_active_dir on purpose (this script
 # imports nothing bash-side) — the two resolutions must agree; see
 # scripts/statusline.pl's own duplicate for the third leg of that parity.
+#
+# PATH RESOLUTION — see lib.sh's bp_continuity_active_dir for the single rule
+# all three components follow (fix-batch F1): override, else $HOME, else
+# $USERPROFILE, else UNRESOLVABLE. Because THIS script is the write path
+# (arm/disarm/status all mutate or authoritatively read the registry), an
+# unresolvable directory here FAILS LOUDLY (STATUS: error, exit 1) rather
+# than guessing — see resolve_registry_dir_or_die() below. That is what makes
+# the gate's and the badge's own "unresolvable => treat as nothing armed"
+# fail-safe behavior correct rather than a fourth divergent guess: if this
+# script could never resolve a directory, it could never have written a
+# marker there either.
 use strict;
 use warnings;
 use POSIX qw(strftime);
@@ -57,14 +68,14 @@ sub cmd_arm {
         exit 1;
     }
 
-    my $mark = continuity_marker($sid);
+    my $dir = resolve_registry_dir_or_die();
+    my $mark = continuity_marker($sid, $dir);
     unless (defined $mark) {
         emit('STATUS', 'error');
         emit('ERROR',  "invalid session id: $sid");
         exit 1;
     }
 
-    my $dir = continuity_active_dir();
     make_path($dir) unless -d $dir;
     my $since = iso_now();
     open my $fh, '>', $mark or do {
@@ -91,7 +102,8 @@ sub cmd_disarm {
     my $opts = parse_args(qw(session));
     my $sid = resolve_session($opts) or return;
 
-    my $mark = continuity_marker($sid);
+    my $dir = resolve_registry_dir_or_die();
+    my $mark = continuity_marker($sid, $dir);
     unless (defined $mark) {
         emit('STATUS', 'error');
         emit('ERROR',  "invalid session id: $sid");
@@ -104,10 +116,28 @@ sub cmd_disarm {
         exit 2;
     }
 
+    # fix-batch F4: a false "disarmed" is the exact mirror of a false
+    # "armed" -- both lie about whether the session is watched. Verify the
+    # PRIMARY marker is actually gone (re-stat rather than trust unlink's
+    # return value alone, since the goal is "is it still enforceable", not
+    # "did the syscall report success") before ever claiming disarmed.
+    # Companion files are best-effort cleanup: their survival cannot cause
+    # gate-continuity.sh to re-block (it only blocks off the PRIMARY
+    # marker's presence), so a companion unlink failure does not change the
+    # STATUS this command reports.
     unlink $mark;
     unlink "$mark.wakeup-pending";
     unlink "$mark.stop-blocks";
     unlink "$mark.stop-ok";
+
+    if (-f $mark) {
+        emit('STATUS',  'error');
+        emit('SESSION', $sid);
+        emit('ERROR',   "primary marker $mark still exists after unlink (permission or lock?) "
+                       . "-- refusing to report disarmed while continuity enforcement may still "
+                       . "be in force");
+        exit 1;
+    }
 
     emit('STATUS',  'disarmed');
     emit('SESSION', $sid);
@@ -117,7 +147,8 @@ sub cmd_status {
     my $opts = parse_args(qw(session));
     my $sid = resolve_session($opts) or return;
 
-    my $mark = continuity_marker($sid);
+    my $dir = resolve_registry_dir_or_die();
+    my $mark = continuity_marker($sid, $dir);
     unless (defined $mark) {
         emit('STATUS', 'error');
         emit('ERROR',  "invalid session id: $sid");
@@ -170,24 +201,52 @@ sub resolve_session {
     return $sid;
 }
 
-# continuity_active_dir() -> the registry dir, duplicated from lib.sh's
-# bp_continuity_active_dir. Must resolve identically for a given environment
-# (spec SS2.6/AC-13).
+# continuity_active_dir() -> the registry dir, or undef if UNRESOLVABLE.
+# Duplicated from lib.sh's bp_continuity_active_dir on purpose; must resolve
+# IDENTICALLY for a given environment (spec SS2.6/AC-13; fix-batch F1's
+# single rule, documented in full at lib.sh's bp_continuity_active_dir):
+# override, else $HOME, else $USERPROFILE, else undef. Does NOT guess $PWD
+# or '.' -- see resolve_registry_dir_or_die(), the only caller, which is
+# where the "fail loudly" half of F1's rule actually lives.
 sub continuity_active_dir {
     return $ENV{CCPRAXIS_CONTINUITY_ACTIVE_DIR}
         if defined $ENV{CCPRAXIS_CONTINUITY_ACTIVE_DIR} && length $ENV{CCPRAXIS_CONTINUITY_ACTIVE_DIR};
-    my $home = $ENV{HOME} // $ENV{USERPROFILE} // '.';
+    my $home = $ENV{HOME};
+    $home = $ENV{USERPROFILE} unless defined $home && length $home;
+    return undef unless defined $home && length $home;
     return "$home/.claude/ccpraxis/.continuity-active";
 }
 
-# continuity_marker($sid) -> marker path, or undef for an invalid id.
-# Mirrors bp_continuity_marker's refusals exactly: a path separator, a glob
-# metacharacter, or a literal '.' anywhere in the id.
-sub continuity_marker {
-    my ($sid) = @_;
-    return undef unless defined $sid && length $sid;
-    return undef if $sid =~ m{[/*.]};
+# resolve_registry_dir_or_die() -> the registry dir, or exits 1 with
+# STATUS: error if UNRESOLVABLE (fix-batch F1). This script is the WRITE
+# path (arm mutates the registry; disarm/status are its authoritative
+# reads), so an unresolvable directory here must never silently fall back
+# to $PWD or '.' -- that is exactly how the gate and the badge would end up
+# looking in a different place than arm just wrote to.
+sub resolve_registry_dir_or_die {
     my $dir = continuity_active_dir();
+    unless (defined $dir) {
+        emit('STATUS', 'error');
+        emit('ERROR',  'cannot resolve continuity registry directory: neither $HOME nor '
+                      . '$USERPROFILE is set, and CCPRAXIS_CONTINUITY_ACTIVE_DIR is not set '
+                      . 'either -- refusing to guess a location (e.g. $PWD or \'.\') that the '
+                      . 'gate and the statusline badge would not agree with');
+        exit 1;
+    }
+    return $dir;
+}
+
+# continuity_marker($sid, $dir) -> marker path, or undef for an invalid id.
+# Mirrors bp_continuity_marker's refusals exactly: a path separator, a
+# backslash (fix-batch F3 -- see lib.sh's bp_continuity_marker for why),
+# a glob metacharacter, or a literal '.' anywhere in the id. Takes $dir
+# explicitly (rather than re-resolving) so callers control whether/how an
+# unresolvable directory is reported -- see resolve_registry_dir_or_die().
+sub continuity_marker {
+    my ($sid, $dir) = @_;
+    return undef unless defined $sid && length $sid;
+    return undef if $sid =~ m{[/\\*.\x00]};
+    return undef unless defined $dir;
     return "$dir/$sid";
 }
 
