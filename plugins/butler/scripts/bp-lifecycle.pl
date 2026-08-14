@@ -443,14 +443,34 @@ sub reconcile_one {
                 my $entry = $reg->{packages}{$pkg};
                 next unless ref $entry eq 'HASH';
                 next unless exists $by_pkg{$pkg};
-                my $have = norm_status($entry->{status});
-                next if $have eq $by_pkg{$pkg};
-                push @drift, "$pkg ($have -> $by_pkg{$pkg})";
-                $entry->{status} = $by_pkg{$pkg} unless $opt->{dry_run};
-                # A terminal package holds no process. Leaving a pid behind
-                # makes `bp-status.sh` draw a dead run as having live
-                # coordinators the moment that pid is reused.
-                delete $entry->{pid} if !$opt->{dry_run} && $TERMINAL{ $by_pkg{$pkg} };
+                my $ledger_status = $by_pkg{$pkg};
+
+                # s02 (runs/registry.json is runtime-only): an in-scope writer
+                # never sets `status` on an entry anymore, so an ABSENT key is
+                # the new normal, not drift -- there is nothing to compare, and
+                # writing one back in would resurrect exactly the copy that
+                # package existed to remove. Only a key that is genuinely
+                # PRESENT (a pre-s02 registry, or one of the still-outstanding
+                # out-of-write-set writers) is a value that can disagree with
+                # the ledger and be worth repairing.
+                if (exists $entry->{status}) {
+                    my $have = norm_status($entry->{status});
+                    if ($have ne $ledger_status) {
+                        push @drift, "$pkg ($have -> $ledger_status)";
+                        $entry->{status} = $ledger_status unless $opt->{dry_run};
+                    }
+                }
+
+                # A terminal package holds no process -- independent of
+                # whether its entry carries a status key at all (post-s02,
+                # most do not). Leaving a pid behind makes `bp-status.sh`
+                # draw a dead run as having live coordinators the moment
+                # that pid is reused, so this still fires on its own.
+                if (!$opt->{dry_run} && $TERMINAL{$ledger_status} && exists $entry->{pid}) {
+                    delete $entry->{pid};
+                    push @drift, "$pkg (pid cleared)"
+                        unless grep { /^\Q$pkg\E \(/ } @drift;
+                }
             }
             if (@drift) {
                 my $detail = scalar(@drift) . ' package(s): ' . join(', ', @drift);

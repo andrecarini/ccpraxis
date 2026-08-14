@@ -164,8 +164,15 @@ my @ALLOWLIST = (
       pattern => qr/status:"running"/ },
     { label => 'gate-stop.sh:~150 (best-effort status sync, jq {status:$st})', path => $GATESTOP_PATH,
       pattern => qr/\{status:\$st\}/ },
-    { label => 'bp-lifecycle.pl:449 (reconcile_one drift repair, $entry->{status} = ...)', path => $LIFECYCLE_PATH,
-      pattern => qr/\$entry->\{status\}\s*=\s*\$by_pkg\{\$pkg\}/ },
+    # PATTERN UPDATED by fix-batch F1 (redteam-step6.md HIGH finding): the
+    # drift-repair still writes $entry->{status} for an entry that ALREADY
+    # carries a status key and disagrees with the ledger -- that write is
+    # still genuinely outside this write set and unfixed (the gap this entry
+    # certifies). What F1 fixed is a DIFFERENT bug: the repair used to also
+    # RESURRECT a status key onto an entry that had none at all (the post-s02
+    # normal shape), which is covered by section 11 below, not this allowlist.
+    { label => 'bp-lifecycle.pl (reconcile_one drift repair, $entry->{status} = $ledger_status, still present-key-only)', path => $LIFECYCLE_PATH,
+      pattern => qr/\$entry->\{status\}\s*=\s*\$ledger_status/ },
     { label => 'bp-answer-decision.pl:706 (status => $plan->{ledger_status})', path => $ANSWER_PATH,
       pattern => qr/status\s*=>\s*\$plan->\{ledger_status\}/ },
     # REMOVED 2026-08-14 by driver adjudication. This entry pinned
@@ -554,6 +561,160 @@ sub write_registry_raw {
         pass('DC6/behavior1 (_block_and_queue): no registry.json at all -- the strongest form of '
            . '"no status key", since the deleted :4484 write was this call path'."'".'s only registry touch');
     }
+}
+
+# ===========================================================================
+# 11. FIX-BATCH F1: bp-lifecycle.pl's registry-drift repair (reconcile_one,
+#     an allowlisted out-of-write-set writer -- section 3 above) must NOT
+#     treat a post-s02 entry with NO `status` key as drift. An absent key is
+#     the new normal; resurrecting it on every reconcile would silently undo
+#     this whole package's deliverable the moment a run ends (bp-orchestrator
+#     itself calls `bp-lifecycle.pl reconcile` unconditionally at the end of
+#     every run, and bp-status.sh triggers it too). This EXERCISES the real
+#     reconcile path end-to-end (a subprocess, real files) rather than
+#     asserting on source text, because the defect is a runtime behavior that
+#     looks fine from a source scan.
+# ===========================================================================
+{
+    my $root = tempdir(CLEANUP => 1);
+    my $bp   = 'reg-runtime-only';
+    my $dir  = "$root/blueprints/$bp";
+    make_path("$dir/packages");
+    make_path("$dir/runs");
+
+    # blueprint.md: fenced metadata block (NOT frontmatter) + package table,
+    # matching bp-lifecycle.pl's own expected shapes (see t/97-lifecycle-
+    # reconcile.t's blueprint_md/make_blueprint helpers, ported minimally).
+    write_file("$dir/blueprint.md", <<"MD");
+# Test Blueprint
+
+```
+blueprint: $bp
+created: 2026-01-01
+last_updated: 2026-01-01T00:00Z
+status: running        # drafting | audited | running | done | archived
+```
+
+## Objective
+
+Test fixture.
+
+## Package status
+
+| pkg | deliverable | depends_on | model | status |
+|-----|-------------|------------|-------|--------|
+| p1 | thing | — | sonnet | done |
+
+## Harvest log
+
+## Incidents
+MD
+
+    write_file("$dir/packages/p1.md", <<"MD");
+---
+package: p1
+blueprint: $bp
+status: done
+last_updated: 2026-01-01T00:00Z
+---
+
+# Package p1
+
+## Next action
+
+None.
+MD
+
+    # Post-s02 registry shape: update_registry_pkg's corrected field sets
+    # never include `status` -- this is what a terminal package's entry
+    # actually looks like on disk today, not a hypothetical.
+    write_file("$dir/runs/registry.json",
+        $J->encode({ packages => { p1 => { attempt => 1, pid => 12345, model => 'sonnet' } } }));
+
+    my ($tfh, $tmp) = File::Temp::tempfile();
+    close $tfh;
+    open(my $saved, '>&', \*STDOUT) or die "dup: $!";
+    open(STDOUT, '>', $tmp) or die "redirect: $!";
+    my $rc = system($^X, $LIFECYCLE_PATH, 'reconcile', '--blueprint', $bp,
+                     '--data-dir', $root, '--no-archive');
+    open(STDOUT, '>&', $saved);
+    close $saved;
+    unlink $tmp;
+    $rc >>= 8;
+
+    is($rc, 0, 'F1: bp-lifecycle.pl reconcile exits 0 against a post-s02 (statusless) registry entry');
+    my $reg_after = $J->decode(slurp("$dir/runs/registry.json"));
+    ok(!exists $reg_after->{packages}{p1}{status},
+       'F1: reconcile does NOT resurrect a status key onto an entry that never had one -- '
+     . 'absent is the new normal, not drift (this is the exact reconcile-path exercise, not a source-text check)');
+    is($reg_after->{packages}{p1}{attempt}, 1,
+       'F1: unrelated fields survive reconcile untouched');
+    ok(!exists $reg_after->{packages}{p1}{pid},
+       'F1: a terminal package still loses its pid on reconcile even with no status key -- '
+     . 'that guard (bp-status.sh must never redraw a dead run as live via a recycled pid) is preserved independently of status');
+}
+
+# ===========================================================================
+# 12. FIX-BATCH F2: an unparseable/corrupted ledger for an ALREADY-LAUNCHED
+#     (dead) package must not become relaunch-eligible. Before this fix,
+#     _load_state resolved such a package's status to 'pending' (Decision 13
+#     removed the registry as a last-resort source), which the watchdog's
+#     dead-coordinator branch cannot distinguish from a fresh, never-
+#     attempted 'pending' package -- so it would relaunch it. This EXERCISES
+#     the real run() watchdog path end-to-end (redteam-step6.md's
+#     probe1-fallback.pl scenario, ported into the immutable suite), not a
+#     source scan.
+# ===========================================================================
+{
+    my $root  = tempdir(CLEANUP => 1);
+    my $bpdir = "$root/bp-f2";
+    make_path("$bpdir/packages");
+    make_path("$bpdir/runs");
+    write_file("$bpdir/blueprint.md", blueprint_md_for('stuckpkg'));
+
+    # A ledger file that EXISTS but has NO frontmatter at all -- the shape an
+    # unresolved git merge conflict or a hand-edit gone wrong leaves behind.
+    # ledger_fm returns undef for this, exactly like a missing file.
+    write_file("$bpdir/packages/stuckpkg.md",
+        "<<<<<<< HEAD\nsome garbage, not frontmatter\n=======\n>>>>>>> branch\n");
+
+    # A dead coordinator's registry footprint: attempt burned, a pid that
+    # cannot possibly be alive (same sentinel t/97-lifecycle-reconcile.t
+    # uses: above the default Linux pid_max, not a live Windows pid either).
+    write_registry_raw($bpdir, { packages => { stuckpkg => { attempt => 2, pid => 4194304 } } });
+
+    write_file("$bpdir/creds.json", $J->encode({ claudeAiOauth => {
+        accessToken => 'sk-ant-F2-aaaaaaaaaaaaaaaaaaaa', refreshToken => 'sk-ant-F2REF-bbbbbbbbbbbbbbbb',
+        expiresAt => (time + 5*3600) * 1000, scopes => ['user:inference'],
+        subscriptionType => 'max', rateLimitTier => 'x' } }));
+    my $usage_ok = $J->encode({ five_hour=>{utilization=>10, resets_at=>'2099-01-01T00:00:00+00:00'},
+                                 seven_day=>{utilization=>5,  resets_at=>'2099-01-01T00:00:00+00:00'} });
+    my $NOW = time;
+    my $tunables = { ceil5=>85, ceil7=>90, drain=>600, max_par=>4, cap=>5, flat=>600, watch_tick=>0,
+                      keeper_int=>600, keeper_bo=>120, thresh_min=>60, jit_lo=>0, jit_hi=>0,
+                      tele_retry=>3, usage_fail=>60, busy_path=>"$root/busy-f2" };
+    my @launched;
+    my $launch = sub { my ($a) = @_; push @launched, $a->{pkg}; return 0; };
+    my %run_opts = (
+        blueprint => 'T-F2', bp_dir => $bpdir, creds_path => "$bpdir/creds.json",
+        tunables => $tunables, once => 1, now => sub { $NOW }, sleep => sub { },
+        http_get  => sub { { status => 200, content => $usage_ok } },
+        http_post => sub { { status => 200, content => '{}' } },
+        launch    => $launch,
+    );
+
+    BpOrch::run({ %run_opts });
+
+    ok(!(grep { $_ eq 'stuckpkg' } @launched),
+       'F2: a dead coordinator whose ledger will not parse is NEVER relaunched -- '
+     . '"unknown" (unparseable) must not resolve to a relaunch-eligible "pending"');
+
+    # Pure-function corroboration: _load_state itself flags this correctly.
+    my ($meta2, $status2) = BpOrch::_load_state($bpdir, "$bpdir/runs");
+    is($status2->{stuckpkg}, 'pending',
+       'F2: _load_state still resolves the unparseable ledger to \'pending\' as TEXT (unchanged -- DC5 non-regression)');
+    is($meta2->{stuckpkg}{ledger_missing}, 1,
+       'F2: but its meta now carries ledger_missing=>1, distinguishing it from a genuinely fresh pending package -- this is what makes it non-relaunchable');
 }
 
 done_testing();

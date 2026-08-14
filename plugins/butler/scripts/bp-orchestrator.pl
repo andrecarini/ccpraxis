@@ -2191,8 +2191,26 @@ sub _load_state {
     my $reg = read_registry($runs);
     my (%meta, %status, %att, %pid, %sid);
     for my $pkg (keys %$dag) {
-        $status{$pkg} = ledger_fm($bpdir, $pkg, 'status') // 'pending';
-        $meta{$pkg}   = { deps => $dag->{$pkg}, write_set => (ledger_fm($bpdir, $pkg, 'write_set') // ''), priority => ledger_fm($bpdir, $pkg, 'priority'), requires_clean_tree => ledger_fm($bpdir, $pkg, 'requires_clean_tree'), ledger_missing => (-f "$bpdir/packages/$pkg.md" ? 0 : 1) };
+        my $raw_status = ledger_fm($bpdir, $pkg, 'status');
+        $status{$pkg} = $raw_status // 'pending';
+        # fix-batch F2 (redteam-step6 MEDIUM): a ledger file that EXISTS but
+        # whose frontmatter will not parse (unresolved merge conflict, a
+        # hand-edit gone wrong, a write that died mid-fsync) makes ledger_fm
+        # return undef exactly like a genuinely missing file -- and Decision
+        # 13 (s02) removed the registry as a last-resort status source for
+        # this case, so $status{$pkg} above resolves to the same 'pending' an
+        # ordinary never-launched package gets. Left alone that is an "unknown
+        # ledger" masquerading as "pending", which is relaunch-eligible --
+        # exactly the residual risk the s02 §8.2 amendment named and left
+        # unmitigated. Folding this into the ALREADY-EXISTING ledger_missing
+        # hold (rather than inventing a parallel state) reuses the mechanism
+        # that already: (a) excludes the package from ready_packages' launch
+        # candidates (:381), (b) excludes it from dag_stall's readiness
+        # accounting (:596), and (c) files an operator-visible needs-you
+        # escalation every tick until the ledger is repaired (:2420-2452) --
+        # so "unknown" is held, not silently treated as "pending".
+        my $file_exists = -f "$bpdir/packages/$pkg.md" ? 1 : 0;
+        $meta{$pkg}   = { deps => $dag->{$pkg}, write_set => (ledger_fm($bpdir, $pkg, 'write_set') // ''), priority => ledger_fm($bpdir, $pkg, 'priority'), requires_clean_tree => ledger_fm($bpdir, $pkg, 'requires_clean_tree'), ledger_missing => (!$file_exists || !defined $raw_status) ? 1 : 0 };
         $att{$pkg}    = $reg->{$pkg}{attempt} // 0;
         $pid{$pkg}    = $reg->{$pkg}{pid};
         $sid{$pkg}    = $reg->{$pkg}{session_id};
@@ -3462,6 +3480,20 @@ sub run {
                     }
                 } else {
                     next if $shutdown;          # don't relaunch during a graceful-shutdown-all
+                    if ($meta->{$pkg}{ledger_missing}) {
+                        # fix-batch F2: a DEAD coordinator whose ledger is now
+                        # missing or unparseable must not be assessed for a
+                        # fresh relaunch -- _load_state resolved its status to
+                        # 'pending' only because Decision 13 removed the
+                        # registry as a last-resort source, not because the
+                        # package is genuinely a fresh, never-attempted
+                        # 'pending' package. Held here exactly like a
+                        # never-launched ledger_missing package (the per-tick
+                        # awaiting_ledger/needs-you escalation above already
+                        # covers this pkg every tick); it becomes relaunch-
+                        # eligible again the moment the ledger reads cleanly.
+                        next;
+                    }
                     # A coordinator that exhausted its turn budget exits 1 exactly
                     # like a crash — only its TERMINAL jsonl event tells them apart.
                     # Classify first so a productive package is continued with a
@@ -4458,10 +4490,11 @@ sub _block_and_queue {
     # it exists to remove. Left positional, unconverted, flagged for the
     # driver to resolve (test update vs. signature change) outside this pass.
     my ($bpdir, $runs, $log, $bp, $pkg, $why, $now, $question, $kind, $category) = @_;
-    # e02 §2.3: checked BEFORE _set_ledger_status/update_registry_pkg -- a bad
-    # category must not leave a package marked 'blocked' in ledger/registry
-    # with no decision filed (the exact Pattern-1 "detected but undelivered"
-    # shape this whole track exists to close).
+    # e02 §2.3: checked BEFORE _set_ledger_status -- a bad category must not
+    # leave a package marked 'blocked' in the ledger with no decision filed
+    # (the exact Pattern-1 "detected but undelivered" shape this whole track
+    # exists to close). No registry mirror to worry about anymore either way:
+    # s02 removed the registry status write this function used to also make.
     return 0 unless _require_category($category, {
         log => $log, site => '_block_and_queue',
         kind => ($kind // 'stuck-package'), package => $pkg,
