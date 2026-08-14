@@ -2191,7 +2191,7 @@ sub _load_state {
     my $reg = read_registry($runs);
     my (%meta, %status, %att, %pid, %sid);
     for my $pkg (keys %$dag) {
-        $status{$pkg} = ledger_fm($bpdir, $pkg, 'status') // ($reg->{$pkg}{status} // 'pending');
+        $status{$pkg} = ledger_fm($bpdir, $pkg, 'status') // 'pending';
         $meta{$pkg}   = { deps => $dag->{$pkg}, write_set => (ledger_fm($bpdir, $pkg, 'write_set') // ''), priority => ledger_fm($bpdir, $pkg, 'priority'), requires_clean_tree => ledger_fm($bpdir, $pkg, 'requires_clean_tree'), ledger_missing => (-f "$bpdir/packages/$pkg.md" ? 0 : 1) };
         $att{$pkg}    = $reg->{$pkg}{attempt} // 0;
         $pid{$pkg}    = $reg->{$pkg}{pid};
@@ -2785,7 +2785,7 @@ sub run {
                     _log($log, 'ledger_status_lost', { package => $pkg, target => 'pending',
                           reason => ($BpWrite::LAST_RESULT && $BpWrite::LAST_RESULT->{reason}) || '?' })
                         unless _set_ledger_status($bpdir, $pkg, 'pending', { log => $log });
-                    update_registry_pkg($runs, $pkg, { attempt => 0, status => 'pending' });
+                    update_registry_pkg($runs, $pkg, { attempt => 0 });
                     $status->{$pkg} = 'pending'; $att->{$pkg} = 0; $pid->{$pkg} = undef;
                 } else {
                     my $q = ($r->{needs_you} && $r->{needs_you}{question})
@@ -3159,7 +3159,7 @@ sub run {
                         _log($log, 'ledger_status_lost', { package => $pkg, target => 'pending',
                               reason => ($BpWrite::LAST_RESULT && $BpWrite::LAST_RESULT->{reason}) || '?' })
                             unless _set_ledger_status($bpdir, $pkg, 'pending', { log => $log });
-                        update_registry_pkg($runs, $pkg, { attempt => 0, status => 'pending', harvest => '', corrective_attempts => $corr + 1,
+                        update_registry_pkg($runs, $pkg, { attempt => 0, harvest => '', corrective_attempts => $corr + 1,
                             harvest_defer_blockers => '' });   # a corrective cycle must not carry a stale blocker list forward
                         $status->{$pkg} = 'pending'; $att->{$pkg} = 0; $pid->{$pkg} = undef;
                         $reg->{$pkg}{harvest} = '';   # mirror the disk clear in-memory (M2)
@@ -4478,10 +4478,11 @@ sub _block_and_queue {
     _log($log, 'block_ledger_write_lost', { package => $pkg,
           reason => ($BpWrite::LAST_RESULT && $BpWrite::LAST_RESULT->{reason}) || '?' })
         unless $ledger_ok;
-    # Also persist to the registry (H3): _load_state prefers the ledger, but if the
-    # ledger write above failed, the registry is the fallback — without this a parked
-    # package could re-enter the watchdog and re-escalate after an orchestrator restart.
-    update_registry_pkg($runs, $pkg, { status => 'blocked' });
+    # No registry write here (s02, Decision 12/13): _load_state no longer has a
+    # registry-status fallback, so a registry write at this call site would have
+    # zero readers, anywhere, ever -- a copy that is written and can never be read.
+    # The safety net for a lost ledger write is block_ledger_write_lost's
+    # unconditional log above, plus the forced needs_you delivery immediately below.
     # `force => 1` when the ledger write above was lost: this call IS the human's
     # only notification that the package is blocked, and it must never be silenced
     # by a gate reading a ledger that this very function just failed to update --

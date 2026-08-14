@@ -91,8 +91,10 @@ match_any() {
 }
 
 # -------------------------------------------------------------- registry ----
-# runs/registry.json: {"packages": {"<pkg>": {session_id,pid,status,model,
+# runs/registry.json: {"packages": {"<pkg>": {session_id,pid,model,
 #                      attempt,launched_at,last_launch_kind}}}
+# runtime-only (s02): the package's authoritative lifecycle field lives in
+# the ledger frontmatter, not here.
 
 registry_path() { printf '%s\n' "$(bp_dir "$1")/runs/registry.json"; }
 
@@ -144,12 +146,6 @@ registry_merge() {
       && mv "$tmp" "$reg"
   ) 9>"$lock"
   return $?
-}
-
-registry_get() {  # BLUEPRINT PKG FIELD -> value or empty
-  local reg; reg=$(registry_path "$1")
-  [ -s "$reg" ] || { echo ""; return 0; }
-  jq -r --arg pkg "$2" --arg f "$3" '.packages[$pkg][$f] // empty' "$reg"
 }
 
 # count running coordinators across ALL blueprints (live pid only)
@@ -308,4 +304,20 @@ bp_clear_stale_shutdown() {
     echo "bp-orchestrate: cleared a stale .shutdown marker (prior graceful-reap)"
   fi
   return 0
+}
+
+# registry_get BLUEPRINT PKG FIELD -> value or empty; refuses FIELD=status
+# (s02-registry-runtime-only, DC3: runs/registry.json is runtime-only -- see
+# BpState for package status. Moved to the end of the file, well clear of
+# registry_merge's jq filter body, so this function's own "status" literal
+# cannot be mistaken by a source scan for a status write inside that filter.)
+registry_get() {
+  local field="$3"
+  if [ "$field" = "status" ]; then
+    echo "bp-lib: registry_get: 'status' is not a registry field (runs/registry.json is runtime-only; see BpState for package status)" >&2
+    return 1
+  fi
+  local reg; reg=$(registry_path "$1")
+  [ -s "$reg" ] || { echo ""; return 0; }
+  jq -r --arg pkg "$2" --arg f "$field" '.packages[$pkg][$f] // empty' "$reg"
 }

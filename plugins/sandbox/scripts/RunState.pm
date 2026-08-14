@@ -224,23 +224,19 @@ sub _ledger_status {
 #
 # S2.5 + 04-run-panel-ledger-truth consolidated fix-batch (HIGH-2 governing
 # rule): the ledger's normalised status wins whenever it is non-empty.
-# Otherwise, the registry entry's 'status' field is used -- but ONLY when
-# $ledger_present is false, i.e. the package has NO ledger file at all.
-# When $ledger_present is true and the ledger yielded no status ('' -- over-
-# cap, CRLF, BOM, malformed, no status: line, whatever the cause), the
-# package is honestly '' (neither done nor running) -- the registry is NEVER
-# consulted for a package whose ledger file EXISTS but failed to parse. This
-# is the fix for the reported "77/79" and "0/3" defects: a bound (or a byte-
-# exact frontmatter check) becoming a fabrication via a silent fall-through
-# to stale registry data. Under-reporting is honest; adopting a
-# contradicting registry value is not.
+# s02-registry-runtime-only (Decision 13, binding, not optional): the
+# registry's 'status' field is never consulted, present or absent, ledger
+# file present or not -- butler no longer writes it, so a legacy/stale copy
+# on disk must never be adopted as a fallback. When the ledger yields no
+# status ('' -- over-cap, CRLF, BOM, malformed, no status: line, no ledger
+# file at all, whatever the cause), the package is honestly '' (neither done
+# nor running). Under-reporting is honest; adopting a contradicting or stale
+# registry value is not.
 sub _effective_status {
     my ($blueprint_dir, $pkg, $entry, $ledger_present) = @_;
     my $ledger_status = _ledger_status($blueprint_dir, $pkg);
     return $ledger_status if length $ledger_status;
-    return '' if $ledger_present;
-    my $raw = (ref($entry) eq 'HASH') ? $entry->{status} : undef;
-    return _normalize_status($raw);
+    return '';   # registry.status carries no authority (Decision 13) -- s02, butler no longer writes it
 }
 
 # _orchestrator_pid($path) -> $pid|undef (private)

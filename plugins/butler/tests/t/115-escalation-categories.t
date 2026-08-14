@@ -323,7 +323,7 @@ sub mk_ledger_bp {
     BpOrch::_block_and_queue($bpdir, $runs, $log, 'bp', $pkg, 'stuck', time, 'question?', 'stuck-package', 'scoping');
     is(ledger_status($bpdir, $pkg), 'blocked', 'D3: valid category -- ledger flips to blocked');
     my $reg = read_registry($bpdir);
-    is($reg->{packages}{$pkg}{status}, 'blocked', 'D3: valid category -- registry flips to blocked');
+    is(($reg->{packages}{$pkg}{status} // ''), '', 'D3: valid category -- registry entry carries no status key (s02: status removed from _block_and_queue; ledger at :324 is the sole authority)');
     my @f = needs_you_files($runs);
     is(scalar @f, 1, 'D3: exactly one decision queued');
     my $rec = $J->decode(slurp("$runs/needs-you/$f[0]"));

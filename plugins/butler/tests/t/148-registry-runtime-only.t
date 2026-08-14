@@ -520,10 +520,40 @@ sub write_registry_raw {
 
     BpOrch::_block_and_queue($bpdir, $runs, $log, 'T', $pkg, 'stuck', time, 'question?', 'stuck-package', 'scoping');
 
-    ok(-e "$runs/registry.json", 'DC6/behavior1 (_block_and_queue): registry.json exists after the call');
-    my $reg = $J->decode(slurp("$runs/registry.json"));
-    ok(exists $reg->{packages}{$pkg}, 'DC6/behavior1 (_block_and_queue): the package reached the registry (the call was exercised, not a no-op)');
-    ok(!exists $reg->{packages}{$pkg}{status}, 'DC6/behavior1 (_block_and_queue): the registry entry has NO status key -- the :4484 call site was deleted per spec §2.1, not merely emptied');
+    # AMENDED 2026-08-14 by driver adjudication -- a SEQUENCING conflict, not a
+    # defect in either side. This section was written at step 3, when the spec
+    # still implied _block_and_queue would keep touching the registry with a
+    # non-status payload. The step-4 spec amendment then ruled the :4484 write
+    # DELETED OUTRIGHT: its only reader (_load_state:2194's fallback) is removed
+    # by this same package under Decision 13, so the write has zero readers and
+    # keeping it would retain exactly the mirror Decision 12 forbids. Under that
+    # ruling _block_and_queue makes NO registry write at all, so the original
+    # "the package reached the registry" assertion demanded the very thing the
+    # amendment deleted. The implementer hit the contradiction and flagged it
+    # instead of coding around it, which is why this is a correction rather
+    # than a silently-weakened oracle.
+    #
+    # NON-VACUITY IS PRESERVED, JUST RE-WITNESSED. That assertion's job was to
+    # prove the call had actually been exercised rather than no-op'd. The
+    # registry can no longer serve as that witness, but the LEDGER can:
+    # _block_and_queue still flips the package to blocked (pinned independently
+    # at plugins/butler/tests/t/115-escalation-categories.t:324, which this
+    # package leaves untouched). So the exercised-ness check moves to the ledger
+    # and the no-status check stays, now stated over whatever the registry holds.
+    my $led_raw    = slurp("$bpdir/packages/$pkg.md");
+    my ($led_stat) = (defined $led_raw && $led_raw =~ /^status:\s*(\S+)/m) ? ($1) : ('');
+    is($led_stat, 'blocked',
+       'DC6/behavior1 (_block_and_queue): the LEDGER flipped to blocked -- proves the call was '
+     . 'exercised, not a no-op (the registry can no longer witness this: its write was deleted)');
+    if (-e "$runs/registry.json") {
+        my $reg = $J->decode(slurp("$runs/registry.json"));
+        ok(!exists $reg->{packages}{$pkg}{status},
+           'DC6/behavior1 (_block_and_queue): no status key for this package in the registry -- '
+         . 'the :4484 call site was DELETED per the spec amendment, not merely emptied');
+    } else {
+        pass('DC6/behavior1 (_block_and_queue): no registry.json at all -- the strongest form of '
+           . '"no status key", since the deleted :4484 write was this call path'."'".'s only registry touch');
+    }
 }
 
 done_testing();

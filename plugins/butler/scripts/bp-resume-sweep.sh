@@ -95,7 +95,6 @@ for BPDIR in "$DATA"/blueprints/*/; do
 
     case "$STATUS" in
       done)
-        registry_merge "$BP_NAME" "$PKG" '{"status":"done"}'
         printf '%-28s %-12s DONE\n' "$BP_NAME/$PKG" "$STATUS" ;;
       blocked|parked)
         NEXT=$(awk '/^## Next action/{getline; while ($0 ~ /^[[:space:]]*$/) getline; print; exit}' "$LEDGER" 2>/dev/null || true)
