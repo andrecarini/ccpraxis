@@ -1548,6 +1548,17 @@ sub cmd_mounts {
     my $skills = discover_skills(%opts);
     my %by_name = map { $_->{name} => $_ } @$skills;
 
+    # spec.md §2.1: optional --manifest FILE. Accumulated ONLY for skills that
+    # reach the print line below (i.e. actually resolved + verified on disk),
+    # never for either warn+next path — the manifest may only ever claim what
+    # was actually placed. Deliberately NO `src` key: this is the load-bearing
+    # no-copy contract with PluginSync::reconcile_copy_plan, whose copy phase
+    # is gated on `defined $e->{src}` — skills are transport-only via a live RO
+    # bind mount, never copied, so omitting `src` makes reconcile a no-op on
+    # the copy side while still tracking presence/absence for pruning.
+    my $manifest_file = $opts{manifest};
+    my @plan;
+
     for my $name (@{$state->{selected}}) {
         my $s = $by_name{$name};
         if (!$s) {
@@ -1563,6 +1574,20 @@ sub cmd_mounts {
             next;
         }
         print "$s->{path}\t$name\n";
+        push @plan, { name => $name, dest_rel => $name, host_path => $s->{path} } if $manifest_file;
+    }
+
+    if ($manifest_file) {
+        my $mdir = dirname($manifest_file);
+        make_path($mdir) unless -d $mdir;
+        my $mtmp = "$manifest_file.tmp.$$";
+        open my $mfh, '>:raw', $mtmp or die "write $mtmp: $!\n";
+        print $mfh JSON::PP->new->canonical(1)->pretty->utf8->encode(\@plan);
+        close $mfh or die "close $mtmp: $!\n";
+        rename $mtmp, $manifest_file or do {
+            unlink $mtmp;
+            die "rename $mtmp -> $manifest_file: $!\n";
+        };
     }
     return 0;
 }
@@ -1798,6 +1823,32 @@ sub cmd_materialize_plugins {
         # $p->{install_path} into claude-home at the container-relative dest, so
         # the selected plugin is present in the sandbox (the host is never
         # mounted in). Only when the path rewrote cleanly under the plugins root.
+        #
+        # p01-sandbox-plugin-provisioning, defect A ("not cached" errors on a
+        # fresh container) -- ROOT CAUSE, NOT FIXED HERE, deliberately.
+        # This copy mechanism is already correct and complete (t/31-plugin-merge.t,
+        # t/32-plugin-sync.t, and a live .host-tier-plugins.json artifact from the
+        # affected launch all confirm the copied tree is byte-identical to the
+        # host's). The actual defect is one layer deeper, inside Claude Code's own
+        # runtime: it resolves and caches installed plugin code under a
+        # CONTENT-HASH-named sibling directory under cache/<marketplace>/<plugin>/
+        # (observed: "ffbd6d5a9514", carrying Claude-Code-only bookkeeping files
+        # ".orphaned_at" and ".in_use/<pid>.tmp.<hash>" that this repo's scripts
+        # never write -- zero-hit grep across plugins/sandbox/scripts/), whereas
+        # this dest_rel below is keyed by the host's raw `version` string, which is
+        # the literal string "unknown" for a plugin like feature-dev. Claude Code
+        # does not recognise this dest_rel as a hit against its own hash-keyed
+        # cache and orphans its own fresh copy. The hash algorithm/key is UNKNOWN
+        # and not computable from anything ccpraxis has access to, so any change
+        # here would be validated ONLY by "the symptom stopped" on a live launch,
+        # which this package's done-criterion 2 explicitly forbids as evidence.
+        # Done-criterion 1 (zero manual repair needed) is therefore EXPLICITLY
+        # UNMET by this package. t/84-plugin-unknown-version-dest-rel.t is a
+        # regression LOCK on today's dest_rel naming (cache/<marketplace>/<plugin>/
+        # unknown) -- changing that naming without solving the hash problem above
+        # would not fix anything and must be a deliberate, reviewed decision, not
+        # an accidental drift. Evidence chain: reports/p01-sandbox-plugin-provisioning/
+        # scout-step1.md (both dispatch entries) and specs/p01-sandbox-plugin-provisioning-spec.md §0/§2.4.
         if (defined $p->{install_path} && length $p->{install_path}
             && defined $entry->{installPath}
             && $entry->{installPath} =~ m{^\Q$CONTAINER_PLUGINS_ROOT\E/(.+)$}) {

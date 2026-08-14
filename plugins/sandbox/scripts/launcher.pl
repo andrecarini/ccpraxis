@@ -849,6 +849,7 @@ my $MATERIALIZED_MARKETPLACES_FILE = "$CLAUDE_DATA/plugins/known_marketplaces.js
 # plugins manifest back as merge provenance (sandbox-installed vs deselected).
 my $PLUGINS_COPY_MANIFEST      = "$LAUNCHER_DIR/.host-tier-plugins.json";
 my $MARKETPLACES_COPY_MANIFEST = "$LAUNCHER_DIR/.host-tier-marketplaces.json";
+my $SKILLS_COPY_MANIFEST       = "$LAUNCHER_DIR/.host-tier-skills.json";
 # Container CLAUDE.md and settings.json: per-project copies (blueprint
 # model). Container can modify these freely; changes never propagate
 # back to ccpraxis. Drift from upstream is detected via stored hash;
@@ -2886,7 +2887,18 @@ sub _copy_file {
 # Build skill mounts
 # =====================================================================
 
+# $skills_manifest_existed captured BEFORE this launch's `mounts` call writes
+# (or rewrites) $SKILLS_COPY_MANIFEST -- it is what gates the one-time legacy
+# cleanup below to fire on exactly one launch (the first one after this
+# shipped), never again. $prior_skills_plan is [] on that same bootstrap
+# launch (no history yet), which is why the ordinary reconcile further below
+# is a no-op removal-wise on that launch -- it only establishes the pattern
+# read back as history for every launch after this one.
+my $skills_manifest_existed = -f $SKILLS_COPY_MANIFEST;
+my $prior_skills_plan       = _read_copy_plan($SKILLS_COPY_MANIFEST);
+
 my @SKILL_MOUNTS;
+my @this_launch_skill_names;
 {
     # LIST FORM, both streams captured: the backtick version let the child's
     # stderr land straight on the frame (and then be discarded with it), and
@@ -2894,7 +2906,8 @@ my @SKILL_MOUNTS;
     # mangle.
     my ($mrc, $output, $merr) = _capture_out_err($^X, $SANDBOX_SKILLS_PL, 'mounts',
         '--selection-file',     $SELECTION_FILE,
-        '--discovery-snapshot', $SNAPSHOT_FILE);
+        '--discovery-snapshot', $SNAPSHOT_FILE,
+        '--manifest',           $SKILLS_COPY_MANIFEST);
     if ($mrc != 0) {
         _launch_fail('select', 'failed to enumerate skill mounts', $mrc >> 8);
         _emit_err($merr) if defined $merr && length $merr;
@@ -2909,8 +2922,61 @@ my @SKILL_MOUNTS;
         next unless defined $host_path && length $host_path
                  && defined $skill_name && length $skill_name;
         push @SKILL_MOUNTS, '-v', "$host_path:/root/.claude/skills/$skill_name:ro";
+        push @this_launch_skill_names, $skill_name;
     }
 }
+
+# One-time legacy cleanup: only fires the launch where $SKILLS_COPY_MANIFEST
+# doesn't exist YET (no host-tier skill manifest history at all -- see
+# $skills_manifest_existed above). Never fires again once that manifest is on
+# disk, even if its contents are later an empty array. Standing policy
+# (mirrored here, not just for this one pass): a content-bearing directory
+# this repo cannot prove it owns is warned about, never deleted -- see
+# PluginSync::prune_orphaned_dirs.
+unless ($skills_manifest_existed) {
+    # Operator-authorised, ONE-TIME removal of two NAMED pre-manifest legacy
+    # skill specimens: `plan` and `work-plan`. This is NOT the standing policy
+    # (PluginSync::prune_orphaned_dirs, called below, still warns rather than
+    # removes any content-bearing directory it finds on its own) -- it is a
+    # single explicit exception the operator authorised for these two exact
+    # names, because no provenance record predating this fix could otherwise
+    # tell "leftover from the retired copy-skills era" apart from "an operator
+    # wrote this by hand in the container" (blueprint p01-sandbox-plugin-
+    # provisioning decision log, 2026-08-14T00:50:44Z: "ONE-TIME REMOVAL OF
+    # THESE TWO, THEN WARN-ONLY"). The names are hard-coded here, not derived
+    # from any predicate over disk contents -- see PluginSync::remove_named_legacy_dirs's
+    # own comment for why a computed list would be the wrong shape for this.
+    # Runs before prune_orphaned_dirs below so these two, once removed, are
+    # simply absent for that pass rather than producing a contradictory
+    # "leaving it in place" warning for a directory this block just removed.
+    my @LEGACY_ONE_TIME_REMOVE = ('plan', 'work-plan');
+    my @removed_specimens = PluginSync::remove_named_legacy_dirs(
+        "$CLAUDE_DATA/skills", \@LEGACY_ONE_TIME_REMOVE, \@this_launch_skill_names);
+    for my $r (@removed_specimens) {
+        _emit_err("Removed pre-manifest legacy skill directory '$r->{name}' ".
+                   "(operator-authorised one-time removal of a named pre-manifest ".
+                   "specimen predating any host-tier manifest -- not the standing policy).\n");
+    }
+
+    my @results = PluginSync::prune_orphaned_dirs("$CLAUDE_DATA/skills", \@this_launch_skill_names);
+    for my $r (@results) {
+        if ($r->{removed}) {
+            _emit_err("Removed stale host-tier skill directory '$r->{name}' ".
+                       "(empty, not selected, predates any host-tier manifest -- one-time cleanup).\n");
+        } else {
+            _emit_err("Skill directory '$r->{name}' is not selected and has no manifest record, ".
+                       "but is NOT empty; leaving it in place (removing it would be unrecoverable ".
+                       "data loss with no provenance evidence). Remove it manually inside the ".
+                       "container if it is confirmed stale.\n");
+        }
+    }
+}
+
+# Ordinary reconcile: remove what we placed last launch that's not selected
+# now. On the bootstrap launch (above), $prior_skills_plan is [] so this is a
+# no-op removal-wise; it still runs so the manifest just written by `mounts`
+# becomes next launch's history.
+sync_copy_plan($prior_skills_plan, _read_copy_plan($SKILLS_COPY_MANIFEST), "$CLAUDE_DATA/skills");
 
 # =====================================================================
 # Build plugin store (Fix 2 copy model) + directory-source marketplace binds

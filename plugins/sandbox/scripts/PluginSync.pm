@@ -17,7 +17,7 @@ use File::Find qw(finddepth);
 use JSON::PP;
 use Exporter qw(import);
 
-our @EXPORT_OK = qw(copy_tree prune_empty_parents reconcile_copy_plan safe_dest_rel read_copy_plan);
+our @EXPORT_OK = qw(copy_tree prune_empty_parents reconcile_copy_plan safe_dest_rel read_copy_plan prune_orphaned_dirs remove_named_legacy_dirs);
 
 # read_copy_plan($path) -> arrayref of {src, dest_rel, ...} — the launcher's
 # copy-plan manifest, which skills.pl writes with ->utf8->encode. Missing /
@@ -194,6 +194,114 @@ sub reconcile_copy_plan {
         elsif (-e $dst) { _force_remove_tree($dst); }        # clean refresh (host wins); read-only-safe
         copy_tree($src, $dst);
     }
+}
+
+# _subtree_has_file($path) -> 1 iff $path (a directory) contains at least one
+# regular file anywhere in its subtree, however deep. Symlinks encountered
+# during the walk are never followed (File::Find's default: it does not
+# descend into a symlinked directory) and never counted as a "regular file"
+# themselves (-f on a symlink to a file would still be true, but we exclude
+# it deliberately -- content ownership here means real bytes this repo/its
+# operator wrote, not a dangling or redirecting link).
+sub _subtree_has_file {
+    my $path = shift;
+    my $found = 0;
+    finddepth({ no_chdir => 1, wanted => sub {
+        my $p = $File::Find::name;
+        return if $found;
+        return if -l $p;                 # never count/follow a symlink
+        $found = 1 if -f $p;
+    }}, $path);
+    return $found;
+}
+
+# prune_orphaned_dirs($dest_root, $keep_names) -> list of { name, removed }
+#   $dest_root  : directory to scan (immediate children only -- skills are
+#                 always flat).
+#   $keep_names : arrayref of names selected THIS launch; never
+#                 inspected/touched -- not even to check emptiness.
+#
+# spec.md §2.3 / §0's operator ruling: an unowned, CONTENT-BEARING directory
+# is warned about, never deleted -- by this function, unconditionally, both
+# for the standing per-launch reconcile AND for the one-time legacy pass the
+# launcher gates on manifest absence. Only a directory holding literally zero
+# regular files anywhere in its subtree is safe to remove outright (it holds
+# no data to lose). The caller (launcher.pl) decides whether/when to invoke
+# this at all; this function itself has no notion of "once" and is safe to
+# call repeatedly -- idempotent (a removed dir won't exist to remove again; a
+# kept or non-empty dir is left untouched every time).
+sub prune_orphaned_dirs {
+    my ($dest_root, $keep_names) = @_;
+    return () unless defined $dest_root && -d $dest_root && !-l $dest_root;
+    my %keep = map { $_ => 1 } @{ $keep_names || [] };
+
+    my @results;
+    opendir(my $dh, $dest_root) or return ();
+    my @kids = sort grep { $_ ne '.' && $_ ne '..' } readdir $dh;
+    closedir $dh;
+
+    for my $name (@kids) {
+        next if $keep{$name};             # selected this launch -- never inspected, never touched
+        my $path = "$dest_root/$name";
+        next if -l $path;                 # symlink: skipped entirely, never reported
+        next unless -d $path;             # non-directory: skipped entirely, never reported
+
+        if (_subtree_has_file($path)) {
+            push @results, { name => $name, removed => 0 };
+        } else {
+            _force_remove_tree($path);
+            push @results, { name => $name, removed => 1 };
+        }
+    }
+    return @results;
+}
+
+# remove_named_legacy_dirs($dest_root, $names, $keep_names) -> list of
+# { name, removed => 1 } — one entry per name in $names that was actually
+# removed.
+#
+# THIS IS NOT A GENERAL-PURPOSE "delete content-bearing dirs" primitive, and
+# must never be called with a computed/predicate-derived list. It exists for
+# exactly one purpose: p01-sandbox-plugin-provisioning's operator-authorised,
+# ONE-TIME removal of the two named pre-manifest legacy skill specimens
+# (`plan`, `work-plan`) that predate any host-tier manifest and therefore have
+# no provenance record `prune_orphaned_dirs`'s standing (permanent) policy can
+# use to justify auto-removing content it can't prove it owns. The caller
+# (launcher.pl's one-time gate, itself already scoped to fire on exactly one
+# launch) is responsible for BOTH the "once" semantics AND for hard-coding the
+# exact two names authorised by the operator — this function only executes
+# whatever explicit list it is handed; it applies NO heuristic of its own
+# (unlike prune_orphaned_dirs's empty-vs-content-bearing test) and is
+# deliberately dumber than that function so it cannot silently grow scope.
+#
+#   $dest_root  : directory to scan (immediate children only).
+#   $names      : arrayref of EXACT directory names authorised for removal —
+#                 the caller must name them explicitly (e.g. ['plan',
+#                 'work-plan']), never compute this list from disk contents.
+#   $keep_names : arrayref of names selected THIS launch; a currently-selected
+#                 name is NEVER removed even if it appears in $names (mirrors
+#                 prune_orphaned_dirs's keep discipline) — an operator
+#                 re-selecting something literally named "plan" today must not
+#                 be at risk from this one-time pass.
+#
+# A name in $names that doesn't exist, is a symlink, or is not a directory is
+# silently skipped (not reported) — this function only reports what it
+# actually removed, same discipline as prune_orphaned_dirs.
+sub remove_named_legacy_dirs {
+    my ($dest_root, $names, $keep_names) = @_;
+    return () unless defined $dest_root && -d $dest_root && !-l $dest_root;
+    my %keep = map { $_ => 1 } @{ $keep_names || [] };
+
+    my @results;
+    for my $name (@{ $names || [] }) {
+        next if $keep{$name};              # currently selected -- never touched
+        my $path = "$dest_root/$name";
+        next if -l $path;                  # symlink: never removed by this pass
+        next unless -d $path;              # not a directory: never removed by this pass
+        _force_remove_tree($path);
+        push @results, { name => $name, removed => 1 };
+    }
+    return @results;
 }
 
 1;
