@@ -192,6 +192,30 @@ perl "${CLAUDE_PLUGIN_ROOT}"/scripts/bp-watch.pl --arm --blueprint $0 \
      --pid-file "<bpdir>/runs/.orchestrator" --max-seconds 1800   # run_in_background
 ```
 
+Immediately after this arm call, declare it -- the SAME `bp-runstate.pl pause` contract
+drive-solo's own w02 addition already uses (not a second mechanism; see
+`gate-drive-loop.sh`'s reporter branch, which reads exactly this):
+
+```
+perl "${CLAUDE_PLUGIN_ROOT}"/scripts/bp-runstate.pl pause --surface reporter \
+     --watcher-pid <the bp-watch.pl background call's own pid> \
+     --until $(( $(date +%s) + 1800 )) \       # same window as --max-seconds above
+     --reason "bp-watch.pl armed, Mode B"
+```
+
+Resolve permanently (never re-arm) instead, whenever:
+  * a `WORKERS-GONE` (2) or `TERMINAL`/`SETTLED` (0) `bp-watch.pl` exit is auto-announced, or
+  * step 2's "No live run" branch is reached after this session already declared a pause:
+
+```
+perl "${CLAUDE_PLUGIN_ROOT}"/scripts/bp-runstate.pl finish --surface reporter \
+     --reason "<why nothing is left to watch>"
+```
+
+A turn that arms `bp-watch.pl` and ends without declaring it is, from outside,
+indistinguishable from a reporter that silently stopped observing -- this is exactly
+what `gate-drive-loop.sh`'s reporter branch now refuses.
+
 A `WORKERS-GONE` (exit 2, the orchestrator's pid died) or a `TERMINAL`/`SETTLED` exit
 (exit 0, every package reached `done`/`dropped`/`blocked`/`parked`) is the trigger to
 **auto-announce to the user**, the same auto-announce doctrine this section already

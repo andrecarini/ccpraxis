@@ -46,6 +46,125 @@ MAX_BLOCKS=3          # never nag more than this many times in a row
 # Coordinators are gate-stop.sh's business. BP_LEDGER is exported only into
 # coordinator processes, so its ABSENCE identifies an interactive driver.
 [ -n "${BP_LEDGER:-}" ] && exit 0
+
+# Read stdin ONCE, here, unconditionally -- both the reporter branch below
+# and the pre-existing driver logic further down need it, and a second read
+# from an already-drained stdin returns empty.
+PAYLOAD=$(cat 2>/dev/null || true)
+
+# ---------------------------------------------------------------------------
+# REPORTER BRANCH (g03-reporter-stop-gate). Self-contained; on BLOCK, exits 2
+# immediately. On ALLOW or "not a registered reporter", falls through to the
+# existing driver logic below, UNCHANGED. A session registered as BOTH (rare)
+# must satisfy both branches independently to stop cleanly.
+#
+# WHY IT NAMES ITS OWN REMEDY. gate-drive-loop.sh's driver-branch BLOCK text
+# tells a driver to dispatch a worker or consult bp-drive-next.pl -- neither
+# concept exists in a reporter's vocabulary. Training an operator to reach
+# for a remedy that does not fit the surface it fires on is exactly what this
+# package's own criterion 3 warns against, so this branch never reuses that
+# text and never falls through to it.
+#
+# ESCAPE HATCHES, INDEPENDENT OF THE DRIVER'S OWN:
+#   * touch <data>/.reporter-stop-ok        — one-shot; consumed on use
+#   * export CCPRAXIS_REPORTER_STOP_OK=1    — session-wide
+[ "${CCPRAXIS_REPORTER_STOP_OK:-}" = "1" ] || {
+  RDIR="${CCPRAXIS_REPORTER_ACTIVE_DIR:-${HOME:-$PWD}/.claude/ccpraxis/.reporter-active}"
+  if [ -d "$RDIR" ]; then
+    RSID=$(bp_json_get "$PAYLOAD" session_id 2>/dev/null || true)
+    RMARK=""
+    case "$RSID" in
+      ''|*/*|*\**|.|..|*..*) ;;                          # invalid -> not registered
+      *) [ -f "$RDIR/$RSID" ] && RMARK="$RDIR/$RSID" ;;
+    esac
+    if [ -n "$RMARK" ]; then
+      # TTL reap -- same staleness discipline as the driver's own marker below.
+      RTTL_H="${CCPRAXIS_REPORTER_TTL_H:-12}"
+      case "$RTTL_H" in ''|*[!0-9]*) RTTL_H=12 ;; esac
+      RNOW=$(date +%s 2>/dev/null || echo 0)
+      RMT=$(stat -c %Y "$RMARK" 2>/dev/null || echo 0)
+      if [ "$RNOW" -gt 0 ] && [ "$RMT" -gt 0 ] \
+         && [ $(( (RNOW - RMT) / 3600 )) -ge "$RTTL_H" ]; then
+        rm -f "$RMARK" 2>/dev/null
+      else
+        RDATA=$(head -n 1 "$RMARK" 2>/dev/null || true)
+        if [ -n "$RDATA" ]; then
+          touch "$RMARK" 2>/dev/null || true
+          if [ -f "$RDATA/.reporter-stop-ok" ]; then
+            rm -f "$RDATA/.reporter-stop-ok" "$RDATA/.reporter-stop-blocks" 2>/dev/null
+            exit 0
+          fi
+          RRUN_DIR=$(dirname "$RDATA" 2>/dev/null || true)
+          RSTATE=""
+          RRS="$HOOK_DIR/../scripts/bp-runstate.pl"
+          if [ -n "$RRUN_DIR" ] && [ -d "$RRUN_DIR" ] && [ -r "$RRS" ] && command -v perl >/dev/null 2>&1; then
+            # SAME bounded fork/timeout pattern as the existing w02 fold below
+            # (copied, not shared, for the identical reason lib.sh cannot hold
+            # it -- write-set).
+            if command -v timeout >/dev/null 2>&1; then
+              RST=$(timeout 10 perl "$RRS" status --root "$RRUN_DIR" --surface reporter 2>/dev/null) || RST=""
+            elif command -v gtimeout >/dev/null 2>&1; then
+              RST=$(gtimeout 10 perl "$RRS" status --root "$RRUN_DIR" --surface reporter 2>/dev/null) || RST=""
+            else
+              RST=$(perl -e '
+                  my $pid = fork();
+                  exit 127 unless defined $pid;
+                  if ($pid == 0) { exec @ARGV; exit 127 }
+                  $SIG{ALRM} = sub { kill 9, $pid };
+                  alarm 10;
+                  waitpid($pid, 0);
+                  my $rc = $?;
+                  alarm 0;
+                  exit($rc == 0 ? 0 : 124);
+                ' perl "$RRS" status --root "$RRUN_DIR" --surface reporter 2>/dev/null) || RST=""
+            fi
+            RSTATE=$(printf '%s' "$RST" | perl -MJSON::PP -0777 -ne '
+                my $j = eval { JSON::PP->new->decode($_) };
+                print(($j && ref($j) eq "HASH" && defined $j->{state}) ? $j->{state} : "");
+              ' 2>/dev/null || true)
+          fi
+          case "$RSTATE" in
+            paused|finished)
+              rm -f "$RDATA/.reporter-stop-blocks" 2>/dev/null
+              exit 0 ;;
+            *)
+              RBLOCKS=0
+              [ -f "$RDATA/.reporter-stop-blocks" ] && RBLOCKS=$(cat "$RDATA/.reporter-stop-blocks" 2>/dev/null || echo 0)
+              case "$RBLOCKS" in ''|*[!0-9]*) RBLOCKS=0 ;; esac
+              if [ "$RBLOCKS" -ge 3 ]; then
+                rm -f "$RDATA/.reporter-stop-blocks" 2>/dev/null
+                echo "butler reporter-gate: allowing this stop after $RBLOCKS consecutive blocks." >&2
+                exit 0
+              fi
+              echo $((RBLOCKS + 1)) > "$RDATA/.reporter-stop-blocks" 2>/dev/null
+              cat >&2 <<EOF
+BLOCKED (butler reporter-gate): this turn is ending with nothing verified to
+resume observation of this run.
+
+A reporter turn may end only once bp-runstate.pl (--surface reporter) reads
+paused (a live, verified bp-watch.pl/bp-wait-for-decision.pl watcher armed
+and declared) or finished (nothing left to observe). Neither holds now.
+
+Do this NOW, in this turn:
+  * (re-)arm bp-watch.pl in Mode B and declare it:
+      perl plugins/butler/scripts/bp-runstate.pl pause --surface reporter \\
+           --watcher-pid <the armed watcher's own pid> --until <epoch> \\
+           --reason "bp-watch.pl armed"
+  * or, if there is genuinely nothing left to observe:
+      perl plugins/butler/scripts/bp-runstate.pl finish --surface reporter \\
+           --reason "<why>"
+  * or, to stop anyway just this once:
+      touch $RDATA/.reporter-stop-ok
+EOF
+              exit 2 ;;
+          esac
+        fi
+      fi
+    fi
+  fi
+}
+# --- end reporter branch -----------------------------------------------------
+
 [ "${CCPRAXIS_DRIVE_STOP_OK:-}" = "1" ] && exit 0
 
 # --- SCOPING, and it must be cheap for the 99% who are not driving ----------
@@ -63,8 +182,9 @@ MAX_BLOCKS=3          # never nag more than this many times in a row
 # no subprocess when nothing is driving anywhere.
 bp_drive_any_active || exit 0
 
-PAYLOAD=$(cat 2>/dev/null || true)
-
+# PAYLOAD was already read once, unconditionally, right after the BP_LEDGER
+# check above (the reporter branch needs it too, and stdin can only be read
+# once) -- reused here rather than re-cat'd.
 SID=$(bp_json_get "$PAYLOAD" session_id 2>/dev/null || true)
 [ -n "$SID" ] || exit 0
 MARK=$(bp_drive_marker "$SID" 2>/dev/null) || exit 0

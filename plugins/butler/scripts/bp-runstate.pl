@@ -54,7 +54,21 @@ sub state_dir {
     $root //= $ENV{CLAUDE_PROJECT_DIR} // Cwd::abs_path("$DIR/../../..") // '.';
     return "$root/.ccpraxis-local-data/.subagent-guard";
 }
-sub state_path { return state_dir($_[0]) . '/run-state.json' }
+
+# state_path($root, $surface) -- $surface optional, trailing, default 'driver'.
+# 'driver' resolves to the byte-identical pre-existing path
+# (.subagent-guard/run-state.json) so every existing caller that never passes
+# a surface takes an unchanged route. Any other surface is a SIBLING file
+# (run-state.<surface>.json), never the default -- see spec §1.3/§2.3: this is
+# what keeps the reporter's own pause/finish/activate contract from
+# overwriting the driver's project-scoped record (and vice versa).
+sub state_path {
+    my ($root, $surface) = @_;
+    $surface = 'driver' unless defined $surface && length $surface;
+    my $base = state_dir($root);
+    return "$base/run-state.json" if $surface eq 'driver';
+    return "$base/run-state.$surface.json";
+}
 
 # pid_alive($pid) — see bp-keepawake.pl for why kill(0) is not enough on
 # Windows: perl cannot signal a native process it did not create, and reports a
@@ -133,8 +147,8 @@ sub pid_fingerprint {
 }
 
 sub _read {
-    my ($root) = @_;
-    my $p = state_path($root);
+    my ($root, $surface) = @_;
+    my $p = state_path($root, $surface);
     open my $fh, '<', $p or return undef;
     local $/;
     my $raw = <$fh>;
@@ -145,7 +159,7 @@ sub _read {
 }
 
 sub _write {
-    my ($root, $rec) = @_;
+    my ($root, $rec, $surface) = @_;
     my $d = state_dir($root);
     unless (-d $d) {
         # mkdir -p, and the leading separator is LOAD-BEARING. An earlier version
@@ -163,7 +177,7 @@ sub _write {
         }
         return 0 unless -d $d;
     }
-    my $p   = state_path($root);
+    my $p   = state_path($root, $surface);
     my $tmp = "$p.tmp.$$";
     open my $fh, '>', $tmp or return 0;
     print {$fh} JSON::PP->new->canonical->encode($rec);
@@ -179,8 +193,8 @@ sub _write {
 # watcher died is indistinguishable from an abandoned run, so it must not keep
 # permitting stops.
 sub effective {
-    my ($root) = @_;
-    my $rec = _read($root) or return ('inert', {});
+    my ($root, $surface) = @_;
+    my $rec = _read($root, $surface) or return ('inert', {});
     my $st  = $rec->{state} // 'inert';
     return ($st, $rec) unless $st eq 'paused';
 
@@ -203,17 +217,18 @@ sub effective {
 }
 
 sub activate {
-    my ($root, $reason) = @_;
-    my ($st, $rec) = effective($root);
+    my ($root, $reason, $surface) = @_;
+    my ($st, $rec) = effective($root, $surface);
     # Never downgrade an explicit pause into active on a fresh dispatch — the
     # watcher is still live and the agent already resolved this turn.
     return 1 if $st eq 'paused';
     return _write($root, { state => 'active', reason => ($reason // 'run in progress'),
-                           updated_at => time });
+                           updated_at => time }, $surface);
 }
 
 sub pause {
     my ($root, %o) = @_;
+    my $surface = $o{surface};
     my $pid = $o{watcher_pid};
     return (0, 'a pause needs --watcher-pid: an unwatched pause is just a stop')
         unless defined $pid && $pid =~ /^\d+$/;
@@ -235,15 +250,15 @@ sub pause {
         unless $until > time;
     _write($root, { state => 'paused', reason => ($o{reason} // 'waiting on a watcher'),
                     watcher_pid => $pid + 0, watcher_fingerprint => $fp,
-                    until => $until + 0, updated_at => time })
+                    until => $until + 0, updated_at => time }, $surface)
         or return (0, 'could not write the run state');
     return (1, "paused until $until, watched by pid $pid");
 }
 
 sub finish {
-    my ($root, $reason) = @_;
+    my ($root, $reason, $surface) = @_;
     _write($root, { state => 'finished', reason => ($reason // 'run complete'),
-                    updated_at => time })
+                    updated_at => time }, $surface)
         or return (0, 'could not write the run state');
     return (1, 'run finished; the gate is inert again');
 }
@@ -261,12 +276,25 @@ unless (caller) {
         elsif ($a eq '--watcher-pid') { $o{watcher_pid} = shift @ARGV }
         elsif ($a eq '--until')       { $o{until}       = shift @ARGV }
         elsif ($a eq '--root')        { $o{root}        = shift @ARGV }
+        elsif ($a eq '--surface')     { $o{surface}     = shift @ARGV }
         else { print STDERR "bp-runstate: unknown option '$a'\n"; exit 3 }
     }
     my $root = $o{root};
 
+    # A typo must fail LOUDLY at parse time, never silently write to a
+    # garbled filename (spec §2.3). Validated once, here, before any verb
+    # dispatch -- 'driver' (the default) always passes this, so an omitted
+    # --surface never hits this check at all.
+    if (defined $o{surface}) {
+        if (!length($o{surface}) || $o{surface} !~ /^[a-z][a-z0-9_-]*$/) {
+            print STDERR "bp-runstate: invalid --surface '$o{surface}' (must match ^[a-z][a-z0-9_-]*\$)\n";
+            exit 3;
+        }
+    }
+    my $surface = $o{surface};
+
     if ($cmd eq 'status') {
-        my ($st, $rec) = BpRunState::effective($root);
+        my ($st, $rec) = BpRunState::effective($root, $surface);
         # ORDER MATTERS: the record's own `state` is what was WRITTEN; $st is
         # what it EFFECTIVELY is now (a pause whose watcher died reads back as
         # active). Spreading %$rec last would let the stored value clobber the
@@ -276,7 +304,7 @@ unless (caller) {
         exit 0;
     }
     elsif ($cmd eq 'activate') {
-        BpRunState::activate($root, $o{reason}) or exit 4;
+        BpRunState::activate($root, $o{reason}, $surface) or exit 4;
         exit 0;
     }
     elsif ($cmd eq 'pause') {
@@ -286,7 +314,7 @@ unless (caller) {
         exit($ok ? 0 : 2);
     }
     elsif ($cmd eq 'finish') {
-        my ($ok, $msg) = BpRunState::finish($root, $o{reason});
+        my ($ok, $msg) = BpRunState::finish($root, $o{reason}, $surface);
         print STDERR "bp-runstate: $msg\n" unless $ok;
         print "$msg\n" if $ok;
         exit($ok ? 0 : 4);
@@ -304,6 +332,14 @@ bp-runstate.pl — the run-state behind the stop gate.
                                            the pid is not running or the
                                            deadline is not in the future.
   finish [--reason R]                      resolve permanently: nothing pending
+
+  --surface NAME       (all verbs, optional, default 'driver') scopes the
+                        state to an independent record -- 'driver' resolves
+                        to the pre-existing run-state.json path unchanged;
+                        any other NAME (^[a-z][a-z0-9_-]*\$) writes/reads a
+                        sibling run-state.NAME.json, never colliding with the
+                        default. e.g. --surface reporter for the reporter's
+                        own bp-watch.pl-backed pause/finish contract.
 
 Stopping is DENIED while the state is active. `pause` and `finish` are the only
 two resolutions; there is no third.

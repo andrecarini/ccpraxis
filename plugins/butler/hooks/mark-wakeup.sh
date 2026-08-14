@@ -50,9 +50,84 @@ PAYLOAD=$(cat 2>/dev/null || true)
 # every unrelated project on the machine. See bp_find_data_dir in lib.sh.
 CWD=$(bp_json_get "$PAYLOAD" cwd 2>/dev/null || true); CWD=${CWD:-$PWD}
 DATA=$(bp_find_data_dir "$CWD" 2>/dev/null || true)
-[ -n "$DATA" ] && [ -d "$DATA/.drive-solo" ] || exit 0
 
 TOOL=$(bp_json_get "$PAYLOAD" tool_name 2>/dev/null || true)
+
+# ---------------------------------------------------------------------------
+# REPORTER REGISTRATION (g03-reporter-stop-gate). A reporter session never
+# calls the director, so the driver-arm regex below can never see it -- see
+# the package spec §1.2 for why the trigger is exactly this shape. It keys
+# off the exact Bash command `bp-watch.pl --arm ... --blueprint <bp>` (Mode
+# B), which is PROVABLY DISJOINT from the driver's own `--package` shape:
+# bp-watch.pl's own arg parser refuses --package and --blueprint together
+# (pinned by 142-reporter-registration.t section B), so the flag that
+# selects Mode B cannot appear in a driver's own invocation.
+#
+# MUST run BEFORE the `.drive-solo` early-exit below: a project where
+# drive-solo has never run (the common case for a reporter-only project)
+# would otherwise never reach this block at all (spec §2.1's load-bearing
+# ordering note).
+#
+# Mirrors bp_drive_marker's shape (lib.sh) but inlined -- lib.sh is outside
+# this package's write set. The match requires the literal invocation, not
+# merely the string: a Read of reporter/SKILL.md, a grep for bp-watch.pl, or
+# an echoed/greped command naming it never executes it, so none of those
+# arm a session -- same discipline the driver's own regex below already
+# relies on (a command that merely NAMES the script does not run it).
+#
+# Uses bp_json_get throughout, like the rest of this file -- the house idiom,
+# reliable on a correctly-escaped payload (verified: 142-reporter-registration.t
+# builds every fixture with a real JSON encoder, not string interpolation).
+if [ "$TOOL" = "Bash" ]; then
+  RCMD=$(bp_json_get "$PAYLOAD" tool_input.command 2>/dev/null || true)
+  # A plain 'bp-watch.pl[^"]*--arm[^"]*--blueprint' substring match on $RCMD
+  # is NOT enough on its own: it also matches an ECHOED/GREPPED string naming
+  # the invocation (e.g. `echo "run bp-watch.pl --arm --blueprint later"`),
+  # because no `"` happens to fall BETWEEN bp-watch.pl and --blueprint in
+  # that case either -- the surrounding quotes are further out, around the
+  # whole echoed phrase. Verified live against the DRIVER's own analogous
+  # arm regex below, on a correctly JSON-escaped payload (not a malformed
+  # one): `bp-drive-next\.pl[^"]*(next|record-order|park)` matches an
+  # equivalent echoed `bp-drive-next.pl next` command too, for the identical
+  # reason -- that regex is NOT reliable prior art for this problem, only a
+  # superficially similar one whose own oracle (t/142 section H) happens to
+  # assert an unrelated file, not the arm marker.
+  #
+  # What DOES distinguish a real invocation from a quoted reference is QUOTE
+  # PARITY immediately before "bp-watch.pl" in the DECODED command text (the
+  # actual bash command bytes bp_json_get returns, already un-escaped -- so
+  # this check does not depend on any JSON-escaping convention at all): in
+  # the real call (`perl "${CLAUDE_PLUGIN_ROOT}"/scripts/bp-watch.pl --arm
+  # --blueprint ...`) there are 0 or 2 quote chars before it (fully closed
+  # pairs, e.g. the CLAUDE_PLUGIN_ROOT expansion) -- EVEN, so "bp-watch.pl"
+  # sits OUTSIDE any open quote, i.e. it is the literal command being run.
+  # In an echoed/grepped reference the whole phrase sits INSIDE one
+  # still-open quoted argument (`echo "run bp-watch.pl ...`) -- exactly ONE
+  # quote char precedes it -- ODD. Checked with perl (already required by
+  # this hook family) rather than reimplemented as bash arithmetic.
+  ARMED=$(printf '%s' "$RCMD" | perl -0777 -ne '
+      my $armed = 0;
+      if (/^(.*?)(bp-watch\.pl.*)$/s) {
+        my ($prefix, $tail) = ($1, $2);
+        my $quotes = () = $prefix =~ /"/g;
+        if ($quotes % 2 == 0 && $tail =~ /^bp-watch\.pl[^"]*--arm[^"]*--blueprint\b/) {
+          $armed = 1;
+        }
+      }
+      print $armed ? "1" : "0";
+    ' 2>/dev/null || echo 0)
+  if [ "$ARMED" = "1" ]; then
+    RSID=$(bp_json_get "$PAYLOAD" session_id 2>/dev/null || true)
+    case "$RSID" in ''|*/*|*\**|.|..|*..*) RSID="" ;; esac
+    if [ -n "$RSID" ] && [ -n "$DATA" ]; then
+      RDIR="${CCPRAXIS_REPORTER_ACTIVE_DIR:-${HOME:-$PWD}/.claude/ccpraxis/.reporter-active}"
+      mkdir -p "$RDIR" 2>/dev/null && printf '%s\n' "$DATA" > "$RDIR/$RSID" 2>/dev/null || true
+    fi
+  fi
+fi
+# --- end reporter registration block ----------------------------------------
+
+[ -n "$DATA" ] && [ -d "$DATA/.drive-solo" ] || exit 0
 
 # ---------------------------------------------------------------------------
 # ARMING: this hook is what registers a session as a drive-solo DRIVER.
