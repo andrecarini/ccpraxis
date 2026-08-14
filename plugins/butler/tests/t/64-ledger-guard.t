@@ -414,9 +414,15 @@ sub nonblank_lines { return grep { /\S/ } split /\n/, $_[0] }
     my $stop = ($H && $H->{hooks}{Stop}) // [];
     is(scalar(@$stop), 1, 'AC-36: Stop still has exactly one block');
     ok(!exists $stop->[0]{matcher}, 'AC-36: Stop block still has no matcher key');
+    # UPDATED 2026-08-14 (g01-explicit-continuity-arming). Same discipline as the
+    # PreToolUse block-1 update immediately above: brought up to reality rather
+    # than loosened. gate-continuity.sh is a legitimate THIRD entry appended to
+    # this same unmatchered block (spec SS2.5's own registration instruction);
+    # the list stays EXACT and ORDERED, so a missing/renamed/reordered
+    # gate-stop.sh or gate-drive-loop.sh still fails this assertion.
     is_deeply([ map { $_->{command} } @{ $stop->[0]{hooks} // [] } ],
-              [ $cmd_of->('gate-stop.sh'), $cmd_of->('gate-drive-loop.sh') ],
-              'AC-36: Stop hook list unchanged');
+              [ $cmd_of->('gate-stop.sh'), $cmd_of->('gate-drive-loop.sh'), $cmd_of->('gate-continuity.sh') ],
+              'AC-36: Stop hook list is exactly [gate-stop.sh, gate-drive-loop.sh, gate-continuity.sh] IN ORDER');
 
     ok(-e $HOOK,  'AC-36: plugins/butler/hooks/ledger-guard.sh exists');
     ok(-s $HOOK,  'AC-36: plugins/butler/hooks/ledger-guard.sh is non-empty');

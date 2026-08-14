@@ -348,6 +348,28 @@ for my $name (sort keys %MARKER) {
 my $marker = $MARKER{ $SANDBOX_ON ? 'sandbox' : 'host' };
 $marker .= ' ' while row_cost($marker) < $MARKER_SLOT;
 
+# ── Continuity badge (g01-explicit-continuity-arming) ────────
+# Per-session, keyed by the documented top-level `session_id` field of the
+# stdin JSON (spec SS2.6/AC-7). A second, INDEPENDENT, always-reserved-width
+# badge, concatenated onto the same $marker field that survives every
+# fallback rung down to row1($f_marker, '', '', '', '').
+#
+# Path resolution is duplicated from lib.sh's bp_continuity_active_dir and
+# bp-continuity.pl's own continuity_active_dir, ON PURPOSE -- this file stays
+# a standalone installed payload (no require of anything under plugins/). The
+# three must resolve identically for a given environment; AC-13 pins that
+# parity directly, so drift is caught rather than assumed away.
+my $sid = $data->{session_id};
+$sid = '' unless defined $sid && !ref($sid) && $sid =~ m{\A[^/\\\0]+\z} && $sid !~ /\.\./;
+my $continuity_dir = $ENV{CCPRAXIS_CONTINUITY_ACTIVE_DIR};
+$continuity_dir = ($ENV{HOME} // '.') . '/.claude/ccpraxis/.continuity-active'
+    unless defined $continuity_dir && length $continuity_dir;
+my $armed = (length $sid && -f "$continuity_dir/$sid") ? 1 : 0;
+
+my $BADGE_SLOT = row_cost('WATCHED');
+my $badge = $armed ? "${OK}WATCHED${R}" : (' ' x $BADGE_SLOT);
+$marker .= ' ' . $badge;
+
 # ── Git (with background fetch every 30 min) ────────────────
 my $git_str = '';
 eval {

@@ -457,3 +457,87 @@ bp_drive_marker() {
   printf '%s/%s' "$dir" "$sid"
   return 0
 }
+
+# ---------------------------------------------------------------------------
+# g01-explicit-continuity-arming: a THIRD, INDEPENDENT registry, sibling to
+# .drive-solo-active/.reporter-active — explicit arm/disarm for a session
+# doing unattended work with no blueprint, no drive-solo, no reporter. See
+# specs/g01-explicit-continuity-arming-spec.md SS2.3.
+# ---------------------------------------------------------------------------
+
+# bp_continuity_active_dir -> echoes the machine-level registry of ARMED
+# continuity sessions. One flat dir; primary markers named by session id,
+# companions dot-suffixed (see bp_continuity_marker).
+bp_continuity_active_dir() {
+  if [ -n "${CCPRAXIS_CONTINUITY_ACTIVE_DIR:-}" ]; then
+    printf '%s' "$CCPRAXIS_CONTINUITY_ACTIVE_DIR"
+    return 0
+  fi
+  printf '%s' "${HOME:-$PWD}/.claude/ccpraxis/.continuity-active"
+}
+
+# bp_continuity_ttl_hours -> the staleness limit, sanitised exactly like
+# bp_drive_ttl_hours.
+bp_continuity_ttl_hours() {
+  local h="${CCPRAXIS_CONTINUITY_TTL_H:-12}"
+  case "$h" in ''|*[!0-9]*) h=12 ;; esac
+  [ "$h" -gt 0 ] 2>/dev/null || h=12
+  printf '%s' "$h"
+}
+
+# bp_continuity_marker SESSION_ID -> echoes the primary marker path.
+# Refuses everything bp_drive_marker refuses, PLUS a literal '.' anywhere in
+# the id — companions are dot-suffixed off the primary marker's own path, so
+# a dotted session id would be indistinguishable from a companion file by
+# bp_continuity_any_active's own basename-has-no-dot sweep discrimination.
+bp_continuity_marker() {
+  local sid="${1:-}" dir
+  [ -n "$sid" ] || return 1
+  case "$sid" in
+    */*|*\*|.|..|*..*|*.*) return 1 ;;
+  esac
+  dir=$(bp_continuity_active_dir)
+  printf '%s/%s' "$dir" "$sid"
+  return 0
+}
+
+# bp_continuity_any_active -> rc 0 iff >=1 LIVE marker after reaping every
+# expired primary marker (and its companions), INLINE, regardless of which
+# session is doing the sweeping.
+#
+# THIS IS THE REAP POINT — owner-independent by construction. Mirrors
+# bp_drive_any_active's own reasoning (lib.sh:395-412 above) for the identical
+# historical defect: a per-session TTL check that only ever runs for the
+# session whose id matches a marker leaves a dead session's marker immortal,
+# because that session never returns to reap its own. Sweeping the WHOLE
+# directory on every caller's behalf, unconditionally, is what closes it.
+bp_continuity_any_active() {
+  local dir now ttl mt f base live=1
+  dir=$(bp_continuity_active_dir)
+  [ -d "$dir" ] || return 1
+
+  now=$(date +%s 2>/dev/null || echo 0)
+  ttl=$(bp_continuity_ttl_hours)
+
+  # See bp_drive_any_active's own comment on "${1:-}" under set -u + nullglob.
+  set -- "$dir"/*
+  [ -e "${1:-}" ] || return 1
+
+  live=0
+  for f in "$@"; do
+    [ -f "$f" ] || continue
+    base=$(basename "$f")
+    case "$base" in *.*) continue ;; esac   # companion file, not a primary marker
+    if [ "$now" -gt 0 ]; then
+      mt=$(stat -c %Y "$f" 2>/dev/null || echo 0)
+      if [ "$mt" -gt 0 ] && [ $(( (now - mt) / 3600 )) -ge "$ttl" ]; then
+        rm -f "$f" "$f.wakeup-pending" "$f.stop-blocks" "$f.stop-ok" 2>/dev/null
+        continue
+      fi
+    fi
+    live=$((live + 1))
+  done
+
+  [ "$live" -gt 0 ] || return 1
+  return 0
+}

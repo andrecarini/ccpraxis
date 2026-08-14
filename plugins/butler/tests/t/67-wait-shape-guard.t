@@ -804,9 +804,13 @@ is(action_of('0'),     'deny', 'AC-29 [pure]: bp_ws_action_of "0" -> DENY');
     my $stop = ($H && $H->{hooks}{Stop}) // [];
     is(scalar(@$stop), 1, 'AC-34: Stop still has exactly one block');
     ok(!exists $stop->[0]{matcher}, 'AC-34: Stop block still has no matcher key');
+    # UPDATED 2026-08-14 (g01-explicit-continuity-arming), same discipline as the
+    # PostToolUse relaxation immediately above: brought up to reality, not
+    # loosened. gate-continuity.sh is a legitimate THIRD entry appended to this
+    # same unmatchered block; the list stays EXACT and ORDERED.
     is_deeply([ map { $_->{command} } @{ $stop->[0]{hooks} // [] } ],
-              [ $cmd_of->('gate-stop.sh'), $cmd_of->('gate-drive-loop.sh') ],
-              'AC-34: Stop hook list unchanged');
+              [ $cmd_of->('gate-stop.sh'), $cmd_of->('gate-drive-loop.sh'), $cmd_of->('gate-continuity.sh') ],
+              'AC-34: Stop hook list is exactly [gate-stop.sh, gate-drive-loop.sh, gate-continuity.sh] IN ORDER');
 
     # AC-35(a): the absence of a matcher key IS the "reached for every tool" evidence. (b) is the
     # behavioural conjunction asserted in the jq-gated group below.

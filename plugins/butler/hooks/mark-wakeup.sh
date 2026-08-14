@@ -218,8 +218,6 @@ if [ "$TOOL" = "Bash" ] && [ -n "$DATA" ]; then
 fi
 # --- end reporter registration block ----------------------------------------
 
-[ -n "$DATA" ] && [ -d "$DATA/.drive-solo" ] || exit 0
-
 # ---------------------------------------------------------------------------
 # ARMING: this hook is what registers a session as a drive-solo DRIVER.
 #
@@ -244,19 +242,34 @@ fi
 # disarms itself the moment the director answers 'done'. A false NEGATIVE
 # leaves a real driver ungated, which is the silent mid-run death this whole
 # pair exists to prevent. When in doubt, arm.
-SID=$(bp_json_get "$PAYLOAD" session_id 2>/dev/null || true)
-if [ "$TOOL" = "Bash" ] && [ -n "$SID" ]; then
-  if printf '%s' "$PAYLOAD" | grep -Eq 'bp-drive-next\.pl[^"]*(next|record-order|park)'; then
-    if MARK=$(bp_drive_marker "$SID" 2>/dev/null); then
-      mkdir -p "$(dirname "$MARK")" 2>/dev/null \
-        && printf '%s\n' "$DATA" > "$MARK" 2>/dev/null || true
+#
+# g01: this block, and its own .drive-solo gate, are UNTOUCHED in effect
+# (spec §2.4) -- a drive-solo run must already have an order dir before a
+# director call can register a driver here. Only the wake-up-write section
+# below (post-ARMING) is restructured to add an independent, unconditional
+# continuity write.
+if [ -n "$DATA" ] && [ -d "$DATA/.drive-solo" ]; then
+  SID=$(bp_json_get "$PAYLOAD" session_id 2>/dev/null || true)
+  if [ "$TOOL" = "Bash" ] && [ -n "$SID" ]; then
+    if printf '%s' "$PAYLOAD" | grep -Eq 'bp-drive-next\.pl[^"]*(next|record-order|park)'; then
+      if MARK=$(bp_drive_marker "$SID" 2>/dev/null); then
+        mkdir -p "$(dirname "$MARK")" 2>/dev/null \
+          && printf '%s\n' "$DATA" > "$MARK" 2>/dev/null || true
+      fi
     fi
   fi
 fi
+# --- end ARMING block --------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# WAKE-UP DETECTION (g01-explicit-continuity-arming, spec §2.4). Computed
+# ONCE, unconditionally -- no longer gated behind .drive-solo existing --
+# then branched into two INDEPENDENT writes. A session that is simultaneously
+# driving AND continuity-armed gets both writes from the same event.
+is_wakeup=0
 case "$TOOL" in
   Task|Agent)
-    : ;;                                  # always a wake-up -- unchanged for Task, NEW for Agent.
+    is_wakeup=1 ;;                        # always a wake-up -- unchanged for Task, NEW for Agent.
                                            # Deliberately reads NO field off the payload (e.g. no
                                            # subagent_type): that field is verified present for
                                            # Task (track-dispatch.sh:24 and others) but UNVERIFIED
@@ -271,12 +284,28 @@ case "$TOOL" in
     # 2026-08-07 — it resolves string scalars only). Using it here would have
     # silently classified every backgrounded Bash call as foreground, so the
     # gate would have blocked turns that legitimately scheduled a wake-up.
-    printf '%s' "$PAYLOAD" | grep -q '"run_in_background"[[:space:]]*:[[:space:]]*true' || exit 0 ;;
-  *)
-    exit 0 ;;
+    if printf '%s' "$PAYLOAD" | grep -q '"run_in_background"[[:space:]]*:[[:space:]]*true'; then
+      is_wakeup=1
+    fi ;;
 esac
 
-mkdir -p "$DATA/.drive-solo" 2>/dev/null || exit 0
-printf '%s %s\n' "$TOOL" "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)" \
-  > "$DATA/.drive-solo/.wakeup-pending" 2>/dev/null || true
+[ "$is_wakeup" = 1 ] || exit 0
+
+# --- existing path, UNCHANGED IN EFFECT -- still requires .drive-solo -------
+if [ -n "$DATA" ] && [ -d "$DATA/.drive-solo" ]; then
+  mkdir -p "$DATA/.drive-solo" 2>/dev/null && \
+    printf '%s %s\n' "$TOOL" "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)" \
+      > "$DATA/.drive-solo/.wakeup-pending" 2>/dev/null || true
+fi
+
+# --- NEW path -- independent of .drive-solo, keyed by THIS session's own ---
+# continuity marker. Written ONLY if that session is already armed (the
+# marker file exists) -- this hook never arms continuity itself.
+CSID=$(bp_json_get "$PAYLOAD" session_id 2>/dev/null || true)
+if [ -n "$CSID" ]; then
+  if CMARK=$(bp_continuity_marker "$CSID" 2>/dev/null); then
+    [ -f "$CMARK" ] && : > "$CMARK.wakeup-pending" 2>/dev/null || true
+  fi
+fi
+
 exit 0

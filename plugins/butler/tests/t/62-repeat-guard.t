@@ -370,9 +370,20 @@ is(gate_verdict_call('Edit', 'worksite', 1),  'deny',  'AC-21: regression - bp_g
     # append to a block it does not own -- so the expected list grows by exactly
     # the entry that was registered on purpose, and this still fails if
     # repeat-guard.sh ever shows up here.
+    # UPDATED 2026-08-14 (driver-adjudicated). This had been RED since h01 and g02
+    # appended gate-headless-background.sh and guard-judge-checks.sh to this block,
+    # and w03 later added guard-validation-interlock.sh -- none of them updated this
+    # list. THE SAME STALE PIN EXISTED IN THREE FILES: t/64-ledger-guard.t and
+    # t/67-wait-shape-guard.t were corrected earlier today; this one was missed
+    # because the fix was driven off the two files a worker happened to name rather
+    # than off a grep for the pattern. Brought up to reality, NOT loosened -- the
+    # list stays EXACT and ORDERED, so b10's claim (repeat-guard.sh must never
+    # appear in a block it does not own) still fails the moment it does.
     is_deeply([ map { $_->{command} } @{ $b1->{hooks} // [] } ],
-              [ $cmd_of->('guard-bash.sh'), $cmd_of->('mark-wakeup.sh') ],
-              'AC-20: block 1 command list unchanged');
+              [ $cmd_of->('guard-bash.sh'), $cmd_of->('mark-wakeup.sh'),
+                $cmd_of->('gate-headless-background.sh'), $cmd_of->('guard-judge-checks.sh'),
+                $cmd_of->('guard-validation-interlock.sh') ],
+              'AC-20: block 1 command list is exactly the five registered Bash hooks IN ORDER (repeat-guard.sh appearing here still fails)');
 
     my $b2 = $pre->[2] // {};
     is($b2->{matcher}, 'Task', 'AC-20: block 2 matcher unchanged');
@@ -401,7 +412,16 @@ is(gate_verdict_call('Edit', 'worksite', 1),  'deny',  'AC-21: regression - bp_g
     is($h3->{timeout}, 15, 'AC-20: block 3 hook timeout=15');
 
     my $post = ($H && $H->{hooks}{PostToolUse}) // [];
-    is(scalar(@$post), 1, 'AC-20: PostToolUse has exactly one block');
+    # RELAXED 2026-08-14 (driver-adjudicated), mirroring the identical relaxations
+    # in plugins/butler/tests/t/64-ledger-guard.t and t/67-wait-shape-guard.t and
+    # the operator-approved PreToolUse precedent of 2026-08-03. Only the
+    # prohibition on APPENDING A NEW BLOCK is lifted: w03 registers
+    # untrack-worker-solo.sh under a Task|Agent PostToolUse block. b10's own claim
+    # stays pinned by the assertions below -- block 0's matcher and its exact
+    # command list -- so a missing, renamed or reordered log-dispatch.sh, or
+    # repeat-guard.sh appearing here, still fails.
+    #   OLD: is(scalar(@$post), 1, 'AC-20: PostToolUse has exactly one block');
+    cmp_ok(scalar(@$post), '>=', 1, 'AC-20: PostToolUse still has at least the 1 pre-w03 block (later packages may append)');
     is($post->[0]{matcher}, 'Task', 'AC-20: PostToolUse block matcher is "Task"');
     is_deeply([ map { $_->{command} } @{ $post->[0]{hooks} // [] } ],
               [ $cmd_of->('log-dispatch.sh') ],
@@ -410,11 +430,13 @@ is(gate_verdict_call('Edit', 'worksite', 1),  'deny',  'AC-21: regression - bp_g
     my $stop = ($H && $H->{hooks}{Stop}) // [];
     is(scalar(@$stop), 1, 'AC-20: Stop has exactly one block');
     ok(!exists $stop->[0]{matcher}, 'AC-20: Stop block has NO "matcher" key');
-    # b46 also registered gate-drive-loop.sh on Stop (559379c). Same reasoning:
-    # the claim is that b10 did not touch the Stop block, and it still holds.
+    # b46 also registered gate-drive-loop.sh on Stop (559379c), and g01
+    # (2026-08-14) appended gate-continuity.sh to the same block. Same
+    # reasoning: the claim is that b10 did not touch the Stop block, and it
+    # still holds -- brought up to reality, not loosened.
     is_deeply([ map { $_->{command} } @{ $stop->[0]{hooks} // [] } ],
-              [ $cmd_of->('gate-stop.sh'), $cmd_of->('gate-drive-loop.sh') ],
-              'AC-20: Stop hook list is [gate-stop.sh, gate-drive-loop.sh]');
+              [ $cmd_of->('gate-stop.sh'), $cmd_of->('gate-drive-loop.sh'), $cmd_of->('gate-continuity.sh') ],
+              'AC-20: Stop hook list is [gate-stop.sh, gate-drive-loop.sh, gate-continuity.sh]');
 
     for my $f (qw(gate-shutdown.sh guard-writes.sh guard-bash.sh track-dispatch.sh log-dispatch.sh gate-stop.sh repeat-guard.sh)) {
         my $path = "$HOOKS/$f";
