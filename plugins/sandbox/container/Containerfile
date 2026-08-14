@@ -14,6 +14,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     socat \
     && rm -rf /var/lib/apt/lists/*
 
+# Cache-busting ARG for the fetch step below (fix-batch step 7, finding F5).
+# A plain `RUN curl ...` layer is cached by Buildah/Podman keyed on the
+# command TEXT plus preceding layers -- an unchanged instruction is NOT
+# re-executed on a routine rebuild, so a cached image would trust a
+# GitHub-rotated/revoked host key (this happened in 2023) forever, with none
+# of the existing staleness triggers (launcher.pl ~2413-2470: version
+# mismatch, container age > 7 days, Containerfile hash drift, ...) ever
+# busting THIS layer specifically -- they only prompt a normal, cache-enabled
+# rebuild. Fix: reuse the SAME 7-day cadence already driving the "container
+# age" staleness check (launcher.pl, `$age_days > 7`) rather than invent a
+# new independent timer -- the launcher passes this ARG a value that changes
+# roughly weekly (`int(time / (7*86400))`), so the fetch layer's cache key
+# changes on that cadence and the keys actually refresh instead of rotting.
+ARG P02_SSH_HOST_KEYS_CACHEBUST=0
 # === BEGIN p02-ssh-host-keys fetch ===
 # The image ships openssh-client but no SSH host keys for any git remote, so
 # any ssh clone (e.g. Claude Code's own plugin installer cloning over SSH)
@@ -27,14 +41,60 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # weaken or skip host-key checking and does not use an unattended
 # trust-on-first-use scan -- it supplies the keys and leaves strict checking ON.
 # SCOPE: GitHub only -- no evidence of a non-GitHub ssh consumer in this
-# codebase; extending to another host is future work, not a one-line change.
-# A failed fetch (no network, rate limit, or unexpected JSON shape) must
-# fail the BUILD loudly rather than ship an image with zero host keys, so
-# the whole step is one && chain with no soft-fail. Written 2026-08-14.
-RUN curl -fsSL https://api.github.com/meta -o /tmp/gh-meta.json \
+# codebase, so extending to another host is future work, not a one-line change.
+# ALL THREE GitHub SSH endpoints ARE covered (fix-batch step 7, finding F3),
+# via a comma-separated known_hosts pattern list rather than three duplicate
+# lines: `github.com` (port 22) plus `ssh.github.com` and
+# `[ssh.github.com]:443` (the port-443 workaround for networks that block
+# outbound 22). All three present the SAME host keys, so one key line serving
+# all three patterns is both correct and 1:1 with the fetched key count.
+# Covering only `github.com` would have reproduced the exact reported symptom
+# ("No ED25519 host key is known for github.com") for any user on a
+# port-22-blocked network -- i.e. precisely the user most likely to need the
+# workaround. The oracle's AC1d prefix assertion was amended by driver
+# authorisation to require all three patterns: the amendment makes it
+# STRICTER, and AC1c's one-line-per-key count is unchanged by construction.
+# A failed fetch (no network, rate limit, unexpected JSON shape, or a
+# malformed/unsafe ssh_keys entry -- fix-batch step 7, findings F1/F2/F6) must
+# fail the BUILD loudly rather than ship an image with zero, incomplete, or
+# unsafe host keys, so the whole step is one && chain with no soft-fail.
+# GUARDS, in order: (1) curl with bounded timeouts/retries (F4) so a
+# black-holed network fails loudly instead of hanging the build forever;
+# (2) `[ -s gh-meta.json ]` rejects a 200-with-empty-body response BEFORE it
+# reaches jq -e, which -- verified against real jq -- reports success on
+# zero-byte input despite its own intent to reject an empty/missing
+# ssh_keys (F6); (3) `jq -e length>0` rejects a missing/null/empty ssh_keys
+# array; (4) the `jq -r` filter itself now VALIDATES every element before
+# writing ANY line: rejects an entry containing an embedded newline/carriage
+# return (F2 -- unvalidated raw-string output let one malicious element
+# inject extra un-prefixed lines, e.g. a `*`/`@cert-authority *` wildcard
+# trusted for every SSH host the container ever contacts, not just
+# github.com) and rejects any entry that doesn't match a known key-type
+# token followed by a base64 blob with nothing else (F1 -- an empty-string
+# element such as `{"ssh_keys":[""]}` previously passed every guard and
+# shipped a keyless "github.com " line that looks healthy but verifies
+# nothing). The newline check runs BEFORE the shape regex and is a literal
+# substring test, not relied on via `^`/`$` anchors, because those anchor to
+# LINE boundaries in jq's (oniguruma) regex engine, not string boundaries --
+# an anchored shape check alone would not catch a mid-string newline.
+# jq's `error()` aborts the WHOLE filter (no partial output) the moment the
+# count of validated entries differs from the input count, so a
+# partially-bad response is refused entirely rather than silently shipping
+# fewer keys -- an filter that merely `select()`ed out bad elements without
+# this count comparison would re-create F1 in a quieter form; (5) `[ -s
+# ssh_known_hosts ]` catches a write that produced zero bytes; (6) a final
+# `grep`-based shape assertion over every written line is redundant with (4)
+# by construction but kept as an explicit, cheap belt-and-suspenders check
+# per the red-team's own suggested mitigation, so a future refactor of the
+# jq filter that silently weakens the validation still fails the build.
+# Written 2026-08-14, revised 2026-08-14 (fix-batch step 7).
+RUN : "cachebust=${P02_SSH_HOST_KEYS_CACHEBUST}" \
+    && curl -fsSL --connect-timeout 10 --max-time 45 --retry 2 --retry-delay 2 --retry-all-errors https://api.github.com/meta -o /tmp/gh-meta.json \
+    && [ -s /tmp/gh-meta.json ] \
     && jq -e '(.ssh_keys // []) | length > 0' /tmp/gh-meta.json > /dev/null \
-    && jq -r '.ssh_keys[] | "github.com " + .' /tmp/gh-meta.json > /etc/ssh/ssh_known_hosts \
+    && jq -r '(.ssh_keys // []) as $all | ($all | map(select((test("\n") or test("\r")) | not)) | map(select(test("^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521) [A-Za-z0-9+/=]+$")))) as $valid | if ($valid | length) != ($all | length) then error("p02: an ssh_keys entry failed key-shape validation") else $valid[] end | "github.com,ssh.github.com,[ssh.github.com]:443 " + .' /tmp/gh-meta.json > /etc/ssh/ssh_known_hosts \
     && [ -s /etc/ssh/ssh_known_hosts ] \
+    && ! grep -qvE '^github\.com,ssh\.github\.com,\[ssh\.github\.com\]:443 (ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521) [A-Za-z0-9+/=]+$' /etc/ssh/ssh_known_hosts \
     && rm -f /tmp/gh-meta.json
 # === END p02-ssh-host-keys fetch ===
 
@@ -52,7 +112,11 @@ RUN curl -fsSL https://api.github.com/meta -o /tmp/gh-meta.json \
 
 # Install Claude Code via native installer (installs to /root/.local/bin)
 ARG CLAUDE_VERSION=latest
-RUN curl -fsSL https://claude.ai/install.sh | bash -s -- ${CLAUDE_VERSION}
+# --connect-timeout/--max-time/--retry* added fix-batch step 7 (finding F4,
+# extended from the p02-ssh-host-keys step to its sibling curl invocations
+# per the reviewer's note -- same rationale: a black-holed network must fail
+# the build loudly rather than hang it forever). No other behavior changed.
+RUN curl -fsSL --connect-timeout 10 --max-time 60 --retry 2 --retry-delay 2 --retry-all-errors https://claude.ai/install.sh | bash -s -- ${CLAUDE_VERSION}
 ENV PATH="/root/.local/bin:${PATH}"
 
 # Terminal — enable 24-bit color support (matches host terminal)
@@ -80,7 +144,10 @@ ENV NODE_OPTIONS="--dns-result-order=ipv4first"
 #   pnpm 11.19.0 (3d) and 11.18.0/dist-tag latest (5d) were both too new;
 #   11.17.0 (2026-07-23, 11 days old) is the newest ELIGIBLE release.
 # Installed by tarball (not apt/nodesource) so the version is pinned exactly.
-RUN curl -sSL https://nodejs.org/dist/v24.18.0/node-v24.18.0-linux-x64.tar.xz -o /tmp/node.tar.xz \
+# --connect-timeout/--max-time/--retry* added fix-batch step 7 (finding F4);
+# see the identical note above the Claude Code installer RUN step. --max-time
+# is larger here (the node tarball is a much bigger download).
+RUN curl -sSL --connect-timeout 10 --max-time 180 --retry 2 --retry-delay 3 --retry-all-errors https://nodejs.org/dist/v24.18.0/node-v24.18.0-linux-x64.tar.xz -o /tmp/node.tar.xz \
     && tar -xf /tmp/node.tar.xz -C /tmp \
     && mv /tmp/node-v24.18.0-linux-x64 /opt/node24 \
     && ln -sf /opt/node24/bin/node /usr/local/bin/node \

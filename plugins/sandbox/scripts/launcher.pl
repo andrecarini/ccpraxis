@@ -2032,8 +2032,18 @@ sub build_image {
     _emit_step(_c_step("Building claude-sandbox image with Claude Code v${HOST_VERSION}..."), "\n");
     log_ev('image_build_start', { version => $HOST_VERSION });
     _tx("\n--- image build (v${HOST_VERSION}) ---\n");
+    # p02-ssh-host-keys fix-batch step 7, finding F5: the Containerfile's
+    # GitHub-host-key fetch RUN layer is otherwise cached forever by
+    # Buildah/Podman (cache key = command text + preceding layers, not wall
+    # clock), so a rotated/revoked GitHub host key (happened in 2023) would
+    # stay trusted indefinitely across ordinary rebuilds. Bust that ONE
+    # layer's cache on the SAME cadence already driving the "container age"
+    # staleness trigger below (`$age_days > 7`), rather than a new
+    # independent timer: this value changes roughly weekly.
+    my $ssh_host_keys_cachebust = int(time() / (7 * 86400));
     my $rc = _tee_system($PODMAN, 'build',
         '--build-arg', "CLAUDE_VERSION=${HOST_VERSION}",
+        '--build-arg', "P02_SSH_HOST_KEYS_CACHEBUST=${ssh_host_keys_cachebust}",
         '-t', "claude-sandbox:${HOST_VERSION}",
         '-t', 'claude-sandbox:latest',
         $CONTAINER_CONFIG);
