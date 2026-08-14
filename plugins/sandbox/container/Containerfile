@@ -14,6 +14,30 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     socat \
     && rm -rf /var/lib/apt/lists/*
 
+# === BEGIN p02-ssh-host-keys fetch ===
+# The image ships openssh-client but no SSH host keys for any git remote, so
+# any ssh clone (e.g. Claude Code's own plugin installer cloning over SSH)
+# fails closed with "Host key verification failed" -- there is nothing in
+# /etc/ssh/ssh_known_hosts to verify against. Fix: populate it at build time
+# from GitHub's own published host-key list at https://api.github.com/meta
+# (.ssh_keys[]), fetched over TLS authenticated by the ca-certificates bundle
+# already installed above -- no separate secret or pinned blob needed, and
+# refetched on every cache-invalidated build rather than vendored once and
+# left to rot. VERIFICATION IS STRENGTHENED, NEVER DISABLED: this does not
+# weaken or skip host-key checking and does not use an unattended
+# trust-on-first-use scan -- it supplies the keys and leaves strict checking ON.
+# SCOPE: GitHub only -- no evidence of a non-GitHub ssh consumer in this
+# codebase; extending to another host is future work, not a one-line change.
+# A failed fetch (no network, rate limit, or unexpected JSON shape) must
+# fail the BUILD loudly rather than ship an image with zero host keys, so
+# the whole step is one && chain with no soft-fail. Written 2026-08-14.
+RUN curl -fsSL https://api.github.com/meta -o /tmp/gh-meta.json \
+    && jq -e '(.ssh_keys // []) | length > 0' /tmp/gh-meta.json > /dev/null \
+    && jq -r '.ssh_keys[] | "github.com " + .' /tmp/gh-meta.json > /etc/ssh/ssh_known_hosts \
+    && [ -s /etc/ssh/ssh_known_hosts ] \
+    && rm -f /tmp/gh-meta.json
+# === END p02-ssh-host-keys fetch ===
+
 # Container runs as root.
 #
 # Rationale: this is a rootless-Podman dev sandbox. Container UID 0 (root)
