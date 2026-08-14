@@ -75,7 +75,7 @@ Exit codes are meaningful and you should branch on them: **0** ok · **2** the w
 Why each op exists rather than an `Edit`:
 
 - **`append-attempt`** inserts at the end of `## Decisions & attempt log`, always as exactly one line, always outside any fenced code block. The one-line rule is not cosmetic — it is what makes two forgeries structurally impossible: the entry starts `- <ISO>` so it can never open a fence (which would break the fence-scoped `MEANS-DEVIATION:` guard below), and its `-` is followed by a digit so it can never forge a `- [x]` checkbox.
-- **`tick-step`** only ever ticks inside the **Pipeline** section, so no op can emit a `- [x]` anywhere else.
+- **`tick-step`** only ever ticks inside `## Pipeline`, so no op can emit a `- [x]` anywhere else.
 - **`set-next-action`** replaces the `## Next action` body wholesale — the one section that is meant to be rewritten.
 - **`add-output`** appends to `## Outputs`, replacing a `_(none yet)_` placeholder if that is all that is there.
 - **`rotate`** moves stale `## Decisions & attempt log` entries out to `reports/ledger-history/<pkg>.md` (a path derived from your ledger's own `.../packages/<pkg>.md` shape — never guess a different location: `bp-resume-sweep.sh` and `bp-status.sh` glob `packages/*.md`, so history must never land there or it gets enumerated as a bogus package). See "Context budget" below for when and why to run it.
@@ -143,7 +143,7 @@ than silent**:
   it couldn't reach budget. Landing over budget loudly is an honest outcome; dropping an entry to hit
   the number is not an option `rotate` will ever take.
 - **Sections `rotate` never touches:** everything except `## Decisions & attempt log` — frontmatter,
-  `## Scope`, `## Done criteria`, `## Inputs`, `## Out of scope`, the **Pipeline** section, `## Next action`,
+  `## Scope`, `## Done criteria`, `## Inputs`, `## Out of scope`, `## Pipeline`, `## Next action`,
   `## Outputs`, `## Escalation`, `## Dispatch log (auto)`. `--dry-run` reports what would move without
   touching either file; `rotate` is idempotent (a repeat run with the same arguments changes nothing).
 

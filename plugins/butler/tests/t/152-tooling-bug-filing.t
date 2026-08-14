@@ -59,13 +59,37 @@ my $reporter_txt  = slurp($REPORTER);
 my $drivesolo_txt = slurp($DRIVESOLO);
 my $coord_txt     = slurp($COORD);
 
+# heading_pos($text, '## Foo') -> byte offset of that ATX heading as a real
+# heading (start of line, nothing after it but whitespace), or -1.
+#
+# ADDED 2026-08-14 by driver adjudication. Every scan below originally used a
+# bare index($text, '## Foo'), which matches the string ANYWHERE -- including
+# inside ordinary backticked prose that merely NAMES a heading. That is not a
+# hypothetical: coordinator-protocol/SKILL.md legitimately mentions `## Pipeline`
+# twice in running text, once inside a list enumerating literal section names.
+# index() found the prose mention first, the scan failed, and the implementer
+# reasonably reworded the DOCUMENTATION to get the test green -- leaving one
+# item in a list of headings formatted unlike its siblings, i.e. the prose got
+# worse to suit the oracle.
+#
+# That is defect shape #5 in this run's catalogue: a malformed oracle shaping
+# production code. It already put grep-based workarounds into a live hook once
+# (t/142 -> mark-wakeup.sh). The fix belongs in the scan, not in the prose: a
+# heading is a line, so match it as one.
+sub heading_pos {
+    my ($text, $heading) = @_;
+    return -1 unless defined $text && defined $heading;
+    return $-[0] if $text =~ /^\Q$heading\E[ \t]*$/m;
+    return -1;
+}
+
 # ---------------------------------------------------------------------------
 # AC1 -- reporter/SKILL.md: "## Filing a ccpraxis tooling bug" before "## Boundaries"
 # ---------------------------------------------------------------------------
 {
     my $heading = '## Filing a ccpraxis tooling bug';
-    my $hpos = index($reporter_txt, $heading);
-    my $bpos = index($reporter_txt, '## Boundaries');
+    my $hpos = heading_pos($reporter_txt, $heading);
+    my $bpos = heading_pos($reporter_txt, '## Boundaries');
     ok($hpos >= 0, 'AC1: reporter/SKILL.md has "## Filing a ccpraxis tooling bug"');
     ok($bpos >= 0, 'AC1 precondition: reporter/SKILL.md still has "## Boundaries"');
     ok($hpos >= 0 && $bpos >= 0 && $hpos < $bpos,
@@ -84,8 +108,8 @@ my $coord_txt     = slurp($COORD);
 my $drivesolo_section = '';
 {
     my $heading = '## Filing a ccpraxis tooling bug';
-    my $hpos = index($drivesolo_txt, $heading);
-    my $cpos = index($drivesolo_txt, '## Commit mechanics');
+    my $hpos = heading_pos($drivesolo_txt, $heading);
+    my $cpos = heading_pos($drivesolo_txt, '## Commit mechanics');
     ok($hpos >= 0, 'AC2: drive-solo/SKILL.md has "## Filing a ccpraxis tooling bug"');
     ok($cpos >= 0, 'AC2 precondition: drive-solo/SKILL.md still has "## Commit mechanics"');
     ok($hpos >= 0 && $cpos >= 0 && $hpos > $cpos,
@@ -105,7 +129,7 @@ my $drivesolo_section = '';
 my $reporter_section = '';
 {
     my $heading = '## Filing a ccpraxis tooling bug';
-    my $hpos = index($reporter_txt, $heading);
+    my $hpos = heading_pos($reporter_txt, $heading);
     if ($hpos >= 0) {
         my $rest = substr($reporter_txt, $hpos + length($heading));
         my $endrel = $rest =~ /^\s*##\s/m ? $-[0] : length($rest);
@@ -132,8 +156,8 @@ for my $case ([reporter => $reporter_section], [drivesolo => $drivesolo_section]
 # ---------------------------------------------------------------------------
 my $prose_vs_mech_section = '';
 {
-    my $mpos = index($coord_txt, '## Mandated means & deviations');
-    my $ppos = index($coord_txt, '## Pipeline');
+    my $mpos = heading_pos($coord_txt, '## Mandated means & deviations');
+    my $ppos = heading_pos($coord_txt, '## Pipeline');
     ok($mpos >= 0, 'AC4 precondition: coordinator-protocol still has "## Mandated means & deviations"');
     ok($ppos >= 0, 'AC4 precondition: coordinator-protocol still has "## Pipeline"');
 
