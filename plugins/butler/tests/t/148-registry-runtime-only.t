@@ -168,8 +168,25 @@ my @ALLOWLIST = (
       pattern => qr/\$entry->\{status\}\s*=\s*\$by_pkg\{\$pkg\}/ },
     { label => 'bp-answer-decision.pl:706 (status => $plan->{ledger_status})', path => $ANSWER_PATH,
       pattern => qr/status\s*=>\s*\$plan->\{ledger_status\}/ },
-    { label => 'bp-resume-sweep.sh:98 (found by this test-writer, NOT in the spec\x27s table -- registry_merge ... {"status":"done"})',
-      path => $SWEEP_PATH, pattern => qr/\{"status":"done"\}/ },
+    # REMOVED 2026-08-14 by driver adjudication. This entry pinned
+    # bp-resume-sweep.sh:98's status write as "still present (the gap is real,
+    # not stale)" -- i.e. it asserted a DEFECT AS CORRECT, which is one of the
+    # twelve oracle-defect shapes catalogued in this run. That was the RIGHT
+    # call when written: the file sat outside s02's write set, and pinning the
+    # gap loudly beat letting the suite go permanently red for something the
+    # package could not touch. The test-writer flagged it for the driver rather
+    # than hiding it, which is why it is being corrected here instead of
+    # shipping.
+    #
+    # The driver then WIDENED s02's write_set to include
+    # plugins/butler/scripts/bp-resume-sweep.sh, precisely because DC1 ("no code
+    # path writes a status key") was otherwise unsatisfiable. With the file in
+    # scope, this entry contradicts DC1, so it is dropped -- which hands
+    # bp-resume-sweep.sh to the exhaustive out-of-allowlist scan below, where it
+    # must now prove it does NOT write registry status.
+    #
+    # The four entries above stay. They are genuinely outside this package's
+    # write set and remain deliberately-documented, tested gaps.
 );
 
 {
