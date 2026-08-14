@@ -1108,12 +1108,29 @@ sub _lifecycle_alert_msg {
     return "$label done: $summary";
 }
 
+# t03-banner-dismiss, step-6 red-team LOW-1 (ruled, kept): this function is
+# pure over $state alone and does not consult $state->{pending}, so the
+# '[d] dismiss' hint below renders even while a stop-runs/full-shutdown/
+# relaunch confirm is armed -- at which point Dashboard::dispatch_key
+# actually routes 'd' to cancel that confirm, not to dismiss the banner
+# (Dashboard.pm's pending-branches run first, spec S2.3/S5). Kept as-is: the
+# spec explicitly documents and accepts this trade-off (it never widens
+# _banner_lines's contract to take $pending), the failure direction is a
+# banner that STAYS VISIBLE rather than one that gets hidden (the opposite of
+# this package's actual attack surface -- information suppression), and
+# fixing it would require widening this function's signature and
+# re-verifying every AC4 exact-string assertion in the oracle for a cosmetic
+# gain. Revisit only if a future package needs _banner_lines to be
+# pending-aware for an unrelated reason.
 sub _banner_lines {
     my ($state) = @_;
     $state = {} unless ref($state) eq 'HASH';
     my @msgs = grep { defined($_) && length($_) }
-        ( _lifecycle_alert_msg($state), _status_alert_msg($state),
-          (defined($state->{install_warning}) && !ref($state->{install_warning}) ? $state->{install_warning} : undef) );
+        ( _lifecycle_alert_msg($state), _status_alert_msg($state) );
+    if (defined($state->{install_warning}) && !ref($state->{install_warning})
+            && length($state->{install_warning})) {
+        push @msgs, $state->{install_warning} . '  [d] dismiss';
+    }
     return [ map { '  !! ' . tui::Frame::safe($_) } @msgs ];
 }
 

@@ -2158,6 +2158,11 @@ sub dispatch_key {
     # token is introduced, so the :2024 whitelist above needs no entry and
     # has nothing to forget.
     return ('backpack', '')           if $key eq 'b';
+    # t03-banner-dismiss S2.3: dismiss the backpack-install-warning banner.
+    # Lowercase-only, deliberately -- same rationale as 'b' above: 'D' is the
+    # LEFT arrow's CSI final byte (\e[D), so an uppercase alias risks firing
+    # on an unassembled escape sequence.
+    return ('dismiss-install-warning', '') if $key eq 'd';
     # Up/down scroll the Activity panel. The read-key seam assembles the arrow
     # escape sequences into the 'UP'/'DOWN' tokens (also accept k/j as aliases).
     return ('scroll-up', $pending)    if $key eq 'UP'   || $key eq 'k';
@@ -3601,6 +3606,25 @@ sub run {
     my $hb_state = 'ok';        # last heartbeat result; 'gone' no longer exits the loop
     my @all_events;             # full chronological event list from the last gather
     my $activity_offset = 0;    # up/down scroll position in the Activity panel
+    # t03-banner-dismiss S2.4: lives OUTSIDE %state's replace-on-gather
+    # lifecycle (same reasoning as $pending/$activity_offset above) and is
+    # re-applied onto %state every tick, so a forced regather ([r]/relaunch,
+    # or simply the next periodic $state_int tick) cannot resurrect a
+    # dismissed install-warning banner.
+    #
+    # SAFETY INVARIANT this flag depends on (step-6 red-team MEDIUM-1): this
+    # is a BLANKET, content-blind, per-process mute -- once set, it suppresses
+    # WHATEVER install_warning the next gather returns, not just the string
+    # that was on screen at dismiss time. That is only safe because every
+    # $INSTALL_WARNING assignment in launcher.pl executes before this loop is
+    # ever entered (_launch_stage_begin('dashboard')) -- so no NEW/different
+    # warning can ever arise while this flag is live to swallow it. That
+    # invariant is enforced by plugins/sandbox/tests/t/87-banner-dismiss.t
+    # PART 7 (a source-structure scan of launcher.pl); if a future change adds
+    # or moves an $INSTALL_WARNING assignment to after the dashboard stage
+    # begins, that test goes red -- read it before "fixing" this flag to be
+    # content-aware or removing it.
+    my $install_warning_dismissed = 0;
     my $activity_max    = 0;    # scroll ceiling (set each frame by activity_window)
     my $flash_until = 0;        # footer-flash expiry (set when [c] hit a dead container)
     my $last_recover_at;        # now() when the last [l] recovery FINISHED (undef: none yet)
@@ -3706,6 +3730,12 @@ sub run {
                     ($cols, $rows) = $term_size->();
                     my $base = $gather->() || {};
                     %state = %$base;
+                    # t03-banner-dismiss S2.4: %state was just wholesale-replaced
+                    # from $base, which unconditionally re-supplies whatever
+                    # install_warning the gather seam has -- re-apply the
+                    # dismissal here so a forced/periodic regather can't
+                    # resurrect a banner the operator already dismissed.
+                    $state{install_warning} = undef if $install_warning_dismissed;
                     @all_events = @{ $base->{events} || [] };   # chronological
                     $activity_offset = 0 if $activity_offset < 0;
                     $last_state = $t;
@@ -3874,6 +3904,17 @@ sub run {
                         $out->(render_frame($prev, $bframe, { color => $color }));
                         $prev = $bframe;
                         last;   # stop draining; keys pressed after the modal wait for the next tick
+                    }
+                    elsif ($action eq 'dismiss-install-warning') {
+                        # t03-banner-dismiss S2.4: two writes, not one -- the
+                        # immediate undef makes THIS tick's render correct
+                        # without waiting for $do_rerender; the lexical flag
+                        # (re-applied at :3713-ish, right after the wholesale
+                        # %state = %$base replace) makes every FUTURE gather
+                        # correct too.
+                        $install_warning_dismissed = 1;
+                        $state{install_warning} = undef;
+                        $scroll_dirty = 1;   # same-tick re-render, mirrors scroll's own flag
                     }
                     elsif ($action eq 'scroll-up') {
                         # Only a view-changing scroll marks the frame dirty; a no-op
