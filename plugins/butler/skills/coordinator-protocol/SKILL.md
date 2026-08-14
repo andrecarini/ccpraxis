@@ -329,9 +329,18 @@ Recognising a finding as a genuine ccpraxis tooling defect — as opposed to you
 an ordinary scope note, or a declined nit — is a **judgement** call. No hook makes it, and none
 should: a gate on an undetectable condition is worse than none.
 
-Once that judgement is made and a report is filed, the `TOOLING-BUG-FILED:` marker's **integrity**
-is **mechanical**: `id=` must resolve to a real, existing report file, and `why=` must be non-empty —
-the same shape as the deviation marker documented above.
+Once that judgement is made and a report is filed, the `TOOLING-BUG-FILED:` marker's **integrity** is
+**defined and mechanically checkable**: `id=` must resolve to a real, existing report file whose own
+frontmatter `id:` matches, and `why=` must be non-empty — the same shape as the deviation marker
+documented in "Mandated means & deviations" above. **Say exactly what that buys you today, not
+more:** this grammar is proven by an exercised test (`t/152-tooling-bug-filing.t`), and any reader can
+apply it by hand — but, unlike that deviation marker, it is **not yet wired into any live hook or into
+the remediation engine** that acts on it automatically. A forged or missing `id=` today produces no
+automatic finding and blocks nothing — nobody acts on it until a human, or a future package, wires
+this check into a `PreToolUse` hook or the conformance judge (named explicit follow-up, out of this
+package's write set). Until then, a defined, tested, checkable-by-hand grammar is still worth more
+than free prose with no shared marker — just not the same thing as that other marker's automatic
+enforcement.
 
 Two other candidates were considered and are explicitly **not** gated. **CONSTRAINT CONFLICT** is
 never gated: the signal does not correlate with "this is a ccpraxis tooling defect" — a surfaced

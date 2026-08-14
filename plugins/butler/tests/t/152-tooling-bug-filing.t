@@ -76,10 +76,39 @@ my $coord_txt     = slurp($COORD);
 # production code. It already put grep-based workarounds into a live hook once
 # (t/142 -> mark-wakeup.sh). The fix belongs in the scan, not in the prose: a
 # heading is a line, so match it as one.
+# FIX-BATCH (step 7, F5): the version above (driver, 64105de) anchored a
+# heading to its own physical line but had two remaining gaps, both found by
+# red-team M2/L3 and both currently non-triggering in committed content
+# (confirmed by grep before this fix), which is luck rather than design:
+#   - no fence-awareness: a line that LOOKS like a heading inside a fenced
+#     example block still counted as a real one.
+#   - CRLF/BOM fragility: a trailing \r before the line-end anchor, or a BOM
+#     as the literal first three bytes of the file, made a real heading on
+#     that line invisible.
+# Fixed by scanning line-by-line via byte offsets (never split(), which loses
+# separator length and would desync the returned offset), toggling a fence
+# flag exactly like parse_tooling_bug_filed's marker scan below, stripping a
+# trailing \r before matching, and skipping a leading UTF-8 BOM for matching
+# purposes only -- the returned offset always indexes the ORIGINAL $text.
 sub heading_pos {
     my ($text, $heading) = @_;
     return -1 unless defined $text && defined $heading;
-    return $-[0] if $text =~ /^\Q$heading\E[ \t]*$/m;
+    my $len = length($text);
+    my $off = (substr($text, 0, 3) eq "\xEF\xBB\xBF") ? 3 : 0;
+    my $fenced = 0;
+    while ($off <= $len) {
+        my $nl = index($text, "\n", $off);
+        my $line_end = ($nl == -1) ? $len : $nl;
+        my $line = substr($text, $off, $line_end - $off);
+        $line =~ s/\r\z//;
+        if ($line =~ /^\s*(?:```|~~~)/) {
+            $fenced = !$fenced;
+        } elsif (!$fenced && $line =~ /^\Q$heading\E[ \t]*\z/) {
+            return $off;
+        }
+        last if $nl == -1;
+        $off = $nl + 1;
+    }
     return -1;
 }
 
@@ -178,6 +207,14 @@ like($prose_vs_mech_section, qr/CONSTRAINT CONFLICT/, 'AC4a: names CONSTRAINT CO
 like($prose_vs_mech_section, qr/ORACLE EDIT/, 'AC4a: names ORACLE EDIT explicitly');
 like($prose_vs_mech_section, qr/CONSTRAINT CONFLICT[^.]{0,400}?\b(not|never)\b[^.]{0,120}?(gate|gated|marker)/is,
      'AC4a: states CONSTRAINT CONFLICT is not gated (within the same passage)');
+# FIX-BATCH (step 7, F7 first item, reviewer S1): the CONSTRAINT CONFLICT
+# "not gated" assertion above had no ORACLE EDIT mirror -- only a bare
+# presence check (qr/ORACLE EDIT/), so the "ORACLE EDIT ... likewise never
+# gated" clause could be deleted entirely and this oracle would stay green
+# as long as the bare string "ORACLE EDIT" remained anywhere in the section.
+# Both halves of AC4 now hold the same shape.
+like($prose_vs_mech_section, qr/ORACLE EDIT[^.]{0,400}?\b(not|never)\b[^.]{0,120}?(gate|gated|marker)/is,
+     'AC4a: states ORACLE EDIT is not gated (within the same passage)');
 like($prose_vs_mech_section, qr/TOOLING-BUG-FILED/, 'AC4b: mentions the TOOLING-BUG-FILED marker');
 like($prose_vs_mech_section, qr/mechanical/i, 'AC4b: calls the marker\'s integrity "mechanical"');
 like($prose_vs_mech_section, qr/judg[e]?ment/i, 'AC4b: names the underlying call a "judgement"');
@@ -189,7 +226,14 @@ like($prose_vs_mech_section, qr/judg[e]?ment/i, 'AC4b: names the underlying call
 {
     like($coord_txt, qr/TOOLING-BUG-FILED:\s*id=/,
          'AC5: coordinator-protocol documents the TOOLING-BUG-FILED: id=... grammar');
-    like($coord_txt, qr/why=/, 'AC5 precondition: why= appears somewhere (MEANS-DEVIATION already uses it)');
+    # FIX-BATCH (step 7, F7 second item, reviewer S2): the original precondition
+    # (qr/why=/, whole-file) was satisfiable by MEANS-DEVIATION's PRE-EXISTING
+    # why= alone, so it passed regardless of whether TOOLING-BUG-FILED's OWN
+    # grammar line carried why= at all -- it tested nothing about the marker
+    # this AC names. Tightened to require id= and why= on the SAME grammar
+    # line, which only TOOLING-BUG-FILED's own documented grammar can satisfy.
+    like($coord_txt, qr/TOOLING-BUG-FILED:\s*id=[^\n]*\bwhy=/,
+         'AC5: the TOOLING-BUG-FILED grammar line itself carries both id= and why=');
 
     my $mdpos = index($coord_txt, 'MEANS-DEVIATION');
     my $tbfpos = index($coord_txt, 'TOOLING-BUG-FILED');
@@ -274,6 +318,14 @@ like($prose_vs_mech_section, qr/judg[e]?ment/i, 'AC4b: names the underlying call
 #         plus EXACTLY one new textual cross-reference from AC4/AC5 (=> 4).
 #         Baseline measured directly from disk, 2026-08-14, before this
 #         package's diff (grep -c MEANS-DEVIATION coordinator-protocol/SKILL.md == 3).
+#
+# FIX-BATCH (step 7, F1) note: M1's honesty fix (the "Prose vs. mechanism"
+# subsection) deliberately avoids the literal `MEANS-DEVIATION:` token —
+# "the deviation marker documented in 'Mandated means & deviations' above" /
+# "that deviation marker" / "that other marker" throughout — specifically so
+# this pre-existing, unmodified assertion keeps holding without being
+# touched. The ORIGINAL MEANS-DEVIATION section remains byte-for-byte
+# unedited (confirmed by diff during this fix-batch).
 # ---------------------------------------------------------------------------
 {
     my $count = () = $coord_txt =~ /MEANS-DEVIATION/g;
@@ -313,18 +365,56 @@ sub write_body_file {
 # Deliberately re-implemented here rather than imported -- spec SS2 rules this
 # package ships no new script, and the check must be exercised INSIDE the
 # oracle, not delegated to production code that does not exist yet.
+# FIX-BATCH (step 7, F4, F6):
+#
+# F4 -- red-team M1: the original single-match (non-/g) section regex
+# captured only the FIRST "## Decisions & attempt log" occurrence, so a
+# duplicated heading (a plausible merge/edit artifact -- this run filed a
+# real report about exactly this class of accidental duplication,
+# 20260814-093030-2d3f, for test file numbers) silently hid every marker
+# after the first occurrence: a false negative directly threatening Done
+# Criterion 5 ("nothing double-files"), since a worker whose genuine marker
+# silently fails to register has every incentive to re-file. DECIDED: union
+# ALL occurrences rather than reject the ledger outright -- a marker in ANY
+# occurrence of the structurally-mandated heading is a real filing, and
+# rejecting the whole ledger would make the failure mode WORSE (every marker
+# lost, not just the ones after the first) for a defect this test's own
+# authors cannot prevent occurring in a live ledger.
+#
+# F6 -- red-team M3: a marker inside a single-backtick inline code span (an
+# illustrative "e.g. `TOOLING-BUG-FILED: ...`" mention while documenting the
+# grammar for a future reader -- verified as a REAL pattern: this run's own
+# ledger entries write exactly this kind of illustrative aside) or inside a
+# 4-space-indented Markdown code block was counted as a genuine filing.
+# THE SINGLE RULE APPLIED: a marker counts only in plain running/list text --
+# never inside a fenced code block (unchanged from the original design),
+# never inside an inline single-backtick code span (detected by an ODD count
+# of backticks preceding the marker on its own line -- standard inline-code-
+# span parsing: odd means still inside an unclosed span at that point), and
+# never on a line that opens with 4+ spaces of indentation (a Markdown
+# indented code block, distinct from a normal ledger bullet which starts at
+# column 0). Same family of rule as the fence check two lines above it --
+# "is this text or is this an example of text" -- applied consistently to
+# every place that question can arise on one line.
 sub parse_tooling_bug_filed {
     my ($txt) = @_;
     my @out;
     return @out unless defined $txt && length $txt;
-    my ($sec) = $txt =~ /^##\s+Decisions\s*&\s*attempt\s+log\s*$(.*?)(?=^##\s|\z)/ms;
-    return @out unless defined $sec;
+    my @sections = $txt =~ /^##\s+Decisions\s*&\s*attempt\s+log\s*$(.*?)(?=^##\s|\z)/msg;
+    return @out unless @sections;
+    my $sec = join("\n", @sections);
     my $fenced = 0;
     for my $ln (split /\r?\n/, $sec) {
         $ln =~ s/\r$//;
         if ($ln =~ /^\s*(?:```|~~~)/) { $fenced = !$fenced; next }
         next if $fenced;
-        next unless $ln =~ /TOOLING-BUG-FILED:\s*(.*)$/;
+        next if $ln =~ /^\s{4,}\S/;   # indented code block -- illustrative, not a marker
+        next unless $ln =~ /TOOLING-BUG-FILED:/;
+        my $mpos = index($ln, 'TOOLING-BUG-FILED:');
+        my $before = substr($ln, 0, $mpos);
+        my $backtick_count = () = $before =~ /`/g;
+        next if $backtick_count % 2 == 1;   # inside an inline code span -- illustrative mention
+        $ln =~ /TOOLING-BUG-FILED:\s*(.*)$/;
         my $rest = $1;
         my $STOP = qr/(?=\s+id=|\s+why=|$)/;
         my ($id)  = $rest =~ /\bid=(.*?)$STOP/;
@@ -336,12 +426,50 @@ sub parse_tooling_bug_filed {
     return @out;
 }
 
+# FIX-BATCH (step 7, F2, F3): red-team H1/H2 defeated the original version of
+# this reference checker with its own reference implementation:
+#
+# F3 -- H2: `id=` had NO character restriction, so a relative-traversal id
+# (`../../evil-planted/forged`) walked straight out of bug-reports/ via naive
+# string concatenation (absolute-looking ids already failed safe -- Perl
+# concatenation doesn't treat a leading `/` as a path reset -- but relative
+# traversal was a live vector). FIXED by constraining `id=` to the exact
+# shape `almanac-bug.pl`'s own `AlmanacBug::new_id()` generates
+# (`plugins/almanac/scripts/almanac-bug.pl:195-200`:
+# `\d{8}-\d{6}-[0-9a-f]{4}`) -- no `/`, `\`, or `.` can ever pass, so
+# traversal is rejected by construction, not by path-normalization logic
+# that could itself have a bug.
+#
+# F2 -- H1: a plain `.md` file with NO almanac frontmatter, dropped into
+# bug-reports/ by any means other than `almanac-bug.pl file` -- which
+# `almanac-bug.pl`'s own `list`/`verify` correctly recognize as "not a
+# report" -- was accepted by a bare `-f` as a fully resolved filing, even
+# though `almanac-bug.pl list` for the same project shows ZERO reports.
+# FIXED by requiring the target to actually BE a report: frontmatter must
+# parse, its own `id:` field must match the marker's `id=` (closing the loop
+# H1 identified as the single missing check), and it must carry a non-empty
+# `status:` -- not merely that some file exists at the naively-derived path.
 sub marker_resolves {
     my ($marker, $project_root) = @_;
     return 0 unless defined $marker->{id} && length $marker->{id};
     return 0 unless defined $marker->{why} && length $marker->{why};   # why= must be non-empty
+    return 0 unless $marker->{id} =~ /^\d{8}-\d{6}-[0-9a-f]{4}$/;      # F3: reject traversal by construction
     my $path = "$project_root/.ccpraxis-local-data/bug-reports/$marker->{id}.md";
-    return -f $path ? 1 : 0;
+    return 0 unless -f $path;
+    open my $fh, '<:raw', $path or return 0;
+    local $/;
+    my $content = <$fh>;
+    close $fh;
+    return 0 unless defined $content && $content =~ /\A---\r?\n(.*?)\r?\n---\r?\n/s;
+    my $fm = $1;
+    my %f;
+    for my $line (split /\r?\n/, $fm) {
+        next unless $line =~ /^([A-Za-z0-9_]+):\s*(.*)$/;
+        $f{$1} = $2;
+    }
+    return 0 unless defined $f{id} && $f{id} eq $marker->{id};        # F2: frontmatter id must match
+    return 0 unless defined $f{status} && length $f{status};          # F2: must actually be a report
+    return 1;
 }
 
 # --- snapshot the REAL project's bug-reports dir, to prove AC14 afterwards --
@@ -371,7 +499,7 @@ my ($real_id) = defined($real_report_path) ? ($real_report_path =~ m{([^/\\]+)\.
 ok(defined $real_id && length $real_id, 'AC7/AC10 setup: a real report id was extracted from the printed path');
 
 SKIP: {
-    skip 'no real filed report to build a marker against', 8 unless defined $real_id;
+    skip 'no real filed report to build a marker against', 26 unless defined $real_id;
 
     # ---- AC7, branch 1: a marker citing the REAL id resolves --------------
     my $ledger_real = <<"LEDGER";
@@ -476,6 +604,108 @@ LEDGER
     my @markers_fenced = parse_tooling_bug_filed($ledger_fenced);
     is(scalar(@markers_fenced), 0,
        'AC7 grammar: a marker inside a fenced code block is never counted, even with a real id');
+
+    # =========================================================================
+    # FIX-BATCH (step 7) -- F2, F3, F4, F5, F6: exercised, adversarial coverage
+    # added against the reviewer/red-team findings. Each block below FAILS if
+    # the corresponding fix in marker_resolves()/parse_tooling_bug_filed()/
+    # heading_pos() is reverted -- confirmed during this fix-batch.
+    # =========================================================================
+
+    # ---- F2 (H1): a plain .md with NO almanac frontmatter is REJECTED, even
+    #      though a bare -f would have accepted it and almanac-bug.pl list
+    #      agrees nothing was ever filed for that id. ------------------------
+    my $junk_id = '20990101-000000-dead';   # valid id= GRAMMAR, never actually filed
+    my $bugreports_dir = "$TMPPROJECT/.ccpraxis-local-data/bug-reports";
+    ok(-d $bugreports_dir || mkdir($bugreports_dir), 'F2 setup: bug-reports dir exists in scratch project')
+        or diag("mkdir failed: $!");
+    open(my $junk_fh, '>:raw', "$bugreports_dir/$junk_id.md") or die "cannot write junk fixture: $!";
+    print {$junk_fh} "not a real almanac report -- no frontmatter, never filed via almanac-bug.pl\n";
+    close $junk_fh;
+    my ($junk_code, $junk_list_out) = run_almanac('list', '--project', $TMPPROJECT);
+    is($junk_code, 0, 'F2 setup: almanac-bug.pl list still exits 0 with the junk file present');
+    unlike($junk_list_out, qr/\Q$junk_id\E/,
+           'F2 setup precondition: almanac-bug.pl itself does NOT count the junk file as a report');
+    my $marker_junk = { id => $junk_id, why => 'planted junk file, never filed' };
+    ok(!marker_resolves($marker_junk, $TMPPROJECT),
+       'F2: marker_resolves REJECTS a plain .md with no almanac frontmatter, unlike a bare -f check');
+
+    # ---- F3 (H2): a relative-traversal id= is REJECTED outright, by grammar,
+    #      before any filesystem check even runs. ---------------------------
+    mkdir "$TMPPROJECT/evil-planted";
+    open(my $evil_fh, '>:raw', "$TMPPROJECT/evil-planted/forged.md") or die "cannot write evil fixture: $!";
+    print {$evil_fh} "this is not a real almanac report, never filed, no frontmatter\n";
+    close $evil_fh;
+    my $marker_traversal = { id => '../../evil-planted/forged', why => 'path traversal attempt' };
+    ok(!marker_resolves($marker_traversal, $TMPPROJECT),
+       'F3: marker_resolves REJECTS a relative-traversal id= outright');
+    # A well-formed real id continues to resolve after the grammar check was
+    # added -- the fix narrows what's ACCEPTED, it doesn't break the true case.
+    ok(marker_resolves({ id => $real_id, why => 'still resolves after F3' }, $TMPPROJECT),
+       'F3 regression guard: a genuinely well-formed id still resolves after the grammar constraint');
+
+    # ---- F4: a duplicated "## Decisions & attempt log" heading no longer
+    #      hides a marker that lives only in the SECOND occurrence. ---------
+    my $ledger_dup_heading = <<"LEDGER";
+## Decisions & attempt log
+
+- 2026-08-14T00:00:07Z -- driver -- first copy, no marker here
+
+## Something else
+
+## Decisions & attempt log
+
+- 2026-08-14T00:00:08Z -- driver -- TOOLING-BUG-FILED: id=$real_id why=marker only in the SECOND occurrence
+LEDGER
+    my @markers_dup_heading = parse_tooling_bug_filed($ledger_dup_heading);
+    is(scalar(@markers_dup_heading), 1,
+       'F4: a marker inside the SECOND occurrence of a duplicated heading is still found');
+    ok(@markers_dup_heading && marker_resolves($markers_dup_heading[0], $TMPPROJECT),
+       'F4: and it resolves, because it cites the real id');
+
+    # ---- F6: an illustrative, backtick-quoted mention of the marker (while
+    #      documenting the grammar for a future reader) is NOT counted, even
+    #      though it sits on a real ledger bullet line in the right section.
+    my $ledger_illustrative = <<"LEDGER";
+## Decisions & attempt log
+
+- 2026-08-14T00:00:09Z -- driver -- documented the grammar for later use, e.g. \`TOOLING-BUG-FILED: id=$real_id why=illustrative example only, never actually meant as a real filing\`
+LEDGER
+    my @markers_illustrative = parse_tooling_bug_filed($ledger_illustrative);
+    is(scalar(@markers_illustrative), 0,
+       'F6: an inline-backtick-quoted illustrative mention of the marker is not counted as a real filing');
+
+    # ---- F6: a 4-space-indented Markdown code block quoting the marker is
+    #      also not counted. -------------------------------------------------
+    my $ledger_indented = <<"LEDGER";
+## Decisions & attempt log
+
+Example ledger line:
+
+    TOOLING-BUG-FILED: id=$real_id why=indented example, not a real bullet
+LEDGER
+    my @markers_indented = parse_tooling_bug_filed($ledger_indented);
+    is(scalar(@markers_indented), 0,
+       'F6: a 4-space-indented illustrative code block is not counted as a real filing');
+
+    # ---- F5: heading_pos() is fence-aware -- a line that LOOKS like a
+    #      heading inside a fenced example block is not a real heading. -----
+    my $fenced_heading_doc = "# Title\n\n```\nExample doc structure:\n## Boundaries\n```\n\nSome real content.\n## Boundaries\nReal section body.\n";
+    my $fence_aware_pos = heading_pos($fenced_heading_doc, '## Boundaries');
+    ok($fence_aware_pos >= 0, 'F5: heading_pos still finds the REAL heading after the fenced example');
+    my $real_heading_offset = index($fenced_heading_doc, "## Boundaries\nReal section body");
+    is($fence_aware_pos, $real_heading_offset,
+       'F5: heading_pos skips the fenced false positive and returns the REAL heading\'s offset');
+
+    # ---- F5: heading_pos() tolerates CRLF line endings on the heading line.
+    my $crlf_doc = "# Title\r\n\r\n## Boundaries\r\nReal content.\r\n";
+    ok(heading_pos($crlf_doc, '## Boundaries') >= 0,
+       'F5: heading_pos matches a heading whose line ends in CRLF, not just LF');
+
+    # ---- F5: heading_pos() tolerates a UTF-8 BOM as the literal first bytes.
+    my $bom_doc = "\xEF\xBB\xBF## Boundaries\nReal content.\n";
+    ok(heading_pos($bom_doc, '## Boundaries') >= 0,
+       'F5: heading_pos matches a heading immediately preceded by a UTF-8 BOM as the file\'s first bytes');
 }
 
 # ---- AC10: `list --project <tmp>` shows the freshly filed title -----------
