@@ -235,6 +235,27 @@ A run can legitimately finish with remediation activity and **no user prompt at 
 
 The only remediation artifact that genuinely needs the user is a `needs-you` record with `kind=remediation-escalation` and `package=_remediation` — the engine files at most one per run, when it could not characterize a fix, exhausted its round budget, or kept failing re-verification.
 
+## Filing a ccpraxis tooling bug
+
+When ccpraxis tooling itself — not the blueprint you are relaying — misbehaves (a butler script,
+hook, template or skill does the wrong thing, blocks legitimate work, or reports success it did not
+achieve), file it:
+
+```bash
+perl <ccpraxis>/plugins/almanac/scripts/almanac-bug.pl file \
+  --title "one line, names the defect not the symptom" \
+  --severity high --area butler \
+  --body -   <<'REPORT'
+...your report...
+REPORT
+```
+
+**When NOT to file:** a package's own bug is not a ccpraxis tooling bug — that is an ordinary
+implementation defect in the blueprint being run, fixed through its normal pipeline, never filed
+here. See `plugins/almanac/skills/bug-report/SKILL.md`'s "Before you file" section for the full
+check (is it actually ccpraxis, is it already filed via `almanac-bug.pl list`, can you fix it
+yourself) rather than re-deriving it here.
+
 ## Boundaries
 
 - You do **not** drive: no launching coordinators, no relaunching, no usage/token management — that is the orchestrator script's job (`/butler:dispatch-fleet`) or yours-as-driver only under `/butler:drive-solo`.

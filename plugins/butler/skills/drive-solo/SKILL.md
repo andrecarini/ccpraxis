@@ -225,6 +225,27 @@ guess in the permissive direction.
 
 Commits are yours (workers and coordinators are hook-blocked from git): atomic, one commit per coherent deliverable, project CLAUDE.md policy, no `Co-Authored-By`.
 
+## Filing a ccpraxis tooling bug
+
+You dispatch coordinators and read their reports — when the tooling underneath them (a butler
+script, hook, template, or skill) misbehaves, blocks legitimate work, or reports success it did not
+achieve, file it yourself:
+
+```bash
+perl <ccpraxis>/plugins/almanac/scripts/almanac-bug.pl file \
+  --title "one line, names the defect not the symptom" \
+  --severity high --area butler \
+  --body -   <<'REPORT'
+...your report...
+REPORT
+```
+
+**When NOT to file:** a package's own bug — the feature the blueprint is building — is not a
+ccpraxis tooling bug; that is an ordinary defect, fixed through the pipeline's implementer loop,
+never filed here. See `plugins/almanac/skills/bug-report/SKILL.md`'s "Before you file" section (is
+it actually ccpraxis, is it already filed via `almanac-bug.pl list`, can you fix it yourself)
+rather than re-deriving that check.
+
 ## Self-modifying blueprints
 
 > **self-modifying** blueprints — blueprints that edit butler's own executor, hooks, or skills — must be driven HERE (interactively), NEVER as a self-modifying dispatch-fleet. The running session keeps its already-loaded instructions, so the mid-run rewrite is safe. Do NOT re-read this SKILL.md file mid-run (Decision #11/#20).

@@ -75,7 +75,7 @@ Exit codes are meaningful and you should branch on them: **0** ok · **2** the w
 Why each op exists rather than an `Edit`:
 
 - **`append-attempt`** inserts at the end of `## Decisions & attempt log`, always as exactly one line, always outside any fenced code block. The one-line rule is not cosmetic — it is what makes two forgeries structurally impossible: the entry starts `- <ISO>` so it can never open a fence (which would break the fence-scoped `MEANS-DEVIATION:` guard below), and its `-` is followed by a digit so it can never forge a `- [x]` checkbox.
-- **`tick-step`** only ever ticks inside `## Pipeline`, so no op can emit a `- [x]` anywhere else.
+- **`tick-step`** only ever ticks inside the **Pipeline** section, so no op can emit a `- [x]` anywhere else.
 - **`set-next-action`** replaces the `## Next action` body wholesale — the one section that is meant to be rewritten.
 - **`add-output`** appends to `## Outputs`, replacing a `_(none yet)_` placeholder if that is all that is there.
 - **`rotate`** moves stale `## Decisions & attempt log` entries out to `reports/ledger-history/<pkg>.md` (a path derived from your ledger's own `.../packages/<pkg>.md` shape — never guess a different location: `bp-resume-sweep.sh` and `bp-status.sh` glob `packages/*.md`, so history must never land there or it gets enumerated as a bogus package). See "Context budget" below for when and why to run it.
@@ -83,6 +83,33 @@ Why each op exists rather than an `Edit`:
 **What no op may touch, and neither may you:** `## Dispatch log (auto)` is hook-maintained and never agent-edited. `mandated_means:` has no op and none may be added — rewriting the requirement to match what you built is the one move that defeats the whole mechanism.
 
 Prose sections the API does not model (`## Scope`, `## Inputs`, and your own narrative) are still yours to write with `Edit` — but anchor on a unique string, never rewrite the whole file.
+
+### The `TOOLING-BUG-FILED:` marker
+
+Same family as `MEANS-DEVIATION:` above — a marker mandated in prose, counted only inside
+`## Decisions & attempt log`, and never inside a fenced code block, so quoting this documentation in
+a ledger cannot forge one either:
+
+```
+TOOLING-BUG-FILED: id=<almanac report id> why=<one-line: why this is unreachable from this package>
+```
+
+Write it once — never before — `almanac-bug.pl file` has actually succeeded and printed a path:
+`id=` is the filename it printed, minus `.md`, never guessed ahead of the real filing. `why=` must
+be **non-empty**, the same integrity rule as that marker's own `why=`. Write it via `bp-ledger.pl
+append-attempt`, never hand-edited — same discipline as every other structured ledger change.
+
+Write it when BOTH hold: (1) the finding is a genuine ccpraxis tooling defect, not your own
+package's bug — the same test `plugins/almanac/skills/bug-report/SKILL.md`'s "Before you file"
+already asks; (2) it is not fixable inside your own write set — matches
+`.ccpraxis-local-data/guidance/fix-ccpraxis-defects-in-place.md`'s own carve-out. If it IS reachable,
+that guidance's default applies instead: fix it, file nothing.
+
+A worked example of the quality bar a filed report needs (bug-report's "What makes a report worth
+reading" transfers almost verbatim): the registry-path `$PWD` guess still live at
+`plugins/butler/hooks/lib.sh:380`, `plugins/butler/hooks/mark-wakeup.sh:214`, and two sites inside
+the reporter's own drive-loop gate script — file:line, verified from disk, evidence stated plainly,
+exactly the bar this filing needs.
 
 ### Context budget — your ledger has one, and a fix when it's blown
 
@@ -116,7 +143,7 @@ than silent**:
   it couldn't reach budget. Landing over budget loudly is an honest outcome; dropping an entry to hit
   the number is not an option `rotate` will ever take.
 - **Sections `rotate` never touches:** everything except `## Decisions & attempt log` — frontmatter,
-  `## Scope`, `## Done criteria`, `## Inputs`, `## Out of scope`, `## Pipeline`, `## Next action`,
+  `## Scope`, `## Done criteria`, `## Inputs`, `## Out of scope`, the **Pipeline** section, `## Next action`,
   `## Outputs`, `## Escalation`, `## Dispatch log (auto)`. `--dry-run` reports what would move without
   touching either file; `rotate` is idempotent (a repeat run with the same arguments changes nothing).
 
@@ -277,6 +304,42 @@ Mechanics worth knowing, because they are parsed literally:
 
 Same standard as the dependency policy above: recorded **and** argued, or it is a failure rather than a judgment call.
 
+## Filing a ccpraxis tooling bug
+
+See `plugins/almanac/skills/bug-report/SKILL.md` for the full doctrine — its "Before you file"
+section (is it actually ccpraxis, is it already filed via `almanac-bug.pl list`, can you fix it
+yourself) — before filing. When it is a genuine, unreachable tooling defect:
+
+```bash
+perl <ccpraxis>/plugins/almanac/scripts/almanac-bug.pl file \
+  --title "one line, names the defect not the symptom" \
+  --severity high --area butler \
+  --body -   <<'REPORT'
+...your report...
+REPORT
+```
+
+Then record it in your ledger with the `TOOLING-BUG-FILED:` marker (see "The `TOOLING-BUG-FILED:`
+marker" above) — never for your OWN package's bug, which is an ordinary implementation defect, fixed
+via the normal loop, never filed.
+
+### Prose vs. mechanism
+
+Recognising a finding as a genuine ccpraxis tooling defect — as opposed to your own package's bug,
+an ordinary scope note, or a declined nit — is a **judgement** call. No hook makes it, and none
+should: a gate on an undetectable condition is worse than none.
+
+Once that judgement is made and a report is filed, the `TOOLING-BUG-FILED:` marker's **integrity**
+is **mechanical**: `id=` must resolve to a real, existing report file, and `why=` must be non-empty —
+the same shape as the deviation marker documented above.
+
+Two other candidates were considered and are explicitly **not** gated. **CONSTRAINT CONFLICT** is
+never gated: the signal does not correlate with "this is a ccpraxis tooling defect" — a surfaced
+spec conflict can resolve as correct, and gating it would manufacture false-positive reports.
+**ORACLE EDIT** authorisation/decline is likewise never gated: it is test-immutability governance,
+not evidence tooling is broken, and layering an unenforced marker onto an already-unenforced
+mechanism (the write-set guard) adds prose, not detection.
+
 ## Pipeline
 
 Workers are dispatched via Task with `subagent_type` set to the **plugin-namespaced** form `butler:bp-<name>` — i.e. `butler:bp-scout`, `butler:bp-architect`, `butler:bp-test-writer`, `butler:bp-implementer`, `butler:bp-reviewer`, `butler:bp-redteam`, `butler:bp-ui-prober`. (Confirmed working 2026-06-11 in a real installed-plugin coordinator run. A bare `bp-<name>` may also resolve, but the namespaced form is authoritative — use it directly so you never spend a turn on an "unknown agent type" retry.)
@@ -302,7 +365,7 @@ Workers are dispatched via Task with `subagent_type` set to the **plugin-namespa
    **Do not assert the whole shape of a shared artifact.** Heading counts, key sets, table sizes, "exactly N ledgers", and literal values of tunable constants all forbid every later package from extending the thing. Assert *your* package's contribution, or a floor — see `t/64`'s AC-36 for the shape of the fix. `bp-shape-lint.pl` flags candidates; run it over any oracle you author.
 
 6. **Review ∥ red-team** (`bp-reviewer` ∥ `bp-redteam`). Read-only, safe to run in parallel.
-7. **Fix-batch.** Consolidate ALL findings from both reports into **one** implementer dispatch — never a sequence of single-finding fixes. Re-validate after.
+7. **Fix-batch.** Consolidate ALL findings from both reports into **one** implementer dispatch — never a sequence of single-finding fixes. Re-validate after. Filing is consolidated the same way: when reviewer and red-team independently name the same tooling defect, file it once — one `TOOLING-BUG-FILED:` marker, never one report per source.
 8. **UI pass** (`bp-ui-prober`), only if the package touches UI. Screenshots get read, the visual checklist applied, findings folded into a final fix-batch if needed.
 
 Check off pipeline steps in the ledger as you go. Steps may be skipped only with a recorded reason.
