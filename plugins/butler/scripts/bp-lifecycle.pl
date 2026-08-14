@@ -1,46 +1,36 @@
 #!/usr/bin/env perl
-# bp-lifecycle.pl — reconcile a blueprint's recorded state with what is actually
-# on disk, and advance its lifecycle when the work is finished.
+# bp-lifecycle.pl — reconcile a blueprint's recorded run-state with what is
+# actually on disk, and archive it once it is done.
 #
-# WHY THIS EXISTS
+# WHAT THIS SCRIPT DOES NOW
 #
-# A blueprint carried four independent records of the same facts:
+# On every observation of a dead (non-live) blueprint it:
 #
-#   1. each package's ledger frontmatter  (`packages/<pkg>.md`, `status:`)
-#   2. the package-status TABLE in `blueprint.md`
-#   3. `runs/registry.json`               (the orchestrator's scratch state)
-#   4. `blueprint.md`'s own `status:`     (drafting|audited|running|done|archived)
+#   1. removes a stale `runs/.orchestrator` marker (one whose pid is no
+#      longer alive, or holds no usable pid at all);
+#   2. clears a TERMINAL package's leftover `pid` from its `runs/registry.json`
+#      entry — this is the only place left that clears that pid
+#      (bp-orchestrator.pl names this script "the only clearer" of it; a
+#      reused pid would otherwise make `bp-status.sh` draw a dead run as
+#      live);
+#   3. archives the blueprint (moves it into `blueprints/_archive/`) once its
+#      lifecycle derives `done` (see `BpState::blueprint_lifecycle`), unless
+#      `--no-archive` was given.
 #
-# Nothing kept them in agreement, and only (1) is written by the thing that
-# actually does the work. Every one of the other three has been observed wrong:
-#
-#   * `sandbox-butler-overhaul` sat at `status: running` with all 77 packages
-#     `done`, indefinitely, because no code path advances a blueprint's own
-#     lifecycle — the orchestrator exits on `run_complete` and releases its
-#     marker, but never records that the initiative finished. It was noticed
-#     only because a human read the ledgers by hand.
-#   * that same blueprint's `runs/registry.json` still claimed 6 `running` and
-#     4 `pending` packages, written 2026-08-01, for packages whose ledgers
-#     reached `done` as late as 2026-08-04 — because the run was finished
-#     interactively rather than by the orchestrator, and nothing reconciles the
-#     registry afterwards.
-#   * `runs/.orchestrator` held pid 18979 from a container reaped on
-#     2026-07-30. The marker is removed on CLEAN exit; an orchestrator that dies
-#     with its container leaves it behind forever, and a reader that treats the
-#     marker's EXISTENCE as liveness then reports a dead run as live.
-#   * the blueprint.md table has drifted from the ledgers before: the
-#     2026-07-28 incident found five packages `done` in their own ledgers but
-#     drawn `pending` in the table, which hid delivered work for days.
+# It does NOT repair blueprint.md's package-status TABLE, and it does NOT
+# reconcile a `runs/registry.json` entry's `status` field — both were retired
+# by s05-retire-reconciler-drift-paths (2026-08-14): the table's writer
+# (`bp-blueprint.pl`'s `set-status` verb) was hard-retired by s03, and no
+# in-scope reader ever consults a registry entry's `status` key any more
+# (only the ledgers are). This script previously also repaired those two
+# copies of package status; see this blueprint's Harvest log for why that
+# became impossible (the 2026-07-28 table-drift incident that motivated the
+# original four-copies design is recorded there, not here).
 #
 # THE RULE THIS SCRIPT ENFORCES
 #
-#   The ledgers are the truth. Everything else is derived, and is repaired to
-#   match on every observation.
-#
-# That is the structural part: staleness cannot accumulate, because it cannot
-# survive being looked at. Wiring this into the observation surfaces (status,
-# the orchestrator's exit, the interactive director) is what makes "a finished
-# blueprint still marked running" unrepresentable rather than merely unlikely.
+#   The ledgers are the truth. Everything else observed here is derived, and
+#   is repaired to match on every observation.
 #
 # SAFETY
 #
@@ -261,21 +251,6 @@ sub bp_call {
     return $ok;
 }
 
-# Read the package-status table as { pkg => normalised status }. Goes through
-# bp_call_out (not backticks) so no path ever reaches a shell: $^X and the
-# script path are Windows paths here, and MSYS argv conversion is disabled.
-sub read_table {
-    my ($file) = @_;
-    my ($ok, $out) = bp_call_out('status', '--file', $file);
-    return undef unless $ok;
-    my %t;
-    for my $ln (split /\n/, ($out // '')) {
-        next unless $ln =~ /\A(\S+):\s*(.*)\z/;
-        $t{$1} = norm_status($2);
-    }
-    return \%t;
-}
-
 # ------------------------------------------------------------- registry ------
 
 sub read_registry {
@@ -407,36 +382,22 @@ sub reconcile_one {
         }
     }
 
-    # --- 2. blueprint.md table drift ---------------------------------------
-    my $table = read_table($bpmd);
-    if (defined $table) {
-        for my $l (@ledgers) {
-            next unless exists $table->{ $l->{pkg} };            # not in the table: authoring's problem, not ours
-            next if $table->{ $l->{pkg} } eq $l->{status};
-            my $detail = "$l->{pkg}: table '$table->{$l->{pkg}}' -> ledger '$l->{status}'";
-            if ($opt->{dry_run}) {
-                push @{ $r{actions} }, { kind => 'table_drift', detail => "would fix $detail", applied => 0 };
-            } else {
-                my ($ok, $out) = bp_call_out('set-status', '--file', $bpmd,
-                                             '--pkg', $l->{pkg}, '--status', $l->{status});
-                if ($ok) {
-                    push @{ $r{actions} }, { kind => 'table_drift', detail => "fixed $detail", applied => 1 };
-                } else {
-                    push @{ $r{errors} }, "could not set table status for $l->{pkg}"
-                                        . (length $out ? ": $out" : '');
-                }
-            }
-        }
-    }
-
-    # --- 3. registry drift --------------------------------------------------
+    # --- 2. registry pid hygiene (was step 3's second half; the
+    #        status-reconciliation half is deleted outright -- s02 made
+    #        runs/registry.json runtime-only and no in-scope reader ever
+    #        consults an entry's status key again (bp-orchestrator.pl's
+    #        ::_load_state reads only attempt/pid/session_id; bp-status.sh
+    #        reads only pid/attempt). A terminal package's leftover pid is
+    #        independently live: bp-orchestrator.pl names this script "the
+    #        only clearer" of it, and bp-status.sh's PROC column consumes
+    #        the same field -- so that half survives, renamed honestly. ----
     my $regpath = "$runs/registry.json";
     if (-f $regpath) {
         my $reg = read_registry($regpath);
         if (!defined $reg) {
             push @{ $r{errors} }, 'runs/registry.json is unreadable or not JSON; left untouched';
         } elsif (ref($reg->{packages}) eq 'HASH') {
-            my @drift;
+            my @cleared;
             my %by_pkg = map { $_->{pkg} => $_->{status} } @ledgers;
             for my $pkg (sort keys %{ $reg->{packages} }) {
                 my $entry = $reg->{packages}{$pkg};
@@ -444,39 +405,22 @@ sub reconcile_one {
                 next unless exists $by_pkg{$pkg};
                 my $ledger_status = $by_pkg{$pkg};
 
-                # s02 (runs/registry.json is runtime-only): an in-scope writer
-                # never sets `status` on an entry anymore, so an ABSENT key is
-                # the new normal, not drift -- there is nothing to compare, and
-                # writing one back in would resurrect exactly the copy that
-                # package existed to remove. Only a key that is genuinely
-                # PRESENT (a pre-s02 registry, or one of the still-outstanding
-                # out-of-write-set writers) is a value that can disagree with
-                # the ledger and be worth repairing.
-                if (exists $entry->{status}) {
-                    my $have = norm_status($entry->{status});
-                    if ($have ne $ledger_status) {
-                        push @drift, "$pkg ($have -> $ledger_status)";
-                        $entry->{status} = $ledger_status unless $opt->{dry_run};
-                    }
-                }
-
                 # A terminal package holds no process -- independent of
                 # whether its entry carries a status key at all (post-s02,
                 # most do not). Leaving a pid behind makes `bp-status.sh`
                 # draw a dead run as having live coordinators the moment
-                # that pid is reused, so this still fires on its own.
-                if (!$opt->{dry_run} && $TERMINAL{$ledger_status} && exists $entry->{pid}) {
-                    delete $entry->{pid};
-                    push @drift, "$pkg (pid cleared)"
-                        unless grep { /^\Q$pkg\E \(/ } @drift;
+                # that pid is reused.
+                if ($TERMINAL{$ledger_status} && exists $entry->{pid}) {
+                    push @cleared, "$pkg (pid cleared)";
+                    delete $entry->{pid} unless $opt->{dry_run};
                 }
             }
-            if (@drift) {
-                my $detail = scalar(@drift) . ' package(s): ' . join(', ', @drift);
+            if (@cleared) {
+                my $detail = scalar(@cleared) . ' package(s): ' . join(', ', @cleared);
                 if ($opt->{dry_run}) {
-                    push @{ $r{actions} }, { kind => 'registry_drift', detail => "would reconcile $detail", applied => 0 };
+                    push @{ $r{actions} }, { kind => 'stale_pid', detail => "would clear $detail", applied => 0 };
                 } elsif (write_registry($regpath, $reg)) {
-                    push @{ $r{actions} }, { kind => 'registry_drift', detail => "reconciled $detail", applied => 1 };
+                    push @{ $r{actions} }, { kind => 'stale_pid', detail => "cleared $detail", applied => 1 };
                 } else {
                     push @{ $r{errors} }, 'could not write runs/registry.json';
                 }
@@ -484,20 +428,11 @@ sub reconcile_one {
         }
     }
 
-    # --- 4. lifecycle advance (report-only; nothing is ever written here) --
+    # --- lifecycle (report-only; nothing is ever written here) -------------
     my $all_delivered = (@ledgers > 0) && !grep { !$DELIVERED{ $_->{status} } } @ledgers;
     $r{all_delivered} = $all_delivered ? 1 : 0;
 
-    if ($lifecycle eq 'done') {
-        push @{ $r{actions} }, {
-            kind    => 'lifecycle',
-            detail  => "blueprint is done (derived; all $r{packages} packages delivered) -- "
-                     . "status: is never written for this transition (Decision 13)",
-            applied => 0,
-        };
-    }
-
-    # --- 5. archive -----------------------------------------------------------
+    # --- 3. archive -----------------------------------------------------------
     if ($opt->{archive} && $lifecycle eq 'done' && !@{ $r{errors} }) {
         my $blueprints = $bpdir;
         $blueprints =~ s{[\\/][^\\/]+\z}{};

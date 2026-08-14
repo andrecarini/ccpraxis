@@ -171,9 +171,21 @@ sub run_lifecycle {
 }
 
 # Table cell for one package, straight off the package-status table row.
+# AMENDED 2026-08-14 by driver adjudication -- the original could not work.
+# It anchored with \z under /m, but /m only re-points ^ and $ at line
+# boundaries; \z remains ABSOLUTE end-of-string. So a table row that was not
+# the very last thing in the file could never match, and worse, the \s* before
+# it spans newlines, so for a row nearer the end the capture reached PAST the
+# table and returned a later line's text. Proven: on a two-row fixture the old
+# pattern returned NO MATCH for the first row and captured "## Harvest log" for
+# the second.
+#
+# Anchoring on $ under /m matches the row's own line, and the trailing
+# optional | consumes the closing pipe of a markdown table row so the capture
+# is the last CELL rather than whatever follows it.
 sub table_cell_of {
     my ($md, $pkg) = @_;
-    return undef unless $md =~ /\Q$pkg\E[^\n]*\|\s*([^\|\n]*)\s*\z/m;
+    return undef unless $md =~ /^[^\n]*\Q$pkg\E[^\n]*?\|\s*([^\|\n]*?)\s*\|?[ \t]*$/m;
     my $v = $1;
     $v =~ s/^\s+|\s+\z//g;
     return $v;
@@ -208,8 +220,21 @@ sub table_cell_of {
         or diag("raw output was not parseable JSON");
     is_deeply($data->[0]{errors}, [], 'AC-9: $r{errors} is empty -- the retired set-status call never fires, so nothing fails')
         if defined $data;
-    is($data->[0]{lifecycle}, 'done',
-       'AC-9: the derived lifecycle reads "done", untouched by either stale copy (the table mismatch, the registry mismatch)')
+    # AMENDED 2026-08-14 by driver adjudication. This asserted 'done', which
+    # CONTRADICTED an already-passing pin in a sibling oracle:
+    # plugins/butler/tests/t/97-lifecycle-reconcile.t:416 requires 'archived'
+    # for this same successful-archive scenario, and that is the correct value --
+    # archiving rewrites the authored word to 'archived', so the derived value
+    # follows it. Written from the spec's AC-9 prose without reconciling against
+    # t/97's existing pin; the implementer hit the disagreement and flagged it
+    # rather than editing the oracle or coding around it.
+    #
+    # THE GUARANTEE IS UNCHANGED and is the point of the assertion: the derived
+    # value is computed from the ledgers, NOT from either stale copy (the table
+    # mismatch or the registry mismatch this fixture deliberately plants). Only
+    # the expected word moves, to the one the archive step legitimately produces.
+    is($data->[0]{lifecycle}, 'archived',
+       'AC-9: the derived lifecycle reads "archived" after a successful archive, computed from the ledgers and untouched by either stale copy (the table mismatch, the registry mismatch)')
         if defined $data;
 
     # THE LIVE-BUG FIX, MADE OBSERVABLE: a directory-existence assertion, not

@@ -25,11 +25,13 @@ DATA=$(bp_data_dir)
 FOUND=0
 STRAYS=()
 
-# Reconcile before reporting. The ledgers are the truth; blueprint.md's own
-# `status:`, its package-status table, runs/registry.json and runs/.orchestrator
-# are all derived, and every one of them has been observed stale (see the header
-# of bp-lifecycle.pl). Repairing on observation is what makes "finished but
-# still marked running" unrepresentable rather than merely unlikely.
+# Reconcile before reporting. As of s05-retire-reconciler-drift-paths
+# (2026-08-14), this repairs only two things on observation: a stale
+# runs/.orchestrator marker, and a terminal package's leftover registry pid
+# (see the header of bp-lifecycle.pl). blueprint.md's package-status table
+# and runs/registry.json's `status` field are NOT repaired here any more —
+# their writer/readers were retired, so there is nothing left to reconcile
+# for either.
 #
 # --no-archive: filing a finished blueprint away is a decision for the verbs
 # that own the lifecycle (/blueprint:manage, the drive loop), not a side effect
