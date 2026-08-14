@@ -181,8 +181,13 @@ sub bp_status_of {
     my ($rc, $data) = run_lifecycle('reconcile', '--blueprint', 'all-done',
                                     '--data-dir', $root, '--no-archive');
     is($rc, 0, 'all-done: exit 0');
-    is(bp_status_of("$dir/blueprint.md"), 'done',
-       'all packages done -> blueprint advances running -> done WITHOUT anyone asking');
+    # RE-WITNESSED for s04-lifecycle-derived (driver ruling 2026-08-14): DC3
+    # forbids writing a literal `status: done`, so the stored field is no
+    # longer where this guarantee is observable. Same guarantee (the
+    # lifecycle ADVANCES to `done` without anyone asking) -- new witness (the
+    # reconciler's derived `lifecycle` JSON field, not the raw stored word).
+    is($data->[0]{lifecycle}, 'done',
+       'all packages done -> lifecycle derives running -> done WITHOUT anyone asking');
     is($data->[0]{all_delivered}, 1, 'all_delivered reported');
     ok((grep { $_->{kind} eq 'lifecycle' } @{ $data->[0]{actions} }),
        'the advance is reported as an action, not done silently');
@@ -235,7 +240,9 @@ sub bp_status_of {
                                     '--data-dir', $root, '--no-archive');
     ok(!-e "$dir/runs/.orchestrator", 'a marker whose pid is dead is removed');
     is($data->[0]{live}, 0, 'the run is reported not-live');
-    is(bp_status_of("$dir/blueprint.md"), 'done', 'and the lifecycle still advances');
+    # RE-WITNESSED for s04-lifecycle-derived (driver ruling 2026-08-14): same
+    # guarantee (advancement survives a stale-marker sweep), new witness.
+    is($data->[0]{lifecycle}, 'done', 'and the lifecycle still advances');
 }
 {
     my $root = tempdir(CLEANUP => 1);
@@ -294,7 +301,10 @@ sub bp_status_of {
     ok((grep { !ref($_) && $_ =~ /could not set table status/ }
               (@{ $data->[0]{actions} || [] }, @{ $data->[0]{errors} || [] })),
        'the failed repair attempt is recorded as an error, not silently dropped or reported as success');
-    is(bp_status_of("$dir/blueprint.md"), 'done',
+    # RE-WITNESSED for s04-lifecycle-derived (driver ruling 2026-08-14): same
+    # guarantee (advancement is unaffected by the permanently-dead table-drift
+    # step), new witness.
+    is($data->[0]{lifecycle}, 'done',
        'and the blueprint STILL advances (all_delivered is ledger-sourced only, independent of table repair)');
 }
 
@@ -365,7 +375,13 @@ sub bp_status_of {
     ok(!-d $dir, 'the blueprint is no longer in the active listing');
     ok(-d "$root/blueprints/_archive/to-archive", 'it is in _archive/ — moved, never deleted');
     ok(-f "$root/blueprints/_archive/to-archive/blueprint.md", 'its content came with it');
-    is(bp_status_of("$root/blueprints/_archive/to-archive/blueprint.md"), 'archived',
+    # RE-WITNESSED for s04-lifecycle-derived (driver ruling 2026-08-14): same
+    # guarantee (advancement all the way to `archived`), new witness. Note
+    # `archived` IS still a literal write (DC6 keeps archiving machine-written
+    # -- only `running`/`done` become unwritable), so bp_status_of would still
+    # agree here; the JSON field is used anyway for consistency with the
+    # other three re-witnessed assertions in this file.
+    is($data->[0]{lifecycle}, 'archived',
        'and it records `archived`, so where it lives and what it says agree');
 }
 {
