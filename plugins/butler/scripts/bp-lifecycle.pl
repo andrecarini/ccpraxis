@@ -523,15 +523,27 @@ sub reconcile_one {
             } else {
                 # Roll back the write above -- but NEVER to a literal 'done'
                 # (DC3 forbids it, and op_set_meta now REJECTS it outright).
-                # The two possible prior authored words were 'audited' or
-                # 'running' (blueprint_lifecycle's own precedence for 'done'
-                # requires exactly one of those); 'running' is also now a hard
-                # refusal, so "restore exactly what was there" cannot be
-                # satisfied for both. 'audited' is always legal and always an
-                # honest description of "human-approved, not yet filed away,
-                # still all-delivered" regardless of which prior word it
-                # replaces (spec §5.1).
+                # The prior authored word that made blueprint_lifecycle derive
+                # 'done' was one of 'audited', 'running' or 'done' itself
+                # (BpState::blueprint_lifecycle's all-delivered advance gate,
+                # fixed in the s04 fix-batch step 7, F1, to include all
+                # three); 'running' and 'done' are both hard refusals for
+                # set-meta now, so "restore exactly what was there" cannot be
+                # satisfied for all of them. 'audited' is always legal and
+                # always an honest description of "human-approved, not yet
+                # filed away, still all-delivered" regardless of which prior
+                # word it replaces (spec §5.1).
                 bp_call('set-meta', '--file', $bpmd, '--field', 'status', '--value', 'audited');
+                # This reconcile's own writes end here, at 'audited' -- not at
+                # whatever $lifecycle/$authored were on entry (possibly
+                # 'running' or 'done'). status_after must reflect the LITERAL
+                # field on disk after this reconcile (spec §2.6), and the
+                # line above is the last thing this reconcile wrote to it.
+                # Found in the s04 fix-batch step 7 review (F3): without this
+                # line status_after stayed at the pre-run authored word,
+                # silently lying about what the failed rollback actually
+                # wrote.
+                $r{status_after} = 'audited';
                 push @{ $r{errors} }, "archive failed: $how";
             }
         }

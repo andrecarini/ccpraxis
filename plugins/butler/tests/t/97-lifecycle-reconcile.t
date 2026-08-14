@@ -397,6 +397,54 @@ sub bp_status_of {
 }
 
 # ============================================================================
+# 8b (F3, s04 fix-batch step 7). The archive-rollback failure branch flips
+# blueprint.md back to 'audited' when the move fails, but before this fix it
+# never updated $r{status_after} to match -- the JSON report kept claiming
+# whatever the pre-run authored word had been (possibly 'running'), lying
+# about what this reconcile actually wrote.
+#
+# A genuine end-to-end filesystem failure of move_dir (rename AND the
+# copy+remove fallback both failing) could not be forced reliably from this
+# Windows test host: every mechanism tried -- an open filehandle on a file
+# inside the source tree (default Windows/MSYS Perl sharing allows read,
+# unlink AND rename of the locked file regardless), chdir'ing into the
+# source directory first, chmod'ing the destination's parent read-only, and
+# a >400-character destination path (long-path support is enabled on this
+# machine) -- still let the move succeed. Forcing it via icacls hit the
+# known non-ASCII-path/cmd.exe mangling landmine (project CLAUDE.md) and
+# risks leaving an undeletable ACL-denied temp directory behind, which is
+# worse than not having this assertion. So this is a source-anchored
+# regression guard instead of a black-box behavioral one: it pins the exact
+# line the fix added, in the exact branch it belongs to, so reverting the
+# fix (deleting that line) fails this test immediately.
+# ============================================================================
+{
+    my $lc_src = slurp($LIFECYCLE);
+    ok(defined $lc_src, 'F3: bp-lifecycle.pl source is readable for the regression guard')
+        or diag("expected $LIFECYCLE");
+    if (defined $lc_src) {
+        # Anchor on the surrounding rollback branch: the rollback write
+        # (set-meta --value audited) up through the 'archive failed' error
+        # push, a window that exists exactly once in this file (AC1 above
+        # already pins @BP_LIFECYCLE_AUTHORED elsewhere, so this specific
+        # bp_call/'archive failed' pairing is unambiguous). Within that
+        # window, $r{status_after} must be (re)assigned to 'audited' -- the
+        # fix -- so this cannot pass by matching an unrelated status_after
+        # assignment elsewhere in the file (e.g. line ~374's initial value,
+        # or the success branch's 'archived').
+        if ($lc_src =~ /(--value',\s*'audited'\s*\).*?archive failed)/s) {
+            my $window = $1;
+            like($window, qr/status_after\}\s*=\s*'audited'\s*;/,
+                "F3: the archive-rollback branch sets \$r{status_after} = 'audited' between the rollback write and "
+              . "the 'archive failed' error, so status_after reflects this reconcile's own last write, not the "
+              . "pre-run authored word");
+        } else {
+            fail("F3: could not locate the archive-rollback branch (rollback write .. 'archive failed') to check");
+        }
+    }
+}
+
+# ============================================================================
 # 9. --all skips _archive/ and non-blueprint strays rather than choking.
 # ============================================================================
 {

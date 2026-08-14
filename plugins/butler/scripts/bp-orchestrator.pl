@@ -4053,15 +4053,30 @@ sub run {
 
     release_marker($marker_fh, "$runs/.orchestrator");
 
-    # Record that the initiative finished, not merely that this process did.
+    # Clean up stale run state now that this process is done, so the NEXT read
+    # of this blueprint (by anyone) sees an accurate picture instead of drift.
     #
-    # Until this call existed, an orchestrator that reached run_complete released
-    # its marker and exited while `blueprint.md` still said `status: running`.
-    # Nothing anywhere advanced a blueprint's own lifecycle, so a finished
-    # initiative stayed indistinguishable from a live one until a human read all
-    # the ledgers by hand — which is exactly how `sandbox-butler-overhaul` sat at
-    # `running` with 77/77 packages done, and how its registry.json kept claiming
-    # six running coordinators that had not existed for days.
+    # This call writes NOTHING to blueprint.md's own `status:` field --
+    # neither now nor before this package (s04-lifecycle-derived). What it
+    # repairs is registry.json (dead pids/stale rows reconciled to the
+    # ledgers) and a stale runs/.orchestrator marker; a blueprint's lifecycle
+    # word itself (drafting/audited/running/done/archived) is derived fresh
+    # on every read by BpState::blueprint_lifecycle and is never recorded
+    # anywhere, so there is no "finished" write for this call to make. Before
+    # s04, bp-lifecycle.pl DID literally write `status: done` at this call
+    # site under some conditions; that write is gone (DC1/DC3), which is why
+    # this comment no longer describes one -- describing a write that hasn't
+    # happened here since s04 shipped is exactly the kind of drift this
+    # script exists to prevent everywhere else.
+    #
+    # Until an earlier version of this call existed, an orchestrator that
+    # reached run_complete released its marker and exited while registry.json
+    # and runs/.orchestrator both kept claiming stale, no-longer-true state.
+    # Nothing anywhere reconciled that drift, so a finished initiative stayed
+    # indistinguishable from a live one until a human read all the ledgers by
+    # hand — which is exactly how `sandbox-butler-overhaul` sat with its own
+    # registry.json claiming six running coordinators that had not existed
+    # for days.
     #
     # AFTER release_marker, deliberately: bp-lifecycle.pl refuses to touch a
     # blueprint whose marker names a live pid (a live run owns its own state), so

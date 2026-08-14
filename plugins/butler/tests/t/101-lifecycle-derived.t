@@ -236,6 +236,21 @@ sub run_bp_blueprint {
         'AC1: the unrecognised-value message lists exactly the three authored words');
     unlike($err3, qr/running,\s*done|done,\s*archived\s*$/,
         'AC1: the unrecognised-value message is not the old 5-word list');
+
+    # --- F5 (s04 fix-batch step 7, red-team LOW): a case/whitespace variant
+    #     of a derived word is refused via the EXPLANATORY exit-2 path, not
+    #     the generic exit-3 one -- the write is blocked either way (that part
+    #     was never broken), this is just about which message the user gets.
+    for my $variant ('Done', ' RUNNING') {
+        my $d4 = make_blueprint($root, "meta-variant-$variant" =~ s/\s+/_/gr, status => 'audited', packages => []);
+        my $f4 = "$d4/blueprint.md";
+        my $before4 = slurp($f4);
+        my ($rc4, undef, $err4) = run_bp_blueprint('set-meta', '--file', $f4,
+                                                    '--field', 'status', '--value', $variant);
+        is($rc4, 2, "F5: set-meta --value '$variant' exits 2 (reject_error/derived), not 3 (arg_error)");
+        like($err4, qr/derived/i, "F5: stderr for --value '$variant' names it DERIVED");
+        is(slurp($f4), $before4, "F5: --value '$variant' leaves the file byte-identical");
+    }
 }
 
 # ============================================================================
@@ -439,6 +454,25 @@ sub run_bp_blueprint {
     is($data->[0]{all_delivered}, 0, 'observable-6: all_delivered is false');
     ok(!(grep { $_->{kind} eq 'lifecycle' } @{ $data->[0]{actions} }),
         'observable-6: no lifecycle-kind action is reported when not all delivered');
+}
+{
+    # F1 (s04 fix-batch step 7): authored 'done' + all packages delivered
+    # must derive to 'done', not fall through to the catch-all 'drafting'.
+    # Before the fix, BpState::blueprint_lifecycle's advance gate listed
+    # only {audited,running}, so this authored/all-delivered combination
+    # silently demoted to 'drafting' -- which meant archiving (whose gate
+    # is this derived value) never fired for a finished blueprint, with no
+    # error and no red test. Exercises the derivation, not source text.
+    my $root = tempdir(CLEANUP => 1);
+    my $dir  = make_blueprint($root, 'f1-authored-done-all-delivered',
+        status   => 'done',
+        packages => [ { pkg => '01-a', ledger => 'done',    table => 'done' },
+                      { pkg => '02-b', ledger => 'dropped', table => 'dropped' } ],
+    );
+    my ($rc, $data) = run_lifecycle('reconcile', '--blueprint', 'f1-authored-done-all-delivered',
+                                    '--data-dir', $root, '--no-archive');
+    is($data->[0]{lifecycle}, 'done',
+        "F1: authored 'done' with every package delivered derives to 'done', not demoted to 'drafting'");
 }
 {
     # Observable behavior 7: drafting + zero packages never advances.

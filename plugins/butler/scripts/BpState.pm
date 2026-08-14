@@ -256,13 +256,31 @@ sub run_is_live {
 #   1. a live run beats every authored value, including archived.
 #   2. authored 'archived' beats the delivered computation (never
 #      re-derived to done).
-#   3. 'done' requires BOTH all-delivered (>=1 package, every value in
-#      {done,dropped}) AND the ADVANCEABLE gate: authored in
-#      {audited,running} (bp-lifecycle.pl:99-103's %ADVANCEABLE).
-#   4. authored 'drafting' -> drafting; authored 'audited' -> audited.
+#   3. all-delivered (>=1 package, every value in {done,dropped}) derives
+#      'done' for any authored value that is already at or past 'done' in
+#      the sense of "the work described by this word is finished":
+#      {audited,running,done}. This is the ADVANCE gate; there used to be a
+#      %ADVANCEABLE table in bp-lifecycle.pl mirroring it, this package
+#      deleted that table, so the gate is now just these three literal
+#      words, spelled out at the call site below. (Authored 'done' with
+#      all packages delivered is a no-op pass through this gate -- it was
+#      already 'done' -- but it MUST be listed here, not left to fall
+#      through to step 4, or it is silently demoted; see the inline
+#      comment below, F1.)
+#   4. authored 'drafting' -> drafting; authored 'audited' -> audited;
+#      authored 'running' -> running: each of the three NON-done authored
+#      words keeps itself when step 3 did not fire (drafting never
+#      advances on its own; audited/running only advance under step 3).
+#      Deliberately NOT extended to 'done' here: an authored 'done' that
+#      is NOT all-delivered has no branch of its own and falls through to
+#      step 5's default -- this is pre-existing, protected behavior
+#      (t/101 AC7 "ac7-stale-done": an old-shape 'done' with an undelivered
+#      package derives to 'drafting', never trusted literally), not
+#      something this package's fix touches.
 #   5. final default 'drafting' — blueprint.md absent/unreadable, authored
-#      '', or a stale/unconfirmed 'running'/'done' on disk (pre-s04) is
-#      treated as ABSENT per Decision 13, never surfaced literally.
+#      '', authored 'done' without all-delivered (step 4's note above), or
+#      anything norm_bp_status did not recognise is treated as ABSENT per
+#      Decision 13, never surfaced literally.
 sub blueprint_lifecycle {
     my ($bpdir, $alive_fn) = @_;
     return 'drafting' unless defined $bpdir;
@@ -279,17 +297,34 @@ sub blueprint_lifecycle {
         (scalar(@values) > 0)
         && !(grep { $_ ne 'done' && $_ ne 'dropped' } @values);
 
-    if ($all_delivered && ($authored eq 'audited' || $authored eq 'running')) {
+    # F1 (s04 fix-batch step 7): the gate below lists {audited,running,done},
+    # not just {audited,running}. Before this fix it listed only the first
+    # two, so an authored 'done' with every package delivered fell all the
+    # way through to step 5's default and was DEMOTED to 'drafting' -- the
+    # exact same shape of bug as the 'running' incident this file's history
+    # already documents just below (a known authored value with no branch
+    # of its own, silently landing on "not started"). Concretely: archiving
+    # (step 5's caller in bp-lifecycle.pl) reads this derived value as its
+    # gate, so a finished, all-delivered, authored-'done' blueprint could
+    # never archive -- no error, no red test, just nothing happening.
+    #
+    # 'done' authored + all-delivered returning 'done' here is a no-op in
+    # effect (it was already 'done'), but it is NOT a no-op to OMIT: leaving
+    # 'done' out of this list is indistinguishable, at the call site, from
+    # deliberately routing it to step 5's default, which is precisely the
+    # silent trap this comment exists to prevent recurring a third time.
+    if ($all_delivered
+        && ($authored eq 'audited' || $authored eq 'running' || $authored eq 'done')) {
         return 'done';
     }
 
-    # The authored word survives when the work is not all delivered. Note the
-    # shape of these three lines: EVERY authored value keeps itself here. The
-    # running branch was missing until 2026-08-14 (s04, driver-adjudicated), so
-    # running was the one authored value with no branch of its own and it fell
-    # through to the catch-all below -- silently DEMOTING a blueprint the author
-    # had marked running, with real work in flight, to drafting, i.e. to "not
-    # started".
+    # The authored word survives when it is not advanced by the gate above.
+    # Note the shape of these three lines: EVERY NON-'done' authored value
+    # keeps itself here. The running branch was missing until 2026-08-14
+    # (s04, driver-adjudicated), so running was the one authored value with
+    # no branch of its own and it fell through to the catch-all below --
+    # silently DEMOTING a blueprint the author had marked running, with real
+    # work in flight, to drafting, i.e. to "not started".
     #
     # Found when s04 wired this function in as the single authority and its
     # oracle asserted "an undelivered package keeps lifecycle at the authored
@@ -298,14 +333,21 @@ sub blueprint_lifecycle {
     # the immutable oracle, which is why it was caught. The asymmetry is the
     # tell: drafting and audited each kept themselves, running did not.
     #
+    # 'done' deliberately has NO branch here: an authored 'done' that is NOT
+    # all-delivered falls through to step 5's default 'drafting' instead --
+    # pre-existing, protected behavior (t/101 AC7 "ac7-stale-done"), not
+    # something this fix touches. Only the all-delivered case (the gate
+    # above) was the defect.
+    #
     # No backticks anywhere in this file, including comments: t/98's DC1 scans
     # the whole source for them, because this module must never shell out.
     return 'drafting' if $authored eq 'drafting';
     return 'audited'  if $authored eq 'audited';
     return 'running'  if $authored eq 'running';
 
-    # Unknown or absent authored value. Not a demotion -- there is nothing to
-    # demote, because nothing legible was authored.
+    # Unknown or absent authored value (including a non-all-delivered
+    # 'done', per the note above). Not a demotion -- there is nothing to
+    # demote, because nothing legible was authored / advanced.
     return 'drafting';
 }
 

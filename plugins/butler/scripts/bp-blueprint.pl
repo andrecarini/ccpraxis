@@ -686,7 +686,21 @@ sub op_set_meta {
         arg_error('set-meta', '--value contains a pipe or newline');
     }
     if ($opt{field} eq 'status') {
-        if ($BP_LIFECYCLE_DERIVED{$opt{value}}) {
+        # F5 (s04 fix-batch step 7, red-team LOW): a case/whitespace variant
+        # of a derived word (e.g. 'Done', ' RUNNING') fails the EXACT match
+        # below and used to fall through to the generic "unrecognised value"
+        # arg_error path -- the write was refused either way (verified, no
+        # bypass), but the user got the wrong explanation (looked like a typo
+        # rather than "this is derived, never authored"). Normalise ONLY for
+        # this derived-word check, so the better message fires for variants
+        # too; the exact-match AUTHORED check just below is left untouched --
+        # widening it would let a case variant of an authored word (e.g.
+        # 'Audited') through validation and then get WRITTEN verbatim,
+        # which is a real behavior change, not a message fix, and out of
+        # scope here.
+        my $norm_value = lc($opt{value} // '');
+        $norm_value =~ s/\A\s+|\s+\z//g;
+        if ($BP_LIFECYCLE_DERIVED{$opt{value}} || $BP_LIFECYCLE_DERIVED{$norm_value}) {
             reject_error('set-meta',
                 "--value '$opt{value}' is a DERIVED blueprint state, not something set-meta writes -- "
               . "'running' is derived from a live runs/.orchestrator marker (BpState::run_is_live) and "
