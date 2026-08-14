@@ -189,8 +189,16 @@ sub bp_status_of {
     is($data->[0]{lifecycle}, 'done',
        'all packages done -> lifecycle derives running -> done WITHOUT anyone asking');
     is($data->[0]{all_delivered}, 1, 'all_delivered reported');
-    ok((grep { $_->{kind} eq 'lifecycle' } @{ $data->[0]{actions} }),
-       'the advance is reported as an action, not done silently');
+    # AMENDED for s05-retire-reconciler-drift-paths (AC-5): the pseudo-action
+    # push for kind 'lifecycle' is deleted outright -- $r{lifecycle} and
+    # $r{all_delivered} (already asserted above) carry this information as
+    # top-level fields now, so the absence claim below is paired, in the SAME
+    # block, with the behavioral claim that the derivation itself still
+    # advances -- not merely that the action list shrank.
+    ok(!(grep { $_->{kind} eq 'lifecycle' } @{ $data->[0]{actions} }),
+       's05 AC-5: no actions entry ever reports kind "lifecycle" -- the pseudo-action push is gone');
+    is($data->[0]{lifecycle}, 'done',
+       's05 AC-5: paired behavioral check -- the SAME fixture still derives lifecycle => "done" with no action announcing it');
 }
 
 # ============================================================================
@@ -263,54 +271,52 @@ sub bp_status_of {
 }
 
 # ============================================================================
-# 5. Table drift: ledger done, table pending. This exact shape hid five
-#    delivered packages for days in the 2026-07-28 incident.
-#
-# RETARGETED for s03-drop-table-status-column (spec §2.6): bp-lifecycle.pl's
-# table-drift repair step shells every blueprint.md mutation through
-# bp-blueprint.pl (bp-lifecycle.pl:91,224), whose set-status is now retired
-# unconditionally (Decision 11) -- the repair this block used to assert CAN
-# NO LONGER SUCCEED, by design. This is the permanently-dead drift-repair
-# path package s05-retire-reconciler-drift-paths is chartered to remove
-# later; this retarget is the minimal honest fix, not a pre-emptive s05
-# implementation. Two assertions change:
-#   - the stale table cell can no longer be repaired -> stays `pending`
-#   - the repair ATTEMPT is recorded as an error ("could not set table
-#     status"), not as a successful `table_drift` action
-# `bp_status_of` unlike above (line below) is UNCHANGED -- all_delivered is
-# ledger-sourced only (bp-lifecycle.pl:469), independent of table-repair
-# success, so the blueprint still advances to `done`.
+# 5. Table drift: RETIRED for s05-retire-reconciler-drift-paths (AC-6), not
+#    re-pointed. This block used to assert step 2's repair-fails shape
+#    (retargeted for s03, see git history). Step 2 (read_table + the
+#    'table_drift' action-kind + the bp_call_out('set-status', ...) call
+#    site) is DELETED OUTRIGHT by this package -- there is no code path left
+#    in bp-lifecycle.pl for a re-pointed assertion here to observe beyond
+#    what plugins/butler/tests/t/153-no-drift-to-repair.t already covers
+#    end-to-end (observable behavior 2: an old-shape blueprint with a
+#    disagreeing table column reconciles clean, the table cell is
+#    byte-unchanged, and -- the headline live-defect fix -- the blueprint
+#    still actually archives). Recorded here per the ledger's own "recorded
+#    in the report as retired, with the reason" option (Done Criterion 3):
+#      - original location: this file, former :284-309 (pre-s05)
+#      - retired assertions' subject: step 2's table-drift repair-fails
+#        behavior (stale cell stays 'pending'; the failed repair attempt is
+#        recorded as an error string 'could not set table status')
+#      - reason: step 2 itself (read_table, the table_drift action-kind, the
+#        set-status call site) is deleted; the guarantee that an old-shape
+#        table no longer blocks reconciliation is re-proven by t/153's
+#        unrepresentability thesis (observable behavior 2), which additionally
+#        proves the STRONGER live-defect claim this block never could: that
+#        archiving itself is no longer silently blocked by the now-impossible
+#        error this block used to assert.
 # ============================================================================
-{
-    my $root = tempdir(CLEANUP => 1);
-    my $dir  = make_blueprint($root, 'table-drift',
-        status   => 'running',
-        packages => [ { pkg => '01-a', ledger => 'done', table => 'pending' },
-                      { pkg => '02-b', ledger => 'done', table => 'done' } ],
-    );
-    my ($rc, $data) = run_lifecycle('reconcile', '--blueprint', 'table-drift',
-                                    '--data-dir', $root, '--no-archive');
-    my $md = slurp("$dir/blueprint.md");
-    like($md, qr/\|\s*01-a\s*\|[^\n]*pending/,
-           'the stale table row can no longer be repaired (set-status is retired) -- it stays pending');
-    # The two lists have DIFFERENT element types -- actions are hashrefs, errors
-    # are plain strings. bp-lifecycle.pl never pushes an action with
-    # `kind => 'errors'`, so a HASH-shaped arm testing for that can never match --
-    # dead weight that only masked an oracle able to falsify on a synthetic
-    # silent-success case. The string arm alone carries the whole assertion.
-    ok((grep { !ref($_) && $_ =~ /could not set table status/ }
-              (@{ $data->[0]{actions} || [] }, @{ $data->[0]{errors} || [] })),
-       'the failed repair attempt is recorded as an error, not silently dropped or reported as success');
-    # RE-WITNESSED for s04-lifecycle-derived (driver ruling 2026-08-14): same
-    # guarantee (advancement is unaffected by the permanently-dead table-drift
-    # step), new witness.
-    is($data->[0]{lifecycle}, 'done',
-       'and the blueprint STILL advances (all_delivered is ledger-sourced only, independent of table repair)');
-}
 
 # ============================================================================
 # 6. Registry drift: the exact sandbox-butler-overhaul shape — registry says
 #    running/pending long after the ledgers went done, and carries dead pids.
+#
+# SPLIT for s05-retire-reconciler-drift-paths (AC-7), not retired wholesale.
+# Step 3 did two unrelated things under one name: status-reconciliation (dead
+# for every in-scope reader -- bp-orchestrator.pl::_load_state never consults
+# registry status, per the spec's §1 finding) and pid-clearing (independently
+# live: bp-orchestrator.pl:198-201 names bp-lifecycle.pl "the only clearer" of
+# a terminal package's stray pid, and bp-status.sh:100 consumes that same
+# column for its PROC display). So:
+#   - RETIRED (subject deleted, same recorded-reason treatment as AC-6): the
+#     two is($reg->{...}{status}, 'done', ...) assertions -- status
+#     reconciliation no longer exists as code.
+#   - REPLACED, in the same block, by a byte-unchanged assertion on the
+#     'status' field where the fixture authors one (pairs the new absence
+#     with a behavioral check, per observable behavior 3).
+#   - SURVIVE UNCHANGED IN SUBSTANCE (only their witness changes): the "no
+#     pid" and "attempt preserved" assertions, and the action-kind check --
+#     grep { $_->{kind} eq 'registry_drift' } becomes
+#     grep { $_->{kind} eq 'stale_pid' }.
 # ============================================================================
 {
     my $root = tempdir(CLEANUP => 1);
@@ -327,13 +333,17 @@ sub bp_status_of {
                                     '--data-dir', $root, '--no-archive');
     require JSON::PP;
     my $reg = JSON::PP->new->decode(slurp("$dir/runs/registry.json"));
-    is($reg->{packages}{'01-a'}{status}, 'done', 'registry status reconciled to the ledger (01-a)');
-    is($reg->{packages}{'02-b'}{status}, 'done', 'registry status reconciled to the ledger (02-b)');
+    is($reg->{packages}{'01-a'}{status}, 'running',
+       's05 AC-7: registry status is NEVER reconciled -- byte-unchanged (still the pre-run authored value "running"), not repaired to the ledger');
+    is($reg->{packages}{'02-b'}{status}, 'pending',
+       's05 AC-7: same, for the second entry -- "pending" survives untouched too');
     ok(!exists $reg->{packages}{'01-a'}{pid},
        'a terminal package keeps no pid — a reused pid would redraw a dead run as live');
     is($reg->{packages}{'01-a'}{attempt}, 2, 'unrelated registry fields are preserved, not rewritten');
-    ok((grep { $_->{kind} eq 'registry_drift' } @{ $data->[0]{actions} }),
-       'registry drift is reported');
+    ok((grep { $_->{kind} eq 'stale_pid' } @{ $data->[0]{actions} }),
+       's05 AC-7: the surviving pid-clearing half is reported under the new, honest kind name "stale_pid"');
+    ok(!(grep { $_->{kind} eq 'registry_drift' } @{ $data->[0]{actions} }),
+       's05 AC-7: the old combined kind name "registry_drift" never appears again');
 }
 
 # ============================================================================
@@ -355,7 +365,29 @@ sub bp_status_of {
     is(slurp("$dir/blueprint.md"),      $before_md,  '--dry-run leaves blueprint.md byte-identical');
     is(slurp("$dir/runs/registry.json"), $before_reg, '--dry-run leaves registry.json byte-identical');
     ok(-e "$dir/runs/.orchestrator", '--dry-run leaves even a stale marker in place');
-    ok(scalar @{ $data->[0]{actions} } >= 3, '--dry-run still REPORTS everything it would have done');
+    # RECOMPUTED for s05-retire-reconciler-drift-paths (AC-8), not left at a
+    # loosened `>= 3`. The `dry` fixture above carries a stale marker, a
+    # table-drift row (01-a: ledger done, table pending), and a terminal
+    # package's stray registry pid. With step 2 (table_drift) and step 3's
+    # status half (registry_drift) both deleted, the table-drift row now
+    # produces ZERO actions -- asserted below as zero, not merely uncounted --
+    # so the exact surviving count is 2: stale_marker (the marker) and
+    # stale_pid (01-a's stray pid, since its ledger status 'done' is
+    # terminal). The exact count is paired with explicit absence checks so a
+    # regression that silently drops one of the two real actions cannot hide
+    # behind an unrelated one reappearing.
+    is(scalar @{ $data->[0]{actions} }, 2,
+       's05 AC-8: --dry-run reports exactly 2 actions (stale_marker, stale_pid) -- not >= 3, recomputed for the deleted kinds');
+    ok((grep { $_->{kind} eq 'stale_marker' } @{ $data->[0]{actions} }),
+       's05 AC-8: stale_marker is one of the two');
+    ok((grep { $_->{kind} eq 'stale_pid' } @{ $data->[0]{actions} }),
+       's05 AC-8: stale_pid is the other of the two');
+    ok(!(grep { $_->{kind} eq 'table_drift' } @{ $data->[0]{actions} }),
+       's05 AC-8: no table_drift action appears -- the table-drift row in this fixture produces zero actions, asserted as zero');
+    ok(!(grep { $_->{kind} eq 'registry_drift' } @{ $data->[0]{actions} }),
+       's05 AC-8: no registry_drift action appears -- the combined kind name is gone');
+    ok(!(grep { $_->{kind} eq 'lifecycle' } @{ $data->[0]{actions} }),
+       's05 AC-8: no lifecycle pseudo-action appears');
     ok(!(grep { $_->{applied} } @{ $data->[0]{actions} }), 'nothing is marked applied under --dry-run');
 }
 

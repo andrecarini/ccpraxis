@@ -164,15 +164,19 @@ my @ALLOWLIST = (
       pattern => qr/status:"running"/ },
     { label => 'gate-stop.sh:~150 (best-effort status sync, jq {status:$st})', path => $GATESTOP_PATH,
       pattern => qr/\{status:\$st\}/ },
-    # PATTERN UPDATED by fix-batch F1 (redteam-step6.md HIGH finding): the
-    # drift-repair still writes $entry->{status} for an entry that ALREADY
-    # carries a status key and disagrees with the ledger -- that write is
-    # still genuinely outside this write set and unfixed (the gap this entry
-    # certifies). What F1 fixed is a DIFFERENT bug: the repair used to also
-    # RESURRECT a status key onto an entry that had none at all (the post-s02
-    # normal shape), which is covered by section 11 below, not this allowlist.
-    { label => 'bp-lifecycle.pl (reconcile_one drift repair, $entry->{status} = $ledger_status, still present-key-only)', path => $LIFECYCLE_PATH,
-      pattern => qr/\$entry->\{status\}\s*=\s*\$ledger_status/ },
+    # REMOVED for s05-retire-reconciler-drift-paths (AC-16), not retargeted.
+    # This entry pinned bp-lifecycle.pl's $entry->{status} = $ledger_status
+    # line (reconcile_one's step-3 status-reconciliation half) as a
+    # documented, deliberate gap. s05 deletes that line outright -- status
+    # reconciliation no longer exists in bp-lifecycle.pl at all, so pinning
+    # it as "still present" would now assert a defect that has been fixed.
+    # With the allowlist entry gone, bp-lifecycle.pl falls under this file's
+    # own EXHAUSTIVE out-of-allowlist scan below (section 3's second half),
+    # which must now pass cleanly against it: the file still calls
+    # write_registry(...) for pid clearing, but must contain no ->{status} =
+    # assignment anywhere, so the scan's compound pattern
+    # (write_registry(...) AND ->{status} =) must not match it. This is a
+    # stronger, behavioral proof than the bare regex this entry used to be.
     { label => 'bp-answer-decision.pl:706 (status => $plan->{ledger_status})', path => $ANSWER_PATH,
       pattern => qr/status\s*=>\s*\$plan->\{ledger_status\}/ },
     # REMOVED 2026-08-14 by driver adjudication. This entry pinned
