@@ -166,9 +166,10 @@ sub marker_path { my ($rdir, $sid) = @_; return "$rdir/$sid"; }
 
 # ===========================================================================
 # F. AC7 part 2 -- a Bash command that NAMES bp-watch.pl in an echo/grep
-#    rather than executing it. mark-wakeup.sh's OWN existing driver regex
-#    already solves the analogous case (verified live against the shipped
-#    file below, section H) -- this is not a hypothetical ask.
+#    rather than executing it. (fixbatch step7 / F4 correction: section H
+#    below no longer claims the driver's own regex is working "prior art"
+#    for this -- verified live, it is NOT. The reporter's own heuristic,
+#    fixed by F1/F5-F8, is what actually solves this for the reporter path.)
 # ===========================================================================
 {
     my $root = new_project();
@@ -201,6 +202,76 @@ sub marker_path { my ($rdir, $sid) = @_; return "$rdir/$sid"; }
 }
 
 # ===========================================================================
+# F5-F8 (fixbatch step7 / F1, HIGH). redteam-step6.md HIGH-1: the FIRST
+# shipped heuristic (a bare double-quote parity count) rejected only the
+# double-quoted echo/grep shapes above and was defeated by a bash comment, a
+# single-quoted string, or a heredoc body -- three DIFFERENT ways of getting
+# the literal text into the command without ever executing it, verified live
+# against the shipped hook. Each fixture below is exactly one of those three
+# reproductions, plus the unquoted-reader residual named in the same finding.
+# ===========================================================================
+{
+    my $root = new_project();
+    my $rdir = tempdir(CLEANUP => 1);
+    my $cmd  = "# reminder: do not forget to run bp-watch.pl --arm --blueprint bp-x "
+             . "--pid-file /tmp/p --max-seconds 1800\nls";
+    my $payload = JSON::PP->new->canonical->encode({
+        session_id => 'sess-f5', cwd => $root, tool_name => 'Bash',
+        tool_input => { command => $cmd },
+    });
+    my ($rc) = run_mark($payload, rdir => $rdir);
+    is($rc, 0, 'F5a: mark-wakeup.sh never blocks on the commented-out command');
+    ok(!-f marker_path($rdir, 'sess-f5'),
+       'F5b (redteam-step6.md HIGH-1 repro #1): a bash COMMENT naming the arm string, '
+     . 'never executed, does NOT register a reporter session');
+}
+{
+    my $root = new_project();
+    my $rdir = tempdir(CLEANUP => 1);
+    my $cmd  = q{grep -l 'bp-watch.pl --arm --blueprint' plugins/butler/skills/reporter/SKILL.md};
+    my $payload = JSON::PP->new->canonical->encode({
+        session_id => 'sess-f6', cwd => $root, tool_name => 'Bash',
+        tool_input => { command => $cmd },
+    });
+    my ($rc) = run_mark($payload, rdir => $rdir);
+    is($rc, 0, 'F6a: mark-wakeup.sh never blocks on the single-quoted grepping command');
+    ok(!-f marker_path($rdir, 'sess-f6'),
+       'F6b (redteam-step6.md HIGH-1 repro #2): a SINGLE-quoted grep for the arm string '
+     . 'does NOT register a reporter session (the original heuristic counted only literal '
+     . '" characters, so this shape was invisible to it)');
+}
+{
+    my $root = new_project();
+    my $rdir = tempdir(CLEANUP => 1);
+    my $cmd  = "cat <<EOF\nbp-watch.pl --arm --blueprint bp-x\nEOF";
+    my $payload = JSON::PP->new->canonical->encode({
+        session_id => 'sess-f7', cwd => $root, tool_name => 'Bash',
+        tool_input => { command => $cmd },
+    });
+    my ($rc) = run_mark($payload, rdir => $rdir);
+    is($rc, 0, 'F7a: mark-wakeup.sh never blocks on the heredoc-body command');
+    ok(!-f marker_path($rdir, 'sess-f7'),
+       'F7b (redteam-step6.md HIGH-1 repro #3): a HEREDOC BODY naming the arm string, '
+     . 'never executed as a command, does NOT register a reporter session');
+}
+{
+    my $root = new_project();
+    my $rdir = tempdir(CLEANUP => 1);
+    my $cmd  = q{grep -r bp-watch.pl --arm --blueprint foo};
+    my $payload = JSON::PP->new->canonical->encode({
+        session_id => 'sess-f8', cwd => $root, tool_name => 'Bash',
+        tool_input => { command => $cmd },
+    });
+    my ($rc) = run_mark($payload, rdir => $rdir);
+    is($rc, 0, 'F8a: mark-wakeup.sh never blocks on the unquoted grepping command');
+    ok(!-f marker_path($rdir, 'sess-f8'),
+       'F8b (fixbatch step7 / F1 residual, closed): an UNQUOTED grep for the arm string '
+     . '(no quoting at all for the filter to strip) does NOT register a reporter session '
+     . '-- the command SEGMENT containing the match begins with a non-executing reader '
+     . '(grep), which the fix rejects even with nothing quoted');
+}
+
+# ===========================================================================
 # G. Same class as E, using the Grep tool directly (the most literal reading
 #    of "greps for bp-watch.pl" from the package ledger's own criterion 6).
 # ===========================================================================
@@ -218,9 +289,32 @@ sub marker_path { my ($rdir, $sid) = @_; return "$rdir/$sid"; }
 }
 
 # ===========================================================================
-# H. Prior-art check: the DRIVER's existing regex already avoids this exact
-#    false positive today (verified live, not assumed) -- proving AC7's
-#    ask is achievable, not a novel difficulty unique to the reporter.
+# H. fixbatch step7 / F4 CORRECTION. The ORIGINAL H2 claimed "the DRIVER's
+#    existing regex already avoids this exact false positive today", but
+#    asserted it against "$ds/.wakeup-pending" -- a path bp_drive_marker()
+#    (lib.sh) never writes to under ANY outcome of this fixture (that file is
+#    written only by the separate backgrounded-Bash wake-up path, further
+#    down in mark-wakeup.sh, which this fixture never reaches). The assertion
+#    was vacuously true under both a correct and a broken regex, disclosed
+#    candidly in the commit message for 3f03a25 -- fixed here by pointing at
+#    the REAL marker path ("$dact/sess-h", where bp_drive_active_dir()
+#    resolves to $CCPRAXIS_DRIVE_ACTIVE_DIR per the SAFETY NOTE below).
+#
+#    Doing so surfaces what the vacuous assertion was hiding: the DRIVER's
+#    own arm regex (`mark-wakeup.sh`, `bp-drive-next\.pl[^"]*(next|...)`,
+#    untouched by this package -- see dispatch's "Explicitly NOT in this
+#    batch") has NO quote-parity check at all. Against this EXACT fixture's
+#    JSON encoding (`"command":"echo \"run bp-drive-next.pl next later\""`),
+#    the escaped quote characters land OUTSIDE the span between
+#    "bp-drive-next.pl" and "next" -- there is no interior quote for
+#    `[^"]*` to be stopped by -- so the regex DOES match, and the driver
+#    marker IS written. Verified live, not assumed: this is redteam-step6.md
+#    LOW-2's finding ("the driver's own arm has the same false positive...
+#    out of this package's scope"), previously undetected by H2 because H2
+#    asserted against the wrong file. The premise "prior art already solves
+#    this" was FALSE for the driver; only the reporter's OWN heuristic (F5-F8
+#    above) is fixed by this package. H2 below now asserts the TRUE,
+#    verified behavior instead of repeating the false claim.
 #
 # SAFETY NOTE (fixture construction, not an assertion change): this fixture
 # deliberately trips the DRIVER's own arm regex, which -- unlike every other
@@ -235,7 +329,6 @@ sub marker_path { my ($rdir, $sid) = @_; return "$rdir/$sid"; }
 # ===========================================================================
 {
     my $root = new_project(drive_solo => 1);
-    my $ds   = "$root/.ccpraxis-local-data/.drive-solo";
     my $dact = tempdir(CLEANUP => 1);
     my $cmd  = q{echo "run bp-drive-next.pl next later"};
     my $payload = JSON::PP->new->canonical->encode({
@@ -245,11 +338,41 @@ sub marker_path { my ($rdir, $sid) = @_; return "$rdir/$sid"; }
     my $out = `CCPRAXIS_DRIVE_ACTIVE_DIR='$dact' bash "$MARK" <<'PAYLOAD_EOF' 2>&1
 $payload
 PAYLOAD_EOF`;
-    is($? >> 8, 0, 'H1: driver arm never blocks on the echoed command either');
-    ok(!-f "$ds/.wakeup-pending",
-       'H2 (prior art, not this package'."'".'s own oracle): the DRIVER'."'".'s existing '
-     . 'arm regex already does not fire on an echoed bp-drive-next.pl command -- confirms '
-     . 'AC7'."'".'s reporter-side ask has a working precedent in this same file');
+    is($? >> 8, 0, 'H1: driver arm never blocks on the echoed command either (registering '
+                 . 'never blocks anything -- see this file'."'".'s own header)');
+    ok(-f "$dact/sess-h",
+       'H2 CORRECTED (fixbatch step7 / F4): the DRIVER'."'".'s existing arm regex has NO '
+     . 'quote-parity check and DOES register on this echoed command, given this exact JSON '
+     . 'escaping -- this is a KNOWN, verified, out-of-scope weakness (redteam-step6.md '
+     . 'LOW-2), not prior art the reporter'."'".'s own fix (F5-F8 above) can lean on. '
+     . 'Recorded here as ground truth so a future reader does not re-derive "the driver '
+     . 'already handles this" from a comment that turned out to be untested');
+}
+# ---------------------------------------------------------------------------
+# H3. Confirms H2's positive result is not an accident of that ONE echoed
+#     shape: a GENUINE, unambiguous bp-drive-next.pl invocation, in the SAME
+#     session/dact scoping, ALSO writes the marker at $dact/<session_id> --
+#     the mechanism H2 observed firing on an echoed command is the same
+#     mechanism a real invocation is supposed to trigger, not a coincidence
+#     of this one fixture's bytes.
+# ---------------------------------------------------------------------------
+{
+    my $root = new_project(drive_solo => 1);
+    my $dact = tempdir(CLEANUP => 1);
+    my $cmd  = q{perl "${CLAUDE_PLUGIN_ROOT}"/scripts/bp-drive-next.pl next};
+    my $payload = JSON::PP->new->canonical->encode({
+        session_id => 'sess-h3', cwd => $root, tool_name => 'Bash',
+        tool_input => { command => $cmd },
+    });
+    my $out = `CCPRAXIS_DRIVE_ACTIVE_DIR='$dact' bash "$MARK" <<'PAYLOAD_EOF' 2>&1
+$payload
+PAYLOAD_EOF`;
+    is($? >> 8, 0, 'H3a: driver arm never blocks on a genuine invocation');
+    ok(-f "$dact/sess-h3",
+       'H3b: a REAL bp-drive-next.pl next invocation, in the identical dact-scoped '
+     . 'fixture shape as H2, ALSO writes the marker at $dact/<session_id> -- the same '
+     . 'code path H2 observed firing on an echoed command is genuinely the driver'."'".'s '
+     . 'real registration mechanism, not a fixture artifact');
 }
 
 # ===========================================================================

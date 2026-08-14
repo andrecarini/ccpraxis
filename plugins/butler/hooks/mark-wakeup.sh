@@ -78,48 +78,139 @@ TOOL=$(bp_json_get "$PAYLOAD" tool_name 2>/dev/null || true)
 # Uses bp_json_get throughout, like the rest of this file -- the house idiom,
 # reliable on a correctly-escaped payload (verified: 142-reporter-registration.t
 # builds every fixture with a real JSON encoder, not string interpolation).
-if [ "$TOOL" = "Bash" ]; then
+#
+# fixbatch step7 / F2: guarded on $DATA up front. Registration cannot write a
+# marker without a resolved data dir anyway, so nothing is lost by checking
+# first -- and this restores the short-circuit for a session in a project with
+# no .ccpraxis-local-data at all, without needing $DATA/.drive-solo to exist
+# (a reporter-only project has no .drive-solo dir; see the ordering note above).
+if [ "$TOOL" = "Bash" ] && [ -n "$DATA" ]; then
   RCMD=$(bp_json_get "$PAYLOAD" tool_input.command 2>/dev/null || true)
-  # A plain 'bp-watch.pl[^"]*--arm[^"]*--blueprint' substring match on $RCMD
-  # is NOT enough on its own: it also matches an ECHOED/GREPPED string naming
-  # the invocation (e.g. `echo "run bp-watch.pl --arm --blueprint later"`),
-  # because no `"` happens to fall BETWEEN bp-watch.pl and --blueprint in
-  # that case either -- the surrounding quotes are further out, around the
-  # whole echoed phrase. Verified live against the DRIVER's own analogous
-  # arm regex below, on a correctly JSON-escaped payload (not a malformed
-  # one): `bp-drive-next\.pl[^"]*(next|record-order|park)` matches an
-  # equivalent echoed `bp-drive-next.pl next` command too, for the identical
-  # reason -- that regex is NOT reliable prior art for this problem, only a
-  # superficially similar one whose own oracle (t/142 section H) happens to
-  # assert an unrelated file, not the arm marker.
+  # fixbatch step7 / F1 (HIGH). A plain 'bp-watch.pl[^"]*--arm[^"]*--blueprint'
+  # substring match is not enough on its own -- see the driver's own regex
+  # below for the identical, unfixed problem. The FIRST version of this check
+  # (a bare "-count parity test on the text before "bp-watch.pl") is ALSO not
+  # enough: it counts only DOUBLE quotes, so it is defeated by any of a bash
+  # COMMENT ("# ... bp-watch.pl --arm --blueprint ..."), a SINGLE-quoted
+  # string ('bp-watch.pl --arm --blueprint'), or a HEREDOC BODY naming the
+  # invocation without ever running it -- verified live against the shipped
+  # hook (redteam-step6.md HIGH-1, three independent reproductions). None of
+  # those are "one case standing in for a general rule"; they are three
+  # DIFFERENT ways of getting the literal text into the command without
+  # executing it, and a parity count over one quote character catches none of
+  # them.
   #
-  # What DOES distinguish a real invocation from a quoted reference is QUOTE
-  # PARITY immediately before "bp-watch.pl" in the DECODED command text (the
-  # actual bash command bytes bp_json_get returns, already un-escaped -- so
-  # this check does not depend on any JSON-escaping convention at all): in
-  # the real call (`perl "${CLAUDE_PLUGIN_ROOT}"/scripts/bp-watch.pl --arm
-  # --blueprint ...`) there are 0 or 2 quote chars before it (fully closed
-  # pairs, e.g. the CLAUDE_PLUGIN_ROOT expansion) -- EVEN, so "bp-watch.pl"
-  # sits OUTSIDE any open quote, i.e. it is the literal command being run.
-  # In an echoed/grepped reference the whole phrase sits INSIDE one
-  # still-open quoted argument (`echo "run bp-watch.pl ...`) -- exactly ONE
-  # quote char precedes it -- ODD. Checked with perl (already required by
-  # this hook family) rather than reimplemented as bash arithmetic.
+  # THE GENERAL RULE this now enforces: scan the raw command byte-by-byte,
+  # tracking whether the current position is inside a single-quoted span, a
+  # double-quoted span, a '#' comment (only when '#' starts a new word --
+  # i.e. is preceded by whitespace, a command separator, or the start of the
+  # string, exactly like bash's own lexer), or a heredoc body (from a <<[-]
+  # operator's introducer line to its terminator line, honouring <<- 's
+  # leading-tab stripping and an optional quoted delimiter). Every character
+  # in any of those spans is replaced with whitespace before the substring
+  # regex ever runs, so "bp-watch.pl --arm --blueprint" can only match text
+  # that is actually part of the command bash would execute -- never text
+  # that is quoted, commented out, or sitting inert inside a heredoc body.
+  # Checked with perl (already required by this hook family) rather than
+  # reimplemented as bash arithmetic.
+  #
+  # This remains a heuristic, not a shell parser: it does not resolve command
+  # substitution ($(...)), variable expansion, or backtick spans, so a command
+  # that builds the invocation through one of those still slips past -- an
+  # accepted residual, in the SAME false-negative direction this trigger is
+  # already documented to prefer (spec §1.2 -- "when in doubt, arm" is the
+  # driver's bias, this trigger's is the opposite, and this fix does not
+  # change that bias, only closes the false-POSITIVE holes redteam found).
   ARMED=$(printf '%s' "$RCMD" | perl -0777 -ne '
-      my $armed = 0;
-      if (/^(.*?)(bp-watch\.pl.*)$/s) {
-        my ($prefix, $tail) = ($1, $2);
-        my $quotes = () = $prefix =~ /"/g;
-        if ($quotes % 2 == 0 && $tail =~ /^bp-watch\.pl[^"]*--arm[^"]*--blueprint\b/) {
-          $armed = 1;
+      my $s = $_;
+      my @c = split //, $s, -1;
+      my $n = scalar @c;
+      my $filtered = "";
+      my $state = "none";      # none | squote | dquote | comment | heredoc
+      my $hd = ""; my $hd_tabs = 0; my $hd_pending = 0; my $line = "";
+      my $i = 0;
+      while ($i < $n) {
+        my $ch = $c[$i];
+        if ($state eq "heredoc") {
+          if ($ch eq "\n") {
+            my $chk = $line; $chk =~ s/^\t+// if $hd_tabs;
+            $state = "none" if $chk eq $hd;
+            $filtered .= (" " x length($line))."\n"; $line = "";
+          } else { $line .= $ch }
+          $i++; next;
         }
+        if ($state eq "comment") {
+          $filtered .= ($ch eq "\n" ? "\n" : " ");
+          $state = "none" if $ch eq "\n";
+          $i++; next;
+        }
+        if ($state eq "squote") {
+          $state = "none" if $ch eq "\x27";
+          $filtered .= ($ch eq "\n" ? "\n" : " ");
+          $i++; next;
+        }
+        if ($state eq "dquote") {
+          if ($ch eq "\\" && $i+1 < $n) { $filtered .= "  "; $i += 2; next }
+          $state = "none" if $ch eq q{"};
+          $filtered .= ($ch eq "\n" ? "\n" : " ");
+          $i++; next;
+        }
+        if ($hd_pending && $ch eq "\n") {
+          $filtered .= "\n"; $i++; $state = "heredoc"; $hd_pending = 0; $line = ""; next;
+        }
+        if ($ch eq "\x27") { $state = "squote"; $filtered .= " "; $i++; next }
+        if ($ch eq q{"})   { $state = "dquote"; $filtered .= " "; $i++; next }
+        if ($ch eq "\\" && $i+1 < $n) { $filtered .= "  "; $i += 2; next }
+        if ($ch eq "#") {
+          my $p = $filtered; $p =~ s/[ \t]+$//;
+          my $last = length($p) ? substr($p, -1) : "";
+          if ($last eq "" || $last =~ /[;&|(\n]/) {
+            $state = "comment"; $filtered .= " "; $i++; next;
+          }
+          $filtered .= "#"; $i++; next;
+        }
+        if ($ch eq "<" && $i+1 < $n && $c[$i+1] eq "<") {
+          my $j = $i+2; my $tabs = 0;
+          if ($j < $n && $c[$j] eq "-") { $tabs = 1; $j++ }
+          $j++ while ($j < $n && $c[$j] =~ /[ \t]/);
+          my $q = "";
+          if ($j < $n && ($c[$j] eq "\x27" || $c[$j] eq q{"})) { $q = $c[$j]; $j++ }
+          my $delim = "";
+          $delim .= $c[$j++] while ($j < $n && $c[$j] =~ /[A-Za-z0-9_]/);
+          $j++ if (length($q) && $j < $n && $c[$j] eq $q);
+          if (length($delim)) {
+            $filtered .= (" " x ($j - $i)); $i = $j;
+            $hd = $delim; $hd_tabs = $tabs; $hd_pending = 1;
+            next;
+          }
+        }
+        $filtered .= $ch; $i++;
       }
-      print $armed ? "1" : "0";
+      my $armed = 0;
+      if ($filtered =~ /bp-watch\.pl[^"]*--arm[^"]*--blueprint\b/) {
+        # fixbatch step7 / F1 residual: an UNQUOTED reference (no quoting at
+        # all to strip, e.g. `grep -r bp-watch.pl --arm --blueprint foo`)
+        # survives the filtering above untouched, because there is nothing
+        # quoted to remove. Close it the same way a human reads the command:
+        # the SEGMENT containing the match (since the last command separator
+        # -- ; & | or newline -- or the start of the string) must not begin
+        # with a non-executing READER. A real invocation always starts with
+        # the interpreter/script itself (perl, ./bp-watch.pl, bp-watch.pl),
+        # never with a command whose whole job is to read or print text.
+        my $pre = substr($filtered, 0, $-[0]);
+        my $seg = ($pre =~ /.*[;&|\n](.*)$/s) ? $1 : $pre;
+        $seg =~ s/^[ \t]+//;
+        my ($first) = $seg =~ /^(\S+)/;
+        $first = defined($first) ? $first : "";
+        $first =~ s{.*/}{};
+        $armed = 1 unless $first =~ /^(?:echo|printf|grep|rg|cat|sed|awk)$/;
+      }
+      print($armed ? "1" : "0");
     ' 2>/dev/null || echo 0)
   if [ "$ARMED" = "1" ]; then
     RSID=$(bp_json_get "$PAYLOAD" session_id 2>/dev/null || true)
     case "$RSID" in ''|*/*|*\**|.|..|*..*) RSID="" ;; esac
-    if [ -n "$RSID" ] && [ -n "$DATA" ]; then
+    if [ -n "$RSID" ]; then
       RDIR="${CCPRAXIS_REPORTER_ACTIVE_DIR:-${HOME:-$PWD}/.claude/ccpraxis/.reporter-active}"
       mkdir -p "$RDIR" 2>/dev/null && printf '%s\n' "$DATA" > "$RDIR/$RSID" 2>/dev/null || true
     fi

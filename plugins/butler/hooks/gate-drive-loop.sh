@@ -47,9 +47,33 @@ MAX_BLOCKS=3          # never nag more than this many times in a row
 # coordinator processes, so its ABSENCE identifies an interactive driver.
 [ -n "${BP_LEDGER:-}" ] && exit 0
 
-# Read stdin ONCE, here, unconditionally -- both the reporter branch below
-# and the pre-existing driver logic further down need it, and a second read
-# from an already-drained stdin returns empty.
+# fixbatch step7 / F2: SCOPING for BOTH surfaces, cheap, BEFORE reading stdin
+# or forking anything. hooks.json's Stop entry has no matcher, so this file
+# runs on every Stop event in every project on the machine (verified against
+# hooks.json:60-67) -- the reporter branch below used to read PAYLOAD and
+# fork bp_json_get unconditionally, which meant that cost landed on every one
+# of those events too, once any reporter had ever registered anywhere.
+#
+# Neither surface can possibly match here unless ITS OWN registry has at
+# least one entry: bp_drive_any_active (lib.sh) is a pure stat+glob for the
+# driver side, and the check below is the same shape for the reporter's
+# $RDIR. Both run before PAYLOAD/stdin is touched at all, so the overwhelming
+# common case (nothing driving, no reporter ever registered) costs a few
+# stats and zero forks -- the invariant this file's own header already
+# claims for the driver branch, restored here for the reporter branch too.
+RDIR="${CCPRAXIS_REPORTER_ACTIVE_DIR:-${HOME:-$PWD}/.claude/ccpraxis/.reporter-active}"
+REPORTER_MAYBE=0
+if [ -d "$RDIR" ]; then
+  set -- "$RDIR"/*
+  [ -e "${1:-}" ] && REPORTER_MAYBE=1
+fi
+if [ "$REPORTER_MAYBE" = "0" ]; then
+  bp_drive_any_active || exit 0
+fi
+
+# Read stdin ONCE, here -- both the reporter branch below and the
+# pre-existing driver logic further down need it, and a second read from an
+# already-drained stdin returns empty.
 PAYLOAD=$(cat 2>/dev/null || true)
 
 # ---------------------------------------------------------------------------
@@ -178,13 +202,23 @@ EOF
 # hook timeout on every single stop.
 #
 # The right question is "is THIS session driving", and mark-wakeup.sh answers
-# it by registering a session the moment it calls the director. Two stats and
-# no subprocess when nothing is driving anywhere.
+# it by registering a session the moment it calls the director. This call
+# itself is still two stats and no subprocess -- but it is no longer the
+# FIRST thing this file does (fixbatch step7 / F3): the reporter-surface
+# pre-check above now runs ahead of it, and PAYLOAD/stdin is read once,
+# unconditionally, immediately after both cheap pre-checks pass or fail.
+# So "nothing is driving anywhere AND no reporter has ever registered" is
+# still cheap (a handful of stats, zero forks, no stdin read) -- but "nothing
+# is driving, yet some reporter marker exists somewhere on this machine" now
+# costs the reporter branch's own subprocess work even though THIS session
+# is neither. That is the corrected claim; see the block above this one for
+# why it could not be avoided without losing the reporter branch's ability to
+# read PAYLOAD at all.
 bp_drive_any_active || exit 0
 
-# PAYLOAD was already read once, unconditionally, right after the BP_LEDGER
-# check above (the reporter branch needs it too, and stdin can only be read
-# once) -- reused here rather than re-cat'd.
+# PAYLOAD was already read once, right after the BP_LEDGER check and the two
+# cheap pre-checks above (the reporter branch needs it too, and stdin can
+# only be read once) -- reused here rather than re-cat'd.
 SID=$(bp_json_get "$PAYLOAD" session_id 2>/dev/null || true)
 [ -n "$SID" ] || exit 0
 MARK=$(bp_drive_marker "$SID" 2>/dev/null) || exit 0
