@@ -46,6 +46,41 @@ sub slurp {
     return $s;
 }
 
+# ===========================================================================
+# count_banner_starts(\@alert_rows) -- fix-batch step 7 (d02-wrap-every-
+# surface, reviewer MUST-FIX #1, red-team follow-up).
+#
+# Duplicated (deliberately, per this fix-batch's write set: no shared lib
+# between t/25 and t/46) from the identical helper in t/25-dashboard.t --
+# see that copy's doc comment for the full derivation, including why
+# anchoring to `/^!! /` (the reviewer's own suggested minimal fix) is WRONG
+# (undercounts an unwrapped banner alongside a wrapped one), why the
+# structural discriminator (first span's role) is authoritative, and the
+# ruled width floor: banner-start COUNTING is undefined at $cols < 3
+# (wrap_line's degenerate-budget path drops the leading-indent span
+# entirely at 1-2 columns, so no discriminator -- structural or textual --
+# can recover a count there), but IS still correct at $cols == 3 exactly
+# via the structural check alone (driver-verified). All existing call sites
+# in THIS file use $cols in (40, 80, 100, 200) -- comfortably clear of that
+# floor -- so this file makes no cols<3 assertion of its own; the pinned
+# width-floor coverage lives in t/25.
+my $CONTINUATION_ROLE = 'text.primary';   # Screen.pm's wrap-continuation indent role
+sub count_banner_starts {
+    my ($rows) = @_;
+    $rows = [] if ref($rows) ne 'ARRAY';
+    my $count = 0;
+    for my $row (@$rows) {
+        next if ref($row) ne 'HASH';
+        my $spans = (ref($row->{spans}) eq 'ARRAY') ? $row->{spans} : undef;
+        # No spans array -> cannot identify a continuation -> counts as a
+        # start (defensive default; every cell this codebase emits carries
+        # spans, so this branch is not an expected path).
+        my $first_role = ($spans && @$spans) ? $spans->[0]{role} : undef;
+        $count++ if !defined($first_role) || $first_role ne $CONTINUATION_ROLE;
+    }
+    return $count;
+}
+
 # --- source-text helpers (Dashboard.pm / launcher.pl are never require'd for
 #     these particular assertions; both are read as plain text). -----------
 sub _balanced_braces {
@@ -998,12 +1033,16 @@ sub drive2 {
         # across more rows). The intent of the original assertion -- "the
         # lifecycle alert and the status alert both surface, distinct from
         # one another" -- is preserved by counting banner-START rows instead
-        # of raw rows: Dashboard::_alert_line prefixes only the FIRST row of
-        # a banner with the literal "!! " marker (wrap_line's continuation
-        # rows carry the continuation indent but never that marker), so
-        # counting rows matching /!! / is a width-invariant banner count.
-        my @banner_starts = grep { $_->{text} =~ /!! / } @alerts;
-        is(scalar(@banner_starts), 2,
+        # of raw rows.
+        # RE-AMENDED, fix-batch step 7 (reviewer MUST-FIX #1): the previous
+        # unanchored `/!! /` text scan over-counts when a CONTINUATION row's
+        # own wrapped content happens to contain "!! " -- see
+        # count_banner_starts's doc comment (top of this file) for the full
+        # derivation, including why the reviewer's own suggested anchored
+        # `/^!! /` fix is ALSO wrong (undercounts a wrapped+unwrapped banner
+        # pair). Use the structural discriminator instead.
+        my $banner_starts = count_banner_starts(\@alerts);
+        is($banner_starts, 2,
             "AC-20: lifecycle + status alerts coexist as two banners (banner-start rows, not raw rows) at cols=$cols");
         # Ordering is asserted with a WIDTH-SAFE discriminator. The pinned message
         # (spec S2.6) is "full shutdown 3/4: stop container - running" = 42 cols, and
@@ -1019,6 +1058,43 @@ sub drive2 {
         like($alerts[0]{text}, qr/stop container - running/,
             "AC-20: the lifecycle alert carries the full pinned detail at cols=$cols") if @alerts && $cols >= 80;
     }
+}
+
+# ===========================================================================
+# count_banner_starts pin (fix-batch step 7, MUST-FIX #1) -- same two
+# fixtures pinned in t/25-dashboard.t, exercised here too since THIS file's
+# own PART 8 assertion (immediately above) is the other amended call site
+# the reviewer flagged.
+# ===========================================================================
+{
+    my %st = (
+        project_name => 'demo', container => 'claude-demo-abcd1234', status => 'running',
+        events => [], beat_age => 1, uptime => 10,
+    );
+
+    # Reviewer's repro, generalized: an install_warning whose text pushes
+    # "urgent!!" onto a wrapped CONTINUATION row must not inflate the count
+    # of ONE real banner into two.
+    my $urgent_text = 'padding words to push the marker off the first '
+        . 'wrapped row into a continuation line padding words to push the '
+        . 'marker off the first wrapped row into a continuation line '
+        . 'urgent!! check this now please and thanks';
+    for my $cols (40, 80) {
+        my %one = (%st, install_warning => $urgent_text);
+        my $fo = Dashboard::compose_frame(\%one, 12, $cols);
+        my @ao = grep { $_->{role} eq 'state.crit' } @$fo;
+        is(count_banner_starts(\@ao), 1,
+            "AC-20 (fix-batch step 7): one real banner with an urgent!! continuation trap still counts as ONE at cols=$cols");
+    }
+
+    # The `/^!! /`-anchor trap: a WRAPPED banner (status alert, loses its
+    # leading indent on row 0) and an UNWRAPPED banner (install_warning,
+    # keeps its leading indent) in the SAME frame must both count once.
+    my %mixed = (%st, status => 'exited', install_warning => 'backpack install FAILED');
+    my $fm = Dashboard::compose_frame(\%mixed, 12, 80);
+    my @am = grep { $_->{role} eq 'state.crit' } @$fm;
+    is(count_banner_starts(\@am), 2,
+        'AC-20 (fix-batch step 7): a wrapped banner and an unwrapped banner together still count as TWO');
 }
 
 # ===========================================================================

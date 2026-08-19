@@ -59,6 +59,99 @@ my $FOOTER_FLASH_ROLE = tui::DashboardScreen::theme_role('footer-flash');
 my $RULE_FILL_RE      = quotemeta(Theme::glyph('rule.h'));
 
 # ===========================================================================
+# count_banner_starts(\@alert_rows) -- fix-batch step 7 (d02-wrap-every-
+# surface, reviewer MUST-FIX #1, red-team follow-up).
+#
+# The step-6 amended assertions counted "banner-start rows" (a width-
+# invariant proxy for "how many banners are present", since a wrapped
+# banner now spans more than one row -- Decision D1) with an UNANCHORED
+# `grep { $_->{text} =~ /!! / }`. That matches the literal substring "!! "
+# anywhere in a row's text, including a CONTINUATION row whose wrapped
+# content happens to contain "!! " (e.g. install_warning text containing
+# "urgent!!"), silently inflating the count. The reviewer reproduced a
+# 2-banner fixture miscounted as 3; the red-team follow-up went further and
+# reproduced a 1-REAL-banner fixture miscounted as 2 -- the sharper failure,
+# because it is "a banner is genuinely missing but the assertion still
+# passes" territory (driver-verified against Dashboard::compose_frame
+# directly, see the two pinned assertions below this helper's call sites).
+#
+# DO NOT "fix" this by anchoring the regex to `^!! ` instead (`/^!! /`).
+# That was the reviewer's own suggested minimal fix and the driver proved it
+# WRONG: a WRAPPED banner's first row loses its leading "  " indent (the
+# spec's documented cosmetic side-effect of rebuilding via make_cell/
+# fit_spans, not a spans array) so its text starts "!! ...", but an
+# UNWRAPPED (single-row) banner KEEPS the "  !! " indent Dashboard::
+# _banner_lines bakes in, so its text starts "  !! ...". `^!! ` matches the
+# first shape and MISSES the second, undercounting two real banners (one
+# wrapped, one not) down to one. Driver-verified against
+# tui::DashboardScreen::compose directly.
+#
+# STRUCTURAL discriminator (primary, authoritative): every cell wrap_line/
+# make_cell emits carries a `spans` arrayref (Frame.pm's single cell
+# constructor). A banner-START row's FIRST span carries the banner's own
+# role (Screen.pm's $banner_role, e.g. 'state.crit'/'state.warn'); a
+# CONTINUATION row's FIRST span carries the continuation-indent role
+# CONTINUATION_ROLE below ('text.primary' -- the plain 2-space indent
+# wrap_line prepends to every line after the first, Screen.pm
+# WRAP_CONTINUATION_INDENT). This distinguishes start-vs-continuation by
+# STRUCTURE, not by scanning rendered text for a marker that a banner's own
+# (dynamic, tool-surfaced) content could coincidentally contain anywhere.
+#
+# TEXT discriminator (secondary, belt-and-braces): `/^\s*!! /` matches BOTH
+# accepted first-row shapes above (wrapped "!! ..." and unwrapped
+# "  !! ...") and rejects the reviewer's `urgent!!`-mid-line repro (no
+# leading "!! " on that row). Used only to CORROBORATE the structural count
+# where the marker can physically appear intact in a row -- see the
+# $cols < 3 note below for where it cannot, by construction.
+#
+# WIDTH FLOOR, RULED (red-team follow-up, ledger criterion 4 -- width 1-3
+# behavior must be DEFINED, not accidental): driver-verified directly
+# against Dashboard::compose_frame that at $cols in (1, 2), wrap_line's
+# forced-progress/degenerate-budget path (triggered when the continuation
+# + leading indent reservation no longer leaves >=1 content column) drops
+# the leading-indent span ENTIRELY -- every row, start AND continuation
+# alike, ends up with the banner role as its ONLY/first span. At those two
+# widths the structural discriminator cannot distinguish start from
+# continuation at all (it counts every row), and the text discriminator
+# also cannot corroborate anything (the 3-character "!! " marker cannot fit
+# intact in a 1- or 2-column row, torn or not). "How many banners are
+# present" is therefore NOT RECOVERABLE from the rendered frame at
+# $cols < 3 -- not a test-discriminator gap, an inherent floor of a 1-2
+# column banner row. Assertions in this file do not claim a banner-start
+# COUNT at $cols < 3; see the width 1/2/3 pinned block below PART (E) for
+# what IS asserted there instead (frame validity, no crash).
+#
+# At $cols == 3 EXACTLY the two discriminators diverge (driver-verified):
+# structural is still correct (a 200-row-budget, 2-banner probe at cols=3
+# returns struct_starts==2, matching ground truth) because Screen.pm still
+# manages to keep line 0's span distinct from continuation lines' spans
+# even though the "!! " marker text itself is torn across rows 0/1 (only
+# one "!" fits per row before the pad). The text discriminator cannot
+# corroborate there (the intact marker literally cannot fit in 3 columns
+# either -- "!! " is exactly 3 columns wide with zero room for content).
+# Per the ruling above: structural is authoritative; the width 1/2/3 pinned
+# block below asserts cols==3 gets a real count (via structural alone) and
+# cols==1/2 do not.
+my $CONTINUATION_ROLE = 'text.primary';   # Screen.pm's wrap-continuation indent role
+sub count_banner_starts {
+    my ($rows) = @_;
+    $rows = [] if ref($rows) ne 'ARRAY';
+    my $count = 0;
+    for my $row (@$rows) {
+        next if ref($row) ne 'HASH';
+        my $spans = (ref($row->{spans}) eq 'ARRAY') ? $row->{spans} : undef;
+        # A row with no spans array (or an empty one) cannot be identified
+        # as a continuation -- there is no indent span to find -- so it
+        # counts as a start. Documented, not silently swallowed: every cell
+        # this codebase actually emits carries spans (make_cell/wrap_line),
+        # so this branch is a defensive default, not an expected path.
+        my $first_role = ($spans && @$spans) ? $spans->[0]{role} : undef;
+        $count++ if !defined($first_role) || $first_role ne $CONTINUATION_ROLE;
+    }
+    return $count;
+}
+
+# ===========================================================================
 # activity_capacity DERIVATION HELPER (package 06, spec S5 ":756-774", Family
 # 3), shared by PART 9 and PART 11/C1a-C1b below. Claim preserved verbatim --
 # "capacity mirrors compose_frame's budget" -- but every literal number that
@@ -345,13 +438,15 @@ my %st = (
     # exited ... re-run claude-sandbox") spans 2 rows -- "one row per alert"
     # is no longer a valid proxy for "how many alerts are present". The
     # original intent -- exactly one alert (the status alert) is showing --
-    # is preserved by counting banner-START rows instead of raw alert rows:
-    # Dashboard::_alert_line prefixes only the FIRST row of a banner with the
-    # literal "!! " marker; wrap_line's continuation rows never carry it.
-    # Counting "!! "-prefixed rows is therefore a width-invariant banner
-    # count (driver-verified against tui::Screen::compose directly).
-    my @a_starts = grep { $_->{text} =~ /!! / } @a;
-    is(scalar(@a_starts), 1, "compose: non-running status -> one alert banner (role: $ALERT_ROLE)");
+    # is preserved by counting banner-START rows instead of raw alert rows.
+    # RE-AMENDED, fix-batch step 7 (reviewer MUST-FIX #1): counting rows by
+    # an unanchored `/!! /` text match over-counts when a continuation row's
+    # own content happens to contain "!! " -- see count_banner_starts's
+    # doc comment above for why, and why anchoring to `/^!! /` is ALSO
+    # wrong (it under-counts an unwrapped banner instead). Use the
+    # structural discriminator.
+    my $a_starts = count_banner_starts(\@a);
+    is($a_starts, 1, "compose: non-running status -> one alert banner (role: $ALERT_ROLE)");
     like($f->[1]{text}, qr/not running/, 'compose: status alert sits under the title');
     is(scalar(@$f), 12, 'compose: status alert keeps the frame exactly $rows');
 
@@ -363,8 +458,10 @@ my %st = (
     # as immediately above: at cols=80 these two banners together occupy 3
     # rows (the status banner wraps to 2, the install banner fits in 1), so
     # raw row count no longer says "two alerts". Count banner-start rows.
-    my @a2_starts = grep { $_->{text} =~ /!! / } @a2;
-    is(scalar(@a2_starts), 2, 'compose: status + install alerts coexist as two banners');
+    # RE-AMENDED, fix-batch step 7 (reviewer MUST-FIX #1): structural
+    # discriminator, not unanchored text match -- see count_banner_starts.
+    my $a2_starts = count_banner_starts(\@a2);
+    is($a2_starts, 2, 'compose: status + install alerts coexist as two banners');
     is(scalar(@$f2), 12, 'compose: two alerts keep the frame exactly $rows');
     # s06-panel-semantics: the container-status line now carries a status
     # glyph, a multi-byte UTF-8 sequence but exactly 2 DISPLAY columns -- the
@@ -372,6 +469,86 @@ my %st = (
     # regression test's idiom above; see Decision #12).
     my $bad = grep { Dashboard::display_width($_->{text}) != 80 } @$f2;
     is($bad, 0, 'compose: alert rows keep exactly $cols');
+}
+
+# count_banner_starts pin (fix-batch step 7, MUST-FIX #1) -- the exact
+# failure the unanchored discriminator missed, and its sharper red-team
+# variant. Both must resolve to the TRUE banner count, not the inflated one
+# an unanchored `/!! /` scan would report.
+{
+    # Red-team's stronger repro: ONE real banner (install_warning only,
+    # no status alert) whose text pushes the two-character "!!" onto a
+    # WRAPPED CONTINUATION row -- the "a banner is genuinely missing but
+    # the assertion still passes" failure mode, because an unanchored scan
+    # counts that continuation row as a second banner-start even though
+    # only one banner exists. Driver-verified: 3 rows at cols=80,
+    # unanchored count=2 (wrong), structural count=1 (right).
+    my $one_banner_text = 'padding words to push the marker off the first '
+        . 'wrapped row into a continuation line padding words to push the '
+        . 'marker off the first wrapped row into a continuation line '
+        . 'urgent!! check this now please and thanks';
+    for my $cols (40, 80) {
+        my %one = (%st, install_warning => $one_banner_text);
+        my $fo = Dashboard::compose_frame(\%one, 12, $cols);
+        my @ao = grep { $_->{role} eq $ALERT_ROLE } @$fo;
+        my $unanchored_count = scalar(grep { $_->{text} =~ /!! / } @ao);
+        my $struct_count     = count_banner_starts(\@ao);
+        is($struct_count, 1,
+            "count_banner_starts: one real banner whose continuation row contains 'urgent!!' still counts as ONE (cols=$cols)");
+        # Pin the failure mode itself: the unanchored scan really does
+        # miscount this exact fixture, so the fix is guarded against
+        # regressing back to it silently.
+        isnt($unanchored_count, 1,
+            "sanity: the unanchored /!! / scan DOES miscount this fixture (cols=$cols, got $unanchored_count) -- confirms the discriminator matters here");
+    }
+
+    # Reviewer's original repro: TWO real banners (status alert, wrapped +
+    # install_warning containing the same "urgent!!" continuation trap).
+    my %two_urgent = (%st, status => 'exited', install_warning => $one_banner_text);
+    my $ft = Dashboard::compose_frame(\%two_urgent, 12, 80);
+    my @at = grep { $_->{role} eq $ALERT_ROLE } @$ft;
+    is(count_banner_starts(\@at), 2,
+        'count_banner_starts: two real banners (one with an urgent!! continuation trap) count as TWO, not three');
+
+    # The case that kills the reviewer's own suggested `/^!! /` fix: a
+    # WRAPPED banner (loses its leading indent on row 0, text "!! ...")
+    # and an UNWRAPPED banner (keeps its leading indent, text "  !! ...")
+    # in the SAME frame must both be counted exactly once each.
+    my %mixed = (%st, status => 'exited', install_warning => 'backpack install FAILED');
+    my $fm = Dashboard::compose_frame(\%mixed, 12, 80);
+    my @am = grep { $_->{role} eq $ALERT_ROLE } @$fm;
+    is(count_banner_starts(\@am), 2,
+        'count_banner_starts: a wrapped banner and an unwrapped banner together still count as TWO (the ^!! -anchor trap)');
+}
+
+# Width floor for banner-start counting (red-team follow-up, ledger
+# criterion 4: width 1-3 behavior must be DEFINED). See count_banner_starts'
+# doc comment for the full derivation. Pinned here so it cannot silently
+# regress or get "simplified" back to an unqualified claim.
+{
+    my %one_short = (%st, install_warning => 'x');
+    for my $cols (1, 2) {
+        my $fw = Dashboard::compose_frame(\%one_short, 24, $cols);
+        is(scalar(@$fw), 24, "banner width floor: frame still exactly \$rows at cols=$cols (no crash)");
+        my $badw = grep { Dashboard::display_width($_->{text}) != $cols } @$fw;
+        is($badw, 0, "banner width floor: every cell still exactly \$cols wide at cols=$cols");
+        my @aw = grep { $_->{role} eq $ALERT_ROLE } @$fw;
+        ok(scalar(@aw) >= 1, "banner width floor: at least one alert-role row still present at cols=$cols");
+        # Deliberately NOT asserting a banner-start COUNT here: at cols<3
+        # wrap_line's degenerate-budget path drops the leading-indent span
+        # entirely, so count_banner_starts cannot distinguish a start from
+        # a continuation (every row looks like a start) -- a genuine floor
+        # of a 1-2 column banner row, not a gap in the discriminator.
+    }
+    # At cols==3 exactly the structural discriminator IS still correct
+    # (driver-verified: a 2-banner, huge-row-budget probe at cols=3 returns
+    # struct_starts==2), even though the text marker itself is torn across
+    # rows there. A real count IS asserted at this width.
+    my %two_short = (%st, status => 'exited', install_warning => 'x');
+    my $f3 = Dashboard::compose_frame(\%two_short, 200, 3);
+    my @a3 = grep { $_->{role} eq $ALERT_ROLE } @$f3;
+    is(count_banner_starts(\@a3), 2,
+        'banner width floor: at cols==3 EXACTLY, count_banner_starts is still correct (structural, not textual)');
 }
 
 # can_launch: [c] may only attach a connector to a RUNNING container; every
