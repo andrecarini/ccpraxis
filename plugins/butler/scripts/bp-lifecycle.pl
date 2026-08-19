@@ -76,7 +76,18 @@ $ENV{MSYS2_ARG_CONV_EXCL} = '*' if $^O =~ /^(MSWin32|cygwin|msys)$/;
 my $SCRIPT_DIR = do {
     my $p = $0;
     $p =~ s{[\\/][^\\/]+\z}{};
-    length $p ? $p : '.';
+    $p = '.' unless length $p;
+    # ABSOLUTE, and that is load-bearing rather than tidy. `require` with a
+    # RELATIVE path searches @INC instead of resolving against cwd, and modern
+    # perl (5.26+) no longer carries '.' in @INC -- so the require below died
+    # with "Can't locate plugins/butler/scripts/BpState.pm in @INC" whenever
+    # this script was invoked by a relative path, i.e. the normal way a human
+    # or a hook types it from the repo root. It worked only when invoked
+    # absolutely, which is exactly how every oracle invokes it, which is why no
+    # test caught it: t/97, t/101 and t/153 all build $LIFECYCLE from abs_path.
+    # Introduced by s04 (de81269) when BpState was wired in; found when the
+    # driver ran the script by hand to archive a finished blueprint.
+    File::Spec->rel2abs($p);
 };
 my $BP_BLUEPRINT = "$SCRIPT_DIR/bp-blueprint.pl";
 
