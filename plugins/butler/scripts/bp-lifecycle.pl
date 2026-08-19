@@ -84,7 +84,8 @@ my $SCRIPT_DIR = do {
     # this script was invoked by a relative path, i.e. the normal way a human
     # or a hook types it from the repo root. It worked only when invoked
     # absolutely, which is exactly how every oracle invokes it, which is why no
-    # test caught it: t/97, t/101 and t/153 all build $LIFECYCLE from abs_path.
+    # test caught it: t/97-lifecycle-reconcile.t, t/161-lifecycle-derived.t
+    # and t/153-no-drift-to-repair.t all build $LIFECYCLE from abs_path.
     # Introduced by s04 (de81269) when BpState was wired in; found when the
     # driver ran the script by hand to archive a finished blueprint.
     File::Spec->rel2abs($p);
