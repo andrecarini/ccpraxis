@@ -237,6 +237,98 @@ sub scoped_hooks_dir_without_bplib {
 }
 
 # ===========================================================================
+# FIX1 (fixbatch step7, redteam-step6.md CRITICAL-1) -- an early, harmless
+# MENTION segment must never veto a LATER, genuine invocation segment in the
+# same compound command. Regression fixture for the leftmost-match-anchor
+# bug; must ARM in every case below (a false negative here is the serious
+# failure per criterion 3).
+# ===========================================================================
+{
+    my @shapes = (
+        ['FIX1a semicolon',
+         q{grep bp-drive-next.pl README.md; perl plugins/butler/scripts/bp-drive-next.pl next}],
+        ['FIX1b pipe',
+         q{cat notes.txt | grep bp-drive-next.pl; perl plugins/butler/scripts/bp-drive-next.pl next}],
+        ['FIX1c background-amp',
+         q{grep bp-drive-next.pl README.md & perl plugins/butler/scripts/bp-drive-next.pl next}],
+        ['FIX1d newline',
+         "grep bp-drive-next.pl README.md\nperl plugins/butler/scripts/bp-drive-next.pl next"],
+        ['FIX1e record-order after mention',
+         q{grep bp-drive-next.pl README.md; perl plugins/butler/scripts/bp-drive-next.pl record-order}],
+        ['FIX1f park after mention',
+         q{grep bp-drive-next.pl README.md; perl plugins/butler/scripts/bp-drive-next.pl park}],
+    );
+    my $n = 0;
+    for my $shape (@shapes) {
+        my ($label, $cmd) = @$shape;
+        $n++;
+        my $root = new_project();
+        my $sid  = "sess-fix1-$n";
+        my $payload = driver_payload($root, $sid, $cmd);
+        my ($rc, $out, $dact) = run_mark_driver($payload);
+        is($rc, 0, "$label: mark-wakeup.sh never blocks");
+        ok(-f marker_path($dact, $sid),
+           "$label (-> FIX1, CRITICAL-1 regression guard): a genuine invocation segment "
+         . "AFTER an unrelated reader-mention segment in the same compound command STILL "
+         . "arms -- '$cmd'");
+    }
+}
+
+# ===========================================================================
+# FIX2 (fixbatch step7, redteam-step6.md CRITICAL-2) -- command/process
+# substitution genuinely executes regardless of the outer reader word. All
+# three shapes below must ARM.
+# ===========================================================================
+{
+    my @shapes = (
+        ['FIX2a dollar-paren unquoted',
+         q{echo $(perl plugins/butler/scripts/bp-drive-next.pl next)}],
+        ['FIX2b dollar-paren double-quoted',
+         q{printf "%s" "$(perl plugins/butler/scripts/bp-drive-next.pl next)"}],
+        ['FIX2c process substitution',
+         q{cat <(perl plugins/butler/scripts/bp-drive-next.pl next)}],
+    );
+    my $n = 0;
+    for my $shape (@shapes) {
+        my ($label, $cmd) = @$shape;
+        $n++;
+        my $root = new_project();
+        my $sid  = "sess-fix2-$n";
+        my $payload = driver_payload($root, $sid, $cmd);
+        my ($rc, $out, $dact) = run_mark_driver($payload);
+        is($rc, 0, "$label: mark-wakeup.sh never blocks");
+        ok(-f marker_path($dact, $sid),
+           "$label (-> FIX2, CRITICAL-2 regression guard): a genuine invocation wrapped in "
+         . "command/process substitution after a reader word STILL arms -- '$cmd'");
+    }
+}
+
+# ===========================================================================
+# FIX3 (fixbatch step7, redteam HIGH) -- a large command must not blow the
+# hook's own 15s external timeout and must still ARM. Built via a real Bash
+# comment padding (never executed) followed by the genuine invocation, so a
+# correct implementation both (a) completes well inside the timeout and (b)
+# still arms.
+# ===========================================================================
+{
+    my $root = new_project();
+    my $padding = ('#' . ('x' x 78) . "\n") x 700;  # ~63KB of comment lines
+    my $cmd = $padding . 'perl plugins/butler/scripts/bp-drive-next.pl next';
+    my $sid = 'sess-fix3-large';
+    my $payload = driver_payload($root, $sid, $cmd);
+    my $t0 = time();
+    my ($rc, $out, $dact) = run_mark_driver($payload);
+    my $elapsed = time() - $t0;
+    is($rc, 0, 'FIX3a: mark-wakeup.sh never blocks on a large command');
+    ok(-f marker_path($dact, $sid),
+       "FIX3b (-> FIX3, HIGH regression guard): a ~63KB command with a genuine invocation "
+     . "at the end STILL arms");
+    ok($elapsed < 15,
+       "FIX3c (-> FIX3, HIGH regression guard): completed in ${elapsed}s, well inside the "
+     . "hook's own 15s external timeout");
+}
+
+# ===========================================================================
 # AC9 -- spec observable #5: a non-Bash tool whose payload text happens to
 # contain the driver invocation string must not arm (the outer $TOOL = Bash
 # gate excludes it before the matcher ever runs). Listed for completeness,

@@ -213,10 +213,18 @@ bp_require_sandbox() {
 # one problem collapsing to one implementation, not two independent copies
 # plus a shared one.
 #
-# NOT a shell parser: command substitution ($(...)), variable expansion, and
-# backtick spans are not resolved, so text built through one of those still
-# slips past filtering -- an accepted, documented residual, same direction
-# every caller of this helper already accepts for its own analogous gap.
+# NOT a shell parser: VARIABLE EXPANSION is not resolved, so an invocation
+# built through string concatenation or a variable (e.g. `X="bp-drive-next.pl
+# next"; eval "$X"`) still slips past filtering -- an accepted, documented
+# residual, same direction every caller of this helper already accepts for
+# its own analogous gap. This residual is about text that DOES NOT LITERALLY
+# APPEAR in the command -- it is constructed at runtime. It does NOT excuse
+# $(...), backticks, or <(...): those are ordinary, unobfuscated shell syntax
+# that executes their contents regardless of surrounding quotes or the outer
+# command, and this function's own $(...)/backtick handling (below, inside
+# the dquote branch) and its callers' segment-boundary treatment of them
+# (mark-wakeup.sh's bp_wakeup_arm_check) exist specifically so that content
+# is NOT treated as inert the way a genuinely-inert residual would be.
 #
 # Returns EMPTY (not the original text) if perl is unavailable or the input
 # was empty -- callers MUST treat empty as "could not determine" and choose
@@ -253,6 +261,33 @@ bp_strip_shell_noise() {
         }
         if ($state eq "dquote") {
           if ($ch eq "\\" && $i+1 < $n) { $filtered .= "  "; $i += 2; next }
+          # fixbatch step7 / d03 FIX 2b: unlike single quotes, a DOUBLE-quoted
+          # $(...) or `...` still EXECUTES in bash -- quoting only suppresses
+          # word-splitting/globbing on the *result*, not the substitution
+          # itself. Blanking it like the rest of the double-quoted span (the
+          # prior behaviour) hid a genuinely-executing invocation from every
+          # downstream matcher. Copy it through VERBATIM instead (tracking
+          # paren depth for $(...), and the next unescaped backtick for
+          # `...`) so callers see live text, exactly as for an unquoted
+          # $(...)/backtick. <(...) is deliberately NOT special-cased here:
+          # process substitution is not recognised inside double quotes at
+          # all in bash (it stays literal text there), so nothing to preserve.
+          if ($ch eq "\$" && $i+1 < $n && $c[$i+1] eq "(") {
+            my $depth = 1; my $j = $i + 2; my $buf = "\$(";
+            while ($j < $n && $depth > 0) {
+              my $cj = $c[$j];
+              $depth++ if $cj eq "(";
+              $depth-- if $cj eq ")";
+              $buf .= $cj; $j++;
+            }
+            $filtered .= $buf; $i = $j; next;
+          }
+          if ($ch eq "\x60") {
+            my $j = $i + 1; my $buf = "\x60";
+            while ($j < $n && $c[$j] ne "\x60") { $buf .= $c[$j]; $j++ }
+            if ($j < $n) { $buf .= $c[$j]; $j++ }
+            $filtered .= $buf; $i = $j; next;
+          }
           $state = "none" if $ch eq q{"};
           $filtered .= ($ch eq "\n" ? "\n" : " ");
           $i++; next;

@@ -38,7 +38,7 @@ source "$HOOK_DIR/lib.sh"
 # 20260814-093113-34a0). Reads a raw (pre-strip) shell command on stdin.
 # Prints "1" if REGEX matches inside the LIVE portion of the command (outside
 # any quoted span, comment, or heredoc body -- see bp_strip_shell_noise,
-# scripts/bp-lib.sh) AND the matched segment's first word is not a
+# scripts/bp-lib.sh) AND the matching SEGMENT's first word is not a
 # non-executing reader (echo|printf|grep|rg|cat|sed|awk). Prints "0"
 # otherwise, including on empty input. Never exits non-zero; never writes to
 # stderr -- this hook's own contract is "exit 0 on every path" (see header).
@@ -50,20 +50,80 @@ source "$HOOK_DIR/lib.sh"
 # matching behaviour for no benefit to it -- keeping this local keeps
 # bp_strip_shell_noise provably unchanged.
 #
-# Degrades in two independent, false-negative-averse directions (never toward
-# silently missing a real invocation):
+# 2026-08-19 d03-one-shell-noise-stripper fixbatch step7, FIX 1 + FIX 2
+# (redteam-step6.md CRITICAL-1/CRITICAL-2, both confirmed regressions against
+# the pre-fbe7f6e raw-payload grep). The single-shot "leftmost match, then
+# look at the text right before it" veto had two independent false-negative
+# holes:
+#   FIX 1 -- the veto anchored on the LEFTMOST occurrence of the base regex
+#     in the WHOLE command, not on the occurrence that actually matched. An
+#     early, harmless mention (`grep bp-drive-next.pl README.md`) vetoed a
+#     later, genuine invocation in the same compound command
+#     (`; perl .../bp-drive-next.pl next`), because [^"]* in the base regex
+#     happily spans `;`, `&`, `|` and newline once quotes are blanked.
+#   FIX 2 -- $(...), backticks and <(...) genuinely execute regardless of the
+#     outer word (`echo $(perl ... next)` really runs the director; `echo`
+#     does not "read" it), but the veto only ever looked at the OUTER
+#     command's first word and vetoed on it.
+#
+# THE FIX, one mechanism for both: split the (stripped) text into SEGMENTS at
+# every real command separator (`;` `&` `|` newline) AND at every
+# command/process-substitution opener (`$(` backtick `<(` `>(`), then judge
+# EACH segment independently -- arm if ANY non-reader segment matches. A
+# reader segment can now only veto ITSELF, never a sibling segment, and
+# substitution content is its own segment rather than inheriting the outer
+# word's verdict. (Double-quoted $(...)/backtick content -- e.g.
+# `printf "%s" "$(perl ... next)"` -- reaches this split as LIVE text too:
+# see bp_strip_shell_noise's dquote handling in scripts/bp-lib.sh, which
+# stopped blanking it for the same reason -- it executes regardless of the
+# surrounding quotes.) This does not resolve NESTED substitutions perfectly
+# (a `)` inside a further-nested string can end a segment early) -- an
+# accepted heuristic limit, same class as the ones already documented below,
+# and it only ever costs a potential false ARM on a pathological nesting, not
+# a missed real invocation.
+#
+# Degrades in three independent, false-negative-averse directions (never
+# toward silently missing a real invocation):
 #   - bp_strip_shell_noise unavailable or empty output (perl missing,
 #     bp-lib.sh unreadable) -> matches against the UNSTRIPPED extracted
 #     command instead of failing closed (mirrors guard-validation-
 #     interlock.sh's own bp_strip_shell_noise fallback).
-#   - perl itself unavailable for the regex+reader-check step -> the base
-#     regex match still runs via bash grep; the reader-segment VETO is
-#     skipped (never applied), which can only ARM more often, never less.
+#   - the extracted command exceeds $BP_WAKEUP_MAX_STRIP_BYTES -> the
+#     (expensive, O(n) char-by-char) stripper is skipped entirely and the
+#     RAW command is matched instead. See the size check below for why and
+#     the chosen threshold.
+#   - perl itself unavailable for the regex+segment-veto step -> the base
+#     regex match still runs via bash grep; the segment veto is skipped
+#     (never applied), which can only ARM more often, never less. NOTE
+#     (fixbatch step7, FIX 5 / reviewer S1): this branch is untested on this
+#     host -- bp_json_get (lib.sh) itself requires perl, and there is no jq
+#     here (repo constraint), so a PATH with perl removed breaks command
+#     EXTRACTION before this branch is ever reached. Reasoned-but-unexercised,
+#     not verified by any test in this repo; a container with jq present
+#     could isolate it, this host cannot.
 bp_wakeup_arm_check() {
   regex="$1"
   cmd=$(cat)
   text="$cmd"
-  if [ -n "$cmd" ] && command -v bp_strip_shell_noise >/dev/null 2>&1; then
+  # fixbatch step7 / FIX 3 (redteam HIGH): bp_strip_shell_noise is an O(n)
+  # char-by-char perl scan; measured on this host: 100KB->4.5s, 500KB->9.1s,
+  # 1000KB->14.9s (this hook's own documented 15s external timeout -- see the
+  # header's dirname-loop story), 2000KB->times out, i.e. NEVER ARMS. That is
+  # a size-triggered instance of exactly the false-negative failure mode this
+  # file exists to prevent, reachable by ordinary large-command accidents
+  # (writing a big file via heredoc, an inline script), no adversary needed.
+  # Every real bp-drive-next.pl invocation shape enumerated in AC8 (bare,
+  # absolute path, --scope flags, cd-prefixed, piped) is a few hundred bytes
+  # at most -- nowhere near this threshold. 8000 bytes is chosen as
+  # comfortably (>10x) above any real invocation shape yet far below where
+  # stripping cost becomes material (100KB is already ~4.5s). Above the
+  # threshold, skip the stripper and match the RAW command instead: this can
+  # only OVER-match (a mention sitting inside a huge quoted/commented span
+  # could false-positive-arm) rather than under-match, which is this file's
+  # stated bias throughout ("when in doubt, arm").
+  : "${BP_WAKEUP_MAX_STRIP_BYTES:=8000}"
+  if [ -n "$cmd" ] && [ "${#cmd}" -le "$BP_WAKEUP_MAX_STRIP_BYTES" ] \
+     && command -v bp_strip_shell_noise >/dev/null 2>&1; then
     stripped=$(printf '%s' "$cmd" | bp_strip_shell_noise)
     [ -n "$stripped" ] && text="$stripped"
   fi
@@ -74,14 +134,21 @@ bp_wakeup_arm_check() {
         my $regex = shift @ARGV;
         my $filtered = do { local $/; <STDIN> };
         my $armed = 0;
-        if ($filtered =~ /$regex/) {
-          my $pre = substr($filtered, 0, $-[0]);
-          my $seg = ($pre =~ /.*[;&|\n](.*)$/s) ? $1 : $pre;
-          $seg =~ s/^[ \t]+//;
-          my ($first) = $seg =~ /^(\S+)/;
-          $first = defined($first) ? $first : "";
-          $first =~ s{.*/}{};
-          $armed = 1 unless $first =~ /^(?:echo|printf|grep|rg|cat|sed|awk)$/;
+        # FIX 1 + FIX 2: segment on real separators AND substitution
+        # openers, then judge each segment on its own -- see the block
+        # comment above this function for the full rationale.
+        my @segs = split /(?:[;&|\n]|\$\(|`|<\(|>\()/, $filtered;
+        SEG: for my $seg (@segs) {
+          while ($seg =~ /$regex/g) {
+            my $pre = substr($seg, 0, $-[0]);
+            $pre =~ s/^[ \t]+//;
+            my ($first) = $pre =~ /^(\S+)/;
+            $first = defined($first) ? $first : "";
+            $first =~ s{.*/}{};
+            unless ($first =~ /^(?:echo|printf|grep|rg|cat|sed|awk)$/) {
+              $armed = 1; last SEG;
+            }
+          }
         }
         print($armed ? "1" : "0");
       ' "$regex" 2>/dev/null
@@ -244,11 +311,18 @@ fi
 # following its own protocol, not an attacker.
 #
 # ACCEPTED RESIDUALS, not fixed here:
-#   - Inherited from bp_strip_shell_noise itself (scripts/bp-lib.sh): command
-#     substitution ($(...)), variable expansion, and backtick spans are not
-#     resolved, so a command that builds the invocation text through one of
-#     those still slips past. Same direction every existing caller of that
-#     helper already accepts.
+#   - 2026-08-19 fixbatch step7: the previous bullet here claimed $(...) and
+#     backtick spans were unresolved and could slip an invocation past this
+#     block. That is no longer true (FIX 1 / FIX 2 above; redteam-step6.md
+#     CRITICAL-1/CRITICAL-2) -- $(...), backticks and <(...) are now treated
+#     as segment boundaries, and their content (including inside double
+#     quotes -- bp_strip_shell_noise no longer blanks it) is judged like any
+#     other executing segment. Inherited from bp_strip_shell_noise itself
+#     (scripts/bp-lib.sh), the ONLY remaining residual of this shape is
+#     VARIABLE EXPANSION: a command that builds the invocation text through a
+#     variable (`X="bp-drive-next.pl next"; eval "$X"`) still slips past,
+#     because nothing here evaluates shell variables. Same direction every
+#     existing caller of that helper already accepts.
 #   - The driver-arm-specific equivalent of `npm te''st`-style reconstitution:
 #     a determined caller could still build `bp-drive-next.pl` plus a
 #     subcommand through string concatenation, `eval`, a variable, or a
@@ -275,6 +349,23 @@ if [ -n "$DATA" ] && [ -d "$DATA/.drive-solo" ]; then
     # wrong quoting language. `if [ "$TOOL" = "Bash" ]` above already
     # guarantees a Bash tool_input, so tool_input.command is the right, and
     # only, field to read.
+    # fixbatch step7 / FIX 4 (redteam SHOULD-FIX): a JSON object with a
+    # DUPLICATE "command" key resolves to whichever bp_json_get's
+    # JSON::PP decode keeps -- LAST-WRITE-WINS, which is JSON::PP's own
+    # deterministic (not "whichever happens to") decode order, mirroring
+    # the RFC 8259 guidance that consumer behaviour on duplicate names is
+    # implementation-defined. Left as-is rather than "fixed": bp_json_get
+    # lives in hooks/lib.sh, outside this package's write set, so any change
+    # to the decode itself is out of scope here. Documenting instead: Claude
+    # Code's own tool_input encoder has no reason to ever emit a duplicate
+    # "command" key (it is a single Perl/JS hash key, structurally exclusive
+    # of duplicates on the producing side) -- this is a defensive concern
+    # about a malformed/adversarial payload shape, not one reachable by a
+    # normal session, and JSON::PP's last-write-wins is at least
+    # deterministic rather than order-random. If this ever needs a
+    # false-negative-averse fix, the right owner is bp_json_get itself (e.g.
+    # unioning all "command" values rather than picking one), not a
+    # workaround duplicated here.
     DCMD=$(bp_json_get "$PAYLOAD" tool_input.command 2>/dev/null || true)
     if [ "$(printf '%s' "$DCMD" | bp_wakeup_arm_check 'bp-drive-next\.pl[^"]*(next|record-order|park)')" = "1" ]; then
       if MARK=$(bp_drive_marker "$SID" 2>/dev/null); then
