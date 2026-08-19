@@ -133,22 +133,74 @@ for my $p (@pairs) {
 # spec's search roots, except the two named pre-authorized exclusions
 # (§2.3), which must still carry the OLD text unchanged.
 #
-# Uses `git ls-files` (tracked files only, matches the spec's intent that
-# these are the citations that matter) restricted to the search roots named
-# in spec §2.3: plugins/**, .ccpraxis-local-data/blueprints/** (both
-# blueprints), docs/**, CLAUDE.md, skills/**. .git/ is excluded by
-# construction (git ls-files never lists it).
+# Coverage is TWO scans, combined:
+#   (a) `git ls-files` (tracked files only) restricted to plugins/**,
+#       docs/**, CLAUDE.md, skills/**. .git/ is excluded by construction
+#       (git ls-files never lists it).
+#   (b) a live opendir/readdir recursion of .ccpraxis-local-data/blueprints/,
+#       done SEPARATELY because that whole tree is gitignored
+#       (.gitignore:19) -- `git ls-files` can NEVER return anything from it,
+#       so folding it into (a)'s root list (as a prior revision of this file
+#       did) produces a search that *claims* to cover live blueprints but
+#       structurally cannot: it silently contributes zero files no matter
+#       how many stale citations exist there. That was a real, confirmed gap
+#       (red-team MEDIUM-1, 2026-08-19): 772 lines of hits in
+#       _archive/ alone, invisible to (a). opendir/readdir only, per the
+#       non-ASCII-path landmine (never glob(), which splits on whitespace).
+#
+# _archive/** is walked but its findings are DISCARDED, not searched at all:
+# an archived blueprint is an immutable historical record of a finished
+# initiative, and its specs legitimately name old basenames because that is
+# what those specs said at the time they were written and executed. The
+# defect this section fixes was never "the archive has old names" -- it is
+# that the oracle *claimed* a coverage of .ccpraxis-local-data/blueprints/
+# that it structurally could not deliver. Excluding _archive/ by directory
+# prefix restores honesty about scope without rewriting frozen history.
 # ============================================================================
 {
-    my @roots = ('plugins', '.ccpraxis-local-data/blueprints', 'docs', 'CLAUDE.md', 'skills');
+    my @roots = ('plugins', 'docs', 'CLAUDE.md', 'skills');
     my $file_list = `cd "$ROOT" && git ls-files -- @roots 2>&1`;
     my @tracked = grep { length } split /\r?\n/, $file_list;
     ok(scalar(@tracked) > 400,
-       'SECTION 3 sanity: git ls-files over the search roots found a plausible number of tracked files ('
+       'SECTION 3 sanity: git ls-files over the tracked search roots found a plausible number of files ('
      . scalar(@tracked) . ')') or diag("git ls-files output: $file_list");
 
-    # Two pre-authorized exclusions (§2.3/§2.4): these must be found, and
-    # must still contain the OLD text verbatim (deliberately left, not
+    # Live blueprints: NOT under git (gitignored), so walked directly.
+    # _archive/ is excluded here by directory-name check, not searched at
+    # all -- see the section header comment for why.
+    my @blueprint_files;
+    {
+        my $bp_root = "$ROOT/.ccpraxis-local-data/blueprints";
+        my @stack = ($bp_root);
+        while (my $dir = pop @stack) {
+            opendir(my $dh, $dir) or next;
+            for my $entry (readdir $dh) {
+                next if $entry eq '.' || $entry eq '..';
+                my $abs = "$dir/$entry";
+                if (-d $abs) {
+                    next if $entry eq '_archive';
+                    push @stack, $abs;
+                } elsif (-f $abs) {
+                    my $rel = $abs;
+                    $rel =~ s{\A\Q$ROOT\E[\\/]}{};
+                    $rel =~ s{\\}{/}g;
+                    push @blueprint_files, $rel;
+                }
+            }
+            closedir $dh;
+        }
+    }
+    ok(scalar(@blueprint_files) > 0,
+       'SECTION 3 sanity: the live .ccpraxis-local-data/blueprints/ scan (excluding _archive/) found at '
+     . 'least one file (' . scalar(@blueprint_files) . ') -- this is the assertion that catches the '
+     . 'illusory-coverage class of defect: a broken/empty walk here must not pass the rest of this '
+     . 'section vacuously, the same way git ls-files silently returning zero for a gitignored root did')
+        or diag('live blueprint scan found zero files; check .ccpraxis-local-data/blueprints/ resolution');
+
+    my @searched = (@tracked, @blueprint_files);
+
+    # Pre-authorized exclusions (§2.3/§2.4): these must be found, and must
+    # still contain the OLD text verbatim (deliberately left, not
     # accidentally missed).
     my %exempt_files = (
         'plugins/butler/tests/t/148-registry-runtime-only.t' => 1,
@@ -171,10 +223,30 @@ for my $p (@pairs) {
         'plugins/butler/tests/t/163-no-duplicate-test-numbers.t' => 1,
     );
 
+    # d01's own package/spec/report files legitimately name the old
+    # basenames -- they describe the rename itself. A directory/prefix scope
+    # (rather than listing each report filename) means a ninth report added
+    # later is covered automatically instead of needing a new line here; it
+    # is still narrow enough that a stale citation in an unrelated live
+    # blueprint package (d02-d05, or a future one) is NOT hidden by it.
+    my @exempt_prefixes = (
+        '.ccpraxis-local-data/blueprints/ccpraxis-tooling-debt/packages/d01-test-numbering-collisions.md',
+        '.ccpraxis-local-data/blueprints/ccpraxis-tooling-debt/specs/d01-test-numbering-collisions-spec.md',
+        '.ccpraxis-local-data/blueprints/ccpraxis-tooling-debt/reports/d01-test-numbering-collisions/',
+    );
+    my $is_exempt_by_prefix = sub {
+        my ($rel) = @_;
+        for my $pfx (@exempt_prefixes) {
+            return 1 if $rel eq $pfx || index($rel, $pfx) == 0;
+        }
+        return 0;
+    };
+
     for my $p (@pairs) {
         my @hits;
-        for my $rel (@tracked) {
+        for my $rel (@searched) {
             next if $exempt_files{$rel};
+            next if $is_exempt_by_prefix->($rel);
             my $abs = "$ROOT/$rel";
             next unless -f $abs;
             my $content = slurp($abs);
@@ -183,7 +255,7 @@ for my $p (@pairs) {
         }
         is(scalar(@hits), 0,
            "SECTION 3 (DC2, #$p->{num}): zero surviving citations of old basename $p->{loser} "
-         . '(outside the two pre-authorized exclusions) -- found in: ' . join(', ', @hits));
+         . '(outside the pre-authorized exclusions) -- found in: ' . join(', ', @hits));
     }
 
     # The two exclusions themselves: confirm they still exist and still

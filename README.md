@@ -305,73 +305,13 @@ ccpraxis/
 │   │   │   │   └── HostCaps.pm
 │   │   │   ├── run-tests.pl                 # Test runner for plugins/butler/tests/t/.
 │   │   │   └── t/
-│   │   │       ├── 00-oracle-hygiene.t
-│   │   │       ├── 01-contract.t
-│   │   │       ├── 02-preflight.t
-│   │   │       ├── 03-govern.t
-│   │   │       ├── 04-log.t
-│   │   │       ├── 05-keeper.t
-│   │   │       ├── 06-orchestrator.t
-│   │   │       ├── 07-http.t
-│   │   │       ├── 08-orchestrator-scenarios.t
-│   │   │       ├── 09-gate.t
-│   │   │       ├── 10-judges.t
-│   │   │       ├── 11-simulation.t
-│   │   │       ├── 12-wait-for-decision.t
-│   │   │       ├── 13-answer-decision.t
-│   │   │       ├── 14-hooks-selftest.t
-│   │   │       ├── 15-orchestrate-shutdown-clear.t
-│   │   │       ├── 16-oauth-sandbox-preflight.t
-│   │   │       ├── 17-drive-next.t
-│   │   │       ├── 18-usage-governor.t
-│   │   │       ├── 19-drive-integration.t
-│   │   │       ├── 20-deps-check.t
-│   │   │       ├── 20-orchestrator-broken-env-turns.t
-│   │   │       ├── 21-durable-checkpoint-commits.t
-│   │   │       ├── 22-checkpoint-hardening.t
-│   │   │       ├── 23-keeper-resilience-antispam.t
-│   │   │       ├── 24-conformance-gate.t
-│   │   │       ├── 25-fast-store.t
-│   │   │       ├── 26-auto-remediation-engine.t
-│   │   │       ├── 27-preflight-repo-check.t
-│   │   │       ├── 60-dag-integrity.t
-│   │   │       ├── 61-judge-starvation.t
-│   │   │       ├── 62-repeat-guard.t
-│   │   │       ├── 63-progress-heuristic.t
-│   │   │       ├── 64-ledger-guard.t
-│   │   │       ├── 65-ledger-api.t
-│   │   │       ├── 66-waiting-discipline.t
-│   │   │       ├── 67-wait-shape-guard.t
-│   │   │       ├── 68-exit-reason-classification.t
-│   │   │       ├── 69-answer-decision-completeness.t
-│   │   │       ├── 70-decision-delivery.t
-│   │   │       ├── 71-ledger-timestamps.t
-│   │   │       ├── 72-subprocess-containment.t
-│   │   │       ├── 73-status-recognition.t
-│   │   │       ├── 74-soft-ordering.t
-│   │   │       ├── 75-effort-and-profiles.t
-│   │   │       ├── 76-reporter-autonomy.t
-│   │   │       ├── 77-feedback.t
-│   │   │       ├── 78-timestamp-authorship.t
-│   │   │       ├── 79-contract-idle-window.t
-│   │   │       ├── 79-worker-backend-dispatcher.t
-│   │   │       ├── 80-rate-limit-attempt-isolation.t
-│   │   │       ├── 80-worker-jail-isolation.t
-│   │   │       ├── 81-opencode-worker-runtime.t
-│   │   │       ├── 81-usage-poll-cadence.t
-│   │   │       ├── 82-orphaned-judge-recovery.t
-│   │   │       ├── 82-worker-model-preference.t
-│   │   │       ├── 83-multi-provider-spend.t
-│   │   │       ├── 84-green-baseline.t
-│   │   │       ├── 85-cache-state.t
-│   │   │       ├── 86-blueprint-write-api.t
-│   │   │       ├── 87-decision-context-split.t
-│   │   │       ├── 88-execution-priority.t
-│   │   │       ├── 89-ledger-context-budget.t
-│   │   │       ├── 90-version-pin-currency.t
-│   │   │       ├── 91-agent-worker-doctrine.t
-│   │   │       ├── 92-write-set-implied-checks.t
-│   │   │       └── 93-turn-cap-consistency.t
+│   │   │       └── NN-slug.t                    # Plain Test::More files, one number per file (enforced by
+│   │   │                                         # t/163-no-duplicate-test-numbers.t). Individual filenames are
+│   │   │                                         # deliberately not enumerated here — this tree previously listed
+│   │   │                                         # them by name, drifted out of sync with the directory (it had
+│   │   │                                         # stopped at 93 while the directory held files up to 162+), and a
+│   │   │                                         # hand-maintained file list rots the same way again. See the
+│   │   │                                         # directory itself, or its own oracle, for the current, accurate set.
 │   │   └── turn-caps.json
 │   ├── sandbox/                             # Sandbox plugin — bundles the claude-sandbox host launcher, the container blueprint, the bootstrap routine, and the /sandbox:setup redirect skill
 │   │   ├── .claude-plugin/
