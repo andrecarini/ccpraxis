@@ -32,11 +32,37 @@ source "$HOOK_DIR/lib.sh"
 
 [ -n "${BP_LEDGER:-}" ] || exit 0
 [ "${BP_ROLE:-coordinator}" = "harvest-judge" ] || exit 0
+# shellcheck source=../scripts/bp-lib.sh
+# Sourced ONLY for bp_strip_shell_noise (t09 guard-hooks-stripping). Order
+# relative to bp_hook_require_jq below does not matter -- jq and this
+# sourcing are independent -- but BOTH must stay after the BP_LEDGER/BP_ROLE
+# gate above (order there IS safety-critical, per the header).
+[ -r "$HOOK_DIR/../scripts/bp-lib.sh" ] && source "$HOOK_DIR/../scripts/bp-lib.sh"
 bp_hook_require_jq
 
 PAYLOAD=$(cat 2>/dev/null || true)
 CMD=$(jq -r '.tool_input.command // empty' <<<"$PAYLOAD" 2>/dev/null)
 [ -n "$CMD" ] || exit 0
+
+# t09 (guard-hooks-stripping). THREAT MODEL: ACCIDENT, not ADVERSARY -- same
+# ruling already on record for mark-wakeup.sh/guard-validation-interlock.sh,
+# not re-derived here. This hook's real defect is a FALSE POSITIVE: a
+# commit-message-shaped or otherwise QUOTED mention of pnpm/npm/yarn
+# lint|build|test reads identically to a real re-run under a raw grep.
+# Residual left knowingly unfixed: a BARE, unquoted MENTION (no reader-veto
+# added -- spec SS6 out-of-scope). Fail direction: above
+# BP_GUARD_MAX_STRIP_BYTES, or when bp_strip_shell_noise is
+# unavailable/empty, MATCH_TEXT stays the RAW command -- never skip the
+# match itself; raw-matching is this guard's own pre-existing behavior.
+MATCH_TEXT="$CMD"
+: "${BP_GUARD_MAX_STRIP_BYTES:=8000}"
+case "$BP_GUARD_MAX_STRIP_BYTES" in
+  ''|*[!0-9]*) BP_GUARD_MAX_STRIP_BYTES=8000 ;;
+esac
+if [ "${#CMD}" -le "$BP_GUARD_MAX_STRIP_BYTES" ] && command -v bp_strip_shell_noise >/dev/null 2>&1; then
+  STRIPPED=$(printf '%s' "$CMD" | bp_strip_shell_noise)
+  [ -n "$STRIPPED" ] && MATCH_TEXT="$STRIPPED"
+fi
 
 # Deliberately narrow: the exact re-run shape named in the incident evidence
 # (sources/2026-08-11-gsa-fleet-collapse.md:125 — "pnpm run lint, pnpm run
@@ -53,7 +79,7 @@ CMD=$(jq -r '.tool_input.command // empty' <<<"$PAYLOAD" 2>/dev/null)
 # boundary class produces false positives on ordinary commands that merely
 # mention the words in a quoted string, e.g. a commit message — see h01
 # fix-batch step 7 report. Left open per spec §2.2's narrow-by-design scope.
-if printf '%s' "$CMD" | grep -Eq '(^|[;&|[:space:](])([^[:space:];&|]*/)?(pnpm|npm|yarn)[[:space:]]+(run[[:space:]]+)?(lint|build|test)\b'; then
+if printf '%s' "$MATCH_TEXT" | grep -Eq '(^|[;&|[:space:](])([^[:space:];&|]*/)?(pnpm|npm|yarn)[[:space:]]+(run[[:space:]]+)?(lint|build|test)\b'; then
   echo "BLOCKED: harvest judges verify a declared \`checks:\` entry via its recorded evidence, never by re-running it (bp-harvest-judge.md Method: 'via a declared artefact, never by re-running them'). Command: $CMD. Look for the check's recorded invocation+result inside your contracted slice instead." >&2
   exit 2
 fi

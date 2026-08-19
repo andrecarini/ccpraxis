@@ -29,6 +29,12 @@ HOOK_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=lib.sh
 # Sourced for bp_json_get ONLY -- NO bp_hook_gate here, by design (see above).
 source "$HOOK_DIR/lib.sh"
+# shellcheck source=../scripts/bp-lib.sh
+# Sourced ONLY for bp_strip_shell_noise, used by the new heredoc-only branch
+# of git_scan_target below (t09). Conditional/tolerant, like mark-wakeup.sh's
+# own sourcing of this same file -- if unreadable, the branch degrades to
+# TODAY's raw-fallback behavior (AC17), never to unconditional allow.
+[ -r "$HOOK_DIR/../scripts/bp-lib.sh" ] && source "$HOOK_DIR/../scripts/bp-lib.sh"
 
 PAYLOAD=$(cat)
 
@@ -112,10 +118,73 @@ git_scan_target() {
   # "fails toward deny" direction -- never a security concern, only a
   # possible extra false positive on prose that itself contains a literal
   # backslash, '#', or '<<'.
+  # t09 (guard-hooks-stripping). THREAT MODEL: ACCIDENT, not ADVERSARY -- the
+  # same ruling already on record for this hook family (see
+  # guard-validation-interlock.sh's header, and mark-wakeup.sh's own
+  # bp_strip_shell_noise consumption); not re-derived here because nothing
+  # about it is in tension. Nothing in this branch needs to survive a
+  # deliberate bypass attempt, only ordinary prose/quoting/heredoc accidents
+  # -- the confirmed live incident (a heredoc report body that merely NAMES
+  # "git stash"/"git reset --hard" in prose, with no git invocation anywhere
+  # in the command) is exactly that shape. A false positive (blocking
+  # legitimate report-writing) is THIS hook's real defect to fix; a false
+  # negative (a real mutation slipping through) must not be introduced --
+  # hence the carrier/shellword re-check below, and the backslash/'#' branch
+  # staying on the untouched raw fallback.
+  #
+  # RESIDUAL LEFT UNFIXED, KNOWINGLY: the backslash/'#'-comment-adjacent raw
+  # fallback immediately below is UNCHANGED -- prose containing a literal
+  # backslash or '#' still forces a fully-raw scan, exactly as before this
+  # package. Only the heredoc-only ('<<', no backslash/'#') trigger gains a
+  # narrower, safer path.
   case "$cmd" in
-    *'\'*|*'#'*|*'<<'*)
+    *'\'*|*'#'*)
       RAW_KIND=escape
       SCAN_OUT="$cmd"
+      return 0
+      ;;
+  esac
+
+  # Heredoc marker present, and NEITHER a backslash NOR a '#' (those stay on
+  # the raw fallback above, untouched): this is the ONE case
+  # bp_strip_shell_noise already handles and git_scan_target's own three-
+  # state walk cannot (no comment/heredoc state at all -- see the header
+  # above). Reuse bp_strip_shell_noise UNMODIFIED; do not re-derive heredoc
+  # parsing here (ledger criterion 2: one stripping implementation).
+  case "$cmd" in
+    *'<<'*)
+      HD_STRIPPED=""
+      if command -v bp_strip_shell_noise >/dev/null 2>&1; then
+        HD_STRIPPED=$(printf '%s' "$cmd" | bp_strip_shell_noise)
+      fi
+      if [ -z "$HD_STRIPPED" ]; then
+        # perl / scripts/bp-lib.sh unavailable, or stripping produced empty
+        # output: fall back to TODAY's behavior exactly. Never treat "could
+        # not strip" as "no heredoc" -- that would silently narrow the scan.
+        RAW_KIND=escape
+        SCAN_OUT="$cmd"
+        return 0
+      fi
+      # Re-run git_scan_target's OWN carrier / shellword checks -- unmodified
+      # regex text, new input -- before trusting the stripped text. Both must
+      # still escalate to fully raw, exactly as the main walk already does
+      # for these two cases below. bp_strip_shell_noise leaves a bare or
+      # double-quoted $(...)/backtick verbatim in its output (it must -- both
+      # genuinely execute), so a heredoc-triggered command that ALSO contains
+      # an unquoted carrier or a `bash -c "..."` wrapper outside the heredoc
+      # must still escalate, exactly as the un-heredoc'd walk already does.
+      if printf '%s' "$HD_STRIPPED" | grep -Eq '`|\$\('; then
+        RAW_KIND=carrier
+        SCAN_OUT="$cmd"
+        return 0
+      fi
+      if printf '%s' "$HD_STRIPPED" | grep -Eq '(^|[;&|[:space:]])(bash|sh|zsh|ksh|dash|eval|xargs)([[:space:]]|$)'; then
+        RAW_KIND=shellword
+        SCAN_OUT="$cmd"
+        return 0
+      fi
+      RAW_KIND=heredoc
+      SCAN_OUT="$HD_STRIPPED"
       return 0
       ;;
   esac

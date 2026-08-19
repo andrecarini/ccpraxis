@@ -159,6 +159,28 @@ bp_ws_deny_r3a() {
 bp_ws_main() {
   bp_hook_gate                                     # inert outside a butler session
 
+  # t09 (guard-hooks-stripping). THREAT MODEL: ACCIDENT, not ADVERSARY -- same
+  # ruling already on record for mark-wakeup.sh/guard-validation-interlock.sh,
+  # not re-derived here. This hook's real defect is a FALSE POSITIVE: a
+  # while/sleep or tail/head-pipe shape merely QUOTED inside a doc string
+  # (e.g. an echoed anti-pattern example) reads identically to a real
+  # wait-loop under a raw grep. Residual left knowingly unfixed: a BARE,
+  # unquoted MENTION (no reader-veto added -- spec SS6 out-of-scope).
+  #
+  # Sourced LAZILY here, inside bp_ws_main, never at file scope -- t/67
+  # sources this file itself to unit-test the pure matcher helpers (D1), and
+  # a file-scope source would run on every such sourcing, not only on real
+  # enforcement.
+  #
+  # NOTE this is NOT D7. D7 (this file's own header) is fail-OPEN on
+  # INFRASTRUCTURE uncertainty -- missing jq, bad payload, unwritable state,
+  # unextractable id -- none of which stripping touches. Stripping-
+  # unavailable degrades to the EXISTING raw-match behavior (a narrower,
+  # already-understood fallback), never to a NEW fail-open path; D7's scope
+  # does not extend to this layer.
+  # shellcheck source=../scripts/bp-lib.sh
+  [ -r "$HOOK_DIR/../scripts/bp-lib.sh" ] && source "$HOOK_DIR/../scripts/bp-lib.sh"
+
   local action
   action=$(bp_ws_action_of "${BP_WAITSHAPE_ACTION:-}")
   [ "$action" = off ] && exit 0
@@ -179,9 +201,23 @@ bp_ws_main() {
       cmd=$(jq -r '.tool_input.command // empty' <<<"$payload" 2>/dev/null) || exit 0
       [ -n "$cmd" ] || exit 0
 
-      [ "$(bp_ws_is_wait_loop "$cmd")" = yes ] && bp_ws_deny_r1 "$cmd"
-      [ "$(bp_ws_is_task_artifact_poll "$cmd")" = yes ] && bp_ws_deny_r3b "$cmd"
-      [ "$(bp_ws_is_false_green_pipe "$cmd")" = yes ] && bp_ws_deny_r2 "$cmd"
+      # Fail direction: above BP_GUARD_MAX_STRIP_BYTES, or when
+      # bp_strip_shell_noise is unavailable/empty, MATCH_TEXT stays the RAW
+      # command -- never skip the match itself (see rationale above).
+      local match_text="$cmd"
+      : "${BP_GUARD_MAX_STRIP_BYTES:=8000}"
+      case "$BP_GUARD_MAX_STRIP_BYTES" in
+        ''|*[!0-9]*) BP_GUARD_MAX_STRIP_BYTES=8000 ;;
+      esac
+      if [ "${#cmd}" -le "$BP_GUARD_MAX_STRIP_BYTES" ] && command -v bp_strip_shell_noise >/dev/null 2>&1; then
+        local stripped
+        stripped=$(printf '%s' "$cmd" | bp_strip_shell_noise)
+        [ -n "$stripped" ] && match_text="$stripped"
+      fi
+
+      [ "$(bp_ws_is_wait_loop "$match_text")" = yes ] && bp_ws_deny_r1 "$cmd"
+      [ "$(bp_ws_is_task_artifact_poll "$match_text")" = yes ] && bp_ws_deny_r3b "$cmd"
+      [ "$(bp_ws_is_false_green_pipe "$match_text")" = yes ] && bp_ws_deny_r2 "$cmd"
       exit 0
       ;;
     TaskOutput)
