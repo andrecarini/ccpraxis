@@ -2088,8 +2088,10 @@ sub _row_ansi {
 }
 
 # render_frame($prev_frame, $new_frame, \%opts) -> the ANSI string to apply.
-# Full redraw (clear + every row) when there is no previous frame, the row count
-# changed (a resize), or opts.full is set; otherwise a per-row diff that touches
+# Full redraw (clear + every row) when there is no previous frame or the row
+# count changed (a resize -- callers force this by passing $prev=undef, the
+# idiom run() uses for a width-only resize too, since render_frame never
+# receives terminal width); otherwise a per-row diff that touches
 # ONLY changed rows, keyed on _cell_sig (D2) -- a VALUE comparison, so two
 # structurally-identical cells built by separate compose_frame calls (distinct
 # spans arrayrefs) still diff to nothing. The whole burst is wrapped in
@@ -2100,7 +2102,7 @@ sub render_frame {
     my ($prev, $new, $opts) = @_;
     $opts ||= {};
     my $color = $opts->{color};
-    my $full  = $opts->{full} || !$prev || !@$prev || @$prev != @$new;
+    my $full  = !$prev || !@$prev || @$prev != @$new;
 
     my $out = "\e[?2026h";   # begin synchronized output
     $out .= "\e[2J\e[H" if $full;
@@ -3600,6 +3602,7 @@ sub run {
     my $last_beat = $start - $beat_int;   # heartbeat fires on the first tick
     my $last_state = undef;               # forces a gather on the first tick
     my ($cols, $rows) = $term_size->();
+    my ($last_cols, $last_rows) = ($cols, $rows);
     my $prev;
     my %state;
     my $pending = '';
@@ -3728,6 +3731,18 @@ sub run {
                 # state refresh (slower cadence than input polling)
                 if (!defined $last_state || $t - $last_state >= $state_int) {
                     ($cols, $rows) = $term_size->();
+                    if ($cols != $last_cols || $rows != $last_rows) {
+                        # c8b0: a width-only resize never changes the ROW COUNT
+                        # that render_frame's own $full formula compares, so the
+                        # per-row diff would otherwise skip unchanged rows and
+                        # leave whatever the real terminal did to them during the
+                        # resize on screen. Reuse the SAME idiom already used
+                        # three times elsewhere in this file to force a full
+                        # repaint ([r] refresh, backpack-modal exit, first frame)
+                        # instead of adding a second mechanism.
+                        $prev = undef;
+                        ($last_cols, $last_rows) = ($cols, $rows);
+                    }
                     my $base = $gather->() || {};
                     %state = %$base;
                     # t03-banner-dismiss S2.4: %state was just wholesale-replaced

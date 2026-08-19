@@ -447,6 +447,27 @@ sub wrap_line {
         }
     }
 
+    # (3a-merge) 9897: glue a single-character hotkey-hint word (this
+    # codebase's own convention -- '[d]', '[r]', '[s]', etc., confirmed by
+    # grep across DashboardScreen.pm) to the SINGLE word immediately
+    # following it, so tui::Layout::wrap's existing "each word is atomic"
+    # guarantee (Layout.pm) can never split them across a wrap boundary.
+    # Left-to-right, non-overlapping: a combined word is not re-matched (no
+    # chained gluing). Multi-character bracket tokens ('[running]') do not
+    # match and are left untouched -- deliberate scope discipline, not an
+    # oversight. Strictly downstream of the fast-path return above, so it
+    # never runs on a row that already fits.
+    my @merged;
+    for (my $i = 0; $i <= $#words; $i++) {
+        if ($words[$i]{text} =~ /^\[[^\[\]\s]\]$/ && $i < $#words) {
+            push @merged, { text => $words[$i]{text} . ' ' . $words[$i + 1]{text}, role => $words[$i]{role} };
+            $i++;   # consume the following word too; do not re-match the combined word
+        } else {
+            push @merged, $words[$i];
+        }
+    }
+    @words = @merged;
+
     # (3b) Overlong-word pre-split at decoded-character boundaries.
     my @pre_split;
     for my $word (@words) {
@@ -570,6 +591,80 @@ sub wrap_line {
         }
     }
     return \@cells;
+}
+
+# bound_for_wrap($text, $max_rows, $w) -> $string, a decoded-character,
+# display-width-safe PREFIX of $text -- 59a4. Callers (tui::Screen::compose's
+# banner loop) call this immediately before wrap_line so wrap_line never pays
+# O(full message length) to wrap a message whose eventual row budget is much
+# smaller: input beyond what could ever survive $max_rows rows of $w columns
+# each is cut before wrap_line ever sees it. Generous, NEVER under-cuts (the
+# cut result's display width is always >= $max_rows*$w when the input needed
+# cutting at all) -- see spec S"Interfaces & contracts" #4. Byte-identical
+# pass-through, no decode round-trip, for input already within budget (the
+# common case: no live caller today sends a banner long enough to need
+# cutting). PURE, PUBLIC.
+#
+# STRICTLY greater than $limit when cutting, not merely >=: wrap_line's own
+# fast path (spans_width($spans) <= $w) is a SEPARATE code path from its
+# word-wrap slow path (which reserves room for the continuation indent even
+# on line 0 -- Frame.pm's own $content_w reservation), and the two produce
+# DIFFERENT line-0 text for the same words when $max_rows==1 (so
+# $limit==$w exactly). Cutting to EXACTLY $limit can therefore land the
+# bounded text exactly at $w columns, spuriously taking wrap_line's fast
+# path where the full/unbounded text -- too long to ever take that fast
+# path -- would have taken the slow path and broken the line differently.
+# Overshooting by one more retained character (when one exists) keeps the
+# bounded text's own spans_width > $w whenever $max_rows==1, so wrap_line
+# takes the SAME code path it would for the full text; found via
+# t/88-banner-wrap-every-surface.t's pre-existing AC-4d ($max_banner_rows==1),
+# a foreign package's regression guard this fix must not break.
+sub bound_for_wrap {
+    my ($text, $max_rows, $w) = @_;
+    return '' if !defined $text || $text eq '';
+    $max_rows = (!defined $max_rows || ref($max_rows) || $max_rows !~ /^-?\d+(?:\.\d+)?$/) ? 0 : int($max_rows);
+    $w        = (!defined $w        || ref($w)        || $w        !~ /^-?\d+(?:\.\d+)?$/) ? 0 : int($w);
+    return '' if $max_rows <= 0 || $w <= 0;
+
+    my $limit = $max_rows * $w;
+
+    # Fast path (the case this fix exists for): decode only a generous
+    # RAW-BYTE prefix first -- up to 4 bytes per UTF-8 character (the widest
+    # this encoding uses), doubled for margin. If that prefix alone already
+    # exceeds $limit, the cut point is inside it and the REST of a huge
+    # $text (a multi-million-character single token, the pathological case
+    # from the filed report) is never even substr'd, let alone decoded --
+    # this is what keeps behavior 11 well under 1s. Only an input whose
+    # prefix does NOT strictly exceed $limit (heavy zero-width/combining
+    # runs, or $text simply fits in the prefix, or the boundary lands
+    # exactly on $limit -- see the overshoot note above) falls through to
+    # the slow, exact path below, which is unavoidable there but rare.
+    my $prefix_bytes = $limit * 4 + 64;
+    if (length($text) > $prefix_bytes) {
+        my $decoded_prefix = _strip_sgr(_decode_str(substr($text, 0, $prefix_bytes)));
+        my $acc = 0;
+        my $out = '';
+        for my $c (split //, $decoded_prefix) {
+            last if $acc > $limit;
+            $out .= $c;
+            $acc += tui::Layout::char_cols($c);
+        }
+        return Encode::encode('UTF-8', $out) if $acc > $limit;
+        # else: prefix wasn't enough (or landed exactly on $limit) -- fall
+        # through to the exact/slow path.
+    }
+
+    return $text if tui::Layout::display_width($text) <= $limit;
+
+    my $decoded = _strip_sgr(_decode_str($text));
+    my $acc     = 0;
+    my $out     = '';
+    for my $c (split //, $decoded) {
+        last if $acc > $limit;
+        $out .= $c;
+        $acc += tui::Layout::char_cols($c);
+    }
+    return Encode::encode('UTF-8', $out);
 }
 
 # clip_pad($str, $w) -> exactly $w display columns. PUBLIC.

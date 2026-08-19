@@ -316,7 +316,16 @@ sub compose {
     for my $msg (@banners) {
         last if @banner_cells >= $max_banner_rows;
         my $budget = $max_banner_rows - @banner_cells;
-        my $wrapped = tui::Frame::wrap_line($msg, $banner_role, $cols, WRAP_CONTINUATION_INDENT());
+        # 59a4: bound the input to a decoded-char, display-width-safe prefix
+        # BEFORE wrap_line sees it -- wrap_line's own cost is O(full message
+        # length), not O(rows that survive), so an unbounded message pays for
+        # wrapping content that would be sliced away below anyway. Uses the
+        # SAME $budget computed above and $cols (not the narrower content_w
+        # wrap_line computes internally), which is generous/safe since no
+        # single wrapped row can ever carry more than $cols display columns
+        # of input (wrap_line's own contract).
+        my $bounded = tui::Frame::bound_for_wrap($msg, $budget, $cols);
+        my $wrapped = tui::Frame::wrap_line($bounded, $banner_role, $cols, WRAP_CONTINUATION_INDENT());
         $wrapped = [ @$wrapped[ 0 .. $budget - 1 ] ] if @$wrapped > $budget;
         push @banner_cells, @$wrapped;
     }
