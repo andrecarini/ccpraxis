@@ -59,9 +59,23 @@ MATCH_TEXT="$CMD"
 case "$BP_GUARD_MAX_STRIP_BYTES" in
   ''|*[!0-9]*) BP_GUARD_MAX_STRIP_BYTES=8000 ;;
 esac
+# CARRIER RE-CHECK -- same rule as guard-bash.sh and guard-git-mutations.sh.
+# bp_strip_shell_noise blanks quoted spans, so a check hidden in a shellword
+# (`sh -c '<check>'`) or a command substitution would vanish before the matcher
+# below sees it, even though it genuinely runs. When a carrier is present in the
+# RAW command, match the raw text instead of the stripped text.
+#
+# Lower stakes here than in guard-bash.sh -- missing a detection costs false
+# confidence that a check was re-run, not destroyed work -- but the rule is the
+# same, and applying it in only some of the hooks that strip is exactly how this
+# hole was introduced in the first place.
 if [ "${#CMD}" -le "$BP_GUARD_MAX_STRIP_BYTES" ] && command -v bp_strip_shell_noise >/dev/null 2>&1; then
   STRIPPED=$(printf '%s' "$CMD" | bp_strip_shell_noise)
-  [ -n "$STRIPPED" ] && MATCH_TEXT="$STRIPPED"
+  if [ -n "$STRIPPED" ] \
+     && ! grep -Eq '(^|[;&|[:space:]])(ba|z|k|da)?sh[[:space:]]+(-[a-zA-Z]*[[:space:]]+)*-c\b' <<<"$CMD" \
+     && ! grep -Eq '`|\$\(' <<<"$CMD"; then
+    MATCH_TEXT="$STRIPPED"
+  fi
 fi
 
 # Deliberately narrow: the exact re-run shape named in the incident evidence

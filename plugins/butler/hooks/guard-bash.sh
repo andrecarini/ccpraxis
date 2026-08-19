@@ -39,9 +39,35 @@ MATCH_TEXT="$CMD"
 case "$BP_GUARD_MAX_STRIP_BYTES" in
   ''|*[!0-9]*) BP_GUARD_MAX_STRIP_BYTES=8000 ;;
 esac
+#
+# CARRIER RE-CHECK -- do NOT trust a strip when the raw command hides an
+# invocation inside a shellword or a command substitution.
+#
+# bp_strip_shell_noise blanks quoted spans, so `bash -c "<mutation>"` strips to
+# `bash -c` and a genuinely executable mutation disappears before any matcher
+# below sees it. Measured, not theorised:
+#
+#   raw  bash -c "<mutation>"   ->  stripped  bash -c
+#   raw  sh -c '<mutation>'     ->  stripped  sh -c
+#
+# guard-git-mutations.sh already re-checks for exactly this before trusting its
+# own strip. That protection was applied there and NOT here when stripping was
+# introduced -- the insight was applied to one hook instead of to the class,
+# which is this repo's most frequently repeated mistake. This hook needs it
+# most: it uniquely covers rebase/merge/commit/push, rm -rf, and deploy and
+# publish actions, with no other guard behind it.
+#
+# When a carrier is present, match the RAW text. That reinstates the false
+# positive the stripping was meant to remove, for those commands only, which is
+# the correct trade for a hook whose job is to BLOCK: a false positive costs a
+# reworded command, a false negative costs the work the guard exists to protect.
 if [ "${#CMD}" -le "$BP_GUARD_MAX_STRIP_BYTES" ] && command -v bp_strip_shell_noise >/dev/null 2>&1; then
   STRIPPED=$(printf '%s' "$CMD" | bp_strip_shell_noise)
-  [ -n "$STRIPPED" ] && MATCH_TEXT="$STRIPPED"
+  if [ -n "$STRIPPED" ] \
+     && ! grep -Eq '(^|[;&|[:space:]])(ba|z|k|da)?sh[[:space:]]+(-[a-zA-Z]*[[:space:]]+)*-c\b' <<<"$CMD" \
+     && ! grep -Eq '`|\$\(' <<<"$CMD"; then
+    MATCH_TEXT="$STRIPPED"
+  fi
 fi
 
 deny() { echo "BLOCKED: $1 Command: $CMD" >&2; exit 2; }

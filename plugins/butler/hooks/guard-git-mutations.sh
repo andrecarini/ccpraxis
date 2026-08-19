@@ -153,6 +153,45 @@ git_scan_target() {
   # parsing here (ledger criterion 2: one stripping implementation).
   case "$cmd" in
     *'<<'*)
+      # TRUST THE STRIP ONLY WHERE THE STRIPPER'S HEREDOC PARSE CAN KEEP UP.
+      #
+      # Added after this package's own red-team found, and the driver confirmed
+      # by running the PRE- and POST-change hooks side by side, that two
+      # ordinary shapes desync bp_strip_shell_noise's terminator matching. In
+      # both, it runs past the terminator, blanks the REST of the command --
+      # including a real trailing mutation -- and returns something that looks
+      # clean, so this branch allowed a command that the pre-change hook denied:
+      #
+      #   cat > f <<'EOF!' ... EOF!   <newline>   <a real mutation>
+      #   the same command with CRLF line endings
+      #
+      # That is a false NEGATIVE in a guard that exists because a prohibited
+      # history-discarding command once destroyed a completed fix-batch here.
+      # Escalating instead costs a false POSITIVE, which is this hook's
+      # acceptable failure and merely restores the behaviour that shipped
+      # before the heredoc branch existed.
+      #
+      # Deliberately NOT fixed by teaching bp_strip_shell_noise more bash: it
+      # is shared with other callers, and widening a parser to close a guard
+      # hole is how the next hole gets opened. Detect what it cannot model and
+      # decline to trust it there.
+      #
+      # `<<-` also escalates. The predicate below cannot distinguish the `-` of
+      # a tab-stripping heredoc from punctuation in a delimiter, and the
+      # red-team flagged `<<-` as an untested shape in its own right -- so it
+      # takes the safe path rather than the clever one.
+      case "$cmd" in
+        *$'\r'*)
+          RAW_KIND=escape
+          SCAN_OUT="$cmd"
+          return 0
+          ;;
+      esac
+      if printf '%s' "$cmd" | grep -Eq "<<-?[[:space:]]*['\"]?[A-Za-z0-9_]*[^A-Za-z0-9_'\"[:space:]]"; then
+        RAW_KIND=escape
+        SCAN_OUT="$cmd"
+        return 0
+      fi
       HD_STRIPPED=""
       if command -v bp_strip_shell_noise >/dev/null 2>&1; then
         HD_STRIPPED=$(printf '%s' "$cmd" | bp_strip_shell_noise)
