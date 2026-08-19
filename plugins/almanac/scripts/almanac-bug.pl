@@ -42,6 +42,12 @@ use File::Basename qw(dirname);
 use Cwd ();
 
 our @STATES = qw(open reviewing taken resolved declined);
+
+# Closed vocabulary for `severity`. `unknown` is IN it — it is the script's own
+# default (see `file`'s `$o{severity} // 'unknown'`), and an enum that rejected
+# its own default would make `file` fail whenever `--severity` is omitted.
+our @SEVERITIES = qw(low medium high blocker unknown);
+sub valid_severity { my ($s) = @_; return scalar grep { $_ eq $s } @SEVERITIES }
 our %NEXT = (
     open      => [qw(reviewing declined)],
     reviewing => [qw(taken open declined)],   # back to open = "not ready, keep editing"
@@ -112,14 +118,20 @@ sub _parse {
     my ($text) = @_;
     return undef unless defined $text && $text =~ /\A---\r?\n(.*?)\r?\n---\r?\n(.*)\z/s;
     my ($fm, $body) = ($1, $2);
-    my %f;
+    my (%f, %seen, $dup);
     for my $line (split /\r?\n/, $fm) {
         next unless $line =~ /^([A-Za-z0-9_]+):\s*(.*)$/;
         my ($k, $v) = ($1, $2);
         $v =~ s/\s+$//;
+        # Last-wins is UNCHANGED — every existing reader of $f->{$k} keeps its
+        # current meaning. `duplicate_key` is only an additional signal that a
+        # key repeated at all, surfaced (not silently swallowed) by the CLI.
+        $dup //= $k if $seen{$k}++;
         $f{$k} = $v;
     }
-    return { fields => \%f, body => $body };
+    my %out = (fields => \%f, body => $body);
+    $out{duplicate_key} = $dup if defined $dup;
+    return \%out;
 }
 sub _render {
     my ($f, $body) = @_;
@@ -127,8 +139,22 @@ sub _render {
                    frozen_at content_sha256 taken_at resolution);
     my %seen;
     my @lines;
-    for my $k (@order) { next unless defined $f->{$k}; push @lines, "$k: $f->{$k}"; $seen{$k}=1 }
-    for my $k (sort keys %$f) { next if $seen{$k}; next unless defined $f->{$k}; push @lines, "$k: $f->{$k}" }
+    # Structural backstop: no field value may carry \r or \n, regardless of
+    # whether the caller validated it. This is what closes the class for good —
+    # the CLI-boundary checks (§2.2 of the spec) exist only to turn what would
+    # otherwise be this die into a specific, actionable per-flag error.
+    for my $k (@order) {
+        next unless defined $f->{$k};
+        die "almanac-bug: internal error — frontmatter field '$k' would contain a newline\n"
+            if $f->{$k} =~ /[\r\n]/;
+        push @lines, "$k: $f->{$k}"; $seen{$k}=1;
+    }
+    for my $k (sort keys %$f) {
+        next if $seen{$k}; next unless defined $f->{$k};
+        die "almanac-bug: internal error — frontmatter field '$k' would contain a newline\n"
+            if $f->{$k} =~ /[\r\n]/;
+        push @lines, "$k: $f->{$k}";
+    }
     return "---\n" . join("\n", @lines) . "\n---\n" . $body;
 }
 sub _read_file { my ($p)=@_; open my $fh,'<:raw',$p or return undef; local $/; my $c=<$fh>; close $fh; return $c }
@@ -154,6 +180,17 @@ sub load {
 
 # The frozen digest covers the BODY only. Status/updated_at legitimately change
 # after freezing; the reported content must not.
+#
+# This function (and the `verify` it backs) proves body-digest integrity ONLY.
+# It does not detect frontmatter corruption or forged fields — a duplicate
+# frontmatter key is caught separately and structurally by `_parse`, and
+# reported by the `list`, `collect`, and `verify` CLI surfaces, not by this
+# digest. Folding frontmatter into the digest would make `verify` scream
+# TAMPERED on every legitimate `set-status` transition, since `status`,
+# `updated_at`, `resolution` and `taken_at` are designed to change after
+# freezing. The injection defense for those fields is the write/read guard
+# (CLI-boundary validation + `_parse`'s duplicate-key detection), not this
+# digest — that split is deliberate and permanent, not a gap to close later.
 sub body_digest { return sha256_hex($_[0] // '') }
 
 sub verify {
@@ -214,6 +251,15 @@ use strict;
 use warnings;
 use JSON::PP;
 
+# The one invariant, enforced at every CLI argument that reaches frontmatter:
+# no value may contain \r or \n. Reject, don't escape/quote -- _parse has no
+# quote handling and none is added (see spec §2.1).
+sub _reject_multiline {
+    my ($cmd, $flag, $val) = @_;
+    die "almanac-bug $cmd: --$flag must be one line\n"
+        if defined $val && !ref $val && $val =~ /[\r\n]/;
+}
+
 sub _slurp_arg {
     my (%o) = @_;
     return $o{body} eq '-' ? do { local $/; <STDIN> } : $o{body} if defined $o{body};
@@ -235,10 +281,14 @@ unless (caller) {
     my @pos  = @{ $o{_pos} // [] };
     my $root = $o{project} // $ENV{CLAUDE_PROJECT_DIR} // Cwd::abs_path('.') // '.';
     $root =~ s{\\}{/}g; $root =~ s{/+$}{};
+    # The sixth vector: $root becomes `project:` in frontmatter, and it is
+    # checked once here, uniformly, for every command -- not per-command.
+    _reject_multiline($cmd || 'almanac-bug', 'project', $root);
 
     if ($cmd eq 'file') {
         my $title = $o{title} or die "almanac-bug file: --title is required\n";
-        die "almanac-bug file: --title must be one line\n" if $title =~ /[\r\n]/;
+        _reject_multiline('file', 'title', $title);
+        _reject_multiline('file', 'area', $o{area}) if defined $o{area} && !ref $o{area};
         my $body = _slurp_arg(%o);
         die "almanac-bug file: --body or --body-file is required (a report with no body is noise)\n"
             unless defined $body && $body =~ /\S/;
@@ -246,9 +296,16 @@ unless (caller) {
         my $id  = AlmanacBug::new_id($now);
         my $dir = AlmanacBug::reports_dir($root);
         my $path = "$dir/$id.md";
+        my $severity = $o{severity} // 'unknown';
+        # Order matters (spec §2.3): the one-line check fires before the enum
+        # check, so a multi-line payload dies "must be one line", not "must be
+        # one of" -- the ee3c fixture's payload is multi-line.
+        _reject_multiline('file', 'severity', $severity) unless ref $severity;
+        die "almanac-bug file: --severity must be one of: " . join(', ', @AlmanacBug::SEVERITIES) . "\n"
+            unless !ref $severity && AlmanacBug::valid_severity($severity);
         my %f = (
             id => $id, title => $title, status => 'open',
-            severity => ($o{severity} // 'unknown'),
+            severity => $severity,
             area     => ($o{area} // 'unknown'),
             project  => $root,
             created_at => AlmanacBug::_iso($now), updated_at => AlmanacBug::_iso($now),
@@ -277,6 +334,9 @@ unless (caller) {
         my $id = $pos[0] or die "almanac-bug update: <id> required\n";
         my $path = $find->($id) or die "almanac-bug update: no report '$id'\n";
         my $rep  = AlmanacBug::load($path) or die "almanac-bug update: $path is unreadable or malformed\n";
+        die "almanac-bug update: '$id' has MALFORMED: duplicate frontmatter key "
+          . "'$rep->{duplicate_key}' — refusing to operate on a possibly-forged report\n"
+            if $rep->{duplicate_key};
         my $st   = $rep->{fields}{status} // 'open';
         unless ($AlmanacBug::MUTABLE{$st}) {
             print STDERR "almanac-bug update: refused — '$id' is $st, and content is frozen from "
@@ -286,6 +346,12 @@ unless (caller) {
         }
         my $body = _slurp_arg(%o);
         die "almanac-bug update: --body or --body-file is required\n" unless defined $body && $body =~ /\S/;
+        _reject_multiline('update', 'title', $o{title}) if defined $o{title} && !ref $o{title};
+        _reject_multiline('update', 'severity', $o{severity}) if defined $o{severity} && !ref $o{severity};
+        if (defined $o{severity} && !ref $o{severity}) {
+            die "almanac-bug update: --severity must be one of: " . join(', ', @AlmanacBug::SEVERITIES) . "\n"
+                unless AlmanacBug::valid_severity($o{severity});
+        }
         my %f = %{ $rep->{fields} };
         $f{title} = $o{title} if defined $o{title} && !ref $o{title};
         $f{severity} = $o{severity} if defined $o{severity} && !ref $o{severity};
@@ -302,6 +368,10 @@ unless (caller) {
         my $to = $o{to} or die "almanac-bug set-status: --to <state> required\n";
         my $path = $find->($id) or die "almanac-bug set-status: no report '$id'\n";
         my $rep  = AlmanacBug::load($path) or die "almanac-bug set-status: $path unreadable\n";
+        die "almanac-bug set-status: '$id' has MALFORMED: duplicate frontmatter key "
+          . "'$rep->{duplicate_key}' — refusing to operate on a possibly-forged report\n"
+            if $rep->{duplicate_key};
+        _reject_multiline('set-status', 'note', $o{note}) if defined $o{note} && !ref $o{note};
         my $from = $rep->{fields}{status} // 'open';
         my ($ok, $why) = AlmanacBug::can_transition($from, $to);
         unless ($ok) { print STDERR "almanac-bug set-status: $why\n"; exit 2 }
@@ -340,11 +410,20 @@ unless (caller) {
             my $rep = AlmanacBug::load($p) or next;
             my $f = $rep->{fields};
             next if defined $o{status} && !ref $o{status} && ($f->{status}//'') ne $o{status};
-            my ($intact, $note) = AlmanacBug::verify($rep);
+            my $integrity;
+            if ($rep->{duplicate_key}) {
+                # A duplicate key makes the frontmatter untrustworthy -- surface
+                # it, don't vanish the row, and skip the (irrelevant once this
+                # is set) digest check.
+                $integrity = "MALFORMED: duplicate frontmatter key '$rep->{duplicate_key}'";
+            } else {
+                my ($intact, $note) = AlmanacBug::verify($rep);
+                $integrity = $note unless $intact;
+            }
             push @out, { id=>$f->{id}, title=>$f->{title}, status=>$f->{status},
                          severity=>$f->{severity}, area=>$f->{area}, project=>$f->{project},
                          created_at=>$f->{created_at}, path=>$p,
-                         ($intact ? () : (integrity=>$note)) };
+                         (defined $integrity ? (integrity=>$integrity) : ()) };
         }
         if ($o{json}) { print JSON::PP->new->canonical->pretty->encode(\@out) }
         else {
@@ -372,6 +451,11 @@ unless (caller) {
             # the real signal, so it is counted separately and quietly.
             unless ($rep && defined $rep->{fields}{id}) { push @skipped, $p; next }
             $n++;
+            if ($rep->{duplicate_key}) {
+                push @bad, ($rep->{fields}{id} // $p)
+                    . ": MALFORMED: duplicate frontmatter key '$rep->{duplicate_key}'";
+                next;
+            }
             my ($ok, $note) = AlmanacBug::verify($rep);
             push @bad, ($rep->{fields}{id} . ": $note") unless $ok;
         }
