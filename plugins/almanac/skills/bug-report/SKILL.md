@@ -27,7 +27,9 @@ REPORT
 ```
 
 `--area` is free text; use the plugin name (`butler`, `sandbox`, `blueprint`, `backpack`,
-`steward`, `beacon`, `almanac`). `--severity`: `low` | `medium` | `high` | `blocker`.
+`steward`, `beacon`, `almanac`). `--severity`: `low` | `medium` | `high` | `blocker`, or
+`unknown` — which is what the script records when `--severity` is omitted. The list is now
+enforced as a closed enum, so a value outside it is rejected rather than written.
 
 **Never create or edit the file directly.** A PreToolUse hook denies Edit/Write on that directory.
 The script is the only writer, because a report freezes once ccpraxis picks it up and a direct edit
