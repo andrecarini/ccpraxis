@@ -190,9 +190,31 @@ for my $p (@pairs) {
             closedir $dh;
         }
     }
-    ok(scalar(@blueprint_files) > 0,
-       'SECTION 3 sanity: the live .ccpraxis-local-data/blueprints/ scan (excluding _archive/) found at '
-     . 'least one file (' . scalar(@blueprint_files) . ') -- this is the assertion that catches the '
+    # Is there anything here to find? Answered INDEPENDENTLY of the walk above,
+    # because the walk is the thing under suspicion. A tree with no live
+    # blueprints is legitimate -- the LIVE INSTALL at ~/.claude/ccpraxis carries
+    # an empty blueprints/ directory, since blueprints are authored in a clone
+    # and never promoted. Requiring a non-zero count there turned this oracle red
+    # in the tree that actually executes, which is the opposite of the point.
+    #
+    # So the guard is conditional: if a non-_archive blueprint directory EXISTS,
+    # the walk must find at least one file in it. If none exists, zero is the
+    # correct answer and proves nothing is broken. What must never happen is the
+    # walk returning zero while blueprints are sitting right there -- that is the
+    # illusory-coverage defect (git ls-files silently returning zero for a
+    # gitignored root) this section was written to catch.
+    my $have_live_blueprints = 0;
+    if (opendir(my $bh, "$ROOT/.ccpraxis-local-data/blueprints")) {
+        for my $e (readdir $bh) {
+            next if $e eq '.' || $e eq '..' || $e eq '_archive';
+            $have_live_blueprints = 1, last if -d "$ROOT/.ccpraxis-local-data/blueprints/$e";
+        }
+        closedir $bh;
+    }
+    ok(!$have_live_blueprints || scalar(@blueprint_files) > 0,
+       'SECTION 3 sanity: if live (non-_archive) blueprints exist, the scan found at least one file ('
+     . scalar(@blueprint_files) . ' found, live blueprints present: ' . ($have_live_blueprints ? 'yes' : 'no')
+     . ') -- this is the assertion that catches the '
      . 'illusory-coverage class of defect: a broken/empty walk here must not pass the rest of this '
      . 'section vacuously, the same way git ls-files silently returning zero for a gitignored root did')
         or diag('live blueprint scan found zero files; check .ccpraxis-local-data/blueprints/ resolution');
