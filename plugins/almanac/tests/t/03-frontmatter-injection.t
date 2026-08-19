@@ -383,6 +383,134 @@ EOF
 # =============================================================================
 
 # =============================================================================
+# AC17 -- FIX 2 (fixbatch-step7, red-team MEDIUM): the invariant closes the
+# whole class, not just \r and \n. --area containing U+2028 LINE SEPARATOR
+# (the red-team's own reproduction) is rejected, and so are the other
+# separators/controls the fix names: U+2029 PARAGRAPH SEPARATOR, U+0085 NEL,
+# VT, FF, and NUL. \x{...} escapes, not literal bytes, per the driver's
+# instruction (Windows source-file encoding landmines).
+# =============================================================================
+{
+    my $SCRATCH = tempdir(CLEANUP => 1);
+    my ($rc, $out) = run('file', '--project', $SCRATCH, '--title', '"probe"', '--body', '"b"',
+                          '--area', qq{"evil\x{2028}injected: yes"});
+    isnt($rc, 0, 'AC17a: --area containing U+2028 LINE SEPARATOR is REJECTED (the red-team repro)');
+    like($out, qr/must be one line/, 'AC17a: stderr still names the one-line rule (locked fragment)');
+    ok(count_reports_in("$SCRATCH/.ccpraxis-local-data/bug-reports") == 0,
+       'AC17a: zero files were created');
+}
+# \x00 NUL is deliberately NOT exercised here: this test drives the CLI
+# through a real shell (backticks), and a NUL byte inside an argv element is
+# not something a Windows/POSIX command line can carry at all -- the shell
+# itself truncates/errors on it before almanac-bug.pl ever sees a value.
+# has_forbidden_bytes()'s \x00 coverage is exercised directly below (AC17d)
+# by calling the guard function in-process instead of through a subshell.
+for my $case (
+    ['U+2029 PARAGRAPH SEPARATOR', "evil\x{2029}injected"],
+    ['U+0085 NEL',                 "evil\x{0085}injected"],
+    ["\\x0B VT",                   "evil\x0Binjected"],
+    ["\\x0C FF",                   "evil\x0Cinjected"],
+) {
+    my ($label, $payload) = @$case;
+    my $SCRATCH = tempdir(CLEANUP => 1);
+    my ($rc, $out) = run('file', '--project', $SCRATCH, '--title', '"probe"', '--body', '"b"',
+                          '--area', qq{"$payload"});
+    isnt($rc, 0, "AC17b [$label]: rejected by the widened invariant");
+    ok(count_reports_in("$SCRATCH/.ccpraxis-local-data/bug-reports") == 0,
+       "AC17b [$label]: zero files were created");
+}
+{
+    # AC17d -- \x00 NUL, exercised in-process against the guard itself
+    # (`do`, not system()) since a subshell cannot carry a NUL byte in argv
+    # at all (see comment above). `do`-ing almanac-bug.pl defines
+    # AlmanacBug::* in this process without running its CLI dispatch --
+    # `unless (caller)` in the script is false here because `do FILE` sets
+    # caller() for code inside FILE, which is exactly what makes this safe.
+    do $A;
+    die "could not load almanac-bug.pl for AC17d: $@" if $@;
+    ok(!AlmanacBug::has_forbidden_bytes("safe value"), 'AC17d: a clean value is not flagged');
+    ok(AlmanacBug::has_forbidden_bytes("evil\x00injected"), 'AC17d: NUL is flagged by has_forbidden_bytes directly');
+
+    # AC17e -- the two layers must enforce the SAME rule, which means the rule
+    # has to hold for a DECODED string too, not only for the un-decoded bytes
+    # argv delivers. _render is callable directly and that is precisely the
+    # caller the structural backstop exists for. Driver-found regression: the
+    # byte-form check (\xE2\x80[\xA8\xA9]) cannot see a decoded U+2028, so
+    # _render accepted "a\x{2028}b" while the CLI rejected the same separator.
+    ok(AlmanacBug::has_forbidden_bytes("evil\x{2028}injected"),
+        'AC17e: DECODED U+2028 is flagged, not just its UTF-8 byte form');
+    ok(AlmanacBug::has_forbidden_bytes("evil\x{2029}injected"),
+        'AC17e: DECODED U+2029 is flagged, not just its UTF-8 byte form');
+    my $rendered = eval {
+        AlmanacBug::_render({ id => 'x', title => 't', status => 'open',
+                              area => "a\x{2028}b" }, 'body') };
+    ok(!defined($rendered),
+        'AC17e: the _render structural backstop REFUSES a decoded U+2028 with the CLI bypassed entirely');
+    ok(defined(eval { AlmanacBug::_render({ id => 'x', title => 't', status => 'open',
+                                            area => 'butler, sandbox (TUI)' }, 'body') }),
+        'AC17e: _render still accepts a legitimate multi-word value (the widened rule does not over-reject)');
+}
+{
+    # TAB is deliberately still allowed -- it does not break _parse's
+    # /\r?\n/ line splitting and is common in pasted text.
+    my $SCRATCH = tempdir(CLEANUP => 1);
+    my ($rc, $o) = run('file', '--project', $SCRATCH, '--title', '"probe"', '--body', '"b"',
+                        '--area', qq{"before\tafter"});
+    is($rc, 0, 'AC17c: TAB inside --area is still accepted (not part of the widened rule)');
+}
+
+# =============================================================================
+# AC18 -- FIX 3 (fixbatch-step7, red-team LOW): a value with leading or
+# trailing whitespace does not round-trip (_parse strips trailing
+# whitespace on read), so the CLI boundary rejects it outright rather than
+# silently accepting a value that will read back different from what was
+# written.
+# =============================================================================
+{
+    my $SCRATCH = tempdir(CLEANUP => 1);
+    my ($rc, $out) = run('file', '--project', $SCRATCH, '--title', '"probe"', '--body', '"b"',
+                          '--area', '"  leading spaces"');
+    isnt($rc, 0, 'AC18a: --area with LEADING whitespace is REJECTED');
+    like($out, qr/leading or trailing whitespace/, 'AC18a: stderr names the round-trip rule');
+    ok(count_reports_in("$SCRATCH/.ccpraxis-local-data/bug-reports") == 0,
+       'AC18a: zero files were created');
+}
+{
+    my $SCRATCH = tempdir(CLEANUP => 1);
+    my ($rc, $out) = run('file', '--project', $SCRATCH, '--title', '"probe"', '--body', '"b"',
+                          '--area', '"trailing spaces  "');
+    isnt($rc, 0, 'AC18b: --area with TRAILING whitespace is REJECTED');
+    like($out, qr/leading or trailing whitespace/, 'AC18b: stderr names the round-trip rule');
+}
+{
+    # update --title with trailing whitespace is refused too (same rule,
+    # different call site).
+    my $SCRATCH = tempdir(CLEANUP => 1);
+    my (undef, $o) = run('file', '--project', $SCRATCH, '--title', '"origtitle"', '--body', '"b"');
+    chomp(my $path = $o);
+    my ($id) = $path =~ m{/([^/]+)\.md$};
+    my $before = slurp($path);
+
+    my ($rc, $out) = run('update', $id, '--project', $SCRATCH, '--body', '"x"',
+                          '--title', '"trailing  "');
+    isnt($rc, 0, 'AC18c: update --title with trailing whitespace is REJECTED');
+    like($out, qr/leading or trailing whitespace/, 'AC18c: stderr names the round-trip rule');
+    is(slurp($path), $before, 'AC18c: report file bytes are UNCHANGED after the refusal');
+}
+{
+    # A legitimate value with internal (not leading/trailing) whitespace is
+    # unaffected -- this is the same fixture as AC8, re-asserted here to make
+    # the boundary of the new rule explicit.
+    my $SCRATCH = tempdir(CLEANUP => 1);
+    my ($rc, $o) = run('file', '--project', $SCRATCH, '--title', '"probe"', '--body', '"b"',
+                        '--area', '"internal spaces are fine"');
+    is($rc, 0, 'AC18d: internal whitespace (not leading/trailing) is still accepted');
+    chomp(my $path = $o);
+    is(raw_field($path, 'area'), 'internal spaces are fine',
+       'AC18d: round-trips verbatim');
+}
+
+# =============================================================================
 # AC16 -- after this entire suite (which only ever touched scratch tempdirs),
 #         the live store still holds exactly the files it had before
 # =============================================================================

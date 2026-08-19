@@ -145,14 +145,16 @@ sub _render {
     # otherwise be this die into a specific, actionable per-flag error.
     for my $k (@order) {
         next unless defined $f->{$k};
-        die "almanac-bug: internal error — frontmatter field '$k' would contain a newline\n"
-            if $f->{$k} =~ /[\r\n]/;
+        die "almanac-bug: internal error — frontmatter field '$k' would contain a line "
+          . "break or control character\n"
+            if has_forbidden_bytes($f->{$k});
         push @lines, "$k: $f->{$k}"; $seen{$k}=1;
     }
     for my $k (sort keys %$f) {
         next if $seen{$k}; next unless defined $f->{$k};
-        die "almanac-bug: internal error — frontmatter field '$k' would contain a newline\n"
-            if $f->{$k} =~ /[\r\n]/;
+        die "almanac-bug: internal error — frontmatter field '$k' would contain a line "
+          . "break or control character\n"
+            if has_forbidden_bytes($f->{$k});
         push @lines, "$k: $f->{$k}";
     }
     return "---\n" . join("\n", @lines) . "\n---\n" . $body;
@@ -176,6 +178,97 @@ sub load {
     $p->{path} = $path;
     $p->{raw}  = $raw;
     return $p;
+}
+
+# cas_write(): FIX 1 (fixbatch-step7, red-team HIGH) — a load-modify-write
+# race defeated the freeze guarantee. Both `update` and `set-status` LOAD a
+# report, then do work that can take real wall-clock time (`update`'s
+# `--body -` BLOCKS on stdin), then WRITE `%f` built from that stale load.
+# If a `set-status --to reviewing` landed in that window, `update`'s
+# subsequent write reverted the status to `open` and erased
+# content_sha256/frozen_at entirely — silently undoing the freeze the
+# refusal message two lines above it promises. `verify` would then say "not
+# frozen" rather than TAMPERED, so nothing would even report the problem.
+#
+# There is no portable, trustworthy OS-level lock to reach for here. This
+# repo runs on Git-for-Windows, where flock() semantics on Windows perl
+# builds are not something else in this codebase relies on (see this
+# script's own header on Windows landmines, and CLAUDE.md), and mtime
+# granularity is too coarse to reliably distinguish two writes inside the
+# same second. So this re-reads the file's actual on-disk BYTES immediately
+# before the write and compares them to the bytes `load()` captured — a
+# compare-and-swap over the load-modify-write window. It cannot close the
+# window entirely (there is a residual gap between this read and the
+# following rename, same as any userspace CAS without a kernel-level lock),
+# but it narrows "anywhere between load and write" down to "between this
+# read and the next few instructions", and it turns the race from silent
+# data loss into a loud, specific refusal instead of ever writing.
+sub cas_write {
+    my ($rep, $bytes) = @_;
+    my $current = _read_file($rep->{path});
+    return (0, 'the report no longer exists on disk') unless defined $current;
+    return (0, 'the report changed on disk since it was loaded (a concurrent '
+             . 'set-status or update landed in between)') unless $current eq $rep->{raw};
+    return (0, 'write failed') unless _write_atomic($rep->{path}, $bytes);
+    return (1, '');
+}
+
+# has_forbidden_bytes(): the ONE definition of "not safe in a frontmatter
+# value", shared by the CLI-boundary guard (_reject_multiline, in package
+# main) and the _render structural backstop below, so the two layers enforce
+# literally the same rule instead of two independently-maintained
+# approximations of it.
+#
+# Originally this was "\r or \n" -- exactly the two bytes report ee3c's
+# reproduction used. A red-team probe (fixbatch-step7, 2026-08-19) showed
+# --area containing U+2028 LINE SEPARATOR sailed through unrejected and
+# landed verbatim in the rendered frontmatter; any consumer that treats
+# U+2028 as a line break (this script's own _parse does not; some other
+# reader might) sees an injected field. The class was never "CR/LF", it was
+# "any line or paragraph break, and any control character" -- so that is
+# what is enforced now:
+#   - every C0 control character except TAB (\x00-\x08, \x0A-\x1F)
+#   - DEL (\x7F)
+#   - every C1 control character (\x80-\x9F), which includes NEL (U+0085)
+#   - the two Unicode line/paragraph separators, U+2028 and U+2029
+# TAB is deliberately still allowed: it does not break line-oriented parsing
+# (_parse splits on /\r?\n/ only) and is common in pasted text.
+#
+# Verified on this platform (Git-for-Windows/Windows perl): argv arrives as
+# raw, UN-decoded bytes, and codepoints <= 0xFF and > 0xFF do not even take
+# the SAME encoding form consistently -- U+2028 (a Perl \x{...} escape whose
+# value is > 0xFF) showed up as the three-byte UTF-8 sequence \xE2\x80\xA8,
+# but U+0085 NEL (a \x{...} escape whose value is <= 0xFF, so Perl does not
+# force the string to internal UTF-8) showed up as the single raw byte
+# \x85, NOT its two-byte UTF-8 encoding \xC2\x85. Both forms had to be
+# handled empirically, not assumed. Rather than chase every encoding a
+# caller might produce, the C1 range (\x80-\x9F) is matched as STANDALONE
+# bytes, which subsumes both "\x85 alone" and "\xC2\x85" (its second byte
+# already falls in \x80-\x9F). The accepted cost: a value containing
+# genuine multi-byte UTF-8 text whose CONTINUATION byte happens to land in
+# \x80-\x9F (e.g. some accented Latin Extended-A characters) would also be
+# rejected. That is judged safe/acceptable here -- report `area`/`title`/
+# `note` values are short, ASCII-oriented labels in practice, and a false
+# rejection fails LOUD (the CLI refuses with a message) rather than
+# silently corrupting anything, which is the failure mode this whole fix
+# exists to close.
+sub has_forbidden_bytes {
+    my ($val) = @_;
+    return 0 unless defined $val;
+    return 1 if $val =~ /[\x00-\x08\x0A-\x1F\x7F-\x9F]/;   # C0 (less TAB) + DEL + C1
+    return 1 if $val =~ /\xE2\x80[\xA8\xA9]/;               # UTF-8 U+2028 / U+2029
+    # ...and the SAME two separators as DECODED characters. The byte form
+    # above covers argv, which arrives un-decoded -- but _render is also
+    # callable directly, and the whole point of the backstop is to hold for a
+    # caller that bypassed the CLI. Such a caller may well hand us a decoded
+    # string, where U+2028 is one character, not three bytes, and the byte
+    # regex above cannot see it. Driver-verified before this line existed:
+    # _render({area => "a\x{2028}b"}) was ACCEPTED while the CLI rejected the
+    # same separator, so the two layers did NOT enforce the same rule despite
+    # sharing this function. A byte string can never contain codepoint 2028,
+    # so this costs the argv path nothing.
+    return 1 if $val =~ /[\x{2028}\x{2029}]/;               # decoded U+2028 / U+2029
+    return 0;
 }
 
 # The frozen digest covers the BODY only. Status/updated_at legitimately change
@@ -252,12 +345,50 @@ use warnings;
 use JSON::PP;
 
 # The one invariant, enforced at every CLI argument that reaches frontmatter:
-# no value may contain \r or \n. Reject, don't escape/quote -- _parse has no
-# quote handling and none is added (see spec §2.1).
+# no value may contain a line/paragraph break or control character (see
+# AlmanacBug::has_forbidden_bytes for the exact class and why it is wider
+# than "\r or \n"). Reject, don't escape/quote -- _parse has no quote
+# handling and none is added (see spec §2.1).
+#
+# The message keeps the substring "must be one line" on purpose: it is the
+# locked fragment every AC in 03-frontmatter-injection.t matches against,
+# and it is still true (a rejected value would not stay one line if any of
+# these bytes were let through) -- just no longer the WHOLE rule, which the
+# rest of the sentence now says.
 sub _reject_multiline {
     my ($cmd, $flag, $val) = @_;
-    die "almanac-bug $cmd: --$flag must be one line\n"
-        if defined $val && !ref $val && $val =~ /[\r\n]/;
+    die "almanac-bug $cmd: --$flag must be one line, with no control characters "
+      . "or Unicode line/paragraph separators\n"
+        if defined $val && !ref $val && AlmanacBug::has_forbidden_bytes($val);
+}
+
+# FIX 3 (fixbatch-step7, red-team LOW): a value with leading/trailing
+# whitespace was written verbatim but _parse strips trailing whitespace on
+# read (and any hand-authored consumer is likely to strip both ends), so
+# write != read-back. Consistent with this package's "reject, don't
+# normalize silently" stance (see spec §2.1): a value that will not survive
+# its own round trip is not a value the store accepts, rather than one it
+# silently mangles later.
+sub _reject_untrimmed {
+    my ($cmd, $flag, $val) = @_;
+    return unless defined $val && !ref $val;
+    die "almanac-bug $cmd: --$flag must not have leading or trailing whitespace "
+      . "(it would not round-trip -- the frontmatter reader strips it)\n"
+        if $val =~ /^\s/ || $val =~ /\s$/;
+}
+
+# TEST SEAM ONLY (fixbatch-step7 FIX 1). When set, ALMANAC_RACE_TEST_HOOK
+# names a perl script; it is run (list-form system(), no shell involved, so
+# no Windows quoting to get right) right after a report is loaded and
+# before `update`/`set-status` do anything else with it. That lets a test
+# deterministically land a concurrent write inside the load-modify-write
+# window instead of racing real threads against real wall-clock timing.
+# Nothing in normal operation ever sets this env var; only
+# plugins/almanac/tests/t/04-*.t does, and the hook script it points at
+# never sets it itself (so there is no recursive self-invocation).
+sub _race_test_hook {
+    return unless defined $ENV{ALMANAC_RACE_TEST_HOOK} && length $ENV{ALMANAC_RACE_TEST_HOOK};
+    system($^X, $ENV{ALMANAC_RACE_TEST_HOOK});
 }
 
 sub _slurp_arg {
@@ -284,11 +415,14 @@ unless (caller) {
     # The sixth vector: $root becomes `project:` in frontmatter, and it is
     # checked once here, uniformly, for every command -- not per-command.
     _reject_multiline($cmd || 'almanac-bug', 'project', $root);
+    _reject_untrimmed($cmd || 'almanac-bug', 'project', $root);
 
     if ($cmd eq 'file') {
         my $title = $o{title} or die "almanac-bug file: --title is required\n";
         _reject_multiline('file', 'title', $title);
+        _reject_untrimmed('file', 'title', $title);
         _reject_multiline('file', 'area', $o{area}) if defined $o{area} && !ref $o{area};
+        _reject_untrimmed('file', 'area', $o{area}) if defined $o{area} && !ref $o{area};
         my $body = _slurp_arg(%o);
         die "almanac-bug file: --body or --body-file is required (a report with no body is noise)\n"
             unless defined $body && $body =~ /\S/;
@@ -301,6 +435,7 @@ unless (caller) {
         # check, so a multi-line payload dies "must be one line", not "must be
         # one of" -- the ee3c fixture's payload is multi-line.
         _reject_multiline('file', 'severity', $severity) unless ref $severity;
+        _reject_untrimmed('file', 'severity', $severity) unless ref $severity;
         die "almanac-bug file: --severity must be one of: " . join(', ', @AlmanacBug::SEVERITIES) . "\n"
             unless !ref $severity && AlmanacBug::valid_severity($severity);
         my %f = (
@@ -337,6 +472,7 @@ unless (caller) {
         die "almanac-bug update: '$id' has MALFORMED: duplicate frontmatter key "
           . "'$rep->{duplicate_key}' — refusing to operate on a possibly-forged report\n"
             if $rep->{duplicate_key};
+        _race_test_hook();
         my $st   = $rep->{fields}{status} // 'open';
         unless ($AlmanacBug::MUTABLE{$st}) {
             print STDERR "almanac-bug update: refused — '$id' is $st, and content is frozen from "
@@ -347,7 +483,9 @@ unless (caller) {
         my $body = _slurp_arg(%o);
         die "almanac-bug update: --body or --body-file is required\n" unless defined $body && $body =~ /\S/;
         _reject_multiline('update', 'title', $o{title}) if defined $o{title} && !ref $o{title};
+        _reject_untrimmed('update', 'title', $o{title}) if defined $o{title} && !ref $o{title};
         _reject_multiline('update', 'severity', $o{severity}) if defined $o{severity} && !ref $o{severity};
+        _reject_untrimmed('update', 'severity', $o{severity}) if defined $o{severity} && !ref $o{severity};
         if (defined $o{severity} && !ref $o{severity}) {
             die "almanac-bug update: --severity must be one of: " . join(', ', @AlmanacBug::SEVERITIES) . "\n"
                 unless AlmanacBug::valid_severity($o{severity});
@@ -356,8 +494,12 @@ unless (caller) {
         $f{title} = $o{title} if defined $o{title} && !ref $o{title};
         $f{severity} = $o{severity} if defined $o{severity} && !ref $o{severity};
         $f{updated_at} = AlmanacBug::_iso(time);
-        AlmanacBug::_write_atomic($path, AlmanacBug::_render(\%f, $body))
-            or die "almanac-bug update: could not write $path\n";
+        my ($cas_ok, $cas_why) = AlmanacBug::cas_write($rep, AlmanacBug::_render(\%f, $body));
+        unless ($cas_ok) {
+            print STDERR "almanac-bug update: refused — '$id' $cas_why. "
+                       . "Retry the command; do not assume it partially applied.\n";
+            exit 2;
+        }
 
         print "$path\n";
         exit 0;
@@ -371,7 +513,9 @@ unless (caller) {
         die "almanac-bug set-status: '$id' has MALFORMED: duplicate frontmatter key "
           . "'$rep->{duplicate_key}' — refusing to operate on a possibly-forged report\n"
             if $rep->{duplicate_key};
+        _race_test_hook();
         _reject_multiline('set-status', 'note', $o{note}) if defined $o{note} && !ref $o{note};
+        _reject_untrimmed('set-status', 'note', $o{note}) if defined $o{note} && !ref $o{note};
         my $from = $rep->{fields}{status} // 'open';
         my ($ok, $why) = AlmanacBug::can_transition($from, $to);
         unless ($ok) { print STDERR "almanac-bug set-status: $why\n"; exit 2 }
@@ -388,8 +532,12 @@ unless (caller) {
         }
         $f{taken_at}   = $now       if $to eq 'taken' && !defined $f{taken_at};
         $f{resolution} = $o{note}   if defined $o{note} && !ref $o{note};
-        AlmanacBug::_write_atomic($path, AlmanacBug::_render(\%f, $rep->{body}))
-            or die "almanac-bug set-status: could not write $path\n";
+        my ($cas_ok, $cas_why) = AlmanacBug::cas_write($rep, AlmanacBug::_render(\%f, $rep->{body}));
+        unless ($cas_ok) {
+            print STDERR "almanac-bug set-status: refused — '$id' $cas_why. "
+                       . "Retry the command; do not assume it partially applied.\n";
+            exit 2;
+        }
 
         print "$id: $from -> $to\n";
         exit 0;
