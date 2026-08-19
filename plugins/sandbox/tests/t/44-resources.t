@@ -339,7 +339,20 @@ use_ok('Dashboard') or BAIL_OUT('Dashboard.pm did not load');
         [ 'localtime',            qr/\blocaltime\b/ ],
         [ 'gmtime',               qr/\bgmtime\b/ ],
         [ 'sleep',                qr/\bsleep\b/ ],
-        [ 'fork',                 qr/\bfork\b/ ],
+        # NARROWED 2026-08-19 by package t01-resources-sampler (blueprint
+        # tui-operator-feedback), from qr/\bfork\b/ to a CALL.
+        #
+        # This list enforces PURITY -- Resources.pm does no I/O, reads no clock,
+        # spawns nothing. A bare-word match also forbade the WORD, and so caught
+        # `reason => 'fork: ...'`: a string the module must now produce, because
+        # it is the text the panel shows when the sampler could not be spawned,
+        # fixed verbatim by the t01 spec.
+        #
+        # Forbidding a CALL is the property that was meant. Forbidding a
+        # substring additionally forbade the module from naming the thing it
+        # reports on, which is not purity. Package d01 of the predecessor
+        # initiative spent a fix-batch on this same over-broad shape.
+        [ 'a fork call',          qr/\bfork\s*(?:\(|;)/ ],
         [ 'alarm',                qr/\balarm\b/ ],
         [ '$PODMAN',              qr/\$PODMAN\b/ ],
         [ 'powershell',           qr/powershell/i ],
@@ -2155,7 +2168,19 @@ FAKE_MODULE
         like($body, qr/log_ev\s*\(\s*['"]resources_sampler_start_failed['"]/,
             'AC-7: the !defined $pid branch calls log_ev with resources_sampler_start_failed');
         like($body, qr/reason\s*=>\s*"fork/, 'AC-7: the log_ev reason mentions fork');
-        like($body, qr/return\s+undef/, 'AC-7: the !defined $pid branch returns undef');
+        # AMENDED 2026-08-19 by package t01-resources-sampler. The failure branch
+        # used to `return undef` and nothing else, so the caller learned only
+        # that there was no pid -- the REASON was logged and then discarded, and
+        # the resources panel could say nothing but "sampling - no reading yet"
+        # forever even when no reading was ever coming. That is the operator
+        # report this package closes, so the arity change is the fix, not damage
+        # to route around.
+        #
+        # The assertion's intent is preserved exactly: the failure branch still
+        # yields NO PID. It now additionally carries the reason outward, and
+        # this pins that shape rather than merely tolerating it.
+        like($body, qr/return\s*\(\s*undef\s*,/,
+            'AC-7: the !defined $pid branch returns no pid, and carries the reason out with it');
         for my $fh (qw(STDIN STDOUT STDERR)) {
             like($body, qr/open\s*\(\s*\Q$fh\E\s*,\s*['"][<>]['"]\s*,\s*['"]\/dev\/null['"]/,
                 "AC-7: _resources_sampler_start reopens $fh on /dev/null");

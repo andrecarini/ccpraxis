@@ -5061,7 +5061,9 @@ sub enter_dashboard {
     # _gather_resources returns undef for the whole session -- the panel is
     # simply absent, never a fabricated zero).
     _resources_sampler_reap_orphan($RESOURCES_SAMPLER_PID, time);
-    $RESOURCES_SAMPLER_CHILD = _resources_sampler_start($RESOURCES_SAMPLER_PID, $CONTAINER_NAME);
+    my $resources_sampler_fact;
+    ($RESOURCES_SAMPLER_CHILD, $resources_sampler_fact)
+        = _resources_sampler_start($RESOURCES_SAMPLER_PID, $CONTAINER_NAME);
 
     # red-team MINOR-1: one-shot guard shared by enter_raw/leave_raw so a
     # re-entrant leave_raw (second Ctrl-C during teardown) only pops the
@@ -5266,6 +5268,19 @@ sub enter_dashboard {
             if (Resources::should_sample($last_resources, $now, Resources::read_interval())) {
                 $cached_resources = _gather_resources();
                 $last_resources   = $now;
+                # Only while NO snapshot has ever been written: keep the
+                # sampler fact current so the panel can say WHY there is
+                # nothing to show. Costs one non-blocking waitpid on the tick
+                # that was already happening; once a snapshot exists the
+                # fresh/stale/failed vocabulary takes over and this is never
+                # consulted again.
+                if (ref($cached_resources) ne 'HASH' && ref($resources_sampler_fact) eq 'HASH') {
+                    $resources_sampler_fact->{elapsed} = defined $resources_sampler_fact->{started_at}
+                        ? $now - $resources_sampler_fact->{started_at} : undef;
+                    $resources_sampler_fact->{grace}   = Resources::max_age();
+                    $resources_sampler_fact->{child_alive}
+                        = _resources_sampler_child_alive($RESOURCES_SAMPLER_CHILD);
+                }
             }
             # Advance the skew-free baseline by host-measured elapsed since the
             # last measurement (elapsed rate matches on both clocks; only the
@@ -5322,6 +5337,7 @@ sub enter_dashboard {
                 oauth_expires_at => $cached_oauth_expires_at,
                 tokens           => $cached_tokens,
                 resources        => $cached_resources,
+                resources_sampler => $resources_sampler_fact,
                 runs             => $cached_runs,
                 # b37-spend-surfaces: undef when no run has persisted a spend
                 # snapshot, and Dashboard::build_panels then omits the Spend
@@ -6200,8 +6216,14 @@ sub _resources_sampler_start {
     my $owner = $$;   # captured BEFORE forking -- in the CHILD, $$ is the child's OWN pid
     my $pid = fork();
     if (!defined $pid) {
-        log_ev('resources_sampler_start_failed', { reason => "fork: $!" });
-        return undef;                      # DEGRADE. No retry, no repeated attempts, no loop.
+        my $why = "$!";
+        log_ev('resources_sampler_start_failed', { reason => "fork: $why" });
+        # DEGRADE. No retry, no repeated attempts, no loop -- but the reason now
+        # travels to the caller instead of dying here. Until t01 this returned a
+        # bare undef, so the failure was known, logged, and then thrown away on
+        # the way to the screen: the panel said "sampling - no reading yet"
+        # forever, which is what the operator reported.
+        return (undef, Resources::sampler_start_outcome(undef, $why, time));
     }
     if ($pid == 0) {
         open(STDIN,  '<', '/dev/null');
@@ -6214,8 +6236,41 @@ sub _resources_sampler_start {
              $PROJECT_PATH)
             or do { POSIX::_exit(127) };
     }
-    log_ev('resources_sampler_started', { pid => $pid });
-    return $pid;
+    # NAMED FOR WHAT IT ESTABLISHES. This fires in the PARENT, immediately after
+    # the child is spawned, which is BEFORE it has re-exec'd -- the child can
+    # still die at exec (POSIX::_exit(127) above) without this line changing.
+    #
+    # (Phrased without the call spelling on purpose: t/44's AC-7 counts real
+    # calls in this sub's body and a comment naming one inflates that count.
+    # An oracle should not constrain prose, but the cheaper correction here is
+    # my wording, not a foreign package's assertion.)
+    # It was called `resources_sampler_started`, and an operator reading it in
+    # the activity log reasonably took it as proof the sampler was alive. It is
+    # not; it is proof a process was forked. Moving it to where exec success is
+    # known is real surgery (the child exits at its own CLI dispatch before the
+    # launch log is even opened) and is a separate follow-up -- so the name is
+    # corrected here and the liveness gap is closed by
+    # _resources_sampler_child_alive instead.
+    log_ev('resources_sampler_forked', { pid => $pid });
+    return ($pid, Resources::sampler_start_outcome($pid, undef, time));
+}
+
+# _resources_sampler_child_alive($pid) -> 1 alive | 0 gone | undef unknown
+#
+# Non-blocking reap check, called from the EXISTING 5s render tick and only
+# while no snapshot has ever been written. No new timer and no new spawn.
+#
+# This is what distinguishes "started and still working" from "started and
+# already dead" -- the case the old optimistic log line actively concealed.
+# undef means NOT CHECKED, and the renderer must never read that as dead.
+sub _resources_sampler_child_alive {
+    my ($pid) = @_;
+    return undef unless defined $pid && $pid =~ /^\d+$/ && $pid > 0;
+    my $r = eval { waitpid($pid, POSIX::WNOHANG()) };
+    return undef if $@;
+    return 0 if defined $r && $r == $pid;   # reaped -> it exited
+    return 0 if defined $r && $r == -1;     # no such child -> gone
+    return 1;
 }
 
 # _resources_sampler_stop($child_pid, $pidfile) — mirrors _keepawake_stop

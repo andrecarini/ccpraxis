@@ -248,6 +248,54 @@ my @RESOURCE_FACT_KEYS = qw(
     host_cpu_pct host_cores
 );
 
+# sampler_wait_spans(\%fact) -> \@spans
+#
+# Renders the ONE case the resources panel used to collapse: no snapshot has
+# ever been written. There are four genuinely different reasons for that and
+# they used to share a sentence, so the panel could never say anything but
+# "sampling - no reading yet" -- including when no reading was ever coming.
+#
+# The distinction that matters most is "started, then gone". fork() succeeding
+# is not the sampler working: the child re-execs and can die at exec, and the
+# log line the operator sees is written in the PARENT immediately after fork,
+# before any of that is known. So a confirmed-dead child is reported at once and
+# never waits out the grace window.
+#
+# `child_alive` undef means "not checked yet", which must never be read as
+# "dead" -- an unchecked liveness falls through to the elapsed-based branches.
+#
+# Decision 2 (blueprint tui-operator-feedback): no colon in any value text here.
+# The label gutter's own colon is package t05-no-colons' business, not this one's.
+sub sampler_wait_spans {
+    my ($fact) = @_;
+    my $neutral = 'sampling - no reading yet';
+
+    my ($text, $role) = ($neutral, 'text.muted');
+    if (ref($fact) eq 'HASH') {
+        my $status  = $fact->{status};
+        my $alive   = $fact->{child_alive};
+        my $elapsed = $fact->{elapsed};
+        my $grace   = $fact->{grace};
+        my $numeric = sub { my ($v) = @_; defined($v) && !ref($v) && $v =~ /^-?\d+(?:\.\d+)?$/ };
+
+        if (defined $status && !ref($status) && $status eq 'failed') {
+            $text = 'FAILED - sampler failed to start; no reading possible';
+            $role = 'state.crit';
+        } elsif (defined $alive && !ref($alive) && !$alive) {
+            $text = 'FAILED - sampler exited before writing a reading';
+            $role = 'state.crit';
+        } elsif ($numeric->($elapsed) && $numeric->($grace) && $elapsed >= $grace) {
+            $text = 'STALLED - sampler still running, no reading after ' . fmt_duration($elapsed);
+            $role = 'state.warn';
+        }
+    }
+
+    return [
+        { text => sprintf('%-*s : ', LABEL_GUTTER(), 'snapshot'), role => 'text.muted' },
+        { text => $text, role => $role },
+    ];
+}
+
 sub snapshot_spans {
     my ($res) = @_;
     return [] unless ref($res) eq 'HASH';
@@ -960,9 +1008,12 @@ sub panels {
     if (ref($state->{resources}) eq 'HASH') {
         push @out, { title => 'Resources', lines => _resources_body($state->{resources}), min_cols => tui::Meter::min_width() };
     } else {
+        # No snapshot has EVER been written. Until t01 this branch rendered one
+        # hardcoded sentence whatever the reason, so a sampler that failed to
+        # fork looked exactly like one that started two seconds ago -- which is
+        # what the operator saw, unchanged, indefinitely.
         push @out, { title => "Resources",
-                     lines => [ row({ label => "snapshot", value => "sampling - no reading yet",
-                                      role => "text.muted", force => 1 }) ],
+                     lines => [ sampler_wait_spans($state->{resources_sampler}) ],
                      min_cols => tui::Meter::min_width() };
     }
 

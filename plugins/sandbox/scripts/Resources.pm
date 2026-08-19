@@ -705,4 +705,37 @@ sub sampler_reap_decision {
     return { pid => $pid, owner => $owner, reap => $reap };
 }
 
+# sampler_start_outcome($pid, $errno_str, $started_at) -> \%fact
+#
+# The pure translation from a fork() result into the plain-data fact the TUI
+# renders. It lives HERE rather than in launcher.pl for one reason: the sandbox
+# suite never require's launcher.pl (it builds container images), so anything
+# that needs a real function-call test has to sit in a real module.
+#
+# WHY THIS EXISTS AT ALL. _resources_sampler_start already knew whether the fork
+# succeeded, and already LOGGED the failure -- but the answer was kept in a
+# teardown-only lexical and never reached the screen. So a sampler that failed
+# to start and a sampler that was merely three seconds old rendered the same
+# sentence, forever: "sampling - no reading yet". The operator reported exactly
+# that. The fact was not missing; it was discarded on the way to the panel.
+sub sampler_start_outcome {
+    my ($pid, $errno_str, $started_at) = @_;
+    my $at = _uint($started_at);
+    my $p  = _uint($pid);
+    return {
+        status     => 'ok',
+        (defined $at ? (started_at => $at) : ()),
+        pid        => $p,
+    } if defined $p && $p > 0;
+
+    # No usable pid: a failure, whether or not the caller handed us an errno.
+    # Never invent a pid key, and never report success for an absent child.
+    my $why = _str($errno_str);
+    return {
+        status => 'failed',
+        (defined $at ? (started_at => $at) : ()),
+        reason => 'fork: ' . (defined $why ? $why : 'unknown'),
+    };
+}
+
 1;
