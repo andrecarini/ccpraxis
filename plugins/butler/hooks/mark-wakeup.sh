@@ -31,6 +31,64 @@ set -u
 HOOK_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=lib.sh
 source "$HOOK_DIR/lib.sh"
+# shellcheck source=../scripts/bp-lib.sh
+[ -r "$HOOK_DIR/../scripts/bp-lib.sh" ] && source "$HOOK_DIR/../scripts/bp-lib.sh"
+
+# bp_wakeup_arm_check REGEX -- d03-one-shell-noise-stripper (almanac report
+# 20260814-093113-34a0). Reads a raw (pre-strip) shell command on stdin.
+# Prints "1" if REGEX matches inside the LIVE portion of the command (outside
+# any quoted span, comment, or heredoc body -- see bp_strip_shell_noise,
+# scripts/bp-lib.sh) AND the matched segment's first word is not a
+# non-executing reader (echo|printf|grep|rg|cat|sed|awk). Prints "0"
+# otherwise, including on empty input. Never exits non-zero; never writes to
+# stderr -- this hook's own contract is "exit 0 on every path" (see header).
+#
+# Kept LOCAL to this file, not lifted into bp-lib.sh: bp_strip_shell_noise's
+# contract is pure stripping, and its only other consumer
+# (guard-validation-interlock.sh) neither wants nor uses a reader-check.
+# Adding the veto to the shared helper would silently widen that file's
+# matching behaviour for no benefit to it -- keeping this local keeps
+# bp_strip_shell_noise provably unchanged.
+#
+# Degrades in two independent, false-negative-averse directions (never toward
+# silently missing a real invocation):
+#   - bp_strip_shell_noise unavailable or empty output (perl missing,
+#     bp-lib.sh unreadable) -> matches against the UNSTRIPPED extracted
+#     command instead of failing closed (mirrors guard-validation-
+#     interlock.sh's own bp_strip_shell_noise fallback).
+#   - perl itself unavailable for the regex+reader-check step -> the base
+#     regex match still runs via bash grep; the reader-segment VETO is
+#     skipped (never applied), which can only ARM more often, never less.
+bp_wakeup_arm_check() {
+  regex="$1"
+  cmd=$(cat)
+  text="$cmd"
+  if [ -n "$cmd" ] && command -v bp_strip_shell_noise >/dev/null 2>&1; then
+    stripped=$(printf '%s' "$cmd" | bp_strip_shell_noise)
+    [ -n "$stripped" ] && text="$stripped"
+  fi
+  [ -n "$text" ] || { echo 0; return; }
+  printf '%s' "$text" | grep -Eq "$regex" || { echo 0; return; }
+  if command -v perl >/dev/null 2>&1; then
+    printf '%s' "$text" | perl -0777 -e '
+        my $regex = shift @ARGV;
+        my $filtered = do { local $/; <STDIN> };
+        my $armed = 0;
+        if ($filtered =~ /$regex/) {
+          my $pre = substr($filtered, 0, $-[0]);
+          my $seg = ($pre =~ /.*[;&|\n](.*)$/s) ? $1 : $pre;
+          $seg =~ s/^[ \t]+//;
+          my ($first) = $seg =~ /^(\S+)/;
+          $first = defined($first) ? $first : "";
+          $first =~ s{.*/}{};
+          $armed = 1 unless $first =~ /^(?:echo|printf|grep|rg|cat|sed|awk)$/;
+        }
+        print($armed ? "1" : "0");
+      ' "$regex" 2>/dev/null
+  else
+    echo 1
+  fi
+}
 
 # Coordinator sessions are gate-stop.sh's business, not ours. BP_LEDGER is
 # exported only into coordinator processes, so its ABSENCE is what identifies
@@ -100,7 +158,7 @@ if [ "$TOOL" = "Bash" ] && [ -n "$DATA" ]; then
   # executing it, and a parity count over one quote character catches none of
   # them.
   #
-  # THE GENERAL RULE this now enforces: scan the raw command byte-by-byte,
+  # THE GENERAL RULE this enforces: scan the raw command byte-by-byte,
   # tracking whether the current position is inside a single-quoted span, a
   # double-quoted span, a '#' comment (only when '#' starts a new word --
   # i.e. is preceded by whitespace, a command separator, or the start of the
@@ -111,8 +169,16 @@ if [ "$TOOL" = "Bash" ] && [ -n "$DATA" ]; then
   # regex ever runs, so "bp-watch.pl --arm --blueprint" can only match text
   # that is actually part of the command bash would execute -- never text
   # that is quoted, commented out, or sitting inert inside a heredoc body.
-  # Checked with perl (already required by this hook family) rather than
-  # reimplemented as bash arithmetic.
+  #
+  # 2026-08-19 d03-one-shell-noise-stripper (almanac report
+  # 20260814-093113-34a0): this used to be an 85-line inline copy of the
+  # state machine, plus an inline reader-segment check. Both now live in one
+  # place -- bp_strip_shell_noise (scripts/bp-lib.sh) for the stripping, and
+  # bp_wakeup_arm_check (this file, defined once above, shared with the
+  # driver-arm block below) for the strip -> match -> reader-veto sequence.
+  # This block's observable behaviour is unchanged; only the implementation
+  # collapsed from a third independent copy to a call into the one shared
+  # definition.
   #
   # This remains a heuristic, not a shell parser: it does not resolve command
   # substitution ($(...)), variable expansion, or backtick spans, so a command
@@ -121,92 +187,7 @@ if [ "$TOOL" = "Bash" ] && [ -n "$DATA" ]; then
   # already documented to prefer (spec §1.2 -- "when in doubt, arm" is the
   # driver's bias, this trigger's is the opposite, and this fix does not
   # change that bias, only closes the false-POSITIVE holes redteam found).
-  ARMED=$(printf '%s' "$RCMD" | perl -0777 -ne '
-      my $s = $_;
-      my @c = split //, $s, -1;
-      my $n = scalar @c;
-      my $filtered = "";
-      my $state = "none";      # none | squote | dquote | comment | heredoc
-      my $hd = ""; my $hd_tabs = 0; my $hd_pending = 0; my $line = "";
-      my $i = 0;
-      while ($i < $n) {
-        my $ch = $c[$i];
-        if ($state eq "heredoc") {
-          if ($ch eq "\n") {
-            my $chk = $line; $chk =~ s/^\t+// if $hd_tabs;
-            $state = "none" if $chk eq $hd;
-            $filtered .= (" " x length($line))."\n"; $line = "";
-          } else { $line .= $ch }
-          $i++; next;
-        }
-        if ($state eq "comment") {
-          $filtered .= ($ch eq "\n" ? "\n" : " ");
-          $state = "none" if $ch eq "\n";
-          $i++; next;
-        }
-        if ($state eq "squote") {
-          $state = "none" if $ch eq "\x27";
-          $filtered .= ($ch eq "\n" ? "\n" : " ");
-          $i++; next;
-        }
-        if ($state eq "dquote") {
-          if ($ch eq "\\" && $i+1 < $n) { $filtered .= "  "; $i += 2; next }
-          $state = "none" if $ch eq q{"};
-          $filtered .= ($ch eq "\n" ? "\n" : " ");
-          $i++; next;
-        }
-        if ($hd_pending && $ch eq "\n") {
-          $filtered .= "\n"; $i++; $state = "heredoc"; $hd_pending = 0; $line = ""; next;
-        }
-        if ($ch eq "\x27") { $state = "squote"; $filtered .= " "; $i++; next }
-        if ($ch eq q{"})   { $state = "dquote"; $filtered .= " "; $i++; next }
-        if ($ch eq "\\" && $i+1 < $n) { $filtered .= "  "; $i += 2; next }
-        if ($ch eq "#") {
-          my $p = $filtered; $p =~ s/[ \t]+$//;
-          my $last = length($p) ? substr($p, -1) : "";
-          if ($last eq "" || $last =~ /[;&|(\n]/) {
-            $state = "comment"; $filtered .= " "; $i++; next;
-          }
-          $filtered .= "#"; $i++; next;
-        }
-        if ($ch eq "<" && $i+1 < $n && $c[$i+1] eq "<") {
-          my $j = $i+2; my $tabs = 0;
-          if ($j < $n && $c[$j] eq "-") { $tabs = 1; $j++ }
-          $j++ while ($j < $n && $c[$j] =~ /[ \t]/);
-          my $q = "";
-          if ($j < $n && ($c[$j] eq "\x27" || $c[$j] eq q{"})) { $q = $c[$j]; $j++ }
-          my $delim = "";
-          $delim .= $c[$j++] while ($j < $n && $c[$j] =~ /[A-Za-z0-9_]/);
-          $j++ if (length($q) && $j < $n && $c[$j] eq $q);
-          if (length($delim)) {
-            $filtered .= (" " x ($j - $i)); $i = $j;
-            $hd = $delim; $hd_tabs = $tabs; $hd_pending = 1;
-            next;
-          }
-        }
-        $filtered .= $ch; $i++;
-      }
-      my $armed = 0;
-      if ($filtered =~ /bp-watch\.pl[^"]*--arm[^"]*--blueprint\b/) {
-        # fixbatch step7 / F1 residual: an UNQUOTED reference (no quoting at
-        # all to strip, e.g. `grep -r bp-watch.pl --arm --blueprint foo`)
-        # survives the filtering above untouched, because there is nothing
-        # quoted to remove. Close it the same way a human reads the command:
-        # the SEGMENT containing the match (since the last command separator
-        # -- ; & | or newline -- or the start of the string) must not begin
-        # with a non-executing READER. A real invocation always starts with
-        # the interpreter/script itself (perl, ./bp-watch.pl, bp-watch.pl),
-        # never with a command whose whole job is to read or print text.
-        my $pre = substr($filtered, 0, $-[0]);
-        my $seg = ($pre =~ /.*[;&|\n](.*)$/s) ? $1 : $pre;
-        $seg =~ s/^[ \t]+//;
-        my ($first) = $seg =~ /^(\S+)/;
-        $first = defined($first) ? $first : "";
-        $first =~ s{.*/}{};
-        $armed = 1 unless $first =~ /^(?:echo|printf|grep|rg|cat|sed|awk)$/;
-      }
-      print($armed ? "1" : "0");
-    ' 2>/dev/null || echo 0)
+  ARMED=$(printf '%s' "$RCMD" | bp_wakeup_arm_check 'bp-watch\.pl[^"]*--arm[^"]*--blueprint\b')
   if [ "$ARMED" = "1" ]; then
     RSID=$(bp_json_get "$PAYLOAD" session_id 2>/dev/null || true)
     case "$RSID" in ''|*/*|*\**|.|..|*..*) RSID="" ;; esac
@@ -243,6 +224,41 @@ fi
 # leaves a real driver ungated, which is the silent mid-run death this whole
 # pair exists to prevent. When in doubt, arm.
 #
+# 2026-08-19 d03-one-shell-noise-stripper (almanac report 20260814-093113-34a0),
+# extending the bias statement above with what THIS fix specifically does and
+# does not change: it closes false POSITIVES -- a MENTION of the invocation
+# (echoed, commented-out, single- or double-quoted, heredoc-embedded, or bare/
+# unquoted) that is never actually executed -- via bp_strip_shell_noise plus
+# the reader-segment veto below. It adds NO new requirement on how a genuine
+# invocation may be shaped: subcommand choice (next|record-order|park), exact
+# script path (relative, absolute, or quoted), a `cd ... &&` prefix, extra CLI
+# flags before or after the subcommand, and a trailing pipe all continue to
+# arm, exactly as before (see AC8 in the package spec for the enumerated
+# shapes this is pinned against).
+#
+# THREAT MODEL, ruled explicitly (same ruling as w03 for
+# guard-validation-interlock.sh, mirrored here rather than re-derived):
+# ACCIDENT, not ADVERSARY. Nothing in this repo's design treats a driver
+# session as trying to defeat its own gate -- every dispatcher of the Bash
+# command this block can see is a butler worker or an interactive driver
+# following its own protocol, not an attacker.
+#
+# ACCEPTED RESIDUALS, not fixed here:
+#   - Inherited from bp_strip_shell_noise itself (scripts/bp-lib.sh): command
+#     substitution ($(...)), variable expansion, and backtick spans are not
+#     resolved, so a command that builds the invocation text through one of
+#     those still slips past. Same direction every existing caller of that
+#     helper already accepts.
+#   - The driver-arm-specific equivalent of `npm te''st`-style reconstitution:
+#     a determined caller could still build `bp-drive-next.pl` plus a
+#     subcommand through string concatenation, `eval`, a variable, or a
+#     sourced function and arm (or dodge arming) without the literal
+#     substring ever appearing in tool_input.command. Accepted for the same
+#     reason w03 accepted its analogue: nobody has a reason to spell the
+#     director's own invocation that way under the ACCIDENT threat model, and
+#     the false-negative bias above means this residual leans toward ARMING a
+#     hard-to-classify command, not silently missing a driver.
+#
 # g01: this block, and its own .drive-solo gate, are UNTOUCHED in effect
 # (spec §2.4) -- a drive-solo run must already have an order dir before a
 # director call can register a driver here. Only the wake-up-write section
@@ -251,7 +267,16 @@ fi
 if [ -n "$DATA" ] && [ -d "$DATA/.drive-solo" ]; then
   SID=$(bp_json_get "$PAYLOAD" session_id 2>/dev/null || true)
   if [ "$TOOL" = "Bash" ] && [ -n "$SID" ]; then
-    if printf '%s' "$PAYLOAD" | grep -Eq 'bp-drive-next\.pl[^"]*(next|record-order|park)'; then
+    # d03-one-shell-noise-stripper: extract tool_input.command FIRST and
+    # match against THAT -- never the raw JSON $PAYLOAD blob. Grepping the
+    # raw payload was the root defect this package closes: JSON's own
+    # structural double quotes are not shell quotes, and bp_strip_shell_noise
+    # is a shell quote-state machine, so feeding it JSON text parses the
+    # wrong quoting language. `if [ "$TOOL" = "Bash" ]` above already
+    # guarantees a Bash tool_input, so tool_input.command is the right, and
+    # only, field to read.
+    DCMD=$(bp_json_get "$PAYLOAD" tool_input.command 2>/dev/null || true)
+    if [ "$(printf '%s' "$DCMD" | bp_wakeup_arm_check 'bp-drive-next\.pl[^"]*(next|record-order|park)')" = "1" ]; then
       if MARK=$(bp_drive_marker "$SID" 2>/dev/null); then
         mkdir -p "$(dirname "$MARK")" 2>/dev/null \
           && printf '%s\n' "$DATA" > "$MARK" 2>/dev/null || true

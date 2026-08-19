@@ -316,6 +316,21 @@ sub marker_path { my ($rdir, $sid) = @_; return "$rdir/$sid"; }
 #    above) is fixed by this package. H2 below now asserts the TRUE,
 #    verified behavior instead of repeating the false claim.
 #
+# 2026-08-19 d03-one-shell-noise-stripper CLOSES THE GAP THIS BLOCK RECORDS.
+# Almanac report 20260814-093113-34a0 named this exact weakness (the driver
+# arm grepping the raw JSON payload, no quote-parity check at all) as its
+# sharpest finding and brought it in scope. d03 routes the driver arm through
+# the same extract -> bp_strip_shell_noise -> match -> reader-segment-veto
+# path the reporter arm already used, so this fixture -- an ECHOED, never
+# executed, mention of bp-drive-next.pl -- must now NOT register a driver
+# session. H2 below is therefore INVERTED on purpose: `ok(-f ...)` becomes
+# `ok(!-f ...)`. This is the fix working, not a change made to satisfy a
+# failing test -- the paragraphs above this note stay exactly as they were
+# written, because they are an honest, dated record of a real, then-out-of-
+# scope bug, and a future reader should still be able to see that the bug
+# was real before it was closed. H3, directly below, is UNCHANGED: a genuine
+# invocation must still arm, now via the new code path.
+#
 # SAFETY NOTE (fixture construction, not an assertion change): this fixture
 # deliberately trips the DRIVER's own arm regex, which -- unlike every other
 # fixture in this file, which stays on the reporter path via run_mark's
@@ -340,13 +355,17 @@ $payload
 PAYLOAD_EOF`;
     is($? >> 8, 0, 'H1: driver arm never blocks on the echoed command either (registering '
                  . 'never blocks anything -- see this file'."'".'s own header)');
-    ok(-f "$dact/sess-h",
-       'H2 CORRECTED (fixbatch step7 / F4): the DRIVER'."'".'s existing arm regex has NO '
-     . 'quote-parity check and DOES register on this echoed command, given this exact JSON '
-     . 'escaping -- this is a KNOWN, verified, out-of-scope weakness (redteam-step6.md '
-     . 'LOW-2), not prior art the reporter'."'".'s own fix (F5-F8 above) can lean on. '
-     . 'Recorded here as ground truth so a future reader does not re-derive "the driver '
-     . 'already handles this" from a comment that turned out to be untested');
+    ok(!-f "$dact/sess-h",
+       'H2 INVERTED (d03-one-shell-noise-stripper, closing almanac report '
+     . '20260814-093113-34a0): this assertion REPLACES the prior '
+     . '"H2 CORRECTED" assertion, which pinned the DRIVER'."'".'s then-existing arm regex '
+     . 'having NO quote-parity check and DOING register on this echoed command. d03 '
+     . 'brought that KNOWN, verified, previously-out-of-scope weakness (redteam-step6.md '
+     . 'LOW-2) in scope and fixed it -- the driver arm now extracts tool_input.command, '
+     . 'strips it via the shared bp_strip_shell_noise, and applies the same reader-segment '
+     . 'veto the reporter arm already used, so this ECHOED, never-executed mention of '
+     . 'bp-drive-next.pl no longer registers a driver session. The inversion below is the '
+     . 'fix working as designed, not a change made to satisfy a failing test.');
 }
 # ---------------------------------------------------------------------------
 # H3. Confirms H2's positive result is not an accident of that ONE echoed

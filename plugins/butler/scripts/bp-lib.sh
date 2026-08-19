@@ -200,12 +200,18 @@ bp_require_sandbox() {
 # against three independent bypass techniques: a bash comment, a
 # single-quoted string, a heredoc body). Lifted here so a THIRD copy of this
 # logic is never written: hooks/guard-validation-interlock.sh is the second
-# consumer of this one implementation. mark-wakeup.sh's own inline copy is
-# deliberately left as-is rather than refactored to call this -- it is
-# already shipped and tested (t/98 and siblings), and routing it through here
-# too is a real improvement but not required to avoid the "fourth copy"
-# defect this comment warns against; only a genuinely NEW caller needs to
-# reuse rather than reinvent.
+# consumer of this one implementation.
+#
+# 2026-08-19 d03-one-shell-noise-stripper (almanac report 20260814-093113-34a0):
+# mark-wakeup.sh's own inline copy is GONE. This sentence used to claim it was
+# "deliberately left as-is rather than refactored to call this" because "only
+# a genuinely NEW caller needs to reuse rather than reinvent" -- that claim is
+# now FALSE and would contradict the code next to it if left standing. Both of
+# mark-wakeup.sh's arms (the reporter-arm block and the driver-arm block) now
+# call this function via a conditional source of this file, mirroring
+# guard-validation-interlock.sh:70-74. This is the third and last treatment of
+# one problem collapsing to one implementation, not two independent copies
+# plus a shared one.
 #
 # NOT a shell parser: command substitution ($(...)), variable expansion, and
 # backtick spans are not resolved, so text built through one of those still
