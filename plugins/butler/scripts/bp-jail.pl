@@ -220,9 +220,9 @@ sub chroot_bin {
 #
 # The chroot isolates the FILESYSTEM. That is how b33 keeps the Claude credential away
 # from a jailed worker: `claude-home/.credentials.json` is simply unreachable on disk
-# (t/80 C1 asserts exactly that). It does NOT isolate the ENVIRONMENT — exec() inherits
-# the parent's %ENV wholesale, and nothing in this file has ever touched %ENV except to
-# READ BP_PROJECT_ROOT/BP_WRITE_SET.
+# (t/156-worker-jail-isolation.t C1 asserts exactly that). It does NOT isolate
+# the ENVIRONMENT — exec() inherits the parent's %ENV wholesale, and nothing in
+# this file has ever touched %ENV except to READ BP_PROJECT_ROOT/BP_WRITE_SET.
 #
 # That was harmless while b33's verified premise held: OpenCode needed no credential, so
 # there was no OpenCode secret anywhere to inherit. b36 breaks that premise. It puts a
@@ -306,8 +306,9 @@ our @JAIL_ENV_DENYLIST = qw(
 #
 # So the threat model is BIDIRECTIONAL: secrets must not leak IN, and controls
 # must not fall OUT. An allowlist defends only the first and actively breaks the
-# second. The denylist defends the first, and t/80's C13 asserts the second by
-# checking the protective variables are still PRESENT inside the jail.
+# second. The denylist defends the first, and t/156-worker-jail-isolation.t's
+# C13 asserts the second by checking the protective variables are still
+# PRESENT inside the jail.
 #
 # GIT_SSH_COMMAND is denied because it is `ssh -i <deploy-key-path> …`, and b33
 # rules that jailed workers get NO git — nothing in the jail needs it. The two
@@ -349,9 +350,10 @@ our @JAIL_ENV_ALLOW_EXACT = qw(
 # There is no CLAUDE_ prefix: that would readmit CLAUDE_CODE_OAUTH_TOKEN, the
 # exact secret the denylist exists to stop.
 #
-# There is no BP_ prefix either, and that is not obvious. It was here, and t/80's
-# canary — BP_JAIL_CANARY, an arbitrary name — SURVIVED the boundary because of
-# it. A prefix readmits every future variable someone names with it, which is
+# There is no BP_ prefix either, and that is not obvious. It was here, and
+# t/156-worker-jail-isolation.t's canary — BP_JAIL_CANARY, an arbitrary name —
+# SURVIVED the boundary because of it. A prefix readmits every future variable
+# someone names with it, which is
 # the denylist's own failure mode reintroduced from the other side. The five
 # BP_ variables a jailed worker actually reads are enumerated above instead.
 #
@@ -434,9 +436,10 @@ sub populate_os_skeleton {
     # PREFER the baked skeleton — hardlinking or copying a real device node
     # preserves it as a device, so a jailed worker gets a functional /dev/null
     # and /dev/urandom. The empty-file path below is a LAST-RESORT fallback for a
-    # container built before this skeleton existed: it satisfies t/80 (nothing
-    # there depends on device semantics) but is NOT functional for a real worker,
-    # which will misbehave redirecting to an empty regular file or reading it for
+    # container built before this skeleton existed: it satisfies
+    # t/156-worker-jail-isolation.t (nothing there depends on device
+    # semantics) but is NOT functional for a real worker, which will
+    # misbehave redirecting to an empty regular file or reading it for
     # entropy. If you are debugging odd worker behaviour and see empty files here,
     # the container predates the skeleton — rebuild it.
     make_path("$jail_root/dev");

@@ -154,7 +154,7 @@ sub _mk_path_without_opencode {
     return $dir;
 }
 # Only attempt the PATH mirror where symlink() works. See the same guard and the
-# same reasoning in t/81: this helper symlinks EVERY entry of EVERY PATH
+# same reasoning in t/157-opencode-worker-runtime.t: this helper symlinks EVERY entry of EVERY PATH
 # directory, which on Windows means tens of thousands of failing calls against
 # System32 — 15+ minutes at file scope, before a single assertion, looking for
 # all the world like a deadlock. Without symlinks the mirror would be empty

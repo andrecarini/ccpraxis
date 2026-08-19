@@ -205,6 +205,15 @@ for my $p (@pairs) {
     my %exempt_files = (
         'plugins/butler/tests/t/148-registry-runtime-only.t' => 1,
         'plugins/butler/tests/t/67-wait-shape-guard.t'        => 1,
+        # 106-guard-git-mutations-quote-mask.t:37 reads "Mirrors t/98's
+        # %CLEAN_ENV discipline" -- but neither current t/98
+        # (98-write-guard-primitive.t) nor its former loser (now
+        # 159-status-read-api.t) contains the %CLEAN_ENV idiom at all; it
+        # lives in 29 OTHER files. This citation was already wrong BEFORE
+        # d01's rename -- it names a file that never had the idiom it claims
+        # to mirror -- so it is not rename damage and is deliberately left
+        # unchanged rather than "fixed" into an equally-wrong new number.
+        'plugins/butler/tests/t/106-guard-git-mutations-quote-mask.t' => 1,
         # THIS FILE, added 2026-08-19 by driver adjudication. The scan below
         # greps every tracked file for each loser's OLD basename -- and this
         # oracle's own @pairs table must NAME those basenames in order to
@@ -271,6 +280,12 @@ for my $p (@pairs) {
     like($c67, qr{plugins/butler/tests/t/20-turns\.t},
          'SECTION 3 exclusion: 67-wait-shape-guard.t:391 keeps its decayed "t/20-turns.t" fixture '
        . 'string unchanged (never a real file under any name)');
+
+    my $c106 = slurp("$ROOT/plugins/butler/tests/t/106-guard-git-mutations-quote-mask.t");
+    like($c106, qr/Mirrors t\/98's/,
+         'SECTION 3 exclusion: 106-guard-git-mutations-quote-mask.t:37 keeps its pre-existing decayed '
+       . '"Mirrors t/98\'s %CLEAN_ENV discipline" citation unchanged -- neither current t/98 file ever '
+       . 'had the %CLEAN_ENV idiom, so this predates and is unrelated to the rename');
 }
 
 # ============================================================================
@@ -299,6 +314,54 @@ for my $p (@pairs) {
           desc => '120: "t/NN:361/435/440, track-dispatch.sh:24)" resolves to 79-worker-backend-dispatcher.t (a loser)',
           re_old => qr/t\/79:361\/435\/440, track-dispatch\.sh:24\)/,
           re_new => qr/t\/155:361\/435\/440, track-dispatch\.sh:24\)/ },
+        # Fix-batch 2 (redteam-step6): a deeper pass found NINE bare-number
+        # citations that survived d01's rename undetected because a
+        # basename-only grep (SECTION 3) cannot see a bare "t/NN". Two of
+        # these were previously mis-asserted as winner-resolved below and are
+        # moved here with corrected text; the remaining seven are pinned
+        # fresh. All nine were driver-verified by content analysis (grepping
+        # the distinguishing idiom -- BP_JAIL_CANARY, C11/C12, symlink,
+        # TEST_BASE -- into the winner vs. the new loser path).
+        { file => 'plugins/butler/scripts/BpState.pm',
+          desc => 'BpState.pm:277 "(t/NN AC7 \"ac7-stale-done\": an old-shape" resolves to 101-lifecycle-derived.t (a loser)',
+          re_old => qr/\(t\/101 AC7 "ac7-stale-done": an old-shape/,
+          re_new => qr/\(t\/161-lifecycle-derived\.t AC7 "ac7-stale-done": an old-shape/ },
+        { file => 'plugins/butler/scripts/bp-jail.pl',
+          desc => 'bp-jail.pl:223 "(t/NN C1 asserts exactly that)" resolves to 80-worker-jail-isolation.t (a loser)',
+          re_old => qr/\(t\/80 C1 asserts exactly that\)/,
+          re_new => qr/\(t\/156-worker-jail-isolation\.t C1 asserts exactly that\)/ },
+        { file => 'plugins/butler/scripts/bp-jail.pl',
+          desc => 'bp-jail.pl:309 "the denylist defends the first, and t/NN\'s C13" resolves to 80-worker-jail-isolation.t (a loser)',
+          re_old => qr/[Tt]he denylist defends the first, and t\/80's C13/,
+          re_new => qr/[Tt]he denylist defends the first, and t\/156-worker-jail-isolation\.t's\n#\s*C13/ },
+        { file => 'plugins/butler/scripts/bp-jail.pl',
+          desc => 'bp-jail.pl:352 "It was here, and t/NN\'s canary" resolves to 80-worker-jail-isolation.t (a loser)',
+          re_old => qr/It was here, and t\/80's\ncanary/,
+          re_new => qr/It was here, and\n#\s*t\/156-worker-jail-isolation\.t's canary/ },
+        { file => 'plugins/butler/scripts/bp-jail.pl',
+          desc => 'bp-jail.pl:437 "it satisfies t/NN (nothing" resolves to 80-worker-jail-isolation.t (a loser)',
+          re_old => qr/it satisfies t\/80 \(nothing/,
+          re_new => qr/it satisfies\n    # t\/156-worker-jail-isolation\.t \(nothing/ },
+        { file => 'plugins/butler/tests/t/155-worker-backend-dispatcher.t',
+          desc => '155:157 "same reasoning in t/NN: this helper symlinks" resolves to 81-opencode-worker-runtime.t (a loser)',
+          re_old => qr/same reasoning in t\/81: this helper symlinks/,
+          re_new => qr/same reasoning in t\/157-opencode-worker-runtime\.t: this helper symlinks/ },
+        { file => 'plugins/butler/tests/t/157-opencode-worker-runtime.t',
+          desc => '157:29 "matches t/NN\'s TEST_BASE rationale" resolves to 80-worker-jail-isolation.t (a loser)',
+          re_old => qr/matches t\/80's TEST_BASE rationale/,
+          re_new => qr/matches t\/156-worker-jail-isolation\.t's TEST_BASE rationale/ },
+        { file => 'plugins/butler/tests/t/157-opencode-worker-runtime.t',
+          desc => '157:227 "project + jail harness mirroring t/NN." resolves to 80-worker-jail-isolation.t (a loser)',
+          re_old => qr/project \+ jail harness mirroring t\/80\./,
+          re_new => qr/project \+ jail harness mirroring t\/156-worker-jail-isolation\.t\./ },
+        { file => 'plugins/butler/tests/t/84-green-baseline.t',
+          desc => '84:639 "t/NN\'s C12 does, so this gate" resolves to 80-worker-jail-isolation.t (a loser)',
+          re_old => qr/t\/80's C12 does, so this gate/,
+          re_new => qr/t\/156-worker-jail-isolation\.t's C12 does, so this gate/ },
+        { file => 'plugins/butler/tests/t/84-green-baseline.t',
+          desc => '84:704 "(mirrors t/NN C11): poll for the" resolves to 80-worker-jail-isolation.t (a loser)',
+          re_old => qr/\(mirrors t\/80 C11\): poll for the/,
+          re_new => qr/\(mirrors t\/156-worker-jail-isolation\.t C11\): poll for the/ },
     );
 
     for my $c (@loser_citations) {
@@ -317,15 +380,26 @@ for my $p (@pairs) {
     # alone is the correct outcome, not an oversight, and this is exactly as
     # testable as "must change".
     my @winner_citations = (
-        { file => 'plugins/butler/scripts/BpState.pm',
-          desc => 'BpState.pm:277 "(t/101 AC7 \"ac7-stale-done\": an old-shape" resolves to 101-guard-writes-specificity.t (the winner)',
-          re   => qr/\(t\/101 AC7 "ac7-stale-done": an old-shape/ },
         { file => 'plugins/butler/tests/t/111-keepawake-shared.t',
           desc => '111: "match_any needed t/108 to guard its two" resolves to 108-match-any-divergence.t (the winner)',
           re   => qr/match_any needed t\/108 to guard its two/ },
-        { file => 'plugins/butler/tests/t/84-green-baseline.t',
-          desc => "84: \"t/80's C12\" resolves to 80-rate-limit-attempt-isolation.t (the winner)",
-          re   => qr/t\/80's C12/ },
+        # Fix-batch 2 (redteam-step6): the BpState.pm:277 and 84:639 entries
+        # formerly here were FALSE -- both are loser-resolved (see
+        # @loser_citations above) and were only ever passing because the
+        # underlying bug was live. They were present, unchanged, in the
+        # ORIGINAL oracle as committed in d5bb8b9 (not introduced by the
+        # earlier fix-batch 9467e54, which carried them forward). Corrected
+        # and moved, not deleted, so the winner side stays pinned by real
+        # driver-verified entries instead of a gap.
+        { file => 'plugins/butler/scripts/bp-govern.pl',
+          desc => 'bp-govern.pl:25 "the oracle (t/81) greps for these" resolves to 81-usage-poll-cadence.t (the winner)',
+          re   => qr/the oracle \(t\/81\) greps for these/ },
+        { file => 'plugins/butler/scripts/bp-lib.sh',
+          desc => 'bp-lib.sh:205 "already shipped and tested (t/98 and siblings)" resolves to 98-write-guard-primitive.t (the winner)',
+          re   => qr/already shipped and tested \(t\/98 and siblings\)/ },
+        { file => 'plugins/butler/scripts/bp-orchestrator.pl',
+          desc => 'bp-orchestrator.pl:4880 "(t/99 S1/behavior13 exercises a fixture" resolves to 99-write-guard-sites.t (the winner)',
+          re   => qr/\(t\/99 S1\/behavior13 exercises a fixture/ },
     );
     for my $c (@winner_citations) {
         my $content = slurp("$ROOT/$c->{file}");

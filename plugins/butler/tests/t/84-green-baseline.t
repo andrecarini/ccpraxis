@@ -636,7 +636,7 @@ sub baseline_ref_exists {
     # -d '/project' is NOT enough: the container image carries a plain /project
     # directory even when nothing is bind-mounted there, and the refusal under
     # test is specifically about v9fs. Check the filesystem type, the same way
-    # t/80's C12 does, so this gate is right on a host (no /project at all), in
+    # t/156-worker-jail-isolation.t's C12 does, so this gate is right on a host (no /project at all), in
     # a real sandbox (/project IS v9fs -> runs), and in a bare container run
     # (/project exists but is not v9fs -> skips instead of failing).
     my $proj_fstype = -d '/project' ? `stat -f -c %T /project 2>/dev/null` : '';
@@ -701,7 +701,7 @@ sub baseline_ref_exists {
                   BP_PROJECT_ROOT => $proj, BP_WRITE_SET => 'pkgP');
     ok(!-e $dest_fail, 'C8: teardown after a forced materialize failure still leaves no stray directory');
 
-    # Teardown after SIGTERM mid-materialize. Best-effort timing (mirrors t/80 C11): poll for the
+    # Teardown after SIGTERM mid-materialize. Best-effort timing (mirrors t/156-worker-jail-isolation.t C11): poll for the
     # destination to start existing, then kill; the FIRST assertion below is the one that carries
     # real information when the feature is missing (nothing is ever created to observe), so this
     # block is not vacuous even though the final ok(!-e) would otherwise trivially hold either way.

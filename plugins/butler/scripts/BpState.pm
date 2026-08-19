@@ -274,7 +274,7 @@ sub run_is_live {
 #      Deliberately NOT extended to 'done' here: an authored 'done' that
 #      is NOT all-delivered has no branch of its own and falls through to
 #      step 5's default -- this is pre-existing, protected behavior
-#      (t/101 AC7 "ac7-stale-done": an old-shape 'done' with an undelivered
+#      (t/161-lifecycle-derived.t AC7 "ac7-stale-done": an old-shape 'done' with an undelivered
 #      package derives to 'drafting', never trusted literally), not
 #      something this package's fix touches.
 #   5. final default 'drafting' — blueprint.md absent/unreadable, authored

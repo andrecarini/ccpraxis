@@ -26,7 +26,7 @@
 # HARNESS RULES (mirroring 79/80):
 #   * %CLEAN_ENV strips every ambient BP_*/PATH-adjacent var this suite controls explicitly.
 #   * All fixtures live under File::Temp / a tempdir rooted at /root (overlayfs, chmod honoured --
-#     matches t/80's TEST_BASE rationale). Nothing is written into the live /project tree.
+#     matches t/156-worker-jail-isolation.t's TEST_BASE rationale). Nothing is written into the live /project tree.
 #   * Any invocation of the real `opencode` binary or bp-jail.pl is wrapped in `timeout` -- no
 #     assertion depends on it finishing; a hang must not hang this suite.
 #   * done_testing(), not a hand-counted plan.
@@ -224,7 +224,7 @@ sub read_frontmatter {
 # =====================================================================================
 # Scaffolding shared by E4/E5/E11/E13: invoking guard-writes.sh directly (the pre-existing,
 # already-shipped enforcer the new guard plugin must call unmodified), and a minimal fake
-# project + jail harness mirroring t/80.
+# project + jail harness mirroring t/156-worker-jail-isolation.t.
 # =====================================================================================
 my $GUARD_HOOK = "$ROOT_PLUGIN/hooks/guard-writes.sh";
 
