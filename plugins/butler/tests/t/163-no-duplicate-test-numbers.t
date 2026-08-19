@@ -394,9 +394,27 @@ for my $p (@pairs) {
         { file => 'plugins/butler/scripts/bp-govern.pl',
           desc => 'bp-govern.pl:25 "the oracle (t/81) greps for these" resolves to 81-usage-poll-cadence.t (the winner)',
           re   => qr/the oracle \(t\/81\) greps for these/ },
-        { file => 'plugins/butler/scripts/bp-lib.sh',
-          desc => 'bp-lib.sh:205 "already shipped and tested (t/98 and siblings)" resolves to 98-write-guard-primitive.t (the winner)',
-          re   => qr/already shipped and tested \(t\/98 and siblings\)/ },
+        # REMOVED 2026-08-19. This slot pinned bp-lib.sh's sentence "already
+        # shipped and tested (t/98 and siblings)", whose bare t/98 correctly
+        # resolves to the WINNER 98-write-guard-primitive.t. The citation was
+        # right; pinning it here was the mistake.
+        #
+        # d03-one-shell-noise-stripper (fbe7f6e) deleted the whole sentence,
+        # and was right to: it claimed mark-wakeup.sh's inline copy of the
+        # stripper was "deliberately left as-is rather than refactored to call
+        # this", and d03 removed that inline copy, so the claim became false
+        # and would have contradicted the code beside it. d03's spec required
+        # correcting the stale prose.
+        #
+        # The lesson is about what an oracle may pin. This file's job is that a
+        # bare t/NN resolves to exactly one file. Pinning the PROSE of a comment
+        # in a file this package does not own makes an unrelated package's
+        # legitimate edit look like a regression -- and it did, turning t/163
+        # red on a full sweep after d03 landed. Section 3's repo-wide sweep
+        # still catches a stale citation of an old BASENAME anywhere, which is
+        # the invariant that actually matters. A winner-resolved bare number in
+        # someone else's comment needs no guard, because nothing about it can
+        # rot: if the sentence is deleted, there is no citation left to be wrong.
         { file => 'plugins/butler/scripts/bp-orchestrator.pl',
           desc => 'bp-orchestrator.pl:4880 "(t/99 S1/behavior13 exercises a fixture" resolves to 99-write-guard-sites.t (the winner)',
           re   => qr/\(t\/99 S1\/behavior13 exercises a fixture/ },
