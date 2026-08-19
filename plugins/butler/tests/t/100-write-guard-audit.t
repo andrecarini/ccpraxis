@@ -20,8 +20,24 @@ use warnings;
 use FindBin qw($Bin);
 use Test::More;
 
-my $REPORT_DIR = "$Bin/../../../../.ccpraxis-local-data/blueprints/"
-               . "butler-and-dashboard-overhaul/reports/a01-write-integrity-reread-under-lock";
+# A blueprint's package/report content lives under blueprints/<name>/ while the
+# blueprint is active, and is relocated to blueprints/_archive/<name>/ once the
+# blueprint is finished. This oracle must find its subject either way -- resolve
+# by checking both locations rather than hardcoding one, and fail loudly (never
+# silently skip) if the subject is in neither.
+my $BP_ROOT = "$Bin/../../../../.ccpraxis-local-data/blueprints";
+my $BP_NAME = 'butler-and-dashboard-overhaul';
+my $BP_REL  = 'reports/a01-write-integrity-reread-under-lock';
+my @BP_CANDIDATES = ("$BP_ROOT/$BP_NAME/$BP_REL", "$BP_ROOT/_archive/$BP_NAME/$BP_REL");
+my ($REPORT_DIR) = grep { -d $_ } @BP_CANDIDATES;
+
+unless (defined $REPORT_DIR) {
+    plan tests => 1;
+    fail("AC15/AC18: package report dir for '$BP_NAME' not found in either location -- looked at: "
+       . join(' | ', @BP_CANDIDATES));
+    done_testing();
+    exit 1;
+}
 
 sub slurp { my ($p) = @_; open my $fh, '<:raw', $p or return undef; local $/; my $c = <$fh>; close $fh; $c }
 

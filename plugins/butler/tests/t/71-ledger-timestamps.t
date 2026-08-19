@@ -28,9 +28,13 @@
 #   * %CLEAN_ENV strips every ambient BP_*.
 #   * The hook is invoked as `bash "$HOOK"`, never executed directly.
 #   * NO LIVE LEDGER IS EVER WRITTEN. Real corpus files (C7) are opened READ-ONLY.
-#   * Corpus enumeration is perl `glob` on explicit paths, never `grep -r`/ripgrep
+#   * Corpus enumeration is opendir-based directory walking on explicit paths,
+#     never perl's built-in `glob` (its argument splits on whitespace, unsafe on
+#     this machine's non-ASCII paths) and never `grep -r`/ripgrep
 #     (.ccpraxis-local-data/ is gitignored; a directory-scoped rg is a false clean).
-#   * TWO globs: active blueprints AND `_archive/*/packages/*.md`.
+#   * TWO trees walked: active blueprints AND `_archive/<name>/packages/*.md`. The
+#     `validate` op assertion is scoped to ACTIVE ledgers only (its required-section
+#     schema post-dates some archived ledgers -- see the C7 block below).
 #   * NO CORPUS SIZE IS PINNED (C7 asserts a LOWER BOUND only).
 #   * Output captured via temp files, never by reopening STDOUT onto an in-memory
 #     scalar (Git-for-Windows perl landmine; project CLAUDE.md).
@@ -213,6 +217,24 @@ sub pl_edit {
                                         replace_all => ($replace_all ? jtrue() : jfalse()) } });
 }
 
+# opendir-based directory enumeration (C7 corpus scan). Perl's built-in glob
+# splits its argument on whitespace, which is unsafe combined with this
+# machine's non-ASCII paths (e.g. C:\Users\André\...); opendir sidesteps both.
+sub _c7_list_dirs {
+    my ($d) = @_;
+    opendir(my $dh, $d) or return ();
+    my @e = grep { $_ ne '.' && $_ ne '..' } readdir $dh;
+    closedir $dh;
+    return @e;
+}
+sub _c7_list_md_in {
+    my ($d) = @_;
+    opendir(my $dh, $d) or return ();
+    my @e = grep { /\.md$/ } readdir $dh;
+    closedir $dh;
+    return map { "$d/$_" } @e;
+}
+
 sub count_occ {
     my ($hay, $needle) = @_;
     return 0 if !length $needle;
@@ -270,9 +292,22 @@ diag("jq available: " . ($have_jq ? "yes" : "no (hook-driving groups will SKIP)"
 # claim in §0, re-checked here rather than trusted).
 # =====================================================================================
 {
-    my @active  = glob("$BP_ROOT/blueprints/*/packages/*.md");
-    my @archive = glob("$BP_ROOT/blueprints/_archive/*/packages/*.md");
-    my @all     = (@active, @archive);
+    # Enumerated via opendir rather than perl's built-in glob: this machine's paths
+    # contain non-ASCII characters (e.g. C:\Users\André\...), and glob's argument
+    # splits on whitespace in ways that can misbehave on such paths; opendir avoids
+    # both hazards.
+    my @active;
+    for my $bp (_c7_list_dirs("$BP_ROOT/blueprints")) {
+        next if $bp eq '_archive';
+        my $pkgdir = "$BP_ROOT/blueprints/$bp/packages";
+        push @active, _c7_list_md_in($pkgdir) if -d $pkgdir;
+    }
+    my @archive;
+    for my $bp (_c7_list_dirs("$BP_ROOT/blueprints/_archive")) {
+        my $pkgdir = "$BP_ROOT/blueprints/_archive/$bp/packages";
+        push @archive, _c7_list_md_in($pkgdir) if -d $pkgdir;
+    }
+    my @all = (@active, @archive);
 
     cmp_ok(scalar(@active),  '>=', 1,  'C7 FIXTURE-SANITY: the active-blueprint glob is non-empty');
     cmp_ok(scalar(@all),     '>=', 10, 'C7: the real ledger corpus enumerates a NON-TRIVIAL number of files (lower bound only, never pinned)');
@@ -296,15 +331,23 @@ diag("jq available: " . ($have_jq ? "yes" : "no (hook-driving groups will SKIP)"
     is($future, 0, 'C7: NONE of the real ledgers are future-dated beyond the spec\'s own 300s allowance');
 
     # And: bp-ledger.pl's OWN `validate` op (unrelated to the new check) must not have
-    # regressed on the real corpus either.
+    # regressed on the real corpus -- but scoped to ACTIVE ledgers only. `validate`'s
+    # required-section schema post-dates some archived ledgers (an archived blueprint
+    # is an immutable historical record written before that schema existed, and is
+    # deliberately never rewritten to satisfy a schema that came later -- same ruling
+    # as for archived citations elsewhere in this initiative), so asserting archived
+    # ledgers satisfy today's schema would assert something that was never true of
+    # them. Active ledgers carry no such excuse: the schema genuinely applies there,
+    # and this assertion must not be weakened for them.
     SKIP: {
         skip 'bp-ledger.pl absent', 1 unless -e $SCRIPT;
         my $ok_all = 1;
-        for my $f (@all[0 .. (@all > 20 ? 19 : $#all)]) {   # a sample is enough; not a global re-scan
+        my @sample = @active[0 .. (@active > 20 ? 19 : $#active)];   # a sample is enough; not a global re-scan
+        for my $f (@sample) {
             my ($rc) = run_pl(['validate', '--ledger', $f]);
             $ok_all = 0 if $rc != 0;
         }
-        ok($ok_all, 'C7: `bp-ledger.pl validate --ledger <file>` still exits 0 on a sample of the real corpus');
+        ok($ok_all, 'C7: `bp-ledger.pl validate --ledger <file>` still exits 0 on a sample of the ACTIVE real corpus');
     }
 }
 
