@@ -147,6 +147,7 @@ sub atomic_overflow_spans {
         "$TUI_DIR/Frame.pm",
         "$TUI_DIR/Layout.pm",
         "$TUI_DIR/Screen.pm",
+        "$TUI_DIR/DashboardScreen.pm",
         "$Bin/75-wrap-on-overflow.t",
     );
     for my $f (@targets) {
@@ -541,11 +542,23 @@ sub _basename { my ($p) = @_; $p =~ s{.*[\\/]}{}; return $p; }
 }
 
 # ===========================================================================
-# S2.5/behavior 7 -- panel titles, banners and the footer never wrap: always
-# exactly one row each. Paired positive control: an ordinary body row under
-# otherwise-identical conditions DOES produce more than one cell once
-# wrap_line exists (checked above); this block only needs to show titles/
-# banners/footer stay singular even when their own text overflows.
+# S2.5/behavior 7 -- AMENDED by package d02-wrap-every-surface, Decision D1
+# (specs/d02-wrap-every-surface-spec.md, Section 0). Panel titles and the
+# footer still never wrap: always exactly one row each, by design -- they are
+# structurally one-row surfaces via compose()'s own $rows==1/$rows==2
+# short-circuits, and are already pre-narrowed upstream (header_spans,
+# _footer_legend) before reaching make_cell. BANNERS NOW WRAP, deliberately
+# (D1): a banner longer than the terminal used to be silently cut (losing,
+# concretely, the "[d] dismiss" hint appended to install_warning); it now
+# spreads across multiple rows via tui::Frame::wrap_line, row-budgeted by
+# Screen.pm's compose() (Decision D2). The single assertion this superseded
+# ("the overflowing banner occupies exactly one row") is replaced below by a
+# multi-row assertion plus full-content reconstruction, proving the banner
+# text wrapped rather than being cut into pieces. Paired positive control,
+# unchanged: an ordinary body row under otherwise-identical conditions DOES
+# produce more than one cell once wrap_line exists (checked above); this
+# block still shows title/footer stay singular even when their own text
+# overflows.
 # ===========================================================================
 {
     my $cols = 12;
@@ -563,13 +576,28 @@ sub _basename { my ($p) = @_; $p =~ s{.*[\\/]}{}; return $p; }
     is(scalar(@$f), $rows, 'exclusion: compose still returns exactly $rows cells with overflowing chrome text');
     cmp_ok(tui::Layout::display_width(plain($f->[0])), '<=', $cols,
         'exclusion: the (single) title cell never exceeds the column width even though the title text overflows -- it was cut, not wrapped into a second row');
-    # Exactly one of the emitted rows carries the banner text fragment (never
-    # two, which would indicate the banner was wrapped). The match prefix is
-    # deliberately shorter than $cols so it survives TRUNCATION and is not
-    # itself the reason for a miss (a longer prefix would never match either
-    # way at this column width, which would be a fixture bug, not a finding).
-    my @banner_rows = grep { plain($_) =~ /a banner/ } @$f;
-    is(scalar(@banner_rows), 1, 'exclusion: the overflowing banner occupies exactly one row, not wrapped into more');
+    # SUPERSEDED (d02-wrap-every-surface, Decision D1/Section 0 AC-0): the
+    # banner now wraps. Selected here by CELL ROLE, not the text-substring
+    # grep the original assertion used -- verified directly against
+    # tui::Frame::wrap_line's real output for this exact fixture
+    # ($long_banner, cols=12, indent=2) that the literal substring "a banner"
+    # survives on only the FIRST wrapped row (the word "banner" is not
+    # split), so a substring grep cannot detect "more than one row" here even
+    # once wrapping is implemented correctly -- it would always find exactly
+    # one match, for the wrong reason (a selector miss, not a behavior miss).
+    # Screen.pm's compose() gives every banner row a stable, distinct role
+    # (here the default 'state.warn', Screen.pm's _ROLE_ATTENTION()), which
+    # is what actually identifies "a row that belongs to this banner" without
+    # depending on where wrap_line happened to break the words.
+    my @banner_rows = grep { defined($_->{role}) && $_->{role} eq 'state.warn' } @$f;
+    cmp_ok(scalar(@banner_rows), '>', 1,
+        'exclusion (superseded by d02 Decision D1): the overflowing banner now occupies MORE than one row -- it wraps rather than being cut');
+    my @banner_plain = map { plain($_) } @banner_rows;
+    my @banner_words = reconstruct(\@banner_plain, tui::Screen::WRAP_CONTINUATION_INDENT());
+    my @expect_words  = words($long_banner);
+    is_deeply(\@banner_words, \@expect_words,
+        'exclusion (superseded by d02 Decision D1): reconstructing the wrapped banner rows recovers the FULL original banner text, in order, none dropped or duplicated -- proving it wrapped rather than being cut into pieces')
+        or diag("  got: [" . join(',', @banner_words) . "]\n  want: [" . join(',', @expect_words) . "]");
     my @footer_rows = grep { plain($_) =~ /a footer/ } @$f;
     is(scalar(@footer_rows), 1, 'exclusion: the overflowing footer occupies exactly one row, not wrapped into more');
 }

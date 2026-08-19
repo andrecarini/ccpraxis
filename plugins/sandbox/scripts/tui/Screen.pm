@@ -263,9 +263,11 @@ sub _place_and_render {
 
 # compose(\%screen, $rows, $cols) -> \@cells, exactly $rows cells. The
 # degradation ladder: title only at $rows==1; title+footer at $rows==2;
-# otherwise banners (dropped from the end of the list first, leaving at
-# least one body row), then panels via tui::Layout::place, then the body
-# padded with blank cells to exactly fill the remaining height. PUBLIC.
+# otherwise banners (wrapped and row-budgeted -- see the banner block below
+# and Decision D2 in specs/d02-wrap-every-surface-spec.md -- dropped from the
+# TAIL of the wrapped-row sequence first, leaving at least one body row),
+# then panels via tui::Layout::place, then the body padded with blank cells
+# to exactly fill the remaining height. PUBLIC.
 sub compose {
     my ($screen, $rows, $cols) = @_;
     $screen = {} if ref($screen) ne 'HASH';
@@ -280,20 +282,45 @@ sub compose {
     my $banner_role = defined($screen->{banner_role}) ? $screen->{banner_role} : _ROLE_ATTENTION();
     my $footer_role = defined($screen->{footer_role}) ? $screen->{footer_role} : 'text.faint';
 
+    # Deliberately truncating, one-row surface -- see Decision D1 in
+    # specs/d02-wrap-every-surface-spec.md; do not swap to wrap_line without
+    # re-deriving the $rows==1 short-circuit below (it returns a literal
+    # 1-element array with no "how many rows did this produce" logic).
     my $title_cell = tui::Frame::make_cell($screen->{title}, $title_role, $cols);
     return [ $title_cell ] if $rows == 1;
 
+    # Deliberately truncating, one-row surface -- see Decision D1 in
+    # specs/d02-wrap-every-surface-spec.md; do not swap to wrap_line without
+    # re-deriving the $rows==2 short-circuit below.
     my $footer_cell = tui::Frame::make_cell($screen->{footer}, $footer_role, $cols);
     return [ $title_cell, $footer_cell ] if $rows == 2;
 
     my $body_height = $rows - 2;
 
+    # Banners wrap (Decision D2, specs/d02-wrap-every-surface-spec.md,
+    # bug report 20260814-093052-312a): a wrapped banner emits MORE than one
+    # row, so the row budget below is spent in ROWS, not in banner messages
+    # -- the message-counting version of this block silently overflowed the
+    # frame once a single long banner wrapped. Mirrors the actual-rendered-
+    # height pattern _place_and_render already uses above ($h = @$r, not an
+    # assumed 1). Ordering: banners are consumed in array order; each is
+    # wrapped in FULL, then only the leading rows that fit the remaining
+    # budget are kept, dropping that banner's own tail rows first -- never
+    # an earlier banner's rows, never a later banner's leading rows. Once
+    # the budget hits 0, no further banner is considered at all.
     my @banners = (ref($screen->{banners}) eq 'ARRAY') ? @{ $screen->{banners} } : ();
-    my $max_banners = $body_height - 1;
-    $max_banners = 0 if $max_banners < 0;
-    @banners = @banners[ 0 .. $max_banners - 1 ] if @banners > $max_banners;
-    my @banner_cells = map { tui::Frame::make_cell($_, $banner_role, $cols) } @banners;
-    $body_height -= scalar(@banner_cells);
+    my $max_banner_rows = $body_height - 1;   # reserve >=1 row for the body, same reservation as today
+    $max_banner_rows = 0 if $max_banner_rows < 0;
+
+    my @banner_cells;
+    for my $msg (@banners) {
+        last if @banner_cells >= $max_banner_rows;
+        my $budget = $max_banner_rows - @banner_cells;
+        my $wrapped = tui::Frame::wrap_line($msg, $banner_role, $cols, WRAP_CONTINUATION_INDENT());
+        $wrapped = [ @$wrapped[ 0 .. $budget - 1 ] ] if @$wrapped > $budget;
+        push @banner_cells, @$wrapped;
+    }
+    $body_height -= scalar(@banner_cells);   # counts ACTUAL rows, fixes the message-count bug
 
     my @panels = (ref($screen->{panels}) eq 'ARRAY') ? @{ $screen->{panels} } : ();
     my @body_cells = _place_and_render(\@panels, $cols, $body_height);

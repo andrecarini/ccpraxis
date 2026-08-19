@@ -384,6 +384,11 @@ sub _oauth_like_role {
 # header_spans(\%state, $cols) -- today's _title_line, unchanged in content
 # (spec S2.4.9): "ccpraxis sandbox - <project>" left, "<container>
 # [<spinner> <status>]" right-justified.
+#
+# This is the pre-narrowing strategy for the non-wrapping title surface
+# (Decision D1, specs/d02-wrap-every-surface-spec.md): content is clipped to
+# $cols here, before tui::Screen::compose's $rows==1 short-circuit ever
+# hands it to make_cell, by design -- not a gap.
 # ===========================================================================
 sub header_spans {
     my ($state, $cols) = @_;
@@ -1000,6 +1005,12 @@ sub panels {
 # Footer legend / confirm prompts / alert banners -- ported from the legacy
 # Dashboard footer_legend/confirm_prompt/_footer_line/_status_alert/
 # lifecycle_alert_msg (Theme roles; no Dashboard reference, AC-P4).
+#
+# _footer_legend/_confirm_prompt are the pre-narrowing strategy for the
+# non-wrapping footer surface (Decision D1, specs/d02-wrap-every-surface-
+# spec.md): they pick the widest tier of a discrete fallback ladder that
+# still fits $cols, before tui::Screen::compose's $rows==2 short-circuit
+# hands the result to make_cell, by design -- not a gap.
 # ===========================================================================
 sub _footer_legend {
     my ($cols) = @_;
@@ -1122,6 +1133,12 @@ sub _lifecycle_alert_msg {
 # re-verifying every AC4 exact-string assertion in the oracle for a cosmetic
 # gain. Revisit only if a future package needs _banner_lines to be
 # pending-aware for an unrelated reason.
+# Banners now wrap at the tui::Screen layer (Decision D1/D2, specs/d02-wrap-
+# every-surface-spec.md), the same division of labor as panel bodies:
+# DashboardScreen composes content, Screen.pm owns width. This function
+# deliberately does NOT gain a $cols parameter -- unlike header_spans/
+# panels/_footer_text, which each pre-narrow for a non-wrapping surface,
+# banner content is handed through as-is and left to tui::Frame::wrap_line.
 sub _banner_lines {
     my ($state) = @_;
     $state = {} unless ref($state) eq 'HASH';

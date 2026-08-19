@@ -339,14 +339,32 @@ my %st = (
     my %dead = (%st, status => 'exited');
     my $f = Dashboard::compose_frame(\%dead, 12, 80);
     my @a = grep { $_->{role} eq $ALERT_ROLE } @$f;
-    is(scalar(@a), 1, "compose: non-running status -> one alert row (role: $ALERT_ROLE)");
+    # AMENDED by package d02-wrap-every-surface, Decision D1
+    # (specs/d02-wrap-every-surface-spec.md, Section 0): banners now wrap
+    # instead of truncate, so at cols=80 this status banner ("container is
+    # exited ... re-run claude-sandbox") spans 2 rows -- "one row per alert"
+    # is no longer a valid proxy for "how many alerts are present". The
+    # original intent -- exactly one alert (the status alert) is showing --
+    # is preserved by counting banner-START rows instead of raw alert rows:
+    # Dashboard::_alert_line prefixes only the FIRST row of a banner with the
+    # literal "!! " marker; wrap_line's continuation rows never carry it.
+    # Counting "!! "-prefixed rows is therefore a width-invariant banner
+    # count (driver-verified against tui::Screen::compose directly).
+    my @a_starts = grep { $_->{text} =~ /!! / } @a;
+    is(scalar(@a_starts), 1, "compose: non-running status -> one alert banner (role: $ALERT_ROLE)");
     like($f->[1]{text}, qr/not running/, 'compose: status alert sits under the title');
     is(scalar(@$f), 12, 'compose: status alert keeps the frame exactly $rows');
 
     # a status alert AND an install_warning coexist as two banners, body intact
     my %both = (%st, status => 'exited', install_warning => 'backpack install FAILED');
     my $f2 = Dashboard::compose_frame(\%both, 12, 80);
-    is(scalar(grep { $_->{role} eq $ALERT_ROLE } @$f2), 2, 'compose: status + install alerts coexist');
+    my @a2 = grep { $_->{role} eq $ALERT_ROLE } @$f2;
+    # AMENDED by package d02-wrap-every-surface, Decision D1 -- same reasoning
+    # as immediately above: at cols=80 these two banners together occupy 3
+    # rows (the status banner wraps to 2, the install banner fits in 1), so
+    # raw row count no longer says "two alerts". Count banner-start rows.
+    my @a2_starts = grep { $_->{text} =~ /!! / } @a2;
+    is(scalar(@a2_starts), 2, 'compose: status + install alerts coexist as two banners');
     is(scalar(@$f2), 12, 'compose: two alerts keep the frame exactly $rows');
     # s06-panel-semantics: the container-status line now carries a status
     # glyph, a multi-byte UTF-8 sequence but exactly 2 DISPLAY columns -- the

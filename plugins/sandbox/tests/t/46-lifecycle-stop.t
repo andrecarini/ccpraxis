@@ -988,7 +988,23 @@ sub drive2 {
         my %st2 = (%st, status => 'exited');
         my $f3 = Dashboard::compose_frame(\%st2, $rows, $cols);
         my @alerts = grep { $_->{role} eq 'state.crit' } @$f3;
-        is(scalar(@alerts), 2, "AC-20: lifecycle + status alerts coexist as two rows at cols=$cols");
+        # AMENDED by package d02-wrap-every-surface, Decision D1
+        # (specs/d02-wrap-every-surface-spec.md, Section 0): banners now wrap
+        # instead of truncate, so "one row per banner" stopped being a valid
+        # proxy for "how many banners are present" -- at cols=40 these two
+        # banners occupy 5 rows, at cols=80 they occupy 3 (driver-verified
+        # against tui::Screen::compose directly: total frame rows stayed
+        # exactly $rows in every case, so nothing is lost, it is just spread
+        # across more rows). The intent of the original assertion -- "the
+        # lifecycle alert and the status alert both surface, distinct from
+        # one another" -- is preserved by counting banner-START rows instead
+        # of raw rows: Dashboard::_alert_line prefixes only the FIRST row of
+        # a banner with the literal "!! " marker (wrap_line's continuation
+        # rows carry the continuation indent but never that marker), so
+        # counting rows matching /!! / is a width-invariant banner count.
+        my @banner_starts = grep { $_->{text} =~ /!! / } @alerts;
+        is(scalar(@banner_starts), 2,
+            "AC-20: lifecycle + status alerts coexist as two banners (banner-start rows, not raw rows) at cols=$cols");
         # Ordering is asserted with a WIDTH-SAFE discriminator. The pinned message
         # (spec S2.6) is "full shutdown 3/4: stop container - running" = 42 cols, and
         # _alert_line prefixes "  !! " (5) for 47 -- so at cols=40 clip_pad MUST
