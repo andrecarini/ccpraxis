@@ -259,8 +259,11 @@ if [ "$TOOL" = "Bash" ] && [ -n "$DATA" ]; then
     RSID=$(bp_json_get "$PAYLOAD" session_id 2>/dev/null || true)
     case "$RSID" in ''|*/*|*\**|.|..|*..*) RSID="" ;; esac
     if [ -n "$RSID" ]; then
-      RDIR="${CCPRAXIS_REPORTER_ACTIVE_DIR:-${HOME:-$PWD}/.claude/ccpraxis/.reporter-active}"
-      mkdir -p "$RDIR" 2>/dev/null && printf '%s\n' "$DATA" > "$RDIR/$RSID" 2>/dev/null || true
+      if RDIR=$(bp_reporter_active_dir 2>/dev/null); then
+        mkdir -p "$RDIR" 2>/dev/null && printf '%s\n' "$DATA" > "$RDIR/$RSID" 2>/dev/null || true
+      else
+        echo "butler reporter-registration: registry path unresolved (HOME and USERPROFILE both unset) -- reporter marker NOT written for session $RSID" >&2
+      fi
     fi
   fi
 fi
@@ -371,6 +374,8 @@ if [ -n "$DATA" ] && [ -d "$DATA/.drive-solo" ]; then
       if MARK=$(bp_drive_marker "$SID" 2>/dev/null); then
         mkdir -p "$(dirname "$MARK")" 2>/dev/null \
           && printf '%s\n' "$DATA" > "$MARK" 2>/dev/null || true
+      elif ! bp_drive_active_dir >/dev/null 2>&1; then
+        echo "butler drive-solo-arm: registry path unresolved (HOME and USERPROFILE both unset) -- driver marker NOT written for session $SID" >&2
       fi
     fi
   fi

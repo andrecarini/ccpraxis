@@ -59,11 +59,16 @@ MAX_BLOCKS=3          # never nag more than this many times in a row
 # driver side, and the check below is the same shape for the reporter's
 # $RDIR. Both run before PAYLOAD/stdin is touched at all, so the overwhelming
 # common case (nothing driving, no reporter ever registered) costs a few
-# stats and zero forks -- the invariant this file's own header already
-# claims for the driver branch, restored here for the reporter branch too.
-RDIR="${CCPRAXIS_REPORTER_ACTIVE_DIR:-${HOME:-$PWD}/.claude/ccpraxis/.reporter-active}"
+# stats and ONE fork here (d04-registry-path-one-rule: $RDIR now resolves via
+# bp_reporter_active_dir, a command substitution, rather than the old inline
+# HOME-or-cwd expression -- no longer literally zero forks; a registry keyed
+# on the current directory is not a registry, so the guess this replaced had
+# to go. bp_drive_any_active immediately below already forks once via
+# bp_drive_active_dir, so the total per-Stop fork count in the common case
+# goes from 1 to 2, not from 0 to 1. Accepted, not eliminated -- see the
+# package spec §5).
 REPORTER_MAYBE=0
-if [ -d "$RDIR" ]; then
+if RDIR=$(bp_reporter_active_dir 2>/dev/null) && [ -d "$RDIR" ]; then
   set -- "$RDIR"/*
   [ -e "${1:-}" ] && REPORTER_MAYBE=1
 fi
@@ -93,8 +98,7 @@ PAYLOAD=$(cat 2>/dev/null || true)
 #   * touch <data>/.reporter-stop-ok        — one-shot; consumed on use
 #   * export CCPRAXIS_REPORTER_STOP_OK=1    — session-wide
 [ "${CCPRAXIS_REPORTER_STOP_OK:-}" = "1" ] || {
-  RDIR="${CCPRAXIS_REPORTER_ACTIVE_DIR:-${HOME:-$PWD}/.claude/ccpraxis/.reporter-active}"
-  if [ -d "$RDIR" ]; then
+  if RDIR=$(bp_reporter_active_dir 2>/dev/null) && [ -d "$RDIR" ]; then
     RSID=$(bp_json_get "$PAYLOAD" session_id 2>/dev/null || true)
     RMARK=""
     case "$RSID" in

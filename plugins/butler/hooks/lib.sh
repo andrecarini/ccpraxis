@@ -361,6 +361,25 @@ bp_find_data_dir() {
   return 1
 }
 
+# bp_registry_root -> echoes the base path every machine-level registry
+# (drive-solo, reporter, continuity) resolves under: override, else $HOME,
+# else $USERPROFILE, else UNRESOLVABLE (rc 1, nothing on stdout). $PWD is
+# never a fallback here — a registry keyed on the current directory is not a
+# registry, because a hook's cwd is not stable across a session (separate
+# process spawns; a driver may `cd` mid-run). This is the ONLY place this
+# order is spelled out; every registry-specific resolver below (and
+# bp_continuity_active_dir) calls this rather than restating it.
+# d04-registry-path-one-rule: extracted verbatim from
+# bp_continuity_active_dir's own inline HOME/USERPROFILE fallback (g01),
+# not reinvented.
+bp_registry_root() {
+  local base="${HOME:-}"
+  [ -n "$base" ] || base="${USERPROFILE:-}"
+  [ -n "$base" ] || return 1
+  printf '%s' "$base"
+  return 0
+}
+
 # bp_drive_active_dir -> echoes the machine-level registry of ACTIVE drive-solo
 # driver sessions. One file per session, named by session_id.
 #
@@ -372,12 +391,35 @@ bp_find_data_dir() {
 # not the driver at all: a second terminal in the same project inherited the
 # gate. The registry answers the question actually being asked — "is THIS
 # session driving?" — and answers it in one stat().
+#
+# d04-registry-path-one-rule: dropped the old inline HOME-or-cwd fallback in
+# favor of bp_registry_root (override -> HOME -> USERPROFILE -> rc 1, no
+# current-directory guess).
 bp_drive_active_dir() {
   if [ -n "${CCPRAXIS_DRIVE_ACTIVE_DIR:-}" ]; then
     printf '%s' "$CCPRAXIS_DRIVE_ACTIVE_DIR"
     return 0
   fi
-  printf '%s' "${HOME:-$PWD}/.claude/ccpraxis/.drive-solo-active"
+  local base
+  base=$(bp_registry_root) || return 1
+  printf '%s' "$base/.claude/ccpraxis/.drive-solo-active"
+  return 0
+}
+
+# bp_reporter_active_dir -> echoes the machine-level registry of ACTIVE
+# reporter sessions. Mirrors bp_drive_active_dir exactly; own override var.
+# d04-registry-path-one-rule: NEW -- the reporter registry previously had no
+# shared resolver at all, just three literal inline HOME-or-cwd copies
+# (mark-wakeup.sh's write site, gate-drive-loop.sh's two read sites).
+bp_reporter_active_dir() {
+  if [ -n "${CCPRAXIS_REPORTER_ACTIVE_DIR:-}" ]; then
+    printf '%s' "$CCPRAXIS_REPORTER_ACTIVE_DIR"
+    return 0
+  fi
+  local base
+  base=$(bp_registry_root) || return 1
+  printf '%s' "$base/.claude/ccpraxis/.reporter-active"
+  return 0
 }
 
 # bp_drive_any_active -> rc 0 if ANY driver session is registered.
@@ -412,7 +454,7 @@ bp_drive_ttl_hours() {
 # CONCURRENT driver — single digits in the worst realistic case.
 bp_drive_any_active() {
   local dir now ttl mt f live=1
-  dir=$(bp_drive_active_dir)
+  dir=$(bp_drive_active_dir) || return 1
   [ -d "$dir" ] || return 1
 
   now=$(date +%s 2>/dev/null || echo 0)
@@ -453,7 +495,7 @@ bp_drive_marker() {
   case "$sid" in
     */*|*\*|.|..|*..*) return 1 ;;
   esac
-  dir=$(bp_drive_active_dir)
+  dir=$(bp_drive_active_dir) || return 1
   printf '%s/%s' "$dir" "$sid"
   return 0
 }
@@ -500,9 +542,8 @@ bp_continuity_active_dir() {
     printf '%s' "$CCPRAXIS_CONTINUITY_ACTIVE_DIR"
     return 0
   fi
-  local base="${HOME:-}"
-  [ -n "$base" ] || base="${USERPROFILE:-}"
-  [ -n "$base" ] || return 1
+  local base
+  base=$(bp_registry_root) || return 1
   printf '%s' "$base/.claude/ccpraxis/.continuity-active"
   return 0
 }
