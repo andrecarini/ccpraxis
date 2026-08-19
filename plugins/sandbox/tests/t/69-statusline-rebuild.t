@@ -349,8 +349,22 @@ ok(length($SRC_BP) > 0, 'setup: bp-statusline.pl was read as raw source bytes');
         is($path_vis, $cwd,
             "AC-O1 ($label): the LAST row is the working directory, complete and alone");
 
-        is($i_marker, 0,
-            "AC-O2 ($label): the marker sits at offset 0 -- nothing is rendered to its left");
+        # t06 AMENDMENT (blueprint Decision 8, package t06-statusline-marker,
+        # 2026-08-19): blueprint Decision 3 (locked) puts a leading, non-emoji
+        # glyph before the marker word -- filled U+25CF on HOST, hollow U+25CB
+        # on SANDBOX -- so the marker WORD can no longer sit at byte offset 0;
+        # the glyph does. AC-O2's INTENT ("the marker leads the row -- nothing
+        # unexpected is rendered to its left") is preserved, not weakened: it
+        # is re-expressed as two exact `is()` checks instead of one, and still
+        # fails if the marker is absent (index -1), pushed further right than
+        # glyph+space, or if anything OTHER than the declared Decision-3 glyph
+        # followed by exactly one space occupies the lead.
+        my %T06_GLYPH_CP = (sandbox => 0x25CB, host => 0x25CF);
+        my $t06_prefix = encode('UTF-8', chr($T06_GLYPH_CP{$label})) . ' ';
+        is(substr($vis, 0, length($t06_prefix)), $t06_prefix,
+            "AC-O2 ($label): row 1 leads with the Decision-3 glyph, immediately followed by exactly one space, and nothing else");
+        is($i_marker, length($t06_prefix),
+            "AC-O2 ($label): the marker word begins immediately after the leading glyph+space -- nothing else is rendered to its left");
 
         my $badge = encode('UTF-8', chr(0x1F4E6));
         ok(index($line, $badge) < 0,
@@ -1117,8 +1131,18 @@ sub glyph_cols_disagreements {
         ok($cost <= 8, "AC-B6 (cols=8): the surviving row costs $cost, within the 8-column budget")
             or diag('  first line = [' . strip_sgr($line) . ']');
         my $vis = strip_sgr($line);
-        ok(length($vis) && index('SANDBOX', substr($vis, 0, 1)) == 0,
-            'AC-B6 (cols=8): whatever survives begins with the head of the declared sandbox marker')
+        # t06 AMENDMENT (blueprint Decision 8, package t06-statusline-marker,
+        # 2026-08-19): with a leading Decision-3 glyph now the first character
+        # of the marker field, the pre-Decision-3 pin ("first surviving
+        # character is the head of the literal word SANDBOX") is superseded --
+        # the first surviving character is the sandbox glyph itself. The
+        # INTENT ("what survives at cols=8 belongs to the marker, not
+        # something else") is preserved: this still fails if the marker
+        # vanishes entirely, or if anything other than the declared
+        # Decision-3 sandbox glyph (hollow circle, U+25CB) survives first.
+        my $t06_sandbox_glyph = encode('UTF-8', chr(0x25CB));
+        ok(length($vis) && substr($vis, 0, length($t06_sandbox_glyph)) eq $t06_sandbox_glyph,
+            'AC-B6 (cols=8): whatever survives begins with the declared sandbox glyph (Decision 3), which now leads the marker field')
             or diag("  first line = [$vis]");
     }
 }

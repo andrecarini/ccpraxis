@@ -366,14 +366,36 @@ for my $name (sort keys %MARKER) {
     my $w = row_cost($MARKER{$name});
     $MARKER_SLOT = $w if $w > $MARKER_SLOT;
 }
-my $marker = $MARKER{ $SANDBOX_ON ? 'sandbox' : 'host' };
-$marker .= ' ' while row_cost($marker) < $MARKER_SLOT;
+
+# Decision 3 (locked, blueprint tui-operator-feedback): a coloured, non-emoji
+# glyph precedes the marker word so HOST and SANDBOX are tellable apart even
+# without reading the word -- filled/attention on HOST (dev tooling can do
+# real damage there), hollow/dim on SANDBOX (the safe default). The hollow-
+# versus-filled shape is the load-bearing signal; colour only reinforces it,
+# so it must survive an SGR strip. Deliberately NOT added to %GLYPH_COLS --
+# see that table's own header and t06's spec for why the byte-length-
+# dominant fallback already budgets both codepoints conservatively.
+my %GLYPH       = ( sandbox => "\x{25CB}", host => "\x{25CF}" );  # hollow, filled
+my %GLYPH_COLOR = ( sandbox => $FAINT,     host => $WARN     );   # role text.faint / state.warn
+
+my $env    = $SANDBOX_ON ? 'sandbox' : 'host';
+my $word   = $MARKER{$env};
+$word     .= ' ' while row_cost($word) < $MARKER_SLOT;   # unchanged padding, word only
+my $marker = "$GLYPH_COLOR{$env}$GLYPH{$env}${R}${MUTED} ${word}";
 
 # ── Continuity badge (g01-explicit-continuity-arming) ────────
 # Per-session, keyed by the documented top-level `session_id` field of the
-# stdin JSON (spec SS2.6/AC-7). A second, INDEPENDENT, always-reserved-width
-# badge, concatenated onto the same $marker field that survives every
-# fallback rung down to row1($f_marker, '', '', '', '').
+# stdin JSON (spec SS2.6/AC-7). t06 (blueprint tui-operator-feedback) moved
+# this OFF row 1/the $marker field entirely and onto its own row, emitted
+# only when armed -- zero rows and zero bytes when it is not. This is safe
+# against row-1 reflow precisely BECAUSE it no longer touches row 1 at all:
+# armed and unarmed runs at the same $cols now produce a byte-identical row
+# 1 (see 151-continuity-statusline-badge.t's F1), so the old reservation
+# inside the marker field is no longer needed to protect that invariant.
+# What varies instead is the total row COUNT (one extra row, only when
+# armed) -- already an existing, accepted kind of movement: row count
+# already varies today based on whether plan_full fits on line 2's own line
+# and whether cwd is non-empty.
 #
 # Path resolution is duplicated from lib.sh's bp_continuity_active_dir and
 # bp-continuity.pl's own continuity_active_dir, ON PURPOSE -- this file stays
@@ -402,9 +424,7 @@ if (!defined $continuity_dir || !length $continuity_dir) {
 }
 my $armed = (defined $continuity_dir && length $sid && -f "$continuity_dir/$sid") ? 1 : 0;
 
-my $BADGE_SLOT = row_cost('WATCHED');
-my $badge = $armed ? "${OK}WATCHED${R}" : (' ' x $BADGE_SLOT);
-$marker .= ' ' . $badge;
+my $badge_row = $armed ? "${OK}WATCHED${R}" : '';
 
 # ── Git (with background fetch every 30 min) ────────────────
 my $git_str = '';
@@ -778,6 +798,7 @@ if ($plan_full) {
 } else {
     push @rows, $line1, $line2;
 }
+push @rows, $badge_row if length $badge_row;   # own row, before the path row, never after
 my $path_row = path_row($cwd);
 push @rows, $path_row if length $path_row;
 print join("\n", @rows);
