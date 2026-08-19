@@ -14,7 +14,7 @@
 # fake backend's env-log will show no TMPDIR line, or an inherited/unset one,
 # never the fresh per-dispatch directory the spec requires.
 #
-# HARNESS RULES (mirrors t/79-worker-backend-dispatcher.t's scaffolding
+# HARNESS RULES (mirrors t/155-worker-backend-dispatcher.t's scaffolding
 # closely -- same fake backend idiom, same %CLEAN_ENV isolation, same
 # `timeout` safety net, same file-based capture never re-opening
 # STDOUT/STDERR onto an in-memory scalar):
@@ -81,7 +81,7 @@ chmod 0755, $FAKE_OPENCODE or die "chmod $FAKE_OPENCODE: $!";
 my $PATH_WITH_FAKE = "$FAKEBIN:$REAL_PATH";
 
 # =====================================================================================
-# Scaffolding: BP_DIR fixture (mirrors t/79's mk_bp/add_pkg/env_for shape).
+# Scaffolding: BP_DIR fixture (mirrors t/155's mk_bp/add_pkg/env_for shape).
 # =====================================================================================
 sub mk_bp {
     my $n = ++$fxn;

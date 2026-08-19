@@ -680,7 +680,7 @@ if ($backend_rc != 0) {
     }
     my $tsline = strftime('%Y-%m-%dT%H:%M:%SZ', gmtime);
     # NOTE: spec §2.9 describes this as "UTF-8 bytes C2 B7", but the oracle
-    # (79-worker-backend-dispatcher.t A15a/A15b) reads the ledger file with no
+    # (155-worker-backend-dispatcher.t A15a/A15b) reads the ledger file with no
     # utf8 decode layer and matches against a Perl `\x{00b7}` pattern, which
     # (absent `use utf8`) only matches a single raw byte 0xB7 — NOT the two-byte
     # C2 B7 UTF-8 encoding. Emitting the literal single byte is what makes the

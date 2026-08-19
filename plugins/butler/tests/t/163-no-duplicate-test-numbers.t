@@ -153,6 +153,22 @@ for my $p (@pairs) {
     my %exempt_files = (
         'plugins/butler/tests/t/148-registry-runtime-only.t' => 1,
         'plugins/butler/tests/t/67-wait-shape-guard.t'        => 1,
+        # THIS FILE, added 2026-08-19 by driver adjudication. The scan below
+        # greps every tracked file for each loser's OLD basename -- and this
+        # oracle's own @pairs table must NAME those basenames in order to
+        # search for them. So it found itself, nine times, and reported its own
+        # data as nine surviving citations. Tautological, not a real hit: the
+        # failure message even named the culprit ("found in:
+        # plugins/butler/tests/t/163-no-duplicate-test-numbers.t").
+        #
+        # Exempting the whole file is the right scope rather than a narrower
+        # line-level skip: every occurrence of an old basename in here is by
+        # construction part of the search definition, so there is no class of
+        # genuine stale citation inside this file that the exemption could
+        # hide. The implementer hit this, flagged it as a suspected wrong test,
+        # and did NOT edit the immutable oracle -- which is why it is corrected
+        # here rather than worked around there.
+        'plugins/butler/tests/t/163-no-duplicate-test-numbers.t' => 1,
     );
 
     for my $p (@pairs) {

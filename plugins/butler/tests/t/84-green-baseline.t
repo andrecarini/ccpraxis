@@ -35,7 +35,7 @@
 # C1/C2 test those directly with synthetic commit lists -- no real ledger directory format is
 # invented for that purpose.
 #
-# HARNESS RULES (mirroring 80-worker-jail-isolation.t):
+# HARNESS RULES (mirroring 156-worker-jail-isolation.t):
 #   * %CLEAN_ENV strips every ambient BP_* var; this package reads BP_GREEN_BASELINE,
 #     BP_BASELINE_TREE, BP_PROJECT_ROOT, BP_WRITE_SET and an inherited value would make the oracle
 #     lie about the default-off behaviour under test in C10.

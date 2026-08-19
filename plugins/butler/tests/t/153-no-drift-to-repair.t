@@ -26,7 +26,7 @@
 #
 # Fixture/capture conventions are lifted verbatim from
 # plugins/butler/tests/t/97-lifecycle-reconcile.t and
-# plugins/butler/tests/t/101-lifecycle-derived.t: real blueprint directories
+# plugins/butler/tests/t/161-lifecycle-derived.t: real blueprint directories
 # on disk, the real scripts run via system(), capture through a REAL temp
 # file (never an in-memory scalar reopen of STDOUT -- "Bad file descriptor"
 # on Git-for-Windows perl, project CLAUDE.md). Blueprint metadata is a FENCED
@@ -54,7 +54,7 @@ ok(-f $LIFECYCLE, 'bp-lifecycle.pl exists') or BAIL_OUT('nothing to test');
 ok(-f $STATUS_SH, 'bp-status.sh exists')    or BAIL_OUT('nothing to test');
 
 # --------------------------------------------------------------- fixtures ---
-# Copied verbatim (shape) from t/97-lifecycle-reconcile.t / t/101-lifecycle-
+# Copied verbatim (shape) from t/97-lifecycle-reconcile.t / t/161-lifecycle-
 # derived.t so all three files build the same real-world fixture shapes.
 
 sub write_file {

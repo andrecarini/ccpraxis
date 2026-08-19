@@ -25,7 +25,7 @@
 #        transition is logged via BpLog::event(--log, 'worker_model_rung', {role, model, rung,
 #        reason}) -- bp-log.pl is `require`d, never reimplemented (spec §5, mandated_means).
 #
-# HARNESS RULES (mirroring t/79, t/81):
+# HARNESS RULES (mirroring t/155, t/157):
 #   * %CLEAN_ENV strips every ambient BP_*/PATH-adjacent var this suite controls explicitly.
 #   * All fixtures live under File::Temp. Nothing is written into the live blueprint dir or a real
 #     ledger.
@@ -139,7 +139,7 @@ sub run_models {
     return ($rc, defined $out ? $out : '', $err);
 }
 
-# A configurable fake backend, mirroring t/81's FAKE_OPENCODE design. Driven entirely by env vars
+# A configurable fake backend, mirroring t/157's FAKE_OPENCODE design. Driven entirely by env vars
 # so one script serves every ladder scenario. NEVER the real opencode CLI.
 my $FAKEBIN = "$TEST_BASE/fakebin";
 make_path($FAKEBIN);

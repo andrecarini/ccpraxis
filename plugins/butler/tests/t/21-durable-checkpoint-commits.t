@@ -9,7 +9,7 @@
 #   * orchestrator-protocol/SKILL.md — the documented discipline (§2.13)
 #
 # Style follows t/20-deps-check.t (init_git / git_commit_all fixtures), t/08 + t/11
-# (mk_bp + a real BpOrch::run driven by a fake clock) and t/20-orchestrator-broken-
+# (mk_bp + a real BpOrch::run driven by a fake clock) and t/154-orchestrator-broken-
 # env-turns.t (sc()/hv() call guards). Every call that may not exist yet is funnelled
 # through a guard so a missing sub is ONE failing assertion, never an aborted file.
 #
@@ -70,7 +70,7 @@ use Config ();
 my $PERL = $Config::Config{perlpath};
 
 # ---------------------------------------------------------------------------
-# Call guards (t/20-orchestrator-broken-env-turns.t:30-32)
+# Call guards (t/154-orchestrator-broken-env-turns.t:30-32)
 # ---------------------------------------------------------------------------
 # scalar call guard: returns the value, or a "DIED: ..." string on exception.
 sub sc { my $c = shift; my $r = eval { $c->() }; return $@ ? 'DIED: ' . ((split /\n/, $@)[0]) : $r }
@@ -596,7 +596,7 @@ sub log_of { my ($dir, $type) = @_; return grep { ($_->{type} // '') eq $type } 
 # drive(...) — ONE BpOrch::run() across several ticks with a fake clock (§2.11:
 # %ckpt is loop-scope, so repeated once=>1 calls could never observe a periodic
 # checkpoint). The sleep seam advances the clock, runs an optional per-tick world
-# mutation, and finally dies "STOP\n" — t/20's `once => 0` + sleep-sentinel shape.
+# mutation, and finally dies "STOP\n" — t/154's `once => 0` + sleep-sentinel shape.
 sub drive {
     my (%o) = @_;
     my $dir   = $o{dir};
@@ -947,7 +947,7 @@ my $WS_RAW   = 'src/live/:docs/live.md';        # a RAW ledger string, colon and
         12-wait-for-decision.t 13-answer-decision.t 14-hooks-selftest.t
         15-orchestrate-shutdown-clear.t 16-oauth-sandbox-preflight.t 17-drive-next.t
         18-usage-governor.t 19-drive-integration.t 20-deps-check.t
-        20-orchestrator-broken-env-turns.t );
+        154-orchestrator-broken-env-turns.t );
     my @missing = grep { !-f "$TDIR/$_" } @baseline;
     is_deeply(\@missing, [], 'AC-29 all 21 pre-existing test files are still present');
     ok(-f "$TDIR/21-durable-checkpoint-commits.t", 'AC-29 the new assertions live in a NEW file');

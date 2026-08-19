@@ -328,18 +328,18 @@ sub blueprint_lifecycle {
     #
     # Found when s04 wired this function in as the single authority and its
     # oracle asserted "an undelivered package keeps lifecycle at the authored
-    # word" (t/101, observable-6). The implementer read the disagreement the
+    # word" (t/161, observable-6). The implementer read the disagreement the
     # other way -- test wrong, code right -- and flagged it rather than editing
     # the immutable oracle, which is why it was caught. The asymmetry is the
     # tell: drafting and audited each kept themselves, running did not.
     #
     # 'done' deliberately has NO branch here: an authored 'done' that is NOT
     # all-delivered falls through to step 5's default 'drafting' instead --
-    # pre-existing, protected behavior (t/101 AC7 "ac7-stale-done"), not
+    # pre-existing, protected behavior (t/161 AC7 "ac7-stale-done"), not
     # something this fix touches. Only the all-delivered case (the gate
     # above) was the defect.
     #
-    # No backticks anywhere in this file, including comments: t/98's DC1 scans
+    # No backticks anywhere in this file, including comments: t/159's DC1 scans
     # the whole source for them, because this module must never shell out.
     return 'drafting' if $authored eq 'drafting';
     return 'audited'  if $authored eq 'audited';

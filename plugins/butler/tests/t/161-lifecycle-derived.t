@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# 101-lifecycle-derived.t — s04-lifecycle-derived: "finished but marked running"
+# 161-lifecycle-derived.t — s04-lifecycle-derived: "finished but marked running"
 # becomes unwritable. Spec: .ccpraxis-local-data/blueprints/butler-and-dashboard-
 # overhaul/specs/s04-lifecycle-derived-spec.md.
 #
@@ -410,7 +410,7 @@ sub run_bp_blueprint {
     # Old-shape 'done' + NOT all delivered + no live -> BpState's own default,
     # 'drafting' -- documented existing BpState behavior, asserted here too so
     # a future change to BpState's precedence is caught at this call site as
-    # well, not only in t/98/t/99.
+    # well, not only in t/159/t/160.
     my $root = tempdir(CLEANUP => 1);
     my $dir  = make_blueprint($root, 'ac7-stale-done',
         status   => 'done',

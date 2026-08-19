@@ -18,7 +18,7 @@
 # b30 detector is not called directly here — see the note below) so a failure can never be
 # "Undefined subroutine".
 #
-# Style follows t/06 and t/20 (mk_bp / go() loop-driving the REAL BpOrch::run tick, not a
+# Style follows t/06 and t/154 (mk_bp / go() loop-driving the REAL BpOrch::run tick, not a
 # reimplementation of the watchdog's cap decision).
 #
 # SYN-23: nothing below cites a bp-orchestrator.pl / bp-govern.pl line number; everything is
@@ -53,9 +53,9 @@ diag("subject under test: $ORCH (+ bp-govern.pl, required transitively)");
 my $J    = JSON::PP->new->canonical;
 my $ROOT = tempdir(CLEANUP => 1);
 my $NOW  = time;
-my $DEAD_PID = 2_000_000_000;   # out of range -> kill 0 fails -> not alive (t/06/t/20 convention)
+my $DEAD_PID = 2_000_000_000;   # out of range -> kill 0 fails -> not alive (t/06/t/154 convention)
 
-# ── fixture plumbing, copied verbatim from the house style (t/06, t/20) ────────────────
+# ── fixture plumbing, copied verbatim from the house style (t/06, t/154) ────────────────
 sub spit       { my ($p, $c) = @_; open my $f, '>:raw', $p or die "spit $p: $!"; print $f $c; close $f; return $p }
 sub slurp_raw  { my ($p) = @_; open my $f, '<:raw', $p or return undef; local $/; my $c = <$f>; close $f; return $c }
 

@@ -189,7 +189,7 @@ sub mk_bp {
     push @L, '';
     push @L, '## Overview';
     push @L, '';
-    push @L, 'Fixture blueprint for 79-worker-backend-dispatcher.t.';
+    push @L, 'Fixture blueprint for 155-worker-backend-dispatcher.t.';
     push @L, '';
     write_file("$bp/blueprint.md", join("\n", @L) . "\n");
 

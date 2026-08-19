@@ -19,7 +19,7 @@
 # `/bin/cat /work/mine.txt -> worker file`). Tests that need to address a file INSIDE the jail by
 # path use `/work/...` on that authority, not as an invented convention.
 #
-# HARNESS RULES (mirroring 79-worker-backend-dispatcher.t):
+# HARNESS RULES (mirroring 155-worker-backend-dispatcher.t):
 #   * %CLEAN_ENV strips every ambient BP_*/PATH-adjacent var this suite controls explicitly.
 #   * All fixtures (fake project root, jail root) are synthesized under a tempdir rooted at
 #     /root -- overlayfs, never /project (9p; chmod is a no-op there -- spec section 2/7).
@@ -196,7 +196,7 @@ sub run_jail {
 
 # Background variant: forks, execs bp-jail.pl directly (no `timeout`, so the pid returned really
 # is the bp-jail.pl process and can be signalled -- mirrors run_worker_bg in
-# 79-worker-backend-dispatcher.t A13).
+# 155-worker-backend-dispatcher.t A13).
 sub run_jail_bg {
     my ($args, %envover) = @_;
     my $outfile = "$TEST_BASE/bgout." . (++$rn) . ".txt";

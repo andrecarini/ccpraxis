@@ -15,7 +15,7 @@
 # already exist, pre-implementation). C10 is expected to PASS today (the heading count is already
 # 12); C8 and C9 are expected to FAIL today (the export / protocol text do not exist yet).
 #
-# HARNESS RULES (mirroring 80-worker-jail-isolation.t):
+# HARNESS RULES (mirroring 156-worker-jail-isolation.t):
 #   * %CLEAN_ENV strips every ambient BP_*/CCPRAXIS_*-adjacent var this suite controls explicitly.
 #   * All fixtures are synthesized under a tempdir rooted at /root, never under /project.
 #   * Every audit invocation is wrapped in `timeout 30` as a safety net only -- no assertion

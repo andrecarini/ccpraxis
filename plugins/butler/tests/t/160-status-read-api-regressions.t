@@ -1,7 +1,7 @@
 #!/usr/bin/env perl
-# t/99-status-read-api-regressions.t — regression coverage for BpState.pm
+# t/160-status-read-api-regressions.t — regression coverage for BpState.pm
 # added in the s01-status-read-api fix-batch step 7, for two defects that
-# survived to step 6 without t/98 (the immutable oracle) catching them:
+# survived to step 6 without t/159 (the immutable oracle) catching them:
 #
 #   M1 — norm_pkg_status/norm_bp_status word-scanned for the FIRST matching
 #        status word instead of matching the whole normalised value, so a
@@ -13,7 +13,7 @@
 #        Windows' case-insensitive filesystem, and a '.LOCK' file would be
 #        wrongly counted as a package.
 #
-# This file is NOT the oracle (t/98 is); it exists specifically to make
+# This file is NOT the oracle (t/159 is); it exists specifically to make
 # these two defects impossible to reintroduce silently. Each test below was
 # verified by the fix-batch worker to FAIL against the pre-fix BpState.pm
 # and PASS after — see the fix-batch report.

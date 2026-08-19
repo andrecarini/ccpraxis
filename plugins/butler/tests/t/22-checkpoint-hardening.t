@@ -73,7 +73,7 @@ use constant EPOCH => 1785000000;                     # 2026-07-25T17:20:00Z
 my $TRAILER = join('-', 'Co', 'Authored', 'By') . ': Evil <e@x.invalid>';
 
 # ---------------------------------------------------------------------------
-# Call guards (t/20-orchestrator-broken-env-turns.t:30-32)
+# Call guards (t/154-orchestrator-broken-env-turns.t:30-32)
 # ---------------------------------------------------------------------------
 sub sc { my $c = shift; my $r = eval { $c->() }; return $@ ? 'DIED: ' . ((split /\n/, $@)[0]) : $r }
 sub hv { my ($h, $k) = @_; return ref($h) eq 'HASH' ? $h->{$k} : "NOT-A-HASH($h)" }

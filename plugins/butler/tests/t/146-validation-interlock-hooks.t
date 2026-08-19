@@ -23,7 +23,7 @@
 # exercises bp_json_get's perl+JSON::PP fallback for real, not hypothetically
 # -- this is spec behavior 8's host, not a simulation of it.
 #
-# HARNESS RULES (mirroring t/79, t/120):
+# HARNESS RULES (mirroring t/155, t/120):
 #   * %CLEAN_ENV strips every ambient BP_*/CCPRAXIS_*-adjacent var so an
 #     inherited value from the coordinator session running this suite cannot
 #     produce a false pass or a false red.

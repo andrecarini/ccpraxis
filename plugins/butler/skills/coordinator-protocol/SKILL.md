@@ -433,7 +433,7 @@ This has already cost one whole review pass: **eleven of eleven** dispatched wor
 | `maxTurns:` | **agent** frontmatter, `plugins/*/agents/<name>.md` | **Task subagents** — the workers you dispatch |
 | `steps:` | **OpenCode twin**, `plugins/butler/opencode/<name>.md` | the same worker under `worker_backend: opencode` |
 
-There are **three** of them, and the third is easy to miss entirely. `t/81-opencode-worker-runtime.t` keeps `steps:` derived from its Claude twin's `maxTurns:`, so changing a cap without syncing the twin turns that file red — deliberately.
+There are **three** of them, and the third is easy to miss entirely. `t/157-opencode-worker-runtime.t` keeps `steps:` derived from its Claude twin's `maxTurns:`, so changing a cap without syncing the twin turns that file red — deliberately.
 
 The first two differ only in case and separator. Raising one does **nothing** for the other, and that is not hypothetical: `b23` raised the ledger default 80 → 150 and wrote "`bp-scout` … default 40" into the authoring protocol while `bp-scout.md` kept `maxTurns: 15` — the very number that same paragraph calls known-starving — for another two months.
 

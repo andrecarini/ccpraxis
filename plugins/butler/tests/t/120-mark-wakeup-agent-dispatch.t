@@ -24,7 +24,7 @@
 # THE Agent/subagent_type QUESTION (dispatch-prompt note, w03's inherited
 # assumption). subagent_type on the Agent tool's tool_input is UNVERIFIED
 # anywhere in this repo (verified only for Task: t/09-gate.t:228, t/78:707,
-# t/79:361/435/440, track-dispatch.sh:24). The spec's mark-wakeup.sh Agent arm
+# t/155:361/435/440, track-dispatch.sh:24). The spec's mark-wakeup.sh Agent arm
 # (`Task|Agent) : ;;`) reads NO field off tool_input at all — it is a wake-up
 # purely by virtue of TOOL NAME. So every fixture below constructs an Agent
 # payload WITHOUT subagent_type, proving the oracle is correct when the field

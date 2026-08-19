@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# t/98-status-read-api.t — immutable oracle for BpState.pm, the s01-status-read-api
+# t/159-status-read-api.t — immutable oracle for BpState.pm, the s01-status-read-api
 # package (spec: .ccpraxis-local-data/blueprints/butler-and-dashboard-overhaul/
 # specs/s01-status-read-api-spec.md).
 #

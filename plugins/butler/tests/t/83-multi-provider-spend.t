@@ -1061,7 +1061,7 @@ HTML
 # =====================================================================================
 # C20 -- no regression. Not a new assertion of its own (a self-referential "this file
 # still passes" check would be vacuous) -- it is verified by running this WHOLE file:
-# C1..C11 above are untouched by this extension, and t/80-worker-jail-isolation.t is
+# C1..C11 above are untouched by this extension, and t/156-worker-jail-isolation.t is
 # run and confirmed separately as part of this package's verification, per spec §5.
 # =====================================================================================
 

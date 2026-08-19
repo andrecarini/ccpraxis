@@ -13,7 +13,7 @@
 #      still puts at the ORIGINAL commit's `max_turns: 80` -- so the authoring
 #      prose says 150 while the template every package is authored from says 80.
 #   3. b49 raised the agent caps and missed the OpenCode `steps:` twins, caught
-#      only because t/81 happened to assert that one mirror.
+#      only because t/157 happened to assert that one mirror.
 #
 # Frontmatter cannot reference a variable, so a literal MUST be physically
 # present in each agent file. True single-sourcing is therefore impossible; what

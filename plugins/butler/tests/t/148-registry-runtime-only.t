@@ -16,7 +16,7 @@
 # coverage), DC7 lives in plugins/sandbox/tests/t/45-run-state.t (out of this
 # file's reach by design -- RunState.pm is sandbox's file, not butler's).
 # DC5/DC8 (whole-suite baselines) are coordinator-side checks, recorded in
-# the step-3 report, not self-tested here (same convention as t/98's DC7).
+# the step-3 report, not self-tested here (same convention as t/159's DC7).
 use strict;
 use warnings;
 use FindBin qw($Bin);

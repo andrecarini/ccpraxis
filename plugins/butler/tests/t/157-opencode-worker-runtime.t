@@ -309,7 +309,7 @@ SKIP: {
 }
 
 # =====================================================================================
-# Scaffolding for E6/E7/E8/E14: bp-worker.pl fixtures (mirrors 79-worker-backend-dispatcher.t).
+# Scaffolding for E6/E7/E8/E14: bp-worker.pl fixtures (mirrors 155-worker-backend-dispatcher.t).
 # =====================================================================================
 sub mk_bp {
     my ($blueprint_backend) = @_;
@@ -346,7 +346,7 @@ my $FAKEBIN = "$TEST_BASE/fakebin";
 mkdir $FAKEBIN unless -d $FAKEBIN;
 
 # A configurable fake `opencode` binary that emits NDJSON on --format json invocations, driven
-# entirely by env vars (one script serves every scenario, mirroring t/79's fake backend design).
+# entirely by env vars (one script serves every scenario, mirroring t/155's fake backend design).
 my $FAKE_OPENCODE = "$FAKEBIN/opencode";
 write_file($FAKE_OPENCODE, <<'SH');
 #!/usr/bin/env bash
@@ -367,7 +367,7 @@ my $PATH_WITH_FAKE = "$FAKEBIN:$REAL_PATH";
 # Mirror PATH into a temp dir as symlinks, omitting exactly the `opencode` name.
 # Dropping whole DIRECTORIES that contain opencode does not work: b34 installs it to
 # /usr/bin by design, and dropping /usr/bin takes bash with it ("Can't exec bash").
-# See the same helper and the same lesson in t/79-worker-backend-dispatcher.t.
+# See the same helper and the same lesson in t/155-worker-backend-dispatcher.t.
 sub _mk_path_without_opencode {
     my ($real_path) = @_;
     my $dir = tempdir('bp81-noopencode-XXXXXX', TMPDIR => 1, CLEANUP => 1);
@@ -461,7 +461,7 @@ sub run_worker {
 
 # =====================================================================================
 # E6 (DC-6) -- a worker emitting a wall of text still yields <=15 lines, with the full
-# (PARSED, not raw-NDJSON) text under reports/. Mirrors how t/79 A14 asserts b32's identical
+# (PARSED, not raw-NDJSON) text under reports/. Mirrors how t/155 A14 asserts b32's identical
 # <=15-line contract, but additionally requires the newline-delimited-JSON event stream be
 # reduced to the final assistant text (spec §2 item 3), which bp-worker.pl does not do yet.
 # =====================================================================================

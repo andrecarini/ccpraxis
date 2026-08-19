@@ -22,7 +22,7 @@
 # TECHNIQUE: no existing butler test invokes bp-launch.sh directly (t/06/t/08/t/80/t/82 all inject
 # a `launch` closure that stands in for it). Per the driver's explicit instruction, THIS file drives
 # the real bp-launch.sh with a stub `claude` shadowing PATH (house style borrowed from
-# t/82-worker-model-preference.t's FAKE_BACKEND: a fake binary on PATH, invoked via `bash -c` +
+# t/158-worker-model-preference.t's FAKE_BACKEND: a fake binary on PATH, invoked via `bash -c` +
 # `timeout`, argv captured to a delimited log file) so C1..C4 are asserted on the ACTUAL CONSTRUCTED
 # COMMAND LINE bp-launch.sh hands to `claude`, per the spec's own C1 instruction ("assert on the
 # built command, not a helper's return value"). This is NOT the launcher.pl/container-build class of

@@ -7,7 +7,7 @@
 #
 # bp-watch.pl DOES NOT EXIST YET at the time this file is written (test-writer
 # runs before the implementer). `require $SCRIPT` is therefore expected to
-# fail; caught with eval (house pattern — t/98-status-read-api.t), so every
+# fail; caught with eval (house pattern — t/159-status-read-api.t), so every
 # BpWatch:: call below dies "Undefined subroutine", $got stays undef, and each
 # `is()`/`ok()` fails as a genuine not-ok — the RIGHT reason: missing behavior,
 # never a scaffolding bug of this file's own making.
