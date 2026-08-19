@@ -361,6 +361,39 @@ bp_find_data_dir() {
   return 1
 }
 
+# bp_is_absolute_path VALUE -> rc 0 iff VALUE begins with a POSIX absolute
+# path ('/...') or a Windows drive-letter path ('C:', 'C:/...', or 'C:\...').
+# Anything else — empty, whitespace-only, '.', '..', a bare relative word —
+# is rejected, rc 1.
+#
+# d04-registry-path-one-rule fixbatch step7 / FIX 1 (redteam-step6.md
+# CRITICAL-1, driver-reproduced). bp_registry_root used to check only
+# `[ -n "$base" ]`: non-empty, never absolute. A whitespace-only or relative
+# $HOME (` `, `.`, `..`, a bare word) therefore passed as "resolved", and the
+# resulting path — base/.claude/ccpraxis/<leaf> — did not start with `/`, so
+# every downstream consumer (mkdir -p, printf > "$MARK", [ -d ]) resolved it
+# relative to the hook's OWN cwd at the moment it ran: exactly the
+# "$PWD is not stable across a session" hazard this whole package exists to
+# close, reached by a different door. Reproduced end to end: HOME=" " left a
+# directory literally named " " under the hook's cwd, marker written with
+# ZERO stderr, and a Stop check from a different cwd never found it.
+#
+# WHAT COUNTS AS ABSOLUTE ON THIS PLATFORM, and why both forms are accepted:
+# Git-for-Windows bash sees POSIX-style ($HOME=/c/Users/André, this machine's
+# REAL value) and Windows-style (C:/Users/... or C:\Users\...) paths alike,
+# both of which genuinely resolve. Rejecting either would disable the
+# registry for a legitimate environment, which is worse than the bug this
+# fixes. A trailing slash, embedded spaces, non-ASCII characters, and even an
+# embedded newline after the leading slash/drive-letter are all accepted
+# verbatim — they are properties of a real path, not evidence of relativity.
+bp_is_absolute_path() {
+  case "$1" in
+    /*) return 0 ;;
+    [A-Za-z]:|[A-Za-z]:[/\\]*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # bp_registry_root -> echoes the base path every machine-level registry
 # (drive-solo, reporter, continuity) resolves under: override, else $HOME,
 # else $USERPROFILE, else UNRESOLVABLE (rc 1, nothing on stdout). $PWD is
@@ -372,10 +405,31 @@ bp_find_data_dir() {
 # d04-registry-path-one-rule: extracted verbatim from
 # bp_continuity_active_dir's own inline HOME/USERPROFILE fallback (g01),
 # not reinvented.
+#
+# fixbatch step7 / FIX 1: "resolved" now means bp_is_absolute_path, not
+# merely non-empty — see that helper's comment for the full rationale.
+#
+# fixbatch step7 / FIX 2 (redteam-step6.md MUST-FIX-1): sets the GLOBAL
+# BP_REGISTRY_ROOT as well as printing on stdout. Every callsite below reads
+# the global instead of capturing this function's own output via a nested
+# $(...) — command substitution unconditionally strips trailing newlines, so
+# a $HOME/$USERPROFILE ending in one or more newlines used to come out
+# shorter after routing through an EXTRA, avoidable capture layer than the
+# pre-refactor inline `base="${HOME:-}"` did (measured: 59 bytes -> 58).
+# Reading the global instead removes that avoidable layer entirely, so the
+# three registry-specific resolvers are now byte-for-byte identical to a
+# direct `base="${HOME:-}"` assignment for EVERY input, not just the ones
+# without trailing newlines. (The one remaining $(...) — where
+# mark-wakeup.sh/gate-drive-loop.sh capture bp_drive_active_dir/
+# bp_reporter_active_dir/bp_continuity_active_dir's OWN stdout — is
+# unavoidable and pre-existing: those functions have always communicated
+# their result over stdout, exactly as bp_continuity_active_dir did before
+# this package touched it.)
 bp_registry_root() {
   local base="${HOME:-}"
   [ -n "$base" ] || base="${USERPROFILE:-}"
-  [ -n "$base" ] || return 1
+  bp_is_absolute_path "$base" || { BP_REGISTRY_ROOT=""; return 1; }
+  BP_REGISTRY_ROOT="$base"
   printf '%s' "$base"
   return 0
 }
@@ -396,13 +450,18 @@ bp_registry_root() {
 # favor of bp_registry_root (override -> HOME -> USERPROFILE -> rc 1, no
 # current-directory guess).
 bp_drive_active_dir() {
+  # fixbatch step7 / FIX 1: the override is validated too — an override that
+  # is empty or relative would otherwise bypass bp_registry_root's guard
+  # entirely and reintroduce the same cwd-relative hazard through a second
+  # door. Test suites always set this to an absolute tempdir, so this is a
+  # no-op for every oracle in this repo.
   if [ -n "${CCPRAXIS_DRIVE_ACTIVE_DIR:-}" ]; then
+    bp_is_absolute_path "$CCPRAXIS_DRIVE_ACTIVE_DIR" || return 1
     printf '%s' "$CCPRAXIS_DRIVE_ACTIVE_DIR"
     return 0
   fi
-  local base
-  base=$(bp_registry_root) || return 1
-  printf '%s' "$base/.claude/ccpraxis/.drive-solo-active"
+  bp_registry_root >/dev/null || return 1
+  printf '%s' "$BP_REGISTRY_ROOT/.claude/ccpraxis/.drive-solo-active"
   return 0
 }
 
@@ -412,13 +471,14 @@ bp_drive_active_dir() {
 # shared resolver at all, just three literal inline HOME-or-cwd copies
 # (mark-wakeup.sh's write site, gate-drive-loop.sh's two read sites).
 bp_reporter_active_dir() {
+  # fixbatch step7 / FIX 1: see bp_drive_active_dir's identical comment.
   if [ -n "${CCPRAXIS_REPORTER_ACTIVE_DIR:-}" ]; then
+    bp_is_absolute_path "$CCPRAXIS_REPORTER_ACTIVE_DIR" || return 1
     printf '%s' "$CCPRAXIS_REPORTER_ACTIVE_DIR"
     return 0
   fi
-  local base
-  base=$(bp_registry_root) || return 1
-  printf '%s' "$base/.claude/ccpraxis/.reporter-active"
+  bp_registry_root >/dev/null || return 1
+  printf '%s' "$BP_REGISTRY_ROOT/.claude/ccpraxis/.reporter-active"
   return 0
 }
 
@@ -538,13 +598,14 @@ bp_drive_marker() {
 #      resolved, arm() could never have written a marker there either, so
 #      there is never a live marker for these fail-safe reads to miss.
 bp_continuity_active_dir() {
+  # fixbatch step7 / FIX 1: see bp_drive_active_dir's identical comment.
   if [ -n "${CCPRAXIS_CONTINUITY_ACTIVE_DIR:-}" ]; then
+    bp_is_absolute_path "$CCPRAXIS_CONTINUITY_ACTIVE_DIR" || return 1
     printf '%s' "$CCPRAXIS_CONTINUITY_ACTIVE_DIR"
     return 0
   fi
-  local base
-  base=$(bp_registry_root) || return 1
-  printf '%s' "$base/.claude/ccpraxis/.continuity-active"
+  bp_registry_root >/dev/null || return 1
+  printf '%s' "$BP_REGISTRY_ROOT/.claude/ccpraxis/.continuity-active"
   return 0
 }
 

@@ -592,4 +592,100 @@ for my $case (
     }
 }
 
+# ===========================================================================
+# N. fixbatch step7 / FIX 1 (redteam-step6.md CRITICAL-1 + SHOULD-FIX-1) --
+#    a non-empty but NON-ABSOLUTE $HOME/$USERPROFILE (whitespace-only, '.',
+#    '..', a bare relative word) must be treated as UNRESOLVED, exactly like
+#    unset -- never accepted merely because it is non-empty. This is the gap
+#    the reviewer/red-team found the original oracle could not catch: every
+#    prior "resolvable" fixture used a real, absolute tempdir.
+# ===========================================================================
+for my $bad_home (' ', '.', '..', 'relative-word', "\t", '  leading-space') {
+    my $scratch = tempdir(CLEANUP => 1);
+    my ($out, $rc) = probe_lib('bp_registry_root', [],
+        env => { HOME => $bad_home, USERPROFILE => undef }, cwd => $scratch);
+    is($rc, 1, "N1 CANONICAL (-> FIX1): bp_registry_root rc 1 for non-absolute \$HOME=[$bad_home]");
+    is($out, '', "N2 CANONICAL (-> FIX1): bp_registry_root prints NOTHING for non-absolute \$HOME=[$bad_home]");
+
+    my ($dout, $drc) = probe_lib('bp_drive_active_dir', [],
+        env => { CCPRAXIS_DRIVE_ACTIVE_DIR => undef, HOME => $bad_home, USERPROFILE => undef },
+        cwd => $scratch);
+    is($drc, 1, "N3 CANONICAL (-> FIX1): bp_drive_active_dir rc 1 for non-absolute \$HOME=[$bad_home]");
+    is($dout, '', "N4 CANONICAL (-> FIX1): bp_drive_active_dir prints NOTHING for non-absolute \$HOME=[$bad_home] "
+                 . "-- specifically not a cwd-relative path built from it");
+    unlike($dout, qr{^\Q$bad_home\E}, 'N5: output does not begin with the raw bad HOME value');
+}
+
+# ===========================================================================
+# O. fixbatch step7 / FIX 1 -- end to end through the REAL hook: a
+#    whitespace-only $HOME must not create ANY stray directory under the
+#    hook's cwd (the observable harm the red-team measured -- a directory
+#    literally named " " on disk). Mirrors section I, but with a
+#    non-absolute HOME instead of an unset one.
+# ===========================================================================
+{
+    my $root    = new_project(drive_solo => 1);
+    my $scratch = tempdir(CLEANUP => 1);
+    my $sid     = 'sess-fix1-whitespace-home';
+
+    my ($rc, $out) = run_hook($MARK, driver_arm_payload($root, $sid),
+        env => { CCPRAXIS_DRIVE_ACTIVE_DIR => undef, HOME => ' ', USERPROFILE => undef },
+        cwd => $scratch);
+
+    is($rc, 0, 'O1 CANONICAL (-> FIX1, Ruling 0): mark-wakeup.sh ARM still exits 0 for a '
+             . 'whitespace-only $HOME');
+    like($out, qr/registry path unresolved/,
+       'O2 CANONICAL (-> FIX1): stderr matches /registry path unresolved/ for a whitespace-only $HOME '
+     . '-- treated as unresolved, not silently accepted');
+    ok(!-e "$scratch/.claude",
+       'O3 CANONICAL (-> FIX1): no .claude directory was created under the scratch cwd');
+    opendir(my $dh, $scratch) or die "opendir $scratch: $!";
+    my @entries = grep { $_ ne '.' && $_ ne '..' } readdir($dh);
+    closedir($dh);
+    is_deeply(\@entries, [],
+       'O4 CANONICAL (-> FIX1): the scratch cwd is completely empty -- specifically no directory '
+     . 'literally named " " (the exact stray artifact the red-team measured) was created');
+}
+
+# ===========================================================================
+# P. fixbatch step7 / FIX 3 (reviewer-step6.md SF1, driver-reproduced) -- the
+#    Site-A diagnostic must fire ONLY for an unresolved registry, never for a
+#    bad SID, even when BOTH conditions hold at once (the compound case the
+#    original oracle's H4 section never exercised).
+# ===========================================================================
+for my $bad_sid ('bad/sid', '..', 'trailing-star*') {
+    my $root    = new_project(drive_solo => 1);
+    my $scratch = tempdir(CLEANUP => 1);
+
+    my ($rc, $out) = run_hook($MARK, driver_arm_payload($root, $bad_sid),
+        env => { CCPRAXIS_DRIVE_ACTIVE_DIR => undef, HOME => undef, USERPROFILE => undef },
+        cwd => $scratch);
+
+    is($rc, 0, "P1 CANONICAL (-> FIX3, sid='$bad_sid'): ARM still exits 0 for a bad sid + "
+             . "unresolved registry");
+    is($out, '', "P2 CANONICAL (-> FIX3, sid='$bad_sid'): stderr is COMPLETELY EMPTY -- the "
+               . "'registry path unresolved' diagnostic must never fire for a bad-id failure, "
+               . "even when the registry is simultaneously unresolved");
+    ok(!-e "$scratch/.claude",
+       "P3 (-> FIX3, sid='$bad_sid'): no .claude directory created under the scratch cwd");
+}
+# The unresolved-registry diagnostic still fires for a GOOD sid in the same
+# unresolved-registry condition -- proving P2's silence above is because of
+# the bad sid specifically, not a regression that silenced the diagnostic
+# outright.
+{
+    my $root    = new_project(drive_solo => 1);
+    my $scratch = tempdir(CLEANUP => 1);
+    my $sid     = 'sess-fix3-good-sid';
+
+    my ($rc, $out) = run_hook($MARK, driver_arm_payload($root, $sid),
+        env => { CCPRAXIS_DRIVE_ACTIVE_DIR => undef, HOME => undef, USERPROFILE => undef },
+        cwd => $scratch);
+
+    is($rc, 0, 'P4 (-> FIX3 control): ARM exits 0 for a good sid + unresolved registry');
+    like($out, qr/registry path unresolved/,
+       'P5 CANONICAL (-> FIX3 control): the diagnostic DOES fire for a good sid + unresolved '
+     . 'registry -- confirming P2 was silenced by the bad sid, not a broken diagnostic path');
+}
+
 done_testing();

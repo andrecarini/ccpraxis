@@ -371,12 +371,27 @@ if [ -n "$DATA" ] && [ -d "$DATA/.drive-solo" ]; then
     # workaround duplicated here.
     DCMD=$(bp_json_get "$PAYLOAD" tool_input.command 2>/dev/null || true)
     if [ "$(printf '%s' "$DCMD" | bp_wakeup_arm_check 'bp-drive-next\.pl[^"]*(next|record-order|park)')" = "1" ]; then
-      if MARK=$(bp_drive_marker "$SID" 2>/dev/null); then
-        mkdir -p "$(dirname "$MARK")" 2>/dev/null \
-          && printf '%s\n' "$DATA" > "$MARK" 2>/dev/null || true
-      elif ! bp_drive_active_dir >/dev/null 2>&1; then
-        echo "butler drive-solo-arm: registry path unresolved (HOME and USERPROFILE both unset) -- driver marker NOT written for session $SID" >&2
-      fi
+      # fixbatch step7 / FIX 3 (reviewer-step6.md SF1, driver-reproduced): the
+      # SID is validated FIRST, mirroring the reporter site's own structure
+      # above (RSID is blanked before the block that would act on it). Before
+      # this, the elif re-probed bp_drive_active_dir independently of WHY
+      # bp_drive_marker failed, so a bad SID + an unresolved registry together
+      # produced the "registry path unresolved" diagnostic even though the
+      # proximate reason no marker was ever attempted was the bad SID -- a
+      # stated-contract violation (spec: this diagnostic must never fire for
+      # a bad-id failure) that also echoed an unsanitized SID into the
+      # transcript. A bad SID alone now stays silent, unchanged from before.
+      case "$SID" in
+        ''|*/*|*\*|.|..|*..*) : ;;
+        *)
+          if MARK=$(bp_drive_marker "$SID" 2>/dev/null); then
+            mkdir -p "$(dirname "$MARK")" 2>/dev/null \
+              && printf '%s\n' "$DATA" > "$MARK" 2>/dev/null || true
+          elif ! bp_drive_active_dir >/dev/null 2>&1; then
+            echo "butler drive-solo-arm: registry path unresolved (HOME and USERPROFILE both unset) -- driver marker NOT written for session $SID" >&2
+          fi
+          ;;
+      esac
     fi
   fi
 fi
