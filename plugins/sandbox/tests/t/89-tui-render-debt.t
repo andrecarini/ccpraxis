@@ -459,4 +459,61 @@ SKIP: {
     }
 }
 
+# ===========================================================================
+# PART 11 -- REGRESSION, added by the driver 2026-08-19 after this package's
+# red-team found a CRITICAL that THIS FILE passed straight through.
+#
+# bound_for_wrap under-cut and silently dropped real banner content whenever
+# $cols <= WRAP_CONTINUATION_INDENT, because wrap_line's degenerate
+# content_w == $w fallback removes the slack the old $max_rows * $w limit
+# accidentally relied on. Every one of the six literal install-warning strings
+# diverged from the unbounded wrap at cols 1 and 2; the driver reproduced 48
+# diverging combinations out of 96.
+#
+# WHY THIS FILE MISSED IT, which is the part worth pinning: AC8's content
+# check hardcodes cols=40, and the only cols=1 check (AC9/behavior 12) uses a
+# single unbreakable token and asserts timing rather than content. The two
+# never overlapped on the vulnerable shape -- word-separated text at a
+# degenerate width -- so 47/47 was green over a live bug. The invariant below
+# is stated directly instead: for ANY text, width and row budget, bounding
+# then wrapping must produce the same surviving rows as wrapping unbounded.
+# That is the whole contract of the bound; it exists to skip work, never to
+# change what the operator sees.
+# ===========================================================================
+SKIP: {
+    skip 'tui/Frame.pm did not load', 1 unless $FRAME_OK;
+    my @texts = (
+        '  !! backpack install FAILED: 3 of 7 items could not be restored  [d] dismiss',
+        '  !! alpha beta gamma delta epsilon',
+        '  !! one two',
+        '  !! ' . ('word ' x 12),
+        '  !! ' . ('a ' x 40),
+    );
+    my ($checked, $diverged, $first) = (0, 0, '');
+    for my $t (@texts) {
+        for my $cols (1, 2, 3, 4, 5, 8, 13, 40, 80) {
+            for my $rows (1, 2, 3, 4, 6, 12) {
+                $checked++;
+                my $un  = eval { tui::Frame::wrap_line($t, 'state.warn', $cols) } or next;
+                my $cut = eval { tui::Frame::bound_for_wrap($t, $rows, $cols) };
+                my $bo  = eval { tui::Frame::wrap_line($cut, 'state.warn', $cols) } or next;
+                my $n   = $rows < scalar(@$un) ? $rows : scalar(@$un);
+                for my $i (0 .. $n - 1) {
+                    my $a = $un->[$i]{text} // '';
+                    my $b = defined $bo->[$i] ? ($bo->[$i]{text} // '') : '';
+                    next if $a eq $b;
+                    $diverged++;
+                    $first ||= "cols=$cols rows=$rows row=$i unbounded=[$a] bounded=[$b]";
+                    last;
+                }
+            }
+        }
+    }
+    is($diverged, 0,
+        "PART 11 (driver regression): bounding then wrapping matches the unbounded wrap "
+      . "for every surviving row across $checked text/width/budget combinations -- the "
+      . 'bound skips work, it never changes what is displayed')
+        or diag("  first divergence: $first");
+}
+
 done_testing();

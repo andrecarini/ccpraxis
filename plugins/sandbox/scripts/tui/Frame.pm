@@ -626,7 +626,27 @@ sub bound_for_wrap {
     $w        = (!defined $w        || ref($w)        || $w        !~ /^-?\d+(?:\.\d+)?$/) ? 0 : int($w);
     return '' if $max_rows <= 0 || $w <= 0;
 
-    my $limit = $max_rows * $w;
+    # The budget must cover the SOURCE columns needed to fill $max_rows rows,
+    # which is more than $max_rows * $w. Word wrapping drops the separator
+    # between words and leaves a row short whenever the next word does not fit,
+    # so each emitted row can consume up to $w content columns PLUS one
+    # discarded space. A final partial word needs another $w of slack.
+    #
+    # $max_rows * $w alone was wrong, and only looked right at ordinary widths:
+    # there wrap_line uses content_w = $w - indent, so the naive limit happened
+    # to over-estimate capacity and absorbed the waste. At $w <= the
+    # continuation indent, wrap_line's degenerate fallback (see (3) above) sets
+    # content_w = $w with indent 0, that accidental slack disappears, and the
+    # cut lost real text: this package's own red-team measured every one of the
+    # six literal install-warning strings diverging from the unbounded wrap at
+    # cols 1 and 2, and the driver reproduced 48 diverging combinations out of
+    # 96 across four texts.
+    #
+    # Erring generous is free here. The bound exists only to avoid wrapping
+    # text that provably cannot be displayed; over-estimating costs a little
+    # work on a huge input, while under-estimating silently changes what the
+    # operator sees, which is the one thing this function must never do.
+    my $limit = $max_rows * ($w + 1) + $w;
 
     # Fast path (the case this fix exists for): decode only a generous
     # RAW-BYTE prefix first -- up to 4 bytes per UTF-8 character (the widest
