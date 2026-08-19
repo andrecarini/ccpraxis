@@ -411,18 +411,47 @@ for my $p (@pairs) {
 
 # ============================================================================
 # SECTION 5 (DC5-adjacent, this package's own file-count invariant). A
-# rename must not add or lose a file: the pre-rename count of tracked .t
-# files in this directory, PLUS this oracle itself, is the post-rename
-# count. Pre-rename count independently confirmed via `git ls-files` at
+# rename must not LOSE a file: the pre-rename count of tracked .t files in
+# this directory, PLUS this oracle itself, is the post-rename floor.
+# Pre-rename count independently confirmed via `git ls-files` at
 # test-writing time: 131. 131 + 1 (this file) = 132.
+#
+# LOWER BOUND, never a pinned count -- and this was originally written as an
+# exact `is(..., 132)`, which is the mistake. It fired the very first time a
+# later package (d03-one-shell-noise-stripper) legitimately added a test file,
+# reporting 133 as a failure. Adding tests is normal work; an oracle that
+# treats it as breakage is a tax on every future package, and the rename this
+# guards is a ONE-TIME migration whose add/lose safety was already established
+# by the pre/post baseline diff recorded in d01's reports directory.
+#
+# The repo had already learned this exactly once and written it down --
+# 71-ledger-timestamps.t's C7 block says "NO CORPUS SIZE IS PINNED (C7 asserts
+# a LOWER BOUND only -- an oracle in this suite broke this session on exactly
+# that)" -- and this oracle pinned a count anyway. Hence the floor.
+#
+# BE HONEST ABOUT WHAT THE FLOOR IS WORTH: once the directory grows, it stops
+# detecting a single lost file (measured -- with 133 files present, deleting
+# one leaves 132 and the floor still passes). A count cannot simultaneously
+# permit growth and detect loss, so this assertion is a coarse backstop, not
+# the add/lose guarantee its original wording claimed.
+#
+# That guarantee was a ONE-TIME migration property and is already discharged
+# elsewhere: the pre/post baseline diff in d01's reports directory compared
+# all 132 files row by row under the nine-pair rename mapping. That artifact,
+# not this counter, is the evidence a rename lost nothing.
+#
+# The invariant that genuinely must hold FOREVER is SECTION 1's duplicate-number
+# scan, which derives duplicates from a live opendir of the directory and so
+# catches a tenth collision whenever it appears.
 # ============================================================================
 {
     opendir(my $dh, $TDIR) or BAIL_OUT("cannot opendir $TDIR: $!");
     my @all_t = grep { -f "$TDIR/$_" && /\.t\z/ } readdir $dh;
     closedir $dh;
-    is(scalar(@all_t), 132,
-       'SECTION 5: plugins/butler/tests/t/ holds exactly 132 .t files -- 131 confirmed pre-rename '
-     . '(git ls-files, test-writing time) plus this oracle itself; a rename must not add or lose a file');
+    cmp_ok(scalar(@all_t), '>=', 132,
+       'SECTION 5: plugins/butler/tests/t/ holds AT LEAST 132 .t files -- 131 confirmed pre-rename '
+     . '(git ls-files, test-writing time) plus this oracle itself; a rename must not lose a file. '
+     . 'Lower bound, never pinned: later packages legitimately add tests.');
 }
 
 # ============================================================================
