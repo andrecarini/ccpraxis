@@ -71,11 +71,19 @@ sub slurp {
         qr/run \/backpack:install in the session to retry/,
         'AC2: the "retry" trailing instruction is gone from launcher.pl entirely');
 
+    # AMENDED BY t05-no-colons. The separator inside these two sentences is
+    # now " - " (operator: "we use way too many instances of the character
+    # `:`. Its distracting. We need none of them."). The INTENT is unchanged
+    # and is what the description says: the warning is the bare sentence,
+    # semicolon-terminated, with no dangling instruction after it -- the two
+    # `unlike` checks above are what enforce the "no dangling instruction"
+    # half, and they are untouched. Only the separator inside the sentence
+    # moved.
     like($src,
-        qr/\$INSTALL_WARNING\s*=\s*'backpack install: declared items never reached install';/,
+        qr/\$INSTALL_WARNING\s*=\s*'backpack install - declared items never reached install';/,
         'AC2: the reconcile-mismatch $INSTALL_WARNING is now the bare sentence, semicolon-terminated (no dangling instruction)');
     like($src,
-        qr/\$INSTALL_WARNING\s*=\s*'backpack install: some items failed';/,
+        qr/\$INSTALL_WARNING\s*=\s*'backpack install - some items failed';/,
         'AC2: the some-items-failed $INSTALL_WARNING is now the bare sentence, semicolon-terminated (no dangling instruction)');
 
     # Counter-fixture (hand-built, not the production source): proves the

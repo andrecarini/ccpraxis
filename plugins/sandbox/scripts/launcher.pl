@@ -4952,13 +4952,13 @@ BASH
             # WHICH failure mode this was (BLOCKER-2 fix).
             my $install_exit = $install_rc >> 8;
             if ($install_exit == 2) {
-                $INSTALL_WARNING = 'backpack install: declared items never reached install';
+                $INSTALL_WARNING = 'backpack install - declared items never reached install';
                 log_ev('backpack_install_reconcile_mismatch', { exit => $install_exit });
                 _emit_out("\n");
                 _emit_out(_c_warn("WARNING:"), " Some declared backpack items never reached install (see RECONCILE/NOTICE/ABSENT/EXTRA above). Handing off to claude anyway — fix in-session via /backpack:add, /backpack:remove, or by editing the backpack file directly and running /backpack:install.\n");
                 _emit_out("\n");
             } elsif ($install_rc != 0) {
-                $INSTALL_WARNING = 'backpack install: some items failed';
+                $INSTALL_WARNING = 'backpack install - some items failed';
                 log_ev('backpack_install_failed', { exit => $install_exit });
                 _emit_out("\n");
                 _emit_out(_c_warn("WARNING:"), " Some backpack items failed (see above). Handing off to claude anyway — fix in-session via /backpack:add, /backpack:remove, or by editing the backpack file directly and running /backpack:install.\n");

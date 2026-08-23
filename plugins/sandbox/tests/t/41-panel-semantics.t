@@ -96,7 +96,28 @@ ok(defined($LABEL_GUTTER) && $LABEL_GUTTER =~ /^\d+$/ && $LABEL_GUTTER > 0,
 # (spec S2.4.1: sprintf('%-*s : ', LABEL_GUTTER(), safe(label))), so every
 # expected label string below is DERIVED from the spec's own constant,
 # never hand-padded.
+# NOT AMENDED BY t05-no-colons, DELIBERATELY -- and this is the interesting
+# case in that package rather than an oversight.
+#
+# Every caller of this helper in this file asserts against
+# Dashboard::build_panels, and Dashboard.pm's own comments (see :934-938 and
+# the _run_lines header) record that build_panels/_fixed_panels are
+# UNREACHABLE from compose_frame: historical, off the render path, with zero
+# other callers, and explicitly "must not be updated to track" the live panel
+# set. So the colons that path emits are never rendered to an operator, and
+# t05's rule -- no RENDERED colon -- does not reach them.
+#
+# The first t05 draft pointed this helper at tui::DashboardScreen::gutter,
+# which is the live path's formatter. That turned 16 assertions red for a good
+# reason: they were correctly describing the legacy path, and the helper had
+# started describing a different one. Two paths that are documented as separate
+# must not be pinned to one expectation.
 sub _gutter_label { return sprintf('%-*s : ', $LABEL_GUTTER, $_[0]); }
+
+# _live_gutter_label -- the LIVE path's label, for the few assertions in this
+# file that go through tui::DashboardScreen rather than build_panels. Derived
+# from the production helper so it cannot drift.
+sub _live_gutter_label { return tui::DashboardScreen::gutter($_[0]); }
 
 # ===========================================================================
 # 4.1 container_status_style (spec S2.1): AC3, AC4
@@ -634,7 +655,13 @@ sub _gutter_label { return sprintf('%-*s : ', $LABEL_GUTTER, $_[0]); }
     # a SUMMARY, not an item listing -- it never contains the fixture's
     # item keys, at any width.
     my %state5 = (status => 'running', backpack => $bp5);
-    my $bp_label14 = _gutter_label('backpack');
+    # THE LIVE label, not the legacy one, and the difference is real: the
+    # backpack row is the one row _fixed_panels builds through
+    # tui::DashboardScreen::row rather than through its own local formatter
+    # (Dashboard.pm:1020), so it carries the live gutter while its siblings in
+    # the same panel carry the legacy one. t05-no-colons made that visible by
+    # changing only the live gutter.
+    my $bp_label14 = _live_gutter_label('backpack');
     my $expected_value14 = tui::DashboardScreen::backpack_summary_spans($bp5);
 
     for my $cols (120, 40) {

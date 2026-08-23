@@ -349,7 +349,7 @@ sub apply {
             if (!$ok2) {
                 $cleanup_failed  = 1;
                 $cleanup_detail  = "$row->{key} was dropped from the backpack but its approval record "
-                                  . 'could not be cleared: ' . _err_detail($err2);
+                                  . 'could not be cleared - ' . _err_detail($err2);
                 $ss->{failures}  = ($ss->{failures} || 0) + 1;
             }
         }
@@ -561,9 +561,15 @@ sub status_spans {
         # deliberately NOT the item key: the row's own key is what a reader
         # would otherwise use to tell this banner apart from the list row,
         # but $detail already carries the identifying context it needs.
-        $text = 'FAILED' . (length($op) ? " $op" : '') . ': ' . $detail;
+        # t05-no-colons: the separator is an en-dash-style " - ", matching the
+        # one the `unavailable` branch below already used between its own two
+        # parts. Operator: "we use way too many instances of the character `:`.
+        # Its distracting. We need none of them." $detail is DATA and is passed
+        # through untouched (blueprint Decision 20) -- only the separator this
+        # file authors changes.
+        $text = 'FAILED' . (length($op) ? " $op" : '') . ' - ' . $detail;
     } elsif ($kind eq 'unavailable') {
-        $text = 'unavailable' . (length($op) ? " - $op" : '') . ': ' . $detail;
+        $text = 'unavailable' . (length($op) ? " - $op" : '') . ' - ' . $detail;
     } else {
         $text = $detail;
     }

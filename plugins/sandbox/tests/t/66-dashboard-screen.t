@@ -936,8 +936,14 @@ sub _dlines_text {
         ok((grep { $_ eq 'refresh' } @$always) ? 1 : 0, "AC-E5 precondition: ALWAYS_SHOWN() includes 'refresh'");
         my $f = eval { Dashboard::compose_frame(\%STATE_ABSENTS, 30, 120) };
         my $joined = (!$@ && defined $f) ? join("\n", map { $_->{text} } @$f) : '';
-        like($joined, qr/access\s+:/, "AC-E5: the 'access' row is rendered even though its value is an absent token (ALWAYS_SHOWN honoured, not just declared)");
-        like($joined, qr/refresh\s+:/, "AC-E5: the 'refresh' row is rendered even though its value is an absent token");
+        # AMENDED BY t05-no-colons: the label gutter's separator is three
+        # spaces now, not " : ". The intent -- that the row is RENDERED even
+        # when its value is an absent token, so ALWAYS_SHOWN is honoured rather
+        # than merely declared -- is unchanged, and these still fail if either
+        # row stops being emitted. Anchored to the start of a line so a stray
+        # "access" inside some other row's prose cannot satisfy them.
+        like($joined, qr/^\s*access\s+\S/m, "AC-E5: the 'access' row is rendered even though its value is an absent token (ALWAYS_SHOWN honoured, not just declared)");
+        like($joined, qr/^\s*refresh\s+\S/m, "AC-E5: the 'refresh' row is rendered even though its value is an absent token");
     }
 }
 {

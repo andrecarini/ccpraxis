@@ -231,8 +231,19 @@ sub runs_n {
         my $texts_with    = panel_line_texts($providers_with);
         my $texts_without = panel_line_texts($providers_without);
 
-        my ($access_with)    = grep { /access\s*:/i } @$texts_with;
-        my ($access_without) = grep { /access\s*:/i } @$texts_without;
+        # AMENDED BY t05-no-colons: the label gutter's separator is three
+        # spaces now, not " : ". Every intent in this block is preserved --
+        # which row exists, which text it carries, and which row must NOT
+        # exist. The row matchers are anchored and require the label to be
+        # followed by whitespace, so `refresh` still cannot match `refreshed`.
+        #
+        # THE "refreshed" ABSENCE CHECKS BELOW MATTERED MOST HERE. They were
+        # is(0) assertions written against /^\s*refreshed\s*:/ and they would
+        # have kept passing after the colon vanished -- vacuously, matching
+        # nothing whatever the panel rendered. A green assertion that can no
+        # longer fail is worse than a red one.
+        my ($access_with)    = grep { /^\s*access\s+\S/i } @$texts_with;
+        my ($access_without) = grep { /^\s*access\s+\S/i } @$texts_without;
         ok(defined $access_with,    'AC3: an access row exists when last_refreshed_age is defined');
         ok(defined $access_without, 'AC3: an access row exists when last_refreshed_age is undefined');
 
@@ -245,19 +256,24 @@ sub runs_n {
                 'AC3/Behavior4: with last_refreshed_age undefined, no duration renders in the access row (matches suppression of the old standalone refreshed row)');
         }
 
-        my @refreshed_with    = grep { /^\s*refreshed\s*:/i } @$texts_with;
-        my @refreshed_without = grep { /^\s*refreshed\s*:/i } @$texts_without;
+        my $REFRESHED_ROW = qr/^\s*refreshed\s+\S/i;
+        my @refreshed_with    = grep { $_ =~ $REFRESHED_ROW } @$texts_with;
+        my @refreshed_without = grep { $_ =~ $REFRESHED_ROW } @$texts_without;
         is(scalar(@refreshed_with), 0, 'AC3/Behavior4: no standalone "refreshed" row exists anywhere when last_refreshed_age is defined');
         is(scalar(@refreshed_without), 0, 'AC3/Behavior4: no standalone "refreshed" row exists anywhere when last_refreshed_age is undefined');
 
-        my ($refresh_with) = grep { /^\s*refresh\s*:/i } @$texts_with;
+        my ($refresh_with) = grep { /^\s*refresh\s+\S/i } @$texts_with;
         ok(defined $refresh_with, 'AC3/Behavior6: the unchanged "refresh" row (present/absent fingerprint) still renders, distinct from "refreshed"/"refresh-exp"');
         like($refresh_with, qr/present \(zqxfp0079\)/, 'AC3/Behavior6: the "refresh" row still carries the fingerprint text unchanged') if defined $refresh_with;
 
         # Non-vacuity: the "no standalone refreshed row" detector must be
         # ABLE to fire -- prove it on a hand-built row that IS labeled
-        # 'refreshed'.
-        my @counter = grep { /^\s*refreshed\s*:/i } ('refreshed   : 45s ago', 'access      : EXPIRED', 'refresh     : present (x)');
+        # 'refreshed'. The fixture rows below now use the CURRENT gutter
+        # (t05-no-colons), and the detector is the SAME compiled pattern the
+        # two absence checks above use, so this cannot drift from them the way
+        # a second hand-written copy could.
+        my @counter = grep { $_ =~ $REFRESHED_ROW }
+            ('refreshed     45s ago', 'access        EXPIRED', 'refresh       present (x)');
         is(scalar(@counter), 1, 'AC3 non-vacuity: the "refreshed" row detector fires exactly once on a hand-built fixture literally labeled refreshed');
     }
 }

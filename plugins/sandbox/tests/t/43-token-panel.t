@@ -651,7 +651,11 @@ ok(length($launcher_src) > 0, 'launcher.pl is readable on disk') or BAIL_OUT("ca
     ok(defined($run_i) && defined($token_i) && defined($act_i) && $run_i < $token_i && $token_i < $act_i,
         'AC-18 (re-pointed): Token panel still sits between Run and Recent activity when backpack data is also present (position unaffected)');
     my ($run_both) = grep { $_->{title} eq 'Run' } @p_both;
-    my $bp_label43 = sprintf('%-*s : ', tui::DashboardScreen::LABEL_GUTTER(), 'backpack');
+    # AMENDED BY t05-no-colons: same correction as t/41 and t/25 -- the width
+    # was derived from the production constant but the separator was
+    # hand-written, so half the expectation was a literal. Call the helper the
+    # render path uses instead.
+    my $bp_label43 = tui::DashboardScreen::gutter('backpack');
     ok(($run_both && grep { $_->[0]{text} eq $bp_label43 } @{ $run_both->{lines} }),
         'AC-18 (re-pointed) counter-fixture: the backpack fact DOES reach the frame in this fixture -- as a row inside Run, not as the deleted panel');
 }

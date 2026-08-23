@@ -154,6 +154,51 @@ sub is_absent {
 # ===========================================================================
 use constant LABEL_GUTTER => 11;
 
+# ---------------------------------------------------------------------------
+# t05-no-colons. Operator, verbatim: "we use way too many instances of the
+# character `:`. Its distracting. We need none of them."
+#
+# GUTTER_SEP is the separator between a label and its value, defined ONCE.
+# Criterion 3 is explicit that the fix belongs at the shared render site rather
+# than at nineteen call sites, and the two hardcoded copies of the gutter
+# sprintf that used to sit in this file are folded into gutter() below for the
+# same reason: a copy that has to be edited alongside its original is how the
+# next colon gets reintroduced.
+#
+# THREE SPACES, NOT ONE, AND THAT IS WHAT MAKES THIS SAFE TO DO EVERYWHERE AT
+# ONCE (blueprint Decision 21). " : " is three display columns and so is "   ",
+# so every width computation, fit_spans budget, truncation point and row-width
+# assertion downstream is unchanged -- only the characters differ. Collapsing
+# to a single space would have shifted every value two columns left and turned
+# a cosmetic change into a layout change.
+#
+# WHAT THIS RULE DOES NOT TOUCH (Decision 20): values. A label gutter, a
+# provider prefix and a warning sentence are text this repo AUTHORS, and they
+# lose their colons. An event body, a blueprint name, a container name, a path,
+# an error string from a subprocess are DATA passing through -- rewriting those
+# would make the screen disagree with the thing it reports on. A blueprint
+# genuinely named foo:bar renders as foo:bar. Clock times keep their colon by
+# Decision 2, operator-confirmed.
+use constant GUTTER_SEP => '   ';
+
+# gutter($label) -> the padded label span text. PUBLIC (used by the three
+# label-rendering sites in this file).
+sub gutter {
+    my ($label) = @_;
+    $label = '' if !defined $label;
+    return sprintf('%-*s%s', LABEL_GUTTER(), tui::Frame::safe($label), GUTTER_SEP());
+}
+
+# pad_label($label, $width) -> a label padded to $width plus the separator.
+# For the narrower, ad-hoc gutters in the Providers panel, which do not use
+# LABEL_GUTTER's width but must use the same separator.
+sub pad_label {
+    my ($label, $width) = @_;
+    $label = '' if !defined $label;
+    $width = length($label) if !defined $width || ref($width) || $width !~ /^\d+$/;
+    return sprintf('%-*s%s', $width, $label, GUTTER_SEP());
+}
+
 sub row {
     my %spec;
     if (@_ == 1 && ref($_[0]) eq 'HASH') {
@@ -203,7 +248,7 @@ sub row {
     return [] if !$force && is_absent($plain);
 
     my @spans = (
-        { text => sprintf('%-*s : ', LABEL_GUTTER(), tui::Frame::safe($label)), role => 'text.muted' },
+        { text => gutter($label), role => 'text.muted' },
         @value_spans,
     );
     return \@spans;
@@ -291,7 +336,7 @@ sub sampler_wait_spans {
     }
 
     return [
-        { text => sprintf('%-*s : ', LABEL_GUTTER(), 'snapshot'), role => 'text.muted' },
+        { text => gutter('snapshot'), role => 'text.muted' },
         { text => $text, role => $role },
     ];
 }
@@ -381,7 +426,7 @@ sub snapshot_spans {
     }
 
     return [
-        { text => sprintf('%-*s : ', LABEL_GUTTER(), 'snapshot'), role => 'text.muted' },
+        { text => gutter('snapshot'), role => 'text.muted' },
         { text => $text, role => $role },
     ];
 }
@@ -889,7 +934,7 @@ sub _spend_claude_spans {
     $c = {} unless ref($c) eq 'HASH';
     my $state = (defined($c->{state}) && $c->{state} eq 'ok') ? 'ok' : 'unreadable';
     my ($role, $key) = _spend_state_style($state);
-    my @spans = ( { text => _status_glyph($key) . ' ', role => $role }, { text => 'Claude : ', role => 'text.muted' } );
+    my @spans = ( { text => _status_glyph($key) . ' ', role => $role }, { text => pad_label('Claude', 6), role => 'text.muted' } );
     if ($state eq 'ok') {
         my @parts;
         for my $w (ref($c->{windows}) eq 'ARRAY' ? @{ $c->{windows} } : ()) {
@@ -911,7 +956,7 @@ sub _spend_go_spans {
     $g = {} unless ref($g) eq 'HASH';
     my $state = (defined($g->{state}) && $g->{state} =~ /^(?:absent|unreadable|exhausted|ok)$/) ? $g->{state} : 'absent';
     my ($role, $key) = _spend_state_style($state);
-    my @spans = ( { text => _status_glyph($key) . ' ', role => $role }, { text => 'Go     : ', role => 'text.muted' } );
+    my @spans = ( { text => _status_glyph($key) . ' ', role => $role }, { text => pad_label('Go', 6), role => 'text.muted' } );
     if ($state eq 'absent') {
         push @spans, { text => 'not configured', role => 'text.muted' };
     } elsif ($state eq 'unreadable') {
@@ -942,7 +987,7 @@ sub _spend_zen_spans {
     $z = {} unless ref($z) eq 'HASH';
     my $state = (defined($z->{state}) && $z->{state} =~ /^(?:disabled|absent|unreadable|exhausted|ok)$/) ? $z->{state} : 'disabled';
     my ($role, $key) = _spend_state_style($state);
-    my @spans = ( { text => _status_glyph($key) . ' ', role => $role }, { text => 'Zen    : ', role => 'text.muted' } );
+    my @spans = ( { text => _status_glyph($key) . ' ', role => $role }, { text => pad_label('Zen', 6), role => 'text.muted' } );
     if ($state eq 'disabled') {
         push @spans, { text => 'disabled', role => 'text.muted' };
     } elsif ($state eq 'absent') {
@@ -1122,7 +1167,7 @@ sub _providers_body {
             my $pct = (defined($top->{fraction}) && !ref($top->{fraction})
                        && $top->{fraction} =~ /^-?\d+(?:\.\d+)?$/)
                     ? sprintf('%d%%', int($top->{fraction} * 100 + 0.5)) : '?';
-            my $pline = [ { text => 'nearest : ', role => 'text.muted' },
+            my $pline = [ { text => pad_label('nearest', 7), role => 'text.muted' },
                           { text => "$top->{provider}/$top->{window} $pct", role => 'accent' } ];
             push @lines, (tui::Frame::spans_width($pline) > $w) ? tui::Frame::fit_spans($pline, $w) : $pline;
         }

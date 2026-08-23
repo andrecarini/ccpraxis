@@ -296,7 +296,14 @@ my %st = (
     # the expected text by CALLING fmt_age(3660), never re-pin "1h 1m 0s" or
     # its replacement "1h01m" as a literal.
     my $expected_uptime = Dashboard::fmt_age(3660);
-    like($joined, qr/uptime\s*:\s*\Q$expected_uptime\E/,
+    # AMENDED BY t05-no-colons: the label gutter's separator is now three
+    # spaces rather than " : " (operator: "we use way too many instances of the
+    # character `:`. Its distracting. We need none of them."). The intent here
+    # is untouched and is stated by the comment above -- it is about the
+    # DURATION FORMAT, re-derived by calling fmt_age rather than pinned as a
+    # literal. Matching on whitespace instead of a colon keeps that intent and
+    # stops the assertion re-pinning a separator it was never about.
+    like($joined, qr/uptime\s+\Q$expected_uptime\E/,
         "compose: uptime renders via the one duration format (fmt_age(3660) == $expected_uptime, never fmt_hms)");
 
     # PART 2 additions (s04-render-foundation, AC-8/INV-1): every cell carries
@@ -691,7 +698,13 @@ my %st = (
     my ($run) = grep { $_->{title} eq 'Run' } @panels;
     ok($run, 'backpack (re-pointed): a Run panel is present when a backpack structure is gathered');
 
-    my $bp_label = sprintf('%-*s : ', tui::DashboardScreen::LABEL_GUTTER(), 'backpack');
+    # AMENDED BY t05-no-colons, and the amendment makes this STRONGER rather
+    # than weaker. It re-derived the gutter width from LABEL_GUTTER but then
+    # hand-wrote " : " -- a half-derived expectation, which is what broke when
+    # the separator changed. It now calls the same helper the render path uses,
+    # which is exactly the discipline the comments a few lines below preach for
+    # the value spans.
+    my $bp_label = tui::DashboardScreen::gutter('backpack');
     my ($bprow) = $run ? (grep { $_->[0]{text} eq $bp_label } @{ $run->{lines} }) : ();
     ok($bprow, 'backpack (re-pointed): a backpack summary row exists in Run when gathered (subject moved off the deleted Backpack panel)');
 
