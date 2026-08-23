@@ -913,4 +913,163 @@ sub ELLIPSIS_COLS {
     return (defined $wd && !ref($wd) && $wd =~ /^\d+$/ && $wd > 0) ? $wd : 1;
 }
 
+# ---------------------------------------------------------------------------
+# table(\@rows, \%opts) -> \@span_rows -- column-aligned rows.
+#
+# Added for t04-blueprints-table (blueprint tui-operator-feedback). The
+# operator: "the blueprints section should be styled as a table because right
+# now its hard to see with things randomly aligned." It was literally that --
+# _one_run_summary_spans concatenated variable-width fields with no padding, so
+# nothing below the first field lined up with anything.
+#
+# WRITTEN ONCE, HERE, AND NOT INLINED INTO THE PANEL. That is the package's
+# criterion 2, and it exists because the predecessor initiative spent two
+# fix-batches on exactly this class of duplication. A second panel wanting
+# columns must not need a second implementation.
+#
+#   \@rows  -- each row is an arrayref of CELLS, one per column, in column
+#              order. A cell is either a plain string, or a spans arrayref, or
+#              a hash { spans => [...] } / { text => ..., role => ... }.
+#              A row may be SHORT; missing trailing cells render as empty.
+#   \%opts:
+#     width   => total display columns available (required to do anything
+#                other than natural sizing)
+#     gap     => columns between adjacent columns (default 2)
+#     align   => \@('left'|'right', ...) per column, default all left
+#     min     => \@(N, ...) per column -- the width below which a column is
+#                dropped rather than shrunk further. Default 1.
+#     drop    => \@(N, ...) per column -- drop order. The HIGHEST number goes
+#                first. A column with no entry is never dropped.
+#
+# NARROW BEHAVIOUR IS DECIDED, NOT INCIDENTAL (criterion 3), in this order:
+#   1. Every column at its natural width (the widest cell in it). If that fits,
+#      done -- and this is the common case.
+#   2. Otherwise DROP whole columns, highest `drop` first, until the rest fit at
+#      natural width. Dropping beats squeezing: three columns you can read are
+#      worth more than six you cannot, and a dropped column is obvious while a
+#      squeezed one silently lies about its content.
+#   3. If no droppable column is left and it still does not fit, SHRINK the
+#      widest remaining column one step at a time, never below its `min`.
+#   4. If it STILL does not fit, the row is emitted anyway and the caller's own
+#      fit_spans/make_cell clips it. This function never returns a row it
+#      claims fits when it does not.
+#
+# Cells are truncated with the same ellipsis wrap_capped uses, so a shortened
+# value is visibly shortened rather than quietly wrong.
+# ---------------------------------------------------------------------------
+sub table {
+    my ($rows, $opts) = @_;
+    return [] if ref($rows) ne 'ARRAY' || !@$rows;
+    $opts = {} if ref($opts) ne 'HASH';
+
+    my $gap = (defined $opts->{gap} && !ref($opts->{gap}) && $opts->{gap} =~ /^\d+$/) ? int($opts->{gap}) : 2;
+    my @align = (ref($opts->{align}) eq 'ARRAY') ? @{ $opts->{align} } : ();
+    my @min   = (ref($opts->{min})   eq 'ARRAY') ? @{ $opts->{min} }   : ();
+    my @drop  = (ref($opts->{drop})  eq 'ARRAY') ? @{ $opts->{drop} }  : ();
+
+    # Normalise every cell to a spans arrayref, and find the column count.
+    my @grid;
+    my $ncols = 0;
+    for my $r (@$rows) {
+        my @cells = (ref($r) eq 'ARRAY') ? @$r : ($r);
+        $ncols = @cells if @cells > $ncols;
+        push @grid, [ map { _table_cell_spans($_) } @cells ];
+    }
+    return [] if $ncols < 1;
+
+    # Natural widths.
+    my @nat = (0) x $ncols;
+    for my $row (@grid) {
+        for my $c (0 .. $ncols - 1) {
+            my $wd = defined $row->[$c] ? spans_width($row->[$c]) : 0;
+            $nat[$c] = $wd if $wd > $nat[$c];
+        }
+    }
+
+    my @live = grep { $nat[$_] > 0 || !defined $drop[$_] } 0 .. $ncols - 1;
+    my $total_w = (defined $opts->{width} && !ref($opts->{width}) && $opts->{width} =~ /^\d+$/)
+                ? int($opts->{width}) : undef;
+
+    my @width = @nat;
+    if (defined $total_w) {
+        my $fits = sub {
+            my $sum = 0;
+            $sum += $width[$_] for @live;
+            $sum += $gap * (scalar(@live) - 1) if @live > 1;
+            return $sum <= $total_w;
+        };
+
+        # (2) drop whole columns, highest `drop` first.
+        while (!$fits->() && @live > 1) {
+            my ($victim, $best);
+            for my $c (@live) {
+                next unless defined $drop[$c] && !ref($drop[$c]) && $drop[$c] =~ /^\d+$/;
+                if (!defined $best || $drop[$c] > $best) { $best = $drop[$c]; $victim = $c }
+            }
+            last unless defined $victim;
+            @live = grep { $_ != $victim } @live;
+        }
+
+        # (3) shrink the widest survivor, never below its floor.
+        while (!$fits->() && @live) {
+            my ($widest, $wmax);
+            for my $c (@live) {
+                my $floor = (defined $min[$c] && !ref($min[$c]) && $min[$c] =~ /^\d+$/) ? int($min[$c]) : 1;
+                next if $width[$c] <= $floor;
+                if (!defined $wmax || $width[$c] > $wmax) { $wmax = $width[$c]; $widest = $c }
+            }
+            last unless defined $widest;      # (4) nothing left to give
+            $width[$widest]--;
+        }
+    }
+
+    my @out;
+    for my $row (@grid) {
+        my @spans;
+        for my $i (0 .. $#live) {
+            my $c = $live[$i];
+            push @spans, { text => ' ' x $gap, role => PAD_ROLE() } if $i > 0 && $gap > 0;
+            push @spans, @{ _table_fit_cell($row->[$c], $width[$c], $align[$c]) };
+        }
+        push @out, \@spans;
+    }
+    return \@out;
+}
+
+# _table_cell_spans($cell) -> a spans arrayref. PRIVATE.
+sub _table_cell_spans {
+    my ($cell) = @_;
+    return [] if !defined $cell;
+    return $cell if ref($cell) eq 'ARRAY';
+    if (ref($cell) eq 'HASH') {
+        return $cell->{spans} if ref($cell->{spans}) eq 'ARRAY';
+        return [ _span_hash($cell) ];
+    }
+    return [ { text => "$cell", role => DEFAULT_ROLE() } ];
+}
+
+# _table_fit_cell(\@spans, $w, $align) -> a spans arrayref exactly $w columns
+# wide. Truncation carries the ellipsis, for the same reason wrap_capped's does:
+# a shortened value must be visibly shortened, never quietly wrong. PRIVATE.
+sub _table_fit_cell {
+    my ($spans, $w, $align) = @_;
+    $spans = [] if ref($spans) ne 'ARRAY';
+    $w = 0 if !defined $w || $w < 0;
+    return [] if $w == 0;
+
+    my $have = spans_width($spans);
+    if ($have > $w) {
+        my $room = $w - ELLIPSIS_COLS();
+        return [ { text => ELLIPSIS(), role => DEFAULT_ROLE() } ] if $room <= 0;
+        my $cut = fit_spans($spans, $room, DEFAULT_ROLE());
+        return [ @$cut, { text => ELLIPSIS(), role => DEFAULT_ROLE() } ];
+    }
+
+    my $pad = $w - $have;
+    return $spans if $pad == 0;
+    return (defined $align && $align eq 'right')
+        ? [ { text => ' ' x $pad, role => PAD_ROLE() }, @$spans ]
+        : [ @$spans, { text => ' ' x $pad, role => PAD_ROLE() } ];
+}
+
 1;

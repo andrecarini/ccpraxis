@@ -539,33 +539,85 @@ sub _nonneg_int {
     return (defined($v) && !ref($v) && $v =~ /^\d+$/) ? ($v + 0) : 0;
 }
 
-sub _one_run_summary_spans {
+# _one_run_summary_cells($s) -> \@cells, one per TABLE COLUMN, in column order.
+#
+# t04-blueprints-table. This used to be _one_run_summary_spans and returned one
+# flat, concatenated span list per run -- variable-width fields glued together
+# with two-space separators, so the state of run 2 sat under the middle of run
+# 1's name and nothing below the first field lined up with anything. The
+# operator's words: "hard to see with things randomly aligned."
+#
+# The change is that a row now describes its CELLS and lets tui::Frame::table
+# decide the widths, because only the table can see the other rows. A per-row
+# renderer structurally cannot align anything.
+#
+# The colon after the blueprint name is gone with the concatenation (Decision 2).
+# In a table the column IS the separator; a colon would be decoration.
+sub _one_run_summary_cells {
     my ($s) = @_;
     $s = {} unless ref($s) eq 'HASH';
+
     my $bp = (defined($s->{blueprint}) && !ref($s->{blueprint}) && length($s->{blueprint})) ? $s->{blueprint} : '?';
-    my @spans = ( { text => "$bp : ", role => 'accent' } );
-
     my $state = (defined($s->{state}) && !ref($s->{state}) && length($s->{state})) ? $s->{state} : '?';
-    push @spans, { text => $state, role => (_run_state_role_map()->{$state} // 'text.muted') };
-
     my $done  = _nonneg_int($s->{packages_done});
     my $total = _nonneg_int($s->{packages_total});
-    push @spans, { text => sprintf('  %d/%d pkg', $done, $total), role => 'text.primary' };
-
-    if (defined($s->{current_package}) && !ref($s->{current_package}) && length($s->{current_package})) {
-        my $cp = substr($s->{current_package}, 0, 200);
-        push @spans, { text => "  cur $cp", role => 'text.primary' };
-    }
-
     my $coord = _nonneg_int($s->{running_coordinators});
-    push @spans, { text => sprintf('  %d coord', $coord), role => 'accent' } if $coord > 0;
-
     my $waiting = _nonneg_int($s->{decisions_waiting});
-    if ($waiting > 0) {
-        push @spans, { text => sprintf('  %d waiting', $waiting), role => ($state eq 'paused' ? 'state.crit' : 'state.warn') };
-    }
 
-    return \@spans;
+    return [
+        [ { text => $bp,    role => 'accent' } ],
+        [ { text => $state, role => (_run_state_role_map()->{$state} // 'text.muted') } ],
+        [ { text => sprintf('%d/%d pkg', $done, $total), role => 'text.primary' } ],
+        [ { text => ($coord > 0 ? sprintf('%d coord', $coord) : ''), role => 'accent' } ],
+        [ { text => ($waiting > 0 ? sprintf('%d waiting', $waiting) : ''),
+            role => ($state eq 'paused' ? 'state.crit' : 'state.warn') } ],
+    ];
+}
+
+# _current_package_line($s) -> a spans row, or undef.
+#
+# THE CURRENT PACKAGE IS DELIBERATELY NOT A TABLE COLUMN, and the reason is a
+# rule this project already paid for. Package d02 of the predecessor initiative
+# closed bug report 20260814-093052-312a with a standing requirement, asserted
+# by plugins/sandbox/tests/t/75-wrap-on-overflow.t AC1: an overflowing row must
+# WRAP, and no word may be silently dropped. A table column that is given up
+# when the panel is narrow drops content -- which is exactly what that rule
+# forbids, and the first draft of this package did it. t/75 caught it.
+#
+# It is also bad table design independently. Every other field here is a short,
+# bounded token (a state word, two counters); a package identifier is
+# unbounded free text, and it is the single field most responsible for the
+# "randomly aligned" appearance the operator reported. Measured: at a typical
+# 48-column band, name + state + count + gaps already spend 45, so a `cur`
+# column would have been dropped on nearly every real screen -- present in the
+# design and absent from the display.
+#
+# As its own indented line it goes through _render_panel's ordinary wrap, so it
+# wraps like any other row and stays fully readable at any width.
+sub _current_package_line {
+    my ($s) = @_;
+    return undef unless ref($s) eq 'HASH';
+    my $cp = $s->{current_package};
+    return undef unless defined $cp && !ref($cp) && length $cp;
+    return [ { text => '  cur ' . substr($cp, 0, 200), role => 'text.primary' } ];
+}
+
+# The table's shape, declared once beside the cells it describes.
+#
+# `drop` is the order columns are given up when the panel is too narrow --
+# HIGHEST FIRST -- and only two columns carry one:
+#   coordinator count (2) goes first: an operational detail, not a status;
+#   waiting count (1) next, because it is the only field that says a human is
+#     BLOCKING the run.
+# Name, state and package count have no `drop` entry and are never dropped:
+# without them the row identifies nothing, and there would be no table left.
+sub _BLUEPRINT_TABLE_OPTS {
+    return {
+        gap   => 2,
+        align => [ 'left', 'left', 'right', 'right', 'right' ],
+        min   => [ 8,      4,      5,       3,       3       ],
+        drop  => [ undef,  undef,  undef,   2,       1       ],
+    };
 }
 
 # _run_summary_lines(\@runs, $max_rows) -- one row per blueprint.
@@ -580,20 +632,35 @@ sub _one_run_summary_spans {
 # unit tests want; a short terminal still gets a bounded panel rather than one
 # that crowds out everything below it.
 sub _run_summary_lines {
-    my ($runs, $max_rows) = @_;
+    my ($runs, $max_rows, $width) = @_;
     return [] unless ref($runs) eq 'ARRAY';
     my @summaries = grep { ref($_) eq 'HASH' } @$runs;
     return [] unless @summaries;
 
     $max_rows = scalar(@summaries)
         unless defined($max_rows) && !ref($max_rows) && $max_rows =~ /\A\d+\z/ && $max_rows >= 1;
-    my @out;
     my $shown = (@summaries < $max_rows) ? scalar(@summaries) : $max_rows;
-    push @out, _one_run_summary_spans($summaries[$_]) for (0 .. $shown - 1);
 
+    # THE WHOLE TABLE IS BUILT AT ONCE, which is the point: column widths come
+    # from every row that will be shown, so a reader can scan down a column.
+    # The "+N more" footer is deliberately NOT a table row -- it belongs to no
+    # column and would otherwise widen the first one for everybody.
+    my $opts = { %{ _BLUEPRINT_TABLE_OPTS() } };
+    $opts->{width} = $width if defined $width && !ref($width) && $width =~ /^\d+$/;
+    my $rows = tui::Frame::table(
+        [ map { _one_run_summary_cells($summaries[$_]) } 0 .. $shown - 1 ], $opts);
+
+    # Interleave each run's current-package line directly beneath its own row,
+    # so the association is positional and needs no repeated label.
+    my @out;
+    for my $i (0 .. $shown - 1) {
+        push @out, $rows->[$i] if defined $rows->[$i];
+        my $cur = _current_package_line($summaries[$i]);
+        push @out, $cur if $cur;
+    }
     if (@summaries > $max_rows) {
         my $extra = @summaries - $max_rows;
-        push @out, [ { text => "  +" . count_of($extra, "more blueprint"), role => 'text.muted' } ];
+        push @out, [ { text => "+" . count_of($extra, "more blueprint"), role => 'text.muted' } ];
     }
     return \@out;
 }
@@ -661,10 +728,48 @@ sub _run_body {
 # empty/absent/non-array $state->{runs} renders one honest no-data line
 # rather than an empty panel.
 # ===========================================================================
+# _blueprints_table_width($cols) -> the display columns a Blueprints row may
+# actually use, or undef when $cols says nothing useful.
+#
+# THE TABLE HAS TO SIZE ITSELF TO THE BAND IT WILL LAND IN, not to the terminal.
+# panels() is handed the FULL terminal width, but this panel is then placed into
+# one band of a multi-column layout and, since t03, into the main region left of
+# the activity column. Sizing to $cols would build a table two or three times
+# wider than the space it gets, and _render_panel's wrap would then break the
+# rows -- destroying exactly the alignment this package exists to create.
+#
+# So: subtract the side column, ask tui::Layout for the bands at that width,
+# and take the NARROWEST. Deliberately the narrowest rather than the band this
+# panel happens to occupy today: the placement depends on how many panels are
+# present and on their min_cols, and a table that silently over-runs when a
+# panel is added elsewhere would be a bug nobody connects to this code. The
+# cost of being conservative is that the table is sometimes narrower than it
+# could be; the cost of being wrong is a broken layout.
+sub _blueprints_table_width {
+    my ($cols) = @_;
+    return undef if !defined $cols || ref($cols) || $cols !~ /^\d+$/ || $cols < 1;
+    my $main = $cols - tui::Screen::side_column_width($cols);
+    my $bands = tui::Layout::columns($main);
+    return undef if ref($bands) ne 'ARRAY' || !@$bands;
+    my $narrow;
+    for my $b (@$bands) {
+        next unless ref($b) eq 'HASH' && defined $b->{w};
+        $narrow = $b->{w} if !defined $narrow || $b->{w} < $narrow;
+    }
+    return undef if !defined $narrow;
+    # _render_panel bakes a two-column body indent into every row before
+    # wrapping, and adds WRAP_CONTINUATION_INDENT on top for any row that does
+    # wrap. Give the table the room that is actually left after the indent, so
+    # a table that reports as fitting genuinely does.
+    my $avail = $narrow - 2;
+    return $avail > 0 ? $avail : undef;
+}
+
 sub _blueprints_body {
-    my ($state) = @_;
+    my ($state, $cols) = @_;
     $state = {} unless ref($state) eq 'HASH';
-    my $lines = _run_summary_lines($state->{runs}, $state->{blueprint_rows_max});
+    my $lines = _run_summary_lines($state->{runs}, $state->{blueprint_rows_max},
+                                   _blueprints_table_width($cols));
     return $lines if @$lines;
     return [ row({ label => 'blueprints', value => 'no active runs', role => 'text.muted', force => 1 }) ];
 }
@@ -1065,7 +1170,7 @@ sub panels {
     my @out;
 
     push @out, { title => 'Run', lines => _run_body($state) };
-    push @out, { title => 'Blueprints', lines => _blueprints_body($state) };
+    push @out, { title => 'Blueprints', lines => _blueprints_body($state, $cols) };
 
     # RESOURCES IS ALWAYS PRESENT, for the same reason the geometry is fixed.
     #
