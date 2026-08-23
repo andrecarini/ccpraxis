@@ -5954,24 +5954,32 @@ sub _keepawake_reap_orphan {
 # _count_needs_you($project) -> count of queued "needs you" decision entries
 # across every blueprint's runs/needs-you/ (Decision #27's dashboard indicator).
 # opendir/readdir (not glob) so project paths with spaces / André bytes are safe.
+# t07-needs-you-lifecycle: this no longer counts FILES. It counts decisions
+# that are still live, using RunState's own summaries -- which already apply
+# the settle rule, already read each blueprint's ledgers, and already know
+# whether a run is over.
+#
+# The operator's report was that the panel said "1 decision waiting" for a run
+# whose agent had nothing outstanding. It did, because eight scripts write into
+# runs/needs-you/ and one narrow path clears it, so a finished package leaves
+# its question queued forever.
+#
+# DERIVED FROM THE SAME SUMMARIES THE Blueprints PANEL RENDERS, deliberately,
+# rather than re-walking the tree with a second copy of the rule. The header
+# indicator and the per-run rows now cannot disagree -- and a second walk is
+# exactly how the old inner loop drifted from being a lifecycle in the first
+# place.
 sub _count_needs_you {
     my ($project) = @_;
-    my $base = "$project/.ccpraxis-local-data/blueprints";
-    return 0 unless -d $base;
+    my $runs = RunState::summarize("$project/.ccpraxis-local-data/blueprints");
+    return 0 unless ref($runs) eq 'ARRAY';
     my $n = 0;
-    opendir(my $bd, $base) or return 0;
-    for my $bp (readdir $bd) {
-        next if $bp eq '.' || $bp eq '..';
-        my $nd = "$base/$bp/runs/needs-you";
-        next unless -d $nd;
-        opendir(my $d, $nd) or next;
-        for my $f (readdir $d) {
-            next if $f =~ /^\./ || $f =~ /\.tmp$/;   # skip dotfiles + atomic-write temps
-            $n++ if -f "$nd/$f";
-        }
-        closedir $d;
+    for my $r (@$runs) {
+        next unless ref($r) eq 'HASH';
+        my $d = $r->{decisions_waiting};
+        next unless defined $d && !ref($d) && $d =~ /^\d+$/;
+        $n += $d;
     }
-    closedir $bd;
     return $n;
 }
 

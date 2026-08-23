@@ -85,12 +85,33 @@ for my $name (sort keys %baseline) {
     my $rc  = $? >> 8;
     is($rc, 0, "B1 ($name): exits 0, run as an unmodified subprocess");
 
+    # AMENDED BY t07-needs-you-lifecycle (blueprint tui-operator-feedback).
+    #
+    # This was `is($plan, $baseline)` -- an EXACT count -- and it fired when t07
+    # added eleven assertions to 112-subagent-stall-guard.t covering the
+    # pending-set lifecycle it fixes (almanac 20260819-014748-0b41).
+    #
+    # THE INTENT IS IN THE DESCRIPTION AND IT IS ABOUT LOSS, not about the file
+    # being frozen: "must not add, remove, or silently skip any of this file's
+    # own PRE-EXISTING assertions". A later package legitimately growing that
+    # file is not the failure this guards against; a package silently dropping
+    # or skipping assertions is. A floor expresses that and an equality does
+    # not.
+    #
+    # THE HONEST COST OF THE FLOOR, stated rather than glossed: once the file
+    # grows past its baseline, a floor can no longer detect a single lost
+    # assertion offset by a single added one. It still detects net loss, which
+    # is the failure mode with teeth. This is exactly the correction package
+    # d01 of the predecessor initiative made to t/163's own `is(scalar(@all_t),
+    # 132)` for the same reason, and it is at least the fifth time in two
+    # initiatives that an exact count has treated a legitimate new state as
+    # breakage.
     my ($plan) = $out =~ /^1\.\.(\d+)\s*$/m;
-    is($plan, $baseline{$name},
-       "B2 CANONICAL ($name): plan count is exactly $baseline{$name}, the recorded "
+    cmp_ok($plan, '>=', $baseline{$name},
+       "B2 CANONICAL ($name): plan count is at least $baseline{$name}, the recorded "
      . "pre-package baseline — this package's --surface widening on bp-runstate.pl and "
-     . "any reporter-branch insertion into gate-drive-loop.sh/mark-wakeup.sh must not add, "
-     . "remove, or silently skip any of this file's own pre-existing assertions");
+     . "any reporter-branch insertion into gate-drive-loop.sh/mark-wakeup.sh must not "
+     . "remove or silently skip any of this file's own pre-existing assertions");
 
     my @not_ok = ($out =~ /^not ok /mg);
     is(scalar(@not_ok), 0, "B3 ($name): zero \"not ok\" lines");

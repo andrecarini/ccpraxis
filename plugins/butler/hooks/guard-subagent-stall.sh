@@ -156,14 +156,39 @@ case "$EVENT" in
     # "does anything look wrong?", and a detector is only as good as its
     # guesses -- one accepted a guard that had already died, the other could be
     # sidestepped by rephrasing a sentence.
-    [ -f "$STATE_DIR/force-stop" ] && exit 0
+    # THE PENDING SET IS CLEARED WHEN THE TURN IS ALLOWED TO END, AND ONLY THEN.
+    #
+    # Closes almanac report 20260819-014748-0b41, filed against this hook: the
+    # state file was append-only and nothing ever truncated it, so the denial
+    # message below listed EVERY background dispatch of the whole session under
+    # the heading "this turn". By the end of a long unattended run that is fifty
+    # entries, most of them hours old and already resolved -- noise that buries
+    # the two lines an operator actually needs to read.
+    #
+    # It is the same shape as the defect package t07 exists to fix in
+    # runs/needs-you/: broad write, no clear. The rule that resolves both is the
+    # same one -- clear when the thing the record was tracking is demonstrably
+    # over -- and here that moment is unambiguous: an ALLOWED Stop means the run
+    # was resolved (finished, or paused behind a watcher whose pid and deadline
+    # bp-runstate.pl verified), so every dispatch recorded up to now is
+    # accounted for.
+    #
+    # DELIBERATELY NOT CLEARED ON A DENIED STOP. A dispatch made two turns ago
+    # and still unresolved is still unresolved, and dropping it would hide
+    # exactly the thing this hook exists to surface. That is why the heading now
+    # says "since the last resolved turn" rather than "this turn" -- the old
+    # wording was a second, smaller defect in the same report: it described a
+    # window the file never had.
+    _clear_pending() { : > "$STATE" 2>/dev/null || true; }
+
+    [ -f "$STATE_DIR/force-stop" ] && { _clear_pending; exit 0; }
 
     RS="$HOOK_DIR/../scripts/bp-runstate.pl"
     [ -f "$RS" ] || exit 0                      # fail open: no state machine, no gate
     ST=$(perl "$RS" status --root "$ROOT" 2>/dev/null) || exit 0
     case "$ST" in
       *'"state":"active"'*) ;;                 # fall through to the denial
-      *) exit 0 ;;                              # inert / paused / finished -> allow
+      *) _clear_pending; exit 0 ;;              # inert / paused / finished -> allow
     esac
 
     PENDING=""
@@ -173,7 +198,7 @@ case "$EVENT" in
 
     cat >&2 <<EOF
 BLOCKED: a run is ACTIVE and this turn did not resolve it.$STALE
-${PENDING:+Unguarded background dispatch(es) this turn: $PENDING
+${PENDING:+Unguarded background dispatch(es) since the last resolved turn: $PENDING
 }
 A turn that ends mid-run without resolving it is how an unattended run dies:
 nothing is scheduled, nothing wakes the session, and the work simply stops.

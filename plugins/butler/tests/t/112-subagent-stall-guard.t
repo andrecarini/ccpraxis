@@ -280,4 +280,60 @@ sub newroot { my $r = tempdir(CLEANUP => 1); mkdir "$r/.ccpraxis-local-data"; re
     like(($post//{})->{matcher}//'', qr/Bash/, '...and Bash');
 }
 
+# ======================= THE PENDING SET HAS A LIFECYCLE ====================
+#
+# Closes almanac report 20260819-014748-0b41, filed against this hook. The
+# pending-dispatch file was APPEND-ONLY and nothing ever truncated it, so the
+# denial message listed every background dispatch of the whole session under the
+# heading "this turn". By the end of a long unattended run that is dozens of
+# entries, most hours old and already resolved -- noise burying the two lines an
+# operator needs.
+#
+# Broad write, no clear: the same shape as the runs/needs-you/ defect package
+# t07 exists to fix, which is why the two were closed together. The rule that
+# resolves both is the same one -- clear when the thing the record tracked is
+# demonstrably over.
+{
+    my $r = newroot();
+    my $state = "$r/.ccpraxis-local-data/.subagent-guard/sess-t112";
+
+    fire($r, dispatch(1, 'worker one'));
+    fire($r, dispatch(1, 'worker two'));
+    ok(-s $state, 'pending-set precondition: two background dispatches are recorded');
+
+    # A DENIED stop must NOT clear. A dispatch made two turns ago and still
+    # unresolved is still unresolved, and dropping it would hide exactly what
+    # this hook exists to surface.
+    my (undef, $denied) = fire($r, stop());
+    like($denied, qr/worker one/, 'a denied Stop still names the earlier dispatch');
+    like($denied, qr/worker two/, '...and the later one');
+    ok(-s $state, 'a DENIED Stop leaves the pending set intact -- an unresolved dispatch stays reported');
+
+    # ...and the heading no longer claims a window the file never had.
+    unlike($denied, qr/dispatch\(es\) this turn/,
+        'the denial no longer says "this turn" about a set that spans the session');
+    like($denied, qr/since the last resolved turn/,
+        'it names the window the set actually covers');
+
+    # A RESOLVED run means every recorded dispatch is accounted for, so an
+    # ALLOWED stop clears.
+    my $rs = "$Bin/../../scripts/bp-runstate.pl";
+  SKIP: {
+        skip('bp-runstate.pl not found', 3) unless -f $rs;
+        system(qq{perl "$rs" finish --root "$r" --reason "test" >/dev/null 2>&1});
+        my ($rc2, $err2) = fire($r, stop());
+        is($rc2, 0, 'a finished run lets the turn end');
+        is($err2, '', '...silently');
+        ok(!-s $state, 'and an ALLOWED Stop clears the pending set, so the next turn starts from empty');
+    }
+
+    # Non-vacuity: the clear is real, not an artefact of the file never having
+    # been written. A fresh dispatch after the clear must reappear.
+    fire($r, dispatch(1, 'worker three'));
+    my (undef, $again) = fire($r, stop());
+    like($again, qr/worker three/, 'a dispatch AFTER the clear is reported again');
+    unlike($again, qr/worker one/,
+        'and the cleared ones do not come back -- the truncation is a real reset, not a display filter');
+}
+
 done_testing();

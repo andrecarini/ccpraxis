@@ -281,14 +281,90 @@ sub _paused_info {
     return ($manual, $reason);
 }
 
-# _count_decisions($needs_you_dir) -> $n (private)
+# ===========================================================================
+# t07-needs-you-lifecycle. Operator, verbatim: "the TUI for GSA says 'needs
+# you: 1 decision waiting' despite the agent that was working on it doesn't
+# really have anything that needs my attention?"
+#
+# COUNTING FILES IN A DIRECTORY IS NOT A LIFECYCLE, and that was the whole
+# defect. Eight scripts write into runs/needs-you/ and exactly ONE narrow path
+# clears them (bp-answer-decision.pl's clear_pkg_decisions, and only for a
+# direct package reset). Everything else -- a package that finished normally, a
+# run that ended, a fleet question the operator resolved some other way --
+# leaves its file behind forever, and the panel keeps asking.
+#
+# THE FAILURE DIRECTION IS NOT SYMMETRIC (done-criterion 4). A decision wrongly
+# kept is a panel that nags. A decision wrongly dropped is a human who is never
+# asked. So every rule below is conservative BY CONSTRUCTION: a record is live
+# unless something demonstrably settled it, and every unreadable, malformed,
+# ambiguous or unrecognised case counts as live.
+#
+# A decision is SETTLED only when the thing it was blocking is demonstrably
+# finished:
+#
+#   1. Its package's ledger says `done` or `dropped`. That is not a new
+#      judgement -- it is the SAME set bp-orchestrator.pl's %DECISION_VALIDITY
+#      already uses to REFUSE FILING one of these. If a package being done
+#      means "do not file this", then a decision filed earlier and now done is
+#      equally moot. The symmetry is the argument.
+#
+#   2. Or the RUN ITSELF is over: no live orchestrator and no .paused marker.
+#      A decision blocking a run that has finished cannot still be blocking it.
+#      This is what covers the fleet-family kinds (reauth, contract-drift,
+#      broken-env), which name no real package.
+#
+# WHY NOT SIMPLY "no .paused means settled": some kinds are filed WITHOUT
+# pausing the run, so a rule keyed on .paused alone would read them as settled
+# the instant they were written -- silently dropping a real pending decision,
+# which is precisely the direction done-criterion 4 forbids. Requiring the run
+# to be over as well is what makes rule 2 safe.
+# ===========================================================================
+
+# The ledger statuses that settle a package-scoped decision. Deliberately NOT
+# including 'blocked' or 'parked': those are exactly the states that mean a
+# human is still needed.
+my %SETTLED_STATUS = map { $_ => 1 } qw(done dropped);
+
+# decision_live(\%rec, $blueprint_dir, $runs_dir, $run_over) -> 1 | 0. PUBLIC
+# and pure (one small file read at most, no writes, no clock, never dies).
+#
+# $run_over is supplied by the caller rather than derived here, because
+# deciding whether a run is over needs the orchestrator-pid liveness probe,
+# which this module deliberately does not perform itself (see the header's
+# Decision 3 note -- the kill(0) syscall lives in launcher.pl).
+sub decision_live {
+    my ($rec, $blueprint_dir, $runs_dir, $run_over) = @_;
+
+    # Anything we cannot read or recognise stays LIVE. This is the branch that
+    # protects a real pending decision from a schema change, a truncated write
+    # or a record from a future version of the queue.
+    return 1 unless ref($rec) eq 'HASH';
+
+    my $pkg = $rec->{package};
+    if (defined $pkg && !ref($pkg) && length $pkg && _safe_pkg_name($pkg)
+        && -f "$blueprint_dir/packages/$pkg.md") {
+        my $status = _ledger_status($blueprint_dir, $pkg);
+        # An empty status means the ledger could not be read or carries none.
+        # That is not evidence of settlement, so the decision stays live.
+        return 1 unless length $status;
+        return $SETTLED_STATUS{$status} ? 0 : 1;
+    }
+
+    # No package ledger to consult -- fleet-family kinds, pseudo-packages, and
+    # anything whose ledger has been removed. Settled only if the run is over.
+    return $run_over ? 0 : 1;
+}
+
+# _count_decisions($needs_you_dir, $blueprint_dir, $run_over) -> $n (private)
 #
 # opendir $needs_you_dir; counts entries that are plain files, skipping any
-# name beginning with '.' and any name ending in '.tmp'. Missing directory,
-# a symlinked directory, or opendir failure -> 0. Deliberately identical to
-# launcher.pl's _count_needs_you inner loop (AC-25).
+# name beginning with '.' and any name ending in '.tmp' -- and, since t07,
+# skipping any whose record decision_live says is settled.
+#
+# $blueprint_dir undef restores the pre-t07 behaviour of counting every file,
+# which is what a caller with no blueprint context can honestly report.
 sub _count_decisions {
-    my ($dir) = @_;
+    my ($dir, $blueprint_dir, $run_over) = @_;
     return 0 if -l $dir;
     return 0 unless -d $dir;
     opendir(my $dh, $dir) or return 0;
@@ -296,10 +372,27 @@ sub _count_decisions {
     for my $f (readdir $dh) {
         next if $f =~ /^\./;
         next if $f =~ /\.tmp$/;
-        $n++ if -f "$dir/$f";
+        next unless -f "$dir/$f";
+        if (defined $blueprint_dir) {
+            my $rec = _read_json_capped("$dir/$f");
+            next unless decision_live($rec, $blueprint_dir, $dir, $run_over);
+        }
+        $n++;
     }
     closedir $dh;
     return $n;
+}
+
+# _read_json_capped($path) -> decoded value | undef (private). Size-capped and
+# eval-wrapped, matching _paused_info's discipline: a queue directory is
+# writable by anything in the container, so a planted multi-GB file must not
+# freeze a render tick.
+sub _read_json_capped {
+    my ($path) = @_;
+    my $blob = _read_head($path, $MAX_MARKER_BYTES);
+    return undef unless defined $blob && length $blob;
+    my $data = eval { JSON::PP->new->decode($blob) };
+    return ref($data) ? $data : undef;
 }
 
 # _pid_state($pid) -> 1 | 0 | undef (private)
@@ -522,7 +615,15 @@ sub summarize_dir {
     my $running_coordinators = ($has_orch && !$dead && $reg_usable) ? $running_count : 0;
 
     my ($paused_manual, $paused_reason) = _paused_info("$runs_dir/.paused");
-    my $decisions_waiting = _count_decisions("$runs_dir/needs-you");
+
+    # t07: "the run is over" is exactly what $state already computes, so it is
+    # read from there rather than re-derived. `idle` and `solo` mean nothing is
+    # running and nothing is paused; `parked` means a shutdown marker is
+    # present. `stale` is deliberately NOT in the set: a dead orchestrator with
+    # a .paused still on disk is an abandoned run, and abandoning a run is not
+    # the same as answering the question it was blocked on.
+    my $run_over = ($state eq 'idle' || $state eq 'solo' || $state eq 'parked') ? 1 : 0;
+    my $decisions_waiting = _count_decisions("$runs_dir/needs-you", $blueprint_dir, $run_over);
 
     my $bp_name = $blueprint_dir;
     $bp_name =~ s{/+$}{};

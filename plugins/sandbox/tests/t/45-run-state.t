@@ -971,14 +971,32 @@ sub can_detect_symlink {
 # 8. decisions_waiting -- B25, B26 -> AC-10.
 # ===========================================================================
 {
+    # AMENDED BY t07-needs-you-lifecycle (blueprint tui-operator-feedback).
+    #
+    # THIS ASSERTION'S SUBJECT IS THE SKIP RULES -- which directory entries are
+    # eligible to be counted at all (plain files yes; .tmp, dotfiles and
+    # subdirectories no). It is not about the decision lifecycle, which t07
+    # added and which plugins/sandbox/tests/t/95-needs-you-lifecycle.t owns.
+    #
+    # The fixture used to write each record as a bare `{}`. Under t07's rule
+    # that is a record with no package to resolve against, in a blueprint with
+    # no orchestrator and no .paused -- i.e. a run that is OVER -- so all three
+    # are correctly SETTLED and the count is 0. The skip rules were never
+    # exercised; the assertion had silently changed subject.
+    #
+    # So the records are now unambiguously LIVE (each names a package whose
+    # ledger reads `blocked`, the state that most clearly still needs a human),
+    # and the assertion tests exactly what its description says again.
     my $root = tempdir(CLEANUP => 1);
+    my $blocked_ledger = "---\npackage: p\nstatus: blocked\n---\n\n# body\n";
     my $dir = make_blueprint($root, 'decisions', registry => registry_json(),
+        packages  => { p1 => $blocked_ledger, p2 => $blocked_ledger, p3 => $blocked_ledger },
         needs_you => [
-            { name => 'a.json' },
-            { name => 'b.json' },
-            { name => 'c.json' },
-            { name => 'skip.tmp' },
-            { name => '.hidden' },
+            { name => 'a.json',   content => '{"package":"p1","kind":"stuck-package"}' },
+            { name => 'b.json',   content => '{"package":"p2","kind":"stuck-package"}' },
+            { name => 'c.json',   content => '{"package":"p3","kind":"stuck-package"}' },
+            { name => 'skip.tmp', content => '{"package":"p1","kind":"stuck-package"}' },
+            { name => '.hidden',  content => '{"package":"p1","kind":"stuck-package"}' },
             { name => 'a-subdir', is_dir => 1 },
         ]);
     is(field(RS('summarize_dir', $dir), 'decisions_waiting'), 3,
@@ -1044,11 +1062,34 @@ sub can_detect_symlink {
 #     _count_needs_you counting rule (same skip rules, by construction).
 # ===========================================================================
 {
+    # AMENDED BY t07-needs-you-lifecycle, for the same reason as B25 above and
+    # with one extra note.
+    #
+    # mirror_count_needs_you is an independent reimplementation of the SKIP
+    # RULES, and that is still exactly what it is worth here. What it can no
+    # longer mirror is the launcher's whole counting rule, because t07 made the
+    # launcher derive its number from RunState::summarize rather than walk the
+    # tree itself -- so "the two agree" is now true by construction, and
+    # asserting it against a third hand-written walk would be asserting a
+    # tautology while pretending otherwise.
+    #
+    # What this pair still earns: the skip rules agree between the mirror and
+    # RunState. The lifecycle half is owned by
+    # plugins/sandbox/tests/t/95-needs-you-lifecycle.t, and the launcher's
+    # derivation is pinned by that file's AC5.
     my $root = tempdir(CLEANUP => 1);
+    my $blocked = "---\npackage: p\nstatus: blocked\n---\n\n# body\n";
+    my $live    = sub { my ($p) = @_; qq({"package":"$p","kind":"stuck-package"}) };
     make_blueprint($root, 'x1', registry => registry_json(),
-        needs_you => [ { name => 'a.json' }, { name => 'b.json' }, { name => '.dot' }, { name => 'z.tmp' } ]);
+        packages  => { p1 => $blocked, p2 => $blocked },
+        needs_you => [ { name => 'a.json', content => $live->('p1') },
+                       { name => 'b.json', content => $live->('p2') },
+                       { name => '.dot',   content => $live->('p1') },
+                       { name => 'z.tmp',  content => $live->('p1') } ]);
     make_blueprint($root, 'x2', registry => registry_json(),
-        needs_you => [ { name => 'c.json' }, { name => 'sub', is_dir => 1 } ]);
+        packages  => { p3 => $blocked },
+        needs_you => [ { name => 'c.json', content => $live->('p3') },
+                       { name => 'sub', is_dir => 1 } ]);
     make_blueprint($root, 'x3', registry => registry_json());   # no needs-you/ at all
     make_blueprint($root, 'x4-broken', registry => 'not json');   # malformed, excluded from summarize entirely
 

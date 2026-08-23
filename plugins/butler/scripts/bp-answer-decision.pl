@@ -395,6 +395,145 @@ sub clear_pkg_decisions {
     return $n;
 }
 
+# ===========================================================================
+# t07-needs-you-lifecycle (blueprint tui-operator-feedback).
+#
+# Operator: "the TUI for GSA says 'needs you: 1 decision waiting' despite the
+# agent that was working on it doesn't really have anything that needs my
+# attention?"
+#
+# BROAD WRITE, NARROW CLEAR. Eight scripts write into runs/needs-you/ --
+# bp-answer-decision.pl, bp-contract.pl, bp-judge.pl, bp-orchestrator.pl,
+# bp-resolve.pl, bp-shape-lint.pl, bp-token-keeper.pl, bp-wait-for-decision.pl
+# -- and until now exactly ONE path cleared anything: clear_pkg_decisions
+# above, and only for a DIRECT package reset. A package that simply finished,
+# or a run that simply ended, left its question queued forever.
+#
+# THE SETTLE RULE IS DUPLICATED FROM RunState::decision_live, ON PURPOSE, and
+# t/95's parity check pins the two together so drift is caught rather than
+# assumed away. It is the same technique statusline.pl already uses for
+# bp_continuity_active_dir ("Path resolution is duplicated ... ON PURPOSE --
+# this file stays a standalone installed payload"; AC-13 pins the parity). The
+# alternative was a butler script requiring a sandbox module, which is a
+# dependency this tree does not have in either direction.
+#
+# WHY THE READER FILTERS *AND* THIS SWEEPS. The reader alone would make the
+# count right while the files accumulated forever. This sweep alone would never
+# reach the operator's case at all: their run had ENDED, so nothing was ticking
+# to run it -- the same trap package t02 found with spend, where the only
+# writer was a fleet orchestrator an interactive session never starts. Both
+# halves are needed, and neither is redundant.
+# ===========================================================================
+
+my %SWEEP_SETTLED_STATUS = map { $_ => 1 } qw(done dropped);
+
+# _sweep_ledger_status($bpdir, $pkg) -> normalised status, or '' (PRIVATE).
+sub _sweep_ledger_status {
+    my ($bpdir, $pkg) = @_;
+    return '' unless defined $pkg && !ref($pkg) && length $pkg;
+    return '' if $pkg =~ m{[\\/\x00]};
+    my $path = "$bpdir/packages/$pkg.md";
+    return '' unless -f $path;
+    open(my $fh, '<:raw', $path) or return '';
+    read($fh, my $blob, 65536);
+    close $fh;
+    return '' unless defined $blob && length $blob;
+    my @lines = split /\n/, $blob, -1;
+    return '' unless @lines && $lines[0] eq '---';
+    for (my $i = 1; $i <= $#lines; $i++) {
+        last if $lines[$i] eq '---';
+        next if length($lines[$i]) > 1024;
+        if ($lines[$i] =~ /^status:[ \t]*(.*)$/) {
+            my $s = $1;
+            $s =~ s/^\s+//; $s =~ s/\s+$//;
+            return lc $s;
+        }
+    }
+    return '';
+}
+
+# decision_live(\%rec, $bpdir, $run_over) -> 1 | 0.
+#
+# The mirror of RunState::decision_live. Conservative by construction: a record
+# is LIVE unless something demonstrably settled it, because the failure
+# directions are not symmetric -- a decision wrongly kept is a panel that nags,
+# a decision wrongly dropped is a human who is never asked.
+sub decision_live {
+    my ($rec, $bpdir, $run_over) = @_;
+    return 1 unless ref($rec) eq 'HASH';
+
+    my $pkg = $rec->{package};
+    if (defined $pkg && !ref($pkg) && length $pkg && $pkg !~ m{[\\/\x00]}
+        && -f "$bpdir/packages/$pkg.md") {
+        my $status = _sweep_ledger_status($bpdir, $pkg);
+        return 1 unless length $status;
+        return $SWEEP_SETTLED_STATUS{$status} ? 0 : 1;
+    }
+    return $run_over ? 0 : 1;
+}
+
+# sweep_settled($runs, $bpdir, $run_over) -> \@swept
+#
+# Archives every settled queue record to runs/resolved-escalations/ and removes
+# it from the queue.
+#
+# ARCHIVED, NOT DELETED, and that is not tidiness. e03's provenance design
+# states that a deleted decision id with NO archive entry is itself the record
+# that a human answered it (see bp-resolve.pl's own header). An auto-settle
+# that merely unlinked would forge that signal -- the audit trail would claim
+# the operator disposed of something they never saw. So each swept record lands
+# in the same archive bp-resolve.pl writes, marked with who settled it and why.
+sub sweep_settled {
+    my ($runs, $bpdir, $run_over) = @_;
+    my $dir = "$runs/needs-you";
+    return [] unless -d $dir;
+    opendir(my $h, $dir) or return [];
+    my @files = grep { /\.json$/ } readdir $h;
+    closedir $h;
+
+    my @swept;
+    for my $f (@files) {
+        my $qpath = "$dir/$f";
+        my $rec = BpOrch::_read_json($qpath);
+        next if decision_live($rec, $bpdir, $run_over);
+
+        my ($id) = $f =~ /^(.*)\.json$/;
+        my $reason = (ref($rec) eq 'HASH' && defined $rec->{package}
+                      && -f "$bpdir/packages/$rec->{package}.md")
+                   ? 'package reached ' . _sweep_ledger_status($bpdir, $rec->{package})
+                   : 'the run ended with no live orchestrator and no pause';
+
+        # THROUGH BpOrch's OWN ATOMIC WRITER, not a second one of this script's.
+        #
+        # _write_json_atomic already does make_path, temp+rename and
+        # never-fatal error handling -- the same contract bp-resolve.pl's
+        # archive path relies on. Hand-rolling an equivalent here would have
+        # duplicated that logic AND tripped a standing census in
+        # t/69-answer-decision-completeness.t and t/70-decision-delivery.t,
+        # which pin this file to exactly ONE raw '>:raw' writer so that a new
+        # feature cannot quietly grow a second independent ledger writer.
+        #
+        # Those two assertions caught this in the pre-commit sweep, and they
+        # were right for a reason adjacent to their stated one: my writer was
+        # not a LEDGER writer, so it did not violate their intent -- but
+        # reaching for the shared writer instead of arguing the distinction is
+        # the better answer, and it left both assertions untouched.
+        my $ok = BpOrch::_write_json_atomic("$runs/resolved-escalations/$id.json", {
+            original    => $rec,
+            resolved_by => 'auto-settle',
+            applied     => JSON::PP::false(),
+            reason      => $reason,
+        });
+        # REFUSE TO REMOVE WHAT WE COULD NOT RECORD. A queue file deleted
+        # without its archive entry is indistinguishable from a human answer,
+        # so a failed archive write must leave the queue alone rather than
+        # trade an over-count for a corrupted audit trail.
+        next unless $ok;
+        push @swept, $id if unlink $qpath;
+    }
+    return \@swept;
+}
+
 # _log_pseudo_ack($runs, $pkg, $kind, $note) — e04 §2.2: a pseudo-package
 # acknowledge has no ledger to carry --note (there is nothing to append to),
 # so the note is not fabricated into a location that doesn't exist. Best-
@@ -414,6 +553,9 @@ unless (caller) {
     my ($bp, $bpdir, $decision, $package, $action, $note, $widen_write_set, $set_write_set);
     # e02 §2.7: --list is a new, standalone, READ-ONLY surface (mutates nothing).
     my ($list_mode, $category_arg);
+    # t07: --sweep is a second standalone surface. Unlike --list it MUTATES,
+    # but only by archiving records the settle rule proves are over.
+    my $sweep_mode;
     my @pos;
     my $need = sub {
         my ($flag) = @_;
@@ -433,6 +575,7 @@ unless (caller) {
         elsif ($arg eq '--widen-write-set') { $widen_write_set = $need->('--widen-write-set'); }
         elsif ($arg eq '--set-write-set')   { $set_write_set   = $need->('--set-write-set'); }
         elsif ($arg eq '--list')            { $list_mode       = 1; }
+        elsif ($arg eq '--sweep')           { $sweep_mode      = 1; }
         elsif ($arg eq '--category')        { $category_arg    = $need->('--category'); }
         elsif ($arg =~ /^--/)               { print STDERR "bp-answer-decision: unknown option $arg\n"; exit 2; }
         else  { push @pos, $arg; }
@@ -476,6 +619,22 @@ unless (caller) {
     # resolved. Read-only: scans runs/needs-you/*.json, prints one JSON object
     # per matching record, sorted oldest-created_at first (ties by id, mirroring
     # BpWait::fresh_decisions's order), and mutates nothing.
+    # t07: --sweep. Read the run's own liveness the same way RunState does --
+    # a run is over when no orchestrator marker is present and no .paused is,
+    # which is the only state in which a fleet-family decision can be settled
+    # without a package ledger to consult.
+    if ($sweep_mode) {
+        if (defined $package || defined $decision || $list_mode) {
+            print STDERR "bp-answer-decision: use --sweep alone\n"; exit 2;
+        }
+        my $run_over = (!-e "$runs/.orchestrator" && !-e "$runs/.paused") ? 1 : 0;
+        my $swept = sweep_settled($runs, $bpdir, $run_over);
+        print JSON::PP->new->canonical->encode({
+            swept => scalar(@$swept), ids => $swept, run_over => ($run_over ? JSON::PP::true() : JSON::PP::false()),
+        }), "\n";
+        exit 0;
+    }
+
     if ($list_mode) {
         if (defined $package || defined $decision) {
             print STDERR "bp-answer-decision: use --list OR --decision/--package, not both\n"; exit 2;
