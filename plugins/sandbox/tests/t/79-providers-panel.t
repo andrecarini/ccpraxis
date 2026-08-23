@@ -335,8 +335,23 @@ sub runs_n {
         ok((grep { /Claude Code/ } @$texts), 'Behavior8: Claude Code heading still renders with spend absent');
         ok((grep { /OpenCode Go/ } @$texts), 'Behavior8: OpenCode Go heading still renders with spend absent');
         ok((grep { /OpenCode Zen/ } @$texts), 'Behavior8: OpenCode Zen heading still renders with spend absent');
-        my @footnote = grep { /\brun\b/i && /spend/i } @$texts;
-        ok(scalar(@footnote) >= 1, 'Behavior8/D6: an absent-spend footnote (distinguishing "run active" vs "no active run") renders in the panel');
+        # AMENDED BY t02-spend-persistence (blueprint tui-operator-feedback).
+        # The footnote no longer mentions a RUN, so /\brun\b/ no longer
+        # matches it. That is the change, not a casualty of it: under
+        # blueprint Decision 11 a run is the wrong absence to name. Every
+        # figure in this panel -- go's windows, zen's balance, claude's
+        # utilizations -- describes the ACCOUNT, and a snapshot is now written
+        # whether or not a fleet run exists. "no active run to report spend
+        # for" was accurate and useless, which is exactly what the operator
+        # said about it when they reported this panel.
+        #
+        # BOTH PARTS OF THE INTENT ARE KEPT, and the second is the load-bearing
+        # one: a footnote exists, and it renders EXACTLY ONCE -- panel-level,
+        # not once per provider block. The count assertion is what stops the
+        # absence statement from being duplicated three times as the provider
+        # blocks were reworded, and it is unchanged.
+        my @footnote = grep { /collecting - no figures yet|FAILED - spend sampler|STALLED - spend sampler/ } @$texts;
+        ok(scalar(@footnote) >= 1, 'Behavior8/D6: an absent-spend footnote renders in the panel (wording replaced by t02; it no longer names a run)');
         is(scalar(@footnote), 1, 'Behavior8/D6: the footnote renders exactly ONCE -- panel-level, not once per provider block') if @footnote;
     }
 }

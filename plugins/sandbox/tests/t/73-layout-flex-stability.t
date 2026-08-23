@@ -188,8 +188,22 @@ sub blank_tail {
     my $txt = join("\n", map { plain($_) } @$f);
     like($txt, qr/sampling - no reading yet/,
         'and Resources SAYS it has no reading rather than silently not being there');
-    like($txt, qr/no snapshot/,
-        'and Providers states the absence rather than expressing it by being missing (D6 footnote preserved)');
+    # AMENDED BY t02-spend-persistence (blueprint tui-operator-feedback). The
+    # literal it pinned, "no snapshot", is gone: that phrase described OUR
+    # plumbing rather than the account, and read as though the provider had
+    # been asked and had nothing to say -- when in fact nothing had asked
+    # (claude was never fetched by anything, and the persisted snapshot the
+    # other two came from was in a format the reader could not parse).
+    #
+    # THE ASSERTION'S INTENT IS THE SENTENCE AFTER THE COMMA, and it is
+    # untouched: Providers must STATE the absence rather than express it by
+    # being missing. So what is pinned now is that a non-empty absence
+    # statement is present, not which words it uses -- and this still fails if
+    # Providers goes back to rendering nothing, or renders figures it does not
+    # have. The alternation is deliberately narrow rather than a bare /./, so a
+    # panel that silently stopped saying anything cannot pass it.
+    like($txt, qr/not collected yet|collecting - no figures yet|FAILED - spend sampler|STALLED - spend sampler/,
+        'and Providers states the absence rather than expressing it by being missing (D6 footnote preserved; wording replaced by t02)');
     unlike($txt, qr/\b0\.0\b|\b0%/,
         'neither fabricates a zero -- absent-vs-empty is preserved, only how it is communicated changed');
 }

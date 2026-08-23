@@ -388,7 +388,20 @@ sub verdict {
 # over the final path -- a reader can never observe a half-written file.
 # Mode 0600 from creation (sysopen with the mode), never chmod'd after.
 # ---------------------------------------------------------------------------
-my @SNAPSHOT_RESULT_FIELDS = qw(provider status five_hour weekly monthly balance budget diagnostic);
+my @SNAPSHOT_RESULT_FIELDS = qw(provider status five_hour seven_day weekly monthly balance budget diagnostic);
+
+# The nested sub-fields a whitelisted field may carry. `used`/`limit` are go's
+# window shape; `utilization` is claude's (t02, blueprint Decision 12 -- claude
+# became a fetched provider, and without this its figures were stripped on
+# write and the panel read `unreadable` for a brand new reason).
+#
+# STILL A WHITELIST, and that is the point. Widening it is the one change in
+# t02 that could weaken the property this whole sub exists for: the OpenCode
+# session cookie is the broadest secret in the system and must provably never
+# reach a persisted file. So the new field is NAMED, never `%$v` -- a stray key
+# smuggled inside a whitelisted nested field is dropped exactly as before.
+# t/171's AC13 asserts that directly, at top level and nested.
+my @SNAPSHOT_NESTED_FIELDS = qw(used limit utilization);
 
 sub _whitelist_result {
     my ($r) = @_;
@@ -398,12 +411,12 @@ sub _whitelist_result {
         next unless exists $r->{$f};
         my $v = $r->{$f};
         if (ref($v) eq 'HASH') {
-            # five_hour/weekly/monthly are the only nested shape this file
-            # ever produces (used/limit) -- whitelist those two sub-fields
-            # only, so an unexpected nested key (e.g. a smuggled credential)
-            # can never ride along even inside a field that IS on the list.
+            # five_hour/seven_day/weekly/monthly are the only nested shapes
+            # this file ever produces -- whitelist their sub-fields only, so an
+            # unexpected nested key (e.g. a smuggled credential) can never ride
+            # along even inside a field that IS on the list.
             my %sub;
-            for my $sf (qw(used limit)) {
+            for my $sf (@SNAPSHOT_NESTED_FIELDS) {
                 $sub{$sf} = $v->{$sf} if exists $v->{$sf};
             }
             $out{$f} = \%sub;
@@ -440,6 +453,105 @@ sub write_snapshot {
     return $path;
 }
 
+# ---------------------------------------------------------------------------
+# claude_from_gate($line, $exit) -> a result hash for the `claude` provider.
+#
+# PURE. The subprocess is run by the caller; this only interprets its output,
+# so the mapping is testable without credentials, without a network, and
+# without a fork.
+#
+# WHY A SUBPROCESS AND NOT A REIMPLEMENTATION (blueprint Decision 12). Until
+# t02, `claude` was never fetched by ANYTHING -- this file's provider list was
+# qw(go zen) and nothing else composed a claude entry -- so the TUI's
+# "Claude : no snapshot" was structural, guaranteed on every launch since the
+# panel shipped, and would have survived the format fix untouched.
+# bp-usage-gate.pl already reads ~/.claude/.credentials.json, enforces a
+# token-life floor, and polls api.anthropic.com/api/oauth/usage with the right
+# oauth beta header. Duplicating that here would fork the handling of the
+# broadest secret in the system -- the same constraint write_snapshot's field
+# whitelist exists to honour. So we call it and parse its one line.
+#
+# Its documented single-line contract (see that script's --help):
+#   OK          five=<u5> seven=<u7> token_life_h=<h>                exit 0
+#   PAUSE       window=... five=<u5> seven=<u7> ...                  exit 10
+#   RELOGIN / UNAVAILABLE / CREDS  detail=...                        exit 40/20/30
+#
+# A PAUSE IS A READING, and a high one. Mapping it to `unknown` would discard
+# the figures at exactly the moment they matter most -- the operator is near a
+# limit and that is what the panel is for. So exit 10 yields status `ok` with
+# both utilizations, and the fact that it is a pause verdict is the governor's
+# business, not the panel's.
+#
+# Anything else -- including a ZERO exit with an unparseable line -- is
+# `unknown` with a diagnostic. `unknown` is never `absent` and never zero: a
+# provider configured enough to have failed is reported as having failed. That
+# rule already governs go and zen here; this extends it rather than inventing
+# a policy.
+sub claude_from_gate {
+    my ($line, $exit) = @_;
+    $line = '' unless defined $line && !ref $line;
+    $exit = -1 unless defined $exit && $exit =~ /^-?\d+$/;
+
+    # THE FIRST LINE THAT LOOKS LIKE THE CONTRACT, not simply the first line.
+    #
+    # The caller captures stderr as well as stdout, deliberately -- a gate that
+    # fails while saying why is more useful than one that fails silently. But
+    # that means a warning printed before the result would become "the first
+    # line", and a healthy poll would be reported as `unknown`. So the verb
+    # prefix is what selects the line.
+    #
+    # Still strict about WHERE the figures may come from: only a line that
+    # opens with one of the five documented verbs is eligible, so a stray
+    # diagnostic that happens to contain `five=` cannot supply a reading.
+    my $first = '';
+    for my $l (split(/\r?\n/, $line)) {
+        next unless $l =~ /^(?:OK|PAUSE|RELOGIN|UNAVAILABLE|CREDS)\b/;
+        $first = $l;
+        last;
+    }
+
+    if ($exit == 0 || $exit == 10) {
+        my ($u5) = $first =~ /\bfive=(-?\d+(?:\.\d+)?)\b/;
+        my ($u7) = $first =~ /\bseven=(-?\d+(?:\.\d+)?)\b/;
+        if (defined $u5 && defined $u7) {
+            return { provider   => 'claude', status => 'ok',
+                     five_hour  => { utilization => $u5 + 0 },
+                     seven_day  => { utilization => $u7 + 0 } };
+        }
+        return { provider => 'claude', status => 'unknown',
+                 diagnostic => _gate_diagnostic($first, $exit,
+                     'gate exited 0 without parseable five= and seven= figures') };
+    }
+
+    return { provider => 'claude', status => 'unknown',
+             diagnostic => _gate_diagnostic($first, $exit, 'gate reported no figures') };
+}
+
+# _gate_diagnostic($line, $exit, $fallback) -> a short, SAFE one-line string.
+#
+# The gate's own `detail=` is preferred because it names the actual cause
+# (telemetry-unreachable, no-oauth-block, oauth-token-under-floor-...), which
+# is the difference between a panel that says "something went wrong" and one
+# that says what to do about it.
+#
+# SANITISED, and not as a formality. This value is server-influenced (the gate
+# forwards an upstream ISO string into its own line, and its redteam already
+# stripped control characters there for the same reason), it is written into a
+# JSON file, and it is then rendered into a terminal. Control bytes are removed
+# so nothing can forge a line break or smuggle an escape sequence into the TUI,
+# and the length is capped so a pathological reply cannot push a panel row into
+# unbounded wrapping. PRIVATE.
+sub _gate_diagnostic {
+    my ($line, $exit, $fallback) = @_;
+    my $d;
+    if (defined $line && $line =~ /\bdetail=(\S+)/) { $d = $1 }
+    elsif (defined $line && $line =~ /^([A-Z]+)\b/) { $d = lc($1) }
+    $d = $fallback unless defined $d && length $d;
+    $d =~ tr/\x00-\x1f\x7f//d;
+    $d = substr($d, 0, 120) if length($d) > 120;
+    return length($d) ? "$d (gate exit $exit)" : "gate exit $exit";
+}
+
 package main;
 
 # ===========================================================================
@@ -473,70 +585,157 @@ unless (caller) {
     my %opt;
     while (@ARGV) {
         my $a = shift @ARGV;
-        if    ($a =~ /^--run-dir=(.*)$/) { $opt{run_dir} = $1 }
-        elsif ($a eq '--run-dir')        { $opt{run_dir} = shift @ARGV }
-        elsif ($a =~ /^--now=(.*)$/)     { $opt{now}     = $1 }
-        elsif ($a eq '--now')            { $opt{now}     = shift @ARGV }
-        elsif ($a =~ /^--log=(.*)$/)     { $opt{log}     = $1 }
-        elsif ($a eq '--log')            { $opt{log}     = shift @ARGV }
-        elsif ($a eq '--offline')        { $opt{offline} = 1 }
-        elsif ($a eq '--force')          { $opt{force}   = 1 }
+        if    ($a =~ /^--run-dir=(.*)$/)    { $opt{run_dir}    = $1 }
+        elsif ($a eq '--run-dir')           { $opt{run_dir}    = shift @ARGV }
+        elsif ($a =~ /^--global-dir=(.*)$/) { $opt{global_dir} = $1 }
+        elsif ($a eq '--global-dir')        { $opt{global_dir} = shift @ARGV }
+        elsif ($a =~ /^--now=(.*)$/)        { $opt{now}        = $1 }
+        elsif ($a eq '--now')               { $opt{now}        = shift @ARGV }
+        elsif ($a =~ /^--log=(.*)$/)        { $opt{log}        = $1 }
+        elsif ($a eq '--log')               { $opt{log}        = shift @ARGV }
+        elsif ($a =~ /^--gate-cmd=(.*)$/)   { $opt{gate_cmd}   = $1 }
+        elsif ($a eq '--gate-cmd')          { $opt{gate_cmd}   = shift @ARGV }
+        # --no-opencode fetches claude ONLY. Like --gate-cmd it exists for the
+        # test suite: without it, exercising the claude mapping would reach out
+        # to the real OpenCode providers on every case, which is both slow and
+        # a poll of the operator's actual account for no reason. Production
+        # never passes it.
+        elsif ($a eq '--no-opencode')       { $opt{no_opencode} = 1 }
+        elsif ($a eq '--offline')           { $opt{offline}    = 1 }
+        elsif ($a eq '--force')             { $opt{force}      = 1 }
         else { print STDERR "bp-spend: unrecognised argument '$a'\n"; exit 2 }
     }
 
     if ($verb ne 'snapshot') {
-        print STDERR "usage: bp-spend.pl snapshot --run-dir DIR [--offline] [--force] [--now EPOCH] [--log PATH]\n";
-        exit 2;
-    }
-    unless (defined $opt{run_dir} && length $opt{run_dir}) {
-        print STDERR "bp-spend: --run-dir is required\n";
+        print STDERR "usage: bp-spend.pl snapshot [--run-dir DIR] [--global-dir DIR] [--offline]\n"
+                   . "                            [--force] [--now EPOCH] [--log PATH]\n";
         exit 2;
     }
 
-    my $now  = defined $opt{now} && $opt{now} =~ /^\d+$/ ? $opt{now} + 0 : time;
-    my $path = "$opt{run_dir}/spend.json";
-
-    # Cross-process cadence floor -- see the header note.
-    if (!$opt{force} && -f $path) {
-        my $fresh = eval {
-            open my $fh, '<:raw', $path or die "read\n";
-            my $raw = do { local $/; <$fh> };
-            close $fh;
-            my $prev = JSON::PP->new->decode($raw);
-            my $gen  = ref $prev eq 'HASH' ? ($prev->{generated_at} // '') : '';
-            # generated_at is ISO; compare via mtime, which is what we control.
-            my @st = stat($path);
-            (@st && ($now - $st[9]) < $BpSpend::CADENCE_TTL_SECONDS) ? 1 : 0;
-        };
-        if ($fresh) { print "$path\n"; exit 0 }
+    # AT LEAST ONE DESTINATION, not specifically --run-dir. Blueprint Decision
+    # 11: every figure in this snapshot -- go's windows, zen's balance,
+    # claude's utilizations -- describes the ACCOUNT, not the run that happened
+    # to poll for it. Requiring a run directory scoped an account fact to a run
+    # and made it unreadable in exactly the state the operator is normally in:
+    # no fleet run active. The run copy keeps being written when asked for, so
+    # no existing fleet behaviour changes.
+    my @dirs = grep { defined && length } ($opt{run_dir}, $opt{global_dir});
+    unless (@dirs) {
+        print STDERR "bp-spend: at least one of --run-dir or --global-dir is required\n";
+        exit 2;
     }
 
-    my @results;
-    if ($opt{offline}) {
-        @results = map { { provider => $_, status => 'absent' } } qw(go zen);
-    }
-    else {
-        my %cache;
-        for my $p (qw(go zen)) {
-            my $r = eval {
-                BpSpend::fetch(provider => $p, now => $now, cache => \%cache,
-                               log_path => $opt{log});
+    my $now   = defined $opt{now} && $opt{now} =~ /^\d+$/ ? $opt{now} + 0 : time;
+    my @paths = map { "$_/spend.json" } @dirs;
+
+    # Cross-process cadence floor -- see the header note. Evaluated across
+    # EVERY destination, not just one: with two paths, a floor that only
+    # consulted the run copy would fetch on every call whenever the global copy
+    # was the stale one, which is the opposite of what a floor is for.
+    my $fresh_path;
+    if (!$opt{force}) {
+        for my $p (@paths) {
+            next unless -f $p;
+            my $fresh = eval {
+                open my $fh, '<:raw', $p or die "read\n";
+                my $raw = do { local $/; <$fh> };
+                close $fh;
+                my $prev = JSON::PP->new->decode($raw);
+                die "shape\n" unless ref $prev eq 'HASH';
+                # generated_at is ISO; compare via mtime, which is what we control.
+                my @st = stat($p);
+                (@st && ($now - $st[9]) < $BpSpend::CADENCE_TTL_SECONDS) ? 1 : 0;
             };
-            # A provider that blows up must not lose the whole snapshot: record
-            # it as unknown (never zero, never absent -- it IS configured enough
-            # to have failed) and keep going.
-            push @results, (ref $r eq 'HASH') ? $r
-                         : { provider => $p, status => 'unknown' };
+            if ($fresh) { $fresh_path = $p; last }
         }
     }
 
-    my $written = eval { BpSpend::write_snapshot(path => $path, results => \@results, now => $now) };
-    if ($@ || !defined $written) {
-        print STDERR "bp-spend: could not write $path: " . ($@ || "unknown error\n");
-        exit 4;
+    my @results;
+    my $reused = 0;
+    if (defined $fresh_path) {
+        # SERVE THE FRESH CONTENT TO EVERY DESTINATION rather than exiting
+        # here. A cadence floor exists to suppress a FETCH; letting it also
+        # suppress the WRITE would mean a destination that does not yet exist
+        # never appears, and the panel stays empty for as long as some other
+        # copy keeps being refreshed -- a floor turned into a permanent
+        # absence. So: no network call, but the file still lands.
+        $reused = 1;
+        my $prev = eval {
+            open my $fh, '<:raw', $fresh_path or die "read\n";
+            my $raw = do { local $/; <$fh> };
+            close $fh;
+            JSON::PP->new->decode($raw);
+        };
+        @results = (ref($prev) eq 'HASH' && ref($prev->{results}) eq 'ARRAY')
+                 ? @{ $prev->{results} } : ();
     }
-    print "$written\n";
+    elsif ($opt{offline}) {
+        # claude joins go and zen here. Until t02 it was absent from this list
+        # entirely, which is why the TUI's "Claude : no snapshot" was
+        # structural rather than a data gap (blueprint Decision 12).
+        @results = map { { provider => $_, status => 'absent' } } qw(claude go zen);
+    }
+    else {
+        # claude first: it is the provider the operator named, and a failure in
+        # the OpenCode fetches must not cost it.
+        push @results, _fetch_claude($opt{gate_cmd});
+
+        unless ($opt{no_opencode}) {
+            my %cache;
+            for my $p (qw(go zen)) {
+                my $r = eval {
+                    BpSpend::fetch(provider => $p, now => $now, cache => \%cache,
+                                   log_path => $opt{log});
+                };
+                # A provider that blows up must not lose the whole snapshot: record
+                # it as unknown (never zero, never absent -- it IS configured enough
+                # to have failed) and keep going.
+                push @results, (ref $r eq 'HASH') ? $r
+                             : { provider => $p, status => 'unknown' };
+            }
+        }
+    }
+
+    my @written;
+    for my $path (@paths) {
+        # Already fresh AND already present -- nothing to do for this one.
+        next if $reused && -f $path;
+        my $w = eval { BpSpend::write_snapshot(path => $path, results => \@results, now => $now) };
+        if ($@ || !defined $w) {
+            print STDERR "bp-spend: could not write $path: " . ($@ || "unknown error\n");
+            exit 4;
+        }
+        push @written, $w;
+    }
+    push @written, $fresh_path if $reused && !@written;
+
+    print "$_\n" for @written;
     exit 0;
+}
+
+# _fetch_claude($gate_cmd) -> a claude result hash. Runs bp-usage-gate.pl (or
+# an injected substitute) and hands its output to the pure mapper.
+#
+# --gate-cmd EXISTS FOR THE TEST SUITE AND FOR NOTHING ELSE IN PRODUCTION. It
+# is the seam that makes the credential path exercisable without owning
+# credentials and without reaching api.anthropic.com -- a test that polled the
+# operator's real account on every run would be both non-deterministic and
+# rude. The default is the real script, resolved next to this one.
+sub _fetch_claude {
+    my ($gate_cmd) = @_;
+
+    my $cmd = (defined $gate_cmd && length $gate_cmd)
+            ? $gate_cmd
+            : do { my $d = $0; $d =~ s{[/\\][^/\\]+$}{}; $d = '.' unless length $d;
+                   qq("$^X" "$d/bp-usage-gate.pl") };
+
+    my $out = eval {
+        local $SIG{__WARN__} = sub {};
+        `$cmd 2>&1`;
+    };
+    # A gate that cannot be RUN at all is still `unknown`, never `absent`: the
+    # distinction is about the provider, not about our ability to ask.
+    return BpSpend::claude_from_gate(defined $out ? $out : '', defined $out ? ($? >> 8) : -1);
 }
 
 1;

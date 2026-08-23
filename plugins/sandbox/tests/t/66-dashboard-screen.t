@@ -148,6 +148,33 @@ sub _strip_sub_bodies {
     return $out;
 }
 
+# _strip_comments($src) -> $src with every full-line and trailing `#` comment
+# blanked, line structure preserved so reported line numbers stay meaningful.
+#
+# Deliberately conservative about what counts as a comment start: a `#` is only
+# treated as one when it is at the start of a line (possibly indented) or
+# preceded by whitespace. That leaves `$#array`, `${\ ... }` and a `#` inside a
+# string mostly intact -- and being conservative is the right direction here,
+# because a `#` this MISSES simply leaves text in place for the checks to scan,
+# which is the pre-existing behaviour. A `#` this over-matched would blank real
+# code and hide a genuine violation.
+sub _strip_comments {
+    my ($src) = @_;
+    return $src unless defined $src;
+    my @out;
+    for my $line (split(/\n/, $src, -1)) {
+        if ($line =~ /^(\s*)#/) {
+            $line =~ s/\S/ /g;                 # whole-line comment
+        } elsif ($line =~ /^(.*?)(\s#.*)$/) {
+            my ($code, $comment) = ($1, $2);
+            $comment =~ s/\S/ /g;
+            $line = $code . $comment;          # trailing comment
+        }
+        push @out, $line;
+    }
+    return join("\n", @out);
+}
+
 # _is_emoji / _emoji_hits -- reused VERBATIM (same shape, same block ranges)
 # from t/64-theme-tokens.t:268-320 (AC-G4 mandates this explicitly).
 sub _is_emoji {
@@ -408,7 +435,28 @@ my $RICH_ROWS = 50;
     ok(defined($src), 'AC-P1: precondition -- tui/DashboardScreen.pm is readable as text (expected to fail until 06 lands)');
   SKIP: {
         skip('tui/DashboardScreen.pm does not exist yet', 3) unless defined $src;
-        my $top = _strip_sub_bodies($src);
+        # COMMENTS ARE STRIPPED TOO, and that is the fix rather than a
+        # loosening. AC-P1 is about load hygiene: what this module DOES when
+        # it is require'd. A comment does nothing. Without this line the check
+        # forbids three ordinary English words -- print, warn, say -- from
+        # appearing anywhere in the file's prose outside a sub body, and this
+        # module's top-level prose is where its design decisions are recorded.
+        #
+        # It had already fired, silently. Commit c38e594 (package t01 of
+        # blueprint tui-operator-feedback) added a comment reading "the panel
+        # could never say anything but", which turned this assertion red; t01's
+        # validation ran t/25, t/44, t/87, t/89 and t/90 and did not include
+        # this file, so the red went unnoticed until t02's own baseline sweep.
+        # Package t02 then added a second occurrence ("nothing to say"),
+        # which is what makes this a rule to fix rather than two words to
+        # reword: the next comment will do it again.
+        #
+        # THE INTENT IS FULLY PRESERVED. A real top-level `print`, `warn` or
+        # `say` STATEMENT is still caught -- stripping comments removes only
+        # text that cannot execute. This is the same correction t01 had to make
+        # to its own AC12, where an oracle forbidding a string anywhere in a
+        # file failed on the comment explaining the change.
+        my $top = _strip_comments(_strip_sub_bodies($src));
         unlike($top, qr/%ENV/, 'AC-P1: no top-level (outside any sub) reference to %ENV');
         unlike($top, qr/\bprint\b|\bwarn\b|\bsay\b/, 'AC-P1: no top-level print/warn/say');
         unlike($top, qr/\bTheme::\w+\s*\(/, 'AC-P1: no top-level call into Theme::');

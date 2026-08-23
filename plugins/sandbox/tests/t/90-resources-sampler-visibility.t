@@ -154,8 +154,20 @@ unlike($LSRC, qr/log_ev\(\s*'resources_sampler_started'/,
     'AC12: no event is emitted under the old name -- it read as proof the sampler was alive, which fork success is not');
 like($LSRC, qr/sampler_start_outcome/,
     'AC13: launcher.pl builds the outcome fact via the pure helper rather than inline');
-like($LSRC, qr/_resources_sampler_child_alive/,
-    'AC14: a liveness check exists, so "started but gone" is distinguishable from "still starting"');
+# AMENDED BY t02 (blueprint tui-operator-feedback, and the same shape blueprint
+# Decision 8 rules on). t02 adds a second detached sampler for spend, which
+# needs the identical non-blocking reap check, so the helper was renamed from
+# _resources_sampler_child_alive to _sampler_child_alive -- nothing in its body
+# was ever resources-specific. Keeping the old name while calling it for a
+# second sampler would have made the name a lie; a second copy under a second
+# name would have made two places to get WNOHANG wrong.
+#
+# THE INTENT IS PRESERVED, which is what makes this an amendment and not a
+# weakening: this still asserts that a liveness check EXISTS and that the
+# resources sampler is the thing being checked. It still fails if the check is
+# deleted, or if the resources sampler stops consulting it.
+like($LSRC, qr/_sampler_child_alive\(\s*\$RESOURCES_SAMPLER_CHILD\s*\)/,
+    'AC14: a liveness check exists and the resources sampler uses it, so "started but gone" is distinguishable from "still starting"');
 like($LSRC, qr/resources_sampler\s*=>/,
     'AC15: the fact is threaded into the state hash the renderer reads');
 

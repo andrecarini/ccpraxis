@@ -296,6 +296,52 @@ sub sampler_wait_spans {
     ];
 }
 
+# spend_wait_spans($fact) -> \@spans. PURE, total, never dies.
+#
+# The spend panel's counterpart to sampler_wait_spans above, and deliberately
+# the same four distinctions in the same vocabulary -- an operator who has
+# learned what STALLED means in the Resources panel should not have to learn a
+# second dialect one panel down.
+#
+# What it replaces is the reason this package exists. "no active run to report
+# spend for" named a RUN as the missing thing, which stopped being true when
+# spend gained a run-independent snapshot (blueprint Decision 11); and it was
+# useless even before that, because the operator is essentially never in a
+# fleet run. The four texts below each name something that could actually be
+# acted on.
+#
+# NO COLON in any of them (Decision 2). The label gutter's own colon belongs to
+# package t05-no-colons and is not touched here.
+sub spend_wait_spans {
+    my ($fact) = @_;
+    my $neutral = 'collecting - no figures yet';
+
+    my ($text, $role) = ($neutral, 'text.faint');
+    if (ref($fact) eq 'HASH') {
+        my $status  = $fact->{status};
+        my $alive   = $fact->{child_alive};
+        my $elapsed = $fact->{elapsed};
+        my $grace   = $fact->{grace};
+        my $numeric = sub { my ($v) = @_; defined($v) && !ref($v) && $v =~ /^-?\d+(?:\.\d+)?$/ };
+
+        if (defined $status && !ref($status) && $status eq 'failed') {
+            $text = 'FAILED - spend sampler failed to start; no figures possible';
+            $role = 'state.crit';
+        } elsif (defined $alive && !ref($alive) && !$alive) {
+            # undef means NOT CHECKED and must never read as dead -- the check
+            # has not run on the first render, and reading undef as false would
+            # make every healthy launch flash a failure.
+            $text = 'FAILED - spend sampler exited before writing figures';
+            $role = 'state.crit';
+        } elsif ($numeric->($elapsed) && $numeric->($grace) && $elapsed >= $grace) {
+            $text = 'STALLED - spend sampler still running, no figures after ' . fmt_duration($elapsed);
+            $role = 'state.warn';
+        }
+    }
+
+    return [ { text => $text, role => $role } ];
+}
+
 sub snapshot_spans {
     my ($res) = @_;
     return [] unless ref($res) eq 'HASH';
@@ -856,6 +902,26 @@ sub _clip_line {
     return tui::Frame::fit_spans($line, $w);
 }
 
+# The three provider blocks below share one wording change from t02.
+#
+# Each used to render "Claude : no snapshot" / "Go     : no snapshot" /
+# "Zen    : no snapshot" when no snapshot existed. Three problems in one
+# string, and the operator's report quoted it:
+#
+#   1. It repeated the provider name that the heading immediately above it
+#      already gives, padded into a column that exists nowhere else.
+#   2. "no snapshot" describes OUR plumbing, not the account. It reads as
+#      though the provider was asked and had nothing to say. In fact nothing
+#      had asked -- claude was never fetched by anything at all, and the
+#      persisted snapshot the other two came from was in a format the reader
+#      could not parse (blueprint Decisions 10 and 12).
+#   3. It carried a colon in the VALUE, which Decision 2 rules out. (The label
+#      gutter's own colon is a separate matter and belongs to t05-no-colons.)
+#
+# "not collected yet" says the true thing -- nothing has been gathered for this
+# provider -- and the panel-level sentence below says WHY, once, instead of
+# three times. The row is kept rather than dropped so the panel's height does
+# not change when figures arrive.
 sub _claude_code_block {
     my ($tokens, $claude_spend, $spend_present, $w) = @_;
     my $t = (ref($tokens) eq 'HASH') ? $tokens : {};
@@ -895,7 +961,7 @@ sub _claude_code_block {
         $spend_line = _clip_line($spans, $protect, $w);
     } else {
         $spend_line = [ { text => _status_glyph('warn') . ' ', role => 'state.warn' },
-                        { text => 'Claude : no snapshot', role => 'text.muted' } ];
+                        { text => 'not collected yet', role => 'text.muted' } ];
     }
     push @lines, _indent_line(_FACT_INDENT(), $spend_line);
 
@@ -911,7 +977,7 @@ sub _opencode_go_block {
         $spend_line = _clip_line($spans, $protect, $w);
     } else {
         $spend_line = [ { text => _status_glyph('warn') . ' ', role => 'state.warn' },
-                        { text => 'Go     : no snapshot', role => 'text.muted' } ];
+                        { text => 'not collected yet', role => 'text.muted' } ];
     }
     push @lines, _indent_line(_FACT_INDENT(), $spend_line);
     return \@lines;
@@ -926,7 +992,7 @@ sub _opencode_zen_block {
         $spend_line = _clip_line($spans, $protect, $w);
     } else {
         $spend_line = [ { text => _status_glyph('warn') . ' ', role => 'state.warn' },
-                        { text => 'Zen    : no snapshot', role => 'text.muted' } ];
+                        { text => 'not collected yet', role => 'text.muted' } ];
     }
     push @lines, _indent_line(_FACT_INDENT(), $spend_line);
     return \@lines;
@@ -961,15 +1027,21 @@ sub _providers_body {
     push @lines, @{ _opencode_go_block($spend ? $spend->{go} : undef, $spend ? 1 : 0, $w) };
     push @lines, @{ _opencode_zen_block($spend ? $spend->{zen} : undef, $spend ? 1 : 0, $w) };
 
-    # D6: once, at the end -- the absent-vs-empty distinction _spend_unavailable_body
-    # used to make (a run active with no snapshot yet, vs. no active run at all).
+    # ONE SENTENCE AT THE END SAYING WHY THERE ARE NO FIGURES.
+    #
+    # This used to read "a run is active but has not written runs/spend.json
+    # yet" or "no active run to report spend for" -- and the operator's report
+    # quoted the second one. Both named a RUN as the missing thing. Under
+    # blueprint Decision 11 that is the wrong absence: every figure here (go's
+    # windows, zen's balance, claude's utilizations) describes the ACCOUNT, and
+    # a snapshot is now written whether or not a fleet run exists. So "no
+    # active run" stopped being a reason and became a non sequitur -- accurate,
+    # and useless, which is exactly what the operator said about it.
+    #
+    # What replaces it is the sampler's own state, in the same vocabulary t01
+    # established for the resources panel next door.
     unless ($spend) {
-        my @runs = (ref($state->{runs}) eq 'ARRAY') ? @{ $state->{runs} } : ();
-        my $active = grep { ref($_) eq 'HASH' && defined($_->{state})
-                            && ($_->{state} eq 'running' || $_->{state} eq 'paused') } @runs;
-        push @lines, [ { text => ($active ? 'a run is active but has not written runs/spend.json yet'
-                                          : 'no active run to report spend for'),
-                        role => 'text.faint' } ];
+        push @lines, spend_wait_spans($state->{spend_sampler});
     }
 
     return \@lines;

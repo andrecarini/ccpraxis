@@ -237,6 +237,7 @@ my $SESSION_MODE   = 0;   # B2: --session => internal connector entry (Decision 
 # required companions; no value here may contain a ':' (the drive letter is
 # deliberately NOT passed as an argument -- see $SELF_PL / _resources_sampler_main).
 my $RESOURCES_SAMPLER_MODE = 0;
+my $SPEND_SAMPLER_MODE     = 0;
 my $SAMPLER_CONTAINER;
 my $SAMPLER_OWNER_PID;
 my @POSITIONAL;
@@ -253,6 +254,12 @@ my @POSITIONAL;
             $SESSION_MODE = 1;
         } elsif ($a eq '--resources-sampler') {
             $RESOURCES_SAMPLER_MODE = 1;
+        } elsif ($a eq '--spend-sampler') {
+            # t02-spend-persistence: this invocation IS the detached spend
+            # sampler. It needs --sampler-owner-pid (to self-exit when the
+            # dashboard goes away) but NOT --sampler-container: spend is an
+            # account fact and no container is involved in reading it.
+            $SPEND_SAMPLER_MODE = 1;
         } elsif ($a eq '--sampler-container') {
             $SAMPLER_CONTAINER = @argv ? shift(@argv) : undef;
         } elsif ($a =~ /^--sampler-container=(.*)$/) {
@@ -280,6 +287,12 @@ if ($RESOURCES_SAMPLER_MODE) {
     }
     if (!defined $SAMPLER_OWNER_PID || $SAMPLER_OWNER_PID !~ /^\d+$/) {
         print STDERR "ERROR: --resources-sampler requires --sampler-owner-pid matching /^\\d+\$/\n";
+        exit 2;
+    }
+}
+if ($SPEND_SAMPLER_MODE) {
+    if (!defined $SAMPLER_OWNER_PID || $SAMPLER_OWNER_PID !~ /^\d+$/) {
+        print STDERR "ERROR: --spend-sampler requires --sampler-owner-pid matching /^\\d+\$/\n";
         exit 2;
     }
 }
@@ -812,6 +825,18 @@ my $MCP_SNAPSHOT_FILE         = "$LAUNCHER_DIR/.mcp-snapshot.json";
 # past Resources::max_age() and reads 'stale', which IS the mechanism.
 my $RESOURCES_SNAPSHOT_FILE   = "$LAUNCHER_DIR/.resources-snapshot.json";
 my $RESOURCES_SAMPLER_PID     = "$LAUNCHER_DIR/resources-sampler.pid";
+# t02-spend-persistence, blueprint Decision 11: the run-independent home for
+# the spend snapshot. bp-spend.pl writes `spend.json` INSIDE this directory, so
+# the directory is what we hand it and the filename is its business.
+#
+# Deliberately the same state dir as every snapshot above rather than a new
+# location: this is not a new concept. What IS new is that spend has one at
+# all. It previously lived only at <fleet run>/spend.json, which scoped an
+# ACCOUNT fact -- go's windows, zen's balance, claude's utilizations all
+# describe the account, not the run that polled for it -- to a run, and so made
+# it unreadable in exactly the state the operator is normally in.
+my $SPEND_GLOBAL_DIR          = $LAUNCHER_DIR;
+my $SPEND_SAMPLER_PID         = "$LAUNCHER_DIR/spend-sampler.pid";
 my $SETTINGS_LOCAL_FILE       = "$PROJECT_PATH/.claude/settings.local.json";
 # installed_plugins.json lives under claude-home/plugins/ (Fix 2), NOT
 # .launcher/ — so it appears at /root/.claude/plugins/installed_plugins.json as
@@ -1462,6 +1487,8 @@ sub _keepawake_release_global { eval { $KEEPAWAKE->release if $KEEPAWAKE }; }
 # launcher exits.
 my $RESOURCES_SAMPLER_CHILD;
 sub _resources_sampler_release_global { eval { _resources_sampler_stop($RESOURCES_SAMPLER_CHILD, $RESOURCES_SAMPLER_PID) if $RESOURCES_SAMPLER_CHILD }; }
+my $SPEND_SAMPLER_CHILD;
+sub _spend_sampler_release_global { eval { _spend_sampler_stop($SPEND_SAMPLER_CHILD) if $SPEND_SAMPLER_CHILD }; }
 
 # _tee_system(@cmd) — run @cmd streaming its combined stdout+stderr LIVE to the
 # console AND into the transcript. system()-style return value ($? convention:
@@ -1670,6 +1697,12 @@ make_path($LAUNCHER_DIR) unless -d $LAUNCHER_DIR;
 if ($RESOURCES_SAMPLER_MODE) {
     exit(_resources_sampler_main($SAMPLER_CONTAINER, $SAMPLER_OWNER_PID));   # never returns
 }
+# t02-spend-persistence: same dispatch point, same reasons -- this process
+# acquires no lock, opens no launch log, touches no container and never enters
+# the TUI.
+if ($SPEND_SAMPLER_MODE) {
+    exit(_spend_sampler_main($SAMPLER_OWNER_PID));                           # never returns
+}
 
 # =====================================================================
 # Cross-process lock (per-project)
@@ -1700,8 +1733,8 @@ sub _rmtree {
 # every signal path -- alt-screen off, cursor shown, title popped, ReadMode
 # restored -- before the STDERR restore and before reset_terminal(). Its
 # once-guard is what makes a second Ctrl-C during teardown safe.
-$SIG{INT}  = sub { tui::LaunchScreens::host_leave($LAUNCH_HOST) if $LAUNCH_HOST; _stderr_capture_drain(); log_ev('signal', { sig => 'INT' });  _keepawake_release_global(); _resources_sampler_release_global(); LaunchLog::close_log($LAUNCH_LOG); _close_transcript(); SandboxLock::release_all(); reset_terminal(); exit 130 };
-$SIG{TERM} = sub { tui::LaunchScreens::host_leave($LAUNCH_HOST) if $LAUNCH_HOST; _stderr_capture_drain(); log_ev('signal', { sig => 'TERM' }); _keepawake_release_global(); _resources_sampler_release_global(); LaunchLog::close_log($LAUNCH_LOG); _close_transcript(); SandboxLock::release_all(); reset_terminal(); exit 143 };
+$SIG{INT}  = sub { tui::LaunchScreens::host_leave($LAUNCH_HOST) if $LAUNCH_HOST; _stderr_capture_drain(); log_ev('signal', { sig => 'INT' });  _keepawake_release_global(); _resources_sampler_release_global(); _spend_sampler_release_global(); LaunchLog::close_log($LAUNCH_LOG); _close_transcript(); SandboxLock::release_all(); reset_terminal(); exit 130 };
+$SIG{TERM} = sub { tui::LaunchScreens::host_leave($LAUNCH_HOST) if $LAUNCH_HOST; _stderr_capture_drain(); log_ev('signal', { sig => 'TERM' }); _keepawake_release_global(); _resources_sampler_release_global(); _spend_sampler_release_global(); LaunchLog::close_log($LAUNCH_LOG); _close_transcript(); SandboxLock::release_all(); reset_terminal(); exit 143 };
 # 03-resources-reader-model fix-batch (red-team L15): closing the terminal
 # window -- the single most common way a user ends a dashboard -- sends HUP,
 # not INT/TERM, and perl does not run END blocks on an uncaught terminating
@@ -1709,7 +1742,7 @@ $SIG{TERM} = sub { tui::LaunchScreens::host_leave($LAUNCH_HOST) if $LAUNCH_HOST;
 # release, sampler release, lock release), which is the entry point for H2
 # step 3 (owner dies without ever running _resources_sampler_release_global).
 $SIG{HUP}  = $SIG{TERM};
-END { tui::LaunchScreens::host_leave($LAUNCH_HOST) if $LAUNCH_HOST; _stderr_capture_drain(); _keepawake_release_global(); _resources_sampler_release_global(); LaunchLog::close_log($LAUNCH_LOG); _close_transcript(); SandboxLock::release_all() }
+END { tui::LaunchScreens::host_leave($LAUNCH_HOST) if $LAUNCH_HOST; _stderr_capture_drain(); _keepawake_release_global(); _resources_sampler_release_global(); _spend_sampler_release_global(); LaunchLog::close_log($LAUNCH_LOG); _close_transcript(); SandboxLock::release_all() }
 
 SandboxLock::acquire($LOCK_DIR, windows => $WINDOWS_FAMILY) or do {
     print STDERR "ERROR: another claude-sandbox is doing setup for this project (lock held > 10s at $LOCK_DIR).\n";
@@ -5065,6 +5098,13 @@ sub enter_dashboard {
     ($RESOURCES_SAMPLER_CHILD, $resources_sampler_fact)
         = _resources_sampler_start($RESOURCES_SAMPLER_PID, $CONTAINER_NAME);
 
+    # t02-spend-persistence: the detached spend sampler, started here for the
+    # same reason and degrading the same way. Without it the run-independent
+    # snapshot path added by Decision 11 would exist and stay empty, which is
+    # the panel the operator already has.
+    my $spend_sampler_fact;
+    ($SPEND_SAMPLER_CHILD, $spend_sampler_fact) = _spend_sampler_start();
+
     # red-team MINOR-1: one-shot guard shared by enter_raw/leave_raw so a
     # re-entrant leave_raw (second Ctrl-C during teardown) only pops the
     # title stack once. See leave_raw below for the full rationale.
@@ -5279,8 +5319,20 @@ sub enter_dashboard {
                         ? $now - $resources_sampler_fact->{started_at} : undef;
                     $resources_sampler_fact->{grace}   = Resources::max_age();
                     $resources_sampler_fact->{child_alive}
-                        = _resources_sampler_child_alive($RESOURCES_SAMPLER_CHILD);
+                        = _sampler_child_alive($RESOURCES_SAMPLER_CHILD);
                 }
+            }
+            # t02: the same bookkeeping for the spend sampler, on the same
+            # already-existing tick and under the same condition -- only while
+            # no snapshot exists anywhere. The grace window is the sampler's
+            # own interval plus a margin: a first reading cannot arrive before
+            # the first round completes, so anything shorter would report a
+            # perfectly healthy sampler as stalled on every launch.
+            if (!-f "$SPEND_GLOBAL_DIR/spend.json" && ref($spend_sampler_fact) eq 'HASH') {
+                $spend_sampler_fact->{elapsed} = defined $spend_sampler_fact->{started_at}
+                    ? $now - $spend_sampler_fact->{started_at} : undef;
+                $spend_sampler_fact->{grace}       = _spend_sampler_interval() + 60;
+                $spend_sampler_fact->{child_alive} = _sampler_child_alive($SPEND_SAMPLER_CHILD);
             }
             # Advance the skew-free baseline by host-measured elapsed since the
             # last measurement (elapsed rate matches on both clocks; only the
@@ -5338,6 +5390,9 @@ sub enter_dashboard {
                 tokens           => $cached_tokens,
                 resources        => $cached_resources,
                 resources_sampler => $resources_sampler_fact,
+                # t02: the same fact for the spend sampler, so "we have no
+                # figures" can say WHY rather than naming the wrong absence.
+                spend_sampler    => $spend_sampler_fact,
                 runs             => $cached_runs,
                 # b37-spend-surfaces: undef when no run has persisted a spend
                 # snapshot, and Dashboard::build_panels then omits the Spend
@@ -6250,12 +6305,19 @@ sub _resources_sampler_start {
     # known is real surgery (the child exits at its own CLI dispatch before the
     # launch log is even opened) and is a separate follow-up -- so the name is
     # corrected here and the liveness gap is closed by
-    # _resources_sampler_child_alive instead.
+    # _sampler_child_alive instead.
     log_ev('resources_sampler_forked', { pid => $pid });
     return ($pid, Resources::sampler_start_outcome($pid, undef, time));
 }
 
-# _resources_sampler_child_alive($pid) -> 1 alive | 0 gone | undef unknown
+# _sampler_child_alive($pid) -> 1 alive | 0 gone | undef unknown
+#
+# Named generically as of t02. It arrived in t01 as
+# _resources_sampler_child_alive, but nothing in it is resources-specific --
+# it is a non-blocking reap check on a pid we forked -- and t02's spend sampler
+# needs exactly the same question answered. Keeping the old name while calling
+# it for a second sampler would have made the name a lie; duplicating the body
+# under a second name would have made two places to get WNOHANG wrong.
 #
 # Non-blocking reap check, called from the EXISTING 5s render tick and only
 # while no snapshot has ever been written. No new timer and no new spawn.
@@ -6263,7 +6325,7 @@ sub _resources_sampler_start {
 # This is what distinguishes "started and still working" from "started and
 # already dead" -- the case the old optimistic log line actively concealed.
 # undef means NOT CHECKED, and the renderer must never read that as dead.
-sub _resources_sampler_child_alive {
+sub _sampler_child_alive {
     my ($pid) = @_;
     return undef unless defined $pid && $pid =~ /^\d+$/ && $pid > 0;
     my $r = eval { waitpid($pid, POSIX::WNOHANG()) };
@@ -6399,6 +6461,148 @@ sub _resources_sampler_main {
     }
     unlink $RESOURCES_SAMPLER_PID;
     return 0;
+}
+
+# ===========================================================================
+# t02-spend-persistence — the detached spend sampler (blueprint Decision 13).
+#
+# WHY A SAMPLER AT ALL. A run-independent snapshot path that nothing writes is
+# still an empty panel, so Decision 11 is inert without a writer that runs
+# outside a fleet run. The launcher is the only thing present in an interactive
+# session, so it has to be the one to start it.
+#
+# WHY NOT ON THE RENDER TICK. Package s17 spent itself removing the one
+# recurring fork from the render path, on a platform where forking is a
+# documented failure mode ("Can't fork, trying again in 5 seconds"), and
+# _gather_spend's own header records that a network fork there could block the
+# TUI for the length of a timeout. That constraint stands untouched: the render
+# tick stays a pure reader, and ONE detached child does the polling.
+#
+# WHY THE CADENCE IS SAFE EVEN IF THIS LOOP IS WRONG. bp-spend.pl's snapshot
+# verb carries a CROSS-PROCESS cadence floor derived from the existing
+# snapshot's mtime -- built precisely so the verb is safe to call on any tick.
+# Inside that window it is a stat plus a read and makes no network call. So the
+# providers cannot be hammered by an interval mistake here; the worst case is a
+# wasted subprocess.
+# ===========================================================================
+
+# How often the sampler asks. Deliberately shorter than bp-spend.pl's own
+# 900-second floor and deliberately not equal to it: the floor is the authority
+# on when a FETCH happens, and this interval only decides how often we give it
+# the chance. Naming a number equal to the floor would make the two look like
+# one mechanism and invite someone to "simplify" by deleting the floor.
+sub _spend_sampler_interval { 300 }
+
+# _spend_sampler_main($owner_pid) -> exit code. Mirrors
+# _resources_sampler_main's shape: refresh the pidfile, do one round, sleep,
+# and self-exit within one cadence of the owner going away.
+#
+# NO ORPHAN REAPER, and that is a deliberate difference from the resources
+# sampler rather than an omission. The owner-liveness check below already
+# bounds an orphan's life to one cadence, and the three teardown paths
+# (INT/TERM/END) kill the child directly. What the resources reaper exists for
+# is the case those do not cover -- a launcher killed so hard that END never
+# ran, leaving a sampler whose owner pid may since have been RECYCLED, so that
+# kill(0) keeps succeeding against an unrelated process. That window exists
+# here too, and is recorded rather than papered over: the cost of hitting it is
+# one idle process waking every five minutes to run a subprocess that its own
+# cadence floor turns into a stat and a read. The resources sampler runs a full
+# probe round on every wake, which is why it earned a reaper and this does not.
+# If the cost assessment ever changes, Resources::sampler_reap_decision is
+# already pure and takes the pidfile record -- the machinery is there to reuse.
+sub _spend_sampler_main {
+    my ($owner_pid) = @_;
+    # Cleared for the same reason _resources_sampler_main clears it: the parent
+    # `local`s it immediately before exec, which leaves it set for this
+    # process's entire life and its whole subtree -- a landmine armed under a
+    # long-lived process, on a project whose own CLAUDE.md documents 576
+    # drive-root strays from exactly this configuration.
+    delete $ENV{MSYS2_ARG_CONV_EXCL};
+    while (1) {
+        last unless kill(0, $owner_pid);
+        eval { _write_file_atomic($SPEND_SAMPLER_PID, "$$ $owner_pid " . time . "\n"); 1 };
+        eval { _spend_sampler_round(); 1 };
+        sleep _spend_sampler_interval();
+    }
+    unlink $SPEND_SAMPLER_PID;
+    return 0;
+}
+
+# _spend_sampler_round() -- one invocation of bp-spend.pl's snapshot verb.
+#
+# Output is discarded: the verb communicates through the file it writes, and
+# this process has no terminal to print to. A failure is not retried here --
+# the next round is a retry, and it arrives on a fixed cadence rather than a
+# tight loop.
+sub _spend_sampler_round {
+    my $spend_pl = _spend_script_path();
+    return unless defined $spend_pl && -f $spend_pl;
+    my @cmd = ($^X, $spend_pl, 'snapshot', '--global-dir', $SPEND_GLOBAL_DIR);
+    system(@cmd);
+    return;
+}
+
+# _spend_script_path() -> path to bp-spend.pl, or undef.
+#
+# Resolved from THIS file's own location rather than from a marketplace path or
+# an env var, because the launcher and bp-spend.pl ship in the same repo and a
+# path that can drift is a path that will. Two layouts are checked: the clone /
+# live install ($SELF_PL is .../plugins/sandbox/scripts/launcher.pl), and the
+# in-container marketplace mount, which has the same shape one level up.
+sub _spend_script_path {
+    my $dir = $SELF_PL;
+    return undef unless defined $dir && length $dir;
+    $dir =~ s{[/\\][^/\\]+$}{};                       # .../plugins/sandbox/scripts
+    $dir =~ s{[/\\]scripts$}{};                       # .../plugins/sandbox
+    $dir =~ s{[/\\]sandbox$}{};                       # .../plugins
+    my $p = "$dir/butler/scripts/bp-spend.pl";
+    return -f $p ? $p : undef;
+}
+
+# _spend_sampler_start($owner_pid_unused) -> ($child_pid|undef, \%outcome).
+#
+# Construct for construct with _resources_sampler_start, INCLUDING the part
+# t01 had to correct there: the fork outcome travels to the caller instead of
+# being logged and discarded. That is not stylistic symmetry -- the identical
+# mistake is available here in the identical shape, and it is the mistake the
+# operator actually reported ("sampling - no reading yet" forever, for a
+# sampler that had never started).
+sub _spend_sampler_start {
+    my $owner = $$;   # captured BEFORE forking
+    my $pid = fork();
+    if (!defined $pid) {
+        my $why = "$!";
+        log_ev('spend_sampler_start_failed', { reason => "fork: $why" });
+        return (undef, Resources::sampler_start_outcome(undef, $why, time));
+    }
+    if ($pid == 0) {
+        open(STDIN,  '<', '/dev/null');
+        open(STDOUT, '>', '/dev/null');
+        open(STDERR, '>', '/dev/null');
+        local $ENV{MSYS2_ARG_CONV_EXCL} = '*';
+        exec($^X, $SELF_PL, '--spend-sampler',
+             '--sampler-owner-pid', $owner,
+             $PROJECT_PATH)
+            or do { POSIX::_exit(127) };
+    }
+    # NAMED FOR WHAT A FORK ESTABLISHES -- that a process exists -- and not for
+    # what it does not, that the sampler is running. The child can still die at
+    # exec without this line changing. t01 renamed resources_sampler_started
+    # for exactly this reason, after an operator reasonably read it in the
+    # activity log as proof the sampler was alive.
+    log_ev('spend_sampler_forked', { pid => $pid });
+    return ($pid, Resources::sampler_start_outcome($pid, undef, time));
+}
+
+# _spend_sampler_stop($child_pid) -- mirrors _resources_sampler_stop.
+sub _spend_sampler_stop {
+    my ($pid) = @_;
+    if (defined $pid && $pid =~ /^\d+$/ && $pid > 0) {
+        kill('KILL', $pid);
+        waitpid($pid, 0);
+        log_ev('spend_sampler_stopped', { pid => $pid });
+    }
+    unlink $SPEND_SAMPLER_PID if -f $SPEND_SAMPLER_PID;
 }
 
 # _tail_lines — last $n chomped lines of a file (the B1 launch log), or ().
@@ -6543,17 +6747,35 @@ sub _gather_spend {
     my ($runs) = @_;
     my $info;
     eval {
+        # RESOLUTION ORDER (t02, blueprint Decision 11): the active run's copy
+        # first, then the run-independent one. Preferring the run copy keeps a
+        # driven fleet's own figures authoritative for that fleet; falling back
+        # to the global copy is what makes the panel work at all when the
+        # operator is not in a run -- which is nearly always.
         my @candidates = grep { ref($_) eq 'HASH' && defined $_->{runs_dir} } @{ $runs || [] };
         my ($active) = grep { ($_->{state} || '') eq 'running' } @candidates;
         ($active) = grep { ($_->{state} || '') eq 'paused' } @candidates if !$active;
-        return unless $active;
-        my $snap = "$active->{runs_dir}/spend.json";
-        return unless -f $snap;
+
+        my @paths;
+        push @paths, "$active->{runs_dir}/spend.json" if $active;
+        push @paths, "$SPEND_GLOBAL_DIR/spend.json";
+
+        my ($snap) = grep { -f $_ } @paths;
+        return unless defined $snap;
+
         my $raw = do { local $/; open my $fh, '<:raw', $snap or return; <$fh> };
         return unless defined $raw && length $raw;
-        my $spend = JSON::PP->new->decode($raw);
-        return unless ref $spend eq 'HASH';
-        $info = SpendPanel::status($spend, time);
+        my $persisted = JSON::PP->new->decode($raw);
+        return unless ref $persisted eq 'HASH';
+
+        # THE TRANSLATION THAT WAS MISSING, and the reason a panel fed real
+        # figures still read "absent". write_snapshot persists an ARRAY under
+        # `results`, each element keyed by a `provider` FIELD; SpendPanel::status
+        # indexes its argument by provider NAME. This line used to hand the
+        # decoded file straight in, so $spend->{go} was always undef and every
+        # provider degraded no matter what had been fetched. See
+        # SpendPanel::from_snapshot's own comment for the measurement.
+        $info = SpendPanel::status(SpendPanel::from_snapshot($persisted), time);
         1;
     } or do { $info = undef };     # any failure -> no panel, dashboard still renders
     return (ref $info eq 'HASH') ? $info : undef;

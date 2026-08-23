@@ -284,4 +284,70 @@ sub status {
     };
 }
 
+# ---------------------------------------------------------------------------
+# SpendPanel::from_snapshot(\%persisted) -> \%spend. PUBLIC, pure, total.
+#
+# THE TRANSLATION THIS MODULE'S OWN HEADER ALREADY NAMED AND NOBODY BUILT.
+# Read that header: \%spend is described as "composed by launcher.pl from
+# BpSpend::fetch() for go/zen, and from bp-usage-gate.pl's own $parsed for
+# claude". That composition step was designed for an in-process caller. When
+# persistence was wired in later, launcher.pl's _gather_spend was pointed at
+# the FILE and handed the decoded bytes straight to status() -- and the file is
+# not in that shape.
+#
+#   what write_snapshot persists:  { generated_at => ISO,
+#                                    results => [ { provider => 'go', ... }, ... ] }
+#   what status() indexes:         { go => {...}, zen => {...}, claude => {...},
+#                                    zen_enabled => 0|1 }
+#
+# An ARRAY keyed by a provider FIELD, versus a hash keyed by provider NAME. So
+# $spend->{go} was always undef and every provider degraded -- go to 'absent',
+# zen to 'disabled', claude to 'unreadable' -- no matter what had actually been
+# fetched. Measured, not inferred: a snapshot in the writer's format carrying
+# go five_hour 42/100 and zen balance 12.34 rendered absent/disabled; the same
+# figures in this function's output render ok/ok.
+#
+# BOTH SHAPES ARE JUSTIFIED WHERE THEY ARE, which is why this is an adapter and
+# not a change to either side. The writer's array form is what makes its field
+# whitelist structural (_whitelist_result runs per result). The reader's keyed
+# form is what an in-process composer naturally produces. The missing piece was
+# always the bridge.
+#
+# Rules, each of which is a distinction status() can actually see:
+#   * a result whose provider is not one of claude/go/zen is DROPPED, never
+#     guessed at -- a newer bp-spend.pl must not be able to inject a key here;
+#   * a provider absent from `results` is ABSENT from the output, never
+#     materialised as {} -- status() reads a missing key as "we never looked"
+#     and a present-but-empty hash as "we looked and found nothing";
+#   * zen_enabled is DERIVED, because it never appears in the persisted format
+#     and defaulting it to 0 renders a successfully-fetched zen as `disabled`
+#     -- the wrong word for "we have figures";
+#   * generated_at is deliberately not forwarded: status() takes no age and
+#     derives none (see its own comment), so passing it would be inert.
+# ---------------------------------------------------------------------------
+my %KNOWN_PROVIDER = map { $_ => 1 } qw(claude go zen);
+
+sub from_snapshot {
+    my ($persisted) = @_;
+    my $p = _hash($persisted);
+    my $results = (ref($p->{results}) eq 'ARRAY') ? $p->{results} : [];
+
+    my %spend;
+    for my $r (@$results) {
+        next unless ref($r) eq 'HASH';
+        my $name = _str($r->{provider});
+        next unless defined $name && $KNOWN_PROVIDER{$name};
+        # Last wins, deliberately: a duplicated provider in a snapshot is
+        # malformed, and the later entry is the one a sequential writer wrote
+        # most recently. Neither is a reason to die.
+        $spend{$name} = $r;
+    }
+
+    $spend{zen_enabled} = (ref($spend{zen}) eq 'HASH'
+                           && defined $spend{zen}{status}
+                           && $spend{zen}{status} ne 'absent') ? 1 : 0;
+
+    return \%spend;
+}
+
 1;
