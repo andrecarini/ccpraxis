@@ -195,6 +195,21 @@ case "$EVENT" in
     [ -s "$STATE" ] && PENDING=$(tr '\n' ';' < "$STATE" 2>/dev/null | sed 's/;$//')
     STALE=""
     case "$ST" in *'"stale_pause":1'*) STALE=" (a previous pause went stale: its watcher is gone)";; esac
+    # t10-run-continuity-gaps: if the pause that just went stale never named
+    # anything it was waiting for, say so HERE -- at the moment the failure is
+    # visible -- rather than leaving the reader to work out why a well-formed
+    # pause achieved nothing. bp-runstate.pl already warned when the pause was
+    # granted; this is the same fact arriving a second time, when it has
+    # actually cost something.
+    case "$ST" in
+      *'"hollow_pause":1'*)
+        case "$STALE" in
+          ?*) STALE="$STALE
+       That pause named no work: a live pid is not evidence anything was in
+       flight, so it idled to its deadline. Pass --watching '<what>' next time." ;;
+        esac
+        ;;
+    esac
 
     cat >&2 <<EOF
 BLOCKED: a run is ACTIVE and this turn did not resolve it.$STALE
@@ -214,7 +229,16 @@ Silence is not a resolution. There are exactly two, and you must pick one:
 
        perl plugins/butler/scripts/bp-runstate.pl pause \
             --watcher-pid <pid> --until \$(( \$(date +%s) + 1800 )) \
+            --watching "<the work in flight -- an agent, a task id, a command>" \
             --reason "<what will wake us>"
+
+     ARM THE WATCHER AROUND REAL WORK, not the other way round. A live pid is
+     verified; it is not evidence that anything is running. A pause with every
+     dispatched worker already finished and nothing new dispatched satisfies
+     every check here and still leaves nothing to wake the session -- it just
+     fails later, when the deadline expires. --watching is not enforced and
+     never refuses a pause; it exists so the emptiness is visible while you can
+     still fix it.
 
 If instead you are about to do the work, DO IT NOW in this turn.
 A pause whose watcher dies reverts to active by itself, so a stale pause cannot

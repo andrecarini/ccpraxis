@@ -444,6 +444,48 @@ sub reconcile_one {
     my $all_delivered = (@ledgers > 0) && !grep { !$DELIVERED{ $_->{status} } } @ledgers;
     $r{all_delivered} = $all_delivered ? 1 : 0;
 
+    # --- 2b. THE SILENT STUCK STATE -------------------------------------------
+    #
+    # t10-run-continuity-gaps, closing almanac report 20260819-145104-4651.
+    #
+    # A blueprint every one of whose packages is delivered, but whose authored
+    # status never left `drafting`, can never be archived by the normal path --
+    # and reconcile said NOTHING about it. It exited 0, reported
+    # all_delivered:1, returned an EMPTY action list, and looked exactly like
+    # success. That is the expensive half: a future reader sees a finished
+    # initiative still listed as live and has no way to know why.
+    #
+    # `drafting` means "not yet audited". The audit gate belongs to the
+    # authoring flow (/blueprint:create runs bp-auditor); a MANUAL drive drives
+    # packages, ticks steps and commits, but nothing in that path records an
+    # audit or advances this field. So a manually-driven initiative completes
+    # perfectly and sits unarchivable forever.
+    #
+    # WHAT THIS DOES NOT DO, and it is the whole reason the fix is a diagnostic
+    # rather than a state change: it does not write `audited`. Backdating an
+    # audit that never happened is worse than the bug -- the gate exists
+    # precisely so nobody can claim one. Done-criterion 3 forbids it outright.
+    # It also does not quietly widen the archive condition, which would drop
+    # the gate's meaning for every blueprint rather than just this one.
+    #
+    # It ends the silence, which is the part that actually costs a reader, and
+    # leaves the policy question where it belongs -- with a human who can
+    # answer it.
+    if ($all_delivered && $lifecycle ne 'archived' && (defined $bp_status ? $bp_status : '') eq 'drafting') {
+        push @{ $r{actions} }, {
+            kind    => 'blocked',
+            reason  => 'never-audited',
+            applied => 0,
+            detail  => "every package is delivered but blueprint.md still says status: drafting, "
+                     . "so this can never be archived. `drafting` means NOT YET AUDITED, and a "
+                     . "manual drive never advances that field. Nothing here will write `audited` "
+                     . "for you: that would backdate an audit that did not happen. Either run the "
+                     . "audit the authoring flow performs, or record explicitly how this "
+                     . "initiative was actually driven.",
+        };
+        $r{blocked} = 'never-audited';
+    }
+
     # --- 3. archive -----------------------------------------------------------
     if ($opt->{archive} && $lifecycle eq 'done' && !@{ $r{errors} }) {
         my $blueprints = $bpdir;

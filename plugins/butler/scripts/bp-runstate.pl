@@ -248,11 +248,66 @@ sub pause {
         unless defined $until && $until =~ /^\d+$/;
     return (0, "--until $until is in the past")
         unless $until > time;
+    # --- t10-run-continuity-gaps: the HOLLOW PAUSE ---------------------------
+    #
+    # Closes almanac report 20260819-123218-45c3, which the operator noticed
+    # live ("dont know why you stopped and why the stop hook didn't catch
+    # that") after a run idled roughly seven hours.
+    #
+    # Everything above verifies that a pause is WELL-FORMED: the watcher pid is
+    # running, its identity is fingerprinted, the deadline is in the future.
+    # None of it establishes that any WORK is in flight. A backgrounded sleep
+    # loop armed solely to satisfy the gate passes every check, and a turn that
+    # ends with every dispatched agent already finished and nothing new
+    # dispatched is then permitted -- with nothing scheduled to wake the
+    # session. That is the very failure the gate's own message describes; the
+    # gate prevented the unresolved version and allowed a well-formed empty one.
+    #
+    # THIS WARNS. IT DOES NOT BLOCK, and the report itself argued for that: the
+    # hook cannot see the harness's agent table, so any attempt to prove work is
+    # pending would be a guess, and a wrong guess here blocks a CORRECT run --
+    # strictly worse than the gap it closes (done-criterion 4). A warning costs
+    # nothing when wrong and is visible in the transcript at the exact moment
+    # the driver can still fix it.
+    #
+    # WHAT IT CAN HONESTLY CHECK is the one thing the caller alone knows: what
+    # the watcher is waiting FOR. `--watching` is that declaration. An absent or
+    # timer-shaped one is the signature of a pause armed for the gate rather
+    # than for the work, and it is recorded in the state so a later reader --
+    # and the gate's own stale-pause message -- can say so rather than
+    # rediscovering it.
+    #
+    # A self-declaration is weaker evidence than an observation, and calling it
+    # anything else would repeat the mistake the FIRST version of the stall
+    # guard made (it accepted a Bash command that merely CONTAINED a token,
+    # verifying ceremony rather than function). The difference is that this one
+    # does not gate on the answer: nothing is permitted or refused because of
+    # it, so there is nothing for a ceremony to buy.
+    my $watching = $o{watching};
+    $watching = undef unless defined $watching && !ref($watching) && $watching =~ /\S/;
+    my $hollow = 0;
+    if (!defined $watching) {
+        $hollow = 1;
+    } elsif ($watching =~ /^\s*(?:sleep|timer|wait|watcher|nothing|n\/?a|-+)\s*$/i) {
+        # A watcher described only as a timer IS only a timer.
+        $hollow = 1;
+    }
+
     _write($root, { state => 'paused', reason => ($o{reason} // 'waiting on a watcher'),
                     watcher_pid => $pid + 0, watcher_fingerprint => $fp,
+                    (defined $watching ? (watching => $watching) : ()),
+                    hollow_pause => $hollow,
                     until => $until + 0, updated_at => time }, $surface)
         or return (0, 'could not write the run state');
-    return (1, "paused until $until, watched by pid $pid");
+    my $msg = "paused until $until, watched by pid $pid";
+    $msg .= "\nWARNING: this pause names nothing it is waiting FOR"
+          . (defined $watching ? " (--watching '$watching' describes a timer, not work)" : ' (no --watching given)')
+          . ".\n  A live pid is not evidence that anything is in flight. If every dispatched"
+          . "\n  worker has already finished and nothing new was dispatched, this pause will"
+          . "\n  simply idle until its deadline and then go stale -- which is the same end"
+          . "\n  state as an unattended run dying, only later. Dispatch first, then pause."
+        if $hollow;
+    return (1, $msg);
 }
 
 sub finish {
@@ -275,6 +330,9 @@ unless (caller) {
         if    ($a eq '--reason')      { $o{reason}      = shift @ARGV }
         elsif ($a eq '--watcher-pid') { $o{watcher_pid} = shift @ARGV }
         elsif ($a eq '--until')       { $o{until}       = shift @ARGV }
+        # t10: what the watcher is waiting FOR. Never gates anything; its
+        # absence produces a warning, never a refusal (see BpRunState::pause).
+        elsif ($a eq '--watching')    { $o{watching}    = shift @ARGV }
         elsif ($a eq '--root')        { $o{root}        = shift @ARGV }
         elsif ($a eq '--surface')     { $o{surface}     = shift @ARGV }
         else { print STDERR "bp-runstate: unknown option '$a'\n"; exit 3 }
