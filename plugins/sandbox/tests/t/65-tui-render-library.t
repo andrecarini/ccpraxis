@@ -86,6 +86,34 @@ sub _write {
 # t/64-theme-tokens.t. Blanks every `sub NAME [(proto)] { ... }` body,
 # leaving only a file's TOP-LEVEL code, for AC-P1's "no top-level %ENV /
 # print / Theme:: call" scan.
+# _strip_comments($src) -> $src with every full-line and trailing `#` comment
+# blanked, line structure preserved. Same shape as the copy added to
+# t/66-dashboard-screen.t; kept here rather than shared because this suite's
+# established convention is to reuse detector SHAPES verbatim rather than
+# introduce a cross-file dependency between test files (see this file's own
+# "SCAFFOLDING REUSE" header note).
+#
+# Conservative about what starts a comment: only a `#` at the start of a line
+# or preceded by whitespace. A `#` this misses simply leaves text in place for
+# the scan, which is the pre-existing behaviour; a `#` this over-matched would
+# blank real code and hide a genuine violation.
+sub _strip_comments {
+    my ($src) = @_;
+    return $src unless defined $src;
+    my @out;
+    for my $line (split(/\n/, $src, -1)) {
+        if ($line =~ /^\s*#/) {
+            $line =~ s/\S/ /g;
+        } elsif ($line =~ /^(.*?)(\s#.*)$/) {
+            my ($code, $comment) = ($1, $2);
+            $comment =~ s/\S/ /g;
+            $line = $code . $comment;
+        }
+        push @out, $line;
+    }
+    return join("\n", @out);
+}
+
 sub _balanced_braces {
     my ($src, $from) = @_;
     my $idx = index($src, '{', $from);
@@ -190,7 +218,21 @@ for my $mod (@TUI_MODULES) {
     ok(defined($src), "AC-P1: $path is readable as text (precondition for the top-level scan)");
   SKIP: {
         skip("$path does not exist yet -- module not implemented", 3) unless defined $src;
-        my $top = _strip_sub_bodies($src);
+        # COMMENTS ARE STRIPPED TOO -- the same amendment made to the identical
+        # check in t/66-dashboard-screen.t, and the reason it is worth making
+        # in both is that this is now the THIRD file where an oracle forbidding
+        # three ordinary English words in PROSE has fired on a comment.
+        #
+        # AC-P1 is about load hygiene: what a module DOES when it is require'd.
+        # A comment does nothing. Without this the check forbids the words
+        # print, warn and say from appearing anywhere in a module's top-level
+        # prose -- which is where these modules record their design decisions,
+        # so it fires on the good behaviour rather than the bad.
+        #
+        # THE INTENT IS FULLY PRESERVED. A real top-level `print`, `warn` or
+        # `say` STATEMENT is still caught; stripping comments removes only text
+        # that cannot execute.
+        my $top = _strip_comments(_strip_sub_bodies($src));
         unlike($top, qr/%ENV/, "AC-P1: $mod: no top-level (outside any sub) reference to \%ENV");
         unlike($top, qr/\bprint\b|\bwarn\b|\bsay\b/, "AC-P1: $mod: no top-level print/warn/say");
         unlike($top, qr/\bTheme::\w+\s*\(/, "AC-P1: $mod: no top-level call into Theme::");

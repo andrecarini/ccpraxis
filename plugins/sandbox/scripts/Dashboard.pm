@@ -2479,6 +2479,25 @@ sub _fixed_region_height {
     $cols = 80 if !defined $cols || ref($cols) || $cols !~ /^-?\d+(?:\.\d+)?$/ || $cols < 1;
     my $panels = tui::DashboardScreen::panels($state, $cols);
     return 0 unless ref($panels) eq 'ARRAY' && @$panels;
+
+    # t03-activity-column: mirror compose()'s side-column split, which happens
+    # BEFORE placement -- the side panel is removed from the panel list and the
+    # rest are placed into a narrower main region. Simulating placement over
+    # the full list at the full width would model a screen that is not what
+    # compose_frame renders, and this function exists precisely to agree with
+    # it.
+    my $side_w = tui::Screen::side_column_width($cols);
+    my $side   = 0;
+    if ($side_w > 0) {
+        my @rest;
+        for my $p (@$panels) {
+            if (!$side && ref($p) eq 'HASH' && $p->{side}) { $side = 1; next }
+            push @rest, $p;
+        }
+        if ($side) { $panels = \@rest; $cols = $cols - $side_w }
+    }
+    return 0 unless @$panels;
+
     my $band_rows = tui::Layout::place($panels, $cols);
 
     # $body_height (only when $rows was supplied) -- the SAME formula
@@ -2504,6 +2523,12 @@ sub _fixed_region_height {
         } @{ $band_rows->[$i] };
         if ($has_activity) { $flex_band = $i; last; }
     }
+    # t03: with a side column there is no flex band in the main flow, because
+    # Activity has left it. Leaving $flex_band set would stop the loop below at
+    # the band Activity WOULD have occupied and under-count the fixed region by
+    # everything after it -- and this function's whole contract is agreeing with
+    # what compose_frame renders.
+    $flex_band = undef if $side;
     my $reserve = (defined($body_height) && defined($flex_band))
         ? tui::Screen::flex_reserve($body_height) : 0;
 
@@ -2574,6 +2599,27 @@ sub _fixed_region_height {
 sub activity_capacity {
     my ($state, $rows, $cols) = @_;
     $state ||= {};
+
+    # t03-activity-column: when Activity is the SIDE COLUMN it is no longer
+    # in the band flow at all, so none of the arithmetic below applies to it.
+    # Its height is the whole body -- $rows minus the title and footer rows --
+    # and alerts do not shorten it, because banners live in the main region
+    # (see tui::Screen::compose's own note on why the side column's height
+    # must not track what is happening elsewhere on the screen).
+    #
+    # THIS FUNCTION AND compose_frame MUST AGREE OR SCROLLING BREAKS: capacity
+    # is what the launcher uses to decide how many events to hand the panel.
+    # Under-report and the column renders short with blank rows below the last
+    # event; over-report and the scroll arithmetic runs off a number the screen
+    # never had. The pre-existing comment above already stakes this function on
+    # that agreement, so the side-column case has to be handled here rather
+    # than left to the fixed-region model that no longer describes it.
+    $rows = 0 if !defined $rows || ref($rows) || $rows !~ /^-?\d+(?:\.\d+)?$/ || $rows < 0;
+    if (tui::Screen::side_column_width($cols) > 0) {
+        my $cap = int($rows) - 2 - 1;             # title row, footer row, panel title
+        return $cap > 0 ? $cap : 0;
+    }
+
     # Fix batch (package 06, red-team finding, latent/low): same guard as
     # _fixed_region_height's cols normalisation and compose_frame's own
     # rows/cols normalisation above -- a ref or non-numeric $rows would

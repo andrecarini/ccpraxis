@@ -1117,9 +1117,23 @@ sub panels {
     # already the scrolling one, it is always last, and state.events supplies
     # far more rows than fit, so extra height is always spent on real content.
     my $ev = (ref($state->{events}) eq 'ARRAY') ? $state->{events} : [];
-    push @out, { title => 'Recent activity',
-                 lines => (@$ev ? [ @$ev ] : [ '(no events yet)' ]),
-                 flex  => 1 };
+    # t03-activity-column: it is ALSO the side panel -- a narrow, fixed column
+    # pinned to the right edge and spanning the full body height, with each
+    # event row wrapping to at most three lines and then an ellipsis. Both are
+    # the operator's request, in their words: "a narrow column instead of
+    # expanding to fill everything", "always the last column and take the
+    # entire height of the terminal", "wrap to up to three lines and then
+    # ellipsis".
+    #
+    # `flex => 1` IS KEPT ON PURPOSE. Below tui::Screen's width threshold there
+    # is no side column, and the panel falls back into the band flow -- where
+    # flex is exactly what stops it being squeezed out by the panels above it.
+    # Dropping the flag would have made the narrow case worse than it is today.
+    push @out, { title    => 'Recent activity',
+                 lines    => (@$ev ? [ @$ev ] : [ '(no events yet)' ]),
+                 flex     => 1,
+                 side     => 1,
+                 wrap_cap => 3 };
 
     return \@out;
 }

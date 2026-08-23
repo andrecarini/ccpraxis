@@ -320,6 +320,13 @@ sub _glyphs_data {
         'status.warn' => { cp => 0x25B3, desc => 'hollow up-pointing triangle -- attention state, replaces an emoji circle' },
         'status.crit' => { cp => 0x00D7, desc => 'multiplication sign -- critical state, replaces an emoji circle' },
         'status.idle' => { cp => 0x25CB, desc => 'white circle -- idle/absent state, replaces an emoji circle' },
+        # t03-activity-column: the truncation marker for a row that wrapped
+        # past its cap. Declared HERE rather than written into tui/Frame.pm
+        # because that module is held to an ASCII-only source rule
+        # (t/65-tui-render-library.t AC-T2: no byte >= 0x80 and no \x{...}
+        # escape >= 0x80), and this table's chr($cp) construction is the
+        # mechanism that rule exists to funnel every glyph through.
+        'ellipsis'    => { cp => 0x2026, desc => 'horizontal ellipsis -- a row was truncated past its wrap cap' },
         # Braille spinner frames -- present so this table is a superset of
         # the sandbox dashboard's glyph_table()'s non-emoji entries (spec
         # §2.5 completeness rule). All width 1, matching the dashboard's own

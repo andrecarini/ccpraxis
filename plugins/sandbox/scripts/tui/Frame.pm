@@ -791,4 +791,126 @@ sub is_known_role {
     return _role_set()->{$role} ? 1 : 0;
 }
 
+# ---------------------------------------------------------------------------
+# wrap_capped($line, $role, $w, $continuation_indent, $max_rows) -> \@cells
+#
+# wrap_line, then keep at most $max_rows rows -- and when rows were dropped,
+# say so in the output rather than truncating silently. The last kept row is
+# re-rendered to end with a single-character ellipsis.
+#
+# Added for t03-activity-column (blueprint tui-operator-feedback). The operator
+# asked for activity rows that "could wrap to up to three lines and then
+# ellipsis"; no wrap-to-N-then-ellipsis helper existed anywhere.
+#
+# BUILT ON wrap_line, NEVER BESIDE IT. Every property that makes wrap_line
+# correct -- the atomic-span carve-out, the leading-indent recovery, the
+# degenerate-indent fallback, "exactly $w columns, never mid-glyph" -- is
+# earned by a lot of careful code and two packages' worth of fixes. A second
+# wrapper would have to re-earn all of it and would drift the first time either
+# was touched. This adds exactly one thing: a cap, applied afterwards.
+#
+# THE ELLIPSIS REPLACES CONTENT, NEVER APPENDS PAST $w. Cells are contracted to
+# be exactly $w display columns, and a caller composing a row from several
+# cells depends on that absolutely -- one over-wide cell shifts everything to
+# its right. So the last kept row is rebuilt from a prefix that leaves room for
+# the ellipsis, through the same make_cell/fit_spans path as every other cell.
+#
+# A NON-NUMERIC $max_rows MEANS UNCAPPED, not zero. Rendering nothing because a
+# parameter was malformed is the worse failure of the two, and this sits on the
+# render path. Only an explicit numeric cap below 1 yields [].
+sub wrap_capped {
+    my ($line, $role, $w, $continuation_indent, $max_rows) = @_;
+
+    my $capped = (defined $max_rows && !ref($max_rows) && $max_rows =~ /^-?\d+(?:\.\d+)?$/)
+               ? int($max_rows) : undef;
+    my $rows = wrap_line($line, $role, $w, $continuation_indent);
+    return $rows unless defined $capped;      # uncapped
+    return []    if $capped < 1;
+    return $rows if @$rows <= $capped;
+
+    $role = DEFAULT_ROLE() if !defined $role;
+    my $w_num = (!defined $w || ref($w) || $w !~ /^-?\d+(?:\.\d+)?$/) ? 0 : int($w);
+
+    my @kept = @{$rows}[ 0 .. $capped - 1 ];
+    my $last = $kept[-1];
+
+    # Trim the last row's own spans to leave one display column for the
+    # ellipsis, then rebuild it. Working on the SPANS rather than the flat text
+    # keeps each fragment's role, so the trimmed row still colours the way its
+    # untrimmed siblings do.
+    my $room = $w_num - ELLIPSIS_COLS();
+    if ($room > 0) {
+        my $trimmed = fit_spans(
+            (ref($last->{spans}) eq 'ARRAY') ? $last->{spans} : spanify($last->{text}, $role),
+            $room, $role);
+        # fit_spans right-pads to exactly $room, and a trailing run of spaces
+        # before an ellipsis reads as a gap rather than a cut. Drop it so the
+        # ellipsis sits against the last real character.
+        my @spans = @$trimmed;
+        while (@spans) {
+            my $t = defined $spans[-1]{text} ? $spans[-1]{text} : '';
+            last if $t =~ /\S/;
+            pop @spans;
+        }
+        if (@spans) {
+            my $t = defined $spans[-1]{text} ? $spans[-1]{text} : '';
+            $t =~ s/\s+$//;
+            $spans[-1] = { %{ $spans[-1] }, text => $t };
+        }
+        push @spans, { text => ELLIPSIS(), role => $role };
+        my $fitted = fit_spans(\@spans, $w_num, $role);
+        $kept[-1] = { text => spans_text($fitted), role => $last->{role}, spans => $fitted };
+    }
+    else {
+        # $w is one column or less -- there is no room for content AND an
+        # ellipsis. Say "there is more" rather than showing a single truncated
+        # character, since at this width the character conveys nothing anyway.
+        $kept[-1] = make_cell(ELLIPSIS(), $role, $w_num);
+    }
+
+    return \@kept;
+}
+
+# The truncation marker, and its display width.
+#
+# TAKEN FROM Theme, NOT WRITTEN HERE. This module is held to an ASCII-only
+# source rule (t/65-tui-render-library.t AC-T2: no byte at or above 0x80, and
+# no hex character escape naming a codepoint at or above 0x80), and Theme's
+# glyph table -- which builds each character with chr($cp) from a hex integer
+# -- is precisely the mechanism that rule exists to funnel every glyph
+# through. Writing the escape inline here would have been the shorter route
+# and is exactly what the rule forbids.
+#
+# The rule scans the RAW source, deliberately not comment-stripped, so even
+# naming the escape in this comment trips it -- which is why the paragraph
+# above describes the forbidden form in words instead of showing it.
+#
+# Memoized like _role_set above, and for the same reason: never call into
+# Theme per span, because its accessors defensive-copy. Fetched lazily so
+# nothing happens at load (AC-P1 forbids a top-level Theme:: call).
+my $ELLIPSIS_CACHE;
+
+# Theme::glyph returns the glyph's UTF-8 BYTES, not a record -- the same form
+# panel_title_line already takes for 'rule.h' a few hundred lines above, and
+# the form every other consumer in this tree uses. The first draft of this sub
+# treated the return value as a hash and read a `char` key off it; that is a
+# non-ref, so the check failed, the ASCII fallback fired, and the dashboard
+# rendered a full stop where the ellipsis belonged. It compiled, every test
+# passed, and only READING the rendered screen caught it -- which is exactly
+# what a UI pass is for.
+sub ELLIPSIS {
+    return $ELLIPSIS_CACHE if defined $ELLIPSIS_CACHE;
+    my $g = Theme::glyph('ellipsis');
+    # Degrade to ASCII rather than to undef. A missing glyph must not make a
+    # truncated row indistinguishable from a complete one -- that is the whole
+    # statement this character carries.
+    $ELLIPSIS_CACHE = (defined $g && !ref($g) && length $g) ? $g : '.';
+    return $ELLIPSIS_CACHE;
+}
+
+sub ELLIPSIS_COLS {
+    my $wd = Theme::glyph_width('ellipsis');
+    return (defined $wd && !ref($wd) && $wd =~ /^\d+$/ && $wd > 0) ? $wd : 1;
+}
+
 1;

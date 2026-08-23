@@ -72,6 +72,54 @@ sub _ROLE_ATTENTION { return 'state.warn'; }
 # continuation line.
 use constant WRAP_CONTINUATION_INDENT => 2;
 
+# ---------------------------------------------------------------------------
+# t03-activity-column -- the side column's two constants.
+#
+# ACTIVITY_COLUMN_COLS is DERIVED and the derivation is written here so it can
+# be checked rather than trusted: an activity row is a 6-column time field plus
+# two spaces (Dashboard::recent_events builds it as sprintf '%-6s  '), then a
+# glyph and a space, then the event body. That is a 10-column fixed prefix. 30
+# columns of body budget on top of it fits `resources_sampler_forked` and most
+# of its siblings on one line, and lets the rest use the three-row cap the
+# operator asked for instead of being cut.
+#
+# SIDE_COLUMN_MIN_MAIN is what the REST of the screen must still have for the
+# split to be worth making, and it is DERIVED FROM tui::Layout's own two-column
+# breakpoint rather than picked. That is the whole ruling behind criterion 5's
+# "behaviour at narrow widths is DEFINED, not incidental":
+#
+#   A side column is taken only when the main region still clears the width at
+#   which tui::Layout is willing to give it two columns.
+#
+# BREAKPOINT_TWO_COL already encodes this project's answer to "how narrow can a
+# panel get before it stops being useful". Reserving 40 columns from a
+# 100-column terminal leaves 60, which that constant says is a single-column
+# width -- so the alternative to this rule is a layout that trades the main
+# region's second column for the activity strip. That trade is not obviously
+# right, and it is not one to make silently: below the threshold the activity
+# panel stays exactly where it is today, flex and all.
+#
+# THE COST, STATED: the side column therefore appears at 130 columns and above.
+# An operator on a 120-column terminal sees no change. If that turns out to be
+# the wrong call for real terminals, the lever is ACTIVITY_COLUMN_COLS -- 30
+# would put the threshold at 120 -- and it is one number, not a redesign.
+# ---------------------------------------------------------------------------
+use constant ACTIVITY_COLUMN_COLS  => 40;
+sub SIDE_COLUMN_MIN_MAIN { tui::Layout::BREAKPOINT_TWO_COL() }
+
+# side_column_width($cols) -> ACTIVITY_COLUMN_COLS | 0. PUBLIC, pure.
+#
+# 0 means "this terminal is too narrow to split", and the caller then behaves
+# exactly as it did before this package -- a fallback to tested behaviour, not
+# a second degraded path to maintain.
+sub side_column_width {
+    my ($cols) = @_;
+    return 0 if !defined $cols || ref($cols) || $cols !~ /^-?\d+(?:\.\d+)?$/;
+    $cols = int($cols);
+    return 0 if $cols < ACTIVITY_COLUMN_COLS() + SIDE_COLUMN_MIN_MAIN();
+    return ACTIVITY_COLUMN_COLS();
+}
+
 # _render_panel(\%panel, $w, $maxh) -> up to $maxh cells: a title line
 # followed by (indented) body lines, clipped to $maxh. PRIVATE.
 sub _render_panel {
@@ -95,9 +143,15 @@ sub _render_panel {
         } else {
             @elems = ($ln);
         }
-        my $cells = tui::Frame::wrap_line(
+        # t03: an optional PER-SOURCE-LINE row cap. Absent (every panel but the
+        # side column today) this is byte-identical to the wrap_line call it
+        # replaces -- wrap_capped with an undefined cap returns wrap_line's own
+        # result. The cap is per source line, not per panel: the operator asked
+        # for three lines per activity row, not three rows of activity.
+        my $cap = (ref($panel) eq 'HASH') ? $panel->{wrap_cap} : undef;
+        my $cells = tui::Frame::wrap_capped(
             [ { text => '  ', role => 'text.primary' }, @elems ],
-            $role, $w, WRAP_CONTINUATION_INDENT()
+            $role, $w, WRAP_CONTINUATION_INDENT(), $cap
         );
         for my $c (@$cells) {
             last if @out >= $maxh;
@@ -297,6 +351,42 @@ sub compose {
 
     my $body_height = $rows - 2;
 
+    # --- t03-activity-column: reserve the rightmost columns, full body height ---
+    #
+    # The panel carrying `side => 1` leaves the band flow and becomes a fixed,
+    # narrow column pinned to the right edge, spanning the WHOLE body. What is
+    # left goes to the existing machinery unchanged, at the narrower width.
+    #
+    # ORDER MATTERS HERE, and this is the reason the reservation happens before
+    # the banner block rather than after it. The side column's height is
+    # $body_height as computed above -- BEFORE banners are subtracted -- so
+    # banners shrink the main region only. That is deliberate: the flex/reserve
+    # machinery in _place_and_render exists precisely so the activity panel's
+    # height does not track what is happening elsewhere on the screen, and a
+    # side column that got shorter when a banner appeared would reintroduce the
+    # reflow that machinery was built to prevent.
+    #
+    # If no panel is marked, or the terminal is too narrow (side_column_width
+    # returns 0), $side_w stays 0 and everything below runs exactly as it did
+    # before this package -- including the activity panel's `flex => 1`, which
+    # is why that flag is KEPT rather than replaced.
+    my @panels_all = (ref($screen->{panels}) eq 'ARRAY') ? @{ $screen->{panels} } : ();
+    my $side_w = side_column_width($cols);
+    my ($side_panel, @panels);
+    if ($side_w > 0) {
+        for my $p (@panels_all) {
+            # FIRST marked panel only. A second one stays in the flow rather
+            # than becoming a second column -- two side columns is not a state
+            # this layout has a meaning for, and silently honouring it would
+            # eat the main region.
+            if (!$side_panel && ref($p) eq 'HASH' && $p->{side}) { $side_panel = $p; next }
+            push @panels, $p;
+        }
+    }
+    $side_w = 0 if !$side_panel;
+    @panels = @panels_all if !$side_panel;
+    my $main_cols = $cols - $side_w;
+
     # Banners wrap (Decision D2, specs/d02-wrap-every-surface-spec.md,
     # bug report 20260814-093052-312a): a wrapped banner emits MORE than one
     # row, so the row budget below is spent in ROWS, not in banner messages
@@ -324,22 +414,46 @@ sub compose {
         # wrap_line computes internally), which is generous/safe since no
         # single wrapped row can ever carry more than $cols display columns
         # of input (wrap_line's own contract).
-        my $bounded = tui::Frame::bound_for_wrap($msg, $budget, $cols);
-        my $wrapped = tui::Frame::wrap_line($bounded, $banner_role, $cols, WRAP_CONTINUATION_INDENT());
+        my $bounded = tui::Frame::bound_for_wrap($msg, $budget, $main_cols);
+        my $wrapped = tui::Frame::wrap_line($bounded, $banner_role, $main_cols, WRAP_CONTINUATION_INDENT());
         $wrapped = [ @$wrapped[ 0 .. $budget - 1 ] ] if @$wrapped > $budget;
         push @banner_cells, @$wrapped;
     }
-    $body_height -= scalar(@banner_cells);   # counts ACTUAL rows, fixes the message-count bug
+    # $main_height, not $body_height. Banners live in the MAIN region now, so
+    # they shorten it alone -- the side column keeps the full body height it
+    # was reserved above. With no side column the two are the same number and
+    # this is the arithmetic that was already here.
+    my $main_height = $body_height - scalar(@banner_cells);
+    $main_height = 0 if $main_height < 0;
 
-    my @panels = (ref($screen->{panels}) eq 'ARRAY') ? @{ $screen->{panels} } : ();
-    my @body_cells = _place_and_render(\@panels, $cols, $body_height);
-
-    while (@body_cells < $body_height) {
-        push @body_cells, tui::Frame::make_cell('', 'text.primary', $cols);
+    my @main_cells = _place_and_render(\@panels, $main_cols, $main_height);
+    while (@main_cells < $main_height) {
+        push @main_cells, tui::Frame::make_cell('', 'text.primary', $main_cols);
     }
-    @body_cells = @body_cells[ 0 .. $body_height - 1 ] if @body_cells > $body_height;
+    @main_cells = @main_cells[ 0 .. $main_height - 1 ] if @main_cells > $main_height;
 
-    return [ $title_cell, @banner_cells, @body_cells, $footer_cell ];
+    # No side column: the banner cells and the main cells stack, exactly as
+    # before, and every row is $cols wide because $main_cols == $cols.
+    return [ $title_cell, @banner_cells, @main_cells, $footer_cell ] if !$side_panel;
+
+    # With a side column, the banner rows and the main rows together form the
+    # LEFT region, and the side column runs beside all of them.
+    my @left = (@banner_cells, @main_cells);
+
+    my @side = _render_panel($side_panel, $side_w, $body_height);
+
+    # BOTH REGIONS ARE PADDED TO $body_height BEFORE JOINING. That is what
+    # keeps "total rows == the terminal height" a structural property rather
+    # than arithmetic somebody has to get right at three call sites: neither
+    # region can run out first, so the join below is always a clean pairing.
+    while (@left < $body_height) { push @left, tui::Frame::make_cell('', 'text.primary', $main_cols) }
+    while (@side < $body_height) { push @side, tui::Frame::make_cell('', 'text.primary', $side_w) }
+    @left = @left[ 0 .. $body_height - 1 ] if @left > $body_height;
+    @side = @side[ 0 .. $body_height - 1 ] if @side > $body_height;
+
+    my @body_cells = map { _join_row_cells($left[$_], $side[$_]) } 0 .. $body_height - 1;
+
+    return [ $title_cell, @body_cells, $footer_cell ];
 }
 
 # viewport($total, $height, $cursor) -> \%vp -- pure integer scrolling

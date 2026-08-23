@@ -1,0 +1,308 @@
+#!/usr/bin/env perl
+# t03-activity-column -- the oracle for blueprint tui-operator-feedback.
+#
+# Closes the operator's third request, verbatim: "the Recent activity could
+# very well be a narrow column instead of expanding to fill everything ... It
+# could be always the last column and take the entire height of the terminal.
+# Everything else could be arranged on the remaining space in rows and columns
+# ... which could wrap to up to three lines and then ellipsis."
+#
+# This is NEW LAYOUT CAPABILITY, not a bug fix. Composition was strictly
+# row-banded (tui::Layout::place assigns panels to bands; bands stack), there
+# was no full-height side-column concept, and no wrap-to-N-then-ellipsis helper
+# existed at all.
+#
+# EVERY SIZE-SENSITIVE ASSERTION SWEEPS A GRID OF WIDTHS *AND* HEIGHTS
+# (criterion 6, and it is not a formality). t08 of this same blueprint fixed a
+# CRITICAL that a 95-assertion file missed because it never varied HOME; the
+# same file's wrap check hardcoded cols=40 while its cols=1 check asserted only
+# timing. A single size proves nothing about a layout.
+use strict;
+use warnings;
+use FindBin qw($Bin);
+use lib "$Bin/../../scripts";
+use Test::More;
+use Theme;
+
+my $OK = eval { require Dashboard; require tui::Screen; require tui::Frame;
+                require tui::Layout; require tui::DashboardScreen; 1 };
+ok($OK, 'the TUI modules load') or BAIL_OUT("require failed: $@");
+
+sub plain { my ($s) = @_; $s =~ s/\e\[[0-9;]*m//g; return $s }
+sub w     { return tui::Layout::display_width(plain($_[0])) }
+
+# A deterministic activity feed. Every fourth row is deliberately long enough
+# to need more than three wrapped lines in a 40-column column.
+my $LONG = 'resources_sampler_forked with an unusually long trailing explanation '
+         . 'that keeps going well past any reasonable column width and then some more';
+sub events {
+    my ($n) = @_;
+    return [ map {
+        [ { text => sprintf('%-6s  ', sprintf('16:%02d', $_ % 60)), role => 'text.muted' },
+          { text => 'o ',  role => 'text.primary' },
+          { text => ($_ % 4 == 0 ? $LONG : 'spend_sampler_forked'), role => 'text.primary' } ]
+    } 1 .. $n ];
+}
+sub state { return { events => events($_[0] // 40), runs => [], tokens => {} } }
+
+# ===========================================================================
+# PART 1 -- tui::Frame::wrap_capped (spec S1).
+# ===========================================================================
+{
+    can_ok('tui::Frame', 'wrap_capped');
+
+    my $text = join(' ', ('alpha') x 60);
+
+    for my $width (12, 20, 40, 61) {
+        for my $cap (1, 2, 3, 5) {
+            my $rows = tui::Frame::wrap_capped($text, 'text.primary', $width, 2, $cap);
+            cmp_ok(scalar(@$rows), '<=', $cap,
+                "AC1: cap $cap at width $width yields at most $cap rows");
+            my @bad = grep { w($_->{text}) != $width } @$rows;
+            is(scalar(@bad), 0,
+                "AC3: every row is exactly $width display columns at cap $cap -- the ellipsis does not overflow");
+        }
+    }
+
+    # THE MARKER IS THE REAL GLYPH, NOT THE ASCII FALLBACK -- and this
+    # assertion exists because the fallback actually fired. tui::Frame::ELLIPSIS
+    # reads Theme::glyph('ellipsis'), which returns the glyph's UTF-8 BYTES; the
+    # first implementation treated the return value as a record and read a
+    # `char` key off it, so the check failed, the fallback engaged, and the
+    # dashboard rendered a full stop where the ellipsis belonged. Everything
+    # compiled and every test passed. Only reading the rendered screen caught
+    # it, so the oracle now pins what reading the screen established.
+    is(tui::Frame::ELLIPSIS(), Theme::glyph('ellipsis'),
+        'AC2: the truncation marker is Theme\'s declared glyph, not the ASCII degrade path');
+    isnt(tui::Frame::ELLIPSIS(), '.',
+        'AC2: and specifically not a full stop, which is what a misread glyph API produced');
+
+    # AC2 -- the ellipsis appears exactly when rows were dropped, and not
+    # otherwise. Asserted in BOTH directions: a marker that is always present
+    # says nothing, and one that is never present hides the truncation.
+    my $ell     = tui::Frame::ELLIPSIS();
+    my $natural = tui::Frame::wrap_line($text, 'text.primary', 20, 2);
+    my $cut     = tui::Frame::wrap_capped($text, 'text.primary', 20, 2, 3);
+    my $whole   = tui::Frame::wrap_capped($text, 'text.primary', 20, 2, scalar(@$natural));
+    cmp_ok(scalar(@$natural), '>', 3, 'AC2 precondition: this input genuinely needs more than three rows');
+    like(plain($cut->[-1]{text}), qr/\Q$ell\E\s*$/,
+        'AC2: when rows were dropped the last kept row ends with the ellipsis');
+    unlike(join('', map { plain($_->{text}) } @$whole), qr/\Q$ell\E/,
+        'AC2: when nothing was dropped no ellipsis is added');
+
+    # AC4 -- a cap at or above the natural row count is wrap_line exactly.
+    is_deeply([ map { $_->{text} } @$whole ], [ map { $_->{text} } @$natural ],
+        'AC4: a cap at the natural row count is byte-identical to wrap_line');
+    is_deeply([ map { $_->{text} } @{ tui::Frame::wrap_capped($text, 'text.primary', 20, 2, 999) } ],
+              [ map { $_->{text} } @$natural ],
+        'AC4: and so is a cap far above it');
+
+    # AC5 -- the two degenerate cap values, which must differ from each other.
+    is_deeply(tui::Frame::wrap_capped($text, 'text.primary', 20, 2, 0), [],
+        'AC5: an explicit cap below 1 yields no rows');
+    my $uncapped = tui::Frame::wrap_capped($text, 'text.primary', 20, 2, undef);
+    is(scalar(@$uncapped), scalar(@$natural),
+        'AC5: a MISSING cap means uncapped, not zero -- rendering nothing because a parameter was malformed is the worse failure, and this is on the render path');
+    is(scalar(@{ tui::Frame::wrap_capped($text, 'text.primary', 20, 2, 'nonsense') }), scalar(@$natural),
+        'AC5: and so does a non-numeric one');
+
+    # Totality: this sits on the render path, so a die blanks the screen.
+    for my $bad (undef, [], {}, \"ref") {
+        my $got = eval { tui::Frame::wrap_capped($bad, 'text.primary', 20, 2, 3) };
+        is(ref($got), 'ARRAY', 'AC5: malformed input yields an arrayref rather than dying')
+            or diag("  died: $@");
+    }
+}
+
+# ===========================================================================
+# PART 2 -- the reservation rule (spec S2.1/S2.2, criterion 5).
+# ===========================================================================
+{
+    my $col   = tui::Screen::ACTIVITY_COLUMN_COLS();
+    my $floor = tui::Screen::SIDE_COLUMN_MIN_MAIN();
+    my $edge  = $col + $floor;
+
+    is(tui::Screen::side_column_width($edge - 1), 0,
+        "AC6: one column below the threshold ($edge) there is no side column");
+    is(tui::Screen::side_column_width($edge), $col,
+        'AC6: at the threshold the full column is reserved');
+    is(tui::Screen::side_column_width($edge + 500), $col,
+        'AC6: and it does not grow with the terminal -- "narrow" is the whole point');
+
+    # THE RULE IS DERIVED, NOT PICKED. This is what makes criterion 5's
+    # "behaviour at narrow widths is DEFINED, not incidental" true rather than
+    # asserted: the floor is tui::Layout's own two-column breakpoint, so the
+    # side column is taken only when the main region still clears the width at
+    # which that module is willing to give it two columns.
+    is($floor, tui::Layout::BREAKPOINT_TWO_COL(),
+        'AC6: the main-region floor IS the layout breakpoint, not a second number that happens to be near it');
+
+    for my $c ($edge, $edge + 1, 200, 400) {
+        cmp_ok($c - tui::Screen::side_column_width($c), '>=', $floor,
+            "AC6: at cols=$c the main region is never left below the floor");
+    }
+
+    for my $bad (undef, 'x', -5, 0, [ ]) {
+        is(tui::Screen::side_column_width($bad), 0,
+            'AC6: a malformed width reserves nothing rather than guessing');
+    }
+}
+
+# ===========================================================================
+# PART 3 -- the composed frame. The invariants that a side column can break.
+# ===========================================================================
+my $EDGE = tui::Screen::ACTIVITY_COLUMN_COLS() + tui::Screen::SIDE_COLUMN_MIN_MAIN();
+my @WIDE   = ($EDGE, $EDGE + 1, 150, 200);
+my @NARROW = (60, 80, $EDGE - 1);
+my @HEIGHTS = (5, 8, 12, 24, 45, 60);
+
+{
+    my ($rowbad, $widebad) = (0, 0);
+    my $checked = 0;
+    for my $cols (@NARROW, @WIDE) {
+        for my $rows (@HEIGHTS) {
+            my $f = Dashboard::compose_frame(state(), $rows, $cols);
+            $rowbad++ if scalar(@$f) != $rows;
+            $widebad += scalar grep { w($_->{text}) != $cols } @$f;
+            $checked++;
+        }
+    }
+    is($rowbad, 0,
+        "AC10: total emitted rows equals the terminal height, across all $checked width/height combinations -- the invariant t08 and the previous initiative's d02 both turned on");
+    is($widebad, 0,
+        'AC11: every emitted row is exactly the terminal width, across the same grid');
+}
+
+# AC7/AC8 -- the column is LAST and spans the WHOLE body.
+for my $cols (@WIDE) {
+    for my $rows (12, 24, 45) {
+        my $f  = Dashboard::compose_frame(state(), $rows, $cols);
+        my $sw = tui::Screen::side_column_width($cols);
+
+        # The title rule for 'Recent activity' must begin within the reserved
+        # right-hand slice, which is what "last column" means positionally.
+        my ($idx) = grep { plain($f->[$_]{text}) =~ /Recent activity/ } 0 .. $#$f;
+        ok(defined $idx, "AC7: cols=$cols rows=$rows -- the activity panel is present");
+      SKIP: {
+            skip('no activity panel', 2) unless defined $idx;
+            my $at = index(plain($f->[$idx]{text}), 'Recent activity');
+            cmp_ok($at, '>=', $cols - $sw,
+                "AC7: cols=$cols rows=$rows -- it starts inside the reserved rightmost $sw columns");
+            is($idx, 1,
+                "AC8: cols=$cols rows=$rows -- and it starts on the FIRST body row, immediately under the screen title");
+        }
+
+        # AC8 -- the bottom body row also carries column content. With 40
+        # events supplied there is always more than enough to fill it.
+        my $last_body = plain($f->[-2]{text});
+        my $tail = substr($last_body, -$sw);
+        like($tail, qr/\S/,
+            "AC8: cols=$cols rows=$rows -- the bottom body row carries side-column content, so the column spans the entire height");
+    }
+}
+
+# AC9 -- below the threshold there is no side column at all, and the activity
+# panel is back in the band flow.
+for my $cols (@NARROW) {
+    my $f = Dashboard::compose_frame(state(), 24, $cols);
+    my ($idx) = grep { plain($f->[$_]{text}) =~ /Recent activity/ } 0 .. $#$f;
+    ok(defined $idx, "AC9: cols=$cols -- the activity panel still exists");
+    isnt($idx, 1, "AC9: cols=$cols -- but it is NOT pinned to the first body row; it is in the band flow, where its flex flag still protects it");
+}
+
+# AC12 -- a banner shortens the MAIN region and leaves the side column's
+# height alone. This is the property tui::Screen::compose orders its code to
+# preserve, and the reason the reservation happens before the banner block.
+for my $cols (@WIDE) {
+    my $rows = 30;
+    my $sw   = tui::Screen::side_column_width($cols);
+    my $plain_f  = Dashboard::compose_frame(state(), $rows, $cols);
+    my $banner_f = Dashboard::compose_frame({ %{ state() }, install_warning => 'a warning that occupies a row' }, $rows, $cols);
+
+    my $count = sub {
+        my ($f) = @_;
+        return scalar grep { substr(plain($_->{text}), -$sw) =~ /\S/ } @{$f}[ 1 .. $#$f - 1 ];
+    };
+    is($count->($banner_f), $count->($plain_f),
+        "AC12: cols=$cols -- a banner does not change how many body rows carry side-column content");
+}
+
+# AC13 -- the other panels are still all there, in the narrower main region.
+for my $cols (@WIDE) {
+    my $f = Dashboard::compose_frame(state(), 45, $cols);
+    my $all = join("\n", map { plain($_->{text}) } @$f);
+    like($all, qr/Run/,        "AC13: cols=$cols -- Run survives the split");
+    like($all, qr/Blueprints/, "AC13: cols=$cols -- Blueprints survives the split");
+    like($all, qr/Resources/,  "AC13: cols=$cols -- Resources survives the split");
+    like($all, qr/Providers/,  "AC13: cols=$cols -- Providers survives the split");
+}
+
+# AC14 -- the three-line cap, THROUGH THE REAL DASHBOARD rather than only
+# through wrap_capped in isolation. A helper that caps correctly and a panel
+# that never uses it would pass PART 1 and fail the operator.
+{
+    my $ell = tui::Frame::ELLIPSIS();
+    for my $cols (@WIDE) {
+        my $sw = tui::Screen::side_column_width($cols);
+        my $f  = Dashboard::compose_frame(state(60), 45, $cols);
+        my @col = map { substr(plain($_->{text}), -$sw) } @{$f}[ 1 .. $#$f - 1 ];
+
+        # A wrapped continuation row is one that does not open with a clock.
+        # Count the longest run of them following a clock row: that run plus
+        # its own leading row is the wrapped height of one event.
+        my ($longest, $run) = (0, 0);
+        for my $line (@col) {
+            if ($line =~ /^\s*\d\d:\d\d/) { $run = 1 }
+            elsif ($line =~ /\S/ && $run)  { $run++; $longest = $run if $run > $longest }
+            else                            { $run = 0 }
+        }
+        cmp_ok($longest, '<=', 3,
+            "AC14: cols=$cols -- no activity row occupies more than three lines in the rendered dashboard");
+        like(join("\n", @col), qr/\Q$ell\E/,
+            "AC14: cols=$cols -- and a row that needed more than three says so with an ellipsis");
+    }
+}
+
+# AC15 -- with no side panel marked, compose is byte-identical to what it did
+# before this package. This is what makes every other consumer of tui::Screen
+# (the backpack screen, the launcher screens) provably unaffected.
+{
+    my %screen = (
+        title  => 'a title', footer => 'a footer',
+        panels => [ { title => 'One', lines => [ 'alpha', 'beta' ] },
+                    { title => 'Two', lines => [ 'gamma' ] } ],
+    );
+    for my $cols (60, 100, 200) {
+        for my $rows (5, 12, 24) {
+            my $f = tui::Screen::compose(\%screen, $rows, $cols);
+            is(scalar(@$f), $rows, "AC15: no side panel, cols=$cols rows=$rows -- row count is the terminal height");
+            my @bad = grep { w($_->{text}) != $cols } @$f;
+            is(scalar(@bad), 0, "AC15: no side panel, cols=$cols rows=$rows -- every row is the terminal width");
+        }
+    }
+}
+
+# ===========================================================================
+# PART 4 -- capacity agrees with the render.
+#
+# Dashboard::activity_capacity is what the launcher uses to decide how many
+# events to hand the panel. Its own header stakes it on agreeing with what
+# compose_frame renders. Moving Activity out of the band flow invalidated the
+# model it computed from, so the agreement has to be re-established, not
+# assumed.
+# ===========================================================================
+for my $cols (@WIDE, @NARROW) {
+    for my $rows (12, 24, 45) {
+        my $sw  = tui::Screen::side_column_width($cols);
+        my $cap = Dashboard::activity_capacity(state(200), $rows, $cols);
+        next unless $sw > 0;
+
+        my $f = Dashboard::compose_frame(state(200), $rows, $cols);
+        my $rendered = scalar grep { substr(plain($_->{text}), -$sw) =~ /\S/ } @{$f}[ 1 .. $#$f - 1 ];
+        # -1 for the panel's own title row, which capacity excludes.
+        is($cap, $rendered - 1,
+            "AC-capacity: cols=$cols rows=$rows -- reported capacity ($cap) matches the rows the column actually renders");
+    }
+}
+
+done_testing();
