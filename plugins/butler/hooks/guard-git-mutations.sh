@@ -327,10 +327,24 @@ SCAN=$SCAN_OUT
 # immediately after a quote/backtick/paren (they follow a space/`;`/newline/
 # start, already matched), so narrowing there costs no existing DENY while
 # closing the false-positive class above.
+# `(` and `{` are in the BASE class, not only the widened ones. almanac
+# 20260819-164901-52d3, verified by running this hook: `(git stash push -m wip)`
+# and `x=1; {git stash push -m wip; }` were both ALLOWED. A subshell or brace
+# group opens a COMMAND POSITION -- the verb immediately after it runs, exactly
+# as it would after a `;` -- so their absence here was a false NEGATIVE, which is
+# the dangerous direction for a guard: a prohibited command executed.
+#
+# This does not reintroduce MINOR-7's false-positive class, and the distinction
+# is the reason the widened classes stay separate. That class was about QUOTES:
+# a quote is never itself a reason the shell will execute what it encloses, so
+# treating it as a boundary makes a quoted MENTION look like an invocation. `(`
+# and `{` are the opposite -- they mean "a command starts here" and nothing
+# else. And this class is applied to the STRIPPED scan target, where quoted
+# spans are already blanked, so a `(` inside prose cannot reach it.
 case "$RAW_KIND" in
-  shellword) ANCHOR_CLASS='[;&|[:space:]'\''"`(]' ;;
-  carrier)   ANCHOR_CLASS='[;&|[:space:]`(]' ;;
-  *)         ANCHOR_CLASS='[;&|[:space:]]' ;;
+  shellword) ANCHOR_CLASS='[;&|[:space:]'\''"`({]' ;;
+  carrier)   ANCHOR_CLASS='[;&|[:space:]`({]' ;;
+  *)         ANCHOR_CLASS='[;&|[:space:]({]' ;;
 esac
 STASH_RE="(^|${ANCHOR_CLASS})git[[:space:]]+stash\\b"
 STASH_RO_RE='git[[:space:]]+stash[[:space:]]+(list|show)\b'

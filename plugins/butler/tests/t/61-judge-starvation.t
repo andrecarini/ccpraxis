@@ -757,7 +757,24 @@ is(BpOrch::_tunables_base()->{judge_spawn_cap}, 3, 'PIN: judge_spawn_cap default
     # -- items 9+10 wording: neither park branch may tell an operator the
     #    package failed (done-criterion 1), and the first-starvation branch
     #    must not claim a widened retry happened.
-    unlike($orch, qr/judge-starved[\s\S]{0,400}?\bfail(?:ed|ure|s)?\b/i,
+    # COMMENTS STRIPPED. This is a PROXIMITY heuristic over raw source, and it
+    # was matching a comment, not decision text: the %DECISION_VALIDITY block's
+    # explanation of why judge-starved is deliberately absent from that table
+    # sits within 400 characters of the DATA KEY 'harvest-failure'. Neither is
+    # operator-facing wording, which is the only thing this assertion is about.
+    #
+    # Verified pre-existing -- the collision is present at b5e1a5d, before any of
+    # 2026-08-24's work -- and it had turned the whole file red (5 not-ok,
+    # because the file also re-runs itself and asserts its own exit code).
+    #
+    # %KIND_REGISTRY's own comment records that its key ORDER was arranged to
+    # dodge this same heuristic. That is the tell: when source has to be laid out
+    # to avoid an oracle, the oracle is reading the wrong thing. Stripping
+    # comments fixes the class instead of rearranging around it.
+    #
+    # Same defect as t/26's backtick scan, t/65, t/66, t/115 and t/145.
+    (my $orch_code = $orch) =~ s/^\s*#.*$//mg;
+    unlike($orch_code, qr/judge-starved[\s\S]{0,400}?\bfail(?:ed|ure|s)?\b/i,
         'REGRESSION items 9+10: no judge-starved decision text says the package failed');
 }
 
@@ -954,8 +971,30 @@ sub reap_dummy {
     my $orch = slurp($ORCH_PL);
     my $n_sites  = () = ($orch =~ /mark_judge_inflight\(\$runs,/g);
     my $n_routed = () = ($orch =~ /'inflight_marker_failed'/g);
-    is($n_sites, 5, 'ITEM 14a: exactly five mark_judge_inflight($runs, ...) call sites remain (re-grepped, not trusted from ledger prose)');
-    is($n_routed, 5, "ITEM 14a: all five sites route a failed marker through 'inflight_marker_failed' (1:1 with the call-site count)");
+    # THE INVARIANT IS THE 1:1 PAIRING, not the literal five.
+    #
+    # The defect this guards is a mark_judge_inflight call site whose failed
+    # return is discarded: the judge runs unmarked, the next tick sees
+    # inflight=>0 and fires another, forever, because $rc==0 never trips the
+    # spawn-fail cap. What proves that cannot happen is that EVERY call site has
+    # a matching 'inflight_marker_failed' route -- a property that holds at five
+    # sites, six, or twenty.
+    #
+    # Pinning the literal 5 made ADDING a correctly-guarded judge kind a
+    # regression. There have been six sites since escalation-resolve was added,
+    # and this assertion has been red for it -- verified pre-existing at
+    # b5e1a5d, before 2026-08-24's work. Being red for a correct change is how
+    # an oracle stops being read.
+    #
+    # A floor plus the equality keeps both halves: sites cannot be LOST (which
+    # would mean a guard was deleted), and none can go unrouted.
+    cmp_ok($n_sites, '>=', 5,
+        'ITEM 14a: at least the original five mark_judge_inflight($runs, ...) call sites remain '
+      . '(re-grepped, not trusted from ledger prose) -- losing one means a guard was deleted');
+    is($n_routed, $n_sites,
+        "ITEM 14a: EVERY call site routes a failed marker through 'inflight_marker_failed' "
+      . "(1:1 with the call-site count, whatever that count is) -- an unrouted site is the "
+      . "unbounded-refire defect");
 }
 
 # ---------------------------------------------------------------------------

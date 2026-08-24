@@ -61,35 +61,67 @@ esac
 # positive the stripping was meant to remove, for those commands only, which is
 # the correct trade for a hook whose job is to BLOCK: a false positive costs a
 # reworded command, a false negative costs the work the guard exists to protect.
+RAW_REASON=exec        # why we are matching RAW; 'exec' = we are not, the strip held
 if [ "${#CMD}" -le "$BP_GUARD_MAX_STRIP_BYTES" ] && command -v bp_strip_shell_noise >/dev/null 2>&1; then
   STRIPPED=$(printf '%s' "$CMD" | bp_strip_shell_noise)
-  if [ -n "$STRIPPED" ] \
-     && ! grep -Eq '(^|[;&|[:space:]])(ba|z|k|da)?sh[[:space:]]+(-[a-zA-Z]*[[:space:]]+)*-c\b' <<<"$CMD" \
-     && ! grep -Eq '`|\$\(' <<<"$CMD"; then
+  if grep -Eq '(^|[;&|[:space:]])(ba|z|k|da)?sh[[:space:]]+(-[a-zA-Z]*[[:space:]]+)*-c\b' <<<"$CMD"; then
+    RAW_REASON=shellword
+  elif grep -Eq '`|\$\(' <<<"$CMD"; then
+    RAW_REASON=carrier
+  elif [ -n "$STRIPPED" ]; then
     MATCH_TEXT="$STRIPPED"
   fi
 fi
 
+# THE COMMAND-POSITION BOUNDARY. almanac 20260819-164901-52d3: every matcher
+# below required the verb to follow start-of-string or one of [;&|<space>], so
+# an invocation sitting immediately after a quote or a paren was not matched --
+# even on the raw path, with no stripping involved:
+#
+#   sh -c ' git reset --hard'    DENY   (leading space)
+#   zsh -c 'git reset --hard'    ALLOW  <-- gap, differing by one space
+#   echo $(git reset --hard)     ALLOW  <-- gap
+#
+# Whether the guard fired depended on incidental whitespace inside a quoted
+# argument. For a hook whose job is to BLOCK, that is the dangerous direction.
+#
+# `(` and `{` are ALWAYS boundaries: a subshell or brace group opens a command
+# position, so the verb after one runs exactly as it would after a `;`.
+#
+# Quotes and backticks are boundaries ONLY when we are already matching raw text
+# because a shell interpreter or a command substitution is present -- i.e. when
+# the shell will re-interpret the quoted span AS CODE. This is the distinction
+# guard-git-mutations.sh's step-6 red-team pass established (its MINOR-7): treat
+# a quote as a boundary unconditionally and a quoted MENTION of a verb starts
+# tripping the guard, which is the false-positive class that makes a guard
+# something people route around.
+case "$RAW_REASON" in
+  shellword) ANCHOR_CLASS='[;&|[:space:]'\''"`({]' ;;
+  carrier)   ANCHOR_CLASS='[;&|[:space:]`({]' ;;
+  *)         ANCHOR_CLASS='[;&|[:space:]({]' ;;
+esac
+A="(^|${ANCHOR_CLASS})"
+
 deny() { echo "BLOCKED: $1 Command: $CMD" >&2; exit 2; }
 
 # --- git working-tree mutations / history rewrites / publishing -------------
-if grep -Eq '(^|[;&|[:space:]])git[[:space:]]+(-[^[:space:]]+[[:space:]]+)*(checkout|switch|restore|reset|clean|rebase|merge|commit|push)\b' <<<"$MATCH_TEXT"; then
+if grep -Eq "${A}git[[:space:]]+(-[^[:space:]]+[[:space:]]+)*(checkout|switch|restore|reset|clean|rebase|merge|commit|push)\b" <<<"$MATCH_TEXT"; then
   deny "git working-tree/history mutations are reserved for the orchestrator. Coordinators and workers change files only via Edit/Write; commits happen after harvest."
 fi
-if grep -Eq '(^|[;&|[:space:]])git[[:space:]]+stash\b' <<<"$MATCH_TEXT" && \
+if grep -Eq "${A}git[[:space:]]+stash\b" <<<"$MATCH_TEXT" && \
    ! grep -Eq 'git[[:space:]]+stash[[:space:]]+(list|show)\b' <<<"$MATCH_TEXT"; then
   deny "git stash mutations are forbidden in coordinator sessions (list/show are fine)."
 fi
 
 # --- rm -rf outside scratch areas -------------------------------------------
-if grep -Eq '(^|[;&|[:space:]])rm[[:space:]]+-[a-zA-Z]*r[a-zA-Z]*f|(^|[;&|[:space:]])rm[[:space:]]+-[a-zA-Z]*f[a-zA-Z]*r' <<<"$MATCH_TEXT"; then
+if grep -Eq "${A}rm[[:space:]]+-[a-zA-Z]*r[a-zA-Z]*f|${A}rm[[:space:]]+-[a-zA-Z]*f[a-zA-Z]*r" <<<"$MATCH_TEXT"; then
   if ! grep -Eq "(/tmp/|${BP_DIR}|integration_test/screenshots)" <<<"$MATCH_TEXT"; then
     deny "rm -rf is only allowed under /tmp, the blueprint dir, or the test screenshot dir. If you found unexpected state, STOP and record it in the ledger rather than cleaning up."
   fi
 fi
 
 # --- deploys / publishing ----------------------------------------------------
-if grep -Eq '(^|[;&|[:space:]])firebase[[:space:]]+deploy\b|(^|[;&|[:space:]])gcloud[[:space:]][^;|&]*deploy\b|(^|[;&|[:space:]])npm[[:space:]]+publish\b' <<<"$MATCH_TEXT"; then
+if grep -Eq "${A}firebase[[:space:]]+deploy\b|${A}gcloud[[:space:]][^;|&]*deploy\b|${A}npm[[:space:]]+publish\b" <<<"$MATCH_TEXT"; then
   deny "deploys and publishing never happen from coordinator sessions (CI-only by project policy)."
 fi
 

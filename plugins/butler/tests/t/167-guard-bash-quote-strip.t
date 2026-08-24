@@ -40,7 +40,50 @@ my $GUARD  = "$HOOKS/guard-bash.sh";
 ok(-f $GUARD, 'guard-bash.sh exists at plugins/butler/hooks/guard-bash.sh')
     or BAIL_OUT('subject hook missing');
 
-my $HAVE_JQ = `command -v jq 2>/dev/null` ne '';
+# Kept distinct from $HAVE_JQ below: one case (AC17) removes perl from PATH, and
+# the shim is written in perl, so that case is only meaningful with a real jq.
+my $HAVE_REAL_JQ = `command -v jq 2>/dev/null` ne '';
+my $HAVE_JQ = $HAVE_REAL_JQ;
+
+# A jq SHIM, so this host stops skipping the only assertions that exercise the
+# hook rather than reading it.
+#
+# guard-bash.sh hard-requires jq (bp_hook_require_jq, fail-closed), and jq does
+# not exist on the Git-for-Windows host. The behavioural half of this file was
+# therefore skipped here -- twelve assertions that never ran anywhere a developer
+# could see them, on a BLOCKING guard. That is the worst place to have coverage
+# that only exists in principle: a false negative here is a prohibited command
+# executing, and 20260819-164901-52d3 is exactly such a gap living undetected
+# behind this skip.
+#
+# The shim implements ONE filter -- `.tool_input.command // empty` -- because
+# that is the only jq invocation in the hook. It is deliberately not a general
+# jq: if the hook ever grows a second filter, the shim prints nothing, the hook
+# sees an empty command and exits 0, and the DENY cases below fail loudly rather
+# than passing on a stub that quietly agrees with everything.
+my $SHIM_DIR;
+unless ($HAVE_JQ) {
+    $SHIM_DIR = tempdir(CLEANUP => 1);
+    open my $s, '>', "$SHIM_DIR/jq" or die "cannot write jq shim: $!";
+    print {$s} <<'SHIM';
+#!/usr/bin/env perl
+use strict; use warnings; use JSON::PP;
+my @a = grep { $_ ne '-r' } @ARGV;
+my $filter = shift(@a) // '';
+die "jq shim: unsupported filter '$filter'\n"
+    unless $filter eq '.tool_input.command // empty';
+my $in = do { local $/; <STDIN> };
+my $j = eval { JSON::PP->new->decode($in) } or exit 0;
+my $v = eval { $j->{tool_input}{command} };
+print $v if defined $v && !ref $v && length $v;
+exit 0;
+SHIM
+    close $s;
+    chmod 0755, "$SHIM_DIR/jq";
+    $ENV{PATH} = "$SHIM_DIR" . ($^O eq 'MSWin32' ? ';' : ':') . $ENV{PATH};
+    $HAVE_JQ = `command -v jq 2>/dev/null` ne '';
+}
+ok($HAVE_JQ, 'jq (real or shimmed) is available, so the behavioural cases below actually run');
 
 my $J    = JSON::PP->new->canonical;
 my $ROOT = tempdir(CLEANUP => 1);
@@ -111,8 +154,38 @@ sub path_without {
     my $src = do { local (@ARGV, $/) = ($GUARD); <> };
     ok(index($src, 'git[[:space:]]+(-[^[:space:]]+[[:space:]]+)*(checkout|switch|restore|reset|clean|rebase|merge|commit|push)\b') >= 0,
        'AC3: the git working-tree/history mutation regex is byte-identical to today');
-    ok(index($src, '(^|[;&|[:space:]])git[[:space:]]+stash\b') >= 0,
-       'AC3: the git stash regex is byte-identical to today');
+    # The VERB half stays byte-identical -- that is what AC3 is for: proving the
+    # set of covered commands has not silently changed.
+    #
+    # The ANCHOR half is deliberately no longer pinned here. It used to be, as
+    # part of this same string, which meant AC3 pinned `(^|[;&|[:space:]])` --
+    # precisely the boundary class almanac 20260819-164901-52d3 identifies as
+    # WRONG (an invocation immediately after a quote or paren was not matched, so
+    # `zsh -c 'git reset --hard'` was allowed while `sh -c ' git reset --hard'`
+    # was denied, differing by one space). An oracle that pins a defect makes
+    # fixing it look like a regression.
+    ok(index($src, 'git[[:space:]]+stash\b') >= 0,
+       'AC3: the git stash VERB regex is byte-identical to today');
+
+    # The anchor is asserted as a PROPERTY instead: command-position openers must
+    # be boundaries. `(` and `{` open a subshell or brace group, so a verb
+    # immediately after one runs exactly as it would after a `;`.
+    my ($base_anchor) = $src =~ /^\s*\*\)\s*ANCHOR_CLASS='([^']*)'/m;
+    ok(defined $base_anchor, 'AC3b: the base anchor class is parseable from the source')
+        or diag('no ANCHOR_CLASS default branch found');
+    for my $ch ('(', '{', ';', '&', '|') {
+        ok(index($base_anchor // '', $ch) >= 0,
+           "AC3b: '$ch' is a command-position boundary in the base anchor class");
+    }
+    # ...and quotes are NOT, on the default path. A quote is never itself the
+    # reason a shell executes what it encloses, so treating it as a boundary
+    # unconditionally turns a quoted MENTION into a match -- the false-positive
+    # class that makes a guard something people route around.
+    for my $ch ("'", '"') {
+        ok(index($base_anchor // '', $ch) < 0,
+           "AC3b: [$ch] is NOT a boundary on the default path -- only when a shell "
+         . "interpreter is present and the quoted span really is code");
+    }
     ok(index($src, 'rm[[:space:]]+-[a-zA-Z]*r[a-zA-Z]*f') >= 0,
        'AC3: the rm -rf regex is byte-identical to today');
     ok(index($src, 'firebase[[:space:]]+deploy\b') >= 0,
@@ -170,12 +243,71 @@ SKIP: {
     # must DEGRADE TO DENY, exactly as today's guard-bash.sh (unmodified) already
     # behaves for this exact input. NEVER allow unconditionally.
     # =================================================================================
-    {
+  SKIP: {
+        # UNREPRODUCIBLE UNDER THE SHIM, and saying so beats a red line that
+        # means nothing. This case removes perl from PATH to prove the hook
+        # degrades to raw matching when bp_strip_shell_noise cannot run. The jq
+        # shim IS perl, so removing perl also removes the hook's JSON parser: it
+        # then reads an empty command and exits 0 at the `[ -n "$CMD" ]` guard,
+        # never reaching a matcher. The 0 that results is not the hook silently
+        # allowing a mutation -- it is the hook never seeing one.
+        #
+        # On a host with real jq this runs exactly as before. Skipping is
+        # honest; asserting 2 here would be asserting something the harness,
+        # not the hook, determines.
+        skip 'jq is shimmed with perl, so removing perl from PATH also removes the '
+           . 'JSON parser; this case needs a real jq', 1
+            unless $HAVE_REAL_JQ;
         my $noperl = path_without('perl');
         my ($rc, $out) = run_guard(q{perl x.pl --text "don't run git checkout"}, PATH => $noperl);
         is($rc, 2, 'AC17: with perl unavailable, the quoted-mention case DEGRADES to raw-match DENY '
                  . '(today\'s pre-fix behavior) -- never silently allows')
             or diag("hook output: $out");
+    }
+
+    # =================================================================================
+    # almanac 20260819-164901-52d3 -- the command-position boundary.
+    #
+    # Every matcher required the verb to follow start-of-string or [;&|<space>].
+    # A quote or an opening paren is in neither class, so an invocation sitting
+    # immediately after one was NOT matched. The report's own table, reproduced
+    # here as executable cases:
+    #
+    #     sh -c ' git reset --hard'    DENY   (leading space)
+    #     zsh -c 'git reset --hard'    ALLOW  <-- gap
+    #     sh -e -c 'git reset --hard'  ALLOW  <-- gap
+    #     echo $(git reset --hard)     ALLOW  <-- gap
+    #
+    # The first two differ by ONE SPACE. Whether a blocking guard fired depended
+    # on incidental whitespace inside a quoted argument, which is not a property
+    # anyone would predict or rely on.
+    # =================================================================================
+    for my $row (
+        [ q{sh -c ' git reset --hard'},   'a shellword invocation with a leading space (already worked)' ],
+        [ q{zsh -c 'git reset --hard'},   'a shellword invocation flush against the quote' ],
+        [ q{sh -e -c 'git reset --hard'}, 'a shellword invocation with an intervening flag' ],
+        [ q{echo $(git reset --hard)},    'a command substitution, verb flush against the paren' ],
+        [ q{(git reset --hard)},          'a subshell -- `(` opens a command position' ],
+        [ q{x=1; {git reset --hard; }},   'a brace group -- `{` opens a command position' ],
+        [ q{(rm -rf /etc)},               'rm -rf inside a subshell' ],
+    ) {
+        my ($cmd, $why) = @$row;
+        my ($rc, $out) = run_guard($cmd);
+        is($rc, 2, "52d3: DENY -- $why") or diag("hook output: $out");
+    }
+
+    # The false-positive controls. Widening the boundary must not start matching
+    # MENTIONS, which is the failure mode that makes a guard something people
+    # route around rather than obey.
+    for my $row (
+        [ q{perl -e 'print "never git reset --hard"'}, 'a verb quoted inside prose, no shell carrier' ],
+        [ q{git diff --stat},                          'read-only git' ],
+        [ q{git stash list},                           'the explicitly allowed stash read' ],
+        [ q{rm -rf /tmp/scratch},                      'rm -rf under /tmp' ],
+    ) {
+        my ($cmd, $why) = @$row;
+        my ($rc, $out) = run_guard($cmd);
+        is($rc, 0, "52d3 control: ALLOW -- $why") or diag("hook output: $out");
     }
 }
 
