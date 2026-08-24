@@ -2181,10 +2181,30 @@ FAKE_MODULE
         # this pins that shape rather than merely tolerating it.
         like($body, qr/return\s*\(\s*undef\s*,/,
             'AC-7: the !defined $pid branch returns no pid, and carries the reason out with it');
-        for my $fh (qw(STDIN STDOUT STDERR)) {
+        # STDIN/STDOUT still go to /dev/null. STDERR does NOT, and that is the
+        # fix rather than a regression.
+        #
+        # The property AC-7 is protecting is that the child never inherits the
+        # CONSOLE handles -- a sampler that writes to the terminal scribbles
+        # across the very TUI it feeds. /dev/null satisfied that for STDERR and
+        # also destroyed the child's only explanation of itself: its argument
+        # validation exits 2 after printing exactly one line naming what was
+        # wrong, and that line went nowhere. The operator saw "FAILED - sampler
+        # exited before writing a reading" and the trail ended there.
+        #
+        # So the assertion now pins the PROPERTY (redirected away from the
+        # console) rather than one particular destination, and separately pins
+        # that STDERR goes somewhere READABLE.
+        for my $fh (qw(STDIN STDOUT)) {
             like($body, qr/open\s*\(\s*\Q$fh\E\s*,\s*['"][<>]['"]\s*,\s*['"]\/dev\/null['"]/,
                 "AC-7: _resources_sampler_start reopens $fh on /dev/null");
         }
+        like($body, qr/_sampler_stderr_to\s*\(/,
+            'AC-7: _resources_sampler_start redirects the child STDERR through _sampler_stderr_to '
+          . '-- away from the console (the property AC-7 protects) and into a file a human can read');
+        unlike($body, qr/open\s*\(\s*STDERR\s*,\s*['"]>['"]\s*,\s*['"]\/dev\/null['"]/,
+            'AC-7: ...and NOT straight to /dev/null, which threw away the one line the child '
+          . 'prints to say why it refused to start');
         like($body, qr/local\s+\$ENV\{MSYS2_ARG_CONV_EXCL\}\s*=\s*'\*'/,
             q{AC-7: _resources_sampler_start sets local $ENV{MSYS2_ARG_CONV_EXCL} = '*'});
         like($body, qr/\bexec\s*\(/, 'AC-7: _resources_sampler_start calls exec(');

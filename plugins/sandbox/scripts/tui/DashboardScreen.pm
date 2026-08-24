@@ -327,7 +327,14 @@ sub sampler_wait_spans {
             $text = 'FAILED - sampler failed to start; no reading possible';
             $role = 'state.crit';
         } elsif (defined $alive && !ref($alive) && !$alive) {
-            $text = 'FAILED - sampler exited before writing a reading';
+            # SAY WHY WHEN WE KNOW WHY. The child's own STDERR is captured now,
+            # so a validation failure names itself here instead of leaving the
+            # operator with a dead end. Absent/unreadable -> the bare sentence,
+            # exactly as before; this never invents a cause.
+            my $why = $fact->{why};
+            $text = (defined $why && !ref($why) && length $why)
+                  ? "FAILED - sampler exited before writing a reading - $why"
+                  : 'FAILED - sampler exited before writing a reading';
             $role = 'state.crit';
         } elsif ($numeric->($elapsed) && $numeric->($grace) && $elapsed >= $grace) {
             $text = 'STALLED - sampler still running, no reading after ' . fmt_duration($elapsed);
@@ -376,7 +383,12 @@ sub spend_wait_spans {
             # undef means NOT CHECKED and must never read as dead -- the check
             # has not run on the first render, and reading undef as false would
             # make every healthy launch flash a failure.
-            $text = 'FAILED - spend sampler exited before writing figures';
+            # Same as the resources sampler above: name the cause when the
+            # child's captured STDERR gave us one, never invent it.
+            my $why = $fact->{why};
+            $text = (defined $why && !ref($why) && length $why)
+                  ? "FAILED - spend sampler exited before writing figures - $why"
+                  : 'FAILED - spend sampler exited before writing figures';
             $role = 'state.crit';
         } elsif ($numeric->($elapsed) && $numeric->($grace) && $elapsed >= $grace) {
             $text = 'STALLED - spend sampler still running, no figures after ' . fmt_duration($elapsed);

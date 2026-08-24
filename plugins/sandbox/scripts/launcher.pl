@@ -814,6 +814,11 @@ my $LOG_RETENTION_LAUNCHES   = ($ENV{CCPRAXIS_LOG_RETENTION} && $ENV{CCPRAXIS_LO
                                 && $ENV{CCPRAXIS_LOG_RETENTION} >= 1)
                              ? $ENV{CCPRAXIS_LOG_RETENTION} + 0 : 10;
 my $LAUNCHER_DIR              = "$CLAUDE_DATA/.launcher";
+# Where a forked sampler's STDERR lands. Its validation exits 2 after printing
+# exactly one line saying what was wrong; that line used to go to /dev/null, so
+# "FAILED - sampler exited before writing a reading" was the end of the trail.
+my $SAMPLER_ERR_RESOURCES     = "$LAUNCHER_DIR/resources-sampler.err";
+my $SAMPLER_ERR_SPEND         = "$LAUNCHER_DIR/spend-sampler.err";
 my $SELECTION_FILE            = "$LAUNCHER_DIR/selected-skills.json";
 my $MANIFEST_FILE             = "$LAUNCHER_DIR/container-manifest.json";
 my $SNAPSHOT_FILE             = "$LAUNCHER_DIR/.discovery-snapshot.json";
@@ -5338,6 +5343,12 @@ sub enter_dashboard {
                     $resources_sampler_fact->{grace}   = Resources::max_age();
                     $resources_sampler_fact->{child_alive}
                         = _sampler_child_alive($RESOURCES_SAMPLER_CHILD);
+                    # Only when it is already known dead: the reason costs a
+                    # file read, and there is nothing to explain on a healthy tick.
+                    $resources_sampler_fact->{why}
+                        = _sampler_err_reason($SAMPLER_ERR_RESOURCES)
+                        if defined $resources_sampler_fact->{child_alive}
+                        && !$resources_sampler_fact->{child_alive};
                 }
             }
             # t02: the same bookkeeping for the spend sampler, on the same
@@ -5351,6 +5362,9 @@ sub enter_dashboard {
                     ? $now - $spend_sampler_fact->{started_at} : undef;
                 $spend_sampler_fact->{grace}       = _spend_sampler_interval() + 60;
                 $spend_sampler_fact->{child_alive} = _sampler_child_alive($SPEND_SAMPLER_CHILD);
+                $spend_sampler_fact->{why} = _sampler_err_reason($SAMPLER_ERR_SPEND)
+                    if defined $spend_sampler_fact->{child_alive}
+                    && !$spend_sampler_fact->{child_alive};
             }
             # Advance the skew-free baseline by host-measured elapsed since the
             # last measurement (elapsed rate matches on both clocks; only the
@@ -6332,7 +6346,19 @@ sub _resources_sampler_start {
     if ($pid == 0) {
         open(STDIN,  '<', '/dev/null');
         open(STDOUT, '>', '/dev/null');
-        open(STDERR, '>', '/dev/null');
+        # STDERR TO A FILE, NOT /dev/null. The sampler's argument validation
+        # exits 2 after printing ONE line naming exactly what was wrong -- and
+        # that line was being thrown away, so the panel could report THAT the
+        # child died (t01) but never WHY. The operator sees "FAILED - sampler
+        # exited before writing a reading" and neither they nor anyone reading
+        # the code afterwards can get further, which is the same
+        # detected-but-undelivered shape this whole area keeps producing.
+        #
+        # A FILE, never an in-memory scalar: Git-for-Windows perl fails
+        # "Bad file descriptor" on that and surfaces it as a bare `Died at ...`
+        # (project CLAUDE.md). Failure to open degrades to /dev/null rather than
+        # letting the child inherit a console STDERR and scribble over the TUI.
+        _sampler_stderr_to($SAMPLER_ERR_RESOURCES);
         local $ENV{MSYS2_ARG_CONV_EXCL} = '*';
         exec($^X, $SELF_PL, '--resources-sampler',
              '--sampler-container', $container,
@@ -6374,6 +6400,49 @@ sub _resources_sampler_start {
 # This is what distinguishes "started and still working" from "started and
 # already dead" -- the case the old optimistic log line actively concealed.
 # undef means NOT CHECKED, and the renderer must never read that as dead.
+# _sampler_stderr_to($path) -- IN THE CHILD, after fork, before exec.
+#
+# Truncates so each launch's reason stands alone; a reader must never be left
+# guessing whether a line is from this run or the last one. Degrades to
+# /dev/null if the file cannot be opened, because the one thing a sampler child
+# must NOT do is inherit a console STDERR and scribble across the TUI it feeds.
+sub _sampler_stderr_to {
+    my ($path) = @_;
+    if (defined $path && length $path) {
+        my $dir = $path;
+        $dir =~ s{[\\/][^\\/]+$}{};
+        eval { File::Path::make_path($dir) unless -d $dir; 1 };
+        return if open(STDERR, '>', $path);
+    }
+    open(STDERR, '>', '/dev/null');
+    return;
+}
+
+# _sampler_err_reason($path) -> first non-empty line, trimmed and capped | undef
+#
+# Read by the render tick ONLY when a sampler is already known to have died, so
+# it costs nothing on the healthy path. Capped and sanitised for the same reason
+# every other operator-facing diagnostic in this file is: a panel row is not a
+# log, and an unbounded string from a subprocess must never be able to reflow it.
+sub _sampler_err_reason {
+    my ($path) = @_;
+    return undef unless defined $path && -f $path;
+    open my $fh, '<', $path or return undef;
+    my $line;
+    while (defined(my $l = <$fh>)) {
+        $l =~ s/\s+$//;
+        next unless length $l;
+        $line = $l;
+        last;
+    }
+    close $fh;
+    return undef unless defined $line && length $line;
+    $line =~ s/^ERROR:\s*//;              # the prefix is implied by the row's role
+    $line =~ s/[^\x20-\x7e]/ /g;          # one line, printable only
+    $line = substr($line, 0, 120) if length($line) > 120;
+    return $line;
+}
+
 sub _sampler_child_alive {
     my ($pid) = @_;
     return undef unless defined $pid && $pid =~ /^\d+$/ && $pid > 0;
@@ -6627,7 +6696,7 @@ sub _spend_sampler_start {
     if ($pid == 0) {
         open(STDIN,  '<', '/dev/null');
         open(STDOUT, '>', '/dev/null');
-        open(STDERR, '>', '/dev/null');
+        _sampler_stderr_to($SAMPLER_ERR_SPEND);   # see _resources_sampler_start
         local $ENV{MSYS2_ARG_CONV_EXCL} = '*';
         exec($^X, $SELF_PL, '--spend-sampler',
              '--sampler-owner-pid', $owner,
