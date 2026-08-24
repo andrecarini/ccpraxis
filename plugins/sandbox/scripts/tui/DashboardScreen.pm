@@ -745,10 +745,26 @@ sub _run_body {
     my $keep_row = row({ label => 'keep-awake', value => [ { text => $keep_text, role => $keep_role } ], force => 1 });
     push @lines, $keep_row if @$keep_row;
 
+    # `needs you` now counts ONLY escalations a human must clear. It used to
+    # count every queued record, most of which the escalation resolver handles
+    # without waking anyone -- so the row asserted ownership over a queue it had
+    # never looked inside, and said "1 decision waiting" when nothing wanted the
+    # operator at all.
     my $ny = (defined($state->{needs_you}) && !ref($state->{needs_you}) && $state->{needs_you} =~ /^\d+$/) ? $state->{needs_you} : 0;
     if ($ny > 0) {
         my $ny_row = row({ label => 'needs you', value => count_of($ny, "decision") . " waiting", role => 'state.warn' });
         push @lines, $ny_row if @$ny_row;
+    }
+
+    # The rest stay VISIBLE, just not as the operator's problem. The resolver can
+    # be capped or unwired -- it was entirely unwired until 2026-08-24 -- and
+    # then these sit still. Muted, and only when there are any: a queue being
+    # worked is not news.
+    my $tq = (defined($state->{triage_queued}) && !ref($state->{triage_queued}) && $state->{triage_queued} =~ /^\d+$/) ? $state->{triage_queued} : 0;
+    if ($tq > 0) {
+        my $tq_row = row({ label => 'in triage', value => count_of($tq, "escalation") . " with the resolver",
+                           role => 'text.muted' });
+        push @lines, $tq_row if @$tq_row;
     }
 
     my $bp_val = backpack_summary_spans($state->{backpack});

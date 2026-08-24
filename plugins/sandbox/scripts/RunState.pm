@@ -365,22 +365,81 @@ sub decision_live {
 # which is what a caller with no blueprint context can honestly report.
 sub _count_decisions {
     my ($dir, $blueprint_dir, $run_over) = @_;
-    return 0 if -l $dir;
-    return 0 unless -d $dir;
-    opendir(my $dh, $dir) or return 0;
-    my $n = 0;
+    my $split = _count_decisions_split($dir, $blueprint_dir, $run_over);
+    return $split->{operator} + $split->{triage};
+}
+
+# ===========================================================================
+# WHOSE QUEUE IS THIS? A live record is not the same as a record that needs the
+# operator, and the panel spent its whole life conflating them.
+#
+# Operator, on the run that forced this: "we use way too many instances of ..."
+# -- no, the one that matters here: "It stopped an overnight run blocking on me
+# to answer some random bullshit question that is an implementation detail."
+#
+# Every queued escalation carries a `category`. Two of them (product,
+# operator-action) are the ones bp-resolve.pl may never decide: they leave the
+# queue only when a human reads them. The rest are handed to the escalation
+# resolver, which either acts or re-tags -- nobody needs to be woken for those.
+#
+# THE DEFAULT IS STILL THE OPERATOR, and deliberately so. A record whose
+# category is missing, unreadable or unrecognised counts as operator-owned,
+# because nothing will ever triage it: bp-orchestrator.pl's resolver dispatch
+# filters on exactly the triageable set, so an unrecognised category is a record
+# no agent will ever look at again. Counting it as "someone else's problem"
+# would be the one failure this module's own header forbids -- "a decision
+# wrongly dropped is a human who is never asked".
+#
+# The list is duplicated from BpOrch::@RESOLVER_TRIAGEABLE rather than imported:
+# RunState is a sandbox-plugin module and BpOrch is a butler-plugin script, and
+# a cross-plugin require would make the TUI's render path depend on butler being
+# installed. t/97 pins the two lists equal, so the duplication cannot drift
+# silently.
+our @TRIAGEABLE_CATEGORIES = qw(unclassified conformance oracle scoping implementation);
+my %TRIAGEABLE = map { $_ => 1 } @TRIAGEABLE_CATEGORIES;
+
+# The legacy spelling, mirroring BpOrch::%CATEGORY_ALIAS. Neither name is
+# triageable, so this only matters for keeping the two tables honestly parallel.
+my %CATEGORY_ALIAS = ('operational' => 'operator-action');
+
+# decision_operator_owned($rec) -> 1|0
+# 1 = only a human can clear this. 0 = an agent is expected to triage it.
+sub decision_operator_owned {
+    my ($rec) = @_;
+    return 1 unless ref($rec) eq 'HASH';
+    my $cat = $rec->{category};
+    return 1 unless defined $cat && !ref($cat) && length $cat;
+    $cat = $CATEGORY_ALIAS{$cat} // $cat;
+    return $TRIAGEABLE{$cat} ? 0 : 1;
+}
+
+# _count_decisions_split($dir, $blueprint_dir, $run_over)
+#   -> { operator => N, triage => M }   (private)
+#
+# Same walk as before, same settled-record skipping, but the survivors are split
+# by ownership instead of summed. Nothing is hidden: a record awaiting triage is
+# still counted, just not under a heading that claims it needs the operator.
+sub _count_decisions_split {
+    my ($dir, $blueprint_dir, $run_over) = @_;
+    my %n = (operator => 0, triage => 0);
+    return \%n if -l $dir;
+    return \%n unless -d $dir;
+    opendir(my $dh, $dir) or return \%n;
     for my $f (readdir $dh) {
         next if $f =~ /^\./;
         next if $f =~ /\.tmp$/;
         next unless -f "$dir/$f";
+        my $rec;
         if (defined $blueprint_dir) {
-            my $rec = _read_json_capped("$dir/$f");
+            $rec = _read_json_capped("$dir/$f");
             next unless decision_live($rec, $blueprint_dir, $dir, $run_over);
+        } else {
+            $rec = _read_json_capped("$dir/$f");
         }
-        $n++;
+        $n{ decision_operator_owned($rec) ? 'operator' : 'triage' }++;
     }
     closedir $dh;
-    return $n;
+    return \%n;
 }
 
 # _read_json_capped($path) -> decoded value | undef (private). Size-capped and
@@ -623,7 +682,12 @@ sub summarize_dir {
     # a .paused still on disk is an abandoned run, and abandoning a run is not
     # the same as answering the question it was blocked on.
     my $run_over = ($state eq 'idle' || $state eq 'solo' || $state eq 'parked') ? 1 : 0;
-    my $decisions_waiting = _count_decisions("$runs_dir/needs-you", $blueprint_dir, $run_over);
+    my $split = _count_decisions_split("$runs_dir/needs-you", $blueprint_dir, $run_over);
+    # decisions_waiting stays the TOTAL, so every existing consumer keeps the
+    # number it has always had. The split is additive.
+    my $decisions_waiting  = $split->{operator} + $split->{triage};
+    my $decisions_operator = $split->{operator};
+    my $decisions_triage   = $split->{triage};
 
     my $bp_name = $blueprint_dir;
     $bp_name =~ s{/+$}{};
@@ -641,6 +705,8 @@ sub summarize_dir {
         current_package      => $current_package,
         running_coordinators => $running_coordinators,
         decisions_waiting    => $decisions_waiting,
+        decisions_operator   => $decisions_operator,
+        decisions_triage     => $decisions_triage,
     };
 }
 

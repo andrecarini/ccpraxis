@@ -5066,7 +5066,8 @@ sub enter_dashboard {
     my $cached_busy_age         = undef;   # B5: age (s) of /tmp/.butler-busy in CONTAINER time, or undef
     my $cached_busy_stamp       = 0;       # host time() when $cached_busy_age was measured
     my $cached_probe_result     = { state => 'lease-absent' };   # s21: KeepAwake's pinned probe struct
-    my $cached_needs_you        = 0;       # B3: queued "needs you" decisions
+    my $cached_needs_you        = 0;       # B3: escalations only the OPERATOR can clear
+    my $cached_triage_queued    = 0;       # ...and those queued for the escalation resolver
     my $cached_backpack         = undef;   # B4: backpack items + per-item approval
     my $cached_oauth_expires_at = undef;   # 01-oauth: epoch-s when the OAuth token expires
     my $cached_tokens           = undef;   # s08: TokenInfo struct
@@ -5298,7 +5299,8 @@ sub enter_dashboard {
                                            detail => $cached_probe_result->{detail},
                                            busy_age => $cached_busy_age });
                 }
-                $cached_needs_you  = _count_needs_you($PROJECT_PATH);          # B3
+                ($cached_needs_you, $cached_triage_queued)
+                                   = _count_needs_you($PROJECT_PATH);          # B3
                 $cached_backpack   = _gather_backpack($bp_host_file, $bp_appr_file);  # B4
                 $cached_oauth_expires_at = _gather_oauth_expiry();
                 $cached_tokens = _gather_tokens();
@@ -5401,6 +5403,7 @@ sub enter_dashboard {
                 busy_age        => $busy_age,
                 stay_awake      => $stay,
                 needs_you        => $cached_needs_you,
+                triage_queued    => $cached_triage_queued,
                 backpack         => $cached_backpack,
                 oauth_expires_at => $cached_oauth_expires_at,
                 tokens           => $cached_tokens,
@@ -5985,18 +5988,40 @@ sub _keepawake_reap_orphan {
 # indicator and the per-run rows now cannot disagree -- and a second walk is
 # exactly how the old inner loop drifted from being a lifecycle in the first
 # place.
+# Returns ($operator, $triage): decisions only a human can clear, and decisions
+# queued for the escalation resolver.
+#
+# The banner used to sum decisions_waiting, the TOTAL, and label it "needs you".
+# Most of that total is work nobody needs to be woken for -- the resolver reads
+# it and either acts or re-tags. Summing it made the panel assert operator
+# ownership over a queue it had not looked inside.
+#
+# Both numbers are returned rather than the first one alone: a record awaiting
+# triage must stay visible, because the resolver can be capped or unavailable
+# and then nothing moves. It just stops being announced as the operator's
+# problem.
 sub _count_needs_you {
     my ($project) = @_;
     my $runs = RunState::summarize("$project/.ccpraxis-local-data/blueprints");
-    return 0 unless ref($runs) eq 'ARRAY';
-    my $n = 0;
+    return (0, 0) unless ref($runs) eq 'ARRAY';
+    my ($op, $tri) = (0, 0);
     for my $r (@$runs) {
         next unless ref($r) eq 'HASH';
+        # Fall back to the total when the split is absent, so a summary produced
+        # by an older RunState still reports SOMETHING rather than silently zero.
+        # Erring toward "the operator owns it" is the safe direction here.
+        my $o = $r->{decisions_operator};
+        my $t = $r->{decisions_triage};
+        if (defined $o && !ref($o) && $o =~ /^\d+$/) {
+            $op += $o;
+            $tri += $t if defined $t && !ref($t) && $t =~ /^\d+$/;
+            next;
+        }
         my $d = $r->{decisions_waiting};
         next unless defined $d && !ref($d) && $d =~ /^\d+$/;
-        $n += $d;
+        $op += $d;
     }
-    return $n;
+    return ($op, $tri);
 }
 
 # _gather_runs($project) -> ARRAYREF of RunState summaries (never undef).

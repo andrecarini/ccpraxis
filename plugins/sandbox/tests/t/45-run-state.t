@@ -279,10 +279,21 @@ sub is_hashref  { my ($h) = @_; return ref($h) eq 'HASH'; }
 sub is_arrayref { my ($h) = @_; return ref($h) eq 'ARRAY'; }
 sub field       { my ($h, $k) = @_; return is_hashref($h) ? $h->{$k} : $FAILED; }
 
+# The closed key set. Deliberately an EQUALITY, not a floor: this is a declared
+# struct with a spec, and a key appearing by accident is exactly the drift the
+# assertion exists to catch. Extending it is therefore a deliberate act, made
+# here, not something a producer gets to do silently.
+#
+# Widened to 13 on 2026-08-24. `decisions_waiting` was the total number of queued
+# escalations and the panel rendered it as "needs you", which asserted operator
+# ownership over a queue nothing had looked inside -- most of those records are
+# handled by the escalation resolver without waking anyone. The split is
+# additive: decisions_waiting keeps its old meaning and its old value, and the
+# two new keys say who each half belongs to.
 my @KEYS_11 = qw(
     blueprint runs_dir state orchestrator_pid paused_manual paused_reason
     packages_total packages_done current_package running_coordinators
-    decisions_waiting
+    decisions_waiting decisions_operator decisions_triage
 );
 
 # assert_summary_shape($summary, $label): the closed 11-key set (S2.2) plus
@@ -290,7 +301,7 @@ my @KEYS_11 = qw(
 sub assert_summary_shape {
     my ($s, $label) = @_;
     ok(is_hashref($s), "$label: summary is a hashref") or return;
-    is_deeply([ sort keys %$s ], [ sort @KEYS_11 ], "$label: exactly the 11 S2.2 keys, no more, no fewer");
+    is_deeply([ sort keys %$s ], [ sort @KEYS_11 ], "$label: exactly the 13 S2.2 keys, no more, no fewer");
     ok(defined($s->{blueprint}) && !ref($s->{blueprint}) && length($s->{blueprint}), "$label: blueprint is a non-empty Str");
     ok(defined($s->{runs_dir})  && !ref($s->{runs_dir})  && length($s->{runs_dir}),  "$label: runs_dir is a non-empty Str");
     # Widened by blueprint unified-tui-design-system package
