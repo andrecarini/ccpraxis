@@ -1177,6 +1177,10 @@ sub _providers_body {
     push @lines, @{ _opencode_go_block($spend ? $spend->{go} : undef, $spend ? 1 : 0, $w) };
     push @lines, @{ _opencode_zen_block($spend ? $spend->{zen} : undef, $spend ? 1 : 0, $w) };
 
+    # (t11's hot-reload rows are a BANNER, not a panel row -- see
+    # hot_reload_banners below. They belong above the panels, with the other
+    # things that are true of this moment rather than of the sandbox.)
+
     # ONE SENTENCE AT THE END SAYING WHY THERE ARE NO FIGURES.
     #
     # This used to read "a run is active but has not written runs/spend.json
@@ -1303,9 +1307,9 @@ sub _footer_legend {
     my ($cols) = @_;
     $cols = 200 if !defined $cols;
     my @tiers = (
-        ' [c] launch Claude Code  [s] stop runs  [x] full shutdown  [up/down] scroll  [r] refresh  [q] quit',
-        ' [c] launch Claude Code  [s] stop runs  [x] shutdown  [r] refresh  [q] quit',
-        ' [c] launch  [s] stop  [x] shutdown  [r] refresh  [q] quit',
+        ' [c] launch Claude Code  [s] stop runs  [x] full shutdown  [up/down] scroll  [r] reload  [q] quit',
+        ' [c] launch Claude Code  [s] stop runs  [x] shutdown  [r] reload  [q] quit',
+        ' [c] launch  [s] stop  [x] shutdown  [r] reload  [q] quit',
     );
     for my $t (@tiers) {
         return $t if tui::Layout::display_width($t) <= $cols;
@@ -1435,7 +1439,50 @@ sub _banner_lines {
             && length($state->{install_warning})) {
         push @msgs, $state->{install_warning} . '  [d] dismiss';
     }
+    push @msgs, @{ hot_reload_msgs($state) };
     return [ map { '  !! ' . tui::Frame::safe($_) } @msgs ];
+}
+
+# hot_reload_msgs(\%state) -> \@messages. PURE, total (t11-tui-hot-reload).
+#
+# Two things reach the operator here, and they answer different questions:
+#
+#   THE NUDGE -- "N modules changed on disk, press [r]". This is what closes
+#   the half of the gap a keypress alone cannot: a promote you made and forgot
+#   to pick up. Without it the feature only helps when you already remember it
+#   exists.
+#
+#   THE REPORT -- what the last [r] actually did. Its most important line is
+#   the one that fires ON SUCCESS: launcher.pl is never reloaded, so a change
+#   that also touched it is only half-applied. Because every function on this
+#   render path is total -- it degrades on missing input rather than dying --
+#   a half-applied change renders the FALLBACK case cleanly and looks like a
+#   change that did not work. Saying so is the difference between a tool that
+#   speeds you up and one that costs you an afternoon.
+#
+# Banners are the right surface rather than a panel row: these are facts about
+# this MOMENT, not about the sandbox, and the banner region is already where
+# such things live and already wraps (package d02).
+sub hot_reload_msgs {
+    my ($state) = @_;
+    return [] unless ref($state) eq 'HASH';
+    my @out;
+
+    my $r = $state->{hot_reload};
+    if (ref($r) eq 'HASH') {
+        my $head = (defined $r->{headline} && !ref $r->{headline}) ? $r->{headline} : 'reload reported nothing';
+        push @out, "[r] $head";
+        if (ref($r->{notes}) eq 'ARRAY') {
+            push @out, $_ for grep { defined && !ref && length } @{ $r->{notes} };
+        }
+    }
+
+    my $n = $state->{hot_reload_pending};
+    if (defined $n && !ref $n && $n =~ /\A\d+\z/ && $n > 0) {
+        push @out, sprintf('%d render module%s changed on disk - press [r] to reload',
+                           $n, ($n == 1 ? '' : 's'));
+    }
+    return \@out;
 }
 
 # ===========================================================================

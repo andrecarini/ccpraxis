@@ -1158,6 +1158,11 @@ sub _backpack_lines {
 # elements) -> the empty list. At most the first $RUN_MAX_ROWS surviving
 # summaries get a line; when more survive, one extra overflow line is
 # appended.
+# t11-tui-hot-reload: how long a [r] reload report stays on screen. Long enough
+# to read after the forced repaint, short enough that a stale claim about a
+# moment that has passed does not linger.
+use constant HOT_RELOAD_REPORT_SECS => 20;
+
 our $RUN_MAX_ROWS = 3;
 
 # _run_int($v) -> a non-negative Int, or 0 for undef/ref/non-digit input
@@ -3619,6 +3624,22 @@ sub run {
     # invoked, so a caller that never presses [b] never loads it.
     my $backpack_screen = (ref($o{backpack_screen}) eq 'CODE') ? $o{backpack_screen}
         : sub { require tui::BackpackScreen; tui::BackpackScreen::run(%{$_[0]}) };
+    # t11-tui-hot-reload: two optional seams, defaulting to no-ops so every
+    # existing caller and test is unaffected byte-for-byte.
+    #
+    #   hot_reload         -> \%summary   (HotReload::summarise's shape)
+    #   hot_reload_pending -> count of modules changed on disk
+    #
+    # Injected rather than called directly for the reason every I/O boundary in
+    # this file is: hot_reload runs a subprocess, and this module contains no
+    # system/exec/fork anywhere. The arrow stays one-way.
+    #
+    # NOTE FOR ANYONE EDITING THE LOOP ITSELF: run() is on the call stack for
+    # the whole session, so THIS sub is the one thing hot-reload cannot update.
+    # These two call sites are frozen at launch; everything behind the seams is
+    # live. Keep the call sites trivial and the logic on the far side.
+    my $hot_reload         = (ref($o{hot_reload})         eq 'CODE') ? $o{hot_reload}         : undef;
+    my $hot_reload_pending = (ref($o{hot_reload_pending}) eq 'CODE') ? $o{hot_reload_pending} : undef;
     my $bp_load       = (ref($o{bp_load})   eq 'CODE') ? $o{bp_load}   : undef;
     my $bp_save       = (ref($o{bp_save})   eq 'CODE') ? $o{bp_save}   : undef;
     my $bp_remove     = (ref($o{bp_remove}) eq 'CODE') ? $o{bp_remove} : undef;
@@ -3674,6 +3695,10 @@ sub run {
     # begins, that test goes red -- read it before "fixing" this flag to be
     # content-aware or removing it.
     my $install_warning_dismissed = 0;
+    # t11: the last [r] reload report, and when it was produced. Loop-scoped
+    # rather than in %state because %state is wholesale-replaced on every
+    # gather; see the re-apply below.
+    my ($hot_reload_report, $hot_reload_report_at) = (undef, 0);
     my $activity_max    = 0;    # scroll ceiling (set each frame by activity_window)
     my $flash_until = 0;        # footer-flash expiry (set when [c] hit a dead container)
     my $last_recover_at;        # now() when the last [l] recovery FINISHED (undef: none yet)
@@ -3791,6 +3816,28 @@ sub run {
                     }
                     my $base = $gather->() || {};
                     %state = %$base;
+                    # t11-tui-hot-reload: the nudge. Thirteen stats, no fork --
+                    # deliberately cheap enough to ride the gather it is folded
+                    # into, because the gap it closes is a PROMOTE THE OPERATOR
+                    # FORGOT TO PICK UP, and a hint they have to ask for would
+                    # not close it. Kept out of the render tick proper (which
+                    # runs far more often) by living here, on the throttled
+                    # gather round.
+                    $state{hot_reload_pending} = $hot_reload_pending
+                        ? (eval { $hot_reload_pending->() } || 0) : 0;
+                    # ...and re-apply the last reload REPORT across the same
+                    # wholesale replace, exactly as the dismissed-banner line
+                    # below does. Without this the report would live for a
+                    # single tick: [r] sets $last_state = undef, which forces a
+                    # gather on the very next pass, which would blank the one
+                    # thing the operator pressed [r] to read. It expires on its
+                    # own rather than sticking, because a stale "reloaded 3
+                    # modules" is a claim about a moment that has passed.
+                    if ($hot_reload_report && $now->() - $hot_reload_report_at <= HOT_RELOAD_REPORT_SECS()) {
+                        $state{hot_reload} = $hot_reload_report;
+                    } else {
+                        $hot_reload_report = undef;
+                    }
                     # t03-banner-dismiss S2.4: %state was just wholesale-replaced
                     # from $base, which unconditionally re-supplies whatever
                     # install_warning the gather seam has -- re-apply the
@@ -3925,6 +3972,31 @@ sub run {
                         $last_beat = $now->() - $beat_int;
                     }
                     elsif ($action eq 'refresh') {
+                        # t11-tui-hot-reload: [r] now RELOADS THE RENDER MODULES
+                        # and then does everything refresh already did.
+                        #
+                        # Nothing is taken away. The operator's read was that
+                        # refresh "doesn't actually do anything meaningful",
+                        # which is nearly right -- the data it forces would have
+                        # arrived within a tick anyway and the repaint is
+                        # invisible when nothing changed. But its three side
+                        # effects turn out to be EXACTLY what a code swap needs:
+                        # a forced gather, a forced full repaint, and a cleared
+                        # banner. So reload is folded in ahead of them rather
+                        # than replacing them.
+                        #
+                        # The smoke closure is built here, in the frozen loop,
+                        # but calls compose_frame BY NAME -- so it renders with
+                        # whatever was just installed, which is the point.
+                        if ($hot_reload) {
+                            my ($w, $h) = $term_size->();
+                            my %snap = %state;
+                            $hot_reload_report = eval {
+                                $hot_reload->(sub { compose_frame(\%snap, $h, $w) });
+                            };
+                            $hot_reload_report_at = $now->();
+                            $state{hot_reload}    = $hot_reload_report;
+                        }
                         $last_state      = undef;   # force a gather next tick
                         $prev            = undef;   # (D) force a FULL repaint: blank
                                                     # (\e[2J) then redraw every row fresh

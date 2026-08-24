@@ -97,6 +97,7 @@ use BackpackReview ();    # #21: the I/O-seam-injected interactive approval walk
 use BackpackOps ();       # 07-backpack-screen E-A: the [b] screen's real bp_load/
                            # bp_save/bp_remove logic, extracted so it is unit-testable
                            # without spawning this file (review-driver-round M1)
+use HotReload ();         # t11: which modules may be hot-reloaded, and which changed
 use tui::LaunchScreens (); # 08-launcher-screens: the launch-phase TUI host,
                            # capture pipeline, progress screen and list screens.
                            # Pure and total; every I/O boundary below is a seam
@@ -837,6 +838,11 @@ my $RESOURCES_SAMPLER_PID     = "$LAUNCHER_DIR/resources-sampler.pid";
 # it unreadable in exactly the state the operator is normally in.
 my $SPEND_GLOBAL_DIR          = $LAUNCHER_DIR;
 my $SPEND_SAMPLER_PID         = "$LAUNCHER_DIR/spend-sampler.pid";
+# t11-tui-hot-reload: the mtimes the currently-loaded render modules had when
+# this process read them. Populated once at dashboard entry and advanced only
+# for a module that actually reloaded -- see _hot_reload's closing note on why
+# a skipped module must NOT have its baseline bumped.
+my $HOT_RELOAD_BASELINE       = {};
 my $SETTINGS_LOCAL_FILE       = "$PROJECT_PATH/.claude/settings.local.json";
 # installed_plugins.json lives under claude-home/plugins/ (Fix 2), NOT
 # .launcher/ — so it appears at /root/.claude/plugins/installed_plugins.json as
@@ -5109,8 +5115,18 @@ sub enter_dashboard {
     # re-entrant leave_raw (second Ctrl-C during teardown) only pops the
     # title stack once. See leave_raw below for the full rationale.
     my $left_raw = 0;
+    # t11-tui-hot-reload: the baseline is taken HERE, once, before the loop --
+    # the mtimes of the render modules as this process actually loaded them.
+    # Anything that moves after this point is a change this process has not
+    # picked up, which is exactly what the nudge should report.
+    $HOT_RELOAD_BASELINE = _hot_reload_mtimes(HotReload::loaded(\%INC));
     my $rc = Dashboard::run(
         color     => 1,
+        # The two t11 seams. Dashboard.pm contains no system/exec/fork and
+        # takes every I/O boundary as an injection; hot_reload runs `perl -c`
+        # in a subprocess, so it is wired in from here like every other spawn.
+        hot_reload         => sub { _hot_reload($_[0]) },
+        hot_reload_pending => sub { _hot_reload_pending() },
         enter_raw => sub {
             Term::ReadKey::ReadMode('cbreak');
             print STDOUT "\e[22;0t";                # XTPUSHTITLE: push icon+window title onto the stack
@@ -6611,6 +6627,161 @@ sub _spend_sampler_stop {
         log_ev('spend_sampler_stopped', { pid => $pid });
     }
     unlink $SPEND_SAMPLER_PID if -f $SPEND_SAMPLER_PID;
+}
+
+# ===========================================================================
+# t11-tui-hot-reload -- the impure half. HotReload.pm decides; this acts.
+#
+# It lives HERE, in launcher.pl, for the reason every other spawn in this tree
+# does: Dashboard.pm has no system/exec/fork anywhere and takes every I/O
+# boundary as an injected seam ("the arrow stays one-way"). Putting a
+# subprocess into it to serve this feature would spend that property to buy a
+# convenience.
+#
+# The cost is that this driver is FROZEN -- it is in the running process, so
+# editing it needs a relaunch. That is the right side of the trade: the driver
+# is stat, validate, swap, smoke, restore, and none of that should need to
+# change, while everything it DECIDES lives in HotReload.pm and stays hot.
+# ===========================================================================
+
+# _hot_reload_mtimes(\@loaded) -> \%name => mtime. Stat only; no fork. Cheap
+# enough to ride the render tick (thirteen stats), which is what the "changed
+# on disk" nudge needs. An unreadable file is simply absent from the result --
+# HotReload::changed reads that as unchanged, deliberately.
+sub _hot_reload_mtimes {
+    my ($loaded) = @_;
+    my %out;
+    for my $m (@{ $loaded || [] }) {
+        next unless ref($m) eq 'HASH' && defined $m->{path};
+        my @st = stat($m->{path});
+        $out{ $m->{name} } = $st[9] if @st && defined $st[9];
+    }
+    return \%out;
+}
+
+# _hot_reload_compiles($path) -> 1 | 0. `perl -c` in a subprocess.
+#
+# THIS GATE IS LOAD-BEARING, NOT BELT-AND-BRACES, and the reason is a perl
+# behaviour worth stating rather than assuming. A `require` of a file with a
+# syntax error does NOT leave the old package intact: subs are installed as
+# they are parsed, so a syntax error at line N leaves every sub BEFORE it
+# replaced and every sub AFTER it stale. The module ends up mixed-version and
+# nothing raises. Measured, not reasoned about:
+#
+#     before:      alpha=v1  beta=v1
+#     reload ok?   no
+#     after-fail:  alpha=v2  beta=v1
+#
+# So a candidate is compiled in a process that cannot damage this one, and only
+# a clean exit earns a swap.
+#
+# stderr goes to a temp file, never to an in-memory scalar: Git-for-Windows
+# perl fails "Bad file descriptor" on that and surfaces it as a bare `Died at
+# ... line N` (project CLAUDE.md). List-form system(), so a path containing a
+# space or the non-ASCII bytes this host's own home directory carries needs no
+# quoting and reaches no shell.
+sub _hot_reload_compiles {
+    my ($path, $libdir) = @_;
+    return 0 unless defined $path && -f $path;
+    my ($tmp_fh, $tmp) = eval { File::Temp::tempfile('ccpraxis-hotreload-XXXXXX', TMPDIR => 1, UNLINK => 0) };
+    return 0 unless defined $tmp;
+    close $tmp_fh if $tmp_fh;
+    my ($saved_out, $saved_err);
+    my $rc = -1;
+    if (open($saved_out, '>&', \*STDOUT) && open($saved_err, '>&', \*STDERR)) {
+        if (open(STDOUT, '>', $tmp) && open(STDERR, '>&', \*STDOUT)) {
+            $rc = system($^X, '-c', '-I', $libdir, $path);
+        }
+        open(STDOUT, '>&', $saved_out);
+        open(STDERR, '>&', $saved_err);
+    }
+    unlink $tmp;
+    return ($rc == 0) ? 1 : 0;
+}
+
+# _hot_reload_snapshot($pkg) / _hot_reload_restore($pkg, \%saved)
+#
+# The rollback. Every coderef in the package's stash is saved before the swap
+# and reinstalled if the swap goes wrong -- five lines, and it is the only
+# answer to the mixed-version failure above that does not require a relaunch.
+#
+# It cannot undo everything: a module whose file-scope body ran far enough to
+# mutate something outside its own package is beyond this. For these thirteen
+# modules that body is memo initialisation and constants, so restoring the subs
+# restores the module.
+sub _hot_reload_snapshot {
+    my ($pkg) = @_;
+    no strict 'refs';
+    my %saved;
+    for my $sym (keys %{"${pkg}::"}) {
+        next unless defined &{"${pkg}::${sym}"};
+        $saved{$sym} = \&{"${pkg}::${sym}"};
+    }
+    return \%saved;
+}
+sub _hot_reload_restore {
+    my ($pkg, $saved) = @_;
+    no strict 'refs';
+    no warnings 'redefine';
+    *{"${pkg}::${_}"} = $saved->{$_} for keys %{ $saved || {} };
+    return;
+}
+
+# _hot_reload($smoke) -> \%summary (HotReload::summarise's shape).
+#
+# $smoke is a coderef that renders one frame with the CURRENT state and size.
+# It is created by the caller and calls compose_frame BY NAME, so it exercises
+# whatever was just installed. A module that compiles but dies at render is
+# caught here rather than on the next keypress.
+sub _hot_reload {
+    my ($smoke) = @_;
+    my $libdir = $SELF_PL;
+    $libdir =~ s{[/\\][^/\\]+$}{};
+
+    my $loaded = HotReload::loaded(\%INC);
+    my $now    = _hot_reload_mtimes($loaded);
+    my $todo   = HotReload::changed($loaded, $HOT_RELOAD_BASELINE, $now);
+
+    my (@reloaded, @skipped, @rolled_back);
+    for my $m (@$todo) {
+        unless (_hot_reload_compiles($m->{path}, $libdir)) {
+            push @skipped, { name => $m->{name}, why => 'does not compile; left untouched' };
+            next;
+        }
+        my $saved = _hot_reload_snapshot($m->{name});
+        my $prev_inc = delete $INC{ $m->{key} };
+        my $ok = eval { local $SIG{__WARN__} = sub {}; require $m->{key}; 1 };
+        if (!$ok) {
+            _hot_reload_restore($m->{name}, $saved);
+            $INC{ $m->{key} } = $prev_inc if defined $prev_inc;
+            push @rolled_back, { name => $m->{name}, why => 'died while loading; previous version restored' };
+            next;
+        }
+        if (ref($smoke) eq 'CODE') {
+            my $rendered = eval { $smoke->(); 1 };
+            unless ($rendered) {
+                _hot_reload_restore($m->{name}, $saved);
+                push @rolled_back, { name => $m->{name}, why => 'loaded but died rendering; previous version restored' };
+                next;
+            }
+        }
+        push @reloaded, $m->{name};
+        $HOT_RELOAD_BASELINE->{ $m->{name} } = $now->{ $m->{name} };
+    }
+    # A skipped or rolled-back module keeps its OLD baseline, so the nudge goes
+    # on reporting it as changed -- the operator is still owed a fix, and a
+    # silent baseline bump would be this package reintroducing the exact defect
+    # t07 spent itself removing (a record cleared for something not settled).
+    return HotReload::summarise({ reloaded => \@reloaded, skipped => \@skipped,
+                                  rolled_back => \@rolled_back });
+}
+
+# _hot_reload_pending() -> count of allowlisted modules whose mtime has moved.
+# Stat only. Rides the render tick to drive the "press r" nudge, which is what
+# closes the other half of the gap: a promote you forgot to pick up.
+sub _hot_reload_pending {
+    my $loaded = HotReload::loaded(\%INC);
+    return scalar @{ HotReload::changed($loaded, $HOT_RELOAD_BASELINE, _hot_reload_mtimes($loaded)) };
 }
 
 # _tail_lines — last $n chomped lines of a file (the B1 launch log), or ().
