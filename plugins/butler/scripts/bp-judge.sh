@@ -98,20 +98,23 @@ elif [ "$KIND" = escalation-resolve ]; then
   # afterwards, deterministically, by bp-resolve.pl -- so an empty write set here
   # is the contract, not an oversight.
   #
-  # 400 is the canonical cap this role never had (almanac 20260823-211302-7d5a:
-  # "bp-escalation-resolver has no canonical turn cap; t/93 has been red for it").
-  # It comes from turn-caps.json's 400 band -- "bounded roles that read a slice
-  # and write one artifact" -- which is exactly this agent: read-only tools, one
-  # record, one ledger, one Decisions table, one verdict.
+  # 800, canonical in turn-caps.json, which this surface is now drift-checked
+  # against (almanac 20260823-211302-7d5a: the role had no canonical cap at all
+  # and t/93 had been red for it).
   #
-  # It is deliberately NOT a small number. turn-caps.json says it in its own
-  # header: a cap is a RUNAWAY BACKSTOP, not a budget. It binds only when the
-  # agent would otherwise still be working, so a healthy judge costs the same at
-  # 400 as at 40 while a starved one costs the whole dispatch. The first version
-  # of this used 40, reasoning about typical cost -- which is the mistake that
-  # file exists to warn against.
-  MODEL="${BP_ESCALATION_MODEL:-sonnet}"; MAXT="${BP_ESCALATION_MAX_TURNS:-400}"
-  case "$MAXT" in ''|*[!0-9]*|0) MAXT=400 ;; esac
+  # 800 rather than the 400 band its read-only tool list would suggest, for two
+  # reasons that both outrank the shape heuristic. e03's DC4 pins this role to
+  # bp-resolve-judge EXACTLY -- they are the pair that decides what happens to a
+  # stuck package, and a resolver capped below the judge it feeds starves on
+  # precisely the hard cases the pair exists for (t/126 AG5 enforces the
+  # equality). And turn-caps.json's own header: a cap is a RUNAWAY BACKSTOP, not
+  # a budget, so lowering it to match expected cost saves nothing on a healthy
+  # run and throws away a dispatch that had almost finished.
+  #
+  # Both smaller values tried here on 2026-08-24 (40, then 400) were reasoned
+  # from typical cost. That is the mistake that file exists to warn against.
+  MODEL="${BP_ESCALATION_MODEL:-sonnet}"; MAXT="${BP_ESCALATION_MAX_TURNS:-800}"
+  case "$MAXT" in ''|*[!0-9]*|0) MAXT=800 ;; esac
   ROLE="escalation-resolver"; J_WRITE_SET=""; J_TEST_PATHS=""
 else
   MODEL="${BP_HARVEST_MODEL:-sonnet}"

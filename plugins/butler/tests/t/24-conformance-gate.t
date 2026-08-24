@@ -675,7 +675,18 @@ sub raw_dev_verdict {
     my $sh  = "$Bin/../../scripts/bp-judge.sh";
     my $src = -r $sh ? slurp($sh) : '';
     ok(length $src, 'AC-23: bp-judge.sh is readable');
-    like($src, qr/harvest\|resolve\|conformance\)/, 'AC-23: KIND validation accepts harvest|resolve|conformance');
+    # Parse the allow-list and check MEMBERSHIP, rather than pinning the literal
+    # string `harvest|resolve|conformance)`. That form pinned the closing paren,
+    # so adding a fourth kind (escalation-resolve, 2026-08-24) turned red an
+    # assertion whose own description only cares that these three are accepted.
+    # Same over-specification this repo has now paid for in t/115, t/145 and
+    # t/26: an oracle asserting more than it means.
+    my ($allow) = $src =~ /case\s+"\$KIND"\s+in\s+([a-z|\-]+)\)/;
+    ok(defined $allow, 'AC-23: the KIND allow-list is parseable') or diag('no case line found');
+    my %accepted = map { $_ => 1 } split /\|/, ($allow // '');
+    ok(!grep({ !$accepted{$_} } qw(harvest resolve conformance)),
+       'AC-23: KIND validation accepts harvest|resolve|conformance')
+        or diag('allow-list: ' . ($allow // '(none)'));
     unlike($src, qr/^\[\s*-f\s*"\$LEDGER"\s*\]\s*\|\|\s*\{[^\n]*exit 1/m,
            'AC-23: the per-package ledger requirement is no longer unconditional (_run has no ledger)');
     ok(!-e "$Bin/../../templates/judge-conformance.md",

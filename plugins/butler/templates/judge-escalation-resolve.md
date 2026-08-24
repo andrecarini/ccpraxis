@@ -21,7 +21,7 @@ notification has nowhere to be delivered, and no verdict is ever written. The or
 `judge_crashed`, and the escalation sits in the queue exactly as it was.
 
 Do not poll: never re-invoke a tool to check a result, and never loop on a sentinel file. Read it
-once. Your cap is `max_turns: 400` — a runaway backstop, not a budget — so keep each check small enough to finish
+once. Your cap is `max_turns: 800` — a runaway backstop, not a budget — but keep each check small enough to finish
 synchronously. **If a check is too slow to run in the foreground, write your verdict without it and
 say so in `evidence`.** A verdict with a stated gap is useful; a process that dies waiting produces
 nothing, and produces it slowly.

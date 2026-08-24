@@ -13,7 +13,6 @@
     "bp-harvest-judge": 400,
     "bp-auditor": 400,
     "bp-feedback-verifier": 400,
-    "bp-escalation-resolver": 400,
 
     "bp-reviewer": 600,
     "bp-redteam": 600,
@@ -22,7 +21,9 @@
     "bp-conformance-judge": 600,
 
     "bp-implementer": 800,
-    "bp-resolve-judge": 800
+    "bp-resolve-judge": 800,
+    "bp-escalation-resolver": 800
   },
-  "_roles_why": "400 = bounded roles that read a slice and write one artifact. 600 = multi-file roles that must EXECUTE things, not just read. 800 = edit/run/edit convergence loops."
+  "_roles_why": "400 = bounded roles that read a slice and write one artifact. 600 = multi-file roles that must EXECUTE things, not just read. 800 = edit/run/edit convergence loops.",
+  "_escalation_resolver_why": "800 despite being READ-ONLY, and deliberately not the 400 band its tool list would suggest. Two reasons, both of which outrank the shape heuristic. (1) e03's DC4 pins this role to bp-resolve-judge EXACTLY -- they are the two agents that decide what happens to a stuck package, and a resolver capped below the judge it feeds would starve on exactly the hard cases the pair exists for; t/126 AG5 enforces the equality. (2) The header of this file: a cap is a RUNAWAY BACKSTOP, not a budget, so lowering it to match expected cost saves nothing on a healthy run and throws away a dispatch that had almost finished. It was briefly set to 400 on 2026-08-24 by reasoning from typical cost -- which is the exact mistake the header warns against."
 }

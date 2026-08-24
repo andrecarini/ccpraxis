@@ -185,9 +185,27 @@ sub slurp { my ($p) = @_; open my $fh, '<:raw', $p or return undef; local $/; my
     BpOrch::_block_and_queue($bpdir, $runs, $log, 'bp', 'bq1', 'stuck', time, 'question?', 'stuck-package', 'scoping');
     my $ltxt = slurp("$bpdir/packages/bq1.md") // '';
     like($ltxt, qr/^status:\s*blocked\s*$/m, 'BQ2: the CURRENT positional call still flips the ledger to blocked (arity/order has not silently shifted)');
+    # _block_and_queue DELIBERATELY no longer writes the registry status. s02
+    # removed it -- bp-orchestrator.pl says so at the function itself: "No
+    # registry mirror to worry about anymore either way: s02 removed the
+    # registry status write this function used to also make." The ledger is the
+    # authority; the registry mirror was a second source of truth that could
+    # disagree with it.
+    #
+    # This assertion had been red ever since, describing behaviour that no
+    # longer exists. It was carried as "pre-existing red" through several
+    # sessions, which is how a red suite stops meaning anything -- every real
+    # regression now has to be distinguished from the noise by hand.
+    #
+    # Inverted to pin the CURRENT contract, so it fails if the mirror ever comes
+    # back without the ledger-authority question being reopened deliberately.
     my $reg_txt = slurp("$runs/registry.json") // '';
     my $reg = eval { JSON::PP->new->decode($reg_txt) };
-    is(ref($reg) eq 'HASH' ? $reg->{packages}{bq1}{status} : undef, 'blocked', 'BQ2: registry also flips to blocked');
+    my $reg_status = ref($reg) eq 'HASH' ? $reg->{packages}{bq1}{status} : undef;
+    ok(!defined $reg_status,
+       'BQ2: _block_and_queue does NOT mirror the status into registry.json -- the ledger is the '
+     . 'single authority (s02), and a mirror that can disagree with it is the defect, not the '
+     . 'feature');
     opendir(my $dh, "$runs/needs-you") or die $!;
     my @f = grep { /\.json$/ } readdir $dh;
     closedir $dh;
