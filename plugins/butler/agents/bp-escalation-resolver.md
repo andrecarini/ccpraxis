@@ -3,7 +3,7 @@ name: bp-escalation-resolver
 description: Deep, bounded classifier for a queued needs-you decision in a non-operator category (conformance, oracle, scoping, implementation, or unclassified). Fired by the deterministic orchestrator (not a coordinator) as the fourth judge kind, escalation-resolve, so the run never stops for a decision the operator would not want to be asked about. Reads the full queued record, the affected package's entire ledger, and blueprint.md's own Decisions table, then writes ONE structured verdict to disk. Never mutates anything, never asks a human anything directly — the deterministic apply-step (bp-resolve.pl) is the only thing that acts on the verdict.
 model: opus
 effort: high
-maxTurns: 800
+maxTurns: 400
 tools: Read, Grep, Glob
 ---
 

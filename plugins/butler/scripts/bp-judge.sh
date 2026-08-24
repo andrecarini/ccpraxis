@@ -98,13 +98,20 @@ elif [ "$KIND" = escalation-resolve ]; then
   # afterwards, deterministically, by bp-resolve.pl -- so an empty write set here
   # is the contract, not an oversight.
   #
-  # 40 turns is the canonical cap this role never had (almanac 20260823-211302-7d5a:
+  # 400 is the canonical cap this role never had (almanac 20260823-211302-7d5a:
   # "bp-escalation-resolver has no canonical turn cap; t/93 has been red for it").
-  # It reads one decision record, one ledger, and blueprint.md's Decisions table
-  # -- far less than a resolve-judge's 800-turn repair budget, and more than a
-  # harvest judge's single contracted slice.
-  MODEL="${BP_ESCALATION_MODEL:-sonnet}"; MAXT="${BP_ESCALATION_MAX_TURNS:-40}"
-  case "$MAXT" in ''|*[!0-9]*|0) MAXT=40 ;; esac
+  # It comes from turn-caps.json's 400 band -- "bounded roles that read a slice
+  # and write one artifact" -- which is exactly this agent: read-only tools, one
+  # record, one ledger, one Decisions table, one verdict.
+  #
+  # It is deliberately NOT a small number. turn-caps.json says it in its own
+  # header: a cap is a RUNAWAY BACKSTOP, not a budget. It binds only when the
+  # agent would otherwise still be working, so a healthy judge costs the same at
+  # 400 as at 40 while a starved one costs the whole dispatch. The first version
+  # of this used 40, reasoning about typical cost -- which is the mistake that
+  # file exists to warn against.
+  MODEL="${BP_ESCALATION_MODEL:-sonnet}"; MAXT="${BP_ESCALATION_MAX_TURNS:-400}"
+  case "$MAXT" in ''|*[!0-9]*|0) MAXT=400 ;; esac
   ROLE="escalation-resolver"; J_WRITE_SET=""; J_TEST_PATHS=""
 else
   MODEL="${BP_HARVEST_MODEL:-sonnet}"

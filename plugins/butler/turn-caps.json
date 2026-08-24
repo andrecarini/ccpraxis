@@ -13,6 +13,7 @@
     "bp-harvest-judge": 400,
     "bp-auditor": 400,
     "bp-feedback-verifier": 400,
+    "bp-escalation-resolver": 400,
 
     "bp-reviewer": 600,
     "bp-redteam": 600,
