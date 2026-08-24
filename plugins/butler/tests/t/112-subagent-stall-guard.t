@@ -213,6 +213,34 @@ sub newroot { my $r = tempdir(CLEANUP => 1); mkdir "$r/.ccpraxis-local-data"; re
      . 'is a distinction the hook actually draws');
 }
 
+{   # A command that merely PRINTS the verdict is not a director tick.
+    #
+    # The activation trigger used to match the TEXT of any Bash output, so
+    # grepping this hook's own source, cat-ing it, or running its tests started
+    # a run -- and the session then could not end, because a diagnostic had
+    # manufactured the very state the Stop gate exists to protect. Observed
+    # 2026-08-24 while investigating this file, which is as close to a
+    # self-demonstrating bug as this repo has produced.
+    #
+    # Same class as almanac 20260819-054052-1168: mention-matching raw command
+    # text with no reader veto.
+    my $r = newroot();
+    fire($r, bash_ev('grep -n "action" plugins/butler/hooks/guard-subagent-stall.sh',
+                     '158:          *\'"action":"run-package"\'*)'));
+    is(state_of($r), 'inert',
+       'a command that merely PRINTS "action":"run-package" does NOT activate — reading a '
+     . 'verdict out of a file is not receiving one from the director');
+
+    # ...and the veto is on the COMMAND, so a real director call still works
+    # even though its output is byte-identical in the part that matters.
+    my $r2 = newroot();
+    fire($r2, bash_ev('perl plugins/butler/scripts/bp-drive-next.pl next --scope x',
+                      '{"action":"run-package","blueprint":"bp","package":"p1"}'));
+    is(state_of($r2), 'active',
+       'counter-fixture: the same verdict from bp-drive-next.pl DOES activate, so the veto '
+     . 'discriminates on producer rather than simply refusing everything');
+}
+
 {   # The two resolutions, end to end.
     my $r = newroot();
     fire($r, dispatch(JSON::PP::true, 'w'));

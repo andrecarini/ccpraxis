@@ -153,6 +153,32 @@ case "$EVENT" in
         # need-order, the run is ALREADY active and activation is a no-op --
         # activation only has an effect on a run that is idle or finished, and
         # that is exactly the false positive.
+        # ...but the response alone is NOT ENOUGH, and reading it alone was a
+        # third bug of the same family, observed the same day.
+        #
+        # This matched the TEXT of any Bash output. So a command that merely
+        # PRINTED the pattern activated a run: a grep over this hook's own
+        # source, a `cat` of it, a test run echoing its fixtures, a commit
+        # message quoting it. Investigating the escalation machinery started a
+        # run about the escalation machinery -- and the session then could not
+        # end, because a diagnostic had manufactured the state the Stop gate
+        # exists to protect.
+        #
+        # That is exactly the class filed as almanac 20260819-054052-1168:
+        # butler guard hooks that mention-match raw command text with no reader
+        # veto. The veto here is cheap and exact -- the ONLY producer of these
+        # verdicts as a Bash tool call is bp-drive-next.pl. (The orchestrator and
+        # gate-drive-loop.sh both invoke it in-process, so neither surfaces as a
+        # tool event and neither is affected.)
+        #
+        # Response AND command, not either: the command says what was asked, the
+        # response says what came back, and activation needs both to be true.
+        # Keeping the response check is what stops a mere ASK from activating.
+        CMD=$(bp_json_get "$PAYLOAD" tool_input.command) || CMD=""
+        case "$CMD" in
+          *bp-drive-next.pl*) ;;
+          *) exit 0 ;;
+        esac
         RESP=$(bp_json_get "$PAYLOAD" tool_response.stdout tool_response) || RESP=""
         case "$RESP" in
           *'"action":"run-package"'*)
