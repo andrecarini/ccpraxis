@@ -14,7 +14,7 @@
 # HARD CONSTRAINTS honoured here (spec S4.0):
 #   * NEVER spawns launcher.pl, never builds an image, never starts a
 #     container. Only the two plain filter scripts are spawned, each bounded
-#     by `timeout`, exactly as t/54-tui-output-hygiene.t and t/54-spend-panel.t
+#     by `timeout`, exactly as t/102-tui-output-hygiene.t and t/54-spend-panel.t
 #     already spawn them.
 #   * Fixtures live only under File::Temp tempdir()/tempfile().
 #   * Never redirects to NUL; /dev/null only.
@@ -1004,7 +1004,7 @@ sub glyph_cols_disagreements {
 # ===========================================================================
 # AC-B -- the whole row is budgeted (criteria 1, 2 and 4 jointly; B-12/B-13).
 # This is the group that covers the overflow defect behind the two red
-# assertions at t/54-tui-output-hygiene.t:247 -- independently asserted here,
+# assertions at t/102-tui-output-hygiene.t:247 -- independently asserted here,
 # never by re-pointing that immutable file.
 #
 # row_cost is computed in this oracle exactly as spec S2.4.1 defines it, so

@@ -93,7 +93,15 @@ fi
 # boundary class produces false positives on ordinary commands that merely
 # mention the words in a quoted string, e.g. a commit message — see h01
 # fix-batch step 7 report. Left open per spec §2.2's narrow-by-design scope.
-if printf '%s' "$MATCH_TEXT" | grep -Eq '(^|[;&|[:space:](])([^[:space:];&|]*/)?(pnpm|npm|yarn)[[:space:]]+(run[[:space:]]+)?(lint|build|test)\b'; then
+# `{` added alongside the `(` this class already had, for the same reason: a
+# brace group opens a command position exactly as a subshell does, so
+# `{npm run test; }` was unmatched while `(npm run test)` was matched -- a
+# distinction with no meaning. The quotes stay OUT, exactly as the note above
+# says, because a quote is not itself a reason the shell executes what it
+# encloses; that asymmetry is the one guard-git-mutations.sh's MINOR-7 pass
+# established and guard-bash.sh now shares. almanac 20260819-164901-52d3's class,
+# applied to the hook that already had half of it.
+if printf '%s' "$MATCH_TEXT" | grep -Eq '(^|[;&|[:space:]({])([^[:space:];&|]*/)?(pnpm|npm|yarn)[[:space:]]+(run[[:space:]]+)?(lint|build|test)\b'; then
   echo "BLOCKED: harvest judges verify a declared \`checks:\` entry via its recorded evidence, never by re-running it (bp-harvest-judge.md Method: 'via a declared artefact, never by re-running them'). Command: $CMD. Look for the check's recorded invocation+result inside your contracted slice instead." >&2
   exit 2
 fi

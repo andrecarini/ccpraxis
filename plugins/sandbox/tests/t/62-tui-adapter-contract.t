@@ -21,7 +21,7 @@
 #
 # HARD CONSTRAINTS honoured here (spec S2.2, AC-10):
 #   * launcher.pl is SLURPED as source text only — never require'd, do'ne,
-#     or executed (t/54-tui-output-hygiene.t's established convention).
+#     or executed (t/102-tui-output-hygiene.t's established convention).
 #   * No network, no container I/O, no podman, no launcher.pl spawn.
 #   * Fixtures live only under File::Temp::tempdir(CLEANUP => 1).
 #   * No `prove` on this host — runs standalone via `perl <file>`.
@@ -74,7 +74,7 @@ sub slurp {
 
 # _balanced_braces($src, $from) -> the '{'...'}' substring balanced from the
 # first '{' at-or-after $from, or undef if unbalanced. Verbatim shape reused
-# from t/54-tui-output-hygiene.t:63-77 / t/59-fleet-event-source.t.
+# from t/102-tui-output-hygiene.t:63-77 / t/59-fleet-event-source.t.
 sub _balanced_braces {
     my ($src, $from) = @_;
     my $idx = index($src, '{', $from);

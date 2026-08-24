@@ -613,7 +613,7 @@ sub lines_text {
 # ===========================================================================
 # C8 -- the statusline form (bp-statusline.pl) fits its budget without
 # truncating mid-glyph. Spawned as a plain filter script (stdin JSON ->
-# stdout), bound by `timeout`, exactly as t/54-tui-output-hygiene.t spawns
+# stdout), bound by `timeout`, exactly as t/102-tui-output-hygiene.t spawns
 # scripts/statusline.pl -- never launcher.pl, never a container.
 # ===========================================================================
 {

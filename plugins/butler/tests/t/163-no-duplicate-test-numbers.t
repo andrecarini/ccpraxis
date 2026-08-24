@@ -59,35 +59,64 @@ sub slurp {
 # exactly the "assertion that cannot fail" shape this package exists to
 # avoid. opendir/readdir only (never glob()) per the non-ASCII-path landmine.
 # ============================================================================
+# EVERY PLUGIN'S SUITE, not just this one.
+#
+# This section walked plugins/butler/tests/t/ alone, so the sandbox suite was
+# free to keep colliding -- and did, accumulating ELEVEN files sharing five
+# numbers (39, 42, 43, 54, 56) while this oracle sat green one directory over.
+# almanac 20260823-205629-2047.
+#
+# d01 fixed the instance and wrote an oracle scoped to the instance. That is the
+# very failure mode the initiative kept finding and naming, committed by the fix
+# for it. Discovering the plugin list at runtime means a plugin added tomorrow is
+# covered the day it gets a test, without anyone remembering to come back here.
 {
-    opendir(my $dh, $TDIR) or BAIL_OUT("cannot opendir $TDIR: $!");
-    my @entries = readdir $dh;
-    closedir $dh;
+    my $PLUGINS = abs_path("$ROOT/plugins");
+    ok(-d $PLUGINS, 'SECTION 1 sanity: plugins/ resolved') or BAIL_OUT("no plugins dir at $PLUGINS");
+    opendir(my $pd, $PLUGINS) or BAIL_OUT("cannot opendir $PLUGINS: $!");
+    my @plugin_names = sort grep { !/^\./ && -d "$PLUGINS/$_" } readdir $pd;
+    closedir $pd;
 
-    my @t_files = sort grep { -f "$TDIR/$_" && /\.t\z/ } @entries;
-    ok(scalar(@t_files) > 100,
-       'SECTION 1 sanity: the directory scan itself found a plausible number of .t files ('
-     . scalar(@t_files) . ') — a broken/empty scan cannot pass the rest of this section vacuously')
-        or diag('directory scan found suspiciously few files; check $TDIR resolution');
+    my @suites = grep { -d $_->{dir} }
+                 map  { { name => $_, dir => "$PLUGINS/$_/tests/t" } } @plugin_names;
+    cmp_ok(scalar(@suites), '>=', 2,
+       'SECTION 1 sanity: at least two plugin test suites were discovered — a scan that found only '
+     . 'one is how this check came to cover only butler in the first place')
+        or diag('suites found: ' . join(', ', map { $_->{name} } @suites));
 
-    my %by_number;
-    my @unnumbered;
-    for my $f (@t_files) {
-        if ($f =~ /^(\d+)-/) {
-            push @{ $by_number{$1} }, $f;
-        } else {
-            push @unnumbered, $f;
+    my $total_files = 0;
+    for my $suite (@suites) {
+        opendir(my $dh, $suite->{dir}) or do {
+            fail("SECTION 1 [$suite->{name}]: cannot opendir $suite->{dir}: $!");
+            next;
+        };
+        my @entries = readdir $dh;
+        closedir $dh;
+
+        my @t_files = sort grep { -f "$suite->{dir}/$_" && /\.t\z/ } @entries;
+        $total_files += scalar @t_files;
+
+        my %by_number;
+        my @unnumbered;
+        for my $f (@t_files) {
+            if ($f =~ /^(\d+)-/) { push @{ $by_number{$1} }, $f }
+            else                 { push @unnumbered, $f }
         }
-    }
-    is(scalar(@unnumbered), 0,
-       'SECTION 1: every .t file in the directory follows the NN-slug.t house numbering convention ('
-     . join(', ', @unnumbered) . ')');
+        is(scalar(@unnumbered), 0,
+           "SECTION 1 [$suite->{name}]: every .t file follows the NN-slug.t house numbering "
+         . 'convention (' . join(', ', @unnumbered) . ')');
 
-    my @dupes = sort { $a <=> $b } grep { scalar(@{ $by_number{$_} }) > 1 } keys %by_number;
-    is(scalar(@dupes), 0,
-       'SECTION 1 (DC1, general): no leading number in plugins/butler/tests/t/ is shared by two or '
-     . 'more files — offending numbers: '
-     . join('; ', map { "$_ => [" . join(', ', @{ $by_number{$_} }) . "]" } @dupes));
+        my @dupes = sort { $a <=> $b } grep { scalar(@{ $by_number{$_} }) > 1 } keys %by_number;
+        is(scalar(@dupes), 0,
+           "SECTION 1 (DC1, general) [$suite->{name}]: no leading number in plugins/$suite->{name}/"
+         . 'tests/t/ is shared by two or more files — offending numbers: '
+         . join('; ', map { "$_ => [" . join(', ', @{ $by_number{$_} }) . "]" } @dupes));
+    }
+
+    # Non-vacuity: a scan that found nothing would pass every is(0) above.
+    cmp_ok($total_files, '>', 100,
+       'SECTION 1 sanity: the scans found a plausible total number of .t files (' . $total_files
+     . ') across all suites — an empty scan cannot pass this section vacuously');
 }
 
 # ============================================================================
