@@ -273,8 +273,8 @@ sub launched_pkgs { my $r=shift; [ map { $_->{pkg} } @{$r->{launched}} ] }
     ok($r->{parked_steady}, 'SIM-5: orchestrator stayed alive awaiting the human — did NOT idle-exit on the parked branch');
     like(slurp("$r->{dir}/packages/A.md"), qr/^status:\s*blocked/m, 'SIM-5: A parked (blocked)');
     is($r->{reg}{C}{harvest}, 'pass', 'SIM-5: independent C completed despite A parking');
-    my $nd = "$r->{dir}/runs/needs-you"; my @q; if (-d $nd) { opendir my $h,$nd; @q=grep {/\.json$/} readdir $h; closedir $h; }
-    is(scalar @q, 1, 'SIM-5: a needs-you decision was queued for the parked branch');
+    my $nd = "$r->{dir}/runs/escalations"; my @q; if (-d $nd) { opendir my $h,$nd; @q=grep {/\.json$/} readdir $h; closedir $h; }
+    is(scalar @q, 1, 'SIM-5: a escalations decision was queued for the parked branch');
 }
 
 # ===========================================================================

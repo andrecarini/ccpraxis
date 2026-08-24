@@ -176,6 +176,49 @@ our %CATEGORY_ALIAS = ('operational' => 'operator-action');
 # operator, and then it will have been a judgement rather than an assumption.
 our @RESOLVER_TRIAGEABLE = qw(unclassified conformance oracle scoping implementation);
 our %RESOLVER_TRIAGEABLE = map { $_ => 1 } @RESOLVER_TRIAGEABLE;
+
+# ===========================================================================
+# THE QUEUE'S NAME. `runs/escalations/`, formerly `runs/needs-you/`.
+#
+# The old name was a claim about ownership that the contents do not support.
+# The directory holds EVERY escalation, and most of them are handed to the
+# escalation resolver and never reach a human -- but anything reading the path
+# (an agent, the dashboard, an operator scanning a run directory) concludes the
+# operator is required. Operator: "we use way too many instances of ... needs-you
+# ... it's confusing agents into making them think it's stuff that actually needs
+# me."
+#
+# `escalations` says what is in it. WHO must act is the record's `category`,
+# which is the one place that question is answered -- and it is answered per
+# record, not per directory, which is precisely why a directory could never
+# carry it honestly.
+use constant ESCALATIONS_DIRNAME => 'escalations';
+use constant ESCALATIONS_LEGACY  => 'needs-you';
+
+# escalations_dir($runs) -> path, MIGRATING a legacy directory on first use.
+#
+# Live runs have queued records under the old name right now. A rename that
+# leaves them behind does not tidy anything -- it strands real escalations
+# somewhere nothing looks, which is strictly worse than the confusing name.
+#
+# The migration is a single rename() and is attempted only when the new
+# directory does not exist and the old one does. Every failure mode falls back
+# to the legacy path rather than to a path that is not there: if the rename
+# loses a race (another tick migrated first) or is refused, we return whichever
+# directory actually exists. Never dies -- this sits on the render and tick
+# paths.
+sub escalations_dir {
+    my ($runs) = @_;
+    return '' unless defined $runs && !ref $runs && length $runs;
+    my $new = "$runs/" . ESCALATIONS_DIRNAME;
+    my $old = "$runs/" . ESCALATIONS_LEGACY;
+    return $new if -d $new;
+    if (-d $old) {
+        return $new if rename($old, $new);   # migrated
+        return -d $new ? $new : $old;        # lost a race, or refused
+    }
+    return $new;
+}
 sub canonical_category {
     my ($c) = @_;
     return undef unless defined $c && !ref $c;
@@ -1626,7 +1669,7 @@ sub queue_needs_you {
         log => "$runs/orchestrator.log", site => 'queue_needs_you',
         kind => $rec->{kind}, package => $rec->{package},
     });
-    my $dir = "$runs/needs-you";
+    my $dir = escalations_dir($runs);
     # make_path croaks on failure (read-only / full runs/) — never let that escape.
     unless (-d $dir) {
         require File::Path;
@@ -1714,7 +1757,7 @@ sub queue_needs_you {
 sub queued_decision_pkgs {
     my ($runs) = @_;
     my %pk;
-    my $dir = "$runs/needs-you";
+    my $dir = escalations_dir($runs);
     if (opendir my $dh, $dir) {
         for my $f (grep { /\.json$/ && !/^\./ } readdir $dh) {
             my $ex = _read_json("$dir/$f");
@@ -3471,7 +3514,7 @@ sub run {
                     # dispatch two for the same package concurrently -- the reused
                     # marker functions enforce that structurally; this only decides
                     # which queued decision a fresh dispatch names).
-                    my $dir = "$runs/needs-you";
+                    my $dir = escalations_dir($runs);
                     next unless -d $dir;
                     opendir(my $dh, $dir) or next;
                     my @cands;
@@ -4623,7 +4666,7 @@ sub remediation_step {
         # dag-stall path self-escalates via its own '_dag' decision once
         # remediation_outstanding clears. Deliberately does NOT change which
         # findings are filtered — that filter is what makes AC-44 pass.
-        my $ny = "$runs/needs-you";
+        my $ny = escalations_dir($runs);
         if (opendir my $dh, $ny) {
             for my $f (grep { /\.json$/ } readdir $dh) {
                 my $ex = _read_json("$ny/$f");

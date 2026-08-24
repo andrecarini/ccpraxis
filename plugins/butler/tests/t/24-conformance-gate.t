@@ -157,7 +157,7 @@ sub reviews_of { my $dir = shift; return ls_json("$dir/runs/review") }
 sub notices_of { my $dir = shift; return ls_json("$dir/runs/notices") }
 sub needs_you_of {
     my $dir = shift; my @o;
-    for my $f (ls_json("$dir/runs/needs-you")) { push @o, jget($f) }
+    for my $f (ls_json("$dir/runs/escalations")) { push @o, jget($f) }
     return @o;
 }
 
@@ -551,7 +551,7 @@ sub raw_dev_verdict {
         my ($label, $raw) = @$case;
         my $dir = mk_bp([ { name => 'b03', status => 'done', means => '[libX]', body => "- silent\n" } ]);
         tryrun($dir, read_verdict => sub { $raw });
-        is(scalar(needs_you_of($dir)), 0, "AC-21 [$label]: no needs-you decision is ever queued");
+        is(scalar(needs_you_of($dir)), 0, "AC-21 [$label]: no escalations decision is ever queued");
         unlike(slurp("$dir/packages/b03.md"), qr/^status:\s*(blocked|parked)/m,
                "AC-21 [$label]: the gate never flips a package to blocked/parked");
     }

@@ -130,9 +130,9 @@ sub shq { my $s = shift; $s =~ s/"/\\"/g; return qq{"$s"}; }
 sub mk_dag_stalled_bp {
     my $bpdir = tempdir(CLEANUP => 1);
     make_path("$bpdir/packages");
-    make_path("$bpdir/runs/needs-you");
+    make_path("$bpdir/runs/escalations");
     # Deliberately NO packages/_dag.md ledger -- that's the whole point.
-    write_file("$bpdir/runs/needs-you/_dag--abc123.json", $J->encode({
+    write_file("$bpdir/runs/escalations/_dag--abc123.json", $J->encode({
         package => '_dag', blueprint => 'bp', kind => 'dag-stalled',
         question => "The blueprint's dependency graph cannot progress.",
         context  => { class => 'unresolvable', unresolvable => [], blockers => [], pending => [] },
@@ -151,7 +151,7 @@ sub run_answer_cli {
 #     stderr names the pseudo-package + acknowledge, decision file untouched.
 {
     my $bpdir = mk_dag_stalled_bp();
-    my $decfile = "$bpdir/runs/needs-you/_dag--abc123.json";
+    my $decfile = "$bpdir/runs/escalations/_dag--abc123.json";
     my ($rc, $out) = run_answer_cli($bpdir, '--decision', '_dag--abc123', '--action', 'relaunch');
     isnt($rc, 0, 'AC2/2a: --action relaunch against a dag-stalled decision is refused (nonzero exit)');
     like($out, qr/pseudo-package|acknowledge/i,
@@ -164,7 +164,7 @@ sub run_answer_cli {
 #     fabricated, JSON on stdout with action:"acknowledge".
 {
     my $bpdir = mk_dag_stalled_bp();
-    my $decfile = "$bpdir/runs/needs-you/_dag--abc123.json";
+    my $decfile = "$bpdir/runs/escalations/_dag--abc123.json";
     my ($rc, $out) = run_answer_cli($bpdir, '--decision', '_dag--abc123', '--action', 'acknowledge');
     is($rc, 0, 'AC2/2b: --action acknowledge against a dag-stalled decision succeeds (exit 0)')
         or diag($out);

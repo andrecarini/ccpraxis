@@ -646,14 +646,14 @@ my %st = (
 # before regexing (spec S3 behaviors 1-8; see t/41-panel-semantics.t AC1/AC2/
 # AC8 for the exact per-span role assertions this file no longer duplicates).
 {
-    # Run panel: fresh lease + stay_awake -> active / holding; needs-you count.
+    # Run panel: fresh lease + stay_awake -> active / holding; escalations count.
     my @p = Dashboard::build_panels({ %st, busy_age => 30, stay_awake => 1, needs_you => 2 });
     my ($run) = grep { $_->{title} eq 'Run' } @p;
     ok($run, 'panels: a Run panel is present');
     my $rtext = join "\n", map { Dashboard::spans_text($_) } @{ $run->{lines} };
     like($rtext, qr/busy-lease.*active/,   'run: fresh lease + stay_awake -> active');
     like($rtext, qr/keep-awake.*holding/,  'run: stay_awake -> keep-awake holding');
-    like($rtext, qr/needs you.*2 decision/,'run: needs-you count surfaced');
+    like($rtext, qr/needs you.*2 decision/,'run: escalations count surfaced');
 }
 {
     # Stale lease (stay_awake false) -> idle / released; zero decisions -> none.

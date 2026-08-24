@@ -170,10 +170,10 @@ sub make_blueprint {
         write_file("$dir/runs/.paused",        $o{paused})       if exists $o{paused};
         write_file("$dir/runs/.shutdown", '') if $o{shutdown};
         if ($o{needs_you}) {
-            make_path("$dir/runs/needs-you");
+            make_path("$dir/runs/escalations");
             for my $f (@{ $o{needs_you} }) {
-                if ($f->{is_dir}) { make_path("$dir/runs/needs-you/$f->{name}"); }
-                else              { write_file("$dir/runs/needs-you/$f->{name}", $f->{content} // '{}'); }
+                if ($f->{is_dir}) { make_path("$dir/runs/escalations/$f->{name}"); }
+                else              { write_file("$dir/runs/escalations/$f->{name}", $f->{content} // '{}'); }
             }
         }
     }
@@ -211,7 +211,7 @@ sub mirror_count_needs_you {
     opendir(my $bd, $root) or return 0;
     for my $bp (readdir $bd) {
         next if $bp eq '.' || $bp eq '..';
-        my $nd = "$root/$bp/runs/needs-you";
+        my $nd = "$root/$bp/runs/escalations";
         next unless -d $nd;
         opendir(my $d, $nd) or next;
         for my $f (readdir $d) {
@@ -1011,14 +1011,14 @@ sub can_detect_symlink {
             { name => 'a-subdir', is_dir => 1 },
         ]);
     is(field(RS('summarize_dir', $dir), 'decisions_waiting'), 3,
-        'AC-10/B25: needs-you/ with 3 plain files + a .tmp + a dotfile + a subdir -> decisions_waiting == 3');
+        'AC-10/B25: escalations/ with 3 plain files + a .tmp + a dotfile + a subdir -> decisions_waiting == 3');
 
     my $root2 = tempdir(CLEANUP => 1);
     my $dir_absent = make_blueprint($root2, 'noneedsyou', registry => registry_json());
-    is(field(RS('summarize_dir', $dir_absent), 'decisions_waiting'), 0, 'AC-10/B26: needs-you/ absent -> decisions_waiting == 0');
+    is(field(RS('summarize_dir', $dir_absent), 'decisions_waiting'), 0, 'AC-10/B26: escalations/ absent -> decisions_waiting == 0');
 
     my $dir_empty = make_blueprint($root2, 'emptyneedsyou', registry => registry_json(), needs_you => []);
-    is(field(RS('summarize_dir', $dir_empty), 'decisions_waiting'), 0, 'AC-10/B26: needs-you/ present but empty -> decisions_waiting == 0');
+    is(field(RS('summarize_dir', $dir_empty), 'decisions_waiting'), 0, 'AC-10/B26: escalations/ present but empty -> decisions_waiting == 0');
 }
 
 # ===========================================================================
@@ -1062,7 +1062,7 @@ sub can_detect_symlink {
         is(field($list->[1], 'state'), 'paused',  'AC-24/B8: mmm-second (.orchestrator+.paused) -> paused');
         is(field($list->[2], 'state'), 'running', 'AC-24/B8: zzz-third (.orchestrator only) -> running');
         is(field($list->[2], 'decisions_waiting'), 1, 'AC-24/B8: zzz-third carries its own independent decisions_waiting');
-        is(field($list->[0], 'decisions_waiting'), 0, 'AC-24/B8: aaa-first carries its own independent decisions_waiting (0, no needs-you/)');
+        is(field($list->[0], 'decisions_waiting'), 0, 'AC-24/B8: aaa-first carries its own independent decisions_waiting (0, no escalations/)');
     } else {
         fail('AC-24/B8: summarize() returned an arrayref of 3 summaries');
     }
@@ -1101,12 +1101,12 @@ sub can_detect_symlink {
         packages  => { p3 => $blocked },
         needs_you => [ { name => 'c.json', content => $live->('p3') },
                        { name => 'sub', is_dir => 1 } ]);
-    make_blueprint($root, 'x3', registry => registry_json());   # no needs-you/ at all
+    make_blueprint($root, 'x3', registry => registry_json());   # no escalations/ at all
     make_blueprint($root, 'x4-broken', registry => 'not json');   # malformed, excluded from summarize entirely
 
     my $list = RS('summarize', $root);
     my $rs_sum = is_arrayref($list) ? eval { my $t = 0; $t += ($_->{decisions_waiting} // 0) for @$list; $t } : undef;
-    my $mirror_sum = mirror_count_needs_you($root);   # deliberately includes x4-broken's needs-you/ (none here) too
+    my $mirror_sum = mirror_count_needs_you($root);   # deliberately includes x4-broken's escalations/ (none here) too
     is($mirror_sum, 3, 'AC-25: sanity -- the independent mirror of _count_needs_you counts 3 over this fixture (a,b,c; not .dot/.tmp/subdir)');
     is($rs_sum, $mirror_sum, 'AC-25: sum(decisions_waiting) across all RunState summaries equals the launcher._count_needs_you-equivalent count over the same tree');
 }
@@ -1241,7 +1241,7 @@ sub _label45 { return sprintf('%-*s : ', tui::DashboardScreen::LABEL_GUTTER(), $
 # RE-POINTED (package 06-dashboard-screen, spec S2.4.3, driver report item
 # 4). heartbeat/uptime MOVED to the front of Run (the deleted Sandbox
 # panel's rows -- see t/41-panel-semantics.t AC1), so busy-lease/
-# keep-awake/needs-you shift from Run indices 0/1/2 to 2/3/4. This also
+# keep-awake/escalations shift from Run indices 0/1/2 to 2/3/4. This also
 # means the Run panel's TOTAL line count is no longer 3 (or 4, or 7) in any
 # of the three ACs below -- every fixture in this section also carries an
 # unconditional oauth row (none of them sets $state->{tokens}), on top of
@@ -1253,7 +1253,7 @@ sub _label45 { return sprintf('%-*s : ', tui::DashboardScreen::LABEL_GUTTER(), $
 # @PINNED_RUN_LABELS itself is also re-derived via _label45()/LABEL_GUTTER()
 # rather than hand-padded: the OLD hand-typed literals ('busy-lease : ', 1
 # space before the colon) assumed the pre-package-06 Run panel's own
-# LOCAL gutter (sized to fit only busy-lease/keep-awake/needs-you); the
+# LOCAL gutter (sized to fit only busy-lease/keep-awake/escalations); the
 # NEW shared LABEL_GUTTER()==11 is wider (sized across every panel), so
 # the correct padding is now 2-3 spaces before the colon depending on the
 # label -- a fact this file must derive, never re-type.
@@ -1273,7 +1273,7 @@ my @PINNED_RUN_LABELS = ( _label45('busy-lease'), _label45('keep-awake'), _label
         ok($run, "AC-16: a Run panel is present ($label)");
         if ($run) {
             ok(defined($run->{lines}[4]),
-                "AC-16/B32: Run has a row at the needs-you position (index 4) ($label) -- re-pointed off the old exactly-3-lines count, t/41:137 non-regression");
+                "AC-16/B32: Run has a row at the escalations position (index 4) ($label) -- re-pointed off the old exactly-3-lines count, t/41:137 non-regression");
             for my $i (0 .. 2) {
                 is($run->{lines}[$i + 2][0]{text}, $PINNED_RUN_LABELS[$i],
                     "AC-16: Run line " . ($i + 2) . " (was line $i pre-package-06) label text unchanged ($label)");
@@ -1310,7 +1310,7 @@ my @PINNED_RUN_LABELS = ( _label45('busy-lease'), _label45('keep-awake'), _label
         # re-pointed to a per-row presence+content check instead of a new
         # total, for the same Decision-15 reason as AC-16.
         ok(defined($run->{lines}[4]),
-            'AC-17/B33: Run has a row at the needs-you position (index 4) -- re-pointed off the old exactly-4-lines count');
+            'AC-17/B33: Run has a row at the escalations position (index 4) -- re-pointed off the old exactly-4-lines count');
         for my $i (0 .. 2) {
             is($run->{lines}[$i + 2][0]{text}, $PINNED_RUN_LABELS[$i], "AC-17: line " . ($i + 2) . " (was line $i pre-package-06) unchanged");
         }
@@ -1322,9 +1322,9 @@ my @PINNED_RUN_LABELS = ( _label45('busy-lease'), _label45('keep-awake'), _label
             { text => '  2 coord',  role => 'accent' },
         ];
         is_deeply($run->{lines}[5], $expected_line3,
-            'AC-17/B33: the summary line (now at index 5, immediately after needs-you) is EXACTLY the S2.10 span list for this summary (decisions_waiting==0 -> no trailing "waiting" span)');
+            'AC-17/B33: the summary line (now at index 5, immediately after escalations) is EXACTLY the S2.10 span list for this summary (decisions_waiting==0 -> no trailing "waiting" span)');
     } else {
-        fail('AC-17/B33: Run has a row at the needs-you position (no Run panel)');
+        fail('AC-17/B33: Run has a row at the escalations position (no Run panel)');
         fail('AC-17/B33: summary line exact span list (no Run panel)');
     }
 }
@@ -1389,7 +1389,7 @@ my @PINNED_RUN_LABELS = ( _label45('busy-lease'), _label45('keep-awake'), _label
         # byte-identical, at the expected indices) instead of a new total,
         # for the same Decision-15 reason as AC-16/AC-17.
         is_deeply([ @{ $run->{lines} }[5 .. 8] ], \@lines,
-            'AC-21/B37: Run indices 5-8 (immediately after needs-you) are BYTE-IDENTICAL, in order, to run_lines_of(5 summaries)\'s own 4 lines (3 summaries + 1 overflow), appended verbatim');
+            'AC-21/B37: Run indices 5-8 (immediately after escalations) are BYTE-IDENTICAL, in order, to run_lines_of(5 summaries)\'s own 4 lines (3 summaries + 1 overflow), appended verbatim');
     } else {
         fail('AC-21/B37: Run indices 5-8 match run_lines_of(5 summaries) (no Run panel)');
     }

@@ -3,7 +3,7 @@
 #
 # WHAT IS BEING PROTECTED
 #
-# The dashboard's `needs you` row counted every live record in runs/needs-you/.
+# The dashboard's `needs you` row counted every live record in runs/escalations/.
 # Most of those are not the operator's: each carries a `category`, and only two
 # of the seven (product, operator-action) are ones bp-resolve.pl may never
 # decide. The rest go to the escalation resolver, which acts or re-tags them
@@ -108,7 +108,7 @@ sub write_json { my ($p, $d) = @_; open my $fh, '>:raw', $p or die $!; print {$f
 {
     my $root = tempdir(CLEANUP => 1);
     my $bp   = "$root/demo";
-    make_path("$bp/runs/needs-you");
+    make_path("$bp/runs/escalations");
     make_path("$bp/packages");
 
     # A live package, so nothing below is skipped as settled by t07's rules.
@@ -117,11 +117,11 @@ sub write_json { my ($p, $d) = @_; open my $fh, '>:raw', $p or die $!; print {$f
     close $pk;
     write_json("$bp/runs/registry.json", { packages => { p1 => { status => 'running' } } });
 
-    write_json("$bp/runs/needs-you/p1--a1.json", { package => 'p1', kind => 'reauth',    category => 'operator-action' });
-    write_json("$bp/runs/needs-you/p1--a2.json", { package => 'p1', kind => 'stuck',     category => 'product' });
-    write_json("$bp/runs/needs-you/p1--b1.json", { package => 'p1', kind => 'starved',   category => 'unclassified' });
-    write_json("$bp/runs/needs-you/p1--b2.json", { package => 'p1', kind => 'conform',   category => 'conformance' });
-    write_json("$bp/runs/needs-you/p1--b3.json", { package => 'p1', kind => 'scope',     category => 'scoping' });
+    write_json("$bp/runs/escalations/p1--a1.json", { package => 'p1', kind => 'reauth',    category => 'operator-action' });
+    write_json("$bp/runs/escalations/p1--a2.json", { package => 'p1', kind => 'stuck',     category => 'product' });
+    write_json("$bp/runs/escalations/p1--b1.json", { package => 'p1', kind => 'starved',   category => 'unclassified' });
+    write_json("$bp/runs/escalations/p1--b2.json", { package => 'p1', kind => 'conform',   category => 'conformance' });
+    write_json("$bp/runs/escalations/p1--b3.json", { package => 'p1', kind => 'scope',     category => 'scoping' });
 
     my $runs = RunState::summarize($root);
     ok(ref($runs) eq 'ARRAY' && @$runs, 'C0: summarize returned a run') or BAIL_OUT('no summary');
@@ -147,13 +147,13 @@ sub write_json { my ($p, $d) = @_; open my $fh, '>:raw', $p or die $!; print {$f
 {
     my $root = tempdir(CLEANUP => 1);
     my $bp   = "$root/quiet";
-    make_path("$bp/runs/needs-you");
+    make_path("$bp/runs/escalations");
     make_path("$bp/packages");
     open my $pk, '>:raw', "$bp/packages/p1.md" or die $!;
     print {$pk} "---\npackage: p1\nstatus: running\n---\n\n# p1\n";
     close $pk;
     write_json("$bp/runs/registry.json", { packages => { p1 => { status => 'running' } } });
-    write_json("$bp/runs/needs-you/p1--only.json", { package => 'p1', kind => 'starved', category => 'unclassified' });
+    write_json("$bp/runs/escalations/p1--only.json", { package => 'p1', kind => 'starved', category => 'unclassified' });
 
     my $runs = RunState::summarize($root);
     my ($s) = grep { ($_->{blueprint} // '') eq 'quiet' } @{ $runs || [] };
@@ -162,6 +162,55 @@ sub write_json { my ($p, $d) = @_; open my $fh, '>:raw', $p or die $!; print {$f
        'D1: a queue holding only triageable records needs the operator ZERO times — the exact '
      . 'state that used to render "needs you: 1 decision waiting"');
     is($s->{decisions_triage}, 1, 'D2: ...and the record is still counted, under triage');
+}
+
+# ---------------------------------------------------------------------------
+# D2. THE RENAME MUST NOT STRAND A LIVE QUEUE.
+#
+# runs/needs-you/ became runs/escalations/ because the old name claimed the
+# operator owns every record. Real runs have records under the old name right
+# now, and a rename that leaves them behind does not tidy anything -- it hides
+# real escalations somewhere nothing looks, which is strictly worse than a
+# confusing directory name.
+#
+# bp-orchestrator.pl MIGRATES on first use. RunState does NOT: it renders, so it
+# must never write, and it must tell the truth about a tree that has not ticked
+# since. It reads whichever directory exists.
+# ---------------------------------------------------------------------------
+{
+    my $root = tempdir(CLEANUP => 1);
+    my $bp   = "$root/legacy";
+    make_path("$bp/runs/needs-you");          # the OLD name, deliberately
+    make_path("$bp/packages");
+    open my $pk, '>:raw', "$bp/packages/p1.md" or die $!;
+    print {$pk} "---\npackage: p1\nstatus: running\n---\n\n# p1\n";
+    close $pk;
+    write_json("$bp/runs/registry.json", { packages => { p1 => { status => 'running' } } });
+    write_json("$bp/runs/needs-you/p1--old.json", { package => 'p1', kind => 'reauth', category => 'operator-action' });
+
+    my $runs = RunState::summarize($root);
+    my ($s) = grep { ($_->{blueprint} // '') eq 'legacy' } @{ $runs || [] };
+    ok($s, 'D2a: a blueprint whose queue is still under the OLD directory name is summarised')
+        or BAIL_OUT('missing');
+    is($s->{decisions_operator}, 1,
+       'D2b: its queued record is still COUNTED — the rename does not strand a live queue');
+    ok(-d "$bp/runs/needs-you",
+       'D2c: ...and RunState did not move it. This module renders; migrating is the '
+     . 'orchestrator\'s job, and a renderer that writes is a renderer that can corrupt');
+
+    # The orchestrator's side of the same contract: it DOES migrate, and the
+    # record survives the move.
+  SKIP: {
+        my $orch = "$Bin/../../../butler/scripts/bp-orchestrator.pl";
+        skip 'bp-orchestrator.pl not present', 3 unless -f $orch;
+        require $orch;
+        my $got = BpOrch::escalations_dir("$bp/runs");
+        is($got, "$bp/runs/escalations", 'D2d: escalations_dir returns the NEW path');
+        ok(-f "$bp/runs/escalations/p1--old.json",
+           'D2e: ...and the queued record moved with it, rather than being left behind');
+        ok(!-d "$bp/runs/needs-you",
+           'D2f: ...and the legacy directory is gone, so there is exactly one queue');
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -191,7 +240,7 @@ sub write_json { my ($p, $d) = @_; open my $fh, '>:raw', $p or die $!; print {$f
        'E0: the panels rendered SOMETHING -- without this, E3\'s unlike() passes on an empty '
      . 'string and asserts nothing at all');
     like($flat, qr/needs you\s+2 decisions waiting/,
-         'E1: the needs-you row renders the OPERATOR count');
+         'E1: the escalations row renders the OPERATOR count');
     like($flat, qr/in triage\s+3 escalations with the resolver/,
          'E2: the triage count renders as its own row, so nothing vanishes from the panel');
     unlike($flat, qr/needs you\s+5 decisions/,

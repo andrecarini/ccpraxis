@@ -439,13 +439,13 @@ sub _run_live {
     is(eval { Dashboard::window_title({ project_name => 'demo', container_gone => 1 }) }, '? demo',
         "AC-8: window_title(container_gone=1) eq '? demo'");
 
-    # Precedence: gone > exited > stopped > needs-you > running > fallback.
+    # Precedence: gone > exited > stopped > escalations > running > fallback.
     is(eval { Dashboard::window_title({ project_name => 'demo', status => 'running', container_gone => 1 }) }, '? demo',
         "AC-8: precedence -- container_gone=1 with status='running' -> '?' (gone beats running)");
     is(eval { Dashboard::window_title({ project_name => 'demo', status => 'exited', needs_you => 3 }) }, 'x demo',
-        "AC-8: precedence -- status='exited' with needs_you=3 -> 'x' (exited beats needs-you)");
+        "AC-8: precedence -- status='exited' with needs_you=3 -> 'x' (exited beats escalations)");
     is(eval { Dashboard::window_title({ project_name => 'demo', status => 'stopped', needs_you => 5 }) }, '- demo',
-        "AC-8: precedence -- status='stopped' with needs_you=5 -> '-' (stopped beats needs-you)");
+        "AC-8: precedence -- status='stopped' with needs_you=5 -> '-' (stopped beats escalations)");
 
     # needs_you non-numeric / negative / undef counts as 0.
     for my $nc (undef, -3, 'abc', 0) {

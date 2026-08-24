@@ -206,12 +206,12 @@ sub slurp { my ($p) = @_; open my $fh, '<:raw', $p or return undef; local $/; my
        'BQ2: _block_and_queue does NOT mirror the status into registry.json -- the ledger is the '
      . 'single authority (s02), and a mirror that can disagree with it is the defect, not the '
      . 'feature');
-    opendir(my $dh, "$runs/needs-you") or die $!;
+    opendir(my $dh, "$runs/escalations") or die $!;
     my @f = grep { /\.json$/ } readdir $dh;
     closedir $dh;
     is(scalar @f, 1, 'BQ2: exactly one decision queued');
     if (@f) {
-        my $rec = eval { JSON::PP->new->decode(slurp("$runs/needs-you/$f[0]")) };
+        my $rec = eval { JSON::PP->new->decode(slurp("$runs/escalations/$f[0]")) };
         is(ref($rec) eq 'HASH' ? $rec->{category} : undef, 'scoping',
             'BQ2: the queued decision carries category=scoping in the RIGHT slot -- a shifted 11th argument would break this specific field');
     } else {

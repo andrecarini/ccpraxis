@@ -203,11 +203,11 @@ sub _live_gutter_label { return tui::DashboardScreen::gutter($_[0]); }
 # header (S2.4.9: today's header content, unchanged); oauth -> the Token
 # panel's `access` row when $state->{tokens} is a HASH, else the Run panel
 # (S2.4.3's last conditional -- never both, never neither); heartbeat/
-# uptime -> MOVE to Run, ahead of busy-lease/keep-awake/needs-you (S2.4.3's
+# uptime -> MOVE to Run, ahead of busy-lease/keep-awake/escalations (S2.4.3's
 # stated Run body order). Per the standing rule ("an assertion may change
 # its subject; it may never lose its claim"), every assertion below keeps
 # ITS ORIGINAL CLAIM; only the panel/row/index it inspects moves. AC8
-# (Run's busy-lease/keep-awake/needs-you role table, immediately below AC7
+# (Run's busy-lease/keep-awake/escalations role table, immediately below AC7
 # in this same block) is re-indexed for the same reason: heartbeat/uptime
 # now sit ahead of it in Run, so leaving AC8's old indices [0,1,2] in place
 # would silently assert the WRONG rows once the panel dissolves -- an
@@ -428,11 +428,11 @@ sub _live_gutter_label { return tui::DashboardScreen::gutter($_[0]); }
         is($n, 2, 'AC7 non-vacuity: the frame-wide substring counter reports 2 when the same text appears in two panels');
     }
 
-    # AC8: Run panel role table across the busy-lease/keep-awake/needs-you
+    # AC8: Run panel role table across the busy-lease/keep-awake/escalations
     # tiers. RE-INDEXED from [0,1,2] to [2,3,4] and re-labeled via
     # _gutter_label(): heartbeat/uptime (always present for this %full-
     # derived fixture) now occupy Run's first two positions (see AC1
-    # above), so busy-lease/keep-awake/needs-you shift down by two. Same
+    # above), so busy-lease/keep-awake/escalations shift down by two. Same
     # claim (the role table itself), same fixture cases, only the
     # subject's location changes.
     my @run_cases = (
@@ -455,7 +455,7 @@ sub _live_gutter_label { return tui::DashboardScreen::gutter($_[0]); }
         is_deeply($rn->{lines}[3], [ { text => _gutter_label('keep-awake'), role => 'label' }, { text => $kt, role => $kr } ],
             "AC8: keep-awake line, now at Run index 3 ($tag)");
         is_deeply($rn->{lines}[4], [ { text => _gutter_label('needs you'), role => 'label' }, { text => $nt, role => $nr } ],
-            "AC8: needs-you line, now at Run index 4 ($tag)");
+            "AC8: escalations line, now at Run index 4 ($tag)");
     }
 
     # AC2 (absent branches): heartbeat/uptime fall back to 'n/a' with role

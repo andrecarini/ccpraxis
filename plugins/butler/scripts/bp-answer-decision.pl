@@ -381,7 +381,7 @@ sub supersede_package_work {
 # packages' decisions are left alone.
 sub clear_pkg_decisions {
     my ($runs, $pkg) = @_;
-    my $d = "$runs/needs-you";
+    my $d = BpOrch::escalations_dir($runs);
     return 0 unless -d $d;
     opendir my $h, $d or return 0;
     my @files = grep { /\.json$/ } readdir $h;
@@ -485,7 +485,7 @@ sub decision_live {
 # in the same archive bp-resolve.pl writes, marked with who settled it and why.
 sub sweep_settled {
     my ($runs, $bpdir, $run_over) = @_;
-    my $dir = "$runs/needs-you";
+    my $dir = BpOrch::escalations_dir($runs);
     return [] unless -d $dir;
     opendir(my $h, $dir) or return [];
     my @files = grep { /\.json$/ } readdir $h;
@@ -657,7 +657,7 @@ unless (caller) {
             }
         }
         my @recs;
-        my $dir = "$runs/needs-you";
+        my $dir = BpOrch::escalations_dir($runs);
         if (opendir my $dh, $dir) {
             for my $f (grep { /\.json$/ } readdir $dh) {
                 my $rec = BpOrch::_read_json("$dir/$f");
@@ -698,7 +698,7 @@ unless (caller) {
         $file = $decision;
         unless ($file =~ m{[\\/]}) {
             $file =~ s/\.json$//i;
-            $file = "$runs/needs-you/$file.json";
+            $file = BpOrch::escalations_dir($runs) . "/$file.json";
         }
         unless (-f $file) {
             print STDERR "bp-answer-decision: decision not found: $file\n"; exit 2;

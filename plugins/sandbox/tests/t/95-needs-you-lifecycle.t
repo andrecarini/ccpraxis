@@ -6,7 +6,7 @@
 # needs my attention?"
 #
 # COUNTING FILES IN A DIRECTORY IS NOT A LIFECYCLE. Eight scripts write into
-# runs/needs-you/ and exactly ONE narrow path cleared them -- and only for a
+# runs/escalations/ and exactly ONE narrow path cleared them -- and only for a
 # direct package reset. A package that simply finished, or a run that simply
 # ended, left its question queued forever and the panel kept asking.
 #
@@ -38,7 +38,7 @@ sub mkfix {
     my (%o) = @_;
     my $root = tempdir(CLEANUP => 1);
     my $bp   = "$root/bp";
-    make_path("$bp/packages", "$bp/runs/needs-you");
+    make_path("$bp/packages", "$bp/runs/escalations");
 
     for my $p (@{ $o{pkgs} || [] }) {
         open(my $f, '>', "$bp/packages/$p->{name}.md") or die $!;
@@ -46,7 +46,7 @@ sub mkfix {
         close $f;
     }
     for my $d (@{ $o{decisions} || [] }) {
-        open(my $f, '>', "$bp/runs/needs-you/$d->{file}") or die $!;
+        open(my $f, '>', "$bp/runs/escalations/$d->{file}") or die $!;
         print {$f} (defined $d->{raw} ? $d->{raw} : JSON::PP->new->encode($d->{rec} || {}));
         close $f;
     }
@@ -246,7 +246,7 @@ SKIP: {
             pkgs => (defined $status ? [ { name => 'p1', status => $status } ] : []));
 
         my $sandbox = RunState::decision_live(
-            (ref($rec) eq 'HASH' ? $rec : $rec), $bp, "$bp/runs/needs-you", $run_over) ? 1 : 0;
+            (ref($rec) eq 'HASH' ? $rec : $rec), $bp, "$bp/runs/escalations", $run_over) ? 1 : 0;
 
         # The butler copy is exercised out of process -- requiring that script
         # here would pull in its whole CLI. A tiny driver keeps this test from

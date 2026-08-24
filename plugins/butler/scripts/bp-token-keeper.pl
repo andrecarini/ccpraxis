@@ -279,7 +279,7 @@ sub keeper_tick {
         # the signal to revisit the copy-token architecture. Emit a DISTINCT,
         # high-visibility event (token_unauthorized + alert=1) — never let this
         # blend into a quiet pause — and return the detail up to the
-        # orchestrator so the queued needs-you decision can name it unmistakably.
+        # orchestrator so the queued escalations decision can name it unmistakably.
         my $alert = "ALERT: the sandbox's OWN OAuth refresh was REJECTED (HTTP $status). "
                   . "The copied token may be invalid OR the host/sandbox token grants have "
                   . "DIVERGED -- this is NOT a routine /login expiry. Revisit the copy-token "

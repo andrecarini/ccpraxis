@@ -110,7 +110,7 @@ sub run_once {
 sub slurp { local $/; open my $f,'<',shift or return ''; <$f> }
 sub reg_of { my $d=shift; my $r=BpOrch::read_registry("$d/runs"); $r }
 sub needs_you {
-    my $d = shift."/runs/needs-you";
+    my $d = shift."/runs/escalations";
     return () unless -d $d;
     opendir my $h, $d or return ();
     my @j = map { JSON::PP->new->decode(slurp("$d/$_")) } grep { /\.json$/ } readdir $h;

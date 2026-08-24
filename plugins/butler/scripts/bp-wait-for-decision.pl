@@ -452,7 +452,7 @@ unless (caller) {
     }
 
     my $res = BpWait::wait_loop({
-        dir     => "$runs/needs-you",
+        dir     => BpOrch::escalations_dir($runs),
         seen    => BpWait::parse_seen($seen_csv),
         timeout => (defined $timeout ? $timeout + 0 : 0),
         poll    => (defined $poll ? $poll + 0 : undef),

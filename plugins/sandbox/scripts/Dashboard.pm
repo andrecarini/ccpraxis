@@ -673,7 +673,7 @@ sub spinner_frame {
 # needs_you; any other key is ignored. $state undef/non-hashref -> {}.
 # Reuses container_status_style as the sole status vocabulary (S2.3): no
 # status word is re-listed here. Precedence: gone > exited > stopped >
-# needs-you > running > fallback. PUBLIC, pure, total. Guaranteed to match
+# escalations > running > fallback. PUBLIC, pure, total. Guaranteed to match
 # /\A[\x20-\x7E]{1,80}\z/ for any input.
 sub window_title {
     my ($state) = @_;

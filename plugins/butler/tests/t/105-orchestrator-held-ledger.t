@@ -222,7 +222,7 @@ sub log_events {
 # the first tick (or any automated watcher) can find out why nothing is
 # progressing. Run several MORE ticks than AC-13/14 with the ledger NEVER
 # appearing (a genuinely permanent hold, not one that resolves on tick 2),
-# then look for an artefact under runs/needs-you/ -- the one surface this
+# then look for an artefact under runs/escalations/ -- the one surface this
 # codebase already uses for "an operator needs to look at this"
 # (queue_needs_you, bp-orchestrator.pl:1347). Today nothing ever calls
 # queue_needs_you for a ledger_missing hold, so this directory stays empty
@@ -269,19 +269,19 @@ sub log_events {
     for (1 .. 10) { BpOrch::run({ %run_opts }); }
 
     my @needs_you_files;
-    if (opendir(my $dh, "$dir/runs/needs-you")) {
+    if (opendir(my $dh, "$dir/runs/escalations")) {
         @needs_you_files = grep { /\.json$/ } readdir $dh;
         closedir $dh;
     }
     my $found;
     for my $f (@needs_you_files) {
-        my $rec = eval { $J->decode(read_file("$dir/runs/needs-you/$f")) };
+        my $rec = eval { $J->decode(read_file("$dir/runs/escalations/$f")) };
         next unless ref $rec eq 'HASH';
         $found = $rec if (($rec->{package} // '') eq 'pkgheld');
     }
     ok(defined $found,
-        'ORACLE-GAP(MAJOR-4): after 10 ticks of a permanent ledger_missing hold, SOME operator-visible signal exists under runs/needs-you/ for the held package')
-        or diag('needs-you dir listing: ' . join(',', @needs_you_files) . '; the only artefact today is a single deduped awaiting_ledger JSONL line nothing reads');
+        'ORACLE-GAP(MAJOR-4): after 10 ticks of a permanent ledger_missing hold, SOME operator-visible signal exists under runs/escalations/ for the held package')
+        or diag('escalations dir listing: ' . join(',', @needs_you_files) . '; the only artefact today is a single deduped awaiting_ledger JSONL line nothing reads');
 }
 
 # =============================================================================

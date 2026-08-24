@@ -88,7 +88,7 @@ sub run_once {
 }
 
 sub slurp { local $/; open my $f,'<',shift or return ''; <$f> }
-sub needs_you_count { my $d=shift."/runs/needs-you"; return 0 unless -d $d; opendir my $h,$d; my @j=grep{/\.json$/}readdir $h; closedir $h; scalar @j }
+sub needs_you_count { my $d=shift."/runs/escalations"; return 0 unless -d $d; opendir my $h,$d; my @j=grep{/\.json$/}readdir $h; closedir $h; scalar @j }
 
 # --- S1: crashed coordinator (dead pid, attempt>0, ledger still 'pending') -> warm relaunch
 {
@@ -126,7 +126,7 @@ sub needs_you_count { my $d=shift."/runs/needs-you"; return 0 unless -d $d; open
     my $l = run_once($dir);
     is(scalar @$l, 0, 'S2 loop-guard: no relaunch past the cap');
     like(slurp("$dir/packages/solo.md"), qr/^status:\s*blocked/m, 'S2 loop-guard: ledger marked blocked');
-    is(needs_you_count($dir), 1, 'S2 loop-guard: a needs-you decision queued');
+    is(needs_you_count($dir), 1, 'S2 loop-guard: a escalations decision queued');
     like(slurp("$dir/runs/orchestrator.log"), qr/watchdog_block/, 'S2 loop-guard: logged watchdog_block');
 }
 
@@ -168,7 +168,7 @@ sub needs_you_count { my $d=shift."/runs/needs-you"; return 0 unless -d $d; open
     is(scalar @$l, 0, 'S6 contract-drift: nothing launched');
     my $p = BpOrch::read_paused("$dir/runs");
     ok($p && $p->{manual}, 'S6 contract-drift: manual (no auto-resume) pause');
-    is(needs_you_count($dir), 1, 'S6 contract-drift: a needs-you decision queued');
+    is(needs_you_count($dir), 1, 'S6 contract-drift: a escalations decision queued');
 }
 
 # --- S7: fleet shutdown signal -> no launch, clean wind-down

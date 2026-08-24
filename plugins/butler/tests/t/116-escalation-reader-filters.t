@@ -78,7 +78,7 @@ sub run_answer_cli {
 # record (no key at all) -- never defaulted (spec §2.6).
 {
     my $root = tempdir(CLEANUP => 1);
-    my $dir  = "$root/needs-you";
+    my $dir  = "$root/escalations";
     make_path($dir);
     write_file("$dir/cat--aa11.json",
         $J->encode({ package=>'cat', blueprint=>'bp', kind=>'stuck-package',
@@ -159,7 +159,7 @@ sub run_answer_cli {
 # F5: CLI --category flag, comma-separated (spec §2.6/observable behavior 4).
 {
     my $root = tempdir(CLEANUP => 1);
-    my $dir  = "$root/needs-you";
+    my $dir  = "$root/escalations";
     make_path($dir);
     write_file("$dir/op--1.json",
         $J->encode({ package=>'op', blueprint=>'bp', kind=>'reauth', question=>'?', context=>'', created_at=>1, category=>'operational' }));
@@ -195,10 +195,10 @@ sub run_answer_cli {
 sub mk_answer_bp {
     my (%recs) = @_;   # id => { package, kind, category(optional), question, created_at }
     my $bpdir = tempdir(CLEANUP => 1);
-    make_path("$bpdir/runs/needs-you");
+    make_path("$bpdir/runs/escalations");
     for my $id (keys %recs) {
         my $r = $recs{$id};
-        write_file("$bpdir/runs/needs-you/$id.json", $J->encode({
+        write_file("$bpdir/runs/escalations/$id.json", $J->encode({
             package => $r->{package}, blueprint => 'bp', kind => $r->{kind},
             question => $r->{question} // '?', context => $r->{context} // '',
             created_at => $r->{created_at},
@@ -216,7 +216,7 @@ sub mk_answer_bp {
         'beta--2'  => { package=>'beta',  kind=>'harvest-failure', category=>'oracle',       created_at=>10 },
         'gamma--3' => { package=>'gamma', kind=>'stuck-package',   created_at=>30 },   # legacy, no category
     );
-    my $before = { map { $_ => slurp("$bpdir/runs/needs-you/$_") }
+    my $before = { map { $_ => slurp("$bpdir/runs/escalations/$_") }
                    map { s/\.json$//r } glob_needs_you($bpdir) };
 
     # G1: --list with no --category -> every record, including legacy, sorted
@@ -241,14 +241,14 @@ sub mk_answer_bp {
         'G2: the legacy record (gamma, no category) does NOT appear under any --category filter');
 
     # G3: --list mutates nothing on disk (spec §2.7 "Mutates nothing").
-    my $after = { map { $_ => slurp("$bpdir/runs/needs-you/$_") }
+    my $after = { map { $_ => slurp("$bpdir/runs/escalations/$_") }
                   map { s/\.json$//r } glob_needs_you($bpdir) };
     is_deeply($after, $before, 'G3: --list left every queued decision file byte-identical (mutates nothing)');
 }
 
 sub glob_needs_you {
     my ($bpdir) = @_;
-    my $dir = "$bpdir/runs/needs-you";
+    my $dir = "$bpdir/runs/escalations";
     opendir my $dh, $dir or return ();
     my @f = grep { /\.json$/ } readdir $dh;
     closedir $dh;
@@ -292,8 +292,8 @@ sub glob_needs_you {
 # pseudo-package answerability NOT fixed here, e04's job).
 {
     my $bpdir = tempdir(CLEANUP => 1);
-    make_path("$bpdir/runs/needs-you");
-    write_file("$bpdir/runs/needs-you/_dag--x1.json", $J->encode({
+    make_path("$bpdir/runs/escalations");
+    write_file("$bpdir/runs/escalations/_dag--x1.json", $J->encode({
         package => '_dag', blueprint => 'bp', kind => 'dag-stalled',
         question => 'The dependency graph cannot progress.', context => {}, created_at => 1,
         category => 'scoping',

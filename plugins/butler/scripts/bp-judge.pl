@@ -155,7 +155,7 @@ sub normalize_harvest {
 #   non-pass, under corrective cap    -> reopen   (relaunch the package NON-terminal
 #                                                  with the audit's specific failures
 #                                                  as corrective context; one cycle)
-#   non-pass, corrective cap exhausted-> park     (queue a needs-you alarm)
+#   non-pass, corrective cap exhausted-> park     (queue a escalations alarm)
 # Park-don't-halt (#13) + demote-don't-panic (#12): a failed audit never auto-kills
 # live dependents — the orchestrator flags them for re-verification, the loop keeps
 # independent work running. corrective_cap default 1 (a single corrective cycle).

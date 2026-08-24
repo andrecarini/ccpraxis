@@ -75,8 +75,14 @@ DECISION_FILE=""
 if [ "$KIND" = escalation-resolve ]; then
   DECISION_ID=$(tr -d '\r\n' < "$BPDIR/runs/escalation-resolve/$PKG.decision" 2>/dev/null || true)
   [ -n "$DECISION_ID" ] || { echo "bp-judge: no decision id at $BPDIR/runs/escalation-resolve/$PKG.decision" >&2; exit 1; }
-  DECISION_FILE="$BPDIR/runs/needs-you/$DECISION_ID.json"
-  [ -f "$DECISION_FILE" ] || { echo "bp-judge: decision record missing at $DECISION_FILE" >&2; exit 1; }
+  # The queue was renamed needs-you -> escalations (the old name asserted the
+  # operator owns every record; most are resolver-owned). bp-orchestrator.pl
+  # migrates the directory on first use, but this script can run against a tree
+  # that has not ticked since, so read whichever exists rather than assuming the
+  # migration has already happened.
+  DECISION_FILE="$BPDIR/runs/escalations/$DECISION_ID.json"
+  [ -f "$DECISION_FILE" ] || DECISION_FILE="$BPDIR/runs/needs-you/$DECISION_ID.json"
+  [ -f "$DECISION_FILE" ] || { echo "bp-judge: decision record missing at $BPDIR/runs/escalations/$DECISION_ID.json" >&2; exit 1; }
 fi
 
 WRITE_SET=$([ -f "$LEDGER" ] && fm_get "$LEDGER" write_set || echo "")

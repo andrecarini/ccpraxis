@@ -68,7 +68,7 @@ sub log_events {
 }
 sub needs_you_files {
     my ($runs) = @_;
-    my $dir = "$runs/needs-you";
+    my $dir = "$runs/escalations";
     return () unless -d $dir;
     opendir my $dh, $dir or return ();
     my @j = sort grep { /\.json$/ } readdir $dh;
@@ -152,7 +152,7 @@ sub mk_ledger_bp {
     };
     ok(!$@, 'B1: queue_needs_you does not die on a missing category') or diag($@);
     ok(!$ret, 'B1: queue_needs_you returns falsy when category is missing (AC1: required, no default)');
-    ok(!-d "$runs/needs-you", 'B1: needs-you/ was never created -- the check runs before mkdir (spec §2.3 ordering)');
+    ok(!-d "$runs/escalations", 'B1: escalations/ was never created -- the check runs before mkdir (spec §2.3 ordering)');
     my @ev = grep { ($_->{type} // '') eq 'escalation_category_invalid' } log_events("$runs/orchestrator.log");
     is(scalar @ev, 1, 'B1: exactly one escalation_category_invalid log line');
     is($ev[0]{package}, 'A1', 'B1: log names the package');
@@ -168,8 +168,8 @@ sub mk_ledger_bp {
         question => 'q?', context => 'c', created_at => 100, category => 'not-a-real-category',
     });
     ok(!$ret, 'B2: an unrecognised category value is refused (AC3)');
-    ok(!-d "$runs/needs-you" || !(grep { 1 } needs_you_files($runs)),
-        'B2: no needs-you file exists after an unrecognised-category call');
+    ok(!-d "$runs/escalations" || !(grep { 1 } needs_you_files($runs)),
+        'B2: no escalations file exists after an unrecognised-category call');
     my @ev = grep { ($_->{type} // '') eq 'escalation_category_invalid' } log_events("$runs/orchestrator.log");
     is(scalar @ev, 1, 'B2: logged once');
     is($ev[0]{category}, 'not-a-real-category', 'B2: log records the ACTUAL bad value (not "missing")');
@@ -198,7 +198,7 @@ sub mk_ledger_bp {
     ok(!$ret2, 'B3: a same-(package,kind) call with a missing category is STILL refused, not deduped through');
     my @after = needs_you_files($runs);
     is_deeply(\@after, \@before, 'B3: dedupe path did not create/alter any file for the bad call');
-    my $rec = $J->decode(slurp("$runs/needs-you/$before[0]"));
+    my $rec = $J->decode(slurp("$runs/escalations/$before[0]"));
     is($rec->{question}, 'first', 'B3: the original valid record is untouched by the refused duplicate attempt');
     my @ev = grep { ($_->{type} // '') eq 'escalation_category_invalid' } log_events("$runs/orchestrator.log");
     is(scalar @ev, 1, 'B3: the refusal was logged despite the (package,kind) collision with an existing file');
@@ -245,7 +245,7 @@ sub mk_ledger_bp {
     };
     ok($ret, 'C1: _enter_pause_manual does not die on a missing category') or diag($@);
     is(BpOrch::read_paused($runs), undef, 'C1: .paused was NOT written (no partial trace)');
-    ok(!(grep { 1 } needs_you_files($runs)), 'C1: no needs-you decision was filed either');
+    ok(!(grep { 1 } needs_you_files($runs)), 'C1: no escalations decision was filed either');
     my @ev = grep { ($_->{type} // '') eq 'escalation_category_invalid' } log_events($log);
     is(scalar @ev, 1, 'C1: the refusal was logged');
 }
@@ -258,7 +258,7 @@ sub mk_ledger_bp {
         { package => '_fleet', blueprint => 'bp', kind => 'reauth',
           question => 're-login', context => 'floor', created_at => 10, category => 'bogus' });
     is(BpOrch::read_paused($runs), undef, 'C2: .paused was NOT written for an unrecognised category');
-    ok(!(grep { 1 } needs_you_files($runs)), 'C2: no needs-you decision was filed');
+    ok(!(grep { 1 } needs_you_files($runs)), 'C2: no escalations decision was filed');
     my @ev = grep { ($_->{type} // '') eq 'escalation_category_invalid' } log_events($log);
     is(scalar @ev, 1, 'C2: logged once, naming the bad value');
     is($ev[0]{category}, 'bogus', 'C2: log records the actual bad value');
@@ -288,7 +288,7 @@ sub mk_ledger_bp {
     ok(BpOrch::read_paused($runs), 'C4: .paused written on a valid category');
     my @f = needs_you_files($runs);
     is(scalar @f, 1, 'C4: exactly one decision filed');
-    my $rec = $J->decode(slurp("$runs/needs-you/$f[0]"));
+    my $rec = $J->decode(slurp("$runs/escalations/$f[0]"));
     # The fixture deliberately passes the LEGACY spelling, so this is now two
     # assertions in one: the category still round-trips to the record, AND it is
     # canonicalised on the way. Exactly one spelling ever reaches disk, which is
@@ -321,7 +321,7 @@ sub mk_ledger_bp {
     is(ledger_status($bpdir, $pkg), 'pending', 'D1: the ledger status: line is UNCHANGED (still pending, never blocked)');
     my $reg = read_registry($bpdir);
     isnt(($reg->{packages}{$pkg}{status} // ''), 'blocked', 'D1: the registry was NOT flipped to blocked');
-    ok(!(grep { 1 } needs_you_files($runs)), 'D1: no needs-you decision was queued');
+    ok(!(grep { 1 } needs_you_files($runs)), 'D1: no escalations decision was queued');
     my @ev = grep { ($_->{type} // '') eq 'escalation_category_invalid' } log_events($log);
     is(scalar @ev, 1, 'D1: the refusal was logged (this is the exact no-partial-trace guarantee, spec §2.3/§5)');
 }
@@ -353,7 +353,7 @@ sub mk_ledger_bp {
     is(($reg->{packages}{$pkg}{status} // ''), '', 'D3: valid category -- registry entry carries no status key (s02: status removed from _block_and_queue; ledger at :324 is the sole authority)');
     my @f = needs_you_files($runs);
     is(scalar @f, 1, 'D3: exactly one decision queued');
-    my $rec = $J->decode(slurp("$runs/needs-you/$f[0]"));
+    my $rec = $J->decode(slurp("$runs/escalations/$f[0]"));
     is($rec->{category}, 'scoping', 'D3: the queued decision carries the passed category');
 }
 

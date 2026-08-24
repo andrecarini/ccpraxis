@@ -405,7 +405,7 @@ sub go {
 
 sub decisions {
     my ($dir) = @_;
-    my $d = "$dir/runs/needs-you";
+    my $d = "$dir/runs/escalations";
     return () unless -d $d;
     opendir my $h, $d or return ();
     my @f = sort grep { /\.json$/ } readdir $h;
@@ -482,7 +482,7 @@ my $PIPE_2 = "## Pipeline\n- [x] a\n- [x] b\n";
     like($reason, qr/broken-env/, 'AC-2 the pause reason names broken-env');
 
     my @all = decisions($dir);
-    is(scalar @all, 1, 'AC-2 exactly ONE needs-you decision filed by the trip');
+    is(scalar @all, 1, 'AC-2 exactly ONE escalations decision filed by the trip');
     my $o = @all ? $all[0]{obj} : {};
     is(($o->{kind}    // ''), 'broken-env', 'AC-2 decision kind is broken-env');
     is(($o->{package} // ''), '_fleet',     'AC-2 decision package is the literal string _fleet');
@@ -828,7 +828,7 @@ my $PIPE_2 = "## Pipeline\n- [x] a\n- [x] b\n";
     ok(!$types{turn_exhausted_no_progress}, 'AC-26 no turn_exhausted_no_progress event on a normal run');
     ok(!$types{registry_update_lost},       'AC-26 no registry_update_lost event on a normal run');
     my @d = decisions($dir);
-    is(scalar @d, 0, 'AC-26 no needs-you decisions on a normal run');
+    is(scalar @d, 0, 'AC-26 no escalations decisions on a normal run');
     ok(!-e "$dir/runs/.paused", 'AC-26 no pause on a normal run');
     my $r = reg_of($dir, 'norm');
     is((exists $r->{turn_continuations}  ? 'PRESENT' : 'ABSENT'), 'ABSENT', 'AC-26 turn_continuations not written on a normal run');

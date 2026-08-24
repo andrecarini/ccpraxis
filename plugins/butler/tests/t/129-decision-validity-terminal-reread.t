@@ -21,9 +21,9 @@
 #
 # VACUITY GUARDS:
 #   - every refusal assertion pairs `ret` falsy with "no file appears in
-#     needs-you/" AND a write_guard log-line check -- an implementation that
+#     escalations/" AND a write_guard log-line check -- an implementation that
 #     returns 0 without actually refusing the write (e.g. a bug that logs
-#     nothing) is still caught by the needs-you/ emptiness check.
+#     nothing) is still caught by the escalations/ emptiness check.
 #   - a POSITIVE control per kind (status=pending, same kind) proves the gate
 #     is not simply refusing everything -- pairs with the negative case so a
 #     "refuse unconditionally" bug fails the control instead of hiding behind
@@ -63,7 +63,7 @@ sub log_events {
 }
 sub needs_you_files {
     my ($runs) = @_;
-    my $dir = "$runs/needs-you";
+    my $dir = "$runs/escalations";
     return () unless -d $dir;
     opendir my $dh, $dir or return ();
     my @j = sort grep { /\.json$/ } readdir $dh;
@@ -117,7 +117,7 @@ for my $kind (@NEW_KINDS) {
           created_at => 10 + $n, category => 'operational' },
         $bpdir);
     ok(!$ret, "AC3/neg: $kind refused when the re-read status is already 'done' (fails today: default-permit)");
-    is_deeply([needs_you_files($runs)], [], "AC3/neg: $kind -- no decision file appears in needs-you/");
+    is_deeply([needs_you_files($runs)], [], "AC3/neg: $kind -- no decision file appears in escalations/");
     my @wg = grep { ($_->{type} // '') eq 'write_guard' } log_events("$runs/orchestrator.log");
     ok((grep { ($_->{outcome} // '') eq 'refused' } @wg) >= 1,
         "AC3/neg: $kind -- a write_guard 'refused' log line is emitted");

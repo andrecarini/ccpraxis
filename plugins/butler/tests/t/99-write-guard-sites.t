@@ -180,8 +180,8 @@ sub run_answer_cli {
 }
 {
     my ($bpdir, $pkg) = mk_answer_bp(status => 'blocked', registry => { status => 'blocked', pid => $$ });   # alive: our own pid
-    make_path("$bpdir/runs/needs-you");
-    my $decfile = "$bpdir/runs/needs-you/$pkg--abc.json";
+    make_path("$bpdir/runs/escalations");
+    my $decfile = "$bpdir/runs/escalations/$pkg--abc.json";
     write_file($decfile, $J->encode({ package => $pkg, blueprint => 'bp', kind => 'stuck-package',
         question => 'q', context => 'c', created_at => 10 }));
     my $before = slurp("$bpdir/packages/$pkg.md");
@@ -204,23 +204,23 @@ sub run_answer_cli {
     is($rc, 0, 'S1/AC9/behavior14: --action reset proceeds and exits 0 despite an alive coordinator pid');
 }
 {
-    # behavior16: a refused answer leaves runs/needs-you/ entirely unchanged.
+    # behavior16: a refused answer leaves runs/escalations/ entirely unchanged.
     my ($bpdir, $pkg) = mk_answer_bp(status => 'blocked', registry => { status => 'blocked', pid => $$ });
-    make_path("$bpdir/runs/needs-you");
-    my $decfile = "$bpdir/runs/needs-you/$pkg--xyz.json";
+    make_path("$bpdir/runs/escalations");
+    my $decfile = "$bpdir/runs/escalations/$pkg--xyz.json";
     write_file($decfile, $J->encode({ package => $pkg, blueprint => 'bp', kind => 'stuck-package',
         question => 'q', context => 'c', created_at => 10 }));
     run_answer_cli($bpdir, '--decision', "$pkg--xyz", '--action', 'accept');
-    opendir my $dh, "$bpdir/runs/needs-you" or die;
+    opendir my $dh, "$bpdir/runs/escalations" or die;
     my @files = sort grep { !/^\./ } readdir $dh;
     closedir $dh;
-    is_deeply(\@files, ["$pkg--xyz.json"], 'S1/AC9/behavior16: runs/needs-you/ unchanged after a refused answer');
+    is_deeply(\@files, ["$pkg--xyz.json"], 'S1/AC9/behavior16: runs/escalations/ unchanged after a refused answer');
 }
 {
     # dead pid -> today's write proceeds, and the ledger status/read-back is honoured (AC10/behavior15/30).
     my ($bpdir, $pkg) = mk_answer_bp(status => 'blocked', registry => { status => 'blocked', pid => $DEAD });
-    make_path("$bpdir/runs/needs-you");
-    my $decfile = "$bpdir/runs/needs-you/$pkg--dd1.json";
+    make_path("$bpdir/runs/escalations");
+    my $decfile = "$bpdir/runs/escalations/$pkg--dd1.json";
     write_file($decfile, $J->encode({ package => $pkg, blueprint => 'bp', kind => 'stuck-package',
         question => 'q', context => 'c', created_at => 10 }));
     my ($rc, $out) = run_answer_cli($bpdir, '--decision', "$pkg--dd1", '--action', 'accept');
@@ -248,8 +248,8 @@ sub run_answer_cli {
         { package => $pkg, blueprint => 'bp', kind => 'stuck-package', question => 'q', context => 'c', created_at => 10, category => 'unclassified' },
         $bpdir);
     is($ret, 0, 'S2/AC11/behavior17-18: stuck-package refused once the re-read (under the ledger lock) finds status done');
-    my @files = glob("$runs/needs-you/*.json");
-    is(scalar(@files), 0, 'S2/AC11: no decision file appears in runs/needs-you/');
+    my @files = glob("$runs/escalations/*.json");
+    is(scalar(@files), 0, 'S2/AC11: no decision file appears in runs/escalations/');
     like(slurp("$runs/orchestrator.log"), qr/"type":"write_guard"/,
         'S2/AC11: a write_guard log event is emitted for the refusal');
 }
@@ -268,7 +268,7 @@ sub run_answer_cli {
         { package => $pkg, blueprint => 'bp', kind => 'totally-unlisted-kind', question => 'q', context => 'c', created_at => 11, category => 'unclassified' },
         $bpdir);
     ok($ret, 'S2/AC12/behavior19: an unlisted kind still queues no matter the re-read status');
-    my @f19 = glob("$runs/needs-you/*.json");
+    my @f19 = glob("$runs/escalations/*.json");
     is(scalar(@f19), 1, 'S2/AC12/behavior19: exactly one decision file for this fixture');
 }
 for my $kind (qw(judge-starved judge-fail harvest-failure)) {
@@ -320,7 +320,7 @@ for my $st (qw(blocked parked)) {
         { package => $pkg, blueprint => 'bp', kind => 'stuck-package', question => 'q', context => 'c', created_at => 16, category => 'unclassified' },
         $bpdir);
     is($ret2, $ret1, 'S2/AC12/behavior23: a repeat (package,kind) call returns the SAME existing path');
-    my @f23 = glob("$runs/needs-you/*.json");
+    my @f23 = glob("$runs/escalations/*.json");
     is(scalar(@f23), 1, 'S2/AC12/behavior23: dedupe still short-circuits -- only one file total');
 }
 {
@@ -386,7 +386,7 @@ sub run_once {
 }
 sub reg_of { my $d = shift; BpOrch::read_registry("$d/runs") }
 sub needs_you {
-    my $d = shift . '/runs/needs-you';
+    my $d = shift . '/runs/escalations';
     return () unless -d $d;
     opendir my $h, $d;
     my @j = map { eval { $J->decode(slurp("$d/$_")) } } grep { /\.json$/ } readdir $h;
@@ -507,7 +507,7 @@ sub bump_last_updated {
         { package => $pkg, blueprint => 'bp', kind => 'stuck-package', question => 'q', context => 'c', created_at => 20, category => 'unclassified' },
         $bpdir);
     ok(!$ret, 'AC16 channel 1: falsy return on refusal');
-    my @f16 = glob("$runs/needs-you/*.json");
+    my @f16 = glob("$runs/escalations/*.json");
     is(scalar(@f16), 0, 'AC16 channel 2: no decision file (the site\'s own signalling channel)');
     like(slurp("$runs/orchestrator.log"), qr/"type":"write_guard"/, 'AC16 channel 3: a write_guard log event is present');
 }

@@ -139,7 +139,7 @@ sub file_decision {
     return ($id, $path, $filed);
 }
 
-sub decision_path { my ($runs, $id) = @_; return "$runs/needs-you/$id.json"; }
+sub decision_path { my ($runs, $id) = @_; return "$runs/escalations/$id.json"; }
 sub archive_path  { my ($runs, $id) = @_; return "$runs/resolved-escalations/$id.json"; }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -422,7 +422,7 @@ run_group('A7 (HIGHEST-VALUE #2: positive marker distinguishes resolver from ope
     # unlink, no archive at all -- exactly what bp-answer-decision.pl already does.
     my ($id_h, $path_h, $filed_h) = file_decision($runs, pkg => $pkg, kind => 'stuck-package', category => 'oracle', question => 'q-human');
     unlink $path_h;
-    ok(!-f decision_path($runs, $id_h), 'A7 setup: the human-answered decision is gone from needs-you/');
+    ok(!-f decision_path($runs, $id_h), 'A7 setup: the human-answered decision is gone from escalations/');
     ok(!-f archive_path($runs, $id_h), 'A7: a human-answered decision has NO archive entry -- absence is the signal for a human answer, presence (with the positive marker) is the signal for the resolver');
 });
 
@@ -441,7 +441,7 @@ run_group('D (AC6: bp-resolve.pl --digest)', sub {
     die "bp-resolve.pl does not exist -- cannot exec its CLI" unless -f $RESOLVE_SCRIPT;
     my $bpdir = tempdir(CLEANUP => 1);
     make_path("$bpdir/runs/resolved-escalations");
-    make_path("$bpdir/runs/needs-you");
+    make_path("$bpdir/runs/escalations");
     my %rec1 = ( original => { package => 'alpha', kind => 'stuck-package', question => 'q1', category => 'oracle' },
                  resolved_by => 'bp-escalation-resolver', action => 'relaunch', rationale => 'r1',
                  confidence => 'high', evidence => 'e1', resolved_at => 1000, applied => JSON::PP::true );
@@ -451,12 +451,12 @@ run_group('D (AC6: bp-resolve.pl --digest)', sub {
     write_file("$bpdir/runs/resolved-escalations/alpha--r1.json", $J->encode(\%rec1));
     write_file("$bpdir/runs/resolved-escalations/beta--r2.json",  $J->encode(\%rec2));
     # A still-queued decision that must NOT appear in the digest.
-    write_file("$bpdir/runs/needs-you/gamma--q1.json",
+    write_file("$bpdir/runs/escalations/gamma--q1.json",
         $J->encode({ package => 'gamma', kind => 'stuck-package', question => 'still queued', category => 'implementation', created_at => 999 }));
 
     my $before_alpha = slurp("$bpdir/runs/resolved-escalations/alpha--r1.json");
     my $before_beta  = slurp("$bpdir/runs/resolved-escalations/beta--r2.json");
-    my $before_gamma = slurp("$bpdir/runs/needs-you/gamma--q1.json");
+    my $before_gamma = slurp("$bpdir/runs/escalations/gamma--q1.json");
 
     my ($rc, $out) = run_resolve_cli('bp', '--digest', '--bp-dir', $bpdir);
     is($rc, 0, 'D1: --digest exits 0');
@@ -471,7 +471,7 @@ run_group('D (AC6: bp-resolve.pl --digest)', sub {
 
     is(slurp("$bpdir/runs/resolved-escalations/alpha--r1.json"), $before_alpha, 'D4: --digest left the alpha archive byte-identical (read-only)');
     is(slurp("$bpdir/runs/resolved-escalations/beta--r2.json"),  $before_beta,  'D4: --digest left the beta archive byte-identical');
-    is(slurp("$bpdir/runs/needs-you/gamma--q1.json"), $before_gamma, 'D4: --digest left the still-queued record byte-identical too');
+    is(slurp("$bpdir/runs/escalations/gamma--q1.json"), $before_gamma, 'D4: --digest left the still-queued record byte-identical too');
 
     my ($rc2, $out2) = run_resolve_cli('bp', '--digest', '--bp-dir', $bpdir);
     is($rc2, 0, 'D5: a REPEAT invocation also exits 0');

@@ -25,7 +25,7 @@ Known gap, not a regression: `bp-status.sh` itself is out of s04-lifecycle-deriv
 Then summarize for the user, and recommend concretely:
 
 - ✅ `done` rows → the deterministic orchestrator harvests + launches dependents itself; just report progress (no manual harvest loop).
-- ⛔ `blocked` / ⏸ `parked` → read those ledgers' Escalation sections only, and check `runs/needs-you/` for queued decisions; present them, batched. To answer and unblock, point the user to `/butler:reporter $0`.
+- ⛔ `blocked` / ⏸ `parked` → read those ledgers' Escalation sections only, and check `runs/escalations/` for queued decisions; present them, batched. To answer and unblock, point the user to `/butler:reporter $0`.
 - A run that should be live but isn't (no `runs/.orchestrator` marker, dead coordinators, non-terminal ledgers) → offer `/butler:dispatch-fleet $0` (sandbox) or `/butler:drive-solo $0` (host/single-session). Both are start-or-continue and recover interrupted work automatically.
 - Pending packages whose dependencies are met → same: `dispatch-fleet` / `drive-solo` picks them up; there is no separate launch/resume verb.
 

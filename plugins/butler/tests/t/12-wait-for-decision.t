@@ -1,6 +1,6 @@
 #!/usr/bin/env perl
 # A7 watcher: bp-wait-for-decision.pl — the reporter's token-free blocking watcher
-# over runs/needs-you/. Part 1 exhausts the pure decision core (decision_id /
+# over runs/escalations/. Part 1 exhausts the pure decision core (decision_id /
 # parse_seen / fresh_decisions). Part 2 drives the blocking wait_loop with injected
 # now/sleep/scan seams (immediate-return, block-then-return, seen-filtering,
 # timeout, announce-ordering, infinite-block) — no real sleeping, no real claude.
@@ -25,8 +25,8 @@ my $J = JSON::PP->new->canonical;
 
 # ---- decision_id: filename is the stable identity --------------------------
 is(BpWait::decision_id('solo--1a2b3c.json'),          'solo--1a2b3c', 'decision_id: strips .json');
-is(BpWait::decision_id('/a/b/runs/needs-you/solo--1a2b3c.json'), 'solo--1a2b3c', 'decision_id: strips unix dir');
-is(BpWait::decision_id('C:\\runs\\needs-you\\solo--1a2b3c.json'), 'solo--1a2b3c', 'decision_id: strips windows dir');
+is(BpWait::decision_id('/a/b/runs/escalations/solo--1a2b3c.json'), 'solo--1a2b3c', 'decision_id: strips unix dir');
+is(BpWait::decision_id('C:\\runs\\escalations\\solo--1a2b3c.json'), 'solo--1a2b3c', 'decision_id: strips windows dir');
 is(BpWait::decision_id('pkg--DEAD.JSON'),             'pkg--DEAD',    'decision_id: .JSON case-insensitive');
 is(BpWait::decision_id(undef),                         '',            'decision_id: undef -> empty');
 
@@ -157,14 +157,14 @@ sub harness {
 }
 
 # ===========================================================================
-# PART 3 — real scan() against a temp needs-you dir (the I/O seam)
+# PART 3 — real scan() against a temp escalations dir (the I/O seam)
 # ===========================================================================
 
 sub write_file { my ($p,$c)=@_; open my $fh,'>:raw',$p or die "$p: $!"; print $fh $c; close $fh; }
 
 {
     my $root = tempdir(CLEANUP => 1);
-    my $dir  = "$root/needs-you";
+    my $dir  = "$root/escalations";
     make_path($dir);
 
     write_file("$dir/alpha--aa11.json",
@@ -208,8 +208,8 @@ is_deeply(BpWait::scan("$Bin/does-not-exist-xyz"), [], 'scan: missing dir -> [] 
 # --runs form, a fresh decision present -> exit 0 + status decision (immediate)
 {
     my $root = tempdir(CLEANUP => 1);
-    make_path("$root/needs-you");
-    write_file("$root/needs-you/solo--ff00.json",
+    make_path("$root/escalations");
+    write_file("$root/escalations/solo--ff00.json",
         $J->encode({ package=>'solo', blueprint=>'bp', kind=>'stuck-package',
                      question=>'Decide?', context=>'x', created_at=>1 }));
     my $out = `"$^X" "$script" --runs "$root" --timeout 5 2>&1`;
@@ -226,17 +226,17 @@ is_deeply(BpWait::scan("$Bin/does-not-exist-xyz"), [], 'scan: missing dir -> [] 
     is($res2->{status}, 'timeout', 'CLI: prints status=timeout when nothing fresh');
 }
 
-# blueprint + --bp-dir form resolves runs/needs-you under the bp dir
+# blueprint + --bp-dir form resolves runs/escalations under the bp dir
 {
     my $root = tempdir(CLEANUP => 1);
     my $bpdir = "$root/bp";
-    make_path("$bpdir/runs/needs-you");
-    write_file("$bpdir/runs/needs-you/k--ab12.json",
+    make_path("$bpdir/runs/escalations");
+    write_file("$bpdir/runs/escalations/k--ab12.json",
         $J->encode({ package=>'k', blueprint=>'mybp', kind=>'harvest-failure',
                      question=>'?', context=>'', created_at=>2 }));
     my $out = `"$^X" "$script" mybp --bp-dir "$bpdir" --timeout 5 2>&1`;
     my $rc  = $? >> 8;
-    is($rc, 0, 'CLI: blueprint + --bp-dir resolves <bpdir>/runs/needs-you') or diag($out);
+    is($rc, 0, 'CLI: blueprint + --bp-dir resolves <bpdir>/runs/escalations') or diag($out);
     my $res = eval { JSON::PP->new->decode($out) };
     is($res->{decisions}[0]{package}, 'k', 'CLI: found the decision under the bp dir');
 }
@@ -286,7 +286,7 @@ is_deeply(BpWait::scan("$Bin/does-not-exist-xyz"), [], 'scan: missing dir -> [] 
 # scan: a partial mid-write JSON (valid prefix, truncated) is skipped, never crashes.
 {
     my $root = tempdir(CLEANUP => 1);
-    my $dir  = "$root/needs-you";
+    my $dir  = "$root/escalations";
     make_path($dir);
     write_file("$dir/part--p1.json", '{"package":"sol","kind":"stuck-pa');  # truncated
     write_file("$dir/ok--o1.json",
@@ -306,7 +306,7 @@ is_deeply(BpWait::scan("$Bin/does-not-exist-xyz"), [], 'scan: missing dir -> [] 
 
 # CLI H2: a negative / non-numeric timeout -> usage error, not a silent infinite block.
 {
-    my $root = tempdir(CLEANUP => 1); make_path("$root/needs-you");
+    my $root = tempdir(CLEANUP => 1); make_path("$root/escalations");
     my $out = `"$^X" "$script" --runs "$root" --timeout -5 2>&1`;
     is($? >> 8, 2, 'CLI H2: negative timeout -> exit 2 (not silent infinite block)');
     my $out2 = `"$^X" "$script" --runs "$root" --timeout abc 2>&1`;

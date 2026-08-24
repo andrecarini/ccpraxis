@@ -961,7 +961,7 @@ sub _dlines_text {
         skip('tui::DashboardScreen did not load', 1) unless $DS_OK;
         my $ny_row = tui::DashboardScreen::row(label => 'needs you', value => "3 decisions waiting", role => 'state.warn');
         my ($attention_span) = grep { ref($_) eq 'HASH' && defined($_->{role}) && $_->{role} =~ /^state\.(warn|crit)$/ } @$ny_row;
-        ok(defined($attention_span), 'AC-E3: the needs-you value span carries a Theme ATTENTION role (state.warn/state.crit), asserted on the span not emitted bytes');
+        ok(defined($attention_span), 'AC-E3: the escalations value span carries a Theme ATTENTION role (state.warn/state.crit), asserted on the span not emitted bytes');
     }
 }
 

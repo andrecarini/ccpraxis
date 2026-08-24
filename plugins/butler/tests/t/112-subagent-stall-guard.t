@@ -354,7 +354,7 @@ sub newroot { my $r = tempdir(CLEANUP => 1); mkdir "$r/.ccpraxis-local-data"; re
 # entries, most hours old and already resolved -- noise burying the two lines an
 # operator needs.
 #
-# Broad write, no clear: the same shape as the runs/needs-you/ defect package
+# Broad write, no clear: the same shape as the runs/escalations/ defect package
 # t07 exists to fix, which is why the two were closed together. The rule that
 # resolves both is the same one -- clear when the thing the record tracked is
 # demonstrably over.

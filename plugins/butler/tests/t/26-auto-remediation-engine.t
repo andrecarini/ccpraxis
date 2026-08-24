@@ -754,7 +754,7 @@ sub mk_runs_verdict {
     my @notices = grep { my $o = jget($_); $o && ($o->{subject} // '') eq 'remediation verified' && ($o->{source} // '') eq 'remediation-engine' } ls_json("$dir/runs/notices");
     is(scalar @notices, 1, 'AC-20: exactly one "remediation verified" notice with source=remediation-engine');
     is(try1(sub { BpRemediate::remediation_outstanding($q2 || {}) }), 0, 'AC-20: remediation_outstanding is 0 once verified');
-    is(scalar(ls_json("$dir/runs/needs-you")), 0, 'AC-20: zero files under runs/needs-you/');
+    is(scalar(ls_json("$dir/runs/escalations")), 0, 'AC-20: zero files under runs/escalations/');
 }
 
 # ---- AC-21: rotate_verdict archives + re-arms b05's gate --------------------
@@ -881,11 +881,11 @@ sub mk_runs_verdict {
         my $p1 = BpOrch::queue_needs_you($runs, $rec);
         my $p2 = BpOrch::queue_needs_you($runs, $rec);
         is($p1, $p2, 'AC-25: a second call in the same run returns the SAME file (package+kind dedupe, :718-719)');
-        my @files = ls_json("$runs/needs-you");
-        is(scalar @files, 1, 'AC-25: exactly one needs-you file for three escalated findings');
+        my @files = ls_json("$runs/escalations");
+        is(scalar @files, 1, 'AC-25: exactly one escalations file for three escalated findings');
         my $o = @files ? jget($files[0]) : undef;
         for my $k (qw(kind package blueprint reason ts manual question context created_at)) {
-            ok(defined $o && exists $o->{$k}, "AC-25: needs-you record has key '$k'");
+            ok(defined $o && exists $o->{$k}, "AC-25: escalations record has key '$k'");
         }
         is(($o || {})->{package}, '_remediation', 'AC-25: package == _remediation') if $o;
         is(($o || {})->{kind}, 'remediation-escalation', 'AC-25: kind == remediation-escalation') if $o;
@@ -895,8 +895,8 @@ sub mk_runs_verdict {
     }
 }
 
-# ---- AC-26: (i) all auto-fixed => empty needs-you; (ii) justify-only => empty
-#             needs-you + one review; (iii) b07 never blocks/parks a ledger --
+# ---- AC-26: (i) all auto-fixed => empty escalations; (ii) justify-only => empty
+#             escalations + one review; (iii) b07 never blocks/parks a ledger --
 {
     my $runs = "$ROOT/ac26a/runs"; make_path($runs);
     my $ctx = mk_ctx();
@@ -906,7 +906,7 @@ sub mk_runs_verdict {
     my $plan = try1(sub { BpRemediate::plan($verdict, $queue, $ctx) });
     is(scalar @{ (died($plan) ? [] : ($plan->{escalate} || [])) }, 0, 'AC-26(i): an auto-fixable finding produces zero escalations')
         or diag(died($plan));
-    is(scalar(ls_json("$runs/needs-you")), 0, 'AC-26(i): runs/needs-you/ is empty when nothing escalates');
+    is(scalar(ls_json("$runs/escalations")), 0, 'AC-26(i): runs/escalations/ is empty when nothing escalates');
 }
 {
     my $ctx = mk_ctx();
@@ -1040,7 +1040,7 @@ sub mk_runs_verdict {
     my $q = jget("$dir/runs/remediation-queue.json");
     ok(defined $q, 'AC-30: the remediation queue is written after ingestion (even with zero entries)');
     is(scalar @{ ($q || {})->{entries} || [] }, 0, 'AC-30: a justify finding produces zero entries');
-    is(scalar(ls_json("$dir/runs/needs-you")), 0, 'AC-30: zero decisions (needs-you) for a justify-only finding');
+    is(scalar(ls_json("$dir/runs/escalations")), 0, 'AC-30: zero decisions (escalations) for a justify-only finding');
     my $before = verdict_of($dir);
     tryrun($dir, read_verdict => sub { { outcome => 'fail', findings => [$f] } });
     my $after = verdict_of($dir);
@@ -1158,7 +1158,7 @@ sub mk_runs_verdict {
     cmp_ok($gf, '<=', 1 + $cap, 'AC-33: gate_firings bounded by 1 + remediation_cap');
     my $ru = (ref $queue33 eq 'HASH') ? ($queue33->{rounds_used} // 0) : 0;
     cmp_ok($ru, '<=', $cap, 'AC-33: rounds_used bounded by remediation_cap');
-    is(scalar(ls_json("$runs33/needs-you")), 1, 'AC-33: exactly one needs-you file survives 20 ticks of adversity');
+    is(scalar(ls_json("$runs33/escalations")), 1, 'AC-33: exactly one escalations file survives 20 ticks of adversity');
     my $rout = try1(sub { BpRemediate::remediation_outstanding($queue33) });
     is($rout, 0, 'AC-33: remediation_outstanding is 0 once every entry has reached a terminal state');
     is(BpOrch::run_complete({ any_running => 0, outstanding => 0, resume_pending => 0, paused => 0, awaiting_human => 0,

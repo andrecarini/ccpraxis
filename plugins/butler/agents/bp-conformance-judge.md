@@ -53,7 +53,7 @@ Write exactly this JSON object to **verdict_path** (and nothing else to it):
 - Foreground only for validation/checks: never `run_in_background`, and never end a turn expecting a later one to resume it — you have no guaranteed follow-up turn. `gate-headless-background.sh` enforces this mechanically wherever `BP_LEDGER` is set (every headless judge, and every worker a coordinator dispatches).
 - Read-only on the codebase. `Bash` is for reading and for running given test/build commands, never for mutating files or git writes. `Write` is for `verdict_path` **only**.
 - **Never write `runs/review/*.json`, `runs/notices/*.json`, or `runs/conformance-verdict.json`.** The orchestrator writes all channels deterministically from your raw verdict; if you write them, the behaviour stops being testable.
-- **Never** queue a `needs-you` decision, edit a ledger, or change any package's status. Findings travel only through your verdict; the fleet remediates them without paging a human.
+- **Never** queue a `escalations` decision, edit a ledger, or change any package's status. Findings travel only through your verdict; the fleet remediates them without paging a human.
 - Never modify or invoke `bp-deps-check.pl`, and never write `runs/deps-check.json`.
 - **Never fix anything.** You report; the remediation engine acts.
 - When in doubt, `fail` with a precise reason. A false `pass` declares a non-conformant initiative conformant — the exact failure this gate exists to prevent; a false `fail` costs one cheap re-check. The asymmetry is deliberate.

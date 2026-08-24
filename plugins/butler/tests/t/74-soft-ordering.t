@@ -274,17 +274,17 @@ MD
     my $status_before = dclone($status);
 
     my $runs_dir = tempdir(CLEANUP => 1);
-    mkdir "$runs_dir/needs-you";
+    mkdir "$runs_dir/escalations";
 
     my ($r, $err) = try_ready($meta, $status, ['busy']);
     ok(defined $r, 'C7: ready_packages callable during a drain') or diag($err);
 
     is_deeply($status, $status_before, 'C7: no package\'s status was mutated by the quiesce (hash unchanged after the call)');
     ok(!-e "$runs_dir/.paused", 'C7: no runs/.paused was written (ready_packages takes no runs path -- it cannot write one)');
-    opendir(my $dh, "$runs_dir/needs-you") or die $!;
+    opendir(my $dh, "$runs_dir/escalations") or die $!;
     my @entries = grep { !/^\.\.?$/ } readdir $dh;
     closedir $dh;
-    is_deeply(\@entries, [], 'C7: no decision file was queued in needs-you/');
+    is_deeply(\@entries, [], 'C7: no decision file was queued in escalations/');
 }
 
 # =============================================================================

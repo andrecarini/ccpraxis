@@ -488,7 +488,7 @@ sub write_registry_raw {
 # 10. DC6 / behavior 1 (reaching _block_and_queue directly): a run()-level
 #     fixture does NOT reach the :3995/:4484 call site -- verified while
 #     writing this file: t/06-orchestrator.t's own T-orphan shape only
-#     exercises orphan_escalations (files a needs-you decision for a package
+#     exercises orphan_escalations (files a escalations decision for a package
 #     ALREADY blocked in its own ledger), which never calls
 #     update_registry_pkg at all. _block_and_queue is reached only from the
 #     watchdog/resolve-judge attempt-cap paths (:2797/:3195/:3255) or a

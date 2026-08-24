@@ -205,20 +205,20 @@ my $dir = tempdir(CLEANUP => 1);
     is(BpOrch::read_paused($runs), undef, 'paused: cleared');
 }
 
-# ---- IO: needs-you queue (schema + dedupe) --------------------------------
+# ---- IO: escalations queue (schema + dedupe) --------------------------------
 {
     my $runs = "$dir/runs2"; mkdir $runs;
     my $f = BpOrch::queue_needs_you($runs, { package=>'A3', blueprint=>'bp', kind=>'stuck-package', question=>'q?', context=>'c', created_at=>100, category=>'unclassified' });
-    ok(-e $f, 'needs-you: file written');
-    like($f, qr{needs-you/A3--[0-9a-f]+\.json$}, 'needs-you: filename pattern <pkg>--<shortid>.json');
+    ok(-e $f, 'escalations: file written');
+    like($f, qr{escalations/A3--[0-9a-f]+\.json$}, 'escalations: filename pattern <pkg>--<shortid>.json');
     my $rec = $J->decode(do { local $/; open my $r,'<',$f or die; <$r> });
-    is($rec->{package}, 'A3', 'needs-you: package field');
-    is($rec->{kind}, 'stuck-package', 'needs-you: kind field');
-    ok(exists $rec->{question} && exists $rec->{context} && exists $rec->{created_at}, 'needs-you: full schema');
+    is($rec->{package}, 'A3', 'escalations: package field');
+    is($rec->{kind}, 'stuck-package', 'escalations: kind field');
+    ok(exists $rec->{question} && exists $rec->{context} && exists $rec->{created_at}, 'escalations: full schema');
     my $f2 = BpOrch::queue_needs_you($runs, { package=>'A3', blueprint=>'bp', kind=>'stuck-package', question=>'again', context=>'c2', created_at=>200, category=>'unclassified' });
-    is($f2, $f, 'needs-you: same package+kind deduped to the existing file');
-    opendir my $dh, "$runs/needs-you"; my @j = grep { /\.json$/ } readdir $dh; closedir $dh;
-    is(scalar @j, 1, 'needs-you: dedupe leaves exactly one file');
+    is($f2, $f, 'escalations: same package+kind deduped to the existing file');
+    opendir my $dh, "$runs/escalations"; my @j = grep { /\.json$/ } readdir $dh; closedir $dh;
+    is(scalar @j, 1, 'escalations: dedupe leaves exactly one file');
 }
 
 # ---- transport: fetch_usage with an injected http_get ---------------------
@@ -327,7 +327,7 @@ MD
     my $p = BpOrch::read_paused($runs);
     is($p->{reason}, 'token-floor', 'manual pause: first reason preserved (no clobber)');
     ok($p->{manual}, 'manual pause: stays manual');
-    opendir my $dh, "$runs/needs-you"; my @j = grep { /\.json$/ } readdir $dh; closedir $dh;
+    opendir my $dh, "$runs/escalations"; my @j = grep { /\.json$/ } readdir $dh; closedir $dh;
     is(scalar @j, 2, 'manual pause: both decisions queued (distinct kinds, not suppressed)');
 }
 
@@ -366,8 +366,8 @@ MD
     BpOrch::queue_needs_you($runs, { package=>'X', blueprint=>'bp', kind=>'stuck-package', question=>'q', context=>'c', created_at=>1, category=>'unclassified' });
     BpOrch::queue_needs_you($runs, { package=>'Y', blueprint=>'bp', kind=>'harvest-failure', question=>'q', context=>'c', created_at=>2, category=>'oracle' });
     # a dotfile + a non-JSON file must be ignored (matches the watcher's scanner).
-    open my $dot, '>', "$runs/needs-you/.cursor" or die; print $dot "x"; close $dot;
-    open my $bad, '>', "$runs/needs-you/notjson.json" or die; print $bad "{ broken"; close $bad;
+    open my $dot, '>', "$runs/escalations/.cursor" or die; print $dot "x"; close $dot;
+    open my $bad, '>', "$runs/escalations/notjson.json" or die; print $bad "{ broken"; close $bad;
     is_deeply([sort keys %{ BpOrch::queued_decision_pkgs($runs) }], ['X','Y'],
         'queued-pkgs: collects every queued package, any kind; ignores dotfiles/half-written files');
 }
@@ -435,10 +435,10 @@ MD
         launch=>sub{ push @launched, $_[0]{pkg}; 0 } });
 
     is(scalar @launched, 0, 'orphan: nothing launched (pkgA done, pkgB blocked)');
-    opendir my $dh, "$bpdir/runs/needs-you" or die "no needs-you dir: $!";
+    opendir my $dh, "$bpdir/runs/escalations" or die "no escalations dir: $!";
     my @j = grep { /^pkgB--.*\.json$/ } readdir $dh; closedir $dh;
-    is(scalar @j, 1, 'orphan: a needs-you decision was filed for the self-blocked pkgB');
-    my $rec = $J->decode(do { local $/; open my $r,'<',"$bpdir/runs/needs-you/$j[0]" or die; <$r> });
+    is(scalar @j, 1, 'orphan: a escalations decision was filed for the self-blocked pkgB');
+    my $rec = $J->decode(do { local $/; open my $r,'<',"$bpdir/runs/escalations/$j[0]" or die; <$r> });
     is($rec->{kind}, 'stuck-package', 'orphan: decision kind is stuck-package');
     like($rec->{context}, qr/expand the write_set to include integration_test/,
         'orphan: decision context carries the coordinator\'s own "## Next action" handoff');

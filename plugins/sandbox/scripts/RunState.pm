@@ -395,6 +395,12 @@ sub _count_decisions {
 # a cross-plugin require would make the TUI's render path depend on butler being
 # installed. t/97 pins the two lists equal, so the duplication cannot drift
 # silently.
+# Mirrors BpOrch::ESCALATIONS_DIRNAME / ESCALATIONS_LEGACY. Duplicated for the
+# same reason the category list below is: a sandbox render module must not
+# require a butler script. t/97 pins both against the butler source.
+use constant ESCALATIONS_DIRNAME => 'escalations';
+use constant ESCALATIONS_LEGACY  => 'needs-you';
+
 our @TRIAGEABLE_CATEGORIES = qw(unclassified conformance oracle scoping implementation);
 my %TRIAGEABLE = map { $_ => 1 } @TRIAGEABLE_CATEGORIES;
 
@@ -682,7 +688,16 @@ sub summarize_dir {
     # a .paused still on disk is an abandoned run, and abandoning a run is not
     # the same as answering the question it was blocked on.
     my $run_over = ($state eq 'idle' || $state eq 'solo' || $state eq 'parked') ? 1 : 0;
-    my $split = _count_decisions_split("$runs_dir/needs-you", $blueprint_dir, $run_over);
+    # The queue directory was renamed needs-you -> escalations: the old name
+    # claimed the operator owns every record, and most are resolver-owned.
+    # bp-orchestrator.pl migrates it on its first tick, but this module RENDERS
+    # -- it must never write, and it must show the truth about a tree that has
+    # not ticked since the rename. So: read whichever exists, preferring the new
+    # name. A run mid-migration reads correctly under either.
+    my $q_dir = "$runs_dir/" . ESCALATIONS_DIRNAME;
+    $q_dir = "$runs_dir/" . ESCALATIONS_LEGACY
+        if !-d $q_dir && -d "$runs_dir/" . ESCALATIONS_LEGACY;
+    my $split = _count_decisions_split($q_dir, $blueprint_dir, $run_over);
     # decisions_waiting stays the TOTAL, so every existing consumer keeps the
     # number it has always had. The split is additive.
     my $decisions_waiting  = $split->{operator} + $split->{triage};

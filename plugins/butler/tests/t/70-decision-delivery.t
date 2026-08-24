@@ -91,7 +91,7 @@ sub run_cli {
 # mk_bp(%o) -> ($bpdir, $decision_id, $pkg, $stale_text). One package ledger whose
 # '## Next action' body is a distinctive, easy-to-grep STALE marker (the "stale park text"
 # the spec's scout describes), a registry entry, and (unless no_decision => 1) one queued
-# needs-you decision of $kind.
+# escalations decision of $kind.
 sub mk_bp {
     my (%o) = @_;
     my $pkg    = $o{pkg}       // 'alpha';
@@ -110,7 +110,7 @@ sub mk_bp {
     my $id;
     unless ($o{no_decision}) {
         $id = "$pkg--" . ($o{id_suffix} // 'abc123');
-        write_file("$bpdir/runs/needs-you/$id.json",
+        write_file("$bpdir/runs/escalations/$id.json",
             $J->encode({ package => $pkg, blueprint => 'bp', kind => $kind,
                          question => 'Decide.', context => 'looped', created_at => 10 }));
     }
@@ -224,9 +224,9 @@ for my $case (
 
     # A second decision for the SAME package -- a human answering again, e.g. after a
     # re-park (direct package mode isn't required here: --decision mode is the common
-    # path and is what a reporter actually invokes from runs/needs-you/).
+    # path and is what a reporter actually invokes from runs/escalations/).
     my $id2 = "$pkg--second";
-    write_file("$bpdir/runs/needs-you/$id2.json",
+    write_file("$bpdir/runs/escalations/$id2.json",
         $J->encode({ package => $pkg, blueprint => 'bp', kind => 'stuck-package',
                      question => 'Decide again.', context => 'looped', created_at => 20 }));
     my ($rc2, $out2) = run_cli($bpdir, '--decision', $id2, '--action', 'relaunch', '--note', 'Second answer: do B instead.');

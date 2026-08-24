@@ -5971,7 +5971,7 @@ sub _keepawake_reap_orphan {
 # ---------------------------------------------------------------------
 
 # _count_needs_you($project) -> count of queued "needs you" decision entries
-# across every blueprint's runs/needs-you/ (Decision #27's dashboard indicator).
+# across every blueprint's runs/escalations/ (Decision #27's dashboard indicator).
 # opendir/readdir (not glob) so project paths with spaces / André bytes are safe.
 # t07-needs-you-lifecycle: this no longer counts FILES. It counts decisions
 # that are still live, using RunState's own summaries -- which already apply
@@ -5980,7 +5980,7 @@ sub _keepawake_reap_orphan {
 #
 # The operator's report was that the panel said "1 decision waiting" for a run
 # whose agent had nothing outstanding. It did, because eight scripts write into
-# runs/needs-you/ and one narrow path clears it, so a finished package leaves
+# runs/escalations/ and one narrow path clears it, so a finished package leaves
 # its question queued forever.
 #
 # DERIVED FROM THE SAME SUMMARIES THE Blueprints PANEL RENDERS, deliberately,

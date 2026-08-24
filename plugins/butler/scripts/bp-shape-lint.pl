@@ -26,7 +26,7 @@
 # WHAT THIS IS NOT
 #
 # Not a correctness checker, and deliberately not silent-clean. Per-fixture
-# counts on locally-built data ("exactly one relaunch", "exactly one needs-you
+# counts on locally-built data ("exactly one relaunch", "exactly one escalations
 # file") are correct and must NOT be flagged; the whole skill is telling those
 # apart from corpus pins. So this reports CANDIDATES with the evidence that
 # made each suspicious, and a human decides. It fails loudly rather than

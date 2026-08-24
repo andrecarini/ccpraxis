@@ -89,7 +89,7 @@ my %STATES = (
         runs => [], events => [], tokens => {},
         install_warning => 'backpack install - some items failed',
     },
-    'needs-you' => {
+    'escalations' => {
         runs => \@RUNS, events => \@EVENTS, tokens => {},
         needs_you => { count => 1 }, backpack => { pending => 2, failed => 1 },
     },

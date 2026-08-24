@@ -179,9 +179,9 @@ sub drive {
     return { dir => $dir, ticks => $ticks, err => ($err // ''), log => slurp("$dir/runs/orchestrator.log") };
 }
 
-sub needs_you_count { my $bpdir = shift; my $d = "$bpdir/runs/needs-you"; return 0 unless -d $d;
+sub needs_you_count { my $bpdir = shift; my $d = "$bpdir/runs/escalations"; return 0 unless -d $d;
                        opendir my $h, $d; my @j = grep { /\.json$/ } readdir $h; closedir $h; scalar @j }
-sub needs_you_count_runs { my $runs = shift; my $d = "$runs/needs-you"; return 0 unless -d $d;
+sub needs_you_count_runs { my $runs = shift; my $d = "$runs/escalations"; return 0 unless -d $d;
                        opendir my $h, $d; my @j = grep { /\.json$/ } readdir $h; closedir $h; scalar @j }
 
 # ===========================================================================
@@ -204,7 +204,7 @@ sub needs_you_count_runs { my $runs = shift; my $d = "$runs/needs-you"; return 0
     my $p = BpOrch::read_paused("$dir/runs");
     is(($p ? $p->{reason} : undef), 'token-floor', 'AC-1 pre-existing manual pause reason preserved (first-manual-reason-wins)');
 
-    is(needs_you_count($dir), 1, 'AC-1 needs-you queue holds exactly one entry');
+    is(needs_you_count($dir), 1, 'AC-1 escalations queue holds exactly one entry');
 }
 
 # ===========================================================================
@@ -343,14 +343,14 @@ sub needs_you_count_runs { my $runs = shift; my $d = "$runs/needs-you"; return 0
 
     my @p1 = grep { ($_->{type} // '') eq 'pause' } log_events_file($log);
     is(scalar @p1, 1, 'AC-6 first call logs exactly one pause line despite quiet_log=>1 (INV-P1)');
-    is(needs_you_count_runs($runs), 1, 'AC-6 first call queues exactly one needs-you entry');
+    is(needs_you_count_runs($runs), 1, 'AC-6 first call queues exactly one escalations entry');
 
     my $paused_before = BpOrch::read_paused($runs);
 
     BpOrch::_enter_pause_manual($runs, $log, 'pause-creds', $dec, { quiet_log=>1 });
     is_deeply(BpOrch::read_paused($runs), $paused_before,
               'AC-6 second call (existing manual pause) leaves .paused unchanged');
-    is(needs_you_count_runs($runs), 1, 'AC-6 second call: needs-you still exactly one entry (own dedup)');
+    is(needs_you_count_runs($runs), 1, 'AC-6 second call: escalations still exactly one entry (own dedup)');
 
     my @p2 = grep { ($_->{type} // '') eq 'pause' } log_events_file($log);
     is(scalar @p2, 1, 'AC-6 second call logs NO additional pause line (quiet_log honoured for a repeat)');

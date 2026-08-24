@@ -483,7 +483,7 @@ sub apply_verdict {
     my ($verdict, $rec, $id, $ctx) = @_;
     my $runs  = $ctx->{runs};
     my $log   = $ctx->{log};
-    my $qpath = "$runs/needs-you/$id.json";
+    my $qpath = BpOrch::escalations_dir($runs) . "/$id.json";
     my $gate  = confidence_gate($verdict);
 
     if ($gate eq 'refuse') {
@@ -708,7 +708,7 @@ unless (caller) {
 
     (my $id = $decision) =~ s{.*[\\/]}{};
     $id =~ s/\.json$//i;
-    my $qpath = "$runs/needs-you/$id.json";
+    my $qpath = BpOrch::escalations_dir($runs) . "/$id.json";
     my $rec = BpOrch::_read_json($qpath);
     unless (ref $rec eq 'HASH') {
         print STDERR "bp-resolve: queued decision not found or unreadable: $qpath\n"; exit 2;

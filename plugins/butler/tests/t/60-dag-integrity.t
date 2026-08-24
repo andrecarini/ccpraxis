@@ -795,7 +795,7 @@ SKIP: {
 # ---------------------------------------------------------------------------
 # AC-31: end-to-end. BpOrch::run over a fixture blueprint whose table uses a
 # SHORT id in depends_on launches every package (all reach done) with no
-# decision filed (runs/needs-you/ stays empty).
+# decision filed (runs/escalations/ stays empty).
 # ---------------------------------------------------------------------------
 {
     my $dir = tempdir(CLEANUP => 1);
@@ -872,8 +872,8 @@ SKIP: {
     is($final{'b01-alpha'}, 'done', 'AC-31: b01-alpha (no dep) reaches done');
     is($final{'b02-beta'}, 'done',
         'AC-31: b02-beta (short-id dep on b01) reaches done -- launched with no decision');
-    my @needs_you = -d "$bpdir/runs/needs-you" ? glob("$bpdir/runs/needs-you/*") : ();
-    is(scalar @needs_you, 0, 'AC-31: runs/needs-you/ stays empty -- no decision was filed');
+    my @needs_you = -d "$bpdir/runs/escalations" ? glob("$bpdir/runs/escalations/*") : ();
+    is(scalar @needs_you, 0, 'AC-31: runs/escalations/ stays empty -- no decision was filed');
 }
 
 # ---------------------------------------------------------------------------
@@ -920,7 +920,7 @@ sub decode_json_file {
 
 sub needs_you_files {
     my ($runs) = @_;
-    my $dir = "$runs/needs-you";
+    my $dir = "$runs/escalations";
     # NOTE: every exit must `return @out`, never a bare `return ()`. A bare
     # `return ()` evaluates to undef in SCALAR context, so `scalar(needs_you_files(...))`
     # would yield undef instead of 0 precisely when the directory correctly
@@ -1138,7 +1138,7 @@ SKIP: {
         'AC-37: finding.subject is the blocker, not the stalled dependent');
     is($entries[0]->{finding}{remedy}{action}, 'remediate-conformance',
         "AC-37: finding.remedy.action is 'remediate-conformance'");
-    is(scalar(needs_you_files($runs)), 0, 'AC-37: runs/needs-you gains no file for a mechanical blocker route');
+    is(scalar(needs_you_files($runs)), 0, 'AC-37: runs/escalations gains no file for a mechanical blocker route');
     my $logtext = '';
     if (open(my $lfh, '<', $log)) { local $/; $logtext = <$lfh> // ''; close $lfh; }
     like($logtext, qr/dag_stall_remediation/, 'AC-37: orchestrator.log gains a dag_stall_remediation event');
@@ -1236,10 +1236,10 @@ SKIP: {
     my ($a, $dir, $runs, $log) = mk_dag_stall_a(meta => $meta, status => $status);
     BpOrch::dag_stall_step($a);
     my @ny = needs_you_files($runs);
-    is(scalar(@ny), 1, 'AC-42: exactly one needs-you file after an unresolvable stall');
+    is(scalar(@ny), 1, 'AC-42: exactly one escalations file after an unresolvable stall');
     for (1 .. 10) { BpOrch::dag_stall_step($a); }
     my @ny2 = needs_you_files($runs);
-    is(scalar(@ny2), 1, 'AC-42: ten further ticks add no additional needs-you file');
+    is(scalar(@ny2), 1, 'AC-42: ten further ticks add no additional escalations file');
     my ($decision) = map { decode_json_file($_) } @ny2;
     is($decision->{package}, '_dag', "AC-42: decision package is '_dag'");
     is($decision->{kind}, 'dag-stalled', "AC-42: decision kind is 'dag-stalled'");
@@ -1301,7 +1301,7 @@ SKIP: {
         my $out = BpOrch::dag_stall_step($a);
         is_deeply($out, { fired => 0, decided => 0, remediation_outstanding => 0 },
             "AC-45: dag_stall==0 short-circuits dag_stall_step for a $case->{label} stall");
-        ok(!-f "$runs/remediation-queue.json" && !-d "$runs/needs-you",
+        ok(!-f "$runs/remediation-queue.json" && !-d "$runs/escalations",
             "AC-45: dag_stall==0 writes nothing for a $case->{label} stall");
     }
 }

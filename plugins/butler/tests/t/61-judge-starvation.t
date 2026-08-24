@@ -133,7 +133,7 @@ sub run_once {
 }
 sub slurp { local $/; open my $f,'<',shift or return ''; <$f> }
 sub reg_of { my $d=shift; my $r=BpOrch::read_registry("$d/runs"); $r }
-sub needs_you { my $d=shift."/runs/needs-you"; return () unless -d $d; opendir my $h,$d; my @j=map { JSON::PP->new->decode(slurp("$d/$_")) } grep {/\.json$/} readdir $h; closedir $h; @j }
+sub needs_you { my $d=shift."/runs/escalations"; return () unless -d $d; opendir my $h,$d; my @j=map { JSON::PP->new->decode(slurp("$d/$_")) } grep {/\.json$/} readdir $h; closedir $h; @j }
 sub seed_verdict { my ($dir,$kind,$pkg,$obj)=@_; my $f=BpOrch::judge_verdict_path("$dir/runs",$kind,$pkg); make_path("$dir/runs/$kind"); open my $w,'>',$f or die; print $w $J->encode($obj); close $w; }
 # NEW scaffolding for this package: a judge's own pid file / stream log
 # (runs/<kind>/<pkg>.pid, runs/<kind>/<pkg>.jsonl — spec §2.2 judge_pid_path /
@@ -303,7 +303,7 @@ is(BpOrch::widen_max_turns(60,60), 90, 'AC-12: widen_max_turns(60,60) == 90 (5-f
     ok(!($reg->{solo}{corrective_attempts}), 'AC-13: corrective_attempts absent/0');
     like(slurp("$dir/packages/solo.md"), qr/^status:\s*done/m, 'AC-13: ledger still reads status: done');
     is(scalar(@{ $r1->{launched} }), 0, 'AC-13: no coordinator was launched');
-    is(scalar(()=needs_you($dir)), 0, 'AC-13: runs/needs-you is empty');
+    is(scalar(()=needs_you($dir)), 0, 'AC-13: runs/escalations is empty');
 
     is(BpOrch::effective_attempts(1,1), 0, 'AC-14: effective_attempts(1,1) == 0 (mechanically: the exemption)');
 
@@ -460,7 +460,7 @@ is(BpJudge::audit_outcome({ verdict=>'fail', corrective_attempts=>1, corrective_
     ok(!(reg_of($dir)->{A}{corrective_attempts}), 'AC-24: corrective_attempts absent/0');
     unlike(slurp("$dir/packages/A.md"), qr/Harvest findings \(re-verify\)/, 'AC-24: no findings block written into A.md');
     is(scalar(grep { $_->{pkg} eq 'A' } @{ $r->{launched} }), 0, 'AC-24: A was not launched');
-    is(scalar(()=needs_you($dir)), 0, 'AC-24: runs/needs-you is empty');
+    is(scalar(()=needs_you($dir)), 0, 'AC-24: runs/escalations is empty');
     is((reg_of($dir)->{A}{harvest} // 'SENTINEL'), '', "AC-24: registry.packages.A.harvest == ''");
     is(reg_of($dir)->{A}{harvest_defer}, 1, 'AC-24: harvest_defer == 1');
     is((reg_of($dir)->{A}{harvest_defer_blockers} // ''), 'B', "AC-24: harvest_defer_blockers == 'B'");

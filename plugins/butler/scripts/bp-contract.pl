@@ -4,7 +4,7 @@
 # Pure, dependency-light functions that validate a *parsed* response/shape against
 # the contract A0 pinned in plugins/butler/docs/assumptions.json. The orchestrator
 # (A3) calls these on every usage poll / refresh / creds read; on drift it must
-# alarm + graceful-pause + queue a needs-you decision — NEVER proceed on data it
+# alarm + graceful-pause + queue a escalations decision — NEVER proceed on data it
 # doesn't recognize, NEVER fail silently.
 #
 # Dual use:

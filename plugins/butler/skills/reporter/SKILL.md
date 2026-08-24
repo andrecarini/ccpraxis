@@ -1,6 +1,6 @@
 ---
 name: reporter
-description: Turn THIS Claude session into the reporter for a blueprint run — sync to current on-disk state, detect and attach to a live unattended run, and surface/relay the decisions that need a human. Use when the user wants to check on, attach to, observe, or talk to a running (or finished) blueprint, asks "how's the run going?", or wants to answer a queued "needs-you" decision. The interactive front door to a deterministic-orchestrator run.
+description: Turn THIS Claude session into the reporter for a blueprint run — sync to current on-disk state, detect and attach to a live unattended run, and surface/relay the decisions that need a human. Use when the user wants to check on, attach to, observe, or talk to a running (or finished) blueprint, asks "how's the run going?", or wants to answer a queued "escalations" decision. The interactive front door to a deterministic-orchestrator run.
 argument-hint: [blueprint]
 ---
 
@@ -10,7 +10,7 @@ You are the **reporter**: the interactive **Claude** front door to an unattended
 
 **Read first:** `${CLAUDE_PLUGIN_ROOT}/skills/orchestrator-protocol/SKILL.md` — the **Cast** section (reporter vs orchestrator-script vs coordinator) is binding doctrine for this role.
 
-**Stay cheap.** Answer every turn from a *fresh, bounded* disk read — `bp-status.sh` plus the `runs/needs-you/` queue — never from an accumulating transcript. Do not read stream logs or full ledgers for status; read a ledger's **Escalation** section only when relaying a specific blocked/parked package.
+**Stay cheap.** Answer every turn from a *fresh, bounded* disk read — `bp-status.sh` plus the `runs/escalations/` queue — never from an accumulating transcript. Do not read stream logs or full ledgers for status; read a ledger's **Escalation** section only when relaying a specific blocked/parked package.
 
 ## 0. Autonomy — decide what you can, escalate what you can't
 
@@ -72,7 +72,7 @@ Take a snapshot:
 bash "${CLAUDE_PLUGIN_ROOT}/scripts/bp-status.sh" $0
 ```
 
-That gives per-package `status / proc / age / attempt / next-action`. Then read the decision queue directory `<bpdir>/runs/needs-you/` (each `*.json` = one pending human decision: `{package, blueprint, kind, question, context, created_at}`).
+That gives per-package `status / proc / age / attempt / next-action`. Then read the decision queue directory `<bpdir>/runs/escalations/` (each `*.json` = one pending human decision: `{package, blueprint, kind, question, context, created_at}`).
 
 ## 2. Detect a live run, then branch
 
@@ -85,7 +85,7 @@ A run is **live** iff `<bpdir>/runs/.orchestrator` exists **and** its PID is ali
 
 **Report status** on request from a fresh `bp-status.sh` read — done / running / parked counts, and for a specific package the first line of its Next action. Cheap turn, no log spelunking.
 
-**Surface pending decisions.** For each file in `runs/needs-you/`, present `package`, `kind`, and `question` (batched if several). The `kind` tells the user — and you — what answering means:
+**Surface pending decisions.** For each file in `runs/escalations/`, present `package`, `kind`, and `question` (batched if several). The `kind` tells the user — and you — what answering means:
 
 | kind | what it means | how you answer (step 4) |
 |---|---|---|
@@ -227,13 +227,13 @@ surface holds no wake-lock today and this does not add one to it.
 
 A run can legitimately finish with remediation activity and **no user prompt at all** — that is the autonomy principle working, not something withheld from the user. Report it as completed work, never as a pending action item.
 
-**`runs/remediation-queue.json`** (`schema: remediation-queue/1`) is the authoritative record. Per entry, surface: `finding_key`, `action`, `state` (`queued` / `awaiting_verify` / `verified` / `escalated`), `round`/`max_rounds`, the remediation package `id` and its current status. For the run as a whole, surface `rounds_used`/`rounds_cap`. Its `escalated[]` array is the authoritative list of what the single `_remediation` decision covers — render that, do **not** re-derive it from `runs/needs-you/`.
+**`runs/remediation-queue.json`** (`schema: remediation-queue/1`) is the authoritative record. Per entry, surface: `finding_key`, `action`, `state` (`queued` / `awaiting_verify` / `verified` / `escalated`), `round`/`max_rounds`, the remediation package `id` and its current status. For the run as a whole, surface `rounds_used`/`rounds_cap`. Its `escalated[]` array is the authoritative list of what the single `_remediation` decision covers — render that, do **not** re-derive it from `runs/escalations/`.
 
 **`runs/notices/`** — informational only, never an action item. Group by `source`: `remediation-engine` means *"I already fixed this"*, `conformance-gate` means *"I detected this"*. Keeping those apart is the whole point of Decision #20; collapsing them makes a self-heal look like an outstanding problem.
 
 **`runs/review/`** — the end-of-run review the user confirms **at leisure**. These are documented+justified deviations and dependency WARNs. They do **not** block the run and must not be presented as though they do.
 
-The only remediation artifact that genuinely needs the user is a `needs-you` record with `kind=remediation-escalation` and `package=_remediation` — the engine files at most one per run, when it could not characterize a fix, exhausted its round budget, or kept failing re-verification.
+The only remediation artifact that genuinely needs the user is a `escalations` record with `kind=remediation-escalation` and `package=_remediation` — the engine files at most one per run, when it could not characterize a fix, exhausted its round budget, or kept failing re-verification.
 
 ## Filing a ccpraxis tooling bug
 

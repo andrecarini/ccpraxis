@@ -210,7 +210,7 @@ case "$EVENT" in
     # the two lines an operator actually needs to read.
     #
     # It is the same shape as the defect package t07 exists to fix in
-    # runs/needs-you/: broad write, no clear. The rule that resolves both is the
+    # runs/escalations/: broad write, no clear. The rule that resolves both is the
     # same one -- clear when the thing the record was tracking is demonstrably
     # over -- and here that moment is unambiguous: an ALLOWED Stop means the run
     # was resolved (finished, or paused behind a watcher whose pid and deadline

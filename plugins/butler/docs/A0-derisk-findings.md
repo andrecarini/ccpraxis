@@ -113,7 +113,7 @@ what Claude Code itself sends.
 ## Probe 4 — Reporter-wake: does a long-blocking background command's completion re-invoke the session? — ✅ PASS
 
 - **Mechanism PROVEN empirically.** A deterministic, token-free Perl watcher (`bp-wait-for-decision` prototype) blocks
-  polling `runs/needs-you/` for a *new* `*.json`, exiting `0` + `DECISION:<file>` when one appears, or `2` + `TIMEOUT`
+  polling `runs/escalations/` for a *new* `*.json`, exiting `0` + `DECISION:<file>` when one appears, or `2` + `TIMEOUT`
   after a bounded `max_wait`. Launched detached, then a decision file was queued; the watcher detected it (`DECISION:
   A3--probe4test.json`), exited 0, and the harness delivered a **completion notification that re-invoked this session**.
 - **This is exactly the reporter auto-announce loop (Decision #27):** reporter arms the watcher → idle, zero Claude

@@ -1,6 +1,6 @@
 #!/usr/bin/env perl
 # A7 unblock: bp-answer-decision.pl — the mechanical, atomic unblock the reporter
-# runs once a human has answered a runs/needs-you/ decision. Part 1 exhausts the
+# runs once a human has answered a runs/escalations/ decision. Part 1 exhausts the
 # pure plan_answer/kind_family matrix (per-kind allowed actions, fail-closed on a
 # bad pair). Part 2 drives the CLI end-to-end against a temp blueprint dir: a
 # package park relaunch/accept/drop and a fleet-pause resume, asserting the ledger
@@ -104,7 +104,7 @@ sub mk_bp {
     write_file("$bpdir/runs/registry.json",
         $J->encode({ packages => { $pkg => { status=>'blocked', attempt=>3, pid=>4321 } } }));
     my $id = "$pkg--abc123";
-    write_file("$bpdir/runs/needs-you/$id.json",
+    write_file("$bpdir/runs/escalations/$id.json",
         $J->encode({ package=>$pkg, blueprint=>'bp', kind=>$kind,
                      question=>'Decide.', context=>'looped', created_at=>10 }));
     write_file("$bpdir/runs/.paused",
@@ -130,7 +130,7 @@ sub run_cli {
     like(slurp("$bpdir/packages/$pkg.md"), qr/^status:\s*pending/m, 'relaunch: ledger status -> pending');
     like(slurp("$bpdir/packages/$pkg.md"), qr/## Human decision \(resolve\)/, 'relaunch: corrective section appended');
     like(slurp("$bpdir/packages/$pkg.md"), qr/Re-scope to use the existing helper\./, 'relaunch: the human note is in the ledger');
-    ok(!-f "$bpdir/runs/needs-you/$id.json", 'relaunch: queue entry deleted');
+    ok(!-f "$bpdir/runs/escalations/$id.json", 'relaunch: queue entry deleted');
     my $reg = JSON::PP->new->decode(slurp("$bpdir/runs/registry.json"));
     is($reg->{packages}{$pkg}{status}, 'pending', 'relaunch: registry status -> pending');
     is($reg->{packages}{$pkg}{attempt}, 0, 'relaunch: registry attempt reset to 0 (fresh budget)');
@@ -147,7 +147,7 @@ sub run_cli {
     is($rc, 0, 'accept: exit 0') or diag($out);
     like(slurp("$bpdir/packages/$pkg.md"), qr/^status:\s*done/m, 'accept: ledger status -> done');
     unlike(slurp("$bpdir/packages/$pkg.md"), qr/## Human decision/, 'accept: no corrective note (not a relaunch)');
-    ok(!-f "$bpdir/runs/needs-you/$id.json", 'accept: queue entry deleted');
+    ok(!-f "$bpdir/runs/escalations/$id.json", 'accept: queue entry deleted');
 }
 
 # --- drop: ledger->dropped, queue cleared ---------------------------------------
@@ -156,7 +156,7 @@ sub run_cli {
     my ($rc, $out) = run_cli($bpdir, '--decision', $id, '--action', 'drop');
     is($rc, 0, 'drop: exit 0') or diag($out);
     like(slurp("$bpdir/packages/$pkg.md"), qr/^status:\s*dropped/m, 'drop: ledger status -> dropped');
-    ok(!-f "$bpdir/runs/needs-you/$id.json", 'drop: queue entry deleted');
+    ok(!-f "$bpdir/runs/escalations/$id.json", 'drop: queue entry deleted');
 }
 
 # --- fleet resume: clears runs/.paused + queue, leaves ledgers alone ------------
@@ -166,7 +166,7 @@ sub run_cli {
     my ($rc, $out) = run_cli($bpdir, '--decision', $id);   # default action resume
     is($rc, 0, 'resume: exit 0') or diag($out);
     ok(!-f "$bpdir/runs/.paused", 'resume: runs/.paused cleared');
-    ok(!-f "$bpdir/runs/needs-you/$id.json", 'resume: queue entry deleted');
+    ok(!-f "$bpdir/runs/escalations/$id.json", 'resume: queue entry deleted');
     like(slurp("$bpdir/packages/$pkg.md"), qr/^status:\s*blocked/m, 'resume: package ledger untouched');
     my $res = eval { JSON::PP->new->decode($out) };
     is($res->{family}, 'fleet', 'resume: JSON family=fleet');
@@ -178,7 +178,7 @@ sub run_cli {
     my ($rc, $out) = run_cli($bpdir, '--decision', $id, '--action', 'relaunch');
     is($rc, 2, 'guard: package action on a fleet decision -> exit 2') or diag($out);
     ok(-f "$bpdir/runs/.paused", 'guard: a rejected answer leaves the pause in place');
-    ok(-f "$bpdir/runs/needs-you/$id.json", 'guard: a rejected answer leaves the queue entry');
+    ok(-f "$bpdir/runs/escalations/$id.json", 'guard: a rejected answer leaves the queue entry');
 }
 {
     my ($bpdir) = mk_bp();
@@ -189,7 +189,7 @@ sub run_cli {
     my ($bpdir, $id) = mk_bp(kind => 'stuck-package');
     my ($rc, $out) = run_cli($bpdir, '--decision', $id, '--action', 'frobnicate');
     is($rc, 2, 'guard: unknown package action -> exit 2');
-    ok(-f "$bpdir/runs/needs-you/$id.json", 'guard: bad action leaves the queue entry');
+    ok(-f "$bpdir/runs/escalations/$id.json", 'guard: bad action leaves the queue entry');
 }
 
 # ===========================================================================
@@ -209,7 +209,7 @@ sub run_cli {
     write_file("$bpdir/runs/resolve/$pkg.inflight", "100\n");
     write_file("$bpdir/runs/resolve/$pkg.verdict.json", $J->encode({ verdict=>'park' }));
     # a stale queued decision for the package (direct reset clears it without an id)
-    write_file("$bpdir/runs/needs-you/$pkg--zzz999.json",
+    write_file("$bpdir/runs/escalations/$pkg--zzz999.json",
         $J->encode({ package=>$pkg, kind=>'stuck-package', question=>'?', created_at=>1 }));
 
     my ($rc, $out) = run_cli($bpdir, '--package', $pkg, '--action', 'reset', '--note', 'Fresh pass please.');
@@ -224,7 +224,7 @@ sub run_cli {
     ok(!-e "$bpdir/runs/resolve/$pkg.inflight",     'reset: resolve .inflight cleared');
     ok(!-e "$bpdir/runs/resolve/$pkg.verdict.json", 'reset: stale resolve verdict cleared');
     ok(!-e "$bpdir/runs/resolve/$pkg.pid",          'reset: resolve pid file cleared');
-    ok(!-e "$bpdir/runs/needs-you/$pkg--zzz999.json", 'reset: queued decision for the package cleared');
+    ok(!-e "$bpdir/runs/escalations/$pkg--zzz999.json", 'reset: queued decision for the package cleared');
     my $res = eval { JSON::PP->new->decode($out) };
     is($res->{action}, 'reset', 'reset: JSON action=reset');
     ok($res->{ok},              'reset: JSON ok=true');

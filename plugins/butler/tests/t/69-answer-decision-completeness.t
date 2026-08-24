@@ -120,7 +120,7 @@ sub run_cli {
 }
 
 # mk_bp(%o) -> ($bpdir, $decision_id, $pkg). Mirrors t/13's helper: one package ledger,
-# a registry, and (unless no_decision => 1) one queued needs-you decision of $kind.
+# a registry, and (unless no_decision => 1) one queued escalations decision of $kind.
 sub mk_bp {
     my (%o) = @_;
     my $pkg   = $o{pkg}    // 'alpha';
@@ -138,7 +138,7 @@ sub mk_bp {
     my $id;
     unless ($o{no_decision}) {
         $id = "$pkg--" . ($o{id_suffix} // 'abc123');
-        write_file("$bpdir/runs/needs-you/$id.json",
+        write_file("$bpdir/runs/escalations/$id.json",
             $J->encode({ package => ($o{decision_package} // $pkg), blueprint => 'bp', kind => $kind,
                          question => 'Decide.', context => 'looped', created_at => 10 }));
     }
@@ -353,7 +353,7 @@ for my $kind (@KINDS) {
     if ($FLEET_KIND{$kind}) {
         my ($bpdir, $id) = mk_bp(pkg => 'zzz', kind => $kind, decision_package => '_fleet', paused => 1, no_decision => 1);
         my $did = "_fleet--x1";
-        write_file("$bpdir/runs/needs-you/$did.json",
+        write_file("$bpdir/runs/escalations/$did.json",
             $J->encode({ package => '_fleet', blueprint => 'bp', kind => $kind, question => '?', created_at => 10 }));
         my ($rc, $out) = run_cli($bpdir, '--decision', $did);   # default action: resume
         is($rc, 0, "C5: fleet-family kind '$kind' produces a deterministic (successful) outcome") or diag($out);
@@ -380,7 +380,7 @@ for my $kind (@KINDS) {
         or diag("actual message: $out");
     my $after = slurp("$bpdir/packages/$pkg.md");
     is($after, $before, 'C6: an unknown kind changes NOTHING in the ledger');
-    ok(-f "$bpdir/runs/needs-you/$id.json", 'C6: an unknown kind leaves the queued decision in place (not consumed)');
+    ok(-f "$bpdir/runs/escalations/$id.json", 'C6: an unknown kind leaves the queued decision in place (not consumed)');
 }
 
 # =====================================================================================

@@ -164,7 +164,7 @@ sub run_once {
 }
 sub slurp { local $/; open my $f,'<',shift or return ''; <$f> }
 sub reg_of { my $d=shift; my $r=BpOrch::read_registry("$d/runs"); $r }
-sub needs_you { my $d=shift."/runs/needs-you"; return () unless -d $d; opendir my $h,$d; my @j=map { JSON::PP->new->decode(slurp("$d/$_")) } grep {/\.json$/} readdir $h; closedir $h; @j }
+sub needs_you { my $d=shift."/runs/escalations"; return () unless -d $d; opendir my $h,$d; my @j=map { JSON::PP->new->decode(slurp("$d/$_")) } grep {/\.json$/} readdir $h; closedir $h; @j }
 sub seed_verdict { my ($dir,$kind,$pkg,$obj)=@_; my $f=BpOrch::judge_verdict_path("$dir/runs",$kind,$pkg); require File::Path; File::Path::make_path("$dir/runs/$kind"); open my $w,'>',$f or die; print $w $J->encode($obj); close $w; }
 
 # ---- A1: audit mode fires a harvest spot-audit on a finished package, and
@@ -215,7 +215,7 @@ sub seed_verdict { my ($dir,$kind,$pkg,$obj)=@_; my $f=BpOrch::judge_verdict_pat
     my $r = run_once($dir);
     like(slurp("$dir/packages/A.md"), qr/^status:\s*blocked/m, 'A4: A parked (blocked) after the corrective cap');
     my @q = needs_you($dir);
-    is(scalar @q, 1, 'A4: a needs-you decision queued');
+    is(scalar @q, 1, 'A4: a escalations decision queued');
     is($q[0]{kind}, 'harvest-failure', 'A4: queued as a harvest-failure alarm');
     is(scalar @{$r->{launched}}, 0, 'A4: not relaunched');
     like(slurp("$dir/runs/orchestrator.log"), qr/harvest_park/, 'A4: logged harvest_park');
