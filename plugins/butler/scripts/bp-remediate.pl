@@ -552,6 +552,27 @@ sub merge_queue {
             }
         }
 
+        # A no_package entry is BOOKKEEPING, not a package. It exists so
+        # %tracked remembers "asked and refused" and the finding cannot
+        # re-escalate every ingestion; it has no ledger and no write set, by
+        # construction (_escalate_new sets write_set => 'n/a' precisely because
+        # there is nothing to write).
+        #
+        # It must never enter %meta. 'n/a' is non-empty, so it slipped past the
+        # empty_write_set skip below and was merged with pkg_status 'done' --
+        # and a done package is one the orchestrator asks a harvest judge to
+        # verify. The judge cannot start (no ledger), the spawn cap eventually
+        # fires, and _block_and_queue files a harvest-spawn-failure naming an id
+        # that by construction has no ledger. Every bp-answer-decision.pl action
+        # (accept/drop/relaunch) resolves the ledger first and fail-closes, and
+        # `acknowledge` is only available to pseudo-packages, so the operator is
+        # left with a queue entry only hand-deletion can clear -- which the
+        # reporter protocol forbids. Almanac 20260824-100216-4ec2.
+        if ($e->{no_package}) {
+            push @skipped, { id => $id, reason => 'no_package' };
+            next;
+        }
+
         my $ws = $e->{write_set};
         if (!defined $ws || !length($ws) || $ws =~ /^\s*$/) {
             push @skipped, { id => $id, reason => 'empty_write_set' };

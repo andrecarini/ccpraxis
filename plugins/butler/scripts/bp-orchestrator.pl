@@ -3308,6 +3308,31 @@ sub run {
                         ? BpJudge::want_harvest_gate({  mode => $mode, status => $st, harvest => $h, inflight => $infl })
                         : BpJudge::want_harvest_audit({ mode => $mode, status => $st, harvest => $h, inflight => $infl });
                     next unless $fire;
+
+                    # NEVER ASK A HARVEST JUDGE TO VERIFY SOMETHING WITH NO
+                    # LEDGER. bp-judge.sh's own first check is `[ -f "$LEDGER" ]
+                    # || exit 1`, so dispatching one is a guaranteed spawn
+                    # failure -- which burns the cap and then files a
+                    # harvest-spawn-failure decision naming a package that has
+                    # no ledger for bp-answer-decision.pl to resolve against.
+                    # Every action there fail-closes on the missing ledger, so
+                    # the operator gets a queue entry only hand-deletion can
+                    # clear. Almanac 20260824-100216-4ec2.
+                    #
+                    # The specific entry in that report is a no_package
+                    # remediation record, and merge_queue now keeps those out of
+                    # %meta at the source. This is the general rule behind it:
+                    # ANY ledger-less package reaching here produces the same
+                    # unanswerable escalation, and there is nothing for a
+                    # harvest judge to verify in a package with no ledger
+                    # regardless of how it got here.
+                    unless (-f "$bpdir/packages/$pkg.md") {
+                        _log($log, 'harvest_skipped_no_ledger', { package => $pkg,
+                            detail => 'no ledger on disk; a harvest judge cannot start against it '
+                                    . 'and the spawn failure would file a decision no action can clear' });
+                        next;
+                    }
+
                     # §3 behavior 24: while any harvest_defer_blockers named package is
                     # still LIVE (not done/dropped/blocked/parked), hold the fire — no
                     # re-audit, no log line (the harvest_defer event + registry field are

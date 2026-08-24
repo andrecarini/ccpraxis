@@ -469,6 +469,82 @@ sub mk_runs_verdict {
     }
 }
 
+# ---- a no_package entry is BOOKKEEPING and must never enter %meta ----------
+#
+# almanac 20260824-100216-4ec2. _escalate_new persists a terminal entry so
+# %tracked remembers "asked and refused" and the finding cannot re-escalate on
+# every ingestion. It has no ledger and no write set by construction, and sets
+# write_set => 'n/a' to say so.
+#
+# 'n/a' is NON-EMPTY, so it sailed past the empty_write_set skip and was merged
+# with pkg_status 'done'. A done package is one the orchestrator hands to a
+# harvest judge; the judge cannot start (bp-judge.sh's first check is
+# [ -f "$LEDGER" ]); the spawn cap eventually fires and _block_and_queue files a
+# harvest-spawn-failure naming an id that by construction has no ledger. Every
+# bp-answer-decision.pl action resolves the ledger before dispatching, so
+# accept/drop/relaunch all fail-close identically, and `acknowledge` is reserved
+# for pseudo-packages. The operator is left with a queue entry that only
+# hand-deleting the JSON can clear -- which the reporter protocol forbids.
+{
+    my $ctx   = mk_ctx();
+    my $queue = try1(sub { BpRemediate::queue_new($ctx) });
+    unless (died($queue)) {
+        # mk_entry builds a FIXED key set and silently drops anything it does
+        # not know, so no_package has to be set on the built entry. Found by the
+        # counter-fixture below: both halves merged, which is impossible if the
+        # flag is doing anything.
+        my $e = mk_entry(id => 'remediation-dag-stall-01-corpus-r1', state => 'escalated',
+                         write_set => 'n/a', pkg_status => 'done');
+        $e->{no_package} = 1;
+        push @{ $queue->{entries} }, $e;
+    }
+    my %meta   = ( A => { deps => [], write_set => 'src/a/' } );
+    my %status = ( A => 'done' );
+    my $r = try1(sub { BpRemediate::merge_queue($queue, \%meta, \%status, {}) });
+    if (my $d = died($r)) { fail('no_package: merge_queue survives a no_package entry'); diag($d); }
+    else {
+        ok(!exists $meta{'remediation-dag-stall-01-corpus-r1'},
+           'no_package: a no_package entry is NOT merged into %meta -- it is bookkeeping, not a '
+         . 'package, and anything in %meta is a thing the orchestrator will act on');
+        ok(!exists $status{'remediation-dag-stall-01-corpus-r1'},
+           'no_package: ...and gets no %status, so it can never read as a finished package '
+         . 'awaiting harvest');
+        my ($skip) = grep { ref $_ eq 'HASH' && ($_->{id} // '') eq 'remediation-dag-stall-01-corpus-r1' }
+                     @{ $r->{skipped} || [] };
+        is(($skip || {})->{reason}, 'no_package',
+           'no_package: the skip is RECORDED with its own reason, so this is a deliberate '
+         . 'exclusion in the report rather than a silent disappearance');
+    }
+
+    # Non-vacuity: the same fixture WITHOUT the flag still merges, so the three
+    # assertions above pin the flag rather than some other property of the entry.
+    my $queue2 = try1(sub { BpRemediate::queue_new($ctx) });
+    unless (died($queue2)) {
+        push @{ $queue2->{entries} }, mk_entry(
+            id => 'remediation-dag-stall-01-corpus-r1', state => 'escalated',
+            write_set => 'n/a', pkg_status => 'done');
+    }
+    my (%meta2, %status2);
+    my $r2 = try1(sub { BpRemediate::merge_queue($queue2, \%meta2, \%status2, {}) });
+    unless (died($r2)) {
+        ok(exists $meta2{'remediation-dag-stall-01-corpus-r1'},
+           'no_package counter-fixture: an identical entry with no no_package flag DOES merge, '
+         . 'so the exclusion is attributable to the flag');
+    }
+}
+
+# ---- the general rule: never harvest a package with no ledger --------------
+{
+    my $orch = "$Bin/../../scripts/bp-orchestrator.pl";
+    my $osrc = -r $orch ? slurp($orch) : '';
+    ok(length $osrc, 'no-ledger guard: bp-orchestrator.pl is readable');
+    like($osrc, qr/harvest_skipped_no_ledger/,
+         'no-ledger guard: the harvest dispatch skips a package with no ledger on disk. The '
+       . 'no_package fix above closes the specific entry in the report; this is the rule behind '
+       . 'it -- ANY ledger-less package reaching that dispatch produces the same unanswerable '
+       . 'escalation, and there is nothing for a harvest judge to verify either way');
+}
+
 # ---- AC-11: merge_queue superset key set, status fallback, no-overwrite ----
 {
     my $ctx = mk_ctx();
@@ -907,8 +983,23 @@ sub mk_runs_verdict {
         like($next // '', qr/git/i, 'AC-28: ## Next action mentions git availability');
         like($inputs // '', qr/(unavailable|cannot run|may be unavailable)/i, 'AC-28: ## Inputs states the git-unavailable degradation clause');
     }
-    my $src = -r "$Bin/../../scripts/bp-remediate.pl" ? slurp("$Bin/../../scripts/bp-remediate.pl") : '';
-    ok(length $src, 'AC-28: bp-remediate.pl is readable for the static exec/system scan');
+    my $raw = -r "$Bin/../../scripts/bp-remediate.pl" ? slurp("$Bin/../../scripts/bp-remediate.pl") : '';
+    ok(length $raw, 'AC-28: bp-remediate.pl is readable for the static exec/system scan');
+
+    # COMMENTS STRIPPED. The scans below exist to prove this module never shells
+    # out; a comment that NAMES one of these constructs shells out exactly as
+    # much as a comment that does not. Writing `acknowledge` in a sentence --
+    # ordinary markdown emphasis in a file full of prose -- turned the backtick
+    # scan red for a module containing no backticks at all.
+    #
+    # This is the same defect this repo has now paid for in t/65, t/66, t/115
+    # and t/145: an oracle reading prose as if it were code. Stripping is the
+    # rule; the instance is not worth rewording around.
+    #
+    # The stripped copy is used ONLY for these scans. Anything asserting about
+    # documentation must read $raw.
+    my $src = $raw;
+    $src =~ s/^\s*#.*$//mg;
     unlike($src, qr/\bsystem\s*\(/, 'AC-28: no system() call in bp-remediate.pl');
     unlike($src, qr/\bexec\s*\(/, 'AC-28: no exec() call in bp-remediate.pl');
     unlike($src, qr/`[^`]*`/, 'AC-28: no backticks in bp-remediate.pl');
