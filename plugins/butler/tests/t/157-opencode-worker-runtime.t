@@ -130,14 +130,68 @@ sub read_frontmatter {
 {
     my @claude_bp = map { m{/([^/]+)\.md$} ? $1 : () }
         find_files_matching($ROOT_AGENTS, qr{/bp-[a-z-]+\.md$});
-    my @claude_judges  = sort grep {  /-judge$/    } @claude_bp;
+    # A JUDGE IS AN AGENT bp-judge.sh DISPATCHES, not an agent whose filename
+    # ends in -judge. This block's own comment already says to classify "by a
+    # RULE rather than a name list" -- but a filename suffix IS a name list with
+    # extra steps, and it broke on the first judge that did not follow the
+    # convention.
+    #
+    # bp-escalation-resolver is the fourth judge kind (escalation-resolve): the
+    # orchestrator fires it through bp-judge.sh, it is read-only, and it writes a
+    # verdict, exactly like the other three. Its filename simply lacks the
+    # -judge suffix -- a stem mismatch that also broke bp-judge.sh's own agent
+    # path derivation until 2026-08-24 (almanac 20260824-170753-01b8). This test
+    # has been red for it since the agent was added, counting it as an eighth
+    # PIPELINE WORKER and then demanding an OpenCode port of a judge.
+    #
+    # Deriving the set from bp-judge.sh means a fifth judge kind is classified
+    # correctly on the day it is wired, whatever it is called.
+    my %judge_agents;
+    {
+        my $js = "$ROOT_PLUGIN/scripts/bp-judge.sh";
+        my $jsrc = -r $js ? do { local (@ARGV, $/) = ($js); <> } : '';
+        my ($allow) = $jsrc =~ /case\s+"\$KIND"\s+in\s+([a-z|\-]+)\)/;
+        my %override;
+        if (my ($case_body) = $jsrc =~ /\n\s*case\s+"\$KIND"\s+in\s*\n(.*?)\nesac/s) {
+            while ($case_body =~ /^\s*([a-z\-]+)\)\s*AGENT_FILE="\$PLUGIN_ROOT\/agents\/([^"]+)"/mg) {
+                # BOTH captures copied out BEFORE any further match runs. The
+                # s/// below is itself a successful match and RESETS $1, so
+                # `(my $stem = $2) =~ s/\.md$//; $override{$1} = $stem;` stores
+                # the stem under an EMPTY key -- the override silently never
+                # applies and the default rule wins. Cost an hour here; the
+                # symptom is indistinguishable from the regex not matching.
+                my ($kind, $file) = ($1, $2);
+                (my $stem = $file) =~ s/\.md$//;
+                $override{$kind} = $stem;
+            }
+        }
+        for my $kind (split /\|/, ($allow // '')) {
+            $judge_agents{ $override{$kind} // "bp-$kind-judge" } = 1;
+        }
+    }
+    ok(scalar(keys %judge_agents) >= 3,
+       'FIXTURE-SANITY: the judge set is derivable from bp-judge.sh (a name-suffix rule is what '
+     . 'broke here)') or diag('derived judges: ' . join(',', sort keys %judge_agents));
+
+    my @claude_judges  = sort grep {  $judge_agents{$_} } @claude_bp;
     my @claude_gates   = sort grep {  /-verifier$/ } @claude_bp;
-    my @claude_workers = sort grep { !/-judge$/ && !/-verifier$/ } @claude_bp;
+    my @claude_workers = sort grep { !$judge_agents{$_} && !/-verifier$/ } @claude_bp;
 
     is(scalar(@claude_workers), 7, 'FIXTURE-SANITY: the Claude agent tree has exactly seven pipeline worker bp-* agents')
         or diag('claude workers found: ' . join(',', @claude_workers));
-    is(scalar(@claude_judges), 3, 'FIXTURE-SANITY: the Claude agent tree has exactly three bp-*-judge agents')
-        or diag('claude judges found: ' . join(',', @claude_judges));
+    # EVERY DERIVED JUDGE HAS AN AGENT FILE, rather than "exactly three". The
+    # literal 3 dated from before e03 added escalation-resolve as the fourth
+    # judge kind, and a count is the wrong contract here anyway: what matters is
+    # that each kind bp-judge.sh will dispatch actually has the agent it will
+    # look for. A missing one is not a miscount, it is a judge that cannot
+    # start -- which is precisely almanac 20260824-170753-01b8, where the
+    # escalation-resolve path had never once executed because its agent file
+    # name did not exist.
+    is_deeply(\@claude_judges, [ sort keys %judge_agents ],
+        'FIXTURE-SANITY: every judge kind bp-judge.sh dispatches has its agent file present, and '
+      . 'the agent tree carries no judge that nothing dispatches')
+        or diag('claude judges found: ' . join(',', @claude_judges)
+              . ' | derived from bp-judge.sh: ' . join(',', sort keys %judge_agents));
 
     my @oc_files = find_files_matching($ROOT_OPENCODE, qr{/bp-[a-z-]+\.md$});
     my @oc_names = sort map { m{/([^/]+)\.md$} ? $1 : () } @oc_files;
