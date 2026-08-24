@@ -385,8 +385,33 @@ sub verdict {
 # a matter of remembering not to pass the credential in.
 #
 # Atomic: write to a temp file in the SAME directory as $path, then rename()
-# over the final path -- a reader can never observe a half-written file.
-# Mode 0600 from creation (sysopen with the mode), never chmod'd after.
+# over the final path -- a reader can never observe a half-written file. That
+# half is true on every platform.
+#
+# THE MODE IS A POSIX-ONLY BEST EFFORT, NOT A GUARANTEE. sysopen asks for 0600
+# at creation and is never chmod'd after, which POSIX honours -- but Windows
+# does not implement the group/other bits that mode describes, and the file
+# measurably lands 0644 on the Git-for-Windows host. almanac 20260823-204738-ee90.
+#
+# THE ACTUAL GUARANTEE IS THE FIELD WHITELIST, a few lines below. Every persisted
+# row is built from an explicit list, so a secret cannot reach this file by being
+# added to a struct upstream -- the OpenCode session cookie, the broadest secret
+# in the system, provably never appears here. That is what is doing the work the
+# mode used to get credit for.
+#
+# This distinction is stated at length ON PURPOSE. The header previously read
+# "Mode 0600 from creation", full stop, and a future reader deciding whether some
+# new field is safe to persist would weigh that as a second line of defence. On
+# this platform there is none. A comment that overstates a security property is
+# worse than one that omits it, because it is load-bearing for a decision nobody
+# has made yet -- which is precisely the decision this paragraph exists to inform.
+#
+# Deliberately NOT fixed by enforcing an ACL on Windows: that trades a documented
+# limitation for platform-specific permission code in a script whose whole point
+# is running everywhere perl does, and it would not change what is safe to put in
+# the file. The whitelist is the invariant to protect; see t/171 AC7, which
+# asserts the honest property (the global destination is no more permissive than
+# the run-dir one) rather than an absolute mode that cannot hold here.
 # ---------------------------------------------------------------------------
 my @SNAPSHOT_RESULT_FIELDS = qw(provider status five_hour seven_day weekly monthly balance budget diagnostic);
 
@@ -444,6 +469,10 @@ sub write_snapshot {
     if (length $dir && !-d $dir) { require File::Path; File::Path::make_path($dir); }
 
     my $tmp_path = "$path.tmp.$$." . int(rand(1_000_000));
+    # 0600 is asked for at creation and KEPT -- it is honoured on POSIX and
+    # ignored on Windows (lands 0644 there). Requesting it costs nothing and is
+    # right wherever it works; what must not happen is anyone reading this line
+    # as a guarantee. See the header: the field whitelist is the invariant.
     sysopen(my $fh, $tmp_path, Fcntl::O_WRONLY() | Fcntl::O_CREAT() | Fcntl::O_TRUNC(), 0600)
         or die "write_snapshot: sysopen $tmp_path: $!";
     print {$fh} $json or die "write_snapshot: write $tmp_path: $!";
