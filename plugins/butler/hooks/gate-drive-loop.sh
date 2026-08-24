@@ -34,7 +34,8 @@
 # allowed with an explanation; and there are two explicit escape hatches.
 #
 # ESCAPE HATCHES
-#   * touch <data>/.drive-solo/.stop-ok   — one-shot; consumed on use
+#   * touch <data>/.drive-solo/.stop-ok   — one-shot; consumed on the stop it
+#                                           actually lets through (see below)
 #   * export CCPRAXIS_DRIVE_STOP_OK=1     — session-wide
 set -u
 HOOK_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -42,6 +43,7 @@ HOOK_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "$HOOK_DIR/lib.sh" 2>/dev/null || exit 0
 
 MAX_BLOCKS=3          # never nag more than this many times in a row
+STOP_OK_MAX_CARRY=3   # how many blocked-by-a-sibling stops .stop-ok may survive
 
 # Coordinators are gate-stop.sh's business. BP_LEDGER is exported only into
 # coordinator processes, so its ABSENCE identifies an interactive driver.
@@ -254,8 +256,47 @@ DS="$DATA/.drive-solo"
 
 touch "$MARK" 2>/dev/null || true
 
-# --- escape hatch: one-shot file, consumed ----------------------------------
+# --- escape hatch: one-shot, spent on the stop it actually lets through ------
+#
+# THIS HOOK IS NOT THE ONLY STOP GATE. guard-subagent-stall.sh blocks whenever
+# bp-runstate.pl reports "state":"active", and it runs independently of this
+# one. The original branch deleted the marker and exited 0, which is correct
+# only if exiting 0 ends the turn -- and it does not when the sibling blocks.
+# The operator's one-shot token was then spent on a stop that never happened,
+# and the next stop -- the one they touched it for -- blocked HERE again,
+# demanding a marker they had already provided. Observed 2026-08-24, and the
+# loop it creates is closed: consult the director, get reactivated, re-finish,
+# lose the token, block again.
+#
+# So while the run is still active, PASS WITHOUT CONSUMING and let the sibling
+# guard do its job. The token survives to cover the stop that follows
+# resolution, which is the stop the operator meant.
+#
+# Bounded, because that reasoning leans on a sibling hook actually being
+# registered: if none is, nothing else will ever block and an unconsumed marker
+# would become a permanent escape hatch rather than a one-shot. After
+# STOP_OK_MAX_CARRY carries it is spent regardless, so the degenerate case is
+# the old behaviour, not an open gate.
 if [ -f "$DS/.stop-ok" ]; then
+  _RS="$HOOK_DIR/../scripts/bp-runstate.pl"
+  _ROOT=$(dirname "$DATA" 2>/dev/null || true)
+  _ACTIVE=""
+  if [ -f "$_RS" ] && [ -n "$_ROOT" ] && [ -d "$_ROOT" ] && command -v perl >/dev/null 2>&1; then
+    _ST=$(perl "$_RS" status --root "$_ROOT" 2>/dev/null) || _ST=""
+    case "$_ST" in *'"state":"active"'*) _ACTIVE=1 ;; esac
+  fi
+
+  _CARRY=$(cat "$DS/.stop-ok" 2>/dev/null || echo 0)
+  case "$_CARRY" in ''|*[!0-9]*) _CARRY=0 ;; esac
+
+  if [ -n "$_ACTIVE" ] && [ "$_CARRY" -lt "$STOP_OK_MAX_CARRY" ]; then
+    # A sibling gate is about to block this stop. Keep the token, count the
+    # carry, and clear the nag counter -- this hook is not the one objecting.
+    printf '%s\n' "$(( _CARRY + 1 ))" > "$DS/.stop-ok" 2>/dev/null || true
+    rm -f "$DS/.stop-blocks" 2>/dev/null
+    exit 0
+  fi
+
   rm -f "$DS/.stop-ok" "$DS/.stop-blocks" "$DS/.wakeup-pending" 2>/dev/null
   exit 0
 fi

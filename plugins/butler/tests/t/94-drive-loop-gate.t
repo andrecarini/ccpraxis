@@ -234,6 +234,73 @@ EOF`;
 }
 
 # ---------------------------------------------------------------------------
+# F'. ...but "one shot" means one STOP, not one Stop-hook INVOCATION.
+#
+# This hook is not the only Stop gate. guard-subagent-stall.sh blocks whenever
+# bp-runstate.pl reports "state":"active", independently of this one. Exiting 0
+# here therefore does NOT mean the turn ended.
+#
+# Observed 2026-08-24: the operator touched .stop-ok, this gate consumed it and
+# passed, the sibling guard blocked the same stop, and the very next stop
+# blocked HERE demanding a marker that had already been spent. The loop that
+# produced is closed — consult the director, get reactivated, re-finish, lose
+# the token, block again — and an operator following the gate's own printed
+# instructions cannot get out of it.
+#
+# So: while the run is active, pass WITHOUT consuming. Spend the token on the
+# stop it actually lets through.
+# ---------------------------------------------------------------------------
+my $RUNSTATE = "$Bin/../../scripts/bp-runstate.pl";
+
+sub set_run_state {
+    my ($root, $verb) = @_;
+    system($^X, $RUNSTATE, $verb, '--root', $root, '--reason', 'fixture') == 0
+        or die "fixture: bp-runstate.pl $verb failed";
+}
+
+SKIP: {
+    skip 'bp-runstate.pl not present', 6 unless -f $RUNSTATE;
+
+    my ($root, $ds) = new_project(order => 1);
+    set_run_state($root, 'activate');
+
+    open my $fh, '>', "$ds/.stop-ok" or die; close $fh;
+    my ($rc) = run_hook($GATE, payload_stop($root));
+    is($rc, 0, "F3: with the run ACTIVE the gate still allows the stop — it is not "
+             . "the hook objecting, and two gates must not both block");
+    ok(-f "$ds/.stop-ok",
+       "F4: ...and the marker SURVIVES, because the sibling guard is about to block "
+     . "this stop and a token spent on a stop that never happened is lost");
+
+    # Non-vacuity: F4 must be pinning a deliberate carry, not a gate that simply
+    # never consumes. Resolve the run and the same marker is spent.
+    set_run_state($root, 'finish');
+    my ($rc2) = run_hook($GATE, payload_stop($root));
+    is($rc2, 0, 'F5: once the run is resolved the stop is allowed');
+    ok(!-f "$ds/.stop-ok",
+       'F6: ...and NOW the marker is consumed — one shot, spent on the stop it let through');
+
+    # Bounded. The carry reasoning leans on a sibling hook actually being
+    # registered; if none is, an unconsumed marker would become a permanent
+    # escape hatch. It must degrade to the old behaviour instead.
+    my ($root2, $ds2) = new_project(order => 1);
+    set_run_state($root2, 'activate');
+    open my $f2, '>', "$ds2/.stop-ok" or die; close $f2;
+
+    my $carries = 0;
+    for (1 .. 12) {                       # far more than any sane cap
+        run_hook($GATE, payload_stop($root2));
+        last unless -f "$ds2/.stop-ok";
+        $carries++;
+    }
+    ok(!-f "$ds2/.stop-ok",
+       "F7: the carry is BOUNDED — an active run cannot keep the marker alive forever "
+     . "(spent after $carries carries)");
+    cmp_ok($carries, '>=', 1,
+           'F8: ...and the bound is not 0, which would be the bug this section fixes');
+}
+
+# ---------------------------------------------------------------------------
 # G. Source-level invariants. These are the properties that keep the gate SAFE,
 #    and each is easy to remove by accident while "simplifying".
 # ---------------------------------------------------------------------------

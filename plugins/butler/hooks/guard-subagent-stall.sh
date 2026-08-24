@@ -135,9 +135,27 @@ case "$EVENT" in
         # subagent was dispatched. Reading the RESPONSE (not the command) is
         # deliberate -- the command only says what was asked, the response says
         # what came back.
+        #
+        # `run-package` ONLY. `need-order` used to activate here too, and that
+        # was wrong in a way that produced a closed loop.
+        #
+        # `need-order` is not work handed back -- it is the director DECLINING
+        # to choose, because the answer belongs to the operator (e.g. two
+        # delivered blueprints and no order covering them: `scope-extends-order`).
+        # Nothing is underway, so there is nothing for a Stop gate to protect.
+        # Worse: an agent that consults the director to CHECK whether anything
+        # is pending was reactivating the very run it had just finished. The
+        # diagnostic mutated the thing being diagnosed, and the session could
+        # not leave: finish -> consult -> reactivate -> blocked stop -> finish.
+        # Observed 2026-08-24.
+        #
+        # This loses nothing. When a drive is genuinely underway and hits
+        # need-order, the run is ALREADY active and activation is a no-op --
+        # activation only has an effect on a run that is idle or finished, and
+        # that is exactly the false positive.
         RESP=$(bp_json_get "$PAYLOAD" tool_response.stdout tool_response) || RESP=""
         case "$RESP" in
-          *'"action":"run-package"'*|*'"action":"need-order"'*)
+          *'"action":"run-package"'*)
             [ -f "$HOOK_DIR/../scripts/bp-runstate.pl" ] && \
               perl "$HOOK_DIR/../scripts/bp-runstate.pl" activate --root "$ROOT" \
                    --reason "director handed back work" >/dev/null 2>&1

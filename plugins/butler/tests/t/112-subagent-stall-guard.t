@@ -176,6 +176,43 @@ sub newroot { my $r = tempdir(CLEANUP => 1); mkdir "$r/.ccpraxis-local-data"; re
     is($rc, 0, '...so stopping stays allowed');
 }
 
+{   # ...and neither does need-order, which used to activate here.
+    #
+    # need-order is the director DECLINING to choose, because the answer belongs
+    # to the operator (e.g. `scope-extends-order`: delivered blueprints with no
+    # order covering them). Nothing is underway, so there is nothing for a stop
+    # gate to protect.
+    #
+    # Treating it as work handed back produced a CLOSED LOOP, observed
+    # 2026-08-24: an agent consulting the director to CHECK whether anything was
+    # pending reactivated the run it had just finished, so the stop gate blocked,
+    # so it finished again, so it consulted again. The diagnostic mutated the
+    # thing being diagnosed and the session could not leave.
+    #
+    # This costs nothing: when a drive is genuinely underway and hits
+    # need-order, the run is ALREADY active, and activation only has an effect
+    # on a run that is idle or finished — precisely the false positive.
+    my $r = newroot();
+    fire($r, bash_ev('perl plugins/butler/scripts/bp-drive-next.pl next',
+                     '{"action":"need-order","candidates":["a","b"],"reason":"scope-extends-order"}'));
+    is(state_of($r), 'inert',
+       'a director response of need-order does NOT activate — it is a question for the '
+     . 'operator, not work in flight');
+    my ($rc) = fire($r, stop());
+    is($rc, 0, '...so merely ASKING the director cannot trap the session');
+}
+
+{   # Non-vacuity for the pair above: the activation path is still wired, so the
+    # two `inert` assertions describe a discriminating rule rather than a hook
+    # that has quietly stopped activating anything at all.
+    my $r = newroot();
+    fire($r, bash_ev('perl plugins/butler/scripts/bp-drive-next.pl next',
+                     '{"action":"run-package","blueprint":"bp","package":"p9"}'));
+    is(state_of($r), 'active',
+       'counter-fixture: run-package still activates, so `done`/`need-order` staying inert '
+     . 'is a distinction the hook actually draws');
+}
+
 {   # The two resolutions, end to end.
     my $r = newroot();
     fire($r, dispatch(JSON::PP::true, 'w'));

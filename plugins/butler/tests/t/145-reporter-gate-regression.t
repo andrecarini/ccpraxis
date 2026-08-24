@@ -52,12 +52,24 @@ my $T = "$Bin";
     is($rc, 0, 'A1 CANONICAL (-> AC6/DC5): t/94-drive-loop-gate.t, run as an unmodified '
              . 'subprocess, exits 0 (Test::More\'s convention for "no failures")');
 
+    # A FLOOR, NOT AN EQUALITY. The baseline was 33; the guard is against LOSS.
+    #
+    # An exact count also fails when someone STRENGTHENS t/94, which is the
+    # opposite of what this file exists to protect and turns every legitimate
+    # new assertion into a red test in an unrelated package. That has now cost
+    # time twice — this pin and the t/112 pin below, changed for the same reason
+    # on the same grounds — so it is worth naming the general rule: an oracle
+    # that pins a count must pin the direction it cares about, or it treats
+    # improvement as breakage.
+    #
+    # The cost is stated honestly: a change that deletes one assertion and adds
+    # two passes here. A3's zero-"not ok" check and A1's exit code are what
+    # catch a silent skip; they do not depend on this number.
     my ($plan) = $out =~ /^1\.\.(\d+)\s*$/m;
-    is($plan, 33,
-       'A2 CANONICAL: t/94\'s own test PLAN count is exactly 33 — the pre-package baseline '
-     . 'recorded before this package\'s first edit. A regression that adds, removes, or '
-     . '(more subtly) SILENTLY SKIPS one of t/94\'s existing assertions changes this number '
-     . 'even if the file\'s own exit code stays 0.');
+    cmp_ok($plan, '>=', 33,
+       'A2 CANONICAL: t/94\'s own test PLAN count is at least 33 — the pre-package baseline '
+     . 'recorded before this package\'s first edit. Assertions may be ADDED; losing one is '
+     . 'the regression, and a silent skip shows up here as a shortfall.');
 
     my @not_ok = ($out =~ /^not ok /mg);
     is(scalar(@not_ok), 0,
