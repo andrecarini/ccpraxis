@@ -242,13 +242,38 @@ ok(length($launcher_src) > 0, 'launcher.pl is readable on disk') or BAIL_OUT("ca
 # Section 2 (done-criterion 2 / AC-4..AC-10, AC-21): coordinator liveness.
 # ===========================================================================
 
-# Shared fixture for AC-4..AC-7: no packages/ dir at all (falls back to the
-# registry key set, S3 behaviour #6, unchanged), a usable registry naming two
-# "running" packages, and an .orchestrator marker holding a parseable PID.
+# Shared fixture for AC-4..AC-7. LEDGER-BACKED, and it has to be.
+#
+# This used to have no packages/ dir at all, relying on the registry key-set
+# fallback to supply the package list. The fallback still works -- it is what
+# gives packages_total below -- but s02's Decision 13 removed the registry's
+# authority over STATUS: _effective_status returns '' for a package with no
+# ledger, because butler no longer writes registry.status. So every package's
+# effective status was '', running_coordinators was 0 no matter what the injected
+# prober said, and AC-5/AC-6 failed while AC-4 ("dead -> 0") passed VACUOUSLY --
+# 0 was the answer for every liveness verdict, so the block tested nothing about
+# liveness at all.
+#
+# That is the real defect here, and it is the same shape as t/126's BQ2, fixed
+# earlier today: an assertion describing behaviour a design decision removed,
+# carried as a red (and a false green beside it) rather than corrected.
+#
+# Giving the fixture real ledgers restores what AC-4..AC-7 are FOR -- that a
+# per-package coordinator PID is liveness-checked, and that an UNKNOWN probe
+# never demotes a package -- instead of re-pinning the expectations to 0, which
+# would have made the whole block permanently vacuous.
+#
+# The registry-fallback path itself keeps its own dedicated coverage elsewhere in
+# this file (S3 behaviour #6); nothing is lost by this fixture using ledgers.
 my $LIVE_ROOT = tempdir(CLEANUP => 1);
 my $LIVE_DIR  = make_bp($LIVE_ROOT, 'coord-bp',
     orchestrator => "555\n",
     registry     => registry_json(p1 => 'running', p2 => 'running', p3 => 'pending'),
+    packages     => {
+        p1 => ledger_with_status('running'),
+        p2 => ledger_with_status('running'),
+        p3 => ledger_with_status('pending'),
+    },
 );
 
 # --- AC-4: PID_ALIVE => 0 (checked-dead) -> stale, running_coordinators=0. -
@@ -666,8 +691,18 @@ my $LIVE_DIR  = make_bp($LIVE_ROOT, 'coord-bp',
             orchestrator => "1\n",
             registry     => registry_json(p1 => 'running'));   # no `packages =>` key at all
         my $s = rs('summarize_dir', $dir);
-        is(field($s, 'running_coordinators'), 1,
-            'HIGH-2 governing-rule counterpart: when packages/ has ZERO candidates (the directory itself is absent), the registry fallback still fires -- ABSENCE, not unparseability, is what licenses adopting the registry');
+        # ASSERTED ON packages_total, not running_coordinators. What this pairing
+        # is about is the PACKAGE SET: absence of packages/ licenses adopting the
+        # registry's keys. It said so, then measured a status-derived number --
+        # and s02's Decision 13 removed the registry's authority over STATUS
+        # (_effective_status returns '' with no ledger), so running_coordinators
+        # is 0 here no matter what, and the assertion had become a claim about a
+        # power the registry no longer has. packages_total measures exactly the
+        # thing named in the description.
+        is(field($s, 'packages_total'), 1,
+            'HIGH-2 governing-rule counterpart: when packages/ has ZERO candidates (the directory itself is absent), the registry fallback still fires for the PACKAGE SET -- ABSENCE, not unparseability, is what licenses adopting the registry');
+        is(field($s, 'running_coordinators'), 0,
+            'HIGH-2 counterpart: ...and the adopted keys carry NO status authority (s02 Decision 13), so nothing is counted running on the strength of registry.status alone');
     }
 }
 
@@ -828,7 +863,13 @@ my $LIVE_DIR  = make_bp($LIVE_ROOT, 'coord-bp',
 {
     my $root = tempdir(CLEANUP => 1);
     my $registry = '{"packages":{"p1":{"status":"running","pid":999},"p2":{"status":"running","pid":1000}}}';
-    my $dir = make_bp($root, 'per-pkg-liveness', orchestrator => "1\n", registry => $registry);
+    # LEDGERS, so the statuses have authority. The pids stay in the registry --
+    # that is where a per-package coordinator pid is recorded -- but s02's
+    # Decision 13 means registry.status alone makes nothing 'running', so a
+    # registry-only fixture yields 0 for every liveness verdict and this
+    # assertion could never observe the behaviour it is named for.
+    my $dir = make_bp($root, 'per-pkg-liveness', orchestrator => "1\n", registry => $registry,
+        packages => { p1 => ledger_with_status('running'), p2 => ledger_with_status('running') });
     local $RunState::PID_ALIVE = sub {
         my ($pid) = @_;
         return 1 if $pid == 1;      # the orchestrator's own PID (alive)
