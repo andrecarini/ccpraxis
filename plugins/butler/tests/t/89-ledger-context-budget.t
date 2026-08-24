@@ -51,7 +51,13 @@ my $ORCH       = "$BUTLER/scripts/bp-orchestrator.pl";
 my $GATE_STOP  = "$BUTLER/hooks/gate-stop.sh";
 
 my $BP_ROOT   = "$PROJ/.ccpraxis-local-data";
-my $BP_DIR    = "$BP_ROOT/blueprints/sandbox-butler-overhaul";
+# Resolved through live AND _archive/ -- see t/87 and almanac 20260823-210122-433f.
+# Archiving a finished blueprint is not breakage; an oracle that treats it as
+# breakage is the defect.
+use lib "$Bin/../lib";
+use HostCaps qw(corpus_blueprint_dir);
+my $BP_DIR    = corpus_blueprint_dir($PROJ, 'sandbox-butler-overhaul')
+              // "$BP_ROOT/blueprints/sandbox-butler-overhaul";
 my $CORPUS    = "$BP_DIR/packages";
 
 diag("subject under test: $SCRIPT "

@@ -30,6 +30,7 @@ our @EXPORT_OK = qw(
     same_path signal_status_visible
     symlink_works chmod_works signals_work have_jq
     data_dir_ancestor native_tmp tempdir_args git_path
+    corpus_blueprint_dir corpus_fixture
 );
 
 use File::Temp qw(tempdir);
@@ -245,6 +246,51 @@ sub data_dir_ancestor {
         $dir = $parent;
     }
     return undef;
+}
+
+# --- the live corpus, wherever it currently lives --------------------------
+#
+# almanac 20260823-210122-433f. Four oracles hardcoded
+# `.ccpraxis-local-data/blueprints/sandbox-butler-overhaul/...`. That blueprint
+# was ARCHIVED -- the documented, expected end of a finished initiative -- and
+# every one of them went red, reporting "missing" about a file sitting intact
+# 30 characters away under `_archive/`. One of them died outright and took 139
+# assertions with it.
+#
+# ARCHIVING IS NOT BREAKAGE. This is the same shape the predecessor
+# initiative's retrospective already named -- an assertion that treats a
+# legitimate new state as breakage -- and the report notes it is the third time
+# it has been paid for. Resolving through both locations makes archival a
+# non-event for the suite, which is what it should have been all along.
+#
+# The report's other finding is the sharper one: these fixtures are 10 MB files
+# under .ccpraxis-local-data/, which git does not carry, so a FRESH CLONE could
+# never pass and the failure would look identical to the archival one. That is
+# not a regression guard, it is a local ritual. Hence corpus_fixture returning
+# undef rather than dying: the caller skips, loudly, naming the uncovered
+# ground -- this module's whole doctrine, applied to a fixture instead of a
+# syscall.
+#
+# corpus_blueprint_dir($proj, $name) -> path | undef
+sub corpus_blueprint_dir {
+    my ($proj, $name) = @_;
+    return undef unless defined $proj && defined $name && length $name;
+    my $root = "$proj/.ccpraxis-local-data/blueprints";
+    for my $cand ("$root/$name", "$root/_archive/$name") {
+        return $cand if -d $cand;
+    }
+    return undef;
+}
+
+# corpus_fixture($proj, $name, $relpath) -> path | undef
+# The same resolution for a single file inside a corpus blueprint.
+sub corpus_fixture {
+    my ($proj, $name, $rel) = @_;
+    my $dir = corpus_blueprint_dir($proj, $name);
+    return undef unless defined $dir;
+    return undef unless defined $rel && length $rel;
+    my $p = "$dir/$rel";
+    return -f $p ? $p : undef;
 }
 
 1;

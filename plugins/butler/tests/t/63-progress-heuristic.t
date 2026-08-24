@@ -109,7 +109,14 @@ my $PROJ   = fwd(abs_path("$Bin/../../../..") // "$Bin/../../../..");
 
 my $SCRIPT          = "$BUTLER/scripts/bp-progress.pl";
 my $ORCH_SCRIPT     = "$BUTLER/scripts/bp-orchestrator.pl";
-my $REAL_TRANSCRIPT = "$PROJ/.ccpraxis-local-data/blueprints/sandbox-butler-overhaul/runs/b25-feedback-intake.jsonl";
+# Resolved through the live AND _archive/ locations rather than hardcoded.
+# sandbox-butler-overhaul was archived -- the expected end of a finished
+# initiative -- and this line used to report the fixture "missing" while it sat
+# intact under _archive/. almanac 20260823-210122-433f. undef = genuinely absent
+# (a fresh clone: these are 10 MB files git does not carry), which is a SKIP.
+use lib "$Bin/../lib";
+use HostCaps qw(corpus_fixture);
+my $REAL_TRANSCRIPT = corpus_fixture($PROJ, 'sandbox-butler-overhaul', 'runs/b25-feedback-intake.jsonl');
 
 diag("subject under test: $SCRIPT " . (-e $SCRIPT ? "(present)" : "(ABSENT -- every C1..C8 assertion below is expected to fail)"));
 
@@ -500,8 +507,23 @@ my @c3_results;
         tool_event(epoch => 2_000_000_000 - 60, tool => 'Bash', input => { command => 'echo hi' }));
 
     my ($root_big, $bp_big, $pkg_big) = new_bp_root();
-    ok(-f $REAL_TRANSCRIPT && -s $REAL_TRANSCRIPT == 10_351_554,
-        'C4 FIXTURE-SANITY: the real 10.3MB transcript is present for the bounded-read check');
+  SKIP: {
+    # A SKIP, not a failure. The fixture is a 10 MB file under
+    # .ccpraxis-local-data/, which git does not carry, so a fresh clone has
+    # never had it -- and a test that goes red for a missing untracked artifact
+    # claims the code is broken when only the checkout differs. HostCaps'
+    # doctrine, applied to a fixture: name the uncovered ground, do not lie
+    # about it.
+    skip 'the 10.3MB transcript corpus is not in this checkout (untracked, '
+       . 'not carried by git) -- the bounded-read check is NOT covered here', 6
+        unless defined $REAL_TRANSCRIPT;
+
+    # A FLOOR, not the exact byte count. The property under test is "a bounded
+    # read of a LARGE file"; pinning 10,351,554 exactly meant the corpus could
+    # never be regenerated or trimmed without this going red for a reason that
+    # has nothing to do with bounded reading.
+    cmp_ok(-s $REAL_TRANSCRIPT, '>=', 10_000_000,
+        'C4 FIXTURE-SANITY: the transcript corpus is present and large enough (>=10MB) for the bounded-read check');
     require File::Path; File::Path::make_path("$root_big/blueprints/$bp_big/runs") unless -d "$root_big/blueprints/$bp_big/runs";
     copy($REAL_TRANSCRIPT, transcript_path($root_big,$bp_big,$pkg_big))
         or die "failed to copy real transcript fixture: $!";
@@ -558,6 +580,7 @@ my @c3_results;
         'C4: peak RSS delta between the tiny fixture and the 10.3MB real transcript is well under '
         . "6MB -- proves the read is bounded (seek-from-end), not a slurp "
         . "(small_peak=${small_peak}KB big_peak=${big_peak}KB delta=${delta_kb}KB)");
+  }
 }
 
 # =====================================================================================

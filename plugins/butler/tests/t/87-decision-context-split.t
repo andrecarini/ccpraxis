@@ -47,7 +47,14 @@ my $PROJ   = fwd(abs_path("$Bin/../../../..") // "$Bin/../../../..");
 my $ORCH   = "$BUTLER/scripts/bp-orchestrator.pl";
 
 my $BP_ROOT   = "$PROJ/.ccpraxis-local-data";
-my $BP_DIR    = "$BP_ROOT/blueprints/sandbox-butler-overhaul";
+# Resolved through live AND _archive/. This blueprint was archived -- the
+# expected end of a finished initiative -- and the hardcoded path made that a
+# CRASH here: the file died outright and took 139 assertions with it, reporting
+# nothing at all rather than one honest skip. almanac 20260823-210122-433f.
+use lib "$Bin/../lib";
+use HostCaps qw(corpus_blueprint_dir);
+my $BP_DIR    = corpus_blueprint_dir($PROJ, 'sandbox-butler-overhaul')
+              // "$BP_ROOT/blueprints/sandbox-butler-overhaul";
 my $LIVE_BP   = "$BP_DIR/blueprint.md";
 my $DECISIONS_DIR = "$BP_DIR/reports/decisions";
 

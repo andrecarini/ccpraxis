@@ -85,7 +85,13 @@ my $PROJ   = fwd(abs_path("$Bin/../../../..") // "$Bin/../../../..");
 my $SCRIPT        = "$BUTLER/scripts/bp-cache-state.pl";
 my $ORCH_SCRIPT   = "$BUTLER/scripts/bp-orchestrator.pl";
 my $SWEEP_SCRIPT  = "$BUTLER/scripts/bp-resume-sweep.sh";
-my $REAL_TRANSCRIPT = "$PROJ/.ccpraxis-local-data/blueprints/sandbox-butler-overhaul/runs/b25-feedback-intake.jsonl";
+# Resolved through live AND _archive/ -- sandbox-butler-overhaul was archived,
+# and this line used to call the fixture "missing" while it sat intact under
+# _archive/. almanac 20260823-210122-433f. undef = absent from this checkout
+# (10 MB, untracked), which is a SKIP rather than a red assertion.
+use lib "$Bin/../lib";
+use HostCaps qw(corpus_fixture);
+my $REAL_TRANSCRIPT = corpus_fixture($PROJ, 'sandbox-butler-overhaul', 'runs/b25-feedback-intake.jsonl');
 
 diag("subject under test: $SCRIPT " . (-e $SCRIPT ? "(present)" : "(ABSENT -- every C1..C11 assertion below is expected to fail)"));
 
@@ -383,8 +389,19 @@ sub mk_age_fixture {
 # =====================================================================================
 {
     my ($root, $bp, $pkg) = new_bp_root();
-    ok(-f $REAL_TRANSCRIPT && -s $REAL_TRANSCRIPT == 10_351_554,
-        'C5 FIXTURE-SANITY: the real b25-feedback-intake.jsonl is present and exactly 10,351,554 bytes')
+  SKIP: {
+    # SKIP, not fail: this is a 10 MB untracked artifact, so a fresh clone has
+    # never had it and a red line here would blame the code for the checkout.
+    skip 'the b25-feedback-intake.jsonl corpus is not in this checkout (untracked, '
+       . 'not carried by git) -- the real-transcript cache observation is NOT covered here', 5
+        unless defined $REAL_TRANSCRIPT;
+
+    # A FLOOR. The exact-byte pin meant the corpus could never be regenerated or
+    # trimmed; what this assertion is really for is "the real, large transcript
+    # is here", and the content properties C5 depends on are asserted below by
+    # observing them, not by pinning a size.
+    cmp_ok(-s $REAL_TRANSCRIPT, '>=', 10_000_000,
+        'C5 FIXTURE-SANITY: the real b25-feedback-intake.jsonl is present and large (>=10MB)')
         or diag("real transcript missing or resized: $REAL_TRANSCRIPT");
     require File::Path; File::Path::make_path("$root/blueprints/$bp/runs") unless -d "$root/blueprints/$bp/runs";
     copy($REAL_TRANSCRIPT, transcript_path($root,$bp,$pkg))
@@ -405,6 +422,7 @@ sub mk_age_fixture {
         "C5: the recorded observation is a HIT (cache_read_input_tokens=18196 on the real "
         . "transcript's first assistant response)")
         or diag('recorded entry: ' . $J->encode($last));
+  }
 }
 
 # =====================================================================================
