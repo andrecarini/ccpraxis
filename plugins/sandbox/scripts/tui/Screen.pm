@@ -149,10 +149,34 @@ sub _render_panel {
         # result. The cap is per source line, not per panel: the operator asked
         # for three lines per activity row, not three rows of activity.
         my $cap = (ref($panel) eq 'HASH') ? $panel->{wrap_cap} : undef;
-        my $cells = tui::Frame::wrap_capped(
-            [ { text => '  ', role => 'text.primary' }, @elems ],
-            $role, $w, WRAP_CONTINUATION_INDENT(), $cap
-        );
+        my $brk = (ref($panel) eq 'HASH') ? $panel->{wrap_break} : undef;
+        my $spans = [ { text => '  ', role => 'text.primary' }, @elems ];
+
+        my $cells;
+        if (defined $brk && !ref($brk) && $brk eq 'char') {
+            # CHARACTER BREAKING WITH A HANGING INDENT, for panels whose rows
+            # have a fixed prefix and whose bodies are single long tokens -- the
+            # activity column. Operator: "It doesn't need to respect word
+            # boundaries, I would rather have it just always break in a dumb way
+            # at the character", and the continuation "should be aligned to the
+            # text itself after the icon".
+            #
+            # `wrap_indent` is declared by the PANEL and is relative to the row's
+            # own text: the panel knows its prefix is `HH:MM  <glyph> `, this
+            # function does not. The 2-column body indent prepended just above is
+            # added here rather than by the panel, because it is this function's
+            # doing and the panel has no business knowing about it.
+            my $hang = (ref($panel) eq 'HASH'
+                        && defined $panel->{wrap_indent}
+                        && !ref($panel->{wrap_indent})
+                        && $panel->{wrap_indent} =~ /^\d+$/)
+                     ? $panel->{wrap_indent} : WRAP_CONTINUATION_INDENT();
+            $cells = tui::Frame::wrap_chars($spans, $role, $w, $hang + 2, $cap);
+        } else {
+            $cells = tui::Frame::wrap_capped(
+                $spans, $role, $w, WRAP_CONTINUATION_INDENT(), $cap
+            );
+        }
         for my $c (@$cells) {
             last if @out >= $maxh;
             push @out, $c;

@@ -181,6 +181,12 @@ use constant LABEL_GUTTER => 11;
 # Decision 2, operator-confirmed.
 use constant GUTTER_SEP => '   ';
 
+# The display width of an activity row's fixed prefix: the 6-column left-padded
+# HH:MM plus two spaces (8), then the glyph plus one space (2). Kept next to the
+# other layout constants rather than inline at the panel, because it has to
+# match what Dashboard::recent_events actually emits -- t/98 pins the pair.
+use constant ACTIVITY_HANG => 10;
+
 # gutter($label) -> the padded label span text. PUBLIC (used by the three
 # label-rendering sites in this file).
 sub gutter {
@@ -1311,11 +1317,28 @@ sub panels {
     # is no side column, and the panel falls back into the band flow -- where
     # flex is exactly what stops it being squeezed out by the panels above it.
     # Dropping the flag would have made the narrow case worse than it is today.
-    push @out, { title    => 'Recent activity',
-                 lines    => (@$ev ? [ @$ev ] : [ '(no events yet)' ]),
-                 flex     => 1,
-                 side     => 1,
-                 wrap_cap => 3 };
+    # ACTIVITY_HANG is the width of an event row's fixed prefix, so a wrapped
+    # row's continuation lines up under the BODY rather than under the
+    # timestamp. Dashboard::recent_events builds every row as
+    #   sprintf('%-6s  ', $hhmm)   -> 8 columns
+    #   "$glyph "                  -> 2 columns
+    # and the body follows at column 10. Operator, with a screenshot: the
+    # wrapped text "is aligned to the hour minute `:` separator, should be
+    # aligned to the text itself after the icon".
+    #
+    # `wrap_break => 'char'` is the other half of the same request -- "It
+    # doesn't need to respect word boundaries, I would rather have it just
+    # always break in a dumb way at the character". Word wrapping is actively
+    # bad here: an event body is one long token (claude_json_relocation_skip),
+    # so in a ~30-column column it either overflows or leaves the row half
+    # empty. Breaking anywhere fills the column.
+    push @out, { title       => 'Recent activity',
+                 lines       => (@$ev ? [ @$ev ] : [ '(no events yet)' ]),
+                 flex        => 1,
+                 side        => 1,
+                 wrap_cap    => 3,
+                 wrap_break  => 'char',
+                 wrap_indent => ACTIVITY_HANG() };
 
     return \@out;
 }

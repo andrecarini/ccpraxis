@@ -305,4 +305,83 @@ for my $cols (@WIDE, @NARROW) {
     }
 }
 
+# ===========================================================================
+# PART 6 -- character-level wrapping with a hanging indent.
+#
+# Operator feedback, with a screenshot, on the shipped column:
+#   "It doesn't need to respect word boundaries, I would rather have it just
+#    always break in a dumb way at the character"
+#   "the wrapped text needs to be aligned to the text above ... aligned to the
+#    hour minute `:` separator, should be aligned to the text itself after the
+#    icon"
+#
+# Both halves matter and they are independent, so both are asserted.
+#
+# Note this part exists because PART 1-5 all stayed green through the change --
+# they cover the CAP and the column geometry, not how a row breaks. A behaviour
+# change that no assertion notices is a gap in the oracle, not a free pass.
+# ===========================================================================
+{
+    can_ok('tui::Frame', 'wrap_chars');
+
+    # A real activity row: 8-column time prefix, 2-column glyph prefix, body.
+    my $row = [ { text => sprintf('%-6s  ', '21:19'), role => 'text.muted' },
+                { text => 'x ',                      role => 'state.crit' },
+                { text => 'backpack_install_failed exit=1', role => 'state.crit' } ];
+
+    my $cells = tui::Frame::wrap_chars($row, 'text.primary', 32, 10, 3);
+    my @txt = map { my $c = $_; join('', map { $_->{text} } @{ $c->{spans} || [] }) } @$cells;
+    cmp_ok(scalar(@txt), '>=', 2, 'PART6: a row longer than the column wraps');
+
+    # (a) CHARACTER breaking: the first row is filled to the column width, which
+    #     a word-boundary wrap could not do -- it would have to stop at the
+    #     space before `exit=1` and leave the tail of the row empty.
+    is(tui::Layout::display_width($txt[0]), 32,
+       'PART6a: the first line fills the column exactly -- broken at a character, not at a '
+     . 'word boundary (a word wrap would stop early and leave the row short)');
+    like($txt[0], qr/backpack_install_faile\z/,
+         'PART6a: ...and the break lands mid-token, which is the "dumb break" that was asked for');
+
+    # (b) HANGING INDENT: continuation starts under the BODY (column 10), not
+    #     under the timestamp and not at the old 2-column continuation indent.
+    my ($lead) = $txt[1] =~ /^( *)/;
+    is(length($lead), 10,
+       'PART6b: the continuation is indented to the BODY column (10 = 8-col time + 2-col glyph), '
+     . 'so it lines up under the event text rather than under the clock');
+
+    # Non-vacuity: the SAME row with no hang is NOT indented, so PART6b is
+    # pinning the parameter rather than some incidental property of the text.
+    my $flat = tui::Frame::wrap_chars($row, 'text.primary', 32, 0, 3);
+    my $f1 = join('', map { $_->{text} } @{ $flat->[1]{spans} || [] });
+    unlike($f1, qr/^ {10}/,
+           'PART6b non-vacuity: with hang=0 the continuation is not indented, so the assertion '
+         . 'above measures the hanging indent and not the body text');
+
+    # (c) The cap still applies, and a truncated row still carries the ellipsis.
+    my $long = [ { text => sprintf('%-6s  ', '21:19'), role => 'text.muted' },
+                 { text => 'x ', role => 'state.crit' },
+                 { text => ('z' x 400), role => 'state.crit' } ];
+    my $capped = tui::Frame::wrap_chars($long, 'text.primary', 32, 10, 3);
+    is(scalar(@$capped), 3, 'PART6c: the 3-row cap is honoured');
+    my $last = join('', map { $_->{text} } @{ $capped->[-1]{spans} || [] });
+    like($last, qr/\Q@{[ tui::Frame::ELLIPSIS() ]}\E/,
+         'PART6c: the capped row carries the ellipsis, so a truncated row stays distinguishable '
+       . 'from a complete one');
+
+    # (d) Totality: the degenerate widths must not die or loop.
+    for my $w (0, 1, 5) {
+        my $got = eval { tui::Frame::wrap_chars($row, 'text.primary', $w, 10, 3) };
+        ok(!$@ && ref($got) eq 'ARRAY', "PART6d: wrap_chars survives width $w without dying");
+    }
+
+    # (e) The panel actually asks for this. A helper nothing calls is not a fix.
+    my $panels = tui::DashboardScreen::panels({ events => [ $row ] }, 132);
+    my ($act) = grep { ref($_) eq 'HASH' && ($_->{title} // '') eq 'Recent activity' } @{ $panels || [] };
+    ok($act, 'PART6e: the Recent activity panel exists');
+    is(($act || {})->{wrap_break}, 'char',
+       'PART6e: ...and declares character breaking');
+    is(($act || {})->{wrap_indent}, 10,
+       'PART6e: ...and a hanging indent matching the row prefix Dashboard::recent_events emits');
+}
+
 done_testing();

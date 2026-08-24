@@ -930,6 +930,112 @@ my $ELLIPSIS_CACHE;
 # rendered a full stop where the ellipsis belonged. It compiled, every test
 # passed, and only READING the rendered screen caught it -- which is exactly
 # what a UI pass is for.
+# wrap_chars($line, $role, $w, $hang, $max_rows) -> \@cells
+#
+# CHARACTER-LEVEL wrapping with a HANGING INDENT. A deliberate second wrapper,
+# not a mode bolted onto wrap_line, because it answers a different question.
+#
+# wrap_line breaks at word boundaries and indents continuations by a small fixed
+# amount. That is right for prose (a banner, a message). It is wrong for the
+# Recent activity column, where every row is `HH:MM  <glyph> body` and the
+# operator asked for exactly two things, in their words: "It doesn't need to
+# respect word boundaries, I would rather have it just always break in a dumb
+# way at the character", and "the wrapped text needs to be aligned to the text
+# above ... should be aligned to the text itself after the icon".
+#
+# Word wrapping in a ~30-column column also wastes a lot of it: an event body is
+# one long token like `claude_json_relocation_skip`, so word logic either
+# overflows or leaves half the row empty. Breaking anywhere fills the column.
+#
+# $hang is the continuation indent in DISPLAY COLUMNS, applied to every row
+# after the first, so continuations line up under the body rather than under the
+# timestamp. Line 0 is never indented -- its own prefix already puts it there.
+#
+# Total: never dies, always returns at least one cell, and degrades to a single
+# empty cell for a non-positive width. Roles are carried per character, so a
+# break mid-span keeps both halves coloured as they were.
+sub wrap_chars {
+    my ($line, $role, $w, $hang, $max_rows) = @_;
+    $role = DEFAULT_ROLE() if !defined $role;
+
+    my $w_num = (!defined $w || ref($w) || $w !~ /^-?\d+(?:\.\d+)?$/) ? 0 : int($w);
+    return [ make_cell('', $role, 0) ] if $w_num < 1;
+
+    my $hang_n = (!defined $hang || ref($hang) || $hang !~ /^-?\d+(?:\.\d+)?$/) ? 0 : int($hang);
+    $hang_n = 0 if $hang_n < 0;
+    # A hanging indent wider than the column would leave no room for content at
+    # all, which is worse than losing the alignment. Same fallback shape
+    # wrap_line uses for its own degenerate indent case.
+    $hang_n = 0 if $hang_n >= $w_num;
+
+    my $cap = (defined $max_rows && !ref($max_rows) && $max_rows =~ /^-?\d+(?:\.\d+)?$/)
+            ? int($max_rows) : undef;
+    return [] if defined($cap) && $cap < 1;
+
+    # Flatten to (char, role) pairs. Decoding per span keeps a multi-byte
+    # character whole -- splitting the raw bytes would cut a UTF-8 sequence in
+    # half, which is how a wrap turns into mojibake.
+    my @chars;
+    for my $sp (@{ spanify($line, $role) }) {
+        my $txt  = defined $sp->{text} ? $sp->{text} : '';
+        my $rl   = defined $sp->{role} ? $sp->{role} : $role;
+        for my $c (split //, _strip_sgr(_decode_str($txt))) {
+            push @chars, [ $c, $rl ];
+        }
+    }
+    return [ make_cell('', $role, $w_num) ] unless @chars;
+
+    my @rows;
+    my $i = 0;
+    while ($i <= $#chars) {
+        my $first  = !@rows;
+        my $indent = $first ? 0 : $hang_n;
+        my $budget = $w_num - $indent;
+        $budget = 1 if $budget < 1;
+
+        my @spans;
+        push @spans, { text => ' ' x $indent, role => $role } if $indent > 0;
+
+        my $used = 0;
+        my ($buf, $buf_role) = ('', undef);
+        while ($i <= $#chars) {
+            my ($c, $rl) = @{ $chars[$i] };
+            my $cw = tui::Layout::char_cols($c);
+            $cw = 1 if !defined $cw || $cw < 0;
+            last if $used > 0 && $used + $cw > $budget;
+            # A single character wider than the whole budget would loop forever
+            # if it were never consumed; take it and overflow by design.
+            if (defined $buf_role && $rl ne $buf_role) {
+                push @spans, { text => Encode::encode('UTF-8', $buf), role => $buf_role };
+                $buf = '';
+            }
+            $buf_role = $rl;
+            $buf .= $c;
+            $used += $cw;
+            $i++;
+        }
+        push @spans, { text => Encode::encode('UTF-8', $buf), role => $buf_role }
+            if length $buf;
+        push @rows, \@spans;
+        last if defined($cap) && @rows >= $cap;
+    }
+
+    # Anything left over is content being dropped, and a truncated row must be
+    # distinguishable from a complete one -- the same statement the ellipsis
+    # carries everywhere else in this file.
+    if ($i <= $#chars && @rows) {
+        my $room = $w_num - ELLIPSIS_COLS();
+        my $last = $rows[-1];
+        if ($room > 0) {
+            my $trimmed = fit_spans($last, $room);
+            push @$trimmed, { text => ELLIPSIS(), role => $role };
+            $rows[-1] = $trimmed;
+        }
+    }
+
+    return [ map { make_cell($_, $role, $w_num) } @rows ];
+}
+
 sub ELLIPSIS {
     return $ELLIPSIS_CACHE if defined $ELLIPSIS_CACHE;
     my $g = Theme::glyph('ellipsis');
