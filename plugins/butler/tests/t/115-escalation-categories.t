@@ -105,7 +105,13 @@ sub mk_ledger_bp {
 # AC: DC1 (taxonomy plumbing precondition)
 # ═══════════════════════════════════════════════════════════════════════════
 {
-    my @want = qw(product operational conformance oracle scoping implementation unclassified);
+    # 'operational' was RENAMED to 'operator-action'. The category declares who
+    # must act, not what the subject matter is, and the old name said the second
+    # thing -- so it collected every infrastructural-feeling escalation into the
+    # one category the resolver may never touch. Operator, on the run that
+    # forced this: "It stopped an overnight run blocking on me to answer some
+    # random bullshit question that is an implementation detail."
+    my @want = qw(product operator-action conformance oracle scoping implementation unclassified);
     is_deeply([sort @BpOrch::CATEGORIES], [sort @want],
         'A1: @BpOrch::CATEGORIES is exactly the 7-value closed set e01 defines') or
         diag('got: ' . join(',', @BpOrch::CATEGORIES));
@@ -113,6 +119,21 @@ sub mk_ledger_bp {
         ok($BpOrch::VALID_CATEGORY{$c}, "A2: \%VALID_CATEGORY recognizes '$c'");
     }
     ok(!$BpOrch::VALID_CATEGORY{'not-a-real-category'}, 'A3: an unlisted string is not in %VALID_CATEGORY');
+
+    # The legacy spelling is ACCEPTED and normalised, never refused. Records
+    # written before the rename are still queued on real disks, and refusing them
+    # would strand live escalations behind a vocabulary change -- a worse failure
+    # than the one the rename fixes.
+    is(BpOrch::canonical_category('operational'), 'operator-action',
+       "A4: the legacy 'operational' spelling canonicalises to 'operator-action'");
+    is(BpOrch::canonical_category('operator-action'), 'operator-action',
+       'A5: canonicalisation is idempotent');
+    is(BpOrch::canonical_category('product'), 'product',
+       'A6: a category with no alias passes through unchanged');
+    is(BpOrch::canonical_category(undef), undef,
+       'A7: undef in, undef out -- the helper never invents a category');
+    ok(!$BpOrch::VALID_CATEGORY{'operational'},
+       'A8: ...but the legacy name is NOT in the canonical set, so nothing new can be FILED under it');
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -268,7 +289,13 @@ sub mk_ledger_bp {
     my @f = needs_you_files($runs);
     is(scalar @f, 1, 'C4: exactly one decision filed');
     my $rec = $J->decode(slurp("$runs/needs-you/$f[0]"));
-    is($rec->{category}, 'operational', 'C4: the filed decision carries the passed category');
+    # The fixture deliberately passes the LEGACY spelling, so this is now two
+    # assertions in one: the category still round-trips to the record, AND it is
+    # canonicalised on the way. Exactly one spelling ever reaches disk, which is
+    # what lets every reader compare without knowing the history.
+    is($rec->{category}, 'operator-action',
+       "C4: the filed decision carries the passed category, canonicalised -- a legacy "
+     . "'operational' call site is accepted and stored as 'operator-action'");
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -364,10 +391,22 @@ sub mk_ledger_bp {
     # category on its own line still counts; a ternary/expression value (e.g.
     # the _require_category log call's `category => (defined ... )`) is not a
     # quoted literal and will not match this pattern.
-    my @found = ($src =~ /\bcategory\s*=>\s*['"]([\w-]+)['"]/g);
-    ok(scalar(@found) >= 21,
-        'J1: AC2 self-check -- at least 21 literal category => \'...\' assignments found in bp-orchestrator.pl '
-      . '(one per real call site; #5/#9 are internal mechanism rows that inherit the caller\'s literal)')
+    # COMMENTS STRIPPED FIRST. This used to scan the raw source, so a comment
+    # that happened to quote the idiom -- `# e01 §3 row 20: category =>
+    # 'operational'` -- was counted as a call site. Editing that comment's
+    # wording then changed the count and turned this assertion red with no call
+    # site added or removed, which is the same defect this repo has now paid for
+    # in t/65, t/66 and t/145: an oracle pinning PROSE.
+    (my $code = $src) =~ s/^\s*#.*$//mg;      # whole-line comments
+    $code =~ s/(?<!['"])#(?![\w-]*['"]).*$//mg;  # trailing comments, leaving #-in-string alone
+    my @found = ($code =~ /\bcategory\s*=>\s*['"]([\w-]+)['"]/g);
+    # 15, measured after stripping. The old raw-source count of 21 included SIX
+    # comments, so its own description -- "one per real call site" -- was never
+    # true of the number it asserted.
+    ok(scalar(@found) >= 15,
+        'J1: AC2 self-check -- at least 15 literal category => \'...\' assignments in '
+      . 'bp-orchestrator.pl CODE (comments excluded). A floor, not an equality: adding a '
+      . 'call site is not a regression, losing one is.')
         or diag('found ' . scalar(@found) . ' literal(s): ' . join(',', @found));
 
     my %valid = map { $_ => 1 } @BpOrch::CATEGORIES;

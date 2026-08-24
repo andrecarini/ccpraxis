@@ -14,7 +14,7 @@
 # other or with bp-wait-for-decision.pl's UNRELATED classify_decision /
 # autonomous_decision_record pair (b24-reporter-autonomy) --
 #   (a) in-place tag on the STILL-QUEUED runs/needs-you/<id>.json, when the
-#       resolver's verdict lands on category product/operational (including
+#       resolver's verdict lands on category product/operator-action (including
 #       every unclassified record that falls back there);
 #   (b) a durable archive at runs/resolved-escalations/<id>.json, written
 #       BEFORE any resolver-triggered unlink of the queue file -- a FAILED
@@ -50,16 +50,24 @@ require "$SELF_DIR/bp-write-guard.pl";    # BpWrite::guarded_write -- used only 
 my @VALID_ACTIONS = ('relaunch', 'widen-write-set', 'edit-depends-on', 'author-ledger');
 my %VALID_ACTION  = map { $_ => 1 } @VALID_ACTIONS;
 
-# The four categories the resolver may ACT on (never product/operational,
+# The four categories the resolver may ACT on (never product/operator-action,
 # never unclassified as a terminal value -- e01 §2.2/§2.3, restated here as
 # the closed set this module is allowed to mutate on).
 my @RESOLVER_OWNED = qw(conformance oracle scoping implementation);
 my %RESOLVER_OWNED = map { $_ => 1 } @RESOLVER_OWNED;
 
+# The two the resolver may never DECIDE, only confirm (the 'tag-only' verdict).
+# Named once rather than open-coded as `$cat eq 'product' || $cat eq '...'` at
+# each gate: that idiom is how the rename would have been applied to two of the
+# three sites and missed the third.
+my @OPERATOR_OWNED = qw(product operator-action);
+my %OPERATOR_OWNED = map { $_ => 1 } @OPERATOR_OWNED;
+sub _operator_owned { my ($c) = @_; return defined $c && $OPERATOR_OWNED{$c} ? 1 : 0 }
+
 # ---------------------------------------------------------------------------
 # verdict_shape_ok(\%verdict) -> (1|0, $why)   -- PURE, no I/O.
 # Required keys present per category:
-#   product|operational  -> category, confidence, evidence defined;
+#   product|operator-action  -> category, confidence, evidence defined;
 #                            action MUST be absent/undef (a shape violation
 #                            otherwise -- see confidence_gate's own comment).
 #   conformance|oracle|scoping|implementation
@@ -70,16 +78,19 @@ my %RESOLVER_OWNED = map { $_ => 1 } @RESOLVER_OWNED;
 #   'unclassified' as a legitimate terminal answer.
 # Content (emptiness, confidence value) is judged elsewhere (confidence_gate)
 # -- this only checks presence, so a low-confidence or empty-evidence
-# product/operational verdict is still shape_ok (V10's own pinned behavior).
+# product/operator-action verdict is still shape_ok (V10's own pinned behavior).
 # ---------------------------------------------------------------------------
 sub verdict_shape_ok {
     my ($v) = @_;
     return (0, 'verdict must be a hashref') unless ref $v eq 'HASH';
-    my $cat = $v->{category};
+    # Canonicalise before every comparison below: a verdict may name the legacy
+    # 'operational' spelling (an older agent doc, a replayed verdict file), and
+    # it must be judged by what it means. BpOrch owns the alias map.
+    my $cat = BpOrch::canonical_category($v->{category});
     return (0, 'missing category') unless defined $cat && length $cat;
 
-    if ($cat eq 'product' || $cat eq 'operational') {
-        return (0, "category=$cat verdict must not carry an action -- product/operational are never actable")
+    if (_operator_owned($cat)) {
+        return (0, "category=$cat verdict must not carry an action -- product/operator-action are never actable")
             if defined $v->{action};
         for my $k (qw(confidence evidence)) {
             return (0, "missing required key '$k' for category=$cat") unless defined $v->{$k};
@@ -93,7 +104,7 @@ sub verdict_shape_ok {
         return (1, undef);
     }
     return (0, "category '" . $cat . "' is not a recognized terminal verdict category "
-             . "(must be one of product/operational/conformance/oracle/scoping/implementation -- "
+             . "(must be one of product/operator-action/conformance/oracle/scoping/implementation -- "
              . "'unclassified' is never a legitimate FINAL verdict, e01 §2.1)");
 }
 
@@ -109,7 +120,12 @@ sub verdict_in_bounds {
     if (defined $act && ($act eq 'accept' || $act eq 'drop')) {
         return (0, "action='$act' is never permitted -- the resolver may never accept or drop a decision");
     }
-    my $cat = $v->{category} // '';
+    # Canonicalised, like the other two gates. Without this a legacy
+    # 'operational' verdict passes verdict_shape_ok (which canonicalises) and
+    # then fails HERE on the membership check, because @BpOrch::CATEGORIES no
+    # longer contains the old spelling -- a verdict accepted by one gate and
+    # rejected by the next, for a difference neither gate is about.
+    my $cat = BpOrch::canonical_category($v->{category}) // '';
     return (0, "category '$cat' is not one of the closed 7-category set")
         unless grep { $_ eq $cat } @BpOrch::CATEGORIES;
     if ($RESOLVER_OWNED{$cat}) {
@@ -124,7 +140,7 @@ sub verdict_in_bounds {
 # confidence_gate(\%verdict) -> 'act' | 'tag-only' | 'refuse'   -- PURE.
 # 'act'      iff shape_ok && in_bounds && category is resolver-owned &&
 #            confidence eq 'high' && evidence is non-empty.
-# 'tag-only' iff shape_ok && category in {product, operational}. An 'action'
+# 'tag-only' iff shape_ok && category in {product, operator-action}. An 'action'
 #            key present on such a verdict is itself a shape violation
 #            (verdict_shape_ok already refused it) and this branch never
 #            fires for it -- it falls through to 'refuse' instead, so a
@@ -142,8 +158,8 @@ sub confidence_gate {
     return 'refuse' unless ref $v eq 'HASH';
     my ($shape_ok) = verdict_shape_ok($v);
     return 'refuse' unless $shape_ok;
-    my $cat = $v->{category} // '';
-    return 'tag-only' if $cat eq 'product' || $cat eq 'operational';
+    my $cat = BpOrch::canonical_category($v->{category}) // '';
+    return 'tag-only' if _operator_owned($cat);
     my ($bounds_ok) = verdict_in_bounds($v);
     if ($bounds_ok && $RESOLVER_OWNED{$cat}
         && defined $v->{confidence} && $v->{confidence} eq 'high'

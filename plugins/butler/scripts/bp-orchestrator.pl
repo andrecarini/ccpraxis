@@ -127,8 +127,60 @@ our %DECISION_VALIDITY = (
 # e02: the closed 7-value escalation-category taxonomy (e01 spec §2.2). One
 # canonical source; queue_needs_you/_enter_pause_manual/_block_and_queue all
 # gate on %VALID_CATEGORY via _require_category (below) before any side effect.
-our @CATEGORIES = qw(product operational conformance oracle scoping implementation unclassified);
+#
+# 'operator-action' WAS 'operational', and the rename is the fix, not cosmetics.
+#
+# THE CATEGORY DOES NOT DESCRIBE THE SUBJECT MATTER. IT DECLARES WHO MUST ACT.
+# That is the whole axis. product and operator-action are the two the resolver
+# may NEVER decide (bp-resolve.pl's tag-only branch), so choosing one of them is
+# choosing to wake a human -- possibly at 3am, possibly for hours, since a
+# blocked fleet waits until someone reads it.
+#
+# 'operational' did not say that. It read as "about the machinery", which is a
+# statement about topic, and so it collected every escalation that felt
+# infrastructural whether or not a human could do anything about it. It became
+# the single largest category in this file -- nine call sites, more than any
+# other -- and it is the one category with no autonomous exit. Operator, on the
+# run this fixes: "It stopped an overnight run blocking on me to answer some
+# random bullshit question that is an implementation detail."
+#
+# The name now asks the question that decides the answer: does this need the
+# operator's HANDS (re-authenticate, repair the environment, choose between two
+# products)? If a competent agent with the resolver's four actions could clear
+# it, it is not operator-action, however infrastructural it looks.
+our @CATEGORIES = qw(product operator-action conformance oracle scoping implementation unclassified);
 our %VALID_CATEGORY = map { $_ => 1 } @CATEGORIES;
+
+# Records written before the rename are still on disk and still queued. They are
+# ACCEPTED and normalised, never refused: refusing them would strand real
+# escalations behind a vocabulary change, which is a worse failure than the one
+# being fixed. Canonicalisation happens at the emitter gate and at every reader,
+# so nothing downstream ever has to know both spellings.
+our %CATEGORY_ALIAS = ('operational' => 'operator-action');
+
+# The categories whose records the escalation-resolver is allowed to LOOK AT.
+# One source, consumed by the dispatch filter below and by bp-resolve.pl, which
+# used to keep its own hardcoded copy of the same four names.
+#
+# 'unclassified' is in here and that is the important entry: it is the "triage
+# me" state. A record filed unclassified gets read by the resolver, which either
+# acts on it or tags it product/operator-action -- the human is the FALLBACK,
+# reached by a judgement rather than by a guess made at the call site.
+#
+# Which is why filing product or operator-action directly is a heavy thing to
+# do: those are NOT in this list, so the resolver never sees the record at all.
+# The category a call site writes is a FINAL, UNREVIEWABLE ROUTING DECISION, and
+# the only correct reason to make it is that you are certain no agent could ever
+# clear this without a human's hands. If you are not certain, file
+# 'unclassified' and let the resolver decide -- it can still route to the
+# operator, and then it will have been a judgement rather than an assumption.
+our @RESOLVER_TRIAGEABLE = qw(unclassified conformance oracle scoping implementation);
+our %RESOLVER_TRIAGEABLE = map { $_ => 1 } @RESOLVER_TRIAGEABLE;
+sub canonical_category {
+    my ($c) = @_;
+    return undef unless defined $c && !ref $c;
+    return $CATEGORY_ALIAS{$c} // $c;
+}
 
 # e02 §2.5: the kind->family registry that replaces bp-answer-decision.pl's
 # source-scanning known_kinds()/kind_family() derivation. Fixes the still-live
@@ -177,9 +229,18 @@ sub known_kinds_list { return @KNOWN_KINDS; }
 # (no .paused with nothing filed, no package marked blocked with nothing
 # queued). Never dies -- same shape as _escalation_write_failed. $ctx: { log,
 # kind, package, site }.
+# Takes a SCALAR REF to the category slot, not a copy, so the alias map can be
+# applied in place: validating and canonicalising must not be two steps a future
+# call site can perform half of. A legacy 'operational' is accepted here and
+# stored as 'operator-action', so exactly one spelling ever reaches disk.
 sub _require_category {
-    my ($category, $ctx) = @_;
-    return 1 if defined $category && $VALID_CATEGORY{$category};
+    my ($cat_ref, $ctx) = @_;
+    my $category = ref($cat_ref) eq 'SCALAR' ? $$cat_ref : $cat_ref;
+    my $canon = canonical_category($category);
+    if (defined $canon && $VALID_CATEGORY{$canon}) {
+        $$cat_ref = $canon if ref($cat_ref) eq 'SCALAR';
+        return 1;
+    }
     my $log = $ctx->{log};
     eval {
         _log($log, 'escalation_category_invalid', {
@@ -1561,7 +1622,7 @@ sub queue_needs_you {
     $bpdir //= dirname($runs);
     # e02 §2.3: checked FIRST -- before mkdir, before the dedupe scan -- so a
     # malformed call is refused every tick, never silently deduped through.
-    return 0 unless _require_category($rec->{category}, {
+    return 0 unless _require_category(\$rec->{category}, {
         log => "$runs/orchestrator.log", site => 'queue_needs_you',
         kind => $rec->{kind}, package => $rec->{package},
     });
@@ -2495,7 +2556,7 @@ sub run {
                     _enter_pause_manual($runs, $log, 'token-floor',
                         { package => '_fleet', blueprint => $bp, kind => 'reauth',
                           question => 'OAuth token crossed the refresh floor unrefreshed — re-authenticate with /login.',
-                          context => 'token-keeper hit the pause-floor', created_at => $now, category => 'operational' });
+                          context => 'token-keeper hit the pause-floor', created_at => $now, category => 'operator-action' });
                 } elsif ($act eq 'pause-auth') {
                     # LOUD divergence alert (hard requirement): a 4xx on the
                     # sandbox's OWN refresh is distinct from a routine expiry —
@@ -2511,13 +2572,13 @@ sub run {
                                     . "The copied token may be invalid OR the host/sandbox token grants have "
                                     . "DIVERGED -- REVISIT the copy-token architecture. This is NOT a routine "
                                     . "/login expiry.",
-                          context => ($k->{detail} // 'the sandbox refresh returned a 4xx'), created_at => $now, category => 'operational' });
+                          context => ($k->{detail} // 'the sandbox refresh returned a 4xx'), created_at => $now, category => 'operator-action' });
                 } elsif ($act eq 'pause-contract' || $act eq 'pause-creds') {
                     my $is_creds = ($act eq 'pause-creds');
                     _enter_pause_manual($runs, $log, "keeper-$act",
                         { package => '_fleet', blueprint => $bp, kind => 'contract-drift',
                           question => 'Credential/refresh contract drift — inspect before resuming.',
-                          context => JSON::PP->new->canonical->encode($k->{detail} // {}), created_at => $now, category => 'operational' },
+                          context => JSON::PP->new->canonical->encode($k->{detail} // {}), created_at => $now, category => 'operator-action' },
                         ($is_creds ? { quiet_log => $creds_gate{armed} } : undef));
                     $creds_gate{armed} = 1 if $is_creds;
                 }
@@ -2567,7 +2628,7 @@ sub run {
                         _enter_pause_manual($runs, $log, 'usage-contract',
                             { package => '_fleet', blueprint => $bp, kind => 'contract-drift',
                               question => 'Usage endpoint contract drift — inspect before resuming.',
-                              context => join('; ', @{ $d->{problems} || [] }), created_at => $now, category => 'operational' });
+                              context => join('; ', @{ $d->{problems} || [] }), created_at => $now, category => 'operator-action' });
                         $paused = read_paused($runs);
                     } elsif ($paused && ($paused->{reason} // '') eq 'telemetry') {
                         # telemetry recovered and we are below the trip -> auto-resume.
@@ -2596,7 +2657,7 @@ sub run {
                         _enter_pause_manual($runs, $log, ($u->{action} // 'usage-fail'),
                             { package => '_fleet', blueprint => $bp, kind => 'contract-drift',
                               question => 'Credentials/usage contract problem — inspect before resuming.',
-                              context => join('; ', @{ $u->{problems} || [] }), created_at => $now, category => 'operational' },
+                              context => join('; ', @{ $u->{problems} || [] }), created_at => $now, category => 'operator-action' },
                             { quiet_log => $creds_gate{armed} });
                         $creds_gate{armed} = 1;
                     } else {
@@ -2608,7 +2669,7 @@ sub run {
                         _enter_pause_manual($runs, $log, ($u->{action} // 'usage-fail'),
                             { package => '_fleet', blueprint => $bp, kind => 'contract-drift',
                               question => 'Credentials/usage contract problem — inspect before resuming.',
-                              context => join('; ', @{ $u->{problems} || [] }), created_at => $now, category => 'operational' });
+                              context => join('; ', @{ $u->{problems} || [] }), created_at => $now, category => 'operator-action' });
                     }
                     $paused = read_paused($runs);
                 }
@@ -3024,8 +3085,17 @@ sub run {
                                   . ", budget $initial -> $current (widened once via the SYN-7 rule), harvest_reaudit=$ra"
                                   . ", starvations=" . ($hs + 1) . ". No verdict file was ever written. Judge log: "
                                   . "runs/harvest/$pkg.jsonl; archived verdicts: runs/harvest/archive/.";
+                        # RE-TRIAGED from 'operational'. A judge that ran out of
+                        # turns is not a question anyone can answer -- there is no
+                        # decision here for a human to make, only a budget to
+                        # widen and a relaunch to perform, which is exactly what
+                        # the resolver's actions are for. Filed 'unclassified' so
+                        # the resolver TRIAGES it; if it decides it cannot act, it
+                        # can still tag this operator-action and the operator is
+                        # asked. What must not happen is what used to: routed to a
+                        # human by default, unreviewed, holding an overnight run.
                         queue_needs_you($runs, { package => $pkg, blueprint => $bp, kind => 'judge-starved',
-                            question => $question, context => $context, created_at => $now, category => 'operational' });
+                            question => $question, context => $context, created_at => $now, category => 'unclassified' });
                         next;
                     }
                     if ($jstate eq 'starved' && $st eq 'done') {
@@ -3087,8 +3157,17 @@ sub run {
                                   . ", budget $initial (unchanged, never widened), harvest_reaudit=$ra, starvations=1. "
                                   . "No verdict file was ever written. Judge log: runs/harvest/$pkg.jsonl; archived verdicts: "
                                   . "runs/harvest/archive/.";
+                        # RE-TRIAGED from 'operational'. A judge that ran out of
+                        # turns is not a question anyone can answer -- there is no
+                        # decision here for a human to make, only a budget to
+                        # widen and a relaunch to perform, which is exactly what
+                        # the resolver's actions are for. Filed 'unclassified' so
+                        # the resolver TRIAGES it; if it decides it cannot act, it
+                        # can still tag this operator-action and the operator is
+                        # asked. What must not happen is what used to: routed to a
+                        # human by default, unreviewed, holding an overnight run.
                         queue_needs_you($runs, { package => $pkg, blueprint => $bp, kind => 'judge-starved',
-                            question => $question, context => $context, created_at => $now, category => 'operational' });
+                            question => $question, context => $context, created_at => $now, category => 'unclassified' });
                         next;
                     }
                     $v = { _timeout => 1 };               # cap exhausted (or not done) -> error -> escalate
@@ -3269,11 +3348,18 @@ sub run {
                         _log($log, 'judge_spawn_failed', { kind => 'harvest', package => $pkg,
                               rc => (defined $rc && $rc == 0) ? 'inflight_marker_failed' : $rc, fails => $sf });
                         if ($sf >= $t->{judge_spawn_cap}) {
-                            # e01 §3 row 20: category => 'operational' (10th positional arg).
+                            # e01 §3 row 20 filed this 'operational'. RE-TRIAGED to
+                            # 'unclassified': a spawn that failed N times is the
+                            # canonical retryable failure, and `relaunch` is one of
+                            # the resolver's four actions. Let it look. It can
+                            # still conclude the sandbox itself is broken and tag
+                            # this operator-action, which is the same answer the
+                            # hardcoded category asserted -- but reached by reading
+                            # the evidence rather than by assuming it.
                             _block_and_queue($bpdir, $runs, $log, $bp, $pkg,
                                 "harvest judge could not be spawned ($sf attempts)", $now,
                                 "Package '$pkg' finished but its harvest judge could not be spawned after $sf tries — check bp-judge.sh / claude in the sandbox, then re-verify and resume.",
-                                'harvest-spawn-failure', 'operational');
+                                'harvest-spawn-failure', 'unclassified');
                             $status->{$pkg} = 'blocked';
                         }
                     }
@@ -3349,6 +3435,12 @@ sub run {
                         next;
                     }
 
+                    # The cap actually has to STOP the dispatch, not merely count
+                    # it: a counter with no guard is a log line, and the run
+                    # keeps hammering. Checked before the candidate scan so a
+                    # given-up package costs nothing per tick.
+                    next if ($reg->{$pkg}{escalation_spawn_fail} // 0) >= $t->{judge_spawn_cap};
+
                     # No judge in flight -- is there an eligible decision queued for
                     # this package? Oldest created_at first (§2.5: serialize, never
                     # dispatch two for the same package concurrently -- the reused
@@ -3362,8 +3454,11 @@ sub run {
                         next unless $f =~ /^\Q$pkg\E--.*\.json$/;
                         my $rec = _read_json("$dir/$f");
                         next unless ref $rec eq 'HASH';
-                        my $cat = $rec->{category} // '';
-                        next unless $cat eq 'unclassified' || $cat =~ /^(?:conformance|oracle|scoping|implementation)$/;
+                        # Canonicalise first: a record queued before the
+                        # operational -> operator-action rename must be routed by
+                        # what it MEANS, not by the spelling it happens to carry.
+                        my $cat = canonical_category($rec->{category}) // '';
+                        next unless $RESOLVER_TRIAGEABLE{$cat};
                         (my $id = $f) =~ s/\.json$//i;
                         push @cands, { id => $id, created_at => ($rec->{created_at} // 0) };
                     }
@@ -3372,20 +3467,60 @@ sub run {
                     @cands = sort { $a->{created_at} <=> $b->{created_at} } @cands;
                     my $pick = $cands[0];
 
+                    # WRITE THE DECISION ID BEFORE SPAWNING, not after.
+                    #
+                    # The judge's whole job is to triage ONE named record, and it
+                    # learns which one by reading this file. Spawning first was a
+                    # race the judge loses: it can be up and reading before the
+                    # orchestrator has written the id, and there is no second
+                    # chance -- a judge is one-shot. Written first, a spawn
+                    # failure just leaves a stale id, which the next tick
+                    # overwrites; that is the harmless direction.
+                    File::Path::make_path("$runs/escalation-resolve");
+                    my $decf = "$runs/escalation-resolve/$pkg.decision";
+                    my $dtmp = "$decf.tmp.$$";
+                    if (open my $fh, '>', $dtmp) {
+                        print $fh $pick->{id};
+                        close $fh;
+                        rename $dtmp, $decf;
+                    }
+
                     my $rc = $spawn_judge->({ kind => 'escalation-resolve', pkg => $pkg });
                     if (defined $rc && $rc == 0 && mark_judge_inflight($runs, 'escalation-resolve', $pkg, $now)) {
-                        File::Path::make_path("$runs/escalation-resolve");
-                        my $decf = "$runs/escalation-resolve/$pkg.decision";
-                        my $dtmp = "$decf.tmp.$$";
-                        if (open my $fh, '>', $dtmp) {
-                            print $fh $pick->{id};
-                            close $fh;
-                            rename $dtmp, $decf;
-                        }
+                        update_registry_pkg($runs, $pkg, { escalation_spawn_fail => 0 })
+                            if ($reg->{$pkg}{escalation_spawn_fail} // 0);
+                        $reg->{$pkg}{escalation_spawn_fail} = 0;
                         _log($log, 'escalation_resolve_fire', { package => $pkg, decision => $pick->{id} });
                     } else {
+                        # A CAP, because this path had none and that is how it
+                        # spun. Filed as almanac 20260824-170753-01b8: the
+                        # escalation-resolve kind was never wired into
+                        # bp-judge.sh, so every dispatch exited 2 -- and with no
+                        # counter here the orchestrator simply retried, roughly
+                        # every ten seconds, indefinitely. Nineteen failures in
+                        # the minute the operator watched it.
+                        #
+                        # harvest already had exactly this cap (harvest_spawn_fail
+                        # / judge_spawn_cap). The rule is that NO judge kind may
+                        # retry a spawn forever: a path that cannot start is a
+                        # defect, and hammering it neither fixes it nor reports
+                        # it. After the cap the record is simply left queued --
+                        # the operator reaches it by the ordinary route, which is
+                        # the correct fallback when autonomy is unavailable.
+                        my $sf = ($reg->{$pkg}{escalation_spawn_fail} // 0) + 1;
+                        update_registry_pkg($runs, $pkg, { escalation_spawn_fail => $sf });
+                        $reg->{$pkg}{escalation_spawn_fail} = $sf;
                         _log($log, 'judge_spawn_failed', { kind => 'escalation-resolve', package => $pkg,
-                              rc => (defined $rc && $rc == 0) ? 'inflight_marker_failed' : $rc });
+                              rc => (defined $rc && $rc == 0) ? 'inflight_marker_failed' : $rc,
+                              fails => $sf,
+                              ($sf >= $t->{judge_spawn_cap}
+                                 ? (detail => "escalation-resolve spawn failed $sf times; giving up for this "
+                                            . "package. Queued escalations stay queued and reach the operator "
+                                            . "normally. Check bp-judge.sh's kind allow-list, "
+                                            . "agents/bp-escalation-resolver.md and "
+                                            . "templates/judge-escalation-resolve.md.")
+                                 : ()) });
+                        unlink $decf;
                     }
                 }
             }
@@ -3807,7 +3942,7 @@ sub run {
                                 . '(missing bash, missing bp-launch.sh, or a bad mount). Fix it, then resume the run '
                                 . 'by deleting runs/.paused (`rm runs/.paused`) — this pause is manual and will not lift on its own.',
                       context  => "exec of 'bash $DIR/bp-launch.sh' failed on $n consecutive launch attempts; last errno: $errno",
-                      created_at => $now, category => 'operational' });
+                      created_at => $now, category => 'operator-action' });
                 $exec_fail_streak = 0;
             }
 
@@ -4120,7 +4255,7 @@ sub _enter_pause_manual {
     # to categorize and stays untouched (spec §5 edge case). A bad category must
     # not leave the fleet paused with nothing filed to explain why.
     if ($decision) {
-        return 0 unless _require_category($decision->{category}, {
+        return 0 unless _require_category(\$decision->{category}, {
             log => $log, site => '_enter_pause_manual',
             kind => $decision->{kind}, package => $decision->{package},
         });
@@ -4145,7 +4280,7 @@ sub _enter_pause_manual {
         $wrote = 1;
     }
     # e01 §3 row 5 -- internal mechanism, inherits the caller's own literal
-    # (already required+validated above at this point), e.g. category => 'operational'
+    # (already required+validated above at this point), e.g. category => 'operator-action'
     # for the fleet-pause callers at rows 10-17, or category => 'scoping' for row 16.
     queue_needs_you($runs, $decision) if $decision;
     _log($log, 'pause', { reason => $reason, manual => 1,
@@ -4510,7 +4645,7 @@ sub _block_and_queue {
     # (the exact Pattern-1 "detected but undelivered" shape this whole track
     # exists to close). No registry mirror to worry about anymore either way:
     # s02 removed the registry status write this function used to also make.
-    return 0 unless _require_category($category, {
+    return 0 unless _require_category(\$category, {
         log => $log, site => '_block_and_queue',
         kind => ($kind // 'stuck-package'), package => $pkg,
     });

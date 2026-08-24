@@ -36,7 +36,7 @@ KIND="${1:?usage: bp-judge.sh <harvest|resolve> <blueprint> <package> <verdict_p
 BP_NAME="${2:?usage: bp-judge.sh <harvest|resolve> <blueprint> <package> <verdict_path>}"
 PKG="${3:?usage: bp-judge.sh <harvest|resolve> <blueprint> <package> <verdict_path>}"
 VERDICT_PATH="${4:?usage: bp-judge.sh <harvest|resolve> <blueprint> <package> <verdict_path>}"
-case "$KIND" in harvest|resolve|conformance) ;; *) echo "bp-judge: unknown kind '$KIND' (want harvest|resolve|conformance)" >&2; exit 2 ;; esac
+case "$KIND" in harvest|resolve|conformance|escalation-resolve) ;; *) echo "bp-judge: unknown kind '$KIND' (want harvest|resolve|conformance|escalation-resolve)" >&2; exit 2 ;; esac
 
 PROJECT_ROOT=$(bp_project_root)
 BPDIR=$(bp_dir "$BP_NAME")
@@ -47,13 +47,36 @@ if [ "$KIND" != conformance ]; then
   [ -f "$LEDGER" ] || { echo "bp-judge: no ledger at $LEDGER" >&2; exit 1; }
 fi
 BLUEPRINT_FILE="$BPDIR/blueprint.md"
-AGENT_FILE="$PLUGIN_ROOT/agents/bp-$KIND-judge.md"
+# The bp-$KIND-judge.md convention holds for three kinds and not the fourth.
+# escalation-resolve's agent is bp-escalation-resolver.md -- different stem, no
+# `-judge` suffix -- so the derived name was agents/bp-escalation-resolve-judge.md,
+# which has never existed. Combined with the allow-list above (which rejected the
+# kind before this line was even reached) that path had never once executed.
+# Almanac 20260824-170753-01b8.
+case "$KIND" in
+  escalation-resolve) AGENT_FILE="$PLUGIN_ROOT/agents/bp-escalation-resolver.md" ;;
+  *)                  AGENT_FILE="$PLUGIN_ROOT/agents/bp-$KIND-judge.md" ;;
+esac
 [ -f "$AGENT_FILE" ] || { echo "bp-judge: no agent file at $AGENT_FILE" >&2; exit 1; }
 # templates/ is NOT in b05's write set, so the conformance prompt is built inline
 # (heredoc) below instead of from a templates/judge-conformance.md file.
 if [ "$KIND" != conformance ]; then
   TEMPLATE="$PLUGIN_ROOT/templates/judge-$KIND.md"
   [ -f "$TEMPLATE" ] || { echo "bp-judge: no template at $TEMPLATE" >&2; exit 1; }
+fi
+
+# escalation-resolve triages ONE named record, and the orchestrator names it by
+# writing runs/escalation-resolve/<pkg>.decision before spawning us. Refuse
+# rather than launch a judge with nothing to judge: a one-shot agent given no
+# target burns its whole budget discovering that, writes no verdict, and is
+# indistinguishable from a crash in the log.
+DECISION_ID=""
+DECISION_FILE=""
+if [ "$KIND" = escalation-resolve ]; then
+  DECISION_ID=$(tr -d '\r\n' < "$BPDIR/runs/escalation-resolve/$PKG.decision" 2>/dev/null || true)
+  [ -n "$DECISION_ID" ] || { echo "bp-judge: no decision id at $BPDIR/runs/escalation-resolve/$PKG.decision" >&2; exit 1; }
+  DECISION_FILE="$BPDIR/runs/needs-you/$DECISION_ID.json"
+  [ -f "$DECISION_FILE" ] || { echo "bp-judge: decision record missing at $DECISION_FILE" >&2; exit 1; }
 fi
 
 WRITE_SET=$([ -f "$LEDGER" ] && fm_get "$LEDGER" write_set || echo "")
@@ -69,6 +92,20 @@ if [ "$KIND" = conformance ]; then
 elif [ "$KIND" = resolve ]; then
   MODEL="${BP_RESOLVE_MODEL:-opus}";   MAXT="${BP_RESOLVE_MAX_TURNS:-800}"
   ROLE="resolve-judge"; J_WRITE_SET="$WRITE_SET"; J_TEST_PATHS="$TEST_PATHS"
+elif [ "$KIND" = escalation-resolve ]; then
+  # READ-ONLY, like the harvest and conformance judges: this judge CLASSIFIES a
+  # queued escalation and writes a verdict. Every mutation it proposes is applied
+  # afterwards, deterministically, by bp-resolve.pl -- so an empty write set here
+  # is the contract, not an oversight.
+  #
+  # 40 turns is the canonical cap this role never had (almanac 20260823-211302-7d5a:
+  # "bp-escalation-resolver has no canonical turn cap; t/93 has been red for it").
+  # It reads one decision record, one ledger, and blueprint.md's Decisions table
+  # -- far less than a resolve-judge's 800-turn repair budget, and more than a
+  # harvest judge's single contracted slice.
+  MODEL="${BP_ESCALATION_MODEL:-sonnet}"; MAXT="${BP_ESCALATION_MAX_TURNS:-40}"
+  case "$MAXT" in ''|*[!0-9]*|0) MAXT=40 ;; esac
+  ROLE="escalation-resolver"; J_WRITE_SET=""; J_TEST_PATHS=""
 else
   MODEL="${BP_HARVEST_MODEL:-sonnet}"
   MAXT="${BP_HARVEST_MAX_TURNS:-}"                       # explicit override WINS
@@ -144,6 +181,8 @@ sed -e "s|{{PLUGIN_ROOT}}|$PLUGIN_ROOT|g" \
     -e "s|{{VERDICT_PATH}}|$VERDICT_PATH|g" \
     -e "s|{{WRITE_SET}}|${WRITE_SET:-—}|g" \
     -e "s|{{TEST_PATHS}}|${TEST_PATHS:-—}|g" \
+    -e "s|{{DECISION_ID}}|${DECISION_ID:-—}|g" \
+    -e "s|{{DECISION_FILE}}|${DECISION_FILE:-—}|g" \
     "$TEMPLATE" > "$PROMPT_FILE"
 PROMPT=$(cat "$PROMPT_FILE")
 fi

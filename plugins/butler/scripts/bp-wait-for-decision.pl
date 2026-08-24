@@ -36,6 +36,20 @@
 package BpWait;
 use strict;
 use warnings;
+use File::Basename ();
+use Cwd ();
+
+# BpOrch owns the category alias map (operational -> operator-action), and the
+# category filter below has to canonicalise both sides of its comparison. Loaded
+# here rather than assumed: this file is required by callers that have not
+# necessarily loaded bp-orchestrator.pl themselves, and calling an undefined
+# BpOrch:: sub is a runtime die that surfaces as a CLI exit 255 -- which, for a
+# tool whose job is answering "is anything waiting?", reads exactly like "no".
+BEGIN {
+    my $_self_dir = File::Basename::dirname(
+        do { (my $f = __FILE__) =~ s{\\}{/}g; Cwd::abs_path($f) // $f });
+    require "$_self_dir/bp-orchestrator.pl";
+}
 
 # decision_id($path_or_name) -> '<pkg>--<shortid>'
 # The stable identity of a queue entry: its filename with any directory prefix
@@ -82,7 +96,17 @@ sub fresh_decisions {
     $seen ||= {};
     my @fresh = grep { !$seen->{ $_->{id} // '' } } @{ $decisions || [] };
     if ($category_filter && %$category_filter) {
-        @fresh = grep { defined $_->{category} && $category_filter->{ $_->{category} } } @fresh;
+        # BOTH SIDES canonicalised. A caller may ask for either spelling and a
+        # record may carry either, so matching raw strings would make
+        # `--category operator-action` silently miss every record queued before
+        # the rename, and `--category operational` miss every one queued after
+        # -- a filter that quietly returns nothing, which reads exactly like
+        # "there is nothing waiting".
+        my %want = map { (BpOrch::canonical_category($_) // $_) => 1 } keys %$category_filter;
+        @fresh = grep {
+            my $c = BpOrch::canonical_category($_->{category});
+            defined $c && $want{$c};
+        } @fresh;
     }
     return [ sort {
         ($a->{created_at} // 0) <=> ($b->{created_at} // 0)

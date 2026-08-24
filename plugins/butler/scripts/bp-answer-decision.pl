@@ -641,7 +641,8 @@ unless (caller) {
         }
         my %filter;
         if (defined $category_arg) {
-            %filter = map { $_ => 1 } grep { length } split /,/, $category_arg;
+            %filter = map { (BpOrch::canonical_category($_) // $_) => 1 }
+                      grep { length } split /,/, $category_arg;
             # fixbatch step7 / red-team NIT 1: a --category flag that IS given
             # but CSV-splits to only empty tokens (e.g. "--category ,,") must
             # not silently degrade to "no filtering" -- see the twin fix in
@@ -661,7 +662,10 @@ unless (caller) {
             for my $f (grep { /\.json$/ } readdir $dh) {
                 my $rec = BpOrch::_read_json("$dir/$f");
                 next unless ref $rec eq 'HASH';
-                my $cat = $rec->{category};
+                # Canonicalised on both sides -- see fresh_decisions() in
+                # bp-wait-for-decision.pl for why a raw-string match here turns
+                # a vocabulary change into "nothing is waiting".
+                my $cat = BpOrch::canonical_category($rec->{category});
                 next if %filter && !(defined $cat && $filter{$cat});
                 (my $id = $f) =~ s/\.json$//i;
                 push @recs, { id => $id, package => $rec->{package}, kind => $rec->{kind},

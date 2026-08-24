@@ -40,11 +40,11 @@ All read fresh from disk, never cached or assumed from a prior turn:
 
 1. **Subject-matter override, checked FIRST, outranks everything below.** If the question touches data
    retention, PII, security, money, or naming/product-identity — even if it is phrased as an
-   implementation detail — it is `category: product` (or `operational` if it needs human hands, e.g. a
+   implementation detail — it is `category: product` (or `operator-action` if it needs human hands, e.g. a
    credential/infra action), regardless of what category it was filed under. This check alone can flip
    an apparently-technical question.
-2. **Atomicity.** If the record is a COMPOUND question and any one clause is product/operational, the
-   **whole record** is product/operational. There is no partial resolution that answers the technical
+2. **Atomicity.** If the record is a COMPOUND question and any one clause is product/operator-action, the
+   **whole record** is product/operator-action. There is no partial resolution that answers the technical
    half and leaves the product half implicitly settled — that would silently answer something the
    operator never actually decided.
 3. **The category table**, only once (1) and (2) clear it:
@@ -54,6 +54,18 @@ All read fresh from disk, never cached or assumed from a prior turn:
      to `product`.** This fallback direction is deliberate and non-negotiable: never "optimize" an
      unclassified record toward autonomy just because no operator-only signal happened to be present —
      absence of a product signal is not the same as presence of a resolver-owned one.
+   - `product` / `operator-action` — **the two you may never decide, only confirm.** They are not a
+     "safe default"; they are the end of the line. A record tagged either one leaves the queue only
+     when a human reads it, which on an unattended overnight run means the fleet waits until morning.
+     `operator-action` specifically means *this needs the operator's HANDS* — re-authenticate, repair
+     the environment — not merely *this is infrastructural*. A retryable spawn failure or a starved
+     judge is not operator-action, however machine-flavoured it looks.
+
+   The asymmetry in (3) and (4) is still correct and still non-negotiable: when you genuinely cannot
+   settle a record, it goes to the operator. The rule is about not reaching that conclusion by
+   reflex — an unread record routed to a human by assumption is not the same as one routed there by a
+   judgement, even though they look identical in the queue.
+
 4. **The confidence-citation rule — the actual backstop, not the category test alone.** Confidence
    `high` requires a **citation that resolves the SPECIFIC disputed fact**, not merely the general
    topic. "The ledger discusses screenshots" is not a citation that a particular screenshot is a real
@@ -72,7 +84,7 @@ Write exactly one JSON object to **verdict_path** (and nothing else to it):
 
 ```json
 {
-  "category": "product | operational | conformance | oracle | scoping | implementation",
+  "category": "product | operator-action | conformance | oracle | scoping | implementation",
   "action": "relaunch | widen-write-set | edit-depends-on | author-ledger",
   "path": "<REQUIRED when action is widen-write-set — the exact write_set entry to add, e.g. a directory or file path such as p/blk9/. Never a citation, never a file:line, never anything containing ':'>",
   "confidence": "high | low",
@@ -88,8 +100,8 @@ Write exactly one JSON object to **verdict_path** (and nothing else to it):
   reads `path` ONLY for `widen-write-set` and refuses the action outright (no partial/fallback
   behavior) if `path` is missing, blank, or contains a `:`. Omit `path` entirely for every other
   action — it is meaningless outside `widen-write-set` and is ignored there.
-- Omit `action` and `rationale` entirely when `category` is `product` or `operational` — a
-  product/operational verdict must never also carry a mutation; including one there is a contract
+- Omit `action` and `rationale` entirely when `category` is `product` or `operator-action` — a
+  product/operator-action verdict must never also carry a mutation; including one there is a contract
   violation the deterministic apply-step refuses outright, not a shortcut that gets acted on anyway.
 - `confidence: low` on a resolver-owned category (`conformance`/`oracle`/`scoping`/`implementation`) is
   itself a contract violation — if your confidence is not `high`, your category must be `product`, full
