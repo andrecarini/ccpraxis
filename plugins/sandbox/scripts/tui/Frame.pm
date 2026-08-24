@@ -435,13 +435,45 @@ sub wrap_line {
             && $prev_span_text !~ / $/
             && $text !~ /^ /;
         $prev_span_text = $text;
+        # ONE SPACE IS A SEPARATOR; A RUN OF TWO OR MORE IS ALIGNMENT.
+        #
+        # This used to `split / +/`, which discards the whole run and lets
+        # tui::Layout::wrap rejoin with a single space. Any intentional
+        # multi-space run therefore collapsed the moment a row wrapped -- and
+        # the label gutter IS such a run (gutter() pads to LABEL_GUTTER and
+        # appends GUTTER_SEP), so every label row lost its alignment at exactly
+        # the widths where it wrapped. Reported from a live TUI and bisected to
+        # cols=130, where the activity column narrows the main region enough to
+        # wrap a 44-column row. almanac 20260824-193918-e002.
+        #
+        # Note (3a-pre) already rescues the row's LEADING indent from this same
+        # discard -- one alignment run saved by name while the general case went
+        # on collapsing. This fixes the class instead of adding a third rescue.
+        #
+        # N-1 spaces are attached to the preceding word and the Nth is left to
+        # act as the ordinary separator, so tui::Layout::wrap re-adding one
+        # space reproduces the original run EXACTLY rather than one column
+        # short or long. Layout::wrap stays unmodified: each word is atomic
+        # there, so a word carrying its own trailing alignment is already
+        # something it handles.
         my $first_tok = 1;
-        for my $tok (split / +/, $text) {
-            if ($tok eq '') { $first_tok = 0; next; }
+        my $pos = 0;
+        while ($text =~ /\G( +|[^ ]+)/gc) {
+            my $piece = $1;
+            if ($piece =~ /^ +$/) {
+                # A run of >= 2 is deliberate alignment: keep all but one space
+                # with the word it follows. A lone space is just a separator and
+                # is dropped, exactly as before.
+                if (length($piece) >= 2 && @words) {
+                    $words[-1]{text} .= substr($piece, 1);
+                }
+                $first_tok = 0;
+                next;
+            }
             if ($first_tok && $glued_to_prev && @words) {
-                $words[-1]{text} .= $tok;
+                $words[-1]{text} .= $piece;
             } else {
-                push @words, { text => $tok, role => $sp_role };
+                push @words, { text => $piece, role => $sp_role };
             }
             $first_tok = 0;
         }

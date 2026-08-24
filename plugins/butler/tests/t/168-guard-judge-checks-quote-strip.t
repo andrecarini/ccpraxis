@@ -85,8 +85,50 @@ sub path_without_jq {
 # =====================================================================================
 {
     my $src = do { local (@ARGV, $/) = ($GUARD); <> };
-    ok(index($src, '(^|[;&|[:space:](])([^[:space:];&|]*/)?(pnpm|npm|yarn)[[:space:]]+(run[[:space:]]+)?(lint|build|test)\b') >= 0,
-       'AC3: the pnpm/npm/yarn lint|build|test denylist regex is byte-identical to today');
+    # The DENYLIST half stays byte-identical -- that is what AC3 is for: proving
+    # the set of blocked commands has not silently changed.
+    #
+    # The ANCHOR half is no longer pinned here. Pinning it inside the same string
+    # meant AC3 also froze the boundary class, so ADDING a boundary turned this
+    # red. `{` was added alongside the `(` this class already had: a brace group
+    # opens a command position exactly as a subshell does, so `{npm run test; }`
+    # was unmatched while `(npm run test)` was matched -- a distinction with no
+    # meaning. See almanac 20260819-164901-52d3 and the same correction made to
+    # t/167's AC3.
+    ok(index($src, '([^[:space:];&|]*/)?(pnpm|npm|yarn)[[:space:]]+(run[[:space:]]+)?(lint|build|test)\b') >= 0,
+       'AC3: the pnpm/npm/yarn lint|build|test DENYLIST regex is byte-identical to today');
+
+    # The anchor is asserted as a property instead: command-position openers are
+    # boundaries, quotes are NOT (a quote is never itself the reason a shell
+    # executes what it encloses -- this hook's own comment says so, and treating
+    # it as a boundary is what produces false positives on quoted mentions).
+    # Extracted by INDEX, not by regex. The class itself contains `]` (inside
+    # `[:space:]`), so any `\[[^\]]*\]` pattern stops early and silently yields
+    # the wrong substring -- which is how the first version of this assertion
+    # failed while the source was perfectly correct.
+    my $anchor;
+    {
+        my $open  = '(^|';
+        my $close = ')([^[:space:];&|]*/)?(pnpm';
+        # Locate the DENYLIST first, then walk BACK to the `(^|` immediately
+        # before it. Searching forward from the first `(^|` in the file finds an
+        # unrelated earlier regex (the shellword carrier check) and spans
+        # everything in between -- which is why the first attempt reported
+        # quotes in the class: it had captured half the script.
+        my $j = index($src, $close);
+        my $i = $j >= 0 ? rindex($src, $open, $j) : -1;
+        $anchor = substr($src, $i + length($open), $j - $i - length($open)) if $i >= 0 && $j > $i;
+    }
+    ok(defined $anchor, 'AC3b: the anchor class is parseable from the denylist regex')
+        or diag('could not locate the anchor class in the source');
+    for my $ch ('(', '{', ';', '&', '|') {
+        ok(index($anchor // '', $ch) >= 0,
+           "AC3b: '$ch' is a command-position boundary in the anchor class");
+    }
+    for my $ch ("'", '"') {
+        ok(index($anchor // '', $ch) < 0,
+           "AC3b: [$ch] is NOT a boundary -- quoting a mention must not trip this guard");
+    }
 }
 
 # =====================================================================================
