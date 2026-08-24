@@ -309,7 +309,14 @@ diag("jq available: " . ($have_jq ? "yes" : "no (hook-driving groups will SKIP)"
     }
     my @all = (@active, @archive);
 
-    cmp_ok(scalar(@active),  '>=', 1,  'C7 FIXTURE-SANITY: the active-blueprint glob is non-empty');
+    # NOT `@active >= 1`. That asserted at least one blueprint is UNARCHIVED --
+    # a statement about whether any initiative happens to be in flight, not about
+    # the corpus this section reads. Both remaining blueprints were archived on
+    # 2026-08-24 (their documented, expected end) and this went red for a project
+    # that had simply finished its work.
+    #
+    # The line below is the check that was always doing the work: the corpus,
+    # active plus archived, is non-trivial. almanac 20260823-210122-433f's class.
     cmp_ok(scalar(@all),     '>=', 10, 'C7: the real ledger corpus enumerates a NON-TRIVIAL number of files (lower bound only, never pinned)');
 
     my $now = time;

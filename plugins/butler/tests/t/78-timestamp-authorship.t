@@ -623,7 +623,15 @@ SKIP: {
     my $bp_root = "$PROJECT_ROOT_FWD/.ccpraxis-local-data/blueprints";
     skip "no local blueprint data at $bp_root (host clone with no local data)", 2 unless -d $bp_root;
 
-    my @files = bsd_glob("$bp_root/*/packages/*.md");
+    # ARCHIVED BLUEPRINTS COUNT. This scanned only the active tree, so once the
+    # last initiative was archived on 2026-08-24 -- the documented, expected end
+    # of a finished blueprint -- the corpus read as empty and AC-22 reported a
+    # scaffolding failure for a project that had merely finished its work.
+    # A ledger does not stop being a ledger when its blueprint is archived, and
+    # the classification below is exactly as meaningful over an archived one.
+    # almanac 20260823-210122-433f's class.
+    my @files = (bsd_glob("$bp_root/*/packages/*.md"),
+                 bsd_glob("$bp_root/_archive/*/packages/*.md"));
     ok(scalar(@files) >= 1, "AC-22: corpus scan enumerates at least one package ledger (found " . scalar(@files) . ")");
 
     my %by_verdict;

@@ -289,10 +289,18 @@ for my $p (@pairs) {
     # later is covered automatically instead of needing a new line here; it
     # is still narrow enough that a stale citation in an unrelated live
     # blueprint package (d02-d05, or a future one) is NOT hidden by it.
-    my @exempt_prefixes = (
-        '.ccpraxis-local-data/blueprints/ccpraxis-tooling-debt/packages/d01-test-numbering-collisions.md',
-        '.ccpraxis-local-data/blueprints/ccpraxis-tooling-debt/specs/d01-test-numbering-collisions-spec.md',
-        '.ccpraxis-local-data/blueprints/ccpraxis-tooling-debt/reports/d01-test-numbering-collisions/',
+    # BOTH the live and the _archive/ location, because a blueprint gets
+    # archived -- that is the documented end of a finished initiative, and
+    # ccpraxis-tooling-debt reached it on 2026-08-24. These are EXEMPTIONS, so a
+    # prefix that silently stops matching does not fail loudly; it just starts
+    # flagging d01's own package/spec/report files for naming the very basenames
+    # they exist to describe. almanac 20260823-210122-433f is exactly this class:
+    # "archiving a blueprint silently breaks tests that hardcode its path".
+    my @exempt_prefixes = map { (".ccpraxis-local-data/blueprints/$_",
+                                 ".ccpraxis-local-data/blueprints/_archive/$_") } (
+        'ccpraxis-tooling-debt/packages/d01-test-numbering-collisions.md',
+        'ccpraxis-tooling-debt/specs/d01-test-numbering-collisions-spec.md',
+        'ccpraxis-tooling-debt/reports/d01-test-numbering-collisions/',
     );
     my $is_exempt_by_prefix = sub {
         my ($rel) = @_;

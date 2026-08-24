@@ -552,7 +552,22 @@ my %CORPUS_DIGEST_BEFORE = map { $_ => md5_hex(read_file($_) // '') } @ALL;
 # missing behaviour, not broken scaffolding.
 # =====================================================================================
 
-ok(scalar(@ACTIVE)  >= 1, "FIXTURE-SANITY: active glob blueprints/*/packages/*.md is non-empty");
+# THE CORPUS, not the ACTIVE corpus. What these two lines exist to establish is
+# that there are real ledgers on disk to read, so a green result below is
+# evidence rather than a vacuous pass over an empty list.
+#
+# `@ACTIVE >= 1` additionally asserted that at least one blueprint is UNARCHIVED,
+# which is not a property of the corpus at all -- it is a statement about whether
+# any initiative happens to be in flight. On 2026-08-24 the last two were
+# archived (their documented, expected end) and this went red, reporting a
+# scaffolding failure for a project that had simply finished its work. An empty
+# active set is a legitimate state, and arguably the desirable one.
+#
+# Same class as almanac 20260823-210122-433f, and the same shape this suite keeps
+# paying for: an assertion treating a legitimate new state as breakage.
+ok(scalar(@ACTIVE) + scalar(@ARCHIVE) >= 1,
+   'FIXTURE-SANITY: the ledger corpus (active + _archive) is non-empty -- there are real '
+ . 'ledgers to read, whether or not any initiative is currently in flight');
 ok(scalar(@ARCHIVE) >= 1, "FIXTURE-SANITY: archive glob blueprints/_archive/*/packages/*.md is non-empty");
 for my $pair (['s05', $FX_S05], ['b09', $FX_B09], ['b28', $FX_B28],
               ['b13', $FX_B13], ['legacy 11-sandbox-rework-finalization', $FX_LEGACY]) {
