@@ -229,6 +229,72 @@ ok($OK, 'HotReload.pm and tui/DashboardScreen.pm load') or BAIL_OUT("require fai
         or diag('notes: ' . join(' | ', @{ $detailed->{notes} || [] }));
     ok((grep { /tui::Frame/ } @{ $detailed->{notes} }),
        'AC9b: ...alongside the module it refused');
+}
+
+# ===========================================================================
+# AC11 -- posixify_path: the drive-letter -> MSYS translation that both the
+# hot-reload gate's -I and the sampler execs depend on.
+#
+# ROOT CAUSE OF TWO SYMPTOMS THAT LOOKED UNRELATED. bin/claude-sandbox.ps1
+# invokes the launcher with a Windows path and sets MSYS2_ARG_CONV_EXCL='*' for
+# the whole process tree, so nothing downstream translates it. $SELF_PL was
+# therefore `C:/Users/.../launcher.pl`, and every consumer hands it to MSYS
+# perl. The child resolved it RELATIVE TO ITS CWD -- measured, from the
+# operator's own screen once the sampler began reporting its reason:
+#
+#   Can't open perl script
+#     "/c/Development/indocs/indocs-bacen-scraper/C:/Users/Andre/.claude/..."
+#
+# That is the project path with the Windows path appended. It killed BOTH
+# samplers at exec on every launch (which is why neither ever wrote a pidfile,
+# almanac 20260824-203404-77e1) and mangled the hot-reload gate's -I, so every
+# candidate module failed to locate Theme.pm and was reported as "does not
+# compile".
+#
+# winify_path already did POSIX -> drive-letter for podman, which wants that
+# form. Nothing did the inverse for MSYS perl, which wants the opposite.
+# ===========================================================================
+{
+    my $src = do { local (@ARGV, $/) = ("$SCRIPTS/launcher.pl"); <> };
+    my ($sub) = $src =~ /(sub posixify_path \{.*?\n\})/s;
+    ok(defined $sub, 'AC11: posixify_path is defined in launcher.pl')
+        or diag('not found -- the translation is inline again, or gone');
+
+  SKIP: {
+        skip 'posixify_path not extractable', 6 unless defined $sub;
+        my $ok = eval "$sub 1";
+        ok($ok, 'AC11: it evaluates standalone (pure -- no launcher state)') or diag($@);
+        skip 'could not evaluate', 5 unless $ok;
+
+        # A path that EXISTS, so the -e guard is satisfied. Built from this
+        # checkout rather than hardcoded, so the case is real on any machine --
+        # and on this one it exercises a non-ASCII path, which is the landmine
+        # the project CLAUDE.md names.
+        my $posix = "$SCRIPTS/launcher.pl";
+        $posix =~ s{\\}{/}g;
+        SKIP: {
+            skip 'launcher path is not POSIX-rooted here', 2 unless $posix =~ m{\A/([a-z])/(.*)\z};
+            my ($drive, $rest) = ($1, $2);
+            is(posixify_path("\u$drive:/$rest"), $posix,
+               'AC11: a drive-letter path that exists is rewritten to MSYS form');
+            (my $back = $rest) =~ s{/}{\\}g;
+            is(posixify_path("\u$drive:\\$back"), $posix,
+               'AC11: ...and the BACKSLASH form too, which is what the PowerShell shim passes');
+        }
+
+        is(posixify_path('C:/definitely/not/here/xyzzy.pl'), 'C:/definitely/not/here/xyzzy.pl',
+           'AC11: a drive-letter path that does NOT resolve is returned untouched -- the '
+         . 'translation can never make a working path worse');
+        is(posixify_path('relative/path.pl'), 'relative/path.pl',
+           'AC11: a relative path is untouched');
+        is(posixify_path(undef), undef, 'AC11: undef in, undef out -- total, never dies');
+    }
+
+    # And the consumer actually uses it: a $SELF_PL that skipped the translation
+    # is the whole defect.
+    like($src, qr/\$SELF_PL\s*=\s*do\s*\{[^}]*posixify_path/s,
+         'AC11: $SELF_PL is built through posixify_path, so every consumer that spawns MSYS '
+       . 'perl with it (both sampler execs, the spend dir, the hot-reload -I) gets MSYS form');
 
     for my $b (undef, 'x', [], { reloaded => 'not-an-array' }) {
         my $g = eval { HotReload::summarise($b) };

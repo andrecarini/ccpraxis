@@ -215,7 +215,59 @@ my $READKEY_OK        = eval { require Term::ReadKey; 1 } ? 1 : 0;
 # re-execs $SELF_PL, not $LAUNCHER_PL, so a dev clone spawns ITS OWN build's
 # sampler rather than the live install's -- otherwise the snapshot contract
 # could mismatch silently between the two.
-my $SELF_PL = do { my $p = abs_path($0) // $0; $p =~ s|\\|/|g; $p };
+my $SELF_PL = do {
+    my $p = abs_path($0) // $0;
+    $p =~ s|\\|/|g;
+    # DRIVE-LETTER FORM -> POSIX FORM, because every consumer of $SELF_PL hands
+    # it to MSYS perl ($^X): the two sampler execs, the spend sampler's dir, and
+    # the hot-reload gate's -I.
+    #
+    # bin/claude-sandbox.ps1 invokes us with a Windows path
+    # (C:\Users\...\launcher.pl) and sets MSYS2_ARG_CONV_EXCL='*' for the whole
+    # process tree, so nothing downstream translates it. The child perl then
+    # resolved `C:/Users/...` RELATIVE TO ITS CWD -- which for a sampler is the
+    # project directory. Measured, from the operator's screen, once the sampler
+    # started reporting its own reason:
+    #
+    #   Can't open perl script
+    #     "/c/Development/indocs/indocs-bacen-scraper/C:/Users/Andre/.claude/..."
+    #
+    # That is the project path with the Windows path appended. Both samplers died
+    # at exec on every launch -- which is why neither ever wrote a pidfile
+    # (almanac 20260824-203404-77e1) -- and the hot-reload gate's `-I` was
+    # mangled the same way, so every candidate module failed to find Theme.pm and
+    # was reported as "does not compile" (the three refusals on the DAME TUI).
+    # One cause, two symptoms that looked unrelated.
+    #
+    # This is the project's own doctrine applied in the direction it was not yet
+    # applied: hand-translate rather than depend on a conversion state. winify_path
+    # already does POSIX -> drive-letter for podman, which wants that form; MSYS
+    # perl wants the opposite, and nothing was doing it.
+    #
+    # Falls back to the original if the translation does not resolve, so a wrong
+    # guess can never be worse than what it replaces.
+    posixify_path($p);
+};
+
+# posixify_path($p) -> $p with a drive-letter prefix rewritten to MSYS form.
+#
+# The inverse of winify_path, and named as its counterpart on purpose: one is
+# for handing paths to NATIVE Windows binaries (podman, git), the other for
+# handing them to MSYS perl. Both exist so nothing has to depend on whatever
+# MSYS2_ARG_CONV_EXCL happens to be set to -- the project's stated doctrine.
+#
+# Pure and total: a path that is already POSIX, a relative path, or anything
+# that does not resolve is returned untouched, so this can never make a working
+# path worse.
+sub posixify_path {
+    my ($p) = @_;
+    return $p unless defined $p && !ref $p && length $p;
+    return $p unless $p =~ m{\A([A-Za-z]):[\\/](.*)\z};
+    my ($drive, $rest) = ($1, $2);
+    $rest =~ s{\\}{/}g;
+    my $posix = '/' . lc($drive) . '/' . $rest;
+    return -e $posix ? $posix : $p;
+}
 
 # =====================================================================
 # Arg parsing
