@@ -51,7 +51,7 @@ my $SPEND = SpendPanel::status(SpendPanel::from_snapshot({ results => [
 ] }), 1787000000);
 
 my @EVENTS = map {
-    [ { text => sprintf('%-6s  ', sprintf('16:%02d', $_)), role => 'text.muted' },
+    [ { text => tui::DashboardScreen::activity_time_text(sprintf('16:%02d', $_)), role => 'text.muted' },
       { text => 'o ', role => 'text.primary' },
       { text => "some_event exit=0", role => 'text.primary' } ]
 } 1 .. 6;

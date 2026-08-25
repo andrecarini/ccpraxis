@@ -1297,7 +1297,8 @@ sub recent_events {
             # AC19 (t/41): the time span's role is the THEME token
             # (theme_role('muted') == 'text.muted').
             $hhmm = ($now_numeric ? fmt_age($now - $rec->{epoch}) : '') unless defined $hhmm;
-            push @spans, { text => sprintf('%-6s  ', $hhmm), role => tui::DashboardScreen::theme_role('muted') };
+            push @spans, { text => tui::DashboardScreen::activity_time_text($hhmm),
+                           role => tui::DashboardScreen::theme_role('muted') };
         }
         # Fix batch (package 06, review finding "Fix 1"): event_style still
         # returns a LEGACY role name (good/bad/muted/accent/value) -- that

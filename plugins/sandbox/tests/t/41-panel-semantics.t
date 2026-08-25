@@ -590,7 +590,7 @@ sub _live_gutter_label { return tui::DashboardScreen::gutter($_[0]); }
 # recent_events gained an OPTIONAL 4th arg: Dashboard::recent_events
 # ($lines, $n, $localtime_fn, $now). Per spec S2.4.6 step 4 the render
 # stage now produces, in order: an optional TIME span -- emitted ONLY when
-# $now is defined and numeric, text sprintf('%-6s  ', fmt_duration($now -
+# $now is defined and numeric, text activity_time_text(fmt_duration($now -
 # $epoch)), role 'text.muted' (a THEME role name -- a deliberately new
 # span, distinct from the glyph/body spans below) -- then the GLYPH span,
 # then the BODY span (both STILL deriving their role from
@@ -657,7 +657,7 @@ sub _live_gutter_label { return tui::DashboardScreen::gutter($_[0]); }
     # event 0: launch_start, no exit/state -> event_style classifies (rule 6: accent).
     my ($role0, $glyph0) = Dashboard::event_style('launch_start', undef, undef);
     is(Dashboard::spans_text($ev->[0]),
-        sprintf("%-6s  ", Dashboard::_local_hhmm($epoch0, \&CORE::gmtime)) . "$glyph0 launch_start",
+        tui::DashboardScreen::activity_time_text(Dashboard::_local_hhmm($epoch0, \&CORE::gmtime)) . "$glyph0 launch_start",
         'AC19: event 0 spans_text == "$duration  $glyph $type$extra"');
     # RE-POINTED (fix-batch, unified-tui-design-system package
     # 06-dashboard-screen, NO_COLOR regression item): recent_events now maps
@@ -676,7 +676,7 @@ sub _live_gutter_label { return tui::DashboardScreen::gutter($_[0]); }
     # event 1: container_start exit=0 -> good; the exit= extra is carried in the text.
     my ($role1, $glyph1) = Dashboard::event_style('container_start', 0, undef);
     is(Dashboard::spans_text($ev->[1]),
-        sprintf("%-6s  ", Dashboard::_local_hhmm($epoch1, \&CORE::gmtime)) . "$glyph1 container_start exit=0",
+        tui::DashboardScreen::activity_time_text(Dashboard::_local_hhmm($epoch1, \&CORE::gmtime)) . "$glyph1 container_start exit=0",
         'AC19: event 1 spans_text carries the exit= extra text, with the classified glyph');
     is($ev->[1][0]{role}, $TIME_ROLE, 'AC19: event 1 timestamp span is muted even though the event itself is good');
     # RE-POINTED (same rationale/derivation as event 0 above), and load-
@@ -692,7 +692,7 @@ sub _live_gutter_label { return tui::DashboardScreen::gutter($_[0]); }
     # event 2: container_gone state=exited -> bad; the state= extra is carried.
     my ($role2, $glyph2) = Dashboard::event_style('container_gone', undef, 'exited');
     is(Dashboard::spans_text($ev->[2]),
-        sprintf("%-6s  ", Dashboard::_local_hhmm($epoch2, \&CORE::gmtime)) . "$glyph2 container_gone state=exited",
+        tui::DashboardScreen::activity_time_text(Dashboard::_local_hhmm($epoch2, \&CORE::gmtime)) . "$glyph2 container_gone state=exited",
         'AC19: event 2 spans_text carries the state= extra text, with the classified glyph');
     is($role2, 'bad', 'AC19: container_gone classifies as bad (sanity check on the fixture)');
     is($ev->[2][0]{role}, $TIME_ROLE, 'AC19: event 2 timestamp span is muted even though the event itself is bad');
@@ -727,7 +727,7 @@ sub _live_gutter_label { return tui::DashboardScreen::gutter($_[0]); }
     }
     is(Dashboard::spans_text($ev_no_now->[0]), Dashboard::spans_text($ev->[0]),
         'AC19 (clock-free): the row is byte-identical with and without $now -- $now cannot influence a wall-clock column');
-    is($ev_no_now->[0][0]{text}, sprintf('%-6s  ', Dashboard::_local_hhmm($epoch0, \&CORE::gmtime)),
+    is($ev_no_now->[0][0]{text}, tui::DashboardScreen::activity_time_text(Dashboard::_local_hhmm($epoch0, \&CORE::gmtime)),
         'AC19 (clock-free): and that column is the event timestamp rendered HH:MM');
 }
 

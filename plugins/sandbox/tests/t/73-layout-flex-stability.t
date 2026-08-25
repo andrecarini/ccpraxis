@@ -34,7 +34,7 @@ use tui::Screen ();
 
 sub events {
     my ($n) = @_;
-    return [ map { [ { text => sprintf('%-6s  ', sprintf('%02d:%02d', 9 + int($_ / 60), $_ % 60)),
+    return [ map { [ { text => tui::DashboardScreen::activity_time_text(sprintf('%02d:%02d', 9 + int($_ / 60), $_ % 60)),
                        role => 'text.muted' },
                      { text => "o event-$_", role => 'text.primary' } ] } (1 .. $n) ];
 }

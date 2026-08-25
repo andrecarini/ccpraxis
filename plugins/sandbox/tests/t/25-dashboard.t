@@ -941,7 +941,7 @@ my %st = (
     # RE-POINTED (operator request): the time column is the event's own WALL
     # CLOCK time, not its age. "row carries time + glyph + type" is preserved;
     # only what "time" means changes, and it no longer depends on $now.
-    my $expected_time0 = sprintf('%-6s  ', Dashboard::_local_hhmm($epoch_pt6, \&CORE::gmtime));
+    my $expected_time0 = tui::DashboardScreen::activity_time_text(Dashboard::_local_hhmm($epoch_pt6, \&CORE::gmtime));
     is(Dashboard::spans_text($ev->[0]), $expected_time0 . ($glyph0 // '') . " launch_start",
         'events: HH:MM + glyph + type (spec S2.4.6 render step 4; time grammar re-derived, "row carries time+glyph+type" preserved)');
     my ($role1, $glyph1) = eval { Dashboard::event_style('container_start', 0, undef) };

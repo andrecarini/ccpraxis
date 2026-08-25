@@ -181,11 +181,36 @@ use constant LABEL_GUTTER => 11;
 # Decision 2, operator-confirmed.
 use constant GUTTER_SEP => '   ';
 
-# The display width of an activity row's fixed prefix: the 6-column left-padded
-# HH:MM plus two spaces (8), then the glyph plus one space (2). Kept next to the
-# other layout constants rather than inline at the panel, because it has to
-# match what Dashboard::recent_events actually emits -- t/98 pins the pair.
-use constant ACTIVITY_HANG => 10;
+# ONE SPACE AFTER THE CLOCK, NOT THREE (operator request, 2026-08-25):
+#
+#     now:    22:15   o launch_start
+#     wanted: 22:15 o launch_start
+#
+# The column was 6 wide with two trailing spaces, so an HH:MM -- always exactly
+# five columns -- was followed by three. Nothing needed the slack: the width was
+# 6 for the sake of the fmt_duration fallback used only when localtime itself
+# fails, and paying a permanent three-column gap on every row for a degraded
+# path that renders no clock at all is the wrong trade. That path now shifts a
+# wide age ("23h59m") one column right instead; it is already the branch where
+# the timestamp is not a timestamp.
+#
+# ACTIVITY_TIME_FMT is the SINGLE definition of the prefix's shape.
+# Dashboard::recent_events emits it via activity_time_text(); ACTIVITY_HANG --
+# the wrap indent, which must agree with it or a wrapped event body hangs at the
+# wrong column -- is derived from it rather than restated. t/98 pins the pair.
+use constant ACTIVITY_TIME_W => 5;                     # HH:MM
+use constant ACTIVITY_GLYPH_W => 2;                    # glyph plus one space
+use constant ACTIVITY_HANG => ACTIVITY_TIME_W() + 1 + ACTIVITY_GLYPH_W();
+
+# activity_time_text($hhmm) -> the time span's text: the clock left-padded into
+# ACTIVITY_TIME_W columns, then ONE space. PUBLIC -- Dashboard::recent_events
+# builds the span from it, and the activity-row oracles derive their expected
+# prefix from it rather than restating the sprintf.
+sub activity_time_text {
+    my ($hhmm) = @_;
+    $hhmm = '' if !defined $hhmm || ref($hhmm);
+    return sprintf('%-*s ', ACTIVITY_TIME_W(), $hhmm);
+}
 
 # gutter($label) -> the padded label span text. PUBLIC (used by the three
 # label-rendering sites in this file).
@@ -1436,9 +1461,9 @@ sub panels {
     # ACTIVITY_HANG is the width of an event row's fixed prefix, so a wrapped
     # row's continuation lines up under the BODY rather than under the
     # timestamp. Dashboard::recent_events builds every row as
-    #   sprintf('%-6s  ', $hhmm)   -> 8 columns
+    #   activity_time_text($hhmm)  -> 6 columns
     #   "$glyph "                  -> 2 columns
-    # and the body follows at column 10. Operator, with a screenshot: the
+    # and the body follows at column 8. Operator, with a screenshot: the
     # wrapped text "is aligned to the hour minute `:` separator, should be
     # aligned to the text itself after the icon".
     #

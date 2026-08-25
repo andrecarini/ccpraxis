@@ -38,7 +38,7 @@ my $LONG = 'resources_sampler_forked with an unusually long trailing explanation
 sub events {
     my ($n) = @_;
     return [ map {
-        [ { text => sprintf('%-6s  ', sprintf('16:%02d', $_ % 60)), role => 'text.muted' },
+        [ { text => tui::DashboardScreen::activity_time_text(sprintf('16:%02d', $_ % 60)), role => 'text.muted' },
           { text => 'o ',  role => 'text.primary' },
           { text => ($_ % 4 == 0 ? $LONG : 'spend_sampler_forked'), role => 'text.primary' } ]
     } 1 .. $n ];
@@ -339,12 +339,18 @@ for my $cols (@WIDE, @NARROW) {
 {
     can_ok('tui::Frame', 'wrap_chars');
 
-    # A real activity row: 8-column time prefix, 2-column glyph prefix, body.
-    my $row = [ { text => sprintf('%-6s  ', '21:19'), role => 'text.muted' },
+    # A real activity row: the ACTIVITY_HANG-column fixed prefix (time + glyph), body.
+    my $row = [ { text => tui::DashboardScreen::activity_time_text('21:19'), role => 'text.muted' },
                 { text => 'x ',                      role => 'state.crit' },
                 { text => 'backpack_install_failed exit=1', role => 'state.crit' } ];
 
-    my $cells = tui::Frame::wrap_chars($row, 'text.primary', 32, 10, 3);
+    # DERIVED, not restated: the hang is whatever the renderer's own constant
+    # says, so a change to the row prefix (2026-08-25: one space after the clock
+    # instead of three) re-points this oracle instead of breaking it.
+    my $HANG = tui::DashboardScreen::ACTIVITY_HANG();
+    my $BODY = 'backpack_install_failed exit=1';
+
+    my $cells = tui::Frame::wrap_chars($row, 'text.primary', 32, $HANG, 3);
     my @txt = map { my $c = $_; join('', map { $_->{text} } @{ $c->{spans} || [] }) } @$cells;
     cmp_ok(scalar(@txt), '>=', 2, 'PART6: a row longer than the column wraps');
 
@@ -354,29 +360,30 @@ for my $cols (@WIDE, @NARROW) {
     is(tui::Layout::display_width($txt[0]), 32,
        'PART6a: the first line fills the column exactly -- broken at a character, not at a '
      . 'word boundary (a word wrap would stop early and leave the row short)');
-    like($txt[0], qr/backpack_install_faile\z/,
-         'PART6a: ...and the break lands mid-token, which is the "dumb break" that was asked for');
+    is($txt[0], tui::DashboardScreen::activity_time_text('21:19') . 'x ' . substr($BODY, 0, 32 - $HANG),
+       'PART6a: ...and the break lands wherever the column runs out inside the token, which is the '
+     . '"dumb break" that was asked for');
 
-    # (b) HANGING INDENT: continuation starts under the BODY (column 10), not
-    #     under the timestamp and not at the old 2-column continuation indent.
+    # (b) HANGING INDENT: continuation starts under the BODY (ACTIVITY_HANG),
+    #     not under the timestamp and not at the old 2-column continuation indent.
     my ($lead) = $txt[1] =~ /^( *)/;
-    is(length($lead), 10,
-       'PART6b: the continuation is indented to the BODY column (10 = 8-col time + 2-col glyph), '
-     . 'so it lines up under the event text rather than under the clock');
+    is(length($lead), $HANG,
+       "PART6b: the continuation is indented to the BODY column ($HANG = time field + one space "
+     . '+ glyph + one space), so it lines up under the event text rather than under the clock');
 
     # Non-vacuity: the SAME row with no hang is NOT indented, so PART6b is
     # pinning the parameter rather than some incidental property of the text.
     my $flat = tui::Frame::wrap_chars($row, 'text.primary', 32, 0, 3);
     my $f1 = join('', map { $_->{text} } @{ $flat->[1]{spans} || [] });
-    unlike($f1, qr/^ {10}/,
+    unlike($f1, qr/^ {$HANG}/,
            'PART6b non-vacuity: with hang=0 the continuation is not indented, so the assertion '
          . 'above measures the hanging indent and not the body text');
 
     # (c) The cap still applies, and a truncated row still carries the ellipsis.
-    my $long = [ { text => sprintf('%-6s  ', '21:19'), role => 'text.muted' },
+    my $long = [ { text => tui::DashboardScreen::activity_time_text('21:19'), role => 'text.muted' },
                  { text => 'x ', role => 'state.crit' },
                  { text => ('z' x 400), role => 'state.crit' } ];
-    my $capped = tui::Frame::wrap_chars($long, 'text.primary', 32, 10, 3);
+    my $capped = tui::Frame::wrap_chars($long, 'text.primary', 32, $HANG, 3);
     is(scalar(@$capped), 3, 'PART6c: the 3-row cap is honoured');
     my $last = join('', map { $_->{text} } @{ $capped->[-1]{spans} || [] });
     like($last, qr/\Q@{[ tui::Frame::ELLIPSIS() ]}\E/,
@@ -385,7 +392,7 @@ for my $cols (@WIDE, @NARROW) {
 
     # (d) Totality: the degenerate widths must not die or loop.
     for my $w (0, 1, 5) {
-        my $got = eval { tui::Frame::wrap_chars($row, 'text.primary', $w, 10, 3) };
+        my $got = eval { tui::Frame::wrap_chars($row, 'text.primary', $w, $HANG, 3) };
         ok(!$@ && ref($got) eq 'ARRAY', "PART6d: wrap_chars survives width $w without dying");
     }
 
@@ -395,7 +402,7 @@ for my $cols (@WIDE, @NARROW) {
     ok($act, 'PART6e: the Recent activity panel exists');
     is(($act || {})->{wrap_break}, 'char',
        'PART6e: ...and declares character breaking');
-    is(($act || {})->{wrap_indent}, 10,
+    is(($act || {})->{wrap_indent}, $HANG,
        'PART6e: ...and a hanging indent matching the row prefix Dashboard::recent_events emits');
 }
 

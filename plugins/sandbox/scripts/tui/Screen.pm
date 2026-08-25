@@ -91,12 +91,16 @@ use constant BODY_INDENT => 0;
 # t03-activity-column -- the side column's two constants.
 #
 # ACTIVITY_COLUMN_COLS is DERIVED and the derivation is written here so it can
-# be checked rather than trusted: an activity row is a 6-column time field plus
-# two spaces (Dashboard::recent_events builds it as sprintf '%-6s  '), then a
-# glyph and a space, then the event body. That is a 10-column fixed prefix. 30
-# columns of body budget on top of it fits `resources_sampler_forked` and most
-# of its siblings on one line, and lets the rest use the three-row cap the
-# operator asked for instead of being cut.
+# be checked rather than trusted: an activity row is a 5-column time field plus
+# one space (tui::DashboardScreen::activity_time_text), then a glyph and a
+# space, then the event body -- an 8-column fixed prefix
+# (tui::DashboardScreen::ACTIVITY_HANG). 30 columns of body budget on top of it
+# fits `resources_sampler_forked` and most of its siblings on one line, and lets
+# the rest use the three-row cap the operator asked for instead of being cut.
+#
+# The prefix lost two columns when the operator asked for one space after the
+# clock rather than three. The column keeps its width: those two columns went to
+# the BODY, which is the thing that was running out of room.
 #
 # SIDE_COLUMN_MIN_MAIN is what the REST of the screen must still have for the
 # split to be worth making, and it is DERIVED FROM tui::Layout's own two-column
