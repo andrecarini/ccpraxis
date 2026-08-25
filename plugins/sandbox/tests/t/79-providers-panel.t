@@ -313,11 +313,23 @@ sub runs_n {
     ok($providers_wp, 'AC4 precondition: a Providers panel exists with a non-empty priority list');
   SKIP: {
         skip('no Providers panel', 2) unless $providers_wp;
+        # THE 'nearest' SUMMARY ROW IS GONE (operator request, 2026-08-25:
+        # "no point to have `nearest claude/five_hour 2500%`").
+        #
+        # It named the provider/window closest to exhaustion and its
+        # percentage, every part of which the per-provider rows immediately
+        # below already say, in the same panel, two lines down. It was also the
+        # most visible casualty of the utilization scale bug: claude's fraction
+        # was stored 0..100 where every other provider's is 0..1, so the
+        # ranking put claude first unconditionally and this row was reporting
+        # something that could not have said anything else.
+        #
+        # $spend->{priority} is still computed and t/54 is its oracle; what is
+        # asserted here now is that the panel leads with a PROVIDER, which is
+        # the property the removal was for.
         my $texts = panel_line_texts($providers_wp);
-        like($texts->[0], qr/nearest/i, "AC4/Behavior9: the FIRST line of the Providers body is the nearest-exhaustion summary");
-        my ($cc_i) = grep { defined($texts->[$_]) && $texts->[$_] =~ /Claude Code/ } (0 .. $#$texts);
-        ok(defined($cc_i) && $cc_i > 0,
-            'AC4/Behavior9/D1: the nearest line sits BEFORE the first Claude Code heading -- panel-level, not nested under any provider');
+        like($texts->[0], qr/Claude Code/,
+            'AC4/Behavior9: the Providers body leads with a provider heading, not a summary of the rows below it');
     }
 
     my $panels_np = tui::DashboardScreen::panels(base_state(spend => { %SPEND_NO_PRIORITY }), 120);

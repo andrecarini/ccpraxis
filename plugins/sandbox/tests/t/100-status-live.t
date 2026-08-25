@@ -109,6 +109,14 @@ sub _run_live {
         state_interval => 0,
         tick_interval  => $o{tick_interval} // 0.25,
         max_ticks      => $o{max_ticks} // 6,
+        # The title spinner is PINNED for these blocks. They assert that an OSC
+        # payload is emitted ONLY WHEN THE TITLE CHANGES -- a change-detection
+        # property, not an animation one. With the production 500ms cadence the
+        # lead character advances during the run, so the title legitimately
+        # changes and the payload count legitimately rises, which would make
+        # this assertion measure the spinner instead of the thing it is about.
+        # A period longer than the run holds the character still.
+        title_spinner_period => 9_999,
         now            => sub { $clock },
         sleep_for      => ($o{sleep_for} // sub { $clock += $_[0] }),
         read_key       => sub { undef },

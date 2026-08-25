@@ -104,16 +104,33 @@ sub _width_table {
 # control / DEL, a handful of zero-width formatting codepoints, and any
 # combining mark; the Theme-declared width if the character is in the
 # glyph-width table; else 1. PUBLIC.
+# MEMOISED. The answer for a given character never changes -- the width table
+# is built once and the Unicode properties are fixed -- and the renderer asks
+# about the SAME few dozen characters thousands of times per frame (every box
+# glyph, every spinner frame, every letter of every label). The \p{Mn}|\p{Me}
+# match in particular is far too expensive to repeat per occurrence.
+#
+# Unbounded by design: the key space is the set of distinct characters that
+# reach a TUI, which is bounded by the screen's own vocabulary in practice. It
+# is not fed arbitrary input -- display_width's ASCII fast path above takes the
+# overwhelming majority of calls before they ever get here.
+my %CHAR_COLS_MEMO;
+
 sub char_cols {
     my ($c) = @_;
     return 0 if !defined $c || $c eq '';
+    return $CHAR_COLS_MEMO{$c} if exists $CHAR_COLS_MEMO{$c};
+
+    my $w;
     my $cp = ord($c);
-    return 0 if $cp < 0x20 || $cp == 0x7F;
-    return 0 if $cp == 0x200B || $cp == 0x200D || $cp == 0xFE0F;
-    return 0 if $c =~ /\p{Mn}|\p{Me}/;
-    my $t = _width_table();
-    return $t->{$c} if exists $t->{$c};
-    return 1;
+    if    ($cp < 0x20 || $cp == 0x7F)                            { $w = 0 }
+    elsif ($cp == 0x200B || $cp == 0x200D || $cp == 0xFE0F)      { $w = 0 }
+    elsif ($c =~ /\p{Mn}|\p{Me}/)                                { $w = 0 }
+    else {
+        my $t = _width_table();
+        $w = exists $t->{$c} ? $t->{$c} : 1;
+    }
+    return $CHAR_COLS_MEMO{$c} = $w;
 }
 
 # glyph_width($c) -- accepts a decoded character OR its UTF-8 byte encoding.
@@ -150,9 +167,43 @@ sub glyph_width {
 sub display_width {
     my ($str) = @_;
     return 0 if !defined $str || $str eq '';
+
+    # FAST PATH: printable ASCII is one column per character, always.
+    #
+    # This function is the hottest thing in the renderer -- measured at ~770
+    # calls per composed frame, and the frame is composed on every tick. The
+    # general path below decodes the string, strips SGR, splits it into
+    # characters and calls char_cols on each, and char_cols runs a UNICODE
+    # PROPERTY REGEX (\p{Mn}|\p{Me}) per character. That is 21 property matches
+    # to measure "heartbeat     50s ago", and it measured 0.051ms per call --
+    # about 39ms of a 200ms render tick spent entirely here.
+    #
+    # Every codepoint in [\x20-\x7E] is width 1: none is a combining mark, none
+    # is zero-width, and the width table holds nothing below U+00B7, so the
+    # general path cannot return anything else for them. An SGR escape starts
+    # with \x1B and a control byte is below \x20, so neither reaches this
+    # branch -- they fall through to the full path that knows how to handle
+    # them. The fast path is therefore exact, not an approximation.
+    return length($str) if $str =~ /\A[\x20-\x7E]*\z/;
+
+    # MEASURE ONLY THE CHARACTERS THAT CAN DIFFER FROM ONE COLUMN.
+    #
+    # This used to split the string into characters and call char_cols on every
+    # one. Profiled on a representative 120-character row: 0.077ms of the
+    # 0.133ms total was that loop -- 120 subroutine calls to answer "1" 119
+    # times. split// cost another 0.021ms building a list that was thrown away.
+    #
+    # Printable ASCII is width 1 (see the fast path above for why that is exact,
+    # not an approximation), so start from length() and correct only for the
+    # characters that are NOT printable ASCII: combining marks and control
+    # bytes subtract, the declared-wide glyphs add. A dashboard row is mostly
+    # label text with a handful of box-drawing glyphs, so this turns 120 calls
+    # into three or four.
     my $s = _strip_sgr(_decode_str($str));
-    my $w = 0;
-    $w += char_cols($_) for split //, $s;
+    my $w = length($s);
+    while ($s =~ /([^\x20-\x7E])/g) {
+        $w += char_cols($1) - 1;
+    }
     return $w;
 }
 

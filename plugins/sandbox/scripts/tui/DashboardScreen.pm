@@ -466,9 +466,19 @@ sub backpack_summary_spans {
         $pending = 0 if $pending < 0;
     }
 
-    my @spans = ( { text => count_of($total, "item") . ", $approved approved", role => "text.primary" } );
+    # TERSE (operator request, 2026-08-25: "too verbose"). This read
+    # "5 items, 0 approved, 5 pending   [b] manage" -- long enough to wrap onto
+    # a second row inside a band-shared panel, which is how a one-line summary
+    # came to cost two.
+    #
+    # The three numbers are not independent: pending is total minus approved,
+    # so stating all three says the same thing twice. "5 items, 5 pending" is
+    # the pair that carries the information -- how many there are, and how many
+    # still want you -- and the key drops to "[b]" because the panel it opens
+    # is titled Backpack and the row is labelled backpack.
+    my @spans = ( { text => count_of($total, 'item'), role => 'text.primary' } );
     push @spans, { text => ", $pending pending", role => 'state.warn' } if $pending > 0;
-    push @spans, { text => '   [b] manage', role => 'text.muted' };
+    push @spans, { text => '  [b]', role => 'text.muted' };
     return \@spans;
 }
 
@@ -873,7 +883,12 @@ sub _blueprints_body {
     my $lines = _run_summary_lines($state->{runs}, $state->{blueprint_rows_max},
                                    _blueprints_table_width($cols));
     return $lines if @$lines;
-    return [ row({ label => 'blueprints', value => 'no active runs', role => 'text.muted', force => 1 }) ];
+    # NO 'blueprints' LABEL (operator request, 2026-08-25: "that's unnecessary
+    # repeating"). The panel is titled Blueprints and this is its only row, so
+    # the gutter was spending eleven columns restating the title directly
+    # beneath itself. Every OTHER row in this dashboard earns its label by
+    # distinguishing itself from its siblings; a lone row has no siblings.
+    return [ [ { text => 'no active runs', role => 'text.muted' } ] ];
 }
 
 # ===========================================================================
@@ -1228,22 +1243,22 @@ sub _providers_body {
 
     my @lines;
 
-    if ($spend && ref($spend->{priority}) eq 'ARRAY' && @{ $spend->{priority} }) {
-        my $top = $spend->{priority}[0];
-        if (ref($top) eq 'HASH' && defined $top->{provider} && defined $top->{window}) {
-            # Fix batch (package 06, red-team finding, latent/low): the prior
-            # guard checked only `!ref`, not "is actually numeric" -- a
-            # non-numeric string would sail past it into `* 100`, warning
-            # under `use warnings` ("Argument isn't numeric") instead of
-            # degrading to '?'.
-            my $pct = (defined($top->{fraction}) && !ref($top->{fraction})
-                       && $top->{fraction} =~ /^-?\d+(?:\.\d+)?$/)
-                    ? sprintf('%d%%', int($top->{fraction} * 100 + 0.5)) : '?';
-            my $pline = [ { text => pad_label('nearest', 7), role => 'text.muted' },
-                          { text => "$top->{provider}/$top->{window} $pct", role => 'accent' } ];
-            push @lines, (tui::Frame::spans_width($pline) > $w) ? tui::Frame::fit_spans($pline, $w) : $pline;
-        }
-    }
+    # THE 'nearest' ROW IS GONE (operator request, 2026-08-25).
+    #
+    # It named the provider/window closest to exhaustion and its percentage --
+    # every part of which the per-provider rows immediately below already say,
+    # in the same panel, usually two lines down. A summary row sitting directly
+    # above the thing it summarises is not a summary, it is a repetition, and
+    # it cost a row of the tallest panel on the screen.
+    #
+    # It was also the most visible casualty of the utilization bug fixed in
+    # SpendPanel this same commit: claude's fraction was stored as 0..100 while
+    # every other provider's is 0..1, so the "nearest exhaustion" sort ranked
+    # claude first unconditionally. The row was reporting a ranking that could
+    # not have been anything else.
+    #
+    # $spend->{priority} is still computed and is now correct; nothing else
+    # consumed this row, so only the rendering goes.
 
     push @lines, @{ _claude_code_block($state->{tokens}, $spend ? $spend->{claude} : undef, $spend ? 1 : 0, $w) };
     push @lines, @{ _opencode_block($spend ? $spend->{go}  : undef,

@@ -50,9 +50,20 @@ my $TITLE = Dashboard::TITLE_SPINNER_PERIOD_SECS();
 
 ok($SPIN > 0,  'A1: the in-screen spinner period is a positive number');
 ok($TITLE > 0, 'A2: the title spinner period is a positive number');
-ok($TITLE > $SPIN,
-    'A3: the OS window title advances more slowly than the in-screen spinner -- a title is '
-  . 'glanced at, not watched, and each change is an OSC write to the terminal');
+# A3 REVISED 2026-08-25. This asserted the title advances MORE SLOWLY than the
+# in-screen spinner, on the reasoning that a title is glanced at rather than
+# watched and each change costs an OSC write. The operator watched it and asked
+# for it faster, which settles the design question: the write is a dozen-odd
+# bytes, emitted only when the title STRING changes, so it is not a cost worth
+# a slower spinner.
+#
+# What still deserves pinning is that the title cadence is a real, bounded
+# number rather than something that drifted to zero or to a value nobody would
+# notice -- so it is bounded on both sides instead of ranked against the other.
+cmp_ok($TITLE, '<=', 2.0,
+    'A3: the OS window title advances at least once every two seconds -- fast enough to read as alive');
+cmp_ok($TITLE, '>=', 0.1,
+    'A3: ...and not so fast that it rewrites the title faster than a terminal can usefully show it');
 
 # ---------------------------------------------------------------------------
 # B. THE REGRESSION ITSELF: all ten frames must be reachable from the real

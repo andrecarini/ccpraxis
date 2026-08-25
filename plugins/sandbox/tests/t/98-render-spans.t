@@ -588,11 +588,27 @@ is(Dashboard::display_width("a\tb"), 2,
             unless $body_row;
         is($body_row->{role}, 'text.primary',
             "AC-16 RETARGETED: a row()-composed panel line's row role is 'text.primary' (was 'body' -- spec 06 S2.1)");
-        cmp_ok(scalar(@{ $body_row->{spans} }), '>=', 2,
-            'AC-16 RETARGETED: the row has at least an indent span plus one content span (exact 6-span shape retired -- see comment above; Decision 15)');
-        is($body_row->{spans}[0]{text}, '  ', 'AC-16: first span is the 2-space body indent');
-        is($body_row->{spans}[0]{role}, 'text.primary',
-            "AC-16 RETARGETED: indent span role is 'text.primary' (was 'body' -- spec 06 S2.1, tui/Screen.pm:91)");
+        cmp_ok(scalar(@{ $body_row->{spans} }), '>=', 1,
+            'AC-16 RETARGETED: the row has at least one content span (exact 6-span shape retired -- see comment above; Decision 15)');
+        # THE TWO-SPACE BODY INDENT IS GONE (tui::Screen::BODY_INDENT, 0 since
+        # 2026-08-25). It predated the panel grid: with no left edge of its own,
+        # a panel needed the indent to tie its rows to the title above them.
+        # Every panel has a real edge now -- a border, or the viewport -- so the
+        # indent was two columns of nothing on every row of every panel.
+        #
+        # Derived from the constant rather than deleted, so this assertion goes
+        # on meaning something if the indent ever comes back.
+        require tui::Screen;
+        my $indent = tui::Screen::BODY_INDENT();
+        if ($indent > 0) {
+            is($body_row->{spans}[0]{text}, ' ' x $indent, "AC-16: first span is the ${indent}-space body indent");
+            is($body_row->{spans}[0]{role}, 'text.primary', "AC-16: indent span role is 'text.primary'");
+        } else {
+            isnt($body_row->{spans}[0]{text}, '  ',
+                'AC-16: no leading indent span -- content starts at the panel edge (BODY_INDENT is 0)');
+            like($body_row->{spans}[0]{text}, qr/\S/,
+                'AC-16: the first span carries content, not padding');
+        }
         is(Dashboard::spans_text($body_row->{spans}), $body_row->{text},
             "AC-16: spans_text(cell->{spans}) eq cell->{text}");
         unlike($body_row->{text}, qr/\e/, 'AC-16: cell text contains no ESC (INV-4)');

@@ -6687,11 +6687,15 @@ sub _resources_sampler_round {
     my $t0     = time;   # measurement time, captured before any probe runs
     my $probes = _resources_probes();
     my $avail  = Resources::probe_availability($probes);
-    my $res    = Resources::gather($probes, Resources::sampler_probe_opts($container, $device));
+    my %probe_err;
+    my $popts  = Resources::sampler_probe_opts($container, $device);
+    $popts->{errors} = %probe_err;
+    my $res    = Resources::gather($probes, $popts);
     my $snap   = Resources::snapshot_build($res, {
         now => $t0, pid => $$, container => $container,
         platform => ($WINDOWS_FAMILY ? 'windows' : 'posix'),
         probes_run => $avail->{present}, probes_absent => $avail->{absent},
+        probe_errors => %probe_err,
     });
     my $bytes = Resources::snapshot_encode($snap);
     _write_file_atomic($snapshot_path, $bytes) if defined $bytes;

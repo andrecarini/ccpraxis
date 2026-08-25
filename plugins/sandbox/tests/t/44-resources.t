@@ -2277,7 +2277,14 @@ FAKE_MODULE
 
 # --- AC-17 -> DC-1/DC-6: snapshot_build's eight declared keys. -----------
 {
-    my @SNAP_KEYS = qw(v written_at sampler_pid container platform probes_run probes_absent resources);
+    # NINE keys now. probe_errors was added 2026-08-25: Resources::gather
+    # discarded every probe failure (`eval { local $SIG{__WARN__} = sub {}; ... }`
+    # with `local $@` above it), so a snapshot could report probes_absent EMPTY
+    # -- all six probes present and executed -- with every one of the fifteen
+    # facts undef, and there was no way to find out why afterwards. Observed
+    # live. It is META, sitting beside probes_run and probes_absent, because it
+    # describes the MEASUREMENT rather than the machine.
+    my @SNAP_KEYS = qw(v written_at sampler_pid container platform probes_run probes_absent probe_errors resources);
     for my $case ( [ 'undef struct', undef ], [ 'ref struct', [] ], [ 'struct with extra keys', { %B10, bogus_extra_key => 'x' } ] ) {
         my ($label, $struct) = @$case;
         my $meta = { now => $NOW, pid => 1, container => $CTR, platform => 'windows', probes_run => [], probes_absent => [] };
@@ -2285,7 +2292,7 @@ FAKE_MODULE
         ok(is_hashref($snap), "AC-17: snapshot_build($label, meta) returns a hashref");
         if (is_hashref($snap)) {
             is_deeply([ sort keys %$snap ], [ sort @SNAP_KEYS ],
-                "AC-17: snapshot_build($label, meta) has exactly the eight declared keys");
+                "AC-17: snapshot_build($label, meta) has exactly the nine declared keys");
             ok(is_hashref($snap->{resources}), "AC-17: snapshot_build($label, meta)->{resources} is a hashref");
             if (is_hashref($snap->{resources})) {
                 is_deeply([ sort keys %{ $snap->{resources} } ], [ sort @KEYS_15 ],
@@ -2294,7 +2301,7 @@ FAKE_MODULE
                 fail("AC-17: snapshot_build($label, meta)->{resources} has exactly the 15 closed keys");
             }
         } else {
-            fail("AC-17: snapshot_build($label, meta) has exactly the eight declared keys");
+            fail("AC-17: snapshot_build($label, meta) has exactly the nine declared keys");
             fail("AC-17: snapshot_build($label, meta)->{resources} is a hashref");
             fail("AC-17: snapshot_build($label, meta)->{resources} has exactly the 15 closed keys");
         }

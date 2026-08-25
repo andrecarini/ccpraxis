@@ -1401,10 +1401,10 @@ sub seg_has { my ($seg, $tag) = @_; return scalar(grep { $_->[0] eq $tag } @{ $s
         );
         my $f = Dashboard::compose_frame(\%st, $rows, $cols);
         is(scalar(@$f), $rows, "AC-25: frame has exactly $rows rows at cols=$cols (recover banner + overlong detail + relaunch confirm)");
-        my $bad = grep { Dashboard::display_width($_->{text}) != $cols } @{$f}[ 1 .. $#{$f} - 1 ];
+        my $bad = grep { Dashboard::display_width($_->{text}) != $cols } @{$f}[ 0 .. $#{$f} - 1 ];
         is($bad, 0, "AC-25: EVERY cell is exactly $cols DISPLAY columns wide at cols=$cols");
 
-        my @bad_spans = grep { !$_->{spans} || ref($_->{spans}) ne 'ARRAY' || !@{ $_->{spans} } } @{$f}[ 1 .. $#{$f} - 1 ];
+        my @bad_spans = grep { !$_->{spans} || ref($_->{spans}) ne 'ARRAY' || !@{ $_->{spans} } } @{$f}[ 0 .. $#{$f} - 1 ];
         is(scalar(@bad_spans), 0, "AC-25: every cell has a non-empty spans arrayref at cols=$cols");
 
         # RETARGETED 2026-08-08 (package 06-dashboard-screen, driver scope
@@ -1451,10 +1451,19 @@ sub seg_has { my ($seg, $tag) = @_; return scalar(grep { $_->[0] eq $tag } @{ $s
         # the spans finds a banner in either placement, which is what these
         # assertions were always about; t/105 owns WHERE it lands.
         my @alerts = grep {
+            # A banner-role span that is JUST THE STATUS WORD belongs to the
+            # title row's own status block, not to a banner. Row 0 has to be
+            # examined (the side column starts there, so a banner can live on
+            # it) but its header carries state.crit for "exited" -- excluding
+            # the row wholesale loses real banners, and including it blindly
+            # counts the header as one. Discriminate on the SPAN, which is
+            # exact: a status word is a closed vocabulary, a banner is prose.
             ref($_->{spans}) eq 'ARRAY'
-                ? scalar(grep { ($_->{role} // '') eq 'state.crit' } @{ $_->{spans} })
+                ? scalar(grep { ($_->{role} // '') eq 'state.crit'
+                                && ($_->{text} // '') !~ /\A(?:running|exited|stopped|paused|created|restarting|stopping|dead|removing|unknown|\?)\z/ }
+                         @{ $_->{spans} })
                 : ($_->{role} // '') eq 'state.crit'
-        } @{$f3}[ 1 .. $#{$f3} - 1 ];
+        } @{$f3}[ 0 .. $#{$f3} - 1 ];
         cmp_ok(scalar(@alerts), '>=', 2, "AC-25: the recover banner + status alert coexist as rows at cols=$cols");
         like($alerts[0]{text}, qr{recover 2/4},
             "AC-25: the recover banner is the FIRST alert row at cols=$cols") if @alerts;

@@ -109,7 +109,20 @@ sub _claude_windows {
         my $w = _hash($claude->{$name});
         my $u = _num($w->{utilization});
         next unless defined $u;
-        push @out, { name => $name, fraction => $u, text => _pct($u) };
+        # utilization IS ALREADY A PERCENT, 0..100. The oauth usage contract
+        # says so twice over -- bp-contract.pl documents the field as
+        # "utilization:int%" and rejects anything outside 0..100 -- but this
+        # stored it as `fraction` and ran it through _pct, which multiplies by
+        # 100. So a real 25% rendered as "2500%".
+        #
+        # The display was the visible half. The worse half was silent: every
+        # other provider's `fraction` is a true 0..1 ratio (go divides used by
+        # limit), and _priority ranks "nearest exhaustion" by sorting on it
+        # descending. A claude window carrying 25 instead of 0.25 outranked
+        # every possible go or zen value by two orders of magnitude, so claude
+        # was ALWAYS reported as nearest regardless of the actual numbers.
+        my $f = $u / 100;
+        push @out, { name => $name, fraction => $f, text => _pct($f) };
     }
     return \@out;
 }

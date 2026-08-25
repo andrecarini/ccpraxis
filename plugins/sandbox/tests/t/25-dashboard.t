@@ -1377,6 +1377,15 @@ sub drive_per_tick {
         beat_interval  => $args{beat_interval}  // 9999,
         state_interval => $args{state_interval} // 999,   # suppress mid-run gathers unless overridden
         tick_interval  => 0.25,
+        # The title spinner is PINNED for this shared driver. Blocks below
+        # count OSC payloads and out-calls per tick, asserting that the title
+        # is emitted ONLY WHEN IT CHANGES -- a change-detection property. At
+        # the production 500ms cadence the lead character advances during the
+        # run, so the title genuinely changes and the counts genuinely rise,
+        # which would turn those assertions into measurements of the spinner
+        # rather than of the property they name. A period longer than the run
+        # holds the character still.
+        title_spinner_period => 9_999,
         color          => 0,
         max_ticks      => $args{max_ticks} // 5,
         now            => sub { $clock },

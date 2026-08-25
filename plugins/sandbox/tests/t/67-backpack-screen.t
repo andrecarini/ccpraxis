@@ -594,7 +594,17 @@ SKIP: {
 
     like($summary_joined, qr/\Q$counts->{total}\E items/, 'AC-L7: the screen summary row states the total count');
     like($dash_text, qr/\Q$counts->{total}\E items/, "AC-L7: tui::DashboardScreen::backpack_summary_spans states the SAME total, from the SAME counts");
-    like($dash_text, qr/\Q$counts->{approved}\E approved/, 'AC-L7: both surfaces state the same approved count');
+    # The dashboard summary no longer states the APPROVED count (operator,
+    # 2026-08-25: "too verbose"). The three numbers were never independent --
+    # pending is total minus approved -- so stating all three said the same
+    # thing twice, and the row wrapped onto a second line inside a shared band.
+    #
+    # AC-L7's property is that the two surfaces AGREE, so it is asserted on the
+    # number they both still state: pending, which is the one that says how many
+    # items still want the operator.
+    my $pending = $counts->{total} - $counts->{approved};
+    like($dash_text, qr/\Q$pending\E pending/,
+        'AC-L7: both surfaces state the same pending count, derived from the SAME counts');
 }
 
 SKIP: {

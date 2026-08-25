@@ -66,6 +66,29 @@ sub slurp {
 # width-floor coverage lives in t/25.
 my $CONTINUATION_ROLE = 'text.primary';   # Screen.pm's wrap-continuation indent role
 my $BANNER_ROLE       = 'state.crit';     # Screen.pm's banner_role (spec 06 S2.4.9)
+# _strip_title_status($row, $is_title) -> a row whose banner-role spans exclude
+# the TITLE's own status block.
+#
+# Row 0 has to be examined -- the side column starts there, so a banner can
+# live on it -- but the header carries a state.crit span for "exited", which is
+# not a banner. Left in, it joins AHEAD of the banner text, so
+# count_banner_starts sees "exited !! full shutdown..." and its ^\s*!! start
+# test misses: two banners were counted as one.
+#
+# Only the title row is filtered, and only for an exact status word. A banner's
+# own continuation legitimately contains words like "running" (the lifecycle
+# detail ends "- running"), and stripping those would corrupt the text the
+# full-detail assertion joins back together.
+sub _strip_title_status {
+    my ($row, $is_title) = @_;
+    return $row unless $is_title && ref($row->{spans}) eq 'ARRAY';
+    my @keep = grep {
+        !( ($_->{role} // '') eq 'state.crit'
+           && ($_->{text} // '') =~ /\A(?:running|exited|stopped|paused|created|restarting|stopping|dead|removing|unknown|\?)\z/ )
+    } @{ $row->{spans} };
+    return { %$row, spans => \@keep };
+}
+
 sub count_banner_starts {
     my ($rows) = @_;
     $rows = [] if ref($rows) ne 'ARRAY';
@@ -1061,10 +1084,19 @@ sub drive2 {
         # the spans finds a banner in either placement, which is what these
         # assertions were always about; t/105 owns WHERE it lands.
         my @alerts = grep {
+            # A banner-role span that is JUST THE STATUS WORD belongs to the
+            # title row's own status block, not to a banner. Row 0 has to be
+            # examined (the side column starts there, so a banner can live on
+            # it) but its header carries state.crit for "exited" -- excluding
+            # the row wholesale loses real banners, and including it blindly
+            # counts the header as one. Discriminate on the SPAN, which is
+            # exact: a status word is a closed vocabulary, a banner is prose.
             ref($_->{spans}) eq 'ARRAY'
-                ? scalar(grep { ($_->{role} // '') eq 'state.crit' } @{ $_->{spans} })
+                ? scalar(grep { ($_->{role} // '') eq 'state.crit'
+                                && ($_->{text} // '') !~ /\A(?:running|exited|stopped|paused|created|restarting|stopping|dead|removing|unknown|\?)\z/ }
+                         @{ $_->{spans} })
                 : ($_->{role} // '') eq 'state.crit'
-        } @{$f3}[ 1 .. $#{$f3} - 1 ];
+        } map { _strip_title_status($_, $_ == $f3->[0]) } @{$f3}[ 0 .. $#{$f3} - 1 ];
         # AMENDED by package d02-wrap-every-surface, Decision D1
         # (specs/d02-wrap-every-surface-spec.md, Section 0): banners now wrap
         # instead of truncate, so "one row per banner" stopped being a valid
@@ -1143,10 +1175,19 @@ sub drive2 {
         my %one = (%st, install_warning => $urgent_text);
         my $fo = Dashboard::compose_frame(\%one, 12, $cols);
         my @ao = grep {
+            # A banner-role span that is JUST THE STATUS WORD belongs to the
+            # title row's own status block, not to a banner. Row 0 has to be
+            # examined (the side column starts there, so a banner can live on
+            # it) but its header carries state.crit for "exited" -- excluding
+            # the row wholesale loses real banners, and including it blindly
+            # counts the header as one. Discriminate on the SPAN, which is
+            # exact: a status word is a closed vocabulary, a banner is prose.
             ref($_->{spans}) eq 'ARRAY'
-                ? scalar(grep { ($_->{role} // '') eq 'state.crit' } @{ $_->{spans} })
+                ? scalar(grep { ($_->{role} // '') eq 'state.crit'
+                                && ($_->{text} // '') !~ /\A(?:running|exited|stopped|paused|created|restarting|stopping|dead|removing|unknown|\?)\z/ }
+                         @{ $_->{spans} })
                 : ($_->{role} // '') eq 'state.crit'
-        } @{$fo}[ 1 .. $#{$fo} - 1 ];
+        } @{$fo}[ 0 .. $#{$fo} - 1 ];
         is(count_banner_starts(\@ao), 1,
             "AC-20 (fix-batch step 7): one real banner with an urgent!! continuation trap still counts as ONE at cols=$cols");
     }
@@ -1160,7 +1201,7 @@ sub drive2 {
         ref($_->{spans}) eq 'ARRAY'
             ? scalar(grep { ($_->{role} // '') eq 'state.crit' } @{ $_->{spans} })
             : ($_->{role} // '') eq 'state.crit'
-    } @{$fm}[ 1 .. $#{$fm} - 1 ];
+    } @{$fm}[ 0 .. $#{$fm} - 1 ];
     is(count_banner_starts(\@am), 2,
         'AC-20 (fix-batch step 7): a wrapped banner and an unwrapped banner together still count as TWO');
 }

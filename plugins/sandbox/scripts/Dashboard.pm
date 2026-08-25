@@ -800,7 +800,11 @@ use constant HOT_RELOAD_REPORT_SECS => 20;
 # needless OSC writes -- so it advances through the SAME ten frames four times
 # more slowly.
 use constant SPINNER_PERIOD_SECS       => 0.5;
-use constant TITLE_SPINNER_PERIOD_SECS => 2.0;
+# Was 2.0, on the reasoning that a title is glanced at rather than watched and
+# each change costs an OSC write. The operator watched it and wanted it faster,
+# which settles it: the write is a dozen-odd bytes emitted only when the STRING
+# changes, so two per second is not a cost worth a slower spinner.
+use constant TITLE_SPINNER_PERIOD_SECS => 0.5;
 
 # The product name, in ONE place. It was a bare literal in two builders
 # (window_title's suffix and the in-screen header's left half) that must agree

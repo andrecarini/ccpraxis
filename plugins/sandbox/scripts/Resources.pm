@@ -412,6 +412,9 @@ sub gather {
     $budget = $DEFAULT_BUDGET unless defined $budget && $budget > 0;
     my $clock = $opts->{now};
     my $t0    = _clock($clock);
+    # Opt-in out-param: a hashref here collects one short reason per probe that
+    # yielded nothing. See the note at the eval below.
+    my $errors = (ref $opts->{errors} eq 'HASH') ? $opts->{errors} : undef;
 
     my %raw;
     for my $key (@PROBE_ORDER) {
@@ -421,8 +424,36 @@ sub gather {
             my $t = _clock($clock);
             last if defined $t && ($t - $t0) >= $budget;
         }
-        my $out = eval { local $SIG{__WARN__} = sub { }; $cb->() };
+        # KEEP THE REASON. This was `eval { local $SIG{__WARN__} = sub {}; ... }`
+        # with `local $@` at the top of the sub, so a probe that died and a
+        # probe that returned nothing were indistinguishable, and BOTH were
+        # indistinguishable from a probe that ran fine and found nothing.
+        #
+        # Observed live on 2026-08-25: a snapshot with probes_absent EMPTY (all
+        # six probes present and executed) and every one of the fifteen facts
+        # undef. The panel could only say "fresh, 14 facts unavailable", which
+        # tells the operator that something failed and nothing about what --
+        # and there was no way to find out afterwards, because the reason had
+        # been discarded at this line.
+        #
+        # $opts->{errors}, when the caller supplies a hashref, collects one
+        # short reason per failed probe. Opt-in so pure callers and tests are
+        # unaffected.
+        my @warn;
+        my $out = eval { local $SIG{__WARN__} = sub { push @warn, $_[0] }; $cb->() };
+        my $err = $@;
         $raw{$key} = (defined $out && !ref $out && length $out) ? $out : undef;
+
+        if (ref $errors eq 'HASH' && !defined $raw{$key}) {
+            my $why = (defined $err && length $err) ? $err
+                    : (@warn                       ? $warn[0]
+                    : (ref $out                    ? 'probe returned a ' . ref($out) . ' ref'
+                                                   : 'probe produced no output'));
+            $why =~ s/\s+/ /g;
+            $why =~ s/^\s+|\s+$//g;
+            $why = substr($why, 0, 160) if length($why) > 160;
+            $errors->{$key} = $why;
+        }
     }
 
     return build({ %raw, container => $opts->{container}, device => $opts->{device} });
@@ -546,6 +577,11 @@ sub snapshot_build {
         platform       => (defined $meta->{platform} && $meta->{platform} eq 'windows') ? 'windows' : 'posix',
         probes_run     => _probe_list($meta->{probes_run}),
         probes_absent  => _probe_list($meta->{probes_absent}),
+        # WHY each probe yielded nothing, when the caller collected it. Meta,
+        # not a fact -- it describes the MEASUREMENT, exactly as probes_run and
+        # probes_absent do, and is what turns "14 facts unavailable" from a
+        # symptom into something an operator can act on.
+        probe_errors   => ((ref $meta->{probe_errors} eq 'HASH') ? $meta->{probe_errors} : {}),
         resources      => $resources,
     };
 }

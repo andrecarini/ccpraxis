@@ -27,8 +27,18 @@
 #     which the spec S2 names as a third meter this panel must show even
 #     though b36 does not produce it):
 #       claude => { status => 'ok'|'unknown',
-#                   five_hour => { utilization => 0..1 } | undef,
-#                   seven_day => { utilization => 0..1 } | undef,
+#                   five_hour => { utilization => 0..100 } | undef,
+#                   seven_day => { utilization => 0..100 } | undef,
+#
+# UTILIZATION IS AN INTEGER PERCENT, NOT A FRACTION. This header declared
+# 0..1 and every fixture below followed it, which is exactly why SpendPanel
+# was written to multiply by 100 and shipped rendering a real 25% as "2500%".
+#
+# The endpoint's own contract settles it twice over: BpContract documents the
+# field as "utilization:int%" and rejects anything outside 0..100, and
+# bp-orchestrator compares it directly against ceilings of 85 and 90 -- values
+# a 0..1 fraction could never reach. The operator's live screen showed 2500%
+# and 1800%, i.e. 25 and 18.
 #                   diagnostic => $str | undef }
 #       go     => { status => 'ok'|'unknown'|'absent',
 #                   five_hour|weekly|monthly => { used => N, limit => N } | undef,
@@ -138,7 +148,7 @@ sub try_call {
 }
 
 # --- Fixture builders ---------------------------------------------------------------
-sub fixture_claude_comfortable { return { status => 'ok', five_hour => { utilization => 0.10 }, seven_day => { utilization => 0.05 } } }
+sub fixture_claude_comfortable { return { status => 'ok', five_hour => { utilization => 10 }, seven_day => { utilization => 5 } } }
 sub fixture_claude_unreadable  { return { status => 'unknown', diagnostic => 'usage endpoint unreachable' } }
 
 sub fixture_go_ok {
@@ -321,7 +331,7 @@ sub lines_text {
     # Paired gate: everything comfortable and roughly EQUAL -> natural
     # (declared) order, not hardcoded "always monthly".
     my $spend_calm = {
-        claude => { status => 'ok', five_hour => { utilization => 0.10 }, seven_day => { utilization => 0.10 } },
+        claude => { status => 'ok', five_hour => { utilization => 10 }, seven_day => { utilization => 10 } },
         go     => fixture_go_ok(five_hour => { used => 1, limit => 12 }, weekly => { used => 2.5, limit => 30 }, monthly => { used => 5, limit => 60 }),
         zen_enabled => 0,
     };
@@ -424,7 +434,7 @@ sub lines_text {
 # the boundary and just past it.
 # ===========================================================================
 {
-    my $claude_low = { status => 'ok', five_hour => { utilization => 0.10 } };
+    my $claude_low = { status => 'ok', five_hour => { utilization => 10 } };
 
     for my $case ([58, 'go', 'below the limit (still ok)'],
                    [60, 'go', 'exactly AT the limit'],
@@ -445,7 +455,7 @@ sub lines_text {
     # VACUITY GATE: when go is genuinely the comfortable one, claude wins. So
     # this is not an implementation that simply always answers 'go'.
     my $spend_flip = { zen_enabled => 0,
-                        claude => { status => 'ok', five_hour => { utilization => 0.99 } },
+                        claude => { status => 'ok', five_hour => { utilization => 99 } },
                         go     => { status => 'ok', monthly => { used => 1, limit => 60 } },
                         zen    => { status => 'absent' } };
     my ($info_flip) = build_info($spend_flip);
