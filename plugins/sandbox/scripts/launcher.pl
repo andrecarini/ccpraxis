@@ -266,7 +266,29 @@ sub posixify_path {
     my ($drive, $rest) = ($1, $2);
     $rest =~ s{\\}{/}g;
     my $posix = '/' . lc($drive) . '/' . $rest;
-    return -e $posix ? $posix : $p;
+
+    # GATED ON THE MOUNT, NOT ON THE FILE.
+    #
+    # The first version guarded with `-e $posix`, meaning "only translate if the
+    # result exists". That looked conservative and is the wrong test: it makes
+    # the translation depend on a stat of one specific path, so ANY reason that
+    # stat fails -- a permissions quirk, a race, an encoding difference in a
+    # path carrying non-ASCII (this machine's paths contain `Andre`) -- silently
+    # returns the drive-letter form, which is precisely the broken value the
+    # function exists to replace. A guard whose failure mode is "reinstate the
+    # bug" is worse than no guard.
+    #
+    # What actually needs deciding is whether THIS perl understands POSIX mount
+    # paths at all. That is a property of the interpreter, answered by one
+    # directory test on the mount root, and it holds regardless of what the rest
+    # of the path looks like. On this host $^O is 'cygwin' and `-d "/c"` is
+    # true; on a native Windows perl it is false and the drive-letter form is
+    # correctly left alone.
+    return $posix if -d ('/' . lc($drive));
+
+    # No POSIX mount for that drive: keep the original, which is the right form
+    # for an interpreter that has no such notion.
+    return $p;
 }
 
 # =====================================================================
@@ -6383,6 +6405,18 @@ sub _gather_resources {
 # _resources_sampler_main via the global $RESOURCES_SAMPLER_PID, not here.
 sub _resources_sampler_start {
     my ($pidfile, $container) = @_;
+    # PRE-FLIGHT: the script we are about to exec must be openable BY THIS
+    # INTERPRETER. Checked here, before forking, because the alternative is what
+    # actually happened: the child died at exec with "Can't open perl script",
+    # the parent saw only a dead pid, and the panel could say the sampler
+    # exited but not why -- for every launch, in every project, until the
+    # child's STDERR stopped going to /dev/null. A stat is cheaper than a fork
+    # and answers the same question sooner. almanac 20260824-203404-77e1.
+    unless (-e $SELF_PL) {
+        my $why = "launcher path is not openable by this perl: $SELF_PL";
+        log_ev('resources_sampler_start_failed', { reason => $why });
+        return (undef, Resources::sampler_start_outcome(undef, $why, time));
+    }
     my $owner = $$;   # captured BEFORE forking -- in the CHILD, $$ is the child's OWN pid
     my $pid = fork();
     if (!defined $pid) {
@@ -6738,6 +6772,11 @@ sub _spend_script_path {
 # operator actually reported ("sampling - no reading yet" forever, for a
 # sampler that had never started).
 sub _spend_sampler_start {
+    unless (-e $SELF_PL) {   # see _resources_sampler_start's pre-flight note
+        my $why = "launcher path is not openable by this perl: $SELF_PL";
+        log_ev('spend_sampler_start_failed', { reason => $why });
+        return (undef, Resources::sampler_start_outcome(undef, $why, time));
+    }
     my $owner = $$;   # captured BEFORE forking
     my $pid = fork();
     if (!defined $pid) {

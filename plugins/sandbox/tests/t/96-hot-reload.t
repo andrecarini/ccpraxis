@@ -282,9 +282,31 @@ ok($OK, 'HotReload.pm and tui/DashboardScreen.pm load') or BAIL_OUT("require fai
                'AC11: ...and the BACKSLASH form too, which is what the PowerShell shim passes');
         }
 
-        is(posixify_path('C:/definitely/not/here/xyzzy.pl'), 'C:/definitely/not/here/xyzzy.pl',
-           'AC11: a drive-letter path that does NOT resolve is returned untouched -- the '
-         . 'translation can never make a working path worse');
+        # GATED ON THE MOUNT, NOT ON THE FILE -- and this assertion was inverted
+        # once, which is worth recording because the first version looked like
+        # the safer contract.
+        #
+        # v1 guarded with `-e $posix`: translate only if the result exists. That
+        # makes the translation depend on stat'ing one specific path, so ANY
+        # reason that stat fails silently returns the drive-letter form -- the
+        # exact broken value the function exists to replace. A guard whose
+        # failure mode is "reinstate the bug" is worse than no guard.
+        #
+        # What needs deciding is whether this INTERPRETER understands POSIX
+        # mount paths, which one directory test on the mount root answers for
+        # every path at once.
+        SKIP: {
+            skip 'no POSIX mount for drive C on this host', 1 unless -d '/c';
+            is(posixify_path('C:/definitely/not/here/xyzzy.pl'), '/c/definitely/not/here/xyzzy.pl',
+               'AC11: a drive-letter path is translated on the strength of the MOUNT existing, '
+             . 'not the file -- a missing file must not silently reinstate the unusable form');
+        }
+        is(posixify_path('ZZ:/not/a/drive.pl'), 'ZZ:/not/a/drive.pl',
+           'AC11: something that is not a drive-letter path is untouched');
+        my $unmounted = 'Z:/no/such/mount/x.pl';
+        is(posixify_path($unmounted), (-d '/z' ? '/z/no/such/mount/x.pl' : $unmounted),
+           'AC11: a drive with no POSIX mount is left in drive-letter form -- correct for an '
+         . 'interpreter that has no such notion');
         is(posixify_path('relative/path.pl'), 'relative/path.pl',
            'AC11: a relative path is untouched');
         is(posixify_path(undef), undef, 'AC11: undef in, undef out -- total, never dies');
