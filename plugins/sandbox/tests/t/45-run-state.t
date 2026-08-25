@@ -1196,15 +1196,6 @@ ok(length($launcher_src) > 0, 'launcher.pl is readable on disk') or BAIL_OUT("ca
 # 13. Dashboard rendering -- AC-16..AC-23, AC-26 (B32-B39).
 # ===========================================================================
 
-# run_lines_of($runs) -> Dashboard::_run_lines($runs) as a list; a single
-# sentinel element on death (never lets a missing sub silently look like ()).
-sub run_lines_of {
-    my ($runs) = @_;
-    my @lines = eval { Dashboard::_run_lines($runs) };
-    return ({ __CALL_FAILED => ($@ || 'unknown') }) if $@;
-    return @lines;
-}
-
 # as_arrayref($v) -> $v if it's an ARRAY ref, else [] (so a call-failed
 # sentinel -- a single HASH element -- never blows up a `@{...}` deref).
 sub as_arrayref { my ($v) = @_; return (ref($v) eq 'ARRAY') ? $v : []; }
@@ -1232,181 +1223,6 @@ my %BASE_STATE = (
     beat_age => 12, uptime => 3660, oauth_remaining => 11520,
     busy_age => 30, stay_awake => 1, needs_you => 2,
 );
-# _label45($label) -> the ONE shared label-gutter rendering of $label (spec
-# S2.4.1: sprintf('%-*s : ', LABEL_GUTTER(), label)), so every expected
-# label string below is DERIVED, never hand-padded.
-sub _label45 { return sprintf('%-*s : ', tui::DashboardScreen::LABEL_GUTTER(), $_[0]); }
-
-# ===========================================================================
-# RE-POINTED (package 06-dashboard-screen, spec S2.4.3, driver report item
-# 4). heartbeat/uptime MOVED to the front of Run (the deleted Sandbox
-# panel's rows -- see t/41-panel-semantics.t AC1), so busy-lease/
-# keep-awake/escalations shift from Run indices 0/1/2 to 2/3/4. This also
-# means the Run panel's TOTAL line count is no longer 3 (or 4, or 7) in any
-# of the three ACs below -- every fixture in this section also carries an
-# unconditional oauth row (none of them sets $state->{tokens}), on top of
-# the two migrated rows. Re-pointing those totals to new numbers would just
-# re-encode the SAME whole-shape pin Decision 15 / t/00-oracle-hygiene.t
-# already forbids elsewhere in this package. What survives, PRESERVED not
-# weakened: each affected row, individually identified by content and
-# position -- the property "exactly N lines" was actually standing in for.
-# @PINNED_RUN_LABELS itself is also re-derived via _label45()/LABEL_GUTTER()
-# rather than hand-padded: the OLD hand-typed literals ('busy-lease : ', 1
-# space before the colon) assumed the pre-package-06 Run panel's own
-# LOCAL gutter (sized to fit only busy-lease/keep-awake/escalations); the
-# NEW shared LABEL_GUTTER()==11 is wider (sized across every panel), so
-# the correct padding is now 2-3 spaces before the colon depending on the
-# label -- a fact this file must derive, never re-type.
-# ===========================================================================
-my @PINNED_RUN_LABELS = ( _label45('busy-lease'), _label45('keep-awake'), _label45('needs you') );
-
-# --- AC-16 (B32): no runs key / runs=>[] / runs=>'x' -> the SAME Run ------
-# --- panel, byte-identical, unaffected by the new code path. --------------
-{
-    my @variants = ( [ 'no runs key', {} ], [ 'runs => []', { runs => [] } ], [ "runs => 'x'", { runs => 'x' } ] );
-    my @all_lines03;
-    for my $v (@variants) {
-        my ($label, $extra) = @$v;
-        my %s = (%BASE_STATE, %$extra);
-        my @panels = eval { Dashboard::_fixed_panels(\%s, 80) };
-        my ($run) = grep { ref($_) eq 'HASH' && ($_->{title} // '') eq 'Run' } @panels;
-        ok($run, "AC-16: a Run panel is present ($label)");
-        if ($run) {
-            ok(defined($run->{lines}[4]),
-                "AC-16/B32: Run has a row at the escalations position (index 4) ($label) -- re-pointed off the old exactly-3-lines count, t/41:137 non-regression");
-            for my $i (0 .. 2) {
-                is($run->{lines}[$i + 2][0]{text}, $PINNED_RUN_LABELS[$i],
-                    "AC-16: Run line " . ($i + 2) . " (was line $i pre-package-06) label text unchanged ($label)");
-                is($run->{lines}[$i + 2][0]{role}, 'label',
-                    "AC-16: Run line " . ($i + 2) . " label role is 'label' ($label)");
-            }
-            push @all_lines03, $run->{lines};
-        } else {
-            push @all_lines03, undef;
-        }
-    }
-    if (defined $all_lines03[0] && defined $all_lines03[1] && defined $all_lines03[2]) {
-        is_deeply($all_lines03[1], $all_lines03[0], 'AC-16: runs=>[] produces the IDENTICAL Run-panel line structure as no runs key at all');
-        is_deeply($all_lines03[2], $all_lines03[0], "AC-16: runs=>'x' (non-arrayref) produces the IDENTICAL Run-panel line structure as no runs key at all");
-    } else {
-        fail('AC-16: runs=>[] identical to no-runs-key (Run panel missing in at least one variant)');
-        fail('AC-16: runs=>\'x\' identical to no-runs-key (Run panel missing in at least one variant)');
-    }
-}
-
-# --- AC-17 (B33): one running summary -> a 4th line, exact span list. ----
-{
-    my $summary = mk_summary(blueprint => 'demo-bp', state => 'running', packages_total => 8, packages_done => 3,
-        current_package => 'pkgX', running_coordinators => 2, decisions_waiting => 0);
-    my %s = (%BASE_STATE, runs => [ $summary ]);
-    my @panels = eval { Dashboard::_fixed_panels(\%s, 80) };
-    my ($run) = grep { ref($_) eq 'HASH' && ($_->{title} // '') eq 'Run' } @panels;
-    ok($run, 'AC-17: Run panel present with one running summary');
-    if ($run) {
-        # RE-POINTED (driver report item 4): same index shift as AC-16
-        # above (fixed rows now at 2/3/4, not 0/1/2 -- no backpack row in
-        # this fixture); the summary row -- appended immediately after
-        # them -- moves from index 3 to index 5. "Exactly 4 lines" is
-        # re-pointed to a per-row presence+content check instead of a new
-        # total, for the same Decision-15 reason as AC-16.
-        ok(defined($run->{lines}[4]),
-            'AC-17/B33: Run has a row at the escalations position (index 4) -- re-pointed off the old exactly-4-lines count');
-        for my $i (0 .. 2) {
-            is($run->{lines}[$i + 2][0]{text}, $PINNED_RUN_LABELS[$i], "AC-17: line " . ($i + 2) . " (was line $i pre-package-06) unchanged");
-        }
-        my $expected_line3 = [
-            { text => 'demo-bp : ', role => 'accent' },
-            { text => 'running',    role => 'good' },
-            { text => '  3/8 pkg',  role => 'value' },
-            { text => '  cur pkgX', role => 'strong' },
-            { text => '  2 coord',  role => 'accent' },
-        ];
-        is_deeply($run->{lines}[5], $expected_line3,
-            'AC-17/B33: the summary line (now at index 5, immediately after escalations) is EXACTLY the S2.10 span list for this summary (decisions_waiting==0 -> no trailing "waiting" span)');
-    } else {
-        fail('AC-17/B33: Run has a row at the escalations position (no Run panel)');
-        fail('AC-17/B33: summary line exact span list (no Run panel)');
-    }
-}
-
-# --- AC-18 (B34): the state -> role table. --------------------------------
-{
-    my @cases = ( [ 'running', 'good' ], [ 'paused', 'warn' ], [ 'parked', 'warn' ], [ 'idle', 'muted' ], [ 'totally-unknown', 'muted' ] );
-    for my $c (@cases) {
-        my ($state, $erole) = @$c;
-        my @lines = run_lines_of([ mk_summary(blueprint => 'b', state => $state) ]);
-        my $line = $lines[0];
-        ok(ref($line) eq 'ARRAY', "AC-18: _run_lines([{state=>'$state'}]) yields one ARRAY line");
-        my $state_span = (ref($line) eq 'ARRAY') ? $line->[1] : undef;
-        is(ref($state_span) eq 'HASH' ? $state_span->{text} : undef, $state, "AC-18: state=$state -- span 2 text is the state verbatim");
-        is(ref($state_span) eq 'HASH' ? $state_span->{role} : undef, $erole, "AC-18: state=$state -- span 2 role is '$erole'");
-    }
-}
-
-# --- AC-19 (B35): decisions_waiting trailing span role (warn vs paused/bad). ---
-{
-    my @lines_running = run_lines_of([ mk_summary(blueprint => 'b', state => 'running', decisions_waiting => 5) ]);
-    my ($trailing_r) = grep { ref($_) eq 'HASH' && defined($_->{text}) && $_->{text} =~ /waiting$/ } @{ as_arrayref($lines_running[0]) };
-    is($trailing_r ? $trailing_r->{text} : undef, '  5 waiting', 'AC-19: decisions_waiting=5, state running -- trailing span text "  5 waiting"');
-    is($trailing_r ? $trailing_r->{role} : undef, 'warn', 'AC-19: ... role "warn" (state is not paused)');
-
-    my @lines_paused = run_lines_of([ mk_summary(blueprint => 'b', state => 'paused', decisions_waiting => 5) ]);
-    my ($trailing_p) = grep { ref($_) eq 'HASH' && defined($_->{text}) && $_->{text} =~ /waiting$/ } @{ as_arrayref($lines_paused[0]) };
-    is($trailing_p ? $trailing_p->{text} : undef, '  5 waiting', 'AC-19: decisions_waiting=5, state paused -- trailing span text unchanged');
-    is($trailing_p ? $trailing_p->{role} : undef, 'bad', 'AC-19: ... role "bad" (state IS paused -- fully stalled on the human)');
-}
-
-# --- AC-20 (B36): optional spans OMITTED, not blanked. --------------------
-{
-    my @lines_nocur = run_lines_of([ mk_summary(blueprint => 'b', state => 'running', current_package => undef, running_coordinators => 3) ]);
-    my @cur_spans = grep { ref($_) eq 'HASH' && defined($_->{text}) && $_->{text} =~ /^\s*cur\s/ } @{ as_arrayref($lines_nocur[0]) };
-    is(scalar(@cur_spans), 0, 'AC-20: current_package undef -> no span whose text starts with "  cur "');
-
-    my @lines_nocoord = run_lines_of([ mk_summary(blueprint => 'b', state => 'running', current_package => 'p1', running_coordinators => 0) ]);
-    my @coord_spans = grep { ref($_) eq 'HASH' && defined($_->{text}) && $_->{text} =~ /coord$/ } @{ as_arrayref($lines_nocoord[0]) };
-    is(scalar(@coord_spans), 0, 'AC-20: running_coordinators == 0 -> no span whose text ends in " coord"');
-}
-
-# --- AC-21 (B37): 5 summaries -> 3 shown + "+2 more blueprint(s)". -------
-{
-    my @five = map { mk_summary(blueprint => "bp$_", state => 'idle') } (1 .. 5);
-    my @lines = run_lines_of(\@five);
-    is(scalar(@lines), 4, 'AC-21/B37: _run_lines(5 summaries) -> 3 summary lines + 1 overflow line = 4');
-    is_deeply($lines[3], [ { text => '  +2 more blueprint(s)', role => 'muted' } ],
-        'AC-21/B37: the trailing overflow line is EXACTLY [{text=>"  +2 more blueprint(s)", role=>"muted"}]');
-
-    my %s = (%BASE_STATE, runs => \@five);
-    my @panels = eval { Dashboard::_fixed_panels(\%s, 80) };
-    my ($run) = grep { ref($_) eq 'HASH' && ($_->{title} // '') eq 'Run' } @panels;
-    ok($run, 'AC-21/B37: a Run panel is present with 5 run summaries');
-    if ($run) {
-        # RE-POINTED (driver report item 4): same index shift as AC-16/
-        # AC-17 above (fixed rows at 2/3/4, no backpack row in this
-        # fixture); the 4 lines run_lines_of(\@five) produced above (still
-        # green, unchanged) are appended starting at index 5, through
-        # index 8. "3 (fixed) + 3 (summaries) + 1 (overflow) = 7 lines" is
-        # re-pointed to a per-row identity check (the SAME 4 lines,
-        # byte-identical, at the expected indices) instead of a new total,
-        # for the same Decision-15 reason as AC-16/AC-17.
-        is_deeply([ @{ $run->{lines} }[5 .. 8] ], \@lines,
-            'AC-21/B37: Run indices 5-8 (immediately after escalations) are BYTE-IDENTICAL, in order, to run_lines_of(5 summaries)\'s own 4 lines (3 summaries + 1 overflow), appended verbatim');
-    } else {
-        fail('AC-21/B37: Run indices 5-8 match run_lines_of(5 summaries) (no Run panel)');
-    }
-}
-
-# --- AC-22 (B38): totality of Dashboard::_run_lines. ----------------------
-{
-    is_deeply([ run_lines_of(undef) ], [], 'AC-22/B38: _run_lines(undef) -> empty list, never dies');
-    is_deeply([ run_lines_of({}) ], [], 'AC-22/B38: _run_lines({}) (non-arrayref) -> empty list, never dies');
-    is_deeply([ run_lines_of([ undef ]) ], [], 'AC-22/B38: _run_lines([undef]) -> empty list (non-hashref element skipped)');
-    is_deeply([ run_lines_of([ 'x' ]) ], [], "AC-22/B38: _run_lines(['x']) -> empty list (non-hashref element skipped)");
-
-    my @one = run_lines_of([ {} ]);
-    is(scalar(@one), 1, 'AC-22/B38: _run_lines([{}]) -> exactly one line');
-    my $first_span = (ref($one[0]) eq 'ARRAY') ? $one[0][0] : undef;
-    is(ref($first_span) eq 'HASH' ? $first_span->{text} : undef, '? : ', 'AC-22/B38: _run_lines([{}]) -- first span text is exactly "? : " (blueprint undef fallback)');
-}
 
 # --- AC-23: Dashboard.pm never use/require's RunState; _run_lines does ---
 # --- no file I/O. -----------------------------------------------------------
@@ -1416,29 +1232,11 @@ my @PINNED_RUN_LABELS = ( _label45('busy-lease'), _label45('keep-awake'), _label
     unlike($dash_src, qr/\buse\s+RunState\b/,     'AC-23: Dashboard.pm source contains no "use RunState"');
     unlike($dash_src, qr/\brequire\s+RunState\b/, 'AC-23: Dashboard.pm source contains no "require RunState"');
 
-    my $body = extract_block($dash_src, 'sub _run_lines');
-    if (defined $body) {
-        unlike($body, qr/\bopen\s*\(/,    'AC-23: _run_lines body contains no open(...) call');
-        unlike($body, qr/\bopendir\b/,    'AC-23: _run_lines body contains no opendir');
-    } else {
-        fail('AC-23: _run_lines body contains no open(...) (sub not found)');
-        fail('AC-23: _run_lines body contains no opendir (sub not found)');
-    }
-}
-
-# --- AC-26 (B39): Run panel index/title invariant. ------------------------
-# RE-POINTED (package 06-dashboard-screen, spec S2.4.3): the Sandbox panel
-# -- which used to occupy index 0, pushing Run to index 1 -- is deleted, so
-# Run is now the FIRST fixed panel. The claim ("Run sits at a STABLE index,
-# whether or not runs are populated -- no new panel is ever inserted before
-# it") survives unchanged; only the pinned index moves from 1 to 0.
-{
-    my @p_without = eval { Dashboard::build_panels(\%BASE_STATE, 80) };
-    is($p_without[0] ? $p_without[0]{title} : undef, 'Run', 'AC-26/B39: with no runs populated, build_panels()[0]->{title} eq "Run"');
-
-    my %with_runs = (%BASE_STATE, runs => [ mk_summary(blueprint => 'b', state => 'running') ]);
-    my @p_with = eval { Dashboard::build_panels(\%with_runs, 80) };
-    is($p_with[0] ? $p_with[0]{title} : undef, 'Run', 'AC-26/B39: with runs populated, build_panels()[0]->{title} is STILL "Run" (no new panel inserted before it)');
+    # The _run_lines body scan (no open(), no opendir) was removed 2026-08-25
+    # along with _run_lines itself -- unreachable legacy, deleted. The two
+    # assertions above are KEPT and are the ones that carry AC-23's weight:
+    # Dashboard.pm must not pull RunState in at all, which is a live
+    # architectural constraint on live code.
 }
 
 done_testing();

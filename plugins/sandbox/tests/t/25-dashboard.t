@@ -16,6 +16,20 @@ use strict;
 use warnings;
 use FindBin qw($Bin);
 use lib "$Bin/../../scripts";
+
+# RETARGETED to the LIVE panel builder. Dashboard::_fixed_panels was deleted --
+# unreachable since compose_frame began delegating to tui::DashboardScreen, and
+# drifted to a panel set (Token/Spend) that no longer renders. The assertions
+# below are about Run-panel CONTENT, which the live builder still produces, so
+# they are re-pointed rather than dropped.
+#
+# A shim rather than an inline rewrite at each call site: panels() returns an
+# ARRAYREF where _fixed_panels returned a LIST, and $cols was optional there
+# (defaulting to 80). One place to state both facts beats twenty.
+sub live_panels {
+    my ($state, $cols) = @_;
+    return @{ tui::DashboardScreen::panels($state, defined $cols ? $cols : 80) };
+}
 use Test::More;
 use File::Temp qw(tempdir);
 use File::Path qw(make_path);
@@ -650,7 +664,7 @@ my %st = (
 # AC8 for the exact per-span role assertions this file no longer duplicates).
 {
     # Run panel: fresh lease + stay_awake -> active / holding; escalations count.
-    my @p = Dashboard::build_panels({ %st, busy_age => 30, stay_awake => 1, needs_you => 2 });
+    my @p = live_panels({ %st, busy_age => 30, stay_awake => 1, needs_you => 2 });
     my ($run) = grep { $_->{title} eq 'Run' } @p;
     ok($run, 'panels: a Run panel is present');
     my $rtext = join "\n", map { Dashboard::spans_text($_) } @{ $run->{lines} };
@@ -660,21 +674,21 @@ my %st = (
 }
 {
     # Stale lease (stay_awake false) -> idle / released; zero decisions -> none.
-    my @p = Dashboard::build_panels({ %st, busy_age => 9999, stay_awake => 0, needs_you => 0 });
+    my @p = live_panels({ %st, busy_age => 9999, stay_awake => 0, needs_you => 0 });
     my $rtext = join "\n", map { Dashboard::spans_text($_) } @{ (grep { $_->{title} eq 'Run' } @p)[0]->{lines} };
     like($rtext, qr/busy-lease.*idle/,     'run: stale lease -> idle');
     like($rtext, qr/keep-awake.*released/, 'run: not awake -> released (PC may sleep)');
-    like($rtext, qr/needs you.*none/,      'run: zero decisions -> none');
+    unlike($rtext, qr/needs you/,     'run: zero decisions -> the escalations row is OMITTED, not rendered as "none"');
 }
 {
     # No run at all (no busy_age) -> busy-lease none.
-    my @p = Dashboard::build_panels({ %st });
+    my @p = live_panels({ %st });
     my $rtext = join "\n", map { Dashboard::spans_text($_) } @{ (grep { $_->{title} eq 'Run' } @p)[0]->{lines} };
     like($rtext, qr/busy-lease.*none/, 'run: absent lease -> none (no active run)');
 }
 {
     # Backpack panel present only when a backpack structure was gathered.
-    my @no = grep { $_->{title} eq 'Backpack' } Dashboard::build_panels({ %st });
+    my @no = grep { $_->{title} eq 'Backpack' } live_panels({ %st });
     ok(!@no, 'backpack: no panel without a gathered structure');
 
     # RE-POINTED (package 06-dashboard-screen, spec S2.4.3/S2.4.8, Decision
@@ -697,7 +711,7 @@ my %st = (
         { key => 'apt:chromium',        approved => 0 },
         { key => 'npm-global:prettier', approved => 1 },
     ] };
-    my @panels = Dashboard::build_panels({ %st, backpack => $bp });
+    my @panels = live_panels({ %st, backpack => $bp });
     my ($run) = grep { $_->{title} eq 'Run' } @panels;
     ok($run, 'backpack (re-pointed): a Run panel is present when a backpack structure is gathered');
 
@@ -1892,13 +1906,13 @@ sub drive_per_tick {
 
     # s06-panel-semantics: panel lines are now arrayrefs-of-spans -- extract
     # text via Dashboard::spans_text before joining/regexing.
-    my @panels_none = Dashboard::_fixed_panels(\%st);
+    my @panels_none = live_panels(\%st);
     my $panels_none = join("\n", map { Dashboard::spans_text($_) } map { @{ $_->{lines} } } @panels_none);
-    like($panels_none, qr{oauth\s*:\s*not logged in \(run /login\)},
+    like($panels_none, qr{oauth\s+not logged in \(run /login\)},
         'C1c: not-logged-in state renders the actionable oauth prompt');
-    my @panels_oauth = Dashboard::_fixed_panels(\%st_oauth);
+    my @panels_oauth = live_panels(\%st_oauth);
     my $panels_oauth = join("\n", map { Dashboard::spans_text($_) } map { @{ $_->{lines} } } @panels_oauth);
-    like($panels_oauth, qr{oauth\s*:\s*expires in 3h12m},
+    like($panels_oauth, qr{oauth\s+expires in 3h12m},
         'C1d: known expiry renders the countdown');
 }
 

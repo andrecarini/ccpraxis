@@ -108,148 +108,25 @@ my @COLS = (1, 20, 39, 40, 50, 79, 80, $BP - 1, $BP, $BP + 1, 120, 200);
 # (chosen as clearly-below samples, still < 90) and so do 101/120/200/1000
 # (clearly-above, still > 90).
 # ---------------------------------------------------------------------------
-is(Dashboard::_two_col_min_cols(), $BP,
-    'AC-1: _two_col_min_cols() == tui::Layout::BREAKPOINT_TWO_COL() (single-source-of-truth derivation, Decision 14)');
+# RE-POINTED to tui::Layout. Dashboard::_two_col_min_cols and
+# Dashboard::_two_col_mode were deleted: both were one-line delegating wrappers
+# (_two_col_min_cols returned tui::Layout::BREAKPOINT_TWO_COL(); _two_col_mode
+# returned arrangement() eq 'two-column'), unreachable once compose_frame began
+# delegating, and their only remaining callers were the legacy render path and
+# this file.
+#
+# AC-1's CLAIM is unchanged and is the one worth keeping: there is a single
+# source of truth for the breakpoint, the mode is 0 strictly below it and 1 at
+# or above it, and a junk width degrades to single-column rather than dying.
+# Asserted against the module that actually owns the decision.
+sub _two_col { return (tui::Layout::arrangement($_[0]) eq 'two-column') ? 1 : 0 }
 
 for my $c (undef, -5, 0, 1, 40, 79, 80, $BP - 1) {
     my $label = defined $c ? $c : 'undef';
-    is(Dashboard::_two_col_mode($c), 0, "AC-1: _two_col_mode($label) == 0");
+    is(_two_col($c), 0, "AC-1: arrangement($label) is single-column");
 }
 for my $c ($BP, 101, 120, 200, 1000) {
-    is(Dashboard::_two_col_mode($c), 1, "AC-1: _two_col_mode($c) == 1");
-}
-
-{
-    # "Never dies, never warns" over the full documented (all-numeric/undef)
-    # value table. NOTE: the spec's own reference implementation of
-    # _two_col_mode (S2.2) is a bare `$cols >= _two_col_min_cols()` numeric
-    # comparison with no special-casing for a NON-numeric string, which would
-    # itself trigger perl's "isn't numeric" warning under `use warnings` --
-    # this appears to conflict with S2.2's separate "a non-numeric $cols must
-    # not warn" sentence. We therefore only assert "never dies/warns" over the
-    # documented numeric/undef table (safe and unambiguous); see the final
-    # report for this untestable-as-written tension.
-    my $died  = 0;
-    my $warns = 0;
-    local $SIG{__WARN__} = sub { $warns++ };
-    for my $c (undef, -5, 0, 1, 40, 79, 80, $BP - 1, $BP, 101, 120, 200, 1000) {
-        eval { Dashboard::_two_col_mode($c) };
-        $died++ if $@;
-    }
-    is($died, 0, 'AC-1: _two_col_mode never dies across the full numeric/undef value table');
-    is($warns, 0, 'AC-1: _two_col_mode never warns across the full numeric/undef value table');
-}
-
-# ---------------------------------------------------------------------------
-# AC-2 -> DC-1: _col_widths: (100)->(50,50), (101)->(50,51), (200)->(100,100),
-# (201)->(100,101); and for every $c in 100..201, lw+rw==$c and rw-lw is 0/1.
-# UNRELATED to the breakpoint migration (AC-B4): _col_widths just splits a
-# GIVEN total column count in half once the caller has already decided to be
-# in two-column mode -- it has no opinion on what that decision threshold is.
-# 100/101/200/201 stay literal, no longer meaning "the breakpoint" (Decision
-# 14 moved that to 90).
-# ---------------------------------------------------------------------------
-{
-    my @cases = ([100, 50, 50], [101, 50, 51], [200, 100, 100], [201, 100, 101]);
-    for my $case (@cases) {
-        my ($cols, $elw, $erw) = @$case;
-        my ($lw, $rw) = Dashboard::_col_widths($cols);
-        is($lw, $elw, "AC-2: _col_widths($cols) left half == $elw");
-        is($rw, $erw, "AC-2: _col_widths($cols) right half == $erw");
-    }
-    for my $c (100 .. 201) {
-        my ($lw, $rw) = Dashboard::_col_widths($c);
-        is($lw + $rw, $c, "AC-2: _col_widths($c): lw+rw == $c");
-        ok((($rw - $lw) == 0 || ($rw - $lw) == 1),
-            "AC-2: _col_widths($c): rw-lw is 0 or 1 (odd width -> right absorbs the extra column)");
-        ok($lw >= 1, "AC-2: _col_widths($c): lw >= 1");
-        ok($rw >= $lw, "AC-2: _col_widths($c): rw >= lw");
-    }
-}
-
-# ---------------------------------------------------------------------------
-# AC-3 -> DC-1: _join_cells on two make_cell()s of widths 30 and 50: text is
-# the concatenation; span count is the sum; role is the LEFT cell's role;
-# display_width/spans_width == 80; text eq spans_text(spans); no ESC.
-# Repeated with a 2-column glyph in the left half to prove the join is
-# display-width correct, not byte-length correct.
-# ---------------------------------------------------------------------------
-{
-    my $l = Dashboard::make_cell('left side content', 'label', 30);
-    my $r = Dashboard::make_cell('right side content here', 'value', 50);
-    my $j = Dashboard::_join_cells($l, $r);
-    is($j->{text}, $l->{text} . $r->{text}, 'AC-3: joined text is the plain concatenation');
-    is(scalar(@{ $j->{spans} }),
-        scalar(@{ Dashboard::_cell_spans($l) }) + scalar(@{ Dashboard::_cell_spans($r) }),
-        'AC-3: joined span count == sum of the two span counts');
-    is($j->{role}, $l->{role}, "AC-3: joined role eq the LEFT cell's role ('label')");
-    isnt($j->{role}, $r->{role}, "AC-3: joined role is NOT the right cell's role ('value')");
-    is(Dashboard::display_width($j->{text}), 80, 'AC-3: display_width(joined text) == 80');
-    is(Dashboard::spans_width($j->{spans}), 80, 'AC-3: spans_width(joined spans) == 80');
-    is($j->{text}, Dashboard::spans_text($j->{spans}), 'AC-3: joined text eq spans_text(joined spans)');
-    unlike($j->{text}, qr/\e/, 'AC-3: joined text contains no ESC');
-}
-{
-    # 2-column glyph -- FIXTURE RE-POINTED (package 06 in-scope oracle
-    # correction). The old \x{1F7E2} emoji circle is no longer on ANY render
-    # path (spec S2.2 Obligation 3: the four emoji circles leave
-    # Dashboard::glyph_table() entirely and now measure width 1 via
-    # tui::Layout, so this fixture's premise -- "a 2-column glyph reaches a
-    # cell" -- silently went false without this change). Claim preserved
-    # verbatim: "the join is measured in display columns, not bytes."
-    # Re-derived via Theme::glyph('sep.bar') (spec S2.2/Obligation 5b: U+FF5C
-    # is the package 06 replacement 2-column glyph, declared width 2 by
-    # Theme, never hand-typed as a codepoint here) rather than any hardcoded
-    # emoji literal -- per spec AC-G6's migration rule.
-    require Theme;
-    my $glyph_char = Theme::glyph('sep.bar');
-    ok(defined $glyph_char, 'AC-3 (glyph): Theme declares a sep.bar glyph to derive the fixture from (AC-G6)');
-    is(Theme::glyph_width('sep.bar'), 2, 'AC-3 (glyph): Theme declares sep.bar at width 2 (the 2-column case this AC needs)');
-    my $glyph_line = [ { text => $glyph_char, role => 'accent' }, { text => 'ok', role => 'body' } ];
-    my $l = Dashboard::make_cell($glyph_line, 'label', 30);
-    my $r = Dashboard::make_cell('right side content here', 'value', 50);
-    is(Dashboard::display_width($l->{text}), 30, 'AC-3 (glyph): left half is exactly 30 display columns');
-    is(Dashboard::display_width($r->{text}), 50, 'AC-3 (glyph): right half is exactly 50 display columns');
-    my $j = Dashboard::_join_cells($l, $r);
-    is(Dashboard::display_width($j->{text}), 80, 'AC-3 (glyph): joined display_width == 80');
-    is(Dashboard::spans_width($j->{spans}), 80, 'AC-3 (glyph): joined spans_width == 80');
-    isnt(length($j->{text}), 80,
-        'AC-3 (glyph): joined BYTE length() != 80 (the join is measured in display columns, not bytes -- a multi-byte UTF-8 glyph makes byte length and display width genuinely differ)');
-}
-
-# ---------------------------------------------------------------------------
-# AC-4 -> DC-1: _panel_rows({title=>'T', lines=>['a','b']}, 20, 99) returns 4
-# cells with the pinned shape; maxh of 3/2/1 drops the blank first, then body
-# lines; maxh of 0/-1 returns (). UNRELATED to the breakpoint migration: this
-# 99 is a generously-large MAX-HEIGHT (a ROW count), not a column width, so
-# it never interacts with the two-column decision at all. Stays literal.
-# ---------------------------------------------------------------------------
-{
-    my $panel = { title => 'T', lines => [ 'a', 'b' ] };
-    my @cells = Dashboard::_panel_rows($panel, 20, 99);
-    is(scalar(@cells), 4, 'AC-4: _panel_rows returns 4 cells (title + 2 body lines + blank)');
-    is($cells[0]{role}, 'panel-title', 'AC-4: cell[0] role is panel-title');
-    # _panel_rows is the FROZEN legacy family (see Dashboard::_panel_title_line):
-    # unreachable from compose_frame and deliberately still ASCII, lead included.
-    # That is why this stays '-- ' while every live-path assertion in this file
-    # now derives its lead from Theme.
-    like($cells[0]{text}, qr/^-- T -+$/, 'AC-4: cell[0] text is the dash-filled panel title (frozen legacy path)');
-    is($cells[1]{spans}[0]{text}, '  ', 'AC-4: cell[1] first span is the 2-space body indent');
-    is($cells[1]{role}, 'body', 'AC-4: cell[1] role is body');
-    is($cells[3]{role}, 'blank', 'AC-4: cell[3] role is blank');
-    is(scalar(grep { Dashboard::display_width($_->{text}) != 20 } @cells), 0,
-        'AC-4: every cell is exactly 20 display columns');
-
-    my %expect_count = (3 => 3, 2 => 2, 1 => 1);
-    for my $maxh (sort keys %expect_count) {
-        my @c = Dashboard::_panel_rows($panel, 20, $maxh);
-        is(scalar(@c), $expect_count{$maxh},
-            "AC-4: _panel_rows(..., maxh=$maxh) returns $expect_count{$maxh} cells (blank dropped first, then body lines)");
-    }
-    for my $maxh (0, -1) {
-        my @c = Dashboard::_panel_rows($panel, 20, $maxh);
-        is(scalar(@c), 0, "AC-4: _panel_rows(..., maxh=$maxh) returns ()");
-    }
+    is(_two_col($c), 1, "AC-1: arrangement($c) is two-column");
 }
 
 # ---------------------------------------------------------------------------
@@ -264,56 +141,6 @@ for my $c ($BP, 101, 120, 200, 1000) {
 # ---------------------------------------------------------------------------
 my $ac56_L = { title => 'L', lines => [ 'l1', 'l2', 'l3', 'l4', 'l5' ] };
 my $ac56_R = { title => 'R', lines => [ 'r1' ] };
-
-{
-    # AC-5: generous $maxh -> exactly max(7,3)==7 cells, each exactly 100
-    # columns; for ASCII content, each half matches the standalone
-    # _panel_rows output (or 50 spaces once R has run out).
-    my @rows = Dashboard::_two_col_rows($ac56_L, $ac56_R, 100, 99);
-    is(scalar(@rows), 7, 'AC-5: max(1+5+1, 1+1+1) == 7 cells returned');
-    is(scalar(grep { Dashboard::display_width($_->{text}) != 100 } @rows), 0,
-        'AC-5: every cell is exactly 100 display columns');
-    is(scalar(grep { Dashboard::spans_width($_->{spans}) != 100 } @rows), 0,
-        'AC-5: every cell has spans_width == 100');
-
-    my @Lrows = Dashboard::_panel_rows($ac56_L, 50, 99);
-    my @Rrows = Dashboard::_panel_rows($ac56_R, 50, 99);
-    for my $i (0 .. 6) {
-        is(substr($rows[$i]{text}, 0, 50), $Lrows[$i]{text},
-            "AC-5: row $i, columns [0,50) match the standalone _panel_rows(L,50,99) cell text");
-        my $expect_right = $i < scalar(@Rrows) ? $Rrows[$i]{text} : (' ' x 50);
-        is(substr($rows[$i]{text}, 50), $expect_right,
-            "AC-5: row $i, columns [50,100) match the standalone R cell text (or 50 blank spaces)");
-    }
-}
-
-{
-    # AC-6: truncation -- maxh=5 -> exactly 5 cells, both halves cut at the
-    # SAME row (row i == _join_cells(L_rows[i], R_rows[i])); maxh=1 -> 1 cell
-    # with BOTH panel titles; maxh=0/-3 -> 0 cells.
-    my @rows5 = Dashboard::_two_col_rows($ac56_L, $ac56_R, 100, 5);
-    is(scalar(@rows5), 5, 'AC-6: maxh=5 -> exactly 5 cells');
-    my @Lrows5 = Dashboard::_panel_rows($ac56_L, 50, 5);
-    my @Rrows5 = Dashboard::_panel_rows($ac56_R, 50, 5);
-    for my $i (0 .. 4) {
-        my $lc = $Lrows5[$i] // Dashboard::make_cell('', 'blank', 50);
-        my $rc = $Rrows5[$i] // Dashboard::make_cell('', 'blank', 50);
-        my $expect = Dashboard::_join_cells($lc, $rc);
-        is_deeply($rows5[$i], $expect,
-            "AC-6: maxh=5, row $i equals _join_cells(L_rows[$i], R_rows[$i]) (both halves cut at the same row)");
-    }
-
-    my @rows1 = Dashboard::_two_col_rows($ac56_L, $ac56_R, 100, 1);
-    is(scalar(@rows1), 1, 'AC-6: maxh=1 -> exactly 1 cell');
-    # _two_col_rows is the frozen legacy family too -- still ASCII, lead included.
-    like($rows1[0]{text}, qr/-- L /, 'AC-6: maxh=1 -- the single row contains "-- L " (frozen legacy path)');
-    like($rows1[0]{text}, qr/-- R /, 'AC-6: maxh=1 -- the single row ALSO contains "-- R " (frozen legacy path)');
-
-    for my $maxh (0, -3) {
-        my @r = Dashboard::_two_col_rows($ac56_L, $ac56_R, 100, $maxh);
-        is(scalar(@r), 0, "AC-6: maxh=$maxh -> 0 cells");
-    }
-}
 
 # ---------------------------------------------------------------------------
 # AC-7 -> DC-1 (narrow fallback, asserted) -- BREAKPOINT MIGRATED (see
@@ -465,40 +292,6 @@ my $ac56_R = { title => 'R', lines => [ 'r1' ] };
     my $bad_violations = $min_cols_violations->($fake_bad_rows);
     is(scalar(@$bad_violations), 1,
         'AC-8 counter-fixture: a hand-built band one column narrower than its panel\'s min_cols IS detected as a violation (proves the min_cols check can fail)');
-}
-
-# ---------------------------------------------------------------------------
-# AC-17 -> DC-1: pairing guard. (_fixed_panels)[0]/[1] are the fixed panels
-# in the SPECIFIED ORDER at the head of the list (D7); _two_col_rows/
-# _body_rows must not die on a degenerate (empty-lines) panel pair.
-# UNRELATED to the breakpoint migration: the 100 below is an arbitrary total
-# column width for the join arithmetic (see the AC-5/AC-6 note above), not
-# the breakpoint itself. Stays literal.
-#
-# RETARGETED 2026-08-08 (package 06-dashboard-screen, spec S2.4.3, same
-# ruling as AC-7 above): the Sandbox panel is deleted, so the claim's
-# subject moves -- Run is now first. Claim preserved: the fixed panels
-# appear in the specified order at the head of the list. Plain %st (no
-# tokens/resources/spend) yields only ONE always-present fixed panel, so
-# index [1] has nothing to name under that fixture; the AC-7 block above
-# already established the fixture pattern for pairing Run with a second
-# panel (`tokens => {}` makes the Token panel present per spec S2.4.3), so
-# it is reused here to keep the two-panel-order claim testable.
-# ---------------------------------------------------------------------------
-{
-    my @fp = Dashboard::_fixed_panels(\%st);
-    is($fp[0]{title}, 'Run', "AC-17: (_fixed_panels)[0]{title} eq 'Run' (Sandbox dissolved per spec 06 S2.4.3)");
-
-    my %st_pair17 = (%st, tokens => {});
-    my @fp_pair = Dashboard::_fixed_panels(\%st_pair17);
-    is($fp_pair[0]{title}, 'Run', "AC-17: with tokens present, (_fixed_panels)[0]{title} is still 'Run'");
-    is($fp_pair[1]{title}, 'Token', "AC-17: (_fixed_panels)[1]{title} eq 'Token' (the specified order's next panel once tokens are present)");
-
-    my $empty_panel = { title => 'Empty', lines => [] };
-    my @rows = eval { Dashboard::_two_col_rows($empty_panel, $empty_panel, 100, 10) };
-    is($@, '', 'AC-17: _two_col_rows with two empty-lines panels does not die');
-    is(scalar(grep { Dashboard::display_width($_->{text}) != 100 } @rows), 0,
-        'AC-17: _two_col_rows(empty-lines panels) -- every returned row is exactly 100 display columns');
 }
 
 # ===========================================================================

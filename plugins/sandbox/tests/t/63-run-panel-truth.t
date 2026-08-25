@@ -610,15 +610,28 @@ my $LIVE_DIR  = make_bp($LIVE_ROOT, 'coord-bp',
 # state values verbatim as muted, with NO Dashboard.pm change needed.
 # ===========================================================================
 {
+    # RE-POINTED to the live renderer. Dashboard::_run_lines was deleted along
+    # with the rest of the unreachable legacy builder family; the live path is
+    # tui::DashboardScreen, and its role vocabulary is Theme's ('text.muted'),
+    # not the legacy one ('muted'). The PROPERTY is untouched: an unrecognised
+    # run state is rendered VERBATIM and MUTED rather than being mapped to
+    # something wrong or dropped -- which is what lets a new state value appear
+    # without a renderer change.
+    #
+    # Found by SEARCH, not by position. The old assertion indexed span 2 of line
+    # 0; the live builder lays the same facts out differently, and an oracle
+    # that pins WHERE a fact sits breaks on every reflow while an oracle that
+    # pins WHAT it says does not.
     for my $state (qw(stale solo)) {
-        my @lines = eval { Dashboard::_run_lines([ mk_summary(blueprint => 'b', state => $state) ]) };
-        ok(!$@, "AC-22: Dashboard::_run_lines does not die rendering state=>'$state'");
-        my $line = $lines[0];
-        my $state_span = (ref($line) eq 'ARRAY') ? $line->[1] : undef;
-        is(ref($state_span) eq 'HASH' ? $state_span->{text} : undef, $state,
-            "AC-22: state=>'$state' -- span 2 text is the state verbatim (no Dashboard.pm change needed)");
-        is(ref($state_span) eq 'HASH' ? $state_span->{role} : undef, 'muted',
-            "AC-22: state=>'$state' -- span 2 role is 'muted' (Dashboard's existing unknown-state fallback)");
+        my $cells = eval { tui::DashboardScreen::_one_run_summary_cells(
+            mk_summary(blueprint => 'b', state => $state), 80) };
+        ok(!$@, "AC-22: the live run-summary renderer does not die rendering state=>'$state'")
+            or diag("  \$\@ = $@");
+        my @spans = map { @$_ } grep { ref($_) eq 'ARRAY' } @{ $cells || [] };
+        my ($state_span) = grep { ref($_) eq 'HASH' && defined($_->{text}) && $_->{text} eq $state } @spans;
+        ok($state_span, "AC-22: state=>'$state' -- a span carries the state VERBATIM (no renderer change needed)");
+        is(ref($state_span) eq 'HASH' ? $state_span->{role} : undef, 'text.muted',
+            "AC-22: state=>'$state' -- that span is muted (the unknown-state fallback)");
     }
 }
 

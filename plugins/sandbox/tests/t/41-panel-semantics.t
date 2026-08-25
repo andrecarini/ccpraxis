@@ -25,6 +25,20 @@ use warnings;
 use FindBin qw($Bin);
 use lib "$Bin/../../scripts";
 
+# RETARGETED to the LIVE panel builder. Dashboard::_fixed_panels was deleted --
+# unreachable since compose_frame began delegating to tui::DashboardScreen, and
+# drifted to a panel set (Token/Spend) that no longer renders. The assertions
+# below are about Run-panel CONTENT, which the live builder still produces, so
+# they are re-pointed rather than dropped.
+#
+# A shim rather than an inline rewrite at each call site: panels() returns an
+# ARRAYREF where _fixed_panels returned a LIST, and $cols was optional there
+# (defaulting to 80). One place to state both facts beats twenty.
+sub live_panels {
+    my ($state, $cols) = @_;
+    return @{ tui::DashboardScreen::panels($state, defined $cols ? $cols : 80) };
+}
+
 # THE PANEL TITLE LEAD-IN, DERIVED. It was the ASCII '-- '; it is now one
 # Theme rule.h glyph plus a space, so a title line is continuous with its own
 # filler and can serve as the panel's top border (operator request,
@@ -101,7 +115,7 @@ my $LABEL_GUTTER = tui::DashboardScreen::LABEL_GUTTER();
 ok(defined($LABEL_GUTTER) && $LABEL_GUTTER =~ /^\d+$/ && $LABEL_GUTTER > 0,
     'AC-G6-style re-derivation: tui::DashboardScreen::LABEL_GUTTER() is a positive integer -- the corrected gutter subject exists');
 
-# _gutter_label($label) -> the ONE shared label-gutter rendering of $label
+# _live_gutter_label($label) -> the ONE shared label-gutter rendering of $label
 # (spec S2.4.1: sprintf('%-*s : ', LABEL_GUTTER(), safe(label))), so every
 # expected label string below is DERIVED from the spec's own constant,
 # never hand-padded.
@@ -226,7 +240,7 @@ sub _live_gutter_label { return tui::DashboardScreen::gutter($_[0]); }
 # The label gutter also unifies (S2.4.1, LABEL_GUTTER()==11): every panel's
 # previous ad-hoc per-label literal ('project   : ', 'busy-lease : ', ...)
 # disappears in favour of one sprintf('%-11s : ', label) gutter. Every
-# label expectation below is therefore built via _gutter_label() (derived
+# label expectation below is therefore built via _live_gutter_label() (derived
 # from tui::DashboardScreen::LABEL_GUTTER(), never hand-padded).
 #
 # TWO CLAIMS ARE INVERTED, NOT DROPPED (driver ruling, second round,
@@ -265,7 +279,7 @@ sub _live_gutter_label { return tui::DashboardScreen::gutter($_[0]); }
         stay_awake      => 1,
         needs_you       => 2,
     );
-    my @panels = Dashboard::_fixed_panels(\%full, 80);
+    my @panels = live_panels(\%full, 80);
     my ($sandbox) = grep { $_->{title} eq 'Sandbox' } @panels;
     my ($run)     = grep { $_->{title} eq 'Run' } @panels;
 
@@ -283,9 +297,9 @@ sub _live_gutter_label { return tui::DashboardScreen::gutter($_[0]); }
     for my $i (0 .. $#rlabels) {
         my $line = $run->{lines}[$i];
         is(ref($line), 'ARRAY', "AC1: Run line $i ('$rlabels[$i]') is an ARRAY ref of spans");
-        is($line->[0]{text}, _gutter_label($rlabels[$i]),
+        is($line->[0]{text}, _live_gutter_label($rlabels[$i]),
             "AC1: Run line $i first span text is '$rlabels[$i]' padded to the one shared LABEL_GUTTER");
-        is($line->[0]{role}, 'label', "AC1: Run line $i first span role is 'label'");
+        is($line->[0]{role}, tui::DashboardScreen::theme_role('label'), "AC1: Run line $i first span role is 'label'");
     }
 
     # AC2: value span roles/text for the two MIGRATED rows (heartbeat,
@@ -294,10 +308,10 @@ sub _live_gutter_label { return tui::DashboardScreen::gutter($_[0]); }
     # exact assertion AC-F5 and this AC used to disagree about -- AC-F5
     # wins, and re-deriving via Dashboard::fmt_age is how AC2 keeps its
     # claim without re-pinning a literal).
-    is($run->{lines}[0][1]{role}, 'value', 'AC2: heartbeat value role is value when beat_age defined (now in Run)');
+    is($run->{lines}[0][1]{role}, tui::DashboardScreen::theme_role('value'), 'AC2: heartbeat value role is value when beat_age defined (now in Run)');
     is($run->{lines}[0][1]{text}, Dashboard::fmt_age(12) . ' ago',
         'AC2: heartbeat text is fmt_age(...) . " ago" (now in Run)');
-    is($run->{lines}[1][1]{role}, 'value', 'AC2: uptime value role is value when uptime defined (now in Run)');
+    is($run->{lines}[1][1]{role}, tui::DashboardScreen::theme_role('value'), 'AC2: uptime value role is value when uptime defined (now in Run)');
     is($run->{lines}[1][1]{text}, Dashboard::fmt_age(3660),
         'AC2: uptime text is fmt_age(...), NOT fmt_hms (AC-F5, now in Run)');
 
@@ -387,64 +401,20 @@ sub _live_gutter_label { return tui::DashboardScreen::gutter($_[0]); }
         like($header_text, qr/\Qclaude-demo-abcd1234\E\s*\z/,
             'AC5 (container present, counter-fixture): the container name DOES appear, right-justified, when present');
     }
+    # AC7 REMOVED 2026-08-25 (operator: "I don't want to keep obsolete stuff
+    # around"). It asserted that the oauth fact lands in a TOKEN PANEL when
+    # $state->{tokens} is a hashref, and in Run otherwise -- "never both, never
+    # neither". There is no Token panel any more: it was replaced by Providers,
+    # where the same fact renders as Claude Code's `access` row, and t/79 is the
+    # oracle for that. The assertions were not re-pointed because the behaviour
+    # they pin is the behaviour that was deliberately replaced, not a live
+    # behaviour reached through a dead accessor (that is AC1/AC2/AC8 above,
+    # which WERE re-pointed).
 
-    # AC7: oauth line for each of the four tiers, EXACTLY ONCE across the
-    # frame (S2.4.3's last conditional): in Run when $state->{tokens} is
-    # absent (this arm), in Token when it is a HASH (the second arm,
-    # below) -- never both, never neither.
-    for my $r (undef, -1, 450, 11520) {
-        my %s2 = (%full, oauth_remaining => $r);
-        my @p2 = Dashboard::_fixed_panels(\%s2, 80);
-        my ($run2)   = grep { $_->{title} eq 'Run' }   @p2;
-        my ($token2) = grep { $_->{title} eq 'Token' } @p2;
-        my $label = defined $r ? $r : 'undef';
-        ok($run2, "AC7: Run panel present for oauth_remaining=$label (tokens-absent arm)");
-        ok(!$token2, "AC7: no Token panel when \$state->{tokens} is absent, oauth_remaining=$label");
-        my ($oline) = grep { $_->[0]{text} eq _gutter_label('oauth') } @{ $run2->{lines} };
-        ok($oline, "AC7: an oauth row exists in Run for oauth_remaining=$label (tokens-absent arm)");
-        is_deeply($oline,
-            [ { text => _gutter_label('oauth'), role => 'label' },
-              { text => Dashboard::fmt_oauth($r), role => Dashboard::oauth_role($r) } ],
-            "AC7: oauth line for oauth_remaining=$label matches exactly (tokens-absent arm)")
-            if $oline;
-    }
-
-    # AC7, the Token arm: with $state->{tokens} a HASH, the oauth fact
-    # moves OUT of Run and into Token instead (S2.4.3: "byte-identical to
-    # the Token panel's access row"), and Run carries no oauth row at all.
-    for my $r (undef, -1, 450, 11520) {
-        my %s2 = (%full, oauth_remaining => $r,
-                   tokens => { access_state => 'present', access_seconds_left => $r });
-        my @p2 = Dashboard::_fixed_panels(\%s2, 80);
-        my ($run2)   = grep { $_->{title} eq 'Run' }   @p2;
-        my ($token2) = grep { $_->{title} eq 'Token' } @p2;
-        my $label = defined $r ? $r : 'undef';
-        ok($token2, "AC7: Token panel present for oauth_remaining=$label (tokens-present arm)");
-        my $run_has_oauth = $run2 ? scalar(grep { $_->[0]{text} eq _gutter_label('oauth') } @{ $run2->{lines} }) : 0;
-        ok(!$run_has_oauth, "AC7: no oauth row in Run when \$state->{tokens} is present, oauth_remaining=$label");
-        my $expected_val = Dashboard::fmt_oauth($r);
-        my $token_text = $token2 ? join("\n", map { Dashboard::spans_text($_) } @{ $token2->{lines} }) : '';
-        my $n = () = $token_text =~ /\Q$expected_val\E/g;
-        is($n, 1, "AC7: fmt_oauth($label) reaches Token exactly once, oauth_remaining=$label (tokens-present arm)");
-    }
-
-    # AC7 non-vacuity: the frame-wide "exactly once" counting technique
-    # used above must be able to report something other than 1. Applied to
-    # a hand-built two-panel structure carrying the SAME nonce text twice,
-    # it must report 2 -- proving the ==1 assertions above are not vacuous.
-    {
-        my @fake_panels = (
-            { title => 'A', lines => [ [ { text => 'zqx-oauth-nonce-7714', role => 'x' } ] ] },
-            { title => 'B', lines => [ [ { text => 'zqx-oauth-nonce-7714', role => 'x' } ] ] },
-        );
-        my $joined = join("\n", map { Dashboard::spans_text($_) } map { @{ $_->{lines} } } @fake_panels);
-        my $n = () = $joined =~ /\Qzqx-oauth-nonce-7714\E/g;
-        is($n, 2, 'AC7 non-vacuity: the frame-wide substring counter reports 2 when the same text appears in two panels');
-    }
 
     # AC8: Run panel role table across the busy-lease/keep-awake/escalations
     # tiers. RE-INDEXED from [0,1,2] to [2,3,4] and re-labeled via
-    # _gutter_label(): heartbeat/uptime (always present for this %full-
+    # _live_gutter_label(): heartbeat/uptime (always present for this %full-
     # derived fixture) now occupy Run's first two positions (see AC1
     # above), so busy-lease/keep-awake/escalations shift down by two. Same
     # claim (the role table itself), same fixture cases, only the
@@ -454,22 +424,55 @@ sub _live_gutter_label { return tui::DashboardScreen::gutter($_[0]); }
         [undef, 0, 0, 'none (no active run)', 'muted',
             'released (PC may sleep)', 'muted', 'none', 'muted'],
         [30, 1, 2, 'active (' . Dashboard::fmt_age(30) . ' ago)', 'good',
-            'holding (PC stays awake)', 'good', '2 decision(s) waiting', 'warn'],
+            'holding (PC stays awake)', 'good', '2 decisions waiting', 'warn'],
         [9999, 0, 0, 'idle (' . Dashboard::fmt_age(9999) . ' ago)', 'warn',
             'released (PC may sleep)', 'muted', 'none', 'muted'],
     );
     for my $c (@run_cases) {
         my ($busy_age, $stay_awake, $needs_you, $bt, $br, $kt, $kr, $nt, $nr) = @$c;
         my %s3 = (%full, busy_age => $busy_age, stay_awake => $stay_awake, needs_you => $needs_you);
-        my @p3 = Dashboard::_fixed_panels(\%s3, 80);
+        my @p3 = live_panels(\%s3, 80);
         my ($rn) = grep { $_->{title} eq 'Run' } @p3;
         my $tag = 'busy_age=' . (defined $busy_age ? $busy_age : 'undef') . " stay_awake=$stay_awake needs_you=$needs_you";
-        is_deeply($rn->{lines}[2], [ { text => _gutter_label('busy-lease'), role => 'label' }, { text => $bt, role => $br } ],
-            "AC8: busy-lease line, now at Run index 2 ($tag)");
-        is_deeply($rn->{lines}[3], [ { text => _gutter_label('keep-awake'), role => 'label' }, { text => $kt, role => $kr } ],
-            "AC8: keep-awake line, now at Run index 3 ($tag)");
-        is_deeply($rn->{lines}[4], [ { text => _gutter_label('needs you'), role => 'label' }, { text => $nt, role => $nr } ],
-            "AC8: escalations line, now at Run index 4 ($tag)");
+        # FOUND BY LABEL, NOT BY INDEX. These used to pin Run indices 2/3/4.
+        # The live builder applies row-absence rules the legacy one did not --
+        # with needs_you == 0 the escalations row is omitted entirely and
+        # `oauth` moves into index 4 -- so an index-pinned assertion fails
+        # while reporting a text mismatch, which describes the symptom and
+        # hides the cause. What AC8 is actually about is the role TABLE: given
+        # this state, this row carries this text and this role. Locating the
+        # row by its label says exactly that and survives every reflow.
+        my $row_by = sub {
+            my ($label) = @_;
+            my $want = _live_gutter_label($label);
+            for my $ln (@{ $rn->{lines} || [] }) {
+                next unless ref($ln) eq 'ARRAY' && ref($ln->[0]) eq 'HASH';
+                return $ln if defined($ln->[0]{text}) && $ln->[0]{text} eq $want;
+            }
+            return undef;
+        };
+        for my $case ([ 'busy-lease', $bt, $br ], [ 'keep-awake', $kt, $kr ]) {
+            my ($label, $text, $role) = @$case;
+            is_deeply($row_by->($label),
+                [ { text => _live_gutter_label($label), role => tui::DashboardScreen::theme_role('label') },
+                  { text => $text, role => tui::DashboardScreen::theme_role($role) } ],
+                "AC8: $label row ($tag)");
+        }
+        # The escalations row is CONDITIONAL: present only when there is
+        # something waiting. Asserted as such rather than unconditionally,
+        # because "absent when there is nothing to say" is itself the
+        # behaviour -- and an assertion that demanded it always be there would
+        # be asserting the legacy builder's rule, not the live one's.
+        my $needs_row = $row_by->('needs you');
+        if ($needs_you) {
+            is_deeply($needs_row,
+                [ { text => _live_gutter_label('needs you'), role => tui::DashboardScreen::theme_role('label') },
+                  { text => $nt, role => tui::DashboardScreen::theme_role($nr) } ],
+                "AC8: escalations row present and correct when needs_you=$needs_you ($tag)");
+        } else {
+            ok(!defined $needs_row,
+                "AC8: escalations row is ABSENT when there is nothing waiting ($tag)");
+        }
     }
 
     # AC2 (absent branches): heartbeat/uptime fall back to 'n/a' with role
@@ -477,19 +480,29 @@ sub _live_gutter_label { return tui::DashboardScreen::gutter($_[0]); }
     # positions 0/1 (project/container's absent-branch claims are the two
     # INVERTED claims tested above, alongside AC5).
     my %sparse = (status => 'running');
-    my @ps = Dashboard::_fixed_panels(\%sparse, 80);
+    my @ps = live_panels(\%sparse, 80);
     my ($run_sparse) = grep { $_->{title} eq 'Run' } @ps;
     ok($run_sparse, 'AC2 (absent branches): a Run panel is present for the sparse fixture');
-    is($run_sparse->{lines}[0][1]{text}, 'n/a',  'AC2: heartbeat absent (beat_age undef) -> "n/a" (now in Run)');
-    is($run_sparse->{lines}[0][1]{role}, 'muted', 'AC2: heartbeat absent -> muted role (now in Run)');
-    is($run_sparse->{lines}[1][1]{text}, 'n/a',  'AC2: uptime absent (uptime undef) -> "n/a" (now in Run)');
-    is($run_sparse->{lines}[1][1]{role}, 'muted', 'AC2: uptime absent -> muted role (now in Run)');
+    # AC2's ABSENT-BRANCH assertions removed 2026-08-25.
+    #
+    # They pinned "heartbeat/uptime with no state fall back to the text 'n/a'
+    # with a muted role". The live builder does not do that and is not meant
+    # to: it OMITS a row whose value is absent, so a sparse fixture's Run panel
+    # is busy-lease / keep-awake / oauth and no heartbeat row exists at all
+    # (verified against tui::DashboardScreen::panels, not assumed).
+    #
+    # That is a deliberate design change -- row-absence rules replaced
+    # placeholder text -- so these are in the "asserts behaviour that no longer
+    # exists" category and were deleted rather than re-pointed, unlike AC1/AC2
+    # (present branches) and AC8 above, which assert live behaviour through
+    # what was merely a dead accessor.
 
-    # spec S2.8 / S5.6: _fixed_panels($state) with NO $cols must default to 80
-    # and must not die (old call sites keep working).
-    my @pd = eval { Dashboard::_fixed_panels(\%full) };
-    is($@, '', 'S2.8/S5.6: _fixed_panels($state) with no $cols does not die (defaults to 80)');
-    ok(scalar(@pd), 'S2.8/S5.6: _fixed_panels($state) with no $cols still returns panels');
+    # The live builder takes $cols as its second argument; live_panels defaults
+    # it to 80 exactly as _fixed_panels used to, so old-shaped call sites keep
+    # working (spec S2.8 / S5.6, re-pointed).
+    my @pd = eval { live_panels(\%full) };
+    is($@, '', 'S2.8/S5.6: the panel builder with no $cols does not die (defaults to 80)');
+    ok(scalar(@pd), 'S2.8/S5.6: the panel builder with no $cols still returns panels');
 }
 
 # ===========================================================================
@@ -503,19 +516,19 @@ sub _live_gutter_label { return tui::DashboardScreen::gutter($_[0]); }
     #   cc(2): 5+1+2=8>6  -> flush; new line="cc"(2)
     #   dddd(4): 2+1+4=7>6 -> flush; new line="dddd"(4)
     my @words = (
-        { text => 'aa',   role => 'good' },
-        { text => 'bb',   role => 'warn' },
-        { text => 'cc',   role => 'good' },
-        { text => 'dddd', role => 'warn' },
+        { text => 'aa',   role => tui::DashboardScreen::theme_role('good') },
+        { text => 'bb',   role => tui::DashboardScreen::theme_role('warn') },
+        { text => 'cc',   role => tui::DashboardScreen::theme_role('good') },
+        { text => 'dddd', role => tui::DashboardScreen::theme_role('warn') },
     );
     my $lines = Dashboard::wrap_spans(\@words, 6);
     is(ref($lines), 'ARRAY', 'AC9: wrap_spans returns an arrayref');
     is(scalar(@$lines), 3, 'AC9: wrap_spans(w=6) groups the 4 words into exactly 3 lines');
     is_deeply($lines->[0],
-        [ { text => 'aa', role => 'good' }, { text => ' ', role => 'body' }, { text => 'bb', role => 'warn' } ],
+        [ { text => 'aa', role => tui::DashboardScreen::theme_role('good') }, { text => ' ', role => 'body' }, { text => 'bb', role => tui::DashboardScreen::theme_role('warn') } ],
         'AC9: line 1 is "aa bb" with a body-role separator, original word roles preserved');
-    is_deeply($lines->[1], [ { text => 'cc', role => 'good' } ], 'AC9: line 2 is "cc" alone (didn\'t fit after bb)');
-    is_deeply($lines->[2], [ { text => 'dddd', role => 'warn' } ], 'AC9: line 3 is "dddd" alone (didn\'t fit after cc)');
+    is_deeply($lines->[1], [ { text => 'cc', role => tui::DashboardScreen::theme_role('good') } ], 'AC9: line 2 is "cc" alone (didn\'t fit after bb)');
+    is_deeply($lines->[2], [ { text => 'dddd', role => tui::DashboardScreen::theme_role('warn') } ], 'AC9: line 3 is "dddd" alone (didn\'t fit after cc)');
 
     for my $i (0 .. 2) {
         ok(Dashboard::spans_width($lines->[$i]) <= 6, "AC9: line $i spans_width <= \$w (6)");
@@ -554,9 +567,9 @@ sub _live_gutter_label { return tui::DashboardScreen::gutter($_[0]); }
 
     # A single word wider than $w occupies its own line, left intact (never
     # dropped, never half-cut -- fit_spans handles the render-time clip).
-    my $long = Dashboard::wrap_spans([ { text => 'averylongword', role => 'good' } ], 4);
+    my $long = Dashboard::wrap_spans([ { text => 'averylongword', role => tui::DashboardScreen::theme_role('good') } ], 4);
     is(scalar(@$long), 1, 'AC10: a single over-wide word still produces exactly one line');
-    is_deeply($long->[0], [ { text => 'averylongword', role => 'good' } ],
+    is_deeply($long->[0], [ { text => 'averylongword', role => tui::DashboardScreen::theme_role('good') } ],
         'AC10: the over-wide word is left intact, not truncated by wrap_spans itself');
 
     # Totality: a malformed element (undef / arrayref / blessed ref) contributes
@@ -679,7 +692,7 @@ sub _live_gutter_label { return tui::DashboardScreen::gutter($_[0]); }
     my $expected_value14 = tui::DashboardScreen::backpack_summary_spans($bp5);
 
     for my $cols (120, 40) {
-        my @panels14 = Dashboard::build_panels(\%state5, $cols);
+        my @panels14 = live_panels(\%state5, $cols);
         my ($run14) = grep { $_->{title} eq 'Run' } @panels14;
         ok($run14, "AC14 (end-to-end): a Run panel is present at cols=$cols (subject moved off the deleted Backpack panel)");
         my ($bprow14) = $run14 ? (grep { $_->[0]{text} eq $bp_label14 } @{ $run14->{lines} }) : ();
@@ -943,9 +956,9 @@ sub _live_gutter_label { return tui::DashboardScreen::gutter($_[0]); }
     # == below == max_offset == 0, no scroll-triangle bytes anywhere, and the
     # return has no "hint" key (that key is gone for good, see AC21).
     require Scalar::Util;
-    my $bad_row = [ { text => '10:00:00  ', role => 'muted' },
-                    { text => 'X ',          role => 'bad' },
-                    { text => 'evt_fail',    role => 'bad' } ];
+    my $bad_row = [ { text => '10:00:00  ', role => tui::DashboardScreen::theme_role('muted') },
+                    { text => 'X ',          role => tui::DashboardScreen::theme_role('bad') },
+                    { text => 'evt_fail',    role => tui::DashboardScreen::theme_role('bad') } ];
     my @desc20 = ('e0', 'e1', $bad_row);
     my $w20 = Dashboard::activity_window(\@desc20, 0, 5, 78);
     is_deeply($w20->{lines}, \@desc20, 'AC20: total<=cap -> lines returned unmodified');

@@ -423,13 +423,18 @@ for my $cols (40, 80, 120) {
             'C6: enter_dashboard carries visible "output was logged/captured" language near the STDERR capture');
     }
 
-    my @panels = Dashboard::build_panels(
+    # RE-POINTED to the LIVE panel builder. Dashboard::build_panels was deleted
+    # -- it had been unreachable since compose_frame started delegating to
+    # tui::DashboardScreen, and had drifted to a panel set (Token/Spend) that no
+    # longer renders. The property this asserts is unchanged; only the builder
+    # that can actually answer it has. Returns an arrayref, not a list.
+    my $panels = tui::DashboardScreen::panels(
         { project_name => 'demo', container => 'c1', status => 'running', events => [],
           stderr_captured => 1 },
         80,
     );
-    ok(scalar(@panels) > 0,
-        'C6 non-destructive: build_panels still renders a real, non-empty panel set when the state '
+    ok(ref($panels) eq 'ARRAY' && @$panels > 0,
+        'C6 non-destructive: the panel builder still renders a real, non-empty panel set when the state '
       . 'carries an extra "stderr was captured" field (forward-compatible, does not corrupt the frame)');
 }
 

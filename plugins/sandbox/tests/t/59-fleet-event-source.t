@@ -434,11 +434,13 @@ sub try_cross_merge {
     }
     # Positive gate: the dashboard still renders a full panel set with ZERO
     # orchestrator events -- degrading is only correct if what remains works.
-    # (build_panels RETURNS A LIST, not an arrayref -- must be captured in
-    # list context or scalar context silently collapses it to a count.)
-    my @panels = Dashboard::build_panels({ project_name => 'demo', container => 'c1', status => 'running', events => [] }, 80);
-    ok(scalar(@panels) > 0, 'C7 positive gate: build_panels still renders a real panel set when there are zero orchestrator events');
-    my ($activity) = grep { ref($_) eq 'HASH' && ($_->{title} || '') eq 'Recent activity' } @panels;
+    # RE-POINTED to the LIVE panel builder (tui::DashboardScreen::panels), which
+    # returns an ARRAYREF. Dashboard::build_panels was deleted: unreachable since
+    # compose_frame began delegating, and drifted to a Token/Spend panel set that
+    # no longer renders at all.
+    my $panels = tui::DashboardScreen::panels({ project_name => 'demo', container => 'c1', status => 'running', events => [] }, 80);
+    ok(ref($panels) eq 'ARRAY' && @$panels > 0, 'C7 positive gate: the panel builder still renders a real panel set when there are zero orchestrator events');
+    my ($activity) = grep { ref($_) eq 'HASH' && ($_->{title} || '') eq 'Recent activity' } @$panels;
     ok(defined($activity), 'C7 positive gate: the Activity panel itself is still present');
 }
 {

@@ -642,27 +642,6 @@ my @CLASS_ORDER = qw(clock environment filesystem process console nondeterminism
     ok(scalar(@non_whitelisted) > 0, 'AC-P6 non-vacuity: the self-scan detector fires on a hand-built row-count-pin line');
 }
 
-# ===========================================================================
-# AC-B -- the breakpoint (Obligation 1, criterion 7, Decision 14)
-# ===========================================================================
-{
-    my $BP = tui::Layout::BREAKPOINT_TWO_COL();
-    for my $c (60, $BP - 1) {
-        is(Dashboard::_two_col_mode($c), 0, "AC-B1: _two_col_mode($c) == 0 (below breakpoint)");
-    }
-    for my $c ($BP, $BP + 1, 99, 100, 120, 200) {
-        is(Dashboard::_two_col_mode($c), 1, "AC-B1: _two_col_mode($c) == 1 (at/above breakpoint)");
-    }
-    for my $c (undef, '', 'abc', 0, -5) {
-        my $label = defined($c) ? ($c eq '' ? "''" : $c) : 'undef';
-        is(Dashboard::_two_col_mode($c), 0, "AC-B1: _two_col_mode($label) == 0 (degradation)");
-    }
-
-    is(Dashboard::_two_col_min_cols(), tui::Layout::BREAKPOINT_TWO_COL(),
-        'AC-B2: Dashboard::_two_col_min_cols() == tui::Layout::BREAKPOINT_TWO_COL() (derivation, not a re-pinned literal)');
-    is(tui::Layout::BREAKPOINT_TWO_COL(), 90,
-        'AC-B2: tui::Layout::BREAKPOINT_TWO_COL() == 90'); # shape-lint: intentional -- Decision 14 locks the responsive breakpoint at 90 columns
-}
 {
     my $src = slurp($DASHBOARD_PM);
     ok(defined($src), 'AC-B3: precondition -- Dashboard.pm is readable as text');
@@ -789,51 +768,6 @@ ok(!Theme->can('display_width'),
 # OTHER oracles (t/41's correction in this same change already applies it:
 # Theme::glyph('status.*') selected live, fails loudly if missing, rather
 # than a hardcoded emoji literal) -- not a distinct t/66 assertion.
-
-# ===========================================================================
-# AC-S -- snapshot_state (Obligation 4, adapter contract Rule 4)
-# ===========================================================================
-{
-    is_deeply([ Dashboard::_resources_lines(undef) ], [], 'AC-S4/Behavior19: Dashboard::_resources_lines(undef) returns the empty list');
-    is_deeply([ Dashboard::_resources_lines('x') ], [], 'AC-S4/Behavior19: Dashboard::_resources_lines(\'x\') returns the empty list');
-}
-sub _dlines_text {
-    my ($res) = @_;
-    my @lines = eval { Dashboard::_resources_lines($res) };
-    return '<CALL FAILED>' if $@;
-    return join("\n", map {
-        ref($_) eq 'ARRAY' ? join('', map { (ref($_) eq 'HASH' && defined $_->{text}) ? $_->{text} : '' } @$_) : ''
-    } @lines);
-}
-{
-    my $fresh_full  = _dlines_text(\%RESOURCES_FRESH_FULL);
-    my $fresh_gaps  = _dlines_text(\%RESOURCES_FRESH_GAPS);
-    my $stale_text  = _dlines_text(\%RESOURCES_STALE);
-    my $failed_text = _dlines_text(\%RESOURCES_FAILED);
-    my $plain_text  = _dlines_text({ %RESOURCES_ALL_NA });
-
-    isnt($fresh_full,  $stale_text,  'AC-S1/Behavior20: fresh renders DISTINCTLY from stale');
-    isnt($fresh_full,  $failed_text, 'AC-S1/Behavior20: fresh renders DISTINCTLY from failed');
-    isnt($stale_text,  $failed_text, 'AC-S1/Behavior20: stale renders DISTINCTLY from failed');
-    isnt($fresh_full,  $plain_text,  'AC-S1/Behavior20: fresh renders DISTINCTLY from the never-written (no snapshot_state key) case');
-    isnt($stale_text,  $plain_text,  'AC-S1/Behavior20: stale renders DISTINCTLY from the never-written case');
-    isnt($failed_text, $plain_text,  'AC-S1/Behavior20: failed renders DISTINCTLY from the never-written case');
-
-    unlike(_dlines_text(\%RESOURCES_STALE_NO_AGE), qr/\b0[smhd]\b/,
-        'AC-S2/Behavior21: stale with snapshot_age undef renders NO fabricated zero-duration clause');
-    like('stale, 0s ago', qr/\b0[smhd]\b/,
-        'AC-S2 non-vacuity: the fabricated-zero detector fires on a hand-built "stale, 0s ago" string');
-
-    unlike($stale_text,  qr/\bn\/a\b/i, 'AC-S5: the stale panel contains no n/a row');
-    unlike($failed_text, qr/\bn\/a\b/i, 'AC-S5: the failed panel contains no n/a row');
-    unlike($fresh_full,  qr/\bn\/a\b/i, 'AC-S3: fresh-with-every-value panel renders no n/a row');
-    unlike($fresh_full,  qr/unavailable/i, 'AC-S3: fresh-with-every-value panel names no unavailable clause');
-    like($fresh_gaps, qr/(\d+)\s*facts?\s*unavailable/i, 'AC-S5: the fresh-with-gaps panel names a count of suppressed facts, pluralised')
-        or diag("  rendered: $fresh_gaps");
-    if ($fresh_gaps =~ /(\d+)\s*facts?\s*unavailable/i) {
-        is($1, 13, 'AC-S5: the fresh-with-gaps count equals the number of suppressed rows (13 of 15 keys undef)');
-    }
-}
 
 # ===========================================================================
 # AC-D -- no duplicated facts (criterion 2)
