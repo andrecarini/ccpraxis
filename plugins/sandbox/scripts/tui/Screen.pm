@@ -605,8 +605,31 @@ sub compose {
     # budget are kept, dropping that banner's own tail rows first -- never
     # an earlier banner's rows, never a later banner's leading rows. Once
     # the budget hits 0, no further banner is considered at all.
+    # WHERE BANNERS GO, AND WHY IT DEPENDS ON WIDTH (operator request,
+    # 2026-08-25: "any errors, warnings and etc could go into that same column
+    # instead of pushing everything down").
+    #
+    # A banner is full-width and stacks ABOVE the panels, so every alert costs
+    # the whole layout a row and shoves the panel grid down -- on a wide
+    # terminal, to say one short sentence across 200 columns. When a side
+    # column exists it is the natural home: it already spans the full body
+    # height, it is where transient, time-ordered things (the activity feed)
+    # already live, and putting alerts there costs the MAIN region nothing at
+    # all.
+    #
+    # Below the breakpoint there is no side column to put them in, so they stay
+    # exactly as they are today -- full-width, above the panels. That is the
+    # operator's own choice of fallback, and it is the right one: on a narrow
+    # terminal the side column would be too cramped to read a wrapped alert in.
     my @banners = (ref($screen->{banners}) eq 'ARRAY') ? @{ $screen->{banners} } : ();
-    my $max_banner_rows = $body_height - 1;   # reserve >=1 row for the body, same reservation as today
+    my $banners_in_side = ($side_w > 0 && $side_panel) ? 1 : 0;
+    my $banner_cols     = $banners_in_side ? ($side_w - 1) : $main_cols;
+    $banner_cols = 1 if $banner_cols < 1;
+
+    # The reservation differs per destination. Full-width banners must leave at
+    # least one body row; side-column banners must leave at least one row of
+    # the activity panel, which is the thing they are sharing a column with.
+    my $max_banner_rows = $body_height - 1;
     $max_banner_rows = 0 if $max_banner_rows < 0;
 
     my @banner_cells;
@@ -621,16 +644,38 @@ sub compose {
         # wrap_line computes internally), which is generous/safe since no
         # single wrapped row can ever carry more than $cols display columns
         # of input (wrap_line's own contract).
-        my $bounded = tui::Frame::bound_for_wrap($msg, $budget, $main_cols);
-        my $wrapped = tui::Frame::wrap_line($bounded, $banner_role, $main_cols, WRAP_CONTINUATION_INDENT());
+        # In the side column a banner butts straight up against the vertical
+        # border, so its first row read as "|!! podman machine..." with no gap
+        # while its own continuation rows were indented -- ragged against the
+        # one edge that makes raggedness obvious. Wrap one column narrower and
+        # spend that column on a leading pad, so every row of every banner
+        # starts in the same place. Full-width banners are unchanged: there the
+        # first column is the screen edge, not a border.
+        my $pad  = $banners_in_side ? 1 : 0;
+        my $wrap_w = $banner_cols - $pad;
+        $wrap_w = 1 if $wrap_w < 1;
+        my $bounded = tui::Frame::bound_for_wrap($msg, $budget, $wrap_w);
+        my $wrapped = tui::Frame::wrap_line($bounded, $banner_role, $wrap_w, WRAP_CONTINUATION_INDENT());
         $wrapped = [ @$wrapped[ 0 .. $budget - 1 ] ] if @$wrapped > $budget;
+        if ($pad) {
+            for my $c (@$wrapped) {
+                my @spans = ( { text => ' ' x $pad, role => $banner_role },
+                              @{ ref($c->{spans}) eq 'ARRAY' ? $c->{spans} : [] } );
+                $c = { text => tui::Frame::spans_text(\@spans), role => $c->{role}, spans => \@spans };
+            }
+        }
         push @banner_cells, @$wrapped;
     }
-    # $main_height, not $body_height. Banners live in the MAIN region now, so
-    # they shorten it alone -- the side column keeps the full body height it
-    # was reserved above. With no side column the two are the same number and
-    # this is the arithmetic that was already here.
-    my $main_height = $body_height - scalar(@banner_cells);
+    # WHO PAYS FOR THE BANNER ROWS.
+    #
+    # When banners render into the SIDE column they cost the main region
+    # nothing -- that is the whole point of moving them -- so $main_height is
+    # the full body height and the panel grid does not shift when an alert
+    # appears. When there is no side column they behave exactly as before:
+    # full-width, above the panels, shortening the main region alone.
+    my $main_height = $banners_in_side
+                    ? $body_height
+                    : ($body_height - scalar(@banner_cells));
     $main_height = 0 if $main_height < 0;
 
     my @main_cells = _place_and_render(\@panels, $main_cols, $main_height);
@@ -643,9 +688,11 @@ sub compose {
     # before, and every row is $cols wide because $main_cols == $cols.
     return [ $title_cell, @banner_cells, @main_cells, $footer_cell ] if !$side_panel;
 
-    # With a side column, the banner rows and the main rows together form the
-    # LEFT region, and the side column runs beside all of them.
-    my @left = (@banner_cells, @main_cells);
+    # With a side column, the main rows ARE the left region on their own --
+    # the banners have moved into the side column (see the note where
+    # $banners_in_side is computed), so nothing is stacked above the panel grid
+    # and it no longer shifts down when an alert appears.
+    my @left = @main_cells;
 
     # THE SIDE COLUMN OWNS ITS LEFT BORDER, which is the mirror of the rule the
     # band grid uses (there, the LEFT panel spends its last column). It has to
@@ -660,7 +707,14 @@ sub compose {
     # side column's own title rule starting there.
     my $side_sep = Theme::glyph('rule.v');
     my $side_bw  = (defined $side_sep && length $side_sep) ? 1 : 0;
-    my @side = _render_panel($side_panel, $side_w - $side_bw, $body_height);
+    # BANNERS SIT ABOVE THE ACTIVITY PANEL, INSIDE THE COLUMN. They are the
+    # newest and most urgent thing on screen, so they take the rows the eye
+    # reaches first; the activity panel renders into whatever is left, which is
+    # why its budget is reduced here rather than it being padded afterwards --
+    # padding would give it rows it could not use and then clip them.
+    my $side_body_h = $body_height - scalar(@banner_cells);
+    $side_body_h = 0 if $side_body_h < 0;
+    my @side = (@banner_cells, _render_panel($side_panel, $side_w - $side_bw, $side_body_h));
 
     # BOTH REGIONS ARE PADDED TO $body_height BEFORE JOINING. That is what
     # keeps "total rows == the terminal height" a structural property rather
