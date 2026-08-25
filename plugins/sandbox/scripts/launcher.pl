@@ -7027,9 +7027,19 @@ sub _container_sampler_round {
     my ($container) = @_;
     my $now = time;
 
-    my $status = `$PODMAN inspect --format '{{.State.Status}}' "$container" 2>/dev/null`;
+    # KEEP THE REASON HERE TOO. 'unknown' is a state the operator SEES -- it
+    # renders in the title block and drives the container-gone styling -- so
+    # arriving at it without being able to say why is the same defect this
+    # sampler was built to stop repeating. Written one line after the round
+    # that was already doing it right for the lease probe.
+    my $status_err = _probe_err_path('inspect');
+    my $status = `$PODMAN inspect --format '{{.State.Status}}' "$container" 2>"$status_err"`;
     chomp $status if defined $status;
-    $status = (defined $status && length $status) ? $status : 'unknown';
+    my $status_why;
+    if (!defined $status || !length $status) {
+        $status    = 'unknown';
+        $status_why = _probe_reason('inspect');
+    }
 
     my $probe   = _busy_lease_probe($container);
     my $machine = _machine_state();
@@ -7040,6 +7050,16 @@ sub _container_sampler_round {
         sampler_pid  => $$,
         container    => $container,
         status       => $status,
+        # DIAGNOSTIC, NOT RENDERED, and deliberately so. undef unless the
+        # inspect produced nothing. The status itself renders as a single word
+        # in the header, which has no room for a reason and should not grow
+        # one -- but "unknown" with no explanation is exactly the dead end this
+        # sampler exists to stop creating, so the reason is written where it
+        # can be read: here, and in probe-inspect.err beside it.
+        #
+        # Saying this out loud because a field nothing consumes is how
+        # probe_errors came to ship inert two commits ago.
+        status_why   => $status_why,
         machine      => $machine,
         probe        => (ref $probe eq 'HASH' ? $probe : { state => 'probe-failed',
                                                            detail => 'probe returned no result' }),
