@@ -278,8 +278,19 @@ sub row {
 
     return [] if !$force && is_absent($plain);
 
+    # `gutter_width` NARROWS THE LABEL COLUMN FOR AN INDENTED ROW. The Providers
+    # panel nests its facts under a provider heading, and that indent used to
+    # push its VALUES two columns right of every other panel's -- see
+    # _FACT_GUTTER for the full reasoning. A row that spends N columns on an
+    # indent asks for a label column N narrower, and its values land in the one
+    # shared column again. Absent, the row pays the full LABEL_GUTTER, which is
+    # every other call site.
+    my $gw = $spec{gutter_width};
+    my $label_text = (defined($gw) && !ref($gw) && $gw =~ /^\d+$/)
+        ? pad_label(tui::Frame::safe($label), $gw)
+        : gutter($label);
     my @spans = (
-        { text => gutter($label), role => 'text.muted' },
+        { text => $label_text, role => 'text.muted' },
         @value_spans,
     );
     return \@spans;
@@ -1207,10 +1218,42 @@ sub _spend_zen_spans {
 use constant _HEADING_INDENT => 0;
 use constant _FACT_INDENT    => 2;
 
+# THE NESTING INDENT MUST NOT MOVE THE VALUE COLUMN (operator, 2026-08-25):
+#
+#     backpack      5 items, 5 pending  [b]      <- Run
+#     snapshot      fresh, 15s old, ...          <- Resources
+#       access        expires in 7h21m, ...      <- Providers, two columns out
+#
+# Every other panel puts a value at column LABEL_GUTTER + GUTTER_SEP. Providers
+# paid that in full and then added _FACT_INDENT on top, so its values -- and
+# only its values -- sat two columns right of the rest of the screen.
+#
+# The indent itself is NOT the thing to remove. It is what makes a fact's
+# referent mechanical rather than positional: a heading is indented LESS than
+# the facts beneath it (_HEADING_INDENT < _FACT_INDENT), which is the shape
+# t/79's Behavior 3 checks and which exists because the operator could not tell
+# which provider a figure belonged to. Flattening the nesting to fix the
+# alignment would trade one complaint straight back for the other.
+#
+# So the indent is spent out of the LABEL column instead of on top of it: a row
+# indented by _FACT_INDENT asks for a label column that much narrower, and lands
+# its value in the same column as everything else. The nesting is still visible
+# -- the LABELS are still indented, which is what the eye follows -- while the
+# values line up across the whole screen.
+use constant _FACT_GUTTER => LABEL_GUTTER() - _FACT_INDENT();
+
 sub _indent_line {
     my ($n, $line) = @_;
     return $line unless ref($line) eq 'ARRAY' && @$line;
     return [ { text => (' ' x $n), role => 'text.primary' }, @$line ];
+}
+
+# _fact_line(\%row_spec) -> ONE indented, value-aligned Providers fact row (or
+# [] when row() suppresses it). The single place _FACT_INDENT and _FACT_GUTTER
+# are paired, so the two can never drift apart into a misalignment.
+sub _fact_line {
+    my ($spec) = @_;
+    return _indent_line(_FACT_INDENT(), row({ %$spec, gutter_width => _FACT_GUTTER() }));
 }
 
 sub _provider_heading {
@@ -1255,8 +1298,8 @@ sub _claude_code_block {
     if (defined $t->{last_refreshed_age}) {
         push @access_spans, { text => ', refreshed ' . fmt_duration($t->{last_refreshed_age}) . ' ago', role => 'text.primary' };
     }
-    my $access_row = row({ label => 'access', value => \@access_spans, force => 1 });
-    push @lines, _indent_line(_FACT_INDENT(), $access_row) if @$access_row;
+    my $access_row = _fact_line({ label => 'access', value => \@access_spans, force => 1 });
+    push @lines, $access_row if @$access_row;
 
     my @refresh_spans;
     if ($t->{refresh_present}) {
@@ -1265,16 +1308,16 @@ sub _claude_code_block {
     } else {
         @refresh_spans = ( { text => 'absent', role => 'state.crit' } );
     }
-    my $refresh_row = row({ label => 'refresh', value => \@refresh_spans, force => 1 });
-    push @lines, _indent_line(_FACT_INDENT(), $refresh_row) if @$refresh_row;
+    my $refresh_row = _fact_line({ label => 'refresh', value => \@refresh_spans, force => 1 });
+    push @lines, $refresh_row if @$refresh_row;
 
     my @present;
     for my $k (qw(subscription_type rate_limit_tier)) {
         push @present, $t->{$k} if defined($t->{$k}) && !ref($t->{$k}) && length($t->{$k});
     }
     if (@present) {
-        my $acc_row = row({ label => 'account', value => [ { text => join(' / ', @present), role => 'text.primary' } ] });
-        push @lines, _indent_line(_FACT_INDENT(), $acc_row) if @$acc_row;
+        my $acc_row = _fact_line({ label => 'account', value => [ { text => join(' / ', @present), role => 'text.primary' } ] });
+        push @lines, $acc_row if @$acc_row;
     }
 
     push @lines, _spend_fact_row('usage', \&_spend_claude_spans, $claude_spend, $spend_present, $w);
@@ -1310,12 +1353,15 @@ sub _spend_fact_row {
     if ($present) {
         my ($spans, $protect) = $builder->($data);
         @value = @$spans;
-        my $line = row({ label => $label, value => \@value });
+        # Clipping happens BEFORE the indent, so it must build the row itself
+        # rather than go through _fact_line -- the gutter width is still the
+        # nested one, which is the whole point of the pairing.
+        my $line = row({ label => $label, value => \@value, gutter_width => _FACT_GUTTER() });
         return _indent_line(_FACT_INDENT(), _clip_line($line, $protect, $w));
     }
     @value = ( { text => _status_glyph('warn') . ' ', role => 'state.warn' },
                { text => 'not collected yet', role => 'text.muted' } );
-    return _indent_line(_FACT_INDENT(), row({ label => $label, value => \@value }));
+    return _fact_line({ label => $label, value => \@value });
 }
 
 # ONE "OpenCode" GROUP, with Go and Zen as facts inside it.

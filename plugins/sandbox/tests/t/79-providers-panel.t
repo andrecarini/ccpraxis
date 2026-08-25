@@ -537,5 +537,58 @@ sub runs_n {
 # An assertion that dead code still exists, and is still commented a certain
 # way, is the one kind that cannot survive removing it.
 
+# ===========================================================================
+# VALUE-COLUMN ALIGNMENT (operator, 2026-08-25): "Providers values are one
+# column right of every other panel".
+#
+#     backpack      5 items, 5 pending  [b]      <- Run
+#     snapshot      fresh, 15s old, ...          <- Resources
+#       access        expires in 7h21m, ...      <- Providers, out by _FACT_INDENT
+#
+# The tension this pins is real and is why the assertion is written as a
+# RELATIONSHIP between two panels rather than as a column number: Providers must
+# keep the nesting that Behavior 3 above requires (a heading indented LESS than
+# its facts) AND land its values where every other panel lands them. Those are
+# only compatible if the indent is spent OUT OF the label column rather than on
+# top of it -- so if someone "fixes" the alignment by flattening the nesting,
+# Behavior 3 goes red; if someone restores the old full-width gutter under the
+# indent, this goes red. Neither can be satisfied by weakening the other.
+# ===========================================================================
+{
+    my $panels = tui::DashboardScreen::panels(base_state(), 132);
+    my $providers = panel_by_title($panels, 'Providers');
+    my $run       = panel_by_title($panels, 'Run');
+    ok($providers && $run, 'ALIGN precondition: both a Providers and a Run panel exist');
+
+  SKIP: {
+        skip('Providers or Run panel missing', 3) unless $providers && $run;
+
+        # value_col($text) -> the column the VALUE starts at, i.e. past the
+        # leading indent, the label and the gutter separator. Derived from the
+        # rendered text the same way a reader's eye derives it: the first
+        # non-space after the run of spaces that follows the label word.
+        my $value_col = sub {
+            my ($t) = @_;
+            return undef unless defined $t && $t =~ /^(\s*\S+\s{2,})\S/;
+            return length($1);
+        };
+
+        my ($run_row) = grep { $value_col->($_) } @{ panel_line_texts($run) };
+        my ($fact_row) = grep { /^\s+\S/ && $value_col->($_) } @{ panel_line_texts($providers) };
+        ok(defined $run_row,  'ALIGN: the Run panel has at least one label/value row to compare against')
+            or diag('  Run lines: ' . join(' | ', @{ panel_line_texts($run) }));
+        ok(defined $fact_row, 'ALIGN: the Providers panel has at least one INDENTED fact row')
+            or diag('  Providers lines: ' . join(' | ', @{ panel_line_texts($providers) }));
+
+      SKIP: {
+            skip('no comparable pair of rows', 1) unless defined($run_row) && defined($fact_row);
+            is($value_col->($fact_row), $value_col->($run_row),
+               'ALIGN CANONICAL: an indented Providers fact starts its VALUE in the same column '
+             . 'as an ordinary Run row -- the nesting indent is spent out of the label column, '
+             . 'not added on top of it')
+                or diag("  Run:       [$run_row]\n  Providers: [$fact_row]");
+        }
+    }
+}
 
 done_testing();
