@@ -6989,14 +6989,40 @@ sub _hot_reload {
     my $todo   = HotReload::changed($loaded, $HOT_RELOAD_BASELINE, $now);
 
     my (@reloaded, @skipped, @rolled_back);
+
+    # ALL-OR-NOTHING: every candidate is compiled BEFORE any is swapped.
+    #
+    # The per-module loop used to compile-and-swap one at a time, so a batch
+    # where one module failed left the others reloaded -- a MIXED-VERSION render
+    # path, which is the same half-applied state this file already warns about
+    # for launcher.pl. Observed on a live TUI: "reloaded 1 module, skipped 1
+    # module", with tui::Frame swapped and tui::DashboardScreen left at the old
+    # version, quietly rendering a blend of the two.
+    #
+    # These thirteen modules are not independent -- DashboardScreen builds spans
+    # that Frame wraps and Screen composes -- so a partial swap is precisely the
+    # combination most likely to render a fallback cleanly and look fine while
+    # being wrong. Refusing the whole batch keeps the process on ONE coherent
+    # version, which is the property that makes a reload safe to offer at all.
+    my @candidates;
     for my $m (@$todo) {
         my ($compiles, $why) = _hot_reload_compiles($m->{path}, $libdir);
-        unless ($compiles) {
-            push @skipped, { name => $m->{name},
-                             why  => 'left untouched - '
-                                   . (defined $why && length $why ? $why : 'does not compile') };
-            next;
-        }
+        if ($compiles) { push @candidates, $m; next }
+        push @skipped, { name => $m->{name},
+                         why  => 'left untouched - '
+                               . (defined $why && length $why ? $why : 'does not compile') };
+    }
+    if (@skipped) {
+        # Name the ones held back too, so the report never reads as though the
+        # rest were fine and merely not attempted.
+        push @skipped, { name => $_->{name}, why => 'held back - another module in this batch '
+                                                  . 'would not compile, and a partial reload '
+                                                  . 'mixes versions' }
+            for @candidates;
+        @candidates = ();
+    }
+
+    for my $m (@candidates) {
         my $saved = _hot_reload_snapshot($m->{name});
         my $prev_inc = delete $INC{ $m->{key} };
         my $ok = eval { local $SIG{__WARN__} = sub {}; require $m->{key}; 1 };

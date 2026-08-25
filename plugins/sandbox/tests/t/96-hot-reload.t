@@ -312,6 +312,36 @@ ok($OK, 'HotReload.pm and tui/DashboardScreen.pm load') or BAIL_OUT("require fai
         is(posixify_path(undef), undef, 'AC11: undef in, undef out -- total, never dies');
     }
 
+    # ------------------------------------------------------------------
+    # AC12 -- the batch is ALL-OR-NOTHING.
+    #
+    # The reload loop used to compile-and-swap one module at a time, so a batch
+    # where one failed left the others swapped: a MIXED-VERSION render path.
+    # Observed on a live TUI as "reloaded 1 module, skipped 1 module", with
+    # tui::Frame at the new version and tui::DashboardScreen at the old one.
+    #
+    # These modules are not independent -- DashboardScreen builds spans that
+    # Frame wraps and Screen composes -- so a partial swap is exactly the
+    # combination most likely to render a fallback cleanly and look fine while
+    # being wrong. That is the failure this whole file exists to make
+    # impossible; a half-applied batch is the same defect the launcher.pl
+    # caveat already warns about, one level down.
+    #
+    # SOURCE-LEVEL ON PURPOSE: _hot_reload lives in launcher.pl, which this
+    # suite must never execute (it builds images and starts containers). The
+    # ORDER of the two phases is the property, and it is visible in the source.
+    # ------------------------------------------------------------------
+    my $compile_all = index($src, 'my @candidates;');
+    my $swap_loop   = index($src, 'for my $m (@candidates) {');
+    cmp_ok($compile_all, '>', -1, 'AC12: the candidate list is built before any swap');
+    cmp_ok($swap_loop,   '>', -1, 'AC12: the swap loop iterates that list');
+    cmp_ok($compile_all, '<', $swap_loop,
+           'AC12: EVERY candidate is compiled BEFORE the first swap -- a compile-and-swap loop '
+         . 'leaves a failed batch mixed-version');
+    like($src, qr/held back - another module in this batch/,
+         'AC12: ...and a module held back by a sibling\'s failure is REPORTED as such, so the '
+       . 'summary never reads as though it was simply not attempted');
+
     # And the consumer actually uses it: a $SELF_PL that skipped the translation
     # is the whole defect.
     like($src, qr/\$SELF_PL\s*=\s*do\s*\{[^}]*posixify_path/s,
