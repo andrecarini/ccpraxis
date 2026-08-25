@@ -2768,21 +2768,38 @@ sub run {
                     $hb_state = $hb if defined $hb;
                 }
 
+                # GEOMETRY IS POLLED EVERY TICK, NOT ON THE GATHER ROUND.
+                #
+                # This used to live inside the state-refresh block below, which
+                # runs once per $state_int (2s in production) -- so a resize was
+                # invisible for up to two seconds, and for however much longer
+                # the gather round itself took. Operator: "it takes a long time
+                # for the repaint to trigger or it may not even trigger at all.
+                # But the moment I e.g. scroll my mouse, everything repaints
+                # nicely" -- scrolling moves $activity_offset, which IS in the
+                # frame signature, so it forced the recompose the resize should
+                # have forced. Reading the terminal size is an ioctl, not a
+                # subprocess; there is no reason for it to ride a throttle meant
+                # for probes. At $tick_int it is now noticed within ~200ms.
+                #
+                # $rows/$cols are in the frame-cache signature, so updating them
+                # here is by itself enough to force a recompose on the same tick.
+                ($cols, $rows) = $term_size->();
+                if ($cols != $last_cols || $rows != $last_rows) {
+                    # c8b0: a width-only resize never changes the ROW COUNT
+                    # that render_frame's own $full formula compares, so the
+                    # per-row diff would otherwise skip unchanged rows and
+                    # leave whatever the real terminal did to them during the
+                    # resize on screen. Reuse the SAME idiom already used
+                    # three times elsewhere in this file to force a full
+                    # repaint ([r] refresh, backpack-modal exit, first frame)
+                    # instead of adding a second mechanism.
+                    $prev = undef;
+                    ($last_cols, $last_rows) = ($cols, $rows);
+                }
+
                 # state refresh (slower cadence than input polling)
                 if (!defined $last_state || $t - $last_state >= $state_int) {
-                    ($cols, $rows) = $term_size->();
-                    if ($cols != $last_cols || $rows != $last_rows) {
-                        # c8b0: a width-only resize never changes the ROW COUNT
-                        # that render_frame's own $full formula compares, so the
-                        # per-row diff would otherwise skip unchanged rows and
-                        # leave whatever the real terminal did to them during the
-                        # resize on screen. Reuse the SAME idiom already used
-                        # three times elsewhere in this file to force a full
-                        # repaint ([r] refresh, backpack-modal exit, first frame)
-                        # instead of adding a second mechanism.
-                        $prev = undef;
-                        ($last_cols, $last_rows) = ($cols, $rows);
-                    }
                     my $base = $gather->() || {};
                     %state = %$base;
                     # t11-tui-hot-reload: the nudge. Thirteen stats, no fork --

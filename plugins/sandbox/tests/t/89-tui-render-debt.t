@@ -140,7 +140,9 @@ sub run_case {
     my @outs;
     my $rc = Dashboard::run(
         beat_interval  => 100000,        # never fires during these short runs
-        state_interval => 0,             # refresh (and re-poll term_size) every tick
+        # The geometry poll no longer rides this throttle (see PART 1b), but the
+        # PART 1 cases still want a gather every tick so each tick emits a frame.
+        state_interval => (exists $args{state_interval} ? $args{state_interval} : 0),
         tick_interval  => 0,
         color          => 0,
         max_ticks      => $args{max_ticks} // 10,
@@ -206,6 +208,45 @@ SKIP: {
         skip 'did not capture the expected 3 frames', 1 if @{ $r2->{frames} } != 3;
         like($r2->{frames}[1], qr/\e\[2J\e\[H/,
             'AC3 (DC1/behavior 3, regression guard): a row-count change (24->12 rows) still forces a full repaint, unaffected by this package');
+    }
+}
+
+# ===========================================================================
+# PART 1b -- the geometry poll does not ride the GATHER throttle.
+#
+# Operator: "there's something wrong with the logic for detecting terminal
+# window size changes and then repainting the TUI. It takes a long time for the
+# repaint to trigger or it may not even trigger at all. But the moment I e.g.
+# scroll my mouse, everything repaints nicely."
+#
+# The cause: term_size() was polled INSIDE run()'s state-refresh block, so a
+# resize could not be noticed until the next gather round -- $state_int (2s in
+# production) plus however long the gather itself took. Scrolling papered over
+# it because $activity_offset is in the frame-cache signature.
+#
+# This case pins the fix where PART 1 cannot: state_interval is set so large
+# that NO second gather happens during the run. Every frame after the first is
+# therefore attributable to geometry alone. Under the old code term_size() was
+# called exactly once and the resize was never seen at all.
+# ===========================================================================
+SKIP: {
+    skip 'Dashboard.pm did not load', 3 unless $DASH_OK;
+
+    my $ts = make_term_size([80, 24], [80, 24], [40, 24], [40, 24]);
+    my $r  = run_case(term_size      => $ts,
+                      state_interval => 100000,   # exactly one gather, on tick 1
+                      keys           => [undef, undef, undef, 'q'],
+                      max_ticks      => 10);
+    is(scalar(@{ $r->{frames} }), 2,
+       'PART1b: with no second gather, exactly two frames are emitted -- the first open, and the resize')
+        or diag("  frames: " . scalar(@{ $r->{frames} }));
+
+    SKIP: {
+        skip 'did not capture the expected 2 frames', 2 if @{ $r->{frames} } != 2;
+        like($r->{frames}[0], qr/\e\[2J\e\[H/,
+             'PART1b: the first frame is the ordinary first-open full repaint');
+        like($r->{frames}[1], qr/\e\[2J\e\[H/,
+             'PART1b: a resize is noticed on the TICK it happens, without waiting for a gather round');
     }
 }
 
