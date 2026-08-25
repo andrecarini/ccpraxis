@@ -596,6 +596,31 @@ sub _cmd_next {
         }
     }
 
+    # B1a: NOTHING IN SCOPE — settled, not a question.
+    #
+    # An empty candidate set has no order to judge, but B2 below emitted
+    # need-order with candidates:[] anyway. That prompt is UNANSWERABLE, and it
+    # is a closed loop rather than a stall: record-order refuses an empty list,
+    # so the session cannot answer it; `next` returns it again on every call;
+    # gate-drive-loop.sh treats any non-done/pause action as actionable work and
+    # blocks the stop for it; and keepawake_apply('active') holds the machine
+    # awake over a run containing no work at all.
+    #
+    # Observed 2026-08-25: the last blueprint was archived, blueprints/ held only
+    # _archive/, and the driver could not end its turn — the gate demanded it
+    # "do the next thing NOW" over zero candidates.
+    #
+    # 'done' asserts "every in-scope blueprint is done-or-parked". That is
+    # vacuously true of an empty scope, and it settles keep-awake, which is what
+    # an empty scope actually needs. This runs BEFORE B2 so the degenerate case
+    # never reaches the ordering logic at all.
+    if (!@candidates) {
+        _append_run_log($dsdir, 'DONE (nothing in scope: no blueprint matches the scope spec)');
+        print _encode_action({ action => 'done' }), "\n";
+        keepawake_apply('settled', $dsdir, $opts);
+        return 0;
+    }
+
     # B2: no order recorded → need-order
     unless (defined $order && @$order) {
         my $action = { action => 'need-order', candidates => \@candidates };
@@ -850,6 +875,37 @@ sub _cmd_record_order {
     my $now   = $opts->{now}->();
     my $dsdir = "$data/.drive-solo";
     make_path($dsdir) unless -d $dsdir;
+
+    # Every name GIVEN must name a real blueprint.
+    #
+    # The omission check immediately below is exhaustive about what is MISSING
+    # and said nothing whatsoever about what is PRESENT, so any string that
+    # reached @argv was persisted verbatim as a blueprint name -- including a
+    # flag. This machine's order.json held
+    #     {"order":["--order","tui-operator-feedback"], ...}
+    # from a `record-order --order <bp>` invocation. The damage is silent, not
+    # loud: the B3 walk looks for a blueprint literally named "--order", finds no
+    # blueprint.md, and parse_dag(undef) => {} makes blueprint_settled trivially
+    # TRUE -- so the bogus entry reports itself settled and the run walks on. It
+    # is the same false-settled class B2a documents, entered through the writer
+    # rather than the reader, which is why fixing it there was not enough.
+    #
+    # Parked blueprints are accepted: a park excludes a blueprint from being
+    # DRIVEN, not from existing, and its directory is still on disk. A name that
+    # matches no directory at all is the error.
+    {
+        my $bpbase = "$data/blueprints";
+        my @unknown = grep { !( -f "$bpbase/$_/blueprint.md" ) } @$bps;
+        if (@unknown) {
+            print STDERR "bp-drive-next record-order: not a blueprint:\n";
+            print STDERR "  - $_\n" for @unknown;
+            print STDERR "Each argument must be a blueprint directory name under\n"
+                       . "  $bpbase/\n"
+                       . "(record-order takes bare names, no flags -- a flag recorded as a\n"
+                       . "blueprint name reports itself settled and is never driven).\n";
+            return 2;
+        }
+    }
 
     # An order that OMITS a blueprint still holding non-terminal packages silently
     # drops that work: the `next` walk iterates the order, so an omitted blueprint
