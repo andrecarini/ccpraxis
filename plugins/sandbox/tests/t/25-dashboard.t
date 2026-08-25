@@ -1252,29 +1252,59 @@ is(Dashboard::activity_capacity({ %st, status => 'exited' }, 28, 120),
     my $floor24 = 3;
     my %exited = (%st, status => 'exited');
 
-    my $below80 = Dashboard::activity_capacity(\%st, 30, 80);
-    is($below80, $floor24,
-        'AC-11 threshold precondition: 30x80 -- one row below the differential threshold, capacity is still exactly at the floor (proves the dead band, not a coincidence)');
-    is(Dashboard::activity_capacity(\%exited, 30, 80), $below80,
-        'AC-11 threshold: 30x80 -- one row BELOW the threshold, a status alert costs NOTHING (still inside the dead band)');
+    # THE THRESHOLD IS LOCATED, NOT PASTED.
+    #
+    # This block's comment has always said the threshold was "measured
+    # exhaustively (row 11-80 scan)" -- but only the ANSWER was written down
+    # (30/31 at 80 cols, 27/28 at 120). That answer is a function of how tall
+    # the panels above Activity happen to be, so it moved by one row the moment
+    # the Providers panel lost a line (Go and Zen nested under one OpenCode
+    # heading, 2026-08-25) and this block went red over a change that did not
+    # touch the dead band at all.
+    #
+    # The PROPERTY is what deserves pinning: there is a contiguous dead band in
+    # which a status alert costs nothing, it ends at exactly one row count, and
+    # from there on the alert costs exactly one row. So do the scan the comment
+    # describes, then assert the shape around whatever it finds.
+    my $find_threshold = sub {
+        my ($cols) = @_;
+        for my $rows (11 .. 80) {
+            my $base  = Dashboard::activity_capacity(\%st, $rows, $cols);
+            my $alert = Dashboard::activity_capacity(\%exited, $rows, $cols);
+            return $rows if $base > $floor24 && $alert == $base - 1;
+        }
+        return undef;
+    };
 
-    my $at80 = Dashboard::activity_capacity(\%st, 31, 80);
-    cmp_ok($at80, '>', $floor24,
-        'AC-11 threshold precondition: 31x80 -- capacity has genuinely left the floor (not still clamped)');
-    is(Dashboard::activity_capacity(\%exited, 31, 80), $at80 - 1,
-        'AC-11 threshold: 31x80 -- the FIRST row count where a status alert costs exactly one more row again');
+    for my $cols (80, 120) {
+        my $thr = $find_threshold->($cols);
+        ok(defined $thr, "AC-11 threshold: a differential threshold exists at ${cols} cols (scan 11..80)");
+        next unless defined $thr;
 
-    my $below120 = Dashboard::activity_capacity(\%st, 27, 120);
-    is($below120, $floor24,
-        'AC-11 threshold precondition: 27x120 -- one row below the differential threshold (two-column), capacity is still exactly at the floor');
-    is(Dashboard::activity_capacity(\%exited, 27, 120), $below120,
-        'AC-11 threshold: 27x120 -- one row BELOW the threshold (two-column), a status alert costs NOTHING');
+        my $below = Dashboard::activity_capacity(\%st, $thr - 1, $cols);
+        is($below, $floor24,
+            "AC-11 threshold precondition: @{[$thr-1]}x$cols -- one row below the threshold, capacity is still "
+          . "exactly at the floor (proves the dead band, not a coincidence)");
+        is(Dashboard::activity_capacity(\%exited, $thr - 1, $cols), $below,
+            "AC-11 threshold: @{[$thr-1]}x$cols -- one row BELOW the threshold, a status alert costs NOTHING");
 
-    my $at120 = Dashboard::activity_capacity(\%st, 28, 120);
-    cmp_ok($at120, '>', $floor24,
-        'AC-11 threshold precondition: 28x120 -- capacity has genuinely left the floor (not still clamped)');
-    is(Dashboard::activity_capacity(\%exited, 28, 120), $at120 - 1,
-        'AC-11 threshold: 28x120 -- the FIRST row count where a status alert costs exactly one more row again (two-column)');
+        my $at = Dashboard::activity_capacity(\%st, $thr, $cols);
+        cmp_ok($at, '>', $floor24,
+            "AC-11 threshold precondition: ${thr}x$cols -- capacity has genuinely left the floor (not still clamped)");
+        is(Dashboard::activity_capacity(\%exited, $thr, $cols), $at - 1,
+            "AC-11 threshold: ${thr}x$cols -- the FIRST row count where a status alert costs exactly one more row again");
+
+        # The dead band is CONTIGUOUS below the threshold -- no stray row where
+        # the differential flickers on and off. This is the half the pasted
+        # answer could never assert.
+        my @leaks = grep {
+            Dashboard::activity_capacity(\%exited, $_, $cols)
+              != Dashboard::activity_capacity(\%st, $_, $cols)
+        } (11 .. $thr - 1);
+        is_deeply(\@leaks, [],
+            "AC-11 threshold: the dead band below ${thr}x$cols is contiguous -- no row count inside it "
+          . "charges for the alert");
+    }
 }
 {
     # s06-panel-semantics + package 06 (Decision 9): the Backpack panel is no

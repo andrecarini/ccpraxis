@@ -1344,7 +1344,15 @@ sub seg_has { my ($seg, $tag) = @_; return scalar(grep { $_->[0] eq $tag } @{ $s
     # pattern is FULLY anchored (\A/\z, not ^/$) so no multi-line render fragment
     # and no merely-OSC-prefixed string can slip through.  The wrap-check itself
     # is unchanged; nothing else is excused.
-    my $OSC_TITLE = qr/\A\e\]0;[\x20-\x7E]*\a\z/;
+    # PAYLOAD CLASS WIDENED 2026-08-25, NARROWNESS PRESERVED. The title's lead
+    # character now animates through the ten braille frames, so the payload is
+    # no longer pure ASCII and /[\x20-\x7E]/ rejected a legitimate emit. What
+    # this exception must never admit is a RENDER FRAGMENT smuggled inside OSC
+    # delimiters -- and every render fragment contains ESC (\x1B), so excluding
+    # control bytes keeps the counter-fixture below passing for the same reason
+    # the ASCII class did. The project name, where operator-supplied text
+    # enters, is still hard-clamped to ASCII inside window_title itself.
+    my $OSC_TITLE = qr/\A\e\]0;[^\x00-\x1F\x7F]*\a\z/;
     my $unwrapped = sub {
         return scalar grep { $_ !~ $OSC_TITLE && (!/^\e\[\?2026h/ || !/\e\[\?2026l$/) } @_;
     };

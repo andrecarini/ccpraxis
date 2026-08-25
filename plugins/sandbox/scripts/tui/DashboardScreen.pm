@@ -991,7 +991,7 @@ sub _spend_claude_spans {
     $c = {} unless ref($c) eq 'HASH';
     my $state = (defined($c->{state}) && $c->{state} eq 'ok') ? 'ok' : 'unreadable';
     my ($role, $key) = _spend_state_style($state);
-    my @spans = ( { text => _status_glyph($key) . ' ', role => $role }, { text => pad_label('Claude', 6), role => 'text.muted' } );
+    my @spans = ( { text => _status_glyph($key) . ' ', role => $role } );
     if ($state eq 'ok') {
         my @parts;
         for my $w (ref($c->{windows}) eq 'ARRAY' ? @{ $c->{windows} } : ()) {
@@ -1013,7 +1013,7 @@ sub _spend_go_spans {
     $g = {} unless ref($g) eq 'HASH';
     my $state = (defined($g->{state}) && $g->{state} =~ /^(?:absent|unreadable|exhausted|ok)$/) ? $g->{state} : 'absent';
     my ($role, $key) = _spend_state_style($state);
-    my @spans = ( { text => _status_glyph($key) . ' ', role => $role }, { text => pad_label('Go', 6), role => 'text.muted' } );
+    my @spans = ( { text => _status_glyph($key) . ' ', role => $role } );
     if ($state eq 'absent') {
         push @spans, { text => 'not configured', role => 'text.muted' };
     } elsif ($state eq 'unreadable') {
@@ -1044,7 +1044,7 @@ sub _spend_zen_spans {
     $z = {} unless ref($z) eq 'HASH';
     my $state = (defined($z->{state}) && $z->{state} =~ /^(?:disabled|absent|unreadable|exhausted|ok)$/) ? $z->{state} : 'disabled';
     my ($role, $key) = _spend_state_style($state);
-    my @spans = ( { text => _status_glyph($key) . ' ', role => $role }, { text => pad_label('Zen', 6), role => 'text.muted' } );
+    my @spans = ( { text => _status_glyph($key) . ' ', role => $role } );
     if ($state eq 'disabled') {
         push @spans, { text => 'disabled', role => 'text.muted' };
     } elsif ($state eq 'absent') {
@@ -1162,47 +1162,62 @@ sub _claude_code_block {
         push @lines, _indent_line(_FACT_INDENT(), $acc_row) if @$acc_row;
     }
 
-    my $spend_line;
-    if ($spend_present) {
-        my ($spans, $protect) = _spend_claude_spans($claude_spend);
-        $spend_line = _clip_line($spans, $protect, $w);
-    } else {
-        $spend_line = [ { text => _status_glyph('warn') . ' ', role => 'state.warn' },
-                        { text => 'not collected yet', role => 'text.muted' } ];
-    }
-    push @lines, _indent_line(_FACT_INDENT(), $spend_line);
+    push @lines, _spend_fact_row('usage', \&_spend_claude_spans, $claude_spend, $spend_present, $w);
 
     return \@lines;
 }
 
-sub _opencode_go_block {
-    my ($go_spend, $spend_present, $w) = @_;
-    my @lines = ( _provider_heading('OpenCode Go') );
-    my $spend_line;
-    if ($spend_present) {
-        my ($spans, $protect) = _spend_go_spans($go_spend);
-        $spend_line = _clip_line($spans, $protect, $w);
-    } else {
-        $spend_line = [ { text => _status_glyph('warn') . ' ', role => 'state.warn' },
-                        { text => 'not collected yet', role => 'text.muted' } ];
+# _spend_fact_row($label, $builder, $data, $present, $w) -> ONE indented,
+# label-gutter-aligned line.
+#
+# THE ALIGNMENT BUG THIS FIXES. The spend line was the only row in the panel
+# that did not use the shared label gutter. access/refresh/account are built
+# with row(), which pads to LABEL_GUTTER; the spend line was built by hand as
+# glyph + pad_label('Claude', 6) + value, a narrower ad-hoc column. So the
+# operator saw
+#
+#     account       max / default_claude_max_20x
+#     x Claude   unreadable -- usage endpoint unreadable
+#
+# with the two values starting in different places. The provider name in that
+# row was redundant anyway -- the heading directly above it already says
+# "Claude Code" -- and the comment above _claude_code_block has said since t02
+# that it "repeated the provider name that the heading immediately above it
+# already gives, padded into a column that exists nowhere else". It was removed
+# from the wording and left in the layout.
+#
+# Now every row in the panel goes through row(), so there is ONE column, and
+# the status glyph leads the VALUE rather than the line -- which also stops the
+# glyph from shifting the text after it by a variable amount.
+sub _spend_fact_row {
+    my ($label, $builder, $data, $present, $w) = @_;
+    my @value;
+    if ($present) {
+        my ($spans, $protect) = $builder->($data);
+        @value = @$spans;
+        my $line = row({ label => $label, value => \@value });
+        return _indent_line(_FACT_INDENT(), _clip_line($line, $protect, $w));
     }
-    push @lines, _indent_line(_FACT_INDENT(), $spend_line);
-    return \@lines;
+    @value = ( { text => _status_glyph('warn') . ' ', role => 'state.warn' },
+               { text => 'not collected yet', role => 'text.muted' } );
+    return _indent_line(_FACT_INDENT(), row({ label => $label, value => \@value }));
 }
 
-sub _opencode_zen_block {
-    my ($zen_spend, $spend_present, $w) = @_;
-    my @lines = ( _provider_heading('OpenCode Zen') );
-    my $spend_line;
-    if ($spend_present) {
-        my ($spans, $protect) = _spend_zen_spans($zen_spend);
-        $spend_line = _clip_line($spans, $protect, $w);
-    } else {
-        $spend_line = [ { text => _status_glyph('warn') . ' ', role => 'state.warn' },
-                        { text => 'not collected yet', role => 'text.muted' } ];
-    }
-    push @lines, _indent_line(_FACT_INDENT(), $spend_line);
-    return \@lines;
+# ONE "OpenCode" GROUP, with Go and Zen as facts inside it.
+#
+# They were two top-level provider blocks -- "OpenCode Go" and "OpenCode Zen" --
+# each with a heading and one fact beneath it, four lines to say two things, and
+# both headings repeating the word the reader already read. They are two
+# products of one provider, so they nest under it: the shared word is said once,
+# the two facts align with each other and with everything else in the panel, and
+# the panel gets two rows of its height back.
+sub _opencode_block {
+    my ($go_spend, $zen_spend, $spend_present, $w) = @_;
+    return [
+        _provider_heading('OpenCode'),
+        _spend_fact_row('Go',  \&_spend_go_spans,  $go_spend,  $spend_present, $w),
+        _spend_fact_row('Zen', \&_spend_zen_spans, $zen_spend, $spend_present, $w),
+    ];
 }
 
 sub _providers_body {
@@ -1231,8 +1246,9 @@ sub _providers_body {
     }
 
     push @lines, @{ _claude_code_block($state->{tokens}, $spend ? $spend->{claude} : undef, $spend ? 1 : 0, $w) };
-    push @lines, @{ _opencode_go_block($spend ? $spend->{go} : undef, $spend ? 1 : 0, $w) };
-    push @lines, @{ _opencode_zen_block($spend ? $spend->{zen} : undef, $spend ? 1 : 0, $w) };
+    push @lines, @{ _opencode_block($spend ? $spend->{go}  : undef,
+                                    $spend ? $spend->{zen} : undef,
+                                    $spend ? 1 : 0, $w) };
 
     # (t11's hot-reload rows are a BANNER, not a panel row -- see
     # hot_reload_banners below. They belong above the panels, with the other

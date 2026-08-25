@@ -148,23 +148,39 @@ sub runs_n {
         skip('no Providers panel to inspect', 11) unless $providers;
         my $texts = panel_line_texts($providers);
 
-        my ($cc_i)  = grep { defined($texts->[$_]) && $texts->[$_] =~ /Claude Code/ } (0 .. $#$texts);
-        my ($go_i)  = grep { defined($texts->[$_]) && $texts->[$_] =~ /OpenCode Go/ } (0 .. $#$texts);
-        my ($zen_i) = grep { defined($texts->[$_]) && $texts->[$_] =~ /OpenCode Zen/ } (0 .. $#$texts);
-        ok(defined $cc_i,  'AC2: a "Claude Code" heading line exists in Providers');
-        ok(defined $go_i,  'AC2: an "OpenCode Go" heading line exists in Providers');
-        ok(defined $zen_i, 'AC2: an "OpenCode Zen" heading line exists in Providers');
+        # RESTRUCTURED 2026-08-25 (operator request): Go and Zen are two
+        # products of ONE provider, so they are facts nested under a single
+        # "OpenCode" heading rather than two top-level headings that each
+        # repeat the word. Four lines became three, and -- because they are now
+        # ordinary fact rows -- their values align with every other value in
+        # the panel instead of sitting in a private, narrower column.
+        #
+        # Behavior 2 and 3 are unchanged as PROPERTIES: every provider has a
+        # heading, headings appear in a stable order, and a heading carries no
+        # label gutter and is indented more shallowly than the facts beneath
+        # it. Only the set of headings changed.
+        my ($cc_i) = grep { defined($texts->[$_]) && $texts->[$_] =~ /Claude Code/ } (0 .. $#$texts);
+        my ($oc_i) = grep { defined($texts->[$_]) && $texts->[$_] =~ /^\s*OpenCode\s*$/ } (0 .. $#$texts);
+        ok(defined $cc_i, 'AC2: a "Claude Code" heading line exists in Providers');
+        ok(defined $oc_i, 'AC2: a single "OpenCode" heading line exists in Providers');
+
+        # ...and Go and Zen survive as FACTS under it, not as vanished content.
+        my ($go_i)  = grep { defined($texts->[$_]) && $texts->[$_] =~ /^\s+Go\b/ }  (0 .. $#$texts);
+        my ($zen_i) = grep { defined($texts->[$_]) && $texts->[$_] =~ /^\s+Zen\b/ } (0 .. $#$texts);
+        ok(defined $go_i,  'AC2: a "Go" fact row exists (nested, not deleted)');
+        ok(defined $zen_i, 'AC2: a "Zen" fact row exists (nested, not deleted)');
 
       SKIP: {
-            skip('a heading is missing', 1) unless defined($cc_i) && defined($go_i) && defined($zen_i);
-            ok($cc_i < $go_i && $go_i < $zen_i,
-                'AC2/Behavior2: the three headings appear in the order Claude Code, OpenCode Go, OpenCode Zen');
+            skip('a heading is missing', 1) unless defined($cc_i) && defined($oc_i)
+                                              && defined($go_i)  && defined($zen_i);
+            ok($cc_i < $oc_i && $oc_i < $go_i && $go_i < $zen_i,
+                'AC2/Behavior2: Claude Code, then OpenCode, then its Go and Zen facts, in that order');
         }
 
         # Behavior 3 -- referent-clarity mechanics: a heading carries no
         # ' : ' gutter and is more shallowly indented than the fact row(s)
         # nested under it.
-        for my $pair ([$cc_i, 'Claude Code'], [$go_i, 'OpenCode Go'], [$zen_i, 'OpenCode Zen']) {
+        for my $pair ([$cc_i, 'Claude Code'], [$oc_i, 'OpenCode']) {
             my ($idx, $label) = @$pair;
           SKIP: {
                 skip("no $label heading found", 2) unless defined $idx;
@@ -349,8 +365,13 @@ sub runs_n {
         skip('no Providers panel', 5) unless $providers;
         my $texts = panel_line_texts($providers);
         ok((grep { /Claude Code/ } @$texts), 'Behavior8: Claude Code heading still renders with spend absent');
-        ok((grep { /OpenCode Go/ } @$texts), 'Behavior8: OpenCode Go heading still renders with spend absent');
-        ok((grep { /OpenCode Zen/ } @$texts), 'Behavior8: OpenCode Zen heading still renders with spend absent');
+        # See the AC2 note above: one "OpenCode" heading with Go and Zen as
+        # facts under it. Behavior8's property is that NOTHING disappears when
+        # $state->{spend} is absent entirely, so all three are still asserted --
+        # the heading and both products.
+        ok((grep { /^\s*OpenCode\s*$/ } @$texts), 'Behavior8: the OpenCode heading still renders with spend absent');
+        ok((grep { /^\s+Go\b/  } @$texts), 'Behavior8: the Go fact row still renders with spend absent');
+        ok((grep { /^\s+Zen\b/ } @$texts), 'Behavior8: the Zen fact row still renders with spend absent');
         # AMENDED BY t02-spend-persistence (blueprint tui-operator-feedback).
         # The footnote no longer mentions a RUN, so /\brun\b/ no longer
         # matches it. That is the change, not a casualty of it: under
