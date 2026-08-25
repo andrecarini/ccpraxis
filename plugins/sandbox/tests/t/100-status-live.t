@@ -275,8 +275,12 @@ sub _run_live {
         my $frame_ns = eval { Dashboard::compose_frame($state_no_spin, 12, $cols) };
         SKIP: {
             skip 'compose_frame died', 1 if $@ || !$frame_ns;
-            like($frame_ns->[0]{text}, qr/\[running\]$/,
-                "AC-5/B5 (cols=$cols): absent spinner_idx -> title row still ends '[running]' unchanged");
+            # The status block LEADS the row (operator request, 2026-08-25) --
+            # it used to trail it. Absent spinner_idx still means no spinner
+            # glyph and no stray space, which is what B5 is really about; only
+            # the anchor moved from end-of-row to start-of-row.
+            like($frame_ns->[0]{text}, qr/^\[running\] /,
+                "AC-5/B5 (cols=$cols): absent spinner_idx -> title row still leads '[running]' with no spinner glyph");
         }
     }
 }
@@ -306,6 +310,14 @@ sub _run_live {
     Dashboard::run(
         color => 0, beat_interval => 9999, state_interval => 0,
         tick_interval => $tick_int, max_ticks => 12,
+        # The spinner period is no longer the render tick. In production it is
+        # 500ms (SPINNER_PERIOD_SECS) -- the render tick is an input-latency
+        # decision and has no business setting animation speed. This section
+        # needs many frames inside a sub-second fake-clock window, so it drives
+        # the period explicitly; the property under test is unchanged (the index
+        # follows the WALL CLOCK, never the tick count), only the constant it
+        # follows is now stated rather than borrowed.
+        spinner_period => $tick_int,
         now       => sub { $clock },
         sleep_for => sub { $clock += $_[0] },
         read_key  => sub { undef },
@@ -374,6 +386,11 @@ sub _run_live {
     my @calls;                                    # every $out call, in order
     Dashboard::run(
         color => 0, tick_interval => 0.15, max_ticks => 5,
+        # Same reason as AC-6a: the spinner period is 500ms in production and is
+        # no longer borrowed from the render tick, so this section states the
+        # period it needs to see a frame change on every idle tick inside its
+        # sub-second window.
+        spinner_period => 0.15,
         beat_interval => 9999, state_interval => 0,
         now => sub { $clock }, sleep_for => sub { $clock += $_[0] },
         read_key => sub { undef }, term_size => sub { (80, 20) },
@@ -405,7 +422,17 @@ sub _run_live {
             unlike($c, qr/\e\]0;/, 'AC-11/B13: a frame call never contains an OSC title sequence');
         }
         if ($c =~ /\A\e\]0;/) {
-            like($c, qr/\A\e\]0;[\x20-\x7E]*\a\z/, 'AC-11/B13: an OSC call matches /\A\e\]0;[\\x20-\\x7E]*\a\z/ exactly');
+            # The title's LEAD CHARACTER animates through the same ten braille
+            # frames as the in-screen spinner (operator request, 2026-08-25), so
+            # the payload is no longer pure ASCII. What still matters -- and is
+            # what this assertion was really protecting -- is that the OSC
+            # sequence is well-formed and carries NO control bytes: no ESC, no
+            # BEL, nothing below 0x20 that could terminate the sequence early or
+            # smuggle a second one. The project name itself is still hard-
+            # clamped to ASCII inside window_title, which is where operator-
+            # supplied text (and therefore any encoding surprise) enters.
+            like($c, qr/\A\e\]0;[^\x00-\x1F\x7F]*\a\z/,
+                'AC-11/B13: an OSC call is well-formed and control-byte-free');
             unlike($c, qr/\e\[\?2026h/, 'AC-11/B13: an OSC call never contains a frame-open sequence');
         }
     }
@@ -423,35 +450,35 @@ sub _run_live {
 # instruction (S2.2's "bp-test-writer hard-codes these" table).
 # ===========================================================================
 {
-    is(eval { Dashboard::window_title({ project_name => 'demo', status => 'running' }) }, '* demo',
-        "AC-8/B8: window_title(running) eq '* demo'");
+    is(eval { Dashboard::window_title({ project_name => 'demo', status => 'running' }) }, '* demo' . " - ccpraxis sandbox",
+        "AC-8/B8: window_title(running) eq '* demo - ccpraxis sandbox'");
 
     for my $status (qw(paused created restarting stopping stopped)) {
-        is(eval { Dashboard::window_title({ project_name => 'demo', status => $status }) }, '- demo',
-            "AC-8: window_title(status=$status) eq '- demo' (stopped family)");
+        is(eval { Dashboard::window_title({ project_name => 'demo', status => $status }) }, '- demo' . " - ccpraxis sandbox",
+            "AC-8: window_title(status=$status) eq '- demo - ccpraxis sandbox' (stopped family)");
     }
     for my $status (qw(dead removing unknown exited)) {
-        is(eval { Dashboard::window_title({ project_name => 'demo', status => $status }) }, 'x demo',
-            "AC-8: window_title(status=$status) eq 'x demo' (exited family)");
+        is(eval { Dashboard::window_title({ project_name => 'demo', status => $status }) }, 'x demo' . " - ccpraxis sandbox",
+            "AC-8: window_title(status=$status) eq 'x demo - ccpraxis sandbox' (exited family)");
     }
-    is(eval { Dashboard::window_title({ project_name => 'demo', status => 'running', needs_you => 1 }) }, '! demo',
-        "AC-8: window_title(running, needs_you=1) eq '! demo'");
-    is(eval { Dashboard::window_title({ project_name => 'demo', container_gone => 1 }) }, '? demo',
-        "AC-8: window_title(container_gone=1) eq '? demo'");
+    is(eval { Dashboard::window_title({ project_name => 'demo', status => 'running', needs_you => 1 }) }, '! demo' . " - ccpraxis sandbox",
+        "AC-8: window_title(running, needs_you=1) eq '! demo - ccpraxis sandbox'");
+    is(eval { Dashboard::window_title({ project_name => 'demo', container_gone => 1 }) }, '? demo' . " - ccpraxis sandbox",
+        "AC-8: window_title(container_gone=1) eq '? demo - ccpraxis sandbox'");
 
     # Precedence: gone > exited > stopped > escalations > running > fallback.
-    is(eval { Dashboard::window_title({ project_name => 'demo', status => 'running', container_gone => 1 }) }, '? demo',
+    is(eval { Dashboard::window_title({ project_name => 'demo', status => 'running', container_gone => 1 }) }, '? demo' . " - ccpraxis sandbox",
         "AC-8: precedence -- container_gone=1 with status='running' -> '?' (gone beats running)");
-    is(eval { Dashboard::window_title({ project_name => 'demo', status => 'exited', needs_you => 3 }) }, 'x demo',
+    is(eval { Dashboard::window_title({ project_name => 'demo', status => 'exited', needs_you => 3 }) }, 'x demo' . " - ccpraxis sandbox",
         "AC-8: precedence -- status='exited' with needs_you=3 -> 'x' (exited beats escalations)");
-    is(eval { Dashboard::window_title({ project_name => 'demo', status => 'stopped', needs_you => 5 }) }, '- demo',
+    is(eval { Dashboard::window_title({ project_name => 'demo', status => 'stopped', needs_you => 5 }) }, '- demo' . " - ccpraxis sandbox",
         "AC-8: precedence -- status='stopped' with needs_you=5 -> '-' (stopped beats escalations)");
 
     # needs_you non-numeric / negative / undef counts as 0.
     for my $nc (undef, -3, 'abc', 0) {
         my $label = defined $nc ? "'$nc'" : 'undef';
-        is(eval { Dashboard::window_title({ project_name => 'demo', status => 'running', needs_you => $nc }) }, '* demo',
-            "AC-8: needs_you=$label counts as 0 -> '* demo' (not '!')");
+        is(eval { Dashboard::window_title({ project_name => 'demo', status => 'running', needs_you => $nc }) }, '* demo' . " - ccpraxis sandbox",
+            "AC-8: needs_you=$label counts as 0 -> '* demo - ccpraxis sandbox' (not '!')");
     }
 }
 
@@ -465,24 +492,24 @@ sub _run_live {
     my $ascii_re = qr/\A[\x20-\x7E]{1,80}\z/;
 
     # B10: no project name -> no trailing space.
-    is(eval { Dashboard::window_title({ status => 'running' }) }, '*',
+    is(eval { Dashboard::window_title({ status => 'running' }) }, "* - ccpraxis sandbox",
         "AC-9/B10: window_title(no project_name) eq '*' (no trailing space)");
 
     # B15 (edge case): {} -> title '?'.
-    is(eval { Dashboard::window_title({}) }, '?', "AC-9: window_title({}) eq '?'");
+    is(eval { Dashboard::window_title({}) }, "? - ccpraxis sandbox", "AC-9: window_title({}) eq '?'");
 
     # Malformed %state -> treated as {} -> '?'.
     for my $case ([undef, 'undef'], ['not a hashref', 'plain string'], [[1,2,3], 'arrayref'], [42, 'number']) {
         my ($input, $label) = @$case;
         my $got = eval { Dashboard::window_title($input) };
         is($@, '', "AC-9: window_title($label) does not die");
-        is($got, '?', "AC-9: window_title($label) treated as {} -> '?'");
+        is($got, "? - ccpraxis sandbox", "AC-9: window_title($label) treated as {} -> '?'");
     }
 
     # B9: non-ASCII project name (decoded-char path and UTF-8-byte path).
-    is(eval { Dashboard::window_title({ project_name => "Andr\x{E9}", status => 'running' }) }, '* Andr?',
+    is(eval { Dashboard::window_title({ project_name => "Andr\x{E9}", status => 'running' }) }, "* Andr? - ccpraxis sandbox",
         "AC-9/B9: window_title(project_name='Andr\\x{E9}' decoded) eq '* Andr?'");
-    is(eval { Dashboard::window_title({ project_name => encode('UTF-8', "Andr\x{E9}"), status => 'running' }) }, '* Andr?',
+    is(eval { Dashboard::window_title({ project_name => encode('UTF-8', "Andr\x{E9}"), status => 'running' }) }, "* Andr? - ccpraxis sandbox",
         "AC-9/B9: window_title(project_name='Andr\\x{E9}' UTF-8 bytes) eq '* Andr?'");
 
     # B9: control bytes, an SGR escape, and a literal BEL in the project name.
@@ -506,7 +533,7 @@ sub _run_live {
         is($@, '', 'AC-9/B9: window_title(500-char project name) does not die');
         like($got, $ascii_re, 'AC-9/B9: window_title(500-char project name) matches the ASCII-safe regex');
         is(length($got // ''), 80, 'AC-9/B9: window_title(500-char project name) truncates to exactly 80 chars');
-        is($got, '* ' . ('x' x 78), "AC-9/B9: window_title(500-char project name) eq '* ' + 78 x's (plain truncation)");
+        is($got, "* " . ("x" x 59) . " - ccpraxis sandbox", "AC-9/B9: window_title(500-char project name) eq '* ' + 78 x's (plain truncation)");
     }
 
     is(scalar(@warnings), 0, 'AC-9: no warnings emitted across any window_title call above');
@@ -540,8 +567,15 @@ sub _run_live {
     is(scalar(@osc_b12), 2, 'AC-10/B12: exactly two OSC payloads across a status-flip run');
     SKIP: {
         skip 'did not get exactly two OSC payloads', 2 unless scalar(@osc_b12) == 2;
-        is($osc_b12[0], "\e]0;* demo\a", "AC-10/B12: first OSC payload is exactly '* demo' (running)");
-        is($osc_b12[1], "\e]0;x demo\a", "AC-10/B12: second OSC payload is exactly 'x demo' (exited)");
+        # RUNNING ANIMATES; every attention state keeps its literal character.
+        # _run_live's clock starts at 0, so the first payload carries title
+        # frame int(0 / TITLE_SPINNER_PERIOD_SECS) % 10 == 0. Derived from the
+        # same @SPINNER_BYTES fixture AC-6b uses rather than pasted, so a change
+        # to the frame ORDER cannot pass here by coincidence.
+        is($osc_b12[0], "\e]0;$SPINNER_BYTES[0] demo - ccpraxis sandbox\a",
+            "AC-10/B12: first OSC payload carries title spinner frame 0 (running animates)");
+        is($osc_b12[1], "\e]0;x demo - ccpraxis sandbox\a",
+            "AC-10/B12: second OSC payload is exactly 'x demo - ccpraxis sandbox' (exited)");
     }
 }
 

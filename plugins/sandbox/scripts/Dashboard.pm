@@ -56,6 +56,7 @@ use warnings;
 use JSON::PP ();
 use File::Spec ();
 use Time::Local ();
+use Time::HiRes ();
 use Encode ();
 
 # tui:: consumption (blueprint unified-tui-design-system, package
@@ -683,13 +684,26 @@ sub window_title {
     my $needs_you = $state->{needs_you};
     $needs_you = 0 if !defined $needs_you || ref $needs_you || $needs_you !~ /^-?\d+(?:\.\d+)?$/;
 
+    # THE LEAD CHARACTER ANIMATES ONLY WHERE ANIMATION MEANS SOMETHING.
+    #
+    # The operator asked for "proper animation on the first character, just
+    # like the running spinner". Taken literally that would animate in every
+    # state -- and the lead character is not decoration: it is the ONLY status
+    # signal that survives into a taskbar button or an alt-tab list, where the
+    # rest of the title is truncated away. Spinning it unconditionally would
+    # trade the one place you can see "this exited an hour ago" for motion.
+    #
+    # So: running animates (motion is exactly what "running" means), and every
+    # attention state keeps its literal, glanceable character. The states that
+    # need you to look are the states that stop moving, which is a stronger
+    # signal than either half alone.
     my $char;
-    if ($state->{container_gone})            { $char = '?'; }
-    elsif ($role eq 'bad')                   { $char = 'x'; }
-    elsif ($role eq 'warn')                  { $char = '-'; }
+    if ($state->{container_gone})             { $char = '?'; }
+    elsif ($role eq 'bad')                    { $char = 'x'; }
+    elsif ($role eq 'warn')                   { $char = '-'; }
     elsif ($role eq 'good' && $needs_you > 0) { $char = '!'; }
-    elsif ($role eq 'good')                  { $char = '*'; }
-    else                                     { $char = '?'; }
+    elsif ($role eq 'good')                   { $char = _title_spinner_char($state->{title_spinner_idx}); }
+    else                                      { $char = '?'; }
 
     # MINOR-3 (red-team step 6): a ref project_name reaches _decode_str's
     # substr() as an lvalue and warns ("Attempt to use reference as lvalue in
@@ -701,8 +715,60 @@ sub window_title {
     $name =~ s/^\s+//;
     $name =~ s/\s+$//;
 
+    # "<char> <project> - ccpraxis sandbox" (operator request, 2026-08-25).
+    #
+    # The suffix goes LAST, not first, because window titles are truncated from
+    # the right in every taskbar this runs in. Leading with the product name
+    # would give every sandbox window the identical visible prefix and hide the
+    # project -- the only part that distinguishes one window from another.
+    # THE PROJECT NAME YIELDS, NOT THE SUFFIX.
+    #
+    # A naive "build it all, then substr to 80" drops the tail first, so a long
+    # project name silently ate the whole " - ccpraxis sandbox" suffix -- the
+    # part that was just asked for, gone in exactly the case where the title is
+    # under pressure. Budget the fixed parts first and clip only the name, so
+    # every title keeps its lead character and its suffix and loses only the
+    # middle, which is the one part with redundancy in it (the project name is
+    # also the first thing in the panel header).
+    my $suffix = ' - ' . PRODUCT_NAME();
+    my $budget = 80 - length($char) - 1 - length($suffix);   # -1 for the space after $char
+    $name = substr($name, 0, $budget) if $budget > 0 && length($name) > $budget;
+    $name = '' if $budget <= 0;
+
     my $title = length($name) ? "$char $name" : $char;
+    $title .= $suffix;
     return substr($title, 0, 80);
+}
+
+# The ten braille frames, resolved through Theme like every other glyph so this
+# file keeps no glyph table of its own.
+#
+# THE ASCII CONTRACT IS DELIBERATELY RELAXED HERE, and only here. window_title
+# used to guarantee /\A[\x20-\x7E]{1,80}\z/ and still hard-clamps the PROJECT
+# NAME to that range just below -- an operator-supplied string is exactly where
+# an encoding surprise would come from. The lead character is ours, is one of
+# ten known code points, and is the same glyph set the TUI body already writes
+# to this terminal on every frame; a terminal that renders the in-screen
+# spinner renders this. Falls back to the old literal '*' if Theme cannot
+# resolve the frame, so the degenerate case is the previous behaviour rather
+# than an empty title.
+# _period_opt($given, $default) -> a strictly positive number. These values are
+# DIVISORS, so a 0 or a stray string is a division-by-zero or a warn-then-wrong
+# index rather than a cosmetic slip.
+sub _period_opt {
+    my ($given, $default) = @_;
+    return $default if !defined $given || ref($given) || $given !~ /^-?\d+(?:\.\d+)?$/;
+    return $default if $given <= 0;
+    return $given;
+}
+
+sub _title_spinner_char {
+    my ($idx) = @_;
+    return '*' if !defined($idx) || ref($idx) || $idx !~ /^-?\d+(?:\.\d+)?$/;
+    my $i = int($idx) % 10;
+    $i += 10 if $i < 0;
+    my $g = Theme::glyph('spinner.' . ($i + 1));
+    return (defined($g) && length($g)) ? $g : '*';
 }
 
 # oauth_role($remaining_secs) -> $role -- spec S2.2. Mirrors fmt_oauth's
@@ -1162,6 +1228,20 @@ sub _backpack_lines {
 # to read after the forced repaint, short enough that a stale claim about a
 # moment that has passed does not linger.
 use constant HOT_RELOAD_REPORT_SECS => 20;
+
+# Animation cadence, seconds per frame. The in-screen spinner reads as motion;
+# the OS window title is glanced at rather than watched, and a title that
+# rewrites five times a second is both distracting in a taskbar and a stream of
+# needless OSC writes -- so it advances through the SAME ten frames four times
+# more slowly.
+use constant SPINNER_PERIOD_SECS       => 0.5;
+use constant TITLE_SPINNER_PERIOD_SECS => 2.0;
+
+# The product name, in ONE place. It was a bare literal in two builders
+# (window_title's suffix and the in-screen header's left half) that must agree
+# -- the sort of duplication that stays correct right up until someone renames
+# one of them.
+use constant PRODUCT_NAME => 'ccpraxis sandbox';
 
 our $RUN_MAX_ROWS = 3;
 
@@ -3597,6 +3677,27 @@ sub _assemble_esc {
 sub run {
     my (%o) = @_;
     my $now        = $o{now}        || sub { time };
+    # A SEPARATE, SUB-SECOND CLOCK, and only the animations use it.
+    #
+    # $now is deliberately integer-seconds (`sub { time }`) and is injected by
+    # tests that assert exact ages and durations; it must stay that way. But
+    # spinner_idx was derived from it as int($now / $tick_int) with $tick_int
+    # = 0.2, and int(<integer> / 0.2) is always a MULTIPLE OF 5 -- so `% 10`
+    # over the ten braille frames could only ever produce index 0 or 5. The
+    # dashboard shipped a ten-frame spinner that alternated between exactly two
+    # glyphs, once per second. Nine-tenths of the frames were unreachable by
+    # arithmetic, not by configuration, which is why it looked like a glyph-table
+    # problem and was not.
+    #
+    # AN INJECTED CLOCK GOVERNS EVERYTHING. If the caller supplied `now` it has
+    # taken control of time, and a second clock ticking independently underneath
+    # it would make the animation -- and therefore the rendered frame, and
+    # therefore every repaint-count assertion -- nondeterministic in exactly the
+    # tests that exist to be deterministic. So hires_now defaults to `now` when
+    # `now` was injected, and only reaches for the real sub-second clock in
+    # production, where nobody is holding time still. A caller that genuinely
+    # wants two different clocks can still pass hires_now explicitly.
+    my $hires_now  = $o{hires_now} || $o{now} || sub { Time::HiRes::time() };
     my $sleep_for  = $o{sleep_for}  || sub { select undef, undef, undef, $_[0] };
     my $read_key   = $o{read_key}   || sub { undef };
     # s15-input-latency: an interruptible wait on input, injected alongside the
@@ -3706,7 +3807,15 @@ sub run {
     my $rc = 0;
     my $ticks = 0;
     my $last_title;                                            # undef => nothing emitted yet
-    my $spin_div = ($tick_int && $tick_int > 0) ? $tick_int : 0.2;   # never divide by zero
+    # Animation cadences, in seconds per frame. Deliberately NOT tied to
+    # $tick_int: the render tick is an input-latency decision (how fast a
+    # keystroke is noticed) and has no business setting how fast a spinner
+    # reads. Coupling them is what produced the two-frame spinner above.
+    # Injectable so a test can drive many frames inside a short fake-clock
+    # window without having to fake half a second per frame. Guarded against
+    # zero/negative/non-numeric because these are divisors.
+    my $spin_div  = _period_opt($o{spinner_period},       SPINNER_PERIOD_SECS());
+    my $title_div = _period_opt($o{title_spinner_period}, TITLE_SPINNER_PERIOD_SECS());
 
     # s15-input-latency pushback (Decision #22): a single-slot holding cell for
     # a byte that $wait_input already consumed off the input source in order to
@@ -3861,7 +3970,14 @@ sub run {
                 $state{uptime}         = $t - $start;
                 $state{pending}        = $pending;
                 $state{container_gone} = ($hb_state eq 'gone') ? 1 : 0;
-                $state{spinner_idx}    = int($t / $spin_div);   # Decision #21: WALL CLOCK, not iteration count
+                # Decision #21: WALL CLOCK, not iteration count -- but the
+                # SUB-SECOND wall clock. $t is integer seconds, and dividing an
+                # integer by 0.5 (or the old 0.2) lands on a coarse lattice that
+                # made most of the ten frames unreachable. See $hires_now.
+                my $ht = $hires_now->();
+                $ht = $t if !defined $ht || ref($ht) || $ht !~ /^-?\d+(?:\.\d+)?$/;
+                $state{spinner_idx}       = int($ht / $spin_div);
+                $state{title_spinner_idx} = int($ht / $title_div);
                 $state{oauth_remaining} = defined $state{oauth_expires_at}
                     ? $state{oauth_expires_at} - $t : undef;
                 # Transient footer notice when [c] was pressed on a non-running

@@ -275,7 +275,10 @@ my %st = (
     is($bad, 0, 'compose: ALL rows exactly $cols wide');
     is($f->[0]{role}, $TITLE_ROLE, "compose: row 0 is the title (role: $TITLE_ROLE, Theme-derived, spec S2.1)");
     like($f->[0]{text}, qr/ccpraxis sandbox/, 'compose: title text present');
-    like($f->[0]{text}, qr/\Qclaude-demo-abcd1234\E.*\[running\]/, 'compose: container+status right-justified');
+    # Status block leads, container name is right-justified (operator request,
+    # 2026-08-25 -- the two used to be adjacent at the right-hand end).
+    like($f->[0]{text}, qr/\A\[running\].*\Qclaude-demo-abcd1234\E/,
+        'compose: status leads the row, container right-justified');
     is($f->[-1]{role}, $FOOTER_ROLE, "compose: last row is the footer (role: $FOOTER_ROLE, Theme-derived, spec S2.1)");
     like($f->[-1]{text}, qr/\[q\] quit/, 'compose: footer legend present');
     my $joined = join "\n", map { $_->{text} } @$f;
@@ -830,7 +833,14 @@ my %st = (
     # chopping the title's closing "]" (the "[running" bug). \e[K must come
     # BEFORE the text, never after.
     my $tf = Dashboard::compose_frame(\%st, 6, 80);
-    like($tf->[0]{text}, qr/\[running\]$/, 'compose: title row ends with the full [running]');
+    # THE PROPERTY IS "the last cell of a full-width row survives", not
+    # "[running] is at the end". This guard exists because a trailing \e[K once
+    # erased the final cell and chopped the title's closing bracket (the
+    # "[running" bug). The status block has since moved to the head of the row,
+    # so the element occupying that last cell is now the container name -- the
+    # anchor moves with it, or the guard silently stops guarding anything.
+    like($tf->[0]{text}, qr/\Qclaude-demo-abcd1234\E$/,
+        'compose: title row ends with the full container name (last cell not erased)');
     my $tr = Dashboard::render_frame(undef, $tf, { color => 0 });
     like($tr,   qr/\e\[1;1H\e\[K/, 'render: line cleared BEFORE the text (\e[K precedes it)');
     unlike($tr, qr/\]\e\[K/,       'render: no \e[K right after "]" (last cell preserved)');
@@ -1532,7 +1542,12 @@ sub drive_per_tick {
         'D: exactly ONE tick deviates from 1 out call and it is tick 0 (the one-time initial OSC window-title emit); every later tick is exactly 1 (no spurious extra render)');
     is($fps[0], 2,
         'D: tick 0 emits exactly 2 out calls -- initial OSC window-title emit + primary render -- and no more');
-    like($e->{out}, qr/\A\e\]0;[\x20-\x7E]*\a\e\[\?2026h/,
+    # The title's lead character animates through the ten braille frames
+    # (operator request, 2026-08-25), so the payload is no longer pure ASCII.
+    # The property here is the SHAPE -- an OSC title emit followed immediately
+    # by a sync-wrapped frame -- so the payload class widens to "any byte that
+    # cannot terminate the sequence or start another", i.e. no control bytes.
+    like($e->{out}, qr/\A\e\]0;[^\x00-\x1F\x7F]*\a\e\[\?2026h/,
         'D: tick 0\'s extra out call IS specifically the OSC window-title emit (title text, then immediately a sync-wrapped frame) -- not some other spurious render that happens to also produce a count of 2');
 }
 
@@ -1585,6 +1600,13 @@ sub drive_per_tick {
         beat_interval  => 9999,
         state_interval => 999,
         tick_interval  => 0.25,
+        # The spinner period is 500ms in production and is no longer borrowed
+        # from the render tick (a render tick is an input-latency decision, not
+        # an animation speed). This block asserts that a quiet tick repaints
+        # EXACTLY the title row -- which requires the spinner to advance on
+        # every tick -- so it states the period it needs rather than inheriting
+        # one that would leave three ticks in four with nothing to repaint.
+        spinner_period => 0.25,
         color          => 0,
         max_ticks      => 4,
         now            => sub { $clock },

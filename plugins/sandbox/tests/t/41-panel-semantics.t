@@ -363,15 +363,20 @@ sub _live_gutter_label { return tui::DashboardScreen::gutter($_[0]); }
             'AC5 (container absent, inverted): no literal "undef" leaks into the header when container is absent');
         unlike($t_no_container, qr/\[\[|\]\]/,
             'AC5 (container absent, inverted): no doubled bracket where the container-name prefix would have gone');
-        like($t_no_container, qr/\[running\]\z/,
-            'AC5 (container absent, inverted): the status clause still renders cleanly, with nothing trailing after it');
+        # The status block LEADS the header (operator request, 2026-08-25); it
+        # used to trail it, with the container name immediately before it. What
+        # AC5 is really asserting is unchanged -- an absent container must not
+        # leave a hole, a stray bracket or a literal "undef" -- so the anchor
+        # moves from end-of-row to start-of-row and the container's own
+        # counter-fixture moves to the right-hand slot it now occupies.
+        like($t_no_container, qr/\A\[running\] /,
+            'AC5 (container absent, inverted): the status clause still renders cleanly at the head of the row');
 
         # counter-fixture: with container PRESENT (the %full fixture
-        # already in scope), the "<container> [" prefix DOES appear -- so
-        # the checks above are not testing a prefix that never renders
-        # under any input.
-        like($header_text, qr/\Qclaude-demo-abcd1234\E \[/,
-            'AC5 (container present, counter-fixture): the "<container> [" prefix DOES appear when container is present');
+        # already in scope), the container name DOES appear -- so the checks
+        # above are not testing an element that never renders under any input.
+        like($header_text, qr/\Qclaude-demo-abcd1234\E\s*\z/,
+            'AC5 (container present, counter-fixture): the container name DOES appear, right-justified, when present');
     }
 
     # AC7: oauth line for each of the four tiers, EXACTLY ONCE across the

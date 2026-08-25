@@ -565,23 +565,46 @@ sub header_spans {
     my $role = _container_role($state->{status}, $state->{container_gone});
     my $spin = _spinner_frame($state->{spinner_idx});
 
-    my @right = (
-        { text => (length($ctr) ? "$ctr [" : '['), role => 'accent' },
+    # The STATUS BLOCK LEADS the line (operator request, 2026-08-25).
+    #
+    # It used to be the last thing on the row, tucked behind the container id at
+    # the far right -- the one element that changes every frame, parked in the
+    # corner the eye reaches last, and the first thing clipped when the terminal
+    # narrows. It is the single most important word on the screen: it is the
+    # answer to "is this thing alive". So it goes where reading starts, and the
+    # container id -- which never changes and is only ever read deliberately --
+    # takes the right-hand slot it vacated.
+    my @lead = (
+        { text => '[', role => 'accent' },
         (defined($spin) ? ( { text => "$spin ", role => $role } ) : ()),
         { text => $st, role => $role },
-        { text => ']', role => 'accent' },
+        { text => '] ', role => 'accent' },
     );
+    my @right = (length($ctr) ? ( { text => $ctr, role => 'accent' } ) : ());
 
-    my $lw = tui::Layout::display_width($left);
-    my $rw = tui::Frame::spans_width(\@right);
-    if ($lw + $rw + 1 <= $cols) {
+    my $leadw = tui::Frame::spans_width(\@lead);
+    my $lw    = tui::Layout::display_width($left);
+    my $rw    = tui::Frame::spans_width(\@right);
+
+    if ($leadw + $lw + $rw + 1 <= $cols) {
         return [
+            @lead,
             { text => $left, role => 'accent' },
-            { text => (' ' x ($cols - $lw - $rw)), role => 'accent' },
+            { text => (' ' x ($cols - $leadw - $lw - $rw)), role => 'accent' },
             @right,
         ];
     }
-    return [ { text => tui::Frame::clip_pad($left, $cols), role => 'accent' } ];
+    # Too narrow for all three. The status block survives and the container id
+    # is dropped first -- the reverse of the old precedence, and deliberately
+    # so: an operator squinting at an 80-column window needs the state far more
+    # than an id they can read off `podman ps`.
+    if ($leadw + $lw <= $cols) {
+        return [
+            @lead,
+            { text => tui::Frame::clip_pad($left, $cols - $leadw), role => 'accent' },
+        ];
+    }
+    return tui::Frame::fit_spans([ @lead, { text => $left, role => 'accent' } ], $cols, 'accent');
 }
 
 # ===========================================================================
