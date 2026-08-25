@@ -385,46 +385,98 @@ my $marker = "$GLYPH_COLOR{$env}$GLYPH{$env}${R}${MUTED} ${word}";
 
 # ── Continuity badge (g01-explicit-continuity-arming) ────────
 # Per-session, keyed by the documented top-level `session_id` field of the
-# stdin JSON (spec SS2.6/AC-7). t06 (blueprint tui-operator-feedback) moved
-# this OFF row 1/the $marker field entirely and onto its own row, emitted
-# only when armed -- zero rows and zero bytes when it is not. This is safe
-# against row-1 reflow precisely BECAUSE it no longer touches row 1 at all:
-# armed and unarmed runs at the same $cols now produce a byte-identical row
-# 1 (see 151-continuity-statusline-badge.t's F1), so the old reservation
-# inside the marker field is no longer needed to protect that invariant.
-# What varies instead is the total row COUNT (one extra row, only when
-# armed) -- already an existing, accepted kind of movement: row count
-# already varies today based on whether plan_full fits on line 2's own line
-# and whether cwd is non-empty.
+# stdin JSON (spec SS2.6/AC-7).
 #
-# Path resolution is duplicated from lib.sh's bp_continuity_active_dir and
-# bp-continuity.pl's own continuity_active_dir, ON PURPOSE -- this file stays
-# a standalone installed payload (no require of anything under plugins/). The
-# three must resolve identically for a given environment; AC-13 pins that
-# parity directly, so drift is caught rather than assumed away.
+# IT TRACKED THE ARMING COMMAND, NOT CONTINUITY (operator, 2026-08-25: "it
+# only appears when I manually toggle it on with the command, doesn't appear
+# when other sources have also turned it on"). It read ONE registry --
+# .continuity-active, written only by bp-continuity.pl's arm -- while butler
+# runs THREE per-session registries, each backing a Stop gate that will refuse
+# to let this session's turn end:
 #
-# PATH RESOLUTION (fix-batch F1) -- same single rule as lib.sh's
-# bp_continuity_active_dir (see that function's comment for the full
-# rationale): override, else $HOME, else $USERPROFILE, else UNRESOLVABLE.
-# This file is a READ path only (it never writes a marker), so unlike
-# bp-continuity.pl it must never hard-fail the statusline over this --
-# "unresolvable" degrades to "badge renders unarmed", which is truthful
-# rather than a fourth guess: if the directory can never be resolved here,
-# bp-continuity.pl could never have resolved it either (same rule), so it
-# could never have written a live marker for this badge to miss.
-my $sid = $data->{session_id};
-$sid = '' unless defined $sid && !ref($sid) && $sid =~ m{\A[^/\\\0]+\z} && $sid !~ /\.\./;
-my $continuity_dir = $ENV{CCPRAXIS_CONTINUITY_ACTIVE_DIR};
-if (!defined $continuity_dir || !length $continuity_dir) {
+#   .continuity-active   gate-continuity.sh    explicit arm / /butler:continuity
+#   .drive-solo-active   gate-drive-loop.sh    a /butler:drive-solo DRIVER session
+#   .reporter-active     gate-drive-loop.sh    a registered reporter session
+#
+# So a session driving a blueprint was gated exactly as hard as an armed one
+# and the badge said nothing. A status indicator that is silent while the
+# state it reports is live does not merely omit -- it tells you the gate is
+# off. All three are now read, and the badge names WHICH, because "why can't
+# this turn end" is the question it exists to answer.
+#
+# Path resolution is duplicated from lib.sh's bp_continuity_active_dir /
+# bp_drive_active_dir / bp_reporter_active_dir, ON PURPOSE -- this file stays a
+# standalone installed payload (no require of anything under plugins/). They
+# must resolve identically for a given environment; AC-13 pins that parity for
+# the continuity one, and the other two are the same rule with a different leaf
+# and a different override variable.
+#
+# PATH RESOLUTION (fix-batch F1) -- override, else $HOME, else $USERPROFILE,
+# else UNRESOLVABLE. This file is a READ path only (it never writes a marker),
+# so unlike bp-continuity.pl it must never hard-fail the statusline over this --
+# "unresolvable" degrades to "badge renders unarmed", which is truthful rather
+# than a fourth guess: if the directory can never be resolved here, the writer
+# could never have resolved it either (same rule), so it could never have
+# written a live marker for this badge to miss.
+#
+# NO TTL IS APPLIED HERE, deliberately and as before. Reaping a stale marker is
+# the hooks' job (bp_continuity_any_active and its siblings sweep the whole
+# registry on every Stop event, owner-independently). A read path that
+# second-guessed the reaper would disagree with the gate, which is the one thing
+# this badge must never do.
+sub _registry_dir {
+    my ($override, $leaf) = @_;
+    my $v = $ENV{$override};
+    return $v if defined $v && length $v;
     my $home = $ENV{HOME};
     $home = $ENV{USERPROFILE} unless defined $home && length $home;
-    $continuity_dir = (defined $home && length $home)
-        ? "$home/.claude/ccpraxis/.continuity-active"
-        : undef;
+    return undef unless defined $home && length $home;
+    return "$home/.claude/ccpraxis/$leaf";
 }
-my $armed = (defined $continuity_dir && length $sid && -f "$continuity_dir/$sid") ? 1 : 0;
 
-my $badge_row = $armed ? "${OK}WATCHED${R}" : '';
+my $sid = $data->{session_id};
+$sid = '' unless defined $sid && !ref($sid) && $sid =~ m{\A[^/\\\0]+\z} && $sid !~ /\.\./;
+
+# Order is PRECEDENCE, most explicit first: an operator who armed continuity by
+# hand is told that, even if this session also happens to be driving.
+my @WATCHERS = (
+    [ 'CCPRAXIS_CONTINUITY_ACTIVE_DIR', '.continuity-active',  'watched'   ],
+    [ 'CCPRAXIS_DRIVE_ACTIVE_DIR',      '.drive-solo-active',  'driving'   ],
+    [ 'CCPRAXIS_REPORTER_ACTIVE_DIR',   '.reporter-active',    'reporting' ],
+);
+my $badge_word = '';
+if (length $sid) {
+    for my $w (@WATCHERS) {
+        my ($override, $leaf, $word) = @$w;
+        my $dir = _registry_dir($override, $leaf);
+        next unless defined $dir;
+        next unless -f "$dir/$sid";
+        $badge_word = $word;
+        last;
+    }
+}
+
+# ── ...and where it goes (operator, 2026-08-25: "the statusline marker with
+# the continuity indicator looks awful... It's an uppercase green word in a
+# line by itself") ─────────────────────────────────────────
+#
+# Both halves of that are fixed, and the second one is the constrained one.
+#
+# t06 put the badge on its OWN ROW specifically so that armed and unarmed runs
+# produce a byte-identical row 1 -- the badge used to sit in row 1's marker
+# field, where its presence reflowed the row. 151's F1 and 166's AC8 pin that
+# invariant, and it is worth keeping: row 1 is the line the eye returns to.
+#
+# A row of its own is not the only way to satisfy it, though. Row 2 is the
+# bounded-width metrics row, already a strip of small facts, and appending
+# there leaves row 1 untouched byte-for-byte -- so F1 and AC8 hold unchanged
+# while the lonely row disappears. It also stops the badge costing a whole
+# screen row to say one word.
+#
+# Lowercase and muted rather than uppercase and green: this is a fact about the
+# session's mode, not an alarm. Green is what this file uses for things that
+# are GOOD; being gated is neither good nor bad, it is just true.
+my $badge = length($badge_word) ? "${MUTED}${badge_word}${R}" : '';
 
 # ── Git (with background fetch every 30 min) ────────────────
 my $git_str = '';
@@ -791,14 +843,18 @@ my $line2 = "${MUTED}${short}${R} "
 # it is bounded-width status, and the one unbounded field sits by itself where
 # its length cannot push anything else off a row.
 my @rows;
+# The badge rides row 2, ahead of plan_full: it is a handful of columns and it
+# is a fact about whether this turn can end, which outranks a plan title for the
+# room left on that row. Row 1 is untouched either way -- see the badge's own
+# note above for why that is the invariant being protected.
+my $line2_full = length($badge) ? "${line2} ${badge}" : $line2;
 if ($plan_full) {
-    my $oneline2 = "${line2} ${plan_full}";
+    my $oneline2 = "${line2_full} ${plan_full}";
     if (row_cost($oneline2) <= $cols) { push @rows, $line1, $oneline2 }
-    else                              { push @rows, $line1, $line2, $plan_full }
+    else                              { push @rows, $line1, $line2_full, $plan_full }
 } else {
-    push @rows, $line1, $line2;
+    push @rows, $line1, $line2_full;
 }
-push @rows, $badge_row if length $badge_row;   # own row, before the path row, never after
 my $path_row = path_row($cwd);
 push @rows, $path_row if length $path_row;
 print join("\n", @rows);

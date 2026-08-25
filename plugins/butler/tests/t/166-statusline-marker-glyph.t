@@ -70,6 +70,11 @@ make_git_absent();
 
 my $TMPROOT = tempdir(CLEANUP => 1);
 
+# THE BADGE WORD, declared once (re-pointed 2026-08-25 -- it was the literal
+# 'WATCHED'). Mirrors t/151's own declaration; every claim here is about WHEN
+# and WHERE the badge renders, never what it spells.
+my $BADGE = 'watched';
+
 # payload_for(%opt) -- current_dir, session_id (opt). No rate_limits key is
 # ever included, which pins plan_full to '' for every fixture in this file --
 # deliberate, so AC6's row-count derivation depends only on cwd-presence, per
@@ -184,7 +189,7 @@ my $GLYPH_SANDBOX_BYTES = encode('UTF-8', chr(0x25CB)); # hollow
 }
 
 # ===========================================================================
-# AC6 -- unarmed run: no WATCHED substring, and the total row count equals
+# AC6 -- unarmed run: no badge substring, and the total row count equals
 # what the SAME payload produces with no continuity concept at all. Every
 # payload in this file omits `rate_limits`, which pins plan_full to '' (see
 # payload_for's comment) -- so the row count depends ONLY on cwd-presence,
@@ -196,7 +201,7 @@ my $GLYPH_SANDBOX_BYTES = encode('UTF-8', chr(0x25CB)); # hollow
 {
     my ($out, $rc) = run_statusline(payload_for(current_dir => '/w/proj-alpha'), sandbox => 0);
     is($rc, 0, 'AC6 setup (cwd present): exits 0');
-    ok(index($out, 'WATCHED') < 0, 'AC6 (cwd present): no WATCHED substring when unarmed');
+    ok(index($out, $BADGE) < 0, 'AC6 (cwd present): no badge substring when unarmed');
     my @rows = split /\n/, $out;
     is(scalar(@rows), 2 + 1,
         'AC6 (cwd present): row count is line1 + line2 + the path row -- no extra row for an '
@@ -205,45 +210,53 @@ my $GLYPH_SANDBOX_BYTES = encode('UTF-8', chr(0x25CB)); # hollow
 {
     my ($out, $rc) = run_statusline(payload_for(current_dir => ''), sandbox => 0);
     is($rc, 0, 'AC6 setup (cwd absent): exits 0');
-    ok(index($out, 'WATCHED') < 0, 'AC6 (cwd absent): no WATCHED substring when unarmed');
+    ok(index($out, $BADGE) < 0, 'AC6 (cwd absent): no badge substring when unarmed');
     my @rows = split /\n/, $out;
     is(scalar(@rows), 2,
         'AC6 (cwd absent): row count is line1 + line2 only -- no path row, no badge row');
 }
 
 # ===========================================================================
-# AC7 -- armed run: exactly one row equals (after SGR strip) WATCHED, and it
-# is the SECOND-TO-LAST row when a path row is present, or the LAST row when
-# it is not.
+# AC7 -- armed run: the badge renders exactly once, on ROW 2, and arming does
+# not change the number of rows.
+#
+# RE-POINTED 2026-08-25. This asserted the badge occupied a ROW OF ITS OWN --
+# second-to-last with a path row, last without. The operator called that
+# "awful" ("an uppercase green word in a line by itself"), so the badge moved
+# onto row 2, the bounded-width metrics row.
+#
+# The claim is re-pointed rather than dropped because the thing it was really
+# protecting still needs protecting, and it is NOT "which row": it is that the
+# badge appears exactly once, in a fixed place, and never on row 1 (AC8 below,
+# and 151's F1). What changes is which fixed place. The row-count half is
+# STRONGER than before -- the badge used to add a row when armed, and now costs
+# none at all.
 # ===========================================================================
-{
+for my $case ([ '/w/proj-alpha', 'path row present' ], [ '', 'no path row' ]) {
+    my ($cwd, $label) = @$case;
     my $cdir = tempdir(CLEANUP => 1);
-    plant_marker($cdir, 'sess-ac7-with-path');
-    my ($out, $rc) = run_statusline(
-        payload_for(current_dir => '/w/proj-alpha', session_id => 'sess-ac7-with-path'),
+    plant_marker($cdir, 'sess-ac7');
+    my ($armed, $rc) = run_statusline(
+        payload_for(current_dir => $cwd, session_id => 'sess-ac7'),
         sandbox => 0, cdir => $cdir);
-    is($rc, 0, 'AC7 setup (path row present): exits 0');
-    my @rows = split /\n/, $out;
-    my @watched_idx = grep { strip_sgr($rows[$_]) eq 'WATCHED' } 0 .. $#rows;
-    is(scalar(@watched_idx), 1,
-        'AC7 (path row present): exactly one row is byte-exact WATCHED after SGR strip');
-    is($watched_idx[0], $#rows - 1,
-        'AC7 (path row present): the WATCHED row is the second-to-last row -- immediately '
-      . 'before the path row, never after it');
-}
-{
-    my $cdir = tempdir(CLEANUP => 1);
-    plant_marker($cdir, 'sess-ac7-no-path');
-    my ($out, $rc) = run_statusline(
-        payload_for(current_dir => '', session_id => 'sess-ac7-no-path'),
+    my ($unarmed) = run_statusline(
+        payload_for(current_dir => $cwd, session_id => 'sess-ac7-unarmed'),
         sandbox => 0, cdir => $cdir);
-    is($rc, 0, 'AC7 setup (no path row): exits 0');
-    my @rows = split /\n/, $out;
-    my @watched_idx = grep { strip_sgr($rows[$_]) eq 'WATCHED' } 0 .. $#rows;
-    is(scalar(@watched_idx), 1,
-        'AC7 (no path row): exactly one row is byte-exact WATCHED after SGR strip');
-    is($watched_idx[0], $#rows,
-        'AC7 (no path row): the WATCHED row is the LAST row when there is no path row to precede');
+    is($rc, 0, "AC7 setup ($label): exits 0");
+
+    my @rows = split /\n/, $armed;
+    my @hits = grep { index(strip_sgr($rows[$_]), $BADGE) >= 0 } 0 .. $#rows;
+    is(scalar(@hits), 1, "AC7 ($label): the badge appears on exactly one row");
+    SKIP: {
+        skip 'badge not found on exactly one row', 1 if @hits != 1;
+        is($hits[0], 1,
+            "AC7 ($label): ...and that row is ROW 2 -- the bounded-width metrics row, never "
+          . 'row 1 and never a row of its own');
+    }
+
+    is(scalar(@rows), scalar(my @u = split /\n/, $unarmed),
+        "AC7 ($label): arming changes no ROW COUNT at all -- the badge rides an existing row "
+      . 'rather than adding one, which is what it used to do');
 }
 
 # ===========================================================================
@@ -393,7 +406,7 @@ for my $sb (0, 1) {
     my $out = `timeout 20 perl "$STATUSLINE" < "$inpath" 2>/dev/null`;
     my $rc  = $? >> 8;
     is($rc, 0, 'Edge case: no crash when the continuity dir is unresolvable (HOME/USERPROFILE/override all unset)');
-    ok(index($out, 'WATCHED') < 0, 'Edge case: no WATCHED badge when the continuity dir is unresolvable');
+    ok(index($out, $BADGE) < 0, 'Edge case: no badge when the continuity dir is unresolvable');
 }
 
 done_testing();

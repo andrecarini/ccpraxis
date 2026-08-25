@@ -59,6 +59,13 @@ make_git_absent();
 
 my $TMPROOT = tempdir(CLEANUP => 1);
 
+# THE BADGE WORD, declared once (re-pointed 2026-08-25). It was the literal
+# 'WATCHED', uppercase and green on a row of its own; the operator called that
+# "awful" and it is now lowercase and muted, riding row 2. Every claim in this
+# file is about WHEN the badge renders, not what it spells, so the word lives
+# here and the assertions read it.
+my $BADGE = 'watched';
+
 sub payload_for {
     my (%opt) = @_;
     my %p = (
@@ -84,6 +91,14 @@ sub run_statusline {
     $ENV{HOME} = $opt{home} // tempdir(CLEANUP => 1);
     if (defined $opt{cdir}) { $ENV{CCPRAXIS_CONTINUITY_ACTIVE_DIR} = $opt{cdir} }
     else                    { delete $ENV{CCPRAXIS_CONTINUITY_ACTIVE_DIR} }
+    # The other two per-session registries the badge now reads (2026-08-25).
+    # Deleted rather than merely left alone when not supplied, so a real value
+    # in the ambient environment can never leak into a fixture -- the same
+    # discipline the continuity override above already follows.
+    if (defined $opt{ddir}) { $ENV{CCPRAXIS_DRIVE_ACTIVE_DIR} = $opt{ddir} }
+    else                    { delete $ENV{CCPRAXIS_DRIVE_ACTIVE_DIR} }
+    if (defined $opt{rdir}) { $ENV{CCPRAXIS_REPORTER_ACTIVE_DIR} = $opt{rdir} }
+    else                    { delete $ENV{CCPRAXIS_REPORTER_ACTIVE_DIR} }
 
     my $out = `timeout 20 perl "$STATUSLINE" < "$inpath" 2>/dev/null`;
     my $rc  = $? >> 8;
@@ -108,8 +123,8 @@ sub plant_marker {
     plant_marker($cdir, 'sess-b-armed');
     my ($out, $rc) = run_statusline(payload_for(session_id => 'sess-b-armed'), cdir => $cdir);
     is($rc, 0, 'B1 setup: statusline.pl exits 0 for an armed session'."'".' payload');
-    ok(index($out, 'WATCHED') >= 0,
-       'B2 CANONICAL (-> AC-7/behavior 16): the WATCHED badge is a byte-exact substring of '
+    ok(index($out, $BADGE) >= 0,
+       'B2 CANONICAL (-> AC-7/behavior 16): the badge is a byte-exact substring of '
      . 'stdout when the payload'."'".'s session_id matches an armed marker');
 }
 
@@ -123,22 +138,22 @@ sub plant_marker {
     plant_marker($cdir, 'sess-c-armed-other');
     my ($out, $rc) = run_statusline(payload_for(session_id => 'sess-c-DIFFERENT-unarmed'), cdir => $cdir);
     is($rc, 0, 'C1 setup: exits 0');
-    ok(index($out, 'WATCHED') < 0,
+    ok(index($out, $BADGE) < 0,
        'C2 CANONICAL (-> AC-7 negative): a DIFFERENT session id in the payload, even though '
-     . 'SOME session is armed in the same registry directory, does NOT render WATCHED -- '
+     . 'SOME session is armed in the same registry directory, does NOT render the badge -- '
      . 'proves per-session lookup, not "is anything armed anywhere" (spec SS out-of-scope '
      . 'item, explicitly rejected)');
 }
 
 # ===========================================================================
 # D. AC-8 (behavior 16, negative): no marker at all for the payload'"'"'s own
-#    session_id -> no WATCHED badge, exit 0, no crash.
+#    session_id -> no badge, exit 0, no crash.
 # ===========================================================================
 {
     my $cdir = tempdir(CLEANUP => 1);   # empty registry
     my ($out, $rc) = run_statusline(payload_for(session_id => 'sess-d-never-armed'), cdir => $cdir);
     is($rc, 0, 'D1: exits 0 for an unarmed session with an otherwise-valid session_id');
-    ok(index($out, 'WATCHED') < 0, 'D2: no WATCHED badge for an unarmed session');
+    ok(index($out, $BADGE) < 0, 'D2: no badge for an unarmed session');
 }
 
 # ===========================================================================
@@ -160,8 +175,8 @@ sub plant_marker {
     ok(scalar(@rows) >= 2,
        'E2 CANONICAL: still renders (at least) the two previously-fixed rows -- no reflow, '
      . 'no row dropped, when session_id is missing');
-    ok(index($out, 'WATCHED') < 0,
-       'E3 CANONICAL: no WATCHED badge renders when session_id is absent -- and critically, '
+    ok(index($out, $BADGE) < 0,
+       'E3 CANONICAL: no badge renders when session_id is absent -- and critically, '
      . 'does NOT fall back to "something, somewhere, is armed" (an armed marker for a '
      . 'DIFFERENT, unrelated session exists in the same registry dir in this exact fixture) '
      . '-- the spec explicitly rejects that weaker fallback');
@@ -226,7 +241,7 @@ sub plant_marker {
         # cdir deliberately NOT passed -- exercise the HOME-derived default
     );
     is($rc, 0, 'G1 setup: exits 0');
-    ok(index($out, 'WATCHED') >= 0,
+    ok(index($out, $BADGE) >= 0,
        'G2 CANONICAL (-> AC-13a): with CCPRAXIS_CONTINUITY_ACTIVE_DIR UNSET and HOME pointed '
      . 'at a fixture, the badge renders from a marker planted at the documented default path '
      . '${HOME}/.claude/ccpraxis/.continuity-active/<sid> -- proves statusline.pl'."'".'s own '
@@ -249,7 +264,7 @@ sub plant_marker {
         home => $home, cdir => $override_dir,
     );
     is($rc, 0, 'G3 setup: exits 0');
-    ok(index($out, 'WATCHED') < 0,
+    ok(index($out, $BADGE) < 0,
        'G4 CANONICAL (-> AC-13b): with CCPRAXIS_CONTINUITY_ACTIVE_DIR SET to an EMPTY '
      . 'override dir, a marker sitting at the HOME-derived default path is NOT consulted -- '
      . 'the override wins, matching lib.sh'."'".'s own override-first precedence exactly');
@@ -287,7 +302,7 @@ sub mkdir_p_test {
     my $out = `timeout 20 perl "$STATUSLINE" < "$inpath" 2>/dev/null`;
     my $rc  = $? >> 8;
     is($rc, 0, 'H1 setup: exits 0 with $HOME unset, $USERPROFILE set');
-    ok(index($out, 'WATCHED') >= 0,
+    ok(index($out, $BADGE) >= 0,
        'H2 CANONICAL (-> fix-batch F1): with $HOME unset and $USERPROFILE pointed at a fixture, '
      . 'the badge renders from a marker under $USERPROFILE/.claude/ccpraxis/.continuity-active '
      . '-- matches lib.sh'."'".'s and bp-continuity.pl'."'".'s documented fallback order '
@@ -317,8 +332,8 @@ sub mkdir_p_test {
     my $rc  = $? >> 8;
     is($rc, 0, 'I1 CANONICAL (-> fix-batch F1): statusline.pl does not crash when '
              . 'CCPRAXIS_CONTINUITY_ACTIVE_DIR, $HOME and $USERPROFILE are all unset');
-    ok(index($out, 'WATCHED') < 0,
-       'I2 CANONICAL: badge renders unarmed (no WATCHED) rather than guessing \'.\' as a '
+    ok(index($out, $BADGE) < 0,
+       'I2 CANONICAL: badge renders unarmed (no badge) rather than guessing \'.\' as a '
      . 'registry root -- the pre-fix fallback');
     my @rows = grep { length } split /\n/, $out;
     ok(scalar(@rows) >= 2, 'I3: still renders both rows -- no crash, no reflow');
@@ -364,6 +379,83 @@ sub mkdir_p_test {
     }
 
     make_tput(120);   # restore the harness default for any later section
+}
+
+# ===========================================================================
+# K. THE BADGE TRACKS CONTINUITY, NOT THE ARMING COMMAND (2026-08-25).
+#
+# Operator: "it only appears when I manually toggle it on with the command,
+# doesn't appear when other sources have also turned it on".
+#
+# It read ONE registry -- .continuity-active, written only by
+# bp-continuity.pl's arm -- while butler runs THREE per-session registries,
+# each backing a Stop gate that refuses to let this session's turn end:
+#
+#   .continuity-active   gate-continuity.sh    explicit arm
+#   .drive-solo-active   gate-drive-loop.sh    a drive-solo DRIVER session
+#   .reporter-active     gate-drive-loop.sh    a registered reporter session
+#
+# A session driving a blueprint was gated exactly as hard as an armed one, and
+# the badge said nothing. That is worse than an omission: a status indicator
+# that is silent while the state it reports is live reads as "the gate is off".
+#
+# Every claim in section B..J above -- per-session lookup, graceful degradation,
+# path resolution -- applies to the two new registries identically, so what is
+# added here is the coverage that could not exist before: each source lights the
+# badge, each names itself, and precedence is deterministic.
+# ===========================================================================
+{
+    my %WORD = (ddir => 'driving', rdir => 'reporting');
+
+    for my $key (sort keys %WORD) {
+        my $dir = tempdir(CLEANUP => 1);
+        plant_marker($dir, 'sess-k-live');
+        my ($out, $rc) = run_statusline(payload_for(session_id => 'sess-k-live'), $key => $dir);
+        is($rc, 0, "K ($WORD{$key}): exits 0");
+        ok(index($out, $WORD{$key}) >= 0,
+           "K CANONICAL ($WORD{$key}): a marker in this registry lights the badge, and the badge "
+         . 'NAMES the source -- the gate that will block this turn is identified, not merely '
+         . 'reported to exist');
+
+        # Per-session, exactly as the continuity registry already is: some
+        # OTHER session being registered must not leak in.
+        my $other = tempdir(CLEANUP => 1);
+        plant_marker($other, 'sess-k-somebody-else');
+        my ($out2) = run_statusline(payload_for(session_id => 'sess-k-not-me'), $key => $other);
+        ok(index($out2, $WORD{$key}) < 0,
+           "K ($WORD{$key}): a marker for a DIFFERENT session does not light this session's badge");
+    }
+
+    # PRECEDENCE is deterministic and most-explicit-first: an operator who armed
+    # continuity by hand is told that, even when the session is also driving.
+    # Asserted with BOTH markers planted, so it is a real tie being broken
+    # rather than one source happening to be the only one present.
+    my $cdir = tempdir(CLEANUP => 1);
+    my $ddir = tempdir(CLEANUP => 1);
+    plant_marker($cdir, 'sess-k-both');
+    plant_marker($ddir, 'sess-k-both');
+    my ($both) = run_statusline(payload_for(session_id => 'sess-k-both'),
+                                cdir => $cdir, ddir => $ddir);
+    ok(index($both, $BADGE) >= 0,
+       'K: with an explicit arm AND a drive registration, the badge reports the explicit arm');
+    ok(index($both, 'driving') < 0,
+       'K: ...and only that -- the badge names one source, never two');
+
+    # HOME-derived defaults for the two new registries, mirroring section G's
+    # claim for the continuity one. The leaf names must match lib.sh's
+    # bp_drive_active_dir / bp_reporter_active_dir exactly or the badge looks in
+    # a different place than the gate writes to.
+    my %LEAF = ('.drive-solo-active' => 'driving', '.reporter-active' => 'reporting');
+    for my $leaf (sort keys %LEAF) {
+        my $home = tempdir(CLEANUP => 1);
+        mkdir_p_test("$home/.claude/ccpraxis/$leaf");
+        plant_marker("$home/.claude/ccpraxis/$leaf", 'sess-k-home');
+        my ($out, $rc) = run_statusline(payload_for(session_id => 'sess-k-home'), home => $home);
+        is($rc, 0, "K ($leaf via HOME): exits 0");
+        ok(index($out, $LEAF{$leaf}) >= 0,
+           "K CANONICAL ($leaf via HOME): with no override set, the badge resolves "
+         . "\$HOME/.claude/ccpraxis/$leaf -- the same path lib.sh's own resolver builds");
+    }
 }
 
 done_testing();
