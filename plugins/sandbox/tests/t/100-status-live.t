@@ -578,6 +578,29 @@ sub _run_live {
 
     my ($enter_body) = $launcher_src =~ /\benter_raw\s*=>\s*sub\s*\{\n(.*?)\n[ \t]*\},/s;
     my ($leave_body) = $launcher_src =~ /\bleave_raw\s*=>\s*sub\s*\{\n(.*?)\n[ \t]*\},/s;
+    # THE TEARDOWN PATH, not one closure. The terminal primitives were extracted
+    # into _restore_terminal so the [r] re-exec path runs exactly the same ones
+    # instead of a second copy that drifts; leave_raw now calls it. The ORDERING
+    # contract these assertions protect is unchanged and still checkable -- it
+    # just lives one call down. Pinning the closure body made a refactor that
+    # removed a duplication look like a regression.
+    if (defined $leave_body && $leave_body =~ /_restore_terminal/) {
+        my ($helper) = $launcher_src =~ /(sub _restore_terminal \{.*?\n\})/s;
+        $leave_body .= "\n" . $helper if defined $helper;
+    }
+
+    # COMMENTS STRIPPED. These assertions compare the INDEX of one escape
+    # sequence against another, so any comment that merely NAMES a sequence
+    # moves the measurement. It fired immediately: a comment added above the
+    # push line explaining why XTPUSHTITLE is now opt-in mentions the neutral
+    # clear, and AC-12(a) started reporting the title set as coming FIRST --
+    # in code where the order was untouched.
+    #
+    # Seventh instance of this shape in two days (t/26, t/44, t/61, t/65, t/66,
+    # t/115), and the same remedy each time: an oracle must read code, not
+    # prose about code.
+    $_ = defined $_ ? do { (my $c = $_) =~ s/^\s*#.*$//mg; $c } : $_
+        for ($enter_body, $leave_body);
     ok(defined $enter_body && length($enter_body), 'AC-12: enter_raw closure body extracted')
         or diag('enter_raw title-save code is not implemented in launcher.pl yet');
     ok(defined $leave_body && length($leave_body), 'AC-12: leave_raw closure body extracted')
