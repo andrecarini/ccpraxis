@@ -67,24 +67,29 @@ use_ok('Dashboard') or BAIL_OUT('Dashboard.pm did not load');
 # behaviour (unlisted: absent from glyph_table(), glyph_width() undef,
 # _safe() -> '?') for these exact four codepoints.
 # ===========================================================================
+# THE SPINNER FRAMES ARE DERIVED, not pasted (re-pointed 2026-08-25). The
+# sequence changed from ten frames with uneven dot counts to eight uniform ones,
+# and a pasted list of codepoints turns a deliberate re-styling into a red test
+# about characters this file never claimed were special. What AC-2 and AC-15 are
+# about is the WIDTH CONTRACT -- every glyph the renderer emits is declared, at
+# its declared width, and measures the same decoded or as UTF-8 bytes -- and
+# that claim is exactly as strong over whatever frames Theme declares. The dot
+# count itself is pinned where it belongs, in t/100-status-live.t's UNIFORM DOTS
+# block.
+my @SPINNER_GLYPHS =
+    map { [ ord(Theme::glyphs()->{"spinner.$_"}{char}), 1, 'spinner', "braille spinner frame $_" ] }
+    1 .. Theme::SPINNER_FRAMES();
+
 my @GLYPHS = (
-    [0x280B,  1, 'spinner', 'braille dots-1'],
-    [0x2819,  1, 'spinner', 'braille dots-2'],
-    [0x2839,  1, 'spinner', 'braille dots-3'],
-    [0x2838,  1, 'spinner', 'braille dots-4'],
-    [0x283C,  1, 'spinner', 'braille dots-5'],
-    [0x2834,  1, 'spinner', 'braille dots-6'],
-    [0x2826,  1, 'spinner', 'braille dots-7'],
-    [0x2827,  1, 'spinner', 'braille dots-8'],
-    [0x2807,  1, 'spinner', 'braille dots-9'],
-    [0x280F,  1, 'spinner', 'braille dots-10'],
+    @SPINNER_GLYPHS,
     [0x2588,  1, 'gauge',   'full block'],
     [0x2591,  1, 'gauge',   'light shade'],
     [0x25B2,  1, 'scroll',  'up triangle'],
     [0x25BC,  1, 'scroll',  'down triangle'],
 );
-is(scalar(@GLYPHS), 14,
-    'sanity: glyph fixture carries all 14 pinned entries (was 18 -- the 4 status-circle emoji moved out, see comment above)');
+is(scalar(@GLYPHS), Theme::SPINNER_FRAMES() + 4,
+    'sanity: glyph fixture carries every spinner frame plus the four gauge/scroll glyphs '
+  . '(the 4 status-circle emoji moved out, see comment above)');
 
 # ===========================================================================
 # AC-1 -> DC-1: display_width returns length() for pure-ASCII strings

@@ -65,9 +65,43 @@ BAIL_OUT("tui::DashboardScreen.pm did not load ($@) -- theme_role() is this orac
 # allow-listed at Dashboard.pm:230-239; the spec cites their exact order).
 # Independent of whatever @SPINNER list the implementer writes.
 # ===========================================================================
-my @SPINNER_CP = (0x280B, 0x2819, 0x2839, 0x2838, 0x283C,
-                   0x2834, 0x2826, 0x2827, 0x2807, 0x280F);
+# RE-POINTED 2026-08-25 (operator: "the spinner has a different number of dots
+# depending on the spinner step. I wish all steps had the same number of dots").
+# The ten dots-1..dots-10 codepoints pulsed -- their dot counts run 3,3,4,3,4,
+# 3,3,4,3,4 -- and were replaced by an eight-frame three-dot arc.
+#
+# The fixture no longer restates the codepoints. It could not: the whole point
+# of the replacement is a property of the sequence (constant dot count, one
+# smooth revolution), and a pasted list asserts only that someone pasted the
+# same list twice. It reads Theme's declaration and asserts the PROPERTY below
+# (see the UNIFORM DOTS block), which is what the operator actually asked for
+# and what a future re-styling must keep.
+my $SPINNER_N     = Theme::SPINNER_FRAMES();
+my @SPINNER_CP    = map { ord(Theme::glyphs()->{"spinner.$_"}{char}) } (1 .. $SPINNER_N);
 my @SPINNER_BYTES = map { encode('UTF-8', chr($_)) } @SPINNER_CP;
+
+# ===========================================================================
+# UNIFORM DOTS -- the operator's actual request, pinned as a property.
+#
+# A braille codepoint's low eight bits ARE its dot pattern (U+2800 + bitmask),
+# so "how many dots does this frame have" is a popcount, not a judgement call.
+# ===========================================================================
+{
+    my %counts;
+    for my $cp (@SPINNER_CP) {
+        my $bits = $cp - 0x2800;
+        my $n = 0;
+        $n += ($bits >> $_) & 1 for 0 .. 7;
+        $counts{$n}++;
+    }
+    is(scalar(keys %counts), 1,
+        'UNIFORM DOTS: every spinner frame lights the SAME number of braille dots -- the glyph '
+      . 'rotates without also pulsing brighter and dimmer')
+        or diag('  dot counts seen: ' . join(', ', map { "$_ x$counts{$_}" } sort keys %counts));
+    cmp_ok($SPINNER_N, '>=', 4, 'UNIFORM DOTS non-vacuity: there are enough frames for the claim to mean something');
+    is(scalar(keys %{{ map { $_ => 1 } @SPINNER_CP }}), $SPINNER_N,
+        'UNIFORM DOTS: the frames are all DISTINCT -- uniformity was not achieved by repeating one glyph');
+}
 
 sub _slurp {
     my ($path) = @_;
@@ -141,13 +175,14 @@ sub _run_live {
 }
 
 # ===========================================================================
-# AC-1 -- spinner_frame exists and satisfies B1: 10 distinct frames for
-# indices 0..9, each display_width == 1, each a key of _dash_glyph_table().
+# AC-1 -- spinner_frame exists and satisfies B1: SPINNER_FRAMES distinct
+# frames, each display_width == 1, each a key of _dash_glyph_table(). The count
+# is DERIVED (it was the literal 10 until 2026-08-25); the claim is unchanged.
 # ===========================================================================
 {
     my $table = eval { _dash_glyph_table() };
     my %seen;
-    for my $idx (0 .. 9) {
+    for my $idx (0 .. $SPINNER_N - 1) {
         my $bytes = eval { tui::DashboardScreen::_spinner_frame($idx) };
         is($@, '', "AC-1: spinner_frame($idx) does not die");
         ok(defined $bytes && length($bytes), "AC-1: spinner_frame($idx) returns a defined non-empty value");
@@ -158,12 +193,15 @@ sub _run_live {
         ok(defined $table && defined $decoded && exists $table->{$decoded},
             "AC-1: spinner_frame($idx) decodes to a key of _dash_glyph_table()");
     }
-    is(scalar(keys %seen), 10, 'AC-1: spinner_frame(0..9) yields 10 DISTINCT frames');
+    is(scalar(keys %seen), $SPINNER_N,
+        "AC-1: spinner_frame(0..@{[ $SPINNER_N - 1 ]}) yields $SPINNER_N DISTINCT frames");
 }
 
 # ===========================================================================
-# AC-2 -- periodic mod 10 and total: B2 + B3, with $SIG{__WARN__} armed to
-# fail on any warning.
+# AC-2 -- periodic mod SPINNER_FRAMES and total: B2 + B3, with $SIG{__WARN__}
+# armed to fail on any warning. The period is DERIVED (it was the literal 10
+# until 2026-08-25); the claim -- it is periodic, and negative indices wrap
+# rather than dying -- is unchanged.
 # ===========================================================================
 {
     my @warnings;
@@ -171,13 +209,13 @@ sub _run_live {
 
     for my $i (-13, -10, -3, -1, 0, 1, 3, 7, 9, 10, 13, 23) {
         my $a = eval { tui::DashboardScreen::_spinner_frame($i) };
-        my $b = eval { tui::DashboardScreen::_spinner_frame($i + 10) };
-        is($a, $b, "AC-2: spinner_frame($i) eq spinner_frame(" . ($i + 10) . ') (period 10)');
+        my $b = eval { tui::DashboardScreen::_spinner_frame($i + $SPINNER_N) };
+        is($a, $b, "AC-2: spinner_frame($i) eq spinner_frame(" . ($i + $SPINNER_N) . ") (period $SPINNER_N)");
     }
-    is(eval { tui::DashboardScreen::_spinner_frame(10) }, eval { tui::DashboardScreen::_spinner_frame(0) },
-        'AC-2: spinner_frame(10) eq spinner_frame(0)');
-    is(eval { tui::DashboardScreen::_spinner_frame(-1) }, eval { tui::DashboardScreen::_spinner_frame(9) },
-        'AC-2: spinner_frame(-1) eq spinner_frame(9)');
+    is(eval { tui::DashboardScreen::_spinner_frame($SPINNER_N) }, eval { tui::DashboardScreen::_spinner_frame(0) },
+        "AC-2: spinner_frame($SPINNER_N) eq spinner_frame(0)");
+    is(eval { tui::DashboardScreen::_spinner_frame(-1) }, eval { tui::DashboardScreen::_spinner_frame($SPINNER_N - 1) },
+        "AC-2: spinner_frame(-1) eq spinner_frame(@{[ $SPINNER_N - 1 ]})");
 
     # B3 TOTALITY, RE-STATED FOR THE LIVE CONTRACT. Dashboard::spinner_frame
     # coerced junk to frame 0; tui::DashboardScreen::_spinner_frame returns
@@ -385,7 +423,7 @@ sub _run_live {
     }
 
     for my $i (0 .. $#renders) {
-        my $expected_idx   = int($t_at_render[$i] / $tick_int) % 10;
+        my $expected_idx   = int($t_at_render[$i] / $tick_int) % $SPINNER_N;
         my $expected_bytes = $SPINNER_BYTES[$expected_idx];
         my $seg = _row1_segment($renders[$i]);
         ok(defined $seg, "AC-6b: render $i -- row 1 segment isolated from the ANSI stream");
@@ -393,7 +431,7 @@ sub _run_live {
             skip 'row 1 segment not isolated', 1 unless defined $seg;
             if ($seg =~ /\[(.*?) running\]/) {
                 is($1, $expected_bytes,
-                    "AC-6b: render $i -- spinner glyph == \@SPINNER[int($t_at_render[$i]/$tick_int) % 10] == index $expected_idx");
+                    "AC-6b: render $i -- spinner glyph == frame[int($t_at_render[$i]/$tick_int) % $SPINNER_N] == index $expected_idx");
             } else {
                 fail("AC-6b: render $i -- row 1 segment did not contain the expected '[<spin> running]' shape");
             }

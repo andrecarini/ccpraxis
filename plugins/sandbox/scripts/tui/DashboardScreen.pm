@@ -607,14 +607,28 @@ sub _container_role {
     return 'state.idle';
 }
 
-my @SPINNER_NAMES = map { "spinner.$_" } (1 .. 10);
+# DERIVED FROM Theme, never restated. The frame count changed once already
+# (ten pulsing frames -> eight uniform ones, 2026-08-25) and a literal here
+# would have indexed past the end of the table on the very next frame.
+#
+# Builder, not a top-level literal -- AC-P1 (t/66) forbids this module calling
+# into Theme:: at load time, the same rule _role_map() and _run_state_role_map()
+# already live under. Memoized, so the list is still built once.
+my $SPINNER_NAMES_MEMO;
+sub _spinner_names {
+    $SPINNER_NAMES_MEMO ||= [ map { "spinner.$_" } (1 .. Theme::SPINNER_FRAMES()) ];
+    return $SPINNER_NAMES_MEMO;
+}
 
 sub _spinner_frame {
     my ($idx) = @_;
     return undef if !defined($idx) || ref($idx) || $idx !~ /^-?\d+(?:\.\d+)?$/;
-    my $i = int($idx) % 10;
-    $i += 10 if $i < 0;
-    return Theme::glyph($SPINNER_NAMES[$i]);
+    my $names = _spinner_names();
+    my $n = scalar @$names;
+    return undef if $n < 1;
+    my $i = int($idx) % $n;
+    $i += $n if $i < 0;
+    return Theme::glyph($names->[$i]);
 }
 
 # _fmt_oauth_like($secs) / _oauth_like_role($secs) -- independent

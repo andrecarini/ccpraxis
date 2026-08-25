@@ -139,6 +139,12 @@ use Encode ();   # core; used only for UTF-8 encoding of declared glyphs
 # ---------------------------------------------------------------------------
 use constant REFERENCE_BG => [30, 30, 30];
 
+# SPINNER_FRAMES -- how many 'spinner.N' glyphs the table below declares, and
+# therefore the period of the animation. PUBLIC: both renderers index the
+# sequence modulo this, and neither may restate the number. See the block
+# comment beside the spinner entries for why it is 8.
+use constant SPINNER_FRAMES => 8;
+
 sub reference_background {
     return [ @{ +REFERENCE_BG } ];
 }
@@ -283,11 +289,12 @@ sub accent_lightness_band {
 #
 # Built lazily and memoized by _glyphs_data() below (see the MODULE SHAPE
 # note near the top of this file). The first nineteen entries are the
-# spec's required minimum set. The ten "spinner.N" entries exist ONLY so
+# spec's required minimum set. The "spinner.N" entries exist ONLY so
 # this table is a superset of the sandbox dashboard's own glyph table's
 # non-emoji entries at the same declared widths (spec §2.5's completeness
-# rule) -- the dashboard's own glyph table carries ten braille spinner
-# frames this table must also name.
+# rule) -- the dashboard's own glyph table carries the braille spinner
+# frames this table must also name. There are SPINNER_FRAMES of them; see
+# the block comment beside them for why that number is what it is.
 #
 # NO EMOJI: every codepoint below was checked against the emoji-range test
 # in t/64-theme-tokens.t's own detector (mirroring spec §2.6.1) and none
@@ -342,16 +349,37 @@ sub _glyphs_data {
         # the sandbox dashboard's glyph_table()'s non-emoji entries (spec
         # §2.5 completeness rule). All width 1, matching the dashboard's own
         # declaration.
-        'spinner.1'  => { cp => 0x280B, desc => 'braille spinner, frame 1 of 10' },
-        'spinner.2'  => { cp => 0x2819, desc => 'braille spinner, frame 2 of 10' },
-        'spinner.3'  => { cp => 0x2839, desc => 'braille spinner, frame 3 of 10' },
-        'spinner.4'  => { cp => 0x2838, desc => 'braille spinner, frame 4 of 10' },
-        'spinner.5'  => { cp => 0x283C, desc => 'braille spinner, frame 5 of 10' },
-        'spinner.6'  => { cp => 0x2834, desc => 'braille spinner, frame 6 of 10' },
-        'spinner.7'  => { cp => 0x2826, desc => 'braille spinner, frame 7 of 10' },
-        'spinner.8'  => { cp => 0x2827, desc => 'braille spinner, frame 8 of 10' },
-        'spinner.9'  => { cp => 0x2807, desc => 'braille spinner, frame 9 of 10' },
-        'spinner.10' => { cp => 0x280F, desc => 'braille spinner, frame 10 of 10' },
+        #
+        # EVERY FRAME HAS THE SAME NUMBER OF DOTS (operator, 2026-08-25: "the
+        # spinner has a different number of dots depending on the spinner step.
+        # I wish all steps had the same number of dots").
+        #
+        # The old ten frames were the widely-copied "dots" sequence, whose dot
+        # counts run 3,3,4,3,4,3,3,4,3,4 -- so the glyph does not merely rotate,
+        # it PULSES, brighter on every second or third frame. That is a second
+        # animation nobody asked for, riding on the one that is meant to be
+        # there.
+        #
+        # These eight are a three-dot arc walked around the 8-dot braille ring.
+        # The ring, in visual order, is dots 1,4,5,6,8,7,3,2 (down the right
+        # column, back up the left); frame k lights ring positions k, k+1, k+2.
+        # So each frame is exactly three dots, consecutive, and the sequence is
+        # a smooth clockwise rotation that returns to its start -- the count is
+        # constant BY CONSTRUCTION rather than by having been counted once.
+        #
+        # EIGHT, not ten, and that is forced rather than chosen: the ring has
+        # eight positions, so a ten-frame cycle over it would have to repeat two
+        # of them and the spinner would stutter twice per revolution. The frame
+        # count is SPINNER_FRAMES, read by both callers; it is not a literal
+        # anywhere outside this file.
+        'spinner.1'  => { cp => 0x2819, desc => 'braille spinner, 3-dot arc, frame 1 of 8' },
+        'spinner.2'  => { cp => 0x2838, desc => 'braille spinner, 3-dot arc, frame 2 of 8' },
+        'spinner.3'  => { cp => 0x28B0, desc => 'braille spinner, 3-dot arc, frame 3 of 8' },
+        'spinner.4'  => { cp => 0x28E0, desc => 'braille spinner, 3-dot arc, frame 4 of 8' },
+        'spinner.5'  => { cp => 0x28C4, desc => 'braille spinner, 3-dot arc, frame 5 of 8' },
+        'spinner.6'  => { cp => 0x2846, desc => 'braille spinner, 3-dot arc, frame 6 of 8' },
+        'spinner.7'  => { cp => 0x2807, desc => 'braille spinner, 3-dot arc, frame 7 of 8' },
+        'spinner.8'  => { cp => 0x280B, desc => 'braille spinner, 3-dot arc, frame 8 of 8' },
     );
 
     my %built;

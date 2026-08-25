@@ -523,13 +523,11 @@ my %BUTLER_KIND_STYLE = (
     release           => [ 'muted',  'idle' ],
 );
 
-# @SPINNER -- the ten braille spinner glyphs (dots-1..dots-10 order, per
-# their own comments), ordered here (the derived glyph table carries no
-# order). s07-live-status spec S2.1. No glyph is added; no width declaration
-# changes.
-my @SPINNER = map { Encode::encode('UTF-8', $_) }
-    ("\x{280B}","\x{2819}","\x{2839}","\x{2838}","\x{283C}",
-     "\x{2834}","\x{2826}","\x{2827}","\x{2807}","\x{280F}");   # dots-1 .. dots-10
+# @SPINNER DELETED (2026-08-25). It listed the ten spinner glyphs in order so
+# this file could index them directly; nothing has read it since the render
+# path moved to Theme::glyph('spinner.N'), and it was a second, silently
+# divergent copy of the sequence -- which the change to eight uniform frames
+# would have left stale and wrong with no test able to notice.
 
 my $OAUTH_WARN_SECS   = 900;   # 15 minutes (spec S2.2)
 my $BACKPACK_MAX_ROWS = 2;     # spec S3.12
@@ -646,8 +644,12 @@ sub _period_opt {
 sub _title_spinner_char {
     my ($idx) = @_;
     return '*' if !defined($idx) || ref($idx) || $idx !~ /^-?\d+(?:\.\d+)?$/;
-    my $i = int($idx) % 10;
-    $i += 10 if $i < 0;
+    # DERIVED FROM Theme, never restated -- see tui::DashboardScreen's own
+    # _spinner_frame for the same note. The frame count changed once already.
+    my $n = Theme::SPINNER_FRAMES();
+    return '*' if !defined($n) || $n < 1;
+    my $i = int($idx) % $n;
+    $i += $n if $i < 0;
     my $g = Theme::glyph('spinner.' . ($i + 1));
     return (defined($g) && length($g)) ? $g : '*';
 }

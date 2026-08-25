@@ -23,9 +23,10 @@
 # and reachability are different properties, and only the first was pinned.
 #
 # So this file asserts REACHABILITY over the real derivation, and it does so
-# without hard-coding the period: it reads the production constants, so raising
-# or lowering a cadence stays legal while making nine-tenths of the frames
-# unreachable does not.
+# without hard-coding the period OR the frame count: it reads the production
+# constants, so raising or lowering a cadence -- or re-styling the sequence, as
+# 2026-08-25 did when the ten uneven-dot frames became eight uniform ones --
+# stays legal, while making most of the frames unreachable does not.
 #
 # It also pins the two things that made the defect possible, so it cannot be
 # reintroduced by the same route:
@@ -41,6 +42,7 @@ use Test::More;
 
 use_ok('Dashboard') or BAIL_OUT('Dashboard.pm did not load');
 require tui::DashboardScreen;
+require Theme;   # SPINNER_FRAMES -- the frame count, derived like the periods
 
 # ---------------------------------------------------------------------------
 # A. The production cadences are sane and independent of the render tick.
@@ -82,12 +84,18 @@ sub distinct_frames {
     return scalar keys %seen;
 }
 
-is(distinct_frames($SPIN, $SPIN * 10 + $SPIN / 2, $SPIN / 8), 10,
-    'B1: all TEN spinner frames are reachable within one full cycle at the production period '
+# The frame count is DERIVED for the same reason the period is. It was the
+# literal 10 until 2026-08-25, when the sequence became eight uniform-dot
+# frames; the claim -- EVERY frame is reachable in one cycle -- is unchanged and
+# is what this file exists for.
+my $N = Theme::SPINNER_FRAMES();
+
+is(distinct_frames($SPIN, $SPIN * $N + $SPIN / 2, $SPIN / 8), $N,
+    "B1: all $N spinner frames are reachable within one full cycle at the production period "
   . '(this is the assertion that fails against the shipped two-frame arithmetic)');
 
-is(distinct_frames($TITLE, $TITLE * 10 + $TITLE / 2, $TITLE / 8), 10,
-    'B2: all TEN title frames are reachable within one full cycle at the title period');
+is(distinct_frames($TITLE, $TITLE * $N + $TITLE / 2, $TITLE / 8), $N,
+    "B2: all $N title frames are reachable within one full cycle at the title period");
 
 # ---------------------------------------------------------------------------
 # C. THE COUNTER-FIXTURE -- the exact broken arithmetic, proving B1 is not
@@ -98,15 +106,28 @@ is(distinct_frames($TITLE, $TITLE * 10 + $TITLE / 2, $TITLE / 8), 10,
 # different from what B1 measures -- otherwise B1 proves nothing.
 # ---------------------------------------------------------------------------
 {
+    # THE PERIOD IS DERIVED, and it has to be. The shipped defect was period 0.2
+    # against ten frames: an integer clock advances the index by exactly 1/period
+    # = 5 per second, and 5 shares a factor with 10, so only 2 of the 10 frames
+    # were ever reachable -- for ten minutes, or forever. With eight frames
+    # (2026-08-25) 5 and 8 are coprime, so 0.2 happens to reach all of them and
+    # the fixture stopped demonstrating anything at all: still green, proving
+    # nothing, which is the worst state a counter-fixture can be in.
+    #
+    # What is being reproduced is the COARSE LATTICE, not the number 0.2. A
+    # period of 1/$N makes the index advance by exactly $N per second, so an
+    # integer clock lands on frame 0 and stays there -- the sharpest possible
+    # form of the same defect, at whatever frame count is current.
+    my $bad_period = 1 / $N;
     my %seen;
     for my $s (0 .. 600) {                      # ten minutes of integer seconds
-        my $f = tui::DashboardScreen::_spinner_frame(int($s / 0.2));
+        my $f = tui::DashboardScreen::_spinner_frame(int($s / $bad_period));
         $seen{$f}++ if defined $f;
     }
-    is(scalar keys %seen, 2,
-        'C1: COUNTER-FIXTURE -- integer seconds / 0.2 yields exactly 2 distinct frames over TEN '
+    is(scalar keys %seen, 1,
+        "C1: COUNTER-FIXTURE -- integer seconds / (1/$N) yields exactly ONE distinct frame over TEN "
       . 'MINUTES, which is the defect this file exists to prevent recurring');
-    cmp_ok(scalar(keys %seen), '<', 10,
+    cmp_ok(scalar(keys %seen), '<', $N,
         'C2: ...and is strictly worse than the production derivation, so B1 is not vacuous');
 }
 
