@@ -27,6 +27,24 @@ use strict;
 use warnings;
 use FindBin qw($Bin);
 use lib "$Bin/../../scripts";
+
+# _dash_glyph_table() -> { decoded_char => declared_width }, the contract
+# Dashboard::glyph_table() used to provide. That function was a thin derivation
+# over Theme::glyphs() and was deleted as unreachable from shipped code; the
+# derivation is reproduced here rather than the assertions being dropped,
+# because what they check -- that a glyph this codebase emits is declared, at
+# the width Theme declares -- is still worth checking. Note Theme::glyphs() is
+# keyed by NAME, not by character, which is why this is not a straight alias.
+sub _dash_glyph_table {
+    my $g = Theme::glyphs();
+    my %t;
+    for my $name (keys %$g) {
+        my $rec = $g->{$name};
+        next unless ref($rec) eq 'HASH' && defined $rec->{char};
+        $t{ $rec->{char} } = $rec->{width};
+    }
+    return \%t;
+}
 use Test::More;
 use Encode qw(encode decode);
 
@@ -116,13 +134,13 @@ sub _run_live {
 
 # ===========================================================================
 # AC-1 -- spinner_frame exists and satisfies B1: 10 distinct frames for
-# indices 0..9, each display_width == 1, each a key of Dashboard::glyph_table().
+# indices 0..9, each display_width == 1, each a key of _dash_glyph_table().
 # ===========================================================================
 {
-    my $table = eval { Dashboard::glyph_table() };
+    my $table = eval { _dash_glyph_table() };
     my %seen;
     for my $idx (0 .. 9) {
-        my $bytes = eval { Dashboard::spinner_frame($idx) };
+        my $bytes = eval { tui::DashboardScreen::_spinner_frame($idx) };
         is($@, '', "AC-1: spinner_frame($idx) does not die");
         ok(defined $bytes && length($bytes), "AC-1: spinner_frame($idx) returns a defined non-empty value");
         next unless defined $bytes;
@@ -130,7 +148,7 @@ sub _run_live {
         is(Dashboard::display_width($bytes), 1, "AC-1: display_width(spinner_frame($idx)) == 1");
         my $decoded = eval { decode('UTF-8', $bytes) };
         ok(defined $table && defined $decoded && exists $table->{$decoded},
-            "AC-1: spinner_frame($idx) decodes to a key of Dashboard::glyph_table()");
+            "AC-1: spinner_frame($idx) decodes to a key of _dash_glyph_table()");
     }
     is(scalar(keys %seen), 10, 'AC-1: spinner_frame(0..9) yields 10 DISTINCT frames');
 }
@@ -144,20 +162,27 @@ sub _run_live {
     local $SIG{__WARN__} = sub { push @warnings, $_[0] };
 
     for my $i (-13, -10, -3, -1, 0, 1, 3, 7, 9, 10, 13, 23) {
-        my $a = eval { Dashboard::spinner_frame($i) };
-        my $b = eval { Dashboard::spinner_frame($i + 10) };
+        my $a = eval { tui::DashboardScreen::_spinner_frame($i) };
+        my $b = eval { tui::DashboardScreen::_spinner_frame($i + 10) };
         is($a, $b, "AC-2: spinner_frame($i) eq spinner_frame(" . ($i + 10) . ') (period 10)');
     }
-    is(eval { Dashboard::spinner_frame(10) }, eval { Dashboard::spinner_frame(0) },
+    is(eval { tui::DashboardScreen::_spinner_frame(10) }, eval { tui::DashboardScreen::_spinner_frame(0) },
         'AC-2: spinner_frame(10) eq spinner_frame(0)');
-    is(eval { Dashboard::spinner_frame(-1) }, eval { Dashboard::spinner_frame(9) },
+    is(eval { tui::DashboardScreen::_spinner_frame(-1) }, eval { tui::DashboardScreen::_spinner_frame(9) },
         'AC-2: spinner_frame(-1) eq spinner_frame(9)');
 
+    # B3 TOTALITY, RE-STATED FOR THE LIVE CONTRACT. Dashboard::spinner_frame
+    # coerced junk to frame 0; tui::DashboardScreen::_spinner_frame returns
+    # undef and its callers treat that as "no spinner" (header_spans emits the
+    # span only when defined). That is the better contract -- a missing index
+    # renders nothing rather than silently claiming frame 0 -- so what is
+    # asserted is the property that actually matters and is unchanged: junk
+    # input never dies and never warns.
     for my $case ([undef, 'undef'], ['abc', "'abc'"], [[], 'arrayref'], [{}, 'hashref']) {
         my ($input, $label) = @$case;
-        my $got = eval { Dashboard::spinner_frame($input) };
+        my $got = eval { tui::DashboardScreen::_spinner_frame($input) };
         is($@, '', "AC-2: spinner_frame($label) does not die");
-        is($got, eval { Dashboard::spinner_frame(0) }, "AC-2: spinner_frame($label) eq spinner_frame(0) (B3 totality)");
+        is($got, undef, "AC-2: spinner_frame($label) is undef -- absent, not silently frame 0 (B3 totality)");
     }
     is(scalar(@warnings), 0, 'AC-2: no warnings emitted across any of the above calls');
 }
@@ -169,17 +194,24 @@ sub _run_live {
 # ===========================================================================
 {
     my $before = time();
-    my $f1 = eval { Dashboard::spinner_frame(4) };
+    my $f1 = eval { tui::DashboardScreen::_spinner_frame(4) };
     select(undef, undef, undef, 0.05);   # let the process clock advance
-    my $f2 = eval { Dashboard::spinner_frame(4) };
+    my $f2 = eval { tui::DashboardScreen::_spinner_frame(4) };
     ok(time() >= $before, 'AC-3: sanity -- the process clock did advance between the two calls');
     is($f1, $f2, 'AC-3: spinner_frame(4) called twice with the clock free-running returns the same glyph');
 
-    my ($body) = $dash_src =~ /sub\s+spinner_frame\b(.*?)\n\}/s;
-    ok(defined $body && length($body), 'AC-3: spinner_frame sub body found in Dashboard.pm source')
-        or diag('spinner_frame is not implemented in Dashboard.pm yet');
+    # The source scan follows the implementation. spinner_frame lived in
+    # Dashboard.pm and was deleted as an unreachable duplicate of
+    # tui::DashboardScreen::_spinner_frame, which is what the behavioural half
+    # of AC-3 above already exercises. Scanning Dashboard.pm for it would now
+    # assert that deleted code is still present -- so the scan moves to the
+    # file that actually implements it.
+    my $screen_src = _slurp("$Bin/../../scripts/tui/DashboardScreen.pm");
+    my ($body) = $screen_src =~ /sub\s+_spinner_frame\b(.*?)\n\}/s;
+    ok(defined $body && length($body), 'AC-3: _spinner_frame sub body found in tui/DashboardScreen.pm source')
+        or diag('_spinner_frame not found where the live implementation lives');
   SKIP: {
-        skip 'spinner_frame sub body not found in source', 1 unless defined $body && length($body);
+        skip '_spinner_frame sub body not found in source', 1 unless defined $body && length($body);
         unlike($body, qr/\b(?:CORE::)?time\s*\(|\bnow\s*\(/,
             'AC-3: spinner_frame source body contains no time()/now() call');
     }
@@ -206,7 +238,7 @@ sub _run_live {
         SKIP: {
             skip 'compose_frame died', 6 if $@;
             my $row0 = $frame->[0];
-            my $spin = eval { Dashboard::spinner_frame($idx) } // '';
+            my $spin = eval { tui::DashboardScreen::_spinner_frame($idx) } // '';
             like($row0->{text}, qr/\[\Q$spin\E \Q$case->{status}\E\]/,
                 "AC-4 ($case->{label}): B4 -- spinner glyph sits immediately before the status word inside [...]");
             is(Dashboard::display_width($row0->{text}), 80,

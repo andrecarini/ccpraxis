@@ -81,6 +81,24 @@ my $SELF_PATH    = "$Bin/66-dashboard-screen.t";
 
 use lib "$Bin/../../scripts";
 
+# _dash_glyph_table() -> { decoded_char => declared_width }, the contract
+# Dashboard::glyph_table() used to provide. That function was a thin derivation
+# over Theme::glyphs() and was deleted as unreachable from shipped code; the
+# derivation is reproduced here rather than the assertions being dropped,
+# because what they check -- that a glyph this codebase emits is declared, at
+# the width Theme declares -- is still worth checking. Note Theme::glyphs() is
+# keyed by NAME, not by character, which is why this is not a straight alias.
+sub _dash_glyph_table {
+    my $g = Theme::glyphs();
+    my %t;
+    for my $name (keys %$g) {
+        my $rec = $g->{$name};
+        next unless ref($rec) eq 'HASH' && defined $rec->{char};
+        $t{ $rec->{char} } = $rec->{width};
+    }
+    return \%t;
+}
+
 # THE PANEL TITLE LEAD-IN, DERIVED. It was the ASCII '-- '; it is now one
 # Theme rule.h glyph plus a space, so a title line is continuous with its own
 # filler and can serve as the panel's top border (operator request,
@@ -350,8 +368,8 @@ my %TOKENS_PRESENT = (
     last_refreshed_at => $NOW - 3600, last_refreshed_age => 3600,
     subscription_type => 'max', rate_limit_tier => 'default_max',
 );
-my $OAUTH_TEXT_WITH_TOKENS    = Dashboard::fmt_oauth(11520);        # "expires in 3h12m"
-my $OAUTH_TEXT_WITHOUT_TOKENS = Dashboard::fmt_oauth(300);          # "expires in 5m"
+my $OAUTH_TEXT_WITH_TOKENS    = tui::DashboardScreen::_fmt_oauth_like(11520);        # "expires in 3h12m"
+my $OAUTH_TEXT_WITHOUT_TOKENS = tui::DashboardScreen::_fmt_oauth_like(300);          # "expires in 5m"
 
 my @RESOURCE_KEYS_15 = qw(
     machine_name machine_state
@@ -720,15 +738,16 @@ ok(!Theme->can('display_width'),
     for my $name (sort keys %$glyphs) {
         my $g = $glyphs->{$name};
         is(Dashboard::display_width($g->{bytes}), $g->{width}, "AC-G1: Dashboard::display_width(glyph '$name') == Theme's declared width");
-        is(Dashboard::glyph_width($g->{bytes}), $g->{width}, "AC-G1: Dashboard::glyph_width(glyph '$name') == Theme's declared width");
+        is(tui::Layout::glyph_width($g->{bytes}), $g->{width}, "AC-G1: tui::Layout::glyph_width(glyph '$name') == Theme's declared width");
     }
 }
 {
-    my $table = Dashboard::glyph_table();
-    ok(exists $table->{"\x{FF5C}"}, 'AC-G2: Dashboard::glyph_table() contains U+FF5C (sep.bar), by membership not table size');
+    # CHAR-keyed, which Theme::glyphs() is not (it is keyed by glyph NAME).
+    my $table = _dash_glyph_table();
+    ok(exists $table->{"\x{FF5C}"}, 'AC-G2: the glyph table contains U+FF5C (sep.bar), by membership not table size');
     is($table->{"\x{FF5C}"}, 2, 'AC-G2: U+FF5C is declared at width 2') if exists $table->{"\x{FF5C}"};
     for my $cp (0x1F7E2, 0x1F534, 0x1F7E1, 0x26AA) {
-        ok(!exists $table->{ chr($cp) }, sprintf('AC-G2: Dashboard::glyph_table() contains NO U+%04X (emoji circle), by membership', $cp));
+        ok(!exists $table->{ chr($cp) }, sprintf('AC-G2: Theme::glyphs() contains NO U+%04X (emoji circle), by membership', $cp));
     }
 }
 {

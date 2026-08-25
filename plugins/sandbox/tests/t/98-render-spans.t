@@ -25,6 +25,24 @@ use strict;
 use warnings;
 use FindBin qw($Bin);
 use lib "$Bin/../../scripts";
+
+# _dash_glyph_table() -> { decoded_char => declared_width }, the contract
+# Dashboard::glyph_table() used to provide. That function was a thin derivation
+# over Theme::glyphs() and was deleted as unreachable from shipped code; the
+# derivation is reproduced here rather than the assertions being dropped,
+# because what they check -- that a glyph this codebase emits is declared, at
+# the width Theme declares -- is still worth checking. Note Theme::glyphs() is
+# keyed by NAME, not by character, which is why this is not a straight alias.
+sub _dash_glyph_table {
+    my $g = Theme::glyphs();
+    my %t;
+    for my $name (keys %$g) {
+        my $rec = $g->{$name};
+        next unless ref($rec) eq 'HASH' && defined $rec->{char};
+        $t{ $rec->{char} } = $rec->{width};
+    }
+    return \%t;
+}
 use Test::More;
 use Encode qw(encode);
 use Theme;
@@ -40,7 +58,7 @@ use_ok('Dashboard') or BAIL_OUT('Dashboard.pm did not load');
 # here at width 2 are REMOVED from this fixture, not re-pinned at a new
 # width. Obligation 3 (spec 06 S2.2) deletes them from Dashboard's glyph
 # table entirely -- Theme.pm never declared them (they are emoji; Decision
-# 11 forbids emoji in this design system) and Dashboard::glyph_table() now
+# 11 forbids emoji in this design system) and _dash_glyph_table() now
 # derives from Theme::glyphs() instead of its own legacy %GLYPH_TABLE. They
 # are no longer "pinned glyphs" at all, so a row here claiming "this is a
 # pinned glyph at width W" would be false of them regardless of W. Their
@@ -158,7 +176,7 @@ is(Dashboard::display_width("a\tb"), 2,
         { text => 'cd',        role => 'body'   },
     ];
     for my $cols (1, 2, 3, 10, 40, 80, 120) {
-        my $cell = Dashboard::make_cell($mixed_line, 'body', $cols);
+        my $cell = tui::Frame::make_cell($mixed_line, 'body', $cols);
         is(Dashboard::spans_width($cell->{spans}), $cols,
             "AC-6: spans_width(make_cell(mixed spans, cols=$cols)) == $cols");
         is(Dashboard::display_width($cell->{text}), $cols,
@@ -196,7 +214,7 @@ is(Dashboard::display_width("a\tb"), 2,
         my $wide_char   = Theme::glyphs()->{$wide_name}{char};
         my $glyph_bytes = encode('UTF-8', $wide_char);
         my $line = 'a' . $wide_char;                 # decoded width 1 + 2 = 3
-        my $cell = Dashboard::make_cell($line, 'body', 2);   # the cut lands mid-glyph
+        my $cell = tui::Frame::make_cell($line, 'body', 2);   # the cut lands mid-glyph
         is(Dashboard::display_width($cell->{text}), 2,
             'AC-7: mid-glyph truncation still yields exactly $w == 2 columns');
         is($cell->{text}, 'a ',
@@ -215,13 +233,13 @@ is(Dashboard::display_width("a\tb"), 2,
 {
     my $build = sub {
         my @rows;
-        push @rows, Dashboard::make_cell(
+        push @rows, tui::Frame::make_cell(
             [ { text => 'foo', role => 'label' }, { text => "\x{1F7E2}", role => 'accent' } ],
             'body', 20);
-        push @rows, Dashboard::make_cell(
+        push @rows, tui::Frame::make_cell(
             [ { text => 'bar', role => 'value' }, { text => 'baz', role => 'muted' } ],
             'body', 20);
-        push @rows, Dashboard::make_cell('plain footer row', 'footer', 20);
+        push @rows, tui::Frame::make_cell('plain footer row', 'footer', 20);
         return \@rows;
     };
     my $mfA = $build->();
@@ -244,8 +262,8 @@ is(Dashboard::display_width("a\tb"), 2,
     # (a) role-only: the ROW-level (cell) role changes; every span (text +
     # role) is byte-for-byte identical between the two frames.
     my $fixed_span = [ { text => 'txt', role => 'accent' } ];
-    my $cellA = Dashboard::make_cell($fixed_span, 'body',  3);   # exact fit, no pad
-    my $cellB = Dashboard::make_cell($fixed_span, 'alert', 3);
+    my $cellA = tui::Frame::make_cell($fixed_span, 'body',  3);   # exact fit, no pad
+    my $cellB = tui::Frame::make_cell($fixed_span, 'alert', 3);
     is_deeply($cellA->{spans}, $cellB->{spans},
         'AC-11 role-only setup: spans array is identical between the two cells');
     is($cellA->{text}, $cellB->{text},
@@ -253,7 +271,7 @@ is(Dashboard::display_width("a\tb"), 2,
     isnt($cellA->{role}, $cellB->{role},
         'AC-11 role-only setup: only the row-level (cell) role differs');
 
-    my $footer3 = Dashboard::make_cell('same', 'footer', 3);
+    my $footer3 = tui::Frame::make_cell('same', 'footer', 3);
     my $frameA = [ $footer3, $cellA ];
     my $frameB = [ $footer3, $cellB ];
     my $rdiff = Dashboard::render_frame($frameA, $frameB, { color => 0 });
@@ -265,9 +283,9 @@ is(Dashboard::display_width("a\tb"), 2,
     # (b) span-only: the OUTER cell role and the concatenated cell text are
     # both identical; only ONE span's role differs (the same visible text is
     # split across spans differently).
-    my $cellC = Dashboard::make_cell(
+    my $cellC = tui::Frame::make_cell(
         [ { text => 'ab', role => 'label' }, { text => 'cd', role => 'body' } ], 'body', 4);
-    my $cellD = Dashboard::make_cell(
+    my $cellD = tui::Frame::make_cell(
         [ { text => 'ab', role => 'muted' }, { text => 'cd', role => 'body' } ], 'body', 4);
     is($cellC->{text}, $cellD->{text},
         'AC-11 span-only setup: concatenated cell text is identical');
@@ -276,7 +294,7 @@ is(Dashboard::display_width("a\tb"), 2,
     isnt($cellC->{spans}[0]{role}, $cellD->{spans}[0]{role},
         "AC-11 span-only setup: only one span's role differs");
 
-    my $footer4 = Dashboard::make_cell('same', 'footer', 4);
+    my $footer4 = tui::Frame::make_cell('same', 'footer', 4);
     my $frameC = [ $footer4, $cellC ];
     my $frameD = [ $footer4, $cellD ];
     my $sdiff = Dashboard::render_frame($frameC, $frameD, { color => 0 });
@@ -295,15 +313,15 @@ is(Dashboard::display_width("a\tb"), 2,
 {
     my @rows = (
         # exact-fit (no padding span) -- last span 'accent' has a non-empty SGR
-        Dashboard::make_cell(
+        tui::Frame::make_cell(
             [ { text => 'AAA', role => 'label' }, { text => 'BBB', role => 'accent' } ],
             'body', 6),
         # exact-fit -- last span 'value' has an EMPTY SGR
-        Dashboard::make_cell(
+        tui::Frame::make_cell(
             [ { text => 'CCC', role => 'strong' }, { text => 'DDD', role => 'value' } ],
             'body', 6),
         # exact-fit, three spans -- last span 'body' has an EMPTY SGR
-        Dashboard::make_cell(
+        tui::Frame::make_cell(
             [ { text => 'E', role => 'good' }, { text => 'F', role => 'warn' }, { text => 'G', role => 'body' } ],
             'body', 3),
     );
@@ -390,7 +408,7 @@ is(Dashboard::display_width("a\tb"), 2,
 # '?' (never one '?' per byte).
 # ===========================================================================
 {
-    my $table = Dashboard::glyph_table();
+    my $table = _dash_glyph_table();
     is(ref($table), 'HASH', 'AC-15: glyph_table() returns a hashref');
 
     # SUPERSEDED (s23): `is(scalar(keys %$table), 18, ...)`.
@@ -409,14 +427,14 @@ is(Dashboard::display_width("a\tb"), 2,
         my $bytes   = encode('UTF-8', $decoded);
         my $tag     = sprintf('U+%04X %s', $cp, $name);
         is($table->{$decoded}, $w, "AC-15: glyph_table()->{$tag} == $w");
-        is(Dashboard::glyph_width($decoded), $w, "AC-15: glyph_width(decoded $tag) == $w");
-        is(Dashboard::glyph_width($bytes),   $w, "AC-15: glyph_width(bytes $tag) == $w");
+        is(tui::Layout::glyph_width($decoded), $w, "AC-15: glyph_width(decoded $tag) == $w");
+        is(tui::Layout::glyph_width($bytes),   $w, "AC-15: glyph_width(bytes $tag) == $w");
         is(Dashboard::_safe($decoded), $bytes,
             "AC-15: _safe(decoded $tag) passes the glyph through byte-for-byte");
         is(Dashboard::_safe($bytes), $bytes,
             "AC-15: _safe(bytes $tag) passes the glyph through byte-for-byte");
     }
-    is(Dashboard::glyph_width('z'), undef, 'AC-15: glyph_width of a non-glyph char -> undef');
+    is(tui::Layout::glyph_width('z'), undef, 'AC-15: glyph_width of a non-glyph char -> undef');
 
     # unlisted non-ASCII CHARACTER -> exactly one '?' (not one per byte)
     my $unlisted       = "\x{4E16}";   # CJK "world", 3 UTF-8 bytes, not allow-listed
@@ -440,7 +458,7 @@ is(Dashboard::display_width("a\tb"), 2,
 # 2026-08-08, driver scope grant E-B): the four status-circle emoji that used
 # to sit in @GLYPHS at width 2. Obligation 3 (spec 06 S2.2) deletes them from
 # the glyph table outright -- they are not "resized", they are GONE: Theme.pm
-# never declared them (Decision 11 forbids emoji) and Dashboard::glyph_table()
+# never declared them (Decision 11 forbids emoji) and _dash_glyph_table()
 # now derives from Theme::glyphs() instead of its own legacy %GLYPH_TABLE.
 #
 # The claim AC-2/AC-15's per-glyph loop made about these four rows ("this is
@@ -479,12 +497,12 @@ is(Dashboard::display_width("a\tb"), 2,
 
         # glyph_table()/glyph_width(): the glyph is gone, not resized
         # (Behavior 3).
-        my $table = Dashboard::glyph_table();
+        my $table = _dash_glyph_table();
         ok(!exists $table->{$decoded},
             "AC-15 RETARGETED: glyph_table() no longer contains $tag (Behavior 3)");
-        is(Dashboard::glyph_width($decoded), undef,
+        is(tui::Layout::glyph_width($decoded), undef,
             "AC-15 RETARGETED: glyph_width(decoded $tag) == undef (no longer declared)");
-        is(Dashboard::glyph_width($bytes), undef,
+        is(tui::Layout::glyph_width($bytes), undef,
             "AC-15 RETARGETED: glyph_width(bytes $tag) == undef (no longer declared)");
 
         # _safe: an unlisted character collapses to exactly one '?', the
@@ -583,8 +601,8 @@ is(Dashboard::display_width("a\tb"), 2,
     # -- byte-identical regression guard, independent of any panel-layout
     # specifics: derived purely from the pinned S3.11/S3.12 algorithm --
     my @rows = (
-        Dashboard::make_cell('Row One', 'body',   10),
-        Dashboard::make_cell('Row Two', 'footer', 10),
+        tui::Frame::make_cell('Row One', 'body',   10),
+        tui::Frame::make_cell('Row Two', 'footer', 10),
     );
     my $out = Dashboard::render_frame(undef, \@rows, { color => 0 });
     my $expected = "\e[?2026h" . "\e[2J\e[H"

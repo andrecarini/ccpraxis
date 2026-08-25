@@ -360,16 +360,16 @@ sub src_unlike {
         [qr/nothing is deleted/i, 'promises nothing is deleted'],
     );
     for my $cols (40, 80, 200) {
-        my $p = eval { Dashboard::confirm_prompt('relaunch', $cols) };
+        my $p = eval { tui::DashboardScreen::_confirm_prompt('relaunch', $cols) };
         ok(defined $p, "AC-5: confirm_prompt('relaunch', $cols) is defined");
         for my $pin (@pins) {
             my ($re, $what) = @$pin;
             like_or_fail($p, $re, "AC-5: relaunch prompt $what at cols=$cols");
         }
     }
-    is(eval { Dashboard::confirm_prompt('', 80) }, undef,
+    is(eval { tui::DashboardScreen::_confirm_prompt('', 80) }, undef,
         "AC-5: confirm_prompt('', 80) is still undef");
-    is(eval { Dashboard::confirm_prompt('shutdown', 80) }, undef,
+    is(eval { tui::DashboardScreen::_confirm_prompt('shutdown', 80) }, undef,
         "AC-5: confirm_prompt('shutdown', 80) (legacy token) is still undef");
 }
 
@@ -385,7 +385,7 @@ sub src_unlike {
     my $fr = Dashboard::compose_frame(\%sr, 12, 80);
     is($fr->[-1]{role}, 'state.crit',
         "AC-6: pending='relaunch' -> footer role is state.crit (was footer-alert -- Theme token migration)");
-    my $prompt = eval { Dashboard::confirm_prompt('relaunch', 80) };
+    my $prompt = eval { tui::DashboardScreen::_confirm_prompt('relaunch', 80) };
     if (defined $prompt) {
         like($fr->[-1]{text}, qr/\Q$prompt\E/,
             "AC-6: pending='relaunch' -> footer text carries the relaunch confirm prompt");

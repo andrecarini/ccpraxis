@@ -27,7 +27,7 @@
 #
 # NO SHAPE PINS (AC-19, Decision 15): no count/is_deeply over the FULL role
 # set, glyph set, %EMOJI_PENDING, %PENDING_GLYPH_REGISTRATION,
-# @GENERATED_SURFACES or Dashboard::glyph_table() anywhere below. Any
+# @GENERATED_SURFACES or _dash_glyph_table() anywhere below. Any
 # is(scalar(...), N) with N > 2 is over a fixture THIS FILE built, and its
 # description says "fixture". The two is_deeply(\@names_in_hash,
 # \@sorted_roles, ...) calls in section G compare two LIVE outputs derived
@@ -62,6 +62,24 @@ my $STATUSLINE_REL  = 'scripts/statusline.pl';
 my $STATUSLINE_ABS  = "$ROOT/$STATUSLINE_REL";
 
 use lib "$Bin/../../scripts";
+
+# _dash_glyph_table() -> { decoded_char => declared_width }, the contract
+# Dashboard::glyph_table() used to provide. That function was a thin derivation
+# over Theme::glyphs() and was deleted as unreachable from shipped code; the
+# derivation is reproduced here rather than the assertions being dropped,
+# because what they check -- that a glyph this codebase emits is declared, at
+# the width Theme declares -- is still worth checking. Note Theme::glyphs() is
+# keyed by NAME, not by character, which is why this is not a straight alias.
+sub _dash_glyph_table {
+    my $g = Theme::glyphs();
+    my %t;
+    for my $name (keys %$g) {
+        my $rec = $g->{$name};
+        next unless ref($rec) eq 'HASH' && defined $rec->{char};
+        $t{ $rec->{char} } = $rec->{width};
+    }
+    return \%t;
+}
 
 # ===========================================================================
 # Literal constants (spec §2.7.1) — declared here, NOT sourced from Theme,
@@ -379,7 +397,7 @@ SKIP: {
     is(Dashboard::display_width($full_block), 1,
         'sanity: Dashboard::display_width agrees with Dashboard\'s own declared width for U+2588 (gauge.full)');
     my $up_triangle = Encode::encode('UTF-8', "\x{25B2}");  # scroll.up, Dashboard.pm:242, declared width 1
-    is(Dashboard::glyph_width($up_triangle), 1,
+    is(tui::Layout::glyph_width($up_triangle), 1,
         'sanity: Dashboard::glyph_width agrees with Dashboard\'s own declared width for U+25B2 (scroll.up)');
 }
 
@@ -1027,7 +1045,7 @@ if ($THEME_OK) {
         for my $case (@HOSTILE) {
             my ($label, $evil) = @$case;
             my $dash_w    = Dashboard::display_width($evil);
-            my $dash_safe = Dashboard::clip_pad($evil, $dash_w);
+            my $dash_safe = tui::Frame::clip_pad($evil, $dash_w);
             my $dashboard_flagged_unsafe = ($dash_safe ne $evil) ? 1 : 0;
           SKIP: {
                 skip("Dashboard's own sanitizer did not flag '$label' as unsafe -- nothing to cross-check", 1)
@@ -1557,13 +1575,13 @@ is_deeply(Theme::x256_rgb(196), [255, 0, 0],     'x256_rgb(196) == [255,0,0] (B-
     my $glyphs = Theme::glyphs();
   SKIP: {
         skip('Dashboard.pm did not load', 1) unless $DASHBOARD_OK;
-        my $dt = Dashboard::glyph_table();
+        my $dt = _dash_glyph_table();
         for my $name (sort keys %$glyphs) {
             my $g = $glyphs->{$name};
           SKIP: {
-                skip("glyph '$name' not present in Dashboard::glyph_table()", 1) unless exists $dt->{ $g->{char} };
-                is(Dashboard::glyph_width($g->{bytes}), $g->{width},
-                    "glyph '$name': present in Dashboard::glyph_table() -- Dashboard::glyph_width agrees with declared width (B-E9, AC-11)");
+                skip("glyph '$name' not present in _dash_glyph_table()", 1) unless exists $dt->{ $g->{char} };
+                is(tui::Layout::glyph_width($g->{bytes}), $g->{width},
+                    "glyph '$name': present in _dash_glyph_table() -- Dashboard::glyph_width agrees with declared width (B-E9, AC-11)");
             }
         }
     }
@@ -1573,19 +1591,19 @@ is_deeply(Theme::x256_rgb(196), [255, 0, 0],     'x256_rgb(196) == [255,0,0] (B-
     my $glyphs = Theme::glyphs();
   SKIP: {
         skip('Dashboard.pm did not load', 1) unless $DASHBOARD_OK;
-        my $dt = Dashboard::glyph_table();
+        my $dt = _dash_glyph_table();
         for my $char (sort keys %$dt) {
             my $cp = ord($char);
             next if _is_emoji($cp);
             my $dash_width = $dt->{$char};
             my ($match) = grep { $_->{char} eq $char } values %$glyphs;
             ok(defined($match),
-                sprintf('Dashboard::glyph_table() entry U+%04X (non-emoji) is declared in Theme::glyphs() (B-E10, AC-9)', $cp))
+                sprintf('_dash_glyph_table() entry U+%04X (non-emoji) is declared in _dash_glyph_table() (B-E10, AC-9)', $cp))
                 or diag(sprintf('  U+%04X (Dashboard width %d) has no matching Theme::glyphs() entry', $cp, $dash_width));
           SKIP: {
                 skip('no matching Theme glyph to compare width against', 1) unless defined $match;
                 is($match->{width}, $dash_width,
-                    sprintf('Dashboard::glyph_table() entry U+%04X width agrees with Theme\'s declared width (B-E10, AC-9)', $cp));
+                    sprintf('_dash_glyph_table() entry U+%04X width agrees with Theme\'s declared width (B-E10, AC-9)', $cp));
             }
         }
     }

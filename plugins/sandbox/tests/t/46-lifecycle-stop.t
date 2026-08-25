@@ -293,16 +293,16 @@ sub _seq_order_ok {
     # AC-5 (B5): footer_legend tiering, exact pinned strings at the extremes.
     # footer_legend does NOT exist yet -- every call is wrapped in eval so a
     # missing sub degrades to a clean per-assertion FAIL, not a fatal abort.
-    my $t1 = eval { Dashboard::footer_legend(200) };
-    is($t1, ' [c] launch Claude Code  [s] stop runs  [x] full shutdown  [up/down] scroll  [r] refresh  [q] quit',
+    my $t1 = eval { tui::DashboardScreen::_footer_legend(200) };
+    is($t1, ' [c] launch Claude Code  [s] stop runs  [x] full shutdown  [up/down] scroll  [r] reload  [q] quit',
         'AC-5: footer_legend(200) is the pinned T1 string, byte-for-byte');
 
-    my $at80 = eval { Dashboard::footer_legend(80) };
+    my $at80 = eval { tui::DashboardScreen::_footer_legend(80) };
     like($at80 // '', qr/\[c\] launch Claude Code/,
         'AC-5: footer_legend(80) still contains "[c] launch Claude Code" (T2, per spec B5)');
 
-    my $t3 = eval { Dashboard::footer_legend(40) };
-    is($t3, ' [c] launch  [s] stop  [x] shutdown  [r] refresh  [q] quit',
+    my $t3 = eval { tui::DashboardScreen::_footer_legend(40) };
+    is($t3, ' [c] launch  [s] stop  [x] shutdown  [r] reload  [q] quit',
         'AC-5: footer_legend(40) is the pinned T3 string, byte-for-byte');
 
     for my $tier ([$t1, 200], [$at80, 80], [$t3, 40]) {
@@ -315,7 +315,7 @@ sub _seq_order_ok {
     # AC-6 (B6): confirm prompts name their exact effects, at wide + narrow.
     # confirm_prompt does NOT exist yet -- every call is wrapped in eval.
     for my $cols (40, 80, 200) {
-        my $sr = eval { Dashboard::confirm_prompt('stop-runs', $cols) };
+        my $sr = eval { tui::DashboardScreen::_confirm_prompt('stop-runs', $cols) };
         ok(defined $sr, "AC-6: confirm_prompt('stop-runs', $cols) is defined");
         if (defined $sr) {
             like($sr, qr/butler runs|ALL .*runs/i, "AC-6: stop-runs prompt names its effect at cols=$cols");
@@ -330,7 +330,7 @@ sub _seq_order_ok {
             fail("AC-6: stop-runs prompt mentions cancel at cols=$cols");
         }
 
-        my $fs = eval { Dashboard::confirm_prompt('full-shutdown', $cols) };
+        my $fs = eval { tui::DashboardScreen::_confirm_prompt('full-shutdown', $cols) };
         ok(defined $fs, "AC-6: confirm_prompt('full-shutdown', $cols) is defined");
         if (defined $fs) {
             like($fs, qr/STOP (THIS )?CONTAINER/, "AC-6: full-shutdown prompt says STOP (THIS) CONTAINER at cols=$cols");
@@ -345,8 +345,8 @@ sub _seq_order_ok {
             fail("AC-6: full-shutdown prompt mentions cancel at cols=$cols");
         }
     }
-    is(eval { Dashboard::confirm_prompt('', 80) }, undef, "AC-6: confirm_prompt('', 80) is undef");
-    is(eval { Dashboard::confirm_prompt('shutdown', 80) }, undef,
+    is(eval { tui::DashboardScreen::_confirm_prompt('', 80) }, undef, "AC-6: confirm_prompt('', 80) is undef");
+    is(eval { tui::DashboardScreen::_confirm_prompt('shutdown', 80) }, undef,
         "AC-6: confirm_prompt('shutdown', 80) (legacy token) is undef");
 
     # AC-7 (B7): compose_frame footer role selection.
@@ -363,7 +363,7 @@ sub _seq_order_ok {
         my $f = Dashboard::compose_frame(\%s, 10, 80);
         is($f->[-1]{role}, 'state.crit',
             "AC-7: pending='$tok' -> footer role is state.crit (was footer-alert -- Theme token migration)");
-        my $prompt = eval { Dashboard::confirm_prompt($tok, 80) };
+        my $prompt = eval { tui::DashboardScreen::_confirm_prompt($tok, 80) };
         like($f->[-1]{text}, qr/\Q$prompt\E/, "AC-7: pending='$tok' -> footer text carries the confirm prompt")
             if defined $prompt;
         fail("AC-7: pending='$tok' -> footer text carries the confirm prompt") unless defined $prompt;

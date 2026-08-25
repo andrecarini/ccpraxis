@@ -51,6 +51,24 @@ my $DASHBOARD_PM = "$SCRIPTS/Dashboard.pm";
 
 use lib "$Bin/../../scripts";
 
+# _dash_glyph_table() -> { decoded_char => declared_width }, the contract
+# Dashboard::glyph_table() used to provide. That function was a thin derivation
+# over Theme::glyphs() and was deleted as unreachable from shipped code; the
+# derivation is reproduced here rather than the assertions being dropped,
+# because what they check -- that a glyph this codebase emits is declared, at
+# the width Theme declares -- is still worth checking. Note Theme::glyphs() is
+# keyed by NAME, not by character, which is why this is not a straight alias.
+sub _dash_glyph_table {
+    my $g = Theme::glyphs();
+    my %t;
+    for my $name (keys %$g) {
+        my $rec = $g->{$name};
+        next unless ref($rec) eq 'HASH' && defined $rec->{char};
+        $t{ $rec->{char} } = $rec->{width};
+    }
+    return \%t;
+}
+
 # THE PANEL TITLE LEAD-IN, DERIVED. It was the ASCII '-- '; it is now one
 # Theme rule.h glyph plus a space, so a title line is continuous with its own
 # filler and can serve as the panel's top border (operator request,
@@ -999,7 +1017,7 @@ SKIP: {
     my $dash_ok = eval { require Dashboard; 1 };
   SKIP: {
         skip('Dashboard.pm did not load', 2) unless $dash_ok;
-        my $dash_table   = Dashboard::glyph_table();
+        my $dash_table   = _dash_glyph_table();
         my $theme_glyphs = Theme::glyphs();
         my @overlap_chars = grep { exists $dash_table->{$_} }
             map { $theme_glyphs->{$_}{char} } keys %$theme_glyphs;
@@ -1022,7 +1040,7 @@ SKIP: {
         my ($cp_violations, $cp_first) = (0, undef);
         for my $s (@ascii_corpus) {
             for my $w (0, 1, 5, 20) {
-                my ($a, $b) = (tui::Frame::clip_pad($s, $w), Dashboard::clip_pad($s, $w));
+                my ($a, $b) = (tui::Frame::clip_pad($s, $w), tui::Frame::clip_pad($s, $w));
                 if ($a ne $b) { $cp_violations++; $cp_first //= "clip_pad('$s',$w): tui='$a' dashboard='$b'"; }
             }
         }

@@ -36,6 +36,25 @@ use strict;
 use warnings;
 use FindBin qw($Bin);
 use lib "$Bin/../../scripts";
+require tui::Meter;
+
+# _dash_glyph_table() -> { decoded_char => declared_width }, the contract
+# Dashboard::glyph_table() used to provide. That function was a thin derivation
+# over Theme::glyphs() and was deleted as unreachable from shipped code; the
+# derivation is reproduced here rather than the assertions being dropped,
+# because what they check -- that a glyph this codebase emits is declared, at
+# the width Theme declares -- is still worth checking. Note Theme::glyphs() is
+# keyed by NAME, not by character, which is why this is not a straight alias.
+sub _dash_glyph_table {
+    my $g = Theme::glyphs();
+    my %t;
+    for my $name (keys %$g) {
+        my $rec = $g->{$name};
+        next unless ref($rec) eq 'HASH' && defined $rec->{char};
+        $t{ $rec->{char} } = $rec->{width};
+    }
+    return \%t;
+}
 use Test::More;
 use Encode qw(encode decode);
 use JSON::PP ();
@@ -240,8 +259,37 @@ sub R {
 }
 
 # D($fn, @args) -> Dashboard::$fn(@args) scalar value, undef on missing/die.
+# D($fn, @args) -- dispatch to Dashboard::$fn, EXCEPT for the handful of names
+# that moved out of Dashboard entirely.
+#
+# gauge and fmt_bytes were deleted as unreachable: tui::Meter owns both now.
+# The shims below preserve the legacy CALL SHAPE (gauge took $used/$total and
+# divided; bar takes the ratio and a cell count) so the vector tables above and
+# below keep their meaning, and their output is byte-identical -- verified, not
+# assumed, before this was written. Routing here rather than rewriting every
+# call site keeps the mapping in one readable place.
+my %MOVED = (
+    gauge     => sub {
+        # Third argument is the cell count, defaulting to ten -- the legacy
+        # signature took it too, and one vector below exercises it.
+        my ($used, $total, $cells) = @_;
+        # Truncated with int(), so 4.9 cells is 4 -- pinned by a vector below.
+        $cells = (defined $cells && !ref($cells) && $cells =~ /^\d+(?:\.\d+)?$/ && int($cells) >= 1)
+               ? int($cells) : 10;
+        # Junk in -> an EMPTY bar, never undef. That was the legacy contract and
+        # it is the one the vector table pins: a gauge with nothing to show
+        # still occupies its ten cells, so the layout does not move when a
+        # reading is missing.
+        my $bad = (!defined $total || ref($total) || $total !~ /^-?\d+(?:\.\d+)?$/ || $total <= 0)
+               || (!defined $used  || ref($used)  || $used  !~ /^-?\d+(?:\.\d+)?$/ || $used < 0);
+        return tui::Meter::bar($bad ? 0 : $used / $total, $cells);
+    },
+    fmt_bytes => sub { return tui::Meter::fmt_bytes(@_) },
+);
+
 sub D {
     my ($fn, @args) = @_;
+    return eval { $MOVED{$fn}->(@args) } if $MOVED{$fn};
     my $res = eval { no strict 'refs'; &{"Dashboard::$fn"}(@args) };
     return $res;
 }
@@ -1003,36 +1051,48 @@ ok(Resources->can('gather'), 'S2.4: Resources::gather exists (guards the counter
 # 8. Classifier / gauge / formatter -- AC-15..AC-18.
 # ===========================================================================
 
-# --- AC-15 -> DC-2: pressure_role, boundaries included. -------------------
+# --- AC-15 -> DC-2: the pressure THRESHOLD TABLE, boundaries included. -----
+#
+# RE-POINTED to tui::Meter, which owns this decision now. Dashboard's own
+# pressure_role was deleted as unreachable; it took ($used, $total), divided,
+# and returned the legacy role names. tui::Meter::pressure_role takes the RATIO
+# and returns Theme role names, so the vectors below carry ratios and Theme
+# names -- the same boundaries, expressed against the module that decides them.
+#
+# The old guard vectors (total 0 / negative / non-numeric / a ref) are NOT
+# re-pointed as-is: dividing was Dashboard's job, so "what happens when total
+# is zero" was a question about a function that no longer exists. tui::Meter's
+# own contract for junk input is undef, and that is asserted instead -- t/65
+# covers its totality more broadly.
 {
     my @vectors = (
-        [ '(0,100)    ratio 0',                        [ 0, 100 ],     'good' ],
-        [ '(74,100)   ratio 0.74',                     [ 74, 100 ],    'good' ],
-        [ '(74.9,100) just under the warn boundary',   [ 74.9, 100 ],  'good' ],
-        [ '(75,100)   EXACTLY 0.75 -- BOUNDARY',       [ 75, 100 ],    'warn' ],
-        [ '(89.9,100) just under the bad boundary',    [ 89.9, 100 ],  'warn' ],
-        [ '(90,100)   EXACTLY 0.90 -- BOUNDARY',       [ 90, 100 ],    'bad' ],
-        [ '(100,100)  ratio 1',                        [ 100, 100 ],   'bad' ],
-        [ '(150,100)  ratio > 1, no clamp',            [ 150, 100 ],   'bad' ],
-        [ '(1,0)      total 0',                        [ 1, 0 ],       'muted' ],
-        [ '(1,-5)     total negative',                 [ 1, -5 ],      'muted' ],
-        [ '(undef,100) used undef',                    [ undef, 100 ], 'muted' ],
-        [ '(-1,100)   used negative',                  [ -1, 100 ],    'muted' ],
-        [ "('x',100)  used non-numeric",               [ 'x', 100 ],   'muted' ],
-        [ "(50,'x')   total non-numeric",              [ 50, 'x' ],    'muted' ],
-        [ '([],100)   used a ref',                     [ [], 100 ],    'muted' ],
+        [ '0      ratio 0',                       0,     'state.ok' ],
+        [ '0.74   just inside good',              0.74,  'state.ok' ],
+        [ '0.749  just under the warn boundary',  0.749, 'state.ok' ],
+        [ '0.75   EXACTLY the warn boundary',     0.75,  'state.warn' ],
+        [ '0.899  just under the crit boundary',  0.899, 'state.warn' ],
+        [ '0.90   EXACTLY the crit boundary',     0.90,  'state.crit' ],
+        [ '1      ratio 1',                       1,     'state.crit' ],
+        [ '1.5    ratio > 1, no clamp',           1.5,   'state.crit' ],
     );
     for my $v (@vectors) {
-        my ($label, $args, $want) = @$v;
-        is(D('pressure_role', @$args), $want, "AC-15: pressure_role$label == '$want'");
+        my ($label, $ratio, $want) = @$v;
+        is(tui::Meter::pressure_role($ratio), $want, "AC-15: pressure_role($label) == '$want'");
     }
-    my $r75 = D('pressure_role', 75, 100);
-    my $r90 = D('pressure_role', 90, 100);
-    ok(defined($r75) && !ref($r75) && $r75 ne 'good',
-        'AC-15: ratio exactly 0.75 is NOT good (good uses a strict <)');
-    ok(defined($r90) && !ref($r90) && $r90 ne 'warn',
+    # The boundaries are STRICT `<` on the lower side -- the property the
+    # original block called out explicitly, kept verbatim in intent.
+    isnt(tui::Meter::pressure_role(0.75), 'state.ok',
+        'AC-15: ratio exactly 0.75 is NOT ok (ok uses a strict <)');
+    isnt(tui::Meter::pressure_role(0.90), 'state.warn',
         'AC-15: ratio exactly 0.90 is NOT warn (warn uses a strict <)');
+    # Junk degrades to undef rather than to a role, so a caller cannot paint
+    # with a value it never computed.
+    for my $junk (undef, 'x', [], {}) {
+        my $label = !defined $junk ? 'undef' : (ref $junk ? ref $junk : "'$junk'");
+        is(tui::Meter::pressure_role($junk), undef, "AC-15: pressure_role($label) is undef, not a role");
+    }
 }
+
 
 # --- AC-16 -> DC-2/DC-4: every returned role is styled by sgr_for_role. ---
 {
@@ -1075,7 +1135,7 @@ ok(Resources->can('gather'), 'S2.4: Resources::gather exists (guards the counter
     is(D('gauge', 100, 100, 4.9), $FULL x 4, 'AC-17: $cells is truncated with int() (4.9 -> 4)');
 
     # Both glyphs are already allow-listed (this package adds none).
-    my $table = Dashboard::glyph_table();
+    my $table = _dash_glyph_table();
     is(ref($table) eq 'HASH' ? $table->{"\x{2588}"} : undef, 1, 'AC-17: U+2588 is already in glyph_table at width 1');
     is(ref($table) eq 'HASH' ? $table->{"\x{2591}"} : undef, 1, 'AC-17: U+2591 is already in glyph_table at width 1');
 }

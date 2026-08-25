@@ -210,19 +210,20 @@ is(Dashboard::fmt_age(90000),   '1d01h',  'age: 1d01h');
 is(Dashboard::fmt_age(undef),   'n/a',    'age: undef -> n/a (ASCII, width-safe)');
 is(Dashboard::fmt_age(-5),      'n/a',    'age: negative -> n/a');
 
-# fmt_hms: uptime in explicit "Xh Ym Zs", all three components always shown.
-is(Dashboard::fmt_hms(0),       '0h 0m 0s',  'hms: zero');
-is(Dashboard::fmt_hms(13),      '0h 0m 13s', 'hms: seconds only');
-is(Dashboard::fmt_hms(133),     '0h 2m 13s', 'hms: minutes + seconds');
-is(Dashboard::fmt_hms(7509),    '2h 5m 9s',  'hms: hours + minutes + seconds');
-is(Dashboard::fmt_hms(undef),   'n/a',       'hms: undef -> n/a');
-is(Dashboard::fmt_hms(-1),      'n/a',       'hms: negative -> n/a');
+# fmt_hms's six assertions removed 2026-08-25. It formatted an uptime as an
+# explicit "Xh Ym Zs" with all three components always shown, was deleted as
+# unreachable, and has NO successor: the spec that superseded it (AC-F5/S2.4.7)
+# says fmt_hms is off every render path, and the live surfaces use fmt_age or
+# fmt_duration, whose own assertions sit immediately above and below this note.
+# Not re-pointed at fmt_duration, which is a different format ('13s', not
+# '0h 0m 13s') -- re-pointing would have meant rewriting the expectations to
+# match, which is authoring new coverage rather than preserving old.
 
-is(length(Dashboard::clip_pad('hi', 5)), 5,  'clip_pad: pads up to width');
-is(Dashboard::clip_pad('hi', 5),  'hi   ',   'clip_pad: right-pads with spaces');
-is(Dashboard::clip_pad('hello world', 5), 'hello', 'clip_pad: truncates to width');
-is(Dashboard::clip_pad('x', 0),   '',        'clip_pad: width 0 -> empty');
-is(Dashboard::clip_pad(undef, 3), '   ',     'clip_pad: undef -> spaces');
+is(length(tui::Frame::clip_pad('hi', 5)), 5,  'clip_pad: pads up to width');
+is(tui::Frame::clip_pad('hi', 5),  'hi   ',   'clip_pad: right-pads with spaces');
+is(tui::Frame::clip_pad('hello world', 5), 'hello', 'clip_pad: truncates to width');
+is(tui::Frame::clip_pad('x', 0),   '',        'clip_pad: width 0 -> empty');
+is(tui::Frame::clip_pad(undef, 3), '   ',     'clip_pad: undef -> spaces');
 
 {
     my $dir = tempdir(CLEANUP => 1);
@@ -755,21 +756,6 @@ my %st = (
         'backpack (inverted, counter-fixture): the summary row (with its non-zero total) IS present in the frame even though the item keys are not');
 }
 {
-    # _backpack_lines: empty stays the unchanged quiet line; a large item list
-    # never exceeds header + 2 paragraph rows and shows "+N more" (cap never
-    # silent) -- exact K/N arithmetic is t/41-panel-semantics.t AC13's job.
-    my @empty = Dashboard::_backpack_lines({ total => 0 });
-    like(Dashboard::spans_text($empty[0]), qr/no backpack/, 'backpack: total 0 -> "no backpack"');
-
-    # 40 longer keys guarantee overflow past 2 rows at $w=78 (20 short "apt:pN"
-    # keys comfortably fit in 2 rows and would never exercise the cap at all).
-    my @items = map { { key => sprintf('apt:pkg%02d', $_), approved => 1 } } (1 .. 40);
-    my @l = Dashboard::_backpack_lines({ total => 40, approved => 40, items => \@items }, 78);
-    ok(scalar(@l) <= 3, 'backpack: many items -> at most header + 2 paragraph rows (never one-row-per-item)');
-    like(join("\n", map { Dashboard::spans_text($_) } @l), qr/\+\d+ more/,
-        'backpack: capped item list shows "+N more" (cap is never silent)');
-}
-{
     # End-to-end: compose_frame surfaces the new panels (and stays exactly sized).
     my $bp = { total => 1, approved => 0, items => [{ key => 'apt:jq', approved => 0 }] };
     my $f = Dashboard::compose_frame(
@@ -902,41 +888,6 @@ my %st = (
         'key: arrow while stop-runs-pending still cancels');
     is_deeply([Dashboard::dispatch_key('DOWN', 'full-shutdown')], ['cancel-full-shutdown', ''],
         'key: arrow while full-shutdown-pending still cancels');
-}
-
-# activity_view: newest-first + up/down scroll window
-{
-    my $chrono = ['a', 'b', 'c', 'd'];   # oldest -> newest
-    is_deeply(Dashboard::activity_view($chrono, 0), ['d','c','b','a'],
-        'activity: offset 0 -> newest-first, full list');
-    is_deeply(Dashboard::activity_view($chrono, 1), ['c','b','a'],
-        'activity: offset 1 -> newest scrolled off the top');
-    is_deeply(Dashboard::activity_view($chrono, 3), ['a'],
-        'activity: offset at last -> oldest only');
-    is_deeply(Dashboard::activity_view($chrono, 99), ['a'],
-        'activity: offset clamps past the end');
-    is_deeply(Dashboard::activity_view([], 0), [],
-        'activity: empty list -> empty view');
-}
-
-# ===========================================================================
-# PART 5 — spawn ladder + argv
-# ===========================================================================
-{
-    is(Dashboard::decide_spawn_mode(1, 1, 'MSWin32'), 'wt',     'spawn-mode: wt present -> wt');
-    is(Dashboard::decide_spawn_mode(0, 1, 'MSWin32'), 'start',  'spawn-mode: no wt, win+comspec -> start');
-    is(Dashboard::decide_spawn_mode(0, 0, 'MSWin32'), 'inline', 'spawn-mode: no wt, no comspec -> inline');
-    is(Dashboard::decide_spawn_mode(0, 1, 'linux'),   'inline', 'spawn-mode: non-windows -> inline');
-
-    my @cmd = ('powershell.exe', '-NoProfile', '-File', 'C:/s/claude-sandbox.ps1', '--session', 'C:/proj');
-    my %ctx = (cmd => \@cmd, comspec => 'C:/Windows/cmd.exe');
-    is_deeply(Dashboard::spawn_argv('wt', \%ctx),
-        ['wt.exe', '-w', 'new', @cmd],
-        'spawn-argv: wt wraps the command in a new window');
-    is_deeply(Dashboard::spawn_argv('start', \%ctx),
-        ['C:/Windows/cmd.exe', '/c', 'start', '', @cmd],
-        'spawn-argv: start wraps the command in a new console');
-    is(Dashboard::spawn_argv('inline', \%ctx), undef, 'spawn-argv: inline -> undef (run in-process)');
 }
 
 # ===========================================================================
@@ -1703,142 +1654,6 @@ sub drive_per_tick {
 # ===========================================================================
 
 # ---------------------------------------------------------------------------
-# A1–A3  _event_time / recent_events with a $localtime_fn seam
-#
-# _event_time($iso_ts, $localtime_fn) does NOT exist yet.  We guard every call
-# with an eval{} so a missing sub causes a per-test FAIL, not a file-level die.
-#
-# The seams are closures over a fixed epoch offset (CORE::gmtime == UTC, so
-# A1 expects unchanged output; +2h and -5h offsets shift the HH:MM:SS).
-#
-# "2026-06-24T10:00:01Z" is a fixed UTC instant. A gmtime seam returns the
-# UTC breakdown unchanged, so HH:MM:SS is still "10:00:01". A +2h seam
-# shifts the epoch forward 7200s before formatting -> "12:00:01". A -5h seam
-# shifts the epoch back 18000s -> "05:00:01".
-# ---------------------------------------------------------------------------
-{
-    # DERIVED via Time::Local::timegm, not a hand-typed literal (a
-    # pre-existing comment here previously asserted this instant's epoch as
-    # 1750759201, which is WRONG -- timegm(1,0,10,24,5,2026) is 1782295201;
-    # the stale literal was never numerically exercised until package 06's
-    # Family 4 arithmetic below needed a real epoch to subtract $now
-    # against, at which point it produced silently-wrong, indistinguishable
-    # "n/a" results for every $now offset. Computing it removes the
-    # possibility of that class of bug recurring.
-    my $epoch_10 = timegm(1, 0, 10, 24, 5, 2026);   # 2026-06-24T10:00:01Z, month is 0-indexed (5 == June)
-
-    # gmtime seam: returns UTC breakdown unchanged (== A1 oracle)
-    my $gmtime_seam = sub { CORE::gmtime($_[0]) };
-
-    # +2h seam: pretend the local clock is 2 hours ahead of UTC
-    my $plus2h_seam = sub {
-        my @lt = CORE::gmtime($_[0] + 7200);
-        return @lt;
-    };
-
-    # -5h seam: pretend the local clock is 5 hours behind UTC
-    my $minus5h_seam = sub {
-        my @lt = CORE::gmtime($_[0] - 18000);
-        return @lt;
-    };
-
-    my $ts = '2026-06-24T10:00:01Z';
-
-    # A1: gmtime seam -> UTC unchanged -> "10:00:01"
-    my $a1 = eval { Dashboard::_event_time($ts, $gmtime_seam) };
-    is($a1, '10:00:01',
-        'A1: _event_time with gmtime seam (UTC offset 0) -> 10:00:01');
-
-    # A2: +2h seam -> "12:00:01"
-    my $a2 = eval { Dashboard::_event_time($ts, $plus2h_seam) };
-    is($a2, '12:00:01',
-        'A2: _event_time with +2h localtime seam -> 12:00:01');
-
-    # A3: -5h seam -> "05:00:01"
-    my $a3 = eval { Dashboard::_event_time($ts, $minus5h_seam) };
-    is($a3, '05:00:01',
-        'A3: _event_time with -5h localtime seam -> 05:00:01');
-
-    # A1-A3 VIA recent_events -- REDESIGNED (package 06, spec S2.4.6, Family
-    # 4). recent_events's OLD 3rd-arg $localtime_fn seam no longer reaches
-    # the render path: "$localtime_fn is retained for signature
-    # compatibility ... and is unused by the new time field" (spec S2.4.6).
-    # An absolute HH:MM:SS can therefore never appear again -- the premise
-    # "the gmtime/+2h/-5h seam produces a given clock-time string" is simply
-    # false under the new design, so re-pointing the OLD assertions at the
-    # SAME seams would be asserting behaviour the spec explicitly retired.
-    #
-    # THE CLAIM THAT SURVIVES is what A1-A3 were always really testing:
-    # DETERMINISM -- the clock reaching a rendered event is an INJECTED
-    # value, never a live call to time(). Re-derived against the NEW seam,
-    # recent_events's 4th argument $now: two different injected $now values
-    # must produce two different time texts, and each text must be exactly
-    # Dashboard::fmt_age($now - $epoch) (spec S2.4.6 render step 4), never a
-    # hardcoded/re-pinned format. The old +2h/-5h seam OFFSETS become two
-    # different $now values instead of two different localtime functions.
-    my @lines_now = ('{"ts":"2026-06-24T10:00:01Z","type":"launch_start","pid":1}');
-    my $now_a = $epoch_10 + 5;      # A1's stand-in: 5s after the event
-    my $now_b = $epoch_10 + 7200;   # A2's stand-in: 2h after the event (was the +2h seam)
-
-    my $ev_a = eval { Dashboard::recent_events(\@lines_now, 1, undef, $now_a) };
-    my $ev_b = eval { Dashboard::recent_events(\@lines_now, 1, undef, $now_b) };
-    # RE-POINTED (operator request). The seam being probed was "the clock is
-    # injected, never live", demonstrated by two different $now values producing
-    # two different AGE texts. The column is a wall clock now, so $now cannot
-    # move it -- and the equivalent, stronger property is that it is INVARIANT
-    # under $now while still varying with the event's own timestamp. That is the
-    # same determinism claim, pointed at the input that actually drives it.
-    my @lines_later = ('{"ts":"2026-06-24T12:34:01Z","type":"launch_start","pid":1}');
-    my $ev_c = eval { Dashboard::recent_events(\@lines_later, 1, \&CORE::gmtime, $now_a) };
-    if ($ev_a && $ev_b && $ev_c) {
-        my $text_a = Dashboard::spans_text($ev_a->[0]);
-        my $text_b = Dashboard::spans_text($ev_b->[0]);
-        is($text_a, $text_b,
-            'A1/A2-seam (recent_events): two different injected $now values produce the SAME row -- a wall clock is a function of the event, not of now');
-        isnt($text_a, Dashboard::spans_text($ev_c->[0]),
-            'A1/A2-seam (recent_events): but a different event TIMESTAMP does change it -- the column is live data, not a constant');
-        like(Dashboard::spans_text($ev_c->[0]), qr/\Q@{[ Dashboard::_local_hhmm(Dashboard::_event_epoch('2026-06-24T12:34:01Z'), \&CORE::gmtime) ]}\E/,
-            'A1-seam (recent_events): the time text is exactly the event timestamp rendered HH:MM, never a hardcoded format');
-    } else {
-        fail('A1/A2-seam (recent_events): recent_events 4-arg $now form not yet wired (expected failure)');
-    }
-
-    # A3-seam, RE-POINTED. The original claim was "the time field is omitted,
-    # not filled with n/a or 00:00:00, when $now is undefined" -- correct for an
-    # AGE, which genuinely cannot be computed without a clock, so rendering one
-    # anyway would have been fabrication.
-    #
-    # A wall-clock time is not in that position: it is a function of the event's
-    # OWN timestamp, which the row already carries. Suppressing it for want of
-    # $now would be withholding data we have, so the honest behaviour inverts.
-    # What stays load-bearing is the real absence case -- an event with no
-    # usable `ts` still gets NO time field rather than a fabricated one.
-    my $ev_bare = eval { Dashboard::recent_events(\@lines_now, 1) };   # no $localtime_fn, no $now at all
-    if ($ev_bare && $ev_a) {
-        is(scalar(@{ $ev_bare->[0] }), scalar(@{ $ev_a->[0] }),
-            'A3-seam: without $now the row is unchanged -- a wall-clock column needs no clock, so there is nothing to omit');
-    } else {
-        fail('A3-seam: recent_events without $now not yet wired (expected failure)');
-    }
-
-    # The genuine honest-absence case, which survives the re-point intact: an
-    # event whose timestamp is missing or unparseable has no time to render, and
-    # must not be given one.
-    my $ev_nots = eval { Dashboard::recent_events(['{"type":"launch_start"}'], 1, \&CORE::gmtime, $now_a) };
-    my $ev_badts = eval { Dashboard::recent_events(['{"ts":"not-a-timestamp","type":"launch_start"}'], 1, \&CORE::gmtime, $now_a) };
-    if ($ev_nots && $ev_badts && $ev_a) {
-        cmp_ok(scalar(@{ $ev_nots->[0] }), '<', scalar(@{ $ev_a->[0] }),
-            'A3-seam (honest absence): an event with NO ts emits fewer spans -- no fabricated time field');
-        unlike(Dashboard::spans_text($ev_nots->[0]), qr/^\d/,
-            'A3-seam (honest absence): and its text does not begin with a digit');
-        unlike(Dashboard::spans_text($ev_badts->[0]), qr/^\d/,
-            'A3-seam (honest absence): an UNPARSEABLE ts is treated as absent, not rendered as 00:00');
-    } else {
-        fail('A3-seam (honest absence): missing-timestamp fixtures did not render');
-    }
-}
-
-# ---------------------------------------------------------------------------
 # B1–B5  fmt_oauth($remaining_secs)
 #
 # fmt_oauth does NOT exist yet.  Each call is wrapped in eval{} so the missing
@@ -1848,35 +1663,35 @@ sub drive_per_tick {
     my $have_fmt_oauth = Dashboard->can('fmt_oauth');
 
     # B1: undef (no token yet) -> actionable 'not logged in (run /login)'
-    my $b1 = eval { Dashboard::fmt_oauth(undef) };
+    my $b1 = eval { tui::DashboardScreen::_fmt_oauth_like(undef) };
     is($b1, 'not logged in (run /login)',
         'B1: fmt_oauth(undef) eq "not logged in (run /login)"');
     unlike($b1 // '', qr/[^\x20-\x7E]/,
         'B1-ascii: not-logged-in label is ASCII-only (width-safe)');
 
     # B2: negative -> 'EXPIRED'
-    my $b2 = eval { Dashboard::fmt_oauth(-5) };
+    my $b2 = eval { tui::DashboardScreen::_fmt_oauth_like(-5) };
     is($b2, 'EXPIRED',
         'B2: fmt_oauth(-5) eq "EXPIRED"');
 
     # B3: zero -> 'EXPIRED'
-    my $b3 = eval { Dashboard::fmt_oauth(0) };
+    my $b3 = eval { tui::DashboardScreen::_fmt_oauth_like(0) };
     is($b3, 'EXPIRED',
         'B3: fmt_oauth(0) eq "EXPIRED"');
 
     # B4: 3h12m -> 'expires in 3h12m'
-    my $b4 = eval { Dashboard::fmt_oauth(3*3600 + 12*60) };
+    my $b4 = eval { tui::DashboardScreen::_fmt_oauth_like(3*3600 + 12*60) };
     is($b4, 'expires in 3h12m',
         'B4: fmt_oauth(3*3600+12*60) eq "expires in 3h12m"');
 
     # B5: sub-minute -> 'expires in 45s'
-    my $b5 = eval { Dashboard::fmt_oauth(45) };
+    my $b5 = eval { tui::DashboardScreen::_fmt_oauth_like(45) };
     is($b5, 'expires in 45s',
         'B5: fmt_oauth(45) eq "expires in 45s"');
 
     # B-ascii: all non-undef returns are ASCII-only (no multi-byte chars)
     for my $secs (-5, 0, 45, 3*3600+12*60) {
-        my $r = eval { Dashboard::fmt_oauth($secs) };
+        my $r = eval { tui::DashboardScreen::_fmt_oauth_like($secs) };
         if (defined $r) {
             unlike($r, qr/[^\x20-\x7E]/,
                 "B-ascii: fmt_oauth($secs) returns ASCII-only string");

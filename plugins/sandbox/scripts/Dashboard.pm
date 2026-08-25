@@ -97,56 +97,6 @@ sub fmt_age {
     return tui::DashboardScreen::fmt_duration($s);
 }
 
-# fmt_hms($secs) -> "Xh Ym Zs" with all three components always shown
-# (e.g. "0h 2m 13s", "2h 5m 9s"). undef / negative -> "n/a".
-#
-# RETAINED, REMOVED FROM EVERY RENDER PATH (package 06, criterion 4 / AC-F5):
-# criterion 4 requires ONE duration format across a rendered frame
-# (fmt_age's/fmt_duration's compact grammar); this function's own three-
-# component grammar is a second one, so no span-producing code calls it
-# anymore. Deleting it outright would redden files outside this package's
-# write set (its only remaining callers are elsewhere in the codebase, per
-# spec S2.4.7 / S6 item 8), so it stays, unused, exactly as
-# _event_time/_backpack_lines/wrap_spans do below.
-sub fmt_hms {
-    my ($s) = @_;
-    return 'n/a' if !defined $s;
-    $s = int($s);
-    return 'n/a' if $s < 0;
-    my $h = int($s / 3600); $s %= 3600;
-    my $m = int($s / 60);   $s %= 60;
-    return sprintf('%dh %dm %ds', $h, $m, $s);
-}
-
-# fmt_oauth($remaining_secs) -> ASCII-only status string for the oauth line.
-# undef (no token yet — sandboxes now own an independent login) ->
-# 'not logged in (run /login)'; <= 0 -> 'EXPIRED'; > 0 -> 'expires in <fmt_age>'.
-sub fmt_oauth {
-    my ($s) = @_;
-    return 'not logged in (run /login)' if !defined $s;
-    return 'EXPIRED' if $s <= 0;
-    return 'expires in ' . fmt_age($s);
-}
-
-# _event_time($iso_ts, $localtime_fn) -> 'HH:MM:SS' in local time.
-# Parses YYYY-MM-DDThh:mm:ssZ to epoch via Time::Local::timegm (UTC), then
-# applies $localtime_fn (default real localtime) to get local breakdown.
-#
-# RETAINED, REMOVED FROM THE render_events PATH (package 06, AC-F5): the
-# event-time column is now rendered by fmt_duration($now - $epoch) (criterion
-# 4's one duration format), never by this clock-time string. Kept, unused,
-# for out-of-write-set callers (spec S2.4.7 / S6 item 8).
-sub _event_time {
-    my ($ts, $localtime_fn) = @_;
-    $localtime_fn ||= sub { localtime($_[0]) };
-    return '00:00:00' unless defined $ts && $ts =~ /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})Z/;
-    my ($yr, $mo, $dy, $h, $m, $sec) = ($1, $2, $3, $4, $5, $6);
-    my $epoch = eval { Time::Local::timegm($sec, $m, $h, $dy, $mo - 1, $yr - 1900) };
-    return '00:00:00' unless defined $epoch;
-    my @lt = $localtime_fn->($epoch);
-    return sprintf('%02d:%02d:%02d', $lt[2], $lt[1], $lt[0]);
-}
-
 # ---------------------------------------------------------------------------
 # s04-render-foundation: the styled-span line model + display-width core.
 # See specs/01-render-foundation-spec.md S3 for the binding API contract.
@@ -275,18 +225,6 @@ sub _glyph_table_ref {
     }
     $GLYPH_TABLE_MEMO = \%table;
     return $GLYPH_TABLE_MEMO;
-}
-sub glyph_table {
-    return { %{ _glyph_table_ref() } };
-}
-
-# glyph_width($char) -> the declared width if $char (a decoded character OR
-# its UTF-8 byte encoding, per D3) is allow-listed, else undef. DELEGATING
-# ALIAS (package 06, Obligation 2/3): tui::Layout::glyph_width consults the
-# SAME Theme-derived table. PUBLIC.
-sub glyph_width {
-    my ($c) = @_;
-    return tui::Layout::glyph_width($c);
 }
 
 # display_width($str) -> the number of terminal display columns $str
@@ -502,52 +440,6 @@ sub fit_spans {
     return @out ? \@out : [ { text => '', role => $pad_role } ];
 }
 
-# make_cell($line, $role, $cols) -> \%cell, the single constructor for a
-# composed row: { text, role, spans }, with display_width($cell->{text}) ==
-# spans_width($cell->{spans}) == $cols, $cell->{text} eq
-# spans_text($cell->{spans}), no ESC in $cell->{text}. PUBLIC.
-sub make_cell {
-    my ($line, $role, $cols) = @_;
-    $role = 'body' if !defined $role;
-    $cols = 0 if !defined $cols || $cols < 0;
-    my $spans = fit_spans(spanify($line, $role), $cols, $role);
-    return { text => spans_text($spans), role => $role, spans => $spans };
-}
-
-# clip_pad($str, $w) -> exactly $w DISPLAY COLUMNS: truncated if longer
-# (mid-glyph cuts drop the glyph, D4), space-padded if shorter. $w <= 0 -> ''.
-# undef -> $w spaces. PUBLIC, semantics changed from byte length to display
-# columns; signature unchanged.
-#
-# F2 correction (s04 fix-batch): the previous comment here claimed clip_pad
-# "does NOT sanitize... but the result is sanitized in practice" because
-# fit_spans/spanify supposedly always did. That was FALSE for a caller of
-# clip_pad directly (fit_spans itself did not sanitize -- see redteam-01.md
-# MAJOR-2: a live C1 CSI / raw C0 control could survive it). fit_spans now
-# sanitizes every character it emits via _safe_char (same mapping `_safe`
-# uses), so clip_pad's output genuinely IS sanitized, unconditionally, by
-# construction -- not merely "in practice" via an unenforced upstream call.
-sub clip_pad {
-    my ($s, $w) = @_;
-    $w = 0 if !defined $w || $w < 0;
-    return spans_text(fit_spans([ { text => $s, role => 'body' } ], $w, 'body'));
-}
-
-# _justify($left, $right, $w) -> $left ... $right filling exactly $w DISPLAY
-# COLUMNS. If they don't both fit (plus a gap), the right side is dropped and
-# the left clipped. String-level (D8); measured with display_width, not
-# length. PRIVATE.
-sub _justify {
-    my ($left, $right, $w) = @_;
-    $left  = '' if !defined $left;
-    $right = '' if !defined $right;
-    if (display_width($left) + display_width($right) + 1 <= $w) {
-        my $gap = $w - display_width($left) - display_width($right);
-        return $left . (' ' x $gap) . $right;
-    }
-    return clip_pad($left, $w);
-}
-
 # _justify_spans(\@spans, $right, $w, $right_role) -> \@spans (s06-panel-
 # semantics, spec S2.5). The spans-aware sibling of _justify: returns a NEW
 # span list (input not mutated) whose spans_width is EXACTLY $w. Unlike
@@ -658,17 +550,6 @@ sub container_status_style {
     return (_status_glyph('idle'), 'muted');
 }
 
-# spinner_frame($idx) -> UTF-8 bytes of one of the 10 braille spinner glyphs
-# in @SPINNER (spec S2.1). PUBLIC, pure, total: never reads the clock -- the
-# caller (Dashboard::run, Decision #21) supplies a wall-clock-derived $idx.
-# undef / non-numeric / any ref -> frame 0. A negative or fractional index is
-# handled by Perl's `%` (period 10 either way): never dies, never warns.
-sub spinner_frame {
-    my ($idx) = @_;
-    $idx = 0 if !defined $idx || ref $idx || $idx !~ /^-?\d+(?:\.\d+)?$/;
-    return $SPINNER[$idx % 10];
-}
-
 # window_title(\%state) -> an ASCII-safe OS window-title string, "<char>
 # <project>" (spec S2.2). Reads ONLY project_name/status/container_gone/
 # needs_you; any other key is ignored. $state undef/non-hashref -> {}.
@@ -771,18 +652,6 @@ sub _title_spinner_char {
     return (defined($g) && length($g)) ? $g : '*';
 }
 
-# oauth_role($remaining_secs) -> $role -- spec S2.2. Mirrors fmt_oauth's
-# three-way semantics plus an explicit "expiring soon" yellow tier at
-# OAUTH_WARN_SECS. A non-numeric $remaining degrades to the undef/absent
-# branch. PUBLIC, pure.
-sub oauth_role {
-    my ($remaining) = @_;
-    return 'bad' if !defined $remaining || $remaining !~ /^-?\d+(?:\.\d+)?$/;
-    return 'bad'  if $remaining <= 0;
-    return 'warn' if $remaining <= $OAUTH_WARN_SECS;
-    return 'good';
-}
-
 # ---------------------------------------------------------------------------
 # s09-resources-panel: the pressure classifier, the gauge and the byte
 # formatter. They live HERE, not in Resources.pm, because they emit render
@@ -797,55 +666,6 @@ my $PRESSURE_BAD  = 0.90;   # ratio at/above which a resource reads 'bad'
 my $GAUGE_FULL    = Encode::encode('UTF-8', "\x{2588}");   # already allow-listed
 my $GAUGE_LIGHT   = Encode::encode('UTF-8', "\x{2591}");   # (glyph_table :240-241)
 my $GAUGE_CELLS   = 10;
-
-# pressure_role($used, $total) -> 'good' | 'warn' | 'bad' | 'muted'. An
-# undeterminable ratio (no total, a total <= 0, a negative/non-numeric used)
-# is 'muted', never a fabricated 0%. Boundaries are inclusive on the upper
-# tier: exactly 0.75 is 'warn', exactly 0.90 is 'bad'. Every returned name is
-# already styled by sgr_for_role -- this package introduces no new role.
-sub pressure_role {
-    my ($used, $total) = @_;
-    return 'muted' if !defined $total || ref $total || $total !~ /^-?\d+(?:\.\d+)?$/ || $total <= 0;
-    return 'muted' if !defined $used  || ref $used  || $used  !~ /^-?\d+(?:\.\d+)?$/ || $used < 0;
-    my $r = $used / $total;
-    return 'good' if $r < $PRESSURE_WARN;
-    return 'warn' if $r < $PRESSURE_BAD;
-    return 'bad';
-}
-
-# gauge($used, $total, $cells) -> a UTF-8 BYTE string of $cells glyphs (full
-# block for the filled part, light shade for the rest). $cells defaults to 10
-# and is truncated with int(); an undeterminable ratio renders an all-empty
-# gauge, so the display width is ALWAYS exactly $cells whatever the input.
-# Both glyphs are already in %GLYPH_TABLE at width 1: this package adds none.
-sub gauge {
-    my ($used, $total, $cells) = @_;
-    my $c = (defined $cells && !ref $cells && $cells =~ /^-?\d+(?:\.\d+)?$/ && $cells >= 1)
-          ? int($cells) : $GAUGE_CELLS;
-    return $GAUGE_LIGHT x $c if pressure_role($used, $total) eq 'muted';
-    my $r = $used / $total;
-    $r = 0 if $r < 0;
-    $r = 1 if $r > 1;
-    my $filled = int($r * $c + 0.5);
-    $filled = 0  if $filled < 0;
-    $filled = $c if $filled > $c;
-    return ($GAUGE_FULL x $filled) . ($GAUGE_LIGHT x ($c - $filled));
-}
-
-# fmt_bytes($n) -> 'n/a' | '<N> B' | '<N.N> kB|MB|GB|TB'. DECIMAL units
-# (1000), end to end: podman is the source of half the numbers and emits
-# decimal (go-units), so parse -> format round-trips and every number can be
-# diffed verbatim against `podman stats` / `podman system df`. Plain bytes
-# carry no decimals. ASCII-only, so length() == display width.
-sub fmt_bytes {
-    my ($n) = @_;
-    return 'n/a' if !defined $n || ref $n || $n !~ /^-?\d+(?:\.\d+)?$/ || $n < 0;
-    return sprintf('%d B', $n) if $n < 1000;
-    for my $u ([ 1e12, 'TB' ], [ 1e9, 'GB' ], [ 1e6, 'MB' ], [ 1e3, 'kB' ]) {
-        return sprintf('%.1f %s', $n / $u->[0], $u->[1]) if $n >= $u->[0];
-    }
-    return sprintf('%d B', $n);
-}
 
 # event_style($type, $exit, $state) -> ($role, $glyph) -- spec S2.3, the
 # activity classifier. $type/$exit/$state are already-scalarized values
@@ -869,42 +689,6 @@ sub event_style {
         return ($role, _status_glyph($key));
     }
     return ('value', _status_glyph('idle'));
-}
-
-# wrap_spans(\@words, $w, $sep_role) -> \@lines -- spec S2.4. Greedy word-wrap
-# by DISPLAY width (never length). Each word is atomic (never split); a word
-# wider than $w occupies its own line intact (fit_spans truncates at
-# render-time). Lines are NOT padded to $w. A malformed element (undef /
-# arrayref / blessed ref) contributes an empty word rather than dying
-# (_span_hash). PUBLIC, pure, total.
-sub wrap_spans {
-    my ($words, $w, $sep_role) = @_;
-    $sep_role = 'body' if !defined $sep_role;
-    return [] if !defined $w || $w !~ /^-?\d+(?:\.\d+)?$/ || $w < 1;
-    return [] if ref($words) ne 'ARRAY' || !@$words;
-
-    my @lines;
-    my @cur;
-    my $cur_w = 0;
-    for my $raw (@$words) {
-        my $sp   = _span_hash($raw, 'body');
-        my $text = defined $sp->{text} ? $sp->{text} : '';
-        my $role = defined $sp->{role} ? $sp->{role} : 'body';
-        my $ww   = display_width($text);
-        if (!@cur) {
-            @cur   = ({ text => $text, role => $role });
-            $cur_w = $ww;
-        } elsif ($cur_w + 1 + $ww <= $w) {
-            push @cur, { text => ' ', role => $sep_role }, { text => $text, role => $role };
-            $cur_w += 1 + $ww;
-        } else {
-            push @lines, [ @cur ];
-            @cur   = ({ text => $text, role => $role });
-            $cur_w = $ww;
-        }
-    }
-    push @lines, [ @cur ] if @cur;
-    return \@lines;
 }
 
 # scroll_indicator($above, $below) -> $text|undef -- spec S2.6, replaces
@@ -989,67 +773,6 @@ sub activity_row_width {
     return $w < 0 ? 0 : $w;
 }
 
-# _backpack_lines(\%backpack, $w) -> body lines for the B4 panel. {total,
-# approved, items=>[{key, approved}]}. s06-panel-semantics (spec S3 items
-# 9-13): a header line (counts, no more (+)/(-) legend) followed by up to
-# BACKPACK_MAX_ROWS wrapped paragraph rows of space-separated item keys
-# (color carries approval state), capped with a "+N more" word when the full
-# list doesn't fit -- K is the largest prefix of items whose wrap (plus the
-# "+N more" word) still fits in BACKPACK_MAX_ROWS rows. $w (paragraph wrap
-# width) undef/<1 -> 78.
-#
-# RETAINED, REMOVED FROM THE DASHBOARD RENDER PATH (package 06, criterion 6 /
-# Decision 9): the dashboard's backpack panel is now a one-line summary
-# (tui::DashboardScreen::backpack_summary_spans, rendered inside the Run
-# panel) with no item-key listing. This full listing -- and wrap_spans below,
-# which it depends on -- moves to package 07's backpack screen; both are
-# kept here, unused by compose_frame, so that package can lift them.
-sub _backpack_lines {
-    my ($bp, $w) = @_;
-    $bp ||= {};
-    $w = 78 if !defined $w || $w !~ /^-?\d+(?:\.\d+)?$/ || $w < 1;
-    my $total = (defined $bp->{total} && $bp->{total} =~ /^\d+$/) ? $bp->{total} : 0;
-    return ( [ { text => '(no backpack for this project)', role => 'muted' } ] ) if $total == 0;
-    my $appr = (defined $bp->{approved} && $bp->{approved} =~ /^\d+$/) ? $bp->{approved} : 0;
-    my $pend = $total - $appr; $pend = 0 if $pend < 0;
-
-    my @header = ( { text => "$total item(s) - ", role => 'label' },
-                   { text => "$appr approved",    role => 'good'  } );
-    push @header, ( { text => ', ', role => 'label' }, { text => "$pend pending", role => 'warn' } )
-        if $pend > 0;
-    my @out = ( \@header );
-
-    my $items = (ref $bp->{items} eq 'ARRAY') ? $bp->{items} : [];
-    my @words = map {
-        my $it  = (ref $_ eq 'HASH') ? $_ : {};
-        my $key = (defined($it->{key}) && length($it->{key})) ? $it->{key} : '?';
-        { text => $key, role => ($it->{approved} ? 'good' : 'warn') };
-    } @$items;
-
-    my $wrapped_all = wrap_spans(\@words, $w);
-    if (@$wrapped_all <= $BACKPACK_MAX_ROWS) {
-        push @out, @$wrapped_all;
-        return @out;
-    }
-
-    # Doesn't fit: search for the largest K (item keys shown, in order) such
-    # that those K words plus a trailing "+N more" (N = total shown - K) word
-    # still wrap to <= BACKPACK_MAX_ROWS rows. K=0 (just "+N more" alone)
-    # always succeeds -- a lone word always occupies exactly one line.
-    my $n_words = scalar(@words);
-    for (my $k = $n_words - 1; $k >= 0; $k--) {
-        my $n = $n_words - $k;
-        my @try = (@words[0 .. $k - 1], { text => "+$n more", role => 'muted' });
-        my $wrapped = wrap_spans(\@try, $w);
-        if (@$wrapped <= $BACKPACK_MAX_ROWS) {
-            push @out, @$wrapped;
-            return @out;
-        }
-    }
-    push @out, @{ wrap_spans([ { text => "+$n_words more", role => 'muted' } ], $w) };
-    return @out;
-}
-
 # _run_lines(\@runs) -> LIST of extra Run-panel body lines (possibly empty).
 # @runs is the RunState::summarize struct list (spec 07 S2.2, closed 11-key
 # set), passed through the gather hash with no arithmetic. Dashboard.pm must
@@ -1093,126 +816,6 @@ my %RUN_STATE_ROLE = ( running => 'good', paused => 'warn', parked => 'warn', id
 # _token_lines split.
 # PRIVATE, pure, mirrors _token_lines' style. Never dies for any input.
 # ===========================================================================
-
-# _title_line / _footer_line / _panel_title_line — single rows, exactly $cols.
-# _title_line returns an ARRAYREF of {text,role} spans (s07-live-status spec
-# S2.4), which make_cell -> spanify already accepts. With $s->{spinner_idx}
-# absent (every pre-existing direct compose_frame call), the emitted text is
-# byte-identical to the pre-s07 plain-string output -- this backward
-# compatibility is load-bearing.
-sub _title_line {
-    my ($s, $cols) = @_;
-    my $left = 'ccpraxis sandbox';
-    $left .= ' - ' . _safe($s->{project_name}) if defined $s->{project_name} && length $s->{project_name};
-    my $ctr = _safe(defined $s->{container} ? $s->{container} : '');
-    my $st  = _safe(defined $s->{status}    ? $s->{status}    : '?');
-    my (undef, $role) = container_status_style($s->{status}, $s->{container_gone});
-
-    my $spin;
-    my $idx = $s->{spinner_idx};
-    $spin = spinner_frame($idx)
-        if defined $idx && !ref($idx) && $idx =~ /^-?\d+(?:\.\d+)?$/;
-
-    my @right_spans = (
-        { text => (length $ctr ? "$ctr [" : '['), role => 'title' },
-        (defined $spin ? ({ text => "$spin ", role => $role }) : ()),
-        { text => $st, role => $role },
-        { text => ']', role => 'title' },
-    );
-
-    my $lw = display_width($left);
-    my $rw = spans_width(\@right_spans);
-    if ($lw + $rw + 1 <= $cols) {
-        return [
-            { text => $left, role => 'title' },
-            { text => (' ' x ($cols - $lw - $rw)), role => 'title' },
-            @right_spans,
-        ];
-    }
-    return [ { text => clip_pad($left, $cols), role => 'title' } ];
-}
-
-# footer_legend($cols) -> the unpadded command legend, tiered so the pinned
-# "[c] launch Claude Code" wording (Decision #9) survives down to 80 cols
-# before degrading (s11-lifecycle-stop spec 08 S2.2). PURE; the caller
-# (_footer_line) is the only one that pads.
-sub footer_legend {
-    my ($cols) = @_;
-    $cols = 200 if !defined $cols;
-    my @tiers = (
-        ' [c] launch Claude Code  [s] stop runs  [x] full shutdown  [up/down] scroll  [r] refresh  [q] quit',
-        ' [c] launch Claude Code  [s] stop runs  [x] shutdown  [r] refresh  [q] quit',
-        ' [c] launch  [s] stop  [x] shutdown  [r] refresh  [q] quit',
-    );
-    for my $t (@tiers) {
-        return $t if display_width($t) <= $cols;
-    }
-    return $tiers[-1];
-}
-
-# confirm_prompt($pending, $cols) -> the unpadded two-step confirm text for
-# one of the two pinned pending tokens, or undef for anything else (including
-# the retired 'shutdown' token). Two tiers per token, "first that fits, else
-# the short one" (s11-lifecycle-stop spec 08 S2.2). PURE.
-sub confirm_prompt {
-    my ($pending, $cols) = @_;
-    $cols = 200 if !defined $cols;
-    return undef unless defined $pending;
-    if ($pending eq 'stop-runs') {
-        my $L = 'Stop ALL butler runs in this project? The container and podman machine stay UP. [y] confirm   [any other] cancel';
-        my $S = 'Stop ALL butler runs? Container+machine stay up. [y] confirm  [other] cancel';
-        return display_width($L) <= $cols ? $L : $S;
-    }
-    if ($pending eq 'full-shutdown') {
-        my $L = 'Full shutdown: stop ALL butler runs, then STOP THIS CONTAINER, then stop the podman machine if no other container is running. [y] confirm   [any other] cancel';
-        my $S = 'Stop runs + STOP CONTAINER (+ machine if last). [y] confirm  [other] cancel';
-        return display_width($L) <= $cols ? $L : $S;
-    }
-    # s12-lifecycle-relaunch: [l] is the ONLY constructive lifecycle control, so
-    # both tiers promise "nothing is deleted" -- the confirm has to read visibly
-    # unlike the two destructive ones above or a user trained to fear the
-    # red footer banner will cancel the one control that fixes their sandbox.
-    # THREE tiers, not two: the spec's short tier is 88 display columns, so at
-    # the 80-col reference width _footer_line's clip_pad would truncate it
-    # mid-word and the footer would no longer carry a whole prompt. The two
-    # spec-pinned wordings are kept verbatim as T1/T2; T3 is a genuinely-short
-    # tier that survives 80 (and below) intact.
-    if ($pending eq 'relaunch') {
-        my @tiers = (
-            'Relaunch: start the podman machine if it is down, start this container, and re-attach. Nothing is deleted. [y] confirm   [any other] cancel',
-            'Start machine + container and re-attach. Nothing is deleted. [y] confirm  [other] cancel',
-            'Relaunch machine + container. Nothing is deleted. [y] confirm  [other] cancel',
-        );
-        for my $t (@tiers) {
-            return $t if display_width($t) <= $cols;
-        }
-        return $tiers[-1];
-    }
-    return undef;
-}
-
-sub _footer_line {
-    my ($s, $cols) = @_;
-    my $pending = defined $s->{pending} ? $s->{pending} : '';
-    my $legend;
-    my $prompt = confirm_prompt($pending, $cols);
-    if (defined $prompt) {
-        $legend = $prompt;
-    } elsif (defined $s->{footer_flash} && length $s->{footer_flash}) {
-        $legend = ' ' . $s->{footer_flash};   # transient [c]-on-dead-container notice
-    } else {
-        $legend = footer_legend($cols);
-    }
-    return clip_pad($legend, $cols);
-}
-
-# _alert_line($msg, $cols) -> a full-width banner row (rendered red via the
-# 'alert' role). Used for the backpack-install-failure warning so it can't be
-# lost behind the alt-screen the way the pre-dashboard stdout warning was.
-sub _alert_line {
-    my ($msg, $cols) = @_;
-    return clip_pad('  !! ' . _safe(defined $msg ? $msg : ''), $cols);
-}
 
 # _status_alert(\%state) -> a one-line banner string when the container is no
 # longer running or no longer reachable, else undef. This drives the "dashboard
@@ -1545,17 +1148,6 @@ sub find_wt {
     return undef;
 }
 
-# decide_spawn_mode($wt, $comspec, $os) -> 'wt' | 'start' | 'inline'.
-# Prefer a real new Windows Terminal window; else a new console via cmd `start`;
-# else reuse the dashboard window (Decision #19's fallback ladder).
-sub decide_spawn_mode {
-    my ($wt, $comspec, $os) = @_;
-    return 'wt'    if $wt;
-    my $is_win = (defined $os ? $os : $^O) =~ /^(MSWin32|cygwin|msys)$/;
-    return 'start' if $is_win && $comspec;
-    return 'inline';
-}
-
 # spawn_argv($mode, \%ctx) -> argv arrayref to run, or undef for 'inline'.
 # ctx.cmd is the caller-supplied command list to run in the new window (the
 # launcher's internal connector entry, `claude-sandbox --session <project>`);
@@ -1718,22 +1310,6 @@ sub recent_events {
         push @ev, \@spans;
     }
     return \@ev;
-}
-
-# activity_view(\@events_chrono, $offset) -> the events to DISPLAY in the Activity
-# panel, NEWEST-FIRST (descending), starting $offset items down from the newest.
-# $offset is the up/down scroll position (0 = newest at top); it's clamped to
-# [0, last index] so scrolling can't run off either end. Pure / unit-tested; the
-# loop keeps the offset and feeds the result to the panel each frame. (Retained;
-# activity_window is the capacity-aware successor used by the loop.)
-sub activity_view {
-    my ($events, $offset) = @_;
-    $events ||= [];
-    my @desc = reverse @$events;
-    return [] unless @desc;
-    $offset = 0       if !defined $offset || $offset < 0;
-    $offset = $#desc  if $offset > $#desc;
-    return [ @desc[$offset .. $#desc] ];
 }
 
 # _alert_msgs(\%state, $rows) -> the (priority-capped) alert banner messages a

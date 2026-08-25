@@ -207,11 +207,11 @@ sub _live_gutter_label { return tui::DashboardScreen::gutter($_[0]); }
     for my $case (@cases) {
         my ($remaining, $erole) = @$case;
         my $label = defined $remaining ? $remaining : 'undef';
-        is(Dashboard::oauth_role($remaining), $erole, "AC6: oauth_role($label) == $erole");
+        is(tui::DashboardScreen::_oauth_like_role($remaining), tui::DashboardScreen::theme_role($erole), "AC6: oauth_role($label) == $erole");
     }
 
     # A non-numeric $remaining degrades to the undef/absent branch (INV-8 totality).
-    is(Dashboard::oauth_role('not-a-number'), 'bad', 'AC6: oauth_role(non-numeric) treated as undef -> bad');
+    is(tui::DashboardScreen::_oauth_like_role('not-a-number'), tui::DashboardScreen::theme_role('bad'), 'AC6: oauth_role(non-numeric) treated as undef -> bad');
 }
 
 # ===========================================================================
@@ -411,7 +411,6 @@ sub _live_gutter_label { return tui::DashboardScreen::gutter($_[0]); }
     # behaviour reached through a dead accessor (that is AC1/AC2/AC8 above,
     # which WERE re-pointed).
 
-
     # AC8: Run panel role table across the busy-lease/keep-awake/escalations
     # tiers. RE-INDEXED from [0,1,2] to [2,3,4] and re-labeled via
     # _live_gutter_label(): heartbeat/uptime (always present for this %full-
@@ -505,221 +504,6 @@ sub _live_gutter_label { return tui::DashboardScreen::gutter($_[0]); }
     ok(scalar(@pd), 'S2.8/S5.6: the panel builder with no $cols still returns panels');
 }
 
-# ===========================================================================
-# 4.4 wrap_spans (spec S2.4): AC9, AC10
-# ===========================================================================
-{
-    # AC9: greedy fill at a known width produces the expected line grouping.
-    # widths: aa=2 bb=2 cc=2 dddd=4; w=6.
-    #   aa(2) -> line="aa"(2)
-    #   bb(2): 2+1+2=5<=6 -> join -> line="aa bb"(5)
-    #   cc(2): 5+1+2=8>6  -> flush; new line="cc"(2)
-    #   dddd(4): 2+1+4=7>6 -> flush; new line="dddd"(4)
-    my @words = (
-        { text => 'aa',   role => tui::DashboardScreen::theme_role('good') },
-        { text => 'bb',   role => tui::DashboardScreen::theme_role('warn') },
-        { text => 'cc',   role => tui::DashboardScreen::theme_role('good') },
-        { text => 'dddd', role => tui::DashboardScreen::theme_role('warn') },
-    );
-    my $lines = Dashboard::wrap_spans(\@words, 6);
-    is(ref($lines), 'ARRAY', 'AC9: wrap_spans returns an arrayref');
-    is(scalar(@$lines), 3, 'AC9: wrap_spans(w=6) groups the 4 words into exactly 3 lines');
-    is_deeply($lines->[0],
-        [ { text => 'aa', role => tui::DashboardScreen::theme_role('good') }, { text => ' ', role => 'body' }, { text => 'bb', role => tui::DashboardScreen::theme_role('warn') } ],
-        'AC9: line 1 is "aa bb" with a body-role separator, original word roles preserved');
-    is_deeply($lines->[1], [ { text => 'cc', role => tui::DashboardScreen::theme_role('good') } ], 'AC9: line 2 is "cc" alone (didn\'t fit after bb)');
-    is_deeply($lines->[2], [ { text => 'dddd', role => tui::DashboardScreen::theme_role('warn') } ], 'AC9: line 3 is "dddd" alone (didn\'t fit after cc)');
-
-    for my $i (0 .. 2) {
-        ok(Dashboard::spans_width($lines->[$i]) <= 6, "AC9: line $i spans_width <= \$w (6)");
-    }
-    is(Dashboard::spans_width($lines->[0]), 5, 'AC9: lines are NOT padded to $w (line 1 width is 5, not 6)');
-    is(Dashboard::spans_width($lines->[1]), 2, 'AC9: lines are NOT padded to $w (line 2 width is 2, not 6)');
-
-    # No leading/trailing separator on any line: first/last elements are words.
-    for my $i (0 .. 2) {
-        isnt($lines->[$i][0]{text}, ' ', "AC9: line $i has no leading separator");
-        isnt($lines->[$i][-1]{text}, ' ', "AC9: line $i has no trailing separator");
-    }
-
-    # Custom $sep_role.
-    my $lines_lbl = Dashboard::wrap_spans(\@words, 6, 'label');
-    is($lines_lbl->[0][1]{role}, 'label', 'AC9: $sep_role parameter controls the separator span role');
-    is($lines_lbl->[0][1]{text}, ' ',     'AC9: separator text is always a single space');
-
-    # Boundary: current_width + 1 + word_width <= $w decides the join, exactly.
-    my @boundary_words = ({ text => 'ab', role => 'body' }, { text => 'cd', role => 'body' });
-    my $exact_fit = Dashboard::wrap_spans(\@boundary_words, 5);   # 2+1+2 == 5 -> joins
-    is(scalar(@$exact_fit), 1, 'AC9: boundary -- current_width+1+word_width == $w -> joins onto one line');
-    my @boundary_words2 = ({ text => 'ab', role => 'body' }, { text => 'cde', role => 'body' });
-    my $one_over = Dashboard::wrap_spans(\@boundary_words2, 5);  # 2+1+3 == 6 > 5 -> splits
-    is(scalar(@$one_over), 2, 'AC9: boundary -- current_width+1+word_width > $w by one -> splits');
-}
-{
-    # AC10: degenerate/total inputs never die and degrade to [].
-    my @words = ({ text => 'a', role => 'body' });
-    is_deeply(Dashboard::wrap_spans(\@words, undef), [], 'AC10: $w undef -> []');
-    is_deeply(Dashboard::wrap_spans(\@words, 0),     [], 'AC10: $w == 0 -> []');
-    is_deeply(Dashboard::wrap_spans(\@words, -5),    [], 'AC10: $w < 0 -> []');
-    is_deeply(Dashboard::wrap_spans([], 10),         [], 'AC10: empty word list -> []');
-    is_deeply(Dashboard::wrap_spans(undef, 10),      [], 'AC10: undef word list -> []');
-    is_deeply(Dashboard::wrap_spans('not-an-arrayref', 10), [], 'AC10: non-arrayref word list -> []');
-
-    # A single word wider than $w occupies its own line, left intact (never
-    # dropped, never half-cut -- fit_spans handles the render-time clip).
-    my $long = Dashboard::wrap_spans([ { text => 'averylongword', role => tui::DashboardScreen::theme_role('good') } ], 4);
-    is(scalar(@$long), 1, 'AC10: a single over-wide word still produces exactly one line');
-    is_deeply($long->[0], [ { text => 'averylongword', role => tui::DashboardScreen::theme_role('good') } ],
-        'AC10: the over-wide word is left intact, not truncated by wrap_spans itself');
-
-    # Totality: a malformed element (undef / arrayref / blessed ref) contributes
-    # an empty word rather than dying or warning (spec S2.4, S5.3).
-    my @malformed = (undef, [1, 2, 3], bless({}, 'Dashboard::Test::Bogus'), 'ok');
-    my ($died, $warns, $result) = (0, 0, undef);
-    local $SIG{__WARN__} = sub { $warns++ };
-    eval { $result = Dashboard::wrap_spans(\@malformed, 20) };
-    $died = 1 if $@;
-    is($died,  0, 'AC10: wrap_spans never dies on malformed elements (undef/arrayref/blessed ref)');
-    is($warns, 0, 'AC10: wrap_spans never warns on malformed elements');
-    is(ref($result), 'ARRAY', 'AC10: wrap_spans still returns an arrayref on malformed input');
-}
-
-# ===========================================================================
-# 4.5 Backpack paragraph (spec S3 behaviors 9-13, S2.8): AC11..AC16
-# ===========================================================================
-{
-    # AC11/AC12: items that fit -> header + exactly 1 paragraph row; no
-    # markers/bullets/per-item rows; word roles follow approval state.
-    my $bp = { total => 3, approved => 2, items => [
-        { key => 'apt:jq',              approved => 1 },
-        { key => 'apt:chromium',        approved => 0 },
-        { key => 'npm-global:prettier', approved => 1 },
-    ] };
-    my @lines = Dashboard::_backpack_lines($bp, 78);   # cols=80 -> w=78
-    is(scalar(@lines), 2, 'AC11: total>0 + items that fit -> exactly 2 lines (header + 1 paragraph row)');
-    is(Dashboard::spans_text($lines[0]), '3 item(s) - 2 approved, 1 pending',
-        'AC10/S3.10: header line text is "<total> item(s) - <appr> approved, <pend> pending"');
-    is(Dashboard::spans_text($lines[1]), 'apt:jq apt:chromium npm-global:prettier',
-        'AC11: paragraph row spans_text is the item keys space-separated, in order');
-    unlike(Dashboard::spans_text($lines[1]), qr/[\[\]]/, 'AC11: no [+]/[-] bracket markers in the paragraph row');
-
-    my @word_spans = grep { $_->{text} !~ /^\s*$/ } @{ $lines[1] };
-    my %role_by_key = map { $_->{text} => $_->{role} } @word_spans;
-    is($role_by_key{'apt:jq'},              'good', 'AC12: approved item word role is good');
-    is($role_by_key{'apt:chromium'},        'warn', 'AC12: pending item word role is warn');
-    is($role_by_key{'npm-global:prettier'}, 'good', 'AC12: second approved item word role is good');
-
-    # Header with pend==0: no ", N pending" suffix.
-    my $bp_allgood = { total => 2, approved => 2, items => [
-        { key => 'apt:a', approved => 1 }, { key => 'apt:b', approved => 1 },
-    ] };
-    my @lines_ag = Dashboard::_backpack_lines($bp_allgood, 78);
-    is(Dashboard::spans_text($lines_ag[0]), '2 item(s) - 2 approved',
-        'S3.10: header with pend==0 omits the ", N pending" clause');
-}
-{
-    # AC13: many items -> body never exceeds header + 2 paragraph rows; the
-    # last word is "+<N> more" (muted), N == total - keys actually shown.
-    my @many_items = map { { key => sprintf('apt:pkg%02d', $_), approved => ($_ % 2 == 0) ? 1 : 0 } } (1 .. 30);
-    my $bp_many = { total => 30, approved => 15, items => \@many_items };
-    my @lines = Dashboard::_backpack_lines($bp_many, 78);
-    ok(scalar(@lines) >= 2 && scalar(@lines) <= 3,
-        'AC13: backpack body is header + at most 2 paragraph rows, even with many items');
-    my @paragraph_rows = @lines[1 .. $#lines];
-    ok(scalar(@paragraph_rows) <= 2, 'AC13: at most BACKPACK_MAX_ROWS=2 paragraph rows');
-    for my $i (0 .. $#paragraph_rows) {
-        ok(Dashboard::spans_width($paragraph_rows[$i]) <= 78, "AC13: paragraph row $i fits within \$w (78)");
-    }
-
-    my $all_text = join(' ', map { Dashboard::spans_text($_) } @paragraph_rows);
-    like($all_text, qr/\+\d+ more$/, 'AC13: with more items than fit, the last word is "+<N> more"');
-    my ($n_more) = $all_text =~ /\+(\d+) more$/;
-    my $last_row = $paragraph_rows[-1];
-    my ($more_span) = grep { $_->{text} =~ /^\+\d+ more$/ } @$last_row;
-    ok($more_span, 'AC13: the "+N more" text is its own span/word');
-    is($more_span->{role}, 'muted', 'AC13: "+N more" word role is muted');
-
-    my %shown_keys;
-    for my $row (@paragraph_rows) {
-        for my $sp (@$row) {
-            $shown_keys{$sp->{text}} = 1 if $sp->{text} =~ /^apt:pkg\d+$/;
-        }
-    }
-    my $k_shown = scalar(keys %shown_keys);
-    is($n_more, 30 - $k_shown, 'AC13: N == <total items> - <keys actually shown>');
-}
-{
-    # AC14: the paragraph wraps to the PASSED width -- same item list, two
-    # widths, different row groupings; every row's width <= the passed width.
-    # 5 keys of exactly 10 chars each: total width incl. 4 separators = 54.
-    my @items5 = map { { key => $_ x 10, approved => 1 } } ('a', 'b', 'c', 'd', 'e');
-    my $bp5 = { total => 5, approved => 5, items => \@items5 };
-
-    my @lines_wide   = Dashboard::_backpack_lines($bp5, 118);   # cols=120 -> w=118: fits in 1 row (54<=118)
-    my @lines_narrow = Dashboard::_backpack_lines($bp5, 38);    # cols=40  -> w=38: must wrap to 2 rows
-
-    is(scalar(@lines_wide) - 1,   1, 'AC14: at $w=118 the 5x10-char item list wraps to exactly 1 paragraph row');
-    is(scalar(@lines_narrow) - 1, 2, 'AC14: the SAME item list at $w=38 wraps to exactly 2 paragraph rows');
-
-    for my $row (@lines_wide[1 .. $#lines_wide]) {
-        ok(Dashboard::spans_width($row) <= 118, 'AC14: wide paragraph row width <= $w (118)');
-    }
-    for my $row (@lines_narrow[1 .. $#lines_narrow]) {
-        ok(Dashboard::spans_width($row) <= 38, 'AC14: narrow paragraph row width <= $w (38)');
-    }
-
-    # End-to-end via build_panels($state,$cols). RE-POINTED (package
-    # 06-dashboard-screen, spec S2.4.3/S2.4.8, Decision 9, driver report
-    # item 1): the Backpack panel is deleted; the backpack fact now reaches
-    # the frame as a single summary ROW inside Run
-    # (tui::DashboardScreen::backpack_summary_spans), which does not wrap
-    # with $cols at all -- so the "row count varies with $cols" half of
-    # this AC has no surviving analog (a one-line summary never wraps).
-    # That half is NOT re-pointed to a new count -- doing so would just
-    # reintroduce the same whole-shape pin Decision 15 / t/00-oracle-
-    # hygiene.t already forbids elsewhere in this package. What survives:
-    # the backpack fact reaches the frame at EVERY width tested, and it is
-    # a SUMMARY, not an item listing -- it never contains the fixture's
-    # item keys, at any width.
-    my %state5 = (status => 'running', backpack => $bp5);
-    # THE LIVE label, not the legacy one, and the difference is real: the
-    # backpack row is the one row _fixed_panels builds through
-    # tui::DashboardScreen::row rather than through its own local formatter
-    # (Dashboard.pm:1020), so it carries the live gutter while its siblings in
-    # the same panel carry the legacy one. t05-no-colons made that visible by
-    # changing only the live gutter.
-    my $bp_label14 = _live_gutter_label('backpack');
-    my $expected_value14 = tui::DashboardScreen::backpack_summary_spans($bp5);
-
-    for my $cols (120, 40) {
-        my @panels14 = live_panels(\%state5, $cols);
-        my ($run14) = grep { $_->{title} eq 'Run' } @panels14;
-        ok($run14, "AC14 (end-to-end): a Run panel is present at cols=$cols (subject moved off the deleted Backpack panel)");
-        my ($bprow14) = $run14 ? (grep { $_->[0]{text} eq $bp_label14 } @{ $run14->{lines} }) : ();
-        ok($bprow14, "AC14 (end-to-end): a backpack summary row exists in Run at cols=$cols");
-        is_deeply([ @{ $bprow14 }[1 .. $#$bprow14] ], $expected_value14,
-            "AC14 (end-to-end): the row's value spans equal backpack_summary_spans(\$bp5) exactly, unaffected by \$cols=$cols")
-            if $bprow14;
-
-        for my $item (@items5) {
-            unlike(Dashboard::spans_text($bprow14), qr/\Q$item->{key}\E/,
-                "AC14 (end-to-end): the backpack row at cols=$cols is a summary, not an item listing (item key '$item->{key}' absent)")
-                if $bprow14;
-        }
-    }
-}
-{
-    # AC15: total==0 (incl. items absent) -> exactly one line, verbatim text.
-    my @lines0 = Dashboard::_backpack_lines({ total => 0 }, 78);
-    is(scalar(@lines0), 1, 'AC15: total==0 -> exactly one line');
-    is(Dashboard::spans_text($lines0[0]), '(no backpack for this project)',
-        'AC15: total==0 line spans_text is "(no backpack for this project)"');
-
-    my @lines_noitems = Dashboard::_backpack_lines({ total => 0, items => undef }, 78);
-    is(scalar(@lines_noitems), 1, 'AC15: total==0 with items absent -> still exactly one line');
-    is(Dashboard::spans_text($lines_noitems[0]), '(no backpack for this project)',
-        'AC15: total==0 with items absent -> same message');
-}
 {
     # AC16: _fixed_region_height($state,$cols) must equal the number of body
     # rows compose_frame actually emits for the fixed region at that $cols,
