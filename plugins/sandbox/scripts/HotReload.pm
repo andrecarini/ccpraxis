@@ -184,9 +184,29 @@ sub summarise {
 
     my @notes;
     push @notes, "$_->{name} - $_->{why}" for @back, @skip;
-    push @notes, 'launcher.pl is never reloaded; a change that also touched it '
-               . 'is only half-applied and may render its fallback case instead of failing'
-        if @rel;
+
+    # THE launcher.pl CAVEAT IS NO LONGER UNCONDITIONAL.
+    #
+    # It used to fire on EVERY successful reload, because launcher.pl genuinely
+    # could not be picked up at all: a change touching both a render module and
+    # launcher.pl was half-applied, and since every function here is total, the
+    # new render code would quietly render its fallback from the old state --
+    # a correct change LOOKING broken. Warning unconditionally was right then.
+    #
+    # It is not right now. _relaunch_self() re-execs the launcher when
+    # launcher.pl has changed, so by the time this runs one of two things is
+    # true: launcher.pl did NOT change, and the caveat is simply false; or it
+    # DID and the re-exec was refused, in which case it is already in @skip
+    # above with its own specific reason and this adds nothing. Either way the
+    # operator is being told something they cannot act on, on every single
+    # reload -- and a banner that always appears is a banner that stops being
+    # read, which costs the ones that matter.
+    #
+    # So it fires only when launcher.pl is actually implicated.
+    my $launcher_implicated = grep { ($_->{name} // '') =~ /launcher\.pl/ } @back, @skip;
+    push @notes, 'launcher.pl changed but was not re-exec\'d, so this reload is only '
+               . 'half-applied; quit and re-run claude-sandbox to pick it up'
+        if @rel && $launcher_implicated;
 
     return { ok => (@back ? 0 : 1), headline => $headline,
              reloaded => \@rel, notes => \@notes };

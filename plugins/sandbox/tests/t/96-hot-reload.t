@@ -184,17 +184,38 @@ ok($OK, 'HotReload.pm and tui/DashboardScreen.pm load') or BAIL_OUT("require fai
     is($s->{ok}, 1, 'AC7: a clean reload reports ok');
     like($s->{headline}, qr/reloaded 2 modules/, 'AC7: and says how many');
 
-    # THE ASSERTION THIS PACKAGE MOST DEPENDS ON. Most real changes to this TUI
-    # touch a render module AND launcher.pl together -- t01 added
-    # sampler_wait_spans to DashboardScreen *and* threaded resources_sampler
-    # into launcher.pl's state hash. Hot-reload feeds NEW render code from the
-    # OLD state, and because every function here is total, that renders the
-    # fallback case cleanly. A correct change LOOKS BROKEN. Silence about that
-    # would make this feature cost more than it saves.
-    ok((grep { /launcher\.pl is never reloaded/ } @{ $s->{notes} }),
-        'AC8: a SUCCESSFUL reload still warns that launcher.pl was not in the set');
-    ok((grep { /half-applied/ } @{ $s->{notes} }),
-        'AC8: and names the consequence -- a half-applied change renders its fallback rather than failing');
+    # AC8 REWRITTEN 2026-08-25, extending this block's OWN principle -- stated
+    # eight lines down as "a note that always appears is one nobody reads".
+    #
+    # The caveat used to fire on every successful reload. That was right while
+    # launcher.pl genuinely could not be picked up: a change touching both a
+    # render module and launcher.pl was half-applied, and since every function
+    # here is total the new render code would quietly render its fallback from
+    # the old state -- a correct change LOOKING broken, which is worth a
+    # standing warning.
+    #
+    # _relaunch_self() removed that condition. The launcher now re-execs when
+    # launcher.pl has changed, so on reaching summarise either launcher.pl did
+    # NOT change (the caveat is false) or the re-exec was refused (it is
+    # already in the notes above, with its own reason). The operator reported
+    # it firing after a clean two-module reload where nothing about the
+    # launcher was in play.
+    ok(!(grep { /launcher\.pl/ } @{ $s->{notes} }),
+        'AC8: a clean reload with launcher.pl UNCHANGED says nothing about launcher.pl -- '
+      . 'there is nothing the operator could act on');
+
+    # ...and it still fires, naming the remedy, when launcher.pl really is
+    # implicated: it changed, and the re-exec was refused.
+    my $half = HotReload::summarise({
+        reloaded => ['tui::Frame'],
+        skipped  => [ { name => 'launcher.pl', why => "not re-exec'd - does not compile" } ],
+    });
+    ok((grep { /half-applied/ } @{ $half->{notes} }),
+        'AC8: a reload where launcher.pl was NOT re-exec\'d still names the consequence');
+    ok((grep { /quit and re-run claude-sandbox/ } @{ $half->{notes} }),
+        'AC8: ...and the remedy, which is the only thing that picks a new launcher.pl up');
+    ok((grep { /launcher\.pl - not re-exec/ } @{ $half->{notes} }),
+        'AC8: ...alongside the specific reason the re-exec was refused');
 
     my $none = HotReload::summarise({ reloaded => [] });
     ok(!(grep { /launcher\.pl/ } @{ $none->{notes} }),
@@ -416,7 +437,18 @@ ok($OK, 'HotReload.pm and tui/DashboardScreen.pm load') or BAIL_OUT("require fai
     my $rep = tui::DashboardScreen::hot_reload_msgs({
         hot_reload => HotReload::summarise({ reloaded => ['tui::Frame'] }) });
     ok((grep { /^\[r\] reloaded 1 module/ } @$rep), 'AC13: the report leads with what happened');
-    ok((grep { /launcher\.pl/ } @$rep), 'AC13: and carries the caveat through to the screen');
+    # A clean reload now carries NO notes (see AC8), so this asserts the
+    # carry-through with a summary that actually has one -- otherwise it would
+    # be re-asserting the caveat's unconditional firing that AC8 just removed.
+    is_deeply($rep, [ grep { /^\[r\] / } @$rep ],
+        'AC13: a clean reload carries the headline and nothing else');
+    my $rep2 = tui::DashboardScreen::hot_reload_msgs({
+        hot_reload => HotReload::summarise({
+            reloaded => ['tui::Frame'],
+            skipped  => [ { name => 'launcher.pl', why => "not re-exec'd - does not compile" } ],
+        }) });
+    ok((grep { /launcher\.pl/ } @$rep2),
+        'AC13: and a summary that DOES have notes carries them through to the screen');
 
     for my $b (undef, 'x', [], { hot_reload => 'nonsense' }, { hot_reload_pending => 'lots' }) {
         is(ref(eval { tui::DashboardScreen::hot_reload_msgs($b) }), 'ARRAY',
