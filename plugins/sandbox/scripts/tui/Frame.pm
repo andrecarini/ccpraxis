@@ -743,19 +743,61 @@ sub cell_sig {
     return $text . '|' . join(',', @parts);
 }
 
-# panel_title_line($title, $w) -> \@spans, exactly $w wide: '-- ' . safe($title)
-# . ' ' followed by rule.h glyphs to $w. The lead-in text carries text.primary;
-# the filler carries rule. PUBLIC.
+# panel_title_line($title, $w) -> \@spans, exactly $w wide: one rule.h glyph,
+# a space, safe($title), a space, then rule.h glyphs to $w. PUBLIC.
+#
+# THE LEAD-IN USED TO BE THE ASCII '-- '. The operator's objection was that it
+# "just looks ugly and is misaligned with everything else", and both halves are
+# fair: two hyphens are not the box-drawing glyph the rest of the rule is made
+# of, so the line visibly changed character three columns in, and they sat at a
+# different optical weight from every other rule on the screen.
+#
+# It is now a single rule.h, which makes the title line genuinely continuous
+# with its own filler -- and, under the panel-grid borders, makes it the panel's
+# TOP BORDER rather than a decorated caption. That is why the lead is one glyph
+# and not three: a border that starts with a gap is not a border.
+# $junctions is an OPTIONAL hashref of { column => glyph }, columns 0-based and
+# relative to this line's own left edge. Each named column in the FILLER region
+# is replaced by its glyph -- this is how a panel-grid junction (tee-down,
+# tee-up, cross) lands on a title rule that is also a top border.
+#
+# A junction falling inside the lead-in (the rule glyph, the spaces, or the
+# title text itself) is DROPPED rather than stamped. Overwriting a character of
+# the title to draw a line through it would corrupt the one piece of text on the
+# row that has to stay readable, and a missing junction glyph is a cosmetic
+# seam, not a corrupted caption. The caller cannot generally know whether a
+# given column will collide, so the decision belongs here.
 sub panel_title_line {
-    my ($title, $w) = @_;
-    my $lead  = '-- ' . safe($title) . ' ';
+    my ($title, $w, $junctions) = @_;
+    my $rule_glyph = Theme::glyph('rule.h');
+    $rule_glyph = '-' if !defined $rule_glyph || !length $rule_glyph;
+    my $lead  = $rule_glyph . ' ' . safe($title) . ' ';
     my @spans = ( { text => $lead, role => DEFAULT_ROLE() } );
     my $lead_w = tui::Layout::display_width($lead);
     my $target_w = (!defined $w || ref($w) || $w !~ /^-?\d+(?:\.\d+)?$/) ? 0 : int($w);
     if ($target_w > $lead_w) {
-        my $fill = Theme::glyph('rule.h');
-        $fill = '' if !defined $fill;
-        push @spans, { text => ($fill x ($target_w - $lead_w)), role => 'rule' };
+        my $fill_n = $target_w - $lead_w;
+        my %j = (ref($junctions) eq 'HASH') ? %$junctions : ();
+        if (!%j) {
+            push @spans, { text => ($rule_glyph x $fill_n), role => 'rule' };
+        } else {
+            # Build the filler a glyph at a time so a junction can replace one
+            # of them. Contiguous runs are still emitted as single spans, so
+            # this costs no extra spans when no junction lands in the filler.
+            my $run = '';
+            for my $i (0 .. $fill_n - 1) {
+                my $col = $lead_w + $i;
+                my $g   = $j{$col};
+                if (defined $g && length $g) {
+                    push @spans, { text => $run, role => 'rule' } if length $run;
+                    $run = '';
+                    push @spans, { text => $g, role => 'rule' };
+                } else {
+                    $run .= $rule_glyph;
+                }
+            }
+            push @spans, { text => $run, role => 'rule' } if length $run;
+        }
     }
     return fit_spans(\@spans, $w, 'rule');
 }

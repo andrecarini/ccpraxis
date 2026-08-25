@@ -45,6 +45,15 @@ my $SELF_PATH = "$Bin/68-launcher-screens.t";
 
 use lib "$Bin/../../scripts";
 
+# THE PANEL TITLE LEAD-IN, DERIVED. It was the ASCII '-- '; it is now one
+# Theme rule.h glyph plus a space, so a title line is continuous with its own
+# filler and can serve as the panel's top border (operator request,
+# 2026-08-25). Taken from Theme rather than written out, so it cannot drift
+# from the declaration the renderer actually uses.
+require Theme;
+my $RULE_LEAD    = Theme::glyph('rule.h');      # UTF-8 BYTES, matches row text
+my $RULE_LEAD_RE = quotemeta($RULE_LEAD);
+
 # ===========================================================================
 # Scaffolding
 # ===========================================================================
@@ -897,7 +906,7 @@ sub panel_title_hits {
     my ($text, @titles) = @_;
     return 0 unless defined $text;
     my $n = 0;
-    for my $t (@titles) { $n += () = $text =~ /-- \Q$t\E /g; }
+    for my $t (@titles) { $n += () = $text =~ /\Q$RULE_LEAD\E \Q$t\E /g; }
     return $n;
 }
 

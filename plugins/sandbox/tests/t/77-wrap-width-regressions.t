@@ -32,6 +32,15 @@ use Encode qw(encode);
 my $SCRIPTS = "$Bin/../../scripts";
 use lib "$Bin/../../scripts";
 
+# THE PANEL TITLE LEAD-IN, DERIVED. It was the ASCII '-- '; it is now one
+# Theme rule.h glyph plus a space, so a title line is continuous with its own
+# filler and can serve as the panel's top border (operator request,
+# 2026-08-25). Taken from Theme rather than written out, so it cannot drift
+# from the declaration the renderer actually uses.
+require Theme;
+my $RULE_LEAD    = Theme::glyph('rule.h');      # UTF-8 BYTES, matches row text
+my $RULE_LEAD_RE = quotemeta($RULE_LEAD);
+
 my $LAYOUT_OK = eval { require tui::Layout; 1 };
 ok($LAYOUT_OK, 'tui/Layout.pm loads') or diag("  require tui::Layout failed: $@");
 my $FRAME_OK = eval { require tui::Frame; 1 };
@@ -171,7 +180,8 @@ SKIP: {
         my $frame = Dashboard::compose_frame(\%state, $rows, $cols);
         my $activity_title_idx;
         for my $i (1 .. $#$frame) {
-            if ($frame->[$i]{text} =~ /-- Recent activity /) { $activity_title_idx = $i; last; }
+            # Title lead-in is a rule glyph now, not '--' -- see t/73's geometry().
+            if ($frame->[$i]{text} =~ /\Q$RULE_LEAD\E Recent activity /) { $activity_title_idx = $i; last; }
         }
         ok(defined $activity_title_idx, "predictor-vs-renderer: compose_frame(cols=$cols) has a Recent-activity title row")
             or next;

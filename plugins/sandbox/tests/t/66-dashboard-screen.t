@@ -81,6 +81,15 @@ my $SELF_PATH    = "$Bin/66-dashboard-screen.t";
 
 use lib "$Bin/../../scripts";
 
+# THE PANEL TITLE LEAD-IN, DERIVED. It was the ASCII '-- '; it is now one
+# Theme rule.h glyph plus a space, so a title line is continuous with its own
+# filler and can serve as the panel's top border (operator request,
+# 2026-08-25). Taken from Theme rather than written out, so it cannot drift
+# from the declaration the renderer actually uses.
+require Theme;
+my $RULE_LEAD    = Theme::glyph('rule.h');      # UTF-8 BYTES, matches row text
+my $RULE_LEAD_RE = quotemeta($RULE_LEAD);
+
 my $NOW = 1700003600;   # pinned clock -- no real-time dependence anywhere in this file.
 
 # ===========================================================================
@@ -289,7 +298,7 @@ sub _panel_title_hits_in_row {
     return 0 unless defined $text;
     my $n = 0;
     for my $t (@KNOWN_PANEL_TITLES) {
-        $n += () = $text =~ /-- \Q$t\E /g;
+        $n += () = $text =~ /\Q$RULE_LEAD\E \Q$t\E /g;
     }
     return $n;
 }

@@ -284,7 +284,7 @@ my %st = (
     my $joined = join "\n", map { $_->{text} } @$f;
     # RE-POINTED (spec S5 ":126"): the Sandbox panel is deleted (spec
     # S2.4.3); claim "a panel title renders" moves subject to "-- Run ".
-    like($joined, qr/-- Run /,        'compose: Run panel title rendered (subject moved from the deleted Sandbox panel)');
+    like($joined, qr/$RULE_FILL_RE Run /,        'compose: Run panel title rendered (subject moved from the deleted Sandbox panel)');
     # RE-POINTED (spec S5 ":127"): the Sandbox panel's own "container : ..."
     # body row is gone -- the container fact now lives ONLY in the header,
     # already asserted two lines above. This becomes Criterion 2/AC-D1's
@@ -292,7 +292,7 @@ my %st = (
     my $container_count = () = ($joined =~ /\Qclaude-demo-abcd1234\E/g);
     is($container_count, 1,
         'compose: the container name appears exactly once in the frame (moved from the deleted Sandbox panel body -- Criterion 2/AC-D1)');
-    like($joined, qr/-- Recent activity /, 'compose: Activity panel rendered');
+    like($joined, qr/$RULE_FILL_RE Recent activity /, 'compose: Activity panel rendered');
     like($joined, qr/\Qlaunch_start\E/,   'compose: B1 event surfaced in Activity');
     # RE-POINTED (spec S5 ":130", S2.4.7/Criterion 4): the one duration
     # format is fmt_duration/fmt_age, never fmt_hms's "Xh Ym Zs" -- re-derive
@@ -345,14 +345,14 @@ my %st = (
 # exists regardless of input, so plain %st is enough to trigger the pairing.
 {
     my $fat = Dashboard::compose_frame(\%st, 24, $BP + 10);
-    my $both = grep { $_->{text} =~ /-- Run / && $_->{text} =~ /-- Blueprints / } @$fat;
+    my $both = grep { $_->{text} =~ /$RULE_FILL_RE Run / && $_->{text} =~ /$RULE_FILL_RE Blueprints / } @$fat;
     is($both, 1, "compose (s05): 24x@{[ $BP + 10 ]} -- exactly one row carries BOTH panel titles (two-column mode)");
 
     my $below = $BP - 1;
     my $fbelow = Dashboard::compose_frame(\%st, 24, $below);
-    my $both_below = grep { $_->{text} =~ /-- Run / && $_->{text} =~ /-- Blueprints / } @$fbelow;
+    my $both_below = grep { $_->{text} =~ /$RULE_FILL_RE Run / && $_->{text} =~ /$RULE_FILL_RE Blueprints / } @$fbelow;
     is($both_below, 0, "compose (s05): 24x$below -- no row carries both panel titles (still stacked)");
-    my ($run_below) = grep { $_->{text} =~ /^-- Run (?:$RULE_FILL_RE)+$/ } @$fbelow;
+    my ($run_below) = grep { $_->{text} =~ /^$RULE_FILL_RE Run (?:$RULE_FILL_RE)+$/ } @$fbelow;
     ok($run_below, "compose (s05): 24x$below -- a row matches /^-- Run <rule.h fill>\$/ (dash-filled full width)");
     is(Dashboard::display_width($run_below->{text}), $below, "compose (s05): that row is exactly $below display columns")
         if $run_below;
@@ -764,7 +764,7 @@ my %st = (
     # 2 display columns -- display_width, not length(), is the invariant.
     is(scalar(grep { Dashboard::display_width($_->{text}) != 80 } @$f), 0, 'compose: new panels keep rows exactly $cols');
     my $joined = join "\n", map { $_->{text} } @$f;
-    like($joined, qr/-- Run /,             'compose: Run panel title rendered');
+    like($joined, qr/$RULE_FILL_RE Run /,             'compose: Run panel title rendered');
     # RE-POINTED (spec S2.4.8, Decision 9): the Backpack panel dissolves into
     # a single summary ROW inside Run ("Rendered through row(label =>
     # 'backpack', ...) inside the Run panel -- not as a panel of its own"),

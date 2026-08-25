@@ -123,13 +123,46 @@ sub side_column_width {
 # _render_panel(\%panel, $w, $maxh) -> up to $maxh cells: a title line
 # followed by (indented) body lines, clipped to $maxh. PRIVATE.
 sub _render_panel {
-    my ($panel, $w, $maxh) = @_;
+    my ($panel, $w, $maxh, $border) = @_;
     my @out;
     return @out if !defined $maxh || $maxh < 1;
     $panel = {} if ref($panel) ne 'HASH';
 
-    my $title_spans = tui::Frame::panel_title_line($panel->{title}, $w);
-    push @out, { text => tui::Frame::spans_text($title_spans), role => 'text.primary', spans => $title_spans };
+    # THE SHARED BORDER COLUMN.
+    #
+    # Horizontally-adjacent panels share ONE column of vertical border rather
+    # than each drawing its own against the other's (operator: "collapse
+    # adjacent borders into a single border"). Layout::place hands out bands
+    # that are already adjacent with no gutter, so the shared column is taken
+    # from the LEFT-HAND panel's own width: a panel that has a neighbour to its
+    # right renders its content into $w - 1 and spends the last column on the
+    # separator. The rightmost panel in a band row has no neighbour, so it keeps
+    # its full width -- which is also what "no border at the viewport edges"
+    # requires, and the two rules turn out to be the same rule.
+    my $sep_glyph = (ref($border) eq 'HASH') ? $border->{sep} : undef;
+    my $has_sep   = (defined $sep_glyph && length $sep_glyph) ? 1 : 0;
+    my $content_w = $has_sep ? ($w - 1) : $w;
+    $content_w = 0 if $content_w < 0;
+
+    my $junctions = (ref($border) eq 'HASH' && ref($border->{junctions}) eq 'HASH')
+                  ? $border->{junctions} : undef;
+
+    my $edge = sub {
+        my ($cell, $glyph, $role) = @_;
+        return $cell unless $has_sep;
+        my @spans = @{ ref($cell->{spans}) eq 'ARRAY' ? $cell->{spans} : [] };
+        push @spans, { text => $glyph, role => $role };
+        return { text => tui::Frame::spans_text(\@spans), role => $cell->{role}, spans => \@spans };
+    };
+
+    my $title_spans = tui::Frame::panel_title_line($panel->{title}, $content_w, $junctions);
+    push @out, $edge->(
+        { text => tui::Frame::spans_text($title_spans), role => 'text.primary', spans => $title_spans },
+        # The title rule IS the top border, so the column where the separator
+        # begins is a junction on this row, not a plain vertical.
+        (defined($border->{corner}) && length($border->{corner})) ? $border->{corner} : $sep_glyph,
+        'rule',
+    );
 
     my $lines = (ref($panel->{lines}) eq 'ARRAY') ? $panel->{lines} : [];
     for my $ln (@$lines) {
@@ -171,18 +204,19 @@ sub _render_panel {
                         && !ref($panel->{wrap_indent})
                         && $panel->{wrap_indent} =~ /^\d+$/)
                      ? $panel->{wrap_indent} : WRAP_CONTINUATION_INDENT();
-            $cells = tui::Frame::wrap_chars($spans, $role, $w, $hang + 2, $cap);
+            $cells = tui::Frame::wrap_chars($spans, $role, $content_w, $hang + 2, $cap);
         } else {
             $cells = tui::Frame::wrap_capped(
-                $spans, $role, $w, WRAP_CONTINUATION_INDENT(), $cap
+                $spans, $role, $content_w, WRAP_CONTINUATION_INDENT(), $cap
             );
         }
         for my $c (@$cells) {
             last if @out >= $maxh;
-            push @out, $c;
+            push @out, $edge->($c, $sep_glyph, 'rule');
         }
     }
-    push @out, tui::Frame::make_cell('', 'text.primary', $w) if @out < $maxh;
+    push @out, $edge->(tui::Frame::make_cell('', 'text.primary', $content_w), $sep_glyph, 'rule')
+        if @out < $maxh;
     return @out;
 }
 
@@ -249,6 +283,133 @@ sub flex_reserve {
     return $reserve < 1 ? 0 : $reserve;
 }
 
+# _sep_columns(\@band_row) -> a hash of the ABSOLUTE columns in this band row
+# that carry a shared vertical border. Every panel but the last one spends its
+# own last column on the separator, so the column is band.x + band.w - 1.
+# PRIVATE.
+sub _sep_columns {
+    my ($row) = @_;
+    my %c;
+    return \%c if ref($row) ne 'ARRAY';
+    for my $j (0 .. $#$row - 1) {
+        $c{ $row->[$j]{x} + $row->[$j]{w} - 1 } = 1;
+    }
+    return \%c;
+}
+
+# _border_for(\@band_rows, $i, $j) -> the border spec for panel $j of band row
+# $i, or undef when it needs no border at all.
+#
+# WHY THE ROW ABOVE MATTERS. A panel's title rule is its top border, so it is
+# also the horizontal line that any vertical border from the band row ABOVE
+# terminates against. Three cases, and getting them wrong shows up as a visibly
+# broken grid rather than a subtle one:
+#
+#   line continues below and arrived from above  -> cross
+#   line begins below, nothing above             -> tee pointing down
+#   line arrived from above, nothing below       -> tee pointing up
+#
+# The third case is not exotic: band rows do not all hold the same number of
+# panels (Layout::place reduces the count when a panel declares min_cols it
+# cannot get), so a three-panel row above a one-panel row is ordinary, and every
+# separator column from the row above lands mid-rule on the row below.
+#
+# The FIRST band row has nothing above it, so it only ever draws tee-downs --
+# which is the same statement as "no border at the top viewport edge".
+# PRIVATE.
+sub _border_for {
+    my ($band_rows, $i, $j) = @_;
+    return undef if ref($band_rows) ne 'ARRAY';
+    my $row = $band_rows->[$i];
+    return undef if ref($row) ne 'ARRAY' || !@$row;
+
+    my $sep   = Theme::glyph('rule.v');
+    my $tee_d = Theme::glyph('tee.down');
+    my $tee_u = Theme::glyph('tee.up');
+    my $cross = Theme::glyph('cross');
+    return undef if !defined $sep || !length $sep;
+
+    my $above = ($i > 0) ? _sep_columns($band_rows->[$i - 1]) : {};
+    my $here  = _sep_columns($row);
+
+    my $is_last  = ($j == $#$row);
+    my $panel_x  = $row->[$j]{x};
+    my $panel_w  = $row->[$j]{w};
+
+    # Junctions from the row above that fall INSIDE this panel's own span, at a
+    # column this panel is not itself terminating. Expressed relative to the
+    # panel's left edge, because that is the coordinate system its title line
+    # works in.
+    my %junctions;
+    for my $c (keys %$above) {
+        next if $c < $panel_x || $c >= $panel_x + $panel_w;
+        my $rel = $c - $panel_x;
+        # The panel's own separator column is handled by `corner` below, not
+        # here -- stamping it twice would put the glyph in the filler AND on the
+        # edge.
+        next if !$is_last && $rel == $panel_w - 1;
+        $junctions{$rel} = (defined $tee_u && length $tee_u) ? $tee_u : $sep;
+    }
+
+    return (%junctions ? { junctions => \%junctions } : undef) if $is_last;
+
+    my $own_col = $panel_x + $panel_w - 1;
+    my $corner  = $above->{$own_col}
+                ? ((defined $cross && length $cross) ? $cross : $sep)
+                : ((defined $tee_d && length $tee_d) ? $tee_d : $sep);
+
+    return { sep => $sep, corner => $corner,
+             (%junctions ? (junctions => \%junctions) : ()) };
+}
+
+# _side_border_cell($left_cell, $side_cell, $sep) -> a ONE-column cell carrying
+# the correct junction for the seam between the main region and the side column.
+#
+# Four cases, decided by what actually meets the seam on this row:
+#
+#   rule from the left, rule to the right  -> cross          (both title rules)
+#   rule from the left only                -> tee pointing left
+#   rule to the right only                 -> tee pointing right
+#   neither                                -> plain vertical
+#
+# "A rule arrives from the left" means the main region's row ENDS in a
+# horizontal rule glyph -- which is true exactly when that row is a panel title
+# line, since those are the only full-width rules. "A rule leaves to the right"
+# means the side column's own row BEGINS with one, true only on its title row.
+# Detected from the rendered text rather than tracked as state, because the two
+# regions are composed independently and only meet here. PRIVATE.
+sub _side_border_cell {
+    my ($left_cell, $side_cell, $sep) = @_;
+    my $h = Theme::glyph('rule.h');
+    my %rule_ish = map { (defined($_) && length($_)) ? ($_ => 1) : () }
+                   ($h, Theme::glyph('tee.down'), Theme::glyph('tee.up'), Theme::glyph('cross'));
+
+    my $ltext = (ref($left_cell) eq 'HASH' && defined $left_cell->{text}) ? $left_cell->{text} : '';
+    my $stext = (ref($side_cell) eq 'HASH' && defined $side_cell->{text}) ? $side_cell->{text} : '';
+
+    # Byte-level suffix/prefix tests, deliberately: every glyph here is a
+    # fixed UTF-8 byte string and both texts are byte strings, so "does this row
+    # end in a rule glyph" is a plain suffix comparison. Decoding first would
+    # buy nothing and would drag this file into character-semantics it does not
+    # otherwise have.
+    my $from_left = 0;
+    for my $g (keys %rule_ish) {
+        next if length($ltext) < length($g);
+        if (substr($ltext, -length($g)) eq $g) { $from_left = 1; last }
+    }
+    my $to_right = (defined($h) && length($h) && length($stext) >= length($h)
+                    && substr($stext, 0, length($h)) eq $h) ? 1 : 0;
+
+    my $glyph = $sep;
+    if    ($from_left && $to_right)  { $glyph = Theme::glyph('cross')     // $sep }
+    elsif ($from_left)               { $glyph = Theme::glyph('tee.left')  // $sep }
+    elsif ($to_right)                { $glyph = Theme::glyph('tee.right') // $sep }
+    $glyph = $sep if !defined $glyph || !length $glyph;
+
+    my @spans = ( { text => $glyph, role => 'rule' } );
+    return { text => $glyph, role => 'rule', spans => \@spans };
+}
+
 sub _place_and_render {
     my ($panels, $cols, $body_height) = @_;
     my @out;
@@ -294,10 +455,11 @@ sub _place_and_render {
             last;
         }
 
-        my @rendered = map { [ _render_panel($_->{panel}, $_->{w}, $remaining) ] } @$row;
+        my @rendered = map { [ _render_panel($row->[$_]{panel}, $row->[$_]{w}, $remaining,
+                                             _border_for($band_rows, $i, $_)) ] } (0 .. $#$row);
         my $h = 0;
         for my $r (@rendered) { $h = @$r if @$r > $h; }
-        push @bands, { row => $row, rendered => \@rendered, h => $h };
+        push @bands, { row => $row, rendered => \@rendered, h => $h, index => $i };
         $used += $h;
     }
 
@@ -314,8 +476,11 @@ sub _place_and_render {
         }
         if (defined $fi) {
             my $target = $bands[$fi]{h} + $slack;
+            my $frow = $bands[$fi]{row};
             $bands[$fi]{rendered} =
-                [ map { [ _render_panel($_->{panel}, $_->{w}, $target) ] } @{ $bands[$fi]{row} } ];
+                [ map { [ _render_panel($frow->[$_]{panel}, $frow->[$_]{w}, $target,
+                                        _border_for($band_rows, $bands[$fi]{index}, $_)) ] }
+                  (0 .. $#$frow) ];
             # Pin the band to $target even if its content came up short: the
             # point is a geometry that does not move, so the shortfall is padded
             # inside the band rather than left as slack that shifts later.
@@ -330,7 +495,25 @@ sub _place_and_render {
             my @cells;
             for my $j (0 .. $#$row) {
                 my $cell = $rendered->[$j][$i];
-                $cell = tui::Frame::make_cell('', 'text.primary', $row->[$j]{w}) if !defined $cell;
+                if (!defined $cell) {
+                    # PADDING MUST CARRY THE BORDER TOO. A short panel next to a
+                    # tall one is padded to the band height here, and a blank
+                    # pad at full band width would punch a hole straight through
+                    # the shared vertical border for exactly as many rows as the
+                    # panels differ in height -- the commonest case there is,
+                    # and one that would look like a rendering bug rather than a
+                    # padding bug.
+                    my $b   = _border_for($band_rows, $band->{index}, $j);
+                    my $sep = (ref($b) eq 'HASH') ? $b->{sep} : undef;
+                    if (defined $sep && length $sep) {
+                        my @spans = ( { text => (' ' x ($row->[$j]{w} - 1)), role => 'text.primary' },
+                                      { text => $sep, role => 'rule' } );
+                        $cell = { text => tui::Frame::spans_text(\@spans),
+                                  role => 'text.primary', spans => \@spans };
+                    } else {
+                        $cell = tui::Frame::make_cell('', 'text.primary', $row->[$j]{w});
+                    }
+                }
                 push @cells, $cell;
             }
             push @out, _join_row_cells(@cells);
@@ -464,18 +647,35 @@ sub compose {
     # LEFT region, and the side column runs beside all of them.
     my @left = (@banner_cells, @main_cells);
 
-    my @side = _render_panel($side_panel, $side_w, $body_height);
+    # THE SIDE COLUMN OWNS ITS LEFT BORDER, which is the mirror of the rule the
+    # band grid uses (there, the LEFT panel spends its last column). It has to
+    # be this way round: the side column is a single fixed column spanning the
+    # whole body, while the main region to its left is a stack of band rows with
+    # differing panel counts, so there is no single "left panel" to charge the
+    # column to.
+    #
+    # The junction at each row depends on what meets the line from either side,
+    # which is only knowable at join time -- a horizontal rule arriving from the
+    # left is a panel title rule ending there; one leaving to the right is the
+    # side column's own title rule starting there.
+    my $side_sep = Theme::glyph('rule.v');
+    my $side_bw  = (defined $side_sep && length $side_sep) ? 1 : 0;
+    my @side = _render_panel($side_panel, $side_w - $side_bw, $body_height);
 
     # BOTH REGIONS ARE PADDED TO $body_height BEFORE JOINING. That is what
     # keeps "total rows == the terminal height" a structural property rather
     # than arithmetic somebody has to get right at three call sites: neither
     # region can run out first, so the join below is always a clean pairing.
     while (@left < $body_height) { push @left, tui::Frame::make_cell('', 'text.primary', $main_cols) }
-    while (@side < $body_height) { push @side, tui::Frame::make_cell('', 'text.primary', $side_w) }
+    while (@side < $body_height) { push @side, tui::Frame::make_cell('', 'text.primary', $side_w - $side_bw) }
     @left = @left[ 0 .. $body_height - 1 ] if @left > $body_height;
     @side = @side[ 0 .. $body_height - 1 ] if @side > $body_height;
 
-    my @body_cells = map { _join_row_cells($left[$_], $side[$_]) } 0 .. $body_height - 1;
+    my @body_cells = map {
+        $side_bw
+            ? _join_row_cells($left[$_], _side_border_cell($left[$_], $side[$_], $side_sep), $side[$_])
+            : _join_row_cells($left[$_], $side[$_])
+    } 0 .. $body_height - 1;
 
     return [ $title_cell, @body_cells, $footer_cell ];
 }

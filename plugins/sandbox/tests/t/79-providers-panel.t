@@ -33,6 +33,15 @@ use warnings;
 use Test::More;
 use FindBin qw($Bin);
 use lib "$Bin/../../scripts";
+
+# THE PANEL TITLE LEAD-IN, DERIVED. It was the ASCII '-- '; it is now one
+# Theme rule.h glyph plus a space, so a title line is continuous with its own
+# filler and can serve as the panel's top border (operator request,
+# 2026-08-25). Taken from Theme rather than written out, so it cannot drift
+# from the declaration the renderer actually uses.
+require Theme;
+my $RULE_LEAD    = Theme::glyph('rule.h');      # UTF-8 BYTES, matches row text
+my $RULE_LEAD_RE = quotemeta($RULE_LEAD);
 use Dashboard ();
 use tui::DashboardScreen ();
 use tui::Layout ();
@@ -128,9 +137,9 @@ sub runs_n {
     for my $cols (60, 140) {
         my $f = Dashboard::compose_frame(base_state(), 30, $cols);
         my $t = frame_text($f);
-        like($t, qr/-- Providers /, "AC1: cols=$cols -- a panel titled Providers exists");
-        unlike($t, qr/-- Token /, "AC1: cols=$cols -- no panel titled Token exists");
-        unlike($t, qr/-- Spend /, "AC1: cols=$cols -- no panel titled Spend exists (Providers is its successor)");
+        like($t, qr/$RULE_LEAD_RE Providers /, "AC1: cols=$cols -- a panel titled Providers exists");
+        unlike($t, qr/$RULE_LEAD_RE Token /, "AC1: cols=$cols -- no panel titled Token exists");
+        unlike($t, qr/$RULE_LEAD_RE Spend /, "AC1: cols=$cols -- no panel titled Spend exists (Providers is its successor)");
     }
 }
 
@@ -402,7 +411,7 @@ sub runs_n {
 
     # Behavior 10: Blueprints exists, is a sibling of Run (not nested in it).
     my $t = frame_text(Dashboard::compose_frame(base_state(runs => $runs), 24, 120));
-    like($t, qr/-- Blueprints /, 'AC5/Behavior10: a panel titled Blueprints exists');
+    like($t, qr/$RULE_LEAD_RE Blueprints /, 'AC5/Behavior10: a panel titled Blueprints exists');
 
     # Behavior 11/16: Run's own content is unaffected by how many blueprint
     # runs exist -- structurally identical with 0 vs 12 runs, and no
@@ -458,11 +467,11 @@ sub runs_n {
     my $small_runs = runs_n(3);
     my $below = $BP - 1;
     my $f_below = Dashboard::compose_frame(base_state(runs => $small_runs), 24, $below);
-    my $both_below = grep { $_->{text} =~ /-- Run / && $_->{text} =~ /-- Blueprints / } @$f_below;
+    my $both_below = grep { $_->{text} =~ /$RULE_LEAD_RE Run / && $_->{text} =~ /$RULE_LEAD_RE Blueprints / } @$f_below;
     is($both_below, 0, "Behavior17: 24x$below -- no row carries BOTH \"-- Run \" and \"-- Blueprints \" (still stacked, below breakpoint)");
 
     my $f_at = Dashboard::compose_frame(base_state(runs => $small_runs), 24, $BP);
-    my $both_at = grep { $_->{text} =~ /-- Run / && $_->{text} =~ /-- Blueprints / } @$f_at;
+    my $both_at = grep { $_->{text} =~ /$RULE_LEAD_RE Run / && $_->{text} =~ /$RULE_LEAD_RE Blueprints / } @$f_at;
     is($both_at, 1, "Behavior17: 24x$BP -- EXACTLY one row carries BOTH \"-- Run \" and \"-- Blueprints \" (two-column mode, unconditional pairing)");
 }
 
@@ -475,9 +484,9 @@ sub runs_n {
     my $minimal = { project_name => 'p', container => 'c', status => 'running' };
     for my $cols (60, 140) {
         my $t = frame_text(Dashboard::compose_frame($minimal, 30, $cols));
-        like($t, qr/-- Resources /,  "Required-6: cols=$cols -- Resources present with a minimal (no-data) state");
-        like($t, qr/-- Providers /,  "Required-6: cols=$cols -- Providers present with a minimal (no-data) state");
-        like($t, qr/-- Blueprints /, "Required-6: cols=$cols -- Blueprints present with a minimal (no-data) state (D4 scope extension)");
+        like($t, qr/$RULE_LEAD_RE Resources /,  "Required-6: cols=$cols -- Resources present with a minimal (no-data) state");
+        like($t, qr/$RULE_LEAD_RE Providers /,  "Required-6: cols=$cols -- Providers present with a minimal (no-data) state");
+        like($t, qr/$RULE_LEAD_RE Blueprints /, "Required-6: cols=$cols -- Blueprints present with a minimal (no-data) state (D4 scope extension)");
     }
 
     my $panels = tui::DashboardScreen::panels($minimal, 120);
@@ -493,7 +502,7 @@ sub runs_n {
     # ARE present -- proves this is a genuine "always present" guarantee,
     # not a coincidence of the empty-state fixture alone.
     my $t_full = frame_text(Dashboard::compose_frame(base_state(runs => runs_n(3)), 30, 120));
-    like($t_full, qr/-- Blueprints /, 'Required-6 non-vacuity: Blueprints also appears with runs present (not an empty-state-only fluke)');
+    like($t_full, qr/$RULE_LEAD_RE Blueprints /, 'Required-6 non-vacuity: Blueprints also appears with runs present (not an empty-state-only fluke)');
 
     # Same non-vacuity pairing for the empty-runs vs non-empty-array vs
     # garbage-value cases (edge case §7): all three must produce the SAME
@@ -501,7 +510,7 @@ sub runs_n {
     for my $case (['empty array', []], ['non-array garbage', 'not-an-array']) {
         my ($label, $val) = @$case;
         my $t3 = frame_text(Dashboard::compose_frame(base_state(runs => $val), 30, 120));
-        like($t3, qr/-- Blueprints /, "Required-6: runs=$label -- Blueprints panel still present");
+        like($t3, qr/$RULE_LEAD_RE Blueprints /, "Required-6: runs=$label -- Blueprints panel still present");
     }
 }
 

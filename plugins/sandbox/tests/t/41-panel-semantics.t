@@ -24,6 +24,15 @@ use strict;
 use warnings;
 use FindBin qw($Bin);
 use lib "$Bin/../../scripts";
+
+# THE PANEL TITLE LEAD-IN, DERIVED. It was the ASCII '-- '; it is now one
+# Theme rule.h glyph plus a space, so a title line is continuous with its own
+# filler and can serve as the panel's top border (operator request,
+# 2026-08-25). Taken from Theme rather than written out, so it cannot drift
+# from the declaration the renderer actually uses.
+require Theme;
+my $RULE_LEAD    = Theme::glyph('rule.h');      # UTF-8 BYTES, matches row text
+my $RULE_LEAD_RE = quotemeta($RULE_LEAD);
 use Test::More;
 use Encode qw(encode);
 use Time::Local qw(timegm);
@@ -721,7 +730,7 @@ sub _live_gutter_label { return tui::DashboardScreen::gutter($_[0]); }
         my $f = Dashboard::compose_frame(\%state16, 30, $cols);
         my $activity_title_idx;
         for my $i (1 .. $#$f) {
-            if ($f->[$i]{text} =~ /-- Recent activity /) { $activity_title_idx = $i; last; }
+            if ($f->[$i]{text} =~ /$RULE_LEAD_RE Recent activity /) { $activity_title_idx = $i; last; }
         }
         ok(defined $activity_title_idx, "AC16: compose_frame(cols=$cols) has a Recent-activity title row");
         my $actual_fixed_rows = defined($activity_title_idx) ? $activity_title_idx - 1 : -1;

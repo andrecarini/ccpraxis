@@ -1869,6 +1869,23 @@ sub launch_blocked_msg {
     return 'container is down - [l] relaunch, or [q] quit and re-run claude-sandbox';
 }
 
+# LEGACY AND FROZEN -- deliberately NOT tracking tui::Frame::panel_title_line.
+#
+# This is reached only from _body_rows, which the note above it marks "do NOT
+# delete" and which compose_frame no longer calls at all (it delegates entirely
+# to tui::DashboardScreen). So this whole family is retained, unreachable code.
+#
+# It stays pure ASCII. I briefly changed the lead here to the rule glyph for
+# consistency with the live path and it was the wrong call twice over: it buys
+# nothing in production, and it broke t/40's AC-5, which compares band-placed
+# rows against standalone ones by slicing with byte-substr on the documented
+# premise that this family emits ASCII ("for ASCII content", :266). A
+# multi-byte lead makes byte offsets and column offsets disagree, so the
+# comparison starts cutting glyphs in half.
+#
+# The rule that matters: the LIVE path owns the visual style; a frozen path
+# keeps the style it was frozen with. Two styles in the tree is not a problem
+# when one of them is unreachable and says so.
 sub _panel_title_line {
     my ($title, $cols) = @_;
     my $s = '-- ' . _safe($title) . ' ';

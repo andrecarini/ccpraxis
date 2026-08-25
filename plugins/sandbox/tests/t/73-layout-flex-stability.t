@@ -69,7 +69,12 @@ sub geometry {
         $i++;
         my $t = plain($cell);
         utf8::decode($t) unless utf8::is_utf8($t);
-        while ($t =~ /--\s+([A-Za-z][A-Za-z ]*?)\s+\x{2500}/g) { push @out, "$1\@$i" }
+        # The title lead-in is a rule glyph, not the old ASCII '--' (operator
+        # request, 2026-08-25): a panel's title line is now its top border, so
+        # it is continuous with its own filler. Both ends of the match are
+        # therefore U+2500. Written as the escape rather than a literal because
+        # this file must not `use utf8`.
+        while ($t =~ /\x{2500}\s+([A-Za-z][A-Za-z ]*?)\s+\x{2500}/g) { push @out, "$1\@$i" }
     }
     return join(' | ', @out);
 }

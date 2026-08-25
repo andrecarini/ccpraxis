@@ -307,6 +307,17 @@ sub _glyphs_data {
         'corner.tr'   => { cp => 0x2510, desc => 'frame corner, top-right' },
         'corner.bl'   => { cp => 0x2514, desc => 'frame corner, bottom-left' },
         'corner.br'   => { cp => 0x2518, desc => 'frame corner, bottom-right' },
+        # Junctions, for the panel grid (operator request, 2026-08-25): each
+        # panel's title rule IS its top border, and horizontally-adjacent
+        # panels share ONE column of vertical border rather than drawing two
+        # against each other. Where a shared column begins below a title rule
+        # that is a tee-down; where it also arrives from the band row above,
+        # the same position is a cross. Nothing is drawn at the viewport edges.
+        'tee.down'    => { cp => 0x252C, desc => 'light tee pointing down, panel-grid junction' },
+        'tee.up'      => { cp => 0x2534, desc => 'light tee pointing up, panel-grid junction' },
+        'cross'       => { cp => 0x253C, desc => 'light cross, panel-grid junction' },
+        'tee.left'    => { cp => 0x2524, desc => 'light tee pointing left, panel-grid junction' },
+        'tee.right'   => { cp => 0x251C, desc => 'light tee pointing right, panel-grid junction' },
         'sep.bar'     => { cp => 0xFF5C, desc => 'fullwidth vertical line, statusline segment separator', width => 2 },
         'sep.dot'     => { cp => 0x00B7, desc => 'middle dot, inline separator' },
         'gauge.full'  => { cp => 0x2588, desc => 'full block, meter fill' },

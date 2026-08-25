@@ -60,8 +60,10 @@ my $BP = tui::Layout::BREAKPOINT_TWO_COL();
 # assertion below that previously matched a FULL dash-filled title row with
 # a bare `-+` is rewritten against this DERIVED pattern -- never a hardcoded
 # '-' or a hardcoded codepoint -- so it cannot drift from Theme's own
-# declaration. The literal "-- " prefix stays ASCII (that part of the title
-# text is unchanged; only the FILL differs).
+# declaration. The TITLE LEAD-IN is now derived too: it was the ASCII "-- ",
+# and is now one rule.h glyph plus a space, so the title line is continuous
+# with its own filler and can serve as the panel's top border (operator
+# request, 2026-08-25). Both halves come from Theme, never a literal.
 # ===========================================================================
 require Theme;
 my $RULE_FILL_RE      = quotemeta(Theme::glyph('rule.h'));                    # UTF-8 BYTES, for byte-string row text
@@ -227,7 +229,11 @@ for my $c ($BP, 101, 120, 200, 1000) {
     my @cells = Dashboard::_panel_rows($panel, 20, 99);
     is(scalar(@cells), 4, 'AC-4: _panel_rows returns 4 cells (title + 2 body lines + blank)');
     is($cells[0]{role}, 'panel-title', 'AC-4: cell[0] role is panel-title');
-    like($cells[0]{text}, qr/^-- T -+$/, 'AC-4: cell[0] text is the dash-filled panel title');
+    # _panel_rows is the FROZEN legacy family (see Dashboard::_panel_title_line):
+    # unreachable from compose_frame and deliberately still ASCII, lead included.
+    # That is why this stays '-- ' while every live-path assertion in this file
+    # now derives its lead from Theme.
+    like($cells[0]{text}, qr/^-- T -+$/, 'AC-4: cell[0] text is the dash-filled panel title (frozen legacy path)');
     is($cells[1]{spans}[0]{text}, '  ', 'AC-4: cell[1] first span is the 2-space body indent');
     is($cells[1]{role}, 'body', 'AC-4: cell[1] role is body');
     is($cells[3]{role}, 'blank', 'AC-4: cell[3] role is blank');
@@ -299,8 +305,9 @@ my $ac56_R = { title => 'R', lines => [ 'r1' ] };
 
     my @rows1 = Dashboard::_two_col_rows($ac56_L, $ac56_R, 100, 1);
     is(scalar(@rows1), 1, 'AC-6: maxh=1 -> exactly 1 cell');
-    like($rows1[0]{text}, qr/-- L /, 'AC-6: maxh=1 -- the single row contains "-- L "');
-    like($rows1[0]{text}, qr/-- R /, 'AC-6: maxh=1 -- the single row ALSO contains "-- R "');
+    # _two_col_rows is the frozen legacy family too -- still ASCII, lead included.
+    like($rows1[0]{text}, qr/-- L /, 'AC-6: maxh=1 -- the single row contains "-- L " (frozen legacy path)');
+    like($rows1[0]{text}, qr/-- R /, 'AC-6: maxh=1 -- the single row ALSO contains "-- R " (frozen legacy path)');
 
     for my $maxh (0, -3) {
         my @r = Dashboard::_two_col_rows($ac56_L, $ac56_R, 100, $maxh);
@@ -337,9 +344,9 @@ my $ac56_R = { title => 'R', lines => [ 'r1' ] };
     is(scalar(@$fbelow), 24, "AC-7: compose_frame(24,$below) returns exactly 24 rows");
     is(scalar(grep { Dashboard::display_width($_->{text}) != $below } @$fbelow), 0,
         "AC-7: compose_frame(24,$below) -- every row is exactly $below display columns");
-    my $both_below = grep { $_->{text} =~ /-- Run / && $_->{text} =~ /-- Blueprints / } @$fbelow;
+    my $both_below = grep { $_->{text} =~ /$RULE_FILL_RE Run / && $_->{text} =~ /$RULE_FILL_RE Blueprints / } @$fbelow;
     is($both_below, 0, "AC-7: 24x$below -- no single row contains BOTH \"-- Run\" and \"-- Blueprints\" (still stacked)");
-    my ($run_below) = grep { $_->{text} =~ /^-- Run (?:$RULE_FILL_RE)+$/ } @$fbelow;
+    my ($run_below) = grep { $_->{text} =~ /^$RULE_FILL_RE Run (?:$RULE_FILL_RE)+$/ } @$fbelow;
     ok($run_below, "AC-7: 24x$below -- some row matches /^-- Run <rule.h fill>\$/");
     is(Dashboard::display_width($run_below->{text}), $below, "AC-7: that row is exactly $below display columns") if $run_below;
 
@@ -347,7 +354,7 @@ my $ac56_R = { title => 'R', lines => [ 'r1' ] };
     is(scalar(@$fat), 24, "AC-7: compose_frame(24,$BP) returns exactly 24 rows");
     is(scalar(grep { Dashboard::display_width($_->{text}) != $BP } @$fat), 0,
         "AC-7: compose_frame(24,$BP) -- every row is exactly $BP display columns");
-    my $both_at = grep { $_->{text} =~ /-- Run / && $_->{text} =~ /-- Blueprints / } @$fat;
+    my $both_at = grep { $_->{text} =~ /$RULE_FILL_RE Run / && $_->{text} =~ /$RULE_FILL_RE Blueprints / } @$fat;
     is($both_at, 1, "AC-7: 24x$BP -- EXACTLY one row contains BOTH \"-- Run \" and \"-- Blueprints \" (two-column mode)");
 }
 
@@ -393,8 +400,8 @@ my $ac56_R = { title => 'R', lines => [ 'r1' ] };
     # claim that IS spec-backed survives, weakened from strict "<" to "<="
     # because sharing a row is now a legitimate outcome: Run's row index
     # never comes AFTER Recent activity's.
-    my ($i_run) = grep { $f->[$_]{text} =~ /-- Run / } 0 .. $#$f;
-    my ($i_ra)  = grep { $f->[$_]{text} =~ /-- Recent activity / } 0 .. $#$f;
+    my ($i_run) = grep { $f->[$_]{text} =~ /$RULE_FILL_RE Run / } 0 .. $#$f;
+    my ($i_ra)  = grep { $f->[$_]{text} =~ /$RULE_FILL_RE Recent activity / } 0 .. $#$f;
     ok(defined $i_run, 'AC-8: a row containing "-- Run " was found');
     ok(defined $i_ra, 'AC-8: a row containing "-- Recent activity " was found');
   SKIP: {
@@ -632,7 +639,7 @@ is(Dashboard::activity_capacity(\%st, 24, undef), Dashboard::activity_capacity(\
         my $f = Dashboard::compose_frame(\%st, 24, $c);
         is(scalar(grep { Dashboard::display_width($_->{text}) != $c } @$f), 0,
             "AC-18: compose_frame(24,$c) -- every row is exactly $c display columns");
-        my ($run_row) = grep { $_->{text} =~ /^-- Run / && $_->{text} =~ /-- Blueprints / } @$f;
+        my ($run_row) = grep { $_->{text} =~ /^$RULE_FILL_RE Run / && $_->{text} =~ /$RULE_FILL_RE Blueprints / } @$f;
         ok($run_row, "AC-18: compose_frame(24,$c) -- a row carries BOTH \"-- Run \" and \"-- Blueprints \" (odd width still triggers two-column mode)");
       SKIP: {
             skip "no paired row found for cols=$c", 1 unless $run_row;

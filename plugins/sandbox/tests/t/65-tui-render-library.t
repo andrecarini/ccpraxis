@@ -51,6 +51,15 @@ my $DASHBOARD_PM = "$SCRIPTS/Dashboard.pm";
 
 use lib "$Bin/../../scripts";
 
+# THE PANEL TITLE LEAD-IN, DERIVED. It was the ASCII '-- '; it is now one
+# Theme rule.h glyph plus a space, so a title line is continuous with its own
+# filler and can serve as the panel's top border (operator request,
+# 2026-08-25). Taken from Theme rather than written out, so it cannot drift
+# from the declaration the renderer actually uses.
+require Theme;
+my $RULE_LEAD    = Theme::glyph('rule.h');      # UTF-8 BYTES, matches row text
+my $RULE_LEAD_RE = quotemeta($RULE_LEAD);
+
 my @TUI_MODULES = qw(tui::Frame tui::Layout tui::Meter tui::Screen);
 my %MODULE_FILE = (
     'tui::Frame'  => "$TUI_DIR/Frame.pm",
@@ -1448,11 +1457,11 @@ SKIP: {
         { title => 'Run',     lines => ['status : running'] },
     );
     my $wide = tui::Screen::compose({ title => 'T', panels => \@panels06, footer => 'F' }, 24, 120);
-    my $both_wide = grep { $_->{text} =~ /-- Sandbox / && $_->{text} =~ /-- Run / } @$wide;
+    my $both_wide = grep { $_->{text} =~ /$RULE_LEAD_RE Sandbox / && $_->{text} =~ /$RULE_LEAD_RE Run / } @$wide;
     is($both_wide, 1, 'AC-S5(06): two panels at 120 cols -- exactly one band row carries both panel titles');
 
     my $narrow = tui::Screen::compose({ title => 'T', panels => \@panels06, footer => 'F' }, 24, 80);
-    my $both_narrow = grep { $_->{text} =~ /-- Sandbox / && $_->{text} =~ /-- Run / } @$narrow;
+    my $both_narrow = grep { $_->{text} =~ /$RULE_LEAD_RE Sandbox / && $_->{text} =~ /$RULE_LEAD_RE Run / } @$narrow;
     is($both_narrow, 0, 'AC-S5(06): the same two panels at 80 cols -- no row carries both panel titles');
 }
 
