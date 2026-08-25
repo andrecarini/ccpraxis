@@ -157,6 +157,23 @@ sub safe_char {
 sub safe {
     my ($str) = @_;
     return '' if !defined $str;
+
+    # FAST PATH: printable ASCII is already safe, and this function is the
+    # renderer's hottest leaf.
+    #
+    # Profiled over one composed frame: 232 calls, ~31us each -- the largest
+    # single cost under make_cell -> fit_spans -> spanify. For a pure-ASCII
+    # string every step below is the identity: _decode_str round-trips it,
+    # _strip_sgr finds no escape (an SGR sequence begins with \x1B, which is
+    # not in this class), safe_char returns each character unchanged for
+    # 0x20..0x7E by its own first rule, and Encode::encode re-encodes it to the
+    # same bytes. Returning the input is not an approximation of that work, it
+    # is the same answer without doing it.
+    #
+    # Most spans on this dashboard are ASCII: labels, values, keys, event text.
+    # The box glyphs and spinner frames are not, and they take the full path.
+    return $str if $str =~ /\A[\x20-\x7E]*\z/;
+
     my $s   = _strip_sgr(_decode_str($str));
     my $out = '';
     $out .= safe_char($_) for split //, $s;
@@ -263,6 +280,30 @@ sub fit_spans {
         my $raw_text = defined $sp->{text} ? $sp->{text} : '';
         my $role     = defined $sp->{role} ? $sp->{role} : DEFAULT_ROLE();
         my $atomic   = (ref($sp) eq 'HASH' && $sp->{atomic}) ? 1 : 0;
+
+        # FAST PATH: a printable-ASCII span that FITS needs none of the work
+        # below. Its display width is its length, safe_char is the identity on
+        # every character of it, and the decode/encode round-trip returns the
+        # same bytes -- so decoding, splitting into characters, calling
+        # char_cols per character and re-encoding all produce exactly
+        # $raw_text and length($raw_text).
+        #
+        # This is the renderer's densest inner loop: profiled at 3,491
+        # char_cols calls for ONE composed frame, nearly all of them from here,
+        # nearly all of them answering "1" about a letter in a label.
+        #
+        # A span that does NOT fit falls through to the general path, because
+        # truncation has to be done glyph by glyph to get the column arithmetic
+        # right. Only the common case is short-circuited.
+        if ($raw_text =~ /\A[\x20-\x7E]*\z/) {
+            my $tw = length $raw_text;
+            if ($width + $tw <= $w) {
+                push @out, { text => $raw_text, role => $role } if $tw;
+                $width += $tw;
+                next;
+            }
+        }
+
         my $decoded  = _strip_sgr(_decode_str($raw_text));
         my @chars    = split //, $decoded;
         my $tw       = 0;

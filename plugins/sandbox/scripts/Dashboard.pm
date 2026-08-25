@@ -2659,6 +2659,11 @@ sub run {
     my $rc = 0;
     my $ticks = 0;
     my $last_title;                                            # undef => nothing emitted yet
+    # Frame-cache state. $gather_seq changes whenever %state is replaced from a
+    # gather, so the signature below does not have to enumerate the state hash
+    # to notice one. See the note at the compose call.
+    my $last_frame_sig;
+    my $gather_seq = 0;
     # Animation cadences, in seconds per frame. Deliberately NOT tied to
     # $tick_int: the render tick is an input-latency decision (how fast a
     # keystroke is noticed) and has no business setting how fast a spinner
@@ -2697,6 +2702,7 @@ sub run {
         my $frame = compose_frame(\%state, $rows, $cols);
         $out->(render_frame($prev, $frame, { color => $color }));
         $prev = $frame;
+        $last_frame_sig = undef;
     };
 
     # MEDIUM-1 (07-backpack-screen fix-batch): the [b] modal blocks this
@@ -2737,6 +2743,7 @@ sub run {
             my $frame = compose_frame(\%state, $rows, $cols);
             $out->(render_frame($prev, $frame, { color => $color }));
             $prev = $frame;
+            $last_frame_sig = undef;
         }
         $last_state = undef;   # force a fresh gather next tick (container status may have changed)
     };
@@ -2814,6 +2821,10 @@ sub run {
                     @all_events = @{ $base->{events} || [] };   # chronological
                     $activity_offset = 0 if $activity_offset < 0;
                     $last_state = $t;
+                    # %state has just been replaced wholesale. Bumping this is
+                    # what tells the frame cache below that EVERY field may have
+                    # moved, without the signature needing to enumerate them.
+                    $gather_seq++;
                     # B5: re-evaluate the wake-lock on the freshly gathered state
                     # (carries busy_age). The launcher's seam owns the decision.
                     $keepawake->(\%state);
@@ -2860,9 +2871,40 @@ sub run {
                     $last_title = $title;
                 }
 
-                my $frame = compose_frame(\%state, $rows, $cols);
-                $out->(render_frame($prev, $frame, { color => $color }));
-                $prev = $frame;
+                # SKIP THE COMPOSE WHEN NOTHING THAT FEEDS IT HAS MOVED.
+                #
+                # This loop recomposed the WHOLE frame five times a second and
+                # then diffed it to discover that mostly nothing had changed.
+                # Measured on the operator's host: two idle launcher processes
+                # burning 16.6% and 12.2% of a core each, doing nothing but
+                # this. render_frame already suppresses the OUTPUT of an
+                # unchanged frame; what it cannot avoid is the cost of building
+                # the frame in order to compare it.
+                #
+                # The signature is every input to compose that can move between
+                # ticks. Everything else in %state arrives from a gather, and
+                # $gather_seq changes when one happens -- so a gather
+                # invalidates the whole cache without the signature having to
+                # enumerate the state hash.
+                #
+                # THE SAFETY PROPERTY, and why this cannot silently freeze the
+                # screen: beat_age and uptime are in the signature and both
+                # advance every whole second, so a full recompose happens at
+                # least once a second no matter what else is or is not
+                # enumerated here. A field this list forgets costs at most one
+                # second of staleness, never a stuck frame.
+                my $sig = join "\x1f", $rows, $cols, $gather_seq, $activity_offset,
+                    map { defined $state{$_} ? $state{$_} : '' }
+                    qw(beat_age uptime pending container_gone spinner_idx
+                       title_spinner_idx oauth_remaining footer_flash status);
+
+                if (!defined $last_frame_sig || $sig ne $last_frame_sig) {
+                    my $frame = compose_frame(\%state, $rows, $cols);
+                    $out->(render_frame($prev, $frame, { color => $color }));
+                    $prev = $frame;
+                    $last_frame_sig = undef;
+                    $last_frame_sig = $sig;
+                }
 
                 # input — DRAIN all pending keys available THIS tick, not one.
                 # $next_key polls non-blocking (falling through to $read_key once
@@ -2928,6 +2970,7 @@ sub run {
                             my $sframe = compose_frame(\%state, $rows, $cols);
                             $out->(render_frame($prev, $sframe, { color => $color }));
                             $prev = $sframe;
+                            $last_frame_sig = undef;
                             next;
                         }
                         $do_lifecycle->($recover, 'recover');
@@ -3010,6 +3053,7 @@ sub run {
                         my $bframe = compose_frame(\%state, $rows, $cols);
                         $out->(render_frame($prev, $bframe, { color => $color }));
                         $prev = $bframe;
+                        $last_frame_sig = undef;
                         last;   # stop draining; keys pressed after the modal wait for the next tick
                     }
                     elsif ($action eq 'dismiss-install-warning') {
@@ -3078,6 +3122,7 @@ sub run {
                     my $frame2 = compose_frame(\%state, $rows, $cols);
                     $out->(render_frame($prev, $frame2, { color => $color }));
                     $prev = $frame2;
+                    $last_frame_sig = undef;
                 };
 
                 my ($quit, $scroll_dirty) = $do_drain->();
