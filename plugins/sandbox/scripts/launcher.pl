@@ -922,6 +922,7 @@ my $SPEND_SAMPLER_PID         = "$LAUNCHER_DIR/spend-sampler.pid";
 # for a module that actually reloaded -- see _hot_reload's closing note on why
 # a skipped module must NOT have its baseline bumped.
 my $HOT_RELOAD_BASELINE       = {};
+my $LAUNCHER_MTIME_AT_START;   # launcher.pl's mtime when this process started -- see _launcher_changed
 my $SETTINGS_LOCAL_FILE       = "$PROJECT_PATH/.claude/settings.local.json";
 # installed_plugins.json lives under claude-home/plugins/ (Fix 2), NOT
 # .launcher/ — so it appears at /root/.claude/plugins/installed_plugins.json as
@@ -985,6 +986,38 @@ sub log_ev { LaunchLog::event($LAUNCH_LOG, @_) }
 my $STDERR_CAPTURE_SAVED;   # dup'd original STDERR filehandle, while redirected
 my $STDERR_CAPTURE_FH;      # File::Temp filehandle currently receiving STDERR
 my $STDERR_CAPTURE_PATH;    # File::Temp path currently receiving STDERR
+
+# _restore_terminal($pop_title) -- put the terminal back the way we found it.
+#
+# Extracted from leave_raw so the [r] re-exec path runs EXACTLY these primitives
+# rather than a second copy that drifts. exec() replaces the process image, so
+# neither END nor the INT/TERM handlers run -- if this is skipped, the operator
+# is left in raw mode on the alt screen with a redirected STDERR, which looks
+# exactly like a hang.
+#
+# $pop_title guards the title-stack pop: popping twice would restore a title
+# belonging to an OUTER application (tmux, vim, an outer launcher). leave_raw
+# owns that decision via its own re-entrancy counter; the re-exec path pops once
+# because it is the process's only teardown.
+sub _restore_terminal {
+    my ($pop_title) = @_;
+    if ($pop_title) {
+        print STDOUT "\e]0;\a";             # neutral: clear our title
+        print STDOUT "\e[23;0t";            # XTPOPTITLE: restore the pushed title
+    }
+    print STDOUT "\e[?25h\e[?1049l";        # show cursor + leave alt-screen
+    eval { Term::ReadKey::ReadMode('restore') };
+    # s17: restore the process's own STDERR before the alt-screen teardown
+    # finishes, so the terminal is never left with a redirected STDERR after the
+    # dashboard closes (the signal/abnormal-exit half is covered separately by
+    # $SIG{INT}/$SIG{TERM}/END at file scope).
+    if ($STDERR_CAPTURE_SAVED) {
+        eval { close(STDERR); open(STDERR, '>&', $STDERR_CAPTURE_SAVED); STDERR->autoflush(1); };
+        close($STDERR_CAPTURE_SAVED) if $STDERR_CAPTURE_SAVED;
+        $STDERR_CAPTURE_SAVED = undef;
+    }
+    return;
+}
 
 # _stderr_capture_drain() -- restore STDERR *and show what was captured*.
 #
@@ -5200,6 +5233,9 @@ sub enter_dashboard {
     # Anything that moves after this point is a change this process has not
     # picked up, which is exactly what the nudge should report.
     $HOT_RELOAD_BASELINE = _hot_reload_mtimes(HotReload::loaded(\%INC));
+    # ...and launcher.pl's own mtime, for the same reason and with the opposite
+    # remedy: it can never be reloaded, so a change to it means RELAUNCH.
+    { my @st = stat($SELF_PL); $LAUNCHER_MTIME_AT_START = $st[9] if @st; }
     my $rc = Dashboard::run(
         color     => 1,
         # The two t11 seams. Dashboard.pm contains no system/exec/fork and
@@ -5207,6 +5243,7 @@ sub enter_dashboard {
         # in a subprocess, so it is wired in from here like every other spawn.
         hot_reload         => sub { _hot_reload($_[0]) },
         hot_reload_pending => sub { _hot_reload_pending() },
+        launcher_changed   => sub { _launcher_changed() },
         enter_raw => sub {
             Term::ReadKey::ReadMode('cbreak');
             print STDOUT "\e[22;0t";                # XTPUSHTITLE: push icon+window title onto the stack
@@ -5239,22 +5276,10 @@ sub enter_dashboard {
             # the terminal-mode restore lines below still run every time --
             # they're already idempotent and existing double-teardown safety
             # relies on them re-running.
-            if (!$left_raw++) {
-                print STDOUT "\e]0;\a";             # neutral: clear our title
-                print STDOUT "\e[23;0t";            # XTPOPTITLE: restore the pushed title
-            }
-            print STDOUT "\e[?25h\e[?1049l";        # show cursor + leave alt-screen
-            eval { Term::ReadKey::ReadMode('restore') };
-            # s17: restore the process's own STDERR before the alt-screen
-            # teardown finishes, so the terminal is never left with a
-            # redirected STDERR after the dashboard closes (the
-            # signal/abnormal-exit half is covered separately by
-            # $SIG{INT}/$SIG{TERM}/END at file scope).
-            if ($STDERR_CAPTURE_SAVED) {
-                eval { close(STDERR); open(STDERR, '>&', $STDERR_CAPTURE_SAVED); STDERR->autoflush(1); };
-                close($STDERR_CAPTURE_SAVED) if $STDERR_CAPTURE_SAVED;
-                $STDERR_CAPTURE_SAVED = undef;
-            }
+            # The terminal primitives live in _restore_terminal so the [r]
+            # re-exec path can run EXACTLY these and not a second copy that
+            # drifts. The $left_raw guard stays here, where its rationale is.
+            _restore_terminal(!$left_raw++);
             # STDERR captured while the alt-screen was up is not lost: it is
             # logged via the same shared, timestamped log_ev writer, and a
             # visible-but-non-destructive indicator (a plain post-alt-screen
@@ -6957,8 +6982,7 @@ sub _hot_reload_restore {
 # caught here rather than on the next keypress.
 sub _hot_reload {
     my ($smoke) = @_;
-    my $libdir = $SELF_PL;
-    $libdir =~ s{[/\\][^/\\]+$}{};
+    my $libdir = _hot_reload_libdir();
 
     my $loaded = HotReload::loaded(\%INC);
     my $now    = _hot_reload_mtimes($loaded);
@@ -6993,6 +7017,23 @@ sub _hot_reload {
         push @reloaded, $m->{name};
         $HOT_RELOAD_BASELINE->{ $m->{name} } = $now->{ $m->{name} };
     }
+    # LAST, AFTER THE MODULE SWAPS. If launcher.pl itself changed, [r] finishes
+    # the job by re-execing rather than telling the operator to go and do it --
+    # their words: "I want the reload to be able to help without needing to
+    # relaunch?".
+    #
+    # Deliberately after the loop, so a run that reloads modules AND replaces the
+    # launcher does the cheap, reversible half first. If the exec succeeds
+    # nothing below runs; if the launcher will not compile we fall through and
+    # report it exactly like a refused module, with the modules that DID reload
+    # still reloaded.
+    if (_launcher_changed()) {
+        my (undef, $why) = _relaunch_self();     # returns only on refusal
+        push @skipped, { name => 'launcher.pl',
+                         why  => 'not re-exec\'d - '
+                               . (defined $why && length $why ? $why : 'does not compile') };
+    }
+
     # A skipped or rolled-back module keeps its OLD baseline, so the nudge goes
     # on reporting it as changed -- the operator is still owed a fix, and a
     # silent baseline bump would be this package reintroducing the exact defect
@@ -7007,6 +7048,88 @@ sub _hot_reload {
 sub _hot_reload_pending {
     my $loaded = HotReload::loaded(\%INC);
     return scalar @{ HotReload::changed($loaded, $HOT_RELOAD_BASELINE, _hot_reload_mtimes($loaded)) };
+}
+
+# _launcher_changed() -> 1|0. Has launcher.pl itself changed since this process
+# started?
+#
+# THE ONE THING [r] CAN NEVER FIX, AND THE OPERATOR HAD NO WAY TO KNOW IT.
+# launcher.pl is the running process -- signal handlers, raw mode, child pids,
+# open log handles -- so it is deliberately absent from the reload allowlist and
+# is structurally absent from %INC besides. HotReload watches the thirteen
+# render modules and nothing else.
+#
+# That produced a genuinely misleading sequence, observed 2026-08-25: a fix
+# landed in launcher.pl, the operator pressed [r], and got
+# "[r] no module changed on disk" -- which was TRUE, correct, and completely
+# irrelevant to the fix they were trying to pick up. The banner said nothing had
+# changed while the thing they needed had changed and simply was not being
+# watched.
+#
+# So watch it, and say the only thing that helps: relaunch. Cheap -- one stat on
+# the gather round that already stats thirteen files.
+# _relaunch_self() -- re-exec THIS launcher with the new code. Never returns on
+# success.
+#
+# Operator: "I want the reload to be able to help without needing to relaunch?"
+#
+# launcher.pl genuinely cannot be hot-RELOADED -- it is the running process, and
+# swapping subs underneath a live signal handler, raw-mode terminal and set of
+# child pids is not something a stash restore can undo. But the process can
+# REPLACE ITSELF: exec() keeps the pid, the terminal and the container (a
+# separate process tree) while running the new code from line one. That gives
+# [r] the outcome asked for without pretending the frozen call stack is
+# reloadable.
+#
+# COMPILE-GATED, exactly like a module swap and for a sharper reason: a module
+# that fails leaves the rest of the TUI running, while a broken launcher exec'd
+# here takes the whole dashboard down with no way back. The same `perl -c`
+# subprocess decides, and its reason is reported.
+#
+# CHILDREN ARE STOPPED FIRST. exec preserves the pid, so the samplers' owner-pid
+# check would still pass and they would survive as ORPHANS RUNNING OLD CODE --
+# silently, since they look alive. Stopping them means the new process forks
+# fresh ones, which is the entire point when the fix being picked up is in the
+# sampler path.
+sub _relaunch_self {
+    my ($compiles, $why) = _hot_reload_compiles($SELF_PL, _hot_reload_libdir());
+    return (0, $why) unless $compiles;
+
+    log_ev('launcher_reexec', { path => $SELF_PL });
+
+    # Owned children, in the same order the clean shutdown path stops them.
+    eval { _resources_sampler_stop($RESOURCES_SAMPLER_CHILD, $RESOURCES_SAMPLER_PID) };
+    eval { _spend_sampler_stop($SPEND_SAMPLER_CHILD) };
+    eval { _keepawake_stop() };
+
+    _restore_terminal(1);
+
+    # ORIGINAL @ARGV: option parsing copies into a lexical (`my @argv = @ARGV`),
+    # so this is still exactly what we were invoked with -- the new process gets
+    # the same project, the same flags, the same session.
+    { exec($^X, $SELF_PL, @ARGV) };
+
+    # Only reachable if exec itself failed. The terminal is already restored and
+    # the children are stopped, so the honest move is to say so and exit rather
+    # than carry on as a half-dismantled dashboard.
+    print STDERR "ccpraxis: could not re-exec $SELF_PL: $!\n";
+    exit 1;
+}
+
+# _hot_reload_libdir() -- the -I the compile gate uses. One definition, shared by
+# the module gate and the launcher gate, so they can never disagree about where
+# this tree's modules live.
+sub _hot_reload_libdir {
+    my $d = $SELF_PL;
+    $d =~ s{[/\\][^/\\]+$}{};
+    return $d;
+}
+
+sub _launcher_changed {
+    return 0 unless defined $LAUNCHER_MTIME_AT_START;
+    my @st = stat($SELF_PL);
+    return 0 unless @st;
+    return ($st[9] // 0) != $LAUNCHER_MTIME_AT_START ? 1 : 0;
 }
 
 # _tail_lines — last $n chomped lines of a file (the B1 launch log), or ().

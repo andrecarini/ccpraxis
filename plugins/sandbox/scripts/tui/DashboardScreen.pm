@@ -1533,6 +1533,19 @@ sub hot_reload_msgs {
         push @out, sprintf('%d render module%s changed on disk - press [r] to reload',
                            $n, ($n == 1 ? '' : 's'));
     }
+
+    # launcher.pl cannot be hot-RELOADED -- it is this running process -- but [r]
+    # now REPLACES it, so the instruction is the same key as everything else.
+    #
+    # This banner exists because the alternative was actively misleading:
+    # a launcher fix was invisible to the nudge (HotReload watches the thirteen
+    # render modules and nothing else), so pressing [r] answered "no module
+    # changed on disk" -- true, correct, and completely irrelevant to the change
+    # being chased. Observed doing exactly that on 2026-08-25, twice, while a
+    # sampler kept failing for a reason a restart would have cleared.
+    if ($state->{launcher_changed}) {
+        push @out, 'launcher.pl changed on disk - press [r] to restart into it';
+    }
     return \@out;
 }
 

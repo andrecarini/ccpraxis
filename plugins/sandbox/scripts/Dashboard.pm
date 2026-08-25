@@ -3640,6 +3640,7 @@ sub run {
     # live. Keep the call sites trivial and the logic on the far side.
     my $hot_reload         = (ref($o{hot_reload})         eq 'CODE') ? $o{hot_reload}         : undef;
     my $hot_reload_pending = (ref($o{hot_reload_pending}) eq 'CODE') ? $o{hot_reload_pending} : undef;
+    my $launcher_changed   = (ref($o{launcher_changed}) eq q{CODE}) ? $o{launcher_changed} : undef;
     my $bp_load       = (ref($o{bp_load})   eq 'CODE') ? $o{bp_load}   : undef;
     my $bp_save       = (ref($o{bp_save})   eq 'CODE') ? $o{bp_save}   : undef;
     my $bp_remove     = (ref($o{bp_remove}) eq 'CODE') ? $o{bp_remove} : undef;
@@ -3825,6 +3826,11 @@ sub run {
                     # gather round.
                     $state{hot_reload_pending} = $hot_reload_pending
                         ? (eval { $hot_reload_pending->() } || 0) : 0;
+                    # launcher.pl is watched separately: it is never in the
+                    # reload allowlist (it is this process), so the count above
+                    # can only ever be 0 for it. [r] now restarts into it.
+                    $state{launcher_changed} = $launcher_changed
+                        ? (eval { $launcher_changed->() } ? 1 : 0) : 0;
                     # ...and re-apply the last reload REPORT across the same
                     # wholesale replace, exactly as the dismissed-banner line
                     # below does. Without this the report would live for a

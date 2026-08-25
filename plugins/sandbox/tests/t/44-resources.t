@@ -2263,11 +2263,28 @@ FAKE_MODULE
                        'AC-8: _resources_sampler_reap_orphan calls kill');
     }
 
+    # COMMENTS STRIPPED FIRST. This is a PROXIMITY window over raw source: it
+    # takes 600 characters from the FIRST occurrence of `$SIG{INT}` and looks for
+    # the release call inside it. Any comment that merely NAMES the handler --
+    # e.g. "the signal/abnormal-exit half is covered separately by
+    # $SIG{INT}/$SIG{TERM}/END at file scope" -- becomes the first match, and the
+    # window then covers prose instead of the handler.
+    #
+    # That fired for real: extracting the terminal-restore primitives out of
+    # leave_raw moved a comment carrying exactly that sentence from line ~5250 to
+    # ~1000, ahead of the handlers, and two assertions went red while the
+    # handlers themselves were untouched. The code was correct; the oracle was
+    # reading prose.
+    #
+    # Sixth instance of this shape in one day (t/26, t/61, t/65, t/66, t/115),
+    # and the same remedy each time.
+    (my $launcher_code = $launcher_src) =~ s/^\s*#.*$//mg;
+
     for my $pair ( [ '$SIG{INT}', qr/\$SIG\{INT\}/ ], [ '$SIG{TERM}', qr/\$SIG\{TERM\}/ ], [ 'END', qr/^END\s*\{/m ] ) {
         my ($label, $qr) = @$pair;
         my $desc = "AC-8: _resources_sampler_release_global appears in the $label handler";
-        if ($launcher_src =~ $qr) {
-            my $window = substr($launcher_src, $-[0], 600);
+        if ($launcher_code =~ $qr) {
+            my $window = substr($launcher_code, $-[0], 600);
             like($window, qr/_resources_sampler_release_global/, $desc);
         } else {
             fail("$desc [$label not found in launcher.pl]");
