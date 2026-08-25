@@ -1085,9 +1085,20 @@ SKIP: {
     my $src  = slurp($path);
   SKIP: {
         skip('Meter.pm source unreadable', 1) unless defined $src;
-        my @occurrences = ($src =~ /\b\Q$const_val\E\b/g);
+        # COMMENTS ARE STRIPPED FIRST (2026-08-26). The claim is "the width is
+        # a named constant, never re-typed as a bare literal" -- that is a
+        # claim about CODE. Counting the digits anywhere in the file also
+        # forbids the prose that explains where the number comes from, and the
+        # moment a comment derived it ("3*8 + 22 = 46") this went red over a
+        # sentence that cannot execute.
+        #
+        # This is the SAME correction AC-P1 in this file already had to make,
+        # against the same failure mode, using the same helper -- see the note
+        # at _strip_comments. The intent is fully preserved: a second literal
+        # in real code is still caught.
+        my @occurrences = (_strip_comments($src) =~ /\b\Q$const_val\E\b/g);
         is(scalar(@occurrences), 1,
-            "AC-M2: the literal $const_val appears exactly once in tui/Meter.pm (the NUMERIC_COL_WIDTH definition itself)");
+            "AC-M2: the literal $const_val appears exactly once in tui/Meter.pm's CODE (the NUMERIC_COL_WIDTH definition itself)");
     }
 
     my $expected_min = tui::Meter::LABEL_COL_WIDTH() + 3 + tui::Meter::NUMERIC_COL_WIDTH()

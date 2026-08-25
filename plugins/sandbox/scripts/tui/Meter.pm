@@ -37,7 +37,22 @@ use tui::Frame;
 use constant LABEL_COL_WIDTH   => 11;
 use constant NUMERIC_COL_WIDTH => 46;
 use constant BAR_CELLS         => 10;
-use constant PERCENT_COL_WIDTH => 4;
+# FIVE, not four (operator, 2026-08-26: "everything in the resources cell is
+# misaligned. I wish it was a neat table instead"). The Resources panel now
+# renders every gauge row through one percent column, and the two CPU rows
+# carry a decimal ("14.8%", "65.0%") that a four-column field would clip. The
+# byte rows still print an integer percent and simply right-align into it.
+use constant PERCENT_COL_WIDTH => 5;
+
+# BYTES_COL_WIDTH -- the field each figure in a used/free/total triple is
+# right-aligned into, so the '|' separators land in the same column on every
+# row that has one. The widest fmt_bytes output is "999.9 TB": four digits, a
+# point, a space and a two-character unit. THREE of these plus the literal
+# " used | ", " free | " and " total" (8 + 8 + 6) is 3*8 + 22 = 46, which is
+# NUMERIC_COL_WIDTH -- the constant was always derived from this triple (see
+# numbers_used_free_total below), the padding just makes every row hit it
+# rather than only the worst case. t/65's AC-M3 checks the two still agree.
+use constant BYTES_COL_WIDTH   => 8;
 use constant PRESSURE_WARN     => 0.75;
 use constant PRESSURE_CRIT     => 0.9;
 
@@ -201,8 +216,15 @@ sub fmt_bytes {
 # NUMERIC_COL_WIDTH pays for. PUBLIC.
 sub numbers_used_free_total {
     my ($used, $free, $total) = @_;
-    return sprintf('%s used | %s free | %s total',
-        fmt_bytes($used), fmt_bytes($free), fmt_bytes($total));
+    # RIGHT-ALIGNED into BYTES_COL_WIDTH (2026-08-26). Unpadded, "2.1 GB used"
+    # and "231.3 GB used" are different widths, so every '|' separator and
+    # everything after it landed in a different column on each row -- which is
+    # exactly what the operator saw as "misaligned". The figures are numbers in
+    # a column; right-aligning them is what makes them read as one.
+    return sprintf('%*s used | %*s free | %*s total',
+        BYTES_COL_WIDTH(), fmt_bytes($used),
+        BYTES_COL_WIDTH(), fmt_bytes($free),
+        BYTES_COL_WIDTH(), fmt_bytes($total));
 }
 
 # fits_numeric_column($text) -> true iff $text's display width does not

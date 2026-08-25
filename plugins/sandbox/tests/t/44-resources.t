@@ -2680,4 +2680,132 @@ FAKE_MODULE
     }
 }
 
+# ===========================================================================
+# THE PANEL IS A TABLE, AND THE GAUGE IS ITS FIRST COLUMN.
+#
+# Operator, 2026-08-26: "everything in the resources cell is misaligned. I wish
+# it was a neat table instead", then, choosing the shape: "Full table but the
+# bars become the first thing".
+#
+# What was wrong: the figures came first, so a gauge started wherever that
+# row's numbers happened to end -- and "2.1 GB used" and "231.3 GB used" are
+# different widths, so every bar and every percent landed in a different
+# column. The two CPU rows had no place in the geometry at all (one printed a
+# bare percentage, the other a percentage followed by a bar), so they lined up
+# with nothing.
+#
+# THE PROPERTY, and why it is written as agreement between rows rather than as
+# column numbers: what makes a table is that its columns are the SAME on every
+# row, not that they sit at any particular place. Asserted this way, widening
+# a figure or renaming a label re-points nothing, while a row that stops
+# sharing the grid fails immediately.
+# ===========================================================================
+SKIP: {
+    my $ds_ok = eval { require tui::DashboardScreen; 1 };
+    skip('tui::DashboardScreen did not load', 6) unless $ds_ok;
+
+    # Deliberately spanning three orders of magnitude, because that is the
+    # input that made the old layout ragged: a one-figure row (2.1 GB) and a
+    # three-figure row (231.3 GB) must still agree.
+    my $fixture = {
+        snapshot_state => 'fresh', snapshot_age => 16,
+        machine_state  => 'running', machine_name => 'podman-machine-default',
+        ctr_mem_used   => 2.1e9,   vm_mem_total    => 10.4e9, ctr_cpu_pct => 14.8,
+        pod_images     => 2.6e9,   pod_containers  => 16.6e9, pod_volumes => 0,
+        host_ram_used  => 21.8e9,  host_ram_total  => 25.5e9,
+        host_disk_used => 231.3e9, host_disk_total => 254.8e9, host_disk_dev => 'C:',
+        host_cpu_pct   => 65.0,    host_cores      => 8,
+    };
+    my $panels = tui::DashboardScreen::panels({ resources => $fixture }, 132);
+    my $panel  = panel_by_title($panels, 'Resources');
+    ok($panel, 'TABLE precondition: a Resources panel exists');
+
+  SKIP: {
+        skip('no Resources panel', 5) unless $panel;
+
+        my $full  = Theme::glyph('gauge.full');
+        my $empty = Theme::glyph('gauge.empty');
+
+        # chars($text) -> decoded characters, so an index means a COLUMN and
+        # not a byte offset (every gauge and box glyph here is multi-byte).
+        my $chars = sub {
+            my ($t) = @_;
+            utf8::decode($t) unless utf8::is_utf8($t);
+            return [ split //, $t ];
+        };
+        my $dfull  = $chars->($full)->[0];
+        my $dempty = $chars->($empty)->[0];
+
+        # bar_col($text) -> the column the gauge starts at, or undef for a row
+        # that has no gauge (snapshot, machine, podman -- those are prose, not
+        # measurements, and are deliberately NOT in the grid).
+        my $bar_col = sub {
+            my ($cs) = @_;
+            for my $i (0 .. $#$cs) {
+                return $i if $cs->[$i] eq $dfull || $cs->[$i] eq $dempty;
+            }
+            return undef;
+        };
+
+        my (@cols, @labels, @gauge_rows);
+        for my $line (@{ $panel->{lines} }) {
+            my $text = line_text($line);
+            my $cs   = $chars->($text);
+            my $c    = $bar_col->($cs);
+            next unless defined $c;
+            push @cols, $c;
+            push @gauge_rows, $text;
+            my ($lab) = $text =~ /^(\S+(?:\s\S+)?)/;
+            push @labels, (defined $lab ? $lab : '?');
+        }
+
+        # LIVENESS FIRST (this file's own non-vacuity discipline): if the
+        # gauges vanished entirely, that fails here by name rather than making
+        # the agreement below vacuously true over an empty list.
+        cmp_ok(scalar(@cols), '==', 5,
+            'TABLE liveness: all five measurable rows carry a gauge -- ctr mem, ctr cpu, host ram, '
+          . 'host disk, host cpu (the two CPU rows gained one; before this they had none)')
+            or diag('  gauge rows: ' . join(', ', @labels));
+
+      SKIP: {
+            skip('did not find the five gauge rows', 3) unless @cols == 5;
+
+            my %distinct = map { $_ => 1 } @cols;
+            is(scalar(keys %distinct), 1,
+                'TABLE CANONICAL: every gauge starts at the SAME display column -- the bars form '
+              . 'one column immediately after the label, which is what makes the rest a table')
+                or diag(join "\n", map { "  [$_]" } @gauge_rows);
+
+            # ...and the column is the label gutter's own end, so the gauge
+            # column is not merely self-consistent, it starts where every other
+            # panel's values start. DERIVED from the shared constants.
+            my $gutter = tui::DashboardScreen::LABEL_GUTTER()
+                       + length(tui::DashboardScreen::GUTTER_SEP());
+            is($cols[0], $gutter,
+                'TABLE: ...and that column IS the shared label gutter, so the Resources values '
+              . 'begin where every other panel\'s do');
+
+            # The figures column agrees too: on the rows that HAVE a
+            # used/free/total triple, the triple starts at one column. Derived
+            # from the gauge column plus the fixed bar and percent fields.
+            my $figures_col = $gutter + tui::Meter::BAR_CELLS() + 1
+                            + tui::Meter::PERCENT_COL_WIDTH() + 2;
+            my @triple_cols;
+            for my $text (@gauge_rows) {
+                next unless $text =~ /used \| /;
+                my $cs = $chars->($text);
+                my $j  = 0;
+                # first non-space at or after the figures column
+                $j++ while $figures_col + $j <= $#$cs && $cs->[$figures_col + $j] eq ' ';
+                push @triple_cols, $figures_col;
+                # the triple must START within its own field, never before it
+                my $before = join('', @{$cs}[$figures_col .. $#$cs]);
+                like($before, qr/^\s*\S.*used \| .*free \| .*total/,
+                    'TABLE: the used/free/total triple begins inside the figures column, '
+                  . 'right-aligned within it');
+            }
+        }
+    }
+}
+
 done_testing();

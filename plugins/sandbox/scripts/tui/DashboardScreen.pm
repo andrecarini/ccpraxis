@@ -1024,22 +1024,87 @@ sub _blueprints_body {
 # Perl cross-package call -- Dashboard consuming tui:: is this package's
 # whole point (Obligation 2).
 # ===========================================================================
-sub _meter_value_spans {
-    my ($used, $total) = @_;
+# ===========================================================================
+# THE RESOURCES PANEL IS A TABLE, AND THE GAUGE IS ITS FIRST COLUMN
+# (operator, 2026-08-26: "everything in the resources cell is misaligned. I
+# wish it was a neat table instead", then: "Full table but the bars become the
+# first thing").
+#
+# Every gauge row now has the same four columns:
+#
+#   <label gutter> <bar> <percent> <figures> <trailing note>
+#
+# The bar leading is not only what was asked for, it is what makes the rest of
+# the table possible. With the figures first, the bar started wherever that
+# row's numbers happened to end -- and since "2.1 GB used" and "231.3 GB used"
+# are different widths, every bar and every percent landed in a different
+# column. Putting the fixed-width things first means the gauges form a clean
+# column immediately after the label, and the variable-width figures trail off
+# to the right where their raggedness costs nothing.
+#
+# It also fixes the two CPU rows, which had no place in the old geometry at
+# all: ctr cpu printed a bare percentage and host cpu printed a percentage
+# followed by a bar, so neither lined up with anything. They are now ordinary
+# gauge rows with an empty figures column.
+#
+# Rows with no gauge at all (snapshot, machine, podman) are unchanged: their
+# text starts at the label gutter, where the bar column begins.
+# ===========================================================================
+
+# _gauge_value_spans($ratio, $pct_text, $figures, \@trail) -> \@spans -- the
+# value half of a gauge row, in column order. $figures may be undef (the CPU
+# rows have no used/free/total to show).
+sub _gauge_value_spans {
+    my ($ratio, $pct_text, $figures, $trail) = @_;
+    return [ { text => 'n/a', role => 'text.muted' },
+             (ref($trail) eq 'ARRAY' ? @$trail : ()) ] unless defined $ratio;
+
+    my $role = tui::Meter::pressure_role($ratio) // 'text.muted';
+    $pct_text = tui::Meter::percent_text($ratio) unless defined $pct_text;
+    $pct_text = '' unless defined $pct_text;
+
+    my @spans = (
+        # atomic: a partly-drawn gauge reads as a DIFFERENT, wrong percentage,
+        # and a clipped percent is the same lie in decimal. Both are dropped
+        # whole rather than truncated -- tui::Frame::fit_spans honours this.
+        { text => tui::Meter::bar($ratio, tui::Meter::BAR_CELLS()), role => $role, atomic => 1 },
+        { text => ' ', role => $role },
+        { text => sprintf('%*s', tui::Meter::PERCENT_COL_WIDTH(), $pct_text),
+          role => $role, atomic => 1 },
+    );
+    push @spans, { text => '  ' . $figures, role => $role }
+        if defined $figures && length $figures;
+    push @spans, @$trail if ref($trail) eq 'ARRAY';
+    return \@spans;
+}
+
+# _bytes_gauge_spans($used, $total, \@trail) -> \@spans -- a gauge row whose
+# figures are a used/free/total triple.
+sub _bytes_gauge_spans {
+    my ($used, $total, $trail) = @_;
     my $ratio = tui::Meter::ratio($used, $total);
-    return [ { text => 'n/a', role => 'text.muted' } ] unless defined $ratio;
+    return _gauge_value_spans(undef, undef, undef, $trail) unless defined $ratio;
     my $avail = (!ref($used) && !ref($total)
                  && $used  =~ /^-?\d+(?:\.\d+)?$/
                  && $total =~ /^-?\d+(?:\.\d+)?$/) ? $total - $used : undef;
     $avail = 0 if defined($avail) && $avail < 0;
-    my $role = tui::Meter::pressure_role($ratio) // 'text.muted';
-    return [
-        { text => tui::Meter::numbers_used_free_total($used, $avail, $total), role => $role },
-        { text => '  ', role => 'text.primary' },
-        { text => tui::Meter::bar($ratio, tui::Meter::BAR_CELLS()), role => $role, atomic => 1 },
-        { text => ' ', role => $role },
-        { text => tui::Meter::percent_text($ratio), role => $role, atomic => 1 },
-    ];
+    return _gauge_value_spans($ratio, undef,
+                              tui::Meter::numbers_used_free_total($used, $avail, $total),
+                              $trail);
+}
+
+# _pct_gauge_spans($pct, \@trail) -> \@spans -- a gauge row whose only figure
+# IS the percentage, so it lives in the percent column and the figures column
+# is empty. One decimal is kept: a CPU reading moves continuously and the
+# tenth is the part that shows it moving, which is why PERCENT_COL_WIDTH is 5.
+sub _pct_gauge_spans {
+    my ($pct, $trail) = @_;
+    return _gauge_value_spans(undef, undef, undef, $trail)
+        unless defined($pct) && !ref($pct) && $pct =~ /^-?\d+(?:\.\d+)?$/;
+    my $ratio = $pct / 100;
+    $ratio = 0 if $ratio < 0;
+    $ratio = 1 if $ratio > 1;
+    return _gauge_value_spans($ratio, sprintf('%.1f%%', $pct), undef, $trail);
 }
 
 sub _resources_body {
@@ -1063,14 +1128,10 @@ sub _resources_body {
     my $machine_row = row({ label => 'machine', value => \@mv });
     push @lines, $machine_row if @$machine_row;
 
-    my $ctrmem_row = row({ label => 'ctr mem', value => _meter_value_spans($r->{ctr_mem_used}, $r->{vm_mem_total}) });
+    my $ctrmem_row = row({ label => 'ctr mem', value => _bytes_gauge_spans($r->{ctr_mem_used}, $r->{vm_mem_total}) });
     push @lines, $ctrmem_row if @$ctrmem_row;
 
-    my $cpct = $r->{ctr_cpu_pct};
-    my $ctrcpu_val = (defined($cpct) && !ref($cpct) && $cpct =~ /^-?\d+(?:\.\d+)?$/)
-        ? [ { text => sprintf('%.1f%%', $cpct), role => 'text.primary' } ]
-        : [ { text => 'n/a', role => 'text.muted' } ];
-    my $ctrcpu_row = row({ label => 'ctr cpu', value => $ctrcpu_val });
+    my $ctrcpu_row = row({ label => 'ctr cpu', value => _pct_gauge_spans($r->{ctr_cpu_pct}) });
     push @lines, $ctrcpu_row if @$ctrcpu_row;
 
     my ($pi, $pc, $pv) = ($r->{pod_images}, $r->{pod_containers}, $r->{pod_volumes});
@@ -1081,33 +1142,20 @@ sub _resources_body {
     my $podman_row = row({ label => 'podman', value => $podman_val });
     push @lines, $podman_row if @$podman_row;
 
-    my $hostram_row = row({ label => 'host ram', value => _meter_value_spans($r->{host_ram_used}, $r->{host_ram_total}) });
+    my $hostram_row = row({ label => 'host ram', value => _bytes_gauge_spans($r->{host_ram_used}, $r->{host_ram_total}) });
     push @lines, $hostram_row if @$hostram_row;
 
-    my @dv = @{ _meter_value_spans($r->{host_disk_used}, $r->{host_disk_total}) };
-    push @dv, { text => " ($r->{host_disk_dev})", role => 'text.muted' }
+    my @disk_trail;
+    push @disk_trail, { text => " ($r->{host_disk_dev})", role => 'text.muted' }
         if defined($r->{host_disk_dev}) && !ref($r->{host_disk_dev}) && length($r->{host_disk_dev});
-    my $hostdisk_row = row({ label => 'host disk', value => \@dv });
+    my $hostdisk_row = row({ label => 'host disk',
+                             value => _bytes_gauge_spans($r->{host_disk_used}, $r->{host_disk_total}, \@disk_trail) });
     push @lines, $hostdisk_row if @$hostdisk_row;
 
-    my $hpct = $r->{host_cpu_pct};
-    my @cv;
-    if (defined($hpct) && !ref($hpct) && $hpct =~ /^-?\d+(?:\.\d+)?$/) {
-        my $ratio = $hpct / 100;
-        $ratio = 0 if $ratio < 0;
-        $ratio = 1 if $ratio > 1;
-        my $role = tui::Meter::pressure_role($ratio) // 'text.muted';
-        @cv = (
-            { text => sprintf('%.1f%%', $hpct), role => $role },
-            { text => '  ', role => 'text.primary' },
-            { text => tui::Meter::bar($ratio, tui::Meter::BAR_CELLS()), role => $role, atomic => 1 },
-        );
-    } else {
-        @cv = ( { text => 'n/a', role => 'text.muted' } );
-    }
-    push @cv, { text => sprintf(' (%d cores)', $r->{host_cores}), role => 'text.muted' }
+    my @cpu_trail;
+    push @cpu_trail, { text => sprintf(' (%d cores)', $r->{host_cores}), role => 'text.muted' }
         if defined($r->{host_cores}) && !ref($r->{host_cores}) && $r->{host_cores} =~ /^\d+$/;
-    my $hostcpu_row = row({ label => 'host cpu', value => \@cv });
+    my $hostcpu_row = row({ label => 'host cpu', value => _pct_gauge_spans($r->{host_cpu_pct}, \@cpu_trail) });
     push @lines, $hostcpu_row if @$hostcpu_row;
 
     return \@lines;
