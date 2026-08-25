@@ -379,7 +379,11 @@ sub _border_for {
 # Detected from the rendered text rather than tracked as state, because the two
 # regions are composed independently and only meet here. PRIVATE.
 sub _side_border_cell {
-    my ($left_cell, $side_cell, $sep) = @_;
+    my ($left_cell, $side_cell, $sep, $has_above, $has_below) = @_;
+    # Default to "the line continues both ways" so a caller that does not say
+    # gets the old behaviour rather than a surprise.
+    $has_above = 1 if !defined $has_above;
+    $has_below = 1 if !defined $has_below;
     my $h = Theme::glyph('rule.h');
     my %rule_ish = map { (defined($_) && length($_)) ? ($_ => 1) : () }
                    ($h, Theme::glyph('tee.down'), Theme::glyph('tee.up'), Theme::glyph('cross'));
@@ -400,10 +404,27 @@ sub _side_border_cell {
     my $to_right = (defined($h) && length($h) && length($stext) >= length($h)
                     && substr($stext, 0, length($h)) eq $h) ? 1 : 0;
 
-    my $glyph = $sep;
-    if    ($from_left && $to_right)  { $glyph = Theme::glyph('cross')     // $sep }
-    elsif ($from_left)               { $glyph = Theme::glyph('tee.left')  // $sep }
-    elsif ($to_right)                { $glyph = Theme::glyph('tee.right') // $sep }
+    # FOUR DIRECTIONS, not two. This used to choose from $from_left/$to_right
+    # alone and assumed the vertical always continued both ways -- true for
+    # every row except the two that bound the body. On the FIRST body row a
+    # horizontal rule arrives from the left (a panel title) and leaves to the
+    # right (the side column's own title) while nothing comes from above, so
+    # the correct glyph is a tee-down; it was drawing a cross, claiming a line
+    # upward into the header row that does not exist. Operator caught it in the
+    # very first rendered row.
+    my $up    = $has_above ? 1 : 0;
+    my $down  = $has_below ? 1 : 0;
+    my $left  = $from_left ? 1 : 0;
+    my $right = $to_right  ? 1 : 0;
+
+    my $glyph;
+    if    ($up && $down && $left && $right) { $glyph = Theme::glyph('cross')     }
+    elsif ($down && $left && $right)        { $glyph = Theme::glyph('tee.down')  }
+    elsif ($up   && $left && $right)        { $glyph = Theme::glyph('tee.up')    }
+    elsif ($up && $down && $left)           { $glyph = Theme::glyph('tee.left')  }
+    elsif ($up && $down && $right)          { $glyph = Theme::glyph('tee.right') }
+    elsif ($left && $right)                 { $glyph = Theme::glyph('rule.h')    }
+    else                                    { $glyph = $sep                      }
     $glyph = $sep if !defined $glyph || !length $glyph;
 
     my @spans = ( { text => $glyph, role => 'rule' } );
@@ -727,7 +748,10 @@ sub compose {
 
     my @body_cells = map {
         $side_bw
-            ? _join_row_cells($left[$_], _side_border_cell($left[$_], $side[$_], $side_sep), $side[$_])
+            ? _join_row_cells($left[$_],
+                              _side_border_cell($left[$_], $side[$_], $side_sep,
+                                                ($_ > 0), ($_ < $body_height - 1)),
+                              $side[$_])
             : _join_row_cells($left[$_], $side[$_])
     } 0 .. $body_height - 1;
 

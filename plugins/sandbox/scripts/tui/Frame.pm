@@ -771,8 +771,21 @@ sub panel_title_line {
     my ($title, $w, $junctions) = @_;
     my $rule_glyph = Theme::glyph('rule.h');
     $rule_glyph = '-' if !defined $rule_glyph || !length $rule_glyph;
+    # THE LEAD GLYPH IS RULE, NOT TEXT. It used to be part of one span with the
+    # title, carrying DEFAULT_ROLE -- correct when the lead was the ASCII '-- '
+    # caption, wrong the moment it became a rule glyph: the single '-' to the
+    # left of every panel name rendered BRIGHTER than the identical glyphs
+    # filling the rest of the same line, so each title line changed colour one
+    # column in. Operator, seeing it live: "no need anymore for that different
+    # colour to the line to the left of the cell label."
+    #
+    # The title TEXT keeps DEFAULT_ROLE -- it is the one thing on the line that
+    # is not decoration.
     my $lead  = $rule_glyph . ' ' . safe($title) . ' ';
-    my @spans = ( { text => $lead, role => DEFAULT_ROLE() } );
+    my @spans = (
+        { text => $rule_glyph,                    role => 'rule' },
+        { text => ' ' . safe($title) . ' ',       role => DEFAULT_ROLE() },
+    );
     my $lead_w = tui::Layout::display_width($lead);
     my $target_w = (!defined $w || ref($w) || $w !~ /^-?\d+(?:\.\d+)?$/) ? 0 : int($w);
     if ($target_w > $lead_w) {
