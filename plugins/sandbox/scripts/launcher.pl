@@ -5280,6 +5280,25 @@ sub enter_dashboard {
     # podman subprocesses off the render tick.
     ($CONTAINER_SAMPLER_CHILD) = _container_sampler_start($CONTAINER_NAME);
 
+    # SEED THE STATUS ONCE, HERE, BEFORE THE LOOP.
+    #
+    # The sampler's first snapshot lands a second or two after this point, and
+    # until it does there is nothing to read. Leaving the gather to discover
+    # that made the launcher announce the container as UNREACHABLE on every
+    # single launch and then take it back a moment later -- reported by the
+    # operator on the first launch after the sampler landed. A warning that is
+    # usually wrong is a warning that gets ignored when it is right.
+    #
+    # One inspect, once per dashboard, on the startup path where a launch is
+    # already spawning containers -- deliberately NOT in the gather, so the
+    # render tick keeps the property this whole sampler exists to give it:
+    # it spawns nothing.
+    {
+        my $seed = `$PODMAN inspect --format '{{.State.Status}}' "$CONTAINER_NAME" 2>/dev/null`;
+        chomp $seed if defined $seed;
+        $cached_status = (defined $seed && length $seed) ? $seed : 'unknown';
+    }
+
     # red-team MINOR-1: one-shot guard shared by enter_raw/leave_raw so a
     # re-entrant leave_raw (second Ctrl-C during teardown) only pops the
     # title stack once. See leave_raw below for the full rationale.
@@ -5460,7 +5479,29 @@ sub enter_dashboard {
                              ? $now - $snap->{measured_at} : undef;
                 my $snap_fresh = (defined $snap_age && $snap_age <= $CONTAINER_SNAPSHOT_MAX_AGE) ? 1 : 0;
 
-                $cached_status = $snap_fresh ? ($snap->{status} // 'unknown') : 'unknown';
+                # COLD START IS NOT "UNREACHABLE".
+                #
+                # The sampler's first snapshot lands a second or two after the
+                # dashboard opens, and until it does there is nothing to read.
+                # Mapping that to 'unknown' made the launcher announce the
+                # container as unreachable on EVERY launch, for a moment, and
+                # then take it back -- which is worse than saying nothing: a
+                # warning that is usually wrong is a warning that gets ignored
+                # when it is right. Reported by the operator on the very first
+                # launch after this sampler landed.
+                #
+                # So the FIRST read, and only the first, falls back to a direct
+                # inspect. It is one subprocess once per dashboard, on the
+                # startup path where a launch is already spawning containers --
+                # not on the render tick this sampler exists to keep clear.
+                # A fresh snapshot updates the status. A stale or missing one
+                # HOLDS the last known value rather than flipping to 'unknown':
+                # the probe result below already carries the staleness, and that
+                # is the field the keep-awake path actually reads. The very
+                # first value is seeded before the loop starts (see the
+                # container sampler's start site), so there is no window in
+                # which this has nothing to hold.
+                $cached_status = $snap->{status} // 'unknown' if $snap_fresh;
                 # B5/s21: busy-lease freshness (the orchestrator keeps
                 # /tmp/.butler-busy fresh only while there's active work or a
                 # pending auto-resume). s21-keep-awake-probe-failure-handling:
@@ -6360,7 +6401,19 @@ sub _powershell_json {
     # later sample round. That is the shape a "processes linger forever"
     # complaint actually takes: not the healthy calls, which exit at once, but
     # the one that never returns.
-    return scalar `timeout 5 powershell.exe -NoProfile -NonInteractive -Command "$cmd" 2>/dev/null`;
+    # SAME BARE-`timeout` DEFECT as the podman probes, and the same fix. From
+    # the launcher's PowerShell-inherited PATH this resolved to
+    # C:\Windows\System32\timeout.exe, which rejected the arguments outright --
+    # so cim_mem, cim_cpu and cim_disk failed for exactly the reason stats, df
+    # and machine did. Their sharing one cause is what made the operator's
+    # snapshot show fifteen undef facts rather than a podman-shaped subset, and
+    # it is why "it must be something about podman" was the wrong theory.
+    #
+    # stderr is captured rather than discarded for the same reason as well: a
+    # probe that fails silently is a probe nobody can fix.
+    my $t = _timeout_prefix(5);
+    my $e = _probe_err_path("cim");
+    return scalar `${t}powershell.exe -NoProfile -NonInteractive -Command "$cmd" 2>"$e"`;
 }
 
 # _resources_probes() -> { key => coderef }, the real I/O half of the s09
@@ -6395,6 +6448,67 @@ sub _powershell_json {
 # launcher died. Bounding every podman probe here restores the once-per-round
 # gate to being an ACTUALLY-working gate: a round can no longer last forever,
 # so the loop always returns to the kill(0,...) check within a bounded time.
+# _gnu_timeout() -> an absolute-path `timeout` prefix, or '' if none is usable.
+#
+# `timeout 5 podman ...` WAS RESOLVING TO C:\Windows\System32\timeout.exe.
+#
+# That is not GNU coreutils' timeout, it is Windows' pause command -- it takes
+# /T, rejects `5 podman ...` outright, and every probe died on argument syntax
+# before podman was ever invoked:
+#
+#     ERROR: Invalid syntax. Default option is not allowed more than '1' time(s).
+#     Type "TIMEOUT /?" for usage.
+#
+# This is why the operator's Resources panel had six probes present, six probes
+# run, and fifteen undef facts. It went undiagnosed for as long as it did
+# because every probe ended in 2>/dev/null, so the message above had nowhere to
+# go; capturing probe stderr surfaced it on the first launch afterwards.
+#
+# WHY IT ONLY BITES HERE. Run from Git Bash, a bare `timeout` finds
+# /usr/bin/timeout and works -- which is why it survived testing. The sampler
+# is exec'd from a launcher started by the PowerShell wrapper, so it inherits
+# the WINDOWS PATH, where System32 comes first and /usr/bin may not appear at
+# all. The command was correct; the environment it ran in was not the one it
+# was written for.
+#
+# So: never a bare name. Resolve it beside $^X (Git for Windows ships perl and
+# coreutils in the same bin), then the conventional POSIX path, and if neither
+# exists return '' -- an unbounded probe is worse than no probe only if it
+# hangs, and every caller already has its own round cadence and a dead-sampler
+# fact. Memoised; this is asked once per probe per round.
+sub _timeout_prefix {
+    my ($secs) = @_;
+    $secs = 5 if !defined $secs || $secs !~ /Ad+z/;
+    my $bin = _gnu_timeout_bin();
+    # THE SECONDS BELONG TO THE PREFIX, not to the caller.
+    #
+    # An earlier shape had callers write `$t 5 $PODMAN ...` with $t empty
+    # when no timeout binary was found -- which produced ` 5 podman ...`, where
+    # the SHELL takes 5 as the command. A missing timeout would then have
+    # broken every probe it was supposed to be protecting, which is the exact
+    # failure this whole change set exists to stop. t/78 caught it.
+    return $bin ? qq{$bin $secs } : q{};
+}
+
+my $GNU_TIMEOUT_MEMO;
+sub _gnu_timeout_bin {
+    return $GNU_TIMEOUT_MEMO if defined $GNU_TIMEOUT_MEMO;
+    my @candidates;
+    if (defined $^X && length $^X) {
+        (my $bin = $^X) =~ s{[/\\][^/\\]+$}{};
+        push @candidates, "$bin/timeout.exe", "$bin/timeout";
+    }
+    push @candidates, '/usr/bin/timeout', '/bin/timeout';
+    for my $c (@candidates) {
+        next unless -x $c || -f $c;
+        # Quoted: Git for Windows installs under "C:\Program Files\Git".
+        $GNU_TIMEOUT_MEMO = qq{"$c"};
+        return $GNU_TIMEOUT_MEMO;
+    }
+    $GNU_TIMEOUT_MEMO = '';
+    return $GNU_TIMEOUT_MEMO;
+}
+
 # _probe_err_path($key) -> where THIS probe's stderr goes for this round.
 #
 # Per-probe, so a reason can be attributed to the probe that produced it. The
@@ -6436,15 +6550,15 @@ sub _resources_probes {
     # stdout, which still has to parse as JSON. Cost is one small file per probe
     # per round, overwritten in place.
     my %p = (
-        stats => sub { my $e = _probe_err_path('stats');
-                       scalar `timeout 5 $PODMAN stats --no-stream --format json 2>"$e"` },
-        df    => sub { my $e = _probe_err_path('df');
-                       scalar `timeout 5 $PODMAN system df --format json 2>"$e"` },
+        stats => sub { my $e = _probe_err_path('stats'); my $t = _timeout_prefix(5);
+                       scalar `${t}$PODMAN stats --no-stream --format json 2>"$e"` },
+        df    => sub { my $e = _probe_err_path('df'); my $t = _timeout_prefix(5);
+                       scalar `${t}$PODMAN system df --format json 2>"$e"` },
     );
     return \%p unless $WINDOWS_FAMILY;
     my %cmd = _ps_commands();
-    $p{machine}  = sub { my $e = _probe_err_path('machine');
-                         scalar `timeout 5 $PODMAN machine list --format json 2>"$e"` }
+    $p{machine}  = sub { my $e = _probe_err_path('machine'); my $t = _timeout_prefix(5);
+                         scalar `${t}$PODMAN machine list --format json 2>"$e"` }
         if $PODMAN =~ /podman/i;
     # ONE powershell.exe per sample round, not three.
     #

@@ -80,8 +80,16 @@ SKIP: {
         or skip('extraction failed', 2);
 
     my $pkg = 'ResSpawnBudget';
+    # _powershell_json now resolves its timeout binary and its stderr path
+    # rather than spelling either out inline: a bare `timeout` was picking up
+    # C:\Windows\System32\timeout.exe from the launcher's PowerShell-inherited
+    # PATH and killing every probe on argument syntax. Both helpers are stubbed
+    # here because this file measures SPAWN COUNT, not command construction --
+    # t/44's FIXBATCH-1 owns what the command looks like.
+    my $stubs = "sub _timeout_prefix { '' }\n"
+              . "sub _probe_err_path { '/dev/null' }\n";
     my $ok = eval "package $pkg;\nuse strict;\nuse warnings;\nuse JSON::PP;\n"
-           . "our \$WINDOWS_FAMILY = 1;\n$ps\n$bom\n$pj\n$all\n1;\n";  ## no critic
+           . "our \$WINDOWS_FAMILY = 1;\n$stubs\n$ps\n$bom\n$pj\n$all\n1;\n";  ## no critic
     ok($ok, 'A2: they eval cleanly into a fresh package') or do {
         diag("eval error: $@");
         skip('eval failed', 1);

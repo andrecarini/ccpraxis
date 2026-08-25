@@ -1267,12 +1267,21 @@ ok(length($launcher_src) > 0, 'launcher.pl is readable on disk') or BAIL_OUT("ca
     my $ps_body = extract_block($launcher_src, 'sub _powershell_json');
     ok(defined $ps_body, 'AC-29: the _powershell_json body is extractable from launcher.pl');
     if (defined $ps_body) {
-        like($ps_body, qr{2>/dev/null}, 'AC-29: _powershell_json redirects stderr to 2>/dev/null (B33)');
+        # RE-POINTED 2026-08-25. This required stderr to go to /dev/null, which
+        # is the DEFECT rather than the contract: the CIM probes failed on this
+        # host for weeks and the reason -- Windows' TIMEOUT.EXE rejecting the
+        # arguments -- was destroyed by this very redirect. It is now captured
+        # to a per-probe file so a failure can be diagnosed.
+        #
+        # What B33 actually protects is the Windows landmine asserted on the
+        # next line: never the literal NUL, which creates an undeletable file.
+        # Redirecting somewhere readable satisfies that and is strictly better.
+        like($ps_body, qr{2>"\$e"}, 'AC-29: _powershell_json captures stderr to a file it can be read from (B33)');
         unlike($ps_body, qr/NUL/, 'AC-29: _powershell_json never uses the literal NUL (Windows landmine) (B33)');
         like($ps_body, qr/MSYS2_ARG_CONV_EXCL/, 'AC-29: _powershell_json sets MSYS2_ARG_CONV_EXCL locally (S2.7c)');
         like($ps_body, qr/\$WINDOWS_FAMILY/, 'AC-29: _powershell_json is guarded by $WINDOWS_FAMILY (S2.7c)');
     } else {
-        fail('AC-29: _powershell_json redirects stderr to 2>/dev/null (B33)');
+        fail('AC-29: _powershell_json captures stderr to a file it can be read from (B33)');
         fail('AC-29: _powershell_json never uses the literal NUL (B33)');
         fail('AC-29: _powershell_json sets MSYS2_ARG_CONV_EXCL locally (S2.7c)');
         fail('AC-29: _powershell_json is guarded by $WINDOWS_FAMILY (S2.7c)');
@@ -2520,12 +2529,36 @@ FAKE_MODULE
     my $probes_body = extract_block($launcher_src, 'sub _resources_probes');
     ok(defined $probes_body, 'FIXBATCH-1: the _resources_probes body is extractable from launcher.pl');
     if (defined $probes_body) {
-        like($probes_body, qr/\btimeout\s+\d+\s+\S+\s+stats\s+--no-stream\s+--format\s+json/,
-            'FIXBATCH-1 (MAJOR-1/H2): the "stats --no-stream" podman probe is wrapped in a bounded timeout (a hung podman.exe can no longer block the sampler round forever)');
-        like($probes_body, qr/\btimeout\s+\d+\s+\S+\s+system\s+df\s+--format\s+json/,
-            'FIXBATCH-1 (MAJOR-1/H2): the "system df" podman probe is wrapped in a bounded timeout');
-        like($probes_body, qr/\btimeout\s+\d+\s+\S+\s+machine\s+list\s+--format\s+json/,
-            'FIXBATCH-1 (MAJOR-1/H2): the "machine list" podman probe is wrapped in a bounded timeout');
+        # RE-POINTED 2026-08-25, and STRENGTHENED.
+        #
+        # These matched the literal word `timeout` -- which is precisely what
+        # was broken. Run from the launcher's PowerShell-inherited PATH, a bare
+        # `timeout` resolved to C:\Windows\System32\timeout.exe, the pause
+        # command, which rejected the arguments outright:
+        #
+        #     ERROR: Invalid syntax. Default option is not allowed more than '1' time(s).
+        #
+        # Every podman probe died on that before podman ran, which is why the
+        # operator's snapshot showed six probes present, six run, and fifteen
+        # undef facts. The assertion passed throughout: the word was there.
+        #
+        # So the bound is now asserted through the RESOLVER, and the bare form
+        # is asserted ABSENT. The second half is the one that would have caught
+        # the original defect, and it is the reason this is two assertions per
+        # probe rather than one.
+        like($probes_body, qr/_timeout_prefix\(\s*\d+\s*\)/,
+            'FIXBATCH-1 (MAJOR-1/H2): the probes take their timeout from the resolver, not from PATH');
+        # The SECONDS live inside the prefix, not at the call site. An earlier
+        # shape had callers write `$t 5 $PODMAN ...` with $t empty when no
+        # timeout binary was found, which produced ` 5 podman ...` -- the shell
+        # taking 5 as the command, so a missing timeout broke every probe it
+        # was meant to protect. t/78 caught that; this pins the corrected shape.
+        for my $probe ('stats\s+--no-stream', 'system\s+df', 'machine\s+list') {
+            like($probes_body, qr/\$\{t\}\$PODMAN\s+$probe/,
+                "FIXBATCH-1 (MAJOR-1/H2): the \"$probe\" podman probe is wrapped in a bounded timeout");
+        }
+        unlike($probes_body, qr/`\s*timeout\s+\d/,
+            'FIXBATCH-1: NO probe invokes a bare `timeout` -- on Windows that is System32\'s pause command, not coreutils');
     } else {
         fail($_) for (
             'FIXBATCH-1 (MAJOR-1/H2): the "stats --no-stream" podman probe is wrapped in a bounded timeout',
