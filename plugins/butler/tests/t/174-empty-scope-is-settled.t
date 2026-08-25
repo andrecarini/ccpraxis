@@ -198,6 +198,39 @@ sub capture_run {
 }
 
 # ===========================================================================
+# PART 1b2 - MALFORMED IS NOT EMPTY, and this is the dangerous direction.
+#
+# Candidate discovery requires blueprint.md, so a directory under blueprints/
+# that HAS package ledgers but no blueprint.md is silently skipped and arrives
+# at the empty-scope branch looking exactly like "nothing is there".
+#
+# Reporting `done` over it is a FALSE-SETTLED bug, not a cosmetic one:
+# bp-watchdog.pl treats `done` as absolute ("The director reports no remaining
+# work. Do not re-arm."), so a ledger sitting at status: running would be
+# declared settled and the run's dead-man's switch disarmed on top of it.
+# 95-watchdog.t's own fixture is precisely this shape -- packages/p1.md with
+# no blueprint.md -- and it went red the moment the empty-scope fix landed
+# without this distinction. Pinned here so the two cases can never re-merge.
+# ===========================================================================
+{
+    my $data = tempdir(CLEANUP => 1);
+    make_path("$data/blueprints/half-created/packages");
+    write_file("$data/blueprints/half-created/packages/p1.md",
+        "---\npackage: p1\nstatus: running\n---\n\nbody\n");
+
+    @KEEPAWAKE = ();
+    my ($rc, $out, $err) = capture_run(['next', '--scope', 'all'], { data_dir => $data });
+
+    unlike(($out // ''), qr/"action"\s*:\s*"done"/,
+        'P1b2: a blueprints/ dir with packages but no blueprint.md is NOT reported settled')
+        or diag($out);
+    isnt($rc, 0, 'P1b2: it is a hard error about the tree, not an action about the work');
+    like($err, qr/half-created/, 'P1b2: and the error names the malformed directory');
+    ok(!grep({ $_ eq 'spawn' } @KEEPAWAKE),
+        'P1b2: no keep-awake is armed for a tree that cannot be driven');
+}
+
+# ===========================================================================
 # PART 1c - POSITIVE CONTROL. One real, pending blueprint and no order:
 # need-order is the CORRECT report and must still fire. A fix that returns
 # `done` whenever no order exists would pass 1a/1b and fail here.

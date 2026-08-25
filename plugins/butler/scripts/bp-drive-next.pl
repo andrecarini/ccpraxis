@@ -614,6 +614,45 @@ sub _cmd_next {
     # vacuously true of an empty scope, and it settles keep-awake, which is what
     # an empty scope actually needs. This runs BEFORE B2 so the degenerate case
     # never reaches the ordering logic at all.
+    # EMPTY IS NOT THE SAME AS MALFORMED, and conflating them is a
+    # false-settled bug rather than a cosmetic one.
+    #
+    # Candidate discovery requires blueprint.md, so a directory under
+    # blueprints/ that HAS packages but no blueprint.md is silently skipped and
+    # lands here looking identical to "nothing is there". Reporting `done` over
+    # it is actively dangerous: bp-watchdog.pl branches on the action string and
+    # treats `done` as absolute ("The director reports no remaining work. Do not
+    # re-arm."), so a package ledger sitting at status: running would be
+    # declared settled and the dead-man's switch disarmed over a wedged run.
+    # 95-watchdog.t's fixture is exactly this shape and caught it.
+    #
+    # A malformed tree is a statement about the TREE, not about the work, so it
+    # takes the same route the missing-blueprints/ case already takes: a hard
+    # error naming what is wrong. That also keeps the watchdog honest by
+    # construction -- director_action() maps an empty stdout to 'unknown', which
+    # is not 'done', so it proceeds to its PROGRESS/STALLED analysis instead of
+    # standing down.
+    my @malformed;
+    if (-d "$data/blueprints" && opendir(my $mdh, "$data/blueprints")) {
+        @malformed = sort grep { $_ ne '.' && $_ ne '..' && $_ ne '_archive'
+                                 && -d "$data/blueprints/$_"
+                                 && !-f "$data/blueprints/$_/blueprint.md" }
+                          readdir $mdh;
+        closedir $mdh;
+    }
+    if (!@candidates && @malformed) {
+        _append_run_log($dsdir, 'MALFORMED (directory under blueprints/ with no blueprint.md): '
+                              . join(',', @malformed));
+        print STDERR "bp-drive-next: blueprints/ holds directories with no blueprint.md:\n";
+        print STDERR "  - $_\n" for @malformed;
+        print STDERR "Each is skipped by candidate discovery, so the scope resolves empty --\n"
+                   . "but 'empty' and 'malformed' are not the same thing, and reporting the run\n"
+                   . "settled over a half-created blueprint would disarm the watchdog on top of\n"
+                   . "a package that may still be running. Finish creating it (blueprint.md), or\n"
+                   . "move it aside, then retry.\n";
+        return 2;
+    }
+
     if (!@candidates) {
         _append_run_log($dsdir, 'DONE (nothing in scope: no blueprint matches the scope spec)');
         print _encode_action({ action => 'done' }), "\n";
