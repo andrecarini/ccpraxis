@@ -324,6 +324,7 @@ my $SESSION_MODE   = 0;   # B2: --session => internal connector entry (Decision 
 # deliberately NOT passed as an argument -- see $SELF_PL / _resources_sampler_main).
 my $RESOURCES_SAMPLER_MODE = 0;
 my $SPEND_SAMPLER_MODE     = 0;
+my $CONTAINER_SAMPLER_MODE = 0;
 my $SAMPLER_CONTAINER;
 my $SAMPLER_OWNER_PID;
 my @POSITIONAL;
@@ -346,6 +347,11 @@ my @POSITIONAL;
             # dashboard goes away) but NOT --sampler-container: spend is an
             # account fact and no container is involved in reading it.
             $SPEND_SAMPLER_MODE = 1;
+        } elsif ($a eq '--container-sampler') {
+            # This invocation IS the detached container-state sampler. It needs
+            # BOTH --sampler-container (what to inspect) and --sampler-owner-pid
+            # (so it self-exits when the dashboard goes away).
+            $CONTAINER_SAMPLER_MODE = 1;
         } elsif ($a eq '--sampler-container') {
             $SAMPLER_CONTAINER = @argv ? shift(@argv) : undef;
         } elsif ($a =~ /^--sampler-container=(.*)$/) {
@@ -379,6 +385,18 @@ if ($RESOURCES_SAMPLER_MODE) {
 if ($SPEND_SAMPLER_MODE) {
     if (!defined $SAMPLER_OWNER_PID || $SAMPLER_OWNER_PID !~ /^\d+$/) {
         print STDERR "ERROR: --spend-sampler requires --sampler-owner-pid matching /^\\d+\$/\n";
+        exit 2;
+    }
+}
+if ($CONTAINER_SAMPLER_MODE) {
+    # Needs BOTH, unlike the spend sampler: a container to inspect, and an
+    # owner pid to stop outliving.
+    if (!defined $SAMPLER_OWNER_PID || $SAMPLER_OWNER_PID !~ /^\d+$/) {
+        print STDERR "ERROR: --container-sampler requires --sampler-owner-pid matching /^\\d+\$/\n";
+        exit 2;
+    }
+    if (!defined $SAMPLER_CONTAINER || !length $SAMPLER_CONTAINER) {
+        print STDERR "ERROR: --container-sampler requires --sampler-container\n";
         exit 2;
     }
 }
@@ -904,6 +922,7 @@ my $LAUNCHER_DIR              = "$CLAUDE_DATA/.launcher";
 # "FAILED - sampler exited before writing a reading" was the end of the trail.
 my $SAMPLER_ERR_RESOURCES     = "$LAUNCHER_DIR/resources-sampler.err";
 my $SAMPLER_ERR_SPEND         = "$LAUNCHER_DIR/spend-sampler.err";
+my $SAMPLER_ERR_CONTAINER     = "$LAUNCHER_DIR/container-sampler.err";
 my $SELECTION_FILE            = "$LAUNCHER_DIR/selected-skills.json";
 my $MANIFEST_FILE             = "$LAUNCHER_DIR/container-manifest.json";
 my $SNAPSHOT_FILE             = "$LAUNCHER_DIR/.discovery-snapshot.json";
@@ -928,6 +947,8 @@ my $RESOURCES_SAMPLER_PID     = "$LAUNCHER_DIR/resources-sampler.pid";
 # it unreadable in exactly the state the operator is normally in.
 my $SPEND_GLOBAL_DIR          = $LAUNCHER_DIR;
 my $SPEND_SAMPLER_PID         = "$LAUNCHER_DIR/spend-sampler.pid";
+my $CONTAINER_SAMPLER_PID     = "$LAUNCHER_DIR/container-sampler.pid";
+my $CONTAINER_SNAPSHOT_FILE   = "$LAUNCHER_DIR/.container-snapshot.json";
 # t11-tui-hot-reload: the mtimes the currently-loaded render modules had when
 # this process read them. Populated once at dashboard entry and advanced only
 # for a module that actually reloaded -- see _hot_reload's closing note on why
@@ -1103,6 +1124,11 @@ my $ORCH_EVENTS_PER_LOG    = 10;   # parsed events kept from orchestrator.log pe
 # bounded to <=120s so a container state change is still reflected within
 # one poll interval; "poll never" is not a fix.
 my $CONTAINER_POLL_SECONDS = 20;
+# How old a container snapshot may be before the reader stops believing it.
+# Two sampler rounds plus a margin: one missed round is still fresh, two
+# consecutive misses read as "could not get a reading" -- the same discipline
+# Resources uses for its own snapshot (MAX_AGE = 60 against a 23s interval).
+my $CONTAINER_SNAPSHOT_MAX_AGE = 50;
 
 # s21-keep-awake-probe-failure-handling (spec S2.3): how many CONSECUTIVE
 # 'probe-failed' busy-lease results KeepAwake::on_probe holds the wake-lock
@@ -1624,6 +1650,8 @@ my $RESOURCES_SAMPLER_CHILD;
 sub _resources_sampler_release_global { eval { _resources_sampler_stop($RESOURCES_SAMPLER_CHILD, $RESOURCES_SAMPLER_PID) if $RESOURCES_SAMPLER_CHILD }; }
 my $SPEND_SAMPLER_CHILD;
 sub _spend_sampler_release_global { eval { _spend_sampler_stop($SPEND_SAMPLER_CHILD) if $SPEND_SAMPLER_CHILD }; }
+my $CONTAINER_SAMPLER_CHILD;
+sub _container_sampler_release_global { eval { _container_sampler_stop($CONTAINER_SAMPLER_CHILD) if $CONTAINER_SAMPLER_CHILD }; }
 
 # _tee_system(@cmd) — run @cmd streaming its combined stdout+stderr LIVE to the
 # console AND into the transcript. system()-style return value ($? convention:
@@ -1838,6 +1866,9 @@ if ($RESOURCES_SAMPLER_MODE) {
 if ($SPEND_SAMPLER_MODE) {
     exit(_spend_sampler_main($SAMPLER_OWNER_PID));                           # never returns
 }
+if ($CONTAINER_SAMPLER_MODE) {
+    exit(_container_sampler_main($SAMPLER_CONTAINER, $SAMPLER_OWNER_PID));   # never returns
+}
 
 # =====================================================================
 # Cross-process lock (per-project)
@@ -1868,8 +1899,8 @@ sub _rmtree {
 # every signal path -- alt-screen off, cursor shown, title popped, ReadMode
 # restored -- before the STDERR restore and before reset_terminal(). Its
 # once-guard is what makes a second Ctrl-C during teardown safe.
-$SIG{INT}  = sub { tui::LaunchScreens::host_leave($LAUNCH_HOST) if $LAUNCH_HOST; _stderr_capture_drain(); log_ev('signal', { sig => 'INT' });  _keepawake_release_global(); _resources_sampler_release_global(); _spend_sampler_release_global(); LaunchLog::close_log($LAUNCH_LOG); _close_transcript(); SandboxLock::release_all(); reset_terminal(); exit 130 };
-$SIG{TERM} = sub { tui::LaunchScreens::host_leave($LAUNCH_HOST) if $LAUNCH_HOST; _stderr_capture_drain(); log_ev('signal', { sig => 'TERM' }); _keepawake_release_global(); _resources_sampler_release_global(); _spend_sampler_release_global(); LaunchLog::close_log($LAUNCH_LOG); _close_transcript(); SandboxLock::release_all(); reset_terminal(); exit 143 };
+$SIG{INT}  = sub { tui::LaunchScreens::host_leave($LAUNCH_HOST) if $LAUNCH_HOST; _stderr_capture_drain(); log_ev('signal', { sig => 'INT' });  _keepawake_release_global(); _resources_sampler_release_global(); _spend_sampler_release_global(); _container_sampler_release_global(); LaunchLog::close_log($LAUNCH_LOG); _close_transcript(); SandboxLock::release_all(); reset_terminal(); exit 130 };
+$SIG{TERM} = sub { tui::LaunchScreens::host_leave($LAUNCH_HOST) if $LAUNCH_HOST; _stderr_capture_drain(); log_ev('signal', { sig => 'TERM' }); _keepawake_release_global(); _resources_sampler_release_global(); _spend_sampler_release_global(); _container_sampler_release_global(); LaunchLog::close_log($LAUNCH_LOG); _close_transcript(); SandboxLock::release_all(); reset_terminal(); exit 143 };
 # 03-resources-reader-model fix-batch (red-team L15): closing the terminal
 # window -- the single most common way a user ends a dashboard -- sends HUP,
 # not INT/TERM, and perl does not run END blocks on an uncaught terminating
@@ -1877,7 +1908,7 @@ $SIG{TERM} = sub { tui::LaunchScreens::host_leave($LAUNCH_HOST) if $LAUNCH_HOST;
 # release, sampler release, lock release), which is the entry point for H2
 # step 3 (owner dies without ever running _resources_sampler_release_global).
 $SIG{HUP}  = $SIG{TERM};
-END { tui::LaunchScreens::host_leave($LAUNCH_HOST) if $LAUNCH_HOST; _stderr_capture_drain(); _keepawake_release_global(); _resources_sampler_release_global(); _spend_sampler_release_global(); LaunchLog::close_log($LAUNCH_LOG); _close_transcript(); SandboxLock::release_all() }
+END { tui::LaunchScreens::host_leave($LAUNCH_HOST) if $LAUNCH_HOST; _stderr_capture_drain(); _keepawake_release_global(); _resources_sampler_release_global(); _spend_sampler_release_global(); _container_sampler_release_global(); LaunchLog::close_log($LAUNCH_LOG); _close_transcript(); SandboxLock::release_all() }
 
 SandboxLock::acquire($LOCK_DIR, windows => $WINDOWS_FAMILY) or do {
     print STDERR "ERROR: another claude-sandbox is doing setup for this project (lock held > 10s at $LOCK_DIR).\n";
@@ -5241,6 +5272,14 @@ sub enter_dashboard {
     my $spend_sampler_fact;
     ($SPEND_SAMPLER_CHILD, $spend_sampler_fact) = _spend_sampler_start();
 
+    # The container-state sampler, started here for the same reason as the
+    # other two and degrading the same way: if the fork fails, the gather reads
+    # no snapshot, treats that as "could not get a reading", and the keep-awake
+    # path holds rather than releasing. The dashboard stays up and responsive
+    # either way -- which is the point, since this sampler exists to keep four
+    # podman subprocesses off the render tick.
+    ($CONTAINER_SAMPLER_CHILD) = _container_sampler_start($CONTAINER_NAME);
+
     # red-team MINOR-1: one-shot guard shared by enter_raw/leave_raw so a
     # re-entrant leave_raw (second Ctrl-C during teardown) only pops the
     # title stack once. See leave_raw below for the full rationale.
@@ -5403,9 +5442,25 @@ sub enter_dashboard {
             # container that died inside the throttle window.
             my $probed_now = 0;
             if ($now - $last_inspect >= $CONTAINER_POLL_SECONDS) {
-                my $s = `$PODMAN inspect --format '{{.State.Status}}' "$CONTAINER_NAME" 2>/dev/null`;
-                chomp $s if defined $s;
-                $cached_status = (defined $s && length $s) ? $s : 'unknown';
+                # READ, DO NOT PROBE. The four podman subprocesses that used to
+                # run here -- inspect, two execs for the busy lease, and a
+                # machine list -- are now the container sampler's job, off the
+                # render tick entirely. This is one file read.
+                #
+                # A MISSING OR STALE SNAPSHOT IS NOT "no lease". It is "we could
+                # not get a reading", which is what probe-failed already means,
+                # and KeepAwake::on_probe already treats that as HOLD-up-to-
+                # tolerance rather than release. Mapping it any other way would
+                # reintroduce the s21 defect from the other direction: a
+                # sampler that is merely behind would look identical to a
+                # container with no work in it, and drop the wake-lock under a
+                # run that is still going.
+                my $snap = _container_snapshot_read();
+                my $snap_age = (ref $snap eq 'HASH' && defined $snap->{measured_at})
+                             ? $now - $snap->{measured_at} : undef;
+                my $snap_fresh = (defined $snap_age && $snap_age <= $CONTAINER_SNAPSHOT_MAX_AGE) ? 1 : 0;
+
+                $cached_status = $snap_fresh ? ($snap->{status} // 'unknown') : 'unknown';
                 # B5/s21: busy-lease freshness (the orchestrator keeps
                 # /tmp/.butler-busy fresh only while there's active work or a
                 # pending auto-resume). s21-keep-awake-probe-failure-handling:
@@ -5415,7 +5470,7 @@ sub enter_dashboard {
                 # indistinguishable from "no lease" or "container gone", and
                 # both released the wake-lock the same way, SIGKILLing and
                 # re-spawning the PowerShell helper on the very next tick).
-                $cached_probe_result = _busy_lease_probe($CONTAINER_NAME);
+                $cached_probe_result = _container_probe_from_snapshot($snap, $now);
                 if ($cached_probe_result->{state} eq 'ok') {
                     $cached_busy_age   = $cached_probe_result->{age};
                     $cached_busy_stamp = $now;
@@ -5450,7 +5505,13 @@ sub enter_dashboard {
                 # round rather than per-tick -- it shells out to `podman machine
                 # list`, which is as expensive as the inspect above, so putting
                 # it here keeps the frame budget exactly where it was.
-                $cached_machine_state = _machine_state();
+                # From the snapshot too -- `podman machine list` was the fourth
+
+                # subprocess on this path. Unknown when the reading is not fresh,
+
+                # never a stale value presented as current.
+
+                $cached_machine_state = $snap_fresh ? $snap->{machine} : undef;
                 $last_inspect  = $now;
                 $probed_now    = 1;
             }
@@ -6869,6 +6930,182 @@ sub _spend_sampler_start {
     return ($pid, Resources::sampler_start_outcome($pid, undef, time));
 }
 
+
+# ===========================================================================
+# THE CONTAINER-STATE SAMPLER.
+#
+# WHY IT EXISTS. The dashboard's gather ran FOUR podman subprocesses inline on
+# the render tick, throttled to one round per $CONTAINER_POLL_SECONDS:
+#
+#     podman inspect --format {{.State.Status}}    the container's state
+#     podman exec <ctr> stat -c %Y /tmp/.butler-busy   the busy lease's mtime
+#     podman exec <ctr> date +%s                       the container's clock
+#     podman machine list                              the VM's state
+#
+# Backticks, so the loop stopped dead until each returned. `podman exec` on
+# Windows crosses into the WSL VM and then into the container; two of them
+# back to back, with an inspect and a machine list, is easily seconds. A
+# keystroke or a resize landing on that round waited behind all four -- which
+# is exactly the "scrolling sometimes takes multiple seconds" the operator
+# reported, and why it was intermittent rather than constant.
+#
+# The launcher's own comment had conceded the deferral for a long time:
+# "podman inspect is comparatively expensive; cache it so the input loop stays
+# responsive. (B3 may make the inspect fully async.)"
+#
+# This is that, following the pattern the resources and spend samplers already
+# established: a detached child does the probing on its own cadence and writes
+# a snapshot; the tick reads the file. The render loop spawns nothing.
+# ===========================================================================
+
+# _container_sampler_round($container) -- ONE probe round, written atomically.
+#
+# Failures are recorded, never swallowed: a field that could not be read is
+# undef and the reason travels beside it, so the reader can tell "the
+# container is stopped" from "we could not ask". That distinction is the whole
+# point of the keep-awake path downstream.
+sub _container_sampler_round {
+    my ($container) = @_;
+    my $now = time;
+
+    my $status = `$PODMAN inspect --format '{{.State.Status}}' "$container" 2>/dev/null`;
+    chomp $status if defined $status;
+    $status = (defined $status && length $status) ? $status : 'unknown';
+
+    my $probe   = _busy_lease_probe($container);
+    my $machine = _machine_state();
+
+    my $snap = {
+        v            => 1,
+        measured_at  => $now,
+        sampler_pid  => $$,
+        container    => $container,
+        status       => $status,
+        machine      => $machine,
+        probe        => (ref $probe eq 'HASH' ? $probe : { state => 'probe-failed',
+                                                           detail => 'probe returned no result' }),
+    };
+    my $bytes = eval { JSON::PP->new->canonical(1)->encode($snap) };
+    _write_file_atomic($CONTAINER_SNAPSHOT_FILE, $bytes) if defined $bytes;
+    return;
+}
+
+# _container_sampler_main($container, $owner_pid) -> exit code.
+sub _container_sampler_main {
+    my ($container, $owner_pid) = @_;
+    # Same reason the other two samplers clear it: the parent `local`s it
+    # immediately before exec, which leaves it set for this process's entire
+    # life and its whole subtree.
+    delete $ENV{MSYS2_ARG_CONV_EXCL};
+    while (1) {
+        last unless kill(0, $owner_pid);
+        eval { _write_file_atomic($CONTAINER_SAMPLER_PID, "$$ $owner_pid " . time . "\n"); 1 };
+        eval { _container_sampler_round($container); 1 };
+        sleep $CONTAINER_POLL_SECONDS;
+    }
+    unlink $CONTAINER_SAMPLER_PID;
+    return 0;
+}
+
+# _container_sampler_start($container) -> ($child_pid|undef, \%outcome).
+# Construct for construct with _spend_sampler_start.
+sub _container_sampler_start {
+    my ($container) = @_;
+    unless (-e $SELF_PL) {
+        my $why = "launcher path is not openable by this perl: $SELF_PL";
+        log_ev('container_sampler_start_failed', { reason => $why });
+        return (undef, Resources::sampler_start_outcome(undef, $why, time));
+    }
+    unless (defined $container && length $container) {
+        my $why = 'no container name to sample';
+        log_ev('container_sampler_start_failed', { reason => $why });
+        return (undef, Resources::sampler_start_outcome(undef, $why, time));
+    }
+    my $owner = $$;
+    my $pid = fork();
+    if (!defined $pid) {
+        my $why = "$!";
+        log_ev('container_sampler_start_failed', { reason => "fork: $why" });
+        return (undef, Resources::sampler_start_outcome(undef, $why, time));
+    }
+    if ($pid == 0) {
+        open(STDIN,  '<', '/dev/null');
+        open(STDOUT, '>', '/dev/null');
+        _sampler_stderr_to($SAMPLER_ERR_CONTAINER);
+        local $ENV{MSYS2_ARG_CONV_EXCL} = '*';
+        exec($^X, $SELF_PL, '--container-sampler',
+             '--sampler-container', $container,
+             '--sampler-owner-pid', $owner,
+             $PROJECT_PATH)
+            or do { POSIX::_exit(127) };
+    }
+    log_ev('container_sampler_forked', { pid => $pid });
+    return ($pid, Resources::sampler_start_outcome($pid, undef, time));
+}
+
+sub _container_sampler_stop {
+    my ($pid) = @_;
+    if (defined $pid && $pid =~ /^\d+$/ && $pid > 0) {
+        kill('KILL', $pid);
+        waitpid($pid, 0);
+        log_ev('container_sampler_stopped', { pid => $pid });
+    }
+    unlink $CONTAINER_SAMPLER_PID if -f $CONTAINER_SAMPLER_PID;
+}
+
+# _container_probe_from_snapshot($snap, $now) -> \%probe_result
+#
+# THE ONE PLACE THAT DECIDES WHAT A MISSING READING MEANS, extracted so it can
+# be tested. KeepAwake::on_probe consumes this, and on_probe STARTS AND STOPS A
+# POWERSHELL PROCESS that holds the machine awake -- so getting this mapping
+# wrong is not a cosmetic glitch. It either drops the wake-lock under a running
+# fleet, or holds it forever after one ends.
+#
+# THE RULE: absent or stale is 'probe-failed', never 'lease-absent'.
+#
+# Those are not interchangeable. 'lease-absent' asserts a fact about the
+# CONTAINER -- there is no work in it -- and on_probe releases the lock at once.
+# 'probe-failed' asserts a fact about US -- we could not ask -- and on_probe
+# holds through a tolerance before giving up. A sampler one round behind is the
+# second thing. Collapsing them would reintroduce s21's defect from the
+# opposite direction: s21 exists because a transient exec hiccup used to be
+# indistinguishable from "no lease", and both released the lock.
+#
+# PURE and total: no clock of its own, no I/O, hostile input yields
+# probe-failed rather than dying.
+sub _container_probe_from_snapshot {
+    my ($snap, $now) = @_;
+    return { state => 'probe-failed',
+             detail => 'container sampler has not written a snapshot yet' }
+        unless ref $snap eq 'HASH';
+
+    my $at = $snap->{measured_at};
+    return { state => 'probe-failed', detail => 'snapshot carries no measurement time' }
+        unless defined $at && !ref $at && $at =~ /^\d+$/;
+
+    $now = $at unless defined $now && !ref $now && $now =~ /^-?\d+$/;
+    my $age = $now - $at;
+    return { state => 'probe-failed', detail => "container sampler snapshot is ${age}s old" }
+        if $age > $CONTAINER_SNAPSHOT_MAX_AGE;
+
+    my $p = $snap->{probe};
+    return { state => 'probe-failed', detail => 'snapshot carried no probe result' }
+        unless ref $p eq 'HASH' && defined $p->{state} && length $p->{state};
+    return $p;
+}
+
+# _container_snapshot_read() -> \%snap | undef. One file read, no spawn.
+sub _container_snapshot_read {
+    return undef unless -f $CONTAINER_SNAPSHOT_FILE;
+    open my $rfh, '<:raw', $CONTAINER_SNAPSHOT_FILE or return undef;
+    local $/;
+    my $raw = <$rfh>;
+    close $rfh;
+    return undef unless defined $raw && length $raw;
+    my $d = eval { JSON::PP->new->decode($raw) };
+    return (ref $d eq 'HASH' && ($d->{v} // 0) == 1) ? $d : undef;
+}
+
 # _spend_sampler_stop($child_pid) -- mirrors _resources_sampler_stop.
 sub _spend_sampler_stop {
     my ($pid) = @_;
@@ -7196,6 +7433,7 @@ sub _relaunch_self {
     # Owned children, in the same order the clean shutdown path stops them.
     eval { _resources_sampler_stop($RESOURCES_SAMPLER_CHILD, $RESOURCES_SAMPLER_PID) };
     eval { _spend_sampler_stop($SPEND_SAMPLER_CHILD) };
+    eval { _container_sampler_stop($CONTAINER_SAMPLER_CHILD) };
     eval { _keepawake_stop() };
 
     _restore_terminal(1);
