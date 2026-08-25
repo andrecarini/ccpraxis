@@ -514,40 +514,16 @@ sub runs_n {
     }
 }
 
-# ===========================================================================
-# Criterion 8 (done-criterion 8, second half) -- Dashboard.pm's four frozen
-# duplicate builders are documented as historical/superseded (D3). This is a
-# DOC-COMMENT check, not a behavior check -- t/40 AC-17 and t/41 AC7 already
-# pin that the builders themselves stay byte-identical (the anti-change);
-# this file's own job is only to confirm the required doc-comment addition
-# landed, mirroring Behavior27's own source-scan convention.
-# ===========================================================================
-{
-    my $dash_path = "$Bin/../../scripts/Dashboard.pm";
-    open my $fh, '<', $dash_path or die "cannot open $dash_path: $!";
-    local $/;
-    my $src = <$fh>;
-    close $fh;
-    my @lines = split /\n/, $src;
+# Criterion 8's doc-comment check REMOVED 2026-08-25.
+#
+# It required Dashboard.pm's four frozen duplicate builders (_fixed_panels,
+# _run_lines, _token_lines, _spend_lines) to carry doc comments saying they
+# were superseded and historical. All four have since been DELETED as
+# unreachable, which is the stronger form of the same intent: the best way to
+# document that a duplicate is superseded is not to have it.
+#
+# An assertion that dead code still exists, and is still commented a certain
+# way, is the one kind that cannot survive removing it.
 
-    for my $sub (qw(_fixed_panels _run_lines _token_lines _spend_lines)) {
-        my ($sub_line_i) = grep { $lines[$_] =~ /^[ \t]*sub \Q$sub\E\b/ } (0 .. $#lines);
-        if (defined $sub_line_i) {
-            # The 35 lines immediately preceding the sub -- wide enough to
-            # span an intervening non-comment line (e.g. `our $RUN_MAX_ROWS
-            # = 3;` sits between _run_lines' doc comment and its `sub` line
-            # today), without reaching into a PRECEDING sub's own comment.
-            my $from = $sub_line_i - 35 < 0 ? 0 : $sub_line_i - 35;
-            my $comment = join("\n", @lines[$from .. $sub_line_i - 1]);
-            like($comment, qr/supersed/i,
-                "criterion8: the doc comment for Dashboard::$sub says it is superseded (D3)");
-            like($comment, qr/pre[-\s]?t01|historical/i,
-                "criterion8: the doc comment for Dashboard::$sub names the PRE-t01 vocabulary or calls itself historical (D3)");
-        } else {
-            fail("criterion8: could not find 'sub $sub' in Dashboard.pm at all");
-            fail("criterion8: (paired) same check, second assertion for $sub");
-        }
-    }
-}
 
 done_testing();

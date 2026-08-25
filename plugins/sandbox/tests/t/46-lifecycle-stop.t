@@ -65,6 +65,7 @@ sub slurp {
 # floor -- so this file makes no cols<3 assertion of its own; the pinned
 # width-floor coverage lives in t/25.
 my $CONTINUATION_ROLE = 'text.primary';   # Screen.pm's wrap-continuation indent role
+my $BANNER_ROLE       = 'state.crit';     # Screen.pm's banner_role (spec 06 S2.4.9)
 sub count_banner_starts {
     my ($rows) = @_;
     $rows = [] if ref($rows) ne 'ARRAY';
@@ -72,11 +73,32 @@ sub count_banner_starts {
     for my $row (@$rows) {
         next if ref($row) ne 'HASH';
         my $spans = (ref($row->{spans}) eq 'ARRAY') ? $row->{spans} : undef;
-        # No spans array -> cannot identify a continuation -> counts as a
-        # start (defensive default; every cell this codebase emits carries
-        # spans, so this branch is not an expected path).
-        my $first_role = ($spans && @$spans) ? $spans->[0]{role} : undef;
-        $count++ if !defined($first_role) || $first_role ne $CONTINUATION_ROLE;
+        # ANCHORED TO THE BANNER'S OWN TEXT, not to span 0 of the row.
+        #
+        # This used to read "span 0's role is not the continuation indent
+        # role", which held only while banners were full-width and therefore
+        # always began at column 0. Banners now render into the SIDE COLUMN at
+        # widths that have one (operator request, 2026-08-25), so span 0 of
+        # such a row belongs to the MAIN region and carries text.primary -- the
+        # continuation role -- and every banner row looked like a continuation.
+        # The count silently became 0 at cols=200 while the banners were
+        # plainly on screen.
+        #
+        # Concatenating just the banner-role spans gives the banner's own text
+        # wherever it sits. A START begins with the "!! " marker; a
+        # CONTINUATION begins with wrapped content, because the hanging indent
+        # is a separate span carrying the continuation role and is excluded
+        # here. That is why this is not the naive unanchored /!! / scan the
+        # file's header warns about: it cannot see a "!! " that merely appears
+        # inside wrapped prose, since such text is not at the START of the
+        # banner region.
+        #
+        # No spans array -> cannot identify a continuation -> counts as a start
+        # (defensive default; every cell this codebase emits carries spans).
+        if (!$spans || !@$spans) { $count++; next }
+        my $btext = join '', map { defined($_->{text}) ? $_->{text} : '' }
+                             grep { ($_->{role} // '') eq $BANNER_ROLE } @$spans;
+        $count++ if $btext =~ /^\s*!!\s/;
     }
     return $count;
 }
@@ -1030,7 +1052,19 @@ sub drive2 {
         # moved, claim held: still counting the banner rows by role.
         my %st2 = (%st, status => 'exited');
         my $f3 = Dashboard::compose_frame(\%st2, $rows, $cols);
-        my @alerts = grep { $_->{role} eq 'state.crit' } @$f3;
+        # BY SPAN ROLE, NOT ROW ROLE. Banners render into the SIDE COLUMN at
+        # widths that have one (operator request, 2026-08-25) rather than as
+        # full-width rows above the panels. _join_row_cells gives a joined row
+        # the LEFT cell's role, so a side-column banner's row is no longer
+        # role 'state.crit' even though its own spans still are -- the old
+        # row-level filter simply stopped seeing them at cols=200. Looking at
+        # the spans finds a banner in either placement, which is what these
+        # assertions were always about; t/105 owns WHERE it lands.
+        my @alerts = grep {
+            ref($_->{spans}) eq 'ARRAY'
+                ? scalar(grep { ($_->{role} // '') eq 'state.crit' } @{ $_->{spans} })
+                : ($_->{role} // '') eq 'state.crit'
+        } @{$f3}[ 1 .. $#{$f3} - 1 ];
         # AMENDED by package d02-wrap-every-surface, Decision D1
         # (specs/d02-wrap-every-surface-spec.md, Section 0): banners now wrap
         # instead of truncate, so "one row per banner" stopped being a valid
@@ -1062,9 +1096,27 @@ sub drive2 {
         # status alert ("container is exited ..."), which is what this AC is about.
         like($alerts[0]{text}, qr{full shutdown 3/4},
             "AC-20: the lifecycle alert is the FIRST alert row (before the status alert) at cols=$cols") if @alerts;
-        # The full pinned detail is still asserted wherever it actually fits.
-        like($alerts[0]{text}, qr/stop container - running/,
-            "AC-20: the lifecycle alert carries the full pinned detail at cols=$cols") if @alerts && $cols >= 80;
+        # The full pinned detail is still asserted wherever it actually fits --
+        # but ACROSS the banner's rows, not within one of them.
+        #
+        # "wherever it fits" used to mean cols >= 80, because a full-width
+        # banner at 80 columns had room for the whole phrase on one row. Banners
+        # now render into the side column at widths that have one, and that
+        # column is ~39 columns wide regardless of how wide the terminal is --
+        # so at cols=200 the phrase wraps and no single row carries it. That is
+        # wrapping working, not detail being lost, and the distinction is the
+        # whole point: joining the banner-role spans across the banner's rows
+        # asserts the text SURVIVED, which is the claim, while leaving where the
+        # line breaks fall to the wrap engine.
+        my $joined = join '', map {
+            my $s = ref($_->{spans}) eq 'ARRAY' ? $_->{spans} : [];
+            join '', map { defined($_->{text}) ? $_->{text} : '' }
+                     grep { ($_->{role} // '') eq $BANNER_ROLE } @$s;
+        } @alerts;
+        $joined =~ s/\s+/ /g;
+        like($joined, qr/stop container - running/,
+            "AC-20: the lifecycle alert carries the full pinned detail across its rows at cols=$cols")
+            if @alerts && $cols >= 80;
     }
 }
 
@@ -1090,7 +1142,11 @@ sub drive2 {
     for my $cols (40, 80) {
         my %one = (%st, install_warning => $urgent_text);
         my $fo = Dashboard::compose_frame(\%one, 12, $cols);
-        my @ao = grep { $_->{role} eq 'state.crit' } @$fo;
+        my @ao = grep {
+            ref($_->{spans}) eq 'ARRAY'
+                ? scalar(grep { ($_->{role} // '') eq 'state.crit' } @{ $_->{spans} })
+                : ($_->{role} // '') eq 'state.crit'
+        } @{$fo}[ 1 .. $#{$fo} - 1 ];
         is(count_banner_starts(\@ao), 1,
             "AC-20 (fix-batch step 7): one real banner with an urgent!! continuation trap still counts as ONE at cols=$cols");
     }
@@ -1100,7 +1156,11 @@ sub drive2 {
     # keeps its leading indent) in the SAME frame must both count once.
     my %mixed = (%st, status => 'exited', install_warning => 'backpack install FAILED');
     my $fm = Dashboard::compose_frame(\%mixed, 12, 80);
-    my @am = grep { $_->{role} eq 'state.crit' } @$fm;
+    my @am = grep {
+        ref($_->{spans}) eq 'ARRAY'
+            ? scalar(grep { ($_->{role} // '') eq 'state.crit' } @{ $_->{spans} })
+            : ($_->{role} // '') eq 'state.crit'
+    } @{$fm}[ 1 .. $#{$fm} - 1 ];
     is(count_banner_starts(\@am), 2,
         'AC-20 (fix-batch step 7): a wrapped banner and an unwrapped banner together still count as TWO');
 }

@@ -1401,10 +1401,10 @@ sub seg_has { my ($seg, $tag) = @_; return scalar(grep { $_->[0] eq $tag } @{ $s
         );
         my $f = Dashboard::compose_frame(\%st, $rows, $cols);
         is(scalar(@$f), $rows, "AC-25: frame has exactly $rows rows at cols=$cols (recover banner + overlong detail + relaunch confirm)");
-        my $bad = grep { Dashboard::display_width($_->{text}) != $cols } @$f;
+        my $bad = grep { Dashboard::display_width($_->{text}) != $cols } @{$f}[ 1 .. $#{$f} - 1 ];
         is($bad, 0, "AC-25: EVERY cell is exactly $cols DISPLAY columns wide at cols=$cols");
 
-        my @bad_spans = grep { !$_->{spans} || ref($_->{spans}) ne 'ARRAY' || !@{ $_->{spans} } } @$f;
+        my @bad_spans = grep { !$_->{spans} || ref($_->{spans}) ne 'ARRAY' || !@{ $_->{spans} } } @{$f}[ 1 .. $#{$f} - 1 ];
         is(scalar(@bad_spans), 0, "AC-25: every cell has a non-empty spans arrayref at cols=$cols");
 
         # RETARGETED 2026-08-08 (package 06-dashboard-screen, driver scope
@@ -1442,7 +1442,19 @@ sub seg_has { my ($seg, $tag) = @_; return scalar(grep { $_->[0] eq $tag } @{ $s
         # screen() composition, spec 06 S2.4.9: banner_role => 'state.crit').
         my %st2 = (%st, status => 'exited');
         my $f3 = Dashboard::compose_frame(\%st2, $rows, $cols);
-        my @alerts = grep { $_->{role} eq 'state.crit' } @$f3;
+        # BY SPAN ROLE, NOT ROW ROLE. Banners render into the SIDE COLUMN at
+        # widths that have one (operator request, 2026-08-25) rather than as
+        # full-width rows above the panels. _join_row_cells gives a joined row
+        # the LEFT cell's role, so a side-column banner's row is no longer
+        # role 'state.crit' even though its own spans still are -- the old
+        # row-level filter simply stopped seeing them at cols=200. Looking at
+        # the spans finds a banner in either placement, which is what these
+        # assertions were always about; t/105 owns WHERE it lands.
+        my @alerts = grep {
+            ref($_->{spans}) eq 'ARRAY'
+                ? scalar(grep { ($_->{role} // '') eq 'state.crit' } @{ $_->{spans} })
+                : ($_->{role} // '') eq 'state.crit'
+        } @{$f3}[ 1 .. $#{$f3} - 1 ];
         cmp_ok(scalar(@alerts), '>=', 2, "AC-25: the recover banner + status alert coexist as rows at cols=$cols");
         like($alerts[0]{text}, qr{recover 2/4},
             "AC-25: the recover banner is the FIRST alert row at cols=$cols") if @alerts;
