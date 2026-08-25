@@ -46,6 +46,9 @@ use Test::More;
 use File::Temp qw(tempdir);
 use File::Path qw(make_path);
 use Time::HiRes ();   # fix-batch MEDIUM-8: wall-clock bound on the gather-tick decode path
+use JSON::PP;         # MEDIUM-8's decode control. Explicit because it was reaching
+                      # this file transitively through RunState.pm -- so the test
+                      # would have started dying if RunState ever stopped needing it.
 
 my $SCRIPTS_DIR   = "$Bin/../../scripts";
 my $RUNSTATE_PATH = "$SCRIPTS_DIR/RunState.pm";
@@ -846,9 +849,37 @@ my $LIVE_DIR  = make_bp($LIVE_ROOT, 'coord-bp',
     my $t0 = [ Time::HiRes::gettimeofday() ];
     my $s = rs('summarize_dir', $dir);
     my $elapsed = Time::HiRes::tv_interval($t0);
-    ok($elapsed < 1.0,
-        sprintf('MEDIUM-8: a cap-compliant-by-bytes (%d bytes) but cardinality-hostile (%d keys) registry is rejected in under 1s (took %.3fs) -- the cardinality guard must run BEFORE the pure-Perl JSON::PP decode, not after it (redteam measured 3.49s when decode precedes the reject)',
-            length($huge_registry), $n, $elapsed));
+
+    # CALIBRATED AGAINST THIS MACHINE, not against a hardcoded second.
+    #
+    # This assertion used to read `ok($elapsed < 1.0, ...)`. The property it
+    # states is an ORDERING one -- "the guard is reached before the decode" --
+    # and a fixed wall-clock ceiling is a proxy that also measures whatever
+    # else the host happens to be doing. It went red at 1.022s (2% over) on an
+    # otherwise-passing tree, purely because a full test sweep was running
+    # alongside it. A test that fails on load reports "you broke it" when the
+    # truth is "the machine was busy", which is the same defect class as an
+    # oracle that measures the wrong thing.
+    #
+    # So measure the thing the ordering actually changes: decoding this exact
+    # payload is what the guard avoids. Time a real decode as the control and
+    # require the guarded path to be a small FRACTION of it. On the redteam's
+    # numbers that is ~0.05s against ~3.49s; if the order is ever inverted the
+    # guarded path becomes a decode plus overhead, so the ratio collapses to
+    # about 1 and this fails hard. The ratio is load-insensitive because both
+    # halves absorb the same contention.
+    my $t1 = [ Time::HiRes::gettimeofday() ];
+    my $control = eval { JSON::PP->new->decode($huge_registry) };
+    my $decode_elapsed = Time::HiRes::tv_interval($t1);
+    ok(ref $control eq 'HASH',
+        'MEDIUM-8 control sanity: the payload really does decode (so its cost is a fair baseline)');
+    ok($decode_elapsed > 0,
+        'MEDIUM-8 control sanity: the decode baseline is measurable');
+
+    my $budget = $decode_elapsed / 3;
+    ok($elapsed < $budget,
+        sprintf('MEDIUM-8: a cap-compliant-by-bytes (%d bytes) but cardinality-hostile (%d keys) registry is rejected in %.3fs, well under a third of the %.3fs a real decode of the same payload costs -- the cardinality guard must run BEFORE the pure-Perl JSON::PP decode, not after it (redteam measured 3.49s when decode precedes the reject)',
+            length($huge_registry), $n, $elapsed, $decode_elapsed));
 }
 
 # ===========================================================================
