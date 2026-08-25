@@ -342,6 +342,49 @@ ok($OK, 'HotReload.pm and tui/DashboardScreen.pm load') or BAIL_OUT("require fai
          'AC12: ...and a module held back by a sibling\'s failure is REPORTED as such, so the '
        . 'summary never reads as though it was simply not attempted');
 
+    # ------------------------------------------------------------------
+    # AC13 -- ORDER: normalise and translate BEFORE resolving.
+    #
+    # This is the actual root cause, and it defeated posixify_path entirely
+    # while looking like posixify_path was broken.
+    #
+    # bin/claude-sandbox.ps1 invokes the launcher as `C:\Users\...\launcher.pl`.
+    # Cygwin's abs_path does not recognise a BACKSLASHED drive-letter path as
+    # absolute -- it treats the whole string as a relative filename and joins it
+    # to the cwd, which is whatever directory the operator ran claude-sandbox
+    # from. Reproduced exactly:
+    #
+    #   cwd /c/Development/DAME
+    #   abs_path('C:\Users\Andre\...\launcher.pl')
+    #     -> /c/Development/DAME/C:/Users/Andre/.../launcher.pl   (openable=NO)
+    #
+    # The original code called abs_path FIRST and normalised backslashes
+    # second, so it tidied the separators and left the join in place. And
+    # because the drive letter was then no longer at the START of the string,
+    # posixify_path's `\A([A-Za-z]):` never matched -- the function was correct
+    # and was simply being handed an already-broken value.
+    #
+    # Order-sensitive bugs do not show up in a "does the helper work" test, so
+    # the ORDER is what gets pinned.
+    # ------------------------------------------------------------------
+    my ($selfpl_block) = $src =~ /(my \$SELF_PL\s*=\s*do \{.*?\n\};)/s;
+    ok(defined $selfpl_block, 'AC13: the $SELF_PL block is locatable')
+        or diag('not found -- if it was restructured, re-derive the ordering assertions below');
+  SKIP: {
+        skip 'no $SELF_PL block', 3 unless defined $selfpl_block;
+        my $i_slash   = index($selfpl_block, 's|\\\\|/|g');
+        my $i_posix   = index($selfpl_block, 'posixify_path($p)');
+        my $i_abspath = index($selfpl_block, 'abs_path($p)');
+        cmp_ok($i_slash, '>', -1, 'AC13: backslashes are normalised in the block');
+        cmp_ok($i_abspath, '>', -1, 'AC13: abs_path is called on the normalised value ($p)')
+            or diag('abs_path($0) means it resolves the RAW argv, which is the bug');
+        ok($i_slash < $i_abspath && $i_posix > -1 && $i_posix < $i_abspath,
+           'AC13: separators are normalised AND the path is translated BEFORE abs_path -- '
+         . 'resolving first joins a backslashed drive-letter path to the cwd, and then the '
+         . 'drive letter is no longer at the start for posixify_path to see')
+            or diag("slash=$i_slash posixify=$i_posix abs_path=$i_abspath");
+    }
+
     # And the consumer actually uses it: a $SELF_PL that skipped the translation
     # is the whole defect.
     like($src, qr/\$SELF_PL\s*=\s*do\s*\{[^}]*posixify_path/s,

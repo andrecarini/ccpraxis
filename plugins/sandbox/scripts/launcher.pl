@@ -216,36 +216,47 @@ my $READKEY_OK        = eval { require Term::ReadKey; 1 } ? 1 : 0;
 # sampler rather than the live install's -- otherwise the snapshot contract
 # could mismatch silently between the two.
 my $SELF_PL = do {
-    my $p = abs_path($0) // $0;
+    # ORDER IS THE WHOLE BUG. This was `abs_path($0)` FIRST and the backslash
+    # normalisation second, which is backwards: bin/claude-sandbox.ps1 invokes
+    # us as `C:\Users\...\launcher.pl`, and Cygwin's abs_path does not recognise
+    # a backslashed drive-letter path as absolute at all. It treats the whole
+    # string as a RELATIVE filename and joins it to the cwd -- which is whatever
+    # directory the operator ran claude-sandbox from. Reproduced exactly:
+    #
+    #   cwd  /c/Users/Andre/AppData/Local/Temp
+    #   abs_path('C:\Users\Andre\...\launcher.pl')
+    #     -> /c/Users/Andre/AppData/Local/Temp/C:/Users/Andre/.../launcher.pl
+    #
+    # The later s|\\|/|g then tidied the backslashes and left the join in place,
+    # producing a path that looks plausible and cannot be opened. Straight from
+    # the operator's screen, via the pre-flight check below:
+    #
+    #   resources_sampler_start_failed reason=launcher path is not openable by
+    #   this perl: /c/Development/DAME/C:/Users/Andre/.claude/.../launcher.pl
+    #
+    # It also explains why posixify_path appeared to do nothing when it was
+    # added: by the time it saw the value, the drive letter was no longer at the
+    # start, so its `\A([A-Za-z]):` never matched. The function was right; it was
+    # being handed an already-broken string.
+    #
+    # So: normalise separators, translate to MSYS form, and only THEN resolve.
+    my $p = $0;
     $p =~ s|\\|/|g;
-    # DRIVE-LETTER FORM -> POSIX FORM, because every consumer of $SELF_PL hands
-    # it to MSYS perl ($^X): the two sampler execs, the spend sampler's dir, and
-    # the hot-reload gate's -I.
+    $p = posixify_path($p);
+    my $abs = abs_path($p);
+    $p = $abs if defined $abs && length $abs;
+    # Translated once more, because abs_path can hand back a drive-letter form
+    # of its own on some perls. Idempotent, so this costs nothing when the value
+    # is already MSYS form.
     #
-    # bin/claude-sandbox.ps1 invokes us with a Windows path
-    # (C:\Users\...\launcher.pl) and sets MSYS2_ARG_CONV_EXCL='*' for the whole
-    # process tree, so nothing downstream translates it. The child perl then
-    # resolved `C:/Users/...` RELATIVE TO ITS CWD -- which for a sampler is the
-    # project directory. Measured, from the operator's screen, once the sampler
-    # started reporting its own reason:
-    #
-    #   Can't open perl script
-    #     "/c/Development/indocs/indocs-bacen-scraper/C:/Users/Andre/.claude/..."
-    #
-    # That is the project path with the Windows path appended. Both samplers died
-    # at exec on every launch -- which is why neither ever wrote a pidfile
-    # (almanac 20260824-203404-77e1) -- and the hot-reload gate's `-I` was
-    # mangled the same way, so every candidate module failed to find Theme.pm and
-    # was reported as "does not compile" (the three refusals on the DAME TUI).
-    # One cause, two symptoms that looked unrelated.
-    #
-    # This is the project's own doctrine applied in the direction it was not yet
-    # applied: hand-translate rather than depend on a conversion state. winify_path
-    # already does POSIX -> drive-letter for podman, which wants that form; MSYS
-    # perl wants the opposite, and nothing was doing it.
-    #
-    # Falls back to the original if the translation does not resolve, so a wrong
-    # guess can never be worse than what it replaces.
+    # WHY THIS MATTERS AT ALL: every consumer of $SELF_PL hands it to MSYS perl
+    # ($^X) -- the two sampler execs, the spend sampler's dir, and the hot-reload
+    # gate's -I. A drive-letter value there killed both samplers at exec on every
+    # launch (which is why neither ever wrote a pidfile, almanac
+    # 20260824-203404-77e1) and mangled the gate's include path, so every
+    # candidate module failed to find Theme.pm and was refused as "does not
+    # compile" -- the three refusals on the DAME TUI, against files that compile
+    # cleanly on the host. One cause, two symptoms that looked unrelated.
     posixify_path($p);
 };
 
@@ -1002,8 +1013,14 @@ my $STDERR_CAPTURE_PATH;    # File::Temp path currently receiving STDERR
 sub _restore_terminal {
     my ($pop_title) = @_;
     if ($pop_title) {
-        print STDOUT "\e]0;\a";             # neutral: clear our title
-        print STDOUT "\e[23;0t";            # XTPOPTITLE: restore the pushed title
+        print STDOUT "\e]0;\a";             # neutral: clear our title -- ALWAYS
+        # XTPOPTITLE only if we pushed. Popping a stack entry we never pushed
+        # restores a title belonging to an OUTER application, and the push is
+        # opt-in since 2026-08-25 (it is the suspected cause of the terminal
+        # window minimising itself at launch -- XTWINOPS 2 is ICONIFY). The
+        # neutral clear above is the half that actually matters and is
+        # unconditional.
+        print STDOUT "\e[23;0t" if $ENV{CCPRAXIS_TITLE_STACK};
     }
     print STDOUT "\e[?25h\e[?1049l";        # show cursor + leave alt-screen
     eval { Term::ReadKey::ReadMode('restore') };
@@ -5246,7 +5263,27 @@ sub enter_dashboard {
         launcher_changed   => sub { _launcher_changed() },
         enter_raw => sub {
             Term::ReadKey::ReadMode('cbreak');
-            print STDOUT "\e[22;0t";                # XTPUSHTITLE: push icon+window title onto the stack
+            # XTPUSHTITLE, now OPT-IN. Operator, 2026-08-25: "terminal window
+            # minimizes itself during the launch".
+            #
+            # This is the only sequence in the codebase that can drive a
+            # window-manager action, and the mechanism is right there in the
+            # XTWINOPS table: parameter 2 is ICONIFY. A terminal with partial
+            # XTWINOPS support that clamps or truncates the 22 lands on 2 and
+            # minimises the window -- at exactly this point in the launch.
+            #
+            # What it buys is cosmetic: restoring the operator's PREVIOUS window
+            # title on exit. The neutral clear below (\e]0;\a in leave_raw)
+            # already stops us leaving OUR title behind, which is the part that
+            # matters. Trading a window that minimises itself for an exactly
+            # restored title is not a trade worth making by default, so it is
+            # off unless asked for.
+            #
+            # NOT REMOVED, because this is a strong inference from the XTWINOPS
+            # table rather than something reproduced here -- if the minimising
+            # turns out to be something else, CCPRAXIS_TITLE_STACK=1 restores
+            # the old behaviour for whoever wants it.
+            print STDOUT "\e[22;0t" if $ENV{CCPRAXIS_TITLE_STACK};
             print STDOUT "\e[?1049h\e[?25l";        # alt-screen + hide cursor
             print STDOUT "\e]0;" . Dashboard::window_title({ project_name => $PROJECT_NAME }) . "\a";
             # s17-statusline-and-output-hygiene (spec S3): while the alt-screen

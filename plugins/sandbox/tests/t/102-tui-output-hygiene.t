@@ -285,8 +285,22 @@ for my $cols (40, 80, 120) {
     }
     SKIP: {
         skip('leave_raw not extractable -- see hard failure above', 1) unless defined $leave_body;
-        src_like($leave_body, qr/\bopen\s*\(\s*\\?\*?STDERR\s*,/,
-            'C4/C7: leave_raw restores STDERR (a second open() on the STDERR filehandle) before the alt-screen exits');
+        # THE TEARDOWN PATH, not one particular closure body.
+        #
+        # The restore was inlined in leave_raw when this was written. It now
+        # lives in _restore_terminal, which leave_raw calls -- extracted so the
+        # [r] re-exec path runs exactly the same primitives instead of a second
+        # copy that drifts. The PROPERTY is unchanged: the process's own STDERR
+        # is restored on the way out. Pinning the closure body instead of the
+        # path made a refactor that improved the code look like a regression.
+        my $teardown = $leave_body;
+        if ($leave_body =~ /_restore_terminal/) {
+            my ($helper) = $LAUNCHER_SRC_TEXT =~ /(sub _restore_terminal \{.*?\n\})/s;
+            $teardown .= $helper if defined $helper;
+        }
+        src_like($teardown, qr/\bopen\s*\(\s*\\?\*?STDERR\s*,/,
+            'C4/C7: the leave_raw teardown path restores STDERR (a second open() on the STDERR '
+          . 'filehandle) before the alt-screen exits -- whether inline or via _restore_terminal');
     }
 
     # Paired positive: the captured text is not simply discarded -- it is
