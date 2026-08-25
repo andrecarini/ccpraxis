@@ -801,7 +801,16 @@ sub _ac11_expect {
     # full-width row survives the \e[K", not "[running] is at the end". The
     # status block moved to the head of the row (operator request, 2026-08-25),
     # so the element occupying that last cell is now the container name.
-    like($f->[0]{text}, qr/\Qclaude-demo-abcd1234\E$/,
+    #
+    # RE-POINTED AGAIN, same day and for the same reason as t/25's copy: the
+    # container id stopped being right-justified, so at 120 columns the last
+    # cell is padding -- and an erased SPACE is invisible, which would leave
+    # this passing while guarding nothing. Compose at the header's own natural
+    # width (derived, never a literal) so the id occupies the final cell again.
+    my $nat = Dashboard::spans_text(tui::DashboardScreen::header_spans(\%st, 400));
+    $nat =~ s/\s+\z//;
+    my $f_nat = Dashboard::compose_frame(\%st, 12, Dashboard::display_width($nat));
+    like($f_nat->[0]{text}, qr/\Qclaude-demo-abcd1234\E$/,
         'AC-15.4: the title row still ends with the full container name (last cell not erased)');
 }
 

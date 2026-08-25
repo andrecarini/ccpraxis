@@ -636,8 +636,8 @@ sub _oauth_like_role {
 
 # ===========================================================================
 # header_spans(\%state, $cols) -- today's _title_line, unchanged in content
-# (spec S2.4.9): "ccpraxis sandbox - <project>" left, "<container>
-# [<spinner> <status>]" right-justified.
+# (spec S2.4.9): the status block, then "ccpraxis sandbox - <project> -
+# <container>" as one left-aligned phrase, then padding to $cols.
 #
 # This is the pre-narrowing strategy for the non-wrapping title surface
 # (Decision D1, specs/d02-wrap-every-surface-spec.md): content is clipped to
@@ -677,18 +677,31 @@ sub header_spans {
         { text => $st, role => $role },
         { text => '] ', role => 'accent' },
     );
-    my @right = (length($ctr) ? ( { text => $ctr, role => 'accent' } ) : ());
+    # THE CONTAINER ID IS NOT RIGHT-JUSTIFIED ANY MORE (operator request,
+    # 2026-08-25):
+    #
+    #   now:    [o running] ccpraxis sandbox - proj        claude-proj-2c052ba3
+    #   wanted: [o running] ccpraxis sandbox - proj - claude-proj-2c052ba3
+    #
+    # Justification put a variable-width gap in the middle of the row, so the id
+    # sat at a column that moved with the terminal and with the project name --
+    # nothing else on the screen is placed that way, and the gap read as two
+    # unrelated things sharing a row rather than one sentence naming this
+    # sandbox. It is now a third clause of the same phrase, joined by the same
+    # ' - ' that already joins the project to "ccpraxis sandbox", and the
+    # padding goes where padding goes everywhere else: at the end.
+    my @right = (length($ctr) ? ( { text => ' - ' . $ctr, role => 'accent' } ) : ());
 
     my $leadw = tui::Frame::spans_width(\@lead);
     my $lw    = tui::Layout::display_width($left);
     my $rw    = tui::Frame::spans_width(\@right);
 
-    if ($leadw + $lw + $rw + 1 <= $cols) {
+    if ($leadw + $lw + $rw <= $cols) {
         return [
             @lead,
             { text => $left, role => 'accent' },
-            { text => (' ' x ($cols - $leadw - $lw - $rw)), role => 'accent' },
             @right,
+            { text => (' ' x ($cols - $leadw - $lw - $rw)), role => 'accent' },
         ];
     }
     # Too narrow for all three. The status block survives and the container id
@@ -1705,10 +1718,16 @@ sub screen {
     # tui::Screen now runs the side column from row 0, so the header occupies
     # the main region alone (operator request, 2026-08-25: Activity should
     # start at the top rather than sit under a full-width band carrying two
-    # short strings). header_spans RIGHT-JUSTIFIES the container id, so it has
-    # to be told the real width -- composing at $cols and letting Screen clip
-    # to the narrower region silently ate the container id off the right-hand
-    # end, which is exactly the element that justification exists to place.
+    # short strings). So it must be composed at the MAIN region's width: the
+    # header no longer spans the terminal, and building it at $cols and letting
+    # tui::Screen clip to the narrower region would eat the container id off the
+    # right-hand end.
+    #
+    # This narrowing OUTLIVED the right-justification it was first written for
+    # (the container id is now a left-aligned clause, 2026-08-25). It is still
+    # required, for the plainer reason above: what is composed here has to be as
+    # wide as the row it is composed into, no wider. tui::Screen re-renders the
+    # title at $main_cols on the side-column path, and the two must agree.
     #
     # side_column_width() is public and pure, and returns 0 below the
     # breakpoint, so on a narrow terminal this is $cols unchanged.

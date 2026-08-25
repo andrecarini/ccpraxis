@@ -290,10 +290,16 @@ my %st = (
     is($bad, 0, 'compose: ALL rows exactly $cols wide');
     is($f->[0]{role}, $TITLE_ROLE, "compose: row 0 is the title (role: $TITLE_ROLE, Theme-derived, spec S2.1)");
     like($f->[0]{text}, qr/ccpraxis sandbox/, 'compose: title text present');
-    # Status block leads, container name is right-justified (operator request,
-    # 2026-08-25 -- the two used to be adjacent at the right-hand end).
-    like($f->[0]{text}, qr/\A\[running\].*\Qclaude-demo-abcd1234\E/,
-        'compose: status leads the row, container right-justified');
+    # Status block leads (operator request, 2026-08-25 -- the two used to be
+    # adjacent at the right-hand end), and the container id is the last clause
+    # of ONE left-aligned phrase rather than right-justified across a gap
+    # (second operator request, same day). RE-POINTED, not deleted: the claim
+    # about WHERE the container id sits is still made, it is just a different
+    # place.
+    like($f->[0]{text}, qr/\A\[running\] ccpraxis sandbox - demo - \Qclaude-demo-abcd1234\E/,
+        'compose: status leads the row, then project and container joined by " - "');
+    unlike($f->[0]{text}, qr/\Qdemo\E {2,}\Qclaude-demo-abcd1234\E/,
+        'compose: no justification gap between the project name and the container id');
     is($f->[-1]{role}, $FOOTER_ROLE, "compose: last row is the footer (role: $FOOTER_ROLE, Theme-derived, spec S2.1)");
     like($f->[-1]{text}, qr/\[q\] quit/, 'compose: footer legend present');
     my $joined = join "\n", map { $_->{text} } @$f;
@@ -832,13 +838,22 @@ my %st = (
     # regression: a trailing \e[K erased the last cell of a full-width row,
     # chopping the title's closing "]" (the "[running" bug). \e[K must come
     # BEFORE the text, never after.
-    my $tf = Dashboard::compose_frame(\%st, 6, 80);
     # THE PROPERTY IS "the last cell of a full-width row survives", not
     # "[running] is at the end". This guard exists because a trailing \e[K once
     # erased the final cell and chopped the title's closing bracket (the
     # "[running" bug). The status block has since moved to the head of the row,
     # so the element occupying that last cell is now the container name -- the
     # anchor moves with it, or the guard silently stops guarding anything.
+    #
+    # RE-POINTED 2026-08-25: the container id stopped being right-justified, so
+    # at 80 columns the final cell is now padding -- and an erased SPACE is
+    # invisible, which would leave this assertion passing while guarding
+    # nothing. Compose at the header's own natural width instead, so the id
+    # occupies the last cell again and the guard keeps its subject. Derived,
+    # never a literal: the width follows the header's wording.
+    my $natural = Dashboard::spans_text(tui::DashboardScreen::header_spans(\%st, 400));
+    $natural =~ s/\s+\z//;
+    my $tf = Dashboard::compose_frame(\%st, 6, Dashboard::display_width($natural));
     like($tf->[0]{text}, qr/\Qclaude-demo-abcd1234\E$/,
         'compose: title row ends with the full container name (last cell not erased)');
     my $tr = Dashboard::render_frame(undef, $tf, { color => 0 });

@@ -360,8 +360,16 @@ sub _live_gutter_label { return tui::DashboardScreen::gutter($_[0]); }
             'AC2 (project absent, inverted): header_spans still returns a non-empty span list');
         is(Dashboard::display_width($t_no_project), 80,
             'AC2 (project absent, inverted): the header still composes to exactly $cols -- well-formed, not corrupted');
-        unlike($t_no_project, qr/ - /,
-            'AC2 (project absent, inverted): no dangling " - " separator when project_name is absent');
+        # RE-POINTED 2026-08-25: " - " is no longer the project's separator
+        # alone -- the container id now joins the same phrase with it, so its
+        # mere presence proves nothing. What "no dangling separator" actually
+        # forbids is a separator with no clause on one side of it: two in a row
+        # (the project's own, emitted anyway, followed by the container's), or
+        # one at the very end of the text.
+        unlike($t_no_project, qr/-\s+-/,
+            'AC2 (project absent, inverted): no doubled " - " separator when project_name is absent');
+        unlike($t_no_project, qr/ - \s*\z/,
+            'AC2 (project absent, inverted): no separator left dangling at the end of the row');
         unlike($t_no_project, qr/undef/i,
             'AC2 (project absent, inverted): no literal "undef" leaks into the header when project_name is absent');
 
@@ -398,8 +406,13 @@ sub _live_gutter_label { return tui::DashboardScreen::gutter($_[0]); }
         # counter-fixture: with container PRESENT (the %full fixture
         # already in scope), the container name DOES appear -- so the checks
         # above are not testing an element that never renders under any input.
-        like($header_text, qr/\Qclaude-demo-abcd1234\E\s*\z/,
-            'AC5 (container present, counter-fixture): the container name DOES appear, right-justified, when present');
+        # RE-POINTED 2026-08-25: the container id is no longer right-justified.
+        # It is the last clause of one left-aligned phrase, joined by ' - ', and
+        # the row is padded after it -- so the claim this makes is "the id is
+        # present, as the tail of the header sentence", which is what AC5 was
+        # ever really about.
+        like($header_text, qr/ - \Qclaude-demo-abcd1234\E\s*\z/,
+            'AC5 (container present, counter-fixture): the container name DOES appear when present, joined to the project by " - "');
     }
     # AC7 REMOVED 2026-08-25 (operator: "I don't want to keep obsolete stuff
     # around"). It asserted that the oauth fact lands in a TOKEN PANEL when
