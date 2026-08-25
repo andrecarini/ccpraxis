@@ -719,12 +719,39 @@ pass('AC22: this file lives under t/ and matches run-tests.pl\'s t/*.t glob; '
     ok(defined $divider_i, 'AC-T2: a divider row is emitted where the events cross midnight')
         or diag('  rows: ' . join(' | ', @text));
     if (defined $divider_i) {
-        like($text[$divider_i], qr/11 Aug/,
-            'AC-T2: the divider names the date the following rows belong to');
         like($text[ $divider_i - 1 ], qr/^22:41/,
             'AC-T2: the row above the divider is the last of the previous day');
         like($text[ $divider_i + 1 ], qr/^00:14/,
             'AC-T2: the row below it is the first of the new day');
+    }
+
+    # AC-T2 RE-POINTED 2026-08-26 -- and this is the assertion that ENCODED the
+    # bug rather than catching it.
+    #
+    # It read "the divider names the date the following rows belong to" and
+    # checked that against recent_events' own CHRONOLOGICAL output. But nothing
+    # renders that order: Dashboard::run windows `reverse @all_events`, so the
+    # panel is newest-first. A separator is the one row whose meaning depends on
+    # which side of it you stand, and reversing the list moves it to the other
+    # side of the boundary it marks -- so the operator saw "-- Wed 26 Aug --"
+    # sitting directly above a block of rows that were Tue 25 Aug.
+    #
+    # The claim was right; its SUBJECT was wrong. Asserted in DISPLAY order now,
+    # which is the only order a human ever sees.
+    my @disp = reverse @text;
+    my ($d_i) = grep { $disp[$_] =~ /^--/ } (0 .. $#disp);
+    ok(defined $d_i, 'AC-T2 (display order): the divider survives the newest-first reversal');
+    if (defined $d_i) {
+        like($disp[ $d_i - 1 ], qr/^00:14/,
+            'AC-T2 (display order): the row ABOVE the divider is the oldest of the NEWER day');
+        like($disp[ $d_i + 1 ], qr/^22:41/,
+            'AC-T2 (display order): the row BELOW it is the newest of the OLDER day');
+        like($disp[$d_i], qr/10 Aug/,
+            'AC-T2 CANONICAL (display order): the divider names the date of the block it HEADS -- '
+          . 'the older one -- because in a newest-first list a separator introduces what follows it');
+        unlike($disp[$d_i], qr/11 Aug/,
+            'AC-T2 (display order): ...and NOT the newer date, which is what it used to say while '
+          . 'sitting above the older rows');
     }
 
     # One day, no divider. A separator that appears when nothing was crossed is

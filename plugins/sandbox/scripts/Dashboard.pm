@@ -1275,6 +1275,7 @@ sub recent_events {
     my $now_numeric = defined($now) && !ref($now) && $now =~ /^-?\d+(?:\.\d+)?$/;
     my @ev;
     my $prev_ymd;
+    my $prev_epoch;
     for my $rec (@last) {
         # WALL-CLOCK, NOT AN AGE (operator request). The column used to read
         # "5m", "11m", "7d16h" -- a relative age answers "how long ago" but
@@ -1287,11 +1288,34 @@ sub recent_events {
         # and reads as sixteen minutes later when it is sixteen minutes into the
         # NEXT DAY. So a date divider is emitted wherever consecutive rows fall
         # on different local dates, and the session divider carries its date too.
+        #
+        # THE DIVIDER CARRIES THE OLDER DATE, NOT THE NEWER ONE (operator,
+        # 2026-08-26: the feed showed "-- Wed 26 Aug --" sitting directly above
+        # a block of 22:15 rows that were Tue 25 Aug).
+        #
+        # These rows are built CHRONOLOGICALLY and the panel renders them
+        # NEWEST-FIRST (Dashboard::run windows `reverse @all_events`). A
+        # separator is the one kind of row whose meaning depends on which side
+        # of it you are on, so reversing the list moves it to the other side of
+        # the boundary it marks: emitted before the first row of the new date,
+        # it lands after them, heading the OLDER block instead.
+        #
+        # Reading a newest-first list downward, a divider introduces what
+        # follows it -- so it must name the older date. Labelling it from
+        # $prev_epoch rather than $rec->{epoch} is the whole fix. The list stays
+        # chronological (every oracle and every consumer depends on that); only
+        # the label changes, to the side it will actually head.
+        #
+        # The session divider is already correct for the same reason without
+        # needing a change: launcher.pl builds it from $hist_last_epoch, the
+        # PREVIOUS session's tail, which is exactly the block it heads once
+        # reversed.
         my $ymd = defined($rec->{epoch}) ? _local_ymd($rec->{epoch}, $localtime_fn) : undef;
         if (defined($ymd) && defined($prev_ymd) && $ymd ne $prev_ymd) {
-            push @ev, day_boundary_row($rec->{epoch}, $localtime_fn);
+            push @ev, day_boundary_row($prev_epoch, $localtime_fn);
         }
-        $prev_ymd = $ymd if defined $ymd;
+        $prev_ymd   = $ymd            if defined $ymd;
+        $prev_epoch = $rec->{epoch}   if defined $rec->{epoch};
 
         my @spans;
         if (defined $rec->{epoch}) {
