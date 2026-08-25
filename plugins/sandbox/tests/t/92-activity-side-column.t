@@ -313,7 +313,14 @@ for my $cols (@WIDE, @NARROW) {
         # column runs from the top, so row 0 carries the column's own title --
         # excluding it counted one row fewer than the renderer draws and made
         # the predictor look wrong when it was right.
-        my $rendered = scalar grep { substr(plain($_->{text}), -$sw) =~ /\S/ } @{$f}[ 0 .. $#$f - 1 ];
+        # ...and stop BEFORE the chrome that sits below the body. That used to
+        # be the footer row alone ($#$f - 1); since 2026-08 a horizontal rule
+        # sits above the footer, and it is full-width -- so it looks like a
+        # rendered side-column row to the -$sw test and counted one too many.
+        # Derived from tui::Screen::chrome_rows() minus the title row, which is
+        # ABOVE the body and is part of the main region, not below it.
+        my $below = tui::Screen::chrome_rows() - 1;
+        my $rendered = scalar grep { substr(plain($_->{text}), -$sw) =~ /\S/ } @{$f}[ 0 .. $#$f - $below ];
         # -1 for the panel's own title row, which capacity excludes.
         is($cap, $rendered - 1,
             "AC-capacity: cols=$cols rows=$rows -- reported capacity ($cap) matches the rows the column actually renders");

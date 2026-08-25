@@ -173,7 +173,7 @@ sub count_banner_starts {
 # fixed-region height AND the old 100-column breakpoint; BOTH moved the
 # fixed region's size, so no literal survives unmigrated. Per spec S5's own
 # worked formula:
-#   capacity == max(0, rows - 2(title+footer) - _fixed_region_height(state,cols) - 1)
+#   capacity == max(0, rows - chrome_rows() - _fixed_region_height(state,cols) - 1)
 # A live status alert is asserted as a DIFFERENTIAL against the non-alert
 # derivation at each call site (preserving this file's own comment, "a
 # status alert costs one more row", as a relative claim) rather than folded
@@ -181,7 +181,12 @@ sub count_banner_starts {
 # ===========================================================================
 sub _cap_expect {
     my ($state, $r, $c) = @_;
-    my $body = $r - 2;
+    # chrome_rows(), not the literal 2 it was: the footer gained a rule above it
+    # in 2026-08, so the chrome the body pays for is title + rule + footer. Read
+    # from tui::Screen for the same reason the flex floor below is -- an oracle
+    # that restates the renderer's constants stops mirroring it the moment one
+    # of them moves.
+    my $body = $r - tui::Screen::chrome_rows();
     my $raw  = $body - Dashboard::_fixed_region_height($state, $c) - 1;
     # Flex floor -- see tui::Screen::flex_reserve. The Activity panel is the
     # flex band, so it is guaranteed rows the fixed region cannot take; read
@@ -1204,8 +1209,9 @@ is(Dashboard::activity_capacity({ %st, status => 'exited' }, 28, 120),
 # The floor value (3) is HAND-DERIVED from tui::Screen::flex_reserve's own
 # documented formula (plugins/sandbox/scripts/tui/Screen.pm:164-172:
 # reserve = min(4, floor(body_h/2)), floored at 0) applied to THIS fixture's
-# own dimensions -- rows=24 -> body_h = 24-2 = 22 -> half = floor(22/2) = 11
-# -> reserve = min(4,11) = 4 -> activity floor = reserve-1 = 3 -- NEVER by
+# own dimensions -- rows=24 -> body_h = 24-3 = 21 (title, footer rule, footer)
+# -> half = floor(21/2) = 10 -> reserve = min(4,10) = 4 -> activity floor =
+# reserve-1 = 3 -- NEVER by
 # calling flex_reserve() or activity_capacity() itself, so a future change
 # that quietly lowers the reservation is caught by this literal going red.
 # ---------------------------------------------------------------------------
@@ -1246,9 +1252,28 @@ is(Dashboard::activity_capacity({ %st, status => 'exited' }, 28, 120),
     # which a status alert costs nothing, it ends at exactly one row count, and
     # from there on the alert costs exactly one row. So do the scan the comment
     # describes, then assert the shape around whatever it finds.
+    # WHERE THE SCAN STARTS, DERIVED RATHER THAN REMEMBERED.
+    #
+    # The old lower bound was the literal 11, and it was not arbitrary: below
+    # it, an alert does not merely take a body row, it shrinks the flex
+    # RESERVATION itself (flex_reserve is min(4, floor(body_h/2)), so at small
+    # heights the floor tracks the body). That is a different mechanism from
+    # the dead band this block pins, and inside it the differential genuinely
+    # does appear -- so the scan has always had to begin above it.
+    #
+    # 11 was that bound for a two-row chrome. The footer rule made the chrome
+    # three rows (2026-08), which moved it to 12, and a remembered 11 turned a
+    # correct layout change into a red test about a property it does not touch.
+    # So compute it: the first row count at which the reservation is already at
+    # its ceiling even after an alert has taken a body row.
+    my $reserve_cap = tui::Screen::flex_reserve(1_000);
+    my $SCAN_LO = 4;
+    $SCAN_LO++ until $SCAN_LO > 80
+        || tui::Screen::flex_reserve($SCAN_LO - tui::Screen::chrome_rows() - 1) == $reserve_cap;
+
     my $find_threshold = sub {
         my ($cols) = @_;
-        for my $rows (11 .. 80) {
+        for my $rows ($SCAN_LO .. 80) {
             my $base  = Dashboard::activity_capacity(\%st, $rows, $cols);
             my $alert = Dashboard::activity_capacity(\%exited, $rows, $cols);
             return $rows if $base > $floor24 && $alert == $base - 1;
@@ -1258,7 +1283,7 @@ is(Dashboard::activity_capacity({ %st, status => 'exited' }, 28, 120),
 
     for my $cols (80, 120) {
         my $thr = $find_threshold->($cols);
-        ok(defined $thr, "AC-11 threshold: a differential threshold exists at ${cols} cols (scan 11..80)");
+        ok(defined $thr, "AC-11 threshold: a differential threshold exists at ${cols} cols (scan $SCAN_LO..80)");
         next unless defined $thr;
 
         my $below = Dashboard::activity_capacity(\%st, $thr - 1, $cols);
@@ -1280,7 +1305,7 @@ is(Dashboard::activity_capacity({ %st, status => 'exited' }, 28, 120),
         my @leaks = grep {
             Dashboard::activity_capacity(\%exited, $_, $cols)
               != Dashboard::activity_capacity(\%st, $_, $cols)
-        } (11 .. $thr - 1);
+        } ($SCAN_LO .. $thr - 1);
         is_deeply(\@leaks, [],
             "AC-11 threshold: the dead band below ${thr}x$cols is contiguous -- no row count inside it "
           . "charges for the alert");

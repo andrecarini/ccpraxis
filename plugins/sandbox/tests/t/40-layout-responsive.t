@@ -549,7 +549,11 @@ for my $c (20, 40, 80, 100, 200) {
 # ---------------------------------------------------------------------------
 sub _ac11_expect {
     my ($state, $r, $c) = @_;
-    my $body = $r - 2;
+    # chrome_rows(), not the literal 2 it was: the footer gained a rule above
+    # it in 2026-08, so the chrome is title + rule + footer. Read from
+    # tui::Screen for the same reason the flex floor below is -- an oracle that
+    # restates the renderer's constants stops mirroring it the moment one moves.
+    my $body = $r - tui::Screen::chrome_rows();
     my $raw  = $body - Dashboard::_fixed_region_height($state, $c) - 1;
     # The Activity panel is tui::Screen's FLEX band and is guaranteed a
     # reservation the fixed region cannot eat, so the old
@@ -591,7 +595,7 @@ sub _ac11_expect {
         my ($state, $r, $c, $label) = @$row;
         my $expect = _ac11_expect($state, $r, $c);
         is(Dashboard::activity_capacity($state, $r, $c), $expect,
-            "AC-11: activity_capacity($label) == $expect (derived: rows - 2 - _fixed_region_height - 1, clamped at 0)");
+            "AC-11: activity_capacity($label) == $expect (derived: rows - chrome_rows() - _fixed_region_height - 1, clamped at the flex floor)");
     }
 
     # RE-POINTED (package t01-providers-panel, operator ruling 2026-08-13):
@@ -626,8 +630,9 @@ sub _ac11_expect {
 # The floor value (3) is HAND-DERIVED from tui::Screen::flex_reserve's own
 # documented formula (plugins/sandbox/scripts/tui/Screen.pm:164-172:
 # reserve = min(4, floor(body_h/2)), floored at 0) applied to THIS fixture's
-# own dimensions -- rows=24 -> body_h = 24-2 = 22 -> half = floor(22/2) = 11
-# -> reserve = min(4,11) = 4 -> activity floor = reserve-1 = 3 (the -1 is the
+# own dimensions -- rows=24 -> body_h = 24-3 = 21 (title, footer rule, footer)
+# -> half = floor(21/2) = 10
+# -> reserve = min(4,10) = 4 -> activity floor = reserve-1 = 3 (the -1 is the
 # panel's own title row, per the existing _ac11_expect/_cap_expect
 # convention in this file and t/25-dashboard.t) -- NEVER by calling
 # flex_reserve() or activity_capacity() itself, so a future change that
@@ -675,9 +680,22 @@ sub _ac11_expect {
     # dead band. Do the scan the header describes, then assert the shape around
     # whatever it finds -- including that the dead band is CONTIGUOUS, which a
     # pasted pair of row numbers could never say.
+    # WHERE THE SCAN STARTS, DERIVED RATHER THAN REMEMBERED (mirrors t/25's
+    # copy). Below this bound an alert does not merely take a body row, it
+    # shrinks the flex RESERVATION itself -- a different mechanism from the dead
+    # band, and one inside which the differential genuinely does appear. The old
+    # literal 11 was that bound for a two-row chrome; the footer rule made the
+    # chrome three rows in 2026-08 and moved it. So compute it: the first row
+    # count at which the reservation is already at its ceiling even after an
+    # alert has taken a body row.
+    my $reserve_cap = tui::Screen::flex_reserve(1_000);
+    my $SCAN_LO = 4;
+    $SCAN_LO++ until $SCAN_LO > 80
+        || tui::Screen::flex_reserve($SCAN_LO - tui::Screen::chrome_rows() - 1) == $reserve_cap;
+
     my $find_threshold = sub {
         my ($cols) = @_;
-        for my $rows (11 .. 80) {
+        for my $rows ($SCAN_LO .. 80) {
             my $base  = Dashboard::activity_capacity(\%st, $rows, $cols);
             my $alert = Dashboard::activity_capacity(\%exited, $rows, $cols);
             return $rows if $base > $floor24 && $alert == $base - 1;
@@ -687,7 +705,7 @@ sub _ac11_expect {
 
     for my $cols (80, 120) {
         my $thr = $find_threshold->($cols);
-        ok(defined $thr, "AC-11 threshold: a differential threshold exists at ${cols} cols (scan 11..80)");
+        ok(defined $thr, "AC-11 threshold: a differential threshold exists at ${cols} cols (scan $SCAN_LO..80)");
         next unless defined $thr;
 
         my $below = Dashboard::activity_capacity(\%st, $thr - 1, $cols);
@@ -706,7 +724,7 @@ sub _ac11_expect {
         my @leaks = grep {
             Dashboard::activity_capacity(\%exited, $_, $cols)
               != Dashboard::activity_capacity(\%st, $_, $cols)
-        } (11 .. $thr - 1);
+        } ($SCAN_LO .. $thr - 1);
         is_deeply(\@leaks, [],
             "AC-11 threshold: the dead band below ${thr}x$cols is contiguous -- no row count inside it "
           . "charges for the alert");
@@ -753,7 +771,13 @@ sub _ac11_expect {
 # one row.
 # ===========================================================================
 {
-    my $f = Dashboard::compose_frame(\%st, 12, 120);
+    # TEN BODY ROWS PLUS THE CHROME, not the literal 12 this was. Twelve meant
+    # "ten body rows" when the chrome was title + footer; the footer rule made
+    # it three rows in 2026-08, and a remembered 12 pushed the needs_you row
+    # off the body -- which turned AC-15.3 red over a layout change that has
+    # nothing to say about per-side diffing.
+    my $AC15_ROWS = 10 + tui::Screen::chrome_rows();
+    my $f = Dashboard::compose_frame(\%st, $AC15_ROWS, 120);
 
     # 1. wrapper + single clear
     my $full = Dashboard::render_frame(undef, $f, { color => 0 });
@@ -763,7 +787,7 @@ sub _ac11_expect {
     is($n_clears, 1, 'AC-15.1: two-column frame full render clears the screen EXACTLY once');
 
     # 2. two structurally identical frames -> no clear, zero row repaints
-    my $fB       = Dashboard::compose_frame(\%st, 12, 120);
+    my $fB       = Dashboard::compose_frame(\%st, $AC15_ROWS, 120);
     my $diffnone = Dashboard::render_frame($f, $fB, { color => 0 });
     unlike($diffnone, qr/\e\[2J/, 'AC-15.2: two structurally identical two-column frames -> no full clear');
     my @moves_none = ($diffnone =~ /\e\[(\d+);1H/g);
@@ -771,8 +795,8 @@ sub _ac11_expect {
         'AC-15.2: two structurally identical two-column frames -> zero row repaints (value-keyed diff on joined multi-span cells)');
 
     # 3a. RIGHT-column-only diff (needs_you, part of the Run panel) -> exactly one row
-    my $f_base_right = Dashboard::compose_frame({ %st, busy_age => 5, stay_awake => 1, needs_you => 1 }, 12, 120);
-    my $f_diff_right = Dashboard::compose_frame({ %st, busy_age => 5, stay_awake => 1, needs_you => 7 }, 12, 120);
+    my $f_base_right = Dashboard::compose_frame({ %st, busy_age => 5, stay_awake => 1, needs_you => 1 }, $AC15_ROWS, 120);
+    my $f_diff_right = Dashboard::compose_frame({ %st, busy_age => 5, stay_awake => 1, needs_you => 7 }, $AC15_ROWS, 120);
     my $diffR = Dashboard::render_frame($f_base_right, $f_diff_right, { color => 0 });
     unlike($diffR, qr/\e\[2J/, 'AC-15.3: RIGHT-column-only (needs_you) diff -> not a full clear');
     my @movesR = ($diffR =~ /\e\[(\d+);1H/g);
@@ -780,7 +804,7 @@ sub _ac11_expect {
         'AC-15.3: a state differing ONLY in a RIGHT-column field (needs_you) repaints EXACTLY one row');
 
     # 3b. LEFT-column-only diff (beat_age, part of the Sandbox panel) -> exactly one row
-    my $f_diff_left = Dashboard::compose_frame({ %st, beat_age => 999 }, 12, 120);
+    my $f_diff_left = Dashboard::compose_frame({ %st, beat_age => 999 }, $AC15_ROWS, 120);
     my $diffL = Dashboard::render_frame($f, $f_diff_left, { color => 0 });
     unlike($diffL, qr/\e\[2J/, 'AC-15.3: LEFT-column-only (beat_age) diff -> not a full clear');
     my @movesL = ($diffL =~ /\e\[(\d+);1H/g);

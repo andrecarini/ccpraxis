@@ -241,10 +241,16 @@ SKIP: {
         banners => [ $first_banner, $second_banner ],
         panels  => [ { title => 'P', lines => [ 'a body line' ] } ],
     };
-    my $f = tui::Screen::compose($screen, 4, $cols);
-    is(scalar(@$f), 4, 'AC-4d: $rows==4 still returns exactly 4 cells');
+    # TWO BODY ROWS PLUS THE CHROME, not the literal 4 this was. The condition
+    # the case is built on is max_banner_rows == 1 -- i.e. body_height == 2 --
+    # and 4 expressed that when the chrome was title + footer. The footer rule
+    # made the chrome three rows in 2026-08; a remembered 4 makes body_height 1,
+    # max_banner_rows 0, and tests nothing this section is about.
+    my $rows = 2 + tui::Screen::chrome_rows();
+    my $f = tui::Screen::compose($screen, $rows, $cols);
+    is(scalar(@$f), $rows, "AC-4d: \$rows==$rows still returns exactly $rows cells");
     my @banner_rows = banner_rows_by_role($f, 'state.warn');
-    is(scalar(@banner_rows), 1, 'AC-4d: $rows==4 (max_banner_rows==1) emits EXACTLY one banner row');
+    is(scalar(@banner_rows), 1, "AC-4d: \$rows==$rows (max_banner_rows==1) emits EXACTLY one banner row");
   SKIP: {
         skip 'no banner row emitted -- fix not implemented yet', 1 unless @banner_rows == 1;
         my $expected_first_row = tui::Frame::wrap_line(

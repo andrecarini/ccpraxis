@@ -192,7 +192,11 @@ my ($dH, $dV, $dTDOWN, $dTUP, $dTLEFT, $dCROSS) = map { dec($_) } ($H, $V, $TDOW
     # slipped straight through that filter. Asserting that a title line BEGINS
     # with a pure-rule span in the rule role is what actually catches it, and
     # is the assertion this section exists for.
-    for my $i (1 .. $#$f - 1) {
+    # The scan stops before ALL the chrome below the body, not just the footer.
+    # Since 2026-08 a full-width horizontal rule sits above the footer, and its
+    # first span is a long run of rule glyphs -- which looks exactly like a
+    # title line to the test below, and is not one: it has no title.
+    for my $i (1 .. $#$f - (tui::Screen::chrome_rows() - 1)) {
         my $spans = $f->[$i]{spans} or next;
         next unless @$spans;
         my $first = $spans->[0];
@@ -223,6 +227,71 @@ my ($dH, $dV, $dTDOWN, $dTUP, $dTLEFT, $dCROSS) = map { dec($_) } ($H, $V, $TDOW
             my $bad = grep { Dashboard::display_width($_->{text}) != $cols } @$f;
             is($bad, 0, "G: ${cols}x$rows -- every row is exactly $cols display columns");
         }
+    }
+}
+
+# ===========================================================================
+# H. THE FOOTER'S BORDER (operator request, 2026-08-25).
+#
+# This is the first horizontal rule in the layout that is NOT a panel title
+# line. Every other one is a panel's title doing double duty as its top border,
+# which is why the grid costs no extra rows and why there are no bottom borders
+# anywhere. The footer has no panel above it to borrow a title rule from, so
+# this rule is constructed -- and it is the only rule that costs a row.
+#
+# Three claims, and the third is the one worth having: it is drawn, it spans the
+# full width, and its JUNCTIONS agree with the row above it. A rule that ignores
+# what meets it draws a straight line through a vertical border and looks broken
+# at exactly the seams the rest of this file exists to protect.
+# ===========================================================================
+{
+    my %ok_rule = map { dec($_) => 1 } grep { defined && length }
+                  ($H, $TUP, $TLEFT, Theme::glyph('tee.right'),
+                   Theme::glyph('corner.bl'), Theme::glyph('corner.br'));
+    my %down    = map { dec($_) => 1 } grep { defined && length }
+                  ($V, $TDOWN, $TLEFT, Theme::glyph('tee.right'), $CROSS,
+                   Theme::glyph('corner.tl'), Theme::glyph('corner.tr'));
+
+    # 4 rows: the last body row must carry the panel-grid seams that this
+    # section is about. At 14 rows the last body row is inside the Activity
+    # panel, which spans its whole band and has no vertical to terminate --
+    # true, and not what needs pinning. A frame just tall enough for the first
+    # band puts the seam directly above the footer rule.
+    for my $case ([100, 4], [150, 4], [100, 14], [150, 14]) {
+        my ($cols, $rows) = @$case;
+        my $f = Dashboard::compose_frame(st(), $rows, $cols);
+        my $rule_i = $#$f - 1;                 # immediately above the footer
+
+        my $rt = chars($f->[$rule_i]{text});
+        my $bad = grep { !$ok_rule{$_} } @$rt;
+        is($bad, 0, "H: ${cols}x$rows -- the row above the footer is made only of horizontal-rule and terminating-junction glyphs")
+            or diag('  [' . $f->[$rule_i]{text} . ']');
+        is(scalar(@$rt), $cols, "H: ${cols}x$rows -- the footer rule spans the full width");
+
+        # JUNCTION AGREEMENT: every column where the row ABOVE carries a glyph
+        # with a downward stroke must carry a terminating junction here, and no
+        # other column may. Derived from the rendered rows, exactly as
+        # tui::Screen derives it -- not from a model of where panels landed.
+        my $above = chars($f->[$rule_i - 1]{text});
+        my @want = grep { $down{ $above->[$_] } } 0 .. $#$above;
+        my @got  = grep { $rt->[$_] ne dec($H) } 0 .. $#$rt;
+        is_deeply(\@got, \@want,
+            "H: ${cols}x$rows -- the footer rule carries a junction at exactly the columns where a "
+          . 'vertical border terminates on it, and nowhere else')
+            or diag("  above: [$f->[$rule_i - 1]{text}]\n  rule:  [$f->[$rule_i]{text}]");
+    }
+
+    # Non-vacuity, stated once: at 4 rows the row above the rule IS the first
+    # band's title line, which carries real vertical seams -- so the agreement
+    # check above is comparing something rather than two empty lists.
+    for my $cols (100, 150) {
+        my $f = Dashboard::compose_frame(st(), 4, $cols);
+        my $above = chars($f->[$#$f - 2]{text});
+        my $n = grep { $down{$_} } @$above;
+        cmp_ok($n, '>', 0,
+            "H: ${cols}x4 non-vacuity -- the row above the footer rule really does carry at least "
+          . 'one terminating vertical')
+            or diag('  [' . $f->[$#$f - 2]{text} . ']');
     }
 }
 

@@ -1330,7 +1330,11 @@ sub _alert_msgs {
     $state ||= {};
     my @msgs = grep { defined && length }
         ( lifecycle_alert_msg($state), _status_alert($state), $state->{install_warning} );
-    my $max_alert = (defined $rows ? $rows : 0) - 3;   # title + >=1 body + footer
+    # chrome (title + the footer rule + footer) plus at least one body row.
+    # DERIVED from tui::Screen, never restated: the footer rule added a chrome
+    # row in 2026-08, and a literal 3 here would have gone on promising a body
+    # row that no longer existed.
+    my $max_alert = (defined $rows ? $rows : 0) - tui::Screen::chrome_rows() - 1;
     $max_alert = 0 if $max_alert < 0;
     if (@msgs > $max_alert) {
         @msgs = $max_alert > 0 ? @msgs[0 .. $max_alert - 1] : ();
@@ -1421,13 +1425,14 @@ sub _fixed_region_height {
     my $band_rows = tui::Layout::place($panels, $cols);
 
     # $body_height (only when $rows was supplied) -- the SAME formula
-    # activity_capacity/compose_frame use: rows - 2 (title+footer) - alert
-    # banner rows. Mirrors tui::Screen::compose's own `$body_height = $rows
-    # - 2; ... $body_height -= scalar(@banner_cells);`.
+    # activity_capacity/compose_frame use: rows - chrome (title + footer rule +
+    # footer) - alert banner rows. Mirrors tui::Screen::compose's own
+    # `$body_height = $rows - chrome_rows(); ... -= scalar(@banner_cells);`,
+    # and reads the constant from there rather than restating it.
     my $body_height;
     if (defined $rows && !ref($rows) && $rows =~ /^-?\d+(?:\.\d+)?$/) {
         my $alerts = scalar(_alert_msgs($state, $rows));
-        $body_height = int($rows) - 2 - $alerts;
+        $body_height = int($rows) - tui::Screen::chrome_rows() - $alerts;
     }
 
     # Which band-row carries the 'Recent activity' (flex) panel -- mirrors
@@ -1554,7 +1559,12 @@ sub activity_capacity {
         # that change and would otherwise be an off-by-one between this
         # predictor and the renderer. t/40's AC-12 agreement check caught it on
         # the first run, as it is designed to.
-        my $cap = int($rows) - 1 - 1;             # footer row, and the panel's own title
+        # chrome_rows() - 1: the side column starts at row 0, so it pays the
+        # chrome MINUS the title row (which occupies the main region only). The
+        # footer rule is NOT one of the rows it escapes -- it spans the whole
+        # terminal, below both regions -- so it has to be in this subtraction or
+        # capacity over-reports by one and the scroll runs off the screen.
+        my $cap = int($rows) - (tui::Screen::chrome_rows() - 1) - 1;   # chrome below row 0, and the panel's own title
         return $cap > 0 ? $cap : 0;
     }
 
@@ -1564,7 +1574,7 @@ sub activity_capacity {
     # otherwise warn under `use warnings` on the bare `< 0` comparison.
     $rows = 0 if !defined $rows || ref($rows) || $rows !~ /^-?\d+(?:\.\d+)?$/ || $rows < 0;
     my $alerts = scalar(_alert_msgs($state, $rows));
-    my $body_h = $rows - 2 - $alerts;             # 2 = title + footer
+    my $body_h = $rows - tui::Screen::chrome_rows() - $alerts;   # title + footer rule + footer
     my $fixed  = _fixed_region_height($state, $cols, $rows);
     my $cap = $body_h - $fixed - 1;               # -1 = Activity panel title
 

@@ -1387,7 +1387,12 @@ SKIP: {
         panels  => [ { title => 'P', lines => ['body line'] } ],
         footer  => 'F',
     };
-    my $tight  = tui::Screen::compose($many_banners_screen, 4, 40);
+    # TWO BODY ROWS PLUS THE CHROME, not the literal 4 this was. Four meant
+    # "two body rows -- room for one banner and one panel row" when the chrome
+    # was title + footer; the footer rule made it three rows in 2026-08, and a
+    # remembered 4 left no room for a banner at all, which is not what this
+    # assertion is about.
+    my $tight  = tui::Screen::compose($many_banners_screen, 2 + tui::Screen::chrome_rows(), 40);
     my $joined = join("\n", map { $_->{text} } @$tight);
     like($joined, qr/first \(kept\)/, 'AC-S2: banners -- the most-important-first banner survives when space is tight');
     unlike($joined, qr/third \(dropped\)/, 'AC-S2: banners -- a surplus banner is dropped from the END of the list first');

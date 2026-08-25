@@ -593,7 +593,12 @@ sub _output_min_cols {
 sub _output_height {
     my ($rows, $nb, $ns) = @_;
     my $r = _int($rows, 24);
-    my $h = $r - 2 - _int($nb, 0) - (_int($ns, 0) + 2) - 1;
+    # chrome_rows(), not the literal 2 it was: the chrome is title + the footer
+    # rule + footer since 2026-08. Read from tui::Screen -- being one row
+    # optimistic here is not cosmetic, it makes tui::Screen clip the panel from
+    # the top and drop the NEWEST output line, which is the one thing this
+    # function exists to protect.
+    my $h = $r - tui::Screen::chrome_rows() - _int($nb, 0) - (_int($ns, 0) + 2) - 1;
     return $h < 1 ? 1 : $h;
 }
 
@@ -1226,7 +1231,8 @@ sub list_screen {
     my $items   = _ls_items($ls);
     my $total   = scalar @$items;
 
-    my $lh = $r - 2 - scalar(@$banners) - 1 - 1;
+    # chrome_rows(), not the literal 2 it was -- see _output_height above.
+    my $lh = $r - tui::Screen::chrome_rows() - scalar(@$banners) - 1 - 1;
     $lh = 0 if $lh < 0;
     my $vp = tui::Screen::viewport($total, $lh, $ls->{cursor});
 

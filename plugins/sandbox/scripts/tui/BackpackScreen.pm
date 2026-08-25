@@ -518,7 +518,10 @@ sub list_height {
     $cols      = int($cols);
     $n_banners = int($n_banners);
 
-    my $body = $rows_n - 2 - $n_banners;
+    # chrome_rows(), not the literal 2 it was: since 2026-08 the chrome is
+    # title + the footer rule + footer. Read from tui::Screen rather than
+    # restated, or this predictor and the composer disagree by a row.
+    my $body = $rows_n - tui::Screen::chrome_rows() - $n_banners;
     my $det  = (tui::Layout::arrangement($cols) eq 'two-column') ? 0
              : ($has_detail ? 1 + DETAIL_ROWS() : 0);
     my $h = $body - 1 - 1 - $det;

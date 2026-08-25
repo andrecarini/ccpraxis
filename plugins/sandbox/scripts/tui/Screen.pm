@@ -88,6 +88,25 @@ use constant WRAP_CONTINUATION_INDENT => 2;
 use constant BODY_INDENT => 0;
 
 # ---------------------------------------------------------------------------
+# THE FOOTER GETS A BORDER ABOVE IT (operator request, 2026-08-25), and it is
+# the FIRST horizontal rule in this layout that is not a panel title.
+#
+# Every other rule on the screen is a panel's title line doing double duty as
+# that panel's top border, which is why the grid costs zero extra rows and why
+# there are no bottom borders anywhere. The footer has no panel above it to
+# borrow a title rule from, so this one is constructed rather than reused -- and
+# unlike every other rule it COSTS A ROW. That row comes out of the body, once,
+# via chrome_rows() below; it is not a per-panel cost and it does not scale.
+#
+# chrome_rows() is PUBLIC because Dashboard::activity_capacity and
+# Dashboard::_fixed_region_height independently predict the body height, and
+# they must agree with compose() exactly or the activity scroll arithmetic runs
+# off a number the screen never had. Those call sites read this; they do not
+# restate it.
+use constant FOOTER_RULE_ROWS => 1;
+sub chrome_rows { 2 + FOOTER_RULE_ROWS() }      # title, the footer rule, footer
+
+# ---------------------------------------------------------------------------
 # t03-activity-column -- the side column's two constants.
 #
 # ACTIVITY_COLUMN_COLS is DERIVED and the derivation is written here so it can
@@ -476,6 +495,78 @@ sub _side_border_cell {
     return { text => $glyph, role => 'rule', spans => \@spans };
 }
 
+# _footer_rule_cell($above_cell, $cols) -> a ONE-row, $cols-wide horizontal rule
+# to sit between the body and the footer, with a tee-up wherever a vertical
+# border in the row above terminates on it. PRIVATE.
+#
+# Junctions are DERIVED FROM THE RENDERED ROW ABOVE, exactly as
+# _side_border_cell derives its own glyph from the text meeting it -- the body
+# is composed by machinery (bands, side column, banners) that does not report
+# where its verticals ended up, and re-deriving that would be a second model of
+# the layout to keep in step with the first. Reading the row is the only source
+# that cannot disagree with what is actually on screen.
+#
+# "A vertical terminates here" means the glyph above carries a stroke going
+# DOWN -- a plain vertical, a tee-down, a left/right tee, a cross, or a top
+# corner. A glyph that has no downward stroke (a plain horizontal, a tee-up, a
+# bottom corner) meets nothing and gets ordinary rule.
+sub _footer_rule_cell {
+    my ($above, $cols) = @_;
+    $cols = 0 if !defined $cols || ref($cols) || $cols !~ /^-?\d+(?:\.\d+)?$/;
+    $cols = int($cols);
+    return tui::Frame::make_cell('', 'text.primary', $cols) if $cols < 1;
+
+    my $h = Theme::glyph('rule.h');
+    # No rule glyph at all (ASCII-only terminal with the table stripped): a
+    # blank row is the honest degradation -- the same "nothing is drawn" the
+    # rest of this file falls back to, never a row of hyphens nobody asked for.
+    return tui::Frame::make_cell('', 'text.primary', $cols)
+        if !defined $h || !length $h;
+
+    my $tee_u = Theme::glyph('tee.up');
+    $tee_u = $h if !defined $tee_u || !length $tee_u;
+
+    my %down = map { (defined($_) && length($_)) ? ($_ => 1) : () }
+               ( Theme::glyph('rule.v'),    Theme::glyph('tee.down'),
+                 Theme::glyph('tee.left'),  Theme::glyph('tee.right'),
+                 Theme::glyph('cross'),
+                 Theme::glyph('corner.tl'), Theme::glyph('corner.tr') );
+
+    my $txt = (ref($above) eq 'HASH' && defined $above->{text}) ? $above->{text} : '';
+    my %junction;                       # column -> 1
+    if (length $txt) {
+        my $dec = $txt;
+        # Same decode heuristic tui::Frame uses: a string already carrying a
+        # codepoint above 0xFF is decoded; anything else is UTF-8 bytes.
+        if ($dec !~ /[^\x00-\xFF]/) { utf8::decode($dec) or $dec = $txt }
+        my $col = 0;
+        for my $ch (split //, $dec) {
+            last if $col >= $cols;
+            my $bytes = $ch;
+            utf8::encode($bytes) if utf8::is_utf8($bytes);
+            $junction{$col} = 1 if $down{$bytes};
+            # ASCII fast path, for the same reason tui::Layout::display_width
+            # has one: this walks a whole row on every composed frame, and the
+            # row is mostly ASCII text that is trivially one column wide.
+            $col += ($ch =~ /\A[\x20-\x7E]\z/) ? 1 : tui::Layout::display_width($bytes);
+        }
+    }
+
+    my @spans;
+    my $run = '';
+    for my $c (0 .. $cols - 1) {
+        if ($junction{$c}) {
+            push @spans, { text => $run, role => 'rule' } if length $run;
+            $run = '';
+            push @spans, { text => $tee_u, role => 'rule' };
+        } else {
+            $run .= $h;
+        }
+    }
+    push @spans, { text => $run, role => 'rule' } if length $run;
+    return tui::Frame::make_cell(\@spans, 'rule', $cols);
+}
+
 sub _place_and_render {
     my ($panels, $cols, $body_height) = @_;
     my @out;
@@ -622,7 +713,7 @@ sub compose {
     my $footer_cell = tui::Frame::make_cell($screen->{footer}, $footer_role, $cols);
     return [ $title_cell, $footer_cell ] if $rows == 2;
 
-    my $body_height = $rows - 2;
+    my $body_height = $rows - chrome_rows();
 
     # --- t03-activity-column: reserve the rightmost columns, full body height ---
     #
@@ -752,7 +843,10 @@ sub compose {
 
     # No side column: the banner cells and the main cells stack, exactly as
     # before, and every row is $cols wide because $main_cols == $cols.
-    return [ $title_cell, @banner_cells, @main_cells, $footer_cell ] if !$side_panel;
+    if (!$side_panel) {
+        my @above = ($title_cell, @banner_cells, @main_cells);
+        return [ @above, _footer_rule_cell($above[-1], $cols), $footer_cell ];
+    }
 
     # With a side column, the main rows ARE the left region on their own --
     # the banners have moved into the side column (see the note where
@@ -817,7 +911,7 @@ sub compose {
             : _join_row_cells($left_all[$_], $side[$_])
     } 0 .. $region_h - 1;
 
-    return [ @body_cells, $footer_cell ];
+    return [ @body_cells, _footer_rule_cell($body_cells[-1], $cols), $footer_cell ];
 }
 
 # viewport($total, $height, $cursor) -> \%vp -- pure integer scrolling
