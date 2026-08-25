@@ -6789,8 +6789,45 @@ sub _hot_reload_compiles {
         open(STDOUT, '>&', $saved_out);
         open(STDERR, '>&', $saved_err);
     }
+    # RETURN THE REASON, NOT JUST THE VERDICT. This used to unlink the capture
+    # and return a bare 0/1, so the banner could say "does not compile" and
+    # nothing -- not the operator, not a later reader of the code -- could get
+    # any further. That happened for real: three modules were refused on a live
+    # run while the same files compiled cleanly on the host under the same
+    # command, and the one thing that would have settled it had already been
+    # deleted.
+    #
+    # Same shape as the sampler that reopened STDERR on /dev/null, fixed earlier
+    # today. Twice in one session is enough to state the rule: a gate that
+    # refuses must keep the refusal's reason. `perl -c` prints exactly the line
+    # that matters ("Can't locate X.pm in @INC ...", "syntax error at ... line
+    # N"), and it costs one file read on a path that only runs when something is
+    # already wrong.
+    my $out = '';
+    if (open my $rfh, '<', $tmp) { local $/; $out = <$rfh> // ''; close $rfh; }
     unlink $tmp;
-    return ($rc == 0) ? 1 : 0;
+    return 1 if $rc == 0;
+
+    # First line that is not the "syntax OK" chatter, sanitised to one printable
+    # line and capped -- a banner row is not a log, and this string is going
+    # into a fixed-width panel.
+    my $why;
+    for my $l (split /\r?\n/, $out) {
+        $l =~ s/^\s+//; $l =~ s/\s+$//;
+        next unless length $l;
+        next if $l =~ /syntax OK\z/;
+        $why = $l;
+        last;
+    }
+    if (defined $why) {
+        $why =~ s/[^\x20-\x7e]/ /g;
+        $why = substr($why, 0, 140) if length($why) > 140;
+    }
+    # rc == -1 means the subprocess never ran (a dup or spawn failure), which is
+    # NOT a compile error and must not be reported as one.
+    $why = ($rc < 0 ? "could not run perl -c (rc=$rc)" : "perl -c exited $rc with no output")
+        if !defined $why;
+    return (0, $why);
 }
 
 # _hot_reload_snapshot($pkg) / _hot_reload_restore($pkg, \%saved)
@@ -6838,8 +6875,11 @@ sub _hot_reload {
 
     my (@reloaded, @skipped, @rolled_back);
     for my $m (@$todo) {
-        unless (_hot_reload_compiles($m->{path}, $libdir)) {
-            push @skipped, { name => $m->{name}, why => 'does not compile; left untouched' };
+        my ($compiles, $why) = _hot_reload_compiles($m->{path}, $libdir);
+        unless ($compiles) {
+            push @skipped, { name => $m->{name},
+                             why  => 'left untouched - '
+                                   . (defined $why && length $why ? $why : 'does not compile') };
             next;
         }
         my $saved = _hot_reload_snapshot($m->{name});

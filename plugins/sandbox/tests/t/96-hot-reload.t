@@ -209,6 +209,27 @@ ok($OK, 'HotReload.pm and tui/DashboardScreen.pm load') or BAIL_OUT("require fai
     is($skip->{ok}, 1, 'AC9: a SKIP is not a failure -- nothing was touched');
     like($skip->{headline}, qr/would not compile/, 'AC9: but it is reported');
 
+    # A REFUSAL MUST CARRY ITS REASON to the operator, not just its verdict.
+    #
+    # Observed on a live run: three modules were refused with
+    # "does not compile; left untouched" while the very same files compiled
+    # cleanly on the host under the identical `perl -c -I <libdir> <path>`. The
+    # gate had already unlinked its capture, so nothing could get further -- not
+    # the operator reading the banner, not me reading the code afterwards.
+    #
+    # Same shape as the sampler that sent its child's STDERR to /dev/null,
+    # fixed earlier the same day. `perl -c` prints exactly the line that
+    # settles it ("Can't locate X.pm in @INC", "syntax error at ... line N").
+    my $why = q{Can't locate Theme.pm in @INC (@INC contains: /nope)};
+    my $detailed = HotReload::summarise({ skipped => [ { name => 'tui::Frame',
+                                                        why  => "left untouched - $why" } ] });
+    ok((grep { /Can't locate Theme\.pm/ } @{ $detailed->{notes} }),
+       'AC9b: the skip note carries the COMPILER\'S OWN reason through to the banner, so a '
+     . 'refusal is actionable instead of being a dead end')
+        or diag('notes: ' . join(' | ', @{ $detailed->{notes} || [] }));
+    ok((grep { /tui::Frame/ } @{ $detailed->{notes} }),
+       'AC9b: ...alongside the module it refused');
+
     for my $b (undef, 'x', [], { reloaded => 'not-an-array' }) {
         my $g = eval { HotReload::summarise($b) };
         is(ref($g), 'HASH', 'AC10: malformed input yields a summary rather than dying') or diag("  died: $@");
