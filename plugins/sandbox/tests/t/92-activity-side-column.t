@@ -188,8 +188,17 @@ for my $cols (@WIDE) {
             my $at = index(plain($f->[$idx]{text}), 'Recent activity');
             cmp_ok($at, '>=', $cols - $sw,
                 "AC7: cols=$cols rows=$rows -- it starts inside the reserved rightmost $sw columns");
-            is($idx, 1,
-                "AC8: cols=$cols rows=$rows -- and it starts on the FIRST body row, immediately under the screen title");
+            # AC8 RE-POINTED 2026-08-25. This asserted index 1 -- the first row
+            # BELOW the screen title -- because the title used to span the whole
+            # terminal. It no longer does: the header occupies the main region
+            # only and the side column runs from row 0, so Activity starts at
+            # the very top of the viewport and gains a row. That was the point
+            # of the change (operator: "I thought Recent Activity would go to
+            # the top of the viewport instead of stretching that banner
+            # throughout the entire terminal"), and index 0 is the assertion
+            # that says it happened.
+            is($idx, 0,
+                "AC8: cols=$cols rows=$rows -- and it starts at the TOP of the viewport, beside the header rather than below it");
         }
 
         # AC8 -- the bottom body row also carries column content. With 40
@@ -298,7 +307,13 @@ for my $cols (@WIDE, @NARROW) {
         next unless $sw > 0;
 
         my $f = Dashboard::compose_frame(state(200), $rows, $cols);
-        my $rendered = scalar grep { substr(plain($_->{text}), -$sw) =~ /\S/ } @{$f}[ 1 .. $#$f - 1 ];
+        # FROM ROW 0, not row 1. The slice used to skip the first row because
+        # the screen title spanned the full terminal and the side column began
+        # beneath it. The header now occupies the main region only and the
+        # column runs from the top, so row 0 carries the column's own title --
+        # excluding it counted one row fewer than the renderer draws and made
+        # the predictor look wrong when it was right.
+        my $rendered = scalar grep { substr(plain($_->{text}), -$sw) =~ /\S/ } @{$f}[ 0 .. $#$f - 1 ];
         # -1 for the panel's own title row, which capacity excludes.
         is($cap, $rendered - 1,
             "AC-capacity: cols=$cols rows=$rows -- reported capacity ($cap) matches the rows the column actually renders");

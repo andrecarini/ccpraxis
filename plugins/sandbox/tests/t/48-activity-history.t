@@ -669,7 +669,15 @@ sub src_like {
     like($line, qr/"type":"smoke"/, 'AC21 smoke: format_event still produces the expected shape');
     my $ev = Dashboard::recent_events([$line], 5);
     is(ref($ev), 'ARRAY', 'AC21 smoke: recent_events still returns an arrayref');
-    is(Dashboard::activity_row_width(80), 78, 'AC21 smoke: activity_row_width(80) is still 78 (unchanged arithmetic)');
+    # DERIVED, not pinned at 78. This asserted "$cols - 2" for the two-space
+    # panel body indent; that indent is now tui::Screen::BODY_INDENT and is 0
+    # (operator request, 2026-08-25 -- every panel has a real left edge now, so
+    # the indent was two columns of nothing on every row). Re-deriving from the
+    # renderer's own constant keeps AC21 a smoke test of the ARITHMETIC rather
+    # than of a number that moves whenever the layout does.
+    require tui::Screen;
+    is(Dashboard::activity_row_width(80), 80 - tui::Screen::BODY_INDENT(),
+        'AC21 smoke: activity_row_width(80) is 80 minus the panel body indent');
     my ($role, $glyph) = Dashboard::event_style('container_start', undef, undef);
     ok(defined($role) && defined($glyph), 'AC21 smoke: event_style still returns (role, glyph)');
 }

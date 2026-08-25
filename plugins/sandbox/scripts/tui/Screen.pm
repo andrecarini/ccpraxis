@@ -72,6 +72,21 @@ sub _ROLE_ATTENTION { return 'state.warn'; }
 # continuation line.
 use constant WRAP_CONTINUATION_INDENT => 2;
 
+# BODY_INDENT -- columns between a panel's left edge and its content.
+#
+# Was 2, is 0 (operator request, 2026-08-25). The indent predates the panel
+# grid: with no left edge of its own, a panel needed the indent to tie its rows
+# to the title above them. Now every panel has an edge -- a border, or the
+# viewport -- and the indent is two columns of nothing on every row of every
+# panel, multiplied by however many panels share a band row.
+#
+# Named rather than inlined because _render_panel's wrap paths must agree with
+# it: a continuation line's hanging indent is measured from where the row's
+# text begins, so this number and that one are a single decision. They used to
+# be stated in two places (a literal '  ' and a hard-coded `+ 2`), which is
+# exactly the kind of pair that drifts.
+use constant BODY_INDENT => 0;
+
 # ---------------------------------------------------------------------------
 # t03-activity-column -- the side column's two constants.
 #
@@ -183,7 +198,24 @@ sub _render_panel {
         # for three lines per activity row, not three rows of activity.
         my $cap = (ref($panel) eq 'HASH') ? $panel->{wrap_cap} : undef;
         my $brk = (ref($panel) eq 'HASH') ? $panel->{wrap_break} : undef;
-        my $spans = [ { text => '  ', role => 'text.primary' }, @elems ];
+        # NO LEFT PADDING INSIDE A PANEL (operator request, 2026-08-25).
+        #
+        # Every body row used to open with a two-column indent, from back when
+        # a panel had no left edge of its own and the indent was what visually
+        # tied a row to the title above it. The panel grid gives every panel an
+        # actual edge -- a border, or the viewport -- so the indent became two
+        # columns of nothing between that edge and the content, on every row of
+        # every panel. On a three-panel row that is six columns of the terminal
+        # spent saying nothing.
+        #
+        # BODY_INDENT rather than a bare literal because the wrap paths below
+        # have to agree with it: a continuation line's hanging indent is
+        # measured from where the row's text starts, so the two numbers are one
+        # decision, and they were previously stated twice (here as '  ', there
+        # as a hard-coded + 2).
+        my $spans = BODY_INDENT() > 0
+                  ? [ { text => (' ' x BODY_INDENT()), role => 'text.primary' }, @elems ]
+                  : [ @elems ];
 
         my $cells;
         if (defined $brk && !ref($brk) && $brk eq 'char') {
@@ -204,7 +236,7 @@ sub _render_panel {
                         && !ref($panel->{wrap_indent})
                         && $panel->{wrap_indent} =~ /^\d+$/)
                      ? $panel->{wrap_indent} : WRAP_CONTINUATION_INDENT();
-            $cells = tui::Frame::wrap_chars($spans, $role, $content_w, $hang + 2, $cap);
+            $cells = tui::Frame::wrap_chars($spans, $role, $content_w, $hang + BODY_INDENT(), $cap);
         } else {
             $cells = tui::Frame::wrap_capped(
                 $spans, $role, $content_w, WRAP_CONTINUATION_INDENT(), $cap
@@ -417,14 +449,23 @@ sub _side_border_cell {
     my $left  = $from_left ? 1 : 0;
     my $right = $to_right  ? 1 : 0;
 
-    my $glyph;
-    if    ($up && $down && $left && $right) { $glyph = Theme::glyph('cross')     }
-    elsif ($down && $left && $right)        { $glyph = Theme::glyph('tee.down')  }
-    elsif ($up   && $left && $right)        { $glyph = Theme::glyph('tee.up')    }
-    elsif ($up && $down && $left)           { $glyph = Theme::glyph('tee.left')  }
-    elsif ($up && $down && $right)          { $glyph = Theme::glyph('tee.right') }
-    elsif ($left && $right)                 { $glyph = Theme::glyph('rule.h')    }
-    else                                    { $glyph = $sep                      }
+    # THE COMPLETE TABLE, keyed on which of the four directions carry a line.
+    # Written out rather than reasoned about in a chain of elsifs: the first
+    # version handled the six cases that occur in the middle of a frame and
+    # silently fell through to a plain vertical for the CORNERS, which is how
+    # the last body row came to draw a bare vertical where a rule arrives from
+    # the left and nothing continues below -- visibly wrong the moment a panel
+    # title landed on that row.
+    my %TABLE = (
+        'UDLR' => 'cross',
+        'UDL'  => 'tee.left',    'UDR' => 'tee.right',
+        'DLR'  => 'tee.down',    'ULR' => 'tee.up',
+        'UL'   => 'corner.br',   'UR'  => 'corner.bl',
+        'DL'   => 'corner.tr',   'DR'  => 'corner.tl',
+        'UD'   => 'rule.v',      'LR'  => 'rule.h',
+    );
+    my $key = ($up ? 'U' : '') . ($down ? 'D' : '') . ($left ? 'L' : '') . ($right ? 'R' : '');
+    my $glyph = defined $TABLE{$key} ? Theme::glyph($TABLE{$key}) : $sep;
     $glyph = $sep if !defined $glyph || !length $glyph;
 
     my @spans = ( { text => $glyph, role => 'rule' } );
@@ -733,29 +774,46 @@ sub compose {
     # reaches first; the activity panel renders into whatever is left, which is
     # why its budget is reduced here rather than it being padded afterwards --
     # padding would give it rows it could not use and then clip them.
-    my $side_body_h = $body_height - scalar(@banner_cells);
+    # THE SIDE COLUMN STARTS AT ROW 0 (operator request, 2026-08-25).
+    #
+    # The header row -- "[<spin> running] ccpraxis sandbox - <project>" on the
+    # left, the container id on the right -- used to span the whole terminal.
+    # On a wide screen that is one full-width row carrying two short strings and
+    # a hundred-odd columns of nothing, sitting directly above a column that
+    # wants every row it can get. It now occupies the MAIN region only, and the
+    # side column runs alongside it, so Activity begins at the very top of the
+    # viewport and gains a row.
+    #
+    # This is not the same as deleting the header, which is what I first read
+    # the request as and declined: the status block still leads it, exactly as
+    # asked for earlier in the same batch. Only its WIDTH changes.
+    my $header_row = tui::Frame::make_cell($screen->{title}, $title_role, $main_cols);
+    my @left_all   = ($header_row, @left);
+    my $region_h   = $body_height + 1;      # the header row is now part of the join
+
+    my $side_body_h = $region_h - scalar(@banner_cells);
     $side_body_h = 0 if $side_body_h < 0;
     my @side = (@banner_cells, _render_panel($side_panel, $side_w - $side_bw, $side_body_h));
 
-    # BOTH REGIONS ARE PADDED TO $body_height BEFORE JOINING. That is what
-    # keeps "total rows == the terminal height" a structural property rather
-    # than arithmetic somebody has to get right at three call sites: neither
-    # region can run out first, so the join below is always a clean pairing.
-    while (@left < $body_height) { push @left, tui::Frame::make_cell('', 'text.primary', $main_cols) }
-    while (@side < $body_height) { push @side, tui::Frame::make_cell('', 'text.primary', $side_w - $side_bw) }
-    @left = @left[ 0 .. $body_height - 1 ] if @left > $body_height;
-    @side = @side[ 0 .. $body_height - 1 ] if @side > $body_height;
+    # BOTH REGIONS ARE PADDED TO $region_h BEFORE JOINING. That is what keeps
+    # "total rows == the terminal height" a structural property rather than
+    # arithmetic somebody has to get right at three call sites: neither region
+    # can run out first, so the join below is always a clean pairing.
+    while (@left_all < $region_h) { push @left_all, tui::Frame::make_cell('', 'text.primary', $main_cols) }
+    while (@side     < $region_h) { push @side,     tui::Frame::make_cell('', 'text.primary', $side_w - $side_bw) }
+    @left_all = @left_all[ 0 .. $region_h - 1 ] if @left_all > $region_h;
+    @side     = @side[     0 .. $region_h - 1 ] if @side     > $region_h;
 
     my @body_cells = map {
         $side_bw
-            ? _join_row_cells($left[$_],
-                              _side_border_cell($left[$_], $side[$_], $side_sep,
-                                                ($_ > 0), ($_ < $body_height - 1)),
+            ? _join_row_cells($left_all[$_],
+                              _side_border_cell($left_all[$_], $side[$_], $side_sep,
+                                                ($_ > 0), ($_ < $region_h - 1)),
                               $side[$_])
-            : _join_row_cells($left[$_], $side[$_])
-    } 0 .. $body_height - 1;
+            : _join_row_cells($left_all[$_], $side[$_])
+    } 0 .. $region_h - 1;
 
-    return [ $title_cell, @body_cells, $footer_cell ];
+    return [ @body_cells, $footer_cell ];
 }
 
 # viewport($total, $height, $cursor) -> \%vp -- pure integer scrolling

@@ -769,7 +769,11 @@ sub day_boundary_row {
 sub activity_row_width {
     my ($cols) = @_;
     return 0 if !defined $cols || $cols !~ /^-?\d+(?:\.\d+)?$/;
-    my $w = $cols - 2;
+    # DERIVED from the renderer's own constant, not a repeated literal. This
+    # was `$cols - 2` for the two-space body indent; that indent is now
+    # BODY_INDENT and is 0, and a hard-coded 2 here would have gone on
+    # reserving columns nothing occupies.
+    my $w = $cols - tui::Screen::BODY_INDENT();
     return $w < 0 ? 0 : $w;
 }
 
@@ -1478,8 +1482,18 @@ sub _fixed_region_height {
                 } else {
                     @elems = ($ln);
                 }
+                # MIRRORS tui::Screen::_render_panel's synthesized line, indent
+                # included. When BODY_INDENT went to 0 and this kept prepending
+                # two spaces, the predictor modelled rows two columns narrower
+                # than the renderer draws them, so the fixed region "wrapped"
+                # more than it does and Activity was under-allocated -- t/40's
+                # AC-12 agreement check caught it immediately, which is the
+                # whole reason that check exists.
+                my $indent = tui::Screen::BODY_INDENT();
                 my $cells = tui::Frame::wrap_line(
-                    [ { text => '  ', role => 'text.primary' }, @elems ],
+                    ($indent > 0
+                        ? [ { text => (' ' x $indent), role => 'text.primary' }, @elems ]
+                        : [ @elems ]),
                     $role, $w, tui::Screen::WRAP_CONTINUATION_INDENT()
                 );
                 $h += (ref($cells) eq 'ARRAY') ? scalar(@$cells) : 1;
@@ -1527,7 +1541,15 @@ sub activity_capacity {
     # than left to the fixed-region model that no longer describes it.
     $rows = 0 if !defined $rows || ref($rows) || $rows !~ /^-?\d+(?:\.\d+)?$/ || $rows < 0;
     if (tui::Screen::side_column_width($cols) > 0) {
-        my $cap = int($rows) - 2 - 1;             # title row, footer row, panel title
+        # THE COLUMN NOW STARTS AT ROW 0. It used to begin under the screen
+        # title, so its height was rows - title - footer - its own panel title.
+        # tui::Screen runs it from the very top of the viewport (the header
+        # occupies the main region only), so the title row is no longer
+        # subtracted -- one more row of events, which is the entire point of
+        # that change and would otherwise be an off-by-one between this
+        # predictor and the renderer. t/40's AC-12 agreement check caught it on
+        # the first run, as it is designed to.
+        my $cap = int($rows) - 1 - 1;             # footer row, and the panel's own title
         return $cap > 0 ? $cap : 0;
     }
 

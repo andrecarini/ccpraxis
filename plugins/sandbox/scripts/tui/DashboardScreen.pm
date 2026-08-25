@@ -1598,8 +1598,23 @@ sub screen {
     $cols = 1 if !defined($cols) || ref($cols) || $cols !~ /^-?\d+(?:\.\d+)?$/ || int($cols) < 1;
     $cols = int($cols);
 
+    # THE HEADER IS BUILT AT THE MAIN REGION'S WIDTH, not the terminal's.
+    #
+    # tui::Screen now runs the side column from row 0, so the header occupies
+    # the main region alone (operator request, 2026-08-25: Activity should
+    # start at the top rather than sit under a full-width band carrying two
+    # short strings). header_spans RIGHT-JUSTIFIES the container id, so it has
+    # to be told the real width -- composing at $cols and letting Screen clip
+    # to the narrower region silently ate the container id off the right-hand
+    # end, which is exactly the element that justification exists to place.
+    #
+    # side_column_width() is public and pure, and returns 0 below the
+    # breakpoint, so on a narrow terminal this is $cols unchanged.
+    my $header_cols = $cols - tui::Screen::side_column_width($cols);
+    $header_cols = 1 if $header_cols < 1;
+
     return {
-        title       => header_spans($state, $cols),
+        title       => header_spans($state, $header_cols),
         title_role  => 'accent',
         banners     => _banner_lines($state),
         banner_role => 'state.crit',

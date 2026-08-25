@@ -84,10 +84,20 @@ my $ALERT_RE  = qr/\Qlow on disk\E/;
     my $alert_row = row_of($with, $ALERT_RE);
     ok(defined $alert_row, 'A: the alert text is on screen');
 
-    # It is on the SAME row as a panel title, which can only be true if it is
-    # beside the grid rather than above it.
-    like($with->[$alert_row]{text}, $RUN_TITLE,
-        'A: the alert shares its row with the Run panel title -- i.e. it is BESIDE the grid, not above it');
+    # It shares its row with the MAIN REGION rather than owning a full-width
+    # row of its own -- which is what "beside the grid, not above it" means.
+    #
+    # RE-ANCHORED 2026-08-25: this used to require the row to carry the Run
+    # panel title, true while the side column began below the screen header.
+    # The header now occupies the main region only and the column runs from row
+    # 0, so the first alert row sits beside the HEADER. Pinning the Run title
+    # specifically was pinning where the column happened to start, not the
+    # property. What matters is that the row carries main-region content too.
+    my $side_w2   = tui::Screen::side_column_width($WIDE);
+    my $main_part = substr($with->[$alert_row]{text}, 0,
+                           length($with->[$alert_row]{text}) - $side_w2);
+    like($main_part, qr/\S/,
+        'A: the alert shares its row with main-region content -- it is BESIDE the grid, not above it');
 
     # And specifically in the right-hand region.
     my $side_w = tui::Screen::side_column_width($WIDE);
