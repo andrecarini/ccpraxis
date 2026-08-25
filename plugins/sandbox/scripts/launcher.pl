@@ -6552,7 +6552,32 @@ sub _resources_probes {
     my %p = (
         stats => sub { my $e = _probe_err_path('stats'); my $t = _timeout_prefix(5);
                        scalar `${t}$PODMAN stats --no-stream --format json 2>"$e"` },
-        df    => sub { my $e = _probe_err_path('df'); my $t = _timeout_prefix(5);
+        # `system df` GETS ITS OWN BUDGET, and the number is measured rather
+        # than picked (operator, 2026-08-26: the podman disk figures "sometimes
+        # they appear sometimes they disappear. Why?").
+        #
+        # Because a five-second budget was hopeless for it. Timed on the
+        # operator's host, three consecutive runs:
+        #
+        #     podman machine list   0.54s
+        #     podman stats          0.56s
+        #     podman system df      10.6s / 18.8s / 25.1s
+        #
+        # Its two siblings are twenty to fifty times faster. `system df` walks
+        # image, container and volume storage inside the WSL VM, so its cost
+        # tracks how much is stored, not how much is running -- which is exactly
+        # why it flapped: it landed only on the rounds it happened to finish
+        # inside five seconds, and pod_images/pod_containers/pod_volumes are the
+        # only three facts fed by one probe, so they vanished and returned as a
+        # group of three.
+        #
+        # 45s is comfortably above the worst reading, and this probe cannot
+        # block the render tick regardless -- it runs in the detached sampler
+        # (efdd028), whose whole purpose is that a slow probe costs latency
+        # nowhere. The failure mode a longer budget risks is a sampler round
+        # overrunning its own interval, which the snapshot's freshness accounting
+        # already reports honestly rather than hiding.
+        df    => sub { my $e = _probe_err_path('df'); my $t = _timeout_prefix(45);
                        scalar `${t}$PODMAN system df --format json 2>"$e"` },
     );
     return \%p unless $WINDOWS_FAMILY;
