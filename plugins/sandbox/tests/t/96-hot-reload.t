@@ -454,4 +454,66 @@ ok($OK, 'HotReload.pm and tui/DashboardScreen.pm load') or BAIL_OUT("require fai
         'AC19: Dashboard.pm still spawns nothing -- the reload driver did not become its first');
 }
 
+# ===========================================================================
+# AC20 -- the compile gate PRE-FLIGHTS the library path, and names the remedy.
+#
+# Every render module `use`s Theme, so a bad -I makes ALL of them fail with
+# "Can't locate Theme.pm in @INC" plus a path dump -- true, unactionable, and
+# indistinguishable from a genuine syntax error inside Theme itself.
+#
+# Observed live on 2026-08-25 (project indocs-bacen-scraper, launcher up 9h28m):
+# five modules refused at once, the @INC dump reading
+# `/c/Development/indocs/indocs-bacen-scraper/C`, i.e. a `C:/Users/...` path
+# joined onto the working directory. One cause: a launcher started BEFORE the
+# $0 normalisation fix, where abs_path() ran ahead of the backslash
+# translation so Cygwin took the drive-letter path as relative.
+#
+# The cruel part is that pressing [r] can NEVER fix it -- the fault is in the
+# running launcher.pl, which is precisely what hot reload cannot replace, and
+# the restart path compiles through this same gate. Only a relaunch works. So
+# the gate must SAY that rather than dumping @INC.
+{
+    my $L = do { local $/; open(my $fh, '<', "$SCRIPTS/launcher.pl") or die $!; <$fh> };
+    my ($sub) = $L =~ /(sub _hot_reload_compiles \{.*?\n\})/s;
+    ok(defined $sub, 'AC20: _hot_reload_compiles is extractable from launcher.pl');
+
+  SKIP: {
+        skip 'compile gate not extractable', 5 unless defined $sub;
+        require File::Temp;
+        my $ok = eval "package T96; use File::Temp; $sub 1";
+        ok($ok, 'AC20: the extracted gate evaluates') or diag($@);
+        skip 'gate did not evaluate', 4 unless $ok;
+
+        my $real = "$SCRIPTS/tui/Frame.pm";
+
+        # A libdir that does not exist at all -- the shape the live failure took.
+        my ($rc1, $why1) = T96::_hot_reload_compiles($real, '/no/such/libdir/anywhere');
+        is($rc1, 0, 'AC20: a non-existent library path is refused');
+        like($why1, qr/quit and re-run claude-sandbox/i,
+            'AC20: ...and the reason names the ONLY remedy that works, rather than dumping @INC');
+
+        # A libdir that exists but has no Theme.pm -- same class, different cause.
+        my $empty = File::Temp::tempdir(CLEANUP => 1);
+        my ($rc2, $why2) = T96::_hot_reload_compiles($real, $empty);
+        is($rc2, 0, 'AC20: a library path without Theme.pm is refused');
+        like($why2, qr/Theme\.pm/,
+            'AC20: ...and the reason names the module that is missing');
+    }
+}
+
+# POSITIVE CONTROL for AC20: with the REAL library path, a real module still
+# compiles. Without this, a gate that refused everything would pass every
+# assertion above.
+{
+    my $L = do { local $/; open(my $fh, '<', "$SCRIPTS/launcher.pl") or die $!; <$fh> };
+    my ($sub) = $L =~ /(sub _hot_reload_compiles \{.*?\n\})/s;
+  SKIP: {
+        skip 'compile gate not extractable', 1 unless defined $sub;
+        my $ok = eval "package T96b; use File::Temp; $sub 1";
+        skip 'gate did not evaluate', 1 unless $ok;
+        my ($rc) = T96b::_hot_reload_compiles("$SCRIPTS/tui/Frame.pm", $SCRIPTS);
+        is($rc, 1, 'AC20 CONTROL: the real library path still compiles a real module (the gate is not refusing everything)');
+    }
+}
+
 done_testing();

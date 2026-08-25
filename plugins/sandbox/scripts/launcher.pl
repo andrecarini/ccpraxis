@@ -6930,6 +6930,35 @@ sub _hot_reload_mtimes {
 sub _hot_reload_compiles {
     my ($path, $libdir) = @_;
     return 0 unless defined $path && -f $path;
+
+    # PRE-FLIGHT THE LIBDIR, AND NAME THE REMEDY WHEN IT IS WRONG.
+    #
+    # Every render module `use`s Theme, so a bad -I makes ALL of them fail with
+    # "Can't locate Theme.pm in @INC" plus a dump of paths -- which is true,
+    # unhelpful, and identical for a genuine syntax error in Theme itself.
+    # Observed live on 2026-08-25: five modules refused at once, the @INC dump
+    # showing `<cwd>/C:/Users/...`, i.e. a Windows path joined onto the working
+    # directory.
+    #
+    # That shape has one cause: a launcher started BEFORE the $0 normalisation
+    # fix. $SELF_PL was resolved with abs_path() before the backslashes were
+    # translated, so Cygwin's abs_path treated the drive-letter path as
+    # relative; _hot_reload_libdir inherits it. The running launcher.pl is
+    # exactly what hot reload cannot replace, so no amount of pressing [r] can
+    # ever fix it -- and the restart path compiles through this same gate, so
+    # that cannot either. The only way out is to quit and re-launch.
+    #
+    # Saying so costs two stats on a path that only runs when something is
+    # already wrong, and converts an unactionable @INC dump into the one
+    # sentence that resolves it.
+    if (defined $libdir && length $libdir && !-d $libdir) {
+        return (0, "library path is not a directory - this launcher predates the \$0 fix; "
+                 . "quit and re-run claude-sandbox ($libdir)");
+    }
+    if (defined $libdir && length $libdir && -d $libdir && !-e "$libdir/Theme.pm") {
+        return (0, "Theme.pm is not in the library path - this launcher predates the \$0 fix; "
+                 . "quit and re-run claude-sandbox ($libdir)");
+    }
     my ($tmp_fh, $tmp) = eval { File::Temp::tempfile('ccpraxis-hotreload-XXXXXX', TMPDIR => 1, UNLINK => 0) };
     return 0 unless defined $tmp;
     close $tmp_fh if $tmp_fh;
