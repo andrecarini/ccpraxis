@@ -405,6 +405,44 @@ sub spend_wait_spans {
     return [ { text => $text, role => $role } ];
 }
 
+# _first_probe_reason(\%errors) -> one short reason | undef.
+#
+# ONE reason, not all of them: this is a single row in a shared band, and when
+# every probe fails they almost always fail for the SAME reason (the podman
+# socket is down, the machine is not running). Listing six copies of it would
+# push the panel's real content off the screen to say one thing repeatedly.
+#
+# Deterministic pick -- the first probe key in sorted order that has a reason --
+# so the row does not flicker between equally-true messages tick to tick, which
+# is what an arbitrary hash order would do.
+sub _first_probe_reason {
+    my ($errs) = @_;
+    return undef unless ref($errs) eq 'HASH';
+
+    # A SPECIFIC REASON BEATS THE FALLBACK, whatever the key order.
+    #
+    # Resources::gather writes "probe produced no output" when it observed
+    # nothing and had nothing better; the sampler overwrites that with the
+    # command's own stderr where it captured some. Both end up in this hash, so
+    # picking by sorted key alone showed "probe produced no output" from
+    # `machine` while `stats` was sitting right there saying "Cannot connect to
+    # Podman socket" -- the generic answer winning purely on the alphabet.
+    #
+    # Within each tier the pick stays sorted-key deterministic, so the row does
+    # not flicker between equally-true messages from tick to tick.
+    my $generic = qr/\Aprobe produced no output\z/;
+    my $fallback;
+    for my $k (sort keys %$errs) {
+        my $v = $errs->{$k};
+        next unless defined $v && !ref $v && length $v;
+        $v =~ s/\s+/ /g;
+        $v = substr($v, 0, 90) if length($v) > 90;
+        return $v unless $v =~ $generic;
+        $fallback = $v unless defined $fallback;
+    }
+    return $fallback;
+}
+
 sub snapshot_spans {
     my ($res) = @_;
     return [] unless ref($res) eq 'HASH';
@@ -419,11 +457,35 @@ sub snapshot_spans {
         $text = 'undef (unrecognised)';
         $role = 'state.warn';
     } elsif ($state eq 'fresh') {
-        $text = 'fresh';
-        $text .= ', ' . fmt_duration($age) . ' old' if $age_numeric;
         my $n = scalar(grep { !defined $res->{$_} } @RESOURCE_FACT_KEYS);
-        $text .= ", " . count_of($n, "fact") . " unavailable" if $n > 0;
-        $role = 'state.ok';
+
+        # A SNAPSHOT WITH NOTHING IN IT IS NOT "fresh".
+        #
+        # This read "fresh, 24s old, 14 facts unavailable" in state.ok green on
+        # the operator's screen -- a healthy-looking row above an empty panel.
+        # It was accurate about the plumbing (a snapshot really had just been
+        # written) and useless about the machine (it contained no readings).
+        # "Broken", as reported.
+        #
+        # Freshness describes the FILE. What the operator needs is whether
+        # there is anything in it, and when there is not, why not -- which the
+        # sampler now records per probe (see _resources_probes: their stderr is
+        # captured rather than sent to /dev/null).
+        if ($n >= scalar(@RESOURCE_FACT_KEYS)) {
+            my $why = _first_probe_reason($res->{snapshot_probe_errors});
+            $text = 'no readings';
+            $text .= ' - ' . $why if defined $why && length $why;
+            $role = 'state.crit';
+        } else {
+            $text = 'fresh';
+            $text .= ', ' . fmt_duration($age) . ' old' if $age_numeric;
+            if ($n > 0) {
+                $text .= ", " . count_of($n, "fact") . " unavailable";
+                my $why = _first_probe_reason($res->{snapshot_probe_errors});
+                $text .= " - $why" if defined $why && length $why;
+            }
+            $role = 'state.ok';
+        }
     } elsif ($state eq 'stale') {
         $text = 'STALE - last written';
         $text .= ' ' . fmt_duration($age) . ' ago' if $age_numeric;

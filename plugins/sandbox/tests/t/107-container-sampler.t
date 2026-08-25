@@ -36,6 +36,7 @@
 use strict;
 use warnings;
 use FindBin qw($Bin);
+use lib "$Bin/../../scripts";
 use Test::More;
 use JSON::PP;
 use File::Temp qw(tempdir);
@@ -161,6 +162,80 @@ my $SRC = do { local (@ARGV, $/) = ($LAUNCHER); <> };
     like($code, qr/--container-sampler/, 'D: the child mode has a dispatch');
     like($code, qr/last unless kill\(0, \$owner_pid\)/,
         'D: the sampler loop self-exits when its owner goes away -- no orphan');
+}
+
+# ===========================================================================
+# E. THE RESOURCES PANEL SAYS WHY, not just how many.
+#
+# The operator's screen read "fresh, 24s old, 14 facts unavailable" in ok-green
+# above an empty panel, and called it broken -- correctly. It was accurate
+# about the plumbing (a snapshot really had just been written) and useless
+# about the machine (it held no readings), and there was no way to find out
+# why, because every probe command ended in 2>/dev/null.
+#
+# Three separate things had to be true for a reason to reach the screen, so
+# all three are asserted: the probe's stderr is captured, the reason survives
+# into the snapshot, and the panel renders it.
+# ===========================================================================
+{
+    require tui::DashboardScreen;
+    require tui::Frame;
+
+    my @KEYS = qw(machine_name machine_state ctr_mem_used vm_mem_total ctr_cpu_pct
+                  pod_images pod_containers pod_volumes host_ram_used host_ram_total
+                  host_disk_dev host_disk_used host_disk_total host_cpu_pct host_cores);
+    my %empty = (map { $_ => undef } @KEYS);
+    $empty{snapshot_state} = 'fresh';
+    $empty{snapshot_age}   = 24;
+
+    # A fresh snapshot with NOTHING in it must not read as healthy.
+    my $t = tui::Frame::spans_text(tui::DashboardScreen::snapshot_spans({ %empty }));
+    unlike($t, qr/\bfresh\b/,
+        'E: a snapshot with no readings at all does NOT report itself fresh -- freshness is a fact about the FILE');
+    like($t, qr/no readings/, 'E: it says there are none');
+    my $spans = tui::DashboardScreen::snapshot_spans({ %empty });
+    is($spans->[-1]{role}, 'state.crit',
+        'E: ...and is styled as a failure, not the ok-green it used to wear over an empty panel');
+
+    # The reason reaches the row.
+    my $why = tui::Frame::spans_text(tui::DashboardScreen::snapshot_spans({
+        %empty, snapshot_probe_errors => { stats => 'Cannot connect to Podman socket' } }));
+    like($why, qr/Cannot connect to Podman socket/,
+        'E: the probe reason is rendered, so the row is actionable rather than a symptom');
+
+    # A SPECIFIC reason outranks the generic fallback whatever the key order --
+    # 'machine' sorts before 'stats', and picking by key alone showed the
+    # useless one while the useful one sat beside it.
+    my $rank = tui::Frame::spans_text(tui::DashboardScreen::snapshot_spans({
+        %empty, snapshot_probe_errors => { machine => 'probe produced no output',
+                                           stats   => 'Cannot connect to Podman socket' } }));
+    like($rank, qr/Cannot connect/,
+        'E: a specific reason beats the generic fallback regardless of alphabetical order');
+
+    # Counter-fixture: a healthy snapshot still reads fresh, so E is not
+    # passing because everything now reports failure.
+    my %full = map { $_ => 1 } @KEYS;
+    my $ok = tui::Frame::spans_text(tui::DashboardScreen::snapshot_spans({
+        %full, snapshot_state => 'fresh', snapshot_age => 3 }));
+    like($ok, qr/fresh/, 'E CONTROL: a snapshot that HAS its readings still reports fresh');
+    unlike($ok, qr/no readings/, 'E CONTROL: ...and says nothing about missing ones');
+}
+
+# ===========================================================================
+# F. THE PROBES KEEP THEIR STDERR. Without this the reason above can never
+#    exist, however well the panel renders it.
+# ===========================================================================
+{
+    my ($probes) = $SRC =~ /(sub _resources_probes \{.*?\n\})/s;
+    ok(defined $probes, 'F: _resources_probes is extractable');
+  SKIP: {
+        skip 'not extractable', 2 unless defined $probes;
+        (my $code = $probes) =~ s/^\s*#.*$//mg;
+        unlike($code, qr/2>\/dev\/null/,
+            'F: no probe discards its stderr -- that is what made the failure undiagnosable');
+        like($code, qr/2>"\$e"/,
+            'F: each probe redirects stderr to its own file, so a reason is attributable to a probe');
+    }
 }
 
 done_testing();

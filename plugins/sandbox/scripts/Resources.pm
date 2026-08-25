@@ -646,29 +646,40 @@ sub snapshot_parse {
 # snapshot -- never to 'failed', because the record itself is well-formed and
 # the resources it names once existed.
 # Never dies, never warns. PUBLIC, pure, total.
+# _snapshot_probe_errors($parsed) -> \%errors (possibly empty, never undef).
+# Pulled out so every snapshot_status arm carries the reasons the same way --
+# the panel needs them most on the FRESH path, where the probes ran and still
+# produced nothing, which is the case that used to render as a bare
+# "N facts unavailable". PRIVATE, total.
+sub _snapshot_probe_errors {
+    my ($parsed) = @_;
+    return {} unless ref $parsed eq 'HASH' && ref $parsed->{probe_errors} eq 'HASH';
+    return $parsed->{probe_errors};
+}
+
 sub snapshot_status {
     my ($parsed, $now, $max_age) = @_;
     my $ma = _num($max_age);
     $ma = max_age() unless defined $ma && $ma > 0;
 
-    return { state => 'failed', age => undef, written_at => undef, resources => build({}) }
+    return { state => 'failed', age => undef, written_at => undef, resources => build({}) , probe_errors => _snapshot_probe_errors($parsed) }
         unless ref $parsed eq 'HASH';
 
     my $wa = _num($parsed->{written_at});
     my $n  = _num($now);
-    return { state => 'failed', age => undef, written_at => $parsed->{written_at}, resources => build({}) }
+    return { state => 'failed', age => undef, written_at => $parsed->{written_at}, resources => build({}) , probe_errors => _snapshot_probe_errors($parsed) }
         unless defined $wa && defined $n;
 
-    return { state => 'fresh', age => 0, written_at => $wa, resources => $parsed->{resources} }
+    return { state => 'fresh', age => 0, written_at => $wa, resources => $parsed->{resources} , probe_errors => _snapshot_probe_errors($parsed) }
         if $n < $wa && ($wa - $n) <= $ma;
 
-    return { state => 'stale', age => 0, written_at => $wa, resources => build({}) }
+    return { state => 'stale', age => 0, written_at => $wa, resources => build({}) , probe_errors => _snapshot_probe_errors($parsed) }
         if $n < $wa;
 
-    return { state => 'fresh', age => $n - $wa, written_at => $wa, resources => $parsed->{resources} }
+    return { state => 'fresh', age => $n - $wa, written_at => $wa, resources => $parsed->{resources} , probe_errors => _snapshot_probe_errors($parsed) }
         if ($n - $wa) <= $ma;
 
-    return { state => 'stale', age => $n - $wa, written_at => $wa, resources => build({}) };
+    return { state => 'stale', age => $n - $wa, written_at => $wa, resources => build({}) , probe_errors => _snapshot_probe_errors($parsed) };
 }
 
 # ---------------------------------------------------------------------------

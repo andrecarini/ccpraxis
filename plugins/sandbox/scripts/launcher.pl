@@ -6395,14 +6395,56 @@ sub _powershell_json {
 # launcher died. Bounding every podman probe here restores the once-per-round
 # gate to being an ACTUALLY-working gate: a round can no longer last forever,
 # so the loop always returns to the kill(0,...) check within a bounded time.
+# _probe_err_path($key) -> where THIS probe's stderr goes for this round.
+#
+# Per-probe, so a reason can be attributed to the probe that produced it. The
+# files live beside the sampler's own .err and are overwritten each round, so
+# they never grow.
+sub _probe_err_path { my ($k) = @_; return "$LAUNCHER_DIR/probe-$k.err" }
+
+# _probe_reason($key) -> the first meaningful stderr line from this probe's last
+# run, or undef. Read only when a probe produced nothing, so a healthy round
+# pays nothing.
+sub _probe_reason {
+    my ($key) = @_;
+    my $p = _probe_err_path($key);
+    return undef unless -f $p && -s $p;
+    open my $fh, '<', $p or return undef;
+    local $/;
+    my $raw = <$fh>;
+    close $fh;
+    return undef unless defined $raw && length $raw;
+    for my $l (split /\r?\n/, $raw) {
+        $l =~ s/^\s+//; $l =~ s/\s+$//;
+        next unless length $l;
+        return length($l) > 160 ? substr($l, 0, 160) : $l;
+    }
+    return undef;
+}
+
 sub _resources_probes {
+    # STDERR IS CAPTURED, NOT DISCARDED.
+    #
+    # Every one of these used to end in `2>/dev/null`. When all six probes
+    # returned nothing -- which is what the operator's host is doing right now,
+    # a snapshot with probes_absent EMPTY and all fifteen facts undef -- there
+    # was no way to find out why, because the reason had been thrown away
+    # INSIDE the command. The sampler's own .err file was 0 bytes for exactly
+    # that reason: nothing ever reached it.
+    #
+    # Redirecting per-probe keeps the reason attributable and keeps it OFF
+    # stdout, which still has to parse as JSON. Cost is one small file per probe
+    # per round, overwritten in place.
     my %p = (
-        stats => sub { scalar `timeout 5 $PODMAN stats --no-stream --format json 2>/dev/null` },
-        df    => sub { scalar `timeout 5 $PODMAN system df --format json 2>/dev/null` },
+        stats => sub { my $e = _probe_err_path('stats');
+                       scalar `timeout 5 $PODMAN stats --no-stream --format json 2>"$e"` },
+        df    => sub { my $e = _probe_err_path('df');
+                       scalar `timeout 5 $PODMAN system df --format json 2>"$e"` },
     );
     return \%p unless $WINDOWS_FAMILY;
     my %cmd = _ps_commands();
-    $p{machine}  = sub { scalar `timeout 5 $PODMAN machine list --format json 2>/dev/null` }
+    $p{machine}  = sub { my $e = _probe_err_path('machine');
+                         scalar `timeout 5 $PODMAN machine list --format json 2>"$e"` }
         if $PODMAN =~ /podman/i;
     # ONE powershell.exe per sample round, not three.
     #
@@ -6513,7 +6555,11 @@ sub _gather_resources {
     return { %{ $st->{resources} },
              snapshot_state      => $st->{state},      # 'fresh' | 'stale' | 'failed'
              snapshot_age        => $st->{age},
-             snapshot_written_at => $st->{written_at} };
+             snapshot_written_at => $st->{written_at},
+             # WHY each probe yielded nothing, when it did. The panel renders
+             # this instead of a bare "N facts unavailable", which named the
+             # symptom and left the operator with nowhere to go.
+             snapshot_probe_errors => $st->{probe_errors} };
 }
 
 # _resources_sampler_start($pidfile, $container) -> child pid | undef.
@@ -6750,13 +6796,26 @@ sub _resources_sampler_round {
     my $avail  = Resources::probe_availability($probes);
     my %probe_err;
     my $popts  = Resources::sampler_probe_opts($container, $device);
-    $popts->{errors} = %probe_err;
+    $popts->{errors} = \%probe_err;
     my $res    = Resources::gather($probes, $popts);
+
+    # UPGRADE "produced no output" TO WHAT THE COMMAND ACTUALLY SAID.
+    #
+    # Resources::gather can only report what it observed: the probe returned
+    # nothing. The command's own stderr says WHY -- "Cannot connect to Podman",
+    # "no such container", a timeout -- and _resources_probes now captures it
+    # per probe instead of discarding it into /dev/null. Merge it in where we
+    # have it, keeping gather's generic reason where we do not.
+    for my $k (keys %probe_err) {
+        my $why = _probe_reason($k);
+        $probe_err{$k} = $why if defined $why && length $why;
+    }
+
     my $snap   = Resources::snapshot_build($res, {
         now => $t0, pid => $$, container => $container,
         platform => ($WINDOWS_FAMILY ? 'windows' : 'posix'),
         probes_run => $avail->{present}, probes_absent => $avail->{absent},
-        probe_errors => %probe_err,
+        probe_errors => \%probe_err,
     });
     my $bytes = Resources::snapshot_encode($snap);
     _write_file_atomic($snapshot_path, $bytes) if defined $bytes;
