@@ -573,15 +573,34 @@ sub window_title {
     # trade the one place you can see "this exited an hour ago" for motion.
     #
     # So: running animates (motion is exactly what "running" means), and every
-    # attention state keeps its literal, glanceable character. The states that
+    # NOT-RUNNING state keeps its literal, glanceable character. The states that
     # need you to look are the states that stop moving, which is a stronger
     # signal than either half alone.
+    #
+    # `!` IS THE EXCEPTION, AND IT IS A REAL ONE (operator, 2026-08-26: "the
+    # title of the terminal replaces the spinner with a `!` in some occasions,
+    # when is that? when there's something that needs me? I wish the `!` would
+    # appear after the spinner instead of replacing it").
+    #
+    # They are right, and the distinction is that `!` is not a state of the
+    # CONTAINER. `x`, `-` and `?` all mean the container is not running -- there
+    # is nothing to animate, so the literal character replacing the spinner
+    # loses nothing. But needs-you fires while the container is running
+    # perfectly well; suppressing the spinner there threw away the "still alive"
+    # signal to say "and also, look at me". Both are true, so both are shown:
+    # the spinner keeps spinning and the `!` follows it.
+    #
+    # It follows rather than leads deliberately -- the lead character is the one
+    # guaranteed to survive taskbar truncation, and "is this thing alive" is the
+    # question that has to be answerable from a single glyph.
     my $char;
     if ($state->{container_gone})             { $char = '?'; }
     elsif ($role eq 'bad')                    { $char = 'x'; }
     elsif ($role eq 'warn')                   { $char = '-'; }
-    elsif ($role eq 'good' && $needs_you > 0) { $char = '!'; }
-    elsif ($role eq 'good')                   { $char = _title_spinner_char($state->{title_spinner_idx}); }
+    elsif ($role eq 'good') {
+        $char = _title_spinner_char($state->{title_spinner_idx});
+        $char .= '!' if $needs_you > 0;
+    }
     else                                      { $char = '?'; }
 
     # MINOR-3 (red-team step 6): a ref project_name reaches _decode_str's

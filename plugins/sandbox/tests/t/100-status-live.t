@@ -539,8 +539,30 @@ sub _run_live {
         is(eval { Dashboard::window_title({ project_name => 'demo', status => $status }) }, 'x demo' . " - ccpraxis sandbox",
             "AC-8: window_title(status=$status) eq 'x demo - ccpraxis sandbox' (exited family)");
     }
-    is(eval { Dashboard::window_title({ project_name => 'demo', status => 'running', needs_you => 1 }) }, '! demo' . " - ccpraxis sandbox",
-        "AC-8: window_title(running, needs_you=1) eq '! demo - ccpraxis sandbox'");
+    # AC-8 RE-POINTED 2026-08-26. `!` used to REPLACE the spinner; the operator
+    # asked for it to follow instead ("I wish the `!` would appear after the
+    # spinner instead of replacing it"), and the distinction is real: `x`, `-`
+    # and `?` all mean the container is NOT running, so there is nothing to
+    # animate and the literal character loses nothing. needs-you fires while the
+    # container is running perfectly well, so suppressing the spinner threw away
+    # the "still alive" signal to say "and also, look at me". Both are true now.
+    #
+    # Asserted with a PINNED spinner index so this does not depend on a clock,
+    # and split into the two claims that matter: the lead is still the spinner
+    # (taskbar truncation keeps the first glyph, and "is this alive" has to
+    # survive it), and the `!` follows it.
+    {
+        my %needy = (project_name => 'demo', status => 'running', needs_you => 1, title_spinner_idx => 0);
+        my $spin  = eval { tui::DashboardScreen::_spinner_frame(0) };
+        my $got   = eval { Dashboard::window_title(\%needy) };
+        is($got, "$spin! demo - ccpraxis sandbox",
+            'AC-8: window_title(running, needs_you=1) leads with the SPINNER and appends "!" -- '
+          . 'both facts, not one replacing the other');
+        my $calm = eval { Dashboard::window_title({ %needy, needs_you => 0 }) };
+        is($calm, "$spin demo - ccpraxis sandbox",
+            'AC-8: ...and with nothing needed the same frame renders WITHOUT the "!" -- the '
+          . 'marker tracks needs_you, not the spinner');
+    }
     is(eval { Dashboard::window_title({ project_name => 'demo', container_gone => 1 }) }, '? demo' . " - ccpraxis sandbox",
         "AC-8: window_title(container_gone=1) eq '? demo - ccpraxis sandbox'");
 
