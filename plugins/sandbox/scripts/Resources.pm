@@ -32,6 +32,7 @@ my @STRUCT_KEYS = qw(
     ctr_mem_used vm_mem_total ctr_cpu_pct
     pod_images pod_containers pod_volumes
     host_ram_used host_ram_total
+    host_swap_used host_swap_total
     host_disk_dev host_disk_used host_disk_total
     host_cpu_pct host_cores
 );
@@ -208,9 +209,22 @@ sub parse_system_df {
     return \%out;
 }
 
-# parse_cim_memory($raw) -> { ram_free, ram_total } | undef, in BYTES.
-# CIM reports kilobytes and those kilobytes are 1024 bytes, so the conversion
-# constant here is 1024 (unlike parse_human_bytes' decimal default).
+# parse_cim_memory($raw) -> { ram_free, ram_total, swap_free, swap_total }
+# | undef, in BYTES. CIM reports kilobytes and those kilobytes are 1024 bytes,
+# so the conversion constant here is 1024 (unlike parse_human_bytes' decimal
+# default).
+#
+# SWAP IS THE PAGING FILE, and the pair of fields matters (operator request,
+# 2026-08-26: "can we also add as a resource the swap usage? like the host mem
+# counter but for swap"). Windows has no single "swap used" counter, so it is
+# derived from SizeStoredInPagingFiles minus FreeSpaceInPagingFiles -- the same
+# total-minus-free shape the RAM row already uses, which is why it can reuse
+# the same renderer unchanged.
+#
+# NOT TotalVirtualMemorySize/FreeVirtualMemory, which is the commit charge --
+# RAM plus paging file together. That number is bigger, moves with RAM, and is
+# not what "swap usage" means to a reader looking at a separate RAM row
+# directly above it.
 sub parse_cim_memory {
     my ($raw) = @_;
     my $d = _decode($raw);
@@ -218,9 +232,13 @@ sub parse_cim_memory {
     return undef unless ref $d eq 'HASH';
     my $free  = _uint($d->{FreePhysicalMemory});
     my $total = _uint($d->{TotalVisibleMemorySize});
+    my $pfree  = _uint($d->{FreeSpaceInPagingFiles});
+    my $ptotal = _uint($d->{SizeStoredInPagingFiles});
     return {
-        ram_free  => (defined $free  ? $free  * 1024 : undef),
-        ram_total => (defined $total ? $total * 1024 : undef),
+        ram_free   => (defined $free   ? $free   * 1024 : undef),
+        ram_total  => (defined $total  ? $total  * 1024 : undef),
+        swap_free  => (defined $pfree  ? $pfree  * 1024 : undef),
+        swap_total => (defined $ptotal ? $ptotal * 1024 : undef),
     };
 }
 
@@ -318,6 +336,8 @@ sub build {
         pod_volumes     => _dfsize($df, 'volumes'),
         host_ram_used   => _delta(_sub($mem, 'ram_total'), _sub($mem, 'ram_free')),
         host_ram_total  => _sub($mem, 'ram_total'),
+        host_swap_used  => _delta(_sub($mem, 'swap_total'), _sub($mem, 'swap_free')),
+        host_swap_total => _sub($mem, 'swap_total'),
         host_disk_dev   => _sub($disk, 'device'),
         host_disk_used  => _delta(_sub($disk, 'disk_total'), _sub($disk, 'disk_free')),
         host_disk_total => _sub($disk, 'disk_total'),
@@ -521,6 +541,7 @@ my %NUM_STRUCT_KEY = map { $_ => 1 } qw(
     ctr_mem_used vm_mem_total ctr_cpu_pct
     pod_images pod_containers pod_volumes
     host_ram_used host_ram_total
+    host_swap_used host_swap_total
     host_disk_used host_disk_total
     host_cpu_pct host_cores
 );

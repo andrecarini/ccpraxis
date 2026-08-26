@@ -374,11 +374,16 @@ sub _live_gutter_label { return tui::DashboardScreen::gutter($_[0]); }
             'AC2 (project absent, inverted): no literal "undef" leaks into the header when project_name is absent');
 
         # counter-fixture: with project_name PRESENT (the %full fixture
-        # already in scope), the " - <project>" clause DOES appear -- so
+        # already in scope), the separated <project> clause DOES appear -- so
         # the "no dangling separator" check above is not testing a
         # separator that never renders under any input.
-        like($header_text, qr/ - demo\b/,
-            'AC2 (project present, counter-fixture): the " - <project>" clause DOES appear when project_name is present');
+        #
+        # The separator is DERIVED from Theme (2026-08-26: it became a middle
+        # dot in the rule role, so it can no longer be spelled as ' - ' here
+        # without turning a styling change into a red test about a character).
+        my $HSEP = quotemeta(' ' . Theme::glyph('sep.dot') . ' ');
+        like($header_text, qr/${HSEP}demo\b/,
+            'AC2 (project present, counter-fixture): the separated <project> clause DOES appear when project_name is present');
     }
     {
         my %no_container = %full;
@@ -407,12 +412,14 @@ sub _live_gutter_label { return tui::DashboardScreen::gutter($_[0]); }
         # already in scope), the container name DOES appear -- so the checks
         # above are not testing an element that never renders under any input.
         # RE-POINTED 2026-08-25: the container id is no longer right-justified.
-        # It is the last clause of one left-aligned phrase, joined by ' - ', and
-        # the row is padded after it -- so the claim this makes is "the id is
-        # present, as the tail of the header sentence", which is what AC5 was
-        # ever really about.
-        like($header_text, qr/ - \Qclaude-demo-abcd1234\E\s*\z/,
-            'AC5 (container present, counter-fixture): the container name DOES appear when present, joined to the project by " - "');
+        # It is the last clause of one left-aligned phrase, and the row is
+        # padded after it -- so the claim this makes is "the id is present, as
+        # the tail of the header sentence", which is what AC5 was ever really
+        # about. RE-POINTED AGAIN 2026-08-26: the joining separator is derived
+        # from Theme rather than spelled, for the same reason as AC2 above.
+        my $CSEP = quotemeta(' ' . Theme::glyph('sep.dot') . ' ');
+        like($header_text, qr/${CSEP}\Qclaude-demo-abcd1234\E\s*\z/,
+            'AC5 (container present, counter-fixture): the container name DOES appear when present, joined to the project by the clause separator');
     }
     # AC7 REMOVED 2026-08-25 (operator: "I don't want to keep obsolete stuff
     # around"). It asserted that the oauth fact lands in a TOKEN PANEL when

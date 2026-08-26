@@ -6348,7 +6348,10 @@ sub _gather_tokens {
 # "$var" to any of these strings is the change this design exists to stop.
 sub _ps_commands {
     return (
-        cim_mem  => "Get-CimInstance Win32_OperatingSystem -OperationTimeoutSec 3 | Select-Object FreePhysicalMemory,TotalVisibleMemorySize | ConvertTo-Json -Compress",
+        # The two paging-file fields are the SWAP row (2026-08-26). They come
+        # from the same CIM instance the RAM figures already do, so this adds
+        # two facts for zero extra queries -- no new probe, no new spawn.
+        cim_mem  => "Get-CimInstance Win32_OperatingSystem -OperationTimeoutSec 3 | Select-Object FreePhysicalMemory,TotalVisibleMemorySize,FreeSpaceInPagingFiles,SizeStoredInPagingFiles | ConvertTo-Json -Compress",
         cim_cpu  => "Get-CimInstance Win32_Processor -OperationTimeoutSec 3 | Select-Object LoadPercentage,NumberOfLogicalProcessors | ConvertTo-Json -Compress",
         cim_disk => "Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' -OperationTimeoutSec 3 | Select-Object DeviceID,FreeSpace,Size | ConvertTo-Json -Compress",
         # ONE invocation for all three, added 2026-08-14. See _cim_all() below

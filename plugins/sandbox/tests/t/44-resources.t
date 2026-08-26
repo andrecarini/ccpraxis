@@ -119,7 +119,7 @@ my $FX_DF_NO_VOL = q{[
     {"Type":"Containers","Total":3,"Active":2,"RawSize":4594936026,"RawReclaimable":13305}
 ]};
 
-my $FX_CIM_MEM = q{{"FreePhysicalMemory":3566360,"TotalVisibleMemorySize":24943928}};
+my $FX_CIM_MEM = q{{"FreePhysicalMemory":3566360,"TotalVisibleMemorySize":24943928,"FreeSpaceInPagingFiles":9619748,"SizeStoredInPagingFiles":12288000}};
 
 my $FX_CIM_DISK = q{[{"DeviceID":"C:","FreeSpace":49240297472,"Size":254788440064},{"DeviceID":"G:","FreeSpace":46778281984,"Size":254788440064}]};
 
@@ -158,6 +158,12 @@ my %B10 = (
     pod_volumes     => 0,
     host_ram_used   => 21890629632,
     host_ram_total  => 25542582272,
+    # The swap pair (2026-08-26). Derived from the SAME CIM instance the RAM
+    # figures come from -- SizeStoredInPagingFiles minus FreeSpaceInPagingFiles,
+    # KB x 1024 -- so a fixture that carries one and not the other would be
+    # describing a CIM response that cannot occur.
+    host_swap_used  => 2732290048,
+    host_swap_total => 12582912000,
     host_disk_dev   => 'C:',
     host_disk_used  => 205548142592,
     host_disk_total => 254788440064,
@@ -170,6 +176,7 @@ my @KEYS_15 = qw(
     ctr_mem_used vm_mem_total ctr_cpu_pct
     pod_images pod_containers pod_volumes
     host_ram_used host_ram_total
+    host_swap_used host_swap_total
     host_disk_dev host_disk_used host_disk_total
     host_cpu_pct host_cores
 );
@@ -611,7 +618,8 @@ use_ok('Dashboard') or BAIL_OUT('Dashboard.pm did not load');
 # --- AC-9 -> DC-1 (B7): parse_cim_memory converts CIM kilobytes x1024. ----
 {
     is_deeply(R('parse_cim_memory', $BOM . $FX_CIM_MEM),
-        { ram_free => 3651952640, ram_total => 25542582272 },
+        { ram_free => 3651952640, ram_total => 25542582272,
+          swap_free => 9850621952, swap_total => 12582912000 },
         'AC-9: parse_cim_memory(BOM+fixture) == KB values x 1024 (B7)');
 }
 
@@ -649,7 +657,8 @@ use_ok('Dashboard') or BAIL_OUT('Dashboard.pm did not load');
 # --- AC-2 -> DC-1 (B1): BOM survival, and why the strip must exist. -------
 {
     my @pairs = (
-        [ 'parse_cim_memory', [ $FX_CIM_MEM ],           { ram_free => 3651952640, ram_total => 25542582272 } ],
+        [ 'parse_cim_memory', [ $FX_CIM_MEM ],           { ram_free => 3651952640, ram_total => 25542582272,
+          swap_free => 9850621952, swap_total => 12582912000 } ],
         [ 'parse_cim_disk',   [ $FX_CIM_DISK, 'C:' ],    { device => 'C:', disk_free => 49240297472, disk_total => 254788440064 } ],
         [ 'parse_cim_cpu',    [ $FX_CIM_CPU ],           { cpu_pct => 16, cores => 8 } ],
     );
@@ -775,9 +784,9 @@ my $BUILT;
     ok(is_hashref($BUILT), 'AC-12: build(all six fixtures + selectors) returns a hashref (B10)');
     if (is_hashref($BUILT)) {
         is_deeply([ sort keys %$BUILT ], [ sort @KEYS_15 ],
-            'AC-12: the returned key set is EXACTLY the 15 closed keys -- an extra key fails (B9)');
+            'AC-12: the returned key set is EXACTLY the closed key set -- an extra key fails (B9)');
     } else {
-        fail('AC-12: the returned key set is EXACTLY the 15 closed keys (B9)');
+        fail('AC-12: the returned key set is EXACTLY the closed key set (B9)');
     }
     for my $k (sort @KEYS_15) {
         is(field($BUILT, $k), $B10{$k}, "AC-12: build(...)->{$k} == " . (defined $B10{$k} ? $B10{$k} : 'undef') . ' (B10)');
@@ -788,11 +797,11 @@ my $BUILT;
         my $b = R('build', $in);
         ok(is_hashref($b), "AC-12: build($label) returns a hashref (B9)");
         if (is_hashref($b)) {
-            is_deeply([ sort keys %$b ], [ sort @KEYS_15 ], "AC-12: build($label) still has all 15 keys (B9)");
+            is_deeply([ sort keys %$b ], [ sort @KEYS_15 ], "AC-12: build($label) still has every key of the closed set (B9)");
             is_deeply($b, \%ALL_NA,
                 "AC-12: build($label) is the all-n/a struct: machine_state 'unknown', every other value undef (B9)");
         } else {
-            fail("AC-12: build($label) still has all 15 keys (B9)");
+            fail("AC-12: build($label) still has every key of the closed set (B9)");
             fail("AC-12: build($label) is the all-n/a struct (B9)");
         }
     }
@@ -2305,14 +2314,14 @@ FAKE_MODULE
             ok(is_hashref($snap->{resources}), "AC-17: snapshot_build($label, meta)->{resources} is a hashref");
             if (is_hashref($snap->{resources})) {
                 is_deeply([ sort keys %{ $snap->{resources} } ], [ sort @KEYS_15 ],
-                    "AC-17: snapshot_build($label, meta)->{resources} has exactly the 15 closed keys");
+                    "AC-17: snapshot_build($label, meta)->{resources} has exactly the closed key set");
             } else {
-                fail("AC-17: snapshot_build($label, meta)->{resources} has exactly the 15 closed keys");
+                fail("AC-17: snapshot_build($label, meta)->{resources} has exactly the closed key set");
             }
         } else {
             fail("AC-17: snapshot_build($label, meta) has exactly the nine declared keys");
             fail("AC-17: snapshot_build($label, meta)->{resources} is a hashref");
-            fail("AC-17: snapshot_build($label, meta)->{resources} has exactly the 15 closed keys");
+            fail("AC-17: snapshot_build($label, meta)->{resources} has exactly the closed key set");
         }
     }
     is(field(R('snapshot_build', {}, {}), 'v'), 1, 'AC-17: snapshot_build(...)->{v} is always 1');

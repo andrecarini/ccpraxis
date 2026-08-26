@@ -167,6 +167,32 @@ sub bar {
     return ($full x $filled) . ($empty x ($c - $filled));
 }
 
+# bar_split($r, $cells) -> ($filled_str, $empty_str), the same glyphs bar()
+# returns but as its two HALVES, so a caller can paint the fill and the track
+# in different roles. Concatenating them is bar() exactly -- t/65 pins that, so
+# the two can never disagree about how many cells are filled.
+#
+# WHY IT EXISTS (operator, 2026-08-26: the gauges are "too distracting"). A
+# single-role bar paints the empty track in the same colour as the fill, so a
+# gauge at 20% is a mostly-bright row saying almost nothing. Splitting lets the
+# track stay in the dim border role while only the fill carries pressure --
+# which is what makes it read as a gauge rather than as a coloured word.
+# PUBLIC.
+sub bar_split {
+    my ($r, $cells) = @_;
+    my $b = bar($r, $cells);
+    return (undef, undef) unless defined $b;
+    my $full  = Theme::glyph('gauge.full');
+    my $empty = Theme::glyph('gauge.empty');
+    return ($b, '') if !defined $full || !length $full;
+    # Count whole GLYPHS, not bytes: both are multi-byte UTF-8.
+    my $n = 0;
+    my $i = 0;
+    while ($i + length($full) <= length($b)
+           && substr($b, $i, length($full)) eq $full) { $n++; $i += length($full) }
+    return (substr($b, 0, $i), substr($b, $i));
+}
+
 # The kB/MB/GB/TB threshold ladder fmt_bytes climbs, smallest first.
 # PRIVATE.
 my @BYTE_UNITS = ( [ 1e3, 'kB' ], [ 1e6, 'MB' ], [ 1e9, 'GB' ], [ 1e12, 'TB' ] );
