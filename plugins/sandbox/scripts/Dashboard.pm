@@ -801,6 +801,12 @@ use constant HOT_RELOAD_REPORT_SECS => 20;
 # rewrites five times a second is both distracting in a taskbar and a stream of
 # needless OSC writes -- so it advances through the SAME ten frames four times
 # more slowly.
+# RESIZE_SETTLE_SECS -- how long after a geometry change every tick keeps
+# painting in full. Sized to cover a terminal that reflows AFTER reporting its
+# new size (a maximize does this; a drag-resize hides it by reporting many
+# times). Long enough to outlast that reflow, short enough that the extra full
+# repaints are invisible: at the production tick five ticks is about a second.
+use constant RESIZE_SETTLE_TICKS       => 5;
 use constant SPINNER_PERIOD_SECS       => 0.5;
 # Was 2.0, on the reasoning that a title is glanced at rather than watched and
 # each change costs an OSC write. The operator watched it and wanted it faster,
@@ -1052,10 +1058,21 @@ sub render_frame {
     my $color = $opts->{color};
     my $full  = !$prev || !@$prev || @$prev != @$new;
 
+    # `repaint` -- RE-EMIT EVERY ROW WITHOUT CLEARING. Distinct from $full,
+    # which also erases the screen first.
+    #
+    # It exists for the resize settle window (see Dashboard::run's geometry
+    # poll): after a terminal reflows on its own, our per-row diff has nothing
+    # to emit because our model and the screen disagree and only the screen
+    # knows it. Re-emitting every row repairs that -- each row carries its own
+    # \e[K -- and NOT clearing is the point: a repeated \e[2J is the one thing
+    # that could read as flicker, and the rows alone are sufficient to repair.
+    my $repaint = $full || $opts->{repaint};
+
     my $out = "\e[?2026h";   # begin synchronized output
     $out .= "\e[2J\e[H" if $full;
     for my $i (0 .. $#$new) {
-        unless ($full) {
+        unless ($repaint) {
             next if _cell_sig($prev->[$i]) eq _cell_sig($new->[$i]);
         }
         $out .= _row_ansi($i + 1, $new->[$i], $color);
@@ -2661,6 +2678,8 @@ sub run {
     my $last_state = undef;               # forces a gather on the first tick
     my ($cols, $rows) = $term_size->();
     my ($last_cols, $last_rows) = ($cols, $rows);
+    # Open while a resize is still settling -- see the note at the geometry poll.
+    my $settle_ticks = 0;
     my $prev;
     my %state;
     my $pending = '';
@@ -2833,7 +2852,48 @@ sub run {
                     # instead of adding a second mechanism.
                     $prev = undef;
                     ($last_cols, $last_rows) = ($cols, $rows);
+                    # ...AND KEEP REPAINTING FOR A MOMENT AFTERWARDS.
+                    #
+                    # Operator, after the poll was moved to every tick: "still
+                    # getting some issue with the repaint on maximizing the
+                    # terminal window. Curiously the problem doesn't happen when
+                    # resizing it, but it happens when I maximize it. It only
+                    # repaints after I scroll the mouse."
+                    #
+                    # That difference is the diagnosis. A drag-resize reports
+                    # its new geometry many times as it moves, so SOME poll
+                    # always lands after the terminal has finished reflowing.
+                    # A maximize is ONE jump: the new size is reported once,
+                    # we repaint against it immediately, and then the terminal
+                    # does its own reflow of the scrollback AFTER our repaint --
+                    # overwriting rows we now believe are correct. From then on
+                    # the per-row diff has nothing to emit, because our model
+                    # and the screen disagree and only the screen knows it.
+                    # Scrolling "fixed" it for the same reason it did before:
+                    # it dirties rows, forcing emissions we were skipping.
+                    #
+                    # So a geometry change arms a short settle window instead of
+                    # a single repaint. While it is open the frame cache is
+                    # bypassed and every tick paints in full, which lands after
+                    # the terminal has finished whatever it was doing. The cost
+                    # is bounded and tiny -- a handful of full repaints, only
+                    # ever right after a resize -- and it needs no way to detect
+                    # an event the terminal never tells us about.
+                    #
+                    # COUNTED IN TICKS, NOT SECONDS. The loop's clock is an
+                    # injected seam and a test may legitimately freeze it; a
+                    # wall-clock deadline would then never expire and the
+                    # window would stay open forever. Ticks are the unit the
+                    # repainting actually happens in, so they are the honest
+                    # unit to bound it in.
+                    $settle_ticks = RESIZE_SETTLE_TICKS();
                 }
+                # The settle window itself. It re-emits every row but does NOT
+                # clear -- the one clear that IS wanted already happened above,
+                # on the tick the change was detected. Repeating it is what
+                # would look like flicker.
+                my $settling = 0;
+                if ($settle_ticks > 0) { $settle_ticks--; $settling = 1; $last_frame_sig = undef }
 
                 # state refresh (slower cadence than input polling)
                 if (!defined $last_state || $t - $last_state >= $state_int) {
@@ -2954,7 +3014,7 @@ sub run {
 
                 if (!defined $last_frame_sig || $sig ne $last_frame_sig) {
                     my $frame = compose_frame(\%state, $rows, $cols);
-                    $out->(render_frame($prev, $frame, { color => $color }));
+                    $out->(render_frame($prev, $frame, { color => $color, repaint => $settling }));
                     $prev = $frame;
                     $last_frame_sig = undef;
                     $last_frame_sig = $sig;

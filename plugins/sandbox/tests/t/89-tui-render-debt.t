@@ -237,16 +237,43 @@ SKIP: {
                       state_interval => 100000,   # exactly one gather, on tick 1
                       keys           => [undef, undef, undef, 'q'],
                       max_ticks      => 10);
-    is(scalar(@{ $r->{frames} }), 2,
-       'PART1b: with no second gather, exactly two frames are emitted -- the first open, and the resize')
+    cmp_ok(scalar(@{ $r->{frames} }), '>=', 2,
+       'PART1b: with no second gather, a frame is still emitted for the resize -- geometry alone '
+     . 'is enough to produce one')
         or diag("  frames: " . scalar(@{ $r->{frames} }));
 
     SKIP: {
-        skip 'did not capture the expected 2 frames', 2 if @{ $r->{frames} } != 2;
+        skip 'did not capture at least 2 frames', 3 if @{ $r->{frames} } < 2;
         like($r->{frames}[0], qr/\e\[2J\e\[H/,
              'PART1b: the first frame is the ordinary first-open full repaint');
         like($r->{frames}[1], qr/\e\[2J\e\[H/,
              'PART1b: a resize is noticed on the TICK it happens, without waiting for a gather round');
+
+        # THE SETTLE WINDOW (operator, 2026-08-26: a MAXIMIZE would not repaint
+        # while a drag-resize would; "it only repaints after I scroll").
+        #
+        # A drag reports its geometry many times, so some poll always lands
+        # after the terminal has finished reflowing. A maximize reports once --
+        # we repaint immediately, and the terminal then reflows ON TOP of that
+        # repaint. From there the per-row diff has nothing to emit, because our
+        # model and the screen disagree and only the screen knows it.
+        #
+        # So a geometry change keeps every row being re-emitted for a few ticks
+        # afterwards. Those follow-up frames must NOT clear again -- one clear
+        # is repair, a repeated clear is the flicker AC2 above forbids -- and
+        # they must genuinely carry rows, or the window would be inert.
+        my @after = @{ $r->{frames} }[ 2 .. $#{ $r->{frames} } ];
+        SKIP: {
+            skip 'no post-resize frames captured', 2 unless @after;
+            my $cleared = grep { /\e\[2J/ } @after;
+            is($cleared, 0,
+               'PART1b: the settle frames after the resize re-emit WITHOUT clearing again -- one '
+             . 'clear repairs, a repeated clear is flicker');
+            my $carrying = grep { /\e\[\d+;1H/ } @after;
+            is($carrying, scalar(@after),
+               'PART1b: ...and every settle frame actually carries rows, so the window repairs a '
+             . 'late reflow rather than merely existing');
+        }
     }
 }
 
