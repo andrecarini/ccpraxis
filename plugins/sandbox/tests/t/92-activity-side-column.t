@@ -32,9 +32,18 @@ sub plain { my ($s) = @_; $s =~ s/\e\[[0-9;]*m//g; return $s }
 sub w     { return tui::Layout::display_width(plain($_[0])) }
 
 # A deterministic activity feed. Every fourth row is deliberately long enough
-# to need more than three wrapped lines in a 40-column column.
-my $LONG = 'resources_sampler_forked with an unusually long trailing explanation '
-         . 'that keeps going well past any reasonable column width and then some more';
+# to need more than three wrapped lines -- at the WIDEST the column can get.
+#
+# DERIVED, NOT HARDCODED, and that distinction has already cost a red: this was
+# a fixed string sized for "a 40-column column", and when the column gained the
+# ability to grow to ACTIVITY_COLUMN_MAX_COLS the string stopped overflowing the
+# three-line cap at cols=200. AC14's ellipsis assertion then failed -- not
+# because the cap broke, but because the fixture no longer exercised it. A
+# fixture that encodes a constant it does not read goes stale silently, so this
+# one reads it.
+my $LONG = 'resources_sampler_forked with an unusually long trailing explanation ';
+$LONG .= 'that keeps going well past any reasonable column width and then some more '
+    while length($LONG) < 4 * tui::Screen::ACTIVITY_COLUMN_MAX_COLS();
 sub events {
     my ($n) = @_;
     return [ map {
@@ -126,8 +135,42 @@ sub state { return { events => events($_[0] // 40), runs => [], tokens => {} } }
         "AC6: one column below the threshold ($edge) there is no side column");
     is(tui::Screen::side_column_width($edge), $col,
         'AC6: at the threshold the full column is reserved');
-    is(tui::Screen::side_column_width($edge + 500), $col,
-        'AC6: and it does not grow with the terminal -- "narrow" is the whole point');
+    # RE-POINTED 2026-08-26, AND THIS ONE IS A REVERSAL, not a tuning change.
+    #
+    # This asserted `side_column_width($edge + 500) == $col` -- the column never
+    # grows, "narrow is the whole point". The operator asked for the opposite:
+    # on a full-width terminal the activity column can be twice as wide, because
+    # the surplus was going to a main region that did not need it.
+    #
+    # What the original assertion was really protecting is preserved below and
+    # in AC6b: the main region never drops below the layout breakpoint, and the
+    # threshold behaviour is byte-identical. Growth spends surplus only.
+    my $max = tui::Screen::ACTIVITY_COLUMN_MAX_COLS();
+    is(tui::Screen::side_column_width($edge + 500), $max,
+        'AC6: on a very wide terminal the column grows to its 2x cap -- it is no '
+      . 'longer pinned narrow, but it is still bounded');
+    cmp_ok($max, '==', 2 * $col,
+        'AC6: the cap IS twice the base width, which is what was asked for, rather '
+      . 'than a third number near it');
+
+    # Monotonic and bounded across the whole range: never below the base once a
+    # split happens, never above the cap, and never shrinking as the terminal
+    # grows. A cap plus a floor does not by itself rule out a non-monotonic
+    # middle, so it is checked rather than assumed.
+    my $prev = 0;
+    my $bad  = '';
+    for my $c ($edge .. $edge + 200) {
+        my $w = tui::Screen::side_column_width($c);
+        if ($w < $col || $w > $max || $w < $prev) {
+            $bad = "cols=$c gave $w (previous $prev, band [$col, $max])";
+            last;
+        }
+        $prev = $w;
+    }
+    is($bad, '',
+        'AC6b: width rises monotonically from the base to the 2x cap and never '
+      . 'leaves that band -- a cap and a floor alone do not rule out a '
+      . 'non-monotonic middle, so it is checked rather than assumed');
 
     # THE RULE IS DERIVED, NOT PICKED. This is what makes criterion 5's
     # "behaviour at narrow widths is DEFINED, not incidental" true rather than

@@ -142,20 +142,62 @@ sub chrome_rows { 2 + FOOTER_RULE_ROWS() }      # title, the footer rule, footer
 # the wrong call for real terminals, the lever is ACTIVITY_COLUMN_COLS -- 30
 # would put the threshold at 120 -- and it is one number, not a redesign.
 # ---------------------------------------------------------------------------
-use constant ACTIVITY_COLUMN_COLS  => 40;
+use constant ACTIVITY_COLUMN_COLS     => 40;
+use constant ACTIVITY_COLUMN_MAX_COLS => 80;
 sub SIDE_COLUMN_MIN_MAIN { tui::Layout::BREAKPOINT_TWO_COL() }
 
-# side_column_width($cols) -> ACTIVITY_COLUMN_COLS | 0. PUBLIC, pure.
+# side_column_width($cols) -> 0, or ACTIVITY_COLUMN_COLS..ACTIVITY_COLUMN_MAX_COLS.
+# PUBLIC, pure.
 #
 # 0 means "this terminal is too narrow to split", and the caller then behaves
 # exactly as it did before this package -- a fallback to tested behaviour, not
 # a second degraded path to maintain.
+#
+# THE COLUMN GROWS WITH THE TERMINAL, AND IT DID NOT USED TO.
+#
+# This returned a flat ACTIVITY_COLUMN_COLS at every width at or above the
+# threshold, and t/92 pinned that explicitly at $edge + 500 -- so the constancy
+# was deliberate, not an oversight, and reversing it is a design decision rather
+# than a tuning change. The operator asked for it directly: on a full-width
+# terminal the activity column can be twice as wide as it currently is, and the
+# surplus was going to a main region that did not need it.
+#
+# What did NOT change is the rule the block comment above establishes: the main
+# region must still clear tui::Layout's own two-column breakpoint. Growth spends
+# only surplus, so the 130-column threshold and everything below it are
+# untouched:
+#
+# The main column is written relative to SIDE_COLUMN_MIN_MAIN ("floor") on
+# purpose: t/65 AC-L1 forbids this file from naming the breakpoint's literal
+# value even in a comment, so that it is declared once, in tui::Layout, and
+# cannot drift out of sync with a copy that looks like documentation.
+#
+#     cols   side   main        note
+#     129      0     129        below threshold, unchanged
+#     130     40    floor       threshold, unchanged -- main sits exactly on it
+#     150     50    floor+10
+#     200     66    floor+44
+#     240+    80    floor+70    capped at 2x
+#
+# The cap is 2x because that is what was asked for. Uncapped floor(cols/3) was
+# the alternative and was rejected: a 400-column terminal would hand the column
+# 133 columns, which starves nothing but stops looking like a side column.
 sub side_column_width {
     my ($cols) = @_;
     return 0 if !defined $cols || ref($cols) || $cols !~ /^-?\d+(?:\.\d+)?$/;
     $cols = int($cols);
     return 0 if $cols < ACTIVITY_COLUMN_COLS() + SIDE_COLUMN_MIN_MAIN();
-    return ACTIVITY_COLUMN_COLS();
+
+    my $w = int($cols / 3);
+    $w = ACTIVITY_COLUMN_MAX_COLS() if $w > ACTIVITY_COLUMN_MAX_COLS();
+    $w = ACTIVITY_COLUMN_COLS()     if $w < ACTIVITY_COLUMN_COLS();
+
+    # Never at the main region's expense -- this clamp is what keeps the
+    # threshold row of the table above honest.
+    my $main_cap = $cols - SIDE_COLUMN_MIN_MAIN();
+    $w = $main_cap if $w > $main_cap;
+
+    return $w;
 }
 
 # _render_panel(\%panel, $w, $maxh) -> up to $maxh cells: a title line
