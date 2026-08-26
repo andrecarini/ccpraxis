@@ -6363,7 +6363,13 @@ sub _ps_commands {
         # array syntax are ALSO perl's dereference syntax, so an unescaped @
         # here interpolates a perl array into the command and the file does not
         # even compile. \@ yields a literal @.
-        cim_all  => "ConvertTo-Json -Compress -Depth 4 -InputObject \@{mem=(Get-CimInstance Win32_OperatingSystem -OperationTimeoutSec 3 | Select-Object FreePhysicalMemory,TotalVisibleMemorySize);cpu=(Get-CimInstance Win32_Processor -OperationTimeoutSec 3 | Select-Object LoadPercentage,NumberOfLogicalProcessors);disk=\@(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' -OperationTimeoutSec 3 | Select-Object DeviceID,FreeSpace,Size)}",
+        # THE PAGING FIELDS BELONG HERE TOO, and forgetting them is what made
+        # the swap row silently absent on its first launch: cim_mem below is
+        # only the FALLBACK -- _cim_all runs this combined query and only drops
+        # to the three-spawn form when it fails, so the primary path is the one
+        # that has to carry a new field. Both now do, and t/78's C section pins
+        # that they agree.
+        cim_all  => "ConvertTo-Json -Compress -Depth 4 -InputObject \@{mem=(Get-CimInstance Win32_OperatingSystem -OperationTimeoutSec 3 | Select-Object FreePhysicalMemory,TotalVisibleMemorySize,FreeSpaceInPagingFiles,SizeStoredInPagingFiles);cpu=(Get-CimInstance Win32_Processor -OperationTimeoutSec 3 | Select-Object LoadPercentage,NumberOfLogicalProcessors);disk=\@(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' -OperationTimeoutSec 3 | Select-Object DeviceID,FreeSpace,Size)}",
     );
 }
 

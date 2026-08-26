@@ -203,4 +203,69 @@ SKIP: {
     }
 }
 
+# ===========================================================================
+# C -- THE COMBINED QUERY AND ITS FALLBACK MUST SELECT THE SAME FIELDS.
+#
+# This section exists because the divergence actually happened. The swap row
+# (2026-08-26) needed two more fields off Win32_OperatingSystem; they were added
+# to `cim_mem` -- which is only the FALLBACK. _cim_all runs `cim_all` and drops
+# to the three-spawn form only when that fails, so the primary path never
+# selected them and every swap fact came back undef on a freshly-started
+# sampler. Nothing failed: the query succeeded, the parse succeeded, the fields
+# simply were not there, and the panel reported "2 facts unavailable" with no
+# probe error to explain it.
+#
+# That is the failure mode a two-path design invites, and A1/A2 above cannot
+# catch it -- they check that the three probe KEYS route through the combined
+# command and that it costs one spawn. Neither says the two paths ask for the
+# same thing.
+#
+# Asserted per-class rather than as a pinned field list, so adding a field to
+# both stays green and adding it to only one does not.
+# ===========================================================================
+{
+    my ($cmds) = $src =~ /sub\s+_ps_commands\s*\{(.*?)\n\}/s;
+    ok(defined $cmds, 'C1: _ps_commands is locatable');
+
+  SKIP: {
+        skip('_ps_commands not locatable', 3) unless defined $cmds;
+
+        my %fallback;
+        for my $k (qw(cim_mem cim_cpu cim_disk)) {
+            my ($line) = $cmds =~ /\b\Q$k\E\s*=>\s*"(.*?)",\n/s;
+            next unless defined $line;
+            my ($class)  = $line =~ /Get-CimInstance\s+(\S+)/;
+            my ($fields) = $line =~ /Select-Object\s+([\w,]+)/;
+            $fallback{$k} = { class => $class, fields => $fields }
+                if defined $class && defined $fields;
+        }
+        is(scalar(keys %fallback), 3, 'C1: all three fallback probes expose a class and a field list')
+            or diag('  parsed: ' . join(', ', sort keys %fallback));
+
+        my ($all) = $cmds =~ /\bcim_all\s*=>\s*"(.*?)",\n/s;
+        ok(defined $all, 'C1: the combined query is locatable');
+
+      SKIP: {
+            skip('nothing to compare', 1) unless defined($all) && keys(%fallback) == 3;
+            my @drift;
+            for my $k (sort keys %fallback) {
+                my $class = $fallback{$k}{class};
+                my ($got) = $all =~ /Get-CimInstance\s+\Q$class\E\b.*?Select-Object\s+([\w,]+)/s;
+                if (!defined $got) { push @drift, "$k ($class): absent from the combined query"; next }
+                my %want = map { $_ => 1 } split /,/, $fallback{$k}{fields};
+                my %have = map { $_ => 1 } split /,/, $got;
+                my @missing = grep { !$have{$_} } sort keys %want;
+                my @extra   = grep { !$want{$_} } sort keys %have;
+                push @drift, "$k ($class): combined is MISSING " . join(',', @missing) if @missing;
+                push @drift, "$k ($class): combined has EXTRA "   . join(',', @extra)   if @extra;
+            }
+            is(scalar(@drift), 0,
+                'C2 CANONICAL: the combined query selects EXACTLY the fields its fallback does, for '
+              . 'every class -- a field added to one path and not the other is how the swap facts '
+              . 'came back undef with nothing reporting an error')
+                or diag('  ' . join("\n  ", @drift));
+        }
+    }
+}
+
 done_testing();
