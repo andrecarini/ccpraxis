@@ -113,7 +113,7 @@ These have each cost real debugging time. Details in the user-global `CLAUDE.md`
 
 ## `.ccpraxis-local-data/` — gitignored, and it does not travel
 
-Holds blueprints, `claude-home` (transcripts, credentials, beacons), launcher state, and the
+Holds blueprints, `claude-home` (transcripts, credentials), launcher state, and the
 `guidance/` notes indexed below. Git never carries it, nor `deploy_key*`. Most of `.claude/` is
 ignored too — but **not** `.claude/settings.json`; see the next section.
 

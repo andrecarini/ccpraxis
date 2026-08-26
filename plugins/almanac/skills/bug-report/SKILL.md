@@ -27,7 +27,7 @@ REPORT
 ```
 
 `--area` is free text; use the plugin name (`butler`, `sandbox`, `blueprint`, `backpack`,
-`steward`, `beacon`, `almanac`). `--severity`: `low` | `medium` | `high` | `blocker`, or
+`steward`, `almanac`). `--severity`: `low` | `medium` | `high` | `blocker`, or
 `unknown` — which is what the script records when `--severity` is omitted. The list is now
 enforced as a closed enum, so a value outside it is rejected rather than written.
 

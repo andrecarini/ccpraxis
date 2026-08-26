@@ -53,7 +53,7 @@ The script emits `KEY: value` lines on stdout:
 
 ### 3. Confirm to the user
 
-One short sentence, mirroring `/beacon:on`/`/beacon:off`'s confirm-to-user step.
+One short sentence confirming the new state to the user.
 
 Examples:
 

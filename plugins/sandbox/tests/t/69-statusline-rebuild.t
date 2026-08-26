@@ -1090,7 +1090,7 @@ sub glyph_cols_disagreements {
             cols => $cols, sandbox => 0, toplevel => $top,
             branch => 'main', home => $SEEDED_HOME, data => $SEEDED_DATA);
         my $vis  = strip_sgr($line);
-        $plans_at{$cols}  = ($vis =~ /\b(?:blueprints|todos|beacons)\b/) ? 1 : 0;
+        $plans_at{$cols}  = ($vis =~ /\b(?:blueprints|todos)\b/) ? 1 : 0;
         $git_at{$cols}    = (index($vis, 'main') >= 0) ? 1 : 0;
         my $proj = field_at($line, 1);
         my $cwd  = field_at($line, 2);

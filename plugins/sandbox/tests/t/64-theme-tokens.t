@@ -131,7 +131,6 @@ my %EMOJI_PENDING_CODEPOINTS = (
 my @EMOJI_SURFACES = (
     'scripts/statusline.pl',
     'plugins/sandbox/scripts/Dashboard.pm',
-    'plugins/beacon/scripts/claude-beacon.pl',
     'plugins/butler/scripts/bp-statusline.pl',
 );
 
@@ -484,7 +483,7 @@ for my $key (sort keys %EMOJI_PENDING) {
 # as an active, honoured waiver while guarding nothing). Both membership, not
 # a count -- AC-19/Decision 15 untouched.
 # ---------------------------------------------------------------------------
-for my $must ('plugins/beacon/scripts/claude-beacon.pl', 'scripts/statusline.pl') {
+for my $must ('scripts/statusline.pl', 'plugins/sandbox/scripts/Dashboard.pm') {
     ok((grep { $_ eq $must } @EMOJI_SURFACES) ? 1 : 0,
         "emoji scan set includes the load-bearing surface '$must' -- membership floor, not a count (M3)");
 }

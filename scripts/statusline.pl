@@ -290,8 +290,8 @@ my $toplevel  = '';
 if (length $workspace) {
     my $t = cmd_out('git', '-C', $workspace, 'rev-parse', '--show-toplevel');
     chomp $t;
-    # git writes UTF-8 bytes; decode once so basename and the beacon
-    # git_root comparisons below (which see JSON-decoded text) agree.
+    # git writes UTF-8 bytes; decode once so basename and every downstream
+    # comparison (which see JSON-decoded text) agree.
     utf8::decode($t) if length($t) && !utf8::is_utf8($t);
     $toplevel = $t;
 }
@@ -341,8 +341,8 @@ if ($root eq '/project' || $project eq 'project') {
 # nising the accounting from what is painted. Rendering the FULL path (rather
 # than only its basename, as this file used to) is what opened that door, so
 # it is closed here. Only the display copies are scrubbed: $root stays
-# verbatim because the plans lookup uses it as a filesystem path and as the
-# beacon git_root key, where a rewritten value would silently miscount.
+# verbatim because the plans lookup uses it as a filesystem path, where a
+# rewritten value would silently miscount.
 $project =~ s/[\x00-\x1f\x7f]//g;
 $cwd     =~ s/[\x00-\x1f\x7f]//g;
 
@@ -513,7 +513,7 @@ eval {
     }
 };
 
-# ── Plans, Todos & Beacons ───────────────────────────────────
+# ── Plans & Todos ────────────────────────────────────────────
 my $plans_str = '';
 eval {
     my @parts;
@@ -537,92 +537,6 @@ eval {
         my $n = grep { /\.md$/ && !/^README\.md$/ && -f "$todo_dir/$_" } readdir($dh);
         closedir($dh);
         push @parts, "${MUTED}todos ${R}${PRIMARY}${n}${R}" if $n > 0;
-    }
-
-    # Beacons: project = local .ccpraxis-local-data/claude-home/beacons + vault
-    # beacons whose git_root matches $root. Global = cached count file, falling
-    # back to a vault-dir filename walk when the cache hasn't been written yet.
-    my $vault_bdir = "$ENV{HOME}/.claude/claude-code-vault/beacons";
-    my $n_project  = 0;
-    if ($root) {
-        my $local_bdir = "$root/.ccpraxis-local-data/claude-home/beacons";
-        if (-d $local_bdir && opendir(my $dh, $local_bdir)) {
-            $n_project += grep { /\.json$/ && !/^\./ } readdir($dh);
-            closedir($dh);
-        }
-        if (-d $vault_bdir && opendir(my $dh, $vault_bdir)) {
-            my @files = grep { /\.json$/ && !/^\./ } readdir($dh);
-            closedir($dh);
-            for my $f (@files) {
-                open(my $fh, '<:raw', "$vault_bdir/$f") or next;
-                my $json_raw = do { local $/; <$fh> };
-                close $fh;
-                my $rec = eval { decode_json($json_raw) };
-                next unless $rec && ref($rec) eq 'HASH';
-                $n_project++ if defined $rec->{git_root} && $rec->{git_root} eq $root;
-            }
-        }
-    }
-
-    my $n_global = 0;
-    my $gcount   = "$vault_bdir/.global-count";
-    my $cache_stale = 1;  # true on missing / unreadable; refined below if read OK
-    if (-f $gcount && open(my $fh, '<', $gcount)) {
-        my $n = <$fh>;
-        close $fh;
-        chomp $n if defined $n;
-        $n_global = (defined $n && $n =~ /^\d+$/) ? $n + 0 : 0;
-        my $age = time() - (stat($gcount))[9];
-        $cache_stale = $age > 30;
-    } elsif (-d $vault_bdir && opendir(my $dh, $vault_bdir)) {
-        $n_global = grep { /\.json$/ && !/^\./ } readdir($dh);
-        closedir($dh);
-    }
-
-    # Debounced async refresh -- fire beacon.pl sync-vault in background when
-    # the cache is stale or missing. Two-tier debounce: a .sync-vault.last-fired
-    # sentinel limits spawn rate to ~1 every 5s regardless of render rate,
-    # then LOCK_NB inside sync-vault dedupes any spawns that still overlap.
-    # The sentinel matters because this runs every keystroke; without it,
-    # a 30s stale window would fire ~300 shell+perl startups on Windows,
-    # each of which the statusline parent waits on for a few ms.
-    #
-    # NB: beacon.pl lives in the `beacon` plugin since D7. statusline.pl is
-    # host-only and runs outside any skill context, so we compute the on-disk
-    # path directly (no ${CLAUDE_PLUGIN_ROOT} substitution available here).
-    if ($cache_stale && -d $vault_bdir) {
-        my $beacon_script = "$ENV{HOME}/.claude/ccpraxis/plugins/beacon/scripts/beacon.pl";
-        my $fired_stamp   = "$vault_bdir/.sync-vault.last-fired";
-        my $spawn_stale   = 1;
-        if (-f $fired_stamp) {
-            $spawn_stale = (time() - (stat($fired_stamp))[9]) > 5;
-        }
-        if ($spawn_stale && -f $beacon_script) {
-            # Touch sentinel BEFORE spawning so concurrent renders skip.
-            # Race-tolerant: a few extra spawns won't hurt (LOCK_NB catches
-            # them), but the sentinel must move forward or we'd fire forever.
-            if (open(my $ts, '>>', $fired_stamp)) { close $ts; }
-            utime(undef, undef, $fired_stamp);
-            spawn_detached($^X, $beacon_script, 'sync-vault');
-        }
-    }
-
-    if ($n_project > 0 || $n_global > 0) {
-        my $s = "${MUTED}beacons ${R}";
-        if ($n_project > 0 && $n_global > 0) {
-            # `<proj> / <faint global>` -- project bright; slash and global
-            # count both faint so they recede as one unit. Spaces give
-            # visual breathing room.
-            $s .= "${PRIMARY}${n_project}${R} ${FAINT}/ ${n_global}${R}";
-        } elsif ($n_project > 0) {
-            $s .= "${PRIMARY}${n_project}${R}";
-        } else {
-            # Only global beacons (none in this project) -- render as 0 / N so
-            # the asymmetry is explicit and the bare number isn't misread
-            # as a project count.
-            $s .= "${PRIMARY}0${R} ${FAINT}/ ${n_global}${R}";
-        }
-        push @parts, $s;
     }
 
     # Double space between segments groups them as distinct categories.

@@ -3,7 +3,6 @@
    "enabledMcpjsonServers" : [],
    "enabledPlugins" : {
       "backpack@ccpraxis-local" : true,
-      "beacon@ccpraxis-local" : true,
       "blueprint@ccpraxis-local" : true,
       "butler@ccpraxis-local" : true,
       "feature-dev@claude-plugins-official" : true,

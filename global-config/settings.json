@@ -12,7 +12,6 @@
    "effortLevel" : "high",
    "enabledPlugins" : {
       "backpack@ccpraxis-local" : true,
-      "beacon@ccpraxis-local" : true,
       "blueprint@ccpraxis-local" : true,
       "butler@ccpraxis-local" : true,
       "feature-dev@claude-plugins-official" : true,
@@ -68,11 +67,6 @@
    "permissions" : {
       "allow" : [
          "Read",
-         "Skill(beacon:delete)",
-         "Skill(beacon:list)",
-         "Skill(beacon:off)",
-         "Skill(beacon:on)",
-         "Skill(beacon:view)",
          "Skill(blueprint:create)",
          "Skill(blueprint:manage)",
          "Skill(butler:dispatch-fleet)",
@@ -100,7 +94,6 @@
          "Bash(git add *)",
          "Bash(git commit *)",
          "Bash(git rm *)",
-         "Bash(perl ~/.claude/ccpraxis/plugins/beacon/scripts/*)",
          "Bash(perl ~/.claude/ccpraxis/scripts/*)",
          "Bash(perl ~/.claude/ccpraxis/plugins/steward/scripts/*)",
          "Bash(bash ~/.claude/ccpraxis/plugins/steward/scripts/*)",

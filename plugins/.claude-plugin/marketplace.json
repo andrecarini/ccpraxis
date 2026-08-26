@@ -7,11 +7,6 @@
   },
   "plugins": [
     {
-      "name": "beacon",
-      "source": "./beacon",
-      "description": "Mark Claude Code sessions as ongoing work; resume them later via claude-beacon."
-    },
-    {
       "name": "backpack",
       "source": "./backpack",
       "description": "What you pack to take into a /sandbox container. Declares tools, runtimes, and project-setup commands so they're auto-restored on every container rebuild."

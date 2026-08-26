@@ -372,9 +372,8 @@ sub make_cell {
 # real risk, not a hypothetical one). (2) a row that already fits its column
 # budget returns byte-identical output to today (the common case). (3)
 # otherwise, word-wrap: flatten to words, pre-split any word wider than the
-# continuation-aware content width at a decoded-character boundary (mirrors
-# beacon's own workaround, claude-beacon.pl:551-554, reimplemented here
-# because that copy is outside this file), hand the word list to the
+# continuation-aware content width at a decoded-character boundary, hand the
+# word list to the
 # EXISTING, UNMODIFIED tui::Layout::wrap, then re-pad each returned line via
 # make_cell/fit_spans -- which is what guarantees "exactly $w columns, never
 # mid-glyph" for every wrapped line using already-tested code. PUBLIC.

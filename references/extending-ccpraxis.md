@@ -20,7 +20,6 @@ ccpraxis/
 ├── plugins/                         # Local plugin marketplace
 │   ├── .claude-plugin/marketplace.json
 │   ├── sandbox/                     # claude-sandbox launcher + container blueprint + /sandbox:setup
-│   ├── beacon/                      # claude-beacon launcher + /beacon:* skills + completion-nudge hook
 │   ├── backpack/                    # /backpack:* skills + auto-declare hook
 │   └── <plugin-name>/...            # New plugins drop in here
 ├── skills/                          # ccpraxis-managed standalone skills
@@ -163,9 +162,9 @@ plugins/myplugin/
 **Optional subdirs:**
 
 - `scripts/` — internal helper scripts. Use Perl by convention; matches the rest of the repo.
-- `skills/<skill-name>/SKILL.md` — skills the plugin contributes. They surface as `/<plugin>:<skill>` in Claude Code's slash menu (e.g. `/beacon:on`). The slash-command body references shared scripts two equivalent ways, both of which resolve correctly **inside a bash code block**:
+- `skills/<skill-name>/SKILL.md` — skills the plugin contributes. They surface as `/<plugin>:<skill>` in Claude Code's slash menu (e.g. `/backpack:add`). The slash-command body references shared scripts two equivalent ways, both of which resolve correctly **inside a bash code block**:
   - **`${CLAUDE_PLUGIN_ROOT}/scripts/foo.pl`** — `CLAUDE_PLUGIN_ROOT` is a shell environment variable Claude Code sets to the plugin root when a plugin skill runs; bash expands it at execution time. Depth-independent (doesn't care how deeply the skill is nested), so it's the form steward/butler/blueprint use, and the preferred form for new plugin skills.
-  - **`${CLAUDE_SKILL_DIR}/../../scripts/foo.pl`** — `CLAUDE_SKILL_DIR` (and `${CLAUDE_SESSION_ID}`) are Claude Code *template substitutions*, replaced in SKILL.md content before it runs; the relative `../../` climbs from the skill dir to the plugin root. Used by beacon/backpack.
+  - **`${CLAUDE_SKILL_DIR}/../../scripts/foo.pl`** — `CLAUDE_SKILL_DIR` (and `${CLAUDE_SESSION_ID}`) are Claude Code *template substitutions*, replaced in SKILL.md content before it runs; the relative `../../` climbs from the skill dir to the plugin root. Used by backpack/butler.
 
   The distinction only bites outside a bash block: in plain prose (no shell to expand env vars) only the template substitutions resolve, so reference a path in prose with `${CLAUDE_SKILL_DIR}`, not `${CLAUDE_PLUGIN_ROOT}`.
 - `bin/` — user-invocable CLI wrappers. Shell-native (`.sh` + `.ps1`). Tiny shims that exec into Perl logic in `scripts/`.
@@ -199,7 +198,7 @@ If you do add one, edit `install.pl` to add the explicit path to the discovery l
 
 ## Shell-script policy
 
-`.sh` and `.ps1` files exist only for **commands the user runs directly outside Claude** — e.g. `claude-sandbox`, `claude-beacon`. Everything else (install hooks, internal helpers, plugin logic, statusline rendering) is Perl. One source of truth, no cross-shell duplication.
+`.sh` and `.ps1` files exist only for **commands the user runs directly outside Claude** — e.g. `claude-sandbox`. Everything else (install hooks, internal helpers, plugin logic, statusline rendering) is Perl. One source of truth, no cross-shell duplication.
 
 **Why we still need the wrappers for user CLIs:** the user types `claude-foo` in their shell; the shell needs to find an executable. Linux honors shebangs on extensionless scripts; Windows doesn't natively run `.pl` files without a registry `ftype`/`assoc` setup that IS gated by admin. Two tiny shims is cheaper than every alternative.
 
@@ -211,7 +210,7 @@ If you do add one, edit `install.pl` to add the explicit path to the discovery l
 exec perl "$HOME/.claude/ccpraxis/plugins/foo/scripts/claude-foo.pl" "$@"
 ```
 
-For the PowerShell counterpart, see `plugins/beacon/bin/claude-beacon.ps1` — it includes a `Get-PerlPath` fallback that finds Perl in Git for Windows, Strawberry, or ActiveState when it's not on the bare PowerShell PATH.
+For the PowerShell counterpart, see `plugins/sandbox/bin/claude-sandbox.ps1` — it includes a `Get-PerlPath` fallback that finds Perl in Git for Windows, Strawberry, or ActiveState when it's not on the bare PowerShell PATH.
 
 ---
 
@@ -279,7 +278,7 @@ exec $^X, "$Bin/../../scripts/_install-bin-helper.pl", $mode, "$Bin/bin"
 exec perl "$HOME/.claude/ccpraxis/plugins/flux/scripts/claude-flux.pl" "$@"
 ```
 
-**5. `bin/claude-flux.ps1`** — mirror `plugins/beacon/bin/claude-beacon.ps1` (Perl locator + `& $PerlExe $Script @args`).
+**5. `bin/claude-flux.ps1`** — mirror `plugins/sandbox/bin/claude-sandbox.ps1` (Perl locator + `& $PerlExe $Script @args`).
 
 **6. Register the plugin** in `plugins/.claude-plugin/marketplace.json` and enable it in `settings.json` under `enabledPlugins`.
 

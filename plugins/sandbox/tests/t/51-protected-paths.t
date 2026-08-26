@@ -1172,7 +1172,7 @@ for my $t ('/', 'C:', 'C:/', 'C:\\', '/a/../..') {
 # delete of the guard's highest-value root: with USERPROFILE pointed at the
 # Claude home on Windows (never hardened by launcher.pl's _pp_env_seam, and
 # tried FIRST under `windows`), ~/.claude/projects, /memory, /todos and the
-# beacon vault all went from REFUSE to LAUNCH. That is blueprint C1 reopened,
+# vault all went from REFUSE to LAUNCH. That is blueprint C1 reopened,
 # and it breaks Decision #3 and the D5 criterion this package carries.
 # AC-64 missed it because it only ever tests a `user-configured` candidate.
 {

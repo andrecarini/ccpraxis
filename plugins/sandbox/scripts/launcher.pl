@@ -307,7 +307,7 @@ sub posixify_path {
 # =====================================================================
 #
 # Accepts an optional positional <project-path> and an optional
-# --resume-session <uuid> flag (used by claude-beacon to resume a
+# --resume-session <uuid> flag (used to resume a
 # specific session). Flag accepted before OR after the positional.
 # `=`-joined form (--resume-session=UUID) accepted too. Missing UUID
 # at end-of-argv is an explicit error.
@@ -906,7 +906,7 @@ $CLAUDE_HOST_CONFIG = do {
 # The sandbox's container-home projection (bind source for /root/.claude) lives
 # under it at claude-home/ — historically this was <project>/.claude-data/, now
 # migrated in (see the migration block below). Everything the sandbox persists
-# (sessions, credentials, launcher metadata, logs, beacons) is nested under
+# (sessions, credentials, launcher metadata, logs) is nested under
 # $CLAUDE_DATA, exactly as it was under .claude-data — only the parent changed.
 my $CCPRAXIS_DATA            = "$PROJECT_PATH/.ccpraxis-local-data";
 my $CLAUDE_DATA              = "$CCPRAXIS_DATA/claude-home";
@@ -2362,7 +2362,7 @@ my $CONTAINER_NAME;
 # manager window: it holds the container alive and exposes a hotkey that
 # spawns a NEW window running the internal connector entry
 # `claude-sandbox --session` — which is what reaches the CONNECTOR branch
-# below. `--resume-session` (used by claude-beacon to resume a specific
+# below. `--resume-session` (used to resume a specific
 # session directly) is also connector mode.
 #
 # CONNECTOR: skip all setup-time work (skill picker, staleness check,
@@ -3316,7 +3316,8 @@ if (-f "$HOST_PLUGINS_DIR/known_marketplaces.json") {
 # can resolve <marketplace>/.claude-plugin/marketplace.json and follow each
 # plugin's relative `source` to the real code. ccpraxis-local is the canonical
 # example: source.path is ~/.claude/ccpraxis/plugins/, which contains
-# .claude-plugin/ + backpack/ + beacon/ + sandbox/ + steward/.
+# .claude-plugin/ + almanac/ + backpack/ + blueprint/ + butler/ + sandbox/ +
+# steward/ + todo/.
 #
 # materialize-known-marketplaces (above) rewrites these entries' source.path AND
 # installLocation to /root/.claude/plugins/marketplaces/<name> — same target as

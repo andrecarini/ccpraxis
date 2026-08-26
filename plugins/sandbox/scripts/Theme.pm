@@ -5,7 +5,7 @@ use Encode ();   # core; used only for UTF-8 encoding of declared glyphs
 
 # =============================================================================
 # Theme.pm -- the single source of colour and glyph truth for every ccpraxis
-# terminal surface (statusline, the sandbox dashboard, beacon, launcher). A call site
+# terminal surface (statusline, the sandbox dashboard, launcher). A call site
 # never sees a hex literal or a raw SGR escape: it names a semantic ROLE
 # (Theme::sgr / Theme::paint) or a GLYPH NAME (Theme::glyph / glyph_width)
 # and gets back an escape string or UTF-8 bytes for the terminal's detected
@@ -13,7 +13,7 @@ use Encode ();   # core; used only for UTF-8 encoding of declared glyphs
 #
 # This package changes NO rendering by itself (blueprint unified-tui-design-
 # system, package 02-design-tokens). Nothing consumes it yet; adoption is
-# packages 05 (render library), 09 (beacon) and 10 (statusline rebuild),
+# packages 05 (render library) and 10 (statusline rebuild),
 # which is also the package that writes the GENERATED block this module's
 # generated_block()/generated_markers() describe (see "THE GENERATED BLOCK"
 # below).

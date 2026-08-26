@@ -22,7 +22,6 @@
 #   sync-project     --slug <s>
 #   resolve-conflict --slug <s> --path <p> --action use-local|use-vault|use-merged [--merged-file <f>]
 #   commit-and-push  --slug <s>
-#   sync-beacons                            (vault-root beacons/ — separate from per-project content)
 
 use strict;
 use warnings;
@@ -53,7 +52,6 @@ die "Cannot determine home directory\n" unless $home;
 $home = norm_path($home);
 
 my $VAULT_DIR        = "$home/.claude/claude-code-vault";
-my $VAULT_BEACON_DIR = "$VAULT_DIR/beacons";
 my $REGISTRY_PATH    = "$VAULT_DIR/.registry-local.json";
 my $VAULT_LOCK       = "$VAULT_DIR/.lock";
 my $BRANCH           = "main";
@@ -183,7 +181,6 @@ elsif ($cmd eq 'status')            { cmd_status() }
 elsif ($cmd eq 'sync-project')      { cmd_sync_project() }
 elsif ($cmd eq 'resolve-conflict')  { cmd_resolve_conflict() }
 elsif ($cmd eq 'commit-and-push')   { cmd_commit_and_push() }
-elsif ($cmd eq 'sync-beacons')      { cmd_sync_beacons() }
 else                                { cmd_help() }
 
 exit 0;
@@ -219,8 +216,6 @@ Sync:
   resolve-conflict --slug <s> --path <p> --action use-local|use-vault|use-merged [--merged-file <f>]
   commit-and-push  --slug <s>
 
-Beacons (vault-root data, separate from per-project content):
-  sync-beacons                          Pre-flight beacon.pl sync-vault, scan, commit + push beacons/
 EOF
 }
 
@@ -1371,196 +1366,6 @@ sub finalize_commit {
         $out->{note} = "Committed and pushed, BUT some files were rolled back because their source changed mid-sync. Re-run sync to pick them up.";
     }
     emit_json($out);
-}
-
-# ── sync-beacons ────────────────────────────────────────────────────
-#
-# Commits + pushes vault-root beacons/ as a self-contained step. Beacons are
-# UUID-keyed JSON records written by /beacon:on (host) and ingested from
-# sandboxes by the statusline-triggered background sync. Until D9 they sat
-# orphaned from git; this subcommand bridges that gap.
-#
-# Lock order: VAULT_LOCK first (consistent with cmd_commit_and_push and
-# cmd_resolve_conflict), then beacons/.sync-vault.lock. The beacons sync lock
-# uses RAW flock to mutually exclude with statusline's beacon.pl sync-vault
-# (which also uses raw flock); vault-sync.pl's acquire_lock helper uses a
-# different protocol (metadata file + sibling .flock sentinel) and is NOT
-# mutually visible — that's why this routine opens the lock by hand.
-sub cmd_sync_beacons {
-    parse_opts(\@ARGV);  # no args — call to reject any unexpected flags
-
-    # Pre-lock guards: emit no_op without acquiring anything.
-    unless (-d "$VAULT_DIR/.git") {
-        emit_json({
-            status => 'no_op',
-            reason => 'vault not initialized on this host (no .git dir)',
-        });
-        return;
-    }
-    unless (-d $VAULT_BEACON_DIR) {
-        emit_json({
-            status => 'no_op',
-            reason => 'beacons directory does not exist',
-        });
-        return;
-    }
-
-    # Lock 1: VAULT_LOCK (acquire_lock — tracked by %HELD_LOCKS, auto-released
-    # on SIGINT/SIGTERM/END).
-    acquire_lock($VAULT_LOCK) or emit_error("Vault lock held by another session.");
-
-    # Lock 2: beacons/.sync-vault.lock (RAW flock to match beacon.pl). Held by
-    # this process via $beacon_lock_fh until cmd_sync_beacons returns; OS
-    # releases on process exit (including signal-driven exits), so explicit
-    # cleanup is best-effort but not load-bearing for correctness.
-    my $beacon_sync_lock = "$VAULT_BEACON_DIR/.sync-vault.lock";
-    open my $beacon_lock_fh, '>>', $beacon_sync_lock
-        or emit_error("Cannot open beacon sync lock $beacon_sync_lock: $!");
-
-    my $got_beacon_lock = 0;
-    for (1..100) {  # ~5s @ 50ms — matches beacon.pl's with_lock cadence
-        if (flock($beacon_lock_fh, LOCK_EX | LOCK_NB)) {
-            $got_beacon_lock = 1;
-            last;
-        }
-        select(undef, undef, undef, 0.05);
-    }
-    unless ($got_beacon_lock) {
-        close $beacon_lock_fh;
-        emit_error("Beacon sync lock held by another process after 5s wait.");
-    }
-
-    # Run the work inside an eval so a die() doesn't leak the raw flock —
-    # tighten the cleanup window before re-emitting through emit_error.
-    # Pass $beacon_lock_fh through so the pre-flight subprocess can close it
-    # in the child before exec (prevents fd inheritance into beacon.pl --no-lock).
-    my $result = eval { _sync_beacons_locked($beacon_lock_fh) };
-    my $err = $@;
-    flock($beacon_lock_fh, LOCK_UN);
-    close $beacon_lock_fh;
-
-    if ($err) {
-        chomp $err;
-        emit_error($err);
-    }
-
-    emit_json($result);
-}
-
-# Body of cmd_sync_beacons that runs while BOTH locks are held. Separated so
-# the lock-release path is exception-safe (cmd_sync_beacons evals this).
-# Takes the beacon lock fh so the pre-flight subprocess can close it in the
-# child before exec — keeps the inherited fd out of beacon.pl --no-lock.
-sub _sync_beacons_locked {
-    my $beacon_lock_fh = shift;
-
-    # Pre-flight: drain pending sandbox ingestion + refresh .global-count
-    # cache via beacon.pl sync-vault --no-lock (--no-lock skips beacon.pl's
-    # own flock since we already hold it). Failures are non-fatal — local
-    # vault records can still be committed/pushed even if ingestion broke.
-    my $beacon_script = "$home/.claude/ccpraxis/plugins/beacon/scripts/beacon.pl";
-    my ($ingested, $ingest_skipped) = (0, 0);
-    my @ingest_errors;
-    if (-f $beacon_script) {
-        # Close $beacon_lock_fh in the child before exec so beacon.pl
-        # --no-lock doesn't inherit a writable handle on the lock file. The
-        # parent (cmd_sync_beacons) keeps its own fd, so the OFD-based flock
-        # is retained throughout.
-        my ($out, $exit) = _run_capture_close_fds(
-            [$beacon_lock_fh],
-            'perl', $beacon_script, 'sync-vault', '--no-lock',
-        );
-        for my $line (split /\n/, $out // '') {
-            $ingested       = $1 + 0 if $line =~ /^INGESTED:\s*(\d+)/;
-            $ingest_skipped = $1 + 0 if $line =~ /^INGEST_SKIPPED:\s*(\d+)/;
-            push @ingest_errors, $1 if $line =~ /^INGEST_ERROR:\s*(.+)/;
-        }
-        if ($exit != 0) {
-            push @ingest_errors,
-                "beacon.pl sync-vault --no-lock exited $exit: "
-                . substr($out // '', 0, 200);
-        }
-    } else {
-        push @ingest_errors,
-            "beacon.pl not found at $beacon_script — skipping pre-flight ingestion";
-    }
-
-    # Secret scan. Beacon labels/summaries are user-or-Claude-supplied free
-    # text — scan_dir_for_secrets walks every file (extension-agnostic) and
-    # skips binaries via null-byte detection. Runs BEFORE git add so a hit
-    # leaves the vault git state untouched.
-    my $findings = scan_dir_for_secrets($VAULT_BEACON_DIR);
-    if (@$findings) {
-        return {
-            status   => 'sensitive_blocked',
-            findings => $findings,
-            note     => "Sensitive patterns detected in beacon JSONs. Vault was NOT modified by /backup. Each finding's `file` and `line` point to the offending record — edit it via /beacon:delete or directly, then re-run /backup.",
-        };
-    }
-
-    # Stage beacons/ — -A so deletions (e.g. /beacon:delete between backups)
-    # are captured. Gitignore patterns filter machine-local artifacts
-    # (.global-count, .sync-vault.lock, *.json.lock, *.tmp.<pid>).
-    unless (vault_git_ok('add', '-A', '--', 'beacons/')) {
-        die "git add failed for beacons/\n";
-    }
-
-    my $status = vault_git_output('status', '--porcelain', '--', 'beacons/');
-    my $committed = 0;
-    if (length $status) {
-        my $msg = "Sync beacons: " . iso_now();
-        unless (vault_git_ok('commit', '-m', $msg)) {
-            die "git commit failed\n";
-        }
-        $committed = 1;
-    }
-
-    # Push only when there's something to push. Covers two cases: a fresh
-    # commit just made above, AND a previous run that committed but failed
-    # to push (network/auth) — vault_ahead_behind sees the unpushed commit
-    # and we retry the push now.
-    my ($ahead, undef) = vault_ahead_behind();
-    my $pushed = 0;
-    if ($ahead > 0) {
-        unless (vault_git_ok('push', 'origin', $BRANCH)) {
-            die "git push failed\n";
-        }
-        $pushed = 1;
-    }
-
-    # Count current beacon JSONs. Read from the filesystem rather than
-    # `git ls-files` so the count matches statusline's view (which is also
-    # a directory walk). Hidden machine-local files are excluded by the
-    # leading-dot filter (so .global-count / .sync-vault.lock never count).
-    my $count = 0;
-    if (opendir(my $dh, $VAULT_BEACON_DIR)) {
-        $count = grep { /\.json$/ && !/^\./ } readdir($dh);
-        closedir($dh);
-    }
-
-    # When nothing existed and nothing happened, downgrade to no_op so the
-    # skill body can skip silently. Otherwise report synced with details.
-    if ($count == 0 && !$committed && !$pushed) {
-        my $out = {
-            status         => 'no_op',
-            reason         => 'no beacon records and nothing to push',
-            ingested       => $ingested + 0,
-            ingest_skipped => $ingest_skipped + 0,
-        };
-        $out->{ingest_errors} = \@ingest_errors if @ingest_errors;
-        return $out;
-    }
-
-    my $out = {
-        status         => 'synced',
-        count          => $count + 0,
-        committed      => $committed ? JSON::PP::true : JSON::PP::false,
-        pushed         => $pushed    ? JSON::PP::true : JSON::PP::false,
-        ingested       => $ingested + 0,
-        ingest_skipped => $ingest_skipped + 0,
-    };
-    $out->{ingest_errors} = \@ingest_errors if @ingest_errors;
-    return $out;
 }
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -2746,13 +2551,13 @@ sub scan_dir_for_secrets {
 
 sub scan_files_for_secrets {
     # ── VAULT SECRET-SCANNING DISABLED (policy decision 2026-06-11) ──────────
-    # The vault is a *private* backup repo: it backs up project + beacon content
+    # The vault is a *private* backup repo: it backs up project content
     # verbatim, including secret-shaped strings (a project's CLAUDE.md may
     # legitimately reference a Sentry DSN, an API key, etc.). Secret-scanning is
     # the job of the *public* ccpraxis repo only — scripts/sensitive-check.pl,
     # run at backup Step 4 before the public git push. This is the single leaf
     # scanner; scan_dir_for_secrets delegates here, so returning empty here
-    # disables the project pre-rename, project post-rename, and beacon scans
+    # disables the project pre-rename and project post-rename scans
     # all at once. To re-enable vault scanning, delete the next line.
     return [];
 

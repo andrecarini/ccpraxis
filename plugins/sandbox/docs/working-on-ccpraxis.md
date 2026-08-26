@@ -100,7 +100,7 @@ the `sandbox-refuse-in-place` blueprint for the full reasoning.
   inspects only `.launcher/` and finds no log there would otherwise reasonably (but wrongly) conclude
   none was kept — this pointer exists to redirect it to the real, writable location (BPK-07).
 - **`.ccpraxis-local-data/` is gitignored and never travels via git.** Blueprints, `claude-home`
-  (agent memory, session transcripts, credentials, beacons) move only by file copy. So do
+  (agent memory, session transcripts, credentials) move only by file copy. So do
   `deploy_key`, `deploy_key.pub` and `.claude/`. If you ever relocate a project, copy those
   explicitly — `git status --ignored` is the authoritative list, not `.gitignore`.
 - **The clone is not a registered marketplace**, so it is not protected and launches normally. If

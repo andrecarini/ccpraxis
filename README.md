@@ -9,7 +9,6 @@ A curated [Claude Code](https://docs.anthropic.com/en/docs/claude-code) configur
 - **Vault sync** — a private `claude-code-vault` git repo backs up todos and project-scoped Claude files (CLAUDE.md, skills, blueprints, memory) across machines, with 3-way merge, locking, journaling, atomic staging, and a pre-rename secret scan
 - **Docker/Podman sandbox** (`claude-sandbox`) — isolated containers (Docker or Podman, auto-detected) with full Claude autonomy, interactive skill selection, blocked install hooks, 7-day package age minimum
 - **Backpack plugin** — per-project declarative manifest of tools/runtimes/setup commands that's replayed on every container rebuild
-- **Beacon plugin** — mark sessions as ongoing work and resume them across restarts, terminal crashes, and context switches
 
 **ccpraxis is meant to be forked.** Everything here — skills, settings, instructions — is configuration you'll want to own, tweak, and carry across machines. Fork the repo so your edits live in your own GitHub account, then pull upstream periodically to grab new skills and fixes.
 
@@ -39,7 +38,7 @@ Optional:
 **Fork first, then install from your fork.** ccpraxis is configuration you'll want to own and customize — forking means your edits live in *your* repo and you can still pull upstream updates when you want them.
 
 1. **Fork ccpraxis on GitHub** (`https://github.com/andrecarini/ccpraxis`) under your own account. Public or private is up to you — this repo holds no secrets, so the choice is purely about whether you want your customizations visible.
-2. **(Optional but strongly recommended) Create a private vault repo for personal backups.** This is a *separate* git repo that holds your todos, persistent plans, beacons, and per-project Claude files (CLAUDE.md, skills, plans, memory) — it stays out of any project repo and syncs your personal state across machines. **It MUST be private** — it carries content you don't want public: project-scoped CLAUDE.md files (which often describe internal architecture, conventions, ongoing initiatives), persistent plan documents (active work-in-progress notes), todo notes (personal reminders), and session memory/labels (which can mention people, paths, decisions in flight). Any git host works (GitHub, GitLab, Gitea, self-hosted); create an empty private repo there, e.g. `https://github.com/<your-user>/claude-code-vault`.
+2. **(Optional but strongly recommended) Create a private vault repo for personal backups.** This is a *separate* git repo that holds your todos, persistent plans, and per-project Claude files (CLAUDE.md, skills, plans, memory) — it stays out of any project repo and syncs your personal state across machines. **It MUST be private** — it carries content you don't want public: project-scoped CLAUDE.md files (which often describe internal architecture, conventions, ongoing initiatives), persistent plan documents (active work-in-progress notes), todo notes (personal reminders), and session memory/labels (which can mention people, paths, decisions in flight). Any git host works (GitHub, GitLab, Gitea, self-hosted); create an empty private repo there, e.g. `https://github.com/<your-user>/claude-code-vault`.
 3. Open Claude Code and tell it:
 
     > Install ccpraxis from `https://github.com/<your-user>/ccpraxis`. My vault repo is `git@github.com:<your-user>/claude-code-vault.git`.
@@ -59,12 +58,6 @@ Once installed, here's what you'll actually type day-to-day, grouped by job:
 **Adding a new project to your personal vault.** `cd` into the project and run `/steward:setup-project`. The skill picks a slug, lets you confirm which files to track, and does an initial sync. On a fresh machine, the same command surfaces vault-only "orphan" projects so you can link the local directory back to existing vault state.
 
 **Starting work in a new project that needs dev tooling.** Exit Claude, then run `claude-sandbox` from a terminal in the project root. On first launch it walks you through bootstrap interactively (image build, git auth, `.ccpraxis-local-data/` setup) then drops you into a containerized Claude session. From inside an existing Claude session, `/sandbox:setup` does the same check and tells you what to do next — it can't run the bootstrap itself because the prompts need the controlling tty.
-
-**Marking a session to resume later.** Run `/beacon:on [label]`. Claude also self-invokes this when the session has substantive ongoing work (a plan, multi-file edits, a multi-step task). When you're done, `/beacon:off` removes the current session's mark.
-
-**Resuming a beaconed session from anywhere.** Run `claude-beacon` from a terminal on the host. It opens a TUI listing every live beacon sorted by last activity; Enter execs `claude --resume <uuid>` for host sessions or `claude-sandbox --resume-session <uuid> <project>` for sandbox sessions.
-
-**Browsing or cleaning up beacons.** `/beacon:list` renders them as a Markdown table, `/beacon:view <id>` shows one full record, `/beacon:delete <id>` removes any beacon by ID-or-prefix (with confirmation).
 
 **Planning a multi-session initiative.** `/blueprint:create` interrogates the objective and decomposes it into scoped packages — a durable on-disk *blueprint* — then gates it through a fresh-context auditor; `/blueprint:manage` lists, views, audits, archives, or deletes them. The `blueprint` plugin is plan-only. Inside a sandbox, the `butler` plugin executes a blueprint: `/butler:dispatch-fleet` starts a deterministic, token-free orchestrator script (no Claude) that watches, launches, relaunches, and usage-governs detached coordinator agents (one per package, with hook-enforced scope/git/ledger discipline) and auto-resumes across usage/token limits; `/butler:drive-solo` is the single interactive execute verb — a thin loop over the deterministic perl director (`bp-drive-next.pl`) that drives one blueprint, a named set, or all audited blueprints to done in one host-or-sandbox session; `/butler:reporter` is the interactive front door you talk to; `/butler:status` reports. Both execute verbs are idempotent start-or-continue (there is no separate resume).
 
@@ -148,35 +141,6 @@ ccpraxis/
 │   │       └── t/
 │   │           ├── 01-encoding.t
 │   │           └── 02-install-diagnostics.t
-│   ├── beacon/                              # Beacon plugin — bundles the /beacon:* skills, the UserPromptSubmit completion-nudge hook, the shared beacon scripts, and the claude-beacon host launcher
-│   │   ├── .claude-plugin/
-│   │   │   └── plugin.json
-│   │   ├── bin/                             # User-invoked CLI lives here; shell-native wrappers are required so users can type `claude-beacon` from any terminal.
-│   │   │   ├── claude-beacon.ps1            # Thin wrapper (Windows/PowerShell)
-│   │   │   └── claude-beacon.sh             # Thin wrapper that execs into claude-beacon.pl (Linux/macOS)
-│   │   ├── ccpraxis-install.pl              # Install hook — wires plugins/beacon/bin/ into user PATH (delegates to _install-bin-helper.pl)
-│   │   ├── hooks/
-│   │   │   ├── completion-nudge.pl          # UserPromptSubmit hook — nudges Claude to offer /beacon:off when the user signals session completion (only if a beacon exists for the current session_id)
-│   │   │   └── hooks.json                   # Auto-registers the UserPromptSubmit hook when the plugin is enabled (shell-form command, path via ${CLAUDE_PLUGIN_ROOT}, runs through Git Bash on Windows so `perl` resolves correctly)
-│   │   ├── scripts/
-│   │   │   ├── beacon.pl                    # Core helper: light/unbeacon/list/get/update-activity/count-{project,global}/sync-vault/scan-sandboxes
-│   │   │   ├── claude-beacon.pl             # TUI launcher (logic for `claude-beacon` on the host)
-│   │   │   └── test-encoding.pl             # automated encoding test suite for the beacon plugin.
-│   │   ├── skills/
-│   │   │   ├── delete/
-│   │   │   │   └── SKILL.md                 # /beacon:delete — delete any beacon by id-or-prefix (with confirmation)
-│   │   │   ├── list/
-│   │   │   │   └── SKILL.md                 # /beacon:list   — render every beacon as a Markdown table (read-only)
-│   │   │   ├── off/
-│   │   │   │   └── SKILL.md                 # /beacon:off    — remove the current session's beacon (with confirmation)
-│   │   │   ├── on/
-│   │   │   │   └── SKILL.md                 # /beacon:on     — mark this session as ongoing work
-│   │   │   └── view/
-│   │   │       └── SKILL.md                 # /beacon:view   — show one beacon's full record by id-or-prefix (read-only)
-│   │   └── tests/
-│   │       ├── run-tests.pl                 # Test runner for plugins/beacon/tests/t/.
-│   │       └── t/
-│   │           └── 01-list-sandbox-fallback.t
 │   ├── blueprint/                           # Authors and manages durable blueprints (plan-only — no execution or resume ve…
 │   │   ├── .claude-plugin/
 │   │   │   └── plugin.json                  # Plugin manifest for blueprint (name, version, description, author).
@@ -524,7 +488,7 @@ The orchestrator is two-phase: a bare run prints the plan and exits without touc
 
 ### Shell-script policy
 
-`.sh` and `.ps1` files exist only for **commands the user runs directly outside Claude** (`claude-sandbox`, `claude-beacon`). Everything else — install logic, plugin internals, statusline rendering — is Perl. One source of truth for host-side code.
+`.sh` and `.ps1` files exist only for **commands the user runs directly outside Claude** (`claude-sandbox`). Everything else — install logic, plugin internals, statusline rendering — is Perl. One source of truth for host-side code.
 
 Two deliberate exceptions: the `butler` and `blueprint` plugins each carry a small set of `.sh` scripts (`bp-lib.sh`, `bp-init.sh`, `bp-launch.sh`, `bp-status.sh`, `bp-resume-sweep.sh`, and hook shell scripts). These run **inside the Linux sandbox container**, where Bash is the right tool (POSIX process management, `flock`, `kill`, background jobs). `bp-lib.sh` is intentionally NOT byte-identical across the two plugins — the butler copy is a superset of the blueprint copy, adding sandbox-execution helpers that the blueprint (host-only) side has no need for.
 
@@ -550,13 +514,6 @@ Two deliberate exceptions: the `butler` and `blueprint` plugins each carry a sma
 **Sandbox**
 - `/sandbox:setup` — confirm `.ccpraxis-local-data/claude-home/` state and direct the user to run `claude-sandbox` from a terminal. `host-only`.
 
-**Beacons** (`beacon@ccpraxis-local` plugin)
-- `/beacon:on [label]` — mark the current session as ongoing work (idempotent — re-invoking refreshes the activity timestamp)
-- `/beacon:off` — remove the current session's mark (Claude asks first only when invoking proactively; direct user invocation needs no confirmation)
-- `/beacon:list` — render every visible beacon as a Markdown table (read-only)
-- `/beacon:view <id-or-prefix>` — show one beacon's full record (read-only)
-- `/beacon:delete <id-or-prefix>` — delete any beacon by ID after confirmation
-
 **Backpack** (`backpack@ccpraxis-local` plugin; sandbox-only — guarded by the `CLAUDE_SANDBOX=1` env var the launcher injects via `podman create -e`)
 - `/backpack:add` — register a new item with a rationale
 - `/backpack:remove` — drop an item
@@ -572,7 +529,6 @@ Two deliberate exceptions: the `butler` and `blueprint` plugins each carry a sma
 
 **Host CLIs (not slash commands — typed in a terminal):**
 - `claude-sandbox` — launch or reattach to a project's sandbox container
-- `claude-beacon` — TUI to resume any beaconed session
 
 ### Statusline
 
@@ -603,8 +559,7 @@ Bidirectional sync between your live `~/.claude/` config and your ccpraxis repo:
 7. Scans all staged files for secrets (API keys, tokens, credentials, private keys)
 8. Commits and pushes (pulls first to avoid conflicts)
 9. **Iterates every registered vault project** — runs the full sync engine for each (see Vault Sync below), surfacing conflicts interactively
-10. **Syncs vault-root beacons** — commits and pushes `beacons/<uuid>.json` records (ingesting any pending sandbox beacons first), with the same secret-scan defense as project content; see the Beacon plugin below for the lifecycle
-11. **Offers registration for the current project** if it has Claude files but isn't tracked yet — `Yes` invokes `/steward:setup-project`, `Not now` defers, `Don't ask again` writes a `.claude/backup-skip` opt-out marker
+10. **Offers registration for the current project** if it has Claude files but isn't tracked yet — `Yes` invokes `/steward:setup-project`, `Not now` defers, `Don't ask again` writes a `.claude/backup-skip` opt-out marker
 
 ### Vault sync
 
@@ -644,7 +599,7 @@ To change what's offered by default, edit `@DEFAULT_TRACKABLE` and `%HARD_EXCLUD
 - Two-level locking (vault `.lock` + per-project `.lock`) with PID+ISO-timestamp and 10-min stale reclaim
 - Atomic `.vault-sync.tmp` staging + batch-rename of staged files
 - Journal at `<vault>/projects/<slug>/.sync-journal.json` with phases (`staging` → `awaiting_resolution` → `renaming` → `sensitive_check` → `committing`); reconciliation on every sync start so an interrupted sync recovers cleanly
-- Secret-scanning is intentionally **not** applied to the private vault — it's a personal backup, so it stores project/beacon content (CLAUDE.md, blueprints) verbatim. Secret-scanning is the *public* ccpraxis repo's job only (`sensitive-check.pl`, backup Step 4). The vault scan hooks (`scan_files_for_secrets`, the `sensitive_check` journal phase) remain in code but are disabled by policy — re-enable by restoring `scan_files_for_secrets`
+- Secret-scanning is intentionally **not** applied to the private vault — it's a personal backup, so it stores project content (CLAUDE.md, blueprints) verbatim. Secret-scanning is the *public* ccpraxis repo's job only (`sensitive-check.pl`, backup Step 4). The vault scan hooks (`scan_files_for_secrets`, the `sensitive_check` journal phase) remain in code but are disabled by policy — re-enable by restoring `scan_files_for_secrets`
 - File-modified-during-sync rollback (re-hash before final rename)
 - Path safety (no `..`, no absolute paths, no backslashes; symlinks skipped via `File::Find` preprocess)
 
@@ -786,31 +741,9 @@ The install pass runs after `release_lock`. In manager mode the launcher then en
 - `/backpack:install` — replay install pass (no container rebuild needed)
 - `/backpack:audit` — surface items missing rationale or whose `verify` no longer passes
 
-### Beacon plugin
-
-`beacon@ccpraxis-local` marks Claude Code sessions as "ongoing meaningful work" so they can be resumed across restarts, terminal crashes, and context switches. Beacon state lives in the vault (host sessions) or `<project>/.ccpraxis-local-data/claude-home/beacons/` (sandbox sessions, ingested into the vault by a background sync), survives Claude wiping its own session data, and shows up as two counters on the statusline (project-local + global).
-
-The system is packaged as a local Claude Code **plugin**, bundling every skill with the shared scripts at a stable `${CLAUDE_PLUGIN_ROOT}` path. Enable it once via `enabledPlugins` in `~/.claude/settings.json` (already wired in this repo's `global-config/settings.json`). Slash commands all live under the `/beacon:*` namespace; one verb per skill.
-
-**Lifecycle (current session):**
-- **`/beacon:on [label]`** — light the current session, optional human-readable label. Idempotent (re-invoking refreshes the activity timestamp). Claude also self-invokes when the session has substantive ongoing work — a plan, multi-file edits, or a multi-step task.
-- **`/beacon:off`** — remove the **current session's** mark. Claude offers it when the user signals the session's work is finished ("done", "shipped", "merged", "PR opened", "let's call it", "lgtm", ...) — the plugin's completion-nudge hook (below) surfaces these signals reliably. Skip-signals like "done with that step, now X" or "done reading" are explicitly excluded in the skill's anti-trigger guidance. Confirmation rule: when Claude offers `/beacon:off` proactively, it asks first via `AskUserQuestion`; when the user types `/beacon:off` directly, the slash command is the consent and the skill removes immediately — no second prompt.
-
-**Housekeeping (by session ID, conversational — no TUI):**
-- **`/beacon:list`** — render every beacon visible from here as a Markdown table (`#`, scope, slug, label/summary, last active, 8-char session-id prefix), plus a count summary. Read-only.
-- **`/beacon:view <id-or-prefix>`** — show one beacon's full record (all 15 fields). Accepts a full UUID or a hex prefix (≥4 chars); halts unambiguously if a prefix matches multiple beacons.
-- **`/beacon:delete <id-or-prefix>`** — delete **any** beacon by ID after mandatory `AskUserQuestion` confirmation. Distinct from `/beacon:off`, which only removes the current session's mark. Halts on ambiguous prefix (never guesses).
-
-**Resume (TUI):**
-- **`claude-beacon`** — host CLI. Wrappers live in `plugins/beacon/bin/` and the plugin's own `ccpraxis-install.pl` wires that dir into PATH (the install orchestrator picks it up automatically — same pattern as the `claude-sandbox` launcher). Opens a TUI listing every live beacon, sorted by last activity, and on Enter execs `claude --resume <uuid>` (host beacons) or `claude-sandbox --resume-session <uuid> <project>` (sandbox beacons). `u` removes the highlighted beacon inline; `r` re-syncs and reloads; `q`/Esc quits. Non-TTY callers get a numbered-prompt fallback. **Runs on the host**, not inside a sandbox — sandbox beacons are reached by spawning a new `claude-sandbox` session.
-
-**Completion-nudge hook — propose, don't auto-act.** `plugins/beacon/hooks/completion-nudge.pl` is registered as a `UserPromptSubmit` hook via the plugin's `hooks/hooks.json` — auto-enabled on host and (when the user selects the beacon plugin in the claude-sandbox TUI) inside the sandbox; no `settings.json` edit needed on either surface. The registration uses shell form (`"command": "perl \"${CLAUDE_PLUGIN_ROOT}/hooks/completion-nudge.pl\""`) rather than exec form: exec form's libuv-based `uv_spawn` does NOT enumerate PATHEXT on Windows, so a bare `perl` can't resolve to `perl.exe`; shell form runs through Git Bash, which handles the extension correctly. Same pattern as the backpack `auto-declare` hook. On every prompt the user submits, the hook does a cheap word-boundary regex over the prompt text against the completion-signal list documented in `/beacon:off`'s SKILL.md description ("done", "shipped", "merged", "deployed", "landed", "PR opened", "lgtm", "looks good", "let's call it", ...). If no signal is present, the hook exits silently — no subprocess spawn, just the perl cold start + a regex match. If a signal IS present AND a beacon exists for the current `session_id`, the hook shells out to sibling `beacon.pl get` via `IPC::Open3` with stdout/stderr drained (otherwise the script's pretty-printed JSON record would leak into the hook's own stdout and Claude Code would silently misread it as plain-text `additionalContext`) and emits a `hookSpecificOutput.additionalContext` nudging Claude to evaluate sub-task-vs-session completion against the SKILL.md anti-trigger examples and offer `/beacon:off`. The hook **never** calls `beacon.pl unbeacon` itself — the `AskUserQuestion` Claude asks BEFORE invoking `/beacon:off` proactively (per the skill description's "ALWAYS confirm" clause) is what gates removal. Direct user invocation of `/beacon:off` skips that ask since the slash command itself is the consent. Same propose-only design as the backpack `auto-declare` hook: cost of a missed signal is one extra cleanup pass via `claude-beacon` or `/beacon:delete`, so the hook casts wide and Claude does the fine-grained call with full conversation context. Always exits 0 — a hook failure must not block the user's prompt.
-
-**Cross-machine sync:** `/steward:backup` includes vault-root `beacons/` in its push step (`vault-sync.pl sync-beacons` — pre-flight sandbox ingestion, secret scan, commit, push), so beacon state survives across machines just like project content.
-
 ### Platforms
 
-The launcher logic and every install hook are written in Perl 5.14+ (see prerequisites). The `.sh` / `.ps1` files under `plugins/*/bin/` are thin shims that locate Perl and exec the corresponding Perl script — they exist only so the user can type `claude-sandbox` / `claude-beacon` directly from their shell.
+The launcher logic and every install hook are written in Perl 5.14+ (see prerequisites). The `.sh` / `.ps1` files under `plugins/*/bin/` are thin shims that locate Perl and exec the corresponding Perl script — they exist only so the user can type `claude-sandbox` directly from their shell.
 
 - **Linux/macOS:** `claude-sandbox.sh` (Bash) execs `plugins/sandbox/scripts/launcher.pl`. No Bash version requirement beyond what comes with any modern distribution.
 - **Windows:** `claude-sandbox.ps1` (PowerShell) locates Perl (PATH, Git for Windows, Strawberry, ActiveState) and execs `plugins/sandbox/scripts/launcher.pl`. PATH and `.PS1` PATHEXT wiring is handled by `perl install.pl --confirm` — no manual environment-variable edits required.
@@ -825,7 +758,7 @@ Before doing anything else, gather both URLs from the user. If the user already 
 
 - **A. Their ccpraxis fork URL** *(required)*. ccpraxis is configuration the user owns and customizes, so they install from their own fork, not the upstream. If they haven't forked yet, ask them to fork `https://github.com/andrecarini/ccpraxis` on GitHub and then give you the URL of their fork. Public or private — their choice; this repo holds no secrets, so privacy is not load-bearing.
 
-- **B. Their private vault repo URL** *(optional but strongly recommended)*. This is a *separate* git repo (typical name: `claude-code-vault`) that holds personal Claude state across machines: todos, persistent plans, beacons, and per-project Claude files (CLAUDE.md, project skills, plans, memory). **It MUST be private** — it contains your personal working state and is the kind of data you do not want public. Any git host works (GitHub, GitLab, Gitea, self-hosted). If they don't already have one, tell them to create an empty **private** repo (e.g. `https://github.com/<user>/claude-code-vault`) and then give you the URL. If they decline to set this up now, that's fine — proceed without it; they can run `vault-sync.pl init` later.
+- **B. Their private vault repo URL** *(optional but strongly recommended)*. This is a *separate* git repo (typical name: `claude-code-vault`) that holds personal Claude state across machines: todos, persistent plans, and per-project Claude files (CLAUDE.md, project skills, plans, memory). **It MUST be private** — it contains your personal working state and is the kind of data you do not want public. Any git host works (GitHub, GitLab, Gitea, self-hosted). If they don't already have one, tell them to create an empty **private** repo (e.g. `https://github.com/<user>/claude-code-vault`) and then give you the URL. If they decline to set this up now, that's fine — proceed without it; they can run `vault-sync.pl init` later.
 
 Once you have URL A (and optionally URL B), clone ccpraxis:
 
@@ -865,7 +798,7 @@ The script is idempotent — re-runs converge from any prior state (plain copy, 
   ```
   For each key in `only_right` (in repo but not live) or `diverged` (different values), ask the user whether to adopt the repo value or keep their existing value. Keys in `only_left` (in live but not repo) are the user's own additions — keep them.
 
-After adopting (or copying), substitute `~` in path-valued fields with the user's home directory. Most JSON config consumers in Claude Code don't expand `~`. Specifically the `extraKnownMarketplaces.ccpraxis-local.source.path` field must be a real absolute path for the local `beacon` plugin marketplace to resolve. Rewrite that field to the on-disk absolute path of `~/.claude/ccpraxis/plugins` on this machine (Windows users can use forward slashes, e.g. `C:/Users/<name>/.claude/ccpraxis/plugins`, since Node accepts both forms).
+After adopting (or copying), substitute `~` in path-valued fields with the user's home directory. Most JSON config consumers in Claude Code don't expand `~`. Specifically the `extraKnownMarketplaces.ccpraxis-local.source.path` field must be a real absolute path for the local ccpraxis plugin marketplace to resolve. Rewrite that field to the on-disk absolute path of `~/.claude/ccpraxis/plugins` on this machine (Windows users can use forward slashes, e.g. `C:/Users/<name>/.claude/ccpraxis/plugins`, since Node accepts both forms).
 
 **5. Add missing marketplaces (must complete before step 6):**
 
@@ -879,7 +812,7 @@ Read the `enabledPlugins` from `global-config/settings.json`. For each plugin, c
 /plugin install <plugin-name>@<marketplace-name>
 ```
 
-**7. Wire ccpraxis's host launchers into PATH (`claude-sandbox`, `claude-beacon`, and anything else any plugin ships):**
+**7. Wire ccpraxis's host launchers into PATH (`claude-sandbox`, and anything else any plugin ships):**
 
 The install orchestrator is a two-phase Perl script. First run = plan only (prints what would change, exits without touching anything). Re-run with `--confirm` to apply.
 
@@ -910,7 +843,7 @@ git remote add upstream https://github.com/andrecarini/ccpraxis.git
 perl ~/.claude/ccpraxis/plugins/steward/scripts/vault-sync.pl init --url "<vault-url>"
 ```
 
-The init is cwd-agnostic — it clones to a fixed location (`~/.claude/claude-code-vault/`) regardless of where you run it from. If the vault is empty, the init scaffolds `README.md`, `.gitignore` (locks, journal, tmps, machine-local registry), `.gitattributes` (`* -text` to defeat CRLF normalization), and `todos/.gitkeep`, then commits and pushes. It does NOT pre-create `beacons/` or `projects/<slug>/` — those land lazily on first use (a `/beacon:on` will materialize `beacons/`; a `/steward:setup-project` will materialize `projects/<slug>/`). If the vault is already populated (e.g. from another machine), the clone preserves its contents.
+The init is cwd-agnostic — it clones to a fixed location (`~/.claude/claude-code-vault/`) regardless of where you run it from. If the vault is empty, the init scaffolds `README.md`, `.gitignore` (locks, journal, tmps, machine-local registry), `.gitattributes` (`* -text` to defeat CRLF normalization), and `todos/.gitkeep`, then commits and pushes. It does NOT pre-create `projects/<slug>/` — that lands lazily on first use (a `/steward:setup-project` will materialize it). If the vault is already populated (e.g. from another machine), the clone preserves its contents.
 
 If the user didn't provide a vault URL, skip this step — they can run the init later.
 

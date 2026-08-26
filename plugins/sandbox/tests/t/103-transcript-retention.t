@@ -181,7 +181,6 @@ my $HOST_BASELINE = {
     effortLevel                    => 'high',
     enabledPlugins => {
         'backpack@ccpraxis-local'                 => JSON::PP::true,
-        'beacon@ccpraxis-local'                    => JSON::PP::true,
         'blueprint@ccpraxis-local'                 => JSON::PP::true,
         'butler@ccpraxis-local'                    => JSON::PP::true,
         'feature-dev@claude-plugins-official'      => JSON::PP::true,
@@ -231,8 +230,6 @@ my $HOST_BASELINE = {
     permissions => {
         allow => [
             'Read',
-            'Skill(beacon:delete)', 'Skill(beacon:list)', 'Skill(beacon:off)',
-            'Skill(beacon:on)', 'Skill(beacon:view)',
             'Skill(blueprint:create)', 'Skill(blueprint:manage)',
             'Skill(butler:dispatch-fleet)', 'Skill(butler:drive-solo)',
             # DELIBERATE DECLARATION, not a sync (00-suite-baseline-green B8/AC-10).
@@ -257,7 +254,6 @@ my $HOST_BASELINE = {
             'Bash(find *)', 'Bash(grep *)', 'Bash(wc *)', 'Bash(awk *)', 'Bash(echo *)',
             'Bash(claude --version)', 'Bash(where claude*)', 'Bash(which claude*)',
             'Bash(git add *)', 'Bash(git commit *)', 'Bash(git rm *)',
-            'Bash(perl ~/.claude/ccpraxis/plugins/beacon/scripts/*)',
             'Bash(perl ~/.claude/ccpraxis/scripts/*)',
             'Bash(perl ~/.claude/ccpraxis/plugins/steward/scripts/*)',
             'Bash(bash ~/.claude/ccpraxis/plugins/steward/scripts/*)',

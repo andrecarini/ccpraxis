@@ -454,7 +454,7 @@ sub _candidate_source_paths {
 # root: `USERPROFILE=C:/Users/u/.claude` on the Windows family (never hardened
 # by launcher.pl's `_pp_env_seam`, and tried FIRST by notion B there) made the
 # real `claude-home` root match `exact`, deleted it, and took
-# `~/.claude/projects`, `/memory`, `/todos` and the beacon vault from REFUSE to
+# `~/.claude/projects`, `/memory` and `/todos` from REFUSE to
 # LAUNCH. That is blueprint C1 reopened, and it breaks Appendix B Decision #3
 # ("no override, no env var, no flag") and criterion D5.
 #

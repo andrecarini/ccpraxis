@@ -17,7 +17,6 @@ user's "accept plan and clear context" does the copy → new session → paste �
 | not this | use instead |
 |---|---|
 | a summary of what happened | just answer; or `/compact` |
-| wrapping up finished work | `/beacon:off` |
 | a durable multi-session initiative with ledgers | `/blueprint:create` |
 | a mechanical context squeeze that keeps this session alive | `/compact` |
 

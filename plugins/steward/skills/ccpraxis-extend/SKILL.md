@@ -69,7 +69,7 @@ For each skill being created, settle: name (kebab-case, no "claude"/"anthropic")
 Write the files into the **repo** (never directly into `~/.claude/skills` or a live plugin):
 
 - **Standalone skill:** `skills/<name>/SKILL.md` (+ any one-level-deep supporting files / `scripts/`).
-- **New plugin:** `plugins/<name>/.claude-plugin/plugin.json` (no `displayName` — the validator rejects it), `skills/<verb>/SKILL.md` per verb, optional `scripts/`, `bin/` (+ `ccpraxis-install.pl` only if it ships a CLI that must land on PATH — delegate to `scripts/_install-bin-helper.pl`). Reference bundled scripts from a skill body via `${CLAUDE_PLUGIN_ROOT}/scripts/...` in bash blocks (the env var bash expands at runtime), matching the other steward/beacon skills.
+- **New plugin:** `plugins/<name>/.claude-plugin/plugin.json` (no `displayName` — the validator rejects it), `skills/<verb>/SKILL.md` per verb, optional `scripts/`, `bin/` (+ `ccpraxis-install.pl` only if it ships a CLI that must land on PATH — delegate to `scripts/_install-bin-helper.pl`). Reference bundled scripts from a skill body via `${CLAUDE_PLUGIN_ROOT}/scripts/...` in bash blocks (the env var bash expands at runtime), matching the other steward skills.
 - **Skill inside an existing plugin:** just `plugins/<existing>/skills/<verb>/SKILL.md`.
 
 Then go to Step 4 (wiring).
