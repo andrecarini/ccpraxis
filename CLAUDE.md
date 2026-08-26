@@ -67,11 +67,36 @@ needs a toolchain, it belongs in the sandbox container.
 Layout: `plugins/<plugin>/tests/t/NN-name.t`, plain `Test::More`, no harness config.
 
 **`prove` does not exist on the Git-for-Windows host** — that perl ships no `TAP::Harness`
-(`Can't locate TAP/Harness/Env.pm`). Run files directly and judge by exit code plus `not ok` count:
+(`Can't locate TAP/Harness/Env.pm`). Run one file directly and judge by exit code plus `not ok`
+count:
 
 ```bash
 perl plugins/sandbox/tests/t/42-refuse-in-place.t
 ```
+
+**For a sweep, use the runner — never a serial `for` loop.** A full sweep is ~70 minutes of CPU
+across 243 files; run one at a time that is exactly what it costs, and a suite nobody wants to run
+is a suite that stops getting run.
+
+```bash
+perl scripts/run-tests.pl --fast            # ~85s: everything except the container tests
+perl scripts/run-tests.pl                   # everything
+perl scripts/run-tests.pl plugins/sandbox   # one plugin
+```
+
+The work here is dominated by PROCESS CREATION, not CPU — a bare statusline spawn costs ~292ms on
+this host — so parallelism buys more than the core count suggests.
+
+**The runner keeps the 12 container tests SERIAL, deliberately.** They start real podman containers
+against one podman machine, so running them concurrently makes them contend: slower in wall-clock
+AND flakier. That is the documented failure signature of this suite (`EXIT=124`/`255` with zero
+`not ok` lines — the process died, no assertion failed). They are classified by what they import,
+not by a tag, so a new one is handled without anybody remembering to mark it.
+
+Judging a "slowest files" list from a contended run is a trap worth naming: under six-way load
+`64-theme-tokens.t` reported 269s and `166-statusline-marker-glyph.t` 134s; run on their own they
+are 12s and ~10s. Contention inflates per-file timings, so measure a slow file **alone** before
+concluding anything about it.
 
 **Record a baseline before you change anything.** Both suites carry pre-existing red from
 in-flight work on other tracks; judge your change by red files *attributable to it*, never by an

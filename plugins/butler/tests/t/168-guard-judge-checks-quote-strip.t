@@ -51,24 +51,34 @@ PAYLOAD_EOF`;
 
 # PATH containing everything on the ambient PATH except jq -- used to prove the gate
 # short-circuits BEFORE jq is required (AC9), independent of host jq availability.
+# SUBTRACT THE DIRECTORIES THAT CONTAIN jq -- do not mirror every other
+# executable into a new one.
+#
+# This used to build a shadow bin/ by symlinking every executable on PATH (plus
+# /usr/bin, /bin, /usr/local/bin) except jq. Measured on this host that is 6401
+# symlinks, and it made this the slowest file in the repository by a wide
+# margin: 237s, of which ~20s was creating them and ~167s was File::Temp's
+# CLEANUP deleting them again at process exit. The teardown dominated because
+# File::Path::rmtree is pure Perl walking one entry at a time through the MSYS
+# layer -- native `rm -rf` does the same directory in 1.4s. The test body itself
+# runs in 13s.
+#
+# The intent is "a PATH on which jq cannot be found". Removing the directories
+# that contain it expresses exactly that, costs one stat per PATH entry instead
+# of thousands of symlinks, and creates nothing that has to be cleaned up.
+#
+# It is also MORE faithful than the mirror was: the mirror silently dropped
+# anything that was not a regular executable file (wrappers, shell functions
+# exported as scripts, anything unreadable), so the guard ran under a PATH
+# subtly unlike the real one. This keeps the real PATH minus jq.
 sub path_without_jq {
-    my $d = "$ROOT/no-jq-bin";
-    return fwd($d) if -d $d;
-    mkdir $d or die "mkdir $d: $!";
-    my %seen;
-    for my $dir (split(/:/, $ENV{PATH} // ''), '/usr/bin', '/bin', '/usr/local/bin') {
-        next unless length $dir && -d $dir;
-        opendir(my $dh, $dir) or next;
-        for my $f (readdir $dh) {
-            next if $f eq 'jq' || $f =~ /^\./;
-            next if $seen{$f}++;
-            my $src = "$dir/$f";
-            next unless -f $src && -x $src;
-            symlink($src, "$d/$f");
-        }
-        closedir $dh;
+    my @keep;
+    for my $dir (split /:/, ($ENV{PATH} // '')) {
+        next unless length $dir;
+        next if -x "$dir/jq" || -x "$dir/jq.exe";
+        push @keep, $dir;
     }
-    return fwd($d);
+    return join ':', @keep;
 }
 
 # =====================================================================================

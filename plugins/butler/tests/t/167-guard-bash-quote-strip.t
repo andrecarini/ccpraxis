@@ -111,25 +111,34 @@ sub run_guard {
 }
 
 # PATH containing everything on the ambient PATH EXCEPT perl (t/67's own precedent).
+# SUBTRACT THE DIRECTORIES THAT CONTAIN $name -- do not mirror every other
+# executable into a new one.
+#
+# This used to build a shadow bin/ by symlinking every executable on PATH (plus
+# /usr/bin, /bin, /usr/local/bin) except $name. Measured on this host that is
+# 6401 symlinks, and in t/168 -- which had the identical helper -- it made that
+# file the slowest in the repository by a wide margin: 237s, of which ~20s was
+# creating them and ~167s was File::Temp's CLEANUP deleting them again at
+# process exit. The teardown dominated because File::Path::rmtree is pure Perl
+# walking one entry at a time through the MSYS layer; native `rm -rf` does the
+# same directory in 1.4s. After this change t/168 runs in 0.6s.
+#
+# The intent is "a PATH on which $name cannot be found". Removing the
+# directories that contain it expresses exactly that, costs one stat per PATH
+# entry instead of thousands of symlinks, and creates nothing to clean up.
+#
+# It is also MORE faithful than the mirror was: the mirror silently dropped
+# anything that was not a regular executable file, so the code under test ran
+# under a PATH subtly unlike the real one. This keeps the real PATH minus $name.
 sub path_without {
     my ($name) = @_;
-    my $d = "$ROOT/no-$name-bin";
-    return fwd($d) if -d $d;
-    mkdir $d or die "mkdir $d: $!";
-    my %seen;
-    for my $dir (split(/:/, ($CLEAN_ENV{PATH} // '')), '/usr/bin', '/bin', '/usr/local/bin') {
-        next unless length $dir && -d $dir;
-        opendir(my $dh, $dir) or next;
-        for my $f (readdir $dh) {
-            next if $f eq $name || $f =~ /^\./;
-            next if $seen{$f}++;
-            my $src = "$dir/$f";
-            next unless -f $src && -x $src;
-            symlink($src, "$d/$f");
-        }
-        closedir $dh;
+    my @keep;
+    for my $dir (split /:/, ($CLEAN_ENV{PATH} // '')) {
+        next unless length $dir;
+        next if -x "$dir/$name" || -x "$dir/$name.exe";
+        push @keep, $dir;
     }
-    return fwd($d);
+    return join ':', @keep;
 }
 
 # =====================================================================================
