@@ -74,7 +74,10 @@ sub http_get {
     ) or return undef;
 
     binmode $sock;
-    syswrite($sock, "GET $path HTTP/1.0\r\nHost: $host:$port\r\nConnection: close\r\n\r\n")
+    # HTTP/1.1, not 1.0: as of Chrome 151 the DevTools HTTP endpoint
+    # closes HTTP/1.0 connections without sending a response at all.
+    # `Connection: close` keeps this a single-shot request regardless.
+    syswrite($sock, "GET $path HTTP/1.1\r\nHost: $host:$port\r\nConnection: close\r\n\r\n")
         or return undef;
 
     my $sel = IO::Select->new($sock);
