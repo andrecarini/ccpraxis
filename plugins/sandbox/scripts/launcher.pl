@@ -6540,6 +6540,42 @@ sub _probe_reason {
     return undef;
 }
 
+# ---------------------------------------------------------------------------
+# The `podman system df` cadence. See the df probe below for why it has one at
+# all; these are the two knobs and the two decisions, kept as PURE FUNCTIONS so
+# the policy is executable by a test rather than buried in a closure -- the same
+# discipline efdd028 applied to the container sampler's stale-versus-absent
+# mapping, and for the same reason: this decides what the panel shows about a
+# machine, so it should be checkable without running a probe.
+#
+# DF_INTERVAL is the operator's own number ("once every e.g. 10 minutes").
+# DF_MAX_AGE is three missed rounds -- one failure is a hiccup and the previous
+# reading is still the best answer available; three in a row is not a hiccup,
+# and at that point "n/a" is the honest render.
+use constant DF_INTERVAL_SECS => 600;
+use constant DF_MAX_AGE_SECS  => 1800;
+
+# Sampler-process state. This lives at file scope because _resources_probes
+# rebuilds its closures every round; the cache must outlive them.
+my ($DF_TEXT, $DF_OK_AT, $DF_TRY_AT);
+
+# _df_should_probe($now, $last_attempt_at) -> 0|1. Throttles ATTEMPTS, so a
+# probe that keeps timing out is not retried every sampler round.
+sub _df_should_probe {
+    my ($now, $try_at) = @_;
+    return 1 if !defined $try_at;
+    return ($now - $try_at >= DF_INTERVAL_SECS()) ? 1 : 0;
+}
+
+# _df_believe_cached($now, $last_success_at) -> 0|1. Bounds the carry-forward,
+# so a permanently-failing probe eventually renders 'n/a' instead of a figure
+# that has quietly stopped being true.
+sub _df_believe_cached {
+    my ($now, $ok_at) = @_;
+    return 0 if !defined $ok_at;
+    return ($now - $ok_at < DF_MAX_AGE_SECS()) ? 1 : 0;
+}
+
 sub _resources_probes {
     # STDERR IS CAPTURED, NOT DISCARDED.
     #
@@ -6556,12 +6592,14 @@ sub _resources_probes {
     my %p = (
         stats => sub { my $e = _probe_err_path('stats'); my $t = _timeout_prefix(5);
                        scalar `${t}$PODMAN stats --no-stream --format json 2>"$e"` },
-        # `system df` GETS ITS OWN BUDGET, and the number is measured rather
-        # than picked (operator, 2026-08-26: the podman disk figures "sometimes
-        # they appear sometimes they disappear. Why?").
+        # `system df` GETS ITS OWN BUDGET AND ITS OWN CADENCE, and both numbers
+        # are measured or given rather than picked (operator, 2026-08-26: the
+        # podman disk figures "sometimes they appear sometimes they disappear.
+        # Why?" -- then, on the fix: "the podman query is something that could
+        # happen once every e.g. 10 minutes").
         #
-        # Because a five-second budget was hopeless for it. Timed on the
-        # operator's host, three consecutive runs:
+        # A five-second budget was hopeless for it. Timed on the operator's
+        # host, three consecutive runs each:
         #
         #     podman machine list   0.54s
         #     podman stats          0.56s
@@ -6569,20 +6607,43 @@ sub _resources_probes {
         #
         # Its two siblings are twenty to fifty times faster. `system df` walks
         # image, container and volume storage inside the WSL VM, so its cost
-        # tracks how much is stored, not how much is running -- which is exactly
+        # tracks how much is STORED, not how much is running -- which is exactly
         # why it flapped: it landed only on the rounds it happened to finish
         # inside five seconds, and pod_images/pod_containers/pod_volumes are the
         # only three facts fed by one probe, so they vanished and returned as a
-        # group of three.
+        # group of exactly three.
         #
-        # 45s is comfortably above the worst reading, and this probe cannot
-        # block the render tick regardless -- it runs in the detached sampler
-        # (efdd028), whose whole purpose is that a slow probe costs latency
-        # nowhere. The failure mode a longer budget risks is a sampler round
-        # overrunning its own interval, which the snapshot's freshness accounting
-        # already reports honestly rather than hiding.
-        df    => sub { my $e = _probe_err_path('df'); my $t = _timeout_prefix(45);
-                       scalar `${t}$PODMAN system df --format json 2>"$e"` },
+        # RAISING THE BUDGET ALONE WOULD HAVE BEEN THE WRONG HALF OF THE FIX,
+        # and this is the operator's point. At the sampler's 23-second cadence a
+        # 10-to-25-second command runs essentially back to back -- the heaviest
+        # thing in the system, continuously, to re-measure storage totals that
+        # move on the order of hours. So the probe now runs at most once per
+        # DF_INTERVAL and the reading is carried forward in between.
+        #
+        # THE CARRY-FORWARD IS BOUNDED, for the reason efdd028 already had to
+        # learn one level down: a cached value that is believed forever stops
+        # being a measurement and becomes a claim. A reading is believed for
+        # DF_MAX_AGE (three missed rounds) and then dropped to undef, so a
+        # permanently-failing probe degrades to "n/a" rather than showing
+        # yesterday's figures as though they were current.
+        #
+        # ATTEMPTS are throttled, not successes -- otherwise a probe that TIMES
+        # OUT would be retried every 23 seconds, which is the 45-second command
+        # running near-continuously all over again, in the one situation where
+        # it is already unhealthy.
+        df    => sub {
+            my $now = time;
+            if (_df_should_probe($now, $DF_TRY_AT)) {
+                $DF_TRY_AT = $now;
+                my $e = _probe_err_path('df'); my $t = _timeout_prefix(45);
+                my $out = scalar `${t}$PODMAN system df --format json 2>"$e"`;
+                if (defined $out && $out =~ /\S/) {
+                    ($DF_TEXT, $DF_OK_AT) = ($out, $now);
+                    return $out;
+                }
+            }
+            return _df_believe_cached($now, $DF_OK_AT) ? $DF_TEXT : undef;
+        },
     );
     return \%p unless $WINDOWS_FAMILY;
     my %cmd = _ps_commands();

@@ -113,4 +113,94 @@ SKIP: {
         "A2: one sample round costs at most ONE powershell.exe (measured: $spawns; was 3)");
 }
 
+# ===========================================================================
+# B -- `podman system df` HAS ITS OWN CADENCE, and the policy is a pure
+# function so it can be checked without running a probe.
+#
+# Operator, 2026-08-26: the podman disk figures "sometimes they appear
+# sometimes they disappear. Why?" -- then, on the fix: "the podman query is
+# something that could happen once every e.g. 10 minutes".
+#
+# Measured on their host, three consecutive runs: `podman machine list` 0.54s,
+# `podman stats` 0.56s, `podman system df` 10.6s / 18.8s / 25.1s. All three
+# shared a five-second bound, so the third almost always died -- and it takes
+# pod_images/pod_containers/pod_volumes with it, which is why they flapped as a
+# group of exactly three.
+#
+# Raising the budget alone would have left a 10-to-25-second command running
+# back to back at the sampler's 23-second cadence: the heaviest thing in the
+# system, continuously, to re-measure storage totals that move on the order of
+# hours. This section is that half of the fix -- the same spawn-budget concern
+# the rest of this file exists for, one probe over.
+# ===========================================================================
+{
+    my ($iv)  = $src =~ /use constant DF_INTERVAL_SECS\s*=>\s*(\d+)/;
+    my ($max) = $src =~ /use constant DF_MAX_AGE_SECS\s*=>\s*(\d+)/;
+    ok(defined $iv && defined $max, 'B1: both df cadence constants are declared')
+        or diag("  interval=" . ($iv // 'undef') . " max_age=" . ($max // 'undef'));
+
+  SKIP: {
+        skip('cadence constants not found', 7) unless defined $iv && defined $max;
+
+        # The interval must be far above the sampler's own, or the probe is
+        # still effectively running every round -- which is the defect.
+        my ($sample) = do {
+            my $rp = "$ROOT/plugins/sandbox/scripts/Resources.pm";
+            open my $fh, '<', $rp or die "read Resources.pm: $!";
+            local $/; my $rs = <$fh>; close $fh;
+            $rs =~ /my \$SAMPLE_INTERVAL\s*=\s*(\d+)/;
+        };
+        ok(defined $sample, 'B1: the sampler cadence is readable from Resources.pm');
+        cmp_ok($iv, '>', 10 * ($sample // 23),
+            "B1 CANONICAL: the df interval ($iv s) is an order of magnitude above the sampler "
+          . 'cadence -- the probe stops riding every round, which is the whole point');
+        cmp_ok($max, '>', $iv,
+            'B1: a cached reading is believed for LONGER than the re-probe interval, or a '
+          . 'single miss would blank the row that the cache exists to hold steady');
+
+        # The two decisions, extracted and exercised directly.
+        my ($should)  = $src =~ /(sub _df_should_probe \{.*?\n\})/s;
+        my ($believe) = $src =~ /(sub _df_believe_cached \{.*?\n\})/s;
+        ok(defined $should && defined $believe, 'B2: both cadence deciders are extractable');
+
+      SKIP: {
+            skip('deciders not extractable', 3) unless defined($should) && defined($believe);
+            my $pkg = 'DfCadence';
+            my $ok = eval "package $pkg;\nuse strict;\nuse warnings;\n"
+                   . "use constant DF_INTERVAL_SECS => $iv;\n"
+                   . "use constant DF_MAX_AGE_SECS  => $max;\n$should\n$believe\n1;\n";  ## no critic
+            ok($ok, 'B2: they eval cleanly into a fresh package') or diag("eval error: $@");
+
+            no strict 'refs';   ## no critic
+            my $sp = \&{"${pkg}::_df_should_probe"};
+            my $bc = \&{"${pkg}::_df_believe_cached"};
+
+            # THE FIRST ROUND ALWAYS PROBES, then not again until due. Asserted
+            # across the boundary from both sides, so an off-by-one shows up.
+            ok($sp->(1000, undef),          'B3: with no prior attempt the probe runs');
+            ok(!$sp->(1000, 1000),          'B3: immediately after an attempt it does not');
+            ok(!$sp->(1000 + $iv - 1, 1000), 'B3: one second before it is due, it does not');
+            ok($sp->(1000 + $iv, 1000),      'B3: at the interval, it does');
+
+            # ATTEMPTS are throttled, not successes -- the failure case is the
+            # one that matters, because a probe that TIMES OUT and is retried
+            # every round is the original defect wearing a longer timeout.
+            ok(!$sp->(1000 + 23, 1000),
+               'B3 CANONICAL: a FAILED attempt still counts as an attempt -- a timing-out probe '
+             . 'is not retried on the next sampler round');
+
+            # ...and the carry-forward is bounded, so a permanently-broken
+            # probe degrades to n/a rather than showing figures that quietly
+            # stopped being true.
+            ok($bc->(1000 + $max - 1, 1000),
+               'B4: a reading younger than the max age is still believed');
+            ok(!$bc->(1000 + $max, 1000),
+               'B4 CANONICAL: at the max age it is NOT -- a cache believed forever stops being a '
+             . 'measurement and becomes a claim');
+            ok(!$bc->(1000, undef),
+               'B4: with no successful reading ever, nothing is believed');
+        }
+    }
+}
+
 done_testing();
