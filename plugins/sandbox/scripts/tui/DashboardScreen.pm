@@ -1107,10 +1107,22 @@ sub _blueprints_body {
 # is neutral grey and recedes into the panel. At warn and crit it takes
 # pressure_role and becomes the only coloured thing on the screen, which is
 # exactly when that is worth being.
+# ...AND THE NORMAL FILL IS ACCENT, NOT GREY (same operator request, the
+# "different colors" half).
+#
+# The first pass at quieting these rows made the below-warn fill text.muted --
+# correct in that it stopped shouting, wrong in that it left the gauge
+# indistinguishable from the label beside it. A meter is a UI element; it should
+# read as one. accent is the token this design system already spends on "this is
+# a thing, not prose" (the project name in the header, the used-token count in
+# the statusline), it is calm, and it is nowhere near the alarm palette.
+#
+# So the ramp is now accent -> state.warn -> state.crit: an identity at rest, an
+# alarm only under pressure. The track stays 'rule' either way.
 sub _gauge_role {
     my ($ratio) = @_;
     my $r = tui::Meter::pressure_role($ratio);
-    return 'text.muted' if !defined $r || $r eq 'state.ok';
+    return 'accent' if !defined $r || $r eq 'state.ok';
     return $r;
 }
 
@@ -1168,6 +1180,23 @@ sub _bytes_gauge_spans {
 # IS the percentage, so it lives in the percent column and the figures column
 # is empty. One decimal is kept: a CPU reading moves continuously and the
 # tenth is the part that shows it moving, which is why PERCENT_COL_WIDTH is 5.
+# _figures_only_spans($text) -> \@spans -- a row that has FIGURES but no gauge,
+# with those figures starting in the same column the gauge rows put theirs.
+#
+# The podman row is the only one of these (operator, 2026-08-26: "have its data
+# aligned with the other cells below"). It reports three storage totals with no
+# ratio to gauge them against -- there is no "total podman storage" to be a
+# percentage OF -- so it leaves the bar and percent columns empty and joins the
+# table at the figures column, which is exactly what "aligned with the other
+# cells" means here.
+sub _figures_only_spans {
+    my ($text) = @_;
+    return [ { text => 'n/a', role => 'text.muted' } ]
+        unless defined $text && length $text;
+    my $pad = tui::Meter::BAR_CELLS() + 1 + tui::Meter::PERCENT_COL_WIDTH() + 2;
+    return [ { text => (' ' x $pad) . $text, role => 'text.primary' } ];
+}
+
 sub _pct_gauge_spans {
     my ($pct, $trail) = @_;
     return _gauge_value_spans(undef, undef, undef, $trail)
@@ -1199,19 +1228,25 @@ sub _resources_body {
     my $machine_row = row({ label => 'machine', value => \@mv });
     push @lines, $machine_row if @$machine_row;
 
+    # PODMAN SITS DIRECTLY UNDER MACHINE (operator, 2026-08-26: "Move the podman
+    # entry to under the machine entry"), which is also where it belongs: both
+    # are facts about the podman installation itself rather than about anything
+    # running inside it, so the panel now reads machine-then-storage, then the
+    # live measurements. It was previously stranded between ctr cpu and host
+    # ram, splitting the container readings from the host ones.
+    my ($pi, $pc, $pv) = ($r->{pod_images}, $r->{pod_containers}, $r->{pod_volumes});
+    my $podman_val = (defined($pi) || defined($pc) || defined($pv))
+        ? _figures_only_spans(sprintf('images %s | containers %s | volumes %s',
+                tui::Meter::fmt_bytes($pi), tui::Meter::fmt_bytes($pc), tui::Meter::fmt_bytes($pv)))
+        : [ { text => 'n/a', role => 'text.muted' } ];
+    my $podman_row = row({ label => 'podman', value => $podman_val });
+    push @lines, $podman_row if @$podman_row;
+
     my $ctrmem_row = row({ label => 'ctr mem', value => _bytes_gauge_spans($r->{ctr_mem_used}, $r->{vm_mem_total}) });
     push @lines, $ctrmem_row if @$ctrmem_row;
 
     my $ctrcpu_row = row({ label => 'ctr cpu', value => _pct_gauge_spans($r->{ctr_cpu_pct}) });
     push @lines, $ctrcpu_row if @$ctrcpu_row;
-
-    my ($pi, $pc, $pv) = ($r->{pod_images}, $r->{pod_containers}, $r->{pod_volumes});
-    my $podman_val = (defined($pi) || defined($pc) || defined($pv))
-        ? [ { text => sprintf('images %s | containers %s | volumes %s',
-                    tui::Meter::fmt_bytes($pi), tui::Meter::fmt_bytes($pc), tui::Meter::fmt_bytes($pv)), role => 'text.primary' } ]
-        : [ { text => 'n/a', role => 'text.muted' } ];
-    my $podman_row = row({ label => 'podman', value => $podman_val });
-    push @lines, $podman_row if @$podman_row;
 
     my $hostram_row = row({ label => 'host ram', value => _bytes_gauge_spans($r->{host_ram_used}, $r->{host_ram_total}) });
     push @lines, $hostram_row if @$hostram_row;

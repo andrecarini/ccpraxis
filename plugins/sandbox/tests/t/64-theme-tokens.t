@@ -394,7 +394,7 @@ SKIP: {
     skip('Dashboard.pm did not load', 2) unless $DASHBOARD_OK;
     my $full_block = Encode::encode('UTF-8', "\x{2588}");   # gauge.full, Dashboard.pm:240, declared width 1
     is(Dashboard::display_width($full_block), 1,
-        'sanity: Dashboard::display_width agrees with Dashboard\'s own declared width for U+2588 (gauge.full)');
+        'sanity: Dashboard::display_width agrees with Dashboard\'s own declared width for gauge.full');
     my $up_triangle = Encode::encode('UTF-8', "\x{25B2}");  # scroll.up, Dashboard.pm:242, declared width 1
     is(tui::Layout::glyph_width($up_triangle), 1,
         'sanity: Dashboard::glyph_width agrees with Dashboard\'s own declared width for U+25B2 (scroll.up)');
@@ -408,7 +408,7 @@ SKIP: {
 for my $cp (0x1F4E6, 0x1F7E2, 0x1F534, 0x1F7E1, 0x26AA, 0xFE0F) {
     ok(_is_emoji($cp), sprintf('_is_emoji(0x%04X) is TRUE (B-E6, AC-10, fixture)', $cp));
 }
-for my $cp (0xFF5C, 0x2500, 0x2502, 0x25CF, 0x25CB, 0x25B3, 0x25B6, 0x2191, 0x00B7, 0x00D7, 0x280B, 0x2588, 0x0041, 0x200D) {
+for my $cp (0xFF5C, 0x2500, 0x2502, 0x25CF, 0x25CB, 0x25B3, 0x25B6, 0x2191, 0x00B7, 0x00D7, 0x280B, 0x2584, 0x0041, 0x200D) {
     ok(!_is_emoji($cp), sprintf('_is_emoji(0x%04X) is FALSE (B-E6, AC-10, fixture)', $cp));
 }
 
@@ -1421,8 +1421,13 @@ is_deeply(Theme::x256_rgb(196), [255, 0, 0],     'x256_rgb(196) == [255,0,0] (B-
         'corner.br'   => { cp => 0x2518, width => 1 },
         'sep.bar'     => { cp => 0xFF5C, width => 2 },
         'sep.dot'     => { cp => 0x00B7, width => 1 },
-        'gauge.full'  => { cp => 0x2588, width => 1 },
-        'gauge.empty' => { cp => 0x2591, width => 1 },
+        # RE-POINTED 2026-08-26: the meter stopped being a full-height block
+        # (operator: "can we have blocks that are not full height?"). This
+        # table is the INDEPENDENT copy Theme is checked against, so the
+        # codepoints move here by hand -- deriving them from Theme would make
+        # the comparison circular and the guard useless.
+        'gauge.full'  => { cp => 0x2584, width => 1 },
+        'gauge.empty' => { cp => 0x2581, width => 1 },
         'scroll.up'   => { cp => 0x25B2, width => 1 },
         'scroll.down' => { cp => 0x25BC, width => 1 },
         'arrow.up'    => { cp => 0x2191, width => 1 },

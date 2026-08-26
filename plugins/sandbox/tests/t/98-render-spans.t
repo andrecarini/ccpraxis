@@ -82,8 +82,11 @@ my @SPINNER_GLYPHS =
 
 my @GLYPHS = (
     @SPINNER_GLYPHS,
-    [0x2588,  1, 'gauge',   'full block'],
-    [0x2591,  1, 'gauge',   'light shade'],
+    # DERIVED (re-pointed 2026-08-26): AC-2/AC-15 are about the width
+    # contract -- declared, and equal in both encodings -- which holds over
+    # whatever glyphs Theme names, exactly as for the spinner frames above.
+    [ord(Theme::glyphs()->{'gauge.full'}{char}),  1, 'gauge', 'meter fill'],
+    [ord(Theme::glyphs()->{'gauge.empty'}{char}), 1, 'gauge', 'meter track'],
     [0x25B2,  1, 'scroll',  'up triangle'],
     [0x25BC,  1, 'scroll',  'down triangle'],
 );

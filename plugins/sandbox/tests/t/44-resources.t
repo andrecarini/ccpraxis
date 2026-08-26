@@ -138,8 +138,12 @@ my $FX_MACHINE_STARTING = q{[{"Name":"boot-me","Default":true,"Running":false,"S
 # ===========================================================================
 # Glyph literals (S2.5): UTF-8 BYTES, the module's span `text` contract.
 # ===========================================================================
-my $FULL  = encode('UTF-8', "\x{2588}");    # E2 96 88
-my $LIGHT = encode('UTF-8', "\x{2591}");    # E2 96 91
+# DERIVED from Theme, not spelled (re-pointed 2026-08-26, when the meter
+# stopped being a full-height block). Every assertion below is about the
+# SHAPE of a bar -- how many cells are filled -- never about which glyph
+# fills them, so a re-styling should re-point this file rather than break it.
+my $FULL  = Theme::glyph('gauge.full');
+my $LIGHT = Theme::glyph('gauge.empty');
 
 sub g { my ($f, $cells) = @_; $cells = 10 unless defined $cells; return ($FULL x $f) . ($LIGHT x ($cells - $f)); }
 
@@ -1143,10 +1147,16 @@ ok(Resources->can('gather'), 'S2.4: Resources::gather exists (guards the counter
     is(Dashboard::display_width(defined $g4 ? $g4 : ''), 4, 'AC-17: display_width(gauge(100,100,4)) == 4');
     is(D('gauge', 100, 100, 4.9), $FULL x 4, 'AC-17: $cells is truncated with int() (4.9 -> 4)');
 
-    # Both glyphs are already allow-listed (this package adds none).
+    # Both glyphs are already allow-listed (this package adds none). Looked up
+    # by NAME rather than by codepoint (re-pointed 2026-08-26): the claim is
+    # "whatever the meter is made of is declared, at width 1", which survives a
+    # re-styling; a spelled codepoint does not.
     my $table = _dash_glyph_table();
-    is(ref($table) eq 'HASH' ? $table->{"\x{2588}"} : undef, 1, 'AC-17: U+2588 is already in glyph_table at width 1');
-    is(ref($table) eq 'HASH' ? $table->{"\x{2591}"} : undef, 1, 'AC-17: U+2591 is already in glyph_table at width 1');
+    for my $name (qw(gauge.full gauge.empty)) {
+        my $ch = Theme::glyphs()->{$name}{char};
+        is(ref($table) eq 'HASH' ? $table->{$ch} : undef, 1,
+            "AC-17: $name is already in glyph_table at width 1");
+    }
 }
 
 # --- AC-18 -> DC-4: fmt_bytes, the 20 pinned literals. --------------------

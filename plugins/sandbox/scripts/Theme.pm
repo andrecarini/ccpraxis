@@ -333,8 +333,28 @@ sub _glyphs_data {
         # a glyph that surface emits without an entry here is exactly what that
         # guard exists to catch. East-Asian-ambiguous, declared as one column.
         'icon.blueprints' => { cp => 0x29C9, desc => 'two joined squares, blueprint count' },
-        'gauge.full'  => { cp => 0x2588, desc => 'full block, meter fill' },
-        'gauge.empty' => { cp => 0x2591, desc => 'light shade, meter track' },
+        'icon.todos'      => { cp => 0x22EE, desc => 'vertical ellipsis, todo count' },
+        # THE GAUGE IS NOT A FULL-HEIGHT BLOCK (operator, 2026-08-26: "I want a
+        # different usage bar foreground styling. Different colors and also
+        # different character. Maybe doesn't need to be a solid block, could be
+        # a slightly dithered one. Or maybe even something completely different
+        # than the full height block. Can we have blocks that are not full
+        # height?").
+        #
+        # Yes -- U+2581..U+2588 are the eighth-height ladder, and the answer to
+        # the question is this pair. U+2584 (lower half block) fills the bottom
+        # half of the cell, so the gauge sits ON the text baseline instead of
+        # standing a full row tall next to it: the same information at roughly
+        # half the visual weight, which is what "too distracting" was about.
+        # U+2581 (lower one eighth) leaves a thin rule where the channel
+        # continues, so the track reads as a channel rather than as more blocks.
+        #
+        # The dithered alternative the operator also floated is one line from
+        # here -- U+2593 over U+2591 -- and was NOT chosen because a shade
+        # pattern still occupies the full cell height, so it changes the texture
+        # without changing the mass. Height is what carries the weight.
+        'gauge.full'  => { cp => 0x2584, desc => 'lower half block, meter fill' },
+        'gauge.empty' => { cp => 0x2581, desc => 'lower one eighth block, meter track' },
         'scroll.up'   => { cp => 0x25B2, desc => 'black up-pointing triangle, scroll indicator' },
         'scroll.down' => { cp => 0x25BC, desc => 'black down-pointing triangle, scroll indicator' },
         'arrow.up'    => { cp => 0x2191, desc => 'upwards arrow, git-ahead count' },
