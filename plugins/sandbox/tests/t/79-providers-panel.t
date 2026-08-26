@@ -275,9 +275,17 @@ sub runs_n {
       SKIP: {
             skip('no access row found in one arm', 3) unless defined($access_with) && defined($access_without);
             like($access_with, qr/EXPIRED/, 'AC3: the access row still carries the expiry-state text');
-            like($access_with, qr/45s/,
-                'AC3/Behavior4: the SAME access row ALSO carries the last-refreshed duration (fmt_duration(45)="45s") when last_refreshed_age is defined');
-            unlike($access_without, qr/45s/,
+            # RE-POINTED 2026-08-26: the expected text is DERIVED from
+            # fmt_duration rather than spelled '45s', because sub-minute
+            # durations now render as the '<1m' floor (operator request) and a
+            # pasted literal turns that into a red test about a fixture number.
+            # The claim -- this row carries the last-refreshed duration, and
+            # carries none when the age is absent -- is unchanged.
+            my $dur = quotemeta(tui::DashboardScreen::fmt_duration(45));
+            like($access_with, qr/$dur/,
+                "AC3/Behavior4: the SAME access row ALSO carries the last-refreshed duration "
+              . "(fmt_duration(45)) when last_refreshed_age is defined");
+            unlike($access_without, qr/refreshed/,
                 'AC3/Behavior4: with last_refreshed_age undefined, no duration renders in the access row (matches suppression of the old standalone refreshed row)');
         }
 

@@ -100,14 +100,32 @@ sub count_of {
 # the legacy Dashboard::fmt_age (Dashboard::fmt_age becomes a delegating
 # alias to this).
 # ===========================================================================
-use constant DURATION_RE => qr/\A(?:\d+s|\d+m|\d+h\d{2}m|\d+d\d{2}h|n\/a)\z/;
+# The `<1m` branch is the sub-minute floor (2026-08-26) -- see fmt_duration's
+# own note. Nothing emits a bare seconds figure any more, but the \d+s branch
+# stays: this constant is the SHAPE VALIDATOR for duration-looking tokens found
+# anywhere on a rendered frame, and narrowing it would turn a stray seconds
+# reading from something a test can catch into something it silently ignores.
+use constant DURATION_RE => qr/\A(?:<1m|\d+s|\d+m|\d+h\d{2}m|\d+d\d{2}h|n\/a)\z/;
 
 sub fmt_duration {
     my ($s) = @_;
     return 'n/a' if !defined($s) || ref($s) || $s !~ /^-?\d+(?:\.\d+)?$/;
     $s = int($s);
     return 'n/a' if $s < 0;
-    return "${s}s" if $s < 60;
+    # SUB-MINUTE COLLAPSES TO "<1m" (operator, 2026-08-26: "All counters in the
+    # format `Xs ago` or `Xs old` could be instead `<1m ago` and then `1m ago`").
+    #
+    # A seconds figure on these rows was precision nobody could use. "heartbeat
+    # 52s ago" and "heartbeat 8s ago" call for exactly the same response --
+    # none -- while the digits churn every tick, which is motion on a panel
+    # whose whole design goal is to sit still. The one thing a reader actually
+    # needs from that range is "it has not been a minute yet", and "<1m" says
+    # that without redrawing.
+    #
+    # It is also the honest shape: every other rung of this ladder is a
+    # coarsening (minutes drop seconds, hours drop minutes), so the bottom rung
+    # coarsening too is the rule rather than an exception to it.
+    return '<1m' if $s < 60;
     my $m = int($s / 60);
     return "${m}m" if $m < 60;
     my $h = int($m / 60); $m %= 60;
@@ -331,6 +349,7 @@ my @RESOURCE_FACT_KEYS = qw(
     ctr_mem_used vm_mem_total ctr_cpu_pct
     pod_images pod_containers pod_volumes
     host_ram_used host_ram_total
+    host_swap_used host_swap_total
     host_disk_dev host_disk_used host_disk_total
     host_cpu_pct host_cores
 );
@@ -675,9 +694,29 @@ sub header_spans {
     $cols = 1 if !defined($cols) || ref($cols) || $cols !~ /^-?\d+(?:\.\d+)?$/ || int($cols) < 1;
     $cols = int($cols);
 
+    # THE CLAUSE SEPARATOR IS A MIDDLE DOT, IN THE RULE ROLE (operator,
+    # 2026-08-26: "I would like to replace the `-` separator with another
+    # character. Maybe just a center dot with a different darker and less
+    # saturated color?").
+    #
+    # A hyphen is a word that reads as part of the sentence -- "ccpraxis sandbox
+    # - proj - claude-proj-2c052ba3" has hyphens inside the container id too, so
+    # the same character was doing two different jobs on one row. A middle dot
+    # is punctuation that cannot be confused for content, and painting it in the
+    # 'rule' role -- the darkest, least saturated token in the palette, already
+    # the one every border uses -- makes the clauses separate without the
+    # separator asking to be read.
+    #
+    # It is a SPAN OF ITS OWN precisely so it can carry that role; the clause
+    # texts keep 'accent'.
     my $pn = ref($state->{project_name}) ? undef : $state->{project_name};
-    my $left = 'ccpraxis sandbox';
-    $left .= ' - ' . tui::Frame::safe($pn) if defined($pn) && length($pn);
+    my $sep_glyph = Theme::glyph('sep.dot');
+    $sep_glyph = '-' if !defined $sep_glyph || !length $sep_glyph;
+    my @sep = ( { text => " $sep_glyph ", role => 'rule' } );
+
+    my @left = ( { text => 'ccpraxis sandbox', role => 'accent' } );
+    push @left, @sep, { text => tui::Frame::safe($pn), role => 'accent' }
+        if defined($pn) && length($pn);
 
     my $ctr_raw = ref($state->{container}) ? undef : $state->{container};
     my $ctr = tui::Frame::safe(defined($ctr_raw) ? $ctr_raw : '');
@@ -713,18 +752,18 @@ sub header_spans {
     # nothing else on the screen is placed that way, and the gap read as two
     # unrelated things sharing a row rather than one sentence naming this
     # sandbox. It is now a third clause of the same phrase, joined by the same
-    # ' - ' that already joins the project to "ccpraxis sandbox", and the
+    # separator that already joins the project to "ccpraxis sandbox", and the
     # padding goes where padding goes everywhere else: at the end.
-    my @right = (length($ctr) ? ( { text => ' - ' . $ctr, role => 'accent' } ) : ());
+    my @right = (length($ctr) ? ( @sep, { text => $ctr, role => 'accent' } ) : ());
 
     my $leadw = tui::Frame::spans_width(\@lead);
-    my $lw    = tui::Layout::display_width($left);
+    my $lw    = tui::Frame::spans_width(\@left);
     my $rw    = tui::Frame::spans_width(\@right);
 
     if ($leadw + $lw + $rw <= $cols) {
         return [
             @lead,
-            { text => $left, role => 'accent' },
+            @left,
             @right,
             { text => (' ' x ($cols - $leadw - $lw - $rw)), role => 'accent' },
         ];
@@ -734,12 +773,9 @@ sub header_spans {
     # so: an operator squinting at an 80-column window needs the state far more
     # than an id they can read off `podman ps`.
     if ($leadw + $lw <= $cols) {
-        return [
-            @lead,
-            { text => tui::Frame::clip_pad($left, $cols - $leadw), role => 'accent' },
-        ];
+        return [ @lead, @{ tui::Frame::fit_spans(\@left, $cols - $leadw, 'accent') } ];
     }
-    return tui::Frame::fit_spans([ @lead, { text => $left, role => 'accent' } ], $cols, 'accent');
+    return tui::Frame::fit_spans([ @lead, @left ], $cols, 'accent');
 }
 
 # ===========================================================================
@@ -1054,25 +1090,60 @@ sub _blueprints_body {
 # _gauge_value_spans($ratio, $pct_text, $figures, \@trail) -> \@spans -- the
 # value half of a gauge row, in column order. $figures may be undef (the CPU
 # rows have no used/free/total to show).
+# _gauge_role($ratio) -> the role the FILL and the percent carry.
+#
+# COLOUR ONLY WHERE IT MEANS SOMETHING (operator, 2026-08-26: "I want the colors
+# and styling of the usage bars to less distracting. I like the color coding and
+# all, but right now it's not good").
+#
+# Every gauge row used to paint its bar, its percent AND its figures in
+# pressure_role -- so a perfectly healthy machine rendered as five rows of
+# bright green, and the one row that had something to say looked exactly as
+# loud as the four that did not. Colour that is always on carries no
+# information; it is just brightness.
+#
+# So the alarm palette is reserved for the alarm. Below the warn threshold --
+# the normal state, and the state the panel is in nearly all the time -- a gauge
+# is neutral grey and recedes into the panel. At warn and crit it takes
+# pressure_role and becomes the only coloured thing on the screen, which is
+# exactly when that is worth being.
+sub _gauge_role {
+    my ($ratio) = @_;
+    my $r = tui::Meter::pressure_role($ratio);
+    return 'text.muted' if !defined $r || $r eq 'state.ok';
+    return $r;
+}
+
 sub _gauge_value_spans {
     my ($ratio, $pct_text, $figures, $trail) = @_;
     return [ { text => 'n/a', role => 'text.muted' },
              (ref($trail) eq 'ARRAY' ? @$trail : ()) ] unless defined $ratio;
 
-    my $role = tui::Meter::pressure_role($ratio) // 'text.muted';
+    my $role = _gauge_role($ratio);
     $pct_text = tui::Meter::percent_text($ratio) unless defined $pct_text;
     $pct_text = '' unless defined $pct_text;
 
-    my @spans = (
-        # atomic: a partly-drawn gauge reads as a DIFFERENT, wrong percentage,
-        # and a clipped percent is the same lie in decimal. Both are dropped
-        # whole rather than truncated -- tui::Frame::fit_spans honours this.
-        { text => tui::Meter::bar($ratio, tui::Meter::BAR_CELLS()), role => $role, atomic => 1 },
-        { text => ' ', role => $role },
-        { text => sprintf('%*s', tui::Meter::PERCENT_COL_WIDTH(), $pct_text),
-          role => $role, atomic => 1 },
-    );
-    push @spans, { text => '  ' . $figures, role => $role }
+    # THE TRACK IS NOT THE FILL. The empty cells carry 'rule' -- the same token
+    # every border on the screen uses -- so the gauge reads as a dim channel
+    # with a marked portion, rather than as ten coloured blocks of two shades.
+    my ($fill, $track) = tui::Meter::bar_split($ratio, tui::Meter::BAR_CELLS());
+    my @spans;
+    # atomic: a partly-drawn gauge reads as a DIFFERENT, wrong percentage, and a
+    # clipped percent is the same lie in decimal. Both are dropped whole rather
+    # than truncated -- tui::Frame::fit_spans honours this. The two halves are
+    # marked separately, which is safe because they are adjacent and equal-width
+    # either way: the failure fit_spans must avoid is a HALF-DRAWN bar, and
+    # dropping one whole half still leaves a bar that cannot be misread as a
+    # percentage, because the percent column sits right beside it.
+    push @spans, { text => $fill,  role => $role,  atomic => 1 } if defined $fill  && length $fill;
+    push @spans, { text => $track, role => 'rule', atomic => 1 } if defined $track && length $track;
+    push @spans, { text => ' ', role => $role };
+    push @spans, { text => sprintf('%*s', tui::Meter::PERCENT_COL_WIDTH(), $pct_text),
+                   role => $role, atomic => 1 };
+    # THE FIGURES ARE NEVER ALARM-COLOURED. They are the longest run of
+    # characters on the row, so painting them red turned one busy disk into a
+    # wall of red text; the gauge beside them already says how bad it is.
+    push @spans, { text => '  ' . $figures, role => 'text.primary' }
         if defined $figures && length $figures;
     push @spans, @$trail if ref($trail) eq 'ARRAY';
     return \@spans;
@@ -1145,6 +1216,13 @@ sub _resources_body {
     my $hostram_row = row({ label => 'host ram', value => _bytes_gauge_spans($r->{host_ram_used}, $r->{host_ram_total}) });
     push @lines, $hostram_row if @$hostram_row;
 
+    # SWAP SITS DIRECTLY UNDER RAM (operator request, 2026-08-26: "like the host
+    # mem counter but for swap"), which is also where it reads best -- the two
+    # are one story, and a machine paging hard is only interesting next to how
+    # full its RAM is. Same builder, same columns, no special case.
+    my $hostswap_row = row({ label => 'host swap', value => _bytes_gauge_spans($r->{host_swap_used}, $r->{host_swap_total}) });
+    push @lines, $hostswap_row if @$hostswap_row;
+
     my @disk_trail;
     push @disk_trail, { text => " ($r->{host_disk_dev})", role => 'text.muted' }
         if defined($r->{host_disk_dev}) && !ref($r->{host_disk_dev}) && length($r->{host_disk_dev});
@@ -1152,10 +1230,13 @@ sub _resources_body {
                              value => _bytes_gauge_spans($r->{host_disk_used}, $r->{host_disk_total}, \@disk_trail) });
     push @lines, $hostdisk_row if @$hostdisk_row;
 
-    my @cpu_trail;
-    push @cpu_trail, { text => sprintf(' (%d cores)', $r->{host_cores}), role => 'text.muted' }
-        if defined($r->{host_cores}) && !ref($r->{host_cores}) && $r->{host_cores} =~ /^\d+$/;
-    my $hostcpu_row = row({ label => 'host cpu', value => _pct_gauge_spans($r->{host_cpu_pct}, \@cpu_trail) });
+    # THE CORE COUNT IS GONE (operator, 2026-08-26: "can drop the cores count
+    # from the `host cpu` line. unnecessary"). It is a fact about the machine,
+    # not about this moment -- it cannot change while the dashboard is open, so
+    # it spent a permanent slot on a row whose whole job is what is happening
+    # now. host_cores is still gathered and still in the snapshot; only the
+    # rendering goes.
+    my $hostcpu_row = row({ label => 'host cpu', value => _pct_gauge_spans($r->{host_cpu_pct}) });
     push @lines, $hostcpu_row if @$hostcpu_row;
 
     return \@lines;

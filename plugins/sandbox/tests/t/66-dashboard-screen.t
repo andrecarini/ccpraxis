@@ -964,16 +964,53 @@ ok(!Theme->can('display_width'),
     cmp_ok(scalar(@tokens), '>=', 3, 'AC-F3: the fixture yields at least 3 distinct-position extracted duration tokens (floor, not a ceiling)')
         or diag("  extracted: " . join(' | ', @tokens));
     my %distinct = map { $_ => 1 } @tokens;
-    cmp_ok(scalar(keys %distinct), '>=', 3, 'AC-F3: at least 3 DISTINCT token strings')
+    cmp_ok(scalar(keys %distinct), '>=', 2, 'AC-F3: at least 2 DISTINCT token strings')
         or diag("  distinct: " . join(' | ', sort keys %distinct));
-    cmp_ok(scalar(keys %branches), '>=', 2, 'AC-F3: the extracted tokens span at least 2 of DURATION_RE\'s branches')
+
+    # AC-F3 BRANCH COVERAGE RE-POINTED 2026-08-26, and the reason is the point.
+    #
+    # This asserted the EXTRACTED tokens span >=2 of DURATION_RE's branches. The
+    # extractor can only capture two of them at all -- \d+s and \d+m; the
+    # compact grammar (\d+h\d{2}m, \d+d\d{2}h) is deliberately outside it, per
+    # this file's own header. Sub-minute durations now render as '<1m' (operator
+    # request -- see fmt_duration), so the seconds branch is EXTINCT on a
+    # rendered frame by design, and the claim became unsatisfiable through this
+    # route for the very reason the change was made.
+    #
+    # The property worth keeping is that DURATION_RE describes a real ladder
+    # rather than one shape, so it is asserted where it is actually decidable:
+    # against fmt_duration's own outputs across the ladder. That is strictly
+    # stronger -- it covers the two branches the extractor could never see.
+    cmp_ok(scalar(keys %branches), '>=', 1, 'AC-F3: the extracted tokens carry at least one recognised branch')
         or diag("  branches seen: " . join(',', sort keys %branches));
+  SKIP: {
+        skip('tui::DashboardScreen did not load', 2) unless $DS_OK;
+        my %ladder;
+        for my $secs (30, 90, 3660, 90000) {
+            my $t = tui::DashboardScreen::fmt_duration($secs);
+            if    ($t eq '<1m')             { $ladder{floor}++ }
+            elsif ($t =~ /\A\d+m\z/)        { $ladder{m}++ }
+            elsif ($t =~ /\A\d+h\d{2}m\z/)  { $ladder{hm}++ }
+            elsif ($t =~ /\A\d+d\d{2}h\z/)  { $ladder{dh}++ }
+            else                            { $ladder{other}++ }
+        }
+        cmp_ok(scalar(keys %ladder), '>=', 4,
+            'AC-F3 (re-pointed): fmt_duration spans at least four DISTINCT rungs of the ladder -- '
+          . 'the sub-minute floor, minutes, hours and days')
+            or diag('  rungs seen: ' . join(',', sort keys %ladder));
+        ok(!exists $ladder{other},
+            'AC-F3 (re-pointed): ...and every rung is one DURATION_RE names -- no unclassified shape');
+    }
 }
 {
   SKIP: {
         skip('tui::DashboardScreen did not load', 1) unless $DS_OK;
         my @table = (
-            [ undef, 'n/a' ], [ -1, 'n/a' ], [ 0, '0s' ], [ 59, '59s' ], [ 60, '1m' ],
+            # RE-POINTED 2026-08-26: sub-minute collapses to '<1m' (operator
+            # request -- see fmt_duration's note). The boundary is still pinned
+            # from both sides, which is the half that matters: 59 is the last
+            # value that floors and 60 is the first that does not.
+            [ undef, 'n/a' ], [ -1, 'n/a' ], [ 0, '<1m' ], [ 59, '<1m' ], [ 60, '1m' ],
             [ 3599, '59m' ], [ 3600, '1h00m' ], [ 3660, '1h01m' ], [ 86399, '23h59m' ],
             [ 86400, '1d00h' ], [ 90000, '1d01h' ],
         );

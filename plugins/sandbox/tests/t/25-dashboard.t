@@ -205,8 +205,8 @@ is(Dashboard::decide_mode(0, 1, 0), 'plain', 'mode: no tty -> plain');
 is(Dashboard::decide_mode(1, 0, 0), 'plain', 'mode: no Term::ReadKey -> plain');
 is(Dashboard::decide_mode(1, 1, 1), 'plain', 'mode: force_plain -> plain');
 
-is(Dashboard::fmt_age(0),       '0s',     'age: 0s');
-is(Dashboard::fmt_age(59),      '59s',    'age: 59s');
+is(Dashboard::fmt_age(0),       '<1m',     'age: 0s renders as the sub-minute floor');
+is(Dashboard::fmt_age(59),      '<1m',    'age: 59s renders as the sub-minute floor (last value that floors)');
 is(Dashboard::fmt_age(60),      '1m',     'age: 60s -> 1m');
 is(Dashboard::fmt_age(3599),    '59m',    'age: 59m');
 is(Dashboard::fmt_age(3600),    '1h00m',  'age: 1h00m');
@@ -301,8 +301,12 @@ my %st = (
     # (second operator request, same day). RE-POINTED, not deleted: the claim
     # about WHERE the container id sits is still made, it is just a different
     # place.
-    like($f->[0]{text}, qr/\A\[running\] ccpraxis sandbox - demo - \Qclaude-demo-abcd1234\E/,
-        'compose: status leads the row, then project and container joined by " - "');
+    # The clause separator is DERIVED from Theme (2026-08-26: it became a
+    # middle dot in the rule role -- see header_spans). Spelling it here would
+    # make a styling change a red test about a character.
+    my $HSEP = quotemeta(' ' . Theme::glyph('sep.dot') . ' ');
+    like($f->[0]{text}, qr/\A\[running\] ccpraxis sandbox${HSEP}demo${HSEP}\Qclaude-demo-abcd1234\E/,
+        'compose: status leads the row, then project and container joined by the clause separator');
     unlike($f->[0]{text}, qr/\Qdemo\E {2,}\Qclaude-demo-abcd1234\E/,
         'compose: no justification gap between the project name and the container id');
     is($f->[-1]{role}, $FOOTER_ROLE, "compose: last row is the footer (role: $FOOTER_ROLE, Theme-derived, spec S2.1)");
@@ -1733,10 +1737,14 @@ sub drive_per_tick {
     is($b4, 'expires in 3h12m',
         'B4: fmt_oauth(3*3600+12*60) eq "expires in 3h12m"');
 
-    # B5: sub-minute -> 'expires in 45s'
+    # B5: sub-minute -> 'expires in <1m'. RE-POINTED 2026-08-26: the seconds
+    # figure became the '<1m' floor (operator request -- see fmt_duration). The
+    # claim is unchanged and is the one that matters here: a sub-minute
+    # remaining time still renders through the SAME duration grammar as every
+    # other row, rather than growing a special case of its own.
     my $b5 = eval { tui::DashboardScreen::_fmt_oauth_like(45) };
-    is($b5, 'expires in 45s',
-        'B5: fmt_oauth(45) eq "expires in 45s"');
+    is($b5, 'expires in <1m',
+        'B5: fmt_oauth(45) eq "expires in <1m"');
 
     # B-ascii: all non-undef returns are ASCII-only (no multi-byte chars)
     for my $secs (-5, 0, 45, 3*3600+12*60) {
