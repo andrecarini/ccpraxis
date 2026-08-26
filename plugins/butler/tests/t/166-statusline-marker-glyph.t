@@ -433,31 +433,24 @@ for my $sb (0, 1) {
 }
 
 # ===========================================================================
-# AC14/AC15 -- non-regression tripwires: 151 and 150 must both stay green.
-# Run as SUBPROCESSES so a crash in either does not abort this file, and so
-# each is judged independently by exit code + not-ok count, matching this
-# project's documented convention (prove does not exist on this host).
+# AC14/AC15 REMOVED 2026-08-26 -- duplicate EXECUTION, not extra coverage.
+#
+# They ran 151-continuity-statusline-badge.t and 150-continuity-gate.t as full
+# subprocesses, as "non-regression tripwires: 151 and 150 must both stay green".
+# But the suite runs 151 and 150. Asserting it here does not add a check; it
+# adds a second execution of the same one, and it cost 22 seconds every time
+# this file ran.
+#
+# It also reported badly. A genuine break in 151 surfaced as TWO reds in two
+# files -- one of them here, in a file that has nothing to do with 151's
+# subject -- which is exactly the noise that makes a suite hard to read. And the
+# pattern nests: had 151 carried a tripwire of its own, this file would have
+# been running that too.
+#
+# What the tripwires were reaching for -- "do not break the continuity badge
+# while editing the marker" -- is real, and it is what the suite is for. The
+# guarantee moves nowhere; only the duplicate run goes.
 # ===========================================================================
-{
-    my $t151 = "$Bin/151-continuity-statusline-badge.t";
-    ok(-f $t151, 'AC14 setup: 151-continuity-statusline-badge.t exists') or BAIL_OUT('151 missing');
-    my $out151 = `timeout 120 perl "$t151" 2>&1`;
-    my $rc151  = $? >> 8;
-    my $not_ok_151 = () = ($out151 =~ /^not ok/mg);
-    is($rc151, 0, 'AC14: plugins/butler/tests/t/151-continuity-statusline-badge.t exits 0');
-    is($not_ok_151, 0, 'AC14: plugins/butler/tests/t/151-continuity-statusline-badge.t has zero not-ok lines')
-        or diag($out151);
-}
-{
-    my $t150 = "$Bin/150-continuity-gate.t";
-    ok(-f $t150, 'AC15 setup: 150-continuity-gate.t exists') or BAIL_OUT('150 missing');
-    my $out150 = `timeout 120 perl "$t150" 2>&1`;
-    my $rc150  = $? >> 8;
-    my $not_ok_150 = () = ($out150 =~ /^not ok/mg);
-    is($rc150, 0, 'AC15: plugins/butler/tests/t/150-continuity-gate.t exits 0');
-    is($not_ok_150, 0, 'AC15: plugins/butler/tests/t/150-continuity-gate.t has zero not-ok lines')
-        or diag($out150);
-}
 
 # ===========================================================================
 # Edge case (spec "Edge cases & failure modes"): session_id present but no
