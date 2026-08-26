@@ -37,3 +37,12 @@ deploy_key
 
 # transient lock written beside a file mutated through bp-blueprint.pl
 plugins/blueprint/templates/*.lock
+
+# Per-session continuity registries. These are RUNTIME state, but they live at
+# $HOME/.claude/ccpraxis/ -- which is a clone of this repo -- so they surface as
+# untracked noise in `git status` there and can be committed by accident. The
+# live install is the only place they ever appear; ignoring them costs the clone
+# nothing and keeps a promotion's status output honest.
+.continuity-active/
+.drive-solo-active/
+.reporter-active/
