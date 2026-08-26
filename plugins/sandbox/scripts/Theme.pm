@@ -327,6 +327,12 @@ sub _glyphs_data {
         'tee.right'   => { cp => 0x251C, desc => 'light tee pointing right, panel-grid junction' },
         'sep.bar'     => { cp => 0xFF5C, desc => 'fullwidth vertical line, statusline segment separator', width => 2 },
         'sep.dot'     => { cp => 0x00B7, desc => 'middle dot, inline separator' },
+        # The statusline's blueprint-count icon (2026-08-26). Declared HERE
+        # because Theme is the single source of glyph truth and t/69's AC-S5
+        # drift guard checks statusline.pl's inline width table against it --
+        # a glyph that surface emits without an entry here is exactly what that
+        # guard exists to catch. East-Asian-ambiguous, declared as one column.
+        'icon.blueprints' => { cp => 0x29C9, desc => 'two joined squares, blueprint count' },
         'gauge.full'  => { cp => 0x2588, desc => 'full block, meter fill' },
         'gauge.empty' => { cp => 0x2591, desc => 'light shade, meter track' },
         'scroll.up'   => { cp => 0x25B2, desc => 'black up-pointing triangle, scroll indicator' },

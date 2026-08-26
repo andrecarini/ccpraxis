@@ -122,115 +122,166 @@ sub plant_marker {
 sub strip_sgr { my $s = shift; $s = '' unless defined $s; $s =~ s/\033\[[^m]*m//g; return $s }
 sub first_line { my $s = shift; $s = '' unless defined $s; my ($l) = split /\n/, $s, 2; return defined($l) ? $l : '' }
 
-# Decision 3's glyphs, as raw UTF-8 bytes -- this file reads statusline.pl's
-# stdout as raw bytes throughout, so comparisons must be byte-level, never
-# character-level (matching 69-statusline-rebuild.t's own encoding discipline).
-my $GLYPH_HOST_BYTES    = encode('UTF-8', chr(0x25CF)); # filled
-my $GLYPH_SANDBOX_BYTES = encode('UTF-8', chr(0x25CB)); # hollow
+# THE GLYPH MEANS CONTINUITY NOW, NOT ENVIRONMENT (operator, 2026-08-26).
+#
+# t06's Decision 3 spent the lead glyph on host-versus-sandbox. That fact is
+# CONSTANT for a session, so the glyph never changed and therefore never told
+# anyone anything the word beside it did not already say in full. The operator
+# reassigned it: "instead of it representing sandbox vs host it should represent
+# continuity watching vs not". Whether this turn can end is the thing that
+# actually varies, and it is what deserves a shape you can read without reading.
+#
+# Decision 3's REAL guarantee is preserved and is what this section still pins:
+# the distinction is carried by SHAPE (filled vs hollow), not by colour, so it
+# survives an SGR strip. Only the subject of the distinction changed.
+#
+# The environment moved into the WORD'S COLOUR -- text.primary on HOST,
+# text.muted on SANDBOX -- per "the `HOST` string could have some slight color
+# difference ... but without screaming too much".
+#
+# Raw UTF-8 bytes throughout: this file reads statusline.pl's stdout as bytes.
+my $GLYPH_WATCHED_BYTES   = encode('UTF-8', chr(0x25CF)); # filled -- a Stop gate is armed
+my $GLYPH_UNWATCHED_BYTES = encode('UTF-8', chr(0x25CB)); # hollow -- nothing watching
 
 # ===========================================================================
-# AC1/AC2 -- glyph, space, padded/unpadded word lead row 1 (spec: Observable
-# behaviors 1-2; Interfaces "Marker construction").
+# AC1/AC2 -- glyph, space, environment word lead row 1. RE-POINTED: the word
+# is no longer padded to a common slot ("No need to reserve space on HOST vs
+# SANDBOX string cell. Have it shrink to fit available space"), so HOST is
+# followed directly by its separator rather than by three columns of padding.
 # ===========================================================================
 {
     my ($out, $rc) = run_statusline(payload_for(), sandbox => 0);
     is($rc, 0, 'AC1 setup: host run exits 0');
     my $vis = strip_sgr(first_line($out));
-    like($vis, qr/\A\Q$GLYPH_HOST_BYTES\E HOST\s* /,
-        'AC1: host, unarmed, cols=120 -- row 1 begins with the filled glyph, one space, HOST, '
-      . 'then the existing padding/separator');
+    like($vis, qr/\A\Q$GLYPH_UNWATCHED_BYTES\E HOST /,
+        'AC1: host, unarmed -- row 1 begins with the hollow glyph, one space, HOST, and NO '
+      . 'reserved padding after the word');
 }
 {
     my ($out, $rc) = run_statusline(payload_for(), sandbox => 1);
     is($rc, 0, 'AC2 setup: sandbox run exits 0');
     my $vis = strip_sgr(first_line($out));
-    like($vis, qr/\A\Q$GLYPH_SANDBOX_BYTES\E SANDBOX /,
-        'AC2: sandbox, unarmed, cols=120 -- row 1 begins with the hollow glyph, one space, SANDBOX');
+    like($vis, qr/\A\Q$GLYPH_UNWATCHED_BYTES\E SANDBOX /,
+        'AC2: sandbox, unarmed -- row 1 begins with the hollow glyph, one space, SANDBOX');
 }
 
 # ===========================================================================
-# AC3 -- each glyph is wrapped in its own role's SGR sequence: state.warn
-# (38;2;214;128;16) on HOST, text.faint (38;2;100;116;139) on SANDBOX.
-# Asserted as a substring check on RAW (non-stripped) stdout: the opening
-# escape must sit immediately before the glyph's own bytes.
+# AC3 -- RE-POINTED to the new subject. The glyph's colour tracks ARMING
+# (state.ok when watched, text.faint when not); the WORD's colour tracks the
+# environment (text.primary on host, text.muted in a sandbox). Asserted as
+# substring checks on RAW stdout, so the opening escape must sit immediately
+# before the bytes it colours.
 # ===========================================================================
 {
     my ($out) = run_statusline(payload_for(), sandbox => 0);
-    my $open = "\033[38;2;214;128;16m";
-    ok(index($out, $open . $GLYPH_HOST_BYTES) >= 0,
-        'AC3: the HOST glyph is immediately preceded by the state.warn truecolor SGR sequence');
+    my $faint = "\033[38;2;100;116;139m";
+    ok(index($out, $faint . $GLYPH_UNWATCHED_BYTES) >= 0,
+        'AC3: an UNWATCHED glyph is immediately preceded by the text.faint truecolor SGR sequence');
+    my $primary = "\033[38;2;230;230;230m";
+    ok(index($out, $primary . ' HOST') >= 0,
+        'AC3: the HOST word carries text.primary -- the brightness step that marks the host '
+      . 'without shouting');
+}
+{
+    my $cdir = tempdir(CLEANUP => 1);
+    plant_marker($cdir, 'sess-ac3-armed');
+    my ($out) = run_statusline(payload_for(session_id => 'sess-ac3-armed'),
+                               sandbox => 0, cdir => $cdir);
+    my $ok_sgr = "\033[38;2;26;168;74m";
+    ok(index($out, $ok_sgr . $GLYPH_WATCHED_BYTES) >= 0,
+        'AC3: a WATCHED glyph is immediately preceded by the state.ok truecolor SGR sequence');
 }
 {
     my ($out) = run_statusline(payload_for(), sandbox => 1);
-    my $open = "\033[38;2;100;116;139m";
-    ok(index($out, $open . $GLYPH_SANDBOX_BYTES) >= 0,
-        'AC3: the SANDBOX glyph is immediately preceded by the text.faint truecolor SGR sequence');
+    my $muted = "\033[38;2;148;163;184m";
+    ok(index($out, $muted . ' SANDBOX') >= 0,
+        'AC3: the SANDBOX word stays text.muted -- the safe default gets the quieter treatment');
 }
 
 # ===========================================================================
 # AC4/AC5 -- the distinction survives colour being stripped, and the polarity
-# is exact (not "some circle appears").
+# is exact (not "some circle appears"). RE-POINTED to arming, which is what
+# the shape now encodes; the environment is checked by its WORD, which is
+# equally strip-proof.
 # ===========================================================================
 {
-    my ($out_host)    = run_statusline(payload_for(), sandbox => 0);
-    my ($out_sandbox) = run_statusline(payload_for(), sandbox => 1);
-    my $vis_host    = strip_sgr($out_host);
-    my $vis_sandbox = strip_sgr($out_sandbox);
+    my $cdir = tempdir(CLEANUP => 1);
+    plant_marker($cdir, 'sess-ac4-armed');
+    my ($out_armed)   = run_statusline(payload_for(session_id => 'sess-ac4-armed'),
+                                       sandbox => 0, cdir => $cdir);
+    my ($out_unarmed) = run_statusline(payload_for(session_id => 'sess-ac4-unarmed'),
+                                       sandbox => 0, cdir => $cdir);
+    my $vis_armed   = strip_sgr($out_armed);
+    my $vis_unarmed = strip_sgr($out_unarmed);
 
-    ok(index($vis_host, $GLYPH_HOST_BYTES) >= 0,
-        'AC4: with all SGR sequences stripped, host output still contains the filled glyph');
-    ok(index($vis_sandbox, $GLYPH_SANDBOX_BYTES) >= 0,
-        'AC4: with all SGR sequences stripped, sandbox output still contains the hollow glyph');
+    ok(index($vis_armed, $GLYPH_WATCHED_BYTES) >= 0,
+        'AC4: with all SGR stripped, a watched session still shows the FILLED glyph');
+    ok(index($vis_unarmed, $GLYPH_UNWATCHED_BYTES) >= 0,
+        'AC4: with all SGR stripped, an unwatched session still shows the HOLLOW glyph');
 
-    is(index($vis_host, $GLYPH_SANDBOX_BYTES), -1,
-        "AC5: host's stripped output never contains the hollow (sandbox) glyph");
-    is(index($vis_sandbox, $GLYPH_HOST_BYTES), -1,
-        "AC5: sandbox's stripped output never contains the filled (host) glyph");
+    is(index($vis_armed, $GLYPH_UNWATCHED_BYTES), -1,
+        "AC5: a watched session's stripped output never contains the hollow glyph");
+    is(index($vis_unarmed, $GLYPH_WATCHED_BYTES), -1,
+        "AC5: an unwatched session's stripped output never contains the filled glyph");
+
+    # ...and the environment is still tellable apart without colour, which is
+    # the half of Decision 3 that must not be lost in the reassignment.
+    my ($vh) = run_statusline(payload_for(), sandbox => 0);
+    my ($vs) = run_statusline(payload_for(), sandbox => 1);
+    like(strip_sgr(first_line($vh)), qr/\bHOST\b/,
+        'AC5: the environment survives an SGR strip too -- as the WORD, now that the glyph '
+      . 'carries something else');
+    like(strip_sgr(first_line($vs)), qr/\bSANDBOX\b/,
+        'AC5: ...on both surfaces');
 }
 
 # ===========================================================================
-# AC6 -- unarmed run: no badge substring, and the total row count equals
-# what the SAME payload produces with no continuity concept at all. Every
-# payload in this file omits `rate_limits`, which pins plan_full to '' (see
-# payload_for's comment) -- so the row count depends ONLY on cwd-presence,
-# per the spec's row-assembly logic (line1, line2, then the path row iff cwd
-# is non-empty). This is derived from the spec text, not from reading the
-# implementation, and is exercised at BOTH cwd-present and cwd-absent to
-# avoid hardcoding a single magic row count.
+# AC6 -- the row COUNT, and how it varies. RE-POINTED 2026-08-26: the two
+# status rows merged into one ("I think we can have it all in a single line
+# instead of two"), and the path row became host-only ("I want it hidden only
+# on the sandbox. On the host it can and should continue appearing").
+#
+# So the count is no longer a fixed 2-plus-path. It is derived here from the
+# two things that actually decide it, exactly as the old version derived its
+# own -- never hardcoded, and exercised on both surfaces so a single magic
+# number can never stand in for the rule.
 # ===========================================================================
 {
     my ($out, $rc) = run_statusline(payload_for(current_dir => '/w/proj-alpha'), sandbox => 0);
-    is($rc, 0, 'AC6 setup (cwd present): exits 0');
-    ok(index($out, $BADGE) < 0, 'AC6 (cwd present): no badge substring when unarmed');
+    is($rc, 0, 'AC6 setup (host, cwd present): exits 0');
+    ok(index($out, $BADGE) < 0, 'AC6: the badge is no longer a WORD anywhere in the output');
     my @rows = split /\n/, $out;
-    is(scalar(@rows), 2 + 1,
-        'AC6 (cwd present): row count is line1 + line2 + the path row -- no extra row for an '
-      . 'absent badge (plan_full is pinned empty by this fixture'."'".'s payload)');
+    is(scalar(@rows), 2,
+        'AC6 (host, cwd present): the merged status row plus the path row');
+}
+{
+    my ($out, $rc) = run_statusline(payload_for(current_dir => '/w/proj-alpha'), sandbox => 1);
+    is($rc, 0, 'AC6 setup (sandbox, cwd present): exits 0');
+    my @rows = split /\n/, $out;
+    is(scalar(@rows), 1,
+        'AC6 CANONICAL (sandbox): the path row is suppressed -- in a container the working '
+      . 'directory is always the same mount, so it is a row spent saying nothing');
 }
 {
     my ($out, $rc) = run_statusline(payload_for(current_dir => ''), sandbox => 0);
-    is($rc, 0, 'AC6 setup (cwd absent): exits 0');
-    ok(index($out, $BADGE) < 0, 'AC6 (cwd absent): no badge substring when unarmed');
+    is($rc, 0, 'AC6 setup (host, cwd absent): exits 0');
     my @rows = split /\n/, $out;
-    is(scalar(@rows), 2,
-        'AC6 (cwd absent): row count is line1 + line2 only -- no path row, no badge row');
+    is(scalar(@rows), 1,
+        'AC6 (host, cwd absent): no path row when there is no path -- the merged status row alone');
 }
 
 # ===========================================================================
-# AC7 -- armed run: the badge renders exactly once, on ROW 2, and arming does
-# not change the number of rows.
+# AC7 -- arming changes the LEAD GLYPH and nothing else.
 #
-# RE-POINTED 2026-08-25. This asserted the badge occupied a ROW OF ITS OWN --
-# second-to-last with a path row, last without. The operator called that
-# "awful" ("an uppercase green word in a line by itself"), so the badge moved
-# onto row 2, the bounded-width metrics row.
+# RE-POINTED TWICE, and the history is the point. It first asserted the badge
+# occupied a ROW OF ITS OWN; the operator called that "awful" and it moved to
+# row 2; then they reassigned it to the lead glyph outright ("Should instead
+# use the `● HOST` versus `○ SANDBOX` to signalize the continuity watcher
+# trigger on that first icon as it is").
 #
-# The claim is re-pointed rather than dropped because the thing it was really
-# protecting still needs protecting, and it is NOT "which row": it is that the
-# badge appears exactly once, in a fixed place, and never on row 1 (AC8 below,
-# and 151's F1). What changes is which fixed place. The row-count half is
-# STRONGER than before -- the badge used to add a row when armed, and now costs
-# none at all.
+# What survived all three shapes is the claim worth keeping: the state is
+# visible, it is visible in exactly one place, and it costs no rows. That is
+# now stronger than it has ever been -- it costs no COLUMNS either.
 # ===========================================================================
 for my $case ([ '/w/proj-alpha', 'path row present' ], [ '', 'no path row' ]) {
     my ($cwd, $label) = @$case;
@@ -244,25 +295,35 @@ for my $case ([ '/w/proj-alpha', 'path row present' ], [ '', 'no path row' ]) {
         sandbox => 0, cdir => $cdir);
     is($rc, 0, "AC7 setup ($label): exits 0");
 
-    my @rows = split /\n/, $armed;
-    my @hits = grep { index(strip_sgr($rows[$_]), $BADGE) >= 0 } 0 .. $#rows;
-    is(scalar(@hits), 1, "AC7 ($label): the badge appears on exactly one row");
-    SKIP: {
-        skip 'badge not found on exactly one row', 1 if @hits != 1;
-        is($hits[0], 1,
-            "AC7 ($label): ...and that row is ROW 2 -- the bounded-width metrics row, never "
-          . 'row 1 and never a row of its own');
-    }
+    my $a = strip_sgr(first_line($armed));
+    my $u = strip_sgr(first_line($unarmed));
 
-    is(scalar(@rows), scalar(my @u = split /\n/, $unarmed),
-        "AC7 ($label): arming changes no ROW COUNT at all -- the badge rides an existing row "
-      . 'rather than adding one, which is what it used to do');
+    like($a, qr/\A\Q$GLYPH_WATCHED_BYTES\E /,
+        "AC7 ($label): an armed session leads with the filled glyph");
+    like($u, qr/\A\Q$GLYPH_UNWATCHED_BYTES\E /,
+        "AC7 ($label): an unarmed session leads with the hollow glyph");
+
+    is(scalar(my @ra = split /\n/, $armed), scalar(my @ru = split /\n/, $unarmed),
+        "AC7 ($label): arming changes no ROW COUNT at all");
 }
 
 # ===========================================================================
-# AC8 (= test 151's F1, must stay green) -- armed and unarmed runs at the SAME
-# cols and SAME environment: split /\n/ first element is BYTE-IDENTICAL
-# (SGR-stripped) between the two runs.
+# AC8 -- row 1 varies with arming in EXACTLY ONE CHARACTER, and is otherwise
+# byte-identical.
+#
+# SUPERSEDED AND REPLACED, deliberately, by operator decision 2026-08-26. This
+# asserted row 1 was byte-identical between an armed and an unarmed run. That
+# invariant existed to stop the badge reflowing row 1 -- a real problem when
+# the badge was a WORD of variable width sitting in the marker field.
+#
+# The operator then put the state ON row 1 on purpose, as the lead glyph. So
+# "row 1 does not vary" is now false BY DESIGN and keeping it would be
+# asserting the absence of the feature.
+#
+# What replaces it is the guarantee that actually mattered underneath it, and
+# it is the stronger half: row 1 must not REFLOW. Same length, same content,
+# one differing character in position zero. A word-shaped badge could never
+# have satisfied this; a glyph does it by construction.
 # ===========================================================================
 for my $sb (0, 1) {
     my $label = $sb ? 'sandbox' : 'host';
@@ -272,12 +333,24 @@ for my $sb (0, 1) {
     my ($out_armed)   = run_statusline(payload_for(session_id => "sess-ac8-armed-$label"),   sandbox => $sb, cdir => $cdir);
     my ($out_unarmed) = run_statusline(payload_for(session_id => "sess-ac8-unarmed-$label"), sandbox => $sb, cdir => $cdir);
 
-    my $line1_armed   = strip_sgr(first_line($out_armed));
-    my $line1_unarmed = strip_sgr(first_line($out_unarmed));
+    my $a = strip_sgr(first_line($out_armed));
+    my $u = strip_sgr(first_line($out_unarmed));
 
-    is($line1_armed, $line1_unarmed,
-        "AC8 ($label): row 1 is BYTE-IDENTICAL (SGR-stripped) whether the run is armed or "
-      . "unarmed -- the badge relocation means row 1 literally does not vary with arming state");
+    isnt($a, $u,
+        "AC8 ($label): row 1 DOES vary with arming now -- the state is on row 1 on purpose "
+      . '(this replaces the byte-identity invariant it superseded)');
+    is(length($a), length($u),
+        "AC8 CANONICAL ($label): ...and varies without REFLOWING -- identical length, so nothing "
+      . 'after the glyph moves by a column');
+
+    # ...and the difference is the LEAD GLYPH alone. Stripping the first
+    # character from each must leave two identical strings.
+    my $ta = $a; my $tu = $u;
+    $ta =~ s/\A\Q$GLYPH_WATCHED_BYTES\E//;
+    $tu =~ s/\A\Q$GLYPH_UNWATCHED_BYTES\E//;
+    is($ta, $tu,
+        "AC8 ($label): the ONLY difference is the lead glyph -- everything after it is "
+      . 'byte-identical between an armed and an unarmed run');
 }
 
 # ===========================================================================

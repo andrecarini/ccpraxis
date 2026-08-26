@@ -346,8 +346,25 @@ ok(length($SRC_BP) > 0, 'setup: bp-statusline.pl was read as raw source bytes');
         # be competing for that row's width.
         is(index($vis, $cwd), -1,
             "AC-O1 ($label): the working directory does NOT appear on row 1");
-        is($path_vis, $cwd,
-            "AC-O1 ($label): the LAST row is the working directory, complete and alone");
+        # RE-POINTED 2026-08-26: the path row is HOST-ONLY (operator: "I want it
+        # hidden only on the sandbox. On the host it can and should continue
+        # appearing in its own line as it currently does"). In a container the
+        # working directory is always the same mount, so the row said nothing.
+        # The claim splits in two rather than weakening: present and complete on
+        # the host, absent in a sandbox.
+        if ($sb) {
+            # NOT `is($path_vis, '')` -- statusline_path_row returns the LAST
+            # row, and with the path row gone that is the status row itself. The
+            # claim is that NO row is the working directory.
+            my @all = map { strip_sgr($_) } statusline_rows(@args);
+            is(scalar(grep { $_ eq $cwd } @all), 0,
+                "AC-O1 ($label): NO row is the working directory -- in a container it is always "
+              . 'the same mount, so the row is spent saying nothing')
+                or diag('  rows: ' . join(' | ', @all));
+        } else {
+            is($path_vis, $cwd,
+                "AC-O1 ($label): the LAST row is the working directory, complete and alone");
+        }
 
         # t06 AMENDMENT (blueprint Decision 8, package t06-statusline-marker,
         # 2026-08-19): blueprint Decision 3 (locked) puts a leading, non-emoji
@@ -359,8 +376,14 @@ ok(length($SRC_BP) > 0, 'setup: bp-statusline.pl was read as raw source bytes');
         # fails if the marker is absent (index -1), pushed further right than
         # glyph+space, or if anything OTHER than the declared Decision-3 glyph
         # followed by exactly one space occupies the lead.
-        my %T06_GLYPH_CP = (sandbox => 0x25CB, host => 0x25CF);
-        my $t06_prefix = encode('UTF-8', chr($T06_GLYPH_CP{$label})) . ' ';
+        # RE-POINTED 2026-08-26: the lead glyph no longer encodes the
+        # ENVIRONMENT -- it encodes whether a Stop gate is armed for this
+        # session (operator: "instead of it representing sandbox vs host it
+        # should represent continuity watching vs not"). These fixtures plant no
+        # marker, so every one of them is unarmed and leads with the hollow
+        # glyph regardless of surface. AC-O2's intent is untouched: the marker
+        # leads the row and nothing unexpected renders to its left.
+        my $t06_prefix = encode('UTF-8', chr(0x25CB)) . ' ';
         is(substr($vis, 0, length($t06_prefix)), $t06_prefix,
             "AC-O2 ($label): row 1 leads with the Decision-3 glyph, immediately followed by exactly one space, and nothing else");
         is($i_marker, length($t06_prefix),
@@ -422,16 +445,33 @@ sub same_slot_report {
         unlike(strip_sgr($off), qr/sandbox/i,
             "AC-M2 (cols=$cols): the host render mentions nothing sandbox-ish");
 
+        # AC-M3 SUPERSEDED 2026-08-26 by operator decision: "No need to reserve
+        # space on HOST vs SANDBOX string cell. Have it shrink to fit available
+        # space."
+        #
+        # The common-slot property existed so row 1 could not reflow between the
+        # two environments. It was worth having when the two could alternate on
+        # one screen -- they cannot. A session is host or sandbox for its whole
+        # life, so the reflow it prevented was between two runs that never sit
+        # side by side, and it cost three columns of padding on every row of
+        # every host session to prevent a comparison nobody makes.
+        #
+        # Keeping the assertion would be asserting the padding is still there.
+        # What replaces it is the claim underneath it that is still true and
+        # still worth guarding: the row is IDENTICAL FROM THE PROJECT NAME
+        # ONWARD, so the only thing the environment changes is the marker
+        # itself -- no downstream field renders differently because of it.
         my $rep = same_slot_report($on, $off);
-        ok($rep->{cost_equal},
-            "AC-M3 (cols=$cols): both marker variants render rows of equal row_cost -- the row does not reflow between environments")
-            or diag(sprintf('  cost sandbox=%d host=%d', row_cost($on), row_cost($off)));
-        ok($rep->{offset_equal},
-            "AC-M3 (cols=$cols): both variants place the first sep.bar at the same byte offset -- the marker slot is common")
-            or diag(sprintf('  sep offset sandbox=%d host=%d', $rep->{sep_a}, $rep->{sep_b}));
-        ok($rep->{tail_equal},
-            "AC-M3 (cols=$cols): the two rows are byte-identical from the first sep.bar onward -- the marker occupies a common slot")
-            or diag('  sandbox = [' . strip_sgr($on) . "]\n  host    = [" . strip_sgr($off) . ']');
+        my ($va, $vb) = (strip_sgr($on), strip_sgr($off));
+        my ($ta) = $va =~ /(proj-alpha.*)\z/s;
+        my ($tb) = $vb =~ /(proj-alpha.*)\z/s;
+        ok(defined($ta) && defined($tb) && $ta eq $tb,
+            "AC-M3 (cols=$cols): the two rows are byte-identical from the project name onward -- "
+          . 'the environment changes the marker and nothing else')
+            or diag('  sandbox = [' . $va . "]\n  host    = [" . $vb . ']');
+        cmp_ok(row_cost($off), '<', row_cost($on),
+            "AC-M3 (cols=$cols): the HOST row is now SHORTER than the sandbox one -- the marker "
+          . 'shrinks to its word instead of padding out to a reserved slot');
 
         my @e_on  = emoji_hits($on);
         my @e_off = emoji_hits($off);

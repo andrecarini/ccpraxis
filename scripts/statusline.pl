@@ -109,6 +109,10 @@ my %GLYPH_COLS = (
     0x3000 => 2,
     0x2191 => 1,
     0x2193 => 1,
+    # The blueprints icon (2026-08-26). East-Asian-ambiguous, so terminals
+    # disagree about it -- declared as one column, which is what a monospaced
+    # terminal renders it as and what the row budget must assume.
+    0x29C9 => 1,
 );
 
 # row_cost($fragment) -> the budget a rendered fragment consumes.
@@ -352,36 +356,48 @@ $cwd     =~ s/[\x00-\x1f\x7f]//g;
 # the var is never set (this file is also the payload installed to the
 # user's ~/.claude/statusline.pl and used on the host).
 #
-# BOTH environments render a marker, in the same role and padded to a common
-# slot, so the row never reflows between them and an absent marker can never
-# be mistaken for a broken statusline. The slot width is derived from the
-# table at run time -- never written down as a number.
+# THE MARKER SHRINKS TO FIT (operator, 2026-08-26: "No need to reserve space on
+# HOST vs SANDBOX string cell. Have it shrink to fit available space").
+#
+# It used to pad HOST out to SANDBOX's width so the row could never reflow
+# between the two. That guarantee was worth having when the two words could
+# alternate on one screen -- they cannot: a given session is one or the other
+# for its whole life, so the reflow it prevented was between two runs that never
+# sit side by side. Three columns of padding on every row of every host session
+# to protect against a comparison nobody makes.
 my $SANDBOX_ON = $ENV{CCPRAXIS_SANDBOX} ? 1 : 0;
 my %MARKER = (
     sandbox => 'SANDBOX',
     host    => 'HOST',
 );
-my $MARKER_SLOT = 0;
-for my $name (sort keys %MARKER) {
-    my $w = row_cost($MARKER{$name});
-    $MARKER_SLOT = $w if $w > $MARKER_SLOT;
-}
 
-# Decision 3 (locked, blueprint tui-operator-feedback): a coloured, non-emoji
-# glyph precedes the marker word so HOST and SANDBOX are tellable apart even
-# without reading the word -- filled/attention on HOST (dev tooling can do
-# real damage there), hollow/dim on SANDBOX (the safe default). The hollow-
-# versus-filled shape is the load-bearing signal; colour only reinforces it,
-# so it must survive an SGR strip. Deliberately NOT added to %GLYPH_COLS --
-# see that table's own header and t06's spec for why the byte-length-
-# dominant fallback already budgets both codepoints conservatively.
-my %GLYPH       = ( sandbox => "\x{25CB}", host => "\x{25CF}" );  # hollow, filled
-my %GLYPH_COLOR = ( sandbox => $FAINT,     host => $WARN     );   # role text.faint / state.warn
+# THE LEAD GLYPH NOW MEANS CONTINUITY, NOT ENVIRONMENT (operator, 2026-08-26:
+# "Should instead use the `● HOST ｜` versus `○ SANDBOX` to signalize the
+# continuity watcher trigger on that first icon as it is. So instead of it
+# representing sandbox vs host it should represent continuity watching vs not").
+#
+# It is the better assignment on its own merits. Host-versus-sandbox is
+# CONSTANT for a session, so a glyph spent on it never changes and therefore
+# never tells you anything you did not already know -- and the word beside it
+# says the same thing in full. Whether this turn can end is the fact that
+# actually varies, and it is the one worth a shape you can read without
+# reading.
+#
+# Filled means watched, hollow means not; the shape is load-bearing, so it
+# survives an SGR strip, exactly as Decision 3 required of the old pair.
+#
+# ...AND THE ENVIRONMENT MOVES INTO THE WORD'S COLOUR. "The `HOST` string could
+# have some slight color difference so we can actually call a bit of attention
+# to the fact its running in the host, but without screaming too much." So HOST
+# takes text.primary and SANDBOX stays text.muted: a brightness step rather
+# than a hue, present when you look at it and silent when you do not. The
+# sandbox is the safe default and gets the quieter treatment.
+my $GLYPH_WATCHED   = "\x{25CF}";   # filled  -- a Stop gate is armed for this session
+my $GLYPH_UNWATCHED = "\x{25CB}";   # hollow  -- nothing is watching
+my %WORD_COLOR = ( sandbox => $MUTED, host => $PRIMARY );
 
-my $env    = $SANDBOX_ON ? 'sandbox' : 'host';
-my $word   = $MARKER{$env};
-$word     .= ' ' while row_cost($word) < $MARKER_SLOT;   # unchanged padding, word only
-my $marker = "$GLYPH_COLOR{$env}$GLYPH{$env}${R}${MUTED} ${word}";
+my $env  = $SANDBOX_ON ? 'sandbox' : 'host';
+my $word = $MARKER{$env};
 
 # ── Continuity badge (g01-explicit-continuity-arming) ────────
 # Per-session, keyed by the documented top-level `session_id` field of the
@@ -456,27 +472,27 @@ if (length $sid) {
     }
 }
 
-# ── ...and where it goes (operator, 2026-08-25: "the statusline marker with
-# the continuity indicator looks awful... It's an uppercase green word in a
-# line by itself") ─────────────────────────────────────────
+# ── ...and where it goes ─────────────────────────────────────
 #
-# Both halves of that are fixed, and the second one is the constrained one.
+# IT IS THE LEAD GLYPH NOW (operator, 2026-08-26). It was a word: first an
+# uppercase green one on a row of its own ("complete shit", their words), then a
+# lowercase one riding row 2. Both spent horizontal space on a binary.
 #
-# t06 put the badge on its OWN ROW specifically so that armed and unarmed runs
-# produce a byte-identical row 1 -- the badge used to sit in row 1's marker
-# field, where its presence reflowed the row. 151's F1 and 166's AC8 pin that
-# invariant, and it is worth keeping: row 1 is the line the eye returns to.
+# A filled-versus-hollow circle says the same thing in one column, in the
+# position the eye already lands on first, and it frees the environment word to
+# carry the environment by colour alone. The three registries the badge reads
+# are unchanged -- only its rendering moves.
 #
-# A row of its own is not the only way to satisfy it, though. Row 2 is the
-# bounded-width metrics row, already a strip of small facts, and appending
-# there leaves row 1 untouched byte-for-byte -- so F1 and AC8 hold unchanged
-# while the lonely row disappears. It also stops the badge costing a whole
-# screen row to say one word.
-#
-# Lowercase and muted rather than uppercase and green: this is a fact about the
-# session's mode, not an alarm. Green is what this file uses for things that
-# are GOOD; being gated is neither good nor bad, it is just true.
-my $badge = length($badge_word) ? "${MUTED}${badge_word}${R}" : '';
+# The named source (watched / driving / reporting) is deliberately NOT dropped:
+# it goes to the WORD'S COLOUR? No -- it goes nowhere, and that is a real
+# trade. A glyph can say "something is watching"; it cannot say which of three
+# things. The operator asked for the glyph, and "why can't this turn end" has a
+# command that answers it precisely (/butler:continuity status). What the
+# statusline owes is the fact, continuously and cheaply, which the glyph does.
+my $watched = length($badge_word) ? 1 : 0;
+my $marker  = ($watched ? $OK : $FAINT)
+            . ($watched ? $GLYPH_WATCHED : $GLYPH_UNWATCHED)
+            . "${R}$WORD_COLOR{$env} ${word}${R}";
 
 # ── Git (with background fetch every 30 min) ────────────────
 my $git_str = '';
@@ -527,7 +543,14 @@ eval {
         opendir(my $dh, $bp_root) or die;
         my $n = grep { $_ ne '_archive' && !/^\./ && -f "$bp_root/$_/blueprint.md" } readdir($dh);
         closedir($dh);
-        push @parts, "${MUTED}blueprints ${R}${PRIMARY}${n}${R}" if $n > 0;
+        # AN ICON, NOT THE WORD (operator, 2026-08-26: "Instead of saying in the
+        # statusline `blueprints 1` we could instead use some icon in place of
+        # the `blueprints` label? You can suggest a bunch to me, I just don't
+        # want any colored emoji"). U+29C9, two joined squares -- layered
+        # packages, which is what a blueprint is -- chosen from four offered.
+        # It is East-Asian-ambiguous width, so it is DECLARED in %GLYPH_COLS
+        # above rather than left to the fallback.
+        push @parts, "${MUTED}\x{29C9} ${R}${PRIMARY}${n}${R}" if $n > 0;
     }
 
     # Todos: non-archived ~/.claude/claude-code-vault/todos/*.md (global)
@@ -614,13 +637,24 @@ if ($rl) {
 
     my $h5_reset = time_until($h5->{resets_at}, 'hm');
     my $d7_reset = time_until($d7->{resets_at});
-    my $h5_r     = $h5_reset ? "${FAINT}\x{FF5C}${h5_reset}\x{FF5C}${R}" : '';
-    my $d7_r     = $d7_reset ? "${FAINT}\x{FF5C}${d7_reset}\x{FF5C}${R}" : '';
+    my $h5_r     = $h5_reset ? "${FAINT} ${h5_reset}${R}" : '';
+    my $d7_r     = $d7_reset ? "${FAINT} ${d7_reset}${R}" : '';
 
+    # ORDINARY SPACES, AND ONE SEPARATOR PER WINDOW (operator, 2026-08-26:
+    # "`5h 11%｜2h 44m｜　7d 26%｜5d 18h｜` -> could be simplified to
+    # `5h 11% 2h 44m｜7d 26% 5d 18h`. Since we're using a monospaced font for
+    # the terminal, anyways, no need nor any point to using different-width
+    # spaces").
+    #
+    # They are right on both counts. The ideographic space bought nothing a
+    # normal space does not in a monospaced cell, and it cost a %GLYPH_COLS
+    # entry to measure. And the reset time was fenced on BOTH sides, so two
+    # windows spent four separators to say two things -- the fence between the
+    # windows is the only one carrying meaning.
     $plan_full  = "${MUTED}5h ${R}" . usage_color($h5_pct) . "${h5_pct}%${R}${h5_r}"
-                . "\x{3000}${MUTED}7d ${R}" . usage_color($d7_pct) . "${d7_pct}%${R}${d7_r}";
+                . "${FAINT}\x{FF5C}${R}${MUTED}7d ${R}" . usage_color($d7_pct) . "${d7_pct}%${R}${d7_r}";
     $plan_short = "${MUTED}5h ${R}" . usage_color($h5_pct) . "${h5_pct}%${R}"
-                . "\x{3000}${MUTED}7d ${R}" . usage_color($d7_pct) . "${d7_pct}%${R}";
+                . "${FAINT}\x{FF5C}${R}${MUTED}7d ${R}" . usage_color($d7_pct) . "${d7_pct}%${R}";
 }
 
 # ── Row 1 ────────────────────────────────────────────────────
@@ -746,29 +780,62 @@ FIT: {
 }
 
 # ── Row 2 (single line if it fits, wrap if not) ──────────────
+# ONE GROUP, ORDINARY SPACES (operator, 2026-08-26: "`Opus 5 1M　72% ｜720k
+# 280k｜` I think we can drop the separator and extra spacing between the usage
+# percentage and the token counters. It could be like this: `Opus 5 1M　72% 720k
+# 280k｜`").
+#
+# The percentage and the two counters are three readings of one thing -- how
+# much context is left -- so fencing them off from each other said they were
+# different subjects. The separator now appears once, at the END, where it
+# genuinely divides context from the plan-usage group that follows.
 my $line2 = "${MUTED}${short}${R} "
-          . "${MUTED}" . fmt($size) . "${R}\x{3000}"
+          . "${MUTED}" . fmt($size) . "${R} "
           . "${pc}${pct_i}%${R} "
-          . "${FAINT}\x{FF5C}${R}${ACCENT}" . fmt($used_tokens) . "${R} "
-          . "${PRIMARY}" . fmt($free_tokens) . "${R}${FAINT}\x{FF5C}${R}";
+          . "${ACCENT}" . fmt($used_tokens) . "${R} "
+          . "${PRIMARY}" . fmt($free_tokens) . "${R}";
 
 # ── Assemble ─────────────────────────────────────────────────
-# The path is the LAST row, alone, per the operator's request: everything above
-# it is bounded-width status, and the one unbounded field sits by itself where
-# its length cannot push anything else off a row.
+#
+# ONE ROW, NOT TWO (operator, 2026-08-26: "I think we can have it all in a
+# single line instead of two"). Everything above is bounded-width and, with the
+# padding, separators and the beacons segment gone, the two rows now fit one.
+#
+# The join is unconditional and the FIT LADDER decides what survives. That is
+# the same discipline row 1 already had -- budget the whole row, never a field
+# of it -- extended over the wider row: git and plans drop whole (they carry
+# embedded SGR and cutting one mid-escape emits garbage), then the project
+# elides, then the marker. What is NOT in the ladder is the context group: it is
+# the reason the statusline exists, so it is the last thing standing.
+# The groups are joined by the SAME separator row 1 already uses between its
+# own fields, so the merged row has one grammar rather than two. Inside a group
+# the fields are spaced, between groups they are fenced -- which is what makes
+# "Opus 5 1M 71% 710k 290k" read as one reading of one thing.
+my @segments = ($line1, $line2);
+push @segments, $plan_full if length $plan_full;
+my $single = join $SEP, @segments;
+
+# ...but never at the cost of losing the context readout. If the joined row does
+# not fit, fall back to the previous two-row shape rather than eliding the one
+# group that must always be legible. A wrapped statusline is worse than a
+# two-row one, and this is the only path that can produce either.
 my @rows;
-# The badge rides row 2, ahead of plan_full: it is a handful of columns and it
-# is a fact about whether this turn can end, which outranks a plan title for the
-# room left on that row. Row 1 is untouched either way -- see the badge's own
-# note above for why that is the invariant being protected.
-my $line2_full = length($badge) ? "${line2} ${badge}" : $line2;
-if ($plan_full) {
-    my $oneline2 = "${line2_full} ${plan_full}";
-    if (row_cost($oneline2) <= $cols) { push @rows, $line1, $oneline2 }
-    else                              { push @rows, $line1, $line2_full, $plan_full }
+if (row_cost($single) <= $cols) {
+    push @rows, $single;
 } else {
-    push @rows, $line1, $line2_full;
+    my $line2_full = length($plan_full) ? "${line2}${SEP}${plan_full}" : $line2;
+    if (row_cost($line2_full) <= $cols) { push @rows, $line1, $line2_full }
+    else                                { push @rows, $line1, $line2, $plan_full }
 }
-my $path_row = path_row($cwd);
+
+# THE PATH ROW IS HOST-ONLY (operator, 2026-08-26: "what I said about hiding the
+# working directory, I want it hidden only on the sandbox. On the host it can
+# and should continue appearing in its own line as it currently does").
+#
+# Which is the right split. In a sandbox the working directory is always
+# /project -- one fixed mount, the same string every session, in a container
+# that by construction holds one project. On the host it is the answer to "where
+# am I", and there it can be anywhere.
+my $path_row = $SANDBOX_ON ? '' : path_row($cwd);
 push @rows, $path_row if length $path_row;
 print join("\n", @rows);
