@@ -28,6 +28,24 @@
 # report instead (see report §"baseline", captured BEFORE any implementation
 # edit, matching this file's own git-untouched state at write time).
 #
+# WHY THIS FILE IS SLOW, AND WHY THAT IS NOT BEING "FIXED". Measured standalone
+# 2026-08-26: 52s, of which 50s is the four child files (t/94 13s, t/112 21s,
+# t/120 5s, t/137 11s). It is therefore ~100% child re-execution — and the sweep
+# already runs all four directly, so A1/A3/B1/B3 (exit 0, zero "not ok")
+# duplicate work the sweep does anyway.
+#
+# That is the same shape removed from t/166-statusline-marker-glyph.t, but it is
+# NOT the same case, and the difference is the whole reason this stays: t/166's
+# nested runs added no assertion the sweep did not already make. Here A2/B2 pin
+# each child's PLAN COUNT, and a plan count under done_testing() cannot be known
+# without running the file. Delete the runs and the floors go with them.
+#
+# The cheap alternative was considered and rejected: have scripts/run-tests.pl
+# record plan counts and have this file read them. That buys ~50s of a ~405s
+# sweep in exchange for a cache whose staleness rule is a new way to pass
+# wrongly — a bad trade for a CANONICAL oracle. Revisit only if the sweep's tail
+# becomes the binding constraint.
+#
 # Runs standalone: perl plugins/butler/tests/t/145-reporter-gate-regression.t
 use strict;
 use warnings;
@@ -65,10 +83,20 @@ my $T = "$Bin";
     # The cost is stated honestly: a change that deletes one assertion and adds
     # two passes here. A3's zero-"not ok" check and A1's exit code are what
     # catch a silent skip; they do not depend on this number.
+    # RE-BASELINED 2026-08-26: 33 -> 39. A floor only has teeth while it sits at
+    # the file's actual count; every legitimate assertion added since widens the
+    # gap it will tolerate before firing. At 33 against an actual 39 this had
+    # already gone slack by six. Re-baselining is the maintenance action the
+    # "honest cost of the floor" note in section B describes but never scheduled,
+    # so it is done here for both floors at once. Both of t/94's and t/112's SKIP
+    # blocks use the COUNTED form (`skip 'reason', N`), which emits its N `ok #
+    # skip` lines either way — so the plan count does not move with the
+    # environment and a tight floor cannot go red on a machine that lacks
+    # bp-runstate.pl.
     my ($plan) = $out =~ /^1\.\.(\d+)\s*$/m;
-    cmp_ok($plan, '>=', 33,
-       'A2 CANONICAL: t/94\'s own test PLAN count is at least 33 — the pre-package baseline '
-     . 'recorded before this package\'s first edit. Assertions may be ADDED; losing one is '
+    cmp_ok($plan, '>=', 39,
+       'A2 CANONICAL: t/94\'s own test PLAN count is at least 39 — its count as re-baselined, '
+     . 'from a pre-package baseline of 33. Assertions may be ADDED; losing one is '
      . 'the regression, and a silent skip shows up here as a shortfall.');
 
     my @not_ok = ($out =~ /^not ok /mg);
@@ -83,8 +111,12 @@ my $T = "$Bin";
 #    plausibly perturb (mark-wakeup.sh, gate-drive-loop.sh, bp-runstate.pl),
 #    re-measured against their OWN recorded pre-package plan counts.
 # ---------------------------------------------------------------------------
+#
+# RE-BASELINED 2026-08-26 to each file's actual count (112: 51 -> 67; 120 and 137
+# were already tight at 21 and 12). See the note on A2 for why this is safe with
+# respect to SKIP blocks, and the "honest cost" note below for why it was needed.
 my %baseline = (
-    '112-subagent-stall-guard.t'      => 51,
+    '112-subagent-stall-guard.t'      => 67,
     '120-mark-wakeup-agent-dispatch.t'=> 21,
     '137-drive-loop-runstate-fold.t'  => 12,
 );
@@ -120,8 +152,8 @@ for my $name (sort keys %baseline) {
     # breakage.
     my ($plan) = $out =~ /^1\.\.(\d+)\s*$/m;
     cmp_ok($plan, '>=', $baseline{$name},
-       "B2 CANONICAL ($name): plan count is at least $baseline{$name}, the recorded "
-     . "pre-package baseline — this package's --surface widening on bp-runstate.pl and "
+       "B2 CANONICAL ($name): plan count is at least $baseline{$name}, its count as of the "
+     . "last re-baselining — this package's --surface widening on bp-runstate.pl and "
      . "any reporter-branch insertion into gate-drive-loop.sh/mark-wakeup.sh must not "
      . "remove or silently skip any of this file's own pre-existing assertions");
 
