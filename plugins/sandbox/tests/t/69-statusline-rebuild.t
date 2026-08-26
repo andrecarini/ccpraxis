@@ -180,6 +180,41 @@ sub field_at {
     return $idx <= $#f ? $f[$idx] : undef;
 }
 
+# project_field($line) / cwd_field($line) -- LOCATE the field rather than
+# assume its position.
+#
+# RE-POINTED 2026-08-26. These were thirteen scattered `project_field($line)`
+# calls, which encoded "the project is the second ｜-separated field on row 1".
+# That stopped being true when the operator reordered the row ("after the
+# HOST/SANDBOX cell, the model usage cell and the budget cell and then the rest
+# of the stuff in the old order"), and it broke ten assertions at once -- none
+# of which are about field POSITION. They are about what the project field
+# CONTAINS.
+#
+# So the position is derived once, here, from the row's actual composition: the
+# project is the first field after the marker that is neither the context group
+# nor the plan-usage group. Both of those are identifiable by shape without
+# knowing the order -- the context group carries the model name and a percent,
+# the plan group carries the window labels. A future reorder re-points this one
+# helper instead of every call site.
+sub _is_context_field { my $f = shift; return (defined $f && $f =~ /\d+%/ && $f =~ /\d+k|\dM/) ? 1 : 0 }
+sub _is_budget_field  { my $f = shift; return (defined $f && $f =~ /\b(?:5h|7d)\b/)            ? 1 : 0 }
+sub project_field {
+    my ($line) = @_;
+    my @f = sep_fields($line);
+    for my $i (1 .. $#f) {
+        next if _is_context_field($f[$i]) || _is_budget_field($f[$i]);
+        return $f[$i];
+    }
+    return undef;
+}
+# The working directory left row 1 entirely (it has its own row on the host and
+# none in a sandbox), so this is now always undef. Kept as a named helper rather
+# than deleted: the assertions that use it are guards against the cwd field
+# REAPPEARING in a bad shape, and they stay meaningful as long as they are
+# asking about the right thing.
+sub cwd_field { return undef }
+
 # --- shims (spec S4.1: F-tput, F-git) ---------------------------------------
 my $SHIM_DIR = tempdir(CLEANUP => 1);
 
@@ -521,7 +556,7 @@ my $ANDRE_NAME = 'Andr' . chr(0xC3) . chr(0xA9) . '-projekt';
         my $c = $case{$id};
         my $line  = statusline_line1(payload_for(current_dir => $c->{cwd}),
                         cols => 200, sandbox => 0, toplevel => $c->{toplevel});
-        my $field = field_at($line, 1);
+        my $field = project_field($line);
         my $shown = defined($field) ? $field : '(no project field)';
 
         if ($id eq 'P-a') {
@@ -564,10 +599,10 @@ my $ANDRE_NAME = 'Andr' . chr(0xC3) . chr(0xA9) . '-projekt';
     # actually drives resolution rather than the assertions passing by luck.
     {
         my $cwd = '/w/loose-dir';
-        my $with    = field_at(statusline_line1(payload_for(current_dir => $cwd),
+        my $with    = project_field(statusline_line1(payload_for(current_dir => $cwd),
                         cols => 200, sandbox => 0, toplevel => '/w/proj-alpha'), 1);
-        my $without = field_at(statusline_line1(payload_for(current_dir => $cwd),
-                        cols => 200, sandbox => 0, toplevel => undef), 1);
+        my $without = project_field(statusline_line1(payload_for(current_dir => $cwd),
+                        cols => 200, sandbox => 0, toplevel => undef));
         ok(defined($with) && defined($without) && $with ne $without,
             'AC-P6 (non-vacuity): the same current_dir resolves to different project fields with and without a reported toplevel')
             or diag('  with = ' . (defined $with ? $with : '(undef)')
@@ -597,7 +632,7 @@ my $ANDRE_NAME = 'Andr' . chr(0xC3) . chr(0xA9) . '-projekt';
         is(strip_sgr(statusline_path_row(@args)), $short,
             'AC-D1: the COMPLETE working directory renders verbatim on its own row');
 
-        my $proj = field_at($line, 1);
+        my $proj = project_field($line);
         ok(defined($proj) && index($proj, '>') < 0 && index($proj, '<') < 0,
             'AC-D2: at a generous width the project field carries no elision marker -- truncation is conditional, not universal')
             or diag('  project field = ' . (defined $proj ? "[$proj]" : '(none)'));
@@ -626,7 +661,7 @@ my $ANDRE_NAME = 'Andr' . chr(0xC3) . chr(0xA9) . '-projekt';
         my $ltop     = "/w/$longname";
         my $line = statusline_line1(payload_for(current_dir => "$ltop/deep/place"),
                         cols => 40, sandbox => 0, toplevel => $ltop);
-        my $proj = field_at($line, 1);
+        my $proj = project_field($line);
         my $ok_shape = defined($proj) && length($proj) > 1 && substr($proj, -1) eq '>';
         ok($ok_shape,
             'AC-D4 (N1): at a forcing width the project field is retained text followed by a right-elision marker')
@@ -666,8 +701,8 @@ my $ANDRE_NAME = 'Andr' . chr(0xC3) . chr(0xA9) . '-projekt';
     for my $cols (40, 60, 80, 120, 200) {
         my $line = statusline_line1(payload_for(current_dir => $long),
                         cols => $cols, sandbox => 0, toplevel => $top);
-        my $proj = field_at($line, 1);
-        my $cwd  = field_at($line, 2);
+        my $proj = project_field($line);
+        my $cwd  = cwd_field($line);
         my $bad  = (defined($proj) && length($proj) && defined($cwd) && $cwd eq '<') ? 1 : 0;
         is($bad, 0,
             "AC-D6 (cols=$cols): the cwd field is never a bare elision marker while the project field is still present")
@@ -1132,8 +1167,8 @@ sub glyph_cols_disagreements {
         my $vis  = strip_sgr($line);
         $plans_at{$cols}  = ($vis =~ /\b(?:blueprints|todos)\b/) ? 1 : 0;
         $git_at{$cols}    = (index($vis, 'main') >= 0) ? 1 : 0;
-        my $proj = field_at($line, 1);
-        my $cwd  = field_at($line, 2);
+        my $proj = project_field($line);
+        my $cwd  = cwd_field($line);
         $elided_at{$cols} = ((defined($proj) && $proj =~ /[<>]/) || (defined($cwd) && $cwd =~ /[<>]/)) ? 1 : 0;
 
         ok(!$plans_at{$cols} || $git_at{$cols},
@@ -1210,7 +1245,7 @@ sub glyph_cols_disagreements {
     {
         my $line = statusline_line1(payload_for(current_dir => '/project/plugins'),
                         cols => 200, sandbox => 1, toplevel => '/project', home => $home);
-        is(field_at($line, 1), 'project',
+        is(project_field($line), 'project',
             'AC-N0: with no name file the mount point is all there is -- the defect, reproduced');
     }
 
@@ -1218,7 +1253,7 @@ sub glyph_cols_disagreements {
     {
         my $line = statusline_line1(payload_for(current_dir => '/project/plugins'),
                         cols => 200, sandbox => 1, toplevel => '/project', home => $home);
-        is(field_at($line, 1), 'gsa-superapp',
+        is(project_field($line), 'gsa-superapp',
             'AC-N1: the name file supplies the real project name in place of the mount point');
     }
 
@@ -1237,7 +1272,7 @@ sub glyph_cols_disagreements {
     {
         my $line = statusline_line1(payload_for(current_dir => '/project'),
                         cols => 200, sandbox => 1, toplevel => '/project', home => $home);
-        is(field_at($line, 1), 'project',
+        is(project_field($line), 'project',
             'AC-N3: an empty name file falls back rather than rendering an empty project field');
     }
 
@@ -1247,7 +1282,7 @@ sub glyph_cols_disagreements {
         my ($out) = run_statusline(payload_for(current_dir => '/project'),
                         cols => 200, sandbox => 1, toplevel => '/project', home => $home);
         my $line = first_line($out);
-        is(field_at($line, 1), 'evilSECOND ROW',
+        is(project_field($line), 'evilSECOND ROW',
             'AC-N4: an embedded newline is scrubbed, not honoured -- the file cannot inject an extra row');
         is(index(strip_sgr($line), "\n"), -1,
             'AC-N4: and no newline reaches the rendered row');
@@ -1258,7 +1293,7 @@ sub glyph_cols_disagreements {
     {
         my $line = statusline_line1(payload_for(current_dir => '/w/proj-alpha/x'),
                         cols => 200, sandbox => 0, toplevel => '/w/proj-alpha', home => $home);
-        is(field_at($line, 1), 'proj-alpha',
+        is(project_field($line), 'proj-alpha',
             'AC-N5: on the host the name still comes from the git toplevel -- the fix is sandbox-shaped only');
     }
 }

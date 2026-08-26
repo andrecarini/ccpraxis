@@ -113,6 +113,8 @@ my %GLYPH_COLS = (
     # disagree about it -- declared as one column, which is what a monospaced
     # terminal renders it as and what the row budget must assume.
     0x29C9 => 1,
+    # The todos icon (2026-08-26), same reasoning.
+    0x22EE => 1,
 );
 
 # row_cost($fragment) -> the budget a rendered fragment consumes.
@@ -559,7 +561,13 @@ eval {
         opendir(my $dh, $todo_dir) or die;
         my $n = grep { /\.md$/ && !/^README\.md$/ && -f "$todo_dir/$_" } readdir($dh);
         closedir($dh);
-        push @parts, "${MUTED}todos ${R}${PRIMARY}${n}${R}" if $n > 0;
+        # AN ICON, NOT THE WORD -- the same call the blueprints count got, and
+        # the operator picked U+22EE (vertical ellipsis, "items continuing
+        # down") from ten offered. Chosen partly BECAUSE it contrasts with
+        # U+29C9 above: two box-shaped glyphs side by side would read as a
+        # matched pair rather than two different counts. Declared in Theme.pm
+        # and in %GLYPH_COLS above.
+        push @parts, "${MUTED}\x{22EE} ${R}${PRIMARY}${n}${R}" if $n > 0;
     }
 
     # Double space between segments groups them as distinct categories.
@@ -811,8 +819,25 @@ my $line2 = "${MUTED}${short}${R} "
 # own fields, so the merged row has one grammar rather than two. Inside a group
 # the fields are spaced, between groups they are fenced -- which is what makes
 # "Opus 5 1M 71% 710k 290k" read as one reading of one thing.
-my @segments = ($line1, $line2);
+#
+# THE ORDER IS MARKER, CONTEXT, BUDGET, THEN THE OLD ROW-1 TAIL (operator,
+# 2026-08-26: "after the HOST/SANDBOX cell, the model usage cell and the budget
+# cell and then the rest of the stuff in the old order").
+#
+# It puts the two things that MOVE nearest the left edge. Context burn and plan
+# usage change continuously and are the reason to glance at this line at all;
+# project, branch and the two counts are near-constant for a session and are
+# there to be found when wanted, not watched. It also means the two readings
+# most likely to matter survive a narrow terminal, since the fit ladder trims
+# from the tail.
+my @tail;
+push @tail, "${ACCENT}${B}${f_project}${R}" if length $f_project;
+push @tail, $f_git   if length $f_git;
+push @tail, $f_plans if length $f_plans;
+
+my @segments = ("${MUTED}${f_marker}${R}", $line2);
 push @segments, $plan_full if length $plan_full;
+push @segments, @tail;
 my $single = join $SEP, @segments;
 
 # ...but never at the cost of losing the context readout. If the joined row does
