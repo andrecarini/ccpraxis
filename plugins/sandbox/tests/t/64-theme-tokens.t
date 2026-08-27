@@ -1421,13 +1421,24 @@ is_deeply(Theme::x256_rgb(196), [255, 0, 0],     'x256_rgb(196) == [255,0,0] (B-
         'corner.br'   => { cp => 0x2518, width => 1 },
         'sep.bar'     => { cp => 0xFF5C, width => 2 },
         'sep.dot'     => { cp => 0x00B7, width => 1 },
-        # RE-POINTED 2026-08-26: the meter stopped being a full-height block
-        # (operator: "can we have blocks that are not full height?"). This
-        # table is the INDEPENDENT copy Theme is checked against, so the
+        # RE-POINTED TWICE. First 2026-08-26, when the meter stopped being a
+        # full-height block (operator: "can we have blocks that are not full
+        # height?") and became 0x2584/0x2581. Then 2026-08-27, when that turned
+        # out to solve the wrong half of the problem: every block element is
+        # anchored to the cell's top or bottom edge, so a half-height block
+        # still sat on the baseline and the bar read as blocks resting on a
+        # floor. The operator's words were "they're not vertically centered".
+        #
+        # 0x2501/0x2500 are box-drawing rules: vertically centred, and spanning
+        # the full cell width so consecutive cells fuse into a continuous line
+        # rather than showing gaps. 0x2501 is the heaviest centred horizontal
+        # rule in the BMP.
+        #
+        # This table is the INDEPENDENT copy Theme is checked against, so the
         # codepoints move here by hand -- deriving them from Theme would make
         # the comparison circular and the guard useless.
-        'gauge.full'  => { cp => 0x2584, width => 1 },
-        'gauge.empty' => { cp => 0x2581, width => 1 },
+        'gauge.full'  => { cp => 0x2501, width => 1 },
+        'gauge.empty' => { cp => 0x2500, width => 1 },
         'scroll.up'   => { cp => 0x25B2, width => 1 },
         'scroll.down' => { cp => 0x25BC, width => 1 },
         'arrow.up'    => { cp => 0x2191, width => 1 },

@@ -42,6 +42,7 @@ $data = {} unless ref($data) eq 'HASH';
 # Regenerate: perl -Iplugins/sandbox/scripts -MTheme -e "print Theme::generated_block()"
 my %THEME_RGB = (
   'accent' => [66,148,250],
+  'gauge.track' => [68,68,68],
   'rule' => [60,70,85],
   'state.crit' => [255,90,90],
   'state.idle' => [110,126,148],
@@ -53,6 +54,7 @@ my %THEME_RGB = (
 );
 my %THEME_X256 = (
   'accent' => 69,
+  'gauge.track' => 238,
   'rule' => 238,
   'state.crit' => 203,
   'state.idle' => 244,
@@ -64,6 +66,7 @@ my %THEME_X256 = (
 );
 my %THEME_ATTR = (
   'accent' => '1',
+  'gauge.track' => '',
   'rule' => '2',
   'state.crit' => '1',
   'state.idle' => '2',

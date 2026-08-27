@@ -200,7 +200,52 @@ sub _roles_data {
             x256    => 238,
             attr    => '2',
             class   => 'decor',
-            meaning => 'Separators, frame lines, gauge track. Carries no fact.',
+            meaning => 'Separators and frame lines. Carries no fact.',
+        },
+        # SPLIT OUT OF 'rule', which used to paint the gauge track too.
+        #
+        # A border and a gauge track look like the same job but are held to
+        # different standards: a border only has to be visible against the
+        # BACKGROUND, whereas a track also has to be distinguishable from the
+        # FILL drawn in the same row. Sharing one token meant tuning either one
+        # moved the other, and repainting 'rule' to fix a gauge would have
+        # repainted every frame line on the screen.
+        #
+        # Measured, not eyeballed (WCAG relative luminance), against the
+        # #1E1E1E background t/64 holds decor roles to:
+        #
+        #   x256  rgb        vs fill    vs bg     verdict
+        #   ----  ---------  ---------  --------  -----------------------------
+        #    236  (48)       4.30:1     1.263     below t/64's 1.5:1 decor floor
+        #    237  (58)       3.71:1     1.466     below it -- first draft, red
+        #    238  (68)       3.18:1     1.712     this
+        #    239  (78)       2.71:1     2.003
+        #
+        # AND THE HONEST CONCLUSION: colour buys almost nothing here. The two
+        # columns pull against each other, and t/64's floor -- correctly -- caps
+        # how dark a track may go before it stops reading as a channel on a dark
+        # terminal. 3.18:1 against the old shared 'rule' figure of 3.11:1 is
+        # noise. "Very dark grey" is delivered as far as the floor allows and no
+        # further; anyone tempted to push to 236 for more separation should read
+        # the vs-bg column first.
+        #
+        # What actually separates fill from track is GLYPH WEIGHT -- heavy rule
+        # against light rule -- which is why that pairing, not this colour, is
+        # the fix for a gauge that read as one undifferentiated smear.
+        #
+        # This role therefore earns its place by DECOUPLING, not by its value: a
+        # border and a track have different jobs, and sharing 'rule' meant a
+        # gauge tweak repainted every frame line on the screen.
+        #
+        # attr is deliberately EMPTY rather than '2'. Dim is a terminal-defined
+        # transform, so stacking it on an already-dark grey makes the rendered
+        # result unpredictable and the numbers above meaningless.
+        'gauge.track' => {
+            rgb     => [68, 68, 68],
+            x256    => 238,
+            attr    => '',
+            class   => 'decor',
+            meaning => 'The unfilled portion of a meter. Carries no fact.',
         },
         'accent' => {
             rgb     => [66, 148, 250],
@@ -353,8 +398,26 @@ sub _glyphs_data {
         # here -- U+2593 over U+2591 -- and was NOT chosen because a shade
         # pattern still occupies the full cell height, so it changes the texture
         # without changing the mass. Height is what carries the weight.
-        'gauge.full'  => { cp => 0x2584, desc => 'lower half block, meter fill' },
-        'gauge.empty' => { cp => 0x2581, desc => 'lower one eighth block, meter track' },
+        # VERTICALLY CENTRED AND CONTIGUOUS, which is what the block elements
+        # could not be. 0x2584/0x2581 sat on the cell's baseline, so the bar
+        # read as a row of blocks resting on a floor rather than as a bar. Every
+        # block-element fill is anchored to an edge (upper or lower) by
+        # definition, so no choice within that family fixes it.
+        #
+        # These two are box-drawing rules: they occupy the cell's vertical
+        # centre and span its full width, so consecutive cells fuse into one
+        # continuous line instead of showing gaps. 0x2501 is the heaviest
+        # centred horizontal rule in the BMP -- nothing in box-drawing is
+        # thicker. Heavier exists only in Symbols for Legacy Computing
+        # (0x1FB97), which was rejected: Theme::glyph() returns bytes
+        # unconditionally with no font-capability fallback, a terminal cannot
+        # detect whether a font has a glyph, and this ships into a container
+        # image whose font is not ours to choose. Tofu would have no backstop.
+        #
+        # Contrast is carried by WEIGHT as well as colour: heavy fill against
+        # light track, painted 'accent' against 'rule'.
+        'gauge.full'  => { cp => 0x2501, desc => 'heavy horizontal rule, meter fill' },
+        'gauge.empty' => { cp => 0x2500, desc => 'light horizontal rule, meter track' },
         'scroll.up'   => { cp => 0x25B2, desc => 'black up-pointing triangle, scroll indicator' },
         'scroll.down' => { cp => 0x25BC, desc => 'black down-pointing triangle, scroll indicator' },
         'arrow.up'    => { cp => 0x2191, desc => 'upwards arrow, git-ahead count' },

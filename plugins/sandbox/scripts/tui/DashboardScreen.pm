@@ -1135,9 +1135,19 @@ sub _gauge_value_spans {
     $pct_text = tui::Meter::percent_text($ratio) unless defined $pct_text;
     $pct_text = '' unless defined $pct_text;
 
-    # THE TRACK IS NOT THE FILL. The empty cells carry 'rule' -- the same token
-    # every border on the screen uses -- so the gauge reads as a dim channel
-    # with a marked portion, rather than as ten coloured blocks of two shades.
+    # THE TRACK IS NOT THE FILL. The empty cells carry 'gauge.track', so the
+    # gauge reads as a dim channel with a marked portion, rather than as ten
+    # coloured blocks of two shades.
+    #
+    # That token used to be 'rule' -- shared with every border on the screen --
+    # and it was split out because the two are held to different standards: a
+    # border only needs to be visible against the background, a track also needs
+    # to be distinguishable from the fill beside it. Theme.pm carries the
+    # measured contrast figures behind the split.
+    #
+    # The separation is now carried by WEIGHT as well as colour: the fill glyph
+    # is a heavy rule and the track a light one, so the gauge survives being
+    # read on a terminal whose palette flattens the two greys.
     my ($fill, $track) = tui::Meter::bar_split($ratio, tui::Meter::BAR_CELLS());
     my @spans;
     # atomic: a partly-drawn gauge reads as a DIFFERENT, wrong percentage, and a
@@ -1148,7 +1158,7 @@ sub _gauge_value_spans {
     # dropping one whole half still leaves a bar that cannot be misread as a
     # percentage, because the percent column sits right beside it.
     push @spans, { text => $fill,  role => $role,  atomic => 1 } if defined $fill  && length $fill;
-    push @spans, { text => $track, role => 'rule', atomic => 1 } if defined $track && length $track;
+    push @spans, { text => $track, role => 'gauge.track', atomic => 1 } if defined $track && length $track;
     push @spans, { text => ' ', role => $role };
     push @spans, { text => sprintf('%*s', tui::Meter::PERCENT_COL_WIDTH(), $pct_text),
                    role => $role, atomic => 1 };
