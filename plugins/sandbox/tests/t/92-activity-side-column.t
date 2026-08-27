@@ -231,17 +231,33 @@ for my $cols (@WIDE) {
             my $at = index(plain($f->[$idx]{text}), 'Recent activity');
             cmp_ok($at, '>=', $cols - $sw,
                 "AC7: cols=$cols rows=$rows -- it starts inside the reserved rightmost $sw columns");
-            # AC8 RE-POINTED 2026-08-25. This asserted index 1 -- the first row
-            # BELOW the screen title -- because the title used to span the whole
-            # terminal. It no longer does: the header occupies the main region
-            # only and the side column runs from row 0, so Activity starts at
-            # the very top of the viewport and gains a row. That was the point
-            # of the change (operator: "I thought Recent Activity would go to
-            # the top of the viewport instead of stretching that banner
-            # throughout the entire terminal"), and index 0 is the assertion
-            # that says it happened.
-            is($idx, 0,
-                "AC8: cols=$cols rows=$rows -- and it starts at the TOP of the viewport, beside the header rather than below it");
+            # AC8 RE-POINTED TWICE, and it is back where it started.
+            #
+            # Originally index 1 -- the first row BELOW the screen title, which
+            # spanned the whole terminal. On 2026-08-25 it became index 0: the
+            # header was narrowed to the main region and the column ran beside
+            # it from row 0, so Activity gained a row (operator: "I thought
+            # Recent Activity would go to the top of the viewport instead of
+            # stretching that banner throughout the entire terminal").
+            #
+            # On 2026-08-27, having seen it, the operator reversed that: "drop
+            # whatever I said about having Recent activity take the top row. It
+            # looks better when it was instead on the second row aligned with
+            # Run." So the header spans the terminal again and the column starts
+            # under it -- index 1 -- which is the row the first main-region panel
+            # also starts on. That alignment is the whole point of the reversal,
+            # so it is asserted directly below rather than left implied.
+            is($idx, 1,
+                "AC8: cols=$cols rows=$rows -- the column starts BELOW the full-width header, not beside it");
+
+            # ...and row 0 is ALL header. This is the structural half of the
+            # claim: index 1 alone would still hold if the column merely started
+            # late while something else occupied row 0's right-hand end. An
+            # activity row is recognisable by its leading clock, so its absence
+            # from row 0's tail is what says the header owns the full width.
+            my $row0_tail = substr(plain($f->[0]{text}), -$sw);
+            unlike($row0_tail, qr/\d\d:\d\d/,
+                "AC8: cols=$cols rows=$rows -- row 0 carries no activity content, so the header spans the terminal");
         }
 
         # AC8 -- the bottom body row also carries column content. With 40

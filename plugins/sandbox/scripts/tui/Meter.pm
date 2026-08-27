@@ -37,12 +37,21 @@ use tui::Frame;
 use constant LABEL_COL_WIDTH   => 11;
 use constant NUMERIC_COL_WIDTH => 46;
 use constant BAR_CELLS         => 10;
-# FIVE, not four (operator, 2026-08-26: "everything in the resources cell is
-# misaligned. I wish it was a neat table instead"). The Resources panel now
-# renders every gauge row through one percent column, and the two CPU rows
-# carry a decimal ("14.8%", "65.0%") that a four-column field would clip. The
-# byte rows still print an integer percent and simply right-align into it.
-use constant PERCENT_COL_WIDTH => 5;
+# FOUR. Every gauge row now prints an INTEGER percent through
+# tui::Meter::percent_text, so the widest possible value is "100%".
+#
+# It was five for one reason: the two CPU rows formatted themselves with
+# sprintf('%.1f%%') instead of going through percent_text, and a decimal needs
+# the extra column. That turned out to be the cause of the misalignment the
+# width was widened to fix -- "100.0%" is SIX columns, so it overflowed even the
+# widened field and shoved its own figures right, leaving the cpu rows out of
+# line with the mem and disk rows around them. The operator's instruction was to
+# drop the fraction ("No need for fractional percentages"), which removes the
+# only thing that ever needed a fifth column.
+#
+# There is now exactly one percent formatter, so a row cannot reintroduce a
+# width this constant does not know about.
+use constant PERCENT_COL_WIDTH => 4;
 
 # BYTES_COL_WIDTH -- the field each figure in a used/free/total triple is
 # right-aligned into, so the '|' separators land in the same column on every
@@ -251,6 +260,44 @@ sub numbers_used_free_total {
         BYTES_COL_WIDTH(), fmt_bytes($used),
         BYTES_COL_WIDTH(), fmt_bytes($free),
         BYTES_COL_WIDTH(), fmt_bytes($total));
+}
+
+# numbers_used_free_total_spans($used, $free, $total) -> \@spans -- the same
+# triple as numbers_used_free_total, but split so the three kinds of token can
+# be painted differently. PUBLIC.
+#
+# WHY SPANS AND NOT A STRING THE CALLER RE-PARSES. The row was one span in
+# 'text.primary', so a quantity, its unit, the word "free" and a '|' separator
+# all carried identical weight and the eye had nothing to lock onto -- the
+# operator's "you are not properly color coding and styling the values to the
+# right of the gauge". The alternative was to format the string here and split
+# it with a regex at the point of use, which means parsing text this module
+# just produced: it would work until the format changed, and then fail
+# silently. Emitting the structure directly keeps the widths and the roles in
+# the one place that owns them.
+#
+# The three roles, and the reason each is what it is:
+#   figure  text.primary -- the value the operator is here to read
+#   word    text.muted   -- "used"/"free"/"total" label their neighbour and
+#                           repeat on every row; they frame a value, which is
+#                           exactly what text.muted means
+#   pipe    rule         -- a separator carrying no fact, the same token every
+#                           other separator on the screen uses
+#
+# The padding stays attached to its figure so the columns still line up: the
+# figure span is the full BYTES_COL_WIDTH field, not the trimmed number.
+sub numbers_used_free_total_spans {
+    my ($used, $free, $total) = @_;
+    my @spans;
+    my @parts = ([ $used, 'used' ], [ $free, 'free' ], [ $total, 'total' ]);
+    for my $i (0 .. $#parts) {
+        my ($v, $word) = @{ $parts[$i] };
+        push @spans, { text => ' | ', role => 'rule' } if $i;
+        push @spans, { text => sprintf('%*s', BYTES_COL_WIDTH(), fmt_bytes($v)),
+                       role => 'text.primary' };
+        push @spans, { text => " $word", role => 'text.muted' };
+    }
+    return \@spans;
 }
 
 # fits_numeric_column($text) -> true iff $text's display width does not

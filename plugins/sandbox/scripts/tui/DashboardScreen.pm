@@ -1164,9 +1164,25 @@ sub _gauge_value_spans {
                    role => $role, atomic => 1 };
     # THE FIGURES ARE NEVER ALARM-COLOURED. They are the longest run of
     # characters on the row, so painting them red turned one busy disk into a
-    # wall of red text; the gauge beside them already says how bad it is.
-    push @spans, { text => '  ' . $figures, role => 'text.primary' }
-        if defined $figures && length $figures;
+    # wall of red text; the gauge beside them already says how bad it is. That
+    # holds for the span form below too: none of its three roles is a state
+    # colour.
+    #
+    # $figures is EITHER a plain string (one span, the historical shape, still
+    # used by callers that have a single opaque figure) OR an arrayref of spans
+    # from tui::Meter::numbers_used_free_total_spans, which splits quantity,
+    # label word and separator so they can be weighted differently. Accepting
+    # both is what let the byte rows gain structure without touching every
+    # caller.
+    if (ref($figures) eq 'ARRAY') {
+        if (@$figures) {
+            push @spans, { text => '  ', role => 'text.primary' };
+            push @spans, @$figures;
+        }
+    }
+    elsif (defined $figures && length $figures) {
+        push @spans, { text => '  ' . $figures, role => 'text.primary' };
+    }
     push @spans, @$trail if ref($trail) eq 'ARRAY';
     return \@spans;
 }
@@ -1182,14 +1198,20 @@ sub _bytes_gauge_spans {
                  && $total =~ /^-?\d+(?:\.\d+)?$/) ? $total - $used : undef;
     $avail = 0 if defined($avail) && $avail < 0;
     return _gauge_value_spans($ratio, undef,
-                              tui::Meter::numbers_used_free_total($used, $avail, $total),
+                              tui::Meter::numbers_used_free_total_spans($used, $avail, $total),
                               $trail);
 }
 
 # _pct_gauge_spans($pct, \@trail) -> \@spans -- a gauge row whose only figure
 # IS the percentage, so it lives in the percent column and the figures column
-# is empty. One decimal is kept: a CPU reading moves continuously and the
-# tenth is the part that shows it moving, which is why PERCENT_COL_WIDTH is 5.
+# is empty.
+#
+# The decimal is GONE. This used to keep one, on the reasoning that a CPU
+# reading moves continuously and the tenth is the part that shows it moving.
+# That cost more than it bought: it made this the only row shape that could
+# emit six columns into the percent field, which is what knocked the cpu rows
+# out of alignment with their neighbours. The bar itself already shows movement,
+# and the operator asked for the fraction to go.
 # _figures_only_spans($text) -> \@spans -- a row that has FIGURES but no gauge,
 # with those figures starting in the same column the gauge rows put theirs.
 #
@@ -1214,7 +1236,21 @@ sub _pct_gauge_spans {
     my $ratio = $pct / 100;
     $ratio = 0 if $ratio < 0;
     $ratio = 1 if $ratio > 1;
-    return _gauge_value_spans($ratio, sprintf('%.1f%%', $pct), undef, $trail);
+    # INTEGER, via percent_text, exactly like every other gauge row.
+    #
+    # This used to pass sprintf('%.1f%%', $pct) and it was the only row shape
+    # that did, which made it the only one that could produce a SIX-column
+    # percent ("100.0%") in a five-column field. The overflow pushed its own
+    # figures one column right, so the cpu rows sat out of line with the mem and
+    # disk rows directly above and below them -- the misalignment the operator
+    # reported, and asked to fix by dropping the fraction: "No need for
+    # fractional percentages."
+    #
+    # Passing undef here is deliberate rather than formatting an integer
+    # locally: _gauge_value_spans then calls tui::Meter::percent_text itself, so
+    # there is ONE percent formatter in the module and a row cannot drift from
+    # the column width again.
+    return _gauge_value_spans($ratio, undef, undef, $trail);
 }
 
 sub _resources_body {
@@ -1965,7 +2001,17 @@ sub screen {
     #
     # side_column_width() is public and pure, and returns 0 below the
     # breakpoint, so on a narrow terminal this is $cols unchanged.
-    my $header_cols = $cols - tui::Screen::side_column_width($cols);
+    # FULL WIDTH AGAIN (operator, 2026-08-27). This was
+    # $cols - side_column_width($cols), because the side column used to start at
+    # row 0 and share that row with the header. It no longer does -- the column
+    # begins below the header, aligned with the first panel -- so the header has
+    # the whole terminal back and must be composed at the whole width.
+    #
+    # The two MUST agree: tui::Screen renders the title into a cell of exactly
+    # this width, so composing narrower leaves a short row and composing wider
+    # gets clipped, which is how the container id lost its right-hand end once
+    # before.
+    my $header_cols = $cols;
     $header_cols = 1 if $header_cols < 1;
 
     return {

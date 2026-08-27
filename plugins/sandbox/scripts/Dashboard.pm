@@ -970,6 +970,7 @@ sub sgr_for_role {
     my ($role) = @_;
     $role = '' if !defined $role;
     return Theme::sgr($role, undef) if exists _theme_role_names()->{$role};
+
     return "\e[1;36m"     if $role eq 'title';        # bold cyan
     return "\e[1m"        if $role eq 'panel-title';  # bold
     return "\e[2m"        if $role eq 'footer';       # dim
@@ -1613,20 +1614,24 @@ sub activity_capacity {
     # than left to the fixed-region model that no longer describes it.
     $rows = 0 if !defined $rows || ref($rows) || $rows !~ /^-?\d+(?:\.\d+)?$/ || $rows < 0;
     if (tui::Screen::side_column_width($cols) > 0) {
-        # THE COLUMN NOW STARTS AT ROW 0. It used to begin under the screen
-        # title, so its height was rows - title - footer - its own panel title.
-        # tui::Screen runs it from the very top of the viewport (the header
-        # occupies the main region only), so the title row is no longer
-        # subtracted -- one more row of events, which is the entire point of
-        # that change and would otherwise be an off-by-one between this
-        # predictor and the renderer. t/40's AC-12 agreement check caught it on
-        # the first run, as it is designed to.
-        # chrome_rows() - 1: the side column starts at row 0, so it pays the
-        # chrome MINUS the title row (which occupies the main region only). The
-        # footer rule is NOT one of the rows it escapes -- it spans the whole
-        # terminal, below both regions -- so it has to be in this subtraction or
-        # capacity over-reports by one and the scroll runs off the screen.
-        my $cap = int($rows) - (tui::Screen::chrome_rows() - 1) - 1;   # chrome below row 0, and the panel's own title
+        # THE COLUMN STARTS BELOW THE HEADER AGAIN (operator, 2026-08-27), so it
+        # pays the FULL chrome once more.
+        #
+        # For one release it began at row 0, beside a header narrowed to the main
+        # region, and this subtracted chrome_rows() - 1 to credit it that extra
+        # row. The operator reversed the layout after seeing it ("it looks better
+        # when it was instead on the second row aligned with Run"), so the credit
+        # has to go back with it: the header spans the terminal, the column
+        # starts under it, and its height is rows - title - footer rule - footer
+        # - its own panel title.
+        #
+        # THIS IS A PREDICTOR OF WHAT tui::Screen ACTUALLY RENDERS, and the two
+        # disagreeing by one is not cosmetic -- capacity is what the launcher
+        # uses to decide how many events to hand the panel, so over-reporting
+        # runs the scroll off rows the screen never had. t/92's AC-capacity and
+        # t/40's AC-12 both check the agreement, and both caught this on the
+        # first run after the layout moved, exactly as designed.
+        my $cap = int($rows) - tui::Screen::chrome_rows() - 1;   # full chrome, and the panel's own title
         return $cap > 0 ? $cap : 0;
     }
 

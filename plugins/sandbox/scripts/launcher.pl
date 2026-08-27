@@ -6488,7 +6488,17 @@ sub _powershell_json {
 # fact. Memoised; this is asked once per probe per round.
 sub _timeout_prefix {
     my ($secs) = @_;
-    $secs = 5 if !defined $secs || $secs !~ /Ad+z/;
+    # \A\d+\z, and the backslashes are LOAD-BEARING. This read /Ad+z/ -- a
+    # literal A, one-or-more d, a z -- because an in-place `perl -0777 -i -pe`
+    # edit ate the backslashes. Nothing warned: it is a valid pattern that
+    # simply never matches, so EVERY caller's value was discarded and every
+    # probe silently ran with a 5-second budget.
+    #
+    # The visible symptom was three permanently missing facts. `podman system
+    # df` is measured just below at 10.6s/18.8s/25.1s and was handed 45s for
+    # that reason; capped at 5s it could never finish, and the operator saw
+    # "3 facts unavailable" with probe_errors {"df":"probe produced no output"}.
+    $secs = 5 if !defined $secs || $secs !~ /\A\d+\z/;
     my $bin = _gnu_timeout_bin();
     # THE SECONDS BELONG TO THE PREFIX, not to the caller.
     #

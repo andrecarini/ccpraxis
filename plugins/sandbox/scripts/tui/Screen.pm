@@ -914,22 +914,29 @@ sub compose {
     # reaches first; the activity panel renders into whatever is left, which is
     # why its budget is reduced here rather than it being padded afterwards --
     # padding would give it rows it could not use and then clip them.
-    # THE SIDE COLUMN STARTS AT ROW 0 (operator request, 2026-08-25).
+    # THE SIDE COLUMN STARTS BELOW THE HEADER (operator, 2026-08-27), REVERSING
+    # the 2026-08-25 request that put it at row 0.
     #
-    # The header row -- "[<spin> running] ccpraxis sandbox - <project>" on the
-    # left, the container id on the right -- used to span the whole terminal.
-    # On a wide screen that is one full-width row carrying two short strings and
-    # a hundred-odd columns of nothing, sitting directly above a column that
-    # wants every row it can get. It now occupies the MAIN region only, and the
-    # side column runs alongside it, so Activity begins at the very top of the
-    # viewport and gains a row.
+    # It ran alongside the header for one release: the header was built at
+    # $main_cols instead of $cols, the side column filled the remaining width on
+    # row 0, and Activity gained a row. The operator's verdict on seeing it:
+    # "drop whatever I said about having Recent activity take the top row. It
+    # looks better when it was instead on the second row aligned with Run."
     #
-    # This is not the same as deleting the header, which is what I first read
-    # the request as and declined: the status block still leads it, exactly as
-    # asked for earlier in the same batch. Only its WIDTH changes.
-    my $header_row = tui::Frame::make_cell($screen->{title}, $title_role, $main_cols);
-    my @left_all   = ($header_row, @left);
-    my $region_h   = $body_height + 1;      # the header row is now part of the join
+    # So the header spans the terminal again and the join starts under it. That
+    # costs Activity exactly the one row it had gained, and buys back the
+    # alignment between the top of the side column and the top of the first
+    # panel in the main region -- the two now begin on the same row, which is
+    # what "aligned with Run" means.
+    #
+    # It also removes the only row on screen shared between an animating cell
+    # (the header carries the spinner) and the side column, which is where a
+    # flashing first row was reported. That is a plausible contributor, NOT a
+    # diagnosis: the report coincided with a [r] reload, whose report banner
+    # renders into this same column and expires on a timer.
+    my $header_row = tui::Frame::make_cell($screen->{title}, $title_role, $cols);
+    my @left_all   = @left;
+    my $region_h   = $body_height;
 
     my $side_body_h = $region_h - scalar(@banner_cells);
     $side_body_h = 0 if $side_body_h < 0;
@@ -953,7 +960,8 @@ sub compose {
             : _join_row_cells($left_all[$_], $side[$_])
     } 0 .. $region_h - 1;
 
-    return [ @body_cells, _footer_rule_cell($body_cells[-1], $cols), $footer_cell ];
+    return [ $header_row, @body_cells,
+             _footer_rule_cell($body_cells[-1], $cols), $footer_cell ];
 }
 
 # viewport($total, $height, $cursor) -> \%vp -- pure integer scrolling

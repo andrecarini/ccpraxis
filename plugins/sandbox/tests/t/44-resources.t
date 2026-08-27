@@ -2567,6 +2567,46 @@ FAKE_MODULE
         # probe rather than one.
         like($probes_body, qr/_timeout_prefix\(\s*\d+\s*\)/,
             'FIXBATCH-1 (MAJOR-1/H2): the probes take their timeout from the resolver, not from PATH');
+
+        # BEHAVIOURAL, BECAUSE THE TEXTUAL FORM ABOVE CANNOT SEE THIS CLASS OF
+        # BUG -- and did not. _timeout_prefix's own guard was written
+        #
+        #     $secs = 5 if !defined $secs || $secs !~ /Ad+z/;
+        #
+        # where /Ad+z/ is a literal A, one-or-more d, a z: a perfectly valid
+        # pattern that matches no number at all, produced by an in-place
+        # `perl -0777 -i -pe` edit eating the backslashes of /\A\d+\z/. Every
+        # caller's argument was therefore discarded and every probe ran with a
+        # 5-second budget. `podman system df` is measured at 10.6s/18.8s/25.1s
+        # and had been given 45s precisely because of that; capped at 5s it
+        # could never return, and the operator saw a permanent "3 facts
+        # unavailable" with probe_errors {"df":"probe produced no output"}.
+        #
+        # Every textual assertion in this block stayed green throughout: the
+        # call site really did say _timeout_prefix(45). Only calling the thing
+        # catches it.
+        #
+        # launcher.pl is still never require'd (see this file's header rule).
+        # The sub is extracted and eval'd into a scratch package with the one
+        # helper it depends on stubbed, so nothing in the launcher runs.
+        my $launcher_src = slurp($LAUNCHER_PATH);
+        my ($tp_src) = $launcher_src =~ /(sub\s+_timeout_prefix\s*\{.*?\n\})/s;
+        ok($tp_src, 'FIXBATCH-1: _timeout_prefix is extractable for a behavioural check');
+      SKIP: {
+            skip('could not extract _timeout_prefix', 3) unless $tp_src;
+            my $ok = eval "package TPProbe; sub _gnu_timeout_bin { 'timeout' } $tp_src 1;";
+            ok($ok, 'FIXBATCH-1: ...and evaluates standalone') or diag("  eval: $@");
+            SKIP: {
+                skip('_timeout_prefix did not evaluate', 2) unless $ok;
+                like(TPProbe::_timeout_prefix(45), qr/\btimeout\s+45\s/,
+                    'FIXBATCH-1 CANONICAL: _timeout_prefix(45) actually carries 45 -- a '
+                  . 'guard regex that silently matches nothing would force every probe to '
+                  . 'the 5s default and starve the long ones');
+                like(TPProbe::_timeout_prefix('not-a-number'), qr/\btimeout\s+5\s/,
+                    'FIXBATCH-1: ...while a non-numeric argument still falls back to 5, so '
+                  . 'the fix did not simply delete the validation');
+            }
+        }
         # The SECONDS live inside the prefix, not at the call site. An earlier
         # shape had callers write `$t 5 $PODMAN ...` with $t empty when no
         # timeout binary was found, which produced ` 5 podman ...` -- the shell
