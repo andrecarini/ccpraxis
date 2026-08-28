@@ -418,13 +418,27 @@ sub assert_baseline_preserved {
         'permissions.deny[0]'  => 1,   # 1edc0d3 -- the belt to autoMemoryEnabled's
                                        # braces: Read(~/.claude/projects/**/memory/**).
                                        # Both files carry exactly this one entry.
+        'env.CLAUDE_CODE_MAX_SUBAGENTS_PER_SESSION' => 1,
+                                       # 2026-08-28 -- the built-in 200-subagent
+                                       # ceiling refused a blueprint's mandatory
+                                       # auditor gate in a session that had spawned
+                                       # none of its own. A butler fleet run reaches
+                                       # that ceiling legitimately: seven packages
+                                       # times a scout/architect/test-writer/
+                                       # implementer-loop/reviewer/redteam/fix-batch
+                                       # pipeline, plus judges and relaunches, is
+                                       # already in the hundreds. Raised on all
+                                       # three surfaces (host payload, its live
+                                       # mirror, and the container blueprint) so a
+                                       # sandbox is not left with the old cap.
     );
     my @unexpected = grep {
         !exists $baseline_flat->{$_} && !$permitted_additions{$_}
     } sort keys %$live_flat;
     $maybe_notice->($_) for @unexpected;
     is_deeply(\@unexpected, [],
-        "A4: $label introduces no key path outside the baseline other than cleanupPeriodDays");
+        "A4: $label introduces no key path outside the baseline other than the "
+      . scalar(keys %permitted_additions) . " named permitted additions");
 }
 
 assert_baseline_preserved('global-config/settings.json',            $HOST_BASELINE,      $host_data);
