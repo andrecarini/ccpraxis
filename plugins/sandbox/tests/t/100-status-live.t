@@ -300,14 +300,20 @@ sub _run_live {
             # expected glyph becomes conditional, so B4 still fails if the lead
             # character goes missing or drifts away from the status word.
             #
-            # The expected static glyph is DERIVED from _container_role, not
-            # typed here, so it cannot drift from the mapping the renderer uses.
-            my %STATIC_FOR_ROLE = (
-                'state.ok'   => 'status.ok',
-                'state.warn' => 'status.warn',
-                'state.crit' => 'status.crit',
-                'state.idle' => 'status.idle',
-            );
+            # The expected static glyph is DERIVED from the renderer's own
+            # mapping, not typed here, so it cannot drift from what is drawn.
+            #
+            # It is derived via container_glyph('header', ...) SPECIFICALLY,
+            # and not via the role. A role->glyph table used to stand here,
+            # mapping state.ok/warn/crit/idle onto status.ok/warn/crit/idle --
+            # left behind, unread, when the per-surface glyph table landed. Had
+            # it still been in use it would have asserted the wrong glyph: the
+            # header's families are not in bijection with its roles. 'stopped'
+            # and 'unreachable' share state.crit while drawing different marks
+            # (status.crit and status.gone), so a role-keyed expectation cannot
+            # express what the header actually renders. Deleted rather than
+            # repaired -- container_glyph is the one mapping, and a second
+            # derivation of the same fact is what let the two disagree before.
             my $spinning = ($case->{status} eq 'running' && !$case->{gone}) ? 1 : 0;
             my $lead;
             if ($spinning) {

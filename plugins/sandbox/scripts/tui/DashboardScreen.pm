@@ -709,6 +709,18 @@ sub container_presentation {
 # reaching a terminal -- a claim this mapping falsified. The header now uses
 # 'status.gone', its own non-emoji mark, and t/64 asserts that no terminal
 # surface references a title.* token again.
+#
+# RULED 2026-08-28: the two vocabularies stay separate, permanently. The
+# question had been open on taste alone -- one glyph set is simpler to hold in
+# your head. What settled it is that the single family the two surfaces drew
+# alike is the one that leaked an emoji into the terminal, so the shared entry
+# was not a simplification, it was the defect. Unifying them means either the
+# terminal takes emoji-block codepoints or the window title gives up the marks
+# that survive taskbar truncation; both surfaces lose. They answer different
+# questions -- the header has a status WORD beside it and the status.* set
+# around it, the title has one glyph in a UI font and nothing to disambiguate
+# it -- and container_presentation already carries everything they must agree
+# on, which is the family and whether it spins.
 # container_glyph($surface, \%presentation) -> Theme glyph token, or undef when
 # the surface draws nothing of its own (running: the spinner IS the glyph).
 #
