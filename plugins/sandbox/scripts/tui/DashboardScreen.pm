@@ -425,11 +425,26 @@ sub sampler_wait_spans {
 #
 # NO COLON in any of them (Decision 2). The label gutter's own colon belongs to
 # package t05-no-colons and is not touched here.
+#
+# THE NEUTRAL CASE NOW SAYS NOTHING, AND RETURNS NO SPANS (operator,
+# 2026-08-28: "no point in having the 'collecting - no figures yet'").
+#
+# It was a fourth line restating what the panel had already said three times:
+# every provider row above it independently renders "not collected yet", so the
+# footnote added a row and no fact. The three OTHER texts stay, and the
+# asymmetry is the point -- FAILED and STALLED name a fault that appears
+# NOWHERE else on the screen (a sampler that died, or one still running with
+# nothing to show after its grace), and losing those would trade a redundant
+# row for a silent one. "Still collecting" is the expected state; a dead
+# sampler is not.
+#
+# Returning an empty list rather than an empty string is deliberate: a span
+# with no text still occupies a row, which is the row this exists to reclaim.
+# The caller must therefore test before pushing -- see providers_lines.
 sub spend_wait_spans {
     my ($fact) = @_;
-    my $neutral = 'collecting - no figures yet';
 
-    my ($text, $role) = ($neutral, 'text.faint');
+    my ($text, $role) = (undef, 'text.faint');
     if (ref($fact) eq 'HASH') {
         my $status  = $fact->{status};
         my $alive   = $fact->{child_alive};
@@ -457,6 +472,7 @@ sub spend_wait_spans {
         }
     }
 
+    return [] unless defined $text;
     return [ { text => $text, role => $role } ];
 }
 
@@ -2076,8 +2092,13 @@ sub _providers_body {
     #
     # What replaces it is the sampler's own state, in the same vocabulary t01
     # established for the resources panel next door.
+    # PUSHED ONLY WHEN IT HAS SOMETHING TO SAY. spend_wait_spans returns an
+    # empty list for the ordinary "still collecting" case (see its header), and
+    # pushing that would put a blank row where the sentence used to be -- which
+    # costs exactly what removing the sentence was meant to save.
     unless ($spend) {
-        push @lines, spend_wait_spans($state->{spend_sampler});
+        my $wait = spend_wait_spans($state->{spend_sampler});
+        push @lines, $wait if ref($wait) eq 'ARRAY' && @$wait;
     }
 
     return \@lines;

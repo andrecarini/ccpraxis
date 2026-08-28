@@ -422,7 +422,7 @@ sub runs_n {
     my $providers = panel_by_title($panels, 'Providers');
     ok($providers, 'Behavior8 precondition: the Providers panel renders even when $state->{spend} is entirely absent');
   SKIP: {
-        skip('no Providers panel', 5) unless $providers;
+        skip('no Providers panel', 8) unless $providers;
         my $texts = panel_line_texts($providers);
         ok((grep { /Claude Code/ } @$texts), 'Behavior8: Claude Code heading still renders with spend absent');
         # See the AC2 note above: one "OpenCode" heading with Go and Zen as
@@ -447,9 +447,40 @@ sub runs_n {
         # not once per provider block. The count assertion is what stops the
         # absence statement from being duplicated three times as the provider
         # blocks were reworded, and it is unchanged.
-        my @footnote = grep { /collecting - no figures yet|FAILED - spend sampler|STALLED - spend sampler/ } @$texts;
-        ok(scalar(@footnote) >= 1, 'Behavior8/D6: an absent-spend footnote renders in the panel (wording replaced by t02; it no longer names a run)');
-        is(scalar(@footnote), 1, 'Behavior8/D6: the footnote renders exactly ONCE -- panel-level, not once per provider block') if @footnote;
+        # RE-POINTED 2026-08-28. The "at least one" half is GONE, because the
+        # behaviour it pinned is gone: the neutral footnote
+        # ("collecting - no figures yet") is no longer emitted at all. It
+        # restated what the Claude Code, Go and Zen rows above it already say
+        # three times over -- the operator's report was that it earned no row.
+        #
+        # THE LOAD-BEARING HALF SURVIVES INTACT, and it needed a live subject to
+        # survive on. The original's own comment says the count is what stops
+        # the absence statement being duplicated once per provider block; with
+        # the neutral case silent, asserting that count against a neutral
+        # sampler would measure zero and prove nothing. So the once-only
+        # property is now asserted where a footnote is actually produced -- a
+        # FAILED sampler -- and the neutral case pins the new behaviour, which
+        # is silence.
+        my $footnote_re = qr/collecting - no figures yet|FAILED - spend sampler|STALLED - spend sampler/;
+
+        my @neutral = grep { /$footnote_re/ } @$texts;
+        is(scalar(@neutral), 0,
+            'Behavior8/D6: a spend sampler with nothing to report renders NO footnote -- the provider rows already say "not collected yet"');
+
+        # A dead sampler is the case the footnote exists for: it names a fault
+        # that appears nowhere else in the panel.
+        my $failed = base_state(tokens => { %TOKENS_EXPIRED_45S },
+                                spend_sampler => { status => 'failed' });
+        my $fp = panel_by_title(tui::DashboardScreen::panels($failed, 120), 'Providers');
+        ok($fp, 'Behavior8/D6 precondition: the Providers panel renders with a failed spend sampler');
+        if ($fp) {
+            my @failnote = grep { /$footnote_re/ } @{ panel_line_texts($fp) };
+            ok(scalar(@failnote) >= 1,
+                'Behavior8/D6: a FAILED spend sampler still renders a footnote -- the fault is named nowhere else');
+            is(scalar(@failnote), 1,
+                'Behavior8/D6: the footnote renders exactly ONCE -- panel-level, not once per provider block')
+                if @failnote;
+        }
     }
 }
 
