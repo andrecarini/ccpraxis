@@ -81,7 +81,7 @@ fi
 # Read stdin ONCE, here -- both the reporter branch below and the
 # pre-existing driver logic further down need it, and a second read from an
 # already-drained stdin returns empty.
-PAYLOAD=$(cat 2>/dev/null || true)
+bp_read_payload open
 
 # ---------------------------------------------------------------------------
 # REPORTER BRANCH (g03-reporter-stop-gate). Self-contained; on BLOCK, exits 2

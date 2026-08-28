@@ -13,7 +13,7 @@ bp_hook_gate
 # Logging is best-effort: degrade silently rather than block work.
 command -v jq >/dev/null 2>&1 || exit 0
 
-PAYLOAD=$(cat)
+bp_read_payload open
 TYPE=$(jq -r '.tool_input.subagent_type // "task"' <<<"$PAYLOAD")
 DESC=$(jq -r '.tool_input.description // (.tool_input.prompt // "" | split("\n")[0]) // ""' <<<"$PAYLOAD" | cut -c1-100)
 TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)

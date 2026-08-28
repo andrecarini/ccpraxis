@@ -28,7 +28,7 @@ HOOK_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # see the header above; sourcing lib.sh does not call it.
 source "$HOOK_DIR/lib.sh"
 
-PAYLOAD=$(cat)
+bp_read_payload closed
 
 # bp_json_get prefers jq and falls back to perl+JSON::PP, so this guard also runs
 # on the jq-less Windows host. It used to `command -v jq || exit 2`, which meant

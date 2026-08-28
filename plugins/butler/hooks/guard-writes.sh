@@ -55,7 +55,7 @@ longest_glob_match() {
   return 0
 }
 
-PAYLOAD=$(cat)
+bp_read_payload closed
 FP=$(jq -r '.tool_input.file_path // .tool_input.notebook_path // empty' <<<"$PAYLOAD")
 [ -n "$FP" ] || exit 0
 CWD=$(jq -r '.cwd // empty' <<<"$PAYLOAD"); CWD=${CWD:-$PWD}

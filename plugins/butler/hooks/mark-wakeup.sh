@@ -162,7 +162,7 @@ bp_wakeup_arm_check() {
 # an interactive driver.
 [ -n "${BP_LEDGER:-}" ] && exit 0
 
-PAYLOAD=$(cat 2>/dev/null || true)
+bp_read_payload open
 
 # Resolve the drive-solo state dir exactly as bp-drive-next.pl does: an explicit
 # CCPRAXIS_DATA_DIR wins, else <project>/.ccpraxis-local-data. No .drive-solo dir

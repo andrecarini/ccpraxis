@@ -54,7 +54,7 @@ bp_hook_require_jq                  # fail-CLOSED (lib.sh:15-21), as guard-write
 # invoked from any coordinator's cwd).
 LEDGER_PL=$(realpath -m "$HOOK_DIR/../scripts/bp-ledger.pl" 2>/dev/null || printf '%s' "$HOOK_DIR/../scripts/bp-ledger.pl")
 
-PAYLOAD=$(cat)
+bp_read_payload closed
 
 FILE_PATH=$(jq -r '.tool_input.file_path // empty'     <<<"$PAYLOAD" 2>/dev/null)
 NB_PATH=$(jq   -r '.tool_input.notebook_path // empty' <<<"$PAYLOAD" 2>/dev/null)

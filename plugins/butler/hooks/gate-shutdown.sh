@@ -26,7 +26,7 @@ SIGNAL=$(bp_active_stop_signal)
 [ -n "$SIGNAL" ] || exit 0            # no stop in progress -> nothing to gate (fast path)
 
 bp_hook_require_jq
-PAYLOAD=$(cat)
+bp_read_payload closed
 TOOL=$(jq -r '.tool_name // empty' <<<"$PAYLOAD")
 # A stop is in force (checked above); a payload with no identifiable tool_name is
 # malformed — fail CLOSED rather than letting an unclassifiable call through.

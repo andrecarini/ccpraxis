@@ -187,8 +187,17 @@ bp_ws_main() {
 
   command -v jq >/dev/null 2>&1 || exit 0          # fail-OPEN posture (D7); no fail-closed helper
 
+  # BOUNDED read (lib.sh:bp_read_payload). `$(cat)` here was unbounded: with
+  # stdin an inherited pipe that never closes it blocked forever at no CPU --
+  # see bug report 20260828-095201-7c1e. 'open' preserves this hook's own
+  # documented D7 fail-OPEN posture, the same direction the `|| exit 0` it
+  # replaces already chose.
+  #
+  # Called from bp_ws_main, which the bottom-of-file main-guard invokes BARE --
+  # not inside $(...) -- so the helper's exit reaches the process, as it must.
   local payload
-  payload=$(cat 2>/dev/null) || exit 0
+  bp_read_payload open
+  payload="$PAYLOAD"
   [ -n "$payload" ] || exit 0
 
   local tool

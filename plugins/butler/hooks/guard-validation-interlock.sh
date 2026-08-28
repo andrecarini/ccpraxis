@@ -73,7 +73,7 @@ source "$HOOK_DIR/lib.sh"
 # shellcheck source=../scripts/bp-lib.sh
 [ -r "$HOOK_DIR/../scripts/bp-lib.sh" ] && source "$HOOK_DIR/../scripts/bp-lib.sh"
 
-PAYLOAD=$(cat 2>/dev/null || true)
+bp_read_payload open
 CMD=$(bp_json_get "$PAYLOAD" tool_input.command 2>/dev/null)
 [ -n "$CMD" ] || exit 0
 

@@ -20,6 +20,67 @@ bp_hook_require_jq() {
   }
 }
 
+# bp_read_payload [FAIL_MODE] -- read the hook payload from stdin, BOUNDED, into
+# the global PAYLOAD. FAIL_MODE is 'closed' (default) or 'open' and decides what
+# happens if stdin never reaches EOF.
+#
+# CALL IT BARE -- `bp_read_payload closed` -- NEVER as `PAYLOAD=$(bp_read_payload)`.
+# Command substitution runs it in a SUBSHELL, where its `exit 2` would terminate
+# only that subshell: the hook would continue, with an empty payload, having
+# printed a denial nobody acted on. That is the same subshell trap
+# guard-git-mutations.sh records beside its own git_scan_target call, and the
+# reason both communicate through a global instead of stdout.
+#
+# WHY THIS EXISTS. Every hook here used `PAYLOAD=$(cat)`, an UNBOUNDED read. When
+# stdin reaches EOF -- which is what Claude Code's own hook dispatch does -- that
+# is correct and instant. When stdin is an inherited pipe that never closes, cat
+# blocks FOREVER at essentially zero CPU, and nothing upstream notices.
+#
+# That is not hypothetical. Bug report 20260828-095201-7c1e: a perl.exe running a
+# throwaway probe out of a session scratchpad was found alive NINE DAYS after the
+# session that spawned it had exited, having burnt 0.016s of CPU in total --
+# blocked on a read, holding 11 MB and 135 handles, orphaned, with nothing in
+# ccpraxis tracking or reaping it. Reproduced directly against
+# guard-git-mutations.sh: with stdin closed it exits 0 at once; with stdin a pipe
+# that never closes it blocks until killed.
+#
+# Note what this does NOT claim. The report guessed the probe had wedged on one
+# of five specific payloads; replaying that probe shows it does not -- all five
+# classify correctly in seconds. The defect is the unbounded read itself, and it
+# was in NINE hooks, so it is fixed once, here.
+#
+# NOT `timeout`. On the Windows host a bare `timeout` resolves to
+# C:\Windows\System32\timeout.exe -- the *pause* command -- which rejects these
+# arguments outright. That exact mistake is bug report 20260825-193930-fff0,
+# where it silently killed all six resources probes before their commands ran.
+# `read -t` is a bash builtin: no PATH, no external binary, nothing to resolve.
+#
+# `read -r -d ''` reads to EOF (no NUL can appear -- JSON escapes U+0000 as the
+# six ASCII bytes \u0000, which is what ledger-guard.sh depends on), returns 1 at
+# EOF with the data intact, and >128 only on timeout. One difference from $(cat)
+# is recorded rather than hidden: $(cat) strips trailing newlines and this does
+# not. No JSON parser cares.
+#
+# The timeout is deliberately far longer than any real payload needs -- a Write
+# tool_input can be hundreds of KB, and this must never fire on a slow-but-live
+# producer. If it fires at all, the alternative was hanging forever.
+bp_read_payload() {
+  local mode="${1:-closed}"
+  local rc=0
+  PAYLOAD=""
+  IFS= read -r -d '' -t "${BP_PAYLOAD_READ_TIMEOUT:-30}" PAYLOAD || rc=$?
+  if [ "$rc" -gt 128 ]; then
+    # Timed out. Fail direction follows the hook's OWN behaviour when it cannot
+    # classify a call: enforcement hooks deny, observers stand aside.
+    if [ "$mode" = open ]; then
+      exit 0
+    fi
+    echo "butler hook: the tool payload did not arrive within ${BP_PAYLOAD_READ_TIMEOUT:-30}s (stdin never closed) -- blocking, because an unread payload cannot be checked." >&2
+    exit 2
+  fi
+  return 0
+}
+
 # bp_json_get PAYLOAD KEY [KEY...] -- echo the first non-empty scalar found at
 # any of the dot-separated KEY paths in PAYLOAD (a JSON object). Prints nothing
 # when no path resolves. Returns 2, printing nothing, when NEITHER jq nor

@@ -42,7 +42,7 @@ HOOK_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # Sourced for bp_json_get ONLY -- NO bp_hook_gate call here, by design (see above).
 source "$HOOK_DIR/lib.sh"
 
-PAYLOAD=$(cat 2>/dev/null || true)
+bp_read_payload open
 
 # Same detection mark-wakeup.sh already uses for the identical field: a raw
 # grep on the literal JSON boolean, never bp_json_get (which returns empty

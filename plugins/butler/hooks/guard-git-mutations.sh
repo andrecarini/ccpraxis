@@ -36,7 +36,7 @@ source "$HOOK_DIR/lib.sh"
 # TODAY's raw-fallback behavior (AC17), never to unconditional allow.
 [ -r "$HOOK_DIR/../scripts/bp-lib.sh" ] && source "$HOOK_DIR/../scripts/bp-lib.sh"
 
-PAYLOAD=$(cat)
+bp_read_payload closed
 
 # See lib.sh:bp_json_get. This used to hard-require jq, which the Windows host
 # does not have and -- per this repo's Perl-only doctrine -- is never going to

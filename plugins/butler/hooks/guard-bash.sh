@@ -18,7 +18,7 @@ bp_hook_require_jq
 # unreadable degrades the block below to raw matching, never to allow.
 [ -r "$HOOK_DIR/../scripts/bp-lib.sh" ] && source "$HOOK_DIR/../scripts/bp-lib.sh"
 
-PAYLOAD=$(cat)
+bp_read_payload closed
 CMD=$(jq -r '.tool_input.command // empty' <<<"$PAYLOAD")
 [ -n "$CMD" ] || exit 0
 

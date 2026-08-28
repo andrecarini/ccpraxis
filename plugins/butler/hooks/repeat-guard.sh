@@ -24,7 +24,7 @@ command -v jq >/dev/null 2>&1 || exit 0         # fail-OPEN; NOT bp_hook_require
 
 ACTION=$(bp_repeat_action_of "${BP_REPEAT_ACTION:-}")
 
-PAYLOAD=$(cat 2>/dev/null) || exit 0
+bp_read_payload open
 [ -n "$PAYLOAD" ] || exit 0
 
 # Everything that can fail runs inside one command substitution whose

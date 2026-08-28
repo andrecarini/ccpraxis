@@ -59,7 +59,7 @@ MAX_BLOCKS=3
 # who is calling right now.
 bp_continuity_any_active || exit 0
 
-PAYLOAD=$(cat 2>/dev/null || true)
+bp_read_payload open
 SID=$(bp_json_get "$PAYLOAD" session_id 2>/dev/null || true)
 [ -n "$SID" ] || exit 0
 MARK=$(bp_continuity_marker "$SID" 2>/dev/null) || exit 0

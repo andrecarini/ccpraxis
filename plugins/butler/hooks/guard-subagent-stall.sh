@@ -59,7 +59,7 @@ HOOK_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # Sourced for bp_json_get ONLY -- NO bp_hook_gate here, by design (see above).
 source "$HOOK_DIR/lib.sh"
 
-PAYLOAD=$(cat 2>/dev/null) || exit 0
+bp_read_payload open
 [ -n "$PAYLOAD" ] || exit 0
 
 EVENT=$(bp_json_get "$PAYLOAD" hook_event_name) || exit 0

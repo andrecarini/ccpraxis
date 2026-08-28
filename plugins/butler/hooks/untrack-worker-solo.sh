@@ -44,7 +44,7 @@ source "$HOOK_DIR/lib.sh"
 
 [ -n "${BP_LEDGER:-}" ] && exit 0
 
-PAYLOAD=$(cat 2>/dev/null || true)
+bp_read_payload open
 CWD=$(bp_json_get "$PAYLOAD" cwd 2>/dev/null); CWD=${CWD:-$PWD}
 DATA=$(bp_find_data_dir "$CWD" 2>/dev/null) || exit 0
 [ -n "$DATA" ] && [ -d "$DATA/.drive-solo" ] || exit 0

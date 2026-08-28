@@ -20,7 +20,7 @@ bp_hook_gate
 [ -z "$(bp_active_stop_signal)" ] || exit 0
 bp_hook_require_jq
 
-PAYLOAD=$(cat)
+bp_read_payload open
 TYPE=$(jq -r '.tool_input.subagent_type // empty' <<<"$PAYLOAD")
 [ -n "$TYPE" ] || exit 0
 

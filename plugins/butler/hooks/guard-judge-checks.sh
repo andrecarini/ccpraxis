@@ -40,7 +40,7 @@ source "$HOOK_DIR/lib.sh"
 [ -r "$HOOK_DIR/../scripts/bp-lib.sh" ] && source "$HOOK_DIR/../scripts/bp-lib.sh"
 bp_hook_require_jq
 
-PAYLOAD=$(cat 2>/dev/null || true)
+bp_read_payload open
 CMD=$(jq -r '.tool_input.command // empty' <<<"$PAYLOAD" 2>/dev/null)
 [ -n "$CMD" ] || exit 0
 
