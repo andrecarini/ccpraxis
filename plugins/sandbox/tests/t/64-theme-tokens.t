@@ -1588,6 +1588,126 @@ is_deeply(Theme::x256_rgb(196), [255, 0, 0],     'x256_rgb(196) == [255,0,0] (B-
     }
 }
 
+# ===========================================================================
+# B-E14 -- THE WAIVER ABOVE IS SCOPED BY USE SITE, NOT ONLY BY TOKEN NAME.
+#
+# The block above waives the emoji rule for title.* because "title glyphs never
+# render in a terminal". That is a claim about where the tokens are USED, but it
+# was enforced only against how they are NAMED -- so nothing stopped a terminal
+# surface from referencing one, and something did: tui::DashboardScreen's
+# container_glyph mapped the HEADER's unreachable family to 'title.gone'
+# (U+26A0), putting an emoji-block codepoint into the terminal header for every
+# unreachable or unknown container. The suite was fully green throughout.
+#
+# The defect was the guard's shape, not the mapping alone. Fixing only the
+# mapping would leave the same hole open for the next reuse, so the waiver's
+# premise is now asserted rather than asserted-in-prose.
+#
+# TWO CHECKS, because either alone is escapable:
+#
+#   B-E14a  BEHAVIOURAL. For every container state the dashboard can present,
+#           the HEADER surface's glyph token is never a title.* one. This is the
+#           exact regression, caught at the function the renderer calls -- so it
+#           holds however the table is spelled or restructured.
+#
+#   B-E14b  TEXTUAL. No sandbox script names a title.* token at all, except the
+#           three files that legitimately form the window-title path: Theme.pm
+#           declares them, Dashboard.pm builds the title, and
+#           tui/DashboardScreen.pm holds the per-surface table whose 'title' row
+#           is their only other home. This catches a reuse in a panel, the
+#           statusline or a screen module -- surfaces B-E14a does not reach.
+#
+# The token list is DERIVED from Theme::glyphs(), not typed here, so adding a
+# fifth title glyph extends both checks automatically.
+#
+# LIMITATION, stated rather than hidden: B-E14b strips whole-line comments only.
+# A title.* token quoted in a TRAILING comment on a line of code, in a file
+# outside the allowlist, would fail this check. That is a deliberate trade --
+# the alternative is a comment-aware Perl parser -- and the fix in that case is
+# to move the note to its own line.
+# ===========================================================================
+{
+    my $glyphs = Theme::glyphs();
+    my @title_tokens = sort grep { /\Atitle\./ } keys %$glyphs;
+
+    ok(scalar(@title_tokens) > 0,
+        'B-E14: precondition -- Theme declares at least one title.* glyph, so this guard has a subject (AC-10)');
+
+    # --- B-E14a: the header surface never draws a title.* glyph. -----------
+    #
+    # The state list is podman's own set (libpod/define/containerstate.go) plus
+    # the two entries that are not statuses: the container_gone flag, and a
+    # deliberately unrecognised string for the fallback family. Between them
+    # they reach every family container_presentation can return.
+    my @states = (
+        [ 'running',     0 ], [ 'created',  0 ], [ 'initialized', 0 ],
+        [ 'stopping',    0 ], [ 'removing', 0 ], [ 'stopped',     0 ],
+        [ 'paused',      0 ], [ 'exited',   0 ], [ 'unknown',     0 ],
+        [ 'running',     1 ], [ 'frobnicated', 0 ], [ undef,      0 ],
+    );
+    # Loaded HERE, inside the block, rather than beside the Theme/Dashboard
+    # requires at the top: this is the only assertion in the file that needs it,
+    # and B-A3's load-hygiene scans are about what Theme.pm does when required,
+    # not about this file's own @INC.
+    my $DS_OK = eval { require tui::DashboardScreen; 1 };
+    ok($DS_OK, 'B-E14a: precondition -- tui::DashboardScreen loads (AC-10)')
+        or diag("  require tui::DashboardScreen failed: $@");
+
+    my %families_seen;
+    for my $case (@states) {
+        last unless $DS_OK;
+        my ($status, $gone) = @$case;
+        my $label = sprintf('%s%s', (defined $status ? $status : '(undef)'), ($gone ? '+gone' : ''));
+        my $pres = eval { tui::DashboardScreen::container_presentation($status, $gone) };
+        if (ref($pres) ne 'HASH') {
+            fail("B-E14a ($label): container_presentation returns a hashref (AC-10)");
+            next;
+        }
+        $families_seen{ $pres->{family} // '(none)' } = 1;
+        my $tok = eval { tui::DashboardScreen::container_glyph('header', $pres) };
+        unlike(defined($tok) ? $tok : '', qr/\Atitle\./,
+            "B-E14a ($label): the header's glyph token is not a title.* one -- "
+          . "title glyphs are emoji-waived on the premise that they never reach a terminal (AC-10)");
+    }
+
+    # A family the state list never produces is a family this check never
+    # tested, so the coverage floor is asserted rather than assumed.
+    for my $fam (qw(running coming stopped unreachable idle)) {
+        ok($families_seen{$fam},
+            "B-E14a: the state list reaches the '$fam' family, so its header glyph was actually checked (AC-10)");
+    }
+
+    # --- B-E14b: no other sandbox surface names a title.* token. -----------
+    my @scan;
+    push @scan, sort glob("$SCRIPTS/*.pm"), sort glob("$SCRIPTS/*.pl"),
+                sort glob("$SCRIPTS/tui/*.pm");
+    push @scan, $STATUSLINE_ABS if defined $STATUSLINE_ABS && -f $STATUSLINE_ABS;
+
+    # The window-title path, and nothing else. Basenames rather than paths so
+    # the entry survives a directory move; tui/DashboardScreen.pm is here for
+    # its 'title' row only, and B-E14a is what holds its 'header' row.
+    my %ALLOWED = map { $_ => 1 } qw(Theme.pm Dashboard.pm DashboardScreen.pm);
+
+    ok(scalar(@scan) >= 10,
+        sprintf('B-E14b: precondition -- the scan set has %d files, not an empty glob (AC-10)', scalar @scan));
+
+    for my $path (@scan) {
+        my ($base) = $path =~ m{([^/\\]+)\z};
+        next if $ALLOWED{ $base || '' };
+        my $src = slurp($path);
+        if (!defined $src) {
+            fail("B-E14b: '$base' is readable (AC-10)");
+            next;
+        }
+        # Whole-line comments only -- see the LIMITATION note above.
+        $src =~ s/^[ \t]*#[^\n]*$//mg;
+        my @named = grep { index($src, $_) >= 0 } @title_tokens;
+        ok(!@named,
+            sprintf("B-E14b: '%s' names no title.* glyph token%s (AC-10)",
+                $base, (@named ? ' -- found: ' . join(', ', @named) : '')));
+    }
+}
+
 {
     # B-E7 CORRECTED for package 06 (driver ruling E-F, packages/06-dashboard-screen.md
     # 2026-08-07T20:40:59Z): the original claim here was "Theme::display_width delegates to

@@ -698,8 +698,17 @@ sub container_presentation {
 #           status.* glyphs used elsewhere on the screen
 #   title   renders in the desktop UI font, alone, with no word to disambiguate
 #
-# 'unreachable' is the one family both draw the same, because the operator asked
-# for the warning sign in both places.
+# NO FAMILY DRAWS THE SAME ON BOTH SURFACES, and 'unreachable' was the exception
+# that proved why it should not (operator, 2026-08-28).
+#
+# The header used to map unreachable to 'title.gone' -- the warning sign -- on
+# the grounds that the operator had asked for that mark in both places. What that
+# actually did was put an emoji-block codepoint (U+26A0) into the terminal, which
+# is precisely what the no-emoji rule forbids. It went unnoticed because t/64
+# waives that rule by TOKEN NAME (title.*), justified by title glyphs never
+# reaching a terminal -- a claim this mapping falsified. The header now uses
+# 'status.gone', its own non-emoji mark, and t/64 asserts that no terminal
+# surface references a title.* token again.
 # container_glyph($surface, \%presentation) -> Theme glyph token, or undef when
 # the surface draws nothing of its own (running: the spinner IS the glyph).
 #
@@ -715,7 +724,7 @@ sub container_glyph {
     return undef unless ref($pres) eq 'HASH';
     my %family_glyph = (
         header => { running => undef, coming => 'status.' . 'warn',
-                    stopped => 'status.crit', unreachable => 'title.gone', idle => undef },
+                    stopped => 'status.crit', unreachable => 'status.gone', idle => undef },
         title  => { running => undef, coming => 'title.paused',
                     stopped => 'title.exited', unreachable => 'title.gone', idle => undef },
     );

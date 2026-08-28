@@ -576,6 +576,23 @@ sub _glyphs_data {
         'status.warn' => { cp => 0x25B3, desc => 'hollow up-pointing triangle -- attention state, replaces an emoji circle' },
         'status.crit' => { cp => 0x00D7, desc => 'multiplication sign -- critical state, replaces an emoji circle' },
         'status.idle' => { cp => 0x25CB, desc => 'white circle -- idle/absent state, replaces an emoji circle' },
+        # THE TERMINAL'S OWN 'CANNOT REACH IT' MARK (operator, 2026-08-28).
+        #
+        # The header used to borrow 'title.gone' (U+26A0 WARNING SIGN) for this
+        # family, which put an emoji-block codepoint into the terminal -- the
+        # exact thing the no-emoji rule exists to prevent. It survived because
+        # that rule's waiver is keyed on the token's NAME (title.*) and its
+        # stated justification is that title glyphs never reach a terminal. A
+        # terminal surface referencing a title.* token makes that justification
+        # false, so the fix is a glyph of the header's own rather than a wider
+        # waiver.
+        #
+        # U+2298 sits in Mathematical Operators, so it is outside every emoji
+        # block, has no emoji presentation to force, and measures one cell. It
+        # is NOT merged into 'status.crit': unreachable and exited share a
+        # colour role but are different facts (we could not ask, versus we asked
+        # and were told), and the header is where that difference is legible.
+        'status.gone' => { cp => 0x2298, desc => 'circled division slash -- the container could not be reached' },
         # t03-activity-column: the truncation marker for a row that wrapped
         # past its cap. Declared HERE rather than written into tui/Frame.pm
         # because that module is held to an ASCII-only source rule
