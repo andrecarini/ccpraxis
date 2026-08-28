@@ -84,25 +84,28 @@ my $ALERT_RE  = qr/\Qlow on disk\E/;
     my $alert_row = row_of($with, $ALERT_RE);
     ok(defined $alert_row, 'A: the alert text is on screen');
 
-    # It shares its row with the MAIN REGION rather than owning a full-width
-    # row of its own -- which is what "beside the grid, not above it" means.
+    # RE-POINTED 2026-08-28: ALERTS ARE AN OVERLAY, NOT A SIDE-COLUMN BANNER.
     #
-    # RE-ANCHORED 2026-08-25: this used to require the row to carry the Run
-    # panel title, true while the side column began below the screen header.
-    # The header now occupies the main region only and the column runs from row
-    # 0, so the first alert row sits beside the HEADER. Pinning the Run title
-    # specifically was pinning where the column happened to start, not the
-    # property. What matters is that the row carries main-region content too.
-    my $side_w2   = tui::Screen::side_column_width($WIDE);
-    my $main_part = substr($with->[$alert_row]{text}, 0,
-                           length($with->[$alert_row]{text}) - $side_w2);
-    like($main_part, qr/\S/,
-        'A: the alert shares its row with main-region content -- it is BESIDE the grid, not above it');
+    # The 2026-08-25 design put alerts INTO the side column so they would stop
+    # pushing the grid down. It worked, but it spent the column: the operator's
+    # report was that warnings were "popping off on top of the Recent activity
+    # column", and a capture showed a `!!` row sitting over the activity feed.
+    #
+    # They are now painted over the BOTTOM of an already-composed frame, after
+    # placement, so they consume no layout budget at all -- which is a STRONGER
+    # version of the original claim (asserted in A above and again in B): the
+    # grid does not move at ANY width, not just where a side column exists.
+    #
+    # What this block now pins is that the alert is at the bottom and does not
+    # land in the activity column.
+    my $side_w    = tui::Screen::side_column_width($WIDE);
+    my $side_part = substr($with->[$alert_row]{text},
+                           length($with->[$alert_row]{text}) - $side_w);
+    unlike($side_part, $ALERT_RE,
+        'A: the alert does NOT render inside the activity column -- that placement is what was reported');
 
-    # And specifically in the right-hand region.
-    my $side_w = tui::Screen::side_column_width($WIDE);
-    my $left_of_alert = substr($with->[$alert_row]{text}, 0, length($with->[$alert_row]{text}) - $side_w);
-    unlike($left_of_alert, $ALERT_RE, 'A: the alert is not in the main region, it is in the side column');
+    cmp_ok($alert_row, '>', $run_with,
+        'A: the alert sits BELOW the panel grid, at the bottom of the frame');
 }
 
 # ===========================================================================
@@ -119,14 +122,26 @@ my $ALERT_RE  = qr/\Qlow on disk\E/;
     my $run_with    = row_of($with,    $RUN_TITLE);
     ok(defined $run_without && defined $run_with, 'B: the Run panel title is locatable with and without an alert');
 
-    cmp_ok($run_with, '>', $run_without,
-        'B: with no side column to hold it, an alert still pushes the grid down (the unchanged fallback)');
+    # RE-POINTED 2026-08-28, AND THE CLAIM INVERTED ON PURPOSE.
+    #
+    # This asserted that a narrow terminal keeps the OLD behaviour: no side
+    # column to hold the alert, so it goes full-width above the panels and costs
+    # the grid a row. That was the documented fallback of the side-column
+    # design.
+    #
+    # The overlay has no fallback, and that is the improvement: it paints over
+    # the composed frame, so it costs nothing at ANY width. The narrow case is
+    # now the SAME as the wide case, which is why this pairing is kept -- an
+    # implementation that pushed the grid at either width fails here.
+    is($run_with, $run_without,
+        'B: at a width with NO side column an alert still does not move the grid -- '
+      . 'the overlay has no push-down fallback, unlike the banner it replaced');
 
     my $alert_row = row_of($with, $ALERT_RE);
     ok(defined $alert_row, 'B: the alert text is on screen');
-    cmp_ok($alert_row, '<', $run_with, 'B: and it sits ABOVE the Run panel');
+    cmp_ok($alert_row, '>', $run_with, 'B: and it sits BELOW the Run panel, at the bottom');
     unlike($with->[$alert_row]{text}, $RUN_TITLE,
-        'B: the alert has its own full-width row, not shared with a panel title');
+        'B: the alert owns its row rather than sharing one with a panel title');
 }
 
 # ===========================================================================
@@ -154,37 +169,41 @@ my $ALERT_RE  = qr/\Qlow on disk\E/;
 # "|!! podman ..." with no gap while its own continuation rows were indented.
 # ===========================================================================
 {
-    my $long = 'this is a deliberately long alert message that cannot possibly fit on one row of the side column and must therefore wrap across several of them';
+    # LONG ENOUGH TO ACTUALLY OVERFLOW $WIDE, which the previous fixture was
+    # not: at 150 columns the old message fitted on ONE row and only its
+    # "[d] dismiss" suffix wrapped, so the assertion passed for the wrong
+    # reason and would have kept passing had wrapping broken entirely.
+    my $long = join ' ', ('this is a deliberately long alert message that cannot possibly fit on one row') x 3;
     my $f = frame($WIDE, install_warning => $long);
-    my $side_w = tui::Screen::side_column_width($WIDE);
 
-    my @alert_rows;
-    for my $cell (@$f) {
-        my $tail = substr($cell->{text}, length($cell->{text}) - $side_w);
-        push @alert_rows, $tail if $tail =~ /deliberately|possibly|wrap/;
-    }
+    # RE-POINTED 2026-08-28: the overlay spans the FULL WIDTH, so a long alert
+    # wraps across whole rows rather than inside a column. The old assertions
+    # measured the side column's tail and its hanging indent against the
+    # vertical border -- neither exists here.
+    my @alert_rows = grep { /deliberately|possibly|one row/ } map { $_->{text} } @$f;
     cmp_ok(scalar(@alert_rows), '>=', 2, 'D: a long alert occupies more than one row (it really did wrap)');
 
-    # THE PROPERTY IS "never flush against the border", NOT "all rows equal".
-    #
-    # Continuation rows carry wrap_line's hanging indent, so they are
-    # deliberately indented FURTHER than the first row -- that is a feature and
-    # asserting uniformity would forbid it. What the fix actually corrected is
-    # that the FIRST row had a gap of ZERO, jammed against the vertical border,
-    # while its own continuations were indented: ragged against the one edge
-    # that makes raggedness obvious.
-    my @gaps = map { my ($ws) = $_ =~ /^\S(\s*)/; length($ws // '') } @alert_rows;
-    my $flush = grep { $_ == 0 } @gaps;
-    is($flush, 0,
-        'D: no row of a side-column alert is flush against the vertical border')
-        or diag('leading gaps seen: ' . join(',', @gaps));
+    # NO WORD IS SILENTLY DROPPED. This is the standing rule t/75 AC1 pins for
+    # every wrapping surface, asserted here too because the overlay is a NEW
+    # surface that wraps -- and the failure it guards against (content quietly
+    # truncated instead of wrapped) is invisible unless something checks.
+    my $joined  = join ' ', @alert_rows;
+    my @missing = grep { $joined !~ /\Q$_\E/ } split /\s+/, $long;
+    is(scalar(@missing), 0, 'D: every word of the alert survives the wrap -- nothing silently truncated')
+        or diag('missing: ' . join(',', @missing));
 
-    # And the continuations agree with each other, so the hanging indent is a
-    # consistent shape rather than per-row drift.
-    my %cont = map { $_ => 1 } @gaps[ 1 .. $#gaps ];
-    is(scalar(keys %cont), 1,
-        'D: continuation rows share one hanging indent')
-        or diag('continuation gaps: ' . join(',', sort keys %cont));
+    # THE FOOTER IS NEVER COVERED, and this is the assertion that would have
+    # caught the first implementation. The overlay was anchored to the bottom of
+    # the frame, which put it over the hotkey row -- hiding the very key that
+    # dismisses it. The operator reported exactly that. It now anchors above the
+    # footer rule, so both chrome rows survive.
+    my $footer = $f->[-1]{text};
+    like($footer, qr/\[q\] quit/, 'D: the footer hotkeys are still visible beneath the overlay');
+    unlike($footer, qr/deliberately|possibly/, 'D: the overlay did not paint over the footer row');
+
+    # And the frame is still exactly as tall as it was asked to be: an overlay
+    # that added rows would be a banner wearing a different name.
+    is(scalar(@$f), 16, 'D: overlaying a long alert did not change the frame height');
 }
 
 done_testing();

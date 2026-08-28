@@ -169,21 +169,39 @@ sub runs_n {
         # label gutter and is indented more shallowly than the facts beneath
         # it. Only the set of headings changed.
         my ($cc_i) = grep { defined($texts->[$_]) && $texts->[$_] =~ /Claude Code/ } (0 .. $#$texts);
-        my ($oc_i) = grep { defined($texts->[$_]) && $texts->[$_] =~ /^\s*OpenCode\s*$/ } (0 .. $#$texts);
+        # RE-POINTED 2026-08-28: THE TWO PROVIDERS SHARE ROWS NOW.
+        #
+        # The operator asked for Claude Code and OpenCode side by side rather
+        # than stacked, so "OpenCode alone on a line" is no longer true above the
+        # width where the pairing fits -- the heading row reads
+        # "Claude Code        OpenCode".
+        #
+        # The NESTING IS NOT FLATTENED, which is the property this file exists to
+        # protect (referent clarity: a heading indented less than its facts).
+        # Each column still carries its own heading above its own indented
+        # facts. What changed is that a rendered ROW can no longer see one
+        # column in isolation -- which is why the indentation checks below moved
+        # to the block builders, where the structure is visible.
+        my ($oc_i) = grep { defined($texts->[$_]) && $texts->[$_] =~ /OpenCode/ } (0 .. $#$texts);
         ok(defined $cc_i, 'AC2: a "Claude Code" heading line exists in Providers');
         ok(defined $oc_i, 'AC2: a single "OpenCode" heading line exists in Providers');
 
         # ...and Go and Zen survive as FACTS under it, not as vanished content.
-        my ($go_i)  = grep { defined($texts->[$_]) && $texts->[$_] =~ /^\s+Go\b/ }  (0 .. $#$texts);
-        my ($zen_i) = grep { defined($texts->[$_]) && $texts->[$_] =~ /^\s+Zen\b/ } (0 .. $#$texts);
+        # Not anchored to the start of the row any more: Go and Zen sit in the
+        # RIGHT column, so their row begins with Claude Code's content.
+        my ($go_i)  = grep { defined($texts->[$_]) && $texts->[$_] =~ /\bGo\b/ }  (0 .. $#$texts);
+        my ($zen_i) = grep { defined($texts->[$_]) && $texts->[$_] =~ /\bZen\b/ } (0 .. $#$texts);
         ok(defined $go_i,  'AC2: a "Go" fact row exists (nested, not deleted)');
         ok(defined $zen_i, 'AC2: a "Zen" fact row exists (nested, not deleted)');
 
       SKIP: {
             skip('a heading is missing', 1) unless defined($cc_i) && defined($oc_i)
                                               && defined($go_i)  && defined($zen_i);
-            ok($cc_i < $oc_i && $oc_i < $go_i && $go_i < $zen_i,
-                'AC2/Behavior2: Claude Code, then OpenCode, then its Go and Zen facts, in that order');
+            # Side by side: the two headings share a row ($cc_i == $oc_i), and
+            # each column's facts follow beneath. The ordering claim that
+            # survives is that the headings come before the facts.
+            ok($cc_i <= $oc_i && $oc_i < $go_i && $go_i <= $zen_i,
+                'AC2/Behavior2: the headings lead, then their facts follow beneath');
         }
 
         # Behavior 3 -- referent-clarity mechanics: a heading carries no
@@ -216,8 +234,21 @@ sub runs_n {
         # block, not merely "somewhere".
       SKIP: {
             skip('missing Claude Code / OpenCode Go heading index', 1) unless defined($cc_i) && defined($go_i);
-            my $cc_block = join("\n", @{$texts}[$cc_i .. $go_i - 1]);
-            like($cc_block, qr/EXPIRED/, 'AC2: the access-expiry text renders WITHIN the Claude Code block');
+            # RE-POINTED 2026-08-28: A ROW SLICE CAN NO LONGER ISOLATE ONE
+            # PROVIDER. With the two side by side, rows cc_i..go_i-1 is empty --
+            # Go shares a row with a Claude Code fact -- so the old slice proved
+            # nothing rather than proving the claim.
+            #
+            # The claim is unchanged and still worth making: the expiry is a
+            # CLAUDE CODE fact, not merely text somewhere in the panel. It is
+            # asserted against the LEFT COLUMN's own text, which is what the
+            # slice was reaching for. Every row is split at the gutter and only
+            # the left half is joined.
+            my $gutter = index($texts->[$cc_i], 'OpenCode');
+            my $cc_block = ($gutter > 0)
+                ? join("\n", map { substr($_, 0, $gutter) } @{$texts}[ $cc_i .. $#$texts ])
+                : join("\n", @{$texts}[ $cc_i .. $#$texts ]);
+            like($cc_block, qr/EXPIRED/, 'AC2: the access-expiry text belongs to the Claude Code column');
         }
     }
 
@@ -398,9 +429,9 @@ sub runs_n {
         # facts under it. Behavior8's property is that NOTHING disappears when
         # $state->{spend} is absent entirely, so all three are still asserted --
         # the heading and both products.
-        ok((grep { /^\s*OpenCode\s*$/ } @$texts), 'Behavior8: the OpenCode heading still renders with spend absent');
-        ok((grep { /^\s+Go\b/  } @$texts), 'Behavior8: the Go fact row still renders with spend absent');
-        ok((grep { /^\s+Zen\b/ } @$texts), 'Behavior8: the Zen fact row still renders with spend absent');
+        ok((grep { /OpenCode/ } @$texts), 'Behavior8: the OpenCode heading still renders with spend absent');
+        ok((grep { /\bGo\b/  } @$texts), 'Behavior8: the Go fact row still renders with spend absent');
+        ok((grep { /\bZen\b/ } @$texts), 'Behavior8: the Zen fact row still renders with spend absent');
         # AMENDED BY t02-spend-persistence (blueprint tui-operator-feedback).
         # The footnote no longer mentions a RUN, so /\brun\b/ no longer
         # matches it. That is the change, not a casualty of it: under
@@ -470,11 +501,26 @@ sub runs_n {
     # without a preset budget, two different $rows values must derive two
     # different overflow counts on the same 12-run fixture (proving the
     # derivation is live, not a coincidence of one sample).
-    my $t_r24 = frame_text(Dashboard::compose_frame(base_state(runs => $runs), 24, 120)); # budget=int(24/3)=8 -> overflow=4
-    my $t_r30 = frame_text(Dashboard::compose_frame(base_state(runs => $runs), 30, 120)); # budget=int(30/3)=10 -> overflow=2
+    # HEIGHTS RE-CHOSEN 2026-08-28: 32 and 34, not 24 and 30.
+    #
+    # The CLAIM is unchanged -- the Blueprints budget tracks $rows, so two
+    # terminal heights derive two different overflow counts from the same
+    # 12-run fixture. Only the samples moved, and they had to.
+    #
+    # At rows=24 the Blueprints panel is now short enough that its "+N more"
+    # footer row is CLIPPED ENTIRELY: the grid was reorganised (Blueprints moved
+    # below Providers and spans the full width), so it gets fewer rows at that
+    # height than before. With no overflow line to parse, the precondition
+    # failed and the real assertion below was SKIPPED -- the test had stopped
+    # running rather than started failing, which is the worse outcome.
+    #
+    # 32 and 34 both render the line (+2 and +1, measured), so the derivation is
+    # observed at both samples rather than assumed at one.
+    my $t_r24 = frame_text(Dashboard::compose_frame(base_state(runs => $runs), 32, 120));
+    my $t_r30 = frame_text(Dashboard::compose_frame(base_state(runs => $runs), 34, 120));
     my ($n24) = $t_r24 =~ /\+(\d+) more blueprint/;
     my ($n30) = $t_r30 =~ /\+(\d+) more blueprint/;
-    ok(defined($n24) && defined($n30), 'AC5/Behavior14 precondition: an overflow line is found at both rows=24 and rows=30');
+    ok(defined($n24) && defined($n30), 'AC5/Behavior14 precondition: an overflow line is found at both rows=32 and rows=34');
   SKIP: {
         skip('overflow line missing at one of the two row counts', 1) unless defined($n24) && defined($n30);
         isnt($n24, $n30,
@@ -490,9 +536,24 @@ sub runs_n {
     my $both_below = grep { $_->{text} =~ /$RULE_LEAD_RE Run / && $_->{text} =~ /$RULE_LEAD_RE Blueprints / } @$f_below;
     is($both_below, 0, "Behavior17: 24x$below -- no row carries BOTH \"-- Run \" and \"-- Blueprints \" (still stacked, below breakpoint)");
 
-    my $f_at = Dashboard::compose_frame(base_state(runs => $small_runs), 24, $BP);
-    my $both_at = grep { $_->{text} =~ /$RULE_LEAD_RE Run / && $_->{text} =~ /$RULE_LEAD_RE Blueprints / } @$f_at;
-    is($both_at, 1, "Behavior17: 24x$BP -- EXACTLY one row carries BOTH \"-- Run \" and \"-- Blueprints \" (two-column mode, unconditional pairing)");
+    # RE-POINTED 2026-08-28: RUN'S PARTNER IS RESOURCES NOW, AND PAIRING NEEDS
+    # ROOM.
+    #
+    # Behavior17 pinned "Run pairs with Blueprints, unconditionally, above the
+    # breakpoint". The operator reorganised the grid: Resources sits beside Run,
+    # and Blueprints spans the full width below Providers. Pairing is also no
+    # longer unconditional -- Resources declares min_cols 75 against Run's 44, so
+    # a band holds both only once the main region has ~119 columns. At the
+    # breakpoint itself (90) they stack, which is the honest outcome rather than
+    # squeezing one of them below readability.
+    #
+    # The claim kept: the pairing is real and width-dependent, asserted at a
+    # width where it demonstrably fits. The stacked case above still guards the
+    # other direction.
+    my $wide = 200;
+    my $f_at = Dashboard::compose_frame(base_state(runs => $small_runs), 24, $wide);
+    my $both_at = grep { $_->{text} =~ /$RULE_LEAD_RE Run / && $_->{text} =~ /$RULE_LEAD_RE Resources / } @$f_at;
+    is($both_at, 1, "Behavior17: 24x$wide -- EXACTLY one row carries BOTH \"-- Run \" and \"-- Resources \"");
 }
 
 # ===========================================================================

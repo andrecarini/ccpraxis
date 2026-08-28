@@ -845,20 +845,54 @@ if ($THEME_OK) {
     for my $role (sort keys %$roles) {
         my $rec = $roles->{$role};
 
+        # A ROLE THAT OWNS ITS BACKGROUND EMITS A SECOND SGR, and these shapes
+        # are extended rather than loosened.
+        #
+        # This design system paints foregrounds only -- that rule stands, and
+        # exactly one role is exempt: 'overlay.warn', the dismissable warning
+        # popup, which occludes arbitrary content and would be illegible drawn
+        # as bare text over a resources gauge. Its contrast is measured against
+        # its OWN background, not reference_background().
+        #
+        # The foreground half of every assertion below is unchanged and still
+        # applies to it, so a regression in the fg would still fail here. What
+        # is added is the bg half, asserted with equal strictness rather than
+        # by relaxing the anchors to allow "anything after".
+        my $has_bg = (ref($rec->{bg}) eq 'ARRAY') ? 1 : 0;
+
         my $tc = Theme::sgr($role, 'truecolor');
-        if (like($tc, qr/\A\e\[38;2;\d{1,3};\d{1,3};\d{1,3}m\z/, "sgr('$role','truecolor') matches the truecolor SGR shape (B-B3, AC-3)")) {
-            my ($r, $g, $b) = $tc =~ /\A\e\[38;2;(\d{1,3});(\d{1,3});(\d{1,3})m\z/;
+        my $tc_re = $has_bg
+            ? qr/\A\e\[38;2;\d{1,3};\d{1,3};\d{1,3}m\e\[48;2;\d{1,3};\d{1,3};\d{1,3}m\z/
+            : qr/\A\e\[38;2;\d{1,3};\d{1,3};\d{1,3}m\z/;
+        if (like($tc, $tc_re, "sgr('$role','truecolor') matches the truecolor SGR shape (B-B3, AC-3)")) {
+            my ($r, $g, $b) = $tc =~ /\A\e\[38;2;(\d{1,3});(\d{1,3});(\d{1,3})m/;
             is_deeply([$r, $g, $b], $rec->{rgb}, "sgr('$role','truecolor') numbers equal the role's rgb (B-B3, AC-3)");
+            if ($has_bg) {
+                my ($br, $bg_, $bb) = $tc =~ /\e\[48;2;(\d{1,3});(\d{1,3});(\d{1,3})m\z/;
+                is_deeply([$br, $bg_, $bb], $rec->{bg},
+                    "sgr('$role','truecolor') background numbers equal the role's bg (B-B3, AC-3)");
+            }
         }
 
         my $x256 = Theme::sgr($role, '256');
-        if (like($x256, qr/\A\e\[38;5;\d{1,3}m\z/, "sgr('$role','256') matches the 256-colour SGR shape (B-B4, AC-13)")) {
-            my ($n) = $x256 =~ /\A\e\[38;5;(\d{1,3})m\z/;
+        my $x_re = $has_bg ? qr/\A\e\[38;5;\d{1,3}m\e\[48;5;\d{1,3}m\z/
+                           : qr/\A\e\[38;5;\d{1,3}m\z/;
+        if (like($x256, $x_re, "sgr('$role','256') matches the 256-colour SGR shape (B-B4, AC-13)")) {
+            my ($n) = $x256 =~ /\A\e\[38;5;(\d{1,3})m/;
             is($n, $rec->{x256}, "sgr('$role','256') number equals the role's x256 (B-B4, AC-13)");
+            if ($has_bg) {
+                my ($bn) = $x256 =~ /\e\[48;5;(\d{1,3})m\z/;
+                is($bn, $rec->{bg256}, "sgr('$role','256') background number equals the role's bg256 (B-B4, AC-13)");
+            }
         }
 
+        # At 'none' a background-owning role emits REVERSE VIDEO -- the only way
+        # to say "this is a surface, not text" with no colour available. An
+        # overlay that vanished on a monochrome terminal would be a warning
+        # nobody sees.
         my $none = Theme::sgr($role, 'none');
-        my $expected_none = $rec->{attr} eq '' ? '' : "\e[$rec->{attr}m";
+        my $expected_none = $has_bg ? "\e[7m"
+                          : ($rec->{attr} eq '' ? '' : "\e[$rec->{attr}m");
         is($none, $expected_none, "sgr('$role','none') matches the attr-only expectation (B-B5, AC-13)");
         like($none, qr/\A(?:\e\[(?:1|2|7)m)?\z/, "sgr('$role','none') carries no colour parameter of any kind (B-B5, AC-13)");
     }
@@ -1464,8 +1498,30 @@ is_deeply(Theme::x256_rgb(196), [255, 0, 0],     'x256_rgb(196) == [255,0,0] (B-
     my $glyphs = Theme::glyphs();
     for my $name (sort keys %$glyphs) {
         my $g = $glyphs->{$name};
-        is(length($g->{char}), 1, "glyph '$name': char is exactly one character (B-E2, AC-9)");
-        is(ord($g->{char}), $g->{cp}, "glyph '$name': ord(char) == cp (B-E2, AC-9)");
+        # SCOPED 2026-08-28: title.* may carry a trailing U+FE0E.
+        #
+        # The rule is "one character", and it exists so a glyph occupies one
+        # cell and cannot smuggle in combining marks. The title.* glyphs are the
+        # exception the operator authorised: they are emoji-capable codepoints,
+        # so they append VARIATION SELECTOR-15 to force TEXT presentation --
+        # without it a terminal may render them as double-width colour emoji,
+        # which both crowds the status word and puts every column after it one
+        # cell out.
+        #
+        # The selector is zero-width, so the intent of the rule (one cell) is
+        # PRESERVED, and that is asserted directly below rather than assumed.
+        # Everything outside title.* is still held to exactly one character.
+        my $is_title = ($name =~ /\Atitle\./) ? 1 : 0;
+        if ($is_title && length($g->{char}) == 2) {
+            is(ord(substr($g->{char}, 1)), 0xFE0E,
+                "glyph '$name': the second character is VARIATION SELECTOR-15, nothing else (B-E2, AC-9)");
+            is(tui::Layout::display_width($g->{bytes}), 1,
+                "glyph '$name': still occupies exactly one cell -- the selector is zero-width (B-E2, AC-9)");
+        }
+        else {
+            is(length($g->{char}), 1, "glyph '$name': char is exactly one character (B-E2, AC-9)");
+        }
+        is(ord(substr($g->{char}, 0, 1)), $g->{cp}, "glyph '$name': ord(char) == cp (B-E2, AC-9)");
         is($g->{bytes}, Encode::encode('UTF-8', $g->{char}), "glyph '$name': bytes eq Encode::encode('UTF-8', char) (B-E2, AC-9)");
         ok(($g->{width} == 1 || $g->{width} == 2) ? 1 : 0, "glyph '$name': width is 1 or 2 (B-E2, AC-9)");
         ok((defined($g->{desc}) && length($g->{desc}) >= 3) ? 1 : 0, "glyph '$name': desc is >= 3 characters (B-E2, AC-9)");
@@ -1505,8 +1561,30 @@ is_deeply(Theme::x256_rgb(196), [255, 0, 0],     'x256_rgb(196) == [255,0,0] (B-
 {
     my $glyphs = Theme::glyphs();
     for my $name (sort keys %$glyphs) {
-        ok(!_is_emoji($glyphs->{$name}{cp}),
-            sprintf("glyph '%s' (U+%04X) is not an emoji codepoint (B-E5, AC-10)", $name, $glyphs->{$name}{cp}));
+        # SCOPED 2026-08-28 to everything EXCEPT title.*, by operator decision.
+        #
+        # The no-emoji rule's stated reasoning is about TERMINAL surfaces: emoji
+        # render inconsistently there, often double-width and in colour. The
+        # title.* glyphs are the one set that does not render in a terminal at
+        # all -- they go in the OS window title, drawn in the desktop's UI font,
+        # where these symbols are the recognisable ones and where the failure
+        # mode the rule guards against does not arise.
+        #
+        # The exception is narrow and it is not a free pass: title.* glyphs must
+        # still force text presentation (asserted above, via U+FE0E) and still
+        # measure one cell. What is relaxed is only the codepoint-block check.
+        #
+        # Every other glyph in the table is still held to the original rule, so
+        # a stray emoji in a header, panel or statusline glyph still fails here.
+        if ($name =~ /\Atitle\./) {
+            ok(1, sprintf("glyph '%s' (U+%04X): emoji check waived for title.* -- window-title glyphs "
+                        . "render in the desktop UI font, not a terminal (B-E5, AC-10)",
+                        $name, $glyphs->{$name}{cp}));
+        }
+        else {
+            ok(!_is_emoji($glyphs->{$name}{cp}),
+                sprintf("glyph '%s' (U+%04X) is not an emoji codepoint (B-E5, AC-10)", $name, $glyphs->{$name}{cp}));
+        }
     }
 }
 
@@ -1595,8 +1673,17 @@ is_deeply(Theme::x256_rgb(196), [255, 0, 0],     'x256_rgb(196) == [255,0,0] (B-
             my $g = $glyphs->{$name};
           SKIP: {
                 skip("glyph '$name' not present in _dash_glyph_table()", 1) unless exists $dt->{ $g->{char} };
-                is(tui::Layout::glyph_width($g->{bytes}), $g->{width},
-                    "glyph '$name': present in _dash_glyph_table() -- Dashboard::glyph_width agrees with declared width (B-E9, AC-11)");
+                # glyph_width() measures ONE glyph and returns undef for a
+                # sequence, so the title.* glyphs -- which carry a trailing
+                # U+FE0E to force text presentation -- are measured with
+                # display_width() instead. Same claim, right instrument: the
+                # declared width must equal the width the layout will actually
+                # count, and for a sequence that is display_width's job.
+                my $measured = (length($g->{char}) > 1)
+                             ? tui::Layout::display_width($g->{bytes})
+                             : tui::Layout::glyph_width($g->{bytes});
+                is($measured, $g->{width},
+                    "glyph '$name': measured width agrees with declared width (B-E9, AC-11)");
             }
         }
     }

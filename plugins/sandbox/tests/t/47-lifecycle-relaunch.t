@@ -1459,14 +1459,34 @@ sub seg_has { my ($seg, $tag) = @_; return scalar(grep { $_->[0] eq $tag } @{ $s
             # counts the header as one. Discriminate on the SPAN, which is
             # exact: a status word is a closed vocabulary, a banner is prose.
             ref($_->{spans}) eq 'ARRAY'
-                ? scalar(grep { ($_->{role} // '') eq 'state.crit'
+                ? scalar(grep { ($_->{role} // '') eq 'overlay.warn'
                                 && ($_->{text} // '') !~ /\A(?:running|exited|stopped|paused|created|restarting|stopping|dead|removing|unknown|\?)\z/ }
                          @{ $_->{spans} })
-                : ($_->{role} // '') eq 'state.crit'
+                : ($_->{role} // '') eq 'overlay.warn'
         } @{$f3}[ 0 .. $#{$f3} - 1 ];
         cmp_ok(scalar(@alerts), '>=', 2, "AC-25: the recover banner + status alert coexist as rows at cols=$cols");
-        like($alerts[0]{text}, qr{recover 2/4},
-            "AC-25: the recover banner is the FIRST alert row at cols=$cols") if @alerts;
+        # RE-POINTED 2026-08-28: THE STACK GROWS UPWARD.
+        #
+        # Alerts were banner rows above the panel grid, where first-emitted meant
+        # topmost. They are now an overlay anchored to the footer that stacks
+        # upward -- the operator's rule, so an arriving warning never shifts one
+        # already being read. warning_entries emits the lifecycle alert before
+        # the status alert, so the recover banner is the OLDEST and sits nearest
+        # the footer.
+        #
+        # Asserted by RELATIVE POSITION rather than "which row is last", because
+        # the recover banner wraps and its final row is a continuation.
+        my ($i_rec, $i_stat);
+        for my $i (0 .. $#alerts) {
+            $i_rec  = $i if !defined($i_rec)  && $alerts[$i]{text} =~ m{recover 2/4};
+            $i_stat = $i if !defined($i_stat) && $alerts[$i]{text} =~ m{not running};
+        }
+        ok(defined $i_rec, "AC-25: the recover banner is identifiable in the stack at cols=$cols")
+            or diag('rows: ' . join(' | ', map { $_->{text} } @alerts));
+        cmp_ok($i_rec, '>', $i_stat,
+            "AC-25: the recover banner sits BELOW the status alert -- emitted first, and the overlay "
+          . "stacks upward, so the oldest ends up nearest the footer (cols=$cols)")
+            if defined($i_rec) && defined($i_stat);
     }
 
     # Edge case 10: a tiny terminal drops the banner rather than crowding the

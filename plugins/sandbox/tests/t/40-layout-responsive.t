@@ -181,8 +181,20 @@ my $ac56_R = { title => 'R', lines => [ 'r1' ] };
     is(scalar(@$fat), 24, "AC-7: compose_frame(24,$BP) returns exactly 24 rows");
     is(scalar(grep { Dashboard::display_width($_->{text}) != $BP } @$fat), 0,
         "AC-7: compose_frame(24,$BP) -- every row is exactly $BP display columns");
-    my $both_at = grep { $_->{text} =~ /$RULE_FILL_RE Run / && $_->{text} =~ /$RULE_FILL_RE Blueprints / } @$fat;
-    is($both_at, 1, "AC-7: 24x$BP -- EXACTLY one row contains BOTH \"-- Run \" and \"-- Blueprints \" (two-column mode)");
+    # RE-POINTED 2026-08-28: AT the breakpoint the panels STACK, and that is
+    # correct rather than a regression.
+    #
+    # tui::Layout's breakpoint (90) is where two columns become POSSIBLE, not
+    # where they are guaranteed: the panels still have to fit. Resources needs
+    # 75 columns and Run 44, so a band holds both only from ~119 -- and the
+    # operator's reorganisation put Resources beside Run, replacing Blueprints
+    # as the pairing partner.
+    #
+    # Squeezing both into 90 columns would render one of them unreadable, so
+    # stacking is the honest outcome. The pairing claim moved to AC-18's widths,
+    # where it demonstrably fits.
+    my $both_at = grep { $_->{text} =~ /$RULE_FILL_RE Run / && $_->{text} =~ /$RULE_FILL_RE Resources / } @$fat;
+    is($both_at, 0, "AC-7: 24x$BP -- at the breakpoint the two panels' minimums do not both fit, so they STACK");
 }
 
 # ---------------------------------------------------------------------------
@@ -428,12 +440,25 @@ is(Dashboard::activity_capacity(\%st, 24, undef), Dashboard::activity_capacity(\
 # partition.
 # ---------------------------------------------------------------------------
 {
-    for my $c (101, 121, 201) {
+    # RE-POINTED 2026-08-28. Two changes, both operator-directed:
+    #
+    #   * the paired panels are Run|RESOURCES now, not Run|Blueprints -- the
+    #     grid was reorganised so Resources sits beside Run and Blueprints spans
+    #     the full width below Providers;
+    #   * pairing is no longer implied by clearing tui::Layout's breakpoint.
+    #     Resources declares min_cols 75 and Run 44, so a band holds both only
+    #     once the MAIN region (terminal minus any side column) has ~119.
+    #
+    # 101 is therefore dropped from this loop and asserted as stacked below:
+    # at 101 the main region is 101, which cannot hold 119. The odd widths that
+    # remain are the ones where the pair genuinely fits, which is what keeps
+    # AC-18's "odd widths still work" claim meaningful rather than vacuous.
+    for my $c (121, 201) {
         my $f = Dashboard::compose_frame(\%st, 24, $c);
         is(scalar(grep { Dashboard::display_width($_->{text}) != $c } @$f), 0,
             "AC-18: compose_frame(24,$c) -- every row is exactly $c display columns");
-        my ($run_row) = grep { $_->{text} =~ /^$RULE_FILL_RE Run / && $_->{text} =~ /$RULE_FILL_RE Blueprints / } @$f;
-        ok($run_row, "AC-18: compose_frame(24,$c) -- a row carries BOTH \"-- Run \" and \"-- Blueprints \" (odd width still triggers two-column mode)");
+        my ($run_row) = grep { $_->{text} =~ /^$RULE_FILL_RE Run / && $_->{text} =~ /$RULE_FILL_RE Resources / } @$f;
+        ok($run_row, "AC-18: compose_frame(24,$c) -- a row carries BOTH \"-- Run \" and \"-- Resources \" (odd width still pairs)");
       SKIP: {
             skip "no paired row found for cols=$c", 1 unless $run_row;
             is(Dashboard::display_width($run_row->{text}), $c,
@@ -615,8 +640,17 @@ sub _ac11_expect {
         my ($r, $c, $label) = @$pair;
         my $cap_plain  = Dashboard::activity_capacity(\%st, $r, $c);
         my $cap_exited = Dashboard::activity_capacity(\%exited, $r, $c);
-        is($cap_exited, $cap_plain - 1,
-            "AC-11: activity_capacity($label, status=exited) == activity_capacity($label) - 1 (a status alert costs exactly one more row -- claim preserved from the original table's own comment; row count chosen to sit above the flex floor)");
+        # RE-POINTED 2026-08-28, SIGN INVERTED. Alerts were banner rows in the
+        # grid, so each one cost Activity a row -- the exact cost the operator
+        # objected to. They are now painted over a finished frame and take no
+        # rows at all, so the differential is ZERO.
+        #
+        # Kept as a differential rather than a bare number: an implementation
+        # that quietly went back to reserving a row for alerts would satisfy
+        # "capacity is N" but fails this.
+        is($cap_exited, $cap_plain,
+            "AC-11: activity_capacity($label, status=exited) == activity_capacity($label) -- an alert "
+          . "overlays the frame and costs NO capacity");
     }
 }
 
@@ -646,10 +680,10 @@ sub _ac11_expect {
         "AC-11 saturation: 24x80 (stacked) -- capacity == the hand-derived flex floor ($floor24)");
     is(Dashboard::activity_capacity(\%exited24, 24, 80), $floor24,
         "AC-11 saturation: 24x80 with a status alert -- capacity is STILL $floor24 (the floor absorbs the alert row; no differential at this row count)");
-    is(Dashboard::activity_capacity(\%st, 24, 120), $floor24,
-        "AC-11 saturation: 24x120 (two-column) -- capacity == the hand-derived flex floor ($floor24)");
-    is(Dashboard::activity_capacity(\%exited24, 24, 120), $floor24,
-        "AC-11 saturation: 24x120 with a status alert -- capacity is STILL $floor24 (the floor absorbs the alert row; no differential at this row count)");
+    cmp_ok(Dashboard::activity_capacity(\%st, 24, 120), '>=', $floor24,
+        "AC-11: 24x120 -- capacity never drops below the flex floor ($floor24); pairing at this width frees a band, so it legitimately exceeds it");
+    is(Dashboard::activity_capacity(\%exited24, 24, 120), Dashboard::activity_capacity(\%st, 24, 120),
+        'AC-11: 24x120 with a status alert -- capacity is UNCHANGED; an alert overlays the frame and consumes no layout row');
 }
 
 # ---------------------------------------------------------------------------
@@ -693,41 +727,31 @@ sub _ac11_expect {
     $SCAN_LO++ until $SCAN_LO > 80
         || tui::Screen::flex_reserve($SCAN_LO - tui::Screen::chrome_rows() - 1) == $reserve_cap;
 
-    my $find_threshold = sub {
-        my ($cols) = @_;
-        for my $rows ($SCAN_LO .. 80) {
-            my $base  = Dashboard::activity_capacity(\%st, $rows, $cols);
-            my $alert = Dashboard::activity_capacity(\%exited, $rows, $cols);
-            return $rows if $base > $floor24 && $alert == $base - 1;
-        }
-        return undef;
-    };
-
+    # RE-POINTED 2026-08-28: THERE IS NO THRESHOLD ANY MORE, AND THAT IS THE POINT.
+    #
+    # This hunted for the first row count at which a status alert starts costing
+    # Activity a row again -- the edge of a "dead band" where the flex floor
+    # absorbed the cost. That phenomenon existed only because an alert WAS a row
+    # in the grid.
+    #
+    # Alerts are now painted over a finished frame and never take a row, so the
+    # differential is zero at every height and no threshold exists to find.
+    #
+    # The replacement is stronger than the pair of claims it replaces: rather
+    # than "absent below a boundary, present above it", it asserts the
+    # differential is absent EVERYWHERE in the same scanned range, with a
+    # non-vacuity check that the range genuinely exercises varying capacity.
     for my $cols (80, 120) {
-        my $thr = $find_threshold->($cols);
-        ok(defined $thr, "AC-11 threshold: a differential threshold exists at ${cols} cols (scan $SCAN_LO..80)");
-        next unless defined $thr;
-
-        my $below = Dashboard::activity_capacity(\%st, $thr - 1, $cols);
-        is($below, $floor24,
-            "AC-11 threshold precondition: @{[$thr-1]}x$cols -- one row below the threshold, capacity is still "
-          . "exactly at the floor (proves the dead band, not a coincidence)");
-        is(Dashboard::activity_capacity(\%exited, $thr - 1, $cols), $below,
-            "AC-11 threshold: @{[$thr-1]}x$cols -- one row BELOW the threshold, a status alert costs NOTHING");
-
-        my $at = Dashboard::activity_capacity(\%st, $thr, $cols);
-        cmp_ok($at, '>', $floor24,
-            "AC-11 threshold precondition: ${thr}x$cols -- capacity has genuinely left the floor (not still clamped)");
-        is(Dashboard::activity_capacity(\%exited, $thr, $cols), $at - 1,
-            "AC-11 threshold: ${thr}x$cols -- the FIRST row count where a status alert costs exactly one more row again");
-
-        my @leaks = grep {
+        my @charged = grep {
             Dashboard::activity_capacity(\%exited, $_, $cols)
               != Dashboard::activity_capacity(\%st, $_, $cols)
-        } ($SCAN_LO .. $thr - 1);
-        is_deeply(\@leaks, [],
-            "AC-11 threshold: the dead band below ${thr}x$cols is contiguous -- no row count inside it "
-          . "charges for the alert");
+        } ($SCAN_LO .. 80);
+        is_deeply(\@charged, [],
+            "AC-11: at ${cols} cols a status alert costs NO capacity at any height in $SCAN_LO..80");
+
+        my %seen = map { Dashboard::activity_capacity(\%st, $_, $cols) => 1 } ($SCAN_LO .. 80);
+        cmp_ok(scalar(keys %seen), '>', 1,
+            "AC-11 non-vacuity: capacity genuinely varies across $SCAN_LO..80 at ${cols} cols");
     }
 }
 

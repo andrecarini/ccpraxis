@@ -614,16 +614,149 @@ sub _status_glyph {
 # _container_role($status, $gone) -> a Theme state role. PRIVATE, mirrors the
 # legacy Dashboard container_status_style's role half (glyph is resolved
 # separately by the caller, via _status_glyph).
+# container_presentation($status, $gone) -> (\%p) with keys:
+#   role     the Theme role (colour)
+#   glyph    the Theme glyph TOKEN for the state, or undef when the spinner
+#            alone represents it (running)
+#   spinner  1 when an animated spinner leads the glyph
+# PUBLIC, pure.
+#
+# ONE MAPPING, USED BY BOTH SURFACES. The header (this module) and the window
+# title (Dashboard::window_title) each had their own copy of this table, and
+# they disagreed: 'initialized' was missing from both, and when it was added to
+# one the two rendered the same container differently. The duplication was the
+# defect, so there is now a single function and the two callers differ only in
+# what they do with the result.
+#
+# THE SPINNER MARKS AN ONGOING ACTION (operator, 2026-08-28). created,
+# initialized, stopping and removing are all mid-transition -- something is
+# happening and will finish on its own -- so they carry a spinner to the LEFT of
+# their state glyph. 'running' is the special case: it is not a transition, so
+# the spinner IS its glyph rather than a prefix to one.
+#
+# The families are the operator's calls, not podman's taxonomy:
+#   stopped, paused  -> treated as exited (the container is not doing anything)
+#   stopping         -> treated as exited, but ongoing, so it also spins
+#   unknown          -> treated as "gone" (we cannot see it, which is the same
+#                       practical situation as not being able to reach it)
+sub container_presentation {
+    my ($status, $gone) = @_;
+    my $st = defined($status) ? $status : '';
+    $st =~ s/^\s+//; $st =~ s/\s+$//;
+
+    # 'word' OVERRIDES THE STATUS STRING, and this is the ONLY case where it
+    # does -- everywhere else the header prints podman's own string verbatim.
+    #
+    # container_gone means the heartbeat could not reach the container and a
+    # follow-up inspect did not say 'running'. Whatever status string we last
+    # captured is therefore STALE BY DEFINITION: we asked, and could not get an
+    # answer. Printing it produced "[<warning glyph> running]" -- the glyph
+    # saying unreachable while the word said executing, with the word usually
+    # winning the reader's attention because it is the part in English.
+    #
+    # So the word says what we actually know. The operator's ruling, given the
+    # choice between this, "gone (was running)", and leaving the contradiction
+    # in place.
+    #
+    # NOTE this does NOT distinguish a removed container from a podman machine
+    # that is down -- both produce a failed exec and a non-'running' inspect, so
+    # both land here. The Resources panel's machine_state is where that
+    # difference is visible today.
+    return { role => 'state.crit', family => 'unreachable', spinner => 0,
+             word => 'unreachable' } if $gone;
+    return { role => 'state.ok',   family => 'running',     spinner => 1 } if $st eq 'running';
+
+    # "we cannot determine the state" -- the same practical situation as gone.
+    return { role => 'state.crit', family => 'unreachable', spinner => 0 } if $st eq 'unknown';
+
+    # Not doing anything. 'dead' and 'restarting' are Docker names kept for a
+    # $PODMAN pointed at docker; podman itself never emits them.
+    return { role => 'state.crit', family => 'stopped', spinner => 0 }
+        if $st =~ /^(?:exited|stopped|paused|dead)$/;
+
+    # Not doing anything, but on its way somewhere -- so it also spins.
+    return { role => 'state.crit', family => 'stopped', spinner => 1 }
+        if $st =~ /^(?:stopping|removing)$/;
+
+    # Coming up.
+    return { role => 'state.warn', family => 'coming', spinner => 1 }
+        if $st =~ /^(?:created|initialized|restarting)$/;
+
+    return { role => 'state.idle', family => 'idle', spinner => 0 };
+}
+
+# THE FAMILY IS SHARED; THE GLYPH IS PER-SURFACE, and keeping those separate is
+# the point.
+#
+# An earlier version returned a single glyph token for both callers, which
+# quietly replaced the HEADER's long-standing status glyphs with the window
+# title's set -- a change nobody asked for. What actually had to be unified was
+# which STATES group together (and whether they spin); how each surface draws a
+# group is a separate question with different constraints:
+#
+#   header  renders in the terminal font, next to the status WORD, alongside the
+#           status.* glyphs used elsewhere on the screen
+#   title   renders in the desktop UI font, alone, with no word to disambiguate
+#
+# 'unreachable' is the one family both draw the same, because the operator asked
+# for the warning sign in both places.
+# container_glyph($surface, \%presentation) -> Theme glyph token, or undef when
+# the surface draws nothing of its own (running: the spinner IS the glyph).
+#
+# The table lives INSIDE the sub, not at file scope. t/66's AC-P1 forbids a
+# top-level print/warn/say, and it scans the source outside sub bodies -- a
+# file-scoped table containing the token 'status.warn' matched that scan. The
+# guard is right to be blunt about it (the same oracle already had to learn to
+# strip comments for the same reason), and the table has no business being a
+# top-level side-effect-free-module exception anyway. It is small and rebuilt
+# per call; container_glyph runs once per surface per frame.
+sub container_glyph {
+    my ($surface, $pres) = @_;
+    return undef unless ref($pres) eq 'HASH';
+    my %family_glyph = (
+        header => { running => undef, coming => 'status.' . 'warn',
+                    stopped => 'status.crit', unreachable => 'title.gone', idle => undef },
+        title  => { running => undef, coming => 'title.paused',
+                    stopped => 'title.exited', unreachable => 'title.gone', idle => undef },
+    );
+    my $map = $family_glyph{ $surface || '' } or return undef;
+    return $map->{ $pres->{family} || 'idle' };
+}
+
 sub _container_role {
     my ($status, $gone) = @_;
     my $st = defined($status) ? $status : '';
     $st =~ s/^\s+//;
     $st =~ s/\s+$//;
-    return 'state.crit' if $gone;
-    return 'state.ok'   if $st eq 'running';
-    return 'state.crit' if $st =~ /^(?:exited|dead|removing|unknown)$/;
-    return 'state.warn' if $st =~ /^(?:created|restarting|stopping|stopped|paused)$/;
-    return 'state.idle';
+    # THE STATUS SET IS PODMAN'S, VERIFIED against libpod/define/containerstate.go
+    # (2026-08-28) rather than assumed. Podman's own doc comments:
+    #
+    #   created      storage configured, NOT yet created in the OCI runtime
+    #   initialized  created in the OCI runtime but not started
+    #   running      currently executing
+    #   stopped      was running but has exited
+    #   paused       has been paused
+    #   exited       has stopped AND been cleaned up
+    #   stopping     in the process of being stopped
+    #   removing     in the process of being removed
+    #   unknown      an error state where information cannot be retrieved
+    #
+    # 'initialized' WAS MISSING and fell through to state.idle -- so a container
+    # created in the runtime but not yet started rendered with the "we do not
+    # recognise this" glyph, when it is plainly transitional and belongs beside
+    # 'created'. That gap existed because this list was written from memory of
+    # Docker's state names.
+    #
+    # 'dead' and 'restarting' are DOCKER names, not podman ones -- neither
+    # appears in podman's set. They are kept rather than removed: they cost one
+    # alternation each, and a podman that ever grows Docker compatibility (or a
+    # user pointing $PODMAN at docker) would otherwise silently fall through to
+    # idle. Their presence is documented so nobody later "cleans up" a branch
+    # believing it is live podman coverage.
+    # DELEGATES, so there is exactly one table. This function survives because
+    # it has many callers that only want the colour; the mapping itself moved to
+    # container_presentation when the header and title were unified.
+    return container_presentation($status, $gone)->{role};
 }
 
 # DERIVED FROM Theme, never restated. The frame count changed once already
@@ -721,10 +854,56 @@ sub header_spans {
     my $ctr_raw = ref($state->{container}) ? undef : $state->{container};
     my $ctr = tui::Frame::safe(defined($ctr_raw) ? $ctr_raw : '');
     my $st_raw = ref($state->{status}) ? undef : $state->{status};
-    my $st = tui::Frame::safe((defined($st_raw) && length($st_raw)) ? $st_raw : '?');
+    # The word is podman's status string verbatim -- EXCEPT where the mapping
+    # supplies an override (container_gone -> 'unreachable'), because there the
+    # captured string is known to be stale. See container_presentation.
+    my $_pres_word = container_presentation($state->{status}, $state->{container_gone})->{word};
+    my $st = tui::Frame::safe(
+        defined($_pres_word) ? $_pres_word
+      : ((defined($st_raw) && length($st_raw)) ? $st_raw : '?'));
 
     my $role = _container_role($state->{status}, $state->{container_gone});
-    my $spin = _spinner_frame($state->{spinner_idx});
+
+    # THE SPINNER ONLY SPINS WHEN SOMETHING IS RUNNING.
+    #
+    # This called _spinner_frame unconditionally, so an exited container
+    # rendered as "[<spinner> exited]" -- a progress animation attached to a
+    # state that is, by definition, not progressing. The operator's report:
+    # "[spinner exited] no reason for a spinner if the status is exited."
+    #
+    # The window title already worked this way (its lead character animates only
+    # while running, and every attention state keeps a literal character), so
+    # this makes the header agree with the title rather than inventing a rule.
+    # A non-running state gets the STATIC glyph for its own role, which is also
+    # the glyph that state uses everywhere else on the screen.
+    # The header and the window title now read the SAME mapping, so a state
+    # cannot render as one thing here and another in the taskbar.
+    #
+    # A transitional state shows BOTH: the spinner (something is happening) and
+    # its state glyph (what is happening). 'running' shows the spinner alone,
+    # because running is not a transition -- there is no second fact to add.
+    my $pres  = container_presentation($state->{status}, $state->{container_gone});
+    my $token = container_glyph('header', $pres);
+    my $spin  = '';
+    if ($pres->{spinner}) {
+        my $f = _spinner_frame($state->{spinner_idx});
+        $spin .= $f if defined $f;
+    }
+    if (defined $token) {
+        my $g = Theme::glyph($token);
+        $spin .= (length($spin) ? ' ' : '') . $g if defined($g) && length($g);
+    }
+    # NO '?' FALLBACK HERE, deliberately -- that belongs to the window title.
+    #
+    # An absent spinner index is a normal transient (state not yet populated),
+    # and the old contract rendered "[running]" with no glyph at all. Falling
+    # back to '?' turned that into "[? running]", which reads as "we do not know
+    # what this is" directly beside the word telling you exactly what it is.
+    #
+    # The title needs a fallback because its glyph is the ONLY thing it has. The
+    # header always has the status word, so an absent glyph costs nothing and
+    # inventing one costs clarity.
+    $spin = undef if !length $spin;
 
     # The STATUS BLOCK LEADS the line (operator request, 2026-08-25).
     #
@@ -819,7 +998,23 @@ sub _one_run_summary_cells {
     my $done  = _nonneg_int($s->{packages_done});
     my $total = _nonneg_int($s->{packages_total});
     my $coord = _nonneg_int($s->{running_coordinators});
-    my $waiting = _nonneg_int($s->{decisions_waiting});
+    # ONLY WHAT NEEDS THE OPERATOR (operator, 2026-08-28: "panel should only
+    # show what actually needs me").
+    #
+    # decisions_waiting is the TOTAL, and it counts two different things: the
+    # decisions a human must make, and the ones an automated resolver is
+    # expected to triage. Showing the total meant the panel raised its hand for
+    # work nobody needed to look at -- and the resolver's queue moving on its
+    # own made the number tick down for no reason the operator could see.
+    #
+    # decisions_operator is that split's human half. FALLING BACK to the total
+    # when the split is absent is deliberate and matches launcher.pl's own
+    # _count_needs_you: a summary written by an older RunState has no split, and
+    # erring toward "the operator owns it" is the safe direction -- silently
+    # reporting zero would hide real work.
+    my $waiting = defined($s->{decisions_operator})
+                ? _nonneg_int($s->{decisions_operator})
+                : _nonneg_int($s->{decisions_waiting});
 
     return [
         [ { text => $bp,    role => 'accent' } ],
@@ -983,11 +1178,19 @@ sub _run_body {
     my $bp_row = row({ label => 'backpack', value => $bp_val });
     push @lines, $bp_row if @$bp_row;
 
-    if (ref($state->{tokens}) ne 'HASH') {
-        my $sec = $state->{oauth_remaining};
-        my $oauth_row = row({ label => 'oauth', value => [ { text => _fmt_oauth_like($sec), role => _oauth_like_role($sec) } ], force => 1 });
-        push @lines, $oauth_row if @$oauth_row;
-    }
+    # THE 'oauth' ROW IS GONE (operator, 2026-08-28). It rendered only when
+    # $state->{tokens} was absent, and said the same thing -- through the same
+    # _fmt_oauth_like formatter -- that Providers' Claude Code "access" row
+    # says. Two credential facts in two panels, told apart only by which one
+    # happened to have data. The fallback now feeds that row instead; see
+    # _claude_code_block's $oauth_fallback.
+
+    # THE PODMAN INSTALLATION FACTS CLOSE THE PANEL (operator, 2026-08-27).
+    # `machine` and `podman` describe the runtime this panel's runs execute in,
+    # which is why they belong beside them rather than among the live gauges in
+    # Resources. They come last so the run-specific rows above keep the position
+    # the operator already reads them in.
+    push @lines, @{ _podman_install_lines($state->{resources}) };
 
     return \@lines;
 }
@@ -1119,11 +1322,33 @@ sub _blueprints_body {
 #
 # So the ramp is now accent -> state.warn -> state.crit: an identity at rest, an
 # alarm only under pressure. The track stays 'rule' either way.
+# _gauge_role($ratio) -> the Theme role the FILL is painted in.
+#
+# A FOUR-STEP RAMP over the Radix step-9 palette (Theme's gauge.* roles), which
+# encodes magnitude continuously AND the two thresholds categorically:
+#
+#     < 50%              gauge.low    blue
+#     50% .. warn        gauge.mid    teal
+#     warn .. crit       gauge.warn   orange
+#     >= crit            gauge.crit   red
+#
+# The two upper boundaries are tui::Meter's own PRESSURE_WARN/PRESSURE_CRIT,
+# read through pressure_role rather than restated, so this cannot drift from the
+# thresholds everything else uses. Only the extra split at half is local, and it
+# is what turns a three-state indicator into a ramp.
+#
+# This replaced a scheme that painted everything below the warn threshold in
+# 'accent': a disk at 5% and a disk at 70% looked identical, so the bar's colour
+# carried no information until something was already wrong.
 sub _gauge_role {
     my ($ratio) = @_;
     my $r = tui::Meter::pressure_role($ratio);
-    return 'accent' if !defined $r || $r eq 'state.ok';
-    return $r;
+    return 'gauge.low' if !defined $r;
+    return 'gauge.warn' if $r eq 'state.warn';
+    return 'gauge.crit' if $r eq 'state.crit';
+    # state.ok: split it at half so the healthy range is not one flat colour.
+    return (defined($ratio) && !ref($ratio) && $ratio =~ /^-?\d+(?:\.\d+)?$/ && $ratio >= 0.5)
+        ? 'gauge.mid' : 'gauge.low';
 }
 
 sub _gauge_value_spans {
@@ -1253,13 +1478,22 @@ sub _pct_gauge_spans {
     return _gauge_value_spans($ratio, undef, undef, $trail);
 }
 
-sub _resources_body {
+# _podman_install_lines(\%resources) -> \@lines -- the `machine` and `podman`
+# rows, which describe the podman INSTALLATION rather than any live reading.
+#
+# THEY LIVE IN THE RUN PANEL, NOT RESOURCES (operator, 2026-08-27: "From the
+# Resources panel, the `machine` line and the `podman` line go into the Run
+# cell. The rest stays in a Resources cell").
+#
+# Extracted rather than duplicated: Resources still owns the measurements and
+# Run owns the installation facts, but both render the SAME two rows from the
+# same snapshot, so there is one place that knows their shape. They were
+# adjacent in Resources already (machine-then-storage), which is why they move
+# as a pair.
+sub _podman_install_lines {
     my ($r) = @_;
     return [] unless ref($r) eq 'HASH';
     my @lines;
-
-    my $snap = snapshot_spans($r);
-    push @lines, $snap if ref($snap) eq 'ARRAY' && @$snap;
 
     my %mstate_role = ( running => 'state.ok', starting => 'state.warn', stopped => 'state.crit' );
     my $ms = $r->{machine_state};
@@ -1274,20 +1508,60 @@ sub _resources_body {
     my $machine_row = row({ label => 'machine', value => \@mv });
     push @lines, $machine_row if @$machine_row;
 
-    # PODMAN SITS DIRECTLY UNDER MACHINE (operator, 2026-08-26: "Move the podman
-    # entry to under the machine entry"), which is also where it belongs: both
-    # are facts about the podman installation itself rather than about anything
-    # running inside it, so the panel now reads machine-then-storage, then the
-    # live measurements. It was previously stranded between ctr cpu and host
-    # ram, splitting the container readings from the host ones.
+    # THE PODMAN ROW IS AN ORDINARY LABELLED ROW NOW, not a figures-column row.
+    #
+    # It used to go through _figures_only_spans, which pads by
+    # BAR_CELLS + 1 + PERCENT_COL_WIDTH + 2 so that a row with no gauge still
+    # lands its figures in the same column as the gauge rows' figures. That was
+    # right while it lived in Resources, beneath the gauges it was aligning to.
+    # It is in RUN now, where there are no gauges at all, so the padding lined
+    # the text up against a column that does not exist -- the operator saw it as
+    # "unnecessary spacing", which is exactly what it was.
+    #
+    # STYLED LIKE THE OTHER FIGURE ROWS: the quantity in text.primary, its label
+    # word in text.muted. Previously the whole string was one text.primary span,
+    # so "imgs" carried the same weight as "2.8 GB" and there was nothing for
+    # the eye to lock onto.
+    #
+    # NO '|' SEPARATORS (operator: "no need for the separators"). They earn
+    # their place in the used/free/total triple, where three same-shaped
+    # quantities need dividing; here each figure is already introduced by its
+    # own word, so the pipes were dividing things that were not run together.
     my ($pi, $pc, $pv) = ($r->{pod_images}, $r->{pod_containers}, $r->{pod_volumes});
-    my $podman_val = (defined($pi) || defined($pc) || defined($pv))
-        ? _figures_only_spans(sprintf('images %s | containers %s | volumes %s',
-                tui::Meter::fmt_bytes($pi), tui::Meter::fmt_bytes($pc), tui::Meter::fmt_bytes($pv)))
-        : [ { text => 'n/a', role => 'text.muted' } ];
+    my $podman_val;
+    if (defined($pi) || defined($pc) || defined($pv)) {
+        my @spans;
+        my @parts = ([ 'imgs', $pi ], [ 'ctrs', $pc ], [ 'vols', $pv ]);
+        for my $i (0 .. $#parts) {
+            my ($word, $v) = @{ $parts[$i] };
+            push @spans, { text => '  ', role => 'text.muted' } if $i;
+            push @spans, { text => $word . ' ', role => 'text.muted' };
+            push @spans, { text => tui::Meter::fmt_bytes($v), role => 'text.primary' };
+        }
+        $podman_val = \@spans;
+    }
+    else {
+        $podman_val = [ { text => 'n/a', role => 'text.muted' } ];
+    }
     my $podman_row = row({ label => 'podman', value => $podman_val });
     push @lines, $podman_row if @$podman_row;
 
+    return \@lines;
+}
+
+sub _resources_body {
+    my ($r) = @_;
+    return [] unless ref($r) eq 'HASH';
+    my @lines;
+
+    my $snap = snapshot_spans($r);
+    push @lines, $snap if ref($snap) eq 'ARRAY' && @$snap;
+
+    # MACHINE AND PODMAN ARE NO LONGER HERE. They describe the podman
+    # installation, not a live reading, and the operator moved them into the Run
+    # panel on 2026-08-27 -- see _podman_install_lines, which both panels share.
+    # What remains is exactly the measurements: a snapshot age, then the
+    # container gauges, then the host gauges.
     my $ctrmem_row = row({ label => 'ctr mem', value => _bytes_gauge_spans($r->{ctr_mem_used}, $r->{vm_mem_total}) });
     push @lines, $ctrmem_row if @$ctrmem_row;
 
@@ -1352,9 +1626,16 @@ sub _spend_claude_spans {
         push @spans, { text => (@parts ? join('  ', @parts) : 'no windows reported'), role => 'text.primary' };
         return (\@spans, 0);
     }
+    # NO DEFAULT DIAGNOSTIC. This fell back to the literal 'usage endpoint
+    # unreadable', which rendered as "usage  x unreadable -- usage endpoint
+    # unreadable" -- the word "usage" three times and "unreadable" twice, to say
+    # one thing. The label already names the fact, so with nothing specific to
+    # add the value is just the state. A REAL diagnostic still shows, because
+    # that is the case where the extra words carry information.
     my $diag = (defined($c->{diagnostic}) && !ref($c->{diagnostic}) && length($c->{diagnostic}))
-             ? $c->{diagnostic} : 'usage endpoint unreadable';
-    push @spans, { text => "unreadable -- $diag", role => 'state.crit' };
+             ? $c->{diagnostic} : '';
+    push @spans, { text => (length($diag) ? "unreadable -- $diag" : 'unreadable'),
+                   role => 'state.crit' };
     return (\@spans, 1);
 }
 
@@ -1512,12 +1793,26 @@ sub _clip_line {
 # three times. The row is kept rather than dropped so the panel's height does
 # not change when figures arrive.
 sub _claude_code_block {
-    my ($tokens, $claude_spend, $spend_present, $w) = @_;
+    my ($tokens, $claude_spend, $spend_present, $w, $oauth_fallback) = @_;
     my $t = (ref($tokens) eq 'HASH') ? $tokens : {};
     my @lines = ( _provider_heading('Claude Code') );
 
+    # THE OAUTH EXPIRY LIVES HERE NOW, not in a separate Run row.
+    #
+    # Run carried an 'oauth' row rendered ONLY when $state->{tokens} was absent
+    # -- a fallback from before this panel existed, using this very formatter
+    # (_fmt_oauth_like) to say the same kind of thing. The operator asked what
+    # it was for and how it differed from Claude Code, which is the right
+    # question: two credential facts in two panels, distinguishable only by
+    # which one happened to have data.
+    #
+    # So the fallback feeds the row that already exists. When the token facts
+    # are present nothing changes; when they are not, this row shows the raw
+    # credential expiry instead of Run growing a row about a provider.
     my $access_state = defined($t->{access_state}) ? $t->{access_state} : 'absent';
     my $sec = ($access_state eq 'absent') ? undef : $t->{access_seconds_left};
+    $sec = $oauth_fallback
+        if !defined($sec) && defined($oauth_fallback) && !ref($oauth_fallback);
     my @access_spans = ( { text => _fmt_oauth_like($sec), role => _oauth_like_role($sec) } );
     if (defined $t->{last_refreshed_age}) {
         push @access_spans, { text => ', refreshed ' . fmt_duration($t->{last_refreshed_age}) . ' ago', role => 'text.primary' };
@@ -1605,6 +1900,71 @@ sub _opencode_block {
     ];
 }
 
+# _PROVIDER_GAP -- the gutter between the two provider blocks. Two columns: one
+# is too tight to read as a separation, three wastes width the blocks want.
+use constant _PROVIDER_GAP => 2;
+
+# _PROVIDER_MIN_COLS -- the width ONE provider block needs before the two can be
+# placed side by side.
+#
+# MEASURED, and the first version was badly wrong. It gated on
+# tui::Meter::min_width() (75), which is the width a RESOURCES GAUGE ROW needs
+# -- a label, a ten-cell bar, a percent and a used/free/total triple. A provider
+# block has none of those. Measured at a generous width, the Claude Code block's
+# widest line is 55 columns and OpenCode's is 30.
+#
+# The wrong gate demanded a 152-column panel for a pairing that fits in 112, so
+# Providers rendered STACKED at every realistic terminal size -- eight rows
+# where four would do. That was the direct cause of Blueprints being dropped
+# entirely on a 24-row terminal: the rows Providers did not need were the rows
+# Blueprints did.
+#
+# 56, not 55: one column of slack so the wider block is not flush against the
+# gutter.
+use constant _PROVIDER_MIN_COLS => 56;
+
+# _side_by_side(\@left, \@right, $lw, $rw) -> \@lines -- two blocks of spans
+# joined into one column of rows, each side fitted to its own width.
+#
+# The lists are almost never the same length, so the shorter one is padded with
+# blank rows rather than the join stopping early -- stopping early would silently
+# DROP the longer provider's tail, which is a data loss that looks like a layout
+# choice.
+#
+# Fitting is delegated to tui::Frame::fit_spans, which both pads and clips to an
+# exact width. Doing it by hand would mean re-deriving display widths that
+# already have one implementation, and getting that wrong is how a row ends up
+# one column too long and wraps the whole panel.
+# _block_width(\@lines) -> the widest rendered line in a block of span rows.
+# The natural width of a column, so two columns can be sized to their content.
+sub _block_width {
+    my ($lines) = @_;
+    return 0 if ref($lines) ne 'ARRAY';
+    my $max = 0;
+    for my $l (@$lines) {
+        next if ref($l) ne 'ARRAY';
+        my $w = tui::Frame::spans_width($l);
+        $max = $w if $w > $max;
+    }
+    return $max;
+}
+
+sub _side_by_side {
+    my ($left, $right, $lw, $rw) = @_;
+    $left  = [] if ref($left)  ne 'ARRAY';
+    $right = [] if ref($right) ne 'ARRAY';
+    my $n = (@$left > @$right) ? scalar(@$left) : scalar(@$right);
+    my @out;
+    for my $i (0 .. $n - 1) {
+        my @row;
+        push @row, @{ tui::Frame::fit_spans($left->[$i]  || [], $lw, 'text.primary') };
+        push @row, { text => ' ' x _PROVIDER_GAP(), role => 'text.primary' };
+        push @row, @{ tui::Frame::fit_spans($right->[$i] || [], $rw, 'text.primary') };
+        push @out, \@row;
+    }
+    return \@out;
+}
+
 sub _providers_body {
     my ($state, $cols) = @_;
     $state = {} unless ref($state) eq 'HASH';
@@ -1630,10 +1990,53 @@ sub _providers_body {
     # $spend->{priority} is still computed and is now correct; nothing else
     # consumed this row, so only the rendering goes.
 
-    push @lines, @{ _claude_code_block($state->{tokens}, $spend ? $spend->{claude} : undef, $spend ? 1 : 0, $w) };
-    push @lines, @{ _opencode_block($spend ? $spend->{go}  : undef,
-                                    $spend ? $spend->{zen} : undef,
-                                    $spend ? 1 : 0, $w) };
+    # THE TWO PROVIDERS SIT SIDE BY SIDE (operator, 2026-08-27: "On Providers,
+    # put Claude Code and OpenCode side by side instead of one under the
+    # other"). They are peers -- two accounts, the same kinds of fact -- so
+    # stacking them made the panel twice as tall as it needed to be and implied
+    # a precedence that does not exist.
+    #
+    # Each block is composed at its OWN half-width, not at $w, or a block would
+    # lay itself out for a panel twice as wide as the space it is about to be
+    # fitted into. Below the two-column breakpoint they stay stacked: two
+    # half-columns of a narrow panel is worse than a tall panel.
+    my $half = int(($w - _PROVIDER_GAP()) / 2);
+    if ($half >= _PROVIDER_MIN_COLS()) {
+        my $cc = _claude_code_block($state->{tokens}, $spend ? $spend->{claude} : undef,
+                                    $spend ? 1 : 0, $half, $state->{oauth_remaining});
+        my $oc = _opencode_block($spend ? $spend->{go}  : undef,
+                                 $spend ? $spend->{zen} : undef,
+                                 $spend ? 1 : 0, $half);
+
+        # COLUMNS ARE SIZED TO THEIR CONTENT, NOT TO HALF THE PANEL.
+        #
+        # Splitting 50/50 put OpenCode at the panel's midpoint however wide the
+        # panel got: on a 170-column Providers panel, Claude Code's ~55 columns
+        # of content sat next to thirty columns of nothing, and OpenCode began
+        # at column 85. The operator's words: "the OpenCode one is all the way
+        # to the right... it looks ugly."
+        #
+        # Two adjacent columns, each as wide as it needs to be, with a fixed
+        # gutter, is what makes them read as a pair. The panel's leftover width
+        # stays empty on the RIGHT, where empty space is unremarkable, instead
+        # of being inserted between two things that belong together.
+        my $lw = _block_width($cc);
+        my $rw = _block_width($oc);
+        # Never wider than the panel: if content genuinely needs more than there
+        # is, fall back to sharing what exists rather than overflowing.
+        if ($lw + _PROVIDER_GAP() + $rw > $w) {
+            $lw = $half;
+            $rw = $w - $half - _PROVIDER_GAP();
+        }
+        push @lines, @{ _side_by_side($cc, $oc, $lw, $rw) };
+    }
+    else {
+        push @lines, @{ _claude_code_block($state->{tokens}, $spend ? $spend->{claude} : undef,
+                                           $spend ? 1 : 0, $w, $state->{oauth_remaining}) };
+        push @lines, @{ _opencode_block($spend ? $spend->{go}  : undef,
+                                        $spend ? $spend->{zen} : undef,
+                                        $spend ? 1 : 0, $w) };
+    }
 
     # (t11's hot-reload rows are a BANNER, not a panel row -- see
     # hot_reload_banners below. They belong above the panels, with the other
@@ -1676,8 +2079,26 @@ sub panels {
     $state = {} if ref($state) ne 'HASH';
     my @out;
 
-    push @out, { title => 'Run', lines => _run_body($state) };
-    push @out, { title => 'Blueprints', lines => _blueprints_body($state, $cols) };
+    # PANEL ORDER IS THE LAYOUT (operator, 2026-08-27). tui::Layout::place packs
+    # consecutive panels into bands, so the order here IS the arrangement:
+    #
+    #     Run | Resources          -- paired, side by side
+    #     Providers                -- full width
+    #     Blueprints               -- full width, and takes the leftover height
+    #
+    # Blueprints moved out from directly under Run to below Providers, and
+    # Resources moved up to sit beside Run.
+    # Run declares a minimum too, and it has to. Now that a band can be split
+    # UNEVENLY to satisfy a neighbour's min_cols, a panel that declares nothing
+    # is treated as infinitely squeezable: beside Resources (75) in a 100-column
+    # main region Run was handed 25, which cannot hold "backpack  5 items, 5
+    # pending [b]". A minimum is what makes the pair demote to two rows instead
+    # of rendering one of them unreadably narrow.
+    #
+    # DERIVED, not picked: the label column and its gutter, plus room for the
+    # longest value this panel actually renders.
+    push @out, { title => 'Run', lines => _run_body($state),
+                 min_cols => tui::Meter::LABEL_COL_WIDTH() + 3 + 30, uneven_ok => 1 };
 
     # RESOURCES IS ALWAYS PRESENT, for the same reason the geometry is fixed.
     #
@@ -1690,13 +2111,16 @@ sub panels {
     # Reserving it costs nothing when data never arrives (the sampler failed to
     # fork, say) and it states that outright rather than vanishing.
     if (ref($state->{resources}) eq 'HASH') {
-        push @out, { title => 'Resources', lines => _resources_body($state->{resources}), min_cols => tui::Meter::min_width() };
+        # uneven_ok: Resources would rather sit beside Run at whatever width its
+        # min_cols demands than be pushed onto its own row. See tui::Layout::place.
+        push @out, { title => 'Resources', lines => _resources_body($state->{resources}),
+                     min_cols => tui::Meter::min_width(), uneven_ok => 1 };
     } else {
         # No snapshot has EVER been written. Until t01 this branch rendered one
         # hardcoded sentence whatever the reason, so a sampler that failed to
         # fork looked exactly like one that started two seconds ago -- which is
         # what the operator saw, unchanged, indefinitely.
-        push @out, { title => "Resources",
+        push @out, { title => "Resources", uneven_ok => 1,
                      lines => [ sampler_wait_spans($state->{resources_sampler}) ],
                      min_cols => tui::Meter::min_width() };
     }
@@ -1717,7 +2141,31 @@ sub panels {
     # It also now carries Claude Code's token facts (Token panel merged in,
     # criterion 2) nested under their own heading, alongside the OpenCode
     # Go/Zen spend facts each under theirs -- see _providers_body.
-    push @out, { title => 'Providers', lines => _providers_body($state, $cols), min_cols => tui::Meter::min_width() };
+    push @out, { title => 'Providers', lines => _providers_body($state, $cols),
+                 min_cols => tui::Meter::min_width(), full_width => 1 };
+
+    # BLUEPRINTS IS FULL WIDTH AND CARRIES THE FLEX (operator, 2026-08-27: "Move
+    # Blueprints to under Providers... The blueprints cell expands to take
+    # available height").
+    #
+    # BUT ONLY WHEN ACTIVITY IS THE SIDE COLUMN, and that condition is the whole
+    # correctness argument. flex was Activity's, and the reason it held still
+    # holds: tui::Screen gives the FIRST flex panel a reservation the fixed
+    # region cannot eat, and without one the last panel in the flow can be
+    # squeezed out of existence entirely.
+    #
+    # Above the breakpoint Activity is removed from this list before placement
+    # and spans the full body height by construction, so the main region's flex
+    # is genuinely free and Blueprints should have it. BELOW the breakpoint
+    # Activity is back in the flow as the last panel, and handing its
+    # reservation to Blueprints deletes it: the sandbox suite failed with "the
+    # activity panel still exists" across every short-terminal case, which is
+    # exactly that.
+    #
+    # So the flag follows the layout rather than being asserted unconditionally.
+    my $activity_is_side = (tui::Screen::side_column_width($cols) > 0) ? 1 : 0;
+    push @out, { title => 'Blueprints', lines => _blueprints_body($state, $cols),
+                 full_width => 1, ($activity_is_side ? (flex => 1) : ()) };
 
     # Recent activity is the FLEX panel (tui::Screen H6) and is always last.
     #
@@ -1918,6 +2366,66 @@ sub _banner_lines {
     return [ map { '  !! ' . tui::Frame::safe($_) } @msgs ];
 }
 
+# warning_entries(\%state) -> \@entries, each { id, text, key } -- EVERY
+# alert-shaped message on the dashboard, as overlay entries. PUBLIC.
+#
+# THIS IS THE WHOLE BANNER POPULATION, and that is the point. Converting only
+# the messages that happened to be in front of me was the bug: the overlay was
+# built, one synthetic producer was pointed at it, and the mechanism it was
+# meant to replace went on rendering everything else into the side column --
+# straight over Recent activity. A capture with "warnings live 0" and a visible
+# `!!` row is exactly that split, and the operator was right to call it out.
+#
+# So the producers are enumerated here, in one place, and _banner_lines (which
+# still exists for callers that legitimately want the flowed form) reads from
+# the same four sources. If a fifth is ever added, it has to be added here to
+# be seen at all -- which is the property the previous arrangement lacked.
+#
+# IDS ARE STABLE PER PRODUCER, not per message text, so a dismissal survives the
+# message being re-rendered with a different age or count in it. A dismissed
+# warning whose text ticks over would otherwise reappear once a second.
+sub warning_entries {
+    my ($state) = @_;
+    $state = {} unless ref($state) eq 'HASH';
+    my @out;
+
+    my $lifecycle = _lifecycle_alert_msg($state);
+    push @out, { id => 'lifecycle', key => 'd', text => $lifecycle }
+        if defined($lifecycle) && length($lifecycle);
+
+    my $status = _status_alert_msg($state);
+    push @out, { id => 'status', key => 'd', text => $status }
+        if defined($status) && length($status);
+
+    push @out, { id => 'install', key => 'd', text => $state->{install_warning} }
+        if defined($state->{install_warning}) && !ref($state->{install_warning})
+        && length($state->{install_warning});
+
+    my $reload = hot_reload_msgs($state);
+    if (ref($reload) eq 'ARRAY') {
+        my $i = 0;
+        for my $m (@$reload) {
+            next unless defined($m) && length($m);
+            push @out, { id => 'reload' . $i++, key => 'd', text => $m };
+        }
+    }
+
+    # Explicit entries supplied by the caller come LAST, so they stack on top --
+    # they are the newest thing that happened.
+    if (ref($state->{warnings}) eq 'ARRAY') {
+        for my $w (@{ $state->{warnings} }) {
+            next unless ref($w) eq 'HASH' && defined $w->{text} && length $w->{text};
+            push @out, { id => (defined $w->{id} ? $w->{id} : $w->{text}),
+                         key => (defined $w->{key} ? $w->{key} : 'd'),
+                         text => $w->{text} };
+        }
+    }
+
+    # Dismissal is the CALLER's state, applied here so every surface honours it.
+    my $dis = (ref($state->{dismissed_warnings}) eq 'HASH') ? $state->{dismissed_warnings} : {};
+    return [ grep { !$dis->{ $_->{id} } } @out ];
+}
+
 # hot_reload_msgs(\%state) -> \@messages. PURE, total (t11-tui-hot-reload).
 #
 # Two things reach the operator here, and they answer different questions:
@@ -2014,12 +2522,28 @@ sub screen {
     my $header_cols = $cols;
     $header_cols = 1 if $header_cols < 1;
 
+    # THE PANELS ARE COMPOSED AT THE MAIN REGION'S WIDTH, NOT THE TERMINAL'S.
+    #
+    # panels() used to be handed $cols. The panels are then rendered into the
+    # main region -- $cols minus the side column -- so any body that uses its
+    # width to make a layout decision made that decision for a region wider than
+    # the one it lands in.
+    #
+    # Providers made it visible and the preview harness is what showed it: at a
+    # 200-column terminal it split its two provider blocks to fit a 200-wide
+    # panel, was rendered into 134, and every joined row overflowed and wrapped
+    # -- turning a clean two-column panel into interleaved fragments. Composing
+    # at the true width is the fix; the header does the same thing directly
+    # above, for the same reason.
+    my $main_cols = $cols - tui::Screen::side_column_width($cols);
+    $main_cols = 1 if $main_cols < 1;
+
     return {
         title       => header_spans($state, $header_cols),
         title_role  => 'accent',
         banners     => _banner_lines($state),
         banner_role => 'state.crit',
-        panels      => panels($state, $cols),
+        panels      => panels($state, $main_cols),
         footer      => _footer_text($state, $cols),
         footer_role => _footer_role($state),
     };
@@ -2047,7 +2571,31 @@ sub compose {
         $state = { %$state, blueprint_rows_max => $budget };
     }
 
-    return tui::Screen::compose(screen($state, $cols), $rows, $cols);
+    # BANNERS NO LONGER PARTICIPATE IN LAYOUT AT ALL.
+    #
+    # screen() still produces them (callers and tests read that shape), but they
+    # are cleared before placement and re-emitted as overlay entries below. That
+    # is what makes "a warning arrives" cost zero rows: previously each banner
+    # was a real row, taken from the side column when one existed -- which is
+    # how they ended up painted over Recent activity.
+    my $screen = screen($state, $cols);
+    $screen->{banners} = [];
+    my $cells = tui::Screen::compose($screen, $rows, $cols);
+
+    # WARNINGS ARE OVERLAID LAST, over a frame that is already complete.
+    #
+    # This is deliberately the final step and outside screen(): the overlay must
+    # not participate in layout at all. Composing it earlier -- as the old
+    # install_warning banner did -- is what made an arriving warning shove the
+    # whole panel grid down a row.
+    #
+    # warning_entries() is the single source: lifecycle and status alerts, the
+    # install warning, hot-reload reports, and anything the caller added -- all
+    # of them, with $state->{dismissed_warnings} already applied.
+    my $warn = warning_entries($state);
+    return tui::Screen::overlay_warnings($cells, $warn, $cols) if @$warn;
+
+    return $cells;
 }
 
 1;

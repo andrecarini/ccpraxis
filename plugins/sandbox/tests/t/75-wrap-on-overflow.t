@@ -652,7 +652,19 @@ SKIP: {
     my @marker_words = map { "ZQXW$_" } (1 .. 12);
     my $marker_text  = join(' ', @marker_words);
     my $cols = 30;
-    my $rows = 30;
+    # HEIGHT RAISED 30 -> 40, 2026-08-28. The WIDTH is what this test is about
+    # (30 columns is what forces the marker row to wrap) and it is unchanged.
+    #
+    # The height had to move because the grid was reorganised: Providers now
+    # renders its two provider blocks stacked at this width and wraps to ~13
+    # rows, which pushed the Blueprints panel -- where the marker lives -- past
+    # the bottom of a 30-row frame entirely. The marker was not truncated; the
+    # panel carrying it was never composed, so the assertion was measuring an
+    # absent row rather than a wrapped one.
+    #
+    # 40 rows reaches the panel with room to spare. Verified: the marker occupies
+    # 3 rows at 40, 50 and 60, so this is not balanced on a boundary.
+    my $rows = 40;
 
     # -- DashboardScreen::compose --------------------------------------
     SKIP: {

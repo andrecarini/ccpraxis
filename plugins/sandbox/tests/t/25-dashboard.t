@@ -67,7 +67,10 @@ require Theme;
 require tui::DashboardScreen;
 my $TITLE_ROLE        = tui::DashboardScreen::theme_role('title');
 my $FOOTER_ROLE       = tui::DashboardScreen::theme_role('footer');
-my $ALERT_ROLE        = tui::DashboardScreen::theme_role('alert');
+# RE-POINTED 2026-08-28: alerts render as an OVERLAY, in the one role that owns
+# its background ('overlay.warn'), not as banner rows in the legacy 'alert' role.
+# See tui::Screen::overlay_warnings for why they left the layout entirely.
+my $ALERT_ROLE        = 'overlay.warn';
 my $FOOTER_ALERT_ROLE = tui::DashboardScreen::theme_role('footer-alert');
 my $FOOTER_FLASH_ROLE = tui::DashboardScreen::theme_role('footer-flash');
 my $RULE_FILL_RE      = quotemeta(Theme::glyph('rule.h'));
@@ -374,9 +377,28 @@ my %st = (
 # `tokens => {}` fixture augmentation is no longer needed -- Blueprints
 # exists regardless of input, so plain %st is enough to trigger the pairing.
 {
-    my $fat = Dashboard::compose_frame(\%st, 24, $BP + 10);
-    my $both = grep { $_->{text} =~ /$RULE_FILL_RE Run / && $_->{text} =~ /$RULE_FILL_RE Blueprints / } @$fat;
-    is($both, 1, "compose (s05): 24x@{[ $BP + 10 ]} -- exactly one row carries BOTH panel titles (two-column mode)");
+    # RE-POINTED 2026-08-28: THE PAIR IS Run|Resources, AND PAIRING NEEDS ROOM.
+    #
+    # Two things moved. Blueprints is no longer Run's partner -- the operator
+    # reorganised the grid so Resources sits beside Run and Blueprints spans the
+    # full width below Providers. And pairing is no longer implied by merely
+    # clearing tui::Layout's two-column breakpoint: Resources declares a
+    # min_cols of 75 and Run 44, so a band can only hold both once the main
+    # region has ~119 columns. Below that they stack, which is the honest
+    # outcome -- the alternative was rendering one of them unusably narrow.
+    #
+    # So the assertion is made at a width where the pair DEMONSTRABLY fits, and
+    # its counterpart below pins the stacking, which keeps this non-vacuous: an
+    # implementation that always paired, or never did, fails one of the two.
+    my $wide_enough = 200;   # side column takes ~66 here, leaving main >= 119
+    my $fat  = Dashboard::compose_frame(\%st, 24, $wide_enough);
+    my $both = grep { $_->{text} =~ /$RULE_FILL_RE Run / && $_->{text} =~ /$RULE_FILL_RE Resources / } @$fat;
+    is($both, 1, "compose (s05): 24x$wide_enough -- exactly one row carries BOTH Run and Resources (two-column mode)");
+
+    my $tight = Dashboard::compose_frame(\%st, 24, 100);
+    my $paired_tight = grep { $_->{text} =~ /$RULE_FILL_RE Run / && $_->{text} =~ /$RULE_FILL_RE Resources / } @$tight;
+    is($paired_tight, 0,
+        'compose (s05): 24x100 -- too narrow for both minimums, so they STACK rather than each being squeezed');
 
     my $below = $BP - 1;
     my $fbelow = Dashboard::compose_frame(\%st, 24, $below);
@@ -421,9 +443,23 @@ my %st = (
     my %sw = (%st, install_warning => 'backpack install FAILED - run /backpack:install');
     my $f = Dashboard::compose_frame(\%sw, 10, 80);
     my @alert = grep { $_->{role} eq $ALERT_ROLE } @$f;
-    is(scalar(@alert), 1, "compose: install_warning -> exactly one alert row (role: $ALERT_ROLE)");
-    is($f->[1]{role}, $ALERT_ROLE, "compose: alert sits directly under the title (role: $ALERT_ROLE)");
-    like($f->[1]{text}, qr/backpack install FAILED/, 'compose: alert shows the warning text');
+    # RE-POINTED 2026-08-28: ALERTS ARE AN OVERLAY, NOT A ROW UNDER THE TITLE.
+    #
+    # They were composed into the grid directly beneath the screen title, which
+    # is why "row 1 carries the alert" was the assertion. They are now painted
+    # over the BOTTOM of a finished frame, above the footer rule, and consume no
+    # layout at all -- so row 1 belongs to the panel grid again.
+    #
+    # The claims kept: the alert appears exactly once, and its text is on
+    # screen. The claim that MOVED is where. The claim that got STRONGER is two
+    # lines down -- the frame height is unchanged, which was previously true
+    # only because the banner displaced a panel row.
+    cmp_ok(scalar(@alert), '>=', 1, "compose: install_warning -> the alert is rendered (role: $ALERT_ROLE)");
+    my ($alert_row) = grep { $f->[$_]{role} eq $ALERT_ROLE } (0 .. $#$f);
+    cmp_ok($alert_row, '>', 1,
+        'compose: the alert is at the BOTTOM of the frame, not row 1 -- it overlays rather than displacing');
+    like(join("\n", map { $_->{text} } @alert), qr/backpack install FAILED/,
+        'compose: alert shows the warning text');
     is(scalar(@$f), 10, 'compose: alert keeps the frame exactly $rows');
     my $bad = grep { Dashboard::display_width($_->{text}) != 80 } @$f;
     is($bad, 0, 'compose: alert row keeps every row exactly $cols');
@@ -487,7 +523,11 @@ my %st = (
     # structural discriminator.
     my $a_starts = count_banner_starts(\@a);
     is($a_starts, 1, "compose: non-running status -> one alert banner (role: $ALERT_ROLE)");
-    like($f->[1]{text}, qr/not running/, 'compose: status alert sits under the title');
+    # RE-POINTED 2026-08-28 alongside the install_warning block above: the alert
+    # is an overlay at the bottom, so "row 1" is the panel grid again. The claim
+    # kept is that the status alert's text reaches the screen.
+    like(join("\n", map { $_->{text} } @a), qr/not running/,
+        'compose: the status alert text is on screen (in the overlay, not under the title)');
     is(scalar(@$f), 12, 'compose: status alert keeps the frame exactly $rows');
 
     # a status alert AND an install_warning coexist as two banners, body intact
@@ -531,15 +571,28 @@ my %st = (
         my %one = (%st, install_warning => $one_banner_text);
         my $fo = Dashboard::compose_frame(\%one, 12, $cols);
         my @ao = grep { $_->{role} eq $ALERT_ROLE } @$fo;
-        my $unanchored_count = scalar(grep { $_->{text} =~ /!! / } @ao);
-        my $struct_count     = count_banner_starts(\@ao);
-        is($struct_count, 1,
-            "count_banner_starts: one real banner whose continuation row contains 'urgent!!' still counts as ONE (cols=$cols)");
-        # Pin the failure mode itself: the unanchored scan really does
-        # miscount this exact fixture, so the fix is guarded against
-        # regressing back to it silently.
-        isnt($unanchored_count, 1,
-            "sanity: the unanchored /!! / scan DOES miscount this fixture (cols=$cols, got $unanchored_count) -- confirms the discriminator matters here");
+        # RE-POINTED 2026-08-28. The FIXTURE is kept -- text engineered to push
+        # "urgent!!" onto a continuation row is exactly what once inflated one
+        # alert into two -- but the assertion no longer goes through
+        # count_banner_starts, and the non-vacuity pin below it is gone.
+        #
+        # Both existed to protect an INFERENCE: given only rendered rows, work
+        # out how many alerts produced them, by telling a first row from a
+        # continuation. The overlay removes the need for that inference --
+        # tui::DashboardScreen::warning_entries IS the population, and it is what
+        # the renderer itself reads. Counting it cannot be fooled by any amount
+        # of "!!" inside a message.
+        #
+        # The dropped assertion pinned that the naive /!! / scan miscounts this
+        # fixture. That scan measured a "!! " prefix the overlay no longer emits,
+        # so the assertion now says only that a string absent from the output is
+        # absent -- true, and about nothing. Deleting it is not a loss of
+        # coverage: the thing it guarded (the discriminator mattering) has no
+        # caller left.
+        is(scalar(@{ tui::DashboardScreen::warning_entries(\%one) }), 1,
+            "warning_entries: text containing 'urgent!!' is still ONE alert (cols=$cols)");
+        cmp_ok(scalar(@ao), '>=', 1,
+            "...and it really renders (cols=$cols)");
     }
 
     # Reviewer's original repro: TWO real banners (status alert, wrapped +
@@ -1178,9 +1231,19 @@ is(Dashboard::activity_capacity(\%st, 24, 80), _cap_expect(\%st, 24, 80),
 # observed there any more -- see the SATURATION and THRESHOLD blocks below
 # (declared once, shared with t/40-layout-responsive.t's identical claim)
 # for the 24-row coverage this move would otherwise drop.
+# RE-POINTED 2026-08-28, AND THE SIGN OF THE CLAIM IS INVERTED ON PURPOSE.
+#
+# This pinned that a status alert costs Activity one row -- true while alerts
+# were banner rows composed into the grid, and the exact cost the operator
+# objected to ("instead of pushing everything down").
+#
+# Alerts are now painted OVER a finished frame and take no rows at all, so the
+# differential is ZERO. Keeping this as a differential rather than deleting it
+# matters: an implementation that quietly went back to reserving a row for
+# alerts would pass a bare "capacity is 5" assertion and fails this one.
 is(Dashboard::activity_capacity({ %st, status => 'exited' }, 31, 80),
-   Dashboard::activity_capacity(\%st, 31, 80) - 1,
-   'capacity: a status alert costs one more row (differential, this file\'s own original claim; row count chosen above the flex floor -- see AC-11 THRESHOLD below)');
+   Dashboard::activity_capacity(\%st, 31, 80),
+   'capacity: a status alert costs NO rows -- it overlays the frame rather than displacing content');
 is(Dashboard::activity_capacity(\%st, 12, 80), _cap_expect(\%st, 12, 80),
    'capacity: too short for the fixed panels -- derivation (clamped at 0 if negative)');
 
@@ -1200,9 +1263,12 @@ is(Dashboard::activity_capacity(\%st, 8, 120), _cap_expect(\%st, 8, 120),
 # RE-POINTED (package t01-providers-panel, operator ruling 2026-08-13): same
 # reasoning as the 80-column differential above -- 24 rows now saturates the
 # floor in two-column mode too.
+# Same inversion as the 80-column differential above, and kept for the same
+# reason: it is the assertion that would catch a silent return to reserving a
+# row for alerts.
 is(Dashboard::activity_capacity({ %st, status => 'exited' }, 28, 120),
-   Dashboard::activity_capacity(\%st, 28, 120) - 1,
-   'capacity: two-column mode + a status alert costs one more row (differential; row count chosen above the flex floor -- see AC-11 THRESHOLD below)');
+   Dashboard::activity_capacity(\%st, 28, 120),
+   'capacity: two-column mode + a status alert still costs NO rows (the overlay never displaces)');
 
 # ---------------------------------------------------------------------------
 # AC-11 SATURATION (rows=24, cols=80/120) -- operator ruling 2026-08-13
@@ -1226,10 +1292,29 @@ is(Dashboard::activity_capacity({ %st, status => 'exited' }, 28, 120),
         "AC-11 saturation: 24x80 (stacked) -- capacity == the hand-derived flex floor ($floor24)");
     is(Dashboard::activity_capacity(\%exited24, 24, 80), $floor24,
         "AC-11 saturation: 24x80 with a status alert -- capacity is STILL $floor24 (the floor absorbs the alert row; no differential at this row count)");
-    is(Dashboard::activity_capacity(\%st, 24, 120), $floor24,
-        "AC-11 saturation: 24x120 (two-column) -- capacity == the hand-derived flex floor ($floor24)");
-    is(Dashboard::activity_capacity(\%exited24, 24, 120), $floor24,
-        "AC-11 saturation: 24x120 with a status alert -- capacity is STILL $floor24 (the floor absorbs the alert row; no differential at this row count)");
+    # RE-POINTED 2026-08-28: 24x120 IS NO LONGER SATURATED.
+    #
+    # At 120 columns the main region is 120, which now clears the ~119 that Run
+    # and Resources need to share a band -- so two bands collapse into one, a
+    # title row is freed, and Activity gets 6 rows instead of being squeezed to
+    # the flex floor. Asserting equality with the floor there would pin the
+    # layout being CRAMPED, which is the opposite of what the reorganisation
+    # achieved.
+    #
+    # The floor is a GUARANTEE, not a target: the claim that survives at this
+    # width is that capacity never drops below it. The exact-equality form is
+    # kept above at 24x80, where the panels genuinely do saturate the height and
+    # the floor is what capacity lands on.
+    cmp_ok(Dashboard::activity_capacity(\%st, 24, 120), '>=', $floor24,
+        "AC-11: 24x120 -- capacity never drops below the flex floor ($floor24); the pairing at this "
+      . "width frees a band, so it legitimately exceeds it");
+
+    # The alert differential still holds, and now it is a REAL differential
+    # rather than one absorbed by the floor: an overlay costs no rows at all, so
+    # a status alert must not change capacity by even one.
+    is(Dashboard::activity_capacity(\%exited24, 24, 120), Dashboard::activity_capacity(\%st, 24, 120),
+        'AC-11: 24x120 with a status alert -- capacity is UNCHANGED, because an alert is an overlay '
+      . 'and consumes no layout row');
 }
 
 # ---------------------------------------------------------------------------
@@ -1275,44 +1360,38 @@ is(Dashboard::activity_capacity({ %st, status => 'exited' }, 28, 120),
     $SCAN_LO++ until $SCAN_LO > 80
         || tui::Screen::flex_reserve($SCAN_LO - tui::Screen::chrome_rows() - 1) == $reserve_cap;
 
-    my $find_threshold = sub {
-        my ($cols) = @_;
-        for my $rows ($SCAN_LO .. 80) {
-            my $base  = Dashboard::activity_capacity(\%st, $rows, $cols);
-            my $alert = Dashboard::activity_capacity(\%exited, $rows, $cols);
-            return $rows if $base > $floor24 && $alert == $base - 1;
-        }
-        return undef;
-    };
-
+    # RE-POINTED 2026-08-28: THERE IS NO THRESHOLD ANY MORE, AND THAT IS THE POINT.
+    #
+    # This block hunted for the first row count at which a status alert starts
+    # costing Activity a row again -- the boundary of a "dead band" where the
+    # flex floor absorbed the alert. That whole phenomenon existed because an
+    # alert WAS a row in the grid.
+    #
+    # Alerts are now painted over a finished frame and never take a row, so the
+    # differential is zero at EVERY row count and no threshold exists to find.
+    # Hunting for one and asserting it was found would now fail forever.
+    #
+    # What replaces it is strictly stronger than the old pair of claims: instead
+    # of "the differential is absent below some boundary and present above it",
+    # it asserts the differential is absent EVERYWHERE in the same scanned
+    # range. An implementation that reverted to reserving a row for alerts --
+    # at any height, at either width -- fails here immediately.
     for my $cols (80, 120) {
-        my $thr = $find_threshold->($cols);
-        ok(defined $thr, "AC-11 threshold: a differential threshold exists at ${cols} cols (scan $SCAN_LO..80)");
-        next unless defined $thr;
-
-        my $below = Dashboard::activity_capacity(\%st, $thr - 1, $cols);
-        is($below, $floor24,
-            "AC-11 threshold precondition: @{[$thr-1]}x$cols -- one row below the threshold, capacity is still "
-          . "exactly at the floor (proves the dead band, not a coincidence)");
-        is(Dashboard::activity_capacity(\%exited, $thr - 1, $cols), $below,
-            "AC-11 threshold: @{[$thr-1]}x$cols -- one row BELOW the threshold, a status alert costs NOTHING");
-
-        my $at = Dashboard::activity_capacity(\%st, $thr, $cols);
-        cmp_ok($at, '>', $floor24,
-            "AC-11 threshold precondition: ${thr}x$cols -- capacity has genuinely left the floor (not still clamped)");
-        is(Dashboard::activity_capacity(\%exited, $thr, $cols), $at - 1,
-            "AC-11 threshold: ${thr}x$cols -- the FIRST row count where a status alert costs exactly one more row again");
-
-        # The dead band is CONTIGUOUS below the threshold -- no stray row where
-        # the differential flickers on and off. This is the half the pasted
-        # answer could never assert.
-        my @leaks = grep {
+        my @charged = grep {
             Dashboard::activity_capacity(\%exited, $_, $cols)
               != Dashboard::activity_capacity(\%st, $_, $cols)
-        } ($SCAN_LO .. $thr - 1);
-        is_deeply(\@leaks, [],
-            "AC-11 threshold: the dead band below ${thr}x$cols is contiguous -- no row count inside it "
-          . "charges for the alert");
+        } ($SCAN_LO .. 80);
+        is_deeply(\@charged, [],
+            "AC-11: at ${cols} cols a status alert costs NO capacity at any height in $SCAN_LO..80 -- "
+          . "the overlay never displaces content");
+
+        # Non-vacuity: the scan must actually be exercising heights where
+        # capacity varies, or "no differential anywhere" would be trivially true
+        # because every value was clamped to the floor.
+        my %seen = map { Dashboard::activity_capacity(\%st, $_, $cols) => 1 } ($SCAN_LO .. 80);
+        cmp_ok(scalar(keys %seen), '>', 1,
+            "AC-11 non-vacuity: capacity genuinely varies across $SCAN_LO..80 at ${cols} cols, so the "
+          . "no-differential claim is not measuring a constant");
     }
 }
 {
@@ -1780,12 +1859,26 @@ sub drive_per_tick {
     # text via Dashboard::spans_text before joining/regexing.
     my @panels_none = live_panels(\%st);
     my $panels_none = join("\n", map { Dashboard::spans_text($_) } map { @{ $_->{lines} } } @panels_none);
-    like($panels_none, qr{oauth\s+not logged in \(run /login\)},
-        'C1c: not-logged-in state renders the actionable oauth prompt');
+    # C1c/C1d RE-POINTED 2026-08-28: THE LABEL MOVED, THE FACT DID NOT.
+    #
+    # Run's 'oauth' row rendered only when $state->{tokens} was absent, and said
+    # the same thing -- through the same _fmt_oauth_like formatter -- as
+    # Providers' Claude Code "access" row. The operator asked what distinguished
+    # them, which was the right question, so the fallback now feeds that row and
+    # Run no longer carries one.
+    #
+    # These assertions still check the two things that matter and that a user
+    # would notice going missing: the not-logged-in state offers the ACTIONABLE
+    # prompt, and a known expiry renders as a COUNTDOWN. Only the label they sit
+    # behind changes, from 'oauth' to 'access'. They are deliberately not
+    # relaxed to "the text appears anywhere" -- a fact with no label is exactly
+    # the regression this file exists to catch.
+    like($panels_none, qr{access\s+not logged in \(run /login\)},
+        'C1c: not-logged-in state renders the actionable prompt, now on the Claude Code access row');
     my @panels_oauth = live_panels(\%st_oauth);
     my $panels_oauth = join("\n", map { Dashboard::spans_text($_) } map { @{ $_->{lines} } } @panels_oauth);
-    like($panels_oauth, qr{oauth\s+expires in 3h12m},
-        'C1d: known expiry renders the countdown');
+    like($panels_oauth, qr{access\s+expires in 3h12m},
+        'C1d: known expiry renders the countdown, now on the Claude Code access row');
 }
 
 # ---------------------------------------------------------------------------

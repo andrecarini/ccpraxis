@@ -284,9 +284,53 @@ sub _run_live {
         SKIP: {
             skip 'compose_frame died', 6 if $@;
             my $row0 = $frame->[0];
-            my $spin = eval { tui::DashboardScreen::_spinner_frame($idx) } // '';
-            like($row0->{text}, qr/\[\Q$spin\E \Q$case->{status}\E\]/,
-                "AC-4 ($case->{label}): B4 -- spinner glyph sits immediately before the status word inside [...]");
+
+            # RE-POINTED 2026-08-27: THE SPINNER ONLY SPINS WHEN RUNNING.
+            #
+            # This expected the animated spinner frame in EVERY case, including
+            # stopped, exited and container_gone -- so it pinned, as correct, a
+            # progress animation attached to states that are by definition not
+            # progressing. The operator reported it as a bug: "[spinner exited]
+            # no reason for a spinner if the status is exited."
+            #
+            # The header now matches the rule the window title already followed:
+            # animate while running, and otherwise show the STATIC glyph for the
+            # state's own role. The assertion keeps its shape -- a glyph
+            # immediately before the status word inside [...] -- and only the
+            # expected glyph becomes conditional, so B4 still fails if the lead
+            # character goes missing or drifts away from the status word.
+            #
+            # The expected static glyph is DERIVED from _container_role, not
+            # typed here, so it cannot drift from the mapping the renderer uses.
+            my %STATIC_FOR_ROLE = (
+                'state.ok'   => 'status.ok',
+                'state.warn' => 'status.warn',
+                'state.crit' => 'status.crit',
+                'state.idle' => 'status.idle',
+            );
+            my $spinning = ($case->{status} eq 'running' && !$case->{gone}) ? 1 : 0;
+            my $lead;
+            if ($spinning) {
+                $lead = eval { tui::DashboardScreen::_spinner_frame($idx) } // '';
+            }
+            else {
+                my $pres = tui::DashboardScreen::container_presentation($case->{status}, $case->{gone});
+                my $tok  = tui::DashboardScreen::container_glyph('header', $pres);
+                $lead = defined($tok) ? (Theme::glyph($tok) // '') : '';
+            }
+
+            # THE WORD IS THE STATUS STRING -- EXCEPT WHEN THE CONTAINER IS
+            # GONE. There the captured status is stale by definition (we tried
+            # to reach the container and could not), so the header says
+            # 'unreachable' instead of repeating it. Without this the assertion
+            # expected "[<warning glyph> running]", which is the self-
+            # contradiction the override exists to remove.
+            my $word = tui::DashboardScreen::container_presentation($case->{status}, $case->{gone})->{word}
+                    // $case->{status};
+            like($row0->{text}, qr/\[\Q$lead\E \Q$word\E\]/,
+                "AC-4 ($case->{label}): B4 -- the lead glyph ("
+              . ($spinning ? 'animated spinner' : 'static state glyph')
+              . ") sits immediately before the status word inside [...]");
             is(Dashboard::display_width($row0->{text}), 80,
                 "AC-4 ($case->{label}): B4 -- display_width(title text) == 80");
             unlike($row0->{text}, qr/[\e\a]/, "AC-4 ($case->{label}): B4 -- title text contains no ESC/BEL");
@@ -303,13 +347,18 @@ sub _run_live {
             # or from the mapping table.
             my $expect_role = tui::DashboardScreen::theme_role($expect_legacy_role);
             my @spans = @{ $row0->{spans} || [] };
-            my ($status_span) = grep { $_->{text} eq $case->{status} } @spans;
+            my ($status_span) = grep { $_->{text} eq $word } @spans;
             ok($status_span, "AC-4 ($case->{label}): B6 -- a span carries the bare status word");
             is($status_span->{role}, $expect_role,
                 "AC-4 ($case->{label}): B6 -- status span role == theme_role(container_status_style(...)[1]) ('$expect_role')")
                 if $status_span;
-            my ($spin_span) = grep { $_->{text} eq "$spin " } @spans;
-            ok($spin_span, "AC-4 ($case->{label}): B6 -- a span carries the spinner glyph");
+            # Same re-pointing as B4: the lead span carries the animated frame
+            # only while running, and the static state glyph otherwise. $lead is
+            # derived above, so this stays a differential against the renderer's
+            # own mapping rather than a hand-typed glyph.
+            my ($spin_span) = grep { $_->{text} eq "$lead " } @spans;
+            ok($spin_span, "AC-4 ($case->{label}): B6 -- a span carries the lead glyph ("
+              . ($spinning ? 'animated spinner' : 'static state glyph') . ")");
             is($spin_span->{role}, $expect_role,
                 "AC-4 ($case->{label}): B6 -- spinner span role == theme_role(container_status_style(...)[1]) ('$expect_role')")
                 if $spin_span;
@@ -528,17 +577,72 @@ sub _run_live {
 # instruction (S2.2's "bp-test-writer hard-codes these" table).
 # ===========================================================================
 {
-    is(eval { Dashboard::window_title({ project_name => 'demo', status => 'running' }) }, '* demo' . " - ccpraxis sandbox",
-        "AC-8/B8: window_title(running) eq '* demo - ccpraxis sandbox'");
+    # RE-POINTED 2026-08-28: the lead characters are operator-chosen glyphs now,
+    # and they live in Theme (title.*) rather than being ASCII literals here.
+    #
+    # The spec's original "hard-code these five characters" instruction is
+    # deliberately NOT followed any more, and that is a downgrade worth stating:
+    # a hard-coded expectation is a stronger oracle. It is replaced by a
+    # derivation from Theme because the alternative -- pasting the same glyph
+    # into two files -- is what let the podman status list drift out of sync in
+    # the first place. The GLYPH is derived; the MAPPING (which state gets which
+    # glyph) is still asserted here, and that is the part with the intent in it.
+    #
+    # No title_spinner_idx is supplied in this block, so 'running' exercises the
+    # fallback path, which is now '?' (operator: the bug-path fallback should
+    # use the same glyph as "status unknown", because that is what it means).
+    my $G = sub {
+        # Mirrors window_title's own helper: the title appends U+FE0E to force
+        # TEXT presentation on these emoji-capable codepoints. The glyph table
+        # deliberately does NOT carry it (the header's sanitiser strips
+        # zero-width characters), so the selector is part of what the TITLE
+        # emits and therefore part of what this oracle must expect.
+        my $g = Theme::glyph($_[0]);
+        return $_[1] unless defined $g && length $g;
+        return $g . "︎";
+    };
 
-    for my $status (qw(paused created restarting stopping stopped)) {
-        is(eval { Dashboard::window_title({ project_name => 'demo', status => $status }) }, '- demo' . " - ccpraxis sandbox",
-            "AC-8: window_title(status=$status) eq '- demo - ccpraxis sandbox' (stopped family)");
+    is(eval { Dashboard::window_title({ project_name => 'demo', status => 'running' }) },
+        '? demo - ccpraxis sandbox',
+        "AC-8/B8: window_title(running) with NO spinner index falls back to '?' -- the "
+      . "same glyph as an unrecognised status, because both mean 'could not determine'");
+
+    # RE-POINTED 2026-08-28 to the operator's regrouping, which is finer than the
+    # old two families:
+    #
+    #   coming up   created, initialized, restarting   spinner + pause glyph
+    #   stopped     exited, stopped, paused, dead      exited glyph, no spinner
+    #   ending      stopping, removing                 spinner + exited glyph
+    #   unreachable unknown, container_gone            warning glyph, no spinner
+    #
+    # The SPINNER is the new axis: a state that is mid-transition animates, so
+    # "something is happening" survives taskbar truncation (which keeps the
+    # first character) while the glyph after it says what.
+    #
+    # A spinner index is pinned here so the expectation is deterministic -- the
+    # block above deliberately omits it to exercise the fallback, which is a
+    # different claim.
+    my $sp = eval { Dashboard::_title_spinner_char(0) };
+
+    for my $status (qw(created initialized restarting)) {
+        is(eval { Dashboard::window_title({ project_name => 'demo', status => $status, title_spinner_idx => 0 }) },
+            "$sp " . $G->('title.paused', '-') . " demo - ccpraxis sandbox",
+            "AC-8: window_title(status=$status) spins, then shows the pause glyph (coming up)");
     }
-    for my $status (qw(dead removing unknown exited)) {
-        is(eval { Dashboard::window_title({ project_name => 'demo', status => $status }) }, 'x demo' . " - ccpraxis sandbox",
-            "AC-8: window_title(status=$status) eq 'x demo - ccpraxis sandbox' (exited family)");
+    for my $status (qw(exited stopped paused dead)) {
+        is(eval { Dashboard::window_title({ project_name => 'demo', status => $status, title_spinner_idx => 0 }) },
+            $G->('title.exited', 'x') . " demo - ccpraxis sandbox",
+            "AC-8: window_title(status=$status) shows the exited glyph and does NOT spin (stopped)");
     }
+    for my $status (qw(stopping removing)) {
+        is(eval { Dashboard::window_title({ project_name => 'demo', status => $status, title_spinner_idx => 0 }) },
+            "$sp " . $G->('title.exited', 'x') . " demo - ccpraxis sandbox",
+            "AC-8: window_title(status=$status) spins, then shows the exited glyph (ending)");
+    }
+    is(eval { Dashboard::window_title({ project_name => 'demo', status => 'unknown', title_spinner_idx => 0 }) },
+        $G->('title.gone', '?') . " demo - ccpraxis sandbox",
+        "AC-8: window_title(status=unknown) shows the UNREACHABLE glyph -- podman reporting an "
+      . "unreadable container is the same practical situation as not reaching it at all");
     # AC-8 RE-POINTED 2026-08-26. `!` used to REPLACE the spinner; the operator
     # asked for it to follow instead ("I wish the `!` would appear after the
     # spinner instead of replacing it"), and the distinction is real: `x`, `-`
@@ -555,7 +659,13 @@ sub _run_live {
         my %needy = (project_name => 'demo', status => 'running', needs_you => 1, title_spinner_idx => 0);
         my $spin  = eval { tui::DashboardScreen::_spinner_frame(0) };
         my $got   = eval { Dashboard::window_title(\%needy) };
-        is($got, "$spin! demo - ccpraxis sandbox",
+        # RE-POINTED 2026-08-28: a SPACE between the spinner and the '!'.
+        # Butted together they read as one two-character glyph, and because the
+        # braille frame changes shape every tick the pair looked like a
+        # different symbol each frame. They are two independent signals
+        # ("alive", "needs you"), so they are spaced like two signals. The
+        # assertion still pins both claims -- spinner leads, '!' follows.
+        is($got, "$spin " . $G->("title.needs","!") . " demo - ccpraxis sandbox",
             'AC-8: window_title(running, needs_you=1) leads with the SPINNER and appends "!" -- '
           . 'both facts, not one replacing the other');
         my $calm = eval { Dashboard::window_title({ %needy, needs_you => 0 }) };
@@ -563,21 +673,25 @@ sub _run_live {
             'AC-8: ...and with nothing needed the same frame renders WITHOUT the "!" -- the '
           . 'marker tracks needs_you, not the spinner');
     }
-    is(eval { Dashboard::window_title({ project_name => 'demo', container_gone => 1 }) }, '? demo' . " - ccpraxis sandbox",
+    is(eval { Dashboard::window_title({ project_name => 'demo', container_gone => 1 }) }, $G->('title.gone','?') . ' demo - ccpraxis sandbox',
         "AC-8: window_title(container_gone=1) eq '? demo - ccpraxis sandbox'");
 
     # Precedence: gone > exited > stopped > escalations > running > fallback.
-    is(eval { Dashboard::window_title({ project_name => 'demo', status => 'running', container_gone => 1 }) }, '? demo' . " - ccpraxis sandbox",
+    is(eval { Dashboard::window_title({ project_name => 'demo', status => 'running', container_gone => 1 }) }, $G->('title.gone','?') . ' demo - ccpraxis sandbox',
         "AC-8: precedence -- container_gone=1 with status='running' -> '?' (gone beats running)");
-    is(eval { Dashboard::window_title({ project_name => 'demo', status => 'exited', needs_you => 3 }) }, 'x demo' . " - ccpraxis sandbox",
+    is(eval { Dashboard::window_title({ project_name => 'demo', status => 'exited', needs_you => 3 }) }, $G->('title.exited','x') . ' demo - ccpraxis sandbox',
         "AC-8: precedence -- status='exited' with needs_you=3 -> 'x' (exited beats escalations)");
-    is(eval { Dashboard::window_title({ project_name => 'demo', status => 'stopped', needs_you => 5 }) }, '- demo' . " - ccpraxis sandbox",
-        "AC-8: precedence -- status='stopped' with needs_you=5 -> '-' (stopped beats escalations)");
+    # 'stopped' joined the EXITED family on 2026-08-28 (operator: give stopped
+    # the same treatment as exited), so the expected glyph moved with it. The
+    # claim is unchanged: the container's state beats the escalation marker,
+    # because needs-you only appends while the sandbox is actually running.
+    is(eval { Dashboard::window_title({ project_name => 'demo', status => 'stopped', needs_you => 5 }) }, $G->('title.exited','x') . ' demo - ccpraxis sandbox',
+        "AC-8: precedence -- status='stopped' with needs_you=5 shows the exited glyph (state beats escalations)");
 
     # needs_you non-numeric / negative / undef counts as 0.
     for my $nc (undef, -3, 'abc', 0) {
         my $label = defined $nc ? "'$nc'" : 'undef';
-        is(eval { Dashboard::window_title({ project_name => 'demo', status => 'running', needs_you => $nc }) }, '* demo' . " - ccpraxis sandbox",
+        is(eval { Dashboard::window_title({ project_name => 'demo', status => 'running', needs_you => $nc }) }, '? demo - ccpraxis sandbox',
             "AC-8: needs_you=$label counts as 0 -> '* demo - ccpraxis sandbox' (not '!')");
     }
 }
@@ -592,8 +706,11 @@ sub _run_live {
     my $ascii_re = qr/\A[\x20-\x7E]{1,80}\z/;
 
     # B10: no project name -> no trailing space.
-    is(eval { Dashboard::window_title({ status => 'running' }) }, "* - ccpraxis sandbox",
-        "AC-9/B10: window_title(no project_name) eq '*' (no trailing space)");
+    # '?' not '*': with no title_spinner_idx this is the fallback path, and the
+    # fallback glyph is now '?' (see the AC-8 block). The CLAIM here is about
+    # the trailing space, not the glyph.
+    is(eval { Dashboard::window_title({ status => 'running' }) }, "? - ccpraxis sandbox",
+        "AC-9/B10: window_title(no project_name) has no trailing space before the suffix");
 
     # B15 (edge case): {} -> title '?'.
     is(eval { Dashboard::window_title({}) }, "? - ccpraxis sandbox", "AC-9: window_title({}) eq '?'");
@@ -607,10 +724,10 @@ sub _run_live {
     }
 
     # B9: non-ASCII project name (decoded-char path and UTF-8-byte path).
-    is(eval { Dashboard::window_title({ project_name => "Andr\x{E9}", status => 'running' }) }, "* Andr? - ccpraxis sandbox",
-        "AC-9/B9: window_title(project_name='Andr\\x{E9}' decoded) eq '* Andr?'");
-    is(eval { Dashboard::window_title({ project_name => encode('UTF-8', "Andr\x{E9}"), status => 'running' }) }, "* Andr? - ccpraxis sandbox",
-        "AC-9/B9: window_title(project_name='Andr\\x{E9}' UTF-8 bytes) eq '* Andr?'");
+    is(eval { Dashboard::window_title({ project_name => "Andr\x{E9}", status => 'running' }) }, "? Andr? - ccpraxis sandbox",
+        "AC-9/B9: window_title(project_name='Andr\\x{E9}' decoded) eq '? Andr?'");
+    is(eval { Dashboard::window_title({ project_name => encode('UTF-8', "Andr\x{E9}"), status => 'running' }) }, "? Andr? - ccpraxis sandbox",
+        "AC-9/B9: window_title(project_name='Andr\\x{E9}' UTF-8 bytes) eq '? Andr?'");
 
     # B9: control bytes, an SGR escape, and a literal BEL in the project name.
     for my $case (
@@ -633,7 +750,8 @@ sub _run_live {
         is($@, '', 'AC-9/B9: window_title(500-char project name) does not die');
         like($got, $ascii_re, 'AC-9/B9: window_title(500-char project name) matches the ASCII-safe regex');
         is(length($got // ''), 80, 'AC-9/B9: window_title(500-char project name) truncates to exactly 80 chars');
-        is($got, "* " . ("x" x 59) . " - ccpraxis sandbox", "AC-9/B9: window_title(500-char project name) eq '* ' + 78 x's (plain truncation)");
+        is($got, "? " . ("x" x 59) . " - ccpraxis sandbox",
+            "AC-9/B9: window_title(500-char project name) truncates the NAME and keeps both the lead glyph and the suffix");
     }
 
     is(scalar(@warnings), 0, 'AC-9: no warnings emitted across any window_title call above');
@@ -674,8 +792,13 @@ sub _run_live {
         # to the frame ORDER cannot pass here by coincidence.
         is($osc_b12[0], "\e]0;$SPINNER_BYTES[0] demo - ccpraxis sandbox\a",
             "AC-10/B12: first OSC payload carries title spinner frame 0 (running animates)");
-        is($osc_b12[1], "\e]0;x demo - ccpraxis sandbox\a",
-            "AC-10/B12: second OSC payload is exactly 'x demo - ccpraxis sandbox' (exited)");
+        # Theme::glyph returns UTF-8 BYTES, which is what an OSC payload carries
+        # -- and it keeps this file free of the glyph literal, which matters
+        # because this oracle must not `use utf8` (see the header).
+        # The trailing bytes are U+FE0E, appended by window_title to force text
+        # presentation (see its helper). The glyph TABLE does not carry it.
+        is($osc_b12[1], "\e]0;" . Theme::glyph('title.exited') . "\xef\xb8\x8e demo - ccpraxis sandbox\a",
+            "AC-10/B12: second OSC payload carries the exited glyph and the project name");
     }
 }
 
@@ -802,6 +925,45 @@ sub _run_live {
         'AC-14: one $ticks line is the increment ($ticks++)');
     ok((grep { /\$ticks\s*>=\s*\$o\{max_ticks\}/ } @ticks_lines) ? 1 : 0,
         'AC-14: one $ticks line is the max_ticks guard ($ticks >= $o{max_ticks})');
+}
+
+
+# ===========================================================================
+# PODMAN'S REAL STATUS SET -- both classifiers, one list.
+#
+# Added 2026-08-28 after 'initialized' was found unclassified in BOTH
+# tui::DashboardScreen::_container_role (the header) and
+# Dashboard::container_status_style (the window title). The lists had been
+# written from memory of DOCKER's state names; podman's actual set comes from
+# libpod/define/containerstate.go, whose String() values are:
+#
+#   created initialized running stopped paused exited stopping removing unknown
+#
+# The failure mode was silent and asymmetric: a container created in the OCI
+# runtime but not started rendered as a transitional state in one place and as
+# "unrecognised" in the other. So this pins the SET, and pins that the two
+# classifiers AGREE -- the duplication is the hazard, so agreement is the thing
+# asserted rather than either list's contents.
+# ===========================================================================
+{
+    my %expect = (
+        created     => 'warn', initialized => 'warn', running  => 'good',
+        stopped     => 'bad',  paused      => 'bad',  exited   => 'bad',
+        stopping    => 'bad',  removing    => 'bad',  unknown  => 'bad',
+    );
+    my %theme_for = (good => 'state.ok', warn => 'state.warn',
+                     bad  => 'state.crit', muted => 'state.idle');
+
+    for my $st (sort keys %expect) {
+        my (undef, $legacy) = Dashboard::container_status_style($st, 0);
+        is($legacy, $expect{$st},
+            "PODMAN-SET: window title classifies '$st' as $expect{$st}");
+        isnt($legacy, 'muted',
+            "PODMAN-SET: '$st' is a REAL podman status, so it must never fall through to 'unrecognised'");
+        my $role = tui::DashboardScreen::_container_role($st, 0);
+        is($role, $theme_for{ $expect{$st} },
+            "PODMAN-SET: header agrees with the title for '$st' (the two lists must not drift)");
+    }
 }
 
 done_testing();

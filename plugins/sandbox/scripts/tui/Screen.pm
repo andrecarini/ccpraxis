@@ -182,6 +182,36 @@ sub SIDE_COLUMN_MIN_MAIN { tui::Layout::BREAKPOINT_TWO_COL() }
 # The cap is 2x because that is what was asked for. Uncapped floor(cols/3) was
 # the alternative and was rejected: a 400-column terminal would hand the column
 # 133 columns, which starves nothing but stops looking like a side column.
+# side_border_width() -> 1 when a vertical rule separates the side column from
+# the main region, else 0. PUBLIC, pure.
+#
+# The border is charged to the side column's own width, so anything that needs
+# the column's usable BODY width must subtract it. compose() derives this
+# locally as $side_bw; it now reads this instead, so there is one answer.
+sub side_border_width {
+    my $g = Theme::glyph('rule.v');
+    return (defined $g && length $g) ? 1 : 0;
+}
+
+# side_column_body_width($cols) -> the columns the side panel's CONTENT gets,
+# i.e. the column minus its border. 0 when there is no side column. PUBLIC, pure.
+#
+# THIS EXISTS BECAUSE A CALLER USED $cols AND WAS SILENTLY WRONG. Activity's
+# scroll indicator is overlaid onto its first/last visible row and justified to
+# a width the caller supplies; Dashboard passed the FULL TERMINAL width while
+# the rows themselves are only as wide as this column. The indicator was
+# therefore justified to a column far outside the panel and clipped, so the
+# "N more above/below" markers never appeared -- for as long as the side column
+# has existed, at its old fixed width just as much as at its current variable
+# one.
+sub side_column_body_width {
+    my ($cols) = @_;
+    my $w = side_column_width($cols);
+    return 0 if $w <= 0;
+    my $b = $w - side_border_width();
+    return $b > 0 ? $b : 0;
+}
+
 sub side_column_width {
     my ($cols) = @_;
     return 0 if !defined $cols || ref($cols) || $cols !~ /^-?\d+(?:\.\d+)?$/;
@@ -908,7 +938,7 @@ sub compose {
     # left is a panel title rule ending there; one leaving to the right is the
     # side column's own title rule starting there.
     my $side_sep = Theme::glyph('rule.v');
-    my $side_bw  = (defined $side_sep && length $side_sep) ? 1 : 0;
+    my $side_bw  = side_border_width();   # one answer, shared with side_column_body_width
     # BANNERS SIT ABOVE THE ACTIVITY PANEL, INSIDE THE COLUMN. They are the
     # newest and most urgent thing on screen, so they take the rows the eye
     # reaches first; the activity panel renders into whatever is left, which is
@@ -962,6 +992,104 @@ sub compose {
 
     return [ $header_row, @body_cells,
              _footer_rule_cell($body_cells[-1], $cols), $footer_cell ];
+}
+
+# overlay_warnings(\@cells, \@warnings, $cols) -> \@cells
+#
+# Paints warnings over the BOTTOM rows of an already-composed frame, in place,
+# WITHOUT CHANGING THE ROW COUNT. PUBLIC.
+#
+# WHY AN OVERLAY AND NOT A BANNER. Warnings used to be banner rows: they were
+# composed into the layout above the panel grid, so every arriving warning
+# shoved the whole screen down a row and every dismissal pulled it back up. On a
+# dashboard whose panels are already fighting for height that is the worst place
+# to spend a row, and the movement itself was the complaint -- the operator's
+# words were that it should appear "without moving anything, just overlay it on
+# top of whatever was in it before. Like it's a pop up."
+#
+# So this runs AFTER placement and consumes no layout budget at all. The frame
+# it returns has exactly as many cells as the one it was given; only their
+# contents differ. Nothing above the overlay is re-laid-out, which is precisely
+# the property that makes a warning arriving cost nothing.
+#
+# STACKING GROWS UPWARD, newest nearest the top of the stack, because the footer
+# edge is the anchor: a new warning must not shift the position of one the
+# operator is already reading, and appending downward would push the stack off
+# the bottom of the terminal.
+#
+# Each entry is { id => ..., text => ... }. The id is the dismissal handle; this
+# function neither dismisses nor remembers anything -- the caller owns that
+# state, so the same frame can be recomposed identically.
+sub overlay_warnings {
+    my ($cells, $warnings, $cols) = @_;
+    return $cells if ref($cells) ne 'ARRAY' || !@$cells;
+    return $cells if ref($warnings) ne 'ARRAY' || !@$warnings;
+    $cols = 0 if !defined $cols || ref($cols) || $cols !~ /^-?\d+(?:\.\d+)?$/;
+    $cols = int($cols);
+    return $cells if $cols < 1;
+
+    # Oldest first in the array; the stack is built from the footer upward, so
+    # the newest ends up on top.
+    my @rows;
+    for my $w (reverse @$warnings) {
+        next unless ref($w) eq 'HASH';
+        my $text = defined $w->{text} ? $w->{text} : '';
+        my $key  = defined $w->{key}  ? $w->{key}  : 'w';
+        # The dismissal key is part of the message, not documented elsewhere: a
+        # popup you cannot work out how to close is a worse defect than the one
+        # it is reporting.
+        my $line = ' ' . $text . '  [' . $key . '] dismiss ';
+        my $wrapped = tui::Frame::wrap_line($line, 'overlay.warn', $cols, 1);
+        push @rows, @{ ref($wrapped) eq 'ARRAY' ? $wrapped : [] };
+    }
+    return $cells unless @rows;
+
+    # THE FOOTER IS NEVER COVERED, and the reason is not aesthetic: the footer
+    # carries the hotkeys, INCLUDING the key that dismisses this overlay. Anchor
+    # the stack over it and the popup hides its own escape hatch -- which is
+    # exactly what the first version did, and what the operator reported: "The
+    # warnings banner stacks on top of the footer containing the hotkeys."
+    #
+    # So the stack is anchored to the row ABOVE the footer rule and grows upward
+    # from there. Both reserved rows are derived from tui::Screen's own chrome
+    # constants rather than restated, so a change to the footer's shape moves
+    # this with it.
+    # THE HEADER IS RESERVED TOO, not just the footer.
+    #
+    # The footer is protected because it carries the dismissal key. The header
+    # is protected because it is the row that says WHICH sandbox this is and
+    # whether it is alive -- on a very short terminal the overlay would
+    # otherwise consume it, and a warning that hides the identity of the thing
+    # it is warning about is a poor trade.
+    #
+    # Concretely: at rows=3 (title, footer rule, footer) there is no space that
+    # is not chrome, and the overlay correctly renders nothing. That restores
+    # the contract the banner had -- t/25 pins "rows<4 suppresses the alert" --
+    # which was lost when alerts stopped being laid out and started being
+    # painted.
+    my $reserve = 1 + FOOTER_RULE_ROWS();     # the footer row, and its rule
+    my $room    = scalar(@$cells) - $reserve - 1;   # -1: never cover the header
+    return $cells if $room < 1;
+
+    # NEVER MORE THAN THE FRAME. A stack taller than the space available would
+    # otherwise index off the front of the array and silently wrap to the top.
+    @rows = @rows[ scalar(@rows) - $room .. $#rows ] if @rows > $room;
+
+    my @out = @$cells;
+    my $first = scalar(@out) - $reserve - scalar(@rows);
+    for my $i (0 .. $#rows) {
+        # wrap_line returns CELLS ({text, role, spans}), not bare span lists.
+        # Feeding the cell itself to fit_spans silently produced blank rows --
+        # it found no spans and padded the whole width -- so the overlay drew a
+        # correctly-sized, correctly-coloured bar with no message in it.
+        my $row   = $rows[$i];
+        my $spans = (ref($row) eq 'HASH' && ref($row->{spans}) eq 'ARRAY')
+                  ? $row->{spans}
+                  : (ref($row) eq 'ARRAY' ? $row : []);
+        $spans = tui::Frame::fit_spans($spans, $cols, 'overlay.warn');
+        $out[ $first + $i ] = tui::Frame::make_cell($spans, 'overlay.warn', $cols);
+    }
+    return \@out;
 }
 
 # viewport($total, $height, $cursor) -> \%vp -- pure integer scrolling

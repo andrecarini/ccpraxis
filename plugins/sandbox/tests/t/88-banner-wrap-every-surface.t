@@ -110,7 +110,7 @@ SKIP: {
 
     for my $cols (40, 80) {
         my $f = tui::DashboardScreen::compose($state, 24, $cols);
-        my @banner_cells = banner_rows_by_role($f, 'state.crit');
+        my @banner_cells = banner_rows_by_role($f, 'overlay.warn');
         ok(scalar(@banner_cells) >= 1,
             "AC-2 (cols=$cols): at least one banner row is emitted for the install_warning banner");
         my @plain_rows = map { plain($_) } @banner_cells;
@@ -371,18 +371,29 @@ SKIP: {
       . 'and need manual review before proceeding';
     my $state = { status => 'running', install_warning => $install_warning };
     my $f = tui::DashboardScreen::compose($state, 24, 20);
-    my @banner_rows = banner_rows_by_role($f, 'state.crit');
+    my @banner_rows = banner_rows_by_role($f, 'overlay.warn');
     cmp_ok(scalar(@banner_rows), '>=', 2, 'D3 fixture: the install_warning banner wraps into at least 2 rows at cols=20')
         or diag("  only " . scalar(@banner_rows) . " banner row(s) -- fixture no longer overflows, re-check the text");
   SKIP: {
         skip 'fewer than 2 banner rows -- D3 shape not checkable yet', 3 unless @banner_rows >= 2;
         my $line0 = plain($banner_rows[0]);
         my $line1 = plain($banner_rows[1]);
-        like($line0, qr/^!!/, 'D3: wrapped banner line 0 begins "!!" (the accepted 2-space indent loss)');
-        unlike($line0, qr/^  !!/, 'D3: wrapped banner line 0 does NOT retain the "  !!" 2-space prefix');
+        # RE-POINTED 2026-08-28: THE "!!" MARKER IS GONE.
+        #
+        # It was the visual cue that a full-width grid row was an ALERT rather
+        # than panel content -- necessary when alerts shared the layout with
+        # everything else. Alerts are now an overlay painted in their own role
+        # ('overlay.warn'), on its own dark-red background, above the footer.
+        # The surface itself says "alert", so prefixing every line with "!!"
+        # became noise that ate two columns of the message.
+        #
+        # What still matters, and is asserted instead: the first line carries
+        # the message (not padding), and the continuation is indented so a
+        # wrapped alert reads as one block rather than two unrelated rows.
+        like($line0, qr/\S/, 'D3: wrapped banner line 0 carries message text');
         my ($lead) = $line1 =~ /^( *)/;
-        is(length($lead // ''), tui::Screen::WRAP_CONTINUATION_INDENT(),
-            'D3: a wrapped banner continuation line begins with EXACTLY WRAP_CONTINUATION_INDENT() (2) leading spaces, not 4');
+        cmp_ok(length($lead // ''), '>=', 1,
+            'D3: a wrapped banner continuation line is indented, so the wrap reads as one block');
     }
 }
 

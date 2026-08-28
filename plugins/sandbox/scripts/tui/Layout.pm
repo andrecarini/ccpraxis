@@ -328,19 +328,121 @@ sub place {
     my $i = 0;
     while ($i < @P) {
         my $n = ($K < (@P - $i)) ? $K : (@P - $i);
+
+        # full_width -- A PANEL THAT TAKES ITS OWN BAND, whatever the width.
+        #
+        # Placement is otherwise purely ordinal: consecutive panels pair up
+        # until the columns run out. That cannot express "these two share a row,
+        # the next two each get their own", which is the layout the operator
+        # asked for on 2026-08-27 (Run beside Resources; Providers and
+        # Blueprints each full width beneath them).
+        #
+        # min_cols could ALMOST do it -- a large enough minimum demotes a panel
+        # via the overflow loop below -- but only by guessing a number that
+        # still exceeds half the main region on every terminal anyone might use.
+        # On a wide enough screen that guess silently stops working and the
+        # panel pairs up again. A declared intent does not have that failure
+        # mode, and it says what it means at the call site.
+        #
+        # It applies to the panel that OPENS a band: a full-width panel starts
+        # its own row, and any panel following it begins the next one.
+        if ($n > 1 && ref($P[$i]) eq 'HASH' && $P[$i]{full_width}) {
+            $n = 1;
+        }
+        elsif ($n > 1) {
+            # ...and it also TERMINATES the band it would otherwise have joined,
+            # so the panel before it keeps its own row rather than dragging it up.
+            for my $j (1 .. $n - 1) {
+                if (ref($P[ $i + $j ]) eq 'HASH' && $P[ $i + $j ]{full_width}) { $n = $j; last }
+            }
+        }
+
         my $bands;
         while (1) {
             $bands = divide($cols, $n);
             if ($n > 1) {
+                my @min = map {
+                    my $panel = $P[ $i + $_ ];
+                    (ref($panel) eq 'HASH' && defined $panel->{min_cols}
+                      && !ref($panel->{min_cols})
+                      && $panel->{min_cols} =~ /^-?\d+(?:\.\d+)?$/)
+                        ? int($panel->{min_cols}) : 0;
+                } 0 .. $n - 1;
+
                 my $overflow = 0;
                 for my $j (0 .. $n - 1) {
-                    my $panel = $P[ $i + $j ];
-                    my $min_cols = (ref($panel) eq 'HASH' && defined $panel->{min_cols}
-                                     && !ref($panel->{min_cols})
-                                     && $panel->{min_cols} =~ /^-?\d+(?:\.\d+)?$/)
-                                 ? $panel->{min_cols} : 0;
-                    if ($min_cols > $bands->[$j]{w}) { $overflow = 1; last; }
+                    if ($min[$j] > $bands->[$j]{w}) { $overflow = 1; last; }
                 }
+
+                # AN UNEVEN SPLIT IS TRIED BEFORE DEMOTING THE BAND.
+                #
+                # divide() splits evenly, and the loop below used to react to a
+                # panel not fitting its half by dropping a panel from the band
+                # entirely. That is a big response to a small problem: a band can
+                # very often hold both panels, just not in equal shares.
+                #
+                # The case that forced this: Resources declares min_cols 75 (a
+                # label, a gauge, a percent and a used/free/total triple). Beside
+                # Run in a 134-column main region its half is 67, so the pair was
+                # demoted and Resources dropped to the next row -- meaning the
+                # operator's "Resources goes to the right of the Run cell" only
+                # took effect on terminals of about 240 columns or wider, and
+                # silently did nothing on anything smaller.
+                #
+                # So: give every panel that declares a minimum exactly its
+                # minimum, and share what is left equally among the rest. Only if
+                # the minimums cannot ALL be met does the band demote, which is
+                # the case the old code was really for.
+                # OPT-IN, AND THAT IS NOT TIMIDITY -- the first version applied
+                # this to every band and silently rearranged screens that had
+                # nothing to do with the request. t/68 caught it: the launcher's
+                # stages and output panels are REQUIRED not to share a row, and
+                # they had been kept apart precisely by a min_cols that did not
+                # fit an even split. Making that fit unevenly paired them.
+                #
+                # A panel opting in is saying "I would rather share a row at an
+                # uneven width than be pushed to my own row". Every panel in the
+                # candidate band must agree, because the split changes the width
+                # of all of them.
+                my $uneven_ok = 1;
+                for my $j (0 .. $n - 1) {
+                    my $panel = $P[ $i + $j ];
+                    if (ref($panel) ne 'HASH' || !$panel->{uneven_ok}) { $uneven_ok = 0; last }
+                }
+
+                if ($overflow && $uneven_ok) {
+                    my $need = 0; $need += $_ for @min;
+                    my $free = $cols - $need;
+                    if ($free >= 0) {
+                        # SURPLUS IS SHARED, NOT DUMPED ON THE LAST PANEL.
+                        #
+                        # The first version gave each panel exactly its minimum
+                        # and let the rounding line hand every spare column to
+                        # the last one. In a 134-column main region that pinned
+                        # Run at its minimum while Resources took the rest --
+                        # so Run wrapped "machine running (podman-machine-default)"
+                        # onto two lines with a third of the row empty next to it.
+                        #
+                        # A minimum is a floor, not an allocation. Everything
+                        # above the floors is split evenly, which keeps the band
+                        # balanced at every width and degrades to the plain even
+                        # split when no panel declares a minimum at all.
+                        my $share = int($free / $n);
+                        my @w;
+                        for my $j (0 .. $n - 1) { push @w, ($min[$j] || 1) + $share }
+                        # Any rounding remainder goes to the last band, exactly as
+                        # divide() does, so the row still sums to $cols.
+                        my $sum = 0; $sum += $_ for @w;
+                        $w[-1] += $cols - $sum;
+                        if ((grep { $_ < 1 } @w) == 0) {
+                            my @b; my $x = 0;
+                            for my $j (0 .. $n - 1) { push @b, { x => $x, w => $w[$j] }; $x += $w[$j] }
+                            $bands = \@b;
+                            $overflow = 0;
+                        }
+                    }
+                }
+
                 if ($overflow) { $n--; next; }
             }
             last;

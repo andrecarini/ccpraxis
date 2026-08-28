@@ -469,7 +469,7 @@ SKIP: {
     is(scalar(@$f), 24,
         'AC12 (DC3/behavior 15): compose() still returns exactly 24 cells (row-budget invariant) for the split-triggering fixture');
 
-    my @banner_cells = banner_rows_by_role($f, 'state.crit');
+    my @banner_cells = banner_rows_by_role($f, 'overlay.warn');
     ok(scalar(@banner_cells) >= 1, 'AC11 sanity: at least one banner row is emitted (liveness control before checking same-row containment)');
 
     my $found_same_row = 0;

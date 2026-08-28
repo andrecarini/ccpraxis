@@ -65,7 +65,17 @@ sub slurp {
 # floor -- so this file makes no cols<3 assertion of its own; the pinned
 # width-floor coverage lives in t/25.
 my $CONTINUATION_ROLE = 'text.primary';   # Screen.pm's wrap-continuation indent role
-my $BANNER_ROLE       = 'state.crit';     # Screen.pm's banner_role (spec 06 S2.4.9)
+# RE-POINTED 2026-08-28: alerts are an OVERLAY, not a layout banner.
+#
+# They used to be composed into the grid with role state.crit (Screen.pm's
+# banner_role, spec 06 S2.4.9). They are now painted over the bottom of an
+# already-composed frame and carry 'overlay.warn' -- the one role in the design
+# system that owns its background, because it occludes arbitrary content.
+#
+# The AC-20 assertions below are unchanged in INTENT: both alerts surface, the
+# lifecycle one leads, and its full detail survives across however many rows the
+# wrap takes. Only the role they look for moved.
+my $BANNER_ROLE       = 'overlay.warn';
 # _strip_title_status($row, $is_title) -> a row whose banner-role spans exclude
 # the TITLE's own status block.
 #
@@ -83,7 +93,7 @@ sub _strip_title_status {
     my ($row, $is_title) = @_;
     return $row unless $is_title && ref($row->{spans}) eq 'ARRAY';
     my @keep = grep {
-        !( ($_->{role} // '') eq 'state.crit'
+        !( ($_->{role} // '') eq $BANNER_ROLE
            && ($_->{text} // '') =~ /\A(?:running|exited|stopped|paused|created|restarting|stopping|dead|removing|unknown|\?)\z/ )
     } @{ $row->{spans} };
     return { %$row, spans => \@keep };
@@ -1092,10 +1102,10 @@ sub drive2 {
             # counts the header as one. Discriminate on the SPAN, which is
             # exact: a status word is a closed vocabulary, a banner is prose.
             ref($_->{spans}) eq 'ARRAY'
-                ? scalar(grep { ($_->{role} // '') eq 'state.crit'
+                ? scalar(grep { ($_->{role} // '') eq $BANNER_ROLE
                                 && ($_->{text} // '') !~ /\A(?:running|exited|stopped|paused|created|restarting|stopping|dead|removing|unknown|\?)\z/ }
                          @{ $_->{spans} })
-                : ($_->{role} // '') eq 'state.crit'
+                : ($_->{role} // '') eq $BANNER_ROLE
         } map { _strip_title_status($_, $_ == $f3->[0]) } @{$f3}[ 0 .. $#{$f3} - 1 ];
         # AMENDED by package d02-wrap-every-surface, Decision D1
         # (specs/d02-wrap-every-surface-spec.md, Section 0): banners now wrap
@@ -1115,9 +1125,28 @@ sub drive2 {
         # derivation, including why the reviewer's own suggested anchored
         # `/^!! /` fix is ALSO wrong (undercounts a wrapped+unwrapped banner
         # pair). Use the structural discriminator instead.
-        my $banner_starts = count_banner_starts(\@alerts);
-        is($banner_starts, 2,
-            "AC-20: lifecycle + status alerts coexist as two banners (banner-start rows, not raw rows) at cols=$cols");
+        # RE-POINTED 2026-08-28: COUNT THE ALERTS, NOT THEIR ROWS.
+        #
+        # count_banner_starts inferred "how many alerts" from rendered rows, by
+        # telling a banner's first row from its continuations via the
+        # continuation span's role. That inference does not survive the move to
+        # an overlay: the overlay wraps with ONE role throughout, so every row
+        # looks like a start and two alerts counted as three.
+        #
+        # The population is now enumerable directly --
+        # tui::DashboardScreen::warning_entries is the single source the
+        # renderer itself uses -- so the claim ("both alerts surface, distinct
+        # from one another") is asserted against that instead of reverse-
+        # engineered from pixels. Strictly better: it cannot be fooled by
+        # wrapping, and it fails if either producer stops emitting.
+        my $entries = tui::DashboardScreen::warning_entries(\%st2);
+        is(scalar(@$entries), 2,
+            "AC-20: lifecycle + status alerts coexist as two distinct alerts at cols=$cols");
+
+        # ...and they still REACH THE SCREEN. Enumerating alone would pass even
+        # if the overlay never painted, so the rendered frame is checked too.
+        cmp_ok(scalar(@alerts), '>=', 2,
+            "AC-20: both alerts are actually rendered, not merely enumerated, at cols=$cols");
         # Ordering is asserted with a WIDTH-SAFE discriminator. The pinned message
         # (spec S2.6) is "full shutdown 3/4: stop container - running" = 42 cols, and
         # _alert_line prefixes "  !! " (5) for 47 -- so at cols=40 clip_pad MUST
@@ -1126,8 +1155,35 @@ sub drive2 {
         # lines up (every cell exactly $cols, which passes). "full shutdown 3/4"
         # fits at every width and still discriminates the lifecycle banner from the
         # status alert ("container is exited ..."), which is what this AC is about.
-        like($alerts[0]{text}, qr{full shutdown 3/4},
-            "AC-20: the lifecycle alert is the FIRST alert row (before the status alert) at cols=$cols") if @alerts;
+        # RE-POINTED 2026-08-28: THE STACK GROWS UPWARD, so "first" moved to the
+        # BOTTOM of the overlay rather than the top of the screen.
+        #
+        # Alerts used to be banner rows above the panel grid, where first-emitted
+        # meant topmost. The overlay anchors to the footer and stacks upward --
+        # the operator's rule, so a newly-arriving warning never shifts the one
+        # already being read. warning_entries emits lifecycle before status, so
+        # lifecycle is the OLDEST and therefore sits nearest the footer.
+        #
+        # The claim is unchanged and still discriminating: the two alerts are
+        # distinguishable and their order is deterministic, not incidental. Only
+        # which end of the stack counts as "first" moved, and the width-safe
+        # discriminator below is kept verbatim for the reason its own comment
+        # gives (the full phrase does not fit at cols=40).
+        # Asserted by RELATIVE POSITION, not by which row is last: the lifecycle
+        # alert wraps, so its final row is a continuation and the last row of the
+        # stack is not the row carrying the discriminator.
+        my ($i_life, $i_stat);
+        for my $i (0 .. $#alerts) {
+            $i_life = $i if !defined($i_life) && $alerts[$i]{text} =~ m{full shutdown 3/4};
+            $i_stat = $i if !defined($i_stat) && $alerts[$i]{text} =~ m{container is exited};
+        }
+        ok(defined($i_life) && defined($i_stat),
+            "AC-20: both alerts are identifiable in the rendered stack at cols=$cols")
+            or diag('rows: ' . join(' | ', map { $_->{text} } @alerts));
+        cmp_ok($i_life, '>', $i_stat,
+            "AC-20: the lifecycle alert sits BELOW the status alert -- it is emitted first and the "
+          . "overlay stacks upward, so the oldest ends up nearest the footer (cols=$cols)")
+            if defined($i_life) && defined($i_stat);
         # The full pinned detail is still asserted wherever it actually fits --
         # but ACROSS the banner's rows, not within one of them.
         #
@@ -1183,13 +1239,29 @@ sub drive2 {
             # counts the header as one. Discriminate on the SPAN, which is
             # exact: a status word is a closed vocabulary, a banner is prose.
             ref($_->{spans}) eq 'ARRAY'
-                ? scalar(grep { ($_->{role} // '') eq 'state.crit'
+                ? scalar(grep { ($_->{role} // '') eq $BANNER_ROLE
                                 && ($_->{text} // '') !~ /\A(?:running|exited|stopped|paused|created|restarting|stopping|dead|removing|unknown|\?)\z/ }
                          @{ $_->{spans} })
-                : ($_->{role} // '') eq 'state.crit'
+                : ($_->{role} // '') eq $BANNER_ROLE
         } @{$fo}[ 0 .. $#{$fo} - 1 ];
-        is(count_banner_starts(\@ao), 1,
-            "AC-20 (fix-batch step 7): one real banner with an urgent!! continuation trap still counts as ONE at cols=$cols");
+        # RE-POINTED 2026-08-28. The scenario is KEPT -- text engineered so a
+        # continuation row contains "urgent!!" is still exactly the input that
+        # once inflated one alert into two -- but the assertion no longer goes
+        # through count_banner_starts.
+        #
+        # That helper inferred alert boundaries from the role of a wrapped row's
+        # indent span. The overlay wraps with one role throughout, so the
+        # inference cannot work and the helper is not used on this surface any
+        # more. Asserting through it would test a code path the renderer has
+        # stopped relying on.
+        #
+        # warning_entries is the population the renderer itself reads, so the
+        # trap is now unfoolable by construction: no amount of "!!" inside a
+        # message can make one entry look like two.
+        is(scalar(@{ tui::DashboardScreen::warning_entries(\%one) }), 1,
+            "AC-20 (fix-batch step 7): text containing 'urgent!!' is still ONE alert at cols=$cols");
+        cmp_ok(scalar(@ao), '>=', 1,
+            "AC-20 (fix-batch step 7): ...and it really renders at cols=$cols");
     }
 
     # The `/^!! /`-anchor trap: a WRAPPED banner (status alert, loses its
@@ -1199,11 +1271,16 @@ sub drive2 {
     my $fm = Dashboard::compose_frame(\%mixed, 12, 80);
     my @am = grep {
         ref($_->{spans}) eq 'ARRAY'
-            ? scalar(grep { ($_->{role} // '') eq 'state.crit' } @{ $_->{spans} })
-            : ($_->{role} // '') eq 'state.crit'
+            ? scalar(grep { ($_->{role} // '') eq $BANNER_ROLE } @{ $_->{spans} })
+            : ($_->{role} // '') eq $BANNER_ROLE
     } @{$fm}[ 0 .. $#{$fm} - 1 ];
-    is(count_banner_starts(\@am), 2,
-        'AC-20 (fix-batch step 7): a wrapped banner and an unwrapped banner together still count as TWO');
+    # Same re-pointing as above: the wrapped + unwrapped pair is still the
+    # scenario, counted through the enumeration rather than through the row
+    # heuristic that could not tell them apart.
+    is(scalar(@{ tui::DashboardScreen::warning_entries(\%mixed) }), 2,
+        'AC-20 (fix-batch step 7): a wrapped alert and an unwrapped alert together are still TWO');
+    cmp_ok(scalar(@am), '>=', 2,
+        'AC-20 (fix-batch step 7): ...and both reach the screen');
 }
 
 # ===========================================================================

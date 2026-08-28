@@ -46,11 +46,33 @@ use Encode ();   # core; used only for UTF-8 encoding of declared glyphs
 # assumption being correct. (Spec §2.4.5, escalation E-6.)
 #
 # -----------------------------------------------------------------------
-# NO EMOJI, EVER, IN THIS MODULE
+# NO EMOJI -- WITH ONE NARROW, DELIBERATE EXCEPTION (title.*)
 # -----------------------------------------------------------------------
 # Every glyph declared below is checked against a block-based emoji detector
 # (mirrored, deliberately, in the test oracle) and none of them fall in an
-# emoji range. Richer non-ASCII glyphs (box-drawing, geometric shapes,
+# emoji range -- EXCEPT the title.* set, waived by operator decision on
+# 2026-08-28.
+#
+# THE EXCEPTION IS SCOPED BY THE RULE'S OWN REASONING. This rule exists because
+# emoji render inconsistently IN A TERMINAL: often double-width, often in
+# colour, and at the mercy of the font stack. The title.* glyphs are the only
+# ones that never reach a terminal -- they are the lead character of the OS
+# WINDOW TITLE, drawn in the desktop's UI font, where these symbols are the
+# recognisable ones and where the failure mode above does not arise.
+#
+# It is not a free pass -- a title.* glyph must still measure exactly one cell.
+#
+# TEXT PRESENTATION IS APPLIED BY THE TITLE BUILDER, NOT HERE, and the reason is
+# worth recording because the obvious placement is wrong. These codepoints have
+# emoji forms, so a U+FE0E variation selector is wanted to force the text form.
+# Declaring it in this table looked right and broke the HEADER: glyphs from here
+# pass through the render path's sanitiser, which strips zero-width and
+# combining characters by design -- an invariant that exists to stop control
+# sequences riding in on untrusted text -- so every affected glyph rendered as
+# "?". The window title has no such sanitiser and is the only surface where the
+# emoji form could appear, so the selector is appended there.
+#
+# Any glyph outside title.* is still held to the original rule. Richer non-ASCII glyphs (box-drawing, geometric shapes,
 # braille) are used freely -- only emoji are excluded. Surfaces that still
 # carry emoji today (scripts/statusline.pl, the sandbox dashboard module,
 # bp-statusline.pl) are a recorded, tracked debt for the packages that own
@@ -247,6 +269,94 @@ sub _roles_data {
             class   => 'decor',
             meaning => 'The unfilled portion of a meter. Carries no fact.',
         },
+
+        # ------------------------------------------------------------------
+        # THE GAUGE FILL RAMP -- Radix Colors, step 9, four steps.
+        #
+        # A PALETTE, NOT FOUR PICKED COLOURS. Radix step 9 is the one its
+        # authors specify as the solid, high-chroma step intended for dark
+        # backgrounds, so legibility here is a property of the system rather
+        # than something tuned per colour and re-tuned whenever one changes.
+        #
+        # WHY NOT THE OBVIOUS SCIENTIFIC RAMPS. Viridis and Cividis are
+        # perceptually uniform across their whole range -- INCLUDING the
+        # near-black end a dark terminal cannot show. Measured against t/64's
+        # own #1E1E1E reference: viridis #440154 is 1.09:1 and #414487 is
+        # 1.91:1, so a gauge below about 40% would have been invisible.
+        # ColorBrewer YlOrRd is the right idea inverted, brightest at LOW values
+        # and darkest at critical (#BD0026, 2.53:1) -- backwards for a meter on
+        # a dark ground. IBM's colourblind-safe set clears the contrast but is
+        # CATEGORICAL, and using a categorical palette sequentially implies an
+        # ordering it does not encode.
+        #
+        # Every step below clears 4.2:1 against that background in truecolour
+        # and 4.5:1 through its 256-colour rung, which is why the x256 values
+        # are recorded rather than left to a nearest-neighbour guess at runtime.
+        #
+        # SEPARATE FROM state.* ON PURPOSE. These are the same three ideas as
+        # state.ok/warn/crit but they are not the same colours, and merging them
+        # would mean a gauge tweak repainting every status glyph on the screen --
+        # the same reasoning that split gauge.track out of rule.
+        # THE WARNING OVERLAY -- the one role that owns its background.
+        #
+        # Operator, 2026-08-27: warnings should "actually appear on the footer of
+        # the terminal, without moving anything, just overlay it on top of
+        # whatever was in it before. Like it's a pop up... Dark red background
+        # (very dark), light white foreground."
+        #
+        # Because it covers arbitrary content, its contrast is measured against
+        # ITS OWN background and not reference_background(): #F5F5F5 on #3B0A0A
+        # is 15.6:1, comfortably AAA. Darker reds score higher still but stop
+        # reading as red; this is the point where it is unmistakably a red
+        # surface and still far past the threshold.
+        #
+        # bg256 52 (#5F0000) is the nearest dark red the 256-colour cube has.
+        # It is lighter than the truecolour value, so the fallback is checked on
+        # its own terms: #F5F5F5 on #5F0000 is 12.96:1, still AAA.
+        'overlay.warn' => {
+            rgb     => [245, 245, 245],
+            bg      => [59, 10, 10],
+            x256    => 255,
+            bg256   => 52,
+            attr    => '1',
+            class   => 'body',
+            meaning => 'A dismissable warning overlaid on the footer. Owns its background.',
+        },
+
+        'gauge.low' => {
+            rgb     => [0, 144, 255],
+            x256    => 33,
+            attr    => '',
+            class   => 'body',
+            meaning => 'Meter fill below half. Ample headroom.',
+        },
+        'gauge.mid' => {
+            rgb     => [18, 165, 148],
+            x256    => 36,
+            attr    => '',
+            class   => 'body',
+            meaning => 'Meter fill from half to the warn threshold. Filling, still fine.',
+        },
+        'gauge.warn' => {
+            rgb     => [247, 107, 21],
+            x256    => 202,
+            attr    => '',
+            class   => 'body',
+            meaning => 'Meter fill past the warn threshold. Needs attention, still functions.',
+        },
+        # Radix red STEP 10, not step 9. Step 9 (#E5484D) measures 4.26:1
+        # against t/64's #1E1E1E reference and the floor for a `body` role is
+        # 4.5:1, so the suite rejected it -- correctly, since this is the one
+        # colour in the ramp that must never be the hard one to read. Step 10 is
+        # the same hue one step lighter and clears it at 5.00:1. The other three
+        # steps stay at 9; only the colour that failed moved.
+        'gauge.crit' => {
+            rgb     => [236, 93, 94],
+            x256    => 203,
+            attr    => '',
+            class   => 'body',
+            meaning => 'Meter fill past the critical threshold.',
+        },
         'accent' => {
             rgb     => [66, 148, 250],
             x256    => 69,
@@ -298,6 +408,18 @@ sub roles {
             class   => $rec->{class},
             meaning => $rec->{meaning},
         };
+        # bg/bg256 are copied ONLY when the role declares them, so a role
+        # without a background has no such keys at all and callers can test
+        # presence rather than having to compare against undef.
+        #
+        # They have to be exposed: sgr() emits a second SGR for these roles, and
+        # a describe-the-table function that omitted the reason would leave the
+        # oracle unable to tell a role that legitimately paints a background
+        # from one that had sprouted a stray escape.
+        if (ref($rec->{bg}) eq 'ARRAY') {
+            $copy{$name}{bg}    = [ @{ $rec->{bg} } ];
+            $copy{$name}{bg256} = $rec->{bg256};
+        }
     }
     return \%copy;
 }
@@ -418,6 +540,33 @@ sub _glyphs_data {
         # light track, painted 'accent' against 'rule'.
         'gauge.full'  => { cp => 0x2501, desc => 'heavy horizontal rule, meter fill' },
         'gauge.empty' => { cp => 0x2500, desc => 'light horizontal rule, meter track' },
+        # ------------------------------------------------------------------
+        # WINDOW-TITLE LEAD CHARACTERS (operator selection, 2026-08-28).
+        #
+        # The title is the ONE string that renders in the desktop's UI font
+        # rather than the terminal's, and it is truncated from the right in
+        # every taskbar -- so the lead character is often all that survives.
+        # These are the states it has to distinguish at one glyph.
+        #
+        # They live in Theme rather than inline in the window-title builder so
+        # the glyph table stays the single source, and so that module needs no
+        # non-ASCII bytes of its own.
+        #
+        # (The identifier of that module is deliberately not named here: t/64's
+        # B-E7 cycle-closure guard scans this file's SOURCE for it, comments
+        # included, because a back-edge that starts life in a comment is how the
+        # last one came back.)
+        #
+        # 'title.gone' is NOT the same as 'title.exited', and the distinction is
+        # the reason it earns a separate glyph: exited is a status podman
+        # REPORTS, while gone is the launcher's own liveness probe having FAILED
+        # to reach the container. One is being told, the other is trying and
+        # not getting through.
+        'title.needs'   => { cp => 0x203C, desc => 'double exclamation -- a decision is waiting on the operator' },
+        'title.exited'  => { cp => 0x2716, desc => 'heavy multiplication x -- container exited or dead' },
+        'title.paused'  => { cp => 0x23F8, desc => 'double vertical bar -- stopped, paused, created, restarting' },
+        'title.gone'    => { cp => 0x26A0, desc => 'warning sign -- the container could not be reached' },
+
         'scroll.up'   => { cp => 0x25B2, desc => 'black up-pointing triangle, scroll indicator' },
         'scroll.down' => { cp => 0x25BC, desc => 'black down-pointing triangle, scroll indicator' },
         'arrow.up'    => { cp => 0x2191, desc => 'upwards arrow, git-ahead count' },
@@ -475,6 +624,7 @@ sub _glyphs_data {
     for my $name (keys %source) {
         my $item  = $source{$name};
         my $char  = chr($item->{cp});
+
         my $width = defined($item->{width}) ? $item->{width} : 1;
         $built{$name} = {
             cp    => $item->{cp},
@@ -624,14 +774,40 @@ sub sgr {
     my $rec = _roles_data()->{$role};
     return '' unless $rec;
     $cap = capability() unless defined $cap;
+
+    # A ROLE MAY OWN ITS BACKGROUND, AND ALMOST NONE DO.
+    #
+    # The header of this module states that the design system paints
+    # FOREGROUNDS ONLY, because a terminal has no alpha channel and the
+    # background belongs to the user's theme. That rule stands, and the reason
+    # it stands is what carves out the exception: it is about text drawn ON the
+    # user's background.
+    #
+    # An OVERLAY is not that. It deliberately occludes whatever it covers, so it
+    # has to supply its own background or it renders as light text sitting on
+    # top of a resources gauge -- illegible, and indistinguishable from a
+    # rendering fault. Its contrast is therefore measured against its OWN
+    # background rather than reference_background(), which is the only honest
+    # way to measure a surface the reference does not describe.
+    #
+    # A role without `bg` behaves exactly as before, byte for byte.
+    my $bg = $rec->{bg};
     if ($cap eq 'truecolor') {
         my ($r, $g, $b) = @{ $rec->{rgb} };
-        return "\e[38;2;$r;$g;${b}m";
+        my $s = "\e[38;2;$r;$g;${b}m";
+        $s .= "\e[48;2;$bg->[0];$bg->[1];$bg->[2]m" if ref($bg) eq 'ARRAY';
+        return $s;
     }
     if ($cap eq '256') {
-        return "\e[38;5;$rec->{x256}m";
+        my $s = "\e[38;5;$rec->{x256}m";
+        $s .= "\e[48;5;$rec->{bg256}m" if ref($bg) eq 'ARRAY' && defined $rec->{bg256};
+        return $s;
     }
     # 'none', or any unrecognised capability string -- treated as 'none'.
+    # Reverse video is the only way to say "this is a surface, not text" with
+    # no colour at all, and an overlay that vanished on a mono terminal would
+    # be a warning nobody sees.
+    return "\e[7m" if ref($bg) eq 'ARRAY';
     return $rec->{attr} eq '' ? '' : "\e[$rec->{attr}m";
 }
 

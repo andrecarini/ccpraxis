@@ -1169,11 +1169,34 @@ ok(!Theme->can('display_width'),
         $both = grep { _panel_title_hits_in_row($_->{text}) >= 2 } @$f if !$@ && ref($f) eq 'ARRAY';
         is($both, 0, "AC-L2/Behavior24: at cols=$cols (< breakpoint), no row carries two panel titles");
     }
-    for my $cols (90, 91, 120, 200) {
+    # RE-POINTED 2026-08-28: CLEARING THE BREAKPOINT NO LONGER IMPLIES PAIRING.
+    #
+    # This asserted that any width at or above tui::Layout's two-column
+    # breakpoint (90) puts two panel titles on one row. That held while the
+    # paired panels declared no minimum width. It does not now: the operator
+    # reorganised the grid so Resources sits beside Run, and Resources needs 75
+    # columns (a label, a gauge, a percent and a used/free/total triple) against
+    # Run's 44 -- so a band can hold both only once the main region has ~119.
+    #
+    # Between 90 and 118 the panels STACK, and that is the correct outcome: the
+    # alternative is rendering one of them too narrow to read. tui::Layout only
+    # promises to CONSIDER two columns above the breakpoint, not to achieve them
+    # regardless of what the panels need.
+    #
+    # 90 and 91 therefore move to the stacked expectation, joining the loop
+    # above. The pairing claim is kept at widths where it genuinely fits, which
+    # is what keeps this non-vacuous.
+    for my $cols (90, 91) {
         my $f = eval { Dashboard::compose_frame(\%STATE_WITH_TOKENS, 24, $cols) };
         my $both = 0;
         $both = grep { _panel_title_hits_in_row($_->{text}) >= 2 } @$f if !$@ && ref($f) eq 'ARRAY';
-        cmp_ok($both, '>=', 1, "AC-L2/Behavior24: at cols=$cols (>= breakpoint) with >=2 panels, at least one row carries two panel titles");
+        is($both, 0, "AC-L2/Behavior24: at cols=$cols the panels' minimums do not both fit, so they STACK");
+    }
+    for my $cols (120, 200) {
+        my $f = eval { Dashboard::compose_frame(\%STATE_WITH_TOKENS, 24, $cols) };
+        my $both = 0;
+        $both = grep { _panel_title_hits_in_row($_->{text}) >= 2 } @$f if !$@ && ref($f) eq 'ARRAY';
+        cmp_ok($both, '>=', 1, "AC-L2/Behavior24: at cols=$cols there is room for both minimums, so a row carries two panel titles");
     }
 }
 {

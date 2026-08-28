@@ -146,20 +146,38 @@ sub _live_gutter_label { return tui::DashboardScreen::gutter($_[0]); }
 # 4.1 container_status_style (spec S2.1): AC3, AC4
 # ===========================================================================
 {
+    # RE-POINTED 2026-08-28 to the operator's regrouping of the container
+    # states. Three moved, by explicit instruction:
+    #
+    #   stopped, paused  -> treated as EXITED. All three mean the container is
+    #                       not doing anything; splitting them across two
+    #                       severities implied a difference in what you would do
+    #                       about it, and there isn't one.
+    #   stopping         -> also exited-family (it is on its way there), though
+    #                       it additionally carries a spinner in the rendered
+    #                       header to show the transition is in flight. That
+    #                       spinner is not part of THIS function's contract --
+    #                       see tui::DashboardScreen::container_presentation.
+    #
+    # 'initialized' is ADDED: a real podman state (verified against
+    # libpod/define/containerstate.go, "created in the OCI runtime but not
+    # started") that was missing from every copy of this mapping because the
+    # lists were written from memory of Docker's state names.
     my @cases = (
-        ['running',    $GLYPH_GREEN,  'good'],
-        ['exited',     $GLYPH_RED,    'bad'],
-        ['dead',       $GLYPH_RED,    'bad'],
-        ['removing',   $GLYPH_RED,    'bad'],
-        ['unknown',    $GLYPH_RED,    'bad'],
-        ['created',    $GLYPH_YELLOW, 'warn'],
-        ['restarting', $GLYPH_YELLOW, 'warn'],
-        ['stopping',   $GLYPH_YELLOW, 'warn'],
-        ['stopped',    $GLYPH_YELLOW, 'warn'],
-        ['paused',     $GLYPH_YELLOW, 'warn'],
-        ['',           $GLYPH_WHITE,  'muted'],
-        [undef,        $GLYPH_WHITE,  'muted'],
-        ['weird',      $GLYPH_WHITE,  'muted'],
+        ['running',     $GLYPH_GREEN,  'good'],
+        ['exited',      $GLYPH_RED,    'bad'],
+        ['dead',        $GLYPH_RED,    'bad'],
+        ['removing',    $GLYPH_RED,    'bad'],
+        ['unknown',     $GLYPH_RED,    'bad'],
+        ['stopping',    $GLYPH_RED,    'bad'],
+        ['stopped',     $GLYPH_RED,    'bad'],
+        ['paused',      $GLYPH_RED,    'bad'],
+        ['created',     $GLYPH_YELLOW, 'warn'],
+        ['initialized', $GLYPH_YELLOW, 'warn'],
+        ['restarting',  $GLYPH_YELLOW, 'warn'],
+        ['',            $GLYPH_WHITE,  'muted'],
+        [undef,         $GLYPH_WHITE,  'muted'],
+        ['weird',       $GLYPH_WHITE,  'muted'],
     );
     for my $case (@cases) {
         my ($status, $eglyph, $erole) = @$case;

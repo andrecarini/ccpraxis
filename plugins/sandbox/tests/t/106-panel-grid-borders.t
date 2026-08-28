@@ -284,7 +284,22 @@ my ($dH, $dV, $dTDOWN, $dTUP, $dTLEFT, $dCROSS) = map { dec($_) } ($H, $V, $TDOW
     # Non-vacuity, stated once: at 4 rows the row above the rule IS the first
     # band's title line, which carries real vertical seams -- so the agreement
     # check above is comparing something rather than two empty lists.
-    for my $cols (100, 150) {
+    # WIDTHS RAISED 100/150 -> 200/240, 2026-08-28.
+    #
+    # The claim is unchanged: at 4 rows the row above the footer rule is the
+    # first band's title line, and it must carry a real vertical seam -- so the
+    # agreement check above is comparing something rather than two empty lists.
+    #
+    # What moved is where a seam EXISTS. The grid was reorganised so Run pairs
+    # with Resources, which declares min_cols 75 against Run's 44 -- a band holds
+    # both only once the main region has ~119 columns. At 100 and 150 (main
+    # regions of 100 and 100, the latter after a 50-column side column) the
+    # panels stack, so the title row is a single full-width rule with no seam,
+    # and this non-vacuity check was correctly reporting that it had nothing to
+    # measure.
+    #
+    # Verified: seams=0 at 150, seams=1 at 200 and 240.
+    for my $cols (200, 240) {
         my $f = Dashboard::compose_frame(st(), 4, $cols);
         my $above = chars($f->[$#$f - 2]{text});
         my $n = grep { $down{$_} } @$above;

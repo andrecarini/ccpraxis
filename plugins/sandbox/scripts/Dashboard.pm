@@ -538,14 +538,29 @@ my $BACKPACK_MAX_ROWS = 2;     # spec S3.12
 # everything -> red/bad. PUBLIC, pure.
 sub container_status_style {
     my ($status, $container_gone) = @_;
-    my $st = defined $status ? $status : '';
-    $st =~ s/^\s+//;
-    $st =~ s/\s+$//;
-    return (_status_glyph('crit'), 'bad')   if $container_gone;
-    return (_status_glyph('ok'), 'good')    if $st eq 'running';
-    return (_status_glyph('crit'), 'bad')   if $st =~ /^(?:exited|dead|removing|unknown)$/;
-    return (_status_glyph('warn'), 'warn')  if $st =~ /^(?:created|restarting|stopping|stopped|paused)$/;
-    return (_status_glyph('idle'), 'muted');
+
+    # DELEGATES to tui::DashboardScreen::container_presentation, which is the
+    # single mapping the header and the window title both read.
+    #
+    # This was a THIRD copy of the same table. All three were written from
+    # memory of Docker's state names, all three were missing podman's
+    # 'initialized', and fixing them one at a time is what made the header
+    # and the taskbar disagree about the same container. This function survives
+    # because callers want the LEGACY role name; the mapping itself does not
+    # live here any more.
+    my %LEGACY = (
+        'state.ok'   => 'good',
+        'state.warn' => 'warn',
+        'state.crit' => 'bad',
+        'state.idle' => 'muted',
+    );
+    my %GLYPH_FOR = (
+        'state.ok' => 'ok', 'state.warn' => 'warn',
+        'state.crit' => 'crit', 'state.idle' => 'idle',
+    );
+    my $pres = tui::DashboardScreen::container_presentation($status, $container_gone);
+    my $role = $pres->{role};
+    return (_status_glyph($GLYPH_FOR{$role} || 'idle'), $LEGACY{$role} || 'muted');
 }
 
 # window_title(\%state) -> an ASCII-safe OS window-title string, "<char>
@@ -593,15 +608,68 @@ sub window_title {
     # It follows rather than leads deliberately -- the lead character is the one
     # guaranteed to survive taskbar truncation, and "is this thing alive" is the
     # question that has to be answerable from a single glyph.
-    my $char;
-    if ($state->{container_gone})             { $char = '?'; }
-    elsif ($role eq 'bad')                    { $char = 'x'; }
-    elsif ($role eq 'warn')                   { $char = '-'; }
-    elsif ($role eq 'good') {
-        $char = _title_spinner_char($state->{title_spinner_idx});
-        $char .= '!' if $needs_you > 0;
+    # GLYPHS CHOSEN BY THE OPERATOR, 2026-08-28. Each comes from Theme so the
+    # table stays the single source and this file stays ASCII.
+    #
+    # A missing glyph falls back to the previous ASCII character rather than to
+    # an empty string: an absent lead character would silently cost the title
+    # the one signal that survives taskbar truncation.
+    # TEXT PRESENTATION IS FORCED HERE, and only here.
+    #
+    # title.* are emoji-capable codepoints, so a desktop may draw them as
+    # full-colour double-width emoji. U+FE0E (VARIATION SELECTOR-15) asks for
+    # the text form instead. It is appended at the point of use rather than
+    # declared in the glyph table because the table feeds the HEADER too, and
+    # the render path's sanitiser strips zero-width characters by design -- so a
+    # selector baked into the glyph turned every header glyph into "?".
+    #
+    # The title has no such sanitiser (only an ASCII pass over the project NAME,
+    # which never touches this character), so the selector survives to the
+    # terminal emulator that sets the window title.
+    my $g = sub {
+        my ($name, $fallback) = @_;
+        my $v = Theme::glyph($name);
+        return $fallback unless defined($v) && length($v);
+        return $v . "\xef\xb8\x8e";   # U+FE0E in UTF-8 bytes
+    };
+
+    # THE SAME MAPPING THE HEADER USES (tui::DashboardScreen::container_presentation).
+    #
+    # This was an independent copy of the header's table and the two drifted:
+    # 'initialized' was missing from both, and fixing one alone made the header
+    # and the taskbar disagree about the same container. The title differs from
+    # the header only in having no room for the status WORD, so its glyph has to
+    # carry everything.
+    #
+    # A transitional state leads with the SPINNER and follows with its state
+    # glyph: taskbar truncation keeps the first character, so "something is
+    # happening" survives, and "what is happening" is there for anyone who can
+    # see the whole title.
+    my $pres  = tui::DashboardScreen::container_presentation($state->{status}, $state->{container_gone});
+    my $token = tui::DashboardScreen::container_glyph('title', $pres);
+    my $char  = '';
+    $char .= _title_spinner_char($state->{title_spinner_idx}) if $pres->{spinner};
+    if (defined $token) {
+        my $sg = $g->($token, '?');
+        $char .= (length($char) ? ' ' : '') . $sg;
     }
-    else                                      { $char = '?'; }
+    $char = '?' if !length $char;
+    {
+        # A SPACE BETWEEN THEM (operator, 2026-08-28). Butted together, the
+        # spinner and the `!` read as one two-character glyph rather than two
+        # independent signals -- and the spinner's braille frames change shape
+        # every tick, so the pair kept looking like a different symbol each
+        # frame. They mean separate things ("alive" and "needs you"), so they
+        # are spaced like separate things.
+        #
+        # The width budget below is derived from length($char), so it absorbs
+        # this without a second edit.
+        # Only while RUNNING. needs-you is about work waiting on you in a live
+        # sandbox; on a container that is stopping or gone the state itself is
+        # the thing to look at, and appending a second marker there buries it.
+        $char .= ' ' . $g->('title.needs', '!')
+            if $needs_you > 0 && $pres->{role} eq 'state.ok';
+    }
 
     # MINOR-3 (red-team step 6): a ref project_name reaches _decode_str's
     # substr() as an lvalue and warns ("Attempt to use reference as lvalue in
@@ -662,11 +730,15 @@ sub _period_opt {
 
 sub _title_spinner_char {
     my ($idx) = @_;
-    return '*' if !defined($idx) || ref($idx) || $idx !~ /^-?\d+(?:\.\d+)?$/;
+    # '?', NOT '*'. The operator's ruling: the bug-path fallback should use the
+    # same glyph as "status unknown", because that is exactly what it means --
+    # we could not work out what to show. A distinct '*' invented a sixth state
+    # with no entry in any table, so anyone who saw it had nothing to look up.
+    return '?' if !defined($idx) || ref($idx) || $idx !~ /^-?\d+(?:\.\d+)?$/;
     # DERIVED FROM Theme, never restated -- see tui::DashboardScreen's own
     # _spinner_frame for the same note. The frame count changed once already.
     my $n = Theme::SPINNER_FRAMES();
-    return '*' if !defined($n) || $n < 1;
+    return '?' if !defined($n) || $n < 1;   # same reasoning as the guard above
     my $i = int($idx) % $n;
     $i += $n if $i < 0;
     my $g = Theme::glyph('spinner.' . ($i + 1));
@@ -794,7 +866,18 @@ sub activity_row_width {
     # was `$cols - 2` for the two-space body indent; that indent is now
     # BODY_INDENT and is 0, and a hard-coded 2 here would have gone on
     # reserving columns nothing occupies.
-    my $w = $cols - tui::Screen::BODY_INDENT();
+    #
+    # AND IT IS THE SIDE COLUMN'S WIDTH WHEN THERE IS ONE, not the terminal's.
+    # This is the width Activity's scroll indicator is justified to. While it
+    # was $cols, the indicator was placed at the right-hand end of a row as wide
+    # as the WHOLE SCREEN, while the rows it was overlaid onto are only as wide
+    # as the column -- so it landed outside the panel and was clipped, and the
+    # "N more above / N more below" markers never appeared at all. That was true
+    # for as long as the side column has existed; it is not a consequence of the
+    # column becoming variable-width.
+    my $body = tui::Screen::side_column_body_width($cols);
+    $body = $cols unless $body > 0;      # no side column: the old behaviour
+    my $w = $body - tui::Screen::BODY_INDENT();
     return $w < 0 ? 0 : $w;
 }
 
@@ -1494,8 +1577,21 @@ sub _fixed_region_height {
     # and reads the constant from there rather than restating it.
     my $body_height;
     if (defined $rows && !ref($rows) && $rows =~ /^-?\d+(?:\.\d+)?$/) {
-        my $alerts = scalar(_alert_msgs($state, $rows));
-        $body_height = int($rows) - tui::Screen::chrome_rows() - $alerts;
+    # ALERTS COST NO ROWS ANY MORE, so none are subtracted here.
+    #
+    # They used to be banner rows composed into the grid, so every alert took a
+    # row from the body and this predictor had to account for it. They are now
+    # painted OVER a finished frame (tui::Screen::overlay_warnings), which is
+    # the whole point of the change: an arriving warning must not move the
+    # layout.
+    #
+    # Subtracting them after that change made this function UNDER-report --
+    # measured at 24x120, capacity dropped from 6 to 5 the moment a status alert
+    # existed. Capacity is what the launcher uses to decide how many events to
+    # hand the Activity panel, so under-reporting renders the panel short with
+    # blank rows the screen actually had room for. t/25's AC-11 differential is
+    # what caught it.
+        $body_height = int($rows) - tui::Screen::chrome_rows();
     }
 
     # Which band-row carries the 'Recent activity' (flex) panel -- mirrors
@@ -1640,8 +1736,21 @@ sub activity_capacity {
     # rows/cols normalisation above -- a ref or non-numeric $rows would
     # otherwise warn under `use warnings` on the bare `< 0` comparison.
     $rows = 0 if !defined $rows || ref($rows) || $rows !~ /^-?\d+(?:\.\d+)?$/ || $rows < 0;
-    my $alerts = scalar(_alert_msgs($state, $rows));
-    my $body_h = $rows - tui::Screen::chrome_rows() - $alerts;   # title + footer rule + footer
+    # ALERTS COST NO ROWS ANY MORE, so none are subtracted here.
+    #
+    # They used to be banner rows composed into the grid, so every alert took a
+    # row from the body and this predictor had to account for it. They are now
+    # painted OVER a finished frame (tui::Screen::overlay_warnings), which is
+    # the whole point of the change: an arriving warning must not move the
+    # layout.
+    #
+    # Subtracting them after that change made this function UNDER-report --
+    # measured at 24x120, capacity dropped from 6 to 5 the moment a status alert
+    # existed. Capacity is what the launcher uses to decide how many events to
+    # hand the Activity panel, so under-reporting renders the panel short with
+    # blank rows the screen actually had room for. t/25's AC-11 differential is
+    # what caught it.
+    my $body_h = $rows - tui::Screen::chrome_rows();   # alerts overlay, they do not take rows
     my $fixed  = _fixed_region_height($state, $cols, $rows);
     my $cap = $body_h - $fixed - 1;               # -1 = Activity panel title
 

@@ -189,6 +189,30 @@ sub state { return { events => events($_[0] // 40), runs => [], tokens => {} } }
         is(tui::Screen::side_column_width($bad), 0,
             'AC6: a malformed width reserves nothing rather than guessing');
     }
+
+    # AC6c -- THE SCROLL INDICATOR'S WIDTH IS THE COLUMN'S, NOT THE SCREEN'S.
+    #
+    # Dashboard::activity_row_width is what activity_window justifies the
+    # "N more above / N more below" overlay to. It used to return $cols -- the
+    # whole terminal -- while the rows it overlays are only as wide as the side
+    # column, so the marker was justified past the panel's right edge and
+    # clipped. The operator's report was that the markers "are not showing", and
+    # they never had, at any side-column width.
+    #
+    # Pinned as a RELATIONSHIP rather than a number: it must equal the column's
+    # body width (the column minus its border) less the body indent, at every
+    # width where a column exists, and fall back to the full terminal where one
+    # does not.
+    # (@WIDE is declared further down this file, so the widths are derived from
+    # $edge here rather than reaching forward for it.)
+    for my $c ($edge, $edge + 20, $edge + 70, $edge + 500) {
+        my $body = tui::Screen::side_column_body_width($c);
+        cmp_ok($body, '>', 0, "AC6c: cols=$c has a side-column body width");
+        is(Dashboard::activity_row_width($c), $body - tui::Screen::BODY_INDENT(),
+            "AC6c: cols=$c -- the scroll overlay is justified to the COLUMN, not the terminal");
+    }
+    is(Dashboard::activity_row_width($edge - 1), ($edge - 1) - tui::Screen::BODY_INDENT(),
+        'AC6c: below the threshold there is no column, so it falls back to the full width');
 }
 
 # ===========================================================================
@@ -278,9 +302,21 @@ for my $cols (@NARROW) {
     isnt($idx, 1, "AC9: cols=$cols -- but it is NOT pinned to the first body row; it is in the band flow, where its flex flag still protects it");
 }
 
-# AC12 -- a banner shortens the MAIN region and leaves the side column's
-# height alone. This is the property tui::Screen::compose orders its code to
-# preserve, and the reason the reservation happens before the banner block.
+# AC12 -- RE-POINTED 2026-08-28. A banner used to shorten the MAIN region while
+# leaving the side column's height alone; that was the property compose()
+# ordered its code to preserve.
+#
+# Alerts are now an OVERLAY: painted over the bottom rows of a finished frame,
+# full width, above the footer rule. So they change neither region's height --
+# a strictly stronger version of the old claim -- but they DO cover the bottom
+# of the side column, because a full-width popup covers whatever is beneath it.
+# That is the operator's own specification ("overlay it on top of whatever was
+# in it before. Like it's a pop up"), not an accident.
+#
+# The claim therefore splits in two, and both halves are asserted below:
+#   * the side column's HEIGHT is unchanged (nothing reflows), and
+#   * the rows the overlay covers are exactly the rows it painted -- it does not
+#     eat more of the column than the alert needed.
 for my $cols (@WIDE) {
     my $rows = 30;
     my $sw   = tui::Screen::side_column_width($cols);
@@ -291,8 +327,19 @@ for my $cols (@WIDE) {
         my ($f) = @_;
         return scalar grep { substr(plain($_->{text}), -$sw) =~ /\S/ } @{$f}[ 1 .. $#$f - 1 ];
     };
-    is($count->($banner_f), $count->($plain_f),
-        "AC12: cols=$cols -- a banner does not change how many body rows carry side-column content");
+    # The frame is the same height either way -- nothing reflowed.
+    is(scalar(@$banner_f), scalar(@$plain_f),
+        "AC12: cols=$cols -- an alert does not change the frame height (it overlays, it does not displace)");
+
+    # And it covers only what it painted: the count of side-column rows drops by
+    # at most the number of overlay rows, never more. A larger drop would mean
+    # the alert had disturbed the column's layout rather than merely covering
+    # its last rows.
+    my $overlay_rows = scalar grep { ($_->{role} // '') eq 'overlay.warn' } @$banner_f;
+    cmp_ok($overlay_rows, '>=', 1, "AC12: cols=$cols -- the alert really is rendered as an overlay");
+    my $lost = $count->($plain_f) - $count->($banner_f);
+    cmp_ok($lost, '<=', $overlay_rows,
+        "AC12: cols=$cols -- the alert covers at most the rows it painted; the column beneath is not reflowed");
 }
 
 # AC13 -- the other panels are still all there, in the narrower main region.
