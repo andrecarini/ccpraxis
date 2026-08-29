@@ -1523,9 +1523,21 @@ sub triage_model {
     my $err = $o->{error};
     $err = (defined $err && !ref $err && length "$err") ? "$err" : undef;
 
+    # `label` is overridable so the caller can say WHERE IN THE WALK this screen
+    # is ("backpack approval - item 3 of 9"). It defaults to the string this
+    # model has always used, so every existing caller renders identically.
+    #
+    # The progress belongs in the label rather than in a row of its own: this
+    # screen is a security gate whose whole job is to show the operator the
+    # commands about to run as root, and a wizard that spends a body row on
+    # bookkeeping is spending it against that job.
+    my $label = $o->{label};
+    $label = (defined $label && !ref $label && length "$label")
+           ? "$label" : 'backpack approval';
+
     return {
         mode        => 'triage',
-        label       => 'backpack approval',
+        label       => $label,
         error       => $err,
         notice      => AS_ROOT_WARNING(),
         notice_role => 'state.crit',
