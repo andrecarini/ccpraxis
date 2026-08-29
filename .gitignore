@@ -46,3 +46,8 @@ plugins/blueprint/templates/*.lock
 .continuity-active/
 .drive-solo-active/
 .reporter-active/
+# Written by the SessionStart orphan sweep (scripts/hooks/reap-orphans-hook.pl).
+# Same reasoning as the markers above: it only ever exists in the live install,
+# and it appeared as untracked the moment the hook first fired -- which means
+# the next /steward:backup would have committed a runtime log into the repo.
+.reap-orphans.log
