@@ -3,8 +3,8 @@
 # locates perl + the script, then invokes it with passthrough args.
 
 # Locate perl from PowerShell (its PATH typically lacks Git Bash's perl). The
-# resolver is shared with claude-beacon.ps1 — single source of truth, dot-sourced
-# from scripts/_perl-path.ps1 — so the two launchers can't drift apart.
+# resolver lives in _perl-path.ps1 -- single source of truth, dot-sourced
+# from scripts/_perl-path.ps1 -- so the two launchers can't drift apart.
 $perlPathLib = "$env:USERPROFILE\.claude\ccpraxis\scripts\_perl-path.ps1"
 if (-not (Test-Path $perlPathLib)) {
     Write-Host "ERROR: $perlPathLib not found. Re-run the ccpraxis installer (perl ~\.claude\ccpraxis\install.pl --confirm)." -ForegroundColor Red
@@ -28,7 +28,7 @@ if (-not (Test-Path $launcher)) {
 # Hard-disable MSYS2 argument-path conversion for the launcher process tree.
 # MSYS2 silently mangles `podman -v HOST:CONTAINER` mount specs (splits on
 # `:`, runs each side through POSIX->Windows conversion, re-joins with `;`)
-# — podman then bind-mounts a `;C`-suffixed path, breaking onboarding /
+# -- podman then bind-mounts a `;C`-suffixed path, breaking onboarding /
 # CLAUDE.md / settings.json mounts. launcher.pl also sets this internally,
 # but doing it here means the guarantee survives even if someone edits the
 # perl side. See global CLAUDE.md for the full failure mode.

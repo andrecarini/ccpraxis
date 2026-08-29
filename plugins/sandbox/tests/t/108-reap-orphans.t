@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# 38 — the orphan reaper selects exactly what it should, and nothing else.
+# 108 — the orphan reaper selects exactly what it should, and nothing else.
 #
 # Bug report 20260828-095201-7c1e: a perl.exe running a throwaway probe out of a
 # session scratchpad was found alive NINE DAYS AND NINETEEN HOURS after its
