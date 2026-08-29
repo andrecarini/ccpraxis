@@ -270,7 +270,12 @@ sub cmd_init {
             "projects/*/.lock\n" .
             "projects/*/.lock.flock\n\n" .
             "# In-flight sync journals — cleared on successful commit; reconciled on next sync.\n" .
-            "projects/*/.sync-journal.json\n\n" .
+            "# BOTH halves must be listed. The journal is a header document plus an\n" .
+            "# append-only ops log; an unignored ops log shows up as an uncommitted change\n" .
+            "# inside projects/<slug>/, which vault_dirty_files reads as DRIFT — and\n" .
+            "# sync-project then refuses to run at all.\n" .
+            "projects/*/.sync-journal.json\n" .
+            "projects/*/.sync-journal.ops.jsonl\n\n" .
             "# Atomic staging tmps and merge tmps written by vault-sync.pl.\n" .
             "*.vault-sync.tmp\n" .
             "projects/*/.merge-*.tmp\n" .
@@ -973,6 +978,11 @@ sub cmd_sync_project {
 
     acquire_lock($VAULT_LOCK)            or emit_error("Vault lock held by another session.");
     acquire_lock("$vproj/.lock")          or emit_error("Project lock for '$slug' held by another session.");
+
+    # BEFORE anything judges the vault's cleanliness. An existing vault's
+    # .gitignore predates the journal split, so its ops log would read as
+    # uncommitted project content and every sync would report drift.
+    ensure_journal_ignored();
 
     # Reconcile any leftover journal before starting fresh.
     my $reconcile = journal_reconcile($slug, $cwd, $vproj);
@@ -1952,6 +1962,22 @@ sub batch_rename_all {
         push @renamed, $op->{path};
     }
 
+    # PERSIST THE STATUS TRANSITIONS THIS PASS JUST MADE.
+    #
+    # The loop above mutates $op->{status} in memory. Under the old whole-file
+    # journal, the journal_write below persisted that for free. It no longer
+    # does -- journal_write is header-only now -- so the transitions are
+    # appended explicitly. Missing this would leave every op reading 'staged'
+    # forever, and journal_reconcile would try to roll back work that had
+    # already completed.
+    #
+    # One line per op, appended once at the end of the pass: O(n) total, not the
+    # O(n^2) the per-op rewrite was.
+    journal_append_ops($slug,
+        map  { { id => $_->{id}, status => $_->{status} } }
+        grep { ref $_ eq 'HASH' && defined $_->{id} && defined $_->{status} }
+        @{ $j->{ops} || [] });
+
     journal_write($slug, $j);
     return { renamed => \@renamed, rolled_back => \@rolled_back };
 }
@@ -2319,25 +2345,144 @@ sub generate_session_id {
 # Journal
 # ═══════════════════════════════════════════════════════════════════════
 
+# THE JOURNAL IS APPEND-ONLY, and the reason is a measured hour.
+#
+# It used to be one JSON document rewritten in full on every staged file:
+# journal_record_op read the whole journal, pushed one entry, and wrote the whole
+# thing back. That is O(n^2) -- every file pays for every file before it.
+#
+# Measured on a live run (bug report 20260829-222333-2b23), syncing
+# gsa-superapp's 1495 tracked files:
+#
+#     .sync-journal.json   1,533,881 bytes   1507 ops
+#     20 seconds later     1,539,794 bytes   1513 ops     <- SIX files
+#
+# ~3.3s per file and rising, because the per-file cost IS the journal's current
+# size. Moving 107 MB of content meant serializing on the order of a GIGABYTE of
+# JSON. The run passed 90 minutes with ~80 more projected. Small projects hid it
+# completely -- two other projects synced in under a minute each -- and
+# .ccpraxis-local-data/blueprints grows without bound, so every project drifts
+# toward it.
+#
+# SPLIT IN TWO. A small header document holds the run's metadata; the ops go to
+# a sibling append-only log, one JSON object per line. Appending is O(1), so the
+# whole sync is linear.
+#
+#   .sync-journal.json       { started_at, slug, cwd, session_id, phase, ... }
+#   .sync-journal.ops.jsonl  one op per line; later lines UPDATE earlier ones by id
+#
+# Status transitions are appended too, rather than mutated in place: the rename
+# pass records {id, status} lines and journal_read merges them last-wins. That is
+# what lets the log stay append-only while ops still change state.
+#
+# BACKWARD COMPATIBLE, and it has to be: a journal written by the old code may be
+# sitting on disk right now from an interrupted sync, and journal_reconcile has
+# to replay it. journal_read still honours an `ops` array inside the header, and
+# merges the log on top of it.
+# Declared above every user: journal_begin and journal_clear both reset it, and
+# both are defined before journal_record_op, which is what seeds it.
+my %JOURNAL_NEXT_ID;
+
 sub journal_path {
     my $slug = shift;
     return "$VAULT_DIR/projects/$slug/.sync-journal.json";
 }
 
+sub journal_ops_path {
+    my $slug = shift;
+    return "$VAULT_DIR/projects/$slug/.sync-journal.ops.jsonl";
+}
+
+# journal_read($slug) -> the merged journal: header + legacy ops + log.
+#
+# A TRUNCATED TRAILING LINE IS EXPECTED, NOT AN ERROR. It is the one failure an
+# append-only log has that a whole-file rewrite does not: a crash mid-append
+# leaves a partial line. Such a line is skipped -- the op it described never
+# completed, so there is nothing to replay for it -- and every complete line
+# before it still counts. Refusing to parse the whole journal because its last
+# line is short would throw away the entire recovery record.
 sub journal_read {
     my $slug = shift;
     my $path = journal_path($slug);
-    return { ops => [], phase => 'none' } unless -f $path;
-    return read_json($path);
+    my $j = (-f $path) ? read_json($path) : undef;
+    $j = { phase => 'none' } unless ref $j eq 'HASH';
+
+    my @ops;
+    my %by_id;
+    for my $op (@{ (ref $j->{ops} eq 'ARRAY') ? $j->{ops} : [] }) {
+        next unless ref $op eq 'HASH';
+        push @ops, $op;
+        $by_id{ $op->{id} } = $op if defined $op->{id};
+    }
+
+    my $ops_path = journal_ops_path($slug);
+    if (open my $fh, '<:raw', $ops_path) {
+        while (my $line = <$fh>) {
+            next unless $line =~ /\n\z/;          # partial trailing line: skip
+            next unless $line =~ /\S/;
+            my $rec = eval { JSON::PP->new->decode($line) };
+            next unless ref $rec eq 'HASH' && defined $rec->{id};
+            if (my $prev = $by_id{ $rec->{id} }) {
+                $prev->{$_} = $rec->{$_} for keys %$rec;   # later line wins
+            }
+            else {
+                push @ops, $rec;
+                $by_id{ $rec->{id} } = $rec;
+            }
+        }
+        close $fh;
+    }
+
+    $j->{ops} = \@ops;
+    return $j;
 }
 
+# journal_write($slug, $j) -- writes the HEADER ONLY.
+#
+# `ops` is stripped: it lives in the log now, and writing it back would
+# double-count it on the next read. A legacy journal's ops are migrated into the
+# log first, so nothing is lost when old state meets new code.
 sub journal_write {
     my ($slug, $j) = @_;
-    write_json(journal_path($slug), $j);
+    my %header = %$j;
+    my $ops = delete $header{ops};
+
+    if (ref $ops eq 'ARRAY' && @$ops && !-f journal_ops_path($slug)) {
+        journal_append_ops($slug, @$ops);
+    }
+    write_json(journal_path($slug), \%header);
+}
+
+# journal_append_ops($slug, @records) -- the O(1) write path.
+#
+# Opened in append mode per call and closed immediately: the vault lock
+# serializes syncs, so there is one writer, and an fh held open across a crash
+# is one more thing that can lose a buffered line.
+sub journal_append_ops {
+    my ($slug, @records) = @_;
+    return unless @records;
+    my $path = journal_ops_path($slug);
+    make_path(dirname($path));
+    open my $fh, '>>:raw', $path or return;
+    my $enc = JSON::PP->new->canonical;
+    for my $r (@records) {
+        next unless ref $r eq 'HASH';
+        print {$fh} $enc->encode($r), "\n";
+    }
+    close $fh;
 }
 
 sub journal_begin {
     my ($slug, $cwd, $vproj) = @_;
+    # A NEW RUN STARTS A NEW LOG. Without this, a leftover ops log from an
+    # earlier run would be merged into this run's journal by journal_read, and
+    # the rename pass would act on ops that belong to a sync that already
+    # finished. journal_clear normally removes both halves; this is the
+    # belt to that braces, for any path that reaches begin without it.
+    my $ops = journal_ops_path($slug);
+    unlink $ops if -f $ops;
+    delete $JOURNAL_NEXT_ID{$slug};
+
     my $j = {
         started_at => iso_now(),
         slug       => $slug,
@@ -2361,16 +2506,44 @@ sub journal_set_phase {
 # journal_record_op were separate read-modify-writes; a crash between them
 # would advance the id counter but lose the op. Now the id is assigned
 # inside the same read-modify-write that appends the op.
+# THE HOT PATH. One append, no read, no rewrite.
+#
+# The id counter is kept in memory and seeded ONCE from whatever is already on
+# disk. Reading the journal per op to compute the next id would reintroduce
+# exactly the cost this change exists to remove -- the write was only half of
+# it; the decode was the other half.
+#
+# One writer at a time is guaranteed by the vault lock (sync-project holds it
+# for the whole run), so an in-memory counter cannot race another process. The
+# seed is per (process, slug), so a second slug in the same run starts from its
+# own journal rather than inheriting the first one's count.
 sub journal_record_op {
     my ($slug, $op) = @_;
-    my $j = journal_read($slug);
-    unless ($op->{id}) {
-        my $id = $j->{next_op_id} // (scalar(@{$j->{ops}}) + 1);
-        $j->{next_op_id} = $id + 1;
-        $op->{id} = "op-$id";
+    unless (defined $JOURNAL_NEXT_ID{$slug}) {
+        my $j = journal_read($slug);
+        my $max = 0;
+        for my $o (@{ $j->{ops} || [] }) {
+            next unless defined $o->{id} && $o->{id} =~ /^op-(\d+)$/;
+            $max = $1 if $1 > $max;
+        }
+        $JOURNAL_NEXT_ID{$slug} = ($j->{next_op_id} && $j->{next_op_id} > $max + 1)
+                                ? $j->{next_op_id} : $max + 1;
     }
-    push @{$j->{ops}}, $op;
-    journal_write($slug, $j);
+    unless ($op->{id}) {
+        $op->{id} = 'op-' . $JOURNAL_NEXT_ID{$slug}++;
+    }
+    journal_append_ops($slug, $op);
+}
+
+# journal_update_op($slug, $id, %fields) -- record a state change by appending.
+#
+# The rename pass used to mutate op->{status} in memory and rewrite the whole
+# journal. Appending a {id, status} line expresses the same transition, and
+# journal_read merges it last-wins.
+sub journal_update_op {
+    my ($slug, $id, %fields) = @_;
+    return unless defined $id;
+    journal_append_ops($slug, { id => $id, %fields });
 }
 
 # Compatibility shim — old callers may still reference next_op_id. Returns a
@@ -2382,6 +2555,13 @@ sub journal_clear {
     my $slug = shift;
     my $path = journal_path($slug);
     unlink $path if -f $path;
+    # The ops log goes with it. Leaving it behind would make the NEXT sync read
+    # a completed run's ops as though they were an interrupted one's -- the
+    # journal is the record of an in-flight sync, and both halves are that
+    # record.
+    my $ops = journal_ops_path($slug);
+    unlink $ops if -f $ops;
+    delete $JOURNAL_NEXT_ID{$slug};
 }
 
 # Reconcile a leftover journal from a previous interrupted sync.
@@ -2459,6 +2639,35 @@ sub vault_status_clean {
     my $slug = shift;
     my $status = vault_git_output('status', '--porcelain', '--', "projects/$slug/");
     return length($status) == 0;
+}
+
+# ensure_journal_ignored() -- add the ops-log ignore rule to an EXISTING vault.
+#
+# cmd_init writes .gitignore once, at vault creation. Every vault created before
+# the journal was split therefore lacks the ops-log rule -- and an unignored ops
+# log inside projects/<slug>/ is read by vault_dirty_files as DRIFT, which makes
+# sync-project refuse to run at all. That is not a cosmetic gap: it bricks sync
+# on every existing vault until the rule is present.
+#
+# Idempotent, and commits the change itself so the vault does not sit
+# permanently dirty at its root.
+sub ensure_journal_ignored {
+    my $path = "$VAULT_DIR/.gitignore";
+    return unless -f $path;
+    open my $fh, '<:raw', $path or return;
+    local $/;
+    my $text = <$fh>;
+    close $fh;
+    return if index($text, 'projects/*/.sync-journal.ops.jsonl') >= 0;
+
+    $text .= "\n# Append-only ops half of the in-flight sync journal.\n"
+           . "projects/*/.sync-journal.ops.jsonl\n";
+    open my $out, '>:raw', $path or return;
+    print {$out} $text;
+    close $out;
+
+    vault_git_ok('add', '.gitignore');
+    vault_git_ok('commit', '-m', 'vault: ignore the append-only sync journal ops log');
 }
 
 sub vault_dirty_files {
