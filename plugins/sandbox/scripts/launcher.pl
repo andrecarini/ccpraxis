@@ -4317,13 +4317,16 @@ if (! _container_exists($CONTAINER_NAME)) {
             # any future image-internal user/path changes.
             '-e',         'CLAUDE_SANDBOX=1',
         );
-        # Published host-port block, allocated above via PortAlloc. The
-        # base's two sub-ranges (base..base+9 bridged, base+10..base+19 open)
-        # are published here in place of the old hardcoded 9000-9019 literals,
-        # so concurrent sandboxes never collide on the same host ports. The
-        # matching SANDBOX_PORT_BASE / SANDBOX_*_PORTS env vars ride alongside
-        # (build_port_args returns both halves). Empty when no free block was
-        # available (fallback: no published ports).
+        # Published host-port block, allocated above via PortAlloc. The whole
+        # block (base..base+19) is published here in place of the old hardcoded
+        # 9000-9019 literals, so concurrent sandboxes never collide on the same
+        # host ports. The matching SANDBOX_PORT_BASE / SANDBOX_OPEN_PORTS env
+        # vars ride alongside. Empty when no free block was available
+        # (fallback: no published ports).
+        #
+        # ONE range, not two, since 2026-08-29: the bridged half and its socat
+        # forwarder are gone (bug report 20260825-235021-5e5c). All twenty ports
+        # are now plain published ports a server can bind directly.
         push @args, @pub_port_args;
         push @args, @PORT_ENV_ARGS;
         push @args, @EXTRA_ENV;

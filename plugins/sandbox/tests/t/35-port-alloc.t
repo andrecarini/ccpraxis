@@ -7,9 +7,9 @@
 # AC-2  next_free_base: skips occupied bases, finds gaps (not just max+20)
 # AC-3  next_free_base: returns undef when entire space is exhausted
 # AC-4  bases_from_published: floors host ports to block boundaries
-# AC-5  ranges_for_base: returns correct (bridged_lo, bridged_hi, open_lo, open_hi)
-# AC-6  build_port_args: correct -p publish args (legacy base 9000 + new base 9020)
-# AC-7  build_port_args: correct -e env args
+# AC-5  ranges_for_base: returns the block's single published range (open_lo, open_hi)
+# AC-6  build_port_args: correct -p publish args (default base 9000 + base 9020)
+# AC-7  build_port_args: correct -e env args, and NO SANDBOX_BRIDGED_PORTS
 use strict;
 use warnings;
 use FindBin qw($Bin);
@@ -63,12 +63,20 @@ is(PortAlloc::next_free_base([9020]),   9000, 'AC-2: gap at 9000 even though 902
 }
 
 # ---- AC-5: ranges_for_base ------------------------------------------------
+#
+# RE-POINTED 2026-08-29 (bug report 20260825-235021-5e5c). This asserted a
+# 4-element (bridged_lo, bridged_hi, open_lo, open_hi) split. The bridged half
+# is gone -- socat's wildcard bind on 0.0.0.0:N excluded the loopback bind it
+# existed to serve -- so a block is now one published range.
+#
+# The ARITY is asserted, not just the values: a caller still written against the
+# old 4-element shape must be caught here rather than silently receiving undef
+# for two of them and publishing garbage.
 {
-    my ($bl, $bh, $ol, $oh) = PortAlloc::ranges_for_base(9020);
-    is($bl,  9020, 'AC-5: bridged_lo = base');
-    is($bh,  9029, 'AC-5: bridged_hi = base+9');
-    is($ol,  9030, 'AC-5: open_lo    = base+10');
-    is($oh,  9039, 'AC-5: open_hi    = base+19');
+    my @r = PortAlloc::ranges_for_base(9020);
+    is(scalar @r, 2, 'AC-5: ranges_for_base returns exactly 2 values -- one range, not a split');
+    is($r[0], 9020, 'AC-5: open_lo = base');
+    is($r[1], 9039, 'AC-5: open_hi = base+19');
 }
 
 # ---- AC-6 + AC-7: build_port_args (base 9020) -----------------------------
@@ -78,36 +86,49 @@ is(PortAlloc::next_free_base([9020]),   9000, 'AC-2: gap at 9000 even though 902
     # publish args
     is_deeply(
         $pub_ref,
-        ['-p', '9020-9029:9020-9029', '-p', '9030-9039:9030-9039'],
-        'AC-6: build_port_args(9020) publish args exact'
+        ['-p', '9020-9039:9020-9039'],
+        'AC-6: build_port_args(9020) publish args exact -- one range covering the whole block'
     );
 
     # env args — build expected list and compare; also spot-check individual vars
     is_deeply(
         $env_ref,
         ['-e', 'SANDBOX_PORT_BASE=9020',
-         '-e', 'SANDBOX_BRIDGED_PORTS=9020-9029',
-         '-e', 'SANDBOX_OPEN_PORTS=9030-9039'],
+         '-e', 'SANDBOX_OPEN_PORTS=9020-9039'],
         'AC-7: build_port_args(9020) env args exact'
     );
+
+    # SANDBOX_BRIDGED_PORTS IS NOT SET, AT ANY VALUE -- asserted, not merely
+    # absent from the list above. Aliasing it to the open range would keep every
+    # "pin your listener to a bridged port" instruction syntactically working
+    # while making it mean the opposite; an unset variable fails loudly instead.
+    ok(!(grep { /SANDBOX_BRIDGED_PORTS/ } @$env_ref),
+        'AC-7: build_port_args sets no SANDBOX_BRIDGED_PORTS -- the bridge is gone, not renamed');
 }
 
-# ---- AC-6 + AC-7: build_port_args back-compat anchor (base 9000) ----------
+# ---- AC-6 + AC-7: build_port_args at the default base (9000) --------------
+#
+# This anchor's POINT is unchanged and worth restating, because its old name
+# ("back-compat") no longer describes it. It exists so the DEFAULT base -- the
+# one a first sandbox on a clean machine gets -- is pinned independently of the
+# 9020 case above, which could otherwise be satisfied by arithmetic that happens
+# to work only away from the start of the range.
+#
+# What changed is the shape, not the base: one published range instead of two.
 {
     my ($pub_ref, $env_ref) = PortAlloc::build_port_args(9000);
 
     is_deeply(
         $pub_ref,
-        ['-p', '9000-9009:9000-9009', '-p', '9010-9019:9010-9019'],
-        'AC-6: build_port_args(9000) legacy publish args (back-compat)'
+        ['-p', '9000-9019:9000-9019'],
+        'AC-6: build_port_args(9000) publish args at the default base'
     );
 
     is_deeply(
         $env_ref,
         ['-e', 'SANDBOX_PORT_BASE=9000',
-         '-e', 'SANDBOX_BRIDGED_PORTS=9000-9009',
-         '-e', 'SANDBOX_OPEN_PORTS=9010-9019'],
-        'AC-7: build_port_args(9000) legacy env args (back-compat)'
+         '-e', 'SANDBOX_OPEN_PORTS=9000-9019'],
+        'AC-7: build_port_args(9000) env args at the default base'
     );
 }
 

@@ -364,7 +364,6 @@ ccpraxis/
 │   │           ├── 34-claude-json-seed.t
 │   │           ├── 35-port-alloc.t
 │   │           ├── 36-launcher-port-publish.t
-│   │           ├── 37-heartbeat-bridge-range.t
 │   │           ├── 38-global-lock.t
 │   │           ├── 39-ccpraxis-workcopy-detect.t
 │   │           ├── 98-render-spans.t

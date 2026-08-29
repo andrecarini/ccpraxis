@@ -219,12 +219,11 @@ RUN git config --global core.autocrlf input \
 WORKDIR /project
 # Entrypoint: container/heartbeat.sh (extracted from the former inline one-liner
 # so its reap decision is unit-testable — plugins/sandbox/tests/t/08-reap-decision.t).
-#   1. Spawn socat bridges for ports 9000-9009 ONLY (0.0.0.0:N -> 127.0.0.1:N)
-#      so the host-browser OAuth callback redirect reaches Claude Code's
-#      loopback-bound listener. The launcher ALSO publishes 9010-9019, but those
-#      are deliberately left un-bridged (a server binds 0.0.0.0:N there directly,
-#      no socat to collide with) — heartbeat.sh does NOT bridge them.
-#   2. Heartbeat keep-alive. Container survives while /tmp/.launcher-alive was
+# It does ONE thing now. It used to also spawn a socat port bridge, removed
+# 2026-08-29 (bug report 20260825-235021-5e5c) because a wildcard bind on
+# 0.0.0.0:N excludes the loopback bind it existed to serve.
+#
+# Heartbeat keep-alive. Container survives while /tmp/.launcher-alive was
 #      mtime-touched within HB=300s (the host manager `claude-sandbox` refreshes
 #      it every 2 min). A 10s startup grace lets the manager land the first touch.
 #      If the sentinel goes stale (manager terminal closed / laptop asleep):
