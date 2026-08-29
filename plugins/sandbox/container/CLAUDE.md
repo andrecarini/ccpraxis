@@ -143,3 +143,15 @@ Use one of these names instead of `localhost` or `127.0.0.1` when connecting to 
 - Your memories, conversation history, and plans persist in `/project/.ccpraxis-local-data/claude-home/`
 - Auth tokens: your Claude account token (`claudeAiOauth`) is **seeded as a copy from the host at launch** (manager mode re-seeds it when the container is created/restarted), and thereafter this sandbox refreshes its OWN copy in-session — that refresh now persists to disk with no relaunch (Fix 1). Don't hand-edit it. MCP plugin OAuth tokens (`mcpOAuth.*`) are sandbox-owned, written by the standard `claude` / `claude mcp add` auth flow, and persist across container rebuilds. The host's own `.credentials.json` is never touched. If you ever see a loud "the sandbox's OWN OAuth refresh was REJECTED (4xx) / grants DIVERGED" alert, that's the keeper telling you the copied token was rejected — surface it; it's the signal to revisit the copy-token model, not a routine re-login.
 - The container may be rebuilt if it becomes stale (Claude Code version mismatch or > 7 days old, Containerfile changed, etc.). The `backpack` plugin handles re-installing tools/runtimes on rebuild — see above. Project-specific files in `/project` persist across rebuilds via the bind mount.
+
+### Where the launch logs are
+
+Every launch writes two files under `~/.claude/sandbox-logs/`, readable from in here:
+
+```bash
+ls -t ~/.claude/sandbox-logs/ | head        # newest launch first
+# launch-<timestamp>-<pid>.log              -- the launcher's own step log
+# launch-<timestamp>-<pid>.transcript.log   -- full captured output, incl. the backpack install pass
+```
+
+This is worth knowing because `~/.claude/.launcher/` **is a read-only overlay in here**, and its emptiness reads as "nothing was recorded". It isn't — the logs are in `sandbox-logs/`, which is a different directory and writable on the host side. A report filed from a live container (`20260813-011838-82bf`) reached a speculative "the install was probably interrupted" conclusion for exactly this reason, when the transcript would have named the three unprocessed items outright.

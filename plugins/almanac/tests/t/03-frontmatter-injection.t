@@ -520,4 +520,75 @@ for my $case (
        "AC16: the live store's report count is unchanged by this suite ($live_before before, $live_after after)");
 }
 
+# ===========================================================================
+# AC19 -- ORDINARY PUNCTUATION IS NOT A CONTROL CHARACTER.
+#
+# has_forbidden_bytes rejects C0, DEL and C1. Applied to UNDECODED UTF-8 that is
+# wrong for the C1 half: continuation bytes occupy \x80-\xBF, which CONTAINS
+# \x80-\x9F entirely. An em dash is E2 80 94, and 0x94 on its own is
+# indistinguishable from a C1 control.
+#
+# The consequence was not cosmetic. Report 20260813-011838-82bf, titled
+# "ccpraxis backpack — two bugs found from a live container", could not be moved
+# to ANY state: every set-status re-renders the frontmatter, the title tripped
+# this check, and the command died with "internal error — frontmatter field
+# 'title' would contain a line break or control character". The work was long
+# finished; the report was wedged by its own dash.
+#
+# Both halves are asserted together on purpose. Loosening a check that exists to
+# stop frontmatter injection is only safe if the injection cases still fail, so
+# this block proves the punctuation passes AND that every separator still does
+# not.
+# ===========================================================================
+{
+    my $SCRATCH = tempdir(CLEANUP => 1);
+    my %ok = (
+        'em dash'      => "backpack \xe2\x80\x94 two bugs",
+        'en dash'      => "range \xe2\x80\x93 wide",
+        'curly quotes' => "the \xe2\x80\x9cthing\xe2\x80\x9d",
+        'ellipsis'     => "waiting\xe2\x80\xa6",
+        'accented'     => "Andr\xc3\xa9's report",
+    );
+    for my $name (sort keys %ok) {
+        my ($rc, $out) = run('file', '--project', $SCRATCH,
+                             '--title', '"' . $ok{$name} . '"', '--body', '"b"');
+        is($rc, 0, "AC19: a title containing $name is accepted") or diag $out;
+
+        # And it must survive a RE-RENDER, which is where the wedge actually
+        # bit -- filing was never the failing step for 82bf.
+        chomp(my $p = $out);
+        my ($id) = $p =~ m{/([^/]+)\.md$};
+      SKIP: {
+            skip "AC19: no id for $name", 1 unless defined $id;
+            my ($rc2, $out2) = run('set-status', $id, '--project', $SCRATCH, '--to', 'reviewing');
+            is($rc2, 0, "AC19: ...and set-status can still re-render it ($name)") or diag $out2;
+        }
+    }
+
+    # The injection cases must STILL be refused -- this is the half that makes
+    # the loosening safe rather than a hole.
+    #
+    # Asserted IN-PROCESS, not through the CLI, for the reason AC17b already
+    # records above: this suite drives the script through a real shell, and a
+    # bare CR in an argv element does not survive the command line to reach the
+    # code. A first draft ran these through `run()` and the CR case failed --
+    # not because the guard let it through, but because the shell had already
+    # eaten it. That is a test measuring the wrong layer.
+    do $A;
+    my %bad = (
+        'newline'         => "a\nstatus: resolved",
+        'carriage return' => "a\rb",
+        'NUL'             => "a\x00b",
+        'DEL'             => "a\x7Fb",
+        'U+2028 bytes'    => "a\xe2\x80\xa8b",
+        'U+2029 bytes'    => "a\xe2\x80\xa9b",
+        'decoded U+2028'  => "a\x{2028}b",
+        'real C1 byte'    => "a\x94b",     # invalid UTF-8: falls to the byte check
+    );
+    for my $name (sort keys %bad) {
+        ok(AlmanacBug::has_forbidden_bytes($bad{$name}),
+            "AC19: $name is STILL rejected -- the decode does not open a hole");
+    }
+}
+
 done_testing();

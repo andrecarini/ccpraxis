@@ -255,7 +255,39 @@ sub cas_write {
 sub has_forbidden_bytes {
     my ($val) = @_;
     return 0 unless defined $val;
-    return 1 if $val =~ /[\x00-\x08\x0A-\x1F\x7F-\x9F]/;   # C0 (less TAB) + DEL + C1
+
+    # DECODE FIRST WHEN THE BYTES ARE VALID UTF-8.
+    #
+    # The C1 half of the class below (\x80-\x9F) cannot be applied to
+    # UNDECODED UTF-8: continuation bytes occupy \x80-\xBF, which CONTAINS the
+    # whole C1 range. So every ordinary punctuation mark in this repo's own
+    # report titles tripped it -- an em dash is E2 80 94, and 0x94 alone looks
+    # exactly like a C1 control.
+    #
+    # Measured: `set-status` on 20260813-011838-82bf ("ccpraxis backpack — two
+    # bugs found from a live container") died with "field 'title' would contain
+    # a line break or control character" and could not be moved to any state.
+    # The report was already terminal work, wedged by its own em dash. En
+    # dashes, curly quotes and ellipses are all the same shape of failure.
+    #
+    # Decoding costs the real protection nothing. A newline is 0x0A decoded or
+    # not, C0 and DEL are unchanged below 0x80, and U+2028/U+2029 are checked as
+    # characters immediately after. What changes is only that legitimate
+    # punctuation stops being mistaken for a control character.
+    #
+    # Invalid UTF-8 falls through to the byte check unchanged -- a caller that
+    # hands us arbitrary bytes still gets the strict treatment, which is the
+    # case the class was written for.
+    my $checked = $val;
+    if (!utf8::is_utf8($checked)) {
+        my $decoded = eval {
+            require Encode;
+            Encode::decode('UTF-8', $checked, Encode::FB_CROAK());
+        };
+        $checked = $decoded if defined $decoded;
+    }
+
+    return 1 if $checked =~ /[\x00-\x08\x0A-\x1F\x7F-\x9F]/;   # C0 (less TAB) + DEL + C1
     return 1 if $val =~ /\xE2\x80[\xA8\xA9]/;               # UTF-8 U+2028 / U+2029
     # ...and the SAME two separators as DECODED characters. The byte form
     # above covers argv, which arrives un-decoded -- but _render is also
