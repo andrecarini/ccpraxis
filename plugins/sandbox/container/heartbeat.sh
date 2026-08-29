@@ -197,42 +197,29 @@ write_reap_record() {
 }
 
 # =============================================================================
-# PURE PORT RANGE (unit-tested — defined at file scope so sourcing exposes it)
-# =============================================================================
-# bridged_ports -> space-separated list of ports to socat-bridge.
-# Priority:
-#   1. SANDBOX_BRIDGED_PORTS=lo-hi  (explicit range from launcher)
-#   2. SANDBOX_PORT_BASE=N          (base; bridges N..N+9)
-#   3. default                      (9000..9009, back-compat)
-bridged_ports() {
-  if [[ -n "${SANDBOX_BRIDGED_PORTS:-}" && "${SANDBOX_BRIDGED_PORTS}" =~ ^[0-9]+-[0-9]+$ ]]; then
-    local lo hi
-    lo="${SANDBOX_BRIDGED_PORTS%-*}"
-    hi="${SANDBOX_BRIDGED_PORTS#*-}"
-    local ports=()
-    local p
-    for (( p=lo; p<=hi; p++ )); do ports+=("$p"); done
-    echo "${ports[*]}"
-  elif [[ -n "${SANDBOX_PORT_BASE:-}" && "${SANDBOX_PORT_BASE}" =~ ^[0-9]+$ ]]; then
-    local ports=()
-    local p
-    for (( p=SANDBOX_PORT_BASE; p<=SANDBOX_PORT_BASE+9; p++ )); do ports+=("$p"); done
-    echo "${ports[*]}"
-  else
-    echo "9000 9001 9002 9003 9004 9005 9006 9007 9008 9009"
-  fi
-}
-
-# =============================================================================
 # MAIN LOOP
 # =============================================================================
+#
+# THE SOCAT PORT BRIDGE IS GONE (2026-08-29, bug report 20260825-235021-5e5c).
+#
+# This used to start, at container boot, one `socat TCP-LISTEN:$p,fork,reuseaddr
+# TCP:127.0.0.1:$p` per port in a "bridged" half of the block, so that an OAuth
+# callback listener on 127.0.0.1:N would be reachable from the host browser.
+#
+# It could not work, and was measured not to. socat holds 0.0.0.0:N, and a
+# wildcard bind EXCLUDES any later bind on 127.0.0.1:N -- with or without
+# SO_REUSEADDR, tested both ways. So the bridge made the port unbindable by the
+# listener it existed to serve: socat running meant Claude Code could not bind
+# ("OAuth callback port 9060 is already in use"), and socat killed meant the
+# listener bound but nothing could reach it. There was no third state.
+#
+# It also squatted ten ports of every block for the container's whole life, so
+# any wildcard-binding dev server placed there failed with EADDRINUSE.
+#
+# Nothing replaces it, because nothing needs to: Claude Code's MCP auth wizard
+# prints the authorization URL and accepts the pasted callback URL, which
+# completes OAuth with no published port at all.
 main() {
-  # socat bridges for the assigned port block (env-driven; default 9000-9009 back-compat).
-  local p
-  for p in $(bridged_ports); do
-    socat TCP-LISTEN:"$p",fork,reuseaddr TCP:127.0.0.1:"$p" 2>/dev/null &
-  done
-
   local start; start=$(now_epoch)
   local grace_started=0 grace_start=0
   local last_tick; last_tick=$(now_epoch)

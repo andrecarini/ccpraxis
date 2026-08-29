@@ -255,7 +255,39 @@ sub cas_write {
 sub has_forbidden_bytes {
     my ($val) = @_;
     return 0 unless defined $val;
-    return 1 if $val =~ /[\x00-\x08\x0A-\x1F\x7F-\x9F]/;   # C0 (less TAB) + DEL + C1
+
+    # DECODE FIRST WHEN THE BYTES ARE VALID UTF-8.
+    #
+    # The C1 half of the class below (\x80-\x9F) cannot be applied to
+    # UNDECODED UTF-8: continuation bytes occupy \x80-\xBF, which CONTAINS the
+    # whole C1 range. So every ordinary punctuation mark in this repo's own
+    # report titles tripped it -- an em dash is E2 80 94, and 0x94 alone looks
+    # exactly like a C1 control.
+    #
+    # Measured: `set-status` on 20260813-011838-82bf ("ccpraxis backpack — two
+    # bugs found from a live container") died with "field 'title' would contain
+    # a line break or control character" and could not be moved to any state.
+    # The report was already terminal work, wedged by its own em dash. En
+    # dashes, curly quotes and ellipses are all the same shape of failure.
+    #
+    # Decoding costs the real protection nothing. A newline is 0x0A decoded or
+    # not, C0 and DEL are unchanged below 0x80, and U+2028/U+2029 are checked as
+    # characters immediately after. What changes is only that legitimate
+    # punctuation stops being mistaken for a control character.
+    #
+    # Invalid UTF-8 falls through to the byte check unchanged -- a caller that
+    # hands us arbitrary bytes still gets the strict treatment, which is the
+    # case the class was written for.
+    my $checked = $val;
+    if (!utf8::is_utf8($checked)) {
+        my $decoded = eval {
+            require Encode;
+            Encode::decode('UTF-8', $checked, Encode::FB_CROAK());
+        };
+        $checked = $decoded if defined $decoded;
+    }
+
+    return 1 if $checked =~ /[\x00-\x08\x0A-\x1F\x7F-\x9F]/;   # C0 (less TAB) + DEL + C1
     return 1 if $val =~ /\xE2\x80[\xA8\xA9]/;               # UTF-8 U+2028 / U+2029
     # ...and the SAME two separators as DECODED characters. The byte form
     # above covers argv, which arrives un-decoded -- but _render is also
@@ -517,7 +549,40 @@ unless (caller) {
         _reject_multiline('set-status', 'note', $o{note}) if defined $o{note} && !ref $o{note};
         _reject_untrimmed('set-status', 'note', $o{note}) if defined $o{note} && !ref $o{note};
         my $from = $rep->{fields}{status} // 'open';
-        my ($ok, $why) = AlmanacBug::can_transition($from, $to);
+
+        # A REPORT CAN BE OUTSIDE THE MACHINE, AND THEN NOTHING COULD MOVE IT.
+        #
+        # can_transition rejects an unknown CURRENT state, which is right for a
+        # typo but leaves no way out of one. 20260825-193930-fff0 carried
+        # `status: fixed` -- not one of @STATES, so it was written by hand or by
+        # a version that predates this machine. set-status refused it ("unknown
+        # current state 'fixed'") and guard-almanac-write.sh denies editing the
+        # reports directory directly, so the report was wedged: correct by every
+        # rule, and unfixable by every sanctioned path.
+        #
+        # --repair is that path, and it is deliberately narrow. It is honoured
+        # ONLY when the current state is not in @STATES: it can rescue a report
+        # that is already outside the machine, and it can never be used to skip
+        # a legal-but-unwanted transition between valid states (open -> resolved
+        # stays refused, with or without it). The target must still be a real
+        # state.
+        #
+        # The status is NOT silently remapped ('fixed' -> 'resolved' would be
+        # the obvious guess). A guess would hide the drift that produced it, and
+        # the operator is the one who knows which state the report actually
+        # reached.
+        my $from_known = grep { $_ eq $from } @AlmanacBug::STATES;
+        my ($ok, $why);
+        if (!$from_known && $o{repair}) {
+            $ok  = (grep { $_ eq $to } @AlmanacBug::STATES) ? 1 : 0;
+            $why = $ok ? '' : "unknown target state '$to'";
+        }
+        else {
+            ($ok, $why) = AlmanacBug::can_transition($from, $to);
+            $why .= " -- this report is OUTSIDE the state machine, so no transition can "
+                  . "reach it. Re-run with --repair to place it in a valid state."
+                if !$ok && !$from_known;
+        }
         unless ($ok) { print STDERR "almanac-bug set-status: $why\n"; exit 2 }
 
         my %f = %{ $rep->{fields} };
@@ -539,7 +604,7 @@ unless (caller) {
             exit 2;
         }
 
-        print "$id: $from -> $to\n";
+        print "$id: $from -> $to" . (($from_known ? '' : '  (repaired: previous status was outside the state machine)')) . "\n";
         exit 0;
     }
 
@@ -621,8 +686,11 @@ almanac-bug.pl — ccpraxis bug reports, one file per report.
         Create a report in the current project. Prints its path.
   update <id> (--body - | --body-file F) [--title T] [--severity S]
         Revise a report. Allowed ONLY while status is `open`.
-  set-status <id> --to <state> [--note N]
+  set-status <id> --to <state> [--note N] [--repair]
         open -> reviewing -> taken -> resolved|declined  (reviewing -> open to hand back)
+        --repair: ONLY for a report whose current status is not a known state
+        (hand-written, or from before this machine existed). It cannot skip a
+        legal transition between valid states. Put it last on the line.
         Leaving `open` FREEZES the body and records its sha256.
   list [--status S] [--json]        reports in this project
   collect [--status S] [--json]     reports across every project (via the index)

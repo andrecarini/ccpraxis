@@ -454,7 +454,16 @@ sub tee_fallback_route {
 # ===========================================================================
 
 sub STAGE_IDS {
-    return [ 'preflight', 'select', 'image', 'create', 'backpack', 'start', 'install', 'dashboard' ];
+    # 'prepare' covers what used to be a SILENT stretch. Between the select
+    # stage ending and create beginning, the launcher ran ~1600 lines of
+    # main-flow work -- skill mounts, the plugin store, credentials, a WSL
+    # host-IP probe, session selection, the whole claude-home layout -- with no
+    # stage marker. Since _launch_stage_begin is the only thing that repaints in
+    # that phase, the frame kept showing whatever was last drawn: on a stale
+    # sandbox, the operator chose an option and then watched a dead menu for
+    # 20+ seconds (bug report 20260829-194441-fd0a). The work was never the
+    # problem; its invisibility was.
+    return [ 'preflight', 'select', 'image', 'prepare', 'create', 'backpack', 'start', 'install', 'dashboard' ];
 }
 
 sub STAGE_STATES { return [ 'pending', 'active', 'ok', 'skipped', 'failed' ] }
@@ -465,6 +474,7 @@ sub STAGE_LABEL {
         preflight => 'preflight checks',
         select    => 'skills, plugins and MCP',
         image     => 'image build',
+        prepare   => 'host files and mounts',
         create    => 'container create',
         backpack  => 'backpack approval',
         start     => 'container start',
@@ -1513,9 +1523,21 @@ sub triage_model {
     my $err = $o->{error};
     $err = (defined $err && !ref $err && length "$err") ? "$err" : undef;
 
+    # `label` is overridable so the caller can say WHERE IN THE WALK this screen
+    # is ("backpack approval - item 3 of 9"). It defaults to the string this
+    # model has always used, so every existing caller renders identically.
+    #
+    # The progress belongs in the label rather than in a row of its own: this
+    # screen is a security gate whose whole job is to show the operator the
+    # commands about to run as root, and a wizard that spends a body row on
+    # bookkeeping is spending it against that job.
+    my $label = $o->{label};
+    $label = (defined $label && !ref $label && length "$label")
+           ? "$label" : 'backpack approval';
+
     return {
         mode        => 'triage',
-        label       => 'backpack approval',
+        label       => $label,
         error       => $err,
         notice      => AS_ROOT_WARNING(),
         notice_role => 'state.crit',

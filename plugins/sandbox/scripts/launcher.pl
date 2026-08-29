@@ -1610,19 +1610,72 @@ sub _backpack_triage_via_screen {
     # removed the item that had just been APPROVED. The inverse (remove row 0,
     # defer row 1) wrote 'defer' last and made a confirmed, non-undoable
     # remove silently do nothing and report nothing.
+    # ONE ITEM PER SCREEN, NOT ALL OF THEM AT ONCE (bug report
+    # 20260829-194517-fea7; operator, 2026-08-29: "if the backpack approval
+    # overflows I can't really see shit. It just cuts off the bottom.").
+    #
+    # Every pending item contributes FOUR rows here -- its identity, then its
+    # install command, its verify command and its rationale (added because
+    # rendering only the name approved, as root, text the operator was never
+    # shown). Handing the whole list to one screen therefore overflowed at a
+    # handful of items, and the surplus was dropped off the bottom.
+    #
+    # WHY THAT IS WORSE THAN AN UGLY SCREEN. This is a security gate.
+    # BackpackApproval's own header states the case: these commands run AS ROOT
+    # in the container, and approval is keyed to a content hash of the exact
+    # commands so that "you approved specific commands, not just a name". An
+    # operator who cannot read a command cannot give the consent this gate
+    # exists to collect, so truncation means approving unread root commands --
+    # the precise failure the four-row detail was introduced to prevent.
+    #
+    # A wizard dissolves it rather than patching it: one item's four rows always
+    # fit, so there is no list height to overflow and no scroll position to
+    # lose. The model builder is reused UNCHANGED -- triage_model already
+    # handles a one-element list -- rather than growing a second screen type.
+    #
+    # Indices stay keyed to the position in @shown, not to the per-screen
+    # position, which is always 0. That distinction is load-bearing: see the
+    # note below on why a key-keyed map was wrong.
+    #
+    # INDEX-KEYED, not key-keyed. BackpackApproval::item_key joins category
+    # and name with ':', so {npm-global, "a:b"} and {"npm-global:a", b} are
+    # two distinct items with ONE key -- and a key-keyed decision map applied
+    # one row's answer to the other. Measured: approve row 0 + remove row 1
+    # removed the item that had just been APPROVED. The inverse (remove row 0,
+    # defer row 1) wrote 'defer' last and made a confirmed, non-undoable
+    # remove silently do nothing and report nothing.
     my %by_index;
-    if (@shown) {
+    my $total = scalar @shown;
+    for my $i (0 .. $total - 1) {
         my $res = _launch_run_list(
-            tui::LaunchScreens::triage_model(\@shown, $plan->{ok}, error => $plan->{error}));
-        my $d   = $res->{decision};
+            tui::LaunchScreens::triage_model(
+                [ $shown[$i] ], [],
+                error => $plan->{error},
+                label => sprintf('backpack approval - item %d of %d', $i + 1, $total),
+            ));
+        my $d   = ref $res eq 'HASH' ? $res->{decision} : undef;
+        $d = {} unless ref $d eq 'HASH';
+
+        # CANCELLING STOPS THE WALK, and everything not yet decided stays
+        # undecided. It must not fall through to the next item as though the
+        # operator had answered it: BackpackReview::commit treats an absent
+        # index as defer, which is the safe direction (nothing installed,
+        # nothing removed, asked again next launch).
+        last unless $d->{confirmed};
+
         my $tri = (ref $d->{triage_index} eq 'HASH') ? $d->{triage_index} : {};
-        if ($d->{confirmed}) {
-            for my $state ('approve', 'remove', 'defer') {
-                next unless ref $tri->{$state} eq 'ARRAY';
-                $by_index{$_} = $state for @{ $tri->{$state} };
-            }
+        for my $state ('approve', 'remove', 'defer') {
+            next unless ref $tri->{$state} eq 'ARRAY';
+            # The per-screen model holds exactly one row, at position 0; map it
+            # back to this item's real position in @shown.
+            $by_index{$i} = $state for grep { $_ == 0 } @{ $tri->{$state} };
         }
     }
+
+    # The already-approved list is deliberately NOT passed to the per-item
+    # screens. It is identical on every step of the walk, so rendering it M
+    # times would spend rows repeating what needs no decision -- in a gate whose
+    # scarce resource is exactly the rows that show commands.
 
     return BackpackReview::commit(
         plan => $plan, approvals => $approvals, decisions_by_index => \%by_index,
@@ -2929,6 +2982,23 @@ if (@STALE_REASONS) {
     }
     # else 'continue' — fall through to launch as-is
 }
+
+# >>> launch-emit:prepare:BEGIN
+# EVERYTHING FROM HERE TO create IS ONE VISIBLE STAGE (bug report
+# 20260829-194441-fd0a).
+#
+# This stretch had no stage marker at all, and _launch_stage_begin is the only
+# thing that repaints in this phase — so the frame kept displaying whatever was
+# last drawn while the launcher did ~1600 lines of real work: the skills.pl
+# `mounts` child, the plugin store copy, credentials, a `wsl -d ... ip -4 addr`
+# host-IP probe, session selection, and the whole claude-home layout. On a stale
+# sandbox that meant choosing an option and then watching a dead menu for 20+
+# seconds. Every one of those steps is legitimate; none of them announced itself.
+#
+# It is ONE stage rather than six because the operator's question is "is it
+# alive", not "which file is it copying" — and one honest marker beats six that
+# each need their own end-state handling on every early-exit path below.
+_launch_stage_begin('prepare');
 
 # The stale-container prompt. Three paths, in descending order of capability:
 #
@@ -4241,6 +4311,9 @@ my $refresh_port_args = sub {
 # B12: must run BEFORE the create-vs-attach decision below — a container
 # reaped after that decision would be routed down the ATTACH path and never
 # get a port block. Non-declinable; see enforce_container_config_shape above.
+_launch_stage_end('prepare', 'ok');
+# <<< launch-emit:prepare:END
+
 # >>> launch-emit:ports:BEGIN
 enforce_container_config_shape($CONTAINER_NAME);
 
@@ -4317,13 +4390,16 @@ if (! _container_exists($CONTAINER_NAME)) {
             # any future image-internal user/path changes.
             '-e',         'CLAUDE_SANDBOX=1',
         );
-        # Published host-port block, allocated above via PortAlloc. The
-        # base's two sub-ranges (base..base+9 bridged, base+10..base+19 open)
-        # are published here in place of the old hardcoded 9000-9019 literals,
-        # so concurrent sandboxes never collide on the same host ports. The
-        # matching SANDBOX_PORT_BASE / SANDBOX_*_PORTS env vars ride alongside
-        # (build_port_args returns both halves). Empty when no free block was
-        # available (fallback: no published ports).
+        # Published host-port block, allocated above via PortAlloc. The whole
+        # block (base..base+19) is published here in place of the old hardcoded
+        # 9000-9019 literals, so concurrent sandboxes never collide on the same
+        # host ports. The matching SANDBOX_PORT_BASE / SANDBOX_OPEN_PORTS env
+        # vars ride alongside. Empty when no free block was available
+        # (fallback: no published ports).
+        #
+        # ONE range, not two, since 2026-08-29: the bridged half and its socat
+        # forwarder are gone (bug report 20260825-235021-5e5c). All twenty ports
+        # are now plain published ports a server can bind directly.
         push @args, @pub_port_args;
         push @args, @PORT_ENV_ARGS;
         push @args, @EXTRA_ENV;

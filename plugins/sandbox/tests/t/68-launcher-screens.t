@@ -1869,6 +1869,74 @@ _write($BP_EMPTY, '{"version":1,"items":[]}');
         'AC-B5 a broken plan and an empty-but-fine plan render DIFFERENTLY (never both as "nothing packed")');
 }
 
+# --- AC-B5b: the approval walk is BOUNDED per screen -----------------------
+#
+# Bug report 20260829-194517-fea7. Every pending item contributes four rows --
+# its identity, then its install command, its verify command and its rationale
+# (added because rendering only the name approved, as root, text the operator
+# was never shown). Handing the whole pending list to ONE screen therefore grew
+# without bound and was cut off at the bottom of the terminal.
+#
+# That is worse than an ugly screen. This is a security gate: the commands run
+# AS ROOT in the container and approval is keyed to a content hash of the exact
+# commands, so an operator who cannot READ a command cannot give the consent the
+# gate exists to collect. Truncation means approving unread root commands.
+#
+# What is asserted is the property that fixes it: a screen's height does not
+# depend on how many items are pending. Measured before the change: 9 pending
+# produced 36 body rows, 40 produced 160.
+{
+    my @many = map {
+        +{ _approval_key => "apt:pkg-$_",
+           install       => "apt-get install -y pkg-$_",
+           verify        => "command -v pkg-$_",
+           rationale     => "needed for build step $_" }
+    } 1 .. 40;
+
+    my $one_of_many = scalar_ls('triage_model', aref([ $many[0] ]), aref([]));
+    my $one_of_few  = scalar_ls('triage_model', aref([ $many[0] ]), aref([]));
+    my $n_many = scalar @{ aref(href($one_of_many)->{items}) };
+    my $n_few  = scalar @{ aref(href($one_of_few)->{items})  };
+
+    cmp_ok($n_many, '>', 0, 'AC-B5b liveness: a one-item triage model carries rows');
+    is($n_many, $n_few,
+        'AC-B5b a single-item screen is the same size regardless of how many items are pending');
+    cmp_ok($n_many, '<=', 8,
+        "AC-B5b a single-item screen stays small enough to fit a short terminal (got $n_many rows)");
+
+    # And the whole-list form is what it replaced: it DOES grow with N. Asserted
+    # so this pair cannot silently become vacuous if triage_model ever stopped
+    # emitting detail rows -- the bound above would then pass for the wrong
+    # reason.
+    my $all = scalar_ls('triage_model', aref(\@many), aref([]));
+    cmp_ok(scalar @{ aref(href($all)->{items}) }, '>', $n_many * 10,
+        'AC-B5b non-vacuity: the all-at-once form really does grow with the item count');
+}
+
+# --- AC-B5c: the screen can say where in the walk it is --------------------
+#
+# The progress indicator belongs in the label, not a body row: every row this
+# screen spends on bookkeeping is a row it is not spending on the commands it
+# exists to show.
+{
+    my $it = { _approval_key => 'apt:ripgrep', install => 'apt-get install -y ripgrep',
+               verify => 'command -v rg', rationale => 'fast search' };
+
+    my $labelled = scalar_ls('triage_model', aref([$it]), aref([]),
+                             label => 'backpack approval - item 3 of 9');
+    is(bstr(href($labelled)->{label}), 'backpack approval - item 3 of 9',
+        'AC-B5c the label is overridable, so a wizard step can say "item N of M"');
+
+    my $default = scalar_ls('triage_model', aref([$it]), aref([]));
+    is(bstr(href($default)->{label}), 'backpack approval',
+        'AC-B5c omitting the label keeps the string every existing caller already rendered');
+
+    # The root warning survives the override. It is the one line on this screen
+    # that states the stakes, and a caller passing a label must not displace it.
+    cmp_ok(length(bstr(href($labelled)->{notice})), '>', 0,
+        'AC-B5c a labelled screen still carries the AS-ROOT notice');
+}
+
 # --- AC-B7: the screen module cannot persist anything itself ---------------
 {
     my $ls_src = _comment_stripped(bstr(slurp($LS_PM)));
@@ -2094,6 +2162,42 @@ my %PRINT_DETECTORS = (
     my $end_body = extract_sub_body($LSRC, 'END {');
     cmp_ok(index(bstr($end_body), 'tui::LaunchScreens::host_leave'), '>=', 0,
         'AC-W6 the END block also tears the host down (guarded)');
+
+    # AC-W6c -- the approval walk asks ONE ITEM PER SCREEN.
+    #
+    # Bug report 20260829-194517-fea7. Handing the whole pending list to one
+    # triage screen overflowed the terminal and dropped the surplus off the
+    # bottom -- in a gate whose commands run AS ROOT and whose approval is
+    # hashed to those exact commands, so unread meant unconsented.
+    #
+    # t/68's AC-B5b pins the MODEL side (a one-item screen is bounded). This
+    # pins the WIRING side: the launcher must not hand the whole array back to
+    # it. Asserted as the absence of the old shape rather than the presence of
+    # the new one -- there are many ways to write a loop, and only one way to
+    # regress.
+    my $walk = extract_sub_body($LSRC, 'sub _backpack_triage_via_screen');
+    ok(defined $walk, 'AC-W6c located _backpack_triage_via_screen');
+  SKIP: {
+        skip 'walk body not found', 2 unless defined $walk;
+        my $w = bstr($walk);
+        cmp_ok(index($w, 'triage_model'), '>=', 0,
+            'AC-W6c liveness: the walk really does build a triage model');
+        # \Q...\E, not a hand-escaped pattern. The first version of this
+        # assertion used /triage_model\s*\(\s*\\\@shown\b/ and was VACUOUS: it
+        # matched neither the old shape nor the new one, so it reported the fix
+        # as verified while testing nothing. Caught by running it against the
+        # old line. A guard for a regression must be shown to fail on the
+        # regression -- the counter-fixture below does exactly that, in-file, so
+        # it cannot rot into a tautology again.
+        my $OLD_SHAPE = 'triage_model(\@shown';
+        ok(index($w, $OLD_SHAPE) < 0,
+            'AC-W6c the walk does NOT pass the whole pending list to one screen');
+
+        my $old_line = 'my $res = _launch_run_list(tui::LaunchScreens::'
+                     . 'triage_model(\@shown, $plan->{ok}, error => $plan->{error}));';
+        cmp_ok(index($old_line, $OLD_SHAPE), '>=', 0,
+            'AC-W6c counter-fixture: the same test really does flag the all-at-once shape');
+    }
 
     # AC-W6b counter-fixture: the SAME comparator on a hand-built string with
     # the two calls reversed must report a violation.

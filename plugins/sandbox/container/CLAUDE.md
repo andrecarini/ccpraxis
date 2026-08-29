@@ -66,27 +66,25 @@ Beyond the ≥7-day rule above and the backpack-declaration guidance: default to
 
 ## Network / Ports
 
-Two port ranges are published 1:1 to the host. **Anything you want reachable from the host browser must bind to a port in one of them** — no other ports are forwarded.
+One port range is published 1:1 to the host. **Anything you want reachable from the host browser must bind to a port in it** — no other ports are forwarded.
 
-The launcher injects the exact ranges into the container via environment variables:
-- **`$SANDBOX_BRIDGED_PORTS`** — the socat-bridged range (e.g. `9020-9029`). When unset, the back-compat default is `9000-9009`.
-- **`$SANDBOX_OPEN_PORTS`** — the published-but-not-bridged range (e.g. `9030-9039`). When unset, the back-compat default is `9010-9019`.
+The launcher injects the exact range into the container via environment variables:
+- **`$SANDBOX_OPEN_PORTS`** — the published range (e.g. `9020-9039`).
+- **`$SANDBOX_PORT_BASE`** — its first port, as a bare number.
 
-Read your actual assigned ranges from those env vars rather than assuming fixed numbers.
+Read your actual assigned range from those env vars rather than assuming fixed numbers.
 
-**Bridged range (`$SANDBOX_BRIDGED_PORTS`) — published AND socat-bridged.** At container startup a `socat` forwarder is listening on `0.0.0.0:N` for each port in this range, forwarding to `127.0.0.1:N` (see the OAuth section below for why). Two consequences:
-  - Use these when a service binds **loopback** (`127.0.0.1:N`) and needs to be reached from the host — chiefly Claude Code's OAuth callback receiver. The bridge carries the host→loopback hop.
-  - A server that binds the **wildcard** `0.0.0.0:N` here will collide with the squatting socat (`EADDRINUSE`, since socat uses `SO_REUSEADDR`, not `SO_REUSEPORT`). You'd have to kill that port's socat first (`pkill -f "TCP-LISTEN:N"`). Avoid the hassle — put wildcard-binding servers on the open range instead.
+Nothing listens on these ports at container startup, so a server can bind `0.0.0.0:N` directly and it is immediately host-reachable. There is nothing to evict and nothing to collide with.
 
-**Open range (`$SANDBOX_OPEN_PORTS`) — published, NOT bridged. Prefer these for dev servers and emulators.** Nothing listens on them at startup, so a server can bind `0.0.0.0:N` directly and it's immediately host-reachable. No socat, nothing to evict. This is the common case — reach for this range first.
+> **There is no longer a "bridged" range, and `$SANDBOX_BRIDGED_PORTS` is unset.** Half of every block used to be held open by a `socat` forwarder on `0.0.0.0:N` so that a loopback OAuth listener would be host-reachable. It could not work: a wildcard bind on `0.0.0.0:N` excludes any later bind on `127.0.0.1:N`, with or without `SO_REUSEADDR`, so the forwarder made the port unbindable by the listener it existed to serve. It also squatted ten ports of every block. Removed 2026-08-29; see the OAuth section for what to do instead.
 
 ### Sharing the URL with the user
 
-When you print the URL for the user to open, prefer `$SANDBOX_HOST_IP` if it's set. Pick any port from the published range that fits your use case:
+When you print the URL for the user to open, prefer `$SANDBOX_HOST_IP` if it's set. Pick any port from the published range:
 
 ```bash
 HOST=${SANDBOX_HOST_IP:-localhost}
-# Pick a port from $SANDBOX_OPEN_PORTS or $SANDBOX_BRIDGED_PORTS as appropriate
+PORT=$(echo "$SANDBOX_OPEN_PORTS" | cut -d- -f1)
 echo "Open http://${HOST}:${PORT}"
 ```
 
@@ -94,30 +92,24 @@ The launcher auto-injects `SANDBOX_HOST_IP` on Windows+Podman, where the host's 
 
 The env var is captured at container-create time, so if the user runs `wsl --shutdown` or reboots and then re-attaches to an existing sandbox, the value may be stale — a fresh `claude-sandbox` launch (which re-creates if needed) refreshes it.
 
-Example: serve a Flutter web build on the first port of the open range:
+Example: serve a Flutter web build on the first port of the range:
 ```bash
 PORT=$(echo "$SANDBOX_OPEN_PORTS" | cut -d- -f1)
-dhttpd --port "${PORT:-9010}" --path build/web
+dhttpd --port "${PORT:-9000}" --path build/web
 ```
 
 ### OAuth Callbacks for MCP Servers
 
-When an MCP server requires OAuth authentication, Claude Code starts a local callback listener on `127.0.0.1:<port>` and opens the OAuth provider's URL in the host browser. The provider then redirects to `http://localhost:<port>/callback?code=...` — which must reach the listener inside this container.
+When an MCP server requires OAuth, Claude Code starts a local callback listener and opens the provider's URL in a browser. Inside a container the browser is on the host, so the redirect cannot reach the listener — and no port forwarding fixes that, for the reason in the note above.
 
-A `socat` bridge runs at container startup forwarding every port in `$SANDBOX_BRIDGED_PORTS` from `0.0.0.0:N` → `127.0.0.1:N`. So any OAuth listener Claude Code starts on a port in that range receives the callback from the host browser via the Podman port map; listeners on any other port do not.
+**Use the manual flow. It works, needs no published port, and is the same for manually-added and plugin-installed MCPs.** Claude Code's auth wizard prints the authorization URL and accepts the pasted callback URL:
 
-To find the bridged range at runtime:
-```bash
-echo "Bridged ports: $SANDBOX_BRIDGED_PORTS"
-BRIDGE_LO=$(echo "${SANDBOX_BRIDGED_PORTS:-9000-9009}" | cut -d- -f1)  # default 9000-9009 back-compat
-```
+1. Start the auth flow (`/mcp`, or `claude mcp add ...`).
+2. Copy the authorization URL it prints and open it in your host browser.
+3. Complete the login there. The provider redirects to a `localhost` URL that will fail to load — that is expected and harmless.
+4. Copy that failed URL out of the address bar and paste it back into Claude Code.
 
-- **`claude mcp add` (manually-added MCPs)**: pass `--callback-port <N>` where N is any port in `$SANDBOX_BRIDGED_PORTS` to pin the listener onto a bridged port. Example (using the first bridged port):
-  ```bash
-  BRIDGE_LO=$(echo "${SANDBOX_BRIDGED_PORTS:-9000-9009}" | cut -d- -f1)  # default 9000-9009 back-compat
-  claude mcp add notion --transport http --callback-port "$BRIDGE_LO" https://mcp.notion.com/mcp
-  ```
-- **Plugin-installed MCPs**: the callback port is chosen randomly by Claude Code and **cannot be overridden** today. If the random port happens to fall in `$SANDBOX_BRIDGED_PORTS` the auth flow works; otherwise it times out. Workaround: re-`/auth` until you get a lucky port, or remove the plugin's MCP entry and re-add it manually with `claude mcp add ... --callback-port "$BRIDGE_LO"`.
+Do **not** pass `--callback-port`, and do not re-run `/auth` hoping for a luckier port — there is no port that works, which is why the machinery that promised one was removed.
 
 ### Installing plugins
 
@@ -151,3 +143,15 @@ Use one of these names instead of `localhost` or `127.0.0.1` when connecting to 
 - Your memories, conversation history, and plans persist in `/project/.ccpraxis-local-data/claude-home/`
 - Auth tokens: your Claude account token (`claudeAiOauth`) is **seeded as a copy from the host at launch** (manager mode re-seeds it when the container is created/restarted), and thereafter this sandbox refreshes its OWN copy in-session — that refresh now persists to disk with no relaunch (Fix 1). Don't hand-edit it. MCP plugin OAuth tokens (`mcpOAuth.*`) are sandbox-owned, written by the standard `claude` / `claude mcp add` auth flow, and persist across container rebuilds. The host's own `.credentials.json` is never touched. If you ever see a loud "the sandbox's OWN OAuth refresh was REJECTED (4xx) / grants DIVERGED" alert, that's the keeper telling you the copied token was rejected — surface it; it's the signal to revisit the copy-token model, not a routine re-login.
 - The container may be rebuilt if it becomes stale (Claude Code version mismatch or > 7 days old, Containerfile changed, etc.). The `backpack` plugin handles re-installing tools/runtimes on rebuild — see above. Project-specific files in `/project` persist across rebuilds via the bind mount.
+
+### Where the launch logs are
+
+Every launch writes two files under `~/.claude/sandbox-logs/`, readable from in here:
+
+```bash
+ls -t ~/.claude/sandbox-logs/ | head        # newest launch first
+# launch-<timestamp>-<pid>.log              -- the launcher's own step log
+# launch-<timestamp>-<pid>.transcript.log   -- full captured output, incl. the backpack install pass
+```
+
+This is worth knowing because `~/.claude/.launcher/` **is a read-only overlay in here**, and its emptiness reads as "nothing was recorded". It isn't — the logs are in `sandbox-logs/`, which is a different directory and writable on the host side. A report filed from a live container (`20260813-011838-82bf`) reached a speculative "the install was probably interrupted" conclusion for exactly this reason, when the transcript would have named the three unprocessed items outright.
