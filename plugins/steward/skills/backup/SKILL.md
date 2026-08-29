@@ -348,7 +348,7 @@ Otherwise list registered projects on this machine:
 perl "${CLAUDE_PLUGIN_ROOT}/scripts/vault-sync.pl" list-projects
 ```
 
-If `projects` is empty, skip to Step 5.6.
+If `projects` is empty, skip to Step 5.7.
 
 For each entry in `projects` (sequentially — the vault lock serializes them; do NOT parallelize):
 
@@ -431,33 +431,6 @@ Handle the response:
 
 Collect per-project results (slug, status, conflict count, rolled-back count, sensitive-blocked status) for Step 7's report.
 
-## Step 5.6: Sync beacon vault data
-
-Beacons live at the vault root in `beacons/<uuid>.json` (separate from per-project content). They're written locally by `/beacon:on` (host) and by the statusline-triggered background sync that ingests sandbox beacons. `/steward:backup` commits and pushes them so they survive across machines.
-
-First check the vault exists locally (reuse the same check as Step 5.5):
-
-```bash
-[ -d "$HOME/.claude/claude-code-vault/.git" ] && echo "VAULT_OK" || echo "VAULT_MISSING"
-```
-
-If `VAULT_MISSING`, skip this step.
-
-Otherwise:
-
-```bash
-perl "${CLAUDE_PLUGIN_ROOT}/scripts/vault-sync.pl" sync-beacons
-```
-
-Parse the JSON `status`:
-
-- `no_op` — no beacons in the vault (empty dir/absent OR nothing to push). Skip silently.
-- `synced` — note the result in Step 7's report. The response includes `count` (current beacon records), `committed` (bool — whether a commit was made this run), `pushed` (bool — whether a push happened), `ingested` (sandbox beacons newly copied into the vault), `ingest_skipped` (sandbox beacons already up-to-date). Summarize as e.g. "Synced N beacons (M ingested from sandboxes; committed; pushed)" or "Synced N beacons (no changes)".
-- `sensitive_blocked` — surface `findings` (each has `file`, `line`, `pattern`). Vault was NOT modified by this run, but the offending content lives in beacon JSONs. Tell the user to fix them (delete the offending beacon via `/beacon:delete <id-or-prefix>` OR open the JSON directly and remove the secret from the label/summary), then re-run `/steward:backup`. Do not auto-redact — beacon labels are user-supplied and should be edited intentionally.
-- `error` — surface the error verbatim; continue with the remaining steps. If the error is "git push failed", reassure the user that the local commit DID succeed and the next `/steward:backup` run will automatically detect the unpushed commit (via `vault_ahead_behind`) and retry the push — no manual git recovery needed.
-
-If the response has `ingest_errors` (sandbox ingestion partial failures), mention them informationally — the main commit/push still proceeded.
-
 ## Step 5.7: Offer registration for unregistered current project
 
 ```bash
@@ -534,7 +507,6 @@ Summarize:
 - ccpraxis sync: what was merged, what was committed, whether the push succeeded; any `preferences_applied` / `preferences_ignored` from the Step 3 export merge
 - Marketplaces: any added/changed
 - Vault projects (Step 5.5): per-slug status (synced / conflicts-resolved / aborted / sensitive-blocked / error); count of files pushed/pulled per project
-- Beacons (Step 5.6): one line — "N beacons synced (committed/pushed)" or "no changes" or "skipped (vault missing)" or "sensitive_blocked" with the findings if any
 - Current-project registration prompt (Step 5.7): offered? user's choice?
 - Plugins: any installed or missing
 - Claude Code snapshots: count, plus newest id and version (from Step 6.6). One line. Mention the revert command: `perl ${CLAUDE_PLUGIN_ROOT}/scripts/claude-binary-backup.pl restore --latest`.
