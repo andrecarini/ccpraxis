@@ -58,13 +58,30 @@ and a combined report cannot be half-fixed.
 
 ## Revising
 
-While the status is `open`, revise freely:
+While the status is `open`, revise freely — but pick the verb that matches what you mean.
+
+**Adding to a report — this is the common case.** Recording progress, evidence found later, a
+correction. `append` cannot lose what is already there:
 
 ```bash
-almanac-bug.pl update <id> --body - <<'REPORT'
+almanac-bug.pl append <id> --body - <<'REPORT'
 ...
 REPORT
 ```
+
+**Replacing a report wholesale.** Rewriting your own just-filed report. `--replace` is required
+whenever the existing body would not survive, and that is deliberate: `update` used to discard the
+report in one step with no confirmation, and there is no undo — reports live under a gitignored
+directory. It erased the evidence in `20260828-095201-7c1e` (the pid, the nine-day uptime, the CPU
+figure) during a routine progress note; that was recoverable only by luck.
+
+```bash
+almanac-bug.pl update <id> --body - --replace <<'REPORT'
+...
+REPORT
+```
+
+Reach for `append` unless you genuinely mean to throw the old text away.
 
 Once it reaches `reviewing` it is **frozen** — that is what lets a reviewer read it without you
 rewriting it underneath them, and what makes `taken` mean something. If you learn more after that,

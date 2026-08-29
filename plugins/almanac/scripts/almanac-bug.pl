@@ -438,7 +438,23 @@ unless (caller) {
     my %o;
     while (@ARGV) {
         my $a = shift @ARGV;
-        if ($a =~ /^--([a-z0-9-]+)$/) { $o{$1} = (@ARGV && $ARGV[0] !~ /^--/) ? shift @ARGV : 1 }
+        # $1 IS CAPTURED BEFORE THE LOOKAHEAD, and that is not style.
+        #
+        # The lookahead `$ARGV[0] !~ /^--/` is itself a match, and a SUCCESSFUL
+        # match resets every capture variable. So when a boolean flag was
+        # followed by another flag -- `--replace --body x` -- the lookahead
+        # matched `^--`, $1 became undef, and the option was stored under the
+        # empty key. The flag was silently dropped: no error, no warning beyond
+        # an "uninitialized value $1" under -w, and the command ran as though it
+        # had never been passed.
+        #
+        # Latent until 2026-08-29, because every flag in this CLI happened to be
+        # written with a value after it. `--replace` and `--repair` are the
+        # first booleans, and t/04 caught it immediately.
+        if ($a =~ /^--([a-z0-9-]+)$/) {
+            my $key = $1;
+            $o{$key} = (@ARGV && $ARGV[0] !~ /^--/) ? shift @ARGV : 1;
+        }
         else { $o{_pos} ||= []; push @{$o{_pos}}, $a }
     }
     my @pos  = @{ $o{_pos} // [] };
@@ -514,6 +530,28 @@ unless (caller) {
         }
         my $body = _slurp_arg(%o);
         die "almanac-bug update: --body or --body-file is required\n" unless defined $body && $body =~ /\S/;
+
+        # UPDATE MUST NOT SILENTLY DESTROY THE REPORT IT IS UPDATING.
+        #
+        # `update` replaces the body wholesale. That is a legitimate verb, but
+        # its most common use is adding progress to a report -- and the obvious
+        # invocation for that (`--body-file <my new section>`) DELETES
+        # everything the filer wrote, in one step, with no confirmation.
+        #
+        # There is no undo. Reports live under .ccpraxis-local-data/, which is
+        # gitignored, so nothing recovers the previous text.
+        #
+        # Done exactly that on 20260828-095201-7c1e, 2026-08-29: an update
+        # intended to record progress erased the original evidence -- the pid,
+        # the nine-day uptime, the CPU figure, the probe source. It was
+        # recoverable only because the whole report happened to still be in the
+        # agent's context. Next time it will not be.
+        #
+        # So: if the existing body would not survive the write, refuse and name
+        # both ways forward. --replace is for a caller who genuinely means to
+        # rewrite; `append` is for the case that keeps being reached for by
+        # mistake.
+        # (the discard guard runs AFTER argument validation — see below)
         _reject_multiline('update', 'title', $o{title}) if defined $o{title} && !ref $o{title};
         _reject_untrimmed('update', 'title', $o{title}) if defined $o{title} && !ref $o{title};
         _reject_multiline('update', 'severity', $o{severity}) if defined $o{severity} && !ref $o{severity};
@@ -522,6 +560,22 @@ unless (caller) {
             die "almanac-bug update: --severity must be one of: " . join(', ', @AlmanacBug::SEVERITIES) . "\n"
                 unless AlmanacBug::valid_severity($o{severity});
         }
+        # LAST, so a malformed argument is still reported as a malformed
+        # argument. Placed before the validation on the first attempt, this
+        # guard answered "your --title contains a newline" with "this would
+        # discard the body" -- true, but not the thing the caller got wrong.
+        # t/03's injection oracles caught it.
+        my $old = defined $rep->{body} ? $rep->{body} : '';
+        if ($old =~ /\S/ && index($body, $old) < 0 && !$o{replace}) {
+            my ($ol, $nl) = (scalar(() = $old =~ /\n/g) + 1, scalar(() = $body =~ /\n/g) + 1);
+            print STDERR
+                "almanac-bug update: refused — this would DISCARD the existing body of '$id' "
+              . "($ol lines replaced by $nl), and there is no undo: reports are gitignored.\n"
+              . "  To add to the report:      almanac-bug.pl append $id --body-file <file>\n"
+              . "  To genuinely rewrite it:   almanac-bug.pl update $id --body-file <file> --replace\n";
+            exit 2;
+        }
+
         my %f = %{ $rep->{fields} };
         $f{title} = $o{title} if defined $o{title} && !ref $o{title};
         $f{severity} = $o{severity} if defined $o{severity} && !ref $o{severity};
@@ -533,6 +587,50 @@ unless (caller) {
             exit 2;
         }
 
+        print "$path\n";
+        exit 0;
+    }
+
+    # append <id> (--body - | --body-file F)
+    #
+    # The verb `update` kept being used for. Adds to the end of the body and
+    # cannot lose what is already there, so recording progress on an open report
+    # is no longer one keystroke away from erasing it.
+    #
+    # Same freeze rule as update: allowed only while the status is mutable. A
+    # frozen report's content is frozen whether you are replacing it or adding
+    # to it -- a reviewer must be able to trust that what they read is what was
+    # filed, and an appended paragraph changes that as surely as a rewrite.
+    if ($cmd eq 'append') {
+        my $id = $pos[0] or die "almanac-bug append: <id> required\n";
+        my $path = $find->($id) or die "almanac-bug append: no report '$id'\n";
+        my $rep  = AlmanacBug::load($path) or die "almanac-bug append: $path is unreadable or malformed\n";
+        die "almanac-bug append: '$id' has MALFORMED: duplicate frontmatter key "
+          . "'$rep->{duplicate_key}' — refusing to operate on a possibly-forged report\n"
+            if $rep->{duplicate_key};
+        _race_test_hook();
+        my $st = $rep->{fields}{status} // 'open';
+        unless ($AlmanacBug::MUTABLE{$st}) {
+            print STDERR "almanac-bug append: refused — '$id' is $st, and content is frozen from "
+                       . "'reviewing' onward. Add a follow-up report instead.\n";
+            exit 2;
+        }
+        my $add = _slurp_arg(%o);
+        die "almanac-bug append: --body or --body-file is required\n"
+            unless defined $add && $add =~ /\S/;
+
+        my $old = defined $rep->{body} ? $rep->{body} : '';
+        $old =~ s/\s+\z//;
+        my $body = length($old) ? "$old\n\n$add" : $add;
+
+        my %f = %{ $rep->{fields} };
+        $f{updated_at} = AlmanacBug::_iso(time);
+        my ($cas_ok, $cas_why) = AlmanacBug::cas_write($rep, AlmanacBug::_render(\%f, $body));
+        unless ($cas_ok) {
+            print STDERR "almanac-bug append: refused — '$id' $cas_why. "
+                       . "Retry the command; do not assume it partially applied.\n";
+            exit 2;
+        }
         print "$path\n";
         exit 0;
     }
@@ -684,8 +782,13 @@ almanac-bug.pl — ccpraxis bug reports, one file per report.
 
   file --title T (--body - | --body-file F) [--severity S] [--area A] [--project ROOT]
         Create a report in the current project. Prints its path.
-  update <id> (--body - | --body-file F) [--title T] [--severity S]
-        Revise a report. Allowed ONLY while status is `open`.
+  append <id> (--body - | --body-file F)
+        Add to the end of a report's body. Allowed ONLY while status is `open`.
+        Use this to record progress — it cannot lose what is already there.
+  update <id> (--body - | --body-file F) [--title T] [--severity S] [--replace]
+        REPLACE a report's body. Allowed ONLY while status is `open`.
+        Refuses when the existing body would be discarded unless --replace is
+        given; there is no undo, as reports are gitignored.
   set-status <id> --to <state> [--note N] [--repair]
         open -> reviewing -> taken -> resolved|declined  (reviewing -> open to hand back)
         --repair: ONLY for a report whose current status is not a known state

@@ -57,9 +57,18 @@ my ($rc_nb) = run('file', '--project', $PROJ, '--title', '"empty"');
 isnt($rc_nb, 0, 'file: refuses a report with no body');
 
 # ---- update while open -----------------------------------------------------
-my ($rc_u) = run('update', $id, '--project', $PROJ, '--body', '"revised while open"');
-is($rc_u, 0, 'update: allowed while open');
-like(body_of($path), qr/revised while open/, 'update: the body actually changed');
+#
+# RE-POINTED 2026-08-29: a whole-body REPLACEMENT now requires --replace.
+#
+# The claim being asserted is unchanged -- a filer can still revise their own
+# report while it is open, and the revision really lands. What changed is that
+# the destructive form must say so, because `update` was one keystroke away from
+# erasing a report and there is no undo (reports are gitignored). That happened
+# to 20260828-095201-7c1e; see the destructive-update block further down, which
+# pins both the refusal and the escape hatches.
+my ($rc_u) = run('update', $id, '--project', $PROJ, '--body', '"revised while open"', '--replace');
+is($rc_u, 0, 'update --replace: allowed while open');
+like(body_of($path), qr/revised while open/, 'update --replace: the body actually changed');
 
 # ---- freeze ----------------------------------------------------------------
 my ($rc_r) = run('set-status', $id, '--project', $PROJ, '--to', 'reviewing');
@@ -100,7 +109,11 @@ isnt($rc_term, 0, 'resolved is TERMINAL — no transitions out of it');
     run('set-status', $id2, '--project', $PROJ, '--to', 'reviewing');
     is((run('set-status', $id2, '--project', $PROJ, '--to', 'open'))[0], 0, 'reviewing -> open hands it back');
     is(field_of($p2, 'content_sha256'), undef, 'handing back CLEARS the digest');
-    is((run('update', $id2, '--project', $PROJ, '--body', '"more detail"'))[0], 0,
+    # `append` rather than `update --replace`: the claim here is that handing a
+    # report back to the filer lets them EDIT it again, and adding detail is the
+    # shape that actually means. Using the destructive verb to prove
+    # "editable" was always slightly beside the point.
+    is((run('append', $id2, '--project', $PROJ, '--body', '"more detail"'))[0], 0,
        '...and the filer can edit again');
 }
 
@@ -189,6 +202,79 @@ isnt($rc_term, 0, 'resolved is TERMINAL — no transitions out of it');
     # And nothing was written outside the projects themselves.
     ok(!-e "$HOME2/.claude/almanac", 'no index directory is created under $HOME');
     ok(!-e "$HOME2/.claude/ccpraxis/bug-index.jsonl", 'nothing is written into the live install');
+}
+
+# ---- update must not silently destroy the report it is updating -----------
+#
+# `update` replaces the body wholesale. That is a legitimate verb, but its most
+# common use is ADDING progress -- and the obvious invocation for that deletes
+# everything the filer wrote, in one step, with no confirmation and no undo
+# (reports live under a gitignored directory).
+#
+# Done exactly that to 20260828-095201-7c1e on 2026-08-29: an update meant to
+# record progress erased the original evidence -- the pid, the nine-day uptime,
+# the CPU figure, the probe source. It was recoverable only because the whole
+# report happened to still be in the agent's context.
+#
+# Three properties, and the third is what keeps this from being a nuisance
+# rather than a guard: a deliberate rewrite must still be possible.
+{
+    my $ap = "$PROJ/orig-body.md";
+    open my $ofh, '>', $ap or die "fixture: $!"; print {$ofh} "ORIGINAL EVIDENCE\npid 87244\n"; close $ofh;
+    my $np = "$PROJ/new-body.md";
+    open my $nfh, '>', $np or die "fixture: $!"; print {$nfh} "PROGRESS NOTE\nfixed in abc123\n"; close $nfh;
+
+    my (undef, $out) = run('file', '--project', $PROJ, '--title', '"destructive-update probe"',
+                           '--severity', 'low', '--area', 'sandbox', '--body-file', qq{"$ap"});
+    chomp(my $dpath = $out);
+    my ($did) = $dpath =~ m{/([^/]+)\.md$};
+
+    # 1. The destructive shape is refused, and the refusal names BOTH ways out.
+    my ($rc_d, $out_d) = run('update', $did, '--project', $PROJ, '--body-file', qq{"$np"});
+    isnt($rc_d, 0, 'update: refuses a body that would discard the existing one');
+    like($out_d, qr/\bappend\b/,   'update: ...the refusal points at `append`');
+    like($out_d, qr/--replace/,    'update: ...and at --replace');
+    like(body_of($dpath), qr/pid 87244/, 'update: the original body is untouched after the refusal');
+
+    # 2. append keeps both halves.
+    my ($rc_a) = run('append', $did, '--project', $PROJ, '--body-file', qq{"$np"});
+    is($rc_a, 0, 'append: succeeds on an open report');
+    like(body_of($dpath), qr/pid 87244/,      'append: the original body survives');
+    like(body_of($dpath), qr/fixed in abc123/, 'append: ...and the new text is there too');
+
+    # 3. A deliberate rewrite is still possible -- otherwise this guard would
+    #    just be an obstacle, and the next person would route around it.
+    my ($rc_r) = run('update', $did, '--project', $PROJ, '--body-file', qq{"$np"}, '--replace');
+    is($rc_r, 0, 'update --replace: an intentional rewrite is still allowed');
+    unlike(body_of($dpath), qr/pid 87244/, 'update --replace: ...and it really did replace');
+
+    # 3b. A BOOLEAN FLAG FOLLOWED BY ANOTHER FLAG MUST SURVIVE PARSING.
+    #
+    # The CLI parser read `--foo` then decided whether the NEXT argv element was
+    # its value, using `$ARGV[0] !~ /^--/`. That lookahead is itself a match, and
+    # a successful match resets the capture variables -- so `--replace --body x`
+    # reset $1 to undef and stored the flag under the EMPTY key. The flag was
+    # silently dropped: the command then ran as though it had never been passed.
+    #
+    # Latent for as long as every flag in this CLI happened to carry a value.
+    # Asserted here with the boolean FIRST, which is the order that broke.
+    {
+        my (undef, $o2) = run('file', '--project', $PROJ, '--title', '"flag-order probe"',
+                              '--severity', 'low', '--area', 'sandbox', '--body-file', qq{"$ap"});
+        chomp(my $fp = $o2);
+        my ($fid) = $fp =~ m{/([^/]+)\.md$};
+        my ($rc_o) = run('update', $fid, '--project', $PROJ, '--replace', '--body-file', qq{"$np"});
+        is($rc_o, 0, 'argv: a boolean flag placed BEFORE another flag is not silently dropped');
+        like(body_of($fp), qr/fixed in abc123/, 'argv: ...and the command actually took effect');
+    }
+
+    # 4. append respects the freeze, exactly as update does. Adding a paragraph
+    #    to a report someone is reviewing changes what they are reading just as
+    #    surely as rewriting it.
+    run('set-status', $did, '--project', $PROJ, '--to', 'reviewing');
+    my ($rc_f, $out_f) = run('append', $did, '--project', $PROJ, '--body-file', qq{"$np"});
+    isnt($rc_f, 0, 'append: refused once the report is frozen');
+    like($out_f, qr/frozen/, 'append: ...and says why');
 }
 
 # ---- repairing a report that is OUTSIDE the machine -----------------------
