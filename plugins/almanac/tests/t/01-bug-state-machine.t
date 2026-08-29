@@ -191,4 +191,65 @@ isnt($rc_term, 0, 'resolved is TERMINAL — no transitions out of it');
     ok(!-e "$HOME2/.claude/ccpraxis/bug-index.jsonl", 'nothing is written into the live install');
 }
 
+# ---- repairing a report that is OUTSIDE the machine -----------------------
+#
+# A status that is not one of @STATES cannot be reached by any transition, so
+# can_transition rejects it as an unknown CURRENT state -- correct for a typo,
+# but it left no way out. 20260825-193930-fff0 carried `status: fixed`, written
+# by hand or by a version predating this machine, and was wedged: set-status
+# refused it and guard-almanac-write.sh denies editing the reports directory
+# directly. Correct by every rule, unfixable by every sanctioned path.
+#
+# --repair is that path. These assertions exist to keep it NARROW: the value is
+# in what it still refuses.
+{
+    my ($rc_f, $out_f) = run('file', '--project', $PROJ, '--title', '"legacy report"',
+                             '--severity', 'low', '--area', 'sandbox', '--body', '"filed before the machine"');
+    is($rc_f, 0, 'repair fixture: a report was filed') or diag $out_f;
+    chomp(my $lpath = $out_f);
+    my ($lid) = $lpath =~ m{/([^/]+)\.md$};
+
+    # Put it outside the machine the only way anything ever did -- by writing
+    # the frontmatter directly. This is the situation being recovered from, so
+    # the fixture has to create it the same way it arose.
+    {
+        open my $fh, '<:raw', $lpath or die "fixture: cannot read $lpath: $!";
+        local $/; my $t = <$fh>; close $fh;
+        $t =~ s/^status:\s*open$/status: fixed/m;
+        open my $out, '>:raw', $lpath or die "fixture: cannot write $lpath: $!";
+        print {$out} $t; close $out;
+    }
+    is(field_of($lpath, 'status'), 'fixed', 'repair fixture: the report is now outside the state machine');
+
+    # 1. Without --repair it is still refused -- but the message must say how to
+    #    recover, or the operator is left exactly as stuck as before.
+    my ($rc_no, $out_no) = run('set-status', $lid, '--project', $PROJ, '--to', 'resolved');
+    isnt($rc_no, 0, 'repair: set-status still refuses an out-of-machine report without --repair');
+    like($out_no, qr/--repair/, 'repair: ...and the refusal names the way out');
+
+    # 2. --repair does NOT become a general override. From a VALID state, an
+    #    illegal transition stays illegal -- this is the assertion that stops the
+    #    flag turning into "skip the state machine".
+    my ($rc_f2, $out_f2) = run('file', '--project', $PROJ, '--title', '"ordinary report"',
+                               '--severity', 'low', '--area', 'sandbox', '--body', '"still open"');
+    chomp(my $opath = $out_f2);
+    my ($oid) = $opath =~ m{/([^/]+)\.md$};
+    my ($rc_skip, $out_skip) = run('set-status', $oid, '--project', $PROJ,
+                                   '--to', 'resolved', '--repair');
+    isnt($rc_skip, 0, 'repair: --repair CANNOT skip a legal transition from a valid state');
+    like($out_skip, qr/not a legal transition/, 'repair: ...it is refused for the ordinary reason');
+    is(field_of($opath, 'status'), 'open', 'repair: the refused report is untouched');
+
+    # 3. The target must still be a real state.
+    my ($rc_bad) = run('set-status', $lid, '--project', $PROJ, '--to', 'bogus', '--repair');
+    isnt($rc_bad, 0, 'repair: --repair still refuses an unknown target state');
+
+    # 4. And it works.
+    my ($rc_ok, $out_ok) = run('set-status', $lid, '--project', $PROJ,
+                               '--to', 'resolved', '--repair');
+    is($rc_ok, 0, 'repair: --repair moves an out-of-machine report into a valid state') or diag $out_ok;
+    is(field_of($lpath, 'status'), 'resolved', 'repair: the status is now a real state');
+    like($out_ok, qr/repaired/, 'repair: the output SAYS it was a repair, not an ordinary transition');
+}
+
 done_testing();

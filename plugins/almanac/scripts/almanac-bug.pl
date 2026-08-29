@@ -517,7 +517,40 @@ unless (caller) {
         _reject_multiline('set-status', 'note', $o{note}) if defined $o{note} && !ref $o{note};
         _reject_untrimmed('set-status', 'note', $o{note}) if defined $o{note} && !ref $o{note};
         my $from = $rep->{fields}{status} // 'open';
-        my ($ok, $why) = AlmanacBug::can_transition($from, $to);
+
+        # A REPORT CAN BE OUTSIDE THE MACHINE, AND THEN NOTHING COULD MOVE IT.
+        #
+        # can_transition rejects an unknown CURRENT state, which is right for a
+        # typo but leaves no way out of one. 20260825-193930-fff0 carried
+        # `status: fixed` -- not one of @STATES, so it was written by hand or by
+        # a version that predates this machine. set-status refused it ("unknown
+        # current state 'fixed'") and guard-almanac-write.sh denies editing the
+        # reports directory directly, so the report was wedged: correct by every
+        # rule, and unfixable by every sanctioned path.
+        #
+        # --repair is that path, and it is deliberately narrow. It is honoured
+        # ONLY when the current state is not in @STATES: it can rescue a report
+        # that is already outside the machine, and it can never be used to skip
+        # a legal-but-unwanted transition between valid states (open -> resolved
+        # stays refused, with or without it). The target must still be a real
+        # state.
+        #
+        # The status is NOT silently remapped ('fixed' -> 'resolved' would be
+        # the obvious guess). A guess would hide the drift that produced it, and
+        # the operator is the one who knows which state the report actually
+        # reached.
+        my $from_known = grep { $_ eq $from } @AlmanacBug::STATES;
+        my ($ok, $why);
+        if (!$from_known && $o{repair}) {
+            $ok  = (grep { $_ eq $to } @AlmanacBug::STATES) ? 1 : 0;
+            $why = $ok ? '' : "unknown target state '$to'";
+        }
+        else {
+            ($ok, $why) = AlmanacBug::can_transition($from, $to);
+            $why .= " -- this report is OUTSIDE the state machine, so no transition can "
+                  . "reach it. Re-run with --repair to place it in a valid state."
+                if !$ok && !$from_known;
+        }
         unless ($ok) { print STDERR "almanac-bug set-status: $why\n"; exit 2 }
 
         my %f = %{ $rep->{fields} };
@@ -539,7 +572,7 @@ unless (caller) {
             exit 2;
         }
 
-        print "$id: $from -> $to\n";
+        print "$id: $from -> $to" . (($from_known ? '' : '  (repaired: previous status was outside the state machine)')) . "\n";
         exit 0;
     }
 
@@ -621,8 +654,11 @@ almanac-bug.pl — ccpraxis bug reports, one file per report.
         Create a report in the current project. Prints its path.
   update <id> (--body - | --body-file F) [--title T] [--severity S]
         Revise a report. Allowed ONLY while status is `open`.
-  set-status <id> --to <state> [--note N]
+  set-status <id> --to <state> [--note N] [--repair]
         open -> reviewing -> taken -> resolved|declined  (reviewing -> open to hand back)
+        --repair: ONLY for a report whose current status is not a known state
+        (hand-written, or from before this machine existed). It cannot skip a
+        legal transition between valid states. Put it last on the line.
         Leaving `open` FREEZES the body and records its sha256.
   list [--status S] [--json]        reports in this project
   collect [--status S] [--json]     reports across every project (via the index)
