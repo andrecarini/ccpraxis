@@ -75,6 +75,25 @@ my $mode = (defined $ENV{CCPRAXIS_REAP_ORPHANS} && $ENV{CCPRAXIS_REAP_ORPHANS} e
 
 my $log = "$root/.claude/ccpraxis/.reap-orphans.log";
 
+# BOUNDED LOG. This appends once per session start, forever, on a machine with
+# many projects -- an unbounded file is a slower version of the leak this hook
+# exists to stop. Trimmed to the most recent lines when it grows past the cap,
+# best-effort: a failure to trim must never prevent the sweep.
+eval {
+    my $CAP = 200;
+    if (-f $log && -s $log > 64 * 1024) {
+        open my $in, '<', $log or die;
+        my @lines = <$in>;
+        close $in;
+        if (@lines > $CAP) {
+            open my $out, '>', $log or die;
+            print {$out} @lines[ -$CAP .. -1 ];
+            close $out;
+        }
+    }
+    1;
+};
+
 # DETACHED, and the output goes to a file rather than to stdout.
 #
 # stdout from a SessionStart hook is parsed by the harness as hook protocol --
