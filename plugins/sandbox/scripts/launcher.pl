@@ -2930,6 +2930,23 @@ if (@STALE_REASONS) {
     # else 'continue' — fall through to launch as-is
 }
 
+# >>> launch-emit:prepare:BEGIN
+# EVERYTHING FROM HERE TO create IS ONE VISIBLE STAGE (bug report
+# 20260829-194441-fd0a).
+#
+# This stretch had no stage marker at all, and _launch_stage_begin is the only
+# thing that repaints in this phase — so the frame kept displaying whatever was
+# last drawn while the launcher did ~1600 lines of real work: the skills.pl
+# `mounts` child, the plugin store copy, credentials, a `wsl -d ... ip -4 addr`
+# host-IP probe, session selection, and the whole claude-home layout. On a stale
+# sandbox that meant choosing an option and then watching a dead menu for 20+
+# seconds. Every one of those steps is legitimate; none of them announced itself.
+#
+# It is ONE stage rather than six because the operator's question is "is it
+# alive", not "which file is it copying" — and one honest marker beats six that
+# each need their own end-state handling on every early-exit path below.
+_launch_stage_begin('prepare');
+
 # The stale-container prompt. Three paths, in descending order of capability:
 #
 #   1. TUI      — a single-choice screen through tui::LaunchScreens, sharing
@@ -4241,6 +4258,9 @@ my $refresh_port_args = sub {
 # B12: must run BEFORE the create-vs-attach decision below — a container
 # reaped after that decision would be routed down the ATTACH path and never
 # get a port block. Non-declinable; see enforce_container_config_shape above.
+_launch_stage_end('prepare', 'ok');
+# <<< launch-emit:prepare:END
+
 # >>> launch-emit:ports:BEGIN
 enforce_container_config_shape($CONTAINER_NAME);
 

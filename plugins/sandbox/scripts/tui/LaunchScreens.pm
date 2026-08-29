@@ -454,7 +454,16 @@ sub tee_fallback_route {
 # ===========================================================================
 
 sub STAGE_IDS {
-    return [ 'preflight', 'select', 'image', 'create', 'backpack', 'start', 'install', 'dashboard' ];
+    # 'prepare' covers what used to be a SILENT stretch. Between the select
+    # stage ending and create beginning, the launcher ran ~1600 lines of
+    # main-flow work -- skill mounts, the plugin store, credentials, a WSL
+    # host-IP probe, session selection, the whole claude-home layout -- with no
+    # stage marker. Since _launch_stage_begin is the only thing that repaints in
+    # that phase, the frame kept showing whatever was last drawn: on a stale
+    # sandbox, the operator chose an option and then watched a dead menu for
+    # 20+ seconds (bug report 20260829-194441-fd0a). The work was never the
+    # problem; its invisibility was.
+    return [ 'preflight', 'select', 'image', 'prepare', 'create', 'backpack', 'start', 'install', 'dashboard' ];
 }
 
 sub STAGE_STATES { return [ 'pending', 'active', 'ok', 'skipped', 'failed' ] }
@@ -465,6 +474,7 @@ sub STAGE_LABEL {
         preflight => 'preflight checks',
         select    => 'skills, plugins and MCP',
         image     => 'image build',
+        prepare   => 'host files and mounts',
         create    => 'container create',
         backpack  => 'backpack approval',
         start     => 'container start',
