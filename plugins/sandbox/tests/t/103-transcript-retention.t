@@ -418,6 +418,25 @@ sub assert_baseline_preserved {
         'permissions.deny[0]'  => 1,   # 1edc0d3 -- the belt to autoMemoryEnabled's
                                        # braces: Read(~/.claude/projects/**/memory/**).
                                        # Both files carry exactly this one entry.
+        # 2026-08-29 -- two guards promoted from prose to enforcement, both
+        # registered globally so they apply in EVERY project, not just ccpraxis.
+        #
+        # block-nonascii-ps1: the ASCII-only rule for .ps1 was already written
+        # down in CLAUDE.md, in detail, with the failure spelled out -- and BOTH
+        # .ps1 files in this repo violated it anyway, the sandbox launcher among
+        # them, carrying an ODD number of 0x94 bytes. Same conclusion
+        # guard-git-mutations.sh reached: a written instruction is not an
+        # enforcement mechanism.
+        #
+        # reap-orphans-hook: a SessionStart sweep for processes left behind by
+        # sessions that already ended (bug 20260828-095201-7c1e). Per-machine
+        # rather than per-project -- that orphan was spawned by a ccpraxis
+        # session and found from an unrelated one.
+        'hooks.PreToolUse[1].matcher'            => 1,
+        'hooks.PreToolUse[1].hooks[0].type'      => 1,
+        'hooks.PreToolUse[1].hooks[0].command'   => 1,
+        'hooks.SessionStart[0].hooks[0].type'    => 1,
+        'hooks.SessionStart[0].hooks[0].command' => 1,
         'env.CLAUDE_CODE_MAX_SUBAGENTS_PER_SESSION' => 1,
                                        # 2026-08-28 -- the built-in 200-subagent
                                        # ceiling refused a blueprint's mandatory

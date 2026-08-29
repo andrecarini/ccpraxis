@@ -61,6 +61,25 @@
                }
             ],
             "matcher" : "Bash"
+         },
+         {
+            "hooks" : [
+               {
+                  "command" : "perl \"$HOME/.claude/ccpraxis/scripts/hooks/block-nonascii-ps1.pl\"",
+                  "type" : "command"
+               }
+            ],
+            "matcher" : "Edit|Write|MultiEdit|NotebookEdit"
+         }
+      ],
+      "SessionStart" : [
+         {
+            "hooks" : [
+               {
+                  "command" : "perl \"$HOME/.claude/ccpraxis/scripts/hooks/reap-orphans-hook.pl\"",
+                  "type" : "command"
+               }
+            ]
          }
       ]
    },
