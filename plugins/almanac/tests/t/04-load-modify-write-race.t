@@ -102,7 +102,13 @@ HOOK
     my $hook = write_hook(id => $id, project => $SCRATCH, to => 'reviewing');
 
     my ($rc, $out) = run(hook => $hook,
-                          args => ['update', $id, '--project', $SCRATCH,
+                          # --replace since 2026-08-29: a whole-body replacement
+                          # must now say so. This suite is about the CAS race,
+                          # not about the discard guard, so the flag keeps the
+                          # subject under test unchanged -- without it the guard
+                          # would refuse before the race ever ran, and RACE1
+                          # would pass for entirely the wrong reason.
+                          args => ['update', $id, '--project', $SCRATCH, '--replace',
                                    '--body', '"a body update racing the freeze"']);
     unlink $hook;
 
@@ -172,7 +178,7 @@ HOOK
     chomp(my $path = $o);
     my ($id) = $path =~ m{/([^/]+)\.md$};
 
-    my ($rc, $out) = run(args => ['update', $id, '--project', $SCRATCH,
+    my ($rc, $out) = run(args => ['update', $id, '--project', $SCRATCH, '--replace',
                                    '--body', '"a perfectly normal sequential update"',
                                    '--title', '"newtitle"']);
     is($rc, 0, 'RACE3: a normal sequential update (no race) still succeeds')
