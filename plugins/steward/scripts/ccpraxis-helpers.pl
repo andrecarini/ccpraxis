@@ -390,15 +390,59 @@ sub cmd_marketplace_diff {
         }
     }
 
+    # SAVED PREFERENCES, the same mechanism settings.json already has.
+    #
+    # Without this, a marketplace that is deliberately machine-local is reported
+    # as a discrepancy on EVERY backup, forever, and the only answers on offer
+    # are "export it" (wrong), "remove it" (wrong) and "skip" (asked again next
+    # time). ccpraxis-local is exactly that case: a directory-source entry whose
+    # path is absolute on this machine, registered per-machine by install.pl, so
+    # exporting it would carry one machine's filesystem into shared config.
+    #
+    # Operator, 2026-08-29: "Keep it live only and make the backup machinery
+    # stop asking that." A recurring question with a permanent answer is a
+    # defect in the question.
+    #
+    # Scope name and semantics mirror filter-diff.pl exactly, so there is one
+    # vocabulary across the whole backup flow rather than a second dialect:
+    #   only_left  + left-only   -> live-only on purpose
+    #   only_right + right-only  -> repo-only on purpose
+    #   diverged   + skip-always -> intentionally different
+    my %valid_action = (only_left => 'left-only', only_right => 'right-only',
+                        diverged  => 'skip-always');
+    my $prefs = {};
+    {
+        my $pf = File::Spec->catfile(ccpraxis_dir(), '.backup-preferences.json');
+        if (-f $pf) {
+            my ($obj) = read_json_file($pf);
+            $prefs = (ref $obj eq 'HASH' && ref $obj->{marketplaces} eq 'HASH')
+                   ? $obj->{marketplaces} : {};
+        }
+    }
+    my @auto_applied;
+    my $honoured = sub {
+        my ($name, $category) = @_;
+        my $saved = $prefs->{$name};
+        return 0 unless ref $saved eq 'HASH';
+        return 0 unless ($saved->{category} // '') eq $category;
+        return 0 unless ($saved->{action}   // '') eq $valid_action{$category};
+        push @auto_applied, { name => $name, category => $category, action => $saved->{action} };
+        return 1;
+    };
+    @live_only = grep { !$honoured->($_->{name}, 'only_left')  } @live_only;
+    @repo_only = grep { !$honoured->($_->{name}, 'only_right') } @repo_only;
+    @diverged  = grep { !$honoured->($_->{name}, 'diverged')   } @diverged;
+
     my $has_diff = scalar(@live_only) + scalar(@repo_only) + scalar(@diverged);
     emit_json({
-        status      => $has_diff ? 'different' : 'identical',
-        live        => $live,
-        repo        => $repo,
-        live_only   => \@live_only,
-        repo_only   => \@repo_only,
-        diverged    => \@diverged,
-        identical   => \@identical,
+        status        => $has_diff ? 'different' : 'identical',
+        live          => $live,
+        repo          => $repo,
+        live_only     => \@live_only,
+        repo_only     => \@repo_only,
+        diverged      => \@diverged,
+        identical     => \@identical,
+        auto_applied  => \@auto_applied,
     });
     exit 0;
 }

@@ -143,22 +143,41 @@ Map each "(remember)" option to its `--category` and `--action`:
 perl ${CLAUDE_PLUGIN_ROOT}/scripts/ccpraxis-helpers.pl marketplace-diff
 ```
 
-Parse the JSON. If `status` is `identical`, skip silently. Otherwise iterate `live_only`, `repo_only`, and `diverged` — for each discrepancy, use AskUserQuestion to present the difference and let the user choose:
+Parse the JSON. If `status` is `identical`, skip silently. If there are `auto_applied` entries, list them briefly (e.g. "Applied 1 saved marketplace preference: `ccpraxis-local` (live-only)") — same shape as the settings steps above.
+
+Otherwise iterate `live_only`, `repo_only`, and `diverged` — for each discrepancy, use AskUserQuestion to present the difference and let the user choose. **Every case carries a "(remember)" option.** A discrepancy whose answer is permanent must not be asked twice: `ccpraxis-local` is a directory-source entry whose path is absolute on this machine and is registered per-machine by `install.pl`, so it is live-only forever — and before preferences existed here, backup asked about it on every single run.
 
 - **Marketplace in live but not repo** (added locally):
   - **"Export to repo"** — will be included in the repo version
+  - **"Keep live-only (remember)"** — save the preference; never asked again
   - **"Remove locally"** — remove with `/plugin marketplace remove <name>`
   - **"Skip"** — leave both sides as-is (same discrepancy next sync)
 
 - **Marketplace in repo but not live** (from another machine, or removed locally):
   - **"Add locally"** — add with `/plugin marketplace add <source>` (`<owner>/<repo>` for GitHub, URL for others)
+  - **"Keep repo-only (remember)"** — save the preference; never asked again
   - **"Remove from repo"** — will be excluded from the repo version
   - **"Skip"** — leave both sides as-is (same discrepancy next sync)
 
 - **Same marketplace, different `source`** (source URL changed):
   - **"Use live"** — repo will be updated to match
   - **"Use repo"** — inform the user to `/plugin marketplace remove <name>` and `/plugin marketplace add <repo-source>` to update locally
+  - **"Keep different (remember)"** — save the preference; never asked again
   - **"Skip"** — leave both sides as-is (same discrepancy next sync)
+
+For any "(remember)" choice, save it under the `marketplaces` scope — the key is the marketplace NAME:
+
+```bash
+perl "${CLAUDE_PLUGIN_ROOT}/scripts/save-preference.pl" \
+  --prefs "$HOME/.claude/ccpraxis/.backup-preferences.json" \
+  --scope marketplaces --key "<NAME>" --category "<CATEGORY>" --action "<ACTION>"
+```
+
+| Option label | `--category` | `--action` |
+|---|---|---|
+| Keep live-only (remember) | `only_left` | `left-only` |
+| Keep repo-only (remember) | `only_right` | `right-only` |
+| Keep different (remember) | `diverged` | `skip-always` |
 
 After all choices, write the reconciled result to `global-config/known_marketplaces.json`. Strip `installLocation` from each entry before writing (paths are machine-specific). If no discrepancies exist, skip silently.
 
