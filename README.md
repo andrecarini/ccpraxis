@@ -2,9 +2,7 @@
 
 # PRAXIS for Claude Code
 
-For running Claude Code on work that takes more than one session. Plans live on disk rather
-than in the context window, hooks refuse the commands that destroy finished work, and a
-project's toolchain can stay in a container instead of on your machine.
+For running Claude Code on work that takes more than one session. Plans live on disk rather than in the context window, hooks refuse the commands that destroy finished work, and a project's toolchain can stay in a container instead of on your machine.
 
 [![Perl 5.14+](https://img.shields.io/badge/runtime-Perl%205.14%2B-39457E?logo=perl&logoColor=white)](https://www.perl.org/)
 [![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows-blue)](#platforms)
@@ -38,13 +36,13 @@ project's toolchain can stay in a container instead of on your machine.
 
 ## Problems it addresses
 
-| Problem | Detail |
+| Problem | What ccpraxis does about it |
 |---|---|
-| **Dev tooling on your machine is an attack surface** | One `npm install` runs arbitrary code from hundreds of packages, with your SSH keys, tokens and browser sessions a single `postinstall` away. |
-| **A written rule is not enforcement** | An agent can ignore an instruction you gave it in a CLAUDE.md file. |
-| **Long work loses its thread** | Anything spanning more than one session gets compacted, and what you decided (and why) goes with it. |
-| **Agents stop early** | They report a plan, summarize what they would do, then end the turn with the work unfinished. |
-| **Nothing travels** | New laptop, and your instructions, skills and project notes are elsewhere, much of it in files you deliberately kept out of the project repo. |
+| **Project dependencies run on your machine.** One `npm install` executes code from hundreds of packages, with your SSH keys and tokens a `postinstall` away. | Runs that project's session in a container instead, if you opt in for that project. Install scripts are disabled for npm and pnpm, and pnpm additionally refuses any package published in the last 7 days. |
+| **A long task can lose its thread.** When a session is compacted or restarted, what you decided and why can go with it. | Keeps the plan, the scope of each chunk of work, and the decisions behind them in files on disk, so the next session reads them instead of trying to remember. |
+| **An agent can stop early**, reporting a plan or summarising what it would do, then ending the turn with the work unfinished. | An opt-in Stop hook refuses to let the turn end unless something is scheduled to resume the work, or you say you are done. It gives way after three refusals, so it nags rather than traps. |
+| **Some commands destroy finished work.** `git stash` and friends discard uncommitted changes, and telling an agent not to run them is not a mechanism. | Hooks refuse a fixed list of those commands before they run. That list is specific and known in advance; this does not make arbitrary rules you write enforceable. |
+| **Your setup does not travel.** Instructions, skills and project notes live outside the project repo, so a new machine starts empty. | Syncs your `~/.claude/` against your own fork, and keeps project-scoped files in a private vault repository you create and control. |
 
 ---
 
@@ -52,53 +50,23 @@ project's toolchain can stay in a container instead of on your machine.
 
 ### An isolated container for project tooling
 
-Opt-in and set up per project; without it, Claude Code runs on your machine exactly as
-normal. When a project has dependencies you'd rather not install directly, `claude-sandbox`
-starts that session in a container instead, so `npm install` and everything it pulls runs
-there. Install scripts are disabled for npm; pnpm packages must also be at least 7 days
-old before they install. Neither control applies to the host. What you install in the
-container is recorded in a **backpack**, a manifest replayed on rebuild, so throwing the
-container away costs one command instead of an afternoon.
+Opt-in and set up per project; without it, Claude Code runs on your machine exactly as normal. When a project has dependencies you'd rather not install directly, `claude-sandbox` starts that session in a container instead, so `npm install` and everything it pulls runs there. Install scripts are disabled for npm; pnpm packages must also be at least 7 days old before they install. Neither control applies to the host. What you install in the container is recorded in a **backpack**, a manifest replayed on rebuild, so throwing the container away costs one command instead of an afternoon.
 
 ### Plans that outlive one session
 
-`/blueprint:create` turns an objective into a **blueprint**: a plan on disk rather than
-held in the conversation, split into **packages**, bounded chunks of work, each with a
-**write set** (the files it may touch), dependencies, and pass/fail criteria specific
-enough to check mechanically, then audited by an agent that never sat in the conversation
-that produced it. Each package keeps a **ledger**, an on-disk record of what was decided
-and why, so a compacted or restarted session picks up from the file instead of from memory
-that's gone.
+`/blueprint:create` turns an objective into a **blueprint**: a plan on disk rather than held in the conversation, split into **packages**, bounded chunks of work, each with a **write set** (the files it may touch), dependencies, and pass/fail criteria specific enough to check mechanically, then audited by an agent that never sat in the conversation that produced it. Each package keeps a **ledger**, an on-disk record of what was decided and why, so a compacted or restarted session picks up from the file instead of from memory that's gone.
 
-**butler** is the plugin that executes a blueprint once it exists. `/butler:dispatch-fleet`
-runs one unattended, sandbox-only: a plain script, not itself an agent, launches one Claude
-session per package, restarts one that dies, waits out rate limits, and resumes on its own.
-`/butler:drive-solo` runs the same execution one package at a time in your own session, on
-the host or in the sandbox.
+**butler** is the plugin that executes a blueprint once it exists. `/butler:dispatch-fleet` runs one unattended, sandbox-only: a plain script, not itself an agent, launches one Claude session per package, restarts one that dies, waits out rate limits, and resumes on its own. `/butler:drive-solo` runs the same execution one package at a time in your own session, on the host or in the sandbox.
 
 ### A nag against stopping early, and rules a hook enforces
 
-Arm a session with `/butler:continuity on` and a hook blocks a turn from ending unless
-something is scheduled to resume the work or you've explicitly disarmed it; reporting a
-plan without doing the work does not satisfy it. It is a persistent nag rather than an
-absolute gate: it yields after three consecutive blocks, and you can override it for a
-single turn with a marker file or for a whole session with an environment variable.
+Arm a session with `/butler:continuity on` and a hook blocks a turn from ending unless something is scheduled to resume the work or you've explicitly disarmed it; reporting a plan without doing the work does not satisfy it. It is a persistent nag rather than an absolute gate: it yields after three consecutive blocks, and you can override it for a single turn with a marker file or for a whole session with an environment variable.
 
-Hooks also deny commands that destroy work faster than you can react to them. `git stash`,
-`reset`, `checkout` and `clean` are refused outright, which protects work on ccpraxis
-itself; add the same registration to another project's `.claude/settings.json` to get it
-there. On Windows, `> NUL` from Bash is blocked, because it creates a file Explorer cannot
-delete.
+Hooks also deny commands that destroy work faster than you can react to them. `git stash`, `reset`, `checkout` and `clean` are refused outright, which protects work on ccpraxis itself; add the same registration to another project's `.claude/settings.json` to get it there. On Windows, `> NUL` from Bash is blocked, because it creates a file Explorer cannot delete.
 
 ### Your setup, synced across machines
 
-**steward** is the plugin that looks after ccpraxis itself. Its `/steward:backup` syncs your
-live `~/.claude/` configuration against this repo, diffing semantically and scanning for
-secrets before anything is pushed. A separate **vault**, a
-private git repository you create and own, holds what can't live in a public project repo:
-global CLAUDE.md, project-specific Claude files, skills, blueprints, todos. It syncs with
-three-way merge and a pre-push secret scan, and never deletes a local file the vault has
-never held.
+**steward** is the plugin that looks after ccpraxis itself. Its `/steward:backup` syncs your live `~/.claude/` configuration against this repo, diffing semantically and scanning for secrets before anything is pushed. A separate **vault**, a private git repository you create and own, holds what can't live in a public project repo: global CLAUDE.md, project-specific Claude files, skills, blueprints, todos. It syncs with three-way merge and a pre-push secret scan, and never deletes a local file the vault has never held.
 
 ```mermaid
 flowchart LR
@@ -126,21 +94,9 @@ flowchart LR
 
 ## On your machine
 
-Installing clones this repo to `~/.claude/ccpraxis`, symlinks (junctions on Windows) every
-skill into `~/.claude/skills/`, creates or merges `~/.claude/CLAUDE.md` and
-`~/.claude/settings.json`, installs the plugins listed there, and puts `claude-sandbox` on
-your PATH: on Windows via the User-scope `PATH`/`PATHEXT` registry values (no admin
-needed), on macOS/Linux by appending one line to your shell rc. If given a vault URL it
-also clones that repo to `~/.claude/claude-code-vault/`. It prints a plan of every change
-first and only touches your system once you re-run it with `--confirm`; nothing needs
-npm, pip, or any other dev tooling on your machine, the installer is Perl only.
+Installing clones this repo to `~/.claude/ccpraxis`, symlinks (junctions on Windows) every skill into `~/.claude/skills/`, creates or merges `~/.claude/CLAUDE.md` and `~/.claude/settings.json`, installs the plugins listed there, and puts `claude-sandbox` on your PATH: on Windows via the User-scope `PATH`/`PATHEXT` registry values (no admin needed), on macOS/Linux by appending one line to your shell rc. If given a vault URL it also clones that repo to `~/.claude/claude-code-vault/`. It prints a plan of every change first and only touches your system once you re-run it with `--confirm`; nothing needs npm, pip, or any other dev tooling on your machine, the installer is Perl only.
 
-There's no automated uninstaller. To back out by hand: delete `~/.claude/ccpraxis`, remove
-the PATH entry (Windows: User Environment Variables in System Properties; macOS/Linux:
-the appended shell rc line), remove the symlinks/junctions under `~/.claude/skills/`, and
-restore `~/.claude/CLAUDE.md`/`settings.json` from the backup the install took before it
-touched them: both are copied to `<file>.pre-ccpraxis.<timestamp>` in `~/.claude/`, and the
-paths are printed during the install. Your vault repo is untouched either way.
+There's no automated uninstaller. To back out by hand: delete `~/.claude/ccpraxis`, remove the PATH entry (Windows: User Environment Variables in System Properties; macOS/Linux: the appended shell rc line), remove the symlinks/junctions under `~/.claude/skills/`, and restore `~/.claude/CLAUDE.md`/`settings.json` from the backup the install took before it touched them: both are copied to `<file>.pre-ccpraxis.<timestamp>` in `~/.claude/`, and the paths are printed during the install. Your vault repo is untouched either way.
 
 ---
 
@@ -182,8 +138,7 @@ Claude Code
 
 ## Quick start
 
-**Fork first.** ccpraxis is configuration you'll want to own; forking means your edits are
-yours and you can still pull upstream.
+**Fork first.** ccpraxis is configuration you'll want to own; forking means your edits are yours and you can still pull upstream.
 
 1. Fork [`andrecarini/ccpraxis`](https://github.com/andrecarini/ccpraxis).
 2. *(Recommended)* Create an empty **private** repo for your vault, e.g. `claude-code-vault`.
@@ -191,12 +146,9 @@ yours and you can still pull upstream.
    > Install ccpraxis from `https://github.com/<you>/ccpraxis`. My vault repo is
    > `git@github.com:<you>/claude-code-vault.git`.
 4. Stay at the terminal for the two confirmation gates (a settings diff, then the install
-   plan described above), then restart Claude Code.
+plan described above), then restart Claude Code.
 
-**Requirements:** Claude Code, Git, and Perl 5.14+ (already present on macOS/Linux and
-inside Git for Windows), plus Docker or Podman if you want the sandbox. Claude follows
-[`docs/install-protocol.md`](docs/install-protocol.md) to do the install; that page is the
-same procedure step by step if you'd rather drive it yourself.
+**Requirements:** Claude Code, Git, and Perl 5.14+ (already present on macOS/Linux and inside Git for Windows), plus Docker or Podman if you want the sandbox. Claude follows [`docs/install-protocol.md`](docs/install-protocol.md) to do the install; that page is the same procedure step by step if you'd rather drive it yourself.
 
 ---
 
@@ -213,18 +165,13 @@ same procedure step by step if you'd rather drive it yourself.
 | `/butler:continuity on` | Refuse to end a turn with work outstanding |
 | `/backpack:add` | Record a tool so container rebuilds restore it |
 
-The rest, including `/todo`, `/almanac`, and `/steward:ccpraxis-extend`, are listed with
-every other surface in [`docs/reference.md`](docs/reference.md).
+The rest, including `/todo`, `/almanac`, and `/steward:ccpraxis-extend`, are listed with every other surface in [`docs/reference.md`](docs/reference.md).
 
 ---
 
 ## Layout and documentation
 
-Plugins live under `plugins/<name>/` (`sandbox`, `backpack`, `blueprint`, `butler`,
-`steward`, `todo`, `almanac`); skills under `skills/`; the `CLAUDE.md` and
-`settings.json` this installs to `~/.claude/` under `global-config/`. Everything here is
-Perl, deliberately: it ships with macOS, Linux, and Git for Windows, so a fresh
-`git clone` runs the whole system without installing a runtime on your host.
+Plugins live under `plugins/<name>/` (`sandbox`, `backpack`, `blueprint`, `butler`, `steward`, `todo`, `almanac`); skills under `skills/`; the `CLAUDE.md` and `settings.json` this installs to `~/.claude/` under `global-config/`. Everything here is Perl, deliberately: it ships with macOS, Linux, and Git for Windows, so a fresh `git clone` runs the whole system without installing a runtime on your host.
 
 | Page | For |
 |---|---|
@@ -234,8 +181,7 @@ Perl, deliberately: it ships with macOS, Linux, and Git for Windows, so a fresh
 
 ## Platforms
 
-macOS, Linux, and Windows are all supported; on Windows the launcher is PowerShell and
-locates Perl itself.
+macOS, Linux, and Windows are all supported; on Windows the launcher is PowerShell and locates Perl itself.
 
 > **Windows: use the WSL2 backend, not Hyper-V.** Microsoft's `Plan9FileServer` silently
 > breaks `O_APPEND` and `utimensat`, which fails `claude --resume` and wedges Bun's lock
@@ -247,16 +193,7 @@ locates Perl itself.
 
 ### The sandbox, versus Claude Code's own isolation options
 
-Claude Code ships [several isolation approaches](https://code.claude.com/docs/en/sandbox-environments)
-that solve a different problem than the sandbox above does. The
-**[sandboxed Bash tool](https://code.claude.com/docs/en/sandboxing)** is a permission
-boundary, not an environment: it confines what Bash commands may read, write and reach,
-but leaves you in whatever environment you're already in, covers only Bash (*"Built-in
-file tools, MCP servers, and hooks still run directly on your host"*), and has no native
-Windows support (*"On Windows, run Claude Code inside a WSL2 distribution"*).
-**[Dev containers](https://code.claude.com/docs/en/devcontainer)** do isolate the full
-environment, genuinely equivalent to the sandbox above; the difference is what surrounds
-it:
+Claude Code ships [several isolation approaches](https://code.claude.com/docs/en/sandbox-environments) that solve a different problem than the sandbox above does. The **[sandboxed Bash tool](https://code.claude.com/docs/en/sandboxing)** is a permission boundary, not an environment: it confines what Bash commands may read, write and reach, but leaves you in whatever environment you're already in, covers only Bash (*"Built-in file tools, MCP servers, and hooks still run directly on your host"*), and has no native Windows support (*"On Windows, run Claude Code inside a WSL2 distribution"*). **[Dev containers](https://code.claude.com/docs/en/devcontainer)** do isolate the full environment, genuinely equivalent to the sandbox above; the difference is what surrounds it:
 
 |  | Dev container | ccpraxis |
 |---|---|---|
@@ -265,21 +202,11 @@ it:
 | Auth across rebuilds | *"the container's home directory is discarded on rebuild"* unless you mount a volume yourself | handled by the launcher |
 | Supply chain | whatever your image does | install scripts disabled for npm/pnpm; a 7-day minimum package age for pnpm |
 
-Anthropic's own warning about dev containers applies here too: *"dev containers do not
-prevent a malicious project from exfiltrating anything accessible inside the container,
-including the Claude Code credentials stored in `~/.claude`."* A container bounds the
-blast radius; it does not make hostile code safe to run.
+Anthropic's own warning about dev containers applies here too: *"dev containers do not prevent a malicious project from exfiltrating anything accessible inside the container, including the Claude Code credentials stored in `~/.claude`."* A container bounds the blast radius; it does not make hostile code safe to run.
 
 ### Continuity, versus `/goal`
 
-[`/goal`](https://code.claude.com/docs/en/goal) sets a completion condition and keeps
-Claude working toward it (*"After each turn, a small fast model checks whether the
-condition holds"*) and needs no setup. Its check runs after each turn, so it depends on a
-next turn happening at all, which doesn't help a session wedged on a command with no
-timeout. Continuity ends only when you disarm it, and for unattended blueprint runs the
-watchdog sits outside the session entirely: `bp-orchestrator.pl`, a plain script spending
-no tokens, detects a session that's alive but producing no output and kills and
-relaunches it rather than waiting for a turn that will never come.
+[`/goal`](https://code.claude.com/docs/en/goal) sets a completion condition and keeps Claude working toward it (*"After each turn, a small fast model checks whether the condition holds"*) and needs no setup. Its check runs after each turn, so it depends on a next turn happening at all, which doesn't help a session wedged on a command with no timeout. Continuity ends only when you disarm it, and for unattended blueprint runs the watchdog sits outside the session entirely: `bp-orchestrator.pl`, a plain script spending no tokens, detects a session that's alive but producing no output and kills and relaunches it rather than waiting for a turn that will never come.
 
 ---
 
