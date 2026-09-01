@@ -24,7 +24,37 @@ use warnings;
 use FindBin qw($Bin);
 use lib "$Bin/../lib";
 use Encode ();
+use JSON::PP;
 use StewardTest qw(ok is run_vs temproot make_machine init_remote write_text done_testing diag);
+
+# staged_actions($home, $slug) -> { push => N, pull => N, delete_local => N, ... }
+#
+# READ THE JOURNAL, NOT `applied`. The response's `applied` field is a COUNT, not
+# an op list, so `grep { $_->{action} eq 'delete_local' } @$applied` matches
+# nothing whether or not the bug is present — every case below built on it was
+# passing vacuously, in the one test whose whole subject is data loss.
+#
+# The ops log is the same source the rename pass acts on, and reading it here is
+# exactly what caught two live projects staging the deletion of files that only
+# existed locally (klink's CLAUDE.md among them). Call it AFTER sync-project and
+# BEFORE commit-and-push.
+sub staged_actions {
+    my ($home, $slug) = @_;
+    my $path = "$home/.claude/claude-code-vault/projects/$slug/.sync-journal.ops.jsonl";
+    my %by;
+    if (open my $fh, '<:raw', $path) {
+        while (my $line = <$fh>) {
+            next unless $line =~ /\n\z/ && $line =~ /\S/;
+            my $o = eval { JSON::PP->new->utf8->decode($line) } or next;
+            next unless ref $o eq 'HASH' && defined $o->{id};
+            $by{ $o->{id} } = { %{ $by{ $o->{id} } || {} }, %$o };   # later line wins
+        }
+        close $fh;
+    }
+    my %n;
+    $n{ $_->{action} // '?' }++ for values %by;
+    return \%n;
+}
 
 my $root   = temproot();
 my $remote = init_remote($root);
@@ -81,12 +111,9 @@ ok((grep { m{bug-reports/2026-a\.md} } @paths), 'AC1: a bug report actually reac
 my $s2 = run_vs($home, 'sync-project', '--slug', 'proj');
 is($s2->{json} && $s2->{json}{status}, 'synced', 'AC2: second sync-project succeeded') or diag($s2->{out});
 
-# applied is the op list; a delete_local in it is the failure.
-my $applied = ($s2->{json} && $s2->{json}{applied}) || [];
-my @ops = ref $applied eq 'ARRAY' ? @$applied : ();
-my @deletes = grep { (ref $_ ? ($_->{action} // '') : '') eq 'delete_local' } @ops;
-is(scalar @deletes, 0, 'AC2: the second sync stages NO delete_local ops')
-    or diag("would delete: " . join(', ', map { $_->{path} // '?' } @deletes[0 .. ($#deletes > 4 ? 4 : $#deletes)]));
+my $act2 = staged_actions($home, 'proj');
+is($act2->{delete_local} // 0, 0, 'AC2: the second sync stages NO delete_local ops')
+    or diag("staged: " . join(', ', map { "$_=$act2->{$_}" } sort keys %$act2));
 
 # The local files are still there, whatever the ops said.
 run_vs($home, 'commit-and-push', '--slug', 'proj', '--session-id', ($s2->{json}{session_id} // ''));
@@ -126,6 +153,18 @@ ok(-f "$proj/.ccpraxis-local-data/blueprints/bp1/blueprint.md", 'AC2: the local 
     my $s3 = run_vs($home, 'sync-project', '--slug', 'proj');
     is($s3->{json} && $s3->{json}{status}, 'synced', 'AC3: staged a sync containing the new file') or diag($s3->{out});
 
+    # NON-VACUITY GUARD FOR staged_actions ITSELF. A helper that silently returned
+    # an empty hash — wrong path, changed journal filename, a decode that throws —
+    # would make every `delete_local == 0` assertion in this file pass forever
+    # while reporting nothing. That is precisely the failure mode being replaced,
+    # so the reader must be proven to see a staged op it MUST see: a brand-new
+    # file was just written, so a push is staged here by construction.
+    my $act3 = staged_actions($home, 'proj');
+    ok(($act3->{push} // 0) >= 1,
+        'AC3: staged_actions actually reads the journal (sees the new file\'s push)')
+        or diag("staged: " . join(', ', map { "$_=$act3->{$_}" } sort keys %$act3)
+                . " -- if empty, the reader is broken and every delete_local check here is vacuous");
+
     # Remove the staged vault-side tmps: the pushes now fail for a reason that
     # has nothing to do with the local file, exactly as in the live incident.
     my $vfiles_dir = "$home/.claude/claude-code-vault/projects/proj/files";
@@ -144,10 +183,9 @@ ok(-f "$proj/.ccpraxis-local-data/blueprints/bp1/blueprint.md", 'AC2: the local 
 
     # THE ASSERTION THAT MATTERS: the next sync must not want to delete it.
     my $s4 = run_vs($home, 'sync-project', '--slug', 'proj');
-    my $ap = ($s4->{json} && $s4->{json}{applied}) || [];
-    my @del = grep { (ref $_ ? ($_->{action} // '') : '') eq 'delete_local' } (ref $ap eq 'ARRAY' ? @$ap : ());
-    is(scalar @del, 0, 'AC3: the sync after a rolled-back push stages NO delete_local')
-        or diag("would delete: " . join(', ', map { $_->{path} // '?' } @del[0 .. ($#del > 4 ? 4 : $#del)]));
+    my $act4 = staged_actions($home, 'proj');
+    is($act4->{delete_local} // 0, 0, 'AC3: the sync after a rolled-back push stages NO delete_local')
+        or diag("staged: " . join(', ', map { "$_=$act4->{$_}" } sort keys %$act4));
 
     run_vs($home, 'commit-and-push', '--slug', 'proj', '--session-id', ($s4->{json}{session_id} // ''));
     ok(-f $victim, 'AC3: the file whose push rolled back still exists locally');
