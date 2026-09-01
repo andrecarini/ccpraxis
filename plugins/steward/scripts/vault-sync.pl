@@ -1074,6 +1074,7 @@ sub cmd_sync_project {
 
     # Classify each file
     my @auto_applied;
+    my @cache_repaired;
     my @conflicts;
     my @file_mod_skipped;
     my $applied = 0;
@@ -1111,9 +1112,31 @@ sub cmd_sync_project {
             $applied++;
             push @auto_applied, { path => $rel, action => 'delete_vault' };
         } elsif ($action eq 'delete_local') {
-            stage_delete_local($slug, $cwd, $rel);
-            $applied++;
-            push @auto_applied, { path => $rel, action => 'delete_local' };
+            # A FILE THE VAULT HAS NEVER HELD CANNOT HAVE BEEN DELETED UPSTREAM.
+            #
+            # classify() sees three hashes and cannot tell "another machine
+            # removed this" from "our own cache is lying about a sync that never
+            # landed". Both look like cache==local with the vault absent. The
+            # second is what a failed push leaves behind (see d667), and reading
+            # it as an upstream deletion is what turns a broken backup into
+            # deleted work.
+            #
+            # Git history settles it: if the path was never added to the vault,
+            # there was no upstream copy to delete, so the local file is simply
+            # unsynced and belongs in a push. Measured on this machine after
+            # d667: 7 files across two projects, including klink's own CLAUDE.md.
+            if (!vault_ever_tracked($slug)->{$rel}) {
+                stage_push($slug, $cwd, $rel, $local_hash);
+                $applied++;
+                push @auto_applied, { path => $rel, action => 'push',
+                                      note => 'cache claimed synced but the vault never held this path; pushing instead of deleting' };
+                push @cache_repaired, $rel;
+            }
+            else {
+                stage_delete_local($slug, $cwd, $rel);
+                $applied++;
+                push @auto_applied, { path => $rel, action => 'delete_local' };
+            }
         } elsif ($action eq 'clear_cache') {
             stage_clear_cache($slug, $cwd, $rel);
             $applied++;
@@ -1141,10 +1164,23 @@ sub cmd_sync_project {
 
     journal_set_phase($slug, 'awaiting_resolution');
 
+    # THE DESTRUCTIVE OPS, CALLED OUT BY NAME. `applied` is a count and
+    # `auto_applied` is a flat list of every op, so the single most destructive
+    # thing a sync can stage -- deleting the user's local files -- was reachable
+    # only by filtering a list nobody filtered. Two tests and one live backup
+    # flow all missed it. A caller cannot warn about what it has to go looking
+    # for, so the deletions get their own field and their own count.
+    my %action_counts;
+    $action_counts{ $_->{action} // '?' }++ for @auto_applied;
+    my @deletes_local = map { $_->{path} } grep { ($_->{action} // '') eq 'delete_local' } @auto_applied;
+
     emit_json({
         status               => 'synced',
         slug                 => $slug,
         applied              => $applied,
+        action_counts        => \%action_counts,
+        deletes_local        => \@deletes_local,
+        cache_repaired       => \@cache_repaired,
         auto_applied         => \@auto_applied,
         conflicts            => \@conflicts,
         skipped_symlinks     => \@skipped_symlinks,
@@ -1767,6 +1803,34 @@ sub add_to_inventory {
 # ═══════════════════════════════════════════════════════════════════════
 # Classify / Sync helpers
 # ═══════════════════════════════════════════════════════════════════════
+
+# vault_ever_tracked($slug) -> { rel_path => 1, ... }
+#
+# Every path git has EVER held for this project, including ones deleted since.
+# `git ls-files` is not enough -- it lists the current tree, so a genuinely
+# deleted file would look identical to one that was never there, which is the
+# exact distinction this exists to make.
+#
+# One `git log` per sync, memoized: the alternative is a git call per candidate
+# file, and the projects this matters for have thousands.
+{
+    my %CACHE;
+    sub vault_ever_tracked {
+        my $slug = shift;
+        return $CACHE{$slug} if $CACHE{$slug};
+        my %seen;
+        my $prefix = "projects/$slug/files/";
+        my $out = vault_git_output('log', '--pretty=format:', '--name-only',
+                                   '--diff-filter=A', '--', $prefix);
+        for my $line (split /\n/, ($out // '')) {
+            $line =~ s/\s+\z//;
+            next unless length $line;
+            next unless index($line, $prefix) == 0;
+            $seen{ substr($line, length $prefix) } = 1;
+        }
+        return $CACHE{$slug} = \%seen;
+    }
+}
 
 # Classify a tracked file based on three hashes (empty string = missing/absent).
 sub classify {

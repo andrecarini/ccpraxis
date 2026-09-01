@@ -315,4 +315,80 @@ ok(-f "$proj/.ccpraxis-local-data/blueprints/bp1/blueprint.md", 'AC2: the local 
     ok(-f "$proj/$rel", 'AC5: and the local file still exists');
 }
 
+# ---------------------------------------------------------------------------
+# AC6 — A POISONED CACHE MUST NOT BECOME A DELETION.
+#
+# Bug report 20260901-050537-63e0. d667's fix stops NEW poisoning; it does
+# nothing about a cache already poisoned by a sync that ran before it. Two
+# registered projects on this machine were in exactly that state, between them
+# staging the deletion of 7 files that existed ONLY locally — klink's own
+# CLAUDE.md among them. A routine backup would have deleted all seven.
+#
+# The condition, reproduced directly: cache says synced, the vault has no copy,
+# the local file is present and unchanged. classify() sees cache == local with
+# the vault absent and reads it as "deleted upstream".
+#
+# It is not. A path the vault has NEVER held cannot have been deleted from it,
+# and git history is what distinguishes the two cases — `git ls-files` cannot,
+# because a genuinely-deleted file is absent from the current tree too.
+# ---------------------------------------------------------------------------
+{
+    my $orphan = "$proj/.ccpraxis-local-data/bug-reports/never-pushed.md";
+    write_text($orphan, "---\nid: orphan\n---\nonly ever existed locally\n");
+
+    # Sync it so a CACHE entry is written, then remove it from the vault side
+    # WITHOUT going through git — the state a rolled-back push leaves behind:
+    # the cache believes it landed, the vault never received it.
+    my $s7 = run_vs($home, 'sync-project', '--slug', 'proj');
+    run_vs($home, 'commit-and-push', '--slug', 'proj', '--session-id', ($s7->{json}{session_id} // ''));
+
+    my $vault_copy = "$home/.claude/claude-code-vault/projects/proj/files/"
+                   . ".ccpraxis-local-data/bug-reports/never-pushed.md";
+    ok(-f $vault_copy, 'AC6: fixture — the file reached the vault before we strand the cache');
+
+    # Removing a COMMITTED vault file out of band is not the poisoned state — it
+    # is vault drift, and the tool refuses rather than guessing. Asserted here
+    # because it is the defence that stands between a corrupted vault tree and a
+    # sync that acts on it; discovered by writing this case expecting `synced`.
+    unlink $vault_copy;
+    my $s8 = run_vs($home, 'sync-project', '--slug', 'proj');
+    is($s8->{json} && $s8->{json}{status}, 'drift',
+       'AC6: an out-of-band vault deletion is caught as drift, not acted on')
+        or diag(substr($s8->{out}, 0, 300));
+
+    # Put it back so the run can continue past the drift guard.
+    write_text($vault_copy, "---\nid: orphan\n---\nonly ever existed locally\n");
+
+    # And the path-never-in-the-vault case: a brand-new local file with a cache
+    # entry forged for it. This is the poisoned state proper.
+    my $forged = ".ccpraxis-local-data/bug-reports/forged-cache.md";
+    write_text("$proj/$forged", "---\nid: forged\n---\nnever pushed anywhere\n");
+    my $cache_file = "$proj/.ccpraxis-local-data/backup-cache/$forged";
+    write_text($cache_file, "---\nid: forged\n---\nnever pushed anywhere\n");
+
+    my $s9 = run_vs($home, 'sync-project', '--slug', 'proj');
+    is($s9->{json} && $s9->{json}{status}, 'synced', 'AC6: sync ran with the forged cache entry')
+        or diag(substr($s9->{out}, 0, 300));
+
+    my $dels9 = ($s9->{json} && $s9->{json}{deletes_local}) || [];
+    ok(!(grep { $_ eq $forged } @$dels9),
+        'AC6: a path the vault NEVER held is not staged for local deletion')
+        or diag("staged for deletion: " . join(', ', @$dels9));
+
+    # The destructive ops must be visible by name, not merely absent. `applied`
+    # is a count and `auto_applied` is every op flattened together, so the one
+    # thing that destroys user data was reachable only by filtering a list that
+    # nobody filtered — two tests and one live backup flow all walked past it.
+    my $acts9 = ($s9->{json} && $s9->{json}{action_counts}) || {};
+    is(scalar(@$dels9), ($acts9->{delete_local} // 0),
+        'AC6: deletes_local and action_counts agree — a deletion cannot be staged invisibly');
+
+    # Non-vacuity: the sync did real work, so "no deletions" is not "no ops".
+    ok(scalar(keys %$acts9) > 0, 'AC6 non-vacuity: the sync staged something to report')
+        or diag('action_counts was empty');
+
+    run_vs($home, 'commit-and-push', '--slug', 'proj', '--session-id', ($s9->{json}{session_id} // ''));
+    ok(-f "$proj/$forged", 'AC6: and the local file survived the sync');
+}
+
 done_testing();
