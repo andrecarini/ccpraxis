@@ -12,13 +12,29 @@ bp_hook_gate() {
   [ -n "${BP_PROJECT_ROOT:-}" ] || exit 0
 }
 
-bp_hook_require_jq() {
-  # Fail-closed: enforcement hooks must not silently degrade.
-  command -v jq >/dev/null 2>&1 || {
-    echo "butler hook: jq is required but missing — blocking to avoid unenforced operation. Install jq in the container." >&2
-    exit 2
-  }
+bp_hook_require_json_parser() {
+  # Fail-closed: enforcement hooks must not silently degrade. But the thing they
+  # actually need is A JSON PARSER, not jq specifically -- bp_json_get below has
+  # read payloads through perl + JSON::PP for as long as it has existed.
+  #
+  # Requiring jq by name meant every hook calling this blocked outright on a host
+  # without it, which is a stock Git-for-Windows machine: this repo's own primary
+  # platform, and one that by its Perl-only doctrine is never going to have jq.
+  # guard-git-mutations.sh hit exactly that, blocking EVERY Bash call on the host
+  # instead of guarding anything, and was given the fallback. The rest were not.
+  #
+  # Only the absence of BOTH parsers still fails closed.
+  command -v jq >/dev/null 2>&1 && return 0
+  if command -v perl >/dev/null 2>&1 && perl -MJSON::PP -e1 >/dev/null 2>&1; then
+    return 0
+  fi
+  echo "butler hook: no JSON parser available (neither jq nor perl+JSON::PP) — blocking to avoid unenforced operation." >&2
+  exit 2
 }
+
+# Kept so a hook not yet converted still behaves, and so an out-of-tree copy does
+# not break. Same semantics as the parser check above.
+bp_hook_require_jq() { bp_hook_require_json_parser; }
 
 # bp_read_payload [FAIL_MODE] -- read the hook payload from stdin, BOUNDED, into
 # the global PAYLOAD. FAIL_MODE is 'closed' (default) or 'open' and decides what
@@ -112,7 +128,16 @@ bp_json_get() {
     # rc deliberately UNCHECKED, matching the pre-existing `jq ... 2>/dev/null`
     # callers: malformed JSON yielded empty (allow) before and still does, so
     # this refactor cannot change what the container decides.
-    jq -r "($expr) // empty" <<<"$payload" 2>/dev/null
+    #
+    # NO WRAPPING PARENS. `//` is left-associative, so `.a // .b // empty` and
+    # `(.a // .b) // empty` are the same query to jq -- but they are NOT the same
+    # STRING, and several tests stand in for jq with a small perl script that
+    # parses the expression. Those shims split on `//` and treat each term as a
+    # dotted path; a leading `(` makes the first term unparseable, so the shim
+    # returns nothing, the hook sees an empty value and ALLOWS what it should
+    # have denied. Emitting the shape the hooks have always used keeps every
+    # such stand-in working, and costs nothing with a real jq.
+    jq -r "$expr // empty" <<<"$payload" 2>/dev/null
     return 0
   fi
 

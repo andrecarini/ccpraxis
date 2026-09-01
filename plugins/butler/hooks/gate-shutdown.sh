@@ -25,9 +25,9 @@ bp_hook_gate
 SIGNAL=$(bp_active_stop_signal)
 [ -n "$SIGNAL" ] || exit 0            # no stop in progress -> nothing to gate (fast path)
 
-bp_hook_require_jq
+bp_hook_require_json_parser
 bp_read_payload closed
-TOOL=$(jq -r '.tool_name // empty' <<<"$PAYLOAD")
+TOOL=$(bp_json_get "$PAYLOAD" tool_name)
 # A stop is in force (checked above); a payload with no identifiable tool_name is
 # malformed — fail CLOSED rather than letting an unclassifiable call through.
 if [ -z "$TOOL" ]; then
@@ -45,9 +45,9 @@ BP_DIR_N=$(realpath -m "$BP_DIR" 2>/dev/null || printf '%s' "$BP_DIR")
 PCLASS="-"
 case "$TOOL" in
   Edit|Write|MultiEdit|NotebookEdit)
-    FP=$(jq -r '.tool_input.file_path // .tool_input.notebook_path // empty' <<<"$PAYLOAD")
+    FP=$(bp_json_get "$PAYLOAD" tool_input.file_path tool_input.notebook_path)
     if [ -n "$FP" ]; then
-      CWD=$(jq -r '.cwd // empty' <<<"$PAYLOAD"); CWD=${CWD:-$PWD}
+      CWD=$(bp_json_get "$PAYLOAD" cwd); CWD=${CWD:-$PWD}
       case "$FP" in /*) ABS="$FP" ;; *) ABS="$CWD/$FP" ;; esac
       ABS=$(realpath -m "$ABS" 2>/dev/null || printf '%s' "$ABS")
       PCLASS=worksite

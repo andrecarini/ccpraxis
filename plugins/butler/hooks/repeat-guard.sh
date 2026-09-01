@@ -13,14 +13,14 @@
 # the deliberate `exit 2` of a confirmed detection. No `set -e` at top level;
 # `set -u` applies only inside the guarded command substitution below, whose
 # non-zero status is swallowed by `|| RESULT=""`. Do NOT use
-# bp_hook_require_jq (fail-CLOSED) or a `trap ... EXIT` (would clobber the
+# bp_hook_require_json_parser (fail-CLOSED) or a `trap ... EXIT` (would clobber the
 # deliberate exit 2).
 HOOK_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=lib.sh
 source "$HOOK_DIR/lib.sh"
 bp_hook_gate                                    # inert outside a butler session
 
-command -v jq >/dev/null 2>&1 || exit 0         # fail-OPEN; NOT bp_hook_require_jq
+command -v jq >/dev/null 2>&1 || exit 0         # fail-OPEN; NOT bp_hook_require_json_parser
 
 ACTION=$(bp_repeat_action_of "${BP_REPEAT_ACTION:-}")
 
@@ -31,7 +31,7 @@ bp_read_payload open
 # non-zero status is swallowed. It emits either "" (=> allow) or
 # "fire<TAB>TOOL<TAB>RUNLEN".
 RESULT=$( set -u
-  TOOL=$(jq -r '.tool_name // empty' <<<"$PAYLOAD" 2>/dev/null) || exit 0
+  TOOL=$(bp_json_get "$PAYLOAD" tool_name) || exit 0
   [ -n "$TOOL" ] || exit 0
 
   # F2: wait/poll tools are the designed use of repeated identical calls -- exempt
@@ -48,7 +48,7 @@ RESULT=$( set -u
   HASH=$(bp_repeat_hash <<<"$PAYLOAD") || exit 0
   [ -n "$HASH" ] || exit 0
 
-  SID=$(jq -r '.session_id // empty' <<<"$PAYLOAD" 2>/dev/null)
+  SID=$(bp_json_get "$PAYLOAD" session_id)
   TOKEN=$(bp_repeat_session_token "$SID")
   FILE=$(bp_repeat_state_path "$TOKEN")
 
