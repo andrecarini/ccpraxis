@@ -86,7 +86,7 @@ Then `butler` executes it. `/butler:dispatch-fleet` starts a deterministic orche
 
 ### 3. Continuity: finish what you started
 
-Arm a session with `/butler:continuity on` and a `Stop` hook pushes back when a turn tries to end with work outstanding. It wants one of two things: **something scheduled to wake the session**, or an **explicit disarm**. "I've summarized my plan" is neither.
+Arm a session with `/butler:continuity on` and a `Stop` hook pushes back when a turn tries to end with work outstanding. It wants either **something scheduled to wake the session**, or an **explicit disarm**. "I've summarized my plan" is neither.
 
 It is a persistent nag, not a cage, and the difference is deliberate. After three consecutive blocks it gives way, on the reasoning in its own source that *"a gate that will not yield is worse than a stalled run"*. Two documented overrides exist as well: a one-shot marker file, and a session-wide environment variable.
 
