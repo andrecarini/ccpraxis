@@ -23,6 +23,7 @@ use strict;
 use warnings;
 use FindBin qw($Bin);
 use lib "$Bin/../lib";
+use Encode ();
 use StewardTest qw(ok is run_vs temproot make_machine init_remote write_text done_testing diag);
 
 my $root   = temproot();
@@ -198,6 +199,82 @@ ok(-f "$proj/.ccpraxis-local-data/blueprints/bp1/blueprint.md", 'AC2: the local 
     # having simply done nothing.
     ok((grep { m{bug-reports/2026-a\.md} } @vpaths),
         'AC4 non-vacuity: ordinary content in the same directory still reached the vault');
+}
+
+# ---------------------------------------------------------------------------
+# AC5 — A NON-ASCII PATH MUST SURVIVE THE JOURNAL ROUND-TRIP.
+#
+# The ACTUAL root cause of 20260901-025445-d667, found only after the tmp-filter
+# fix above failed to change the outcome. AC4 was a real bug and made every run
+# worse, but it was not what broke the backup.
+#
+# sync-project and commit-and-push are SEPARATE PROCESSES that hand each other
+# file paths through the ops journal. The journal's log half was read with a bare
+# `JSON::PP->new->decode`, which returns utf8-FLAGGED strings. A path through
+# `André` came back as the characters `Ã©`, perl re-encoded that on the way to
+# Windows, and the resulting path did not exist -- so `-f $op->{tmp_path}` was
+# false for EVERY push, all 4414 rolled back with tmp_missing, and the backup
+# reported success having stored nothing. The files were on disk the entire
+# time; `ls` found them and `-f` did not.
+#
+# read_json() had re-encoded to bytes since it was written. The append-only log
+# was added later and skipped that step, so the two halves of one journal
+# disagreed about what a filename was.
+#
+# WHY THE SUITE STAYED GREEN THROUGH ALL OF IT: temproot() resolves to
+# /c/Users/Public — pure ASCII. Every path this suite has ever tested round-trips
+# byte-identically whether or not the flag is set. The real vault lives under
+# `André`. So the bug was unreachable from the tests by construction, and no
+# amount of running them harder would have found it.
+#
+# Hence a non-ASCII FILENAME rather than a non-ASCII root: it reproduces the
+# fault wherever the test root happens to live.
+#
+# The first attempt at this fix used `->decode` + re-encode, which DOUBLE-encoded
+# (bytes read as Latin-1, then encoded again) and left the failure identical.
+# `->utf8->decode` is what makes the pair symmetric with the writer.
+# ---------------------------------------------------------------------------
+{
+    # Raw UTF-8 bytes, deliberately not `use utf8` — this is how a filename
+    # actually reaches the sync.
+    my $accented = "caf\x{c3}\x{a9}-r\x{c3}\x{a9}sum\x{c3}\x{a9}.md";
+    my $rel = ".ccpraxis-local-data/bug-reports/$accented";
+    write_text("$proj/$rel", "---\nid: accented\n---\nnon-ascii filename\n");
+
+    my $s6 = run_vs($home, 'sync-project', '--slug', 'proj');
+    is($s6->{json} && $s6->{json}{status}, 'synced', 'AC5: sync staged the non-ASCII path')
+        or diag(substr($s6->{out}, 0, 300));
+
+    my $c6 = run_vs($home, 'commit-and-push', '--slug', 'proj',
+                    '--session-id', ($s6->{json}{session_id} // ''));
+
+    # THE ASSERTION. With the flag bug present this is 2 (push + cache) and the
+    # status is rolled_back_nothing_stored.
+    my @rb6 = @{ ($c6->{json} && $c6->{json}{rolled_back_during_sync}) || [] };
+    is(scalar @rb6, 0, 'AC5: the non-ASCII push did NOT roll back')
+        or diag("status=" . (($c6->{json} && $c6->{json}{status}) // '?') . "; rolled back: "
+                . join(', ', map { ($_->{path} // '?') . ' (' . ($_->{reason} // '?') . ')' } @rb6));
+
+    # And it is really in the vault, byte-identically — a path that round-tripped
+    # through the wrong encoding would either be absent or present under a
+    # mangled name, and both fail this.
+    my $vf6 = run_vs($home, 'vault-files', '--slug', 'proj');
+    # StewardTest::run_vs parses with decode_json, so reported paths come back as
+    # utf8-FLAGGED characters while $rel is raw bytes. Compare in one encoding or
+    # the case fails on the harness rather than on the product. (That the parse
+    # succeeded at all is itself evidence the product emitted valid UTF-8.)
+    my @vp6 = map { my $p = ref $_ ? ($_->{path} // '') : $_;
+                    utf8::is_utf8($p) ? Encode::encode('UTF-8', $p) : $p }
+              @{ ($vf6->{json} && $vf6->{json}{files}) || [] };
+    # scalar(), NOT a bare grep. `ok((grep {...}), 'name')` passes the MATCHES as
+    # a list, so on zero matches the name string slides into the truth slot and
+    # the case passes vacuously with an empty name — which is exactly what it did
+    # on first run here, hiding a real mismatch.
+    ok(scalar(grep { $_ eq $rel } @vp6),
+        'AC5: the non-ASCII filename reached the vault with its bytes intact')
+        or diag("vault has: " . join(', ', grep { /bug-reports/ } @vp6));
+
+    ok(-f "$proj/$rel", 'AC5: and the local file still exists');
 }
 
 done_testing();
