@@ -2512,7 +2512,19 @@ sub journal_read {
         while (my $line = <$fh>) {
             next unless $line =~ /\n\z/;          # partial trailing line: skip
             next unless $line =~ /\S/;
-            my $rec = eval { JSON::PP->new->decode($line) };
+            # BYTES, NOT CHARS -- and this is not a detail. decode() returns
+            # utf8-FLAGGED strings, so a path through `André` becomes the chars
+            # `Ã©`, which perl re-encodes on the way to Windows into a path that
+            # does not exist. Every `-f $op->{tmp_path}` then fails and every
+            # push rolls back with tmp_missing -- 4414 of 4414, measured, while
+            # the files sat on disk the whole time. read_json() has re-encoded
+            # since it was written; this log path was added later and did not,
+            # so the two halves of the same journal disagreed about a filename.
+            # `->utf8` is load-bearing, not decoration. Without it the raw UTF-8
+            # bytes are read as Latin-1 chars (`Ã©`), and _encode_strings_recursive
+            # then DOUBLE-encodes them -- a wrong answer that looks like a fix.
+            # With it, the pair round-trips to the same bytes the writer emitted.
+            my $rec = _encode_strings_recursive(eval { JSON::PP->new->utf8->decode($line) });
             next unless ref $rec eq 'HASH' && defined $rec->{id};
             if (my $prev = $by_id{ $rec->{id} }) {
                 $prev->{$_} = $rec->{$_} for keys %$rec;   # later line wins
