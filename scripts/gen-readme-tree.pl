@@ -78,7 +78,16 @@ if ($help) {
 }
 
 my $REPO_ROOT = abs_path("$Bin/..");
-my $README    = "$REPO_ROOT/README.md";
+
+# THE TREE LIVES IN docs/repo-layout.md, NOT THE README.
+#
+# It was 377 of the README's 849 lines -- 44% of the front page spent on a
+# generated listing, most of it undescribed, pushing the actual explanation of
+# what ccpraxis IS below the fold. The README is now a front door; this file is
+# the reference it links to. The variable keeps its name because every routine
+# below refers to it and the script's job is unchanged: own the block between
+# the markers, wherever that block lives.
+my $README    = "$REPO_ROOT/docs/repo-layout.md";
 
 # Excludes (relative paths or bare names).
 my %EXCLUDE_DIRS = map { $_ => 1 } qw(
