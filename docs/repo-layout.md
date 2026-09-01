@@ -22,7 +22,10 @@ ccpraxis/
 ├── .gitattributes
 ├── CLAUDE.md
 ├── docs/
-│   └── design-conventions.md
+│   ├── design-conventions.md                  # Design calls: packaging, approval flows, and what gets enforced in code
+│   ├── install-protocol.md                    # The fresh-install procedure Claude follows when asked to install ccpraxis
+│   ├── reference.md                           # How each surface works: install contract, slash commands, statusline, backup flow, vault sync, sandbox, backpack
+│   └── repo-layout.md                         # This page: every tracked file, annotated and generated from disk
 ├── global-config/
 │   ├── CLAUDE.md                              # Global instructions (supply chain rules, response style)
 │   ├── known_marketplaces.json                # Marketplace selections (synced across machines)
