@@ -55,20 +55,28 @@ Five things kept going wrong. Each one is now a system in this repo.
 
 ### 1. A sandbox that manages itself
 
-Claude runs **inside a container**, so the toolchain that `npm install` executes is never on your machine. That part is table stakes. The rest is not:
+Claude runs **inside a container**, one per project, so the toolchain that `npm install` executes is never on your machine. Containers are **disposable on purpose**: everything worth keeping lives in the backpack manifest or the vault, so throwing one away and rebuilding costs a command rather than an afternoon.
 
-|  | plain Docker / devcontainer | ccpraxis |
+#### Compared with Claude Code's own options
+
+Claude Code ships [several isolation approaches](https://code.claude.com/docs/en/sandbox-environments), and they solve a different problem than this does.
+
+The **[sandboxed Bash tool](https://code.claude.com/docs/en/sandboxing)** is a permission boundary, not an environment. It uses OS primitives (macOS Seatbelt, Linux bubblewrap) to confine what Bash commands may read, write, and reach — but it doesn't *give* you an environment, it constrains commands in whatever one you're already in. Anthropic's own docs are explicit that it covers only Bash: *"Built-in file tools, MCP servers, and hooks still run directly on your host."* And **it does not support native Windows** — *"On Windows, run Claude Code inside a WSL2 distribution."* In practice that means one WSL2 box, with one toolchain, shared by every project you own.
+
+**[Dev containers](https://code.claude.com/docs/en/devcontainer)** *do* isolate the full environment — that part is genuinely equivalent, and worth saying plainly. The difference is everything around the container:
+
+|  | Dev container | ccpraxis |
 |---|---|---|
-| Container lifecycle | you run and clean up | launcher creates, reaps, and shuts down; stale containers are detected and offered for reuse or replacement |
-| Rebuilds | hand-edit the image, rebuild, re-install | **backpack** replays every declared tool, runtime, and setup command automatically |
+| Who drives it | an editor that supports the spec — VS Code, Codespaces, JetBrains. *"Editors without dev container support, such as plain Vim, are not part of this workflow."* | a terminal launcher; no editor involvement |
+| Lifecycle | your editor builds and reopens; stale containers are yours to notice | creates, detects stale containers and offers reuse or replacement, reaps, shuts down |
+| Rebuilds | edit the Dockerfile or add devcontainer features, then rebuild | **backpack** replays every declared tool, runtime, and setup command |
 | Recording what you installed | you remember to update the Dockerfile | a `PostToolUse` hook watches `Bash`, notices installs, and hands the agent a pre-filled `/backpack:add` |
-| Runtime | pick one | Docker **or** Podman, auto-detected |
-| Visibility | `docker ps` | a live TUI (below) — resources, providers, auth expiry, blueprint progress, dismissable warnings |
-| Supply-chain posture | whatever the image does | install hooks blocked, **7-day minimum package age**, rootless user-namespace isolation under Podman |
+| Auth across rebuilds | *"the container's home directory is discarded on rebuild"* — persisting it means mounting a volume and setting `CLAUDE_CONFIG_DIR` yourself | handled by the launcher |
+| Runtime | Docker | Docker **or** Podman, auto-detected |
+| Visibility | `docker ps` | a live TUI — resources, auth expiry, blueprint progress, dismissable warnings |
+| Supply chain | whatever your image does | install hooks blocked, **7-day minimum package age**, rootless user-namespace isolation under Podman |
 
-The containers are **disposable on purpose**. Everything worth keeping lives in the backpack manifest or the vault, so throwing one away and rebuilding costs a command rather than an afternoon.
-
-> **Versus Claude Code's built-in sandboxing.** The native sandbox restricts what tool calls may touch on *your host* — it is a permission boundary around a session, and the toolchain still has to be installed on your machine to be used. ccpraxis moves the whole session into a container: the toolchain, the caches, and anything a dependency executes live and die there. The two are complementary rather than competing; this is the heavier one.
+> **What none of this buys you.** Anthropic's warning applies here too, and it is worth repeating rather than burying: *"dev containers do not prevent a malicious project from exfiltrating anything accessible inside the container, including the Claude Code credentials stored in `~/.claude`."* A container bounds the blast radius. It does not make hostile code safe to run, and ccpraxis does not change that.
 
 ### 2. Work that survives losing the thread
 
@@ -80,7 +88,26 @@ Then `butler` executes it. `/butler:dispatch-fleet` starts a deterministic orche
 
 Arm a session with `/butler:continuity on` and a `Stop` hook refuses to let a turn end while work is outstanding. There are exactly two legal ways out: **something is scheduled to wake the session**, or you **explicitly disarm**. "I've summarized my plan" is not one of them.
 
-It works because settlement is explicit rather than inferred — no heuristic decides whether you're done, so there is nothing to guess wrong. This README's own session hit that gate: the turn was blocked, and it was right to block.
+Settlement is *explicit*, never inferred. No heuristic decides whether you're done, so there is nothing to guess wrong. This README's own session hit the gate — the turn was blocked, and it was right to block.
+
+<details>
+<summary><b>How this differs from <code>/goal</code></b></summary>
+
+[`/goal`](https://code.claude.com/docs/en/goal) sets a completion condition and keeps Claude working toward it: *"After each turn, a small fast model checks whether the condition holds."* It needs no setup and is the right tool for most work.
+
+Two structural differences matter when a run is genuinely unattended:
+
+**Settlement.** `/goal` ends when a model judges the condition met — a probabilistic call on a fuzzy predicate. Continuity has no such judgement to make: it ends when you disarm. That is a narrower promise, and a narrower promise is one that can't be wrong.
+
+**Liveness.** `/goal`'s check runs *after each turn*, so it depends on turns continuing to happen. A session wedged on a command with no timeout produces no next turn, and nothing in-session is left to notice. For blueprint runs ccpraxis puts the watchdog **outside** the session: `bp-orchestrator.pl` is a plain script holding no context and spending no tokens, and its watch tick handles exactly that case —
+
+> `WATCHDOG — dead→relaunch (warm/cold per resume economics); alive+log-flat→kill+cold-relaunch; loop-guard past an attempt cap → blocked + queue a decision`
+
+A hung session is *alive but log-flat*: detected, killed, cold-relaunched. The source is blunt about why the obvious check isn't enough — *"bare `pid_alive()` is not evidence of a LIVE coordinator"* — because a process can be nominally alive and doing nothing at all.
+
+The honest trade: `/goal` is one command and works anywhere. This is a plugin, a launcher, and a blueprint on disk. Reach for it when a run has to survive things the session itself cannot observe.
+
+</details>
 
 ### 4. Rules that are enforced, not suggested
 
