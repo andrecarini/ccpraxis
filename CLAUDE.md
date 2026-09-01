@@ -158,8 +158,26 @@ when the trigger applies:
 | `.ccpraxis-local-data/guidance/escalate-product-decisions-only.md` | about to ask the operator anything mid-run |
 | `.ccpraxis-local-data/guidance/fix-ccpraxis-defects-in-place.md` | a real defect surfaces outside the current package's write set |
 | `docs/design-conventions.md` (tracked) | making a design call — packaging, approval flows, what to enforce in code — or hitting a Windows/Perl oddity that smells environmental |
+| `.ccpraxis-local-data/references/tropes.md` | writing prose a human will read — README, docs, skill copy, commit bodies, replies to the operator. Re-check the output against it before sending, not only before writing |
 
 Nothing that a hook already enforces belongs here — the hook is the instruction.
+
+**These paths are gitignored, so a fresh clone starts without them.** That is deliberate — they are
+notes, not code — but it means the rows above dangle until restored. `tropes.md` is the one with a
+canonical source, so it can simply be re-fetched:
+
+```bash
+mkdir -p .ccpraxis-local-data/references
+curl -sSL -o .ccpraxis-local-data/references/tropes.md \
+  https://gist.githubusercontent.com/ossa-ma/dae6f9571534f3fbd1266a384be00e11/raw
+```
+
+(The site is <https://tropes.fyi>. Its `/tropes-md` link renders a single-page app, so fetching that
+URL yields the HTML shell rather than the file — use the gist.)
+
+A note on using it: it is a checklist for **generated prose**, not a style ban. Verbatim quotes stay
+byte-exact even when they contain something on the list, and a real proper noun is not title case.
+The 2026-09-01 README pass left three flagged lines untouched for exactly those reasons.
 
 ## `.claude/settings.json` is TRACKED — and that is load-bearing
 
