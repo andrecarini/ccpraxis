@@ -51,3 +51,8 @@ plugins/blueprint/templates/*.lock
 # and it appeared as untracked the moment the hook first fired -- which means
 # the next /steward:backup would have committed a runtime log into the repo.
 .reap-orphans.log
+
+# Test-run debris. A hook under test writes .hook-err.<pid> next to the test
+# file; a `git add -A` mid-run committed one (6a666db) and the test then removed
+# it, leaving a tracked path with no working copy. Ignore the shape, not the pid.
+plugins/*/tests/t/.hook-err.*
