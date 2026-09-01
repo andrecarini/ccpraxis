@@ -1,5 +1,3 @@
-<div align="center">
-
 # PRAXIS for Claude Code
 
 A layer you install on top of Claude Code, for engineers running several projects at once.
@@ -13,8 +11,6 @@ Each project gets its own container, with its own toolchain, dependencies and co
 [![Stars](https://img.shields.io/github/stars/andrecarini/ccpraxis?style=flat)](https://github.com/andrecarini/ccpraxis/stargazers)
 [![Last commit](https://img.shields.io/github/last-commit/andrecarini/ccpraxis)](https://github.com/andrecarini/ccpraxis/commits/main)
 
-</div>
-
 ---
 
 ## Contents
@@ -26,6 +22,7 @@ Each project gets its own container, with its own toolchain, dependencies and co
   - [Finishing without being watched](#finishing-without-being-watched)
   - [Hooks for the mistakes that are not worth repeating](#hooks-for-the-mistakes-that-are-not-worth-repeating)
   - [Your setup, synced across machines](#your-setup-synced-across-machines)
+  - [A statusline worth the two lines it costs](#a-statusline-worth-the-two-lines-it-costs)
   - [Choosing when Claude Code updates](#choosing-when-claude-code-updates)
 - [On your machine](#on-your-machine)
 - [See it](#see-it)
@@ -66,7 +63,11 @@ It is opt-in per project. Without it Claude Code runs on your machine exactly as
 
 `/blueprint:create` turns an objective into a **blueprint**: a plan on disk rather than held in the conversation, split into **packages**, bounded chunks of work, each with a **write set** (the files it may touch), dependencies, and pass/fail criteria specific enough to check mechanically, then audited by an agent that never sat in the conversation that produced it. Each package keeps a **ledger**, an on-disk record of what was decided and why, so a compacted or restarted session picks up from the file instead of from memory that's gone.
 
-**butler** is the plugin that executes a blueprint once it exists. `/butler:dispatch-fleet` runs one unattended: a plain script, not itself an agent, launches one Claude session per package, restarts any that die, and drives the blueprint to done. It runs inside the sandbox, which is what makes unattended work practical: permission prompts have nothing to stop, because the blast radius is already the container.
+**butler** is the plugin that executes a blueprint once it exists. `/butler:dispatch-fleet` runs one unattended, and the packages are what make that parallel. Dependencies between them form a graph, and every package declares the files it may write, so the orchestrator can launch several at once: those whose dependencies are met and whose write sets do not overlap. Two agents never edit the same file, because the plan already established they cannot. Each gets its own Claude session, up to a concurrency cap you set.
+
+The orchestrator itself is a plain script rather than an agent, so watching, launching and relaunching costs no tokens. It notices a session that died and restarts it, and a session that is alive but has stopped producing output, which it kills and restarts cold.
+
+It runs inside the sandbox, which is what makes unattended work practical: permission prompts have nothing to stop, because the blast radius is already the container.
 
 It is also usage-aware, which matters more than it sounds. Rather than driving until your limit is hit and everything stops mid-package, it watches burn rate and pauses at a trip point **below** the ceiling, leaving budget for you. When the window resets it resumes on its own.
 
@@ -102,31 +103,25 @@ Most of what accumulates around a project should not ship with it. Blueprints, t
 
 `/todo:create` writes a note without derailing what you are doing, and `/todo:resume` picks one back up later. They ride along in the vault, so the note you left on one machine is there on the next.
 
+### A statusline worth the two lines it costs
+
+Claude Code gives you a couple of rows at the bottom of the terminal. This puts everything you would otherwise interrupt yourself to check into them:
+
+```text
+○ HOST ｜ ccpraxis ｜ ⌥ main ↑3 ↓22 ｜ ⧉ 2  ⋮ 14
+Opus 5 200k 59% 118k 82k ｜ 5h 34% 3h 35m｜7d 12% 4d 4h
+/c/Development/ccpraxis
+```
+
+Reading across: this session is on the **host** rather than in a sandbox, in the `ccpraxis` project, on `main` with 3 commits to push and 22 to pull, with 2 blueprints and 14 todos outstanding. Then the model, a 200k context window at 59% with 118k used and 82k left, and both usage windows: 34% of the 5-hour spent and 3h35m until it resets, 12% of the weekly and 4d4h to go.
+
+The usage figures are the ones that change behaviour. Knowing you are at 34% with three hours to reset is the difference between starting a long run and regretting it.
+
+It collapses to a single row when the terminal is wide enough, drops fields by priority as it narrows, and never lets a truncation cost you the context readout. Perl core modules only, so it adds no dependency and no startup cost worth measuring.
+
 ### Choosing when Claude Code updates
 
 Claude Code ships often, sometimes several times a day, and an update that breaks your setup arrives on its schedule rather than yours. `/steward:update` puts that back under your control: it reads the changelog for every version newer than yours, weighs release age, checks community issues for the versions in range, and presents the risk before you pick one. It snapshots the current binary first, so an update that goes wrong is one command to undo.
-
-```mermaid
-flowchart LR
-  subgraph HOST["Your machine"]
-    CC["Claude Code<br/>~/.claude"]
-    LAUNCH["claude-sandbox<br/>launcher + TUI"]
-  end
-  subgraph CTR["Disposable container"]
-    SESS["Claude session"]
-    TOOLS["toolchain<br/>node · python · …"]
-    BP["backpack manifest<br/>replayed on rebuild"]
-  end
-  VAULT[("Private vault repo<br/>CLAUDE.md · skills<br/>blueprints · todos")]
-  REPO[("Your ccpraxis fork")]
-
-  LAUNCH ==> CTR
-  SESS --- TOOLS
-  BP -.rebuilds.-> TOOLS
-  CC <-->|/steward:backup| REPO
-  CC <-->|vault sync| VAULT
-  CTR -.->|never touches| HOST
-```
 
 ---
 
@@ -240,7 +235,11 @@ Claude Code ships [several isolation approaches](https://code.claude.com/docs/en
 | Auth across rebuilds | *"the container's home directory is discarded on rebuild"* unless you mount a volume yourself | handled by the launcher |
 | Supply chain | whatever your image does | install scripts disabled for npm/pnpm; a 7-day minimum package age for pnpm |
 
-[Docker Sandboxes](https://docs.docker.com/ai/sandboxes/) is the closest thing to this, and it is good at what it does: each agent runs in a microVM with *"its own Docker daemon, filesystem, and network"*, so isolation is genuinely per-sandbox rather than shared. The difference is not isolation, it is everything built on top. Docker Sandboxes knows nothing about Claude Code. Your skills, plugins, credentials, per-project instructions and the state of a long-running plan are not its concern, and its documentation does not address whether what an agent installs survives a rebuild. ccpraxis is narrower on purpose: it only isolates Claude Code, and in exchange the container knows what it is running.
+[Docker Sandboxes](https://docs.docker.com/ai/sandboxes/) gives each agent a microVM with *"its own Docker daemon, filesystem, and network"*, which is stronger isolation than a container. The catch is what it demands of your machine. It requires **Windows 11** with the Windows Hypervisor Platform enabled, or **macOS Sonoma on Apple silicon**, or **Ubuntu 24.04+** with KVM — and Docker *"does not test or support Docker Sandboxes on Ubuntu derivatives, such as Linux Mint and Pop!\_OS."* Windows 10 is out. Intel Macs are out. Most Linux distributions are out. Inside a VM or VDI you also need nested virtualization, and every sandbox pays a microVM boot of a few seconds.
+
+ccpraxis asks for a container runtime you probably already have, Docker or Podman, auto-detected. That buys weaker isolation than a microVM and much wider reach.
+
+The other difference is what the isolation knows about. Docker Sandboxes is agent-agnostic, so your Claude skills, plugins, credentials, per-project instructions and the state of a half-finished plan are outside its remit, and its documentation does not say whether what an agent installs survives a rebuild. ccpraxis only isolates Claude Code, and in exchange the container knows what it is running: the backpack replays the toolchain, the vault carries the config, and butler can drive work inside it.
 
 Anthropic's own warning about dev containers applies here too: *"dev containers do not prevent a malicious project from exfiltrating anything accessible inside the container, including the Claude Code credentials stored in `~/.claude`."* A container bounds the blast radius; it does not make hostile code safe to run.
 
@@ -252,20 +251,19 @@ Anthropic's own warning about dev containers applies here too: *"dev containers 
 
 ## Fork it
 
-ccpraxis is meant to be forked. Change what you disagree with and pull upstream for fixes:
+ccpraxis is meant to be forked. The rules here are opinions, and yours will differ.
+
+`~/.claude/ccpraxis` is a clone of *your* fork, so changes you make there are yours to commit and push. The install already added `upstream` pointing at this repo, so pulling fixes is:
 
 ```bash
-cd ~/.claude/ccpraxis
-git remote add upstream https://github.com/andrecarini/ccpraxis.git
-git fetch upstream && git merge upstream/main
+git -C ~/.claude/ccpraxis fetch upstream
+git -C ~/.claude/ccpraxis merge upstream/main
 ```
 
-Then run `/steward:backup` to resync your live config.
+Two things that are easy to get wrong:
 
----
+**That directory is the code Claude Code is running.** Merging into it changes the tooling underneath a live session, so restart Claude Code afterwards rather than carrying on in the session that was open.
 
-<div align="center">
+**A merge can bring new surfaces with it.** New skills need linking into `~/.claude/skills/`, new plugins need installing, and settings may have gained keys. Run `perl ~/.claude/ccpraxis/install.pl` to see what a merge changed, re-run it with `--confirm` to apply, then `/steward:backup` to resync config and relink skills. A merge alone leaves new skills present on disk and invisible to Claude.
 
-Licensed under [Apache 2.0](LICENSE).
-
-</div>
+If you have customised heavily, expect conflicts in `global-config/` and `.claude/settings.json` — those are the files both sides edit.
