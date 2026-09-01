@@ -4,11 +4,11 @@
 
 **P**rompts, **R**ules, **A**gents, e**X**tensions, **I**ntegrations, **S**kills
 
-A configuration for Claude Code. It runs your sessions in disposable containers that rebuild themselves, keeps multi-session work on disk instead of in the context window, and enforces its rules with hooks that block the call.
+A working Claude Code configuration: plugins, rules, hooks and launchers, shaped by daily use. The problems below are the ones it exists to solve.
 
 [![Perl 5.14+](https://img.shields.io/badge/runtime-Perl%205.14%2B-39457E?logo=perl&logoColor=white)](https://www.perl.org/)
 [![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows-blue)](#platforms)
-[![No host tooling](https://img.shields.io/badge/host%20tooling-none%20required-success)](#1-a-sandbox-that-manages-itself)
+[![Install: git clone](https://img.shields.io/badge/install-git%20clone-success)](#quick-start)
 [![License](https://img.shields.io/badge/license-Apache%202.0-green)](LICENSE)
 [![Stars](https://img.shields.io/github/stars/andrecarini/ccpraxis?style=flat)](https://github.com/andrecarini/ccpraxis/stargazers)
 [![Last commit](https://img.shields.io/github/last-commit/andrecarini/ccpraxis)](https://github.com/andrecarini/ccpraxis/commits/main)
@@ -42,10 +42,10 @@ Each of these kept going wrong, and each is now a system in this repo.
 | Problem | Detail |
 |---|---|
 | **Dev tooling on your machine is an attack surface** | One `npm install` runs arbitrary code from hundreds of packages, with your SSH keys, tokens and browser sessions a single `postinstall` away. "Be careful" is not a control. |
-| **Telling an agent a rule does not enforce it** | A prohibited `git stash` here swept a finished batch of fixes into a stash that was never restored, while the ledger recorded the step as complete. The instruction was written down. It was violated three times. |
+| **A written rule is not enforcement** | An agent can ignore an instruction you gave it. A prohibited `git stash` here destroyed a finished batch of work while the run still reported success. |
 | **Long work loses its thread** | Anything spanning more than one session gets compacted, and what you decided (and why) goes with it. |
 | **Agents stop early** | They report a plan, summarize what they would do, then end the turn with the work unfinished. |
-| **Nothing travels** | New laptop, and your instructions, skills and project notes are elsewhere, much of it in files you cannot commit to the project repo. |
+| **Nothing travels** | New laptop, and your instructions, skills and project notes are elsewhere, much of it in files you deliberately kept out of the project repo. |
 
 ---
 
@@ -53,7 +53,9 @@ Each of these kept going wrong, and each is now a system in this repo.
 
 ### 1. A sandbox that manages itself
 
-Claude runs **inside a container**, one per project, so the toolchain that `npm install` executes is never on your machine. Containers are **disposable on purpose**: everything worth keeping lives in the backpack manifest or the vault, so throwing one away and rebuilding costs a command rather than an afternoon.
+Opt-in, and per project. Most work needs nothing here: you run Claude Code normally. When a project has dependencies and a toolchain you would rather not install on your machine, `claude-sandbox` starts that project's session in a container instead, so whatever `npm install` executes runs there.
+
+The containers are **disposable on purpose**. Everything worth keeping lives in the backpack manifest or the vault, so throwing one away and rebuilding costs a command rather than an afternoon.
 
 #### Compared with Claude Code's own options
 
@@ -72,7 +74,7 @@ The **[sandboxed Bash tool](https://code.claude.com/docs/en/sandboxing)** is a p
 | Auth across rebuilds | *"the container's home directory is discarded on rebuild"*; persisting it means mounting a volume and setting `CLAUDE_CONFIG_DIR` yourself | handled by the launcher |
 | Runtime | Docker | Docker **or** Podman, auto-detected |
 | Visibility | `docker ps` | a live TUI: resources, auth expiry, blueprint progress, dismissable warnings |
-| Supply chain | whatever your image does | install hooks blocked, **7-day minimum package age**, rootless user-namespace isolation under Podman |
+| Supply chain | whatever your image does | install scripts disabled for npm and pnpm; a **7-day minimum package age** for pnpm specifically; rootless user-namespace isolation under Podman |
 
 > **What none of this buys you.** Anthropic's warning applies here too, and it is worth repeating rather than burying: *"dev containers do not prevent a malicious project from exfiltrating anything accessible inside the container, including the Claude Code credentials stored in `~/.claude`."* A container bounds the blast radius. It does not make hostile code safe to run, and ccpraxis does not change that.
 
@@ -84,9 +86,9 @@ Then `butler` executes it. `/butler:dispatch-fleet` starts a deterministic orche
 
 ### 3. Continuity: finish what you started
 
-Arm a session with `/butler:continuity on` and a `Stop` hook refuses to let a turn end while work is outstanding. A turn may end once **something is scheduled to wake the session**, or once you **explicitly disarm**. "I've summarized my plan" does not qualify.
+Arm a session with `/butler:continuity on` and a `Stop` hook pushes back when a turn tries to end with work outstanding. It wants either **something scheduled to wake the session**, or an **explicit disarm**. "I've summarized my plan" is neither.
 
-Settlement is explicit, so no heuristic has to decide whether you are done and there is nothing to guess wrong. This README's own session hit the gate: the turn was blocked, and it was right to block.
+It is a persistent nag, not a cage, and the difference is deliberate. After three consecutive blocks it gives way, on the reasoning in its own source that *"a gate that will not yield is worse than a stalled run"*. Two documented overrides exist as well: a one-shot marker file, and a session-wide environment variable.
 
 <details>
 <summary><b>How this differs from <code>/goal</code></b></summary>
@@ -109,12 +111,12 @@ A hung session is *alive but log-flat*: detected, killed, cold-relaunched. The s
 
 Every rule that has cost real time here became a hook that **denies the call before it runs**:
 
-- `git stash` / `reset` / `checkout` / `clean`: blocked in *every* session after the incident above, matched even inside quoted or nested commands
+- `git stash` / `reset` / `checkout` / `clean`: denied outright, matched even inside quoted or nested commands. Registered in this repo's own `.claude/settings.json`, so it guards work *on ccpraxis*; wire it into another project's settings to get it there
 - `> NUL` from Bash on Windows: creates a file Explorer cannot delete; blocked
 - Non-ASCII in a `.ps1`: PowerShell 5.1 reads a BOM-less file as CP1252, and one stray byte becomes a string delimiter that breaks parsing far from the real line; blocked
 - Direct edits to bug reports and blueprints: writes must go through the API that validates them
 
-**22 hooks**, backed by **273 test files**. The tests exist to prove each guard still fails when the fix is removed.
+Each guard has tests that fail when the guard is removed, which is the only way to know it still does anything.
 
 ### 5. Your setup, on every machine
 
@@ -211,8 +213,8 @@ Claude follows [`docs/install-protocol.md`](docs/install-protocol.md) to do the 
 | `/steward:backup` | Sync config and every registered vault project |
 | `/steward:setup-project` | Track this project's Claude files in your vault |
 | `/blueprint:create` | Turn an objective into an audited, on-disk plan |
-| `/butler:dispatch-fleet` | Execute a blueprint with detached coordinators |
-| `/butler:drive-solo` | Execute one interactively instead |
+| `/butler:dispatch-fleet` | Execute a blueprint with detached coordinators (sandbox only) |
+| `/butler:drive-solo` | Execute one interactively, on the host or in the sandbox |
 | `/butler:continuity on` | Refuse to end a turn with work outstanding |
 | `/backpack:add` | Record a tool so rebuilds restore it |
 | `/todo:create`, `/todo:resume` | Vault-synced todo notes |
