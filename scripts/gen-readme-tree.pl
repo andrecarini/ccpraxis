@@ -227,8 +227,70 @@ sub describe {
         return _first_sentence(trim($d), 80) if defined $d && length trim($d);
     }
 
+    # 3a. Conventional directories, and the plugin manifest.
+    #
+    # Every plugin repeats the same skeleton: hooks/, scripts/, skills/,
+    # tests/t/. Seven copies of an identical `hooks/.about` would be seven
+    # things to keep in sync for one fact, so the convention is described once
+    # here. A `.about` still wins (checked above), which is how a plugin whose
+    # `docs/` means something particular says so.
+    #
+    # These are deliberately generic. A default that overstates -- claiming
+    # what a directory contains in a plugin the author never looked at -- is
+    # worse than the blank it replaces.
+    if ($is_dir) {
+        my ($base) = $rel =~ m{([^/]+)\z};
+        my %CONVENTION = (
+            'hooks'          => 'Hook scripts registered in settings.json',
+            'agents'         => 'Subagent definitions this plugin dispatches',
+            'skills'         => 'Slash-command skills this plugin provides',
+            'commands'       => 'Slash-command definitions',
+            'scripts'        => 'Implementation scripts',
+            'tests'          => 'Test suite -- run via scripts/run-tests.pl',
+            't'              => 'Test files, one concern each',
+            'lib'            => 'Shared helpers',
+            'templates'      => 'Templates instantiated at runtime',
+            'specs'          => 'Package specifications',
+            '.claude-plugin' => 'Plugin manifest directory',
+        );
+        if (my $d = $CONVENTION{ $base // '' }) {
+            # `docs/` is intentionally absent: what a docs dir holds differs
+            # per plugin, so it gets a hand-written .about or nothing.
+            return $d;
+        }
+    }
+    if (!$is_dir && $rel =~ m{\.claude-plugin/plugin\.json\z}) {
+        return 'Plugin manifest -- name, description, version';
+    }
+
+    # A JSON file that declares `_about` is describing itself. The convention
+    # already existed here (turn-caps.json, docs/assumptions.json) -- it just
+    # was not being read, so the files documented themselves into a tree that
+    # then reported them as undocumented.
+    if (!$is_dir && $rel =~ /\.json\z/) {
+        my $d = _read_json_field($abs, '_about');
+        return _first_sentence(trim($d), 80) if defined $d && length trim($d);
+    }
+
+    # 3b. Agent definition — same frontmatter shape as SKILL.md, same reader.
+    #     An agent's `description:` is its dispatch contract, so it is written
+    #     with care and is exactly the one-liner this tree wants.
+    # `opencode/` holds the same agent definitions ported for another runner,
+    # with the same frontmatter -- same reader, same result.
+    if (!$is_dir && $rel =~ m{/(?:agents|opencode)/[^/]+\.md\z}) {
+        my $d = _read_skill_description($abs);
+        return _first_sentence(trim($d), 80) if defined $d && length trim($d);
+    }
+
     # 4. Script header.
-    if (!$is_dir && $rel =~ /\.(?:pl|pm|sh|ps1)\z/) {
+    #
+    # `.t` IS A SCRIPT HEADER SOURCE. Test files are 273 of this repo's 628
+    # tree entries, and every one of them opens with a header stating what it
+    # proves -- that convention is enforced by review, so the descriptions
+    # already existed. Omitting the extension here is what made them show up
+    # as "no description", which read as 273 files nobody had documented
+    # rather than one missing character class.
+    if (!$is_dir && $rel =~ /\.(?:pl|pm|sh|ps1|t)\z/) {
         my $d = _read_script_header($abs);
         return _first_sentence(trim($d), 80) if defined $d && length trim($d);
     }
@@ -315,17 +377,60 @@ sub _read_script_header {
         chomp $line;
         next if $line =~ /^#!/;        # shebang
         next if $line =~ /^\s*$/;      # blank
+
+        # A .pm OPENS WITH `package Foo;`, AND ITS HEADER IS ON THE NEXT LINE.
+        # Terminating the scan on the first non-comment line meant 24 of this
+        # repo's 33 modules reported "no description" while line 2 held one --
+        # e.g. RunState.pm's "pure orchestrator/run-state summarizer for the
+        # dashboard". Skip only the declarations that legitimately precede a
+        # header, and only until the header starts: once a comment has been
+        # seen, any non-comment line still ends the block, so this cannot
+        # wander off and grab an unrelated comment from deeper in the file.
+        if (!@comments && $line =~ /^\s*(?:package|use|require|our|no)\b/) {
+            next;
+        }
+
         last unless $line =~ /^\s*#\s?(.*)$/;
-        push @comments, $1;
+        my $text = $1;
+
+        # A RULE OF `=` IS NOT A DESCRIPTION. Banner comments open several files
+        # here, and taking the first comment line verbatim rendered Theme.pm as
+        # "=========================================". Decoration is skipped
+        # while it precedes the real text; once real text has started, a
+        # decoration line ends the paragraph like any other break.
+        if ($text =~ /^[\s=\-*_#~]*$/) {
+            next unless @comments;
+            last;
+        }
+
+        push @comments, $text;
     }
     close $fh;
     return undef unless @comments;
 
-    # If the first comment is `<filename> — desc`, take the part after `— `.
-    if ($comments[0] =~ /^\S+\.(?:pl|pm|sh|ps1)\s+(?:\xE2\x80\x94|--)\s+(.+)$/) {
+    # JOIN THE OPENING COMMENT BLOCK, don't take only its first line.
+    #
+    # Headers here wrap: "# 04-....t — a load-modify-write race cannot defeat the"
+    # continues on the next line. Reading one line produced descriptions that
+    # stopped mid-clause ("cannot defeat the", "but its post-install verify
+    # fails, the ins") -- which looked like a truncation bug in the cap, and is
+    # not: the sentence simply was not all there. Join until the first blank
+    # comment line, which is where a header's opening paragraph ends by
+    # convention; _first_sentence then cuts at the real sentence boundary.
+    my @para;
+    for my $c (@comments) {
+        last if $c =~ /^\s*$/;
+        push @para, $c;
+    }
+    my $head = join ' ', @para;
+    $head =~ s/\s+/ /g;
+    $head = trim($head);
+
+    # If it opens with `<filename> — desc`, take the part after the dash.
+    if ($head =~ /^\S+\.(?:pl|pm|sh|ps1|t)\s+(?:\xE2\x80\x94|--)\s+(.+)$/) {
         return $1;
     }
-    return $comments[0];
+    return $head;
 }
 
 sub _first_sentence {
@@ -336,9 +441,24 @@ sub _first_sentence {
     if (length($s) > 20 && $s =~ /^(.{15,}?[.!?])\s/) {
         $s = $1;
     }
-    # Hard cap on length.
-    if (length($s) > $cap) {
-        $s = substr($s, 0, $cap - 1) . "…";
+    # Hard cap -- on CHARACTERS, at a WORD boundary.
+    #
+    # Every description source here is read as raw UTF-8 BYTES, so a plain
+    # substr can slice a multi-byte character in half and emit a lone
+    # continuation byte: "...but its post-install verify fails, the install<FFFD>".
+    # Decode, cut, re-encode. And back off to the last space so the cut lands
+    # between words rather than mid-token ("(spec section 2.1/").
+    my $chars = $s;
+    my $decoded = utf8::decode($chars);   # false => not valid UTF-8; treat as bytes
+    $chars = $s unless $decoded;
+
+    if (length($chars) > $cap) {
+        my $cut = substr($chars, 0, $cap - 1);
+        if ($cut =~ /^(.{40,})\s\S*$/) { $cut = $1 }
+        $cut =~ s/[\s,;:(\[\/-]+$//;
+        $cut .= "\x{2026}";
+        utf8::encode($cut) if $decoded;
+        return $cut;
     }
     return $s;
 }
@@ -464,7 +584,7 @@ sub do_bootstrap {
 sub do_render {
     my $tree = walk($REPO_ROOT, '');
 
-    my @nodes;  # { line, desc }
+    my @nodes;  # { line, desc, rel }
 
     my $emit;
     $emit = sub {
@@ -476,7 +596,10 @@ sub do_render {
         my $line = $prefix . $marker . $name;
         my $desc = describe($node->{abs}, $node->{rel}, $node->{is_dir});
         $desc = trim($desc);
-        push @nodes, { line => $line, desc => $desc };
+        # `rel` rides along so the undescribed-count can tell a deliberate
+        # blank from a real gap. Without it that filter matched nothing and
+        # silently changed no behaviour at all.
+        push @nodes, { line => $line, desc => $desc, rel => $node->{rel} };
 
         if (@{$node->{children}}) {
             my $cp = $prefix . ($is_last ? "    " : "\xE2\x94\x82   ");
@@ -580,7 +703,21 @@ open my $wfh, '>:raw', $README or die "Cannot write $README: $!\n";
 print $wfh @lines;
 close $wfh;
 
-my $missing = grep { !length $_->{desc} && $_->{line} ne 'ccpraxis/' } @$nodes;
+# DO NOT REPORT DELIBERATE BLANKS AS MISSING.
+#
+# Rule 3 in describe() gives each skill exactly ONE description line -- on the
+# skill dir when it has a hand-written .about, otherwise on its SKILL.md. The
+# other half of the pair is blank ON PURPOSE. Counting those made the script
+# report 32 undescribed entries when nothing was undescribed, which is a
+# warning that costs someone an afternoon proving it wrong. A reported number
+# has to mean something actionable or it trains people to ignore the reporting.
+my $missing = grep {
+       !length $_->{desc}
+    && $_->{line} ne 'ccpraxis/'
+    && ($_->{rel} // '') !~ m{(?:\A|/)skills/[^/]+/?\z}
+    && ($_->{rel} // '') !~ m{/SKILL\.md\z}
+} @$nodes;
+
 print "gen-readme-tree.pl: wrote $README.\n";
 if ($missing) {
     print STDERR "  ($missing entr", ($missing == 1 ? 'y has' : 'ies have'),

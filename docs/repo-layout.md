@@ -19,633 +19,633 @@ than editing this file, which is overwritten on every regeneration.
 <!-- BEGIN-FILE-TREE -->
 ```
 ccpraxis/
-├── .gitattributes
-├── CLAUDE.md
-├── docs/
-│   ├── design-conventions.md                  # Design calls: packaging, approval flows, and what gets enforced in code
-│   ├── install-protocol.md                    # The fresh-install procedure Claude follows when asked to install ccpraxis
-│   ├── reference.md                           # How each surface works: install contract, slash commands, statusline, backup flow, vault sync, sandbox, backpack
-│   └── repo-layout.md                         # This page: every tracked file, annotated and generated from disk
-├── global-config/
-│   ├── CLAUDE.md                              # Global instructions (supply chain rules, response style)
-│   ├── known_marketplaces.json                # Marketplace selections (synced across machines)
-│   └── settings.json                          # Base settings (env, statusline, plugins, effort level)
-├── host-tools/
-│   ├── bin/
-│   │   └── .gitkeep
-│   └── ccpraxis-install.pl                    # host-tools install hook: put `perl` on the user's PATH.
-├── install.pl                                 # Top-level setup orchestrator — discovers and runs every surface's ccpraxis-install.pl. Two-phase: bare run = plan only, --confirm = apply.
-├── plugins/                                   # Local plugin marketplace ("ccpraxis-local")
-│   ├── .claude-plugin/
-│   │   └── marketplace.json                   # Lists the plugins below; loaded via extraKnownMarketplaces in settings.json
-│   ├── almanac/                               # Almanac plugin — durable project records: ccpraxis bug reports (state machine + write guard) and the guidance notes that replace built-in auto-memory
-│   │   ├── .claude-plugin/
-│   │   │   └── plugin.json
-│   │   ├── hooks/
-│   │   │   ├── guard-almanac-write.sh         # PreToolUse guard: denies Edit/Write on bug-reports/*.md so the state machine cannot be bypassed
-│   │   │   └── hooks.json                     # Registers the bug-report write guard for any project with almanac enabled
-│   │   ├── scripts/
-│   │   │   └── almanac-bug.pl                 # Bug-report state machine: file/update/set-status/list/collect/verify. The only sanctioned writer of bug-reports/*.md
-│   │   ├── skills/
+├── .gitattributes                                                # Defeats CRLF normalization so shipped scripts stay LF
+├── CLAUDE.md                                                     # Instructions for working on ccpraxis itself
+├── docs/                                                         # Reference, install protocol, repo layout, design conventions
+│   ├── design-conventions.md                                     # Design calls: packaging, approval flows, and what gets enforced in code
+│   ├── install-protocol.md                                       # The fresh-install procedure Claude follows when asked to install ccpraxis
+│   ├── reference.md                                              # How each surface works: install contract, slash commands, statusline, backup flow, vault sync, sandbox, backpack
+│   └── repo-layout.md                                            # This page: every tracked file, annotated and generated from disk
+├── global-config/                                                # What gets installed to ~/.claude/ — global CLAUDE.md and settings
+│   ├── CLAUDE.md                                                 # Global instructions (supply chain rules, response style)
+│   ├── known_marketplaces.json                                   # Marketplace selections (synced across machines)
+│   └── settings.json                                             # Base settings (env, statusline, plugins, effort level)
+├── host-tools/                                                   # Host-side executables wired onto PATH by install.pl
+│   ├── bin/                                                      # PATH target — launcher shims land here
+│   │   └── .gitkeep                                              # Keeps the empty PATH target directory in git
+│   └── ccpraxis-install.pl                                       # host-tools install hook: put `perl` on the user's PATH.
+├── install.pl                                                    # Top-level setup orchestrator — discovers and runs every surface's ccpraxis-install.pl. Two-phase: bare run = plan only, --confirm = apply.
+├── plugins/                                                      # Local plugin marketplace ("ccpraxis-local")
+│   ├── .claude-plugin/                                           # Plugin manifest directory
+│   │   └── marketplace.json                                      # Lists the plugins below; loaded via extraKnownMarketplaces in settings.json
+│   ├── almanac/                                                  # Almanac plugin — durable project records: ccpraxis bug reports (state machine + write guard) and the guidance notes that replace built-in auto-memory
+│   │   ├── .claude-plugin/                                       # Plugin manifest directory
+│   │   │   └── plugin.json                                       # Plugin manifest -- name, description, version
+│   │   ├── hooks/                                                # Hook scripts registered in settings.json
+│   │   │   ├── guard-almanac-write.sh                            # PreToolUse guard: denies Edit/Write on bug-reports/*.md so the state machine cannot be bypassed
+│   │   │   └── hooks.json                                        # Registers the bug-report write guard for any project with almanac enabled
+│   │   ├── scripts/                                              # Implementation scripts
+│   │   │   └── almanac-bug.pl                                    # Bug-report state machine: file/update/set-status/list/collect/verify. The only sanctioned writer of bug-reports/*.md
+│   │   ├── skills/                                               # Slash-command skills this plugin provides
 │   │   │   ├── bug-report/
-│   │   │   │   └── SKILL.md                   # File a ccpraxis tooling bug report from whatever project you are working in.
+│   │   │   │   └── SKILL.md                                      # File a ccpraxis tooling bug report from whatever project you are working in.
 │   │   │   └── bug-triage/
-│   │   │       └── SKILL.md                   # Collect and triage ccpraxis bug reports filed from every project on this machin…
-│   │   └── tests/
-│   │       └── t/
-│   │           ├── 01-bug-state-machine.t
-│   │           ├── 02-write-guard.t
-│   │           ├── 03-frontmatter-injection.t
-│   │           └── 04-load-modify-write-race.t
-│   ├── backpack/                              # Backpack plugin — declarative tool/runtime/setup manifest for sandbox containers
-│   │   ├── .claude-plugin/
-│   │   │   └── plugin.json
-│   │   ├── hooks/
-│   │   │   └── auto-declare.pl                # PostToolUse hook on Bash — detects install commands and proposes /backpack:add
-│   │   ├── scripts/
-│   │   │   └── backpack.pl                    # Core helper: validate / list / install / add / remove / audit
-│   │   ├── skills/
+│   │   │       └── SKILL.md                                      # Collect and triage ccpraxis bug reports filed from every project on this…
+│   │   └── tests/                                                # Test suite -- run via scripts/run-tests.pl
+│   │       └── t/                                                # Test files, one concern each
+│   │           ├── 01-bug-state-machine.t                        # bug reports are frozen once ccpraxis picks them up.
+│   │           ├── 02-write-guard.t                              # bug reports are writable only through almanac-bug.pl.
+│   │           ├── 03-frontmatter-injection.t                    # a report cannot be born forged.
+│   │           └── 04-load-modify-write-race.t                   # a load-modify-write race cannot defeat the freeze guarantee.
+│   ├── backpack/                                                 # Backpack plugin — declarative tool/runtime/setup manifest for sandbox containers
+│   │   ├── .claude-plugin/                                       # Plugin manifest directory
+│   │   │   └── plugin.json                                       # Plugin manifest -- name, description, version
+│   │   ├── hooks/                                                # Hook scripts registered in settings.json
+│   │   │   └── auto-declare.pl                                   # PostToolUse hook on Bash — detects install commands and proposes /backpack:add
+│   │   ├── scripts/                                              # Implementation scripts
+│   │   │   └── backpack.pl                                       # Core helper: validate / list / install / add / remove / audit
+│   │   ├── skills/                                               # Slash-command skills this plugin provides
 │   │   │   ├── add/
-│   │   │   │   └── SKILL.md                   # /backpack:add     — register a new item (with rationale)
+│   │   │   │   └── SKILL.md                                      # /backpack:add     — register a new item (with rationale)
 │   │   │   ├── audit/
-│   │   │   │   └── SKILL.md                   # /backpack:audit   — surface items missing rationale or whose verify no longer passes
+│   │   │   │   └── SKILL.md                                      # /backpack:audit   — surface items missing rationale or whose verify no longer passes
 │   │   │   ├── install/
-│   │   │   │   └── SKILL.md                   # /backpack:install — replay install pass (no container rebuild needed)
+│   │   │   │   └── SKILL.md                                      # /backpack:install — replay install pass (no container rebuild needed)
 │   │   │   ├── list/
-│   │   │   │   └── SKILL.md                   # /backpack:list    — show contents grouped by category
+│   │   │   │   └── SKILL.md                                      # /backpack:list    — show contents grouped by category
 │   │   │   └── remove/
-│   │   │       └── SKILL.md                   # /backpack:remove  — drop an item
-│   │   └── tests/
-│   │       ├── run-tests.pl                   # Test runner for plugins/backpack/tests/t/.
-│   │       └── t/
-│   │           ├── 01-encoding.t
-│   │           ├── 02-install-diagnostics.t
-│   │           ├── 03-install-declared-reconciliation.t
-│   │           ├── 04-install-depends-on-ordering.t
-│   │           ├── 05-install-blame-attribution.t
-│   │           ├── 06-dependency-audit-table.t
-│   │           ├── 07-install-accounting-regressions.t
-│   │           ├── 08-bin-dirs-validation.t
-│   │           ├── 09-profile-fragment.t
-│   │           ├── 10-reinstall-loop.t
-│   │           ├── 11-docs-contract.t
-│   │           └── 12-bin-dirs-security.t
-│   ├── blueprint/                             # Authors and manages durable blueprints (plan-only — no execution or resume ve…
-│   │   ├── .claude-plugin/
-│   │   │   └── plugin.json                    # Plugin manifest for blueprint (name, version, description, author).
-│   │   ├── agents/
-│   │   │   └── bp-auditor.md                  # bp-auditor agent - fresh-context completeness auditor; reads only the blueprint files and returns gaps as questions before the blueprint is handed to butler.
-│   │   ├── scripts/
-│   │   │   ├── bp-init.sh                     # ensure the ccpraxis local data root exists and self-gitignores.
-│   │   │   ├── bp-lib.sh                      # shared helpers for the blueprint (authoring) plugin.
-│   │   │   └── bp-migrate-plans.pl            # deterministically migrate legacy .claude-plans/*.md
-│   │   ├── skills/
+│   │   │       └── SKILL.md                                      # /backpack:remove  — drop an item
+│   │   └── tests/                                                # Test suite -- run via scripts/run-tests.pl
+│   │       ├── run-tests.pl                                      # Test runner for plugins/backpack/tests/t/.
+│   │       └── t/                                                # Test files, one concern each
+│   │           ├── 01-encoding.t                                 # backpack.pl encoding + verify-surfacing regressions.
+│   │           ├── 02-install-diagnostics.t                      # When a backpack item installs but its post-install verify fails, the install…
+│   │           ├── 03-install-declared-reconciliation.t          # ORACLE for b01-backpack-install-accounting criteria 2/3 (spec section 2.1…
+│   │           ├── 04-install-depends-on-ordering.t              # ORACLE for b01-backpack-install-accounting criterion 4 (spec section 2.3…
+│   │           ├── 05-install-blame-attribution.t                # ORACLE for b01-backpack-install-accounting criterion 5 (spec section 2.4, case…
+│   │           ├── 06-dependency-audit-table.t                   # ORACLE for b01-backpack-install-accounting criterion 4's required artifact…
+│   │           ├── 07-install-accounting-regressions.t           # Regression suite for the b01-backpack-install-accounting step-7 fix-batch.
+│   │           ├── 08-bin-dirs-validation.t                      # Oracle for b02-backpack-owns-path — DC1 (schema) + DC2 (cmd_add authoring path).
+│   │           ├── 09-profile-fragment.t                         # Oracle for b02-backpack-owns-path — DC1, `cmd_install --profile-path`.
+│   │           ├── 10-reinstall-loop.t                           # Oracle for b02-backpack-owns-path — DC3, THE LOAD-BEARING CRITERION.
+│   │           ├── 11-docs-contract.t                            # Oracle for b02-backpack-owns-path — DC4, static content assertions.
+│   │           └── 12-bin-dirs-security.t                        # Oracle for b02-backpack-owns-path — fix-batch step7 regressions.
+│   ├── blueprint/                                                # Authors and manages durable blueprints (plan-only — no execution or resume…
+│   │   ├── .claude-plugin/                                       # Plugin manifest directory
+│   │   │   └── plugin.json                                       # Plugin manifest for blueprint (name, version, description, author).
+│   │   ├── agents/                                               # Subagent definitions this plugin dispatches
+│   │   │   └── bp-auditor.md                                     # bp-auditor agent - fresh-context completeness auditor; reads only the blueprint files and returns gaps as questions before the blueprint is handed to butler.
+│   │   ├── scripts/                                              # Implementation scripts
+│   │   │   ├── bp-init.sh                                        # ensure the ccpraxis local data root exists and self-gitignores.
+│   │   │   ├── bp-lib.sh                                         # shared helpers for the blueprint (authoring) plugin.
+│   │   │   └── bp-migrate-plans.pl                               # deterministically migrate legacy .claude-plans/*.md living-document plans into…
+│   │   ├── skills/                                               # Slash-command skills this plugin provides
 │   │   │   ├── authoring-protocol/
-│   │   │   │   └── SKILL.md                   # Operating protocol for the blueprint author — the interactive Claude Code ses…
+│   │   │   │   └── SKILL.md                                      # Operating protocol for the blueprint author — the interactive Claude Code…
 │   │   │   ├── create/
-│   │   │   │   └── SKILL.md                   # Create a new blueprint — a durable multi-package initiative with per-package …
+│   │   │   │   └── SKILL.md                                      # Create a new blueprint — a durable multi-package initiative with per-package…
 │   │   │   └── manage/
-│   │   │       └── SKILL.md                   # Manage blueprint lifecycle — list all blueprints with status, view one, re-ru…
-│   │   └── templates/
-│   │       ├── blueprint.md                   # Template for a blueprint's top-level file (objective, decisions, package status table, package blocks); instantiated by /blueprint:create.
-│   │       └── package-ledger.md              # Template for a per-package ledger; its frontmatter (status/model/max_turns/write_set/test_paths) is the contract butler reads at launch.
-│   ├── butler/                                # Executes blueprints.
-│   │   ├── .claude-plugin/
-│   │   │   └── plugin.json                    # Plugin manifest for butler (name, version, description, author).
-│   │   ├── agents/
-│   │   │   ├── bp-architect.md                # bp-architect worker (opus) - writes the package spec that tests and implementation build from. Report-only.
-│   │   │   ├── bp-conformance-judge.md
-│   │   │   ├── bp-escalation-resolver.md
-│   │   │   ├── bp-feedback-verifier.md        # bp-feedback-verifier agent - fresh-context, tool-enforced read-only diff of a feedback batch's raw files against its decomposition; reports omissions, distortions and modality drift, and cannot fix anything.
-│   │   │   ├── bp-harvest-judge.md            # bp-harvest-judge - verifies a finished package's outputs vs done-criteria from disk. Verdict-to-disk, never fixes.
-│   │   │   ├── bp-implementer.md              # bp-implementer worker - converges code on the immutable tests within the package write_set. Hook-blocked from test files.
-│   │   │   ├── bp-redteam.md                  # bp-redteam worker (opus) - adversarial pass over the package. Report-only.
-│   │   │   ├── bp-resolve-judge.md            # bp-resolve-judge - broad-context fix attempt for a stuck package; applies an intent-clear fix (relaunch) or parks with a question.
-│   │   │   ├── bp-reviewer.md                 # bp-reviewer worker - spec-conformance and conventions review. Report-only.
-│   │   │   ├── bp-scout.md                    # bp-scout worker (haiku) - terrain map with file:line for the package. Report-only.
-│   │   │   ├── bp-test-writer.md              # bp-test-writer worker - writes the immutable test oracle from the spec. May only touch the package test_paths.
-│   │   │   └── bp-ui-prober.md                # bp-ui-prober worker - finder-based UI scenarios and screenshot reads for packages that touch UI.
-│   │   ├── docs/
-│   │   │   ├── A0-derisk-findings.md
-│   │   │   ├── assumptions.json
-│   │   │   └── spend-credentials.md
-│   │   ├── hooks/
-│   │   │   ├── gate-continuity.sh             # Stop hook for an EXPLICITLY-ARMED continuity session.
-│   │   │   ├── gate-drive-loop.sh             # Stop hook inside a /butler:drive-solo DRIVER session.
-│   │   │   ├── gate-headless-background.sh    # PreToolUse hook for Bash, deny-when-headless.
-│   │   │   ├── gate-shutdown.sh               # PreToolUse graceful-stop gate (Decision #10/#18, package A4).
-│   │   │   ├── gate-stop.sh                   # Stop hook inside coordinator sessions.
-│   │   │   ├── guard-bash.sh                  # PreToolUse hook for Bash inside coordinator sessions.
-│   │   │   ├── guard-blueprint-write.sh       # PreToolUse hook (b43-blueprint-write-api).
-│   │   │   ├── guard-git-mutations.sh         # PreToolUse hook denying git working-tree mutations
-│   │   │   ├── guard-judge-checks.sh          # PreToolUse hook for Bash, mechanising done
-│   │   │   ├── guard-subagent-stall.sh        # refuse to end a turn that dispatched a background
-│   │   │   ├── guard-validation-interlock.sh  # PreToolUse hook for Bash.
-│   │   │   ├── guard-writes.sh                # PreToolUse hook for Edit|Write|MultiEdit|NotebookEdit.
-│   │   │   ├── hooks.json                     # Hook registration for butler: PreToolUse (gate-shutdown/guard-writes on edits, gate-shutdown/track-dispatch on Task, guard-bash on Bash), PostToolUse (log-dispatch), Stop (gate-stop). gate-shutdown is the A4 graceful-stop gate: on a fleet stop signal (runs/.shutdown | runs/.paused | runs/<pkg>.force-stop) it denies new work and lets the coordinator funnel to a clean park.
-│   │   │   ├── ledger-guard.sh                # PreToolUse package-ledger write-integrity guard (b12).
-│   │   │   ├── lib.sh                         # shared helpers for butler hooks.
-│   │   │   ├── log-dispatch.sh                # PostToolUse hook for Task inside coordinator sessions.
-│   │   │   ├── mark-wakeup.sh                 # PreToolUse hook for Task, Agent and Bash, in a DRIVE-SOLO
-│   │   │   ├── repeat-guard.sh                # PreToolUse mechanical repeat-command guard (b10).
-│   │   │   ├── track-dispatch.sh              # PreToolUse hook for Task inside coordinator sessions.
-│   │   │   ├── track-worker-solo.sh           # PreToolUse hook for Task|Agent, INTERACTIVE drive-solo
-│   │   │   ├── untrack-worker-solo.sh         # PostToolUse hook for Task|Agent, INTERACTIVE
-│   │   │   └── wait-shape-guard.sh            # PreToolUse guard for four wait/poll pathologies b10's exact-repeat
-│   │   ├── opencode/
-│   │   │   ├── bp-architect.md
-│   │   │   ├── bp-implementer.md
-│   │   │   ├── bp-redteam.md
-│   │   │   ├── bp-reviewer.md
-│   │   │   ├── bp-scout.md
-│   │   │   ├── bp-test-writer.md
-│   │   │   ├── bp-ui-prober.md
-│   │   │   └── guard-writes-plugin.js
-│   │   ├── scripts/
-│   │   │   ├── BpState.pm
-│   │   │   ├── bp-answer-decision.pl          # the MECHANICAL unblock the reporter performs once a
-│   │   │   ├── bp-baseline.pl                 # green-baseline materialization (b40-green-baseline-isolation).
-│   │   │   ├── bp-blueprint.pl                # the deterministic blueprint.md write/read API (b43-blueprint-write-api).
-│   │   │   ├── bp-cache-state.pl              # b41-cache-state-tracking: the ONE place that decides whether
-│   │   │   ├── bp-checkpoint.pl               # durable WIP checkpoint commits (b02, Decisions #2/#17).
-│   │   │   ├── bp-checks.pl                   # derive the checks a package's WRITE SET implies, and fail a
-│   │   │   ├── bp-containment-audit.pl        # post-step subprocess write-containment audit (b20).
-│   │   │   ├── bp-continuity.pl               # explicit continuity arm/disarm/status for THIS session.
-│   │   │   ├── bp-contract.pl                 # Anthropic-side + creds CONTRACT validators (Decision #29/#31).
-│   │   │   ├── bp-deps-check.pl               # deterministic dependency/version-policy classifier (Decisions #4, #11, #12, #14…
-│   │   │   ├── bp-dispatch-log.pl             # the per-dispatch budget record for a driver- or
-│   │   │   ├── bp-drive-next.pl               # the mechanical director for /butler:drive-solo.
-│   │   │   ├── bp-fast-store.sh               # pnpm store-dir + virtual-store-dir on container-native storage
-│   │   │   ├── bp-feedback.pl                 # one-command capture of a single piece of operator feedback
-│   │   │   ├── bp-govern.pl                   # the deterministic usage-governance decision functions for the
-│   │   │   ├── bp-hooks-selftest.sh           # A8 / Decision #31 startup self-assert.
-│   │   │   ├── bp-http.pl                     # the orchestrator/keeper HTTPS transport, via curl.
-│   │   │   ├── bp-init.sh                     # ensure the ccpraxis local data root exists and self-gitignores.
-│   │   │   ├── bp-jail.pl                     # per-dispatch worker jail isolation (b33-worker-jail-isolation).
-│   │   │   ├── bp-judge.pl                    # the DETERMINISTIC decision core for A5 (the judges).
-│   │   │   ├── bp-judge.sh                    # fire ONE scoped, throwaway judge for a package and detach it.
-│   │   │   ├── bp-keepawake.pl                # the wake-lock, shared by every long-running butler driver.
-│   │   │   ├── bp-launch.sh                   # launch (or resume) a headless coordinator session for one package.
-│   │   │   ├── bp-ledger.pl                   # the deterministic ledger API (b13-deterministic-ledger-api).
-│   │   │   ├── bp-lib.sh                      # butler's copy of the shared base helpers PLUS sandbox-only execution helpers.
-│   │   │   ├── bp-lifecycle.pl                # reconcile a blueprint's recorded run-state with what is
-│   │   │   ├── bp-log.pl                      # structured, line-flushed, crash-safe run logger (Decision #30).
-│   │   │   ├── bp-orchestrate.sh              # start (or report on) the deterministic, token-free
-│   │   │   ├── bp-orchestrator.pl             # the deterministic, TOKEN-FREE orchestrator process-management
-│   │   │   ├── bp-pin.pl                      # version-pin resolver + drift auditor (b46-version-pin-currency).
-│   │   │   ├── bp-preflight.pl                # environment-support assertion (Decisions #29/#31).
-│   │   │   ├── bp-progress.pl                 # b11-progress-heuristic-turns-backstop: a semantic liveness check
-│   │   │   ├── bp-remediate.pl                # b07-auto-remediation-engine: the DETERMINISTIC decision core
-│   │   │   ├── bp-resolve.pl                  # e03-autonomous-resolution: the deterministic apply-step for
-│   │   │   ├── bp-resume-sweep.sh             # find interrupted coordinators and resume them economically.
-│   │   │   ├── bp-runstate.pl                 # the run-state machine behind the stop gate.
-│   │   │   ├── bp-shape-lint.pl               # flag oracle assertions that pin the WHOLE SHAPE of a
-│   │   │   ├── bp-spend-auth.pl               # credential UX for the OpenCode Go/Zen spend cookie
-│   │   │   ├── bp-spend.pl                    # normalized OpenCode Go + Zen spend reader, plus the composed
-│   │   │   ├── bp-status.sh                   # one-line-per-package rollup across blueprints.
-│   │   │   ├── bp-statusline.pl               # b37-spend-surfaces C8: the compact spend form for
-│   │   │   ├── bp-token-keeper.pl             # the orchestrator's OAuth token-keeper (Decisions #11/#12/#30).
-│   │   │   ├── bp-turn-caps.pl                # the canonical turn-cap source, and the drift guard over it.
-│   │   │   ├── bp-usage-gate.pl               # ONE host-safe usage-headroom poll for /butler:drive-solo.
-│   │   │   ├── bp-validate-dag.pl             # deterministic blueprint-DAG validator.
-│   │   │   ├── bp-wait-for-decision.pl        # the reporter's TOKEN-FREE blocking watcher (A7).
-│   │   │   ├── bp-watch.pl                    # the general, condition-driven watcher for both interactive
-│   │   │   ├── bp-watchdog.pl                 # the drive-solo run's dead-man's switch.
-│   │   │   ├── bp-worker-models.pl            # worker model preference resolution + fallback ladder.
-│   │   │   ├── bp-worker.pl                   # deterministic non-Task dispatcher for butler workers.
-│   │   │   └── bp-write-guard.pl              # BpWrite::guarded_write, the a01-write-integrity-reread-under-lock
-│   │   ├── skills/
+│   │   │       └── SKILL.md                                      # Manage blueprint lifecycle — list all blueprints with status, view one, re-run…
+│   │   └── templates/                                            # Templates instantiated at runtime
+│   │       ├── blueprint.md                                      # Template for a blueprint's top-level file (objective, decisions, package status table, package blocks); instantiated by /blueprint:create.
+│   │       └── package-ledger.md                                 # Template for a per-package ledger; its frontmatter (status/model/max_turns/write_set/test_paths) is the contract butler reads at launch.
+│   ├── butler/                                                   # Executes blueprints.
+│   │   ├── .claude-plugin/                                       # Plugin manifest directory
+│   │   │   └── plugin.json                                       # Plugin manifest for butler (name, version, description, author).
+│   │   ├── agents/                                               # Subagent definitions this plugin dispatches
+│   │   │   ├── bp-architect.md                                   # bp-architect worker (opus) - writes the package spec that tests and implementation build from. Report-only.
+│   │   │   ├── bp-conformance-judge.md                           # Whole-blueprint conformance judge.
+│   │   │   ├── bp-escalation-resolver.md                         # Deep, bounded classifier for a queued escalations decision in a non-operator…
+│   │   │   ├── bp-feedback-verifier.md                           # bp-feedback-verifier agent - fresh-context, tool-enforced read-only diff of a feedback batch's raw files against its decomposition; reports omissions, distortions and modality drift, and cannot fix anything.
+│   │   │   ├── bp-harvest-judge.md                               # bp-harvest-judge - verifies a finished package's outputs vs done-criteria from disk. Verdict-to-disk, never fixes.
+│   │   │   ├── bp-implementer.md                                 # bp-implementer worker - converges code on the immutable tests within the package write_set. Hook-blocked from test files.
+│   │   │   ├── bp-redteam.md                                     # bp-redteam worker (opus) - adversarial pass over the package. Report-only.
+│   │   │   ├── bp-resolve-judge.md                               # bp-resolve-judge - broad-context fix attempt for a stuck package; applies an intent-clear fix (relaunch) or parks with a question.
+│   │   │   ├── bp-reviewer.md                                    # bp-reviewer worker - spec-conformance and conventions review. Report-only.
+│   │   │   ├── bp-scout.md                                       # bp-scout worker (haiku) - terrain map with file:line for the package. Report-only.
+│   │   │   ├── bp-test-writer.md                                 # bp-test-writer worker - writes the immutable test oracle from the spec. May only touch the package test_paths.
+│   │   │   └── bp-ui-prober.md                                   # bp-ui-prober worker - finder-based UI scenarios and screenshot reads for packages that touch UI.
+│   │   ├── docs/                                                 # Design records behind butler's orchestration decisions
+│   │   │   ├── A0-derisk-findings.md                             # De-risk spike findings behind the unattended-run overhaul
+│   │   │   ├── assumptions.json                                  # Machine-readable assumptions registry seeded by A0 (de-risk spike).
+│   │   │   └── spend-credentials.md                              # How bp-spend.pl reads OpenCode Go/Zen quota, and the credentials it needs
+│   │   ├── hooks/                                                # Hook scripts registered in settings.json
+│   │   │   ├── gate-continuity.sh                                # Stop hook for an EXPLICITLY-ARMED continuity session.
+│   │   │   ├── gate-drive-loop.sh                                # Stop hook inside a /butler:drive-solo DRIVER session.
+│   │   │   ├── gate-headless-background.sh                       # PreToolUse hook for Bash, deny-when-headless.
+│   │   │   ├── gate-shutdown.sh                                  # PreToolUse graceful-stop gate (Decision #10/#18, package A4).
+│   │   │   ├── gate-stop.sh                                      # Stop hook inside coordinator sessions.
+│   │   │   ├── guard-bash.sh                                     # PreToolUse hook for Bash inside coordinator sessions.
+│   │   │   ├── guard-blueprint-write.sh                          # PreToolUse hook (b43-blueprint-write-api).
+│   │   │   ├── guard-git-mutations.sh                            # PreToolUse hook denying git working-tree mutations in ANY session, including…
+│   │   │   ├── guard-judge-checks.sh                             # PreToolUse hook for Bash, mechanising done criterion 6 (h01 spec §2.2).
+│   │   │   ├── guard-subagent-stall.sh                           # refuse to end a turn that dispatched a background subagent without arming a…
+│   │   │   ├── guard-validation-interlock.sh                     # PreToolUse hook for Bash.
+│   │   │   ├── guard-writes.sh                                   # PreToolUse hook for Edit|Write|MultiEdit|NotebookEdit.
+│   │   │   ├── hooks.json                                        # Hook registration for butler: PreToolUse (gate-shutdown/guard-writes on edits, gate-shutdown/track-dispatch on Task, guard-bash on Bash), PostToolUse (log-dispatch), Stop (gate-stop). gate-shutdown is the A4 graceful-stop gate: on a fleet stop signal (runs/.shutdown | runs/.paused | runs/<pkg>.force-stop) it denies new work and lets the coordinator funnel to a clean park.
+│   │   │   ├── ledger-guard.sh                                   # PreToolUse package-ledger write-integrity guard (b12).
+│   │   │   ├── lib.sh                                            # shared helpers for butler hooks.
+│   │   │   ├── log-dispatch.sh                                   # PostToolUse hook for Task inside coordinator sessions.
+│   │   │   ├── mark-wakeup.sh                                    # PreToolUse hook for Task, Agent and Bash, in a DRIVE-SOLO DRIVER session…
+│   │   │   ├── repeat-guard.sh                                   # PreToolUse mechanical repeat-command guard (b10).
+│   │   │   ├── track-dispatch.sh                                 # PreToolUse hook for Task inside coordinator sessions.
+│   │   │   ├── track-worker-solo.sh                              # PreToolUse hook for Task|Agent, INTERACTIVE drive-solo sessions only.
+│   │   │   ├── untrack-worker-solo.sh                            # PostToolUse hook for Task|Agent, INTERACTIVE drive-solo sessions only.
+│   │   │   └── wait-shape-guard.sh                               # PreToolUse guard for four wait/poll pathologies b10's exact-repeat hash…
+│   │   ├── opencode/                                             # The same agent definitions ported to the OpenCode runner
+│   │   │   ├── bp-architect.md                                   # Package spec designer for blueprint packages.
+│   │   │   ├── bp-implementer.md                                 # Implementation worker for blueprint packages.
+│   │   │   ├── bp-redteam.md                                     # Adversarial security and abuse reviewer for blueprint packages.
+│   │   │   ├── bp-reviewer.md                                    # Code reviewer for blueprint packages.
+│   │   │   ├── bp-scout.md                                       # Terrain-mapping scout for blueprint packages.
+│   │   │   ├── bp-test-writer.md                                 # Test author for blueprint packages.
+│   │   │   ├── bp-ui-prober.md                                   # UI verification worker for blueprint packages.
+│   │   │   └── guard-writes-plugin.js                            # OpenCode hook wrapping guard-writes.sh unchanged
+│   │   ├── scripts/                                              # Implementation scripts
+│   │   │   ├── BpState.pm                                        # pure reader of the two authoritative status stores: package ledger frontmatter…
+│   │   │   ├── bp-answer-decision.pl                             # the MECHANICAL unblock the reporter performs once a human has answered a…
+│   │   │   ├── bp-baseline.pl                                    # green-baseline materialization (b40-green-baseline-isolation).
+│   │   │   ├── bp-blueprint.pl                                   # the deterministic blueprint.md write/read API (b43-blueprint-write-api).
+│   │   │   ├── bp-cache-state.pl                                 # b41-cache-state-tracking: the ONE place that decides whether a package's…
+│   │   │   ├── bp-checkpoint.pl                                  # durable WIP checkpoint commits (b02, Decisions #2/#17).
+│   │   │   ├── bp-checks.pl                                      # derive the checks a package's WRITE SET implies, and fail a blueprint whose…
+│   │   │   ├── bp-containment-audit.pl                           # post-step subprocess write-containment audit (b20).
+│   │   │   ├── bp-continuity.pl                                  # explicit continuity arm/disarm/status for THIS session.
+│   │   │   ├── bp-contract.pl                                    # Anthropic-side + creds CONTRACT validators (Decision #29/#31).
+│   │   │   ├── bp-deps-check.pl                                  # deterministic dependency/version-policy classifier (Decisions #4, #11, #12…
+│   │   │   ├── bp-dispatch-log.pl                                # the per-dispatch budget record for a driver- or coordinator-issued Agent/Task…
+│   │   │   ├── bp-drive-next.pl                                  # the mechanical director for /butler:drive-solo.
+│   │   │   ├── bp-fast-store.sh                                  # pnpm store-dir + virtual-store-dir on container-native storage (blueprint…
+│   │   │   ├── bp-feedback.pl                                    # one-command capture of a single piece of operator feedback…
+│   │   │   ├── bp-govern.pl                                      # the deterministic usage-governance decision functions for the orchestrator (A3).
+│   │   │   ├── bp-hooks-selftest.sh                              # A8 / Decision #31 startup self-assert.
+│   │   │   ├── bp-http.pl                                        # the orchestrator/keeper HTTPS transport, via curl.
+│   │   │   ├── bp-init.sh                                        # ensure the ccpraxis local data root exists and self-gitignores.
+│   │   │   ├── bp-jail.pl                                        # per-dispatch worker jail isolation (b33-worker-jail-isolation).
+│   │   │   ├── bp-judge.pl                                       # the DETERMINISTIC decision core for A5 (the judges).
+│   │   │   ├── bp-judge.sh                                       # fire ONE scoped, throwaway judge for a package and detach it.
+│   │   │   ├── bp-keepawake.pl                                   # the wake-lock, shared by every long-running butler driver.
+│   │   │   ├── bp-launch.sh                                      # launch (or resume) a headless coordinator session for one package.
+│   │   │   ├── bp-ledger.pl                                      # the deterministic ledger API (b13-deterministic-ledger-api).
+│   │   │   ├── bp-lib.sh                                         # butler's copy of the shared base helpers PLUS sandbox-only execution helpers.
+│   │   │   ├── bp-lifecycle.pl                                   # reconcile a blueprint's recorded run-state with what is actually on disk, and…
+│   │   │   ├── bp-log.pl                                         # structured, line-flushed, crash-safe run logger (Decision #30).
+│   │   │   ├── bp-orchestrate.sh                                 # start (or report on) the deterministic, token-free orchestrator…
+│   │   │   ├── bp-orchestrator.pl                                # the deterministic, TOKEN-FREE orchestrator process-management loop for A3.
+│   │   │   ├── bp-pin.pl                                         # version-pin resolver + drift auditor (b46-version-pin-currency).
+│   │   │   ├── bp-preflight.pl                                   # environment-support assertion (Decisions #29/#31).
+│   │   │   ├── bp-progress.pl                                    # b11-progress-heuristic-turns-backstop: a semantic liveness check for a…
+│   │   │   ├── bp-remediate.pl                                   # b07-auto-remediation-engine: the DETERMINISTIC decision core that turns a b05…
+│   │   │   ├── bp-resolve.pl                                     # e03-autonomous-resolution: the deterministic apply-step for…
+│   │   │   ├── bp-resume-sweep.sh                                # find interrupted coordinators and resume them economically.
+│   │   │   ├── bp-runstate.pl                                    # the run-state machine behind the stop gate.
+│   │   │   ├── bp-shape-lint.pl                                  # flag oracle assertions that pin the WHOLE SHAPE of a shared artifact, rather…
+│   │   │   ├── bp-spend-auth.pl                                  # credential UX for the OpenCode Go/Zen spend cookie…
+│   │   │   ├── bp-spend.pl                                       # normalized OpenCode Go + Zen spend reader, plus the composed audit-verdict…
+│   │   │   ├── bp-status.sh                                      # one-line-per-package rollup across blueprints.
+│   │   │   ├── bp-statusline.pl                                  # b37-spend-surfaces C8: the compact spend form for Claude Code's statusline.
+│   │   │   ├── bp-token-keeper.pl                                # the orchestrator's OAuth token-keeper (Decisions #11/#12/#30).
+│   │   │   ├── bp-turn-caps.pl                                   # the canonical turn-cap source, and the drift guard over it.
+│   │   │   ├── bp-usage-gate.pl                                  # ONE host-safe usage-headroom poll for /butler:drive-solo.
+│   │   │   ├── bp-validate-dag.pl                                # deterministic blueprint-DAG validator.
+│   │   │   ├── bp-wait-for-decision.pl                           # the reporter's TOKEN-FREE blocking watcher (A7).
+│   │   │   ├── bp-watch.pl                                       # the general, condition-driven watcher for both interactive surfaces…
+│   │   │   ├── bp-watchdog.pl                                    # the drive-solo run's dead-man's switch.
+│   │   │   ├── bp-worker-models.pl                               # worker model preference resolution + fallback ladder.
+│   │   │   ├── bp-worker.pl                                      # deterministic non-Task dispatcher for butler workers.
+│   │   │   └── bp-write-guard.pl                                 # BpWrite::guarded_write, the a01-write-integrity-reread-under-lock primitive…
+│   │   ├── skills/                                               # Slash-command skills this plugin provides
 │   │   │   ├── continuity/
-│   │   │   │   └── SKILL.md                   # Toggle or check explicit continuity arming for THIS session — a Stop gate tha…
+│   │   │   │   └── SKILL.md                                      # Toggle or check explicit continuity arming for THIS session — a Stop gate that…
 │   │   │   ├── coordinator-protocol/
-│   │   │   │   └── SKILL.md                   # Binding operating protocol for butler coordinators — the headless Claude Code…
+│   │   │   │   └── SKILL.md                                      # Binding operating protocol for butler coordinators — the headless Claude Code…
 │   │   │   ├── dispatch-fleet/
-│   │   │   │   └── SKILL.md                   # Execute a blueprint as a headless multi-coordinator FLEET (sandbox-only) — st…
+│   │   │   │   └── SKILL.md                                      # Execute a blueprint as a headless multi-coordinator FLEET (sandbox-only) —…
 │   │   │   ├── drive-solo/
-│   │   │   │   └── SKILL.md                   # The one interactive execute verb — drive one blueprint, a named set, or ALL a…
+│   │   │   │   └── SKILL.md                                      # The one interactive execute verb — drive one blueprint, a named set, or ALL…
 │   │   │   ├── feedback/
-│   │   │   │   └── SKILL.md                   # Turns a batch of raw operator feedback into verified, sourced, basis-marked fin…
+│   │   │   │   └── SKILL.md                                      # Turns a batch of raw operator feedback into verified, sourced, basis-marked…
 │   │   │   ├── orchestrator-protocol/
-│   │   │   │   └── SKILL.md                   # Operating doctrine for butler execution — the reporter (the interactive Claud…
+│   │   │   │   └── SKILL.md                                      # Operating doctrine for butler execution — the reporter (the interactive Claude…
 │   │   │   ├── reporter/
-│   │   │   │   └── SKILL.md                   # Turn THIS Claude session into the reporter for a blueprint run — sync to curr…
+│   │   │   │   └── SKILL.md                                      # Turn THIS Claude session into the reporter for a blueprint run — sync to…
 │   │   │   └── status/
-│   │   │       └── SKILL.md                   # Show the state of one or all blueprints — package statuses, live coordinator …
-│   │   ├── templates/
-│   │   │   ├── dispatch-prompt.md             # Coordinator bootstrap-prompt template; bp-launch.sh fills the placeholders and feeds it to the detached claude -p coordinator.
-│   │   │   ├── judge-escalation-resolve.md
-│   │   │   ├── judge-harvest.md
-│   │   │   └── judge-resolve.md
-│   │   ├── tests/
-│   │   │   ├── lib/
-│   │   │   │   └── HostCaps.pm
-│   │   │   ├── run-tests.pl                   # Test runner for plugins/butler/tests/t/.
-│   │   │   └── t/
-│   │   │       ├── 00-oracle-hygiene.t
-│   │   │       ├── 01-contract.t
-│   │   │       ├── 02-preflight.t
-│   │   │       ├── 03-govern.t
-│   │   │       ├── 04-log.t
-│   │   │       ├── 05-keeper.t
-│   │   │       ├── 06-orchestrator.t
-│   │   │       ├── 07-http.t
-│   │   │       ├── 08-orchestrator-scenarios.t
-│   │   │       ├── 09-gate.t
-│   │   │       ├── 10-judges.t
-│   │   │       ├── 100-write-guard-audit.t
-│   │   │       ├── 101-guard-writes-specificity.t
-│   │   │       ├── 102-set-test-paths.t
-│   │   │       ├── 103-add-decision-newline-refusal.t
-│   │   │       ├── 104-reporter-skill-note-quoting.t
-│   │   │       ├── 105-orchestrator-held-ledger.t
-│   │   │       ├── 106-guard-git-mutations-quote-mask.t
-│   │   │       ├── 107-locate-table-heading-anchor.t
-│   │   │       ├── 108-match-any-divergence.t
-│   │   │       ├── 109-ledger-budget-irreducible.t
-│   │   │       ├── 11-simulation.t
-│   │   │       ├── 110-ledger-budget-fixbatch.t
-│   │   │       ├── 111-keepawake-shared.t
-│   │   │       ├── 112-subagent-stall-guard.t
-│   │   │       ├── 113-oneshot-judge-waiting-discipline.t
-│   │   │       ├── 114-accept-settles-harvest.t
-│   │   │       ├── 115-escalation-categories.t
-│   │   │       ├── 116-escalation-reader-filters.t
-│   │   │       ├── 117-keepawake-no-process-storm.t
-│   │   │       ├── 118-table-has-no-status.t
-│   │   │       ├── 119-gate-headless-background.t
-│   │   │       ├── 12-wait-for-decision.t
-│   │   │       ├── 120-mark-wakeup-agent-dispatch.t
-│   │   │       ├── 121-guard-judge-checks.t
-│   │   │       ├── 122-h01-settings-registration.t
-│   │   │       ├── 123-h01-prose-qualifiers.t
-│   │   │       ├── 124-remediation-attempt-cap.t
-│   │   │       ├── 125-resolve-verdict-gates.t
-│   │   │       ├── 126-resolve-dispatch-and-guards.t
-│   │   │       ├── 127-harvest-error-vs-fail-text.t
-│   │   │       ├── 128-pseudo-package-acknowledge.t
-│   │   │       ├── 129-decision-validity-terminal-reread.t
-│   │   │       ├── 13-answer-decision.t
-│   │   │       ├── 130-order-json-prune-stale-blueprint.t
-│   │   │       ├── 131-remediation-authoring-validity.t
-│   │   │       ├── 132-token-park-doc-honesty.t
-│   │   │       ├── 133-bp-watch-decision-core.t
-│   │   │       ├── 134-bp-watch-cli.t
-│   │   │       ├── 135-bp-watch-doctrine.t
-│   │   │       ├── 136-bp-dispatch-log.t
-│   │   │       ├── 137-drive-loop-runstate-fold.t
-│   │   │       ├── 138-drive-solo-interrupt-doctrine.t
-│   │   │       ├── 139-coordinator-protocol-dispatch-doctrine.t
-│   │   │       ├── 14-hooks-selftest.t
-│   │   │       ├── 140-hooks-reach-non-ccpraxis-project.t
-│   │   │       ├── 141-hooks-json-route-registration.t
-│   │   │       ├── 142-reporter-registration.t
-│   │   │       ├── 143-reporter-stop-gate.t
-│   │   │       ├── 144-runstate-surface-separation.t
-│   │   │       ├── 145-reporter-gate-regression.t
-│   │   │       ├── 146-validation-interlock-hooks.t
-│   │   │       ├── 147-worker-tmpdir-isolation.t
-│   │   │       ├── 148-registry-runtime-only.t
-│   │   │       ├── 149-continuity-toggle.t
-│   │   │       ├── 15-orchestrate-shutdown-clear.t
-│   │   │       ├── 150-continuity-gate.t
-│   │   │       ├── 151-continuity-statusline-badge.t
-│   │   │       ├── 152-tooling-bug-filing.t
-│   │   │       ├── 153-no-drift-to-repair.t
-│   │   │       ├── 154-orchestrator-broken-env-turns.t
-│   │   │       ├── 155-worker-backend-dispatcher.t
-│   │   │       ├── 156-worker-jail-isolation.t
-│   │   │       ├── 157-opencode-worker-runtime.t
-│   │   │       ├── 158-worker-model-preference.t
-│   │   │       ├── 159-status-read-api.t
-│   │   │       ├── 16-oauth-sandbox-preflight.t
-│   │   │       ├── 160-status-read-api-regressions.t
-│   │   │       ├── 161-lifecycle-derived.t
-│   │   │       ├── 162-status-vocabulary-seventh.t
-│   │   │       ├── 163-no-duplicate-test-numbers.t
-│   │   │       ├── 164-driver-arm-noise-stripping.t
-│   │   │       ├── 165-registry-path-one-rule.t
-│   │   │       ├── 166-statusline-marker-glyph.t
-│   │   │       ├── 167-guard-bash-quote-strip.t
-│   │   │       ├── 168-guard-judge-checks-quote-strip.t
-│   │   │       ├── 169-wait-shape-guard-quote-strip.t
-│   │   │       ├── 17-drive-next.t
-│   │   │       ├── 170-guard-git-mutations-heredoc-strip.t
-│   │   │       ├── 171-spend-global-and-claude.t
-│   │   │       ├── 172-run-continuity-gaps.t
-│   │   │       ├── 173-escalation-resolve-wiring.t
-│   │   │       ├── 174-empty-scope-is-settled.t
-│   │   │       ├── 175-hook-payload-read-bound.t
-│   │   │       ├── 18-usage-governor.t
-│   │   │       ├── 19-drive-integration.t
-│   │   │       ├── 20-deps-check.t
-│   │   │       ├── 21-durable-checkpoint-commits.t
-│   │   │       ├── 22-checkpoint-hardening.t
-│   │   │       ├── 23-keeper-resilience-antispam.t
-│   │   │       ├── 24-conformance-gate.t
-│   │   │       ├── 25-fast-store.t
-│   │   │       ├── 26-auto-remediation-engine.t
-│   │   │       ├── 27-preflight-repo-check.t
-│   │   │       ├── 60-dag-integrity.t
-│   │   │       ├── 61-judge-starvation.t
-│   │   │       ├── 62-repeat-guard.t
-│   │   │       ├── 63-progress-heuristic.t
-│   │   │       ├── 64-ledger-guard.t
-│   │   │       ├── 65-ledger-api.t
-│   │   │       ├── 66-waiting-discipline.t
-│   │   │       ├── 67-wait-shape-guard.t
-│   │   │       ├── 68-exit-reason-classification.t
-│   │   │       ├── 69-answer-decision-completeness.t
-│   │   │       ├── 70-decision-delivery.t
-│   │   │       ├── 71-ledger-timestamps.t
-│   │   │       ├── 72-subprocess-containment.t
-│   │   │       ├── 73-status-recognition.t
-│   │   │       ├── 74-soft-ordering.t
-│   │   │       ├── 75-effort-and-profiles.t
-│   │   │       ├── 76-reporter-autonomy.t
-│   │   │       ├── 77-feedback.t
-│   │   │       ├── 78-timestamp-authorship.t
-│   │   │       ├── 79-contract-idle-window.t
-│   │   │       ├── 80-rate-limit-attempt-isolation.t
-│   │   │       ├── 81-usage-poll-cadence.t
-│   │   │       ├── 82-orphaned-judge-recovery.t
-│   │   │       ├── 83-multi-provider-spend.t
-│   │   │       ├── 84-green-baseline.t
-│   │   │       ├── 85-cache-state.t
-│   │   │       ├── 86-blueprint-write-api.t
-│   │   │       ├── 87-decision-context-split.t
-│   │   │       ├── 88-execution-priority.t
-│   │   │       ├── 89-ledger-context-budget.t
-│   │   │       ├── 90-version-pin-currency.t
-│   │   │       ├── 91-agent-worker-doctrine.t
-│   │   │       ├── 92-write-set-implied-checks.t
-│   │   │       ├── 93-turn-cap-consistency.t
-│   │   │       ├── 94-drive-loop-gate.t
-│   │   │       ├── 95-watchdog.t
-│   │   │       ├── 96-hook-path-walk-and-scope.t
-│   │   │       ├── 97-lifecycle-reconcile.t
-│   │   │       ├── 98-write-guard-primitive.t
-│   │   │       └── 99-write-guard-sites.t
-│   │   └── turn-caps.json
-│   ├── sandbox/                               # Sandbox plugin — bundles the claude-sandbox host launcher, the container blueprint, the bootstrap routine, and the /sandbox:setup redirect skill
-│   │   ├── .claude-plugin/
-│   │   │   └── plugin.json
-│   │   ├── bin/                               # User-invoked CLI lives here; shell-native wrappers are required so users can type `claude-sandbox` from any terminal.
-│   │   │   ├── claude-sandbox.ps1             # Thin shim — locates Perl + execs launcher.pl (Windows/PowerShell)
-│   │   │   └── claude-sandbox.sh              # Thin shim — execs into plugins/sandbox/scripts/launcher.pl (Linux/macOS)
-│   │   ├── ccpraxis-install.pl                # Install hook — wires plugins/sandbox/bin/ into user PATH (delegates to _install-bin-helper.pl)
-│   │   ├── container/                         # Container blueprint — files that get baked into or mounted into the sandbox container
-│   │   │   ├── CLAUDE.md                      # Container-specific instructions (full autonomy)
-│   │   │   ├── Containerfile                  # OCI container image: Debian bookworm + Claude Code CLI + dev tools (runs as root; works with Docker or rootless Podman)
-│   │   │   ├── claude.json                    # Onboarding bypass for containers
-│   │   │   ├── heartbeat.sh                   # the sandbox container's entrypoint keep-alive loop (B6).
-│   │   │   └── settings.json                  # Container-specific settings
-│   │   ├── docs/
-│   │   │   ├── B0-tui-spike-findings.md
-│   │   │   ├── b0-tui-probe.pl                # B0 TUI viability spike (Decision #18/#19, package B0).
-│   │   │   ├── concurrent-config-safety-spike.md
-│   │   │   ├── migration-record.md
-│   │   │   ├── protected-paths.md
-│   │   │   ├── terminal-minimize-investigation.md
-│   │   │   ├── token-schema-inventory.md
-│   │   │   ├── tui-adapter-contract.md
-│   │   │   └── working-on-ccpraxis.md
-│   │   ├── scripts/
-│   │   │   ├── BackpackApproval.pm
-│   │   │   ├── BackpackOps.pm
-│   │   │   ├── BackpackReview.pm
-│   │   │   ├── CcpraxisWorkCopy.pm
-│   │   │   ├── ClaudeConfig.pm
-│   │   │   ├── ConnectorHold.pm
-│   │   │   ├── Dashboard.pm                   # the raw-ANSI TUI dashboard framework for `claude-sandbox` (B2).
-│   │   │   ├── HotReload.pm
-│   │   │   ├── KeepAwake.pm
-│   │   │   ├── LaunchLog.pm
-│   │   │   ├── MountSpec.pm
-│   │   │   ├── PluginSync.pm
-│   │   │   ├── PortAlloc.pm
-│   │   │   ├── ProtectedPaths.pm
-│   │   │   ├── Resources.pm
-│   │   │   ├── RunState.pm
-│   │   │   ├── SandboxLock.pm
-│   │   │   ├── SessionFilter.pm
-│   │   │   ├── SpendPanel.pm
-│   │   │   ├── Theme.pm
-│   │   │   ├── TokenInfo.pm
-│   │   │   ├── bootstrap.pl                   # First-launch setup invoked by launcher.pl when .claude-data is missing. 6 steps: verify container blueprint, build image, mkdir .claude-data, append .gitignore, git auth (HTTPS PAT / SSH deploy-key), invoke ccpraxis-install.pl. Fully interactive over the launcher's tty.
-│   │   │   ├── keep-awake.ps1                 # hold a Windows wake-lock for as long as THIS process lives,
-│   │   │   ├── launcher.pl                    # The actual claude-sandbox launcher: arg parsing, bootstrap detection, lock + dead-PID cleanup, image build, TUI selector orchestration, staleness check, mount assembly, container create-or-reattach. Wrappers in bin/ are tiny shims that exec into this.
-│   │   │   ├── select-session.pl              # TUI session picker for the claude-sandbox launcher.
-│   │   │   ├── skills.pl                      # Discovery/selection backend for the launcher: enumerates custom + plugin skills + plugins + MCP servers, drives the interactive TUI picker, writes selection state and diff reports the launcher consumes.
-│   │   │   └── tui/
-│   │   │       ├── BackpackScreen.pm          # tui::BackpackScreen -- the [b] screen (blueprint unified-tui-design-system,
-│   │   │       ├── DashboardScreen.pm         # tui::DashboardScreen -- the dashboard's content vocabulary (blueprint
-│   │   │       ├── Frame.pm                   # tui::Frame -- row composition, sanitisation and the single SGR emitter for
-│   │   │       ├── LaunchScreens.pm           # tui::LaunchScreens -- the launch-phase screens for claude-sandbox
-│   │   │       ├── Layout.pm                  # tui::Layout -- measurement, wrapping, and arrangement for the shared TUI
-│   │   │       ├── Meter.pm                   # tui::Meter -- meter rows: Decision 4's geometry (label, numbers, bar,
-│   │   │       └── Screen.pm                  # tui::Screen -- pure composition + viewport + diff, with a deliberately
-│   │   ├── skills/
+│   │   │       └── SKILL.md                                      # Show the state of one or all blueprints — package statuses, live coordinator…
+│   │   ├── templates/                                            # Templates instantiated at runtime
+│   │   │   ├── dispatch-prompt.md                                # Coordinator bootstrap-prompt template; bp-launch.sh fills the placeholders and feeds it to the detached claude -p coordinator.
+│   │   │   ├── judge-escalation-resolve.md                       # Prompt: the escalation-resolver that triages one queued escalation
+│   │   │   ├── judge-harvest.md                                  # Prompt: the harvest-judge that re-checks a package the coordinator called done
+│   │   │   └── judge-resolve.md                                  # Prompt: the resolve-judge, one broad-context attempt at a wedged package
+│   │   ├── tests/                                                # Test suite -- run via scripts/run-tests.pl
+│   │   │   ├── lib/                                              # Shared helpers
+│   │   │   │   └── HostCaps.pm                                   # HostCaps -- functional probes for host capabilities the butler oracles assume.
+│   │   │   ├── run-tests.pl                                      # Test runner for plugins/butler/tests/t/.
+│   │   │   └── t/                                                # Test files, one concern each
+│   │   │       ├── 00-oracle-hygiene.t                           # the shared-shape lint, as a TEST.
+│   │   │       ├── 01-contract.t                                 # A8 contract-validators (bp-contract.pl): good shapes pass, drifted shapes are…
+│   │   │       ├── 02-preflight.t                                # A8 preflight (bp-preflight.pl): asserts environment support from the manifest…
+│   │   │       ├── 03-govern.t                                   # A3 governance decision functions (bp-govern.pl): burn-rate cadence (#8)…
+│   │   │       ├── 04-log.t                                      # A3/A8 run logger (bp-log.pl, Decision #30): structured JSON lines, secrets…
+│   │   │       ├── 05-keeper.t                                   # A3 token-keeper (bp-token-keeper.pl, Decisions #11/#12/#30): every…
+│   │   │       ├── 06-orchestrator.t                             # A3 orchestrator process-management (bp-orchestrator.pl): every DETERMINISTIC…
+│   │   │       ├── 07-http.t                                     # BpHttp::parse_response — the curl-output status/body splitter (pure).
+│   │   │       ├── 08-orchestrator-scenarios.t                   # A3 orchestrator LOOP scenarios — drive the real BpOrch::run({once=>1}) through…
+│   │   │       ├── 09-gate.t                                     # A4 graceful-stop gate — the allow-park/deny-work matrix (bp_gate_verdict), the…
+│   │   │       ├── 10-judges.t                                   # A5 judges: the pure decision core (BpJudge::) exhaustively, then the…
+│   │   │       ├── 100-write-guard-audit.t                       # the two report artifacts a01-write-integrity- reread-under-lock must leave on…
+│   │   │       ├── 101-guard-writes-specificity.t                # a02-api-and-guard-defects, DEFECT 1.
+│   │   │       ├── 102-set-test-paths.t                          # a02-api-and-guard-defects, DEFECT 2.
+│   │   │       ├── 103-add-decision-newline-refusal.t            # a02-api-and-guard-defects, DEFECT 3.
+│   │   │       ├── 104-reporter-skill-note-quoting.t             # a02-api-and-guard-defects, DEFECT 4.
+│   │   │       ├── 105-orchestrator-held-ledger.t                # a02-api-and-guard-defects, DEFECT 5.
+│   │   │       ├── 106-guard-git-mutations-quote-mask.t          # a02-api-and-guard-defects, DEFECT 6.
+│   │   │       ├── 107-locate-table-heading-anchor.t             # a02-api-and-guard-defects, DEFECT 7.
+│   │   │       ├── 108-match-any-divergence.t                    # a02-api-and-guard-defects, drift guard.
+│   │   │       ├── 109-ledger-budget-irreducible.t               # a03-ledger-budget-irreducible oracle.
+│   │   │       ├── 11-simulation.t                               # A6 simulation harness: drive the REAL BpOrch::run (NOT --once) across MANY…
+│   │   │       ├── 110-ledger-budget-fixbatch.t                  # regression tests for the a03-ledger-budget-irreducible step-6 fix-batch…
+│   │   │       ├── 111-keepawake-shared.t                        # the wake-lock is ONE definition, and the FLEET holds it too.
+│   │   │       ├── 112-subagent-stall-guard.t                    # the stop gate is a STATE MACHINE.
+│   │   │       ├── 113-oneshot-judge-waiting-discipline.t        # a one-shot judge must never be told to background its work.
+│   │   │       ├── 114-accept-settles-harvest.t                  # accepting a harvest failure must be DURABLE.
+│   │   │       ├── 115-escalation-categories.t                   # e02-escalation-classification-layer oracle, part 1: the three emitters…
+│   │   │       ├── 116-escalation-reader-filters.t               # e02-escalation-classification-layer oracle, part 2: the reader side…
+│   │   │       ├── 117-keepawake-no-process-storm.t              # Regression oracle for the 2026-08-13 process storm.
+│   │   │       ├── 118-table-has-no-status.t                     # s03-drop-table-status-column oracle.
+│   │   │       ├── 119-gate-headless-background.t                # oracle for gate-headless-background.sh (h01-headless-background-gate spec…
+│   │   │       ├── 12-wait-for-decision.t                        # A7 watcher: bp-wait-for-decision.pl — the reporter's token-free blocking…
+│   │   │       ├── 120-mark-wakeup-agent-dispatch.t              # oracle for done criterion 4, the HIGHEST-VALUE test in this package…
+│   │   │       ├── 121-guard-judge-checks.t                      # oracle for guard-judge-checks.sh (h01 spec §2.2, done criterion 6, AC6).
+│   │   │       ├── 122-h01-settings-registration.t               # oracle for the REVISED registration decision (g02 spec §2.1-§2.3, INVERTING…
+│   │   │       ├── 123-h01-prose-qualifiers.t                    # oracle for done criterion 5 (h01 spec §2.6/§2.7, AC5): the prose is fixed too…
+│   │   │       ├── 124-remediation-attempt-cap.t                 # oracle for r01-remediation-attempt-cap.
+│   │   │       ├── 125-resolve-verdict-gates.t                   # e03-autonomous-resolution oracle, part 1: BpResolve's PURE gates…
+│   │   │       ├── 126-resolve-dispatch-and-guards.t             # e03-autonomous-resolution oracle, part 2: the orchestrator-side wiring -- the…
+│   │   │       ├── 127-harvest-error-vs-fail-text.t              # e04-honest-terminal-reporting, AC1 (-> DC1): a crashed harvest judge (verdict…
+│   │   │       ├── 128-pseudo-package-acknowledge.t              # e04-honest-terminal-reporting, AC2 (-> DC2)…
+│   │   │       ├── 129-decision-validity-terminal-reread.t       # e04-honest-terminal-reporting, AC3 (-> DC3): a decision must never be queued…
+│   │   │       ├── 13-answer-decision.t                          # A7 unblock: bp-answer-decision.pl — the mechanical, atomic unblock the…
+│   │   │       ├── 130-order-json-prune-stale-blueprint.t        # e04-honest-terminal-reporting, AC4 (-> DC4): an order.json entry naming a…
+│   │   │       ├── 131-remediation-authoring-validity.t          # r02-remediation-authoring-validity
+│   │   │       ├── 132-token-park-doc-honesty.t                  # e04-honest-terminal-reporting, AC5 (-> DC5): three documentation surfaces…
+│   │   │       ├── 133-bp-watch-decision-core.t                  # IMMUTABLE ORACLE for w01-bp-watch's pure decision core (package BpWatch in…
+│   │   │       ├── 134-bp-watch-cli.t                            # IMMUTABLE ORACLE for w01-bp-watch's CLI surface…
+│   │   │       ├── 135-bp-watch-doctrine.t                       # IMMUTABLE ORACLE for w01-bp-watch's doctrine surface: criterion 10 (registers…
+│   │   │       ├── 136-bp-dispatch-log.t                         # IMMUTABLE ORACLE for w02-dispatch-budget-and- interrupt's per-dispatch budget…
+│   │   │       ├── 137-drive-loop-runstate-fold.t                # the w02 FOLD: gate-drive-loop.sh consults bp-runstate.pl's effective 'paused'…
+│   │   │       ├── 138-drive-solo-interrupt-doctrine.t           # IMMUTABLE ORACLE for w02's SKILL.md doctrine changes to…
+│   │   │       ├── 139-coordinator-protocol-dispatch-doctrine.t  # IMMUTABLE ORACLE for w02's §2.5 edit to plugins/butler/skills/coordinator-proto…
+│   │   │       ├── 14-hooks-selftest.t                           # A8 hooks self-test (bp-hooks-selftest.sh) — the DETERMINISTIC parts…
+│   │   │       ├── 140-hooks-reach-non-ccpraxis-project.t        # the oracle package g02 exists to force into being (done criteria 2 and 5; spec…
+│   │   │       ├── 141-hooks-json-route-registration.t           # oracle for the REGISTRATION-ROUTE half of g02's fix (spec §2.1/§2.2/§2.3/§2.4…
+│   │   │       ├── 142-reporter-registration.t                   # g03-reporter-stop-gate, PILLAR 1: registration, and its disjointness from the…
+│   │   │       ├── 143-reporter-stop-gate.t                      # g03-reporter-stop-gate, PILLARS 2 and 4: the gate FIRES for a registered…
+│   │   │       ├── 144-runstate-surface-separation.t             # g03-reporter-stop-gate, PILLAR 3: the --surface separation on bp-runstate.pl…
+│   │   │       ├── 145-reporter-gate-regression.t                # g03-reporter-stop-gate, DC5/DC8: the reporter branch must not weaken the…
+│   │   │       ├── 146-validation-interlock-hooks.t              # oracle for w03-validation-interlock, derived ONLY from…
+│   │   │       ├── 147-worker-tmpdir-isolation.t                 # oracle for w03-validation-interlock, derived ONLY from…
+│   │   │       ├── 148-registry-runtime-only.t                   # s02-registry-runtime-only: runs/registry.json becomes strictly runtime-only.
+│   │   │       ├── 149-continuity-toggle.t                       # g01-explicit-continuity-arming, THE TOGGLE SURFACE: `bp-continuity.pl…
+│   │   │       ├── 15-orchestrate-shutdown-clear.t               # bp_clear_stale_shutdown (bp-lib.sh / #28): an explicit dispatch clears a stale…
+│   │   │       ├── 150-continuity-gate.t                         # g01-explicit-continuity-arming, THE STOP GATE: gate-continuity.sh plus its…
+│   │   │       ├── 151-continuity-statusline-badge.t             # g01-explicit-continuity-arming, THE STATUSLINE BADGE: scripts/statusline.pl…
+│   │   │       ├── 152-tooling-bug-filing.t                      # g04-tooling-bugs-get-filed
+│   │   │       ├── 153-no-drift-to-repair.t                      # s05-retire-reconciler-drift-paths: the copies ARE unrepresentable, which is…
+│   │   │       ├── 154-orchestrator-broken-env-turns.t           # b01-orchestrator-broken-env-turns — the immutable test oracle.
+│   │   │       ├── 155-worker-backend-dispatcher.t               # b32-worker-backend-dispatcher oracle.
+│   │   │       ├── 156-worker-jail-isolation.t                   # b33-worker-jail-isolation oracle.
+│   │   │       ├── 157-opencode-worker-runtime.t                 # b34-opencode-worker-runtime oracle.
+│   │   │       ├── 158-worker-model-preference.t                 # b35-worker-model-preference oracle.
+│   │   │       ├── 159-status-read-api.t                         # immutable oracle for BpState.pm, the s01-status-read-api package (spec…
+│   │   │       ├── 16-oauth-sandbox-preflight.t                  # oracle tests for the oauth_usable($d,$now_ms) pure predicate and the…
+│   │   │       ├── 160-status-read-api-regressions.t             # regression coverage for BpState.pm added in the s01-status-read-api fix-batch…
+│   │   │       ├── 161-lifecycle-derived.t                       # s04-lifecycle-derived: "finished but marked running" becomes unwritable.
+│   │   │       ├── 162-status-vocabulary-seventh.t               # Regression oracle for the SEVENTH package status, `dropped`.
+│   │   │       ├── 163-no-duplicate-test-numbers.t               # d01-test-numbering-collisions: this package's own acceptance oracle.
+│   │   │       ├── 164-driver-arm-noise-stripping.t              # d03-one-shell-noise-stripper.
+│   │   │       ├── 165-registry-path-one-rule.t                  # d04-registry-path-one-rule: the DRIVE-SOLO and REPORTER registries stop…
+│   │   │       ├── 166-statusline-marker-glyph.t                 # blueprint tui-operator-feedback, package t06-statusline-marker…
+│   │   │       ├── 167-guard-bash-quote-strip.t                  # oracle for t09-guard-hooks-stripping's guard-bash.sh changes (spec…
+│   │   │       ├── 168-guard-judge-checks-quote-strip.t          # oracle for t09-guard-hooks-stripping's guard-judge-checks.sh changes (spec…
+│   │   │       ├── 169-wait-shape-guard-quote-strip.t            # oracle for t09-guard-hooks-stripping's wait-shape-guard.sh changes (spec…
+│   │   │       ├── 17-drive-next.t                               # immutable oracle for bp-drive-next.pl (01-director-core).
+│   │   │       ├── 170-guard-git-mutations-heredoc-strip.t       # oracle for t09-guard-hooks-stripping's guard-git-mutations.sh changes (spec…
+│   │   │       ├── 171-spend-global-and-claude.t                 # t02-spend-persistence — the butler-side oracle for blueprint…
+│   │   │       ├── 172-run-continuity-gaps.t                     # t10-run-continuity-gaps -- the oracle for blueprint tui-operator-feedback.
+│   │   │       ├── 173-escalation-resolve-wiring.t               # the escalation-resolve judge path is actually wired.
+│   │   │       ├── 174-empty-scope-is-settled.t                  # Two writer/reader defects that together let the director ask an UNANSWERABLE…
+│   │   │       ├── 175-hook-payload-read-bound.t                 # the hook payload read is BOUNDED.
+│   │   │       ├── 18-usage-governor.t                           # immutable oracle for bp-usage-gate.pl (02-usage-governor).
+│   │   │       ├── 19-drive-integration.t                        # skill↔director contract test (04-wireup-cleanup, Decision #12).
+│   │   │       ├── 20-deps-check.t                               # BpDepsCheck::run classifies dependency/runtime-version governance violations…
+│   │   │       ├── 21-durable-checkpoint-commits.t               # b02-durable-checkpoint-commits — the immutable test oracle.
+│   │   │       ├── 22-checkpoint-hardening.t                     # b02-durable-checkpoint-commits — hardening regressions (fix-batch 02).
+│   │   │       ├── 23-keeper-resilience-antispam.t               # b03-keeper-resilience-antispam — the immutable test oracle.
+│   │   │       ├── 24-conformance-gate.t                         # b05-conformance-gate
+│   │   │       ├── 25-fast-store.t                               # b06-sandbox-fast-test-io — the immutable test oracle.
+│   │   │       ├── 26-auto-remediation-engine.t                  # b07-auto-remediation-engine
+│   │   │       ├── 27-preflight-repo-check.t                     # p02-preflight-repo-check — tests for the NEW `repo.usable` preflight check.
+│   │   │       ├── 60-dag-integrity.t                            # --- load the unit under test (guarded: it does not exist yet) ---
+│   │   │       ├── 61-judge-starvation.t                         # b09-judge-starvation-and-verdict-archive: harvest turn-budget scaling…
+│   │   │       ├── 62-repeat-guard.t                             # b10-repeat-command-guard oracle.
+│   │   │       ├── 63-progress-heuristic.t                       # immutable oracle for b11-progress-heuristic-turns-backstop.
+│   │   │       ├── 64-ledger-guard.t                             # b12-ledger-write-integrity oracle.
+│   │   │       ├── 65-ledger-api.t                               # b13-deterministic-ledger-api oracle.
+│   │   │       ├── 66-waiting-discipline.t                       # b14-waiting-discipline oracle.
+│   │   │       ├── 67-wait-shape-guard.t                         # b15-wait-shape-and-pipe-guards oracle.
+│   │   │       ├── 68-exit-reason-classification.t               # immutable oracle for b16-exit-reason-and-cold-escalation.
+│   │   │       ├── 69-answer-decision-completeness.t             # b17-answer-decision-completeness oracle.
+│   │   │       ├── 70-decision-delivery.t                        # b18-decision-delivery-and-park-loop oracle.
+│   │   │       ├── 71-ledger-timestamps.t                        # b19-ledger-timestamp-integrity oracle.
+│   │   │       ├── 72-subprocess-containment.t                   # b20-subprocess-write-containment oracle.
+│   │   │       ├── 73-status-recognition.t                       # b21-status-blueprint-recognition oracle.
+│   │   │       ├── 74-soft-ordering.t                            # immutable oracle for b22-soft-ordering-constraint.
+│   │   │       ├── 75-effort-and-profiles.t                      # immutable oracle for b23-effort-quality-and-turn-sizing.
+│   │   │       ├── 76-reporter-autonomy.t                        # oracle for b24-reporter-autonomy, derived ONLY from…
+│   │   │       ├── 77-feedback.t                                 # see coordinator-corrections.md's own account of the em-dash byte/char bug.
+│   │   │       ├── 78-timestamp-authorship.t                     # b27-ledger-timestamp-authorship — the Stop gate stamps last_updated: from…
+│   │   │       ├── 79-contract-idle-window.t                     # b28-contract-idle-window — an idle usage window (utilization 0) legitimately…
+│   │   │       ├── 80-rate-limit-attempt-isolation.t             # immutable oracle for b29-rate-limit-attempt-isolation.
+│   │   │       ├── 81-usage-poll-cadence.t                       # immutable oracle for b30-usage-poll-cadence-floor.
+│   │   │       ├── 82-orphaned-judge-recovery.t                  # immutable oracle for b31-orphaned-judge-marker-recovery.
+│   │   │       ├── 83-multi-provider-spend.t                     # b36-multi-provider-spend-governance oracle.
+│   │   │       ├── 84-green-baseline.t                           # b40-green-baseline-isolation oracle.
+│   │   │       ├── 85-cache-state.t                              # b41-cache-state-tracking oracle.
+│   │   │       ├── 86-blueprint-write-api.t                      # b43-blueprint-write-api oracle.
+│   │   │       ├── 87-decision-context-split.t                   # b42-decision-context-split oracle.
+│   │   │       ├── 88-execution-priority.t                       # immutable oracle for b44-execution-priority.
+│   │   │       ├── 89-ledger-context-budget.t                    # b45-ledger-context-budget oracle.
+│   │   │       ├── 90-version-pin-currency.t                     # b46-version-pin-currency oracle.
+│   │   │       ├── 91-agent-worker-doctrine.t                    # b49-agent-worker-turn-doctrine oracle.
+│   │   │       ├── 92-write-set-implied-checks.t                 # b50-write-set-implied-checks oracle.
+│   │   │       ├── 93-turn-cap-consistency.t                     # b51-turn-cap-single-source oracle.
+│   │   │       ├── 94-drive-loop-gate.t                          # the drive-solo driver's stop discipline.
+│   │   │       ├── 95-watchdog.t                                 # the drive-solo run's dead-man's switch.
+│   │   │       ├── 96-hook-path-walk-and-scope.t                 # Hook path-walk termination, and drive-solo session scoping.
+│   │   │       ├── 97-lifecycle-reconcile.t                      # bp-lifecycle.pl, the derived-state reconciler.
+│   │   │       ├── 98-write-guard-primitive.t                    # immutable oracle for BpWrite::guarded_write, the…
+│   │   │       └── 99-write-guard-sites.t                        # the four converted sites of a01-write-integrity- reread-under-lock (spec §3…
+│   │   └── turn-caps.json                                        # CANONICAL turn caps.
+│   ├── sandbox/                                                  # Sandbox plugin — bundles the claude-sandbox host launcher, the container blueprint, the bootstrap routine, and the /sandbox:setup redirect skill
+│   │   ├── .claude-plugin/                                       # Plugin manifest directory
+│   │   │   └── plugin.json                                       # Plugin manifest -- name, description, version
+│   │   ├── bin/                                                  # User-invoked CLI lives here; shell-native wrappers are required so users can type `claude-sandbox` from any terminal.
+│   │   │   ├── claude-sandbox.ps1                                # Thin shim — locates Perl + execs launcher.pl (Windows/PowerShell)
+│   │   │   └── claude-sandbox.sh                                 # Thin shim — execs into plugins/sandbox/scripts/launcher.pl (Linux/macOS)
+│   │   ├── ccpraxis-install.pl                                   # Install hook — wires plugins/sandbox/bin/ into user PATH (delegates to _install-bin-helper.pl)
+│   │   ├── container/                                            # Container blueprint — files that get baked into or mounted into the sandbox container
+│   │   │   ├── CLAUDE.md                                         # Container-specific instructions (full autonomy)
+│   │   │   ├── Containerfile                                     # OCI container image: Debian bookworm + Claude Code CLI + dev tools (runs as root; works with Docker or rootless Podman)
+│   │   │   ├── claude.json                                       # Onboarding bypass for containers
+│   │   │   ├── heartbeat.sh                                      # the sandbox container's entrypoint keep-alive loop (B6).
+│   │   │   └── settings.json                                     # Container-specific settings
+│   │   ├── docs/                                                 # Design records, spikes, and investigations behind the sandbox
+│   │   │   ├── B0-tui-spike-findings.md                          # TUI viability spike — what a terminal UI could support here
+│   │   │   ├── b0-tui-probe.pl                                   # B0 TUI viability spike (Decision #18/#19, package B0).
+│   │   │   ├── concurrent-config-safety-spike.md                 # Decision doc: keeping config writes safe under concurrent sessions
+│   │   │   ├── migration-record.md                               # Record of the work-copy to standalone-clone migration
+│   │   │   ├── protected-paths.md                                # The protected-path guard: what a container may never write
+│   │   │   ├── terminal-minimize-investigation.md                # Investigation into terminal minimize behaviour
+│   │   │   ├── token-schema-inventory.md                         # Inventory of the token-credential schemas the sandbox reads
+│   │   │   ├── tui-adapter-contract.md                           # Contract between the TUI and the state it renders
+│   │   │   └── working-on-ccpraxis.md                            # How to develop ccpraxis itself: clone vs live install, promotion
+│   │   ├── scripts/                                              # Implementation scripts
+│   │   │   ├── BackpackApproval.pm                               # Per-item, machine-local approval memory for backpack items — the launcher's…
+│   │   │   ├── BackpackOps.pm                                    # BackpackOps -- the impure half of the [b] backpack screen's three persistence…
+│   │   │   ├── BackpackReview.pm                                 # Interactive per-item backpack approval walk (#21) — I/O-seam-injected so the…
+│   │   │   ├── CcpraxisWorkCopy.pm                               # Detection + routing for the ccpraxis sandboxed work-copy flow (p01).
+│   │   │   ├── ClaudeConfig.pm                                   # Self-healing for claude-home/.claude.json — the per-sandbox claude config.
+│   │   │   ├── ConnectorHold.pm                                  # Fix 3 — a connector window must not vanish silently when the sandbox dies.
+│   │   │   ├── Dashboard.pm                                      # the raw-ANSI TUI dashboard framework for `claude-sandbox` (B2).
+│   │   │   ├── HotReload.pm                                      # decide WHICH modules may be hot-reloaded and WHICH have changed.
+│   │   │   ├── KeepAwake.pm                                      # B5 — keep-awake held by the dashboard, gated by the orchestrator's busy-lease…
+│   │   │   ├── LaunchLog.pm                                      # LaunchLog — the sandbox launcher's durable, per-launch diagnostic log (B1).
+│   │   │   ├── MountSpec.pm                                      # Mount-spec helpers shared by launcher.pl and the test suite.
+│   │   │   ├── PluginSync.pm                                     # Fix 2 tier-2 plugin store (copy model) — the pure file-reconcile core, split…
+│   │   │   ├── PortAlloc.pm                                      # PortAlloc — pure port-block allocation logic (no podman, no filesystem).
+│   │   │   ├── ProtectedPaths.pm                                 # Pure, filesystem-free path-containment and protected-root logic for the…
+│   │   │   ├── Resources.pm                                      # Pure parsers + assembler for the s09 Resources panel (podman machine, this…
+│   │   │   ├── RunState.pm                                       # pure orchestrator/run-state summarizer for the dashboard.
+│   │   │   ├── SandboxLock.pm                                    # 04-build-race-lock — generalised mkdir-based lock, parameterised by directory.
+│   │   │   ├── SessionFilter.pm                                  # pure classifier for butler-spawned sessions.
+│   │   │   ├── SpendPanel.pm                                     # Turns b36's (BpSpend) per-provider spend structs -- plus a third, Claude…
+│   │   │   ├── Theme.pm                                          # the single source of colour and glyph truth for every ccpraxis terminal…
+│   │   │   ├── TokenInfo.pm                                      # Turns a parsed credentials document + the file's mtime + "now" into a…
+│   │   │   ├── bootstrap.pl                                      # First-launch setup invoked by launcher.pl when .claude-data is missing. 6 steps: verify container blueprint, build image, mkdir .claude-data, append .gitignore, git auth (HTTPS PAT / SSH deploy-key), invoke ccpraxis-install.pl. Fully interactive over the launcher's tty.
+│   │   │   ├── keep-awake.ps1                                    # hold a Windows wake-lock for as long as THIS process lives, and NO LONGER than…
+│   │   │   ├── launcher.pl                                       # The actual claude-sandbox launcher: arg parsing, bootstrap detection, lock + dead-PID cleanup, image build, TUI selector orchestration, staleness check, mount assembly, container create-or-reattach. Wrappers in bin/ are tiny shims that exec into this.
+│   │   │   ├── select-session.pl                                 # TUI session picker for the claude-sandbox launcher.
+│   │   │   ├── skills.pl                                         # Discovery/selection backend for the launcher: enumerates custom + plugin skills + plugins + MCP servers, drives the interactive TUI picker, writes selection state and diff reports the launcher consumes.
+│   │   │   └── tui/                                              # TUI toolkit — layout, framing, meters, screens
+│   │   │       ├── BackpackScreen.pm                             # tui::BackpackScreen -- the [b] screen (blueprint unified-tui-design-system…
+│   │   │       ├── DashboardScreen.pm                            # tui::DashboardScreen -- the dashboard's content vocabulary (blueprint…
+│   │   │       ├── Frame.pm                                      # tui::Frame -- row composition, sanitisation and the single SGR emitter for the…
+│   │   │       ├── LaunchScreens.pm                              # tui::LaunchScreens -- the launch-phase screens for claude-sandbox (blueprint…
+│   │   │       ├── Layout.pm                                     # tui::Layout -- measurement, wrapping, and arrangement for the shared TUI…
+│   │   │       ├── Meter.pm                                      # tui::Meter -- meter rows: Decision 4's geometry (label, numbers, bar, percent)…
+│   │   │       └── Screen.pm                                     # tui::Screen -- pure composition + viewport + diff, with a deliberately CLOSED…
+│   │   ├── skills/                                               # Slash-command skills this plugin provides
 │   │   │   ├── setup/
-│   │   │   │   └── SKILL.md                   # /sandbox:setup — confirms .claude-data state and tells the user to exit Claude and run `claude-sandbox`
+│   │   │   │   └── SKILL.md                                      # /sandbox:setup — confirms .claude-data state and tells the user to exit Claude and run `claude-sandbox`
 │   │   │   └── test/
-│   │   │       └── SKILL.md                   # Run the sandbox plugin's verification suite — proves the bind-mount honors O_…
-│   │   └── tests/
-│   │       ├── lib/
-│   │       │   └── TestSandbox.pm
-│   │       ├── manual/
-│   │       │   └── longrun-freeze-check.sh    # Long-running empirical test: spins up a container with the current bind-mount architecture, drives claude with periodic keystrokes via socat for 8 minutes, and confirms it stayed alive throughout. Destructive — needs a real container runtime. See file header for usage.
-│   │       ├── run-tests.pl                   # Test runner for plugins/sandbox/tests/t/.
-│   │       └── t/
-│   │           ├── 01-bind-honors-append-and-utimensat.t
-│   │           ├── 02-launcher-bind-mount-shape.t
-│   │           ├── 03-claude-json-file-bind.t
-│   │           ├── 04-runtime-detection.t
-│   │           ├── 06-launcher-ro-protection.t
-│   │           ├── 07-mountspec-volume-vs-bind.t
-│   │           ├── 08-launcher-loads-from-any-cwd.t
-│   │           ├── 09-no-stdin-after-podman-start.t
-│   │           ├── 10-select-session-empty-dir.t
-│   │           ├── 100-status-live.t
-│   │           ├── 101-claude-json-relocation-migration.t
-│   │           ├── 102-tui-output-hygiene.t
-│   │           ├── 103-transcript-retention.t
-│   │           ├── 104-animation-cadence.t
-│   │           ├── 105-banner-placement.t
-│   │           ├── 106-panel-grid-borders.t
-│   │           ├── 107-container-sampler.t
-│   │           ├── 108-reap-orphans.t
-│   │           ├── 11-select-session-parses.t
-│   │           ├── 12-keepalive-heartbeat.t
-│   │           ├── 13-install-pass-heartbeat.t
-│   │           ├── 18-multi-session-shared-state.t
-│   │           ├── 21-select-session-multiple.t
-│   │           ├── 22-mountspec-edge-cases.t
-│   │           ├── 23-reap-decision.t
-│   │           ├── 24-launch-log.t
-│   │           ├── 25-dashboard.t
-│   │           ├── 26-backpack-approval.t
-│   │           ├── 27-backpack-review.t
-│   │           ├── 28-keepawake.t
-│   │           ├── 29-select-session-viewport.t
-│   │           ├── 30-connector-hold.t
-│   │           ├── 31-plugin-merge.t
-│   │           ├── 32-plugin-sync.t
-│   │           ├── 33-credentials-degrade.t
-│   │           ├── 34-claude-json-seed.t
-│   │           ├── 35-port-alloc.t
-│   │           ├── 36-launcher-port-publish.t
-│   │           ├── 37-launch-stage-coverage.t
-│   │           ├── 38-global-lock.t
-│   │           ├── 39-ccpraxis-workcopy-detect.t
-│   │           ├── 40-layout-responsive.t
-│   │           ├── 41-panel-semantics.t
-│   │           ├── 42-refuse-in-place.t
-│   │           ├── 43-token-panel.t
-│   │           ├── 44-resources.t
-│   │           ├── 45-run-state.t
-│   │           ├── 46-lifecycle-stop.t
-│   │           ├── 47-lifecycle-relaunch.t
-│   │           ├── 48-activity-history.t
-│   │           ├── 49-session-filter.t
-│   │           ├── 50-input-latency.t
-│   │           ├── 51-protected-paths.t
-│   │           ├── 52-detector-hardening.t
-│   │           ├── 53-refuse-protected-paths.t
-│   │           ├── 54-spend-panel.t
-│   │           ├── 55-minimize-evidence.t
-│   │           ├── 56-launcher-d5-hardening.t
-│   │           ├── 57-node-pnpm-toolchain.t
-│   │           ├── 58-container-health-detect.t
-│   │           ├── 59-fleet-event-source.t
-│   │           ├── 60-keepawake-probe.t
-│   │           ├── 61-settings-scope-split.t
-│   │           ├── 62-tui-adapter-contract.t
-│   │           ├── 63-run-panel-truth.t
-│   │           ├── 64-theme-tokens.t
-│   │           ├── 65-tui-render-library.t
-│   │           ├── 66-dashboard-screen.t
-│   │           ├── 67-backpack-screen.t
-│   │           ├── 68-launcher-screens.t
-│   │           ├── 69-statusline-rebuild.t
-│   │           ├── 70-launch-prompt-conversion.t
-│   │           ├── 71-test-harness-orphan-reaping.t
-│   │           ├── 72-log-retention.t
-│   │           ├── 73-layout-flex-stability.t
-│   │           ├── 74-transcript-pointer.t
-│   │           ├── 75-wrap-on-overflow.t
-│   │           ├── 76-cold-start-machine-recovery.t
-│   │           ├── 77-wrap-width-regressions.t
-│   │           ├── 78-resources-spawn-budget.t
-│   │           ├── 79-providers-panel.t
-│   │           ├── 80-ssh-host-keys.t
-│   │           ├── 81-skills-manifest-mounts.t
-│   │           ├── 82-skills-prune-orphaned-dirs.t
-│   │           ├── 83-skills-reconcile-manifest.t
-│   │           ├── 84-plugin-unknown-version-dest-rel.t
-│   │           ├── 85-skills-legacy-specimen-removal.t
-│   │           ├── 86-skills-legacy-removal-fixbatch.t
-│   │           ├── 87-banner-dismiss.t
-│   │           ├── 88-banner-wrap-every-surface.t
-│   │           ├── 89-tui-render-debt.t
-│   │           ├── 90-resources-sampler-visibility.t
-│   │           ├── 91-spend-snapshot-adapter.t
-│   │           ├── 92-activity-side-column.t
-│   │           ├── 93-blueprints-table.t
-│   │           ├── 94-no-rendered-colons.t
-│   │           ├── 95-needs-you-lifecycle.t
-│   │           ├── 96-hot-reload.t
-│   │           ├── 97-escalation-ownership.t
-│   │           ├── 98-render-spans.t
-│   │           └── 99-shared-claude-json-concurrency.t
-│   ├── steward/                               # Meta-plugin that maintains ccpraxis and owns its backup, onboarding, and self-e…
-│   │   ├── .claude-plugin/
-│   │   │   └── plugin.json
-│   │   ├── scripts/
-│   │   │   ├── ccpraxis-helpers.pl            # Deterministic subcommands for /backup (sync-skills, etc.) — replaces several LLM-driven prose steps with scripted ones; emits JSON the skill consumes
-│   │   │   ├── check-plugins.pl               # Detects missing or stale plugins vs settings.json
-│   │   │   ├── claude-binary-backup.pl        # Snapshot / list / restore / prune / verify / detect for the Claude Code binary — gives /steward:update a deterministic safety net before any installer runs
-│   │   │   ├── filter-diff.pl                 # Filters json-diff output through saved preferences
-│   │   │   ├── json-diff.pl                   # Semantic JSON diff (--deep-exclude, structured report)
-│   │   │   ├── onboard.pl                     # deterministically prepare a project to use the ccpraxis blueprint
-│   │   │   ├── save-preference.pl             # Records "remember this divergence" decisions
-│   │   │   ├── sensitive-check.pl             # Scans the public ccpraxis repo for secrets before committing
-│   │   │   ├── sync-export.pl                 # Detects drift between live config and this repo
-│   │   │   ├── usage-audit-rates.json         # Provider rate card (Anthropic / Z.ai / DeepSeek / Kimi) for usage-audit.pl
-│   │   │   ├── usage-audit.pl                 # Token-usage + provider-cost engine for /steward:usage-audit
-│   │   │   └── vault-sync.pl                  # Central engine for claude-code-vault project backups.
-│   │   ├── skills/
+│   │   │       └── SKILL.md                                      # Run the sandbox plugin's verification suite — proves the bind-mount honors…
+│   │   └── tests/                                                # Test suite -- run via scripts/run-tests.pl
+│   │       ├── lib/                                              # Shared helpers
+│   │       │   └── TestSandbox.pm                                # Common helpers for plugins/sandbox/tests/.
+│   │       ├── manual/                                           # Manual verification scripts, not run by the suite
+│   │       │   └── longrun-freeze-check.sh                       # Long-running empirical test: spins up a container with the current bind-mount architecture, drives claude with periodic keystrokes via socat for 8 minutes, and confirms it stayed alive throughout. Destructive — needs a real container runtime. See file header for usage.
+│   │       ├── run-tests.pl                                      # Test runner for plugins/sandbox/tests/t/.
+│   │       └── t/                                                # Test files, one concern each
+│   │           ├── 01-bind-honors-append-and-utimensat.t         # Pins the assumption that the current container backend's host bind mount…
+│   │           ├── 02-launcher-bind-mount-shape.t                # Pins the launcher's post-refactor mount layout: /root/.claude is a host bind…
+│   │           ├── 03-claude-json-file-bind.t                    # Dir-bind + CLAUDE_CONFIG_DIR shape (s02-config-safety-implement spec B38-B41…
+│   │           ├── 04-runtime-detection.t                        # All three perl entry points (launcher.pl, bootstrap.pl, TestSandbox.pm) ship…
+│   │           ├── 06-launcher-ro-protection.t                   # The .launcher directory contains launcher-managed metadata that the container…
+│   │           ├── 07-mountspec-volume-vs-bind.t                 # Holds MountSpec::v_to_mount accountable for the bind/volume distinction.
+│   │           ├── 08-launcher-loads-from-any-cwd.t              # Regression: launcher.pl must resolve its own scripts/ dir to find MountSpec.pm…
+│   │           ├── 09-no-stdin-after-podman-start.t              # Regression: any interactive prompt (STDIN read) in launcher.pl must happen…
+│   │           ├── 10-select-session-empty-dir.t                 # Empty sessions dir should produce NEW without showing the picker.
+│   │           ├── 100-status-live.t                             # s07-live-status: spinner + status colour + OS window title.
+│   │           ├── 101-claude-json-relocation-migration.t        # Decision #10 / Ruling B (2026-07-28) — the .claude.json relocation migration.
+│   │           ├── 102-tui-output-hygiene.t                      # s17-statusline-and-output-hygiene: sandbox indicator, output hygiene while the…
+│   │           ├── 103-transcript-retention.t                    # Oracle tests for b39-transcript-retention, derived from…
+│   │           ├── 104-animation-cadence.t                       # The spinner shipped with ten frames and could only ever show TWO of them.
+│   │           ├── 105-banner-placement.t                        # WHERE BANNERS RENDER, and what that costs the layout.
+│   │           ├── 106-panel-grid-borders.t                      # THE PANEL GRID'S BORDERS -- glyph choice, collapsing, and viewport edges.
+│   │           ├── 107-container-sampler.t                       # THE CONTAINER-STATE SAMPLER, and the one mapping in it that can cost real…
+│   │           ├── 108-reap-orphans.t                            # 108 — the orphan reaper selects exactly what it should, and nothing else.
+│   │           ├── 11-select-session-parses.t                    # select-session.pl must handle a real-shaped JSONL session: - extract the…
+│   │           ├── 12-keepalive-heartbeat.t                      # Validates the container's keep-alive pattern that the Containerfile bakes in…
+│   │           ├── 13-install-pass-heartbeat.t                   # Regression test for the install-pass heartbeat pattern in launcher.pl.
+│   │           ├── 18-multi-session-shared-state.t               # Multi-session use case: two `claude-sandbox` invocations on the same project…
+│   │           ├── 21-select-session-multiple.t                  # Picker with multiple session jsonl files: verify "Start a new session" is…
+│   │           ├── 22-mountspec-edge-cases.t                     # MountSpec corner cases — paths with spaces, mixed separators, edge detection…
+│   │           ├── 23-reap-decision.t                            # B6 graceful-reap: the container entrypoint's reap logic…
+│   │           ├── 24-launch-log.t                               # B1 launch logging: LaunchLog.pm — the launcher's durable per-launch JSON-line…
+│   │           ├── 25-dashboard.t                                # B2 dashboard framework: Dashboard.pm — the raw-ANSI TUI for `claude-sandbox`.
+│   │           ├── 26-backpack-approval.t                        # per-item, machine-local approval memory for backpack items (the launcher's…
+│   │           ├── 27-backpack-review.t                          # the interactive per-item approval walk (#21).
+│   │           ├── 28-keepawake.t                                # KeepAwake.pm (B5) — the keep-awake decision + the seam-injected lifecycle…
+│   │           ├── 29-select-session-viewport.t                  # Unit tests for the select-session.pl picker's viewport + display helpers — the…
+│   │           ├── 30-connector-hold.t                           # Fix 3 — ConnectorHold: when a connector's `podman exec -it ...
+│   │           ├── 31-plugin-merge.t                             # Fix 2 tier-2 merge-preserve + provenance.
+│   │           ├── 32-plugin-sync.t                              # Fix 2 PluginSync: the copy-model file reconcile.
+│   │           ├── 33-credentials-degrade.t                      # Fix 1 robustness: materialize-credentials must DEGRADE (preserve in-container…
+│   │           ├── 34-claude-json-seed.t                         # ClaudeConfig::heal_claude_json — the self-heal for claude-home/.claude.json's…
+│   │           ├── 35-port-alloc.t                               # pure port-block allocation logic (no podman, no filesystem).
+│   │           ├── 36-launcher-port-publish.t                    # Immutable oracle for blueprint 02-launcher-port-alloc.
+│   │           ├── 37-launch-stage-coverage.t                    # 37 — EVERY LONG STRETCH OF THE LAUNCH FLOW IS INSIDE A STAGE.
+│   │           ├── 38-global-lock.t                              # SandboxLock.pm (04-build-race-lock) — unit tests for the NEW module.
+│   │           ├── 39-ccpraxis-workcopy-detect.t                 # Tests for CcpraxisWorkCopy — the detection + routing module (p01).
+│   │           ├── 40-layout-responsive.t                        # s05-responsive-layout: the two-column layout oracle for Dashboard.pm.
+│   │           ├── 41-panel-semantics.t                          # s06-panel-semantics: colors + glyphs across Sandbox/Run/Backpack/Activity.
+│   │           ├── 42-refuse-in-place.t                          # Tests for the p01 in-place refusal (blueprint sandbox-refuse-in-place).
+│   │           ├── 43-token-panel.t                              # s08-token-panel: access + refresh token status (TokenInfo.pm + launcher…
+│   │           ├── 44-resources.t                                # s09-resources-panel: podman machine + container + host resources.
+│   │           ├── 45-run-state.t                                # s10-run-state-panel: orchestrator/run state on the dashboard (RunState.pm +…
+│   │           ├── 46-lifecycle-stop.t                           # s11-lifecycle-stop: stop-runs + full-shutdown, staged feedback, TUI-persistent.
+│   │           ├── 47-lifecycle-relaunch.t                       # s12-lifecycle-relaunch-recovery: the [l] relaunch/recover control + the shared…
+│   │           ├── 48-activity-history.t                         # s13-activity-history: recent activity across restarts.
+│   │           ├── 49-session-filter.t                           # s14-session-filter — unit + end-to-end tests for the butler-session filter.
+│   │           ├── 50-input-latency.t                            # s15-input-latency: oracle for the new `wait_input` seam in Dashboard::run().
+│   │           ├── 51-protected-paths.t                          # Oracle tests for ProtectedPaths (q01-protected-roots), derived from…
+│   │           ├── 52-detector-hardening.t                       # Tests for q02-detector-hardening — the anchor-set / marker-count / branch-(A)…
+│   │           ├── 53-refuse-protected-paths.t                   # Oracle tests for q03-launcher-refusal, derived from…
+│   │           ├── 54-spend-panel.t                              # b37-spend-surfaces oracle.
+│   │           ├── 55-minimize-evidence.t                        # Oracle test for s18-terminal-minimize-spike, derived from…
+│   │           ├── 56-launcher-d5-hardening.t                    # Oracle tests for q05-launcher-d5-hardening, derived from…
+│   │           ├── 57-node-pnpm-toolchain.t                      # Oracle for b38-node-pnpm-toolchain (blueprint sandbox-butler-overhaul).
+│   │           ├── 58-container-health-detect.t                  # Oracle tests for s03-container-health-detect, derived from…
+│   │           ├── 59-fleet-event-source.t                       # s16-fleet-event-source: butler fleet + keep-awake events into the activity…
+│   │           ├── 60-keepawake-probe.t                          # s21-keep-awake-probe-failure-handling: a transient podman-exec failure must…
+│   │           ├── 61-settings-scope-split.t                     # Oracle for the settings-scope split: machine-local state in…
+│   │           ├── 62-tui-adapter-contract.t                     # the TUI panel-adapter contract's ENFORCEMENT, for blueprint…
+│   │           ├── 63-run-panel-truth.t                          # ORACLE for package 04-run-panel-ledger-truth (blueprint…
+│   │           ├── 64-theme-tokens.t                             # ORACLE for package 02-design-tokens (blueprint unified-tui-design-system)…
+│   │           ├── 65-tui-render-library.t                       # ORACLE for package 05-render-library (blueprint unified-tui-design-system)…
+│   │           ├── 66-dashboard-screen.t                         # ORACLE for package 06-dashboard-screen (blueprint unified-tui-design-system)…
+│   │           ├── 67-backpack-screen.t                          # ORACLE for package 07-backpack-screen (blueprint unified-tui-design-system)…
+│   │           ├── 68-launcher-screens.t                         # ORACLE for package 08-launcher-screens (blueprint unified-tui-design-system)…
+│   │           ├── 69-statusline-rebuild.t                       # 69-statusline-rebuild -- the ORACLE for blueprint unified-tui-design-system…
+│   │           ├── 70-launch-prompt-conversion.t                 # Package 12 — the launch prompts package 08 handed back.
+│   │           ├── 71-test-harness-orphan-reaping.t              # 71-test-harness-orphan-reaping.t
+│   │           ├── 72-log-retention.t                            # LaunchLog::prune_logs.
+│   │           ├── 73-layout-flex-stability.t                    # 73-layout-flex-stability.t
+│   │           ├── 74-transcript-pointer.t                       # Oracle for b02-backpack-owns-path — DC5 (AC14, AC15) + a supplementary…
+│   │           ├── 75-wrap-on-overflow.t                         # ORACLE for package t02-wrap-on-overflow (blueprint…
+│   │           ├── 76-cold-start-machine-recovery.t              # Regression oracle: a STOPPED podman machine must not end the launch.
+│   │           ├── 77-wrap-width-regressions.t                   # fix-batch step-7 regression coverage for t02-wrap-on-overflow (blueprint…
+│   │           ├── 78-resources-spawn-budget.t                   # Regression oracle: the Resources sample round costs ONE powershell.exe, not…
+│   │           ├── 79-providers-panel.t                          # ORACLE for package t01-providers-panel (blueprint…
+│   │           ├── 80-ssh-host-keys.t                            # Oracle for p02-container-ssh-host-keys (blueprint…
+│   │           ├── 81-skills-manifest-mounts.t                   # p01-sandbox-plugin-provisioning — spec.md §2.1, Observable behaviors 1-2.
+│   │           ├── 82-skills-prune-orphaned-dirs.t               # p01-sandbox-plugin-provisioning — spec.md §2.3, Observable behavior 5.
+│   │           ├── 83-skills-reconcile-manifest.t                # p01-sandbox-plugin-provisioning — spec.md Observable behaviors 3, 4, 6, 7…
+│   │           ├── 84-plugin-unknown-version-dest-rel.t          # p01-sandbox-plugin-provisioning — AC-9 (maps to done-criterion 6, "a…
+│   │           ├── 85-skills-legacy-specimen-removal.t           # p01-sandbox-plugin-provisioning — driver correction after implementer-step4…
+│   │           ├── 86-skills-legacy-removal-fixbatch.t           # p01-sandbox-plugin-provisioning — fix-batch step 7 regression coverage for…
+│   │           ├── 87-banner-dismiss.t                           # ORACLE for package t03-banner-dismiss (blueprint…
+│   │           ├── 88-banner-wrap-every-surface.t                # ORACLE for package d02-wrap-every-surface (blueprint ccpraxis-tooling-debt)…
+│   │           ├── 89-tui-render-debt.t                          # ORACLE for package t08-tui-render-debt (blueprint tui-operator-feedback)…
+│   │           ├── 90-resources-sampler-visibility.t             # t01-resources-sampler — the oracle for blueprint tui-operator-feedback.
+│   │           ├── 91-spend-snapshot-adapter.t                   # t02-spend-persistence — the sandbox-side oracle for blueprint…
+│   │           ├── 92-activity-side-column.t                     # t03-activity-column -- the oracle for blueprint tui-operator-feedback.
+│   │           ├── 93-blueprints-table.t                         # t04-blueprints-table -- the oracle for blueprint tui-operator-feedback.
+│   │           ├── 94-no-rendered-colons.t                       # t05-no-colons -- the oracle for blueprint tui-operator-feedback.
+│   │           ├── 95-needs-you-lifecycle.t                      # t07-needs-you-lifecycle -- the oracle for blueprint tui-operator-feedback.
+│   │           ├── 96-hot-reload.t                               # t11-tui-hot-reload -- the oracle for blueprint tui-operator-feedback.
+│   │           ├── 97-escalation-ownership.t                     # "needs you" means the operator, not the queue.
+│   │           ├── 98-render-spans.t                             # s04-render-foundation: the render/span oracle for Dashboard.pm.
+│   │           └── 99-shared-claude-json-concurrency.t           # Shared claude-home/.claude.json — no corruption under real concurrency, on the…
+│   ├── steward/                                                  # Meta-plugin that maintains ccpraxis and owns its backup, onboarding, and…
+│   │   ├── .claude-plugin/                                       # Plugin manifest directory
+│   │   │   └── plugin.json                                       # Plugin manifest -- name, description, version
+│   │   ├── scripts/                                              # Implementation scripts
+│   │   │   ├── ccpraxis-helpers.pl                               # Deterministic subcommands for /backup (sync-skills, etc.) — replaces several LLM-driven prose steps with scripted ones; emits JSON the skill consumes
+│   │   │   ├── check-plugins.pl                                  # Detects missing or stale plugins vs settings.json
+│   │   │   ├── claude-binary-backup.pl                           # Snapshot / list / restore / prune / verify / detect for the Claude Code binary — gives /steward:update a deterministic safety net before any installer runs
+│   │   │   ├── filter-diff.pl                                    # Filters json-diff output through saved preferences
+│   │   │   ├── json-diff.pl                                      # Semantic JSON diff (--deep-exclude, structured report)
+│   │   │   ├── onboard.pl                                        # deterministically prepare a project to use the ccpraxis blueprint system.
+│   │   │   ├── save-preference.pl                                # Records "remember this divergence" decisions
+│   │   │   ├── sensitive-check.pl                                # Scans the public ccpraxis repo for secrets before committing
+│   │   │   ├── sync-export.pl                                    # Detects drift between live config and this repo
+│   │   │   ├── usage-audit-rates.json                            # Provider rate card (Anthropic / Z.ai / DeepSeek / Kimi) for usage-audit.pl
+│   │   │   ├── usage-audit.pl                                    # Token-usage + provider-cost engine for /steward:usage-audit
+│   │   │   └── vault-sync.pl                                     # Central engine for claude-code-vault project backups.
+│   │   ├── skills/                                               # Slash-command skills this plugin provides
 │   │   │   ├── audit/
-│   │   │   │   └── SKILL.md                   # Audits the ccpraxis repo itself — fans out read-only subagents (per-system re…
+│   │   │   │   └── SKILL.md                                      # Audits the ccpraxis repo itself — fans out read-only subagents (per-system…
 │   │   │   ├── backup/
-│   │   │   │   └── SKILL.md                   # Syncs everything personal between the live host and your private repos — ccpr…
+│   │   │   │   └── SKILL.md                                      # Syncs everything personal between the live host and your private repos —…
 │   │   │   ├── ccpraxis-extend/
-│   │   │   │   └── SKILL.md                   # THE single entrypoint for changing ccpraxis or adding new functionality to it.
+│   │   │   │   └── SKILL.md                                      # THE single entrypoint for changing ccpraxis or adding new functionality to it.
 │   │   │   ├── setup-project/
-│   │   │   │   └── SKILL.md                   # Onboard the current project to the ccpraxis system — create the local data di…
+│   │   │   │   └── SKILL.md                                      # Onboard the current project to the ccpraxis system — create the local data dir…
 │   │   │   ├── update/
-│   │   │   │   └── SKILL.md                   # Safely updates Claude Code by researching releases before installing.
+│   │   │   │   └── SKILL.md                                      # Safely updates Claude Code by researching releases before installing.
 │   │   │   └── usage-audit/
-│   │   │       └── SKILL.md                   # Measures real Claude Code token consumption across every transcript on this mac…
-│   │   └── tests/
-│   │       ├── lib/
-│   │       │   └── StewardTest.pm             # StewardTest — minimal test harness for the steward vault engine.
-│   │       ├── run-tests.pl                   # runner for the steward vault test suite.
-│   │       └── t/
-│   │           ├── 01-encoding.t
-│   │           ├── 02-host-memory-roundtrip.t
-│   │           ├── 03-second-machine-link.t
-│   │           ├── 04-conflict.t
-│   │           ├── 05-hard-exclude.t
-│   │           ├── 06-refresh-idempotent.t
-│   │           ├── 07-vault-metadata-rot.t
-│   │           ├── 08-backup-data-migration.t
-│   │           ├── 09-no-drive-root-strays.t
-│   │           ├── 10-marketplace-preferences.t
-│   │           ├── 11-journal-append-only.t
-│   │           └── 12-fresh-register-commits.t
-│   └── todo/                                  # Personal todo notes synced to your private vault repo.
-│       ├── .claude-plugin/
-│       │   └── plugin.json
-│       └── skills/
+│   │   │       └── SKILL.md                                      # Measures real Claude Code token consumption across every transcript on this…
+│   │   └── tests/                                                # Test suite -- run via scripts/run-tests.pl
+│   │       ├── lib/                                              # Shared helpers
+│   │       │   └── StewardTest.pm                                # StewardTest — minimal test harness for the steward vault engine.
+│   │       ├── run-tests.pl                                      # runner for the steward vault test suite.
+│   │       └── t/                                                # Test files, one concern each
+│   │           ├── 01-encoding.t                                 # byte-for-byte assertion that encode_project_dir reproduces the six live…
+│   │           ├── 02-host-memory-roundtrip.t                    # fresh register + host-memory PUSH.
+│   │           ├── 03-second-machine-link.t                      # the cross-machine guarantee from Decision #1: host memories pushed from…
+│   │           ├── 04-conflict.t                                 # a real 3-way conflict on the synthetic _host-memory path: two machines edit…
+│   │           ├── 05-hard-exclude.t                             # hard-excludes are honoured both at WALK time (a tracked directory containing…
+│   │           ├── 06-refresh-idempotent.t                       # refresh-default-tracked picks up default paths that came into existence AFTER…
+│   │           ├── 07-vault-metadata-rot.t                       # scope item 4: when this machine's local tracked_paths grow beyond what the…
+│   │           ├── 08-backup-data-migration.t                    # steward's per-project backup state (the registration metadata + the…
+│   │           ├── 09-no-drive-root-strays.t                     # regression guard for the C:\c and C:\tmp leak.
+│   │           ├── 10-marketplace-preferences.t                  # a marketplace discrepancy with a permanent answer must not be asked twice.
+│   │           ├── 11-journal-append-only.t                      # the sync journal is append-only, and every way that could go wrong is pinned…
+│   │           └── 12-fresh-register-commits.t                   # a fresh registration's FIRST commit must actually store the files, and must…
+│   └── todo/                                                     # Personal todo notes synced to your private vault repo.
+│       ├── .claude-plugin/                                       # Plugin manifest directory
+│       │   └── plugin.json                                       # Plugin manifest -- name, description, version
+│       └── skills/                                               # Slash-command skills this plugin provides
 │           ├── create/
-│           │   └── SKILL.md                   # /todo:create          — save a todo note
+│           │   └── SKILL.md                                      # /todo:create          — save a todo note
 │           ├── manage/
-│           │   └── SKILL.md                   # /todo:manage          — list / view / edit / delete / done
+│           │   └── SKILL.md                                      # /todo:manage          — list / view / edit / delete / done
 │           └── resume/
-│               └── SKILL.md                   # /todo:resume          — load a todo and work on it
-├── references/
-│   ├── extending-ccpraxis.md                  # Extension contract — how plugins/skills/standalone surfaces plug into ccpraxis and what each must provide
-│   └── skill-writing-guide.md                 # Shared skill authoring guide (folder structure, progressive disclosure, writing tips)
-├── scripts/                                   # ccpraxis-wide utility scripts (shared across surfaces)
-│   ├── _install-bin-helper.pl                 # Shared PATH/PATHEXT wiring (idempotent). Branches on $^O. Used by per-surface ccpraxis-install.pl hooks.
-│   ├── _perl-path.ps1                         # single source of truth for locating perl from PowerShell.
-│   ├── gen-readme-tree.pl                     # Generates the file-tree section of README.md from disk, using per-module metadata (.about > plugin.json > SKILL.md > script header). --check mode wires into /backup as a pre-flight; --bootstrap is a one-shot for adopting on an existing README.
-│   ├── hooks/                                 # Host-side PreToolUse hooks installed via global-config/settings.json
-│   │   ├── block-nonascii-ps1.pl              # PreToolUse guard: refuse to write non-ASCII into a
-│   │   ├── block-nul-redirect.pl              # Blocks bash `> nul` redirects on Windows — without this hook, scripts that target /dev/null on Unix create a stray `nul` file in the cwd, polluting the repo
-│   │   └── reap-orphans-hook.pl               # SessionStart hook: sweep processes left behind by
-│   ├── install-skills.pl                      # Symlinks (Unix) or junctions (Windows: `mklink /J`) every skills/<name>/ into ~/.claude/skills/. plan/apply modes. Called from the install protocol — handles Windows where `ln -s` silently falls back to a file copy.
-│   ├── lint-msys2-guard.pl                    # Pre-flight for /backup: walks every .pl that invokes podman natively and asserts the MSYS2_ARG_CONV_EXCL=* guard is set (the bug it prevents: `;C`-suffixed bind-mount targets on Windows)
-│   ├── lint-readme-paths.allow                # Allowlist for lint-readme-paths.pl — backtick contents that look like ccpraxis paths but are intentional non-host paths (e.g. container-internal)
-│   ├── lint-readme-paths.pl                   # Pre-flight for /backup: verifies every backtick-quoted ccpraxis path in README.md exists on disk
-│   ├── reap-orphans.pl                        # find (and optionally kill) processes left behind by a
-│   ├── run-tests.pl                           # the repo-wide test runner.
-│   ├── statusline.pl                          # Custom two-line status bar (model, context, rate limits)
-│   ├── todo-sync.pl                           # Vault todos: list/create/done/sync (git ops scoped to todos/)
-│   ├── tui-preview.pl                         # a live, resizable preview of the sandbox dashboard, driven
-│   ├── update-bootstrap-monitor.pl            # /steward:update support: versioned archive + drift check for upstream bootstrap.ps1
-│   ├── update-install.pl                      # /steward:update support: direct-binary install pipeline (detect / manifest / install / verify)
-│   └── update-research.pl                     # /steward:update support: fetches GitHub releases + changelog presence + symptom searches against issues
-└── skills/
+│               └── SKILL.md                                      # /todo:resume          — load a todo and work on it
+├── references/                                                   # Vendored reference material consulted by skills
+│   ├── extending-ccpraxis.md                                     # Extension contract — how plugins/skills/standalone surfaces plug into ccpraxis and what each must provide
+│   └── skill-writing-guide.md                                    # Shared skill authoring guide (folder structure, progressive disclosure, writing tips)
+├── scripts/                                                      # ccpraxis-wide utility scripts (shared across surfaces)
+│   ├── _install-bin-helper.pl                                    # Shared PATH/PATHEXT wiring (idempotent). Branches on $^O. Used by per-surface ccpraxis-install.pl hooks.
+│   ├── _perl-path.ps1                                            # single source of truth for locating perl from PowerShell.
+│   ├── gen-readme-tree.pl                                        # Generates the file-tree section of README.md from disk, using per-module metadata (.about > plugin.json > SKILL.md > script header). --check mode wires into /backup as a pre-flight; --bootstrap is a one-shot for adopting on an existing README.
+│   ├── hooks/                                                    # Host-side PreToolUse hooks installed via global-config/settings.json
+│   │   ├── block-nonascii-ps1.pl                                 # PreToolUse guard: refuse to write non-ASCII into a .ps1 file.
+│   │   ├── block-nul-redirect.pl                                 # Blocks bash `> nul` redirects on Windows — without this hook, scripts that target /dev/null on Unix create a stray `nul` file in the cwd, polluting the repo
+│   │   └── reap-orphans-hook.pl                                  # SessionStart hook: sweep processes left behind by sessions that have already…
+│   ├── install-skills.pl                                         # Symlinks (Unix) or junctions (Windows: `mklink /J`) every skills/<name>/ into ~/.claude/skills/. plan/apply modes. Called from the install protocol — handles Windows where `ln -s` silently falls back to a file copy.
+│   ├── lint-msys2-guard.pl                                       # Pre-flight for /backup: walks every .pl that invokes podman natively and asserts the MSYS2_ARG_CONV_EXCL=* guard is set (the bug it prevents: `;C`-suffixed bind-mount targets on Windows)
+│   ├── lint-readme-paths.allow                                   # Allowlist for lint-readme-paths.pl — backtick contents that look like ccpraxis paths but are intentional non-host paths (e.g. container-internal)
+│   ├── lint-readme-paths.pl                                      # Pre-flight for /backup: verifies every backtick-quoted ccpraxis path in README.md exists on disk
+│   ├── reap-orphans.pl                                           # find (and optionally kill) processes left behind by a Claude Code session that…
+│   ├── run-tests.pl                                              # the repo-wide test runner.
+│   ├── statusline.pl                                             # Custom two-line status bar (model, context, rate limits)
+│   ├── todo-sync.pl                                              # Vault todos: list/create/done/sync (git ops scoped to todos/)
+│   ├── tui-preview.pl                                            # a live, resizable preview of the sandbox dashboard, driven by synthetic state.
+│   ├── update-bootstrap-monitor.pl                               # /steward:update support: versioned archive + drift check for upstream bootstrap.ps1
+│   ├── update-install.pl                                         # /steward:update support: direct-binary install pipeline (detect / manifest / install / verify)
+│   └── update-research.pl                                        # /steward:update support: fetches GitHub releases + changelog presence + symptom searches against issues
+└── skills/                                                       # User-invocable skills, mirrored to ~/.claude/skills/
     ├── carry-over/
-    │   └── SKILL.md                           # /carry-over           — hand this session's work to a fresh one (plan-mode handover; not /compact)
-    ├── launch-chrome-puppet/                  # /launch-chrome-puppet — CDP browser automation
+    │   └── SKILL.md                                              # /carry-over           — hand this session's work to a fresh one (plan-mode handover; not /compact)
+    ├── launch-chrome-puppet/                                     # /launch-chrome-puppet — CDP browser automation
     │   ├── SKILL.md
-    │   └── scripts/
-    │       ├── chrome-puppet.pl               # Subcommand dispatcher (launch, navigate, text, etc.)
-    │       └── lib/
-    │           └── CDPClient.pm               # Pure-Perl WebSocket + CDP client
+    │   └── scripts/                                              # Implementation scripts
+    │       ├── chrome-puppet.pl                                  # Subcommand dispatcher (launch, navigate, text, etc.)
+    │       └── lib/                                              # Shared helpers
+    │           └── CDPClient.pm                                  # Pure-Perl WebSocket + CDP client
     └── refresh/
-        └── SKILL.md                           # /refresh              — reread CLAUDE.md mid-conversation
+        └── SKILL.md                                              # /refresh              — reread CLAUDE.md mid-conversation
 ```
 <!-- END-FILE-TREE -->
