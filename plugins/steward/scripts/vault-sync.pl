@@ -92,6 +92,19 @@ my @DEFAULT_TRACKABLE = (
     # this machine, and a report frozen at `taken` is evidence of what was
     # actually claimed — not re-derivable from anything.
     '.ccpraxis-local-data/bug-reports',
+    # Standing operating rulings (bug report 20260901-023828-bf81). These replace
+    # Claude Code's built-in auto-memory, which ccpraxis disables deliberately
+    # (autoMemoryEnabled: false in every settings layer, plus a permissions.deny
+    # on the memory path), and the project CLAUDE.md indexes them as
+    # read-on-demand.
+    #
+    # So they are rules the agent is expected to follow, in a gitignored
+    # directory, that the backup did not know existed. Losing the disk lost them
+    # SILENTLY: CLAUDE.md would keep pointing at files that were no longer there.
+    # push-straight-to-main.md shows the cost of that — it exists because the
+    # same false alarm was raised three times in one session before somebody
+    # wrote it down.
+    '.ccpraxis-local-data/guidance',
     $HOST_MEMORY_REL,                          # host-side memory (synthetic; see local_abs)
 );
 
@@ -1374,6 +1387,30 @@ sub finalize_commit {
     if (@$mid_sync_rollbacks) {
         $out->{rolled_back_during_sync} = $mid_sync_rollbacks;
         $out->{note} = "Committed and pushed, BUT some files were rolled back because their source changed mid-sync. Re-run sync to pick them up.";
+
+        # A ROLLBACK OF EVERYTHING IS NOT A SUCCESSFUL BACKUP.
+        #
+        # Report 20260901-025445-d667: a fresh registration returned
+        # `committed_and_pushed` having rolled back all 4405 push ops. Nothing
+        # was stored — the vault held 201 MB of unrenamed *.vault-sync.tmp
+        # staging, invisible to `git status` because that pattern is in the
+        # vault's own .gitignore, and `git ls-files` showed only metadata.json.
+        #
+        # The status was the only thing an operator (or the backup skill) would
+        # look at, and it said success. Surfacing the count is not enough: the
+        # first run DID report `rolled_back=4405` and it read as a footnote.
+        #
+        # When nothing renamed, the run failed. Say so, and say why -- the
+        # per-op reason was previously recorded on the op and never emitted,
+        # which is why the trigger is still unidentified.
+        if (!@{ $rename_report->{renamed} || [] }) {
+            $out->{status} = 'rolled_back_nothing_stored';
+            $out->{note}   = "NOTHING was stored: every staged file rolled back. The vault was not "
+                           . "updated. Re-run sync; if it repeats, the reasons below identify why.";
+            my %why;
+            $why{ $_->{reason} // 'unknown' }++ for @$mid_sync_rollbacks;
+            $out->{rollback_reasons} = \%why;
+        }
     }
     emit_json($out);
 }
@@ -1894,6 +1931,10 @@ sub batch_rename_all {
     my $j = journal_read($slug);
     my @renamed;
     my @rolled_back;
+    # Paths whose PUSH rolled back, so the matching `cache` op can roll back
+    # with it. stage_push records the push before its cache op and the journal
+    # preserves that order, so the push is always seen first.
+    my %rolled_back_paths;
 
     for my $op (@{$j->{ops}}) {
         next if $op->{status} eq 'complete' || $op->{status} eq 'rolled_back';
@@ -1929,8 +1970,33 @@ sub batch_rename_all {
                 $op->{status} = 'rolled_back';
                 $op->{reason} = 'source_modified_during_sync';
                 push @rolled_back, { path => $op->{path}, reason => 'source_modified_during_sync' };
+                $rolled_back_paths{ $op->{path} } = 1;
                 next;
             }
+        }
+
+        # A CACHE OP WHOSE PUSH ROLLED BACK MUST ROLL BACK TOO.
+        #
+        # This is the data-loss bug (report 20260901-025445-d667). stage_push
+        # records the push AND a separate `cache` op. When the push rolls back
+        # but the cache op completes, the cache — which is the "last known
+        # synced state" — asserts a sync that never reached the vault.
+        #
+        # The NEXT sync then sees local == cache and the vault missing the file,
+        # and the only consistent reading of that is "deleted upstream". It
+        # staged delete_local for 4405 files: every bug report, blueprint and
+        # correction note in the project, reported as an ordinary `synced`.
+        #
+        # The three-way comparison was behaving correctly on a cache that lied.
+        # So the cache must never record a file as synced unless its content
+        # actually landed. This holds whatever caused the push to roll back --
+        # which matters, because that trigger is still unidentified.
+        if ($op->{action} eq 'cache' && $rolled_back_paths{ $op->{path} // '' }) {
+            unlink $op->{tmp_path} if -f $op->{tmp_path};
+            $op->{status} = 'rolled_back';
+            $op->{reason} = 'push_rolled_back';
+            push @rolled_back, { path => $op->{path}, reason => 'push_rolled_back' };
+            next;
         }
 
         unless (-f $op->{tmp_path}) {
@@ -1942,6 +2008,9 @@ sub batch_rename_all {
                 $op->{status} = 'rolled_back';
                 $op->{reason} = 'tmp_missing_and_final_missing';
                 push @rolled_back, { path => $op->{path}, reason => 'tmp_missing' };
+                # Same rule as above: if this was the push, its cache op must
+                # not go on to claim the file was synced.
+                $rolled_back_paths{ $op->{path} } = 1 if ($op->{action} // '') eq 'push';
             }
             next;
         }
