@@ -2,11 +2,9 @@
 
 # PRAXIS for Claude Code
 
-**P**rompts, **R**ules, **A**gents, e**X**tensions, **I**ntegrations, **S**kills
-
-A Claude Code configuration: plugins, hooks and a launcher script, covering an optional
-isolated container, plans that survive a session ending, and syncing your setup across
-machines.
+For running Claude Code on work that takes more than one session. Plans live on disk rather
+than in the context window, hooks refuse the commands that destroy finished work, and a
+project's toolchain can stay in a container instead of on your machine.
 
 [![Perl 5.14+](https://img.shields.io/badge/runtime-Perl%205.14%2B-39457E?logo=perl&logoColor=white)](https://www.perl.org/)
 [![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows-blue)](#platforms)
