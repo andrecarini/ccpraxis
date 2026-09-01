@@ -1716,6 +1716,29 @@ sub walk_dir_into_inventory {
         wanted => sub {
             return if -l $_;
             return unless -f $_;
+
+            # THE SYNC'S OWN STAGING FILES ARE NOT CONTENT.
+            #
+            # Root cause of bug report 20260901-025445-d667, found 2026-09-01.
+            # This walk enumerated `*.vault-sync.tmp` as ordinary tracked files.
+            # build_hash_map_from_cache already skipped them; this walk -- which
+            # feeds every side, local, vault AND cache -- did not.
+            #
+            # An interrupted sync leaves staging files behind. The next sync
+            # treated them as content and staged them AGAIN, producing
+            # `x.vault-sync.tmp.vault-sync.tmp`, and every run added another 15
+            # characters. Measured on the ccpraxis dev clone: 4403 stray tmps in
+            # the project and a staged vault path of 259 characters -- one below
+            # Windows' 260-character MAX_PATH. Past that limit the tmp cannot be
+            # created, so `-f $op->{tmp_path}` is false and EVERY push op rolls
+            # back with tmp_missing. Measured: 8822 of 8822.
+            #
+            # That is what made a backup report success while storing nothing,
+            # and (before the cache-rollback fix) what poisoned the cache into
+            # staging deletion of every local file. The compounding is the
+            # dangerous part: each failed sync makes the next one worse.
+            return if $_ =~ /\Q$TMP_SUFFIX\E\z/;
+
             my $rel = $to_rel->($_);
             unless (defined $rel && validate_relative_path($rel)) {
                 push @$skipped_bad, ($rel // $_);
