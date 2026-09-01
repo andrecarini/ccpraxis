@@ -399,4 +399,58 @@ PROBE_EOF
      . 'path and return 0 here, passing K1 by accident while still failing this');
 }
 
+# ===========================================================================
+# Z. A STALE WAKE-UP MARKER MUST NOT PERMIT A STOP.
+#     (bug report 20260829-225523-88e7)
+#
+# The marker records that something was DISPATCHED. It never recorded WHEN, so
+# it did not distinguish "a background task is running" from "a background task
+# ran, finished, and was reported on three turns ago". The gate consumed
+# whichever marker happened to be on disk, and an armed session ended a turn
+# having just written "next: promote, then re-run the sync" -- exactly the
+# failure this gate exists to prevent. The operator had to ask why it stopped.
+#
+# A wake-up scheduled long ago has either fired or died; a shell hook cannot
+# tell which, and both mean it is no longer pending. So it expires.
+# ===========================================================================
+{
+    my $root = new_project();
+    my $cdir = tempdir(CLEANUP => 1);
+    plant_marker($cdir, 'sess-z');
+
+    my $wp = marker_path($cdir, 'sess-z') . '.wakeup-pending';
+
+    # A marker stamped well in the past: the shape left behind by a background
+    # task that completed several turns earlier.
+    open my $fh, '>', $wp or die "fixture: $!";
+    print {$fh} (time - 86400) . " Bash\n";
+    close $fh;
+    ok(-f $wp, 'Z0 fixture: a stale wake-up marker exists');
+
+    my ($rc, $out) = run_gate(stop_payload($root, 'sess-z'), cdir => $cdir);
+    isnt($rc, 0, 'Z1: a STALE wake-up marker does NOT permit the stop -- the gate still blocks');
+    ok(!-f $wp, 'Z2: ...and the stale marker is removed, so it cannot be spent twice');
+
+    # And the fresh case still works, so Z1 is not just "the gate always blocks".
+    my $root2 = new_project();
+    my $cdir2 = tempdir(CLEANUP => 1);
+    plant_marker($cdir2, 'sess-z2');
+    my $wp2 = marker_path($cdir2, 'sess-z2') . '.wakeup-pending';
+    open my $fh2, '>', $wp2 or die "fixture: $!";
+    print {$fh2} time . " Bash\n";
+    close $fh2;
+    my ($rc2) = run_gate(stop_payload($root2, 'sess-z2'), cdir => $cdir2);
+    is($rc2, 0, 'Z3 non-vacuity: a FRESH wake-up marker still permits the stop');
+
+    # An unstamped marker (written before this change) falls back to mtime
+    # rather than being stranded or blindly trusted.
+    my $root3 = new_project();
+    my $cdir3 = tempdir(CLEANUP => 1);
+    plant_marker($cdir3, 'sess-z3');
+    my $wp3 = marker_path($cdir3, 'sess-z3') . '.wakeup-pending';
+    open my $fh3, '>', $wp3 or die "fixture: $!"; close $fh3;   # empty, no stamp
+    my ($rc3) = run_gate(stop_payload($root3, 'sess-z3'), cdir => $cdir3);
+    is($rc3, 0, 'Z4 upgrade path: an unstamped marker written just now is honoured via its mtime');
+}
+
 done_testing();

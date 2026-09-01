@@ -1,0 +1,155 @@
+#!/usr/bin/env perl
+# 12-fresh-register-commits.t — a fresh registration's FIRST commit must
+# actually store the files, and must not poison the cache if it does not.
+#
+# Bug report 20260901-025445-d667. Registering the ccpraxis dev clone
+# (4405 files), the first commit-and-push returned `committed_and_pushed` while
+# rolling back all 4405 push ops. Nothing was committed: the vault held 201 MB
+# of unrenamed *.vault-sync.tmp staging, invisible to `git status` because that
+# pattern is in the vault's own .gitignore, and `git ls-files` showed only
+# metadata.json.
+#
+# The SECOND sync then staged `delete_local` for every file — 4405 deletions,
+# zero pushes — because the cache had recorded the files as synced even though
+# the push ops rolled back. local == cache + vault absent reads as "deleted
+# upstream". It reported `status: synced` while staging the deletion of every
+# bug report, blueprint and correction note in the project.
+#
+# Two claims, and the second is the one that turns a failed backup into data
+# loss:
+#   AC1  a fresh registration's first commit actually commits its files
+#   AC2  after a sync, the next sync does not want to DELETE anything local
+use strict;
+use warnings;
+use FindBin qw($Bin);
+use lib "$Bin/../lib";
+use StewardTest qw(ok is run_vs temproot make_machine init_remote write_text done_testing diag);
+
+my $root   = temproot();
+my $remote = init_remote($root);
+my $home   = make_machine($root, 'home1');
+my $proj   = "$root/proj"; mkdir $proj or die;
+run_vs($home, 'init', '--url', $remote);
+
+# Content shaped like the real case: a CLAUDE.md plus a data root holding
+# several kinds of tracked material.
+write_text("$proj/CLAUDE.md", "# proj\n");
+write_text("$proj/.ccpraxis-local-data/bug-reports/2026-a.md", "---\nid: a\n---\nbody a\n");
+write_text("$proj/.ccpraxis-local-data/bug-reports/2026-b.md", "---\nid: b\n---\nbody b\n");
+write_text("$proj/.ccpraxis-local-data/corrections/c1.md", "correction one\n");
+write_text("$proj/.ccpraxis-local-data/blueprints/bp1/blueprint.md", "# bp1\n");
+write_text("$proj/.ccpraxis-local-data/blueprints/bp1/packages/01-x.md", "# pkg\n");
+
+my $files = join ',', 'CLAUDE.md',
+    '.ccpraxis-local-data/bug-reports',
+    '.ccpraxis-local-data/corrections',
+    '.ccpraxis-local-data/blueprints';
+
+my $reg = run_vs($home, 'register', '--fresh', '--cwd', $proj, '--slug', 'proj', '--files', $files);
+is($reg->{json} && $reg->{json}{status}, 'registered_fresh', 'registered fresh') or diag($reg->{out});
+
+# ---------------------------------------------------------------------------
+# AC1 — the first commit stores the files.
+# ---------------------------------------------------------------------------
+my $s1 = run_vs($home, 'sync-project', '--slug', 'proj');
+is($s1->{json} && $s1->{json}{status}, 'synced', 'AC1: first sync-project succeeded') or diag($s1->{out});
+
+my $c1 = run_vs($home, 'commit-and-push', '--slug', 'proj', '--session-id', ($s1->{json}{session_id} // ''));
+is($c1->{json} && $c1->{json}{status}, 'committed_and_pushed', 'AC1: first commit-and-push succeeded')
+    or diag($c1->{out});
+
+# THE ROLLBACK COUNT IS THE ASSERTION. The live failure reported success with
+# every op rolled back, so "status was committed_and_pushed" proves nothing on
+# its own.
+my @rb = @{ ($c1->{json} && $c1->{json}{rolled_back_during_sync}) || [] };
+is(scalar @rb, 0, 'AC1: NOTHING was rolled back on a fresh first commit')
+    or diag("rolled back: " . join(', ', map { ($_->{path} // '?') . ' (' . ($_->{reason} // '?') . ')' } @rb[0 .. ($#rb > 4 ? 4 : $#rb)]));
+
+# And the content is really in the vault, tracked by git — not sitting as
+# unrenamed staging that git ignores.
+my $vfiles = run_vs($home, 'vault-files', '--slug', 'proj');
+my @paths = map { ref $_ ? ($_->{path} // '') : $_ } @{ ($vfiles->{json} && $vfiles->{json}{files}) || [] };
+ok(scalar(@paths) >= 5, 'AC1: the vault reports the tracked files (got ' . scalar(@paths) . ')')
+    or diag($vfiles->{out});
+ok((grep { m{bug-reports/2026-a\.md} } @paths), 'AC1: a bug report actually reached the vault');
+
+# ---------------------------------------------------------------------------
+# AC2 — THE DATA-LOSS CLAIM. A second sync, with nothing changed locally, must
+# not want to delete local files.
+# ---------------------------------------------------------------------------
+my $s2 = run_vs($home, 'sync-project', '--slug', 'proj');
+is($s2->{json} && $s2->{json}{status}, 'synced', 'AC2: second sync-project succeeded') or diag($s2->{out});
+
+# applied is the op list; a delete_local in it is the failure.
+my $applied = ($s2->{json} && $s2->{json}{applied}) || [];
+my @ops = ref $applied eq 'ARRAY' ? @$applied : ();
+my @deletes = grep { (ref $_ ? ($_->{action} // '') : '') eq 'delete_local' } @ops;
+is(scalar @deletes, 0, 'AC2: the second sync stages NO delete_local ops')
+    or diag("would delete: " . join(', ', map { $_->{path} // '?' } @deletes[0 .. ($#deletes > 4 ? 4 : $#deletes)]));
+
+# The local files are still there, whatever the ops said.
+run_vs($home, 'commit-and-push', '--slug', 'proj', '--session-id', ($s2->{json}{session_id} // ''));
+ok(-f "$proj/.ccpraxis-local-data/bug-reports/2026-a.md", 'AC2: the local bug report survived a second sync');
+ok(-f "$proj/.ccpraxis-local-data/corrections/c1.md",     'AC2: the local correction survived');
+ok(-f "$proj/.ccpraxis-local-data/blueprints/bp1/blueprint.md", 'AC2: the local blueprint survived');
+
+# ---------------------------------------------------------------------------
+# AC3 — A ROLLED-BACK PUSH MUST NOT LEAVE A CACHE ENTRY BEHIND.
+#
+# This is the mechanism of the data loss, tested directly rather than through
+# the (still unidentified) trigger that made 4405 pushes roll back.
+#
+# A push rolls back when its source changes between staging and rename. So:
+# stage a sync, then modify the source before commit-and-push. The push rolls
+# back for a legitimate reason — and the question is whether its cache op rolls
+# back with it.
+#
+# If it does not, the cache claims a sync that never reached the vault, and the
+# NEXT sync reads local == cache + vault-absent as "deleted upstream" and stages
+# delete_local. That is how a failed backup becomes deleted work.
+#
+# THE FIRST VERSION OF THIS CASE WAS VACUOUS, and the way it failed is worth
+# recording. It made the push roll back by MODIFYING the source after staging —
+# which also makes cache != local, so the next sync reads "local changed", pushes
+# again, and never reaches the delete path. It passed with the fix disabled.
+#
+# The real incident had cache == local with the vault EMPTY: nothing had changed
+# locally, the pushes simply never landed. So the reproduction has to make the
+# push fail for a reason UNRELATED to the source content — here by removing the
+# staged vault-side tmps, which triggers the tmp-missing rollback while the cache
+# ops still carry the current content.
+{
+    my $victim = "$proj/.ccpraxis-local-data/bug-reports/2026-c.md";
+    write_text($victim, "---\nid: c\n---\noriginal\n");
+
+    my $s3 = run_vs($home, 'sync-project', '--slug', 'proj');
+    is($s3->{json} && $s3->{json}{status}, 'synced', 'AC3: staged a sync containing the new file') or diag($s3->{out});
+
+    # Remove the staged vault-side tmps: the pushes now fail for a reason that
+    # has nothing to do with the local file, exactly as in the live incident.
+    my $vfiles_dir = "$home/.claude/claude-code-vault/projects/proj/files";
+    my @tmps;
+    if (opendir my $dh, "$vfiles_dir/.ccpraxis-local-data/bug-reports") {
+        push @tmps, "$vfiles_dir/.ccpraxis-local-data/bug-reports/$_"
+            for grep { /\.vault-sync\.tmp\z/ } readdir $dh;
+        closedir $dh;
+    }
+    ok(scalar(@tmps) > 0, 'AC3: fixture — staged push tmps exist to remove');
+    unlink $_ for @tmps;
+
+    my $c3 = run_vs($home, 'commit-and-push', '--slug', 'proj', '--session-id', ($s3->{json}{session_id} // ''));
+    my @rb3 = @{ ($c3->{json} && $c3->{json}{rolled_back_during_sync}) || [] };
+    ok(scalar(@rb3) > 0, 'AC3: those pushes rolled back') or diag(substr($c3->{out}, 0, 300));
+
+    # THE ASSERTION THAT MATTERS: the next sync must not want to delete it.
+    my $s4 = run_vs($home, 'sync-project', '--slug', 'proj');
+    my $ap = ($s4->{json} && $s4->{json}{applied}) || [];
+    my @del = grep { (ref $_ ? ($_->{action} // '') : '') eq 'delete_local' } (ref $ap eq 'ARRAY' ? @$ap : ());
+    is(scalar @del, 0, 'AC3: the sync after a rolled-back push stages NO delete_local')
+        or diag("would delete: " . join(', ', map { $_->{path} // '?' } @del[0 .. ($#del > 4 ? 4 : $#del)]));
+
+    run_vs($home, 'commit-and-push', '--slug', 'proj', '--session-id', ($s4->{json}{session_id} // ''));
+    ok(-f $victim, 'AC3: the file whose push rolled back still exists locally');
+}
+
+done_testing();

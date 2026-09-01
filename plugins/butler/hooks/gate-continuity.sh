@@ -89,9 +89,41 @@ fi
 # --- a wake-up is already scheduled: this turn end is legitimate -----------
 # mark-wakeup.sh's extended write (independent of .drive-solo) wrote this on
 # a Task/Agent dispatch or a backgrounded Bash call. CONSUME it.
+#
+# BUT ONLY IF IT IS STILL PENDING (bug report 20260829-225523-88e7).
+#
+# The marker used to be a bare flag with no timestamp. It records that something
+# was DISPATCHED, never that anything will still wake the session -- so a marker
+# written for work that had already completed several turns earlier was
+# consumed by a later, unrelated stop. An armed session ended a turn having just
+# written "next: promote, then re-run the sync", and the operator had to ask why
+# it stopped. That is precisely what this gate is for.
+#
+# A wake-up that was scheduled long ago has either fired or died by now; a hook
+# cannot tell which, and both mean it is no longer pending. So the marker
+# expires. WAKEUP_TTL_S is generous -- a genuine background task that has not
+# called back within it is not something this session should be waiting on
+# silently anyway.
+#
+# .stop-blocks is deliberately NOT cleared here any more. "A wake-up was
+# scheduled" and "this agent has been repeatedly trying to end its turn" are
+# independent facts, and clearing the counter on marker consumption let a single
+# backgrounded command both permit the stop AND erase the evidence of the
+# pattern.
+WAKEUP_TTL_S=${CCPRAXIS_CONTINUITY_WAKEUP_TTL_S:-900}
 if [ -f "$MARK.wakeup-pending" ]; then
-  rm -f "$MARK.wakeup-pending" "$MARK.stop-blocks" 2>/dev/null
-  exit 0
+  WNOW=$(date +%s 2>/dev/null || echo 0)
+  WAT=$(awk 'NR==1{print $1+0; exit}' "$MARK.wakeup-pending" 2>/dev/null || echo 0)
+  # A marker with no timestamp predates this change; fall back to its mtime so
+  # an in-flight upgrade does not either strand or over-trust it.
+  [ "$WAT" -gt 0 ] 2>/dev/null || WAT=$(stat -c %Y "$MARK.wakeup-pending" 2>/dev/null || echo 0)
+  rm -f "$MARK.wakeup-pending" 2>/dev/null
+  if [ "$WNOW" -gt 0 ] && [ "$WAT" -gt 0 ] && [ $(( WNOW - WAT )) -lt "$WAKEUP_TTL_S" ]; then
+    rm -f "$MARK.stop-blocks" 2>/dev/null
+    exit 0
+  fi
+  # Stale: fall through and block. The marker is gone either way, so a stale one
+  # cannot be spent twice.
 fi
 
 # --- bounded nagging ---------------------------------------------------------

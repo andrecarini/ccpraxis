@@ -440,7 +440,20 @@ fi
 CSID=$(bp_json_get "$PAYLOAD" session_id 2>/dev/null || true)
 if [ -n "$CSID" ]; then
   if CMARK=$(bp_continuity_marker "$CSID" 2>/dev/null); then
-    [ -f "$CMARK" ] && : > "$CMARK.wakeup-pending" 2>/dev/null || true
+    # STAMPED, not just touched (bug report 20260829-225523-88e7).
+    #
+    # This used to be an empty file: a bare "something was dispatched" flag with
+    # no notion of WHEN. The gate consumes it at the next stop, so a marker
+    # written for work that had already finished several turns earlier was still
+    # honoured -- and an armed session ended a turn with the work plainly
+    # unfinished, which is the exact failure the gate exists to prevent.
+    #
+    # The epoch lets the gate expire it: a wake-up that was scheduled long ago
+    # has, by then, either fired or died. Which of those it was is not knowable
+    # from a shell hook, and both mean the same thing here -- it is no longer
+    # pending.
+    [ -f "$CMARK" ] && printf '%s %s\n' "$(date +%s 2>/dev/null || echo 0)" "$TOOL" \
+      > "$CMARK.wakeup-pending" 2>/dev/null || true
   fi
 fi
 
