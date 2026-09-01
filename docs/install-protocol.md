@@ -38,7 +38,17 @@ perl ~/.claude/ccpraxis/scripts/install-skills.pl apply
 
 The script is idempotent — re-runs converge from any prior state (plain copy, stale symlink, missing). Junctions on Windows need no Developer Mode and no admin privilege.
 
-**3. Handle CLAUDE.md:**
+**3. Back up whatever config the user already has — BEFORE steps 4 and 5 touch it.**
+
+Steps 4 and 5 replace `~/.claude/CLAUDE.md` with a symlink (or merge into it) and copy or key-merge `~/.claude/settings.json`. Both are shown to the user first, but a reviewed diff is not a rollback: once accepted, the file they had is gone. Copy it aside while it still exists.
+
+```bash
+perl ~/.claude/ccpraxis/scripts/backup-user-config.pl
+```
+
+Idempotent and safe on a fresh machine: a file that does not exist is skipped rather than created, an existing backup is never overwritten, and a `CLAUDE.md` that is already a ccpraxis symlink is left alone rather than archived as though it were the user's own. Report the paths it prints — that is the user's undo, and it is the only one they get, since there is no automated uninstaller.
+
+**4. Handle CLAUDE.md:**
 
 - If `~/.claude/CLAUDE.md` does not exist: symlink it.
   ```bash
@@ -46,7 +56,7 @@ The script is idempotent — re-runs converge from any prior state (plain copy, 
   ```
 - If it already exists: read both the existing file and the repo's `global-config/CLAUDE.md`. Ask the user (via AskUserQuestion) whether to replace it with a symlink to the repo version or to merge. If merging, incorporate the repo's rules into the existing file and leave it as a regular file.
 
-**4. Handle settings.json:**
+**5. Handle settings.json:**
 
 - If `~/.claude/settings.json` does not exist: copy the repo version.
   ```bash
@@ -60,11 +70,11 @@ The script is idempotent — re-runs converge from any prior state (plain copy, 
 
 After adopting (or copying), substitute `~` in path-valued fields with the user's home directory. Most JSON config consumers in Claude Code don't expand `~`. Specifically the `extraKnownMarketplaces.ccpraxis-local.source.path` field must be a real absolute path for the local ccpraxis plugin marketplace to resolve. Rewrite that field to the on-disk absolute path of `~/.claude/ccpraxis/plugins` on this machine (Windows users can use forward slashes, e.g. `C:/Users/<name>/.claude/ccpraxis/plugins`, since Node accepts both forms).
 
-**5. Add missing marketplaces (must complete before step 6):**
+**6. Add missing marketplaces (must complete before step 7):**
 
-Read `global-config/known_marketplaces.json` (if it exists). Compare against `~/.claude/plugins/known_marketplaces.json` — on a fresh Claude Code install both `installed_plugins.json` and `known_marketplaces.json` are created on first launch, so absence means treat as empty. For each marketplace in the repo but not installed locally, inform the user and offer to add it with `/plugin marketplace add <owner>/<repo>` (for GitHub sources) or the appropriate URL. The marketplaces must land **before** step 6, since step 6 installs plugins **from** these marketplaces.
+Read `global-config/known_marketplaces.json` (if it exists). Compare against `~/.claude/plugins/known_marketplaces.json` — on a fresh Claude Code install both `installed_plugins.json` and `known_marketplaces.json` are created on first launch, so absence means treat as empty. For each marketplace in the repo but not installed locally, inform the user and offer to add it with `/plugin marketplace add <owner>/<repo>` (for GitHub sources) or the appropriate URL. The marketplaces must land **before** step 7, since step 7 installs plugins **from** these marketplaces.
 
-**6. Install missing plugins (depends on step 5):**
+**7. Install missing plugins (depends on step 6):**
 
 Read the `enabledPlugins` from `global-config/settings.json`. For each plugin, check if it's already installed by reading `~/.claude/plugins/installed_plugins.json` (if it exists). For any plugin not found there, inform the user which plugins are missing and offer to install them. Install with:
 
@@ -72,7 +82,7 @@ Read the `enabledPlugins` from `global-config/settings.json`. For each plugin, c
 /plugin install <plugin-name>@<marketplace-name>
 ```
 
-**7. Wire ccpraxis's host launchers into PATH (`claude-sandbox`, and anything else any plugin ships):**
+**8. Wire ccpraxis's host launchers into PATH (`claude-sandbox`, and anything else any plugin ships):**
 
 The install orchestrator is a two-phase Perl script. First run = plan only (prints what would change, exits without touching anything). Re-run with `--confirm` to apply.
 
@@ -90,14 +100,14 @@ The user must restart their terminal (or open a new one) for the PATH/PATHEXT ch
 
 Internally the orchestrator runs every `ccpraxis-install.pl` discovered under `plugins/<name>/` and `skills/<name>/`. Each hook is idempotent — re-runs are safe no-ops. On Windows only User-scope `PATH`/`PATHEXT` are touched (no admin required).
 
-**8. Add `upstream` remote for future updates:**
+**9. Add `upstream` remote for future updates:**
 
 ```bash
 cd ~/.claude/ccpraxis
 git remote add upstream https://github.com/andrecarini/ccpraxis.git
 ```
 
-**9. (If user provided a vault URL) Initialize the vault repo:**
+**10. (If user provided a vault URL) Initialize the vault repo:**
 
 ```bash
 perl ~/.claude/ccpraxis/plugins/steward/scripts/vault-sync.pl init --url "<vault-url>"
@@ -107,4 +117,4 @@ The init is cwd-agnostic — it clones to a fixed location (`~/.claude/claude-co
 
 If the user didn't provide a vault URL, skip this step — they can run the init later.
 
-**10. Tell the user to restart Claude Code.**
+**11. Tell the user to restart Claude Code.**

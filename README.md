@@ -140,9 +140,9 @@ npm, pip, or any other dev tooling on your machine, the installer is Perl only.
 There's no automated uninstaller. To back out by hand: delete `~/.claude/ccpraxis`, remove
 the PATH entry (Windows: User Environment Variables in System Properties; macOS/Linux:
 the appended shell rc line), remove the symlinks/junctions under `~/.claude/skills/`, and
-restore `~/.claude/CLAUDE.md`/`settings.json` from a backup. **Take that backup yourself
-before installing.** The installer shows you every change and waits for `--confirm`, but it
-does not copy your existing files aside first. Your vault repo is untouched either way.
+restore `~/.claude/CLAUDE.md`/`settings.json` from the backup the install took before it
+touched them: both are copied to `<file>.pre-ccpraxis.<timestamp>` in `~/.claude/`, and the
+paths are printed during the install. Your vault repo is untouched either way.
 
 ---
 
