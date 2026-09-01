@@ -602,7 +602,8 @@ ccpraxis/
 │   │           ├── 09-no-drive-root-strays.t                     # regression guard for the C:\c and C:\tmp leak.
 │   │           ├── 10-marketplace-preferences.t                  # a marketplace discrepancy with a permanent answer must not be asked twice.
 │   │           ├── 11-journal-append-only.t                      # the sync journal is append-only, and every way that could go wrong is pinned…
-│   │           └── 12-fresh-register-commits.t                   # a fresh registration's FIRST commit must actually store the files, and must…
+│   │           ├── 12-fresh-register-commits.t                   # a fresh registration's FIRST commit must actually store the files, and must…
+│   │           └── 13-install-config-backup.t                    # installing must not destroy a config the user already had.
 │   └── todo/                                                     # Personal todo notes synced to your private vault repo.
 │       ├── .claude-plugin/                                       # Plugin manifest directory
 │       │   └── plugin.json                                       # Plugin manifest -- name, description, version
@@ -619,6 +620,7 @@ ccpraxis/
 ├── scripts/                                                      # ccpraxis-wide utility scripts (shared across surfaces)
 │   ├── _install-bin-helper.pl                                    # Shared PATH/PATHEXT wiring (idempotent). Branches on $^O. Used by per-surface ccpraxis-install.pl hooks.
 │   ├── _perl-path.ps1                                            # single source of truth for locating perl from PowerShell.
+│   ├── backup-user-config.pl                                     # copy a user's pre-existing Claude Code config aside before ccpraxis installs…
 │   ├── gen-readme-tree.pl                                        # Generates the file-tree section of README.md from disk, using per-module metadata (.about > plugin.json > SKILL.md > script header). --check mode wires into /backup as a pre-flight; --bootstrap is a one-shot for adopting on an existing README.
 │   ├── hooks/                                                    # Host-side PreToolUse hooks installed via global-config/settings.json
 │   │   ├── block-nonascii-ps1.pl                                 # PreToolUse guard: refuse to write non-ASCII into a .ps1 file.
