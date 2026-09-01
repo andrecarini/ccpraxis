@@ -12,14 +12,14 @@ HOOK_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=lib.sh
 source "$HOOK_DIR/lib.sh"
 bp_hook_gate
-bp_hook_require_jq
+bp_hook_require_json_parser
 # shellcheck source=../scripts/bp-lib.sh
 # Sourced ONLY for bp_strip_shell_noise (t09 guard-hooks-stripping). Tolerant:
 # unreadable degrades the block below to raw matching, never to allow.
 [ -r "$HOOK_DIR/../scripts/bp-lib.sh" ] && source "$HOOK_DIR/../scripts/bp-lib.sh"
 
 bp_read_payload closed
-CMD=$(jq -r '.tool_input.command // empty' <<<"$PAYLOAD")
+CMD=$(bp_json_get "$PAYLOAD" tool_input.command)
 [ -n "$CMD" ] || exit 0
 
 # t09 (guard-hooks-stripping). THREAT MODEL: ACCIDENT, not ADVERSARY -- same

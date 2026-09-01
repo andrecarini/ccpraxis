@@ -17,7 +17,7 @@ HOOK_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=lib.sh
 source "$HOOK_DIR/lib.sh"
 bp_hook_gate
-bp_hook_require_jq
+bp_hook_require_json_parser
 
 # longest_glob_match REL PATTERNS
 #   PATTERNS: colon-separated, same dialect as lib.sh:match_any
@@ -56,9 +56,9 @@ longest_glob_match() {
 }
 
 bp_read_payload closed
-FP=$(jq -r '.tool_input.file_path // .tool_input.notebook_path // empty' <<<"$PAYLOAD")
+FP=$(bp_json_get "$PAYLOAD" tool_input.file_path tool_input.notebook_path)
 [ -n "$FP" ] || exit 0
-CWD=$(jq -r '.cwd // empty' <<<"$PAYLOAD"); CWD=${CWD:-$PWD}
+CWD=$(bp_json_get "$PAYLOAD" cwd); CWD=${CWD:-$PWD}
 
 case "$FP" in
   /*) ABS="$FP" ;;

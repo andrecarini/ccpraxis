@@ -70,8 +70,17 @@ unless ($HAVE_JQ) {
 use strict; use warnings; use JSON::PP;
 my @a = grep { $_ ne '-r' } @ARGV;
 my $filter = shift(@a) // '';
+# Accept bp_json_get's parenthesised form, "(.tool_input.command) // empty", as
+# well as the bare one. The hook now reads its payload through bp_json_get so it
+# works without jq at all, and that helper wraps the path in parens. Parens and
+# spacing are normalised away; anything that is not this ONE logical filter
+# still dies, which is the narrowness this shim exists for.
+my $norm = $filter;
+$norm =~ s/[()]//g;
+$norm =~ s/\s+/ /g;
+$norm =~ s/^ | $//g;
 die "jq shim: unsupported filter '$filter'\n"
-    unless $filter eq '.tool_input.command // empty';
+    unless $norm eq '.tool_input.command // empty';
 my $in = do { local $/; <STDIN> };
 my $j = eval { JSON::PP->new->decode($in) } or exit 0;
 my $v = eval { $j->{tool_input}{command} };
@@ -318,6 +327,47 @@ SKIP: {
         my ($rc, $out) = run_guard($cmd);
         is($rc, 0, "52d3 control: ALLOW -- $why") or diag("hook output: $out");
     }
+}
+
+# ---------------------------------------------------------------------------
+# THE GUARD MUST STILL ENFORCE WITH NO jq AT ALL.
+#
+# Bug report 20260901-133230-bcd8. This hook used to hard-require jq and read its
+# payload with a direct `jq` call, so on a host without jq it blocked every Bash
+# call instead of guarding anything -- and the jq check in bp-preflight.pl is
+# skipped on win32, so nothing said so. It now reads through bp_json_get, which
+# falls back to perl + JSON::PP.
+#
+# Everything above runs against a SHIM on PATH, so it exercises the jq branch.
+# That proves the shim still matches; it does not prove the fallback works, and
+# the fallback is what every jq-less host actually runs. So: scrub PATH of jq
+# entirely and assert the guard still DENIES.
+if ($HAVE_REAL_JQ) {
+    diag('bcd8 NOT RUN: this host has a real jq, which cannot be removed from PATH '
+       . 'without also removing the tools the harness needs. The case is meaningful '
+       . 'only where jq is genuinely absent, which is the platform it is about.');
+    ok(1, 'bcd8: skipped, real jq present (see diag)');
+}
+else {
+    # PATH minus the shim directory only. Emptying PATH outright also removes
+    # bash, which run_guard needs -- the first attempt did exactly that and the
+    # file died at "Can't exec bash" rather than testing anything.
+    my $sep = ($^O eq 'MSWin32') ? ';' : ':';
+    my $nojq = join $sep, grep { $_ ne $SHIM_DIR } split /\Q$sep\E/, $ENV{PATH};
+
+    my ($rc, $out) = run_guard('git reset --hard HEAD~1', PATH => $nojq);
+
+    is($rc, 2, 'bcd8: with NO jq on PATH, a prohibited command is still DENIED')
+        or diag("rc=$rc output: $out");
+    like($out, qr/BLOCKED:/, 'bcd8: it blocks for the right reason, not a missing-parser abort')
+        or diag("output: $out");
+
+    # Non-vacuity: the same scrubbed PATH must still ALLOW something harmless.
+    # Without this, a hook that blocked unconditionally -- the exact old bug --
+    # would satisfy the assertion above.
+    my ($rc2, $out2) = run_guard('git diff --stat', PATH => $nojq);
+    is($rc2, 0, 'bcd8 non-vacuity: read-only git is still ALLOWED with no jq')
+        or diag("rc=$rc2 output: $out2");
 }
 
 done_testing();

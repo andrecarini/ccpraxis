@@ -43,7 +43,7 @@ HOOK_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=lib.sh
 source "$HOOK_DIR/lib.sh"
 bp_hook_gate                        # inert outside a coordinator session, at zero cost
-bp_hook_require_jq                  # fail-CLOSED (lib.sh:15-21), as guard-writes.sh:20
+bp_hook_require_json_parser                  # fail-CLOSED (lib.sh:15-21), as guard-writes.sh:20
 
 # b19-ledger-timestamp-integrity: the last_updated: VALUE check (monotonicity +
 # future-skew) lives ONCE, in bp-ledger.pl (the b13 API), and this hook `require`s it
@@ -56,12 +56,12 @@ LEDGER_PL=$(realpath -m "$HOOK_DIR/../scripts/bp-ledger.pl" 2>/dev/null || print
 
 bp_read_payload closed
 
-FILE_PATH=$(jq -r '.tool_input.file_path // empty'     <<<"$PAYLOAD" 2>/dev/null)
-NB_PATH=$(jq   -r '.tool_input.notebook_path // empty' <<<"$PAYLOAD" 2>/dev/null)
+FILE_PATH=$(bp_json_get "$PAYLOAD" tool_input.file_path)
+NB_PATH=$(bp_json_get "$PAYLOAD" tool_input.notebook_path)
 FP=${FILE_PATH:-$NB_PATH}
 [ -n "$FP" ] || exit 0              # no path (incl. empty/unparseable payload) -> not a ledger write
 
-CWD=$(jq -r '.cwd // empty' <<<"$PAYLOAD" 2>/dev/null)
+CWD=$(bp_json_get "$PAYLOAD" cwd)
 [ -n "$CWD" ] || CWD=$PWD
 case "$FP" in /*) ABS="$FP" ;; *) ABS="$CWD/$FP" ;; esac
 ABS=$(realpath -m "$ABS" 2>/dev/null || printf '%s' "$ABS")
@@ -77,7 +77,7 @@ case "$ABS" in
   *) exit 0 ;;
 esac
 
-TOOL=$(jq -r '.tool_name // empty' <<<"$PAYLOAD" 2>/dev/null)
+TOOL=$(bp_json_get "$PAYLOAD" tool_name)
 
 # Belt-and-braces: a markdown ledger is not a notebook, so NotebookEdit could
 # only ever corrupt it. Cheap arm, no reconstruction.
@@ -86,7 +86,7 @@ if [ "$TOOL" = NotebookEdit ]; then
   exit 2
 fi
 
-# Fail-CLOSED on our own missing dependency, exactly as bp_hook_require_jq does.
+# Fail-CLOSED on our own missing dependency, exactly as bp_hook_require_json_parser does.
 if ! command -v perl >/dev/null 2>&1; then
   printf '%s\n' "LEDGER-GUARD: BLOCKED — perl is required to validate ledger writes but is missing; blocking to avoid unenforced operation. Install perl in the container." >&2
   exit 2
@@ -196,7 +196,7 @@ sub truthy { my ($v) = @_; return $v ? 1 : 0 }
 
 # --- b19: require the shared last_updated_check() from bp-ledger.pl --------
 # FAIL CLOSED if it cannot be loaded, matching this guard's existing discipline for a
-# missing perl/jq (bp_hook_require_jq, lib.sh) -- an unenforced guard is worse than a
+# missing perl/jq (bp_hook_require_json_parser, lib.sh) -- an unenforced guard is worse than a
 # blocked write. $LEDGER_PL is an ABSOLUTE path computed by the surrounding bash.
 # bp-ledger.pl and this embedded validator share the same (unnamed, so "main") Perl
 # package; a couple of its low-level byte helpers (is_str/as_bytes/count_occ/

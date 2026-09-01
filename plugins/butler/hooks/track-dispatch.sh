@@ -18,10 +18,10 @@ bp_hook_gate
 # launch — a phantom marker would survive into the warm resume and wedge the next
 # dispatch ("a write-capable worker is already in flight"). (Package A4.)
 [ -z "$(bp_active_stop_signal)" ] || exit 0
-bp_hook_require_jq
+bp_hook_require_json_parser
 
 bp_read_payload open
-TYPE=$(jq -r '.tool_input.subagent_type // empty' <<<"$PAYLOAD")
+TYPE=$(bp_json_get "$PAYLOAD" tool_input.subagent_type)
 [ -n "$TYPE" ] || exit 0
 
 MARKER=$(marker_path)

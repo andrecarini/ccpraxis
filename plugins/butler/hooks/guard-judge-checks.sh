@@ -19,10 +19,10 @@
 # conformance-judge carry no such instruction in their own Method sections).
 #
 # ORDER IS SAFETY-CRITICAL. BP_LEDGER, then BP_ROLE, and ONLY THEN
-# bp_hook_require_jq. jq does NOT exist on this Windows host — calling
-# bp_hook_require_jq before the role check would hard-fail-closed on every
+# bp_hook_require_json_parser. jq does NOT exist on this Windows host — calling
+# bp_hook_require_json_parser before the role check would hard-fail-closed on every
 # Bash call in every session on this host, including interactive ones,
-# whenever this hook happened to be registered. bp_hook_require_jq is safe
+# whenever this hook happened to be registered. bp_hook_require_json_parser is safe
 # to call ONLY once we already know we are inside a headless harvest-judge
 # process, where jq is guaranteed by bp_require_sandbox/the container image.
 set -u
@@ -34,14 +34,14 @@ source "$HOOK_DIR/lib.sh"
 [ "${BP_ROLE:-coordinator}" = "harvest-judge" ] || exit 0
 # shellcheck source=../scripts/bp-lib.sh
 # Sourced ONLY for bp_strip_shell_noise (t09 guard-hooks-stripping). Order
-# relative to bp_hook_require_jq below does not matter -- jq and this
+# relative to bp_hook_require_json_parser below does not matter -- jq and this
 # sourcing are independent -- but BOTH must stay after the BP_LEDGER/BP_ROLE
 # gate above (order there IS safety-critical, per the header).
 [ -r "$HOOK_DIR/../scripts/bp-lib.sh" ] && source "$HOOK_DIR/../scripts/bp-lib.sh"
-bp_hook_require_jq
+bp_hook_require_json_parser
 
 bp_read_payload open
-CMD=$(jq -r '.tool_input.command // empty' <<<"$PAYLOAD" 2>/dev/null)
+CMD=$(bp_json_get "$PAYLOAD" tool_input.command)
 [ -n "$CMD" ] || exit 0
 
 # t09 (guard-hooks-stripping). THREAT MODEL: ACCIDENT, not ADVERSARY -- same
