@@ -120,13 +120,25 @@ Only the steps that apply to what you touched:
    ```
    (`claude` is the host CLI; run it from Bash. It copies the plugin into `~/.claude/plugins/cache/` and records it, so the plugin persists across restarts. Enabling in `enabledPlugins` alone is not enough — without the install record a fresh session may not load it.) If you instead added a skill to an **existing** plugin, skip the install and just update that plugin's `plugin.json` description so it stays accurate.
 
-4. **README.** It's generated — never hand-edit the file tree. Run, in order:
+4. **Docs.** The file tree is generated and lives in **`docs/repo-layout.md`**, not the README — never hand-edit it. Run, in order:
    ```bash
    perl ~/.claude/ccpraxis/scripts/gen-readme-tree.pl --write
    perl ~/.claude/ccpraxis/scripts/gen-readme-tree.pl --check
    perl ~/.claude/ccpraxis/scripts/lint-readme-paths.pl
    ```
-   The tree comment comes from a `.about` sidecar if present, else `plugin.json`, else the SKILL.md `description` — so a good frontmatter description is usually enough; add a `<name>.about` one-liner only to override. If you changed hand-written prose (the intro bullets, Features, or host-only examples) to mention the new/renamed command, edit those by hand, then re-run `--check` + lint until clean.
+   The tree comment comes from a `.about` sidecar if present, else `plugin.json`, else the SKILL.md `description` — so a good frontmatter description is usually enough; add a `<name>.about` one-liner only to override.
+
+   Then place any prose by audience, because the split is the point:
+   - **`README.md`** — the front door. Only touch it if the change alters *what
+     ccpraxis is or why someone would want it*. A new slash command belongs in
+     its "What you actually type" table; a new capability worth choosing the
+     project for belongs in "What makes it different". Most changes need
+     neither. Keep it short — it was cut from 849 lines to ~257 on purpose.
+   - **`docs/reference.md`** — how the thing works. This is where mechanics,
+     contracts, and flows go.
+   - **`docs/install-protocol.md`** — only if the install procedure changed.
+
+   Re-run `--check` + lint until clean.
 
 5. **Live mirror.** Bare skills are mirrored to `~/.claude/skills/`; refresh after any create/edit/delete:
    ```bash

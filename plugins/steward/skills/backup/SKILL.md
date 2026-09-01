@@ -43,7 +43,9 @@ After this step, the repo is fully up to date with remote.
 
 ## Step 1.2: README drift pre-flight
 
-Before committing or pushing, make sure README.md still describes the repo as it actually is on disk. Two cheap linters catch the common drift cases — they exist precisely so we don't ship a README that references files we renamed or deleted.
+Before committing or pushing, make sure the docs still describe the repo as it actually is on disk. Two cheap linters catch the common drift cases — they exist precisely so we don't ship docs that reference files we renamed or deleted.
+
+Note the split: `README.md` is the front door (pitch, quick start, what you type), while the reference material lives in `docs/reference.md`, `docs/install-protocol.md`, and the generated `docs/repo-layout.md`.
 
 ```bash
 perl ~/.claude/ccpraxis/scripts/lint-readme-paths.pl
@@ -54,7 +56,7 @@ Handle each:
 
 - **`lint-readme-paths.pl`** — fails (exit 1) when an inline backticked path (e.g. ``` `scripts/foo.pl` ```) doesn't resolve on disk. Stdout names each missing path with its README line number. Surface them to the user and offer to fix: either correct the path in the README, or — if the backtick is an intentional non-host reference (container-internal etc.) — add the literal to `scripts/lint-readme-paths.allow`.
 
-- **`gen-readme-tree.pl --check`** — fails (exit 1) when the file-tree section between the `<!-- BEGIN-FILE-TREE -->` markers is stale. The fix is mechanical: run `perl ~/.claude/ccpraxis/scripts/gen-readme-tree.pl --write` to regenerate the tree, then re-read the README — newly-added entries appear with no description until you write a `.about` sidecar (or a plugin.json / SKILL.md / script-comment description) for them. Ask the user before running `--write` if there are entries to describe; if it's just structural (an existing entry moved), running `--write` directly is fine.
+- **`gen-readme-tree.pl --check`** — fails (exit 1) when the file-tree section between the `<!-- BEGIN-FILE-TREE -->` markers in **`docs/repo-layout.md`** is stale. (It reads and writes that file, not the README — the tree was moved out of the front page. The script's messages still say "README"; the file it means is `docs/repo-layout.md`.) The fix is mechanical: run `perl ~/.claude/ccpraxis/scripts/gen-readme-tree.pl --write` to regenerate the tree, then re-read that page — newly-added entries appear with no description until you write a `.about` sidecar (or a plugin.json / SKILL.md / script-comment description) for them. Ask the user before running `--write` if there are entries to describe; if it's just structural (an existing entry moved), running `--write` directly is fine.
 
 Don't auto-fix without confirmation — drift sometimes signals intent (e.g. the user moved a file but the description is still accurate, just needs a path update). When in doubt, surface and ask.
 
