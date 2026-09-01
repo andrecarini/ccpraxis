@@ -152,4 +152,52 @@ ok(-f "$proj/.ccpraxis-local-data/blueprints/bp1/blueprint.md", 'AC2: the local 
     ok(-f $victim, 'AC3: the file whose push rolled back still exists locally');
 }
 
+# ---------------------------------------------------------------------------
+# AC4 — THE SYNC'S OWN STAGING FILES ARE NOT CONTENT.
+#
+# Root cause of 20260901-025445-d667. The inventory walk enumerated
+# `*.vault-sync.tmp` as ordinary tracked files. An interrupted sync leaves those
+# behind, so the next sync staged them AGAIN as
+# `x.vault-sync.tmp.vault-sync.tmp`, adding 15 characters every run.
+#
+# Measured on the real clone: 4403 stray tmps locally and a staged vault path of
+# 259 characters, one below Windows' 260-char MAX_PATH. Past it the tmp cannot
+# be created, `-f $op->{tmp_path}` is false, and every push rolls back with
+# tmp_missing -- 8822 of 8822. That is what made a backup report success while
+# storing nothing.
+#
+# The compounding is what makes it dangerous: each failed sync makes the next
+# one worse.
+# ---------------------------------------------------------------------------
+{
+    my $stray = "$proj/.ccpraxis-local-data/bug-reports/leftover.md.vault-sync.tmp";
+    write_text($stray, "debris from an interrupted sync\n");
+
+    my $s5 = run_vs($home, 'sync-project', '--slug', 'proj');
+    is($s5->{json} && $s5->{json}{status}, 'synced', 'AC4: sync runs with stray staging files present')
+        or diag(substr($s5->{out}, 0, 300));
+
+    run_vs($home, 'commit-and-push', '--slug', 'proj', '--session-id', ($s5->{json}{session_id} // ''));
+
+    # ASSERT ON THE VAULT, NOT ON `applied`. The first version of this case
+    # grepped $s5->{json}{applied} for a tmp path -- but `applied` is a COUNT,
+    # not an op list, so the grep matched nothing whether or not the bug was
+    # present, and the case passed with the fix disabled. (The same mistake made
+    # AC2's delete_local check pass while a file was being deleted.) What the
+    # bug actually produces is observable on disk: the sync's own staging file
+    # committed into the vault as though it were content.
+    my $vf = run_vs($home, 'vault-files', '--slug', 'proj');
+    my @vpaths = map { ref $_ ? ($_->{path} // '') : $_ }
+                 @{ ($vf->{json} && $vf->{json}{files}) || [] };
+    my @tmp_in_vault = grep { /\Qvault-sync.tmp\E/ } @vpaths;
+    is(scalar @tmp_in_vault, 0,
+        'AC4: no staging file is stored in the vault as content')
+        or diag("in vault: " . join(', ', @tmp_in_vault[0 .. ($#tmp_in_vault > 4 ? 4 : $#tmp_in_vault)]));
+
+    # The real file beside it still synced, so AC4 is not passing by the sync
+    # having simply done nothing.
+    ok((grep { m{bug-reports/2026-a\.md} } @vpaths),
+        'AC4 non-vacuity: ordinary content in the same directory still reached the vault');
+}
+
 done_testing();
