@@ -463,7 +463,17 @@ sub STAGE_IDS {
     # sandbox, the operator chose an option and then watched a dead menu for
     # 20+ seconds (bug report 20260829-194441-fd0a). The work was never the
     # problem; its invisibility was.
-    return [ 'preflight', 'select', 'image', 'prepare', 'create', 'backpack', 'start', 'install', 'dashboard' ];
+    #
+    # THE ORDER HERE IS THE ORDER THE LAUNCHER RUNS THEM IN, and it is checked
+    # mechanically (t/37 AC5) rather than trusted. It read
+    # 'preflight, select, image, ...' until 2026-09-04, but launcher.pl builds
+    # the image (:2379) BEFORE it opens the skills picker (:2630) -- so the
+    # operator watched 'skills, plugins and MCP' sit pending while the row
+    # below it built and went green. Nothing was wrong except the row order,
+    # which is the kind of wrong that makes someone doubt the parts that are
+    # right. t/68's AC-G4 pinned the declared order as if it were the real one,
+    # so the test agreed with the bug; it now pins execution order.
+    return [ 'preflight', 'image', 'select', 'prepare', 'create', 'backpack', 'start', 'install', 'dashboard' ];
 }
 
 sub STAGE_STATES { return [ 'pending', 'active', 'ok', 'skipped', 'failed' ] }
@@ -473,7 +483,15 @@ sub STAGE_LABEL {
     my %label = (
         preflight => 'preflight checks',
         select    => 'skills, plugins and MCP',
-        image     => 'image build',
+        # 'base image build', not 'image build'. The operator asked whether
+        # 'image build  skipped' meant their Rebuild had been ignored, or
+        # whether they were "confusing things on image build vs container
+        # create" -- and both readings were available from the row alone. This
+        # stage is the SHARED claude-sandbox:latest image, built once and reused
+        # by every project; 'container create' below it is this project's own
+        # container. Skipping the first while doing the second is the normal
+        # case, and the word 'base' is what says so.
+        image     => 'base image build',
         prepare   => 'host files and mounts',
         create    => 'container create',
         backpack  => 'backpack approval',
