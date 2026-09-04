@@ -468,8 +468,15 @@ sub host_ops {
     # AC-G4 (behaviour 11) -- pairwise ordering ONLY (Decision 15: no length
     # pin, no is_deeply over the whole list).
     my %pos; $pos{ $ids[$_] } = $_ for 0 .. $#ids;
+    # 2026-09-04: this list said ['select','image'], which is the order the ids
+    # were DECLARED in, not the order launcher.pl runs them (image :2379 comes
+    # before the skills picker :2630). The pair was copied from the declaration,
+    # so the test confirmed the declaration against itself and the display bug
+    # survived a green suite. t/37 AC5 now derives the expected order from the
+    # launcher source instead, which is the only thing that can catch a drift
+    # like this; this pair is kept as a cheap, readable pin of the same fact.
     my @pairs = (['image','create'], ['create','start'], ['start','dashboard'],
-                 ['preflight','select'], ['select','image'], ['create','backpack'],
+                 ['preflight','image'], ['image','select'], ['create','backpack'],
                  ['backpack','start'], ['start','install'], ['install','dashboard']);
     for my $p (@pairs) {
         my ($a, $b) = @$p;

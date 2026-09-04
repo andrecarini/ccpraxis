@@ -2958,7 +2958,19 @@ if (@STALE_REASONS) {
             my $build_lock = "$CLAUDE_HOST_CONFIG/ccpraxis/.locks/image-build";
             File::Path::make_path(dirname($build_lock));
             SandboxLock::acquire($build_lock, timeout => 600, windows => $WINDOWS_FAMILY);
+            # Re-open the image stage. It was ended 'skipped' at :2384 -- the
+            # image existed, so the presence check was right at the time -- but
+            # the operator has since chosen Rebuild, and this call rebuilds it
+            # for real. Without these two markers the longest operation of the
+            # whole launch ran under a row reading 'image build  skipped', which
+            # is not a stale label but an actively false one. Reported
+            # 2026-09-04: "many times I get image build - skipped even though it
+            # wasn't skipped and I manually chose the option to rebuild".
+            # stage_begin on an already-ended stage is defined behaviour: it
+            # sets state back to 'active' and re-stamps {started}.
+            _launch_stage_begin('image');
             build_image();
+            _launch_stage_end('image', 'ok');
             SandboxLock::release($build_lock);
         }
         # Refresh per-project container blueprint copies from upstream
@@ -5082,6 +5094,30 @@ if ($start_rc != 0 && $port_in_use->($start_rc)) {
             reset_terminal();
             exit ($start_rc >> 8 || 1);   # never exit 0 on a failed/ signal-killed start
         }
+        # RECOVERED. Both of these are the start seam's (:4996) obligations,
+        # and this retry loop reaches `podman start` without going through it,
+        # so it has to discharge them itself.
+        #
+        # The stage: the seam marked 'start' failed on the collision rc, which
+        # was true of that attempt and false of the launch. Nothing downstream
+        # ever cleared it, so a launch that recovered and went on to succeed
+        # left a red 'x container start  failed' row on screen for the rest of
+        # its life -- reported 2026-09-04 as "why did it say that it failed to
+        # launch? It was still doing everything and ... has started without
+        # issues". A port collision is the one start failure this launcher is
+        # built to recover from; the display was the only thing that had not
+        # been told.
+        #
+        # The heartbeat: also armed only inside the seam. Un-armed,
+        # _launch_heartbeat_tick (:1329) returns 0 forever and the launcher
+        # stops touching /tmp/.launcher-alive, which is the sentinel the
+        # container's entrypoint reaps itself over. That one never surfaced as
+        # a visible bug, and it is worth being explicit about why: the
+        # unconditional touch below (:5115) and the backpack install's own
+        # in-exec refresher happen to cover the window. It was a latent hazard
+        # resting on a coincidence, not a live failure.
+        _launch_stage_end('start', 'ok');
+        _launch_heartbeat_arm();
     } else {
         # Existing container: its -p mapping was baked at create and cannot
         # be re-published by `podman start`. Do NOT force-recreate.
