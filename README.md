@@ -24,6 +24,7 @@ Each project gets its own container, with its own toolchain, dependencies and co
   - [Your setup, synced across machines](#your-setup-synced-across-machines)
   - [A statusline worth the two lines it costs](#a-statusline-worth-the-two-lines-it-costs)
   - [Choosing when Claude Code updates](#choosing-when-claude-code-updates)
+  - [No dependency tree of its own](#no-dependency-tree-of-its-own)
 - [On your machine](#on-your-machine)
 - [See it](#see-it)
 - [Quick start](#quick-start)
@@ -73,6 +74,8 @@ It is also usage-aware, which matters more than it sounds. Rather than driving u
 
 `/butler:drive-solo` runs the same execution one package at a time in your own session, on the host or in the sandbox, when you would rather watch.
 
+Not every long task earns a blueprint. When a session is filling up mid-task, `/carry-over` writes the handover for the next one: what the work is, what has been decided and why, which claims are verified and which are assumed, and what to do first. Where something is genuinely unresolved, it asks you. It arrives as a plan, so accepting it clears the context and opens the fresh session already holding that prompt. A `/compact` summarises what happened; this is written to be acted on.
+
 ### Finishing without being watched
 
 Arm a session with `/butler:continuity on` and a hook blocks a turn from ending unless something is scheduled to resume the work or you've explicitly disarmed it; reporting a plan without doing the work does not satisfy it. It is a persistent nag rather than an absolute gate: it yields after three consecutive blocks, and you can override it for a single turn with a marker file or for a whole session with an environment variable.
@@ -101,7 +104,9 @@ This is a fixed list of known failures, not a mechanism for enforcing rules you 
 
 Most of what accumulates around a project should not ship with it. Blueprints, todos, session notes and project-specific instructions are yours, not the codebase's, and committing them to a repo other people pull is the wrong answer. They go to a **vault** instead: a private git repository you create and control, synced with three-way merge and a pre-push secret scan, which never deletes a local file it has never held.
 
-`/todo:create` writes a note without derailing what you are doing, and `/todo:resume` picks one back up later. They ride along in the vault, so the note you left on one machine is there on the next.
+`/todo:create` writes a note without derailing what you are doing, and `/todo:resume` picks one back up later. They ride along in the vault, so the note you left on one machine is there on the next. `/steward:setup-project` is what enrols a project: it finds the Claude files worth keeping, proposes a name, and either registers them fresh or links the project back to a slug an earlier machine already pushed, which is how a clone on new hardware gets its notes back.
+
+Two more of steward's commands are worth knowing about. `/steward:usage-audit` reads every transcript on the machine — the host plus each project's sandbox home, nested subagent transcripts included — separates what you spent talking to Claude from what unattended runs spent on your behalf, and prices the total against Anthropic's list rates and several cheaper providers. If a week disappeared, that report says where. And `/steward:ccpraxis-extend` is the single door for changing ccpraxis itself: it works out whether you're asking for something new or a change to something that exists, does the work, and then wires it in — the plugin registration, the settings entry, the skill link. That wiring is the part that's easy to skip by hand, and skipping it leaves a skill sitting on disk that nothing ever loads.
 
 ### A statusline worth the two lines it costs
 
@@ -117,17 +122,23 @@ Reading across: this session is on the **host** rather than in a sandbox, in the
 
 The usage figures are the ones that change behaviour. Knowing you are at 34% with three hours to reset is the difference between starting a long run and regretting it.
 
-It collapses to a single row when the terminal is wide enough, drops fields by priority as it narrows, and never lets a truncation cost you the context readout. Perl core modules only, so it adds no dependency and no startup cost worth measuring.
+It collapses to a single row when the terminal is wide enough, drops fields by priority as it narrows, and never lets a truncation cost you the context readout.
 
 ### Choosing when Claude Code updates
 
 Claude Code ships often, sometimes several times a day, and an update that breaks your setup arrives on its schedule rather than yours. `/steward:update` puts that back under your control: it reads the changelog for every version newer than yours, weighs release age, checks community issues for the versions in range, and presents the risk before you pick one. It snapshots the current binary first, so an update that goes wrong is one command to undo.
 
+### No dependency tree of its own
+
+All of it is Perl — installer, launcher, orchestrator, statusline, sync logic, the tests — and only modules that ship with the interpreter. No CPAN, no npm, no pip, no build step, no lockfile. Perl is already on macOS and Linux, and Git for Windows carries its own, so on most machines the clone is the install.
+
+That is partly portability and partly the whole argument. Something whose job is to keep other people's package code off your machine should not start by running some of it.
+
 ---
 
 ## On your machine
 
-Installing clones this repo to `~/.claude/ccpraxis`, symlinks (junctions on Windows) every skill into `~/.claude/skills/`, creates or merges `~/.claude/CLAUDE.md` and `~/.claude/settings.json`, installs the plugins listed there, and puts `claude-sandbox` on your PATH: on Windows via the User-scope `PATH`/`PATHEXT` registry values (no admin needed), on macOS/Linux by appending one line to your shell rc. If given a vault URL it also clones that repo to `~/.claude/claude-code-vault/`. It prints a plan of every change first and only touches your system once you re-run it with `--confirm`; nothing needs npm, pip, or any other dev tooling on your machine, the installer is Perl only.
+Installing clones this repo to `~/.claude/ccpraxis`, symlinks (junctions on Windows) every skill into `~/.claude/skills/`, creates or merges `~/.claude/CLAUDE.md` and `~/.claude/settings.json`, installs the plugins listed there, and puts `claude-sandbox` on your PATH: on Windows via the User-scope `PATH`/`PATHEXT` registry values (no admin needed), on macOS/Linux by appending one line to your shell rc. If given a vault URL it also clones that repo to `~/.claude/claude-code-vault/`. It prints a plan of every change first and only touches your system once you re-run it with `--confirm`.
 
 There's no automated uninstaller. To back out by hand: delete `~/.claude/ccpraxis`, remove the PATH entry (Windows: User Environment Variables in System Properties; macOS/Linux: the appended shell rc line), remove the symlinks/junctions under `~/.claude/skills/`, and restore `~/.claude/CLAUDE.md`/`settings.json` from the backup the install took before it touched them: both are copied to `<file>.pre-ccpraxis.<timestamp>` in `~/.claude/`, and the paths are printed during the install. Your vault repo is untouched either way.
 
@@ -196,15 +207,18 @@ plan described above), then restart Claude Code.
 | `/butler:dispatch-fleet` | Execute a blueprint with detached sessions per package (sandbox only) |
 | `/butler:drive-solo` | Execute one interactively, on the host or in the sandbox |
 | `/butler:continuity on` | Refuse to end a turn with work outstanding |
+| `/carry-over` | Hand this session's work to a fresh one |
 | `/backpack:add` | Record a tool so container rebuilds restore it |
+| `/steward:usage-audit` | Price what you actually consumed, here and in every sandbox |
+| `/steward:ccpraxis-extend` | Add to or change ccpraxis, wired in properly |
 
-The rest, including `/todo`, `/almanac`, and `/steward:ccpraxis-extend`, are listed with every other surface in [`docs/reference.md`](docs/reference.md).
+The rest, including `/todo` and `/almanac`, are listed with every other surface in [`docs/reference.md`](docs/reference.md).
 
 ---
 
 ## Layout and documentation
 
-Plugins live under `plugins/<name>/` (`sandbox`, `backpack`, `blueprint`, `butler`, `steward`, `todo`, `almanac`); skills under `skills/`; the `CLAUDE.md` and `settings.json` this installs to `~/.claude/` under `global-config/`. Everything here is Perl, deliberately: it ships with macOS, Linux, and Git for Windows, so a fresh `git clone` runs the whole system without installing a runtime on your host.
+Plugins live under `plugins/<name>/` (`sandbox`, `backpack`, `blueprint`, `butler`, `steward`, `todo`, `almanac`); skills under `skills/`; the `CLAUDE.md` and `settings.json` this installs to `~/.claude/` under `global-config/`.
 
 | Page | For |
 |---|---|
@@ -267,3 +281,5 @@ Two things that are easy to get wrong:
 **A merge can bring new surfaces with it.** New skills need linking into `~/.claude/skills/`, new plugins need installing, and settings may have gained keys. Run `perl ~/.claude/ccpraxis/install.pl` to see what a merge changed, re-run it with `--confirm` to apply, then `/steward:backup` to resync config and relink skills. A merge alone leaves new skills present on disk and invisible to Claude.
 
 If you have customised heavily, expect conflicts in `global-config/` and `.claude/settings.json` — those are the files both sides edit.
+
+Once your fork has diverged, `/steward:audit` is the health check before you rely on it: read-only agents go over each plugin for defects and for what an attacker could do with it, check the seams between them, walk the install as a first-time user, and run the test suite. The findings land in a dated report under `.ccpraxis-local-data/audits/`.
