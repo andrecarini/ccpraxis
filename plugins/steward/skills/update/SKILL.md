@@ -15,6 +15,12 @@ This division is deliberate. The prose version of this skill made the agent hand
 ## Step 1: Research
 
 ```bash
+ccpraxis research gather
+```
+
+`ccpraxis` is the dispatcher shim (`plugins/steward/bin/`), on PATH via the plugin's install hook. If it isn't found — a fresh clone that hasn't been installed, or a shell opened before the PATH change took effect — fall back to the full path, which is what the shim wraps:
+
+```bash
 perl ~/.claude/ccpraxis/plugins/steward/scripts/update-research.pl gather
 ```
 
@@ -55,7 +61,7 @@ State the recommendation and its `why`. If `recommendation.version` is null, say
 Whatever they choose, including staying put:
 
 ```bash
-perl ~/.claude/ccpraxis/plugins/steward/scripts/update-research.pl record-decision \
+ccpraxis research record-decision \
   --from "<current>" --to "<chosen-or-current>" \
   --action <installed|declined|deferred> --reason "<why, in one line>"
 ```
@@ -75,9 +81,9 @@ Both, in this order, before touching anything.
 **6b.** Snapshot the live binary:
 
 ```bash
-perl ~/.claude/ccpraxis/plugins/steward/scripts/claude-binary-backup.pl snapshot \
+ccpraxis binary snapshot \
   --reason "pre-install of v<SELECTED>" --mark pre-install
-perl ~/.claude/ccpraxis/plugins/steward/scripts/claude-binary-backup.pl prune --keep 4
+ccpraxis binary prune --keep 4
 ```
 
 **Check the exit code.** Non-zero means STOP — do not run the installer. Without a snapshot a botched install has no revert path, and that has happened on real installs. Surface the returned `snapshot.id` to the user.
@@ -97,9 +103,9 @@ Detect the install method first: a binary at `~/.local/bin/claude` is a native i
 
 Run `claude --version`. If it succeeds and matches the selection, say so and mention the snapshot id.
 
-If it fails — non-zero exit, no output, crash, hang, panic — or reports a different version, the install is broken. Surface the exact error, list snapshots (`claude-binary-backup.pl list`), and offer via `AskUserQuestion`:
+If it fails — non-zero exit, no output, crash, hang, panic — or reports a different version, the install is broken. Surface the exact error, list snapshots (`ccpraxis binary list`), and offer via `AskUserQuestion`:
 
-- **Revert to the pre-install snapshot (Recommended)** → `claude-binary-backup.pl restore --latest`, then verify `claude --version` works again.
+- **Revert to the pre-install snapshot (Recommended)** → `ccpraxis binary restore --latest`, then verify `claude --version` works again.
 - **Leave it in place** → do nothing.
 
 Either way, tell the user to restart Claude Code.
@@ -107,11 +113,11 @@ Either way, tell the user to restart Claude Code.
 ## Maintenance
 
 ```bash
-update-research.pl status                 # what's cached, how stale, where it lives
-update-research.pl history --limit 20     # past decisions
-update-research.pl gather --offline       # full analysis from cache, no network
-update-research.pl gather --force         # ignore TTLs and conditional GETs
-update-research.pl prune                  # dry run; --apply to delete
+ccpraxis research status                 # what's cached, how stale, where it lives
+ccpraxis research history --limit 20     # past decisions
+ccpraxis research gather --offline       # full analysis from cache, no network
+ccpraxis research gather --force         # ignore TTLs and conditional GETs
+ccpraxis research prune                  # dry run; --apply to delete
 ```
 
 `prune` clears artifacts from a retired approach that cached a 3.6 MB rendered page per run and never removed one — 38 MB of it was still present when this was written.
@@ -119,9 +125,9 @@ update-research.pl prune                  # dry run; --apply to delete
 ## Manual revert, any time
 
 ```bash
-perl ~/.claude/ccpraxis/plugins/steward/scripts/claude-binary-backup.pl list
-perl ~/.claude/ccpraxis/plugins/steward/scripts/claude-binary-backup.pl restore --latest
-perl ~/.claude/ccpraxis/plugins/steward/scripts/claude-binary-backup.pl restore --snapshot <id>
+ccpraxis binary list
+ccpraxis binary restore --latest
+ccpraxis binary restore --snapshot <id>
 ```
 
 Snapshots live in `~/.claude/backups/claude-code/`; the newest 4 are kept, and a fresh "pre-restore" snapshot is taken before any restore, so restores are themselves reversible.
