@@ -158,6 +158,18 @@ sub aref { my ($x) = @_; return ref $x eq 'ARRAY' ? $x : []; }
 sub href { my ($x) = @_; return ref $x eq 'HASH'  ? $x : {}; }
 sub bstr { my ($x) = @_; return defined $x && !ref $x ? $x : ''; }
 
+# scalar_layout_width($s) -- measure with the SAME helper the renderer pads
+# with. Using length() here instead would agree on today's ASCII labels and
+# then disagree, silently, the first time a label or glyph is not ASCII --
+# which is precisely the case the padding has to survive. tui::Layout is
+# already loaded as a dependency of tui::LaunchScreens.
+sub scalar_layout_width {
+    my ($s) = @_;
+    return 0 unless defined $s && length $s;
+    my $w = eval { tui::Layout::display_width($s) };
+    return defined $w ? $w : length $s;
+}
+
 # num($x) -> $x when it is a number, else -1. A missing implementation
 # returns undef; coercing to -1 keeps every numeric comparison FAILING (which
 # is correct today) instead of drowning the run in uninitialized warnings.
@@ -504,6 +516,73 @@ sub host_ops {
     for my $s (qw(pending active ok skipped failed)) {
         ok($sv{$s}, "AC-G6 STAGE_STATES() contains '$s'");
     }
+
+    # -----------------------------------------------------------------------
+    # AC-G7 -- THE STATE COLUMN IS A COLUMN.
+    #
+    # The rows used to be glyph . ' ' . label . '  ' . state with no padding,
+    # so the state started at a different offset on every row. The state is the
+    # only part of this panel that changes during a launch, which makes it
+    # exactly the part that wants to be readable straight down. Reported
+    # 2026-09-04 ("This is not aligned ... Is it aligned during the actual
+    # display runtime?" -- it was not).
+    #
+    # Asserted on the RENDERED rows, not on the padding arithmetic, because the
+    # arithmetic being right is not the claim; the claim is that the columns
+    # line up on screen.
+    # -----------------------------------------------------------------------
+    my $model = scalar_ls('stages_init', undef);
+    my @m = @{ aref($model) };
+    my @vocab = qw(ok active pending skipped failed);
+    # Give every row a DIFFERENT state, so a renderer that accidentally aligned
+    # by emitting a constant-width state cannot pass this.
+    for my $i (0 .. $#m) {
+        next unless ref $m[$i] eq 'HASH';
+        $m[$i]{state} = $vocab[ $i % scalar @vocab ];
+    }
+
+    my $screen = scalar_ls('progress_screen',
+        { stages => $model, seams => { title => 't68' } }, 100, 40);
+    my ($panel) = grep { ref $_ eq 'HASH' && bstr($_->{title}) eq 'stages' }
+                  @{ aref(href($screen)->{panels}) };
+
+    my @offsets;
+    for my $row (@{ aref(href($panel)->{lines}) }) {
+        next unless ref $row eq 'ARRAY';
+        # The state segment is the last one; everything before it is the
+        # prefix whose width decides where the state lands.
+        my @seg = map { ref $_ eq 'HASH' ? bstr($_->{text}) : '' } @$row;
+        next unless @seg >= 2;
+        my $prefix = join '', @seg[0 .. $#seg - 1];
+        push @offsets, scalar_layout_width($prefix);
+    }
+
+    cmp_ok(scalar @offsets, '>=', 5,
+        'AC-G7 liveness: the stages panel rendered rows to measure')
+        or diag('  no rows came back; every offset check below would be vacuous');
+
+    my %distinct = map { $_ => 1 } @offsets;
+    is(scalar keys %distinct, (@offsets ? 1 : 0),
+        'AC-G7 every stage row puts its state at the same column')
+        or diag('  offsets seen: ' . join(', ', @offsets)
+              . "\n  a ragged state column is what the padding exists to prevent");
+
+    # -----------------------------------------------------------------------
+    # AC-G8 -- and that alignment is only real because the glyphs agree.
+    #
+    # The glyph precedes the label, so a glyph one column wider than the others
+    # shifts its whole row and no amount of label padding recovers it. This is
+    # the assumption the padding rests on, pinned so a future glyph swap fails
+    # here rather than surfacing as a subtly crooked panel.
+    # -----------------------------------------------------------------------
+    my %gw;
+    for my $st (qw(pending active ok skipped failed)) {
+        my $g = bstr(scalar_ls('_stage_glyph', $st));
+        $gw{ scalar_layout_width($g) } = 1 if length $g;
+    }
+    is(scalar keys %gw, 1,
+        'AC-G8 every stage glyph is the same display width (the padding assumes it)')
+        or diag('  widths seen: ' . join(', ', sort keys %gw));
 }
 
 # ===========================================================================

@@ -3028,9 +3028,17 @@ _launch_stage_begin('prepare');
 sub prompt_stale_action {
     my ($reasons_ref, $host_version) = @_;
     my @reasons = @$reasons_ref;
+    # SAY THAT REBUILD DOES BOTH. This read "Rebuild — fresh container with
+    # Claude Code v$host_version", which advertises a CONTAINER rebuild and
+    # then also force-builds the base image at :2961. An operator who chose it
+    # and then read "base image build  skipped" on the stages panel had been
+    # told, by the option's own wording, to expect only the container -- and
+    # asked whether they were "confusing things on image build vs container
+    # create". They were not; three separate things pointed the same wrong way,
+    # and this was one of them.
     my @options = (
-        ['rebuild',  "Rebuild — fresh container with Claude Code v$host_version"],
-        ['continue', "Continue as-is"],
+        ['rebuild',  "Rebuild — base image and container, on Claude Code v$host_version"],
+        ['continue', "Continue as-is — rebuild nothing"],
     );
 
     # Path 1: render as a screen. Gated on {active}, not just $LAUNCH_MODE, for

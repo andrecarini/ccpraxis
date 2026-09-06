@@ -655,6 +655,30 @@ sub progress_screen {
     }
 
     my @stages = (ref $host->{stages} eq 'ARRAY') ? @{ $host->{stages} } : ();
+
+    # PAD THE LABEL COLUMN so the states form one. This used to emit
+    # label . '  ' . state with no padding, which put the state at a different
+    # column on every row -- 'dashboard  pending' and
+    # 'skills, plugins and MCP  ok' share nothing to read down. The states are
+    # the only part of this panel that changes, so they are exactly what wants
+    # to be scannable in a vertical line.
+    #
+    # Measured, not assumed: this alignment is only real if every glyph is the
+    # same width, since the glyph precedes the label. All five
+    # (status.idle/ok/crit, cursor, sep.dot) measure display_width 1 -- they are
+    # U+25CB, U+25CF, U+00D7, U+25B6, U+00B7, none of them the double-width
+    # CJK-range characters that would silently shift a row by a column.
+    # t/68 pins that property so a future glyph swap cannot quietly break this.
+    #
+    # display_width, not length: labels are ASCII today and length would agree,
+    # but the padding must stay correct for whatever a label becomes.
+    my $label_w = 0;
+    for my $s (@stages) {
+        next unless ref $s eq 'HASH';
+        my $w = tui::Layout::display_width(_str($s->{label}));
+        $label_w = $w if $w > $label_w;
+    }
+
     my @stage_rows;
     for my $s (@stages) {
         next unless ref $s eq 'HASH';
@@ -662,10 +686,13 @@ sub progress_screen {
         $state = 'pending' unless length $state;
         my $role  = _stage_role($state);
         my $glyph = _stage_glyph($state);
+        my $label = _str($s->{label});
+        my $pad   = $label_w - tui::Layout::display_width($label);
+        $pad = 0 if $pad < 0;
         push @stage_rows, [
-            { text => $glyph . ' ',        role => $role },
-            { text => _str($s->{label}),   role => 'text.primary' },
-            { text => '  ' . $state,       role => $role },
+            { text => $glyph . ' ',              role => $role },
+            { text => $label . (' ' x $pad),     role => 'text.primary' },
+            { text => '  ' . $state,             role => $role },
         ];
     }
 
