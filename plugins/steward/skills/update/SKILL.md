@@ -3,212 +3,129 @@ name: update
 description: Safely updates Claude Code by researching releases before installing. Checks changelog, release age, and community issues, then offers version choices. Use when the user wants to update Claude Code, check for new versions, or says "update", "upgrade", "new version".
 user-invocable: true
 host-only: true
-allowed-tools: Bash, Read, WebFetch, WebSearch, AskUserQuestion, Skill
+allowed-tools: Bash, Read, AskUserQuestion, Skill
 ---
 
-Research the latest Claude Code releases, assess their risk, snapshot the current binary as a safety net, and let the user choose which version to install. If the install breaks the binary, the user can revert in one command.
+# /steward:update
 
-## Step 1: Get current version
+The research is done by `update-research.pl`, which fetches, merges, caches and classifies. Your job is to present its findings, get a decision, record it, and run the install. **Do not re-derive anything it already computes** — no WebFetch of the changelog, no hand-counting versions, no hand-computing ages.
 
-```bash
-claude --version
-```
+This division is deliberate. The prose version of this skill made the agent hand-fan eight WebFetches per run, and on 2026-09-06 it was measurably wrong three ways at once: it read the Releases API through a prose summarizer that returned 5 of 100 releases, its version-string issue query matched every issue filed that day, and it re-derived everything on every invocation so declining an update cost as much as taking one.
 
-Parse the version number (e.g. `2.1.91` from `2.1.91 (Claude Code)`).
-
-## Step 2: Detect install method
+## Step 1: Research
 
 ```bash
-which claude 2>/dev/null || where claude 2>/dev/null
-uname -s 2>/dev/null || echo "Windows"
+perl ~/.claude/ccpraxis/plugins/steward/scripts/update-research.pl gather
 ```
 
-Classify based on binary location and OS:
-- Binary at `~/.local/bin/claude` or `~/.local/bin/claude.exe` → **native install**
-- Binary in a path containing `node_modules` → **npm**
-- Binary under a Homebrew prefix (e.g. `/opt/homebrew/`, `/usr/local/Cellar/`) → **brew**
-- Otherwise → **unknown**
+Add `--current <version>` only if `claude --version` can't be read. Cold run ≈9s; warm run ≈1s, because release dates and changelog text are immutable and cached forever, and only open issues expire (12h).
 
-Combine with OS: `windows-native`, `macos-native`, `linux-native`, `npm`, `brew`, `unknown`.
+Parse the JSON:
 
-**If method is NOT `windows-native`:** explain what was detected (install method, OS, binary path) and invoke `/steward:ccpraxis-extend` to extend this skill with update logic for that method:
+| Field | What to do with it |
+|---|---|
+| `current_version`, `latest_version`, `versions_behind` | The headline |
+| `candidates[]` | One row per version, newest first. Each has `version`, `published_at`, `date_source`, `age_days`, `risk`, `risk_reasons[]`, `bullet_count`, `bullets[]`, `issues[]` |
+| `runtime_clusters[]` | Active bundled-runtime crash clusters: `runtime`, `reports`, `from_version` |
+| `recommendation` | `{version, why}`. `version` is null when nothing qualifies — say so plainly rather than picking the least-bad |
+| `decisions[]` | What was chosen before, newest first |
+| `warnings[]`, `coverage_ok`, `source_disagreements[]` | Surface all of these; do not silently drop one |
+| `network` | Which sources were fetched vs served from cache. Worth one line so the user knows what it cost |
 
-```
-/steward:ccpraxis-extend Change the steward:update skill: add an update code path for <detected-method> on <OS>. Binary is at <path>. The skill currently only handles windows-native. Add a conditional branch for this method. For reference — macOS/Linux native: `curl -fsSL https://claude.ai/install.sh | bash -s <VERSION>`, npm: `npm install -g @anthropic-ai/claude-code@<VERSION>`, brew: no version pinning. Test the new code path before finishing.
-```
+Risk bands, worst-first: `RUNTIME_RISK`, `HIGH`, `NO_CHANGELOG`/`UNKNOWN`, `MEDIUM`, `LOW`. They already account for age, open issues blaming the version, reaction counts, and cluster membership — do not recompute or second-guess them.
 
-Then exit — do not continue with the steps below.
+## Step 2: Check the decision history first
 
-## Step 3: Get changelog and available versions
+If `decisions[]` shows a version previously `declined`, look at why. If the issues named in that reason are no longer in that version's `issues[]`, say so — that is a version worth re-offering, and it is the whole reason the log exists. Don't silently re-present a version the user already rejected as though it were new.
 
-The local cache at `~/.claude/cache/changelog.md` only covers the installed version and older. Fetch the official changelog for newer versions:
+## Step 3: Present
 
-```
-WebFetch https://code.claude.com/docs/en/changelog
-```
+A table, one row per version, newest first: version, released, age, risk, and a compact summary of the changes. Use `bullet_count` to say how large each entry is; reproduce `bullets` in full only for versions the user is actually weighing, or when asked. A 100-bullet changelog pasted into chat helps nobody.
 
-Parse version headers (e.g. `## 2.1.92`) and their changelogs. Build a list of versions newer than the current one, sorted newest first.
+**Filter crash reports by platform.** Each issue carries `platforms[]`. A Linux-only glibc segfault cluster is not a reason for a Windows user to stay put, and presenting it as one is the single most misleading thing the old flow did. Say which platform each cluster affects.
 
-If the current version is already the latest, tell the user "You're up to date on vX.Y.Z" and exit.
+State the recommendation and its `why`. If `recommendation.version` is null, say that staying put is the sound choice and why.
 
-## Step 4: Get publish dates from GitHub releases and cross-reference with changelog
+## Step 4: Ask
 
-```
-WebFetch https://api.github.com/repos/anthropics/claude-code/releases?per_page=20
-```
+`AskUserQuestion` with the recommended version first (labelled "Recommended"), then a small number of genuine alternatives drawn from `candidates`, then "Stay on `<current>`". Never offer a `RUNTIME_RISK` version as the recommendation; you may still list it, labelled, since the choice is the user's.
 
-Match releases by tag name (e.g. `v2.1.92`) to get `published_at` timestamps.
+## Step 5: Record the decision — always
 
-Cross-reference: identify any GitHub releases that do **not** have a corresponding changelog entry. These are "undocumented" versions — flag them in the report (Step 7) and factor into recommendations.
-
-## Step 5: Calculate release age and risk
-
-For each version newer than current, compute age from `published_at`:
-
-| Age | Risk | Label |
-|-----|------|-------|
-| < 48 hours | **HIGH** | "Very new — not enough community feedback yet" |
-| 48h – 7 days | **MEDIUM** | "Recent — some feedback may exist" |
-| > 7 days | **LOW** | "Established release" |
-
-## Step 6: Check GitHub issues for problems
-
-**Searching only for the version string is not enough** — runtime/Bun crashes often aren't tagged with the version number. You MUST run BOTH kinds of searches, in parallel:
-
-**6a. Version-string search** (catches version-specific reports):
-
-```
-WebFetch https://api.github.com/search/issues?q=repo:anthropics/claude-code+<latest-version>+state:open&sort=reactions&order=desc&per_page=10
-```
-
-**6b. Symptom searches** (catches the broad pattern of runtime crashes). Run ALL of these in parallel:
-
-```
-WebFetch https://api.github.com/search/issues?q=repo:anthropics/claude-code+%22stack+overflow%22+state:open&sort=created&order=desc&per_page=10
-WebFetch https://api.github.com/search/issues?q=repo:anthropics/claude-code+%22panic%22+Bun+state:open&sort=created&order=desc&per_page=10
-WebFetch https://api.github.com/search/issues?q=repo:anthropics/claude-code+%22illegal+instruction%22+state:open&sort=created&order=desc&per_page=10
-WebFetch https://api.github.com/search/issues?q=repo:anthropics/claude-code+segfault+state:open&sort=created&order=desc&per_page=10
-WebFetch https://api.github.com/search/issues?q=repo:anthropics/claude-code+%22crashes+on+startup%22+state:open&sort=created&order=desc&per_page=10
-```
-
-**Hard-stop signals** — if ANY of the symptom searches return issues created in the last 7 days that describe:
-- The binary crashing on `--version`, `--help`, or other trivial invocations
-- "starts and exits in N seconds" patterns
-- Bun panics / segfaults / illegal instructions on startup
-- A bundled-runtime version (e.g. "Bun 1.3.14") appearing in multiple recent crash reports
-
-…then the most recent Claude Code versions are likely affected by a bundled-runtime regression. Identify roughly when the crash pattern started (look at issue creation dates) and treat all versions from that point forward as **🔴 RUNTIME-RISK**. Do NOT recommend any of them. Flag them prominently in the report.
-
-Also scan the top issues from 6a for trivial-invocation crash signals like "starts and exits in N seconds" — these are hard stops too, even if reaction counts look low.
-
-## Step 7: Present findings
-
-Display a clear report:
-
-1. **Version summary:** current → latest, how many versions behind.
-
-2. **Full per-version table.** **One row per version. Never collapse multiple versions into a single row, even for boring patches — the user wants to see every single version.** Columns: Version, Released, Age, Risk, Changes. Risk is 🟢 LOW / 🟡 MEDIUM / 🔴 HIGH / 🔴 RUNTIME-RISK / ⚠️ NO CHANGELOG. For the "Changes" column, list the actual changelog bullets compactly — don't summarize away the detail, and don't drop entries. If a version has no changelog entry, give it its own row with ⚠️ **NO CHANGELOG** and put it in approximate chronological position.
-
-3. **Community reports:** number of open issues from the version-string search, plus a separate "Runtime/crash issues" section listing the recent symptom-search hits (title, number, date, reactions). If symptom searches found fresh hard-stop signals, lead with those — they override everything else.
-
-4. **Undocumented versions:** if any GitHub releases lack a changelog entry, list them with a warning.
-
-5. **Recommendation:** based on release age, issue count, changelog availability, AND the symptom-search results. Rules:
-   - Never recommend a 🔴 RUNTIME-RISK version, regardless of age.
-   - Never recommend a version with no published changelog.
-   - If the latest is < 48h old with no track record, recommend the newest version that's > 7 days old instead.
-   - If symptom searches show a recent crash pattern, recommend the newest version that pre-dates the crash pattern.
-
-## Step 8: Ask user what to do
-
-Use AskUserQuestion. Build the options dynamically:
-
-- **"Update to vX.Y.Z (latest)"** — always present. Add risk label if HIGH or MEDIUM. If changelog is missing, add "⚠️ no changelog".
-- **"Update to vA.B.C (newest with changelog)"** — present if the latest version lacks a changelog. This is the newest version that has a published changelog entry.
-- For each intermediate version that is > 7 days old (LOW risk) and newer than current, add: **"Update to vA.B.C (X days old, low risk)"**
-- **"Stay on vCurrent"** — always present as the last option.
-
-Record the exact version number the user selects — it will be used in the install steps below.
-
-If the user picks "Stay on vCurrent", exit — no further steps.
-
-## Step 9: Back up config, then snapshot the binary (REQUIRED safety net)
-
-The user has now committed to installing a specific version (Step 8 didn't exit). Before touching the Claude Code binary, do two safety steps in this order.
-
-### 9a. Back up everything first
-
-Invoke `/steward:backup` via the **Skill** tool. This pushes the user's ccpraxis config and every vault-tracked project to their private repos, so the machine's full personal state is captured *before* a binary install that could go wrong. Wait for it to finish.
-
-If the backup fails or the user aborts it mid-way, **stop the update here** and ask whether to proceed without a backup — do not silently continue to the install.
-
-### 9b. Snapshot the live binary
-
-**Before** invoking any installer, snapshot the live Claude Code binary. This guarantees the user can revert if the installer leaves a broken binary in place (which has happened on real installs — see the Bun 1.3.14 regression of May 2026).
+Whatever they choose, including staying put:
 
 ```bash
-perl ~/.claude/ccpraxis/plugins/steward/scripts/claude-binary-backup.pl snapshot --reason "pre-install of v<SELECTED-VERSION>" --mark pre-install
+perl ~/.claude/ccpraxis/plugins/steward/scripts/update-research.pl record-decision \
+  --from "<current>" --to "<chosen-or-current>" \
+  --action <installed|declined|deferred> --reason "<why, in one line>"
 ```
 
-Replace `<SELECTED-VERSION>` with the user's choice from Step 8.
+`declined` for "stay on current", `installed` for an update you are about to perform, `deferred` for "not now, ask me later". The `--reason` is what makes the next run useful, so write a real one — name the issue numbers if that is why.
 
-**Check the exit code.** If it is non-zero, STOP — do NOT proceed to the installer. Surface the JSON error to the user. The snapshot must succeed; without it, a botched install has no revert path.
-
-Then prune old snapshots so the backup dir doesn't grow without bound. The script keeps the 4 newest by default:
+If the store lives in the vault, push it so other machines inherit it:
 
 ```bash
+perl ~/.claude/ccpraxis/plugins/steward/scripts/update-research.pl sync "steward: update research"
+```
+
+If the user picked "stay", stop here.
+
+## Step 6: Back up, then snapshot the binary
+
+Both, in this order, before touching anything.
+
+**6a.** Invoke `/steward:backup` via the Skill tool and wait for it. If it fails or the user aborts it, **stop** and ask whether to proceed without a backup.
+
+**6b.** Snapshot the live binary:
+
+```bash
+perl ~/.claude/ccpraxis/plugins/steward/scripts/claude-binary-backup.pl snapshot \
+  --reason "pre-install of v<SELECTED>" --mark pre-install
 perl ~/.claude/ccpraxis/plugins/steward/scripts/claude-binary-backup.pl prune --keep 4
 ```
 
-Surface the `snapshot.id` returned by Step 9 to the user — they may want to remember it.
+**Check the exit code.** Non-zero means STOP — do not run the installer. Without a snapshot a botched install has no revert path, and that has happened on real installs. Surface the returned `snapshot.id` to the user.
 
-## Step 10: Execute install
+## Step 7: Install the version they chose
 
-**IMPORTANT: Always install the exact version the user selected.** Do NOT use `claude update` — it fetches the absolute latest release, which may differ from what the user chose if a new version was published between research and execution.
+Never `claude update` — it fetches the absolute latest, which may not be what was chosen if something shipped during the conversation.
 
-Always use the version-pinned installer:
+Detect the install method first: a binary at `~/.local/bin/claude` is a native install; one under `node_modules` is npm; one under a Homebrew prefix is brew.
+
+- **Windows native:** `powershell -Command "& ([scriptblock]::Create((irm https://claude.ai/install.ps1))) <SELECTED>"`
+- **macOS/Linux native:** `curl -fsSL https://claude.ai/install.sh | bash -s <SELECTED>`
+- **npm:** `npm install -g @anthropic-ai/claude-code@<SELECTED>`
+- **brew:** no version pinning; tell the user and confirm before proceeding.
+
+## Step 8: Verify, and revert if it broke
+
+Run `claude --version`. If it succeeds and matches the selection, say so and mention the snapshot id.
+
+If it fails — non-zero exit, no output, crash, hang, panic — or reports a different version, the install is broken. Surface the exact error, list snapshots (`claude-binary-backup.pl list`), and offer via `AskUserQuestion`:
+
+- **Revert to the pre-install snapshot (Recommended)** → `claude-binary-backup.pl restore --latest`, then verify `claude --version` works again.
+- **Leave it in place** → do nothing.
+
+Either way, tell the user to restart Claude Code.
+
+## Maintenance
 
 ```bash
-powershell -Command "& ([scriptblock]::Create((irm https://claude.ai/install.ps1))) <SELECTED-VERSION>"
+update-research.pl status                 # what's cached, how stale, where it lives
+update-research.pl history --limit 20     # past decisions
+update-research.pl gather --offline       # full analysis from cache, no network
+update-research.pl gather --force         # ignore TTLs and conditional GETs
+update-research.pl prune                  # dry run; --apply to delete
 ```
 
-Replace `<SELECTED-VERSION>` with the exact version number from Step 8 (e.g. `2.1.141`).
+`prune` clears artifacts from a retired approach that cached a 3.6 MB rendered page per run and never removed one — 38 MB of it was still present when this was written.
 
-## Step 11: Verify install and offer revert if broken
-
-Verify by running `claude --version` again. If `claude --version` succeeds AND the output matches the selected version: ✅ tell the user the install succeeded. Mention the pre-install snapshot id (from Step 9) so they know how to revert manually later if anything goes wrong.
-
-If `claude --version` fails (non-zero exit, no output, crash, hang, or panic) OR the reported version doesn't match what was selected:
-
-1. **The install is broken.** Surface the exact error to the user.
-2. List available snapshots so the user can see what's there:
-   ```bash
-   perl ~/.claude/ccpraxis/plugins/steward/scripts/claude-binary-backup.pl list
-   ```
-3. Offer to revert to the pre-install snapshot. Use AskUserQuestion with two options:
-   - **"Revert to pre-install snapshot (Recommended)"** — runs the restore command below.
-   - **"Leave broken install in place"** — do nothing; user will fix manually.
-4. If user picks revert, run:
-   ```bash
-   perl ~/.claude/ccpraxis/plugins/steward/scripts/claude-binary-backup.pl restore --latest
-   ```
-   Then verify `claude --version` works again. Tell the user to restart Claude Code.
-
-In all success cases, tell the user to restart Claude Code for the new version to take effect.
-
-## Manual revert (any time, outside this skill)
-
-Even outside `/update`, the user can revert at any time:
+## Manual revert, any time
 
 ```bash
-# List available snapshots:
 perl ~/.claude/ccpraxis/plugins/steward/scripts/claude-binary-backup.pl list
-
-# Revert to the most recent snapshot:
 perl ~/.claude/ccpraxis/plugins/steward/scripts/claude-binary-backup.pl restore --latest
-
-# Revert to a specific snapshot by id:
 perl ~/.claude/ccpraxis/plugins/steward/scripts/claude-binary-backup.pl restore --snapshot <id>
 ```
 
-Snapshots live under `~/.claude/backups/claude-code/`. The script keeps the 4 newest by default and takes a fresh "pre-restore" snapshot before any restore op, so restores are themselves reversible.
+Snapshots live in `~/.claude/backups/claude-code/`; the newest 4 are kept, and a fresh "pre-restore" snapshot is taken before any restore, so restores are themselves reversible.
