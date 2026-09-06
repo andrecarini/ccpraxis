@@ -62,11 +62,7 @@ perl ~/.claude/ccpraxis/plugins/steward/scripts/update-research.pl record-decisi
 
 `declined` for "stay on current", `installed` for an update you are about to perform, `deferred` for "not now, ask me later". The `--reason` is what makes the next run useful, so write a real one — name the issue numbers if that is why.
 
-If the store lives in the vault, push it so other machines inherit it:
-
-```bash
-perl ~/.claude/ccpraxis/plugins/steward/scripts/update-research.pl sync "steward: update research"
-```
+**The store syncs itself.** `gather` and `record-decision` both commit and push to the vault automatically when one exists, so other machines inherit the research and the decisions without anyone remembering a step. Both report the result under `sync` in their JSON; a failed push is reported, never fatal — the commit is local and the next run pushes it. Use `--no-sync` on `gather` to suppress it. The manual `sync` verb still exists for the odd case.
 
 If the user picked "stay", stop here.
 

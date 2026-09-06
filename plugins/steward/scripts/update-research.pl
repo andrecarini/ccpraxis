@@ -58,7 +58,10 @@ use warnings;
 use JSON::PP ();
 use File::Path qw(make_path);
 use File::Basename qw(dirname);
+use FindBin ();
+use lib $FindBin::Bin;
 use Getopt::Long qw(GetOptionsFromArray);
+use VaultNamespace ();
 
 # MSYS2 mangles ':'-separated args handed to native Windows binaries (curl,
 # git), rewriting them into ';'-joined Windows paths. Every URL we pass contains
@@ -69,6 +72,20 @@ $ENV{MSYS2_ARG_CONV_EXCL} = '*' if $^O =~ /^(MSWin32|cygwin|msys)$/;
 
 my $SCHEMA          = 1;
 my $ISSUE_TTL       = 12 * 3600;   # seconds; see "MUTABLE, TTL'd" above
+
+# How long an issue's state may go unverified before it is re-checked.
+#
+# THE BUG THIS FIXES. The symptom searches filter `state:open`, so when an issue
+# is CLOSED it simply stops appearing in results -- and a record that stops
+# appearing was never updated. It kept `state: open` forever and went on
+# penalising its version indefinitely. Measured on the real store: 87 issues
+# held, 72 of which had never had their state re-checked since first sight.
+#
+# Absence from a result page is NOT sufficient evidence of closure either --
+# with per_page=30 an issue can fall out of the window because newer ones
+# pushed it out. So state is re-verified positively, against the issue's own
+# endpoint, on a rolling basis.
+my $ISSUE_VERIFY_AGE = 7 * 86400;
 my $CHANGELOG_URL   = 'https://raw.githubusercontent.com/anthropics/claude-code/main/CHANGELOG.md';
 # Anthropic's own published changelog. It states that it is generated from the
 # GitHub CHANGELOG.md, and measured on 2026-09-06 the two agreed exactly: 387
@@ -418,12 +435,13 @@ sub runtime_named {
 
 sub cmd_gather {
     my (@argv) = @_;
-    my ($current, $ttl, $offline, $force) = (undef, $ISSUE_TTL, 0, 0);
+    my ($current, $ttl, $offline, $force, $no_sync) = (undef, $ISSUE_TTL, 0, 0, 0);
     GetOptionsFromArray(\@argv,
         'current=s'    => \$current,
         'issues-ttl=i' => \$ttl,
         'offline'      => \$offline,
         'force'        => \$force,
+        'no-sync'      => \$no_sync,
     ) or bail('bad arguments to gather');
 
     my $S = store_paths() or bail('cannot determine home directory');
@@ -620,31 +638,56 @@ sub cmd_gather {
         # installed one), and capped, because the unauthenticated core API
         # allows 60 requests an hour and this must not eat the budget for a
         # number that only sharpens an ordering.
-        my $hydrated = 0;
+        my ($hydrated, $newly_closed) = (0, 0);
         if (defined $current) {
-            my @want = grep {
+            # Two reasons to visit an issue's own endpoint, and both matter:
+            # it is the only place reactions are populated, and it is the only
+            # way to learn an issue has CLOSED (search, filtered to open, can
+            # only ever answer by omission). Never-checked first, then
+            # longest-unverified, so the rolling re-check cannot starve.
+            my @want = sort {
+                my $A = $istore->{issues}{$a}{reactions_at};
+                my $B = $istore->{issues}{$b}{reactions_at};
+                return -1 if !$A && $B;
+                return  1 if $A && !$B;
+                return ($A // '') cmp ($B // '') || $b <=> $a;
+            } grep {
                 my $i = $istore->{issues}{$_};
-                !$i->{reactions_at} && grep { vcmp($_, $current) > 0 } @{ $i->{versions} || [] };
-            } sort { $b <=> $a } keys %{ $istore->{issues} };
+                my $due = !$i->{reactions_at}
+                       || (time - (iso_to_epoch($i->{reactions_at}) // 0)) > $ISSUE_VERIFY_AGE;
+                # Only issues that bear on a decision. Verifying one that blames
+                # a version older than the installed one spends a request from a
+                # 60/hour budget to refine a number nobody will read.
+                $due && grep { vcmp($_, $current) > 0 } @{ $i->{versions} || [] };
+            } keys %{ $istore->{issues} };
+
             for my $n (@want[0 .. ($#want > 14 ? 14 : $#want)]) {
                 last unless defined $n;
                 my $r = http_get("https://api.github.com/repos/anthropics/claude-code/issues/$n");
                 next unless $r->{status} == 200;
                 my $j = eval { JSON::PP->new->decode($r->{content}) } or next;
+                my $was = $istore->{issues}{$n}{state} // 'open';
                 $istore->{issues}{$n}{reactions} =
                     (ref $j->{reactions} eq 'HASH' ? ($j->{reactions}{total_count} // 0) : 0);
                 $istore->{issues}{$n}{comments}     = $j->{comments};
                 $istore->{issues}{$n}{state}        = $j->{state};
                 $istore->{issues}{$n}{reactions_at} = now_iso();
                 $hydrated++;
+                $newly_closed++ if $was eq 'open' && ($j->{state} // '') ne 'open';
             }
         }
 
         $istore->{fetched_at} = now_iso();
         $istore->{schema}     = $SCHEMA;
         write_json_file($S->{issues}, $istore) or push @warnings, 'could not write issues.json';
-        $net{issues} = "fetched ($got records, $hydrated hydrated"
+        $net{issues} = "fetched ($got records, $hydrated verified"
+                     . ($newly_closed ? ", $newly_closed newly closed" : '')
                      . ($failed ? ", $failed queries failed" : '') . ')';
+        # Worth saying out loud: a closed issue stops penalising its version,
+        # which can change the recommendation between two otherwise identical
+        # runs. Silent, that looks like the tool being inconsistent.
+        push @warnings, "$newly_closed issue(s) have been closed upstream since last checked; "
+                      . 'they no longer count against their versions' if $newly_closed;
         push @warnings, "$failed issue queries failed (GitHub search is rate limited to ~10/min "
                       . 'unauthenticated); results may be partial' if $failed;
     }
@@ -659,6 +702,24 @@ sub cmd_gather {
     $analysis->{coverage_ok}   = $coverage_ok ? JSON::PP::true : JSON::PP::false;
     $analysis->{source_disagreements} = \@disagreements;
     $analysis->{decisions}     = read_decisions($S->{decisions}, 10);
+
+    # AUTOMATIC. Research that stays on one machine is research the next
+    # machine pays for again, which is the whole thing this store exists to
+    # stop. Skipped when offline (nothing new to push) and suppressible with
+    # --no-sync. A sync failure is reported, never fatal: the analysis is
+    # already computed and the operator should still get it.
+    unless ($offline || $no_sync) {
+        my $s = do_sync('steward: update research');
+        $analysis->{sync} = {
+            synced => ($s->{synced} ? JSON::PP::true : JSON::PP::false),
+            pushed => ($s->{pushed} ? JSON::PP::true : JSON::PP::false),
+            reason => $s->{reason},
+            error  => $s->{error},
+        };
+        push @{ $analysis->{warnings} }, "research store sync failed: $s->{error}"
+            if !$s->{ok} && $s->{error};
+    }
+
     json_out($analysis);
     return 0;
 }
@@ -855,7 +916,14 @@ sub cmd_record_decision {
     print {$fh} "$line\n";
     close $fh;
 
-    json_out({ ok => JSON::PP::true, recorded => $rec, store => $S->{root} });
+    # A decision is the most valuable thing in the store and the cheapest to
+    # lose, so it is pushed as soon as it is made rather than waiting for the
+    # next gather.
+    my $s = do_sync("steward: record update decision ($action)");
+    json_out({ ok => JSON::PP::true, recorded => $rec, store => $S->{root},
+               sync => { synced => ($s->{synced} ? JSON::PP::true : JSON::PP::false),
+                         pushed => ($s->{pushed} ? JSON::PP::true : JSON::PP::false),
+                         reason => $s->{reason}, error => $s->{error} } });
     return 0;
 }
 
@@ -971,50 +1039,31 @@ sub git_path {
 # also holds projects/ and todos/, each owned by a different script, and a broad
 # `git add -A` here would sweep another owner's half-finished work into this
 # commit.
+# do_sync -- the shared implementation, used by both the `sync` verb and the
+# automatic sync that follows gather/record-decision. One code path, so the
+# automatic and manual routes cannot drift apart.
+sub do_sync {
+    my ($msg) = @_;
+    my $S = store_paths() or return { ok => 0, error => 'cannot determine home directory' };
+    return { ok => 1, synced => 0, reason => 'store is not in a vault; nothing to sync' }
+        unless $S->{in_vault};
+    return VaultNamespace::sync(
+        vault   => $S->{vault},
+        path    => 'research/claude-code',
+        message => (defined $msg && length $msg ? $msg : 'steward: update research'),
+    );
+}
+
 sub cmd_sync {
     my (@argv) = @_;
-    my $msg = shift @argv;
-    my $S = store_paths() or bail('cannot determine home directory');
-    unless ($S->{in_vault}) {
-        json_out({ ok => JSON::PP::true, synced => JSON::PP::false,
-                   reason => 'store is not in a vault; nothing to sync',
-                   store => $S->{root} });
-        return 0;
+    my $r = do_sync(shift @argv);
+    my $S = store_paths();
+    for my $k (qw(ok synced pushed)) {
+        $r->{$k} = $r->{$k} ? JSON::PP::true : JSON::PP::false if exists $r->{$k};
     }
-    my $vault = git_path($S->{vault});
-    my $rel   = 'research/claude-code';
-    $msg = 'steward: update research' unless defined $msg && length $msg;
-
-    my @steps;
-    my $run = sub {
-        my (@a) = @_;
-        my @cmd = ('git', '-C', $vault, @a);
-        my $out = '';
-        if (open my $ph, '-|', @cmd) { local $/; $out = <$ph> // ''; close $ph }
-        my $rc = $? >> 8;
-        push @steps, { cmd => join(' ', @a), rc => $rc };
-        return ($rc, $out);
-    };
-
-    my ($rc_add) = $run->('add', '--', $rel);
-    if ($rc_add != 0) { json_out({ ok => JSON::PP::false, error => 'git add failed', steps => \@steps }); return 1 }
-
-    my ($rc_diff) = $run->('diff', '--cached', '--quiet', '--', $rel);
-    if ($rc_diff == 0) {
-        json_out({ ok => JSON::PP::true, synced => JSON::PP::false,
-                   reason => 'no changes to commit', store => $S->{root}, steps => \@steps });
-        return 0;
-    }
-
-    my ($rc_c) = $run->('commit', '-m', $msg, '--', $rel);
-    if ($rc_c != 0) { json_out({ ok => JSON::PP::false, error => 'git commit failed', steps => \@steps }); return 1 }
-
-    my ($rc_p, $push_out) = $run->('push');
-    json_out({ ok => JSON::PP::true, synced => JSON::PP::true,
-               pushed => ($rc_p == 0 ? JSON::PP::true : JSON::PP::false),
-               push_error => ($rc_p == 0 ? undef : $push_out),
-               store => $S->{root}, steps => \@steps });
-    return 0;
+    $r->{store} = $S->{root} if $S;
+    json_out($r);
+    return $r->{ok} ? 0 : 1;
 }
 
 # ---------------------------------------------------------------------------
