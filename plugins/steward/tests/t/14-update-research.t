@@ -125,6 +125,23 @@ sub by_version {
     return \%h;
 }
 
+# have_git -- a plain guard rather than Test::More's SKIP/skip.
+#
+# StewardTest exports its own ok/is/like and NOT skip, so a `SKIP: { skip(...) }`
+# block dies with "Undefined subroutine &main::skip" on any machine that lacks
+# git — the one machine where that branch is the only one that runs. It passed
+# here purely because git is installed. An `if` cannot fail that way, and
+# done_testing() copes with the varying count.
+my $HAVE_GIT;
+sub have_git {
+    unless (defined $HAVE_GIT) {
+        my $v = `git --version 2>&1`;
+        $HAVE_GIT = ($? == 0 && ($v // '') =~ /git version/) ? 1 : 0;
+        diag('git unavailable — the vault-sync assertions are not running') unless $HAVE_GIT;
+    }
+    return $HAVE_GIT;
+}
+
 # ---------------------------------------------------------------------------
 my $home = "$ROOT/h1";
 make_path($home);
@@ -313,9 +330,7 @@ sub isnt_str  { my ($got, $bad, $n) = @_; ok((($got // '') ne $bad), $n)
 # The vault also holds projects/ and todos/, each owned by a different script.
 # A broad `git add -A` here would sweep a sibling's half-finished work into this
 # commit — which is why sync is path-scoped, and why that scoping is pinned.
-SKIP: {
-    my $git = `git --version 2>&1`;
-    skip('git unavailable', 4) unless $? == 0 && $git =~ /git version/;
+if (have_git()) {
 
     my $h7 = "$ROOT/h7";
     my $vault = "$h7/.claude/claude-code-vault";
@@ -358,6 +373,115 @@ SKIP: {
     my $again = run($h7, 'sync', 'test: again')->{json} || {};
     ok((!$again->{synced} && ($again->{reason} // '') =~ /no changes/),
        'AC8 a second sync with nothing new commits nothing');
+}
+
+# --- AC10: a CLOSED issue stops counting against its version -----------------
+#
+# The symptom searches filter state:open, so a closed issue simply stops
+# appearing in results -- and a record that stops appearing was never updated.
+# It kept state:open forever and went on penalising its version indefinitely.
+# Measured on the real store before this was fixed: 87 issues held, 72 of which
+# had never had their state re-checked since first sight.
+{
+    my $h10 = "$ROOT/h10";
+    make_path($h10);
+    my %closed = (
+        90001 => { number => 90001, title => 'fixed long ago', state => 'closed',
+                   created_at => iso(20 * 86400), reactions => 40,
+                   platforms => ['linux'], versions => ['2.1.248'], runtime => undef },
+    );
+    seed_store($h10, fixture_versions(), \%closed);
+    my $s10 = by_version(run($h10, 'gather', '--current', '2.1.219', '--offline')->{json} || {});
+    is(scalar @{ $s10->{'2.1.248'}{issues} || [] }, 0,
+       'AC10 a closed issue is not listed against its version');
+    is(($s10->{'2.1.248'}{risk} // ''), 'LOW',
+       'AC10 and does not hold the version above LOW')
+        or diag('  a closed issue with 40 reactions must not outrank a fixed bug');
+
+    # The identical record, still open: proves the assertion above turns on
+    # state and not on the fixture simply being ignored.
+    my $h11 = "$ROOT/h11";
+    make_path($h11);
+    my %open = ( 90001 => { %{ $closed{90001} }, state => 'open' } );
+    seed_store($h11, fixture_versions(), \%open);
+    my $s11 = by_version(run($h11, 'gather', '--current', '2.1.219', '--offline')->{json} || {});
+    is(scalar @{ $s11->{'2.1.248'}{issues} || [] }, 1,
+       'AC10 counter-check: the identical record DOES count while open');
+    is(($s11->{'2.1.248'}{risk} // ''), 'HIGH',
+       'AC10 counter-check: and lifts the version (40 reactions)');
+}
+
+# --- AC11: gather and record-decision sync by themselves ---------------------
+# Research that stays on one machine is research the next machine pays for
+# again, which is the whole reason the store exists.
+if (have_git()) {
+
+    my $h12    = "$ROOT/h12";
+    my $vault  = "$h12/.claude/claude-code-vault";
+    my $remote = "$ROOT/remote12.git";
+    my $dir    = "$vault/research/claude-code";
+    make_path($dir);
+    system('git', 'init', '--bare', '-q', $remote);
+    for my $c (['init','-q'], ['config','user.email','t@example.com'], ['config','user.name','T'],
+               ['commit','--allow-empty','-q','-m','base'],
+               ['remote','add','origin',$remote], ['push','-q','-u','origin','HEAD']) {
+        system('git', '-C', $vault, @$c);
+    }
+    for my $pair ([ "$dir/versions.json", { schema => 1, versions => fixture_versions() } ],
+                  [ "$dir/issues.json",   { schema => 1, fetched_at => iso(0), issues => {} } ]) {
+        open my $fh, '>:raw', $pair->[0] or die;
+        print {$fh} JSON::PP->new->canonical(1)->encode($pair->[1]);
+        close $fh;
+    }
+
+    # --offline must NOT sync: nothing new can have arrived, and a run that
+    # cannot reach the network should not be reaching for git either.
+    my $off = run($h12, 'gather', '--current', '2.1.219', '--offline')->{json} || {};
+    ok(!exists $off->{sync}, 'AC11 an offline gather does not attempt a sync');
+
+    my $rd = run($h12, 'record-decision', '--to', '2.1.250', '--action', 'installed',
+                        '--reason', 'auto-sync check')->{json} || {};
+    ok(($rd->{sync} && $rd->{sync}{synced}), 'AC11 record-decision syncs without being asked')
+        or diag(JSON::PP->new->encode($rd->{sync} || {}));
+
+    my $log = `git -C "$vault" log --oneline -- research/claude-code`;
+    like($log, qr/record update decision/, 'AC11 and the decision reached a commit');
+}
+
+# --- AC12: the shared namespace sync serves ANY vault namespace ---------------
+# reports/ and bootstrap-archive/ were untracked in the real vault: usage-audit
+# wrote reports for months that nothing ever committed, while its own
+# description said it "writes a dated report into the vault".
+if (have_git()) {
+
+    my $CLI = "$Bin/../../scripts/vault-namespace-sync.pl";
+    ok(-f $CLI, "AC12 vault-namespace-sync.pl exists");
+
+    my $vault  = "$ROOT/v13";
+    my $remote = "$ROOT/remote13.git";
+    make_path("$vault/reports/usage");
+    make_path("$vault/projects/someone-else");
+    system('git', 'init', '--bare', '-q', $remote);
+    for my $c (['init','-q'], ['config','user.email','t@example.com'], ['config','user.name','T'],
+               ['commit','--allow-empty','-q','-m','base'],
+               ['remote','add','origin',$remote], ['push','-q','-u','origin','HEAD']) {
+        system('git', '-C', $vault, @$c);
+    }
+    for my $f (["$vault/reports/usage/2026-09-06.md", "# usage\n"],
+               ["$vault/projects/someone-else/wip.md", "not mine\n"]) {
+        open my $fh, '>:raw', $f->[0] or die;
+        print {$fh} $f->[1];
+        close $fh;
+    }
+
+    my $raw = `"$^X" "$CLI" reports "test: reports" --vault "$vault" 2>"$ROOT/e13"`;
+    my $j   = eval { JSON::PP->new->decode($raw) } || {};
+    ok($j->{synced}, 'AC12 an arbitrary namespace (reports/) is committed') or diag($raw);
+
+    my $tracked = `git -C "$vault" ls-files`;
+    ok(($tracked =~ m{reports/usage/2026-09-06\.md} && $tracked !~ m{projects/someone-else}),
+       "AC12 and a different owner's namespace is left alone")
+        or diag("  tracked:\n$tracked");
 }
 
 done_testing();

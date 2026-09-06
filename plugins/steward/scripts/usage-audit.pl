@@ -18,6 +18,7 @@ use JSON::PP;
 use File::Find;
 use File::Path  qw(make_path);
 use File::Basename qw(dirname);
+use FindBin ();   # to locate vault-namespace-sync.pl beside this script
 use Cwd ();
 use Time::Local qw(timegm);
 use Getopt::Long;
@@ -421,6 +422,24 @@ unless ($no_vault) {
     print $fh $doc;
     close $fh;
     print "REPORT: $out_path\n";
+
+    # COMMIT IT. Writing into the vault directory is not the same as putting it
+    # in the vault, and for months it was not: `git status` there listed
+    # reports/ as untracked, so every report this script had ever produced sat
+    # on one machine while the skill's own description said it "writes a dated
+    # report into the vault". Nothing else committed it -- todo-sync.pl owns
+    # todos/, vault-sync.pl owns projects/, and reports/ had no owner at all.
+    #
+    # Only when the report went to the default vault location: an explicit
+    # --out elsewhere is the caller's to manage.
+    if (!defined $ENV{CCPRAXIS_NO_VAULT_SYNC}
+        && $out_path =~ m{/claude-code-vault/reports/}) {
+        my $sync = "$FindBin::Bin/vault-namespace-sync.pl";
+        if (-f $sync) {
+            system($^X, $sync, 'reports', "steward: usage report $date");
+            print "SYNCED: reports/ (rc=" . ($? >> 8) . ")\n";
+        }
+    }
 }
 
 printf "ROOTS: %d   FILES: %s   REQUESTS: %s   TOKENS: %s\n",
