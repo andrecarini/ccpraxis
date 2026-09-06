@@ -86,7 +86,25 @@ SKIP: {
     # PATH and killing every probe on argument syntax. Both helpers are stubbed
     # here because this file measures SPAWN COUNT, not command construction --
     # t/44's FIXBATCH-1 owns what the command looks like.
-    my $stubs = "sub _timeout_prefix { '' }\n"
+    # FREEZE THE CLOCK. _cim_all memoizes for 5 SECONDS (launcher.pl :6818),
+    # and this test pulls three keys back to back expecting the last two to hit
+    # the memo. That holds on an idle host and stops holding under load: with
+    # the suite at -j6 a single powershell.exe probe can outlast the TTL, so
+    # the second pull re-spawns and the count comes back 2. Which is exactly
+    # what it did -- 2, never 3, because one expiry costs exactly one extra
+    # spawn. Green standalone, red in every sweep.
+    #
+    # That is the test measuring the machine's load, not the memo. The claim
+    # here is "one round pulls three keys through one call", and it is true
+    # whether or not a probe happens to be slow today. Freezing time asserts
+    # the memo and nothing else; a broken memo still fails, because it would
+    # spawn per key regardless of the clock.
+    #
+    # `use subs` is required: defining sub time{} alone does not override the
+    # builtin. It is compiled as part of the same eval'd unit, before $all.
+    my $stubs = "use subs qw(time);\n"
+              . "sub time { 1_000_000 }\n"
+              . "sub _timeout_prefix { '' }\n"
               . "sub _probe_err_path { '/dev/null' }\n";
     my $ok = eval "package $pkg;\nuse strict;\nuse warnings;\nuse JSON::PP;\n"
            . "our \$WINDOWS_FAMILY = 1;\n$stubs\n$ps\n$bom\n$pj\n$all\n1;\n";  ## no critic
