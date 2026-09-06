@@ -560,6 +560,10 @@ ccpraxis/
 │   ├── steward/                                                  # Meta-plugin that maintains ccpraxis and owns its backup, onboarding, and…
 │   │   ├── .claude-plugin/                                       # Plugin manifest directory
 │   │   │   └── plugin.json                                       # Plugin manifest -- name, description, version
+│   │   ├── bin/
+│   │   │   ├── ccpraxis.ps1                                      # thin dispatcher shim for steward's host-side scripts.
+│   │   │   └── ccpraxis.sh                                       # thin dispatcher shim for steward's host-side scripts.
+│   │   ├── ccpraxis-install.pl                                   # steward plugin install hook.
 │   │   ├── scripts/                                              # Implementation scripts
 │   │   │   ├── VaultNamespace.pm                                 # Scoped commit + push for ONE top-level namespace inside the vault.
 │   │   │   ├── ccpraxis-helpers.pl                               # Deterministic subcommands for /backup (sync-skills, etc.) — replaces several LLM-driven prose steps with scripted ones; emits JSON the skill consumes
@@ -607,7 +611,8 @@ ccpraxis/
 │   │           ├── 11-journal-append-only.t                      # the sync journal is append-only, and every way that could go wrong is pinned…
 │   │           ├── 12-fresh-register-commits.t                   # a fresh registration's FIRST commit must actually store the files, and must…
 │   │           ├── 13-install-config-backup.t                    # installing must not destroy a config the user already had.
-│   │           └── 14-update-research.t                          # the update research engine and its persistence layer.
+│   │           ├── 14-update-research.t                          # the update research engine and its persistence layer.
+│   │           └── 15-ccpraxis-shim.t                            # the `ccpraxis` dispatcher shim and its install hook.
 │   └── todo/                                                     # Personal todo notes synced to your private vault repo.
 │       ├── .claude-plugin/                                       # Plugin manifest directory
 │       │   └── plugin.json                                       # Plugin manifest -- name, description, version
