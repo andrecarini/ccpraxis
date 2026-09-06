@@ -561,6 +561,7 @@ ccpraxis/
 │   │   ├── .claude-plugin/                                       # Plugin manifest directory
 │   │   │   └── plugin.json                                       # Plugin manifest -- name, description, version
 │   │   ├── scripts/                                              # Implementation scripts
+│   │   │   ├── VaultNamespace.pm                                 # Scoped commit + push for ONE top-level namespace inside the vault.
 │   │   │   ├── ccpraxis-helpers.pl                               # Deterministic subcommands for /backup (sync-skills, etc.) — replaces several LLM-driven prose steps with scripted ones; emits JSON the skill consumes
 │   │   │   ├── check-plugins.pl                                  # Detects missing or stale plugins vs settings.json
 │   │   │   ├── claude-binary-backup.pl                           # Snapshot / list / restore / prune / verify / detect for the Claude Code binary — gives /steward:update a deterministic safety net before any installer runs
@@ -570,8 +571,10 @@ ccpraxis/
 │   │   │   ├── save-preference.pl                                # Records "remember this divergence" decisions
 │   │   │   ├── sensitive-check.pl                                # Scans the public ccpraxis repo for secrets before committing
 │   │   │   ├── sync-export.pl                                    # Detects drift between live config and this repo
+│   │   │   ├── update-research.pl                                # Deterministic release research for /steward:update, with a persistence layer. Fetches the GitHub CHANGELOG.md, Anthropic's published changelog (the only source carrying a date for every version), the Releases API and GitHub issue search; merges them into a store that keeps immutable facts forever and expires only open-issue data; classifies risk from the clock at run time; and keeps an append-only log of what the operator chose and why. Store lives in the vault when there is one, so a second machine inherits the history.
 │   │   │   ├── usage-audit-rates.json                            # Provider rate card (Anthropic / Z.ai / DeepSeek / Kimi) for usage-audit.pl
 │   │   │   ├── usage-audit.pl                                    # Token-usage + provider-cost engine for /steward:usage-audit
+│   │   │   ├── vault-namespace-sync.pl                           # commit and push ONE top-level namespace in the vault.
 │   │   │   └── vault-sync.pl                                     # Central engine for claude-code-vault project backups.
 │   │   ├── skills/                                               # Slash-command skills this plugin provides
 │   │   │   ├── audit/
@@ -603,7 +606,8 @@ ccpraxis/
 │   │           ├── 10-marketplace-preferences.t                  # a marketplace discrepancy with a permanent answer must not be asked twice.
 │   │           ├── 11-journal-append-only.t                      # the sync journal is append-only, and every way that could go wrong is pinned…
 │   │           ├── 12-fresh-register-commits.t                   # a fresh registration's FIRST commit must actually store the files, and must…
-│   │           └── 13-install-config-backup.t                    # installing must not destroy a config the user already had.
+│   │           ├── 13-install-config-backup.t                    # installing must not destroy a config the user already had.
+│   │           └── 14-update-research.t                          # the update research engine and its persistence layer.
 │   └── todo/                                                     # Personal todo notes synced to your private vault repo.
 │       ├── .claude-plugin/                                       # Plugin manifest directory
 │       │   └── plugin.json                                       # Plugin manifest -- name, description, version
