@@ -613,7 +613,8 @@ ccpraxis/
 │   │           ├── 13-install-config-backup.t                    # installing must not destroy a config the user already had.
 │   │           ├── 14-update-research.t                          # the update research engine and its persistence layer.
 │   │           ├── 15-ccpraxis-shim.t                            # the `ccpraxis` dispatcher shim and its install hook.
-│   │           └── 16-no-nul-and-marketplace-noise.t             # two defects found by using the tools, not by reading them.
+│   │           ├── 16-no-nul-and-marketplace-noise.t             # two defects found by using the tools, not by reading them.
+│   │           └── 17-nul-hook-override.t                        # block-nul-redirect.pl still blocks, and now has a way to say "this one is a…
 │   └── todo/                                                     # Personal todo notes synced to your private vault repo.
 │       ├── .claude-plugin/                                       # Plugin manifest directory
 │       │   └── plugin.json                                       # Plugin manifest -- name, description, version
