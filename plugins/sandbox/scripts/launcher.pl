@@ -2504,6 +2504,33 @@ my $CONTAINER_NAME;
             reset_terminal();
             exit 1;
         }
+        # VERSION SKEW ON THE CONNECTOR PATH: WARN, DO NOT REBUILD.
+        #
+        # This path returns before the staleness block, so the forced rebuild
+        # that a plain `claude-sandbox` performs on a version mismatch is never
+        # reached here -- connecting to a running container joined it silently.
+        #
+        # It is deliberately NOT forced. The container is RUNNING, and a forced
+        # rebuild would `podman rm -f` a live session out from under whoever is
+        # using it, which is worse than the skew it would be fixing. So the same
+        # decision function is consulted and its reason is reported instead of
+        # acted on, with the remedy named.
+        {
+            my $rv = (-f "$LAUNCHER_DIR/claude-version")
+                ? do { my $v = _read_file("$LAUNCHER_DIR/claude-version");
+                       chomp $v if defined $v; $v }
+                : undef;
+            if (my $skew = decide_forced_rebuild(1, $rv, $HOST_VERSION)) {
+                _emit_err(_c_warn("WARNING:"), " $skew\n");
+                _emit_err("       Connecting anyway -- this container is running and rebuilding it\n",
+                          "       would end the session inside it. Session files under claude-home\n",
+                          "       are shared through the bind mount and assume one version wrote\n",
+                          "       them, so close this sandbox and run `claude-sandbox` with no flags\n",
+                          "       to rebuild it when convenient.\n");
+                log_ev('connector_version_skew', { recorded => $rv, host => $HOST_VERSION });
+            }
+        }
+
         _emit_step(_c_step("Connecting to running sandbox: $CONTAINER_NAME"), "\n");
         SandboxLock::release($LOCK_DIR);
         # S2.12 case (b): the container is ALREADY running, so the keep-alive
