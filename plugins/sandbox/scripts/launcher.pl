@@ -2369,20 +2369,36 @@ sub backpack_review {
 # permanently block a launch. After acquiring, RE-CHECK the image (the winner
 # may have already built it); only build if still missing. release() frees this
 # lock; release_all() in END/signals also covers it.
+# PROBE ONLY. NOTHING IS BUILT BEFORE THE OPERATOR HAS ANSWERED.
+#
+# This used to build the base image here, which is BEFORE the skills picker and
+# before the stale/rebuild prompt. Three things were wrong with that, all
+# reported by the operator on 2026-09-07 ("some things were already being built
+# before that step? and then things kept getting built?"):
+#
+#   1. Choosing Rebuild at the prompt force-builds the image again (:2972), so
+#      a launch that started with no image could build it TWICE, with nothing
+#      able to change in between.
+#   2. The reattach path (`podman exec` into a running container, ~:2508)
+#      returns without ever needing an image -- and it sits AFTER this point, so
+#      rejoining a running sandbox could trigger a full image build it would
+#      never use.
+#   3. Being asked "rebuild or continue?" after minutes of building reads as
+#      the launcher ignoring the answer it is about to ask for.
+#
+# The build cannot simply move earlier-and-conditional either: whether it is
+# wanted depends on the prompt, and the prompt depends on the skills picker
+# (one staleness reason compares the selection against what the container was
+# built with, :2726). So the probe stays here, where the lock and the existence
+# question already lived, and the single build happens after the answer.
+my $IMAGE_EXISTS;
 {
     my $build_lock = "$CLAUDE_HOST_CONFIG/ccpraxis/.locks/image-build";
     File::Path::make_path(dirname($build_lock));
     my $got_build_lock = SandboxLock::acquire($build_lock, timeout => 600, windows => $WINDOWS_FAMILY);
     # fail-open: proceed even if !$got_build_lock
     `$PODMAN image inspect claude-sandbox:latest 2>&1`;
-    if ($? != 0) {
-        _launch_stage_begin('image');
-        build_image();
-        _launch_stage_end('image', 'ok');
-    }
-    else {
-        _launch_stage_end('image', 'skipped');
-    }
+    $IMAGE_EXISTS = ($? == 0) ? 1 : 0;
     SandboxLock::release($build_lock);
 }
 
@@ -2674,13 +2690,28 @@ run_perl_to_file('MCP discovery snapshot',    $MCP_SNAPSHOT_FILE,    'discover-m
 
 my @STALE_REASONS;
 
-# Version mismatch.
+# A VERSION MISMATCH IS NOT A SUGGESTION.
+#
+# This used to be an ordinary @STALE_REASONS entry, which meant "Continue
+# as-is" left a container running Claude Code vX against a host on vY. That
+# configuration is not supported and nothing downstream is written to cope with
+# it: the statusline, the session files under claude-home and the resume
+# machinery are all shared through the bind mount and all assume one version
+# wrote them.
+#
+# It follows the B18 precedent (enforce_container_config_shape, :2806) rather
+# than the prompt: routing it through prompt_stale_action would make it
+# silently declinable, because that prompt defaults to "continue" AND returns
+# "continue" on EOF in every non-interactive launch. A remediation that a
+# headless launch skips by default is not a remediation.
+my $FORCE_REBUILD_REASON;
 if (-f "$LAUNCHER_DIR/claude-version") {
     my $cv = _read_file("$LAUNCHER_DIR/claude-version");
     chomp $cv if defined $cv;
     $cv //= '';
     if (length $cv && $cv ne $HOST_VERSION) {
-        push @STALE_REASONS, "  - Claude Code version mismatch: container has v${cv}, host has v${HOST_VERSION}";
+        $FORCE_REBUILD_REASON =
+            "Claude Code version mismatch: container has v${cv}, host has v${HOST_VERSION}";
     }
 }
 
@@ -2704,11 +2735,17 @@ if (-f "$LAUNCHER_DIR/container-created") {
 }
 
 # Containerfile hash drift.
+#
+# NO SAVED HASH IS NOT DRIFT. This fired whenever the record was merely absent
+# and said "Containerfile has changed since last build" -- on a first launch
+# there was no last build, so nothing changed and there is nothing to compare
+# against. It offered a rebuild of something that did not exist yet, which is
+# half of why the prompt read as nonsense.
 my $CURRENT_DF_HASH = containerfile_hash();
 {
     my $saved = _read_file("$LAUNCHER_DIR/containerfile-hash");
     chomp $saved if defined $saved;
-    if (!defined $saved || $saved ne $CURRENT_DF_HASH) {
+    if (defined $saved && length $saved && $saved ne $CURRENT_DF_HASH) {
         push @STALE_REASONS, "  - Containerfile has changed since last build";
     }
 }
@@ -2716,9 +2753,13 @@ my $CURRENT_DF_HASH = containerfile_hash();
 # Launcher hash drift.
 my $CURRENT_LAUNCHER_HASH = launcher_hash();
 {
+    # Same as the Containerfile hash above: an ABSENT record is not drift. With
+    # `!defined $saved` in the condition this fired on a first launch and said
+    # the launcher had "changed since container was created" when no container
+    # had ever been created.
     my $saved = _read_file("$LAUNCHER_DIR/launcher-hash");
     chomp $saved if defined $saved;
-    if (!defined $saved || $saved ne $CURRENT_LAUNCHER_HASH) {
+    if (defined $saved && length $saved && $saved ne $CURRENT_LAUNCHER_HASH) {
         push @STALE_REASONS, "  - Launcher scripts have changed since container was created";
     }
 }
@@ -2941,58 +2982,111 @@ sub _skill_divergence_msg {
 # Rebuild prompt (interactive)
 # =====================================================================
 
-if (@STALE_REASONS) {
+# THE DECISION, THEN THE WORK -- in that order, and only over choices that
+# actually exist.
+#
+# Reported 2026-09-07: "I got to the screen where I choose the plugins skills
+# etc. Then after a while I got the r vs c to rebuild vs continue dialog. It
+# didn't make sense to me because some things were already being built before
+# that step? and then things kept getting built?" All three observations were
+# right, and the second complaint is the sharper one: the prompt offered
+# "Continue as-is" unconditionally, including when there was no image to
+# continue from -- in which case continuing would reach `podman create` against
+# a nonexistent image and fail.
+#
+# So the prompt is now built from what is actually on disk:
+#
+#   image missing   -> a build is going to happen no matter what is chosen, so
+#                      "continue" cannot mean "skip it". Said plainly instead of
+#                      offered as a choice.
+#   container missing -> it will be created regardless; Rebuild differs only in
+#                      also rebuilding the base image.
+#   version mismatch -> not offered at all. Forced (see $FORCE_REBUILD_REASON).
+#
+# And the build itself moved here, AFTER the answer, so nothing is built before
+# the operator has said what they want -- and so it happens exactly once. It
+# used to be able to run twice in one launch: once because the image was
+# missing, then again because Rebuild was chosen.
+my $CONTAINER_EXISTS_NOW = _container_exists($CONTAINER_NAME) ? 1 : 0;
+my $do_rebuild = 0;
+
+if (defined $FORCE_REBUILD_REASON) {
+    # Non-declinable. Stated, not asked.
+    _emit_err(_c_warn("REBUILD REQUIRED:"), " $FORCE_REBUILD_REASON\n");
+    _emit_err("       A container and host on different Claude Code versions is not a\n",
+              "       supported configuration -- session files under claude-home are\n",
+              "       shared through the bind mount and assume one version wrote them.\n",
+              "       Rebuilding the image and recreating the container.\n");
+    log_ev('forced_rebuild', { reason => $FORCE_REBUILD_REASON });
+    $do_rebuild = 1;
+}
+elsif (@STALE_REASONS) {
     # Package 12: this used to _launch_suspend() the frame so the hand-rolled
     # menu could own the terminal, then resume. It renders as a screen now, so
     # there is nothing to hand back — prompt_stale_action picks the TUI or the
     # plain path itself, exactly as the skills picker at the select stage does.
-    my $action = prompt_stale_action(\@STALE_REASONS, $HOST_VERSION);
-    if ($action eq 'rebuild') {
-        # Remove old container if it exists. Captured: this runs with the frame
-        # back up, so inherited stdio would paint over it.
-        _tee_system($PODMAN, 'rm', '-f', $CONTAINER_NAME);
-        # Forced rebuild — acquire the global build lock but skip the re-check
-        # (the user explicitly chose rebuild, so we always build regardless of
-        # whether a concurrent launcher already built it). Fail-open on timeout.
-        {
-            my $build_lock = "$CLAUDE_HOST_CONFIG/ccpraxis/.locks/image-build";
-            File::Path::make_path(dirname($build_lock));
-            SandboxLock::acquire($build_lock, timeout => 600, windows => $WINDOWS_FAMILY);
-            # Re-open the image stage. It was ended 'skipped' at :2384 -- the
-            # image existed, so the presence check was right at the time -- but
-            # the operator has since chosen Rebuild, and this call rebuilds it
-            # for real. Without these two markers the longest operation of the
-            # whole launch ran under a row reading 'image build  skipped', which
-            # is not a stale label but an actively false one. Reported
-            # 2026-09-04: "many times I get image build - skipped even though it
-            # wasn't skipped and I manually chose the option to rebuild".
-            # stage_begin on an already-ended stage is defined behaviour: it
-            # sets state back to 'active' and re-stamps {started}.
-            _launch_stage_begin('image');
-            build_image();
-            _launch_stage_end('image', 'ok');
-            SandboxLock::release($build_lock);
-        }
-        # Refresh per-project container blueprint copies from upstream
-        # (plugins/sandbox/container/). Any in-container modifications get
-        # overwritten — that's the explicit opt-in semantic of Rebuild.
-        _copy_file("$CONTAINER_CONFIG/CLAUDE.md",    $CONTAINER_CLAUDE_MD);
-        _copy_file("$CONTAINER_CONFIG/settings.json", $CONTAINER_SETTINGS_JSON);
-        _write_file($CLAUDE_MD_HASH_FILE, $CURRENT_CLAUDE_MD_HASH);
-        _write_file($SETTINGS_HASH_FILE,  $CURRENT_SETTINGS_HASH);
-        # Regenerate container name.
-        unlink "$LAUNCHER_DIR/container-name";
-        my $path_hash = substr(md5_of_string($PROJECT_PATH), 0, 8);
-        $CONTAINER_NAME = "claude-${PROJECT_NAME}-${path_hash}";
-        _write_file("$LAUNCHER_DIR/container-name", $CONTAINER_NAME);
-    } elsif ($action eq 'cancel') {
+    my $action = prompt_stale_action(\@STALE_REASONS, $HOST_VERSION,
+                                     { image_exists     => $IMAGE_EXISTS,
+                                       container_exists => $CONTAINER_EXISTS_NOW });
+    if    ($action eq 'rebuild') { $do_rebuild = 1 }
+    elsif ($action eq 'cancel')  {
         tui::LaunchScreens::host_leave($LAUNCH_HOST) if $LAUNCH_HOST;
         _emit_out("Cancelled.\n");
         SandboxLock::release($LOCK_DIR);
         reset_terminal();
         exit 0;
     }
-    # else 'continue' — fall through to launch as-is
+    # else 'continue' — keep whatever exists; a missing image is still built below.
+}
+
+if ($do_rebuild) {
+    # Remove old container if it exists. Captured: this runs with the frame
+    # back up, so inherited stdio would paint over it.
+    _tee_system($PODMAN, 'rm', '-f', $CONTAINER_NAME) if $CONTAINER_EXISTS_NOW;
+    $CONTAINER_EXISTS_NOW = 0;
+
+    # Refresh per-project container blueprint copies from upstream
+    # (plugins/sandbox/container/). Any in-container modifications get
+    # overwritten — that's the explicit opt-in semantic of Rebuild.
+    _copy_file("$CONTAINER_CONFIG/CLAUDE.md",    $CONTAINER_CLAUDE_MD);
+    _copy_file("$CONTAINER_CONFIG/settings.json", $CONTAINER_SETTINGS_JSON);
+    _write_file($CLAUDE_MD_HASH_FILE, $CURRENT_CLAUDE_MD_HASH);
+    _write_file($SETTINGS_HASH_FILE,  $CURRENT_SETTINGS_HASH);
+    # Regenerate container name.
+    unlink "$LAUNCHER_DIR/container-name";
+    my $path_hash = substr(md5_of_string($PROJECT_PATH), 0, 8);
+    $CONTAINER_NAME = "claude-${PROJECT_NAME}-${path_hash}";
+    _write_file("$LAUNCHER_DIR/container-name", $CONTAINER_NAME);
+}
+
+# THE ONE AND ONLY IMAGE BUILD. Wanted when the image is absent, or when a
+# rebuild was chosen or forced. Both conditions collapse into a single call, so
+# "missing AND rebuild" builds once rather than twice.
+{
+    my $need_build = (!$IMAGE_EXISTS || $do_rebuild) ? 1 : 0;
+    if ($need_build) {
+        my $build_lock = "$CLAUDE_HOST_CONFIG/ccpraxis/.locks/image-build";
+        File::Path::make_path(dirname($build_lock));
+        SandboxLock::acquire($build_lock, timeout => 600, windows => $WINDOWS_FAMILY);
+        # Re-check under the lock ONLY when this is a "missing image" build: a
+        # concurrent launcher may have just built it, and a second identical
+        # build helps nobody. An explicit rebuild always builds -- that is what
+        # was asked for.
+        my $still_missing = do { `$PODMAN image inspect claude-sandbox:latest 2>&1`; $? != 0 };
+        if ($do_rebuild || $still_missing) {
+            _launch_stage_begin('image');
+            build_image();
+            _launch_stage_end('image', 'ok');
+            $IMAGE_EXISTS = 1;
+        }
+        else {
+            _launch_stage_end('image', 'skipped');
+        }
+        SandboxLock::release($build_lock);
+    }
+    else {
+        _launch_stage_end('image', 'skipped');
+    }
 }
 
 # >>> launch-emit:prepare:BEGIN
@@ -3026,19 +3120,38 @@ _launch_stage_begin('prepare');
 # model shortcuts and prints them on the rows, so the affordance the old menu
 # advertised in its footer survives the conversion rather than being dropped.
 sub prompt_stale_action {
-    my ($reasons_ref, $host_version) = @_;
+    my ($reasons_ref, $host_version, $state) = @_;
     my @reasons = @$reasons_ref;
+    $state = {} unless ref $state eq 'HASH';
+    my $have_image     = $state->{image_exists}     ? 1 : 0;
+    my $have_container = $state->{container_exists} ? 1 : 0;
+
     # SAY THAT REBUILD DOES BOTH. This read "Rebuild — fresh container with
     # Claude Code v$host_version", which advertises a CONTAINER rebuild and
-    # then also force-builds the base image at :2961. An operator who chose it
-    # and then read "base image build  skipped" on the stages panel had been
-    # told, by the option's own wording, to expect only the container -- and
-    # asked whether they were "confusing things on image build vs container
-    # create". They were not; three separate things pointed the same wrong way,
-    # and this was one of them.
+    # then also force-builds the base image. An operator who chose it and then
+    # read "base image build  skipped" on the stages panel had been told, by
+    # the option's own wording, to expect only the container.
+    #
+    # AND SAY WHAT "CONTINUE" WILL ACTUALLY DO. It read "rebuild nothing"
+    # unconditionally, which is false whenever a piece is missing: with no
+    # image, continuing still has to build one before anything can be created;
+    # with no container, continuing still creates one. Offering an option that
+    # misdescribes itself is how the whole prompt came to read as nonsense.
+    my @missing;
+    push @missing, 'base image' unless $have_image;
+    push @missing, 'container'  unless $have_container;
+
+    my $continue_label = @missing
+        ? 'Continue — keep what exists, build the ' . join(' and ', @missing)
+        : 'Continue as-is — rebuild nothing';
+
+    my $rebuild_label = $have_image
+        ? "Rebuild — base image and container, on Claude Code v$host_version"
+        : "Rebuild — build the base image and create the container, on Claude Code v$host_version";
+
     my @options = (
-        ['rebuild',  "Rebuild — base image and container, on Claude Code v$host_version"],
-        ['continue', "Continue as-is — rebuild nothing"],
+        ['rebuild',  $rebuild_label],
+        ['continue', $continue_label],
     );
 
     # Path 1: render as a screen. Gated on {active}, not just $LAUNCH_MODE, for
