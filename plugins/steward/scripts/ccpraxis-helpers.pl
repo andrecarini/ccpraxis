@@ -333,8 +333,23 @@ sub cmd_check_claude_md {
 # ─── Subcommand: marketplace-diff ─────────────────────────────────────────
 
 sub cmd_marketplace_diff {
-    my $live = File::Spec->catfile(claude_dir(), 'plugins', 'known_marketplaces.json');
-    my $repo = File::Spec->catfile(ccpraxis_dir(), 'global-config', 'known_marketplaces.json');
+    # --live / --repo override the default locations. Added for testability:
+    # without them this subcommand can only ever be exercised against the
+    # operator's own two files, so a test writes fixtures, gets the real files
+    # diffed instead, and passes on whatever they happen to contain. That is
+    # not a hypothetical -- t/16's first assertion did exactly that, and only
+    # its counter-check revealed the fixtures were being ignored.
+    my ($live, $repo);
+    {
+        my @argv = @ARGV;
+        while (@argv) {
+            my $a = shift @argv;
+            if    ($a eq '--live') { $live = shift @argv }
+            elsif ($a eq '--repo') { $repo = shift @argv }
+        }
+    }
+    $live //= File::Spec->catfile(claude_dir(), 'plugins', 'known_marketplaces.json');
+    $repo //= File::Spec->catfile(ccpraxis_dir(), 'global-config', 'known_marketplaces.json');
 
     my ($live_obj, $live_err) = -f $live ? read_json_file($live) : (undef, "missing: $live");
     my ($repo_obj, $repo_err) = -f $repo ? read_json_file($repo) : (undef, "missing: $repo");
@@ -351,13 +366,33 @@ sub cmd_marketplace_diff {
     #   "marketplaceName": { "source": {...}, "installLocation": "...", ... },
     #   ...
     # }
-    # Strip installLocation from each entry before comparing (machine-specific).
+    # Strip the fields that are NOT part of a marketplace's identity before
+    # comparing. Two kinds, and both must go:
+    #
+    #   installLocation  machine-specific absolute path.
+    #   lastUpdated      a refresh timestamp. Bumped every time Claude Code
+    #                    re-fetches a marketplace, on each machine
+    #                    independently, with no bearing on what the marketplace
+    #                    IS.
+    #
+    # lastUpdated was not stripped, so `claude-plugins-official` reported as
+    # "diverged" on 2026-09-06 with byte-identical `source` on both sides and
+    # only the timestamp differing. The skill's diverged branch is written for
+    # "the source URL changed" and offers Use live / Use repo / remember --
+    # meaning a routine refresh presented as a conflict, on every backup,
+    # forever. That is exactly the recurring-prompt noise the preferences
+    # system was built to eliminate, arriving through a different door.
+    #
+    # Named explicitly rather than allow-listing `source`: a future field that
+    # genuinely distinguishes two marketplaces should show up as a difference
+    # and be noticed, not be silently discarded by a filter nobody revisits.
+    my @VOLATILE = qw(installLocation lastUpdated);
     my $strip = sub {
         my $obj = shift;
         my %out;
         for my $name (keys %$obj) {
             my $entry = { %{ $obj->{$name} // {} } };
-            delete $entry->{installLocation};
+            delete $entry->{$_} for @VOLATILE;
             $out{$name} = $entry;
         }
         return \%out;

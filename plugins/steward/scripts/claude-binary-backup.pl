@@ -174,7 +174,20 @@ sub free_bytes {
         my $drive = '';
         if ($win_dir =~ m{^([A-Za-z]):}) { $drive = uc $1; }
         return undef unless $drive;
-        my $out = `powershell -NoProfile -Command "(Get-PSDrive -Name $drive -ErrorAction SilentlyContinue).Free" 2>NUL`;
+        # NO SHELL-LEVEL stderr REDIRECT. This read `2>NUL`, and Git-for-Windows
+        # perl runs backticks through sh -- where NUL is not a device but a
+        # FILENAME, so every call left a literal `NUL` file in the working
+        # directory that Explorer cannot delete. It is this repo's own
+        # documented landmine, committed in this repo's own code; one was
+        # created in /c/Development/ccpraxis on 2026-09-06 by the snapshot this
+        # very script takes.
+        #
+        # `2>/dev/null` is NOT the fix either: it would be wrong the moment
+        # backticks go through cmd.exe on a native-Windows perl. The suppression
+        # belongs one layer in, where it is portable -- -ErrorAction
+        # SilentlyContinue is already doing it, which is what made the redirect
+        # redundant as well as harmful. Same reasoning as bp-keepawake.pl:229.
+        my $out = `powershell -NoProfile -Command "(Get-PSDrive -Name $drive -ErrorAction SilentlyContinue).Free"`;
         return undef unless defined $out;
         chomp $out;
         $out =~ s/\s+//g;
@@ -213,7 +226,12 @@ sub read_binary_version {
         my $win_path = to_windows_path($path);
         my $q = $win_path;
         $q =~ s/'/''/g;  # PowerShell single-quote escape
-        my $cmd = "powershell -NoProfile -Command \"(Get-Item -LiteralPath '$q').VersionInfo.ProductVersion\" 2>NUL";
+        # Same fix as free_bytes above: the `2>NUL` that used to end this line
+        # created a literal NUL file under sh. Here the suppression was doing
+        # real work -- a missing file makes Get-Item write an error -- so it
+        # moves inside PowerShell as -ErrorAction SilentlyContinue rather than
+        # being dropped. The caller already treats empty output as 'unknown'.
+        my $cmd = "powershell -NoProfile -Command \"(Get-Item -LiteralPath '$q' -ErrorAction SilentlyContinue).VersionInfo.ProductVersion\"";
         my $out = `$cmd`;
         if (defined $out) {
             chomp $out;
