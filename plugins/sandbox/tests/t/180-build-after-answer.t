@@ -92,21 +92,43 @@ like($CODE, qr/\$IMAGE_EXISTS\s*=\s*\(\s*\$\?\s*==\s*0\s*\)/,
 # AC3 — the build is guarded by "missing OR rebuild", so it cannot run twice
 # and cannot be skipped when the image is genuinely absent.
 # ---------------------------------------------------------------------------
-like($CODE, qr/\$need_build\s*=\s*\(\s*!\s*\$IMAGE_EXISTS\s*\|\|\s*\$do_rebuild\s*\)/,
-     'AC3 the build condition is "image missing OR rebuild chosen"')
-    or diag('  both conditions must collapse into ONE call, or the two-build bug returns');
+# The condition itself now lives in decide_launch_plan() and is exercised
+# behaviourally across every state by t/181 -- which is a better test than
+# matching its text. What remains structural here is that the build site is
+# DRIVEN by that decision rather than re-deriving one of its own.
+like($CODE, qr/\$need_build\s*=\s*\$PLAN->\{build_image\}/,
+     'AC3 the build site takes its answer from the decision function')
+    or diag('  a second, hand-rolled condition here is how the two-build bug returns');
+like($CODE, qr/my\s+\$PLAN\s*=\s*decide_launch_plan\(/,
+     'AC3 the plan is computed once, from one function');
 
-# Continuing with a missing image must still build. Asserted as the absence of
-# an early-exit: the build block is not inside the `if ($do_rebuild)` body.
+# BUILD BEFORE DESTROY. build_image() exits the process on failure (:2302), so
+# with the old order — `podman rm -f` the container, THEN build — any ordinary
+# build failure (disk full, a bad Containerfile edit, a network blip fetching
+# packages) left the operator with no container AND no new image: strictly
+# worse off than before they launched. Building first makes a failed rebuild
+# cost time and nothing else.
+#
+# This also subsumes the earlier "build is on the common path" check: sitting
+# outside and ahead of the `if ($do_rebuild)` body is what makes it common.
 {
     my $rebuild_block = pos_of(qr/if\s*\(\s*\$do_rebuild\s*\)\s*\{/);
+    # Anchored on the PLAN-driven removal specifically. A bare `rm -f` regex
+    # matches a helper sub earlier in the file (:2919) that removes an
+    # arbitrary named container, and matching that instead compared the build
+    # against the wrong line entirely.
+    my $rm_at = pos_of(qr/_tee_system\(\$PODMAN,\s*'rm',\s*'-f',\s*\$CONTAINER_NAME\)\s*if\s*\$PLAN->\{remove_container\}/);
     cmp_ok($rebuild_block, '>', 0, 'AC3 liveness: the rebuild block was located');
+    cmp_ok($rm_at, '>', 0, 'AC3 liveness: the container removal was located');
+
     SKIP: {
-        skip 'no build call found', 1 unless @build_at;
-        # The single build sits after the rebuild block closes, i.e. it is on
-        # the common path rather than only under "rebuild".
-        cmp_ok($build_at[0], '>', $rebuild_block,
-            'AC3 the build is on the common path, so "continue" still builds a missing image');
+        skip 'no build call found', 2 unless @build_at;
+        cmp_ok($build_at[0], '<', $rm_at,
+            'AC3 the image is built BEFORE the container is destroyed')
+            or diag('  build_image() exits on failure; destroying first loses the '
+                  . 'container to any failed build');
+        cmp_ok($build_at[0], '<', $rebuild_block,
+            'AC3 and sits outside the rebuild branch, so "continue" still builds a missing image');
     }
 }
 
@@ -129,7 +151,7 @@ like($CODE, qr/\$FORCE_REBUILD_REASON\s*=/,
 
 like($CODE, qr/if\s*\(\s*defined\s+\$FORCE_REBUILD_REASON\s*\)/,
      'AC4 the forced path is taken before the prompt is even considered');
-like($CODE, qr/elsif\s*\(\s*\@STALE_REASONS\s*\)/,
+like($CODE, qr/elsif\s*\(\s*plan_wants_prompt\(/,
      'AC4 the prompt is the ELSE branch, so a forced rebuild never asks');
 
 # ---------------------------------------------------------------------------
@@ -141,9 +163,10 @@ like($CODE, qr/prompt_stale_action\([^)]*container_exists\s*=>/s,
      'AC5 and whether the container exists');
 
 # "rebuild nothing" must not be claimed when something has to be built.
-like($CODE, qr/\@missing\s*$/m, 'AC5 the label is built from what is missing');
-like($CODE, qr/Continue — keep what exists, build the/,
-     'AC5 continue describes the work it will still do');
+like($CODE, qr/\$continue_label\s*=/,
+     'AC5 the continue label is derived, not a fixed string');
+like($CODE, qr/Continue — keep this container, build a base image at/,
+     "AC5 continue names the container fate too, not just the build");
 like($CODE, qr/Continue as-is — rebuild nothing/,
      'AC5 and only claims "rebuild nothing" for the case where that is true');
 
