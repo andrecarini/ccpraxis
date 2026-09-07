@@ -465,15 +465,21 @@ sub STAGE_IDS {
     # problem; its invisibility was.
     #
     # THE ORDER HERE IS THE ORDER THE LAUNCHER RUNS THEM IN, and it is checked
-    # mechanically (t/37 AC5) rather than trusted. It read
-    # 'preflight, select, image, ...' until 2026-09-04, but launcher.pl builds
-    # the image (:2379) BEFORE it opens the skills picker (:2630) -- so the
-    # operator watched 'skills, plugins and MCP' sit pending while the row
-    # below it built and went green. Nothing was wrong except the row order,
-    # which is the kind of wrong that makes someone doubt the parts that are
-    # right. t/68's AC-G4 pinned the declared order as if it were the real one,
-    # so the test agreed with the bug; it now pins execution order.
-    return [ 'preflight', 'image', 'select', 'prepare', 'create', 'backpack', 'start', 'install', 'dashboard' ];
+    # mechanically (t/37 AC5) rather than trusted.
+    #
+    # It has now moved twice, and the history is the argument for the check.
+    # Originally 'preflight, select, image, ...' while the launcher built the
+    # image BEFORE the picker -- so the operator watched 'skills, plugins and
+    # MCP' sit pending while the row below it went green. That was corrected to
+    # put image second on 2026-09-04.
+    #
+    # On 2026-09-07 the launcher itself changed: nothing is built until the
+    # operator has answered the rebuild prompt, which cannot be asked until the
+    # picker has run. So the build genuinely happens after select now, and the
+    # declaration follows it back. AC5 caught this the moment the launcher
+    # moved, naming both sequences -- which is exactly what it was written for,
+    # and what the hand-copied pin in t/68 could never have done.
+    return [ 'preflight', 'select', 'image', 'prepare', 'create', 'backpack', 'start', 'install', 'dashboard' ];
 }
 
 sub STAGE_STATES { return [ 'pending', 'active', 'ok', 'skipped', 'failed' ] }

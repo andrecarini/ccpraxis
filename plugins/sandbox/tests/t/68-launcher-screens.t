@@ -488,7 +488,7 @@ sub host_ops {
     # launcher source instead, which is the only thing that can catch a drift
     # like this; this pair is kept as a cheap, readable pin of the same fact.
     my @pairs = (['image','create'], ['create','start'], ['start','dashboard'],
-                 ['preflight','image'], ['image','select'], ['create','backpack'],
+                 ['preflight','select'], ['select','image'], ['create','backpack'],
                  ['backpack','start'], ['start','install'], ['install','dashboard']);
     for my $p (@pairs) {
         my ($a, $b) = @$p;
