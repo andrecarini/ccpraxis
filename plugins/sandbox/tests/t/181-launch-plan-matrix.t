@@ -252,4 +252,118 @@ for my $w (@WORLDS) {
     is($bad, 0, 'no combination of state, force, staleness and answer yields an incoherent plan');
 }
 
+# ===========================================================================
+# AC7 — THE TWO FUNCTIONS COMPOSED, as the launcher wires them.
+#
+# Everything above tests decide_forced_rebuild and decide_launch_plan
+# SEPARATELY, and that is not sufficient: the operator's question is about
+# their interaction. "Host on Z, container on Y, no image at all — are you
+# going to build Z and then launch a container running Y?"
+#
+# Answering that by reading the source is the kind of claim that has already
+# been wrong more than once here, so it is composed and driven instead.
+# launcher_would_do() mirrors the real wiring: force first, prompt only if
+# nothing is forced, then the plan.
+# ===========================================================================
+sub launcher_would_do {
+    my (%in) = @_;
+    my $force = forced($in{container_exists}, $in{recorded_version}, $in{host_version});
+    my %state = (
+        image_exists     => $in{image_exists},
+        container_exists => $in{container_exists},
+        force_reason     => $force,
+        stale_count      => ($in{stale_count} // 0),
+    );
+    my $asked = wants(%state);
+    # The launcher passes an operator answer ONLY when it actually prompted.
+    my $p = plan(%state, operator => ($asked ? $in{operator} : undef));
+    return { %$p, force_reason => $force, asked => $asked };
+}
+
+# --- The operator's exact scenario: host Z, container Y, NO image ------------
+{
+    my $r = launcher_would_do(
+        image_exists     => 0,
+        container_exists => 1,
+        recorded_version => '2.1.219',   # Y, what the container has
+        host_version     => '2.1.257',   # Z, what the host has
+        stale_count      => 0,
+    );
+
+    ok(defined $r->{force_reason},
+       'AC7 host Z + container Y + no image: the version mismatch FORCES');
+    is($r->{asked}, 0,
+       'AC7 ...so no prompt is put — "continue" is never on offer here')
+        or diag('  the label question was about a state that never reaches a label');
+    is($r->{rebuild}, 1, 'AC7 ...a rebuild happens');
+    is($r->{build_image}, 1, 'AC7 ...the image is built, at the HOST version');
+    is($r->{remove_container}, 1,
+       'AC7 ...AND the Y container is removed, so Z-image + Y-container cannot occur')
+        or diag('  building Z while keeping Y is the outcome asked about; '
+              . 'remove_container is what prevents it');
+}
+
+# Same, with stale reasons also present: forcing still wins and still does not ask.
+{
+    my $r = launcher_would_do(
+        image_exists => 0, container_exists => 1,
+        recorded_version => '2.1.219', host_version => '2.1.257',
+        stale_count => 4, operator => 'continue',
+    );
+    is($r->{asked}, 0, 'AC7 a forced mismatch suppresses the prompt even alongside stale reasons');
+    is($r->{rebuild}, 1, 'AC7 and a stray "continue" cannot weaken it');
+    is($r->{remove_container}, 1, 'AC7 the mismatched container is still removed');
+}
+
+# Unknown container version + no image: same treatment.
+{
+    my $r = launcher_would_do(
+        image_exists => 0, container_exists => 1,
+        recorded_version => undef, host_version => '2.1.257',
+    );
+    is($r->{asked}, 0, 'AC7 unknown container version + no image: forced, not asked');
+    is($r->{remove_container}, 1, 'AC7 and the unknown container is replaced');
+}
+
+# --- The case the "keep this container" label IS for -------------------------
+# Versions agree, image absent. Only here is continuing offered at all.
+{
+    my $r = launcher_would_do(
+        image_exists => 0, container_exists => 1,
+        recorded_version => '2.1.257', host_version => '2.1.257',
+        stale_count => 1, operator => 'continue',
+    );
+    is($r->{force_reason}, undef, 'AC7 matching versions do not force');
+    is($r->{asked}, 1, 'AC7 so the operator is asked');
+    is($r->{rebuild}, 0, 'AC7 continue keeps the container');
+    is($r->{remove_container}, 0, 'AC7 ...intact');
+    is($r->{build_image}, 1, 'AC7 ...while the absent image is still built');
+}
+
+# --- EXHAUSTIVE: a surviving container never has a version known to differ ----
+{
+    my $violations = 0;
+    my @versions = ('2.1.257', '2.1.219', undef, '');
+    for my $img (0, 1) {
+        for my $ctr (0, 1) {
+            for my $rv (@versions) {
+                for my $stale (0, 3) {
+                    for my $ans (undef, 'rebuild', 'continue', 'cancel') {
+                        my $r = launcher_would_do(
+                            image_exists => $img, container_exists => $ctr,
+                            recorded_version => $rv, host_version => '2.1.257',
+                            stale_count => $stale, operator => $ans);
+                        next if $r->{cancel};   # nothing proceeds
+                        next unless $ctr;       # no container to survive
+                        $violations++ if !$r->{remove_container} && defined $r->{force_reason};
+                    }
+                }
+            }
+        }
+    }
+    is($violations, 0,
+       'AC7 EXHAUSTIVE: no launch proceeds with a container whose version is known to differ')
+        or diag('  a surviving container plus a force reason IS the skew this must prevent');
+}
+
 done_testing();
