@@ -120,14 +120,31 @@ sub role_is_valid {
     return '';
 }
 
+# MAX_BUDGET_SECONDS (fixbatch 02-redteam / H1) -- the ceiling
+# stale_after_seconds honors before scaling a caller-supplied budget. 7 days
+# (604800s). Every real dispatch budget observed on this run tops out at
+# 3000s, so this is nowhere near a real ceiling being hit by accident; it
+# exists only to stop a budget the CLI's own /^\d+$/ guard admits (e.g.
+# --budget-seconds 999999999999999999999, which JSON round-trips as
+# 1e+21) from scaling stale_after_seconds() past any clock this process
+# will ever see, which is how a `running` record was made permanently
+# is_live/never-stale through the SANCTIONED CLI (H1). A non-finite value
+# (Inf/NaN, reachable only via a hand-edited record since the CLI's regex
+# already excludes them) is caught by the same `<=` comparison: Inf is
+# never <= MAX_BUDGET_SECONDS, NaN never satisfies any comparison, so both
+# fall through to the same default-budget path as 0/-5/'abc'/''.
+our $MAX_BUDGET_SECONDS = 7 * 24 * 60 * 60;
+
 # stale_after_seconds($budget_seconds) — PURE, always returns a defined
-# Int. A usable positive budget scales the threshold; anything else
-# (undef, 0, negative, non-numeric) falls back to the DEFAULT budget, not to
-# "never stale" — an absent/garbage budget must not make staleness
-# unreachable.
+# Int. A usable positive budget AT OR BELOW MAX_BUDGET_SECONDS scales the
+# threshold; anything else (undef, 0, negative, non-numeric, non-finite, or
+# an absurdly large budget — see MAX_BUDGET_SECONDS above) falls back to
+# the DEFAULT budget, not to "never stale" — an absent/garbage/oversized
+# budget must not make staleness unreachable.
 sub stale_after_seconds {
     my ($budget_seconds) = @_;
-    if (defined $budget_seconds && looks_like_number($budget_seconds) && $budget_seconds > 0) {
+    if (defined $budget_seconds && looks_like_number($budget_seconds)
+        && $budget_seconds > 0 && $budget_seconds <= $MAX_BUDGET_SECONDS) {
         return $STALE_BUDGET_MULTIPLE * $budget_seconds;
     }
     return $STALE_BUDGET_MULTIPLE * $DEFAULT_BUDGET_SECONDS;
@@ -298,7 +315,12 @@ use Scalar::Util qw(looks_like_number);
 my $MAIN_DIR = dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; Cwd::abs_path($f) // $f });
 require "$MAIN_DIR/bp-write-guard.pl";   # fixbatch step7 / MEDIUM-3: BpWrite::guarded_write
 
-my $ID_RE = qr/^[A-Za-z0-9._-]+$/;
+# fixbatch 02-redteam / M1: \z, not $ -- in Perl, $ matches BEFORE a
+# trailing newline, so "..\n" matches this class AND is not eq '..',
+# defeating both halves of the :348 guard below (and, independently,
+# loosening what --id itself accepts at :337+). \z anchors to the true end
+# of the string, no exception.
+my $ID_RE = qr/^[A-Za-z0-9._-]+\z/;
 
 sub usage_error {
     my ($msg) = @_;
@@ -552,29 +574,84 @@ unless (caller) {
             print STDOUT "UNVERIFIABLE: no record for $o{id}\n";
             exit 4;
         }
-        my $duration = BpDispatchLog::elapsed_seconds($rec->{started_at}, $now);
-        $rec->{status}           = $o{status};
-        $rec->{ended_at}         = $now;
-        $rec->{duration_seconds} = $duration;
+
+        # fixbatch 02-redteam / H2d: `finish` is a SECOND writer of the
+        # attribution fields `start` validates at :345-350/:352-356 — it
+        # reads them back off disk and rewrites them verbatim. A
+        # hand-edited (or otherwise foreign-written) record can carry
+        # anything in blueprint/package/role, and re-persisting that
+        # unvalidated is how this same writer would come to assert
+        # blueprint: "../../../etc" as if it had been checked. Refuse
+        # loudly instead (exit 2, naming the offending field) — consistent
+        # with `start`'s own refusal of the identical shapes, and
+        # deliberately NOT silently stripping or laundering the value,
+        # which would hide the anomaly instead of surfacing it.
+        for my $opt (qw(blueprint package)) {
+            my $v = $rec->{$opt};
+            next unless defined $v;
+            usage_error("finish: record field '$opt' ('$v') has an invalid shape "
+                       . "-- refusing to re-persist an unvalidated attribution value")
+                if $v !~ $ID_RE || $v eq '.' || $v eq '..';
+        }
+        if (defined $rec->{role} && !BpDispatchLog::role_is_valid($rec->{role})) {
+            usage_error("finish: record field 'role' ('$rec->{role}') must be one of: "
+                       . join(', ', @BpDispatchLog::ROLES)
+                       . " -- refusing to re-persist an unvalidated attribution value");
+        }
+
+        # fixbatch 02-redteam / H2b: a record with no usable started_at
+        # (absent, non-numeric -- e.g. hand-edited) must not have `finish`
+        # FABRICATE a duration via `$now - undef`/`$now - "text"`. `list`
+        # (:531) and `elapsed` (:502) already refuse to evaluate such a
+        # record; `finish` did not, and `finish` is the one branch whose
+        # bogus number gets PERSISTED (to the record AND, for `done`, to
+        # the append-only history.jsonl that future median_seconds reads
+        # from -- unlike the other two, this is not a one-off misreport,
+        # it is permanent skew). `finish` must still be able to CLOSE the
+        # record -- refusing outright would strand it as `running` forever,
+        # which reads as a live agent forever, a worse failure than a
+        # closed record with no duration. So: close it, but record neither
+        # a fabricated duration_seconds nor a history.jsonl line, and say
+        # why on stderr (mirrors AC39's existing "interrupted appends no
+        # history line" precedent -- finishing without a duration/history
+        # line is already a legitimate outcome of this command, not a new
+        # one).
+        my $has_duration = defined $rec->{started_at}
+                         && looks_like_number($rec->{started_at});
+        my $duration;
+        if ($has_duration) {
+            $duration = BpDispatchLog::elapsed_seconds($rec->{started_at}, $now);
+        } else {
+            print STDERR "bp-dispatch-log: warning: record for '$o{id}' has no usable "
+                       . "started_at -- closing it without a duration_seconds and without "
+                       . "appending a history.jsonl line\n";
+        }
+
+        $rec->{status}   = $o{status};
+        $rec->{ended_at} = $now;
+        $rec->{duration_seconds} = $duration if defined $duration;
         $rec->{report}           = $o{report} if defined $o{report};
         $rec->{note}             = $o{note}   if defined $o{note};
 
         BpDispatchLog::write_record($root, $rec)
             or do { print STDERR "bp-dispatch-log: could not write record for '$o{id}'\n"; exit 4 };
 
-        # Only a COMPLETED `done` dispatch contributes to the median. A
-        # duration cut short by intervention (interrupted/killed) is not
-        # representative of "how long this kind of work normally takes",
-        # and folding it in would silently pull the baseline toward the
-        # very failures the median exists to flag.
-        if ($o{status} eq 'done') {
+        # Only a COMPLETED `done` dispatch with a real duration contributes
+        # to the median. A duration cut short by intervention
+        # (interrupted/killed) is not representative of "how long this
+        # kind of work normally takes", and folding it in would silently
+        # pull the baseline toward the very failures the median exists to
+        # flag; an unevaluable duration (see H2b above) is not
+        # representative of anything at all.
+        if ($o{status} eq 'done' && defined $duration) {
             BpDispatchLog::append_history($root, {
                 worker_type      => $rec->{worker_type},
                 duration_seconds => $duration,
                 ended_at         => $now,
             }) or do { print STDERR "bp-dispatch-log: could not append history for '$o{id}'\n"; exit 4 };
         }
-        print "finished $o{id} (status=$o{status} duration_seconds=$duration)\n";
+        print "finished $o{id} (status=$o{status} duration_seconds="
+            . (defined $duration ? $duration : 'unknown') . ")\n";
         exit 0;
     }
     else {
