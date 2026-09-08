@@ -533,9 +533,13 @@ sub _resolve_clone_dir {
     # undocumented BACKUP_CLONE_DIR override worked.
     my $self_dir;
     eval {
-        my $abs = abs_path(__FILE__);
-        $abs =~ s{\\}{/}g if defined $abs;
-        $self_dir = dirname(dirname(dirname($abs))) if defined $abs;
+        # Normalise separators BEFORE deriving the directory: abs_path can return
+        # a backslashed path on Windows and dirname does not split on backslashes.
+        # Enforced by plugins/butler/tests/t/93-turn-cap-consistency.t (C9).
+        (my $self = __FILE__) =~ s{\\}{/}g;
+        my $abs = abs_path($self) // $self;
+        $abs =~ s{\\}{/}g;
+        $self_dir = dirname(dirname(dirname($abs)));
     };
     if (defined $self_dir && -d "$self_dir/.git") {
         my $norm_root = $root; $norm_root =~ s{/+\z}{};
