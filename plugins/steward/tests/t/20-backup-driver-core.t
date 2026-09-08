@@ -1620,6 +1620,332 @@ PERL
 }
 
 # =====================================================================
+# CONTRACT AMENDMENT (package 01, p16, backup-driver blueprint) --
+# phase_spec's OPTIONAL "crash_preserves_items" flag (default OFF).
+#
+# R6 (AC32 above) unconditionally wipes a phase's items/scratch on a
+# "running" re-entry (mid-execution death, cause unknown). Decision 5
+# needs a phase whose checkpoints are genuinely durable work (package 04's
+# per-project vault sync) to SURVIVE that wipe, without weakening R6 for
+# every other phase. This section pins the opt-in flag's exact contract:
+#   1. default OFF -- unchanged behavior, now asserted explicitly
+#   2. opted IN -- items survive a "running" re-entry; an already-
+#      checkpointed unit does not re-execute
+#   3. opted IN -- answers are STILL cleared unconditionally (the
+#      consent-replay guard is not negotiable, flag or no flag)
+#   4. opted IN -- scratch is STILL cleared unconditionally
+#   5. the "paused" re-entry path is unchanged for both flag states
+# =====================================================================
+
+# ---- stub 1: crash_preserves_items OFF (or simply absent) -- a checkpointed
+# unit must re-execute after a "running" re-entry, exactly as before this
+# amendment existed.
+my $STUB_CRASH_OFF_SRC = <<PERL;
+package Backup::Phase::StubCrashOff;
+use strict;
+use warnings;
+use POSIX ();
+
+sub phase_spec {
+    return { name => 'stub_crash_off', order => 100, resumable => 1, title => 'Stub Crash Off' };
+}
+
+sub run_phase {
+    my (\$ctx) = \@_;
+    _log('stub_crash_off_enter');
+
+    unless (\$ctx->{is_done}->('work')) {
+        \$ctx->{checkpoint}->('work', { done => 1 });
+        _log('stub_crash_off_work');
+    }
+
+    my \$marker = \$ENV{BACKUP_TEST_KILL_MARKER};
+    if (defined \$marker && length \$marker && !-e \$marker) {
+        open my \$mfh, '>', \$marker or die "cannot write marker \$marker: \$!";
+        close \$mfh;
+        POSIX::_exit(137);
+    }
+
+    return { status => 'complete' };
+}
+
+$LOG_HELPER
+
+1;
+PERL
+
+# ---- stub 2: crash_preserves_items ON -- the checkpointed unit must NOT
+# re-execute after a "running" re-entry, and scratch must still reset to
+# empty (tracked via a per-visit counter written into scratch itself).
+my $STUB_CRASH_ON_SRC = <<PERL;
+package Backup::Phase::StubCrashOn;
+use strict;
+use warnings;
+use POSIX ();
+
+sub phase_spec {
+    return { name => 'stub_crash_on', order => 100, resumable => 1,
+             crash_preserves_items => 1, title => 'Stub Crash On' };
+}
+
+sub run_phase {
+    my (\$ctx) = \@_;
+    _log('stub_crash_on_enter');
+
+    \$ctx->{scratch}{visits} = (\$ctx->{scratch}{visits} // 0) + 1;
+    \$ctx->{note}->('stub_crash_on_scratch_visits', "\$ctx->{scratch}{visits}");
+
+    unless (\$ctx->{is_done}->('work')) {
+        \$ctx->{checkpoint}->('work', { done => 1 });
+        _log('stub_crash_on_work');
+    }
+
+    my \$marker = \$ENV{BACKUP_TEST_KILL_MARKER};
+    if (defined \$marker && length \$marker && !-e \$marker) {
+        open my \$mfh, '>', \$marker or die "cannot write marker \$marker: \$!";
+        close \$mfh;
+        POSIX::_exit(137);
+    }
+
+    return { status => 'complete' };
+}
+
+$LOG_HELPER
+
+1;
+PERL
+
+# ---- stub 3: crash_preserves_items ON, PLUS a decision -- proves the flag
+# does not become a consent-replay hole: the item survives the crash, but
+# the answer must still be re-asked.
+my $STUB_CRASH_ANSWER_SRC = <<PERL;
+package Backup::Phase::StubCrashAnswer;
+use strict;
+use warnings;
+use POSIX ();
+
+sub phase_spec {
+    return { name => 'stub_crash_answer', order => 100, resumable => 1,
+             crash_preserves_items => 1, title => 'Stub Crash Answer' };
+}
+
+sub run_phase {
+    my (\$ctx) = \@_;
+    _log('stub_crash_answer_enter');
+
+    unless (\$ctx->{is_done}->('setup')) {
+        \$ctx->{checkpoint}->('setup', { done => 1 });
+        _log('stub_crash_answer_setup');
+    }
+
+    unless (defined \$ctx->{answers}{'stub_crash_answer.confirm'}) {
+        return { status => 'needs_decision', decisions => [ \$ctx->{decision}->(
+            id      => 'stub_crash_answer.confirm',
+            kind    => 'push_confirmation',
+            title   => 'Confirm the push?',
+            choices => [ { id => 'yes', label => 'Yes' }, { id => 'no', label => 'No' } ],
+        ) ] };
+    }
+
+    my \$marker = \$ENV{BACKUP_TEST_KILL_MARKER};
+    if (defined \$marker && length \$marker && !-e \$marker) {
+        open my \$mfh, '>', \$marker or die "cannot write marker \$marker: \$!";
+        close \$mfh;
+        POSIX::_exit(137);
+    }
+
+    return { status => 'complete' };
+}
+
+$LOG_HELPER
+
+1;
+PERL
+
+# ---- stub 4a/4b: the "paused" re-entry path, one WITHOUT and one WITH the
+# flag -- neither must be disturbed by this amendment (R6's paused branch
+# is untouched code).
+my $STUB_PAUSE_OFF_SRC = <<PERL;
+package Backup::Phase::StubPauseOff;
+use strict;
+use warnings;
+
+sub phase_spec {
+    return { name => 'stub_pause_off', order => 100, resumable => 1, title => 'Stub Pause Off' };
+}
+
+sub run_phase {
+    my (\$ctx) = \@_;
+    _log('stub_pause_off_enter');
+
+    unless (\$ctx->{is_done}->('mark')) {
+        \$ctx->{checkpoint}->('mark', { ok => 1 });
+        _log('stub_pause_off_mark');
+    }
+
+    unless (defined \$ctx->{answers}{'stub_pause_off.q'}) {
+        return { status => 'needs_decision', decisions => [ \$ctx->{decision}->(
+            id      => 'stub_pause_off.q',
+            kind    => 'push_confirmation',
+            title   => 'Proceed?',
+            choices => [ { id => 'yes', label => 'Yes' }, { id => 'no', label => 'No' } ],
+        ) ] };
+    }
+
+    return { status => 'complete' };
+}
+
+$LOG_HELPER
+
+1;
+PERL
+
+my $STUB_PAUSE_ON_SRC = <<PERL;
+package Backup::Phase::StubPauseOn;
+use strict;
+use warnings;
+
+sub phase_spec {
+    return { name => 'stub_pause_on', order => 100, resumable => 1,
+             crash_preserves_items => 1, title => 'Stub Pause On' };
+}
+
+sub run_phase {
+    my (\$ctx) = \@_;
+    _log('stub_pause_on_enter');
+
+    unless (\$ctx->{is_done}->('mark')) {
+        \$ctx->{checkpoint}->('mark', { ok => 1 });
+        _log('stub_pause_on_mark');
+    }
+
+    unless (defined \$ctx->{answers}{'stub_pause_on.q'}) {
+        return { status => 'needs_decision', decisions => [ \$ctx->{decision}->(
+            id      => 'stub_pause_on.q',
+            kind    => 'push_confirmation',
+            title   => 'Proceed?',
+            choices => [ { id => 'yes', label => 'Yes' }, { id => 'no', label => 'No' } ],
+        ) ] };
+    }
+
+    return { status => 'complete' };
+}
+
+$LOG_HELPER
+
+1;
+PERL
+
+# ---- property 1: default OFF -- items wiped, unit re-executes ----
+{
+    my $scn = new_scenario('StubCrashOff.pm' => $STUB_CRASH_OFF_SRC);
+    $scn->{kill_marker} = "$scn->{root}/crash-off-kill-marker";
+
+    my $r1 = run_backup($scn, '--json');
+    is($r1->{exit}, 137, '(setup) crash_preserves_items default-off: first invocation dies mid-execution (137)');
+
+    my $r2 = run_backup($scn, '--json');
+    is($r2->{exit}, 0, 'crash_preserves_items default-off: bare re-invocation completes the run')
+        or diag($r2->{out} . $r2->{err});
+    is($r2->{json}{status}, 'complete', 'crash_preserves_items default-off: status == "complete"');
+
+    my %counts = log_counts($scn->{log_path});
+    is($counts{stub_crash_off_work} // 0, 2,
+        'crash_preserves_items default-off (PINNED, unchanged R6 behavior): the checkpointed unit RE-EXECUTES after a "running" re-entry (items were wiped)');
+}
+
+# ---- property 2: opted IN -- items survive, unit does NOT re-execute; and
+# property 4: scratch is still cleared unconditionally when opted in ----
+{
+    my $scn = new_scenario('StubCrashOn.pm' => $STUB_CRASH_ON_SRC);
+    $scn->{kill_marker} = "$scn->{root}/crash-on-kill-marker";
+
+    my $r1 = run_backup($scn, '--json');
+    is($r1->{exit}, 137, '(setup) crash_preserves_items ON: first invocation dies mid-execution (137)');
+
+    my $r2 = run_backup($scn, '--json');
+    is($r2->{exit}, 0, 'crash_preserves_items ON: bare re-invocation completes the run')
+        or diag($r2->{out} . $r2->{err});
+    is($r2->{json}{status}, 'complete', 'crash_preserves_items ON: status == "complete"');
+
+    my %counts = log_counts($scn->{log_path});
+    is($counts{stub_crash_on_work} // 0, 1,
+        'crash_preserves_items ON: the checkpointed unit does NOT re-execute after a "running" re-entry (items survived)');
+
+    my @visit_notes = grep { ($_->{key} // '') eq 'stub_crash_on_scratch_visits' } @{ $r2->{json}{notes} // [] };
+    is(scalar(@visit_notes), 2, 'crash_preserves_items ON: scratch visit counter was noted on both invocations');
+    if (scalar(@visit_notes) == 2) {
+        is($visit_notes[0]{value}, '1', 'crash_preserves_items ON: scratch on the first invocation starts at 1');
+        is($visit_notes[1]{value}, '1',
+            'crash_preserves_items ON: scratch STILL RESETS to 1 on the second invocation (scratch cleared unconditionally even when items survive)');
+    }
+    else {
+        ok(0, 'crash_preserves_items ON: scratch on the first invocation starts at 1');
+        ok(0, 'crash_preserves_items ON: scratch STILL RESETS to 1 on the second invocation (scratch cleared unconditionally even when items survive)');
+    }
+}
+
+# ---- property 3 (the critical one): opted IN, but answers are STILL
+# cleared unconditionally on a "running" re-entry -- the flag must not
+# become a consent-replay hole. Also re-confirms property 2 (the earlier
+# checkpointed item is NOT re-executed) inside the same crash/resume cycle
+# that clears the answer, so the two guarantees are proven to co-exist. ----
+{
+    my $scn = new_scenario('StubCrashAnswer.pm' => $STUB_CRASH_ANSWER_SRC);
+    $scn->{kill_marker} = "$scn->{root}/crash-answer-kill-marker";
+
+    my $r1 = run_backup($scn, '--json');
+    is($r1->{json}{status}, 'needs_decision', '(setup) crash_preserves_items ON + decision: pauses for consent');
+    my $token = $r1->{json}{resume_token};
+
+    my $r2 = run_backup($scn, '--json', '--resume', ($token // ''), '--answer', 'stub_crash_answer.confirm=yes');
+    is($r2->{exit}, 137, '(setup) crash_preserves_items ON + decision: dies immediately after receiving the consent answer');
+
+    my $r3 = run_backup($scn, '--json');
+    is($r3->{json}{status}, 'needs_decision',
+        'crash_preserves_items ON + decision: re-entering a "running" phase STILL clears its stored answer (must ask again, same as R6 without the flag)');
+
+    my %counts = log_counts($scn->{log_path});
+    is($counts{stub_crash_answer_setup} // 0, 1,
+        'crash_preserves_items ON + decision: the item checkpointed before the decision did NOT re-execute (items survived the crash even though the answer did not)');
+
+    # Answer it again and let the run actually finish, closing the loop.
+    my $token2 = $r3->{json}{resume_token};
+    my $r4 = run_backup($scn, '--json', '--resume', ($token2 // ''), '--answer', 'stub_crash_answer.confirm=yes');
+    is($r4->{exit}, 0, 'crash_preserves_items ON + decision: re-answering completes the run')
+        or diag($r4->{out} . $r4->{err});
+}
+
+# ---- property 5: the "paused" re-entry path is unaffected by this
+# amendment, for BOTH flag states (R6's paused branch is untouched code) ----
+{
+    my $scn = new_scenario('StubPauseOff.pm' => $STUB_PAUSE_OFF_SRC);
+    my $r1 = run_backup($scn, '--json');
+    is($r1->{json}{status}, 'needs_decision', '(setup) paused-path, flag OFF: pauses for consent');
+    my $token = $r1->{json}{resume_token};
+
+    my $r2 = run_backup($scn, '--json', '--resume', ($token // ''), '--answer', 'stub_pause_off.q=yes');
+    is($r2->{exit}, 0, 'paused-path, flag OFF: resume completes') or diag($r2->{out} . $r2->{err});
+
+    my %counts = log_counts($scn->{log_path});
+    is($counts{stub_pause_off_mark} // 0, 1,
+        'paused-path, flag OFF: the item checkpointed before the pause is NOT re-executed across a paused re-entry (unchanged behavior)');
+}
+{
+    my $scn = new_scenario('StubPauseOn.pm' => $STUB_PAUSE_ON_SRC);
+    my $r1 = run_backup($scn, '--json');
+    is($r1->{json}{status}, 'needs_decision', '(setup) paused-path, flag ON: pauses for consent');
+    my $token = $r1->{json}{resume_token};
+
+    my $r2 = run_backup($scn, '--json', '--resume', ($token // ''), '--answer', 'stub_pause_on.q=yes');
+    is($r2->{exit}, 0, 'paused-path, flag ON: resume completes') or diag($r2->{out} . $r2->{err});
+
+    my %counts = log_counts($scn->{log_path});
+    is($counts{stub_pause_on_mark} // 0, 1,
+        'paused-path, flag ON: the item checkpointed before the pause is NOT re-executed across a paused re-entry (paused branch unaffected by the amendment)');
+}
+
+# =====================================================================
 # AC19 -- perl -c is clean on all three files
 # =====================================================================
 {

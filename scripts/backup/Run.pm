@@ -23,6 +23,26 @@
 # vault-sync.pl's git_path) -- see CLAUDE.md's MSYS2 landmine writeup. It
 # must not be set here, because doing so process-wide would silently change
 # the environment every later phase module inherits.
+#
+# CONTRACT AMENDMENT (package 01, p16) -- crash_preserves_items: an OPTIONAL
+# phase_spec flag, default OFF. R6 below says a "running" re-entry (a phase
+# died mid-execution, cause unknown) wipes that phase's checkpointed items,
+# because ordinarily an item is only a CLAIM of work done and cannot be
+# trusted after an unexplained death. That is correct for cheap, freely
+# repeatable units -- and it is what t/21 and t/22 depend on, unconditionally,
+# so it stays the default. But Decision 5 ("every mechanical step must be
+# resumable... one vault sync was killed after 90 minutes with its progress
+# unrecoverable") makes a per-project checkpoint in a long-running phase
+# (package 04's Vault.pm) a genuinely durable record, not a mere claim --
+# wiping it on an unrelated crash would recreate exactly the loss Decision 5
+# exists to prevent. So this is opt-in, per phase, rather than a global
+# change to R6: whether an item is safe to trust after a death depends on
+# WHAT it records (a cheap idempotent step vs. 90 minutes of sync), and only
+# the phase author knows that. A phase that sets this flag MUST confirm its
+# consequential successes against reality rather than trusting its own
+# bookkeeping blindly -- see Export.pm's `ls-remote` check (package 03/05),
+# needed because on Windows a signal death behind a .cmd wrapper is invisible
+# to $?. See the R6 handling inside execute() for the exact mechanics.
 
 package Backup::Run;
 use strict;
@@ -336,6 +356,13 @@ sub discover_phases {
             name      => $spec->{name},
             order     => $spec->{order} + 0,
             resumable => $spec->{resumable} ? 1 : 0,
+            # crash_preserves_items (contract amendment, package 01 p16, see
+            # header comment above execute()'s R6 handling for the full
+            # rationale): OPTIONAL and OFF unless a phase spec explicitly
+            # sets it truthy -- absence means exactly the same "()" as
+            # before this flag existed, which is what keeps t/21 and t/22
+            # (neither of which mentions this key) byte-for-byte unaffected.
+            crash_preserves_items => $spec->{crash_preserves_items} ? 1 : 0,
             title     => $spec->{title},
             pkg       => $pkg,
             run_fn    => $run_fn,
@@ -706,15 +733,52 @@ sub _execute_impl {
         # R6 (coordinator ruling, closes a MAJOR): an answer authorises ONE
         # attempt, not a phase forever. Re-entering a phase whose PRIOR
         # status was "running" means it died mid-execution -- what it did
-        # is unknown -- so its items/scratch AND any of its own answers are
-        # cleared, regardless of the resumable flag: a stale "yes" consent
-        # must never be silently replayed after a mid-execution kill.
+        # is unknown. ANSWERS ARE ALWAYS CLEARED HERE, regardless of the
+        # resumable flag AND regardless of crash_preserves_items below: a
+        # stale "yes" consent must never be silently replayed after a
+        # mid-execution kill. This half of R6 is not negotiable -- it is
+        # the consent-replay guard, and no phase_spec flag opts out of it.
         # Re-entering after "paused" PRESERVES answers (that is the whole
         # point of the pause/answer cycle, AC13/AC32 depend on it); for a
         # non-resumable phase it still clears items/scratch on that path,
         # unchanged from before this ruling.
         if ($prior_pstatus eq 'running') {
-            $pstate->{items}   = {};
+            # crash_preserves_items (contract amendment, package 01 p16):
+            # DEFAULT OFF. A phase that does not opt in behaves exactly as
+            # R6 originally specified -- items AND scratch both wiped on a
+            # "running" re-entry, because what a died phase actually did is
+            # unknown and an item is ordinarily a claim, not a verified
+            # fact.
+            #
+            # When a phase DOES opt in, it is declaring that its
+            # checkpointed items are durable records of completed work
+            # rather than merely a claim -- e.g. Vault.pm's per-project
+            # sync checkpoints (package 04, Decision 5: "every mechanical
+            # step must be resumable... one vault sync was killed after 90
+            # minutes with its progress unrecoverable"). Wiping those on an
+            # unrelated mid-execution death would force a full re-sync,
+            # exactly the loss Decision 5 exists to prevent -- so for an
+            # opted-in phase, items SURVIVE a "running" re-entry. scratch
+            # is transient working state (not a checkpoint), so it is
+            # cleared unconditionally either way.
+            #
+            # SAFETY CONDITION for any phase that opts in: an item is a
+            # record of work COMPLETED, not an authorisation, so it is only
+            # safe to trust after an unexplained death if the phase
+            # confirms consequential successes against reality rather than
+            # trusting its own bookkeeping -- Export.pm does this with
+            # `ls-remote` (package 03/05) because on Windows a signal death
+            # behind a .cmd wrapper is invisible to $? (see CLAUDE.md). A
+            # phase that checkpoints cheap, freely-repeatable idempotent
+            # units has no need for this flag at all; it belongs only to
+            # phases whose checkpoints represent genuinely expensive,
+            # externally-verifiable work.
+            #
+            # This is deliberately per-phase (an opt-in flag), never
+            # process-wide: t/21 and t/22 are already-shipped, committed,
+            # green siblings that depend on the UNCONDITIONAL clear -- a
+            # global change here would silently break both.
+            $pstate->{items} = {} unless $ph->{crash_preserves_items};
             $pstate->{scratch} = {};
             if (ref($state->{answers}) eq 'HASH') {
                 my $prefix = "$name.";
