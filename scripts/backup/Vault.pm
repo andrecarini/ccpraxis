@@ -161,7 +161,20 @@ sub run_phase {
         my ($unit, $msg) = @_;
         return unless defined $msg;
         my $durable = $load_failures->();
-        $durable->{$unit} = $msg;
+        # red-team finding (backup-driver package 04 errfix): unlike every
+        # success payload handed to $ctx ($kv/$j/$rj/$sj/$cj, all run
+        # through _sanitize_utf8 above), $msg here can be a raw stdout/
+        # stderr snippet from a failed child (_interpret_response /
+        # _interpret_todo_sync build these from unparsed bytes when a
+        # child dies before emitting valid JSON). backup.pl's own stdout
+        # encoder has no ->utf8 (S1.8) -- ONE unsanitised byte here does
+        # not just garble this message, it makes the driver's entire
+        # stdout unparseable, destroying the pause payload and the resume
+        # token for a phase whose whole reason to exist is not losing
+        # progress on a long-running vault sync. Sanitise at this single
+        # choke point so every caller of record_failure is covered
+        # regardless of whether it also sanitised upstream.
+        $durable->{$unit} = _sanitize_utf8($msg);
         $ctx->{checkpoint}->($failure_key, $durable);
     };
     my $record_success = sub {
@@ -775,12 +788,21 @@ sub _interpret_response {
             my $body_err = $j->{error};
             my $msg = "$label exited $r->{exit}";
             $msg .= ": $body_err" if defined $body_err && length "$body_err";
-            return (0, $j, $msg);
+            # errfix: sanitise the error string on this path too, same
+            # discipline as $kv/$j/$sj/$cj on the success path below --
+            # $body_err is decode_json output (already valid UTF-8 if the
+            # parse succeeded) but this is the single choke point every
+            # caller relies on, so make it unconditionally safe rather than
+            # trusting each call site to remember.
+            return (0, $j, _sanitize_utf8($msg));
         }
-        return (0, undef, "$label exited $r->{exit}: " . _stdout_or_stderr_snippet($r));
+        # _stdout_or_stderr_snippet returns RAW child bytes (stdout/stderr)
+        # when JSON parsing failed -- exactly the shape that corrupts
+        # backup.pl's whole stdout stream if handed to $ctx unsanitised.
+        return (0, undef, _sanitize_utf8("$label exited $r->{exit}: " . _stdout_or_stderr_snippet($r)));
     }
     unless (ref($j) eq 'HASH') {
-        return (0, undef, "$label produced unparseable output: " . _stdout_or_stderr_snippet($r));
+        return (0, undef, _sanitize_utf8("$label produced unparseable output: " . _stdout_or_stderr_snippet($r)));
     }
     return (1, $j, undef);
 }
@@ -803,13 +825,19 @@ sub _interpret_todo_sync {
         my $msg = "todo-sync.pl exited $r->{exit}";
         if (defined $kv{ERROR} && length $kv{ERROR}) { $msg .= ": $kv{ERROR}"; }
         elsif (defined $r->{err} && length $r->{err}) { $msg .= ': (stdout had no ERROR: line) stderr: ' . _clamp($r->{err}, 200); }
-        return (\%kv, $msg);
+        # errfix: $kv{ERROR} and the stderr clamp above are both raw child
+        # bytes -- %kv itself only gets sanitised by the CALLER
+        # (run_phase's `$kv = _sanitize_utf8($kv)`), which never touches
+        # $msg, a separate return value. Sanitise here so this failure
+        # string is safe on its own regardless of what the caller does with
+        # %kv.
+        return (\%kv, _sanitize_utf8($msg));
     }
     unless (defined $status && ($status eq 'ok' || $status eq 'synced')) {
         my $msg = "todo-sync.pl reported status '" . (defined $status ? $status : '(none)') . "'";
         if (defined $kv{ERROR} && length $kv{ERROR}) { $msg .= ": $kv{ERROR}"; }
         elsif (defined $r->{err} && length $r->{err}) { $msg .= ': (stdout had no ERROR: line) stderr: ' . _clamp($r->{err}, 200); }
-        return (\%kv, $msg);
+        return (\%kv, _sanitize_utf8($msg));
     }
     return (\%kv, undef);
 }
