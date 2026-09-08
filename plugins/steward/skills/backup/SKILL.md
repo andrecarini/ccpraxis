@@ -3,573 +3,231 @@ name: backup
 description: Syncs everything personal between the live host and your private repos — ccpraxis config (global + container) AND every project registered for vault backup (CLAUDE.md, skills, plans, memory). Scans for secrets before pushing. Resolves vault sync conflicts interactively. If you're in a project that has trackable Claude files but isn't registered for backup, offers to register it. Also surfaces Claude Code binary snapshots taken by /update and supports manual revert. Use when the user wants to sync config, back up settings, push config changes, sync vault projects, list/revert Claude Code snapshots, or says "backup", "sync config", "push config", "sync everything", "back up my work", "revert claude code", "list claude snapshots", "rollback claude".
 user-invocable: true
 host-only: true
-allowed-tools: Bash, Read, Write, Edit, AskUserQuestion, Skill
+allowed-tools: Bash, AskUserQuestion, Skill
 ---
 
-## Two modes
+This skill is a thin wrapper. Every mechanical step — git, file merges, the vault, the
+secret scan, the report — is owned by a driver script. The wrapper's whole job is:
+invoke the driver, present its decisions, relay its report, re-invoke with the answers.
 
-This skill has two modes:
+## Modes
 
-1. **Default (full sync):** when the user says "backup", "sync config", etc. — run Steps 1 through 7 below (full config + vault sync).
-2. **Snapshot/revert (Step R):** when the user says "revert claude code", "list snapshots", "rollback claude code", "restore claude code binary", or similar — skip directly to **Step R** at the bottom. Don't run the full sync flow.
+Two modes, chosen by intent:
 
-If intent is unclear, use AskUserQuestion to choose.
+1. **Full sync (default).** Intent like "backup", "sync config", "push config", "sync
+   everything", "back up my work" — go to **Running the driver**.
+2. **Snapshot/revert.** Intent like "revert claude code", "list snapshots", "rollback
+   claude code", "restore claude code binary" — go directly to **Snapshot/revert mode**
+   and never invoke the driver.
 
-Sync your ccpraxis between `~/.claude/` (live) and the export repo at `~/.claude/ccpraxis/`, then sync every vault-registered project at `~/.claude/claude-code-vault/projects/<slug>/`.
+If intent is unclear, ask with `AskUserQuestion` before doing either.
 
-## Step 1: Integrate remote
+## Running the driver
 
-```bash
-cd "$HOME/.claude/ccpraxis" && git fetch origin 2>&1 || true
+The full-sync path never touches git, files, or vault contents directly. Every call is
+to `perl ~/.claude/ccpraxis/scripts/backup.pl` (the driver — lives at the ccpraxis repo
+root, not `${CLAUDE_PLUGIN_ROOT}`). The wrapper's loop is: invoke, branch on the exit
+code, answer, re-invoke.
+
+**First invocation** — no `--restart`, no `--resume`:
+
+```
+perl ~/.claude/ccpraxis/scripts/backup.pl run --json
 ```
 
-If the repo has no remote configured, skip this step silently.
+Exactly one JSON object is written to stdout per invocation. On an error exit the driver
+also writes one `backup: <message>` line to stderr — redirect stderr separately, or parse
+the JSON line out and ignore that one; do not treat its presence as "stdout did not parse".
+Stop and show the raw output verbatim only if no JSON object is present at all — never
+guess an exit meaning from text.
 
-If remote has new commits, integrate them now so the repo is fully up to date before syncing:
-
-```bash
-cd "$HOME/.claude/ccpraxis"
-# Stash any uncommitted local changes (from /steward:ccpraxis-extend, manual edits, etc.)
-git stash 2>&1 || true
-# Merge remote — fast-forward when possible, merge commit when diverged
-git merge origin/main --no-edit 2>&1
-# Re-apply stashed changes
-git stash pop 2>&1 || true
-```
-
-If the merge or stash pop produces conflicts, resolve them automatically by reading both versions and producing a clean merge. Only use AskUserQuestion if both sides made substantial, incompatible changes to the same section and the right resolution is genuinely ambiguous.
-
-After this step, the repo is fully up to date with remote.
-
-## Step 1.2: README drift pre-flight
-
-Before committing or pushing, make sure the docs still describe the repo as it actually is on disk. Two cheap linters catch the common drift cases — they exist precisely so we don't ship docs that reference files we renamed or deleted.
-
-Note the split: `README.md` is the front door (pitch, quick start, what you type), while the reference material lives in `docs/reference.md`, `docs/install-protocol.md`, and the generated `docs/repo-layout.md`.
-
-```bash
-perl ~/.claude/ccpraxis/scripts/lint-readme-paths.pl
-perl ~/.claude/ccpraxis/scripts/gen-readme-tree.pl --check
-```
-
-Handle each:
-
-- **`lint-readme-paths.pl`** — fails (exit 1) when an inline backticked path (e.g. ``` `scripts/foo.pl` ```) doesn't resolve on disk. Stdout names each missing path with its README line number. Surface them to the user and offer to fix: either correct the path in the README, or — if the backtick is an intentional non-host reference (container-internal etc.) — add the literal to `scripts/lint-readme-paths.allow`.
-
-- **`gen-readme-tree.pl --check`** — fails (exit 1) when the file-tree section between the `<!-- BEGIN-FILE-TREE -->` markers in **`docs/repo-layout.md`** is stale. (It reads and writes that file, not the README — the tree was moved out of the front page. The script's messages still say "README"; the file it means is `docs/repo-layout.md`.) The fix is mechanical: run `perl ~/.claude/ccpraxis/scripts/gen-readme-tree.pl --write` to regenerate the tree, then re-read that page — newly-added entries appear with no description until you write a `.about` sidecar (or a plugin.json / SKILL.md / script-comment description) for them. Ask the user before running `--write` if there are entries to describe; if it's just structural (an existing entry moved), running `--write` directly is fine.
-
-Don't auto-fix without confirmation — drift sometimes signals intent (e.g. the user moved a file but the description is still accurate, just needs a path update). When in doubt, surface and ask.
-
-## Step 1.5: Ensure local installation is up to date
-
-Make sure the local `~/.claude/` is wired up correctly. This catches new skills, updated CLAUDE.md, and settings changes from remote or local edits.
-
-**Skills:** Mirror every skill in `~/.claude/ccpraxis/skills/` to `~/.claude/skills/`. Symlink on Unix, copy on Windows. Idempotent — `unchanged` rows mean nothing was touched.
-
-```bash
-perl ${CLAUDE_PLUGIN_ROOT}/scripts/ccpraxis-helpers.pl sync-skills
-```
-
-Parse the JSON. If `status` is `partial`, surface the per-skill errors. Otherwise mention any non-`unchanged` results in the Step 7 report. Do NOT iterate the loop yourself — the script owns the file-system writes.
-
-**CLAUDE.md:**
-
-```bash
-perl ${CLAUDE_PLUGIN_ROOT}/scripts/ccpraxis-helpers.pl check-claude-md
-```
-
-Parse the JSON `status`:
-- `linked` or `equal_content` — silently OK, no action.
-- `differs` (Windows) or `symlinked_elsewhere` (Unix) — flag it in the Step 7 report. Don't change it automatically (the user may have intentionally merged content).
-- `missing_live` / `missing_repo` — flag prominently.
-
-**settings.json:** Before making any changes to `~/.claude/settings.json`, create a timestamped backup:
-
-```bash
-cp ~/.claude/settings.json "$HOME/.claude/settings.json.$(date +%Y-%m-%dT%H%M%S)"
-```
-
-Do NOT auto-modify the live settings without user approval. Run the semantic diff filtered through saved preferences:
-
-```bash
-perl "${CLAUDE_PLUGIN_ROOT}/scripts/json-diff.pl" ~/.claude/settings.json ~/.claude/ccpraxis/global-config/settings.json \
-  | perl "${CLAUDE_PLUGIN_ROOT}/scripts/filter-diff.pl" --prefs "$HOME/.claude/ccpraxis/.backup-preferences.json" --scope live_vs_repo
-```
-
-This outputs a JSON report with:
-- `auto_applied` — keys skipped due to saved preferences (notify the user these were applied)
-- `needs_decision` — keys requiring user input, grouped by `only_left`, `only_right`, `diverged`
-- `has_undecided` — boolean, whether any keys need a decision
-
-Note: keys whose values are nested objects on both sides (like `env`, `enabledPlugins`) are expanded to dotted sub-keys (e.g., `env.DISABLE_LOGIN_COMMAND`). Present each sub-key as an individual decision.
-
-If `status` is `"identical"`, skip silently. If there are `auto_applied` entries, list them briefly (e.g. "Applied 2 saved preferences: `key1` (intentionally different), `key2` (live-only)").
-
-For each key in `needs_decision`, use AskUserQuestion to present the difference and let the user choose:
-
-- For `diverged` keys:
-  - **"Use live value"** — one-time sync; repo will be updated during export in Step 3
-  - **"Use repo value"** — update the live settings.json with the repo value
-  - **"Keep different (remember)"** — leave both as-is and save preference so this key is not asked about again
-  - **"Skip"** — leave both sides as-is (will be asked again next sync)
-- For `only_left` keys (only in live):
-  - **"Export to repo"** — repo will pick it up during export in Step 3
-  - **"Keep live-only (remember)"** — save preference so this key is not asked about again
-  - **"Skip"** — will be asked again next sync
-- For `only_right` keys (only in repo):
-  - **"Add to live"** — update live settings.json with the repo value
-  - **"Keep repo-only (remember)"** — save preference so this key is not asked about again
-  - **"Skip"** — will be asked again next sync
-
-**Record every key the user answered "Skip" on** — you pass them to the export merge in Step 3 as `--skip-key`. Without that, "Skip" wouldn't mean what it says: the merge would still push a `only_left` key into the repo, or overwrite a `diverged` one with the live value. Use the key name exactly as the diff reported it, dotted form included (`env.DISABLE_LOGIN_COMMAND`). Passing a skipped `only_right` key too is harmless (the merge preserves repo-only keys anyway), so when in doubt pass them all rather than case-analyzing which ones matter.
-
-For any choice that includes "(remember)", save the preference:
-
-```bash
-perl "${CLAUDE_PLUGIN_ROOT}/scripts/save-preference.pl" \
-  --prefs "$HOME/.claude/ccpraxis/.backup-preferences.json" \
-  --scope live_vs_repo --key "<KEY>" --category "<CATEGORY>" --action "<ACTION>"
-```
-
-Map each "(remember)" option to its `--category` and `--action`:
-
-| Option label | `--category` | `--action` |
+| exit | status | what the wrapper does |
 |---|---|---|
-| Keep different (remember) | `diverged` | `skip-always` |
-| Keep live-only (remember) | `only_left` | `left-only` |
-| Keep repo-only (remember) | `only_right` | `right-only` |
+| 0 | complete | go to **Relaying the report**, then **Follow-up actions**, then stop. |
+| 20 | complete_with_failures | go to **Relaying the report** (it surfaces the failures) and **Follow-up actions**, then stop — never report this as a clean backup. |
+| 10 | needs_decision | go to **Presenting decisions** for every entry of `decisions[]`, collect one choice per decision, then re-invoke (see the resume form below) with `--resume <resume_token>` and one `--answer <id>=<choice-id>` per decision, all in the same call. Leaving any pending decision unanswered is refused (exit 4, `answer_missing`) — answer them together, never partially. |
+| 2 | usage | a wrapper bug: stop, show `error.message`, change nothing. |
+| 3 | token error | `token_missing` (no token held — a new session, or a crashed one): report that a paused run exists and ask the operator whether to `--restart` (discard it and start fresh) or stop — never restart silently, that drops pending decisions and re-runs completed phases. `token_malformed` / `token_unknown` / `token_replayed`: stop, show `error.message`, never retry the same token — `token_replayed` is terminal, that token is spent forever; offer `--restart` only as an explicit escape hatch taken on the operator's own word. |
+| 4 | answer refused | the wrapper's own bug (`answer_unknown_id`, `answer_duplicate`, `answer_unknown_choice`, `answer_missing`). `consumed_seq` is written only after a successful resume, so on this path it is still unwritten and the resume token is still valid — that makes the run recoverable, but recovery means going back to **Presenting decisions** and asking the operator again for every pending decision, with the same token. `decisions[]` carries the choices that were OFFERED, never the operator's selections, so it cannot be replayed or re-derived into answers — never fabricate an answer from it. A second exit 4 after a genuine re-ask stops the loop and shows `error.message` verbatim. |
+| 1 | internal | stop, surface `error.code` and `error.message`; never auto-restart — restarting repeats completed phases. |
 
-**Marketplaces:** Detect discrepancies between live and repo `known_marketplaces.json` (the script strips `installLocation` before comparing):
+**Resume invocation** (exit 10, one `--answer` per pending decision, all in the same call):
 
-```bash
-perl ${CLAUDE_PLUGIN_ROOT}/scripts/ccpraxis-helpers.pl marketplace-diff
+```
+perl ~/.claude/ccpraxis/scripts/backup.pl run --json --resume <resume_token> --answer <id>=<choice-id> [--answer <id>=<choice-id> ...]
 ```
 
-Parse the JSON. If `status` is `identical`, skip silently. If there are `auto_applied` entries, list them briefly (e.g. "Applied 1 saved marketplace preference: `ccpraxis-local` (live-only)") — same shape as the settings steps above.
+**Restart invocation** (exit 3 `token_missing`, only on the operator's own word — discards
+the paused run):
 
-Otherwise iterate `live_only`, `repo_only`, and `diverged` — for each discrepancy, use AskUserQuestion to present the difference and let the user choose. **Every case carries a "(remember)" option.** A discrepancy whose answer is permanent must not be asked twice: `ccpraxis-local` is a directory-source entry whose path is absolute on this machine and is registered per-machine by `install.pl`, so it is live-only forever — and before preferences existed here, backup asked about it on every single run.
-
-- **Marketplace in live but not repo** (added locally):
-  - **"Export to repo"** — will be included in the repo version
-  - **"Keep live-only (remember)"** — save the preference; never asked again
-  - **"Remove locally"** — remove with `/plugin marketplace remove <name>`
-  - **"Skip"** — leave both sides as-is (same discrepancy next sync)
-
-- **Marketplace in repo but not live** (from another machine, or removed locally):
-  - **"Add locally"** — add with `/plugin marketplace add <source>` (`<owner>/<repo>` for GitHub, URL for others)
-  - **"Keep repo-only (remember)"** — save the preference; never asked again
-  - **"Remove from repo"** — will be excluded from the repo version
-  - **"Skip"** — leave both sides as-is (same discrepancy next sync)
-
-- **Same marketplace, different `source`** (source URL changed):
-  - **"Use live"** — repo will be updated to match
-  - **"Use repo"** — inform the user to `/plugin marketplace remove <name>` and `/plugin marketplace add <repo-source>` to update locally
-  - **"Keep different (remember)"** — save the preference; never asked again
-  - **"Skip"** — leave both sides as-is (same discrepancy next sync)
-
-For any "(remember)" choice, save it under the `marketplaces` scope — the key is the marketplace NAME:
-
-```bash
-perl "${CLAUDE_PLUGIN_ROOT}/scripts/save-preference.pl" \
-  --prefs "$HOME/.claude/ccpraxis/.backup-preferences.json" \
-  --scope marketplaces --key "<NAME>" --category "<CATEGORY>" --action "<ACTION>"
+```
+perl ~/.claude/ccpraxis/scripts/backup.pl run --json --restart
 ```
 
-| Option label | `--category` | `--action` |
+Repeat the exit-10 branch until a terminal exit. Bound the loop at **20 driver
+invocations**; if that bound is hit, stop, say plainly that the backup is **incomplete**
+(never summarise it as done), and print the resume token so the operator can continue
+this same run in a fresh session rather than restarting it and re-running completed
+phases.
+
+## Presenting decisions
+
+The wrapper must never answer, select, or invent a choice on behalf of the operator —
+every decision requires the operator's own selection via `AskUserQuestion`, obtained
+fresh each time it is needed; synthesizing or guessing one, even from a prior answer
+or from `decisions[]` itself, is not allowed. `decisions[]` is a record of the choices
+OFFERED, not of anything the operator selected, so it can never stand in for consent.
+
+Every entry of `decisions[]` follows the same shape: `title` is the question text,
+`detail` and any `data` payload are shown to the operator BEFORE the question,
+`choices[]` become the `AskUserQuestion` options labelled with each choice's `label`,
+and the operator's selection is mapped back to that choice's `id` for
+`--answer <id>=<choice-id>`. If a decision carries more choices than one
+`AskUserQuestion` question can display, split it (narrow first, then choose) or fall
+back to free-form text — never silently drop a choice, and never invent one.
+
+For a `kind` not in the table below (a driver newer than this skill), fall back to
+the generic presentation: show `title` + `detail` + `choices` verbatim and never
+guess a default.
+
+| kind | what it is | how to present it |
 |---|---|---|
-| Keep live-only (remember) | `only_left` | `left-only` |
-| Keep repo-only (remember) | `only_right` | `right-only` |
-| Keep different (remember) | `diverged` | `skip-always` |
-
-After all choices, write the reconciled result to `global-config/known_marketplaces.json`. Strip `installLocation` from each entry before writing (paths are machine-specific). If no discrepancies exist, skip silently.
-
-## Step 2: Detect differences
-
-Run the detection script:
-
-```
-perl "${CLAUDE_PLUGIN_ROOT}/scripts/sync-export.pl"
-```
-
-This outputs JSON describing each file's sync status:
-- `identical` — no action needed
-- `live_only` — exists in live but not export → copy to export
-- `export_only` — exists in export but not live → copy to live
-- `conflict` — both sides differ → needs merge (Step 2)
-- `settings_changed` — settings.json differs (merge needed)
-- `marketplace_changed` — known_marketplaces.json differs (already reconciled in Step 1.5)
-- `container_settings_diverged` — plugins/sandbox/container/settings.json has shared keys that differ from global-config (Step 3.5)
-
-## Step 3: Handle each file
-
-For **identical** files: skip, report as in sync.
-
-For **live_only** / **export_only**: copy the file to the missing side.
-
-For **settings_changed**: run the deterministic merge script. Live wins on shared keys and keys only in repo are preserved — except where the user has said otherwise. The script reads `.backup-preferences.json` itself (`live_vs_repo` scope) and honors it: `skip-always` and `right-only` keep the repo's value, `left-only` stays out of the repo entirely. Append one `--skip-key` per key the user answered "Skip" on in Step 1.5. Don't hand-merge JSON — the script handles atomic write and post-write verification:
-
-```bash
-perl ${CLAUDE_PLUGIN_ROOT}/scripts/ccpraxis-helpers.pl settings-export-merge \
-  --skip-key "<KEY>" --skip-key "<KEY>"
-```
-
-(Drop the `--skip-key` flags entirely when nothing was skipped.)
-
-Surface the result. If `status: error`, stop and report the JSON. Otherwise report, for Step 7:
-
-- `preferences_applied` — what a saved preference or a `--skip-key` protected, with the `effect` string. Worth one line each; this is the user's earlier decisions visibly holding.
-- `preferences_ignored` — preferences whose saved `category` no longer matches the key's actual relation. These are dead entries in `.backup-preferences.json`; surface them so the user can re-decide (answering the key again in a later Step 1.5 with a "(remember)" option overwrites the stale entry).
-- `skip_keys_unmatched` — a `--skip-key` that matched nothing in either file. Almost always a typo on your side; re-check it against the diff's key names rather than reporting it as a user-facing finding.
-
-For **conflict** files:
-1. Read BOTH versions (live and export)
-2. Understand what changed on each side
-3. For each conflict, use AskUserQuestion to ask the user how to resolve it:
-   - **"Use live version"** — live overwrites export
-   - **"Use export version"** — export overwrites live
-   - **"Merge"** — present a merged version for approval, then write to BOTH locations
-   If all conflicts have the same obvious cause (e.g., line-ending differences only), batch
-   them into a single AskUserQuestion instead of asking one-by-one.
-
-For **container_settings_diverged**: handled in Step 3.5 after global-config is finalized — no action here.
-
-For **marketplace_changed**, **live_only**, or **export_only** marketplace: already reconciled in Step 1.5 — no additional action needed.
-
-## Step 3.5: Container settings sync
-
-After `global-config/settings.json` is finalized in Step 3, run the semantic diff filtered through saved preferences:
-
-```bash
-perl "${CLAUDE_PLUGIN_ROOT}/scripts/json-diff.pl" ~/.claude/ccpraxis/global-config/settings.json ~/.claude/ccpraxis/plugins/sandbox/container/settings.json \
-  | perl "${CLAUDE_PLUGIN_ROOT}/scripts/filter-diff.pl" --prefs "$HOME/.claude/ccpraxis/.backup-preferences.json" --scope global_vs_container
-```
-
-Note: keys whose values are nested objects on both sides (like `env`, `enabledPlugins`) are expanded to dotted sub-keys (e.g., `env.DISABLE_LOGIN_COMMAND`). Present each sub-key as an individual decision.
-
-If `status` is `"identical"`, skip silently. If there are `auto_applied` entries, list them briefly (e.g. "Applied 3 saved preferences: `env.FOO` (container-only), `model` (intentionally different), ...").
-
-For each key in `needs_decision`, use AskUserQuestion to present the difference and let the user choose:
-
-- For `diverged` keys (same key, different values):
-  - **"Propagate to container"** — one-time sync; update `plugins/sandbox/container/settings.json` to match `global-config`
-  - **"Keep container value"** — leave `plugins/sandbox/container/settings.json` as-is (one-time)
-  - **"Keep different (remember)"** — leave both as-is and save preference so this key is not asked about again
-  - **"Skip"** — leave as-is (will be asked again next sync)
-- For `only_left` keys (only in global-config):
-  - **"Add to container"** — copy the key to `plugins/sandbox/container/settings.json`
-  - **"Keep global-only (remember)"** — save preference so this key is not asked about again
-  - **"Skip"** — will be asked again next sync
-- For `only_right` keys (only in plugins/sandbox/container):
-  - **"Keep container-only (remember)"** — save preference so this key is not asked about again
-  - **"Remove from container"** — delete the key from `plugins/sandbox/container/settings.json`
-  - **"Skip"** — will be asked again next sync
-
-For any choice that includes "(remember)", save the preference:
-
-```bash
-perl "${CLAUDE_PLUGIN_ROOT}/scripts/save-preference.pl" \
-  --prefs "$HOME/.claude/ccpraxis/.backup-preferences.json" \
-  --scope global_vs_container --key "<KEY>" --category "<CATEGORY>" --action "<ACTION>"
-```
-
-Map each "(remember)" option to its `--category` and `--action`:
-
-| Option label | `--category` | `--action` |
-|---|---|---|
-| Keep different (remember) | `diverged` | `skip-always` |
-| Keep global-only (remember) | `only_left` | `left-only` |
-| Keep container-only (remember) | `only_right` | `right-only` |
-
-## Step 4: Sensitive data scan
-
-Before committing, run the sensitive data scanner:
-
-```
-perl "${CLAUDE_PLUGIN_ROOT}/scripts/sensitive-check.pl" "$HOME/.claude/ccpraxis"
-```
-
-If it finds anything, show the user what was detected and **do NOT proceed** with git operations until resolved.
-
-## Step 5: Commit and push
-
-Only after the scan passes:
-
-```bash
-cd "$HOME/.claude/ccpraxis"
-git add -A
-git status
-```
-
-If nothing to commit and local is up to date with remote: report "Everything is already in sync" and skip to Step 6.
-
-If there are changes to commit, summarize what's being sent (new files, modified files, key changes). Use AskUserQuestion:
-- **"Push it"** — commit and push
-- **"Abort"** — discard staged changes and stop
-
-If confirmed: commit and push. Since Step 1 already integrated remote, pushing is always a clean fast-forward.
-
-If the repo has no remote configured, commit locally and tell the user to set up a remote.
-
-## Step 5.4: Sync todos
-
-Todos live at the vault root in `todos/` (separate from per-project content). They're written locally by `/todo:create` and `/todo:manage`, which no longer self-sync — `/steward:backup` owns committing and pushing them. Run this **before** the project syncs below, so the vault working tree is clean for their `git pull --rebase`.
-
-First check the vault exists (same check as Step 5.5):
-
-```bash
-[ -d "$HOME/.claude/claude-code-vault/.git" ] && echo "VAULT_OK" || echo "VAULT_MISSING"
-```
-
-If `VAULT_MISSING`, skip this step. Otherwise:
-
-```bash
-perl "$HOME/.claude/ccpraxis/scripts/todo-sync.pl" sync "backup: sync todos"
-```
-
-`todo-sync.pl` lives in `scripts/` (it's the shared todo engine, not part of steward). Its `sync` `git stash -u`s any uncommitted vault state, rebases onto origin, commits **`todos/` only** (scoped — never `projects/`), pushes, and pops — safe to run on a dirty `todos/`. Parse the `KEY: value` lines:
-
-- `STATUS: synced` → note `PULLED`/`COMMITTED`/`PUSHED` for Step 7's report (e.g. "Todos: committed + pushed" or "no changes").
-- `STATUS: conflict` → a rebase conflict in `todos/`; surface it (resolve under `~/.claude/claude-code-vault/todos/`) and continue with the rest of the backup.
-- `STATUS: error` → surface verbatim; continue.
-
-## Step 5.5: Sync registered vault projects
-
-`vault-sync.pl` owns ALL git/file/hash/merge work — your job is to invoke subcommands, parse JSON, and present `AskUserQuestion` for conflicts. Never run `git` against the vault yourself, never `cp`/`mv` files into the vault, never compute hashes yourself.
-
-First check that the vault exists locally:
-
-```bash
-[ -d "$HOME/.claude/claude-code-vault/.git" ] && echo "VAULT_OK" || echo "VAULT_MISSING"
-```
-
-If `VAULT_MISSING`, skip this step (vault not initialized on this machine — covered by setup in the ccpraxis README).
-
-Otherwise list registered projects on this machine:
-
-```bash
-perl "${CLAUDE_PLUGIN_ROOT}/scripts/vault-sync.pl" list-projects
-```
-
-If `projects` is empty, skip to Step 5.7.
-
-For each entry in `projects` (sequentially — the vault lock serializes them; do NOT parallelize):
-
-### 5.5.a — Sync the project
-
-**Stale-entry check first (fix H7 from red-team):** if the entry's `project_exists` field is `false`, the registered project directory has been moved or deleted. Surface this to the user:
-
-> ⚠ Project `<slug>` is registered but its directory no longer exists at `<path>`. Skipping. Run `perl ${CLAUDE_PLUGIN_ROOT}/scripts/vault-sync.pl unregister --slug <slug>` to remove the stale entry (vault contents will be preserved as orphans).
-
-Then skip to the next project — do NOT call `sync-project` for a missing path.
-
-For entries with `project_exists: true`, first **refresh default-tracked paths** so any default-ON path that came into existence since registration — most importantly this machine's host memory dir (`_host-memory`, resolving to `~/.claude/projects/<encoded-cwd>/memory`), but also a newly-created `.ccpraxis-local-data/blueprints` etc. — gets picked up without a re-register:
-
-```bash
-perl "${CLAUDE_PLUGIN_ROOT}/scripts/vault-sync.pl" refresh-default-tracked --slug "<slug>"
-```
-
-This only updates THIS machine's local metadata (idempotent — a second run reports `already_tracked`); the vault-side `tracked_paths` converge inside the `sync-project` commit below. The response's `added` array (if any) is informational — mention it in the summary. Then sync:
-
-```bash
-perl "${CLAUDE_PLUGIN_ROOT}/scripts/vault-sync.pl" sync-project --slug "<slug>"
-```
-
-Capture the `session_id` field from the response — you'll pass it through `resolve-conflict` and `commit-and-push` (fix H2: prevents a parallel invocation from splicing into this session's journal).
-
-Handle the response:
-
-- `status: drift` — vault has uncommitted changes in `projects/<slug>/` outside any known journal (left over from an unclean exit). Surface `dirty_files` to the user; **skip this project** and continue with the next one. The user can clean up manually at `~/.claude/claude-code-vault/` and re-run `/steward:backup`.
-- `status: error` — surface the error; skip this project; continue.
-- `status: synced` — continue.
-
-If the response has `skipped_symlinks` or `skipped_bad_paths` non-empty, mention those (informational, not blocking).
-
-### 5.5.b — Conflict resolution loop
-
-If `conflicts` is non-empty, iterate them in order. For each conflict, use `AskUserQuestion`:
-
-**Question:** `"Conflict on '<path>' in project '<slug>' — local and vault both changed since last sync. How to resolve?"`
-
-**Options** (build dynamically based on the conflict entry):
-
-1. **"Use local version"** — overwrite vault with local. Always offered.
-2. **"Use vault version"** — overwrite local with vault. Always offered.
-3. **"Show diff"** — display merge tmp content, then re-prompt. Offered only when `is_text == true`.
-4. **"Use merged"** — accept the auto-merged result. Offered ONLY when `is_text == true` AND `merge_result.exit_code == 0`.
-5. **"Abort sync"** — stop processing THIS project (do NOT commit-and-push for this slug); move on to the next project. Always offered last.
-
-**Binary files (`is_text == false`):** offer only options 1, 2, and 5. Add a note in the question text: *"This is a binary file — diff and merged-view are not available."*
-
-**"Show diff":** `bash cat "<merge_result.tmp_path>"` to display the `git merge-file --diff3` result (conflict markers, or clean merged file when `exit_code == 0`). Re-ask the SAME conflict's question afterward.
-
-**"Abort sync":** report **explicitly** that any conflicts the user already resolved in this slug's session will be discarded:
-
-> Aborted sync for project `<slug>`. **The N conflict(s) you already resolved in this session will be discarded** — they'll be re-asked on the next `/steward:backup`. Vault is untouched for this project. Continuing with the next project.
-
-Then continue to the next project. Do NOT call commit-and-push for THIS slug.
-
-**"Use local" / "Use vault" / "Use merged":** pass the same `--session-id` captured from `sync-project`:
-
-```bash
-perl "${CLAUDE_PLUGIN_ROOT}/scripts/vault-sync.pl" resolve-conflict --slug "<slug>" --path "<path>" --action <use-local|use-vault|use-merged> --session-id "<session_id>" [--merged-file "<merge_result.tmp_path>"]
-```
-
-(Pass `--merged-file` only for `use-merged`.)
-
-### 5.5.c — Commit and push
-
-After all conflicts resolved (or if there were none), pass the same `--session-id`:
-
-```bash
-perl "${CLAUDE_PLUGIN_ROOT}/scripts/vault-sync.pl" commit-and-push --slug "<slug>" --session-id "<session_id>"
-```
-
-Handle the response:
-
-- `committed_and_pushed` — success. Note the `last_synced_at`. If `rolled_back_during_sync` present, mention those paths (their source files changed mid-sync; will be picked up next `/steward:backup`).
-- `sensitive_blocked` — vault was NOT modified; pre-rename scan caught secrets in staged files. Surface `findings` (file/line/pattern) to the user; tell them to remove the secrets and re-run `/steward:backup`.
-- `sensitive_blocked_post_rename` — defense-in-depth scan caught a leak after rename. The script automatically rolls back the rename via `git checkout` and clears the journal, so the vault is restored to its pre-sync state. Surface the `findings` to the user and tell them to fix the source files before re-running `/steward:backup`.
-- `error` — surface error; continue with next project.
-
-Collect per-project results (slug, status, conflict count, rolled-back count, sensitive-blocked status) for Step 7's report.
-
-## Step 5.7: Offer registration for unregistered current project
-
-```bash
-CWD="$(pwd -P)"
-perl "${CLAUDE_PLUGIN_ROOT}/scripts/vault-sync.pl" is-registered --cwd "$CWD"
-```
-
-If `registered: true`, skip (already handled in Step 5.5).
-
-If `registered: false`, check the opt-out marker:
-
-```bash
-[ -f "$CWD/.claude/backup-skip" ] && echo "SKIP_MARKER"
-```
-
-If `SKIP_MARKER` is present, skip the offer — but **mention it in the Step 7 report** so the user remembers it's there and can delete it if they want to re-enable the prompt (fix M2 from red-team):
-
-> Skipped registration offer for `<cwd>` — `.claude/backup-skip` marker present. Delete it to re-enable the prompt.
-
-Otherwise check whether the cwd has anything worth tracking:
-
-```bash
-perl "${CLAUDE_PLUGIN_ROOT}/scripts/vault-sync.pl" detect-trackable --cwd "$CWD"
-```
-
-If `trackable` is empty, skip (nothing to back up).
-
-If `trackable` is non-empty, use `AskUserQuestion`:
-
-**Question:** `"This directory has trackable Claude files but isn't registered for vault backup. Found: <list of paths from trackable>. Register now?"`
-
-**Options:**
-
-- **"Yes, register"** — invoke the `/steward:setup-project` skill (use the `Skill` tool with `skill: "steward:setup-project"`, empty args). Do NOT try to register manually — the skill owns the bootstrap flow.
-- **"Not now"** — skip this time. Mention they can run `/steward:setup-project` later.
-- **"Don't ask again for this directory"** — create the opt-out marker so future `/steward:backup` runs skip the offer:
-  ```bash
-  mkdir -p "$CWD/.claude" && : > "$CWD/.claude/backup-skip"
-  ```
-  Tell the user the marker was created (at `<cwd>/.claude/backup-skip`) and that they can delete it to re-enable the offer.
-
-## Step 6: Check for missing plugins
-
-Run the plugin check script:
-
-```bash
-perl "${CLAUDE_PLUGIN_ROOT}/scripts/check-plugins.pl" \
-  --settings "$HOME/.claude/ccpraxis/global-config/settings.json" \
-  --installed "$HOME/.claude/plugins/installed_plugins.json" \
-  --marketplaces "$HOME/.claude/plugins/known_marketplaces.json"
-```
-
-If `status` is `"ok"` or `"no_config"`, skip silently.
-
-If `status` is `"missing_plugins"`:
-- For entries in `missing_marketplaces`: inform the user that the marketplace needs to be added first with `/plugin marketplace add <owner>/<repo>`.
-- For entries in `missing`: inform the user and offer to install with `/plugin install <name>@<marketplace>`.
-- For entries in `extra_installed`: mention informally that these are installed locally but not tracked in the config (no action needed).
-
-## Step 6.6: Claude Code binary snapshots (informational)
-
-List snapshots taken by `/update` (or manually). This is informational only — don't prompt for revert during a regular sync.
-
-```bash
-perl ${CLAUDE_PLUGIN_ROOT}/scripts/claude-binary-backup.pl list
-```
-
-Capture the `count` and the newest snapshot's `id` + `version` from the JSON for the report in Step 7. If the script fails or returns count=0, just skip — no snapshots is a normal state.
-
-## Step 7: Report
-
-Summarize:
-
-- ccpraxis sync: what was merged, what was committed, whether the push succeeded; any `preferences_applied` / `preferences_ignored` from the Step 3 export merge
-- Marketplaces: any added/changed
-- Vault projects (Step 5.5): per-slug status (synced / conflicts-resolved / aborted / sensitive-blocked / error); count of files pushed/pulled per project
-- Current-project registration prompt (Step 5.7): offered? user's choice?
-- Plugins: any installed or missing
-- Claude Code snapshots: count, plus newest id and version (from Step 6.6). One line. Mention the revert command: `perl ${CLAUDE_PLUGIN_ROOT}/scripts/claude-binary-backup.pl restore --latest`.
-
-## Step R: Snapshot/revert mode
-
-When invoked in revert/snapshot intent (not full sync), do ONLY the steps below.
-
-### R.1 — List available snapshots
-
-```bash
-perl ${CLAUDE_PLUGIN_ROOT}/scripts/claude-binary-backup.pl list
-```
-
-Parse the JSON. Show the user a numbered table: id, version, captured_at_utc, reason (if present), mark (if present), corrupt flag. Newest first.
-
-If `count` is 0: tell the user no snapshots exist (probably never ran `/update` yet). Exit.
-
-### R.2 — Detect current binary state
-
-```bash
-perl ${CLAUDE_PLUGIN_ROOT}/scripts/claude-binary-backup.pl detect
-```
-
-Surface the current binary's path, version, and SHA-256. This helps the user see whether they actually need to revert.
-
-### R.3 — Ask what to do
-
-Use AskUserQuestion:
-
-- **"Restore latest snapshot"** — runs `restore --latest`. Recommended if the user is confident any snapshot will work.
-- **"Restore a specific snapshot"** — follow-up: ask which id from the table in R.1.
-- **"Verify a snapshot's integrity"** — runs `verify --snapshot <id>` against a chosen id.
-- **"Cancel"** — exit without changes.
-
-### R.4 — Execute restore (if chosen)
-
-```bash
-# Restore latest:
-perl ${CLAUDE_PLUGIN_ROOT}/scripts/claude-binary-backup.pl restore --latest
-
-# Or restore a specific id:
-perl ${CLAUDE_PLUGIN_ROOT}/scripts/claude-binary-backup.pl restore --snapshot <id>
-```
-
-The script automatically takes a pre-restore snapshot before swapping the binary, so the restore is itself reversible.
-
-After the restore completes, verify:
-
-```bash
-claude --version
-```
-
-If `claude --version` matches the restored version: ✅ tell the user, and mention the pre-restore snapshot id (from the restore JSON) — they can revert the revert if needed.
-
-If `claude --version` fails: surface the error. The pre-restore snapshot id is the user's escape hatch. Do not try further restores automatically — let the user decide.
-
-### R.5 — Execute verify (if chosen)
-
-```bash
-perl ${CLAUDE_PLUGIN_ROOT}/scripts/claude-binary-backup.pl verify --snapshot <id>
-```
-
-Report the JSON. If exit code is 2 (integrity failure), surface the details — the snapshot is corrupt and cannot safely be restored from. Running `prune --keep N` will auto-remove ALL corrupt entries (corrupt entries are dropped regardless of the keep-N window). To force-remove a single corrupt snapshot without touching others, the user can `rm -rf ~/.claude/backups/claude-code/<id>` manually.
+| dirty_worktree | ~/.claude/ccpraxis has uncommitted local changes before the remote integrate step | show the dirty file list from detail/data, offer `continue_without_merge` (leave the uncommitted changes untouched) or `merge_anyway` (git itself refuses if the merge would overwrite local changes) |
+| remote_merge_conflict | merging origin/main hit a real conflict | show the conflicting paths from detail/data, offer `abort_merge` (abort and restore the pre-merge HEAD) or `keep_conflict` (leave the conflict on disk for manual resolution) |
+| clone_live_divergence | the exported repo and the live tree disagree in a way preflight cannot reconcile automatically | show the divergence detail, offer `acknowledge` (continue anyway) or `treat_as_failure` (fail the run over it) |
+| readme_drift | README.md or docs/repo-layout.md is stale relative to the tree on disk | show the drift detail (missing paths or a stale generated section), offer `acknowledge` (continue anyway) or `treat_as_failure` (fail the run over it) |
+| settings_key | a live-vs-repo settings.json key differs, or exists on only one side | show the key and both values from detail/data, offer use-live, use-repo, keep-different-remember, or skip, noting that a remember choice is saved as a preference |
+| marketplace_key | a live-vs-repo known_marketplaces.json entry differs | show the marketplace name and both sides, offer export/add, keep-remember, remove, or skip as fits the discrepancy |
+| file_conflict | a synced file differs on both sides in a way that is not a settings key | show both versions (or a diff) from detail/data, offer use-live, use-export, or merge-manually |
+| container_settings_key | a global-config-vs-container settings.json key differs | show the key and both values, offer propagate-to-container, keep-container, keep-different-remember, or skip |
+| sensitive_finding | the pre-push secret scanner found a likely credential | show every finding (file, line, pattern) from detail/data verbatim, offer abort or rescan-after-fixing — never let the operator push past this decision silently |
+| push_confirmation | ccpraxis is ready to commit and push a real change set | summarize what is being sent from detail/data (new and modified files), offer push-it or abort |
+| vault_conflict | a vault-registered project has both local and vault changes to the same path since the last sync | show the conflict payload, including data.merge_preview when present (a diff3-style preview of both sides), offer use-local, use-vault, use-merged (only when a clean merge exists), or abort-this-project |
+| project_registration | the current directory has trackable Claude files but is not registered for vault backup | show the trackable paths from detail/data, offer register-now, not-now, or dont-ask-again |
+| plugin_install | a plugin the config expects is not installed locally | show the plugin name and marketplace, offer install or skip — installing only relays a command, see Follow-up actions |
+| step_failure | a phase hit a mechanical failure it cannot resolve itself and escalated it into a question instead of silently failing the run | render title, then detail/data verbatim, then the choices exactly as given, and tell the operator plainly that a phase turned a mechanical failure into a question |
+
+## Relaying the report
+
+Only exit 0 and exit 20 carry `notes[]`. Take the LAST entry with `key == 'report'`
+in that array — it is authoritative (closeout does not promise every prior report note
+survives a crash, so a mid-execution kill can leave a stale one behind a fresh one).
+If no `report` note is present, report the run's outcome from `phases[]` alone and
+say plainly that no report was produced — never fabricate a summary or claim a clean
+backup by default.
+
+If `report.degraded` is `true`, report assembly itself threw and some fields may be
+`null`: relay what is present, name the missing sections, and treat the run as
+problematic regardless of anything else.
+
+`unit_failures` — not `degraded` — decides whether the operator is told something
+went wrong: treat the run as problematic when `unit_failures` is non-empty, OR any
+entry of `phases[]` has `status: failed`, OR the exit code was 20. `degraded` means
+only that report assembly threw; it is `false` on a run that failed real units, so
+never read it alone as "everything is fine."
+
+Surface, from the report's fields:
+
+- `ccpraxis_sync` — what merged, what committed, whether the push succeeded; never
+  re-promote a captured `push_warnings` protected-ref notice to a failure. Alongside
+  it, `preferences.applied` / `preferences.ignored` / `preferences.skip_keys_unmatched`.
+  It also carries two purely-informational checks that run every time: `skills` (the
+  skills mirror sync — what changed, if anything) and `claude_md` (the global
+  CLAUDE.md status check between live and repo). Mention both — a `claude_md` status
+  other than `ok` means global CLAUDE.md has drifted, and that is worth surfacing
+  even though nothing failed.
+- `marketplaces` — anything added or changed.
+- `vault_projects.projects[]` — per-slug status and class; read the per-project
+  files-pushed/pulled counts from the `sync_counts` entries elsewhere in `notes[]`
+  (they are not part of this structure).
+- `current_project_registration` — whether the offer fired and the operator's choice;
+  **always** mention the skip marker (with `skip_marker_path`, and that deleting it
+  re-enables the offer) whenever `skip_marker_present` is `true`, even if no offer
+  fired this run.
+- `plugins` — `missing`, `extra_installed`, `missing_marketplaces`.
+- `snapshots` — `count`, `newest_id`, `newest_version`, `newest_corrupt`, and
+  `revert_command` — informational only; never offer or perform a revert during a full
+  sync. The revert mode is entered by intent (see **Modes**), never from a report.
+- `sources` — a phase that never ran is reported as "never ran", never as "found
+  nothing".
+
+## Follow-up actions
+
+On a terminal exit (0 or 20), walk every entry of `follow_up_actions` and act on its
+`action` value. Only these four exist; an unrecognised `action` is reported to the
+operator verbatim and not acted on.
+
+- **`invoke_setup_project`** (`action`, `cwd`) — emitted only when the operator
+  already answered `register_now` on a `project_registration` decision. **Perform**
+  it: invoke the `Skill` tool with `steward:setup-project` against `cwd`.
+- **`create_skip_marker`** (`action`, `path`) — emitted only when the operator
+  already answered `dont_ask_again`. **Perform** it: use `Bash` to create `path`'s
+  parent directory first (`mkdir -p`) — it can be missing, since a bare root
+  `CLAUDE.md` alone is enough to trigger the offer — then create the empty marker
+  file at `path`. Verify the file actually exists afterward before telling the
+  operator it was recorded; if creation failed, say so plainly instead of claiming
+  success, and tell the operator where the marker is and that deleting it
+  re-enables the offer.
+- **`install_plugin`** (`action`, `plugin`, `name`, `marketplace`, `command`) —
+  emitted when the operator answered `install`. **Relay** it: `/plugin install` is a
+  Claude Code client command, not a shell command an agent can execute, so surface
+  `command` for the operator to run themselves.
+- **`add_marketplace`** (`action`, `marketplace`, `plugin`) — emitted unconditionally
+  whenever a marketplace is missing; no question gates it. **Inform only**: tell the
+  operator the marketplace is missing and needs `/plugin marketplace add
+  <owner>/<repo>` — never act on it automatically yourself, since that would be an
+  unconsented mutation reaching through the consent channel. It carries no `command`
+  key, so there is nothing to fabricate. `marketplace` is a marketplace *name*, not
+  necessarily an `owner/repo` (a directory-source marketplace, for example) — show the
+  `<owner>/<repo>` placeholder as-is and let the operator supply the real source, never
+  substitute `marketplace`'s value into it.
+
+## Snapshot/revert mode
+
+Entered directly from Modes — this mode never invokes the driver. It always calls
+`${CLAUDE_PLUGIN_ROOT}/scripts/claude-binary-backup.pl` instead. Behaviour preserved
+unchanged from the prior protocol (skill-before.md:516-575).
+
+1. **List.**
+   ```
+   perl ${CLAUDE_PLUGIN_ROOT}/scripts/claude-binary-backup.pl list
+   ```
+   Parse the JSON. Show a numbered table — id, version, captured_at_utc, reason (if
+   present), mark (if present), corrupt flag — newest first. If `count` is 0, tell the
+   operator no snapshots exist (probably `/update` was never run) and stop.
+
+2. **Detect.**
+   ```
+   perl ${CLAUDE_PLUGIN_ROOT}/scripts/claude-binary-backup.pl detect
+   ```
+   Surface the current binary's path, version, and SHA-256, so the operator can see
+   whether a revert is even needed.
+
+3. **Ask.** Use `AskUserQuestion` to offer: restore the latest snapshot; restore a
+   specific snapshot (follow-up: which id, from the list above); verify a snapshot's
+   integrity (which id); cancel without changes.
+
+4. **Restore**, if chosen:
+   ```
+   perl ${CLAUDE_PLUGIN_ROOT}/scripts/claude-binary-backup.pl restore --latest
+   ```
+   or, for a specific id:
+   ```
+   perl ${CLAUDE_PLUGIN_ROOT}/scripts/claude-binary-backup.pl restore --snapshot <id>
+   ```
+   The script takes its own pre-restore snapshot before swapping the binary, so the
+   restore is itself reversible. Afterward, run `claude --version` to confirm: if it
+   matches the restored version, tell the operator and name the pre-restore snapshot
+   id as the escape hatch (in case they need to revert the revert). If it fails,
+   surface the error, name the pre-restore snapshot id, and do not attempt further
+   restores automatically — let the operator decide.
+
+5. **Verify**, if chosen:
+   ```
+   perl ${CLAUDE_PLUGIN_ROOT}/scripts/claude-binary-backup.pl verify --snapshot <id>
+   ```
+   Report the JSON. Exit code 2 means an integrity failure — the snapshot is corrupt
+   and cannot safely be restored from. `prune --keep N` auto-removes all corrupt
+   entries regardless of the keep-N window; to force-remove a single corrupt snapshot
+   without touching others, the operator can delete its directory under
+   `~/.claude/backups/claude-code/<id>` manually.
