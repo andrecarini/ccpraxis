@@ -1053,13 +1053,29 @@ sub _one_run_summary_cells {
                 ? _nonneg_int($s->{decisions_operator})
                 : _nonneg_int($s->{decisions_waiting});
 
+    # decisions_triage is the automated-resolver half of the same split
+    # (RunState.pm:724). It rides in the SAME cell as the waiting count --
+    # not a new column -- so the two figures sit adjacent and are visible
+    # together; see spec S2.2.1 for why a sixth column/new line were both
+    # rejected. Its own word ("triage") and its own role (text.muted) keep
+    # it distinguishable from decisions_operator's "N waiting" span.
+    my $triage = _nonneg_int($s->{decisions_triage});
+
+    my @waiting_cell = ( {
+        text => ($waiting > 0 ? sprintf('%d waiting', $waiting) : ''),
+        role => ($state eq 'paused' ? 'state.crit' : 'state.warn'),
+    } );
+    if ($triage > 0) {
+        my $lead = ($waiting > 0) ? ', ' : '';
+        push @waiting_cell, { text => $lead . sprintf('%d triage', $triage), role => 'text.muted' };
+    }
+
     return [
         [ { text => $bp,    role => 'accent' } ],
         [ { text => $state, role => (_run_state_role_map()->{$state} // 'text.muted') } ],
         [ { text => sprintf('%d/%d pkg', $done, $total), role => 'text.primary' } ],
         [ { text => ($coord > 0 ? sprintf('%d coord', $coord) : ''), role => 'accent' } ],
-        [ { text => ($waiting > 0 ? sprintf('%d waiting', $waiting) : ''),
-            role => ($state eq 'paused' ? 'state.crit' : 'state.warn') } ],
+        \@waiting_cell,
     ];
 }
 
@@ -1089,6 +1105,27 @@ sub _current_package_line {
     my $cp = $s->{current_package};
     return undef unless defined $cp && !ref($cp) && length $cp;
     return [ { text => '  cur ' . substr($cp, 0, 200), role => 'text.primary' } ];
+}
+
+# _paused_reason_line($s) -> a spans row, or undef.
+#
+# Same shape as _current_package_line above: an optional standalone line
+# beneath a run's table row, not a table column. Gated on state=>'paused' IN
+# ADDITION TO paused_reason being present -- paused_reason is carried forward
+# from the .paused marker file and this sub has no way to prove it was
+# cleared the instant a run resumed, so the row's own state cell (already
+# trusted as authoritative) is what gates rendering. See spec S2.1.1.
+#
+# Deliberately does NOT sanitize/truncate-for-control-chars/re-encode: that is
+# the render pipeline's job, done exactly once, downstream (Frame::wrap_line
+# -> spanify -> safe). See spec S2.1.2.
+sub _paused_reason_line {
+    my ($s) = @_;
+    return undef unless ref($s) eq 'HASH';
+    return undef unless defined($s->{state}) && $s->{state} eq 'paused';
+    my $reason = $s->{paused_reason};
+    return undef unless defined $reason && !ref($reason) && length $reason;
+    return [ { text => '  paused ' . substr($reason, 0, 200), role => 'state.warn' } ];
 }
 
 # The table's shape, declared once beside the cells it describes.
@@ -1139,11 +1176,21 @@ sub _run_summary_lines {
     my $rows = tui::Frame::table(
         [ map { _one_run_summary_cells($summaries[$_]) } 0 .. $shown - 1 ], $opts);
 
-    # Interleave each run's current-package line directly beneath its own row,
-    # so the association is positional and needs no repeated label.
+    # Interleave each run's optional sub-lines directly beneath its own row, so
+    # the association is positional and needs no repeated label.
+    #
+    # ORDER IS DELIBERATE (spec S2.3): the paused reason comes BEFORE the
+    # current-package line. A parked run's reason is why the operator is being
+    # asked to look at all, so it must not be pushed below a package name that is
+    # merely incidental to it. Both lines are optional and independent -- either,
+    # neither, or both may render, and when neither does the run's output is
+    # byte-identical to what it was before this package existed (t/182 AC9/AC10
+    # pin exactly that).
     my @out;
     for my $i (0 .. $shown - 1) {
         push @out, $rows->[$i] if defined $rows->[$i];
+        my $reason = _paused_reason_line($summaries[$i]);
+        push @out, $reason if $reason;
         my $cur = _current_package_line($summaries[$i]);
         push @out, $cur if $cur;
     }
