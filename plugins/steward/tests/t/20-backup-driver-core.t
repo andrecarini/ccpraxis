@@ -1483,6 +1483,143 @@ for my $case (
 }
 
 # =====================================================================
+# CONTRACT AMENDMENT (package 03 handoff, backup-driver blueprint) --
+# $ctx->{get_phase_item}: a READ-ONLY, cross-phase accessor. Package 02
+# (Preflight.pm) checkpoints settings_outcome under its OWN phase, and
+# package 03 (settings-export-merge) needs to read it -- the existing
+# get_item/is_done/checkpoint/scratch quartet is phase-scoped (bound to
+# $pstate, i.e. the CURRENTLY EXECUTING phase) and cannot do that. Four
+# properties, driven with two stub phases where the second reads what the
+# first checkpointed:
+#   1. a later phase can read an EARLIER phase's checkpointed item
+#   2. undef for an unknown phase, and for a known phase + unknown key
+#   3. NO AUTOVIVIFICATION: asking about a phase that never ran must not
+#      create an entry for it in the on-disk state
+#   4. the existing get_item stays phase-scoped (unchanged behavior)
+# =====================================================================
+my $STUB_CKPT_A_SRC = <<PERL;
+package Backup::Phase::StubCkptA;
+use strict;
+use warnings;
+
+sub phase_spec {
+    return { name => 'stub_ckpt_a', order => 100, resumable => 1, title => 'Stub Ckpt A' };
+}
+
+sub run_phase {
+    my (\$ctx) = \@_;
+    _log('stub_ckpt_a');
+    \$ctx->{checkpoint}->('greeting', { hello => 'stub_ckpt_a says hi', count => 42 });
+
+    # No-autoviv probe: this phase name is never discovered at all (no such
+    # .pm file exists in this scenario), so \$state->{phases} must never
+    # gain an entry for it merely because it was asked about.
+    my \$ghost = \$ctx->{get_phase_item}->('phase_ghost_never_discovered', 'anything');
+    \$ctx->{note}->('ghost_phase_result', defined(\$ghost) ? 'defined' : 'undef');
+
+    return { status => 'complete' };
+}
+
+$LOG_HELPER
+
+1;
+PERL
+
+my $STUB_CKPT_B_SRC = <<PERL;
+package Backup::Phase::StubCkptB;
+use strict;
+use warnings;
+
+sub phase_spec {
+    return { name => 'stub_ckpt_b', order => 200, resumable => 1, title => 'Stub Ckpt B' };
+}
+
+sub run_phase {
+    my (\$ctx) = \@_;
+    _log('stub_ckpt_b');
+
+    # 1. Read an item checkpointed by an earlier, DIFFERENT phase.
+    my \$seen = \$ctx->{get_phase_item}->('stub_ckpt_a', 'greeting');
+    if (ref(\$seen) eq 'HASH') {
+        \$ctx->{note}->('cross_phase_hello', \$seen->{hello} // '(missing)');
+        \$ctx->{note}->('cross_phase_count', defined(\$seen->{count}) ? "\$seen->{count}" : '(missing)');
+    }
+    else {
+        \$ctx->{note}->('cross_phase_hello', '(not a hashref)');
+        \$ctx->{note}->('cross_phase_count', '(not a hashref)');
+    }
+
+    # 2. Unknown phase name -> undef.
+    my \$unknown_phase = \$ctx->{get_phase_item}->('no_such_phase', 'greeting');
+    \$ctx->{note}->('unknown_phase_result', defined(\$unknown_phase) ? 'defined' : 'undef');
+
+    # 3. Known phase, unknown key -> undef.
+    my \$unknown_key = \$ctx->{get_phase_item}->('stub_ckpt_a', 'no_such_key');
+    \$ctx->{note}->('unknown_key_result', defined(\$unknown_key) ? 'defined' : 'undef');
+
+    # 4. get_item stays phase-scoped: stub_ckpt_b never checkpointed
+    # 'greeting' itself, so ITS OWN get_item must not see stub_ckpt_a's item.
+    my \$own_view = \$ctx->{get_item}->('greeting');
+    \$ctx->{note}->('own_get_item_result', defined(\$own_view) ? 'defined' : 'undef');
+
+    return { status => 'complete' };
+}
+
+$LOG_HELPER
+
+1;
+PERL
+
+{
+    my $scn = new_scenario('StubCkptA.pm' => $STUB_CKPT_A_SRC, 'StubCkptB.pm' => $STUB_CKPT_B_SRC);
+    my $r = run_backup($scn, '--json');
+    is($r->{exit}, 0, 'get_phase_item: a run using it completes cleanly')
+        or diag($r->{out} . $r->{err});
+    is($r->{json}{status}, 'complete', 'get_phase_item: status == "complete"');
+
+    my %note_of;
+    for my $n (@{ $r->{json}{notes} // [] }) {
+        $note_of{ $n->{key} // '' } = $n->{value};
+    }
+
+    # ---- property 1: cross-phase read of an earlier phase's checkpoint ----
+    is($note_of{cross_phase_hello}, 'stub_ckpt_a says hi',
+        'get_phase_item: a later phase reads the exact data an earlier phase checkpointed (hello field)');
+    is($note_of{cross_phase_count}, '42',
+        'get_phase_item: a later phase reads the exact data an earlier phase checkpointed (count field)');
+
+    # ---- property 2: undef for unknown phase / unknown key ----
+    is($note_of{unknown_phase_result}, 'undef',
+        'get_phase_item: an unknown phase name yields undef');
+    is($note_of{unknown_key_result}, 'undef',
+        'get_phase_item: a known phase with an unknown key yields undef');
+    is($note_of{ghost_phase_result}, 'undef',
+        'get_phase_item: a phase that never ran at all yields undef');
+
+    # ---- property 4: get_item stays phase-scoped (unchanged) ----
+    is($note_of{own_get_item_result}, 'undef',
+        'get_phase_item addition does not change get_item: it still cannot see another phase\'s item');
+
+    # ---- property 3: no autovivification on disk ----
+    my $final_state = read_state($scn->{state_path});
+    if (defined $final_state && ref($final_state->{phases}) eq 'HASH') {
+        ok(!exists $final_state->{phases}{phase_ghost_never_discovered},
+            'get_phase_item: no autoviv -- the on-disk state has no entry for a phase that never ran');
+        ok(!exists $final_state->{phases}{no_such_phase},
+            'get_phase_item: no autoviv -- the on-disk state has no entry for a second never-run phase name');
+        is(join(',', sort keys %{ $final_state->{phases} }), 'stub_ckpt_a,stub_ckpt_b',
+            'get_phase_item: the phases hash contains ONLY the two phases that actually ran');
+    }
+    else {
+        ok(0, "get_phase_item: $_") for (
+            'no autoviv -- the on-disk state has no entry for a phase that never ran',
+            'no autoviv -- the on-disk state has no entry for a second never-run phase name',
+            'the phases hash contains ONLY the two phases that actually ran',
+        );
+    }
+}
+
+# =====================================================================
 # AC19 -- perl -c is clean on all three files
 # =====================================================================
 {
