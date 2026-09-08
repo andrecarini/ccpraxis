@@ -749,6 +749,41 @@ sub _execute_impl {
         }
 
         my $answers_snapshot = { %{ $state->{answers} // {} } };
+
+        # -----------------------------------------------------------------
+        # THE $ctx CONTRACT -- every key a phase module's run_phase() may
+        # rely on. This is the whole surface; a phase must not reach past
+        # it into $state directly.
+        #
+        #   run_id, phase, state_path, answers -- read-only identity/inputs.
+        #   is_done / get_item / checkpoint / scratch -- PHASE-SCOPED: all
+        #     four read or write only $state->{phases}{$name} (THIS phase's
+        #     own slice, bound above as $pstate). Preflight.pm (package 02)
+        #     depends on that scoping and must keep it -- do not change it.
+        #   note / decision -- write helpers with no read counterpart.
+        #   get_phase_item -- the ONE cross-phase key, and it is READ-ONLY
+        #     (no cross-phase write exists, and none should: Decision 10
+        #     makes this module the sole owner of the state file, and a
+        #     write surface for other phases' slices would let a later
+        #     phase corrupt an earlier phase's already-persisted record).
+        #     It exists because package 03 (settings-export-merge) needs to
+        #     read the `skip_keys` package 02's Preflight phase checkpoints
+        #     under its OWN name, and get_item cannot do that -- it is
+        #     bound to $pstate, i.e. always the CURRENTLY EXECUTING phase.
+        #     Without a cross-phase reader, package 03 would silently get
+        #     undef, pass no --skip-key, and discard the operator's
+        #     explicit "skip this key" decision: the merge would still push
+        #     an only_left key into the repo, or overwrite a diverged one
+        #     with the live value, with nothing failing to flag it (see
+        #     SKILL.md). Returns undef -- never dies -- for an unknown
+        #     phase, an unknown key, or a phase that has not yet
+        #     checkpointed that key, and it must NOT autovivify
+        #     $state->{phases}{$phase} as a side effect of asking: a phase
+        #     that has genuinely never run must still be ABSENT from the
+        #     phases hash afterward, or this read would corrupt the very
+        #     phase-status bookkeeping read_run_state()/the resume loop
+        #     depend on.
+        # -----------------------------------------------------------------
         my $ctx = {
             run_id     => $state->{run_id},
             phase      => $name,
@@ -779,6 +814,22 @@ sub _execute_impl {
                 my ($ok, $reason) = validate_decision(\%fields);
                 die "Backup::Run: invalid decision constructed by phase '$name': $reason\n" unless $ok;
                 return { %fields };
+            },
+            get_phase_item => sub {
+                my ($other_phase, $key) = @_;
+                return undef unless defined $other_phase && length $other_phase;
+                return undef unless defined $key;
+                # Deliberately a PLAIN hash read, not a chained dereference:
+                # $state->{phases} already exists (built at run-state
+                # construction time), so reading a possibly-absent key off
+                # it here does not autovivify anything. Only if that read
+                # yields a real hashref do we go one level further.
+                my $other_pstate = $state->{phases}{$other_phase};
+                return undef unless ref($other_pstate) eq 'HASH';
+                my $other_items = $other_pstate->{items};
+                return undef unless ref($other_items) eq 'HASH';
+                return undef unless exists $other_items->{$key};
+                return $other_items->{$key}{data};
             },
         };
 
