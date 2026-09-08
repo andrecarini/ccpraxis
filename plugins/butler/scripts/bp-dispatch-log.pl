@@ -492,6 +492,17 @@ unless (caller) {
             print STDOUT "UNVERIFIABLE: no record for $o{id}\n";
             exit 4;
         }
+        # A record whose started_at is absent or non-numeric cannot be evaluated,
+        # and elapsed_seconds is a plain subtraction (t/136 B1/B2 pin that
+        # deliberately) -- so `$now - undef` would silently print $now, reporting
+        # an agent as having run for decades. Refuse instead, reusing the
+        # UNVERIFIABLE/exit-4 vocabulary this same branch already uses for a
+        # missing record rather than inventing a second marker. The `list` site
+        # below already guards this; `elapsed` was missed. Covered by t/178.
+        unless (defined $rec->{started_at} && looks_like_number($rec->{started_at})) {
+            print STDOUT "UNVERIFIABLE: record for $o{id} has no usable started_at\n";
+            exit 4;
+        }
         my $elapsed = BpDispatchLog::elapsed_seconds($rec->{started_at}, $now);
         my $budget  = $rec->{budget_seconds};
         my $over    = BpDispatchLog::is_over_budget($elapsed, $budget);
