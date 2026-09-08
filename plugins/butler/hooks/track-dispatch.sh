@@ -40,4 +40,87 @@ if is_writer "$TYPE"; then
   printf '%s' "$TYPE" > "$MARKER"
 fi
 
+# --- dispatch record write step (agent-telemetry/03-dispatch-write-path) ---
+#
+# The hook is an OBSERVER: every branch below falls through to the final
+# `exit 0` at the bottom of this file. Nothing here may exit 2 or otherwise
+# block the dispatch — a missing/broken/slow logger degrades to "no record
+# written", never to "dispatch blocked" (spec S1.1).
+#
+# Only bp-* subagent types are recorded (Decision 6 vocabulary); the raw
+# TYPE (e.g. "butler:bp-implementer") is normalized to its base name by
+# stripping through the LAST ':'. --worker-type passes the NORMALIZED base,
+# never the raw prefixed value.
+if [ "${BP_DISPATCH_LOG_OFF:-}" != "1" ]; then
+  BASE="${TYPE##*:}"
+  if [[ "$BASE" =~ ^[A-Za-z0-9._-]{1,64}$ ]] && [[ "$BASE" == bp-* ]]; then
+    NOW=$(date +%s 2>/dev/null || echo 0)
+    if [[ "$NOW" =~ ^[0-9]+$ ]] && [ "$NOW" -gt 0 ] && bp_is_absolute_path "${BP_PROJECT_ROOT:-}"; then
+      # Attribution: from the environment only, validated and OMITTED (never
+      # guessed, never substituted) when unset/empty/malshaped. '.'/'..' are
+      # explicitly rejected even though they match the character class.
+      BPTOK=""
+      if [[ "${BP_BLUEPRINT:-}" =~ ^[A-Za-z0-9._-]{1,64}$ ]] \
+        && [ "${BP_BLUEPRINT}" != "." ] && [ "${BP_BLUEPRINT}" != ".." ]; then
+        BPTOK="$BP_BLUEPRINT"
+      fi
+      PKGTOK=""
+      if [[ "${BP_PACKAGE:-}" =~ ^[A-Za-z0-9._-]{1,64}$ ]] \
+        && [ "${BP_PACKAGE}" != "." ] && [ "${BP_PACKAGE}" != ".." ]; then
+        PKGTOK="$BP_PACKAGE"
+      fi
+
+      LOGDIR="$BP_PROJECT_ROOT/.ccpraxis-local-data/.dispatch-log"
+
+      # Deduplication (spec S2.3): a `running` record whose normalized
+      # worker_type equals BASE, whose package is absent or equals PKGTOK,
+      # and whose started_at is within 120s of NOW in either direction,
+      # means the coordinator already stamped this dispatch — write nothing.
+      # Fork-free, bounded scan: over SCAN_CAP files, stand aside (treat as
+      # claimed) rather than prove a negative in unbounded time.
+      WT_RE='"worker_type":"([^"]*)"'
+      PKG_RE='"package":"([^"]*)"'
+      SA_RE='"started_at":([0-9]+)'
+      CLAIMED=0
+      if [ -d "$LOGDIR" ]; then
+        n=0
+        for f in "$LOGDIR"/*.json; do
+          [ -f "$f" ] || continue
+          n=$((n + 1))
+          if [ "$n" -gt 2000 ]; then CLAIMED=1; break; fi
+          LINE=""
+          IFS= read -r -N 8192 LINE < "$f" 2>/dev/null || true
+          case "$LINE" in
+            *'"status":"running"'*) ;;
+            *) continue ;;
+          esac
+          [[ "$LINE" =~ $WT_RE ]] || continue
+          rt="${BASH_REMATCH[1]##*:}"
+          [ "$rt" = "$BASE" ] || continue
+          if [[ "$LINE" =~ $PKG_RE ]]; then
+            [ "${BASH_REMATCH[1]}" = "$PKGTOK" ] || continue
+          fi
+          [[ "$LINE" =~ $SA_RE ]] || continue
+          d=$((NOW - 10#${BASH_REMATCH[1]}))
+          [ "$d" -lt 0 ] && d=$((-d))
+          [ "$d" -le 120 ] && { CLAIMED=1; break; }
+        done
+      fi
+
+      if [ "$CLAIMED" = 0 ]; then
+        ID="hk-${BPTOK:-nobp}-${PKGTOK:-nopkg}-${BASE}-${NOW}-$$-${RANDOM}"
+        LOGGER="$HOOK_DIR/../scripts/bp-dispatch-log.pl"
+        ARGS=(start --id "$ID" --worker-type "$BASE" --role worker --root "$BP_PROJECT_ROOT")
+        [ -n "$BPTOK" ]  && ARGS+=(--blueprint "$BPTOK")
+        [ -n "$PKGTOK" ] && ARGS+=(--package "$PKGTOK")
+        # </dev/null: the child can never inherit a pipe that never closes.
+        # >/dev/null 2>&1: a PreToolUse hook's stdout is a protocol channel —
+        # neither the logger's "started ..." line nor its diagnostics may
+        # reach Claude Code. || :: the child's exit status is discarded.
+        perl "$LOGGER" "${ARGS[@]}" </dev/null >/dev/null 2>&1 || :
+      fi
+    fi
+  fi
+fi
+
 exit 0
