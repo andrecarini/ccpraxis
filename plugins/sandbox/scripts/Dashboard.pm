@@ -3312,6 +3312,14 @@ sub run {
                         # correct too.
                         $install_warning_dismissed = 1;
                         $state{install_warning} = undef;
+                        # Also drop the latched hot-reload report. The action keeps
+                        # its original name for compatibility with t/87's pinned
+                        # vocabulary, but it dismisses every LATCHED banner, which
+                        # is what the '[d] dismiss' label has always promised. Both
+                        # writes again: the lexical so a later gather cannot
+                        # resurrect it, the state so THIS tick renders correctly.
+                        $hot_reload_report = undef;
+                        $state{hot_reload}  = undef;
                         $scroll_dirty = 1;   # same-tick re-render, mirrors scroll's own flag
                     }
                     elsif ($action eq 'scroll-up') {

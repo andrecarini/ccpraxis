@@ -2445,13 +2445,41 @@ sub _lifecycle_alert_msg {
 sub _banner_lines {
     my ($state) = @_;
     $state = {} unless ref($state) eq 'HASH';
+    # '[d] dismiss' is offered ONLY when 'd' will actually dismiss something that
+    # is on screen. It used to be glued unconditionally to install_warning while
+    # 'd' cleared only that field, so the operator saw
+    #     !! [r] no module changed on disk  [d] dismiss
+    # pressed 'd', and watched the [r] line sit there -- the key doing something
+    # different from its own label. Reported from the field, 2026-09-09.
+    #
+    # LATCHED vs DERIVED is the whole distinction. install_warning and the
+    # hot-reload REPORT are latched, so clearing them is meaningful. The
+    # "N modules changed" nudge, "launcher.pl changed", and the lifecycle/status
+    # alerts are all derived from live state and would be re-derived on the very
+    # next gather -- offering to dismiss those would just be a second lie.
+    #
+    # Suppressed entirely while a confirm is armed: Dashboard::dispatch_key runs
+    # its pending-branches FIRST, so 'd' cancels the confirm and dismisses
+    # nothing. Advertising dismiss there is exactly the mislabelling this guard
+    # exists to stop, and is why this function now consults $state->{pending}.
+    my $armed = defined($state->{pending}) && !ref($state->{pending})
+                && length($state->{pending});
+    my $warn  = (defined($state->{install_warning}) && !ref($state->{install_warning})
+                 && length($state->{install_warning})) ? $state->{install_warning} : undef;
+    my $has_report = ref($state->{hot_reload}) eq 'HASH';
+    my $hint = (!$armed && (defined($warn) || $has_report)) ? '  [d] dismiss' : '';
+
     my @msgs = grep { defined($_) && length($_) }
         ( _lifecycle_alert_msg($state), _status_alert_msg($state) );
-    if (defined($state->{install_warning}) && !ref($state->{install_warning})
-            && length($state->{install_warning})) {
-        push @msgs, $state->{install_warning} . '  [d] dismiss';
+    my @hot = @{ hot_reload_msgs($state) };
+
+    if (defined $warn) {
+        push @msgs, $warn . $hint;   # the hint rides the warning when there is one
     }
-    push @msgs, @{ hot_reload_msgs($state) };
+    elsif (length($hint) && @hot) {
+        $hot[0] .= $hint;            # otherwise it rides the hot-reload report line
+    }
+    push @msgs, @hot;
     return [ map { '  !! ' . tui::Frame::safe($_) } @msgs ];
 }
 
