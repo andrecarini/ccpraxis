@@ -1642,6 +1642,134 @@ sub make_direct_ctx_closeout {
 }
 
 # ===========================================================================
+# COORDINATOR ITEM 7 -- Preflight.pm checkpoints 'sync_skills' (:649) and
+# 'check_claude_md' (:680) every run the respective unit succeeds spawning/
+# parsing, but Closeout.pm never reads either into the report (grep confirms
+# zero occurrences of both checkpoint key strings in Closeout.pm's source),
+# so a detected CLAUDE.md drift is currently reported to nobody -- old
+# SKILL.md Step 1.5's two reporting duties vanished at the Step 7 relay, a
+# step quietly dropped, which is exactly what Decision 8 / the parity
+# mechanism exists to catch.
+#
+# NAMING CARE: the dispatch names these informally as 'skills_synced' and
+# 'claude_md_status' -- those are Preflight.pm's NOTE keys (Run.pm-notes,
+# each gated on a change/drift condition: skills_synced only fires if
+# @changed is non-empty, claude_md_status only fires on
+# differs/symlinked_elsewhere/missing_live/missing_repo). get_phase_item is
+# CHECKPOINT-ITEM-only (Run.pm's own contract: it reads
+# $state->{phases}{$other}{items}, never {notes}) -- so the two keys this
+# scenario seeds and Closeout.pm would need to read are the CHECKPOINT keys
+# 'sync_skills' and 'check_claude_md', verified directly against
+# Preflight.pm's source before writing this fixture, not assumed from the
+# dispatch's prose.
+#
+# SCHEMA CHOICE: both land under ccpraxis_sync, as two NEW sub-keys
+# ('skills' and 'claude_md'), not as new TOP-LEVEL report keys. Reasoning:
+#   1. ccpraxis_sync ALREADY nests two other preflight-sourced,
+#      decision-free, purely-informational facts this exact same way --
+#      remote_integration and clone_live -- gated on the identical
+#      $pf_present / sources.preflight condition this scenario reuses.
+#      Adding here is the SAME convention the dispatch asked for, not a
+#      second one.
+#   2. Every field that DOES get its own top-level key (preferences,
+#      marketplaces, plugins, snapshots) does so because it carries
+#      DECISIONS/follow-up actions the wrapper renders distinctly (checked
+#      directly: neither 'sync_skills' nor 'check_claude_md' status ever
+#      drives a decision kind in @Backup::Run::DECISION_KINDS). Skills-sync
+#      and the CLAUDE.md check are purely informational, like
+#      remote_integration/clone_live -- not like plugins/marketplaces.
+#   3. ccpraxis_sync's own null/present discipline (already gated on
+#      sources.preflight || sources.export being present) gives "absent
+#      preflight" vs "present but clean" for free, with no second
+#      convention invented -- exactly what the dispatch asked for by name.
+# If the coordinator rules the other way (a dedicated top-level key),
+# only this scenario's key path (ccpraxis_sync.skills / .claude_md instead
+# of two new top-level keys) needs to change; nothing else in this file
+# depends on the choice.
+# ===========================================================================
+{
+    # Part A -- present + CLEAN (status 'ok'): surfaced, not collapsed away.
+    my $ra = setup_root();
+    set_fixture($ra->{fixture_dir}, fixture_name('is-registered', 0), mk_is_registered(registered => 1, slug => 'reg', cwd => $ra->{cwd}));
+    set_fixture($ra->{fixture_dir}, fixture_name('check-plugins.pl', 0), mk_check_plugins(status => 'ok'));
+    set_fixture($ra->{fixture_dir}, fixture_name('list', 0), mk_snapshot_list(status => 'ok', count => 0));
+    write_state_raw($ra->{state_path}, seed_state(preflight_items => {
+        settings_outcome => { skip_keys => [], preferences_saved => [], answers => {} },
+        sync_skills       => { status => 'ok', count => 2, changed => [ 'skill-a', 'skill-b' ], errors => [] },
+        check_claude_md   => { status => 'ok', live => 'live-sha-abc', repo => 'repo-sha-abc', target => "$ra->{home}/.claude/CLAUDE.md" },
+    }));
+    my $respa = run_backup($ra, {});
+    is($respa->{exit}, 0, 'ITEM7a: (setup) present + clean preflight completes') or diag($respa->{out} . $respa->{err});
+    my $reporta = report_from_notes($respa->{json}{notes});
+    if (ref($reporta) eq 'HASH') {
+        ok(defined($reporta->{ccpraxis_sync}), 'ITEM7a: ccpraxis_sync is present (non-null) when preflight is present, even when clean');
+        is(ref($reporta->{ccpraxis_sync}{skills}), 'HASH', "ITEM7a: report.ccpraxis_sync.skills surfaces preflight's sync_skills checkpoint")
+            or diag('ccpraxis_sync keys present: ' . join(', ', sort keys %{ $reporta->{ccpraxis_sync} // {} }));
+        is_deeply_ids($reporta->{ccpraxis_sync}{skills}{changed} // ['MISSING'], ['skill-a', 'skill-b'],
+            'ITEM7a: ccpraxis_sync.skills.changed lists the synced skill names, not collapsed away')
+;
+        is(ref($reporta->{ccpraxis_sync}{claude_md}), 'HASH', "ITEM7a: report.ccpraxis_sync.claude_md surfaces preflight's check_claude_md checkpoint")
+            or diag('ccpraxis_sync keys present: ' . join(', ', sort keys %{ $reporta->{ccpraxis_sync} // {} }));
+        is(($reporta->{ccpraxis_sync}{claude_md}{status} // 'MISSING'), 'ok',
+            'ITEM7a: a present-but-clean claude_md status ("ok") is reported, not omitted')
+;
+    } else {
+        ok(0, "ITEM7a: report.ccpraxis_sync.$_ surfaces preflight's checkpoint (report missing)") for qw(skills claude_md);
+    }
+
+    # Part B -- present + a NON-TRIVIAL (drift) claude_md status: visible
+    # verbatim, never collapsed to a generic true/false/ok.
+    my $rb = setup_root();
+    set_fixture($rb->{fixture_dir}, fixture_name('is-registered', 0), mk_is_registered(registered => 1, slug => 'reg', cwd => $rb->{cwd}));
+    set_fixture($rb->{fixture_dir}, fixture_name('check-plugins.pl', 0), mk_check_plugins(status => 'ok'));
+    set_fixture($rb->{fixture_dir}, fixture_name('list', 0), mk_snapshot_list(status => 'ok', count => 0));
+    write_state_raw($rb->{state_path}, seed_state(preflight_items => {
+        settings_outcome => { skip_keys => [], preferences_saved => [], answers => {} },
+        check_claude_md   => { status => 'differs', live => 'live-sha-DRIFT', repo => 'repo-sha-DRIFT', target => "$rb->{home}/.claude/CLAUDE.md" },
+    }));
+    my $respb = run_backup($rb, {});
+    is($respb->{exit}, 0, 'ITEM7b: (setup) present preflight with a drifted CLAUDE.md still completes') or diag($respb->{out} . $respb->{err});
+    my $reportb = report_from_notes($respb->{json}{notes});
+    if (ref($reportb) eq 'HASH') {
+        is(($reportb->{ccpraxis_sync}{claude_md}{status} // 'MISSING'), 'differs',
+            "ITEM7b: a non-trivial claude_md status ('differs', a real Preflight.pm drift value) reaches the report verbatim")
+;
+        ok((ref($reportb->{ccpraxis_sync}) eq 'HASH' && ref($reportb->{ccpraxis_sync}{claude_md}) eq 'HASH'),
+            'ITEM7b: (setup) ccpraxis_sync.claude_md is present to carry the drift status at all')
+            or diag('ccpraxis_sync: ' . (defined($reportb->{ccpraxis_sync}) ? JSON::PP->new->canonical->encode($reportb->{ccpraxis_sync}) : 'undef'));
+    } else {
+        ok(0, "ITEM7b: a non-trivial claude_md status reaches the report verbatim (report missing)");
+        ok(0, 'ITEM7b: (setup) ccpraxis_sync.claude_md is present to carry the drift status at all (report missing)');
+    }
+
+    # Part C -- ABSENT preflight: ccpraxis_sync is null, never a fake "clean".
+    my $rc = setup_root();
+    set_fixture($rc->{fixture_dir}, fixture_name('is-registered', 0), mk_is_registered(registered => 1, slug => 'reg', cwd => $rc->{cwd}));
+    set_fixture($rc->{fixture_dir}, fixture_name('check-plugins.pl', 0), mk_check_plugins(status => 'ok'));
+    set_fixture($rc->{fixture_dir}, fixture_name('list', 0), mk_snapshot_list(status => 'ok', count => 0));
+    write_state_raw($rc->{state_path}, seed_state());   # no preflight_items at all
+    my $respc = run_backup($rc, {});
+    is($respc->{exit}, 0, 'ITEM7c: (setup) absent preflight still completes') or diag($respc->{out} . $respc->{err});
+    my $reportc = report_from_notes($respc->{json}{notes});
+    if (ref($reportc) eq 'HASH') {
+        ok(!defined($reportc->{ccpraxis_sync}), 'ITEM7c: absent preflight -> ccpraxis_sync is null (skills/claude_md are absent, never a fake "clean")');
+    } else {
+        ok(0, 'ITEM7c: absent preflight -> ccpraxis_sync is null (report missing)');
+    }
+
+    # Direct contrast -- Part A (present, clean) must not collapse to the
+    # SAME shape as Part C (genuinely absent): the sources.<phase> pattern
+    # this file already relies on elsewhere (AC12) extended to this fact.
+    if (ref($reporta) eq 'HASH' && ref($reportc) eq 'HASH') {
+        isnt((defined($reporta->{ccpraxis_sync}) ? 'present' : 'absent'),
+             (defined($reportc->{ccpraxis_sync}) ? 'present' : 'absent'),
+             'ITEM7: present-but-clean and absent preflight produce DIFFERENT ccpraxis_sync presence, never collapsed to one shape');
+    } else {
+        ok(0, 'ITEM7: present-but-clean and absent preflight produce DIFFERENT ccpraxis_sync presence (a report was missing)');
+    }
+}
+
+# ===========================================================================
 # AC21 -- a signal-killed check-plugins.pl is NOT treated as exit 0/status ok.
 # ===========================================================================
 {

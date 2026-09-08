@@ -627,6 +627,14 @@ sub _assemble_report {
             pushed    => $ex_present ? _shape_hash(_gpi($ctx, 'export', 'pushed'),             'export.pushed',            \@shape_failures) : undef,
             remote_integration => $pf_present ? _shape_hash(_gpi($ctx, 'preflight', 'remote_integration'), 'preflight.remote_integration', \@shape_failures) : undef,
             clone_live         => $pf_present ? _shape_hash(_gpi($ctx, 'preflight', 'clone_live'),         'preflight.clone_live',         \@shape_failures) : undef,
+            # ITEM7 (coordinator): preflight checkpoints these every run the
+            # respective unit succeeds (Preflight.pm:649/:680) but nothing
+            # previously read them back out -- a detected CLAUDE.md drift was
+            # reported to nobody. Nested here, not as new top-level keys,
+            # for the same reason remote_integration/clone_live are: purely
+            # informational, decision-free facts sourced from preflight.
+            skills             => $pf_present ? _shape_hash(_gpi($ctx, 'preflight', 'sync_skills'),      'preflight.sync_skills',      \@shape_failures) : undef,
+            claude_md          => $pf_present ? _shape_hash(_gpi($ctx, 'preflight', 'check_claude_md'),  'preflight.check_claude_md',  \@shape_failures) : undef,
         };
     }
 
