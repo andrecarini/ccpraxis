@@ -41,6 +41,9 @@ use JSON::PP;
 use Fcntl qw(:flock O_WRONLY O_CREAT O_EXCL);
 use File::Basename qw(dirname);
 use Cwd qw(abs_path);
+use File::Spec ();
+use POSIX ();
+use IO::Handle ();
 
 # MSYS2 path-conversion guard (house rule): this script may spawn bp-launch.sh
 # (native bash) with ':'-bearing args on a Windows host; disable the translation.
@@ -2078,9 +2081,189 @@ sub mark_judge_inflight {
         my $e = $!; unlink $tmp;
         return _escalation_write_failed($runs, 'mark_judge_inflight(rename)', $f, $e);
     }
+    # agent-telemetry/03-dispatch-write-path: on the success path ONLY, log
+    # a role=judge dispatch record. Logging never changes this sub's return
+    # value -- that value feeds the harvest_spawn_fail/escalation_spawn_fail/
+    # resolve_attempts caps, and a logging failure must not read as a spawn
+    # failure (spec S2.4 / S5.2).
+    my $root = dispatch_log_root($runs);
+    if (defined $root) {
+        my $id = dispatch_log_id($runs, $kind, $pkg);
+        if (defined $id) {
+            my @args = ('start', '--id', $id,
+                        '--worker-type', judge_worker_type($kind),
+                        '--role', 'judge', '--package', $pkg, '--root', $root);
+            my $bptok = judge_blueprint_token($runs);
+            push @args, '--blueprint', $bptok if defined $bptok;
+            _dispatch_log(@args);
+        }
+    }
     return 1;
 }
-sub clear_judge_inflight { my ($runs, $kind, $pkg) = @_; unlink judge_inflight_path($runs, $kind, $pkg); }
+sub clear_judge_inflight {
+    my ($runs, $kind, $pkg) = @_;
+    my $f = judge_inflight_path($runs, $kind, $pkg);
+    # agent-telemetry/03-dispatch-write-path: fire `finish` ONLY when the
+    # inflight marker actually exists, so a second clear on an
+    # already-settled record (AC44) never calls the logger a second time --
+    # a second `finish` on a `done` record would append a second
+    # history.jsonl line and skew the median.
+    if (-e $f) {
+        my $root = dispatch_log_root($runs);
+        if (defined $root) {
+            my $id = dispatch_log_id($runs, $kind, $pkg);
+            if (defined $id) {
+                # Status is decided by evidence already on disk at this
+                # instant: every settle site clears the inflight marker
+                # BEFORE archiving/unlinking the verdict, so this reads the
+                # right evidence (spec S2.4).
+                my $status = (-e judge_verdict_path($runs, $kind, $pkg)) ? 'done' : 'interrupted';
+                _dispatch_log('finish', '--id', $id, '--status', $status, '--root', $root);
+            }
+        }
+    }
+    unlink $f;
+}
+
+# --- dispatch-log recording for judges (agent-telemetry/03-dispatch-write-path)
+#
+# Judges never go through Task -- the orchestrator fires them directly
+# (orchestrator-protocol/SKILL.md:18) -- so THIS is where role=judge dispatch
+# records are written; track-dispatch.sh only ever sees Task dispatches
+# (workers). The choke point is the inflight marker pair
+# (mark_judge_inflight/clear_judge_inflight above), called at every
+# fire/settle site -- NOT the injectable spawn_judge seam, which tests
+# replace with their own closure that would never see logging placed there.
+
+# judge_worker_type($kind) -- mirrors bp-judge.sh's own AGENT_FILE case
+# exactly, not invented: escalation-resolve is bp-escalation-resolver
+# (different stem, no "-judge" suffix); every other kind is bp-<kind>-judge.
+sub judge_worker_type {
+    my ($kind) = @_;
+    return 'bp-escalation-resolver' if defined($kind) && $kind eq 'escalation-resolve';
+    my $k = defined($kind) ? $kind : '';
+    return "bp-$k-judge";
+}
+
+# judge_blueprint_token($runs) -- basename(dirname($runs)), the blueprint
+# directory name one level up from runs/. undef (never guessed) unless it
+# matches the same shape guard as bp-dispatch-log.pl's own --id/--blueprint
+# (^[A-Za-z0-9._-]+$) and is neither '.' nor '..'.
+sub judge_blueprint_token {
+    my ($runs) = @_;
+    return undef unless defined $runs && length $runs;
+    my $b = File::Basename::basename(dirname($runs));
+    return undef unless defined $b && $b =~ /^[A-Za-z0-9._-]+\z/;
+    return undef if $b eq '.' || $b eq '..';
+    return $b;
+}
+
+# dispatch_log_id($runs,$kind,$pkg) -- "jd-<bptok|nobp>-<kind>-<pkg>". undef
+# (no logging at all) if $kind or $pkg fails the same shape guard ('_run' is
+# a legal package token -- underscore is in the class).
+sub dispatch_log_id {
+    my ($runs, $kind, $pkg) = @_;
+    for my $v ($kind, $pkg) {
+        return undef unless defined $v && $v =~ /^[A-Za-z0-9._-]+\z/;
+        return undef if $v eq '.' || $v eq '..';
+    }
+    my $bp = judge_blueprint_token($runs);
+    my $bptok = defined($bp) ? $bp : 'nobp';
+    return "jd-$bptok-$kind-$pkg";
+}
+
+# dispatch_log_root($runs) -- 1. the prefix of $runs before
+# "/.ccpraxis-local-data/", if present; 2. else $ENV{CLAUDE_PROJECT_DIR} if
+# set and non-empty; 3. else undef (no logging at all -- never a guessed
+# root, per the hook's own --root contract, S2.1 point 4).
+#
+# Mirrors track-dispatch.sh's own bp_is_absolute_path gate on
+# BP_PROJECT_ROOT (agent-telemetry/03-dispatch-write-path fix-batch, M3): a
+# relative CLAUDE_PROJECT_DIR (".", "", a bare word) must not resolve
+# against the orchestrator's own cwd and create a stray
+# .ccpraxis-local-data/ tree there. Refuse (undef, i.e. no logging at all)
+# rather than guess or normalise -- the same degradation path already used
+# for every other invalid input to this function.
+sub dispatch_log_root {
+    my ($runs) = @_;
+    return undef unless defined $runs;
+    my $root;
+    if ($runs =~ m{^(.*)/\.ccpraxis-local-data/}) {
+        $root = $1;
+    } else {
+        my $cpd = $ENV{CLAUDE_PROJECT_DIR};
+        $root = $cpd if defined($cpd) && length($cpd);
+    }
+    return undef unless defined $root;
+    return undef unless $root =~ m{^/} || $root =~ m{^[A-Za-z]:(?:[/\\]|$)};
+    return $root;
+}
+
+# _dispatch_log(@args) -- impure glue. system()s bp-dispatch-log.pl when it
+# exists beside this script; the return value is ALWAYS discarded and this
+# never dies -- a logging failure must never look like a judge-spawn/settle
+# failure to mark_judge_inflight/clear_judge_inflight's own callers (S2.4,
+# and the governing "observer never blocks" rule this package inherits from
+# track-dispatch.sh's S1.1). Never passes --now: that CLI seam is gated
+# behind CCPRAXIS_DISPATCH_LOG_TEST_NOW=1 and a production caller that
+# passes it gets exit 2 and no record (AC46) -- started_at/ended_at are
+# always the logger's own `time`.
+#
+# Redirection mirrors the hook's own call site (agent-telemetry/03-
+# dispatch-write-path fix-batch, M4): stdin from the null device (the child
+# can never inherit a pipe that never closes), stdout/stderr discarded (the
+# logger's "started ..."/"finished ..."/"refused: ..." lines must not land
+# in runs/orchestrator.log, a JSONL event log nothing parses free text
+# into), exit status still ignored.
+#
+# `local *STDOUT`/reopen alone does NOT move the underlying OS file
+# descriptor on this project's primary platform (Cygwin/Git-for-Windows
+# perl) -- measured directly: system()'s child still inherited the
+# parent's real fd 1/2 and its output leaked through regardless. dup2 the
+# real fds explicitly instead, and restore them unconditionally in every
+# path (redirect-setup failure, system() failure, or success) so a logging
+# hiccup can never leave the ORCHESTRATOR's own stdout/stderr wedged onto
+# /dev/null for the rest of the run.
+sub _dispatch_log {
+    my (@args) = @_;
+    my $script = "$DIR/bp-dispatch-log.pl";
+    return unless -f $script;
+    local $@;
+    # Flush BEFORE swapping fd 1/2: the orchestrator's own stdout/stderr are
+    # typically redirected to a plain file (bp-orchestrate.sh's
+    # `>> orchestrator.log 2>&1`), which makes Perl's own PerlIO buffer
+    # them rather than write-through. dup2() only retargets the OS file
+    # descriptor, not that in-process buffer -- anything still sitting in
+    # it when fd 1/2 point at /dev/null would be lost the moment it later
+    # flushes. Flushing first (STDOUT/STDERR->flush, from IO::Handle) makes
+    # sure everything the orchestrator already queued reaches the real log
+    # before this sub touches the fds at all.
+    eval { STDOUT->flush; STDERR->flush; 1 } or 1;
+    my ($devnull_r, $devnull_w, $saved_in, $saved_out, $saved_err);
+    my $ready = eval {
+        open($devnull_r, '<', File::Spec->devnull) or die "devnull read: $!";
+        open($devnull_w, '>', File::Spec->devnull) or die "devnull write: $!";
+        $saved_in  = POSIX::dup(0);
+        $saved_out = POSIX::dup(1);
+        $saved_err = POSIX::dup(2);
+        POSIX::dup2(fileno($devnull_r), 0);
+        POSIX::dup2(fileno($devnull_w), 1);
+        POSIX::dup2(fileno($devnull_w), 2);
+        1;
+    };
+    if ($ready) {
+        eval { system($^X, $script, @args); 1 } or 1;
+    }
+    POSIX::dup2($saved_out, 1) if defined $saved_out;
+    POSIX::dup2($saved_err, 2) if defined $saved_err;
+    POSIX::dup2($saved_in,  0) if defined $saved_in;
+    POSIX::close($saved_out) if defined $saved_out;
+    POSIX::close($saved_err) if defined $saved_err;
+    POSIX::close($saved_in)  if defined $saved_in;
+    close $devnull_r if $devnull_r;
+    close $devnull_w if $devnull_w;
+    return;
+}
 
 # --- runs/.orchestrator marker (PID + flock; held for the run's lifetime).
 sub acquire_marker {
