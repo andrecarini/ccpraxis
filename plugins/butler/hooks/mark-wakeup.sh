@@ -101,6 +101,65 @@ source "$HOOK_DIR/lib.sh"
 #     EXTRACTION before this branch is ever reached. Reasoned-but-unexercised,
 #     not verified by any test in this repo; a container with jq present
 #     could isolate it, this host cannot.
+#
+# bp_unquote_script_paths -- reads a raw (pre-strip) shell command on stdin,
+# echoes it back with the QUOTES removed from any quoted span whose ENTIRE
+# content is a bare script path ending ".pl" (no whitespace, no shell
+# metacharacter inside). Everything else passes through byte-for-byte.
+#
+# 2026-09-08, toolfix-drivesolo-arm (real drive-solo run, this host):
+# bp_strip_shell_noise blanks EVERY character inside a quoted span, full
+# stop -- that is correct for its stated job (hide inert quoted text from a
+# substring matcher) but it also blanks a QUOTED PROGRAM PATH, which is not
+# inert: the shell still executes it. A driver session that defensively
+# quoted its own script path --
+#   perl "C:/Users/André/.claude/ccpraxis/plugins/butler/scripts/bp-drive-next.pl" next --scope backup-driver
+# -- is ordinary, correct shell (the path contains a non-ASCII character,
+# and quoting a path is the standard defensive habit), yet after stripping
+# the literal text "bp-drive-next.pl" no longer appears ANYWHERE in the
+# result, so bp_wakeup_arm_check's regex can never match it. Confirmed live:
+# this is exactly what happened in a real run on this host -- the driver was
+# never registered, gate-drive-loop.sh was silently inert, and the
+# statusline's "driving" badge never appeared. The documented canonical
+# invocation shape (SKILL.md: `perl "${CLAUDE_PLUGIN_ROOT}"/scripts/bp-drive-
+# next.pl next`) dodges this only because just the VARIABLE is quoted, not
+# the script name itself -- a coincidence of style, not a property this
+# hook actually enforced.
+#
+# THE FIX runs BEFORE bp_strip_shell_noise, not INSIDE it: bp_strip_shell_
+# noise is also guard-validation-interlock.sh's helper for an unrelated
+# classification job (see that helper's own header in scripts/bp-lib.sh),
+# so widening ITS quote handling would change behaviour there too, out of
+# scope and unreviewed for this fix. Un-quoting is done as a narrow, local
+# pre-pass instead: a quoted span only loses its quotes if its content is
+# NOTHING BUT a path ending ".pl" -- once unquoted it is bare, unquoted text
+# by the time bp_strip_shell_noise and the segment/reader-veto logic below
+# ever see it, so every existing property (segment split, first-word veto,
+# $(...)/backtick handling, size guard) applies to it exactly as it would
+# to a naturally-unquoted invocation. Deliberately conservative: a quoted
+# span with anything ELSE inside it (extra words, `;`/`&`/`|`/`<`/`>`/
+# backtick, or content that does not end ".pl") is left untouched and still
+# gets blanked by bp_strip_shell_noise exactly as before this fix -- so an
+# INERT quoted mention that merely happens to contain the substring
+# (`echo "perl /x/bp-drive-next.pl next"`, content has an internal space and
+# does not end ".pl" at the closing quote) is still vetoed, unchanged.
+#
+# NOT a shell parser, same residual class as bp_strip_shell_noise itself:
+# does not track surrounding comment/heredoc state. This is provably safe
+# here because bp_strip_shell_noise's comment and heredoc handling blanks
+# EVERY character of a comment or heredoc body regardless of quoting -- so
+# a script path that this pre-pass unquotes INSIDE a comment or heredoc
+# still gets blanked by the very next stage, unchanged in outcome. Also does
+# not resolve escaped quotes (`\"`) inside a double-quoted span containing a
+# path -- an accepted, narrow residual: no real invocation shape in this
+# repo escapes a quote inside its own path.
+bp_unquote_script_paths() {
+  perl -0777 -pe '
+      s/"([^"\x27;&|<>`\s]+\.pl)"/ $1 /g;
+      s/\x27([^\x27";&|<>`\s]+\.pl)\x27/ $1 /g;
+    ' 2>/dev/null
+}
+
 bp_wakeup_arm_check() {
   regex="$1"
   cmd=$(cat)
@@ -122,6 +181,17 @@ bp_wakeup_arm_check() {
   # could false-positive-arm) rather than under-match, which is this file's
   # stated bias throughout ("when in doubt, arm").
   : "${BP_WAKEUP_MAX_STRIP_BYTES:=8000}"
+  # bp_unquote_script_paths (see its own header above): un-quote a quoted
+  # script-path-only span BEFORE bp_strip_shell_noise runs, same size guard
+  # and perl-availability check as the strip step below -- if either is
+  # skipped, this pre-pass is skipped too and the RAW cmd flows through
+  # unchanged, same false-negative-averse "fall back to raw" bias already
+  # documented for the strip step.
+  if [ -n "$cmd" ] && [ "${#cmd}" -le "$BP_WAKEUP_MAX_STRIP_BYTES" ] \
+     && command -v perl >/dev/null 2>&1; then
+    unquoted=$(printf '%s' "$cmd" | bp_unquote_script_paths)
+    [ -n "$unquoted" ] && cmd="$unquoted" && text="$cmd"
+  fi
   if [ -n "$cmd" ] && [ "${#cmd}" -le "$BP_WAKEUP_MAX_STRIP_BYTES" ] \
      && command -v bp_strip_shell_noise >/dev/null 2>&1; then
     stripped=$(printf '%s' "$cmd" | bp_strip_shell_noise)
