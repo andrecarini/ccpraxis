@@ -286,7 +286,12 @@ sub write_run_state {
 sub _resolve_phase_dir {
     my $override = $ENV{BACKUP_PHASE_DIR};
     return $override if defined $override && length $override;
-    return dirname(abs_path(__FILE__));
+    # Normalise separators BEFORE deriving the directory. abs_path can return a
+    # backslashed path on Windows, and File::Basename::dirname does not split on
+    # backslashes -- it would hand back the whole path as the "directory".
+    # Enforced by plugins/butler/tests/t/93-turn-cap-consistency.t (C9).
+    (my $self = __FILE__) =~ s{\\}{/}g;
+    return dirname(abs_path($self) // $self);
 }
 
 # discover_phases($dir?) -> list of { name, order, resumable, title, pkg }
