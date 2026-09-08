@@ -441,8 +441,33 @@ sub _do_file_conflicts {
     for my $i (0 .. $#conflict_items) {
         my ($file, $id) = @{ $pairs[$i] };
         my $it = $conflict_items[$i];
-        my ($lt, $lt_trunc) = _clamp_text($it->{live_text});
-        my ($rt, $rt_trunc) = _clamp_text($it->{repo_text});
+        # HARDEN item9b: live_text/repo_text are RAW file bytes -- unlike
+        # every other value this module hands to $ctx (see run_phase's
+        # $home_n normalisation and _sanitize_utf8's header comment), they
+        # never passed through _ensure_utf8_bytes. backup.pl's stdout
+        # encoder has no ->utf8 (spec S2.6) and just passes string bytes
+        # through unescaped; a genuinely invalid byte (a lone Latin-1 byte,
+        # a truncated multi-byte sequence -- not a Perl-widened string,
+        # since _read_file_raw reads ':raw') then reaches stdout as-is and
+        # breaks the "exactly one parseable JSON object" invariant outright
+        # -- not merely lossy, UNPARSEABLE by a strict UTF-8 JSON consumer,
+        # which also destroys the resume token a paused run depends on.
+        # _ensure_utf8_bytes repairs this the SAME way it already repairs
+        # $home_n: valid UTF-8 (including real non-ASCII content) is left
+        # byte-for-byte untouched -- this is exactly why the round-trip
+        # assertions exercising genuine non-ASCII file content stay green
+        # -- while a genuinely invalid byte is Latin-1-reinterpreted into
+        # its nearest real character. That is a deliberate choice over a
+        # lossy U+FFFD substitution: a replacement character would LOOK
+        # like faithful content to the operator choosing between
+        # use_live/use_export (whole-file copies) while silently not being
+        # the file's real bytes; the Latin-1 reinterpretation at least
+        # keeps the codepoint meaningful and never renders as the generic
+        # "this was altered" glyph a substitution would.
+        my $live_repaired = _ensure_utf8_bytes($it->{live_text});
+        my $repo_repaired = _ensure_utf8_bytes($it->{repo_text});
+        my ($lt, $lt_trunc) = _clamp_text($live_repaired);
+        my ($rt, $rt_trunc) = _clamp_text($repo_repaired);
         push @decisions, $ctx->{decision}->(
             kind    => 'file_conflict',
             id      => $id,
