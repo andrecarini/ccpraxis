@@ -2434,4 +2434,151 @@ for my $variant (
     unlike($state_raw, qr/\Q$secret\E/, 'HARDEN item8: a credential-shaped remote URL must be redacted from the persisted state file');
 }
 
+
+# ---------------------------------------------------------------------------
+# Item 9 (coordinator hardening, round 5) -- Export.pm:420-421 reads the two
+# sides of a file_conflict with _read_file_raw and puts them straight into
+# data.live_text/data.repo_text WITHOUT _ensure_utf8_bytes -- unlike every
+# other value this module hands to $ctx. Built from explicit \xC3\xA9 BYTE
+# escapes (the two-byte UTF-8 encoding of U+00E9), never a literal source
+# character and never `use utf8`, exactly like the path fixtures elsewhere
+# in this file, so the TEST's own encoding cannot confound the result.
+# ---------------------------------------------------------------------------
+{
+    my $live_nonascii = "live-\xC3\xA9-version\n";
+    my $repo_nonascii = "repo-\xC3\xA9-different\n";
+    isnt($live_nonascii, $repo_nonascii, '(setup) HARDEN item9: the two non-ASCII fixture byte strings genuinely differ');
+    like($live_nonascii, qr/\xC3\xA9/, '(setup) HARDEN item9: the live fixture carries the raw 2-byte UTF-8 sequence for e-acute');
+
+    my $r = setup_root(with_origin => 0);
+    seed_preflight_outcome($r->{state_path}, { skip_keys => [], preferences_saved => [], answers => {} });
+    write_text("$r->{ccpx}/item9-content.txt", $repo_nonascii);
+    _git($r->{home}, $r->{ccpx}, 'add', '-A');
+    _git($r->{home}, $r->{ccpx}, 'commit', '-q', '-m', 'add item9-content.txt to repo');
+    write_text("$r->{home}/.claude/item9-content.txt", $live_nonascii);
+    my $sync_json = encode_json([ { file => 'item9-content.txt', status => 'not_linked', note => 'copy differs from repo' } ]);
+
+    my $resp = run_backup($r, { STUB_SYNC_JSON => $sync_json });
+    is($resp->{exit}, 10, '(setup) HARDEN item9: the non-ASCII-content conflict pauses the run') or diag($resp->{out} . $resp->{err});
+    my @fc = decisions_of_kind($resp, 'file_conflict');
+    record_decisions(@fc);
+    my $d = $fc[0];
+
+    # Ruling P17 (coordinator, round 6): byte-identity is the right test
+    # for a PATH (the bytes ARE the identity, per P15) but the wrong test
+    # for CONTENT inside a JSON string -- a \uXXXX escape decodes back to
+    # the exact original codepoint, so JSON escaping is a legitimate
+    # ENCODING of the value, not data loss. Reframed to compare the
+    # DECODED VALUE (what decode_json actually hands back, already
+    # widened by _spawn's own decode_json call) against the original
+    # content widened the same way -- strict about equality of the value,
+    # not about which encoding shape carries it.
+    my $expected_live = Encode::decode('UTF-8', $live_nonascii);
+    my $expected_repo = Encode::decode('UTF-8', $repo_nonascii);
+
+    if (defined $d) {
+        is($d->{data}{live_text}, $expected_live,
+            'HARDEN item9: the DECODED data.live_text value round-trips the original non-ASCII content exactly');
+        is($d->{data}{repo_text}, $expected_repo,
+            'HARDEN item9: the DECODED data.repo_text value round-trips the original non-ASCII content exactly');
+    } else {
+        ok(0, 'HARDEN item9: the DECODED data.live_text value round-trips the original non-ASCII content exactly');
+        ok(0, 'HARDEN item9: the DECODED data.repo_text value round-trips the original non-ASCII content exactly');
+    }
+
+    # Whole-stdout validity: FB_CROAK CONSUMES its source buffer as a side
+    # effect (hit this exact trap earlier in this file, item3's UTF-8
+    # round-trip check) -- decode a COPY, never $resp->{out} itself.
+    my $stdout_copy = $resp->{out};
+    my $stdout_decodes = eval { Encode::decode('UTF-8', $stdout_copy, FB_CROAK); 1 } ? 1 : 0;
+    ok($stdout_decodes, 'HARDEN item9: the driver stdout as a whole is still valid UTF-8 after the non-ASCII-content decision is emitted')
+        or diag('Encode::decode(UTF-8, ..., FB_CROAK) failed: ' . ($@ // '(no bytes)'));
+
+    # Same reframing for the run-state file: parse it as JSON (its own
+    # encoder has the identical no-\x{}utf8 shape as backup.pl's stdout
+    # encoder, so the same escaping-is-legitimate reasoning applies) and
+    # compare the DECODED pending-decision value, not raw bytes in the
+    # file text.
+    my $state = read_state($r->{state_path});
+    my $pending_decisions = (defined $state && ref($state->{pending}) eq 'HASH' && ref($state->{pending}{decisions}) eq 'ARRAY')
+        ? $state->{pending}{decisions} : [];
+    my ($pending_d) = grep { ($_->{kind} // '') eq 'file_conflict' } @$pending_decisions;
+    if (defined $pending_d) {
+        is($pending_d->{data}{live_text}, $expected_live,
+            'HARDEN item9: the same DECODED value survives into the run-state file pending-decision data');
+    } else {
+        ok(0, 'HARDEN item9: the same DECODED value survives into the run-state file pending-decision data');
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Item 9b -- content that is NOT valid UTF-8 at all (a lone \xE9, i.e. a
+# single Latin-1 byte with no continuation byte -- not a legal UTF-8
+# sequence on its own). The spec does not define a byte-level REPAIR
+# contract for INVALID file content (S2.10's UTF-8 rulings cover $root/
+# paths and JSON::PP->utf8 write paths; nothing addresses a conflicting
+# file whose bytes are not text at all) -- so whether data.live_text
+# should be _ensure_utf8_bytes-repaired (Latin-1-reinterpreted, as that
+# helper already does for a lone \x{e9}-style value elsewhere) for this
+# case specifically is an open question for the coordinator/implementer,
+# flagged in the report rather than guessed here. What is NOT open,
+# though, is Run.pm/backup.pl's own unconditional invariant (spec 01
+# S2.6): "Exactly one JSON object is written to stdout per invocation."
+# That is not a guess -- it is an existing hard contract this module must
+# meet regardless of file content, so the second assertion below enforces
+# it directly rather than treating it as speculative. The first assertion
+# enforces S2.9's separate, equally unconditional "never die on an
+# environmental condition" rule. Empirically (see the report): the raw
+# invalid byte is written straight into the JSON string value, which
+# breaks the stdout invariant even though the JSON *syntax* is otherwise
+# well-formed and the process exits without dying.
+# report rather than asserted here as a guess.
+# ---------------------------------------------------------------------------
+{
+    my $live_latin1 = "live-\xE9-lone-byte\n";
+    my $repo_plain  = "repo-plain-version\n";
+    my $r = setup_root(with_origin => 0);
+    seed_preflight_outcome($r->{state_path}, { skip_keys => [], preferences_saved => [], answers => {} });
+    write_text("$r->{ccpx}/item9b-content.txt", $repo_plain);
+    _git($r->{home}, $r->{ccpx}, 'add', '-A');
+    _git($r->{home}, $r->{ccpx}, 'commit', '-q', '-m', 'add item9b-content.txt to repo');
+    write_text("$r->{home}/.claude/item9b-content.txt", $live_latin1);
+    my $sync_json = encode_json([ { file => 'item9b-content.txt', status => 'not_linked', note => 'copy differs from repo' } ]);
+
+    my $resp = run_backup($r, { STUB_SYNC_JSON => $sync_json });
+    isnt($resp->{exit}, 1, 'HARDEN item9b: invalid-UTF-8 (lone Latin-1 byte) file content never yields phase_died (S2.9: never die on an environmental condition)')
+        or diag($resp->{out} . $resp->{err});
+    ok((defined $resp->{json} && ref($resp->{json}) eq 'HASH'),
+        'HARDEN item9b: stdout is still exactly one parseable JSON object even with invalid-UTF-8 file content')
+        or diag('stdout=[' . $resp->{out} . ']  stderr=[' . $resp->{err} . ']');
+
+    # New this round (coordinator): the diagnostic above showed the
+    # invalid byte silently replaced with U+FFFD in the preview text --
+    # lossy corruption of the very content the operator uses to choose
+    # between use_live/use_export, with nothing marking it as unfaithful.
+    # The spec does not name a specific "preview may be unfaithful" field,
+    # so this asserts the PROPERTY rather than inventing one: either the
+    # shown text survives losslessly, or the decision carries at least one
+    # field beyond the known baseline set (an explicit signal something
+    # was altered) -- never a silent substitution presented as if it were
+    # the file's real content. Strict decode_json already failed above
+    # (306), so structure here is recovered via a LOSSY decode (FB_DEFAULT
+    # substitutes U+FFFD for the invalid byte) purely for INSPECTION --
+    # this does not weaken 306, which correctly stays red because a
+    # compliant/strict consumer still cannot parse this stdout at all.
+    my $lossy_text = eval { Encode::decode('UTF-8', $resp->{out}, Encode::FB_DEFAULT()) };
+    my $inspect = (defined $lossy_text) ? eval { JSON::PP->new->decode($lossy_text) } : undef;
+    my ($d2) = (ref($inspect) eq 'HASH' && ref($inspect->{decisions}) eq 'ARRAY')
+        ? grep { ($_->{kind} // '') eq 'file_conflict' } @{ $inspect->{decisions} }
+        : ();
+    my %known_data_fields = map { $_ => 1 } qw(file live_path repo_path live_text repo_text live_bytes repo_bytes truncated);
+    my @extra_fields = (defined $d2 && ref($d2->{data}) eq 'HASH')
+        ? grep { !$known_data_fields{$_} } keys %{ $d2->{data} }
+        : ();
+    my $shown_live = (defined $d2 && ref($d2->{data}) eq 'HASH') ? ($d2->{data}{live_text} // '') : '';
+    my $shows_replacement_char = ($shown_live =~ /\x{FFFD}/) ? 1 : 0;
+    ok(!($shows_replacement_char && !@extra_fields),
+        'HARDEN item9b: invalid-UTF-8 content must not be silently lossy -- a U+FFFD-substituted preview must carry an explicit unfaithful-preview signal, not be shown as if faithful')
+        or diag('shown_live=[' . $shown_live . ']  extra_fields=[' . join(',', @extra_fields) . ']');
+}
 done_testing();
