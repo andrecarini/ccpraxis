@@ -246,23 +246,30 @@ sub mk_ledger {
 # ===========================================================================
 # Shape helpers
 # ===========================================================================
-my @SUMMARY_KEYS_16 = qw(
+# Ruling AT-11 (driver, 2026-09-09): widened 16 -> 17 for run_agents, and RENAMED
+# to drop the count. A name that encodes a count decays every time the struct is
+# widened -- @KEYS_11 was still called that while holding 13, and package 04's
+# implementer renamed it for exactly this reason. Two test-writers then
+# reintroduced the antipattern as @SUMMARY_KEYS within a day. Count-free names
+# only.
+my @SUMMARY_KEYS = qw(
     blueprint runs_dir state orchestrator_pid orchestrator_alive orchestrator_started_at
     paused_manual paused_reason packages_total packages_done current_package
     running_coordinators decisions_waiting decisions_operator decisions_triage packages
+    run_agents
 );
-my @PKG_KEYS_7 = qw(name status attempt attempt_cap step steps_pending next_action);
+my @PKG_KEYS = qw(name status attempt attempt_cap step steps_pending next_action agents);
 
-sub assert_16_keys {
+sub assert_summary_keys {
     my ($s, $label) = @_;
     ok(is_hashref($s), "$label: summary is a hashref") or return;
-    is_deeply([ sort keys %$s ], [ sort @SUMMARY_KEYS_16 ], "$label: AC1 -- exactly the 16 S2.1 keys, no more, no fewer");
+    is_deeply([ sort keys %$s ], [ sort @SUMMARY_KEYS ], "$label: AC1 -- exactly the 17 S2.1 keys, no more, no fewer");
 }
 
 sub assert_pkg_shape {
     my ($e, $label) = @_;
     ok(is_hashref($e), "$label: package entry is a hashref") or return;
-    is_deeply([ sort keys %$e ], [ sort @PKG_KEYS_7 ], "$label: AC28 -- exactly the 7 S2.2 keys, 'agents' absent");
+    is_deeply([ sort keys %$e ], [ sort @PKG_KEYS ], "$label: AC28 -- exactly the 8 S2.2 keys (package 05 adds 'agents')");
 }
 
 sub assert_new_key_types {
@@ -341,7 +348,7 @@ use_ok('RunState');
 }
 
 # ===========================================================================
-# 3. AC1/AC3 -- the 16-key shape and new-key types, across >= 3 structurally
+# 3. AC1/AC3 -- the 17-key shape and new-key types, across >= 3 structurally
 #    different fixtures.
 # ===========================================================================
 {
@@ -349,20 +356,20 @@ use_ok('RunState');
 
     my $dir_empty = make_blueprint($root, 'empty-run', registry => registry_json());
     my $s_empty = RS('summarize_dir', $dir_empty);
-    assert_16_keys($s_empty, 'AC1 [no packages]');
+    assert_summary_keys($s_empty, 'AC1 [no packages]');
     assert_new_key_types($s_empty, 'AC1 [no packages]');
 
     my $dir_one = make_blueprint($root, 'one-pkg', orchestrator => "42\n",
         registry => registry_json(), packages => { p1 => mk_ledger(status => 'running', pipeline => 1, marks => { 1 => 'x' }) });
     my $s_one = RS('summarize_dir', $dir_one);
-    assert_16_keys($s_one, 'AC1 [one package, orchestrator marker]');
+    assert_summary_keys($s_one, 'AC1 [one package, orchestrator marker]');
     assert_new_key_types($s_one, 'AC1 [one package, orchestrator marker]');
 
     my %many;
     $many{"p$_"} = mk_ledger(status => 'pending') for (1 .. 5);
     my $dir_many = make_blueprint($root, 'many-pkg', shutdown => 1, registry => registry_json(), packages => \%many);
     my $s_many = RS('summarize_dir', $dir_many);
-    assert_16_keys($s_many, 'AC1 [many packages, parked state]');
+    assert_summary_keys($s_many, 'AC1 [many packages, parked state]');
     assert_new_key_types($s_many, 'AC1 [many packages, parked state]');
 }
 

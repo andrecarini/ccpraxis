@@ -47,6 +47,12 @@ our $MAX_PACKAGES       = 512;               # a registry (or ledger set) with m
                                               # than this is treated as unreadable (falls back /
                                               # skips the blueprint), same degradation the byte
                                               # caps above already use
+our $MAX_DISPATCH_RECORDS = 512;             # 05-runstate-agent-aggregation (spec S2.9): candidate
+                                              # *.json entries in the dispatch log. Over this,
+                                              # _dispatch_index returns {} (every blueprint reports
+                                              # agents => [], no error, no partial answer -- Decision
+                                              # 9's "an over-cap set degrades to NO row rather than a
+                                              # fabricated one").
 
 # $PID_ALIVE: CODE ref | undef. Injected by the caller (launcher.pl). NEVER
 # set or probed by RunState itself -- see _pid_state() below.
@@ -732,6 +738,198 @@ sub _ledger_packages {
     return [ sort @names ];
 }
 
+# ===========================================================================
+# 05-runstate-agent-aggregation: the dispatch-log reader.
+#
+# RunState DUPLICATES the small parse rules bp-dispatch-log.pl (a BUTLER
+# plugin script) owns, rather than `require`ing across the plugin boundary --
+# spec S1.1. Three recorded reasons: no stable path from the sandbox plugin
+# to the butler plugin across clone/live-install/mount layouts;
+# bp-dispatch-log.pl is a script whose `package main` section transitively
+# requires bp-write-guard.pl and defines a print-STDERR-and-exit helper,
+# neither of which may enter a render-only module's graph; and what is
+# actually needed is a few lines of arithmetic and a 3-element membership
+# test -- the same call package 04 already made for effective_attempts.
+#
+# The five predicate-input helpers below are pure, pinned-name, and total:
+# none dies, none warns, on any input including refs and hostile bytes.
+# ===========================================================================
+
+# _rec_attr($v) -> Str | undef (private)
+#
+# Reproduces BpDispatchLog::attribution's collapse: undef unless $v is
+# defined, not a ref, and has non-zero length; else $v verbatim (bytes
+# untouched).
+sub _rec_attr {
+    my ($v) = @_;
+    return undef unless defined($v) && !ref($v) && length($v);
+    return $v;
+}
+
+# _rec_str($v) -> Str (private)
+#
+# '' unless $v is defined and not a ref; else $v. Used only for the `status`
+# comparison, so a `status` that is a hashref can never warn.
+sub _rec_str {
+    my ($v) = @_;
+    return '' unless defined($v) && !ref($v);
+    return $v;
+}
+
+# _rec_epoch($v) -> Int | undef (private)
+#
+# undef unless $v is defined, not a ref, matches /\A\d{1,12}\z/ and is > 0;
+# else $v + 0. Deliberate deviation from 02's is_live (which uses
+# looks_like_number, admitting "1.5e9"/"-3"): bare digits only, matching the
+# shape _mtime/_orchestrator_pid already use in this module.
+sub _rec_epoch {
+    my ($v) = @_;
+    return undef unless defined($v) && !ref($v) && $v =~ /\A\d{1,12}\z/;
+    return undef unless $v > 0;
+    return $v + 0;
+}
+
+# _rec_budget($v) -> Int | undef (private)
+#
+# undef unless $v is defined, not a ref, matches /\A\d{1,10}\z/, is > 0, and
+# is <= 604800 (7 days -- reproduces $BpDispatchLog::MAX_BUDGET_SECONDS,
+# guarding against an absurd budget scaling stale_after_seconds past any
+# reachable clock).
+sub _rec_budget {
+    my ($v) = @_;
+    return undef unless defined($v) && !ref($v) && $v =~ /\A\d{1,10}\z/;
+    return undef unless $v > 0 && $v <= 604800;
+    return $v + 0;
+}
+
+# _rec_role($v) -> Str | undef (private)
+#
+# _rec_attr first, then membership in the literal list
+# qw(coordinator worker judge); anything else -> undef. Decision 6 locks the
+# vocabulary -- an unrecognised role string is never emitted verbatim.
+my %RS_ROLE_OK = map { $_ => 1 } qw(coordinator worker judge);
+sub _rec_role {
+    my ($v) = @_;
+    my $s = _rec_attr($v);
+    return undef unless defined $s;
+    return $RS_ROLE_OK{$s} ? $s : undef;
+}
+
+# _rec_worker_type($v) -> Str | undef (private)
+#
+# _rec_attr first; then, on the bytes: replace every control byte
+# ([\x00-\x1F\x7F]) with a space, collapse runs of spaces, trim; undef if the
+# result is empty; truncate to at most 64 bytes, then repair a split UTF-8
+# sequence at the cut (package 04 S2.6 step 7's exact rule: drop trailing
+# continuation bytes \x80-\xBF, then drop one more byte if what remains ends
+# in a lead byte \xC0-\xFF).
+sub _rec_worker_type {
+    my ($v) = @_;
+    my $s = _rec_attr($v);
+    return undef unless defined $s;
+    # fix-batch MEDIUM-1 / red-team MEDIUM-1: JSON::PP->decode (no ->utf8)
+    # returns a UTF8-flagged character string, so length()/substr() below
+    # would count code points, not bytes -- a 64-CHARACTER bound rather than
+    # the 64-BYTE bound spec S2.7/B15 actually specifies. Downgrade to raw
+    # bytes first so every operation below (control-byte class, length,
+    # substr, the split-sequence repair) is genuinely byte-scoped.
+    utf8::encode($s) if utf8::is_utf8($s);
+    $s =~ s/[\x00-\x1F\x7F]/ /g;
+    $s =~ s/\x20+/\x20/g;
+    $s =~ s/\A\x20+//;
+    $s =~ s/\x20+\z//;
+    return undef unless length $s;
+    if (length($s) > 64) {
+        $s = substr($s, 0, 64);
+        while (length($s) && ord(substr($s, -1, 1)) >= 0x80 && ord(substr($s, -1, 1)) <= 0xBF) {
+            $s = substr($s, 0, -1);
+        }
+        if (length($s)) {
+            my $last_byte = ord(substr($s, -1, 1));
+            $s = substr($s, 0, -1) if $last_byte >= 0xC0 && $last_byte <= 0xFF;
+        }
+    }
+    return $s;
+}
+
+# _dispatch_dir($blueprints_root) -> Str | undef (private, pinned name)
+#
+# Pure string arithmetic, no filesystem access, never dies (spec S2.4). The
+# anchor is deliberately strict: only a path whose tail is exactly
+# "/.ccpraxis-local-data/blueprints" (optionally trailing-slashed) yields a
+# dispatch dir, so an unrelated directory two levels up from an arbitrary
+# fixture is never read.
+sub _dispatch_dir {
+    my ($blueprints_root) = @_;
+    return undef unless defined($blueprints_root) && !ref($blueprints_root) && length($blueprints_root);
+    my $p = $blueprints_root;
+    $p =~ s{\\}{/}g;
+    $p =~ s{/+\z}{};
+    return undef unless $p =~ m{\A(.+)/\.ccpraxis-local-data/blueprints\z};
+    return "$1/.ccpraxis-local-data/.dispatch-log";
+}
+
+# _dispatch_index($dispatch_dir) -> \%idx (private, pinned name)
+#
+# Shape: { <blueprint> => { <package> => [ <agent>, ... ] } }, blueprint and
+# package keys taken VERBATIM from the record, agents sorted per S2.8 (by
+# started_at ascending, ties broken by id ascending). Never dies, never
+# warns. Always returns a HASH ref, never undef -- including when
+# $dispatch_dir is undef/a ref/zero-length, is a symlink, is not a directory,
+# opendir fails, or the candidate count exceeds $MAX_DISPATCH_RECORDS
+# (Decision 9: an over-cap set degrades to NO row, not a partial answer).
+#
+# Discovery is opendir/readdir only (glob is forbidden anywhere in this
+# file). Per-record reads reuse the module's existing _read_json_capped,
+# which already degrades a directory-named-*.json, a symlink, an unreadable
+# file, an empty file, and undecodable/oversized bytes to undef -- so all of
+# those "skip" cases need no new code here.
+sub _dispatch_index {
+    my ($dispatch_dir) = @_;
+    my %idx;
+    return \%idx unless defined($dispatch_dir) && !ref($dispatch_dir) && length($dispatch_dir);
+    return \%idx if -l $dispatch_dir;
+    return \%idx unless -d $dispatch_dir;
+    opendir(my $dh, $dispatch_dir) or return \%idx;
+    my @candidates;
+    for my $entry (readdir $dh) {
+        push @candidates, $1 if $entry =~ /\A([A-Za-z0-9._-]{1,128})\.json\z/;
+    }
+    closedir $dh;
+    return \%idx if scalar(@candidates) > $MAX_DISPATCH_RECORDS;
+
+    for my $stem (sort @candidates) {
+        my $rec = _read_json_capped("$dispatch_dir/$stem.json");
+        next unless ref($rec) eq 'HASH';
+        next unless _rec_str($rec->{status}) eq 'running';
+        my $started = _rec_epoch($rec->{started_at});
+        next unless defined $started;
+        my $bp = _rec_attr($rec->{blueprint});
+        next unless defined $bp;
+        my $pkg = _rec_attr($rec->{package});
+        next unless defined $pkg;
+        my $budget = _rec_budget($rec->{budget_seconds});
+        push @{ $idx{$bp}{$pkg} }, {
+            id                  => $stem,
+            role                => _rec_role($rec->{role}),
+            worker_type         => _rec_worker_type($rec->{worker_type}),
+            started_at          => $started,
+            budget_seconds      => $budget,
+            stale_after_seconds => 4 * ($budget // 1800),
+        };
+    }
+
+    for my $bp (keys %idx) {
+        for my $pkg (keys %{ $idx{$bp} }) {
+            $idx{$bp}{$pkg} = [
+                sort { $a->{started_at} <=> $b->{started_at} || $a->{id} cmp $b->{id} }
+                    @{ $idx{$bp}{$pkg} }
+            ];
+        }
+    }
+    return \%idx;
+}
+
 # summarize_dir($blueprint_dir) -> \%summary | undef
 #
 # Builds the S2.2 summary for ONE blueprint directory. undef (the blueprint
@@ -750,9 +948,36 @@ sub _ledger_packages {
 # running_coordinators 0), regardless of what the registry claims. Never
 # dies.
 sub summarize_dir {
-    my ($blueprint_dir) = @_;
+    my ($blueprint_dir, $agent_index) = @_;
     return undef unless defined $blueprint_dir && !ref($blueprint_dir)
         && length($blueprint_dir) && -d $blueprint_dir;
+
+    # 05-runstate-agent-aggregation (spec S2.1/S2.6): $agent_index is an
+    # optional second parameter, a HashRef in the shape _dispatch_index
+    # returns. When it is NOT a HASH ref (undef, a scalar, an arrayref, a
+    # blessed object), it is ignored entirely and this call builds its own
+    # index -- the anchor is the parent of $blueprint_dir, normalised the
+    # same way _dispatch_dir itself normalises its own input.
+    my $idx;
+    if (ref($agent_index) eq 'HASH') {
+        $idx = $agent_index;
+    }
+    else {
+        my $parent = $blueprint_dir;
+        $parent =~ s{\\}{/}g;
+        $parent =~ s{/+\z}{};
+        $parent =~ s{/[^/]*\z}{};
+        $idx = _dispatch_index(_dispatch_dir($parent));
+    }
+
+    # S2.6: $bp_name is the SAME value the summary emits as its own
+    # `blueprint` key, computed by the same three lines used below -- pinned
+    # here too so the record's `blueprint` field is matched against exactly
+    # the string the panel displays.
+    my $bp_name = $blueprint_dir;
+    $bp_name =~ s{/+$}{};
+    $bp_name = (split m{/}, $bp_name)[-1];
+    my $by_pkg = (ref($idx) eq 'HASH' && ref($idx->{$bp_name}) eq 'HASH') ? $idx->{$bp_name} : {};
 
     my $runs_dir = "$blueprint_dir/runs";
     my $has_runs = (-d $runs_dir) ? 1 : 0;
@@ -874,6 +1099,15 @@ sub summarize_dir {
         # returns all-undef without any special-casing here.
         my $facts = _ledger_facts($blueprint_dir, $pkg);
 
+        # 05-runstate-agent-aggregation (spec S2.2/S2.6): a fresh arrayref of
+        # fresh element hashes per entry, never aliased into the shared index
+        # (AC39) -- `[ @$list ]` alone only copies the list, not the element
+        # hashrefs inside it, and those elements are the same SVs that live
+        # in %idx; `[ map { { %$_ } } @$list ]` copies both levels (fix-batch
+        # MEDIUM-2 / red-team 05-redteam.md).
+        my $pkg_agent_list = $by_pkg->{$pkg};
+        my $agents = (ref($pkg_agent_list) eq 'ARRAY') ? [ map { { %$_ } } @$pkg_agent_list ] : [];
+
         push @packages_out, {
             name          => $pkg,
             status        => (length($status) ? $status : undef),
@@ -882,6 +1116,7 @@ sub summarize_dir {
             step          => $facts->{step},
             steps_pending => $facts->{steps_pending},
             next_action   => $facts->{next_action},
+            agents        => $agents,
         };
     }
 
@@ -952,9 +1187,16 @@ sub summarize_dir {
     my $decisions_operator = $split->{operator};
     my $decisions_triage   = $split->{triage};
 
-    my $bp_name = $blueprint_dir;
-    $bp_name =~ s{/+$}{};
-    $bp_name = (split m{/}, $bp_name)[-1];
+    # Ruling AT-8: a 17th run-level key, run_agents, holding agents whose
+    # `package` is the orchestrator's `_run` pseudo-package (Decision 10's
+    # blueprint-scoped conformance judge, bp-orchestrator.pl:2095). `agents`
+    # nests inside `packages`, and `_run` is not a real package (it is
+    # excluded from @pkgs above by the registry's own underscore-prefix
+    # filter and never has a packages/_run.md ledger), so it has nowhere to
+    # attach inside the packages loop -- same $by_pkg lookup, same fresh-copy
+    # rule (never aliased into the shared index).
+    my $run_agent_list = $by_pkg->{'_run'};
+    my $run_agents = (ref($run_agent_list) eq 'ARRAY') ? [ map { { %$_ } } @$run_agent_list ] : [];
 
     return {
         blueprint               => $bp_name,
@@ -973,6 +1215,7 @@ sub summarize_dir {
         decisions_operator      => $decisions_operator,
         decisions_triage        => $decisions_triage,
         packages                => \@packages_out,
+        run_agents              => $run_agents,
     };
 }
 
@@ -984,11 +1227,18 @@ sub summarize_dir {
 # Per-blueprint isolation: one blueprint with a malformed registry never
 # suppresses, alters, or reorders any sibling's summary. Order is ascending
 # by blueprint directory name (inherited from blueprint_dirs).
+#
+# 05-runstate-agent-aggregation (spec S2.1, Decision 9): the dispatch-log
+# index is built ONCE here and passed to every summarize_dir call, rather
+# than each blueprint re-enumerating and re-opening the same records --
+# without this, an 11-run dashboard would pay the opendir + up-to-512
+# head-reads eleven times per 10s gather tick instead of once.
 sub summarize {
     my ($root) = @_;
+    my $idx = _dispatch_index(_dispatch_dir($root));
     my @out;
     for my $dir (blueprint_dirs($root)) {
-        my $s = summarize_dir($dir);
+        my $s = summarize_dir($dir, $idx);
         push @out, $s if defined $s;
     }
     return \@out;
