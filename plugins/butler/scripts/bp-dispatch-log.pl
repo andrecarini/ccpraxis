@@ -305,6 +305,175 @@ sub list_records {
     return \@ids;
 }
 
+# ---------------------------------------------------------------------------
+# RETENTION -- bug 20260908-225444-b9db.
+#
+# The store only ever GREW. `start` writes one record per dispatch and nothing
+# ever removed one. Hook-written worker records are never `finish`ed at all:
+# track-dispatch.sh's PostToolUse side has no correlation key by which it could
+# identify which record to close (the id is hk-...-$$-$RANDOM, persisted
+# nowhere), so those records sit at status `running` forever, age into `stale`,
+# and stay.
+#
+# Two consumers then degrade SILENTLY at different thresholds, and the LOWER
+# one bites first:
+#
+#   store >  512  the dashboard's agent detail vanishes wholesale
+#                 ($RunState::MAX_DISPATCH_RECORDS, plugins/sandbox/scripts/
+#                 RunState.pm -- an unbounded per-tick read is its own hazard,
+#                 so standing aside is the correct LOCAL decision)
+#   store > 2000  track-dispatch.sh stops recording entirely (its own bounded
+#                 scan cap; standing aside over-cap is likewise correct locally)
+#
+# Neither cap is wrong. Both are the right answer to an unbounded store -- which
+# is why the fix belongs HERE, in the thing that grows. With retention in place
+# neither threshold is ever approached, and an operator never has to notice that
+# agent rows quietly stopped appearing.
+#
+# WHY ONLY THE *LIVE* RECORDS ARE PROTECTED. A merely-STALE `running` record
+# must be prunable: unfinished `running` records are the entire population that
+# fills this directory, so protecting all of them would make retention a no-op
+# that looks like a fix. is_live (running AND inside 4x its own budget) is
+# protected unconditionally, whatever the count -- that is precisely what the
+# dashboard is rendering right now, and what the hook's 120s dedup window
+# matches against. Everything else is history, and history is what we trim.
+
+# $RETENTION_KEEP -- how many non-live records survive a prune. Deliberately
+# well under the 512 reader cap rather than merely under the 2000 writer cap:
+# the panel this telemetry exists to feed goes blank at the LOWER number, so
+# sizing to the higher one would leave the visible failure in place.
+our $RETENTION_KEEP = 256;
+
+# $RETENTION_HIGH_WATER -- prune only once the store exceeds this. Hysteresis,
+# not decoration: with no gap between trigger and target, every `start` past the
+# line would re-scan and re-sort the whole directory to delete a single file.
+# With it, the full pass runs once per (HIGH_WATER - KEEP) dispatches.
+our $RETENTION_HIGH_WATER = 320;
+
+# $READER_CAP mirrors $RunState::MAX_DISPATCH_RECORDS (plugins/sandbox/scripts/
+# RunState.pm). Duplicated across a plugin boundary on purpose -- butler must not
+# load a sandbox module in order to write a log -- and the duplication is
+# guarded: butler t/182 reads RunState.pm and fails if the two ever drift apart.
+our $READER_CAP = 512;
+
+# prune_plan(\@entries, $now, $keep) -> \@ids_to_delete -- PURE.
+#
+# @entries is [ { id => $id, rec => \%rec|undef }, ... ]. Three classes:
+#
+#   NOT OURS    rec is not a hash, or carries no worker_type. Left alone
+#               entirely. `start` requires --worker-type, so every record this
+#               writer has ever produced has one; anything else in the directory
+#               is a foreign file, and deleting it would be this function
+#               exceeding its remit.
+#   PROTECTED   is_live -- never returned, at any count.
+#   PRUNABLE    everything else, newest-first by started_at; the first $keep
+#               survive and the rest are returned.
+#
+# A record whose started_at is absent or non-numeric sorts as OLDEST (key -1)
+# rather than being skipped: `elapsed` and `list` both already refuse to
+# evaluate such a record, so it informs no consumer and is the first thing that
+# should go. Ties break on id ascending, so the plan is deterministic for a
+# given input -- a prune that depended on readdir order would be untestable.
+sub prune_plan {
+    my ($entries, $now, $keep) = @_;
+    $keep = $RETENTION_KEEP unless defined $keep && looks_like_number($keep) && $keep >= 0;
+    my @prunable;
+    for my $e (@{ $entries || [] }) {
+        next unless ref $e eq 'HASH' && defined $e->{id};
+        my $rec = $e->{rec};
+        next unless ref $rec eq 'HASH' && defined $rec->{worker_type};   # not ours
+        next if is_live($rec, $now);                                     # protected
+        my $key = (defined $rec->{started_at} && looks_like_number($rec->{started_at}))
+                ? $rec->{started_at} + 0 : -1;
+        push @prunable, { id => $e->{id}, key => $key };
+    }
+    my @sorted = sort { $b->{key} <=> $a->{key} || $a->{id} cmp $b->{id} } @prunable;
+    return [] unless @sorted > $keep;
+    return [ map { $_->{id} } @sorted[ $keep .. $#sorted ] ];
+}
+
+# $ALARM_MAX_BYTES / alarm_path / note_alarm -- the report's point (c).
+#
+# A cap that is hit silently is a permanent stop nobody can discover. Retention
+# should mean neither cap is ever reached, so a line in this file means
+# retention ITSELF failed -- which is exactly the moment the evidence has to
+# already be on disk rather than inferable. The file is not named *.json, so it
+# is invisible to list_records, to the hook's scan, and to its own count.
+#
+# Truncated (not rotated) past 64 KiB: this file exists to be found, not to
+# become the next unbounded thing in a directory that is here because something
+# grew without bound.
+our $ALARM_MAX_BYTES = 64 * 1024;
+sub alarm_path { return log_dir($_[0]) . '/retention-alarm.log' }
+sub note_alarm {
+    my ($root, $msg, $now) = @_;
+    return 0 unless defined $msg && length $msg;
+    _mkdir_p(log_dir($root)) or return 0;
+    my $p    = alarm_path($root);
+    my $size = (-f $p) ? (-s $p) : 0;
+    my $mode = (defined $size && $size > $ALARM_MAX_BYTES) ? '>' : '>>';
+    open my $fh, $mode, $p or return 0;
+    $msg =~ s/\s+/ /g;
+    print {$fh} (defined $now ? $now : time) . " $msg\n";
+    close $fh;
+    return 1;
+}
+
+# prune_records($root, $now, %opt) -> \%summary -- IMPURE. opt: keep, force.
+#
+# Best-effort by contract: every failure path degrades to "pruned fewer than
+# hoped", never to an error a caller must handle. `start`'s job is to record a
+# dispatch; retention riding along must not be able to fail it.
+#
+# Also sweeps ORPHANED LOCK FILES. BpWrite::guarded_write leaves a
+# "$id.json.lock" beside every record it writes and nothing removed those
+# either. They are invisible to list_records and to the hook (neither matches
+# *.json.lock) so they never counted toward any cap -- but they are half of
+# every readdir this directory serves, and a lock whose record is gone protects
+# nothing.
+sub prune_records {
+    my ($root, $now, %opt) = @_;
+    $now = time unless defined $now;
+    my $keep = (defined $opt{keep} && looks_like_number($opt{keep}) && $opt{keep} >= 0)
+             ? int($opt{keep}) : $RETENTION_KEEP;
+    my $dir  = log_dir($root);
+    my $ids  = list_records($root);
+    my %sum  = (scanned => scalar(@$ids), pruned => 0, locks => 0, failed => 0, skipped => 0);
+
+    unless ($opt{force} || @$ids > $RETENTION_HIGH_WATER) {
+        $sum{skipped}   = 1;
+        $sum{remaining} = $sum{scanned};
+        return \%sum;
+    }
+
+    my @entries = map { { id => $_, rec => read_record($root, $_) } } @$ids;
+    my $doomed  = prune_plan(\@entries, $now, $keep);
+    for my $id (@$doomed) {
+        if (unlink "$dir/$id.json") { $sum{pruned}++ } else { $sum{failed}++ }
+        $sum{locks}++ if unlink "$dir/$id.json.lock";
+    }
+
+    # Orphaned locks left by earlier runs: records pruned by hand, or writes
+    # that never produced a record at all.
+    if (opendir my $dh, $dir) {
+        for my $f (readdir $dh) {
+            next unless $f =~ /^(.+\.json)\.lock\z/;
+            next if -e "$dir/$1";
+            $sum{locks}++ if unlink "$dir/$f";
+        }
+        closedir $dh;
+    }
+
+    $sum{remaining} = $sum{scanned} - $sum{pruned};
+    if ($sum{remaining} > $READER_CAP) {
+        note_alarm($root, "retention ran but the store still holds $sum{remaining} records, "
+                        . "over the $READER_CAP reader cap, so the dashboard is rendering no "
+                        . "agent detail. Either too many records are LIVE to prune, or unlink "
+                        . "is failing ($sum{failed} failures this pass).", $now);
+    }
+    return \%sum;
+}
+
 package main;
 use strict;
 use warnings;
@@ -344,6 +513,8 @@ unless (caller) {
         elsif ($a eq '--blueprint')      { $o{blueprint}       = shift @ARGV }
         elsif ($a eq '--package')        { $o{package}         = shift @ARGV }
         elsif ($a eq '--role')           { $o{role}            = shift @ARGV }
+        elsif ($a eq '--keep')           { $o{keep}            = shift @ARGV }
+        elsif ($a eq '--force')          { $o{force}           = 1 }
         else { usage_error("unknown option '$a'") }
     }
     my $root = $o{root};
@@ -386,6 +557,19 @@ unless (caller) {
                 if defined $o{$opt};
         }
     }
+
+    # --keep / --force are retention options and belong to `prune` alone --
+    # the same shape as the start-only guard above, for the same reason: an
+    # option silently ignored on the wrong command is how a caller comes to
+    # believe it asked for something it did not.
+    if ($cmd ne 'prune') {
+        for my $opt (qw(keep force)) {
+            usage_error("--$opt is only valid with the prune command")
+                if defined $o{$opt};
+        }
+    }
+    usage_error("--keep '$o{keep}' must be a non-negative integer")
+        if defined $o{keep} && $o{keep} !~ /^\d+\z/;
 
     # fixbatch step7 / MEDIUM-2: --now is a TEST-ONLY seam (see file header).
     # Nothing previously distinguished a test invocation from a production
@@ -504,6 +688,19 @@ unless (caller) {
                        . ($result->{reason} // 'unknown error') . "\n";
             exit 4;
         }
+        # Retention rides on `start` because `start` is the only thing that
+        # grows the store (bug 20260908-225444-b9db). Gated by its own
+        # high-water mark, so the common call costs one extra readdir and
+        # nothing else; the full read-and-sort pass runs about once per
+        # (HIGH_WATER - KEEP) dispatches. Wrapped in eval and its result
+        # ignored on failure: recording the dispatch is this command's job,
+        # trimming history is housekeeping, and housekeeping must never be
+        # able to fail the job.
+        my $trim = eval { BpDispatchLog::prune_records($root, $now) } || {};
+        if (($trim->{pruned} || 0) > 0) {
+            print STDERR "bp-dispatch-log: retention pruned $trim->{pruned} record(s) and "
+                       . "$trim->{locks} stale lock file(s); $trim->{remaining} remain\n";
+        }
         print "started $id (worker_type=$wt budget_seconds=$budget)\n";
         exit 0;
     }
@@ -562,6 +759,19 @@ unless (caller) {
                 . 'stale: ' . ($stale ? 'true' : 'false') . "\n";
         }
         exit 0;
+    }
+    elsif ($cmd eq 'prune') {
+        # Explicit prune: always does the full pass. `start`'s automatic call
+        # is gated on the high-water mark because it runs on every dispatch;
+        # an operator who typed `prune` has already made that decision.
+        my $trim = BpDispatchLog::prune_records($root, $now,
+                                                keep => $o{keep}, force => 1);
+        print "scanned: $trim->{scanned}\n";
+        print "pruned: $trim->{pruned}\n";
+        print "locks_removed: $trim->{locks}\n";
+        print "remaining: $trim->{remaining}\n";
+        print "unlink_failures: $trim->{failed}\n";
+        exit($trim->{failed} ? 4 : 0);
     }
     elsif ($cmd eq 'finish') {
         usage_error('--id is required') unless defined $o{id};
@@ -664,6 +874,7 @@ bp-dispatch-log.pl — the per-dispatch budget record for an Agent/Task worker.
   elapsed --id <ID> [--root DIR] [--now EPOCH]
   list    [--root DIR] [--now EPOCH]
   finish  --id <ID> --status done|interrupted|killed [--report PATH] [--note TEXT] [--root DIR] [--now EPOCH]
+  prune   [--keep N] [--root DIR] [--now EPOCH]
 
 --blueprint / --package / --role are optional and valid ONLY with `start`;
 --role is a closed vocabulary of exactly coordinator, worker or judge.
@@ -673,6 +884,15 @@ exists for --id) · 4 elapsed/finish: no record for --id (UNVERIFIABLE).
 
 A `running` record is STALE once its elapsed time exceeds 4x its own
 budget_seconds; `list` marks it `stale: true` but still shows it.
+
+RETENTION. `start` prunes automatically once the store passes its high-water
+mark, keeping the 256 most recent non-live records (bug 20260908-225444-b9db --
+before this the store only ever grew, and two consumers went silently dark at
+512 and at 2000 records). LIVE records are never pruned, whatever the count.
+`prune` does the same pass on demand, ignoring the high-water gate. If a prune
+leaves the store still over the 512 reader cap, one line is written to
+.dispatch-log/retention-alarm.log: a cap reached silently is a permanent stop
+nobody can discover.
 USAGE
         exit 2;
     }

@@ -1232,6 +1232,21 @@ sub dispatch_key {
     # Lowercase-only, deliberately -- same rationale as 'b' above: 'D' is the
     # LEFT arrow's CSI final byte (\e[D), so an uppercase alias risks firing
     # on an unassembled escape sequence.
+    #
+    # Bound UNCONDITIONALLY, and that is now the settled answer rather than an
+    # oversight (bug 20260908-193156-2cee, mechanism 3: "silent no-op when
+    # there is nothing to dismiss"). Ruled working-as-intended, because the
+    # thing that made it a defect is gone: '[d] dismiss' is no longer rendered
+    # unless 'd' will actually clear something (t/183), so nothing on screen
+    # invites the press in the first place. Adding a "nothing to dismiss"
+    # notice would answer a complaint about banners you cannot get rid of by
+    # inventing another banner. Every unbound key in this TUI is swallowed
+    # silently; this one is no different when it has no work to do.
+    #
+    # 'd' is also, deliberately, never destructive on ANY screen -- the
+    # backpack screen's drop moved to 'x' for exactly that reason. The
+    # invariant is enforced in t/189, derived rather than hardcoded, so
+    # rebinding dismiss here onto a letter that destroys elsewhere fails.
     return ('dismiss-install-warning', '') if $key eq 'd';
     # Up/down scroll the Activity panel. The read-key seam assembles the arrow
     # escape sequences into the 'UP'/'DOWN' tokens (also accept k/j as aliases).

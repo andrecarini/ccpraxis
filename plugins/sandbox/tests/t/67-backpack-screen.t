@@ -644,7 +644,7 @@ SKIP: {
 # before -- `read_key` alone, no `wait_key` seam, so an exhausted `keys`
 # queue ends the loop via run()'s own "no input source at all" rule
 # (S2.4.1: "a poll yields nothing and wait_key is not a coderef" ->
-# terminate). That shape makes 'd' and a queued 'y' STRUCTURALLY
+# terminate). That shape makes 'x' and a queued 'y' STRUCTURALLY
 # ADJACENT -- both come off the same `read_key` queue with nothing between
 # them -- which is indistinguishable from genuine type-ahead queued BEFORE
 # the operator could have seen DROP_WARNING(), and run()'s post-arm drain
@@ -724,20 +724,20 @@ SKIP: {
 
 SKIP: {
     skip('tui::BackpackScreen does not exist yet', 7) unless $BS_OK;
-    # --- AC-S3: behaviour 17 -- 'd' then, after a GENUINE gap, 'y', with a
+    # --- AC-S3: behaviour 17 -- 'x' then, after a GENUINE gap, 'y', with a
     # remove seam.
     #
-    # Test-defect fix (MEDIUM-2/type-ahead-drain): this used to script 'd'
-    # and 'y' back to back on the SAME read_key queue (keys => ['d','y',
+    # Test-defect fix (MEDIUM-2/type-ahead-drain): this used to script 'x'
+    # and 'y' back to back on the SAME read_key queue (keys => ['x','y',
     # 'q']). That shape is indistinguishable from type-ahead queued BEFORE
     # the operator could possibly have seen DROP_WARNING() -- run()'s own
     # post-arm drain (S2.4.1) correctly eats a 'y' with nothing between it
-    # and the 'd' that armed the confirm, and the remove seam correctly
+    # and the 'x' that armed the confirm, and the remove seam correctly
     # never fired. The bug was in THIS TEST'S assumption, not in run(): it
     # asserted the fire-after-confirm claim (a) using a fixture that
     # actually exercises the no-gap claim (b) instead (see AC-C6, below,
     # for (b) itself). Modelled here as intended -- claim (a), "a confirm
-    # that follows the warning DOES fire" -- by putting 'd' on read_key and
+    # that follows the warning DOES fire" -- by putting 'x' on read_key and
     # 'y'+'q' behind wait_keys, so the drain (which only ever calls
     # read_key, never wait_key) has nothing to eat, and 'y' is only ever
     # observed by run()'s NEXT loop iteration -- a later, separate
@@ -749,7 +749,7 @@ SKIP: {
         items     => [ $item ], approvals => \%appr,
         remove    => sub { push @remove_calls, $_[0]; return (1, {}); },
         save      => sub { push @save_calls, { %{ $_[0] } }; return (1, {}); },
-        keys      => [ 'd' ],
+        keys      => [ 'x' ],
         wait_keys => [ 'y', 'q' ],
     );
     is(scalar(@remove_calls), 1, 'AC-S3: the remove seam was called exactly once (confirm AFTER a genuine gap fires -- claim (a))');
@@ -773,7 +773,7 @@ SKIP: {
     };
     my $ss2 = tui::BackpackScreen::init(%$seams2);
     $ss2->{cursor} = 0;
-    tui::BackpackScreen::apply($ss2, tui::BackpackScreen::dispatch_key($ss2, 'd'), $seams2);
+    tui::BackpackScreen::apply($ss2, tui::BackpackScreen::dispatch_key($ss2, 'x'), $seams2);
     tui::BackpackScreen::apply($ss2, tui::BackpackScreen::dispatch_key($ss2, 'y'), $seams2);
     my $list_text = _bp_list_text($ss2, 40, 120);
     unlike($list_text, qr/\Q@{[ BackpackApproval::item_key($item) ]}\E/,
@@ -802,7 +802,7 @@ SKIP: {
     # be untested, which is the exact gap the red-team's MEDIUM-2 finding
     # named ("the single-key confirm is satisfiable from type-ahead, so
     # DROP_WARNING() need never be displayed before a NON-UNDOABLE drop
-    # fires"). 'd' and 'y' sit on the SAME read_key queue with nothing
+    # fires"). 'x' and 'y' sit on the SAME read_key queue with nothing
     # between them -- indistinguishable from a fast "dy" typed before any
     # frame could have rendered the warning -- so run()'s drain (which
     # fires the instant dispatch_key returns 'confirm-drop', S2.4.1's own
@@ -816,7 +816,7 @@ SKIP: {
         items  => [ $item ], approvals => \%appr,
         remove => sub { push @remove_calls, $_[0]; return (1, {}); },
         save   => sub { push @save_calls, { %{ $_[0] } }; return (1, {}); },
-        keys   => [ 'd', 'y', 'q' ],
+        keys   => [ 'x', 'y', 'q' ],
     );
     is(scalar(@remove_calls), 0,
         'AC-C6: a "y" queued with NO gap after the arming "d" does NOT fire the remove seam -- claim (b)');
@@ -844,7 +844,7 @@ SKIP: {
         items     => [ $item2 ], approvals => \%appr2,
         remove    => sub { push @remove_calls2, $_[0]; return (1, {}); },
         save      => sub { return (1, {}); },
-        keys      => [ 'd' ],
+        keys      => [ 'x' ],
         wait_keys => [ 'y', 'q' ],
     );
     is(scalar(@remove_calls2), 1,
@@ -936,14 +936,14 @@ SKIP: {
 
 SKIP: {
     skip('tui::BackpackScreen does not exist yet', 3) unless $BS_OK;
-    # --- AC-C1: behaviour 19 -- 'd' alone never writes. ---
+    # --- AC-C1: behaviour 19 -- 'x' alone never writes. ---
     my $item = { category => 'cat', name => 'zqxc1', install => 'x', verify => 'y' };
     my @remove_calls;
     my $seams = { items => [ $item ], approvals => {}, remove => sub { push @remove_calls, $_[0]; return (1, {}); } };
     my $ss = tui::BackpackScreen::init(%$seams);
     $ss->{cursor} = 0;
-    my $action = tui::BackpackScreen::dispatch_key($ss, 'd');
-    is($action, 'confirm-drop', "AC-C1: dispatch_key(ss,'d') -> 'confirm-drop'");
+    my $action = tui::BackpackScreen::dispatch_key($ss, 'x');
+    is($action, 'confirm-drop', "AC-C1: dispatch_key(ss,'x') -> 'confirm-drop'");
     tui::BackpackScreen::apply($ss, $action, $seams);
     is(scalar(@remove_calls), 0, 'AC-C1: the remove seam is called ZERO times by arming alone');
     my $banners = tui::BackpackScreen::banners($ss);
@@ -966,7 +966,7 @@ SKIP: {
         my $seams = { items => [ $item ], approvals => {}, remove => sub { push @remove_calls, $_[0]; return (1, {}); } };
         my $ss = tui::BackpackScreen::init(%$seams);
         $ss->{cursor} = 0;
-        my $arm_action = tui::BackpackScreen::dispatch_key($ss, 'd');
+        my $arm_action = tui::BackpackScreen::dispatch_key($ss, 'x');
         tui::BackpackScreen::apply($ss, $arm_action, $seams);
         my $cancel_action = tui::BackpackScreen::dispatch_key($ss, $cancel_key);
         is($cancel_action, 'cancel-drop', "AC-C2: '$cancel_key' while armed -> 'cancel-drop'");
@@ -997,7 +997,7 @@ SKIP: {
     my $seams = { items => [ $item ], approvals => {}, remove => sub { return (1, {}); } };
     my $ss = tui::BackpackScreen::init(%$seams);
     $ss->{cursor} = 0;
-    my $action = tui::BackpackScreen::dispatch_key($ss, 'd');
+    my $action = tui::BackpackScreen::dispatch_key($ss, 'x');
     tui::BackpackScreen::apply($ss, $action, $seams);
     my $banners = tui::BackpackScreen::banners($ss);
     my $warning = tui::BackpackScreen::DROP_WARNING();
@@ -1013,7 +1013,7 @@ SKIP: {
     my $seams = { items => [ $item ], approvals => {} };   # deliberately NO remove seam
     my $ss = tui::BackpackScreen::init(%$seams);
     $ss->{cursor} = 0;
-    my $action = tui::BackpackScreen::dispatch_key($ss, 'd');
+    my $action = tui::BackpackScreen::dispatch_key($ss, 'x');
     tui::BackpackScreen::apply($ss, $action, $seams);
     my $banners = tui::BackpackScreen::banners($ss);
     my $has_warning = grep { tui::Frame::spans_text($_) =~ /\Q@{[ tui::BackpackScreen::DROP_WARNING() ]}\E/ } @$banners;
@@ -1035,7 +1035,7 @@ SKIP: {
     };
     my $ss = tui::BackpackScreen::init(%$seams);
     $ss->{cursor} = 0;
-    my $a1 = tui::BackpackScreen::dispatch_key($ss, 'd');
+    my $a1 = tui::BackpackScreen::dispatch_key($ss, 'x');
     tui::BackpackScreen::apply($ss, $a1, $seams);
     my $a2 = tui::BackpackScreen::dispatch_key($ss, 'y');
     tui::BackpackScreen::apply($ss, $a2, $seams);
@@ -1156,7 +1156,7 @@ SKIP: {
         my $seams = { items => [ { key => 'zqxw4a2', approved => 0 } ], approvals => {}, remove => sub { return (1, {}); } };
         my $ss = tui::BackpackScreen::init(%$seams);
         $ss->{cursor} = 0;
-        my $action = tui::BackpackScreen::dispatch_key($ss, 'd');
+        my $action = tui::BackpackScreen::dispatch_key($ss, 'x');
         tui::BackpackScreen::apply($ss, $action, $seams);
         isnt($ss->{status}{kind}, 'failed', 'AC-W4 case2 (item undef x drop): kind is not failed');
         is($ss->{status}{kind}, 'unavailable', 'AC-W4 case2 (item undef x drop): kind is unavailable');
@@ -1178,7 +1178,7 @@ SKIP: {
         my $seams = { items => [ $item ], approvals => {} };
         my $ss = tui::BackpackScreen::init(%$seams);
         $ss->{cursor} = 0;
-        my $action = tui::BackpackScreen::dispatch_key($ss, 'd');
+        my $action = tui::BackpackScreen::dispatch_key($ss, 'x');
         tui::BackpackScreen::apply($ss, $action, $seams);
         isnt($ss->{status}{kind}, 'failed', 'AC-W4 case4 (no remove seam): kind is not failed');
         is($ss->{status}{kind}, 'unavailable', 'AC-W4 case4 (no remove seam): kind is unavailable');
@@ -1257,7 +1257,7 @@ SKIP: {
     #
     # Test-defect fix (MEDIUM-2/type-ahead-drain, same shape as AC-S3
     # above): 'y' now arrives via wait_keys, after a genuine gap past the
-    # 'd' that arms the confirm, so run()'s post-arm drain (which only
+    # 'x' that arms the confirm, so run()'s post-arm drain (which only
     # touches read_key) has nothing queued to eat -- this is claim (a),
     # "a confirm that follows the warning fires", exercised here through
     # the failed-cleanup arm specifically. ---
@@ -1268,7 +1268,7 @@ SKIP: {
         items     => [ $item ], approvals => \%appr,
         remove    => sub { return (1, {}); },
         save      => sub { return (0, { broken => 1, message => $nonce }); },
-        keys      => [ 'd' ],
+        keys      => [ 'x' ],
         wait_keys => [ 'y', 'q' ],
     );
     is($result->{status}{kind}, 'failed', 'AC-W8: the status kind is failed');
@@ -1292,7 +1292,7 @@ SKIP: {
     };
     my $ss2 = tui::BackpackScreen::init(%$seams2);
     $ss2->{cursor} = 0;
-    tui::BackpackScreen::apply($ss2, tui::BackpackScreen::dispatch_key($ss2, 'd'), $seams2);
+    tui::BackpackScreen::apply($ss2, tui::BackpackScreen::dispatch_key($ss2, 'x'), $seams2);
     tui::BackpackScreen::apply($ss2, tui::BackpackScreen::dispatch_key($ss2, 'y'), $seams2);
     my $list_text = _bp_list_text($ss2, 40, 120);
     unlike($list_text, qr/\Q$key\E/,
@@ -1825,7 +1825,7 @@ SKIP: {
         tui::BackpackScreen::init(load => sub { return { items => [], approvals => {}, error => { broken => 1 } }; }), 24, 80);
     my $armed_ss = tui::BackpackScreen::init(items => [ { category => 'cat', name => 'zqxp3', install => 'x', verify => 'y' } ], approvals => {}, remove => sub { return (1, {}); });
     $armed_ss->{cursor} = 0;
-    tui::BackpackScreen::apply($armed_ss, tui::BackpackScreen::dispatch_key($armed_ss, 'd'), { items => [], approvals => {}, remove => sub { return (1, {}); } });
+    tui::BackpackScreen::apply($armed_ss, tui::BackpackScreen::dispatch_key($armed_ss, 'x'), { items => [], approvals => {}, remove => sub { return (1, {}); } });
     push @fixture_frames, tui::BackpackScreen::compose($armed_ss, 24, 80);
 
     my $bad_roles = 0;
