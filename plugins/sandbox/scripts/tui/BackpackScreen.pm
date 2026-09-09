@@ -61,8 +61,26 @@ sub STATUS_KINDS {
     return [ 'ok', 'noop', 'unavailable', 'failed' ];
 }
 
+# 'x', not 'd'. The dashboard binds 'd' to DISMISS A BANNER -- benign,
+# reversible, and the screen an operator spends nearly all their time on. This
+# screen used to bind the same letter to DROP AN ITEM, which is permanent (see
+# DROP_WARNING above). One key, two screens, and on one of them it destroys
+# something. Reported from the field, 2026-09-08, as part of "there's an issue
+# with every instance where [d] appears on screen".
+#
+# The destructive one moved, not the benign one, on two grounds. Muscle memory
+# flows from the screen you see constantly to the one you visit occasionally,
+# so the rare screen is where a surprise is cheapest. And 'x' already means
+# "tear this down, with a confirm" on the dashboard (full-shutdown), so the
+# pairing this leaves behind is one an operator can actually hold: 'd' never
+# destroys anything anywhere, 'x' always asks first.
+#
+# 'd' is now simply unbound here -- the uniform fate of every unbound key in
+# this TUI. An operator arriving with dashboard reflexes presses it and nothing
+# happens, which is the correct outcome for a key whose meaning does not exist
+# on this screen.
 sub FOOTER_LEGEND {
-    return '[k/j] move  [a] approve  [d] drop  [y] confirm  [q/ESC] quit';
+    return '[k/j] move  [a] approve  [x] drop  [y] confirm  [q/ESC] quit';
 }
 
 # STATE_LABEL($approved) -> 'approved'|'pending'. Total: any hostile input
@@ -251,7 +269,10 @@ sub dispatch_key {
     if ($key eq 'a') {
         return 'approve';
     }
-    if ($key eq 'd') {
+    # 'x' arms the drop confirm -- see FOOTER_LEGEND above for why this is not
+    # 'd'. The ACTION token stays 'confirm-drop'/'drop': the key moved, the
+    # vocabulary did not, so nothing downstream of dispatch_key changes.
+    if ($key eq 'x') {
         $ss->{confirm} = { op => 'drop', key => _selected_key($ss) };
         return 'confirm-drop';
     }
