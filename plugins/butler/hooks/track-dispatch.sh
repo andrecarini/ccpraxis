@@ -87,7 +87,34 @@ if [ "${BP_DISPATCH_LOG_OFF:-}" != "1" ]; then
         for f in "$LOGDIR"/*.json; do
           [ -f "$f" ] || continue
           n=$((n + 1))
-          if [ "$n" -gt 2000 ]; then CLAIMED=1; break; fi
+          if [ "$n" -gt 2000 ]; then
+            # Over SCAN_CAP: stand aside for THIS dispatch (correct -- proving
+            # a negative in unbounded time is worse), but do not simply leave.
+            #
+            # Standing aside alone was a ONE-WAY DOOR (bug 20260908-225444-b9db):
+            # the store only grew, so once past 2000 it stayed past 2000, and
+            # this branch then blocked the only thing that could ever shrink it
+            # -- the logger, whose `start` is where retention now runs. Recording
+            # would have been off from that moment on, silently and forever.
+            #
+            # So the over-cap path RUNS THE PRUNE ITSELF. This dispatch still
+            # goes unrecorded; the next one finds a store back under 256 and
+            # records normally. The alarm line is what makes the incident
+            # discoverable at all, and it is bounded twice over: the prune that
+            # follows it stops this branch from firing again for hundreds of
+            # dispatches, and the append is skipped once the file passes 64 KiB
+            # (the same ceiling bp-dispatch-log.pl's own note_alarm applies).
+            ALARM="$LOGDIR/retention-alarm.log"
+            ASZ=0
+            [ -f "$ALARM" ] && ASZ=$(wc -c < "$ALARM" 2>/dev/null || echo 0)
+            [ "$ASZ" -lt 65536 ] 2>/dev/null && \
+              printf '%s track-dispatch.sh stood aside: over 2000 records, this dispatch went unrecorded; running a prune\n' \
+                "$NOW" >> "$ALARM" 2>/dev/null || :
+            perl "$HOOK_DIR/../scripts/bp-dispatch-log.pl" prune \
+                 --root "$BP_PROJECT_ROOT" </dev/null >/dev/null 2>&1 || :
+            CLAIMED=1
+            break
+          fi
           LINE=""
           IFS= read -r -N 8192 LINE < "$f" 2>/dev/null || true
           case "$LINE" in
