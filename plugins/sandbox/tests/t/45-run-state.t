@@ -290,18 +290,26 @@ sub field       { my ($h, $k) = @_; return is_hashref($h) ? $h->{$k} : $FAILED; 
 # handled by the escalation resolver without waking anyone. The split is
 # additive: decisions_waiting keeps its old meaning and its old value, and the
 # two new keys say who each half belongs to.
-my @KEYS_11 = qw(
-    blueprint runs_dir state orchestrator_pid paused_manual paused_reason
-    packages_total packages_done current_package running_coordinators
-    decisions_waiting decisions_operator decisions_triage
+#
+# Widened to 16 by package 04-runstate-run-and-package-facts (driver ruling
+# AT-4): orchestrator_alive and orchestrator_started_at are run-level facts
+# with nowhere to live inside the per-package `packages` array, and the
+# array itself is the third addition. The variable is renamed from the
+# stale, count-encoding name it carried before (already wrong since the
+# 11->13 widening) to a count-free name, because a name that encodes a
+# count decays every time the struct is widened again.
+my @SUMMARY_KEYS = qw(
+    blueprint runs_dir state orchestrator_pid orchestrator_alive orchestrator_started_at
+    paused_manual paused_reason packages_total packages_done current_package
+    running_coordinators decisions_waiting decisions_operator decisions_triage packages
 );
 
-# assert_summary_shape($summary, $label): the closed 11-key set (S2.2) plus
+# assert_summary_shape($summary, $label): the closed 16-key set (S2.1) plus
 # the declared type/nullability of each key. AC-6 / B28.
 sub assert_summary_shape {
     my ($s, $label) = @_;
     ok(is_hashref($s), "$label: summary is a hashref") or return;
-    is_deeply([ sort keys %$s ], [ sort @KEYS_11 ], "$label: exactly the 13 S2.2 keys, no more, no fewer");
+    is_deeply([ sort keys %$s ], [ sort @SUMMARY_KEYS ], "$label: exactly the 16 S2.1 keys, no more, no fewer");
     ok(defined($s->{blueprint}) && !ref($s->{blueprint}) && length($s->{blueprint}), "$label: blueprint is a non-empty Str");
     ok(defined($s->{runs_dir})  && !ref($s->{runs_dir})  && length($s->{runs_dir}),  "$label: runs_dir is a non-empty Str");
     # Widened by blueprint unified-tui-design-system package
@@ -323,6 +331,19 @@ sub assert_summary_shape {
     ok(!defined($s->{current_package}) || (!ref($s->{current_package}) && length($s->{current_package})), "$label: current_package is undef or a non-empty Str");
     ok(defined($s->{running_coordinators}) && $s->{running_coordinators} =~ /^\d+$/, "$label: running_coordinators is a non-negative Int");
     ok(defined($s->{decisions_waiting}) && $s->{decisions_waiting} =~ /^\d+$/, "$label: decisions_waiting is a non-negative Int");
+    # fix-batch SHOULD-FIX (review): the type checks for the three keys
+    # 04-runstate-run-and-package-facts added (AT-4) landed only in t/184's
+    # assert_new_key_types, never here -- so this canonical shape assertion
+    # was already WRONG about the design the moment those three keys were
+    # specified, exactly the same gap the 'stale'/'solo' states comment two
+    # blocks up describes. Widened here rather than left for whoever first
+    # constructs a fixture missing one of these three to discover.
+    ok(!defined($s->{orchestrator_alive}) || $s->{orchestrator_alive} == 0 || $s->{orchestrator_alive} == 1,
+        "$label: orchestrator_alive is 1, 0, or undef");
+    ok(!defined($s->{orchestrator_started_at})
+        || ($s->{orchestrator_started_at} =~ /^\d+$/ && $s->{orchestrator_started_at} > 0),
+        "$label: orchestrator_started_at is undef or a positive Int");
+    ok(ref($s->{packages}) eq 'ARRAY', "$label: packages is always an ARRAY ref, defined, even for empty runs");
 }
 
 # ===========================================================================
