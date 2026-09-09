@@ -6083,6 +6083,7 @@ sub enter_dashboard {
                 project_name    => $PROJECT_NAME,
                 container       => $CONTAINER_NAME,
                 status          => $cached_status,
+                now             => $now,
                 # s12 MINOR-3: "the status above is a CACHE reading -- do not
                 # trust it to skip work". Dashboard::run_recover_stages honours
                 # this by always calling the container_start seam (which

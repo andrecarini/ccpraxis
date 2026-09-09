@@ -593,6 +593,14 @@ sub _glyphs_data {
         # colour role but are different facts (we could not ask, versus we asked
         # and were told), and the header is where that difference is legible.
         'status.gone' => { cp => 0x2298, desc => 'circled division slash -- the container could not be reached' },
+        # blueprint agent-telemetry 06-blueprints-panel-tree, Decision 11: the
+        # blueprints tree's judge rows need their own status.* marker, not a
+        # borrow of status.warn (which would conflate "attention" with "this
+        # row is a judge") and not a title.* token (title glyphs are for the
+        # header only). U+00A7 SECTION SIGN sits in Latin-1 Supplement, outside
+        # every emoji range t/64's _is_emoji lists, and measures one cell like
+        # its sibling status.crit (U+00D7, the same East-Asian-Ambiguous class).
+        'status.judge' => { cp => 0x00A7, desc => 'section sign -- a judge, fired by the orchestrator' },
         # t03-activity-column: the truncation marker for a row that wrapped
         # past its cap. Declared HERE rather than written into tui/Frame.pm
         # because that module is held to an ASCII-only source rule
