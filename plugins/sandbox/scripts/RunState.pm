@@ -482,6 +482,195 @@ sub _pid_state {
     return $result ? 1 : 0;
 }
 
+# _mtime($path) -> Int|undef (private)
+#
+# 04-runstate-run-and-package-facts (spec S2.3): the DRIVER-SIDE timestamp
+# behind orchestrator_started_at. Uses stat, never a clock read. undef
+# unless $path is a plain file and not a symlink; undef unless
+# (stat $path)[9] is defined, matches /\A\d+\z/ and is > 0; else that
+# integer. Never dies.
+sub _mtime {
+    my ($path) = @_;
+    return undef unless defined $path && -f $path;
+    return undef if -l $path;
+    my @st = stat($path);
+    my $mtime = $st[9];
+    return undef unless defined $mtime && $mtime =~ /\A\d+\z/ && $mtime > 0;
+    return $mtime + 0;
+}
+
+# _reg_count($v) -> Int (private)
+#
+# 04-runstate-run-and-package-facts (spec S2.4): reproduces
+# bp-orchestrator.pl's `_reg_int($v) // 0` composition exactly, including
+# its treatment of 0. Returns $v + 0 when $v is defined, not a ref, and
+# matches /\A\d{1,10}\z/ (bare unsigned digits, 1-10 of them -- rejects a
+# sign, a decimal point, exponent notation, and an 11-digit run); returns 0
+# for everything else (undef, a ref, a negative, a float, "1e3", a string).
+sub _reg_count {
+    my ($v) = @_;
+    return 0 unless defined $v && !ref($v);
+    return 0 unless $v =~ /\A\d{1,10}\z/;
+    return $v + 0;
+}
+
+# _attempt_cap() -> Int (private)
+#
+# 04-runstate-run-and-package-facts (spec S2.4): mirrors
+# bp-orchestrator.pl:2419's `cap => $ENV{BP_ATTEMPT_CAP} // 5` -- a
+# dashboard process without the variable reports the same cap an
+# orchestrator without the variable would use. $ENV{BP_ATTEMPT_CAP} + 0 when
+# that variable is defined, matches /\A\d{1,10}\z/ and is > 0; otherwise 5.
+# Reading %ENV is not a clock read, a spawn or an I/O and does not breach
+# S2.0.
+sub _attempt_cap {
+    my $v = $ENV{BP_ATTEMPT_CAP};
+    return 5 unless defined $v && $v =~ /\A\d{1,10}\z/;
+    my $n = $v + 0;
+    return $n > 0 ? $n : 5;
+}
+
+# _parse_pipeline($blob) -> ($step, $steps_pending) (private)
+#
+# 04-runstate-run-and-package-facts (spec S2.5): pure, takes the raw ledger
+# bytes, never touches the filesystem, never dies. Returns (undef, undef)
+# when $blob is undef/empty or when no checkbox line is recognised.
+sub _parse_pipeline {
+    my ($blob) = @_;
+    return (undef, undef) unless defined $blob && length $blob;
+    my $stripped = $blob;
+    $stripped =~ s/\A\xEF\xBB\xBF//;
+    my @lines = split /\n/, $stripped, -1;
+    for my $l (@lines) { $l =~ s/\r\z//; }
+
+    my $start;
+    for my $i (0 .. $#lines) {
+        if ($lines[$i] =~ /\A##[ \t]+Pipeline[ \t]*\z/i) { $start = $i; last; }
+    }
+    return (undef, undef) unless defined $start;
+
+    # fix-batch MEDIUM-2: the heading stop-test is byte-level and
+    # markdown-naive -- a shell comment/log line pasted into the section at
+    # column 0 (e.g. "# perl scripts/run-tests.pl", a plausible thing for a
+    # validation step to carry) looks exactly like the next heading and
+    # truncates the scan early, understating $total and (combined with the
+    # AT-6 max-based denominator) rendering an in-progress package as
+    # COMPLETE. Track a fenced-code-block toggle and suppress the heading
+    # stop-test while inside a fence.
+    my %checked;   # step number (string "1".."8") -> 1|0, first occurrence wins
+    my $in_fence = 0;
+    for (my $i = $start + 1; $i <= $#lines; $i++) {
+        my $line = $lines[$i];
+        if ($line =~ /\A[ \t]*(?:\x60\x60\x60|~~~)/) { $in_fence = !$in_fence; next; }
+        last if !$in_fence && $line =~ /\A#{1,6}[ \t]/;
+        next if length($line) > 1024;
+        if ($line =~ /\A[ \t]*-[ \t]*\[([ xX])\][ \t]*([1-8])\.[ \t]/) {
+            my ($mark, $num) = ($1, $2);
+            next if exists $checked{$num};
+            $checked{$num} = ($mark eq 'x' || $mark eq 'X') ? 1 : 0;
+        }
+    }
+
+    my @seen_nums = map { $_ + 0 } keys %checked;
+    return (undef, undef) unless @seen_nums;
+
+    # fix-batch AT-6 (driver ruling): the denominator is the HIGHEST STEP
+    # NUMBER OBSERVED, not a count of parseable lines. The two diverge the
+    # moment any recognised line is skipped (over-length, a repeated number)
+    # while a HIGHER-numbered step is still present -- previously this mixed
+    # a step NUMBER (numerator) with a LINE COUNT (denominator), e.g. six
+    # steps pending against a denominator of seven in an eight-step pipeline.
+    my $total = $seen_nums[0];
+    for my $n (@seen_nums) { $total = $n if $n > $total; }
+
+    my @pending = sort { $a <=> $b } grep { !$checked{$_} } @seen_nums;
+    my $current = @pending ? $pending[0] : $total;
+    my $step = sprintf('%d/%d', $current, $total);
+    return ($step, \@pending);
+}
+
+# _parse_next_action($blob) -> Str|undef (private)
+#
+# 04-runstate-run-and-package-facts (spec S2.6): pure, never dies.
+#
+# fix-batch HIGH-2: takes the LAST matching heading, not the first. A
+# template has exactly one '## Next action' section, so first == only there
+# -- but real ledgers in this repo append a fresh one after every journal
+# entry, newest last (verified on a real archived ledger with five headings:
+# the first was a step-3 dispatch instruction, the last "None -- package
+# COMPLETE"). First-match renders the OLDEST instruction as current; taking
+# the last is what makes the panel show the actually-current one.
+sub _parse_next_action {
+    my ($blob) = @_;
+    return undef unless defined $blob && length $blob;
+    my $stripped = $blob;
+    $stripped =~ s/\A\xEF\xBB\xBF//;
+    my @lines = split /\n/, $stripped, -1;
+    for my $l (@lines) { $l =~ s/\r\z//; }
+
+    my $start;
+    for my $i (0 .. $#lines) {
+        if ($lines[$i] =~ /\A##[ \t]+Next[ \t]+action[ \t]*\z/i) { $start = $i; }
+    }
+    return undef unless defined $start;
+
+    # fix-batch MEDIUM-2 (redteam's own "same guard should be applied to
+    # _parse_next_action, whose collection loop has the identical stop
+    # condition"): a fenced code block containing a line starting with '#'
+    # at column 0 must not be misread as the next heading and truncate the
+    # collected text early.
+    my @collected;
+    my $len = 0;
+    my $in_fence = 0;
+    for (my $i = $start + 1; $i <= $#lines; $i++) {
+        my $line = $lines[$i];
+        if ($line =~ /\A[ \t]*(?:\x60\x60\x60|~~~)/) { $in_fence = !$in_fence; }
+        else { last if !$in_fence && $line =~ /\A#{1,6}[ \t]/; }
+        push @collected, $line;
+        $len += length($line) + 1;
+        last if $len >= 4096;
+    }
+
+    my $joined = join(' ', @collected);
+    $joined =~ s/[\x00-\x1F\x7F]/ /g;
+    $joined =~ s/\x20+/\x20/g;
+    $joined =~ s/\A\x20+//;
+    $joined =~ s/\x20+\z//;
+    return undef unless length $joined;
+    return undef if substr($joined, 0, 1) eq '<' && substr($joined, -1, 1) eq '>';
+
+    if (length($joined) > 200) {
+        $joined = substr($joined, 0, 200);
+        while (length($joined) && ord(substr($joined, -1, 1)) >= 0x80 && ord(substr($joined, -1, 1)) <= 0xBF) {
+            $joined = substr($joined, 0, -1);
+        }
+        if (length($joined)) {
+            my $last = ord(substr($joined, -1, 1));
+            $joined = substr($joined, 0, -1) if $last >= 0xC0 && $last <= 0xFF;
+        }
+    }
+    return $joined;
+}
+
+# _ledger_facts($blueprint_dir, $pkg) -> \%facts (private)
+#
+# 04-runstate-run-and-package-facts (spec S2.7): keys step/steps_pending/
+# next_action, all undef on any failure. Never dies. Deliberately
+# independent of frontmatter validity -- unlike _ledger_status, which stays
+# strict and unchanged.
+sub _ledger_facts {
+    my ($blueprint_dir, $pkg) = @_;
+    my %facts = (step => undef, steps_pending => undef, next_action => undef);
+    return \%facts unless _safe_pkg_name($pkg);
+    my $blob = _read_head("$blueprint_dir/packages/$pkg.md", $MAX_LEDGER_BYTES);
+    return \%facts unless defined $blob && length $blob;
+    my ($step, $pending) = _parse_pipeline($blob);
+    $facts{step}          = $step;
+    $facts{steps_pending} = $pending;
+    $facts{next_action}   = _parse_next_action($blob);
+    return \%facts;
+}
+
 # _ledger_packages($blueprint_dir) -> \@names | undef (private)
 #
 # undef ONLY when "$blueprint_dir/packages" is genuinely absent: a symlink,
@@ -631,6 +820,7 @@ sub summarize_dir {
     my $packages_done  = 0;
     my $running_count  = 0;
     my $current_package;
+    my @packages_out;   # 04-runstate-run-and-package-facts: ArrayRef[HashRef], ledger order
     for my $pkg (sort @pkgs) {
         my $entry = $reg_pkgs->{$pkg};
         # HIGH-2 governing rule: the registry is consulted only when the
@@ -660,6 +850,39 @@ sub summarize_dir {
             $current_package = (length($pkg) > 128 ? substr($pkg, 0, 128) : $pkg)
                 unless defined $current_package;
         }
+
+        # 04-runstate-run-and-package-facts (spec S2.4): the displayed
+        # attempt is effective_attempts (attempts - turn_continuations -
+        # rate_limit_discounts, floored at 0) -- the number the orchestrator
+        # actually acts on, not the raw registry `attempt`. Undef whenever
+        # the registry itself is unusable or this package's entry is not a
+        # HASH; a registry-fallback entry (no ledger file) still populates
+        # it from the same $entry the loop already fetched, no second read.
+        my ($attempt, $attempt_cap);
+        if ($reg_usable && ref($entry) eq 'HASH') {
+            my $raw   = _reg_count($entry->{attempt});
+            my $tc    = _reg_count($entry->{turn_continuations});
+            my $rld   = _reg_count($entry->{rate_limit_discounts});
+            my $n     = $raw - $tc - $rld;
+            $attempt     = $n < 0 ? 0 : $n;
+            $attempt_cap = _attempt_cap();
+        }
+
+        # spec S2.7: ledger-derived facts are independent of $ledger_mode --
+        # a registry-fallback package (no packages/<pkg>.md at all) simply
+        # has no file for _read_head to find, so _ledger_facts naturally
+        # returns all-undef without any special-casing here.
+        my $facts = _ledger_facts($blueprint_dir, $pkg);
+
+        push @packages_out, {
+            name          => $pkg,
+            status        => (length($status) ? $status : undef),
+            attempt       => $attempt,
+            attempt_cap   => $attempt_cap,
+            step          => $facts->{step},
+            steps_pending => $facts->{steps_pending},
+            next_action   => $facts->{next_action},
+        };
     }
 
     my $has_shutdown = $has_runs && -e "$runs_dir/.shutdown";
@@ -678,6 +901,31 @@ sub summarize_dir {
               :                                         'idle';
 
     my $running_coordinators = ($has_orch && !$dead && $reg_usable) ? $running_count : 0;
+
+    # 04-runstate-run-and-package-facts (spec S2.3, driver ruling AT-5):
+    # $alive is REUSED verbatim, not re-probed (AC9 -- no second probe).
+    # orchestrator_started_at is the marker's mtime (driver-side, never a
+    # self-report, never a computed uptime -- RunState may not read a
+    # clock), suppressed the moment the pid is POSITIVELY checked-dead so a
+    # stale marker cannot yield an ever-growing uptime downstream. Unknown
+    # liveness does NOT suppress it (a dead prober or missing prober is not
+    # evidence of death). NOTE (fix-batch HIGH-1, left UNCHANGED -- see the
+    # implementer's report): the requested revision, gating on $alive == 1
+    # rather than !$dead, contradicts spec S2.3's own worked example ("unknown
+    # liveness is not treated as death") and t/184 AC6 (an IMMUTABLE oracle,
+    # not in this batch's two authorised test edits), which asserts
+    # orchestrator_started_at stays DEFINED for all three unknown-liveness
+    # sub-cases. The red-team report's own "Minimal mitigation" for HIGH-1
+    # (04-redteam.md ~line 72) places the fix in package 06's renderer
+    # ("an uptime may be rendered only when orchestrator_alive == 1"), not
+    # here. Implementing HIGH-1 as literally worded in this dispatch breaks
+    # AC6 (verified: 3 `not ok`) and the spec text simultaneously, so it is
+    # left as-is pending coordinator adjudication.
+    my $orchestrator_alive = $alive;
+    my $orchestrator_started_at =
+        (!$has_orch) ? undef
+      : $dead         ? undef
+      :                 _mtime("$runs_dir/.orchestrator");
 
     my ($paused_manual, $paused_reason) = _paused_info("$runs_dir/.paused");
 
@@ -709,19 +957,22 @@ sub summarize_dir {
     $bp_name = (split m{/}, $bp_name)[-1];
 
     return {
-        blueprint            => $bp_name,
-        runs_dir             => $runs_dir,
-        state                => $state,
-        orchestrator_pid     => $orchestrator_pid,
-        paused_manual        => $paused_manual,
-        paused_reason        => $paused_reason,
-        packages_total       => $packages_total,
-        packages_done        => $packages_done,
-        current_package      => $current_package,
-        running_coordinators => $running_coordinators,
-        decisions_waiting    => $decisions_waiting,
-        decisions_operator   => $decisions_operator,
-        decisions_triage     => $decisions_triage,
+        blueprint               => $bp_name,
+        runs_dir                => $runs_dir,
+        state                   => $state,
+        orchestrator_pid        => $orchestrator_pid,
+        orchestrator_alive      => $orchestrator_alive,
+        orchestrator_started_at => $orchestrator_started_at,
+        paused_manual           => $paused_manual,
+        paused_reason           => $paused_reason,
+        packages_total          => $packages_total,
+        packages_done           => $packages_done,
+        current_package         => $current_package,
+        running_coordinators    => $running_coordinators,
+        decisions_waiting       => $decisions_waiting,
+        decisions_operator      => $decisions_operator,
+        decisions_triage        => $decisions_triage,
+        packages                => \@packages_out,
     };
 }
 
