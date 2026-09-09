@@ -298,18 +298,31 @@ sub field       { my ($h, $k) = @_; return is_hashref($h) ? $h->{$k} : $FAILED; 
 # stale, count-encoding name it carried before (already wrong since the
 # 11->13 widening) to a count-free name, because a name that encodes a
 # count decays every time the struct is widened again.
+#
+# Widened to 17 by package 05-runstate-agent-aggregation (driver ruling
+# AT-8): Decision 10 (locked) places the blueprint-scoped conformance judge
+# under the RUN, and the orchestrator writes it with the `_run`
+# pseudo-package (bp-orchestrator.pl:2095). `agents` nests inside `packages`
+# and there is no package for `_run` to attach to, so a 17th run-level key,
+# `run_agents`, holds it -- an ArrayRef[HashRef], same 6-key element shape as
+# `packages[].agents`, never undef. Ruling AT-10 authorises this edit: the
+# closed-key-set assertion below would otherwise go permanently red the
+# moment RunState.pm starts emitting the new key, on every fixture in this
+# file, since `run_agents` must be always-present (a sometimes-absent key
+# defeats the closed-key-set contract) rather than conditionally omitted.
 my @SUMMARY_KEYS = qw(
     blueprint runs_dir state orchestrator_pid orchestrator_alive orchestrator_started_at
     paused_manual paused_reason packages_total packages_done current_package
     running_coordinators decisions_waiting decisions_operator decisions_triage packages
+    run_agents
 );
 
-# assert_summary_shape($summary, $label): the closed 16-key set (S2.1) plus
-# the declared type/nullability of each key. AC-6 / B28.
+# assert_summary_shape($summary, $label): the closed 17-key set (S2.1 + AT-8)
+# plus the declared type/nullability of each key. AC-6 / B28.
 sub assert_summary_shape {
     my ($s, $label) = @_;
     ok(is_hashref($s), "$label: summary is a hashref") or return;
-    is_deeply([ sort keys %$s ], [ sort @SUMMARY_KEYS ], "$label: exactly the 16 S2.1 keys, no more, no fewer");
+    is_deeply([ sort keys %$s ], [ sort @SUMMARY_KEYS ], "$label: exactly the 17 S2.1+AT-8 keys, no more, no fewer");
     ok(defined($s->{blueprint}) && !ref($s->{blueprint}) && length($s->{blueprint}), "$label: blueprint is a non-empty Str");
     ok(defined($s->{runs_dir})  && !ref($s->{runs_dir})  && length($s->{runs_dir}),  "$label: runs_dir is a non-empty Str");
     # Widened by blueprint unified-tui-design-system package
@@ -344,6 +357,12 @@ sub assert_summary_shape {
         || ($s->{orchestrator_started_at} =~ /^\d+$/ && $s->{orchestrator_started_at} > 0),
         "$label: orchestrator_started_at is undef or a positive Int");
     ok(ref($s->{packages}) eq 'ARRAY', "$label: packages is always an ARRAY ref, defined, even for empty runs");
+    # AT-8: run_agents is an ArrayRef[HashRef] of the same 6-key agent shape
+    # as packages[].agents, always present (never undef), holding any agent
+    # whose record names the `_run` pseudo-package (Decision 10's
+    # conformance judge). Package 05 does not widen the element shape here;
+    # it only asserts the run-level key exists and is the right ref type.
+    ok(ref($s->{run_agents}) eq 'ARRAY', "$label: run_agents is always an ARRAY ref, defined, even when no _run agent exists (AT-8)");
 }
 
 # ===========================================================================
