@@ -450,6 +450,18 @@ sub assert_baseline_preserved {
                                        # three surfaces (host payload, its live
                                        # mirror, and the container blueprint) so a
                                        # sandbox is not left with the old cap.
+        'env.CLAUDE_CODE_ENABLE_TODO_TOOLS' => 1,
+                                       # 2026-09-10 -- Claude Code withdrew the
+                                       # todo/task tools (TaskCreate/Get/Update/
+                                       # List, TodoWrite) from Opus 4.8, Sonnet 5,
+                                       # Fable 5 and newer; its own changelog names
+                                       # CLAUDE_CODE_ENABLE_TODO_TOOLS=1 as the way
+                                       # back. Operator wants them on both sides,
+                                       # so it is declared on the same three
+                                       # surfaces as the subagent cap above (host
+                                       # payload, its live mirror, and the
+                                       # container blueprint) -- a sandbox must not
+                                       # be left without a tool the host has.
     );
     my @unexpected = grep {
         !exists $baseline_flat->{$_} && !$permitted_additions{$_}
