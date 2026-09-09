@@ -1360,8 +1360,13 @@ sub _agent_row {
         # R3 (package-scoped, level 2): never shows worker_type -- there is
         # one coordinator per package, so a type discriminator adds nothing.
         # R7 (run-scoped, level 1): no such uniqueness guarantee, so it
-        # identifies itself the same way a worker row does (t/187 AC36).
-        $label     = ($level == 2) ? 'coordinator' : (defined($wt) ? $wt : 'coordinator');
+        # identifies itself the same way a worker row does (t/187 AC36) -- but
+        # M2 (package 07 red-team): a bare worker_type in accent at indent 2 is
+        # byte-for-byte the shape of a package row, so the run-scoped label
+        # carries its own word first ("coordinator  <worker_type>"), two spaces
+        # matching every other separator in a tree row. The judge nonce still
+        # appears (spec S2.9): AC36's (c) only checks the nonce is present.
+        $label     = ($level == 2) ? 'coordinator' : (defined($wt) ? 'coordinator  ' . $wt : 'coordinator');
         $role_span = 'accent';
     }
     elsif ($role eq 'worker') {
@@ -1701,7 +1706,11 @@ sub _blueprints_table_width {
     return $avail > 0 ? $avail : undef;
 }
 
-sub _blueprints_body {
+# _blueprints_body_today($state, $cols) -> \@lines. The pipeline as it existed
+# before this package: no row budget, no collapse. Extracted unchanged so the
+# extended _blueprints_body below can fall back to it byte-for-byte whenever a
+# budget is absent, cannot be measured, or simply fits (S3 Behavior 1/2).
+sub _blueprints_body_today {
     my ($state, $cols) = @_;
     $state = {} unless ref($state) eq 'HASH';
     my $lines = _run_summary_lines($state->{runs}, $state->{blueprint_rows_max},
@@ -1713,6 +1722,537 @@ sub _blueprints_body {
     # beneath itself. Every OTHER row in this dashboard earns its label by
     # distinguishing itself from its siblings; a lone row has no siblings.
     return [ [ { text => 'no active runs', role => 'text.muted' } ] ];
+}
+
+# ===========================================================================
+# Row budget and priority (package 07-row-budget-and-preview). The tree
+# package 06 shipped is unbounded, and tui::Screen::_render_panel clips it
+# SILENTLY past the panel's height (Screen.pm:279/341, outside this write
+# set). This section adds a MEASURED capacity (never a predicted one -- see
+# _blueprints_capacity below and ruling AT-14), a documented priority order
+# (S2.4) that decides which rows survive, and a collapse notice that says so.
+# ===========================================================================
+
+# BLUEPRINTS_PROBE_MARK -- the sentinel text a probe-mode _blueprints_body
+# emits, ASCII-only (tui-ascii-only), unrelated to any real render output.
+use constant BLUEPRINTS_PROBE_MARK => '~bpcap~';
+
+# _tree_present($state) -> 1 | 0. 1 iff some element of $state->{runs} is a
+# HASH with state eq 'running' AND (packages is an ARRAY or run_agents is an
+# ARRAY) -- the same capability gate _tree_lines already applies, generalised
+# across every run rather than one. Total.
+sub _tree_present {
+    my ($state) = @_;
+    return 0 unless ref($state) eq 'HASH';
+    return 0 unless ref($state->{runs}) eq 'ARRAY';
+    for my $r (@{ $state->{runs} }) {
+        next unless ref($r) eq 'HASH';
+        next unless defined($r->{state}) && !ref($r->{state}) && $r->{state} eq 'running';
+        return 1 if ref($r->{packages}) eq 'ARRAY' || ref($r->{run_agents}) eq 'ARRAY';
+    }
+    return 0;
+}
+
+# _blueprints_capacity($state, $rows, $cols) -> Int | undef. The panel's true
+# body capacity, MEASURED through the real tui::Screen pipeline rather than
+# predicted (ruling AT-14; Dashboard::_fixed_region_height is this repo's own
+# record of a predictor drifting wrong twice). Compose one probe frame whose
+# Blueprints body is a run of $rows sentinel rows (an intentionally generous
+# upper bound -- a panel body can never exceed the frame's own row count) and
+# count how many came back.
+sub _blueprints_capacity {
+    my ($state, $rows, $cols) = @_;
+    return undef unless ref($state) eq 'HASH';
+    return undef unless defined($rows) && !ref($rows) && $rows =~ /\A\d+\z/ && $rows >= 1;
+    return undef unless defined($cols) && !ref($cols) && $cols =~ /\A\d+\z/ && $cols >= 1;
+    return undef unless _tree_present($state);
+
+    my $probe_state = { %$state, blueprints_probe => $rows };
+    my $scr = screen($probe_state, $cols);
+    return undef unless ref($scr) eq 'HASH';
+    # compose() clears banners before composing (they are overlaid afterward,
+    # outside layout) -- the probe must too, or it measures a geometry the
+    # real frame never actually has.
+    $scr->{banners} = [];
+    my $cells = tui::Screen::compose($scr, $rows, $cols);
+    return undef unless ref($cells) eq 'ARRAY';
+
+    # POSITIONAL, not "found anywhere" (fix-batch, redteam HIGH-1): a bare
+    # substring search counts the mark wherever foreign state echoes it back
+    # -- project_name into the header, status into the header's container
+    # word, an activity event's free-text `reason=` into the side column --
+    # any of which inflates the measured capacity past what the panel can
+    # actually show, and _render_panel's silent clip then drops the LAST
+    # body row, which by construction (S2.6) is the collapse notice itself.
+    #
+    # A genuine probe row is, by construction, THE ENTIRE row: one span
+    # (BODY_INDENT is 0, no label, no prefix) whose text is exactly the
+    # mark, padded on the right to the panel's content width. So a real
+    # probe row's composed text always begins with the mark AT COLUMN 0.
+    # Nothing else on the frame can: the header's own text always leads
+    # with the literal 'ccpraxis sandbox', every Run/Providers/Resources
+    # body row leads with a fixed label column before any state-derived
+    # value, and the side column (Activity) is always joined AFTER the
+    # main region's own text, which is itself padded to full width -- so
+    # foreign content can echo the mark, but never at position 0 of the
+    # composed row.
+    my $mark = BLUEPRINTS_PROBE_MARK();
+    my $count = 0;
+    for my $c (@$cells) {
+        next unless ref($c) eq 'HASH' && defined($c->{text}) && !ref($c->{text});
+        $count++ if index($c->{text}, $mark) == 0;
+    }
+    return $count;
+}
+
+# _row_cost($row, $width) -> Int >= 1. How many PHYSICAL rows one logical row
+# will occupy, using the same pre-wrap helper the tree already uses (a tree
+# row that has already been through _wrap_tree_row at this $width therefore
+# fits, and costs exactly 1). $width absent/malformed means "cannot measure a
+# wrap" -- costs 1, never dies.
+sub _row_cost {
+    my ($row, $width) = @_;
+    return 1 unless defined($width) && !ref($width) && $width =~ /\A\d+\z/ && $width > 0;
+    my $physical = _wrap_tree_row($row, $width);
+    return 1 unless ref($physical) eq 'ARRAY';
+    my $n = scalar(@$physical);
+    return $n >= 1 ? $n : 1;
+}
+
+# _pkg_stuck($p, $now) -> 1 | 0 (spec S2.4). Total: 0 for a non-HASH, missing
+# keys, refs, or hostile values.
+sub _pkg_stuck {
+    my ($p, $now) = @_;
+    return 0 unless ref($p) eq 'HASH';
+
+    if (ref($p->{agents}) eq 'ARRAY') {
+        for my $a (@{ $p->{agents} }) {
+            next unless ref($a) eq 'HASH';
+            next unless defined($a->{role}) && !ref($a->{role}) && $a->{role} eq 'judge';
+            return 1 if _agent_live($a, $now);
+        }
+    }
+
+    my ($att, $cap) = ($p->{attempt}, $p->{attempt_cap});
+    if (defined($att) && !ref($att) && $att =~ /\A\d{1,10}\z/
+        && defined($cap) && !ref($cap) && $cap =~ /\A\d{1,10}\z/
+        && $cap > 0 && $att >= $cap) {
+        return 1;
+    }
+
+    if (defined($p->{status}) && !ref($p->{status})
+        && ($p->{status} eq 'blocked' || $p->{status} eq 'parked')) {
+        return 1;
+    }
+
+    return 0;
+}
+
+# _agent_kind($a) -> one of coordinator|worker|judge|other. Same closed
+# vocabulary _agent_row already enforces (Decision 6): anything else is
+# 'other', matching this file's own @others grouping -- no new role word.
+sub _agent_kind {
+    my ($a) = @_;
+    my $r = (ref($a) eq 'HASH' && defined($a->{role}) && !ref($a->{role})) ? $a->{role} : '';
+    return 'coordinator' if $r eq 'coordinator';
+    return 'worker'      if $r eq 'worker';
+    return 'judge'       if $r eq 'judge';
+    return 'other';
+}
+
+# _push_plan_row(\@entries, $spans, $pri, $kind, $parent, $width) -> Int |
+# undef. Pre-wraps $spans exactly as _tree_lines/_wrap_tree_rows already do
+# (one physical row per element of _wrap_tree_row's result), pushing one plan
+# entry per physical row, all sharing $pri/$kind/$parent. Returns the index of
+# the FIRST physical entry pushed (the anchor a child row's `parent` points
+# at), or undef if nothing was pushed.
+sub _push_plan_row {
+    my ($entries, $spans, $pri, $kind, $parent, $width) = @_;
+    my $physical = _wrap_tree_row($spans, $width);
+    $physical = [ $spans ] unless ref($physical) eq 'ARRAY' && @$physical;
+    my $anchor;
+    my @cont_idx;
+    for my $row (@$physical) {
+        # CORRECTED (fix-batch, redteam MEDIUM-4): every physical row used to
+        # get the LOGICAL row's own parent, so a continuation had no link at
+        # all to its own first line -- the budget could admit
+        # "01-...  attempt 2/5  step" while independently dropping its own
+        # continuation "4/8" (or the reverse, since both were ordinary,
+        # separately-costed pri-5 candidates), and the truncated row reads
+        # as complete (a package with no step at all) rather than as
+        # truncated.
+        #
+        # A `parent => $anchor` link alone is NOT enough (tried first, found
+        # insufficient by execution): it stops a continuation from surviving
+        # without its anchor, but the anchor and its continuation are still
+        # two SEPARATE candidates in the same priority tier, admitted one at
+        # a time -- so a budget that fits the anchor but runs out one row
+        # short still shows the head with the tail silently missing, just
+        # from ordinary admission order rather than from a broken parent
+        # link. The whole physical group of one logical row is ATOMIC: every
+        # row after the first is marked `cont_of => $anchor` and EXCLUDED
+        # from `_select_rows`'s own candidate tiers entirely (never
+        # independently admitted or rejected) -- `_select_rows` instead
+        # folds a continuation's own cost into its anchor's closure cost, so
+        # the whole logical row is kept or dropped as one unit. `parent`
+        # still points at the anchor (not independently at the logical
+        # row's own parent), which keeps `_valid_parent`'s strictly-
+        # decreasing check intact and means nothing else in this file needs
+        # to know a continuation is special.
+        my $row_parent = defined($anchor) ? $anchor : $parent;
+        push @$entries, { spans => $row, pri => $pri, kind => $kind, parent => $row_parent };
+        my $idx = $#$entries;
+        if (defined $anchor) {
+            $entries->[$idx]{cont_of} = $anchor;
+            push @cont_idx, $idx;
+        } else {
+            $anchor = $idx;
+        }
+    }
+    $entries->[$anchor]{continuations} = \@cont_idx if defined($anchor) && @cont_idx;
+    return $anchor;
+}
+
+# _atomic_group($entries, $i) -> \@indices. Row $i together with every
+# physical continuation of its own logical row (S2.4's own wrap-atomicity,
+# fix-batch MEDIUM-4) -- the unit `_select_rows` must admit or reject as a
+# whole. A row with no continuations (the common case) returns just itself.
+sub _atomic_group {
+    my ($entries, $i) = @_;
+    my @g = ($i);
+    my $e = (ref($entries) eq 'ARRAY' && ref($entries->[$i]) eq 'HASH') ? $entries->[$i] : undef;
+    my $conts = $e ? $e->{continuations} : undef;
+    push @g, @$conts if ref($conts) eq 'ARRAY';
+    return @g;
+}
+
+# _package_plan_rows(\@entries, $p, $now, $run_i, $width). Mirrors
+# _package_tree_lines row-for-row (same gate, same group order: coordinators,
+# workers, judges, others), annotating each with S2.4's priority. Pushes
+# DIRECTLY onto the caller's shared \@entries (never a local array of its
+# own) -- a local array whose own anchors get spliced into a larger one after
+# the fact is exactly how a package's coordinator/worker rows end up pointing
+# at the WRONG (pre-splice, locally-numbered) parent index; this file has
+# already paid for that bug once, during this same package's own build.
+sub _package_plan_rows {
+    my ($entries, $p, $now, $run_i, $width) = @_;
+    return unless ref($p) eq 'HASH';
+    my $name = _bound_display($p->{name}, 200);
+    return unless defined $name;
+    return unless _pkg_in_flight($p, $now);
+
+    my @spans = ( { text => _indent(1), role => 'text.muted' },
+                  { text => $name,      role => 'accent' } );
+    my ($att, $cap) = ($p->{attempt}, $p->{attempt_cap});
+    if (defined($att) && !ref($att) && $att =~ /\A\d{1,10}\z/
+        && defined($cap) && !ref($cap) && $cap =~ /\A\d{1,10}\z/) {
+        push @spans, { text => "  attempt $att/$cap",
+                       role => ($att >= $cap ? 'state.warn' : 'text.primary') };
+    }
+    my $step = _bound_display($p->{step}, 32);
+    push @spans, { text => "  step $step", role => 'text.muted' } if defined $step;
+
+    my $pkg_pri = _pkg_stuck($p, $now) ? 4 : 5;
+    my $pkg_i = _push_plan_row($entries, \@spans, $pkg_pri, 'package', $run_i, $width);
+
+    my @agents = (ref($p->{agents}) eq 'ARRAY') ? @{ $p->{agents} } : ();
+    my @live   = grep { _agent_live($_, $now) } @agents;
+    my $rolewd = sub {
+        my ($a) = @_;
+        my $r = $a->{role};
+        return (defined($r) && !ref($r)) ? $r : '';
+    };
+    my @coordinators = grep { $rolewd->($_) eq 'coordinator' } @live;
+    my @workers      = grep { $rolewd->($_) eq 'worker' } @live;
+    my @judges       = grep { $rolewd->($_) eq 'judge' } @live;
+    my @others       = grep {
+        my $r = $rolewd->($_);
+        $r ne 'coordinator' && $r ne 'worker' && $r ne 'judge';
+    } @live;
+
+    my $coord_i;
+    if (@coordinators) {
+        for my $c (@coordinators) {
+            my $row = _agent_row($c, 2, $now);
+            next unless $row;
+            my $i = _push_plan_row($entries, $row, 6, 'coordinator', $pkg_i, $width);
+            $coord_i = $i unless defined $coord_i;
+        }
+    }
+    elsif (defined($p->{status}) && !ref($p->{status}) && $p->{status} eq 'running') {
+        my $row = [ { text => _indent(2), role => 'text.muted' },
+                    { text => 'coordinator', role => 'accent' } ];
+        $coord_i = _push_plan_row($entries, $row, 6, 'coordinator', $pkg_i, $width);
+    }
+    for my $w (@workers) {
+        my $row = _agent_row($w, 3, $now);
+        next unless $row;
+        _push_plan_row($entries, $row, 7, 'worker', (defined($coord_i) ? $coord_i : $pkg_i), $width);
+    }
+    for my $j (@judges) {
+        my $row = _agent_row($j, 2, $now);
+        next unless $row;
+        _push_plan_row($entries, $row, 3, 'judge', $pkg_i, $width);
+    }
+    for my $o (@others) {
+        my $row = _agent_row($o, 3, $now);
+        next unless $row;
+        _push_plan_row($entries, $row, 7, 'other', $pkg_i, $width);
+    }
+    return;
+}
+
+# _tree_plan_rows(\@entries, $s, $now, $width, $run_i). Mirrors _tree_lines
+# row-for-row: the same gate (state=>running AND packages is an ARRAY), the
+# same order (orchestrator, then every package block, then run_agents flat at
+# level 1, unreordered). Pushes directly onto the caller's shared \@entries,
+# for the same reason _package_plan_rows does.
+sub _tree_plan_rows {
+    my ($entries, $s, $now, $width, $run_i) = @_;
+    return unless ref($s) eq 'HASH';
+    return unless defined($s->{state}) && !ref($s->{state}) && $s->{state} eq 'running';
+    return unless ref($s->{packages}) eq 'ARRAY';
+
+    my $orch = _orchestrator_line($s, $now);
+    if ($orch) {
+        my $av = $s->{orchestrator_alive};
+        my $alive = (defined($av) && !ref($av) && $av) ? 1 : 0;
+        _push_plan_row($entries, $orch, ($alive ? 8 : 3), 'orchestrator', $run_i, $width);
+    }
+
+    for my $p (@{ $s->{packages} }) {
+        _package_plan_rows($entries, $p, $now, $run_i, $width);
+    }
+
+    my @run_agents = (ref($s->{run_agents}) eq 'ARRAY') ? @{ $s->{run_agents} } : ();
+    for my $a (@run_agents) {
+        next unless _agent_live($a, $now);
+        my $row = _agent_row($a, 1, $now);
+        next unless $row;
+        my $kind = _agent_kind($a);
+        my $pri  = ($kind eq 'judge') ? 3 : ($kind eq 'coordinator' ? 6 : 7);
+        _push_plan_row($entries, $row, $pri, $kind, $run_i, $width);
+    }
+
+    return;
+}
+
+# _blueprints_row_plan($state, $cols) -> \@entries (spec S2.2). The whole
+# panel body as an ordered plan, one entry per (physical, after pre-wrap) row.
+# Mirrors _run_summary_lines exactly -- same table build, same interleave
+# order (table row, paused reason, cur line, tree lines), same overflow
+# footer -- so that with no budget in play, [ map {spans} @plan ] is
+# is_deeply-equal to _blueprints_body's own output (S2.2's own invariant).
+sub _blueprints_row_plan {
+    my ($state, $cols) = @_;
+    my @entries;
+    return \@entries unless ref($state) eq 'HASH';
+    my $now   = _tree_now($state);
+    my $width = _blueprints_table_width($cols);
+    return \@entries unless ref($state->{runs}) eq 'ARRAY';
+    my @summaries = grep { ref($_) eq 'HASH' } @{ $state->{runs} };
+    return \@entries unless @summaries;
+
+    my $max_rows = $state->{blueprint_rows_max};
+    $max_rows = scalar(@summaries)
+        unless defined($max_rows) && !ref($max_rows) && $max_rows =~ /\A\d+\z/ && $max_rows >= 1;
+    my $shown = (@summaries < $max_rows) ? scalar(@summaries) : $max_rows;
+
+    my $opts = { %{ _BLUEPRINT_TABLE_OPTS() } };
+    $opts->{width} = $width if defined $width && !ref($width) && $width =~ /^\d+$/;
+    my $rows = tui::Frame::table(
+        [ map { _one_run_summary_cells($summaries[$_]) } 0 .. $shown - 1 ], $opts);
+
+    for my $i (0 .. $shown - 1) {
+        my $run_i;
+        if (defined $rows->[$i]) {
+            push @entries, { spans => $rows->[$i], pri => 1, kind => 'run', parent => undef };
+            $run_i = $#entries;
+        }
+        my $reason = _paused_reason_line($summaries[$i]);
+        push @entries, { spans => $reason, pri => 2, kind => 'partial', parent => $run_i } if $reason;
+        my $cur = _current_package_line($summaries[$i]);
+        push @entries, { spans => $cur, pri => 5, kind => 'cur', parent => $run_i } if $cur;
+        _tree_plan_rows(\@entries, $summaries[$i], $now, $width, $run_i);
+    }
+    if (@summaries > $max_rows) {
+        my $extra = @summaries - $max_rows;
+        push @entries, { spans => [ { text => "+" . count_of($extra, "more blueprint"), role => 'text.muted' } ],
+                          pri => 1, kind => 'overflow', parent => undef };
+    }
+    return \@entries;
+}
+
+# _entry_pri($entries, $i) -> Int. Defensive accessor for _select_rows'
+# sort -- 9 (below every real priority) for a hostile/malformed entry, so a
+# sort never compares undef (which would warn under 'use warnings', breaking
+# the purity contract) and a hostile entry never outranks a real one.
+sub _entry_pri {
+    my ($entries, $i) = @_;
+    my $e = (ref($entries) eq 'ARRAY') ? $entries->[$i] : undef;
+    return 9 unless ref($e) eq 'HASH';
+    my $p = $e->{pri};
+    return (defined($p) && !ref($p) && $p =~ /\A\d+\z/) ? $p : 9;
+}
+
+# _valid_parent($entries, $i) -> Int | undef. The entry's `parent`, but only
+# when it is a well-formed, strictly-earlier, HASH-shaped index -- which is
+# also what guarantees the ancestor-walk in _select_rows always terminates
+# (each step strictly decreases).
+sub _valid_parent {
+    my ($entries, $i) = @_;
+    return undef unless ref($entries) eq 'ARRAY';
+    my $e = $entries->[$i];
+    return undef unless ref($e) eq 'HASH';
+    my $p = $e->{parent};
+    return undef unless defined($p) && !ref($p) && $p =~ /\A\d+\z/;
+    return undef unless $p < $i && $p >= 0 && ref($entries->[$p]) eq 'HASH';
+    return $p;
+}
+
+# _select_rows($entries, $budget, $width) -> \@indices (spec S2.5). Admits by
+# priority (lower pri first, then document order) with ancestor closure via
+# `parent`, skip-and-continue when a candidate's closure does not fit. Total:
+# [] for a bad/absent budget or hostile $entries, never dies or warns.
+sub _select_rows {
+    my ($entries, $budget, $width) = @_;
+    return [] unless defined($budget) && !ref($budget) && $budget =~ /\A\d+\z/ && $budget >= 1;
+    return [] unless ref($entries) eq 'ARRAY' && @$entries;
+
+    # A continuation (`cont_of` set, fix-batch MEDIUM-4) is never an
+    # independent candidate -- it is admitted or rejected only as part of
+    # its anchor's own atomic group (_atomic_group), folded into the
+    # anchor's closure cost below. Excluding it here is what makes a
+    # multi-line logical row a single unit rather than two same-tier rows
+    # that could be admitted separately, one row short of each other.
+    my @candidates = grep { ref($entries->[$_]) eq 'HASH' && !$entries->[$_]{cont_of} } (0 .. $#$entries);
+    my %tier;
+    push @{ $tier{ _entry_pri($entries, $_) } }, $_ for @candidates;
+
+    my %kept;
+    my $spent = 0;
+    # PRIORITY TIERS in ascending order (pri 1 first); WITHIN a tier, by
+    # ascending closure cost -- cheapest first. Cheapest-first within a tier
+    # is what lets a row whose ancestor is already kept (a run-scoped judge,
+    # whose parent is the run row admitted at pri 1) win a slot ahead of
+    # same-priority siblings that would each drag in their OWN not-yet-kept
+    # parent (a package-scoped judge, cost 2, vs the run-scoped one's cost
+    # 1) -- this is M4 (spec Behavior 6/AC27): the blueprint-scoped
+    # conformance judge must survive whenever there is room for {run row +
+    # judge row}, even competing against forty same-priority package judges
+    # that sit earlier in document order.
+    #
+    # CORRECTED (fix-batch, redteam HIGH-2): this used to compute each
+    # candidate's closure/cost ONCE per tier, against the kept-set as of the
+    # tier's start, on the claimed invariant that "every parent ... sits in
+    # a strictly earlier (numerically lower) tier than its children". THAT
+    # CLAIM WAS FALSE -- a `judge` entry is pri 3, but its parent (the
+    # package row) is pri 4/5, a LATER tier; an alive orchestrator is pri 8,
+    # a coordinator pri 6, both later than a judge's pri 3. So when two
+    # judges shared an unkept package-row parent, the SECOND judge's frozen
+    # cost still charged for that parent even after the first judge's
+    # admission had already paid for it -- a spurious rejection that also
+    # inverted priority order (a healthy pri-7 worker admitted while a live
+    # pri-3 judge was dropped) and systematically under-filled the budget
+    # (wasted slack nothing later could claim, with the hidden count
+    # inflated to match).
+    #
+    # The tier-start closure below is now used ONLY to produce a cheapest-
+    # first admission ORDER for the tier; the closure/cost that actually
+    # gates admission is recomputed against the LIVE %kept at the moment
+    # each candidate is considered (S2.5's own pseudocode), so an ancestor
+    # another same-tier sibling just admitted is never double-charged.
+    # Document index remains the tie-break when costs are equal, so the
+    # ordering is still a refinement of "index asc", never a departure from
+    # it when there is nothing to break a cost tie with.
+    for my $pri (sort { $a <=> $b } keys %tier) {
+        my %closure;
+        for my $i (@{ $tier{$pri} }) {
+            # _atomic_group($i) folds $i's own continuations (fix-batch
+            # MEDIUM-4) into its own need; an ancestor pulled in below gets
+            # the SAME treatment, so admitting a multi-line ancestor row
+            # (e.g. a wrapped package row) as someone else's dependency
+            # never leaves that ancestor's own continuation orphaned.
+            my @need = _atomic_group($entries, $i);
+            my $p = _valid_parent($entries, $i);
+            while (defined($p) && !$kept{$p}) {
+                push @need, _atomic_group($entries, $p);
+                $p = _valid_parent($entries, $p);
+            }
+            my $cost = 0;
+            $cost += _row_cost($entries->[$_]{spans}, $width) for @need;
+            $closure{$i} = { cost => $cost };
+        }
+        my @order = sort {
+            $closure{$a}{cost} <=> $closure{$b}{cost} || $a <=> $b
+        } @{ $tier{$pri} };
+
+        for my $i (@order) {
+            next if $kept{$i};
+            # Recomputed against the LIVE %kept -- see the comment above.
+            my @need = _atomic_group($entries, $i);
+            my $p = _valid_parent($entries, $i);
+            while (defined($p) && !$kept{$p}) {
+                push @need, _atomic_group($entries, $p);
+                $p = _valid_parent($entries, $p);
+            }
+            my $cost = 0;
+            $cost += _row_cost($entries->[$_]{spans}, $width) for @need;
+            next if $spent + $cost > $budget;
+            $kept{$_} = 1 for @need;
+            $spent += $cost;
+        }
+    }
+    return [ sort { $a <=> $b } keys %kept ];
+}
+
+# _collapse_notice($hidden) -> \@spans (spec S2.6). One span, indent 0, so it
+# can never be read as a tree row at any level.
+sub _collapse_notice {
+    my ($hidden) = @_;
+    # A leading EMPTY-TEXT span (indent 0), matching every tree row's own
+    # leading-indent-as-its-own-span convention (_indent($level)) -- so
+    # row_leading (the same "first span is pure whitespace" probe AC30 uses
+    # against a real indent-2 row) sees this row's indent as exactly 0,
+    # rather than -1 for "no separate indent span at all".
+    return [ { text => '', role => 'text.muted' },
+             { text => '+' . count_of($hidden, 'row') . ' hidden (short panel)',
+               role => 'text.muted' } ];
+}
+
+# _blueprints_body($state, $cols) -> \@lines (spec S2.3/S2.8). Probe mode
+# first (S2.8's own requirement); then the row-budget collapse; today's
+# pipeline (_blueprints_body_today) whenever there is nothing to collapse.
+sub _blueprints_body {
+    my ($state, $cols) = @_;
+    $state = {} unless ref($state) eq 'HASH';
+
+    my $probe = $state->{blueprints_probe};
+    if (defined($probe) && !ref($probe) && $probe =~ /\A\d+\z/ && $probe >= 1) {
+        return [ map { [ { text => BLUEPRINTS_PROBE_MARK(), role => 'text.muted' } ] } (1 .. $probe) ];
+    }
+
+    my $cap = $state->{blueprint_body_rows};
+    my $has_cap = defined($cap) && !ref($cap) && $cap =~ /\A\d+\z/ && $cap >= 1;
+    return _blueprints_body_today($state, $cols) unless $has_cap;
+    return _blueprints_body_today($state, $cols) unless _tree_present($state);
+
+    my $plan = _blueprints_row_plan($state, $cols);
+    return _blueprints_body_today($state, $cols) unless ref($plan) eq 'ARRAY' && @$plan;
+
+    my $width = _blueprints_table_width($cols);
+    my $total = 0;
+    $total += _row_cost($_->{spans}, $width) for @$plan;
+    return _blueprints_body_today($state, $cols) if $total <= $cap;
+
+    my $reserve = _row_cost(_collapse_notice(scalar @$plan), $width);
+    my $keep = _select_rows($plan, $cap - $reserve, $width);
+    $keep = [] unless ref($keep) eq 'ARRAY';
+    my $hidden = scalar(@$plan) - scalar(@$keep);
+
+    my @out = map { $plan->[$_]{spans} } @$keep;
+    push @out, _collapse_notice($hidden);
+    return \@out;
 }
 
 # ===========================================================================
@@ -3062,6 +3602,17 @@ sub compose {
         my $budget = int($h / 3);
         $budget = 3 if $budget < 3;
         $state = { %$state, blueprint_rows_max => $budget };
+    }
+
+    # Derive the Blueprints panel's ROW budget (package 07, spec S2.7) --
+    # distinct from blueprint_rows_max above, which caps RUNS, never rows
+    # (t/79 Behavior13/15 pin that meaning; it is not reopened here). A
+    # caller-supplied blueprint_body_rows wins, exactly as blueprint_rows_max
+    # does. No probe is composed when _tree_present is false -- that is the
+    # common case (no running run with a tree) and it must cost nothing.
+    if (ref($state) eq 'HASH' && !defined($state->{blueprint_body_rows}) && _tree_present($state)) {
+        my $cap = _blueprints_capacity($state, $rows, $cols);
+        $state = { %$state, blueprint_body_rows => $cap } if defined $cap;
     }
 
     # BANNERS NO LONGER PARTICIPATE IN LAYOUT AT ALL.
