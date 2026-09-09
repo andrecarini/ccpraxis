@@ -58,6 +58,15 @@ require Theme;
 
 my $HAVE_READKEY = eval { require Term::ReadKey; 1 } ? 1 : 0;
 
+# SYNTH_NOW -- the fixed synthetic clock (package 07). Every started_at the
+# tree fixtures below carry is derived from this ONE constant, never from a
+# real time() -- that is what makes `--dump WxH --phase N` byte-identical
+# across two runs (AC42) and what keeps `_agent_live`'s stale/future filters
+# exercisable without the fixture drifting out of range as real time passes.
+# Any fixed positive integer of at most 12 digits works (_epoch's own
+# contract); this one reads as a plausible recent epoch, nothing more.
+use constant SYNTH_NOW => 1_767_225_600;
+
 # Dismissed warning ids. Lives here, not in synth_state: the generator keeps
 # producing a warning while its period is active, so "dismissed" has to be
 # remembered by the loop or the popup would return on the next frame.
@@ -191,29 +200,141 @@ sub synth_events {
     return \@out;
 }
 
-# Field names taken from _one_run_summary_cells, not guessed: {blueprint},
-# {state}, {packages_done}, {packages_total}, {running_coordinators},
-# {decisions_waiting}. A first pass invented {name}/{pct} and every row rendered
-# "? running 0/0 pkg" -- synthetic data that misses the real keys previews a
-# panel nobody ships.
+# _synth_pkg_agents($i, $phase, $j, $stuck) -> \@agents. Field names taken
+# from the shipped struct (S2.10), never invented: id role worker_type
+# started_at budget_seconds stale_after_seconds, role in
+# coordinator|worker|judge. Pure function of its own arguments and
+# SYNTH_NOW -- no time()/localtime()/rand() (package 07's own AC48 guard).
+#
+# $stuck=>1 (package index 0 of every running run, package 07's DC3 fixture)
+# always carries THREE fixed agents: a coordinator, an OVER-BUDGET-but-still-
+# live worker (elapsed exceeds budget_seconds but stays inside
+# stale_after_seconds -- AC39), and a live bp-resolve-judge (AC38) -- plus one
+# genuinely STALE agent and one FAR-FUTURE-started_at agent (both fail
+# _agent_live and so must never appear in a rendered dump -- AC46).
+sub _synth_pkg_agents {
+    my ($i, $phase, $j, $stuck) = @_;
+    my @agents;
+    if ($stuck) {
+        push @agents, { id => "r${i}p${j}c", role => 'coordinator', worker_type => undef,
+                         started_at => SYNTH_NOW() - 900, budget_seconds => 1800, stale_after_seconds => 7200 };
+        push @agents, { id => "r${i}p${j}w", role => 'worker', worker_type => 'bp-implementer',
+                         started_at => SYNTH_NOW() - 1800, budget_seconds => 900, stale_after_seconds => 7200 };
+        push @agents, { id => "r${i}p${j}j", role => 'judge', worker_type => 'bp-resolve-judge',
+                         started_at => SYNTH_NOW() - 300, budget_seconds => 1800, stale_after_seconds => 7200 };
+        push @agents, { id => "r${i}p${j}stale", role => 'worker', worker_type => 'pv-worker-stale',
+                         started_at => SYNTH_NOW() - 100_000, budget_seconds => 1800, stale_after_seconds => 1800 };
+        push @agents, { id => "r${i}p${j}future", role => 'worker', worker_type => 'pv-worker-future',
+                         started_at => SYNTH_NOW() + 10_000_000, budget_seconds => 1800, stale_after_seconds => 7200 };
+        return \@agents;
+    }
+    # Non-stuck packages: 0..4 agents, swept across (run, phase, package
+    # index) so every count from 0 through >=4 appears somewhere across the
+    # phase range (package 07's AC40 coverage: 0, exactly 1, and >=4).
+    my $n = ($i + $phase + $j) % 5;
+    for my $k (1 .. $n) {
+        my $role = ($k == 1) ? 'coordinator' : 'worker';
+        push @agents, {
+            id                  => "r${i}p${j}a${k}",
+            role                => $role,
+            worker_type         => ($role eq 'coordinator') ? undef : "pv-worker-$i-$j-$k",
+            started_at          => SYNTH_NOW() - (300 + 60 * $k),
+            budget_seconds      => 1800,
+            stale_after_seconds => 7200,
+        };
+    }
+    return \@agents;
+}
+
+# _synth_packages($i, $phase) -> \@packages. Package index 0 is always the
+# STUCK one (status running, attempt == attempt_cap -- package 07's AC38
+# precondition); the rest sweep attempt/step/agent-count for visual variety.
+sub _synth_packages {
+    my ($i, $phase) = @_;
+    my $n = 1 + (($i * 7 + $phase) % 4);   # 1..4 packages per running run
+    my @packages;
+    for my $j (0 .. $n - 1) {
+        my $stuck = ($j == 0) ? 1 : 0;
+        my ($attempt, $cap) = $stuck ? (3, 3) : (1 + ($j % 2), 5);
+        push @packages, {
+            name          => sprintf('pkg-preview-%d-%02d', $i, $j),
+            status        => 'running',
+            attempt       => $attempt,
+            attempt_cap   => $cap,
+            step          => sprintf('%d/%d', 1 + ($j % 3), 3 + ($j % 5)),
+            steps_pending => [ ($j + 1) .. ($j + 3) ],
+            next_action   => undef,
+            agents        => _synth_pkg_agents($i, $phase, $j, $stuck),
+        };
+    }
+    return \@packages;
+}
+
+# _synth_run_agents($i, $phase) -> \@agents. A live bp-conformance-judge on
+# roughly half the (run, phase) combinations, an empty list on the rest --
+# package 07's AC40 needs both, and AC27/M4's own fixture is what this
+# mirrors (a blueprint-scoped judge in `run_agents`, the last tree row).
+sub _synth_run_agents {
+    my ($i, $phase) = @_;
+    return [] if ($i + $phase) % 2 == 1;
+    return [ { id => "r${i}-cj", role => 'judge', worker_type => 'bp-conformance-judge',
+                started_at => SYNTH_NOW() - 600, budget_seconds => 1800, stale_after_seconds => 7200 } ];
+}
+
+# synth_runs($n, $phase) -> \@runs. Field names taken from the shipped
+# struct, never guessed -- a first pass that invented {name}/{pct} rendered
+# every row as "? running 0/0 pkg", a preview that looked plausible and
+# showed nothing (this file's own long-standing warning, package 07's own
+# repeat of it at ten times the struct size). EVERY element (running or not)
+# carries the full 17-key run-level struct (S2.10) -- simpler than
+# maintaining two shapes, and nothing downstream distinguishes them; a
+# non-running element's packages/run_agents are simply empty, which is what
+# the real gate (_tree_lines: state eq 'running') already requires for a
+# tree to render at all.
 sub synth_runs {
-    my ($n) = @_;
-    my @states = qw(running running queued done failed);
+    my ($n, $phase) = @_;
+    $n     = 0 unless defined($n)     && !ref($n)     && $n     =~ /^\d+$/;
+    $phase = 0 unless defined($phase) && !ref($phase) && $phase =~ /^-?\d+$/;
+
+    my @states = qw(running running queued paused done failed);
     my @names  = qw(tui-operator-feedback sandbox-resources statusline-rework
                     activity-column providers-panel theme-tokens layout-bands
                     hot-reload spend-adapter reaper-sweep preview-harness
                     gauge-palette);
-    return [ map {
-        my $i = $_;
-        {
-            blueprint            => $names[ ($i - 1) % @names ],
-            state                => $states[ $i % @states ],
-            packages_done        => ($i * 3) % 9,
-            packages_total       => 9,
-            running_coordinators => ($i % 3),
-            decisions_waiting    => ($i % 5 == 0) ? 1 : 0,
-        }
-    } 1 .. $n ];
+
+    my @out;
+    for my $i (1 .. $n) {
+        my $state     = $states[ $i % @states ];
+        my $blueprint = $names[ ($i - 1) % @names ];
+        my $running   = ($state eq 'running') ? 1 : 0;
+
+        my $packages   = $running ? _synth_packages($i, $phase)    : [];
+        my $run_agents = $running ? _synth_run_agents($i, $phase)  : [];
+        my $current    = (@$packages) ? $packages->[-1]{name} : undef;
+
+        push @out, {
+            blueprint               => $blueprint,
+            runs_dir                 => "/tmp/ccpraxis-preview-runs/$blueprint",
+            state                    => $state,
+            orchestrator_pid         => 4000 + (($i * 37) % 5000),
+            orchestrator_alive       => (($i + $phase) % 4 == 0) ? 0 : 1,
+            orchestrator_started_at  => SYNTH_NOW() - (600 + 300 * ($i % 5)),
+            paused_manual            => ($state eq 'paused' && ($i % 2 == 0)) ? 1 : 0,
+            paused_reason            => ($state eq 'paused')
+                                       ? 'preview-synthetic pause: waiting on operator input'
+                                       : undef,
+            packages_total           => 9,
+            packages_done            => ($i * 3) % 9,
+            current_package          => $current,
+            running_coordinators     => ($i % 3),
+            decisions_waiting        => ($i % 5 == 0) ? 1 : 0,
+            decisions_operator       => ($i + $phase) % 3,
+            decisions_triage         => ($i + $phase + 1) % 3,
+            packages                 => $packages,
+            run_agents               => $run_agents,
+        };
+    }
+    return \@out;
 }
 
 # EVERY STATUS THE STATUS BLOCK CAN SHOW, in one cycle-able list.
@@ -280,6 +401,10 @@ sub synth_state {
         project_name     => $project,
         container        => $container,
         status           => $status,
+        # SYNTH_NOW, not time() -- the fixed synthetic clock every started_at
+        # in synth_runs is measured against, so a geometry/phase reproduces
+        # byte-identically (package 07, AC41/AC42).
+        now              => SYNTH_NOW(),
         container_gone   => $pin ? ($pin->{gone} ? 1 : 0)
                                  : (($status eq 'exited' && $phase % 2) ? 1 : 0),
         beat_age         => ($phase % 41),
@@ -296,7 +421,7 @@ sub synth_state {
         title_spinner_idx => $phase % Theme::SPINNER_FRAMES(),
         resources        => synth_resources($phase),
         events           => synth_events($phase),
-        runs             => synth_runs($n_runs),
+        runs             => synth_runs($n_runs, $phase),
         backpack         => { items => ($phase % 8), pending => ($phase % 5) },
         oauth_remaining  => 7 * 3600 + 21 * 60 - ($phase * 60),
         tokens           => $tokens,
@@ -386,6 +511,56 @@ sub capture_report {
         push @out, sprintf('  %-16s %3d%s%s', $p->{title}, 1 + scalar(@{ $p->{lines} || [] }),
             ($p->{flex} ? '  flex' : ''), ($p->{side} ? '  side' : ''));
     }
+    push @out, '';
+    # THE MEASURED ROW BUDGET (package 07, S2.10). `C` is what
+    # _blueprints_capacity actually measured at this geometry through the
+    # real tui::Screen pipeline (ruling AT-14 -- never predicted); `P` is the
+    # row plan's own entry count; `H` is how many of those the SAME
+    # collapse math (_blueprints_body's own S2.3 pseudocode, replicated here
+    # only to REPORT the number, not to render it -- the render still goes
+    # through Dashboard::compose_frame/compose()'s own S2.7 wiring) would
+    # hide at that capacity. 'n/a' for any part that could not be measured
+    # (no tree present, a geometry too small to resolve).
+    # CORRECTED (fix-batch, redteam MEDIUM-1): the plan/table-width figures
+    # below must be computed at $main, the width the Blueprints panel is
+    # ACTUALLY rendered into (panels() above already uses $main, matching
+    # what screen()/panels() does internally in the real pipeline) -- not
+    # $cols, the raw terminal width including any side column. At cols >=
+    # ~178 (a side column exists) the two widths diverge and the reported
+    # figures described a panel that was never rendered (report said
+    # "hidden 5" while the frame's own notice said "+6"). _blueprints_capacity
+    # is the one exception: it is called with the raw $cols deliberately,
+    # matching Dashboard::compose()'s own call (it composes a full probe
+    # frame and narrows internally via screen()/compose(), exactly as the
+    # real pipeline does).
+    my $bp_cap  = tui::DashboardScreen::_blueprints_capacity($state, $rows, $cols);
+    my $bp_plan = tui::DashboardScreen::_blueprints_row_plan($state, $main);
+    my $bp_plan_n = (ref($bp_plan) eq 'ARRAY') ? scalar(@$bp_plan) : undef;
+    my $bp_hidden;
+    # $bp_cap >= 1 -- a SECOND defect in the same block: _blueprints_body's
+    # own gate (`$cap >= 1`) treats capacity 0 as "no collapse" (today's
+    # unbounded pipeline runs instead), but the collapse math below used to
+    # run unconditionally, reporting the WHOLE plan as hidden even though
+    # the rendered frame carries no collapse notice at all (capacity 0 ==
+    # no Blueprints body, S5's own documented "no collapse" edge case).
+    if (defined($bp_cap) && $bp_cap >= 1 && defined($bp_plan_n) && $bp_plan_n > 0
+        && tui::DashboardScreen::_tree_present($state)) {
+        my $bp_width = tui::DashboardScreen::_blueprints_table_width($main);
+        my $bp_total = 0;
+        $bp_total += tui::DashboardScreen::_row_cost($_->{spans}, $bp_width) for @$bp_plan;
+        if ($bp_total <= $bp_cap) {
+            $bp_hidden = 0;
+        } else {
+            my $bp_reserve = tui::DashboardScreen::_row_cost(
+                tui::DashboardScreen::_collapse_notice($bp_plan_n), $bp_width);
+            my $bp_keep = tui::DashboardScreen::_select_rows($bp_plan, $bp_cap - $bp_reserve, $bp_width);
+            $bp_hidden = $bp_plan_n - (ref($bp_keep) eq 'ARRAY' ? scalar(@$bp_keep) : 0);
+        }
+    }
+    push @out, sprintf("blueprints    capacity %s  plan %s  hidden %s",
+        defined($bp_cap)     ? $bp_cap     : 'n/a',
+        defined($bp_plan_n)  ? $bp_plan_n  : 'n/a',
+        defined($bp_hidden)  ? $bp_hidden  : 'n/a');
     push @out, '';
     # THE REAL POPULATION, via warning_entries -- not $state->{warnings}.
     #
