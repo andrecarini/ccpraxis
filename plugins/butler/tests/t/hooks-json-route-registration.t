@@ -89,8 +89,12 @@ my @EXPECT = (
     { event => 'PostToolUse', matcher => 'Task|Agent|Bash',                             file => 'context-ceiling.sh',          args => '' },
     { event => 'SubagentStop',matcher => '',                                            file => 'track-dispatch.sh',           args => '' },
     { event => 'Stop',        matcher => '',                                            file => 'stop-gate.sh',                args => '' },
+    # never-halt package 06 (Decision 9/40): Notification/PermissionDenied
+    # record-only hooks, registered through the same guarded 2.2 template.
+    { event => 'Notification',      matcher => 'permission_prompt', file => 'record-prompt.sh', args => '' },
+    { event => 'PermissionDenied',  matcher => '',                  file => 'record-denial.sh', args => '' },
 );
-is(scalar(@EXPECT), 18, 'sanity: this file\'s own sec 2.3 fixture table has 18 rows');
+is(scalar(@EXPECT), 20, 'sanity: this file\'s own sec 2.3 fixture table has 20 rows (never-halt 06 adds 2)');
 
 sub expect_key { my ($r) = @_; return join("\x1e", $r->{event}, $r->{matcher}, $r->{file}, $r->{args}) }
 

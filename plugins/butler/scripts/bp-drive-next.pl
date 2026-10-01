@@ -42,7 +42,9 @@
 #                                                      holds non-terminal packages (typically owned by
 #                                                      a concurrent worker). NOT completion: stopping
 #                                                      here kills the run mid-package.
-#   {"action":"done"}                                  every in-scope blueprint is done-or-parked
+#   {"action":"done","denials":N}                      every in-scope blueprint is done-or-parked;
+#                                                      N = cumulative auto-mode denial count (never-halt
+#                                                      Decision 9; see `bp-denials summary` for a breakdown)
 #
 #   Keep-awake is a director-managed SIDE EFFECT (started when work is runnable or a
 #   timed auto-resume is pending; stopped when settled) — never an action.
@@ -121,6 +123,7 @@ my $DIR = dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; abs_path($f) // $f });
 require "$DIR/bp-orchestrator.pl";
 require "$DIR/bp-keepawake.pl";    # the shared wake-lock (also used by the fleet)
 require "$DIR/BpDataRoot.pm";      # the single, bounded data-root resolution chain (package 04)
+require "$DIR/BpHook/PromptWatch.pm";  # denial_count() for the `done` action's denials key (never-halt 06)
 
 # ===========================================================================
 # PURE DECISION FUNCTIONS (no I/O, no globals, no network — unit-tested in t/17)
@@ -1317,7 +1320,7 @@ sub _cmd_next {
 
     if (!@candidates) {
         _append_run_log($dsdir, 'DONE (nothing in scope: no blueprint matches the scope spec)');
-        print _encode_action({ action => 'done' }), "\n";
+        print _encode_action({ action => 'done', denials => _denials_count($data) }), "\n";
         keepawake_apply('settled', $dsdir, $opts);
         return 0;
     }
@@ -1790,7 +1793,7 @@ sub _cmd_next {
         _drop_from_order($dsdir, @newly_archived) if @newly_archived;
     }
 
-    print _encode_action({ action => 'done' }), "\n";
+    print _encode_action({ action => 'done', denials => _denials_count($data) }), "\n";
     keepawake_apply('settled', $dsdir, $opts);
     return 0;
 }
@@ -1920,6 +1923,16 @@ sub _encode_action {
     return JSON::PP->new->canonical->encode($action);
 }
 
+# never-halt package 06: denials count for the `done` action. Any failure
+# (bad data dir, decode error, missing file) degrades to 0 -- a corrupt or
+# huge denials.jsonl can only lower the count, never fail `done` (spec
+# sec 2.10, edge case 12).
+sub _denials_count {
+    my ($data) = @_;
+    my $n = eval { BpHook::PromptWatch::denial_count($data) };
+    return (defined $n && $n =~ /\A\d+\z/) ? $n : 0;
+}
+
 # ===========================================================================
 # HELP TEXT
 # ===========================================================================
@@ -1950,7 +1963,7 @@ NEXT-ACTION JSON  (exactly one per `next`)
   {"action":"stop","reason":"token-refresh-failed","detail":…} token could not be refreshed; the wake-lock is released and the run ends. NOT a pause: a pause promises a resume, and there is none until a human re-authenticates.
   {"action":"blueprint-done","blueprint":B,"pending":[…],"archived":true|false,"archive_detail":"…"} B settled; pending = remaining bps to re-eval; archived/archive_detail report the director's own single-blueprint archive attempt (reuses bp-lifecycle.pl reconcile --archive)
   {"action":"in-flight","blueprint":B,"packages":[…],"running":[…]} nothing dispatchable right now, but B still holds non-terminal packages (typically owned by a concurrent worker). NOT completion: stopping here kills the run mid-package.
-  {"action":"done"}                                  every in-scope blueprint is done-or-parked
+  {"action":"done","denials":N}                      every in-scope blueprint is done-or-parked; N = cumulative auto-mode denial count (never-halt Decision 9; see `bp-denials summary` for a breakdown)
 
   Keep-awake is a director-managed SIDE EFFECT (started when work is runnable or a timed auto-resume is pending; stopped when settled) — never an action.
 

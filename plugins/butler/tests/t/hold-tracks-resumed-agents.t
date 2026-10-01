@@ -84,6 +84,11 @@ $ENV{HOME}                  = $FAKE_HOME;
 $ENV{USERPROFILE}           = $FAKE_HOME;
 $ENV{BUTLER_STATE_DIR}      = $STATE_DIR;
 $ENV{BUTLER_HOLD_TEST_MODE} = 1;
+# never-halt 06 (AC-19): a fixture, never-existing data root, so
+# butler-hold's prompt-watch resolution (BpDataRoot::resolve) is exercised
+# hermetically and stays OFF (no real .ccpraxis-local-data is ever touched),
+# leaving this file's own assertions unchanged.
+$ENV{CCPRAXIS_DATA_DIR}     = "$TMPROOT/no-prompt-watch-data";
 
 # ---------------------------------------------------------------------------
 # generic helpers
@@ -143,6 +148,7 @@ sub spawn_hold {
         $ENV{BUTLER_HOLD_TEST_TICK}    = $TICK;
         $ENV{BUTLER_HOLD_TEST_SECONDS} = $seconds;
         $ENV{CCPRAXIS_NO_WAKELOCK}     = 1;
+        $ENV{CCPRAXIS_DATA_DIR}        = "$TMPROOT/no-prompt-watch-data";
         open(STDOUT, '>', $outfile) or POSIX::_exit(126);
         open(STDERR, '>', $errfile) or POSIX::_exit(126);
         { no warnings q(exec); exec(q(bash), $SHIM, @$argv); }

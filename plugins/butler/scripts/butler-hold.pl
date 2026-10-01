@@ -20,6 +20,13 @@
 # a session identity; it learns its session only from a hook-written ticket
 # (BpHook::take_ticket) or, when a Stop denial minted one, a one-shot token
 # passed with --token. Additive only (Decision 19): nothing else changes.
+#
+# Exit codes: 0 normal release (off, finished, deadline, superseded, EXTEND);
+# 1 refusal or internal error; 143 killed by a signal; 3 PROMPT (never-halt
+# package 06, Decision 9/40) -- a subagent of this holder's own session
+# recorded a permission prompt after this holder's start or latest
+# extension; the holder prints one line, `PROMPT <agent_id>: <message>`,
+# and exits immediately, with no `released:` line and no item report.
 use strict;
 use warnings;
 use FindBin qw($Bin);
@@ -28,6 +35,7 @@ use Digest::SHA qw(sha1_hex);
 use Fcntl qw(:flock);
 use File::Basename qw(dirname);
 use Time::HiRes qw(sleep time);
+use Encode qw(encode_utf8);
 
 # Signals and the top-level eval are installed before any other work (spec
 # 2.8, review M1, red-team M4): a die anywhere below, including a failed
@@ -484,10 +492,25 @@ sub main {
 
 require "$Bin/BpHook.pm"
     unless grep { m{(?:^|/)BpHook\.pm$} } keys %INC;
+require "$Bin/BpDataRoot.pm"
+    unless grep { m{(?:^|/)BpDataRoot\.pm$} } keys %INC;
+require "$Bin/BpHook/PromptWatch.pm"
+    unless grep { m{(?:^|/)BpHook/PromptWatch\.pm$} } keys %INC;
 
 $| = 1;
 binmode(STDOUT, ':raw');
 $SIG{__WARN__} = sub { };
+
+# ---------------------------------------------------------------------------
+# never-halt package 06 (Decision 9/40): prompt watching. Resolved ONCE per
+# process from the process's own cwd and env (Decision 11 (8)) -- never from
+# a payload. If the resolved data dir is not an existing directory, prompt
+# watching is OFF for this whole process: no error, no output, no behaviour
+# change (spec sec 2.8, edge case 1/6).
+# ---------------------------------------------------------------------------
+my $WATCH_DATA = eval { BpDataRoot::resolve()->{data_dir} };
+my $WATCHING   = (defined $WATCH_DATA && -d $WATCH_DATA) ? 1 : 0;
+my $PROMPTS    = $WATCHING ? "$WATCH_DATA/.drive-solo/prompts.jsonl" : undef;
 
 # ---------------------------------------------------------------------------
 # argv parsing (by hand -- no option-parsing module of any kind)
@@ -774,6 +797,17 @@ if ($is_alive) {
         transcript_path => $tp,
     };
 
+    # never-halt package 06, Decision 11 (10): re-base the extending
+    # process's prompts_offset to its OWN watching state at the moment of
+    # the extend -- "to the file's end at that moment" when watching is ON;
+    # carry the prior value through when this process's watching is OFF.
+    if ($WATCHING) {
+        $rec->{prompts_offset} = (-s $PROMPTS) // 0;
+    }
+    elsif (defined $existing->{prompts_offset}) {
+        $rec->{prompts_offset} = $existing->{prompts_offset};
+    }
+
     # Written before the record becomes visible (review M5): the
     # accountability line must never be observable-after-the-fact as
     # missing just because a reader raced the record's own appearance.
@@ -804,6 +838,28 @@ my $fp = compute_fp();
 my $now = int(time());
 my $outputs = { %$peek_outputs };
 
+# never-halt package 06: captured BEFORE the record is written (spec sec
+# 2.8 BECOME). M2 (red-team): seed from the PREVIOUS holder record's
+# last-known prompts_offset when one exists for this same session ($existing
+# may be a stale/dead-process record left behind, same continuity-holder
+# resumption pattern as the EXTEND branch above) -- otherwise a prompt
+# written between a worker's dispatch and this BECOME, or between one holder
+# ending and the next starting, is silently treated as already-seen. Only
+# fall back to the file's current end when there is genuinely no prior
+# record for this session.
+my $prompt_off;
+if ($WATCHING) {
+    if (ref $existing eq 'HASH'
+        && defined $existing->{prompts_offset}
+        && !ref($existing->{prompts_offset})
+        && $existing->{prompts_offset} =~ /\A\d+\z/) {
+        $prompt_off = $existing->{prompts_offset} + 0;
+    }
+    else {
+        $prompt_off = (-s $PROMPTS) // 0;
+    }
+}
+
 my $rec = {
     session_id      => $SID,
     token           => $token,
@@ -817,6 +873,7 @@ my $rec = {
     deadline        => $now + $HOLD,
     transcript_path => $tp,
 };
+$rec->{prompts_offset} = $prompt_off if $WATCHING;
 
 BpHook::log_reason($SID, 'butler-hold', 'hold', join(', ', @ITEMS));
 my $ok = write_record_atomic($RECORD_PATH, $rec);
@@ -881,6 +938,21 @@ my $last_valid = $rec;
 my $last_seq = $rec->{ext_seq} // 0;
 my @last_items = @{ (ref $rec->{items} eq 'ARRAY') ? $rec->{items} : [] };
 
+# never-halt package 06: the in-memory byte offset into $PROMPTS, seeded
+# from this BECOME's own prompts_offset (undef/OFF -> 0; never read before
+# this process's own start).
+my $PROMPT_OFFSET = $prompt_off // 0;
+
+# SHOULD-FIX 3 (never-halt package 06 fix-batch): tracks, independently of
+# $last_seq (which the extension-report coalescing logic owns and may
+# advance from the LOCKED re-read in step 3/4), the highest ext_seq whose
+# prompts_offset has actually been applied to rebase $PROMPT_OFFSET. An
+# extension first observed inside the locked section advances $last_seq
+# without ever going through the unlocked WATCHING block below, so using
+# $last_seq here would make that extend's re-base silently never happen;
+# $prompt_seen_seq only ever advances where the re-base itself is applied.
+my $prompt_seen_seq = $rec->{ext_seq} // 0;
+
 # report_extension_if_advanced($record) -- 2.4 step 1. Prints ONE extension
 # line when $record's ext_seq has advanced past $last_seq, then updates
 # $last_seq/@last_items from $record. Several extensions between two reads
@@ -930,6 +1002,36 @@ while (1) {
     # 2.4 step 1 (unlocked read): an extension is reported as soon as it is
     # observed, before this tick's finish detection.
     $report_extension_if_advanced->($rp);
+
+    # never-halt package 06 (Decision 9/40), spec sec 2.8 loop steps 1-4:
+    # placed after the unlocked record read, the off/superseded checks and
+    # the extension report, and BEFORE finish detection.
+    if ($WATCHING) {
+        my $rp_ext_seq = $rp->{ext_seq} // 0;
+        if ($rp_ext_seq > $prompt_seen_seq
+            && defined $rp->{prompts_offset}
+            && !ref($rp->{prompts_offset})
+            && $rp->{prompts_offset} =~ /\A\d+\z/) {
+            $PROMPT_OFFSET = $rp->{prompts_offset} + 0;
+        }
+        $prompt_seen_seq = $rp_ext_seq if $rp_ext_seq > $prompt_seen_seq;
+        my ($prompt_recs, $new_off) = BpHook::PromptWatch::read_from($PROMPTS, $PROMPT_OFFSET);
+        $PROMPT_OFFSET = $new_off;
+        for my $pr (@$prompt_recs) {
+            next unless ref $pr eq 'HASH';
+            next unless defined $pr->{session_id} && !ref($pr->{session_id}) && $pr->{session_id} eq $SID;
+            my $paid = $pr->{agent_id};
+            $paid = 'main' unless defined $paid && !ref($paid) && $paid =~ /\A[A-Za-z0-9_-]{1,64}\z/;
+            my $pmsg = $pr->{message};
+            $pmsg = '' unless defined $pmsg && !ref($pmsg);
+            $pmsg =~ s/[\x00-\x1f\x7f-\x9f\x{2028}\x{2029}]+/ /g;
+            $pmsg =~ s/\A\s+//;
+            $pmsg =~ s/\s+\z//;
+            $pmsg = '(no message)' unless length $pmsg;
+            print STDOUT encode_utf8("PROMPT $paid: $pmsg\n");
+            exit 3;
+        }
+    }
 
     $known_deadline = $rp->{deadline};
     $last_valid = $rp;

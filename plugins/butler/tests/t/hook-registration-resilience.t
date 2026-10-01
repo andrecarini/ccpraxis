@@ -76,9 +76,10 @@ sub read_json {
         arm-on-entry.sh bind-dispatch.sh context-ceiling.sh continuity-off-check.sh
         gate-shutdown.sh guard-ask-operator.sh guard-bash.sh guard-blueprint-write.sh
         guard-fork.sh guard-git-mutations.sh guard-writes.sh hooks.json ledger-guard.sh
+        record-denial.sh record-prompt.sh
         run-hook.sh stop-gate.sh track-dispatch.sh wait-shape-guard.sh
     );
-    is(scalar(@EXPECT_FILES), 17, 'sanity: this file\'s own sec 2.4 fixture list has 17 entries');
+    is(scalar(@EXPECT_FILES), 19, 'sanity: this file\'s own sec 2.4 fixture list has 19 entries (never-halt 06 adds record-prompt.sh, record-denial.sh)');
 
     opendir(my $dh, $HOOKS) or BAIL_OUT("cannot opendir $HOOKS: $!");
     my (@actual_files, @subdirs);
@@ -217,8 +218,8 @@ sub all_registered_commands {
         all_registered_commands($hooksjson, 'hooks.json'),
         all_registered_commands($settings,  'settings.json'),
     );
-    is(scalar(@combined), 19,
-       'B6a: exactly 19 commands are registered in total across hooks.json + settings.json')
+    is(scalar(@combined), 21,
+       'B6a: exactly 21 commands are registered in total across hooks.json + settings.json (never-halt 06 adds 2)')
         or diag('found ' . scalar(@combined) . ' registered commands');
 
     my (@bad_127, @bad_rc, @slow);

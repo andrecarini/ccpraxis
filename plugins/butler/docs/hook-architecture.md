@@ -65,9 +65,11 @@ and `runs/<pkg>.force-stop`.
 | hooks.json | PostToolUse | Task\|Agent\|Bash | context-ceiling.sh |
 | hooks.json | SubagentStop | (none) | track-dispatch.sh |
 | hooks.json | Stop | (none) | stop-gate.sh |
+| hooks.json | Notification | permission_prompt | record-prompt.sh |
+| hooks.json | PermissionDenied | (none) | record-denial.sh |
 | settings.json | PreToolUse | Bash | guard-git-mutations.sh (sec 2.2 settings form) |
 
-This is 18 hooks.json commands and 1 settings.json command, every one in the guarded registration form
+This is 20 hooks.json commands and 1 settings.json command, every one in the guarded registration form
 of spec 16's section 2.2 (`unset BASH_ENV; f=...; w=.../run-hook.sh; [ -f "$f" ] && [ -f "$w" ] || exit 0;
 bash -n "$f" && bash -n "$w" || exit 0; exec env -u SHELLOPTS bash "$f"`), so a missing or broken script
 or wrapper never blocks (RT-M1), and neither BASH_ENV nor SHELLOPTS reach the hook's own bash (RT-L7).
@@ -217,6 +219,22 @@ reason: The one Stop registration left in either file (Decision 5), in the guard
 ### registration: settings.json PreToolUse [Bash] guard-git-mutations.sh
 verdict: keep
 reason: This repo keeps its unconditional protection against destructive git, run from the clone by $CLAUDE_PROJECT_DIR, now rewritten to the guarded 2.2 settings form by package 16's batch B.
+
+### file: record-denial.sh
+verdict: keep
+reason: Added by never-halt package 06; it records each auto-mode classifier denial to denials.jsonl for a driver or coordinator session, prints nothing and never blocks.
+
+### file: record-prompt.sh
+verdict: keep
+reason: Added by never-halt package 06; it records each permission prompt to prompts.jsonl for a driver or coordinator session, so the holder can wake the driver.
+
+### registration: hooks.json Notification [permission_prompt] record-prompt.sh
+verdict: keep
+reason: Registered on Notification with the permission_prompt matcher in the guarded 2.2 form; Notification output is discarded, so the hook only records.
+
+### registration: hooks.json PermissionDenied [] record-denial.sh
+verdict: keep
+reason: Registered without a matcher on PermissionDenied in the guarded 2.2 form; it prints nothing, so it never asks the model to retry.
 
 ## BpHook core API
 
@@ -777,6 +795,10 @@ result in 08's ledger. `plugins/butler/tests/t/fleet-holder-integration.t` exerc
 contract in-process for all three outcomes. The merged Bash guard exempts a command that is exactly one
 `butler-hold` invocation from the headless no-background rule.
 
+A holder also exits early, with exit code 3 and the single line `PROMPT <agent_id>: <message>`, when
+any prompt in its own session is recorded after the holder's start or latest extension (never-halt
+Decision 9; filtered on session_id alone, never agent_id — Decision 40).
+
 ## Reason log
 
 Decision 7: every off and silence reason goes into one log the operator can read, with session, time
@@ -1096,6 +1118,8 @@ next fork dispatch, and the guard denies again after it. Decision 3 applies thro
 | guard-ask-operator.sh | 4 | --pre ledger,armed : exits when BP_LEDGER is unset and armed/<session_id> is absent |
 | track-dispatch.sh | 1 | --pre ledger,driver : exits when BP_LEDGER is unset and the session is not an armed driver |
 | guard-fork.sh | 3 | --pre text:fork : exits when the payload text does not contain fork |
+| record-prompt.sh | 0 | --pre ledger,driver : exits when BP_LEDGER is unset and the session is not an armed driver |
+| record-denial.sh | 0 | --pre ledger,driver : exits when BP_LEDGER is unset and the session is not an armed driver |
 
 **Who each rule applies to.** A fork counts as a subagent everywhere.
 

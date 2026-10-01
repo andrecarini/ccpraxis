@@ -95,6 +95,10 @@ $ENV{HOME}             = $FAKE_HOME;
 $ENV{USERPROFILE}      = $FAKE_HOME;
 $ENV{BUTLER_STATE_DIR} = $STATE_DIR;
 $ENV{BUTLER_HOLD_TEST_MODE} = 1;
+# never-halt 06 (AC-19): a fixture, never-existing data root, so
+# butler-hold's prompt-watch resolution (BpDataRoot::resolve) is exercised
+# hermetically and stays OFF, leaving this file's own assertions unchanged.
+$ENV{CCPRAXIS_DATA_DIR} = "$TMPROOT/no-prompt-watch-data";
 
 my $CONT_ROOT = "$STATE_DIR/continuity";
 
@@ -168,6 +172,7 @@ sub spawn_hold {
         $ENV{USERPROFILE}           = $FAKE_HOME;
         $ENV{BUTLER_STATE_DIR}      = $STATE_DIR;
         $ENV{BUTLER_HOLD_TEST_MODE} = 1;
+        $ENV{CCPRAXIS_DATA_DIR}     = "$TMPROOT/no-prompt-watch-data";
         for my $k (keys %$env_over) {
             if (defined $env_over->{$k}) { $ENV{$k} = $env_over->{$k} }
             else                          { delete $ENV{$k} }
