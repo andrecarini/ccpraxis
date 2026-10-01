@@ -215,6 +215,39 @@ our @REPO_LINTS = (
 # satisfied at once.
 my $SWEEP_TEMPLATE = 'ccpraxis-sweep-XXXXXX';
 
+# Package 10-nested-runner-audit (Decision 28, amendment 1 -- red-team
+# MEDIUM-1): whether THIS process itself inherited the "enclosing sweep owns
+# the audit" marker, captured ONCE at load time -- before run_one() ever sets
+# CCPRAXIS_SWEEP_OWNS_AUDIT for a CHILD it is about to spawn. Capturing it
+# here (rather than re-reading %ENV at each audit site) means run_one()'s own
+# assignment, scoped to its `local %ENV` for a child process, can never
+# retroactively make THIS process think it should skip its own audit.
+#
+# The marker's VALUE is no longer a bare, guessable/copy-pasteable literal
+# "1" -- it is run_one()'s own per-file sandbox path (the same string it
+# assigns to $ENV{HOME} for that child). "Active" requires ALL THREE to hold,
+# checked byte-exact with no normalization:
+#   (a) both CCPRAXIS_SWEEP_OWNS_AUDIT and HOME are non-empty and equal,
+#   (b) that path exists as a directory on disk right now, and
+#   (c) its basename has the exact shape $SWEEP_TEMPLATE produces (derived
+#       from that template below, not a hand-maintained duplicate pattern).
+# A marker failing any of these is treated as absent, SILENTLY -- no stdout/
+# stderr about the rejection, so a rejected marker fails safe and quiet
+# rather than becoming a new way to leak why it was rejected. This closes the
+# hand-exportable `CCPRAXIS_SWEEP_OWNS_AUDIT=1` bypass (red-team MEDIUM-1):
+# a bare literal can no longer satisfy (a), let alone (b)/(c).
+my $ENCLOSING_SWEEP_OWNS_AUDIT = do {
+    my $m = $ENV{CCPRAXIS_SWEEP_OWNS_AUDIT};
+    my $h = $ENV{HOME};
+    my $shape_re = do {
+        (my $t = $SWEEP_TEMPLATE) =~ s/X+\z//;
+        qr/\A\Q$t\E[A-Za-z0-9_]{6}\z/;
+    };
+    (defined $m && length $m && defined $h && length $h && $m eq $h
+        && -d $m
+        && (basename($m) =~ $shape_re)) ? 1 : 0;
+};
+
 # _sandbox_registry_path() -> $path -- FIX-BATCH m4 (review, step 7): with no
 # single wrapping directory left to nuke on interrupt (see $SWEEP_TEMPLATE's
 # own comment above for why), the INT/TERM handler instead needs to know
@@ -965,6 +998,25 @@ sub run_one {
     my $base    = _sandbox_base();
     my $sandbox = File::Temp::tempdir($SWEEP_TEMPLATE, DIR => $base, CLEANUP => 0);
     _register_sandbox_dir($sandbox);
+
+    # Package 10-nested-runner-audit (Decision 28, amendment 1 -- red-team
+    # MEDIUM-1): every host test process this runner starts sees
+    # CCPRAXIS_SWEEP_OWNS_AUDIT set to this SAME per-file sandbox path it is
+    # about to assign to $ENV{HOME} below, whether or not THIS process itself
+    # inherited the marker (see $ENCLOSING_SWEEP_OWNS_AUDIT above, captured
+    # before this sub could ever run). Placed AFTER the scrub above so no
+    # future scrub addition can delete it by accident -- it matches neither
+    # ^BP_ nor CCPRAXIS_TEST_LINT_ROOT, so it was never at risk from the
+    # existing deletes, but the ordering keeps that true structurally, not by
+    # luck. Placed AFTER $sandbox exists (not before, as the unhardened
+    # version had it) because the value IS that path -- a nested runner
+    # trusts the marker only when it equals its own inherited HOME, that path
+    # exists on disk, and its basename has the expected sweep-template shape;
+    # a bare hand-typed literal can no longer satisfy any of that. A runner
+    # nested under this one inherits it and skips its own audit, printing one
+    # notice line in place of it; this outer process's own audit is
+    # unaffected (it decided already, at load time).
+    $ENV{CCPRAXIS_SWEEP_OWNS_AUDIT} = $sandbox;
     # TMPDIR points at $sandbox itself now, NOT a "Temp" subdirectory of it.
     # A fixture's own File::Temp/File::Spec->tmpdir()-based tempfiles landing
     # in the same directory as its sandboxed HOME is harmless (nothing here
@@ -1520,15 +1572,28 @@ sub run_sweep {
     # -- never a pre-existing artifact of this same run's own state-file
     # bookkeeping (that write happens later, and is filtered by path below
     # regardless).
-    my @audit_pre_paths = _git_status_paths($ROOT_ABS);
-    my @audit_pre_procs = grep { !(defined $REAL_KEEPAWAKE_PID && $_->{pid} eq $REAL_KEEPAWAKE_PID) } _wakelock_pids();
-    # FIX-BATCH M4 (review, step 7): the real butler-state dir and continuity
-    # active dir are never under $ROOT_ABS, so git status can never see a
-    # write into them -- snapshot them directly, by (mtime,size) per file so
-    # a modification of an already-existing file counts, not only a brand
-    # new path.
-    my $audit_pre_bs = _dir_snapshot($REAL_BUTLER_STATE_DIR);
-    my $audit_pre_ca = _dir_snapshot($REAL_CONTINUITY_ACTIVE_DIR);
+    #
+    # Package 10-nested-runner-audit (Decision 28): when THIS process itself
+    # inherited the "enclosing sweep owns the audit" marker (captured at load
+    # time, above -- never re-read here), the pre-snapshot is skipped
+    # entirely: no git status, no wake-lock query, no butler-state/continuity
+    # snapshot. The enclosing sweep's own pre-snapshot, taken before this
+    # nested run was ever spawned, already covers this window.
+    my @audit_pre_paths;
+    my @audit_pre_procs;
+    my $audit_pre_bs;
+    my $audit_pre_ca;
+    unless ($ENCLOSING_SWEEP_OWNS_AUDIT) {
+        @audit_pre_paths = _git_status_paths($ROOT_ABS);
+        @audit_pre_procs = grep { !(defined $REAL_KEEPAWAKE_PID && $_->{pid} eq $REAL_KEEPAWAKE_PID) } _wakelock_pids();
+        # FIX-BATCH M4 (review, step 7): the real butler-state dir and continuity
+        # active dir are never under $ROOT_ABS, so git status can never see a
+        # write into them -- snapshot them directly, by (mtime,size) per file so
+        # a modification of an already-existing file counts, not only a brand
+        # new path.
+        $audit_pre_bs = _dir_snapshot($REAL_BUTLER_STATE_DIR);
+        $audit_pre_ca = _dir_snapshot($REAL_CONTINUITY_ACTIVE_DIR);
+    }
 
     # --- collect ---------------------------------------------------------------
     my @files;
@@ -2037,8 +2102,18 @@ sub run_sweep {
     # present before this sweep started FAILS the sweep and is NAMED, even when
     # every test file itself was green. The real ~/.claude/butler-state is never
     # part of this -- it is not under $ROOT_ABS, so git status never sees it.
+    #
+    # Package 10-nested-runner-audit (Decision 28): when THIS process itself
+    # inherited the marker, the post-audit is replaced by one notice line
+    # instead -- no git status, no _stable_wakelock_pids (so no 2s double
+    # sample), no butler-state/continuity diff, no AUDIT FAILED section. The
+    # enclosing sweep's own post-audit, which runs after this nested run has
+    # fully exited, still catches anything left behind.
     my $audit_failed = 0;
-    {
+    if ($ENCLOSING_SWEEP_OWNS_AUDIT) {
+        print "\naudit: skipped -- the enclosing sweep owns the repo, wake-lock and "
+            . "butler-state audit (CCPRAXIS_SWEEP_OWNS_AUDIT)\n";
+    } else {
         my @post_paths = _git_status_paths($ROOT_ABS);
         my %pre_path = map { ($_ => 1) } @audit_pre_paths;
         my @new_paths = grep { !$pre_path{$_} } @post_paths;
