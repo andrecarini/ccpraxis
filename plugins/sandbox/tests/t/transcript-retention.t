@@ -38,6 +38,29 @@
 #   AC-8 : $CONTAINER_BASELINE's entry is preceded by the same
 #   AC-9 : %permitted_additions carries no env.CLAUDE_CODE_TODO_REMINDER_MODE
 #          entry (the key is declared in-baseline, not permitted-as-extra)
+#
+# 03-strip-claude-code-bloat (operator-ui-tweaks), derived from
+#   .ccpraxis-local-data/blueprints/operator-ui-tweaks/specs/03-strip-claude-code-bloat-spec.md
+# Adds 8 new DELIBERATE DECLARATION keys to both baselines: three top-level
+# booleans, one 15-entry skillOverrides object, and four env keys. None of
+# S4 (disableFastMode) or S9 (the anthropic-skills switch) is set — both are
+# explicitly out of scope (spec §6) and asserted absent (AC-6/B-5).
+#   AC-1  : both files parse and keep $schema (covered by existing A3)
+#   AC-2  : B-1 -- disableArtifact/disableRemoteControl/disableClaudeAiConnectors
+#           are JSON boolean true, in both files
+#   AC-3  : B-2 -- skillOverrides is exactly the 15 names -> 'off', in both files
+#   AC-4  : B-3 -- skillOverrides has no update-config/keybindings-help/`:`-key
+#   AC-5  : B-4 -- the four env keys are exactly '1', in both files
+#   AC-6  : B-5 -- disableFastMode absent; no anthropic-skills enabledPlugins key
+#   AC-7  : all 8 new keys are present in $HOST_BASELINE (A4(a)), each with a
+#           DELIBERATE DECLARATION comment (B-6)
+#   AC-8  : the same in $CONTAINER_BASELINE
+#   AC-9  : B-7 -- none of the new paths is in %permitted_additions
+#   AC-10 : A4(a)/(b) pass for both files (existing assert_baseline_preserved)
+#   AC-11 : this file exits 0 with no not ok lines (not expected yet -- the
+#           keys are not in the live settings files until the implementer acts)
+#   AC-12 : promote-syncs-global-config.t, promote-drops-retired-keys.t and
+#           global-config-perl-hook-guard.t are unaffected (run, not edited)
 
 use strict;
 use warnings;
@@ -189,6 +212,62 @@ ok(!exists $container_data->{todoFeatureEnabled},
     'AC-6: container settings.json does not set a top-level todoFeatureEnabled');
 
 # =====================================================================
+# B-1..B-5 (03-strip-claude-code-bloat spec §2.3, done criterion 5) — targeted
+# assertions on the 8 new switches, both files.
+# =====================================================================
+
+my @BOOL_SWITCHES = qw(disableArtifact disableRemoteControl disableClaudeAiConnectors);
+my @ENV_SWITCHES  = qw(CLAUDE_CODE_DISABLE_ADVISOR_TOOL CLAUDE_CODE_DISABLE_FAST_MODE
+                       DISABLE_BUG_COMMAND DISABLE_FEEDBACK_COMMAND);
+my @SKILL_NAMES = qw(
+    artifact-capabilities artifact-design artifact-diagramming batch claude-api
+    code-review dataviz fewer-permission-prompts loop run run-skill-generator
+    security-review simplify team-onboarding verify
+);
+my %EXPECTED_SKILL_OVERRIDES = map { $_ => 'off' } @SKILL_NAMES;
+
+for my $case (
+    [ 'global-config/settings.json',                 $host_data ],
+    [ 'plugins/sandbox/container/settings.json',      $container_data ],
+) {
+    my ($label, $data) = @$case;
+
+    # B-1
+    for my $key (@BOOL_SWITCHES) {
+        ok(JSON::PP::is_bool($data->{$key}) && $data->{$key},
+            "B-1: $label $key is a JSON boolean true");
+    }
+
+    # B-2
+    is_deeply($data->{skillOverrides}, \%EXPECTED_SKILL_OVERRIDES,
+        "B-2: $label skillOverrides is exactly the 15-name object, every value 'off'");
+
+    # B-3
+    SKIP: {
+        skip "B-3: $label skillOverrides is not a hash -- cannot check for stray keys", 1
+            unless ref($data->{skillOverrides}) eq 'HASH';
+        my @stray = grep {
+            $_ eq 'update-config' || $_ eq 'keybindings-help' || /:/
+        } keys %{ $data->{skillOverrides} };
+        is_deeply(\@stray, [],
+            "B-3: $label skillOverrides has no update-config/keybindings-help/`:`-qualified key");
+    }
+
+    # B-4
+    for my $key (@ENV_SWITCHES) {
+        is($data->{env}{$key}, '1', "B-4: $label env.$key is exactly '1'");
+    }
+
+    # B-5
+    ok(!exists $data->{disableFastMode},
+        "B-5: $label has no top-level disableFastMode");
+    my @anthropic_skill_plugins = grep { /anthropic-skills/ }
+        keys %{ $data->{enabledPlugins} || {} };
+    is_deeply(\@anthropic_skill_plugins, [],
+        "B-5: $label has no anthropic-skills key in enabledPlugins");
+}
+
+# =====================================================================
 # A4 — every pre-existing key is preserved, checked against a captured
 # baseline (fully-qualified key paths -> scalar values), NOT a whole-file
 # byte snapshot (spec §A4: both files are under concurrent edit by other
@@ -239,6 +318,31 @@ my $HOST_BASELINE = {
     agentPushNotifEnabled         => JSON::PP::true,
     attribution                   => { commit => '', pr => '' },
     autoScrollEnabled              => JSON::PP::false,
+    # DELIBERATE DECLARATION, operator request 2026-09-27 (blueprint
+    # operator-ui-tweaks, package 03-strip-claude-code-bloat): turn off the
+    # Artifact tool family and /artifacts. claude.exe 2.1.282 marks this key
+    # "Deprecated: use enableArtifact: false" but STILL HONOURS it via the
+    # legacyDisableKey resolver (var C={legacyDisableKey:"disableArtifact",...};
+    # a true value in any scanned settings layer flips mst()/g()/I$n()/ET()/kT()
+    # to disabled). This also removes the artifact-design and
+    # artifact-diagramming bundled skills (isEnabled:ET), overlapping with
+    # skillOverrides below deliberately. Re-check on every Claude Code update.
+    disableArtifact                => JSON::PP::true,
+    # DELIBERATE DECLARATION, operator request 2026-09-27 (blueprint
+    # operator-ui-tweaks, package 03-strip-claude-code-bloat): turn off claude.ai
+    # MCP cloud connectors. claude.exe 2.1.282 reads this via ale(), true if any
+    # settings source sets it; gates both the auto-fetch of claudeai-mcp servers
+    # and the connect path for claudeai-scope servers only -- plugin-provided
+    # MCP servers (chrome-devtools-mcp, the notion plugin) are a different scope
+    # and are unaffected. Re-check on every Claude Code update.
+    disableClaudeAiConnectors      => JSON::PP::true,
+    # DELIBERATE DECLARATION, operator request 2026-09-27 (blueprint
+    # operator-ui-tweaks, package 03-strip-claude-code-bloat): turn off Remote
+    # Control (claude.ai/code, `claude remote-control`, --remote-control/--rc,
+    # auto-start, the in-session toggle). claude.exe 2.1.282 reads this via
+    # gH() = QP()?.settings.disableRemoteControl===!0, off merged settings
+    # (userSettings included). Re-check on every Claude Code update.
+    disableRemoteControl           => JSON::PP::true,
     # DELIBERATE DECLARATION, operator request 2026-09-27: turn off Claude Code's
     # Workflows feature (the Workflow tool), which ccpraxis does not use. butler's
     # director does its own orchestration. Schema: "Disable the Workflows
@@ -265,6 +369,18 @@ my $HOST_BASELINE = {
     env => {
         CLAUDE_AUTO_BACKGROUND_TASKS               => '1',
         CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR   => '0',
+        # DELIBERATE DECLARATION, operator request 2026-09-27 (blueprint
+        # operator-ui-tweaks, package 03-strip-claude-code-bloat): hides the
+        # advisor server tool and /advisor. claude.exe 2.1.282 reads this via
+        # D.bool() (true only for "1"/"true"/"yes"/"on"), gating urt()/$S();
+        # with urt() false the advisor tool is never attached to the request.
+        # Re-check on every Claude Code update.
+        CLAUDE_CODE_DISABLE_ADVISOR_TOOL           => '1',
+        # DELIBERATE DECLARATION, operator request 2026-09-27 (blueprint
+        # operator-ui-tweaks, package 03-strip-claude-code-bloat): hides /fast.
+        # claude.exe 2.1.282 reads this via D.bool(), gating oo(); /fast's
+        # isHidden is !oo(). Re-check on every Claude Code update.
+        CLAUDE_CODE_DISABLE_FAST_MODE              => '1',
         CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY        => '1',
         CLAUDE_CODE_ENABLE_AWAY_SUMMARY            => '1',
         CLAUDE_CODE_IDE_SKIP_AUTO_INSTALL          => 'true',
@@ -289,6 +405,18 @@ my $HOST_BASELINE = {
         CLAUDE_CODE_TODO_REMINDER_MODE             => 'off',
         CLAUDE_CODE_USE_POWERSHELL_TOOL            => '1',
         DISABLE_AUTOUPDATER                        => '1',
+        # DELIBERATE DECLARATION, operator request 2026-09-27 (blueprint
+        # operator-ui-tweaks, package 03-strip-claude-code-bloat): disables
+        # /bug. claude.exe 2.1.282's Rj() reads DISABLE_FEEDBACK_COMMAND first,
+        # then this key (D.bool()); either alone is sufficient, both are set
+        # per Decision 7. Re-check on every Claude Code update.
+        DISABLE_BUG_COMMAND                        => '1',
+        # DELIBERATE DECLARATION, operator request 2026-09-27 (blueprint
+        # operator-ui-tweaks, package 03-strip-claude-code-bloat): disables
+        # /feedback, the feedback tip, and (via Crr()) the already-denied
+        # SendFeedback tool's fourth lever. claude.exe 2.1.282's Rj() reads
+        # this via D.bool(). Re-check on every Claude Code update.
+        DISABLE_FEEDBACK_COMMAND                   => '1',
         DISABLE_INSTALL_GITHUB_APP_COMMAND         => '1',
         DISABLE_UPGRADE_COMMAND                    => '1',
         ENABLE_PROMPT_CACHING_1H                   => '1',
@@ -375,6 +503,36 @@ my $HOST_BASELINE = {
     remoteControlAtStartup      => JSON::PP::false,
     showClearContextOnPlanAccept => JSON::PP::true,
     showThinkingSummaries        => JSON::PP::true,
+    # DELIBERATE DECLARATION, operator request 2026-09-27 (blueprint
+    # operator-ui-tweaks, package 03-strip-claude-code-bloat): sets all 15
+    # named bundled prompt skills to "off" via claude.exe 2.1.282's
+    # skillOverrides enum (["on","name-only","user-invocable-only","off"] --
+    # not a boolean; "off" is the only value used here). The reader chain is
+    # nIn()/OOe()/S2()/N0(): "off" fails WQ(), so the skill never reaches the
+    # Skill tool's command set (mT) nor the skill_listing text the model
+    # reads, and a typed /name is refused with "disabled via skillOverrides".
+    # Plugin skills always resolve to "on" (OOe: e.source==="plugin" => "on"),
+    # so no ccpraxis-local skill is affected. update-config and
+    # keybindings-help are deliberately NOT keys here (they are not on the
+    # operator's list and must stay "on" -- see B-3 below). Re-check this
+    # list on every Claude Code update, since skillOverrides matches by name.
+    skillOverrides => {
+        'artifact-capabilities'    => 'off',
+        'artifact-design'          => 'off',
+        'artifact-diagramming'     => 'off',
+        'batch'                    => 'off',
+        'claude-api'               => 'off',
+        'code-review'              => 'off',
+        'dataviz'                  => 'off',
+        'fewer-permission-prompts' => 'off',
+        'loop'                     => 'off',
+        'run'                      => 'off',
+        'run-skill-generator'      => 'off',
+        'security-review'          => 'off',
+        'simplify'                 => 'off',
+        'team-onboarding'          => 'off',
+        'verify'                   => 'off',
+    },
     skipAutoPermissionPrompt     => JSON::PP::true,
     statusLine => {
         # 2026-09-24 -- same guarded form as the perl hooks (see block-nul-redirect above).
@@ -391,6 +549,31 @@ my $CONTAINER_BASELINE = {
     agentPushNotifEnabled  => JSON::PP::true,
     attribution            => { commit => '', pr => '' },
     autoScrollEnabled       => JSON::PP::false,
+    # DELIBERATE DECLARATION, operator request 2026-09-27 (blueprint
+    # operator-ui-tweaks, package 03-strip-claude-code-bloat): turn off the
+    # Artifact tool family and /artifacts. claude.exe 2.1.282 marks this key
+    # "Deprecated: use enableArtifact: false" but STILL HONOURS it via the
+    # legacyDisableKey resolver (var C={legacyDisableKey:"disableArtifact",...};
+    # a true value in any scanned settings layer flips mst()/g()/I$n()/ET()/kT()
+    # to disabled). This also removes the artifact-design and
+    # artifact-diagramming bundled skills (isEnabled:ET), overlapping with
+    # skillOverrides below deliberately. Re-check on every Claude Code update.
+    disableArtifact         => JSON::PP::true,
+    # DELIBERATE DECLARATION, operator request 2026-09-27 (blueprint
+    # operator-ui-tweaks, package 03-strip-claude-code-bloat): turn off claude.ai
+    # MCP cloud connectors. claude.exe 2.1.282 reads this via ale(), true if any
+    # settings source sets it; gates both the auto-fetch of claudeai-mcp servers
+    # and the connect path for claudeai-scope servers only -- plugin-provided
+    # MCP servers (chrome-devtools-mcp, the notion plugin) are a different scope
+    # and are unaffected. Re-check on every Claude Code update.
+    disableClaudeAiConnectors => JSON::PP::true,
+    # DELIBERATE DECLARATION, operator request 2026-09-27 (blueprint
+    # operator-ui-tweaks, package 03-strip-claude-code-bloat): turn off Remote
+    # Control (claude.ai/code, `claude remote-control`, --remote-control/--rc,
+    # auto-start, the in-session toggle). claude.exe 2.1.282 reads this via
+    # gH() = QP()?.settings.disableRemoteControl===!0, off merged settings
+    # (userSettings included). Re-check on every Claude Code update.
+    disableRemoteControl    => JSON::PP::true,
     editorMode              => 'vim',
     effortLevel             => 'high',
     enabledPlugins => {
@@ -400,12 +583,36 @@ my $CONTAINER_BASELINE = {
     env => {
         CLAUDE_AUTO_BACKGROUND_TASKS             => '1',
         CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR => '0',
+        # DELIBERATE DECLARATION, operator request 2026-09-27 (blueprint
+        # operator-ui-tweaks, package 03-strip-claude-code-bloat): hides the
+        # advisor server tool and /advisor. claude.exe 2.1.282 reads this via
+        # D.bool() (true only for "1"/"true"/"yes"/"on"), gating urt()/$S();
+        # with urt() false the advisor tool is never attached to the request.
+        # Re-check on every Claude Code update.
+        CLAUDE_CODE_DISABLE_ADVISOR_TOOL         => '1',
+        # DELIBERATE DECLARATION, operator request 2026-09-27 (blueprint
+        # operator-ui-tweaks, package 03-strip-claude-code-bloat): hides /fast.
+        # claude.exe 2.1.282 reads this via D.bool(), gating oo(); /fast's
+        # isHidden is !oo(). Re-check on every Claude Code update.
+        CLAUDE_CODE_DISABLE_FAST_MODE            => '1',
         CLAUDE_CODE_ENABLE_AWAY_SUMMARY          => '1',
         CLAUDE_CODE_IDE_SKIP_AUTO_INSTALL        => 'true',
         CLAUDE_CODE_NEW_INIT                     => '1',
         CLAUDE_CODE_NO_FLICKER                   => '1',
         CLAUDE_CODE_SCROLL_SPEED                 => '3',
         DISABLE_AUTOUPDATER                      => '1',
+        # DELIBERATE DECLARATION, operator request 2026-09-27 (blueprint
+        # operator-ui-tweaks, package 03-strip-claude-code-bloat): disables
+        # /bug. claude.exe 2.1.282's Rj() reads DISABLE_FEEDBACK_COMMAND first,
+        # then this key (D.bool()); either alone is sufficient, both are set
+        # per Decision 7. Re-check on every Claude Code update.
+        DISABLE_BUG_COMMAND                      => '1',
+        # DELIBERATE DECLARATION, operator request 2026-09-27 (blueprint
+        # operator-ui-tweaks, package 03-strip-claude-code-bloat): disables
+        # /feedback, the feedback tip, and (via Crr()) the already-denied
+        # SendFeedback tool's fourth lever. claude.exe 2.1.282's Rj() reads
+        # this via D.bool(). Re-check on every Claude Code update.
+        DISABLE_FEEDBACK_COMMAND                 => '1',
         DISABLE_INSTALL_GITHUB_APP_COMMAND       => '1',
         DISABLE_LOGIN_COMMAND                    => '0',
         DISABLE_LOGOUT_COMMAND                   => '0',
@@ -448,6 +655,36 @@ my $CONTAINER_BASELINE = {
     remoteControlAtStartup       => JSON::PP::false,
     showClearContextOnPlanAccept => JSON::PP::true,
     showThinkingSummaries        => JSON::PP::true,
+    # DELIBERATE DECLARATION, operator request 2026-09-27 (blueprint
+    # operator-ui-tweaks, package 03-strip-claude-code-bloat): sets all 15
+    # named bundled prompt skills to "off" via claude.exe 2.1.282's
+    # skillOverrides enum (["on","name-only","user-invocable-only","off"] --
+    # not a boolean; "off" is the only value used here). The reader chain is
+    # nIn()/OOe()/S2()/N0(): "off" fails WQ(), so the skill never reaches the
+    # Skill tool's command set (mT) nor the skill_listing text the model
+    # reads, and a typed /name is refused with "disabled via skillOverrides".
+    # Plugin skills always resolve to "on" (OOe: e.source==="plugin" => "on"),
+    # so no ccpraxis-local skill is affected. update-config and
+    # keybindings-help are deliberately NOT keys here (they are not on the
+    # operator's list and must stay "on" -- see B-3 below). Re-check this
+    # list on every Claude Code update, since skillOverrides matches by name.
+    skillOverrides => {
+        'artifact-capabilities'    => 'off',
+        'artifact-design'          => 'off',
+        'artifact-diagramming'     => 'off',
+        'batch'                    => 'off',
+        'claude-api'               => 'off',
+        'code-review'              => 'off',
+        'dataviz'                  => 'off',
+        'fewer-permission-prompts' => 'off',
+        'loop'                     => 'off',
+        'run'                      => 'off',
+        'run-skill-generator'      => 'off',
+        'security-review'          => 'off',
+        'simplify'                 => 'off',
+        'team-onboarding'          => 'off',
+        'verify'                   => 'off',
+    },
     skipDangerousModePermissionPrompt => JSON::PP::true,
     statusLine => {
         command => 'perl "$HOME/.claude/statusline.pl"',
@@ -685,7 +922,8 @@ ok(defined $host_marker_idx,      'sanity: found $HOST_BASELINE = { in this file
 ok(defined $container_marker_idx, 'sanity: found $CONTAINER_BASELINE = { in this file\'s own source');
 
 sub declaration_comment_ok {
-    my ($lines, $target_idx, $label) = @_;
+    my ($lines, $target_idx, $label, $key_name) = @_;
+    $key_name = 'CLAUDE_CODE_TODO_REMINDER_MODE' unless defined $key_name;
     my @comment_lines;
     for (my $i = $target_idx - 1; $i >= 0; $i--) {
         my $line = $lines->[$i];
@@ -694,7 +932,7 @@ sub declaration_comment_ok {
     }
     my $block = join("\n", @comment_lines);
     like($block, qr/DELIBERATE DECLARATION/,
-        "$label: CLAUDE_CODE_TODO_REMINDER_MODE is preceded by a DELIBERATE DECLARATION comment");
+        "$label: $key_name is preceded by a DELIBERATE DECLARATION comment");
 }
 
 SKIP: {
@@ -727,5 +965,67 @@ SKIP: {
 
 unlike($self_src, qr/'env\.CLAUDE_CODE_TODO_REMINDER_MODE'\s*=>/,
     'AC-9: %permitted_additions carries no env.CLAUDE_CODE_TODO_REMINDER_MODE entry');
+
+# =====================================================================
+# B-6/B-7 (03-strip-claude-code-bloat spec §2.3 item 5) — self-read checks,
+# generalising AC-7/AC-8/AC-9 to the 8 new keys.
+# =====================================================================
+
+my ($container_end_idx) = grep {
+    $_ > $container_marker_idx && $self_lines[$_] =~ /^\};\s*$/
+} 0 .. $#self_lines;
+
+my @b6_cases = (
+    [ 'disableArtifact',               qr/^\s*disableArtifact\s*=>/ ],
+    [ 'disableClaudeAiConnectors',      qr/^\s*disableClaudeAiConnectors\s*=>/ ],
+    [ 'disableRemoteControl',           qr/^\s*disableRemoteControl\s*=>/ ],
+    [ 'skillOverrides',                 qr/^\s*skillOverrides\s*=>\s*\{/ ],
+    [ 'CLAUDE_CODE_DISABLE_ADVISOR_TOOL', qr/^\s*CLAUDE_CODE_DISABLE_ADVISOR_TOOL\s*=>/ ],
+    [ 'CLAUDE_CODE_DISABLE_FAST_MODE',  qr/^\s*CLAUDE_CODE_DISABLE_FAST_MODE\s*=>/ ],
+    [ 'DISABLE_BUG_COMMAND',            qr/^\s*DISABLE_BUG_COMMAND\s*=>/ ],
+    [ 'DISABLE_FEEDBACK_COMMAND',       qr/^\s*DISABLE_FEEDBACK_COMMAND\s*=>/ ],
+);
+
+SKIP: {
+    skip 'B-6: baseline markers not found in this file\'s own source',
+        scalar(@b6_cases) * 2
+        unless defined $host_marker_idx && defined $container_marker_idx && defined $container_end_idx;
+
+    for my $case (@b6_cases) {
+        my ($name, $pattern) = @$case;
+
+        my ($host_key_idx) = grep {
+            $_ > $host_marker_idx && $_ < $container_marker_idx && $self_lines[$_] =~ $pattern
+        } 0 .. $#self_lines;
+        SKIP: {
+            skip "B-6: $name not found in \$HOST_BASELINE source", 1
+                unless defined $host_key_idx;
+            declaration_comment_ok(\@self_lines, $host_key_idx, "B-6 ($name, host)", $name);
+        }
+
+        my ($container_key_idx) = grep {
+            $_ > $container_marker_idx && $_ < $container_end_idx && $self_lines[$_] =~ $pattern
+        } 0 .. $#self_lines;
+        SKIP: {
+            skip "B-6: $name not found in \$CONTAINER_BASELINE source", 1
+                unless defined $container_key_idx;
+            declaration_comment_ok(\@self_lines, $container_key_idx, "B-6 ($name, container)", $name);
+        }
+    }
+}
+
+for my $pattern (
+    qr/'disableArtifact'\s*=>/,
+    qr/'disableRemoteControl'\s*=>/,
+    qr/'disableClaudeAiConnectors'\s*=>/,
+    qr/'skillOverrides\./,
+    qr/'env\.CLAUDE_CODE_DISABLE_ADVISOR_TOOL'/,
+    qr/'env\.CLAUDE_CODE_DISABLE_FAST_MODE'/,
+    qr/'env\.DISABLE_BUG_COMMAND'/,
+    qr/'env\.DISABLE_FEEDBACK_COMMAND'/,
+) {
+    unlike($self_src, $pattern,
+        "B-7: %permitted_additions carries no entry matching $pattern");
+}
 
 done_testing();
