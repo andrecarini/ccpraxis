@@ -117,7 +117,7 @@ guess a default.
 | push_confirmation | ccpraxis is ready to commit and push a real change set | summarize what is being sent from detail/data (new and modified files), offer push-it or abort |
 | vault_conflict | a vault-registered project has both local and vault changes to the same path since the last sync | show the conflict payload, including data.merge_preview when present (a diff3-style preview of both sides), offer use-local, use-vault, use-merged (only when a clean merge exists), or abort-this-project |
 | project_registration | the current directory has trackable Claude files but is not registered for vault backup | show the trackable paths from detail/data, offer register-now, not-now, or dont-ask-again |
-| plugin_install | a plugin the config expects is not installed locally | show the plugin name and marketplace, offer install or skip — installing only relays a command, see Follow-up actions |
+| plugin_install | a plugin the config enables that Claude Code cannot load: no install record for user scope or this project, and its marketplace does not serve it in place from a local directory | show the plugin name, marketplace and detail; offer install or skip. Say plainly that installing is a `/plugin install` the operator types at the Claude Code prompt, which neither you nor the driver can run; see Follow-up actions |
 | step_failure | a phase hit a mechanical failure it cannot resolve itself and escalated it into a question instead of silently failing the run | render title, then detail/data verbatim, then the choices exactly as given, and tell the operator plainly that a phase turned a mechanical failure into a question |
 
 ## Relaying the report
@@ -185,9 +185,9 @@ operator verbatim and not acted on.
   success, and tell the operator where the marker is and that deleting it
   re-enables the offer.
 - **`install_plugin`** (`action`, `plugin`, `name`, `marketplace`, `command`) —
-  emitted when the operator answered `install`. **Relay** it: `/plugin install` is a
-  Claude Code client command, not a shell command an agent can execute, so surface
-  `command` for the operator to run themselves.
+  emitted on an `install` answer. **Relay** it, never run it: Claude Code cannot load `plugin` — no
+  install record for user scope or this project, and its marketplace does not serve it in place. Tell the
+  operator to type `command` at the Claude Code prompt, not in a shell; never report it installed.
 - **`add_marketplace`** (`action`, `marketplace`, `plugin`) — emitted unconditionally
   whenever a marketplace is missing; no question gates it. **Inform only**: tell the
   operator the marketplace is missing and needs `/plugin marketplace add

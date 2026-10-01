@@ -72,8 +72,13 @@
 #
 # Invariant worth stating because it narrows the risk (spec S2.8, tested by
 # AC19): no value obtained from $ctx is EVER passed to a child process by
-# this module. Every child argument is derived from the process environment
-# (HOME/USERPROFILE, Cwd::cwd()) in the same invocation.
+# this module, with ONE sanctioned exception — registration_probe.cwd is
+# forwarded as check-plugins.pl's --project argument (see ~line 349) because
+# that probe's cwd is itself process-environment-derived (Cwd::cwd() at
+# probe time, not operator/config input), so it carries none of the risk
+# this invariant exists to avoid. Every OTHER child argument is derived
+# from the process environment (HOME/USERPROFILE, Cwd::cwd()) in the same
+# invocation.
 
 package Backup::Phase::Closeout;
 use strict;
@@ -342,9 +347,16 @@ sub _run_u3_plugin_check {
     my $installed    = "$home/.claude/plugins/installed_plugins.json";
     my $marketplaces = "$home/.claude/plugins/known_marketplaces.json";
 
-    my $r = _run_capture($^X, "$root/plugins/steward/scripts/check-plugins.pl",
+    my @argv = (
         '--settings', _widen_utf8($settings), '--installed', _widen_utf8($installed),
-        '--marketplaces', _widen_utf8($marketplaces));
+        '--marketplaces', _widen_utf8($marketplaces),
+    );
+    my $rp = _gi($ctx, 'registration_probe');
+    if (ref($rp) eq 'HASH' && defined($rp->{cwd}) && length($rp->{cwd})) {
+        push @argv, '--project', _widen_utf8($rp->{cwd});
+    }
+
+    my $r = _run_capture($^X, "$root/plugins/steward/scripts/check-plugins.pl", @argv);
     my ($ok, $j, $err) = _interpret_response_plugins($r, 'check-plugins.pl');
     if ($ok) {
         $j = _sanitize_utf8($j);
@@ -423,17 +435,18 @@ sub _plugin_decision {
     my $name        = $entry->{name} // '';
     my $marketplace = $entry->{marketplace} // '';
     my $command     = "/plugin install $name\@$marketplace";
+    my $detail      = "Claude Code cannot load '$plugin': no installed_plugins.json entry covers user scope or this project, and marketplace '$marketplace' does not serve it in place from a local directory. Installing it is a Claude Code client action that only you can take; the backup cannot run it. To install, type $command at the Claude Code prompt (it is not a shell command).";
 
     return $ctx->{decision}->(
         kind    => 'plugin_install',
         id      => $id,
         title   => "install missing plugin '" . _title_key($plugin) . "'?",
         subject => $plugin,
-        detail  => $command,
+        detail  => $detail,
         data    => { plugin => $plugin, name => $name, marketplace => $marketplace, command => $command },
         choices => [
             # NIT 2 (redteam): see the identical note at the registration decision above.
-            { id => 'install', label => "Install '" . _title_key($plugin) . "'" },
+            { id => 'install', label => "Install '" . _title_key($plugin) . "' (you type /plugin install at the Claude Code prompt)" },
             { id => 'skip',    label => "Skip '" . _title_key($plugin) . "'" },
         ],
     );
