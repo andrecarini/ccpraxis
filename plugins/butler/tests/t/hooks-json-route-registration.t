@@ -105,8 +105,12 @@ my @EXPECT = (
     # never-halt package 11 (Decision 43, N3): a new UserPromptSubmit route,
     # no matcher, guarded 2.2 template, arm-nudge-prompt.sh.
     { event => 'UserPromptSubmit',    matcher => '', file => 'arm-nudge-prompt.sh', args => '' },
+    # never-halt package 12 (Decision 43, N6/N1-now): a second, matcher-less
+    # SessionStart group, after denial-breaker.sh's, guarded 2.2 template,
+    # session-start-nudge.sh.
+    { event => 'SessionStart',        matcher => '', file => 'session-start-nudge.sh', args => '' },
 );
-is(scalar(@EXPECT), 25, 'sanity: this file\'s own sec 2.3 fixture table has 25 rows (never-halt 06 adds 2, never-halt 07 adds 4, never-halt 11 adds 1)');
+is(scalar(@EXPECT), 26, 'sanity: this file\'s own sec 2.3 fixture table has 26 rows (never-halt 06 adds 2, never-halt 07 adds 4, never-halt 11 adds 1, never-halt 12 adds 1)');
 
 sub expect_key { my ($r) = @_; return join("\x1e", $r->{event}, $r->{matcher}, $r->{file}, $r->{args}) }
 
@@ -143,7 +147,7 @@ if (ref $doc eq 'HASH' && ref $doc->{hooks} eq 'HASH') {
 my @expect_keys = sort map { expect_key($_) } @EXPECT;
 my @actual_keys = sort map { expect_key($_) } @actual;
 is_deeply(\@actual_keys, \@expect_keys,
-    'B1a: hooks.json\'s (event, matcher, file, args) multiset equals sec 2.3 exactly (25 commands)')
+    'B1a: hooks.json\'s (event, matcher, file, args) multiset equals sec 2.3 exactly (26 commands)')
     or diag("actual:\n" . join("\n", @actual_keys) . "\nexpected:\n" . join("\n", @expect_keys));
 
 is(scalar(@template_mismatches), 0,
