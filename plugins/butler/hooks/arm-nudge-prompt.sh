@@ -107,12 +107,11 @@ PR=${PR//\\n/ }
 PR=${PR//\\r/ }
 PR=${PR//\\t/ }
 PR=${PR//\\u2019/\'}
-PR=${PR//\\U2019/\'}
 PR=${PR//’/\'}
 
 # Step 12: /drive-solo (with or without the butler: prefix, leading
 # whitespace allowed) arms itself; no nudge needed.
-[[ $PR =~ ^[[:space:]]*/(butler:)?drive-solo([[:space:]]|\$) ]] && exit 0
+[[ $PR =~ ^[[:space:]]*/(butler:)?drive-solo([[:space:]]|$) ]] && exit 0
 
 # Step 13: the phrase list (sec 2.3.1), matched case-insensitively.
 ALT_RE="(^|[^[:alnum:]])(keep[[:space:]]+going|keep[[:space:]]+working|carry[[:space:]]+on|while[[:space:]]+i'?m[[:space:]]+(away|out|gone|asleep)|while[[:space:]]+i[[:space:]]+am[[:space:]]+(away|out|gone|asleep)|i'?ll[[:space:]]+be[[:space:]]+back|i[[:space:]]+will[[:space:]]+be[[:space:]]+back|be[[:space:]]+right[[:space:]]+back|overnight|unattended|until[[:space:]]+(it'?s|it[[:space:]]+is|you'?re|you[[:space:]]+are)[[:space:]]+(done|finished))([^[:alnum:]]|\$)"
