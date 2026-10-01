@@ -61,6 +61,21 @@
 #           keys are not in the live settings files until the implementer acts)
 #   AC-12 : promote-syncs-global-config.t, promote-drops-retired-keys.t and
 #           global-config-perl-hook-guard.t are unaffected (run, not edited)
+#
+# tooling-fixes package 15 (Decision 46), derived from
+#   .ccpraxis-local-data/blueprints/tooling-fixes/specs/15-sandbox-only-plugin-updates-spec.md
+# §2.13.2. FORCE_AUTOUPDATE_PLUGINS returns to the container baseline (removed
+# by 06-plugins-current-at-start, Decision 11) under a DELIBERATE DECLARATION
+# comment explaining why it is now safe: it reopens the global plugin-update
+# gate that DISABLE_AUTOUPDATER shuts, and the per-marketplace `autoUpdate`
+# flag the launcher writes every launch into known_marketplaces.json is the
+# effective gate -- false for every marketplace with a host-shared plugin.
+#   TF15-1 (AC24a) : $CONTAINER_BASELINE declares FORCE_AUTOUPDATE_PLUGINS =>
+#                    '1' under a DELIBERATE DECLARATION comment
+#   TF15-2 (AC24b) : %permitted_additions carries no env.FORCE_AUTOUPDATE_PLUGINS
+#                    entry -- the key is declared in-baseline (A4(a) covers it)
+#   TF15-3 (AC24c) : no extraKnownMarketplaces.*.autoUpdate key exists in the
+#                    live container file or in %permitted_additions
 
 use strict;
 use warnings;
@@ -627,9 +642,16 @@ my $CONTAINER_BASELINE = {
         # anything else silently falls back to the remote default. The key is
         # undocumented, so re-check it on every Claude Code update.
         CLAUDE_CODE_TODO_REMINDER_MODE           => 'off',
-        # FORCE_AUTOUPDATE_PLUGINS removed (06-plugins-current-at-start,
-        # Decision 11): the container is host-refresh materialized now, so
-        # its own auto-updater is turned off rather than left racing the copy.
+        # DELIBERATE DECLARATION, tooling-fixes package 15 (Decision 46):
+        # reopens the global plugin-update gate that DISABLE_AUTOUPDATER shuts
+        # (claude.exe 2.1.282's bee() requires FORCE_AUTOUPDATE_PLUGINS once
+        # DISABLE_AUTOUPDATER is set). The per-marketplace `autoUpdate` flag
+        # the launcher writes every launch into known_marketplaces.json is the
+        # effective gate -- false for every marketplace with a host-shared
+        # plugin, true only for a marketplace whose sandbox plugins are all
+        # sandbox-only, so a host-shared plugin can never be moved past the
+        # host's version by this flag. Re-check on every Claude Code update.
+        FORCE_AUTOUPDATE_PLUGINS                 => '1',
         CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY       => '1',
     },
     extraKnownMarketplaces => {
@@ -1026,6 +1048,42 @@ for my $pattern (
 ) {
     unlike($self_src, $pattern,
         "B-7: %permitted_additions carries no entry matching $pattern");
+}
+
+# =====================================================================
+# TF15-1/TF15-2/TF15-3 (tooling-fixes package 15, Decision 46, spec §2.13.2
+# item 4) -- self-read checks pinning the FORCE_AUTOUPDATE_PLUGINS
+# re-addition and the extraKnownMarketplaces.*.autoUpdate invariant.
+# =====================================================================
+
+my ($force_autoupdate_idx) = grep {
+    $_ > $container_marker_idx && $_ < $container_end_idx
+        && $self_lines[$_] =~ /^\s*FORCE_AUTOUPDATE_PLUGINS\s*=>\s*'1'/
+} 0 .. $#self_lines;
+
+ok(defined $force_autoupdate_idx,
+    'TF15-1: FORCE_AUTOUPDATE_PLUGINS => \'1\' found in $CONTAINER_BASELINE source, strictly inside the hash');
+
+SKIP: {
+    skip 'TF15-1: FORCE_AUTOUPDATE_PLUGINS not found in $CONTAINER_BASELINE source', 1
+        unless defined $force_autoupdate_idx;
+    declaration_comment_ok(\@self_lines, $force_autoupdate_idx, 'TF15-1', 'FORCE_AUTOUPDATE_PLUGINS');
+}
+
+unlike($self_src, qr/'env\.FORCE_AUTOUPDATE_PLUGINS'\s*=>/,
+    'TF15-2: %permitted_additions carries no env.FORCE_AUTOUPDATE_PLUGINS entry');
+
+{
+    my $ekm = (ref $container_data->{extraKnownMarketplaces} eq 'HASH')
+        ? $container_data->{extraKnownMarketplaces} : {};
+    my @with_autoupdate = sort grep {
+        ref $ekm->{$_} eq 'HASH' && exists $ekm->{$_}{autoUpdate}
+    } keys %$ekm;
+    is_deeply(\@with_autoupdate, [],
+        'TF15-3: no extraKnownMarketplaces.*.autoUpdate key in the live container file');
+
+    unlike($self_src, qr/'extraKnownMarketplaces\.[^']*autoUpdate'\s*=>/,
+        'TF15-3: %permitted_additions carries no extraKnownMarketplaces.*.autoUpdate entry');
 }
 
 done_testing();

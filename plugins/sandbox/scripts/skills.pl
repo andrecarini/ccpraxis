@@ -27,8 +27,10 @@ use B ();
 use Fcntl qw(:flock);
 use File::Basename qw(dirname);
 use File::Path qw(make_path);
+use File::Find qw(find);
 use File::Spec;
 use POSIX qw(strftime);
+use Digest::SHA ();
 
 our $SCHEMA_VERSION = 3;
 
@@ -123,6 +125,123 @@ sub _dir_exists_fs {
     return 0 unless defined $p && length $p;
     my $bytes = utf8::is_utf8($p) ? Encode::encode('UTF-8', $p) : $p;
     return -d $bytes;
+}
+
+# tooling-fixes package 15 (spec 2.3-2.4): byte-safe form of a path that may
+# or may not already be a decoded Unicode string (utf8 flag set), for use in
+# filesystem calls (-f/-d/open) on Windows, mirroring _dir_exists_fs's logic.
+sub _fs_bytes {
+    my $p = shift;
+    return $p unless defined $p;
+    return utf8::is_utf8($p) ? Encode::encode('UTF-8', $p) : $p;
+}
+
+# tooling-fixes package 15 (spec 2.4): SAFE = ^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$
+# and not containing '..'. Used to decide whether a declared version string
+# (plugin.json or catalog entry) is trustworthy enough to become part of a
+# container cache path, or whether to fall back to a content digest.
+sub _is_safe_version {
+    my $v = shift;
+    return 0 unless defined $v && !ref($v) && length($v);
+    return 0 unless $v =~ /^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}\z/;
+    return 0 if index($v, '..') >= 0;
+    return 1;
+}
+
+# tooling-fixes package 15 fix-batch (NIT, cheap -- folded in): a plugin or
+# marketplace key segment, or a marketplace-relative path segment, that is a
+# Windows reserved device name (case-insensitive, with or without an
+# extension -- "nul", "nul.txt") or ends in a trailing dot must never be
+# trusted into a path we build and copy from -- consistent with the other
+# Windows-safety guards already in this file (_dir_exists_fs, _fs_bytes).
+sub _is_unsafe_path_segment {
+    my $seg = shift;
+    return 1 unless defined $seg && length $seg;
+    # "." and ".." are structural dot-path components, not candidate file/dir
+    # names -- callers already reject ".." via a dedicated traversal check,
+    # and a leading "./" is a legitimate, normalized-away prefix (spec 2.3's
+    # own src_rel handling). Neither is a Windows reserved name.
+    return 0 if $seg eq '.' || $seg eq '..';
+    return 1 if $seg =~ /\.\z/;
+    (my $stem = $seg) =~ s/\..*\z//;
+    return 1 if $stem =~ /^(?:nul|con|prn|aux|com[1-9]|lpt[1-9])\z/i;
+    return 0;
+}
+
+# tooling-fixes package 15 fix-batch (red-team H3): walk every path component
+# from $root (exclusive) down to $leaf (inclusive) and refuse if ANY of them
+# is a symlink -- not just the final component, which is all the pre-existing
+# _dir_exists_fs-style checks examine. A symlinked MIDDLE directory in a
+# corrupted/malicious local marketplace snapshot (e.g. pointing at ~/.ssh)
+# must never be followed into the container copy-plan. $root and $leaf are
+# both already-decoded Unicode path strings (from_fs'd); filesystem calls go
+# through _fs_bytes. Returns 1 (UNSAFE -- a symlink was found somewhere from
+# $root down to $leaf, inclusive of $root itself) or 0 (clean: every
+# component is a real, non-symlink directory/file). A $leaf outside $root, or
+# missing args, is treated as unsafe (fail closed).
+sub _path_has_symlink_component {
+    my ($root, $leaf) = @_;
+    return 1 unless defined $root && defined $leaf;
+    my $root_b = _fs_bytes($root);
+    my $leaf_b = _fs_bytes($leaf);
+    return 1 unless $leaf_b =~ /^\Q$root_b\E/;
+    (my $rel = $leaf_b) =~ s{^\Q$root_b\E/?}{};
+    return 1 if -l $root_b;
+    my $cur = $root_b;
+    for my $part (split m{/}, $rel) {
+        next unless length $part;
+        $cur = length($cur) ? "$cur/$part" : $part;
+        return 1 if -l $cur;
+    }
+    return 0;
+}
+
+# tooling-fixes package 15 (spec 2.4): lowercase hex SHA-256, first 12 chars,
+# over every regular file under $dir_in (symlinks skipped and not descended,
+# same as PluginSync::copy_tree), sorted by relative path compared bytewise
+# with '/' separators, of relpath_bytes . "\0" . file_bytes . "\0".
+sub _content_digest {
+    my $dir_in = shift;
+    my $dir_b  = _fs_bytes($dir_in);
+    my @files;
+    find({ no_chdir => 1, wanted => sub {
+        my $p = $File::Find::name;
+        return if -l $p;
+        return unless -f $p;
+        push @files, $p;
+    } }, $dir_b);
+    my @pairs;
+    for my $f (@files) {
+        (my $rel = $f) =~ s{^\Q$dir_b\E/?}{};
+        push @pairs, [ $rel, $f ];
+    }
+    @pairs = sort { $a->[0] cmp $b->[0] } @pairs;
+    my $sha = Digest::SHA->new(256);
+    for my $pair (@pairs) {
+        my ($rel, $file) = @$pair;
+        # tooling-fixes package 15 fix-batch (review M2 / red-team M2-redteam):
+        # this is reached through $classify_key for every member key, every
+        # launch, including keys a host refresh races against (a file that
+        # vanishes or locks mid-read). Dying here used to abort the whole
+        # launch via run_perl_or_die, which spec 2.8 and this sub's own
+        # "Never dies" doc comment both forbid. Degrade instead: an unreadable
+        # file makes the whole digest unresolvable, and the caller treats
+        # undef exactly like "no local copy exists" (falls through to
+        # not-resolvable, never dies).
+        open my $fh, '<:raw', $file or return undef;
+        local $/;
+        my $bytes = <$fh>;
+        unless (defined $bytes) {
+            close $fh;
+            return undef;
+        }
+        close $fh or return undef;
+        $sha->add($rel);
+        $sha->add("\0");
+        $sha->add($bytes);
+        $sha->add("\0");
+    }
+    return substr(lc($sha->hexdigest), 0, 12);
 }
 
 # True iff $v decoded from JSON as a JSON *integer* (not a string, not a
@@ -2029,6 +2148,18 @@ sub cmd_materialize_plugins {
     my $file   = $opts{selection_file} or die "--selection-file required\n";
     my $output = $opts{output}         or die "--output required\n";
 
+    # review S2: delete the sidecar up front, before any other work, so a
+    # partial/crashed run (a die anywhere below, before the sidecar is
+    # rewritten near the end) can never leave a PRIOR launch's eligible-set
+    # sidecar lying around for materialize-known-marketplaces to read later.
+    # Previously only the launcher's call ordering (always run
+    # materialize-plugins, which rewrites the sidecar every successful run,
+    # before materialize-known-marketplaces) happened to prevent this.
+    if (defined(my $manifest_opt_early = $opts{manifest})) {
+        my $sidecar_early = dirname($manifest_opt_early) . '/.sandbox-autoupdate-marketplaces.json';
+        unlink $sidecar_early if -e $sidecar_early;
+    }
+
     my $state = load_state($file);
     my $plugins = discover_plugins(%opts);
     my %by_key = map { $_->{key} => $_ } @$plugins;
@@ -2039,8 +2170,27 @@ sub cmd_materialize_plugins {
     # missing/empty installedAt as "not recorded" and won't load them.
     my $host_plugins_file = $opts{plugins_file}
         // home() . "/.claude/plugins/installed_plugins.json";
-    my $host_data = -f $host_plugins_file ? read_json($host_plugins_file) : {};
-    $host_data = {} unless ref $host_data eq 'HASH';
+    # tooling-fixes package 15 fix-batch (review M1 / red-team H1): a host
+    # registry that EXISTS but fails to decode to the expected shape (a torn
+    # read -- read_json_with_retry's own doc comment calls this real on
+    # Windows) must be distinguished from a registry that's genuinely absent.
+    # Silently treating a torn read as "{}" makes every host-installed plugin
+    # invisible, which makes its marketplace look sandbox-only and wins it
+    # autoUpdate:true -- exactly the popup-loop trigger this package exists to
+    # prevent. Absent (no -f) is the normal "no host plugins yet" case and
+    # keeps today's behavior; present-but-unparseable sets a fail-closed flag
+    # consumed below by the eligibility pass, so NO marketplace can be judged
+    # eligible this launch when the host picture is unknown.
+    my $host_registry_unparseable = 0;
+    my $host_data = {};
+    if (-f $host_plugins_file) {
+        my $raw = read_json($host_plugins_file);
+        if (ref $raw eq 'HASH' && ref $raw->{plugins} eq 'HASH') {
+            $host_data = $raw;
+        } else {
+            $host_registry_unparseable = 1;
+        }
+    }
     my $host_plugins = (ref $host_data->{plugins} eq 'HASH')
         ? $host_data->{plugins} : {};
     my $host_top_version = (ref $host_data eq 'HASH') ? $host_data->{version} : undef;
@@ -2052,9 +2202,27 @@ sub cmd_materialize_plugins {
     # host-refreshed below. Derived from dirname($host_plugins_file), NOT
     # home()/_load_known_marketplaces, so a test passing --plugins-file stays
     # hermetic (spec 2.1). Missing/unparseable -> nothing is directory-source.
-    my $host_km_file = dirname($host_plugins_file) . '/known_marketplaces.json';
-    my $host_km = -f $host_km_file ? read_json($host_km_file) : {};
-    $host_km = {} unless ref $host_km eq 'HASH';
+    my $host_plugins_dir = dirname($host_plugins_file);
+    # tooling-fixes package 15 (spec 2.2/2.6): decode once, so every path we
+    # BUILD from it (catalog file, plugin dir, manifest `src`) is a proper
+    # Unicode character string -- JSON::PP's ->utf8->encode then encodes it
+    # exactly once. Filesystem calls on paths built from it go through
+    # _fs_bytes/_dir_exists_fs, which re-encode for the OS call.
+    my $host_plugins_dir_u = from_fs($host_plugins_dir);
+    my $host_km_file = "$host_plugins_dir/known_marketplaces.json";
+    # Same fail-closed distinction as the installed-plugins registry above
+    # (review's NIT, folded into this fix): present-but-unparseable also
+    # trips $host_registry_unparseable, since directory-source detection and
+    # mechanism A's resolvability both depend on this file being readable.
+    my $host_km = {};
+    if (-f $host_km_file) {
+        my $raw_km = read_json($host_km_file);
+        if (ref $raw_km eq 'HASH') {
+            $host_km = $raw_km;
+        } else {
+            $host_registry_unparseable = 1;
+        }
+    }
     my %directory_source_mkt;
     for my $mkt_name (keys %$host_km) {
         my $mkt_entry = $host_km->{$mkt_name};
@@ -2118,25 +2286,36 @@ sub cmd_materialize_plugins {
     # the merge below. Read BEFORE we overwrite it.
     my $manifest_file = $opts{manifest};
     my %prior_keys;
-    # 06-plugins-current-at-start (spec 2.3): a prior entry carrying an
-    # `origin` (host-refresh / host-refresh-retained) never counts as
-    # "placed by the launcher" for %prior_keys, so a refreshed-but-unselected
-    # key is never dropped as deselected. Its dest_rel is remembered
-    # separately, for the retain rule (Behaviour 9 / AC7).
-    my %prior_refresh_dest_rel;
+    # 06-plugins-current-at-start (spec 2.3), widened by tooling-fixes package
+    # 15 (spec 2.6): a prior entry carrying an `origin` of host-refresh(-
+    # retained) OR marketplace-refresh(-retained) never counts as "placed by
+    # the launcher" for %prior_keys, so a refreshed-but-unselected key is
+    # never dropped as deselected. Its {dest_rel, origin} is remembered
+    # separately, for the generalized retain rule (spec 2.6).
+    my %prior_refresh;
     if ($manifest_file && -f $manifest_file) {
         my $pj = read_json($manifest_file);
         if (ref $pj eq 'ARRAY') {
             for my $e (@$pj) {
                 next unless ref $e eq 'HASH' && defined $e->{key};
-                if (defined $e->{origin} && ($e->{origin} eq 'host-refresh' || $e->{origin} eq 'host-refresh-retained')) {
-                    $prior_refresh_dest_rel{$e->{key}} = $e->{dest_rel};
-                } elsif (!defined $e->{origin}) {
+                my $origin = $e->{origin};
+                if (defined $origin && (
+                    $origin eq 'host-refresh' || $origin eq 'host-refresh-retained'
+                    || $origin eq 'marketplace-refresh' || $origin eq 'marketplace-refresh-retained'
+                )) {
+                    $prior_refresh{$e->{key}} = { dest_rel => $e->{dest_rel}, origin => $origin };
+                } elsif (!defined $origin) {
                     $prior_keys{$e->{key}} = 1;
                 }
             }
         }
     }
+    # spec 2.6 retain rule: origin marketplace-refresh-retained iff the prior
+    # origin started with marketplace-refresh, else host-refresh-retained.
+    my $retain_origin_for = sub {
+        my $prior_origin = shift // '';
+        return ($prior_origin =~ /^marketplace-refresh/) ? 'marketplace-refresh-retained' : 'host-refresh-retained';
+    };
 
     my %plugins_out;
     my @missing;
@@ -2225,6 +2404,151 @@ sub cmd_materialize_plugins {
     my $existing = -f $output ? read_json($output) : {};
     $existing = {} unless ref $existing eq 'HASH';
     my $existing_plugins = (ref $existing->{plugins} eq 'HASH') ? $existing->{plugins} : {};
+
+    my $mkt_of = sub {
+        my $key = shift;
+        return ($key =~ /\@([^@]+)$/) ? $1 : undef;
+    };
+
+    # tooling-fixes package 15 (spec 2.2-2.4): mechanism A -- resolve a
+    # sandbox-only key against its marketplace's own local snapshot.
+    my %catalog_cache;
+    my $get_catalog = sub {
+        my $mkt = shift;
+        return $catalog_cache{$mkt} if exists $catalog_cache{$mkt};
+        my $cat_file = "$host_plugins_dir_u/marketplaces/$mkt/.claude-plugin/marketplace.json";
+        my $data = -f _fs_bytes($cat_file) ? read_json(_fs_bytes($cat_file)) : undef;
+        $data = undef unless ref $data eq 'HASH' && ref $data->{plugins} eq 'ARRAY';
+        return $catalog_cache{$mkt} = $data;
+    };
+
+    # Returns { resolvable => 0|1, remote => 0|1, mkt, name, src_dir, version }.
+    # Never dies; every unresolvable condition in spec 2.2-2.3 and 2.8 simply
+    # falls through to resolvable => 0.
+    #
+    # tooling-fixes package 15 fix-batch (review S1 / red-team M2-redteam):
+    # memoized per key -- the un-memoized version was computed at least twice
+    # per key per launch (once per eligibility-pass member, once per the
+    # preserved-tier loop below), re-walking the filesystem and re-hashing
+    # content every time, including for keys whose marketplace a cheaper
+    # check (directory-source, or the fail-closed flag below) has already
+    # ruled out. A marketplace+key pair's classification cannot change within
+    # a single launch (every input it reads -- host_km, the catalog file, the
+    # plugin dir -- is read once at process start), so caching on $key alone
+    # is sound for the lifetime of this subroutine call.
+    my %classify_cache;
+    my $classify_key = sub {
+        my $key = shift;
+        return $classify_cache{$key} if exists $classify_cache{$key};
+        my $not_resolvable = { resolvable => 0, remote => 0 };
+        # tooling-fixes package 15 fix-batch (review M1 / red-team H1): when
+        # the host registry picture is unknown (torn/unparseable read), we
+        # cannot safely resolve ANY key against it -- fail closed rather than
+        # risk granting autoUpdate to a marketplace the host actually shares.
+        return $classify_cache{$key} = $not_resolvable if $host_registry_unparseable;
+        my ($name, $mkt) = $key =~ /^(.*)\@([^@]+)$/;
+        return $classify_cache{$key} = $not_resolvable
+            unless defined $name && length $name && defined $mkt && length $mkt;
+        for my $seg ($name, $mkt) {
+            return $classify_cache{$key} = $not_resolvable
+                if $seg =~ m{[/\\]} || $seg eq '.' || $seg eq '..' || _is_unsafe_path_segment($seg);
+        }
+        return $classify_cache{$key} = $not_resolvable if $directory_source_mkt{$mkt};
+        my $km_entry = $host_km->{$mkt};
+        return $classify_cache{$key} = $not_resolvable unless ref $km_entry eq 'HASH';
+        my $cat = $get_catalog->($mkt);
+        return $classify_cache{$key} = $not_resolvable unless $cat;
+        my $entry;
+        for my $e (@{ $cat->{plugins} }) {
+            next unless ref $e eq 'HASH';
+            if (defined $e->{name} && !ref($e->{name}) && $e->{name} eq $name) { $entry = $e; last; }
+        }
+        return $classify_cache{$key} = $not_resolvable unless $entry;
+        my $src_rel = $entry->{source};
+        return $classify_cache{$key} = { resolvable => 0, remote => 1 } if ref $src_rel eq 'HASH';
+        return $classify_cache{$key} = $not_resolvable if ref $src_rel;
+        return $classify_cache{$key} = $not_resolvable unless defined $src_rel && length $src_rel;
+        return $classify_cache{$key} = $not_resolvable
+            if $src_rel =~ m{^/} || $src_rel =~ m{^[A-Za-z]:} || $src_rel =~ m{\\};
+        for my $seg (split m{/}, $src_rel) {
+            return $classify_cache{$key} = $not_resolvable
+                if $seg eq '..' || _is_unsafe_path_segment($seg);
+        }
+        (my $rel = $src_rel) =~ s{^\./}{};
+        $rel =~ s{/+$}{};
+        return $classify_cache{$key} = $not_resolvable unless length($rel) && $rel ne '.';
+        my $mkt_root = "$host_plugins_dir_u/marketplaces/$mkt";
+        my $src_dir = "$mkt_root/$rel";
+        return $classify_cache{$key} = $not_resolvable unless _dir_exists_fs($src_dir);
+        # red-team H3: reject a symlinked MIDDLE path component, not just the
+        # final one -- a corrupted/malicious marketplace snapshot could
+        # otherwise point an arbitrary host directory (e.g. ~/.ssh) at a key
+        # this mechanism would then copy into the container.
+        return $classify_cache{$key} = $not_resolvable
+            if _path_has_symlink_component($mkt_root, $src_dir);
+        return $classify_cache{$key} = $not_resolvable unless ref $existing_plugins->{$key} eq 'ARRAY';
+
+        my $plugin_json = "$src_dir/.claude-plugin/plugin.json";
+        my $pdata = -f _fs_bytes($plugin_json) ? read_json(_fs_bytes($plugin_json)) : undef;
+        my $v;
+        if (ref $pdata eq 'HASH' && _is_safe_version($pdata->{version})) {
+            $v = $pdata->{version};
+        } elsif (_is_safe_version($entry->{version})) {
+            $v = $entry->{version};
+        } else {
+            $v = _content_digest($src_dir);
+        }
+        # review M2: _content_digest now returns undef on an unreadable file
+        # instead of dying -- treat that exactly like "no local copy exists".
+        return $classify_cache{$key} = $not_resolvable unless defined $v;
+        return $classify_cache{$key} =
+            { resolvable => 1, remote => 0, mkt => $mkt, name => $name, src_dir => $src_dir, version => $v };
+    };
+
+    # tooling-fixes package 15 (spec 2.9): auto-update eligibility per
+    # marketplace, recomputed fresh every launch from this run's inputs only.
+    my %mkt_members;
+    my %selected_this_launch = map { $_ => 1 } keys %plugins_out;
+    for my $key (keys %plugins_out) {
+        my $mkt = $mkt_of->($key);
+        $mkt_members{$mkt}{$key} = 1 if defined $mkt;
+    }
+    for my $key (keys %$existing_plugins) {
+        next if exists $plugins_out{$key};
+        next if exists $prior_keys{$key};
+        my $mkt = $mkt_of->($key);
+        $mkt_members{$mkt}{$key} = 1 if defined $mkt;
+    }
+    # review M1 / red-team H1: when the host registry picture for this launch
+    # is unknown (installed_plugins.json or known_marketplaces.json present
+    # but unparseable), no marketplace can be judged eligible -- every key
+    # would look sandbox-only, which is exactly the false-positive this
+    # mechanism must never produce. Leave %autoupdate_eligible empty.
+    my %autoupdate_eligible;
+    unless ($host_registry_unparseable) {
+        for my $mkt (keys %mkt_members) {
+            next if $directory_source_mkt{$mkt};
+            my $any_selected    = 0;
+            my $any_host_shared = 0;
+            for my $k (keys %{ $mkt_members{$mkt} }) {
+                $any_selected = 1 if $selected_this_launch{$k};
+                $any_host_shared = 1 if defined $best_host_install->($k);
+                last if $any_selected && $any_host_shared;
+            }
+            # review S1 / red-team M2-redteam: a marketplace already
+            # disqualified by the cheap selected/host-shared check never
+            # needs $classify_key (filesystem walk + possible content
+            # digest) run over its members at all.
+            next if $any_selected || $any_host_shared;
+            my $any_not_resolvable = 0;
+            for my $k (keys %{ $mkt_members{$mkt} }) {
+                $any_not_resolvable = 1 unless $classify_key->($k)->{resolvable};
+            }
+            next unless $any_not_resolvable;
+            $autoupdate_eligible{$mkt} = 1;
+        }
+    }
+
     for my $key (sort keys %$existing_plugins) {
         next if exists $plugins_out{$key};   # host-selected this launch -> fresh wins
         next if exists $prior_keys{$key};    # we placed it before, now deselected -> drop
@@ -2232,11 +2556,23 @@ sub cmd_materialize_plugins {
         # 06-plugins-current-at-start (spec 2.1, Behaviour 4/8/9): a preserved
         # key whose host install is current is rewritten to the host's
         # version rather than kept stale (Decision 11's root cause). Directory-
-        # source marketplaces (live binds) and any key with no present host
-        # dir are kept verbatim.
-        my $mkt_name = ($key =~ /\@([^@]*)$/) ? $1 : undef;
+        # source marketplaces (live binds) and any key of an auto-update-
+        # eligible marketplace (tooling-fixes 15, mechanism B: the container
+        # owns it) are kept verbatim.
+        my $mkt_name = $mkt_of->($key);
         my $is_dir_source = defined $mkt_name && exists $directory_source_mkt{$mkt_name};
-        my $host_inst = (!$is_dir_source) ? $best_host_install->($key) : undef;
+        my $is_eligible_mkt = defined $mkt_name && exists $autoupdate_eligible{$mkt_name};
+
+        if ($is_dir_source || $is_eligible_mkt) {
+            $plugins_out{$key} = $existing_plugins->{$key};  # preserve verbatim
+            if (exists $prior_refresh{$key}) {
+                push @copy_plan, { key => $key, dest_rel => $prior_refresh{$key}{dest_rel},
+                    origin => $retain_origin_for->($prior_refresh{$key}{origin}) };
+            }
+            next;
+        }
+
+        my $host_inst = $best_host_install->($key);
         my $host_dir  = $host_inst ? normalize_path($host_inst->{installPath}) : undef;
         my $host_dir_present = defined $host_dir && _dir_exists_fs($host_dir);
         my $rewritten = $host_dir_present ? $rewrite->($host_dir) : undef;
@@ -2269,14 +2605,47 @@ sub cmd_materialize_plugins {
             } @{ $existing_plugins->{$key} };
             $plugins_out{$key} = \@refreshed;
             push @copy_plan, { key => $key, src => $host_dir, dest_rel => $dest_rel, origin => 'host-refresh' };
-        } else {
-            $plugins_out{$key} = $existing_plugins->{$key};  # preserve verbatim
-            if (exists $prior_refresh_dest_rel{$key}) {
-                # Host no longer supplies a previously refreshed key (spec
-                # Behaviour 9 / AC7): keep the cache dir alive with a retain
-                # entry carrying no src, so reconcile_copy_plan doesn't prune it.
-                push @copy_plan, { key => $key, dest_rel => $prior_refresh_dest_rel{$key}, origin => 'host-refresh-retained' };
+            next;
+        }
+
+        if (!$host_inst) {
+            my $cls = $classify_key->($key);
+            if ($cls->{resolvable}) {
+                # tooling-fixes package 15 (spec 2.5-2.6): mechanism A --
+                # marketplace-refresh. Rewrite every element of the ARRAY
+                # record to the marketplace's current version.
+                my @refreshed = map {
+                    my %e = (ref $_ eq 'HASH') ? %$_ : ();
+                    my $prior_version = $e{version};
+                    $e{version}     = $cls->{version};
+                    $e{installPath} = "$CONTAINER_PLUGINS_ROOT/cache/$cls->{mkt}/$cls->{name}/$cls->{version}";
+                    delete $e{gitCommitSha};
+                    if (!defined $prior_version || $prior_version ne $cls->{version}) {
+                        $e{lastUpdated} = now_iso();
+                    }
+                    \%e;
+                } @{ $existing_plugins->{$key} };
+                $plugins_out{$key} = \@refreshed;
+                push @copy_plan, { key => $key, src => normalize_path($cls->{src_dir}),
+                    dest_rel => "cache/$cls->{mkt}/$cls->{name}/$cls->{version}", origin => 'marketplace-refresh' };
+                next;
             }
+            if ($cls->{remote}) {
+                warn "Warning: sandbox-only plugin $key has a remote source in marketplace $mkt_name, "
+                    . "which also serves host-installed plugins; left at its installed version.\n";
+            }
+        }
+
+        # Not resolvable (or a host install exists but can't be refreshed, e.g.
+        # non-ARRAY record) -> verbatim, with the generalized retain rule.
+        $plugins_out{$key} = $existing_plugins->{$key};
+        if (exists $prior_refresh{$key}) {
+            # Host (or the marketplace) no longer supplies a previously
+            # refreshed key (spec Behaviour 9 / AC5/AC7): keep the cache dir
+            # alive with a retain entry carrying no src, so
+            # reconcile_copy_plan doesn't prune it.
+            push @copy_plan, { key => $key, dest_rel => $prior_refresh{$key}{dest_rel},
+                origin => $retain_origin_for->($prior_refresh{$key}{origin}) };
         }
     }
 
@@ -2315,6 +2684,23 @@ sub cmd_materialize_plugins {
         rename $mtmp, $manifest_file or do {
             unlink $mtmp;
             die "rename $mtmp -> $manifest_file: $!\n";
+        };
+
+        # tooling-fixes package 15 (spec 2.10): hand the auto-update-eligible
+        # marketplace set to materialize-known-marketplaces via a sidecar next
+        # to the manifest. Written on every run that has a manifest, even when
+        # empty, atomically, with the same die convention as the manifest.
+        my $sidecar_file = dirname($manifest_file) . '/.sandbox-autoupdate-marketplaces.json';
+        my @eligible_sorted = sort keys %autoupdate_eligible;
+        my $sdir = dirname($sidecar_file);
+        make_path($sdir) unless -d $sdir;
+        my $stmp = "$sidecar_file.tmp.$$";
+        open my $sfh, '>:raw', $stmp or die "write $stmp: $!\n";
+        print $sfh JSON::PP->new->canonical(1)->pretty->utf8->encode(\@eligible_sorted);
+        close $sfh or die "close $stmp: $!\n";
+        rename $stmp, $sidecar_file or do {
+            unlink $stmp;
+            die "rename $stmp -> $sidecar_file: $!\n";
         };
     }
     return 0;
@@ -2372,6 +2758,23 @@ sub cmd_materialize_known_marketplaces {
     my $host_plugins_dir = dirname($host_file);
     my @mkt_copy_plan;   # [{name, src(host marketplaces/<name>), dest_rel}]
 
+    # tooling-fixes package 15 (spec 2.10-2.11): the eligible-marketplace set
+    # mechanism B computed this same launch in cmd_materialize_plugins, handed
+    # over via a sidecar next to the plugin manifest. Missing, unparseable, or
+    # not an array -> empty set; never dies on it.
+    my %eligible_from_sidecar;
+    if (defined(my $manifest_opt = $opts{manifest})) {
+        my $sidecar_file = dirname($manifest_opt) . '/.sandbox-autoupdate-marketplaces.json';
+        if (-f $sidecar_file) {
+            my $data = read_json($sidecar_file);
+            if (ref $data eq 'ARRAY') {
+                for my $n (@$data) {
+                    $eligible_from_sidecar{$n} = 1 if defined $n && !ref($n);
+                }
+            }
+        }
+    }
+
     my %out;
     for my $name (sort keys %$host) {
         my $entry = $host->{$name};
@@ -2406,10 +2809,19 @@ sub cmd_materialize_known_marketplaces {
         $rewritten{installLocation} = $container_install;
         $out{$name} = \%rewritten;
 
-        # Copy-plan: launcher copies this marketplace's metadata into claude-home.
-        my $mkt_src = "$host_plugins_dir/marketplaces/$name";
-        push @mkt_copy_plan, { name => $name, src => $mkt_src, dest_rel => "marketplaces/$name" }
-            if -d $mkt_src;
+        # Copy-plan: launcher copies this marketplace's metadata into
+        # claude-home. tooling-fixes package 15 (spec 2.11, catalog-dir
+        # ownership): once an auto-update-eligible marketplace's container
+        # catalog dir exists, the container (Claude Code's own updater) owns
+        # it -- stop re-copying from the host so it isn't reset every launch.
+        my $container_mkt_dir = dirname($output) . "/marketplaces/$name";
+        if ($eligible_from_sidecar{$name} && _dir_exists_fs($container_mkt_dir)) {
+            push @mkt_copy_plan, { name => $name, dest_rel => "marketplaces/$name" };
+        } else {
+            my $mkt_src = "$host_plugins_dir/marketplaces/$name";
+            push @mkt_copy_plan, { name => $name, src => $mkt_src, dest_rel => "marketplaces/$name" }
+                if -d $mkt_src;
+        }
     }
 
     # Tier-2 merge-preserve (Fix 2): known_marketplaces.json is a real RW file
@@ -2424,6 +2836,21 @@ sub cmd_materialize_known_marketplaces {
         next if exists $out{$name};     # host marketplace -> fresh rewrite wins
         next if exists $host->{$name};  # host marketplace (defensive; already in %out)
         $out{$name} = $existing->{$name};  # sandbox-added marketplace -> preserve
+    }
+
+    # tooling-fixes package 15 (spec 2.11, Decision 46): an explicit JSON
+    # boolean autoUpdate on every HASH entry, every launch -- true only for a
+    # non-directory marketplace in this run's eligible set, false otherwise.
+    # This overwrites any autoUpdate the host entry or the prior container
+    # entry carried, and is the only Fge input the container settings.json
+    # leaves unoverridden (spec 1.6-1.7). A non-HASH preserved entry is left
+    # untouched (can't carry the key safely).
+    for my $name (keys %out) {
+        next unless ref $out{$name} eq 'HASH';
+        my $src = $out{$name}{source};
+        my $src_type = (ref $src eq 'HASH') ? ($src->{source} // '') : '';
+        my $is_eligible = $eligible_from_sidecar{$name} && $src_type ne 'directory';
+        $out{$name}{autoUpdate} = $is_eligible ? JSON::PP::true : JSON::PP::false;
     }
 
     my $dir = dirname($output);
