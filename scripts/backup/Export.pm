@@ -111,6 +111,7 @@ use File::Basename qw(dirname);
 use File::Temp ();
 use Cwd qw(abs_path);
 use Encode ();
+use B ();
 
 # ===========================================================================
 # phase_spec / run_phase -- the contract package 01 (Run.pm) requires.
@@ -653,6 +654,7 @@ sub _do_container_diff {
     }
     $fd_json = _sanitize_utf8($fd_json);
 
+    $fd_json->{followed_global} = _container_follow_candidates($ctx, $fd_json, $prefs_path);
     $ctx->{checkpoint}->('container_diff', $fd_json);
     my @auto = @{ $fd_json->{auto_applied} // [] };
     $ctx->{note}->('container_auto_applied', \@auto) if @auto;
@@ -674,7 +676,8 @@ sub _do_container_outcome {
 
     my $diff = $ctx->{get_item}->('container_diff');
     my @decisions = (ref($diff) eq 'HASH') ? _container_decisions($ctx, $diff) : ();
-    return {} unless @decisions;
+    my @followed  = (ref($diff) eq 'HASH') ? _container_followed_list($diff)   : ();
+    return {} unless @decisions || @followed;
 
     my $container_path = "$root/plugins/sandbox/container/settings.json";
     my $prefs_path      = "$root/.backup-preferences.json";
@@ -708,13 +711,12 @@ sub _do_container_outcome {
         }
 
         if ($rel eq 'diverged' && $choice eq 'propagate_to_container') {
-            my $v = $d->{data}{value};
-            $writes{$key} = (ref($v) eq 'HASH') ? $v->{left} : $v;
+            $writes{$key} = _container_write_value($rel, $d->{data}{value});
             $need_write = 1;
             push @applied, $key;
         }
         elsif ($rel eq 'only_left' && $choice eq 'add_to_container') {
-            $writes{$key} = $d->{data}{value};
+            $writes{$key} = _container_write_value($rel, $d->{data}{value});
             $need_write = 1;
             push @applied, $key;
         }
@@ -725,10 +727,20 @@ sub _do_container_outcome {
         }
     }
 
+    my @followed_out;
+    for my $f (@followed) {
+        my $v = $diff->{needs_decision}{ $f->{relation} }{ $f->{key} };
+        $writes{ $f->{key} } = _container_write_value($f->{relation}, $v);
+        $need_write = 1;
+        push @followed_out, { key => $f->{key}, relation => $f->{relation}, answer => $f->{answer} };
+    }
+
+    my $write_ok = 1;
     if ($need_write) {
         my ($data, $read_err) = _read_or_init_json_file($container_path);
         if (defined $read_err) {
             push @failed_msgs, "container_outcome: $read_err";
+            $write_ok = 0;
         }
         else {
             # $writes{$_} came off a checkpointed decision, already
@@ -739,16 +751,31 @@ sub _do_container_outcome {
             # multi-byte character here would be double-encoded. Re-widen
             # right before the write; _read_or_init_json_file's own
             # decode_json (which widens) already makes the REST of $data
-            # consistent with this.
-            _assign_nested($data, $_, _widen_utf8($writes{$_})) for keys %writes;
-            _delete_nested($data, $_) for keys %deletes;
+            # consistent with this. The KEY must be widened too (MEDIUM-2 /
+            # S1): a non-ASCII key off a checkpoint is raw UTF-8 bytes same
+            # as the value, and _assign_nested/_delete_nested use it as a
+            # literal hash key -- an unwidened key reaches _write_json_file's
+            # ->utf8 encoder and gets double-encoded, same defect class as
+            # the value one, matching Closeout.pm's own key-widening fix.
+            _assign_nested($data, _widen_utf8($_), _widen_utf8($writes{$_})) for keys %writes;
+            _delete_nested($data, _widen_utf8($_)) for keys %deletes;
             my $ok = eval { _write_json_file($container_path, $data); 1 };
-            push @failed_msgs, "container_outcome: cannot write $container_path: $@" unless $ok;
+            unless ($ok) {
+                push @failed_msgs, "container_outcome: cannot write $container_path: $@";
+                $write_ok = 0;
+            }
         }
     }
 
+    # LOW-1 (red-team): a followed key is only reported/checkpointed as
+    # followed if the write actually landed -- otherwise the note would
+    # claim success on a write that failed.
+    @followed_out = () unless $write_ok;
+
+    $ctx->{note}->('container_followed_global', \@followed_out) if @followed_out;
     $ctx->{checkpoint}->('container_outcome', { applied => \@applied, removed => \@removed,
-                                                  preferences_saved => \@prefs_saved });
+                                                  preferences_saved => \@prefs_saved,
+                                                  followed_global => \@followed_out });
     $ctx->{note}->('container_preferences_saved', \@prefs_saved) if @prefs_saved;
 
     my $ret = {};
@@ -756,19 +783,108 @@ sub _do_container_outcome {
     return $ret;
 }
 
+# Determines which container needs_decision items "follow" this run's
+# preflight settings_outcome answer instead of becoming a decision. Called
+# ONLY by _do_container_diff -- never by _do_container_outcome, which must
+# rebuild the followed set from the checkpoint alone.
+#
+# HIGH-1 (red-team): a key with ANY saved global_vs_container preference
+# entry -- regardless of whether its stored category still matches the
+# current diff -- must never be followed. Once global-config gains a key
+# that was previously container-only (e.g. a keep_container_only_remember
+# preference), the preference's category ("only_right") no longer matches
+# the new relation ("diverged"), so filter-diff.pl's own category check
+# leaves it in needs_decision. Following it anyway would silently overwrite
+# a value the operator explicitly asked to keep. Skipping it here lets it
+# fall through to the normal container_settings_key decision path instead,
+# where the operator is asked again.
+sub _container_follow_candidates {
+    my ($ctx, $fd_json, $prefs_path) = @_;
+    my $so = exists $ctx->{get_phase_item}
+           ? $ctx->{get_phase_item}->('preflight', 'settings_outcome') : undef;
+    my $answers = (ref($so) eq 'HASH' && ref($so->{answers}) eq 'HASH') ? $so->{answers} : {};
+    my $prefs = _container_preference_keys($prefs_path);
+    my $nd = ref($fd_json->{needs_decision}) eq 'HASH' ? $fd_json->{needs_decision} : {};
+    my @out;
+    for my $rel (qw(diverged only_left)) {
+        my $group = $nd->{$rel};
+        next unless ref($group) eq 'HASH';
+        for my $k (sort keys %$group) {
+            my $ans = $answers->{$k};
+            next unless defined $ans && !ref($ans) && ($ans eq 'use_live' || $ans eq 'export_to_repo');
+            next if $prefs->{$k};
+            push @out, { key => $k, relation => $rel, answer => $ans };
+        }
+    }
+    return \@out;
+}
+
+# Reads .backup-preferences.json's global_vs_container scope directly (the
+# same file filter-diff.pl consults) and returns a {key => 1} set of every
+# key that has ANY saved preference entry there, independent of category.
+# Used only by _container_follow_candidates (HIGH-1) -- filter-diff.pl's own
+# category-matched check still governs auto_applied/needs_decision.
+sub _container_preference_keys {
+    my ($prefs_path) = @_;
+    return {} unless defined $prefs_path && -f $prefs_path;
+    my $raw = eval {
+        open my $fh, '<', $prefs_path or die "open failed: $!";
+        local $/;
+        <$fh>;
+    };
+    return {} unless defined $raw;
+    my $json = eval { decode_json($raw) };
+    return {} unless ref($json) eq 'HASH';
+    my $scope = $json->{global_vs_container};
+    return {} unless ref($scope) eq 'HASH';
+    return { map { $_ => 1 } keys %$scope };
+}
+
 # ===========================================================================
 # Container decision builders -- pure functions of the checkpointed diff
 # data, so U6 can regenerate the SAME ids deterministically without
 # re-running json-diff.pl/filter-diff.pl.
 # ===========================================================================
+sub _container_write_value {
+    my ($rel, $v) = @_;
+    return (ref($v) eq 'HASH') ? $v->{left} : $v if $rel eq 'diverged';
+    return $v;
+}
+
+# Pure function of a container_diff checkpoint hash: validated
+# followed_global entries, in stored order. Single source of truth used by
+# both the decision-exclusion (_container_items_ordered) and the write
+# application (_do_container_outcome), so an item is always either
+# excluded-and-applied or included-and-asked -- never both, never neither.
+sub _container_followed_list {
+    my ($diff) = @_;
+    return () unless ref($diff) eq 'HASH';
+    my $list = $diff->{followed_global};
+    return () unless ref($list) eq 'ARRAY';
+    my $nd = ref($diff->{needs_decision}) eq 'HASH' ? $diff->{needs_decision} : {};
+    my @out;
+    for my $e (@$list) {
+        next unless ref($e) eq 'HASH';
+        my ($key, $rel, $answer) = @{$e}{qw(key relation answer)};
+        next unless defined $key && !ref($key) && length $key;
+        next unless defined $rel && ($rel eq 'diverged' || $rel eq 'only_left');
+        next unless defined $answer && ($answer eq 'use_live' || $answer eq 'export_to_repo');
+        next unless ref($nd->{$rel}) eq 'HASH' && exists $nd->{$rel}{$key};
+        push @out, { key => $key, relation => $rel, answer => $answer };
+    }
+    return @out;
+}
+
 sub _container_items_ordered {
     my ($diff) = @_;
     my $nd = (ref($diff) eq 'HASH' && ref($diff->{needs_decision}) eq 'HASH') ? $diff->{needs_decision} : {};
+    my %followed = map { ("$_->{relation}\0$_->{key}" => 1) } _container_followed_list($diff);
     my @items;
     for my $rel (qw(diverged only_left only_right)) {
         my $group = $nd->{$rel};
         next unless ref($group) eq 'HASH';
         for my $k (sort keys %$group) {
+            next if $followed{"$rel\0$k"};
             push @items, { key => $k, relation => $rel, value => $group->{$k} };
         }
     }
@@ -1417,9 +1533,20 @@ sub _widen_utf8 {
     # correct. Recurse into HASH/ARRAY exactly like _sanitize_utf8 does, so
     # every leaf string is re-widened regardless of nesting depth.
     my $ref = ref($s);
-    if ($ref eq 'HASH')  { return { map { $_ => _widen_utf8($s->{$_}) } keys %$s }; }
+    # MEDIUM-2 (red-team) / S1 (review): widen KEYS too, matching
+    # Closeout.pm:987's identical fix. A key reached through a checkpoint is
+    # raw UTF-8 bytes same as any value; skipping the widen on it double-
+    # encodes it when _write_json_file's ->utf8 encoder runs.
+    if ($ref eq 'HASH')  { return { map { _widen_utf8($_) => _widen_utf8($s->{$_}) } keys %$s }; }
     if ($ref eq 'ARRAY') { return [ map { _widen_utf8($_) } @$s ]; }
     return $s if $ref;   # JSON::PP::Boolean or any other blessed ref
+    # A genuine JSON number must never be retyped as a string here (same
+    # defect/fix as Closeout.pm's _widen_utf8): the Encode::decode() dance
+    # below always returns a PV, discarding the IV/NV, so a followed/applied
+    # object value carrying a real number (e.g. AC2's modelSettings => {a=>1})
+    # would otherwise come back quoted. _json_number distinguishes a genuine
+    # number (IOK/NOK, no POK) from a numeric-looking string (POK).
+    return $s + 0 if _json_number($s);
     # JSON::PP->new->decode() (NO ->utf8 -- Run.pm's own read, which is
     # what get_item()/get_phase_item() ultimately return through) sets the
     # utf8 flag on EVERY decoded string regardless, WITHOUT transcoding --
@@ -1437,6 +1564,11 @@ sub _widen_utf8 {
     my $probe = $s;
     my $widened = eval { Encode::decode('UTF-8', $probe, Encode::FB_CROAK()) };
     return defined $widened ? $widened : $s;
+}
+
+sub _json_number {
+    my $f = B::svref_2object(\$_[0])->FLAGS;
+    return (($f & (B::SVf_IOK | B::SVf_NOK)) && !($f & B::SVf_POK)) ? 1 : 0;
 }
 
 sub _run_capture {
