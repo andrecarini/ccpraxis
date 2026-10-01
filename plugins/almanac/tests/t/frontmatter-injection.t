@@ -33,13 +33,73 @@ use JSON::PP;
 my $A = "$S/almanac-bug.pl";
 ok(-f $A, 'almanac-bug.pl exists') or BAIL_OUT('script missing');
 
+(my $BUTLER_SCRIPTS = "$Bin/../../../butler/scripts") =~ s{\\}{/}g;
+my $BPHOOK_PM = "$BUTLER_SCRIPTS/BpHook.pm";
+ok(-f $BPHOOK_PM, 'BpHook.pm exists (needed to mint test tickets)') or BAIL_OUT('BpHook.pm missing');
+require $BPHOOK_PM;
+
 my $HOME = tempdir(CLEANUP => 1);
+my $CFG  = tempdir(CLEANUP => 1);   # CLAUDE_CONFIG_DIR
+my $BSD  = tempdir(CLEANUP => 1);   # BUTLER_STATE_DIR
+for ($HOME, $CFG, $BSD) { s{\\}{/}g }
 
 sub run {
     my (@args) = @_;
-    my $cmd = qq{ALMANAC_HOME="$HOME" perl "$A" } . join(' ', @args) . ' 2>&1';
+    my $cmd = qq{ALMANAC_HOME="$HOME" HOME="$HOME" USERPROFILE="$HOME" }
+            . qq{CLAUDE_CONFIG_DIR="$CFG" BUTLER_STATE_DIR="$BSD" perl "$A" }
+            . join(' ', @args) . ' 2>&1';
     my $out = `$cmd`;
     return ($? >> 8, $out // '');
+}
+
+# ---------------------------------------------------------------------------
+# Ticket minting (12-bug-claimant-and-triaging, spec sec 5.4): moving a
+# report into `triaging` now records the caller's identity from a butler
+# hook ticket, keyed on sha1(name, argv). Used only where a transition must
+# actually SUCCEED -- a refusal path that fires before the identity gate
+# (a duplicate-key report, a multiline/untrimmed flag) needs none.
+# ---------------------------------------------------------------------------
+my $TICKET_SEQ = 0;
+sub ensure_transcript {
+    my ($sid) = @_;
+    require File::Path;
+    my $dir = "$CFG/projects/p";
+    File::Path::make_path($dir) unless -d $dir;
+    my $path = "$dir/$sid.jsonl";
+    unless (-f $path) {
+        open my $fh, '>', $path or die "fixture: cannot write transcript $path: $!";
+        print {$fh} "{}\n";
+        close $fh;
+    }
+    return $path;
+}
+sub mint_ticket {
+    my ($session, $agent, @argv) = @_;
+    my $transcript = ensure_transcript($session);
+    local $ENV{BUTLER_STATE_DIR} = $BSD;
+    my $ok = BpHook::write_ticket(
+        { session_id => $session, tool_use_id => 'T' . (++$TICKET_SEQ),
+          (defined $agent ? (agent_id => $agent) : ()),
+          transcript_path => $transcript, cwd => undef },
+        'almanac-bug', [ @argv ]);
+    die "fixture: could not write ticket for (@argv)\n" unless $ok;
+    return;
+}
+# This file's args are shell-quoted strings (e.g. '"fixed in abc123"') so
+# values with spaces survive the backtick shell; the almanac-bug.pl
+# subprocess receives them with that outer pair of double quotes already
+# stripped by the shell. A ticket's argv must equal the subprocess's real
+# @ARGV, so strip the same quoting before minting.
+sub _unquote_argv {
+    return map { my $v = $_; $v =~ s/^"(.*)"$/$1/s; $v } @_;
+}
+# run_as($session, $agent_or_undef, @args) -- mints a ticket for EXACTLY
+# @args (after this file's shell-quoting is undone), then spawns
+# almanac-bug.pl with that same argv.
+sub run_as {
+    my ($session, $agent, @args) = @_;
+    mint_ticket($session, $agent, _unquote_argv(@args));
+    return run(@args);
 }
 
 # Read the raw file bytes -- no field_of, no _parse-mimicking helper. Used only
@@ -146,15 +206,16 @@ my $ee3c_payload = "low\nstatus: resolved\ninjected: yes";
     my ($id) = $path =~ m{/([^/]+)\.md$};
     my $before = slurp($path);
 
-    my ($rc, $out) = run('set-status', $id, '--project', $SCRATCH, '--to', 'reviewing',
+    my ($rc, $out) = run('set-status', $id, '--project', $SCRATCH, '--to', 'triaging',
                           '--note', qq{"fixed.\nstatus: resolved"});
     isnt($rc, 0, 'AC5a: set-status --note with embedded newline is REJECTED');
     like($out, qr/must be one line/, 'AC5a: stderr names the one-line rule');
     is(slurp($path), $before, 'AC5a: report file bytes are UNCHANGED, and status did not transition');
 
-    # Legitimate: single-line note, real transitions to reach a MUTABLE-note state.
-    my ($rc_ok) = run('set-status', $id, '--project', $SCRATCH, '--to', 'reviewing',
-                       '--note', '"fixed in abc123"');
+    # Legitimate: single-line note, real transition to reach a MUTABLE-note
+    # state. This one must actually SUCCEED, so it needs a real ticket.
+    my ($rc_ok) = run_as('S1', undef, 'set-status', $id, '--project', $SCRATCH, '--to', 'triaging',
+                          '--note', '"fixed in abc123"');
     is($rc_ok, 0, 'AC5b: a legitimate single-line --note is accepted');
     is(raw_field($path, 'resolution'), 'fixed in abc123', 'AC5b: the resolution note is recorded verbatim');
 }
@@ -317,7 +378,7 @@ EOF
     is(slurp($dup_path), $before, 'AC12c: the malformed file is left byte-for-byte unchanged');
 
     # set-status also refuses it (spec §2.5, same shape as update).
-    my ($rc_s, $out_s) = run('set-status', $dup_id, '--project', $SCRATCH, '--to', 'reviewing');
+    my ($rc_s, $out_s) = run('set-status', $dup_id, '--project', $SCRATCH, '--to', 'triaging');
     isnt($rc_s, 0, 'AC12c (set-status): set-status REFUSES to operate on a duplicate-key report');
     like($out_s, qr/MALFORMED: duplicate frontmatter key/,
          'AC12c (set-status): the refusal names the locked MALFORMED fragment');
@@ -358,7 +419,7 @@ EOF
                           '--body', '"original untampered body"');
     chomp(my $path = $o);
     my ($id) = $path =~ m{/([^/]+)\.md$};
-    run('set-status', $id, '--project', $SCRATCH, '--to', 'reviewing');
+    run_as('S1', undef, 'set-status', $id, '--project', $SCRATCH, '--to', 'triaging');
 
     my ($rc_clean) = run('verify', '--project', $SCRATCH);
     is($rc_clean, 0, 'AC14: verify is clean before any tampering');
@@ -561,7 +622,7 @@ for my $case (
         my ($id) = $p =~ m{/([^/]+)\.md$};
       SKIP: {
             skip "AC19: no id for $name", 1 unless defined $id;
-            my ($rc2, $out2) = run('set-status', $id, '--project', $SCRATCH, '--to', 'reviewing');
+            my ($rc2, $out2) = run_as('S1', undef, 'set-status', $id, '--project', $SCRATCH, '--to', 'triaging');
             is($rc2, 0, "AC19: ...and set-status can still re-render it ($name)") or diag $out2;
         }
     }

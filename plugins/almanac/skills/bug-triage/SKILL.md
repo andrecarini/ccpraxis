@@ -1,6 +1,6 @@
 ---
 name: bug-triage
-description: Collect and triage ccpraxis bug reports filed from every project on this machine, and move them through reviewing → taken → resolved/declined. Use when working ON ccpraxis and the user asks what bugs have been reported, wants to review the queue, or says "collect the bug reports", "what's been filed", "triage the bugs". Host-side, ccpraxis-repo work. Skip for filing a new report, which is /almanac:bug-report.
+description: Collect and triage ccpraxis bug reports filed from every project on this machine, and move them through triaging → taken → resolved/declined. Use when working ON ccpraxis and the user asks what bugs have been reported, wants to review the queue, or says "collect the bug reports", "what's been filed", "triage the bugs". Host-side, ccpraxis-repo work. Skip for filing a new report, which is /almanac:bug-report.
 allowed-tools: Bash, Read, Grep, Glob, Edit, Write
 ---
 
@@ -26,24 +26,32 @@ still match their digests, by re-reading each file from disk rather than trustin
 ## The states
 
 ```
-open  ->  reviewing  ->  taken  ->  resolved | declined
+open  ->  triaging  ->  taken  ->  resolved | declined
              |
              +-------->  open        (hand it back: "not ready, keep editing")
 ```
 
 ```bash
-perl "${CLAUDE_PLUGIN_ROOT}/scripts/almanac.pl" bug set-status <id> --to reviewing
+perl "${CLAUDE_PLUGIN_ROOT}/scripts/almanac.pl" bug set-status <id> --to triaging
 perl "${CLAUDE_PLUGIN_ROOT}/scripts/almanac.pl" bug set-status <id> --to taken
 perl "${CLAUDE_PLUGIN_ROOT}/scripts/almanac.pl" bug set-status <id> --to resolved --note "fixed in <sha>"
 perl "${CLAUDE_PLUGIN_ROOT}/scripts/almanac.pl" bug set-status <id> --to declined --note "<why>"
+perl "${CLAUDE_PLUGIN_ROOT}/scripts/almanac.pl" bug takeover <id>
 ```
 
 Leaving `open` **freezes the body** and records its digest. From then on the filer cannot revise it
 — deliberately. Send it back to `open` if it genuinely needs more from them.
 
+Moving a report to `triaging` **claims it for your session** (and your agent id, if you are a
+subagent) — the identity comes from butler's own hook ticket, never from a flag, so the command
+must be written literally (no `$variables`) in a session with the butler plugin enabled. From then
+on **only you can move it on or back to `open`**; anyone else is refused and told who holds it.
+`list`/`collect` flag a claim as stale when its session has no transcript on this machine, or when
+it is older than 24h — `bug takeover <id>` recovers a stale claim for your own session.
+
 ## Triaging well
 
-**Move it to `reviewing` before you start reading**, not after. The freeze exists so the text cannot
+**Move it to `triaging` before you start reading**, not after. The freeze exists so the text cannot
 change while you assess it; claiming it afterwards defeats the point.
 
 **Verify the claim from disk before believing it.** Reports are written by agents mid-run, under

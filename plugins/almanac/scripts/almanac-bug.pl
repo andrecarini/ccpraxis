@@ -9,12 +9,22 @@
 # THE SHAPE. One file per report, written ONLY through this script, in a small
 # state machine that freezes a report once ccpraxis has picked it up:
 #
-#   open  ->  reviewing  ->  taken  ->  resolved | declined
+#   open  ->  triaging  ->  taken  ->  resolved | declined
 #
 # `open` is the reporter's: they may keep editing while nobody has looked. From
-# `reviewing` onward the content is FROZEN — the filer cannot rewrite history
-# under a reviewer who is mid-read, and a `taken` report cannot be quietly
+# `triaging` onward the content is FROZEN — the filer cannot rewrite history
+# under a triager who is mid-read, and a `taken` report cannot be quietly
 # reworded after the fact.
+#
+# RENAME (package 12, 12-bug-claimant-and-triaging, Decision 31): the state
+# formerly called `reviewing` is now `triaging`, and moving a report into it is
+# a CLAIM — the claiming session's identity is recorded, read from a butler
+# hook ticket (BpHook::take_ticket), never from a CLI argument. Only the
+# claimant can move the report on or back to `open`; a claim with no
+# transcript or older than 24h is stale and reported by list/collect/doctor,
+# and recoverable with the `takeover` verb. A report whose on-disk status is
+# still the old name `reviewing` is read, on every load, as a claimless
+# `triaging` — never rewritten by a mere read; see AlmanacBug::load.
 #
 # THREE LAYERS OF IMMUTABILITY, because two are bypassable:
 #   1. this script refuses a content change once frozen;
@@ -62,7 +72,7 @@ use Almanac::Lock ();
 # retry deadline is named as that.
 our $LAST_ERROR = '';
 
-our @STATES = qw(open reviewing taken resolved declined);
+our @STATES = qw(open triaging taken resolved declined);
 
 # Closed vocabulary for `severity`. `unknown` is IN it — it is the script's own
 # default (see `file`'s `$o{severity} // 'unknown'`), and an enum that rejected
@@ -70,14 +80,19 @@ our @STATES = qw(open reviewing taken resolved declined);
 our @SEVERITIES = qw(low medium high blocker unknown);
 sub valid_severity { my ($s) = @_; return scalar grep { $_ eq $s } @SEVERITIES }
 our %NEXT = (
-    open      => [qw(reviewing declined)],
-    reviewing => [qw(taken open declined)],   # back to open = "not ready, keep editing"
-    taken     => [qw(resolved declined)],
-    resolved  => [],
-    declined  => [],
+    open     => [qw(triaging declined)],
+    triaging => [qw(taken open declined)],   # back to open = "not ready, keep editing"
+    taken    => [qw(resolved declined)],
+    resolved => [],
+    declined => [],
 );
 # Content is editable ONLY in these states.
 our %MUTABLE = (open => 1);
+# On-disk legacy name -> current name. Applied ONLY on read (AlmanacBug::load);
+# the bytes on disk are never batch-rewritten (spec sec 2.2).
+our %LEGACY_STATUS = (reviewing => 'triaging');
+# A triaging claim older than this (seconds) is stale (spec sec 2.6). 24h.
+our $CLAIM_STALE_SECONDS = 86400;
 
 sub _now { time }
 sub _iso { my @t = gmtime($_[0] // time);
@@ -222,7 +237,9 @@ sub _parse {
 sub _render {
     my ($f, $body) = @_;
     my @order = qw(id title status severity area project created_at updated_at
-                   frozen_at content_sha256 taken_at resolution);
+                   frozen_at content_sha256 claimant_session claimant_agent
+                   claimant_transcript_path claimed_at
+                   taken_over_from taken_over_at taken_over_reason taken_at resolution);
     my %seen;
     my @lines;
     # Structural backstop: no field value may carry \r or \n, regardless of
@@ -300,7 +317,118 @@ sub load {
     my $p = _parse($raw) or return undef;
     $p->{path} = $path;
     $p->{raw}  = $raw;
+    # MIGRATION ON READ, ONLY (spec sec 2.2): a report still saying the legacy
+    # status name is read as the current name everywhere, and $p->{raw} is NOT
+    # touched -- cas_write still compares the real on-disk bytes.
+    my $st = $p->{fields}{status};
+    if (defined $st && exists $LEGACY_STATUS{$st}) {
+        $p->{legacy_status}  = $st;
+        $p->{fields}{status} = $LEGACY_STATUS{$st};
+    }
     return $p;
+}
+
+# _transcript_visibility($path) -> ($root_visible, $file_exists)
+#
+# FIX (S2 / red-team M1, package 12 fix-batch): a recorded transcript_path is
+# an ABSOLUTE path captured by whichever process held the claim at claim time
+# (host or sandbox). Checking it from a DIFFERENT process (a sandbox checking
+# a host claim, or vice versa -- plugins/sandbox/scripts/launcher.pl's mount
+# scope never gives a container the host's transcripts, and never the
+# reverse) must not read "I cannot see it" as "it is gone": that is exactly
+# what made a live host claim read STALE from inside a sandbox, and `takeover`
+# then succeeded wrongly, stealing an active claim.
+#
+# The distinguishing signal is the transcript's ROOT directory (the
+# "<...>/projects" directory the session file sits two levels under -- see
+# BpSession::transcript_roots). A DIFFERENT mount scope means that whole root
+# does not exist from here at all. A genuinely deleted transcript, checked
+# from the SAME scope that wrote it, still has its root -- only the specific
+# file is gone. So: root missing -> indeterminate (caller falls back to the
+# age-only rule); root present but file missing -> genuinely stale.
+sub _transcript_visibility {
+    my ($path) = @_;
+    return (0, 0) unless defined $path && length $path;
+    (my $p = $path) =~ s{\\}{/}g;
+    (my $root = $p) =~ s{/[^/]+/[^/]+\z}{};
+    my $root_visible = length($root) && -d $root;
+    my $file_exists  = -f $path;
+    return ($root_visible, $file_exists);
+}
+
+# claim_state($fields, $now) -> undef | { stale => 0|1, reason => $str_or_undef }
+#
+# undef when the (already-migrated) status is not 'triaging'. Lives here, not
+# in almanac-doctor.pl, so doctor stays within its AC21 static constraints
+# (spec sec 2.6/2.9). Dies if BpSession.pm cannot be loaded for a LEGACY claim
+# (one recorded before claimant_transcript_path existed) -- there is no
+# age-only fallback for that case (spec sec 1.2): a claim's liveness is never
+# guessed by a process that has no way to check it at all. A claim that DOES
+# carry claimant_transcript_path never takes this path -- see
+# _transcript_visibility above for why an invisible root is not the same
+# finding as an absent file.
+sub claim_state {
+    my ($f, $now) = @_;
+    return undef unless defined $f->{status} && $f->{status} eq 'triaging';
+
+    my $csess = $f->{claimant_session};
+    if (!defined $csess || !length $csess) {
+        return { stale => 1, reason => 'no claimant recorded' };
+    }
+
+    my $tpath = $f->{claimant_transcript_path};
+    if (defined $tpath && length $tpath) {
+        my ($root_visible, $file_exists) = _transcript_visibility($tpath);
+        if ($root_visible && !$file_exists) {
+            return { stale => 1, reason => "claimant session $csess has no transcript on this machine" };
+        }
+        # Root not visible from here -> indeterminate: fall through to the
+        # age-only rule below without consulting BpSession at all. Root
+        # visible and file present -> live by transcript; also fall through,
+        # so the age rule still applies on top (a transcript can be present
+        # and still 25h old).
+    }
+    else {
+        my $bpsession_path = _butler_module_path('BpSession.pm');
+        unless (defined $bpsession_path && -f $bpsession_path) {
+            die "cannot load butler's BpSession.pm ($bpsession_path): file not found\n";
+        }
+        unless (grep { m{(?:^|/)BpSession\.pm$} } keys %INC) {
+            my $ok = eval { require $bpsession_path; 1 };
+            die "cannot load butler's BpSession.pm ($bpsession_path): $@" unless $ok;
+        }
+        my $transcript = eval { BpSession::find_transcript($csess) };
+        if (!defined $transcript) {
+            return { stale => 1, reason => "claimant session $csess has no transcript on this machine" };
+        }
+    }
+
+    my $claimed_at = $f->{claimed_at};
+    my $claimed_epoch;
+    if (defined $claimed_at && $claimed_at =~ /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})Z$/) {
+        $claimed_epoch = eval { require Time::Local; Time::Local::timegm($6, $5, $4, $3, $2 - 1, $1) };
+    }
+    unless (defined $claimed_epoch) {
+        return { stale => 1, reason => 'claimed_at missing or unreadable' };
+    }
+
+    my $age = $now - $claimed_epoch;
+    if ($age > $CLAIM_STALE_SECONDS) {
+        return { stale => 1, reason => 'claim is ' . int($age / 3600) . 'h old (stale after 24h)' };
+    }
+    return { stale => 0 };
+}
+
+# _butler_module_path($basename) -> absolute path of a butler scripts module,
+# located from THIS FILE's own directory (spec sec 1.2), same technique the
+# BEGIN block above already uses for Almanac::Lock.
+sub _butler_module_path {
+    my ($basename) = @_;
+    my $dir = __FILE__;
+    $dir =~ s{\\}{/}g;
+    $dir =~ s{/[^/]+\z}{};
+    $dir = '.' unless length $dir;
+    return "$dir/../../butler/scripts/$basename";
 }
 
 # cas_write(): FIX 1 (fixbatch-step7, red-team HIGH) — a load-modify-write
@@ -673,6 +801,100 @@ sub _refuse_unlocked {
     exit 2;
 }
 
+# _caller_identity($verb, \@argv_raw) -> ($ok, $who_or_message)
+#
+#   $who = { session => $sid, agent => $aid_or_undef }
+#   On failure, $message is already the full phrase (no "almanac-bug <verb>: "
+#   prefix, no "refused — " prefix) -- the caller composes
+#   "almanac-bug $verb: refused — $message".
+#
+# The ONLY identity source (spec sec 2.3): a butler hook ticket, keyed on the
+# exact argv almanac-bug.pl was invoked with. No CLI flag and no environment
+# variable is ever consulted here, by design.
+sub _caller_identity {
+    my ($verb, $argv) = @_;
+    my $no_ticket_msg =
+        "no hook ticket for this exact command. A claim needs the caller's session identity, "
+      . "which only butler's PreToolUse hook supplies: run it from a Claude Code session with "
+      . "the butler plugin enabled, with the id and every argument written literally (no "
+      . "\$variables). Nothing was written.";
+
+    my $bphook_path = AlmanacBug::_butler_module_path('BpHook.pm');
+    unless (defined $bphook_path && -f $bphook_path) {
+        return (0, "cannot load butler's BpHook.pm ($bphook_path): file not found. Nothing was written.");
+    }
+    unless (grep { m{(?:^|/)BpHook\.pm$} } keys %INC) {
+        my $ok = eval { require $bphook_path; 1 };
+        unless ($ok) {
+            my $err = $@ || 'unknown error';
+            $err =~ s/\s+\z//;
+            return (0, "cannot load butler's BpHook.pm ($bphook_path): $err. Nothing was written.");
+        }
+    }
+
+    my $t = eval { BpHook::take_ticket('almanac-bug', $argv) };
+    return (0, $no_ticket_msg) unless defined $t;
+    return (0, "two sessions issued this exact command at once, so the caller cannot be "
+             . "identified. Retry. Nothing was written.")
+        if !ref($t) && $t eq 'ambiguous';
+    return (0, $no_ticket_msg) unless ref $t eq 'HASH';
+
+    my $sid = $t->{session_id};
+    return (0, $no_ticket_msg)
+        unless defined $sid && !ref($sid) && $sid =~ /^[A-Za-z0-9_-]{1,128}$/;
+
+    my $aid = $t->{agent_id};
+    my $agent;
+    if (!defined $aid || (!ref($aid) && $aid eq '')) {
+        $agent = undef;
+    }
+    elsif (!ref($aid) && $aid =~ /^[A-Za-z0-9_-]{1,64}$/) {
+        $agent = $aid;
+    }
+    else {
+        return (0, "the hook ticket carries an unrecognised agent id; this claim cannot be "
+                 . "recorded safely. Nothing was written.");
+    }
+
+    # transcript_path (S2 / red-team M1, package 12 fix-batch): recorded on
+    # the claim so a LATER check of its liveness can tell "this transcript is
+    # genuinely gone" apart from "this process cannot see that mount scope at
+    # all" -- see claim_state's and _transcript_visibility's headers. Not
+    # validated beyond "a defined, non-ref, non-empty string" -- it is never a
+    # CLI value, only ever what the hook ticket itself recorded (BpHook.pm's
+    # write_ticket, from the PreToolUse payload), and _render's structural
+    # backstop still refuses it if it somehow carried a forbidden byte.
+    my $tp = $t->{transcript_path};
+    my $transcript_path = (defined $tp && !ref($tp) && length $tp) ? $tp : undef;
+
+    return (1, { session => $sid, agent => $agent, transcript_path => $transcript_path });
+}
+
+# _is_claimant($claimant_session, $claimant_agent, $caller_session, $caller_agent) -> 1|0
+#
+# spec sec 2.5. A claimless report (no $claimant_session) is never matched --
+# the caller treats that as its own case (behavior 8), not as a mismatch.
+sub _is_claimant {
+    my ($cs, $ca, $ts, $ta) = @_;
+    return 0 unless defined $cs && length $cs;
+    return 0 unless defined $ts && $ts eq $cs;
+    return 1 unless defined $ta;                     # the session's own main thread
+    return 1 if defined $ca && $ta eq $ca;
+    return 0;
+}
+
+# _claimant_mismatch_message($verb, $id, $f) -- the 3.4 refusal text, for a
+# triaging report that DOES carry a claimant the caller is not.
+sub _claimant_mismatch_message {
+    my ($verb, $id, $f) = @_;
+    my $cs = $f->{claimant_session};
+    my $ca = $f->{claimant_agent};
+    my $agent_part = (defined $ca && length $ca) ? " (agent $ca)" : '';
+    return "almanac-bug $verb: refused — '$id' is triaging and claimed by session $cs$agent_part "
+         . "since $f->{claimed_at}; only the claimant may move it. If the claim is stale, "
+         . "'almanac-bug.pl takeover $id' takes it over.\n";
+}
+
 sub _slurp_arg {
     my (%o) = @_;
     return $o{body} eq '-' ? do { local $/; <STDIN> } : $o{body} if defined $o{body};
@@ -684,6 +906,11 @@ sub _slurp_arg {
 }
 
 unless (caller) {
+    # The exact argv almanac-bug.pl was invoked with, verb first -- captured
+    # BEFORE the first shift. A claim's identity comes from a butler hook
+    # ticket keyed on this exact argv (spec sec 2.3); nothing else may ever
+    # supply it.
+    my @ARGV_RAW = @ARGV;
     my $cmd = shift @ARGV // '';
     my %o;
     while (@ARGV) {
@@ -793,7 +1020,7 @@ unless (caller) {
         my $st   = $rep->{fields}{status} // 'open';
         unless ($AlmanacBug::MUTABLE{$st}) {
             print STDERR "almanac-bug update: refused — '$id' is $st, and content is frozen from "
-                       . "'reviewing' onward so a reviewer cannot have the report rewritten "
+                       . "'triaging' onward so a reviewer cannot have the report rewritten "
                        . "underneath them. Add a follow-up report instead.\n";
             $lock->release;
             exit 2;
@@ -888,7 +1115,7 @@ unless (caller) {
         my $st = $rep->{fields}{status} // 'open';
         unless ($AlmanacBug::MUTABLE{$st}) {
             print STDERR "almanac-bug append: refused — '$id' is $st, and content is frozen from "
-                       . "'reviewing' onward. Add a follow-up report instead.\n";
+                       . "'triaging' onward. Add a follow-up report instead.\n";
             $lock->release;
             exit 2;
         }
@@ -917,7 +1144,26 @@ unless (caller) {
     if ($cmd eq 'set-status') {
         my $id = $pos[0] or die "almanac-bug set-status: <id> required\n";
         my $to = $o{to} or die "almanac-bug set-status: --to <state> required\n";
+
+        # AC3 / behavior 10: the renamed state refuses the OLD name, with a
+        # hint, BEFORE anything else -- including before the identity check,
+        # so a stale SKILL.md's literal `--to reviewing` gets the rename hint
+        # rather than a ticket error.
+        if ($to eq 'reviewing') {
+            print STDERR "almanac-bug set-status: unknown target state 'reviewing' -- it was "
+                       . "renamed: use --to triaging\n";
+            exit 2;
+        }
+
         my $path = $find->($id) or die "almanac-bug set-status: no report '$id'\n";
+
+        # Identity (spec sec 2.3): minted right after $find resolves the path
+        # and BEFORE the lock, so the ±30s ticket cannot expire while the
+        # process queues on the lock. Called on EVERY set-status so the
+        # ticket is always consumed; its result is required only once $from
+        # or $to is known to be `triaging` (checked below, after load).
+        my ($id_ok, $id_who_or_msg) = _caller_identity('set-status', \@ARGV_RAW);
+
         # Before the load, for the same reason as `update` above.
         my ($lock, $lock_err) = Almanac::Lock->acquire($path, verb => 'set-status');
         _refuse_unlocked('set-status', $id, $lock_err) unless $lock;
@@ -929,6 +1175,31 @@ unless (caller) {
         _reject_multiline('set-status', 'note', $o{note}) if defined $o{note} && !ref $o{note};
         _reject_untrimmed('set-status', 'note', $o{note}) if defined $o{note} && !ref $o{note};
         my $from = $rep->{fields}{status} // 'open';
+
+        if ($from eq 'triaging' || $to eq 'triaging') {
+            unless ($id_ok) {
+                print STDERR "almanac-bug set-status: refused — $id_who_or_msg\n";
+                $lock->release;
+                exit 2;
+            }
+        }
+
+        if ($from eq 'triaging') {
+            my $f = $rep->{fields};
+            my $cs = $f->{claimant_session};
+            if (!defined $cs || !length $cs) {
+                print STDERR "almanac-bug set-status: refused — '$id' is triaging with no "
+                           . "claimant recorded (it predates claims); take it over first: "
+                           . "almanac-bug.pl takeover $id\n";
+                $lock->release;
+                exit 2;
+            }
+            unless (_is_claimant($cs, $f->{claimant_agent}, $id_who_or_msg->{session}, $id_who_or_msg->{agent})) {
+                print STDERR _claimant_mismatch_message('set-status', $id, $f);
+                $lock->release;
+                exit 2;
+            }
+        }
 
         # A REPORT CAN BE OUTSIDE THE MACHINE, AND THEN NOTHING COULD MOVE IT.
         #
@@ -977,6 +1248,31 @@ unless (caller) {
         }
         $f{taken_at}   = $now       if $to eq 'taken' && !defined $f{taken_at};
         $f{resolution} = $o{note}   if defined $o{note} && !ref $o{note};
+
+        # Claim fields (spec sec 2.4 step 4). $id_who_or_msg is a hashref here
+        # whenever $to eq 'triaging' -- the identity-required check above
+        # already enforced that.
+        if ($to eq 'triaging') {
+            $f{claimant_session} = $id_who_or_msg->{session};
+            if (defined $id_who_or_msg->{agent}) { $f{claimant_agent} = $id_who_or_msg->{agent} }
+            else                                 { delete $f{claimant_agent} }
+            if (defined $id_who_or_msg->{transcript_path}) { $f{claimant_transcript_path} = $id_who_or_msg->{transcript_path} }
+            else                                            { delete $f{claimant_transcript_path} }
+            $f{claimed_at} = $now;
+            delete $f{taken_over_from};
+            delete $f{taken_over_at};
+            delete $f{taken_over_reason};
+        }
+        elsif ($to eq 'open') {
+            delete $f{claimant_session};
+            delete $f{claimant_agent};
+            delete $f{claimant_transcript_path};
+            delete $f{claimed_at};
+            delete $f{taken_over_from};
+            delete $f{taken_over_at};
+            delete $f{taken_over_reason};
+        }
+        # taken/declined from triaging: claim fields are KEPT untouched.
         my ($cas_ok, $cas_why) = AlmanacBug::cas_write($rep, AlmanacBug::_render(\%f, $rep->{body}));
         unless ($cas_ok) {
             print STDERR "almanac-bug set-status: refused — '$id' $cas_why. "
@@ -987,6 +1283,104 @@ unless (caller) {
 
         $lock->release;
         print "$id: $from -> $to" . (($from_known ? '' : '  (repaired: previous status was outside the state machine)')) . "\n";
+        exit 0;
+    }
+
+    # takeover <id> (spec sec 2.7) -- recovers a STALE triaging claim: no
+    # transcript for the recorded claimant, or claimed more than 24h ago.
+    if ($cmd eq 'takeover') {
+        my $id = $pos[0] or die "almanac-bug takeover: <id> required\n";
+        my $path = $find->($id) or die "almanac-bug takeover: no report '$id'\n";
+
+        # Identity is REQUIRED on every call (unlike set-status, every
+        # takeover involves triaging by definition).
+        my ($id_ok, $id_who_or_msg) = _caller_identity('takeover', \@ARGV_RAW);
+        unless ($id_ok) {
+            print STDERR "almanac-bug takeover: refused — $id_who_or_msg\n";
+            exit 2;
+        }
+
+        my ($lock, $lock_err) = Almanac::Lock->acquire($path, verb => 'takeover');
+        _refuse_unlocked('takeover', $id, $lock_err) unless $lock;
+        my $rep = AlmanacBug::load($path) or die "almanac-bug takeover: $path unreadable\n";
+        die "almanac-bug takeover: '$id' has MALFORMED: duplicate frontmatter key "
+          . "'$rep->{duplicate_key}' — refusing to operate on a possibly-forged report\n"
+            if $rep->{duplicate_key};
+        _race_test_hook($lock);
+
+        my $f      = $rep->{fields};
+        my $status = $f->{status} // 'open';
+        unless ($status eq 'triaging') {
+            print STDERR "almanac-bug takeover: refused — '$id' is $status; only a triaging "
+                       . "report has a claim to take over.\n";
+            $lock->release;
+            exit 2;
+        }
+
+        # FIX (S1, package 12 fix-batch): claim_state can die (a legacy claim
+        # with no claimant_transcript_path, and butler's BpSession.pm missing
+        # or unloadable) -- that used to propagate uncaught, exiting 255 with
+        # no "refused" message at all. Same refusal style as every other exit
+        # here (print to STDERR, release the lock, exit 2) rather than a raw
+        # crash; the message names the same failure list/collect already
+        # surface for this exact die (see the `list`/`collect` loader above).
+        my $cstate = eval { AlmanacBug::claim_state($f, time) };
+        if (!defined $cstate && $@) {
+            print STDERR "almanac-bug takeover: refused — cannot check claim liveness: $@";
+            $lock->release;
+            exit 2;
+        }
+        unless ($cstate && $cstate->{stale}) {
+            my $cs = $f->{claimant_session};
+            my $ca = $f->{claimant_agent};
+            my $agent_part = (defined $ca && length $ca) ? " (agent $ca)" : '';
+            print STDERR "almanac-bug takeover: refused — '$id' is claimed by session "
+                       . "$cs$agent_part since $f->{claimed_at}, and that claim is live (its "
+                       . "transcript is present and it is under 24h old). Only a stale claim can "
+                       . "be taken over.\n";
+            $lock->release;
+            exit 2;
+        }
+
+        my $now    = AlmanacBug::_iso(time);
+        my $old_cs = $f->{claimant_session};
+        my $old_ca = $f->{claimant_agent};
+        my ($taken_over_from_field, $prev_text);
+        if (defined $old_cs && length $old_cs) {
+            $taken_over_from_field = (defined $old_ca && length $old_ca) ? "$old_cs/$old_ca" : $old_cs;
+            $prev_text = (defined $old_ca && length $old_ca)
+                       ? "session $old_cs agent $old_ca" : "session $old_cs";
+        }
+        else {
+            $taken_over_from_field = 'none';
+            $prev_text = 'nobody';
+        }
+
+        my %nf = %$f;
+        $nf{status} = 'triaging';
+        $nf{claimant_session} = $id_who_or_msg->{session};
+        if (defined $id_who_or_msg->{agent}) { $nf{claimant_agent} = $id_who_or_msg->{agent} }
+        else                                 { delete $nf{claimant_agent} }
+        if (defined $id_who_or_msg->{transcript_path}) { $nf{claimant_transcript_path} = $id_who_or_msg->{transcript_path} }
+        else                                            { delete $nf{claimant_transcript_path} }
+        $nf{claimed_at}        = $now;
+        $nf{taken_over_from}   = $taken_over_from_field;
+        $nf{taken_over_at}     = $now;
+        $nf{taken_over_reason} = $cstate->{reason};
+        $nf{updated_at}        = $now;
+        $nf{content_sha256}  //= AlmanacBug::body_digest($rep->{body});
+        $nf{frozen_at}       //= $now;
+
+        my ($cas_ok, $cas_why) = AlmanacBug::cas_write($rep, AlmanacBug::_render(\%nf, $rep->{body}));
+        unless ($cas_ok) {
+            print STDERR "almanac-bug takeover: refused — '$id' $cas_why. "
+                       . "Retry the command; do not assume it partially applied.\n";
+            $lock->release;
+            exit 2;
+        }
+
+        $lock->release;
+        print "$id: claim taken over from $prev_text ($cstate->{reason})\n";
         exit 0;
     }
 
@@ -1019,10 +1413,28 @@ unless (caller) {
                 my ($intact, $note) = AlmanacBug::verify($rep);
                 $integrity = $note unless $intact;
             }
-            push @out, { id=>$f->{id}, title=>$f->{title}, status=>$f->{status},
-                         severity=>$f->{severity}, area=>$f->{area}, project=>$f->{project},
-                         created_at=>$f->{created_at}, path=>$p,
-                         (defined $integrity ? (integrity=>$integrity) : ()) };
+            my %row = ( id=>$f->{id}, title=>$f->{title}, status=>$f->{status},
+                        severity=>$f->{severity}, area=>$f->{area}, project=>$f->{project},
+                        created_at=>$f->{created_at}, path=>$p,
+                        (defined $integrity ? (integrity=>$integrity) : ()) );
+            # Stale-claim surfacing (spec sec 2.8): claim_state is defined only
+            # for a (migrated) 'triaging' row. A die (butler unreachable) is a
+            # refusal, not a silently-clean report -- never report false
+            # cleanliness for a check that could not actually run.
+            if (($f->{status}//'') eq 'triaging') {
+                $row{claimant_session} = $f->{claimant_session} if defined $f->{claimant_session};
+                $row{claimant_agent}   = $f->{claimant_agent}   if defined $f->{claimant_agent};
+                $row{claimed_at}       = $f->{claimed_at}       if defined $f->{claimed_at};
+                my $cstate = eval { AlmanacBug::claim_state($f, time) };
+                if (!defined $cstate && $@) {
+                    print STDERR "almanac-bug $cmd: refused — cannot check claim liveness: $@";
+                    exit 2;
+                }
+                if ($cstate && $cstate->{stale}) {
+                    $row{stale_claim} = $cstate->{reason};
+                }
+            }
+            push @out, \%row;
         }
         # ->utf8 ON THE ENCODE SIDE TOO, and it is not optional. known_projects
         # decodes the registry with ->utf8 (see :123), so project paths arrive
@@ -1042,6 +1454,18 @@ unless (caller) {
                 printf "%-22s %-10s %-9s %s\n", $r->{id}, $r->{status}//'?',
                        $r->{severity}//'?', $r->{title}//'';
                 print  "  !! $r->{integrity}\n" if $r->{integrity};
+                if (($r->{status}//'') eq 'triaging') {
+                    if (defined $r->{claimant_session}) {
+                        my $agent_part = defined $r->{claimant_agent} ? " agent $r->{claimant_agent}" : '';
+                        print "  claimed by session $r->{claimant_session}$agent_part since "
+                            . ($r->{claimed_at} // '?') . "\n";
+                    } else {
+                        print "  no claimant recorded\n";
+                    }
+                    print "  !! STALE CLAIM: $r->{stale_claim} -- take it over with: "
+                        . "almanac-bug.pl takeover $r->{id}\n"
+                        if defined $r->{stale_claim};
+                }
                 print  "  $r->{project}\n" if $cmd eq 'collect';
             }
             # FIX (defect 4, 20260911-225720-4c57): `list` used to print a
@@ -1201,11 +1625,20 @@ almanac-bug.pl — ccpraxis bug reports, one file per report.
   update <id> (--body - | --body-file F) [--title T] [--severity S] [--replace]
         REPLACE a report's body. Allowed ONLY while status is `open`. Refuses when the existing body would be discarded unless --replace is given; there is no undo, as reports are gitignored.
   set-status <id> --to <state> [--note N] [--repair]
-        open -> reviewing -> taken -> resolved|declined  (reviewing -> open to hand back)
+        open -> triaging -> taken -> resolved|declined  (triaging -> open to hand back)
+        Moving to `triaging` CLAIMS the report for the calling session (and agent, for a
+        subagent) -- the identity comes from a butler hook ticket, never from a flag, and is
+        required: run this from a Claude Code session with the butler plugin enabled, with the
+        id and every argument written literally (no $variables). Only the claimant may then move
+        it on or back to `open`; see `takeover` for a stale claim.
         --repair: ONLY for a report whose current status is not a known state (hand-written, or from before this machine existed). It cannot skip a legal transition between valid states. Put it last on the line.
         Leaving `open` FREEZES the body and records its sha256.
-  list [--status S] [--json]        reports in THIS PROJECT only
-  collect [--status S] [--json]     reports across every project REGISTERED in steward's backup registry -- filing a bug and registering for backup are unrelated decisions, so an unregistered project is excluded, not scanned for
+  takeover <id>
+        Recovers a STALE triaging claim (no transcript for its claimant, or claimed over 24h ago)
+        and records the calling session as the new claimant. Refused on a live claim or a report
+        that is not triaging. Requires a hook ticket, exactly like set-status.
+  list [--status S] [--json]        reports in THIS PROJECT only; flags a stale triaging claim
+  collect [--status S] [--json]     reports across every project REGISTERED in steward's backup registry -- filing a bug and registering for backup are unrelated decisions, so an unregistered project is excluded, not scanned for; flags a stale triaging claim
   verify                            re-check every frozen body against its digest
 
 One report per file. Write only through this script — a PreToolUse hook denies direct edits to the reports directory.

@@ -404,7 +404,7 @@ sub parse_findings {
     is($bug_res->{rc}, 0, 'AC6 fixture: bug report filed') or diag($bug_res->{stderr});
     chomp(my $bug_path = $bug_res->{stdout});
     my ($bug_id) = $bug_path =~ m{/([^/]+)\.md$};
-    my $freeze_res = run_child([ $^X, $BUG_PL, 'set-status', $bug_id, '--project', $P1, '--to', 'reviewing' ],
+    my $freeze_res = run_child([ $^X, $BUG_PL, 'set-status', $bug_id, '--project', $P1, '--to', 'declined' ],
         env => { ALMANAC_HOME => $H6, HOME => $H6, USERPROFILE => $H6 });
     is($freeze_res->{rc}, 0, 'AC6 fixture: bug report frozen') or diag($freeze_res->{stderr});
 
@@ -608,7 +608,7 @@ sub parse_findings {
         env => { ALMANAC_HOME => $H11, HOME => $H11, USERPROFILE => $H11 });
     chomp(my $bug_path = $res_bf->{stdout});
     my ($bug_id) = $bug_path =~ m{/([^/]+)\.md$};
-    run_child([ $^X, $BUG_PL, 'set-status', $bug_id, '--project', $P11, '--to', 'reviewing' ],
+    run_child([ $^X, $BUG_PL, 'set-status', $bug_id, '--project', $P11, '--to', 'declined' ],
         env => { ALMANAC_HOME => $H11, HOME => $H11, USERPROFILE => $H11 });
     {
         my $raw = slurp_raw($bug_path);

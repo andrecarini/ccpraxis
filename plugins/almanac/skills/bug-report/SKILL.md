@@ -89,7 +89,7 @@ REPORT
 
 Reach for `append` unless you genuinely mean to throw the old text away.
 
-Once it reaches `reviewing` it is **frozen** — that is what lets a reviewer read it without you
+Once it reaches `triaging` it is **frozen** — that is what lets a reviewer read it without you
 rewriting it underneath them, and what makes `taken` mean something. If you learn more after that,
 file a follow-up and reference the original id. The refusal message says so too.
 

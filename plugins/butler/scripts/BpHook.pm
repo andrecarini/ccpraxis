@@ -765,7 +765,8 @@ sub _normalize_ticket_name {
     my $b = $name;
     $b =~ s{.*[/\\]}{};
     $b =~ s/\.(?:pl|sh)$//;
-    return ($b eq 'butler-continuity' || $b eq 'butler-hold' || $b eq 'butler-fork-ok') ? $b : undef;
+    return ($b eq 'butler-continuity' || $b eq 'butler-hold' || $b eq 'butler-fork-ok'
+         || $b eq 'almanac-bug') ? $b : undef;
 }
 
 sub write_ticket {

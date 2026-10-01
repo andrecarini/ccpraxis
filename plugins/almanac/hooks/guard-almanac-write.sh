@@ -10,7 +10,7 @@
 # Both have a state machine or a compare-and-swap lock that a direct Edit/Write
 # would bypass outright, so this denies Edit/Write/MultiEdit/NotebookEdit
 # against either shape and points at the script that owns it instead. Bug
-# reports freeze once picked up (open -> reviewing -> taken -> resolved |
+# reports freeze once picked up (open -> triaging -> taken -> resolved |
 # declined); stores are protected by Almanac::Lock plus a sealed digest, and
 # almanac-bug.pl verify reports either kind of out-of-band write.
 #
@@ -231,7 +231,7 @@ A report's body is FROZEN once it leaves 'open' — that is what lets a reviewer
   While still open, revise it:
     perl <ccpraxis>/plugins/almanac/scripts/almanac-bug.pl update $ID --body -
 
-  Already reviewing/taken? It is deliberately immutable. File a follow-up:
+  Already triaging/taken? It is deliberately immutable. File a follow-up:
     perl <ccpraxis>/plugins/almanac/scripts/almanac-bug.pl file --title "..." --body -
 
   Check state:  almanac-bug.pl list        (this project)
