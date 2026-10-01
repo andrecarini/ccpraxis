@@ -400,6 +400,7 @@ my %SKILLS = (
             'butler-hold',
             'run_in_background: true',
             "butler-continuity off --reason '<what is done>'",
+            '`pause-long`',   # pkg10/never-halt AC-13: the off-line now also names pause-long
         ],
         file_required => [
             '`in-flight`',
@@ -408,6 +409,8 @@ my %SKILLS = (
             'STOP ITERATING AND REPORT NOW',
             'bp-dispatch-log.pl start',
             'do not defer again',
+            '`pause-long`',   # pkg10/never-halt AC-13: the new action-table row
+            'until_iso',      # pkg10/never-halt AC-13: the new action's handoff-time field
         ],
         rule_q => \&rule_Q_drive_solo_violations,
     },
@@ -552,6 +555,113 @@ for my $skill_name (sort keys %SKILLS) {
             }
         }
     };
+}
+
+# ===========================================================================
+# package 10 (never-halt): the new `pause-long` row in drive-solo/SKILL.md,
+# and a non-regression pin on the pre-existing `pause` row.
+# Spec: .ccpraxis-local-data/blueprints/never-halt/specs/10-long-usage-pause-ends-session-spec.md
+#   AC-14 -- the pause-long row's own content (table-row check, new here).
+#   AC-15 -- the pause row stays byte-identical to its pre-change text.
+# ===========================================================================
+{
+    my $dir        = "$Bin/../../skills/drive-solo";
+    my $next_path  = "$dir/SKILL.next.md";
+    my $md_path    = "$dir/SKILL.md";
+    my $target     = -e $next_path ? $next_path : $md_path;
+    my $text       = _slurp($target);
+
+    unless (ok(defined $text, '(pkg10) AC-14/AC-15: drive-solo target file is readable')) {
+        done_testing();
+        exit;
+    }
+
+    my @lines = _lines_of($text);
+
+    # ── AC-14: exactly one pause-long row, with the required content ───────
+    my @pl_matches = grep { /^\|\s*`pause-long`/ } @lines;
+    is(scalar(@pl_matches), 1,
+        '(pkg10) AC-14: exactly one line matches /^\|\s*`pause-long`/');
+
+    SKIP: {
+        skip '(pkg10) AC-14: no pause-long row to inspect', 16 unless @pl_matches == 1;
+        my $row = $pl_matches[0];
+
+        for my $term (
+            'TaskStop', 'no background sleep', 'no holder', 'handoff',
+            '## Next action', 'attempt-log', 'git status', 'pending',
+            'decision', 're-invoke', 'until_iso', 'continuity off', 'last',
+            # fix-batch (reviewer S1/S2/N1, red-team L1/L2/L3): the row must
+            # also stop an already-running holder, ignore its late report,
+            # close each stopped worker's dispatch-log record, note any
+            # refused call behind a stop, explain why no report-first step,
+            # and state the report/continuity-off ordering unambiguously.
+            "holder's background task", 'ignore', 'after continuity is off',
+            'bp-dispatch-log.pl finish', 'interrupted',
+            'bp-denials summary', 'refused',
+            'needs a holder', 'same response turn',
+        ) {
+            ok(index(lc($row), lc($term)) >= 0,
+                "(pkg10) AC-14: the pause-long row mentions '$term' (case-insensitive)");
+        }
+
+        my $handoff_pos    = index(lc($row), 'handoff');
+        my $continuity_pos = index(lc($row), 'continuity off');
+        ok($handoff_pos >= 0 && $continuity_pos >= 0 && $handoff_pos < $continuity_pos,
+            '(pkg10) AC-14: "handoff" appears before "continuity off" in the row');
+
+        unlike($row, qr/butler-hold|butler-continuity|\bsilence/i,
+            '(pkg10) AC-14/E10: the row names no stop-machinery command directly '
+          . '(it points at "Continuity and dispatch" instead)');
+        unlike($row, qr/sleeps until/,
+            '(pkg10) AC-14: the row describes no background sleep');
+
+        my @cells = split /\|/, $row;
+        my $last_cell = $cells[-1] // '';
+        like($last_cell, qr/\(none/,
+            '(pkg10) AC-14: the last cell (Next director call) matches /\(none/');
+    }
+
+    # ── AC-15: the pre-existing pause row is byte-identical, unedited ──────
+    my $PINNED_PAUSE_ROW =
+        '| `pause` (reason=`usage`) | Wait **token-cheaply** until `action.until_epoch` with one '
+      . 'background Bash call that sleeps until that epoch, held as described in Continuity and '
+      . 'dispatch. Never busy-poll. | `next` again (after it finishes) |';
+
+    my @pause_matches = grep { /^\|\s*`pause` \(reason/ } @lines;
+    is(scalar(@pause_matches), 1,
+        '(pkg10) AC-15: exactly one line matches /^\|\s*`pause` \(reason/');
+    SKIP: {
+        skip '(pkg10) AC-15: no pause row to compare', 1 unless @pause_matches == 1;
+        (my $got = $pause_matches[0]) =~ s/\r\z//;
+        is($got, $PINNED_PAUSE_ROW,
+            '(pkg10) AC-15: the pause row is byte-identical to its pre-change text');
+    }
+
+    # ── fix-batch item L4 (red-team): "Never end a turn with nothing
+    # scheduled" named only two reasons a turn may end; pause-long is
+    # neither, so it must now be named as a third. Section-scoped (not the
+    # continuity block), so no budget constraint applies here.
+    my $heading_idx;
+    for my $i (0 .. $#lines) {
+        if ($lines[$i] =~ /^## Never end a turn with nothing scheduled\s*\z/) {
+            $heading_idx = $i; last;
+        }
+    }
+    ok(defined $heading_idx,
+        '(pkg10) L4: "## Never end a turn with nothing scheduled" heading is present');
+
+    SKIP: {
+        skip '(pkg10) L4: heading not found, cannot verify its section', 1
+            unless defined $heading_idx;
+        my $next_heading_idx;
+        for my $i ($heading_idx + 1 .. $#lines) {
+            if ($lines[$i] =~ /^## /) { $next_heading_idx = $i; last; }
+        }
+        my $section = join("\n", @lines[$heading_idx + 1 .. (defined $next_heading_idx ? $next_heading_idx - 1 : $#lines)]);
+        like($section, qr/pause-long/,
+            '(pkg10) L4: the "Never end a turn" section names pause-long as a legitimate way to end a turn');
+    }
 }
 
 done_testing();

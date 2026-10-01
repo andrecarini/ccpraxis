@@ -53,7 +53,7 @@ With more than one package in flight, a dispatch without exactly one such line n
 Never dispatch with `subagent_type: fork`; launch a fresh subagent with a self-contained prompt instead.
 Before a turn ends with background workers or a pause running: `butler-hold <id> [<id> ...]` with `run_in_background: true` only when `butler-continuity status` shows `holder: none`; while one is already running, run `butler-hold <new id>` in the foreground instead, which extends it and returns at once.
 When the holder exits, act on its report and hold again for ids still running.
-At `done`, or when the operator says stop: `butler-continuity off --reason '<what is done>'`.
+At `done`, at `pause-long`, or when the operator says stop: `butler-continuity off --reason '<what is done>'`.
 A denied stop prints commands carrying a stop token; run them as printed.
 <!-- continuity:end -->
 
@@ -72,6 +72,7 @@ Call `bp-drive-next.pl next --scope <scope>` → dispatch the returned action **
 | `need-order` | JUDGE the blueprint order over `candidates` (dependencies / risk / value — a Claude judgment, Decision #3), then persist it. | `bp-drive-next.pl record-order <bp> [<bp> …]`, then `next` again |
 | `run-package` | Set the ledger to `running`, dispatch the package's next pipeline step per **`coordinator-protocol` VERBATIM** with its `Ledger:` line, and verify each worker's result on disk. When that worker runs in the background, call `next` again in the same turn; the director may hand out another disjoint package. A `run-package` for a package already in flight means no dispatch was bound to it for 30 minutes: dispatch its next step. | `next` again |
 | `pause` (reason=`usage`) | Wait **token-cheaply** until `action.until_epoch` with one background Bash call that sleeps until that epoch, held as described in Continuity and dispatch. Never busy-poll. | `next` again (after it finishes) |
+| `pause-long` (reason=`usage`) | The usage window reopens more than 12 h out (`action.until_iso`), so this session ends instead of waiting: no background sleep, no holder (no report-first step: waiting for one needs a holder, which this action rules out). Write the handoff first: stop (`TaskStop`) any worker of yours still running, and stop the holder's background task if one is running; close each stopped worker's dispatch-log record with `bp-dispatch-log.pl finish --id <id> --status interrupted`, and note any refused call from `bp-denials summary` against a stopped worker so the recorded interruption reason is accurate. In every in-flight package's ledger append an attempt-log entry (step reached, uncommitted files from `git status`, each stopped worker's step marked interrupted by the usage pause, any such refused call) and set `## Next action` to the concrete step a fresh session resumes with. Then report per blueprint what is done and what is pending, each in-flight package with its next action, every decision batched for the operator, and when to re-invoke `/butler:drive-solo` (after `until_iso`) — report, then, in that same response turn, turn continuity off (see Continuity and dispatch) with a reason naming the pause end and that the handoff is written; the report is the last text. Ignore any holder report or PROMPT line that arrives after continuity is off. | *(none — session ends; the operator re-invokes after `until_iso`)* |
 | `stop` (reason=`token-refresh-failed`) | **Genuinely terminal:** the director already tried and failed to refresh the token (via `bp-token-keeper.pl`). Tell the user to `/login` and re-invoke `drive-solo`; add to the end-batch (Decision #15). NOT an auto-resume. | *(none — stop; user re-invokes)* |
 | `blueprint-done` | RE-EVALUATE the still-`pending` blueprints' validity (semantic Claude judgment, Decision #3/#4/#17); PARK the stale/moot ones. Then report the archive in one line: `archived` true means it was filed into `_archive/`; false quotes `archive_detail` (a "deferred:" or "archive failed:" one is retried by later `next` calls, nothing to do). Unrelated to the blueprint-level `park`. | `bp-drive-next.pl park <blueprint> <reason…>` for each stale bp, then `next` again |
 | `in-flight` | Nothing new can start yet; the packages named in the action's `inflight` key are still being driven (use `running` when the key is absent). Any listed package with no worker of yours running (after `/clear`, a crash or a new session) is resumed from its ledger per coordinator-protocol "Resumption". Otherwise end the turn waiting on your workers (see Continuity and dispatch). It is never completion. | `next` again after a worker returns |
@@ -84,8 +85,9 @@ Call `bp-drive-next.pl next --scope <scope>` → dispatch the returned action **
 
 ## Never end a turn with nothing scheduled
 
-**A driver turn may end for exactly two reasons: something will wake the session, or
-the run is settled.** Nothing else.
+**A driver turn may end for exactly three reasons: something will wake the session,
+the run is settled, or the action is `pause-long`** (the session is handing off and
+ending on purpose; see the `pause-long` row above). Nothing else.
 
 Something will wake you when the turn dispatched a subagent, or started a
 `run_in_background` Bash call — both notify you and the loop resumes. A **foreground**

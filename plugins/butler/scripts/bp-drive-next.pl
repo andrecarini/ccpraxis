@@ -26,6 +26,9 @@
 #   {"action":"need-order","candidates":[…]}          no order yet; session must judge+record
 #   {"action":"run-package","blueprint":B,"package":P} drive this package next
 #   {"action":"pause","until_epoch":E,"reason":"usage"} timed auto-resume at epoch E
+#   {"action":"pause-long","reason":"usage","until_epoch":E,"until_iso":"…"}  usage pause ending
+#                                                      more than 12 h out: the session writes its
+#                                                      handoff and ends; no auto-resume in this session
 #   {"action":"stop","reason":"token-refresh-failed","detail":…} token could not be
 #                                                      refreshed; the wake-lock is released and the
 #                                                      run ends. NOT a pause: a pause promises a
@@ -52,7 +55,7 @@
 # GOVERNOR VERDICT CONSUMED  (from bp-usage-gate.pl verdict — pkg-02)
 #   {"action":"ok"|"pause-usage"|"pause-token"|"unavailable","until_epoch":E|null,"reason":…}
 #   ok           → proceed
-#   pause-usage  → pause reason=usage, until_epoch=E
+#   pause-usage  → pause reason=usage, until_epoch=E; pause-long instead when E - now > 12 h
 #   pause-token  → attempt a refresh (bp-token-keeper). Recovered → proceed;
 #                  failed → action=stop, wake-lock released, error logged.
 #                  Solo NEVER pauses for token expiry — see _token_recover.
@@ -84,6 +87,7 @@ use File::Basename qw(dirname basename);
 use Cwd qw(abs_path);
 use Fcntl qw(:flock);
 use Errno ();
+use POSIX qw(strftime);
 # Loaded WITHOUT importing `time`/`sleep` — this file's default `now` seam is
 # bare `time` (CORE, integer epoch, per spec "Integer epochs"); importing
 # Time::HiRes's floating-point time() would silently change that contract.
@@ -1057,6 +1061,27 @@ sub pause_keepawake_phase {
     return (($until - $now) > $KEEPAWAKE_PAUSE_HORIZON_SECONDS) ? 'settled' : 'pause-pending';
 }
 
+# never-halt package 10: a usage pause that reopens more than 12h out hands the
+# session off instead of waiting it out (Decision 41, narrowed by Decision 42 —
+# butler-hold.pl's 50-minute clamp is explicitly NOT the mechanism here).
+our $LONG_PAUSE_HANDOFF_SECONDS = 12 * 3600;   # 43200, package-global, test-readable
+
+# pause_is_long($reason, $until_epoch, $now) -> 1 | 0   (pure; no I/O)
+#   1 iff  defined $reason && $reason eq 'usage'
+#      &&  defined $until_epoch && $until_epoch =~ /\A-?\d+(?:\.\d+)?\z/
+#      &&  ($until_epoch - $now) > $LONG_PAUSE_HANDOFF_SECONDS
+#   else 0
+sub pause_is_long {
+    my ($reason, $until, $now) = @_;
+    return 0 unless defined $reason && $reason eq 'usage';
+    return 0 unless defined $until && $until =~ /\A-?\d+(?:\.\d+)?\z/;
+    # red-team L5: a pathologically huge until_epoch blows up gmtime()/
+    # strftime() downstream ("Usage: POSIX::strftime") -- fail safe to "not
+    # long" here, before any caller reaches that strftime call.
+    return 0 unless gmtime(int $until);
+    return (($until - $now) > $LONG_PAUSE_HANDOFF_SECONDS) ? 1 : 0;
+}
+
 sub keepawake_apply {
     my ($phase, $dsdir, $opts) = @_;
     # The seam shape (spawn / kill_pid / powershell_available in %$opts) is
@@ -1523,6 +1548,19 @@ sub _cmd_next {
             my $until = $mapped->{until_epoch};
             my $reason = $mapped->{reason};
 
+            if (pause_is_long($reason, $until, $now)) {
+                my $iso = strftime('%Y-%m-%dT%H:%M:%SZ', gmtime(int($until)));
+                _append_run_log($dsdir, sprintf(
+                    'PAUSE-LONG (%.1fh away, threshold %.1fh) -- the session hands off and ends; '
+                  . 're-invoke drive-solo after %s',
+                    ($until - $now) / 3600, $LONG_PAUSE_HANDOFF_SECONDS / 3600, $iso));
+                my $action = { action => 'pause-long', reason => $reason,
+                               until_epoch => $until, until_iso => $iso };
+                print _encode_action($action), "\n";
+                keepawake_apply('settled', $dsdir, $opts);
+                return 0;
+            }
+
             my $phase = pause_keepawake_phase($reason, $until, $now);
             if ($phase eq 'settled' && $reason eq 'usage' && defined $until) {
                 _append_run_log($dsdir, sprintf(
@@ -1960,6 +1998,7 @@ NEXT-ACTION JSON  (exactly one per `next`)
   {"action":"need-order","candidates":[…]}          no order yet; session must judge+record
   {"action":"run-package","blueprint":B,"package":P} drive this package next
   {"action":"pause","until_epoch":E,"reason":"usage"} timed auto-resume at epoch E
+  {"action":"pause-long","reason":"usage","until_epoch":E,"until_iso":"…"}  usage pause ending more than 12 h out: the session writes its handoff and ends; no auto-resume in this session
   {"action":"stop","reason":"token-refresh-failed","detail":…} token could not be refreshed; the wake-lock is released and the run ends. NOT a pause: a pause promises a resume, and there is none until a human re-authenticates.
   {"action":"blueprint-done","blueprint":B,"pending":[…],"archived":true|false,"archive_detail":"…"} B settled; pending = remaining bps to re-eval; archived/archive_detail report the director's own single-blueprint archive attempt (reuses bp-lifecycle.pl reconcile --archive)
   {"action":"in-flight","blueprint":B,"packages":[…],"running":[…]} nothing dispatchable right now, but B still holds non-terminal packages (typically owned by a concurrent worker). NOT completion: stopping here kills the run mid-package.
@@ -1970,7 +2009,7 @@ NEXT-ACTION JSON  (exactly one per `next`)
 GOVERNOR VERDICT CONSUMED  (from bp-usage-gate.pl verdict — pkg-02)
   {"action":"ok"|"pause-usage"|"pause-token"|"unavailable","until_epoch":E|null,"reason":…}
   ok           → proceed
-  pause-usage  → pause reason=usage, until_epoch=E
+  pause-usage  → pause reason=usage, until_epoch=E; pause-long instead when E - now > 12 h
   pause-token  → attempt a refresh (bp-token-keeper). Recovered → proceed; failed → action=stop, wake-lock released, error logged. Solo NEVER pauses for token expiry — see _token_recover.
   unavailable  → retry a few times, then degrade-and-proceed (log "governance degraded")
 

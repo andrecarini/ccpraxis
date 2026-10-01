@@ -14,6 +14,7 @@ use File::Temp qw(tempdir);
 use File::Path qw(make_path);
 use File::Basename qw(basename);
 use Cwd qw(getcwd abs_path);
+use POSIX qw(strftime);
 
 # ── require the not-yet-existing script ─────────────────────────────────────
 # If it doesn't exist this is a compile-time die → caught with eval.
@@ -1042,6 +1043,207 @@ sub capture_run {
     my $w = BpKeepAwake::winify('/c/Development/ccpraxis/x.ps1');
     like($w, qr{^[A-Z]:/}, 'AC-43: winify yields a drive-letter Windows path');
     unlike($w, qr{^/}, 'AC-43: ...and never a leading slash (that is the drive-root-stray shape)');
+}
+
+# =============================================================================
+# package 10 (never-halt): a long usage pause (> 12h out) ends the session
+# with a new `pause-long` action instead of `pause`.
+# Spec: .ccpraxis-local-data/blueprints/never-halt/specs/10-long-usage-pause-ends-session-spec.md
+# =============================================================================
+
+# ── AC-1/AC-2: pause_is_long (pure) and $LONG_PAUSE_HANDOFF_SECONDS ─────────
+{
+    is($BpDrive::LONG_PAUSE_HANDOFF_SECONDS, 43200,
+        'AC-1(pkg10): $LONG_PAUSE_HANDOFF_SECONDS is 43200 (12h)');
+
+    is(BpDrive::pause_is_long('usage', $NOW + 43200 + 1, $NOW), 1,
+        'AC-2(pkg10): just over 12h away -> long (1)');
+    is(BpDrive::pause_is_long('usage', $NOW + 43200, $NOW), 0,
+        'AC-2(pkg10): exactly 12h away -> NOT long (boundary is strict >, not >=)');
+    is(BpDrive::pause_is_long('usage', $NOW + 88 * 3600, $NOW), 1,
+        'AC-2(pkg10): 88h away (the measured seven-day case) -> long');
+    is(BpDrive::pause_is_long('usage', $NOW + 3600, $NOW), 0,
+        'AC-2(pkg10): 1h away -> not long');
+    is(BpDrive::pause_is_long('usage', $NOW - 3600, $NOW), 0,
+        'AC-2(pkg10): overdue (negative D) -> never long');
+    is(BpDrive::pause_is_long('usage', undef, $NOW), 0,
+        'AC-2(pkg10): undefined until_epoch -> not long (E3: never a strftime on garbage)');
+    is(BpDrive::pause_is_long('usage', 'soon', $NOW), 0,
+        'AC-2(pkg10): non-numeric until_epoch -> not long');
+    is(BpDrive::pause_is_long('token', $NOW + 88 * 3600, $NOW), 0,
+        'AC-2(pkg10): a non-usage reason -> never long, regardless of D');
+    is(BpDrive::pause_is_long(undef, $NOW + 88 * 3600, $NOW), 0,
+        'AC-2(pkg10): an undefined reason -> never long, regardless of D');
+}
+
+# ── AC-3/AC-4/AC-10: the pause-long action shape, run.md line, state isolation ─
+{
+    my $EPOCH = $NOW + 13 * 3600;   # > 12h away
+    my $data = tempdir(CLEANUP => 1);
+    make_bp_dir($data, 'bp-x', [{key=>'p1',status=>'pending',write_set=>'x/p1/'}]);
+    my $dsdir = "$data/.drive-solo"; make_path($dsdir);
+    write_json("$dsdir/order.json", { order => ['bp-x'], recorded_at => $NOW });
+
+    # AC-10 fixture: inflight.json must come out byte-identical, and no
+    # parks.json / announced.json may be created, on this path.
+    my $inflight_bytes = qq({"inflight":["bp-x:p1"]}\n);
+    open(my $ifh, '>:raw', "$dsdir/inflight.json") or die "write inflight.json: $!";
+    print $ifh $inflight_bytes;
+    close $ifh;
+
+    my ($rc, $out) = capture_run(
+        ['next', '--scope', 'bp-x'],
+        { data_dir => $data,
+          now      => sub { $NOW },
+          verdict  => sub { { action=>'pause-usage', until_epoch=>$EPOCH, reason=>'usage' } } }
+    );
+    is($rc, 0, 'AC-3(pkg10): a >12h usage pause exits 0');
+
+    my @nl = ($out =~ /\n/g);
+    is(scalar(@nl), 1, 'AC-3(pkg10): stdout is exactly one line');
+    chomp(my $line = $out);
+    my $act = eval { $J->decode($line) };
+    ok(defined $act, 'AC-3(pkg10): stdout is valid JSON') or diag($out);
+
+    is_deeply([sort keys %$act], [qw(action reason until_epoch until_iso)],
+        'AC-3(pkg10): keys are exactly {action,reason,until_epoch,until_iso}');
+    is($act->{action}, 'pause-long', 'AC-3(pkg10): action is pause-long');
+    is($act->{reason}, 'usage', 'AC-3(pkg10): reason is usage');
+    is($act->{until_epoch}, $EPOCH,
+        'AC-3(pkg10): until_epoch carries the verdict epoch unchanged');
+    like($out, qr/"until_epoch"\s*:\s*[0-9]+/,
+        'AC-3(pkg10): until_epoch is a JSON number in the raw output');
+
+    my $expect_iso = strftime('%Y-%m-%dT%H:%M:%SZ', gmtime($EPOCH));
+    is($act->{until_iso}, $expect_iso,
+        'AC-3(pkg10): until_iso equals POSIX::strftime(%Y-%m-%dT%H:%M:%SZ, gmtime(until_epoch))');
+
+    # AC-4(pkg10): run.md gains a PAUSE-LONG line, never PAUSE-BEYOND-HORIZON.
+    my $run_md = read_file("$dsdir/run.md");
+    like($run_md, qr/PAUSE-LONG/, 'AC-4(pkg10): run.md gains a line matching PAUSE-LONG');
+    ok(index($run_md, $expect_iso) >= 0,
+        'AC-4(pkg10): the run.md line contains the until_iso string');
+    unlike($run_md, qr/PAUSE-BEYOND-HORIZON/,
+        'AC-4(pkg10): no PAUSE-BEYOND-HORIZON line is written on the long-pause path');
+
+    # AC-10(pkg10): no state file other than run.md (+ wake-lock) is touched.
+    my $inflight_after = do {
+        open(my $fh, '<:raw', "$dsdir/inflight.json") or die $!;
+        local $/; my $x = <$fh>; close $fh; $x;
+    };
+    is($inflight_after, $inflight_bytes,
+        'AC-10(pkg10): inflight.json is byte-identical before and after the call');
+    ok(!-e "$dsdir/parks.json", 'AC-10(pkg10): no parks.json is created');
+    ok(!-e "$dsdir/announced.json", 'AC-10(pkg10): no announced.json is created');
+}
+
+# ── AC-6: exactly 12h away stays a plain pause (strict boundary), pinned key set ─
+{
+    my $EPOCH = $NOW + 12 * 3600;   # exactly H12
+    my $data = tempdir(CLEANUP => 1);
+    make_bp_dir($data, 'bp-x', [{key=>'p1',status=>'pending',write_set=>'x/p1/'}]);
+    my $dsdir = "$data/.drive-solo"; make_path($dsdir);
+    write_json("$dsdir/order.json", { order => ['bp-x'], recorded_at => $NOW });
+
+    my ($rc, $out) = capture_run(
+        ['next', '--scope', 'bp-x'],
+        { data_dir => $data,
+          now      => sub { $NOW },
+          verdict  => sub { { action=>'pause-usage', until_epoch=>$EPOCH, reason=>'usage' } } }
+    );
+    is($rc, 0, 'AC-6(pkg10): exactly-12h call exits 0');
+    chomp(my $line = $out);
+    my $act = eval { $J->decode($line) };
+    ok(defined $act, 'AC-6(pkg10): stdout is valid JSON') or diag($out);
+    is($act->{action}, 'pause',
+        'AC-6(pkg10): exactly 12h away is still plain pause (strict >, not >=)');
+    is_deeply([sort keys %$act], [qw(action reason until_epoch)],
+        'AC-6(pkg10): keys are exactly {action,reason,until_epoch} -- no until_iso on the plain-pause path');
+}
+
+# ── AC-9: an undefined until_epoch never yields pause-long ──────────────────
+{
+    my $data = tempdir(CLEANUP => 1);
+    make_bp_dir($data, 'bp-x', [{key=>'p1',status=>'pending',write_set=>'x/p1/'}]);
+    my $dsdir = "$data/.drive-solo"; make_path($dsdir);
+    write_json("$dsdir/order.json", { order => ['bp-x'], recorded_at => $NOW });
+
+    my ($rc, $out) = capture_run(
+        ['next', '--scope', 'bp-x'],
+        { data_dir => $data,
+          now      => sub { $NOW },
+          verdict  => sub { { action=>'pause-usage', until_epoch=>undef, reason=>'usage' } } }
+    );
+    is($rc, 0, 'AC-9(pkg10): undefined until_epoch call exits 0');
+    chomp(my $line = $out);
+    my $act = eval { $J->decode($line) };
+    ok(defined $act, 'AC-9(pkg10): stdout is valid JSON') or diag($out);
+    is($act->{action}, 'pause',
+        'AC-9(pkg10): an undefined until_epoch never yields pause-long (E3)');
+}
+
+# ── red-team L5 pin: a pathologically huge until_epoch must fail safe, ──────
+# never die. Pre-fix, gmtime()/strftime() on an epoch this large dies with
+# "Usage: POSIX::strftime", killing `next` with NO action emitted at all --
+# itself a worse never-halt violation than the bug pause-long exists to fix.
+# The guard is `return 0 unless gmtime(int $until);` before the strftime call.
+{
+    my $HUGE = 67768036191676799;
+
+    # Direct pure-sub call: must not die, must return 0 (never "long").
+    my $died = 0;
+    my $result = eval { BpDrive::pause_is_long('usage', $HUGE, $NOW) };
+    $died = 1 if $@;
+    ok(!$died, 'L5(pkg10): pause_is_long does not die on a pathologically huge until_epoch')
+        or diag($@);
+    is($result, 0, 'L5(pkg10): pause_is_long fails safe to 0 (not long) on a huge until_epoch')
+        unless $died;
+
+    # Full next path: must not die, must emit the ordinary `pause` action
+    # (not pause-long, not a crash with no action at all).
+    my $data = tempdir(CLEANUP => 1);
+    make_bp_dir($data, 'bp-x', [{key=>'p1',status=>'pending',write_set=>'x/p1/'}]);
+    my $dsdir = "$data/.drive-solo"; make_path($dsdir);
+    write_json("$dsdir/order.json", { order => ['bp-x'], recorded_at => $NOW });
+
+    my ($rc, $out);
+    my $full_died = 0;
+    eval {
+        ($rc, $out) = capture_run(
+            ['next', '--scope', 'bp-x'],
+            { data_dir => $data,
+              now      => sub { $NOW },
+              verdict  => sub { { action=>'pause-usage', until_epoch=>$HUGE, reason=>'usage' } } }
+        );
+        1;
+    } or do { $full_died = 1; };
+    ok(!$full_died, 'L5(pkg10): the full next call does not die on a pathologically huge until_epoch')
+        or diag($@);
+
+    SKIP: {
+        skip 'L5(pkg10): next died, cannot inspect its output', 3 if $full_died;
+        is($rc, 0, 'L5(pkg10): the full next call exits 0 on a huge until_epoch');
+        chomp(my $line = $out);
+        my $act = eval { $J->decode($line) };
+        ok(defined $act, 'L5(pkg10): stdout is still valid JSON') or diag($out);
+        is($act->{action}, 'pause',
+            'L5(pkg10): a huge until_epoch fails safe to the ordinary pause action, never pause-long')
+            if defined $act;
+    }
+}
+
+# ── AC-11: --help documents the new pause-long action shape ────────────────
+{
+    my ($rc, $out) = capture_run(['--help'], {});
+    is($rc, 0, 'AC-11(pkg10): --help exits 0');
+    like($out, qr/pause-long/, 'AC-11(pkg10): --help lists the pause-long action');
+    like($out, qr/until_iso/,  'AC-11(pkg10): --help documents the until_iso field');
+    like($out, qr/12\s*h\b/,   'AC-11(pkg10): --help states the 12h condition');
+    # B10/§2.4: the existing lines must still be present too.
+    like($out, qr/\bpause\b/,        'AC-11(pkg10): --help still contains the pause action');
+    like($out, qr/pause.*token/s,    'AC-11(pkg10): --help still contains the pause/token action');
+    like($out, qr/ok.*pause-usage.*pause-token.*unavailable/s,
+        'AC-11(pkg10): the governor-verdict-consumed ordering (ok, pause-usage, pause-token, unavailable) is unchanged');
 }
 
 done_testing();

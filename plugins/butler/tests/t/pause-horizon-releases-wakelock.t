@@ -145,18 +145,52 @@ sub run_pause {
     is_deeply(\@PHASES, ['pause-pending'], 'AC-4: near pause hands BpKeepAwake pause-pending');
     unlike($near_log, qr/PAUSE-BEYOND-HORIZON/, 'AC-4: near pause logs no horizon release');
 
-    my ($far_act, $far_log) = run_pause($NOW + 88 * 3600);
-    is($far_act->{action}, 'pause', 'AC-5: far pause still emits a pause action');
-    is_deeply(\@PHASES, ['settled'], 'AC-5: far pause hands BpKeepAwake settled');
-    like($far_log, qr/PAUSE-BEYOND-HORIZON/, 'AC-5: far pause records why the lock went');
+    # AC-8 (package 10 / never-halt, Decision 47): the "far" case moved from
+    # 88h to 9h. 88h now crosses the NEW 12h long-pause threshold (package
+    # 10) and stops being a plain `pause` at all -- see the dedicated
+    # pause-long block below. 9h stays comfortably under 12h while still
+    # being past this file's own 6h wake-lock horizon, so it is the value
+    # that actually isolates "the 6h wake-lock horizon still works" from
+    # "the 12h long-pause threshold also fired" -- the two could no longer
+    # be told apart at 88h once pause-long exists. The 6h-horizon CONTRACT
+    # itself (only the wake-lock changes, never the pause action's keys) is
+    # unchanged; only the probe value moved.
+    my ($far_act, $far_log) = run_pause($NOW + 9 * 3600);
+    is($far_act->{action}, 'pause',
+        'AC-8: a 9h pause still emits a plain pause action (past the 6h horizon, short of the 12h long-pause threshold)');
+    is_deeply(\@PHASES, ['settled'], 'AC-8: a 9h pause hands BpKeepAwake settled');
+    like($far_log, qr/PAUSE-BEYOND-HORIZON/, 'AC-8: a 9h pause records why the lock went');
+    unlike($far_log, qr/PAUSE-LONG/,
+        'AC-8: a 9h pause never logs PAUSE-LONG (it is under the 12h long-pause threshold)');
 
     # THE CONTRACT: only the wake-lock changes, never the action. Same reason,
     # same shape; the epoch differs only because the inputs did.
-    is($far_act->{reason}, $near_act->{reason}, 'AC-5: reason unchanged across the horizon');
+    is($far_act->{reason}, $near_act->{reason}, 'AC-8: reason unchanged across the 6h horizon');
     is_deeply([sort keys %$far_act], [sort keys %$near_act],
-        'AC-5: the action JSON has identical keys either side of the horizon');
+        'AC-8: the action JSON has identical keys either side of the 6h horizon');
+    is($far_act->{until_epoch}, $NOW + 9 * 3600,
+        'AC-8: until_epoch is still reported in full -- the run resumes, it is just not held awake');
+}
+
+# ── AC-5/B1/B2 (package 10 / never-halt, Decision 47): an 88h usage pause now
+# crosses the 12h long-pause threshold -- it is no longer a plain `pause` at
+# all. The wake-lock is released the same way (`settled`) that the 6h horizon
+# already gave any far-out pause; what changes is the ACTION itself.
+# ===========================================================================
+{
+    my ($far_act, $far_log) = run_pause($NOW + 88 * 3600);
+    is($far_act->{action}, 'pause-long',
+        '(pkg10) AC-5: an 88h usage pause emits pause-long, not plain pause');
+    is_deeply(\@PHASES, ['settled'],
+        '(pkg10) AC-5/B2: the wake-lock module receives exactly settled for the long pause');
+    like($far_log, qr/PAUSE-LONG/,
+        '(pkg10) AC-5/B2: run.md gains a line matching PAUSE-LONG for the long pause');
+    unlike($far_log, qr/PAUSE-BEYOND-HORIZON/,
+        '(pkg10) AC-5/B2: no PAUSE-BEYOND-HORIZON line is written on the long-pause path');
+    is($far_act->{reason}, 'usage', '(pkg10) AC-5: reason is usage');
     is($far_act->{until_epoch}, $NOW + 88 * 3600,
-        'AC-5: until_epoch is still reported in full -- the run resumes, it is just not held awake');
+        '(pkg10) AC-5: until_epoch is still reported in full on the long-pause action');
+    ok(exists $far_act->{until_iso}, '(pkg10) AC-5: the pause-long action carries an until_iso field');
 }
 
 done_testing();
