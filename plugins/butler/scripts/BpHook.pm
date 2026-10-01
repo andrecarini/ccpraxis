@@ -436,6 +436,40 @@ sub latest_is_off {
     return -e "$root/off/$sid" ? 1 : 0;
 }
 
+# ------------------------------------------------------------ prompt marker -
+# never-halt package 11 (Decision 43, N3/N5): prompt_marker is the one path
+# formula shared by the bash shim (arm-nudge-prompt.sh, which reproduces this
+# by hand since it cannot call perl) and this module's own readers below.
+# last_prompt_epoch and operator_off are pure readers, used by the chart
+# reminder's N5 nudge; neither ever dies on bad input.
+
+sub prompt_marker {
+    my ($sid) = @_;
+    return undef unless defined $sid && !ref($sid) && $sid =~ $SID_RE;
+    my $root = state_dir();
+    return undef unless defined $root;
+    return "$root/prompted/$sid";
+}
+
+sub last_prompt_epoch {
+    my ($sid) = @_;
+    my $path = prompt_marker($sid);
+    return undef unless defined $path;
+    my $raw = _read_bytes($path);
+    return undef unless defined $raw;
+    return undef unless $raw =~ /\A([0-9]{1,12})\r?\n?\z/;
+    return $1 + 0;
+}
+
+sub operator_off {
+    my ($sid) = @_;
+    return 0 unless defined $sid && !ref($sid) && $sid =~ $SID_RE;
+    my $root = state_dir();
+    return 0 unless defined $root;
+    my $data = _read_json("$root/off/$sid");
+    return (ref $data eq 'HASH' && defined $data->{actor} && !ref($data->{actor}) && $data->{actor} eq 'operator') ? 1 : 0;
+}
+
 # ------------------------------------------------------------------ silence -
 
 sub set_silence {

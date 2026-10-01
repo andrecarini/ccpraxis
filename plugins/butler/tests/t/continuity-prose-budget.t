@@ -7,8 +7,10 @@
 # sweep across the whole file, required content per skill, and ordering for
 # the two skills whose block placement matters. Reads SKILL.next.md when
 # present, else falls back to the live SKILL.md, so it keeps working once
-# package 16 swaps the files in. Reads nothing else: no environment variable
-# except via FindBin, no process spawn, no network, no butler run state.
+# package 16 swaps the files in. Reads nothing else beyond the seven skill
+# files above and, for never-halt package 11's AC-34, global-config/
+# CLAUDE.md: no environment variable except via FindBin, no process spawn,
+# no network, no butler run state.
 #
 # Rule ids below (F, B, N, O, R, P, Q) are the spec's own letters, not
 # invented here -- see specs/15-skills-prose-spec.md section 2.4.
@@ -383,6 +385,11 @@ my %SKILLS = (
             '/butler:continuity off',
             'butler-continuity status',
             'butler-continuity ask --text',
+            # never-halt 11-arming-nudges (AC-33): the clause added to the
+            # "Output:" line and the new sentence after the self-arm
+            # triggers line, at the same 40-line budget.
+            'Hooks nudge toward arming',
+            'arming stays your call',
         ],
         file_required => [],
         rule_q => undef,
@@ -661,6 +668,63 @@ for my $skill_name (sort keys %SKILLS) {
         my $section = join("\n", @lines[$heading_idx + 1 .. (defined $next_heading_idx ? $next_heading_idx - 1 : $#lines)]);
         like($section, qr/pause-long/,
             '(pkg10) L4: the "Never end a turn" section names pause-long as a legitimate way to end a turn');
+    }
+}
+
+# ===========================================================================
+# never-halt package 11-arming-nudges (DC5): AC-34 of
+# .ccpraxis-local-data/blueprints/never-halt/specs/11-arming-nudges-spec.md
+# section 4 -- global-config/CLAUDE.md carries the new "## Arming continuity
+# (butler)" section (sec 2.9), a pure insertion between "## Skill
+# Self-Invocation" and "## House rules learned across projects". DOES NOT
+# EXIST YET at the time this block is written -- expected to fail for
+# exactly that reason.
+# ===========================================================================
+{
+    my $path = "$Bin/../../../../global-config/CLAUDE.md";
+    ok(-e $path, '(AC-34) global-config/CLAUDE.md exists') or diag("missing: $path");
+
+    my $text = -e $path ? _slurp($path) : undef;
+    ok(defined $text, '(AC-34) global-config/CLAUDE.md is readable');
+
+  SKIP: {
+        skip '(AC-34) cannot inspect an unreadable file', 6 unless defined $text;
+        $text =~ s/\r\n/\n/g;
+        my @lines = split /\n/, $text;
+
+        my @heading_idx = grep { ($lines[$_] // '') eq '## Arming continuity (butler)' } (0 .. $#lines);
+        is(scalar(@heading_idx), 1, '(AC-34) exactly one line is "## Arming continuity (butler)"');
+
+      SKIP: {
+            skip '(AC-34) no heading to inspect further', 5 unless @heading_idx == 1;
+            my $hi = $heading_idx[0];
+
+            my @EXPECT_BULLETS = (
+                '- Arm with `butler-continuity on` before work that should go on without the operator: '
+              . 'they said "keep going", they are away or it runs overnight, or the work is unattended '
+              . 'and multi-step.',
+                '- Never arm for one interactive answer.',
+                '- Hooks nudge toward arming on such a prompt, and when work has gone on a long time with '
+              . 'no operator message. Nudges are advice; whether to arm stays your call.',
+            );
+
+            my @non_blank;
+            for my $i ($hi + 1 .. $#lines) {
+                next unless $lines[$i] =~ /\S/;
+                push @non_blank, $lines[$i];
+                last if @non_blank == 3;
+            }
+            is_deeply(\@non_blank, \@EXPECT_BULLETS,
+                '(AC-34) the three sec 2.9 bullet lines follow the heading as the next non-blank lines, byte-exact')
+                or diag(join("\n", @non_blank));
+
+            my @skill_idx = grep { ($lines[$_] // '') eq '## Skill Self-Invocation' } (0 .. $#lines);
+            my @house_idx = grep { ($lines[$_] // '') eq '## House rules learned across projects' } (0 .. $#lines);
+            ok(@skill_idx, '(AC-34) "## Skill Self-Invocation" is present');
+            ok(@house_idx, '(AC-34) "## House rules learned across projects" is present');
+            ok((@skill_idx && $hi > $skill_idx[0]), '(AC-34) the new heading sits after "## Skill Self-Invocation"');
+            ok((@house_idx && $hi < $house_idx[0]), '(AC-34) the new heading sits before "## House rules learned across projects"');
+        }
     }
 }
 

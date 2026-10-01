@@ -31,6 +31,8 @@ use JSON::PP ();
 use Digest::SHA qw(sha1_hex);
 use POSIX qw(WNOHANG);
 use Time::HiRes qw(sleep);
+use Cwd ();
+use File::Copy qw(copy);
 
 my $S       = "$Bin/../../scripts";
 $S =~ s{\\}{/}g;
@@ -49,6 +51,21 @@ require "$S/BpHook.pm";   # package 03 -- real and already implemented
 }
 
 require "$Bin/../../../almanac/scripts/almanac-decision.pl";
+
+# never-halt 11-arming-nudges (N7, spec sec 2.6): Almanac::Task, for
+# AC-27/AC-28/AC-29/AC-30's fixtures (Almanac::Task::add/set_status/focus).
+require "$Bin/../../../almanac/scripts/almanac-task.pl";
+
+# task_pl_abs() -- the spec's own P: Cwd::abs_path of almanac-task.pl beside
+# butler's scripts dir, forward-slashed. Computed fresh each call (never a
+# frozen literal), matching the command's own Cwd::abs_path("$Bin/../../
+# almanac/scripts/almanac-task.pl") at spec sec 2.6.
+sub task_pl_abs {
+    my $p = Cwd::abs_path("$S/../../almanac/scripts/almanac-task.pl");
+    return undef unless defined $p;
+    $p =~ s{\\}{/}g;
+    return $p;
+}
 
 # filed($root) -- the almanac decision store's own records for $root, per
 # package 09 (Decision 108). Returns [] rather than dying when the store has
@@ -1456,6 +1473,299 @@ sub run_oc_bounded {
     else {
         pass('R4-isolation: no real HOME/USERPROFILE was set to check (nothing to guard)');
     }
+}
+
+# ===========================================================================
+# never-halt package 11-arming-nudges, N7 (DC4): AC-26..AC-32 of
+# .ccpraxis-local-data/blueprints/never-halt/specs/11-arming-nudges-spec.md
+# section 4. The butler-continuity.pl N7 additions DO NOT EXIST YET at the
+# time this block is written -- every assertion below is expected to fail
+# for exactly that reason, never a harness bug in this file.
+# ===========================================================================
+
+sub s8 { my ($sid) = @_; return substr($sid, 0, 8) }
+
+# copy_tree($src, $dst) -- shallow recursive copy, core modules only (AC-31
+# needs a standalone copy of plugins/butler/scripts/ with no sibling
+# almanac plugin).
+sub copy_tree {
+    my ($src, $dst) = @_;
+    return unless -d $src;
+    make_path($dst);
+    my @stack = ('');
+    while (@stack) {
+        my $rel = pop @stack;
+        my $sdir = length($rel) ? "$src/$rel" : $src;
+        opendir(my $dh, $sdir) or next;
+        my @entries = readdir($dh);
+        closedir $dh;
+        for my $e (@entries) {
+            next if $e eq '.' || $e eq '..';
+            my $srel = length($rel) ? "$rel/$e" : $e;
+            my $sp = "$src/$srel";
+            my $dp = "$dst/$srel";
+            if (-d $sp) {
+                make_path($dp);
+                push @stack, $srel;
+            } else {
+                (my $ddir = $dp) =~ s{/[^/]+$}{};
+                make_path($ddir) if length $ddir;
+                copy($sp, $dp);
+            }
+        }
+    }
+}
+
+# run_cmd_at($cmd_path, $env_over, @args) -- V20-style direct subprocess
+# invocation against an ARBITRARY copy of butler-continuity.pl (AC-31 needs
+# to run a copy outside $CMD's own tree). Applies the SAME baseline
+# env/overlay contract as spawn_cmd()/run_cmd() above.
+sub run_cmd_at {
+    my ($cmd_path, $env_over, @args) = @_;
+    my (undef, $outfile) = tempfile();
+    my (undef, $errfile) = tempfile();
+    local %ENV = %ENV;
+    delete $ENV{$_} for grep { !/^CCPRAXIS_NO_WAKELOCK$/ && /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
+    $ENV{BUTLER_STATE_DIR}               = $CURRENT_STATE_BASE;
+    $ENV{CCPRAXIS_CONTINUITY_ACTIVE_DIR} = $LEGACY;
+    $ENV{CLAUDE_PROJECT_DIR}             = $PROJECT;
+    $ENV{CCPRAXIS_NO_WAKELOCK}           = 1;
+    for my $k (keys %$env_over) {
+        if (defined $env_over->{$k}) { $ENV{$k} = $env_over->{$k} } else { delete $ENV{$k} }
+    }
+    my @cmd = ($^X, $cmd_path, @args);
+    my $pid = fork();
+    die "fork: $!" unless defined $pid;
+    if ($pid == 0) {
+        open(STDOUT, '>', $outfile) or POSIX::_exit(126);
+        open(STDERR, '>', $errfile) or POSIX::_exit(126);
+        exec(@cmd);
+        POSIX::_exit(127);
+    }
+    push @KILL_PIDS, $pid;
+    my @r = wait_cmd($pid, $outfile, $errfile);
+    @KILL_PIDS = grep { $_ != $pid } @KILL_PIDS;
+    return @r;
+}
+
+# ===========================================================================
+# AC-26 (B20): `on` prints the existing line, the chart line, and the perl
+# hint line. Same for `on --role driver`.
+# ===========================================================================
+{
+    my $P = task_pl_abs();
+    for my $case (['on', 'manual', []], ['on --role driver', 'driver', ['--role', 'driver']]) {
+        my ($label, $role, $extra) = @$case;
+        fresh_state_dir();
+        my $sid = sess_id('ac26' . $role);
+        write_ticket_argv($sid, ['on', @$extra]);
+        my ($out, $err, $rc) = run_cmd({}, 'on', @$extra);
+        is($rc, 0, "AC-26 [$label]: exits 0") or diag("stderr: $err");
+        is($err, '', "AC-26 [$label]: stderr is empty");
+        my $expect = "continuity on for session " . s8($sid) . " (role $role).\n"
+                   . "Chart your tasklist now: add a task for each step still ahead and mark the current one doing.\n"
+                   . (defined $P ? "  perl $P focus | list | add --title '<step>' | status <id> doing|blocked|done\n" : '');
+        is($out, $expect, "AC-26 [$label]: stdout is exactly the existing line, the chart line, and the perl hint line");
+    }
+}
+
+# ===========================================================================
+# AC-27 (B21): off with open tasks -- the existing line, the header, one
+# line per open task in list order (done/obsoleted omitted), then the perl
+# status line.
+# ===========================================================================
+{
+    my $P = task_pl_abs();
+    fresh_state_dir();
+    my $sid = sess_id('ac27');
+    BpHook::arm($sid, role => 'manual', by => 'on');
+    my $proj_ac27 = "$TMPROOT/ac27-proj";
+    make_path("$proj_ac27/.ccpraxis-local-data");
+
+    my %ids;
+    for my $title (qw(A B C D E)) {
+        my $rec = eval { Almanac::Task::add(root => $proj_ac27, title => $title) };
+        $ids{$title} = (ref $rec eq 'HASH') ? $rec->{id} : undef;
+    }
+    my %status_for = (A => 'pending', B => 'doing', C => 'done', D => 'blocked', E => 'obsoleted');
+    for my $title (qw(B C D E)) {
+        next unless defined $ids{$title};
+        eval { Almanac::Task::set_status($ids{$title}, $status_for{$title}, root => $proj_ac27) };
+    }
+
+    write_ticket_argv($sid, ['off', '--reason', 'work all done'], cwd => $proj_ac27);
+    my ($out, $err, $rc) = run_cmd({ CLAUDE_PROJECT_DIR => $proj_ac27, ':cwd' => $proj_ac27 },
+        'off', '--reason', 'work all done');
+    is($rc, 0, 'AC-27: off --reason exits 0') or diag("stderr: $err");
+
+    my $expect = "continuity off for session " . s8($sid) . " (actor agent); reason logged.\n"
+               . "Still open in your tasklist; chart any that are stale now:\n"
+               . "  $ids{A} pending A\n"
+               . "  $ids{B} doing B\n"
+               . "  $ids{D} blocked D\n"
+               . (defined $P ? "  perl $P status <id> doing|blocked|done|obsoleted\n" : '');
+    is($out, $expect, 'AC-27: stdout is exactly the existing off line, the header, the three open task lines (in order), then the perl status line');
+}
+
+# ===========================================================================
+# AC-28 (B22): more than 10 open -> 10 task lines, "... and K more", the
+# perl line. A 100-char title prints as 77 chars + "...".
+# ===========================================================================
+{
+    my $P = task_pl_abs();
+    fresh_state_dir();
+    my $sid = sess_id('ac28');
+    BpHook::arm($sid, role => 'manual', by => 'on');
+    my $proj_ac28 = "$TMPROOT/ac28-proj";
+    make_path("$proj_ac28/.ccpraxis-local-data");
+
+    my @ids;
+    for my $i (1 .. 11) {
+        my $title = ($i == 1) ? ('x' x 100) : "task $i";
+        my $rec = eval { Almanac::Task::add(root => $proj_ac28, title => $title) };
+        push @ids, (ref $rec eq 'HASH') ? $rec->{id} : undef;
+    }
+    my $rec12 = eval { Almanac::Task::add(root => $proj_ac28, title => 'task 12') };
+    push @ids, (ref $rec12 eq 'HASH') ? $rec12->{id} : undef;
+
+    write_ticket_argv($sid, ['off', '--reason', 'checking the cap'], cwd => $proj_ac28);
+    my ($out, $err, $rc) = run_cmd({ CLAUDE_PROJECT_DIR => $proj_ac28, ':cwd' => $proj_ac28 },
+        'off', '--reason', 'checking the cap');
+    is($rc, 0, 'AC-28: off --reason exits 0') or diag("stderr: $err");
+
+    my @lines = split /\n/, $out;
+    is(scalar(grep { /^  \S+ pending / } @lines), 10, 'AC-28: exactly 10 task lines are printed');
+    ok((grep { /^  \.\.\. and 2 more$/ } @lines), 'AC-28: a "... and 2 more" line is printed (12 open - 10 shown = 2)');
+    if (defined $ids[0]) {
+        ok((grep { index($_, "  $ids[0] pending ") == 0 && index($_, 'x' x 77 . '...') > 0 } @lines),
+            'AC-28: the 100-x title prints as 77 x\'s + "..."');
+    }
+    if (defined $P) {
+        ok((grep { $_ eq "  perl $P status <id> doing|blocked|done|obsoleted" } @lines),
+            'AC-28: the perl status line is still the last line');
+    }
+}
+
+# ===========================================================================
+# AC-29 (B23): no open tasks (no tasklist at all, and only-done tasks) ->
+# the existing off line, then "Your tasklist has no open tasks."
+# ===========================================================================
+{
+    # (a) no almanac store under the project at all.
+    {
+        fresh_state_dir();
+        my $sid = sess_id('ac29a');
+        BpHook::arm($sid, role => 'manual', by => 'on');
+        my $proj_empty = "$TMPROOT/ac29a-proj";
+        make_path($proj_empty);   # deliberately no .ccpraxis-local-data/almanac
+        write_ticket_argv($sid, ['off', '--reason', 'nothing to chart'], cwd => $proj_empty);
+        my ($out, $err, $rc) = run_cmd({ CLAUDE_PROJECT_DIR => $proj_empty, ':cwd' => $proj_empty },
+            'off', '--reason', 'nothing to chart');
+        is($rc, 0, 'AC-29a: off --reason exits 0') or diag("stderr: $err");
+        is($out, "continuity off for session " . s8($sid) . " (actor agent); reason logged.\nYour tasklist has no open tasks.\n",
+            'AC-29a: stdout is exactly the existing off line then the no-open-tasks line (no tasklist at all)');
+    }
+    # (b) only done tasks.
+    {
+        fresh_state_dir();
+        my $sid = sess_id('ac29b');
+        BpHook::arm($sid, role => 'manual', by => 'on');
+        my $proj_ac29b = "$TMPROOT/ac29b-proj";
+        make_path("$proj_ac29b/.ccpraxis-local-data");
+        my $rec = eval { Almanac::Task::add(root => $proj_ac29b, title => 'already finished') };
+        my $id  = (ref $rec eq 'HASH') ? $rec->{id} : undef;
+        eval { Almanac::Task::set_status($id, 'done', root => $proj_ac29b) } if defined $id;
+        write_ticket_argv($sid, ['off', '--reason', 'all tasks done'], cwd => $proj_ac29b);
+        my ($out, $err, $rc) = run_cmd({ CLAUDE_PROJECT_DIR => $proj_ac29b, ':cwd' => $proj_ac29b },
+            'off', '--reason', 'all tasks done');
+        is($rc, 0, 'AC-29b: off --reason exits 0') or diag("stderr: $err");
+        is($out, "continuity off for session " . s8($sid) . " (actor agent); reason logged.\nYour tasklist has no open tasks.\n",
+            'AC-29b: stdout is exactly the existing off line then the no-open-tasks line (only done tasks)');
+    }
+}
+
+# ===========================================================================
+# AC-30 (B24): a session focused onto another project's tasklist -> off
+# lists that other project's open task, not $PROJECT's own.
+# ===========================================================================
+{
+    fresh_state_dir();
+    my $sid = sess_id('ac30');
+    BpHook::arm($sid, role => 'manual', by => 'on');
+
+    my $p2 = "$TMPROOT/ac30-p2";
+    make_path("$p2/.ccpraxis-local-data");
+    my $rec_p2 = eval { Almanac::Task::add(root => $p2, title => 'P2 task') };
+    my $id_p2  = (ref $rec_p2 eq 'HASH') ? $rec_p2->{id} : undef;
+
+    my $rec_proj = eval { Almanac::Task::add(root => $PROJECT, title => 'PROJECT task') };
+
+    local %ENV = %ENV;
+    delete $ENV{CLAUDE_CODE_SESSION_ID};
+    my $task_pl = "$Bin/../../../almanac/scripts/almanac-task.pl";
+    system(qq{"$^X" "$task_pl" focus --session "$sid" --tasklist "$p2" --root "$PROJECT" > /dev/null 2>&1});
+
+    write_ticket_argv($sid, ['off', '--reason', 'checking focus routing']);
+    my ($out, $err, $rc) = run_cmd({}, 'off', '--reason', 'checking focus routing');
+    is($rc, 0, 'AC-30: off --reason exits 0') or diag("stderr: $err");
+
+    if (defined $id_p2) {
+        like($out, qr/\Q$id_p2\E pending P2 task/, 'AC-30: the listed task is P2\'s pending task');
+    }
+    unlike($out, qr/PROJECT task/, "AC-30: \$PROJECT's own pending task is NOT listed");
+}
+
+# ===========================================================================
+# AC-31 (B25): no almanac plugin beside butler (scripts copied alone) ->
+# `on` prints the existing line and the chart line only (no perl hint);
+# `off` prints the existing line only (no header, no tasks).
+# ===========================================================================
+{
+    my $iso_root = tempdir(CLEANUP => 1);
+    (my $iso = "$iso_root/butler") =~ s{\\}{/}g;
+    copy_tree("$Bin/../../scripts", "$iso/scripts");
+    ok(-f "$iso/scripts/butler-continuity.pl", 'AC-31 fixture: the copy carries butler-continuity.pl');
+    ok(!-e "$iso_root/almanac", 'AC-31 fixture: the isolated copy has no sibling almanac/ directory');
+    my $iso_cmd = "$iso/scripts/butler-continuity.pl";
+
+    fresh_state_dir();
+    my $sid_on = sess_id('ac31on');
+    write_ticket_argv($sid_on, ['on']);
+    my ($out_on, $err_on, $rc_on) = run_cmd_at($iso_cmd, {}, 'on');
+    is($rc_on, 0, 'AC-31: on (no sibling almanac) exits 0') or diag("stderr: $err_on");
+    is($out_on, "continuity on for session " . s8($sid_on) . " (role manual).\n"
+              . "Chart your tasklist now: add a task for each step still ahead and mark the current one doing.\n",
+       'AC-31: on stdout is exactly the existing line and the chart line (no perl hint line)');
+
+    my $sid_off = sess_id('ac31off');
+    BpHook::arm($sid_off, role => 'manual', by => 'on');
+    write_ticket_argv($sid_off, ['off', '--reason', 'a b']);
+    my ($out_off, $err_off, $rc_off) = run_cmd_at($iso_cmd, {}, 'off', '--reason', 'a b');
+    is($rc_off, 0, 'AC-31: off (no sibling almanac) exits 0') or diag("stderr: $err_off");
+    is($out_off, "continuity off for session " . s8($sid_off) . " (actor agent); reason logged.\n",
+       'AC-31: off stdout is exactly the existing line only (no header, no task lines)');
+}
+
+# ===========================================================================
+# AC-32 (B26): V1-V20 and every other existing CV assertion already pass
+# unedited above (not re-asserted here). A non-operator off with no reason
+# still refuses rc 1 with empty stdout; the coordinator on still prints
+# exactly its nothing-to-do line.
+# ===========================================================================
+{
+    fresh_state_dir();
+    my $sid = sess_id('ac32off');
+    BpHook::arm($sid, role => 'manual', by => 'on');
+    write_ticket_argv($sid, ['off']);
+    my ($out, $err, $rc) = run_cmd({}, 'off');
+    is($rc, 1, 'AC-32: a non-operator off with no reason exits 1');
+    is($out, '', 'AC-32: ...with empty stdout');
+
+    my $sid2 = sess_id('ac32on');
+    my ($out2, $err2, $rc2) = run_cmd({ BP_LEDGER => '/x/ledger.md' }, 'on');
+    is($rc2, 0, 'AC-32: coordinator on exits 0');
+    is($out2, "continuity is on by construction for a coordinator; nothing to do.\n",
+        'AC-32: coordinator on stdout is exactly the nothing-to-do line');
 }
 
 done_testing();

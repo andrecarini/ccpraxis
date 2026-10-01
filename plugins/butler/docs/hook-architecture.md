@@ -71,9 +71,10 @@ and `runs/<pkg>.force-stop`.
 | hooks.json | PostToolUse | (none) | denial-breaker.sh |
 | hooks.json | PostToolUseFailure | (none) | denial-breaker.sh |
 | hooks.json | SessionStart | (none) | denial-breaker.sh |
+| hooks.json | UserPromptSubmit | (none) | arm-nudge-prompt.sh |
 | settings.json | PreToolUse | Bash | guard-git-mutations.sh (sec 2.2 settings form) |
 
-This is 24 hooks.json commands and 1 settings.json command, every one in the guarded registration form
+This is 25 hooks.json commands and 1 settings.json command, every one in the guarded registration form
 of spec 16's section 2.2 (`unset BASH_ENV; f=...; w=.../run-hook.sh; [ -f "$f" ] && [ -f "$w" ] || exit 0;
 bash -n "$f" && bash -n "$w" || exit 0; exec env -u SHELLOPTS bash "$f"`), so a missing or broken script
 or wrapper never blocks (RT-M1), and neither BASH_ENV nor SHELLOPTS reach the hook's own bash (RT-L7).
@@ -260,6 +261,14 @@ reason: Registered without a matcher in the guarded 2.2 form; an allowed call th
 verdict: keep
 reason: Added by never-halt package 07 (FIX-3); registered without a matcher in the guarded 2.2 form so it fires on every SessionStart, resetting the per-session total_since offset so a resumed session isn't permanently falsely tripped.
 
+### file: arm-nudge-prompt.sh
+verdict: keep
+reason: Added by never-halt package 11 (Decision 43, N3); pure bash, it records each operator prompt's epoch and suggests arming on an unarmed prompt that signals unattended work.
+
+### registration: hooks.json UserPromptSubmit [] arm-nudge-prompt.sh
+verdict: keep
+reason: Registered without a matcher on UserPromptSubmit in the guarded 2.2 form; it never blocks and prints at most one additionalContext line.
+
 ## BpHook core API
 
 Package 03 builds `plugins/butler/scripts/BpHook.pm` and `plugins/butler/hooks/run-hook.sh`.
@@ -268,6 +277,12 @@ hook reads that answer through it, and none asks whether any drive is active in 
 was the defect behind bug 20260922-210421-0468. Everything below is tested in-process in
 `plugins/butler/tests/t/hook-core-api.t`, with `BUTLER_STATE_DIR` pointed at a tempdir and payloads
 passed as hashes (Decision 12).
+
+`BpHook::prompt_marker` (never-halt package 11) builds the path to the per-session prompt marker
+arm-nudge-prompt.sh writes, and `BpHook::last_prompt_epoch` and `BpHook::operator_off` are the
+readers of that marker's contents and of the off record's actor, used by the chart reminder's N5
+nudge to decide how long the session has gone without an operator message and whether an operator
+turned continuity off.
 
 ### Entry path and process budget
 
@@ -569,6 +584,7 @@ continuity/
   tickets/<k>/            command-binding tickets for one exact command.
   stop-tokens/            gate-minted stop tokens and one <sid>.current pointer per session.
   fork-ok/<sid>.json      package 19's one-shot fork override token, minted by butler-fork-ok.
+  prompted/<sid>          epoch of the session's last operator prompt (never-halt 11). Written in bash by arm-nudge-prompt.sh, read through BpHook::prompt_marker; not collected by gc_sessions.
   reasons.log             the Decision 7 reason log.
   hook-errors.log         internal errors caught by BpHook::main.
 ```
@@ -1145,6 +1161,7 @@ next fork dispatch, and the guard denies again after it. Decision 3 applies thro
 | record-prompt.sh | 0 | --pre ledger,driver : exits when BP_LEDGER is unset and the session is not an armed driver |
 | record-denial.sh | 0 | --pre ledger,driver : exits when BP_LEDGER is unset and the session is not an armed driver |
 | denial-breaker.sh | 3 | --pre ledger,driver : exits when BP_LEDGER is unset and the session is not an armed driver |
+| arm-nudge-prompt.sh | 1 | no run-hook.sh and no --pre (pure bash, never starts perl) : exits when BP_LEDGER is set, the payload is not a main-thread UserPromptSubmit, or the prompt is a task-notification |
 
 **Who each rule applies to.** A fork counts as a subagent everywhere.
 
@@ -1169,6 +1186,8 @@ next fork dispatch, and the guard denies again after it. Decision 3 applies thro
 - guard-ask-operator: coordinator, or any caller in an armed session.
 - track-dispatch: coordinator, and an armed driver's main thread.
 - guard-fork: every session and caller (Decision 64).
+- arm-nudge-prompt: the main thread's operator prompts only; a task-notification, a subagent payload
+  or a BP_LEDGER environment is skipped before anything is written.
 
 Behaviour kept by package 14, and which existing tests each rebuild re-expresses in
 `plugins/butler/tests/t/guards-remake-suite.t` (Decision 26: assertions about a Decision 6 override

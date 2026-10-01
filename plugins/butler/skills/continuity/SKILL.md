@@ -48,13 +48,13 @@ Run these as plain Bash tool calls, arguments in single quotes.
   it word for word.
 - **Operator branch:** a reasonless `off` works only when the operator's own message was
   `/butler:continuity off`. If it refuses, the agent started the off itself and needs a `--reason`.
-- **Output:** `on` prints `continuity on for session <sid> (role <role>)`. `off` prints
+- **Output:** `on` prints `continuity on for session <sid> (role <role>)` and a line to chart your tasklist. `off` prints
   `continuity off for session <sid> (actor ...); reason logged`. `status` prints an armed/off/not
   armed line, a `holder:` line, an optional `silence:` line, and a `wake-lock:` line. `silence`
   prints `continuity silenced for one stop of session <sid>; reason logged`.
 - **Self-arm triggers:** run `butler-continuity on` before starting background work you expect to
   outlive the turn, or before unattended multi-step work — for example when the operator is away
-  or said "keep going". Do not self-arm for one interactive answer.
+  or said "keep going". Do not self-arm for one interactive answer. Hooks nudge toward arming; arming stays your call.
 - **Off** (`butler-continuity off --reason '<what is done>'`) is right only when all work is done
   or the operator ended it. It stays off until an explicit `on`; a later director call does not
   re-arm it. A persistent process nobody is waiting on (a dev server, `tail -f`) is not work to hold; if nothing else is pending, off with a reason is the right move.

@@ -73,6 +73,7 @@ sub read_json {
 # ===========================================================================
 {
     my @EXPECT_FILES = qw(
+        arm-nudge-prompt.sh
         arm-on-entry.sh bind-dispatch.sh context-ceiling.sh continuity-off-check.sh
         denial-breaker.sh
         gate-shutdown.sh guard-ask-operator.sh guard-bash.sh guard-blueprint-write.sh
@@ -80,7 +81,7 @@ sub read_json {
         record-denial.sh record-prompt.sh
         run-hook.sh stop-gate.sh track-dispatch.sh wait-shape-guard.sh
     );
-    is(scalar(@EXPECT_FILES), 20, 'sanity: this file\'s own sec 2.4 fixture list has 20 entries (never-halt 06 adds record-prompt.sh, record-denial.sh; never-halt 07 adds denial-breaker.sh)');
+    is(scalar(@EXPECT_FILES), 21, 'sanity: this file\'s own sec 2.4 fixture list has 21 entries (never-halt 06 adds record-prompt.sh, record-denial.sh; never-halt 07 adds denial-breaker.sh; never-halt 11 adds arm-nudge-prompt.sh)');
 
     opendir(my $dh, $HOOKS) or BAIL_OUT("cannot opendir $HOOKS: $!");
     my (@actual_files, @subdirs);
@@ -219,8 +220,8 @@ sub all_registered_commands {
         all_registered_commands($hooksjson, 'hooks.json'),
         all_registered_commands($settings,  'settings.json'),
     );
-    is(scalar(@combined), 25,
-       'B6a: exactly 25 commands are registered in total across hooks.json + settings.json (never-halt 06 adds 2, never-halt 07 adds 4: PreToolUse/PostToolUse/PostToolUseFailure/SessionStart denial-breaker.sh)')
+    is(scalar(@combined), 26,
+       'B6a: exactly 26 commands are registered in total across hooks.json + settings.json (never-halt 06 adds 2, never-halt 07 adds 4: PreToolUse/PostToolUse/PostToolUseFailure/SessionStart denial-breaker.sh; never-halt 11 adds 1: UserPromptSubmit arm-nudge-prompt.sh)')
         or diag('found ' . scalar(@combined) . ' registered commands');
 
     my (@bad_127, @bad_rc, @slow);

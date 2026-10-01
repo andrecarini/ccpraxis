@@ -874,4 +874,290 @@ DRIVER
     }
 }
 
+# =============================================================================
+# never-halt package 11-arming-nudges, N5 (DC3): AC-18..AC-25 of
+# .ccpraxis-local-data/blueprints/never-halt/specs/11-arming-nudges-spec.md
+# section 4. reminder-chart-tasklist.pl's N5 addition DOES NOT EXIST YET at
+# the time this block is written -- every assertion below is expected to
+# fail for exactly that reason, never a harness bug in this file.
+#
+# This block never relies on fire_reminder()'s own BP_*/CLAUDE_* scrub for
+# CCPRAXIS_ARM_NUDGE_MIN (fire_reminder only deletes BP_*/CLAUDE_* keys):
+# every case below explicitly deletes/sets CCPRAXIS_ARM_NUDGE_MIN itself.
+# =============================================================================
+
+# off_path/write_off/write_marker/nudged_path -- the N5 state-file formulas
+# from spec sec 1.3/2.5, built directly (not through BpHook, which this file
+# never requires) so these helpers work whether or not BpHook.pm has grown
+# its never-halt-11 additions yet.
+sub off_path   { my ($state, $sid) = @_; return "$state/continuity/off/$sid" }
+sub write_off {
+    my ($state, $sid, $actor) = @_;
+    make_path("$state/continuity/off");
+    open(my $fh, '>', off_path($state, $sid)) or die $!;
+    print {$fh} JSON::PP->new->encode({ actor => $actor });
+    close $fh;
+}
+sub write_marker {
+    my ($state, $sid, $epoch) = @_;
+    make_path("$state/continuity/prompted");
+    open(my $fh, '>', "$state/continuity/prompted/$sid") or die $!;
+    print {$fh} "$epoch\n";
+    close $fh;
+}
+sub nudged_path { my ($home, $sid) = @_; return "$home/.claude/almanac-state/chart-reminder/$sid.nudged" }
+
+sub n5_text { my ($n) = @_; return "No operator message for $n min and work continues. If this session should keep working without the operator, arm continuity: butler-continuity on" }
+sub n5_regex {
+    my (@ns) = @_;
+    my $alt = join('|', map { quotemeta(n5_text($_)) } @ns);
+    return qr/\A(?:$alt)\z/;
+}
+
+# scrub_arm_nudge_min($env) -- explicit CCPRAXIS_ARM_NUDGE_MIN deletion,
+# per this package's test-writer note: fire_reminder() only scrubs
+# BP_*/CLAUDE_*, so an ambient CCPRAXIS_ARM_NUDGE_MIN would otherwise leak
+# into every baseline case below.
+sub scrub_arm_nudge_min { my ($env) = @_; $env->{CCPRAXIS_ARM_NUDGE_MIN} = undef; return $env }
+
+# =============================================================================
+# AC-18 + AC-19 (B12, B13, B14): first fire at call 20, quiet through call
+# 40 (marker unchanged), fires again at call 60 once the marker is rewritten
+# stale again.
+# =============================================================================
+{
+    my $sid = fresh_sid();
+    my ($env, $home, $state, $proj) = base_env();
+    scrub_arm_nudge_min($env);
+    my $marker_epoch = time() - 31 * 60;
+    write_marker($state, $sid, $marker_epoch);
+
+    my $last;
+    for my $i (1 .. 20) {
+        $last = fire_reminder(mkpayload(sid => $sid, cwd => $proj), %$env);
+        is($last->{out}, '', "AC-18: call $i prints nothing") if $i < 20;
+    }
+    my $d = decode_out($last->{out});
+    ok(ref($d) eq 'HASH', 'AC-18: call 20 prints exactly one decodable JSON line')
+        or diag("stdout=[$last->{out}]");
+    if (ref($d) eq 'HASH') {
+        is($d->{hookSpecificOutput}{hookEventName}, 'PostToolUse', 'AC-18: call 20 hookEventName is PostToolUse');
+        like($d->{hookSpecificOutput}{additionalContext}, n5_regex(31, 32),
+            'AC-18: call 20 additionalContext matches the N5 text with N 31 or 32');
+    }
+    is($last->{err}, '', 'AC-18: call 20 stderr is empty');
+    is(slurp(nudged_path($home, $sid)), "$marker_epoch\n", 'AC-18: the .nudged file holds the marker epoch');
+
+    # AC-19: calls 21-39 quiet (marker unchanged), call 40 quiet too.
+    for my $i (21 .. 40) {
+        my $r = fire_reminder(mkpayload(sid => $sid, cwd => $proj), %$env);
+        is($r->{out}, '', "AC-19: call $i prints nothing (marker unchanged)");
+    }
+
+    # a new, later marker epoch -> fires again at the next 20th call (60).
+    my $marker_epoch2 = time() - 45 * 60;
+    write_marker($state, $sid, $marker_epoch2);
+    my $last60;
+    for my $i (41 .. 60) {
+        $last60 = fire_reminder(mkpayload(sid => $sid, cwd => $proj), %$env);
+        is($last60->{out}, '', "AC-19: call $i prints nothing") if $i < 60;
+    }
+    my $d60 = decode_out($last60->{out});
+    ok(ref($d60) eq 'HASH', 'AC-19: call 60 prints exactly one decodable JSON line')
+        or diag("stdout=[$last60->{out}]");
+    if (ref($d60) eq 'HASH') {
+        like($d60->{hookSpecificOutput}{additionalContext}, n5_regex(45, 46),
+            'AC-19: call 60 additionalContext matches the N5 text with N 45 or 46 (a new operator prompt nudges again)');
+    }
+}
+
+# =============================================================================
+# AC-20 (B15): quiet cases -- armed, judge, operator off, fresh marker,
+# missing marker, garbage marker. An agent off does NOT suppress it. Every
+# run: rc 0, stderr empty, 0 tickets left after call 20.
+# =============================================================================
+{
+    my %cases = (
+        armed => sub {
+            my ($env, $home, $state, $sid) = @_;
+            touch_armed($state, $sid);
+            write_marker($state, $sid, time() - 31 * 60);
+        },
+        judge => sub {
+            my ($env, $home, $state, $sid) = @_;
+            $env->{BP_LEDGER} = '1';
+            $env->{BP_ROLE}   = 'harvest-judge';
+            write_marker($state, $sid, time() - 31 * 60);
+        },
+        'operator off' => sub {
+            my ($env, $home, $state, $sid) = @_;
+            write_off($state, $sid, 'operator');
+            write_marker($state, $sid, time() - 31 * 60);
+        },
+        'fresh marker' => sub {
+            my ($env, $home, $state, $sid) = @_;
+            write_marker($state, $sid, time() - 5 * 60);
+        },
+        'absent marker' => sub {
+            my ($env, $home, $state, $sid) = @_;
+            # no marker written at all
+        },
+        'garbage marker' => sub {
+            my ($env, $home, $state, $sid) = @_;
+            make_path("$state/continuity/prompted");
+            open(my $fh, '>', "$state/continuity/prompted/$sid") or die $!;
+            print {$fh} "garbage\n";
+            close $fh;
+        },
+    );
+    for my $label (sort keys %cases) {
+        my $sid = fresh_sid();
+        my ($env, $home, $state, $proj) = base_env();
+        scrub_arm_nudge_min($env);
+        $cases{$label}->($env, $home, $state, $sid);
+        my $last;
+        for (1 .. 20) { $last = fire_reminder(mkpayload(sid => $sid, cwd => $proj), %$env) }
+        if ($label eq 'armed') {
+            isnt($last->{out}, '', "AC-20 [$label]: call 20 fires (armed makes gate true)");
+        } else {
+            is($last->{out}, '', "AC-20 [$label]: call 20 prints nothing");
+        }
+        is($last->{rc}, 0, "AC-20 [$label]: call 20 exits 0");
+        is($last->{err}, '', "AC-20 [$label]: call 20 stderr is empty");
+        is(scalar(ticket_names(ticket_dir($home, $sid))), 0, "AC-20 [$label]: 0 tickets remain after call 20");
+    }
+
+    # positive: an agent off does NOT suppress the nudge.
+    {
+        my $sid = fresh_sid();
+        my ($env, $home, $state, $proj) = base_env();
+        scrub_arm_nudge_min($env);
+        write_off($state, $sid, 'agent');
+        write_marker($state, $sid, time() - 31 * 60);
+        my $last;
+        for (1 .. 20) { $last = fire_reminder(mkpayload(sid => $sid, cwd => $proj), %$env) }
+        is($last->{rc}, 0, 'AC-20 [agent off]: call 20 exits 0');
+        is($last->{err}, '', 'AC-20 [agent off]: call 20 stderr is empty');
+        isnt($last->{out}, '', 'AC-20 [agent off]: call 20 prints the N5 line (agent off does not suppress it)');
+        is(scalar(ticket_names(ticket_dir($home, $sid))), 0, 'AC-20 [agent off]: 0 tickets remain after call 20');
+    }
+}
+
+# =============================================================================
+# AC-21 (B16): CCPRAXIS_ARM_NUDGE_MIN override. 5 with a 6-min marker fires
+# with N 6 or 7; 0/abc/1441/'' with a 6-min marker fall back to 30 (so a
+# 6-minute-old marker stays quiet).
+# =============================================================================
+{
+    my $sid = fresh_sid();
+    my ($env, $home, $state, $proj) = base_env();
+    $env->{CCPRAXIS_ARM_NUDGE_MIN} = 5;
+    write_marker($state, $sid, time() - 6 * 60);
+    my $last;
+    for (1 .. 20) { $last = fire_reminder(mkpayload(sid => $sid, cwd => $proj), %$env) }
+    my $d = decode_out($last->{out});
+    ok(ref($d) eq 'HASH', 'AC-21: CCPRAXIS_ARM_NUDGE_MIN=5 with a 6-min marker fires at call 20')
+        or diag("stdout=[$last->{out}]");
+    like($d->{hookSpecificOutput}{additionalContext}, n5_regex(6, 7),
+        'AC-21: N is 6 or 7') if ref($d) eq 'HASH';
+
+    for my $bad (0, 'abc', 1441, '') {
+        my $sid2 = fresh_sid();
+        my ($env2, $home2, $state2, $proj2) = base_env();
+        $env2->{CCPRAXIS_ARM_NUDGE_MIN} = $bad;
+        write_marker($state2, $sid2, time() - 6 * 60);
+        my $last2;
+        for (1 .. 20) { $last2 = fire_reminder(mkpayload(sid => $sid2, cwd => $proj2), %$env2) }
+        is($last2->{out}, '', "AC-21: CCPRAXIS_ARM_NUDGE_MIN='$bad' falls back to 30 -- a 6-min marker stays quiet");
+    }
+}
+
+# =============================================================================
+# AC-22 (B17): focused and unarmed with a stale marker -> one line, X (the
+# unchanged reminder text) + "\n" + the N5 line.
+# =============================================================================
+{
+    my $sid = fresh_sid();
+    my ($env, $home, $state, $proj) = base_env();
+    scrub_arm_nudge_min($env);
+    is(do_focus($sid, $proj), 0, 'AC-22 fixture: focus succeeds');
+    write_marker($state, $sid, time() - 31 * 60);
+    my $last;
+    for (1 .. 20) { $last = fire_reminder(mkpayload(sid => $sid, cwd => $proj), %$env) }
+    my $d = decode_out($last->{out});
+    ok(ref($d) eq 'HASH', 'AC-22: call 20 (focused, unarmed, stale marker) prints exactly one decodable JSON line')
+        or diag("stdout=[$last->{out}]");
+    if (ref($d) eq 'HASH') {
+        # The existing reminder text (X) already carries its own embedded
+        # "\n" (prefix sentence, then the almanac-task.pl hint line), so the
+        # N5 line -- always a single line with no embedded "\n" -- is
+        # recovered from the END of $ctx, not by splitting on the FIRST
+        # "\n".
+        my $ctx = $d->{hookSpecificOutput}{additionalContext} // '';
+        my ($x, $rest) = $ctx =~ /\A(.*)\n([^\n]*)\z/s;
+        assert_reminder_text($x // $ctx, 20, $ALM, 'AC-22: the reminder half (X)');
+        like($rest // '', n5_regex(31, 32), 'AC-22: the N5 half follows one "\n"');
+    }
+}
+
+# =============================================================================
+# AC-23 (B18): a stale marker, R-12-style perl shim -- calls 1 and 19 launch
+# zero perl, call 20 launches exactly one, and call 20 printed the N5 line.
+# =============================================================================
+{
+    my $real_perl = (File::Spec->file_name_is_absolute($^X) && -x $^X) ? $^X
+                   : do { my $p = `bash -c "command -v perl"`; chomp $p; $p };
+    my $shim = tempdir(CLEANUP => 1);
+    open(my $pfh, '>', "$shim/perl") or die $!;
+    print {$pfh} "#!/usr/bin/env bash\nprintf 'perl %s\\n' \"\$\$\" >> \"\$SHIM_LOG\"\nexec \"$real_perl\" \"\$\@\"\n";
+    close $pfh;
+    chmod 0755, "$shim/perl";
+
+    my $sid = fresh_sid();
+    my ($env, $home, $state, $proj) = base_env();
+    scrub_arm_nudge_min($env);
+    write_marker($state, $sid, time() - 31 * 60);
+    my (undef, $log) = tempfile();
+    $env->{SHIM_LOG} = $log;
+    $env->{PATH} = "$shim:$ENV{PATH}";
+
+    my $last;
+    for my $i (1 .. 20) {
+        unlink $log;
+        $last = fire_reminder(mkpayload(sid => $sid, cwd => $proj), %$env);
+        my $count = () = ((slurp($log) // '') =~ /^perl /mg);
+        if ($i == 20) {
+            is($count, 1, 'AC-23: the firing call (20, stale marker) launches perl exactly once');
+            isnt($last->{out}, '', 'AC-23: ...and call 20 actually printed the N5 line');
+        } elsif ($i == 1 || $i == 19) {
+            is($count, 0, "AC-23: an ordinary call ($i) launches perl ZERO times");
+        }
+    }
+}
+
+# =============================================================================
+# AC-24 (B19): a stale marker, 19 main calls, then one subagent call (never
+# counted, never prints), then the 20th main call prints the N5 line.
+# =============================================================================
+{
+    my $sid = fresh_sid();
+    my ($env, $home, $state, $proj) = base_env();
+    scrub_arm_nudge_min($env);
+    write_marker($state, $sid, time() - 31 * 60);
+    for (1 .. 19) { fire_reminder(mkpayload(sid => $sid, cwd => $proj), %$env) }
+
+    my $sub_r = fire_reminder(mkpayload(sid => $sid, cwd => $proj, agent_id => 'sub-1'), %$env);
+    is($sub_r->{out}, '', 'AC-24: a subagent call prints nothing (not counted)');
+
+    my $r20 = fire_reminder(mkpayload(sid => $sid, cwd => $proj), %$env);
+    isnt($r20->{out}, '', 'AC-24: the next main call (the true 20th) prints the N5 line');
+}
+
+# =============================================================================
+# AC-25: static scan for R-12 (no spawn/fork/alarm) and R-11 (one <STDIN>)
+# is already asserted above, byte-identically, in the R-11 and R-12 blocks
+# of this same file -- no further assertion is needed here; this comment
+# exists only for traceability from the spec's AC numbering.
+# =============================================================================
+
 done_testing();

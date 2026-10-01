@@ -22,6 +22,7 @@ use warnings;
 use FindBin qw($Bin);
 use JSON::PP ();
 use POSIX qw(strftime);
+use Cwd ();
 
 require "$Bin/BpHook.pm"
     unless grep { m{(?:^|/)BpHook\.pm$} } keys %INC;
@@ -174,6 +175,85 @@ sub plan_after_off {
     return;
 }
 
+# _task_pl_path() -- never-halt package 11 (Decision 43, N7, spec sec 2.6):
+# the P used by both the "on" chart-now hint and the "off" open-tasks
+# listing. Cwd::abs_path of almanac-task.pl beside butler's own scripts
+# dir, forward-slashed; undef when the almanac plugin is not installed
+# beside this one (AC-31: a standalone copy of plugins/butler/scripts/).
+sub _task_pl_path {
+    my $p = Cwd::abs_path("$Bin/../../almanac/scripts/almanac-task.pl");
+    return undef unless defined $p && length $p;
+    return undef unless -f $p;
+    $p =~ s{\\}{/}g;
+    return $p;
+}
+
+# _print_n7_off($sid, $cwd) -- never-halt package 11 N7, spec sec 2.6: after
+# "off"'s existing line, list the session's still-open tasks (its focused
+# tasklist, else the project tasklist for $cwd). Never dies, never writes to
+# stderr, never changes the exit code; prints nothing more on any failure
+# (missing almanac plugin, load failure, or a store error).
+sub _print_n7_off {
+    my ($sid, $cwd) = @_;
+    my $P = _task_pl_path();
+    return unless defined $P;
+
+    unless (grep { m{(?:^|/)almanac-task\.pl$} } keys %INC) {
+        local $@;
+        my $ok = eval { require $P; 1 };
+        return unless $ok;
+    }
+
+    my $have_cwd = defined $cwd && length $cwd;
+    my $root;
+    {
+        local $@;
+        $root = eval {
+            $have_cwd
+                ? Almanac::Task::focused(session => $sid, cwd => $cwd)
+                : Almanac::Task::focused(session => $sid);
+        };
+        return if $@;
+    }
+    my $list;
+    {
+        local $@;
+        $list = eval {
+            defined $root
+                ? Almanac::Task::list_tasks(root => $root)
+                : ($have_cwd ? Almanac::Task::list_tasks(cwd => $cwd) : Almanac::Task::list_tasks());
+        };
+        return if $@;
+    }
+    return unless ref $list eq 'ARRAY';
+
+    my %OPEN = (pending => 1, doing => 1, blocked => 1);
+    my @open = grep {
+        ref $_ eq 'HASH' && ref $_->{fields} eq 'HASH'
+            && defined $_->{fields}{status} && $OPEN{ $_->{fields}{status} }
+    } @$list;
+
+    unless (@open) {
+        out("Your tasklist has no open tasks.\n");
+        return;
+    }
+
+    out("Still open in your tasklist; chart any that are stale now:\n");
+    my $shown = 0;
+    for my $t (@open) {
+        last if $shown >= 10;
+        my $title = sanitize_text($t->{fields}{title});
+        $title = substr($title, 0, 77) . '...' if length($title) > 80;
+        out("  $t->{id} $t->{fields}{status} $title\n");
+        $shown++;
+    }
+    if (@open > 10) {
+        out('  ... and ' . (scalar(@open) - 10) . " more\n");
+    }
+    out("  perl $P status <id> doing|blocked|done|obsoleted\n");
+    return;
+}
+
 sub lease_sync {
     return if $ENV{CCPRAXIS_NO_WAKELOCK};
     my $ldir = BpContinuityLease::legacy_dir();
@@ -287,7 +367,7 @@ if ($verb ne 'ask' && $verb ne 'questions' && $verb ne 'answer') {
 # ---------------------------------------------------------------------------
 # Step 4: binding (on, off, silence, status).
 # ---------------------------------------------------------------------------
-my ($SID, $AID, $OPERATOR_TICKET, $PROJECT, $TRANSCRIPT_PATH);
+my ($SID, $AID, $OPERATOR_TICKET, $PROJECT, $TRANSCRIPT_PATH, $TICKET_CWD);
 
 if ($verb eq 'on' || $verb eq 'off' || $verb eq 'silence' || $verb eq 'status') {
     my $t = BpHook::take_ticket('butler-continuity', \@argv0);
@@ -298,6 +378,7 @@ if ($verb eq 'on' || $verb eq 'off' || $verb eq 'silence' || $verb eq 'status') 
         $OPERATOR_TICKET  = (JSON::PP::is_bool($t->{operator}) && $t->{operator}) ? 1 : 0;
         $TRANSCRIPT_PATH  = $t->{transcript_path};
         $PROJECT          = project_of($t->{cwd});
+        $TICKET_CWD       = (defined $t->{cwd} && length $t->{cwd}) ? $t->{cwd} : undef;
 
         if (exists $flags{token} && defined $flags{token}) {
             my $s2 = BpHook::take_stop_token($flags{token});    # always consumed when given
@@ -351,6 +432,9 @@ if ($verb eq 'on') {
         refuse("could not write continuity state (" . (BpHook::last_error() // '') . ").");
     }
     out("continuity on for session $S8 (role $role).\n");
+    out("Chart your tasklist now: add a task for each step still ahead and mark the current one doing.\n");
+    my $P = _task_pl_path();
+    out("  perl $P focus | list | add --title '<step>' | status <id> doing|blocked|done\n") if defined $P;
     lease_sync();
     exit 0;
 }
@@ -379,6 +463,7 @@ if ($verb eq 'off') {
 
     my $note = $was_armed ? '' : '; was not armed';
     out("continuity off for session $S8 (actor $actor$note); reason logged.\n");
+    _print_n7_off($SID, $TICKET_CWD);
     unless ($logged) {
         binmode(STDERR, ':raw');
         print STDERR "butler-continuity: warning: reason log not written.\n";
