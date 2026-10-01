@@ -255,12 +255,17 @@ for my $case (
     SKIP: {
         skip 'hooks.json does not decode yet', 3 unless ref $cfg eq 'HASH';
 
+        # Package 13 adds a THIRD PreToolUse entry (matcher "Bash") whose
+        # command also names guard-almanac-write.sh, so a command-text grep
+        # now matches two entries. Count by matcher instead -- the
+        # Edit|Write|MultiEdit|NotebookEdit entry itself is still exactly
+        # one and byte-identical (asserted below), which is what this
+        # criterion is actually pinning.
         my @edit_entries;
         for my $blk (@{ $cfg->{hooks}{PreToolUse} || [] }) {
-            my @cmds = map { $_->{command} // '' } @{ $blk->{hooks} || [] };
-            push @edit_entries, $blk if grep { /guard-almanac-write\.sh/ } @cmds;
+            push @edit_entries, $blk if ($blk->{matcher} // '') eq 'Edit|Write|MultiEdit|NotebookEdit';
         }
-        is(scalar(@edit_entries), 1, 'G-6: exactly one entry still runs guard-almanac-write.sh');
+        is(scalar(@edit_entries), 1, 'G-6: exactly one entry has matcher Edit|Write|MultiEdit|NotebookEdit');
         if (@edit_entries) {
             is($edit_entries[0]{matcher}, 'Edit|Write|MultiEdit|NotebookEdit', 'G-6: its matcher is unchanged');
             is(scalar(@{ $edit_entries[0]{hooks} || [] }), 1, 'G-6: still exactly one hook object');

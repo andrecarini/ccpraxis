@@ -11,6 +11,16 @@
         ]
       },
       {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 15,
+            "command": "unset BASH_ENV ; f=\"${CLAUDE_PLUGIN_ROOT}/hooks/guard-almanac-write.sh\" ; [ -f \"$f\" ] || exit 0 ; exec env -u SHELLOPTS bash \"$f\""
+          }
+        ]
+      },
+      {
         "matcher": "TaskCreate|TaskUpdate|TaskList|TaskGet",
         "hooks": [
           {
