@@ -721,12 +721,26 @@ sub _perl_cluster_code_text {
 # never touches a test file" (S6: allow) apart from "the code itself
 # do/require/runtests a test file" (S2(b): still a test run).
 sub _perl_opt_walk {
-    my ($words, $start) = @_;
+    my ($words, $start, $opts) = @_;
+    $opts ||= {};
+    my $keep_unpredictable = $opts->{keep_unpredictable} ? 1 : 0;
     my $i = defined $start ? $start : 0;
     my $n = scalar @$words;
     while ($i < $n) {
         my $t = _word_text($words->[$i]);
-        return (undef, 0, undef) unless defined $t;
+        if (!defined $t) {
+            # never-halt 09-gb-h-residuals sec 3.14 (Decision 38): a caller
+            # that opts in (_perl_test_run only) keeps an unpredictable word
+            # as the script index, PROVIDED it doesn't look like an option
+            # (raw text starting with '-') -- an unpredictable thing that
+            # LOOKS like an option is still too ambiguous to walk past, so
+            # that case still aborts exactly like today.
+            if ($keep_unpredictable) {
+                my $raw = $words->[$i]{raw};
+                return ($i, 0, undef) unless defined $raw && $raw =~ /^-/;
+            }
+            return (undef, 0, undef);
+        }
         if ($t eq '--') { $i++; last }
         if ($t =~ /^-[wWXtT]*c[wWXtT]*$/) { return (undef, 1, undef) }
         if ($t =~ /^-MO[=:]/)             { return (undef, 1, undef) }
@@ -774,6 +788,70 @@ sub _runner_or_dot_t_name {
     return 0;
 }
 
+# never-halt 09-gb-h-residuals sec 3.14 (Decision 38) -- rule (a): a RAW
+# word's own text (quotes stripped, backslash turned to forward slash) is
+# test-run-shaped by itself: it ends in ".t" (case-insensitive on
+# Windows-family perls) or its basename is "run-tests.pl". Independent of
+# whether the word is predictable -- "plugins/fx/tests/t/*.t" and
+# "$D/alpha.t" both qualify this way, without resolving $D at all.
+sub _d38_raw_is_test_shaped {
+    my ($raw, $is_winfam) = @_;
+    return 0 unless defined $raw;
+    (my $rf = $raw) =~ s/['"]//g;
+    $rf =~ tr{\\}{/};
+    return 1 if $is_winfam ? ($rf =~ /\.t$/i) : ($rf =~ /\.t$/);
+    (my $base = $rf) =~ s{.*/}{};
+    $base = lc($base) if $is_winfam;
+    return 1 if $base eq 'run-tests.pl';
+    return 0;
+}
+
+# never-halt 09-gb-h-residuals sec 3.14 (Decision 38) -- rule (b): NAME gets
+# a test-run-shaped value in one of two ways within the SAME command text
+# (every segment of BpHook::_segments($cmd)): a leading NAME=value word of
+# any segment (including right after "export"), or a segment shaped
+# "for NAME in W1 W2 ..." where any Wi is test-shaped by rule (a).
+sub _d38_name_resolves_test_shaped {
+    my ($cmd, $name, $is_winfam) = @_;
+    return 0 unless defined $cmd && defined $name && length $name;
+    my @segs = eval { BpHook::_segments($cmd) };
+    return 0 unless @segs;
+    for my $seg (@segs) {
+        next unless defined $seg && length $seg;
+        my $words = BpHook::_tokenize_words($seg);
+        next unless ref $words eq 'ARRAY' && @$words;
+
+        my $wi = 0;
+        $wi++ if defined $words->[0]{literal} && $words->[0]{literal} eq 'export';
+        # never-halt 09-gb-h-residuals SHOULD-FIX 6 (reviewer S2): walk
+        # EVERY leading "NAME=value" word of the segment, not just the
+        # first -- "X=1 S=plugins/fx/tests/t/a.t; perl "$S"" has two
+        # leading assignments, and checking only the first (X) never
+        # consults S's value, letting a real test run past the interlock.
+        while ($wi < @$words) {
+            my $raw = $words->[$wi]{raw};
+            last unless defined $raw && $raw =~ /^[A-Za-z_][A-Za-z0-9_]*=/;
+            if ($raw =~ /^\Q$name\E=(.*)$/s) {
+                return 1 if _d38_raw_is_test_shaped($1, $is_winfam);
+            }
+            $wi++;
+        }
+
+        if (@$words >= 4
+            && defined $words->[0]{literal} && $words->[0]{literal} eq 'for'
+            && defined $words->[1]{literal} && $words->[1]{literal} eq $name
+            && defined $words->[2]{literal} && $words->[2]{literal} eq 'in')
+        {
+            for my $j (3 .. $#$words) {
+                my $raw = $words->[$j]{raw};
+                next unless defined $raw;
+                return 1 if _d38_raw_is_test_shaped($raw, $is_winfam);
+            }
+        }
+    }
+    return 0;
+}
+
 # _perl_test_run($cmd) -> 0|1. Never dies (wrapped in eval); a parse failure
 # other than the shared deadline marker fails open (0), leaving the
 # existing regex's verdict untouched. A deadline hit fails CLOSED (N5): the
@@ -797,7 +875,7 @@ sub _perl_test_run {
                 || $cmd =~ /~\d+\.(?:pl|t)\b/i
                 || ($cmd =~ /\bw?perl/i && ($cmd =~ /\bxargs\b/i || $cmd =~ /\bfind\b/i));
 
-        my $deadline = Time::HiRes::time() + 2;
+        my $deadline = _hyg_deadline_at(2);
         my $is_winfam = _hyg_is_winfam();
         for my $e (_hyg_commands($cmd, 0, $deadline)) {
             next unless ref $e eq 'HASH';
@@ -865,7 +943,12 @@ sub _perl_test_run {
             next unless _perl_binary_name($name);
 
             my ($ops, undef) = _hyg_scan_redirects($e->{argv} || []);
-            my ($idx, $is_c, $code) = _perl_opt_walk($ops, 0);
+            # never-halt 09-gb-h-residuals sec 3.14 (Decision 38): opt in to
+            # keeping an unpredictable, non-option-looking script word as
+            # the index (instead of aborting the walk) -- D38's own rules
+            # below decide whether it counts as a test run, rather than the
+            # old blanket "whole command mentions .t" fallback.
+            my ($idx, $is_c, $code) = _perl_opt_walk($ops, 0, { keep_unpredictable => 1 });
             next if $is_c;
 
             if (defined $code) {
@@ -881,14 +964,41 @@ sub _perl_test_run {
 
             if (!defined $idx) {
                 # S2(a)/M1: no predictable script word -- stdin/pipe/
-                # redirect-only argv, or an unresolvable ($VAR/glob) script
-                # word. Fall back to whether the WHOLE command mentions a
+                # redirect-only argv, or an argv that ends after the
+                # options. Fall back to whether the WHOLE command mentions a
                 # .t file, the runner, or a tests/t/ directory.
                 return 1 if $cmd =~ /\.t\b/i || $cmd =~ /run-tests\.pl/i || $cmd =~ m{tests/t/}i;
                 next;
             }
 
             my $s = _word_text($ops->[$idx]);
+
+            if (!defined $s && !(defined $ops->[$idx]{literal})
+                && defined $ops->[$idx]{raw})
+            {
+                # D38: the script word's own text is unpredictable (a
+                # variable, command substitution or glob) -- it counts as a
+                # test run ONLY via rule (a) (its own raw text is .t-/
+                # runner-shaped) or rule (b) (it is exactly $NAME/${NAME},
+                # and NAME resolves to a .t-/runner-shaped value elsewhere
+                # in the same command). Mere MENTION of ".t" anywhere else
+                # on the line (e.g. inside a --text value) is not enough.
+                my $raw_idx = $ops->[$idx]{raw};
+                if (_d38_raw_is_test_shaped($raw_idx, $is_winfam)) { return 1 }
+                my $name_var;
+                if ($raw_idx =~ /^"\$\{([A-Za-z_][A-Za-z0-9_]*)\}"$/
+                    || $raw_idx =~ /^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$/)
+                { $name_var = $1 }
+                elsif ($raw_idx =~ /^"\$([A-Za-z_][A-Za-z0-9_]*)"$/
+                    || $raw_idx =~ /^\$([A-Za-z_][A-Za-z0-9_]*)$/)
+                { $name_var = $1 }
+                if (defined $name_var
+                    && _d38_name_resolves_test_shaped($cmd, $name_var, $is_winfam))
+                {
+                    return 1;
+                }
+                next;
+            }
             # S2(a): _hyg_scan_redirects only drops OUTPUT-shaped redirects
             # (it exists to find write TARGETS) -- an input redirect ("<",
             # possibly fd-prefixed) is left in $ops untouched, so it can
@@ -1155,6 +1265,38 @@ sub _read_ledger_write_set {
     return \@ws;
 }
 
+# _ledger_scope_paths($data_n, $bp, $pkg) -> \@entries | undef.
+# never-halt 09-gb-h-residuals sec 2.2/3.13 (Decision 36 N6): the named
+# ledger's write_set entries PLUS its test_paths entries -- reads the
+# frontmatter exactly as _read_ledger_write_set does. A missing
+# "test_paths:" key contributes nothing (not an error).
+sub _ledger_scope_paths {
+    my ($data_n, $bp, $pkg) = @_;
+    return undef unless defined $data_n && length $data_n;
+    return undef unless _valid_member_name($bp) && _valid_member_name($pkg);
+    my $lraw = _read_bytes("$data_n/blueprints/$bp/packages/$pkg.md");
+    return undef unless defined $lraw && length $lraw;
+    my @lines = split /\n/, $lraw;
+    return undef unless @lines;
+    (my $first = $lines[0]) =~ s/[ \t\r]+$//;
+    return undef unless $first eq '---';
+
+    my ($ws_val, $tp_val);
+    for my $i (1 .. $#lines) {
+        (my $l = $lines[$i]) =~ s/\r$//;
+        last if $l eq '---';
+        if (!defined $ws_val && $l =~ /^write_set:[\x20\t]*(.*?)[\x20\t]*$/) { $ws_val = $1 }
+        if (!defined $tp_val && $l =~ /^test_paths:[\x20\t]*(.*?)[\x20\t]*$/) { $tp_val = $1 }
+    }
+    return undef unless defined $ws_val;
+    my @out = grep { length } split /:/, $ws_val;
+    return undef unless @out;
+    if (defined $tp_val && length $tp_val) {
+        push @out, grep { length } split /:/, $tp_val;
+    }
+    return \@out;
+}
+
 # _resolve_binding($data_n, $tuid) -> { blueprint, package, write_set =>
 # [entries] } | undef. Spec sec 2.2. Never dies; any parse/read failure is
 # an undef (conservative fallback upstream).
@@ -1247,6 +1389,124 @@ sub _runner_basename_matches {
     (my $base = $t) =~ s{.*/}{};
     $base = lc($base) if _hyg_is_winfam();
     return $base eq 'run-tests.pl' ? 1 : 0;
+}
+
+# _scoped_test_operand($cmd) -> $text | undef. never-halt 09-gb-h-residuals
+# sec 3.13 (Decision 36 N6): reads segment 0 of BpHook::_segments($cmd),
+# tokenised and reduced (drops leading NAME= assignments and wrappers), and
+# returns the single scoped test-file/runner-flag text this run names, or
+# undef when there isn't exactly one.
+sub _scoped_test_operand {
+    my ($cmd) = @_;
+    my $r = eval {
+        return undef unless defined $cmd && length $cmd;
+        my @segs = BpHook::_segments($cmd);
+        my $seg0 = $segs[0];
+        return undef unless defined $seg0 && length $seg0;
+        my $words = BpHook::_tokenize_words($seg0);
+        return undef unless ref $words eq 'ARRAY' && @$words;
+        my ($name_word, $argv, undef) = _hyg_reduce($words);
+        return undef unless defined $name_word;
+        $argv ||= [];
+        my $name = _hyg_command_name($name_word);
+        my $is_winfam = _hyg_is_winfam();
+
+        my $S;
+        my @after_pool;
+        if (defined $name && _perl_binary_name($name)) {
+            my ($idx, $is_c, $code) = _perl_opt_walk($argv, 0);
+            return undef if $is_c || defined $code || !defined $idx;
+            $S = $argv->[$idx];
+            @after_pool = @$argv[$idx + 1 .. $#$argv];
+        }
+        else {
+            $S = $name_word;
+            @after_pool = @$argv;
+        }
+        return undef unless defined $S;
+
+        my $test_shaped = sub {
+            my ($text) = @_;
+            return 0 unless defined $text;
+            (my $tt = $text) =~ tr{\\}{/};
+            return $is_winfam ? ($tt =~ /\.t$/i ? 1 : 0) : ($tt =~ /\.t$/ ? 1 : 0);
+        };
+
+        if (_runner_basename_matches($S->{raw})) {
+            my @positionals;
+            my $j = 0;
+            my $m = scalar @after_pool;
+            while ($j < $m) {
+                my $w = $after_pool[$j];
+                my $lit = $w->{literal};
+                if (defined $lit && ($lit eq '--ledger' || $lit eq '--jobs')) { $j += 2; next }
+                my $probe = defined $lit ? $lit : $w->{raw};
+                if (defined $probe && $probe =~ /^-/) { $j++; next }
+                push @positionals, $w;
+                $j++;
+            }
+            return undef unless @positionals == 1;
+            my $text = _word_text($positionals[0]);
+            return undef unless defined $text;
+            (my $tt = $text) =~ tr{\\}{/};
+            return $tt if $test_shaped->($tt);
+            return undef;
+        }
+
+        my $text = _word_text($S);
+        return undef unless defined $text;
+        (my $tt = $text) =~ tr{\\}{/};
+        return $tt if $test_shaped->($tt);
+        return undef;
+    };
+    return undef if $@;
+    return $r;
+}
+
+# _operand_in_scope($operand, $data_n, \@scope_paths) -> 0|1.
+# never-halt 09-gb-h-residuals sec 3.13: normalises the operand to
+# repo-relative (an absolute path must fold under dirname($data_n)), then
+# checks it against every scope-path entry (normalised the same way
+# write_sets_overlap's own callers do, via _widen_ws_prefixes).
+sub _operand_in_scope {
+    my ($operand, $data_n, $scope_paths) = @_;
+    return 0 unless defined $operand && length $operand;
+    return 0 unless ref $scope_paths eq 'ARRAY' && @$scope_paths;
+    my $op = $operand;
+    $op =~ s{^\./}{};
+    my $rel;
+    if (_hyg_is_abs($op)) {
+        my $folded = _fold_path($op);
+        my $root = dirname($data_n);
+        $root =~ tr{\\}{/};
+        my $froot = _fold_path($root) . '/';
+        return 0 unless index($folded, $froot) == 0;
+        $rel = substr($folded, length($froot));
+    }
+    else {
+        $rel = $op;
+    }
+    # never-halt 09-gb-h-residuals MUST-FIX 4 (red-team M1): a ".." segment
+    # anywhere in the (already root-relativised) operand means the true,
+    # collapsed target is NOT what a bare prefix comparison would see --
+    # "plugins/fx/alpha/../tests/t/beta.t" prefix-matches scope
+    # "plugins/fx/alpha/" even though it really resolves to
+    # "plugins/fx/tests/t/beta.t", outside that scope. Rather than teach
+    # _fold_path to collapse "." / ".." (which would also have to reject
+    # a ".." that walks above the root), treat ANY operand containing a
+    # ".." segment as definitionally out of scope -- the smaller, more
+    # targeted fix: a real in-scope operand never needs one.
+    (my $norm_rel = $rel) =~ tr{\\}{/};
+    return 0 if $norm_rel =~ m{(^|/)\.\.(/|$)};
+    my $frel = _fold_path($rel);
+    for my $e (_widen_ws_prefixes($scope_paths)) {
+        next unless length $e;
+        my $fe = _fold_path($e);
+        next unless length $fe;
+        return 1 if $frel eq $fe;
+        return 1 if index($frel, "$fe/") == 0;
+    }
+    return 0;
 }
 
 # _flag_ledger_values($trimmed) -> list of contributed --ledger/--ledger=
@@ -1656,7 +1916,53 @@ sub _gb_d {
                                 my ($st, $val) = _named_validation_ledger($cmd);
                                 if ($st eq 'value') {
                                     my $r = _resolve_named_ledger($data_n, $val, \%ledger_ws_cache);
-                                    $caller_ws = $r->{write_set} if defined $r;
+                                    if (defined $r) {
+                                        if (_is_full_sweep_runner($cmd)) {
+                                            $caller_ws = $r->{write_set};
+                                        }
+                                        else {
+                                            # never-halt 09-gb-h-residuals sec
+                                            # 3.13 (Decision 36 N6): naming A
+                                            # does not scope an operand that
+                                            # belongs to some OTHER package --
+                                            # the scoped operand must itself
+                                            # be a member of A's own
+                                            # test_paths/write_set.
+                                            my $operand = _scoped_test_operand($cmd);
+                                            my $is_member = 0;
+                                            if (defined $operand) {
+                                                my $scope_paths = _ledger_scope_paths(
+                                                    $data_n, $r->{blueprint}, $r->{package});
+                                                $is_member = _operand_in_scope($operand, $data_n, $scope_paths)
+                                                    if defined $scope_paths;
+                                            }
+                                            if ($is_member) {
+                                                $caller_ws = $r->{write_set};
+                                            }
+                                            else {
+                                                # never-halt 09-gb-h-residuals
+                                                # sec 3.13: kept short on
+                                                # purpose (the codebase's
+                                                # usual interlock-message
+                                                # length), so it survives
+                                                # Common::fit()'s 160-char
+                                                # budget for realistic
+                                                # pkg/role names intact --
+                                                # the original, spec-literal
+                                                # wording ran well past 160
+                                                # chars even before the
+                                                # package name, and fit()
+                                                # would truncate it mid-
+                                                # sentence.
+                                                my $pkgname_n6 = _sanitize($r->{package}, 64);
+                                                return [
+                                                    BpHook::Guards::Common::fit(
+                                                        "BLOCKED (validation interlock): this test file is outside package ${pkgname_n6}'s test_paths/write_set; a write-capable worker ($role_writer) is in flight."),
+                                                    BpHook::Guards::Common::fit($cmd_line),
+                                                ];
+                                            }
+                                        }
+                                    }
                                 }
                                 $full_sweep = _is_full_sweep_runner($cmd) if defined $caller_ws;
                             }
@@ -1755,9 +2061,12 @@ sub _hyg_is_winfam { return ($^O =~ /^(?:MSWin32|msys|cygwin)$/) ? 1 : 0 }
 # redteam-3 S4: the .exe suffix itself must fold case too on a Windows-
 # family perl ("rm.EXE"), not just the verb name -- a shell there resolves
 # both case-insensitively.
+# never-halt 09-gb-h-residuals sec 3.11 (Decision 33): unlink, shred, dd,
+# sort and curl are added to both alternations, with the same .exe/case
+# rules as every other trigger verb.
 my $HYG_TRIGGER_RE = _hyg_is_winfam()
-    ? qr/(?:^|[;&|\s(){}\x60'"])(?:[^\s;&|()'"\x60{}]*\/)?(?i:cd|pushd|rm|rmdir|mv|cp|ln|touch|mkdir|tee|sed|perl|truncate)(?i:\.exe)?(?=[\s;&|()'"\x60]|$)|>/
-    : qr/(?:^|[;&|\s(){}\x60'"])(?:[^\s;&|()'"\x60{}]*\/)?(?:cd|pushd|rm|rmdir|mv|cp|ln|touch|mkdir|tee|sed|perl|truncate)(?:\.exe)?(?=[\s;&|()'"\x60]|$)|>/;
+    ? qr/(?:^|[;&|\s(){}\x60'"])(?:[^\s;&|()'"\x60{}]*\/)?(?i:cd|pushd|rm|rmdir|mv|cp|ln|touch|mkdir|tee|sed|perl|truncate|unlink|shred|dd|sort|curl)(?i:\.exe)?(?=[\s;&|()'"\x60]|$)|>/
+    : qr/(?:^|[;&|\s(){}\x60'"])(?:[^\s;&|()'"\x60{}]*\/)?(?:cd|pushd|rm|rmdir|mv|cp|ln|touch|mkdir|tee|sed|perl|truncate|unlink|shred|dd|sort|curl)(?:\.exe)?(?=[\s;&|()'"\x60]|$)|>/;
 
 sub _hyg_is_abs {
     my ($v) = @_;
@@ -2240,6 +2549,10 @@ sub _hyg_never_target {
     return 0 unless defined $D;
     return 1 if $D =~ m{^/dev/(?:null|stdout|stderr|stdin|tty)$};
     return 1 if $D =~ m{^/dev/fd/[0-9]+$};
+    # never-halt 09-gb-h-residuals sec 3.8 (r2-N3): /dev/tcp/HOST/PORT and
+    # /dev/udp/HOST/PORT are bash's pseudo-device network redirection, never
+    # a resolvable filesystem write target.
+    return 1 if $D =~ m{^/dev/(?:tcp|udp)/};
     return 0;
 }
 
@@ -2893,10 +3206,35 @@ sub _hyg_find_shellc_script {
     my ($argv) = @_;
     my $n = scalar @$argv;
     my $ci;
-    for my $idx (0 .. $n - 1) {
+    # never-halt 09-gb-h-residuals sec 3.10 (r2-N7/review N3): walk argv in
+    # ORDER and stop at the first predictable non-option word -- a "-c"
+    # appearing AFTER the script operand (e.g. "bash x.sh -c cd") is never
+    # bash's own -c, it's an argument to the script.
+    for (my $idx = 0; $idx < $n; $idx++) {
         my $lit = $argv->[$idx]{literal};
-        next unless defined $lit && $lit =~ /^-/;
-        if ($lit =~ /^-[a-zA-Z]*c[a-zA-Z]*$/) { $ci = $idx; last }
+        if (!defined $lit) { next }
+        if ($lit eq '--') { last }
+        if ($lit eq '-o' || $lit eq '+o' || $lit eq '-O' || $lit eq '+O'
+            || $lit eq '--rcfile' || $lit eq '--init-file')
+        {
+            $idx++;
+            next;
+        }
+        # never-halt 09-gb-h-residuals MUST-FIX 3 (reviewer M2): a clustered
+        # short-option form ending in 'o'/'O' (e.g. "-eo", "-euo", "+xo")
+        # ALSO takes an operand word, the same as a bare "-o"/"+o"/"-O"/"+O"
+        # -- without this, "bash -eo pipefail -c 'cd x'" misreads "pipefail"
+        # as the first predictable non-option word and never finds the real
+        # "-c" script.
+        if ($lit =~ /^[-+][a-zA-Z]*[oO]$/) {
+            $idx++;
+            next;
+        }
+        if ($lit =~ /^[-+]/) {
+            if ($lit =~ /^-[a-zA-Z]*c[a-zA-Z]*$/) { $ci = $idx; last }
+            next;
+        }
+        last; # first predictable non-option word: no -c beyond this point
     }
     return undef unless defined $ci;
     for my $idx ($ci + 1 .. $n - 1) {
@@ -3071,6 +3409,135 @@ sub hyg_targets {
             push @out, map { { kind => 'write', shape => 'truncate', word => $_ } } @$pos;
             next;
         }
+        # never-halt 09-gb-h-residuals sec 3.11 (Decision 33): unlink, shred,
+        # dd of=, sort -o and curl -o classifiers.
+        if ($name eq 'unlink') {
+            my ($pos, undef) = _hyg_positional($operands, {});
+            push @out, map { { kind => 'delete', shape => 'unlink', word => $_ } } @$pos;
+            next;
+        }
+        if ($name eq 'shred') {
+            my $has_u = 0;
+            for my $w (@$operands) {
+                my $lit = $w->{literal};
+                next unless defined $lit && $lit =~ /^-/;
+                $has_u = 1 if $lit eq '-u' || $lit eq '--remove' || $lit =~ /^--remove=/;
+                $has_u = 1 if $lit =~ /^-[fvxz]*u[fvxz]*$/;
+            }
+            my ($pos, undef) = _hyg_positional($operands,
+                { '-n' => 1, '-s' => 1, '--iterations' => 1, '--size' => 1, '--random-source' => 1 });
+            my $kind = $has_u ? 'delete' : 'write';
+            push @out, map { { kind => $kind, shape => 'shred', word => $_ } } @$pos;
+            next;
+        }
+        if ($name eq 'dd') {
+            for my $w (@$operands) {
+                my $lit = $w->{literal};
+                next unless defined $lit && $lit =~ /^of=(.*)$/s;
+                my $val = $1;
+                next unless length $val;
+                # never-halt 09-gb-h-residuals SHOULD-FIX 5 (reviewer S1):
+                # $val is a plain substring of the whole "of=..." word's
+                # already-resolved literal, so a leading "~" in it never got
+                # the tokenizer's own word-START unpredictable treatment
+                # (that only fires for a real word's first character --
+                # here the first character of the WHOLE word is "o"). Without
+                # this, "dd of=~/x" resolves against the repo root instead
+                # of being recognised as $HOME/x, unlike every other
+                # tilde-prefixed write target. Re-synthesize the same
+                # {literal=>undef, raw=>...} shape the tokenizer gives a
+                # genuine leading-"~" word, so _hyg_resolve's existing
+                # "~"/"~/..." raw branches (and _hyg_home_alias) apply here
+                # too.
+                my $tword = ($val eq '~' || $val =~ m{^~/})
+                    ? { literal => undef, raw => $val, tail => undef }
+                    : { literal => $val, raw => $val, tail => undef };
+                push @out, { kind => 'write', shape => 'dd of=', word => $tword };
+            }
+            next;
+        }
+        if ($name eq 'sort') {
+            my @t_sort;
+            my $dd = 0;
+            my $nn = scalar @$operands;
+            my $j = 0;
+            while ($j < $nn) {
+                my $w = $operands->[$j];
+                my $lit = $w->{literal};
+                if (!$dd && defined $lit && $lit eq '--') { $dd = 1; $j++; next }
+                if (!$dd && defined $lit) {
+                    if ($lit eq '-o' || $lit eq '--output') {
+                        my $val = ($j + 1 < $nn) ? $operands->[$j + 1] : undef;
+                        push @t_sort, $val if defined $val;
+                        $j += 2;
+                        next;
+                    }
+                    if ($lit =~ /^--output=(.*)$/s) {
+                        my $v = $1;
+                        push @t_sort, { literal => $v, raw => $v, tail => undef } if length $v;
+                        $j++;
+                        next;
+                    }
+                    if ($lit =~ /^-([bdfgiMhnRrcCsuVz]*)o(.*)$/s) {
+                        my $rest = $2;
+                        if (length $rest) {
+                            push @t_sort, { literal => $rest, raw => $rest, tail => undef };
+                            $j++;
+                            next;
+                        }
+                        my $val = ($j + 1 < $nn) ? $operands->[$j + 1] : undef;
+                        push @t_sort, $val if defined $val;
+                        $j += 2;
+                        next;
+                    }
+                    if ($lit eq '-k' || $lit eq '-t' || $lit eq '-S' || $lit eq '-T') { $j += 2; next }
+                }
+                $j++;
+            }
+            push @out, map { { kind => 'write', shape => 'sort -o', word => $_ } } @t_sort;
+            next;
+        }
+        if ($name eq 'curl') {
+            my @t_curl;
+            my $dd = 0;
+            my $nn = scalar @$operands;
+            my $j = 0;
+            while ($j < $nn) {
+                my $w = $operands->[$j];
+                my $lit = $w->{literal};
+                if (!$dd && defined $lit && $lit eq '--') { $dd = 1; $j++; next }
+                if (!$dd && defined $lit) {
+                    if ($lit eq '-o' || $lit eq '--output') {
+                        my $val = ($j + 1 < $nn) ? $operands->[$j + 1] : undef;
+                        push @t_curl, $val if defined $val && !(defined $val->{literal} && $val->{literal} eq '-');
+                        $j += 2;
+                        next;
+                    }
+                    if ($lit =~ /^--output=(.*)$/s) {
+                        my $v = $1;
+                        push @t_curl, { literal => $v, raw => $v, tail => undef } if length($v) && $v ne '-';
+                        $j++;
+                        next;
+                    }
+                    if ($lit =~ /^-([sSLfkvIiNq#]*)o(.*)$/s) {
+                        my $rest = $2;
+                        if (length $rest) {
+                            push @t_curl, { literal => $rest, raw => $rest, tail => undef } unless $rest eq '-';
+                            $j++;
+                            next;
+                        }
+                        my $val = ($j + 1 < $nn) ? $operands->[$j + 1] : undef;
+                        push @t_curl, $val if defined $val && !(defined $val->{literal} && $val->{literal} eq '-');
+                        $j += 2;
+                        next;
+                    }
+                    if ($lit eq '-O') { $j++; next }
+                }
+                $j++;
+            }
+            push @out, map { { kind => 'write', shape => 'curl -o', word => $_ } } @t_curl;
+            next;
+        }
         if ($name eq 'sed') {
             my $has_i  = 0;
             my $has_ef = 0;
@@ -3081,7 +3548,12 @@ sub hyg_targets {
                 $has_ef = 1 if $lit =~ /^(?:-e|-f|--expression|--file)$/ || $lit =~ /^--expression=/ || $lit =~ /^--file=/;
                 # redteam M5: code glued directly onto -e/-f ("-e's/a/b/'")
                 # still counts as inline code, not a separate script/file.
-                $has_ef = 1 if $lit =~ /^-[ef].+/;
+                # never-halt 09-gb-h-residuals sec 3.9 (r2-N2): widened to
+                # "-[nrsuzE]*[ef].+" so an in-place suffix letter group
+                # placed BEFORE the e/f ("-Ee's/a/b/'", "-ne's/a/b/p'") is
+                # still recognised as glued code -- an "i" in that position
+                # (e.g. "-ie ...") is still an in-place SUFFIX, not code.
+                $has_ef = 1 if $lit =~ /^-[nrsuzE]*[ef].+/;
             }
             if ($has_i) {
                 my ($pos, undef) = _hyg_positional($operands, { '-e' => 1, '-f' => 1, '-l' => 1 });
@@ -3419,6 +3891,28 @@ sub _hyg_deadline_seconds {
     return $v + 0;
 }
 
+# never-halt 09-gb-h-residuals sec 2.2/3.1 (r4-S2): the deadline is measured
+# from the HOOK PROCESS's own start (BpHook::started_at(), stamped as the
+# first statement of BpHook::main()), not from this rule's own entry -- a
+# slow decode under load must not hand GB-h/GB-w/_perl_test_run a fresh
+# budget as if no time had passed. $cap (optional) additionally bounds how
+# far past "now" the deadline may sit (used by _perl_test_run's own, lower,
+# 2s budget) -- BP_GUARD_DEADLINE_SECONDS can only shrink either number,
+# never lengthen the process-start-derived one.
+sub _hyg_deadline_at {
+    my ($cap) = @_;
+    my $S   = _hyg_deadline_seconds();
+    my $now = Time::HiRes::time();
+    my $t0  = BpHook::started_at();
+    my $pd  = (defined $t0 && $t0 <= $now) ? $t0 + $S : $now + $S;
+    if (defined $cap) {
+        my $capped = ($cap < $S) ? $cap : $S;
+        my $want   = $now + $capped;
+        return ($want < $pd) ? $want : $pd;
+    }
+    return $pd;
+}
+
 sub _gb_h_impl {
     my ($p, $cmd, $ti) = @_;
     # review S2: reset the cross-call cache as the FIRST statement of every
@@ -3471,7 +3965,12 @@ sub _gb_h_impl {
     my $pm = (ref $p eq 'HASH') ? $p->{permission_mode} : undef;
     my $bypass = (defined $pm && !ref($pm) && ($pm eq 'bypassPermissions' || $pm eq 'dontAsk')) ? 1 : 0;
 
-    my $deadline_at = Time::HiRes::time() + _hyg_deadline_seconds();
+    my $deadline_at = _hyg_deadline_at();
+    # never-halt 09-gb-h-residuals sec 3.1: checked right after the deadline
+    # is computed and before _hyg_ctx -- a process-start deadline that has
+    # ALREADY expired (a slow decode under load) must deny a triggered
+    # command at once, never spend more wall-clock computing context first.
+    if (Time::HiRes::time() > $deadline_at) { return _hyg_oversize_lines($cmd, $hint_ok_early) }
     my $ctx         = _hyg_ctx($p);
     my $hint_ok     = (!$is_ledger && !defined BpHook::agent_id($p)) ? 1 : 0;
     my $cmd_line    = 'Command: ' . BpHook::Guards::Common::echo_cmd($cmd);
@@ -3553,12 +4052,19 @@ sub _gb_w_mkdir_ancestor_ok {
     my $Rc = BpHook::Guards::Common::canon($root);
     my $Dc = BpHook::Guards::Common::canon($D);
     return 0 unless defined $Rc && length $Rc && defined $Dc && length $Dc;
-    my $REL;
-    if ($Dc eq $Rc)                    { $REL = '' }
-    elsif (index($Dc, "$Rc/") == 0)    { $REL = substr($Dc, length($Rc) + 1) }
-    else                                { return 0 }
-    return 0 unless length $REL;
+    # never-halt 09-gb-h-residuals sec 3.12 (02-review N1): $ci is computed
+    # FIRST, then used for both the equality and the prefix test below -- a
+    # case-insensitive host must fold BOTH comparisons, not just the later
+    # pattern match, or an upper-cased ancestor spelling never matches $Rc
+    # at all and this returns 0 before $ci is even consulted. REL is still
+    # taken from $Dc (the ORIGINAL-case string) by length, matching $Rc's.
     my $ci = eval { BpHook::WriteGuards::_is_ci() } ? 1 : 0;
+    my ($Rc_cmp, $Dc_cmp) = $ci ? (lc($Rc), lc($Dc)) : ($Rc, $Dc);
+    my $REL;
+    if ($Dc_cmp eq $Rc_cmp)                    { $REL = '' }
+    elsif (index($Dc_cmp, "$Rc_cmp/") == 0)    { $REL = substr($Dc, length($Rc) + 1) }
+    else                                        { return 0 }
+    return 0 unless length $REL;
     my $cand = $REL . '/';
     my $cand_m = $ci ? lc($cand) : $cand;
     for my $P (@{ $R->{packages} || [] }) {
@@ -3631,7 +4137,7 @@ sub _gb_w_impl {
         $deadline_at = $HYG_TARGETS_CACHE->{deadline_at};
     }
     else {
-        $deadline_at = Time::HiRes::time() + _hyg_deadline_seconds();
+        $deadline_at = _hyg_deadline_at();
         my @t = eval { hyg_targets($cmd, $deadline_at) };
         if (my $err = $@) {
             return _hyg_oversize_lines($cmd, 0) if ref $err && $err == $HYG_DEADLINE_MARKER;

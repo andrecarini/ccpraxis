@@ -1726,26 +1726,10 @@ sub timed_load_payload {
     return Time::HiRes::time() - $t0;
 }
 
-# ---------------------------------------------------------------------------
-# timed_run_for($caller, $cmd, %o) -- run_for(), wall-clock timed and bounded
-# the same way, for AC-59 (which must observe BOTH a fast return AND rc==2
-# through the full GuardBash path, not just the decode in isolation). If the
-# 8s alarm's die is not absorbed inside load_payload (e.g. it fires during
-# GuardBash's own scan instead), the eval here still protects the rest of
-# this file from a crashed run.
-# ---------------------------------------------------------------------------
-sub timed_run_for {
-    my ($caller, $cmd, %o) = @_;
-    my $t0 = Time::HiRes::time();
-    local $SIG{ALRM} = sub { die "timed_run_for: 8s bound hit\n" };
-    alarm(8);
-    my $res = eval { run_for($caller, $cmd, %o) };
-    my $eval_err = $@;
-    alarm(0);
-    my $elapsed = Time::HiRes::time() - $t0;
-    $res = { rc => 0, out => '', err => "timed_run_for: eval died: $eval_err" } unless defined $res;
-    return ($res, $elapsed);
-}
+# (package 09-gb-h-residuals, AC-17 / spec sec 3.15: timed_run_for had no
+# caller and is deleted here, along with its own doc block above. AC-59
+# observes rc/timing through real_entry_main()/with_decode_counter() below,
+# never through this now-removed helper.)
 
 # ===========================================================================
 # AC-56 -- Decision 25 (1): decoder equivalence. Whatever BpHook uses to
@@ -1832,9 +1816,18 @@ sub timed_run_for {
 # is at most 4x the ASCII time (guarding against a near-zero ASCII baseline
 # with max(ascii, 0.05)), plus an absolute backstop under 12s so a genuinely
 # hung decode still fails in bounded time. Both payloads must decode
-# successfully (payload_ok == 1). Bounded by a 30s timeout on the whole
+# successfully (payload_ok == 1). Bounded by a 60s timeout on the whole
 # child (never redirected to NUL) so a still-slow decode fails this
 # assertion in bounded time instead of hanging the file.
+#
+# Package 09-gb-h-residuals, AC-17 / spec sec 3.15: the child times
+# load_payload THREE times per payload and reports the MINIMUM of the three
+# (Decision 34 -- a single timing under -jN runner contention is flaky by
+# construction; the minimum is the closest approximation to an unloaded
+# cost this in-process child can produce without a dedicated quiescent
+# host). The ratio and backstop assertions below consume those minimums.
+# The whole-child alarm rises from 30s to 60s to cover three decodes per
+# payload instead of one.
 # ===========================================================================
 {
     my $n = 524288; # 2 bytes/char -> ~1,048,576 bytes of command text alone
@@ -1871,11 +1864,17 @@ for my $pair ([ascii => $ascii_path], [utf8 => $utf8_path]) {
     local $/;
     my $raw = <$fh>;
     close $fh;
-    my $t0 = Time::HiRes::time();
-    BpHook::load_payload($raw);
-    my $elapsed = Time::HiRes::time() - $t0;
-    print "ELAPSED_\U$label\E=$elapsed\n";
-    print "PAYLOAD_OK_\U$label\E=" . (BpHook::payload_ok() ? 1 : 0) . "\n";
+    my $min_elapsed;
+    my $ok_count = 0;
+    for (1 .. 3) {
+        my $t0 = Time::HiRes::time();
+        BpHook::load_payload($raw);
+        my $elapsed = Time::HiRes::time() - $t0;
+        $min_elapsed = $elapsed if !defined($min_elapsed) || $elapsed < $min_elapsed;
+        $ok_count++ if BpHook::payload_ok();
+    }
+    print "ELAPSED_\U$label\E=$min_elapsed\n";
+    print "PAYLOAD_OK_\U$label\E=" . (($ok_count == 3) ? 1 : 0) . "\n";
 }
 PERL
 
@@ -1890,15 +1889,15 @@ PERL
     my $timed_out = 0;
     my $child_out;
     {
-        local $SIG{ALRM} = sub { $timed_out = 1; kill('KILL', $pid); die "AC-58: 30s timeout hit\n" };
-        alarm(30);
+        local $SIG{ALRM} = sub { $timed_out = 1; kill('KILL', $pid); die "AC-58: 60s timeout hit\n" };
+        alarm(60);
         eval { local $/; $child_out = <$ph>; };
         alarm(0);
     }
     close $ph;
     waitpid($pid, 0);
 
-    ok(!$timed_out, 'AC-58: the child perl process completed within the 30s timeout');
+    ok(!$timed_out, 'AC-58: the child perl process completed within the 60s timeout');
     my ($ascii_elapsed) = ($child_out // '') =~ /^ELAPSED_ASCII=([\d.eE+-]+)/m;
     my ($ascii_ok)      = ($child_out // '') =~ /^PAYLOAD_OK_ASCII=(\d+)/m;
     my ($utf8_elapsed)  = ($child_out // '') =~ /^ELAPSED_UTF8=([\d.eE+-]+)/m;
@@ -2026,7 +2025,7 @@ PERL
 # real_entry_main($raw, %env) -- BpHook::main('Guards::GuardBash') through
 # its own real stdin-read/load_payload/dispatch order, wall-clock timed
 # (Time::HiRes), bounded by a hard alarm backstop ($backstop_seconds,
-# default 8, same convention as timed_load_payload/timed_run_for above) so a
+# default 8, same convention as timed_load_payload above) so a
 # still-slow decode fails this file's own timing assertions instead of
 # hanging the whole run. Returns ({ rc, err }, elapsed_seconds).
 #
@@ -2465,5 +2464,544 @@ sub small_command_json {
 # too, for the same reason: run standalone, not embedded here.
 # ===========================================================================
 pass('AC-16: existing-suite regression is verified by running each file directly (see comment above), not re-executed in this file');
+
+# ===========================================================================
+# Package 09-gb-h-residuals (specs/09-gb-h-residuals-spec.md). AC-70 onward.
+# WRITTEN BLIND TO THE IMPLEMENTATION, same convention as the rest of this
+# file: GuardBash.pm/BpHook.pm's package-09 changes (the _hyg_deadline_at
+# process-start seam, the <<\WORD/arithmetic/paren-depth lexer changes, the
+# alarm pass-through, the /dev/tcp|udp fix, the sed/bash-c/write-tool
+# classifier fixes, and the GB-w mkdir-ancestor case fold) DO NOT EXIST YET
+# at the time this block is written -- every case below is expected RED
+# until the implementer lands it, EXCEPT where a comment says otherwise
+# (the spec's own AC-16-equivalent "pin" rows, and AC-82's housekeeping
+# check). This file's own running AC-N numbering continues from AC-69; the
+# spec's OWN "AC-2".."AC-17" labels (specs/09-gb-h-residuals-spec.md sec 4)
+# are cited in parentheses alongside each new AC-NN below so the mapping to
+# the spec is traceable.
+# ===========================================================================
+
+# ===========================================================================
+# AC-70 (spec AC-2, sec 3.1 rows 1-2) -- the GB-h deadline is measured from
+# BpHook::main's process-start stamp ($BpHook::MAIN_STARTED_AT), not from
+# GB-h's own entry. Forcing the stamp to 30s in the past must deny a
+# TRIGGERED command at once (fail-closed, well past the ~5s default), while
+# leaving an UNtriggered command allowed; once the local scope ends, the
+# triggered command allows again (the stamp does not leak into later calls).
+# ===========================================================================
+{
+    my $driver_main = caller_by_name('driver-main');
+    {
+        local $BpHook::MAIN_STARTED_AT = time() - 30;
+        my $res_triggered = run_for($driver_main, 'touch f');
+        is($res_triggered->{rc}, 2,
+           'AC-70 (spec AC-2, sec 3.1 row 1): MAIN_STARTED_AT 30s in the past -> a triggered command denies at once (today: allows, the seam is not read)')
+            or diag("err: $res_triggered->{err}");
+        like($res_triggered->{err}, qr/script file/i,
+           'AC-70 (spec AC-2, sec 3.1 row 1): the deadline denial names the existing over-size remedy');
+
+        my $res_untriggered = run_for($driver_main, 'ls');
+        is($res_untriggered->{rc}, 0,
+           'AC-70 (spec AC-2, sec 3.1 row 1): the same stale stamp does not deny an UNtriggered command');
+    }
+
+    my $res_after = run_for($driver_main, 'touch f');
+    is($res_after->{rc}, 0,
+       'AC-70 (spec AC-2, sec 3.1 row 2): once the local scope ends, the same triggered command allows again (the stamp does not leak)');
+}
+
+# ===========================================================================
+# AC-71 (spec AC-3, sec 2.2/4) -- through a FRESH child process (bounded by a
+# 60s timeout), using the real_entry_env fixture for driver-main, two ~1 MiB
+# payloads (description padded with U+00E9) each carry a command just under
+# 256 KiB. The child times BpHook::load_payload(raw) alone (T_dec), then
+# BpHook::main('Guards::GuardBash') with STDIN on the same raw bytes
+# (T_main). T_main must stay within T_dec's own decode cost plus a fixed
+# margin -- NOT decode cost plus a FRESH 5s GB-h budget, which is what
+# TODAY's code gives (deadline computed at GB-h entry, after the decode).
+# ===========================================================================
+{
+    my $CAP = 256 * 1024;
+    my $target = $CAP - 4096;
+
+    # Shape 1: rm -f ~/x ~/x ... ~/*, same construction as AC-48 shape 3
+    # (worker-bash-hygiene.t's own package-01 AC numbering) -- a home-alias
+    # match-all glob with many operands, denied regardless of the deadline.
+    my $op = '~/x';
+    my $n_ops = int(($target - length('rm -f  ~/*')) / (length($op) + 1));
+    my $cmd1 = 'rm -f ' . join(' ', ($op) x $n_ops) . ' ~/*';
+    ok(length($cmd1) < $CAP, 'AC-71 fixture sanity: shape 1 command is under the 256 KiB cap');
+
+    # Shape 2: perl plugins/fx/tests/t/x.t; echo x>a>a>a...
+    my $prefix2 = 'perl plugins/fx/tests/t/x.t; echo x';
+    my $filler2 = '>a' x int(($target - length($prefix2)) / 2);
+    my $cmd2 = $prefix2 . $filler2;
+    ok(length($cmd2) < $CAP, 'AC-71 fixture sanity: shape 2 command is under the 256 KiB cap');
+
+    my $desc = "\x{e9}" x 380000; # ~760000 bytes once UTF-8 encoded
+
+    my @shapes = (
+        [ shape1 => $cmd1, 2 ],
+        [ shape2 => $cmd2, undef ],
+    );
+
+    my $scripts_dir = "$BUTLER_DIR/scripts";
+    my $child_code = <<'PERL';
+use strict;
+use warnings;
+BEGIN { $ENV{CCPRAXIS_NO_WAKELOCK} = 1 }
+require BpHook;
+require Time::HiRes;
+my ($payload_path) = @ARGV;
+open(my $fh, '<:raw', $payload_path) or die "child: cannot open payload: $!";
+local $/;
+my $raw = <$fh>;
+close $fh;
+
+my $t_dec0 = Time::HiRes::time();
+eval { BpHook::load_payload($raw) };
+my $t_dec = Time::HiRes::time() - $t_dec0;
+
+open(my $ifh, '<:raw', $payload_path) or die "child: cannot reopen payload for stdin: $!";
+local *STDIN;
+open(STDIN, '<&', $ifh) or die "child: cannot dup stdin: $!";
+
+open(my $saved_out, '>&', \*STDOUT) or die "child: dup STDOUT: $!";
+open(my $saved_err, '>&', \*STDERR) or die "child: dup STDERR: $!";
+open(STDOUT, '>', '/dev/null') or die "child: redirect STDOUT: $!";
+open(STDERR, '>', '/dev/null') or die "child: redirect STDERR: $!";
+
+my $t_main0 = Time::HiRes::time();
+my $ret = eval { BpHook::main('Guards::GuardBash') };
+my $died = $@;
+my $t_main = Time::HiRes::time() - $t_main0;
+
+open(STDOUT, '>&', $saved_out) or die "child: restore STDOUT: $!";
+open(STDERR, '>&', $saved_err) or die "child: restore STDERR: $!";
+
+my $rc = (defined $ret && !length($died)) ? $ret : 0;
+print "T_DEC=$t_dec\n";
+print "T_MAIN=$t_main\n";
+print "RC=$rc\n";
+PERL
+
+    for my $s (@shapes) {
+        my ($label, $cmd, $expect_rc) = @$s;
+        my $payload = {
+            tool_name  => 'Bash',
+            tool_input => { command => $cmd, description => $desc },
+            session_id => $DRIVER_SID,
+            cwd        => $REPO,
+        };
+        my $raw = JSON::PP->new->utf8->canonical->encode($payload);
+        cmp_ok(length($raw), '<', 1_040_000, "AC-71 fixture sanity: $label raw payload is under 1,040,000 bytes");
+
+        my (undef, $payload_path) = tempfile();
+        open(my $pfh, '>:raw', $payload_path) or die "AC-71: cannot write $label payload fixture: $!";
+        print {$pfh} $raw;
+        close $pfh;
+
+        my %env = (
+            BUTLER_STATE_DIR   => $STATE_BASE,
+            CLAUDE_PROJECT_DIR => $REPO,
+            TMP => $TMPFIX, TEMP => $TMPFIX, TMPDIR => $TMPFIX,
+            HOME => $HOMEFIX, USERPROFILE => $HOMEFIX,
+            CCPRAXIS_DATA_DIR => $CCPDIR,
+        );
+
+        local %ENV = %ENV;
+        for my $k (keys %env) { $ENV{$k} = $env{$k} }
+
+        my @cmdv = ($^X, '-I', $scripts_dir, '-e', $child_code, $payload_path);
+        my $pid = open(my $ph, '-|');
+        die "AC-71: fork failed: $!" unless defined $pid;
+        if ($pid == 0) {
+            open(STDIN, '<', '/dev/null') or CORE::exit(126);
+            exec(@cmdv);
+            CORE::exit(127);
+        }
+        my $timed_out = 0;
+        my $child_out;
+        {
+            local $SIG{ALRM} = sub { $timed_out = 1; kill('KILL', $pid); die "AC-71: 60s timeout hit\n" };
+            alarm(60);
+            eval { local $/; $child_out = <$ph>; };
+            alarm(0);
+        }
+        close $ph;
+        waitpid($pid, 0);
+
+        ok(!$timed_out, "AC-71 (spec AC-3): $label child completed within the 60s timeout");
+
+        my ($t_dec)  = ($child_out // '') =~ /^T_DEC=([\d.eE+-]+)/m;
+        my ($t_main) = ($child_out // '') =~ /^T_MAIN=([\d.eE+-]+)/m;
+        my ($rc)     = ($child_out // '') =~ /^RC=(-?\d+)/m;
+
+        diag("AC-71: $label T_dec=" . ($t_dec // '<undef>') . "s T_main=" . ($t_main // '<undef>') . "s rc=" . ($rc // '<undef>'));
+
+        my $t_dec_v  = defined $t_dec  ? $t_dec  : 999;
+        my $t_main_v = defined $t_main ? $t_main : 999;
+        my $cap = ($t_dec_v > 5 ? $t_dec_v : 5) + 1.0;
+        cmp_ok($t_main_v, '<=', $cap,
+            "AC-71 (spec AC-3): $label T_main <= max(5, T_dec) + 1.0s (today: GB-h starts its own fresh 5s AFTER the decode)")
+            or diag("child output: " . ($child_out // '<undef>'));
+        cmp_ok($t_main_v, '<', 12,
+            "AC-71 (spec AC-3): $label T_main < 12s backstop")
+            or diag("child output: " . ($child_out // '<undef>'));
+
+        if (defined $expect_rc) {
+            is($rc, $expect_rc, "AC-71 (spec AC-3): $label exits rc $expect_rc")
+                or diag("child output: " . ($child_out // '<undef>'));
+        }
+
+        unlink $payload_path;
+    }
+}
+
+# ===========================================================================
+# AC-72 (spec AC-4, sec 3.3) -- a die matching /alarm/i (and NOT matching
+# JSON::PP's own "at character offset" phrase) raised inside ANY decode
+# attempt in load_payload propagates out of load_payload. A JSON::PP-shaped
+# die that happens to mention "alarm" (the control) does not propagate, and
+# payload_ok() stays 0 either way.
+# ===========================================================================
+{
+    my $raw = JSON::PP->new->utf8->canonical->encode(
+        { tool_name => 'Bash', tool_input => { command => 'echo hi' }, session_id => 'x' });
+
+    {
+        no warnings 'redefine';
+        local *JSON::PP::decode = sub { die "alarm clock\n" };
+        eval { BpHook::load_payload($raw) };
+        my $died = $@;
+        like($died, qr/alarm/,
+            'AC-72 (spec AC-4, sec 3.3): a die matching /alarm/i inside the decode propagates out of load_payload (today: swallowed)');
+    }
+
+    {
+        no warnings 'redefine';
+        local *JSON::PP::decode = sub { die "garbage at character offset 3 (before \"alarm\")\n" };
+        eval { BpHook::load_payload($raw) };
+        my $died = $@;
+        is($died, '',
+            'AC-72 (spec AC-4, sec 3.3): a JSON::PP-shaped "at character offset" die, even mentioning "alarm", does NOT propagate');
+        is(BpHook::payload_ok(), 0,
+            'AC-72: the control die still leaves payload_ok() 0, same as any other swallowed decode failure');
+    }
+}
+
+# ===========================================================================
+# AC-73 (spec AC-5, sec 3.4) -- <<\WORD (a backslash-escaped delimiter) is
+# recognised as a quoted-delimiter heredoc operator; its body is skipped
+# like any other quoted-delimiter heredoc body.
+# ===========================================================================
+{
+    my $driver_main = caller_by_name('driver-main');
+    my $cmd1 = "cat <<\\EOF > $TMPFIX/f\ncd x\nEOF";
+    is(run_for($driver_main, $cmd1)->{rc}, 0,
+       'AC-73 (spec AC-5, sec 3.4 row 1): cat <<\EOF with "cd x" only inside the body -> allow (today a false B-1)')
+        or diag("cmd: $cmd1");
+
+    my $cmd2 = "cat <<\\EOF\ndon't\nEOF\nrm -rf .git";
+    is(run_for($driver_main, $cmd2)->{rc}, 2,
+       'AC-73 (spec AC-5, sec 3.4 row 2): a REAL rm -rf .git AFTER the <<\EOF body -> deny (c) (today allowed)')
+        or diag("cmd: $cmd2");
+}
+
+# ===========================================================================
+# AC-74 (spec AC-6, sec 3.5) -- arithmetic spans ($(( )) anywhere, (( )) in
+# command position) are recognised with a bounded look-ahead and replaced by
+# a single unpredictable placeholder, so nothing inside them is lexed as a
+# heredoc operator, redirect or separator; a failed look-ahead falls back to
+# today's lexing exactly (no new bypass).
+# ===========================================================================
+{
+    my $driver_main = caller_by_name('driver-main');
+    my @allow_rows = (
+        [ '(( i > 3 ))'                               => $OUTSIDE ],
+        [ 'if (( n > 0 )); then echo y; fi'            => $OUTSIDE ],
+        [ 'echo "$(( 3 > 2 ))"'                        => $OUTSIDE ],
+        [ 'x=$(( y > 0 ? 1 : 0 ))'                     => $OUTSIDE ],
+        [ 'for (( i=0; i<3; i++ )); do echo $i; done'  => $REPO ],
+    );
+    for my $r (@allow_rows) {
+        my ($cmd, $cwd) = @$r;
+        my $res = run_for($driver_main, $cmd, cwd => $cwd);
+        is($res->{rc}, 0, "AC-74 (spec AC-6, sec 3.5): '$cmd' -> allow (today false B-2)") or diag("cmd: $cmd, err: $res->{err}");
+    }
+
+    my @deny_rows = (
+        [ "(( x = 1 << y ))\nrm -rf .git" => 'arithmetic << is not a heredoc, then a real rm -rf .git' ],
+        [ "echo \$((1<<n))\nrm -rf .git"   => 'arithmetic $(( 1<<n )), then a real rm -rf .git' ],
+    );
+    for my $r (@deny_rows) {
+        my ($cmd, $label) = @$r;
+        is(run_for($driver_main, $cmd)->{rc}, 2, "AC-74 (spec AC-6, sec 3.5): $label -> deny (c) (today: bypass)") or diag("cmd: $cmd");
+    }
+
+    # must-stay-denied controls (spec sec 5 E7): a $( substitution inside
+    # arithmetic, and bash's own nested-subshell "((cd O) && ls)" reading,
+    # both fail the look-ahead and fall back to today's lexing -- neither
+    # becomes a NEW bypass relative to HEAD.
+    my $ctrl1 = 'echo $(( $(rm -rf .git) + 1 ))';
+    is(run_for($driver_main, $ctrl1)->{rc}, 2,
+       'AC-74 control (spec AC-6): a $( substitution inside arithmetic still denies (c)') or diag("cmd: $ctrl1");
+
+    my $ctrl2 = "((cd $OUTSIDE) && ls)";
+    is(run_for($driver_main, $ctrl2)->{rc}, 2,
+       'AC-74 control (spec AC-6): ((cd <O>) && ls) still denies B-1') or diag("cmd: $ctrl2");
+
+    # New pin: the arithmetic look-ahead's failure-scan does not exempt
+    # parens that appear inside ${...} PATTERN TEXT (a parameter-expansion
+    # pattern-removal/substitution operator, e.g. ${x//(/}) or immediately
+    # after a backslash. A crafted command can use that to make the whole
+    # arithmetic span collapse into one inert ${_bp_arith} placeholder (0
+    # targets) while smuggling a real command past it between the
+    # placeholder and the next statement.
+    my $bypass = q{(( ${x//(/} + ${y//(/} )); rm -rf .git; : ${z//))/}};
+    is(run_for($driver_main, $bypass)->{rc}, 2,
+       'AC-74 (spec AC-6, sec 3.5): arithmetic look-ahead smuggled past ${...} pattern-text parens -> deny (c) (today: wrongly allowed, 0 targets found)')
+        or diag("cmd: $bypass");
+}
+
+# ===========================================================================
+# AC-75 (spec AC-7, sec 3.6) -- a frame whose closer is ")" (opened by $(,
+# <( or >() keeps its OWN paren depth; only a ")" at depth 0 closes it.
+# ===========================================================================
+{
+    my $driver_main = caller_by_name('driver-main');
+    # Row 1 is spec sec 3.6's own example: "$(" opens a frame whose closer is
+    # ")", and _segments() ALREADY treats an unquoted ")" as a segment
+    # boundary at the TOP level -- that is exactly why a top-level
+    # `case $1 in (a) rm -rf .git;; esac` is already denied today. The bug
+    # here is narrower: the frame does not yet keep its OWN paren depth, so
+    # the case arm's "(a)" closes the $( frame early instead of being treated
+    # as nested depth, and the real `rm -rf .git` after it is read as live
+    # text inside the (still-open, from the parser's broken point of view)
+    # substitution rather than as the closing boundary. The fix is the
+    # one-line depth-tracking branch in sec 3.6 ("An unquoted ( increments
+    # the depth ... only a ) at depth 0 closes the frame"); it does not
+    # require new case-statement grammar.
+    my $cmd1 = q{X="$(case $1 in (a) rm -rf .git;; esac)"};
+    is(run_for($driver_main, $cmd1)->{rc}, 2,
+       'AC-75 (spec AC-7, sec 3.6 row 1): case (a) inside "$( ... )" -> deny (c) (today allowed; frame paren depth missing)') or diag("cmd: $cmd1");
+
+    my $cmd2 = q{x="$( (echo a) )"};
+    is(run_for($driver_main, $cmd2)->{rc}, 0,
+       'AC-75 (spec AC-7, sec 3.6 row 2): a balanced nested ( ) inside "$( ... )" -> allow') or diag("cmd: $cmd2");
+
+    my $cmd3 = q{echo "$(printf '%s' '(')"};
+    is(run_for($driver_main, $cmd3)->{rc}, 0,
+       q{AC-75 (spec AC-7, sec 3.6 row 3): a literal '(' produced inside a quoted command substitution -> allow}) or diag("cmd: $cmd3");
+
+    # New pin: the SAME missing-frame-depth bug also wrongly allows an
+    # unquoted-but-still-dangerous subshell form that doesn't involve a case
+    # statement at all -- a bare nested subshell "( (rm -rf .git) )" whose
+    # outer "$(" frame closes early at the inner ")" , leaving the real
+    # `rm -rf .git` unseen. Red-team confirmed all three variants below are
+    # affected by the same bug; at minimum the first (double-quoted) is
+    # required, the other two are included for the same reason.
+    my $cmd4 = q{x="$( (rm -rf .git) )"};
+    is(run_for($driver_main, $cmd4)->{rc}, 2,
+       'AC-75 (spec AC-7, sec 3.6): x="$( (rm -rf .git) )" -> deny (c) (today allowed; frame paren depth missing)') or diag("cmd: $cmd4");
+
+    my $cmd5 = q{x=$( (rm -rf .git) )};
+    is(run_for($driver_main, $cmd5)->{rc}, 2,
+       'AC-75 (spec AC-7, sec 3.6): x=$( (rm -rf .git) ) (unquoted) -> deny (c) (today allowed; frame paren depth missing)') or diag("cmd: $cmd5");
+
+    my $cmd6 = q{echo "$( (rm -rf .git) )"};
+    is(run_for($driver_main, $cmd6)->{rc}, 2,
+       'AC-75 (spec AC-7, sec 3.6): echo "$( (rm -rf .git) )" -> deny (c) (today allowed; frame paren depth missing)') or diag("cmd: $cmd6");
+}
+
+# ===========================================================================
+# AC-76 (spec AC-8, sec 3.8) -- _hyg_never_target also covers /dev/tcp/ and
+# /dev/udp/ pseudo-devices (never a resolvable write target).
+# ===========================================================================
+{
+    my $driver_main = caller_by_name('driver-main');
+    for my $c (
+        [ 'echo x > /dev/tcp/host/80' => 'redirect to /dev/tcp' ],
+        [ 'exec 3<>/dev/tcp/host/80'  => 'fd redirect to /dev/tcp' ],
+        [ 'echo x > /dev/udp/host/53' => 'redirect to /dev/udp' ],
+    ) {
+        my ($cmd, $label) = @$c;
+        is(run_for($driver_main, $cmd)->{rc}, 0, "AC-76 (spec AC-8, sec 3.8): $label -> allow (today false B-2)") or diag("cmd: $cmd");
+    }
+}
+
+# ===========================================================================
+# AC-77 (spec AC-9, sec 3.9) -- sed's glued-code test becomes
+# /^-[nrsuzE]*[ef].+/ (an "i" before the e/f is still an in-place SUFFIX,
+# not code).
+# ===========================================================================
+{
+    my $driver_main = caller_by_name('driver-main');
+    my $cmd1 = "sed -i -Ee's/a/b/' $OUTSIDE/f";
+    is(run_for($driver_main, $cmd1)->{rc}, 2,
+       q{AC-77 (spec AC-9, sec 3.9 row 1): sed -i -Ee's/a/b/' outside -> deny B-2 (today allowed, glued code missed)})
+        or diag("cmd: $cmd1");
+
+    my $cmd2 = "sed -i -ne's/a/b/p' $OUTSIDE/f";
+    is(run_for($driver_main, $cmd2)->{rc}, 2,
+       q{AC-77 (spec AC-9, sec 3.9 row 2): sed -i -ne's/a/b/p' outside -> deny B-2 (today allowed, glued code missed)})
+        or diag("cmd: $cmd2");
+
+    my $cmd3 = "sed -i -Ee's/a/b/' $REPO/f";
+    is(run_for($driver_main, $cmd3)->{rc}, 0,
+       'AC-77 (spec AC-9, sec 3.9 row 3): same glued-code form, target inside the repo -> allow') or diag("cmd: $cmd3");
+
+    my $cmd4 = "sed -i -ie 's/a/b/' $OUTSIDE/f";
+    is(run_for($driver_main, $cmd4)->{rc}, 2,
+       'AC-77 (spec AC-9, sec 3.9 row 4): sed -i -ie (an in-place SUFFIX "e", not glued code) outside -> still deny B-2 (today\'s/unchanged behaviour)')
+        or diag("cmd: $cmd4");
+}
+
+# ===========================================================================
+# AC-78 (spec AC-10, sec 3.10) -- _hyg_find_shellc_script's option walk stops
+# at the first predictable non-option word (no -c beyond the script operand).
+# ===========================================================================
+{
+    my $driver_main = caller_by_name('driver-main');
+    is(run_for($driver_main, 'bash x.sh -c cd')->{rc}, 0,
+       'AC-78 (spec AC-10, sec 3.10 row 1): bash x.sh -c cd -> allow (-c appears AFTER the script operand, today a false B-1)');
+
+    for my $c (
+        [ q{bash -o pipefail -c 'cd x'} => '-o pipefail skips its value, then -c is found' ],
+        [ q{sh -ec 'cd x'}              => 'a glued -ec cluster matching -c' ],
+        [ q{bash --norc -c 'cd x'}      => '--norc is an unlisted long option, the walk continues to -c' ],
+        # New pin: a CLUSTERED option word that bundles another short flag
+        # with "-o" (e.g. "-eo", "-euo") is not recognised by the option
+        # walk today -- only an exact "-o"/"+o"/"-O"/"+O" consumes the next
+        # word. So the walk wrongly treats "pipefail" as the script operand
+        # (stopping there, no -c found) instead of correctly skipping it and
+        # finding "-c" with script operand "cd x".
+        [ q{bash -eo pipefail -c 'cd x'}  => 'a clustered -eo option bundles -o, which must still skip its value' ],
+        [ q{bash -euo pipefail -c 'cd x'} => 'a clustered -euo option bundles -o, which must still skip its value' ],
+    ) {
+        my ($cmd, $label) = @$c;
+        is(run_for($driver_main, $cmd)->{rc}, 2, "AC-78 (spec AC-10, sec 3.10): $label -> deny B-1") or diag("cmd: $cmd");
+    }
+}
+
+# ===========================================================================
+# AC-79 (spec AC-11, sec 3.11) -- unlink, shred, dd, sort and curl are added
+# to $HYG_TRIGGER_RE and classified by hyg_targets per the spec's table.
+# ===========================================================================
+{
+    my $driver_main = caller_by_name('driver-main');
+    my @rows = (
+        [ "unlink $OUTSIDE/f"                          => 2, 'unlink outside -> deny B-2' ],
+        [ "unlink $REPO/f"                              => 0, 'unlink repo -> allow' ],
+        [ "shred -u $OUTSIDE/f"                          => 2, 'shred -u outside -> deny B-2 (delete)' ],
+        [ "shred $OUTSIDE/f"                             => 2, 'shred (no -u) outside -> deny B-2 (write)' ],
+        [ "shred -u $TMPFIX/f"                           => 0, 'shred -u tmp -> allow' ],
+        [ "dd if=/dev/zero of=$OUTSIDE/f bs=1 count=1"   => 2, 'dd of= outside -> deny B-2' ],
+        [ "dd if=x of=$TMPFIX/f"                         => 0, 'dd of= tmp -> allow' ],
+        [ "dd if=x of=/dev/null"                         => 0, 'dd of=/dev/null -> allow' ],
+        # New pin (never-halt 09-gb-h-residuals, SHOULD-FIX): dd's of= value
+        # is tilde-resolved before classification, the same way other
+        # home-alias write targets are, so it is recognised as targeting
+        # $HOME/x (outside the repo via the HOME=HOMEFIX fixture env) rather
+        # than resolving relative to cwd as the literal "<R>/~/x".
+        [ "dd of=~/x"                                    => 2, 'dd of=~/x (tilde-resolved to $HOME/x) -> deny B-2 (home-alias write target)' ],
+        [ "sort -o $OUTSIDE/f in.txt"                    => 2, 'sort -o outside -> deny B-2' ],
+        [ "sort --output=$OUTSIDE/f in.txt"              => 2, 'sort --output= outside -> deny B-2' ],
+        [ "sort -o$OUTSIDE/f in.txt"                     => 2, 'sort -oGLUED outside -> deny B-2' ],
+        [ "sort -ro $OUTSIDE/f in.txt"                   => 2, 'sort -ro (cluster) outside -> deny B-2' ],
+        [ "sort -o $TMPFIX/f in.txt"                     => 0, 'sort -o tmp -> allow' ],
+        [ "sort -k 2 in.txt"                             => 0, 'sort -k 2 (skips its value, no target) -> allow' ],
+        [ "sort -t o in.txt"                             => 0, 'sort -t o (skips its value; the "o" is not -o) -> allow' ],
+        [ "curl -o $OUTSIDE/f https://x"                 => 2, 'curl -o outside -> deny B-2' ],
+        [ "curl -sSLo $OUTSIDE/f https://x"              => 2, 'curl -sSLo (cluster) outside -> deny B-2' ],
+        [ "curl --output=$OUTSIDE/f https://x"           => 2, 'curl --output= outside -> deny B-2' ],
+        [ "curl -o $TMPFIX/f https://x"                  => 0, 'curl -o tmp -> allow' ],
+        [ "curl -o - https://x"                          => 0, 'curl -o - (a literal "-" target is skipped) -> allow' ],
+        [ "curl -O https://x/f"                          => 0, 'curl -O (ignored, not a target flag) -> allow' ],
+    );
+    for my $r (@rows) {
+        my ($cmd, $rc, $label) = @$r;
+        is(run_for($driver_main, $cmd)->{rc}, $rc, "AC-79 (spec AC-11, sec 3.11): $label") or diag("cmd: $cmd");
+    }
+
+    is(run_for($driver_main, 'unlink .git')->{rc}, 2,
+       'AC-79 (spec AC-11): unlink .git -> deny (c), default mode');
+    is(run_for($driver_main, 'unlink .git', permission_mode => 'bypassPermissions')->{rc}, 2,
+       'AC-79 (spec AC-11): unlink .git -> deny (c), also under bypassPermissions');
+}
+
+# ===========================================================================
+# AC-80 (spec AC-12, sec 3.12) -- _gb_w_mkdir_ancestor_ok computes $ci FIRST,
+# then (when true) compares lc($Dc) with lc($Rc) for both the equality and
+# the prefix test (REL still taken from $Dc by length).
+#
+# CAVEAT (test-writer note, not a spec gap in the behaviour itself): the
+# spec names this call ("It calls ... _gb_w_mkdir_ancestor_ok directly after
+# _gb_w_require_writeguards()") but does not give the sub's own parameter
+# order/shape -- it is an EXISTING GuardBash.pm internal (not one of this
+# package's "New" subs in spec sec 2.2), and this file is blind to
+# GuardBash.pm's source by design. The call below is the test-writer's
+# best-effort reconstruction from spec sec 3.12's own prose ("$R = {
+# packages => [ { write_set => 'src/a/x.pm' } ] }" and "root <R>", "D = ...")
+# as ($D, $root, $R). CORRECTED per implementer confirmation (reading the
+# real code): the actual signature is ($R, $root, $D) -- ledger-data hashref
+# first, root second, directory third. Calls below use that order.
+# ===========================================================================
+{
+    ok(BpHook::Guards::GuardBash::_gb_w_require_writeguards(),
+       'AC-80 (spec AC-12, sec 3.12) setup: _gb_w_require_writeguards() loads WriteGuards');
+
+    my $root = $REPO;
+    my $R = { packages => [ { write_set => 'src/a/x.pm' } ] };
+
+    SKIP: {
+        my $is_ci = eval { BpHook::WriteGuards::_is_ci() };
+        skip("AC-80 case-variant row: _is_ci() is false (not a case-insensitive host), per spec sec 3.12's stated skip condition", 1)
+            unless $is_ci;
+        my $D_upper = uc("$root/src");
+        is(BpHook::Guards::GuardBash::_gb_w_mkdir_ancestor_ok($R, $root, $D_upper), 1,
+           'AC-80 (spec AC-12, sec 3.12): an upper-cased ancestor spelling -> 1 on a case-insensitive host (today 0)');
+    }
+
+    my $D_exact = "$root/src";
+    is(BpHook::Guards::GuardBash::_gb_w_mkdir_ancestor_ok($R, $root, $D_exact), 1,
+       'AC-80 (spec AC-12, sec 3.12): the exact-case ancestor -> 1');
+
+    my $D_other = "$root/other";
+    is(BpHook::Guards::GuardBash::_gb_w_mkdir_ancestor_ok($R, $root, $D_other), 0,
+       'AC-80 (spec AC-12, sec 3.12): a non-ancestor directory -> 0');
+}
+
+# ===========================================================================
+# AC-81 (spec AC-16, pin rows) -- already-closed items. Pinned here as
+# regression checks (DC1); NOT DC2 red-today tests.
+# ===========================================================================
+{
+    my $driver_main = caller_by_name('driver-main');
+    my $cmd1 = "(>$OUTSIDE/f)";
+    is(run_for($driver_main, $cmd1)->{rc}, 2,
+       'AC-81 (spec AC-16 pin, r2-N1): (>OUTSIDE/f) -> deny B-2 (already closed; pin, not a DC2 red test)') or diag("cmd: $cmd1");
+
+    my $cmd2 = 'rm -rf .git # ' . ('x' x 1000);
+    my $res2 = run_for($driver_main, $cmd2, env => { BP_GUARD_MAX_STRIP_BYTES => '100' });
+    is($res2->{rc}, 2,
+       'AC-81 (spec AC-16 pin, r2-N6): BP_GUARD_MAX_STRIP_BYTES=100, rm -rf .git # <1000 x> -> deny (c) (already closed; pin, not a DC2 red test)')
+        or diag("cmd: $cmd2");
+}
+
+# ===========================================================================
+# AC-82 (spec AC-17, sec 3.15) -- test-file housekeeping: this file no
+# longer defines sub timed_run_for (already removed above, in this same
+# change -- this is a static pin, not a DC2 red-today test).
+# ===========================================================================
+{
+    open(my $fh, '<', __FILE__) or die "AC-82: cannot reopen self: $!";
+    local $/;
+    my $src = <$fh>;
+    close $fh;
+    my $count = () = $src =~ /^sub timed_run_for\b/mg;
+    is($count, 0,
+       'AC-82 (spec AC-17, sec 3.15): worker-bash-hygiene.t no longer defines sub timed_run_for');
+}
 
 done_testing();

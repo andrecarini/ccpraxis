@@ -28,6 +28,17 @@ use Fcntl qw(:flock O_WRONLY O_APPEND O_CREAT O_EXCL);
 use File::Basename qw(dirname);
 use Cwd ();
 use B qw(svref_2object SVp_POK);
+use Time::HiRes ();
+
+# never-halt 09-gb-h-residuals (spec sec 2.1, E1): the wall-clock stamp for
+# "hook process start", taken as the FIRST statement of main() and local'd
+# to that one call -- so an in-process caller that invokes main() again (the
+# test suites do) never sees a stale stamp from a previous call, and a
+# GuardHarness::run_module() call that never goes through main() at all sees
+# undef (today's behaviour, unchanged).
+our $MAIN_STARTED_AT;
+
+sub started_at { return $MAIN_STARTED_AT }
 
 my $SID_RE    = qr/\A[A-Za-z0-9_-]{1,128}\z/;
 my $AGENT_RE  = qr/\A[A-Za-z0-9_-]{1,64}\z/;
@@ -1080,6 +1091,53 @@ sub _segments {
     my $i = 0;
     my @pending_heredocs; # ops ('$dash, $word') queued on the CURRENT line
 
+    # never-halt 09-gb-h-residuals sec 3.5 (r2-N7c, r3-N2, r4-S1b): a bounded
+    # look-ahead that recognises an arithmetic span ("$((" anywhere, or "(("
+    # in command position) and reports where it ends, so the whole span can
+    # be replaced by a single unpredictable placeholder -- nothing inside it
+    # (heredoc operator, redirect, separator) is ever lexed. $start is the
+    # index of the FIRST "(" of the "((" pair. $arith_hwm is a high-water
+    # mark: once a look-ahead has failed up to some index j, any later
+    # attempt starting below that mark is known to fail too and skips the
+    # scan outright -- this keeps total look-ahead work linear in the text.
+    my $arith_hwm = -1;
+    my $try_arith = sub {
+        my ($start) = @_;
+        return undef if $start <= $arith_hwm;
+        my $j = $start + 2;
+        my $depth = 0;
+        while ($j < $len) {
+            my $cj = substr($text, $j, 1);
+            # never-halt 09-gb-h-residuals MUST-FIX 1 (red-team H1): fail the
+            # look-ahead (fall back to ordinary lexing) on '{', '}' or '\' too,
+            # the same way it already fails on quotes and '$('. Without this,
+            # parens embedded in ${...} pattern text (e.g. "${x//(/}") or
+            # escaped with a backslash are counted as real nesting, letting
+            # the scan's depth diverge from bash's and read past the true
+            # closing "))" through injected commands to a later inert "))".
+            if ($cj eq "\n" || $cj eq "'" || $cj eq '"' || $cj eq "\x60"
+                || $cj eq '{' || $cj eq '}' || $cj eq '\\') {
+                $arith_hwm = $j if $j > $arith_hwm;
+                return undef;
+            }
+            if ($cj eq '$' && $j + 1 < $len && substr($text, $j + 1, 1) eq '(') {
+                $arith_hwm = $j if $j > $arith_hwm;
+                return undef;
+            }
+            if ($cj eq '(') { $depth++; $j++; next }
+            if ($cj eq ')') {
+                if ($depth > 0) { $depth--; $j++; next }
+                if ($j + 1 < $len && substr($text, $j + 1, 1) eq ')') { return $j + 2 }
+                $arith_hwm = $j if $j > $arith_hwm;
+                return undef;
+            }
+            $j++;
+        }
+        $arith_hwm = $j if $j > $arith_hwm;
+        return undef;
+    };
+    my $ARITH_CMD_POS_RE = qr/^[ \t]*(?:(?:if|elif|while|until|for|then|do|else|!|time)[ \t]+)*$/;
+
     # Consumes, verbatim and WITHOUT ever feeding the quote/frame state
     # machine above, the body of each queued heredoc (in textual order),
     # advancing $i to the first line after the last body's delimiter line.
@@ -1136,6 +1194,20 @@ sub _segments {
                 $i++;
                 next;
             }
+            if (substr($text, $i, 3) eq '$((') {
+                # never-halt 09 sec 3.5: an arithmetic span inside a double-
+                # quoted word ("$(( 3 > 2 ))") is recognised too -- on
+                # success it is folded into the same unpredictable
+                # placeholder as the unquoted case, so nothing inside it
+                # (not even a literal '"') is re-lexed. On failure, fall
+                # through to today's "$(" substitution-frame handling below.
+                my $end = $try_arith->($i + 1);
+                if (defined $end) {
+                    $frame->{buf} .= '${_bp_arith}';
+                    $i = $end;
+                    next;
+                }
+            }
             if (substr($text, $i, 2) eq '$(') {
                 # never-halt/01 M1: do NOT flush the enclosing word's buf here --
                 # a quoted "$(...)" host word (e.g. "$(pwd)/.git") must stay one
@@ -1155,7 +1227,56 @@ sub _segments {
             $i++;
             next;
         }
+        # never-halt 09 sec 3.5: an arithmetic span starting here ("$((" at
+        # any point, or "((" when this frame's buf is still in "command
+        # position" -- only if/elif/while/until/for/then/do/else/!/time
+        # keywords precede it) is tried BEFORE anything else in this
+        # quote=='none' zone, so a "<<" or "(args to lex) inside it is never
+        # mistaken for a heredoc operator or a real redirect/separator. A
+        # failed look-ahead changes nothing: every check below still runs
+        # against the very same '(' or '$' character (E7 -- no new bypass).
+        if (substr($text, $i, 3) eq '$((') {
+            my $end = $try_arith->($i + 1);
+            if (defined $end) {
+                $frame->{buf} .= '${_bp_arith}';
+                $i = $end;
+                next;
+            }
+        }
+        elsif (substr($text, $i, 2) eq '((' && $frame->{buf} =~ $ARITH_CMD_POS_RE) {
+            my $end = $try_arith->($i);
+            if (defined $end) {
+                $frame->{buf} .= '${_bp_arith}';
+                $i = $end;
+                next;
+            }
+        }
+        # never-halt 09 sec 3.6: a frame opened by $(/<(/>() keeps its OWN
+        # paren depth -- an unquoted '(' inside it is just more text (bumps
+        # the depth), and a ')' only closes the frame once that depth is
+        # back at 0. The top-level frame (closer undef) is untouched.
+        if ($c eq '(' && defined $frame->{closer} && $frame->{closer} eq ')') {
+            $frame->{depth} = ($frame->{depth} // 0) + 1;
+            $frame->{buf} .= $c;
+            $i++;
+            next;
+        }
         if (defined $frame->{closer} && $c eq $frame->{closer}) {
+            if ($frame->{closer} eq ')' && ($frame->{depth} // 0) > 0) {
+                # never-halt 09-gb-h-residuals MUST-FIX 2 (red-team H2 /
+                # reviewer M1): an unquoted ')' that brings this frame's
+                # depth back to 0 must END the segment here, exactly like
+                # the existing top-level behavior below (closer undef) --
+                # not be appended to the buffer. Appending let a subshell
+                # like "$( (rm -rf .git) )" or a case-statement "(a)"
+                # pattern-closer survive as unlexed text inside the outer
+                # buf instead of being split into its own segment.
+                $frame->{depth}--;
+                push @segs, $frame->{buf};
+                $frame->{buf} = '';
+                $i++;
+                next;
+            }
             # never-halt/01 M1: the substitution body is still emitted as its
             # own segment (parsed as a command in its own right, Decision
             # 22 S6), but the enclosing word's buf is NOT reset by the open --
@@ -1183,8 +1304,8 @@ sub _segments {
         if ($c eq '<' && $i + 1 < $len && substr($text, $i + 1, 1) eq '<'
             && !($i > 0 && substr($text, $i - 1, 1) eq '<')) {
             pos($text) = $i;
-            if ($text =~ /\G<<(-)?[ \t]*(?:'([^'\n]*)'|"([^"\n]*)"|([A-Za-z_][A-Za-z0-9_.-]*))/gc) {
-                my $word = defined $2 ? $2 : defined $3 ? $3 : $4;
+            if ($text =~ /\G<<(-)?[ \t]*(?:'([^'\n]*)'|"([^"\n]*)"|\\([A-Za-z_][A-Za-z0-9_.-]*)|([A-Za-z_][A-Za-z0-9_.-]*))/gc) {
+                my $word = defined $2 ? $2 : defined $3 ? $3 : defined $4 ? $4 : $5;
                 if (defined $word && length $word) {
                     push @pending_heredocs, [ (defined $1 ? 1 : 0), $word ];
                     $i = pos($text);
@@ -1736,7 +1857,19 @@ sub _fast_ascii_escape_decode {
     # silently hand that to the ascii-only decoder below (it would treat it
     # as a Latin-1 code point instead of failing), fall back instead.
     return undef if $esc =~ /[\x80-\xFF]/;
-    return eval { JSON::PP->new->decode($esc) };
+    my $out = eval { JSON::PP->new->decode($esc) };
+    my $err = $@;
+    # never-halt 09-gb-h-residuals (Decision 30, red-team 4 N1): a die
+    # raised mid-decode here is otherwise swallowed by this very eval and
+    # never reaches load_payload's own alarm re-throw below -- re-die it
+    # now (ALRM-shaped only, never a JSON::PP parse-error that merely
+    # mentions "alarm") so it propagates like any other decode attempt's.
+    if (!defined $out && defined $err && length $err
+        && $err =~ /alarm/i && $err !~ /at character offset/)
+    {
+        die $err;
+    }
+    return $out;
 }
 
 sub load_payload {
@@ -1752,15 +1885,21 @@ sub load_payload {
         $data = eval { _fast_ascii_escape_decode($raw) };
         my $fast_err = $@;
         if ((!defined $data || ref($data) ne 'HASH')
-            && defined $fast_err && length $fast_err && $fast_err =~ /alarm/i)
+            && defined $fast_err && length $fast_err
+            && $fast_err =~ /alarm/i && $fast_err !~ /at character offset/)
         {
-            # Decision 26 (3): an ALRM die that fires mid-fast-path must
-            # never be swallowed into a slow-path retry -- load_payload's own
-            # eval around the fast path would otherwise treat the alarm's
-            # die exactly like an ordinary decode failure and fall through to
-            # the slow JSON::PP->utf8->decode path, which is the very
+            # never-halt 09-gb-h-residuals (Decision 30, red-team 4 N1): an
+            # ALRM die that fires mid-fast-path must never be swallowed into
+            # a slow-path retry -- load_payload's own eval around the fast
+            # path would otherwise treat the alarm's die exactly like an
+            # ordinary decode failure and fall through to the slow
+            # JSON::PP->utf8->decode path, which is the very
             # quadratic-for-non-ASCII cost the fast path exists to avoid.
-            # Re-throw so the caller's own alarm handling sees it.
+            # Re-throw so the caller's own alarm handling sees it. Excluded:
+            # a JSON::PP-shaped "at character offset" die, which carries that
+            # phrase for every real parse error -- a malformed payload whose
+            # text happens to contain the word "alarm" must stay an ordinary
+            # swallowed decode failure.
             die $fast_err;
         }
         if (!defined $data || ref($data) ne 'HASH') {
@@ -1772,10 +1911,24 @@ sub load_payload {
             # path onto a large payload.
             if (defined $PAYLOAD_RAW_LEN && $PAYLOAD_RAW_LEN <= 65536) {
                 $data = eval { JSON::PP->new->utf8->decode($raw) };
+                my $slow_err = $@;
+                if ((!defined $data || ref($data) ne 'HASH')
+                    && defined $slow_err && length $slow_err
+                    && $slow_err =~ /alarm/i && $slow_err !~ /at character offset/)
+                {
+                    die $slow_err;
+                }
                 if (!defined $data || ref($data) ne 'HASH') {
                     my $repaired = _repair_lone_surrogates($raw);
                     if ($repaired ne $raw) {
                         $data = eval { JSON::PP->new->utf8->decode($repaired) };
+                        my $slow_err2 = $@;
+                        if ((!defined $data || ref($data) ne 'HASH')
+                            && defined $slow_err2 && length $slow_err2
+                            && $slow_err2 =~ /alarm/i && $slow_err2 !~ /at character offset/)
+                        {
+                            die $slow_err2;
+                        }
                     }
                 }
             }
@@ -1851,6 +2004,7 @@ sub _append_hook_error {
 }
 
 sub main {
+    local $MAIN_STARTED_AT = Time::HiRes::time();
     my ($module, @args) = @_;
     # R8-RVM1 (review M1): track whether the warn handler actually fired
     # for THIS invocation, not whether payload_ok() is true -- payload_ok()
