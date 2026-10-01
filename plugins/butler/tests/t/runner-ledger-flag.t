@@ -59,6 +59,38 @@ my $REPO_ROOT = RunnerStateHarness::repo_root();
 
 my $BOUND = 20;   # seconds; every runner fixture below is 1 near-instant file
 
+# ---------------------------------------------------------------------------
+# make_green_lint_root() -- a committed git repo fixture holding three green
+# plugins/butler/tests/t/<name> lints, for CCPRAXIS_TEST_LINT_ROOT. Needed
+# because tooling-fixes 07 makes a --ledger run also run the three repo
+# lints: without this, AC-1/AC-2 below would run the real repo lints and
+# their file count/redness would depend on the real tree's state. See
+# .ccpraxis-local-data/blueprints/tooling-fixes/specs/
+# 07-validation-runs-repo-lints-spec.md section 4 "Regression".
+# ---------------------------------------------------------------------------
+my @LEDGER_FLAG_LINT_BASENAMES = qw(
+    test-naming-hygiene.t
+    tests-never-run-tests.t
+    turn-cap-consistency.t
+);
+
+sub make_green_lint_root {
+    my $root = tempdir(CLEANUP => 1);
+    (my $root_n = $root) =~ s{\\}{/}g;
+    my $dir = "$root_n/plugins/butler/tests/t";
+    make_path($dir);
+    for my $name (@LEDGER_FLAG_LINT_BASENAMES) {
+        open(my $fh, '>:raw', "$dir/$name") or die "cannot write $dir/$name: $!";
+        print {$fh} "#!/usr/bin/env perl\n# platform: any\nprint \"ok 1 - fixture pass\\n\";\nexit 0;\n";
+        close $fh;
+    }
+    system('git', '-C', $root_n, 'init', '-q') == 0 or die "git init failed in $root_n";
+    system('git', '-C', $root_n, 'add', '-A') == 0 or die "git add failed in $root_n";
+    system('git', '-C', $root_n, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'base') == 0
+        or die "git commit failed in $root_n";
+    return $root_n;
+}
+
 # =============================================================================
 # SECTION 1 -- scripts/run-tests.pl --ledger argv grammar (AC-1..AC-6)
 # =============================================================================
@@ -73,17 +105,20 @@ my $BOUND = 20;   # seconds; every runner fixture below is 1 near-instant file
     my $fixture = make_fixture_tree('quick-green.t' => green_source());
     my $ledger_path = File::Spec->catfile($fixture, 'tests', 't', 'quick-green.t');
     my $state_dir = tempdir(CLEANUP => 1);
+    my $lint_root = make_green_lint_root();
 
     my $res = run_runner_bounded(
         args    => ['--ledger', $ledger_path, $fixture],
-        env     => { CCPRAXIS_TEST_STATE_DIR => $state_dir },
+        env     => { CCPRAXIS_TEST_STATE_DIR => $state_dir, CCPRAXIS_TEST_LINT_ROOT => $lint_root },
         timeout => $BOUND,
     );
     is($res->{rc}, 0, 'AC-1: --ledger <existing file> <fixture dir> -> rc 0') or diag($res->{err});
     my @ledger_lines = grep { /^ledger: /m } split /\n/, $res->{out};
     is(scalar(@ledger_lines), 1, 'AC-1: exactly one "ledger: " line on stdout');
     like($res->{out}, qr/^ledger: \Q$ledger_path\E$/m, 'AC-1: the ledger line names the exact --ledger path');
-    like($res->{out}, qr/^1 files/m, 'AC-1: summary reports 1 file (the ledger path was not treated as a target)');
+    like($res->{out}, qr/^4 files/m,
+        'AC-1: summary reports 4 files (the target plus the three repo lints tooling-fixes 07 adds; '
+      . 'the ledger path itself was not treated as a target)');
 }
 
 # ---------------------------------------------------------------------------
@@ -93,15 +128,17 @@ my $BOUND = 20;   # seconds; every runner fixture below is 1 near-instant file
     my $fixture = make_fixture_tree('quick-green.t' => green_source());
     my $ledger_path = File::Spec->catfile($fixture, 'tests', 't', 'quick-green.t');
     my $state_dir = tempdir(CLEANUP => 1);
+    my $lint_root = make_green_lint_root();
 
     my $res = run_runner_bounded(
         args    => ["--ledger=$ledger_path", $fixture],
-        env     => { CCPRAXIS_TEST_STATE_DIR => $state_dir },
+        env     => { CCPRAXIS_TEST_STATE_DIR => $state_dir, CCPRAXIS_TEST_LINT_ROOT => $lint_root },
         timeout => $BOUND,
     );
     is($res->{rc}, 0, 'AC-2: --ledger=<existing file> <fixture dir> -> rc 0') or diag($res->{err});
     like($res->{out}, qr/^ledger: \Q$ledger_path\E$/m, 'AC-2: the ledger line names the exact --ledger= path');
-    like($res->{out}, qr/^1 files/m, 'AC-2: summary reports 1 file');
+    like($res->{out}, qr/^4 files/m,
+        'AC-2: summary reports 4 files (the target plus the three repo lints tooling-fixes 07 adds)');
 }
 
 # ---------------------------------------------------------------------------

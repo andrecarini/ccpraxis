@@ -182,9 +182,20 @@ my $KEEP_SANDBOX = 0;
 # never-halt 03: the --ledger path, taken verbatim (no rel2abs, no separator
 # folding -- File::Spec on Git-for-Windows perl is the Unix flavour, and
 # rel2abs of a C:/ path is wrong). undef unless --ledger was given. Set once
-# during argv parsing in run_sweep(), read-only afterward. Nothing reads it
-# yet except the announcement line below; tooling-fixes 07 builds on it.
+# during argv parsing in run_sweep(), read-only afterward. tooling-fixes 07:
+# lint mode is on exactly when this is defined.
 my $LEDGER_PATH;
+
+# tooling-fixes 07: the repo-wide lints a --ledger run also runs, once each,
+# defined exactly once here (DC3) so every caller agrees on the set. `our`,
+# file-scope, so a file that `require`s this script can read it. Relative,
+# forward-slash paths, in this fixed order -- a list, not a marker, by design
+# (a lint-registry marker is explicitly out of scope).
+our @REPO_LINTS = (
+    'plugins/butler/tests/t/test-naming-hygiene.t',
+    'plugins/butler/tests/t/tests-never-run-tests.t',
+    'plugins/butler/tests/t/turn-cap-consistency.t',
+);
 
 # The recognisable prefix every per-file sandbox/win-tmp dir carries (m4).
 # Lets an operator (or a stray-orphan reaper) tell this runner's own scratch
@@ -425,7 +436,7 @@ usage: perl scripts/run-tests.pl [--fast] [--jobs N] [--nice] [--state=failed] [
   --nice          low-impact mode: cap parallelism at max(2, cores/4), leaving the machine usable for whoever else is on it. Does not touch OS scheduling priority (spawned git/podman children aren't covered by that). Env var CCPRAXIS_TEST_JOBS=N sets the same kind of ambient low-impact default without a per-run flag.
   --state=failed  re-run only the files recorded failing by the previous run
   --keep-sandbox  do not remove each file's per-file sandbox HOME after it runs (package 21-test-sandbox). Default: removed.
-  --ledger PATH   name the package ledger this run validates (must exist; exit 2 otherwise). The validation interlock scopes the run to that package's write set.
+  --ledger PATH   name the package ledger this run validates (must exist; exit 2 otherwise). The validation interlock scopes the run to that package's write set, and the run also runs the repo lints once each (tooling-fixes 07), reporting a red that also fails at HEAD as pre-existing.
 
 Precedence for parallelism (most to least specific):
   --jobs N  >  --nice  >  CCPRAXIS_TEST_JOBS env var  >  default (cores - 2)
@@ -433,6 +444,243 @@ Precedence for parallelism (most to least specific):
 Container lane (opt-in, off by default -- a lane-AVAILABILITY switch, never a routing switch; see classify_file()'s own header comment):
   CCPRAXIS_CONTAINER_LANE_ENABLED=1|true|yes|on   run any/linux-marked, non-serial-classified files inside the existing claude-sandbox:latest container instead of on this host. Any other value (unset, "", "0", "false", "no", "off", ...) means OFF -- those files simply run on the host instead, exactly as before this env var existed. Only the whole working tree that was last committed is reflected in the container (package 05's own limitation), so an ordinary sweep tests HEAD, not uncommitted edits, for every file this sends there.
 USAGE
+
+# --- tooling-fixes 07: repo-lint mode helpers --------------------------------
+#
+# _lint_root() -- the tree a --ledger run's repo lints are read from and
+# compared against HEAD in. CCPRAXIS_TEST_LINT_ROOT, if set and non-empty, is
+# a test-isolation hook (same convention as CCPRAXIS_TEST_STATE_DIR), used
+# verbatim: no abs_path, no separator folding. Read only in lint mode.
+#
+# FIX-BATCH M1 (red-team, step 7): CCPRAXIS_TEST_LINT_ROOT used to be honored
+# in a REAL (non-test) invocation too -- a worker could point the lints at a
+# directory of green stubs and get exit 0, with only a stdout "(root: ...)"
+# line revealing it. Gated behind CCPRAXIS_TEST_STATE_DIR also being set and
+# non-empty: every oracle invocation in this suite that sets
+# CCPRAXIS_TEST_LINT_ROOT sets CCPRAXIS_TEST_STATE_DIR in the SAME env hash
+# (the harness's own convention -- see validation-runs-repo-lints.t and
+# runner-ledger-flag.t), so this is inert for exactly nothing the oracles
+# exercise, and inert for a real run, which has no reason to ever set either.
+sub _lint_root {
+    return $ENV{CCPRAXIS_TEST_LINT_ROOT}
+        if defined $ENV{CCPRAXIS_TEST_LINT_ROOT} && length $ENV{CCPRAXIS_TEST_LINT_ROOT}
+        && defined $ENV{CCPRAXIS_TEST_STATE_DIR} && length $ENV{CCPRAXIS_TEST_STATE_DIR};
+    return $ROOT_ABS;
+}
+
+# _path_identity($path) -- the same "is this the same file" test the
+# collection step uses to avoid adding a lint a target already selected
+# (spec section 2.4): Cwd::abs_path, falling back to the path itself when
+# abs_path can't resolve it (e.g. a path under a HEAD snapshot that no
+# longer exists by the time this is called), backslashes folded to forward
+# slashes, lowercased on a Windows-family perl (case-insensitive filesystem).
+sub _path_identity {
+    my ($p) = @_;
+    my $id = Cwd::abs_path($p);
+    $id = $p unless defined $id;
+    $id =~ s{\\}{/}g;
+    $id = lc($id) if $^O =~ /^(MSWin32|cygwin|msys)$/;
+    return $id;
+}
+
+# _drive_form($p) -- "/c/x" -> "C:/x"; undef when $p is not that shape.
+sub _drive_form {
+    my ($p) = @_;
+    return "\U$1\E:/$2" if defined $p && $p =~ m{^/([A-Za-z])/(.*)$};
+    return undef;
+}
+
+# _backslash_form($p) -- $p with every forward slash turned into a backslash;
+# undef when that is a no-op (nothing to add as a distinct spelling).
+sub _backslash_form {
+    my ($p) = @_;
+    return undef unless defined $p;
+    (my $b = $p) =~ s{/}{\\}g;
+    return $b eq $p ? undef : $b;
+}
+
+# _root_spellings($r) -> @spellings, longest first -- every textual form a
+# tree root $r might appear as inside a lint's own TAP output (spec section
+# 2.5 step 3): $r itself; Cwd::abs_path($r) when defined; the drive form of
+# each; the backslash form of each of those. Longest-first so a substring
+# spelling (e.g. the bare drive-relative form) never partially shadows a
+# longer one when both are replaced by sub.
+sub _root_spellings {
+    my ($r) = @_;
+    my (@out, %seen);
+    my $add = sub {
+        my ($s) = @_;
+        return unless defined $s && length $s;
+        push @out, $s unless $seen{$s}++;
+    };
+    my @base = ($r);
+    my $abs = Cwd::abs_path($r);
+    push @base, $abs if defined $abs;
+    $add->($_) for @base;
+    my @drive = grep { defined } map { _drive_form($_) } @base;
+    $add->($_) for @drive;
+    my @backslash = grep { defined } map { _backslash_form($_) } @out;
+    $add->($_) for @backslash;
+    return sort { length($b) <=> length($a) } @out;
+}
+
+# _lint_signature($out, $root) -> \@sorted_normalised_lines -- spec section
+# 2.5 step 3's sig(): the set of "not ok"/comment lines (excluding a "# Looks
+# like ..." summary line), with the "not ok" test number blanked and every
+# occurrence of $root's own spellings replaced by "<ROOT>", longest spelling
+# first so one spelling never partially shadows another.
+sub _lint_signature {
+    my ($out, $root) = @_;
+    my @spellings = _root_spellings($root);
+    my %sig;
+    for my $line (split /\r?\n/, (defined $out ? $out : '')) {
+        next unless $line =~ /^not ok\b/ || $line =~ /^\s*#/;
+        next if $line =~ /^\s*#\s*Looks like /;
+        (my $norm = $line) =~ s/^not ok \d+/not ok/;
+        for my $sp (@spellings) {
+            my $q = quotemeta($sp);
+            $norm =~ s/$q/<ROOT>/g;
+        }
+        $sig{$norm} = 1;
+    }
+    return [ sort keys %sig ];
+}
+
+# _run_git_capture(@cmd) -> ($out, $rc) -- list-form fork+exec (no shell, no
+# string interpolation anywhere in the command line: every element of @cmd
+# reaches exec() as its own argv entry). stderr is folded into the captured
+# stdout (same "caller only cares about rc, output is for a diagnostic
+# string" contract the old backtick calls had). (red-team LOW, step 7:
+# replaces the backtick `git -C "$root" ...` forms below, which ran through a
+# real shell -- a $root/rev containing `$(...)` was live shell syntax there.)
+sub _run_git_capture {
+    my (@cmd) = @_;
+    my $pid = open(my $fh, '-|');
+    return (undef, -1) unless defined $pid;
+    if ($pid == 0) {
+        open(STDERR, '>&', \*STDOUT) or close(STDERR);
+        open(STDIN, '<', File::Spec->devnull) or close(STDIN);
+        exec(@cmd) or POSIX::_exit(127);
+    }
+    local $/;
+    my $out = <$fh>;
+    close $fh;
+    my $rc = ($? == -1) ? -1 : ($? >> 8);
+    return (defined $out ? $out : '', $rc);
+}
+
+# _head_rev_parse_rc($root, $rev) -> $rc -- `git -C $root rev-parse --verify
+# -q $rev`'s exit code (0 == $rev resolves). $rev defaults to 'HEAD'. List-
+# form (_run_git_capture), never a shell.
+sub _head_rev_parse_rc {
+    my ($root, $rev) = @_;
+    $rev = 'HEAD' unless defined $rev && length $rev;
+    my (undef, $rc) = _run_git_capture('git', '-C', $root, 'rev-parse', '--verify', '-q', $rev);
+    return $rc;
+}
+
+# _ledger_blueprint($ledger_path) -> $blueprint_name | undef -- the blueprint
+# a --ledger path belongs to, read straight off the path's own
+# ".../blueprints/<blueprint>/packages/..." shape (the same layout every real
+# package ledger lives at; bp-baseline.pl's ref is keyed on this same name).
+# undef for anything else (a bare fixture path, as every oracle in this suite
+# uses) -- callers must treat that as "no baseline ref to even try".
+sub _ledger_blueprint {
+    my ($ledger_path) = @_;
+    return undef unless defined $ledger_path && length $ledger_path;
+    (my $norm = $ledger_path) =~ s{\\}{/}g;
+    return $1 if $norm =~ m{/blueprints/([^/]+)/packages/};
+    return undef;
+}
+
+# _first_non_wip_rev($root) -> $rev | undef -- walks `git log` from HEAD
+# backward (newest first) and returns the first commit whose subject does NOT
+# match bp-checkpoint.pl's own `wip(<pkg>): ...` shape (is_checkpoint_subject,
+# \A\s*wip\( ), i.e. the fallback half of H1 (red-team, step 7) for a repo/
+# branch with no refs/butler/baseline/<blueprint> ref recorded at all (outside
+# a blueprint run, or before bp-baseline.pl has ever advanced one). Bounded at
+# 200 commits -- deliberately not unbounded (this already walks history on
+# every red-lint run; see spec section 5's documented no-timeout limitation).
+# undef only when $root has no commit at all (HEAD itself doesn't resolve).
+sub _first_non_wip_rev {
+    my ($root) = @_;
+    return undef if _head_rev_parse_rc($root, 'HEAD') != 0;
+    my ($out, $rc) = _run_git_capture('git', '-C', $root, 'log', '--format=%H %s', '-n', '200', 'HEAD');
+    return 'HEAD' if $rc != 0 || !defined $out || !length $out;
+    my $last_sha;
+    for my $line (split /\n/, $out) {
+        next unless $line =~ /^(\S+)(?:\s(.*))?$/;
+        my ($sha, $subj) = ($1, $2);
+        $last_sha = $sha;
+        return $sha unless defined $subj && $subj =~ /\A\s*wip\(/;
+    }
+    return defined $last_sha ? $last_sha : 'HEAD';
+}
+
+# _resolve_baseline_rev($root, $ledger_path) -> $rev | undef -- H1 (red-team,
+# step 7). The comparison baseline used to be bare HEAD unconditionally,
+# which is wrong under dispatch-fleet specifically: the orchestrator makes
+# `wip(<pkg>): ...` checkpoint commits (orchestrator-protocol/SKILL.md) BEFORE
+# this package's own validation step runs, so by the time this comparison
+# fires, HEAD already contains the very regression this feature exists to
+# catch -- it reads as "pre-existing" and the exit code stays 0.
+# refs/butler/baseline/<blueprint> (bp-baseline.pl's own ref, advanced only
+# past done+harvest-passed work -- it skips WIP commits by construction) is
+# tried first, keyed off the blueprint name embedded in --ledger's own path.
+# Falls back to _first_non_wip_rev when that ref is absent (no blueprint name
+# parseable from $ledger_path, or the ref itself doesn't exist yet) --
+# drive-solo and every oracle in this suite land here, and get the exact same
+# answer bare HEAD used to give (no WIP commits -> first commit IS HEAD).
+sub _resolve_baseline_rev {
+    my ($root, $ledger_path) = @_;
+    my $blueprint = _ledger_blueprint($ledger_path);
+    if (defined $blueprint) {
+        my $ref = "refs/butler/baseline/$blueprint";
+        return $ref if _head_rev_parse_rc($root, $ref) == 0;
+    }
+    return _first_non_wip_rev($root);
+}
+
+# _materialize_head_archive($root, $dest, $rev) -> $rc -- `git archive $rev`
+# piped into `tar -x -C $dest` entirely in Perl (two list-form children, this
+# process pumping the bytes between them) -- no shell, no string
+# interpolation anywhere (red-team LOW, step 7: the previous `/bin/sh -c`
+# form built a shell command line; even though its own quoting happened to
+# neutralise `$(...)`, a lint-root path is untrusted input and this removes
+# the shell from the picture entirely rather than relying on quoting being
+# right forever). $rev defaults to 'HEAD'. Must never write anything into
+# $root itself (no worktree/stash/checkout/reset).
+sub _materialize_head_archive {
+    my ($root, $dest, $rev) = @_;
+    $rev = 'HEAD' unless defined $rev && length $rev;
+
+    my $git_pid = open(my $git_fh, '-|', 'git', '-C', $root, 'archive', $rev);
+    return -1 unless defined $git_pid;
+    binmode $git_fh;
+
+    my $tar_pid = open(my $tar_fh, '|-', 'tar', '-x', '-C', $dest);
+    unless (defined $tar_pid) {
+        close $git_fh;
+        return -1;
+    }
+    binmode $tar_fh;
+
+    my $buf;
+    while (my $n = sysread($git_fh, $buf, 65536)) {
+        last unless $n > 0;
+        my $off = 0;
+        while ($off < $n) {
+            my $w = syswrite($tar_fh, $buf, $n - $off, $off);
+            last unless defined $w;
+            $off += $w;
+        }
+    }
+    close $git_fh;
+    my $git_rc = $? == -1 ? -1 : ($? >> 8);
+    close $tar_fh;
+    my $tar_rc = $? == -1 ? -1 : ($? >> 8);
+    return $git_rc != 0 ? $git_rc : $tar_rc;
+}
 
 # --- state file (--state=failed) --------------------------------------------
 # Path: .ccpraxis-local-data/test-state/last-failures.txt, relative to $ROOT_ABS.
@@ -709,6 +957,10 @@ sub run_one {
         delete $ENV{$k} if $k =~ /^BP_/;
     }
     delete $ENV{$_} for qw(CCPRAXIS_DATA_DIR CLAUDE_PROJECT_DIR CLAUDE_CONFIG_DIR ALMANAC_HOME);
+    # tooling-fixes 07: a lint-root override is a test-isolation hook for THIS
+    # process's own lint collection, never something a child (including a
+    # nested runner) should inherit.
+    delete $ENV{CCPRAXIS_TEST_LINT_ROOT};
 
     my $base    = _sandbox_base();
     my $sandbox = File::Temp::tempdir($SWEEP_TEMPLATE, DIR => $base, CLEANUP => 0);
@@ -1305,6 +1557,65 @@ sub run_sweep {
     @files = sort @files;
     unless (@files) { print STDERR "no test files matched\n"; exit 2 }
 
+    # tooling-fixes 07: lint mode is on exactly when --ledger was given
+    # (BP_VALIDATE_LEDGER in the environment has no effect -- runner-ledger-
+    # flag.t AC-6 pins that). Collection happens AFTER the empty-selection
+    # exits above, so the lints never turn an empty selection into a run
+    # (spec section 2.4).
+    my $LINT_MODE = defined $LEDGER_PATH;
+    my $LINT_ROOT;
+    my %LINT_RELPATH_BY_IDENTITY;   # identity(lint path) => its @REPO_LINTS relpath
+    my @LINT_MISSING_RESULTS;
+    if ($LINT_MODE) {
+        $LINT_ROOT = _lint_root();
+        my %existing_identity = map { (_path_identity($_) => 1) } @files;
+        for my $relpath (@REPO_LINTS) {
+            my $lint_path = "$LINT_ROOT/$relpath";
+            if (!-f $lint_path) {
+                push @LINT_MISSING_RESULTS, {
+                    file => $lint_path, rc => 1, notok => 0, secs => 0,
+                    lint_missing => 1,
+                    out => "REPO LINT MISSING: $relpath -- not found under $LINT_ROOT\n",
+                };
+                next;
+            }
+            # LOW (red-team, step 7): a lint that EXISTS but can't be read
+            # used to fall through to classify_file()'s own silent skip
+            # (permissions, corruption, ...) -- the file simply vanished from
+            # the run with no trace. Same loud treatment as REPO LINT MISSING.
+            unless (-r $lint_path) {
+                push @LINT_MISSING_RESULTS, {
+                    file => $lint_path, rc => 1, notok => 0, secs => 0,
+                    lint_missing => 1,
+                    out => "REPO LINT MISSING: $relpath -- exists under $LINT_ROOT but could not be read\n",
+                };
+                next;
+            }
+            my $id = _path_identity($lint_path);
+            $LINT_RELPATH_BY_IDENTITY{$id} = $relpath;
+            unless ($existing_identity{$id}) {
+                push @files, $lint_path;
+                $existing_identity{$id} = 1;
+            }
+        }
+        # S3 (review, step 7): a launch's own target selection can already
+        # contain the same physical lint file twice under two different
+        # spellings (e.g. an explicit lint path alongside a plugin-dir glob
+        # that also matches it) -- done criterion 1 ("each lint runs once")
+        # broke in that case even though the injection step above never
+        # re-added an already-present lint. Dedupe the WHOLE selection by
+        # identity, not just the injected lints, now that it's fully built.
+        my %dedupe_seen;
+        @files = grep { !$dedupe_seen{ _path_identity($_) }++ } @files;
+        @files = sort @files;
+
+        my $line = 'repo lints: ' . join(' ', map { basename($_) } @REPO_LINTS);
+        $line .= " (root: $ENV{CCPRAXIS_TEST_LINT_ROOT})"
+            if defined $ENV{CCPRAXIS_TEST_LINT_ROOT} && length $ENV{CCPRAXIS_TEST_LINT_ROOT}
+            && defined $ENV{CCPRAXIS_TEST_STATE_DIR} && length $ENV{CCPRAXIS_TEST_STATE_DIR};
+        print "$line\n";
+    }
+
     # MARKER GATE, SERIAL HEURISTIC, THEN MARKER VALUE -- classify_file() is
     # the sole routing predicate (spec section 2.1/2.6). A refused file never
     # spawned a process; it is synthesised as a red result below so it flows
@@ -1316,6 +1627,17 @@ sub run_sweep {
         if    ($d->{lane} eq 'refused')       { push @refused,      { file => $f, marker => $d->{marker} } }
         elsif ($d->{lane} eq 'host-serial')   { push @host_serial,  $f }
         elsif ($d->{lane} eq 'host-parallel') { push @host_parallel,$f }
+        elsif ($LINT_MODE && exists $LINT_RELPATH_BY_IDENTITY{ _path_identity($f) }) {
+            # M2 (red-team, step 7): the 3 repo lints are meta-checks about
+            # this repo's OWN conventions, not platform-dependent product
+            # code -- with CCPRAXIS_CONTAINER_LANE_ENABLED set they would
+            # otherwise be eligible for the container lane (they declare
+            # `# platform: any`) and run against a CONTAINER's copy of a git
+            # ref instead of the working tree, so a real working-tree
+            # regression would never go red. Force the host lane always,
+            # regardless of the lane-availability gate below.
+            push @host_parallel, $f;
+        }
         else                                  { push @container,    $f }
     }
     # --fast empties the host-serial lane. Keep what it dropped so the summary
@@ -1508,9 +1830,81 @@ sub run_sweep {
     # --- refused phase -----------------------------------------------------------
     push @results, _refusal_result($_) for @refused;
 
+    # --- repo-lint missing phase (tooling-fixes 07, spec section 2.6) ------------
+    push @results, @LINT_MISSING_RESULTS;
+
+    # --- repo-lint HEAD comparison (tooling-fixes 07, spec section 2.5) ---------
+    # Lint mode only. Covers every result whose file is a lint (by identity),
+    # that is red, not refused, not container-infra and not missing. HEAD is
+    # materialised at most once per run, lazily, only when at least one lint
+    # is actually red -- a plain green run never pays this cost.
+    my %LINT_ANNOTATION;   # $result->{file} => { pre_existing => 0|1, reason => ..., new_lines => [...] }
+    if ($LINT_MODE) {
+        my @lint_reds = grep {
+            $_->{rc} != 0 && !$_->{refused} && !$_->{container_infra} && !$_->{lint_missing}
+                && exists $LINT_RELPATH_BY_IDENTITY{ _path_identity($_->{file}) }
+        } @results;
+
+        if (@lint_reds) {
+            my $head_dir;
+            my $head_unavailable;
+            # H1 (red-team, step 7): the comparison baseline is no longer
+            # bare HEAD -- see _resolve_baseline_rev's own header comment.
+            my $baseline_rev = _resolve_baseline_rev($LINT_ROOT, $LEDGER_PATH);
+            if (!defined $baseline_rev) {
+                $head_unavailable = "no resolvable baseline/HEAD revision in the lint root";
+            } else {
+                $head_dir = File::Temp::tempdir($SWEEP_TEMPLATE, DIR => _sandbox_base(), CLEANUP => 0);
+                _register_sandbox_dir($head_dir);
+                my $arc_rc = _materialize_head_archive($LINT_ROOT, $head_dir, $baseline_rev);
+                if ($arc_rc != 0) {
+                    $head_unavailable = "git archive|tar exited $arc_rc materialising the lint root's baseline ($baseline_rev)";
+                }
+            }
+
+            for my $r (@lint_reds) {
+                my $relpath = $LINT_RELPATH_BY_IDENTITY{ _path_identity($r->{file}) };
+                if (defined $head_unavailable) {
+                    $LINT_ANNOTATION{ $r->{file} } = { pre_existing => 0, reason => "HEAD comparison unavailable: $head_unavailable" };
+                    next;
+                }
+                my $head_file = "$head_dir/$relpath";
+                unless (-f $head_file) {
+                    $LINT_ANNOTATION{ $r->{file} } = { pre_existing => 0, reason => 'not present at HEAD' };
+                    next;
+                }
+                my $head_result = run_one($head_file);   # NOT added to @results (spec 2.5 step 2)
+                if ($head_result->{rc} == 0) {
+                    $LINT_ANNOTATION{ $r->{file} } = { pre_existing => 0, reason => 'not red at HEAD' };
+                    next;
+                }
+                my $work_sig = _lint_signature($r->{out}, $LINT_ROOT);
+                my $head_sig = _lint_signature($head_result->{out}, $head_dir);
+                my %head_sig_set = map { ($_ => 1) } @$head_sig;
+                my @new_lines = sort grep { !$head_sig_set{$_} } @$work_sig;
+                my $is_subset = !@new_lines;
+                # S1 (review, step 7): also require rc <= HEAD's own rc -- a
+                # duplicated/degenerate failure signature (e.g. an empty
+                # work_sig whose rc happens to equal HEAD's by coincidence,
+                # or a WORSE working-tree exit code that still produces a
+                # signature subset) must never misclassify as pre-existing.
+                if ($is_subset && (@$work_sig || $r->{rc} == $head_result->{rc}) && $r->{rc} <= $head_result->{rc}) {
+                    $LINT_ANNOTATION{ $r->{file} } = { pre_existing => 1 };
+                } else {
+                    $LINT_ANNOTATION{ $r->{file} } = {
+                        pre_existing => 0, reason => 'new failure lines vs HEAD', new_lines => \@new_lines,
+                    };
+                }
+            }
+
+            _force_remove_tree($head_dir) if defined $head_dir && !$KEEP_SANDBOX;
+        }
+    }
+
     # --- report ----------------------------------------------------------------
     my $wall = time - $start;
     my @red  = grep { $_->{rc} != 0 } @results;
+    my $pre_existing_lint_reds = grep { $LINT_ANNOTATION{ $_->{file} } && $LINT_ANNOTATION{ $_->{file} }{pre_existing} } @red;
 
     # NIT-1 (review, promoted for step 7): the container-lane batch's file
     # count used to be invisible in this breakdown (folded into the leading
@@ -1534,17 +1928,43 @@ sub run_sweep {
     if (@red) {
         print "\nRED:\n";
         for my $r (sort { $a->{file} cmp $b->{file} } @red) {
-            printf "  %-52s exit=%-3d notok=%d%s\n", basename($r->{file}), $r->{rc}, $r->{notok},
+            my $ann = $LINT_ANNOTATION{ $r->{file} };
+            my $is_lint = defined $ann || $r->{lint_missing};
+            # A repo lint is named by its FULL path (not just basename): the
+            # attribution/pre-existing line that follows needs the reader to
+            # be able to find it, and tooling-fixes 07's own oracle looks for
+            # the exact lint path on this line.
+            my $label = $is_lint ? $r->{file} : basename($r->{file});
+            printf "  %-52s exit=%-3d notok=%d%s\n", $label, $r->{rc}, $r->{notok},
                 ($r->{refused}          ? '   <- refused: platform marker missing/invalid'
                  : $r->{container_infra} ? '   <- container lane unavailable, never run (see message)'
+                 : $r->{lint_missing}    ? '   <- repo lint missing'
                  : $r->{notok} == 0      ? '   <- died, no failing assertion'
                                          : '');
+            if (defined $ann) {
+                if ($ann->{pre_existing}) {
+                    print "repo lint: pre-existing (fails identically at HEAD); not counted\n";
+                } else {
+                    print "repo lint: attributed to this change ($ann->{reason})\n";
+                    if ($ann->{reason} eq 'new failure lines vs HEAD') {
+                        print "        new vs HEAD: $_\n" for @{ $ann->{new_lines} };
+                    }
+                }
+            }
             for my $line (grep { /^not ok/ } split /\n/, $r->{out}) {
                 print "      $line\n";
+            }
+            if ($r->{lint_missing}) {
+                for my $line (split /\n/, $r->{out}) {
+                    print "      $line\n" if length $line;
+                }
             }
         }
     } else {
         print "all green\n";
+    }
+    if ($pre_existing_lint_reds > 0) {
+        print "pre-existing lint reds: $pre_existing_lint_reds (not counted in the exit code)\n";
     }
 
     # SKIPPED (package 21-test-sandbox, task 42): a skip_all file is listed
@@ -1579,7 +1999,10 @@ sub run_sweep {
         my $dur = _read_durations();
         for my $rel (keys %$dur) { delete $dur->{$rel} unless -f _to_abs($rel) }
         for my $r (@results) {
-            next if $r->{refused} || $r->{container_infra};
+            # S4 (review, step 7): a REPO LINT MISSING synthetic result never
+            # ran either -- same reasoning as refused/container_infra above,
+            # and spec section 2.6 rules it out explicitly.
+            next if $r->{refused} || $r->{container_infra} || $r->{lint_missing};
             next unless defined $r->{file} && $r->{file} ne '?';
             $dur->{ _relpath($r->{file}) } = $r->{secs} // 0;
         }
@@ -1681,7 +2104,7 @@ sub run_sweep {
         eval { unlink $SANDBOX_REGISTRY_PATH if defined $SANDBOX_REGISTRY_PATH };
     }
 
-    my $exit_code = scalar(@red);
+    my $exit_code = scalar(@red) - $pre_existing_lint_reds;
     $exit_code = 1 if $audit_failed && $exit_code == 0;
     exit $exit_code;
 }
