@@ -396,12 +396,13 @@ the second.
 
 **Tickets** (any time, for example arming when no stop is pending). The PreToolUse hook
 `continuity-off-check.sh` writes one ticket per real, predictable invocation of `butler-continuity`,
-`butler-hold` or `butler-fork-ok` (package 28, Decision 105) -- it is the one and only writer of all
-three names. `guard-fork.sh` writes none: its Bash-branch ticket write moved into
-`continuity-off-check.sh` so a second writer never produces two tickets for one call:
+`butler-hold`, `butler-fork-ok` (package 28, Decision 105) or `almanac-bug` (package 12,
+12-bug-claimant-and-triaging) -- it is the one and only writer of all four names. `guard-fork.sh`
+writes none: its Bash-branch ticket write moved into `continuity-off-check.sh` so a second writer
+never produces two tickets for one call:
 
 - Key: `k` = lowercase hex SHA-1 (core `Digest::SHA`) of `join("\0", $name, @argv)`, where `$name` is
-  normalised to `butler-continuity`, `butler-hold` or `butler-fork-ok`. The command computes the same
+  normalised to `butler-continuity`, `butler-hold`, `butler-fork-ok` or `almanac-bug`. The command computes the same
   `k` from its own `@ARGV`, so a ticket is found only for the exact same command.
 - File: `<state>/tickets/<k>/<session_id>.<tool_use_id>.json`, for example
   `{"session_id":"abb7e549-0e1f-4c1b-9a53-0d3b5a3c7f10","tool_use_id":"toolu_01HG32t2hGKSSJK7U3qVvWJm","agent_id":null,"operator":false,"background":true,"transcript_path":"C:/Users/André/.claude/projects/C--Development-ccpraxis/abb7e549-....jsonl","cwd":"C:/Development/ccpraxis","at":1790212345}`.
@@ -908,9 +909,10 @@ which is a re-scope request for package 04 (see Re-scope requests), in line with
 module per hook package.
 
 **Mechanism.** `continuity-off-check.sh` is a PreToolUse Bash hook with the prefilter
-`--pre text:butler-continuity,text:butler-hold,text:butler-fork-ok` (package 28, Decision 105): it
-exits when the payload text contains none of the three names. It writes the tickets described under
-Command binding.
+`--pre text:butler-continuity,text:butler-hold,text:butler-fork-ok,text:almanac` (package 28,
+Decision 105; `text:almanac` added by package 12, 12-bug-claimant-and-triaging): it exits when the
+payload text contains none of the four names. It writes the tickets described under Command
+binding.
 For each real invocation of `butler-continuity off`, with or without `--reason`, from a payload
 without `agent_id`, it reads the tail (at most 1 MiB) of the payload's `transcript_path` and finds the
 latest genuine operator record, walking back past everything that is not one:
@@ -1081,7 +1083,7 @@ next fork dispatch, and the guard denies again after it. Decision 3 applies thro
 
 | stop-gate.sh | 7 | --pre ledger,armed : exits when BP_LEDGER is unset and armed/<session_id> is absent |
 | arm-on-entry.sh | 1 | --pre text:bp-drive-next : exits when the payload text does not contain bp-drive-next |
-| continuity-off-check.sh | 0 | --pre text:butler-continuity,text:butler-hold,text:butler-fork-ok : exits when the payload text contains none of the three names |
+| continuity-off-check.sh | 0 | --pre text:butler-continuity,text:butler-hold,text:butler-fork-ok,text:almanac : exits when the payload text contains none of the four names |
 | bind-dispatch.sh | 6 | --pre ledger,driver : exits when BP_LEDGER is unset and the session is not an armed driver |
 | guard-writes.sh | 3 | --pre ledger,driver : exits when BP_LEDGER is unset and the session is not an armed driver |
 | ledger-guard.sh | 1 | --pre text:/packages/ --pre ledger,driver : exits when the payload text lacks /packages/, or when BP_LEDGER is unset and the session is not an armed driver |

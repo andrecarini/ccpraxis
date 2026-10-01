@@ -2,30 +2,99 @@
 # platform: any
 # t/01 — bug reports are frozen once ccpraxis picks them up.
 #
-# The guarantee: a report's body cannot change from `reviewing` onward, so a
-# reviewer cannot have it rewritten underneath them and a `taken` report cannot
+# The guarantee: a report's body cannot change from `triaging` onward, so a
+# triager cannot have it rewritten underneath them and a `taken` report cannot
 # be quietly reworded afterwards. Three layers back that up — the script
 # refuses, a PreToolUse hook denies direct edits, and a sha256 recorded at
 # freeze time DETECTS a write that got through anyway. The first two are
 # bypassable by a determined Bash call; the third is not, because it does not
 # rely on preventing anything.
+#
+# RENAME (12-bug-claimant-and-triaging, Decision 31): `reviewing` is renamed
+# `triaging` everywhere, and moving a report to `triaging` now records the
+# calling session's identity from a butler hook TICKET
+# (BpHook::take_ticket('almanac-bug', ...)), never from a CLI argument. Every
+# `set-status` call that enters or leaves `triaging` therefore needs a
+# matching ticket minted first (see mint_ticket()/run_as() below) — the exact
+# ARGV_RAW the almanac-bug.pl subprocess receives must equal the argv the
+# ticket was minted for (BpHook keys a ticket on sha1(name, argv)).
+#
+# WRITTEN BLIND TO THE IMPLEMENTATION: almanac-bug.pl has NO claimant/ticket
+# logic yet at the time this file is written, and @AlmanacBug::STATES still
+# says `reviewing`. Every assertion below that depends on the rename or on
+# claim recording is EXPECTED TO FAIL (red) until package 12 lands; that is
+# the point of a failing-first oracle, not a bug in this file.
 use strict;
 use warnings;
 use FindBin qw($Bin);
 use Test::More;
 use File::Temp qw(tempdir);
+use File::Path qw(make_path);
 use JSON::PP;
 
 (my $S = "$Bin/../../scripts") =~ s{\\}{/}g;
 my $A = "$S/almanac-bug.pl";
 ok(-f $A, 'almanac-bug.pl exists') or BAIL_OUT('script missing');
 
+(my $BUTLER_SCRIPTS = "$Bin/../../../butler/scripts") =~ s{\\}{/}g;
+my $BPHOOK_PM = "$BUTLER_SCRIPTS/BpHook.pm";
+ok(-f $BPHOOK_PM, 'BpHook.pm exists (needed to mint test tickets)') or BAIL_OUT('BpHook.pm missing');
+require $BPHOOK_PM;
+
+# ---------------------------------------------------------------------------
+# AC19 hygiene: snapshot the REAL ~/.claude/butler-state and the real repo's
+# .ccpraxis-local-data/bug-reports BEFORE this file touches $ENV{HOME} etc,
+# and compare again at the very end. A missing directory is fine either way.
+# ---------------------------------------------------------------------------
+my $REAL_HOME = $ENV{HOME} // $ENV{USERPROFILE} // '';
+(my $REAL_BUTLER_STATE = length($REAL_HOME) ? "$REAL_HOME/.claude/butler-state" : '/nonexistent-no-real-home') =~ s{\\}{/}g;
+(my $REPO_ROOT = "$Bin/../../../..") =~ s{\\}{/}g;
+my $REAL_BUG_REPORTS = "$REPO_ROOT/.ccpraxis-local-data/bug-reports";
+
+sub snapshot_dir {
+    my ($dir) = @_;
+    return { exists => 0 } unless -d $dir;
+    my %info;
+    my @stack = ($dir);
+    while (my $d = pop @stack) {
+        opendir(my $dh, $d) or next;
+        for my $e (readdir $dh) {
+            next if $e eq '.' || $e eq '..';
+            my $full = "$d/$e";
+            if (-d $full) { push @stack, $full }
+            else { $info{$full} = (stat $full)[9] }
+        }
+        closedir $dh;
+    }
+    return { exists => 1, files => \%info };
+}
+my $HYGIENE_BEFORE_BUTLER = snapshot_dir($REAL_BUTLER_STATE);
+my $HYGIENE_BEFORE_BUGS   = snapshot_dir($REAL_BUG_REPORTS);
+
+# ---------------------------------------------------------------------------
+# Isolated environment (AC in spec sec 4): fresh tempdirs for everything a
+# claim operation could touch, so no claim/ticket op ever reaches the real
+# machine state.
+# ---------------------------------------------------------------------------
 my $HOME = tempdir(CLEANUP => 1);
 my $PROJ = tempdir(CLEANUP => 1);
+my $CFG  = tempdir(CLEANUP => 1);   # CLAUDE_CONFIG_DIR
+my $BSD  = tempdir(CLEANUP => 1);   # BUTLER_STATE_DIR
+for ($HOME, $PROJ, $CFG, $BSD) { s{\\}{/}g }
+
+$ENV{HOME}              = $HOME;
+$ENV{USERPROFILE}       = $HOME;
+$ENV{ALMANAC_HOME}      = $HOME;
+$ENV{CLAUDE_CONFIG_DIR} = $CFG;
+$ENV{BUTLER_STATE_DIR}  = $BSD;
+delete $ENV{CCPRAXIS_DATA_DIR};
+delete $ENV{CLAUDE_PROJECT_DIR};
 
 sub run {
     my (@args) = @_;
-    my $cmd = qq{ALMANAC_HOME="$HOME" perl "$A" } . join(' ', @args) . ' 2>&1';
+    my $cmd = qq{ALMANAC_HOME="$HOME" HOME="$HOME" USERPROFILE="$HOME" }
+            . qq{CLAUDE_CONFIG_DIR="$CFG" BUTLER_STATE_DIR="$BSD" perl "$A" }
+            . join(' ', @args) . ' 2>&1';
     my $out = `$cmd`;
     return ($? >> 8, $out // '');
 }
@@ -40,6 +109,84 @@ sub field_of {
     open my $f, '<:raw', $p or return undef;
     local $/; my $t = <$f>;
     return $t =~ /^\Q$k\E:\s*(.*)$/m ? $1 : undef;
+}
+
+# ---------------------------------------------------------------------------
+# Ticket minting (spec sec 5.4): a claim's identity comes ONLY from a butler
+# hook ticket, keyed on sha1(name, argv). mint_ticket's argv must equal
+# EXACTLY the argv the almanac-bug.pl subprocess receives.
+# ---------------------------------------------------------------------------
+my $TICKET_SEQ = 0;
+sub ensure_transcript {
+    my ($sid) = @_;
+    my $dir = "$CFG/projects/p";
+    make_path($dir) unless -d $dir;
+    my $path = "$dir/$sid.jsonl";
+    unless (-f $path) {
+        open my $fh, '>', $path or die "fixture: cannot write transcript $path: $!";
+        print {$fh} "{}\n";
+        close $fh;
+    }
+    return $path;
+}
+sub mint_ticket {
+    my ($session, $agent, @argv) = @_;
+    my $transcript = ensure_transcript($session);
+    local $ENV{BUTLER_STATE_DIR} = $BSD;
+    my $ok = BpHook::write_ticket(
+        { session_id => $session, tool_use_id => 'T' . (++$TICKET_SEQ),
+          (defined $agent ? (agent_id => $agent) : ()),
+          transcript_path => $transcript, cwd => $PROJ },
+        'almanac-bug', [ @argv ]);
+    die "fixture: could not write ticket for (@argv)\n" unless $ok;
+    return;
+}
+# run_as($session, $agent_or_undef, @args) -- mints a ticket for EXACTLY
+# @args, then spawns almanac-bug.pl with that same argv. Use this (never
+# plain run()) for any set-status call whose --to or current status is
+# triaging.
+sub run_as {
+    my ($session, $agent, @args) = @_;
+    mint_ticket($session, $agent, @args);
+    return run(@args);
+}
+
+# ---- AC1: state machine constants, loaded in-process (no subprocess) ------
+#
+# `do $A` executes the script with a defined caller(), so its own
+# `unless (caller) { ... }` CLI block never runs — only the package-level
+# declarations load. Same technique almanac-doctor.t already uses.
+{
+    local $@;
+    do $A;
+    diag("AC1: loading $A failed: $@") if $@;
+}
+is_deeply(\@AlmanacBug::STATES, [qw(open triaging taken resolved declined)],
+    'AC1: @AlmanacBug::STATES is open triaging taken resolved declined');
+ok(!exists $AlmanacBug::NEXT{reviewing}, 'AC1: %NEXT has no reviewing key');
+is_deeply($AlmanacBug::NEXT{triaging}, [qw(taken open declined)],
+    "AC1: \$NEXT{triaging} is taken open declined");
+is($AlmanacBug::LEGACY_STATUS{reviewing}, 'triaging',
+    "AC1: \$LEGACY_STATUS{reviewing} eq 'triaging'");
+
+# ---- AC2: USAGE and doc text no longer say "reviewing" ---------------------
+{
+    my ($rc_usage, $out_usage) = run();
+    like($out_usage, qr/triaging/, 'AC2: USAGE mentions triaging');
+    like($out_usage, qr/takeover/, 'AC2: USAGE mentions the takeover verb');
+    unlike($out_usage, qr/reviewing/i, 'AC2: USAGE no longer mentions reviewing');
+}
+{
+    (my $ALMANAC_DIR = "$Bin/../..") =~ s{\\}{/}g;
+    for my $rel (qw(skills/bug-triage/SKILL.md skills/bug-report/SKILL.md hooks/guard-almanac-write.sh)) {
+        my $p = "$ALMANAC_DIR/$rel";
+        SKIP: {
+            skip "AC2: $rel missing", 1 unless -f $p;
+            open my $fh, '<:raw', $p or do { fail("AC2: cannot read $rel"); last SKIP; };
+            local $/; my $txt = <$fh>; close $fh;
+            unlike($txt, qr/reviewing/i, "AC2: $rel contains no 'reviewing' (case-insensitive)");
+        }
+    }
 }
 
 # ---- file ------------------------------------------------------------------
@@ -71,28 +218,38 @@ my ($rc_u) = run('update', $id, '--project', $PROJ, '--body', '"revised while op
 is($rc_u, 0, 'update --replace: allowed while open');
 like(body_of($path), qr/revised while open/, 'update --replace: the body actually changed');
 
+# ---- AC3: the renamed state refuses the OLD name, with a hint -------------
+{
+    my ($rc3, $out3) = run('set-status', $id, '--project', $PROJ, '--to', 'reviewing');
+    isnt($rc3, 0, 'AC3: --to reviewing is refused');
+    like($out3, qr/use --to triaging/, 'AC3: STDERR tells the caller to use --to triaging');
+    is(field_of($path, 'status'), 'open', 'AC3: the report stays open after the refused call');
+}
+
 # ---- freeze ----------------------------------------------------------------
-my ($rc_r) = run('set-status', $id, '--project', $PROJ, '--to', 'reviewing');
-is($rc_r, 0, 'set-status: open -> reviewing');
-is(field_of($path, 'status'), 'reviewing', 'status is reviewing');
+my ($rc_r) = run_as('S1', undef, 'set-status', $id, '--project', $PROJ, '--to', 'triaging');
+is($rc_r, 0, 'set-status: open -> triaging (AC4), claimed by a hook ticket');
+is(field_of($path, 'status'), 'triaging', 'status is triaging');
 my $digest = field_of($path, 'content_sha256');
 ok(defined $digest && length $digest, 'leaving open RECORDS a body digest');
 ok(defined field_of($path, 'frozen_at'), '...and stamps frozen_at');
 
 my ($rc_u2, $out_u2) = run('update', $id, '--project', $PROJ, '--body', '"sneaky rewrite"');
-isnt($rc_u2, 0, 'update: REFUSED once reviewing');
-like($out_u2, qr/frozen/i, '...and the refusal explains why');
+isnt($rc_u2, 0, 'update: REFUSED once triaging');
+like($out_u2, qr/frozen/i, '...and the refusal explains why (AC17)');
+like($out_u2, qr/triaging/i, '...and names triaging specifically, not the old name (AC17)');
 unlike(body_of($path), qr/sneaky rewrite/, '...and the body is genuinely unchanged');
 
 # ---- transitions -----------------------------------------------------------
-my ($rc_bad, $out_bad) = run('set-status', $id, '--project', $PROJ, '--to', 'resolved');
-isnt($rc_bad, 0, 'reviewing -> resolved is refused (no skipping taken)');
+my ($rc_bad, $out_bad) = run_as('S1', undef, 'set-status', $id, '--project', $PROJ, '--to', 'resolved');
+isnt($rc_bad, 0, 'triaging -> resolved is refused (no skipping taken) (AC4)');
 like($out_bad, qr/not a legal transition/, '...and names the legal targets');
 
-my ($rc_x) = run('set-status', $id, '--project', $PROJ, '--to', 'nonsense');
+my ($rc_x) = run_as('S1', undef, 'set-status', $id, '--project', $PROJ, '--to', 'nonsense');
 isnt($rc_x, 0, 'an unknown state is refused');
 
-is((run('set-status', $id, '--project', $PROJ, '--to', 'taken'))[0], 0, 'reviewing -> taken');
+is((run_as('S1', undef, 'set-status', $id, '--project', $PROJ, '--to', 'taken'))[0], 0,
+   'triaging -> taken, by the claimant (AC4)');
 ok(defined field_of($path, 'taken_at'), 'taken stamps taken_at');
 is((run('set-status', $id, '--project', $PROJ, '--to', 'resolved', '--note', '"fixed in abc123"'))[0], 0,
    'taken -> resolved');
@@ -102,13 +259,14 @@ my ($rc_term) = run('set-status', $id, '--project', $PROJ, '--to', 'taken');
 isnt($rc_term, 0, 'resolved is TERMINAL — no transitions out of it');
 
 # ---- hand-back unfreezes ---------------------------------------------------
-# A reviewer who wants more from the filer must be able to give the report back,
+# A triager who wants more from the filer must be able to give the report back,
 # or "frozen" becomes a trap rather than a guarantee.
 {
     my (undef, $o) = run('file', '--project', $PROJ, '--title', '"second"', '--body', '"b"');
     chomp(my $p2 = $o); my ($id2) = $p2 =~ m{/([^/]+)\.md$};
-    run('set-status', $id2, '--project', $PROJ, '--to', 'reviewing');
-    is((run('set-status', $id2, '--project', $PROJ, '--to', 'open'))[0], 0, 'reviewing -> open hands it back');
+    run_as('S2', undef, 'set-status', $id2, '--project', $PROJ, '--to', 'triaging');
+    is((run_as('S2', undef, 'set-status', $id2, '--project', $PROJ, '--to', 'open'))[0], 0,
+       'triaging -> open hands it back, by the claimant (AC4)');
     is(field_of($p2, 'content_sha256'), undef, 'handing back CLEARS the digest');
     # `append` rather than `update --replace`: the claim here is that handing a
     # report back to the filer lets them EDIT it again, and adding detail is the
@@ -122,7 +280,7 @@ isnt($rc_term, 0, 'resolved is TERMINAL — no transitions out of it');
 {
     my (undef, $o) = run('file', '--project', $PROJ, '--title', '"third"', '--body', '"original body"');
     chomp(my $p3 = $o); my ($id3) = $p3 =~ m{/([^/]+)\.md$};
-    run('set-status', $id3, '--project', $PROJ, '--to', 'reviewing');
+    run_as('S3', undef, 'set-status', $id3, '--project', $PROJ, '--to', 'triaging');
 
     is((run('verify', '--project', $PROJ))[0], 0, 'verify: clean while nothing has been tampered with');
 
@@ -270,12 +428,13 @@ isnt($rc_term, 0, 'resolved is TERMINAL — no transitions out of it');
     }
 
     # 4. append respects the freeze, exactly as update does. Adding a paragraph
-    #    to a report someone is reviewing changes what they are reading just as
+    #    to a report someone is triaging changes what they are reading just as
     #    surely as rewriting it.
-    run('set-status', $did, '--project', $PROJ, '--to', 'reviewing');
+    run_as('S4', undef, 'set-status', $did, '--project', $PROJ, '--to', 'triaging');
     my ($rc_f, $out_f) = run('append', $did, '--project', $PROJ, '--body-file', qq{"$np"});
-    isnt($rc_f, 0, 'append: refused once the report is frozen');
-    like($out_f, qr/frozen/, 'append: ...and says why');
+    isnt($rc_f, 0, 'append: refused once the report is frozen (AC17)');
+    like($out_f, qr/frozen/, '...and says why (AC17)');
+    like($out_f, qr/triaging/i, '...and names triaging specifically (AC17)');
 }
 
 # ---- repairing a report that is OUTSIDE the machine -----------------------
@@ -337,6 +496,16 @@ isnt($rc_term, 0, 'resolved is TERMINAL — no transitions out of it');
     is($rc_ok, 0, 'repair: --repair moves an out-of-machine report into a valid state') or diag $out_ok;
     is(field_of($lpath, 'status'), 'resolved', 'repair: the status is now a real state');
     like($out_ok, qr/repaired/, 'repair: the output SAYS it was a repair, not an ordinary transition');
+}
+
+# ---- AC19: this file never touched the REAL machine state ------------------
+{
+    my $after_butler = snapshot_dir($REAL_BUTLER_STATE);
+    my $after_bugs   = snapshot_dir($REAL_BUG_REPORTS);
+    is_deeply($after_butler, $HYGIENE_BEFORE_BUTLER,
+        'AC19: the real ~/.claude/butler-state is untouched by this file');
+    is_deeply($after_bugs, $HYGIENE_BEFORE_BUGS,
+        'AC19: the real repo .ccpraxis-local-data/bug-reports is untouched by this file');
 }
 
 done_testing();

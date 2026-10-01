@@ -424,6 +424,22 @@ sub scan {
                     repair => 'restore it from the vault history, or accept it by re-saving through its own almanac verb',
                 };
             }
+
+            # STALE-CLAIM (package 12, 12-bug-claimant-and-triaging, spec sec
+            # 2.9): a triaging claim with no transcript, or older than 24h. A
+            # die from claim_state (butler unreachable) propagates to main's
+            # own `eval { scan(...) }` -- an internal error, never a silent
+            # clean report for a check that could not actually run.
+            my $cstate = AlmanacBug::claim_state($rep->{fields}, time);
+            if (defined $cstate && $cstate->{stale}) {
+                my $root_c = _decode_maybe($P);
+                push @findings, {
+                    class  => 'STALE-CLAIM', num => 10, scope => 'project', type => 'bug', id => $rep->{fields}{id},
+                    path   => $rp_c, line => undef,
+                    detail => $cstate->{reason},
+                    repair => qq(almanac bug takeover $rep->{fields}{id} --project "$root_c"),
+                };
+            }
         }
     }
 

@@ -1,10 +1,11 @@
 # BpHook::ContinuityOffCheck -- the PreToolUse module behind
 # hooks/next/continuity-off-check.sh (package 04 of blueprint
 # hook-continuity-remake). Writes command tickets for every predictable
-# butler-continuity/butler-hold/butler-fork-ok invocation (package 28,
-# Decision 105 -- this module is the one and only ticket writer for all
-# three names), and tells an operator-typed `/butler:continuity off` apart
-# from anything an agent could produce.
+# butler-continuity/butler-hold/butler-fork-ok/almanac-bug invocation
+# (package 28, Decision 105; almanac-bug added by package 12,
+# 12-bug-claimant-and-triaging -- this module is the one and only ticket
+# writer for all four names), and tells an operator-typed
+# `/butler:continuity off` apart from anything an agent could produce.
 #
 # Contract: .ccpraxis-local-data/blueprints/hook-continuity-remake/specs/
 # 04-continuity-command-spec.md SS2.3/2.4; 28-fork-guard-bash-cost-spec.md
@@ -77,6 +78,29 @@ sub run {
 
             BpHook::write_ticket($p, $name, $argv, operator => $operator, background => $background);
         }
+    }
+
+    # almanac-bug (package 12, Decision 31): a bug-triage CLAIM needs the
+    # caller's session identity, which only this hook can supply. Two command
+    # shapes are predictable -- a direct almanac-bug.pl invocation, and the
+    # almanac.pl dispatcher's `bug set-status`/`bug takeover`. Only the two
+    # verbs that touch the claim (`set-status`, `takeover`) ever need a
+    # ticket; every other almanac-bug verb needs no identity at all.
+    for my $argv (BpHook::invocations($cmd, 'almanac-bug')) {
+        next if ref $argv ne 'ARRAY';
+        next if grep { !defined $_ } @$argv;
+        my $v0 = $argv->[0];
+        next unless defined $v0 && ($v0 eq 'set-status' || $v0 eq 'takeover');
+        BpHook::write_ticket($p, 'almanac-bug', $argv, operator => 0, background => $background);
+    }
+    for my $argv (BpHook::invocations($cmd, 'almanac')) {
+        next if ref $argv ne 'ARRAY';
+        next if grep { !defined $_ } @$argv;
+        next unless defined $argv->[0] && $argv->[0] eq 'bug';
+        my $v1 = $argv->[1];
+        next unless defined $v1 && ($v1 eq 'set-status' || $v1 eq 'takeover');
+        BpHook::write_ticket($p, 'almanac-bug', [ @{$argv}[1 .. $#$argv] ],
+                              operator => 0, background => $background);
     }
 
     return 0;

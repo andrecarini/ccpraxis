@@ -231,7 +231,7 @@ ok(ref($HOOKS_DOC) eq 'HASH', 'precondition: hooks.json decodes as an object') o
                 $total += scalar(@{ $group->{hooks} // [] });
             }
         }
-        is($total, 18, 'AC-4: hooks.json holds 18 commands total');
+        is($total, 20, 'AC-4: hooks.json holds 20 commands total (never-halt 06: +record-prompt.sh, +record-denial.sh)');
         my @hits = _find_commands($HOOKS_DOC, 'continuity-off-check.sh');
         is(scalar(@hits), 1, 'AC-4: continuity-off-check.sh is registered exactly once');
         SKIP: {
@@ -253,7 +253,7 @@ ok(ref($HOOKS_DOC) eq 'HASH', 'precondition: hooks.json decodes as an object') o
     my @lines = grep { length } split /\n/, $src;
     my $last = @lines ? $lines[-1] : '';
     is($last,
-        q{exec bash "$d/run-hook.sh" ContinuityOffCheck --pre text:butler-continuity,text:butler-hold,text:butler-fork-ok -- "$@"},
+        q{exec bash "$d/run-hook.sh" ContinuityOffCheck --pre text:butler-continuity,text:butler-hold,text:butler-fork-ok,text:almanac -- "$@"},
         'AC-5: its last non-empty line equals the 2.3 exec line exactly');
 }
 

@@ -733,7 +733,7 @@ for my $shape (
     is($rc_f, 0, 'AC16 fixture: a bug report exists in project P') or diag($out_f);
     chomp(my $rpath = $out_f);
     my ($rid) = $rpath =~ m{/([^/]+)\.md$};
-    bugrun($home16, 'set-status', $rid, '--project', $proj16, '--to', 'reviewing');
+    bugrun($home16, 'set-status', $rid, '--project', $proj16, '--to', 'declined');
     open($fh, '>>:raw', $rpath) or die $!;
     print {$fh} 'TAMPERED-BYTES';
     close $fh;
