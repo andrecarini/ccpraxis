@@ -503,11 +503,22 @@ sub reconcile {
     }
 
     if ($d->{action} eq 'none') {
+        my $journaled = 0;
+        if ($o{journal_noop}) {
+            $journaled = _write_plan_record(
+                dir => $dir, why => $why, armed => $armed, arm_ids => $arm_ids,
+                found_guid => $found_guid, found_name => $found_name,
+                wanted_guid => $d->{wanted_guid}, wanted_name => $d->{wanted_name},
+                wanted_basis => $d->{wanted_basis},
+                action => 'none', result => 'ok', error => '', detail => '',
+                rc => $last_rc, ms => $ms->(),
+            );
+        }
         return _outcome(
             outcome => 'correct', armed => $armed, arm_ids => $arm_ids,
             found_guid => $found_guid, found_name => $found_name,
             wanted_guid => $d->{wanted_guid}, wanted_name => $d->{wanted_name},
-            wanted_basis => $d->{wanted_basis}, rc => $last_rc, ms => $ms->(),
+            wanted_basis => $d->{wanted_basis}, rc => $last_rc, journaled => $journaled, ms => $ms->(),
         );
     }
 

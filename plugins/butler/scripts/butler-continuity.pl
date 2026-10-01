@@ -139,6 +139,41 @@ sub project_of {
     return (defined $proj && length $proj) ? $proj : '-';
 }
 
+# plan_after_off($ldir) -- package 11: when an `off` removes the last live
+# arm, restore the power plan synchronously instead of waiting up to one
+# tick (60s) for the refresher, which may never come if it has already been
+# signalled. Loaded lazily (this is the only verb that reaches
+# BpPowerPlan), contained in an eval, and never changes stdout or the exit
+# code -- only an optional single stderr warning line. Not gated on
+# CCPRAXIS_NO_WAKELOCK: powercfg_argv already refuses the real binary under
+# that variable, and gating here would make the call untestable through the
+# subprocess seam.
+sub plan_after_off {
+    my ($ldir) = @_;
+    my $o;
+    my $ok = eval {
+        require "$Bin/BpPowerPlan.pm" unless defined &BpPowerPlan::reconcile;
+        $o = BpPowerPlan::reconcile($ldir, why => 'continuity-off', journal_noop => 1);
+        1;
+    };
+    if (!$ok || (ref $o eq 'HASH' && defined $o->{outcome} && $o->{outcome} eq 'error')) {
+        my $reason;
+        if (ref $o eq 'HASH' && defined $o->{outcome} && $o->{outcome} eq 'error') {
+            $reason = defined $o->{reason} ? $o->{reason} : 'error';
+            my $detail = defined $o->{detail} ? $o->{detail} : '';
+            $reason .= " $detail" if length $detail;
+        }
+        else {
+            my $err = defined $@ && length $@ ? $@ : 'unknown error';
+            $err =~ s/\r?\n.*$//s;
+            $reason = $err;
+        }
+        binmode(STDERR, ':raw');
+        print STDERR _bytes("butler-continuity: warning: power plan not restored ($reason).") . "\n";
+    }
+    return;
+}
+
 sub lease_sync {
     return if $ENV{CCPRAXIS_NO_WAKELOCK};
     my $ldir = BpContinuityLease::legacy_dir();
@@ -334,6 +369,8 @@ if ($verb eq 'off') {
     }
 
     my $was_armed = BpHook::is_armed($SID);
+    my $plan_ldir   = BpContinuityLease::legacy_dir();
+    my $live_before = defined $plan_ldir ? (BpContinuityLease::any_active($plan_ldir) ? 1 : 0) : 0;
     my $ok = BpHook::disarm($SID, actor => $actor, reason => $reason);
     unless ($ok) {
         refuse("could not write continuity state (" . (BpHook::last_error() // '') . ").");
@@ -347,6 +384,8 @@ if ($verb eq 'off') {
         print STDERR "butler-continuity: warning: reason log not written.\n";
     }
     lease_sync();
+    plan_after_off($plan_ldir)
+        if $live_before && defined $plan_ldir && !BpContinuityLease::any_active($plan_ldir);
     exit 0;
 }
 

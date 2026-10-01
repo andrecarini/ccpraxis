@@ -966,11 +966,13 @@ sub _script_main {
 # While a handover is in flight (H4 onward) NEITHER signal may run the release
 # closure: the helper and the lock both belong to the successor now.
 sub _handle_signal {
-    my ($reason, $handing_over_ref, $release, $log) = @_;
+    my ($reason, $handing_over_ref, $release, $log, $exit_plan_step) = @_;
     if ($$handing_over_ref) {
+        eval { $exit_plan_step->('refresher-signal') } if defined $exit_plan_step;
         $log->('EXIT', 'reason=signal-during-handover');
         exit 0;
     }
+    eval { $exit_plan_step->('refresher-signal') } if defined $exit_plan_step;
     $release->($reason);
     exit 0;
 }
@@ -1181,56 +1183,27 @@ sub daemon_loop {
         $log->('RELEASE', 'reason=' . (defined $reason ? $reason : 'unknown'));
         $log->('EXIT', 'reason=released');
     };
-    local $SIG{TERM} = sub { _handle_signal('term', \$handing_over, $release, $log) };
-    local $SIG{INT}  = sub { _handle_signal('int',  \$handing_over, $release, $log) };
-
-    # THERE IS NO PROCESS-START DEADLINE, AND THAT IS A CORRECTION.
-    #
-    # There was one: TTL + 1h from the moment the refresher started. It looked
-    # like a harmless belt and was a guillotine. The Stop gate touches an armed
-    # marker on every turn end, so a long-lived arm never expires — but the
-    # daemon did, and at that instant it released the lock and exited. The only
-    # thing that restarts it is the Stop gate, and this file's own header argues
-    # a daemon was needed precisely BECAUSE a long unattended turn has no Stop.
-    # So a session armed past the deadline, mid-turn, silently lost its
-    # wake-lock and the host was free to suspend: the exact failure this module
-    # exists to prevent, reintroduced on a timer.
-    #
-    # any_active is already the bound, and it is the RIGHT bound: it is derived
-    # from the markers, so it expires when the arms do rather than when this
-    # process happens to have started. A second cap derived from the same clock
-    # and the same files could only either duplicate it or contradict it.
-    my $iter = 0;
-    my $last_gc = 0;
-    my $next_handover_try = 0;
-    my $did_replace = 0;
-
-    # Package 05: the power journal's per-process probe cache/seq counter,
-    # and the JOURNAL-ERROR repeat-suppression state (spec 2.8: after two
-    # consecutive identical JOURNAL-ERRORs, the same text logs no more than
-    # once per hour, so a persistently-failing journal never fills lease.log).
-    my %journal_cache;
-    my $journal_err_text;
-    my $journal_err_repeats = 0;
-    my $journal_err_logged_at = 0;
-    my $snap = code_snapshot();
-
     # Package 06: the power plan follows arming. Windows-platform-only,
     # inside an eval, so a plan failure (including a failed require) can
     # never take the refresher down with it -- neither the journal step nor
     # the heartbeat below is skipped on account of it. Same repeat-
     # suppression shape as JOURNAL-ERROR (spec 2.8), with its own state.
+    #
+    # Defined here, BEFORE the SIG{TERM}/SIG{INT} handlers are installed just
+    # below, so a signal delivered at any point after START is logged can
+    # reach $exit_plan_step (package 11: the plan is restored on every
+    # refresher exit, not only the IDLE one).
     my $plan_err_text;
     my $plan_err_repeats = 0;
     my $plan_err_logged_at = 0;
     my $run_plan_step = sub {
-        my ($why) = @_;
+        my ($why, %extra) = @_;
         return unless platform() eq 'windows' && (!exists $opts{plan} || $opts{plan});
         my $plan_opts = (ref $opts{plan_opts} eq 'HASH') ? $opts{plan_opts} : {};
         my $outcome;
         my $ok = eval {
             require "$DIR/BpPowerPlan.pm" unless grep { m{(?:^|/)BpPowerPlan\.pm$} } keys %INC;
-            $outcome = BpPowerPlan::reconcile($dir, why => $why, %$plan_opts);
+            $outcome = BpPowerPlan::reconcile($dir, why => $why, %$plan_opts, %extra);
             1;
         };
         unless ($ok) {
@@ -1264,12 +1237,56 @@ sub daemon_loop {
             (defined $outcome->{reason} ? $outcome->{reason} : ''),
             ($outcome->{journaled} ? 1 : 0)));
     };
+    my $exit_plan_ran = 0;
+    my $exit_plan_step = sub {
+        my ($why) = @_;
+        return if $exit_plan_ran;
+        $run_plan_step->($why, journal_noop => 1);
+        $exit_plan_ran = 1;
+    };
 
+    local $SIG{TERM} = sub { _handle_signal('term', \$handing_over, $release, $log, $exit_plan_step) };
+    local $SIG{INT}  = sub { _handle_signal('int',  \$handing_over, $release, $log, $exit_plan_step) };
+
+    # THERE IS NO PROCESS-START DEADLINE, AND THAT IS A CORRECTION.
+    #
+    # There was one: TTL + 1h from the moment the refresher started. It looked
+    # like a harmless belt and was a guillotine. The Stop gate touches an armed
+    # marker on every turn end, so a long-lived arm never expires — but the
+    # daemon did, and at that instant it released the lock and exited. The only
+    # thing that restarts it is the Stop gate, and this file's own header argues
+    # a daemon was needed precisely BECAUSE a long unattended turn has no Stop.
+    # So a session armed past the deadline, mid-turn, silently lost its
+    # wake-lock and the host was free to suspend: the exact failure this module
+    # exists to prevent, reintroduced on a timer.
+    #
+    # any_active is already the bound, and it is the RIGHT bound: it is derived
+    # from the markers, so it expires when the arms do rather than when this
+    # process happens to have started. A second cap derived from the same clock
+    # and the same files could only either duplicate it or contradict it.
+    my $iter = 0;
+    my $last_gc = 0;
+    my $next_handover_try = 0;
+    my $did_replace = 0;
+
+    # Package 05: the power journal's per-process probe cache/seq counter,
+    # and the JOURNAL-ERROR repeat-suppression state (spec 2.8: after two
+    # consecutive identical JOURNAL-ERRORs, the same text logs no more than
+    # once per hour, so a persistently-failing journal never fills lease.log).
+    my %journal_cache;
+    my $journal_err_text;
+    my $journal_err_repeats = 0;
+    my $journal_err_logged_at = 0;
+    my $snap = code_snapshot();
+
+    my $loop_result;
+    my $loop_err;
+    my $ok_loop = eval {
     while (1) {
         my $reason_data = active_reason($dir);
         unless (defined $reason_data) {
             $log->('IDLE', 'reason=no-live-arm');
-            $run_plan_step->('refresher-exit');
+            $exit_plan_step->('refresher-exit');
             last;
         }
 
@@ -1293,7 +1310,11 @@ sub daemon_loop {
                     target => $target, tick => $tick, spawn => $handover_spawn, log => $log,
                     own_script => $own_script,
                 );
-                return 'handed-over' if $handed;
+                if ($handed) {
+                    $exit_plan_step->('refresher-handover');
+                    $loop_result = 'handed-over';
+                    last;
+                }
                 $next_handover_try = time() + $HANDOVER_RETRY_SECONDS;
             }
         }
@@ -1377,6 +1398,24 @@ sub daemon_loop {
         last if defined $opts{max_iterations} && $iter >= $opts{max_iterations};
         sleep $tick;
     }
+    1;
+    };
+    unless ($ok_loop) {
+        $loop_err = $@;
+        eval {
+            my $m = defined $loop_err && length $loop_err ? $loop_err : 'unknown error';
+            $m =~ s/\n.*//s;
+            $m =~ s/[^\x20-\x7e]/?/g;
+            $m = substr($m, 0, 200);
+            $log->('ERROR', "reason=$m");
+        };
+        eval { $exit_plan_step->('refresher-error') };
+        eval { $release->('error') } unless $handing_over;
+        close $lock if $locked;
+        die $loop_err;
+    }
+
+    return 'handed-over' if defined $loop_result && $loop_result eq 'handed-over';
 
     $release->('idle');
     close $lock if $locked;
