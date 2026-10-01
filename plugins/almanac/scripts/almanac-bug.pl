@@ -895,6 +895,22 @@ sub _claimant_mismatch_message {
          . "'almanac-bug.pl takeover $id' takes it over.\n";
 }
 
+# _refuse_if_tampered($verb, $id, $rep, $lock) -- spec sec 2.1. Verifies the
+# body digest of an already-loaded report and, on mismatch, refuses loudly
+# (naming the report and the verb) before the caller does anything else with
+# it. Returns only when the report is intact or not frozen; writes nothing,
+# under any path.
+sub _refuse_if_tampered {
+    my ($verb, $id, $rep, $lock) = @_;
+    my ($intact, $note) = AlmanacBug::verify($rep);
+    return if $intact;
+    print STDERR "almanac-bug $verb: refused — '$id' $note. Its body changed after it was "
+               . "frozen, outside this script; nothing was written. Run "
+               . "'almanac-bug.pl verify' to list every tampered report.\n";
+    $lock->release;
+    exit 2;
+}
+
 sub _slurp_arg {
     my (%o) = @_;
     return $o{body} eq '-' ? do { local $/; <STDIN> } : $o{body} if defined $o{body};
@@ -1016,6 +1032,7 @@ unless (caller) {
         die "almanac-bug update: '$id' has MALFORMED: duplicate frontmatter key "
           . "'$rep->{duplicate_key}' — refusing to operate on a possibly-forged report\n"
             if $rep->{duplicate_key};
+        _refuse_if_tampered('update', $id, $rep, $lock);
         _race_test_hook($lock);
         my $st   = $rep->{fields}{status} // 'open';
         unless ($AlmanacBug::MUTABLE{$st}) {
@@ -1111,6 +1128,7 @@ unless (caller) {
         die "almanac-bug append: '$id' has MALFORMED: duplicate frontmatter key "
           . "'$rep->{duplicate_key}' — refusing to operate on a possibly-forged report\n"
             if $rep->{duplicate_key};
+        _refuse_if_tampered('append', $id, $rep, $lock);
         _race_test_hook($lock);
         my $st = $rep->{fields}{status} // 'open';
         unless ($AlmanacBug::MUTABLE{$st}) {
@@ -1171,6 +1189,7 @@ unless (caller) {
         die "almanac-bug set-status: '$id' has MALFORMED: duplicate frontmatter key "
           . "'$rep->{duplicate_key}' — refusing to operate on a possibly-forged report\n"
             if $rep->{duplicate_key};
+        _refuse_if_tampered('set-status', $id, $rep, $lock);
         _race_test_hook($lock);
         _reject_multiline('set-status', 'note', $o{note}) if defined $o{note} && !ref $o{note};
         _reject_untrimmed('set-status', 'note', $o{note}) if defined $o{note} && !ref $o{note};
@@ -1306,6 +1325,7 @@ unless (caller) {
         die "almanac-bug takeover: '$id' has MALFORMED: duplicate frontmatter key "
           . "'$rep->{duplicate_key}' — refusing to operate on a possibly-forged report\n"
             if $rep->{duplicate_key};
+        _refuse_if_tampered('takeover', $id, $rep, $lock);
         _race_test_hook($lock);
 
         my $f      = $rep->{fields};
@@ -1398,21 +1418,40 @@ unless (caller) {
             });
         }
         my @out;
+        my @tampered;   # [ id-or-path, path ] for every tampered report LOADED,
+                        # even one a --status filter would otherwise exclude
+                        # (spec sec 2.3) -- the digest check runs before the filter.
+        my @unreadable; # paths that look like a report (start with a frontmatter
+                        # envelope) but failed to load at all (red-team M2) --
+                        # distinct from a plain .md with no envelope, which is not
+                        # a report and stays quietly skipped, same as `verify`.
         for my $p (@paths) {
             next unless -f $p;
-            my $rep = $read_only_load->($p) or next;
+            my $rep = $read_only_load->($p);
+            unless ($rep) {
+                my $raw = AlmanacBug::_read_file($p);
+                push @unreadable, $p if defined $raw && $raw =~ /\A---\r?\n/;
+                next;
+            }
             my $f = $rep->{fields};
-            next if defined $o{status} && !ref $o{status} && ($f->{status}//'') ne $o{status};
             my $integrity;
             if ($rep->{duplicate_key}) {
                 # A duplicate key makes the frontmatter untrustworthy -- surface
-                # it, don't vanish the row, and skip the (irrelevant once this
-                # is set) digest check.
+                # it, don't vanish the row. FIX (red-team M1): this used to skip
+                # the digest check and never reach @tampered, so a --status
+                # filter could hide a tampered report behind the duplicate key.
+                # It is now pushed into the same summary as a real digest
+                # mismatch, with its own MALFORMED wording.
                 $integrity = "MALFORMED: duplicate frontmatter key '$rep->{duplicate_key}'";
+                push @tampered, [ $f->{id} // $p, $p ];
             } else {
                 my ($intact, $note) = AlmanacBug::verify($rep);
-                $integrity = $note unless $intact;
+                unless ($intact) {
+                    $integrity = $note;
+                    push @tampered, [ $f->{id} // $p, $p ];
+                }
             }
+            next if defined $o{status} && !ref $o{status} && ($f->{status}//'') ne $o{status};
             my %row = ( id=>$f->{id}, title=>$f->{title}, status=>$f->{status},
                         severity=>$f->{severity}, area=>$f->{area}, project=>$f->{project},
                         created_at=>$f->{created_at}, path=>$p,
@@ -1484,6 +1523,28 @@ unless (caller) {
                     . "steward's backup registry -- a project that files ccpraxis bugs but is "
                     . "not registered for backup is excluded from this count (see any "
                     . "'skipped' warnings above for a registered root that could not be read).\n";
+            }
+            # Column-0 summary (spec sec 2.3), after the footer, one per
+            # tampered report LOADED -- including one a --status filter
+            # excluded from the rows above. Read verbs exit 0 regardless
+            # (B9): this is the loud flag, not a failure.
+            for my $t (@tampered) {
+                my ($tid, $tpath) = @$t;
+                print "!! TAMPERED: $tid -- its body no longer matches the sha256 recorded "
+                    . "when it was frozen ($tpath). set-status, takeover, update and append "
+                    . "refuse it; run 'almanac-bug.pl verify' for detail.\n";
+            }
+            # FIX (red-team M2): a report whose envelope is broken (unterminated
+            # '---' block, truncated/emptied file) used to vanish from every read
+            # surface -- no row, no TAMPERED, no trace at all. A file that merely
+            # has no frontmatter envelope is not a report and stays quietly
+            # skipped (same convention as `verify`'s "skipped" tally); one that
+            # DOES start with '---' but still failed to parse is surfaced here,
+            # loud, the same way a digest mismatch is.
+            for my $up (@unreadable) {
+                print "!! UNREADABLE: $up -- this starts with a frontmatter envelope but "
+                    . "could not be parsed (truncated, corrupted, or missing its closing "
+                    . "'---'); treat it as tampered until reviewed.\n";
             }
         }
         exit 0;

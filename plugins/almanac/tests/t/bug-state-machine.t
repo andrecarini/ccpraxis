@@ -60,6 +60,7 @@ sub snapshot_dir {
         opendir(my $dh, $d) or next;
         for my $e (readdir $dh) {
             next if $e eq '.' || $e eq '..';
+            next if $e eq 'continuity';
             my $full = "$d/$e";
             if (-d $full) { push @stack, $full }
             else { $info{$full} = (stat $full)[9] }
@@ -277,10 +278,12 @@ isnt($rc_term, 0, 'resolved is TERMINAL — no transitions out of it');
 }
 
 # ---- tamper detection: the layer that cannot be routed around --------------
+my $id3;
 {
     my (undef, $o) = run('file', '--project', $PROJ, '--title', '"third"', '--body', '"original body"');
-    chomp(my $p3 = $o); my ($id3) = $p3 =~ m{/([^/]+)\.md$};
+    chomp(my $p3 = $o); ($id3) = $p3 =~ m{/([^/]+)\.md$};
     run_as('S3', undef, 'set-status', $id3, '--project', $PROJ, '--to', 'triaging');
+    my $digest3 = field_of($p3, 'content_sha256');
 
     is((run('verify', '--project', $PROJ))[0], 0, 'verify: clean while nothing has been tampered with');
 
@@ -291,19 +294,44 @@ isnt($rc_term, 0, 'resolved is TERMINAL — no transitions out of it');
     open my $w, '>:raw', $p3 or die; print {$w} $raw; close $w;
 
     my ($rc_v, $out_v) = run('verify', '--project', $PROJ);
-    isnt($rc_v, 0, 'verify: DETECTS an out-of-band edit to a frozen report');
+    isnt($rc_v, 0, 'verify: DETECTS an out-of-band edit to a frozen report (AC15/B13)');
     like($out_v, qr/TAMPERED/, '...and says so unmistakably');
-    like((run('collect', '--project', $PROJ))[1], qr/TAMPERED|!!/,
-         'collect: surfaces the integrity failure too');
+
+    my ($rc_c, $out_c) = run('collect', '--project', $PROJ);
+    is($rc_c, 0, 'collect: exits 0 even with a tampered report present (AC11/B9)');
+    like($out_c, qr/^!! TAMPERED: \Q$id3\E\b/m,
+         'collect: a column-0 TAMPERED summary line names the report (AC11)');
+
+    # AC3: the laundering path is closed -- the claimant can no longer move a
+    # tampered triaging report to open and have its digest silently cleared.
+    my ($rc_open, $out_open) = run_as('S3', undef, 'set-status', $id3, '--project', $PROJ, '--to', 'open');
+    isnt($rc_open, 0, 'AC3: claimant set-status --to open on a tampered report is refused');
+    like($out_open, qr/TAMPERED/, 'AC3: ...with a TAMPERED refusal');
+    is(field_of($p3, 'content_sha256'), $digest3,
+       'AC3: the digest is NOT cleared by the refused --to open (the laundering path is closed)');
+    is(field_of($p3, 'status'), 'triaging', 'AC3: the report stays triaging after the refusal');
 }
 
 # ---- listing ---------------------------------------------------------------
 {
-    my (undef, $l) = run('list', '--project', $PROJ);
+    my ($rc_l, $l) = run('list', '--project', $PROJ);
+    is($rc_l, 0, 'list: exits 0 even with a tampered report present (AC10/B9)');
     like($l, qr/judge deadlocks/, 'list: shows this project\'s reports');
-    my (undef, $lj) = run('list', '--project', $PROJ, '--json');
+    my ($rc_lj, $lj) = run('list', '--project', $PROJ, '--json');
+    is($rc_lj, 0, 'list --json: exits 0 (AC12/B10)');
     my $parsed = eval { JSON::PP->new->decode($lj) };
     ok(ref $parsed eq 'ARRAY', 'list --json: emits a JSON array');
+    SKIP: {
+        skip 'AC12: decode failed', 2 unless ref $parsed eq 'ARRAY';
+        my ($row3) = grep { ($_->{id} // '') eq $id3 } @$parsed;
+        ok(defined $row3, 'AC12: tampered row present in list --json output')
+            or diag "AC12: id $id3 missing from --json output: $lj";
+        SKIP: {
+            skip 'AC12: tampered row not found in list --json (failed above)', 1 unless defined $row3;
+            like($row3->{integrity}, qr/^TAMPERED: /,
+                 "AC12: the tampered report's integrity field matches ^TAMPERED: ");
+        }
+    }
     my (undef, $lo) = run('list', '--project', $PROJ, '--status', 'open');
     unlike($lo, qr/judge deadlocks/, 'list --status open: filters out the resolved one');
 
