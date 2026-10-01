@@ -67,9 +67,13 @@ and `runs/<pkg>.force-stop`.
 | hooks.json | Stop | (none) | stop-gate.sh |
 | hooks.json | Notification | permission_prompt | record-prompt.sh |
 | hooks.json | PermissionDenied | (none) | record-denial.sh |
+| hooks.json | PreToolUse | (none) | denial-breaker.sh |
+| hooks.json | PostToolUse | (none) | denial-breaker.sh |
+| hooks.json | PostToolUseFailure | (none) | denial-breaker.sh |
+| hooks.json | SessionStart | (none) | denial-breaker.sh |
 | settings.json | PreToolUse | Bash | guard-git-mutations.sh (sec 2.2 settings form) |
 
-This is 20 hooks.json commands and 1 settings.json command, every one in the guarded registration form
+This is 24 hooks.json commands and 1 settings.json command, every one in the guarded registration form
 of spec 16's section 2.2 (`unset BASH_ENV; f=...; w=.../run-hook.sh; [ -f "$f" ] && [ -f "$w" ] || exit 0;
 bash -n "$f" && bash -n "$w" || exit 0; exec env -u SHELLOPTS bash "$f"`), so a missing or broken script
 or wrapper never blocks (RT-M1), and neither BASH_ENV nor SHELLOPTS reach the hook's own bash (RT-L7).
@@ -235,6 +239,26 @@ reason: Registered on Notification with the permission_prompt matcher in the gua
 ### registration: hooks.json PermissionDenied [] record-denial.sh
 verdict: keep
 reason: Registered without a matcher on PermissionDenied in the guarded 2.2 form; it prints nothing, so it never asks the model to retry.
+
+### file: denial-breaker.sh
+verdict: keep
+reason: Added by never-halt package 07; a deny-only circuit breaker that refuses a driver or coordinator agent's classifier-bound call once its auto-mode denial counts reach 2 consecutive or 17 total, and records per-call reset points on PostToolUse and PostToolUseFailure.
+
+### registration: hooks.json PreToolUse [] denial-breaker.sh
+verdict: keep
+reason: Registered without a matcher in the guarded 2.2 form; it denies or abstains, never emits a decision on stdout.
+
+### registration: hooks.json PostToolUse [] denial-breaker.sh
+verdict: keep
+reason: Registered without a matcher in the guarded 2.2 form; it records the agent's reset point and prints nothing.
+
+### registration: hooks.json PostToolUseFailure [] denial-breaker.sh
+verdict: keep
+reason: Registered without a matcher in the guarded 2.2 form; an allowed call that fails still reset auto mode's consecutive count, so it records the same reset point and prints nothing.
+
+### registration: hooks.json SessionStart [] denial-breaker.sh
+verdict: keep
+reason: Added by never-halt package 07 (FIX-3); registered without a matcher in the guarded 2.2 form so it fires on every SessionStart, resetting the per-session total_since offset so a resumed session isn't permanently falsely tripped.
 
 ## BpHook core API
 
@@ -1120,6 +1144,7 @@ next fork dispatch, and the guard denies again after it. Decision 3 applies thro
 | guard-fork.sh | 3 | --pre text:fork : exits when the payload text does not contain fork |
 | record-prompt.sh | 0 | --pre ledger,driver : exits when BP_LEDGER is unset and the session is not an armed driver |
 | record-denial.sh | 0 | --pre ledger,driver : exits when BP_LEDGER is unset and the session is not an armed driver |
+| denial-breaker.sh | 3 | --pre ledger,driver : exits when BP_LEDGER is unset and the session is not an armed driver |
 
 **Who each rule applies to.** A fork counts as a subagent everywhere.
 

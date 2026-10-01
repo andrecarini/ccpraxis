@@ -93,8 +93,17 @@ my @EXPECT = (
     # record-only hooks, registered through the same guarded 2.2 template.
     { event => 'Notification',      matcher => 'permission_prompt', file => 'record-prompt.sh', args => '' },
     { event => 'PermissionDenied',  matcher => '',                  file => 'record-denial.sh', args => '' },
+    # never-halt package 07 (Decision 15, spec sec 2.10): denial-breaker.sh is
+    # registered 4x, no matcher, one new PostToolUseFailure top-level key, plus
+    # a SessionStart registration (FIX-3) resetting the per-session
+    # total_since offset so a resumed session isn't permanently falsely
+    # tripped.
+    { event => 'PreToolUse',          matcher => '', file => 'denial-breaker.sh', args => '' },
+    { event => 'PostToolUse',         matcher => '', file => 'denial-breaker.sh', args => '' },
+    { event => 'PostToolUseFailure',  matcher => '', file => 'denial-breaker.sh', args => '' },
+    { event => 'SessionStart',        matcher => '', file => 'denial-breaker.sh', args => '' },
 );
-is(scalar(@EXPECT), 20, 'sanity: this file\'s own sec 2.3 fixture table has 20 rows (never-halt 06 adds 2)');
+is(scalar(@EXPECT), 24, 'sanity: this file\'s own sec 2.3 fixture table has 24 rows (never-halt 06 adds 2, never-halt 07 adds 4)');
 
 sub expect_key { my ($r) = @_; return join("\x1e", $r->{event}, $r->{matcher}, $r->{file}, $r->{args}) }
 
@@ -131,7 +140,7 @@ if (ref $doc eq 'HASH' && ref $doc->{hooks} eq 'HASH') {
 my @expect_keys = sort map { expect_key($_) } @EXPECT;
 my @actual_keys = sort map { expect_key($_) } @actual;
 is_deeply(\@actual_keys, \@expect_keys,
-    'B1a: hooks.json\'s (event, matcher, file, args) multiset equals sec 2.3 exactly (18 commands)')
+    'B1a: hooks.json\'s (event, matcher, file, args) multiset equals sec 2.3 exactly (24 commands)')
     or diag("actual:\n" . join("\n", @actual_keys) . "\nexpected:\n" . join("\n", @expect_keys));
 
 is(scalar(@template_mismatches), 0,

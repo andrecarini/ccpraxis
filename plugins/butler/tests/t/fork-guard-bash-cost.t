@@ -231,7 +231,7 @@ ok(ref($HOOKS_DOC) eq 'HASH', 'precondition: hooks.json decodes as an object') o
                 $total += scalar(@{ $group->{hooks} // [] });
             }
         }
-        is($total, 20, 'AC-4: hooks.json holds 20 commands total (never-halt 06: +record-prompt.sh, +record-denial.sh)');
+        is($total, 24, 'AC-4: hooks.json holds 24 commands total (never-halt 06: +record-prompt.sh, +record-denial.sh; never-halt 07: +denial-breaker.sh x3, +SessionStart denial-breaker.sh)');
         my @hits = _find_commands($HOOKS_DOC, 'continuity-off-check.sh');
         is(scalar(@hits), 1, 'AC-4: continuity-off-check.sh is registered exactly once');
         SKIP: {

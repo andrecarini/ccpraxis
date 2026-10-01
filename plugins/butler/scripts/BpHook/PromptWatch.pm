@@ -334,4 +334,75 @@ sub denial_count {
     return scalar @$recs;
 }
 
+# ------------------------------------------------- never-halt 07 readers ----
+# Added for BpHook::DenialBreaker (specs/07-denial-circuit-breaker-spec.md
+# sec 2.6). Public, never die, never print, add no file-scope require of
+# BpHook.
+
+# agent_key($p) -> exactly what _agent_id_for($p) returns.
+sub agent_key {
+    my ($p) = @_;
+    return _agent_id_for($p);
+}
+
+# drive_solo_dir($p) -> "$data/.drive-solo" | undef. Resolves $data exactly
+# as run() does. Never creates anything (unlike _resolve_drive_solo_dir).
+sub drive_solo_dir {
+    my ($p) = @_;
+    my $data = _resolve_data_dir($p);
+    return undef unless defined $data;
+    my $ds = "$data/.drive-solo";
+    return -d $ds ? $ds : undef;
+}
+
+# agent_denial_counts($path, $sid, $aid, $since) -> ($total, $since_count).
+# Reads the file once. A record is a COMPLETE line (ending "\n") starting at
+# byte offset $o. It qualifies when its bytes contain the literal substring
+# '"session_id":"$sid"' AND it decodes (JSON::PP->new->utf8) to a hash with
+# session_id eq $sid and agent_id eq $aid. $total is the count of qualifying
+# records; $since_count is the count of qualifying records with $o >= $since.
+# $since is treated as 0 when undef, not \A\d+\z, or greater than the file's
+# current size. A missing or unreadable file, or an undef/empty $sid or $aid,
+# gives (0, 0). Never dies.
+sub agent_denial_counts {
+    my ($path, $sid, $aid, $since) = @_;
+    return (0, 0) unless defined $path && -f $path;
+    return (0, 0) unless _is_plain_string($sid) && length($sid);
+    return (0, 0) unless _is_plain_string($aid) && length($aid);
+
+    my $size = -s $path;
+    $size = 0 unless defined $size;
+    my $since_ok = (defined $since && !ref($since) && $since =~ /\A\d+\z/ && $since <= $size)
+        ? ($since + 0) : 0;
+
+    my $needle = qq{"session_id":"$sid"};
+    my $total = 0;
+    my $since_count = 0;
+
+    my $ok = eval {
+        open(my $fh, '<:raw', $path) or return 0;
+        local $/;
+        my $content = <$fh>;
+        close $fh;
+        $content = '' unless defined $content;
+        while ($content =~ /\G([^\n]*)\n/gc) {
+            my $line = $1;
+            my $o = pos($content) - length($line) - 1;
+            if (index($line, $needle) >= 0) {
+                my $obj = eval { JSON::PP->new->utf8->decode($line) };
+                if (!$@ && ref $obj eq 'HASH'
+                    && defined $obj->{session_id} && $obj->{session_id} eq $sid
+                    && defined $obj->{agent_id} && $obj->{agent_id} eq $aid)
+                {
+                    $total++;
+                    $since_count++ if $o >= $since_ok;
+                }
+            }
+        }
+        return 1;
+    };
+    return (0, 0) unless $ok;
+    return ($total, $since_count);
+}
+
 1;
