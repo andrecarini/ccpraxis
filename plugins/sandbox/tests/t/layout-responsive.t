@@ -876,4 +876,77 @@ sub _ac11_expect {
         'AC-15.4: the title row still ends with the full container name (last cell not erased)');
 }
 
+# ===========================================================================
+# package 13-dashboard-threads (specs/13-dashboard-threads-spec.md S3
+# behaviour 15, AC7): "Supported widths" IS this file's own @COLS. At every
+# listed width, compose_frame must not die/warn and every cell must satisfy
+# the same width invariants AC-9 already pins (reusing _assert_ac9_cell
+# verbatim) -- and, additionally, every whitespace-separated token of the
+# thread line's own plain text must survive into the frame's joined text
+# (wrapped, never dropped -- the thread line is declared non-elidable).
+# ===========================================================================
+{
+    my $thread = {
+        name => 'zqx15-thread', state => 'live', done => 4, total => 9,
+        doing => [ { class => 'doing', kind => 'text', title => 'zqx15 doing task', waits_on => undef },
+                   { class => 'doing', kind => 'text', title => 'zqx15 second doing task', waits_on => undef } ],
+        current => undef,
+        next    => { class => 'pending', kind => 'text', title => 'zqx15 next task', waits_on => undef },
+        owner   => { kind => 'session', id => 'zqx15-sess', alive => undef, activity_at => 1_700_000_000, armed => 0 },
+    };
+    my $now = 1_700_000_100;
+    my ($line_spans, $line_err) = (eval { tui::DashboardScreen::_thread_line({ thread => $thread }, $now) }, $@);
+    ok(!$line_err, 'package-13/B15 precondition: tui::DashboardScreen::_thread_line does not die') or diag(" error: $line_err");
+    ok(ref($line_spans) eq 'ARRAY' && @$line_spans, 'package-13/B15 precondition: _thread_line returns a non-empty spans row');
+
+  SKIP: {
+        skip('_thread_line not available', 1) unless ref($line_spans) eq 'ARRAY' && @$line_spans;
+        my $line_text = Dashboard::spans_text($line_spans);
+        my @words = grep { length } split /\s+/, $line_text;
+        ok(scalar(@words) > 3, 'package-13/B15 precondition: the thread line has more than 3 words (a real fixture, not a degenerate one)');
+
+        # reviewer-1 finding 4a: %st has no `now`, so without one threaded
+        # into %st_threaded the real render path's owner verdict comes out
+        # `unknown` (spec S2.3 rule 3: no valid `now` => unknown), while the
+        # precondition above computed @words from _thread_line called
+        # directly with a hardcoded $now -- the two disagreed on whether
+        # 'live' appears. Threading the SAME $now into %st_threaded makes
+        # the real compose_frame() path agree with the precondition.
+        my %st_threaded = (
+            %st,
+            now  => $now,
+            runs => [ { blueprint => 'zqx15-tooling-fixes', state => 'running',
+                        packages_done => 4, packages_total => 9, running_coordinators => 0,
+                        escalations_waiting => 0, thread => $thread } ],
+        );
+
+        # reviewer-1 finding 4b: spec Behaviour 15 requires word-survival
+        # only at columns 40/80/120/200 (the "Supported widths" set) -- at
+        # cols=1 a multi-character token (e.g. 'zqx15-thread', '4/9') cannot
+        # possibly fit on one row by construction, so asserting word
+        # survival at every value in @COLS over-asserts beyond the spec.
+        # Every column (including the narrow ones) still gets the no-die
+        # plus width-invariant check via _assert_ac9_cell, both here and in
+        # the narrow-columns loop below.
+        my %WORD_SURVIVAL_COLS = map { $_ => 1 } (40, 80, 120, 200);
+        for my $c (@COLS) {
+            _assert_ac9_cell(\%st_threaded, 60, $c, " (package-13 threaded state, cols=$c)");
+            next unless $WORD_SURVIVAL_COLS{$c};
+            my $f = eval { Dashboard::compose_frame(\%st_threaded, 60, $c) };
+            next if $@ || ref($f) ne 'ARRAY';
+            my $joined = join("\n", map { $_->{text} } @$f);
+            my @missing = grep { index($joined, $_) < 0 } @words;
+            is(scalar(@missing), 0, "package-13/B15: every word of the thread line survives (wrapped, never dropped) at cols=$c")
+                or diag('  missing: ' . join(', ', @missing));
+        }
+
+        # 1/20/39/50/79/89/90/91 (the spec's extra robustness list): no die,
+        # width invariant still holds, even where the thread line cannot
+        # possibly fit on one row.
+        for my $c (1, 20, 39, 50, 79, 89, 90, 91) {
+            _assert_ac9_cell(\%st_threaded, 60, $c, " (package-13 threaded state, narrow cols=$c)");
+        }
+    }
+}
+
 done_testing();
