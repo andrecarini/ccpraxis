@@ -30,6 +30,10 @@ perl "${CLAUDE_PLUGIN_ROOT}/scripts/almanac.pl" note create --title "one line" -
 NOTE
 perl "${CLAUDE_PLUGIN_ROOT}/scripts/almanac.pl" note create --audience external --target docs/x.md \
   --title "one line" --covers "what it's about"
+perl "${CLAUDE_PLUGIN_ROOT}/scripts/almanac.pl" note create --global --title "one line" \
+  --covers "what it's about" --content -   <<'NOTE'
+...the fact...
+NOTE
 ```
 
 ## Work it
@@ -48,5 +52,18 @@ perl "${CLAUDE_PLUGIN_ROOT}/scripts/almanac.pl" note check-pointers
 
 `edit --content` on an external target is refused unless you pass `--force-external`.
 
-A global note appears in the imported notes index `~/.claude/almanac-notes.md` once someone runs
-`perl "${CLAUDE_PLUGIN_ROOT}/scripts/almanac-migrate-memories.pl" render-index` on the host.
+A global note requires `--covers`: one line of at most 200 bytes saying what the note covers (it's
+the only line sessions see in the notes index). A global `create` without `--covers`, an
+`edit --unset covers` without a replacement, or any covers over the budget is refused outright --
+never silently truncated. An `edit` that doesn't touch covers at all is never refused on its account,
+even for a legacy note whose stored covers is missing or over budget.
+
+`create`, `edit` and `delete` in global scope re-render the imported notes index
+(`~/.claude/almanac-notes.md`) themselves, right after the change commits, and print
+`index: rendered` as the last line. If that line reads `index: failed` instead, your note change was
+still kept -- fix the reported reason (shown on stderr) and then run
+`perl "${CLAUDE_PLUGIN_ROOT}/scripts/almanac-migrate-memories.pl" render-index` on the host to bring
+the index back in sync.
+
+`delete` removes the content file of an `internal` note along with its record. An `external` note's
+target file is never touched by delete.

@@ -628,7 +628,7 @@ our ($AC24_STATE_A, $AC24_STATE_B);
     mkdir(norm_path($H35) . '/.claude/claude-code-vault') unless -d (norm_path($H35) . '/.claude/claude-code-vault');
     mkdir(norm_path($H35) . '/.claude/claude-code-vault/docs') unless -d (norm_path($H35) . '/.claude/claude-code-vault/docs');
 
-    my $r0 = run_cli('create', '--title', 'Global note', '--content', 'global-bytes', '--global', '--home', $H35);
+    my $r0 = run_cli('create', '--title', 'Global note', '--content', 'global-bytes', '--covers', 'AC-35-global-covers', '--global', '--home', $H35);
     is($r0->{rc}, 0, 'AC-35 (create): create --global exits 0') or diag("stderr: $r0->{err}");
     is(field0($r0->{out}, 'scope'), 'global', 'AC-35 (create): result block carries scope: global');
     my $gid = field0($r0->{out}, 'id');
@@ -653,7 +653,11 @@ our ($AC24_STATE_A, $AC24_STATE_B);
     my $global_target = internal_dir($H35, 'global') . "/$gid.md";
     my $rdel = run_cli('delete', $gid, '--global', '--home', $H35);
     is($rdel->{rc}, 0, 'AC-35 (delete): delete --global exits 0') or diag("stderr: $rdel->{err}");
-    ok(-f $global_target, 'AC-35 (delete): the global target file still exists after delete');
+    # AC-19 (spec 09-notes-fixes §2.5): an internal note's content file is
+    # now REMOVED by delete, in EITHER scope -- replaces the old
+    # "still exists" oracle.
+    ok(!-f $global_target, 'AC-19: delete --global REMOVES the internal note\'s content file too');
+    like($rdel->{out}, qr/^content: removed$/m, 'AC-19: STDOUT carries content: removed for the global delete');
 }
 
 # =============================================================================
