@@ -15,12 +15,20 @@ use strict;
 use warnings;
 use JSON::PP ();
 use Encode ();
+use Cwd ();
 
 # Almanac/ sits beside THIS FILE (not $0, not FindBin -- both are the
 # invoking program, which a test's `do $TASK_PL` makes the .t file, not this
-# one).
+# one). This file was never hit by bug 75fe's doubled-join defect -- it
+# only unshifts $dir onto @INC and loads siblings via bareword
+# `use Module ();`, which resolves through perl's own @INC search rather
+# than a manual string-concatenated require path, so a relative $dir
+# already worked. __FILE__ is still resolved through Cwd::abs_path here,
+# defensively and for consistency with the scripts that did have the
+# defect (almanac-doctor.pl, almanac-inbox.pl), not because this file
+# needed the fix.
 BEGIN {
-    my $dir = __FILE__;
+    my $dir = Cwd::abs_path(__FILE__);
     $dir =~ s{\\}{/}g;
     $dir =~ s{/[^/]+\z}{};
     $dir = '.' unless length $dir;
@@ -225,9 +233,20 @@ sub check_refs {
         return $report;
     }
 
+    # blocked_on names an inbox item (blueprint where-things-go, package
+    # 01-inbox-rename, spec 2.7): read A/inbox/ when it exists, else the
+    # unmigrated legacy dir A/<LEGACY_INBOX_TYPE>/ when THAT exists, else
+    # nothing (every ref dangling). Never migrates, writes or loads
+    # Almanac::Inbox -- this stays a read-only existence probe.
+    my $LEGACY_INBOX_TYPE = 'decision';
     my $dstore = eval {
-        Almanac::Store->open(scope => 'project', type => 'decision',
+        my $si = Almanac::Store->open(scope => 'project', type => 'inbox',
             root => $opt{root}, home => $opt{home}, cwd => $opt{cwd});
+        return $si if -d $si->dir;
+        my $sl = Almanac::Store->open(scope => 'project', type => $LEGACY_INBOX_TYPE,
+            root => $opt{root}, home => $opt{home}, cwd => $opt{cwd});
+        return $sl if -d $sl->dir;
+        return undef;
     };
 
     my @refs;
@@ -566,136 +585,14 @@ sub _cmd_unfocus {
 # CLI entry point.
 # ---------------------------------------------------------------------------
 unless (caller) {
-    binmode(STDOUT, ':encoding(UTF-8)');
-
-    # Argv grammar: one pass over the WHOLE of @ARGV, same as almanac-
-    # todo.pl -- the verb is simply the first positional token once parsing
-    # is done.
-    my (%o, %bool_default, @pos);
-    while (@ARGV) {
-        my $a = shift @ARGV;
-        if ($a =~ /^--([a-z0-9-]+)$/) {
-            my $key = $1;
-            my $has_val = (@ARGV && $ARGV[0] !~ /^--/);
-            my $val = $has_val ? shift @ARGV : 1;
-            $o{$key} = $val;
-            if ($has_val) { delete $bool_default{$key} }
-            else          { $bool_default{$key} = 1 }
-        } else {
-            push @pos, $a;
-        }
-    }
-    my $cmd = shift @pos;
-
-    my $ok = eval {
-        _usage('missing_verb') unless defined $cmd && length $cmd;
-
-        my %VERBS = map { $_ => 1 } qw(
-            add insert-at insert-before insert-after move-first move-last
-            reorder status edit list show focus focused unfocus
-        );
-        _usage('unknown_verb') unless $VERBS{$cmd};
-
-        my %ALLOWED_FLAGS = (
-            'add'            => [qw(title body blocked-on id root)],
-            'insert-at'      => [qw(title body blocked-on id root)],
-            'insert-before'  => [qw(title body blocked-on id root)],
-            'insert-after'   => [qw(title body blocked-on id root)],
-            'move-first'     => [qw(root)],
-            'move-last'      => [qw(root)],
-            'reorder'        => [qw(root)],
-            'status'         => [qw(expect-rev root)],
-            'edit'           => [qw(title body blocked-on clear-blocked-on expect-rev root)],
-            'list'           => [qw(json root)],
-            'show'           => [qw(json root)],
-            'focus'          => [qw(session tasklist root)],
-            'focused'        => [qw(session json root)],
-            'unfocus'        => [qw(session root)],
-        );
-        my %allowed = map { $_ => 1 } @{ $ALLOWED_FLAGS{$cmd} };
-        for my $k (keys %o) {
-            _usage('unknown_flag') unless $allowed{$k};
-        }
-
-        # Value-taking flags fail OPEN on a missing value (bare flag) --
-        # `title` and the two booleans (`json`, `clear-blocked-on`) are
-        # deliberately excluded (bespoke / genuine booleans).
-        for my $k (qw(root body id expect-rev session tasklist blocked-on)) {
-            _usage('missing_flag_value') if $bool_default{$k};
-        }
-
-        if    ($cmd eq 'add') { _cmd_add(\%o, \%bool_default) }
-        elsif ($cmd eq 'insert-at') {
-            my $pos = shift @pos;
-            _usage('extra_positional') if @pos;
-            _cmd_insert_at(\%o, \%bool_default, $pos);
-        }
-        elsif ($cmd eq 'insert-before') {
-            my $ref_id = shift @pos;
-            _usage('missing_id') unless defined $ref_id && length $ref_id;
-            _usage('extra_positional') if @pos;
-            _cmd_insert_before(\%o, \%bool_default, $ref_id);
-        }
-        elsif ($cmd eq 'insert-after') {
-            my $ref_id = shift @pos;
-            _usage('missing_id') unless defined $ref_id && length $ref_id;
-            _usage('extra_positional') if @pos;
-            _cmd_insert_after(\%o, \%bool_default, $ref_id);
-        }
-        elsif ($cmd eq 'move-first') {
-            my $id = shift @pos;
-            _usage('missing_id') unless defined $id && length $id;
-            _usage('extra_positional') if @pos;
-            _cmd_move_first(\%o, $id);
-        }
-        elsif ($cmd eq 'move-last') {
-            my $id = shift @pos;
-            _usage('missing_id') unless defined $id && length $id;
-            _usage('extra_positional') if @pos;
-            _cmd_move_last(\%o, $id);
-        }
-        elsif ($cmd eq 'reorder') {
-            _cmd_reorder(\%o, \@pos);
-        }
-        elsif ($cmd eq 'status') {
-            _usage('missing_id') unless @pos && defined $pos[0] && length $pos[0];
-            _usage('extra_positional') if @pos > 2;
-            _cmd_status(\%o, \@pos);
-        }
-        elsif ($cmd eq 'edit') {
-            my $id = shift @pos;
-            _usage('missing_id') unless defined $id && length $id;
-            _usage('extra_positional') if @pos;
-            _cmd_edit(\%o, \%bool_default, $id);
-        }
-        elsif ($cmd eq 'list') {
-            _usage('extra_positional') if @pos;
-            _cmd_list(\%o);
-        }
-        elsif ($cmd eq 'show') {
-            my $id = shift @pos;
-            _usage('missing_id') unless defined $id && length $id;
-            _usage('extra_positional') if @pos;
-            _cmd_show(\%o, $id);
-        }
-        elsif ($cmd eq 'focus') {
-            _usage('extra_positional') if @pos;
-            _cmd_focus(\%o);
-        }
-        elsif ($cmd eq 'focused') {
-            _usage('extra_positional') if @pos;
-            _cmd_focused(\%o);
-        }
-        elsif ($cmd eq 'unfocus') {
-            _usage('extra_positional') if @pos;
-            _cmd_unfocus(\%o);
-        }
-        1;
-    };
-    unless ($ok) {
-        Almanac::Record::fatal($@);
-    }
-    exit 0;
+    # Retired CLI (blueprint where-things-go, package 02-thread-store,
+    # Decision 3): threads replace the flat tasklist and per-session focus.
+    # Every argv -- every old verb, no verb at all -- prints exactly this
+    # pointer to STDERR and exits 2, before anything else runs. The library
+    # half above (lines 1-575ish) is unchanged: requiring this file still
+    # defines Almanac::Task::* and prints nothing.
+    print STDERR "almanac: 'almanac task' is retired; use 'almanac thread' instead\n";
+    exit 2;
 }
 
 1;

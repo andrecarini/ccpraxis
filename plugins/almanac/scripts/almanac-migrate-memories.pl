@@ -13,11 +13,19 @@
 # reopen.
 use strict;
 use warnings;
+use File::Spec ();
 
 # Almanac/ sits beside THIS FILE (not $0, not FindBin) -- see almanac-note.pl
-# / almanac-todo.pl's identical BEGIN block for the reasoning.
+# / almanac-todo.pl's identical BEGIN block for the reasoning. This file was
+# never hit by bug 75fe's doubled-join defect -- it only unshifts $dir onto
+# @INC and loads siblings via bareword `use Module ();`, which resolves
+# through perl's own @INC search rather than a manual string-concatenated
+# require path, so a relative $dir already worked. __FILE__ is still
+# resolved through File::Spec->rel2abs here, defensively and for
+# consistency with the scripts that did have the defect (almanac-doctor.pl,
+# almanac-inbox.pl), not because this file needed the fix.
 BEGIN {
-    my $dir = __FILE__;
+    my $dir = File::Spec->rel2abs(__FILE__);
     $dir =~ s{\\}{/}g;
     $dir =~ s{/[^/]+\z}{};
     $dir = '.' unless length $dir;
@@ -535,6 +543,11 @@ sub _run_migration {
 
             if (defined $fm->{description} && length($fm->{description})) {
                 $ent->{covers} = _sanitize_tc($fm->{description});
+            } elsif ($ent->{dirinfo}{scope} eq 'global') {
+                # A global note now REQUIRES --covers (package 09). Without a
+                # description, fall back to the sanitized title rather than
+                # letting the migration's own create calls be refused.
+                $ent->{covers} = $ent->{title};
             }
 
             my $type = $fm->{'metadata.type'};

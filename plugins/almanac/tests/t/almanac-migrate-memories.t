@@ -1044,7 +1044,7 @@ sub snapshot_tree {
 
     # One valid global note, one project note (must be excluded), one
     # malformed (missing title) global note (must be excluded, reported).
-    my $rg = run_note('create', '--title', 'Good Global Note', '--global', '--home', $HOME);
+    my $rg = run_note('create', '--title', 'Good Global Note', '--covers', 'good-global-covers', '--global', '--home', $HOME);
     is($rg->{rc}, 0, 'AC-14 fixture: a good global note is created') or diag("stderr: $rg->{err}");
 
     my $R = fresh_root();
@@ -1052,7 +1052,7 @@ sub snapshot_tree {
     is($rp->{rc}, 0, 'AC-14 fixture: a project note is created (must never appear in the index)')
         or diag("stderr: $rp->{err}");
 
-    my $rbad = run_note('create', '--title', 'placeholder', '--global', '--home', $HOME);
+    my $rbad = run_note('create', '--title', 'placeholder', '--covers', 'placeholder-covers', '--global', '--home', $HOME);
     is($rbad->{rc}, 0, 'AC-14 fixture: a to-be-broken global note is created') or diag("stderr: $rbad->{err}");
     my $bad_id = field_line($rbad->{out}, 'id');
     # Exercise the spec's own "missing_title" exclusion by stripping the
@@ -1064,7 +1064,11 @@ sub snapshot_tree {
     my $r1 = run_migrate('render-index', home => $HOME);
     is($r1->{rc}, 0, 'AC-14 (mixed notes): render-index exits 0') or diag("stdout: $r1->{out}\nstderr: $r1->{err}");
     is(field_line($r1->{out}, 'notes'), '1', 'AC-14 (mixed notes): notes: 1 (only the good global note is kept)');
-    is(field_line($r1->{out}, 'changed'), 'yes', 'AC-14 (mixed notes): changed: yes');
+    # 09-notes-fixes §2.4: every global create/edit already auto-renders the
+    # index as it commits, so by the time this EXPLICIT render-index call
+    # runs (after the last global mutation above), the index is already
+    # current -- changed: no (was changed: yes before auto-render existed).
+    is(field_line($r1->{out}, 'changed'), 'no', 'AC-14 (mixed notes): changed: no (auto-render already made the index current)');
     my $excluded_line = field_line($r1->{out}, 'excluded') // '';
     like($excluded_line, qr/\Q$bad_id\E=missing_title/, 'AC-14 (mixed notes): the malformed note appears under excluded: as missing_title');
     my $bytes1 = slurp_raw($T);
@@ -1089,7 +1093,9 @@ sub snapshot_tree {
     my $r3 = run_migrate('render-index', home => $HOME);
     is($r3->{rc}, 0, 'AC-14 (emptying): render-index exits 0') or diag("stderr: $r3->{err}");
     is(-s $T, 0, 'AC-14 (emptying): the index is zero bytes again');
-    is(field_line($r3->{out}, 'changed'), 'yes', 'AC-14 (emptying): changed: yes');
+    # Same reasoning as above: the delete itself already auto-rendered the
+    # (now-empty) index, so this explicit call is a no-op.
+    is(field_line($r3->{out}, 'changed'), 'no', 'AC-14 (emptying): changed: no (auto-render already emptied the index)');
 }
 
 # =============================================================================
@@ -1119,7 +1125,7 @@ sub snapshot_tree {
     my $claude_before = slurp_raw("$HOME/.claude/CLAUDE.md");
 
     # Build a real block first, then hand-edit its payload.
-    my $rg = run_note('create', '--title', 'Seed Note', '--global', '--home', $HOME);
+    my $rg = run_note('create', '--title', 'Seed Note', '--covers', 'seed-note-covers', '--global', '--home', $HOME);
     is($rg->{rc}, 0, 'AC-15 (hand_edited) fixture: seed note created') or diag("stderr: $rg->{err}");
     my $r0 = run_migrate('render-index', home => $HOME);
     is($r0->{rc}, 0, 'AC-15 (hand_edited) fixture: initial render-index exits 0') or diag("stderr: $r0->{err}");
@@ -1216,6 +1222,63 @@ ok(1, 'AC-21: coordinator-only (ledger + real ~/.claude/almanac-notes.md) -- not
     } else {
         fail('AC-22: exactly one line equal to "@~/.claude/almanac-notes.md" at column 0');
     }
+}
+
+# =============================================================================
+# AC-25 (spec 09-notes-fixes, B25) -- a global memory with no `description`
+# migrates with covers equal to its (sanitized) title, so the migration's
+# own global creates are not refused by almanac-note.pl's new --covers
+# requirement; a global memory whose `description` exceeds the 200-byte
+# budget yields a failed entry (create_failed) and no note.
+# =============================================================================
+{
+    my $HOME25 = fresh_home();
+    my $S2_25 = s2_dir($HOME25);
+
+    # No description at all -- fm->{name} supplies the title; covers must
+    # fall back to that same (sanitized) title.
+    write_frontmatter_md("$S2_25/no-description.md",
+        [ ['name', 'No Description Memory'] ], "Body with no description.\n",
+        mtime => 1_700_000_500);
+
+    my $r = run_migrate('run', home => $HOME25, json => 1);
+    is($r->{rc}, 0, 'AC-25 (no description): run exits 0') or diag("stdout: $r->{out}\nstderr: $r->{err}");
+    my $j = decode_json_or_undef($r->{raw_out});
+    ok(ref($j) eq 'HASH', 'AC-25 (no description): run --json decodes') or diag("raw: $r->{raw_out}");
+    if (ref($j) eq 'HASH') {
+        is($j->{summary}{failed}, 0, 'AC-25 (no description): summary.failed is 0');
+    }
+
+    my ($glist25) = list_json_global($HOME25);
+    ok(ref($glist25) eq 'ARRAY', 'AC-25 (no description): global list --json decodes');
+    my @matches25 = note_by_migrated_from($glist25, s2_key('no-description.md'));
+    is(scalar(@matches25), 1, 'AC-25 (no description): exactly one note carries the expected migrated_from');
+    if (@matches25 == 1) {
+        is($matches25[0]{title}, 'No Description Memory', 'AC-25 (no description): title resolves as usual');
+        is($matches25[0]{covers}, 'No Description Memory', 'AC-25 (no description): covers falls back to the sanitized title');
+    }
+
+    # description over the 200-byte budget -> create_failed, no note.
+    my $HOME25B = fresh_home();
+    my $S2_25B = s2_dir($HOME25B);
+    my $long_description = 'd' x 201;
+    write_frontmatter_md("$S2_25B/over-budget.md",
+        [ ['name', 'Over Budget Memory'], ['description', $long_description] ],
+        "Body with an over-budget description.\n", mtime => 1_700_000_600);
+
+    my $rb = run_migrate('run', home => $HOME25B, json => 1);
+    is($rb->{rc}, 2, 'AC-25 (over-budget description): run exits 2') or diag("stdout: $rb->{out}\nstderr: $rb->{err}");
+    my $jb = decode_json_or_undef($rb->{raw_out});
+    if (ref($jb) eq 'HASH') {
+        is($jb->{summary}{failed}, 1, 'AC-25 (over-budget description): summary.failed is 1');
+        my ($entry) = grep { ($_->{key} // '') eq s2_key('over-budget.md') } @{ $jb->{entries} || [] };
+        ok(ref($entry) eq 'HASH' && $entry->{status} eq 'create_failed',
+            'AC-25 (over-budget description): the entry\'s status is create_failed')
+            or diag('entries: ' . JSON::PP->new->canonical->encode($jb->{entries} || []));
+    }
+    my ($glist25b) = list_json_global($HOME25B);
+    my @matches25b = note_by_migrated_from($glist25b, s2_key('over-budget.md'));
+    is(scalar(@matches25b), 0, 'AC-25 (over-budget description): no note was created');
 }
 
 # =============================================================================

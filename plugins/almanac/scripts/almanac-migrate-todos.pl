@@ -18,11 +18,19 @@
 # before the call -- never by disabling MSYS2's own conversion.
 use strict;
 use warnings;
+use Cwd ();
 
 # Almanac/ sits beside THIS FILE (not $0, not FindBin) -- see
-# almanac-todo.pl's identical BEGIN block for the reasoning.
+# almanac-todo.pl's identical BEGIN block for the reasoning. This file was
+# never hit by bug 75fe's doubled-join defect -- it only unshifts $dir onto
+# @INC and loads siblings via bareword `use Module ();`, which resolves
+# through perl's own @INC search rather than a manual string-concatenated
+# require path, so a relative $dir already worked. __FILE__ is still
+# resolved through Cwd::abs_path here, defensively and for consistency with
+# the scripts that did have the defect (almanac-doctor.pl, almanac-inbox.pl),
+# not because this file needed the fix.
 BEGIN {
-    my $dir = __FILE__;
+    my $dir = Cwd::abs_path(__FILE__);
     $dir =~ s{\\}{/}g;
     $dir =~ s{/[^/]+\z}{};
     $dir = '.' unless length $dir;

@@ -301,7 +301,7 @@ my $live_almanac_before = list_almanac_files($LIVE_ALMANAC);
     step_and_check($H, 'AC3 todo reopen',   $TODO_PL, 'reopen',   $tid);
     step_and_check($H, 'AC3 todo delete',   $TODO_PL, 'delete',   $tid);
 
-    my $rn = step_and_check($H, 'AC3 note create', $NOTE_PL, 'create', '--title', 'AC3 note');
+    my $rn = step_and_check($H, 'AC3 note create', $NOTE_PL, 'create', '--title', 'AC3 note', '--covers', 'AC3 note covers');
     my $nid = field0($rn->{out}, 'id');
     ok(defined $nid && length $nid, 'AC3 setup: note id captured') or diag($rn->{out});
 
@@ -755,6 +755,268 @@ HOLDER
     is($r->{rc}, 0, 'AC13: global todo create under a home containing "André" exits 0') or diag("stderr: $r->{err}");
     assert_snapshot_equals_compute($H, 'AC13 (André home)');
     assert_matches_todo_count($H, 'AC13 (André home)');
+}
+
+# =============================================================================
+# AC18 (blueprint where-things-go, package 02-thread-store, specs/
+# 02-thread-store-spec.md section 2.6, behaviour 21) -- the open-thread
+# count and the recorded-projects list.
+#
+# Fixtures build thread metadata records directly via Almanac::Store (type
+# 'thread', unmodified by this package), exactly as Almanac::Thread::
+# create_thread would write them, since Thread.pm does not exist yet.
+# =============================================================================
+sub mk_thread {
+    my ($root, $name, $state) = @_;
+    my $store = Almanac::Store->open(scope => 'project', type => 'thread', root => $root);
+    $store->create(id => $name, fields => { created => '2026-01-01T00:00:00Z', state => $state, owner_kind => 'none', owner_id => '-' },
+        order => [qw(created state owner_kind owner_id)]);
+    return;
+}
+
+{
+    my $H18 = new_home();
+    my $PA = tempdir(CLEANUP => 1); $PA =~ s{\\}{/}g;
+    my $PB = tempdir(CLEANUP => 1); $PB =~ s{\\}{/}g;
+
+    # PA is "registered" (in the steward registry); PB is known only via a
+    # recorded thread write. write_registry-style helper not present in this
+    # file; build the minimal registry JSON directly.
+    mkdir_p("$H18/.claude/claude-code-vault");
+    write_raw("$H18/.claude/claude-code-vault/.registry-local.json",
+        JSON::PP->new->canonical->encode({ projects => { pa => { path => $PA } } }));
+
+    mk_thread($PA, 'pa-open', 'live');
+    mk_thread($PA, 'pa-handed', 'handed-off');
+    mk_thread($PA, 'pa-archived', 'archived');
+    mk_thread($PB, 'pb-open', 'live');
+
+    my $res = eval { Almanac::GlobalCounts::refresh(home => $H18, record_root => $PB) };
+    ok(ref($res) eq 'HASH' && ($res->{ok} // 0), 'AC18: refresh(record_root => PB) succeeds')
+        or diag('error: ' . ($@ // 'refresh did not return ok'));
+
+    my $path = eval { Almanac::GlobalCounts::snapshot_path(home => $H18) };
+    my $snap = eval { Almanac::GlobalCounts::read_snapshot(defined $path ? $path : '') };
+    ok(ref($snap) eq 'HASH', 'AC18: snapshot decodes after the PB-recording refresh') or diag('error: ' . ($@ // '(none)'));
+    if (ref($snap) eq 'HASH') {
+        is($snap->{thread}{open}, 3, 'AC18: thread.open == 3 (PA: live+handed-off; PB: live); archived not counted');
+        ok((grep { norm_path($_) eq norm_path($PB) } @{ $snap->{thread}{projects} || [] }) >= 1,
+            'AC18: thread.projects contains PB (the recorded root)');
+    }
+
+    # a later global todo write (no record_root) must keep PB recorded and
+    # recount both projects.
+    my $rtodo = run_cli($TODO_PL, 'create', '--title', 'AC18 keeps PB', '--global', '--home', $H18);
+    is($rtodo->{rc}, 0, 'AC18 fixture: a global todo write after the thread refresh exits 0') or diag($rtodo->{err});
+    my $snap2 = eval { Almanac::GlobalCounts::read_snapshot(defined $path ? $path : '') };
+    if (ref($snap2) eq 'HASH') {
+        is($snap2->{thread}{open}, 3, 'AC18: a later global todo write (no record_root) still counts PB\'s thread');
+        ok((grep { norm_path($_) eq norm_path($PB) } @{ $snap2->{thread}{projects} || [] }) >= 1,
+            'AC18: ...and PB is still in thread.projects');
+    }
+
+    # archiving a thread in PB lowers open by one.
+    {
+        my $store = Almanac::Store->open(scope => 'project', type => 'thread', root => $PB);
+        my $rec = $store->read('pb-open');
+        $store->update('pb-open', expect => $rec, set => { state => 'archived' });
+    }
+    my $res3 = eval { Almanac::GlobalCounts::refresh(home => $H18, record_root => $PB) };
+    ok(ref($res3) eq 'HASH' && ($res3->{ok} // 0), 'AC18 fixture: refresh after archiving PB\'s thread succeeds');
+    my $snap3 = eval { Almanac::GlobalCounts::read_snapshot(defined $path ? $path : '') };
+    is(ref($snap3) eq 'HASH' ? $snap3->{thread}{open} : undef, 2,
+        'AC18: archiving PB\'s open thread lowers thread.open by one (3 -> 2)');
+
+    # a project both registered AND recorded is counted once: record PA too.
+    my $res4 = eval { Almanac::GlobalCounts::refresh(home => $H18, record_root => $PA) };
+    my $snap4 = eval { Almanac::GlobalCounts::read_snapshot(defined $path ? $path : '') };
+    is(ref($snap4) eq 'HASH' ? $snap4->{thread}{open} : undef, 2,
+        'AC18: PA counted once whether reached via the registry or via being recorded (count unchanged)');
+}
+
+# =============================================================================
+# AC18 -- a failing refresh (e.g. <home>/.claude is a plain file) prints the
+# global_counts_stale warning via the CLI's own warning path, exits 0, and
+# the thread write that triggered it is on disk regardless.
+# =============================================================================
+{
+    my $H18b = new_home();
+    write_raw("$H18b/.claude", 'not a directory');
+    my $P18b = tempdir(CLEANUP => 1); $P18b =~ s{\\}{/}g;
+    my $res = eval { Almanac::GlobalCounts::refresh(home => $H18b, record_root => $P18b) };
+    ok(ref($res) eq 'HASH', 'AC18: refresh on a broken <home>/.claude returns a hashref, never dies')
+        or diag('error: ' . ($@ // '(none)'));
+    if (ref($res) eq 'HASH') {
+        ok(!($res->{ok} // 0), 'AC18: ...and ok is false (the refresh genuinely failed)');
+        ok(defined $res->{reason} && length $res->{reason}, 'AC18: ...with a reason set');
+    }
+}
+
+# =============================================================================
+# AC18 -- non-ASCII project roots round-trip and are counted.
+# =============================================================================
+{
+    my $H18c = new_home();
+    my $base = tempdir(CLEANUP => 1); $base =~ s{\\}{/}g;
+    my $Pu = "$base/André-project";
+    mkdir_p($Pu);
+    mk_thread($Pu, 'unicode-thread', 'live');
+    my $res = eval { Almanac::GlobalCounts::refresh(home => $H18c, record_root => $Pu) };
+    ok(ref($res) eq 'HASH' && ($res->{ok} // 0), 'AC18: refresh with a non-ASCII ("André") record_root succeeds')
+        or diag('error: ' . ($@ // 'refresh did not return ok'));
+    my $path = eval { Almanac::GlobalCounts::snapshot_path(home => $H18c) };
+    my $snap = eval { Almanac::GlobalCounts::read_snapshot(defined $path ? $path : '') };
+    if (ref($snap) eq 'HASH') {
+        is($snap->{thread}{open}, 1, 'AC18: the non-ASCII project\'s open thread is counted');
+        ok((grep { norm_path($_) eq norm_path($Pu) } @{ $snap->{thread}{projects} || [] }) >= 1,
+            'AC18: the non-ASCII project root round-trips byte-exact in thread.projects');
+    }
+}
+
+# =============================================================================
+# AC18 -- snapshot never exceeds 4096 bytes: a fixture with many long
+# recorded roots evicts in the 2.6 order (registry-member entries first,
+# oldest first; then the oldest remaining) and keeps `open` correct.
+# =============================================================================
+{
+    my $Hbig = new_home();
+    my @roots;
+    for my $i (1 .. 60) {
+        my $base = tempdir(CLEANUP => 1); $base =~ s{\\}{/}g;
+        my $r = "$base/a-very-long-project-directory-name-to-pad-the-snapshot-$i";
+        mkdir_p($r);
+        mk_thread($r, "t-$i", 'live');
+        push @roots, $r;
+        eval { Almanac::GlobalCounts::refresh(home => $Hbig, record_root => $r) };
+    }
+    my $path = eval { Almanac::GlobalCounts::snapshot_path(home => $Hbig) };
+    my $bytes = slurp_raw(defined $path ? $path : '');
+    ok(defined $bytes, 'AC18 (size budget): the snapshot file is readable after 60 recorded roots');
+    if (defined $bytes) {
+        ok(length($bytes) <= 4096, 'AC18 (size budget): the snapshot never exceeds 4096 bytes')
+            or diag('size: ' . length($bytes));
+        my $snap = eval { JSON::PP->new->utf8->decode($bytes) };
+        if (ref($snap) eq 'HASH') {
+            # where-things-go package 02-thread-store, Decision 28: spec 2.6
+            # step 1 derives @recorded solely from the PREVIOUSLY WRITTEN,
+            # already-budget-evicted snapshot -- a non-registry root evicted
+            # from `projects` in one refresh() call is therefore permanently
+            # unrecoverable in later calls (verbatim per spec, confirmed by
+            # the implementer, not a bug). With 60 distinct, never-revisited
+            # roots and long path names, eviction starts well before all 60
+            # are ever recorded together, so `open` is NOT required to equal
+            # 60 at the end -- only to stay a plausible count and to never
+            # exceed what the surviving `projects` list can account for.
+            ok(defined $snap->{thread}{open} && $snap->{thread}{open} >= 0 && $snap->{thread}{open} <= 60,
+                'AC18 (size budget): open stays within [0, 60] (eviction of a non-registry root is permanent per spec 2.6 step 1, so open is not required to still be exactly 60)')
+                or diag('open: ' . ($snap->{thread}{open} // '(undef)'));
+            ok(scalar(@{ $snap->{thread}{projects} || [] }) < 60,
+                'AC18 (size budget): some recorded projects were evicted from the projects list (count dropped)')
+                or diag('projects count: ' . scalar(@{ $snap->{thread}{projects} || [] }));
+            ok($snap->{thread}{open} >= scalar(@{ $snap->{thread}{projects} || [] }),
+                'AC18 (size budget): open is at least as large as the surviving projects list (every root still listed is among those counted)')
+                or diag('open: ' . $snap->{thread}{open} . ' projects: ' . scalar(@{ $snap->{thread}{projects} || [] }));
+        }
+    }
+}
+
+# =============================================================================
+# AC18 -- a snapshot with a malformed `thread` section still yields the
+# correct todo/note counts (the bad thread key is dropped, not fatal).
+# =============================================================================
+{
+    my $Hmal = new_home();
+    run_cli($TODO_PL, 'create', '--title', 'AC18 malformed-thread todo', '--global', '--home', $Hmal);
+    my $path = eval { Almanac::GlobalCounts::snapshot_path(home => $Hmal) };
+    ok(defined $path && -f $path, 'AC18 (malformed thread) fixture: a snapshot exists after a todo write');
+    if (defined $path && -f $path) {
+        my $raw = slurp_raw($path);
+        my $doc = eval { JSON::PP->new->utf8->decode($raw) };
+        if (ref($doc) eq 'HASH') {
+            $doc->{thread} = { open => 'not-a-number', projects => 'not-an-array' };
+            write_raw($path, JSON::PP->new->utf8->canonical->encode($doc));
+            my $snap = eval { Almanac::GlobalCounts::read_snapshot($path) };
+            ok(ref($snap) eq 'HASH', 'AC18 (malformed thread): read_snapshot still returns a hashref') or diag('error: ' . ($@ // '(none)'));
+            if (ref($snap) eq 'HASH') {
+                ok(!exists $snap->{thread}, 'AC18 (malformed thread): the bad thread key is dropped entirely');
+                ok(exists $snap->{todo} && ref($snap->{todo}) eq 'HASH', 'AC18 (malformed thread): todo counts survive');
+                ok(exists $snap->{note} && ref($snap->{note}) eq 'HASH', 'AC18 (malformed thread): note counts survive');
+            }
+        } else {
+            fail('AC18 (malformed thread): fixture snapshot decodes as JSON');
+        }
+    }
+}
+
+# =============================================================================
+# AC18 -- serialize() without a thread key is byte-identical to the
+# no-thread-support baseline (ASCII-only document, same todo/note counts).
+# =============================================================================
+{
+    my $counts_no_thread = { todo => { open => 1, done => 2, total => 3 }, note => { total => 4 } };
+    my $gen_at = '2026-01-01T00:00:00Z';
+    my $bytes_without_thread_key = eval { Almanac::GlobalCounts::serialize($counts_no_thread, $gen_at) };
+    ok(defined $bytes_without_thread_key, 'AC18: serialize() without a thread key in $counts succeeds')
+        or diag('error: ' . ($@ // '(none)'));
+    if (defined $bytes_without_thread_key) {
+        unlike($bytes_without_thread_key, qr/"thread"/, 'AC18: no "thread" key is emitted when $counts carries none');
+    }
+}
+
+# =============================================================================
+# REGRESSION (blueprint tooling-backlog, package 13-almanac-decision-
+# relative-path; almanac bug 20261001-184636-75fe; no architect spec --
+# Decision 65, mechanical fix): almanac-todo.pl and almanac-note.pl, invoked
+# by their everyday RELATIVE path from the repo root (the bug report's exact
+# repro style), must never fail with perl's "Can't locate ... in @INC". Both
+# scripts' BEGIN blocks only `unshift @INC, $dir` and `use Module::Name ()`
+# (no sibling-SCRIPT require), so this already passes today; it is asserted
+# here so the package's fix (Cwd::abs_path(__FILE__) in every BEGIN block
+# named by the ledger's write_set) cannot regress it. The real doubled-join
+# failure (relative sibling-SCRIPT require) is covered for almanac-doctor.pl
+# and almanac-bug.pl/almanac-migrate-todos.pl/almanac-migrate-memories.pl in
+# almanac-doctor.t, almanac-inbox.pl/almanac-task.pl in
+# almanac-decision-blocks.t, and almanac-thread.pl in thread-sessions.t.
+# =============================================================================
+{
+    (my $REPO_ROOT = Cwd::abs_path("$Bin/../../../..")) =~ s{\\}{/}g;
+    ok(-d "$REPO_ROOT/plugins/almanac/scripts", 'REGRESSION precondition: REPO_ROOT resolves to the repo checkout')
+        or BAIL_OUT("REPO_ROOT does not look like the repo root: $REPO_ROOT");
+
+    # run_cli_relative($rel_script, @args) -> { rc, out, err } -- same shape
+    # as run_cli() above, but the script is given as a RELATIVE path and the
+    # subshell alone is cd'd to $REPO_ROOT first (this process's own cwd is
+    # never touched), reproducing the bug report's literal invocation style.
+    sub run_cli_relative {
+        my ($rel_script, @args) = @_;
+        my (undef, $outpath) = File::Temp::tempfile();
+        my (undef, $errpath) = File::Temp::tempfile();
+        my $argstr = join(' ', map { qq{"$_"} } @args);
+        system(qq{cd "$REPO_ROOT" && perl "$rel_script" $argstr > "$outpath" 2> "$errpath"});
+        my $rc  = $? >> 8;
+        my $out = slurp_text($outpath);
+        my $err = slurp_text($errpath);
+        unlink $outpath, $errpath;
+        return { rc => $rc, out => (defined $out ? $out : ''), err => (defined $err ? $err : '') };
+    }
+
+    my $CANT_LOCATE_RE = qr/Can't locate \S+ in \@INC/;
+
+    my $Hrel1 = tempdir(CLEANUP => 1);
+    my $r1 = run_cli_relative('plugins/almanac/scripts/almanac-todo.pl', 'list', '--home', $Hrel1);
+    unlike($r1->{out} . $r1->{err}, $CANT_LOCATE_RE,
+        'REGRESSION (75fe): almanac-todo.pl by RELATIVE path from the repo root never fails "Can\'t locate ... in @INC"')
+        or diag("rc=$r1->{rc}\nout:\n$r1->{out}\nerr:\n$r1->{err}");
+    is($r1->{rc}, 0, 'REGRESSION (75fe): almanac-todo.pl "list" on an empty --home exits 0 via relative invocation')
+        or diag("out:\n$r1->{out}\nerr:\n$r1->{err}");
+
+    my $Hrel2 = tempdir(CLEANUP => 1);
+    my $r2 = run_cli_relative('plugins/almanac/scripts/almanac-note.pl', 'list', '--home', $Hrel2);
+    unlike($r2->{out} . $r2->{err}, $CANT_LOCATE_RE,
+        'REGRESSION (75fe): almanac-note.pl by RELATIVE path from the repo root never fails "Can\'t locate ... in @INC"')
+        or diag("rc=$r2->{rc}\nout:\n$r2->{out}\nerr:\n$r2->{err}");
+    is($r2->{rc}, 0, 'REGRESSION (75fe): almanac-note.pl "list" on an empty --home exits 0 via relative invocation')
+        or diag("out:\n$r2->{out}\nerr:\n$r2->{err}");
 }
 
 # ---------------------------------------------------------------------------

@@ -352,8 +352,20 @@ sub alt_spelling {
     return $p;
 }
 
-# The finding-line oracle, pinned verbatim from spec section 4.
-my $FINDING_RE = qr/^(UNPARSEABLE|TAMPERED|UNVERIFIED|DANGLING-POINTER|DANGLING-REF|INTERRUPTED-REORDER|CHECK-FAILED|LOCK-HOLDER-GONE|LEGACY-QUEUE): (\S+) (\S+)\/(\S+): (.*) -- (.+) -- repair: (.+)$/;
+# The finding-line oracle, pinned verbatim from spec section 4. Classes
+# ARCHIVED-OPEN-TASK (11), BAD-LINK (12) and UNMIGRATED-TASKLIST (13) added
+# by specs/02-thread-store-spec.md section 2.8. UNMIGRATED-BUG (14) added by
+# blueprint where-things-go, package 07-bug-lifecycle, specs/
+# 07-bug-lifecycle-spec.md section 2.11 (a BAD-LINK bug finding reuses the
+# existing BAD-LINK class, num 12, with type 'bug' -- no regex change needed
+# for that one).
+# NOTE (specs/02-thread-store-spec.md section 2.8): a thread finding's id is
+# itself `<thread>/<task>` (contains its own internal '/'), so the
+# type/id split below is made NON-GREEDY on the type side ((\S+?)) -- it
+# splits at the FIRST '/' rather than the last, which is identical to the
+# old (greedy) behaviour whenever id has no '/' of its own (every pre-
+# existing finding kind) and is now also correct for `thread`.
+my $FINDING_RE = qr/^(UNPARSEABLE|TAMPERED|UNVERIFIED|DANGLING-POINTER|DANGLING-REF|INTERRUPTED-REORDER|CHECK-FAILED|LOCK-HOLDER-GONE|LEGACY-QUEUE|ARCHIVED-OPEN-TASK|BAD-LINK|UNMIGRATED-TASKLIST|UNMIGRATED-BUG): (\S+) (\S+?)\/(\S+): (.*) -- (.+) -- repair: (.+)$/;
 sub parse_findings {
     my ($stdout) = @_;
     my @lines = split /\n/, $stdout;
@@ -384,8 +396,8 @@ sub parse_findings {
             fields => { title => 'clean note', audience => 'internal', target => 'clean-target.md' },
             order => [qw(title audience target)]);
         write_raw("$P/clean-target.md", "target exists\n");
-        my ($dstore, $drec) = mk_record(scope => 'project', type => 'decision', root => $P,
-            fields => { title => 'clean decision', status => 'unanswered' }, order => [qw(title status)]);
+        my ($dstore, $drec) = mk_record(scope => 'project', type => 'inbox', root => $P,
+            fields => { title => 'clean inbox item', status => 'unanswered' }, order => [qw(title status)]);
         mk_record(scope => 'project', type => 'task', root => $P,
             fields => { title => 'clean task', status => 'pending', blocked_on => $drec->{id} },
             order => [qw(title status blocked_on)]);
@@ -404,7 +416,8 @@ sub parse_findings {
     is($bug_res->{rc}, 0, 'AC6 fixture: bug report filed') or diag($bug_res->{stderr});
     chomp(my $bug_path = $bug_res->{stdout});
     my ($bug_id) = $bug_path =~ m{/([^/]+)\.md$};
-    my $freeze_res = run_child([ $^X, $BUG_PL, 'set-status', $bug_id, '--project', $P1, '--to', 'declined' ],
+    my $freeze_res = run_child([ $^X, $BUG_PL, 'set-status', $bug_id, '--project', $P1, '--to', 'dropped',
+        '--note', 'dropped for fixture' ],
         env => { ALMANAC_HOME => $H6, HOME => $H6, USERPROFILE => $H6 });
     is($freeze_res->{rc}, 0, 'AC6 fixture: bug report frozen') or diag($freeze_res->{stderr});
 
@@ -412,9 +425,29 @@ sub parse_findings {
     write_raw("$P1/.ccpraxis-local-data/.subagent-guard/questions.md.migrated", "- already migrated?\n");
 
     my $res = run_doctor(home => $H6, args => [ '--root', $P1 ]);
-    is($res->{stdout}, '', 'AC6: clean fixture -- stdout is empty') or diag('stdout: ' . $res->{stdout});
+    # where-things-go package 02-thread-store (specs/02-thread-store-spec.md
+    # 2.8, finding 13): this fixture deliberately seeds >=1 record straight
+    # into the flat `task` Store for both P1 and P2 (line ~397 above), which
+    # now unconditionally fires one UNMIGRATED-TASKLIST finding per project
+    # -- so "clean" here means clean of every OTHER finding kind, not
+    # entirely silent. stderr/exit-code semantics for "N finding(s) present"
+    # are unchanged.
     is($res->{stderr}, '', 'AC6: clean fixture -- stderr is empty') or diag('stderr: ' . $res->{stderr});
-    is($res->{rc}, 0, 'AC6: clean fixture -- exit 0');
+    is($res->{rc}, 1, 'AC6: clean fixture -- exit 1 (UNMIGRATED-TASKLIST only)') or diag('stdout: ' . $res->{stdout});
+    my @ac6_findings = parse_findings($res->{stdout});
+    is(scalar(@ac6_findings), 2, 'AC6: clean fixture -- exactly 2 findings total') or diag($res->{stdout});
+    my @ac6_um = grep { $_->{class} eq 'UNMIGRATED-TASKLIST' } @ac6_findings;
+    is(scalar(@ac6_um), 2, 'AC6: clean fixture -- both findings are UNMIGRATED-TASKLIST (one per project)');
+    for my $f (@ac6_um) {
+        is($f->{scope}, 'project', 'AC6: UNMIGRATED-TASKLIST scope is project');
+        is($f->{type}, 'task', 'AC6: UNMIGRATED-TASKLIST type is task');
+        is($f->{id}, '-', 'AC6: UNMIGRATED-TASKLIST id is -');
+        like($f->{detail}, qr/the flat tasklist holds 1 record\(s\) not yet migrated to threads/,
+            'AC6: UNMIGRATED-TASKLIST detail names the count');
+    }
+    my %ac6_roots = map { (($_->{repair} =~ /--root "([^"]+)"/) ? (norm_root($1) => 1) : ()) } @ac6_um;
+    is_deeply([ sort keys %ac6_roots ], [ sort (norm_root($P1), norm_root($P2)) ],
+        'AC6: the two UNMIGRATED-TASKLIST findings cover exactly P1 and P2 (nothing else, nothing missing)');
 }
 
 # =============================================================================
@@ -545,20 +578,30 @@ sub parse_findings {
 }
 
 # =============================================================================
-# AC10 (DC6) -- a task blocked_on a nonexistent decision; a task blocked on an
-# existing decision is not reported.
+# AC10/AC13 (specs/02-thread-store-spec.md section 2.8) -- OVERRIDDEN: doctor
+# no longer scans the flat `task` store at all (Almanac::Task::check_refs is
+# removed; Almanac::Thread::check_refs restates it over every thread's
+# UNLINKED tasks). A thread task blocked_on a nonexistent inbox item is
+# reported with type `thread`, id `<thread>/<task>`, and the thread-specific
+# repair command; a task blocked on an existing inbox item is not reported.
+# Fixtures build the thread/thread-tasks-<name> stores directly (mirroring
+# exactly what Almanac::Thread::add_task would write), since Thread.pm does
+# not exist yet to do it through the library.
 # =============================================================================
 {
     my $H10 = mk_root();
     my $P10 = mk_root();
-    my (undef, $drec) = mk_record(scope => 'project', type => 'decision', root => $P10,
-        fields => { title => 'real decision', status => 'unanswered' }, order => [qw(title status)]);
-    my (undef, $bad_task) = mk_record(scope => 'project', type => 'task', root => $P10,
-        fields => { title => 'blocked on nothing', status => 'pending', blocked_on => 'nosuch-decision' },
-        order => [qw(title status blocked_on)]);
-    my (undef, $ok_task) = mk_record(scope => 'project', type => 'task', root => $P10,
-        fields => { title => 'blocked on real', status => 'pending', blocked_on => $drec->{id} },
-        order => [qw(title status blocked_on)]);
+    my (undef, $drec) = mk_record(scope => 'project', type => 'inbox', root => $P10,
+        fields => { title => 'real inbox item', status => 'unanswered' }, order => [qw(title status)]);
+    mk_record(scope => 'project', type => 'thread', root => $P10, id => 'ac10-thread',
+        fields => { created => '2026-01-01T00:00:00Z', state => 'live', owner_kind => 'none', owner_id => '-' },
+        order => [qw(created state owner_kind owner_id)]);
+    my (undef, $bad_task) = mk_record(scope => 'project', type => 'thread-tasks-ac10-thread', root => $P10,
+        fields => { title => 'blocked on nothing', created => '2026-01-01T00:00:00Z', status => 'pending', blocked_on => 'nosuch-decision' },
+        order => [qw(title created status blocked_on)]);
+    my (undef, $ok_task) = mk_record(scope => 'project', type => 'thread-tasks-ac10-thread', root => $P10,
+        fields => { title => 'blocked on real', created => '2026-01-01T00:00:00Z', status => 'pending', blocked_on => $drec->{id} },
+        order => [qw(title created status blocked_on)]);
 
     my $res = run_doctor(home => $H10, args => [ '--root', $P10 ]);
     my @findings = parse_findings($res->{stdout});
@@ -566,13 +609,345 @@ sub parse_findings {
     is(scalar(@dref), 1, 'AC10: exactly 1 DANGLING-REF line') or diag($res->{stdout});
     if (@dref) {
         my $f = $dref[0];
-        is($f->{type}, 'task', 'AC10: type is task');
-        is($f->{id}, $bad_task->{id}, 'AC10: id is the bad task\'s id');
-        is($f->{detail}, 'blocked_on nosuch-decision names no decision', 'AC10: detail names the target');
-        like($f->{repair}, qr/almanac task edit \Q$bad_task->{id}\E --clear-blocked-on --root "\Q$P10\E"/,
-            'AC10: repair is the exact edit --clear-blocked-on command');
+        is($f->{type}, 'thread', 'AC10 (spec 2.8): type is thread (never task -- the flat store is not scanned)');
+        is($f->{id}, "ac10-thread/$bad_task->{id}", 'AC10 (spec 2.8): id is <thread>/<task>');
+        is($f->{detail}, 'blocked_on nosuch-decision names no inbox item', 'spec 2.7/2.8: detail names the target, "names no inbox item"');
+        like($f->{repair}, qr/almanac thread edit ac10-thread \Q$bad_task->{id}\E --clear-blocked-on --root "\Q$P10\E"/,
+            'AC10 (spec 2.8): repair is the exact thread edit --clear-blocked-on command');
     }
-    ok(!(grep { $_->{id} eq $ok_task->{id} } @dref), 'AC10: the task blocked on a REAL decision is not reported');
+    ok(!(grep { $_->{id} =~ /\Q$ok_task->{id}\E\z/ } @dref), 'AC10: the task blocked on a REAL inbox item is not reported');
+}
+
+# =============================================================================
+# AC13 (specs/02-thread-store-spec.md section 2.8) -- a record left in the
+# FLAT `task` store (never scanned for DANGLING-REF any more) produces NO
+# DANGLING-REF finding at all -- confirms the Almanac::Task::check_refs loop
+# is gone, not merely redirected.
+# =============================================================================
+{
+    my $H10b = mk_root();
+    my $P10b = mk_root();
+    mk_record(scope => 'project', type => 'task', root => $P10b,
+        fields => { title => 'flat, blocked on nothing', status => 'pending', blocked_on => 'nosuch-decision' },
+        order => [qw(title status blocked_on)]);
+    my $res = run_doctor(home => $H10b, args => [ '--root', $P10b ]);
+    my @findings = parse_findings($res->{stdout});
+    my @dref = grep { $_->{class} eq 'DANGLING-REF' } @findings;
+    is(scalar(@dref), 0, 'AC13 (spec 2.8): a dangling blocked_on left in the flat task store produces no DANGLING-REF (not scanned)')
+        or diag($res->{stdout});
+}
+
+# =============================================================================
+# B18 (re-expressed for threads) -- an unmigrated A/decision/ (no A/inbox/):
+# Almanac::Thread::check_refs's blocked_on check falls back to the legacy
+# dir and reports no DANGLING-REF for a thread task blocked on a record that
+# genuinely exists there; one naming nothing still reports "names no inbox
+# item"; doctor never migrates (both dirs byte-unchanged).
+# =============================================================================
+{
+    my $H18 = mk_root();
+    my $P18 = mk_root();
+    my (undef, $drec18) = mk_record(scope => 'project', type => 'decision', root => $P18,
+        fields => { title => 'legacy real item', status => 'unanswered' }, order => [qw(title status)]);
+    mk_record(scope => 'project', type => 'thread', root => $P18, id => 'b18-thread',
+        fields => { created => '2026-01-01T00:00:00Z', state => 'live', owner_kind => 'none', owner_id => '-' },
+        order => [qw(created state owner_kind owner_id)]);
+    my (undef, $bad_task18) = mk_record(scope => 'project', type => 'thread-tasks-b18-thread', root => $P18,
+        fields => { title => 'blocked on nothing', created => '2026-01-01T00:00:00Z', status => 'pending', blocked_on => 'nosuch-decision' },
+        order => [qw(title created status blocked_on)]);
+    my (undef, $ok_task18) = mk_record(scope => 'project', type => 'thread-tasks-b18-thread', root => $P18,
+        fields => { title => 'blocked on legacy real', created => '2026-01-01T00:00:00Z', status => 'pending', blocked_on => $drec18->{id} },
+        order => [qw(title created status blocked_on)]);
+
+    my $res18 = run_doctor(home => $H18, args => [ '--root', $P18 ]);
+    my @findings18 = parse_findings($res18->{stdout});
+    my @dref18 = grep { $_->{class} eq 'DANGLING-REF' } @findings18;
+    is(scalar(@dref18), 1, 'B18: exactly 1 DANGLING-REF line on an unmigrated A/decision/ project') or diag($res18->{stdout});
+    ok(!(grep { $_->{id} =~ /\Q$ok_task18->{id}\E\z/ } @dref18),
+        'B18: the task blocked on a REAL legacy A/decision/ record is not reported (fallback read succeeds)');
+    if (@dref18) {
+        is($dref18[0]->{detail}, 'blocked_on nosuch-decision names no inbox item',
+            'B18: the dangling one still reports "names no inbox item" via the fallback');
+    }
+    ok(-d "$P18/.ccpraxis-local-data/almanac/decision", 'B18: A/decision still exists after doctor runs (never migrated)');
+    ok(!-d "$P18/.ccpraxis-local-data/almanac/inbox", 'B18: A/inbox was never created by doctor');
+}
+
+# ---------------------------------------------------------------------------
+# write_pkg_ledger($root, $bp, $pkg, $status, archived=>0|1) -- the minimal
+# frontmatter PackageLink::resolve reads.
+# ---------------------------------------------------------------------------
+sub write_pkg_ledger {
+    my ($root, $bp, $pkg, $status, %opt) = @_;
+    my $base = $opt{archived}
+        ? norm_root($root) . "/.ccpraxis-local-data/blueprints/_archive/$bp/packages"
+        : norm_root($root) . "/.ccpraxis-local-data/blueprints/$bp/packages";
+    make_path($base);
+    open(my $fh, '>:raw', "$base/$pkg.md") or die "fixture: cannot write $base/$pkg.md: $!";
+    print {$fh} "---\nstatus: $status\n---\n";
+    close $fh;
+}
+
+# =============================================================================
+# AC13 (specs/02-thread-store-spec.md section 2.8) -- ARCHIVED-OPEN-TASK: an
+# unlinked task whose status is not done/obsoleted in an ARCHIVED thread.
+# =============================================================================
+{
+    my $Harc = mk_root();
+    my $Parc = mk_root();
+    mk_record(scope => 'project', type => 'thread', root => $Parc, id => 'arc-thread',
+        fields => { created => '2026-01-01T00:00:00Z', state => 'archived', owner_kind => 'none', owner_id => '-', archived_at => '2026-01-02T00:00:00Z' },
+        order => [qw(created state owner_kind owner_id archived_at)]);
+    my (undef, $open_task) = mk_record(scope => 'project', type => 'thread-tasks-arc-thread', root => $Parc,
+        fields => { title => 'still open', created => '2026-01-01T00:00:00Z', status => 'doing' },
+        order => [qw(title created status)]);
+    mk_record(scope => 'project', type => 'thread-tasks-arc-thread', root => $Parc,
+        fields => { title => 'actually done', created => '2026-01-01T00:00:00Z', status => 'done' },
+        order => [qw(title created status)]);
+
+    my $res = run_doctor(home => $Harc, args => [ '--root', $Parc ]);
+    my @findings = parse_findings($res->{stdout});
+    my @aot = grep { $_->{class} eq 'ARCHIVED-OPEN-TASK' } @findings;
+    is(scalar(@aot), 1, 'AC13: exactly one ARCHIVED-OPEN-TASK finding (the done task is not flagged)') or diag($res->{stdout});
+    if (@aot) {
+        is($aot[0]{type}, 'thread', 'AC13: ARCHIVED-OPEN-TASK type is thread');
+        is($aot[0]{id}, "arc-thread/$open_task->{id}", 'AC13: ARCHIVED-OPEN-TASK id is <thread>/<task>');
+        like($aot[0]{detail}, qr/task \Q$open_task->{id}\E is doing in archived thread arc-thread/,
+            'AC13: detail names the task, status and thread');
+        like($aot[0]{repair}, qr/almanac thread status arc-thread \Q$open_task->{id}\E done --root "\Q$Parc\E"/,
+            'AC13: repair is the exact thread status ... done command');
+    }
+}
+
+# =============================================================================
+# AC13 -- BAD-LINK: missing / parked / dropped, and NEVER for an archived-
+# thread's linked task or a link resolving under blueprints/_archive.
+# =============================================================================
+{
+    my $Hbl = mk_root();
+    my $Pbl = mk_root();
+    mk_record(scope => 'project', type => 'thread', root => $Pbl, id => 'bl-thread',
+        fields => { created => '2026-01-01T00:00:00Z', state => 'live', owner_kind => 'none', owner_id => '-' },
+        order => [qw(created state owner_kind owner_id)]);
+    write_pkg_ledger($Pbl, 'bpm', '01-m', 'parked');
+    write_pkg_ledger($Pbl, 'bpd', '01-d', 'dropped');
+    my (undef, $missing_task) = mk_record(scope => 'project', type => 'thread-tasks-bl-thread', root => $Pbl,
+        fields => { title => 'bpmissing/01-x', created => '2026-01-01T00:00:00Z', link => 'bpmissing/01-x' },
+        order => [qw(title created link)]);
+    my (undef, $parked_task) = mk_record(scope => 'project', type => 'thread-tasks-bl-thread', root => $Pbl,
+        fields => { title => 'bpm/01-m', created => '2026-01-01T00:00:00Z', link => 'bpm/01-m' },
+        order => [qw(title created link)]);
+    my (undef, $dropped_task) = mk_record(scope => 'project', type => 'thread-tasks-bl-thread', root => $Pbl,
+        fields => { title => 'bpd/01-d', created => '2026-01-01T00:00:00Z', link => 'bpd/01-d' },
+        order => [qw(title created link)]);
+    # archived-only blueprint: never flagged, whatever its status.
+    write_pkg_ledger($Pbl, 'bpa', '01-a', 'parked', archived => 1);
+    my (undef, $archived_link_task) = mk_record(scope => 'project', type => 'thread-tasks-bl-thread', root => $Pbl,
+        fields => { title => 'bpa/01-a', created => '2026-01-01T00:00:00Z', link => 'bpa/01-a' },
+        order => [qw(title created link)]);
+
+    my $res = run_doctor(home => $Hbl, args => [ '--root', $Pbl ]);
+    my @findings = parse_findings($res->{stdout});
+    my @bl = grep { $_->{class} eq 'BAD-LINK' } @findings;
+    is(scalar(@bl), 3, 'AC13: exactly three BAD-LINK findings (missing, parked, dropped; archived-location link never flagged)')
+        or diag($res->{stdout});
+    my %by_id = map { $_->{id} => $_ } @bl;
+    if (exists $by_id{"bl-thread/$missing_task->{id}"}) {
+        like($by_id{"bl-thread/$missing_task->{id}"}{detail}, qr/link bpmissing\/01-x is missing/, 'AC13: BAD-LINK missing detail');
+        like($by_id{"bl-thread/$missing_task->{id}"}{repair}, qr/restore the ledger, or almanac thread archive bl-thread --root "\Q$Pbl\E"/,
+            'AC13: BAD-LINK missing repair');
+    } else { fail('AC13: BAD-LINK missing finding present') }
+    if (exists $by_id{"bl-thread/$parked_task->{id}"}) {
+        like($by_id{"bl-thread/$parked_task->{id}"}{detail}, qr/link bpm\/01-m package is parked/, 'AC13: BAD-LINK parked detail');
+        like($by_id{"bl-thread/$parked_task->{id}"}{repair}, qr/read the package ledger and unpark it or archive the thread/,
+            'AC13: BAD-LINK parked repair');
+    } else { fail('AC13: BAD-LINK parked finding present') }
+    if (exists $by_id{"bl-thread/$dropped_task->{id}"}) {
+        like($by_id{"bl-thread/$dropped_task->{id}"}{detail}, qr/link bpd\/01-d package is dropped/, 'AC13: BAD-LINK dropped detail');
+        like($by_id{"bl-thread/$dropped_task->{id}"}{repair}, qr/almanac thread archive-if-done bl-thread --root "\Q$Pbl\E"/,
+            'AC13: BAD-LINK dropped repair');
+    } else { fail('AC13: BAD-LINK dropped finding present') }
+    ok(!exists $by_id{"bl-thread/$archived_link_task->{id}"},
+        'AC13: a link resolving under blueprints/_archive is never flagged (Decision 18 F1), regardless of status');
+}
+
+# =============================================================================
+# DC2 (specs/07-bug-lifecycle-spec.md section 2.11, AC16 there) -- BAD-LINK
+# findings for a `scheduled` BUG report (type 'bug', reusing the BAD-LINK
+# class and num 12): missing, parked, dropped and syntactically invalid
+# links are each flagged; a link resolving only under blueprints/_archive,
+# and a package still active (not done/parked/dropped), are never flagged.
+#
+# Written directly to disk (bypassing the CLI): almanac-bug.pl does not yet
+# support `--to scheduled` at all (write_set, not yet implemented) -- this is
+# the oracle for the behavior that implementation must produce.
+# =============================================================================
+{
+    my $Hbg = mk_root();
+    my $Pbg = mk_root();
+    my $bg_seq = 0;
+
+    write_pkg_ledger($Pbg, 'bgpm',  '01-m',  'parked');
+    write_pkg_ledger($Pbg, 'bgpd',  '01-d',  'dropped');
+    write_pkg_ledger($Pbg, 'bgpa',  '01-a',  'parked', archived => 1);
+    write_pkg_ledger($Pbg, 'bgpok', '01-ok', 'running');
+
+    my $mk_scheduled_bug = sub {
+        my (%o) = @_;
+        my $id   = AlmanacBug::new_id() . sprintf('-bg%02d', ++$bg_seq);
+        my $now  = AlmanacBug::_iso(time);
+        my $body = 'body text';
+        my $dir  = AlmanacBug::reports_dir($Pbg);
+        make_path($dir) unless -d $dir;
+        my $path = "$dir/$id.md";
+        my %f = (
+            id => $id, title => ($o{title} // 'scheduled bug'), status => 'scheduled',
+            severity => 'unknown', area => 'unknown', project => $Pbg,
+            created_at => $now, updated_at => $now, frozen_at => $now,
+            content_sha256 => AlmanacBug::body_digest($body),
+            package => $o{package}, package_root => $Pbg, scheduled_at => $now,
+        );
+        my @order = qw(id title status severity area project created_at updated_at
+                       frozen_at content_sha256 package package_root scheduled_at);
+        open my $fh, '>:raw', $path or die "fixture: cannot write $path: $!";
+        print {$fh} "---\n" . join("\n", map { "$_: $f{$_}" } @order) . "\n---\n$body";
+        close $fh;
+        return ($path, $id);
+    };
+
+    my (undef, $missing_id)  = $mk_scheduled_bug->(title => 'bg missing',  package => 'bgpmissing/01-x');
+    my (undef, $parked_id)   = $mk_scheduled_bug->(title => 'bg parked',   package => 'bgpm/01-m');
+    my (undef, $dropped_id)  = $mk_scheduled_bug->(title => 'bg dropped',  package => 'bgpd/01-d');
+    my (undef, $invalid_id)  = $mk_scheduled_bug->(title => 'bg invalid',  package => 'not-a-link');
+    my (undef, $archived_id) = $mk_scheduled_bug->(title => 'bg archived', package => 'bgpa/01-a');
+    my (undef, $active_id)   = $mk_scheduled_bug->(title => 'bg active',   package => 'bgpok/01-ok');
+
+    my $res = run_doctor(home => $Hbg, args => [ '--root', $Pbg ]);
+    my @findings = parse_findings($res->{stdout});
+    my @bl = grep { $_->{class} eq 'BAD-LINK' && $_->{type} eq 'bug' } @findings;
+    is(scalar(@bl), 4, 'DC2: exactly 4 BAD-LINK/bug findings (missing, parked, dropped, invalid)')
+        or diag($res->{stdout});
+    my %by_id = map { $_->{id} => $_ } @bl;
+    if (exists $by_id{$missing_id}) {
+        like($by_id{$missing_id}{detail}, qr/link bgpmissing\/01-x is missing/, 'DC2: BAD-LINK/bug missing detail');
+        like($by_id{$missing_id}{repair},
+            qr/restore the ledger, or almanac bug set-status \Q$missing_id\E --to dropped --note "<why>" --project "\Q$Pbg\E"/,
+            'DC2: BAD-LINK/bug missing repair');
+    } else { fail('DC2: BAD-LINK/bug missing finding present') }
+    if (exists $by_id{$parked_id}) {
+        like($by_id{$parked_id}{detail}, qr/link bgpm\/01-m package is parked/, 'DC2: BAD-LINK/bug parked detail');
+        like($by_id{$parked_id}{repair},
+            qr/unpark the package, or almanac bug set-status \Q$parked_id\E --to dropped --note "<why>" --project "\Q$Pbg\E"/,
+            'DC2: BAD-LINK/bug parked repair');
+    } else { fail('DC2: BAD-LINK/bug parked finding present') }
+    if (exists $by_id{$dropped_id}) {
+        like($by_id{$dropped_id}{detail}, qr/link bgpd\/01-d package is dropped/, 'DC2: BAD-LINK/bug dropped detail');
+        like($by_id{$dropped_id}{repair},
+            qr/almanac bug set-status \Q$dropped_id\E --to dropped --note "<why>" --project "\Q$Pbg\E"/,
+            'DC2: BAD-LINK/bug dropped repair');
+    } else { fail('DC2: BAD-LINK/bug dropped finding present') }
+    if (exists $by_id{$invalid_id}) {
+        like($by_id{$invalid_id}{detail}, qr/package link 'not-a-link' is invalid/, 'DC2: BAD-LINK/bug invalid detail');
+        like($by_id{$invalid_id}{repair},
+            qr/almanac bug set-status \Q$invalid_id\E --to dropped --note "<why>" --project "\Q$Pbg\E"/,
+            'DC2: BAD-LINK/bug invalid repair');
+    } else { fail('DC2: BAD-LINK/bug invalid finding present') }
+    ok(!exists $by_id{$archived_id},
+        'DC2: a link resolving under blueprints/_archive is never flagged, regardless of status (Decision 18 F1)');
+    ok(!exists $by_id{$active_id},
+        'DC2: a package that is merely active (not done/parked/dropped) produces no BAD-LINK/bug finding');
+}
+
+# =============================================================================
+# DC4 (specs/07-bug-lifecycle-spec.md section 2.11) -- UNMIGRATED-BUG (14):
+# a 'taken' bug report whose resolution note names no resolvable package is
+# flagged; one whose note DOES resolve gets no such finding (it migrates on
+# the next almanac-bug.pl call instead -- doctor itself never writes).
+# =============================================================================
+{
+    my $Hum2 = mk_root();
+    my $Pum2 = mk_root();
+    my $now  = AlmanacBug::_iso(time);
+    my $body = 'body';
+    my $dir  = AlmanacBug::reports_dir($Pum2);
+    make_path($dir) unless -d $dir;
+
+    my @order = qw(id title status severity area project created_at updated_at
+                   frozen_at content_sha256 taken_at resolution);
+    my $write_taken = sub {
+        my (%o) = @_;
+        my $id = $o{id};
+        my $path = "$dir/$id.md";
+        my %f = (
+            id => $id, title => ($o{title} // 'stuck taken'), status => 'taken',
+            severity => 'unknown', area => 'unknown', project => $Pum2,
+            created_at => $now, updated_at => $now, frozen_at => $now,
+            content_sha256 => AlmanacBug::body_digest($body),
+            taken_at => $now, resolution => $o{resolution},
+        );
+        open my $fh, '>:raw', $path or die "fixture: cannot write $path: $!";
+        print {$fh} "---\n" . join("\n", map { defined $f{$_} ? "$_: $f{$_}" : () } @order) . "\n---\n$body";
+        close $fh;
+    };
+
+    my $id1 = AlmanacBug::new_id() . '-umbg1';
+    $write_taken->(id => $id1, resolution => 'investigating still');
+
+    my $res = run_doctor(home => $Hum2, args => [ '--root', $Pum2 ]);
+    my @findings = parse_findings($res->{stdout});
+    my @um = grep { $_->{class} eq 'UNMIGRATED-BUG' } @findings;
+    is(scalar(@um), 1, 'DC4: exactly one UNMIGRATED-BUG finding (the resolution names no package)')
+        or diag($res->{stdout});
+    if (@um) {
+        is($um[0]{type}, 'bug', 'DC4: UNMIGRATED-BUG type is bug');
+        is($um[0]{id}, $id1, 'DC4: UNMIGRATED-BUG id is the report id');
+        like($um[0]{detail}, qr/status 'taken' predates 'scheduled', and its note names no package/,
+            'DC4: UNMIGRATED-BUG detail names the reason from spec sec 2.7');
+        like($um[0]{repair},
+            qr/almanac bug set-status \Q$id1\E --to scheduled --package <blueprint>\/<package> --repair --project "\Q$Pum2\E"/,
+            'DC4: UNMIGRATED-BUG repair');
+    }
+
+    # A resolvable note: no UNMIGRATED-BUG finding (doctor never writes; the
+    # next almanac-bug.pl call migrates it instead).
+    write_pkg_ledger($Pum2, 'umbp', '01-um', 'running');
+    my $id2 = AlmanacBug::new_id() . '-umbg2';
+    $write_taken->(id => $id2, resolution => 'Scheduled as umbp 01-um');
+
+    my $res2 = run_doctor(home => $Hum2, args => [ '--root', $Pum2 ]);
+    my @findings2 = parse_findings($res2->{stdout});
+    ok(!(grep { $_->{class} eq 'UNMIGRATED-BUG' && $_->{id} eq $id2 } @findings2),
+        'DC4: a taken report whose note resolves gets no UNMIGRATED-BUG finding');
+    ok((grep { $_->{class} eq 'UNMIGRATED-BUG' && $_->{id} eq $id1 } @findings2),
+        'DC4: the unresolvable one is still flagged on this second run (doctor never migrates it away)');
+}
+
+# =============================================================================
+# AC13 -- UNMIGRATED-TASKLIST: >=1 record in the flat `task` store.
+# =============================================================================
+{
+    my $Hum = mk_root();
+    my $Pum = mk_root();
+    mk_record(scope => 'project', type => 'task', root => $Pum,
+        fields => { title => 'still flat', status => 'pending' }, order => [qw(title status)]);
+    mk_record(scope => 'project', type => 'task', root => $Pum,
+        fields => { title => 'also flat', status => 'doing' }, order => [qw(title status)]);
+
+    my $res = run_doctor(home => $Hum, args => [ '--root', $Pum ]);
+    my @findings = parse_findings($res->{stdout});
+    my @um = grep { $_->{class} eq 'UNMIGRATED-TASKLIST' } @findings;
+    is(scalar(@um), 1, 'AC13: exactly one UNMIGRATED-TASKLIST finding') or diag($res->{stdout});
+    if (@um) {
+        is($um[0]{type}, 'task', 'AC13: UNMIGRATED-TASKLIST type is task');
+        is($um[0]{id}, '-', 'AC13: UNMIGRATED-TASKLIST id is -');
+        like($um[0]{detail}, qr/the flat tasklist holds 2 record\(s\) not yet migrated to threads/, 'AC13: UNMIGRATED-TASKLIST detail names the count');
+        like($um[0]{repair}, qr/almanac thread list --root "\Q$Pum\E"/, 'AC13: UNMIGRATED-TASKLIST repair');
+    }
+
+    # doctor never migrates: the flat store is untouched by the run.
+    require Almanac::Store;
+    my $after_store = Almanac::Store->open(scope => 'project', type => 'task', root => $Pum);
+    is(scalar(@{ $after_store->ids }), 2, 'AC13: doctor never migrates -- the flat task store still holds both records');
 }
 
 # =============================================================================
@@ -608,7 +983,8 @@ sub parse_findings {
         env => { ALMANAC_HOME => $H11, HOME => $H11, USERPROFILE => $H11 });
     chomp(my $bug_path = $res_bf->{stdout});
     my ($bug_id) = $bug_path =~ m{/([^/]+)\.md$};
-    run_child([ $^X, $BUG_PL, 'set-status', $bug_id, '--project', $P11, '--to', 'declined' ],
+    run_child([ $^X, $BUG_PL, 'set-status', $bug_id, '--project', $P11, '--to', 'dropped',
+        '--note', 'dropped for fixture' ],
         env => { ALMANAC_HOME => $H11, HOME => $H11, USERPROFILE => $H11 });
     {
         my $raw = slurp_raw($bug_path);
@@ -786,7 +1162,8 @@ my ($H15, $P15b_2, $legacy_p2, $legacy_home, $legacy_live);
     is($f_live->{scope}, 'orphan',  'AC15: the live install is labelled orphan') if $f_live;
     for my $f (@lq) {
         my ($dir) = $f->{path} =~ m{^(.*)/\.ccpraxis-local-data/\.subagent-guard/questions\.md$};
-        like($f->{repair}, qr/^almanac decision list --root "\Q$dir\E"$/, "AC15: repair names D=$dir exactly");
+        like($f->{repair}, qr/^almanac inbox list --root "\Q$dir\E"$/, "spec 2.7: repair is 'almanac inbox list', names D=$dir exactly");
+        is($f->{type}, 'inbox', 'spec 2.7: the LEGACY-QUEUE probe reports type => inbox');
     }
 
     for my $p ($legacy_p2, $legacy_home, $legacy_live) {
@@ -794,7 +1171,7 @@ my ($H15, $P15b_2, $legacy_p2, $legacy_home, $legacy_live);
         my $body = slurp_raw($p);
         is($body, "- question one?\n- question two?\n", 'AC15: ...and byte-identical to the seed');
         my ($dir) = $p =~ m{^(.*)/\.ccpraxis-local-data/\.subagent-guard/questions\.md$};
-        ok(!-d "$dir/.ccpraxis-local-data/almanac/decision", 'AC15: no decision store dir was created under this D');
+        ok(!-d "$dir/.ccpraxis-local-data/almanac/inbox", 'spec 2.7: no inbox store dir was created under this D (the probe never absorbs)');
     }
 }
 {
@@ -818,15 +1195,15 @@ my ($H15, $P15b_2, $legacy_p2, $legacy_home, $legacy_live);
 
     for my $f (@lq0) {
         my ($dir) = $f->{path} =~ m{^(.*)/\.ccpraxis-local-data/\.subagent-guard/questions\.md$};
-        my $res = run_child([ $^X, $ALMANAC_PL, 'decision', 'list', '--root', $dir ],
+        my $res = run_child([ $^X, $ALMANAC_PL, 'inbox', 'list', '--root', $dir ],
             env => { ALMANAC_HOME => $H15, HOME => $H15, USERPROFILE => $H15 });
         is($res->{rc}, 0, "AC15c: running the printed repair for $dir exits 0") or diag($res->{stderr});
         ok(-f "$dir/.ccpraxis-local-data/.subagent-guard/questions.md.migrated",
             "AC15c: ...and questions.md.migrated now exists under $dir");
-        my $dstore = eval { Almanac::Store->open(scope => 'project', type => 'decision', root => $dir) };
+        my $dstore = eval { Almanac::Store->open(scope => 'project', type => 'inbox', root => $dir) };
         my $list = eval { $dstore->list() } if $dstore;
         is(scalar(@{ (ref $list eq 'ARRAY') ? $list : [] }), 2,
-            "AC15c: ...and the decision store at $dir now holds 2 legacy-* records") if $dstore;
+            "AC15c: ...and the inbox store at $dir now holds 2 legacy-* records") if $dstore;
     }
     my $res_after = run_doctor(home => $H15, args => [ '--root', $P15b_2 ]);
     my @lq_after = grep { $_->{class} eq 'LEGACY-QUEUE' } parse_findings($res_after->{stdout});
@@ -872,25 +1249,37 @@ my (%ALL_EXPECT, $ALL_HOME, $ALL_P1, $ALL_LOCK_PID);
         repair => qq(almanac note delete $dangling_note->{id} --root "$ALL_P1", or recreate the target file),
     };
 
-    # F5 (AC10-flavoured): dangling task ref
-    my (undef, $bad_task) = mk_record(scope => 'project', type => 'task', root => $ALL_P1,
-        fields => { title => 'blocked', status => 'pending', blocked_on => 'nosuch-decision' },
-        order => [qw(title status blocked_on)]);
+    # F5 (AC10-flavoured, OVERRIDDEN by specs/02-thread-store-spec.md section
+    # 2.8): dangling THREAD task ref (the flat task store is no longer
+    # scanned for DANGLING-REF at all).
+    mk_record(scope => 'project', type => 'thread', root => $ALL_P1, id => 'all-thread',
+        fields => { created => '2026-01-01T00:00:00Z', state => 'live', owner_kind => 'none', owner_id => '-' },
+        order => [qw(created state owner_kind owner_id)]);
+    my (undef, $bad_task) = mk_record(scope => 'project', type => 'thread-tasks-all-thread', root => $ALL_P1,
+        fields => { title => 'blocked', created => '2026-01-01T00:00:00Z', status => 'pending', blocked_on => 'nosuch-decision' },
+        order => [qw(title created status blocked_on)]);
     $ALL_EXPECT{"DANGLING-REF\x1F" . norm_root($ALL_P1)} = {
-        detail => 'blocked_on nosuch-decision names no decision',
-        repair => qq(almanac task edit $bad_task->{id} --clear-blocked-on --root "$ALL_P1"),
+        detail => 'blocked_on nosuch-decision names no inbox item',
+        repair => qq(almanac thread edit all-thread $bad_task->{id} --clear-blocked-on --root "$ALL_P1"),
     };
 
-    # F6 (AC18-flavoured): interrupted reorder journal
+    # F6 (AC18-flavoured): interrupted reorder journal, still on the flat
+    # `task` store (the journal mechanism is generic to Store and is
+    # unrelated to migration state). Per spec 2.8 item 5, `task` no longer
+    # has a listing verb, so the exact repair text this fixture used to pin
+    # ("almanac task list --root ...") can no longer be right; the spec does
+    # not state its replacement, so only the negative is asserted here (see
+    # the AC18 block below, same reasoning).
     my $tstore = Almanac::Store->open(scope => 'project', type => 'task', root => $ALL_P1);
+    make_path($tstore->dir) unless -d $tstore->dir;
     my $journal_path = "@{[$tstore->dir]}/.reorder-journal.json";
     write_raw($journal_path, JSON::PP->new->canonical->encode({
         version => 1, writer => 'fixture', started_at => time(),
-        entries => { $bad_task->{id} => { prev_rank => undef, next_rank => undef } },
+        entries => { 'some-task-id' => { prev_rank => undef, next_rank => undef } },
     }));
     $ALL_EXPECT{"INTERRUPTED-REORDER\x1F" . norm_root($journal_path)} = {
         detail => 'an abandoned reorder journal is present',
-        repair => qq(almanac task list --root "$ALL_P1"),
+        repair_not => qq(almanac task list --root "$ALL_P1"),
     };
 
     # F7 (AC19-flavoured): note id_mismatch. Deliberately in the GLOBAL note
@@ -938,7 +1327,7 @@ my (%ALL_EXPECT, $ALL_HOME, $ALL_P1, $ALL_LOCK_PID);
         detail => 'unabsorbed legacy question queue',
         # D (the repair's --root argument) comes from canonical_root(), same
         # as the LEGACY-QUEUE <path> itself (review S1) -- never the raw H.
-        repair => qq(almanac decision list --root "@{[norm_root($ALL_HOME)]}"),
+        repair => qq(almanac inbox list --root "@{[norm_root($ALL_HOME)]}"),
     };
 
     # Snapshot BEFORE running doctor (excluding names ending .lock/.lock.holder).
@@ -988,7 +1377,11 @@ my (%ALL_EXPECT, $ALL_HOME, $ALL_P1, $ALL_LOCK_PID);
         unless ($exp) { diag("AC16: unexpected finding, not registered by this fixture: $line"); next }
         if ($exp->{detail_re}) { like($detail, $exp->{detail_re}, "AC16: $class detail matches for $path") }
         else                    { is($detail, $exp->{detail}, "AC16: $class detail matches for $path") }
-        is($repair, $exp->{repair}, "AC16: $class repair matches the section 2.2.4 table for $path");
+        if (exists $exp->{repair_not}) {
+            isnt($repair, $exp->{repair_not}, "AC16/spec 2.8: $class repair is no longer the retired-verb text for $path");
+        } else {
+            is($repair, $exp->{repair}, "AC16: $class repair matches the section 2.2.4 table for $path");
+        }
         delete $ALL_EXPECT{$key};
     }
     is($bad_count, 0, 'AC16: every stdout line except the last matches the finding regex');
@@ -1030,9 +1423,20 @@ my (%ALL_EXPECT, $ALL_HOME, $ALL_P1, $ALL_LOCK_PID);
     my (undef, $dnote) = mk_record(scope => 'project', type => 'note', root => $M1_ROOT_RAW,
         fields => { title => 'm1 dangling', audience => 'internal', target => 'gone.md' },
         order => [qw(title audience target)]);
-    my (undef, $dtask) = mk_record(scope => 'project', type => 'task', root => $M1_ROOT_RAW,
-        fields => { title => 'm1 blocked', status => 'pending', blocked_on => 'nosuch-decision' },
-        order => [qw(title status blocked_on)]);
+    # where-things-go package 02-thread-store (specs/02-thread-store-spec.md
+    # 2.8): DANGLING-REF no longer scans the flat `task` store at all (see
+    # AC10/AC13/AC18 above, already pinning that behaviour) -- a dangling
+    # blocked_on now has to live on a THREAD task to produce a DANGLING-REF
+    # finding, so this fixture builds one directly (mirroring AC10's
+    # pattern) purely to keep exercising M1's actual regression: byte-exact
+    # non-ASCII encoding of the repair line, for whichever finding kind can
+    # still carry one.
+    mk_record(scope => 'project', type => 'thread', root => $M1_ROOT_RAW, id => 'm1-thread',
+        fields => { created => '2026-01-01T00:00:00Z', state => 'live', owner_kind => 'none', owner_id => '-' },
+        order => [qw(created state owner_kind owner_id)]);
+    my (undef, $dtask) = mk_record(scope => 'project', type => 'thread-tasks-m1-thread', root => $M1_ROOT_RAW,
+        fields => { title => 'm1 blocked', created => '2026-01-01T00:00:00Z', status => 'pending', blocked_on => 'nosuch-decision' },
+        order => [qw(title created status blocked_on)]);
 
     my $res = run_doctor(home => $M1_HOME, args => [ '--root', $M1_ROOT_RAW ]);
     my @findings = parse_findings($res->{stdout});
@@ -1074,10 +1478,28 @@ my (%ALL_EXPECT, $ALL_HOME, $ALL_P1, $ALL_LOCK_PID);
     } else {
         fail('M1: running the printed DANGLING-POINTER repair verbatim (byte-exact argv) finds the store and succeeds');
     }
-    if ($rf && $rf->{repair} =~ /^almanac task edit (\S+) --clear-blocked-on --root "(.+)"$/) {
+    if ($rf && $rf->{repair} =~ /^almanac thread edit m1-thread (\S+) --clear-blocked-on --root "(.+)"$/) {
         my ($id, $root_arg) = ($1, $2);
-        my $edit_res = run_child([ $^X, $ALMANAC_PL, 'task', 'edit', $id, '--clear-blocked-on', '--root', $root_arg ],
-            env => { ALMANAC_HOME => $M1_HOME, HOME => $M1_HOME, USERPROFILE => $M1_HOME });
+        # blueprint where-things-go package 03-thread-sessions (Decision 18
+        # F6/F7): 'thread edit' is now a hard-gated write verb -- running
+        # this doctor-printed repair verbatim needs a ticket minted for the
+        # EXACT argv almanac-thread.pl will see (the type word 'thread' is
+        # stripped by almanac.pl's dispatch, so the ticket's argv starts at
+        # 'edit'), under its OWN pinned BUTLER_STATE_DIR (this file never
+        # otherwise sets one, so leaving it ambient would reach the
+        # operator's real butler state -- exactly what this session's
+        # earlier unpinned CLI probing already corrupted twice).
+        my $m1_bsd = mk_root();
+        require "$S/../../butler/scripts/BpHook.pm" unless grep { m{(?:^|/)BpHook\.pm$} } keys %INC;
+        {
+            local $ENV{BUTLER_STATE_DIR} = $m1_bsd;
+            BpHook::write_ticket(
+                { session_id => 'M1-SESSION', tool_use_id => 'M1T1',
+                  transcript_path => undef, cwd => '/fixture' },
+                'almanac-thread', [ 'edit', 'm1-thread', $id, '--clear-blocked-on', '--root', $root_arg ]);
+        }
+        my $edit_res = run_child([ $^X, $ALMANAC_PL, 'thread', 'edit', 'm1-thread', $id, '--clear-blocked-on', '--root', $root_arg ],
+            env => { ALMANAC_HOME => $M1_HOME, HOME => $M1_HOME, USERPROFILE => $M1_HOME, BUTLER_STATE_DIR => $m1_bsd });
         is($edit_res->{rc}, 0,
             'M1: running the printed DANGLING-REF repair verbatim (byte-exact argv) finds the store and succeeds')
             or diag("rc=$edit_res->{rc} out=$edit_res->{stdout} err=$edit_res->{stderr}");
@@ -1152,14 +1574,20 @@ my (%ALL_EXPECT, $ALL_HOME, $ALL_P1, $ALL_LOCK_PID);
     if (@reorder) {
         is($reorder[0]{id}, '-', 'AC18: id is "-"');
         is($reorder[0]{type}, 'task', 'AC18: type is task');
-        is($reorder[0]{repair}, qq(almanac task list --root "$P18"), 'AC18: repair is almanac task list --root P1');
+        # spec 2.8 item 5: task no longer has a listing verb, so the old
+        # "almanac task list --root ..." repair text can no longer be right;
+        # the spec does not pin its replacement, so only the negative holds.
+        isnt($reorder[0]{repair}, qq(almanac task list --root "$P18"),
+            'AC18/spec 2.8: repair is no longer the retired "almanac task list" text');
     }
     ok(-f $journal_path, 'AC18: the journal still exists after doctor');
     is(slurp_raw($journal_path), $journal_bytes, 'AC18: ...byte-identical');
     is(slurp_raw($task1->{path}), $task_bytes_before, 'AC18: the task record bytes are unchanged');
 
+    # spec 2.8: DANGLING-REF no longer scans the flat task store at all, so
+    # this fixture's flat blocked_on no longer produces one.
     my @dref = grep { $_->{class} eq 'DANGLING-REF' } @findings;
-    ok(scalar(@dref) >= 1, 'AC18: DANGLING-REF checks for P1 still ran alongside the journal finding');
+    is(scalar(@dref), 0, 'AC18/spec 2.8: no DANGLING-REF from a flat-task-store blocked_on (not scanned any more)');
 }
 
 # =============================================================================
@@ -1228,7 +1656,7 @@ my (%ALL_EXPECT, $ALL_HOME, $ALL_P1, $ALL_LOCK_PID);
         my @nc_lines = grep { $_ !~ /^\s*#/ } split /\n/, $src;
         my $nc = join("\n", @nc_lines);
         for my $forbidden (qw{--- Digest:: sha256_hex JSON::PP questions.md subagent-guard
-                               Almanac::Decision open_decisions absorb( ->create( ->update(
+                               Almanac::Inbox open_inbox migrate_legacy_store absorb( ->create( ->update(
                                ->delete( ->reorder( ->insert_ ->recover( unlink rename
                                write_atomic make_path mkdir alarm}) {
             unlike($nc, qr/\Q$forbidden\E/, "AC21: almanac-doctor.pl (comments stripped) never contains '$forbidden'");
@@ -1343,8 +1771,8 @@ use File::Basename ();
     my $P24 = mk_root();
     my @decisions;
     for my $i (1 .. 20) {
-        my (undef, $d) = mk_record(scope => 'project', type => 'decision', root => $P24,
-            fields => { title => "decision $i", status => 'unanswered' }, order => [qw(title status)]);
+        my (undef, $d) = mk_record(scope => 'project', type => 'inbox', root => $P24,
+            fields => { title => "inbox item $i", status => 'unanswered' }, order => [qw(title status)]);
         push @decisions, $d;
     }
     for my $i (1 .. 100) {
@@ -1376,8 +1804,27 @@ use File::Basename ();
     my $elapsed = Time::HiRes::time() - $t0;
     diag(sprintf('AC24: doctor over 300 records took %.2fs wall', $elapsed));
     ok($elapsed < 20, sprintf('AC24: doctor completes within a 20s timeout (%.2fs)', $elapsed));
-    is($res->{stdout}, '', 'AC24: empty stdout (a clean tree)') or diag($res->{stdout});
-    is($res->{rc}, 0, 'AC24: exit 0');
+    # where-things-go package 02-thread-store (specs/02-thread-store-spec.md
+    # 2.8, finding 13): this fixture seeds 80 records (20 blocked + 60 plain)
+    # straight into the flat `task` Store, which now unconditionally fires
+    # one UNMIGRATED-TASKLIST finding -- "clean" here means clean of every
+    # OTHER finding kind (the 20 blocked_on records are no longer scanned for
+    # DANGLING-REF at all; see AC13/AC18 above, already pinning that).
+    my @ac24_findings = parse_findings($res->{stdout});
+    is(scalar(@ac24_findings), 1, 'AC24: exactly 1 finding total') or diag($res->{stdout});
+    my ($ac24_um) = grep { $_->{class} eq 'UNMIGRATED-TASKLIST' } @ac24_findings;
+    ok(defined $ac24_um, 'AC24: the one finding is UNMIGRATED-TASKLIST') or diag($res->{stdout});
+    if ($ac24_um) {
+        is($ac24_um->{scope}, 'project', 'AC24: UNMIGRATED-TASKLIST scope is project');
+        is($ac24_um->{type}, 'task', 'AC24: UNMIGRATED-TASKLIST type is task');
+        like($ac24_um->{detail}, qr/the flat tasklist holds 80 record\(s\) not yet migrated to threads/,
+            'AC24: UNMIGRATED-TASKLIST detail names the count (80 = 20 blocked + 60 plain)');
+    } else {
+        fail('AC24: UNMIGRATED-TASKLIST scope is project');
+        fail('AC24: UNMIGRATED-TASKLIST type is task');
+        fail('AC24: UNMIGRATED-TASKLIST detail names the count (80 = 20 blocked + 60 plain)');
+    }
+    is($res->{rc}, 1, 'AC24: exit 1 (UNMIGRATED-TASKLIST only)');
 }
 
 # =============================================================================
@@ -1453,6 +1900,146 @@ use File::Basename ();
             ok(-f $script, "AC28: $about names a script that exists ($script)");
         }
     }
+}
+
+# =============================================================================
+# NEW (blueprint where-things-go, package 03-thread-sessions, specs/
+# 03-thread-sessions-spec.md section 2.12): almanac-doctor.pl warns on
+# STDERR, once, when butler is not installed beside almanac -- never a
+# finding (exit code unaffected). Almanac::SessionLive.pm does not exist yet,
+# so every assertion in this block is expected to fail for exactly that
+# reason until package 03 lands.
+# =============================================================================
+{
+    # Negative case: in THIS repo's real layout, butler IS a sibling of
+    # almanac -- doctor must print no such warning.
+    my $r = run_doctor(args => ['--root', mk_root()]);
+    unlike($r->{stderr}, qr/butler is not installed beside almanac/,
+        'package 03 AC12: with butler present (this repo\'s real layout), doctor prints no absent-butler warning');
+}
+{
+    # Positive case: a copy of plugins/almanac with no butler/ sibling.
+    my $copyroot = tempdir(CLEANUP => 1); $copyroot =~ s{\\}{/}g;
+    (my $src_abs = abs_path("$S/..")) =~ s{\\}{/}g; # plugins/almanac
+    my $dest = "$copyroot/plugins/almanac";
+    make_path($dest);
+    my @files;
+    require File::Find;
+    File::Find::find(sub { push @files, $File::Find::name if -f $_ }, $src_abs);
+    for my $f (@files) {
+        (my $norm = $f) =~ s{\\}{/}g;
+        (my $rel = $norm) =~ s/\A\Q$src_abs\E//;
+        next if $rel =~ m{^/tests/};
+        my $destf = "$dest$rel";
+        make_path(File::Basename::dirname($destf));
+        require File::Copy;
+        File::Copy::copy($f, $destf);
+    }
+    ok(!-d "$copyroot/plugins/butler", 'package 03 AC12 fixture: no butler/ sibling exists beside the copy');
+    SKIP: {
+        skip 'package 03 AC12: copy of almanac-doctor.pl missing', 2
+            unless -f "$dest/scripts/almanac-doctor.pl";
+        my $ROOT = mk_root();
+        my $res = run_child([ $^X, "$dest/scripts/almanac-doctor.pl", '--root', $ROOT ],
+            env => { ALMANAC_HOME => $ROOT, HOME => $ROOT, USERPROFILE => $ROOT });
+        like($res->{stderr},
+            qr/almanac doctor: warning: butler is not installed beside almanac \(.*BpHook\.pm not found\); thread writes are not gated against subagents/,
+            'package 03 AC12: the copied almanac-doctor.pl prints the exact 2.12 warning text') or diag($res->{stderr});
+    }
+}
+
+# =============================================================================
+# REGRESSION (blueprint tooling-backlog, package 13-almanac-decision-
+# relative-path; almanac bug 20261001-184636-75fe; no architect spec --
+# Decision 65, mechanical fix): almanac-doctor.pl, almanac-bug.pl,
+# almanac-migrate-todos.pl and almanac-migrate-memories.pl, invoked by their
+# everyday RELATIVE path from the repo root (the bug report's exact repro
+# style: `perl plugins/almanac/scripts/<name>.pl ...`), must never fail with
+# perl's "Can't locate ... in @INC". almanac-doctor.pl's BEGIN block derives
+# $NOTE_PL/$BUG_PL as "$DIR/almanac-note.pl"/"$DIR/almanac-bug.pl" from
+# (possibly relative) __FILE__ and `require`s both (almanac-doctor.pl:30-39,
+# 46-50) -- the exact doubled-join defect the bug report describes for
+# almanac-decision.pl's sibling require, so this is the PRIMARY failing
+# assertion in this file before the fix lands. almanac-bug.pl,
+# almanac-migrate-todos.pl and almanac-migrate-memories.pl's own BEGIN
+# blocks are bareword-only (`use Module::Name ()`, no sibling-SCRIPT
+# require) and already pass for a harmless read verb; they are asserted
+# here too so the fix (touching every BEGIN block named by the ledger's
+# write_set) cannot regress them. almanac-bug.pl's SEPARATE
+# _butler_module_path()->require($bphook_path) relative-sibling defect is
+# only reached from the ticket-gated set-status/takeover verbs, not the
+# harmless "list" used here -- out of scope for this block (ledger's "fix
+# every instance found" covers it regardless of whether a dedicated test
+# invokes that exact gated path).
+# =============================================================================
+{
+    # run_relative(\@cmd, %opt) -- same fork()+exec() + per-stream-tempfile
+    # discipline as run_child() above, but the CHILD additionally chdir()s to
+    # $REPO_ROOT first, and the command's script path is given RELATIVE
+    # (never resolved to absolute) -- reproducing the bug report's literal
+    # invocation style. This process's own cwd is never touched.
+    sub run_relative {
+        my ($cmd, %opt) = @_;
+        my (undef, $outfile) = tempfile();
+        my (undef, $errfile) = tempfile();
+        my $pid = fork();
+        die "fork: $!" unless defined $pid;
+        if ($pid == 0) {
+            chdir($REPO_ROOT) or exit(125);
+            delete $ENV{CLAUDE_PROJECT_DIR};
+            delete $ENV{CCPRAXIS_DATA_DIR};
+            delete $ENV{BP_PROJECT_ROOT};
+            delete $ENV{BP_LEDGER};
+            delete $ENV{ALMANAC_SURFACE};
+            delete $ENV{ALMANAC_LOCK_TIMEOUT_MS};
+            if ($opt{env}) {
+                for my $k (keys %{ $opt{env} }) {
+                    if (defined $opt{env}{$k}) { $ENV{$k} = $opt{env}{$k} } else { delete $ENV{$k} }
+                }
+            }
+            open(STDOUT, '>', $outfile) or exit(126);
+            open(STDERR, '>', $errfile) or exit(126);
+            open(STDIN, '<', File::Spec->devnull) or exit(126);
+            exec(@$cmd) or exit(127);
+        }
+        waitpid($pid, 0);
+        my $rc = $? >> 8;
+        return { rc => $rc, stdout => (slurp_raw($outfile) // ''), stderr => (slurp_raw($errfile) // '') };
+    }
+
+    my $CANT_LOCATE_RE = qr/Can't locate \S+ in \@INC/;
+
+    my $Rd = mk_root();
+    my $rdoc = run_relative([ $^X, 'plugins/almanac/scripts/almanac-doctor.pl', '--root', $Rd ],
+        env => { ALMANAC_HOME => $Rd, HOME => $Rd, USERPROFILE => $Rd });
+    unlike($rdoc->{stdout} . $rdoc->{stderr}, $CANT_LOCATE_RE,
+        'REGRESSION (75fe): almanac-doctor.pl by RELATIVE path from the repo root never fails "Can\'t locate ... in @INC"')
+        or diag("rc=$rdoc->{rc}\nstdout:\n$rdoc->{stdout}\nstderr:\n$rdoc->{stderr}");
+    is($rdoc->{rc}, 0, 'REGRESSION (75fe): almanac-doctor.pl on a clean empty --root exits 0 via relative invocation')
+        or diag("stdout:\n$rdoc->{stdout}\nstderr:\n$rdoc->{stderr}");
+
+    my $Rb = mk_root();
+    my $rbug = run_relative([ $^X, 'plugins/almanac/scripts/almanac-bug.pl', 'list', '--project', $Rb ],
+        env => { ALMANAC_HOME => $Rb, HOME => $Rb, USERPROFILE => $Rb });
+    unlike($rbug->{stdout} . $rbug->{stderr}, $CANT_LOCATE_RE,
+        'REGRESSION (75fe): almanac-bug.pl by RELATIVE path from the repo root never fails "Can\'t locate ... in @INC" (harmless "list" verb)')
+        or diag("rc=$rbug->{rc}\nstdout:\n$rbug->{stdout}\nstderr:\n$rbug->{stderr}");
+    is($rbug->{rc}, 0, 'REGRESSION (75fe): almanac-bug.pl "list" on an empty --project exits 0 via relative invocation')
+        or diag("stdout:\n$rbug->{stdout}\nstderr:\n$rbug->{stderr}");
+
+    my $Rmt = mk_root();
+    my $rmt = run_relative([ $^X, 'plugins/almanac/scripts/almanac-migrate-todos.pl', '--home', $Rmt ]);
+    unlike($rmt->{stdout} . $rmt->{stderr}, $CANT_LOCATE_RE,
+        'REGRESSION (75fe): almanac-migrate-todos.pl by RELATIVE path from the repo root never fails "Can\'t locate ... in @INC"')
+        or diag("rc=$rmt->{rc}\nstdout:\n$rmt->{stdout}\nstderr:\n$rmt->{stderr}");
+
+    my $Rmm = mk_root();
+    my $rmm = run_relative([ $^X, 'plugins/almanac/scripts/almanac-migrate-memories.pl', 'plan', '--home', $Rmm ]);
+    unlike($rmm->{stdout} . $rmm->{stderr}, $CANT_LOCATE_RE,
+        'REGRESSION (75fe): almanac-migrate-memories.pl by RELATIVE path from the repo root never fails "Can\'t locate ... in @INC"')
+        or diag("rc=$rmm->{rc}\nstdout:\n$rmm->{stdout}\nstderr:\n$rmm->{stderr}");
+    is($rmm->{rc}, 0, 'REGRESSION (75fe): almanac-migrate-memories.pl "plan" on an empty --home exits 0 via relative invocation')
+        or diag("stdout:\n$rmm->{stdout}\nstderr:\n$rmm->{stderr}");
 }
 
 # =============================================================================

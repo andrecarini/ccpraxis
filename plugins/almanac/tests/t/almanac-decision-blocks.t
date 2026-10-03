@@ -13,6 +13,20 @@
 # module is wrapped in eval{} / run_cli() so "Undefined subroutine" / "Can't
 # open perl script" is a caught, reported failure for THIS assertion rather
 # than an abort of the whole file.
+#
+# REPURPOSED (blueprint where-things-go, package 02-thread-store):
+# almanac-task.pl's CLI is retired; blocked_tasks()'s B1/B2/B3 fixtures now
+# create their tasks through almanac-thread.pl (a thread named `blk`), since
+# almanac-inbox.pl::blocked_tasks() already scans BOTH the flat task store
+# (B7's ownership-boundary grep is unchanged -- it still names
+# Almanac::Task::list_tasks for the flat half) AND every thread's tasks
+# (almanac-inbox.pl:403-428); a thread task's key is the compound
+# "<threadname>/<taskid>" (almanac-inbox.pl:419), never a bare task id, so
+# every comparison below uses that compound key.
+#
+# EDITED further for blueprint where-things-go, package 03-thread-sessions
+# (Decision 18 F6): a hard ticket gate lands on every almanac-thread.pl
+# write verb -- run_thread() mints one for the exact argv of each call.
 use strict;
 use warnings;
 use FindBin qw($Bin);
@@ -26,8 +40,16 @@ use Scalar::Util qw(refaddr);
 use POSIX ();
 
 (my $S = "$Bin/../../scripts") =~ s{\\}{/}g;
-my $DECISION_PL = "$S/almanac-decision.pl";
+my $INBOX_PL = "$S/almanac-inbox.pl";
 my $TASK_PL     = "$S/almanac-task.pl";
+my $THREAD_PL   = "$S/almanac-thread.pl";
+
+# blueprint where-things-go, package 03-thread-sessions (Decision 18 F6): a
+# hard ticket gate lands on every almanac-thread.pl write verb. run_thread()
+# mints one for the EXACT argv of each call so this file's fixtures keep
+# working once that gate exists -- pure migration, not new behaviour.
+(my $DB_BUTLER_SCRIPTS = "$Bin/../../../butler/scripts") =~ s{\\}{/}g;
+my $DB_TICKET_SEQ = 0;
 
 my $FILE_HOME = tempdir(CLEANUP => 1);
 $FILE_HOME =~ s{\\}{/}g;
@@ -38,6 +60,9 @@ delete local $ENV{CLAUDE_PROJECT_DIR};
 delete local $ENV{CCPRAXIS_DATA_DIR};
 delete local $ENV{BP_PROJECT_ROOT};
 delete local $ENV{CLAUDE_CODE_SESSION_ID};
+my $DB_BSD = tempdir(CLEANUP => 1); $DB_BSD =~ s{\\}{/}g;
+local $ENV{BUTLER_STATE_DIR} = $DB_BSD;
+require "$DB_BUTLER_SCRIPTS/BpHook.pm" unless grep { m{(?:^|/)BpHook\.pm$} } keys %INC;
 
 # ---------------------------------------------------------------------------
 # scaffolding
@@ -113,8 +138,20 @@ sub run_cli {
     my $err = slurp_text($errpath);
     return { rc => $rc, out => (defined $out ? $out : ''), err => (defined $err ? $err : '') };
 }
-sub run_dec  { return run_cli($DECISION_PL, @_) }
+sub run_dec  { return run_cli($INBOX_PL, @_) }
 sub run_task { return run_cli($TASK_PL, @_) }
+sub _mint_thread_ticket {
+    my (@argv) = @_;
+    local $ENV{BUTLER_STATE_DIR} = $DB_BSD;
+    BpHook::write_ticket(
+        { session_id => 'FIXTURE-SESSION', tool_use_id => 'FT' . (++$DB_TICKET_SEQ),
+          transcript_path => undef, cwd => '/fixture' },
+        'almanac-thread', [ @argv ]);
+}
+sub run_thread {
+    _mint_thread_ticket(@_);
+    return run_cli($THREAD_PL, @_);
+}
 
 sub field0 {
     my ($text, $key) = @_;
@@ -137,8 +174,9 @@ sub decode_json_or_undef {
     return eval { JSON::PP->new->decode($text) };
 }
 
-sub decision_dir_for { return norm_path($_[0]) . '/.ccpraxis-local-data/almanac/decision' }
+sub inbox_dir_for { return norm_path($_[0]) . '/.ccpraxis-local-data/almanac/inbox' }
 sub task_dir_for     { return norm_path($_[0]) . '/.ccpraxis-local-data/almanac/task' }
+sub thread_tasks_dir_for { return norm_path($_[0]) . "/.ccpraxis-local-data/almanac/thread-tasks-$_[1]" }
 
 sub md_files_in {
     my ($dir) = @_;
@@ -156,7 +194,7 @@ sub parse_traversal {
     my ($text) = @_;
     return {} unless defined $text;
     my %out = (
-        decision        => field0($text, 'decision'),
+        item            => field0($text, 'item'),
         tasks_available => field0($text, 'tasks_available'),
         tasks_reason    => field0($text, 'tasks_reason'),
         blocked_total   => field0($text, 'blocked_total'),
@@ -202,21 +240,21 @@ sub live_almanac_listing {
 }
 my $live_listing_before = live_almanac_listing();
 
-ok(-f $DECISION_PL, 'almanac-decision.pl exists at plugins/almanac/scripts/almanac-decision.pl')
-    or diag('almanac-decision.pl is not present yet -- every assertion below is '
+ok(-f $INBOX_PL, 'almanac-inbox.pl exists at plugins/almanac/scripts/almanac-inbox.pl')
+    or diag('almanac-inbox.pl is not present yet -- every assertion below is '
           . 'expected to fail for exactly that reason, not any other.');
 
-# In-process calls load almanac-decision.pl ONLY (spec: it brings
+# In-process calls load almanac-inbox.pl ONLY (spec: it brings
 # Almanac::Task with it via require of the sibling script at compile time --
 # this file must not also `do` almanac-task.pl).
-do $DECISION_PL if -f $DECISION_PL;
+do $INBOX_PL if -f $INBOX_PL;
 
 # =============================================================================
 # B7 -- ownership boundary, by grep. Run whether or not the script loaded.
 # =============================================================================
 {
-    if (-f $DECISION_PL) {
-        my @lines = read_all_lines($DECISION_PL);
+    if (-f $INBOX_PL) {
+        my @lines = read_all_lines($INBOX_PL);
         my @list_tasks_hits = grep { /Almanac::Task::list_tasks/ } @lines;
         my @task_type_hits  = grep { /type\s*=>\s*'task'/ } @lines;
         my @writeish_hits   = grep { /blocked_on/ && /(?:->update\(|->create\(|\bset\s*=>|\bunset\s*=>)/ } @lines;
@@ -256,23 +294,26 @@ my (%task_bytes_before, %task_bytes_after_b1, %task_bytes_after_obsolete, %task_
     $D2_id = field0($rd2->{out}, 'id');
     ok(defined $D2_id, 'B1 fixture: file D2 succeeds') or diag("stderr: $rd2->{err}");
 
-    my $rt1 = run_task('add', '--title', 'T1', '--blocked-on', $D_id, '--root', $ROOT);
-    $T1_id = field0($rt1->{out}, 'id');
+    my $rblk = run_thread('create', 'blk', '--root', $ROOT);
+    is($rblk->{rc}, 0, 'B1 fixture: create thread blk succeeds') or diag("stderr: $rblk->{err}");
+
+    my $rt1 = run_thread('add', 'blk', '--title', 'T1', '--blocked-on', $D_id, '--root', $ROOT);
+    $T1_id = field0($rt1->{out}, 'task');
     ok(defined $T1_id, 'B1 fixture: add T1 --blocked-on D succeeds') or diag("stderr: $rt1->{err}");
 
-    my $rt2 = run_task('add', '--title', 'T2', '--blocked-on', $D_id, '--root', $ROOT);
-    $T2_id = field0($rt2->{out}, 'id');
+    my $rt2 = run_thread('add', 'blk', '--title', 'T2', '--blocked-on', $D_id, '--root', $ROOT);
+    $T2_id = field0($rt2->{out}, 'task');
     ok(defined $T2_id, 'B1 fixture: add T2 --blocked-on D succeeds') or diag("stderr: $rt2->{err}");
 
-    my $rt3 = run_task('add', '--title', 'T3', '--blocked-on', $D2_id, '--root', $ROOT);
-    $T3_id = field0($rt3->{out}, 'id');
+    my $rt3 = run_thread('add', 'blk', '--title', 'T3', '--blocked-on', $D2_id, '--root', $ROOT);
+    $T3_id = field0($rt3->{out}, 'task');
     ok(defined $T3_id, 'B1 fixture: add T3 --blocked-on D2 succeeds') or diag("stderr: $rt3->{err}");
 
-    my $rt4 = run_task('add', '--title', 'T4', '--root', $ROOT);
-    $T4_id = field0($rt4->{out}, 'id');
+    my $rt4 = run_thread('add', 'blk', '--title', 'T4', '--root', $ROOT);
+    $T4_id = field0($rt4->{out}, 'task');
     ok(defined $T4_id, 'B1 fixture: add T4 (unblocked) succeeds') or diag("stderr: $rt4->{err}");
 
-    my $tdir = task_dir_for($ROOT);
+    my $tdir = thread_tasks_dir_for($ROOT, 'blk');
     for my $id ($T1_id, $T2_id, $T3_id, $T4_id) {
         next unless defined $id;
         $task_bytes_before{$id} = slurp_raw("$tdir/$id.md");
@@ -292,10 +333,10 @@ my (%task_bytes_before, %task_bytes_after_b1, %task_bytes_after_obsolete, %task_
     is($trav1->{dangling_total}, '0', 'B1: dangling_total: 0');
     is(scalar(@{ $trav1->{groups} }), 2, 'B1: exactly two blocked_task groups are printed');
     if (@{ $trav1->{groups} } == 2) {
-        is($trav1->{groups}[0]{task}, $T1_id, 'B1: T1 is the first blocked_task group (task list order)');
+        is($trav1->{groups}[0]{task}, "blk/$T1_id", 'B1: T1 is the first blocked_task group (task list order)');
         is($trav1->{groups}[0]{ref}, 'live', 'B1: T1\'s group reports ref: live');
         is($trav1->{groups}[0]{title}, 'T1', 'B1: T1\'s group reports its title');
-        is($trav1->{groups}[1]{task}, $T2_id, 'B1: T2 is the second blocked_task group');
+        is($trav1->{groups}[1]{task}, "blk/$T2_id", 'B1: T2 is the second blocked_task group');
         is($trav1->{groups}[1]{ref}, 'live', 'B1: T2\'s group reports ref: live');
         is($trav1->{groups}[1]{title}, 'T2', 'B1: T2\'s group reports its title');
     } else {
@@ -306,8 +347,8 @@ my (%task_bytes_before, %task_bytes_after_b1, %task_bytes_after_obsolete, %task_
         );
     }
     my @named = map { $_->{task} } @{ $trav1->{groups} };
-    ok(!(grep { $_ eq $T3_id } @named), 'B1: T3 (blocked on D2, not D) is absent from the traversal');
-    ok(!(grep { $_ eq $T4_id } @named), 'B1: T4 (unblocked) is absent from the traversal');
+    ok(!(grep { $_ eq "blk/$T3_id" } @named), 'B1: T3 (blocked on D2, not D) is absent from the traversal');
+    ok(!(grep { $_ eq "blk/$T4_id" } @named), 'B1: T4 (unblocked) is absent from the traversal');
 
     for my $id ($T1_id, $T2_id, $T3_id, $T4_id) {
         next unless defined $id;
@@ -318,11 +359,11 @@ my (%task_bytes_before, %task_bytes_after_b1, %task_bytes_after_obsolete, %task_
     # B2 -- obsolete T2; blocks D now reports it dangling; blocks --json
     # agrees; repeating the same answer is a no-op with the same traversal.
     # -------------------------------------------------------------------
-    my $robs = run_task('status', $T2_id, 'obsoleted', '--root', $ROOT);
-    is($robs->{rc}, 0, 'B2 fixture: almanac-task.pl status T2 obsoleted exits 0') or diag("stderr: $robs->{err}");
+    my $robs = run_thread('status', 'blk', $T2_id, 'obsoleted', '--root', $ROOT);
+    is($robs->{rc}, 0, 'B2 fixture: almanac-thread.pl status blk T2 obsoleted exits 0') or diag("stderr: $robs->{err}");
     # Decision 24 (3): T2 is the dangling task, the most interesting one
     # (review m8) -- snapshot it right after its OWN legitimate change (via
-    # almanac-task.pl's own `status` verb) so B6 can guard it across every
+    # almanac-thread.pl's own `status` verb) so B6 can guard it across every
     # subsequent decision-script call in this block.
     $task_bytes_after_obsolete{$T2_id} = slurp_raw("$tdir/$T2_id.md") if defined $T2_id;
 
@@ -331,9 +372,9 @@ my (%task_bytes_before, %task_bytes_after_b1, %task_bytes_after_obsolete, %task_
     my $trav2 = parse_traversal($rblocks->{out});
     is($trav2->{blocked_total}, '2', 'B2: blocked_total: 2 (T1 and T2 still both present)');
     is($trav2->{dangling_total}, '1', 'B2: dangling_total: 1 (T2 alone)');
-    my ($t2grp) = grep { $_->{task} eq $T2_id } @{ $trav2->{groups} };
+    my ($t2grp) = grep { $_->{task} eq "blk/$T2_id" } @{ $trav2->{groups} };
     is(ref($t2grp) eq 'HASH' ? $t2grp->{ref} : undef, 'dangling', 'B2: T2\'s group now reports ref: dangling');
-    my ($t1grp) = grep { $_->{task} eq $T1_id } @{ $trav2->{groups} };
+    my ($t1grp) = grep { $_->{task} eq "blk/$T1_id" } @{ $trav2->{groups} };
     is(ref($t1grp) eq 'HASH' ? $t1grp->{ref} : undef, 'live', 'B2: T1\'s group still reports ref: live');
 
     my $rblocksj = run_dec('blocks', $D_id, '--json', '--root', $ROOT);
@@ -341,12 +382,12 @@ my (%task_bytes_before, %task_bytes_after_b1, %task_bytes_after_obsolete, %task_
     my $decoded = decode_json_or_undef($rblocksj->{out});
     ok(ref($decoded) eq 'HASH', 'B2: blocks --json decodes to a hash') or diag("raw: $rblocksj->{out}");
     if (ref($decoded) eq 'HASH') {
-        is($decoded->{decision}, $D_id, 'B2 --json: decision equals D');
+        is($decoded->{item}, $D_id, 'B2 --json: item equals D');
         is($decoded->{tasks_available} ? 1 : 0, 1, 'B2 --json: tasks_available is true');
         my $blocked = $decoded->{blocked};
         is(ref($blocked) eq 'ARRAY' ? scalar(@$blocked) : -1, 2, 'B2 --json: blocked has exactly two entries');
         if (ref($blocked) eq 'ARRAY') {
-            my ($jt2) = grep { $_->{id} eq $T2_id } @$blocked;
+            my ($jt2) = grep { $_->{id} eq "blk/$T2_id" } @$blocked;
             is(ref($jt2) eq 'HASH' ? $jt2->{ref} : undef, 'dangling', 'B2 --json: T2\'s entry reports ref: dangling');
         }
     }
@@ -369,20 +410,20 @@ my (%task_bytes_before, %task_bytes_after_b1, %task_bytes_after_obsolete, %task_
 # hashref (refaddr) as T2's entry in tasks.
 # =============================================================================
 {
-    my $report = eval { Almanac::Decision::blocked_tasks($D_id, root => $ROOT) };
+    my $report = eval { Almanac::Inbox::blocked_tasks($D_id, root => $ROOT) };
     ok(!$@, 'B3: blocked_tasks(D) in-process does not die') or diag("error: $@");
     ok(ref($report) eq 'HASH', 'B3: blocked_tasks returns a hashref') or diag('not a hashref');
     if (ref($report) eq 'HASH') {
-        is_deeply([sort keys %$report], [sort qw(decision available reason tasks dangling)],
-            'B3: the report has exactly decision/available/reason/tasks/dangling');
-        is($report->{decision}, $D_id, 'B3: decision equals D');
+        is_deeply([sort keys %$report], [sort qw(item available reason tasks dangling)],
+            'B3: the report has exactly item/available/reason/tasks/dangling');
+        is($report->{item}, $D_id, 'B3: item equals D');
         is($report->{available}, 1, 'B3: available == 1');
         is($report->{reason}, 'ok', 'B3: reason == ok');
         my $tasks = $report->{tasks};
         is(ref($tasks) eq 'ARRAY' ? scalar(@$tasks) : -1, 2, 'B3: tasks has exactly two entries (T1, T2)');
         if (ref($tasks) eq 'ARRAY') {
-            my ($e1) = grep { $_->{task} eq $T1_id } @$tasks;
-            my ($e2) = grep { $_->{task} eq $T2_id } @$tasks;
+            my ($e1) = grep { $_->{task} eq "blk/$T1_id" } @$tasks;
+            my ($e2) = grep { $_->{task} eq "blk/$T2_id" } @$tasks;
             ok(defined $e1, 'B3: T1 has a tasks entry');
             ok(defined $e2, 'B3: T2 has a tasks entry');
             is_deeply([sort keys %$e1], [sort qw(task status title ref)], 'B3: a tasks entry has exactly task/status/title/ref') if $e1;
@@ -398,8 +439,8 @@ my (%task_bytes_before, %task_bytes_after_b1, %task_bytes_after_obsolete, %task_
         }
     } else {
         fail("B3: $_") for (
-            'the report has exactly decision/available/reason/tasks/dangling',
-            'decision equals D', 'available == 1', 'reason == ok', 'tasks has exactly two entries (T1, T2)',
+            'the report has exactly item/available/reason/tasks/dangling',
+            'item equals D', 'available == 1', 'reason == ok', 'tasks has exactly two entries (T1, T2)',
         );
     }
 }
@@ -411,7 +452,7 @@ my (%task_bytes_before, %task_bytes_after_b1, %task_bytes_after_obsolete, %task_
 {
     my $ROOT4 = tempdir(CLEANUP => 1);
     $ROOT4 =~ s{\\}{/}g;
-    my $rec4 = eval { Almanac::Decision::file(root => $ROOT4, title => 'B4 decision, no task store') };
+    my $rec4 = eval { Almanac::Inbox::file(root => $ROOT4, title => 'B4 decision, no task store') };
     ok(!$@ && defined($rec4), 'B4 fixture: a decision exists, no task store directory was ever created')
         or diag("error: $@");
     my $id4 = ref($rec4) eq 'HASH' ? $rec4->{id} : 'MISSING-B4';
@@ -428,7 +469,7 @@ my (%task_bytes_before, %task_bytes_after_b1, %task_bytes_after_obsolete, %task_
     is($rblocksu->{rc}, 2, 'B4/item19: blocks UNKNOWN exits 2') or diag("stderr: $rblocksu->{err}");
     is(err_kind($rblocksu->{err}), 'not_found', 'B4/item19: ...kind: not_found');
 
-    my $reportu = eval { Almanac::Decision::blocked_tasks('no-such-decision-id', root => $ROOT4) };
+    my $reportu = eval { Almanac::Inbox::blocked_tasks('no-such-decision-id', root => $ROOT4) };
     ok(!$@, 'B4/item19: blocked_tasks(UNKNOWN) in-process does not die') or diag("error: $@");
     is(ref($reportu) eq 'HASH' ? $reportu->{available} : undef, 1,
        'B4/item19: blocked_tasks(UNKNOWN) still traverses (available == 1) -- it never checks decision existence');
@@ -440,7 +481,7 @@ my (%task_bytes_before, %task_bytes_after_b1, %task_bytes_after_obsolete, %task_
 {
     my $ROOT5 = tempdir(CLEANUP => 1);
     $ROOT5 =~ s{\\}{/}g;
-    my $rec5 = eval { Almanac::Decision::file(root => $ROOT5, title => 'B5 decision') };
+    my $rec5 = eval { Almanac::Inbox::file(root => $ROOT5, title => 'B5 decision') };
     ok(!$@ && defined($rec5), 'B5 fixture: a decision exists') or diag("error: $@");
     my $id5 = ref($rec5) eq 'HASH' ? $rec5->{id} : 'MISSING-B5';
 
@@ -456,7 +497,7 @@ my (%task_bytes_before, %task_bytes_after_b1, %task_bytes_after_obsolete, %task_
     is($trav5->{blocked_total}, '0', 'B5: blocked_total: 0');
     is($trav5->{dangling_total}, '0', 'B5: dangling_total: 0');
 
-    my $ddir5 = decision_dir_for($ROOT5);
+    my $ddir5 = inbox_dir_for($ROOT5);
     my @dkeys;
     if (open(my $fh, '<', "$ddir5/$id5.md")) {
         local $/;
@@ -467,7 +508,7 @@ my (%task_bytes_before, %task_bytes_after_b1, %task_bytes_after_obsolete, %task_
     is($dkeys[0], 'answered', 'B5: the decision itself was committed as answered on disk') if @dkeys;
     ok(@dkeys, 'B5: the decision record on disk carries a status field') unless @dkeys;
 
-    my $report5 = eval { Almanac::Decision::blocked_tasks($id5, root => $ROOT5) };
+    my $report5 = eval { Almanac::Inbox::blocked_tasks($id5, root => $ROOT5) };
     ok(!$@, 'B5: blocked_tasks() in-process does not die on a malformed task store') or diag("error: $@");
     is(ref($report5) eq 'HASH' ? $report5->{available} : undef, 0, 'B5: blocked_tasks() reports available == 0');
     is(ref($report5) eq 'HASH' ? $report5->{reason} : undef, 'malformed', 'B5: blocked_tasks() reports reason == malformed');
@@ -534,7 +575,7 @@ my (%task_bytes_before, %task_bytes_after_b1, %task_bytes_after_obsolete, %task_
 {
     my $ROOTM1 = tempdir(CLEANUP => 1);
     $ROOTM1 =~ s{\\}{/}g;
-    my $recm1 = eval { Almanac::Decision::file(root => $ROOTM1, title => 'm1 pin target') };
+    my $recm1 = eval { Almanac::Inbox::file(root => $ROOTM1, title => 'm1 pin target') };
     ok(!$@ && defined($recm1), 'm1 fixture: a decision exists') or diag("error: $@");
     my $idm1 = ref($recm1) eq 'HASH' ? $recm1->{id} : 'MISSING-M1';
 
@@ -542,12 +583,72 @@ my (%task_bytes_before, %task_bytes_after_b1, %task_bytes_after_obsolete, %task_
     {
         no warnings 'redefine';
         local *Almanac::Task::list_tasks = sub { die bless({}, 'Almanac::Store::Error') };
-        $report = eval { Almanac::Decision::blocked_tasks($idm1, root => $ROOTM1) };
+        $report = eval { Almanac::Inbox::blocked_tasks($idm1, root => $ROOTM1) };
     }
     ok(!$@, 'm1 (review): blocked_tasks() does not die when list_tasks() throws an error object whose stringification is false')
         or diag("error: " . (defined($@) ? "$@" : '(undef)'));
     is(ref($report) eq 'HASH' ? $report->{available} : undef, 0,
        'm1 (review): ...and reports available == 0 -- never a silently wrong available => 1, reason => ok');
+}
+
+# =============================================================================
+# REGRESSION (blueprint tooling-backlog, package 13-almanac-decision-
+# relative-path; almanac bug 20261001-184636-75fe; no architect spec --
+# Decision 65, mechanical fix): almanac-inbox.pl and almanac-task.pl, invoked
+# by their everyday RELATIVE path from the repo root, must never fail with
+# perl's "Can't locate ... in @INC". almanac-inbox.pl's BEGIN block derives
+# $TASK_PL as "$dir/almanac-task.pl" from (possibly relative) __FILE__ and
+# `require`s it (almanac-inbox.pl:26-32/44) -- the exact doubled-join defect
+# the bug report describes for almanac-decision.pl's sibling require, so
+# this is the PRIMARY failing assertion in this file before the fix lands.
+# almanac-task.pl's own BEGIN block is bareword-only (no sibling-SCRIPT
+# require) and already passes; it is asserted here too so the fix (touching
+# every BEGIN block named by the ledger's write_set) cannot regress it.
+# =============================================================================
+{
+    (my $REPO_ROOT = Cwd::abs_path("$Bin/../../../..")) =~ s{\\}{/}g;
+    ok(-d "$REPO_ROOT/plugins/almanac/scripts", 'REGRESSION precondition: REPO_ROOT resolves to the repo checkout')
+        or BAIL_OUT("REPO_ROOT does not look like the repo root: $REPO_ROOT");
+
+    # run_cli_relative($rel_script, @args) -> { rc, out, err } -- same
+    # fork()+exec(LIST) discipline as run_cli() above (no shell string), but
+    # the CHILD chdir()s to $REPO_ROOT first and $rel_script is a RELATIVE
+    # path resolved against that cwd -- this process's own cwd is never
+    # touched. Reproduces the bug report's literal invocation style.
+    sub run_cli_relative {
+        my ($rel_script, @args) = @_;
+        my (undef, $outpath) = tempfile(UNLINK => 1);
+        my (undef, $errpath) = tempfile(UNLINK => 1);
+        my $pid = fork();
+        die "run_cli_relative: fork() failed: $!" unless defined $pid;
+        if ($pid == 0) {
+            chdir($REPO_ROOT) or POSIX::_exit(125);
+            open(STDOUT, '>', $outpath) or POSIX::_exit(126);
+            open(STDERR, '>', $errpath) or POSIX::_exit(126);
+            exec($^X, $rel_script, @args) or POSIX::_exit(127);
+        }
+        waitpid($pid, 0);
+        my $rc = $? >> 8;
+        my $out = slurp_text($outpath);
+        my $err = slurp_text($errpath);
+        return { rc => $rc, out => (defined $out ? $out : ''), err => (defined $err ? $err : '') };
+    }
+
+    my $CANT_LOCATE_RE = qr/Can't locate \S+ in \@INC/;
+
+    my $ROOTrel1 = tempdir(CLEANUP => 1); $ROOTrel1 =~ s{\\}{/}g;
+    my $ri = run_cli_relative('plugins/almanac/scripts/almanac-inbox.pl', 'list', '--root', $ROOTrel1);
+    unlike($ri->{out} . $ri->{err}, $CANT_LOCATE_RE,
+        'REGRESSION (75fe): almanac-inbox.pl by RELATIVE path from the repo root never fails "Can\'t locate ... in @INC"')
+        or diag("rc=$ri->{rc}\nout:\n$ri->{out}\nerr:\n$ri->{err}");
+    is($ri->{rc}, 0, 'REGRESSION (75fe): almanac-inbox.pl "list" on an empty --root exits 0 via relative invocation')
+        or diag("out:\n$ri->{out}\nerr:\n$ri->{err}");
+
+    my $ROOTrel2 = tempdir(CLEANUP => 1); $ROOTrel2 =~ s{\\}{/}g;
+    my $rt = run_cli_relative('plugins/almanac/scripts/almanac-task.pl', 'list', '--root', $ROOTrel2);
+    unlike($rt->{out} . $rt->{err}, $CANT_LOCATE_RE,
+        'REGRESSION (75fe): almanac-task.pl by RELATIVE path from the repo root never fails "Can\'t locate ... in @INC"')
+        or diag("rc=$rt->{rc}\nout:\n$rt->{out}\nerr:\n$rt->{err}");
 }
 
 # =============================================================================
