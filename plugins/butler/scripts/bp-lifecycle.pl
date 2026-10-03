@@ -78,6 +78,7 @@ use Getopt::Long qw(GetOptionsFromArray);
 use File::Path qw(make_path remove_tree);
 use File::Copy ();
 use File::Spec;
+use Fcntl qw(:flock);
 
 my $SCRIPT_DIR = do {
     # __FILE__, not $0: this file is now requirable (package 05,
@@ -85,8 +86,23 @@ my $SCRIPT_DIR = do {
     # so a sibling require anchored on $0 would resolve against the wrong
     # directory. __FILE__ is always this file's own path, in every mode.
     my $p = __FILE__;
-    $p =~ s{[\\/][^\\/]+\z}{};
-    $p = '.' unless length $p;
+    if ($p =~ m{[\\/]}) {
+        $p =~ s{[\\/][^\\/]+\z}{};
+        $p = '.' unless length $p;
+    } elsif (-f $p) {
+        # bare-name invocation (perl bp-lifecycle.pl ...): no separator means
+        # perl resolved it against cwd, so cwd IS the script's directory --
+        # but only when __FILE__ actually names a real file here. Reject the
+        # alternative (red-team 03, L1/L2): fed through stdin or a string
+        # eval, __FILE__ is a sentinel like '-' or '(eval N)' that is NOT a
+        # file on disk, so falling through to '.' would load sibling modules
+        # from an arbitrary, possibly attacker-controlled cwd. No ccpraxis
+        # caller invokes this script that way today, but there's no reason to
+        # leave the door open.
+        $p = '.';
+    } else {
+        die "bp-lifecycle.pl: cannot determine script directory from __FILE__ ('$p'); refusing to guess a sibling-module search path.\n";
+    }
     # ABSOLUTE, and that is load-bearing rather than tidy. `require` with a
     # RELATIVE path searches @INC instead of resolving against cwd, and modern
     # perl (5.26+) no longer carries '.' in @INC -- so the require below died
@@ -244,6 +260,77 @@ sub pid_alive {
     my ($pid) = @_;
     return 0 unless defined $pid && $pid =~ /\A[0-9]+\z/ && $pid > 0;
     return kill(0, $pid) ? 1 : 0;
+}
+
+# Classifies a runs/.orchestrator marker without holding any lock on return:
+# 'absent' (no file), 'free' (an LOCK_SH|LOCK_NB probe succeeded -- nobody
+# holds it), 'held' (the probe lost to a conflicting lock), or 'error' (open
+# or flock failed for any other reason; $err explains). Named so a test can
+# call it directly (spec 12, 2.2) -- never inline this.
+sub marker_probe {
+    my ($path) = @_;
+    my $fh;
+    unless (open($fh, '<', $path)) {
+        return ('absent', undef) if $!{ENOENT};
+        return ('error', "open: $!");
+    }
+    if (flock($fh, LOCK_SH | LOCK_NB)) {
+        flock($fh, LOCK_UN);
+        close $fh;
+        return ('free', undef);
+    }
+    my $held = $!{EWOULDBLOCK} || $!{EAGAIN} || $!{EACCES};
+    my $err  = $!;
+    close $fh;
+    return ('held', undef) if $held;
+    return ('error', "flock: $err");
+}
+
+# The only unlinker of a stale runs/.orchestrator marker. Holds LOCK_EX
+# across the path-identity check and the unlink itself (spec 12, 2.3.1) so a
+# starting orchestrator or a second concurrent reconciler cannot race it.
+# Returns 1 if reconcile_one must return immediately afterward (no repairs
+# 2-4: the removal collided with a starting orchestrator, or the marker was
+# replaced mid-reconcile), 0 if normal flow should continue (removal
+# succeeded or failed outright -- same as today's behaviour).
+sub remove_stale_marker {
+    my ($marker, $r, $why) = @_;
+    my $fh;
+    unless (open($fh, '<', $marker)) {
+        return 0 if $!{ENOENT};
+        push @{ $r->{errors} }, "could not remove stale marker $marker: $!";
+        return 1;
+    }
+    unless (flock($fh, LOCK_EX | LOCK_NB)) {
+        if ($!{EWOULDBLOCK} || $!{EAGAIN} || $!{EACCES}) {
+            close $fh;
+            $r->{live} = 1;
+            $r->{marker_lock} = 'held';
+            push @{ $r->{actions} }, { kind => 'skipped', detail => 'runs/.orchestrator was locked by a starting orchestrator; left in place' };
+            return 1;
+        }
+        my $err = $!;
+        close $fh;
+        push @{ $r->{errors} }, "could not lock stale marker $marker: $err";
+        return 1;
+    }
+    my @path_stat = stat($marker);
+    my @fh_stat   = stat($fh);
+    unless (@path_stat && @fh_stat
+            && $path_stat[0] == $fh_stat[0] && $path_stat[1] == $fh_stat[1]) {
+        flock($fh, LOCK_UN);
+        close $fh;
+        push @{ $r->{actions} }, { kind => 'skipped', detail => 'runs/.orchestrator was replaced during reconcile; left in place' };
+        return 1;
+    }
+    if (unlink $marker) {
+        push @{ $r->{actions} }, { kind => 'stale_marker', detail => "removed runs/.orchestrator ($why)", applied => 1 };
+    } else {
+        push @{ $r->{errors} }, "could not remove stale marker $marker: $!";
+    }
+    flock($fh, LOCK_UN);
+    close $fh;
+    return 0;
 }
 
 # The coordinator pid bp-launch.sh's watcher recorded for this package, or
@@ -584,30 +671,42 @@ sub reconcile_one {
     my $runs   = "$bpdir/runs";
     my $marker = "$runs/.orchestrator";
     my $pid    = marker_pid($marker);
-    my $live   = (-e $marker && pid_alive($pid)) ? 1 : 0;
+    my ($lock, $lock_err) = marker_probe($marker);
+    my $live   = ($lock eq 'held')                        ? 1
+               : ($lock ne 'absent' && pid_alive($pid))    ? 1
+               :                                             0;
     # H2/H1 (redteam): whether an orchestrator marker EVER existed here, not
     # merely whether it still does after block 1 below may remove it.
     my $marker_existed = -e $marker ? 1 : 0;
     $r{live} = $live;
     $r{orchestrator_pid} = $pid;
+    $r{marker_lock} = $lock;
 
     my $lifecycle = BpState::blueprint_lifecycle($bpdir, \&pid_alive);
     $r{lifecycle} = $lifecycle;
 
     if ($live) {
-        push @{ $r{actions} }, { kind => 'skipped', detail => "orchestrator pid $pid is alive; state belongs to the run" };
+        my $detail = ($lock eq 'held')
+            ? "orchestrator marker lock is held (" . (defined $pid ? "pid $pid" : 'pid unknown') . "); state belongs to the run"
+            : "orchestrator pid $pid is alive; state belongs to the run";
+        push @{ $r{actions} }, { kind => 'skipped', detail => $detail };
+        return \%r;
+    }
+
+    if ($lock eq 'error') {
+        push @{ $r{actions} }, { kind => 'skipped', detail => "could not probe the runs/.orchestrator lock ($lock_err); refusing to judge the run live or dead, nothing reconciled" };
+        push @{ $r{errors} }, "could not probe orchestrator marker lock: $lock_err";
         return \%r;
     }
 
     # --- 1. stale marker ----------------------------------------------------
-    if (-e $marker) {
+    if ($lock eq 'free') {
         my $why = defined $pid ? "pid $pid is not alive" : 'marker holds no usable pid';
         if ($opt->{dry_run}) {
             push @{ $r{actions} }, { kind => 'stale_marker', detail => "would remove runs/.orchestrator ($why)", applied => 0 };
-        } elsif (unlink $marker) {
-            push @{ $r{actions} }, { kind => 'stale_marker', detail => "removed runs/.orchestrator ($why)", applied => 1 };
         } else {
-            push @{ $r{errors} }, "could not remove stale marker $marker: $!";
+            my $abort = remove_stale_marker($marker, \%r, $why);
+            return \%r if $abort;
         }
     }
 
@@ -1104,7 +1203,7 @@ sub norm_bp_status {
     $s =~ s/#.*\z//;                       # the template keeps a trailing comment
     $s =~ s/[^a-z]+/ /g;
     for my $w (split /\s+/, $s) {
-        return $w if $w =~ /\A(?:drafting|audited|running|done|archived)\z/;
+        return $w if $w =~ /\A(?:drafting|audited|parked|running|done|archived)\z/;
     }
     return '';
 }

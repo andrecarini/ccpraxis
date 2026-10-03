@@ -38,12 +38,13 @@ package BpOrch;
 use strict;
 use warnings;
 use JSON::PP;
-use Fcntl qw(:flock O_WRONLY O_CREAT O_EXCL);
+use Fcntl qw(:flock O_WRONLY O_CREAT O_EXCL O_RDWR);
 use File::Basename qw(dirname);
 use Cwd qw(abs_path);
 use File::Spec ();
 use POSIX ();
 use IO::Handle ();
+use Scalar::Util ();
 
 # MSYS2 path-conversion guard (house rule): this script may spawn bp-launch.sh
 # (native bash) with ':'-bearing args on a Windows host; disable the translation.
@@ -103,7 +104,7 @@ our $PID_ALIVE_FN;
 # park branches) are guarded by `$st eq 'done'` as a precondition for reaching
 # the queue_needs_you call -- but `$st` is a once-per-tick SNAPSHOT
 # (`_load_state`, read once at tick-start), never re-read for the rest of the
-# tick. A human running `bp-answer-decision.pl` mid-tick can flip the ledger's
+# tick. A human running `bp-answer-escalation.pl` mid-tick can flip the ledger's
 # real status after the snapshot but before either branch runs, so the
 # precondition being "structural" was never true of the LIVE ledger, only of
 # the stale value the tick captured (fixbatch step7 / red-team MAJOR). Gating
@@ -113,7 +114,7 @@ our $PID_ALIVE_FN;
 # AC14 control pins) -- the table row was never the right tool for a
 # freshness problem. Instead, `_judge_outcome_still_applies` (below) now ALSO
 # re-reads the ledger's live `status:` immediately before either branch
-# commits to queuing, under the same lock bp-answer-decision.pl's status
+# commits to queuing, under the same lock bp-answer-escalation.pl's status
 # writes take, and refuses if it no longer reads 'done' -- a01's
 # re-read-under-the-lock convention, applied to the resource (the ledger)
 # this gate was missing rather than to this table (which cannot express a
@@ -126,6 +127,16 @@ our %DECISION_VALIDITY = (
     'harvest-failure'        => ['done', 'dropped'],
     'harvest-spawn-failure'  => ['done', 'dropped'],
 );
+
+# review-1.md M2 (06-fleet-inbox-bridge): kinds filed ONLY when the ledger
+# already reads 'done' (judge-starved: ":its status is still 'done'"), so the
+# bridge's S1 settle step ("package reached done/dropped -> auto-archive")
+# would silently archive the very record filed BECAUSE the package is done,
+# before the resolver or the operator ever sees it -- defeating "never goes
+# quiet" for a harvest audit that never completed. Named here, next to
+# %DECISION_VALIDITY's own judge-starved comment, for the same reason that one
+# is: a kind whose validity/settlement cannot be judged by ledger status alone.
+my %SETTLE_EXEMPT = map { $_ => 1 } qw(judge-starved);
 
 # e02: the closed 7-value escalation-category taxonomy (e01 spec §2.2). One
 # canonical source; queue_needs_you/_enter_pause_manual/_block_and_queue all
@@ -228,12 +239,945 @@ sub canonical_category {
     return $CATEGORY_ALIAS{$c} // $c;
 }
 
-# e02 §2.5: the kind->family registry that replaces bp-answer-decision.pl's
+# ===========================================================================
+# 05-fleet-thread-and-wording: a fleet run's Almanac::Thread wiring (spec
+# specs/05-fleet-thread-and-wording-spec.md). Off by default ($opt->{fleet_thread}
+# false, the CLI's only production caller passes true) -- Almanac::Thread is
+# never loaded and nothing under <project>/.ccpraxis-local-data/almanac is
+# touched unless a caller opts in, so the ~27 pre-existing run() test callers
+# are byte-for-byte unaffected (spec §2.1).
+#
+# Every sub below whose name starts with _fleet_thread_ NEVER DIES (its body
+# runs inside its own eval; a failure becomes a BpLog event, never a
+# propagated exception -- see §2.3) and calls only the Almanac::Thread
+# library, never the thread CLI or any other almanac command-line tool (AC4
+# pins this with a static source check). Every call of one of these subs, in the
+# text of `sub run`, sits between acquire_marker( and release_marker($marker_fh
+# (the flock-holding invariant, Decision 17 Q7/F6) -- enforced by placement,
+# never by Thread.pm, which does not check the flock itself.
+# ===========================================================================
+
+# fleet_thread_name($bp) -> "fleet-<slug>", NEVER dies. Spec §2.2.
+sub fleet_thread_name {
+    my ($bp) = @_;
+    my $r = eval {
+        my $s = lc(defined $bp ? $bp : '');
+        $s =~ s/[^a-z0-9]+/-/g;
+        $s =~ s/\A-+//;
+        $s =~ s/-+\z//;
+        $s = substr($s, 0, 54);
+        $s =~ s/-+\z//;
+        $s = 'run' if $s eq '';
+        "fleet-$s";
+    };
+    return defined $r ? $r : 'fleet-run';
+}
+
+# fleet_thread_reason($s) -> a 1..200-byte valid-UTF-8 string, no control
+# characters, NEVER dies. Spec §2.2.
+sub fleet_thread_reason {
+    my ($s) = @_;
+    my $r = eval {
+        return 'unknown' unless defined $s && !ref $s;
+        require Encode;
+        my $bytes = utf8::is_utf8($s) ? Encode::encode('UTF-8', $s) : $s;
+        # Encode::decode(..., CHECK) is DESTRUCTIVE when CHECK is true (it
+        # consumes the decoded portion of its 2nd arg in place) -- always
+        # validate a disposable COPY, never $bytes itself.
+        unless (eval { my $copy = $bytes; Encode::decode('UTF-8', $copy, Encode::FB_CROAK()); 1 }) {
+            $bytes =~ s/([\x80-\xff])/?/g;
+        }
+        $bytes =~ s/[\x00-\x1f\x7f]/ /g;
+        $bytes =~ s/ {2,}/ /g;
+        $bytes =~ s/\A //;
+        $bytes =~ s/ \z//;
+        return 'unknown' if $bytes eq '';
+        if (length($bytes) > 200) {
+            my $cut = 197;
+            $cut--
+                while $cut > 0
+                   && !eval { my $copy = substr($bytes, 0, $cut); Encode::decode('UTF-8', $copy, Encode::FB_CROAK()); 1 };
+            $bytes = substr($bytes, 0, $cut) . '...';
+        }
+        return $bytes;
+    };
+    return defined $r ? $r : 'unknown';
+}
+
+# _fleet_thread_err($@) -> a short "kind[: detail]" string for a
+# fleet_thread_error BpLog event's `error` field. Never dies itself.
+sub _fleet_thread_err {
+    my ($err) = @_;
+    my $out = eval {
+        return 'error' unless defined $err;
+        if ((Scalar::Util::reftype($err) // '') eq 'HASH' && defined $err->{kind}) {
+            my $kind = $err->{kind};
+            my $d = $err->{detail} // $err->{cause};
+            return (defined $d && length $d) ? "$kind: $d" : $kind;
+        }
+        my $s = "$err";
+        $s =~ s/\s+\z//;
+        $s =~ s/\n.*//s;
+        return length($s) ? $s : 'error';
+    };
+    return defined $out ? $out : 'error';
+}
+
+# _fleet_thread_setup(\%a) -> \%ctx | undef. a: blueprint, bp_dir, runs, log.
+# Called exactly once per run(), only when $opt->{fleet_thread}, immediately
+# after the orchestrator_start log line -- after the marker is held and
+# before the loop's eval. Spec §2.4. NEVER dies (wrapped in its own eval):
+# setup runs before the loop's own eval, so a die here would leak the marker.
+sub _fleet_thread_setup {
+    my ($a) = @_;
+    my $ctx;
+    my $log = $a->{log};
+    eval {
+        my $bp     = $a->{blueprint};
+        my $bp_dir = $a->{bp_dir};
+        my $runs   = $a->{runs};
+
+        # 1. Project root (structural only, no walk-up).
+        my $abs = abs_path($bp_dir);
+        $abs = $bp_dir unless defined $abs;
+        (my $norm = $abs) =~ s{\\}{/}g;
+        unless ($norm =~ m{\A(.+)/\.ccpraxis-local-data/blueprints/([^/]+)/?\z} && -d "$1/.ccpraxis-local-data") {
+            _log($log, 'fleet_thread_disabled', { reason => 'no_project_root' });
+            return;
+        }
+        my ($root, $owner_bp) = ($1, $2);
+        unless (defined $bp && $owner_bp eq $bp) {
+            _log($log, 'fleet_thread_disabled', { reason => 'bp_dir_mismatch' });
+            return;
+        }
+        unless (defined $bp && length($bp) <= 128 && $bp =~ /\A[A-Za-z0-9][A-Za-z0-9._-]*\z/ && $bp !~ /\.\./) {
+            _log($log, 'fleet_thread_disabled', { reason => 'bad_blueprint_name' });
+            return;
+        }
+
+        # 2. Load. Push (never unshift/local) so Thread.pm's later lazy
+        # requires still see this path.
+        my $lib_dir = "$DIR/../../almanac/scripts";
+        push @INC, $lib_dir unless grep { $_ eq $lib_dir } @INC;
+        my $loaded = eval { require Almanac::Thread; 1 };
+        unless ($loaded) {
+            _log($log, 'fleet_thread_disabled', { reason => 'load_failed' });
+            return;
+        }
+
+        # 3. Choose the thread: B, B-2, ..., B-99.
+        my $base = fleet_thread_name($bp);
+        my ($name, $created);
+        for my $n (1..99) {
+            my $cand = ($n == 1) ? $base : "$base-$n";
+            my $th = eval { Almanac::Thread::read_thread($cand, root => $root) };
+            my $rerr = $@;
+            if ($rerr) {
+                if (ref($rerr) && defined $rerr->{kind} && $rerr->{kind} eq 'not_found') {
+                    my $ok = eval {
+                        Almanac::Thread::create_thread($cand, owner_kind => 'orchestrator', owner_id => $bp,
+                            actor => 'orchestrator', root => $root);
+                        1;
+                    };
+                    unless ($ok) {
+                        _log($log, 'fleet_thread_disabled', { reason => 'store_error' });
+                        return;
+                    }
+                    $name = $cand; $created = 1;
+                    last;
+                }
+                _log($log, 'fleet_thread_disabled', { reason => 'store_error' });
+                return;
+            }
+            if (($th->{state} // '') eq 'live' && ($th->{owner_kind} // '') eq 'orchestrator'
+                && ($th->{owner_id} // '') eq $bp) {
+                $name = $cand; $created = 0;
+                last;
+            }
+            # not reusable: archived, handed-off, session-owned, unowned, or
+            # another orchestrator -- try the next candidate.
+        }
+        unless (defined $name) {
+            _log($log, 'fleet_thread_disabled', { reason => 'no_free_name' });
+            return;
+        }
+
+        $ctx = { name => $name, root => $root, bp => $bp, runs => $runs, log => $log,
+                 sent => {}, open => {}, paused => 0, sig => undef };
+
+        # 4. Link packages (idempotent; archives immediately if every package
+        # is already done or dropped).
+        eval {
+            Almanac::Thread::add_packages($name, [$bp], root => $root, actor => 'orchestrator');
+            1;
+        } or _log($log, 'fleet_thread_error', { op => 'add_packages', error => _fleet_thread_err($@) });
+
+        # 5. Seed sent/open from the thread's own log.
+        eval {
+            my $entries = Almanac::Thread::log_entries($name, root => $root);
+            my %applied;
+            for my $e (@{ $entries || [] }) {
+                my $reason = $e->{reason};
+                next unless defined $reason && length $reason;
+                my ($tok) = split ' ', $reason, 2;
+                next unless defined $tok && length $tok;
+                if ($e->{event} eq 'escalation-sent') { $ctx->{sent}{$tok} = 1; }
+                elsif ($e->{event} eq 'answer-applied') { $applied{$tok} = 1; }
+            }
+            for my $id (keys %{ $ctx->{sent} }) {
+                $ctx->{open}{$id} = 1 unless $applied{$id};
+            }
+            1;
+        } or do {
+            $ctx->{sent} = {}; $ctx->{open} = {};
+            _log($log, 'fleet_thread_error', { op => 'seed', error => _fleet_thread_err($@) });
+        };
+
+        # 6. launched.
+        eval {
+            Almanac::Thread::record_event($name, 'launched',
+                reason => fleet_thread_reason("orchestrator started (pid $$)"),
+                actor => 'orchestrator', root => $root);
+            1;
+        } or _log($log, 'fleet_thread_error', { op => 'launched', error => _fleet_thread_err($@) });
+
+        # 6.5 (MEDIUM-2): re-check ownership right after the launched write.
+        # Closes the restart race where a take_over lands between step 3's
+        # read and this write -- the thread may no longer be ours to use.
+        my $own = eval { Almanac::Thread::read_thread($name, root => $root) };
+        if ($@) {
+            _log($log, 'fleet_thread_error', { op => 'ownership_check', error => _fleet_thread_err($@) });
+        } else {
+            my $still_ours = ref($own) eq 'HASH'
+                && (($own->{state} // '') eq 'live' || ($own->{state} // '') eq 'archived')
+                && ($own->{owner_kind} // '') eq 'orchestrator'
+                && ($own->{owner_id} // '') eq $bp;
+            unless ($still_ours) {
+                _log($log, 'fleet_thread_disabled', { reason => 'taken_over' });
+                $ctx = undef;
+                return;
+            }
+        }
+
+        # 7.
+        _log($log, 'fleet_thread', { thread => $name, created => ($created ? 1 : 0) });
+        1;
+    };
+    if ($@) {
+        _log($log, 'fleet_thread_disabled', { reason => 'store_error' }) unless $ctx;
+    }
+    return $ctx;
+}
+
+# _fleet_thread_tick(\%ctx, \%t) -> (nothing). t: paused (the tick's
+# $paused), meta. Called once per tick when ctx is defined, immediately
+# before the # ---- PAUSE GATING block, so it runs on every tick, paused
+# ticks included. Spec §2.5. NEVER dies.
+sub _fleet_thread_tick {
+    my ($ctx, $t) = @_;
+    return unless $ctx;
+    return if $ctx->{dead};
+    eval {
+        my $name = $ctx->{name};
+        my $root = $ctx->{root};
+        my $runs = $ctx->{runs};
+        my $log  = $ctx->{log};
+        my $bp   = $ctx->{bp};
+
+        # 0 (MEDIUM-2): re-check ownership on every tick -- a locked-read
+        # done once at setup is not good enough; a take-over can land while
+        # the orchestrator is still alive. Stop writing into (and archiving)
+        # a thread that is no longer ours. A failed READ (store hiccup) is
+        # its own `fleet_thread_error` -- it is not evidence of a take-over,
+        # so it does not drop the context.
+        my $own = eval { Almanac::Thread::read_thread($name, root => $root) };
+        if ($@) {
+            _log($log, 'fleet_thread_error', { op => 'ownership_check', error => _fleet_thread_err($@) });
+        } else {
+            my $still_ours = ref($own) eq 'HASH'
+                && (($own->{state} // '') eq 'live' || ($own->{state} // '') eq 'archived')
+                && ($own->{owner_kind} // '') eq 'orchestrator'
+                && ($own->{owner_id} // '') eq $bp;
+            unless ($still_ours) {
+                _log($log, 'fleet_thread_disabled', { reason => 'taken_over' });
+                $ctx->{dead} = 1;
+                return;
+            }
+        }
+
+        # 1. Escalation scan.
+        my $dir = escalations_dir($runs);
+        my @present;
+        if (defined $dir && length $dir && -d $dir) {
+            if (opendir(my $dh, $dir)) {
+                @present = grep { /\.json\z/ && !/^\./ && -f "$dir/$_" } readdir $dh;
+                closedir $dh;
+                s/\.json\z// for @present;
+                @present = sort @present;
+            }
+        }
+        for my $id (@present) {
+            next if $ctx->{sent}{$id};
+            my $rec = _read_json("$dir/$id.json");
+            my $cat = (ref $rec eq 'HASH') ? canonical_category($rec->{category}) : undef;
+            my $operator_owned = (!defined $cat || $cat eq '' || !$RESOLVER_TRIAGEABLE{$cat}) ? 1 : 0;
+            next unless $operator_owned;
+            my $kind = (ref $rec eq 'HASH' && defined $rec->{kind} && length $rec->{kind}) ? $rec->{kind} : '-';
+            my $catdisp = (defined $cat && length $cat) ? $cat : '-';
+            eval {
+                Almanac::Thread::record_event($name, 'escalation-sent',
+                    reason => fleet_thread_reason("$id $kind $catdisp"),
+                    actor => 'orchestrator', root => $root);
+                1;
+            } or _log($log, 'fleet_thread_error', { op => 'escalation-sent', error => _fleet_thread_err($@) });
+            $ctx->{sent}{$id} = 1;
+            $ctx->{open}{$id} = 1;
+        }
+
+        # 2. Answers.
+        my %present_set = map { $_ => 1 } @present;
+        for my $id (sort keys %{ $ctx->{open} }) {
+            next if $present_set{$id};
+            if (-e "$runs/resolved-escalations/$id.json") {
+                delete $ctx->{open}{$id};
+                next;
+            }
+            eval {
+                Almanac::Thread::record_event($name, 'answer-applied',
+                    reason => fleet_thread_reason($id), actor => 'orchestrator', root => $root);
+                1;
+            } or _log($log, 'fleet_thread_error', { op => 'answer-applied', error => _fleet_thread_err($@) });
+            delete $ctx->{open}{$id};
+        }
+
+        # 3. Pause transition. LOW-1: a restart into an already-expired timed
+        # pause must not log `paused` here only to auto-resume a moment later
+        # in the same tick's PAUSE GATING -- skip the emission when this pause
+        # is non-manual and already resume_ready, since gating is about to
+        # clear it before this tick does anything else observable.
+        my $now_paused = defined $t->{paused} ? 1 : 0;
+        my $about_to_autoresume = $now_paused
+            && !$t->{paused}{manual}
+            && resume_ready($t->{paused}, $t->{now} // time);
+        if ($now_paused && !$ctx->{paused} && !$about_to_autoresume) {
+            eval {
+                Almanac::Thread::record_event($name, 'paused',
+                    reason => fleet_thread_reason($t->{paused}{reason}),
+                    actor => 'orchestrator', root => $root);
+                1;
+            } or _log($log, 'fleet_thread_error', { op => 'paused', error => _fleet_thread_err($@) });
+        } elsif (!$now_paused && $ctx->{paused}) {
+            eval {
+                Almanac::Thread::record_event($name, 'resumed', actor => 'orchestrator', root => $root);
+                1;
+            } or _log($log, 'fleet_thread_error', { op => 'resumed', error => _fleet_thread_err($@) });
+        }
+        # Leave ctx paused unchanged on the suppressed-emission tick, so the
+        # tick that actually clears .paused a moment later (same gating pass)
+        # does not see a paused->unpaused transition and log a lone `resumed`.
+        $ctx->{paused} = $now_paused unless $about_to_autoresume;
+
+        # 4. New packages.
+        my $sig = join("\n", sort keys %{ $t->{meta} || {} });
+        if (defined $ctx->{sig} && $ctx->{sig} ne $sig) {
+            eval {
+                Almanac::Thread::add_packages($name, [$bp], root => $root, actor => 'orchestrator');
+                1;
+            } or _log($log, 'fleet_thread_error', { op => 'add_packages', error => _fleet_thread_err($@) });
+        }
+        $ctx->{sig} = $sig;
+        1;
+    };
+    _log($ctx->{log}, 'fleet_thread_error', { op => 'tick', error => _fleet_thread_err($@) }) if $@;
+    return;
+}
+
+# _fleet_thread_end(\%ctx, $complete) -> (nothing). Spec §2.6. NEVER dies.
+sub _fleet_thread_end {
+    my ($ctx, $complete) = @_;
+    return unless $ctx;
+    return if $ctx->{dead};
+    eval {
+        my $name = $ctx->{name};
+        my $root = $ctx->{root};
+        my $log  = $ctx->{log};
+        my $bp   = $ctx->{bp};
+
+        # MEDIUM-2: re-check ownership before the end-of-run write. Without
+        # this, a taken-over thread gets `finished`/archived by an
+        # orchestrator that no longer owns it.
+        my $own = eval { Almanac::Thread::read_thread($name, root => $root) };
+        if ($@) {
+            _log($log, 'fleet_thread_error', { op => 'ownership_check', error => _fleet_thread_err($@) });
+        } else {
+            my $still_ours = ref($own) eq 'HASH'
+                && (($own->{state} // '') eq 'live' || ($own->{state} // '') eq 'archived')
+                && ($own->{owner_kind} // '') eq 'orchestrator'
+                && ($own->{owner_id} // '') eq $bp;
+            unless ($still_ours) {
+                _log($log, 'fleet_thread_disabled', { reason => 'taken_over' });
+                $ctx->{dead} = 1;
+                return;
+            }
+        }
+
+        if ($complete) {
+            eval {
+                Almanac::Thread::record_event($name, 'finished', reason => 'run complete',
+                    actor => 'orchestrator', root => $root);
+                1;
+            } or _log($log, 'fleet_thread_error', { op => 'finished', error => _fleet_thread_err($@) });
+        } else {
+            eval {
+                Almanac::Thread::archive_if_done($name, root => $root, actor => 'orchestrator');
+                1;
+            } or _log($log, 'fleet_thread_error', { op => 'archive_if_done', error => _fleet_thread_err($@) });
+        }
+        1;
+    };
+    _log($ctx->{log}, 'fleet_thread_error', { op => 'end', error => _fleet_thread_err($@) }) if $@;
+    return;
+}
+
+# ===========================================================================
+# 06-fleet-inbox-bridge: an escalation the resolver (or a direct auth/contract
+# site) has marked operator-owned becomes an inbox item (package 01's
+# Almanac::Inbox), so the operator can answer from any session. Off by
+# default ($opt->{inbox_bridge} false) -- see run()'s setup/tick wiring above/
+# below. Spec specs/06-fleet-inbox-bridge-spec.md.
+#
+# Implementation constraint (done criterion 6): no `category => '<literal>'`
+# pair and no 'product'/'operator-action'/'operational' string literal
+# anywhere in this section -- the operator-owned pair is named once, as a
+# qw() list, and read through %INBOX_OWNED everywhere else.
+# ===========================================================================
+my %INBOX_OWNED = map { $_ => 1 } qw(product operator-action);
+
+# _strip_leading_underscores($s) -> $s with every LEADING '_' removed.
+#
+# N4: this strips ALL leading underscores, while inbox_resolve_link's own
+# candidate lookup tries only $seg3 and "_$seg3" -- i.e. exactly ONE leading
+# underscore. That asymmetry is harmless under the current invariant: every
+# real caller ($pkg/$id this file ever writes) has AT MOST one leading '_'
+# (`_fleet`, `_fleet--<hex>`; a genuine multi-underscore id is rule U --
+# unfileable, logged once, never reaches this function via the bridge's own
+# S3 path). If that invariant is ever relaxed, resolve the asymmetry rather
+# than assume it still holds.
+sub _strip_leading_underscores {
+    my ($s) = @_;
+    return $s unless defined $s;
+    (my $r = $s) =~ s/\A_+//;
+    return $r;
+}
+
+# inbox_link_for($bp, $pkg, $id) -> "$bp/$seg2/$seg3" | undef. Spec §2.1.
+sub inbox_link_for {
+    my ($bp, $pkg, $id) = @_;
+    return undef unless defined $bp && defined $pkg && defined $id;
+    my $seg2 = _strip_leading_underscores($pkg);
+    my $seg3 = _strip_leading_underscores($id);
+    for my $seg ($bp, $seg2, $seg3) {
+        return undef unless defined $seg && length($seg) && length($seg) <= 128;
+        return undef unless $seg =~ /\A[A-Za-z0-9][A-Za-z0-9._-]*\z/;
+        return undef if $seg =~ /\.\./;
+    }
+    return "$bp/$seg2/$seg3";
+}
+
+# inbox_resolve_link($runs, $bp, $link) -> \%r. Spec §2.1. Never dies, never
+# writes. r.state: foreign | found | gone | ambiguous | unreadable.
+sub inbox_resolve_link {
+    my ($runs, $bp, $link) = @_;
+    return { state => 'foreign' } unless defined $link && !ref $link;
+    my @segs = split m{/}, $link, -1;
+    return { state => 'foreign' } unless @segs == 3 && defined $bp && $segs[0] eq $bp;
+    my ($seg1, $seg2, $seg3) = @segs;
+    my $dir = escalations_dir($runs);
+    my @found;
+    my $any_unreadable = 0;
+    for my $cand ("$dir/$seg3.json", "$dir/_$seg3.json") {
+        next unless -f $cand;
+        my $rec = _read_json($cand);
+        unless (ref $rec eq 'HASH') { $any_unreadable = 1; next; }
+        my $pkg = _strip_leading_underscores($rec->{package});
+        next unless defined $pkg && $pkg eq $seg2;
+        (my $id = $cand) =~ s{.*[\\/]}{};
+        $id =~ s/\.json\z//i;
+        push @found, { state => 'found', id => $id, rec => $rec };
+    }
+    return { state => 'unreadable' } if $any_unreadable;
+    return { state => 'ambiguous' } if @found > 1;
+    return $found[0] if @found == 1;
+    return { state => 'gone' };
+}
+
+# _json_bytes($s) -> $s with the JSON::PP decode()-without-->utf8 flag quirk
+# undone (a scoped utf8::downgrade): on JSON::PP 4.16, a VALUE that contains a
+# non-ASCII byte comes back flagged utf8=1 with its OCTETS UNCHANGED (so a raw
+# UTF-8 sequence like "Caf\xc3\xa9" is two Latin-1-looking characters, not one
+# decoded "e"-with-accent) -- an ASCII-only value is unaffected either way.
+# Every byte here is <=0xFF, so the downgrade always succeeds and restores
+# plain-byte semantics, matching how the rest of this file treats escalation
+# content; without it, fleet_thread_reason's `utf8::is_utf8($s)` check would
+# believe the flag and double-encode the bytes. Shared by every site that
+# turns JSON::PP-decoded escalation text into operator-facing reason/title/
+# body text (review-1.md S1 + N1).
+sub _json_bytes {
+    my ($s) = @_;
+    return $s unless defined $s;
+    utf8::downgrade($s, 1);
+    return $s;
+}
+
+# _inbox_bridge_scrub_utf8($bytes) -> $bytes, with any byte sequence that is
+# NOT valid UTF-8 replaced byte-for-byte with '?' -- the same substitution
+# fleet_thread_reason applies to a title, but without its control-character
+# collapse or 200-byte truncation (the bridge's inbox BODY is not length- or
+# control-char-constrained the way a title/thread reason is). A fully valid
+# UTF-8 input (e.g. "Caf\xc3\xa9") is returned byte-for-byte unchanged (AC18).
+# Never dies. redteam-1.md M2.
+sub _inbox_bridge_scrub_utf8 {
+    my ($bytes) = @_;
+    return $bytes unless defined $bytes && !ref $bytes;
+    require Encode;
+    my $copy = $bytes;
+    unless (eval { Encode::decode('UTF-8', $copy, Encode::FB_CROAK()); 1 }) {
+        $bytes =~ s/([\x80-\xff])/?/g;
+    }
+    return $bytes;
+}
+
+# _orphan_close_reason($runs, $link) -> the exact 2.3 reason text for an item
+# whose linked escalation file is gone.
+sub _orphan_close_reason {
+    my ($runs, $link) = @_;
+    my @segs = split m{/}, $link, -1;
+    my $seg3 = $segs[2];
+    return "linked escalation $link no longer exists" unless defined $seg3 && length $seg3;
+    for my $cand ($seg3, "_$seg3") {
+        my $arc = _read_json("$runs/resolved-escalations/$cand.json");
+        next unless ref $arc eq 'HASH';
+        my $reason = _json_bytes($arc->{reason});
+        return "escalation $cand closed: $reason" if defined $reason && length $reason;
+        return "escalation $cand closed: resolved by " . (defined $arc->{resolved_by} ? _json_bytes($arc->{resolved_by}) : 'unknown');
+    }
+    return "linked escalation $link no longer exists";
+}
+
+# _inbox_bridge_iso_to_epoch($s) -> epoch seconds | undef. Parses the exact
+# "YYYY-MM-DDTHH:MM:SSZ" shape _iso()/almanac-inbox.pl's _now_iso() write.
+# Never dies; undef on anything else.
+sub _inbox_bridge_iso_to_epoch {
+    my ($s) = @_;
+    return undef unless defined $s && $s =~ /\A(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})Z\z/;
+    my ($y, $mo, $d, $h, $mi, $se) = ($1, $2, $3, $4, $5, $6);
+    require Time::Local;
+    return eval { Time::Local::timegm($se, $mi, $h, $d, $mo - 1, $y) };
+}
+
+# inbox_close_item($ctx, $item, $reason, $by) -> 'closed'|'already'|'conflict'|'error'. Spec §2.3.
+sub inbox_close_item {
+    my ($ctx, $item, $reason, $by) = @_;
+    return 'already' if ref($item) eq 'HASH' && exists $item->{fields}{closed_at};
+    my $result = eval {
+        Almanac::Inbox::open_inbox(root => $ctx->{root})->update($item->{id},
+            expect => { rev => $item->{rev}, fields => $item->{fields} },
+            set    => { status => 'answered', closed_at => _iso(time()),
+                        closed_reason => fleet_thread_reason($reason), closed_by => $by },
+        );
+        'closed';
+    };
+    if (my $err = $@) {
+        # N5: a bare ref() check dies on a non-HASH ref (e.g. a blessed
+        # arrayref or scalarref exception) -- guard with reftype so this
+        # function keeps its NEVER DIES contract against any exception shape.
+        return 'conflict' if (Scalar::Util::reftype($err) // '') eq 'HASH' && defined $err->{kind} && $err->{kind} eq 'conflict';
+        return 'error';
+    }
+    return $result;
+}
+
+# inbox_close_orphans($ctx, $by) -> \@closed_item_ids. Spec §2.4.
+sub inbox_close_orphans {
+    my ($ctx, $by) = @_;
+    my @closed;
+    eval {
+        my $items = Almanac::Inbox::list_items(root => $ctx->{root});
+        for my $item (@$items) {
+            my $link = $item->{fields}{link};
+            next unless defined $link;
+            my @segs = split m{/}, $link, -1;
+            next unless @segs == 3 && $segs[0] eq $ctx->{bp};
+            next if exists $item->{fields}{closed_at};
+            my $r = inbox_resolve_link($ctx->{runs}, $ctx->{bp}, $link);
+            next unless $r->{state} eq 'gone';
+            my $reason = _orphan_close_reason($ctx->{runs}, $link);
+            my $res = inbox_close_item($ctx, $item, $reason, $by);
+            push @closed, $item->{id} if $res eq 'closed';
+        }
+        1;
+    } or _inbox_bridge_log_error($ctx, 'close_orphans', $@);
+    return \@closed;
+}
+
+# archive_settled_escalation($runs, $id, $rec, $reason) -> 1|0. Spec §2.4.
+sub archive_settled_escalation {
+    my ($runs, $id, $rec, $reason) = @_;
+    my $ok = _write_json_atomic("$runs/resolved-escalations/$id.json",
+        { original => $rec, resolved_by => 'auto-settle', applied => JSON::PP::false, reason => $reason });
+    return 0 unless $ok;
+    my $qpath = escalations_dir($runs) . "/$id.json";
+    return 1 if !-e $qpath;
+    return unlink($qpath) ? 1 : 0;
+}
+
+# orchestrator_marker_live($runs) -> 1|0. Spec §2.4.
+sub orchestrator_marker_live {
+    my ($runs) = @_;
+    my $path = "$runs/.orchestrator";
+    return 0 unless -e $path;
+    open(my $fh, '<', $path) or return 1;
+    if (flock($fh, LOCK_SH | LOCK_NB)) {
+        flock($fh, LOCK_UN);
+        close $fh;
+        return 0;
+    }
+    close $fh;
+    return 1;
+}
+
+# inbox_bridge_setup(\%a) -> ($ctx, undef) | (undef, $reason). Spec §2.4,
+# mirroring _fleet_thread_setup's structural project-root rule (step 1).
+sub inbox_bridge_setup {
+    my ($a) = @_;
+    my $log = $a->{log};
+    my $ctx;
+    my $reason;
+    eval {
+        my $bp     = $a->{blueprint};
+        my $bp_dir = $a->{bp_dir};
+        my $runs   = $a->{runs};
+
+        my $abs = abs_path($bp_dir);
+        $abs = $bp_dir unless defined $abs;
+        (my $norm = $abs) =~ s{\\}{/}g;
+        unless ($norm =~ m{\A(.+)/\.ccpraxis-local-data/blueprints/([^/]+)/?\z} && -d "$1/.ccpraxis-local-data") {
+            $reason = 'no_project_root';
+            return;
+        }
+        my ($root, $owner_bp) = ($1, $2);
+        unless (defined $bp && $owner_bp eq $bp) {
+            $reason = 'bp_dir_mismatch';
+            return;
+        }
+        unless (defined $bp && length($bp) <= 128 && $bp =~ /\A[A-Za-z0-9][A-Za-z0-9._-]*\z/ && $bp !~ /\.\./) {
+            $reason = 'bad_blueprint_name';
+            return;
+        }
+
+        my $lib_dir = "$DIR/../../almanac/scripts";
+        push @INC, $lib_dir unless grep { $_ eq $lib_dir } @INC;
+        my $loaded = eval { require "$lib_dir/almanac-inbox.pl"; 1 };
+        unless ($loaded) {
+            $reason = 'load_failed';
+            return;
+        }
+
+        $ctx = { bp => $bp, bpdir => $bp_dir, runs => $runs, root => $root, log => $log, once => {} };
+        1;
+    };
+    if ($@) { $ctx = undef; $reason ||= 'load_failed'; }
+    _log($log, 'inbox_bridge_disabled', { reason => $reason }) unless $ctx;
+    return $ctx ? ($ctx, undef) : (undef, $reason);
+}
+
+# _inbox_bridge_once($ctx, $key, $code) -- runs $code->() at most once per
+# distinct $key per process (the "once" dedupe set, spec §2.5 edge case 14).
+sub _inbox_bridge_once {
+    my ($ctx, $key, $code) = @_;
+    return if !$ctx || $ctx->{once}{$key}++;
+    $code->();
+}
+
+sub _inbox_bridge_log_error {
+    my ($ctx, $op, $err) = @_;
+    return unless $ctx;
+    my $detail = _fleet_thread_err($err);
+    _inbox_bridge_once($ctx, "error:$op:$detail", sub {
+        _log($ctx->{log}, 'inbox_bridge_error', { op => $op, error => $detail });
+    });
+}
+
+# _inbox_bridge_eligible_now($rec, $reg, $tun) -> ($f1, $f2, $cat). Spec §2.5,
+# redteam-1.md M1's minimal mitigation: whether escalation record $rec is
+# F1 (operator-owned) or F2 (resolver-unavailable) ELIGIBLE RIGHT NOW -- the
+# same test S3 uses to decide whether to file an item, reused by S2 to decide
+# whether an answered item's action may be authorized (shared, not duplicated,
+# per N9).
+sub _inbox_bridge_eligible_now {
+    my ($rec, $reg, $tun) = @_;
+    return (0, 0, undef) unless ref $rec eq 'HASH';
+    my $pkg = $rec->{package};
+    my $cat = canonical_category($rec->{category});
+    my $f1  = defined($cat) && $INBOX_OWNED{$cat} ? 1 : 0;
+    # N6: guard the registry lookup on `defined $pkg` -- an undef $pkg must
+    # never autovivify $reg->{undef} nor trip an "uninitialized" warning.
+    my $f2  = (defined($cat) && $RESOLVER_TRIAGEABLE{$cat}
+                  && ( (defined $pkg && $pkg eq '_fleet')
+                       || (defined $pkg && (($reg->{$pkg}{escalation_spawn_fail} // 0) >= ($tun->{judge_spawn_cap} // 3))) )) ? 1 : 0;
+    return ($f1, $f2, $cat);
+}
+
+# _inbox_bridge_choices_for($pkg, $kind) -> "a,b,c" | undef. Spec §2.2.
+sub _inbox_bridge_choices_for {
+    my ($pkg, $kind) = @_;
+    my $fam = kind_family_of($kind);
+    return undef unless defined $fam;
+    return 'resume' if $fam eq 'fleet';
+    return undef unless $fam eq 'package';
+    return undef if defined $pkg && $pkg =~ /^_/;
+    return 'relaunch,accept,drop,not-mine';
+}
+
+# _inbox_bridge_escalation_files($runs) -> sorted list of *.json basenames
+# (without extension) under <esc>.
+sub _inbox_bridge_escalation_ids {
+    my ($runs) = @_;
+    my $dir = escalations_dir($runs);
+    return () unless -d $dir;
+    opendir(my $dh, $dir) or return ();
+    my @ids = sort grep { /\.json\z/ && -f "$dir/$_" } readdir $dh;
+    closedir $dh;
+    s/\.json\z//i for @ids;
+    return @ids;
+}
+
+# _inbox_bridge_tick($ctx, \%t) -> $applied_count. Spec §3.1. t: status, reg,
+# tunables, answer (coderef). NEVER dies. $applied_count is how many answered
+# items had their action successfully applied (rc 0) this tick -- review-1.md
+# M1: the caller uses a non-zero count as the signal to refresh its own
+# $meta/$status/$att/$pid/$sid/$paused snapshot before any later same-tick
+# step (e.g. RECONCILE ORPHANED ESCALATIONS) reads them stale.
+sub _inbox_bridge_tick {
+    my ($ctx, $t) = @_;
+    return 0 unless $ctx;
+    my $applied_count = 0;
+    my $runs   = $ctx->{runs};
+    my $log    = $ctx->{log};
+    my $bp     = $ctx->{bp};
+    my $status = $t->{status}    || {};
+    my $reg    = $t->{reg}       || {};
+    my $tun    = $t->{tunables}  || {};
+    my $answer = $t->{answer};
+
+    # S1 -- settle: archive the escalation of a done/dropped package. No
+    # almanac access in this step.
+    eval {
+        my $dir = escalations_dir($runs);
+        for my $id (_inbox_bridge_escalation_ids($runs)) {
+            my $rec = _read_json("$dir/$id.json");
+            next unless ref $rec eq 'HASH';
+            next if $SETTLE_EXEMPT{ $rec->{kind} // '' };
+            my $pkg = $rec->{package};
+            next unless defined $pkg && exists $status->{$pkg};
+            my $st = lc($status->{$pkg} // '');
+            next unless $st eq 'done' || $st eq 'dropped';
+            if (archive_settled_escalation($runs, $id, $rec, "package reached $st")) {
+                _log($log, 'escalation_settled', { escalation => $id, package => $pkg, status => $st });
+            }
+        }
+        1;
+    } or _inbox_bridge_log_error($ctx, 's1_settle', $@);
+
+    # S2 -- items: open the inbox once; apply answers; close orphans/gone
+    # links; remember which escalation ids already have an open item.
+    my %has_open_item;
+    my $inbox_ok = eval {
+        my $items = Almanac::Inbox::list_items(root => $ctx->{root});
+        my @mine = sort { $a->{id} cmp $b->{id} } grep {
+            my $link = $_->{fields}{link};
+            defined $link && (split(m{/}, $link, -1))[0] eq $bp
+                && scalar(split(m{/}, $link, -1)) == 3
+                && !exists $_->{fields}{closed_at}
+        } @$items;
+        for my $item (@mine) {
+            my $link = $item->{fields}{link};
+            my $r = inbox_resolve_link($runs, $bp, $link);
+            my $state = $r->{state};
+            if ($state eq 'ambiguous') {
+                _inbox_bridge_once($ctx, "ambiguous:$link", sub { _log($log, 'inbox_link_ambiguous', { link => $link }); });
+                # review-1.md S2(a): mark BOTH candidate ids as "has an open
+                # item" -- otherwise S3 files a fresh (also ambiguous) item
+                # for each candidate every tick, unbounded (redteam-1.md L1).
+                my @segs = split m{/}, $link, -1;
+                if (@segs == 3 && length $segs[2]) {
+                    $has_open_item{ $segs[2] }    = 1;
+                    $has_open_item{ "_$segs[2]" } = 1;
+                }
+                next;
+            }
+            if ($state eq 'unreadable') {
+                _inbox_bridge_once($ctx, "unreadable:$link", sub { _log($log, 'inbox_link_unreadable', { link => $link }); });
+                next;
+            }
+            if ($state eq 'gone') {
+                inbox_close_item($ctx, $item, _orphan_close_reason($runs, $link), 'orchestrator');
+                next;
+            }
+            # 'found'
+            if (($item->{fields}{status} // '') eq 'answered') {
+                my $choice = $item->{fields}{choice};
+                my $note   = $item->{fields}{note};
+
+                # redteam-1.md M1 (authorization bypass): this item is only
+                # the bridge's own if its `choices` field is EXACTLY what the
+                # bridge would offer for this escalation's (package, kind)
+                # right now, the answered `choice` is a member of that set,
+                # and the escalation is still F1/F2-eligible right now. A
+                # forged item (hand-filed, wrong/absent choices, or an
+                # escalation that was never routed to the operator) never
+                # reaches the answer seam -- this also removes the
+                # action=>undef default-to-relaunch path for a choices-less
+                # item. The item is left exactly as it is (not closed): it
+                # still "covers" the escalation, so S3 must not pile a second
+                # item on top of it.
+                my ($f1_now, $f2_now) = _inbox_bridge_eligible_now($r->{rec}, $reg, $tun);
+                my $expected_choices = _inbox_bridge_choices_for(
+                    (ref $r->{rec} eq 'HASH' ? $r->{rec}{package} : undef),
+                    (ref $r->{rec} eq 'HASH' ? $r->{rec}{kind}    : undef));
+                my $item_choices = $item->{fields}{choices};
+                my $choices_ok = defined($expected_choices) && defined($item_choices)
+                               && $item_choices eq $expected_choices;
+                my $choice_ok  = $choices_ok && defined($choice)
+                               && grep { $_ eq $choice } split(/,/, $expected_choices, -1);
+                unless ($choice_ok && ($f1_now || $f2_now)) {
+                    $has_open_item{ $r->{id} } = 1;
+                    next;
+                }
+
+                # redteam-1.md L4: a not-mine answer re-queues the escalation
+                # IN PLACE (the file survives), so if a prior pass applied it
+                # (rc 0) but its item close then hit a persistent
+                # conflict/error, this same answered item is still here next
+                # tick. Re-running requeue_not_mine would wipe any resolver
+                # verdict written on the record since (resolved_by/
+                # confidence/evidence/product_question). Detect "already
+                # applied" by the record's own returned_at being no older
+                # than this item's answered_at, and retry only the close.
+                if ($choice eq 'not-mine' && ref($r->{rec}) eq 'HASH'
+                        && defined $r->{rec}{returned_at} && $r->{rec}{returned_at} =~ /\A\d+\z/) {
+                    my $ans_epoch = _inbox_bridge_iso_to_epoch($item->{fields}{answered_at});
+                    if (defined $ans_epoch && $r->{rec}{returned_at} >= $ans_epoch) {
+                        my $cres = inbox_close_item($ctx, $item,
+                            'answer applied: not-mine (returned to the escalation resolver)', 'orchestrator');
+                        $has_open_item{ $r->{id} } = 1 unless $cres eq 'closed' || $cres eq 'already';
+                        next;
+                    }
+                }
+
+                my $rc = eval { $answer->({ id => $r->{id}, action => $choice, note => $note }); };
+                $rc = 1 unless defined $rc;
+                if ($rc == 0) {
+                    $applied_count++;
+                    my $reason = ($choice eq 'not-mine')
+                        ? 'answer applied: not-mine (returned to the escalation resolver)'
+                        : "answer applied: $choice";
+                    my $cres = inbox_close_item($ctx, $item, $reason, 'orchestrator');
+                    # review-1.md S2(b): a persistent close conflict/error
+                    # leaves the item open -- treat it as still covering the
+                    # escalation so S3 does not also file a fresh one.
+                    $has_open_item{ $r->{id} } = 1 unless $cres eq 'closed' || $cres eq 'already';
+                    _log($log, 'inbox_answer_applied', { escalation => $r->{id}, item => $item->{id}, choice => $choice });
+                } elsif ($rc == 6) {
+                    # Deferred: the item stays open (answered) -- it still
+                    # covers this escalation, so S3 must not file a second,
+                    # unanswered item alongside it.
+                    $has_open_item{ $r->{id} } = 1;
+                    _inbox_bridge_once($ctx, "deferred:$item->{id}", sub {
+                        _log($log, 'inbox_answer_deferred', { escalation => $r->{id}, item => $item->{id}, choice => $choice, rc => $rc });
+                    });
+                } else {
+                    my $cres = inbox_close_item($ctx, $item, "answer $choice could not be applied (bp-answer-escalation exit $rc)", 'orchestrator');
+                    # review-1.md S2(b): only a successful close clears the
+                    # way for S3 to file a fresh item (AC4); a persistent
+                    # conflict/error keeps this one open instead of piling a
+                    # new item on top of it every tick (redteam-1.md L1-adjacent).
+                    $has_open_item{ $r->{id} } = 1 unless $cres eq 'closed' || $cres eq 'already';
+                    _log($log, 'inbox_answer_failed', { escalation => $r->{id}, item => $item->{id}, choice => $choice, rc => $rc });
+                }
+            } else {
+                $has_open_item{ $r->{id} } = 1;
+            }
+        }
+        1;
+    };
+    _inbox_bridge_log_error($ctx, 's2_items', $@) unless $inbox_ok;
+    return $applied_count unless $inbox_ok;   # S3 depends on S2 (open-inbox) having succeeded
+
+    # S3 -- file: one new item per unfiled operator-owned escalation.
+    eval {
+        for my $id (_inbox_bridge_escalation_ids($runs)) {
+            next if $has_open_item{$id};
+            my $dir = escalations_dir($runs);
+            my $rec = _read_json("$dir/$id.json");
+            next unless ref $rec eq 'HASH';
+            my $pkg = $rec->{package};
+            my ($f1, $f2, $cat) = _inbox_bridge_eligible_now($rec, $reg, $tun);
+            next unless $f1 || $f2;
+
+            my $kind = $rec->{kind};
+            my $link = inbox_link_for($bp, $pkg, $id);
+            my $choices = _inbox_bridge_choices_for($pkg, $kind);
+            unless (defined $link && defined $choices) {
+                my $why = !defined $link ? 'bad_link'
+                        : !defined kind_family_of($kind) ? 'unknown_kind'
+                        : 'pseudo_package';
+                _inbox_bridge_once($ctx, "unfileable:$id", sub {
+                    _log($log, 'inbox_bridge_unfileable', { escalation => $id, reason => $why });
+                });
+                next;
+            }
+
+            my $q = (defined $rec->{product_question} && length $rec->{product_question}) ? $rec->{product_question}
+                  : (defined $rec->{question} && length $rec->{question}) ? $rec->{question} : undef;
+            # review-1.md S1/N1 + redteam-1.md M2: undo the JSON::PP flag
+            # quirk (see _json_bytes), THEN scrub any byte sequence that is
+            # not valid UTF-8 the same way fleet_thread_reason does for the
+            # title -- Almanac::Record::serialize refuses to write invalid
+            # UTF-8, and without this the body (verbatim $q, never run
+            # through fleet_thread_reason) silently fails file() below with
+            # no operator-visible signal (redteam-1.md M2, reproduced).
+            $q = _inbox_bridge_scrub_utf8(_json_bytes($q)) if defined $q;
+            my $kdisp = defined $kind ? $kind : '';
+            my $title = defined $q ? fleet_thread_reason($q) : "Escalation $id (kind $kdisp) needs your answer";
+            my $body  = (defined $q ? $q : $title) . "\n\n" . "Escalation: $id (kind $kdisp)"
+                      . ($f2 ? "\nThe escalation resolver could not triage this escalation." : '') . "\n";
+
+            my $new_item = eval { Almanac::Inbox::file(root => $ctx->{root}, title => $title, body => $body,
+                link => $link, choices => $choices); };
+            if ($new_item) {
+                _log($log, 'inbox_item_filed', { escalation => $id, item => $new_item->{id}, rule => ($f1 ? 'F1' : 'F2') });
+            } else {
+                # redteam-1.md M2: a filing failure (store refused, bad_title,
+                # lock timeout, or -- pre-scrub -- invalid UTF-8) must not be
+                # silent: the operator is never told, every tick, forever.
+                my $ferr = _fleet_thread_err($@);
+                _inbox_bridge_once($ctx, "file_error:$id", sub {
+                    _log($log, 'inbox_bridge_error', { op => 'file', escalation => $id, error => $ferr });
+                });
+            }
+        }
+        1;
+    } or _inbox_bridge_log_error($ctx, 's3_file', $@);
+    return $applied_count;
+}
+
+# e02 §2.5: the kind->family registry that replaces bp-answer-escalation.pl's
 # source-scanning known_kinds()/kind_family() derivation. Fixes the still-live
 # 'dag-stalled' visibility bug (techcontas-batch1 #2) -- dag-stalled is built
 # via _dag_decision, a builder function invisible to a source-scanning regex.
 # 'family' is 'package' (resolved through the ledger) or 'fleet' (resolved by
-# clearing .paused) -- same two values bp-answer-decision.pl's kind_family()
+# clearing .paused) -- same two values bp-answer-escalation.pl's kind_family()
 # already returns.
 our %KIND_REGISTRY = (
     # Ordering below is deliberate, not incidental: t/61 scans the whole file
@@ -261,10 +1205,16 @@ our %KIND_REGISTRY = (
     'chronic-scoping'         => { family => 'package' },
 );
 our @KNOWN_KINDS = sort keys %KIND_REGISTRY;
-sub kind_family_of { my ($k) = @_; return defined $k ? $KIND_REGISTRY{$k}{family} : undef; }
+# N8 (06-fleet-inbox-bridge): the bridge calls this with arbitrary kinds from
+# escalation records on disk, including ones never registered -- a bare
+# `$KIND_REGISTRY{$k}{family}` would AUTOVIVIFY an empty hashref entry for
+# every unknown kind, growing %KIND_REGISTRY (and @KNOWN_KINDS, via its
+# `keys` snapshot were it re-read) on every call. `exists` first means an
+# unknown kind leaves the registry untouched.
+sub kind_family_of { my ($k) = @_; return (defined $k && exists $KIND_REGISTRY{$k}) ? $KIND_REGISTRY{$k}{family} : undef; }
 # Accessor (rather than a bare cross-package `@BpOrch::KNOWN_KINDS` reference):
 # a fully-qualified global referenced only once in another file trips perl's
-# "used only once" warning, which would leak onto bp-answer-decision.pl's
+# "used only once" warning, which would leak onto bp-answer-escalation.pl's
 # stdout/stderr (its CLI callers parse stdout as JSON -- a stray warning line
 # breaks that parse). A sub call carries no such warning.
 sub known_kinds_list { return @KNOWN_KINDS; }
@@ -321,7 +1271,7 @@ our $COORDINATOR_MAX_RUNTIME_SECS = $ENV{BP_COORDINATOR_MAX_RUNTIME_SECS} || (24
 # ===========================================================================
 
 sub _is_terminal { my $s = shift // ''; $s =~ /^(done|dropped|blocked|parked)$/ ? 1 : 0 }
-# blocked/parked = HALTED AWAITING A HUMAN: a human's answer (bp-answer-decision)
+# blocked/parked = HALTED AWAITING A HUMAN: a human's answer (bp-answer-escalation)
 # flips the package back to pending and the STILL-RUNNING orchestrator relaunches it
 # (the reporter contract is "no restart needed"). 'done'/'dropped' are settled —
 # nothing a human can do reopens them — so they never keep the loop alive.
@@ -1361,7 +2311,7 @@ sub has_progressable_work {
 # decision. A coordinator can self-block/park in its OWN ledger (stop-gate.sh
 # permits a terminal stop with a '## Next action') WITHOUT the orchestrator ever
 # running its escalation path — so no decision is filed, the reporter's queue-watcher
-# (bp-wait-for-decision) stays silent, and the run goes quiet. The loop reconciles
+# (bp-wait-for-escalation) stays silent, and the run goes quiet. The loop reconciles
 # this every tick: every awaiting-human package must leave the human something to
 # act on. $queued = { pkg => 1 } of packages that already have a decision (any kind).
 # Pure.
@@ -1380,7 +2330,7 @@ sub orphan_escalations {
 # --- the orchestrator exits ONLY when there is genuinely nothing left it could do:
 # nothing running, nothing progressable, no auto-resume pending, not paused, AND
 # nothing parked/blocked awaiting a human. The last clause is load-bearing: a
-# blocked/parked package is unblocked by a human's answer (bp-answer-decision flips
+# blocked/parked package is unblocked by a human's answer (bp-answer-escalation flips
 # it to pending), and the documented reporter contract is that the STILL-RUNNING
 # orchestrator relaunches it next tick — "no restart needed". Exiting here strands
 # the run on a dead orchestrator. Awaiting-human work keeps the loop alive (idle-
@@ -1831,7 +2781,7 @@ sub clear_pause { my ($runs) = @_; unlink "$runs/.paused"; }
 # Returns the decision file path on success (existing one when deduped), 0 on any
 # mkdir/write/rename failure (never dies — see _escalation_write_failed).
 # the raw temp+rename publish, unchanged from the pre-a01 shape (atomic: temp in
-# the same dir + rename, so the A7 bp-wait-for-decision watcher never reads a
+# the same dir + rename, so the A7 bp-wait-for-escalation watcher never reads a
 # half-written queue file). Factored out so both the direct path (kind not in
 # %DECISION_VALIDITY) and the guarded path (kind IS in the table, called from
 # INSIDE guarded_write's own `mutate`, i.e. still under the ledger's lock) share
@@ -2050,7 +3000,7 @@ sub queue_needs_you {
 # --- packages that currently have a queued needs-you decision (any kind). Used to
 # reconcile orphaned blocked/parked packages (orphan_escalations) so the loop never
 # re-files a decision for a package the human can already see. Half-written/non-JSON
-# files and dotfiles are ignored (matches bp-wait-for-decision's scanner).
+# files and dotfiles are ignored (matches bp-wait-for-escalation's scanner).
 sub queued_decision_pkgs {
     my ($runs) = @_;
     my %pk;
@@ -2288,10 +3238,10 @@ sub archive_judge_verdict {
 # hasn't moved (a fresh inflight epoch, or a verdict landing) -- it says nothing
 # about the PACKAGE'S LEDGER STATUS, which every caller's `$st` is a once-per-tick
 # snapshot of (`_load_state`, never re-read again this tick). A human running
-# `bp-answer-decision.pl` mid-tick can flip that status after the snapshot but
+# `bp-answer-escalation.pl` mid-tick can flip that status after the snapshot but
 # before this function is reached, and this gate used to let the outcome through
 # anyway. When `$expected_status` is supplied, ALSO re-read the ledger's `status:`
-# field -- under the ledger's OWN lock, the same lock bp-answer-decision.pl's
+# field -- under the ledger's OWN lock, the same lock bp-answer-escalation.pl's
 # status writes take (`BpWrite::lock_path("$bpdir/packages/$pkg.md")`) -- and
 # refuse (reason `ledger-status-moved`) if it no longer matches. Same shape as
 # `_harvest_verdict_still_applies`'s status check below: a gate-only guarded_write
@@ -2562,10 +3512,23 @@ sub _dispatch_log {
 # --- runs/.orchestrator marker (PID + flock; held for the run's lifetime).
 sub acquire_marker {
     my ($path) = @_;
-    open my $fh, '>', $path or die "bp-orchestrator: marker open: $!";
-    unless (flock($fh, LOCK_EX | LOCK_NB)) { close $fh; return undef; }
-    { my $o = select($fh); local $| = 1; print $fh "$$\n"; select($o); }
-    return $fh;                       # keep open to hold the lock
+    for (my $attempt = 1; $attempt <= 3; $attempt++) {
+        sysopen(my $fh, $path, O_RDWR | O_CREAT, 0666)
+            or die "bp-orchestrator: marker open: $!";
+        unless (flock($fh, LOCK_EX | LOCK_NB)) { close $fh; return undef; }
+        my @path_stat = stat($path);
+        my @fh_stat   = stat($fh);
+        unless (@path_stat && @fh_stat
+                && $path_stat[0] == $fh_stat[0] && $path_stat[1] == $fh_stat[1]) {
+            close $fh;
+            next;
+        }
+        truncate($fh, 0) or die "bp-orchestrator: marker write: $!";
+        seek($fh, 0, 0) or die "bp-orchestrator: marker write: $!";
+        { my $pid_line = "$$\n"; defined(syswrite($fh, $pid_line)) or die "bp-orchestrator: marker write: $!"; }
+        return $fh;                       # keep open to hold the lock
+    }
+    return undef;
 }
 sub read_marker_pid {
     my ($path) = @_;
@@ -3017,6 +3980,52 @@ sub run {
     }
     _log($log, 'orchestrator_start', { blueprint => $bp, pid => $$, tunables => $t });
 
+    # 05-fleet-thread-and-wording: a fleet run's thread. Off by default
+    # ($opt->{fleet_thread} false): $fctx stays undef, no Almanac::Thread code
+    # runs, nothing is written under .ccpraxis-local-data/almanac (spec §2.1).
+    my $fctx = $opt->{fleet_thread}
+        ? _fleet_thread_setup({ blueprint => $bp, bp_dir => $bpdir, runs => $runs, log => $log })
+        : undef;
+
+    # 06-fleet-inbox-bridge: off by default ($opt->{inbox_bridge} false), same
+    # opt-in convention as fleet_thread above (spec §2.4). $bctx stays undef,
+    # inbox_bridge_setup is never called, no almanac-inbox.pl %INC entry is
+    # added and nothing under <project>/.ccpraxis-local-data/almanac is
+    # touched unless a caller opts in.
+    my ($bctx) = $opt->{inbox_bridge}
+        ? inbox_bridge_setup({ blueprint => $bp, bp_dir => $bpdir, runs => $runs, log => $log })
+        : ();
+    # answer_escalation: test seam (spec §2.4). Default shells out to
+    # bp-answer-escalation.pl exactly as a human would, child stdout/stderr
+    # redirected to the null device around the call (the _run_quiet
+    # discipline bp-resolve.pl uses, reimplemented locally -- BpResolve is
+    # not loaded here).
+    my $answer_escalation = $opt->{answer_escalation} || sub {
+        my ($a) = @_;
+        my $devnull = File::Spec->devnull;
+        my ($so, $se);
+        open($so, '>&', \*STDOUT) or return 1;
+        open($se, '>&', \*STDERR) or return 1;
+        unless (open(STDOUT, '>', $devnull)) { open(STDOUT, '>&', $so); return 1; }
+        unless (open(STDERR, '>', $devnull)) { open(STDOUT, '>&', $so); open(STDERR, '>&', $se); return 1; }
+        # N2: encode explicitly rather than relying on perl's internal
+        # utf8-flagged representation happening to carry the right bytes to
+        # the child -- correct on every runtime this probe covered, but
+        # implicit. Never the value on $a->{note} itself (it is also logged).
+        require Encode;
+        my $note_arg = $a->{note};
+        $note_arg = Encode::encode('UTF-8', $note_arg) if defined $note_arg && utf8::is_utf8($note_arg);
+        system($^X, "$DIR/bp-answer-escalation.pl", $bp, '--decision', $a->{id}, '--action', $a->{action},
+            (defined $note_arg ? ('--note', $note_arg) : ()), '--bp-dir', $bpdir);
+        my $raw = $?;
+        open(STDOUT, '>&', $so); open(STDERR, '>&', $se);
+        close $so; close $se;
+        return 1 if $raw == -1;
+        my $code = $raw >> 8;
+        return $code if $code;
+        return ($raw & 127) ? 1 : 0;
+    };
+
     my $STOP = 0;
     local $SIG{TERM} = sub { $STOP = 1 };
     local $SIG{INT}  = sub { $STOP = 1 };
@@ -3210,7 +4219,7 @@ sub run {
                                     . "but has no ledger file (packages/$pkg.md). It is held -- never "
                                     . "launched, no attempt burned -- until one exists. Run "
                                     . "'bp-blueprint.pl add-package' (or otherwise create the ledger) "
-                                    . "then answer this decision.",
+                                    . "then answer this escalation.",
                         context    => { ledger => "packages/$pkg.md" },
                         created_at => $now,
                         category   => 'implementation',
@@ -3428,6 +4437,31 @@ sub run {
             # refuses every tick. `local` is scoped to this tick, so the next
             # _tunables() re-read above still sees the operator's real environment.
             local $ENV{BP_MAX_PARALLEL} = $t->{max_par} // 2;
+
+            # 06-fleet-inbox-bridge: runs every tick, paused ticks included,
+            # immediately before 05's fleet-thread tick (spec §2.4) -- so a
+            # closed/applied escalation this pass is visible to 05's own tick
+            # in the SAME tick.
+            my $inbox_applied = $bctx ? _inbox_bridge_tick($bctx, { status => $status, reg => read_registry($runs),
+                tunables => $t, answer => $answer_escalation }) : 0;
+            # review-1.md M1: an applied answer (relaunch/reset/accept/drop)
+            # flips the ledger and/or unlinks the escalation file THROUGH A
+            # SUBPROCESS -- $meta/$status/$att/$pid/$sid and $paused were
+            # snapshotted at tick-start and are now stale. Left stale, the
+            # later RECONCILE ORPHANED ESCALATIONS pass (same tick) still sees
+            # the pre-answer status and re-files a fresh 'stuck-package'
+            # escalation for the package the operator just unblocked
+            # (reproduced). Refresh both immediately, before anything else
+            # this tick reads them.
+            if ($inbox_applied) {
+                ($meta, $status, $att, $pid, $sid) = _load_state($bpdir, $runs);
+                $paused = read_paused($runs);
+            }
+
+            # 05-fleet-thread-and-wording: runs on every tick, paused ticks
+            # included, after the token keeper and usage poll have refreshed
+            # $paused (spec §2.5) and before PAUSE GATING's early `next`.
+            _fleet_thread_tick($fctx, { paused => $paused, meta => $meta, now => $now }) if $fctx;
 
             # ---- PAUSE GATING: maybe auto-resume; never launch while paused ----
             my $resume_pending = ($paused && !$paused->{manual}) ? 1 : 0;
@@ -4017,7 +5051,7 @@ sub run {
                     # || exit 1`, so dispatching one is a guaranteed spawn
                     # failure -- which burns the cap and then files a
                     # harvest-spawn-failure decision naming a package that has
-                    # no ledger for bp-answer-decision.pl to resolve against.
+                    # no ledger for bp-answer-escalation.pl to resolve against.
                     # Every action there fail-closes on the missing ledger, so
                     # the operator gets a queue entry only hand-deletion can
                     # clear. Almanac 20260824-100216-4ec2.
@@ -4845,12 +5879,12 @@ sub run {
                 my $errno = (defined $LAST_EXEC_ERROR && length "$LAST_EXEC_ERROR")
                           ? "$LAST_EXEC_ERROR" : 'exec failed (errno unavailable)';
                 _enter_pause_manual($runs, $log, 'broken-env: launcher could not be executed',
-                    { package => '_fleet', blueprint => $bp, kind => 'broken-env',
+                    { package => '_fleet', blueprint => $bp, kind => 'broken-env', category => 'unclassified',
                       question => "The launcher could not be executed $n times in a row — the run environment is broken "
                                 . '(missing bash, missing bp-launch.sh, or a bad mount). Fix it, then resume the run '
                                 . 'by deleting runs/.paused (`rm runs/.paused`) — this pause is manual and will not lift on its own.',
                       context  => "exec of 'bash $DIR/bp-launch.sh' failed on $n consecutive launch attempts; last errno: $errno",
-                      created_at => $now, category => 'operator-action' });
+                      created_at => $now });
                 $exec_fail_streak = 0;
             }
 
@@ -4871,9 +5905,9 @@ sub run {
                         detail => 'awaiting-human with no queued decision (coordinator self-park) — escalating' });
                     queue_needs_you($runs, {
                         package => $pkg, blueprint => $bp, kind => 'stuck-package', category => 'unclassified',
-                        question => "Package '$pkg' was set to '$st' by its coordinator with no decision filed for you. "
+                        question => "Package '$pkg' was set to '$st' by its coordinator with no escalation filed for you. "
                                   . "Read its '## Next action' (it may address an instruction to the orchestrator, e.g. a write_set change), then relaunch with guidance / accept / drop.",
-                        context  => ($next // "orphaned '$st' status — no needs-you decision existed; filed by the orchestrator so the run doesn't go silent"),
+                        context  => ($next // "orphaned '$st' status — no escalation existed; filed by the orchestrator so the run doesn't go silent"),
                         created_at => $now,
                     });
                 }
@@ -5072,10 +6106,12 @@ sub run {
                     }
                 }
             }
-            if (run_complete({ any_running => $any_running, outstanding => $outstanding,
+            my $complete = run_complete({ any_running => $any_running, outstanding => $outstanding,
                                resume_pending => $resume_pending, paused => ($paused ? 1 : 0),
                                awaiting_human => $awaiting_human,
-                               conformance_outstanding => $conf_outstanding })) {
+                               conformance_outstanding => $conf_outstanding });
+            _fleet_thread_end($fctx, $complete) if $fctx;
+            if ($complete) {
                 _log($log, 'idle_exit', { detail => 'no running, no progressable work, not paused, nothing awaiting a human' });
                 last;
             }
@@ -5276,7 +6312,7 @@ sub _dag_decision {
         kind       => 'dag-stalled',
         question   => "The blueprint's dependency graph cannot progress: $n unresolvable dependency "
                     . "problem(s). No package can launch until the graph resolves. Fix blueprint.md's "
-                    . "depends_on column (or drop the affected packages), then answer this decision.",
+                    . "depends_on column (or drop the affected packages), then answer this escalation.",
         context    => {
             class        => $class,          # 'unresolvable' | 'remediation-exhausted'
             unresolvable => $r->{unresolvable},
@@ -5881,10 +6917,10 @@ sub _apply_harvest_findings {
 # `runs` means no liveness check, so the orchestrator writing its OWN packages'
 # ledgers (internal callers) never refuses itself (edge case 4). `supersede => 1`
 # skips the liveness check even when `runs` is given (the --action reset shape,
-# which already kills the coordinator before calling this -- bp-answer-decision.pl
+# which already kills the coordinator before calling this -- bp-answer-escalation.pl
 # :497). `log` overrides the default log path (`$runs/orchestrator.log`).
 # fixbatch step7: the coordinator-alive check factored out of _set_ledger_status's
-# `valid` closure so bp-answer-decision.pl can run it as a cheap, best-effort PRE-
+# `valid` closure so bp-answer-escalation.pl can run it as a cheap, best-effort PRE-
 # check before it writes anything at all (see that script's header comment on the
 # ordering this enables). This is advisory only -- the AUTHORITATIVE check remains
 # the one still run under the ledger's own lock inside _set_ledger_status itself;
@@ -6020,6 +7056,6 @@ unless (caller) {
         }
         $bpdir = "$data/blueprints/$bp";
     }
-    BpOrch::run({ blueprint => $bp, bp_dir => $bpdir, once => $once });
+    BpOrch::run({ blueprint => $bp, bp_dir => $bpdir, once => $once, fleet_thread => 1, inbox_bridge => 1 });
 }
 1;
