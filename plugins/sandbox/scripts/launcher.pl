@@ -473,6 +473,16 @@ $PROJECT_PATH = abs_path($PROJECT_PATH)
     or die "ERROR: cannot resolve project path '$POSITIONAL[0]'\n";
 $PROJECT_PATH =~ s|\\|/|g;
 $PROJECT_PATH =~ s|/+$||;
+# f15e: Cwd::abs_path() on this host hands back a lowercase-drive POSIX path
+# (e.g. /c/Development/ccpraxis). winify_path() (MountSpec.pm, shared and
+# out of scope per Decision 68) preserves whatever case the drive letter
+# already had, so it would convert this to `c:/Development/ccpraxis`. Real
+# Claude Code host session dirs on disk always use an uppercase drive
+# letter, and SessionFork's encoding is case-preserving by design, so a
+# lowercase drive letter here means the picker's host-origin rows never
+# match. Normalize the POSIX drive letter to uppercase BEFORE winify_path
+# runs, local to launcher.pl only.
+$PROJECT_PATH =~ s{^/([a-z])/}{'/' . uc($1) . '/'}e if $WINDOWS_FAMILY;
 $PROJECT_PATH = winify_path($PROJECT_PATH);
 
 my $PROJECT_NAME = lc(basename($PROJECT_PATH));
@@ -3661,14 +3671,16 @@ sub prompt_stale_action {
 # _container_name_for($raw_path) -> container name string
 # Normalises a path using the SAME sequence the main launch applies to
 # $PROJECT_PATH (abs_path -> backslash->slash -> strip trailing slash ->
-# winify_path -> lc(basename) -> space->dash) so any container-name lookup
-# always matches the name the real podman launch uses for the same
-# worktree. Idempotent on already-normalised paths.
+# uppercase POSIX drive letter (Windows only) -> winify_path -> lc(basename)
+# -> space->dash) so any container-name lookup always matches the name the
+# real podman launch uses for the same worktree. Idempotent on
+# already-normalised paths.
 sub _container_name_for {
     my ($raw_path) = @_;
     my $p = abs_path($raw_path) // $raw_path;
     $p =~ s|\\|/|g;
     $p =~ s|/+$||;
+    $p =~ s{^/([a-z])/}{'/' . uc($1) . '/'}e if $WINDOWS_FAMILY;
     $p = winify_path($p);
     my $n = lc(basename($p));
     $n =~ s/ /-/g;
@@ -7162,7 +7174,7 @@ sub _keepawake_reap_orphan {
 # Returns ($operator, $triage): decisions only a human can clear, and decisions
 # queued for the escalation resolver.
 #
-# The banner used to sum decisions_waiting, the TOTAL, and label it "needs you".
+# The banner used to sum escalations_waiting, the TOTAL, and label it "needs you".
 # Most of that total is work nobody needs to be woken for -- the resolver reads
 # it and either acts or re-tags. Summing it made the panel assert operator
 # ownership over a queue it had not looked inside.
@@ -7181,14 +7193,14 @@ sub _count_needs_you {
         # Fall back to the total when the split is absent, so a summary produced
         # by an older RunState still reports SOMETHING rather than silently zero.
         # Erring toward "the operator owns it" is the safe direction here.
-        my $o = $r->{decisions_operator};
-        my $t = $r->{decisions_triage};
+        my $o = $r->{inbox_waiting};
+        my $t = $r->{triage_waiting};
         if (defined $o && !ref($o) && $o =~ /^\d+$/) {
             $op += $o;
             $tri += $t if defined $t && !ref($t) && $t =~ /^\d+$/;
             next;
         }
-        my $d = $r->{decisions_waiting};
+        my $d = $r->{escalations_waiting};
         next unless defined $d && !ref($d) && $d =~ /^\d+$/;
         $op += $d;
     }

@@ -66,6 +66,15 @@ sub encode_project_path {
             $out .= '-';
         }
     }
+    # The Encode::decode() above leaves $out internally UTF8-flagged (even
+    # though every char it can contain is plain ASCII), which corrupts any
+    # non-ASCII bytes it later gets concatenated with (e.g. a
+    # $claude_config_dir containing a literal UTF-8-encoded accented
+    # character, such as this host's `C:\Users\André`): Perl upgrades the
+    # byte string to match the flag, double-encoding it. Per this module's
+    # own contract ("Paths are opaque byte strings"), collapse back to an
+    # unflagged byte string before returning.
+    utf8::encode($out) if utf8::is_utf8($out);
     return $out;
 }
 
