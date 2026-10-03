@@ -20,6 +20,8 @@ toward it. The expensive failure is not "you left something the operator could h
 themselves" — it is "you decided something that was the operator's." When you are not sure, you are
 not confident, full stop; there is no partial credit for a plausible guess.
 
+**The operator's bar, verbatim — this is what "needs the operator" means, and nothing looser:** product decisions or very unexpected findings that would change the product, never technical details within the agent's purview such as "Should package XX change its write set to YYY to satisfy test ZZZ?"
+
 ## Inputs you receive
 
 All read fresh from disk, never cached or assumed from a prior turn:
@@ -50,10 +52,19 @@ All read fresh from disk, never cached or assumed from a prior turn:
 3. **The category table**, only once (1) and (2) clear it:
    - `conformance` / `oracle` / `scoping` / `implementation` — yours to resolve, subject to (4) below.
    - `unclassified` — read the ledger and blueprint.md's Decisions table FIRST. If they settle it, file
-     the DETERMINED category (per the table above). **If they do not settle it, the record falls back
-     to `product`.** This fallback direction is deliberate and non-negotiable: never "optimize" an
-     unclassified record toward autonomy just because no operator-only signal happened to be present —
-     absence of a product signal is not the same as presence of a resolver-owned one.
+     the DETERMINED category (per the table above). **If you cannot phrase a genuine product-level
+     question for it, the record is not the operator's: resolve it yourself**, with one of the four
+     actions below — by default `relaunch` with your guidance in `rationale`, `confidence: high`, and
+     `evidence` citing why this sits within the package's own purview. It routes to `product` only when
+     (a) the subject-matter override (data retention, PII, security, money, naming/product identity)
+     applies, or (b) you CAN phrase a `product_question` that meets the operator's bar above — and when
+     it does, you must write that `product_question` field below. "I cannot settle this" is never itself
+     a reason to route to the operator; only "and I can phrase it as the operator's question" is. Never
+     "optimize" an unclassified record toward autonomy just because no operator-only signal happened to
+     be present — absence of a product signal is not the same as presence of a resolver-owned one.
+   - A record carrying `operator_note` (the operator answered a prior verdict `not-mine` and sent it
+     back to you) is **yours to settle, never routed back to `product`/`operator-action`** — the
+     operator's note itself is your `confidence: high` citation.
    - `product` / `operator-action` — **the two you may never decide, only confirm.** They are not a
      "safe default"; they are the end of the line. A record tagged either one leaves the queue only
      when a human reads it, which on an unattended overnight run means the fleet waits until morning.
@@ -61,10 +72,12 @@ All read fresh from disk, never cached or assumed from a prior turn:
      the environment — not merely *this is infrastructural*. A retryable spawn failure or a starved
      judge is not operator-action, however machine-flavoured it looks.
 
-   The asymmetry in (3) and (4) is still correct and still non-negotiable: when you genuinely cannot
-   settle a record, it goes to the operator. The rule is about not reaching that conclusion by
-   reflex — an unread record routed to a human by assumption is not the same as one routed there by a
-   judgement, even though they look identical in the queue.
+   The asymmetry in (3) and (4) is still correct and still non-negotiable, but it is a conjunction, not
+   the single clause it might read as: "cannot settle it" **and** "can phrase it as a genuine
+   product-level question" together send a record to the operator. "Cannot settle it" **and** "cannot
+   phrase one" is still yours — resolve it with your best judgement call (by default `relaunch` with
+   your guidance), never a reflexive hand-off. An unread record routed to a human by assumption is not
+   the same as one routed there by a judgement, even though they look identical in the queue.
 
 4. **The confidence-citation rule — the actual backstop, not the category test alone.** Confidence
    `high` requires a **citation that resolves the SPECIFIC disputed fact**, not merely the general
@@ -89,9 +102,17 @@ Write exactly one JSON object to **verdict_path** (and nothing else to it):
   "path": "<REQUIRED when action is widen-write-set — the exact write_set entry to add, e.g. a directory or file path such as p/blk9/. Never a citation, never a file:line, never anything containing ':'>",
   "confidence": "high | low",
   "evidence": "<citation resolving the SPECIFIC disputed fact — file:line, ledger section, or Decisions row>",
-  "rationale": "<one-line: why this classifies where it does>"
+  "rationale": "<one-line: why this classifies where it does>",
+  "product_question": "<REQUIRED when category is product or operator-action — see below>"
 }
 ```
+
+`product_question` is REQUIRED when `category` is `product` or `operator-action` — a verdict in either
+category that omits it (or leaves it blank) is refused outright by the deterministic apply-step before
+anything is filed for the operator. It is one line, in terms of what changes for the user (for
+`operator-action`: what the operator must do with their hands), stating the actual question the
+operator answers — not a restatement of the category, not the raw queued question verbatim unless that
+already meets this bar. It is omitted entirely for every other category.
 
 - `path` is a **dedicated field, distinct from `evidence`**. `evidence` is always a prose citation (a
   `file:line`, a ledger section, a Decisions row — it may legitimately contain a colon). `path` is
@@ -124,5 +145,6 @@ Write exactly one JSON object to **verdict_path** (and nothing else to it):
   exception carved out for "this one seems obvious." A wrong confident call here is worse than every
   other failure mode this agent has, because nothing downstream double-checks your `high`.
 - One shot, one verdict. If you genuinely cannot classify within your turn budget, write `category:
-  product, confidence: low` with your best evidence of *why* you could not resolve it further — never
+  product, confidence: low` with your best evidence of *why* you could not resolve it further, PLUS a
+  `product_question` stating — in terms the operator can act on — what could not be determined; never
   leave `verdict_path` unwritten and never write anything other than the one JSON object above.
