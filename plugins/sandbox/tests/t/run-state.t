@@ -38,6 +38,18 @@ use File::Temp qw(tempdir);
 use File::Path qw(make_path);
 use File::Find ();
 
+# AC15 (08-blueprint-parks fix-batch, SF-3): pin HOME/USERPROFILE/
+# ALMANAC_HOME to an isolated tempdir before any production code loads
+# (use_ok('RunState') below included), so a fixture call that is ever
+# unticketed cannot reach the operator's real vault (Decision 29). Pure
+# hardening -- this file names none of these vars today.
+BEGIN {
+    my $env_pin = File::Temp::tempdir(CLEANUP => 1);
+    $ENV{HOME}         = $env_pin;
+    $ENV{USERPROFILE}  = $env_pin;
+    $ENV{ALMANAC_HOME} = $env_pin;
+}
+
 my $SCRIPTS_DIR    = "$Bin/../../scripts";
 my $RUNSTATE_PATH  = "$SCRIPTS_DIR/RunState.pm";
 my $LAUNCHER_PATH  = "$SCRIPTS_DIR/launcher.pl";
@@ -187,6 +199,15 @@ sub make_blueprint {
     return $dir;
 }
 
+# 08-blueprint-parks: a blueprint.md with a fenced `status:` the way BpState
+# reads it. make_blueprint() above never writes blueprint.md at all (RunState
+# never reads it for anything else), so this is a separate, deliberately
+# minimal helper used only by the AC12/B15 block below.
+sub write_blueprint_md_fence {
+    my ($dir, $status) = @_;
+    write_file("$dir/blueprint.md", "# Test Blueprint\n\n```\nstatus: $status\n```\n");
+}
+
 sub snapshot_tree {
     my ($root) = @_;
     my %snap;
@@ -285,11 +306,11 @@ sub field       { my ($h, $k) = @_; return is_hashref($h) ? $h->{$k} : $FAILED; 
 # assertion exists to catch. Extending it is therefore a deliberate act, made
 # here, not something a producer gets to do silently.
 #
-# Widened to 13 on 2026-08-24. `decisions_waiting` was the total number of queued
+# Widened to 13 on 2026-08-24. `escalations_waiting` was the total number of queued
 # escalations and the panel rendered it as "needs you", which asserted operator
 # ownership over a queue nothing had looked inside -- most of those records are
 # handled by the escalation resolver without waking anyone. The split is
-# additive: decisions_waiting keeps its old meaning and its old value, and the
+# additive: escalations_waiting keeps its old meaning and its old value, and the
 # two new keys say who each half belongs to.
 #
 # Widened to 16 by package 04-runstate-run-and-package-facts (driver ruling
@@ -311,19 +332,31 @@ sub field       { my ($h, $k) = @_; return is_hashref($h) ? $h->{$k} : $FAILED; 
 # moment RunState.pm starts emitting the new key, on every fixture in this
 # file, since `run_agents` must be always-present (a sometimes-absent key
 # defeats the closed-key-set contract) rather than conditionally omitted.
+#
+# Widened to 19 by package 13-dashboard-threads (where-things-go, architect
+# spec specs/13-dashboard-threads-spec.md S2.2): `thread` (undef, or a HASH
+# naming the thread driving this blueprint -- name/state/done/total/doing/
+# current/next/owner) and `thread_events` (ARRAY, never undef, the project's
+# up to $RunState::MAX_THREAD_EVENTS newest thread-log entries, identical
+# across every summary from one summarize() call) are ALWAYS present, same
+# closed-set discipline as every earlier widening.
 my @SUMMARY_KEYS = qw(
     blueprint runs_dir state orchestrator_pid orchestrator_alive orchestrator_started_at
     paused_manual paused_reason packages_total packages_done current_package
-    running_coordinators decisions_waiting decisions_operator decisions_triage packages
-    run_agents
+    running_coordinators escalations_waiting inbox_waiting triage_waiting packages
+    run_agents thread thread_events
 );
+
+# EVENT_KEYS -- the 11 always-present keys of one %event element inside
+# thread_events (spec S2.2).
+my @EVENT_KEYS = qw(thread id at epoch event actor session task from to reason);
 
 # assert_summary_shape($summary, $label): the closed 17-key set (S2.1 + AT-8)
 # plus the declared type/nullability of each key. AC-6 / B28.
 sub assert_summary_shape {
     my ($s, $label) = @_;
     ok(is_hashref($s), "$label: summary is a hashref") or return;
-    is_deeply([ sort keys %$s ], [ sort @SUMMARY_KEYS ], "$label: exactly the 17 S2.1+AT-8 keys, no more, no fewer");
+    is_deeply([ sort keys %$s ], [ sort @SUMMARY_KEYS ], "$label: exactly the 19 S2.1+AT-8+package-13 keys, no more, no fewer");
     ok(defined($s->{blueprint}) && !ref($s->{blueprint}) && length($s->{blueprint}), "$label: blueprint is a non-empty Str");
     ok(defined($s->{runs_dir})  && !ref($s->{runs_dir})  && length($s->{runs_dir}),  "$label: runs_dir is a non-empty Str");
     # Widened by blueprint unified-tui-design-system package
@@ -344,7 +377,7 @@ sub assert_summary_shape {
     ok(defined($s->{packages_done})  && $s->{packages_done}  =~ /^\d+$/, "$label: packages_done is a non-negative Int");
     ok(!defined($s->{current_package}) || (!ref($s->{current_package}) && length($s->{current_package})), "$label: current_package is undef or a non-empty Str");
     ok(defined($s->{running_coordinators}) && $s->{running_coordinators} =~ /^\d+$/, "$label: running_coordinators is a non-negative Int");
-    ok(defined($s->{decisions_waiting}) && $s->{decisions_waiting} =~ /^\d+$/, "$label: decisions_waiting is a non-negative Int");
+    ok(defined($s->{escalations_waiting}) && $s->{escalations_waiting} =~ /^\d+$/, "$label: escalations_waiting is a non-negative Int");
     # fix-batch SHOULD-FIX (review): the type checks for the three keys
     # 04-runstate-run-and-package-facts added (AT-4) landed only in t/184's
     # assert_new_key_types, never here -- so this canonical shape assertion
@@ -364,6 +397,44 @@ sub assert_summary_shape {
     # conformance judge). Package 05 does not widen the element shape here;
     # it only asserts the run-level key exists and is the right ref type.
     ok(ref($s->{run_agents}) eq 'ARRAY', "$label: run_agents is always an ARRAY ref, defined, even when no _run agent exists (AT-8)");
+
+    # package 13-dashboard-threads (spec S2.2): thread is undef or a HASH of
+    # the declared shape; thread_events is always an ARRAY, never undef, each
+    # element an 11-key hash, bounded by $RunState::MAX_THREAD_EVENTS.
+    ok(!defined($s->{thread}) || is_hashref($s->{thread}),
+        "$label: thread is undef or a HASH (package 13)");
+    if (is_hashref($s->{thread})) {
+        my $th = $s->{thread};
+        ok(defined($th->{name}) && length($th->{name}), "$label: thread.name is a non-empty Str");
+        ok(defined($th->{state}) && grep { $th->{state} eq $_ } qw(live handed-off),
+            "$label: thread.state is 'live' or 'handed-off'");
+        ok(defined($th->{done}) && $th->{done} =~ /^\d+$/, "$label: thread.done is a non-negative Int");
+        ok(defined($th->{total}) && $th->{total} =~ /^\d+$/, "$label: thread.total is a non-negative Int");
+        ok(ref($th->{doing}) eq 'ARRAY', "$label: thread.doing is always an ARRAY ref");
+        ok(exists($th->{current}), "$label: thread.current key exists (undef or a label hash)");
+        ok(exists($th->{next}), "$label: thread.next key exists (undef or a label hash)");
+        ok(is_hashref($th->{owner}), "$label: thread.owner is a HASH");
+        if (is_hashref($th->{owner})) {
+            my $ow = $th->{owner};
+            ok(defined($ow->{kind}) && grep { $ow->{kind} eq $_ } qw(session orchestrator none),
+                "$label: thread.owner.kind is session|orchestrator|none");
+            ok(!defined($ow->{alive}) || $ow->{alive} == 0 || $ow->{alive} == 1,
+                "$label: thread.owner.alive is undef, 0 or 1");
+            ok(!defined($ow->{armed}) || $ow->{armed} == 0 || $ow->{armed} == 1,
+                "$label: thread.owner.armed is 0 or 1 (never undef)");
+        }
+    }
+    ok(ref($s->{thread_events}) eq 'ARRAY', "$label: thread_events is always an ARRAY ref, never undef (package 13)");
+    if (ref($s->{thread_events}) eq 'ARRAY') {
+        cmp_ok(scalar(@{ $s->{thread_events} }), '<=', 10,
+            "$label: thread_events has at most \$RunState::MAX_THREAD_EVENTS (10) entries");
+        for my $i (0 .. $#{ $s->{thread_events} }) {
+            my $e = $s->{thread_events}[$i];
+            ok(is_hashref($e), "$label: thread_events[$i] is a hashref");
+            next unless is_hashref($e);
+            is_deeply([ sort keys %$e ], [ sort @EVENT_KEYS ], "$label: thread_events[$i] has exactly the 11 S2.2 event keys");
+        }
+    }
 }
 
 # ===========================================================================
@@ -742,6 +813,47 @@ sub can_detect_symlink {
     is(field(RS('summarize_dir', $dir), 'state'), 'idle', 'B12/AC-7: no marker present -> state \'idle\'');
 }
 
+# --- AC12 (08-blueprint-parks, B15): blueprint.md authored 'parked' forces
+# state => 'parked' even under a LIVE orchestrator marker (beats a live run,
+# unlike B11's .shutdown marker which is a run-level fact). escalations/
+# inbox/triage counts are derived from run markers only and stay identical
+# to the same fixture authored 'audited'. The 17-key set is unchanged. ------
+{
+    my $root = tempdir(CLEANUP => 1);
+    my $dir = make_blueprint($root, 'bp-authored-parked', orchestrator => "$$\n",
+        registry => registry_json(p1 => 'running'),
+        needs_you => [ { name => 'esc1.json', content => '{}' } ]);
+    write_blueprint_md_fence($dir, 'parked');
+    my $s = RS('summarize_dir', $dir);
+    is(field($s, 'state'), 'parked', "AC12 (B15): authored parked beats a live orchestrator marker");
+    SKIP: {
+        skip 'summarize_dir did not return a hashref', 1 unless is_hashref($s);
+        is_deeply([sort keys %$s], [sort @SUMMARY_KEYS], 'AC12 (B15): the key set is still the closed set (19, package 13 widening)');
+    }
+
+    my $root2 = tempdir(CLEANUP => 1);
+    my $dir2 = make_blueprint($root2, 'bp-audited-baseline', orchestrator => "$$\n",
+        registry => registry_json(p1 => 'running'),
+        needs_you => [ { name => 'esc1.json', content => '{}' } ]);
+    write_blueprint_md_fence($dir2, 'audited');
+    my $s2 = RS('summarize_dir', $dir2);
+    isnt(field($s2, 'state'), 'parked',
+        'AC12 (B15) baseline: the same fixture authored audited is NOT parked (sanity on the fixture itself)');
+    is(field($s, 'escalations_waiting'), field($s2, 'escalations_waiting'),
+        'AC12 (B15): escalations_waiting is identical whether authored parked or audited');
+    is(field($s, 'inbox_waiting'), field($s2, 'inbox_waiting'), 'AC12 (B15): inbox_waiting is identical too');
+    is(field($s, 'triage_waiting'), field($s2, 'triage_waiting'), 'AC12 (B15): triage_waiting is identical too');
+}
+{
+    # A missing blueprint.md never forces parked -- no die, degrades to 0.
+    my $root = tempdir(CLEANUP => 1);
+    my $dir = make_blueprint($root, 'bp-no-blueprint-md', orchestrator => "$$\n",
+        registry => registry_json(p1 => 'running'));
+    my ($s, $err) = probe_call('summarize_dir', $dir);
+    ok($err eq '', 'AC12 (B15): no blueprint.md at all does not die') or diag($err);
+    isnt(field($s, 'state'), 'parked', 'AC12 (B15): ...and never forces parked');
+}
+
 # --- B13/AC-2: .paused content -> paused_manual / paused_reason. ---------
 {
     my $root = tempdir(CLEANUP => 1);
@@ -1020,7 +1132,7 @@ sub can_detect_symlink {
 }
 
 # ===========================================================================
-# 8. decisions_waiting -- B25, B26 -> AC-10.
+# 8. escalations_waiting -- B25, B26 -> AC-10.
 # ===========================================================================
 {
     # AMENDED BY t07-needs-you-lifecycle (blueprint tui-operator-feedback).
@@ -1051,15 +1163,15 @@ sub can_detect_symlink {
             { name => '.hidden',  content => '{"package":"p1","kind":"stuck-package"}' },
             { name => 'a-subdir', is_dir => 1 },
         ]);
-    is(field(RS('summarize_dir', $dir), 'decisions_waiting'), 3,
-        'AC-10/B25: escalations/ with 3 plain files + a .tmp + a dotfile + a subdir -> decisions_waiting == 3');
+    is(field(RS('summarize_dir', $dir), 'escalations_waiting'), 3,
+        'AC-10/B25: escalations/ with 3 plain files + a .tmp + a dotfile + a subdir -> escalations_waiting == 3');
 
     my $root2 = tempdir(CLEANUP => 1);
     my $dir_absent = make_blueprint($root2, 'noneedsyou', registry => registry_json());
-    is(field(RS('summarize_dir', $dir_absent), 'decisions_waiting'), 0, 'AC-10/B26: escalations/ absent -> decisions_waiting == 0');
+    is(field(RS('summarize_dir', $dir_absent), 'escalations_waiting'), 0, 'AC-10/B26: escalations/ absent -> escalations_waiting == 0');
 
     my $dir_empty = make_blueprint($root2, 'emptyneedsyou', registry => registry_json(), needs_you => []);
-    is(field(RS('summarize_dir', $dir_empty), 'decisions_waiting'), 0, 'AC-10/B26: escalations/ present but empty -> decisions_waiting == 0');
+    is(field(RS('summarize_dir', $dir_empty), 'escalations_waiting'), 0, 'AC-10/B26: escalations/ present but empty -> escalations_waiting == 0');
 }
 
 # ===========================================================================
@@ -1102,15 +1214,15 @@ sub can_detect_symlink {
         is(field($list->[0], 'state'), 'idle',    'AC-24/B8: aaa-first (no markers) -> idle');
         is(field($list->[1], 'state'), 'paused',  'AC-24/B8: mmm-second (.orchestrator+.paused) -> paused');
         is(field($list->[2], 'state'), 'running', 'AC-24/B8: zzz-third (.orchestrator only) -> running');
-        is(field($list->[2], 'decisions_waiting'), 1, 'AC-24/B8: zzz-third carries its own independent decisions_waiting');
-        is(field($list->[0], 'decisions_waiting'), 0, 'AC-24/B8: aaa-first carries its own independent decisions_waiting (0, no escalations/)');
+        is(field($list->[2], 'escalations_waiting'), 1, 'AC-24/B8: zzz-third carries its own independent escalations_waiting');
+        is(field($list->[0], 'escalations_waiting'), 0, 'AC-24/B8: aaa-first carries its own independent escalations_waiting (0, no escalations/)');
     } else {
         fail('AC-24/B8: summarize() returned an arrayref of 3 summaries');
     }
 }
 
 # ===========================================================================
-# 11. AC-25: decisions_waiting SUM agrees with launcher.pl's
+# 11. AC-25: escalations_waiting SUM agrees with launcher.pl's
 #     _count_needs_you counting rule (same skip rules, by construction).
 # ===========================================================================
 {
@@ -1146,10 +1258,10 @@ sub can_detect_symlink {
     make_blueprint($root, 'x4-broken', registry => 'not json');   # malformed, excluded from summarize entirely
 
     my $list = RS('summarize', $root);
-    my $rs_sum = is_arrayref($list) ? eval { my $t = 0; $t += ($_->{decisions_waiting} // 0) for @$list; $t } : undef;
+    my $rs_sum = is_arrayref($list) ? eval { my $t = 0; $t += ($_->{escalations_waiting} // 0) for @$list; $t } : undef;
     my $mirror_sum = mirror_count_needs_you($root);   # deliberately includes x4-broken's escalations/ (none here) too
     is($mirror_sum, 3, 'AC-25: sanity -- the independent mirror of _count_needs_you counts 3 over this fixture (a,b,c; not .dot/.tmp/subdir)');
-    is($rs_sum, $mirror_sum, 'AC-25: sum(decisions_waiting) across all RunState summaries equals the launcher._count_needs_you-equivalent count over the same tree');
+    is($rs_sum, $mirror_sum, 'AC-25: sum(escalations_waiting) across all RunState summaries equals the launcher._count_needs_you-equivalent count over the same tree');
 }
 
 # ===========================================================================
@@ -1255,7 +1367,7 @@ sub mk_summary {
         packages_done        => $o{packages_done} // 0,
         current_package      => $o{current_package},
         running_coordinators => $o{running_coordinators} // 0,
-        decisions_waiting    => $o{decisions_waiting} // 0,
+        escalations_waiting    => $o{escalations_waiting} // 0,
     };
 }
 
@@ -1278,6 +1390,29 @@ my %BASE_STATE = (
     # assertions above are KEPT and are the ones that carry AC-23's weight:
     # Dashboard.pm must not pull RunState in at all, which is a live
     # architectural constraint on live code.
+}
+
+# ===========================================================================
+# 14. package 13-dashboard-threads (specs/13-dashboard-threads-spec.md):
+#     thread / thread_events sanity on THIS file's own pre-existing fixtures
+#     (no almanac/thread/ dir anywhere in this file) -- behaviour 6 ("a
+#     project with no almanac/thread/ dir gives every summary thread=>undef
+#     and thread_events=>[]"). The deep, fixture-rich coverage of behaviours
+#     1-17 (AC1, AC3, AC5-AC10, AC13, AC14) lives in the new, purpose-built
+#     plugins/sandbox/tests/t/dashboard-threads.t, per the architect's file
+#     split (Decision 57) -- this section only pins what AC2/AC4 require to
+#     live HERE (the widened key set itself, exercised against fixtures this
+#     file already builds, with no almanac/thread/ directory created by any
+#     of them).
+# ===========================================================================
+{
+    my $root = tempdir(CLEANUP => 1);
+    make_blueprint($root, 'no-thread-dir', orchestrator => "1\n",
+        registry => registry_json(p1 => 'running'));
+    my $s = RS('summarize_dir', "$root/no-thread-dir");
+    is(field($s, 'thread'), undef, 'B6/AC1: no almanac/thread/ dir anywhere -> summary.thread is undef');
+    is_deeply(field($s, 'thread_events'), [], 'B6/AC1: ... -> summary.thread_events is [] (ARRAY, never undef)');
+    assert_summary_shape($s, 'package-13 no-thread fixture');
 }
 
 done_testing();

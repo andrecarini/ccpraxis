@@ -39,8 +39,8 @@ use JSON::PP;
 use File::Temp qw(tempdir);
 use File::Path qw(make_path);
 
-my $WAIT_SCRIPT   = "$Bin/../../scripts/bp-wait-for-decision.pl";
-my $ANSWER_SCRIPT = "$Bin/../../scripts/bp-answer-decision.pl";
+my $WAIT_SCRIPT   = "$Bin/../../scripts/bp-wait-for-escalation.pl";
+my $ANSWER_SCRIPT = "$Bin/../../scripts/bp-answer-escalation.pl";
 
 require $WAIT_SCRIPT;     # loads BpWait
 require $ANSWER_SCRIPT;   # loads BpAnswer + BpOrch (the CLI requires bp-orchestrator.pl)
@@ -301,8 +301,8 @@ sub glob_needs_you {
     }));
     my ($rc, $out) = run_answer_cli($bpdir, '--decision', '_dag--x1', '--action', 'accept');
     isnt($rc, 0, 'H3: acting on a dag-stalled decision still fails (pseudo-package answerability is NOT this package\'s job)');
-    unlike($out, qr/unknown decision kind/i,
-        'H3: the failure is NOT the false "unknown decision kind \'dag-stalled\'" claim -- visibility is fixed')
+    unlike($out, qr/unknown escalation kind/i,
+        'H3: the failure is NOT the false "unknown escalation kind \'dag-stalled\'" claim -- visibility is fixed')
         or diag("actual message: $out");
     like($out, qr/_dag/,
         'H3: the failure message names the pseudo-package target (a specific, ledger-targeted refusal)')

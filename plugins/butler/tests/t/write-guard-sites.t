@@ -27,7 +27,7 @@ use File::Temp qw(tempdir);
 use File::Path qw(make_path);
 
 require "$Bin/../../scripts/bp-orchestrator.pl";
-my $ANSWER_SCRIPT = "$Bin/../../scripts/bp-answer-decision.pl";
+my $ANSWER_SCRIPT = "$Bin/../../scripts/bp-answer-escalation.pl";
 require $ANSWER_SCRIPT;   # loads BpAnswer; also (re)loads BpOrch, harmlessly
 
 my $J    = JSON::PP->new->canonical;

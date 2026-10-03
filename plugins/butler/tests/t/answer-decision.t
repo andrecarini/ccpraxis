@@ -1,6 +1,6 @@
 #!/usr/bin/env perl
 # platform: any
-# A7 unblock: bp-answer-decision.pl — the mechanical, atomic unblock the reporter
+# A7 unblock: bp-answer-escalation.pl — the mechanical, atomic unblock the reporter
 # runs once a human has answered a runs/escalations/ decision. Part 1 exhausts the
 # pure plan_answer/kind_family matrix (per-kind allowed actions, fail-closed on a
 # bad pair). Part 2 drives the CLI end-to-end against a temp blueprint dir: a
@@ -15,7 +15,7 @@ use JSON::PP;
 use File::Temp qw(tempdir);
 use File::Path qw(make_path);
 
-my $script = "$Bin/../../scripts/bp-answer-decision.pl";
+my $script = "$Bin/../../scripts/bp-answer-escalation.pl";
 require $script;   # also loads BpOrch (the CLI requires bp-orchestrator.pl)
 
 my $J = JSON::PP->new->canonical;

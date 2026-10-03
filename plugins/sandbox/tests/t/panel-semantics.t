@@ -468,7 +468,7 @@ sub _live_gutter_label { return tui::DashboardScreen::gutter($_[0]); }
             # refreshing. Under Modern Standby ES_SYSTEM_REQUIRED is a request
             # against the idle timer, not a decision. What is asserted is
             # knowable here; what the machine then does is not.
-            'holding (wake-lock asserted)', 'good', '2 decisions waiting', 'warn'],
+            'holding (wake-lock asserted)', 'good', '2 escalations waiting', 'warn'],
         [9999, 0, 0, 'idle (' . Dashboard::fmt_age(9999) . ' ago)', 'warn',
             'released (PC may sleep)', 'muted', 'none', 'muted'],
     );

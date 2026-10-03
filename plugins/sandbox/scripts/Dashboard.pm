@@ -77,6 +77,10 @@ require tui::DashboardScreen;
 require tui::Frame;
 require tui::Screen;
 require Theme;
+# package 13-dashboard-threads (specs/13-dashboard-threads-spec.md S2.4):
+# merge_thread_events slots thread-log rows into the activity feed using the
+# same LaunchLog::merge_by_key launcher.pl already uses for fleet rows.
+require LaunchLog;
 
 # ===========================================================================
 # PURE CORE
@@ -1663,6 +1667,215 @@ sub recent_events {
         push @ev, \@spans;
     }
     return \@ev;
+}
+
+# ===========================================================================
+# package 13-dashboard-threads (specs/13-dashboard-threads-spec.md S2.4): the
+# thread-log-event surface that gets interleaved into the activity feed built
+# above. RunState carries each project's thread_events on every `runs`
+# element (the only channel from RunState to Dashboard without touching
+# launcher.pl, which is outside this package's write set).
+# ===========================================================================
+
+our $THREAD_FEED_MAX     = 10;    # same bound as the fleet source (recent_events' default $n)
+our $THREAD_DEDUP_WINDOW = 300;   # seconds; cross-source dedup window (spec S2.4 step 3)
+our $THREAD_FUTURE_SLACK = 300;   # seconds; redteam M3 -- a thread-controlled
+                                  # `at:` more than this far past $now is
+                                  # dropped so it can't permanently occupy a
+                                  # slot in the newest-10 feed
+
+# _thread_epoch_ok($v) -> 0|1 (private). A positive integer of at most 12
+# digits -- the same shape every epoch in this surface is required to have.
+sub _thread_epoch_ok {
+    my ($v) = @_;
+    return 0 unless defined($v) && !ref($v) && $v =~ /\A\d{1,12}\z/;
+    return 0 unless $v > 0;
+    return 1;
+}
+
+# row_time_key($row) -> Int seconds-since-local-midnight | undef (PUBLIC,
+# pure). A byte-for-byte restatement of launcher.pl's own _row_time_key (the
+# `s-rowtimekey` region) -- the two must stay in lockstep; AC9 (dashboard-
+# threads.t) extracts the launcher's version as source text and pins them
+# equal across a fixture sweep. Never requires/does launcher.pl itself.
+sub row_time_key {
+    my ($row) = @_;
+    return undef unless ref($row) eq 'ARRAY' && @$row && ref($row->[0]) eq 'HASH';
+    my $t = $row->[0]{text};
+    return undef unless defined($t) && $t =~ /^(\d\d):(\d\d)(?::(\d\d))?/;
+    return $1 * 3600 + $2 * 60 + (defined($3) ? $3 : 0);
+}
+
+# %THREAD_EVENT_KIND_STYLE -- spec S2.4's thread-event -> event_style(kind)
+# table, for every thread event name with a fixed style regardless of its
+# other fields. `task-status` is handled separately in thread_event_style
+# below, because its style depends on its own `to` field.
+my %THREAD_EVENT_KIND_STYLE = (
+    launched         => 'launch',  created        => 'launch',
+    attached         => 'launch',  resumed        => 'launch',
+    paused           => 'pause',   'handed-off'   => 'pause',
+    'taken-over'     => 'pause',   'escalation-sent' => 'pause',
+    finished         => 'pkg_finished', archived  => 'pkg_finished',
+    'answer-applied' => 'pkg_finished',
+    detached         => 'release',
+);
+
+# thread_event_style(\%ev) -> ($role, $glyph) (PUBLIC, pure). Delegates every
+# decision to the existing event_style() classifier -- spec S2.4's table.
+sub thread_event_style {
+    my ($ev) = @_;
+    return event_style(undef) unless ref($ev) eq 'HASH';
+    my $event = $ev->{event};
+    $event = '' unless defined($event) && !ref($event);
+    if ($event eq 'task-status') {
+        my $to = $ev->{to};
+        $to = '' unless defined($to) && !ref($to);
+        return event_style('pkg_finished') if $to eq 'done' || $to eq 'obsoleted';
+        return event_style('pause')        if $to eq 'blocked';
+        return event_style('checkpoint');
+    }
+    return event_style(exists($THREAD_EVENT_KIND_STYLE{$event}) ? $THREAD_EVENT_KIND_STYLE{$event} : $event);
+}
+
+# thread_event_rows(\@runs, $localtime_fn, $now) -> \@records (PUBLIC, pure,
+# total). Spec S2.4: unions every summary's thread_events (deduped by
+# "<thread>/<id>", first occurrence wins), drops anything older than
+# now-86400 or more than $THREAD_FUTURE_SLACK past $now when $now parses
+# (redteam M3: a thread record can forge a future `at:` and would otherwise
+# permanently occupy a newest-10 slot), keeps the newest $THREAD_FEED_MAX,
+# and builds each row exactly as recent_events does. Non-ARRAY $runs gives
+# [].
+sub thread_event_rows {
+    my ($runs, $localtime_fn, $now) = @_;
+    return [] unless ref($runs) eq 'ARRAY';
+
+    my %seen;
+    my @all;
+    for my $r (@$runs) {
+        next unless ref($r) eq 'HASH';
+        next unless ref($r->{thread_events}) eq 'ARRAY';
+        for my $ev (@{ $r->{thread_events} }) {
+            next unless ref($ev) eq 'HASH';
+            next unless _thread_epoch_ok($ev->{epoch});
+            my $thread = $ev->{thread};
+            my $id     = $ev->{id};
+            next unless defined($thread) && !ref($thread) && defined($id) && !ref($id);
+            my $key = "$thread/$id";
+            next if $seen{$key}++;
+            push @all, $ev;
+        }
+    }
+
+    @all = grep { $_->{epoch} >= $now - 86400 } @all if _thread_epoch_ok($now);
+    @all = grep { $_->{epoch} <= $now + $THREAD_FUTURE_SLACK } @all if _thread_epoch_ok($now);
+
+    @all = sort {
+        $a->{epoch} <=> $b->{epoch} || $a->{thread} cmp $b->{thread} || $a->{id} cmp $b->{id}
+    } @all;
+    @all = @all[ -$THREAD_FEED_MAX .. -1 ] if scalar(@all) > $THREAD_FEED_MAX;
+
+    my @records;
+    for my $ev (@all) {
+        my ($role, $glyph) = thread_event_style($ev);
+        my $body = "$ev->{event} thread=$ev->{thread}";
+        $body .= " task=$ev->{task}"     if defined $ev->{task};
+        $body .= " from=$ev->{from}"     if defined $ev->{from};
+        $body .= " to=$ev->{to}"         if defined $ev->{to};
+        $body .= " reason=$ev->{reason}" if defined $ev->{reason};
+        $body = substr($body, 0, $EVENT_FIELD_MAX_LEN) if length($body) > $EVENT_FIELD_MAX_LEN;
+        my $hhmm = _local_hhmm($ev->{epoch}, $localtime_fn);
+        my @spans = (
+            { text => tui::DashboardScreen::activity_time_text($hhmm), role => tui::DashboardScreen::theme_role('muted') },
+            { text => "$glyph ", role => tui::DashboardScreen::theme_role($role) },
+            { text => _safe($body), role => tui::DashboardScreen::theme_role($role) },
+        );
+        push @records, { row => \@spans, epoch => $ev->{epoch}, event => $ev->{event},
+                          thread => $ev->{thread}, id => $ev->{id} };
+    }
+    return \@records;
+}
+
+# merge_thread_events(\@events, \@runs, $localtime_fn, $now) -> \@merged
+# (PUBLIC, pure, total). Spec S2.4: splits \@events at the last session-
+# boundary marker, drops a thread row whose underlying occurrence the fleet
+# feed already shows within $THREAD_DEDUP_WINDOW seconds (launched<->
+# orchestrator_start, paused<->pause), then interleaves the rest into the
+# CURRENT segment via LaunchLog::merge_by_key + row_time_key. Any internal
+# failure returns a shallow copy of \@events (a NEW arrayref), never the
+# original reference, never an exception.
+sub merge_thread_events {
+    my ($events, $runs, $localtime_fn, $now) = @_;
+    my @ev = (ref($events) eq 'ARRAY') ? @$events : ();
+    my $fallback = sub { return [ @ev ]; };
+
+    my $result = eval {
+        my $R = thread_event_rows($runs, $localtime_fn, $now);
+        return $fallback->() unless ref($R) eq 'ARRAY' && @$R;
+
+        # Split at the LAST session-boundary marker row (session_boundary_row's
+        # own shape: exactly one span whose text opens "-- previous session").
+        my $b = 0;
+        for my $i (0 .. $#ev) {
+            my $row = $ev[$i];
+            next unless ref($row) eq 'ARRAY' && scalar(@$row) == 1 && ref($row->[0]) eq 'HASH';
+            my $t = $row->[0]{text};
+            next unless defined($t) && $t =~ /\A-- previous session\b/;
+            $b = $i + 1;
+        }
+        my @prefix  = ($b > 0)      ? @ev[0 .. $b - 1] : ();
+        my @current = ($b <= $#ev) ? @ev[$b .. $#ev]   : ();
+
+        # Cross-source dedup candidates: a CURRENT fleet row with >=3 spans,
+        # a defined row_time_key, and a "kind" taken from span index 2's text
+        # up to the first space.
+        my %COUNTERPART = ( launched => 'orchestrator_start', paused => 'pause' );
+        my @candidates;
+        for my $i (0 .. $#current) {
+            my $row = $current[$i];
+            next unless ref($row) eq 'ARRAY' && scalar(@$row) >= 3;
+            my $key = row_time_key($row);
+            next unless defined $key;
+            my $kt = (ref($row->[2]) eq 'HASH') ? $row->[2]{text} : undef;
+            next unless defined $kt;
+            my ($kind) = $kt =~ /\A(\S*)/;
+            next unless defined($kind) && length($kind);
+            push @candidates, { idx => $i, kind => $kind, key => $key };
+        }
+
+        my %consumed;
+        my @surviving_R;
+        for my $rec (@$R) {
+            my $counterpart = $COUNTERPART{ $rec->{event} };
+            if (!defined $counterpart) { push @surviving_R, $rec; next; }
+            my $rk = row_time_key($rec->{row});
+            if (!defined $rk) { push @surviving_R, $rec; next; }
+
+            my ($best_i, $best_d);
+            for my $c (@candidates) {
+                next if $consumed{ $c->{idx} };
+                next unless $c->{kind} eq $counterpart;
+                my $raw = abs($c->{key} - $rk);
+                my $d   = ($raw <= (86400 - $raw)) ? $raw : (86400 - $raw);
+                if (!defined($best_d) || $d < $best_d || ($d == $best_d && $c->{idx} < $best_i)) {
+                    $best_d = $d;
+                    $best_i = $c->{idx};
+                }
+            }
+            if (defined($best_i) && $best_d <= $THREAD_DEDUP_WINDOW) {
+                $consumed{$best_i} = 1;
+            }
+            else {
+                push @surviving_R, $rec;
+            }
+        }
+
+        my $merged_current = LaunchLog::merge_by_key(
+            [ \@current, [ map { $_->{row} } @surviving_R ] ], key => \&row_time_key);
+        $merged_current = [] unless ref($merged_current) eq 'ARRAY';
+
+        return [ @prefix, @$merged_current ];
+    };
+    return (ref($result) eq 'ARRAY') ? $result : $fallback->();
 }
 
 # _alert_msgs(\%state, $rows) -> the (priority-capped) alert banner messages a
@@ -3264,7 +3477,12 @@ sub run {
                     # dismissal here so a forced/periodic regather can't
                     # resurrect a banner the operator already dismissed.
                     $state{install_warning} = undef if $install_warning_dismissed;
-                    @all_events = @{ $base->{events} || [] };   # chronological
+                    # package 13-dashboard-threads (spec S2.4 "Dashboard::run"):
+                    # thread-log rows get slotted into the activity feed here,
+                    # wrapped in eval with the old assignment as the fallback --
+                    # a failure in the merge must never blank the feed.
+                    my $merged_events = eval { merge_thread_events($base->{events} || [], $base->{runs}, undef, $t) };
+                    @all_events = (ref($merged_events) eq 'ARRAY') ? @$merged_events : @{ $base->{events} || [] };   # chronological
                     $activity_offset = 0 if $activity_offset < 0;
                     $last_state = $t;
                     # %state has just been replaced wholesale. Bumping this is

@@ -39,6 +39,9 @@ package RunState;
 use strict;
 use warnings;
 use JSON::PP ();
+use Time::Local ();   # pure UTC arithmetic only (Time::Local::timegm), eval-wrapped below -- this
+                       # module reads no clock, so every epoch this file ever produces comes from a
+                       # byte already on disk (a log record's own `at:` field), never from "now".
 
 our $MAX_REGISTRY_BYTES = 4 * 1024 * 1024;   # 4 MiB, mirrors SessionFilter
 our $MAX_LEDGER_BYTES   = 65536;             # 64 KiB of a package ledger is plenty for frontmatter
@@ -53,6 +56,25 @@ our $MAX_DISPATCH_RECORDS = 512;             # 05-runstate-agent-aggregation (sp
                                               # agents => [], no error, no partial answer -- Decision
                                               # 9's "an over-cap set degrades to NO row rather than a
                                               # fabricated one").
+
+# package 13-dashboard-threads (specs/13-dashboard-threads-spec.md S2.2):
+# bounds for the thread/thread_events surface, same "over cap degrades to
+# nothing fabricated" discipline as $MAX_DISPATCH_RECORDS above.
+our $MAX_THREAD_EVENTS = 10;          # mirrors launcher.pl's $ORCH_EVENTS_PER_LOG
+our $MAX_THREAD_RECORDS = 512;        # .md entries in almanac/thread/
+our $MAX_THREAD_TASKS = 512;          # .md entries in one thread-tasks-<name>/
+our $MAX_ALMANAC_RECORD_BYTES = 65536;   # bytes read from one almanac record file
+our $MAX_INDEX_LINK_RESOLUTIONS = 8192;  # redteam M2: global cap on linked-task
+                                          # ledger lookups per _thread_index call
+                                          # (worst case otherwise 512 threads x
+                                          # 512 tasks); the per-call cache keeps
+                                          # repeats of the same link free
+our $FUTURE_EVENT_SLACK_SECONDS = 300;   # redteam M3: an `at:` more than this
+                                          # far past its log file's mtime is
+                                          # dropped rather than trusted, so a
+                                          # thread can't plant future-dated
+                                          # events to permanently fill the
+                                          # project-wide newest-10 feed
 
 # $PID_ALIVE: CODE ref | undef. Injected by the caller (launcher.pl). NEVER
 # set or probed by RunState itself -- see _pid_state() below.
@@ -294,7 +316,7 @@ sub _paused_info {
 #
 # COUNTING FILES IN A DIRECTORY IS NOT A LIFECYCLE, and that was the whole
 # defect. Eight scripts write into runs/needs-you/ and exactly ONE narrow path
-# clears them (bp-answer-decision.pl's clear_pkg_decisions, and only for a
+# clears them (bp-answer-escalation.pl's clear_pkg_decisions, and only for a
 # direct package reset). Everything else -- a package that finished normally, a
 # run that ended, a fleet question the operator resolved some other way --
 # leaves its file behind forever, and the panel keeps asking.
@@ -441,7 +463,7 @@ sub _count_decisions_split {
         next if $f =~ /^\./;
         next if $f =~ /\.tmp$/;
         # A QUEUE RECORD IS A .json FILE. Everything that WRITES or REMOVES one
-        # already agrees on that -- bp-answer-decision.pl's clear_pkg_decisions
+        # already agrees on that -- bp-answer-escalation.pl's clear_pkg_decisions
         # and sweep_settled, and bp-orchestrator.pl's queued_decision_pkgs, all
         # filter /\.json$/. This counter did not, and the gap had a name: a
         # zero-byte `<id>.json.lock` left behind after its record was answered
@@ -948,6 +970,707 @@ sub _dispatch_index {
     return \%idx;
 }
 
+# _bp_authored_parked($blueprint_dir) -> 0|1 (private, package blueprint-park (08))
+#
+# Reads blueprint.md's own fenced metadata (never a package ledger): the
+# first fenced code block in the file, the first status: line inside it,
+# normalised and compared to 'parked'. Never dies, never writes; an undef/
+# missing/symlinked blueprint.md degrades to 0. The fence marker is built via
+# chr() rather than written literally -- a literal triple-backtick is itself a
+# banned token in this module's own source (checks:no-shell-capture, AC-8).
+#
+# Normalisation is duplicated from BpState::norm_bp_status (lowercase, strip
+# a trailing '#...' comment, collapse every run of non-letters to a single
+# space, trim) rather than imported: RunState is a sandbox-plugin module and
+# BpState is a butler-plugin script, and a cross-plugin require would make
+# the TUI's render path depend on butler being installed (the same reason
+# ESCALATIONS_DIRNAME and @TRIAGEABLE_CATEGORIES above are duplicated, not
+# imported). Package 08 (status "parked") L7/NIT-3: this used to be a plain
+# lc+trim-exact comparison, which disagreed with BpState on a hand-edited
+# value like `status: parked.` or `status: "parked"`. Keep this in lockstep
+# with BpState::norm_bp_status by hand; nothing currently pins the two
+# algorithms equal the way t/97 pins the triageable lists.
+sub _bp_authored_parked {
+    my ($blueprint_dir) = @_;
+    return 0 unless defined $blueprint_dir;
+    my $blob = _read_head("$blueprint_dir/blueprint.md", 65536);
+    return 0 unless defined $blob;
+    my $fence_q = quotemeta(chr(96) x 3);
+    return 0 unless $blob =~ /^$fence_q[ \t]*\r?\n((?:.*\r?\n)*?)^$fence_q[ \t]*\r?$/m;
+    my $fence = $1;
+    return 0 unless $fence =~ /^status:[ \t]*([^\r\n]*)/m;
+    my $v = lc($1);
+    $v =~ s/#.*\z//;
+    $v =~ s/[^a-z]+/ /g;
+    $v =~ s/\A\s+|\s+\z//g;
+    return ($v eq 'parked') ? 1 : 0;
+}
+
+# ===========================================================================
+# package 13-dashboard-threads (specs/13-dashboard-threads-spec.md): the
+# thread/thread_events surface. Restates package 02's store layout and
+# package 12's task-labelling rules (spec S2.1) rather than loading any
+# Almanac:: module -- a sandbox-plugin module must not depend on the almanac
+# plugin being installed, and Almanac::Thread reads the clock and takes
+# locks, which this module's own purity contract forbids. Every helper below
+# is total: a malformed/hostile/over-cap input degrades to an empty/undef
+# result, never propagates an exception.
+# ===========================================================================
+
+# _project_root($blueprints_root) -> Str | undef (private, pinned name)
+#
+# Pure string arithmetic, the same anchor _dispatch_dir uses: only a path
+# whose tail is exactly "/.ccpraxis-local-data/blueprints" (optionally
+# trailing-slashed, backslashes folded to '/') yields a project root.
+sub _project_root {
+    my ($blueprints_root) = @_;
+    return undef unless defined($blueprints_root) && !ref($blueprints_root) && length($blueprints_root);
+    my $p = $blueprints_root;
+    $p =~ s{\\}{/}g;
+    $p =~ s{/+\z}{};
+    return undef unless $p =~ m{\A(.+)/\.ccpraxis-local-data/blueprints\z};
+    return $1;
+}
+
+# _valid_thread_name($name) -> 0|1 (private)
+#
+# Restates Almanac::Thread::valid_name exactly.
+sub _valid_thread_name {
+    my ($name) = @_;
+    return 0 unless defined $name;
+    return 0 unless $name =~ /\A[a-z0-9][a-z0-9-]{0,63}\z/;
+    return 0 if $name =~ /\A(?:con|prn|aux|nul|com[1-9]|lpt[1-9])\z/i;
+    return 1;
+}
+
+# _valid_record_id($id) -> 0|1 (private)
+#
+# Restates Almanac::Store's own record-id grammar (one task/log entry's file
+# stem).
+sub _valid_record_id {
+    my ($id) = @_;
+    return 0 unless defined($id) && length($id) <= 128;
+    return 0 unless $id =~ /\A[A-Za-z0-9][A-Za-z0-9._-]*\z/;
+    return 0 if $id =~ /\.\./;
+    return 0 if $id =~ /\A(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])\z/i;
+    return 1;
+}
+
+# _valid_link_part($s) -> 0|1 (private). Shared grammar for one side of a
+# "<blueprint>/<package>" link AND for an orchestrator thread's owner_id
+# (which names a blueprint directory).
+sub _valid_link_part {
+    my ($s) = @_;
+    return 0 unless defined($s) && !ref($s) && length($s) && length($s) <= 128;
+    return 0 unless $s =~ /\A[A-Za-z0-9][A-Za-z0-9._-]*\z/;
+    return 0 if $s =~ /\.\./;
+    return 1;
+}
+
+# _rank_id_cmp_local($ra, $rb, $ia, $ib) -> Int (private)
+#
+# Restates Almanac::Store::_rank_id_cmp: rank first (cmp), ties (and
+# unranked records) broken by id; unranked sorts after every ranked entry.
+sub _rank_id_cmp_local {
+    my ($ra, $rb, $ia, $ib) = @_;
+    if (defined($ra) && defined($rb)) {
+        my $c = $ra cmp $rb;
+        return $c ? $c : ($ia cmp $ib);
+    }
+    elsif (defined $ra) { return -1; }
+    elsif (defined $rb) { return 1; }
+    else { return $ia cmp $ib; }
+}
+
+# _alm_text($v) -> Str | undef (private). C0 and DEL removed; undef in, undef
+# out.
+sub _alm_text {
+    my ($v) = @_;
+    return undef unless defined($v) && !ref($v);
+    my $s = $v;
+    $s =~ s/[\x00-\x1F\x7F]//g;
+    return $s;
+}
+
+# _parse_record($bytes) -> \%fields | undef (private, pinned name)
+#
+# Accepts exactly what statusline.pl's almanac_parse_record accepts: a
+# "---\n" + "key: value\n" lines + "---\n" frontmatter block, nothing after
+# it required. Values are validated against a DECODED copy (so a character
+# class like [A-Za-z0-9_] behaves correctly on a multi-byte key, and the
+# control-character reject applies to codepoints, not raw bytes) but the
+# fields returned hold the ORIGINAL bytes -- Dashboard's caller contract D3
+# wants UTF-8 bytes, never a double-decoded value.
+sub _parse_record {
+    my ($bytes) = @_;
+    return undef unless defined($bytes) && !ref($bytes);
+    my $raw  = "$bytes";
+    my $text = $raw;
+    if ($text =~ /[^\x00-\x7f]/) {
+        return undef if utf8::is_utf8($text);
+        return undef unless utf8::decode($text);
+        return undef if $text =~ /[^\x{0}-\x{10FFFF}]/;
+        return undef if $text =~ /[\x{D800}-\x{DFFF}\x{FDD0}-\x{FDEF}\x{FFFE}\x{FFFF}\x{1FFFE}\x{1FFFF}\x{2FFFE}\x{2FFFF}\x{3FFFE}\x{3FFFF}\x{4FFFE}\x{4FFFF}\x{5FFFE}\x{5FFFF}\x{6FFFE}\x{6FFFF}\x{7FFFE}\x{7FFFF}\x{8FFFE}\x{8FFFF}\x{9FFFE}\x{9FFFF}\x{AFFFE}\x{AFFFF}\x{BFFFE}\x{BFFFF}\x{CFFFE}\x{CFFFF}\x{DFFFE}\x{DFFFF}\x{EFFFE}\x{EFFFF}\x{FFFFE}\x{FFFFF}\x{10FFFE}\x{10FFFF}]/;
+    }
+    my @l  = split /\n/, $text, -1;
+    my @lb = split /\n/, $raw,  -1;
+    return undef unless @l && $l[0] eq '---';
+    my $closing;
+    for my $i (1 .. $#l) {
+        if ($l[$i] =~ /\A---\r?\z/) { $closing = $i; last; }
+    }
+    return undef unless defined($closing) && $closing >= 2 && $l[$closing] eq '---';
+    my %fields;
+    for my $i (1 .. $closing - 1) {
+        return undef unless $l[$i] =~ /\A([A-Za-z0-9_]+): (.*)\z/;
+        my ($k, $v) = ($1, $2);
+        return undef if exists $fields{$k};
+        return undef if $v =~ /[\x00-\x08\x0A-\x1F\x7F-\x9F\x{2028}\x{2029}]/;
+        my ($bv) = ($lb[$i] =~ /\A[A-Za-z0-9_]+: (.*)\z/);
+        $fields{$k} = defined($bv) ? $bv : $v;
+    }
+    return \%fields;
+}
+
+# @LINK_STATUSES -- restates Almanac::PackageLink::@STATUSES.
+my %LINK_STATUSES = map { $_ => 1 } qw(pending running converging reviewing done blocked parked dropped);
+
+# _normalize_link_status($raw) -> one of @LINK_STATUSES | '' (private).
+# Restates Almanac::PackageLink::norm_status.
+sub _normalize_link_status {
+    my ($s) = @_;
+    return '' unless defined $s;
+    $s = lc $s;
+    $s =~ s/[^a-z]+/ /g;
+    $s =~ s/\A\s+|\s+\z//g;
+    return $LINK_STATUSES{$s} ? $s : '';
+}
+
+# _fm_status_from_blob($blob) -> Str (private)
+#
+# Restates Almanac::PackageLink::_fm_get('status'), operating on bytes
+# already in hand rather than re-opening the file: the FIRST '---'-delimited
+# block only, the first `status:` line inside it wins.
+sub _fm_status_from_blob {
+    my ($blob) = @_;
+    return '' unless defined($blob) && length($blob);
+    my @lines = split /\n/, $blob, -1;
+    my $in = 0;
+    for my $ln (@lines) {
+        if ($ln =~ /\A-{3}\s*\z/) { $in++; last if $in == 2; next; }
+        next unless $in == 1;
+        if ($ln =~ /\Astatus:\s*(.*?)\s*\z/) { return _normalize_link_status($1); }
+    }
+    return '';
+}
+
+# _pipeline_step_word($blob) -> Str | undef (private, pinned name)
+#
+# Restates _parse_pipeline's own "## Pipeline" scan, but returns the WORD of
+# the lowest-numbered unchecked entry rather than an "N/M" fraction -- see
+# spec S2.1 "Pipeline step word". Never reuses _parse_pipeline itself (that
+# sub accepts only steps 1-8; this one accepts 1-99 per the spec's checkbox
+# regex).
+sub _pipeline_step_word {
+    my ($blob) = @_;
+    return undef unless defined($blob) && length($blob);
+    my $stripped = $blob;
+    $stripped =~ s/\A\xEF\xBB\xBF//;
+    my @lines = split /\n/, $stripped, -1;
+    for my $l (@lines) { $l =~ s/\r\z//; }
+
+    my $start;
+    for my $i (0 .. $#lines) {
+        if ($lines[$i] =~ /\A##[ \t]+Pipeline[ \t]*\z/i) { $start = $i; last; }
+    }
+    return undef unless defined $start;
+
+    my %entry;   # num -> [checked?, word], first occurrence of each number wins
+    my $in_fence = 0;
+    for (my $i = $start + 1; $i <= $#lines; $i++) {
+        my $line = $lines[$i];
+        if ($line =~ /\A[ \t]*(?:\x60\x60\x60|~~~)/) { $in_fence = !$in_fence; next; }
+        last if !$in_fence && $line =~ /\A#{1,6}[ \t]/;
+        next if length($line) > 1024;
+        if ($line =~ /\A[ \t]*-[ \t]*\[([ xX])\][ \t]*(\d{1,2})\.[ \t]+(\S+)/) {
+            my ($mark, $num, $word) = ($1, $2, $3);
+            next if exists $entry{$num};
+            $entry{$num} = [ ($mark eq 'x' || $mark eq 'X') ? 1 : 0, $word ];
+        }
+    }
+    my @nums = sort { $a <=> $b } keys %entry;
+    return undef unless @nums;
+    my ($lowest_unchecked) = grep { !$entry{$_}[0] } @nums;
+    return undef unless defined $lowest_unchecked;
+    my $word = lc($entry{$lowest_unchecked}[1]);
+    $word =~ s/[^a-z0-9-]//g;
+    return length($word) ? $word : undef;
+}
+
+# _link_resolve($project_root, $link, \%cache) -> \%r (private, pinned name)
+#
+# Restates Almanac::PackageLink::resolve exactly (Decision 18 F1): live
+# ledger wins over an archived one, which wins over "missing". Never
+# consults CCPRAXIS_DATA_DIR. Total -- a bad project root or link grammar
+# degrades to state 'invalid', never an exception.
+#
+# \%cache is optional (spec S2.2 step 4: "cache ledger reads by path for this
+# call"). When given, it is keyed by "$project_root\0$link" and holds the
+# full result, so a package linked by more than one task across the index is
+# read from disk at most once per _thread_index call. Callers that omit it
+# get the old uncached behaviour.
+sub _link_resolve {
+    my ($project_root, $link, $cache) = @_;
+    my $invalid = { state => 'invalid', blueprint => undef, package => undef, status => undef, step => undef };
+    return $invalid unless defined($link) && length($link);
+
+    my $key = (ref($cache) eq 'HASH' && defined($project_root) && length($project_root))
+        ? "$project_root\0$link" : undef;
+    return $cache->{$key} if defined($key) && exists $cache->{$key};
+
+    my @parts = split m{/}, $link, -1;
+    if (@parts != 2) { $cache->{$key} = $invalid if defined $key; return $invalid; }
+    my ($bp, $pkg) = @parts;
+    if (!_valid_link_part($bp) || !_valid_link_part($pkg) || !defined($project_root) || !length($project_root)) {
+        $cache->{$key} = $invalid if defined $key;
+        return $invalid;
+    }
+
+    # Link parts are forced to bytes before concatenation with the root (a
+    # flagged-but-ASCII part would otherwise Latin-1-upgrade a non-ASCII
+    # root -- spec S2.1).
+    for my $p ($bp, $pkg) { utf8::encode($p) if utf8::is_utf8($p); }
+
+    my $bdir = "$project_root/.ccpraxis-local-data/blueprints";
+    my $live_path     = "$bdir/$bp/packages/$pkg.md";
+    my $archived_path = "$bdir/_archive/$bp/packages/$pkg.md";
+
+    my $ledger;
+    if    (-f $live_path     && !-l $live_path)     { $ledger = $live_path; }
+    elsif (-f $archived_path && !-l $archived_path) { $ledger = $archived_path; }
+    else {
+        my $r = { state => 'missing', blueprint => $bp, package => $pkg, status => undef, step => undef };
+        $cache->{$key} = $r if defined $key;
+        return $r;
+    }
+
+    my $blob       = _read_head($ledger, $MAX_LEDGER_BYTES);
+    my $raw_status = _fm_status_from_blob($blob);
+    my $status     = length($raw_status) ? $raw_status : 'pending';
+    my $step       = _pipeline_step_word($blob);
+    my $r = { state => 'ok', blueprint => $bp, package => $pkg, status => $status, step => $step };
+    $cache->{$key} = $r if defined $key;
+    return $r;
+}
+
+# _status_class($status) -> 'done'|'doing'|'blocked'|'pending' (private).
+# Spec S2.1's linked-task classification table.
+sub _status_class {
+    my ($status) = @_;
+    return 'done'    if $status eq 'done'    || $status eq 'dropped';
+    return 'doing'   if $status eq 'running' || $status eq 'converging' || $status eq 'reviewing';
+    return 'blocked' if $status eq 'blocked' || $status eq 'parked';
+    return 'pending';
+}
+
+# _is_abs_local($p) -> 0|1 (private). Restates Almanac::SessionLive::_is_abs.
+sub _is_abs_local {
+    my ($p) = @_;
+    return 0 unless defined($p) && length($p);
+    return 1 if $p =~ m{\A/};
+    return 1 if $p =~ m{\A[A-Za-z]:[\\/]};
+    return 0;
+}
+
+# _build_owner($blueprints_root, $project_root, \%thread_fields) -> \%owner
+# (private). Spec S2.2 "owner rules". Total: a hostile/absent field degrades
+# to the honest "no evidence" shape, never an exception.
+sub _build_owner {
+    my ($blueprints_root, $project_root, $f) = @_;
+    my $raw_kind = (ref($f) eq 'HASH') ? $f->{owner_kind} : undef;
+    my $kind = (defined($raw_kind) && ($raw_kind eq 'session' || $raw_kind eq 'orchestrator'))
+        ? $raw_kind : 'none';
+    my $raw_id = (ref($f) eq 'HASH') ? $f->{owner_id} : undef;
+    my $id = (defined($raw_id) && !ref($raw_id) && length($raw_id) && $raw_id ne '-') ? $raw_id : undef;
+
+    my %owner = (kind => $kind, id => $id, alive => undef, activity_at => undef, armed => 0);
+    return \%owner unless $kind eq 'session' || $kind eq 'orchestrator';
+
+    if ($kind eq 'orchestrator') {
+        if (defined($id) && _valid_link_part($id)) {
+            my $marker = "$blueprints_root/$id/runs/.orchestrator";
+            $owner{alive} = (-e $marker && !-l $marker) ? _pid_state(_orchestrator_pid($marker)) : 0;
+        }
+        return \%owner;
+    }
+
+    # $kind eq 'session'. owner.alive stays undef for the whole lifetime of
+    # this branch (S2.2: "undef for session/none") -- the live/dead verdict
+    # for a session is made at render time, from activity_at/armed, by
+    # tui::DashboardScreen::thread_owner_status.
+    my $sid_ok = defined($id) && $id =~ /\A[A-Za-z0-9_-]{1,128}\z/;
+    return \%owner unless $sid_ok;
+
+    my $raw_t = (ref($f) eq 'HASH') ? $f->{owner_transcript} : undef;
+    return \%owner unless defined($raw_t) && !ref($raw_t) && length($raw_t);
+
+    my $mapped = 0;
+    my $t = $raw_t;
+    if ($t =~ m{\A/root/\.claude/(.*)\z}) {
+        $t = "$project_root/.ccpraxis-local-data/claude-home/$1";
+        $mapped = 1;
+    }
+
+    # H1 hardening: owner_transcript comes from a thread record the
+    # container can write, so it must not be trusted as a raw filesystem
+    # path -- a crafted "//host/share" or a backslash form could reach a
+    # network share (confirmed: cygpath reads "//host/share" as a UNC path),
+    # and ".." could walk the path outside the tree the mapping intended.
+    # Reject traversal, any backslash, a leading "//" (UNC), and require the
+    # basename to be exactly "<sid>.jsonl" (it must name this session's own
+    # transcript, never another session's or an arbitrary file). Anything
+    # else leaves activity_at undef (renders "unknown"), never a stat or
+    # opendir attempt.
+    my $valid_t = 0;
+    if (defined($t) && length($t) && $t !~ /\.\./ && $t !~ /\\/ && $t !~ m{\A/{2,}}) {
+        my ($base) = ($t =~ m{([^/]+)\z});
+        $valid_t = 1 if defined($base) && $base eq "$id.jsonl";
+    }
+
+    if ($valid_t && -f $t && !-l $t) {
+        my @st = stat($t);
+        my $best = (defined($st[9]) && $st[9] =~ /\A\d+\z/) ? $st[9] + 0 : undef;
+        if (($t) =~ m{\A(.*)/[^/]+\z}) {
+            my $subdir = "$1/$id/subagents";
+            if (-d $subdir && !-l $subdir) {
+                if (opendir(my $dh, $subdir)) {
+                    my @cands;
+                    for my $e (readdir $dh) {
+                        next unless $e =~ /\.jsonl\z/;
+                        next unless -f "$subdir/$e" && !-l "$subdir/$e";
+                        push @cands, $e;
+                        last if scalar(@cands) >= 512;
+                    }
+                    closedir $dh;
+                    for my $e (@cands) {
+                        my @st2 = stat("$subdir/$e");
+                        next unless defined($st2[9]) && $st2[9] =~ /\A\d+\z/;
+                        $best = $st2[9] + 0 if !defined($best) || $st2[9] + 0 > $best;
+                    }
+                }
+            }
+        }
+        $owner{activity_at} = $best;
+    }
+
+    my $arm_path;
+    if ($mapped) {
+        $arm_path = "$project_root/.ccpraxis-local-data/claude-home/butler-state/continuity/armed/$id";
+    }
+    else {
+        my $bsd = $ENV{BUTLER_STATE_DIR};
+        if (defined($bsd) && length($bsd) && _is_abs_local($bsd)) {
+            (my $v = $bsd) =~ s{/+\z}{};
+            $arm_path = "$v/continuity/armed/$id";
+        }
+        else {
+            for my $var (qw(HOME USERPROFILE)) {
+                my $val = $ENV{$var};
+                next unless defined($val) && length($val) && _is_abs_local($val);
+                (my $v = $val) =~ s{/+\z}{};
+                $arm_path = "$v/.claude/butler-state/continuity/armed/$id";
+                last;
+            }
+        }
+    }
+    $owner{armed} = (defined($arm_path) && -f $arm_path && !-l $arm_path) ? 1 : 0;
+    return \%owner;
+}
+
+# _thread_build($project_root, $blueprints_root, $name, \%fields, \%cache, \$link_budget)
+#   -> \%thread | undef (private)
+#
+# undef means "skip this thread entirely" (an over-cap task set, spec S2.2
+# step 4). Otherwise: name/done/total/doing/current/next/owner/driven, where
+# `driven` is the set of blueprint names this thread's own tasks + its
+# `blueprints` field name (spec S2.2 step 5) -- `state` is added by the
+# caller, which already has it from the thread record.
+#
+# \%cache and \$link_budget are optional, forwarded to _link_resolve. When
+# \$link_budget is given and reaches 0, further linked tasks in this (and any
+# later) thread degrade to the same "missing" rendering as an invalid link,
+# without attempting another ledger read -- redteam M2's global cap.
+sub _thread_build {
+    my ($project_root, $blueprints_root, $name, $fields, $cache, $link_budget) = @_;
+
+    my $tasks_dir = "$project_root/.ccpraxis-local-data/almanac/thread-tasks-$name";
+    # S3/M1 fix: filter by name only first (no stat), so an over-cap
+    # directory (the abuse case this cap exists for) is rejected without
+    # stat'ing every entry -- measured ~1.7s per scan at 5000 entries vs
+    # 0.007s matching names only.
+    my @raw_ids;
+    if (-d $tasks_dir && !-l $tasks_dir) {
+        if (opendir(my $dh, $tasks_dir)) {
+            for my $e (readdir $dh) {
+                next unless $e =~ /\A(.+)\.md\z/;
+                my $id = $1;
+                next unless _valid_record_id($id);
+                push @raw_ids, [ $id, $e ];
+            }
+            closedir $dh;
+        }
+    }
+    return undef if scalar(@raw_ids) > $MAX_THREAD_TASKS;
+
+    my @candidates;
+    for my $pair (@raw_ids) {
+        my ($id, $e) = @$pair;
+        push @candidates, $id if -f "$tasks_dir/$e" && !-l "$tasks_dir/$e";
+    }
+
+    my @parsed;
+    for my $id (sort @candidates) {
+        my $blob = _read_capped("$tasks_dir/$id.md", $MAX_ALMANAC_RECORD_BYTES);
+        next unless defined $blob;
+        my $f = _parse_record($blob);
+        next unless ref($f) eq 'HASH';
+        push @parsed, { id => $id, rank => $f->{rank}, fields => $f };
+    }
+    @parsed = sort { _rank_id_cmp_local($a->{rank}, $b->{rank}, $a->{id}, $b->{id}) } @parsed;
+
+    my %driven;
+    if (defined($fields->{blueprints}) && length($fields->{blueprints})) {
+        $driven{$_} = 1 for split /,/, $fields->{blueprints};
+    }
+
+    my @doing;
+    my $current;
+    my $next_label;
+    my $done = 0;
+    my $total = scalar(@parsed);
+
+    for my $t (@parsed) {
+        my $f = $t->{fields};
+        my $link = $f->{link};
+        my ($class, $label);
+        if (defined($link) && length($link)) {
+            my $budget_exhausted = ref($link_budget) eq 'SCALAR' && defined($$link_budget) && $$link_budget <= 0;
+            my $r;
+            if ($budget_exhausted) {
+                $r = { state => 'invalid', blueprint => undef, package => undef, status => undef, step => undef };
+            }
+            else {
+                $$link_budget-- if ref($link_budget) eq 'SCALAR' && defined($$link_budget);
+                $r = _link_resolve($project_root, $link, $cache);
+            }
+            if ($r->{state} eq 'invalid') {
+                $class = 'pending';
+                my $title = _alm_text($link);
+                $title = '' unless defined $title;
+                $label = { class => $class, kind => 'text', title => "$title missing", waits_on => undef };
+            }
+            else {
+                $driven{ $r->{blueprint} } = 1 if defined $r->{blueprint};
+                my $number = (defined($r->{package}) && $r->{package} =~ /\A(\d+)/) ? $1 : $r->{package};
+                if ($r->{state} eq 'ok') {
+                    $class = _status_class($r->{status});
+                    my $step = defined($r->{step}) ? $r->{step} : $r->{status};
+                    $label = { class => $class, kind => 'link', blueprint => $r->{blueprint}, number => $number, step => $step };
+                }
+                else {   # missing
+                    $class = 'pending';
+                    $label = { class => $class, kind => 'link', blueprint => $r->{blueprint}, number => $number, step => 'missing' };
+                }
+            }
+        }
+        else {
+            my $status = $f->{status};
+            $status = '' unless defined $status;
+            $class = ($status eq 'done' || $status eq 'obsoleted') ? 'done'
+                   : ($status eq 'doing')                           ? 'doing'
+                   : ($status eq 'blocked')                         ? 'blocked'
+                   :                                                  'pending';
+            my $title = _alm_text($f->{title});
+            $title = $t->{id} unless defined($title) && length($title);
+            my $waits_on = _alm_text($f->{blocked_on});
+            $waits_on = undef unless defined($waits_on) && length($waits_on);
+            $label = { class => $class, kind => 'text', title => $title, waits_on => $waits_on };
+        }
+
+        $done++ if $class eq 'done';
+        push @doing, $label if $class eq 'doing';
+        $current = $label if !defined($current) && $class ne 'done';
+        $next_label = $label if !defined($next_label) && $class eq 'pending';
+    }
+    $current = undef if @doing;
+
+    my $owner = _build_owner($blueprints_root, $project_root, $fields);
+
+    return {
+        name => $name, done => $done, total => $total,
+        doing => \@doing, current => $current, next => $next_label,
+        owner => $owner, driven => \%driven,
+    };
+}
+
+# _thread_events_for(\%kept) -> \@events (private). Spec S2.2 step 7:
+# project-level, the newest $MAX_THREAD_EVENTS entries across every kept
+# thread, ascending by (epoch, thread, id).
+sub _thread_events_for {
+    my ($kept, $project_root) = @_;
+    my $A = "$project_root/.ccpraxis-local-data/almanac";
+    my @all;
+    for my $name (sort keys %$kept) {
+        my $ldir = "$A/thread-log-$name";
+        next unless -d $ldir && !-l $ldir;
+        next unless opendir(my $dh, $ldir);
+        # S3/M1 fix: match names only first, sort and cut to the top N, and
+        # stat only the survivors -- a thread log grows unboundedly, so
+        # stat'ing every entry before the cut cost ~1.7s per scan at 5000
+        # entries, measured, against 0.007s for the name match alone.
+        my @raw_ids;
+        for my $e (readdir $dh) {
+            push @raw_ids, [ $1, $e ] if $e =~ /\A(\d{8})\.md\z/;
+        }
+        closedir $dh;
+        next unless @raw_ids;
+        @raw_ids = sort { $b->[0] <=> $a->[0] } @raw_ids;
+        @raw_ids = @raw_ids[0 .. $MAX_THREAD_EVENTS - 1] if scalar(@raw_ids) > $MAX_THREAD_EVENTS;
+        my @ids;
+        for my $pair (@raw_ids) {
+            my ($id, $e) = @$pair;
+            next unless -f "$ldir/$e" && !-l "$ldir/$e";
+            my @st = stat("$ldir/$e");
+            my $mtime = (defined($st[9]) && $st[9] =~ /\A\d+\z/) ? $st[9] + 0 : undef;
+            push @ids, [ $id, $mtime ];
+        }
+        for my $pair (@ids) {
+            my ($id, $mtime) = @$pair;
+            my $blob = _read_capped("$ldir/$id.md", $MAX_ALMANAC_RECORD_BYTES);
+            next unless defined $blob;
+            my $f = _parse_record($blob);
+            next unless ref($f) eq 'HASH';
+            my $event = $f->{event};
+            next unless defined($event) && length($event);
+            my $at = $f->{at};
+            next unless defined($at) && $at =~ /\A(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)Z\z/;
+            my ($yr, $mo, $dy, $h, $mi, $s) = ($1, $2, $3, $4, $5, $6);
+            # S2 fix: pass the 4-digit year as is. timegm($y - 1900) feeds
+            # Time::Local its rolling-century heuristic (meant for 2-digit
+            # years), so 1970 - 1900 = 70 is read back as 2070, not 1970
+            # (measured: Time::Local::timegm(0,0,0,1,0,70) == 3155760000).
+            # Reject anything before 1970 outright rather than let the same
+            # heuristic silently reinterpret it.
+            next if ($yr + 0) < 1970;
+            local $@;
+            my $epoch = eval { Time::Local::timegm($s, $mi, $h, $dy, $mo - 1, $yr) };
+            next if $@ || !defined($epoch);
+            # M3 fix: a thread record the container controls can set `at:`
+            # to any future timestamp; without a ceiling it would sort as
+            # the newest event forever and permanently occupy a slot in the
+            # project-wide top-10 feed. The log file's own mtime (not the
+            # clock) is the only trustworthy ceiling available to a
+            # clock-free module.
+            next if defined($mtime) && $epoch > $mtime + $FUTURE_EVENT_SLACK_SECONDS;
+            push @all, {
+                thread => $name, id => $id, at => $at, epoch => $epoch, event => $event,
+                actor => $f->{actor}, session => $f->{session}, task => $f->{task},
+                from => $f->{from}, to => $f->{to}, reason => $f->{reason},
+            };
+        }
+    }
+    @all = sort {
+        $b->{epoch} <=> $a->{epoch} || $a->{thread} cmp $b->{thread} || $b->{id} cmp $a->{id}
+    } @all;
+    @all = @all[0 .. $MAX_THREAD_EVENTS - 1] if scalar(@all) > $MAX_THREAD_EVENTS;
+    @all = sort {
+        $a->{epoch} <=> $b->{epoch} || $a->{thread} cmp $b->{thread} || $a->{id} cmp $b->{id}
+    } @all;
+    return \@all;
+}
+
+# _thread_index($blueprints_root) -> { by_bp => {...}, events => [...] }
+# (private, pinned name)
+#
+# Never undef, never dies. On any failure (no project root, no thread/ dir,
+# an over-cap thread-record set) it returns the empty shape. Spec S2.2's
+# full algorithm.
+sub _thread_index {
+    my ($blueprints_root) = @_;
+    my $empty = { by_bp => {}, events => [] };
+
+    my $P = _project_root($blueprints_root);
+    return $empty unless defined $P;
+    my $A = "$P/.ccpraxis-local-data/almanac";
+    my $tdir = "$A/thread";
+    return $empty if -l $tdir;
+    return $empty unless -d $tdir;
+
+    # S3/M1 fix: match/validate names only first (no stat), so an over-cap
+    # thread/ directory is rejected without stat'ing every entry.
+    my @raw_stems;
+    if (opendir(my $dh, $tdir)) {
+        for my $e (readdir $dh) {
+            next unless $e =~ /\A(.+)\.md\z/;
+            my $stem = $1;
+            push @raw_stems, [ $stem, $e ] if _valid_thread_name($stem);
+        }
+        closedir $dh;
+    }
+    return $empty if scalar(@raw_stems) > $MAX_THREAD_RECORDS;
+
+    my @candidates;
+    for my $pair (@raw_stems) {
+        my ($stem, $e) = @$pair;
+        push @candidates, $stem if -f "$tdir/$e" && !-l "$tdir/$e";
+    }
+
+    my %kept;
+    my %ledger_cache;                                 # spec S2.2 step 4
+    my $link_budget = $MAX_INDEX_LINK_RESOLUTIONS;    # redteam M2 global cap
+    for my $name (sort @candidates) {
+        my $blob = _read_capped("$tdir/$name.md", $MAX_ALMANAC_RECORD_BYTES);
+        next unless defined $blob;
+        my $fields = _parse_record($blob);
+        next unless ref($fields) eq 'HASH';
+        my $state = $fields->{state};
+        next unless defined($state) && ($state eq 'live' || $state eq 'handed-off');
+
+        my $built = _thread_build($P, $blueprints_root, $name, $fields, \%ledger_cache, \$link_budget);
+        next unless ref($built) eq 'HASH';
+        $built->{state} = $state;
+        $kept{$name} = $built;
+    }
+
+    my %by_bp_candidates;
+    for my $name (keys %kept) {
+        for my $bp (keys %{ $kept{$name}{driven} }) {
+            push @{ $by_bp_candidates{$bp} }, $name;
+        }
+    }
+
+    my %by_bp;
+    for my $bp (keys %by_bp_candidates) {
+        my $winner;
+        for my $name (@{ $by_bp_candidates{$bp} }) {
+            if (!defined $winner) { $winner = $name; next; }
+            my $t = $kept{$name};
+            my $w = $kept{$winner};
+            my $t_live = ($t->{state} eq 'live') ? 0 : 1;
+            my $w_live = ($w->{state} eq 'live') ? 0 : 1;
+            if ($t_live != $w_live) { $winner = $name if $t_live < $w_live; next; }
+            my $t_orch = ($t->{owner}{kind} eq 'orchestrator' && defined($t->{owner}{id}) && $t->{owner}{id} eq $bp) ? 0 : 1;
+            my $w_orch = ($w->{owner}{kind} eq 'orchestrator' && defined($w->{owner}{id}) && $w->{owner}{id} eq $bp) ? 0 : 1;
+            if ($t_orch != $w_orch) { $winner = $name if $t_orch < $w_orch; next; }
+            $winner = $name if ($name cmp $winner) < 0;
+        }
+        $by_bp{$bp} = $kept{$winner} if defined $winner;
+    }
+
+    my $events = _thread_events_for(\%kept, $P);
+    return { by_bp => \%by_bp, events => $events };
+}
+
 # summarize_dir($blueprint_dir) -> \%summary | undef
 #
 # Builds the S2.2 summary for ONE blueprint directory. undef (the blueprint
@@ -966,7 +1689,7 @@ sub _dispatch_index {
 # running_coordinators 0), regardless of what the registry claims. Never
 # dies.
 sub summarize_dir {
-    my ($blueprint_dir, $agent_index) = @_;
+    my ($blueprint_dir, $agent_index, $thread_index) = @_;
     return undef unless defined $blueprint_dir && !ref($blueprint_dir)
         && length($blueprint_dir) && -d $blueprint_dir;
 
@@ -986,6 +1709,22 @@ sub summarize_dir {
         $parent =~ s{/+\z}{};
         $parent =~ s{/[^/]*\z}{};
         $idx = _dispatch_index(_dispatch_dir($parent));
+    }
+
+    # package 13-dashboard-threads (spec S2.2): $thread_index is an optional
+    # third parameter, in the shape _thread_index returns -- same "ignored
+    # when not a HASH, this call builds its own" discipline as $agent_index
+    # above, same parent-of-$blueprint_dir anchor.
+    my $tidx;
+    if (ref($thread_index) eq 'HASH') {
+        $tidx = $thread_index;
+    }
+    else {
+        my $parent = $blueprint_dir;
+        $parent =~ s{\\}{/}g;
+        $parent =~ s{/+\z}{};
+        $parent =~ s{/[^/]*\z}{};
+        $tidx = _thread_index($parent);
     }
 
     # S2.6: $bp_name is the SAME value the summary emits as its own
@@ -1189,6 +1928,15 @@ sub summarize_dir {
     # a .paused still on disk is an abandoned run, and abandoning a run is not
     # the same as answering the question it was blocked on.
     my $run_over = ($state eq 'idle' || $state eq 'solo' || $state eq 'parked') ? 1 : 0;
+
+    # package blueprint-park (08) (spec §2.8): blueprint.md's own authored
+    # 'parked' beats everything, including a live orchestrator marker --
+    # state 'parked' now ALSO means "blueprint.md authored parked", not only
+    # "a runs/.shutdown marker exists". $run_over, computed above, is derived
+    # from the run markers only and is NOT recomputed here: escalations/
+    # inbox/triage waiting counts stay exactly what the same fixture reports
+    # under any other authored value. No new key -- the 17-key set is closed.
+    $state = 'parked' if _bp_authored_parked($blueprint_dir);
     # The queue directory was renamed needs-you -> escalations: the old name
     # claimed the operator owns every record, and most are resolver-owned.
     # bp-orchestrator.pl migrates it on its first tick, but this module RENDERS
@@ -1199,11 +1947,11 @@ sub summarize_dir {
     $q_dir = "$runs_dir/" . ESCALATIONS_LEGACY
         if !-d $q_dir && -d "$runs_dir/" . ESCALATIONS_LEGACY;
     my $split = _count_decisions_split($q_dir, $blueprint_dir, $run_over);
-    # decisions_waiting stays the TOTAL, so every existing consumer keeps the
+    # escalations_waiting stays the TOTAL, so every existing consumer keeps the
     # number it has always had. The split is additive.
-    my $decisions_waiting  = $split->{operator} + $split->{triage};
-    my $decisions_operator = $split->{operator};
-    my $decisions_triage   = $split->{triage};
+    my $escalations_waiting = $split->{operator} + $split->{triage};
+    my $inbox_waiting       = $split->{operator};
+    my $triage_waiting      = $split->{triage};
 
     # Ruling AT-8: a 17th run-level key, run_agents, holding agents whose
     # `package` is the orchestrator's `_run` pseudo-package (Decision 10's
@@ -1215,6 +1963,28 @@ sub summarize_dir {
     # rule (never aliased into the shared index).
     my $run_agent_list = $by_pkg->{'_run'};
     my $run_agents = (ref($run_agent_list) eq 'ARRAY') ? [ map { { %$_ } } @$run_agent_list ] : [];
+
+    # package 13-dashboard-threads (spec S2.2): the 18th/19th run-level keys.
+    # `thread` is a FRESH deep copy of whichever thread $tidx chose to drive
+    # THIS blueprint (undef when none does); `thread_events` is a fresh deep
+    # copy of the project-level list, identical across every summary from one
+    # summarize() call but never the same reference (AC1/B7).
+    my $chosen = (ref($tidx) eq 'HASH' && ref($tidx->{by_bp}) eq 'HASH') ? $tidx->{by_bp}{$bp_name} : undef;
+    my $thread_out;
+    if (ref($chosen) eq 'HASH') {
+        $thread_out = {
+            name    => $chosen->{name},
+            state   => $chosen->{state},
+            done    => $chosen->{done},
+            total   => $chosen->{total},
+            doing   => [ map { { %$_ } } @{ $chosen->{doing} || [] } ],
+            current => (ref($chosen->{current}) eq 'HASH') ? { %{ $chosen->{current} } } : undef,
+            next    => (ref($chosen->{next})    eq 'HASH') ? { %{ $chosen->{next} } }    : undef,
+            owner   => (ref($chosen->{owner})   eq 'HASH') ? { %{ $chosen->{owner} } }   : undef,
+        };
+    }
+    my $thread_events_src = (ref($tidx) eq 'HASH' && ref($tidx->{events}) eq 'ARRAY') ? $tidx->{events} : [];
+    my $thread_events_out = [ map { { %$_ } } @$thread_events_src ];
 
     return {
         blueprint               => $bp_name,
@@ -1229,11 +1999,13 @@ sub summarize_dir {
         packages_done           => $packages_done,
         current_package         => $current_package,
         running_coordinators    => $running_coordinators,
-        decisions_waiting       => $decisions_waiting,
-        decisions_operator      => $decisions_operator,
-        decisions_triage        => $decisions_triage,
+        escalations_waiting     => $escalations_waiting,
+        inbox_waiting           => $inbox_waiting,
+        triage_waiting          => $triage_waiting,
         packages                => \@packages_out,
         run_agents              => $run_agents,
+        thread                  => $thread_out,
+        thread_events           => $thread_events_out,
     };
 }
 
@@ -1254,9 +2026,12 @@ sub summarize_dir {
 sub summarize {
     my ($root) = @_;
     my $idx = _dispatch_index(_dispatch_dir($root));
+    # package 13-dashboard-threads (spec S2.2): the thread index is built
+    # ONCE here too, same reasoning as the dispatch index above.
+    my $tidx = _thread_index($root);
     my @out;
     for my $dir (blueprint_dirs($root)) {
-        my $s = summarize_dir($dir, $idx);
+        my $s = summarize_dir($dir, $idx, $tidx);
         push @out, $s if defined $s;
     }
     return \@out;

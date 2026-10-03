@@ -37,7 +37,7 @@ my $LAUNCH_PATH = "$SCRIPTS_DIR/bp-launch.sh";
 # assignment there is this file's byte-for-byte successor).
 my $GATESTOP_PATH   = "$Bin/../../scripts/BpHook/StopGate.pm";
 my $LIFECYCLE_PATH  = "$SCRIPTS_DIR/bp-lifecycle.pl";
-my $ANSWER_PATH     = "$SCRIPTS_DIR/bp-answer-decision.pl";
+my $ANSWER_PATH     = "$SCRIPTS_DIR/bp-answer-escalation.pl";
 my $SWEEP_PATH      = "$SCRIPTS_DIR/bp-resume-sweep.sh";
 
 require $ORCH_PATH;   # package BpOrch
@@ -184,7 +184,7 @@ my @ALLOWLIST = (
     # assignment anywhere, so the scan's compound pattern
     # (write_registry(...) AND ->{status} =) must not match it. This is a
     # stronger, behavioral proof than the bare regex this entry used to be.
-    { label => 'bp-answer-decision.pl:706 (status => $plan->{ledger_status})', path => $ANSWER_PATH,
+    { label => 'bp-answer-escalation.pl:706 (status => $plan->{ledger_status})', path => $ANSWER_PATH,
       pattern => qr/status\s*=>\s*\$plan->\{ledger_status\}/ },
     # REMOVED 2026-08-14 by driver adjudication. This entry pinned
     # bp-resume-sweep.sh:98's status write as "still present (the gap is real,

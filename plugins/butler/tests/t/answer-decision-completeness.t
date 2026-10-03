@@ -79,7 +79,7 @@ use File::Path qw(make_path);
 use Cwd qw(abs_path);
 
 my $BUTLER = abs_path("$Bin/../..");
-my $SCRIPT = "$BUTLER/scripts/bp-answer-decision.pl";
+my $SCRIPT = "$BUTLER/scripts/bp-answer-escalation.pl";
 my $SWEEP  = "$BUTLER/scripts/bp-resume-sweep.sh";
 my $LEDGER_API = "$BUTLER/scripts/bp-ledger.pl";
 my $ORCH_SRC   = "$BUTLER/scripts/bp-orchestrator.pl";

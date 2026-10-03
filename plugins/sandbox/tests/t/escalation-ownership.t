@@ -129,15 +129,15 @@ sub write_json { my ($p, $d) = @_; open my $fh, '>:raw', $p or die $!; print {$f
     my ($s) = grep { ($_->{blueprint} // '') eq 'demo' } @$runs;
     ok($s, 'C1: the demo blueprint is in the summary') or BAIL_OUT('missing');
 
-    is($s->{decisions_operator}, 2,
+    is($s->{inbox_waiting}, 2,
        'C2: exactly the two operator-owned records are counted as needing the operator');
-    is($s->{decisions_triage}, 3,
+    is($s->{triage_waiting}, 3,
        'C3: the three triageable records are counted separately — VISIBLE, not hidden, because '
      . 'the resolver can be capped or unwired and then nothing moves');
-    is($s->{decisions_waiting}, 5,
-       'C4: decisions_waiting still reports the TOTAL, so every existing consumer keeps the '
+    is($s->{escalations_waiting}, 5,
+       'C4: escalations_waiting still reports the TOTAL, so every existing consumer keeps the '
      . 'number it has always had');
-    is($s->{decisions_operator} + $s->{decisions_triage}, $s->{decisions_waiting},
+    is($s->{inbox_waiting} + $s->{triage_waiting}, $s->{escalations_waiting},
        'C5: the split is exhaustive — no record falls out of both halves');
 }
 
@@ -159,10 +159,10 @@ sub write_json { my ($p, $d) = @_; open my $fh, '>:raw', $p or die $!; print {$f
     my $runs = RunState::summarize($root);
     my ($s) = grep { ($_->{blueprint} // '') eq 'quiet' } @{ $runs || [] };
     ok($s, 'D0: the quiet blueprint is in the summary') or BAIL_OUT('missing');
-    is($s->{decisions_operator}, 0,
+    is($s->{inbox_waiting}, 0,
        'D1: a queue holding only triageable records needs the operator ZERO times — the exact '
      . 'state that used to render "needs you: 1 decision waiting"');
-    is($s->{decisions_triage}, 1, 'D2: ...and the record is still counted, under triage');
+    is($s->{triage_waiting}, 1, 'D2: ...and the record is still counted, under triage');
 }
 
 # ---------------------------------------------------------------------------
@@ -193,7 +193,7 @@ sub write_json { my ($p, $d) = @_; open my $fh, '>:raw', $p or die $!; print {$f
     my ($s) = grep { ($_->{blueprint} // '') eq 'legacy' } @{ $runs || [] };
     ok($s, 'D2a: a blueprint whose queue is still under the OLD directory name is summarised')
         or BAIL_OUT('missing');
-    is($s->{decisions_operator}, 1,
+    is($s->{inbox_waiting}, 1,
        'D2b: its queued record is still COUNTED — the rename does not strand a live queue');
     ok(-d "$bp/runs/needs-you",
        'D2c: ...and RunState did not move it. This module renders; migrating is the '
@@ -240,11 +240,11 @@ sub write_json { my ($p, $d) = @_; open my $fh, '>:raw', $p or die $!; print {$f
     ok(length($flat) > 0,
        'E0: the panels rendered SOMETHING -- without this, E3\'s unlike() passes on an empty '
      . 'string and asserts nothing at all');
-    like($flat, qr/needs you\s+2 decisions waiting/,
+    like($flat, qr/needs you\s+2 escalations waiting/,
          'E1: the escalations row renders the OPERATOR count');
     like($flat, qr/in triage\s+3 escalations with the resolver/,
          'E2: the triage count renders as its own row, so nothing vanishes from the panel');
-    unlike($flat, qr/needs you\s+5 decisions/,
+    unlike($flat, qr/needs you\s+5 escalations/,
            'E3: the row does NOT render the total — that conflation is the defect');
 }
 

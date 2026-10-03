@@ -754,15 +754,15 @@ my %st = (
     my $rtext = join "\n", map { Dashboard::spans_text($_) } @{ $run->{lines} };
     like($rtext, qr/busy-lease.*active/,   'run: fresh lease + stay_awake -> active');
     like($rtext, qr/keep-awake.*holding/,  'run: stay_awake -> keep-awake holding');
-    like($rtext, qr/needs you.*2 decision/,'run: escalations count surfaced');
+    like($rtext, qr/needs you.*2 escalation/,'run: escalations count surfaced');
 }
 {
-    # Stale lease (stay_awake false) -> idle / released; zero decisions -> none.
+    # Stale lease (stay_awake false) -> idle / released; zero escalations -> none.
     my @p = live_panels({ %st, busy_age => 9999, stay_awake => 0, needs_you => 0 });
     my $rtext = join "\n", map { Dashboard::spans_text($_) } @{ (grep { $_->{title} eq 'Run' } @p)[0]->{lines} };
     like($rtext, qr/busy-lease.*idle/,     'run: stale lease -> idle');
     like($rtext, qr/keep-awake.*released/, 'run: not awake -> released (PC may sleep)');
-    unlike($rtext, qr/needs you/,     'run: zero decisions -> the escalations row is OMITTED, not rendered as "none"');
+    unlike($rtext, qr/needs you/,     'run: zero escalations -> the escalations row is OMITTED, not rendered as "none"');
 }
 {
     # No run at all (no busy_age) -> busy-lease none.

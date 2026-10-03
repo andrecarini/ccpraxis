@@ -919,10 +919,10 @@ ok(!Theme->can('display_width'),
     my $j3 = (defined $f3) ? join("\n", map { $_->{text} } @$f3) : '';
     unlike($j0, qr/needs you/, 'AC-E3/Behavior13: needs_you==0 -> "needs you" row absent from the frame');
     like($j3, qr/needs you/, 'AC-E3/Behavior13: needs_you==3 -> "needs you" row present');
-    like($j3, qr/3\s*decisions\s*waiting/, 'AC-E3: needs_you==3 row carries the count, pluralised');
+    like($j3, qr/3\s*escalations\s*waiting/, 'AC-E3: needs_you==3 row carries the count, pluralised');
   SKIP: {
         skip('tui::DashboardScreen did not load', 1) unless $DS_OK;
-        my $ny_row = tui::DashboardScreen::row(label => 'needs you', value => "3 decisions waiting", role => 'state.warn');
+        my $ny_row = tui::DashboardScreen::row(label => 'needs you', value => "3 escalations waiting", role => 'state.warn');
         my ($attention_span) = grep { ref($_) eq 'HASH' && defined($_->{role}) && $_->{role} =~ /^state\.(warn|crit)$/ } @$ny_row;
         ok(defined($attention_span), 'AC-E3: the escalations value span carries a Theme ATTENTION role (state.warn/state.crit), asserted on the span not emitted bytes');
     }

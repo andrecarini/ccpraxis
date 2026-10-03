@@ -54,8 +54,8 @@ sub mk_run {
     my (%o) = @_;
     my %s;
     for my $k (qw(blueprint state packages_done packages_total
-                  running_coordinators decisions_operator decisions_waiting
-                  decisions_triage paused_reason current_package)) {
+                  running_coordinators inbox_waiting escalations_waiting
+                  triage_waiting paused_reason current_package)) {
         $s{$k} = $o{$k} if exists $o{$k};
     }
     return \%s;
@@ -217,14 +217,14 @@ sub frame_text { my ($f) = @_; return join("\n", map { plain($_) } @$f) }
 }
 
 # ===========================================================================
-# AC5 (done criterion 2; B5) -- decisions_operator=>2, decisions_triage=>1 ->
+# AC5 (done criterion 2; B5) -- inbox_waiting=>2, triage_waiting=>1 ->
 # 2 spans; span0 '/^2 waiting$/' in state.warn/state.crit per state; span1
 # '/^, 1 triage$/' in text.muted; roles differ. Also asserted at panel level.
 # ===========================================================================
 {
     for my $case (['running', 'state.warn'], ['paused', 'state.crit']) {
         my ($st, $expect_role0) = @$case;
-        my $s = mk_run(blueprint => "bp-ac5-$st", state => $st, decisions_operator => 2, decisions_triage => 1,
+        my $s = mk_run(blueprint => "bp-ac5-$st", state => $st, inbox_waiting => 2, triage_waiting => 1,
                         packages_done => 0, packages_total => 1);
         my $cells = tui::DashboardScreen::_one_run_summary_cells($s);
         my $cell = $cells->[4];
@@ -252,11 +252,11 @@ sub frame_text { my ($f) = @_; return join("\n", map { plain($_) } @$f) }
 }
 
 # ===========================================================================
-# AC6 (done criterion 2; B6) -- decisions_operator=>0, decisions_triage=>3 ->
+# AC6 (done criterion 2; B6) -- inbox_waiting=>0, triage_waiting=>3 ->
 # 2 spans, joined text exactly "3 triage" (no leading comma/space).
 # ===========================================================================
 {
-    my $s = mk_run(blueprint => 'bp-ac6', state => 'running', decisions_operator => 0, decisions_triage => 3,
+    my $s = mk_run(blueprint => 'bp-ac6', state => 'running', inbox_waiting => 0, triage_waiting => 3,
                     packages_done => 0, packages_total => 1);
     my $cell = tui::DashboardScreen::_one_run_summary_cells($s)->[4];
     is(scalar(@$cell), 2, 'AC6: cell index 4 has exactly 2 spans');
@@ -270,12 +270,12 @@ sub frame_text { my ($f) = @_; return join("\n", map { plain($_) } @$f) }
 
 # ===========================================================================
 # AC7 (done criterion 2; B7, non-vacuity pair to AC5/AC6) --
-# decisions_triage 0 or absent -> exactly 1 span, "N waiting", no "triage"
+# triage_waiting 0 or absent -> exactly 1 span, "N waiting", no "triage"
 # substring anywhere -- proves the AC5/AC6 detector is not vacuously true.
 # ===========================================================================
 {
-    for my $case (['decisions_triage=>0', { decisions_operator => 4, decisions_triage => 0 }],
-                  ['decisions_triage absent entirely', { decisions_operator => 4 }]) {
+    for my $case (['triage_waiting=>0', { inbox_waiting => 4, triage_waiting => 0 }],
+                  ['triage_waiting absent entirely', { inbox_waiting => 4 }]) {
         my ($label, $extra) = @$case;
         my $s = mk_run(blueprint => 'bp-ac7', state => 'running', packages_done => 0, packages_total => 1, %$extra);
         my $cell = tui::DashboardScreen::_one_run_summary_cells($s)->[4];
@@ -290,13 +290,13 @@ sub frame_text { my ($f) = @_; return join("\n", map { plain($_) } @$f) }
 }
 
 # ===========================================================================
-# AC8 (done criterion 2; B5/B6 fallback interplay) -- decisions_operator
-# absent, decisions_waiting=>5, decisions_triage=>2 -> joined text is exactly
+# AC8 (done criterion 2; B5/B6 fallback interplay) -- inbox_waiting
+# absent, escalations_waiting=>5, triage_waiting=>2 -> joined text is exactly
 # "5 waiting, 2 triage" (the pre-existing operator->waiting fallback composes
 # correctly with the new triage span).
 # ===========================================================================
 {
-    my $s = mk_run(blueprint => 'bp-ac8', state => 'running', decisions_waiting => 5, decisions_triage => 2,
+    my $s = mk_run(blueprint => 'bp-ac8', state => 'running', escalations_waiting => 5, triage_waiting => 2,
                     packages_done => 0, packages_total => 1);
     my $cell = tui::DashboardScreen::_one_run_summary_cells($s)->[4];
     my $joined = join('', map { $_->{text} } @$cell);
@@ -309,7 +309,7 @@ sub frame_text { my ($f) = @_; return join("\n", map { plain($_) } @$f) }
 # Golden values below were captured by running the CURRENT, UNMODIFIED
 # DashboardScreen.pm (2026-09-08) against these exact fixtures via a
 # throwaway Data::Dumper capture script, then transcribed by hand. Fixture A
-# has neither new fact present (no paused_reason key, no decisions_triage
+# has neither new fact present (no paused_reason key, no triage_waiting
 # key). Fixture B additionally sets state=>paused with paused_reason still
 # absent (proves the new paused-gate introduces no drift on its own).
 # Fixture C additionally sets current_package (proves the interleave order
@@ -317,11 +317,11 @@ sub frame_text { my ($f) = @_; return join("\n", map { plain($_) } @$f) }
 # ===========================================================================
 {
     my $A = mk_run(blueprint => 'bp-golden-a', state => 'running', packages_done => 2, packages_total => 5,
-                    running_coordinators => 1, decisions_operator => 3);
+                    running_coordinators => 1, inbox_waiting => 3);
     my $B = mk_run(blueprint => 'bp-golden-b', state => 'paused', packages_done => 1, packages_total => 4,
-                    running_coordinators => 0, decisions_operator => 2);
+                    running_coordinators => 0, inbox_waiting => 2);
     my $C = mk_run(blueprint => 'bp-golden-c', state => 'running', packages_done => 3, packages_total => 6,
-                    running_coordinators => 2, decisions_operator => 0, current_package => 'golden-current-pkg');
+                    running_coordinators => 2, inbox_waiting => 0, current_package => 'golden-current-pkg');
 
     my $GOLDEN_CELLS_A = [
         [ { role => 'accent',       text => 'bp-golden-a' } ],
@@ -559,7 +559,7 @@ sub frame_text { my ($f) = @_; return join("\n", map { plain($_) } @$f) }
 {
     my $nonceA = 'nonce-ac15-runA-reason-x7q';
     my $runA = mk_run(blueprint => 'bp-ac15-a', state => 'paused', paused_reason => $nonceA, packages_done => 1, packages_total => 3);
-    my $runB = mk_run(blueprint => 'bp-ac15-b', state => 'running', decisions_triage => 1, packages_done => 2, packages_total => 4);
+    my $runB = mk_run(blueprint => 'bp-ac15-b', state => 'running', triage_waiting => 1, packages_done => 2, packages_total => 4);
     my $runC = mk_run(blueprint => 'bp-ac15-c', state => 'idle', packages_done => 0, packages_total => 1);
 
     my $state = base_state(runs => [$runA, $runB, $runC]);

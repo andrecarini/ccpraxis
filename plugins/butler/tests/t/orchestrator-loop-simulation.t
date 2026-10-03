@@ -168,6 +168,7 @@ sub run_sim {
             http_post=>sub { { status=>200, content=>'{}' } },
             launch=>$launch, pid_alive=>sub { (defined $_[0] && $alive{$_[0]}) ? 1 : 0 },
             spawn_judge=>$spawn,
+            ($spec->{fleet_thread} ? (fleet_thread => 1) : ()),
         });
         1;
     } or $err = $@;
@@ -327,6 +328,28 @@ sub launched_pkgs { my $r=shift; [ map { $_->{pkg} } @{$r->{launched}} ] }
     cmp_ok(length($led), '<', 4096, 'SIM-7: cold-read proxy — ledger stays bounded (<4KB), no per-cycle bloat');
     like($led, qr/^status:\s*blocked/m, 'SIM-7: parked after the corrective cap (two reopens then park)');
     is($r->{reg}{A}{corrective_attempts}, 2, 'SIM-7: exactly corr_cap corrective cycles were spent');
+}
+
+# ===========================================================================
+# SIM-FLEET: fleet_thread => 1 (package 05) threaded through run_sim's BpOrch::run
+# call changes nothing about the simulation's outcome. This fixture's bp_dir
+# (a bare tempdir, no .ccpraxis-local-data ancestor) degrades gracefully
+# (fleet_thread_disabled no_project_root): the ~27 pre-existing run_sim() calls
+# above never pass fleet_thread and are therefore byte-for-byte unaffected by
+# this option's existence (see the conditional pass-through in run_sim above).
+# ===========================================================================
+{
+    my $r = run_sim({
+        pkgs  => [['A','—','pending','p/a/'], ['B','A','pending','p/b/']],
+        coord => { A => {runs=>2,then=>'done'}, B => {runs=>2,then=>'done'} },
+        harvest => { A=>'pass', B=>'pass' },
+        fleet_thread => 1,
+    });
+    is($r->{err}, undef, 'SIM-FLEET: loop terminated cleanly with fleet_thread => 1 (same as SIM-1 without it)');
+    is_deeply([sort @{launched_pkgs($r)}], ['A','B'], 'SIM-FLEET: both A and B still launched exactly once each');
+    like($r->{log}, qr/idle_exit/, 'SIM-FLEET: still ended via idle_exit');
+    like($r->{log}, qr/fleet_thread_disabled/, 'SIM-FLEET: a bp_dir with no .ccpraxis-local-data ancestor logs fleet_thread_disabled (no_project_root) rather than dying or changing the run');
+    ok(! -d "$r->{dir}/.ccpraxis-local-data", 'SIM-FLEET: no almanac tree is created under the fixture (thread-less degradation wrote nothing)');
 }
 
 done_testing();
