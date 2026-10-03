@@ -399,10 +399,15 @@ sub slurp {
     is(BpContinuityLease::legacy_dir(), $abs_legacy,
        'L7 guard: legacy_dir() resolves to this test\'s own tempdir, not the real HOME');
 
-    BpHook::write_ticket($p, 'butler-continuity', ['on']);
+    # package 04-continuity-threads (Decision 36, spec 2.4): bare `on` now
+    # refuses R1 (a thread is required). This block is about the wake-lock
+    # following BpHook's arm state, not about thread attachment, so it arms
+    # via `--role reporter` -- the one `on` form the spec exempts from the
+    # thread requirement (spec 2.2.1/2.3 step 2b).
+    BpHook::write_ticket($p, 'butler-continuity', ['on', '--role', 'reporter']);
 
-    my ($out1, $err1, $rc1) = run_cli('on');
-    is($rc1, 0, 'L7: on exits 0') or diag("stderr: $err1");
+    my ($out1, $err1, $rc1) = run_cli('on', '--role', 'reporter');
+    is($rc1, 0, 'L7: on --role reporter exits 0') or diag("stderr: $err1");
     is(BpContinuityLease::any_active($legacy), 1, 'L7: after on, any_active(legacy_dir) is 1');
 
     my $p2 = { session_id => $sid, tool_use_id => 'tu2', transcript_path => "$home/x.jsonl", cwd => $home };

@@ -118,7 +118,7 @@ ALT_RE="(^|[^[:alnum:]])(keep[[:space:]]+going|keep[[:space:]]+working|carry[[:s
 shopt -s nocasematch
 if [[ $PR =~ $ALT_RE ]]; then
     shopt -u nocasematch
-    printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"This prompt suggests unattended work. If this session should keep working without the operator, arm continuity first: butler-continuity on"}}'
+    printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"This prompt suggests unattended work. If this session should keep working without the operator, arm and attach a thread first: butler-continuity on --new-thread <name> (or --thread <name> to resume one)"}}'
     exit 0
 fi
 shopt -u nocasematch

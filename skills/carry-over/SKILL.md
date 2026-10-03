@@ -67,7 +67,8 @@ re-establish the facts you intend to carry:
 If a check is slow, still do the cheap ones. A handover built on stale claims is the failure mode.
 
 <!-- continuity:begin -->
-If `butler-continuity` exists, run `butler-continuity status`; if armed, make `butler-continuity on` the first command of "Re-orient first" (add `--role reporter` when it reports role reporter), or name `/butler:drive-solo <scope>` for a driver instead.
+If `butler-continuity` exists, run `butler-continuity status`; if it shows a `thread:` line other than `none`, set any doing task of that thread to pending, then run `butler-continuity off --reason 'carried over to a fresh session'` just before step 4, so the thread is handed off and the fresh session can resume it.
+If it was armed, make `butler-continuity on --thread <that thread>` the first command of "Re-orient first" (`butler-continuity on --role reporter` when it reports role reporter), or name `/butler:drive-solo <scope>` and the thread for a driver instead.
 The fresh session has a new id and starts unarmed.
 <!-- continuity:end -->
 

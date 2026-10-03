@@ -33,8 +33,11 @@ my $SCRIPTS    = "$BUTLER/scripts";
 
 require "$SCRIPTS/BpHook.pm";
 
+# package 04-continuity-threads (spec 2.8): the nudge now tells the session
+# to arm AND ATTACH A THREAD, naming both the --new-thread and --thread forms.
 my $N3_TEXT = 'This prompt suggests unattended work. If this session should keep working '
-            . 'without the operator, arm continuity first: butler-continuity on';
+            . 'without the operator, arm and attach a thread first: butler-continuity on '
+            . '--new-thread <name> (or --thread <name> to resume one)';
 
 # ---------------------------------------------------------------------------
 # small IO / scaffolding
