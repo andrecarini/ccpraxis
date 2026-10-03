@@ -178,6 +178,17 @@ sub mint_ticket {
     my ($session, $agent, @argv) = @_;
     return mint_ticket_raw($session, $agent, ensure_transcript($session), @argv);
 }
+# age_transcript($sid, $seconds_ago) -- blueprint where-things-go package 03:
+# claim staleness is now judged by TRANSCRIPT mtime (Almanac::SessionLive),
+# never by claimed_at age alone, so fixtures that need a stale claim must
+# age the transcript file ensure_transcript() wrote, not just rewrite
+# claimed_at on the report.
+sub age_transcript {
+    my ($sid, $seconds_ago) = @_;
+    my $path = "$CFG/projects/p/$sid.jsonl";
+    utime(time - $seconds_ago, time - $seconds_ago, $path) if -f $path;
+    return $path;
+}
 # run_as($session, $agent_or_undef, @args) -- mints a ticket for EXACTLY
 # @args (with a transcript), then spawns almanac-bug.pl with that same argv.
 sub run_as {
@@ -246,7 +257,7 @@ sub mk_legacy_report {
     run('verify', '--project', $PROJ);
     is(slurp_raw($path), $raw_before, 'AC5: verify did not rewrite the legacy file bytes');
 
-    my ($rc_ss, $out_ss) = run_as('LS1', undef, 'set-status', $id, '--project', $PROJ, '--to', 'taken');
+    my ($rc_ss, $out_ss) = run_as('LS1', undef, 'set-status', $id, '--project', $PROJ, '--to', 'scheduled');
     isnt($rc_ss, 0, 'AC5: set-status on a claimless legacy triaging report is refused');
     like($out_ss, qr/takeover/, 'AC5: ...and the refusal names takeover');
     is(slurp_raw($path), $raw_before, 'AC5: the refused set-status left the file bytes untouched');
@@ -327,8 +338,9 @@ sub mk_legacy_report {
 
 # =============================================================================
 # AC10 -- behavior 4: a non-claimant (another session, or a sibling agent of
-# the claiming session) is refused for taken/open/declined; the claimant is
-# named; the file is unchanged.
+# the claiming session) is refused for scheduled/open/dropped (RENAMED from
+# taken/open/declined, blueprint where-things-go package 07-bug-lifecycle);
+# the claimant is named; the file is unchanged.
 # =============================================================================
 {
     my (undef, $o) = run('file', '--project', $PROJ, '--title', '"ac10 claimant"', '--body', '"b"');
@@ -336,7 +348,7 @@ sub mk_legacy_report {
     run_as('S1', 'A1', 'set-status', $id, '--project', $PROJ, '--to', 'triaging');
     is(field_of($path, 'status'), 'triaging', 'AC10 setup: claimed by S1/A1');
 
-    for my $to (qw(taken open declined)) {
+    for my $to (qw(scheduled open dropped)) {
         my $raw_before = slurp_raw($path);
         my ($rc, $out) = run_as('S2', undef, 'set-status', $id, '--project', $PROJ, '--to', $to);
         isnt($rc, 0, "AC10: another session is refused moving it to $to");
@@ -360,9 +372,15 @@ sub mk_legacy_report {
     my (undef, $o) = run('file', '--project', $PROJ, '--title', '"ac11a same agent"', '--body', '"b"');
     chomp(my $path = $o); my ($id) = $path =~ m{/([^/]+)\.md$};
     run_as('S1', 'A1', 'set-status', $id, '--project', $PROJ, '--to', 'triaging');
-    my ($rc) = run_as('S1', 'A1', 'set-status', $id, '--project', $PROJ, '--to', 'taken');
-    is($rc, 0, 'AC11: the claimant (same session+agent) moves it to taken');
-    is(field_of($path, 'claimant_session'), 'S1', 'AC11: the claim fields are KEPT after moving to taken');
+    # RENAMED (package 07-bug-lifecycle): the old target 'taken' is retired.
+    # 'dropped' is used here instead of 'scheduled' deliberately -- this
+    # assertion is about claim fields surviving a transition OUT of triaging
+    # by the claimant, which 'dropped' exercises without needing a package
+    # ledger fixture (scheduled's --package requirement is orthogonal and
+    # covered in bug-lifecycle.t).
+    my ($rc) = run_as('S1', 'A1', 'set-status', $id, '--project', $PROJ, '--to', 'dropped', '--note', '"not reproducible"');
+    is($rc, 0, 'AC11: the claimant (same session+agent) moves it to dropped');
+    is(field_of($path, 'claimant_session'), 'S1', 'AC11: the claim fields are KEPT after moving to dropped');
 }
 {
     my (undef, $o) = run('file', '--project', $PROJ, '--title', '"ac11b main thread"', '--body', '"b"');
@@ -403,37 +421,61 @@ sub mk_legacy_report {
 }
 
 # =============================================================================
-# AC13 -- staleness by age: 25h old is stale, 23h old is not.
+# AC13 -- EDITED for blueprint where-things-go package 03-thread-sessions
+# (specs/03-thread-sessions-spec.md section 2.11/behaviour 15): staleness is
+# now judged by the claimant's TRANSCRIPT activity (Almanac::SessionLive),
+# never by claimed_at age alone -- a 25h-old claimed_at with a FRESH
+# transcript is explicitly NOT stale; a transcript idle past the shared
+# $IDLE_SECONDS (60m) threshold IS stale, with the new reason text.
 # =============================================================================
 {
-    my (undef, $o) = run('file', '--project', $PROJ, '--title', '"ac13 age"', '--body', '"b"');
+    my (undef, $o) = run('file', '--project', $PROJ, '--title', '"ac13 idle transcript"', '--body', '"b"');
     chomp(my $path = $o); my ($id) = $path =~ m{/([^/]+)\.md$};
     run_as('AGE1', undef, 'set-status', $id, '--project', $PROJ, '--to', 'triaging');
 
-    rewrite_field($path, 'claimed_at', AlmanacBug::_iso(time - 25 * 3600));
+    age_transcript('AGE1', 2 * 3600); # 120m idle, unarmed -- dead/idle
     my (undef, $lo) = run('list', '--project', $PROJ);
-    like($lo, qr/!! STALE CLAIM: claim is 25h old \(stale after 24h\)/, 'AC13: a 25h old claim is stale');
+    like($lo, qr/!! STALE CLAIM: claimant session AGE1 has been idle 120m \(dead after 60m\)/,
+        'AC13: a claim whose transcript has been idle 120m is stale, with the new idle-based reason text');
 
-    rewrite_field($path, 'claimed_at', AlmanacBug::_iso(time - 23 * 3600));
+    my (undef, $lj) = run('list', '--project', $PROJ, '--json');
+    my $parsed = eval { JSON::PP->new->decode($lj) };
+    my ($row) = grep { ($_->{id} // '') eq $id } @{ $parsed || [] };
+    SKIP: {
+        skip 'AC13: row not found', 1 unless defined $row;
+        is($row->{stale_claim}, 'claimant session AGE1 has been idle 120m (dead after 60m)',
+            'AC13: --json carries the same idle-based stale_claim reason');
+    }
+}
+{
+    my (undef, $o) = run('file', '--project', $PROJ, '--title', '"ac13 age alone is not enough"', '--body', '"b"');
+    chomp(my $path = $o); my ($id) = $path =~ m{/([^/]+)\.md$};
+    run_as('AGE2', undef, 'set-status', $id, '--project', $PROJ, '--to', 'triaging');
+
+    # claimed_at alone, aged 25h, with the transcript left fresh (as
+    # ensure_transcript() wrote it): behaviour 15 -- age alone no longer
+    # stales a claim.
+    rewrite_field($path, 'claimed_at', AlmanacBug::_iso(time - 25 * 3600));
     my (undef, $lo2) = run('list', '--project', $PROJ);
     my ($lo2_row) = grep { /\Q$id\E/ } split /\n/, $lo2;
-    unlike($lo2_row // '', qr/STALE CLAIM/, 'AC13: a 23h old claim is NOT stale (no !!)');
+    unlike($lo2_row // '', qr/STALE CLAIM/,
+        'AC13: a 25h-old claimed_at with a FRESH transcript is NOT stale (age alone no longer stales a claim)');
     my (undef, $lj2) = run('list', '--project', $PROJ, '--json');
     my $parsed2 = eval { JSON::PP->new->decode($lj2) };
     my ($row2) = grep { ($_->{id} // '') eq $id } @{ $parsed2 || [] };
     SKIP: {
         skip 'AC13: row not found', 1 unless defined $row2;
-        ok(!exists $row2->{stale_claim}, 'AC13: --json carries no stale_claim at 23h');
+        ok(!exists $row2->{stale_claim}, 'AC13: --json carries no stale_claim when only claimed_at is old');
     }
 }
 
 # =============================================================================
-# AC13b -- transcript-root VISIBILITY fallback (S2 / red-team M1 fix): a
-# claimant_transcript_path whose ROOT (two path segments up -- the
-# "<...>/projects" directory, per _transcript_visibility's own contract) is
-# not visible from this process must NOT be read as stale just because it is
-# invisible -- it falls back to the 24h age-only rule. Distinct from AC12
-# (root IS visible, file genuinely missing -> stale regardless of age).
+# AC13b -- transcript-root VISIBILITY fallback (S2 / red-team M1 fix),
+# EDITED for package 03-thread-sessions: a claimant_transcript_path whose
+# ROOT is not visible from this process falls back to the claim/attach time
+# (SessionLive::judge's "since" basis) against the ARMED threshold (780m =
+# 13h), not the old 24h age-only rule. Distinct from AC12 (root IS visible,
+# file genuinely missing -> stale regardless of age).
 # =============================================================================
 {
     # A path whose grandparent directory ($HOME/no-such-mount-<n>) never
@@ -468,16 +510,17 @@ sub mk_legacy_report {
     }
     my (undef, $out_to_live) = run_as('OTHER-AC13B', undef, 'takeover', $id, '--project', $PROJ);
     like($out_to_live, qr/claim is live/,
-        'AC13b: takeover of the recent invisible-root claim is refused as live (age fallback says live)');
+        'AC13b: takeover of the recent invisible-root claim is refused as live (since-fallback says live)');
 
-    # Age the same claim past 24h: the age-only fallback must still catch it
-    # -- invisibility must not ALSO suppress the age rule.
-    rewrite_field($path, 'claimed_at', AlmanacBug::_iso(time - 25 * 3600));
+    # Age the same claim's claimed_at past the ARMED threshold (780m = 13h):
+    # the since-fallback must still catch it -- invisibility must not ALSO
+    # suppress staleness forever.
+    rewrite_field($path, 'claimed_at', AlmanacBug::_iso(time - 14 * 3600));
     my (undef, $lo2) = run('list', '--project', $PROJ);
-    like($lo2, qr/!! STALE CLAIM: claim is 25h old \(stale after 24h\)/,
-        'AC13b: the same invisible-root claim, aged past 24h, IS reported stale (age fallback still fires)');
+    like($lo2, qr/!! STALE CLAIM: claim is 840m old and its transcript is not visible here \(dead after 780m\)/,
+        'AC13b: the same invisible-root claim, aged past 13h, IS reported stale (since-fallback still fires)');
     my ($rc_takeover, $out_takeover) = run_as('OTHER-AC13B-2', undef, 'takeover', $id, '--project', $PROJ);
-    is($rc_takeover, 0, 'AC13b: takeover of the now-stale (by age) invisible-root claim succeeds') or diag $out_takeover;
+    is($rc_takeover, 0, 'AC13b: takeover of the now-stale (by since-fallback) invisible-root claim succeeds') or diag $out_takeover;
     is(field_of($path, 'claimant_session'), 'OTHER-AC13B-2',
         'AC13b: the new claimant is recorded after takeover of the aged invisible-root claim');
 }
@@ -490,7 +533,7 @@ sub mk_legacy_report {
     my (undef, $o) = run('file', '--project', $PROJ, '--title', '"ac14 stale doctor"', '--body', '"b"');
     chomp(my $path = $o); my ($id) = $path =~ m{/([^/]+)\.md$};
     run_as('DOC-STALE', undef, 'set-status', $id, '--project', $PROJ, '--to', 'triaging');
-    rewrite_field($path, 'claimed_at', AlmanacBug::_iso(time - 25 * 3600));
+    age_transcript('DOC-STALE', 2 * 3600); # package 03: staleness is transcript-idle-based now
 
     my ($rc, $out) = run_doctor('--root', $PROJ);
     is($rc, 1, 'AC14: doctor exits 1 when a STALE-CLAIM finding exists');
@@ -513,7 +556,7 @@ sub mk_legacy_report {
     my (undef, $o) = run('file', '--project', $PROJ, '--title', '"ac15 stale takeover"', '--body', '"b"');
     chomp(my $path = $o); my ($id) = $path =~ m{/([^/]+)\.md$};
     run_as('OLDC', 'OLDA', 'set-status', $id, '--project', $PROJ, '--to', 'triaging');
-    rewrite_field($path, 'claimed_at', AlmanacBug::_iso(time - 25 * 3600));
+    age_transcript('OLDC', 2 * 3600); # package 03: staleness is transcript-idle-based now
 
     my ($rc, $out) = run_as('NEWC', undef, 'takeover', $id, '--project', $PROJ);
     is($rc, 0, 'AC15: takeover of a stale claim succeeds') or diag $out;
@@ -524,7 +567,7 @@ sub mk_legacy_report {
     ok(defined field_of($path, 'taken_over_at'), 'AC15: taken_over_at is recorded');
     ok(defined field_of($path, 'taken_over_reason'), 'AC15: taken_over_reason is recorded');
 
-    my ($rc_old, $out_old) = run_as('OLDC', 'OLDA', 'set-status', $id, '--project', $PROJ, '--to', 'taken');
+    my ($rc_old, $out_old) = run_as('OLDC', 'OLDA', 'set-status', $id, '--project', $PROJ, '--to', 'scheduled');
     isnt($rc_old, 0, 'AC15: the OLD claimant is refused after the takeover');
     like($out_old, qr/claimed by session NEWC/, 'AC15: ...and the refusal names the new claimant');
 }
@@ -553,7 +596,7 @@ sub mk_legacy_report {
     my (undef, $o) = run('file', '--project', $PROJ, '--title', '"ac16 dispatch takeover"', '--body', '"b"');
     chomp(my $path = $o); my ($id) = $path =~ m{/([^/]+)\.md$};
     run_as('AC16OLD', undef, 'set-status', $id, '--project', $PROJ, '--to', 'triaging');
-    rewrite_field($path, 'claimed_at', AlmanacBug::_iso(time - 25 * 3600));
+    age_transcript('AC16OLD', 2 * 3600); # package 03: staleness is transcript-idle-based now
 
     # almanac.pl strips the leading 'bug' word and passes the rest unchanged
     # to almanac-bug.pl -- the ticket must be minted for THAT argv.
@@ -568,6 +611,31 @@ sub mk_legacy_report {
 # AC17 is bug-state-machine.t's (behavior 11, update/append frozen specifically
 # for `triaging`). Not repeated here.
 # =============================================================================
+
+# =============================================================================
+# AC5 (package 03-thread-sessions, specs/03-thread-sessions-spec.md section
+# 2.11) -- the stale rule is switched to Almanac::SessionLive: the source no
+# longer names the retired age-only constant or the BpSession dependency.
+# =============================================================================
+{
+    open(my $fh, '<:raw', $A) or die "cannot read $A: $!";
+    local $/;
+    my $src = <$fh>;
+    close $fh;
+    unlike($src, qr/\bCLAIM_STALE_SECONDS\b/, 'AC5: almanac-bug.pl source no longer contains CLAIM_STALE_SECONDS');
+    unlike($src, qr/\bBpSession\b/, 'AC5: almanac-bug.pl source no longer contains BpSession');
+    like($src, qr/\bAlmanac::SessionLive\b/, 'AC5: almanac-bug.pl source now names Almanac::SessionLive');
+}
+{
+    # claim_state never dies with butler absent (SessionLive never loads
+    # butler, so a missing BpHook.pm must not crash the stale check).
+    local $ENV{BUTLER_STATE_DIR} = '/no-such-butler-state-dir-ac5';
+    my (undef, $o) = run('file', '--project', $PROJ, '--title', '"ac5 butler absent"', '--body', '"b"');
+    chomp(my $path = $o); my ($id) = $path =~ m{/([^/]+)\.md$};
+    run_as('AC5BA', undef, 'set-status', $id, '--project', $PROJ, '--to', 'triaging');
+    my (undef, $lo) = run('list', '--project', $PROJ);
+    ok(defined $lo, 'AC5: list does not die when BUTLER_STATE_DIR points nowhere (claim_state never dies)');
+}
 
 # =============================================================================
 # AC18 -- behavior 12: ContinuityOffCheck issues `almanac-bug` tickets for

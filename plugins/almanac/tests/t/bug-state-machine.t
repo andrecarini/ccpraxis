@@ -24,6 +24,17 @@
 # says `reviewing`. Every assertion below that depends on the rename or on
 # claim recording is EXPECTED TO FAIL (red) until package 12 lands; that is
 # the point of a failing-first oracle, not a bug in this file.
+#
+# SECOND RENAME (blueprint where-things-go, package 07-bug-lifecycle,
+# Decision 8): `taken -> resolved | declined` becomes
+# `scheduled -> fixed | dropped`. `scheduled` carries a validated
+# `--package <blueprint>/<package>` link; `fixed` can never be set by hand
+# (reconcile only); `dropped` requires a reason. almanac-bug.pl has NONE of
+# this at the time this file is updated -- every fixture and assertion
+# touched by this rename is likewise EXPECTED TO FAIL (red) until package
+# 07-bug-lifecycle lands. See bug-lifecycle.t for the full oracle on
+# scheduling, reconcile and migration; this file keeps only the renamed
+# edges of the state machine itself.
 use strict;
 use warnings;
 use FindBin qw($Bin);
@@ -162,13 +173,30 @@ sub run_as {
     do $A;
     diag("AC1: loading $A failed: $@") if $@;
 }
-is_deeply(\@AlmanacBug::STATES, [qw(open triaging taken resolved declined)],
-    'AC1: @AlmanacBug::STATES is open triaging taken resolved declined');
+# RENAMED (blueprint where-things-go, package 07-bug-lifecycle, Decision 8):
+# taken -> scheduled, resolved -> fixed, declined -> dropped. %LEGACY_STATUS
+# now ALSO maps the two retired-but-mappable names (resolved, declined) on
+# read, on top of the pre-existing reviewing -> triaging mapping; `taken` is
+# deliberately NOT in %LEGACY_STATUS (it cannot be mapped without a package
+# link -- see bug-lifecycle.t for the migration oracle).
+is_deeply(\@AlmanacBug::STATES, [qw(open triaging scheduled fixed dropped)],
+    'AC1: @AlmanacBug::STATES is open triaging scheduled fixed dropped');
 ok(!exists $AlmanacBug::NEXT{reviewing}, 'AC1: %NEXT has no reviewing key');
-is_deeply($AlmanacBug::NEXT{triaging}, [qw(taken open declined)],
-    "AC1: \$NEXT{triaging} is taken open declined");
+ok(!exists $AlmanacBug::NEXT{taken}, 'AC1: %NEXT has no taken key (retired)');
+is_deeply($AlmanacBug::NEXT{triaging}, [qw(scheduled open dropped)],
+    "AC1: \$NEXT{triaging} is scheduled open dropped");
+is_deeply($AlmanacBug::NEXT{scheduled}, [qw(fixed dropped)],
+    "AC1: \$NEXT{scheduled} is fixed dropped");
+is_deeply($AlmanacBug::NEXT{fixed}, [], "AC1: \$NEXT{fixed} is terminal (empty)");
+is_deeply($AlmanacBug::NEXT{dropped}, [], "AC1: \$NEXT{dropped} is terminal (empty)");
 is($AlmanacBug::LEGACY_STATUS{reviewing}, 'triaging',
     "AC1: \$LEGACY_STATUS{reviewing} eq 'triaging'");
+is($AlmanacBug::LEGACY_STATUS{resolved}, 'fixed',
+    "AC1: \$LEGACY_STATUS{resolved} eq 'fixed'");
+is($AlmanacBug::LEGACY_STATUS{declined}, 'dropped',
+    "AC1: \$LEGACY_STATUS{declined} eq 'dropped'");
+ok(!exists $AlmanacBug::LEGACY_STATUS{taken},
+    "AC1: \$LEGACY_STATUS{taken} is NOT set -- it cannot be mapped without a package link");
 
 # ---- AC2: USAGE and doc text no longer say "reviewing" ---------------------
 {
@@ -227,6 +255,36 @@ like(body_of($path), qr/revised while open/, 'update --replace: the body actuall
     is(field_of($path, 'status'), 'open', 'AC3: the report stays open after the refused call');
 }
 
+# ---- AC5 (specs/07-bug-lifecycle-spec.md section 2.4 step 1): the THREE
+# retired bug-lifecycle target names (taken, resolved, declined) each refuse
+# with their own rename hint, before anything else is written, and the file
+# stays byte-identical -- package 07-bug-lifecycle, Decision 8.
+#
+# A FRESH report, deliberately -- not $id/$path. Under the CURRENT (pre-
+# package-07) implementation these three old names are still legal targets,
+# so a refusal here is exactly what is under test; reusing the main report
+# would let an erroneously-accepted `declined` silently retire it before the
+# rest of this file's lifecycle assertions ever run.
+# ---------------------------------------------------------------------------
+{
+    my (undef, $o5) = run('file', '--project', $PROJ, '--title', '"ac5 retired names"', '--body', '"b"');
+    chomp(my $path5 = $o5);
+    my ($id5) = $path5 =~ m{/([^/]+)\.md$};
+    my $before = body_of($path5);
+    my ($rcT, $outT) = run('set-status', $id5, '--project', $PROJ, '--to', 'taken');
+    isnt($rcT, 0, 'AC5: --to taken is refused');
+    like($outT, qr/use --to scheduled --package <blueprint>\/<package>/,
+        'AC5: ...STDERR tells the caller to use --to scheduled --package');
+    my ($rcR, $outR) = run('set-status', $id5, '--project', $PROJ, '--to', 'resolved');
+    isnt($rcR, 0, 'AC5: --to resolved is refused');
+    like($outR, qr/replaced by 'fixed'/, "AC5: ...STDERR says it was replaced by 'fixed'");
+    my ($rcD, $outD) = run('set-status', $id5, '--project', $PROJ, '--to', 'declined');
+    isnt($rcD, 0, 'AC5: --to declined is refused');
+    like($outD, qr/use --to dropped --note/, 'AC5: ...STDERR tells the caller to use --to dropped --note');
+    is(field_of($path5, 'status'), 'open', 'AC5: the report stays open after all three refused calls');
+    is(body_of($path5), $before, 'AC5: the body is byte-identical after all three refused calls');
+}
+
 # ---- freeze ----------------------------------------------------------------
 my ($rc_r) = run_as('S1', undef, 'set-status', $id, '--project', $PROJ, '--to', 'triaging');
 is($rc_r, 0, 'set-status: open -> triaging (AC4), claimed by a hook ticket');
@@ -242,22 +300,43 @@ like($out_u2, qr/triaging/i, '...and names triaging specifically, not the old na
 unlike(body_of($path), qr/sneaky rewrite/, '...and the body is genuinely unchanged');
 
 # ---- transitions -----------------------------------------------------------
-my ($rc_bad, $out_bad) = run_as('S1', undef, 'set-status', $id, '--project', $PROJ, '--to', 'resolved');
-isnt($rc_bad, 0, 'triaging -> resolved is refused (no skipping taken) (AC4)');
-like($out_bad, qr/not a legal transition/, '...and names the legal targets');
+#
+# RENAMED (package 07-bug-lifecycle): `resolved` is retired (AC5 above covers
+# its own refusal). The "you cannot skip the middle step" claim is now best
+# demonstrated by `fixed`, which can NEVER be reached by hand from ANY state
+# -- it is set only by reconcile (spec sec 2.4 step 2) -- so attempting it
+# from `triaging` is refused with that specific message, not "not a legal
+# transition".
+my ($rc_bad, $out_bad) = run_as('S1', undef, 'set-status', $id, '--project', $PROJ, '--to', 'fixed');
+isnt($rc_bad, 0, 'triaging -> fixed is refused -- fixed is never set by hand (AC4)');
+like($out_bad, qr/is set only by reconcile/, '...and the refusal names reconcile');
 
 my ($rc_x) = run_as('S1', undef, 'set-status', $id, '--project', $PROJ, '--to', 'nonsense');
 isnt($rc_x, 0, 'an unknown state is refused');
 
-is((run_as('S1', undef, 'set-status', $id, '--project', $PROJ, '--to', 'taken'))[0], 0,
-   'triaging -> taken, by the claimant (AC4)');
-ok(defined field_of($path, 'taken_at'), 'taken stamps taken_at');
-is((run('set-status', $id, '--project', $PROJ, '--to', 'resolved', '--note', '"fixed in abc123"'))[0], 0,
-   'taken -> resolved');
+# `scheduled` requires a valid --package (spec sec 2.4 step 5), validated
+# against a real ledger.
+(my $pkg_dir = "$PROJ/.ccpraxis-local-data/blueprints/smtest/packages") =~ s{\\}{/}g;
+make_path($pkg_dir);
+open(my $pfh, '>:raw', "$pkg_dir/01-smtest.md") or die "fixture: cannot write package ledger: $!";
+print {$pfh} "---\nstatus: running\n---\n";
+close $pfh;
+
+is((run_as('S1', undef, 'set-status', $id, '--project', $PROJ, '--to', 'scheduled', '--package', 'smtest/01-smtest'))[0], 0,
+   'triaging -> scheduled, by the claimant, with a valid --package (AC4)');
+ok(defined field_of($path, 'scheduled_at'), 'scheduled stamps scheduled_at');
+is(field_of($path, 'package'), 'smtest/01-smtest', 'scheduled records the package link');
+
+my ($rc_fixed_by_hand, $out_fixed_by_hand) = run('set-status', $id, '--project', $PROJ, '--to', 'fixed');
+isnt($rc_fixed_by_hand, 0, 'scheduled -> fixed by hand is refused -- fixed is set only by reconcile');
+like($out_fixed_by_hand, qr/is set only by reconcile/, '...and the refusal names reconcile');
+
+is((run('set-status', $id, '--project', $PROJ, '--to', 'dropped', '--note', '"fixed in abc123"'))[0], 0,
+   'scheduled -> dropped');
 is(field_of($path, 'resolution'), 'fixed in abc123', 'the resolution note is recorded');
 
-my ($rc_term) = run('set-status', $id, '--project', $PROJ, '--to', 'taken');
-isnt($rc_term, 0, 'resolved is TERMINAL — no transitions out of it');
+my ($rc_term) = run('set-status', $id, '--project', $PROJ, '--to', 'scheduled', '--package', 'smtest/01-smtest');
+isnt($rc_term, 0, 'dropped is TERMINAL — no transitions out of it');
 
 # ---- hand-back unfreezes ---------------------------------------------------
 # A triager who wants more from the filer must be able to give the report back,
@@ -333,7 +412,7 @@ my $id3;
         }
     }
     my (undef, $lo) = run('list', '--project', $PROJ, '--status', 'open');
-    unlike($lo, qr/judge deadlocks/, 'list --status open: filters out the resolved one');
+    unlike($lo, qr/judge deadlocks/, 'list --status open: filters out the dropped one');
 
     # collect always includes the CURRENT project even when it is not in the
     # registry — a report filed from an unregistered project must still be
@@ -469,10 +548,16 @@ my $id3;
 #
 # A status that is not one of @STATES cannot be reached by any transition, so
 # can_transition rejects it as an unknown CURRENT state -- correct for a typo,
-# but it left no way out. 20260825-193930-fff0 carried `status: fixed`, written
-# by hand or by a version predating this machine, and was wedged: set-status
-# refused it and guard-almanac-write.sh denies editing the reports directory
-# directly. Correct by every rule, unfixable by every sanctioned path.
+# but it left no way out. 20260825-193930-fff0 carried an out-of-machine
+# status, written by hand or by a version predating this machine, and was
+# wedged: set-status refused it and guard-almanac-write.sh denies editing the
+# reports directory directly. Correct by every rule, unfixable by every
+# sanctioned path.
+#
+# RENAMED (package 07-bug-lifecycle): `fixed` is now an IN-MACHINE state (set
+# only by reconcile), so it can no longer stand in for "a status outside
+# @STATES" -- this fixture uses `closed` instead, a status that equally
+# predates this machine and still belongs to no version of @STATES.
 #
 # --repair is that path. These assertions exist to keep it NARROW: the value is
 # in what it still refuses.
@@ -489,15 +574,15 @@ my $id3;
     {
         open my $fh, '<:raw', $lpath or die "fixture: cannot read $lpath: $!";
         local $/; my $t = <$fh>; close $fh;
-        $t =~ s/^status:\s*open$/status: fixed/m;
+        $t =~ s/^status:\s*open$/status: closed/m;
         open my $out, '>:raw', $lpath or die "fixture: cannot write $lpath: $!";
         print {$out} $t; close $out;
     }
-    is(field_of($lpath, 'status'), 'fixed', 'repair fixture: the report is now outside the state machine');
+    is(field_of($lpath, 'status'), 'closed', 'repair fixture: the report is now outside the state machine');
 
     # 1. Without --repair it is still refused -- but the message must say how to
     #    recover, or the operator is left exactly as stuck as before.
-    my ($rc_no, $out_no) = run('set-status', $lid, '--project', $PROJ, '--to', 'resolved');
+    my ($rc_no, $out_no) = run('set-status', $lid, '--project', $PROJ, '--to', 'dropped', '--note', '"stale"');
     isnt($rc_no, 0, 'repair: set-status still refuses an out-of-machine report without --repair');
     like($out_no, qr/--repair/, 'repair: ...and the refusal names the way out');
 
@@ -509,7 +594,7 @@ my $id3;
     chomp(my $opath = $out_f2);
     my ($oid) = $opath =~ m{/([^/]+)\.md$};
     my ($rc_skip, $out_skip) = run('set-status', $oid, '--project', $PROJ,
-                                   '--to', 'resolved', '--repair');
+                                   '--to', 'scheduled', '--repair');
     isnt($rc_skip, 0, 'repair: --repair CANNOT skip a legal transition from a valid state');
     like($out_skip, qr/not a legal transition/, 'repair: ...it is refused for the ordinary reason');
     is(field_of($opath, 'status'), 'open', 'repair: the refused report is untouched');
@@ -518,11 +603,18 @@ my $id3;
     my ($rc_bad) = run('set-status', $lid, '--project', $PROJ, '--to', 'bogus', '--repair');
     isnt($rc_bad, 0, 'repair: --repair still refuses an unknown target state');
 
+    # 3b. --repair cannot reach `fixed` either -- that refusal is unconditional
+    # (spec sec 2.4 step 2), regardless of how far outside the machine the
+    # report currently is.
+    my ($rc_fx, $out_fx) = run('set-status', $lid, '--project', $PROJ, '--to', 'fixed', '--repair');
+    isnt($rc_fx, 0, 'repair: --repair cannot reach fixed -- it is set only by reconcile');
+    like($out_fx, qr/is set only by reconcile/, 'repair: ...with the reconcile-only message');
+
     # 4. And it works.
     my ($rc_ok, $out_ok) = run('set-status', $lid, '--project', $PROJ,
-                               '--to', 'resolved', '--repair');
+                               '--to', 'dropped', '--note', '"stale, filed before the machine"', '--repair');
     is($rc_ok, 0, 'repair: --repair moves an out-of-machine report into a valid state') or diag $out_ok;
-    is(field_of($lpath, 'status'), 'resolved', 'repair: the status is now a real state');
+    is(field_of($lpath, 'status'), 'dropped', 'repair: the status is now a real state');
     like($out_ok, qr/repaired/, 'repair: the output SAYS it was a repair, not an ordinary transition');
 }
 
