@@ -20,6 +20,18 @@
 use strict;
 use warnings;
 BEGIN { $ENV{CCPRAXIS_NO_WAKELOCK} = 1 }
+# AC15 (08-blueprint-parks fix-batch, SF-3): pin ALMANAC_HOME to an isolated
+# tempdir before any production code loads (Decision 29) -- this file names
+# no ALMANAC_HOME today. Deliberately NOT re-pinning HOME/USERPROFILE here:
+# $REAL_HOME/$REAL_USERPROFILE below are captured from the REAL host
+# environment on purpose, to verify the real butler-state vault is never
+# touched by this run -- pinning HOME this early would make that check
+# vacuous (it would always compare against a fake vault) instead of
+# hardening it.
+BEGIN {
+    require File::Temp;
+    $ENV{ALMANAC_HOME} = File::Temp::tempdir(CLEANUP => 1);
+}
 use Test::More;
 use FindBin qw($Bin);
 use Cwd qw(abs_path getcwd);
@@ -1160,7 +1172,7 @@ sub run_hook_perl {
             # that settles it, not "done" -- two blueprints (one done, one
             # parked) are needed so the SCOPE resolves to nothing further.
             _pw_make_bp_dir($data, 'bp-a', [{ key => 'p1', status => 'done' }]);
-            _pw_make_bp_dir($data, 'bp-b', [{ key => 'p1', status => 'pending' }]);
+            my $bp_b = _pw_make_bp_dir($data, 'bp-b', [{ key => 'p1', status => 'pending' }]);
             my $dsdir = "$data/.drive-solo"; make_path($dsdir);
             open my $ofh, '>:raw', "$dsdir/order.json" or die $!;
             print $ofh $J->encode({ order => ['bp-a', 'bp-b'], recorded_at => 1_830_297_600 });
@@ -1168,8 +1180,11 @@ sub run_hook_perl {
             open my $afh, '>:raw', "$dsdir/announced.json" or die $!;
             print $afh $J->encode({ announced => ['bp-a'] });
             close $afh;
-            open my $pfh, '>:raw', "$dsdir/parks.json" or die $!;
-            print $pfh $J->encode([{ blueprint => 'bp-b', reason => 'out of scope', at => 1_830_297_600 }]);
+            # Authored directly in blueprint.md (spec 08-blueprint-parks
+            # §2.1), not parks.json: the director's only source of
+            # parkedness is the blueprint's own status now.
+            open my $pfh, '>>:raw', "$bp_b/blueprint.md" or die $!;
+            print $pfh "\n```\nstatus: parked\nparked_reason: out of scope\n```\n";
             close $pfh;
 
             my $expect_n = 0;

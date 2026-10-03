@@ -17,6 +17,18 @@ use File::Basename qw(basename);
 use Fcntl qw(:flock);
 use Time::HiRes qw(time);
 
+# AC15 (08-blueprint-parks fix-batch, SF-3): pin HOME/USERPROFILE/
+# ALMANAC_HOME to an isolated tempdir before any production code loads, so
+# a fixture call that is ever unticketed cannot reach the operator's real
+# vault (Decision 29). Pure hardening -- this file names none of these vars
+# today.
+BEGIN {
+    my $env_pin = File::Temp::tempdir(CLEANUP => 1);
+    $ENV{HOME}         = $env_pin;
+    $ENV{USERPROFILE}  = $env_pin;
+    $ENV{ALMANAC_HOME} = $env_pin;
+}
+
 my $SCRIPT = "$Bin/../../scripts/bp-drive-next.pl";
 require $SCRIPT;
 
@@ -66,6 +78,15 @@ sub write_json {
     my ($path, $data) = @_;
     open my $fh, '>:raw', $path or die "write_json $path: $!";
     print $fh $J->encode($data);
+    close $fh;
+}
+
+sub write_bp_status_fence {
+    my ($bp_dir, $status, $reason) = @_;
+    open my $fh, '>>:raw', "$bp_dir/blueprint.md" or die "append fence $bp_dir/blueprint.md: $!";
+    print $fh "\n```\nstatus: $status\n";
+    print $fh "parked_reason: $reason\n" if defined $reason;
+    print $fh "```\n";
     close $fh;
 }
 
@@ -573,13 +594,16 @@ for my $conc_value (undef, '0', 'true', '', '1') {
     make_bp_dir($data, 'bpx', [
         { key => 'p1-a', status => 'pending', write_set => 'a/' },
     ]);
-    make_bp_dir($data, 'bpy', [
+    my $bpy = make_bp_dir($data, 'bpy', [
         { key => 'q1', status => 'pending', write_set => 'q/' },
     ]);
+    # Authored directly in blueprint.md (spec 08-blueprint-parks §2.1), not
+    # parks.json: the director's only source of parkedness is the
+    # blueprint's own status now.
+    write_bp_status_fence($bpy, 'parked', 'stale');
     my $dsdir = "$data/.drive-solo";
     make_path($dsdir);
     write_json("$dsdir/order.json", { order => ['bpx', 'bpy'], recorded_at => $NOW });
-    write_json("$dsdir/parks.json", [ { blueprint => 'bpy', reason => 'stale', at => $NOW } ]);
     write_json("$dsdir/inflight.json", { packages => [
         { blueprint => 'bpx', package => 'p1-a', ledger => ledger_prefix($data, 'bpx', 'p1-a'), since => $NOW - 20 },
         { blueprint => 'ghost-bp', package => 'p9', ledger => ledger_prefix($data, 'ghost-bp', 'p9'), since => $NOW - 20 },

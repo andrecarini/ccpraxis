@@ -165,7 +165,7 @@ sub norm_bp_status {
     $s =~ s/#.*\z//;                       # the template keeps a trailing comment
     $s =~ s/[^a-z]+/ /g;
     $s =~ s/\A\s+|\s+\z//g;
-    return $s =~ /\A(?:drafting|audited|running|done|archived)\z/
+    return $s =~ /\A(?:drafting|audited|parked|running|done|archived)\z/
         ? $s
         : '';
 }
@@ -250,10 +250,14 @@ sub run_is_live {
 }
 
 # blueprint_lifecycle($bpdir, $alive_fn) -> $lifecycle
-# One of drafting|audited|running|done|archived. Precedence, first match
-# wins (spec §2.4, a design decision assembled from reconcile_one's prose
-# logic, not verbatim source):
-#   1. a live run beats every authored value, including archived.
+# One of drafting|audited|parked|running|done|archived. Precedence, first
+# match wins (spec §2.4, a design decision assembled from reconcile_one's
+# prose logic, not verbatim source; package blueprint-park (08) adds rule 0):
+#   0. authored 'parked' beats everything, including a live run -- checked
+#      before run_is_live is even called, so $alive_fn is never invoked for
+#      a parked blueprint and its outcome (even a die) cannot change the
+#      answer.
+#   1. a live run beats every other authored value, including archived.
 #   2. authored 'archived' beats the delivered computation (never
 #      re-derived to done).
 #   3. all-delivered (>=1 package, every value in {done,dropped}) derives
@@ -285,9 +289,11 @@ sub blueprint_lifecycle {
     my ($bpdir, $alive_fn) = @_;
     return 'drafting' unless defined $bpdir;
 
-    return 'running' if run_is_live($bpdir, $alive_fn);
-
     my $authored = norm_bp_status(bp_meta_get("$bpdir/blueprint.md", 'status'));
+
+    return 'parked' if $authored eq 'parked';
+
+    return 'running' if run_is_live($bpdir, $alive_fn);
 
     return 'archived' if $authored eq 'archived';
 

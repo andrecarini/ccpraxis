@@ -754,19 +754,185 @@ sub op_set_section {
 # rows and rejects these values outright. So advancing a blueprint's own lifecycle -- the
 # last step of /blueprint:create -- required a hand-splice, which is precisely what this
 # API exists to prevent. Found by hitting it while authoring a real blueprint.
+#
+# 08-blueprint-parks (spec §2.2) extends this: `parked` is a fourth AUTHORED word,
+# carrying a `parked_reason:` fenced-metadata line that exists iff status is parked, and
+# a status write that LEAVES parked closes that park's open inbox item (package 01's
+# almanac-inbox.pl) under this file's own lock, before the rename lands.
 # -------------------------------------------------------------------------------------
-my @BP_LIFECYCLE_AUTHORED = qw(drafting audited archived);
+my @BP_LIFECYCLE_AUTHORED = qw(drafting audited parked archived);
 my @BP_LIFECYCLE_DERIVED  = qw(running done);
 my %BP_LIFECYCLE_DERIVED  = map { $_ => 1 } @BP_LIFECYCLE_DERIVED;
 my %BP_LIFECYCLE_AUTHORED = map { $_ => 1 } @BP_LIFECYCLE_AUTHORED;
 my %META_FIELDS  = map { $_ => 1 } qw(blueprint created last_updated status execution_mode);
+
+# REASON_OK($r) -> 1|0 (spec §2.1). After trimming, non-empty, at most 200
+# bytes, and contains none of CR, LF, '|' or '#'. Raw bytes, never decoded.
+sub _reason_ok {
+    my ($r) = @_;
+    return 0 unless defined $r;
+    (my $t = $r) =~ s/\A\s+|\s+\z//g;
+    return 0 unless length $t;
+    return 0 if length($t) > 200;
+    return 0 if $t =~ /[\r\n|#]/;
+    return 1;
+}
+
+sub _trim_reason { my ($r) = @_; (my $t = $r) =~ s/\A\s+|\s+\z//g; return $t; }
+
+# The fence marker is built via chr() -- a literal triple-backtick is itself
+# a banned token in some sibling modules' source; kept the same way here for
+# consistency with BpState.pm's bp_meta_get.
+my $FENCE = chr(96) x 3;
+
+# _authored_field_of($text, $field) -> $value|undef: the first "$field:" line
+# inside the FIRST fenced metadata block, trimmed, comment stripped. Used to
+# read the PRE-WRITE authored status/parked_reason before any mutation.
+sub _authored_field_of {
+    my ($text, $field) = @_;
+    my $fence_q = quotemeta $FENCE;
+    return undef unless defined $text && $text =~ /^$fence_q\s*\n((?:.*\n)*?)^$fence_q\s*$/m;
+    my $block = $1;
+    my $fq = quotemeta $field;
+    return undef unless $block =~ /^$fq:[ \t]*([^\n#]*)/m;
+    my $v = $1;
+    $v =~ s/\s+\z//;
+    return $v;
+}
+
+# _set_parked_reason($text, $reason) -> $new_text. $reason defined => insert/
+# update a `parked_reason:` line right after the first fenced block's
+# `status:` line (and after any `^[ \t]+#` continuation lines that directly
+# follow it, so the template's two-line comment is never split, spec §2.1).
+# $reason undef => remove any existing `parked_reason:` line in that fence.
+# A no-op (no fence, or no `status:` line in it) returns $text unchanged --
+# the caller has already validated a `status:` line exists.
+sub _set_parked_reason {
+    my ($text, $reason) = @_;
+    my @lines = split /\n/, $text, -1;
+    my ($start, $end);
+    for my $i (0 .. $#lines) {
+        if ($lines[$i] =~ /^\Q$FENCE\E\s*$/) {
+            if (!defined $start) { $start = $i; }
+            else { $end = $i; last; }
+        }
+    }
+    return $text unless defined $start && defined $end;
+
+    my ($status_i, $pr_i);
+    for my $i ($start + 1 .. $end - 1) {
+        $status_i = $i if !defined($status_i) && $lines[$i] =~ /^status:/;
+        $pr_i     = $i if !defined($pr_i)     && $lines[$i] =~ /^parked_reason:/;
+    }
+    return $text unless defined $status_i;
+
+    if (defined $reason) {
+        if (defined $pr_i) {
+            $lines[$pr_i] = "parked_reason: $reason";
+        } else {
+            my $insert_at = $status_i + 1;
+            while ($insert_at <= $end - 1 && $lines[$insert_at] =~ /^[ \t]+#/) { $insert_at++; }
+            splice(@lines, $insert_at, 0, "parked_reason: $reason");
+        }
+    } elsif (defined $pr_i) {
+        splice(@lines, $pr_i, 1);
+    }
+    return join("\n", @lines);
+}
+
+sub _iso_now_utc {
+    my @t = gmtime(time);
+    return sprintf('%04d-%02d-%02dT%02d:%02d:%02dZ',
+                   $t[5] + 1900, $t[4] + 1, $t[3], $t[2], $t[1], $t[0]);
+}
+
+# _close_park_items($file, $new_value, $pre_reason): the unpark hook (spec
+# §2.2). $file is the blueprint.md path being written; $new_value is the
+# status it is being set to (never 'parked' -- the caller only calls this
+# when leaving parked). Closes every open park item for this blueprint via a
+# CAS update to 'answered'. Returns 1 on success (including "nothing to do"
+# skip cases). On any real failure it prints to STDERR and calls `exit 4`
+# directly -- this runs from inside run_write's mutate callback, BEFORE the
+# rename, so exiting here leaves blueprint.md byte-identical (spec §2.2 step
+# 5 / E2).
+#
+# Spec E2's OTHER half lives downstream of here, not in this function: this
+# call can return 1 (every item closed successfully) and run_write's own
+# rename can STILL fail afterwards (an I/O error, `io_error` -> exit 4). That
+# leaves the item answered while blueprint.md is still authored `parked` --
+# accepted and documented per E2 ("the item is closed but the blueprint is
+# still parked... re-running the unpark succeeds, with nothing left to
+# close"). Nothing to fix here; this is the accepted asymmetry, not a bug.
+sub _close_park_items {
+    my ($file, $new_value, $pre_reason) = @_;
+
+    my $abs_dir = abs_path(dirname($file));
+    return 1 unless defined $abs_dir;
+    (my $norm = $abs_dir) =~ s{\\}{/}g;
+    return 1 unless $norm =~ m{^(.+)/\.ccpraxis-local-data/blueprints/([^/]+)$};
+    my ($root, $bp) = ($1, $2);
+    return 1 unless -d "$root/.ccpraxis-local-data";
+    return 1 unless -d "$root/.ccpraxis-local-data/almanac/inbox";
+
+    my $inbox_pl = "$DIR/../../almanac/scripts/almanac-inbox.pl";
+    my $load_ok = eval { require $inbox_pl; 1 };
+    unless ($load_ok) {
+        (my $msg = $@) =~ s/\s+\z//;
+        emit_err("bp-blueprint: set-meta: cannot load inbox library $inbox_pl: $msg");
+        exit 4;
+    }
+
+    my $items = eval { Almanac::Inbox::list_items(root => $root) };
+    if ($@) {
+        my $msg = ref($@) ? ($@->{detail} // $@->{kind} // 'error') : $@;
+        $msg =~ s/\s+\z// unless ref $msg;
+        emit_err("bp-blueprint: set-meta: cannot list inbox items at $root: $msg");
+        exit 4;
+    }
+
+    my $reason_text = (defined $pre_reason && length $pre_reason) ? $pre_reason : '(none recorded)';
+    my $closed_reason = "blueprint $bp left parked (status now $new_value); park reason: $reason_text";
+
+    my @park_items = grep {
+        ref $_ eq 'HASH'
+        && defined $_->{fields}{link}   && $_->{fields}{link}   eq $bp
+        && defined $_->{fields}{status} && $_->{fields}{status} eq 'unanswered'
+        && defined $_->{fields}{title}  && $_->{fields}{title}  =~ /^Blueprint \Q$bp\E parked:/
+    } @$items;
+
+    for my $item (@park_items) {
+        my $ok = eval {
+            Almanac::Inbox::open_inbox(root => $root)->update($item->{id},
+                expect => { rev => $item->{rev}, fields => $item->{fields} },
+                set    => { status => 'answered', closed_at => _iso_now_utc(),
+                            closed_reason => $closed_reason, closed_by => 'bp-blueprint.pl set-meta' });
+            1;
+        };
+        unless ($ok) {
+            my $err = $@;
+            my $kind = (ref($err) && eval { $err->isa('Almanac::Store::Error') }) ? $err->{kind} : undef;
+            if (defined $kind && $kind eq 'conflict') {
+                my $re = eval { Almanac::Inbox::read_item($item->{id}, root => $root) };
+                if (!$@ && ref($re) eq 'HASH'
+                    && (!defined($re->{fields}{status}) || $re->{fields}{status} ne 'unanswered')) {
+                    next;   # already handled (by this attempt or a concurrent one)
+                }
+            }
+            my $msg = ref($err) ? ($err->{detail} // $err->{kind} // 'error') : $err;
+            $msg =~ s/\s+\z// unless ref $msg;
+            emit_err("bp-blueprint: set-meta: could not close park item $item->{id} for $bp: $msg");
+            exit 4;
+        }
+    }
+    return 1;
+}
 
 sub op_set_meta {
     my @args = @_;
     my %opt;
     my $ok;
     { local $SIG{__WARN__} = sub { };
-      $ok = GetOptionsFromArray(\@args, \%opt, 'file=s', 'field=s', 'value=s'); }
+      $ok = GetOptionsFromArray(\@args, \%opt, 'file=s', 'field=s', 'value=s', 'reason=s'); }
     arg_error('set-meta', 'unrecognised option') unless $ok;
     arg_error('set-meta', 'unexpected extra arguments: ' . join(' ', @args)) if @args;
     for my $r (qw(file field value)) {
@@ -807,25 +973,91 @@ sub op_set_meta {
         }
     }
 
+    # 08-blueprint-parks (spec §2.2): --reason is accepted ONLY with
+    # --field status --value parked, where it is required and must pass
+    # REASON_OK. `parked_reason` is never a --field of its own (not added to
+    # %META_FIELDS above), so `--field parked_reason` keeps refusing there.
+    if (defined $opt{reason}) {
+        unless ($opt{field} eq 'status' && $opt{value} eq 'parked') {
+            arg_error('set-meta', "--reason is accepted only with --field status --value parked");
+        }
+        unless (_reason_ok($opt{reason})) {
+            arg_error('set-meta', "--reason is invalid: must be non-empty, at most 200 bytes, "
+                                 . "and contain none of CR, LF, '|' or '#'");
+        }
+        $opt{reason} = _trim_reason($opt{reason});
+    } elsif ($opt{field} eq 'status' && $opt{value} eq 'parked') {
+        arg_error('set-meta', "--value parked requires --reason <text>");
+    }
+
     run_write('set-meta', $opt{file}, sub {
         my ($orig) = @_;
         my $f = quotemeta $opt{field};
 
         # The metadata block is the fenced ``` block near the top. Only ever touch a
         # `field:` line inside it -- a `status:` elsewhere (a package ledger quoted in
-        # prose, say) must not be rewritten.
-        unless ($orig =~ /^```\s*\n(?:.*\n)*?^$f:/m) {
-            return (undef, "no `$opt{field}:` line found in the metadata block of $opt{file}");
+        # prose, or a prose line that happens to start with "status:" ABOVE the fence,
+        # say) must not be rewritten. 08-blueprint-parks MF-1/M3: the previous version
+        # of this rewrite used a plain `/m` substitution with no fence anchoring, so a
+        # `status:`-looking line appearing textually before the fence (prose) was
+        # rewritten instead of the real fenced line, and the function still reported
+        # success. Confine the rewrite to the FIRST fenced block's line range, using
+        # the same fence-boundary scan `_set_parked_reason` already does.
+        my @lines = split /\n/, $orig, -1;
+        my ($fstart, $fend);
+        for my $i (0 .. $#lines) {
+            if ($lines[$i] =~ /^\Q$FENCE\E\s*$/) {
+                if (!defined $fstart) { $fstart = $i; }
+                else { $fend = $i; last; }
+            }
+        }
+        my $done = 0;
+        if (defined $fstart && defined $fend) {
+            for my $i ($fstart + 1 .. $fend - 1) {
+                next if $done;
+                if ($lines[$i] =~ /^($f:)([ \t]*)([^\n#]*)(#[^\n]*)?$/) {
+                    my ($g1, $g2, $g3, $g4) = ($1, $2, $3, $4);
+                    $lines[$i] = $g1 . ($g2 || ' ') . $opt{value} . (defined $g4 ? "        $g4" : '');
+                    $done = 1;
+                }
+            }
+        }
+        return (undef, "no `$opt{field}:` line found in the metadata block of $opt{file}")
+            unless defined $fstart && defined $fend;
+        return (undef, "could not rewrite `$opt{field}:`") unless $done;
+        my $new = join("\n", @lines);
+
+        if ($opt{field} eq 'status') {
+            # 08-blueprint-parks L7/NIT-3/NIT-5: this used to be an ad hoc
+            # lc+trim comparison, which disagreed with BpState::norm_bp_status
+            # (the project's one true normaliser -- also used by the director
+            # and by RunState) on a hand-edited value like `status: parked.`
+            # or `status: "parked"`. Route through the same normaliser so all
+            # three readers reach the same verdict.
+            require "$DIR/BpState.pm" unless defined &BpState::norm_bp_status;
+            my $pre_status = BpState::norm_bp_status(_authored_field_of($orig, 'status'));
+
+            # Redteam L4(a): a duplicate/concurrent `park` call must not
+            # clobber the reason already recorded -- the first reason wins
+            # (EC-2), including on this idempotent re-park path.
+            my $reason_to_write = $opt{reason};
+            if ($opt{value} eq 'parked' && $pre_status eq 'parked') {
+                my $existing_reason = _authored_field_of($orig, 'parked_reason');
+                $reason_to_write = $existing_reason if defined $existing_reason && length $existing_reason;
+            }
+
+            $new = _set_parked_reason($new, $opt{value} eq 'parked' ? $reason_to_write : undef);
+
+            # Unpark hook (spec §2.2): fires only when the PRE-write authored
+            # status was 'parked' and the new value is not -- so a second,
+            # unrelated status write (already non-parked) never loads the
+            # inbox at all (B9's no-op guarantee).
+            if ($pre_status eq 'parked' && $opt{value} ne 'parked') {
+                my $pre_reason = _authored_field_of($orig, 'parked_reason');
+                _close_park_items($opt{file}, $opt{value}, $pre_reason);   # exits 4 on failure
+            }
         }
 
-        my $new = $orig;
-        my $done = 0;
-        # Preserve any trailing `# comment` the template carries on the line.
-        $new =~ s{^($f:)([ \t]*)([^\n#]*)(#[^\n]*)?$}{
-            $done++ ? "$1$2$3" . ($4 // '')
-                    : $1 . ($2 || ' ') . $opt{value} . (defined $4 ? "        $4" : '')
-        }me;
-        return (undef, "could not rewrite `$opt{field}:`") unless $done;
         return ($new, undef);
     });
 }

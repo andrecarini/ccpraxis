@@ -29,6 +29,18 @@ use File::Path qw(make_path);
 use File::Basename qw(basename dirname);
 use Digest::MD5 qw(md5_hex);
 
+# AC15 (08-blueprint-parks fix-batch, SF-3): pin HOME/USERPROFILE/
+# ALMANAC_HOME to an isolated tempdir before any production code loads, so
+# a fixture call that is ever unticketed cannot reach the operator's real
+# vault (Decision 29). Pure hardening -- this file names none of these vars
+# today.
+BEGIN {
+    my $env_pin = File::Temp::tempdir(CLEANUP => 1);
+    $ENV{HOME}         = $env_pin;
+    $ENV{USERPROFILE}  = $env_pin;
+    $ENV{ALMANAC_HOME} = $env_pin;
+}
+
 my $BUTLER    = "$Bin/../..";
 my $DRIVE_SCRIPT = "$BUTLER/scripts/bp-drive-next.pl";
 my $BP_SCRIPT    = "$BUTLER/scripts/bp-blueprint.pl";
@@ -86,6 +98,20 @@ sub write_json {
     my ($path, $data) = @_;
     open my $fh, '>:raw', $path or die "write_json $path: $!";
     print $fh $J->encode($data);
+    close $fh;
+}
+
+# Append a FENCED ``` metadata block (distinct from this file's own
+# "---\nstatus: ...\n---" frontmatter convention above, which is a local,
+# unrelated shape) so BpState::bp_meta_get -- the one reader the director's
+# new _bp_parked() helper uses (spec 08-blueprint-parks §2.1/§2.5) -- can see
+# an authored status: parked. parks.json is no longer a source of truth.
+sub write_bp_status_fence {
+    my ($bp_dir, $status, $reason) = @_;
+    open my $fh, '>>:raw', "$bp_dir/blueprint.md" or die "append fence $bp_dir/blueprint.md: $!";
+    print $fh "\n```\nstatus: $status\n";
+    print $fh "parked_reason: $reason\n" if defined $reason;
+    print $fh "```\n";
     close $fh;
 }
 
@@ -562,9 +588,7 @@ ac10_case('out-of-scope', sub {
 ac10_case('parked', sub {
     my ($data) = @_;
     my $bp = make_bp_dir($data, 'B', [ { key => 'q', status => 'pending', write_set => 'b/' } ]);
-    my $ds = "$data/.drive-solo";
-    make_path($ds);
-    write_json("$ds/parks.json", [ { blueprint => 'B', reason => 'stale', at => $NOW } ]);
+    write_bp_status_fence($bp, 'parked', 'stale');
     return $bp;
 });
 
