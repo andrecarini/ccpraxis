@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # guard-tasks-tool.sh -- deny Claude Code's session-scoped Tasks tool CRUD
-# (TaskCreate/TaskUpdate/TaskList/TaskGet) in favour of the almanac tasklist,
-# which persists across sessions. Package 15-harness-tasks-and-reminder
-# (blueprint almanac-records); see specs/15-harness-tasks-and-reminder-spec.md
-# section 2.2 for the exact contract this file implements.
+# (TaskCreate/TaskUpdate/TaskList/TaskGet) in favour of an almanac THREAD,
+# which persists across sessions (the flat tasklist is retired). Package
+# 15-harness-tasks-and-reminder (blueprint almanac-records; see
+# specs/15-harness-tasks-and-reminder-spec.md section 2.2) OVERRIDDEN by
+# blueprint where-things-go, package 02-thread-store (specs/
+# 02-thread-store-spec.md section 2.10): verb map and denial text point at
+# almanac-thread.pl now.
 #
 # Bash builtins only -- no external command-line JSON tool, no capturing
 # stdin through a subshell cat, no delimiter-based read. Reads stdin once, in
@@ -30,10 +33,10 @@ else
 fi
 
 case "$TOOL" in
-    TaskCreate) VERB="add --title '<task>'" ;;
-    TaskUpdate) VERB="status <id> pending|doing|blocked|done|obsoleted" ;;
+    TaskCreate) VERB="add <thread> --title '<task>'" ;;
+    TaskUpdate) VERB="status <thread> <task> pending|doing|blocked|done|obsoleted" ;;
     TaskList)   VERB="list" ;;
-    TaskGet)    VERB="show <id>" ;;
+    TaskGet)    VERB="show <thread>" ;;
     *) exit 0 ;;
 esac
 
@@ -45,8 +48,8 @@ ROOT="${SELF_DIR%/hooks}"
 INTERP="pe"'rl'
 
 cat >&2 <<EOF
-$TOOL is disabled here: session tasks vanish with the session. Use the almanac tasklist, which persists.
-  $INTERP $ROOT/scripts/almanac-task.pl $VERB
-Focus it for this session once with: $INTERP $ROOT/scripts/almanac-task.pl focus
+$TOOL is disabled here: session tasks vanish with the session. Use an almanac thread, which persists.
+  $INTERP $ROOT/scripts/almanac-thread.pl $VERB
+Start one for this work with: $INTERP $ROOT/scripts/almanac-thread.pl create <name>
 EOF
 exit 2

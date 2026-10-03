@@ -39,18 +39,24 @@ my $HOOKS_JSON = "$H/hooks.json";
 my $G = q{unset BASH_ENV ; f="${CLAUDE_PLUGIN_ROOT}/hooks/guard-tasks-tool.sh" ; [ -f "$f" ] || exit 0 ; bash -n "$f" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash "$f"};
 my $MATCHER = 'TaskCreate|TaskUpdate|TaskList|TaskGet';
 
+# AC14 (blueprint where-things-go, package 02-thread-store, specs/
+# 02-thread-store-spec.md section 2.10): the Tasks tool is denied in favour
+# of an almanac THREAD now, not the retired flat tasklist. Verb map and
+# three-line denial text updated per spec; the interpreter word is still
+# "perl" (guard-tasks-tool.sh keeps the split-literal trick so the word
+# itself never appears together in the script's own source -- G-5 below).
 my %VERB = (
-    TaskCreate => q{add --title '<task>'},
-    TaskUpdate => 'status <id> pending|doing|blocked|done|obsoleted',
+    TaskCreate => q{add <thread> --title '<task>'},
+    TaskUpdate => 'status <thread> <task> pending|doing|blocked|done|obsoleted',
     TaskList   => 'list',
-    TaskGet    => 'show <id>',
+    TaskGet    => 'show <thread>',
 );
 
 sub deny_text {
     my ($tool, $root) = @_;
-    return "$tool is disabled here: session tasks vanish with the session. Use the almanac tasklist, which persists.\n"
-         . "  perl $root/scripts/almanac-task.pl $VERB{$tool}\n"
-         . "Focus it for this session once with: perl $root/scripts/almanac-task.pl focus\n";
+    return "$tool is disabled here: session tasks vanish with the session. Use an almanac thread, which persists.\n"
+         . "  perl $root/scripts/almanac-thread.pl $VERB{$tool}\n"
+         . "Start one for this work with: perl $root/scripts/almanac-thread.pl create <name>\n";
 }
 
 # ---------------------------------------------------------------------------

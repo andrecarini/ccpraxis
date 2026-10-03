@@ -67,47 +67,48 @@ sub current_R {
     return '';
 }
 
-# reminder_prefix($n) / reminder_suffix($root) -- the two pieces of the
-# reminder text Decision 5 leaves untouched: the per-call "Tool call $n..."
-# line opening, and the almanac-task.pl command-line hint. Kept as separate
-# subs (rather than inlined into assert_reminder_text) so a caller can build
-# qr/^\Q$prefix\E/ / qr/\Q$suffix\E\z/ anchors around whatever the (regex-
-# checked, never hardcoded) middle sentence turns out to be.
-sub reminder_prefix { my ($n) = @_; return "Tool call $n in this session: chart your tasklist." }
-sub reminder_suffix { my ($root) = @_; return "  perl $root/scripts/almanac-task.pl focus | list | add --title '<step>' | status <id> doing|blocked|done" }
+# OVERRIDDEN by blueprint where-things-go, package 02-thread-store
+# (specs/02-thread-store-spec.md section 2.10, behaviour 22, AC15): the
+# almanac-records package 15 text above (Decision 5) is superseded by an
+# EXACT two-line text the architect pinned (caller question 1), no longer
+# tolerant-regex-matched -- "chart your tasklist"/"focused" become "chart
+# your thread"/"owns a live thread", and the command hint now names
+# almanac-thread.pl's verbs. reminder_prefix/suffix together are the WHOLE
+# reminder text now (two lines, nothing else).
+sub reminder_prefix { my ($n) = @_; return "Tool call $n in this session: chart your thread. Move your current steps through doing, blocked and done; add a task only for a new step of work." }
+sub reminder_suffix { my ($root) = @_; return "  perl $root/scripts/almanac-thread.pl list | show <thread> | add <thread> --title '<step>' | status <thread> <task> doing|blocked|done" }
 
-# assert_reminder_text($text, $n, $root, $label) -- Decision 5 / done
-# criterion 1 oracle for the reminder sentence:
-#   - $text starts with the unchanged per-call prefix and ends with the
-#     unchanged command-line suffix (the two anchors Decision 5 leaves
-#     alone);
-#   - it never contains "Record where the work stands" (done criterion 1,
-#     verbatim -- this is the retired sentence that produced status-log
-#     entries);
-#   - the replaced sentence, whatever its exact wording, tells the agent to
-#     move its current steps through doing, blocked and done (key clause 1
-#     of Decision 5), matched by a regex tolerant of "its/your/the",
-#     singular "step", and punctuation/ordering variation between the three
-#     status words;
-#   - and tells the agent to add a task only for a new step of work (key
-#     clause 2 of Decision 5), matched the same way.
-# Deliberately never pins one exact sentence: Decision 5 states the meaning
-# the new text must carry, not its bytes, and inventing a literal here would
-# make the test an echo of one implementer's phrasing rather than an oracle
-# for the decision.
+# OVERRIDDEN AGAIN by blueprint where-things-go, package 04-continuity-threads
+# (specs/04-continuity-threads-spec.md section 2.8, behaviour 18): when the
+# session is attached to a live thread <T> (not merely armed), the generic
+# "<thread>" placeholder is replaced by the real thread name in both lines.
+# "$gate" from arming ALONE (no attached thread) keeps the generic, unnamed
+# text above byte-identical (reminder_prefix/reminder_suffix are untouched).
+sub reminder_prefix_named { my ($n, $name) = @_; return "Tool call $n in this session: chart your thread $name. Move your current steps through doing, blocked and done; add a task only for a new step of work." }
+sub reminder_suffix_named { my ($root, $name) = @_; return "  perl $root/scripts/almanac-thread.pl show $name | add $name --title '<step>' | status $name <task> doing|blocked|done" }
+
+sub assert_reminder_text_named {
+    my ($text, $n, $root, $name, $label) = @_;
+    $text = '' unless defined $text;
+    my $prefix = reminder_prefix_named($n, $name);
+    my $suffix = reminder_suffix_named($root, $name);
+    is($text, "$prefix\n$suffix", "$label: is exactly the named-thread two-line reminder for '$name'");
+    return;
+}
+
+# assert_reminder_text($text, $n, $root, $label) -- AC15/behaviour 22 oracle:
+# the reminder is EXACTLY the two pinned lines (prefix line, then suffix
+# line), nothing more, nothing less.
 sub assert_reminder_text {
     my ($text, $n, $root, $label) = @_;
     $text = '' unless defined $text;
     my $prefix = reminder_prefix($n);
     my $suffix = reminder_suffix($root);
-    like($text, qr/^\Q$prefix\E/, "$label: starts with the unchanged 'Tool call $n...chart your tasklist.' prefix");
-    like($text, qr/\Q$suffix\E\z/, "$label: ends with the unchanged almanac-task.pl command-line hint");
+    like($text, qr/^\Q$prefix\E/, "$label: starts with the exact 'Tool call $n...chart your thread.' line");
+    like($text, qr/\Q$suffix\E\z/, "$label: ends with the exact almanac-thread.pl command-line hint");
+    unlike($text, qr/chart your tasklist/i, "$label: no longer says 'chart your tasklist' (retired package-15 wording)");
     unlike($text, qr/Record where the work stands/i,
-        "$label: no longer contains 'Record where the work stands' (done criterion 1)");
-    like($text, qr/\bmove\b[^.\n]{0,60}?\bstep(?:s)?\b[^.\n]{0,40}?\bthrough\b[^.\n]{0,60}?\bdoing\b[^.\n]{0,30}?\bblocked\b[^.\n]{0,30}?\bdone\b/is,
-        "$label: tells the agent to move its current steps through doing, blocked and done");
-    like($text, qr/\badd\b[^.\n]{0,20}?\btask\b[^.\n]{0,20}?\bonly\b[^.\n]{0,20}?\bfor\b[^.\n]{0,20}?(?:a\s+)?new\s+step\s+of\s+work\b/is,
-        "$label: tells the agent to add a task only for a new step of work");
+        "$label: no longer contains 'Record where the work stands'");
     return;
 }
 
@@ -283,11 +284,34 @@ sub decode_out {
     return eval { JSON::PP->new->decode($lines[0]) };
 }
 
+# do_focus($sid, $root) -- AC15/behaviour 22 override: "focused" (a task-
+# focus record) is retired; a session now "owns a live thread" instead. This
+# makes the session own one by creating a thread with that session as owner
+# (Almanac::Thread::owned_by_session's definition), via almanac-thread.pl
+# create --session <sid>. Kept under its old name so every existing R-xx/
+# AC-xx call site below is re-expressed with "owns a live thread" by this
+# one change, as AC15 requires, rather than by touching each site.
+#
+# EDITED for blueprint where-things-go, package 03-thread-sessions (Decision
+# 18 F6): the `create` verb is hard ticket-gated. do_focus pins its own
+# BUTLER_STATE_DIR (rather than depending on whatever the caller's ambient
+# %ENV happens to carry) and mints a matching ticket for the exact argv it
+# spawns, so this fixture keeps working once the gate lands -- pure
+# migration, not new behaviour.
 sub do_focus {
     my ($sid, $root) = @_;
     local %ENV = %ENV;
     delete $ENV{CLAUDE_CODE_SESSION_ID};
-    system(qq{perl "$ALM/scripts/almanac-task.pl" focus --session "$sid" --root "$root" > /dev/null 2>&1});
+    my $state = tempdir(CLEANUP => 1);
+    $state =~ s{\\}{/}g;
+    $ENV{BUTLER_STATE_DIR} = $state;
+    require "$BUTLER/scripts/BpHook.pm" unless grep { m{(?:^|/)BpHook\.pm$} } keys %INC;
+    our $DO_FOCUS_TICKET_SEQ;
+    BpHook::write_ticket(
+        { session_id => $sid, tool_use_id => 'DF' . (++$DO_FOCUS_TICKET_SEQ),
+          transcript_path => undef, cwd => $root },
+        'almanac-thread', ['create', 'owned-thread', '--session', $sid, '--root', $root]);
+    system(qq{perl "$ALM/scripts/almanac-thread.pl" create owned-thread --session "$sid" --root "$root" > /dev/null 2>&1});
     return $? >> 8;
 }
 
@@ -907,7 +931,10 @@ sub write_marker {
 }
 sub nudged_path { my ($home, $sid) = @_; return "$home/.claude/almanac-state/chart-reminder/$sid.nudged" }
 
-sub n5_text { my ($n) = @_; return "No operator message for $n min and work continues. If this session should keep working without the operator, arm continuity: butler-continuity on" }
+# OVERRIDDEN by blueprint where-things-go, package 04-continuity-threads
+# (specs/04-continuity-threads-spec.md section 2.8): the N5 nudge now says
+# "arm and attach a thread" and names both CLI forms.
+sub n5_text { my ($n) = @_; return "No operator message for $n min and work continues. If this session should keep working without the operator, arm and attach a thread: butler-continuity on --new-thread <name> (or --thread <name> to resume one)" }
 sub n5_regex {
     my (@ns) = @_;
     my $alt = join('|', map { quotemeta(n5_text($_)) } @ns);
@@ -1095,7 +1122,10 @@ sub scrub_arm_nudge_min { my ($env) = @_; $env->{CCPRAXIS_ARM_NUDGE_MIN} = undef
         # "\n".
         my $ctx = $d->{hookSpecificOutput}{additionalContext} // '';
         my ($x, $rest) = $ctx =~ /\A(.*)\n([^\n]*)\z/s;
-        assert_reminder_text($x // $ctx, 20, $ALM, 'AC-22: the reminder half (X)');
+        # package 04-continuity-threads (behaviour 18): do_focus() attaches
+        # the session to thread "owned-thread" (Almanac::Thread::create with
+        # --session), so the reminder half now names that thread.
+        assert_reminder_text_named($x // $ctx, 20, $ALM, 'owned-thread', 'AC-22: the reminder half (X)');
         like($rest // '', n5_regex(31, 32), 'AC-22: the N5 half follows one "\n"');
     }
 }

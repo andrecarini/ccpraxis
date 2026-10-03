@@ -1,10 +1,11 @@
 #!/usr/bin/env perl
 # reminder-chart-tasklist.pl -- fires on the 20th (40th, 60th, ...) main-
 # thread PostToolUse call of a session, emitting additionalContext, while
-# the session is armed (butler continuity) or has a focused almanac
-# tasklist. It also emits a separate N5 nudge line when the session is
-# neither armed nor focused, provided the other N5 conditions hold (never-
-# halt package 11, spec sec 2.5). Package 15-harness-tasks-and-reminder (blueprint
+# the session is armed (butler continuity) or attached to a live thread. It
+# also
+# emits a separate N5 nudge line when the session is neither armed nor owns
+# one, provided the other N5 conditions hold (never-halt package 11, spec
+# sec 2.5). Package 15-harness-tasks-and-reminder (blueprint
 # almanac-records), round 3 per Decision 28: the ticket CLAIM itself now
 # happens entirely inside the registration's own bash
 # (plugins/almanac/hooks/hooks.json) -- builtins only, no perl, no
@@ -22,8 +23,10 @@
 #
 # ONE PROCESS, NEVER BLOCKS, ALWAYS EXITS 0. Almanac::Lock is never required
 # directly by this file (review M-1): it is only ever loaded transitively,
-# exactly once, via almanac-task.pl's own use of Almanac::Store on this
-# firing call, so there is no second load under a different %INC key and no
+# exactly once, via Almanac::Thread's own use of Almanac::Store on this
+# firing call, loaded by MODULE NAME (require Almanac::Thread, not a path)
+# so it keeps the %INC key 'Almanac/Thread.pm' (and 'Almanac/Lock.pm')
+# whoever else loads it -- no second load under a different key and no
 # "Subroutine redefined" warning on stderr. Every require of a repo file
 # sits inside eval. Never system, exec, backticks, qx, fork or a piped open.
 #
@@ -67,12 +70,13 @@ sub _run {
         utf8::encode($cwd) if utf8::is_utf8($cwd);
     }
 
-    my $gate_armed = _armed($sid, $root);
-    my $gate = $gate_armed || _focused($sid, $cwd, $root);
+    my $gate_armed   = _armed($sid, $root);
+    my $thread_name  = _attached_thread($sid, $cwd, $root);
+    my $gate = $gate_armed || defined $thread_name;
 
     my $nudge = _n5_nudge($sid, $home, $root, $gate_armed);
     my $printed = 0;
-    $printed = _emit($n, $root, $gate, $nudge) if $gate || defined $nudge;
+    $printed = _emit($n, $root, $gate, $nudge, $thread_name) if $gate || defined $nudge;
     _record_nudge($home, $sid, $nudge) if defined $nudge && $printed;
 
     _advance_watermark($tdir, $n);
@@ -141,21 +145,30 @@ sub _armed {
     return $armed ? 1 : 0;
 }
 
-sub _focused {
+sub _attached_thread {
     my ($sid, $cwd, $root) = @_;
-    return 0 unless defined $cwd && length $cwd;
-    my $loaded = eval { require "$root/scripts/almanac-task.pl"; 1 };
-    return 0 unless $loaded;
-    my $tasklist = eval { Almanac::Task::focused(session => $sid, cwd => $cwd) };
-    return defined($tasklist) ? 1 : 0;
+    return undef unless defined $cwd && length $cwd;
+    my $name = eval {
+        local @INC = ("$root/scripts", @INC);
+        require Almanac::Thread;
+        Almanac::Thread::attached_thread(session => $sid, cwd => $cwd);
+    };
+    return undef if $@;
+    return $name;
 }
 
 sub _emit {
-    my ($n, $root, $gate, $nudge) = @_;
+    my ($n, $root, $gate, $nudge, $name) = @_;
     my $text;
     if ($gate) {
-        $text = "Tool call $n in this session: chart your tasklist. Move your current steps through doing, blocked and done; add a task only for a new step of work.\n"
-               . "  perl $root/scripts/almanac-task.pl focus | list | add --title '<step>' | status <id> doing|blocked|done";
+        if (defined $name) {
+            $text = "Tool call $n in this session: chart your thread $name. Move your current steps through doing, blocked and done; add a task only for a new step of work.\n"
+                   . "  perl $root/scripts/almanac-thread.pl show $name | add $name --title '<step>' | status $name <task> doing|blocked|done";
+        }
+        else {
+            $text = "Tool call $n in this session: chart your thread. Move your current steps through doing, blocked and done; add a task only for a new step of work.\n"
+                   . "  perl $root/scripts/almanac-thread.pl list | show <thread> | add <thread> --title '<step>' | status <thread> <task> doing|blocked|done";
+        }
         $text .= "\n" . $nudge->{text} if ref $nudge eq 'HASH';
     }
     elsif (ref $nudge eq 'HASH') {
@@ -201,7 +214,7 @@ sub _n5_nudge {
     return undef if defined $r && $r == $e;
 
     my $mins = int($age / 60);
-    my $text = "No operator message for $mins min and work continues. If this session should keep working without the operator, arm continuity: butler-continuity on";
+    my $text = "No operator message for $mins min and work continues. If this session should keep working without the operator, arm and attach a thread: butler-continuity on --new-thread <name> (or --thread <name> to resume one)";
     return { text => $text, epoch => $e };
 }
 
