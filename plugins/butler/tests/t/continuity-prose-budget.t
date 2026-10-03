@@ -384,12 +384,18 @@ my %SKILLS = (
             'dispatch alone',
             '/butler:continuity off',
             'butler-continuity status',
-            'butler-continuity ask --text',
+            'almanac inbox file --title',   # spec 01-inbox-rename AC34: was 'butler-continuity ask --text'
             # never-halt 11-arming-nudges (AC-33): the clause added to the
             # "Output:" line and the new sentence after the self-arm
             # triggers line, at the same 40-line budget.
             'Hooks nudge toward arming',
             'arming stays your call',
+            # package 04-continuity-threads (spec 2.10): the thread-attach forms
+            # and the hand-off/doing-gate language in the continuity block.
+            '--new-thread <name>',
+            '--thread <name>',
+            'hands the thread off',
+            'refuses while a task of the thread is doing',
         ],
         file_required => [],
         rule_q => undef,
@@ -408,6 +414,10 @@ my %SKILLS = (
             'run_in_background: true',
             "butler-continuity off --reason '<what is done>'",
             '`pause-long`',   # pkg10/never-halt AC-13: the off-line now also names pause-long
+            # package 04-continuity-threads (spec 2.10): the first-step thread
+            # arm and add-packages call.
+            'butler-continuity on --role driver --new-thread <name>',
+            'almanac thread add-packages',
         ],
         file_required => [
             '`in-flight`',
@@ -418,6 +428,9 @@ my %SKILLS = (
             'do not defer again',
             '`pause-long`',   # pkg10/never-halt AC-13: the new action-table row
             'until_iso',      # pkg10/never-halt AC-13: the new action's handoff-time field
+            # package 04-continuity-threads (spec 2.10): the done row's
+            # archive-if-done call.
+            'almanac thread archive-if-done',
         ],
         rule_q => \&rule_Q_drive_solo_violations,
     },
@@ -430,8 +443,12 @@ my %SKILLS = (
             'butler-hold',
             'butler-continuity silence --reason',
             'butler-continuity off --reason',
+            'no thread',   # package 04-continuity-threads (spec 2.10)
         ],
-        file_required => [],
+        file_required => [
+            'for debugging',        # package 04-continuity-threads (spec 2.10)
+            'almanac thread show',  # package 04-continuity-threads (spec 2.10)
+        ],
         rule_q => \&rule_Q_reporter_violations,
     },
     'coordinator-protocol' => {
@@ -484,6 +501,10 @@ my %SKILLS = (
             'butler-continuity status',
             'butler-continuity on',
             'Re-orient first',
+            # package 04-continuity-threads (spec 2.10): the resume form and
+            # the off-before-clear call.
+            'butler-continuity on --thread <that thread>',
+            'butler-continuity off --reason',
         ],
         file_required => [],
         rule_q => undef,

@@ -213,7 +213,8 @@ sub mk_home {
 my $ALMANAC_OK = eval {
     require "$ALMANAC_DIR/almanac-todo.pl";
     require "$ALMANAC_DIR/almanac-note.pl";
-    require "$ALMANAC_DIR/almanac-decision.pl";   # brings Almanac::Task with it
+    require "$ALMANAC_DIR/almanac-inbox.pl";
+    require "$ALMANAC_DIR/Almanac/Thread.pm";   # package 12-statusline-threads: the thread counter
     1;
 };
 diag("almanac modules did not load: $@") unless $ALMANAC_OK;
@@ -251,20 +252,37 @@ sub seed_notes {
         }
     });
 }
-sub seed_tasks {
-    my ($root, @spec) = @_;
-    for my $t (@spec) {
-        my ($st, $title) = @$t;
-        my $rec = Almanac::Task::add(root => $root, title => $title // ('task ' . (++$fixture_seq)));
-        Almanac::Task::set_status($rec->{id}, $st, root => $root) if $st ne 'pending';
-    }
+# seed_threads($root, $n_live, $n_handed_off, $n_archived) -- package
+# 12-statusline-threads replaces the flat tasklist counter with a thread
+# counter: project.thread counts records in thread/ with state live or
+# handed-off (archived is never counted). Each thread is empty (no tasks);
+# thread_is_done requires at least one task, so an empty thread never
+# auto-archives on creation (Decision 37's landmine does not apply here).
+sub seed_threads {
+    my ($root, $n_live, $n_handed_off, $n_archived) = @_;
+    $n_live //= 0; $n_handed_off //= 0; $n_archived //= 0;
+    with_host_policy(sub {
+        for (1 .. $n_live) {
+            Almanac::Thread::create_thread('live-' . (++$fixture_seq), root => $root);
+        }
+        for (1 .. $n_handed_off) {
+            my $name = 'handed-' . (++$fixture_seq);
+            Almanac::Thread::create_thread($name, root => $root);
+            Almanac::Thread::record_event($name, 'handed-off', root => $root, reason => 'fixture handoff');
+        }
+        for (1 .. $n_archived) {
+            my $name = 'archived-' . (++$fixture_seq);
+            Almanac::Thread::create_thread($name, root => $root);
+            Almanac::Thread::archive($name, root => $root);
+        }
+    });
 }
 sub seed_decisions {
     my ($root, $n_unanswered, $n_answered) = @_;
-    Almanac::Decision::file(root => $root, title => 'decision ' . (++$fixture_seq)) for 1 .. $n_unanswered;
+    Almanac::Inbox::file(root => $root, title => 'decision ' . (++$fixture_seq)) for 1 .. $n_unanswered;
     for (1 .. $n_answered) {
-        my $rec = Almanac::Decision::file(root => $root, title => 'decision ' . (++$fixture_seq));
-        Almanac::Decision::answer($rec->{id}, root => $root, answer => 'yes, go ahead');
+        my $rec = Almanac::Inbox::file(root => $root, title => 'decision ' . (++$fixture_seq));
+        Almanac::Inbox::answer($rec->{id}, root => $root, answer => 'yes, go ahead');
     }
 }
 sub seed_blueprint {
@@ -292,7 +310,7 @@ sub render {
 my $G_BLUEPRINT = encode('UTF-8', chr(0x29C9));
 my $G_TODO      = encode('UTF-8', chr(0x274F));
 my $G_NOTE      = encode('UTF-8', chr(0x2630));
-my $G_TASK      = encode('UTF-8', chr(0x25A3));
+my $G_THREAD    = encode('UTF-8', chr(0x23E3));   # package 12-statusline-threads: replaces the retired G_TASK (0x25A3)
 my $G_FLAG      = encode('UTF-8', chr(0x2691));
 my $G_AGENTOFF  = encode('UTF-8', chr(0x2205));
 my $G_DOT       = encode('UTF-8', chr(0x00B7));
@@ -373,8 +391,7 @@ my $DATA_FULL = tempdir(CLEANUP => 1);
 if ($ALMANAC_OK) {
     seed_todos('project', $P_FULL, 5, 2);
     seed_notes('project', $P_FULL, 2);
-    seed_tasks($P_FULL, ['pending'], ['pending'], ['doing'], ['blocked'],
-               ['done'], ['done'], ['done'], ['obsoleted']);
+    seed_threads($P_FULL, 1, 1, 1);   # 1 live + 1 handed-off count (P=2); 1 archived is excluded
     seed_decisions($P_FULL, 2, 1);
     seed_todos('global', $H_FULL, 3, 1);
     seed_notes('global', $H_FULL, 1);
@@ -391,9 +408,9 @@ SKIP: {
     my $row = first_line($out);
     my @fields = sep_fields($row);
     my $last = @fields ? $fields[-1] : '';
-    my $want = "${G_FLAG} 2  ${G_BLUEPRINT} 1  ${G_TASK} 4  ${G_TODO} 5${G_DOT}3  ${G_NOTE}2${G_DOT}1";
+    my $want = "${G_FLAG} 2  ${G_BLUEPRINT} 1  ${G_THREAD} 2  ${G_TODO} 5${G_DOT}3  ${G_NOTE}2${G_DOT}1";
     is($last, $want,
-        'AC-1 (behaviour 1): the last field is exactly the decisions/blueprints/tasklist/todos/notes join')
+        'AC-1 (behaviour 1, package 12-statusline-threads AC7): the last field is exactly the decisions/blueprints/thread/todos/notes join')
         or diag("  last field = [$last]\n  row 1 = [" . strip_sgr($row) . "]");
     unlike($last, qr/   /, 'AC-1: the counters field never contains 3+ consecutive spaces');
 }
@@ -657,7 +674,7 @@ SKIP: {
         my $vis = strip_sgr($row);
         my $F  = ($vis =~ /\Q$G_FLAG\E 2(?!\d)/) ? 1 : 0;
         my $Gt = (index($vis, 'main') >= 0) ? 1 : 0;
-        my $C  = (index($vis, $G_BLUEPRINT) >= 0 || index($vis, $G_TASK) >= 0
+        my $C  = (index($vis, $G_BLUEPRINT) >= 0 || index($vis, $G_THREAD) >= 0
                 || index($vis, $G_TODO) >= 0 || index($vis, $G_NOTE) >= 0) ? 1 : 0;
         my $Pj = defined(project_field($row)) ? 1 : 0;
 

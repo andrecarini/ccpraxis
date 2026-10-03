@@ -83,12 +83,13 @@ sub _question_text {
 }
 
 # ---------------------------------------------------------------------------
-# file_question($p, $text) -> $id|undef. Files $text as an almanac pending
-# decision (Almanac::Decision::file), never falling back to the process
-# cwd (Hooks, and GuardHarness::run_module in-process, can have the repo as
+# file_question($p, $text) -> $id|undef. Files $text as an almanac inbox
+# item (Almanac::Inbox::file), never falling back to the process cwd
+# (Hooks, and GuardHarness::run_module in-process, can have the repo as
 # their cwd -- a fallback there would write real state). Package 09 re-
-# point (Decision 108, spec sec 2.5); one call site so a future change edits
-# one place.
+# point (Decision 108, spec sec 2.5; renamed by blueprint where-things-go,
+# package 01-inbox-rename); one call site so a future change edits one
+# place.
 # ---------------------------------------------------------------------------
 sub file_question {
     my ($p, $text) = @_;
@@ -104,13 +105,13 @@ sub file_question {
         return undef;
     }
 
-    my $decision_pl = "$SELF_DIR/../../../../almanac/scripts/almanac-decision.pl";
-    unless (grep { m{(?:^|/)almanac-decision\.pl$} } keys %INC) {
+    my $inbox_pl = "$SELF_DIR/../../../../almanac/scripts/almanac-inbox.pl";
+    unless (grep { m{(?:^|/)almanac-inbox\.pl$} } keys %INC) {
         local $@;
-        return undef unless eval { require $decision_pl; 1 };
+        return undef unless eval { require $inbox_pl; 1 };
     }
 
-    my $rec = eval { Almanac::Decision::file(title => $text, cwd => $start) };
+    my $rec = eval { Almanac::Inbox::file(title => $text, cwd => $start) };
     return (ref $rec eq 'HASH' && defined $rec->{id}) ? $rec->{id} : undef;
 }
 
@@ -139,7 +140,7 @@ sub run {
     my @lines;
     push @lines, "BLOCKED: $why, so asking the operator would stop unattended work for an answer nobody is there to give.";
     if (defined $id) {
-        push @lines, "The question is filed as pending decision $id.";
+        push @lines, "The question is filed as inbox item $id.";
     }
     else {
         push @lines, 'The question could not be filed; note it in your report instead.';

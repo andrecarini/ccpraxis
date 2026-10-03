@@ -271,9 +271,13 @@ my $G = q{unset BASH_ENV ; f="${CLAUDE_PLUGIN_ROOT}/hooks/guard-almanac-write.sh
     assert_deny_bash("truncate -s 0 $R", 'AC4/b9: truncate -s 0 R');
 }
 {
-    my (undef, undef, $err10) = assert_deny_bash('touch /c/P/.ccpraxis-local-data/almanac/decision/d1.md', 'AC4/b10: touch decision');
-    like($err10, qr/almanac-decision\.pl/, 'AC5: decision denial names almanac-decision.pl');
-    like($err10, qr/file \| answer/,       'AC5: decision denial names its verb list');
+    my (undef, undef, $err10) = assert_deny_bash('touch /c/P/.ccpraxis-local-data/almanac/decision/d1.md', 'AC4/b10: touch decision (legacy dir)');
+    like($err10, qr/almanac-inbox\.pl/, 'spec 2.7: legacy decision-dir denial names almanac-inbox.pl (not almanac-decision.pl)');
+    like($err10, qr/file \| answer/,    'AC5: decision denial names its verb list');
+
+    my (undef, undef, $err10b) = assert_deny_bash('touch /c/P/.ccpraxis-local-data/almanac/inbox/d1.md', 'AC30: touch inbox');
+    like($err10b, qr/almanac-inbox\.pl/, 'AC30: inbox denial names almanac-inbox.pl');
+    like($err10b, qr/file \| answer/,    'AC30: inbox denial names its verb list');
 }
 
 # =============================================================================
@@ -292,7 +296,12 @@ my $G = q{unset BASH_ENV ; f="${CLAUDE_PLUGIN_ROOT}/hooks/guard-almanac-write.sh
     my (undef, undef, $errn) = assert_deny_bash(
         q{node -e "require('fs').writeFileSync('/c/H/.claude/claude-code-vault/almanac/task/k.md','x')"},
         'AC7: node -e task one-liner');
-    like($errn, qr/almanac-task\.pl/, 'AC5: node one-liner denial names almanac-task.pl');
+    # EDITED for blueprint where-things-go, package 02-thread-store (the
+    # flat tasklist's CLI is retired; the guard now points the `task` store
+    # shape at almanac-thread.pl, per guard-almanac-write.sh's own SCRIPT=
+    # table): the denial now names almanac-thread.pl, not the retired
+    # almanac-task.pl.
+    like($errn, qr/almanac-thread\.pl/, 'AC5: node one-liner denial names almanac-thread.pl (almanac-task.pl is retired)');
 }
 
 # =============================================================================
@@ -332,8 +341,11 @@ my $G = q{unset BASH_ENV ; f="${CLAUDE_PLUGIN_ROOT}/hooks/guard-almanac-write.sh
         'AC10: the root denial text names the shape');
     ok((grep { $_ eq '  a.md' } @lines), 'AC10: the path field is the relative text "a.md"') or diag($err14);
     like($err14, qr/almanac-bug\.pl \(file \| update \| append \| set-status\)/, 'AC10: names almanac-bug.pl verbs');
-    like($err14, qr/almanac-todo\.pl, almanac-note\.pl, almanac-task\.pl, almanac-decision\.pl/,
-        'AC10: names the other scripts');
+    # EDITED for blueprint where-things-go, package 02-thread-store: the
+    # retired almanac-task.pl is replaced by almanac-thread.pl in the
+    # script list guard-almanac-write.sh now prints.
+    like($err14, qr/almanac-todo\.pl, almanac-note\.pl, almanac-thread\.pl, almanac-inbox\.pl/,
+        'spec 2.7: names the other scripts, almanac-thread.pl in place of almanac-task.pl, almanac-inbox.pl in place of almanac-decision.pl');
     like($err14, qr/use absolute paths instead of cd/, 'AC10: tells the caller to use absolute paths instead of cd');
 }
 

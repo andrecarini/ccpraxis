@@ -1,15 +1,16 @@
 package Almanac::LegacyQueue;
 # Almanac::LegacyQueue -- lazy absorption of the retired operator question
 # queue (<project>/.ccpraxis-local-data/.subagent-guard/questions.md) into
-# the almanac pending-decisions store. Blueprint hook-continuity-remake,
-# package 09-question-queue. See specs/09-question-queue-spec.md sec 2.1.
+# the almanac inbox store. Blueprint hook-continuity-remake,
+# package 09-question-queue. See specs/09-question-queue-spec.md sec 2.1
+# (renamed by blueprint where-things-go, package 01-inbox-rename).
 #
 # THE ONLY READER OF questions.md ANYWHERE (Q16 of that spec's oracle).
-# open_decisions() in almanac-decision.pl is the ONE call site (spec 2.2);
+# open_inbox() in almanac-inbox.pl is the ONE call site (spec 2.2);
 # nothing else in this repo may read or write that path.
 #
 # absorb() NEVER dies, prints or spawns, and it never opens a store itself
-# (no ->open(, no Almanac::Decision::*) -- it is handed an already-open
+# (no ->open(, no Almanac::Inbox::*) -- it is handed an already-open
 # store and writes only through $store->create, plus one rename.
 use strict;
 use warnings;

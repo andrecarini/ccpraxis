@@ -228,15 +228,20 @@ my $PREFIX = 'perl "${CLAUDE_PLUGIN_ROOT}/scripts/almanac.pl"';
 # The six skills (spec §2.3). smoke_expected is the §2.3 table entry, checked
 # verbatim by AC8; smoke_type is used by AC2/AC9/AC10.
 # ---------------------------------------------------------------------------
-my @SKILL_DIRS = qw(todo note task decision bug-report bug-triage);
+# AC16 (specs/02-thread-store-spec.md section 2.10): skills/task/ is deleted
+# and skills/thread/ replaces it (name: thread, smoke `thread list`).
+my @SKILL_DIRS = qw(todo note thread inbox bug-report bug-triage);
 my %SMOKE_EXPECTED = (
     'todo'       => 'todo list',
     'note'       => 'note list',
-    'task'       => 'task list',
-    'decision'   => 'decision list',
+    'thread'     => 'thread list',
+    'inbox'      => 'inbox list',
     'bug-report' => 'bug list',
     'bug-triage' => 'bug collect',
 );
+
+# AC16: skills/task/ must be gone entirely (not merely superseded).
+ok(!-d "$ROOT/skills/task", 'AC16: plugins/almanac/skills/task/ no longer exists');
 
 my %parsed;      # dir -> parse_frontmatter() result
 my %blocks;      # dir -> list of blocks (each an arrayref of logical lines)
@@ -389,7 +394,7 @@ for my $dir (@SKILL_DIRS) {
 # AC7 (DC6): no SKILL.md names a type script directly.
 # ===========================================================================
 for my $dir (@SKILL_DIRS) {
-    unlike($raw_text{$dir}, qr/almanac-(?:todo|note|task|decision|bug|doctor)\.pl/,
+    unlike($raw_text{$dir}, qr/almanac-(?:todo|note|task|thread|inbox|bug|doctor)\.pl/,
         "AC7: $dir/SKILL.md never names an almanac-<type>.pl script directly");
 }
 
@@ -484,16 +489,35 @@ my %PINNED_ABOUT = (
     'Almanac/Record.pm.about'        => 'The record format: one record per file, front matter plus body; parse, serialize, ids, forbidden bytes',
     'Almanac/Store.pm.about'         => 'Per-record CRUD in project and global scope, rank-key ordering, seals, and the one scope predicate',
     'Almanac/ClaudeMdBlock.pm.about' => 'Renders the note directory as a hashed block between markers and detects hand-edits and conflicts',
-    'Almanac/LegacyQueue.pm.about'   => 'Absorbs a legacy subagent-guard question queue into project pending decisions, then renames it',
+    'Almanac/LegacyQueue.pm.about'   => 'Absorbs a legacy subagent-guard question queue into project inbox items, then renames it',
     'Almanac/GlobalCounts.pm.about'  => 'Recounts global todos and notes after each global mutation into one read-only-mounted counts file',
     'almanac-todo.pl.about'              => 'Todo CRUD in project and global scope: create, list, show, edit, complete, reopen, delete, count',
     'almanac-note.pl.about'              => 'Notes as a pointer plus metadata, project or global; promote moves one between internal and external',
-    'almanac-task.pl.about'              => "The project's one ordered tasklist: insert, move, reorder, status, and per-session focus",
-    'almanac-decision.pl.about'          => 'Pending product decisions: agents file, the operator answers, answering lists the tasks it blocked',
+    # AC19/specs/02-thread-store-spec.md section 2.10: almanac-task.pl's CLI
+    # is retired; this .about is rewritten to say so (the library half
+    # stays, per the architect's resolution of the inbox/butler-continuity
+    # coupling).
+    'almanac-task.pl.about'              => 'Retired CLI: prints a pointer to almanac thread and exits 2; its library half stays for old readers',
+    'almanac-inbox.pl.about'             => "The operator's inbox: agents file items, the operator answers, answering lists the tasks it blocked",
+    'almanac-decision.pl.about'          => 'Retired: prints one line pointing at the inbox script and exits 2',
     'almanac-migrate-todos.pl.about'     => "Host-side move of the vault's legacy todos into global almanac todos, verified before removal",
     'almanac-migrate-memories.pl.about'  => 'Host-side migration of Claude Code memories into notes, and render-index for the notes index',
     'gen-statusline-counters.pl.about'   => 'Prints the almanac counting block embedded in scripts/statusline.pl, which may import nothing',
+    # AC19/AC16 (specs/02-thread-store-spec.md sections 2.3, 2.4, 2.7): new
+    # this package.
+    'almanac-thread.pl.about'            => 'Threads per project: create, list, show, archive; ordered tasks with a status or a package link; a typed log',
+    'Almanac/Thread.pm.about'            => 'Thread store library: metadata, ordered tasks, typed log, the archive rule and the flat-tasklist migration',
+    'Almanac/PackageLink.pm.about'       => 'Resolves <blueprint>/<package> to its ledger, live or under blueprints/_archive, and reads its status',
 );
+
+# AC16/AC19 precondition: these three sidecars are NEW this package and must
+# exist (the generic @pl_pm_files loop below only checks a sidecar once its
+# target .pl/.pm file exists, which would otherwise silently skip them
+# entirely while almanac-thread.pl/Thread.pm/PackageLink.pm do not exist yet).
+for my $rel (qw(almanac-thread.pl.about Almanac/Thread.pm.about Almanac/PackageLink.pm.about)) {
+    ok(-f "$ROOT/scripts/$rel", "AC16/AC19 precondition: plugins/almanac/scripts/$rel exists")
+        or diag("not present yet -- $rel's pinned-text comparison below cannot run until it exists");
+}
 
 sub check_about_format {
     my ($path, $label) = @_;
@@ -533,8 +557,8 @@ for my $f (@pl_pm_files) {
     my $raw = slurp_raw($plugin_about);
     (my $content = $raw) =~ s/\n\z//;
     is($content,
-       'Almanac: durable one-file-per-record todos, notes, tasklist, pending decisions and bug reports, written only by scripts',
-       'AC14: plugins/almanac/.about byte-equals the §2.4 caption (Decision 42)');
+       'Almanac: durable one-file-per-record todos, notes, tasklist, operator inbox and bug reports, written only by scripts',
+       'spec 2.7: plugins/almanac/.about byte-equals the new caption (operator inbox, not pending decisions)');
 }
 
 # ===========================================================================
@@ -580,8 +604,8 @@ my $PLUGIN_JSON_PATH = "$ROOT/.claude-plugin/plugin.json";
 my $EXPECTED_PLUGIN_DESCRIPTION =
     "Durable records that outlive a session, one file per record, written only through their scripts: "
   . "project and global todos, notes (a pointer plus metadata, in place of Claude Code auto-memory), "
-  . "the project's ordered tasklist, pending product decisions for the operator, and ccpraxis bug reports. "
-  . "Bundles /almanac:todo, /almanac:note, /almanac:task, /almanac:decision, /almanac:bug-report and "
+  . "the project's ordered tasklist, the operator's inbox, and ccpraxis bug reports. "
+  . "Bundles /almanac:todo, /almanac:note, /almanac:task, /almanac:inbox, /almanac:bug-report and "
   . "/almanac:bug-triage, the almanac dispatcher and doctor, and hooks that deny direct edits to the stores.";
 
 my $plugin_json;
@@ -654,7 +678,7 @@ like($readme_text, qr/^\s*-\s*\[.*\]\(#records-that-outlive-a-session\)/m,
     }
 }
 
-for my $row (qw(todo note task decision)) {
+for my $row (qw(todo note task inbox)) {
     like($readme_text, qr/\|\s*\`\/almanac:$row\`\s*\|/, "AC20: README Commands table has a row beginning with \`/almanac:$row\`");
 }
 

@@ -1,6 +1,6 @@
 package Almanac::Store;
 # Almanac::Store -- the CRUD + ordering layer every almanac record type (todos,
-# notes, tasklists, pending decisions -- packages 04/05/07/08) calls. Built
+# notes, tasklists, inbox items -- packages 04/05/07/08) calls. Built
 # over Almanac::Lock (package 01) and Almanac::Record (package 02). Blueprint
 # almanac-records, package 03-store (see specs/03-store-spec.md).
 #
@@ -84,7 +84,7 @@ my %KEY_ORDER = (
     lock_timeout      => [qw(id path waited_ms timeout_ms holder_pid holder_host)],
     io                => [qw(path errno)],
     usage             => [qw(detail)],
-    refused           => [qw(path detail)],
+    refused           => [qw(path detail cause)],
 );
 
 sub _tok {

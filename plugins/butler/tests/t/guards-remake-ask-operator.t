@@ -66,13 +66,22 @@ BEGIN { $ENV{CCPRAXIS_NO_WAKELOCK} = 1 }
 use lib dirname(__FILE__) . '/../lib';
 use GuardHarness;
 
-require(Cwd::abs_path(dirname(__FILE__) . '/../../../almanac/scripts/almanac-decision.pl'));
+# spec 01-inbox-rename: GuardAskOperator now files into Almanac::Inbox
+# (almanac-inbox.pl), not Almanac::Decision -- guarded, house not-yet-built
+# pattern.
+{
+    local $@;
+    eval { require(Cwd::abs_path(dirname(__FILE__) . '/../../../almanac/scripts/almanac-inbox.pl')); 1 }
+        or diag("almanac-inbox.pl did not load (expected until package 01-inbox-rename renames it): $@");
+}
 
-# filed($root) -- the almanac decision store's own records for $root.
+# filed($root) -- the almanac inbox store's own records for $root.
 sub filed {
     my ($root) = @_;
-    return [] unless -d "$root/.ccpraxis-local-data/almanac/decision";
-    return Almanac::Decision::list_decisions(root => $root);
+    return [] unless -d "$root/.ccpraxis-local-data/almanac/inbox";
+    return [] unless defined &Almanac::Inbox::list_items;
+    my $list = eval { Almanac::Inbox::list_items(root => $root) };
+    return (ref $list eq 'ARRAY') ? $list : [];
 }
 
 # ---------------------------------------------------------------------------
@@ -197,11 +206,11 @@ for my $role (qw(manual driver reporter)) {
     like($lines[0], qr/\bARMED\b/, "AO-1 (role $role): line 1 contains ARMED");
     like($lines[0], qr/^BLOCKED: continuity is ARMED for this session, so asking the operator would stop unattended work for an answer nobody is there to give\.$/,
          "AO-1 (role $role): exact line 1 text");
-    like($lines[1], qr/^The question is filed as pending decision \S+\.$/,
-         "AO-1 (role $role): line 2 names the filed decision");
+    like($lines[1], qr/^The question is filed as inbox item \S+\.$/,
+         "AC17/AC29 (role $role): line 2 names the filed inbox item");
 
     my $recs = filed($root);
-    is(scalar(@$recs), 1, "AO-1 (role $role): exactly one pending decision filed");
+    is(scalar(@$recs), 1, "AO-1 (role $role): exactly one inbox item filed");
     if (@$recs) {
         is($recs->[0]{fields}{title}, 'Should I rename it?', "AO-1 (role $role): filed with the exact title");
         is($recs->[0]{fields}{status}, 'unanswered', "AO-1 (role $role): filed unanswered");
@@ -381,8 +390,9 @@ for my $role (qw(manual driver reporter)) {
 }
 
 # ===========================================================================
-# AO-7 -- the filed record equals what "butler-continuity ask" produces for
-# the same text: the same Almanac::Decision::file call.
+# AO-7 -- the filed record's shape: Almanac::Inbox::file's usual fields
+# (title/status/created). "butler-continuity ask" no longer exists to compare
+# against (spec 01-inbox-rename 2.6: retired) -- this pins the shape directly.
 # ===========================================================================
 {
     my $root = mk_root();
