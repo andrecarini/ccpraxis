@@ -1960,6 +1960,31 @@ sub _widen_prefix_related {
     return 0;
 }
 
+# _byteify($s) -> raw UTF-8 bytes (never re-encoded if already bytes). See
+# Almanac::PackageLink::_byteify for the full rationale: a decoded (utf8-
+# flagged) string concatenated with a raw-bytes string silently corrupts
+# non-ASCII bytes under Perl's mismatched-encoding upgrade rules. See also
+# `as_bytes` (~2946): that helper downgrades first and encodes only as a
+# fallback, which matters when the source already holds raw bytes that were
+# merely upgraded (not characters) -- `_widen_check_inflight_conflict` tries
+# both interpretations and keeps whichever one resolves to a real file.
+sub _byteify {
+    my ($s) = @_;
+    return $s unless defined $s;
+    my $copy = $s;
+    utf8::encode($copy) if utf8::is_utf8($copy);
+    return $copy;
+}
+
+# _widen_valid_name($s) -- same grammar bp-drive-next.pl's own `_valid_name`
+# uses for an inflight.json entry's blueprint/package names (spec Sec2.2).
+# Keeping entries to this grammar also rules out path traversal when we
+# build a filesystem path out of them below.
+sub _widen_valid_name {
+    my ($s) = @_;
+    return (defined $s && !ref $s && $s =~ /^[A-Za-z0-9][A-Za-z0-9_.-]*$/) ? 1 : 0;
+}
+
 # _widen_check_inflight_conflict($ledger, \@new_paths) -> "$bp/$pkg" | undef.
 # Reads .drive-solo/inflight.json alongside $ledger's own data dir (4 levels
 # up: packages/ -> <bp>/ -> blueprints/ -> data). Any failure to resolve or
@@ -2001,13 +2026,43 @@ sub _widen_check_inflight_conflict {
         next unless defined $obp && !ref($obp) && defined $opkg && !ref($opkg);
         next if $obp eq $own_bp && $opkg eq $own_pkg; # never conflict with self
 
-        my $oledger = $e->{ledger};
-        next unless defined $oledger && !ref($oledger) && length $oledger;
-        (my $oledger_fs = $oledger) =~ tr{\\}{/};
-        unless ($oledger_fs =~ m{\A(?:/|[A-Za-z]:/)}) {
-            $oledger_fs = "$data_dir/$oledger_fs";
+        my $oledger_fs;
+
+        # Prefer deriving the other ledger's path from its own blueprint/
+        # package names -- the same way the director (bp-drive-next.pl)
+        # always re-derives the file it reads. The entry's `ledger` string
+        # is written data-dir-relative by the director but is documented
+        # there as informational only; resolving it against $data_dir
+        # (below) double-joins the data dir and never exists in practice.
+        if (_widen_valid_name($obp) && _widen_valid_name($opkg)) {
+            my $cand = "$blueprints_dir/$obp/packages/$opkg.md";
+            $oledger_fs = $cand if -f $cand;
         }
-        next unless -f $oledger_fs;
+
+        if (!defined $oledger_fs) {
+            my $oledger = $e->{ledger};
+            if (defined $oledger && !ref($oledger) && length $oledger) {
+                # Try both byte interpretations of the decoded JSON string:
+                # a producer that wrote raw UTF-8 bytes without a JSON
+                # ->utf8 encode round-trips correctly through `_byteify`
+                # (re-encode only if the decode flagged it as characters);
+                # a producer that itself ->utf8->encode'd an already-raw-
+                # bytes string round-trips through `as_bytes`'s downgrade
+                # instead. Keep whichever candidate actually stats.
+                for my $cand (_byteify($oledger), as_bytes($oledger)) {
+                    (my $cand_fs = $cand) =~ tr{\\}{/};
+                    unless ($cand_fs =~ m{\A(?:/|[A-Za-z]:/)}) {
+                        $cand_fs = "$data_dir/$cand_fs";
+                    }
+                    if (-f $cand_fs) {
+                        $oledger_fs = $cand_fs;
+                        last;
+                    }
+                }
+            }
+        }
+
+        next unless defined $oledger_fs;
 
         my $ocontent = do {
             open(my $ofh, '<:raw', $oledger_fs) or next;
