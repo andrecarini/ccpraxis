@@ -109,8 +109,13 @@ my @EXPECT = (
     # SessionStart group, after denial-breaker.sh's, guarded 2.2 template,
     # session-start-nudge.sh.
     { event => 'SessionStart',        matcher => '', file => 'session-start-nudge.sh', args => '' },
+    # package 11-ac-loss-clean-suspend-cycle (tooling-backlog blueprint, spec
+    # sec 2.9): a new matcher-less PreToolUse group, guarded 2.2 template,
+    # ac-standdown-gate.sh -- the PreToolUse guard that refuses subagent tool
+    # calls while an AC-loss stand-down is in effect.
+    { event => 'PreToolUse',          matcher => '', file => 'ac-standdown-gate.sh', args => '' },
 );
-is(scalar(@EXPECT), 26, 'sanity: this file\'s own sec 2.3 fixture table has 26 rows (never-halt 06 adds 2, never-halt 07 adds 4, never-halt 11 adds 1, never-halt 12 adds 1)');
+is(scalar(@EXPECT), 27, 'sanity: this file\'s own sec 2.3 fixture table has 27 rows (never-halt 06 adds 2, never-halt 07 adds 4, never-halt 11 adds 1, never-halt 12 adds 1, tooling-backlog package 11 adds 1)');
 
 sub expect_key { my ($r) = @_; return join("\x1e", $r->{event}, $r->{matcher}, $r->{file}, $r->{args}) }
 
@@ -147,7 +152,7 @@ if (ref $doc eq 'HASH' && ref $doc->{hooks} eq 'HASH') {
 my @expect_keys = sort map { expect_key($_) } @EXPECT;
 my @actual_keys = sort map { expect_key($_) } @actual;
 is_deeply(\@actual_keys, \@expect_keys,
-    'B1a: hooks.json\'s (event, matcher, file, args) multiset equals sec 2.3 exactly (26 commands)')
+    'B1a: hooks.json\'s (event, matcher, file, args) multiset equals sec 2.3 exactly (27 commands)')
     or diag("actual:\n" . join("\n", @actual_keys) . "\nexpected:\n" . join("\n", @expect_keys));
 
 is(scalar(@template_mismatches), 0,

@@ -1033,6 +1033,63 @@ while (1) {
         }
     }
 
+    # package 11 (tooling-backlog), spec sec 2.7: the AC-loss watch probe.
+    # Runs once per loop iteration, after the PROMPT block and before finish
+    # detection. A die anywhere in here is swallowed: the holder continues
+    # and nothing is printed (spec's own "failure isolation" rule).
+    if ($WATCHING) {
+        eval {
+            unless (defined &BpAcWatch::enabled) {
+                require "$Bin/BpAcWatch.pm";
+            }
+            if (BpAcWatch::enabled()) {
+                my $test_mode = (defined $ENV{BUTLER_HOLD_TEST_MODE} && $ENV{BUTLER_HOLD_TEST_MODE} eq '1') ? 1 : 0;
+                my $probe_file_set = (defined $ENV{CCPRAXIS_AC_PROBE_FILE} && length $ENV{CCPRAXIS_AC_PROBE_FILE}) ? 1 : 0;
+                if (!$test_mode || $probe_file_set) {
+                    my $armdata = read_json_file("$ROOT/armed/$SID");
+                    if (ref $armdata eq 'HASH' && defined $armdata->{role} && $armdata->{role} eq 'driver') {
+                        my $obs = BpAcWatch::observe($WATCH_DATA, src => 'holder');
+                        # S7 (fix-batch, reviewer-1): wake on expired OR
+                        # standing-down OR monitoring, not just expired. With
+                        # two drive-solo sessions in one project, the FIRST
+                        # director's stand-down can move the shared phase
+                        # straight to standing-down/monitoring before this
+                        # (second) session's holder ever observes expired --
+                        # it must still stand down, not keep holding the
+                        # wake-lock and the Continuous plan for a run this
+                        # project has already decided to sleep (P1).
+                        if (ref $obs eq 'HASH' && defined $obs->{phase}
+                            && ($obs->{phase} eq 'expired' || $obs->{phase} eq 'standing-down'
+                                || $obs->{phase} eq 'monitoring')) {
+                            my $since = $obs->{dc_since};
+                            BpAcWatch::log_event($WATCH_DATA, 'holder', 'HOLDER-WAKE',
+                                { on_battery_since => (defined $since ? BpAcWatch::_iso_utc($since) : '-') },
+                                'battery grace expired; waking the holder');
+
+                            my $lfh3;
+                            if (open($lfh3, '>>', $LOCK_PATH)) {
+                                eval {
+                                    local $SIG{ALRM} = sub { die "bp-hold-ac-lock-timeout\n" };
+                                    alarm(10);
+                                    flock($lfh3, LOCK_EX);
+                                    alarm(0);
+                                };
+                                alarm(0);
+                            }
+                            unlink($RECORD_PATH);
+                            if ($lfh3) { flock($lfh3, LOCK_UN); close $lfh3 }
+
+                            my $hhmm = defined $since ? BpHook::local_utc_hhmm(int($since)) : undef;
+                            $hhmm = 'unknown' unless defined $hhmm;
+                            out_line("ACLOSS on battery since $hhmm (grace expired); run bp-drive-next.pl next now");
+                            end_report('AC power lost', $last_valid, 4);
+                        }
+                    }
+                }
+            }
+        };
+    }
+
     $known_deadline = $rp->{deadline};
     $last_valid = $rp;
 

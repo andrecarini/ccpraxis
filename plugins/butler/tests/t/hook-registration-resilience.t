@@ -73,6 +73,7 @@ sub read_json {
 # ===========================================================================
 {
     my @EXPECT_FILES = qw(
+        ac-standdown-gate.sh
         arm-nudge-prompt.sh
         arm-on-entry.sh bind-dispatch.sh context-ceiling.sh continuity-off-check.sh
         denial-breaker.sh
@@ -81,7 +82,7 @@ sub read_json {
         record-denial.sh record-prompt.sh
         run-hook.sh session-start-nudge.sh stop-gate.sh track-dispatch.sh wait-shape-guard.sh
     );
-    is(scalar(@EXPECT_FILES), 22, 'sanity: this file\'s own sec 2.4 fixture list has 22 entries (never-halt 06 adds record-prompt.sh, record-denial.sh; never-halt 07 adds denial-breaker.sh; never-halt 11 adds arm-nudge-prompt.sh; never-halt 12 adds session-start-nudge.sh)');
+    is(scalar(@EXPECT_FILES), 23, 'sanity: this file\'s own sec 2.4 fixture list has 23 entries (never-halt 06 adds record-prompt.sh, record-denial.sh; never-halt 07 adds denial-breaker.sh; never-halt 11 adds arm-nudge-prompt.sh; never-halt 12 adds session-start-nudge.sh; tooling-backlog package 11 adds ac-standdown-gate.sh)');
 
     opendir(my $dh, $HOOKS) or BAIL_OUT("cannot opendir $HOOKS: $!");
     my (@actual_files, @subdirs);
@@ -220,8 +221,8 @@ sub all_registered_commands {
         all_registered_commands($hooksjson, 'hooks.json'),
         all_registered_commands($settings,  'settings.json'),
     );
-    is(scalar(@combined), 27,
-       'B6a: exactly 27 commands are registered in total across hooks.json + settings.json (never-halt 06 adds 2, never-halt 07 adds 4: PreToolUse/PostToolUse/PostToolUseFailure/SessionStart denial-breaker.sh; never-halt 11 adds 1: UserPromptSubmit arm-nudge-prompt.sh; never-halt 12 adds 1: SessionStart session-start-nudge.sh)')
+    is(scalar(@combined), 28,
+       'B6a: exactly 28 commands are registered in total across hooks.json + settings.json (never-halt 06 adds 2, never-halt 07 adds 4: PreToolUse/PostToolUse/PostToolUseFailure/SessionStart denial-breaker.sh; never-halt 11 adds 1: UserPromptSubmit arm-nudge-prompt.sh; never-halt 12 adds 1: SessionStart session-start-nudge.sh; tooling-backlog package 11 adds 1: PreToolUse ac-standdown-gate.sh)')
         or diag('found ' . scalar(@combined) . ' registered commands');
 
     my (@bad_127, @bad_rc, @slow);

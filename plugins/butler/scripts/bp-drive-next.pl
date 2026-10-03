@@ -5,7 +5,7 @@
 # USAGE
 #   bp-drive-next.pl next --scope <spec>
 #   bp-drive-next.pl record-order <bp> [<bp> …]
-#   bp-drive-next.pl park <blueprint> <reason…>
+#   bp-drive-next.pl park <blueprint> [--needs-operator] <reason…>
 #   bp-drive-next.pl --help
 #
 # SUBCOMMANDS
@@ -18,9 +18,14 @@
 #   record-order <bp> [<bp> …]
 #       Persist the SESSION-judged blueprint order to order.json. The director never
 #       invents order — it only persists and serves it.
-#   park <blueprint> <reason…>
-#       Record a blueprint-level park (idempotent) to parks.json and log it. A parked
-#       blueprint is settled: never driven, excluded from every pending list.
+#   park <blueprint> [--needs-operator] <reason…>
+#       Write status: parked and the reason into the blueprint's OWN blueprint.md
+#       (via bp-blueprint.pl set-meta), idempotent, and log it. A parked blueprint is
+#       settled: never driven, excluded from every pending list. --needs-operator also
+#       files one inbox item linked to the blueprint; unparking is a plain set-meta
+#       status write, which closes that item. A legacy park file, if one exists, is
+#       migrated into blueprint.md on the first call and then removed (package
+#       08-blueprint-parks).
 #
 # NEXT-ACTION JSON  (exactly one per `next`)
 #   {"action":"need-order","candidates":[…]}          no order yet; session must judge+record
@@ -48,6 +53,13 @@
 #   {"action":"done","denials":N}                      every in-scope blueprint is done-or-parked;
 #                                                      N = cumulative auto-mode denial count (never-halt
 #                                                      Decision 9; see `bp-denials summary` for a breakdown)
+#   {"action":"ac-stand-down","reason":"ac-loss","on_battery_since_iso":…,
+#    "grace_expired_iso":…,"inflight":[…],"monitor_live":true|false,
+#    "log":…}                                          package 11 (tooling-backlog): AC power has been
+#                                                      lost past the 5-minute grace period. Stand down
+#                                                      in-flight local dispatches, disarm continuity,
+#                                                      release the wake-lock and start/confirm
+#                                                      bp-ac-watch.pl monitor; see the drive-solo SKILL.
 #
 #   Keep-awake is a director-managed SIDE EFFECT (started when work is runnable or a
 #   timed auto-resume is pending; stopped when settled) — never an action.
@@ -63,7 +75,6 @@
 #
 # STATE  (<data>/.drive-solo/, all director-owned)
 #   order.json      {"order":[…],"recorded_at":<epoch>}
-#   parks.json      [{"blueprint":…,"reason":…,"at":<epoch>}, …]
 #   announced.json  {"announced":[…]}   blueprints whose blueprint-done already fired
 #   inflight.json   {"packages":[{"blueprint":…,"package":…,"ledger":…,"since":<epoch>}],
 #                   "updated_at":<epoch>}   the project-level in-flight set
@@ -88,6 +99,8 @@ use Cwd qw(abs_path);
 use Fcntl qw(:flock);
 use Errno ();
 use POSIX qw(strftime);
+use Encode ();
+use File::Spec ();
 # Loaded WITHOUT importing `time`/`sleep` — this file's default `now` seam is
 # bare `time` (CORE, integer epoch, per spec "Integer epochs"); importing
 # Time::HiRes's floating-point time() would silently change that contract.
@@ -195,13 +208,17 @@ sub resolve_scope {
     return @out;
 }
 
-# 1a. blueprint_lifecycle($bpdir) → 'drafting'|'audited'|'archived'|'' (unknown)
+# 1a. blueprint_lifecycle($bpdir) → 'drafting'|'audited'|'parked'|'archived'|'' (unknown)
 # Reads blueprint.md's OWN `status:` -- the authoring lifecycle. That is a
 # different axis from package status (which lives in ledger frontmatter) and from
 # the run states this file computes; blueprint.md's own comment says so:
-# "drafting | audited | archived -- running/done are computed".
+# "drafting | audited | parked | archived -- running/done are computed".
 # Bounded to the first 40 lines because it is frontmatter: a `status:` further
 # down is prose about a package, not the blueprint's declaration.
+# 08-blueprint-parks: this local reader/gate pair is UNCHANGED by that package.
+# `parked` stays drivable here (fails open, see blueprint_drivable below) --
+# exclusion of a parked blueprint from driving is handled entirely through
+# `_bp_parked($bpdir)` / `%parked` (spec §2.5), never through this function.
 sub blueprint_lifecycle {
     my ($bpdir) = @_;
     open my $fh, '<', "$bpdir/blueprint.md" or return '';
@@ -429,15 +446,23 @@ sub load_inflight {
     return (\@entries, $dirty);
 }
 
+# _bp_parked($bpdir) -> 0|1 (package 08-blueprint-parks, spec §2.5). The ONE
+# parkedness test in this file: 1 iff blueprint.md's own authored status
+# (BpState::bp_meta_get + BpState::norm_bp_status, the same reader
+# _archive_gate already loads BpState for) is 'parked'. No other code in
+# this file names a legacy park file any more -- see _migrate_parks_json,
+# the one remaining reader, which absorbs it into blueprint.md before any of
+# this runs.
+sub _bp_parked {
+    my ($bpdir) = @_;
+    require "$DIR/BpState.pm" unless defined &BpState::norm_bp_status;
+    return (BpState::norm_bp_status(BpState::bp_meta_get("$bpdir/blueprint.md", 'status')) eq 'parked') ? 1 : 0;
+}
+
 # _prune_inflight($data, \@entries) -> $dirty (spec §2.6). Mutates @entries
 # in place (drops terminal-ledger, missing-ledger and parked-blueprint ones).
 sub _prune_inflight {
     my ($data, $entries) = @_;
-    my $dsdir = "$data/.drive-solo";
-    my $parks_raw = _read_json_file("$dsdir/parks.json", $dsdir);
-    my @parks_list = (ref $parks_raw eq 'ARRAY') ? @$parks_raw : ();
-    my %parked = map { $_->{blueprint} => 1 } grep { ref $_ eq 'HASH' && $_->{blueprint} } @parks_list;
-
     my @kept;
     my $dirty = 0;
     for my $e (@$entries) {
@@ -450,7 +475,7 @@ sub _prune_inflight {
         if (!-d $bpdir || !-f "$bpdir/blueprint.md") { $dirty = 1; next; }
         if (blueprint_lifecycle($bpdir) eq 'drafting') { $dirty = 1; next; }
         if (!-f "$bpdir/packages/$pkg.md") { $dirty = 1; next; }
-        if ($parked{$bp})                  { $dirty = 1; next; }
+        if (_bp_parked($bpdir))            { $dirty = 1; next; }
         my $status = ledger_fm($bpdir, $pkg, 'status') // 'pending';
         if (_is_terminal($status))         { $dirty = 1; next; }
         push @kept, $e;
@@ -642,10 +667,18 @@ sub read_state {
     my $order = (ref $order_data eq 'HASH' && ref $order_data->{order} eq 'ARRAY')
               ? $order_data->{order} : undef;
 
-    # parks.json
-    my $parks_raw = _read_json_file("$dsdir/parks.json", $dsdir);
-    my @parks_list = (ref $parks_raw eq 'ARRAY') ? @$parks_raw : ();
-    my %parked = map { $_->{blueprint} => 1 } grep { ref $_ eq 'HASH' && $_->{blueprint} } @parks_list;
+    # parked (package 08-blueprint-parks, spec §2.5): every blueprint in the
+    # order AND in the candidate set (B2a needs candidates not yet in the
+    # order too) whose blueprint.md authors status: parked. A legacy park
+    # file is gone after migration; _bp_parked is the only parkedness test.
+    my %parked;
+    {
+        my %seen;
+        for my $bp (@{ $order // [] }, @$candidate_bps) {
+            next if $seen{$bp}++;
+            $parked{$bp} = 1 if _bp_parked("$bpbase/$bp");
+        }
+    }
 
     # announced.json
     my $ann_data = _read_json_file("$dsdir/announced.json", $dsdir);
@@ -1093,6 +1126,99 @@ sub keepawake_apply {
 }
 
 # ===========================================================================
+# AC-LOSS WATCH WIRING (package 11, tooling-backlog, spec sec 2.5)
+# ===========================================================================
+
+# Set by ac_check() when the phase was `reconnected`; consumed (and
+# cleared) by _encode_action(), which logs RESUMED right before the normal
+# next-action JSON it is about to print -- the one point every return path
+# of _cmd_next already funnels through, so this needs no change to any of
+# the many individual print sites below.
+my $AC_RESUME_DATA;
+
+sub _ac_inflight_list {
+    my ($dsdir) = @_;
+    my $path = "$dsdir/inflight.json";
+    return [] unless -f $path;
+    my $data = eval {
+        open(my $fh, '<:raw', $path) or return undef;
+        local $/;
+        my $raw = <$fh>;
+        close $fh;
+        JSON::PP->new->utf8->decode($raw);
+    };
+    return [] unless ref $data eq 'HASH' && ref $data->{packages} eq 'ARRAY';
+    return [ map { { blueprint => $_->{blueprint}, package => $_->{package} } }
+             grep { ref $_ eq 'HASH' } @{ $data->{packages} } ];
+}
+
+# ac_check($data, $dsdir, $opts) -> \%action | undef. Any failure here (a
+# die, a lock timeout, enabled() false) is swallowed and logged WATCH-ERROR
+# on a best-effort basis; `next` then proceeds exactly as it does today
+# (spec sec 2.5's "whole call wrapped in eval").
+sub ac_check {
+    my ($data, $dsdir, $opts) = @_;
+    $opts = {} unless ref $opts eq 'HASH';
+    my $result;
+    my $ok = eval {
+        require "$DIR/BpAcWatch.pm" unless defined &BpAcWatch::enabled;
+        return 1 unless BpAcWatch::enabled();
+
+        # M2 (fix-batch, redteam-1): a stored "reconnected" phase is only
+        # ever set from an earlier observation -- it can be minutes stale by
+        # the time this `next` call gets around to it. Force a FRESH probe
+        # in that one case (never on the far more common ac/grace/etc. path,
+        # to avoid adding a real probe spawn to every ordinary `next` call)
+        # so a flicker or a fail-open resume that has since reverted to dc
+        # is caught before the director re-asserts the wake-lock on battery.
+        my $prior_status = eval { BpAcWatch::status($data) };
+        my $prior_phase = (ref $prior_status eq 'HASH') ? $prior_status->{phase} : undef;
+        my $force_probe = (defined $prior_phase && $prior_phase eq 'reconnected') ? 1 : 0;
+
+        my %obs_opts = (src => 'director');
+        $obs_opts{force} = 1 if $force_probe;
+        my $obs = BpAcWatch::observe($data, %obs_opts);
+        my $phase = (ref $obs eq 'HASH') ? $obs->{phase} : undef;
+        return 1 unless defined $phase;
+
+        if ($phase eq 'expired' || $phase eq 'standing-down' || $phase eq 'monitoring') {
+            my $inflight = _ac_inflight_list($dsdir);
+            $result = BpAcWatch::standdown_director_side($data,
+                inflight => $inflight,
+                keepawake_settle => sub { keepawake_apply('settled', $dsdir, $opts) },
+            );
+        }
+        elsif ($phase eq 'reconnected') {
+            if ($force_probe && (($obs->{source} // '') eq 'dc')) {
+                # The fresh probe this call just took contradicts the stored
+                # reconnect: do not resume onto battery. Revert to
+                # monitoring and report ac-stand-down again instead.
+                BpAcWatch::revert_reconnect_to_monitoring($data);
+                my $inflight = _ac_inflight_list($dsdir);
+                $result = BpAcWatch::standdown_director_side($data,
+                    inflight => $inflight,
+                    keepawake_settle => sub { keepawake_apply('settled', $dsdir, $opts) },
+                );
+            }
+            else {
+                BpAcWatch::resume_director_side($data);
+                $AC_RESUME_DATA = $data;
+            }
+        }
+        1;
+    };
+    unless ($ok) {
+        my $e = defined $@ ? $@ : 'unknown error';
+        $e =~ s/\n.*//s;
+        eval {
+            require "$DIR/BpAcWatch.pm" unless defined &BpAcWatch::log_event;
+            BpAcWatch::log_event($data, 'director', 'WATCH-ERROR', {}, $e);
+        };
+    }
+    return $result;
+}
+
+# ===========================================================================
 # TOKEN RECOVERY (operator decision 2026-08-12)
 # ===========================================================================
 #
@@ -1183,6 +1309,15 @@ sub _cmd_next {
     my $now    = $opts->{now}->();
     my $dsdir  = "$data/.drive-solo";
     my $verdict_fn = $opts->{verdict};
+
+    # package 11 (tooling-backlog), spec sec 2.5: the AC-loss watch, checked
+    # once, before any keepawake_apply call and before need-order or
+    # usage-gate work.
+    my $ac_result = ac_check($data, $dsdir, $opts);
+    if (defined $ac_result) {
+        print _encode_action($ac_result), "\n";
+        return 0;
+    }
 
     # Parse --scope <spec>
     my $spec = '';
@@ -1891,10 +2026,6 @@ sub _cmd_record_order {
     {
         my $bpbase = "$data/blueprints";
         my %given  = map { $_ => 1 } @$bps;
-        my $parks  = _read_json_file("$dsdir/parks.json", $dsdir);
-        my %parked = map  { $_->{blueprint} => 1 }
-                     grep { ref $_ eq 'HASH' && $_->{blueprint} }
-                     (ref $parks eq 'ARRAY' ? @$parks : ());
 
         my @dropped;
         if (-d $bpbase && opendir(my $dh, $bpbase)) {
@@ -1902,7 +2033,7 @@ sub _cmd_record_order {
                                    && -f "$bpbase/$_/blueprint.md" } readdir $dh;
             closedir $dh;
             for my $bp (@dirs) {
-                next if $given{$bp} || $parked{$bp};
+                next if $given{$bp} || _bp_parked("$bpbase/$bp");
                 my $dag = parse_dag(_read_file("$bpbase/$bp/blueprint.md"));
                 my @live = grep { !_is_terminal(ledger_fm("$bpbase/$bp", $_, 'status') // 'pending') }
                            keys %$dag;
@@ -1913,7 +2044,7 @@ sub _cmd_record_order {
             print STDERR "bp-drive-next record-order: refusing an order that omits blueprint(s) still holding non-terminal packages -- the `next` walk iterates the recorded order, so an omitted blueprint is never driven and the run reports 'done' over work it never looked at:\n";
             print STDERR "  - $_\n" for @dropped;
             print STDERR "Include them in the order, or exclude them deliberately with:\n"
-                       . "  bp-drive-next.pl park <blueprint> <reason...>\n";
+                       . "  bp-drive-next.pl park <blueprint> [--needs-operator] <reason...>\n";
             return 2;
         }
     }
@@ -1924,30 +2055,375 @@ sub _cmd_record_order {
 }
 
 # ===========================================================================
-# SUBCOMMAND: park
+# SUBCOMMAND: park (package 08-blueprint-parks, spec §2.3)
 # ===========================================================================
 
+# REASON_OK($r) -> 1|0 (spec §2.1). After trimming, non-empty, at most 200
+# bytes, and contains none of CR, LF, '|' or '#'. Mirrors bp-blueprint.pl's
+# own _reason_ok — kept as a second, deliberately tiny copy rather than a
+# cross-script require, the same choice this file already makes for every
+# other BpOrch-mirrored pure function.
+sub _reason_ok {
+    my ($r) = @_;
+    return 0 unless defined $r && !ref $r;
+    (my $t = $r) =~ s/\A\s+|\s+\z//g;
+    return 0 unless length $t;
+    return 0 if length($t) > 200;
+    return 0 if $t =~ /[\r\n|#]/;
+    return 1;
+}
+sub _trim_reason { my ($r) = @_; (my $t = $r) =~ s/\A\s+|\s+\z//g; return $t; }
+
+# _run_capturing_stderr(@cmd) -> ($exit, $stderr_text). List-form subprocess
+# (never a shell string); STDERR captured through a real temp file, never an
+# in-memory scalar (Landmine #2). $exit is -1 if the process could not even
+# be started.
+#
+# N6 (review NIT-6): the child's STDOUT is ALSO redirected, to /dev/null (or
+# the Windows equivalent) -- set-meta prints nothing to stdout today, but
+# this is the subprocess the stop gate's "empty stdout means unknown" action
+# JSON contract depends on (spec §5/S3), and a future set-meta stdout line
+# would otherwise land, unredirected, in whatever this process's own STDOUT
+# currently is (the director's own action JSON during `next`'s migration
+# call). Discarding it here removes that latent risk entirely rather than
+# merely capturing it unused.
+sub _run_capturing_stderr {
+    my (@cmd) = @_;
+    require File::Temp;
+    my ($efh, $epath) = File::Temp::tempfile(); close $efh;
+    my $devnull = File::Spec->devnull;
+    open(my $saved_err, '>&', \*STDERR) or return (-1, "cannot dup STDERR: $!");
+    open(my $saved_out, '>&', \*STDOUT) or do {
+        open(STDERR, '>&', $saved_err); close $saved_err;
+        return (-1, "cannot dup STDOUT: $!");
+    };
+    my $rc = -1;
+    if (open(STDERR, '>', $epath) && open(STDOUT, '>', $devnull)) {
+        $rc = system(@cmd);
+    }
+    open(STDERR, '>&', $saved_err); close $saved_err;
+    open(STDOUT, '>&', $saved_out); close $saved_out;
+    my $err = _read_file($epath) // '';
+    unlink $epath;
+    my $exit = ($rc == -1) ? -1 : ($rc >> 8);
+    return ($exit, $err);
+}
+
+# _park_item_open($items, $bp) -> $item|undef: the first OPEN park item for
+# $bp (spec §2.2 step 4's definition, reused by both the director and
+# bp-blueprint.pl's unpark hook): fields.link eq $bp, fields.status eq
+# 'unanswered', title starting "Blueprint $bp parked:".
+sub _park_item_open {
+    my ($items, $bp) = @_;
+    for my $it (@$items) {
+        next unless ref $it eq 'HASH';
+        next unless defined $it->{fields}{link}   && $it->{fields}{link}   eq $bp;
+        next unless defined $it->{fields}{status} && $it->{fields}{status} eq 'unanswered';
+        next unless defined $it->{fields}{title}  && $it->{fields}{title}  =~ /^Blueprint \Q$bp\E parked:/;
+        return $it;
+    }
+    return undef;
+}
+
 sub _cmd_park {
-    my ($bp, $reason, $opts) = @_;
+    my ($bp, $reason, $needs_operator, $opts) = @_;
     my $data  = $opts->{data_dir} or die "bp-drive-next: data_dir required\n";
-    my $now   = $opts->{now}->();
     my $dsdir = "$data/.drive-solo";
-    make_path($dsdir) unless -d $dsdir;
+    # No make_path here: every validation refusal below (B20) must leave
+    # the data dir byte-for-byte untouched, including no .drive-solo/ at
+    # all when it did not already exist. _append_run_log creates it lazily,
+    # only on the PARK line this function logs after a real write.
 
-    my $parks_raw = _read_json_file("$dsdir/parks.json");
-    my @parks = (ref $parks_raw eq 'ARRAY') ? @$parks_raw : ();
-
-    # Idempotent: check if bp already parked (EC-2)
-    my $already = grep { ref $_ eq 'HASH' && ($_->{blueprint} // '') eq $bp } @parks;
-    if ($already) {
-        # Re-park is structural no-op: do NOT add a second entry, do NOT log to run.md (B8 / EC-2)
-        return 0;
+    # M1/SF-2/L5 (redteam-1): validate the name BEFORE any filesystem check
+    # that could be satisfied by a path-traversal segment (`../../victim`).
+    # Reuses `_valid_name`, the same grammar already used for an
+    # inflight.json blueprint entry, plus a length cap -- this also closes
+    # L5 (an invalid name under --needs-operator used to park first and only
+    # fail at filing time, looping on exit 3 forever on every retry).
+    unless (_valid_name($bp) && length($bp) <= 128) {
+        print STDERR "bp-drive-next park: '$bp' is not a valid blueprint name "
+                    . "(expected alnum start, then alnum/./_/-, at most 128 bytes)\n";
+        return 2;
     }
 
-    push @parks, { blueprint => $bp, reason => $reason, at => $now };
-    _write_json_atomic("$dsdir/parks.json", \@parks);
-    _append_run_log($dsdir, "PARK $bp — $reason");
+    # Validation (spec §2.3 step 4, exit 2, nothing written).
+    my $bpdir = "$data/blueprints/$bp";
+    my $bpmd  = "$bpdir/blueprint.md";
+    unless (-f $bpmd) {
+        print STDERR "bp-drive-next park: no such blueprint '$bp' (no $bpmd)\n";
+        return 2;
+    }
+    require "$DIR/BpState.pm" unless defined &BpState::norm_bp_status;
+    my $authored = BpState::norm_bp_status(BpState::bp_meta_get($bpmd, 'status'));
+    if ($authored eq 'archived') {
+        print STDERR "bp-drive-next park: '$bp' is archived; refusing to park an archived blueprint\n";
+        return 2;
+    }
+
+    my $root;
+    if ($needs_operator) {
+        (my $norm = $data) =~ s{\\}{/}g;
+        $norm =~ s{/+\z}{};
+        unless ($norm =~ m{^(.+)/\.ccpraxis-local-data\z} && -d "$1/.ccpraxis-local-data") {
+            print STDERR "bp-drive-next park: --needs-operator requires the data dir to be "
+                        . "<project>/.ccpraxis-local-data; got $data\n";
+            return 2;
+        }
+        $root = $1;
+        my $inbox_pl = "$DIR/../../almanac/scripts/almanac-inbox.pl";
+        my $load_ok = eval { require $inbox_pl; 1 };
+        unless ($load_ok) {
+            (my $msg = $@) =~ s/\s+\z//;
+            print STDERR "bp-drive-next park: --needs-operator requires the inbox library "
+                        . "($inbox_pl), which failed to load: $msg\n";
+            return 2;
+        }
+    }
+
+    # Write (spec §2.3 step 5): already parked -> write nothing, log nothing
+    # (EC-2, the first reason wins). Otherwise a list-form bp-blueprint.pl
+    # set-meta subprocess.
+    if ($authored ne 'parked') {
+        my ($exit, $err) = _run_capturing_stderr(
+            $^X, "$DIR/bp-blueprint.pl", 'set-meta', '--file', $bpmd,
+            '--field', 'status', '--value', 'parked', '--reason', $reason);
+        if ($exit != 0) {
+            print STDERR $err if length $err;
+            print STDERR "bp-drive-next park: could not park '$bp' (bp-blueprint.pl set-meta exited $exit)\n"
+                unless length $err;
+            return 2;
+        }
+        # MF-1/M3 (redteam-1): set-meta exiting 0 is not proof the fenced
+        # `status:` line actually changed -- a fence-scoping defect in the
+        # rewrite could leave blueprint.md reading as unparked while this
+        # function reports success and logs PARK. Re-check with the same
+        # reader the rest of the director trusts before logging anything.
+        unless (_bp_parked($bpdir)) {
+            print STDERR "bp-drive-next park: set-meta exited 0 for '$bp' but it does not read as "
+                        . "parked afterwards; refusing to log PARK\n";
+            return 2;
+        }
+        _append_run_log($dsdir, "PARK $bp — $reason");
+    }
+
+    # needs-operator (spec §2.3 step 6): file one item, unless one is already
+    # open. Exit 3 on a filing failure -- the status stays parked either way.
+    if ($needs_operator) {
+        my $filed_item;
+        my $ok = eval {
+            my $items = Almanac::Inbox::list_items(root => $root);
+            unless (_park_item_open($items, $bp)) {
+                $filed_item = Almanac::Inbox::file(root => $root, title => "Blueprint $bp parked: $reason",
+                    link => $bp,
+                    body => "Unpark with: bp-blueprint.pl set-meta --file $bpmd --field status --value audited\n");
+            }
+            1;
+        };
+        unless ($ok) {
+            (my $msg = $@) =~ s/\s+\z//;
+            print STDERR "bp-drive-next park: could not file the inbox item for '$bp': $msg\n";
+            print STDERR "'$bp' is already parked; re-run the same command to retry filing it.\n";
+            return 3;
+        }
+
+        # L4(c) (redteam-1): an unpark can race in between the set-meta write
+        # above and this filing. Nothing else will ever close an item filed
+        # for a blueprint that is no longer parked (the unpark hook only
+        # fires on a status write LEAVING parked, and none happened here) --
+        # so re-check and close it ourselves rather than leave it orphaned.
+        # Best-effort: a failure here just leaves the pre-existing race
+        # window open, no worse than before this check.
+        if (defined $filed_item && !_bp_parked($bpdir)) {
+            eval {
+                Almanac::Inbox::open_inbox(root => $root)->update($filed_item->{id},
+                    expect => { rev => $filed_item->{rev}, fields => $filed_item->{fields} },
+                    set    => { status => 'answered',
+                                closed_at => strftime('%Y-%m-%dT%H:%M:%SZ', gmtime(CORE::time())),
+                                closed_reason => "blueprint $bp was unparked concurrently with this --needs-operator filing",
+                                closed_by => 'bp-drive-next.pl park' });
+            };
+        }
+    }
+
     return 0;
+}
+
+# ===========================================================================
+# _migrate_parks_json (spec §2.4): absorbs a legacy park file, if one exists,
+# into every listed blueprint's own blueprint.md as status: parked. Runs
+# from run() BEFORE every subcommand. The legacy file is removed only once
+# every listed entry is migrated -- a migration failure leaves it untouched
+# and fails the WHOLE call closed (exit 2, empty stdout), per this package's
+# self-modification safety constraint (spec §5): one of "the legacy file is
+# gone and blueprint.md is the whole truth" or "the director refuses to act"
+# always holds, never a mix. This function is the ONLY place in this file --
+# and, per the static check this package adds, the only place outside
+# tests/ in the whole plugin tree -- that names the legacy file by its
+# literal filename.
+# ===========================================================================
+
+sub _sanitize_migrate_reason {
+    my ($r) = @_;
+    $r = (defined $r && !ref $r) ? $r : '';
+    $r =~ s/[\r\n|#]/ /g;
+    $r =~ s/\s+/ /g;
+    $r =~ s/\A\s+|\s+\z//g;
+    if (length($r) > 200) {
+        $r = substr($r, 0, 200);
+        # N1 (review NIT-1): back off an INCOMPLETE trailing UTF-8 sequence
+        # only -- never a COMPLETE one that merely happens to end exactly on
+        # the 200-byte boundary. The previous version always stripped any
+        # trailing continuation run plus the lead byte before it, which lost
+        # a whole, perfectly valid character whenever the cut landed cleanly
+        # (spec E6 only requires never SPLITTING a character, not discarding
+        # one gratuitously). Scan back at most 3 bytes (the longest lead-byte
+        # distance for a 4-byte sequence) to find the nearest non-
+        # continuation byte, then compare how many continuation bytes
+        # actually follow it to how many its own high bits declare.
+        my $len = length($r);
+        for my $back (1 .. 3) {
+            last if $back > $len;
+            my $pos = $len - $back;
+            my $b = ord(substr($r, $pos, 1));
+            next if ($b & 0xC0) == 0x80;   # a continuation byte -- keep scanning back
+            my $expect = ($b & 0xF8) == 0xF0 ? 3
+                       : ($b & 0xF0) == 0xE0 ? 2
+                       : ($b & 0xE0) == 0xC0 ? 1
+                       : 0;
+            my $have = $back - 1;          # continuation bytes actually present after it
+            $r = substr($r, 0, $pos) if $expect > 0 && $have < $expect;
+            last;                           # found the nearest lead/ASCII byte; stop
+        }
+    }
+    return length($r) ? $r : '(no reason recorded)';
+}
+
+# _migrate_parks_json($data, $dsdir, $opts) -> @failures (empty = ok).
+sub _migrate_parks_json {
+    my ($data, $dsdir, $opts) = @_;
+    my $file = "$dsdir/parks.json";
+    return () unless -e $file;
+
+    # Decoded WITH ->utf8 (unlike every other JSON reader in this file): the
+    # legacy file may carry a reason with real non-ASCII content (spec §2.4
+    # step 2/E6), and only a semantic UTF-8 decode here, paired with an
+    # explicit re-encode back to bytes below before the reason reaches argv,
+    # round-trips it byte-for-byte. Decoding as plain octets (this file's
+    # usual `_read_json_file`) would upgrade each raw UTF-8 byte to its OWN
+    # codepoint instead, which a subprocess call then mangles on the way out.
+    # M2 (redteam-1): _read_file returning undef is a READ failure (EACCES, a
+    # sharing violation), not evidence the file is corrupt -- fail closed
+    # (a migration failure for the whole call) rather than moving aside a
+    # file nothing actually looked at.
+    my $raw = _read_file($file);
+    return ("could not read $file: $!") unless defined $raw;
+
+    my $decoded = eval { JSON::PP->new->utf8->decode($raw) };
+    my $octet_fallback = 0;
+    if ($@ || ref($decoded) ne 'ARRAY') {
+        # M2 (redteam-1): a valid-JSON parks.json holding non-UTF-8 bytes (a
+        # raw CP1252 byte in a reason, say) croaks under ->utf8. The OLD
+        # reader (_read_json_file) decoded without ->utf8 (octet semantics)
+        # and the old writer wrote raw argv bytes back verbatim, so such a
+        # file was an EFFECTIVE park under the old code. Retry with octet
+        # semantics before concluding the file is corrupt; only the
+        # "moved aside" conclusion loses parks the old code honoured.
+        my $octet_decoded = eval { JSON::PP->new->decode($raw) };
+        if (!$@ && ref($octet_decoded) eq 'ARRAY') {
+            $decoded = $octet_decoded;
+            $octet_fallback = 1;
+        }
+    }
+    if (ref($decoded) ne 'ARRAY') {
+        my $moved = "$dsdir/parks.json.corrupt-" . $opts->{now}->();
+        unless (rename($file, $moved)) {
+            return ("could not move aside corrupt parks.json to $moved: $!");
+        }
+        _append_run_log($dsdir, "WARN PARKS-MIGRATE: $file is not a JSON array; moved aside to $moved");
+        return ();
+    }
+
+    require "$DIR/BpState.pm" unless defined &BpState::norm_bp_status;
+
+    my ($parked_now, @failures) = (0);
+    for my $entry (@$decoded) {
+        next unless ref $entry eq 'HASH';
+        my $bp = $entry->{blueprint};
+        next unless defined $bp && !ref $bp && length $bp;
+
+        # M1/SF-2 (redteam-1): an entry naming a path-traversal segment
+        # (`../../victim`) must not reach the filesystem checks below. Skip
+        # and log it, same as any other unmigratable entry -- it does not
+        # fail the whole migration (spec §2.4 step 3's existing skip shape).
+        unless (_valid_name($bp) && length($bp) <= 128) {
+            _append_run_log($dsdir, "PARKS-MIGRATE skip $bp: invalid blueprint name");
+            next;
+        }
+
+        my $bpmd = "$data/blueprints/$bp/blueprint.md";
+        unless (-f $bpmd) {
+            _append_run_log($dsdir, "PARKS-MIGRATE skip $bp: no live blueprint");
+            next;
+        }
+        my $authored = BpState::norm_bp_status(BpState::bp_meta_get($bpmd, 'status'));
+        if ($authored eq 'archived') {
+            _append_run_log($dsdir, "PARKS-MIGRATE skip $bp: archived");
+            next;
+        }
+        next if $authored eq 'parked';   # already parked -- ok, no write, no re-log
+
+        # Re-encode the decoded (character) reason back to raw bytes before
+        # it goes anywhere near argv or _sanitize_migrate_reason's
+        # byte-counting (spec §2.4 step 2) -- an ASCII-only reason round-trips
+        # through this as a no-op either way. M2 (redteam-1): when the whole
+        # file was decoded under the OCTET fallback above, JSON::PP still
+        # hands back a utf8-FLAGGED Perl string whose codepoints are each
+        # 0-255 and equal the original raw byte values one-for-one (octet
+        # decoding never produces a codepoint above 255) -- it is NOT already
+        # a byte string. encode_utf8 would re-encode it as real UTF-8 (one
+        # codepoint like U+00E9 becomes the TWO bytes 0xC3 0xA9), corrupting
+        # it a second time; the correct downgrade is iso-8859-1/latin1, which
+        # maps each 0-255 codepoint back to its identical single raw byte.
+        my $reason_bytes = $entry->{reason};
+        $reason_bytes = (defined $reason_bytes && !ref $reason_bytes)
+            ? ($octet_fallback ? Encode::encode('iso-8859-1', $reason_bytes) : Encode::encode_utf8($reason_bytes))
+            : '';
+        my $reason = _sanitize_migrate_reason($reason_bytes);
+        my ($exit, $err) = _run_capturing_stderr(
+            $^X, "$DIR/bp-blueprint.pl", 'set-meta', '--file', $bpmd,
+            '--field', 'status', '--value', 'parked', '--reason', $reason);
+        if ($exit != 0) {
+            (my $msg = $err) =~ s/\s+\z//;
+            push @failures, "could not park $bp during parks.json migration"
+                           . (length($msg) ? ": $msg" : '');
+            next;
+        }
+        # MF-1/M3 (redteam-1): re-check, same as _cmd_park -- set-meta exiting
+        # 0 is not proof the fenced status line actually changed. Treat a
+        # mismatch as a migration failure for this entry so the file is kept
+        # (not unlinked) rather than silently losing the park.
+        unless (_bp_parked("$data/blueprints/$bp")) {
+            push @failures, "$bp: set-meta exited 0 during migration but it does not read as parked afterwards";
+            next;
+        }
+        $parked_now++;
+    }
+
+    return @failures if @failures;
+
+    unless (unlink($file) || $!{ENOENT}) {
+        return ("could not remove $file after migration: $!");
+    }
+    # N2 (review NIT-2): "skipped" here is everything this call did NOT park
+    # just now -- it lumps together entries already parked (no write needed,
+    # arguably a success) with entries genuinely skipped (no live blueprint,
+    # archived, invalid name, not a hash/no blueprint key). No test or
+    # consumer distinguishes these sub-counts today; documenting the lumped
+    # meaning here is the cheapest correct fix rather than growing the
+    # loop's bookkeeping for a line only run.md shows.
+    my $skipped = scalar(@$decoded) - $parked_now;
+    _append_run_log($dsdir, "PARKS-MIGRATED $parked_now parked, $skipped skipped");
+    return ();
 }
 
 # ===========================================================================
@@ -1956,6 +2432,20 @@ sub _cmd_park {
 
 sub _encode_action {
     my ($action) = @_;
+    # package 11 (tooling-backlog), spec sec 2.5: after a resume, the
+    # director logs RESUMED with the first normal action's name, right
+    # before printing it. Every _cmd_next return path funnels through this
+    # one function, so this is the single point that needs to know.
+    if (defined $AC_RESUME_DATA) {
+        my $d = $AC_RESUME_DATA;
+        $AC_RESUME_DATA = undef;
+        eval {
+            require "$DIR/BpAcWatch.pm" unless defined &BpAcWatch::log_event;
+            my $name = (ref $action eq 'HASH' && defined $action->{action}) ? $action->{action} : '-';
+            BpAcWatch::log_event($d, 'director', 'RESUMED', { first_action => $name },
+                'resume complete; reporting the first normal action');
+        };
+    }
     # We need JSON null for until_epoch when undef.
     # JSON::PP->new->canonical handles undef → null correctly.
     return JSON::PP->new->canonical->encode($action);
@@ -1982,7 +2472,7 @@ Stateless-from-disk: every `next` recomputes from ledgers + <data>/.drive-solo/.
 USAGE
   bp-drive-next.pl next --scope <spec>
   bp-drive-next.pl record-order <bp> [<bp> …]
-  bp-drive-next.pl park <blueprint> <reason…>
+  bp-drive-next.pl park <blueprint> [--needs-operator] <reason…>
   bp-drive-next.pl --help
 
 SUBCOMMANDS
@@ -1991,8 +2481,8 @@ SUBCOMMANDS
       <spec> = one blueprint name | comma/space list of names | "all" (or empty) = all audited blueprints. <spec> resolves mechanically to the candidate SET and is used ONLY for need-order candidates; once order.json exists it is the authoritative scope+order and --scope is ignored.
   record-order <bp> [<bp> …]
       Persist the SESSION-judged blueprint order to order.json. The director never invents order — it only persists and serves it.
-  park <blueprint> <reason…>
-      Record a blueprint-level park (idempotent) to parks.json and log it. A parked blueprint is settled: never driven, excluded from every pending list.
+  park <blueprint> [--needs-operator] <reason…>
+      Write status: parked and the reason into the blueprint's own blueprint.md (idempotent, via bp-blueprint.pl set-meta) and log it. A parked blueprint is settled: never driven, excluded from every pending list. --needs-operator also files one inbox item linked to the blueprint; unparking (bp-blueprint.pl set-meta --field status --value <audited|drafting|archived>) closes that item.
 
 NEXT-ACTION JSON  (exactly one per `next`)
   {"action":"need-order","candidates":[…]}          no order yet; session must judge+record
@@ -2003,6 +2493,7 @@ NEXT-ACTION JSON  (exactly one per `next`)
   {"action":"blueprint-done","blueprint":B,"pending":[…],"archived":true|false,"archive_detail":"…"} B settled; pending = remaining bps to re-eval; archived/archive_detail report the director's own single-blueprint archive attempt (reuses bp-lifecycle.pl reconcile --archive)
   {"action":"in-flight","blueprint":B,"packages":[…],"running":[…]} nothing dispatchable right now, but B still holds non-terminal packages (typically owned by a concurrent worker). NOT completion: stopping here kills the run mid-package.
   {"action":"done","denials":N}                      every in-scope blueprint is done-or-parked; N = cumulative auto-mode denial count (never-halt Decision 9; see `bp-denials summary` for a breakdown)
+  {"action":"ac-stand-down","reason":"ac-loss","on_battery_since_iso":…,"grace_expired_iso":…,"inflight":[…],"monitor_live":true|false,"log":…} package 11 (tooling-backlog): AC power lost past the 5-minute grace period; stand down, disarm continuity, release the wake-lock and run bp-ac-watch.pl monitor
 
   Keep-awake is a director-managed SIDE EFFECT (started when work is runnable or a timed auto-resume is pending; stopped when settled) — never an action.
 
@@ -2015,7 +2506,6 @@ GOVERNOR VERDICT CONSUMED  (from bp-usage-gate.pl verdict — pkg-02)
 
 STATE  (<data>/.drive-solo/, all director-owned)
   order.json      {"order":[…],"recorded_at":<epoch>}
-  parks.json      [{"blueprint":…,"reason":…,"at":<epoch>}, …]
   announced.json  {"announced":[…]}   blueprints whose blueprint-done already fired
   inflight.json   {"packages":[{"blueprint":…,"package":…,"ledger":…,"since":<epoch>}],
                   "updated_at":<epoch>}   the project-level in-flight set: added on run-package, pruned once its ledger turns terminal. Concurrent hand-out (a further ready package disjoint from every in-flight write set) is unconditional.
@@ -2062,7 +2552,7 @@ sub _resolve_data_dir {
 my $USAGE = <<'END_USAGE';
 usage: bp-drive-next.pl next --scope <spec>
        bp-drive-next.pl record-order <bp> [<bp> ...]
-       bp-drive-next.pl park <blueprint> <reason...>
+       bp-drive-next.pl park <blueprint> [--needs-operator] <reason...>
        bp-drive-next.pl --help
 END_USAGE
 
@@ -2071,9 +2561,11 @@ END_USAGE
 # element right after --scope is consumed as its value only when it exists
 # and does not itself start with '-' (otherwise --scope's value is '' and
 # that next element is validated on its own, same as the old silent-ignore
-# parse used to leave for _cmd_next). `record-order` and `park` define no
-# options at all, so ANY element starting with '-' is rejected -- including
-# a `park` reason word typed unquoted with a leading dash (Q4).
+# parse used to leave for _cmd_next). `record-order` defines no options at
+# all, so ANY element starting with '-' is rejected. `park` defines exactly
+# one option, the bare token --needs-operator, in any position after the
+# subcommand (spec §2.3); any other element starting with '-' is rejected --
+# including a `park` reason word typed unquoted with a leading dash (Q4).
 sub _reject_unknown_options {
     my ($sub, $argv) = @_;
     my @a = @$argv;
@@ -2089,6 +2581,14 @@ sub _reject_unknown_options {
             }
             return $o if $o =~ /^-/;
             $i++;
+        }
+        return undef;
+    }
+
+    if ($sub eq 'park') {
+        for my $o (@a) {
+            next if $o eq '--needs-operator';
+            return $o if $o =~ /^-/;
         }
         return undef;
     }
@@ -2133,6 +2633,32 @@ sub run {
         print STDERR "bp-drive-next $sub: unknown option '$bad'\n";
         print STDERR $USAGE;
         return 2;
+    }
+
+    # park's own argument shape (spec §2.3 step 1): --needs-operator in any
+    # position, then <blueprint>, then the reason (join of what remains).
+    # REASON_OK is checked here too -- BEFORE any data-root resolution or
+    # migration, so a bad reason never shells out or writes anything.
+    my ($park_bp, $park_reason, $park_needs_operator);
+    if ($sub eq 'park') {
+        $park_needs_operator = 0;
+        my @filtered;
+        for my $a (@argv) {
+            if ($a eq '--needs-operator') { $park_needs_operator = 1; next; }
+            push @filtered, $a;
+        }
+        $park_bp     = shift @filtered;
+        $park_reason = join(' ', @filtered);
+        unless (defined $park_bp && length $park_bp) {
+            print STDERR "bp-drive-next park: blueprint name required\n";
+            return 2;
+        }
+        unless (_reason_ok($park_reason)) {
+            print STDERR "bp-drive-next park: reason must be non-empty, at most 200 bytes, "
+                        . "and contain none of CR, LF, '|' or '#'\n";
+            return 2;
+        }
+        $park_reason = _trim_reason($park_reason);
     }
 
     # Inject production defaults for each seam. data_dir is PROJECT-anchored
@@ -2207,18 +2733,42 @@ sub run {
         # defaults are real; that is the point of them living in one place.)
     );
 
+    # _migrate_parks_json (spec §2.4): runs from run(), AFTER the data-root
+    # check and BEFORE dispatch to _cmd_next / _cmd_record_order / _cmd_park
+    # -- no subcommand reads director state before this. Self-modification
+    # safety (spec §5): on failure, print to STDERR, nothing on STDOUT, and
+    # return 2 -- never drive anything over a half-migrated legacy park file.
+    {
+        # No make_path here: a data dir with no legacy park file (the
+        # steady state for every B20 refusal fixture) must leave NO trace
+        # at all -- _migrate_parks_json's own -e check short-circuits
+        # before touching .drive-solo/, and _append_run_log creates it
+        # lazily only when there is something real to log.
+        my $dsdir = "$data_dir/.drive-solo";
+        my @fail = _migrate_parks_json($data_dir, $dsdir, \%full_opts);
+        if (@fail) {
+            print STDERR "bp-drive-next: legacy park migration failed -- nothing driven:\n";
+            print STDERR "  - $_\n" for @fail;
+            # Redteam L2 (cheap half): this stalls every subsequent call on
+            # every blueprint until the cause is fixed, with no other signal
+            # (exit 2, empty stdout, by design -- spec §5/B17). Point at
+            # repairing or removing the offending entry (named above) in the
+            # legacy park file under $dsdir, so an unattended run's operator
+            # is not left guessing. (The legacy file's own name is a literal
+            # string AC5 confines to _migrate_parks_json's body, so it is not
+            # repeated here -- see that sub's failure messages above.)
+            print STDERR "Repair or remove the offending entry (named above) in the legacy park file "
+                        . "under $dsdir, then retry -- each entry is migrated independently and idempotently.\n";
+            return 2;
+        }
+    }
+
     if ($sub eq 'next') {
         return _cmd_next(\@argv, \%full_opts);
     } elsif ($sub eq 'record-order') {
         return _cmd_record_order(\@argv, \%full_opts);
-    } else {    # $sub eq 'park' — the only remaining option per the guard above
-        my $bp     = shift @argv;
-        my $reason = join(' ', @argv);
-        unless (defined $bp && length $bp) {
-            print STDERR "bp-drive-next park: blueprint name required\n";
-            return 2;
-        }
-        return _cmd_park($bp, $reason, \%full_opts);
+    } else {    # $sub eq 'park'
+        return _cmd_park($park_bp, $park_reason, $park_needs_operator, \%full_opts);
     }
 }
 

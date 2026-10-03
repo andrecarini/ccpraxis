@@ -68,6 +68,7 @@ and `runs/<pkg>.force-stop`.
 | hooks.json | Notification | permission_prompt | record-prompt.sh |
 | hooks.json | PermissionDenied | (none) | record-denial.sh |
 | hooks.json | PreToolUse | (none) | denial-breaker.sh |
+| hooks.json | PreToolUse | (none) | ac-standdown-gate.sh |
 | hooks.json | PostToolUse | (none) | denial-breaker.sh |
 | hooks.json | PostToolUseFailure | (none) | denial-breaker.sh |
 | hooks.json | SessionStart | (none) | denial-breaker.sh |
@@ -75,7 +76,7 @@ and `runs/<pkg>.force-stop`.
 | hooks.json | SessionStart | (none) | session-start-nudge.sh |
 | settings.json | PreToolUse | Bash | guard-git-mutations.sh (sec 2.2 settings form) |
 
-This is 26 hooks.json commands and 1 settings.json command, every one in the guarded registration form
+This is 27 hooks.json commands and 1 settings.json command, every one in the guarded registration form
 of spec 16's section 2.2 (`unset BASH_ENV; f=...; w=.../run-hook.sh; [ -f "$f" ] && [ -f "$w" ] || exit 0;
 bash -n "$f" && bash -n "$w" || exit 0; exec env -u SHELLOPTS bash "$f"`), so a missing or broken script
 or wrapper never blocks (RT-M1), and neither BASH_ENV nor SHELLOPTS reach the hook's own bash (RT-L7).
@@ -149,6 +150,10 @@ reason: Package 16 flattened this file from the pre-cutover staging tree's guard
 ### file: wait-shape-guard.sh
 verdict: keep
 reason: Package 16 flattened this file from the pre-cutover staging tree's guards sub-batch; it still denies the four polling pathologies for coordinators, with the repeat detector folded in from package 14's build.
+
+### file: ac-standdown-gate.sh
+verdict: keep
+reason: Package 11 (tooling-backlog) added this file; it denies every subagent tool call while an AC-loss stand-down is active, registered with no matcher so it runs for every tool. Exempts `SendMessage` and `SubagentHandback` (fix-batch H2) so a denied worker can still deliver the report its own denial text asks for -- the same two tools `BpHook::DenialBreaker`'s `@CLASSIFIER_EXEMPT_TOOLS` already exempts, for the identical reason. A marker older than `BpAcWatch::STALE_AFTER` (30 minutes) with no live monitor self-heals to phase `ac` instead of refusing forever (fix-batch H3).
 
 ### registration: hooks.json PreToolUse [Bash] guard-bash.sh
 verdict: keep
@@ -249,6 +254,10 @@ reason: Added by never-halt package 07; a deny-only circuit breaker that refuses
 ### registration: hooks.json PreToolUse [] denial-breaker.sh
 verdict: keep
 reason: Registered without a matcher in the guarded 2.2 form; it denies or abstains, never emits a decision on stdout.
+
+### registration: hooks.json PreToolUse [] ac-standdown-gate.sh
+verdict: keep
+reason: Package 11 (tooling-backlog) added this registration with no matcher, so every tool call is checked, but the acstanddown env-only atom keeps it a pure bash no-op (no perl spawn) whenever the stand-down marker is absent.
 
 ### registration: hooks.json PostToolUse [] denial-breaker.sh
 verdict: keep
@@ -1172,6 +1181,7 @@ next fork dispatch, and the guard denies again after it. Decision 3 applies thro
 | denial-breaker.sh | 3 | --pre ledger,driver : exits when BP_LEDGER is unset and the session is not an armed driver |
 | arm-nudge-prompt.sh | 1 | no run-hook.sh and no --pre (pure bash, never starts perl) : exits when BP_LEDGER is set, the payload is not a main-thread UserPromptSubmit, or the prompt is a task-notification |
 | session-start-nudge.sh | 1 | --pre armed : exits when armed/<session_id> is absent |
+| ac-standdown-gate.sh | 2 | --pre acstanddown : exits when the AC-loss stand-down marker is absent (env-only, no session file read) |
 
 **Who each rule applies to.** A fork counts as a subagent everywhere.
 
