@@ -32,7 +32,7 @@ open  ->  triaging  ->  scheduled  ->  fixed | dropped
  +-------------------->  dropped     (with a reason)
 ```
 
-`triaging -> dropped` is also legal — a report can be declined without ever being scheduled.
+`triaging -> dropped` is also legal — a report can be dropped without ever being scheduled.
 
 ```bash
 perl "${CLAUDE_PLUGIN_ROOT}/scripts/almanac.pl" bug set-status <id> --to triaging

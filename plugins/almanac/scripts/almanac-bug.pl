@@ -731,6 +731,22 @@ sub link_root {
     return report_root($report_path);
 }
 
+# FIX (fixbatch-1, redteam M1 / reviewer S1): a relative --project used to be
+# stored byte-for-byte as package_root, so later resolution (link_root ->
+# PackageLink::resolve) depended on whoever's cwd happened to be current at
+# call time -- a report could get marked fixed against the WRONG project's
+# ledger simply because the next caller's cwd differed from the one that
+# scheduled it. Resolve to an absolute path at the point of writing, same as
+# the CLI's own backslash/trailing-slash normalisation, and keep the bytes
+# (never re-encode -- the André landmine) rather than falling back silently.
+sub _abs_root {
+    my ($root) = @_;
+    return $root unless defined $root && length $root;
+    (my $r = $root) =~ s{\\}{/}g;
+    $r =~ s{/+$}{};
+    return Cwd::abs_path($r) // $r;
+}
+
 # package_verdict(\%fields, $report_path) -> undef | \%v -- spec sec 2.3.
 # undef unless the report's status is 'scheduled'.
 sub package_verdict {
@@ -915,7 +931,7 @@ sub _reconcile_report {
         if (defined $link) {
             $f{status} = 'scheduled';
             $f{package} = $link;
-            $f{package_root} = $root;
+            $f{package_root} = _abs_root($root);
             $f{scheduled_at} = $now;
             $f{migrated_from} = 'taken';
             $changed = 1;
@@ -1200,8 +1216,27 @@ unless (caller) {
         # Latent until 2026-08-29, because every flag in this CLI happened to be
         # written with a value after it. `--replace` and `--repair` are the
         # first booleans, and t/04 caught it immediately.
+        # FIX (fixbatch-1, redteam H1): an unrecognised `--opt=value` form used
+        # to fall through to the `else` branch as a bare positional, silently
+        # dropped, and a bare `--root` used to be accepted and stored under
+        # $o{root}, which nothing ever reads -- the automatic reconcile a few
+        # lines down then ran against the cwd/CLAUDE_PROJECT_DIR fallback with
+        # no indication the caller's intended root was ignored. `--root` is
+        # every sibling almanac script's (and almanac-doctor.pl's) root flag,
+        # so this is the natural mistake, and it is no longer silent: either
+        # form now refuses with exit 2 BEFORE the automatic reconcile runs.
+        if ($a =~ /^--([a-z0-9-]+)=/) {
+            print STDERR "almanac-bug: unrecognised option '$a' -- use '--$1 <value>' "
+                . "(space-separated), not '--$1=value'\n";
+            exit 2;
+        }
         if ($a =~ /^--([a-z0-9-]+)$/) {
             my $key = $1;
+            if ($key eq 'root') {
+                print STDERR "almanac-bug: --root is not a recognised option for this script -- "
+                    . "use --project instead\n";
+                exit 2;
+            }
             $o{$key} = (@ARGV && $ARGV[0] !~ /^--/) ? shift @ARGV : 1;
         }
         else { $o{_pos} ||= []; push @{$o{_pos}}, $a }
@@ -1613,7 +1648,7 @@ unless (caller) {
         $f{resolution} = $o{note}   if defined $o{note} && !ref $o{note};
         if ($to eq 'scheduled') {
             $f{package}      = $pkg_link;
-            $f{package_root} = $root;
+            $f{package_root} = AlmanacBug::_abs_root($root);
             $f{scheduled_at} = $now;
         }
 
@@ -1859,19 +1894,56 @@ unless (caller) {
                 my $v = AlmanacBug::package_verdict($f, $p);
                 if ($v && grep { $v->{verdict} eq $_ } qw(invalid missing done parked dropped)) {
                     $row{package_problem} = $v->{verdict};
-                    $row{_flag_text} = AlmanacBug::flag_text(
-                        kind => $v->{verdict}, id => $f->{id}, link => $v->{link}, root => $v->{root});
+                    # FIX (fixbatch-1, reviewer N2): reconcile always skips a
+                    # tampered report, so the DONE hint's "run: ... reconcile"
+                    # can never actually do anything for one -- suppress it
+                    # and let the TAMPERED line above (already printed from
+                    # $row{integrity}) be the only, actionable advice.
+                    unless ($v->{verdict} eq 'done' && defined $integrity) {
+                        # FIX (fixbatch-1, reviewer S2): spec 2.8 defines <R> in
+                        # `reconcile --project "<R>"` as the REPORT's own root,
+                        # not the linked package's root ($v->{root}, i.e.
+                        # package_root) -- those can differ, and substituting
+                        # the wrong one prints a reconcile command that will
+                        # never touch this report. `missing` is unaffected and
+                        # keeps using $v->{root}, which is correct for it.
+                        my $hint_root = $v->{verdict} eq 'done'
+                            ? AlmanacBug::report_root($p) : $v->{root};
+                        $row{_flag_text} = AlmanacBug::flag_text(
+                            kind => $v->{verdict}, id => $f->{id}, link => $v->{link},
+                            root => $hint_root);
+                    }
                 }
             }
             elsif (($f->{status}//'') eq 'fixed' || ($f->{status}//'') eq 'dropped') {
                 $row{package} = $f->{package} if defined $f->{package};
             }
             elsif (($f->{status}//'') eq 'taken') {
-                my (undef, $reason) = AlmanacBug::migration_link($f, $root);
-                if (defined $reason) {
-                    $row{unmigrated} = $reason;
+                # FIX (fixbatch-1, reviewer S3): a `taken` report that lives in
+                # a DIFFERENT project than the one this run's $root is scoped
+                # to can never be migrated by any reconcile call -- its own
+                # project's reconcile would resolve the note correctly and
+                # flag it there, but this run (e.g. `collect` scanning many
+                # projects) would silently accept whatever migration_link($f,
+                # $root) says, which is resolved against the WRONG tree. Flag
+                # it unconditionally on a project mismatch, regardless of what
+                # migration_link reports, per the reviewer's minimal fix.
+                my $report_project_root = AlmanacBug::report_root($p);
+                if (defined $report_project_root && defined $root
+                        && $report_project_root ne $root) {
+                    $row{unmigrated} = "this report's project ($report_project_root) differs "
+                        . "from the project this run is scoped to ($root) -- its migration "
+                        . "cannot be checked from here; repair it by hand from its own project";
                     $row{_flag_text} = AlmanacBug::flag_text(
-                        kind => 'unmigrated', id => $f->{id}, reason => $reason);
+                        kind => 'unmigrated', id => $f->{id}, reason => $row{unmigrated});
+                }
+                else {
+                    my (undef, $reason) = AlmanacBug::migration_link($f, $root);
+                    if (defined $reason) {
+                        $row{unmigrated} = $reason;
+                        $row{_flag_text} = AlmanacBug::flag_text(
+                            kind => 'unmigrated', id => $f->{id}, reason => $reason);
+                    }
                 }
             }
             push @out, \%row;
