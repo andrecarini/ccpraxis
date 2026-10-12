@@ -546,10 +546,12 @@ my ($AC9_ROOT, $AC9_ID, $AC9_TARGET);
         is(scalar(@dangling_minus_excluded), 0,
             'AC-16: project.dangling is empty once the AC-7-style explicit-target notes are excluded by id')
             or diag('unexpected dangling ids: ' . join(',', map { $_->{id} } @dangling_minus_excluded));
+        my $ac16_idx = 0;
         for my $id (@internal_ids) {
+            $ac16_idx++;
             my ($e) = grep { $_->{id} eq $id } @{$c->{project}{pointers}};
-            ok(ref($e) eq 'HASH' && $e->{status} eq 'ok', "AC-16: internal note $id has status ok")
-                or diag('entry: ' . (ref($e) eq 'HASH' ? JSON::PP->new->encode($e) : 'MISSING'));
+            ok(ref($e) eq 'HASH' && $e->{status} eq 'ok', "AC-16: internal note #$ac16_idx has status ok")
+                or diag("id=$id entry: " . (ref($e) eq 'HASH' ? JSON::PP->new->encode($e) : 'MISSING'));
         }
     }
 }

@@ -1539,11 +1539,26 @@ is_deeply(Theme::x256_rgb(196), [255, 0, 0],     'x256_rgb(196) == [255,0,0] (B-
         # it changed from U+22EE to U+274F and row_cost honesty requires the
         # width to be declared and checked. icon.blueprints stays unpinned.
         'icon.notes'      => { cp => 0x2630, width => 2 },
-        'icon.tasklist'   => { cp => 0x25A3, width => 1 },
         'icon.decisions'  => { cp => 0x2691, width => 1 },
         'icon.todos'      => { cp => 0x274F, width => 1 },
         'badge.silenced'  => { cp => 0x2016, width => 1 },
         'badge.agentoff'  => { cp => 0x2205, width => 1 },
+        # blueprint where-things-go, package 12-statusline-threads (spec
+        # 2.4): icon.tasklist and its U+25A3 counter glyph are RETIRED (the
+        # focus row and flat tasklist are gone, Decision 3) -- asserted
+        # absent in the block right after this table, never required here.
+        # The six glyphs below replace it: the row-1 thread counter and the
+        # thread directory row's bar/doing/next/idle glyphs. thread.blocked
+        # is deliberately NOT in this table: its codepoint is U+229D by
+        # Decision 54 (a non-emoji substitution for the originally-named
+        # U+26D4), and spec 2.4 requires every test to read it from
+        # Theme::glyphs() at runtime rather than hard-code it -- pinning it
+        # here would defeat that.
+        'icon.threads'    => { cp => 0x23E3, width => 1 },
+        'thread.full'     => { cp => 0x25B0, width => 1 },
+        'thread.empty'    => { cp => 0x25B1, width => 1 },
+        'thread.idle'     => { cp => 0x23F8, width => 1 },
+        'arrow.right'     => { cp => 0x2192, width => 1 },
     );
     for my $name (sort keys %REQUIRED_GLYPHS) {
         my $want = $REQUIRED_GLYPHS{$name};
@@ -1553,6 +1568,25 @@ is_deeply(Theme::x256_rgb(196), [255, 0, 0],     'x256_rgb(196) == [255,0,0] (B-
             is($glyphs->{$name}{cp}, $want->{cp}, sprintf("glyph '%s' codepoint is U+%04X (B-E1, AC-9)", $name, $want->{cp}));
             is($glyphs->{$name}{width}, $want->{width}, "glyph '$name' declared width is $want->{width} (B-E1, AC-9)");
         }
+    }
+
+    # package 12-statusline-threads AC8: icon.tasklist is GONE (the flat
+    # tasklist / focus row are retired, Decision 3) -- a required-absence
+    # check, the mirror image of the table above.
+    ok(!exists $glyphs->{'icon.tasklist'},
+        "Theme::glyphs() no longer declares 'icon.tasklist' (AC8, package 12-statusline-threads)");
+
+    # package 12-statusline-threads AC8/section 2.4: thread.blocked exists,
+    # is declared width 1, and its codepoint is NOT read as a fixed literal
+    # here (spec 2.4: "Tests take the code point from
+    # Theme::glyphs()->{'thread.blocked'}{cp} and never hard-code it").
+    ok(exists $glyphs->{'thread.blocked'},
+        "Theme::glyphs() includes 'thread.blocked' (AC8, package 12-statusline-threads)");
+  SKIP: {
+        skip("glyph 'thread.blocked' missing", 2) unless exists $glyphs->{'thread.blocked'};
+        is($glyphs->{'thread.blocked'}{width}, 1, "glyph 'thread.blocked' declared width is 1 (AC8)");
+        my $cp = $glyphs->{'thread.blocked'}{cp};
+        ok(!_is_emoji($cp), sprintf("glyph 'thread.blocked' (U+%04X, read from Theme at runtime) is not an emoji codepoint (AC8)", $cp // 0));
     }
 }
 

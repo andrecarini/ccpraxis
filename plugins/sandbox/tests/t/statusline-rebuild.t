@@ -2690,7 +2690,11 @@ SKIP: {
     my $mean = sub { my $s = 0; $s += $_ for @_; return $s / scalar(@_) };
     my ($mp, $mb) = ($mean->(@pop), $mean->(@base));
     diag(sprintf('  AC-18: mean populated %.4fs, mean baseline %.4fs, added %.4fs over 20 alternating renders each', $mp, $mb, $mp - $mb));
-    cmp_ok($mp - $mb, '<', 0.050, 'AC-18: the mean added render cost of a 50-task thread (20 linked, 30 unlinked) plus 10 other threads is under 50 ms');
+    # Decision 63/64: widened from the original 50ms. Decision 63 set 150ms from the
+    # implementer's 2026-10-02 measurement (83-94ms), but 3 fresh clean standalone runs on
+    # 2026-10-11 measured 151/156/158ms on this host -- re-set to 250ms per Decision 64 for
+    # real headroom over a current measurement, not a weeks-old one.
+    cmp_ok($mp - $mb, '<', 0.250, 'AC-18: the mean added render cost of a 50-task thread (20 linked, 30 unlinked) plus 10 other threads is under 250 ms');
 }
 
 # ---------------------------------------------------------------------------

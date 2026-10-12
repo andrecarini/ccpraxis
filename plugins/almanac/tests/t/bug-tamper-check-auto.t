@@ -185,6 +185,21 @@ sub freeze_report {
     return ($path, $id, $digest);
 }
 
+# write_pkg_ledger($root, $bp, $pkg, $status) -- the minimal frontmatter
+# Almanac::PackageLink::resolve reads. RENAME (package 07-bug-lifecycle):
+# 'taken' is retired as a direct --to target in favour of
+# 'scheduled --package <bp>/<pkg>', which (when the transition is actually
+# meant to SUCCEED, not merely be attempted against a tampered report) needs
+# a real package ledger to resolve against.
+sub write_pkg_ledger {
+    my ($root, $bp, $pkg, $status) = @_;
+    my $base = "$root/.ccpraxis-local-data/blueprints/$bp/packages";
+    make_path($base);
+    open(my $fh, '>:raw', "$base/$pkg.md") or die "fixture: cannot write $base/$pkg.md: $!";
+    print {$fh} "---\nstatus: $status\n---\n";
+    close $fh;
+}
+
 # =============================================================================
 # AC1, AC2, AC3 -- B1/B2: set-status refuses a tampered report no matter who
 # is asking or whether they have a ticket at all; the tamper check precedes
@@ -196,9 +211,11 @@ sub freeze_report {
     tamper_body($path);
     my $bytes_before = slurp_raw($path);
 
-    # AC1: the claimant, WITH a valid ticket, is still refused.
-    my ($rc1, $out1) = run_as('CLAIM1', undef, $proj, 'set-status', $id, '--project', $proj, '--to', 'taken');
-    is($rc1, 2, 'AC1: claimant set-status --to taken on a tampered report exits 2');
+    # AC1: the claimant, WITH a valid ticket, is still refused. (RENAMED:
+    # taken -> scheduled; no --package needed -- the tamper check fires
+    # before the package-requirement check ever runs.)
+    my ($rc1, $out1) = run_as('CLAIM1', undef, $proj, 'set-status', $id, '--project', $proj, '--to', 'scheduled');
+    is($rc1, 2, 'AC1: claimant set-status --to scheduled on a tampered report exits 2');
     like($out1, qr/refused/, 'AC1: ...STDERR says refused');
     like($out1, qr/TAMPERED/, 'AC1: ...and TAMPERED');
     like($out1, qr/\Q$id\E/, 'AC1: ...naming the report id');
@@ -206,13 +223,13 @@ sub freeze_report {
 
     # AC2: a NON-claimant, with a valid ticket of their own, sees TAMPERED
     # rather than "claimed by session ...".
-    my ($rc2, $out2) = run_as('NOTCLAIM1', undef, $proj, 'set-status', $id, '--project', $proj, '--to', 'taken');
+    my ($rc2, $out2) = run_as('NOTCLAIM1', undef, $proj, 'set-status', $id, '--project', $proj, '--to', 'scheduled');
     is($rc2, 2, 'AC2: non-claimant set-status on the tampered report also exits 2');
     like($out2, qr/TAMPERED/, 'AC2: ...TAMPERED, not the claimant check');
     unlike($out2, qr/claimed by session/, 'AC2: ...the claimant-mismatch message never fires');
 
     # AC2: with NO ticket at all, still TAMPERED rather than "no hook ticket".
-    my ($rc3, $out3) = run('set-status', $id, '--project', $proj, '--to', 'taken');
+    my ($rc3, $out3) = run('set-status', $id, '--project', $proj, '--to', 'scheduled');
     is($rc3, 2, 'AC2: ticketless set-status on the tampered report also exits 2');
     like($out3, qr/TAMPERED/, 'AC2: ...TAMPERED, not the identity check');
     unlike($out3, qr/no hook ticket/, 'AC2: ...the "no hook ticket" message never fires');
@@ -231,24 +248,28 @@ sub freeze_report {
 }
 
 # =============================================================================
-# AC4 -- B3: a tampered `taken` report refuses both --to resolved and
-# --to declined.
+# AC4 -- B3: a tampered `scheduled` report (RENAMED from `taken`) refuses
+# --to dropped. `--to fixed` is deliberately NOT exercised here: it is now
+# refused UNCONDITIONALLY (set only by reconcile, spec sec 2.4 step 2) --
+# that refusal fires before the tamper check regardless of tampering, so it
+# tests a different thing and would misreport this file's claim.
 # =============================================================================
 {
     my $proj = new_project();
-    my ($path, $id) = freeze_report($proj, 'CLAIM4', 'ac4 tampered taken', 'original body for ac4');
-    my ($rc_take) = run_as('CLAIM4', undef, $proj, 'set-status', $id, '--project', $proj, '--to', 'taken');
-    is($rc_take, 0, 'AC4 setup: claimant takes the still-intact report');
+    write_pkg_ledger($proj, 'ac4bp', '01-ac4', 'running');
+    my ($path, $id) = freeze_report($proj, 'CLAIM4', 'ac4 tampered scheduled', 'original body for ac4');
+    my ($rc_take) = run_as('CLAIM4', undef, $proj, 'set-status', $id, '--project', $proj, '--to', 'scheduled', '--package', 'ac4bp/01-ac4');
+    is($rc_take, 0, 'AC4 setup: claimant schedules the still-intact report');
     tamper_body($path);
     my $bytes_before = slurp_raw($path);
 
-    for my $to (qw(resolved declined)) {
-        my ($rc, $out) = run('set-status', $id, '--project', $proj, '--to', $to);
-        is($rc, 2, "AC4: set-status --to $to on a tampered taken report exits 2");
+    for my $to (qw(dropped)) {
+        my ($rc, $out) = run('set-status', $id, '--project', $proj, '--to', $to, '--note', '"x"');
+        is($rc, 2, "AC4: set-status --to $to on a tampered scheduled report exits 2");
         like($out, qr/TAMPERED/, "AC4: ...TAMPERED ($to)");
         like($out, qr/\Q$id\E/, "AC4: ...naming the id ($to)");
     }
-    is(slurp_raw($path), $bytes_before, 'AC4: file byte-identical after both refusals');
+    is(slurp_raw($path), $bytes_before, 'AC4: file byte-identical after the refusal');
 }
 
 # =============================================================================
@@ -329,10 +350,11 @@ sub freeze_report {
 # =============================================================================
 {
     my $proj = new_project();
+    write_pkg_ledger($proj, 'ac8bp', '01-ac8', 'running');
 
     my (undef, $id_a) = freeze_report($proj, 'CLAIM8', 'ac8 intact frozen', 'body a');
-    my ($rc_a, $out_a) = run_as('CLAIM8', undef, $proj, 'set-status', $id_a, '--project', $proj, '--to', 'taken');
-    is($rc_a, 0, 'AC8: intact frozen report, claimant set-status --to taken still succeeds') or diag $out_a;
+    my ($rc_a, $out_a) = run_as('CLAIM8', undef, $proj, 'set-status', $id_a, '--project', $proj, '--to', 'scheduled', '--package', 'ac8bp/01-ac8');
+    is($rc_a, 0, 'AC8: intact frozen report, claimant set-status --to scheduled still succeeds') or diag $out_a;
 
     my (undef, $id_b) = file_report($proj, 'ac8 open report', 'body b');
     my ($rc_b, $out_b) = run('append', $id_b, '--project', $proj, '--body', '"more"');

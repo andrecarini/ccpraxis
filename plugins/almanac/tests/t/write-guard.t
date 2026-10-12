@@ -288,8 +288,9 @@ die "could not load almanac-bug.pl in-process: $@" if $@;
     my ($rc_a22) = run22('append', $legacy_id, '--project', qq{"$proj22"}, '--body', qq{"more detail"});
     is($rc_a22, 0, 'AC22: append exits 0 addressed by the legacy id');
 
-    my ($rc_s22) = run22('set-status', $legacy_id, '--project', qq{"$proj22"}, '--to', 'declined');
-    is($rc_s22, 0, 'AC22: set-status --to declined exits 0 addressed by the legacy id');
+    my ($rc_s22) = run22('set-status', $legacy_id, '--project', qq{"$proj22"}, '--to', 'dropped',
+                         '--note', qq{"not reproducible"});
+    is($rc_s22, 0, 'AC22: set-status --to dropped exits 0 addressed by the legacy id');
 
     my ($rc_v22) = run22('verify', '--project', qq{"$proj22"});
     is($rc_v22, 0, 'AC22: verify exits 0');
