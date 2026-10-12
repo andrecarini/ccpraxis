@@ -120,9 +120,10 @@ END {
 # system(1, @cmd) returns undef and spawns no process on this host.
 #
 # Fix: use `powershell.exe Start-Process -PassThru`, which does the real
-# work here -- allocates cmd.exe its own native console window (same as a
-# plain interactive launch; NOT started with any hidden/minimized window
-# style), returns immediately without waiting for the child to exit, and
+# work here -- allocates cmd.exe its own native console window (started
+# MINIMIZED since 2026-10-12: a minimized window still owns a real console, so
+# AC-1/AC-3 hold, and a sweep no longer pops focus-stealing windows on the
+# operator's desktop -- bug 20261012-030623-74af), returns immediately without waiting for the child to exit, and
 # hands back the child's real Win32 PID (== WINPID) directly via .Id, with
 # no msys-pid-to-WINPID resolution step needed at all. This is portable
 # across both native-Windows and Cygwin perl (it shells out to a real
@@ -134,7 +135,7 @@ sub spawn_console_process {
     my $marker = 'ccpx_console_liveness_test_' . $$ . '_' . time();
     my $inner  = "title $marker & ping -n 90 127.0.0.1 >NUL";
     my $ps = q{powershell.exe -NoProfile -NonInteractive -Command }
-           . qq{"(Start-Process -FilePath cmd.exe -ArgumentList '/c','$inner' -PassThru).Id"};
+           . qq{"(Start-Process -FilePath cmd.exe -ArgumentList '/c','$inner' -WindowStyle Minimized -PassThru).Id"};
     my $raw = `$ps 2>/dev/null`;
     my $exec_ok = ($? != -1);
     return (undef, undef) unless $exec_ok && defined $raw;
