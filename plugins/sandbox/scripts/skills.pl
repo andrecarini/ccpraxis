@@ -690,7 +690,16 @@ sub discover_plugins {
         # hooks, agents or scripts, and `total == 0` means "nothing to judge",
         # not "nothing usable". Only a plugin that shipped skills and made every
         # one of them host-only is filtered.
-        my $census = plugin_skill_census(plugin_source_dir($key, $install_path));
+        # A row whose files exist nowhere is a plugin that was retired or
+        # evicted: Claude Code never prunes installed_plugins.json, so `todo`
+        # kept being offered after it left the marketplace (bug
+        # 20261011-215330-2d26). installPath alone cannot decide this -- it is
+        # dead for every directory-source plugin -- so ask the same resolver
+        # the census and the mounts use.
+        my $source_dir = plugin_source_dir($key, $install_path);
+        next unless defined $source_dir;
+
+        my $census = plugin_skill_census($source_dir);
         my @host_only = @{ $census->{host_only} };
         next if $census->{total} > 0 && @host_only == $census->{total};
 

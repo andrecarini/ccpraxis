@@ -68,6 +68,9 @@ sub fixture {
         $_ => [ { installPath => "$proj/.fake/$_", scope => 'project',
                   projectPath => $proj, version => '1.0.0' } ]
     } @keys;
+    # The installs must exist: discovery skips a row whose files exist nowhere,
+    # as a retired plugin (retired-plugin-not-offered.t).
+    make_path("$proj/.fake/$_") for @keys;
     my $plugins_file = "$proj/installed_plugins.json";
     write_json_file($plugins_file, { plugins => \%plugins });
 
