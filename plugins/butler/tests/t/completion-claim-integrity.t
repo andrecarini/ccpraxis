@@ -749,6 +749,83 @@ sub claim_check {
 }
 
 {
+    # AC-27b (bug 20261012-014847-ded4): a skipped point's TAP line is
+    # `ok N # skip <reason>`, so parse_tap captures the bare directive
+    # `# skip <reason>` as its "description". It asserts nothing; normalizing
+    # it to '' keeps a SKIP guard that later runs for real from reading as a
+    # removed assertion.
+    my $ok = eval { require $SCRIPT; 1 };
+    SKIP: {
+        skip 'require failed', 5 unless $ok && main->can('normalize_description');
+        is(main::normalize_description('# skip glyph not found'), '',
+            'AC-27b: a bare "# skip <reason>" directive normalizes to the empty string');
+        is(main::normalize_description('# SKIP not ready'), '',
+            'AC-27b: ...case-insensitively');
+        is(main::normalize_description('#TODO later'), '',
+            'AC-27b: a bare "# TODO" directive normalizes to the empty string too');
+        is(main::normalize_description('# of rows counted'), '# of rows counted',
+            'AC-27b: an authored description that merely starts with "#" is kept');
+        is(main::normalize_description('# skipped rows are not counted'), '# skipped rows are not counted',
+            'AC-27b: "# skipped" is not the skip directive (word boundary)');
+    }
+}
+
+{
+    # AC-27c: a skip-reason string present at step 3 and gone at step 5 (the
+    # guarded points now run for real) is DRIFT, not a shrink. No reaccept ->
+    # ORACLE_DRIFT_UNACCEPTED and no ORACLE_SHRANK.
+    my $step3 = oracle_line(step => 3, path => 'skipflip.t',
+        descriptions => ['alpha', '# skip the thread segment is not on row 1'], assertions => 3);
+    my $step5 = oracle_line(step => 5, path => 'skipflip.t',
+        descriptions => ['alpha', 'thread count is primary', 'thread glyph is muted'], assertions => 3);
+    my $ledger = write_ledger(status => 'done',
+        pipeline => mk_pipeline(ticked => { map { $_ => 1 } 1 .. 7 }, na => { 8 => 1 }),
+        test_paths => 'skipflip.t', oracle_records => [$step3, $step5]);
+    my ($rc, $out, $err, $report) = claim_check($ledger);
+    ok($report, 'AC-27c: claim-check produced a decodable JSON report');
+    my @codes = $report ? map { $_->{code} } @{ $report->{findings} || [] } : ();
+    ok(!grep({ $_ eq 'ORACLE_SHRANK' } @codes),
+        'AC-27c: a vanished skip-reason string alone is NOT an ORACLE_SHRANK');
+    ok(scalar(grep { $_ eq 'ORACLE_DRIFT_UNACCEPTED' } @codes),
+        'AC-27c: ...it is drift, which still needs a reaccept');
+}
+
+{
+    # AC-27d: AC-27c's fixture WITH a reaccept -> no finding at all.
+    my $step3 = oracle_line(step => 3, path => 'skipflip2.t',
+        descriptions => ['alpha', '# skip glyph not found'], assertions => 3);
+    my $step5 = oracle_line(step => 5, path => 'skipflip2.t',
+        descriptions => ['alpha', 'glyph is declared', 'glyph width is 1'], assertions => 3,
+        reaccept => { reason => 'skip guard now runs for real', delta => {} });
+    my $ledger = write_ledger(status => 'done',
+        pipeline => mk_pipeline(ticked => { map { $_ => 1 } 1 .. 7 }, na => { 8 => 1 }),
+        test_paths => 'skipflip2.t', oracle_records => [$step3, $step5]);
+    my ($rc, $out, $err, $report) = claim_check($ledger);
+    ok($report, 'AC-27d: claim-check produced a decodable JSON report');
+    is_deeply($report && $report->{findings}, [],
+        'AC-27d: a skip-to-real flip with a reaccept produces no finding');
+}
+
+{
+    # AC-27e: a REAL authored description removed alongside a skip string still
+    # shrinks -- the fix only discounts skip directives, never real assertions.
+    my $step3 = oracle_line(step => 3, path => 'skipflip3.t',
+        descriptions => ['alpha', 'beta', '# skip x'], assertions => 3);
+    my $step5 = oracle_line(step => 5, path => 'skipflip3.t',
+        descriptions => ['alpha', 'gamma', 'delta'], assertions => 3,
+        reaccept => { reason => 'trying to bless a removal', delta => {} });
+    my $ledger = write_ledger(status => 'done',
+        pipeline => mk_pipeline(ticked => { map { $_ => 1 } 1 .. 7 }, na => { 8 => 1 }),
+        test_paths => 'skipflip3.t', oracle_records => [$step3, $step5]);
+    my ($rc, $out, $err, $report) = claim_check($ledger);
+    ok($report, 'AC-27e: claim-check produced a decodable JSON report');
+    my ($f) = $report ? grep { $_->{code} eq 'ORACLE_SHRANK' } @{ $report->{findings} || [] } : ();
+    ok($f, 'AC-27e: a removed authored description still fires ORACLE_SHRANK, reaccept or not');
+    is_deeply($f ? $f->{delta}{descriptions_removed} : undef, ['beta'],
+        'AC-27e: ...and the removed set names only the real description, not the skip string');
+}
+
+{
     # AC-28: done, step 3 ticked, a .t in test_paths, NO step-3 record -> ORACLE_NOT_RECORDED.
     my $ledger = write_ledger(status => 'done',
         pipeline => mk_pipeline(ticked => { map { $_ => 1 } 1 .. 7 }, na => { 8 => 1 }),
