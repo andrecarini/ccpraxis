@@ -986,6 +986,46 @@ sub td {
     is(read_bytes($mk), 'butler:bp-implementer',
         'R9-TH1 (coordinator): ...and the coordinator marker is left in place -- the worker is still running');
 }
+# Bug 20261012-013358-1404: the coordinator half of R9-TH1 had no completion
+# path at all. _handle_subagent_stop returned at once whenever BP_LEDGER was
+# set, so a backgrounded writer's runs/<pkg>.active-worker outlived the worker
+# and refused every later test run in the package (and, through the shared-tree
+# interlock, in its siblings) until the 180-minute age-out.
+{
+    my $coord_stop = sub {
+        my (%o) = @_;   # marker, meta (hashref), payload_type
+        my ($env, $bp_dir) = fresh_coord_env();
+        my $mk = marker_of($bp_dir, $env->{BP_PACKAGE});
+        write_bytes($mk, $o{marker});
+        my $tp = "$bp_dir/transcript.jsonl";
+        write_bytes($tp, '');
+        my $sid = 'r9th1-coord-stop-sid';
+        my $subdir = dirname($tp) . "/$sid/subagents";
+        make_path($subdir);
+        write_bytes("$subdir/agent-c1.meta.json", JSON::PP->new->canonical->encode($o{meta}));
+        my $res = td({
+            hook_event_name => 'SubagentStop', session_id => $sid, agent_id => 'c1',
+            agent_type => $o{payload_type} // $o{meta}{agentType}, transcript_path => $tp,
+            agent_transcript_path => "$subdir/agent-c1.jsonl", stop_hook_active => JSON::PP::false(),
+        }, env => $env);
+        return ($res, $mk);
+    };
+
+    my ($res, $mk) = $coord_stop->(marker => 'butler:bp-implementer',
+        meta => { agentType => 'butler:bp-implementer', toolUseId => 'C1', spawnDepth => 1 });
+    is($res->{rc}, 0, 'R9-TH1 (coordinator): SubagentStop never denies');
+    ok(!-e $mk, 'R9-TH1 (coordinator): the SubagentStop of the backgrounded writer clears its marker');
+
+    ($res, $mk) = $coord_stop->(marker => 'butler:bp-implementer',
+        meta => { agentType => 'butler:bp-reviewer', toolUseId => 'C2', spawnDepth => 1 });
+    is(read_bytes($mk), 'butler:bp-implementer',
+        'R9-TH1 (coordinator): a different worker finishing leaves the writer\'s marker in place');
+
+    ($res, $mk) = $coord_stop->(marker => 'butler:bp-implementer',
+        meta => { agentType => 'butler:bp-implementer', toolUseId => 'C3', spawnDepth => 2 });
+    is(read_bytes($mk), 'butler:bp-implementer',
+        'R9-TH1 (coordinator): a nested subagent of the same type finishing does not clear it');
+}
 {
     # TM6 (and the M6 half): a coordinator marker older than the staleness
     # TTL no longer blocks a fresh writer dispatch.

@@ -124,12 +124,12 @@ sub canon {
 }
 
 # ---------------------------------------------------------------------------
-# subagent_tool_use_id($p) -> toolUseId from
+# subagent_meta($p) -> the decoded hash of
 # <dirname(transcript_path)>/<session_id>/subagents/agent-<agent_id>.meta.json
-# when agent_id is defined and not '?', the file parses, and the value
-# matches ^[A-Za-z0-9_-]{1,128}$; else undef.
+# (Claude Code writes agentType, toolUseId, spawnDepth there) when agent_id is
+# defined and not '?' and the file parses; else undef.
 # ---------------------------------------------------------------------------
-sub subagent_tool_use_id {
+sub subagent_meta {
     my ($p) = @_;
     return undef unless ref $p eq 'HASH';
     my $aid = BpHook::agent_id($p);
@@ -148,6 +148,16 @@ sub subagent_tool_use_id {
     close $fh;
     return undef unless defined $raw;
     my $data = eval { JSON::PP->new->utf8->decode($raw) };
+    return (ref $data eq 'HASH') ? $data : undef;
+}
+
+# ---------------------------------------------------------------------------
+# subagent_tool_use_id($p) -> toolUseId from subagent_meta($p) when it
+# matches ^[A-Za-z0-9_-]{1,128}$; else undef.
+# ---------------------------------------------------------------------------
+sub subagent_tool_use_id {
+    my ($p) = @_;
+    my $data = subagent_meta($p);
     return undef unless ref $data eq 'HASH';
     my $tuid = $data->{toolUseId};
     return undef unless defined $tuid && !ref($tuid) && length $tuid;
