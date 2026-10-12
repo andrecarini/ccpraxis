@@ -1345,8 +1345,12 @@ sub colour_literal_hits {
 # import_violations($code) -> list of findings. The allow-list is the spec's,
 # verbatim: statusline.pl is an installed standalone payload and may reach
 # only for core modules (criterion 6).
+# Cwd added 2026-10-12: the generated almanac payload calls Cwd::abs_path
+# (its _alm_sw_real_path mirrors BpDataRoot::_real_path) but may not import
+# (spec 2.2, AC-9), and nothing else loaded Cwd, so that eval failed silently
+# on every call. Cwd is core, which is all criterion 6 asks.
 my @CORE_ALLOWED = qw(strict warnings JSON::PP Time::Piece File::Basename
-                      POSIX Encode constant Carp List::Util Scalar::Util);
+                      POSIX Encode constant Carp List::Util Scalar::Util Cwd);
 sub import_violations {
     my ($code) = @_;
     my %allowed = map { $_ => 1 } @CORE_ALLOWED;

@@ -19,6 +19,7 @@ use warnings;
 use JSON::PP;
 use Time::Piece;
 use File::Basename;
+use Cwd ();    # the generated payload calls Cwd::abs_path but may not import (spec 2.2)
 use constant MIN_CWD_COLS     => 2;
 use constant MIN_PROJECT_COLS => 2;
 
@@ -490,7 +491,6 @@ sub _alm_sw_real_path {
     my ($p) = @_;
     return $p unless defined $p && length $p;
     return $p unless -e $p;
-    require Cwd;    # nothing else loads it; unloaded, the eval returned undef silently
     my $r = eval { Cwd::abs_path($p) };
     return (defined $r && length $r) ? $r : $p;
 }

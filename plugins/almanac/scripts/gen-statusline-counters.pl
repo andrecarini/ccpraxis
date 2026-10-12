@@ -22,6 +22,7 @@
 use strict;
 use warnings;
 use File::Basename ();
+use Cwd ();    # the payload it emits calls Cwd::abs_path; statusline.pl loads it
 BEGIN {
     # Separators FIRST, then dirname -- __FILE__ can carry backslashes on
     # Windows and dirname on a mixed-separator path misbehaves. Same shape as
@@ -203,7 +204,6 @@ sub _alm_sw_real_path {
     my ($p) = @_;
     return $p unless defined $p && length $p;
     return $p unless -e $p;
-    require Cwd;    # nothing else loads it; unloaded, the eval returned undef silently
     my $r = eval { Cwd::abs_path($p) };
     return (defined $r && length $r) ? $r : $p;
 }
