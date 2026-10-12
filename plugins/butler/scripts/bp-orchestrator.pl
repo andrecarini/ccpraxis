@@ -53,6 +53,12 @@ BEGIN { $ENV{MSYS2_ARG_CONV_EXCL} = '*' if $^O =~ /^(MSWin32|cygwin|msys)$/; }
 # Absolute script dir so `require "$DIR/..."` resolves no matter how this script
 # is invoked (relative CLI path, absolute, or `require`d from a test).
 my $DIR = dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; abs_path($f) // $f });
+# Register under the key every dependent requires us by. Run as $0 this file has
+# no %INC entry, so the lazy require of bp-cache-state.pl / bp-progress.pl (which
+# require US at their top level) compiled the whole file a second time: 158
+# "Subroutine redefined" lines and every file-scoped `my` re-initialised under
+# the running loop (t/orchestrator-single-load.t).
+$INC{"$DIR/bp-orchestrator.pl"} //= __FILE__;
 require "$DIR/bp-govern.pl";
 require "$DIR/bp-contract.pl";
 require "$DIR/bp-log.pl";
