@@ -87,8 +87,12 @@ our $LAST_ERROR = '';
 # RENAME (blueprint where-things-go, package 07-bug-lifecycle, Decision 8):
 # taken -> scheduled, resolved -> fixed, declined -> dropped. `scheduled`
 # carries a validated <blueprint>/<package> link (package 02's
-# Almanac::PackageLink); `fixed` is reached ONLY by reconcile, never by hand;
-# `dropped` requires a reason. See specs/07-bug-lifecycle-spec.md section 2.1.
+# Almanac::PackageLink); `fixed` is reached by reconcile (scheduled -> fixed)
+# or, as of Decision 66, by hand ONLY via `triaging -> fixed --no-package
+# --note "<...>"` for an in-place fix with no blueprint package (originally
+# named "Out of scope" in specs/07-bug-lifecycle-spec.md section 6, then
+# reopened by the operator); `dropped` requires a reason. See
+# specs/07-bug-lifecycle-spec.md section 2.1 and 2.13.
 our @STATES = qw(open triaging scheduled fixed dropped);
 
 # Closed vocabulary for `severity`. `unknown` is IN it — it is the script's own
@@ -98,7 +102,8 @@ our @SEVERITIES = qw(low medium high blocker unknown);
 sub valid_severity { my ($s) = @_; return scalar grep { $_ eq $s } @SEVERITIES }
 our %NEXT = (
     open      => [qw(triaging dropped)],
-    triaging  => [qw(scheduled open dropped)],   # back to open = "not ready, keep editing"
+    triaging  => [qw(scheduled open dropped fixed)],   # back to open = "not ready, keep editing"
+                                                        # fixed = in-place fix, --no-package only (Decision 66)
     scheduled => [qw(fixed dropped)],
     fixed     => [],
     dropped   => [],
@@ -261,8 +266,8 @@ sub _render {
                    frozen_at content_sha256 claimant_session claimant_agent
                    claimant_transcript_path claimed_at
                    taken_over_from taken_over_at taken_over_reason taken_at package
-                   package_root scheduled_at fixed_at fixed_commit migrated_from
-                   resolution);
+                   package_root scheduled_at fixed_at fixed_commit fixed_without_package
+                   migrated_from resolution);
     my %seen;
     my @lines;
     # Structural backstop: no field value may carry \r or \n, regardless of
@@ -731,6 +736,22 @@ sub link_root {
     return report_root($report_path);
 }
 
+# FIX (fixbatch-1, redteam M1 / reviewer S1): a relative --project used to be
+# stored byte-for-byte as package_root, so later resolution (link_root ->
+# PackageLink::resolve) depended on whoever's cwd happened to be current at
+# call time -- a report could get marked fixed against the WRONG project's
+# ledger simply because the next caller's cwd differed from the one that
+# scheduled it. Resolve to an absolute path at the point of writing, same as
+# the CLI's own backslash/trailing-slash normalisation, and keep the bytes
+# (never re-encode -- the André landmine) rather than falling back silently.
+sub _abs_root {
+    my ($root) = @_;
+    return $root unless defined $root && length $root;
+    (my $r = $root) =~ s{\\}{/}g;
+    $r =~ s{/+$}{};
+    return Cwd::abs_path($r) // $r;
+}
+
 # package_verdict(\%fields, $report_path) -> undef | \%v -- spec sec 2.3.
 # undef unless the report's status is 'scheduled'.
 sub package_verdict {
@@ -915,7 +936,7 @@ sub _reconcile_report {
         if (defined $link) {
             $f{status} = 'scheduled';
             $f{package} = $link;
-            $f{package_root} = $root;
+            $f{package_root} = _abs_root($root);
             $f{scheduled_at} = $now;
             $f{migrated_from} = 'taken';
             $changed = 1;
@@ -1200,8 +1221,27 @@ unless (caller) {
         # Latent until 2026-08-29, because every flag in this CLI happened to be
         # written with a value after it. `--replace` and `--repair` are the
         # first booleans, and t/04 caught it immediately.
+        # FIX (fixbatch-1, redteam H1): an unrecognised `--opt=value` form used
+        # to fall through to the `else` branch as a bare positional, silently
+        # dropped, and a bare `--root` used to be accepted and stored under
+        # $o{root}, which nothing ever reads -- the automatic reconcile a few
+        # lines down then ran against the cwd/CLAUDE_PROJECT_DIR fallback with
+        # no indication the caller's intended root was ignored. `--root` is
+        # every sibling almanac script's (and almanac-doctor.pl's) root flag,
+        # so this is the natural mistake, and it is no longer silent: either
+        # form now refuses with exit 2 BEFORE the automatic reconcile runs.
+        if ($a =~ /^--([a-z0-9-]+)=/) {
+            print STDERR "almanac-bug: unrecognised option '$a' -- use '--$1 <value>' "
+                . "(space-separated), not '--$1=value'\n";
+            exit 2;
+        }
         if ($a =~ /^--([a-z0-9-]+)$/) {
             my $key = $1;
+            if ($key eq 'root') {
+                print STDERR "almanac-bug: --root is not a recognised option for this script -- "
+                    . "use --project instead\n";
+                exit 2;
+            }
             $o{$key} = (@ARGV && $ARGV[0] !~ /^--/) ? shift @ARGV : 1;
         }
         else { $o{_pos} ||= []; push @{$o{_pos}}, $a }
@@ -1459,14 +1499,24 @@ unless (caller) {
             exit 2;
         }
 
-        # spec sec 2.4 step 2: `fixed` is ALWAYS refused by hand -- with or
-        # without --repair, before the identity check, regardless of the
-        # report's current status. The legal edge scheduled -> fixed in %NEXT
-        # is exercised by reconcile only.
-        if ($to eq 'fixed') {
-            print STDERR "almanac-bug set-status: refused -- 'fixed' is set only by reconcile, "
-                       . "when the package a scheduled report names is done. Run "
-                       . "'almanac-bug.pl reconcile'.\n";
+        # spec sec 2.4 step 2 / 2.13 (Decision 66): `fixed` is refused by hand
+        # UNLESS --no-package is given, for an in-place fix with no blueprint
+        # package. The legal edge scheduled -> fixed in %NEXT is exercised by
+        # reconcile only; the legal edge triaging -> fixed is exercised ONLY
+        # via this --no-package escape hatch, checked here before the
+        # identity check, regardless of the report's current status. (The
+        # --no-package value itself, and whether $from is actually triaging,
+        # is validated later, after the report loads -- can_transition
+        # refuses any other $from.)
+        if ($to eq 'fixed' && !$o{'no-package'}) {
+            print STDERR "almanac-bug set-status: refused -- 'fixed' is set by hand only "
+                       . "together with --no-package --note \"<what fixed it>\" (an in-place fix "
+                       . "with no blueprint package); otherwise reconcile sets it when a "
+                       . "scheduled report's package is done. Run 'almanac-bug.pl reconcile'.\n";
+            exit 2;
+        }
+        if (defined $o{'no-package'} && $to ne 'fixed') {
+            print STDERR "almanac-bug set-status: --no-package applies only to --to fixed\n";
             exit 2;
         }
 
@@ -1546,6 +1596,19 @@ unless (caller) {
         # the obvious guess). A guess would hide the drift that produced it, and
         # the operator is the one who knows which state the report actually
         # reached.
+        # Decision 66: --no-package reaches `fixed` ONLY from `triaging`, even
+        # though %NEXT{scheduled} also lists `fixed` -- that edge is reserved
+        # for reconcile. Without this, --no-package would let a hand call
+        # bypass a SCHEDULED report's package-done requirement too, which is
+        # exactly the shortcut reconcile exists to prevent.
+        if ($to eq 'fixed' && $o{'no-package'} && $from ne 'triaging') {
+            print STDERR "almanac-bug set-status: refused -- --no-package only applies from "
+                       . "triaging ('$id' is $from; a scheduled report fixes via reconcile once "
+                       . "its package is done)\n";
+            $lock->release;
+            exit 2;
+        }
+
         my $from_known = grep { $_ eq $from } @AlmanacBug::STATES;
         my ($ok, $why);
         if (!$from_known && $o{repair}) {
@@ -1600,6 +1663,20 @@ unless (caller) {
             }
         }
 
+        # spec sec 2.13 (Decision 66) step 6b: target `fixed` via --no-package
+        # requires a non-blank --note describing what fixed it -- the one
+        # piece of evidence reconcile would otherwise have supplied (a
+        # package link and its commits).
+        if ($to eq 'fixed' && $o{'no-package'}) {
+            my $note = $o{note};
+            unless (defined $note && !ref($note) && $note =~ /\S/) {
+                print STDERR "almanac-bug set-status: --to fixed --no-package requires "
+                           . "--note \"<what fixed it>\" (an in-place fix must say what)\n";
+                $lock->release;
+                exit 2;
+            }
+        }
+
         my %f = %{ $rep->{fields} };
         my $now = AlmanacBug::_iso(time);
         $f{status} = $to;
@@ -1613,8 +1690,12 @@ unless (caller) {
         $f{resolution} = $o{note}   if defined $o{note} && !ref $o{note};
         if ($to eq 'scheduled') {
             $f{package}      = $pkg_link;
-            $f{package_root} = $root;
+            $f{package_root} = AlmanacBug::_abs_root($root);
             $f{scheduled_at} = $now;
+        }
+        if ($to eq 'fixed' && $o{'no-package'}) {
+            $f{fixed_at} = $now;
+            $f{fixed_without_package} = 1;
         }
 
         # Claim fields (spec sec 2.4 step 4). $id_who_or_msg is a hashref here
@@ -1652,6 +1733,7 @@ unless (caller) {
         $lock->release;
         print "$id: $from -> $to"
             . ($to eq 'scheduled' ? " (package $pkg_link)" : '')
+            . (($to eq 'fixed' && $o{'no-package'}) ? " (no package -- in-place fix)" : '')
             . (($from_known ? '' : '  (repaired: previous status was outside the state machine)')) . "\n";
         exit 0;
     }
@@ -1859,19 +1941,56 @@ unless (caller) {
                 my $v = AlmanacBug::package_verdict($f, $p);
                 if ($v && grep { $v->{verdict} eq $_ } qw(invalid missing done parked dropped)) {
                     $row{package_problem} = $v->{verdict};
-                    $row{_flag_text} = AlmanacBug::flag_text(
-                        kind => $v->{verdict}, id => $f->{id}, link => $v->{link}, root => $v->{root});
+                    # FIX (fixbatch-1, reviewer N2): reconcile always skips a
+                    # tampered report, so the DONE hint's "run: ... reconcile"
+                    # can never actually do anything for one -- suppress it
+                    # and let the TAMPERED line above (already printed from
+                    # $row{integrity}) be the only, actionable advice.
+                    unless ($v->{verdict} eq 'done' && defined $integrity) {
+                        # FIX (fixbatch-1, reviewer S2): spec 2.8 defines <R> in
+                        # `reconcile --project "<R>"` as the REPORT's own root,
+                        # not the linked package's root ($v->{root}, i.e.
+                        # package_root) -- those can differ, and substituting
+                        # the wrong one prints a reconcile command that will
+                        # never touch this report. `missing` is unaffected and
+                        # keeps using $v->{root}, which is correct for it.
+                        my $hint_root = $v->{verdict} eq 'done'
+                            ? AlmanacBug::report_root($p) : $v->{root};
+                        $row{_flag_text} = AlmanacBug::flag_text(
+                            kind => $v->{verdict}, id => $f->{id}, link => $v->{link},
+                            root => $hint_root);
+                    }
                 }
             }
             elsif (($f->{status}//'') eq 'fixed' || ($f->{status}//'') eq 'dropped') {
                 $row{package} = $f->{package} if defined $f->{package};
             }
             elsif (($f->{status}//'') eq 'taken') {
-                my (undef, $reason) = AlmanacBug::migration_link($f, $root);
-                if (defined $reason) {
-                    $row{unmigrated} = $reason;
+                # FIX (fixbatch-1, reviewer S3): a `taken` report that lives in
+                # a DIFFERENT project than the one this run's $root is scoped
+                # to can never be migrated by any reconcile call -- its own
+                # project's reconcile would resolve the note correctly and
+                # flag it there, but this run (e.g. `collect` scanning many
+                # projects) would silently accept whatever migration_link($f,
+                # $root) says, which is resolved against the WRONG tree. Flag
+                # it unconditionally on a project mismatch, regardless of what
+                # migration_link reports, per the reviewer's minimal fix.
+                my $report_project_root = AlmanacBug::report_root($p);
+                if (defined $report_project_root && defined $root
+                        && $report_project_root ne $root) {
+                    $row{unmigrated} = "this report's project ($report_project_root) differs "
+                        . "from the project this run is scoped to ($root) -- its migration "
+                        . "cannot be checked from here; repair it by hand from its own project";
                     $row{_flag_text} = AlmanacBug::flag_text(
-                        kind => 'unmigrated', id => $f->{id}, reason => $reason);
+                        kind => 'unmigrated', id => $f->{id}, reason => $row{unmigrated});
+                }
+                else {
+                    my (undef, $reason) = AlmanacBug::migration_link($f, $root);
+                    if (defined $reason) {
+                        $row{unmigrated} = $reason;
+                        $row{_flag_text} = AlmanacBug::flag_text(
+                            kind => 'unmigrated', id => $f->{id}, reason => $reason);
+                    }
                 }
             }
             push @out, \%row;
@@ -2093,16 +2212,19 @@ almanac-bug.pl — ccpraxis bug reports, one file per report.
         Add to the end of a report's body. Allowed ONLY while status is `open`. Use this to record progress — it cannot lose what is already there.
   update <id> (--body - | --body-file F) [--title T] [--severity S] [--replace]
         REPLACE a report's body. Allowed ONLY while status is `open`. Refuses when the existing body would be discarded unless --replace is given; there is no undo, as reports are gitignored.
-  set-status <id> --to <state> [--note N] [--package BP/PKG] [--repair]
-        open -> triaging -> scheduled -> fixed|dropped  (triaging -> open to hand back)
+  set-status <id> --to <state> [--note N] [--package BP/PKG] [--no-package] [--repair]
+        open -> triaging -> scheduled -> fixed|dropped  (triaging -> open to hand back;
+        triaging -> fixed via --no-package, below)
         Moving to `triaging` CLAIMS the report for the calling session (and agent, for a
         subagent) -- the identity comes from a butler hook ticket, never from a flag, and is
         required: run this from a Claude Code session with the butler plugin enabled, with the
         id and every argument written literally (no $variables). Only the claimant may then move
         it on or back to `open`; see `takeover` for a stale claim.
         --to scheduled requires --package <blueprint>/<package>, validated against an existing
-        package ledger (live or archived). `fixed` can never be set by hand -- reconcile sets it
-        once the scheduled package is done. --to dropped requires --note "<reason>".
+        package ledger (live or archived); reconcile sets `fixed` once that package is done.
+        `fixed` can also be set by hand directly from `triaging`, but ONLY together with
+        --no-package --note "<what fixed it>" -- for an in-place fix with no blueprint package
+        (Decision 66). --to dropped requires --note "<reason>".
         --repair: ONLY for a report whose current status is not a known state (hand-written, or from before this machine existed). It cannot skip a legal transition between valid states. Put it last on the line.
         Leaving `open` FREEZES the body and records its sha256.
   takeover <id>

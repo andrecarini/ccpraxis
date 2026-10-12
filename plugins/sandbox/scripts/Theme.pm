@@ -508,8 +508,25 @@ sub _glyphs_data {
         # declared at two columns. None is an emoji: the no-emoji oracle
         # intersects its block list with \p{Emoji}, which U+2630/U+2691 fail.
         'icon.notes'      => { cp => 0x2630, desc => 'trigram for heaven, note count', width => 2 },
-        'icon.tasklist'   => { cp => 0x25A3, desc => 'square containing a small filled square, tasklist count and focus row' },
         'icon.decisions'  => { cp => 0x2691, desc => 'black flag, pending-decision count' },
+        # blueprint where-things-go, package 12-statusline-threads (spec
+        # 2.4): icon.tasklist / U+25A3 is RETIRED along with the flat
+        # tasklist and the focus row (Decision 3). These six replace it --
+        # the row-1 thread counter and the thread directory row's bar,
+        # doing-cursor (reuses 'cursor' above) and idle/blocked/next glyphs.
+        'icon.threads'    => { cp => 0x23E3, desc => 'benzene ring with circle, open-thread count and thread lead' },
+        'thread.full'     => { cp => 0x25B0, desc => 'black parallelogram, a done task in the thread bar' },
+        'thread.empty'    => { cp => 0x25B1, desc => 'white parallelogram, an open task in the thread bar' },
+        'thread.idle'     => { cp => 0x23F8, desc => 'double vertical bar, the attached thread has nothing doing' },
+        # Decision 54: Decision 12 / design 9 named U+26D4 (NO ENTRY) for the
+        # blocked glyph, but U+26D4 is Emoji_Presentation=Yes and fails the
+        # no-colour-emoji guards (statusline-rebuild.t AC-E1/AC-G1,
+        # theme-tokens.t B-E5). Substituted with U+229D CIRCLED DASH: not an
+        # emoji, East-Asian-neutral, reads as "no entry" in monochrome. Tests
+        # read this codepoint from Theme::glyphs() at runtime and never pin
+        # it (spec 2.4).
+        'thread.blocked'  => { cp => 0x229D, desc => 'circled dash, the current thread task is blocked' },
+        'arrow.right'     => { cp => 0x2192, desc => 'rightwards arrow, the attached thread\'s next task' },
         # The Decision 7 badge. 'agentoff' has no hyphen because glyph names
         # are dot-separated lowercase alphanumerics (Decision 119).
         'badge.silenced'  => { cp => 0x2016, desc => 'double vertical line, this session is silenced' },
