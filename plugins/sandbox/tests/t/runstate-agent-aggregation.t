@@ -416,9 +416,18 @@ sub can_detect_symlink {
 my @SUMMARY_KEYS_16 = qw(
     blueprint runs_dir state orchestrator_pid orchestrator_alive orchestrator_started_at
     paused_manual paused_reason packages_total packages_done current_package
-    running_coordinators decisions_waiting decisions_operator decisions_triage packages
+    running_coordinators escalations_waiting inbox_waiting triage_waiting packages
 );
 my @SUMMARY_KEYS_17 = (@SUMMARY_KEYS_16, 'run_agents');
+
+# Widened 17 -> 19 by package 13-dashboard-threads (where-things-go,
+# Decision 58): this file calls the REAL RunState::summarize_dir (assert_17_keys
+# below, and AC43's source-parse of t/run-state.t's own @SUMMARY_KEYS), so both
+# go red for a stale-COUNT reason the moment RunState starts always-emitting
+# `thread`/`thread_events`, independent of anything package 04/05 themselves
+# own. Mechanical widening only -- see the matching comment in
+# runstate-package-facts.t.
+my @SUMMARY_KEYS_19 = (@SUMMARY_KEYS_17, 'thread', 'thread_events');
 
 my @PKG_KEYS_8 = qw(agents attempt attempt_cap name next_action status step steps_pending);
 
@@ -431,8 +440,8 @@ my @FORBIDDEN_AGENT_KEYS = qw(
 sub assert_17_keys {
     my ($s, $label) = @_;
     ok(is_hashref($s), "$label: summary is a hashref") or return;
-    is_deeply([ sort keys %$s ], [ sort @SUMMARY_KEYS_17 ],
-        "$label: AC1 [AT-8 amended, 16->17] -- exactly the 17 run-level keys, incl. run_agents");
+    is_deeply([ sort keys %$s ], [ sort @SUMMARY_KEYS_19 ],
+        "$label: AC1 [AT-8 amended, 16->17; package-13 widened 17->19] -- exactly the 19 run-level keys, incl. run_agents/thread/thread_events");
     ok(is_arrayref($s->{run_agents}), "$label: AT-8 -- run_agents is an ARRAY ref, never undef");
 }
 
@@ -543,7 +552,12 @@ use_ok('RunState');
         # Ruling AT-11: AC43 pinned 16, the pre-AT-8 count. AT-8 added run_agents as a
         # 17th always-present key and AT-10 authorised t/45's widening, so asserting 16
         # here pins a contract the driver deliberately superseded.
-        is(scalar(@names), 17, 'AC43: t/45 @SUMMARY_KEYS holds all 17 names (AT-8 widening)');
+        #
+        # Widened 17 -> 19 by package 13-dashboard-threads (Decision 58): t/45's own
+        # @SUMMARY_KEYS gained `thread` and `thread_events` (spec S2.2), another
+        # driver-authorised widening of the exact same literal this assertion reads --
+        # same precedent as the 16->17 edit just above, now superseded in turn.
+        is(scalar(@names), 19, 'AC43: t/45 @SUMMARY_KEYS holds all 19 names (AT-8 + package-13 widenings)');
         ok(!(grep { $_ eq 'agents' } @names), q{AC43: t/45 @SUMMARY_KEYS contains no 'agents'});
     }
     else {

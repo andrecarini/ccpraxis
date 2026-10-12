@@ -29,6 +29,18 @@ use File::Path qw(make_path);
 use File::Basename qw(dirname);
 use Cwd qw(abs_path);
 
+# AC15 (08-blueprint-parks fix-batch, SF-3): pin HOME/USERPROFILE/
+# ALMANAC_HOME to an isolated tempdir before any production code loads, so
+# a fixture call that is ever unticketed cannot reach the operator's real
+# vault (Decision 29). Pure hardening -- this file names none of these vars
+# today.
+BEGIN {
+    my $env_pin = File::Temp::tempdir(CLEANUP => 1);
+    $ENV{HOME}         = $env_pin;
+    $ENV{USERPROFILE}  = $env_pin;
+    $ENV{ALMANAC_HOME} = $env_pin;
+}
+
 my $DIR       = dirname(abs_path(do { (my $f = __FILE__) =~ s{\\}{/}g; $f }));
 my $SCRIPTS   = "$DIR/../../scripts";
 my $LIFECYCLE = "$SCRIPTS/bp-lifecycle.pl";
@@ -492,6 +504,28 @@ sub bp_status_of {
     is($rc, 0, '--all: exit 0 with a stray and an archive present');
     my @names = sort map { $_->{blueprint} } @$data;
     is_deeply(\@names, ['real'], '--all visits real blueprints only: not _archive/, not strays');
+}
+
+# ============================================================================
+# AC10 (08-blueprint-parks, DC4) -- B13: reconcile --archive on a parked,
+# all-delivered blueprint does not archive it. The report shows
+# lifecycle: parked and status_before: parked.
+# ============================================================================
+{
+    my $root = tempdir(CLEANUP => 1);
+    my $dir  = make_blueprint($root, 'ac10-parked-all-delivered',
+        status   => 'parked',
+        packages => [ { pkg => '01-a', ledger => 'done', table => 'done' } ],
+    );
+    my ($rc, $data) = run_lifecycle('reconcile', '--blueprint', 'ac10-parked-all-delivered',
+                                    '--data-dir', $root, '--archive');
+    is($rc, 0, 'AC10: exit 0');
+    is($data->[0]{lifecycle}, 'parked',
+        'AC10 (B13): lifecycle reports parked despite every package being delivered');
+    is($data->[0]{status_before}, 'parked', 'AC10 (B13): status_before is parked');
+    ok(-d $dir, 'AC10 (B13): the blueprint directory is NOT archived');
+    is(bp_status_of("$dir/blueprint.md"), 'parked',
+        'AC10 (B13): blueprint.md still says status: parked (never archived)');
 }
 
 # ============================================================================

@@ -305,6 +305,20 @@ ok(-f $NOTE_PL, 'almanac-note.pl exists at plugins/almanac/scripts/almanac-note.
         for my $i (0 .. $#lines) {
             $caller_line = $i + 1 if !defined($caller_line) && $lines[$i] =~ /unless\s*\(\s*caller\s*\)/;
         }
+        # AC-23: locate `sub _cmd_delete` and the next `sub ` after it, so the
+        # single permitted `unlink` can be checked for location as well as
+        # count (replaces AC-46's blanket ban, line 336 pre-rewrite).
+        my ($delete_sub_line, $next_sub_after_delete);
+        for my $i (0 .. $#lines) {
+            if (!defined($delete_sub_line) && $lines[$i] =~ /^\s*sub\s+_cmd_delete\b/) {
+                $delete_sub_line = $i + 1;
+                next;
+            }
+            if (defined($delete_sub_line) && !defined($next_sub_after_delete) && $i + 1 > $delete_sub_line
+                && $lines[$i] =~ /^\s*sub\s+/) {
+                $next_sub_after_delete = $i + 1;
+            }
+        }
         for my $i (0 .. $#lines) {
             my $line = $lines[$i];
             next if $line =~ /^\s*#/;
@@ -333,7 +347,21 @@ ok(-f $NOTE_PL, 'almanac-note.pl exists at plugins/almanac/scripts/almanac-note.
             diag($_) for @exit_before_guard;
         }
         unless (ok(@writefile_hits == 0, 'AC-46: the file never calls Almanac::Record::write_file')) { diag($_) for @writefile_hits }
-        unless (ok(@unlink_hits == 0, 'AC-46: the file contains no `unlink`')) { diag($_) for @unlink_hits }
+        # AC-23 (replaces AC-46's "the file contains no unlink", line 336):
+        # exactly one non-comment `unlink` call in the whole file, and it
+        # must sit between `sub _cmd_delete` and the next `sub` after it.
+        is(scalar(@unlink_hits), 1, 'AC-23: the file contains exactly one non-comment `unlink` call')
+            or diag($_) for @unlink_hits;
+        if (@unlink_hits == 1 && $unlink_hits[0] =~ /^\Q$NOTE_PL\E:(\d+):/) {
+            my $hit_line = $1;
+            ok(defined($delete_sub_line) && defined($next_sub_after_delete)
+                    && $hit_line > $delete_sub_line && $hit_line < $next_sub_after_delete,
+                'AC-23: the one `unlink` call lies between `sub _cmd_delete` and the next `sub` line')
+                or diag("unlink at line $hit_line; _cmd_delete starts at "
+                    . ($delete_sub_line // '(not found)') . ", next sub at " . ($next_sub_after_delete // '(not found)'));
+        } else {
+            fail('AC-23: the one `unlink` call lies between `sub _cmd_delete` and the next `sub` line');
+        }
         unless (ok(@alarm_hits == 0, 'AC-46: the file contains no `alarm`')) { diag($_) for @alarm_hits }
         unless (ok(@srand_hits == 0, 'AC-46: the file contains no `srand`')) { diag($_) for @srand_hits }
         unless (ok(@frontmatter_hits == 0, 'AC-46/MR: the file contains no frontmatter/--- delimiter parsing')) { diag($_) for @frontmatter_hits }
@@ -357,6 +385,9 @@ ok(-f $NOTE_PL, 'almanac-note.pl exists at plugins/almanac/scripts/almanac-note.
             qr/^\s*use\s+JSON::PP\b/,          qr/^\s*use\s+Encode\b/,
             qr/^\s*use\s+Almanac::Store\b/,    qr/^\s*use\s+Almanac::Record\b/,
             qr/^\s*use\s+Almanac::Lock\b/, qr/^\s*use\s+Almanac::GlobalCounts\b/,
+            # AC-26 (spec §2.6): the covers-budget and render-capture fixes
+            # add exactly these two beyond the set above.
+            qr/^\s*use\s+File::Temp\b/, qr/^\s*use\s+Almanac::ClaudeMdBlock\b/,
         );
         my @bad_imports = grep { my $l = $_; !grep { $l =~ $_ } @allowed } @uses;
         unless (ok(@bad_imports == 0, 'AC-47: the file imports only from the §2.0 allowlist')) {
@@ -375,8 +406,12 @@ ok(-f $NOTE_PL, 'almanac-note.pl exists at plugins/almanac/scripts/almanac-note.
             'the file contains an `unless (caller)` main guard line',
             'no `exit` statement occurs before the `unless (caller)` line',
             'the file never calls Almanac::Record::write_file',
-            'the file contains no `unlink`', 'the file contains no `alarm`', 'the file contains no `srand`',
+            'the file contains no `alarm`', 'the file contains no `srand`',
             'the file contains no frontmatter/--- delimiter parsing',
+        );
+        fail("AC-23: $_") for (
+            'the file contains exactly one non-comment `unlink` call',
+            'the one `unlink` call lies between `sub _cmd_delete` and the next `sub` line',
         );
         fail("AC-41: $_") for (
             "the file never mentions the literal '/run/.containerenv'",
@@ -750,9 +785,12 @@ my ($X_ID, $X_PATH);
 }
 
 # =============================================================================
-# AC-13 -- delete: record gone, TARGET FILE STILL EXISTS WITH UNCHANGED
-# BYTES (both audiences), show then not_found, .md.lock remains, delete
-# nosuch: not_found (never a silent no-op / never 0).
+# AC-13/AC-19/AC-20 -- delete: record gone; an INTERNAL note's content file
+# is now REMOVED (spec §2.5, replacing the old "survives" oracle); an
+# EXTERNAL note's target is NEVER touched (bytes AND mtime unchanged);
+# `content: removed`/`content: kept` is printed on STDOUT after the result
+# block; show then not_found, .md.lock remains, delete nosuch: not_found
+# (never a silent no-op / never 0).
 # =============================================================================
 {
     my $ROOT13 = tempdir(CLEANUP => 1);
@@ -772,8 +810,8 @@ my ($X_ID, $X_PATH);
     is($r1->{rc}, 0, 'AC-13: delete exits 0') or diag("stderr: $r1->{err}");
     is(field0($r1->{out}, 'changed'), 'yes', 'AC-13: result block carries changed: yes');
     ok(!-f $path13, 'AC-13: the record file is gone');
-    ok(-f $target13, 'AC-13: the target file STILL EXISTS after delete');
-    is(slurp_raw($target13), 'keepme', 'AC-13: the target file\'s bytes are unchanged after delete');
+    ok(!-f $target13, 'AC-19: deleting an internal note REMOVES its content file (§2.5)');
+    like($r1->{out}, qr/^content: removed$/m, 'AC-19: STDOUT carries content: removed, after the result block');
 
     my $r2 = run_cli('show', $id13, '--root', $ROOT13);
     is($r2->{rc}, 2, 'AC-13: show <deleted id> exits 2');
@@ -784,8 +822,9 @@ my ($X_ID, $X_PATH);
     my $r3 = run_cli('delete', 'never-existed-note', '--root', $ROOT13);
     is($r3->{rc}, 2, 'AC-13: delete nosuch exits 2 (not 0 -- it does NOT no-op)');
     is(err_kind($r3->{err}), 'not_found', 'AC-13: ...with kind: not_found');
+    unlike($r3->{out}, qr/^content:/m, 'AC-22 (B21): a refused delete prints no content: line');
 
-    # external audience
+    # external audience -- AC-20: bytes AND mtime are untouched.
     mkdir(norm_path($ROOT13) . '/docs') unless -d (norm_path($ROOT13) . '/docs');
     my $rext = run_cli('create', '--title', 'External', '--audience', 'external', '--target', 'docs/x.md', '--root', $ROOT13);
     is($rext->{rc}, 0, 'AC-13 fixture: external create succeeds') or diag("stderr: $rext->{err}");
@@ -794,10 +833,14 @@ my ($X_ID, $X_PATH);
     open(my $fh, '>:raw', $extpath_target) or die "fixture: cannot seed external target: $!";
     print {$fh} 'external content';
     close $fh;
+    utime(1_700_000_000, 1_700_000_000, $extpath_target) or die "fixture: utime: $!";
+    my $mtime_before_ext = (stat($extpath_target))[9];
     my $rdel = run_cli('delete', $extid, '--root', $ROOT13);
     is($rdel->{rc}, 0, 'AC-13: delete on an external note exits 0') or diag("stderr: $rdel->{err}");
-    ok(-f $extpath_target, 'AC-13: <root>/docs/x.md still exists after deleting the external note that pointed at it');
-    is(slurp_raw($extpath_target), 'external content', 'AC-13: the external target\'s bytes are unchanged after delete');
+    ok(-f $extpath_target, 'AC-13/AC-20: <root>/docs/x.md still exists after deleting the external note that pointed at it');
+    is(slurp_raw($extpath_target), 'external content', 'AC-20: the external target\'s bytes are unchanged after delete');
+    is((stat($extpath_target))[9], $mtime_before_ext, 'AC-20: the external target\'s mtime is unchanged after delete');
+    like($rdel->{out}, qr/^content: kept$/m, 'AC-20: STDOUT carries content: kept for an external delete');
 }
 
 # =============================================================================
@@ -1181,7 +1224,7 @@ my (%cp_fixtures);
     my $GDIR36 = record_dir($HOME36, 'global');
 
     my $rp = run_cli('create', '--title', 'Same Title Both Scopes', '--root', $ROOT36);
-    my $rg = run_cli('create', '--title', 'Same Title Both Scopes', '--global', '--home', $HOME36);
+    my $rg = run_cli('create', '--title', 'Same Title Both Scopes', '--covers', 'AC-36-global-covers', '--global', '--home', $HOME36);
     is($rp->{rc}, 0, 'AC-36 fixture: project create succeeds') or diag("stderr: $rp->{err}");
     is($rg->{rc}, 0, 'AC-36 fixture: global create succeeds') or diag("stderr: $rg->{err}");
     my $pid = field0($rp->{out}, 'id');
@@ -1252,11 +1295,270 @@ my (%cp_fixtures);
     # --global 0 still selects global (presence, not truthiness)
     my $HOME45 = tempdir(CLEANUP => 1);
     $HOME45 =~ s{\\}{/}g;
-    my $r6 = run_cli('create', '--title', 'global via presence', '--global', '0', '--home', $HOME45, '--root', $ROOT45);
+    my $r6 = run_cli('create', '--title', 'global via presence', '--covers', 'AC-45-global-covers', '--global', '0', '--home', $HOME45, '--root', $ROOT45);
     is($r6->{rc}, 0, 'AC-45: create --global 0 --home <H> exits 0') or diag("stderr: $r6->{err}");
     is(field0($r6->{out}, 'scope'), 'global', 'AC-45: --global 0 STILL selects the global scope (presence, not truthiness)');
     my $GDIR45 = record_dir($HOME45, 'global');
     is(scalar(list_md_files($GDIR45)), 1, 'AC-45: exactly one record was written under the GLOBAL dir, not project');
+}
+
+# =============================================================================
+# Spec 09-notes-fixes §2.3/§2.5/§2.6: global --covers requirement+budget, and
+# delete's content-file removal rule. Test labels below carry the spec's own
+# AC numbers with a "(covers)"/"(delete)" suffix to disambiguate from this
+# file's pre-existing (05-notes) AC-9..AC-18 labels, which cover unrelated
+# edit/check-pointers behavior.
+# =============================================================================
+
+# -----------------------------------------------------------------------
+# AC-18 (static) -- the budget number comes from COVERS_BYTE_BUDGET(), never
+# the literal 200, anywhere non-comment in almanac-note.pl.
+# -----------------------------------------------------------------------
+{
+    my @lines = read_all_lines($NOTE_PL);
+    my $budget_sym_count = grep { /\bCOVERS_BYTE_BUDGET\b/ } @lines;
+    ok($budget_sym_count >= 1, 'AC-18: almanac-note.pl mentions COVERS_BYTE_BUDGET')
+        or diag('COVERS_BYTE_BUDGET not found anywhere in the file');
+    my @literal_200 = grep { $_ !~ /^\s*#/ && /\b200\b/ } @lines;
+    ok(@literal_200 == 0, 'AC-18: no non-comment line contains the literal 200')
+        or diag($_) for @literal_200;
+}
+
+# -----------------------------------------------------------------------
+# AC-9 (covers)/B7 -- create --global without --covers: missing_covers,
+# nothing written.
+# -----------------------------------------------------------------------
+{
+    my $HOMEC9 = tempdir(CLEANUP => 1); $HOMEC9 =~ s{\\}{/}g;
+    my $r = run_cli('create', '--title', 'No Covers', '--global', '--home', $HOMEC9);
+    is($r->{rc}, 2, 'AC-9 (covers): create --global without --covers exits 2') or diag("stdout: $r->{out}\nstderr: $r->{err}");
+    is($r->{out}, '', 'AC-9 (covers): STDOUT is empty');
+    is(err_kind($r->{err}), 'usage', 'AC-9 (covers): ...with kind: usage');
+    is(field2($r->{err}, 'detail'), 'missing_covers', 'AC-9 (covers): ...and detail: missing_covers');
+    like($r->{err}, qr/a global note needs --covers/, 'AC-9 (covers): STDERR carries the missing_covers prose line');
+    my $GDIR9 = record_dir($HOMEC9, 'global');
+    is(scalar(list_md_files($GDIR9)), 0, 'AC-9 (covers): no record was created under the global store');
+    my $NOTES9 = internal_dir($HOMEC9, 'global');
+    is(scalar(list_md_files($NOTES9)), 0, 'AC-9 (covers): no content file appears under the global notes dir');
+}
+
+# -----------------------------------------------------------------------
+# AC-10 (covers)/B8 -- project create without covers still exits 0.
+# -----------------------------------------------------------------------
+{
+    my $ROOTC10 = tempdir(CLEANUP => 1); $ROOTC10 =~ s{\\}{/}g;
+    my $r = run_cli('create', '--title', 'No Covers Needed', '--root', $ROOTC10);
+    is($r->{rc}, 0, 'AC-10 (covers): project create without --covers exits 0') or diag("stderr: $r->{err}");
+}
+
+# -----------------------------------------------------------------------
+# AC-11 (covers)/B9 -- 201 bytes refused (byte count stated); 200 accepted
+# and stored untruncated.
+# -----------------------------------------------------------------------
+{
+    my $HOMEC11 = tempdir(CLEANUP => 1); $HOMEC11 =~ s{\\}{/}g;
+    my $c201 = 'x' x 201;
+    my $r1 = run_cli('create', '--title', 'Over Budget', '--covers', $c201, '--global', '--home', $HOMEC11);
+    is($r1->{rc}, 2, 'AC-11 (covers): create --global --covers <201 bytes> exits 2') or diag("stderr: $r1->{err}");
+    is(field2($r1->{err}, 'detail'), 'covers_over_budget', 'AC-11 (covers): ...detail: covers_over_budget');
+    like($r1->{err}, qr/--covers is 201 bytes/, 'AC-11 (covers): STDERR states "--covers is 201 bytes"');
+    like($r1->{err}, qr/at most 200 bytes/, 'AC-11 (covers): STDERR states "at most 200 bytes"');
+    my $GDIR11 = record_dir($HOMEC11, 'global');
+    is(scalar(list_md_files($GDIR11)), 0, 'AC-11 (covers): nothing was written for the refused 201-byte covers');
+
+    my $c200 = 'x' x 200;
+    my $r2 = run_cli('create', '--title', 'Exactly Budget', '--covers', $c200, '--global', '--home', $HOMEC11);
+    is($r2->{rc}, 0, 'AC-11 (covers): create --global --covers <200 bytes> (exactly the budget) exits 0') or diag("stderr: $r2->{err}");
+    my $id11 = field0($r2->{out}, 'id');
+    my ($j11) = show_json($id11, '--global', '--home', $HOMEC11);
+    is(ref($j11) eq 'HASH' ? $j11->{fields}{covers} : undef, $c200, 'AC-11 (covers): the stored covers is the full 200-byte value, untruncated');
+}
+
+# -----------------------------------------------------------------------
+# AC-12 (covers)/B10 -- multibyte byte counting: 100xe (200 bytes)
+# accepted, 101xe (202 bytes) refused and the count is stated.
+# -----------------------------------------------------------------------
+{
+    my $HOMEC12 = tempdir(CLEANUP => 1); $HOMEC12 =~ s{\\}{/}g;
+    my $e_ok  = "\x{e9}" x 100;   # 100 x 2-byte UTF-8 char = 200 bytes
+    my $e_bad = "\x{e9}" x 101;   # 202 bytes
+
+    my $r1 = run_cli('create', '--title', 'Multibyte OK', '--covers', $e_ok, '--global', '--home', $HOMEC12);
+    is($r1->{rc}, 0, 'AC-12 (covers): 100 x e-acute (200 bytes) is accepted') or diag("stderr: $r1->{err}");
+
+    my $r2 = run_cli('create', '--title', 'Multibyte Bad', '--covers', $e_bad, '--global', '--home', $HOMEC12);
+    is($r2->{rc}, 2, 'AC-12 (covers): 101 x e-acute (202 bytes) is refused') or diag("stdout: $r2->{out}\nstderr: $r2->{err}");
+    is(field2($r2->{err}, 'detail'), 'covers_over_budget', 'AC-12 (covers): ...detail: covers_over_budget');
+    like($r2->{err}, qr/--covers is 202 bytes/, 'AC-12 (covers): STDERR states "--covers is 202 bytes"');
+}
+
+# -----------------------------------------------------------------------
+# AC-13 (covers)/B11 -- --set covers= satisfies the requirement and is
+# budget-checked the same way as --covers.
+# -----------------------------------------------------------------------
+{
+    my $HOMEC13 = tempdir(CLEANUP => 1); $HOMEC13 =~ s{\\}{/}g;
+    my $r1 = run_cli('create', '--title', 'Via Set', '--set', 'covers=via set value', '--global', '--home', $HOMEC13);
+    is($r1->{rc}, 0, 'AC-13 (covers): --set covers=... satisfies the global covers requirement') or diag("stderr: $r1->{err}");
+    my $id13c = field0($r1->{out}, 'id');
+    my ($j13c) = show_json($id13c, '--global', '--home', $HOMEC13);
+    is(ref($j13c) eq 'HASH' ? $j13c->{fields}{covers} : undef, 'via set value', 'AC-13 (covers): the --set value is stored as covers');
+
+    my $r2 = run_cli('create', '--title', 'Via Set Over Budget', '--set', 'covers=' . ('y' x 201), '--global', '--home', $HOMEC13);
+    is($r2->{rc}, 2, 'AC-13 (covers): --set covers=<201 bytes> is refused') or diag("stderr: $r2->{err}");
+    is(field2($r2->{err}, 'detail'), 'covers_over_budget', 'AC-13 (covers): ...detail: covers_over_budget');
+}
+
+# -----------------------------------------------------------------------
+# AC-14 (covers)/B12 -- edit over budget via --covers and via --set
+# covers=: refused with the byte count; rev and fields unchanged.
+# -----------------------------------------------------------------------
+{
+    my $HOMEC14 = tempdir(CLEANUP => 1); $HOMEC14 =~ s{\\}{/}g;
+    my $r0 = run_cli('create', '--title', 'Edit Budget Fixture', '--covers', 'initial covers', '--global', '--home', $HOMEC14);
+    is($r0->{rc}, 0, 'AC-14 (covers) fixture: global create succeeds') or diag("stderr: $r0->{err}");
+    my $id14 = field0($r0->{out}, 'id');
+    my ($before14) = show_json($id14, '--global', '--home', $HOMEC14);
+    my $before_rev14 = ref($before14) eq 'HASH' ? $before14->{rev} : undef;
+
+    my $r1 = run_cli('edit', $id14, '--covers', ('z' x 201), '--global', '--home', $HOMEC14);
+    is($r1->{rc}, 2, 'AC-14 (covers): edit --global --covers <201 bytes> exits 2') or diag("stderr: $r1->{err}");
+    is(field2($r1->{err}, 'detail'), 'covers_over_budget', 'AC-14 (covers): ...detail: covers_over_budget');
+    like($r1->{err}, qr/--covers is 201 bytes/, 'AC-14 (covers): STDERR states the byte count for --covers');
+
+    my $r2 = run_cli('edit', $id14, '--set', 'covers=' . ('w' x 201), '--global', '--home', $HOMEC14);
+    is($r2->{rc}, 2, 'AC-14 (covers): edit --global --set covers=<201 bytes> exits 2') or diag("stderr: $r2->{err}");
+    is(field2($r2->{err}, 'detail'), 'covers_over_budget', 'AC-14 (covers): ...detail: covers_over_budget (via --set)');
+
+    my ($after14) = show_json($id14, '--global', '--home', $HOMEC14);
+    is(ref($after14) eq 'HASH' ? $after14->{rev} : undef, $before_rev14, 'AC-14 (covers): rev is unchanged after both refusals');
+    is(ref($after14) eq 'HASH' ? $after14->{fields}{covers} : undef, 'initial covers', 'AC-14 (covers): covers is unchanged after both refusals');
+}
+
+# -----------------------------------------------------------------------
+# AC-15 (covers)/B13 -- edit --unset covers on a global note is refused
+# missing_covers; record unchanged.
+# -----------------------------------------------------------------------
+{
+    my $HOMEC15 = tempdir(CLEANUP => 1); $HOMEC15 =~ s{\\}{/}g;
+    my $r0 = run_cli('create', '--title', 'Unset Covers Fixture', '--covers', 'will be unset', '--global', '--home', $HOMEC15);
+    my $id15 = field0($r0->{out}, 'id');
+    ok(defined $id15, 'AC-15 (covers) fixture: global create succeeds') or diag("stderr: $r0->{err}");
+
+    my $r1 = run_cli('edit', $id15, '--unset', 'covers', '--global', '--home', $HOMEC15);
+    is($r1->{rc}, 2, 'AC-15 (covers): edit --global --unset covers exits 2') or diag("stdout: $r1->{out}\nstderr: $r1->{err}");
+    is(field2($r1->{err}, 'detail'), 'missing_covers', 'AC-15 (covers): ...detail: missing_covers');
+
+    my ($after15) = show_json($id15, '--global', '--home', $HOMEC15);
+    is(ref($after15) eq 'HASH' ? $after15->{fields}{covers} : undef, 'will be unset', 'AC-15 (covers): covers is unchanged after the refused unset');
+}
+
+# -----------------------------------------------------------------------
+# AC-16 (covers)/B14+B15 -- a legacy global note with no covers can still
+# be edited (as long as the edit doesn't touch covers); project-scope
+# create/edit with an over-budget covers still exits 0 (no project budget).
+# -----------------------------------------------------------------------
+{
+    my $HOMEC16 = tempdir(CLEANUP => 1); $HOMEC16 =~ s{\\}{/}g;
+    # Build a "legacy" global note with NO covers at all by hand-tampering
+    # the on-disk frontmatter after a (covers-satisfying) create -- the CLI
+    # itself can never construct this shape going forward, which is exactly
+    # why it is a hand-made fixture rather than a plain create.
+    my $r0 = run_cli('create', '--title', 'Legacy Global', '--covers', 'temporary', '--global', '--home', $HOMEC16);
+    my $id16 = field0($r0->{out}, 'id');
+    ok(defined $id16, 'AC-16 (covers) fixture: global create succeeds') or diag("stderr: $r0->{err}");
+    my $GDIR16 = record_dir($HOMEC16, 'global');
+    remove_frontmatter_field("$GDIR16/$id16.md", 'covers');
+    my ($legacy_before) = show_json($id16, '--global', '--home', $HOMEC16);
+    ok(ref($legacy_before) eq 'HASH' && !exists($legacy_before->{fields}{covers}),
+        'AC-16 (covers) fixture: the legacy note now has no covers field at all');
+
+    my $r1 = run_cli('edit', $id16, '--title', 'Legacy Global Edited', '--global', '--home', $HOMEC16);
+    is($r1->{rc}, 0, 'AC-16 (covers)/B14: editing a legacy covers-less global note (without touching covers) exits 0')
+        or diag("stderr: $r1->{err}");
+
+    my $ROOTC16 = tempdir(CLEANUP => 1); $ROOTC16 =~ s{\\}{/}g;
+    my $big = 'p' x 300;
+    my $r2 = run_cli('create', '--title', 'Project Big Covers', '--covers', $big, '--root', $ROOTC16);
+    is($r2->{rc}, 0, 'AC-16 (covers)/B15: project create with a 300-byte covers exits 0 (no project budget)')
+        or diag("stderr: $r2->{err}");
+    my $id16p = field0($r2->{out}, 'id');
+    my $r3 = run_cli('edit', $id16p, '--covers', $big, '--root', $ROOTC16);
+    is($r3->{rc}, 0, 'AC-16 (covers)/B15: project edit with a 300-byte covers exits 0 (no project budget)')
+        or diag("stderr: $r3->{err}");
+}
+
+# -----------------------------------------------------------------------
+# AC-21 (delete)/B19,B22,B23 -- content removal is refused (content: kept,
+# nothing touched) for: an internal-labelled target OUTSIDE the notes dir;
+# a record with promote_to set; and a directory occupying the content path.
+# -----------------------------------------------------------------------
+{
+    my $ROOTC21 = tempdir(CLEANUP => 1); $ROOTC21 =~ s{\\}{/}g;
+    my $DIR21 = record_dir($ROOTC21, 'project');
+
+    # B19: audience internal, target hand-tampered to point OUTSIDE the
+    # notes dir (the CLI itself can never construct this shape).
+    mkdir(norm_path($ROOTC21) . '/docs') unless -d (norm_path($ROOTC21) . '/docs');
+    my $r19 = run_cli('create', '--title', 'B19 outside notes dir', '--root', $ROOTC21);
+    my $id19 = field0($r19->{out}, 'id');
+    ok(defined $id19, 'AC-21 (B19) fixture: create succeeds') or diag("stderr: $r19->{err}");
+    set_frontmatter_field("$DIR21/$id19.md", 'target', 'docs/outside.md');
+    my $outside_path = norm_path($ROOTC21) . '/docs/outside.md';
+    open(my $fh19, '>:raw', $outside_path) or die "fixture: cannot seed $outside_path: $!";
+    print {$fh19} 'outside bytes';
+    close $fh19;
+    my $rdel19 = run_cli('delete', $id19, '--root', $ROOTC21);
+    is($rdel19->{rc}, 0, 'AC-21 (B19): delete of an internal-labelled, outside-notes-dir target exits 0') or diag("stderr: $rdel19->{err}");
+    ok(-f $outside_path, 'AC-21 (B19): the outside-notes-dir file still exists');
+    is(slurp_raw($outside_path), 'outside bytes', 'AC-21 (B19): its bytes are unchanged');
+    like($rdel19->{out}, qr/^content: kept$/m, 'AC-21 (B19): STDOUT carries content: kept');
+
+    # B22: promote_to set on an internal note -- nothing removed.
+    my $r22 = run_cli('create', '--title', 'B22 promote in flight', '--content', 'b22 bytes', '--root', $ROOTC21);
+    my $id22 = field0($r22->{out}, 'id');
+    ok(defined $id22, 'AC-21 (B22) fixture: create succeeds') or diag("stderr: $r22->{err}");
+    set_frontmatter_field("$DIR21/$id22.md", 'promote_to', 'docs/wip.md');
+    my $target22 = internal_dir($ROOTC21, 'project') . "/$id22.md";
+    ok(-f $target22, 'AC-21 (B22) fixture: the content file exists before delete');
+    my $rdel22 = run_cli('delete', $id22, '--root', $ROOTC21);
+    is($rdel22->{rc}, 0, 'AC-21 (B22): delete of a note with promote_to set exits 0') or diag("stderr: $rdel22->{err}");
+    ok(-f $target22, 'AC-21 (B22): the content file still exists (promote in flight)');
+    is(slurp_raw($target22), 'b22 bytes', 'AC-21 (B22): its bytes are unchanged');
+    like($rdel22->{out}, qr/^content: kept$/m, 'AC-21 (B22): STDOUT carries content: kept');
+
+    # B23: a DIRECTORY occupies the content path.
+    my $r23 = run_cli('create', '--title', 'B23 directory at path', '--root', $ROOTC21);
+    my $id23 = field0($r23->{out}, 'id');
+    ok(defined $id23, 'AC-21 (B23) fixture: create succeeds') or diag("stderr: $r23->{err}");
+    my $target23 = internal_dir($ROOTC21, 'project') . "/$id23.md";
+    unlink($target23) if -f $target23;
+    mkdir($target23) or diag("could not mkdir $target23: $!");
+    open(my $fh23, '>:raw', "$target23/inner.txt") or die "fixture: cannot write inner file: $!";
+    print {$fh23} 'inner bytes';
+    close $fh23;
+    my $rdel23 = run_cli('delete', $id23, '--root', $ROOTC21);
+    is($rdel23->{rc}, 0, 'AC-21 (B23): delete when a directory occupies the content path exits 0') or diag("stderr: $rdel23->{err}");
+    ok(-d $target23, 'AC-21 (B23): the directory still exists');
+    ok(-f "$target23/inner.txt", 'AC-21 (B23): its contents survive');
+    like($rdel23->{out}, qr/^content: kept$/m, 'AC-21 (B23): STDOUT carries content: kept');
+}
+
+# -----------------------------------------------------------------------
+# AC-22 (delete)/B20 -- an internal note whose content file is already
+# gone (out of band): delete exits 0, content: absent.
+# -----------------------------------------------------------------------
+{
+    my $ROOTC22 = tempdir(CLEANUP => 1); $ROOTC22 =~ s{\\}{/}g;
+    my $r0 = run_cli('create', '--title', 'B20 already gone', '--root', $ROOTC22);
+    my $id20 = field0($r0->{out}, 'id');
+    ok(defined $id20, 'AC-22 (B20) fixture: create succeeds') or diag("stderr: $r0->{err}");
+    my $target20 = internal_dir($ROOTC22, 'project') . "/$id20.md";
+    unlink($target20) if -f $target20;
+    ok(!-f $target20, 'AC-22 (B20) fixture: the content file was removed out of band');
+    my $rdel20 = run_cli('delete', $id20, '--root', $ROOTC22);
+    is($rdel20->{rc}, 0, 'AC-22 (B20): delete exits 0 when the content file is already absent') or diag("stderr: $rdel20->{err}");
+    like($rdel20->{out}, qr/^content: absent$/m, 'AC-22 (B20): STDOUT carries content: absent');
 }
 
 # =============================================================================

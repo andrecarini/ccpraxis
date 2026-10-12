@@ -38,7 +38,7 @@ use warnings;
 use FindBin qw($Bin);
 use Test::More;
 
-my $WAIT_SCRIPT = "$Bin/../../scripts/bp-wait-for-decision.pl";
+my $WAIT_SCRIPT = "$Bin/../../scripts/bp-wait-for-escalation.pl";
 require $WAIT_SCRIPT;
 
 my $REPORTER_SKILL = "$Bin/../../skills/reporter/SKILL.md";

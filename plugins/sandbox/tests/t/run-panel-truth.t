@@ -177,7 +177,7 @@ sub mk_summary {
         packages_done        => $o{packages_done} // 0,
         current_package      => $o{current_package},
         running_coordinators => $o{running_coordinators} // 0,
-        decisions_waiting    => $o{decisions_waiting} // 0,
+        escalations_waiting    => $o{escalations_waiting} // 0,
     };
 }
 
@@ -422,7 +422,7 @@ my $LIVE_DIR  = make_bp($LIVE_ROOT, 'coord-bp',
     is(field($s, 'state'), 'solo', 'AC-11: state eq "solo" -- never a phantom "paused" run');
     is(field($s, 'orchestrator_pid'), undef, 'AC-11: orchestrator_pid undef (no runs/, no marker to read)');
     is(field($s, 'running_coordinators'), 0, 'AC-11: running_coordinators == 0');
-    is(field($s, 'decisions_waiting'), 0, 'AC-11: decisions_waiting == 0');
+    is(field($s, 'escalations_waiting'), 0, 'AC-11: escalations_waiting == 0');
 
     my $list = rs('summarize', $root);
     ok(is_arrayref($list), 'AC-12: summarize($root) returns an arrayref for the solo-only root');

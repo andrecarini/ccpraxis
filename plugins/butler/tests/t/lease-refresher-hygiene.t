@@ -939,6 +939,16 @@ my ($g3, $r3_winpid_of_refresher);
     kill('TERM', $r1_pid);
     my $gone   = wait_gone($h_winpid, 20);
     my $unlink_pid  = !wait_gone_or_exists($pidfile, 20);
+    # The refresher's release closure writes EXIT reason=released LAST -- after
+    # the KEEPAWAKE stop line, the lease.pid unlink and RELEASE reason=term. The
+    # helper vanishing (wait_gone) and keepawake.pid vanishing (the helper
+    # deletes its own) do NOT imply the refresher has finished releasing: it
+    # still has to notice via one more tasklist spawn, which under -j6 load can
+    # take seconds. Bounded poll on the real terminal event (archived never-halt
+    # Decision 28), never a longer fixed sleep. 20s: >= one $TICK of signal-
+    # delivery latency + stop_helper's own 10s+2s ceiling, and matches this
+    # block's other two bounds.
+    my $released = wait_for_regex($logfile, qr/EXIT reason=released/, 20);
     ok($gone, 'AC-5: within 20s, tasklist no longer shows the helper')
         or diag('winpid: ' . (defined $h_winpid ? $h_winpid : '<undef>'));
     ok(!-e $pidfile, 'AC-5: keepawake.pid is absent within the bound');
@@ -947,7 +957,8 @@ my ($g3, $r3_winpid_of_refresher);
     like($final5, qr/KEEPAWAKE keepawake stop winpid=\Q$h_winpid\E result=gone/,
         'AC-5: lease.log has the KEEPAWAKE stop result=gone line') or diag("lease.log:\n$final5");
     like($final5, qr/RELEASE reason=term/, 'AC-5: lease.log has RELEASE reason=term');
-    like($final5, qr/EXIT reason=released/, 'AC-5: lease.log has EXIT reason=released');
+    like($final5, qr/EXIT reason=released/, 'AC-5: lease.log has EXIT reason=released')
+        or diag("EXIT wait returned $released after 20s bound; lease.log:\n$final5");
 
     unless (wait_pid_exit($r1_pid, 10)) { local $@; eval { kill('KILL', $r1_pid) } }
     force_kill_winpid($h_winpid);

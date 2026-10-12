@@ -11,12 +11,14 @@
 # The only files this script may create or modify are the lock sidecars its
 # own non-blocking probe touches, exactly as almanac-bug.pl's own verify does.
 #
-# THIS FILE NEVER LOADS OR CALLS Almanac::Decision: every decision read path
-# in that module absorbs the legacy question queue as a side effect, which
-# would turn a diagnostic into a write. A legacy queue is reported (finding
-# class LEGACY-QUEUE) but never read, renamed or absorbed here -- its path
-# comes from Almanac::LegacyQueue::legacy_path, so this file never spells the
-# file name itself.
+# THIS FILE NEVER LOADS OR CALLS Almanac::Inbox, AND NEVER MIGRATES AN
+# UNMIGRATED LEGACY STORE: every inbox read path in that module absorbs the
+# legacy question queue and renames an old unmigrated store directory as a
+# side effect, either of which would turn a diagnostic into a write. A
+# legacy queue is reported (finding class LEGACY-QUEUE) but never read,
+# renamed or absorbed here -- its path comes from
+# Almanac::LegacyQueue::legacy_path, so this file never spells the file name
+# itself.
 package Almanac::Doctor;
 use strict;
 use warnings;
@@ -24,32 +26,41 @@ use Fcntl qw(LOCK_EX LOCK_NB LOCK_UN);
 use Errno ();
 use Encode ();
 use Sys::Hostname ();
+use Cwd ();
 
-my ($DIR, $NOTE_PL, $TASK_PL, $BUG_PL);
+my ($DIR, $NOTE_PL, $BUG_PL);
+# __FILE__ is resolved through Cwd::abs_path first -- a relative __FILE__
+# (true of any relative CLI invocation) would otherwise leave $DIR relative
+# too, and @INC's own path-join logic then doubles the directory onto the
+# require paths below (bug 20261001-184636-75fe): "Can't locate
+# plugins/almanac/scripts/almanac-note.pl in @INC".
 BEGIN {
-    $DIR = __FILE__;
+    $DIR = Cwd::abs_path(__FILE__);
     $DIR =~ s{\\}{/}g;
     # A bare filename (no '/' at all) has nothing for s{/[^/]+\z}{} to match,
     # which would otherwise leave $DIR equal to the script's own name.
     $DIR = ($DIR =~ m{/}) ? ($DIR =~ s{/[^/]+\z}{}r) : '.';
     $NOTE_PL = "$DIR/almanac-note.pl";
-    $TASK_PL = "$DIR/almanac-task.pl";
     $BUG_PL  = "$DIR/almanac-bug.pl";
     unshift @INC, $DIR;
 }
 
 # `require` of an absolute sibling path, at compile time, so each script's
 # own `unless (caller)` CLI main never fires here (require always runs with
-# a caller frame) -- the same idiom almanac-decision.pl uses for
-# almanac-task.pl.
+# a caller frame) -- the same idiom almanac-inbox.pl uses for
+# almanac-note.pl. OVERRIDDEN by blueprint where-things-go, package
+# 02-thread-store (specs/02-thread-store-spec.md section 2.8): the flat
+# almanac-task.pl require is gone; Almanac::Thread (by module name) replaces
+# Almanac::Task::check_refs and adds check_health.
 require $NOTE_PL;
-require $TASK_PL;
 require $BUG_PL;
 
 use Almanac::Store ();
 use Almanac::Record ();
 use Almanac::Lock ();
 use Almanac::LegacyQueue ();
+use Almanac::Thread ();
+use Almanac::SessionLive ();
 
 our $VERSION = '1.0';
 
@@ -103,14 +114,23 @@ sub _is_scope_unavailable_reason {
 
 # _listable_repair($type, $scope, $root) -> the F6 repair text: a listing
 # verb for the record types that have one in that scope, else the
-# manual-step text (Decision 37(1)). todo/note list in either scope; task
-# and decision are project-only stores, so a global task/decision type dir
-# (found only by shape) gets the manual step too -- `almanac decision list
-# --global` is not a flag that verb accepts.
+# manual-step text (Decision 37(1)). todo/note list in either scope; inbox
+# and thread are project-only stores, so a global inbox/thread type dir
+# (found only by shape) gets the manual step too -- `almanac inbox list
+# --global` is not a flag that verb accepts. OVERRIDDEN by blueprint
+# where-things-go, package 02-thread-store (specs/02-thread-store-spec.md
+# section 2.8 item 5): `task` (the retired flat tasklist) no longer has a
+# listing verb; `thread` lists in project scope; a type matching
+# thread-(?:tasks|log)-<name> repairs with `almanac thread show <name>`.
 sub _listable_repair {
     my ($type, $scope, $root) = @_;
+    if ($type =~ /\Athread-(?:tasks|log)-(.+)\z/) {
+        my $name = $1;
+        return "no almanac verb lists store type '$type'" unless $scope eq 'project';
+        return qq(almanac thread show $name --root "@{[ _decode_maybe($root) ]}");
+    }
     my %listable_either  = (todo => 1, note => 1);
-    my %listable_project = (task => 1, decision => 1);
+    my %listable_project = (inbox => 1, thread => 1);
     my $listable = $listable_either{$type}
                 || ($listable_project{$type} && $scope eq 'project');
     return "no almanac verb lists store type '$type'" unless $listable;
@@ -320,11 +340,18 @@ sub _process_check_entry {
                     detail => "target $t resolves to no file", repair => $repair,
                 };
             } else {
+                # OVERRIDDEN by blueprint where-things-go, package
+                # 02-thread-store (specs/02-thread-store-spec.md section
+                # 2.8): the flat `task` store is retired; this branch now
+                # reports Almanac::Thread::check_refs entries, type
+                # 'thread', id "<thread>/<task>" (already combined by
+                # check_refs), repaired via `almanac thread edit`.
+                (my $bare_task = $d->{task}) =~ s{\A\Q$d->{thread}\E/}{};
                 push @$findings, {
-                    class  => $class, num => $num, scope => $scope, type => 'task', id => $d->{task},
+                    class  => $class, num => $num, scope => $scope, type => 'thread', id => $d->{task},
                     path   => $root_c, line => undef,
-                    detail => "blocked_on $d->{target} names no decision",
-                    repair => qq(almanac task edit $d->{task} --clear-blocked-on --root "$root_c"),
+                    detail => "blocked_on $d->{target} names no inbox item",
+                    repair => qq(almanac thread edit $d->{thread} $bare_task --clear-blocked-on --root "$root_c"),
                 };
             }
         }
@@ -362,6 +389,15 @@ sub scan {
 
     my @findings;
     my @stderr_lines;
+
+    # Package 03-thread-sessions, spec 2.12: warn, once, when butler is not
+    # installed beside almanac -- never a finding (exit code unaffected).
+    unless (Almanac::SessionLive::butler_present()) {
+        my $path = _decode_maybe(Almanac::SessionLive::butler_bphook_path());
+        push @stderr_lines,
+            "almanac doctor: warning: butler is not installed beside almanac ($path not found); "
+          . "thread writes are not gated against subagents";
+    }
 
     my $cur_root = (defined $opt{root} && length $opt{root})
         ? $opt{root} : Almanac::Store::resolve_project_root();
@@ -426,10 +462,9 @@ sub scan {
             }
 
             # STALE-CLAIM (package 12, 12-bug-claimant-and-triaging, spec sec
-            # 2.9): a triaging claim with no transcript, or older than 24h. A
-            # die from claim_state (butler unreachable) propagates to main's
-            # own `eval { scan(...) }` -- an internal error, never a silent
-            # clean report for a check that could not actually run.
+            # 2.9): a triaging claim stale by the shared liveness rule
+            # (Almanac::SessionLive, blueprint where-things-go package
+            # 03-thread-sessions, spec 2.11) -- never dies.
             my $cstate = AlmanacBug::claim_state($rep->{fields}, time);
             if (defined $cstate && $cstate->{stale}) {
                 my $root_c = _decode_maybe($P);
@@ -439,6 +474,62 @@ sub scan {
                     detail => $cstate->{reason},
                     repair => qq(almanac bug takeover $rep->{fields}{id} --project "$root_c"),
                 };
+            }
+
+            # BAD-LINK/bug (blueprint where-things-go, package 07-bug-lifecycle,
+            # spec sec 2.11, num 12 -- reuses the thread BAD-LINK class with
+            # type 'bug'). Read-only: AlmanacBug::package_verdict never writes,
+            # never dies, and already treats an archived-location link exactly
+            # like a live one -- but THIS finding, like the existing thread one
+            # above it, never flags a package resolving only under
+            # blueprints/_archive/ (Decision 18 F1, "doctor does not flag an
+            # archived package"), regardless of its status.
+            my $v = AlmanacBug::package_verdict($rep->{fields}, $rp);
+            if (defined $v
+                && (grep { $v->{verdict} eq $_ } qw(missing parked dropped invalid))
+                && !(defined $v->{location} && $v->{location} eq 'archived')) {
+                my $root_c = _decode_maybe($P);
+                my $link   = defined $v->{link} ? $v->{link} : '';
+                my ($detail, $repair);
+                if ($v->{verdict} eq 'missing') {
+                    $detail = "link $link is missing";
+                    $repair = qq(restore the ledger, or almanac bug set-status $rep->{fields}{id} --to dropped --note "<why>" --project "$root_c");
+                }
+                elsif ($v->{verdict} eq 'parked') {
+                    $detail = "link $link package is parked";
+                    $repair = qq(unpark the package, or almanac bug set-status $rep->{fields}{id} --to dropped --note "<why>" --project "$root_c");
+                }
+                elsif ($v->{verdict} eq 'dropped') {
+                    $detail = "link $link package is dropped";
+                    $repair = qq(almanac bug set-status $rep->{fields}{id} --to dropped --note "<why>" --project "$root_c");
+                }
+                else { # invalid
+                    my $field = defined $rep->{fields}{package} ? $rep->{fields}{package} : '';
+                    $detail = "package link '$field' is invalid";
+                    $repair = qq(almanac bug set-status $rep->{fields}{id} --to dropped --note "<why>" --project "$root_c");
+                }
+                push @findings, {
+                    class  => 'BAD-LINK', num => 12, scope => 'project', type => 'bug', id => $rep->{fields}{id},
+                    path   => $rp_c, line => undef,
+                    detail => $detail, repair => $repair,
+                };
+            }
+
+            # UNMIGRATED-BUG (same package, spec sec 2.11, num 14): a `taken`
+            # report whose resolution note names no resolvable package. Doctor
+            # never writes and never migrates it away -- the next
+            # almanac-bug.pl call does, via reconcile.
+            if (($rep->{fields}{status} // '') eq 'taken') {
+                my (undef, $reason) = AlmanacBug::migration_link($rep->{fields}, $P);
+                if (defined $reason) {
+                    my $root_c = _decode_maybe($P);
+                    push @findings, {
+                        class  => 'UNMIGRATED-BUG', num => 14, scope => 'project', type => 'bug', id => $rep->{fields}{id},
+                        path   => $rp_c, line => undef,
+                        detail => "status 'taken' predates 'scheduled', and $reason",
+                        repair => qq(almanac bug set-status $rep->{fields}{id} --to scheduled --package <blueprint>/<package> --repair --project "$root_c"),
+                    };
+                }
             }
         }
     }
@@ -468,8 +559,62 @@ sub scan {
     }
 
     for my $P (@project_roots) {
-        my $res = Almanac::Task::check_refs(root => $P);
-        _process_check_entry(\@findings, 'task', 'project', $P, $res->{project}, 'check_refs', 'DANGLING-REF', 5);
+        my $res = Almanac::Thread::check_refs(root => $P);
+        _process_check_entry(\@findings, 'thread', 'project', $P, $res->{project}, 'check_refs', 'DANGLING-REF', 5);
+
+        my $health = Almanac::Thread::check_health(root => $P);
+        if ($health->{available}) {
+            my $root_c = _decode_maybe($P);
+            for my $f (@{ $health->{findings} }) {
+                my $id = "$f->{thread}/$f->{task}";
+                if ($f->{kind} eq 'archived_open_task') {
+                    push @findings, {
+                        class  => 'ARCHIVED-OPEN-TASK', num => 11, scope => 'project', type => 'thread', id => $id,
+                        path   => _decode_maybe($f->{path}), line => undef,
+                        detail => "task $f->{task} is $f->{status} in archived thread $f->{thread}",
+                        repair => qq(almanac thread status $f->{thread} $f->{task} done --root "$root_c"),
+                    };
+                }
+                elsif ($f->{kind} eq 'link_missing') {
+                    push @findings, {
+                        class  => 'BAD-LINK', num => 12, scope => 'project', type => 'thread', id => $id,
+                        path   => _decode_maybe($f->{path}), line => undef,
+                        detail => "link $f->{link} is missing",
+                        repair => qq(restore the ledger, or almanac thread archive $f->{thread} --root "$root_c"),
+                    };
+                }
+                elsif ($f->{kind} eq 'link_parked') {
+                    push @findings, {
+                        class  => 'BAD-LINK', num => 12, scope => 'project', type => 'thread', id => $id,
+                        path   => _decode_maybe($f->{path}), line => undef,
+                        detail => "link $f->{link} package is parked",
+                        repair => 'read the package ledger and unpark it or archive the thread',
+                    };
+                }
+                elsif ($f->{kind} eq 'link_dropped') {
+                    push @findings, {
+                        class  => 'BAD-LINK', num => 12, scope => 'project', type => 'thread', id => $id,
+                        path   => _decode_maybe($f->{path}), line => undef,
+                        detail => "link $f->{link} package is dropped",
+                        repair => qq(almanac thread archive-if-done $f->{thread} --root "$root_c"),
+                    };
+                }
+            }
+        }
+
+        my $tstore = eval { Almanac::Store->open(scope => 'project', type => 'task', root => $P) };
+        if ($tstore) {
+            my $n = eval { scalar(@{ $tstore->ids }) };
+            if (defined $n && $n >= 1) {
+                my $root_c = _decode_maybe($P);
+                push @findings, {
+                    class  => 'UNMIGRATED-TASKLIST', num => 13, scope => 'project', type => 'task', id => '-',
+                    path   => _decode_maybe($tstore->dir), line => undef,
+                    detail => "the flat tasklist holds $n record(s) not yet migrated to threads",
+                    repair => qq(almanac thread list --root "$root_c"),
+                };
+            }
+        }
     }
 
     my $home = $ENV{ALMANAC_HOME};
@@ -492,7 +637,7 @@ sub scan {
         # confirmed a directory above, and open() creates nothing. The
         # printed path is therefore Store-canonical, exactly like every
         # other finding class (record-level paths already go through Store).
-        my $dstore = eval { Almanac::Store->open(scope => 'project', type => 'decision', root => $D) };
+        my $dstore = eval { Almanac::Store->open(scope => 'project', type => 'inbox', root => $D) };
         next unless $dstore;
         my $legacy = Almanac::LegacyQueue::legacy_path($dstore);
         next unless -e $legacy;
@@ -502,10 +647,10 @@ sub scan {
 
         my $label = $is_project_root{$c} ? 'project' : 'orphan';
         push @findings, {
-            class  => 'LEGACY-QUEUE', num => 9, scope => $label, type => 'decision', id => '-',
+            class  => 'LEGACY-QUEUE', num => 9, scope => $label, type => 'inbox', id => '-',
             path   => _decode_maybe($legacy), line => undef,
             detail => 'unabsorbed legacy question queue',
-            repair => qq(almanac decision list --root "@{[ _decode_maybe($repair_root) ]}"),
+            repair => qq(almanac inbox list --root "@{[ _decode_maybe($repair_root) ]}"),
         };
     }
 

@@ -61,7 +61,7 @@ sub mkfix {
 sub waiting {
     my ($root) = @_;
     my $s = RunState::summarize($root);
-    return (ref($s) eq 'ARRAY' && @$s && ref($s->[0]) eq 'HASH') ? $s->[0]{decisions_waiting} : undef;
+    return (ref($s) eq 'ARRAY' && @$s && ref($s->[0]) eq 'HASH') ? $s->[0]{escalations_waiting} : undef;
 }
 
 my $STUCK = { package => 'p1', kind => 'stuck-package', category => 'operational' };
@@ -223,8 +223,8 @@ for my $c (@MUST_SETTLE) {
 # panel and the sweep would disagree about what the operator still owes.
 # ===========================================================================
 SKIP: {
-    my $ans = "$Bin/../../../butler/scripts/bp-answer-decision.pl";
-    skip('bp-answer-decision.pl not found', 1) unless -f $ans;
+    my $ans = "$Bin/../../../butler/scripts/bp-answer-escalation.pl";
+    skip('bp-answer-escalation.pl not found', 1) unless -f $ans;
 
     my @cases = (
         [ { package => 'p1', kind => 'stuck-package' }, 'done',       0, 0 ],

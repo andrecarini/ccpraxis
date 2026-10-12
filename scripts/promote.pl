@@ -648,6 +648,7 @@ sub main {
     my $payload_dir; # repo to read global-config/* from
     my $payload_ref; # ref within that repo
     my $sync_stopped = 0;
+    my $live_only_commits = 0; # dry-run only: live HEAD has commits clone main lacks
 
     # Decision 27's baseline for the settings.json array-unit widening merge:
     # the live install's HEAD *before* this run's merge changes it. Captured
@@ -699,6 +700,9 @@ sub main {
             push @out, "merge: up-to-date";
         } else {
             push @out, "merge: would-merge " . short_sha($live_head) . ' <- ' . short_sha($clone_main);
+        }
+        if (defined $live_head) {
+            $live_only_commits = is_ancestor($clone_dir, $live_head, 'main') ? 0 : 1;
         }
         $payload_dir = $clone_dir;
         $payload_ref = 'main';
@@ -985,6 +989,14 @@ sub main {
         }
     }
     push @out, "settings: $settings_status";
+    if ($mode eq 'dry-run' && $live_only_commits) {
+        push @out,
+            "  caveat: preview ignores live-only commits -- live HEAD " . short_sha($baseline_sha)
+            . " has commits clone main " . short_sha($clone_main)
+            . " lacks; a real promote merges first, so the result may differ either way --"
+            . " apply may report or perform changes this preview doesn't show, or this"
+            . " preview's 'removed'/'updated' lines may not happen";
+    }
     push @out, @settings_lines;
 
     # -----------------------------------------------------------------

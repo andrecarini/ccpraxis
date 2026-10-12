@@ -1,6 +1,6 @@
 #!/usr/bin/env perl
 # platform: any
-# A7 watcher: bp-wait-for-decision.pl — the reporter's token-free blocking watcher
+# A7 watcher: bp-wait-for-escalation.pl — the reporter's token-free blocking watcher
 # over runs/escalations/. Part 1 exhausts the pure decision core (decision_id /
 # parse_seen / fresh_decisions). Part 2 drives the blocking wait_loop with injected
 # now/sleep/scan seams (immediate-return, block-then-return, seen-filtering,
@@ -15,7 +15,7 @@ use JSON::PP;
 use File::Temp qw(tempdir);
 use File::Path qw(make_path);
 
-my $script = "$Bin/../../scripts/bp-wait-for-decision.pl";
+my $script = "$Bin/../../scripts/bp-wait-for-escalation.pl";
 require $script;
 
 my $J = JSON::PP->new->canonical;

@@ -24,7 +24,7 @@ use Test::More;
 (my $S = "$Bin/../../scripts") =~ s{\\}{/}g;
 require "$S/bp-judge.pl";
 
-my $SRC = do { open my $f, '<', "$S/bp-answer-decision.pl" or die; local $/; <$f> };
+my $SRC = do { open my $f, '<', "$S/bp-answer-escalation.pl" or die; local $/; <$f> };
 
 # ---- the predicate this bug lives in ---------------------------------------
 # Pinned first, because the fix is only correct while this is how firing works.

@@ -34,7 +34,7 @@
     {
       "name": "almanac",
       "source": "./almanac",
-      "description": "Durable records that outlive a session, one file per record, written only through their scripts: project and global todos, notes (a pointer plus metadata, in place of Claude Code auto-memory), the project's ordered tasklist, pending product decisions for the operator, and ccpraxis bug reports. Bundles /almanac:todo, /almanac:note, /almanac:task, /almanac:decision, /almanac:bug-report and /almanac:bug-triage, the almanac dispatcher and doctor, and hooks that deny direct edits to the stores."
+      "description": "Durable records that outlive a session, one file per record, written only through their scripts: project and global todos, notes (a pointer plus metadata, in place of Claude Code auto-memory), the project's ordered tasklist, the operator's inbox, and ccpraxis bug reports. Bundles /almanac:todo, /almanac:note, /almanac:task, /almanac:inbox, /almanac:bug-report and /almanac:bug-triage, the almanac dispatcher and doctor, and hooks that deny direct edits to the stores."
     }
   ]
 }

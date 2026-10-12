@@ -43,7 +43,7 @@ Leaving `open` **freezes the body** and records its digest. From then on the fil
 — deliberately. Send it back to `open` if it genuinely needs more from them.
 
 Moving a report to `triaging` **claims it for your session** (and your agent id, if you are a
-subagent) — the identity comes from butler's own hook ticket, never from a flag, so the command
+subagent) — the identity comes from a ticket butler itself issues, never from a flag, so the command
 must be written literally (no `$variables`) in a session with the butler plugin enabled. From then
 on **only you can move it on or back to `open`**; anyone else is refused and told who holds it.
 `list`/`collect` flag a claim as stale when its session has no transcript on this machine, or when

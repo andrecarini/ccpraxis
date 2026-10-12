@@ -1,6 +1,6 @@
 ---
 name: todo
-description: Record, list and close deferred work an agent can do later, as project todos for this repo or global todos for anything cross-project. Use proactively when the operator says "remind me", "for later" or "add a todo", or names follow-up work this session will not finish, and use when asked what is outstanding. Skip for steps of the current task, which go in /almanac:task, and for questions only the operator can answer, which go in /almanac:decision.
+description: Record, list and close deferred work an agent can do later, as project todos for this repo or global todos for anything cross-project. Use proactively when the operator says "remind me", "for later" or "add a todo", or names follow-up work this session will not finish, and use when asked what is outstanding. Skip for steps of the current task, which go in /almanac:thread, and for questions only the operator can answer, which go in /almanac:inbox.
 allowed-tools: Bash, Read
 ---
 
@@ -40,6 +40,7 @@ perl "${CLAUDE_PLUGIN_ROOT}/scripts/almanac.pl" todo edit <id> --title "..."
 perl "${CLAUDE_PLUGIN_ROOT}/scripts/almanac.pl" todo complete <id>
 perl "${CLAUDE_PLUGIN_ROOT}/scripts/almanac.pl" todo reopen <id>
 perl "${CLAUDE_PLUGIN_ROOT}/scripts/almanac.pl" todo delete <id>
+perl "${CLAUDE_PLUGIN_ROOT}/scripts/almanac.pl" todo promote <id> --thread <thread>
 ```
 
 Add `--json` to `list`/`show` for machine-readable output.

@@ -14,6 +14,19 @@ use File::Temp qw(tempdir);
 use File::Path qw(make_path);
 use File::Basename qw(basename);
 use Cwd qw(getcwd abs_path);
+use POSIX qw(strftime);
+
+# AC15 (08-blueprint-parks fix-batch, SF-3): pin HOME/USERPROFILE/
+# ALMANAC_HOME to an isolated tempdir before any production code loads, so
+# a fixture call that is ever unticketed cannot reach the operator's real
+# vault (Decision 29). Pure hardening -- this file names none of these vars
+# today.
+BEGIN {
+    my $env_pin = File::Temp::tempdir(CLEANUP => 1);
+    $ENV{HOME}         = $env_pin;
+    $ENV{USERPROFILE}  = $env_pin;
+    $ENV{ALMANAC_HOME} = $env_pin;
+}
 
 # ── require the not-yet-existing script ─────────────────────────────────────
 # If it doesn't exist this is a compile-time die → caught with eval.
@@ -72,6 +85,42 @@ sub write_json {
     open my $fh, '>:raw', $path or die "write_json $path: $!";
     print $fh $J->encode($data);
     close $fh;
+}
+
+# Append a fenced metadata block directly to an existing blueprint.md, so a
+# fixture can express "authored parked" (spec 08-blueprint-parks §2.1)
+# WITHOUT going through parks.json/migration. bp_meta_get finds the FIRST
+# fenced ``` block in the file; make_bp_dir's blueprint.md has none, so the
+# appended block here is that first (and only) block.
+sub write_bp_status_fence {
+    my ($bp_dir, $status, $reason) = @_;
+    open my $fh, '>>:raw', "$bp_dir/blueprint.md" or die "append fence $bp_dir/blueprint.md: $!";
+    print $fh "\n```\nstatus: $status\n";
+    print $fh "parked_reason: $reason\n" if defined $reason;
+    print $fh "```\n";
+    close $fh;
+}
+
+# Raw (never BpState-whitelist-coupled) readers of the fenced status/field,
+# mirrored from lifecycle-reconcile.t's bp_status_of so this file's oracle
+# does not depend on BpState::norm_bp_status already knowing 'parked'.
+sub bp_status_of {
+    my ($file) = @_;
+    my $c = read_file($file) // '';
+    return '' unless $c =~ /^```\s*\n((?:.*\n)*?)^```\s*$/m;
+    my $b = $1;
+    return '' unless $b =~ /^status:[ \t]*([^\n#]*)/m;
+    my $v = $1; $v =~ s/\s+\z//; return $v;
+}
+
+sub bp_field_of {
+    my ($file, $field) = @_;
+    my $c = read_file($file) // '';
+    return undef unless $c =~ /^```\s*\n((?:.*\n)*?)^```\s*$/m;
+    my $b = $1;
+    my $fq = quotemeta $field;
+    return undef unless $b =~ /^$fq:[ \t]*([^\n#]*)/m;
+    my $v = $1; $v =~ s/\s+\z//; return $v;
 }
 
 sub read_json {
@@ -431,15 +480,17 @@ sub capture_run {
     make_bp_dir($data, 'bp-two', [
         {key=>'q1', status=>'pending', write_set=>'two/q1/'},
     ]);
-    # B3: parked — must be excluded from pending list
-    make_bp_dir($data, 'bp-three', [
+    # B3: parked — must be excluded from pending list. Authored directly in
+    # blueprint.md's fenced metadata (spec 08-blueprint-parks §2.1/§2.5): the
+    # director's only source of parkedness is the blueprint's own status now,
+    # never parks.json.
+    my $bp_three = make_bp_dir($data, 'bp-three', [
         {key=>'r1', status=>'pending', write_set=>'three/r1/'},
     ]);
+    write_bp_status_fence($bp_three, 'parked', 'stale');
     my $dsdir = "$data/.drive-solo"; make_path($dsdir);
     write_json("$dsdir/order.json",
         { order => ['bp-one','bp-two','bp-three'], recorded_at => $NOW });
-    write_json("$dsdir/parks.json",
-        [{ blueprint=>'bp-three', reason=>'stale', at=>$NOW }]);
     # B1 not yet in announced.json
     write_json("$dsdir/announced.json", { announced => [] });
 
@@ -485,14 +536,13 @@ sub capture_run {
 {
     my $data = tempdir(CLEANUP => 1);
     make_bp_dir($data, 'bp-a', [{key=>'p1',status=>'done',write_set=>'a/p1/'}]);
-    make_bp_dir($data, 'bp-b', [{key=>'p1',status=>'pending',write_set=>'b/p1/'}]);
+    my $bp_b = make_bp_dir($data, 'bp-b', [{key=>'p1',status=>'pending',write_set=>'b/p1/'}]);
+    write_bp_status_fence($bp_b, 'parked', 'out of scope');
     my $dsdir = "$data/.drive-solo"; make_path($dsdir);
     write_json("$dsdir/order.json",
         { order => ['bp-a','bp-b'], recorded_at => $NOW });
-    # bp-a announced; bp-b parked
+    # bp-a announced; bp-b parked (authored directly in blueprint.md)
     write_json("$dsdir/announced.json", { announced => ['bp-a'] });
-    write_json("$dsdir/parks.json",
-        [{ blueprint=>'bp-b', reason=>'out of scope', at=>$NOW }]);
 
     my ($rc, $out) = capture_run(
         ['next', '--scope', 'all'],
@@ -505,43 +555,46 @@ sub capture_run {
         'AC-6: all in-scope blueprints done-or-parked → action=done');
 }
 
-# ── AC-7: park — idempotent, one entry, run.md logged ───────────────────────
+# ── AC1 (DC1, spec B1+B2): park writes status+reason into blueprint.md ──────
+# Rewritten for 08-blueprint-parks (Decision 9): park no longer writes
+# parks.json at all. It writes status: parked + parked_reason: directly into
+# the blueprint's own blueprint.md (through bp-blueprint.pl set-meta), logs
+# PARK to run.md, and a second park with a different reason is a byte-
+# identical no-op (the first reason wins, spec EC-2 / observable B2).
 {
     my $data = tempdir(CLEANUP => 1);
-    make_bp_dir($data, 'bp-stale', [{key=>'p1',status=>'pending',write_set=>'s/p1/'}]);
+    my $bp = make_bp_dir($data, 'bp-stale', [{key=>'p1',status=>'pending',write_set=>'s/p1/'}]);
+    write_bp_status_fence($bp, 'audited');
     my $dsdir = "$data/.drive-solo"; make_path($dsdir);
 
     my ($rc1) = capture_run(
         ['park', 'bp-stale', 'stale — superseded'],
         { data_dir => $data }
     );
-    is($rc1, 0, 'AC-7: first park exits 0');
-
-    my $parks = read_json("$dsdir/parks.json");
-    ok(ref $parks eq 'ARRAY', 'AC-7: parks.json is an array');
-    my @bp_entries = grep { $_->{blueprint} eq 'bp-stale' } @$parks;
-    is(scalar @bp_entries, 1, 'AC-7: exactly one entry for bp-stale in parks.json');
-    is($bp_entries[0]{reason}, 'stale — superseded',
-        'AC-7: reason preserved verbatim');
-    ok(defined $bp_entries[0]{at}, 'AC-7: at field present');
+    is($rc1, 0, 'B1: first park exits 0');
+    is(bp_status_of("$bp/blueprint.md"), 'parked',
+        'B1: blueprint.md fence now says status: parked');
+    is(bp_field_of("$bp/blueprint.md", 'parked_reason'), 'stale — superseded',
+        'B1: parked_reason holds the reason verbatim');
+    ok(!-e "$dsdir/parks.json", 'B1: no parks.json is ever created');
 
     my $run_md = read_file("$dsdir/run.md");
-    like($run_md, qr/PARK\s+bp-stale/,
-        'AC-7: PARK line written to run.md');
+    my $expect_park_line = 'PARK bp-stale — stale — superseded';
+    like($run_md, qr/\Q$expect_park_line\E/,
+        'B1: PARK line written to run.md verbatim');
 
-    # Second park — structural idempotence
+    my $before = read_file("$bp/blueprint.md");
+
+    # Second park, different reason — byte-identical, first reason wins.
     my ($rc2) = capture_run(
         ['park', 'bp-stale', 'second attempt'],
         { data_dir => $data }
     );
-    is($rc2, 0, 'AC-7(idempotent): second park exits 0');
-
-    my $parks2 = read_json("$dsdir/parks.json");
-    my @bp_entries2 = grep { $_->{blueprint} eq 'bp-stale' } @$parks2;
-    is(scalar @bp_entries2, 1,
-        'AC-7(idempotent): still exactly one entry (no dup appended)');
-    is($bp_entries2[0]{reason}, 'stale — superseded',
-        'AC-7(idempotent): original reason preserved (first at/reason wins, spec EC-2)');
+    is($rc2, 0, 'B2: second park exits 0');
+    is(read_file("$bp/blueprint.md"), $before,
+        'B2: blueprint.md is byte-identical on a second park (first reason wins)');
+    my @park_lines = (read_file("$dsdir/run.md") =~ /^PARK\b.*$/mg);
+    is(scalar(@park_lines), 1, 'B2: exactly one PARK line logged, ever (no duplicate)');
 }
 
 # ── AC-8: keepawake_should_be_on — pure, zero spawn ─────────────────────────
@@ -912,7 +965,7 @@ sub capture_run {
 {
     my $data = tempdir(CLEANUP => 1);
     make_bp_dir($data, 'bp-old',  [ {key=>'p1', status=>'done',    write_set=>'old/p1/'} ]);
-    make_bp_dir($data, 'bp-new',  [ {key=>'q1', status=>'pending', write_set=>'new/q1/'} ]);
+    my $bp_new = make_bp_dir($data, 'bp-new',  [ {key=>'q1', status=>'pending', write_set=>'new/q1/'} ]);
 
     make_path("$data/.drive-solo");
     write_json("$data/.drive-solo/order.json", { order => ['bp-old'], recorded_at => 1 });
@@ -930,13 +983,80 @@ sub capture_run {
         'AC-40: the uncovered blueprint is named in `missing`');
 
     # A parked blueprint is settled by definition and must NOT re-trigger this.
-    write_json("$data/.drive-solo/parks.json",
-               [ { blueprint => 'bp-new', reason => 'moot', at => 1 } ]);
+    # Authored directly in blueprint.md (spec 2.1) -- parks.json is no longer
+    # a source of truth after migration.
+    write_bp_status_fence($bp_new, 'parked', 'moot');
     my (undef, $out2) = capture_run(['next', '--scope', 'bp-new'], { data_dir => $data });
     chomp(my $l2 = $out2);
     my $a2 = eval { $J->decode($l2) };
     isnt($a2->{action}, 'need-order',
         'AC-40: a PARKED uncovered blueprint does not re-ask for an order');
+}
+
+# ── AC3 (DC1, spec B5): unparking returns a blueprint to drivable ───────────
+{
+    my $data = tempdir(CLEANUP => 1);
+    my $bp = make_bp_dir($data, 'bp-again', [{key=>'p1',status=>'pending',write_set=>'again/p1/'}]);
+    write_bp_status_fence($bp, 'parked', 'paused for now');
+    my $dsdir = "$data/.drive-solo"; make_path($dsdir);
+    write_json("$dsdir/order.json", { order => ['bp-again'], recorded_at => $NOW });
+
+    my ($rc0, $out0) = capture_run(['next', '--scope', 'all'], { data_dir => $data });
+    chomp(my $l0 = $out0);
+    my $act0 = eval { $J->decode($l0) };
+    is($act0->{action}, 'done', 'B5: while parked and in order, next reports done (nothing left drivable)');
+
+    # Unpark directly in blueprint.md -- the director has no unpark verb
+    # (spec §7, out of scope); unparking is bp-blueprint.pl set-meta. This
+    # simulates that caller having already run.
+    my $content = read_file("$bp/blueprint.md");
+    $content =~ s/^status:\s*parked\s*$/status: audited/m;
+    $content =~ s/^parked_reason:.*\n//m;
+    open my $wfh, '>:raw', "$bp/blueprint.md" or die $!;
+    print $wfh $content;
+    close $wfh;
+
+    my ($rc1, $out1) = capture_run(['next', '--scope', 'all'], { data_dir => $data });
+    chomp(my $l1 = $out1);
+    my $act1 = eval { $J->decode($l1) };
+    is($act1->{action}, 'run-package', 'B5: once unparked and still in order, next drives it again');
+    is($act1->{blueprint}, 'bp-again', 'B5: ...the right blueprint');
+}
+{
+    # A genuinely unparked-but-not-in-order case: the blueprint was parked
+    # (and never recorded in the order at all, which is a non-empty order
+    # that simply omits it -- so this does NOT hit the unrelated
+    # $order_was_empty_array exemption that an empty-array order.json
+    # triggers), then unparked directly in blueprint.md (the same
+    # caller-already-ran-set-meta simulation as the B5 block above). Per
+    # spec B5, unparking only returns a blueprint to drivable if it is in
+    # the order; since it never was, `next` must still ask for an order.
+    my $data = tempdir(CLEANUP => 1);
+    my $bp = make_bp_dir($data, 'bp-not-in-order', [{key=>'p1',status=>'pending',write_set=>'nio/p1/'}]);
+    write_bp_status_fence($bp, 'parked', 'paused for now');
+    # bp-other must exist on disk (and be in-order/drivable) so ORDER-PRUNE
+    # does not drop it before the order is tested for emptiness -- a pruned
+    # order collapses to the SAME "no order recorded" (B2) path an empty
+    # array takes, never reaching the B2a/scope-extends-order check this
+    # block means to exercise.
+    make_bp_dir($data, 'bp-other', [{key=>'p1',status=>'pending',write_set=>'other/p1/'}]);
+    my $dsdir = "$data/.drive-solo"; make_path($dsdir);
+    write_json("$dsdir/order.json", { order => ['bp-other'], recorded_at => $NOW });
+
+    my $content = read_file("$bp/blueprint.md");
+    $content =~ s/^status:\s*parked\s*$/status: audited/m;
+    $content =~ s/^parked_reason:.*\n//m;
+    open my $wfh, '>:raw', "$bp/blueprint.md" or die $!;
+    print $wfh $content;
+    close $wfh;
+
+    my ($rc, $out) = capture_run(['next', '--scope', 'bp-not-in-order'], { data_dir => $data });
+    chomp(my $line = $out);
+    my $act = eval { $J->decode($line) };
+    is($act->{action}, 'need-order',
+        'B5: an unparked blueprint absent from the order asks for an order');
+    is($act->{reason}, 'scope-extends-order',
+        'B5: ...with reason scope-extends-order');
 }
 
 # ── AC-41: record-order refuses to drop live work (AC-40's anti-livelock) ────
@@ -948,7 +1068,7 @@ sub capture_run {
 {
     my $data = tempdir(CLEANUP => 1);
     make_bp_dir($data, 'bp-keep', [ {key=>'p1', status=>'pending', write_set=>'keep/p1/'} ]);
-    make_bp_dir($data, 'bp-drop', [ {key=>'q1', status=>'pending', write_set=>'drop/q1/'} ]);
+    my $bp_drop = make_bp_dir($data, 'bp-drop', [ {key=>'q1', status=>'pending', write_set=>'drop/q1/'} ]);
 
     my ($rc, $out, $err) = capture_run(['record-order', 'bp-keep'], { data_dir => $data });
     isnt($rc, 0, 'AC-41: recording an order that omits a live blueprint is refused');
@@ -956,12 +1076,11 @@ sub capture_run {
     like($err, qr/park/,    'AC-41: ...and points at the sanctioned way to exclude it');
     ok(!-f "$data/.drive-solo/order.json", 'AC-41: no order was written by the refused call');
 
-    # Parked → legitimately omittable.
+    # Parked (B4) → legitimately omittable. Authored directly in blueprint.md.
     make_path("$data/.drive-solo");
-    write_json("$data/.drive-solo/parks.json",
-               [ { blueprint => 'bp-drop', reason => 'superseded', at => 1 } ]);
+    write_bp_status_fence($bp_drop, 'parked', 'superseded');
     my ($rc2) = capture_run(['record-order', 'bp-keep'], { data_dir => $data });
-    is($rc2, 0, 'AC-41: once parked, omitting it is accepted');
+    is($rc2, 0, 'AC-41 (B4): once parked, omitting it is accepted');
 
     # A blueprint whose packages are all terminal is not live work either.
     my $data3 = tempdir(CLEANUP => 1);
@@ -1042,6 +1161,207 @@ sub capture_run {
     my $w = BpKeepAwake::winify('/c/Development/ccpraxis/x.ps1');
     like($w, qr{^[A-Z]:/}, 'AC-43: winify yields a drive-letter Windows path');
     unlike($w, qr{^/}, 'AC-43: ...and never a leading slash (that is the drive-root-stray shape)');
+}
+
+# =============================================================================
+# package 10 (never-halt): a long usage pause (> 12h out) ends the session
+# with a new `pause-long` action instead of `pause`.
+# Spec: .ccpraxis-local-data/blueprints/never-halt/specs/10-long-usage-pause-ends-session-spec.md
+# =============================================================================
+
+# ── AC-1/AC-2: pause_is_long (pure) and $LONG_PAUSE_HANDOFF_SECONDS ─────────
+{
+    is($BpDrive::LONG_PAUSE_HANDOFF_SECONDS, 43200,
+        'AC-1(pkg10): $LONG_PAUSE_HANDOFF_SECONDS is 43200 (12h)');
+
+    is(BpDrive::pause_is_long('usage', $NOW + 43200 + 1, $NOW), 1,
+        'AC-2(pkg10): just over 12h away -> long (1)');
+    is(BpDrive::pause_is_long('usage', $NOW + 43200, $NOW), 0,
+        'AC-2(pkg10): exactly 12h away -> NOT long (boundary is strict >, not >=)');
+    is(BpDrive::pause_is_long('usage', $NOW + 88 * 3600, $NOW), 1,
+        'AC-2(pkg10): 88h away (the measured seven-day case) -> long');
+    is(BpDrive::pause_is_long('usage', $NOW + 3600, $NOW), 0,
+        'AC-2(pkg10): 1h away -> not long');
+    is(BpDrive::pause_is_long('usage', $NOW - 3600, $NOW), 0,
+        'AC-2(pkg10): overdue (negative D) -> never long');
+    is(BpDrive::pause_is_long('usage', undef, $NOW), 0,
+        'AC-2(pkg10): undefined until_epoch -> not long (E3: never a strftime on garbage)');
+    is(BpDrive::pause_is_long('usage', 'soon', $NOW), 0,
+        'AC-2(pkg10): non-numeric until_epoch -> not long');
+    is(BpDrive::pause_is_long('token', $NOW + 88 * 3600, $NOW), 0,
+        'AC-2(pkg10): a non-usage reason -> never long, regardless of D');
+    is(BpDrive::pause_is_long(undef, $NOW + 88 * 3600, $NOW), 0,
+        'AC-2(pkg10): an undefined reason -> never long, regardless of D');
+}
+
+# ── AC-3/AC-4/AC-10: the pause-long action shape, run.md line, state isolation ─
+{
+    my $EPOCH = $NOW + 13 * 3600;   # > 12h away
+    my $data = tempdir(CLEANUP => 1);
+    make_bp_dir($data, 'bp-x', [{key=>'p1',status=>'pending',write_set=>'x/p1/'}]);
+    my $dsdir = "$data/.drive-solo"; make_path($dsdir);
+    write_json("$dsdir/order.json", { order => ['bp-x'], recorded_at => $NOW });
+
+    # AC-10 fixture: inflight.json must come out byte-identical, and no
+    # parks.json / announced.json may be created, on this path.
+    my $inflight_bytes = qq({"inflight":["bp-x:p1"]}\n);
+    open(my $ifh, '>:raw', "$dsdir/inflight.json") or die "write inflight.json: $!";
+    print $ifh $inflight_bytes;
+    close $ifh;
+
+    my ($rc, $out) = capture_run(
+        ['next', '--scope', 'bp-x'],
+        { data_dir => $data,
+          now      => sub { $NOW },
+          verdict  => sub { { action=>'pause-usage', until_epoch=>$EPOCH, reason=>'usage' } } }
+    );
+    is($rc, 0, 'AC-3(pkg10): a >12h usage pause exits 0');
+
+    my @nl = ($out =~ /\n/g);
+    is(scalar(@nl), 1, 'AC-3(pkg10): stdout is exactly one line');
+    chomp(my $line = $out);
+    my $act = eval { $J->decode($line) };
+    ok(defined $act, 'AC-3(pkg10): stdout is valid JSON') or diag($out);
+
+    is_deeply([sort keys %$act], [qw(action reason until_epoch until_iso)],
+        'AC-3(pkg10): keys are exactly {action,reason,until_epoch,until_iso}');
+    is($act->{action}, 'pause-long', 'AC-3(pkg10): action is pause-long');
+    is($act->{reason}, 'usage', 'AC-3(pkg10): reason is usage');
+    is($act->{until_epoch}, $EPOCH,
+        'AC-3(pkg10): until_epoch carries the verdict epoch unchanged');
+    like($out, qr/"until_epoch"\s*:\s*[0-9]+/,
+        'AC-3(pkg10): until_epoch is a JSON number in the raw output');
+
+    my $expect_iso = strftime('%Y-%m-%dT%H:%M:%SZ', gmtime($EPOCH));
+    is($act->{until_iso}, $expect_iso,
+        'AC-3(pkg10): until_iso equals POSIX::strftime(%Y-%m-%dT%H:%M:%SZ, gmtime(until_epoch))');
+
+    # AC-4(pkg10): run.md gains a PAUSE-LONG line, never PAUSE-BEYOND-HORIZON.
+    my $run_md = read_file("$dsdir/run.md");
+    like($run_md, qr/PAUSE-LONG/, 'AC-4(pkg10): run.md gains a line matching PAUSE-LONG');
+    ok(index($run_md, $expect_iso) >= 0,
+        'AC-4(pkg10): the run.md line contains the until_iso string');
+    unlike($run_md, qr/PAUSE-BEYOND-HORIZON/,
+        'AC-4(pkg10): no PAUSE-BEYOND-HORIZON line is written on the long-pause path');
+
+    # AC-10(pkg10): no state file other than run.md (+ wake-lock) is touched.
+    my $inflight_after = do {
+        open(my $fh, '<:raw', "$dsdir/inflight.json") or die $!;
+        local $/; my $x = <$fh>; close $fh; $x;
+    };
+    is($inflight_after, $inflight_bytes,
+        'AC-10(pkg10): inflight.json is byte-identical before and after the call');
+    ok(!-e "$dsdir/parks.json", 'AC-10(pkg10): no parks.json is created');
+    ok(!-e "$dsdir/announced.json", 'AC-10(pkg10): no announced.json is created');
+}
+
+# ── AC-6: exactly 12h away stays a plain pause (strict boundary), pinned key set ─
+{
+    my $EPOCH = $NOW + 12 * 3600;   # exactly H12
+    my $data = tempdir(CLEANUP => 1);
+    make_bp_dir($data, 'bp-x', [{key=>'p1',status=>'pending',write_set=>'x/p1/'}]);
+    my $dsdir = "$data/.drive-solo"; make_path($dsdir);
+    write_json("$dsdir/order.json", { order => ['bp-x'], recorded_at => $NOW });
+
+    my ($rc, $out) = capture_run(
+        ['next', '--scope', 'bp-x'],
+        { data_dir => $data,
+          now      => sub { $NOW },
+          verdict  => sub { { action=>'pause-usage', until_epoch=>$EPOCH, reason=>'usage' } } }
+    );
+    is($rc, 0, 'AC-6(pkg10): exactly-12h call exits 0');
+    chomp(my $line = $out);
+    my $act = eval { $J->decode($line) };
+    ok(defined $act, 'AC-6(pkg10): stdout is valid JSON') or diag($out);
+    is($act->{action}, 'pause',
+        'AC-6(pkg10): exactly 12h away is still plain pause (strict >, not >=)');
+    is_deeply([sort keys %$act], [qw(action reason until_epoch)],
+        'AC-6(pkg10): keys are exactly {action,reason,until_epoch} -- no until_iso on the plain-pause path');
+}
+
+# ── AC-9: an undefined until_epoch never yields pause-long ──────────────────
+{
+    my $data = tempdir(CLEANUP => 1);
+    make_bp_dir($data, 'bp-x', [{key=>'p1',status=>'pending',write_set=>'x/p1/'}]);
+    my $dsdir = "$data/.drive-solo"; make_path($dsdir);
+    write_json("$dsdir/order.json", { order => ['bp-x'], recorded_at => $NOW });
+
+    my ($rc, $out) = capture_run(
+        ['next', '--scope', 'bp-x'],
+        { data_dir => $data,
+          now      => sub { $NOW },
+          verdict  => sub { { action=>'pause-usage', until_epoch=>undef, reason=>'usage' } } }
+    );
+    is($rc, 0, 'AC-9(pkg10): undefined until_epoch call exits 0');
+    chomp(my $line = $out);
+    my $act = eval { $J->decode($line) };
+    ok(defined $act, 'AC-9(pkg10): stdout is valid JSON') or diag($out);
+    is($act->{action}, 'pause',
+        'AC-9(pkg10): an undefined until_epoch never yields pause-long (E3)');
+}
+
+# ── red-team L5 pin: a pathologically huge until_epoch must fail safe, ──────
+# never die. Pre-fix, gmtime()/strftime() on an epoch this large dies with
+# "Usage: POSIX::strftime", killing `next` with NO action emitted at all --
+# itself a worse never-halt violation than the bug pause-long exists to fix.
+# The guard is `return 0 unless gmtime(int $until);` before the strftime call.
+{
+    my $HUGE = 67768036191676799;
+
+    # Direct pure-sub call: must not die, must return 0 (never "long").
+    my $died = 0;
+    my $result = eval { BpDrive::pause_is_long('usage', $HUGE, $NOW) };
+    $died = 1 if $@;
+    ok(!$died, 'L5(pkg10): pause_is_long does not die on a pathologically huge until_epoch')
+        or diag($@);
+    is($result, 0, 'L5(pkg10): pause_is_long fails safe to 0 (not long) on a huge until_epoch')
+        unless $died;
+
+    # Full next path: must not die, must emit the ordinary `pause` action
+    # (not pause-long, not a crash with no action at all).
+    my $data = tempdir(CLEANUP => 1);
+    make_bp_dir($data, 'bp-x', [{key=>'p1',status=>'pending',write_set=>'x/p1/'}]);
+    my $dsdir = "$data/.drive-solo"; make_path($dsdir);
+    write_json("$dsdir/order.json", { order => ['bp-x'], recorded_at => $NOW });
+
+    my ($rc, $out);
+    my $full_died = 0;
+    eval {
+        ($rc, $out) = capture_run(
+            ['next', '--scope', 'bp-x'],
+            { data_dir => $data,
+              now      => sub { $NOW },
+              verdict  => sub { { action=>'pause-usage', until_epoch=>$HUGE, reason=>'usage' } } }
+        );
+        1;
+    } or do { $full_died = 1; };
+    ok(!$full_died, 'L5(pkg10): the full next call does not die on a pathologically huge until_epoch')
+        or diag($@);
+
+    SKIP: {
+        skip 'L5(pkg10): next died, cannot inspect its output', 3 if $full_died;
+        is($rc, 0, 'L5(pkg10): the full next call exits 0 on a huge until_epoch');
+        chomp(my $line = $out);
+        my $act = eval { $J->decode($line) };
+        ok(defined $act, 'L5(pkg10): stdout is still valid JSON') or diag($out);
+        is($act->{action}, 'pause',
+            'L5(pkg10): a huge until_epoch fails safe to the ordinary pause action, never pause-long')
+            if defined $act;
+    }
+}
+
+# ── AC-11: --help documents the new pause-long action shape ────────────────
+{
+    my ($rc, $out) = capture_run(['--help'], {});
+    is($rc, 0, 'AC-11(pkg10): --help exits 0');
+    like($out, qr/pause-long/, 'AC-11(pkg10): --help lists the pause-long action');
+    like($out, qr/until_iso/,  'AC-11(pkg10): --help documents the until_iso field');
+    like($out, qr/12\s*h\b/,   'AC-11(pkg10): --help states the 12h condition');
+    # B10/§2.4: the existing lines must still be present too.
+    like($out, qr/\bpause\b/,        'AC-11(pkg10): --help still contains the pause action');
+    like($out, qr/pause.*token/s,    'AC-11(pkg10): --help still contains the pause/token action');
+    like($out, qr/ok.*pause-usage.*pause-token.*unavailable/s,
+        'AC-11(pkg10): the governor-verdict-consumed ordering (ok, pause-usage, pause-token, unavailable) is unchanged');
 }
 
 done_testing();

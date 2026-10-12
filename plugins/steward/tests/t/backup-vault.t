@@ -2842,8 +2842,8 @@ PERL
 
     my $pstore  = bp16_open_proj_store($proj, 'todo');
     $pstore->create(id => 'pac6', fields => {}, body => "project record\n");
-    my $pstore2 = bp16_open_proj_store($proj, 'decision');
-    $pstore2->create(id => 'pac6d', fields => {}, body => "project decision record\n");
+    my $pstore2 = bp16_open_proj_store($proj, 'inbox');   # spec 01-inbox-rename AC34: was 'decision'
+    $pstore2->create(id => 'pac6d', fields => {}, body => "project inbox record\n");
     my $gstore  = bp16_open_global_store($r->{home}, 'todo');
     $gstore->create(id => 'gac6', fields => {}, body => "global record\n");
 
@@ -2861,7 +2861,7 @@ PERL
     my @tree = bp16_git_ls_tree($remote, 'main');
     ok(scalar(grep { $_ eq 'projects/ac6/files/.ccpraxis-local-data/almanac/todo/pac6.md' } @tree),
        'AC6: the project almanac record reached the remote');
-    ok(scalar(grep { $_ eq 'projects/ac6/files/.ccpraxis-local-data/almanac/decision/pac6d.md' } @tree),
+    ok(scalar(grep { $_ eq 'projects/ac6/files/.ccpraxis-local-data/almanac/inbox/pac6d.md' } @tree),
        'AC6: a second project store TYPE reached the remote too');
     ok(scalar(grep { $_ eq 'almanac/todo/gac6.md' } @tree),
        'AC6: the global almanac record reached the remote');

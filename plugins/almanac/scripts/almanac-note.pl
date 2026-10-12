@@ -15,10 +15,19 @@ use warnings;
 use File::Path ();
 use JSON::PP ();
 use Encode ();
+use File::Temp ();
 
 # Almanac/ sits beside THIS FILE (not $0, not FindBin -- both are the
 # invoking program, which a test's `do $NOTE_PL` makes the .t file, not
-# this one). See almanac-todo.pl's BEGIN block for the same reasoning.
+# this one). See almanac-todo.pl's BEGIN block for the same reasoning. This
+# file was never hit by bug 75fe's doubled-join defect -- it only unshifts
+# $dir onto @INC and loads siblings via bareword `use Module ();`, which
+# resolves through perl's own @INC search rather than a manual string-
+# concatenated require path, so a relative $dir (left as-is from __FILE__,
+# no abs_path/rel2abs call) already works. Unlike the scripts that did have
+# the defect (almanac-doctor.pl, almanac-inbox.pl), this file adds no path-
+# resolving import at all: this test's own §2.0 import allowlist (AC-47)
+# has neither Cwd nor File::Spec in it, and this file needs neither.
 BEGIN {
     my $dir = __FILE__;
     $dir =~ s{\\}{/}g;
@@ -30,6 +39,7 @@ use Almanac::Store ();
 use Almanac::Record ();
 use Almanac::Lock ();
 use Almanac::GlobalCounts ();
+use Almanac::ClaudeMdBlock ();
 
 our $VERSION = '1.0';
 
@@ -62,11 +72,130 @@ sub _maybe_refresh_global_counts {
     return;
 }
 
+# Verbs whose success in GLOBAL scope must re-render ~/.claude/almanac-
+# notes.md (spec 09, Decision 10). promote is deliberately excluded (out of
+# scope -- flagged to the driver).
+my %RENDER_INDEX_VERBS = map { $_ => 1 } qw(create edit delete);
+
+# _run_render_index_child($o) -> { ok => 1 } | { ok => 0, reason => $r }
+#
+# Spawns `almanac-migrate-memories.pl render-index` as a CHILD process (S2.4
+# "why a child process") so its own `exit 2` on refusal never ends THIS
+# process. STDOUT/STDERR are captured through File::Temp files (never an
+# in-memory scalar reopen -- the CLAUDE.md-documented "Bad file descriptor"
+# landmine) and restored before returning, whatever the outcome.
+sub _run_render_index_child {
+    my ($o) = @_;
+
+    my $dir = __FILE__;
+    $dir =~ s{\\}{/}g;
+    $dir =~ s{/[^/]+\z}{};
+    $dir = '.' unless length $dir;
+    my $script = "$dir/almanac-migrate-memories.pl";
+    return { ok => 0, reason => 'render_script_missing' } unless -f $script;
+
+    my @argv = ($script, 'render-index');
+    push @argv, '--home', $o->{home} if exists $o->{home};
+
+    my ($out_fh, $out_path) = File::Temp::tempfile(UNLINK => 1);
+    my ($err_fh, $err_path) = File::Temp::tempfile(UNLINK => 1);
+    close $out_fh;
+    close $err_fh;
+
+    STDOUT->flush;
+    open(my $save_out, '>&', \*STDOUT) or return { ok => 0, reason => 'spawn_failed' };
+    unless (open(my $save_err, '>&', \*STDERR)) {
+        open(STDOUT, '>&', $save_out);
+        return { ok => 0, reason => 'spawn_failed' };
+    } else {
+        # keep $save_err alive for the restore below
+        my $rc;
+        my $spawned = eval {
+            open(STDOUT, '>', $out_path) or die "open_out\n";
+            open(STDERR, '>', $err_path) or die "open_err\n";
+            $rc = system { $^X } ($^X, @argv);
+            1;
+        };
+        open(STDOUT, '>&', $save_out);
+        open(STDERR, '>&', $save_err);
+        binmode(STDOUT, ':encoding(UTF-8)');
+
+        return { ok => 0, reason => 'spawn_failed' } unless $spawned;
+        return { ok => 0, reason => 'spawn_failed' } if !defined($rc) || $rc == -1;
+
+        return { ok => 1 } if $rc == 0;
+
+        my $err_bytes = '';
+        if (open(my $fh, '<:raw', $err_path)) {
+            local $/;
+            $err_bytes = <$fh>;
+            close $fh;
+        }
+        my $exit_code = $rc >> 8;
+        my $signal_num = $rc & 127;
+        my $default_reason = $signal_num ? "signal_$signal_num" : "exit_$exit_code";
+        my $reason = (defined($err_bytes) && $err_bytes =~ /^\s*detail:\s*(\S+)/m)
+            ? $1 : $default_reason;
+        return { ok => 0, reason => $reason };
+    }
+}
+
+# _maybe_render_index($scope, \%o) -- called after a global create/edit/
+# delete's own STDOUT has already been printed. Never dies, never exits: any
+# internal error becomes reason => 'render_error' (S2.4).
+sub _maybe_render_index {
+    my ($scope, $o) = @_;
+    return unless $scope eq 'global';
+
+    local $@;
+    my $result = eval { _run_render_index_child($o) };
+    my $ok     = (ref($result) eq 'HASH') ? $result->{ok} : 0;
+    my $reason = (ref($result) eq 'HASH' && defined $result->{reason}) ? $result->{reason} : 'render_error';
+
+    if ($ok) {
+        print "index: rendered\n";
+    } else {
+        print "index: failed\n";
+        print STDERR "almanac: notes index not rendered (reason: $reason); the note change was kept -- fix the cause, then run almanac-migrate-memories.pl render-index\n";
+        print STDERR "almanac-warning:\n";
+        print STDERR "  kind: notes_index_stale\n";
+        print STDERR "  reason: $reason\n";
+    }
+    return;
+}
+
 # ---------------------------------------------------------------------------
 # small helpers
 # ---------------------------------------------------------------------------
 
 sub _usage { die Almanac::Store::Error->new(kind => 'usage', detail => $_[0]) }
+
+# _covers_bytes($v) -> the number of UTF-8 octets $v would occupy ON DISK
+# (S2.2 "covers byte count"). Argv arrives as raw bytes (no utf8 flag); a
+# string already carrying the flag (built in-process) is encoded once.
+#
+# A raw-bytes value that is NOT clean, complete UTF-8 (e.g. a lone lead byte,
+# never produced by a real terminal but reachable via a fixture) is mirrored
+# against Almanac::Record::serialize()'s own HIGH-2 decode-then-maybe-
+# reencode step: such a value is left as raw bytes there, and the
+# surrounding Encode::encode('UTF-8', $text) then upgrades every byte >= 0x80
+# as its own Latin-1 code point before re-encoding it, DOUBLING it. Counting
+# anything else would let this check pass a value that the store then writes
+# at a different size than the one just validated.
+sub _covers_bytes {
+    my ($v) = @_;
+    return 0 unless defined $v;
+    if (utf8::is_utf8($v)) {
+        my $e = eval { Encode::encode('UTF-8', $v) };
+        return defined($e) ? length($e) : length($v);
+    }
+    my $tail = $v;
+    my $decoded = eval { Encode::decode('UTF-8', $tail, Encode::FB_QUIET()) };
+    return length($v) if defined($decoded) && !length($tail);
+    my $n = 0;
+    $n += ($_ >= 0x80 ? 2 : 1) for unpack('C*', $v);
+    return $n;
+}
 
 sub _trim {
     my ($s) = @_;
@@ -266,6 +395,19 @@ sub _unversioned_prefix {
     return $store->scope eq 'project' ? '.ccpraxis-local-data' : 'notes';
 }
 
+# _target_is_internal_shaped($store, $target) -> 1 | 0 -- the single shared
+# definition of "this target looks like it lives under the scope's internal
+# notes prefix" (spec 2.2: must be factored out, never re-derived). Used by
+# _cmd_edit, _cmd_delete and _validate_target so a future change (for
+# example Windows case folding) cannot leave one caller on a different
+# definition than the others.
+sub _target_is_internal_shaped {
+    my ($store, $target) = @_;
+    return 0 unless defined $target;
+    my $prefix = _internal_prefix($store);
+    return $target =~ m{\A\Q$prefix\E/[^/]+\.md\z} ? 1 : 0;
+}
+
 # _structurally_valid_target($raw) -> 1 | 0 -- S2.3 steps 1-3 only (never
 # dies, never checks audience). Used by check_pointers() so a malformed
 # target/promote_to field can never make it probe outside the anchor.
@@ -300,9 +442,8 @@ sub _validate_target {
     _usage('bad_target') if $t =~ m{(?:\A|/)\.(?:/|\z)};
     _usage('bad_target') unless $t =~ /\A.+\.md\z/;
     if ($audience eq 'internal') {
-        my $prefix = _internal_prefix($store);
         _usage('internal_target_outside_notes_dir')
-            unless $t =~ m{\A\Q$prefix\E/[^/]+\.md\z};
+            unless _target_is_internal_shaped($store, $t);
     } elsif ($audience eq 'external') {
         my $unv = _unversioned_prefix($store);
         # Compared case-insensitively on Windows (and other case-insensitive
@@ -544,6 +685,23 @@ sub _cmd_create {
         $fields{covers} = $mc;
     }
 
+    # A global note's covers line is the only line a session sees in the
+    # rendered index (S2.3) -- required, and bounded by the same budget the
+    # render step truncates against, so a refusal here never surprises
+    # anyone with a silently-truncated value later.
+    if ($scope eq 'global') {
+        my $budget = Almanac::ClaudeMdBlock::COVERS_BYTE_BUDGET();
+        unless (exists $fields{covers}) {
+            print STDERR "almanac: a global note needs --covers: one line of at most $budget bytes saying what the note covers (it is the only line sessions see in the notes index)\n";
+            _usage('missing_covers');
+        }
+        my $n = _covers_bytes($fields{covers});
+        if ($n > $budget) {
+            print STDERR "almanac: --covers is $n bytes; a global note's covers must be at most $budget bytes (it is the only line sessions see in the notes index)\n";
+            _usage('covers_over_budget');
+        }
+    }
+
     my $body = _resolve_body($o);
 
     if ($materialize) {
@@ -663,6 +821,36 @@ sub _cmd_edit {
         else            { push @unset, 'tags' unless grep { $_ eq 'tags' } @unset }
     }
 
+    # A global note's covers stays required and budgeted across an edit too
+    # (S2.3): unsetting it with nothing to replace it is refused, and a new
+    # value is budget-checked exactly like create's. An edit that never
+    # touches covers is never refused here, even for a legacy record whose
+    # stored covers is missing or over budget.
+    if ($scope eq 'global') {
+        my $budget = Almanac::ClaudeMdBlock::COVERS_BYTE_BUDGET();
+        if ((grep { $_ eq 'covers' } @unset) && !exists $set{covers}) {
+            print STDERR "almanac: a global note needs --covers: one line of at most $budget bytes saying what the note covers (it is the only line sessions see in the notes index)\n";
+            _usage('missing_covers');
+        }
+        # review S1 / red-team F2: the dedicated --covers flag above already
+        # refuses an empty value (bad_covers), but a bare --set covers=...
+        # stored the raw value unchecked, so an empty or whitespace-only
+        # --set covers= blanked a global note's required covers field with
+        # exit 0. Close that the same way --unset-with-no-replacement is
+        # closed: refuse before the budget check ever runs.
+        if (exists $set{covers} && _trim($set{covers}) eq '') {
+            print STDERR "almanac: a global note needs --covers: one line of at most $budget bytes saying what the note covers (it is the only line sessions see in the notes index)\n";
+            _usage('missing_covers');
+        }
+        if (exists $set{covers}) {
+            my $n = _covers_bytes($set{covers});
+            if ($n > $budget) {
+                print STDERR "almanac: --covers is $n bytes; a global note's covers must be at most $budget bytes (it is the only line sessions see in the notes index)\n";
+                _usage('covers_over_budget');
+            }
+        }
+    }
+
     # Step 3: resolve the body (if given), then the content (if given).
     my $body    = $body_given    ? _resolve_body($o)    : undef;
     my $content = $content_given ? _resolve_content($o) : undef;
@@ -693,8 +881,7 @@ sub _cmd_edit {
         # hand edit or an older script version -- spec 2.3).
         my $target_is_internal_shaped = 0;
         if ($audience eq 'internal') {
-            my $prefix = _internal_prefix($store);
-            $target_is_internal_shaped = ($target =~ m{\A\Q$prefix\E/[^/]+\.md\z}) ? 1 : 0;
+            $target_is_internal_shaped = _target_is_internal_shaped($store, $target);
         }
         _usage('external_target_refused')
             if ($audience eq 'external' || ($audience eq 'internal' && !$target_is_internal_shaped))
@@ -738,9 +925,10 @@ sub _cmd_edit {
             # S1 (review 02-review.md): clean up only a temp THIS invocation
             # created, and only if it is still a plain file -- never a
             # directory (or anything else) that happened to occupy the same
-            # name. AC-46 (almanac-note-crud.t) forbids the literal `unlink`
-            # in this file; remove_tree also removes a plain file, but never
-            # recurses into one, so it is safe once gated this way.
+            # name. This uses remove_tree rather than unlink (the one
+            # `unlink` call in this file lives in _cmd_delete, S2.5) --
+            # remove_tree also removes a plain file, but never recurses into
+            # one, so it is safe once gated this way.
             File::Path::remove_tree($tmp) if $created && -f $tmp && !-l $tmp;
             die $err;
         }
@@ -870,6 +1058,66 @@ sub _cmd_delete {
     $expect{rev} = $o->{'expect-rev'} if exists $o->{'expect-rev'};
     $store->delete($id, expect => \%expect);
     _print_result(id => $rec->{id}, scope => $scope, path => $rec->{path}, changed => 'yes');
+
+    # Content-file removal (S2.5) -- decided from the fields read BEFORE the
+    # delete, and only acted on AFTER $store->delete returns successfully.
+    # An external target, a malformed/outside-the-notes-dir target, or a
+    # promote in flight all leave the rule false: the file is never stat'd,
+    # opened or removed.
+    my $f          = $rec->{fields};
+    my $audience   = $f->{audience};
+    my $target     = $f->{target};
+    my $promote_to = $f->{promote_to};
+    my $remove_rule = 0;
+    if (defined($audience) && $audience eq 'internal'
+        && defined($target) && _structurally_valid_target($target)
+        && !defined($promote_to)) {
+        $remove_rule = 1 if _target_is_internal_shaped($store, $target);
+    }
+
+    unless ($remove_rule) {
+        print "content: kept\n";
+        return;
+    }
+
+    # Target-uniqueness guard (review M2 / red-team F1): an internal note's
+    # target is only safe to unlink if THIS record is the sole owner of it.
+    # _validate_target lets create register an explicit --target pointing at
+    # any file under the internal prefix, including another live note's
+    # content file, so without this check a delete here can destroy a
+    # different note's content. Compared case-insensitively because this
+    # runs on Windows, where 'notes/a.md' and 'notes/A.md' are one file.
+    my $target_cmp = ($^O =~ /^(MSWin32|cygwin|msys)$/) ? lc($target) : $target;
+    for my $other (@{ $store->list }) {
+        next if $other->{id} eq $rec->{id};
+        my $other_target = $other->{fields}{target};
+        next unless defined $other_target;
+        my $other_cmp = ($^O =~ /^(MSWin32|cygwin|msys)$/) ? lc($other_target) : $other_target;
+        if ($other_cmp eq $target_cmp) {
+            print "content: kept\n";
+            return;
+        }
+    }
+
+    my $abs = _anchor_abs($store) . "/$target";
+    if (-f $abs && !-l $abs) {
+        if (unlink $abs) {
+            print "content: removed\n";
+        } else {
+            my $errno = "$!";
+            print "content: failed\n";
+            print STDERR "almanac: note record deleted but its content file was not removed ("
+                . _encode_for_error($abs) . "): $errno\n";
+            print STDERR "almanac-warning:\n";
+            print STDERR "  kind: note_content_not_removed\n";
+            (my $tok = $errno) =~ s/\s+/_/g;
+            print STDERR "  reason: $tok\n";
+        }
+    } elsif (-e $abs) {
+        print "content: kept\n";
+    } else {
+        print "content: absent\n";
+    }
 }
 
 sub _cmd_check_pointers {
@@ -938,6 +1186,18 @@ unless (caller) {
             _usage('missing_flag_value') if $bool_default{$k};
         }
 
+        # An empty --home/--root ("" -- distinct from the flag being absent
+        # entirely) must also fail closed (review M4 / red-team F4): Store's
+        # _resolve_home treats '' as unset and falls through to
+        # ALMANAC_HOME/HOME/USERPROFILE, so an empty value here silently
+        # redirects a mutating verb to the REAL vault instead of the caller's
+        # intended fixture. This is the exact mechanism behind this
+        # package's real-vault incident.
+        for my $k (qw(home root)) {
+            _usage('missing_flag_value')
+                if exists($o{$k}) && !$bool_default{$k} && !length($o{$k});
+        }
+
         if ($cmd ne 'check-pointers') {
             _usage('scope_conflict') if exists($o{project}) && exists($o{global});
         }
@@ -951,6 +1211,7 @@ unless (caller) {
         elsif ($cmd eq 'delete')          { _cmd_delete($scope, \%o, \@pos) }
         elsif ($cmd eq 'check-pointers')  { _cmd_check_pointers(\%o, \@pos) }
 
+        _maybe_render_index($scope, \%o) if $RENDER_INDEX_VERBS{$cmd};
         _maybe_refresh_global_counts($scope, \%o) if $GLOBAL_COUNTS_VERBS{$cmd};
         1;
     };

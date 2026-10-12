@@ -20,6 +20,26 @@
                }
             ],
             "matcher" : "Task|Agent|Bash"
+         },
+         {
+            "hooks" : [
+               {
+                  "command" : "unset BASH_ENV ; f=\"${CLAUDE_PLUGIN_ROOT}/hooks/denial-breaker.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
+                  "timeout" : 15,
+                  "type" : "command"
+               }
+            ]
+         }
+      ],
+      "PostToolUseFailure" : [
+         {
+            "hooks" : [
+               {
+                  "command" : "unset BASH_ENV ; f=\"${CLAUDE_PLUGIN_ROOT}/hooks/denial-breaker.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
+                  "timeout" : 15,
+                  "type" : "command"
+               }
+            ]
          }
       ],
       "PreToolUse" : [
@@ -126,6 +146,47 @@
                }
             ],
             "matcher" : "AskUserQuestion"
+         },
+         {
+            "hooks" : [
+               {
+                  "command" : "unset BASH_ENV ; f=\"${CLAUDE_PLUGIN_ROOT}/hooks/denial-breaker.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
+                  "timeout" : 15,
+                  "type" : "command"
+               }
+            ]
+         },
+         {
+            "hooks" : [
+               {
+                  "command" : "unset BASH_ENV ; f=\"${CLAUDE_PLUGIN_ROOT}/hooks/ac-standdown-gate.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
+                  "timeout" : 15,
+                  "type" : "command"
+               }
+            ]
+         }
+      ],
+      "Notification" : [
+         {
+            "hooks" : [
+               {
+                  "command" : "unset BASH_ENV ; f=\"${CLAUDE_PLUGIN_ROOT}/hooks/record-prompt.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
+                  "timeout" : 15,
+                  "type" : "command"
+               }
+            ],
+            "matcher" : "permission_prompt"
+         }
+      ],
+      "PermissionDenied" : [
+         {
+            "hooks" : [
+               {
+                  "command" : "unset BASH_ENV ; f=\"${CLAUDE_PLUGIN_ROOT}/hooks/record-denial.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
+                  "timeout" : 15,
+                  "type" : "command"
+               }
+            ]
          }
       ],
       "SubagentStop" : [
@@ -133,6 +194,37 @@
             "hooks" : [
                {
                   "command" : "unset BASH_ENV ; f=\"${CLAUDE_PLUGIN_ROOT}/hooks/track-dispatch.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
+                  "timeout" : 15,
+                  "type" : "command"
+               }
+            ]
+         }
+      ],
+      "SessionStart" : [
+         {
+            "hooks" : [
+               {
+                  "command" : "unset BASH_ENV ; f=\"${CLAUDE_PLUGIN_ROOT}/hooks/denial-breaker.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
+                  "timeout" : 15,
+                  "type" : "command"
+               }
+            ]
+         },
+         {
+            "hooks" : [
+               {
+                  "command" : "unset BASH_ENV ; f=\"${CLAUDE_PLUGIN_ROOT}/hooks/session-start-nudge.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
+                  "timeout" : 15,
+                  "type" : "command"
+               }
+            ]
+         }
+      ],
+      "UserPromptSubmit" : [
+         {
+            "hooks" : [
+               {
+                  "command" : "unset BASH_ENV ; f=\"${CLAUDE_PLUGIN_ROOT}/hooks/arm-nudge-prompt.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
                   "timeout" : 15,
                   "type" : "command"
                }

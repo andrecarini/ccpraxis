@@ -49,7 +49,7 @@ use File::Path qw(make_path);
 use Cwd qw(abs_path);
 
 my $BUTLER = abs_path("$Bin/../..");
-my $SCRIPT = "$BUTLER/scripts/bp-answer-decision.pl";
+my $SCRIPT = "$BUTLER/scripts/bp-answer-escalation.pl";
 
 ok(-f $SCRIPT, "subject under test exists: $SCRIPT") or BAIL_OUT("cannot find $SCRIPT");
 

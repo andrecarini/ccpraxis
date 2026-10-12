@@ -1190,7 +1190,7 @@ if [ "$KIND" = "root" ]; then
     echo
     echo "  $NPATH"
     echo
-    echo "Bug reports are written only through almanac-bug.pl (file | update | append | set-status), and almanac records only through their own scripts (almanac-todo.pl, almanac-note.pl, almanac-task.pl, almanac-decision.pl). Run the script verb for the record you meant, and use absolute paths instead of cd."
+    echo "Bug reports are written only through almanac-bug.pl (file | update | append | set-status), and almanac records only through their own scripts (almanac-todo.pl, almanac-note.pl, almanac-thread.pl, almanac-inbox.pl). Run the script verb for the record you meant, and use absolute paths instead of cd."
     echo
     echo "Any write that did not go through the scripts is reported by:  perl <ccpraxis>/plugins/almanac/scripts/almanac-bug.pl verify"
   } >&2
@@ -1199,13 +1199,19 @@ fi
 
 # kind == store — the verb map, keyed by lc(type). ${TYPE,,} is a bash
 # builtin (no extra process on the deny path, unlike a printf|tr pipeline).
+# LEGACY_INBOX_TYPE is the unmigrated store dir's own name (blueprint
+# where-things-go, package 01-inbox-rename): a write into an unmigrated
+# legacy dir is still denied and points at the live script.
 TYPE_LC=${TYPE,,}
+LEGACY_INBOX_TYPE=decision
 case "$TYPE_LC" in
   todo)        SCRIPT="almanac-todo.pl";     VERBS="create | edit | complete | reopen | delete" ;;
   note)        SCRIPT="almanac-note.pl";     VERBS="create | edit | promote | delete" ;;
-  task)        SCRIPT="almanac-task.pl";     VERBS="add | edit | status | move-first | move-last | reorder" ;;
-  task-focus)  SCRIPT="almanac-task.pl";     VERBS="focus | unfocus" ;;
-  decision)    SCRIPT="almanac-decision.pl"; VERBS="file | answer" ;;
+  task)        SCRIPT="almanac-thread.pl";   VERBS="list (the flat tasklist and focus are retired; threads replace them)" ;;
+  task-focus)  SCRIPT="almanac-thread.pl";   VERBS="list (the flat tasklist and focus are retired; threads replace them)" ;;
+  thread|thread-tasks-*|thread-log-*)
+               SCRIPT="almanac-thread.pl";   VERBS="create | add | edit | move | reorder | status | archive | event" ;;
+  inbox|"$LEGACY_INBOX_TYPE")  SCRIPT="almanac-inbox.pl"; VERBS="file | answer" ;;
   "")
     SCRIPT="almanac-<type>.pl"
     VERBS="(the script for the store you meant)"

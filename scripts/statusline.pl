@@ -129,6 +129,13 @@ my $WARN    = rgb('state.warn');
 my $CRIT    = rgb('state.crit');
 my $SEP     = " ${RULE}\x{FF5C}${R} ";
 
+# Theme's 'thread.blocked' codepoint (Decision 54: U+229D CIRCLED DASH, a
+# reversible stand-in for Decision 12's U+26D4, which fails the no-colour-
+# emoji guards). Named once here so a future swap touches exactly the three
+# places that need the literal: this constant, %GLYPH_COLS below and the
+# render site in thread_row -- never a fourth hard-coded \x{229D} (review N5).
+my $G_BLOCKED = "\x{229D}";
+
 # ── Display width ────────────────────────────────────────────
 # %GLYPH_COLS declares the display width of every non-single-column glyph
 # this file can emit. U+FF5C (the segment separator) is FULL-WIDTH: two
@@ -149,6 +156,19 @@ my %GLYPH_COLS = (
     0x274F => 1,
     # The notes icon (package 10). East-Asian-WIDE, so two columns.
     0x2630 => 2,
+    # The thread row's glyphs (package 12-statusline-threads, spec 2.4).
+    # U+25B6, U+2192 and U+2502 are East-Asian-ambiguous; the rest default to
+    # one column anyway, but every glyph the thread row can emit is declared
+    # explicitly so the AC-S5/AC-8 drift guards stay meaningful for all of
+    # them, not just the ambiguous ones.
+    0x23E3 => 1,   # icon.threads, the row-1 thread counter / thread-row lead
+    0x25B0 => 1,   # thread.full, a done task in the bar
+    0x25B1 => 1,   # thread.empty, an open task in the bar
+    0x25B6 => 1,   # cursor, the thread row's "doing" marker
+    0x2192 => 1,   # arrow.right, the thread row's "next" marker
+    0x2502 => 1,   # rule.v, the thread row's path separator
+    0x23F8 => 1,   # thread.idle, nothing doing
+    ord($G_BLOCKED) => 1,   # thread.blocked, the current task is blocked
 );
 
 # row_cost($fragment) -> the budget a rendered fragment consumes.
@@ -310,7 +330,7 @@ sub spawn_detached {
 }
 
 # ── Almanac counters (generated) ─────────────────────────────
-# The counting code for todos, notes, the tasklist and pending decisions. It
+# The counting code for todos, notes, the thread and the operator's inbox. It
 # cannot be imported (this file loads nothing from the repo) and must not
 # spawn (a subprocess per render costs ~292 ms on the Windows host), so it is
 # GENERATED next to the almanac modules and carried here byte for byte. A
@@ -320,23 +340,38 @@ sub spawn_detached {
 # Regenerate: perl plugins/almanac/scripts/gen-statusline-counters.pl
 #
 # The one shared accessor for almanac counts, restated from Almanac::Store,
-# Almanac::GlobalCounts and almanac-task.pl because this file may import
-# nothing. Every public sub wraps its body in eval and degrades to the
-# "unavailable" value (undef); nothing here ever dies to its caller, spawns,
-# or writes. Paths are byte strings throughout.
+# Almanac::GlobalCounts, Almanac::PackageLink and Almanac::Thread because
+# this file may import nothing. Every public sub wraps its body in eval and
+# degrades to the "unavailable" value (undef); nothing here ever dies to its
+# caller, spawns, or writes. Paths are byte strings throughout.
 #
 #   almanac_counts(cwd => $dir, sandbox => 0|1) -> {
-#       project => { todo, note, task, decision } | undef,
-#       global  => { todo, note } | undef }
-#   almanac_focus(cwd => $dir, session => $sid) -> undef | { name, current }
+#       project => { todo, note, thread, inbox } | undef,
+#       global  => { todo, note, thread } | undef }
+#   almanac_thread(cwd => $dir, session => $sid) -> undef | {
+#       name, done, total, doing => [ \%label, ... ],
+#       current => \%label | undef, next => \%label | undef }
+#     %label = ( class => 'doing'|'blocked'|'pending',
+#                kind => 'text', title => $text, waits_on => $text|undef )
+#            | ( class => ..., kind => 'link', blueprint => $bp,
+#                number => $nn, step => $word )
+#   blueprint where-things-go, package 12-statusline-threads (spec section
+#   2). almanac_focus and the flat-tasklist "task" count are RETIRED
+#   (Decision 3): the row-1 counter and the directory row now read threads.
 my $ALMANAC_SNAPSHOT_NAME = 'almanac-global-counts.json';
+my $ALMANAC_LEGACY_INBOX_DIR = 'decision';
+my $ALM_PKG_STATUS_OK = { map { ($_ => 1) } qw(pending running converging reviewing done blocked parked dropped) };
 # Frontmatter already read this render, keyed by the record dir's identity
 # (device and inode where the platform has them, else its path) plus the
-# entry name. A focused tasklist is often the project itself under another
-# spelling of its path, and a file open is the dominant cost of a render, so
-# its task files are read once, not twice.
+# entry name. An attached thread's own record and its task records are each
+# read once, not twice, even though almanac_counts and almanac_thread both
+# scan thread/ -- a file open is the dominant cost of a render.
 my $ALMANAC_FM_SEEN = {};
 my $ALMANAC_DIR_KEY = {};
+# Per-render memo of _alm_link_resolve, keyed by "$root\0$link" -- spec 5
+# requires each ledger be read at most once per render; without this, K tasks
+# linking the same package re-read and re-scan the ledger K times.
+my $ALMANAC_LINK_SEEN = {};
 # _alm_bytes($s) -> $s as UTF-8 bytes. A JSON-decoded path is a character
 # string; the filesystem wants the bytes.
 sub _alm_bytes {
@@ -361,11 +396,236 @@ sub _alm_is_id {
     return 0 if $id =~ /\A(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])\z/i;
     return 1;
 }
-# _alm_project_root($cwd) -> the project root, or undef. Mirrors
-# Almanac::Store::resolve_project_root textually (Cwd is not allowed here):
-# the nearest ancestor holding .ccpraxis-local-data or .git, else a non-empty
-# CLAUDE_PROJECT_DIR, else the start. A relative start is never walked, so
-# the process cwd is never consulted; a relative result is no project.
+# _alm_sw_* / $ALMANAC_SW_IS_WIN / _alm_bounded_walk -- a PRIVATE mirror of
+# plugins/butler/scripts/BpDataRoot.pm's bounded walk-up (R1-R4), restated
+# here because this file may import nothing (AC-S3/AC-9). The marker kept is
+# this file's own: .ccpraxis-local-data OR .git, matching
+# Almanac::Store::_bounded_walk (unlike BpDataRoot.pm, which never looks at
+# .git). A parity test (statusline-bounded-walkup.t AC-3) asserts the 11
+# stop-rule subs below are source-identical to BpDataRoot.pm, modulo naming.
+my $ALMANAC_SW_IS_WIN = ($^O =~ /^(MSWin32|msys|cygwin)$/) ? 1 : 0;
+sub _alm_sw_fold_ascii {
+    my ($s) = @_;
+    return $s unless defined $s;
+    (my $t = $s) =~ tr/A-Z/a-z/;
+    return $t;
+}
+sub _alm_sw_is_abs_ish {
+    my ($p) = @_;
+    return 0 unless defined $p && length $p;
+    return 1 if $p =~ m{^/};
+    return 1 if $p =~ m{^[A-Za-z]:[\\/]};
+    return 1 if $ALMANAC_SW_IS_WIN && $p =~ m{^\\};
+    return 0;
+}
+sub _alm_sw_lex_canon {
+    my ($p) = @_;
+    return '' unless defined $p;
+    (my $s = $p) =~ s{\\}{/}g;
+    my $drive_prefix = '';
+    if ($ALMANAC_SW_IS_WIN) {
+        if ($s =~ m{^/([A-Za-z])(/.*)?$}) {
+            my $rest = defined $2 ? $2 : '/';
+            $s = lc($1) . ':' . $rest;
+        }
+        elsif ($s =~ m{^([A-Za-z]):(/.*)?$}) {
+            my $rest = defined $2 ? $2 : '/';
+            $s = lc($1) . ':' . $rest;
+        }
+        if ($s =~ m{^([a-z]:)(/.*)?$}) {
+            $drive_prefix = $1;
+            $s = defined $2 ? $2 : '/';
+        }
+    }
+    my $is_abs = ($s =~ m{^/});
+    my @parts = split m{/+}, $s;
+    shift @parts if @parts && $parts[0] eq '';
+    my @out;
+    for my $seg (@parts) {
+        next if $seg eq '' || $seg eq '.';
+        if ($seg eq '..') { pop @out if @out; next }
+        push @out, $seg;
+    }
+    my $canon = $is_abs ? ('/' . join('/', @out)) : join('/', @out);
+    $canon = $drive_prefix . $canon if length $drive_prefix;
+    unless ($canon =~ m{^(?:[a-z]:)?/\z}) {
+        $canon =~ s{/\z}{};
+    }
+    return $canon;
+}
+sub _alm_sw_seg_eq {
+    my ($x, $y, $allow_83) = @_;
+    $allow_83 = 1 unless defined $allow_83;
+    return $x eq $y unless $ALMANAC_SW_IS_WIN;
+    return 1 if _alm_sw_fold_ascii($x) eq _alm_sw_fold_ascii($y);
+    return 0 unless $allow_83;
+    for my $pair ([$x, $y], [$y, $x]) {
+        my ($short, $long) = @$pair;
+        next unless defined $short && $short =~ /^([^~\/]{1,6})~[0-9]+(?:\.[^.\/]{0,3})?$/;
+        my $stem = _alm_sw_fold_ascii($1);
+        $stem =~ s/[^a-z0-9]//g;
+        next unless length $stem;
+        my $longfold = _alm_sw_fold_ascii($long);
+        $longfold =~ s/[^a-z0-9]//g;
+        $longfold = substr($longfold, 0, 6);
+        return 1 if $stem eq $longfold;
+    }
+    return 0;
+}
+sub _alm_sw_same_path {
+    my ($p, $q, $allow_83) = @_;
+    $allow_83 = 1 unless defined $allow_83;
+    return 0 unless defined $p && defined $q;
+    my $ca = _alm_sw_lex_canon($p);
+    my $cb = _alm_sw_lex_canon($q);
+    my @sa = grep { length } split m{/}, $ca, -1;
+    my @sb = grep { length } split m{/}, $cb, -1;
+    return 0 unless scalar(@sa) == scalar(@sb);
+    for my $i (0 .. $#sa) {
+        return 0 unless _alm_sw_seg_eq($sa[$i], $sb[$i], $allow_83);
+    }
+    return 1;
+}
+sub _alm_sw_real_path {
+    my ($p) = @_;
+    return $p unless defined $p && length $p;
+    return $p unless -e $p;
+    my $r = eval { Cwd::abs_path($p) };
+    return (defined $r && length $r) ? $r : $p;
+}
+sub _alm_sw_same_path_any_form {
+    my ($d, $s, $allow_83) = @_;
+    $allow_83 = 1 unless defined $allow_83;
+    return 1 if _alm_sw_same_path($d, $s, $allow_83);
+    my $rd = _alm_sw_real_path($d);
+    my $rs = _alm_sw_real_path($s);
+    return 1 if _alm_sw_same_path($rd, $rs, $allow_83);
+    if ($^O =~ /^(msys|cygwin)$/ && defined &Cygwin::posix_to_win_path) {
+        my $wd = eval { Cygwin::posix_to_win_path($rd) };
+        my $ws = eval { Cygwin::posix_to_win_path($rs) };
+        $wd = $rd unless defined $wd;
+        $ws = $rs unless defined $ws;
+        return 1 if _alm_sw_same_path($wd, $ws, $allow_83);
+    }
+    return 0;
+}
+sub _alm_sw_compute_stops {
+    my @candidates;
+    push @candidates, eval { File::Spec->tmpdir };
+    push @candidates, $ENV{TMP}, $ENV{TEMP}, $ENV{TMPDIR};
+    push @candidates, $ENV{HOME}, $ENV{USERPROFILE};
+    my @stops;
+    for my $v (@candidates) {
+        next unless defined $v && length $v;
+        next unless _alm_sw_is_abs_ish($v);
+        my $canon = _alm_sw_lex_canon($v);
+        next if $canon =~ m{^(?:[a-z]:)?/\z};
+        push @stops, $v;
+    }
+    return \@stops;
+}
+sub _alm_sw_is_stop {
+    my ($d, $stops, $allow_83) = @_;
+    $allow_83 = 1 unless defined $allow_83;
+    for my $s (@$stops) {
+        return 1 if _alm_sw_same_path_any_form($d, $s, $allow_83);
+    }
+    return 0;
+}
+sub _alm_sw_collapse_dotdot {
+    my ($p) = @_;
+    return $p unless defined $p && length $p;
+    return $p unless $p =~ m{(?:^|/)\.\.?(?:/|\z)};
+    my $drive_prefix = '';
+    my $s = $p;
+    if ($ALMANAC_SW_IS_WIN && $s =~ m{^([A-Za-z]:)(/.*)?\z}) {
+        $drive_prefix = $1;
+        $s = defined $2 ? $2 : '/';
+    }
+    my $is_abs = ($s =~ m{^/});
+    my @parts = split m{/+}, $s;
+    shift @parts if @parts && $parts[0] eq '';
+    my @out;
+    for my $seg (@parts) {
+        next if $seg eq '' || $seg eq '.';
+        if ($seg eq '..') { pop @out if @out; next }
+        push @out, $seg;
+    }
+    my $canon = $is_abs ? ('/' . join('/', @out)) : join('/', @out);
+    $canon = $drive_prefix . $canon if length $drive_prefix;
+    unless ($canon =~ m{^(?:[A-Za-z]:)?/\z}) {
+        $canon =~ s{/\z}{};
+    }
+    return $canon;
+}
+sub _alm_sw_home_usable {
+    for my $v ($ENV{HOME}, $ENV{USERPROFILE}) {
+        return 1 if defined $v && length $v && _alm_sw_is_abs_ish($v);
+    }
+    return 0;
+}
+sub _alm_sw_parent_of {
+    my ($d) = @_;
+    return undef unless defined $d && length $d;
+    return undef if $d =~ m{\A[A-Za-z]:/?\z};
+    return undef if $d eq '/';
+    my $idx = rindex($d, '/');
+    return undef if $idx < 0;
+    my $parent = substr($d, 0, $idx);
+    return '/' if $parent eq '';
+    return "$parent/" if $parent =~ m{\A[A-Za-z]:\z};
+    return $parent;
+}
+sub _alm_bounded_walk {
+    my ($start) = @_;
+    return undef unless defined $start && length $start;
+    (my $s = $start) =~ s{\\}{/}g;
+    $s = _alm_sw_collapse_dotdot($s) if length $s;
+    my $home_ok = _alm_sw_home_usable();
+    my $stops = _alm_sw_compute_stops();
+    # stat-based identity (device+inode) check, supplementing _alm_sw_is_stop's
+    # text-only match: this file loads no Cwd (AC-S3/AC-9), so the _alm_sw_*
+    # subs' realpath step is silently inert and a junction/symlink/alternate-
+    # codepoint alias of a stop directory evades text comparison. stat is a
+    # core builtin -- no use/require needed -- and two paths naming the same
+    # filesystem entry share a (dev, ino) pair even when their text differs.
+    my @stop_dev_ino;
+    for my $stop (@$stops) {
+        my @st = stat($stop);
+        push @stop_dev_ino, [$st[0], $st[1]] if @st && defined $st[0];
+    }
+    my $d = $s;
+    my %seen;
+    while (1) {
+        return undef if $seen{$d}++;
+        my $is_stop_here = _alm_sw_is_stop($d, $stops);
+        if (!$is_stop_here && @stop_dev_ino) {
+            my @dst = stat($d);
+            if (@dst && defined $dst[0]) {
+                for my $sdi (@stop_dev_ino) {
+                    if ($dst[0] == $sdi->[0] && $dst[1] == $sdi->[1]) {
+                        $is_stop_here = 1;
+                        last;
+                    }
+                }
+            }
+        }
+        return undef if $is_stop_here && !_alm_sw_same_path_any_form($d, $s);
+        return $d if -d "$d/.ccpraxis-local-data" || -e "$d/.git";
+        return undef if $is_stop_here;
+        return undef unless $home_ok;
+        my $parent = _alm_sw_parent_of($d);
+        return undef unless defined $parent && length $parent && $parent ne $d;
+        $d = $parent;
+    }
+}
+# _alm_project_root($cwd) -> the project root, or undef. The nearest ancestor
+# holding .ccpraxis-local-data or .git, found by the bounded walk
+# _alm_bounded_walk above; that walk mirrors Almanac::Store::_bounded_walk
+# and plugins/butler/scripts/BpDataRoot.pm's R1-R4, restated inline because
+# this file may import nothing. After the walk comes CLAUDE_PROJECT_DIR, then
+# the start. A relative start is never walked, so the process cwd is never
+# consulted; a relative result is no project.
 sub _alm_project_root {
     my ($cwd) = @_;
     my $start = _alm_bytes($cwd);
@@ -374,17 +634,7 @@ sub _alm_project_root {
     if (_alm_is_abs($start)) {
         my $dir = $start;
         $dir =~ s{/+\z}{} unless $dir =~ m{\A(?:[A-Za-z]:)?/\z};
-        while (length $dir) {
-            if (-d "$dir/.ccpraxis-local-data" || -e "$dir/.git") { $project = $dir; last }
-            last if $dir =~ m{\A[A-Za-z]:/?\z} || $dir eq '/';
-            my $idx = rindex($dir, '/');
-            last if $idx < 0;
-            my $parent = substr($dir, 0, $idx);
-            $parent = '/' if $parent eq '';
-            $parent = "$parent/" if $parent =~ m{\A[A-Za-z]:\z};
-            last if $parent eq $dir;
-            $dir = $parent;
-        }
+        $project = _alm_bounded_walk($dir);
     }
     if (!defined $project) {
         my $cpd = $ENV{CLAUDE_PROJECT_DIR};
@@ -511,13 +761,36 @@ sub _alm_count {
     }
     return $n;
 }
+# _alm_count_field($dir, $field, @values) -> the records in $dir that parse
+# and whose $field equals one of @values. Same record-name grammar and
+# frontmatter cache as _alm_count, generalised to any field (package
+# 12-statusline-threads: thread records are counted by "state", not
+# "status").
+sub _alm_count_field {
+    my ($dir, $field, @values) = @_;
+    my %want = map { ($_ => 1) } @values;
+    my $n = 0;
+    for my $e (_alm_record_names($dir)) {
+        my $fm = _alm_frontmatter($dir, $e);
+        next unless $fm;
+        next unless defined $fm->{$field};
+        next unless $want{ $fm->{$field} };
+        $n++;
+    }
+    return $n;
+}
 sub _alm_nonneg_int {
     my ($v) = @_;
     return 0 unless defined $v && !ref($v);
     return ("$v" =~ /\A\d+\z/) ? 1 : 0;
 }
-# _alm_snapshot($path) -> { todo, note } or undef. One attempt, never a
-# retry: Almanac::GlobalCounts::_read_snapshot_once's checks, in its order.
+# _alm_snapshot($path) -> { todo, note, thread } or undef. One attempt, never
+# a retry: Almanac::GlobalCounts::_read_snapshot_once's checks, in its order.
+# thread is the integer thread.open when the snapshot carries a HASH "thread"
+# member whose "open" is a non-negative integer and whose "projects" (if
+# present) is an ARRAY of defined, non-ref, non-empty scalars; otherwise
+# thread is undef -- a malformed thread member never invalidates todo/note
+# (package 12-statusline-threads, spec 2.1).
 sub _alm_snapshot {
     my ($path) = @_;
     return undef unless -f $path;
@@ -540,7 +813,22 @@ sub _alm_snapshot {
     }
     my $note = $d->{note};
     return undef unless ref($note) eq 'HASH' && _alm_nonneg_int($note->{total});
-    return { todo => 0 + $todo->{open}, note => 0 + $note->{total} };
+    my $thread;
+    my $th = $d->{thread};
+    if (ref($th) eq 'HASH' && _alm_nonneg_int($th->{open})) {
+        my $projects_ok = 1;
+        if (exists $th->{projects}) {
+            if (ref($th->{projects}) eq 'ARRAY') {
+                for my $p (@{ $th->{projects} }) {
+                    $projects_ok = 0 if !defined($p) || ref($p) || !length("$p");
+                }
+            } else {
+                $projects_ok = 0;
+            }
+        }
+        $thread = 0 + $th->{open} if $projects_ok;
+    }
+    return { todo => 0 + $todo->{open}, note => 0 + $note->{total}, thread => $thread };
 }
 sub almanac_counts {
     my (%o) = @_;
@@ -552,78 +840,303 @@ sub almanac_counts {
             $project = {
                 todo     => _alm_count("$ad/todo", 'open'),
                 note     => _alm_count("$ad/note"),
-                task     => _alm_count("$ad/task", 'pending', 'doing', 'blocked'),
-                decision => _alm_count("$ad/decision", 'unanswered'),
+                thread   => _alm_count_field("$ad/thread", 'state', 'live', 'handed-off'),
+                inbox    => _alm_count(-d "$ad/inbox" ? "$ad/inbox" : "$ad/$ALMANAC_LEGACY_INBOX_DIR", 'unanswered'),
             };
         }
         1;
     } or $project = undef;
     eval {
         my $home = _alm_home();
-        if (defined $home && $o{sandbox}) {
-            $global = _alm_snapshot("$home/.claude/$ALMANAC_SNAPSHOT_NAME");
-        }
-        elsif (defined $home) {
-            my $v = "$home/.claude/claude-code-vault/almanac";
-            $global = { todo => _alm_count("$v/todo", 'open'), note => _alm_count("$v/note") };
+        if (defined $home) {
+            my $snap = _alm_snapshot("$home/.claude/$ALMANAC_SNAPSHOT_NAME");
+            if ($o{sandbox}) {
+                $global = $snap;
+            } else {
+                my $v = "$home/.claude/claude-code-vault/almanac";
+                $global = { todo => _alm_count("$v/todo", 'open'), note => _alm_count("$v/note"),
+                            thread => (ref($snap) eq 'HASH' ? $snap->{thread} : undef) };
+            }
         }
         1;
     } or $global = undef;
     return { project => $project, global => $global };
 }
-# _alm_text($chars) -> a decoded field value with C0 and DEL removed.
+# _alm_text($chars) -> a decoded field value with C0, DEL and Unicode format
+# characters (\p{Cf}: bidi overrides/embeddings/isolates, ZWSP, the Arabic
+# letter mark, etc.) removed. Format characters pass grammar-restricted
+# fields untouched (those are plain ASCII) but would otherwise reach a free-
+# text title or blocked_on byte for byte, letting a crafted value reverse or
+# spoof the rendered row on a bidi-aware terminal (redteam L1).
 sub _alm_text {
     my ($s) = @_;
     $s = '' unless defined $s;
     $s =~ s/[\x00-\x1f\x7f]//g;
+    $s =~ s/\p{Cf}//g;
     return $s;
 }
-sub _alm_focus {
+# _alm_thread_name_ok($name) -> 1 iff $name is a thread id (restates
+# Almanac::Thread::valid_name: lowercase alnum/hyphen, <=64 chars, not a
+# reserved device name). This is stricter and lower-case-only compared to
+# _alm_is_id, which is the generic Almanac::Store grammar used for record
+# FILE names (e.g. task ids) -- the two must not be conflated.
+sub _alm_thread_name_ok {
+    my ($name) = @_;
+    return 0 unless defined $name && $name =~ /\A[a-z0-9][a-z0-9-]{0,63}\z/;
+    return 0 if $name =~ /\A(?:con|prn|aux|nul|com[1-9]|lpt[1-9])\z/i;
+    return 1;
+}
+# _alm_rank_id_cmp($ra, $rb, $ia, $ib) -> restates Almanac::Store's
+# _rank_id_cmp: rank (if both defined) compared with cmp, tie broken by id;
+# a ranked entry always sorts before an unranked one; two unranked entries
+# sort by id.
+sub _alm_rank_id_cmp {
+    my ($ra, $rb, $ia, $ib) = @_;
+    if (defined $ra && defined $rb) {
+        my $c = $ra cmp $rb;
+        return $c ? $c : ($ia cmp $ib);
+    } elsif (defined $ra) {
+        return -1;
+    } elsif (defined $rb) {
+        return 1;
+    } else {
+        return $ia cmp $ib;
+    }
+}
+# _alm_norm_pkg_status($raw) -> restates Almanac::PackageLink::norm_status:
+# lowercase, every run of non-[a-z] becomes one space, trim, and the WHOLE
+# result must equal one of @Almanac::PackageLink::STATUSES (interpolated at
+# generation time into $ALM_PKG_STATUS_OK, the same way $ALMANAC_SNAPSHOT_NAME
+# is interpolated) or the result is ''.
+sub _alm_norm_pkg_status {
+    my ($s) = @_;
+    return '' unless defined $s;
+    my $t = lc $s;
+    $t =~ s/[^a-z]+/ /g;
+    $t =~ s/\A\s+|\s+\z//g;
+    return $ALM_PKG_STATUS_OK->{$t} ? $t : '';
+}
+# _alm_read_capped($path, $cap) -> up to $cap bytes of $path, or undef if it
+# cannot be opened. Read in 8 KiB steps, same discipline as _alm_frontmatter.
+sub _alm_read_capped {
+    my ($path, $cap) = @_;
+    return undef unless open(my $fh, '<:raw', $path);
+    my $bytes = '';
+    my $n = 0;
+    while ($n < $cap) {
+        my $want = $cap - $n;
+        $want = 8192 if $want > 8192;
+        my $got = read($fh, $bytes, $want, $n);
+        last unless defined $got && $got > 0;
+        $n += $got;
+    }
+    close($fh);
+    return $bytes;
+}
+# _alm_link_resolve($root, $link) -> restates Almanac::PackageLink::resolve
+# plus the pipeline-step reader (spec 2.2). Never consults CCPRAXIS_DATA_DIR.
+# { state => 'invalid' }
+# { state => 'missing', blueprint, package }
+# { state => 'ok', blueprint, package, status, step }
+sub _alm_link_resolve {
+    my ($root, $link) = @_;
+    $link = '' unless defined $link;
+    my $key = (defined($root) ? $root : '') . "\0" . $link;
+    my $cached = $ALMANAC_LINK_SEEN->{$key};
+    return $cached if defined $cached;
+    my $result = _alm_link_resolve_uncached($root, $link);
+    $ALMANAC_LINK_SEEN->{$key} = $result;
+    return $result;
+}
+sub _alm_link_resolve_uncached {
+    my ($root, $link) = @_;
+    my @parts = split m{/}, $link, -1;
+    return { state => 'invalid' } unless @parts == 2;
+    my ($bp, $pkg) = @parts;
+    for my $p ($bp, $pkg) {
+        return { state => 'invalid' }
+            unless defined($p) && length($p) && length($p) <= 128
+                && $p =~ /\A[A-Za-z0-9][A-Za-z0-9._-]*\z/ && index($p, '..') < 0;
+    }
+    $bp  = _alm_bytes($bp);
+    $pkg = _alm_bytes($pkg);
+    my $live     = "$root/.ccpraxis-local-data/blueprints/$bp/packages/$pkg.md";
+    my $archived = "$root/.ccpraxis-local-data/blueprints/_archive/$bp/packages/$pkg.md";
+    my $ledger;
+    if (-f $live)          { $ledger = $live }
+    elsif (-f $archived)   { $ledger = $archived }
+    else                   { return { state => 'missing', blueprint => $bp, package => $pkg } }
+    my $bytes = _alm_read_capped($ledger, 65536);
+    $bytes = '' unless defined $bytes;
+    my @lines = split /\n/, $bytes, -1;
+    my $in = 0;
+    my $status_raw;
+    for my $ln (@lines) {
+        if ($ln =~ /\A-{3}\s*\z/) { $in++; last if $in == 2; next; }
+        next unless $in == 1;
+        if (!defined($status_raw) && $ln =~ /\Astatus:[ \t]*(.*)/) {
+            my $raw = $1;
+            $raw =~ s/\s+\z//;
+            $status_raw = $raw;
+        }
+    }
+    my $norm = _alm_norm_pkg_status($status_raw);
+    my $status = length($norm) ? $norm : 'pending';
+    my $step = _alm_pipeline_step($bytes);
+    return { state => 'ok', blueprint => $bp, package => $pkg, status => $status, step => $step };
+}
+# _alm_pipeline_step($blob) -> the current step word, or undef -- restates
+# RunState::_parse_pipeline's rule (spec 2.2), run over ledger bytes.
+sub _alm_pipeline_step {
+    my ($blob) = @_;
+    return undef unless defined $blob && length $blob;
+    my $s = $blob;
+    $s =~ s/\A\xEF\xBB\xBF//;
+    my @lines = split /\n/, $s, -1;
+    for my $l (@lines) { $l =~ s/\r\z//; }
+    my $start;
+    for my $i (0 .. $#lines) {
+        if ($lines[$i] =~ /\A##[ \t]+Pipeline[ \t]*\z/i) { $start = $i; last; }
+    }
+    return undef unless defined $start;
+    my %checked;
+    my %word;
+    my $in_fence = 0;
+    for (my $i = $start + 1; $i <= $#lines; $i++) {
+        my $line = $lines[$i];
+        if ($line =~ /\A[ \t]*(?:\x60{3}|~~~)/) { $in_fence = $in_fence ? 0 : 1; next; }
+        last if !$in_fence && $line =~ /\A#{1,6}[ \t]/;
+        next if length($line) > 1024;
+        if ($line =~ /\A[ \t]*-[ \t]*\[([ xX])\][ \t]*(\d{1,2})\.[ \t]+(\S+)/) {
+            my ($mark, $num_raw, $w) = ($1, $2, $3);
+            my $num = 0 + $num_raw;
+            next if exists $checked{$num};
+            $checked{$num} = ($mark eq 'x' || $mark eq 'X') ? 1 : 0;
+            $word{$num} = $w;
+        }
+    }
+    my @nums = sort { $a <=> $b } keys %checked;
+    return undef unless @nums;
+    my @pending = grep { !$checked{$_} } @nums;
+    return undef unless @pending;
+    my $w = lc($word{ $pending[0] });
+    $w =~ s/[^a-z0-9-]//g;
+    return length($w) ? $w : undef;
+}
+# _alm_classify_linked($status) -> 'done'|'doing'|'blocked'|'pending', per
+# spec 2.1's resolved-status table.
+sub _alm_classify_linked {
+    my ($status) = @_;
+    return 'done'    if defined($status) && ($status eq 'done' || $status eq 'dropped');
+    return 'doing'   if defined($status) && ($status eq 'running' || $status eq 'converging' || $status eq 'reviewing');
+    return 'blocked' if defined($status) && ($status eq 'blocked' || $status eq 'parked');
+    return 'pending';
+}
+# _alm_classify_unlinked($status) -> 'done'|'doing'|'blocked'|'pending', per
+# spec 2.1's unlinked-status table.
+sub _alm_classify_unlinked {
+    my ($status) = @_;
+    $status = '' unless defined $status;
+    return 'done'    if $status eq 'done' || $status eq 'obsoleted';
+    return 'doing'   if $status eq 'doing';
+    return 'blocked' if $status eq 'blocked';
+    return 'pending';
+}
+# _alm_pkg_number($pkg) -> the leading digits of a package name (leading
+# zeros kept), or the whole package part when it has none (spec 2.1 rule 7).
+sub _alm_pkg_number {
+    my ($pkg) = @_;
+    $pkg = '' unless defined $pkg;
+    return $1 if $pkg =~ /\A(\d+)/;
+    return $pkg;
+}
+# _alm_task_label($root, \%fm, $id) -> ($class, \%label), per spec 2.1 rules
+# 5-9.
+sub _alm_task_label {
+    my ($root, $fm, $id) = @_;
+    if (defined($fm->{link})) {
+        my $res = _alm_link_resolve($root, $fm->{link});
+        if ($res->{state} eq 'ok') {
+            my $class = _alm_classify_linked($res->{status});
+            my $step  = (defined($res->{step}) && length($res->{step})) ? $res->{step} : $res->{status};
+            return ($class, { class => $class, kind => 'link', blueprint => $res->{blueprint},
+                               number => _alm_pkg_number($res->{package}), step => $step });
+        }
+        if ($res->{state} eq 'missing') {
+            return ('pending', { class => 'pending', kind => 'link', blueprint => $res->{blueprint},
+                                  number => _alm_pkg_number($res->{package}), step => 'missing' });
+        }
+        my $txt = _alm_text($fm->{link}) . ' missing';
+        return ('pending', { class => 'pending', kind => 'text', title => $txt, waits_on => undef });
+    }
+    my $class = _alm_classify_unlinked($fm->{status});
+    my $title = _alm_text($fm->{title});
+    $title = $id unless length $title;
+    my $wo;
+    if (defined $fm->{blocked_on}) {
+        my $w = _alm_text($fm->{blocked_on});
+        $wo = length($w) ? $w : undef;
+    }
+    return ($class, { class => $class, kind => 'text', title => $title, waits_on => $wo });
+}
+# _alm_thread_find(cwd, session) -> the implementation behind almanac_thread
+# (spec 2.1). Not eval-wrapped itself; almanac_thread wraps it.
+sub _alm_thread_find {
     my (%o) = @_;
     my $sid = $o{session};
     return undef unless _alm_is_id($sid);
     my $root = _alm_project_root($o{cwd});
     return undef unless defined $root;
-    my $fm = _alm_frontmatter("$root/.ccpraxis-local-data/almanac/task-focus", "$sid.md");
-    return undef unless $fm && defined $fm->{tasklist};
-    my $tl = $fm->{tasklist};
-    $tl =~ tr{\\}{/};
-    $tl =~ s{/+\z}{};
-    return undef unless length $tl;
-    my $base = $tl;
-    $base =~ s{\A.*/}{}s;
-    my $name = _alm_text($base);
-    return undef unless length $name;
-    my $current;
-    # The value is decoded text; the filesystem wants its bytes. A relative
-    # tasklist would resolve against the process cwd, so it names only.
-    my $tl_bytes = _alm_bytes($tl);
-    return { name => $name, current => $current } unless _alm_is_abs($tl_bytes);
-    my $dir = "$tl_bytes/.ccpraxis-local-data/almanac/task";
-    my @doing;
-    for my $e (_alm_record_names($dir)) {
-        my $t = _alm_frontmatter($dir, $e);
-        next unless $t && defined $t->{status} && $t->{status} eq 'doing';
+    my $tdir = "$root/.ccpraxis-local-data/almanac/thread";
+    my @names;
+    if (opendir(my $dh, $tdir)) {
+        while (defined(my $e = readdir($dh))) {
+            next unless $e =~ /\A(.+)\.md\z/s;
+            push @names, $1 if _alm_thread_name_ok($1);
+        }
+        closedir($dh);
+    }
+    my $chosen;
+    for my $name (sort @names) {
+        my $fm = _alm_frontmatter($tdir, "$name.md");
+        next unless $fm;
+        next unless defined($fm->{state}) && $fm->{state} eq 'live';
+        next unless defined($fm->{owner_kind}) && $fm->{owner_kind} eq 'session';
+        next unless defined($fm->{owner_id}) && $fm->{owner_id} eq $sid;
+        $chosen = $name;
+        last;
+    }
+    return undef unless defined $chosen;
+    my $tasks_dir = "$root/.ccpraxis-local-data/almanac/thread-tasks-$chosen";
+    my @recs;
+    for my $e (_alm_record_names($tasks_dir)) {
+        my $fm = _alm_frontmatter($tasks_dir, $e);
+        next unless $fm;
         (my $id = $e) =~ s/\.md\z//;
-        push @doing, [ $t->{rank}, $id, $t->{title} ];
+        push @recs, { id => $id, fm => $fm };
     }
-    @doing = sort {
-        (defined $a->[0] && defined $b->[0]) ? (($a->[0] cmp $b->[0]) || ($a->[1] cmp $b->[1]))
-      : defined $a->[0] ? -1
-      : defined $b->[0] ? 1
-      : ($a->[1] cmp $b->[1])
-    } @doing;
-    if (@doing && defined $doing[0][2]) {
-        $current = _alm_text($doing[0][2]);
-        $current = undef unless length $current;
+    @recs = sort { _alm_rank_id_cmp($a->{fm}{rank}, $b->{fm}{rank}, $a->{id}, $b->{id}) } @recs;
+    my $total = scalar @recs;
+    my $done = 0;
+    my @doing;
+    my $current;
+    my $next;
+    for my $r (@recs) {
+        my ($class, $label) = _alm_task_label($root, $r->{fm}, $r->{id});
+        if ($class eq 'done') { $done++; next; }
+        push @doing, $label if $class eq 'doing';
+        $current = $label unless defined $current;
+        $next = $label if !defined($next) && $class eq 'pending';
     }
-    return { name => $name, current => $current };
+    $current = undef if @doing;
+    return { name => $chosen, done => $done, total => $total, doing => \@doing,
+             current => $current, next => $next };
 }
-sub almanac_focus {
+sub almanac_thread {
     my (%o) = @_;
-    my $focus;
-    eval { $focus = _alm_focus(%o); 1 } or $focus = undef;
-    return $focus;
+    my $t;
+    eval { $t = _alm_thread_find(%o); 1 } or $t = undef;
+    return $t;
 }
 # <<< END GENERATED FROM gen-statusline-counters.pl <<<
 
@@ -919,36 +1432,35 @@ eval {
 };
 # -- power-plan:end --
 
-# ── Pending decisions, and every other almanac count ─────────
+# ── The operator's inbox, and every other almanac count ─────────
 #
 # A COUNT, BECAUSE THE ALTERNATIVE WAS STOPPING. Unattended work used to halt
 # the moment an agent wanted to ask something -- hours of idle for an answer
 # nobody was there to give, and usually for a question the agent could have
-# settled itself. Questions are filed as almanac pending decisions now
-# instead, and the thing that makes that acceptable rather than a way of
-# losing them is that the operator can SEE there are some waiting without
-# going to look.
+# settled itself. Questions are filed as almanac inbox items now instead, and
+# the thing that makes that acceptable rather than a way of losing them is
+# that the operator can SEE there are some waiting without going to look.
 #
-# Package 10 routes this, and the todo/note/tasklist counters below, through
+# Package 10 routes this, and the todo/note/thread counters below, through
 # the ONE generated accessor above. This is its only call site; the counters
 # segment reuses the same result.
 my $almanac = { project => undef, global => undef };
 {
-    # -- pending-decisions:begin --
+    # -- inbox:begin --
     $almanac = almanac_counts(cwd => $workspace, sandbox => $SANDBOX_ON);
-    # -- pending-decisions:end --
+    # -- inbox:end --
 }
 my $alm_project = ref($almanac) eq 'HASH' && ref($almanac->{project}) eq 'HASH' ? $almanac->{project} : {};
 my $alm_global  = ref($almanac) eq 'HASH' && ref($almanac->{global})  eq 'HASH' ? $almanac->{global}  : {};
-my $pending_decisions = $alm_project->{decision} // 0;
+my $inbox_unanswered = $alm_project->{inbox} // 0;
 
-# The pending-decisions flag, built here rather than inside the "Plans &
-# Todos" eval below: this way a failure in the blueprint scan (opendir ...
-# or die) can never take the flag down with it. It leads the counters field
-# now (Decision 1) rather than riding in the marker.
-my $decisions_str = '';
-$decisions_str = bgrgb('overlay.warn') . rgb('overlay.warn') . "\x{2691} ${pending_decisions}${R}"
-    if $pending_decisions > 0;
+# The inbox flag, built here rather than inside the "Plans & Todos" eval
+# below: this way a failure in the blueprint scan (opendir ... or die) can
+# never take the flag down with it. It leads the counters field (Decision 1)
+# rather than riding in the marker.
+my $inbox_str = '';
+$inbox_str = bgrgb('overlay.warn') . rgb('overlay.warn') . "\x{2691} ${inbox_unanswered}${R}"
+    if $inbox_unanswered > 0;
 
 # ── ...and where it goes ─────────────────────────────────────
 #
@@ -977,9 +1489,9 @@ my $marker  = ($watched ? $OK : $FAINT)
 # space -- when neither applies.
 $marker .= "${R} ${WARN}${badge_glyph}${R}" if length $badge_glyph;
 
-# Pending decisions no longer ride in the marker field (Decision 1): they now
-# lead the counters field via $decisions_str, built above next to
-# $pending_decisions, so the fit ladder can drop them last rather than first.
+# The inbox flag no longer rides in the marker field (Decision 1): it now
+# leads the counters field via $inbox_str, built above next to
+# $inbox_unanswered, so the fit ladder can drop it last rather than first.
 
 # ── Git (with background fetch every 30 min) ────────────────
 my $git_str = '';
@@ -1051,20 +1563,39 @@ eval {
     # highlight, so nothing here is drawn in the bright colours.
     #
     # Todos are U+274F (package 01-statusline-counters; U+22EE previously),
-    # with a space before the number, same as the tasklist. Notes are
+    # with a space before the number, same as the thread counter. Notes are
     # U+2630, with NO space before the number -- the one counter that packs
-    # tight against its glyph. The tasklist is U+25A3 (project only: tasks
-    # have no global store). All are declared in Theme.pm and, where not one
-    # column, in %GLYPH_COLS above.
-    for my $c (['task', "\x{25A3}", 0, ' '], ['todo', "\x{274F}", 1, ' '], ['note', "\x{2630}", 1, '']) {
-        my ($kind, $glyph, $has_global, $gap) = @$c;
-        my $p = $alm_project->{$kind} // 0;
-        my $g = $has_global ? ($alm_global->{$kind} // 0) : 0;
+    # tight against its glyph. The thread counter is U+23E3 (package
+    # 12-statusline-threads: replaces the retired U+25A3 tasklist counter;
+    # unlike the tasklist, threads DO have a global side, read from the
+    # snapshot -- Decision 18 F4). All are declared in Theme.pm and, where
+    # not one column, in %GLYPH_COLS above.
+    #
+    # Clamp, thread only (spec 2.3): a defined global count below the
+    # project's own is shown as the project's, since the global snapshot
+    # counts every project including this one and so can never truly be
+    # lower -- a sandbox-created thread can leave it stale (refresh refuses
+    # in a container). An absent/invalid global thread count is 0, same as
+    # every other counter here, and is never clamped (behaviour 2: no
+    # snapshot renders "P", not "P.P").
+    for my $c (['thread', "\x{23E3}", 1, ' ', 1], ['todo', "\x{274F}", 1, ' ', 0], ['note', "\x{2630}", 1, '', 0]) {
+        my ($kind, $glyph, $has_global, $gap, $clamp) = @$c;
+        my $p     = $alm_project->{$kind} // 0;
+        my $g_raw = $has_global ? $alm_global->{$kind} : undef;
+        my $g     = defined($g_raw) ? $g_raw : 0;
+        $g = $p if $clamp && defined($g_raw) && $g < $p;
         next unless $p > 0 || $g > 0;
         my $seg;
         if ($p > 0) {
             $seg = "${MUTED}${glyph}${R}${gap}${PRIMARY}${p}${R}";
             $seg .= "${FAINT}\x{00B7}${R}${MUTED}${g}${R}" if $g > 0;
+        } elsif ($kind eq 'thread') {
+            # statusline-thread-row.t AC6 behaviour 3: the gap space is
+            # itself INSIDE the number's text.faint run, unlike the older
+            # todos/notes counters below (whose gap sits between the two
+            # colour runs, uncoloured) -- both are correct against their own
+            # oracle; this one is new and this is what it pins.
+            $seg = "${FAINT}${glyph}${R}${FAINT}${gap}${g}${R}";
         } else {
             $seg = "${FAINT}${glyph}${R}${gap}${FAINT}${g}${R}";
         }
@@ -1184,7 +1715,7 @@ $cols = 120 unless defined($cols) && $cols =~ /^\d+$/ && $cols > 0;
 # The $d parameter is retained rather than removed so the ladder's shape and
 # every call site stay recognisable against the tests; it is always passed ''.
 #
-# counters($dec, $plans) -- the decisions flag and the blueprints/tasklist/
+# counters($dec, $plans) -- the inbox flag and the blueprints/thread/
 # todos/notes list, joined by the same two-space separator that already
 # groups those segments from each other. Either half may be empty; the
 # result never has a leading, trailing, or tripled space.
@@ -1214,6 +1745,249 @@ sub path_row {
     return "${FAINT}${d}${R}";
 }
 
+# ── The thread directory row (package 12-statusline-threads, spec 2.3) ──
+#
+# label_text(\%label) -> the FULL, unelided display text for a task label:
+# "<blueprint>/<number> <step>" for a link, else its title. A linked task's
+# OWN title field is never used here (spec 2.1 rule: "A linked task's own
+# title is never rendered").
+sub label_text {
+    my ($label) = @_;
+    return '' unless ref($label) eq 'HASH';
+    if (($label->{kind} // '') eq 'link') {
+        my $bp   = defined($label->{blueprint}) ? $label->{blueprint} : '';
+        my $nn   = defined($label->{number})    ? $label->{number}    : '';
+        my $step = defined($label->{step})      ? $label->{step}      : '';
+        return "$bp/$nn $step";
+    }
+    return defined($label->{title}) ? $label->{title} : '';
+}
+
+# label_minimal(\%label) -> the MINIMAL elided form (spec 2.3's fit_label):
+# ".../<NN>" for a link, the first character plus "..." for text.
+sub label_minimal {
+    my ($label) = @_;
+    return '' unless ref($label) eq 'HASH';
+    if (($label->{kind} // '') eq 'link') {
+        my $nn = defined($label->{number}) ? $label->{number} : '';
+        return ".../$nn";
+    }
+    my $title = defined($label->{title}) ? $label->{title} : '';
+    my $first = substr($title, 0, 1);
+    return length($first) ? "${first}..." : '...';
+}
+
+# fit_label(\%label, $max) -> the first form (spec 2.3) whose row_cost is at
+# most $max, or undef if none is. Link forms: full, "<bp>/<NN>", then
+# substr(bp,0,k).".../"NN for k=length(bp)-1 down to 0. Text forms: full,
+# then the first k characters (trailing whitespace trimmed) plus "..." for
+# k=length(title)-1 down to 1, skipping a k whose trimmed prefix is empty.
+sub fit_label {
+    my ($label, $max) = @_;
+    return undef unless ref($label) eq 'HASH';
+    if (($label->{kind} // '') eq 'link') {
+        my $bp   = defined($label->{blueprint}) ? $label->{blueprint} : '';
+        my $nn   = defined($label->{number})    ? $label->{number}    : '';
+        my $step = defined($label->{step})      ? $label->{step}      : '';
+        my $full = "$bp/$nn $step";
+        return $full if row_cost($full) <= $max;
+        my $short = "$bp/$nn";
+        return $short if row_cost($short) <= $max;
+        for (my $k = length($bp) - 1; $k >= 0; $k--) {
+            my $cand = substr($bp, 0, $k) . ".../$nn";
+            return $cand if row_cost($cand) <= $max;
+        }
+        return undef;
+    }
+    my $title = defined($label->{title}) ? $label->{title} : '';
+    return $title if row_cost($title) <= $max;
+    # Every character costs at least 1 and "..." costs 3, so a k-character
+    # prefix can never fit once k > $max - 3 -- walking from length($title)-1
+    # down to there is wasted O(L) work per candidate, O(L^2) overall, on a
+    # title with no length cap (review M1 / redteam H1). Starting at
+    # min(length-1, $max-3) bounds the loop by $cols instead, with no change
+    # to which prefix is returned: every skipped k could not have fit anyway.
+    my $k0 = length($title) - 1;
+    my $max_k = $max - 3;
+    $k0 = $max_k if $k0 > $max_k;
+    for (my $k = $k0; $k >= 1; $k--) {
+        my $p = substr($title, 0, $k);
+        $p =~ s/\s+\z//;
+        next unless length $p;
+        my $cand = "${p}...";
+        return $cand if row_cost($cand) <= $max;
+    }
+    return undef;
+}
+
+# thread_row(\%thread, $path_text, $cols) -> the directory row, fit to $cols
+# through the 8-rung ladder (spec 2.3). $thread is almanac_thread's return
+# value (always a HASH here). $path_text is '' in the sandbox (no path part
+# at all, per the existing CCPRAXIS_SANDBOX rule); on the host it is the
+# sanitised current_dir. The thread name and n/N are never cut.
+sub thread_row {
+    my ($thread, $path_text, $cols) = @_;
+    my $name  = defined($thread->{name})  ? $thread->{name}  : '';
+    my $N     = defined($thread->{total}) ? $thread->{total} : 0;
+    my $n     = defined($thread->{done})  ? $thread->{done}  : 0;
+    my @doing = (ref($thread->{doing}) eq 'ARRAY') ? @{ $thread->{doing} } : ();
+    my $current = (ref($thread->{current}) eq 'HASH') ? $thread->{current} : undef;
+    my $next    = (ref($thread->{next})    eq 'HASH') ? $thread->{next}    : undef;
+
+    my $LEAD = "${MUTED}\x{23E3}${R} ${PRIMARY}${name}${R}";
+
+    # ACT state: doing (one or more doing tasks), blocked (no doing task but
+    # the first not-done task is blocked-class), else idle. A blocked TEXT
+    # label folds its waits_on into the title here, once, so elision (R3)
+    # treats the whole "<title>: waiting on <X>" as one string (spec 2.3's
+    # ladder note on R3).
+    my ($state, $act_label);
+    if (@doing) {
+        $state     = 'doing';
+        $act_label = $doing[0];
+    } elsif (defined($current) && (($current->{class} // '') eq 'blocked')) {
+        $state     = 'blocked';
+        $act_label = $current;
+        if (($act_label->{kind} // '') ne 'link' && defined($act_label->{waits_on}) && length($act_label->{waits_on})) {
+            $act_label = { %$act_label, title => "$act_label->{title}: waiting on $act_label->{waits_on}" };
+        }
+    } else {
+        $state     = 'idle';
+        $act_label = undef;
+    }
+    my $extra = (@doing > 1) ? (scalar(@doing) - 1) : 0;
+
+    my $bar_part = sub {
+        my ($w, $f) = @_;
+        return '' unless $w > 0;
+        $f = 0 if $f < 0;
+        $f = $w if $f > $w;
+        my $filled = "${ACCENT}" . ("\x{25B0}" x $f) . "${R}";
+        my $empty  = "${FAINT}"  . ("\x{25B1}" x ($w - $f)) . "${R}";
+        return " $filled$empty";
+    };
+    my $act_part = sub {
+        my ($text) = @_;
+        if ($state eq 'doing') {
+            my $seg = "  ${OK}\x{25B6}${R} ${PRIMARY}${text}${R}";
+            $seg .= " ${MUTED}+${extra}${R}" if $extra > 0;
+            return $seg;
+        }
+        if ($state eq 'blocked') {
+            return "  ${CRIT}${G_BLOCKED}${R} ${PRIMARY}${text}${R}";
+        }
+        return "  ${FAINT}\x{23F8} idle${R}";
+    };
+    my $next_part = sub {
+        my ($text) = @_;
+        return " ${FAINT}\x{2192}${R} ${MUTED}${text}${R}";
+    };
+    my $path_part = sub {
+        my ($text) = @_;
+        return '' unless length $text;
+        return "  ${RULE}\x{2502}${R} ${FAINT}${text}${R}";
+    };
+    my $count_part = " ${PRIMARY}${n}/${N}${R}";
+
+    my $path_disp    = defined($path_text) ? $path_text : '';
+    my $next_text    = defined($next) ? label_text($next) : undef;
+    my $act_text     = ($state ne 'idle' && defined($act_label)) ? label_text($act_label) : undef;
+    my $bar_w        = $N;
+    my $bar_f        = $n;
+    my $act_removed  = 0;
+
+    my $measure = sub {
+        my $r = $LEAD;
+        $r .= $bar_part->($bar_w, $bar_f);
+        $r .= $count_part;
+        unless ($act_removed) {
+            $r .= $act_part->($act_text);
+            $r .= $next_part->($next_text) if defined $next_text;
+        }
+        $r .= $path_part->($path_disp);
+        return $r;
+    };
+
+    my $row = $measure->();
+    RUNG: {
+        last RUNG if row_cost($row) <= $cols;
+
+        # R1: the path shortens to "...<sep><last>".
+        if (length $path_disp) {
+            my $p = $path_disp;
+            $p =~ s{[/\\]+\z}{};
+            if ($p =~ m{\A(.*)([/\\])([^/\\]*)\z}) {
+                my $last = $3;
+                $path_disp = "...$2$last" if length $last;
+            }
+        }
+        $row = $measure->();
+        last RUNG if row_cost($row) <= $cols;
+
+        # R2: the next field elides, or is removed entirely.
+        if (defined $next_text) {
+            my $saved = $next_text;
+            $next_text = '';
+            my $without = $measure->();
+            my $avail = $cols - row_cost($without);
+            $next_text = $saved;
+            $next_text = fit_label($next, $avail);
+        }
+        $row = $measure->();
+        last RUNG if row_cost($row) <= $cols;
+
+        # R3: the doing/blocked label elides, down to its minimal form.
+        if ($state ne 'idle' && defined $act_text) {
+            my $saved = $act_text;
+            $act_text = '';
+            my $without = $measure->();
+            my $avail = $cols - row_cost($without);
+            $act_text = $saved;
+            my $fitted = fit_label($act_label, $avail);
+            $act_text = defined($fitted) ? $fitted : label_minimal($act_label);
+        }
+        $row = $measure->();
+        last RUNG if row_cost($row) <= $cols;
+
+        # R4: the bar shrinks to the largest w in [1, N-1] that fits. A bar
+        # wider than $cols can never fit (each cell costs at least 1 column),
+        # so starting at min(N-1, $cols) instead of N-1 bounds this at
+        # O(cols) rather than O(N) per rung, O(N^2) overall for a large
+        # thread (redteam M1) -- every skipped w could not have fit anyway.
+        if ($N > 1) {
+            my $w0 = $N - 1;
+            $w0 = $cols if $w0 > $cols;
+            for (my $w = $w0; $w >= 1; $w--) {
+                my $f = int($n * $w / $N);
+                my ($save_w, $save_f) = ($bar_w, $bar_f);
+                $bar_w = $w; $bar_f = $f;
+                my $r = $measure->();
+                if (row_cost($r) <= $cols) { last; }
+                $bar_w = $save_w; $bar_f = $save_f;
+            }
+        }
+        $row = $measure->();
+        last RUNG if row_cost($row) <= $cols;
+
+        # R5: the bar drops.
+        $bar_w = 0; $bar_f = 0;
+        $row = $measure->();
+        last RUNG if row_cost($row) <= $cols;
+
+        # R6: the path drops.
+        $path_disp = '';
+        $row = $measure->();
+        last RUNG if row_cost($row) <= $cols;
+
+        # R7: the activity (ACT and NEXT) drops, leaving "<lead> <n>/<N>".
+        # Emitted even if the row still overflows -- the thread name and
+        # n/N are never cut.
+        $act_removed = 1;
+        $row = $measure->();
+    }
+    return $row;
+}
+
 # The fit ladder. The WHOLE row is budgeted, never one field of it: the old
 # code truncated the project name to the full column budget and then
 # appended the separator, git and plans segments on top, overflowing the row
@@ -1231,7 +2005,7 @@ sub path_row {
 # a rewrite instead of a one-line change. Steps 4 and 7 are no-ops while
 # $f_cwd is empty -- both are already guarded by `if (length $f_cwd)`.
 #
-# $f_decisions is carried SEPARATELY from $f_plans (Decision 3(5)): the flag
+# $f_inbox is carried SEPARATELY from $f_plans (Decision 3(5)): the flag
 # must keep its old survival priority, riding alongside the marker even after
 # the four counters below it are dropped at step 2. It is folded back onto
 # the marker at step 8 -- the last rung, same as when it lived inside the
@@ -1241,24 +2015,24 @@ my $f_marker    = $marker;
 my $f_project   = $project;
 my $f_cwd       = '';
 my $f_git       = $git_str;
-my $f_decisions = $decisions_str;
+my $f_inbox = $inbox_str;
 my $f_plans     = $plans_str;
 my $sep_cost    = row_cost($SEP);
 my $line1;
 
 FIT: {
-    $line1 = row1($f_marker, $f_project, $f_cwd, $f_git, counters($f_decisions, $f_plans));
+    $line1 = row1($f_marker, $f_project, $f_cwd, $f_git, counters($f_inbox, $f_plans));
     last FIT if row_cost($line1) <= $cols;
 
-    # 2. plans, and its separator. The decisions flag is unaffected -- it
+    # 2. plans, and its separator. The inbox flag is unaffected -- it
     # still rides in the counters field, now alone.
     $f_plans = '';
-    $line1 = row1($f_marker, $f_project, $f_cwd, $f_git, counters($f_decisions, $f_plans));
+    $line1 = row1($f_marker, $f_project, $f_cwd, $f_git, counters($f_inbox, $f_plans));
     last FIT if row_cost($line1) <= $cols;
 
     # 3. git, and its separator.
     $f_git = '';
-    $line1 = row1($f_marker, $f_project, $f_cwd, $f_git, counters($f_decisions, $f_plans));
+    $line1 = row1($f_marker, $f_project, $f_cwd, $f_git, counters($f_inbox, $f_plans));
     last FIT if row_cost($line1) <= $cols;
 
     # 4. left-elide the working directory, down to its floor.
@@ -1269,48 +2043,48 @@ FIT: {
         my $avail = $cols - $fixed;
         $avail = MIN_CWD_COLS if $avail < MIN_CWD_COLS;
         $f_cwd = fit_tail($cwd, $avail);
-        $line1 = row1($f_marker, $f_project, $f_cwd, $f_git, counters($f_decisions, $f_plans));
+        $line1 = row1($f_marker, $f_project, $f_cwd, $f_git, counters($f_inbox, $f_plans));
         last FIT if row_cost($line1) <= $cols;
     }
 
     # 5. right-elide the project name, down to its floor. $fixed accounts for
-    # the decisions flag too, now that it is a field of its own rather than
+    # the inbox flag too, now that it is a field of its own rather than
     # part of $f_marker -- the project's budget must still see the whole row.
     if (length $f_project) {
         my $fixed = row_cost($f_marker) + $sep_cost
                   + (length($f_cwd) ? $sep_cost + row_cost($f_cwd) : 0)
-                  + (length($f_decisions) ? $sep_cost + row_cost($f_decisions) : 0);
+                  + (length($f_inbox) ? $sep_cost + row_cost($f_inbox) : 0);
         my $avail = $cols - $fixed;
         $avail = MIN_PROJECT_COLS if $avail < MIN_PROJECT_COLS;
         $f_project = fit_head($project, $avail);
-        $line1 = row1($f_marker, $f_project, $f_cwd, $f_git, counters($f_decisions, $f_plans));
+        $line1 = row1($f_marker, $f_project, $f_cwd, $f_git, counters($f_inbox, $f_plans));
         last FIT if row_cost($line1) <= $cols;
     }
 
     # 6. the project, and its separator.
     $f_project = '';
-    $line1 = row1($f_marker, $f_project, $f_cwd, $f_git, counters($f_decisions, $f_plans));
+    $line1 = row1($f_marker, $f_project, $f_cwd, $f_git, counters($f_inbox, $f_plans));
     last FIT if row_cost($line1) <= $cols;
 
     # 7. the working directory down to a bare marker, then gone entirely.
     if (length $f_cwd) {
         $f_cwd = fit_tail($cwd, 1);
-        $line1 = row1($f_marker, $f_project, $f_cwd, $f_git, counters($f_decisions, $f_plans));
+        $line1 = row1($f_marker, $f_project, $f_cwd, $f_git, counters($f_inbox, $f_plans));
         last FIT if row_cost($line1) <= $cols;
         $f_cwd = '';
-        $line1 = row1($f_marker, $f_project, $f_cwd, $f_git, counters($f_decisions, $f_plans));
+        $line1 = row1($f_marker, $f_project, $f_cwd, $f_git, counters($f_inbox, $f_plans));
         last FIT if row_cost($line1) <= $cols;
     }
 
-    # 8. the marker itself -- folding the decisions flag back onto it first,
+    # 8. the marker itself -- folding the inbox flag back onto it first,
     # in exactly today's composition, so it is the first thing fit_head cuts
     # rather than something already dropped a step earlier. Below the common
     # slot the symmetry guarantee is void by declaration -- nothing can hold
     # there -- but the budget invariant still does.
     my $m8 = $f_marker;
-    if (length $f_decisions) {
-        $m8 = "${f_marker}${R} ${f_decisions}";
-        $f_decisions = '';
+    if (length $f_inbox) {
+        $m8 = "${f_marker}${R} ${f_inbox}";
+        $f_inbox = '';
     }
     (my $bare = $m8) =~ s/\s+\z//;
     $f_marker = fit_head($bare, $cols);
@@ -1363,7 +2137,7 @@ my $line2 = "${MUTED}${short}${R} "
 my @tail;
 push @tail, "${ACCENT}${B}${f_project}${R}" if length $f_project;
 push @tail, $f_git if length $f_git;
-my $f_counters = counters($f_decisions, $f_plans);
+my $f_counters = counters($f_inbox, $f_plans);
 push @tail, $f_counters if length $f_counters;
 
 my @segments = ("${MUTED}${f_marker}${R}", $line2);
@@ -1393,20 +2167,18 @@ if (row_cost($single) <= $cols) {
 # that by construction holds one project. On the host it is the answer to "where
 # am I", and there it can be anywhere.
 #
-# THE FOCUSED TASKLIST gets a row of its own when this session has one:
-# "U+25A3 <tasklist name> U+00B7 <current task>", after the status row(s) and before the
-# path row, so on the host the path stays last. The current task is the first
-# task in `doing`, which may be any length, so the row is right-elided to the
-# terminal width rather than capped below it.
-my $focus = almanac_focus(cwd => $workspace, session => $sid);
-if (ref($focus) eq 'HASH' && defined $focus->{name} && length $focus->{name}) {
-    my $trow = "${MUTED}\x{25A3}${R} ${PRIMARY}$focus->{name}${R}";
-    $trow .= "${FAINT} \x{00B7} ${R}${PRIMARY}$focus->{current}${R}"
-        if defined $focus->{current} && length $focus->{current};
-    my $fitted = fit_head($trow, $cols);
-    push @rows, $fitted if length $fitted;
+# THE ATTACHED THREAD LEADS THE DIRECTORY ROW (Decision 12, package
+# 12-statusline-threads, spec 2.3): replaces the retired focus row
+# ("U+25A3 <tasklist name> . <current task>") entirely. With no attached
+# thread the directory row is exactly today's unelided path_row -- the one
+# new row this package adds is thread_row's, and it REPLACES the path row in
+# place on the host (so the row count never changes there) while ADDING a
+# row in the sandbox, which otherwise has no directory row at all.
+my $thread = almanac_thread(cwd => $workspace, session => $sid);
+my $thread_path_text = $SANDBOX_ON ? '' : $cwd;
+if (ref($thread) eq 'HASH') {
+    push @rows, thread_row($thread, $thread_path_text, $cols);
+} elsif (length $thread_path_text) {
+    push @rows, path_row($thread_path_text);
 }
-
-my $path_row = $SANDBOX_ON ? '' : path_row($cwd);
-push @rows, $path_row if length $path_row;
 print join("\n", @rows);

@@ -44,7 +44,8 @@
       "DISABLE_LOGIN_COMMAND" : "0",
       "DISABLE_LOGOUT_COMMAND" : "0",
       "DISABLE_UPGRADE_COMMAND" : "1",
-      "ENABLE_PROMPT_CACHING_1H" : "1"
+      "ENABLE_PROMPT_CACHING_1H" : "1",
+      "FORCE_AUTOUPDATE_PLUGINS" : "1"
    },
    "extraKnownMarketplaces" : {
       "notion-plugin-marketplace" : {

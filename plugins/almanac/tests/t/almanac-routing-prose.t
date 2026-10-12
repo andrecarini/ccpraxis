@@ -55,10 +55,14 @@ sub parse_frontmatter {
     return { ok => 1, description => $description, body => join("\n", @body) };
 }
 
+# OVERRIDDEN by blueprint where-things-go, package 02-thread-store (specs/
+# 02-thread-store-spec.md section 2.10, AC16): skills/task/ is deleted and
+# skills/thread/ replaces it as the carrier of the routing rule Decision 5
+# pinned for the old tasklist skill, re-expressed for threads.
 my %SKILL_PATH = (
-    task     => "$ROOT/skills/task/SKILL.md",
+    thread   => "$ROOT/skills/thread/SKILL.md",
     todo     => "$ROOT/skills/todo/SKILL.md",
-    decision => "$ROOT/skills/decision/SKILL.md",
+    decision => "$ROOT/skills/inbox/SKILL.md",   # spec 01-inbox-rename: decision -> inbox
     note     => "$ROOT/skills/note/SKILL.md",
 );
 
@@ -72,41 +76,48 @@ for my $k (keys %SKILL_PATH) {
 }
 
 # =============================================================================
-# task -- Decision 5 routing rule: "tasklist: steps of work actively under
-# way, never status notes". Done criterion 2: the task skill's description
+# thread (specs/02-thread-store-spec.md section 2.10, AC16) -- re-expression
+# of Decision 5's routing rule for threads: "a thread's tasks: steps of work
+# actively under way, never status notes". The thread skill's description
 # names the routing rule, and its BODY says status notes and progress logs
-# do not belong in the tasklist.
+# do not belong in a thread's tasks (move the step's status instead), and
+# that a linked task's status is its package's.
 # =============================================================================
 SKIP: {
-    skip 'task/SKILL.md missing or unparseable', 4 unless $parsed{task}{ok};
-    my $d = $parsed{task}{description} // '';
-    my $b = $parsed{task}{body} // '';
+    skip 'thread/SKILL.md missing or unparseable', 5 unless $parsed{thread}{ok};
+    my $d = $parsed{thread}{description} // '';
+    my $b = $parsed{thread}{body} // '';
 
-    # Key clause: the tasklist holds steps of work that are actively under
-    # way right now (not finished, not merely planned) -- tolerant of
+    # Key clause: a thread's tasks hold steps of work that are actively
+    # under way right now (not finished, not merely planned) -- tolerant of
     # "actively under way" / "currently under way" / "under way now" and of
     # "step(s) of work" vs "work step(s)".
     like($d, qr/\bstep(?:s)?\s+of\s+work\b/i,
-        "task description: names 'step(s) of work' as what the tasklist holds");
+        "thread description: names 'step(s) of work' as what a thread's tasks hold");
     like($d, qr/\bactively\b[^.\n]{0,20}\bunder\s*way\b|\bunder\s*way\b[^.\n]{0,20}\bactively\b|\bcurrently\s+under\s*way\b/i,
-        "task description: says those steps are actively under way (not just planned or finished)");
+        "thread description: says those steps are actively under way (not just planned or finished)");
 
-    # Done criterion 2, second clause: the BODY says status notes and
-    # progress logs do NOT belong in the tasklist. Tolerant of "status
-    # notes"/"status updates", "progress logs"/"progress updates", and of
-    # "do not belong"/"don't belong"/"never" phrasing, in either order.
+    # The BODY says status notes and progress logs do NOT belong in a
+    # thread's tasks -- tolerant of "status notes"/"status updates",
+    # "progress logs"/"progress updates", and of "do not belong"/"don't
+    # belong"/"never" phrasing, in either order.
     like($b, qr/\bstatus\s+(?:notes?|updates?)\b/i,
-        "task body: mentions status notes/updates");
+        "thread body: mentions status notes/updates");
     like($b, qr/\bprogress\s+(?:logs?|updates?)\b/i,
-        "task body: mentions progress logs/updates");
+        "thread body: mentions progress logs/updates");
     unless (
         $b =~ /\bstatus\s+(?:notes?|updates?)\b[^.\n]{0,80}\b(?:do(?:es)?\s+not|don't|never)\s+belong\b/is
         || $b =~ /\b(?:do(?:es)?\s+not|don't|never)\s+belong\b[^.\n]{0,80}\bstatus\s+(?:notes?|updates?)\b/is
     ) {
-        fail("task body: says status notes do not belong in the tasklist");
+        fail("thread body: says status notes do not belong in a thread's tasks");
     } else {
-        pass("task body: says status notes do not belong in the tasklist");
+        pass("thread body: says status notes do not belong in a thread's tasks");
     }
+
+    # AC16: a linked task's status is its package's -- distinct new clause
+    # this package's spec requires that the old task skill never had.
+    like($b, qr/\blinked\b[^.\n]{0,60}\bstatus\b[^.\n]{0,40}\bpackage\b|\bpackage\b[^.\n]{0,40}\bstatus\b[^.\n]{0,60}\blinked\b/is,
+        "thread body: says a linked task's status is its package's");
 }
 
 # =============================================================================

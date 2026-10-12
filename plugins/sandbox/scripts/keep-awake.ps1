@@ -121,6 +121,21 @@
 # the owner's exit is the only automatic release; an unverifiable owner means
 # OWNER-UNVERIFIABLE and the fallback lease. See the pinning block below the
 # clamps.
+#
+# -OwnerStartTicks (package 05): an open process handle makes WINPID reuse
+# impossible for our OWN lifetime, but the pin happens strictly after the
+# caller already knows the owner's WINPID -- and in the gap between the
+# owner dying and us reaching that pin, Windows can hand the same WINPID to
+# an unrelated process that also happens to have started before us (so the
+# existing started-after-helper heuristic alone would accept it). A caller
+# that also knows the owner's own StartTime.ToFileTimeUtc() can pass it here;
+# an exact mismatch at pin time means OWNER-UNVERIFIABLE reason=start-time-
+# mismatch and the normal fallback, instead of silently pinning an impostor.
+# 0 (the default) means no anchor was supplied -- today's behaviour. A
+# probe-time re-check in Get-OwnerState (OWNER-REPLACED) is defence in depth
+# for the same identity question, routed through the same seam,
+# Get-KaOwnerStartTicks, which also accepts a test-only override via
+# -SimulateOwnerStartTicksFile.
 [CmdletBinding()]
 param(
     [string]$PidFile,
@@ -130,7 +145,9 @@ param(
     [int]$OwnerWinPid = 0,      # WINDOWS pid of the owner; 0 = no owner identity (heartbeat only)
     [string]$OwnerDesc = '',    # owner's own description (package 04); default text when absent
     [switch]$SimulatePowerRequestFailure,
-    [switch]$SimulatePowerRequestException
+    [switch]$SimulatePowerRequestException,
+    [long]$OwnerStartTicks = 0,              # owner's StartTime.ToFileTimeUtc(); 0 = not supplied
+    [string]$SimulateOwnerStartTicksFile = '' # TEST-ONLY seam: see Get-KaOwnerStartTicks
 )
 $ErrorActionPreference = 'Stop'
 
@@ -336,6 +353,7 @@ if ($LeaseSeconds -gt 0 -and $LeaseSeconds -lt 60) { $LeaseSeconds = 60 }
 if ($PollSeconds  -lt 5)    { $PollSeconds  = 5 }
 if ($LeaseSeconds -gt 0 -and $PollSeconds -gt $LeaseSeconds) { $PollSeconds = $LeaseSeconds }
 if ($OwnerWinPid  -lt 0)    { $OwnerWinPid  = 0 }
+if ($OwnerStartTicks -lt 0) { $OwnerStartTicks = 0 }
 
 # One log line per event: an exception message can be multi-line (and localised).
 function ConvertTo-KaOneLine {
@@ -350,14 +368,40 @@ function ConvertTo-KaOneLine {
 # are exactly the process that keeps polling while the owner is moderated. So a
 # caller may name its owner with -OwnerWinPid, a WINDOWS pid (never an MSYS pid:
 # the $$ of Git-for-Windows perl is a different namespace). We pin that process
-# by holding a handle to it, which makes pid reuse impossible for our lifetime,
-# and ask the handle whether it has exited: still running means QUIET (hold),
-# exited means GONE (release now). The probe is an in-process handle query; it
-# spawns nothing. If the owner cannot be pinned, owner mode is off for good.
+# by holding a handle to it, which makes pid reuse impossible AFTER the pin --
+# but not BEFORE it. Between the real owner dying and us reaching this block,
+# Windows can hand the same WINPID to an unrelated process that also happens
+# to have started before us, and the pre-existing started-after-helper
+# heuristic alone would accept it as the owner. A caller that also knows the
+# owner's own start time can close that gap by passing -OwnerStartTicks: an
+# exact mismatch at pin time is rejected (OWNER-UNVERIFIABLE reason=start-
+# time-mismatch) instead of silently pinning an impostor. Get-OwnerState
+# below re-checks the same identity at every probe (OWNER-REPLACED) as
+# defence in depth, in case a future change ever drops the handle pin. Once
+# pinned, we ask the handle whether it has exited: still running means QUIET
+# (hold), exited means GONE (release now). The probe is an in-process handle
+# query; it spawns nothing. If the owner cannot be pinned, owner mode is off
+# for good.
 #
 # Pinned here, after the pid file is written and before either wait loop, so the
 # no-pid-file path honours the owner too.
+# [long] UTC FILETIME ticks of $Process's start time. The ONE place the helper
+# reads an owner's start time (pin and probe both call it). Test seam: when
+# -SimulateOwnerStartTicksFile names an existing file whose first line,
+# trimmed, is all digits, that number is returned instead. A missing file or
+# a non-numeric first line means the real value is returned. Does not catch:
+# a read error throws to the caller.
+function Get-KaOwnerStartTicks {
+    param([System.Diagnostics.Process]$Process)
+    if ($SimulateOwnerStartTicksFile -and (Test-Path -LiteralPath $SimulateOwnerStartTicksFile)) {
+        $raw = Get-Content -LiteralPath $SimulateOwnerStartTicksFile -ErrorAction Stop | Select-Object -First 1
+        if ($null -ne $raw -and "$raw".Trim() -match '^\d+$') { return [long]("$raw".Trim()) }
+    }
+    return [long]$Process.StartTime.ToFileTimeUtc()
+}
+
 $script:Owner = $null
+$script:PinnedOwnerStartTicks = [long]0
 $requestedNoLease = ($LeaseSeconds -eq 0)
 if ($requestedNoLease) {
     $unverifiedTail = '-- no verified owner, so lease 0 falls back to the 60s lease'
@@ -370,20 +414,30 @@ if ($OwnerWinPid -gt 0) {
         # Reading .Handle opens AND CACHES the process handle for the life of
         # this object -- that is the pin. HasExited alone opens and closes a
         # fresh handle per call, which pins nothing.
-        $null      = $p.Handle
-        $exited    = $p.HasExited
-        $started   = $p.StartTime
-        $selfStart = [System.Diagnostics.Process]::GetCurrentProcess().StartTime
+        $null       = $p.Handle
+        $exited     = $p.HasExited
+        $started    = $p.StartTime                                   # kept, used only for the OWNER line's display
+        $startTicks = Get-KaOwnerStartTicks $p                       # seam
+        $selfStartTicks = [System.Diagnostics.Process]::GetCurrentProcess().StartTime.ToFileTimeUtc()  # never via seam
         if ($exited) {
             Write-KaLog 'OWNER-UNVERIFIABLE' ("winpid={0} reason=exited-at-start {1}" -f $OwnerWinPid, $unverifiedTail)
             try { $p.Dispose() } catch {}
-        } elseif ($started -gt $selfStart) {
+        } elseif ($OwnerStartTicks -gt 0 -and $startTicks -ne $OwnerStartTicks) {
+            # The caller supplied an anchor and the process found at this
+            # WINPID does not match it -- either the WINPID was reused
+            # between the owner dying and this pin (the real race this
+            # package fixes), or a test seam is simulating exactly that.
+            # Reject rather than silently pinning an impostor.
+            Write-KaLog 'OWNER-UNVERIFIABLE' ("winpid={0} reason=start-time-mismatch expected={1} actual={2} {3}" -f $OwnerWinPid, $OwnerStartTicks, $startTicks, $unverifiedTail)
+            try { $p.Dispose() } catch {}
+        } elseif ($startTicks -gt $selfStartTicks) {
             # A process that began after us cannot be the one that spawned us:
             # the pid was reused.
             Write-KaLog 'OWNER-UNVERIFIABLE' ("winpid={0} reason=started-after-helper {1}" -f $OwnerWinPid, $unverifiedTail)
             try { $p.Dispose() } catch {}
         } else {
             $script:Owner = $p
+            $script:PinnedOwnerStartTicks = $startTicks
             Write-KaLog 'OWNER' ("winpid={0} name={1} started={2}" -f $OwnerWinPid, $p.ProcessName, $started.ToString('yyyy-MM-dd HH:mm:ss'))
         }
     } catch {
@@ -412,6 +466,11 @@ function Get-OwnerState {
     try {
         $script:Owner.Refresh()
         if ($script:Owner.HasExited) { return 'gone' }
+        $probeTicks = Get-KaOwnerStartTicks $script:Owner                     # seam, defence in depth
+        if ($probeTicks -ne $script:PinnedOwnerStartTicks) {
+            Write-KaLog 'OWNER-REPLACED' ("winpid={0} pinned_start={1} probed_start={2} -- start time changed since pin, treating owner as gone" -f $OwnerWinPid, $script:PinnedOwnerStartTicks, $probeTicks)
+            return 'gone'
+        }
         return 'alive'
     } catch {
         Write-KaLog 'OWNER-PROBE-FAILED' ("owner={0} reason={1}" -f $OwnerWinPid, (ConvertTo-KaOneLine $_.Exception.Message))

@@ -5,7 +5,7 @@
 # .ccpraxis-local-data/blueprints/hook-continuity-remake/specs/
 # 09-question-queue-spec.md sections 2.1, 2.2 and 4.1. Derived only from that
 # spec text plus the already-implemented almanac-records package 08 store
-# (Almanac::Store, Almanac::Record, Almanac::Lock, almanac-decision.pl), which
+# (Almanac::Store, Almanac::Record, Almanac::Lock, almanac-inbox.pl), which
 # the spec names explicitly as the shared machinery this shim sits on top of.
 # NOT derived from reading the shim itself, which this package's write set
 # has not written yet -- LQ_absorb()/LQ_legacy_path() below turn a missing
@@ -43,17 +43,28 @@ delete local $ENV{BP_PROJECT_ROOT};
 delete local $ENV{BP_LEDGER};
 
 (my $ALM_DIR = "$Bin/../../scripts") =~ s{\\}{/}g;
-my $DECISION_PL = "$ALM_DIR/almanac-decision.pl";
+my $INBOX_PL = "$ALM_DIR/almanac-inbox.pl";
 my $LEGACYQ_PM  = "$ALM_DIR/Almanac/LegacyQueue.pm";
 
-ok(-f $DECISION_PL, 'precondition: almanac-decision.pl exists (almanac-records package 08, already implemented)')
-    or diag('almanac-decision.pl is missing -- everything below that goes through it will fail for that reason');
+ok(-f $INBOX_PL, 'precondition: almanac-inbox.pl exists (almanac-records package 08, already implemented)')
+    or diag('almanac-inbox.pl is missing -- everything below that goes through it will fail for that reason');
 
 {
     local $@;
-    do $DECISION_PL if -f $DECISION_PL;
-    diag("almanac-decision.pl failed to load: $@") if $@;
+    do $INBOX_PL if -f $INBOX_PL;
+    diag("almanac-inbox.pl failed to load: $@") if $@;
 }
+
+# Almanac::Store is shared infra from package 08, named explicitly by this
+# package's spec (section 2.7: "Store.pm needs no code change") -- require it
+# directly (adding $ALM_DIR to @INC, the same directory almanac-inbox.pl's
+# own BEGIN block would unshift) rather than relying on that file's `do` to
+# pull it in as a side effect, since it does not exist yet and must not
+# crash the whole run when it is missing (house pattern: per-assertion
+# failure, never a file-level die).
+unshift @INC, $ALM_DIR;
+eval { require Almanac::Store };
+diag("Almanac::Store failed to load: $@") if $@;
 
 ok(-f $LEGACYQ_PM, 'precondition (expected to fail until this package writes it): Almanac/LegacyQueue.pm exists on disk')
     or diag("missing: $LEGACYQ_PM -- every LQ_absorb()/LQ_legacy_path() call below will report a legible "
@@ -136,13 +147,13 @@ sub legacy_path_for {
     return norm_root($root) . '/.ccpraxis-local-data/.subagent-guard/questions.md';
 }
 
-sub decision_dir_for {
-    return norm_root($_[0]) . '/.ccpraxis-local-data/almanac/decision';
+sub inbox_dir_for {
+    return norm_root($_[0]) . '/.ccpraxis-local-data/almanac/inbox';
 }
 
 sub open_store {
     my ($root) = @_;
-    return Almanac::Store->open(scope => 'project', type => 'decision', root => $root);
+    return Almanac::Store->open(scope => 'project', type => 'inbox', root => $root);
 }
 
 sub mk_root {
@@ -185,7 +196,7 @@ sub snapshot_dir {
 sub real_snapshot {
     return {
         guard    => snapshot_dir("$REPO_ROOT/.ccpraxis-local-data/.subagent-guard"),
-        decision => snapshot_dir("$REPO_ROOT/.ccpraxis-local-data/almanac/decision"),
+        decision => snapshot_dir("$REPO_ROOT/.ccpraxis-local-data/almanac/inbox"),
     };
 }
 my $REAL_BEFORE = real_snapshot();
@@ -211,8 +222,8 @@ my ($P1, $ACCENTED_TITLE, $SEED_BYTES);
     $SEED_BYTES = join("\n", @seed) . "\n";
     write_raw(legacy_path_for($P1), $SEED_BYTES);
 
-    my $list = eval { Almanac::Decision::list_decisions(root => $P1) };
-    ok(!$@, 'L1 fixture: list_decisions(root => P) does not die') or diag("error: $@");
+    my $list = eval { Almanac::Inbox::list_items(root => $P1) };
+    ok(!$@, 'L1 fixture: list_items(root => P) does not die') or diag("error: $@");
     my @recs = (ref $list eq 'ARRAY') ? @$list : ();
     is(scalar(@recs), 3, 'L1: a seeded 5-line legacy file (1 stamped, 1 unstamped, 1 non-ASCII, '
                         . '1 blank, 1 non-question) absorbs into exactly 3 unanswered decisions');
@@ -241,11 +252,11 @@ my ($P1, $ACCENTED_TITLE, $SEED_BYTES);
 # already gone).
 # =============================================================================
 {
-    my $before = eval { Almanac::Decision::list_decisions(root => $P1) };
+    my $before = eval { Almanac::Inbox::list_items(root => $P1) };
     my %before_rev = map { $_->{id} => $_->{rev} } (ref $before eq 'ARRAY' ? @$before : ());
     my $migrated_before = slurp_raw("$P1/.ccpraxis-local-data/.subagent-guard/questions.md.migrated");
 
-    my $after = eval { Almanac::Decision::list_decisions(root => $P1) };
+    my $after = eval { Almanac::Inbox::list_items(root => $P1) };
     my %after_rev = map { $_->{id} => $_->{rev} } (ref $after eq 'ARRAY' ? @$after : ());
     is_deeply(\%after_rev, \%before_rev, 'L3: a re-open leaves every id\'s rev unchanged');
 
@@ -273,7 +284,7 @@ my ($P1, $ACCENTED_TITLE, $SEED_BYTES);
     is($report4->{state}, 'absorbed', 'L4: re-opening a re-created file absorbs again');
     is($report4->{already}, 1, 'L4: the one identical line is not re-filed (already == 1)');
 
-    my $list = eval { Almanac::Decision::list_decisions(root => $P1) };
+    my $list = eval { Almanac::Inbox::list_items(root => $P1) };
     my @recs = (ref $list eq 'ARRAY') ? @$list : ();
     is(scalar(@recs), 4, 'L4: the total is now 4 (3 original + 1 genuinely new)');
     ok((grep { defined $_->{fields}{title} && $_->{fields}{title} eq 'Brand new re-created line?' } @recs),
@@ -294,8 +305,8 @@ my ($P1, $ACCENTED_TITLE, $SEED_BYTES);
 # =============================================================================
 {
     my $P5 = mk_root();
-    my $list = eval { Almanac::Decision::list_decisions(root => $P5) };
-    ok(!$@, 'L5: list_decisions() on a project with no .subagent-guard/ at all does not die') or diag("error: $@");
+    my $list = eval { Almanac::Inbox::list_items(root => $P5) };
+    ok(!$@, 'L5: list_items() on a project with no .subagent-guard/ at all does not die') or diag("error: $@");
     is_deeply($list, [], 'L5: the list is empty');
     ok(!-d "$P5/.ccpraxis-local-data/.subagent-guard", 'L5: the directory is still absent (absorb creates nothing)');
 
@@ -341,7 +352,7 @@ chdir($root) or exit(125);
 my $deadline = time() + 20;
 until (-e $barrier_file || time() > $deadline) { select(undef, undef, undef, 0.02) }
 { local $@; do $decision_pl; if ($@) { open(my $fh, '>', $out_file); print {$fh} "ERR $@"; exit 0 } }
-my $list = Almanac::Decision::list_decisions(root => $root);
+my $list = Almanac::Inbox::list_items(root => $root);
 open(my $ofh, '>', $out_file) or exit(126);
 print {$ofh} scalar(@$list), "\n";
 close $ofh;
@@ -356,7 +367,7 @@ PERL
         my $pid = fork();
         die "fork: $!" unless defined $pid;
         if ($pid == 0) {
-            exec($^X, $child_script, $DECISION_PL, $P7, $barrier, $out);
+            exec($^X, $child_script, $INBOX_PL, $P7, $barrier, $out);
             POSIX::_exit(127);
         }
         push @pids, $pid;
@@ -382,7 +393,7 @@ PERL
         diag("child outputs: " . join(', ', @counts));
     }
 
-    my $final = eval { Almanac::Decision::list_decisions(root => $P7) };
+    my $final = eval { Almanac::Inbox::list_items(root => $P7) };
     is(scalar(@{ (ref $final eq 'ARRAY') ? $final : [] }), 3, 'L7: the final store holds exactly 3 decisions');
     ok(-f "$P7/.ccpraxis-local-data/.subagent-guard/questions.md.migrated", 'L7: exactly one rename happened (.migrated exists)');
     ok(!-e "$P7/.ccpraxis-local-data/.subagent-guard/questions.md.migrated.2", 'L7: no .migrated.2 was created (no double rename)');
@@ -442,16 +453,16 @@ PERL
         or diag('got: ' . (defined $reason9 ? $reason9 : 'undef'));
 
     ok(-f legacy_path_for($P9), 'L9: while the lock is held, the legacy file is still intact (not renamed)');
-    my $list9_held = eval { Almanac::Decision::list_decisions(root => $P9) };
+    my $list9_held = eval { Almanac::Inbox::list_items(root => $P9) };
     is(scalar(@{ (ref $list9_held eq 'ARRAY') ? $list9_held : [] }), 0,
        'L9: while the lock is held, nothing is filed (the timed-out absorb touched nothing)');
 
     $held_lock->release if defined $held_lock;
 
     # Spec sec 2.2: EVERY open absorbs a still-present legacy file -- so once
-    # the lock is released, the NEXT open (this list_decisions call) absorbs
+    # the lock is released, the NEXT open (this list_items call) absorbs
     # the one still-unrenamed line exactly once.
-    my $list9_after = eval { Almanac::Decision::list_decisions(root => $P9) };
+    my $list9_after = eval { Almanac::Inbox::list_items(root => $P9) };
     is(scalar(@{ (ref $list9_after eq 'ARRAY') ? $list9_after : [] }), 1,
        'L9: after the lock is released, the next open absorbs the legacy file exactly once (1 record)');
 }
@@ -464,19 +475,19 @@ PERL
     my $P10 = mk_root();
     make_path("$P10/.ccpraxis-local-data/.subagent-guard");
     write_raw(legacy_path_for($P10), "- decide this?\n");
-    my $list10a = eval { Almanac::Decision::list_decisions(root => $P10) };
+    my $list10a = eval { Almanac::Inbox::list_items(root => $P10) };
     my ($rec10) = (ref $list10a eq 'ARRAY') ? @$list10a : ();
     ok(defined $rec10, 'L10 fixture: the line absorbed into one decision') or diag("error: $@");
 
     SKIP: {
         skip 'L10: fixture absorption did not produce a record', 2 unless defined $rec10;
-        my ($answered, $changed) = eval { Almanac::Decision::answer($rec10->{id}, root => $P10, answer => 'go with A') };
+        my ($answered, $changed) = eval { Almanac::Inbox::answer($rec10->{id}, root => $P10, answer => 'go with A') };
         ok(!$@, 'L10 fixture: answer() on the absorbed decision does not die') or diag("error: $@");
 
         write_raw(legacy_path_for($P10), "- decide this?\n");   # identical raw line, re-created
         lq_absorb(open_store($P10));
 
-        my $reread = eval { Almanac::Decision::read_decision($rec10->{id}, root => $P10) };
+        my $reread = eval { Almanac::Inbox::read_item($rec10->{id}, root => $P10) };
         is(ref($reread) eq 'HASH' ? $reread->{fields}{status} : undef, 'answered',
            'L10: the decision is still answered after the identical line re-appears');
         is(ref($reread) eq 'HASH' ? $reread->{fields}{answer} : undef, 'go with A',
@@ -512,17 +523,20 @@ PERL
 }
 
 # =============================================================================
-# L12 -- almanac-decision.pl has exactly one Almanac::LegacyQueue::absorb(
-# call, inside sub open_decisions, and exactly one ->open( call in the file.
+# L12 / AC6 -- almanac-inbox.pl has exactly one Almanac::LegacyQueue::absorb(
+# call, exactly one ->open( call and exactly one migrate_legacy_store( call,
+# ALL inside sub open_inbox, with migrate preceding absorb (spec 2.1's
+# "migrate_legacy_store($store) ... then Almanac::LegacyQueue::absorb($store)").
 # =============================================================================
 {
-    my @lines = read_all_lines($DECISION_PL);
-    my (@absorb_hits, @open_hits, $od_start, $od_end);
+    my @lines = read_all_lines($INBOX_PL);
+    my (@absorb_hits, @open_hits, @migrate_hits, $od_start, $od_end);
     for my $i (0 .. $#lines) {
         next if $lines[$i] =~ /^\s*#/;   # a prose comment mentioning the call is not a call
-        push @absorb_hits, $i + 1 if $lines[$i] =~ /Almanac::LegacyQueue::absorb\s*\(/;
-        push @open_hits, $i + 1   if $lines[$i] =~ /->open\s*\(/;
-        if (!defined($od_start) && $lines[$i] =~ /^\s*sub\s+open_decisions\b/) {
+        push @absorb_hits, $i + 1  if $lines[$i] =~ /Almanac::LegacyQueue::absorb\s*\(/;
+        push @open_hits, $i + 1    if $lines[$i] =~ /->open\s*\(/;
+        push @migrate_hits, $i + 1 if $lines[$i] =~ /\bmigrate_legacy_store\s*\(/;
+        if (!defined($od_start) && $lines[$i] =~ /^\s*sub\s+open_inbox\b/) {
             $od_start = $i + 1;
             for my $j ($i + 1 .. $#lines) {
                 if ($lines[$j] =~ /^\s*sub\s+\w+/) { $od_end = $j; last }
@@ -536,22 +550,69 @@ PERL
     unless (is(scalar(@open_hits), 1, 'L12: exactly one ->open( call in the file')) {
         diag("lines: " . join(',', @open_hits));
     }
+    unless (is(scalar(@migrate_hits), 1, 'AC6: exactly one migrate_legacy_store( call in the file')) {
+        diag("lines: " . join(',', @migrate_hits));
+    }
     if (defined($od_start) && @absorb_hits == 1) {
         ok($absorb_hits[0] >= $od_start && $absorb_hits[0] <= $od_end,
-           "L12: the sole absorb( call (line $absorb_hits[0]) lives inside sub open_decisions ($od_start..$od_end)");
+           "L12: the sole absorb( call (line $absorb_hits[0]) lives inside sub open_inbox ($od_start..$od_end)");
     } else {
-        fail('L12: the sole absorb( call lives inside sub open_decisions');
+        fail('L12: the sole absorb( call lives inside sub open_inbox');
+    }
+    if (defined($od_start) && @migrate_hits == 1) {
+        ok($migrate_hits[0] >= $od_start && $migrate_hits[0] <= $od_end,
+           "AC6: the sole migrate_legacy_store( call (line $migrate_hits[0]) lives inside sub open_inbox ($od_start..$od_end)");
+    } else {
+        fail('AC6: the sole migrate_legacy_store( call lives inside sub open_inbox');
+    }
+    if (@migrate_hits == 1 && @absorb_hits == 1) {
+        ok($migrate_hits[0] < $absorb_hits[0],
+           "AC6: migrate_legacy_store( (line $migrate_hits[0]) precedes Almanac::LegacyQueue::absorb( (line $absorb_hits[0]))");
+    } else {
+        fail('AC6: migrate_legacy_store( precedes Almanac::LegacyQueue::absorb(');
     }
 }
 
 # =============================================================================
-# L13 -- legacy_path(open_decisions(root => P)) has the pinned shape and
+# B13 (second case) / AC28 -- an unmigrated A/decision/ plus a legacy
+# questions.md with no inbox store yet: the FIRST open migrates A/decision ->
+# A/inbox, THEN absorbs the legacy queue into A/inbox -- never into A/decision.
+# =============================================================================
+{
+    my $PMA = mk_root();
+    make_path("$PMA/.ccpraxis-local-data/.subagent-guard");
+    write_raw(legacy_path_for($PMA), "- migrate then absorb?\n");
+
+    # seed an unmigrated legacy decision store with one pre-existing record.
+    my $legacy_dir = "$PMA/.ccpraxis-local-data/almanac/decision";
+    make_path($legacy_dir);
+    eval {
+        my $lstore = Almanac::Store->open(scope => 'project', type => 'decision', root => $PMA);
+        $lstore->create(id => 'pre-existing', fields => { title => 'pre-existing', status => 'unanswered', created => '2020-01-01T00:00:00Z' },
+                         order => [qw(title status created)]);
+    };
+    ok(!$@, 'B13/AC28 fixture: a pre-existing legacy decision record exists in A/decision') or diag("error: $@");
+
+    my $list_ma = eval { Almanac::Inbox::list_items(root => $PMA) };
+    ok(!$@, 'B13/AC28: list_items() on an unmigrated project with a legacy queue does not die') or diag("error: $@");
+    my @recs_ma = (ref $list_ma eq 'ARRAY') ? @$list_ma : ();
+    ok(!-d $legacy_dir, 'B13/AC28: A/decision no longer exists after the first open');
+    ok(-d "$PMA/.ccpraxis-local-data/almanac/inbox", 'B13/AC28: A/inbox exists after the first open');
+    is(scalar(@recs_ma), 2, 'B13/AC28: A/inbox holds both the migrated pre-existing record and the absorbed legacy-queue line');
+    ok((grep { $_->{id} eq 'pre-existing' } @recs_ma), 'B13/AC28: the pre-existing record migrated across by id');
+    ok((grep { defined $_->{fields}{title} && $_->{fields}{title} eq 'migrate then absorb?' } @recs_ma),
+       'B13/AC28: the legacy-queue line was absorbed into A/inbox (never into A/decision)');
+    ok(!-e legacy_path_for($PMA), 'B13/AC28: questions.md is gone after absorption');
+}
+
+# =============================================================================
+# L13 -- legacy_path(open_inbox(root => P)) has the pinned shape and
 # starts with P's own canonical form.
 # =============================================================================
 {
     my $P13 = mk_root();
-    my $store13 = eval { Almanac::Decision::open_decisions(root => $P13) };
-    ok(!$@ && defined $store13, 'L13 fixture: open_decisions(root => P) does not die') or diag("error: $@");
+    my $store13 = eval { Almanac::Inbox::open_inbox(root => $P13) };
+    ok(!$@ && defined $store13, 'L13 fixture: open_inbox(root => P) does not die') or diag("error: $@");
     my $path13 = defined($store13) ? lq_legacy_path($store13) : undef;
     ok(defined $path13, 'L13: legacy_path() returns a defined path') or diag('legacy_path() returned undef');
     if (defined $path13) {
@@ -573,7 +634,7 @@ PERL
 # =============================================================================
 {
     is_deeply(real_snapshot(), $REAL_BEFORE,
-       'L14: the real repo\'s .ccpraxis-local-data/.subagent-guard/ and almanac/decision/ are unchanged');
+       'L14: the real repo\'s .ccpraxis-local-data/.subagent-guard/ and almanac/inbox/ are unchanged');
 }
 
 done_testing();

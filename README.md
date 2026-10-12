@@ -113,8 +113,8 @@ Two more of steward's commands are worth knowing about. `/steward:usage-audit` r
 
 **almanac** keeps five kinds of record, each one file per record: project and global todos
 (`/almanac:todo`), notes that point at a fact instead of copying it (`/almanac:note`), the
-project's ordered tasklist (`/almanac:task`), pending product decisions for the operator
-(`/almanac:decision`), and ccpraxis bug reports (`/almanac:bug-report`, `/almanac:bug-triage`).
+project's ordered tasklist (`/almanac:task`), the operator's inbox
+(`/almanac:inbox`), and ccpraxis bug reports (`/almanac:bug-report`, `/almanac:bug-triage`).
 
 Storage is plain files on disk. A project record lives at
 `<project>/.ccpraxis-local-data/almanac/<type>/<id>.md`; a global one (todos and notes only) at
@@ -241,7 +241,7 @@ plan described above), then restart Claude Code.
 | `/almanac:todo` | Record a todo that outlives this session |
 | `/almanac:note` | Keep a durable fact, in place of Claude Code auto-memory |
 | `/almanac:task` | Work the project's ordered tasklist |
-| `/almanac:decision` | File a product decision only the operator can make |
+| `/almanac:inbox` | File what only the operator can answer, and record the answer |
 
 The rest are listed with every other surface in [`docs/reference.md`](docs/reference.md).
 

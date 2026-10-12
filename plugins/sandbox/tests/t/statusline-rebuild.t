@@ -406,19 +406,32 @@ sub statusline_rows {
 my $REPO_ROOT    = "$Bin/../../../..";
 my $ALMANAC_DIR  = "$Bin/../../../almanac/scripts";
 my $GENERATOR    = "$ALMANAC_DIR/gen-statusline-counters.pl";
-my $DECISION_CLI = "$ALMANAC_DIR/almanac-decision.pl";
+my $INBOX_CLI    = "$ALMANAC_DIR/almanac-inbox.pl";
 my $LEGACYQ_PM   = "$ALMANAC_DIR/Almanac/LegacyQueue.pm";
+# blueprint where-things-go, package 02-thread-store: the flat tasklist's CLI
+# is retired; the hygiene background helper's task-kind write moves to
+# almanac-thread.pl. package 03-thread-sessions then hard ticket-gates that
+# CLI's write verbs (Decision 18 F6), so the helper also needs BpHook.pm to
+# mint a ticket per write.
+(my $BUTLER_DIR_FOR_HYG = "$Bin/../../../butler/scripts") =~ s{\\}{/}g;
+my $BPHOOK_PM_FOR_HYG = "$BUTLER_DIR_FOR_HYG/BpHook.pm";
 
 my $ALMANAC_OK = eval {
     require "$ALMANAC_DIR/almanac-todo.pl";
     require "$ALMANAC_DIR/almanac-note.pl";
-    require "$ALMANAC_DIR/almanac-decision.pl";   # brings Almanac::Task with it
+    require "$ALMANAC_DIR/almanac-inbox.pl";
+    require "$ALMANAC_DIR/Almanac/Thread.pm";   # package 12-statusline-threads: the thread counter + row
     1;
 };
 my $ALMANAC_ERR = $@;
 
-# The real repo's almanac store, listed (name, size, mtime) before anything
-# below runs and compared again at the very end: this file never writes it.
+# The hygiene fixture -- what it proves and why it is fixture-only (Decision
+# 36). The old design listed the REAL repo's almanac store before and after
+# the whole file ran, which flaked whenever a live session wrote a record
+# concurrently. The fixed design points CCPRAXIS_DATA_DIR at a temp project
+# for this file's entire process tree, so the hygiene check never reads the
+# live repo at all, and stresses that redirection with a background helper
+# that writes real records into the same temp root for the whole run.
 sub almanac_listing {
     my ($root) = @_;
     my @out;
@@ -432,8 +445,206 @@ sub almanac_listing {
     } }, $root);
     return [ sort @out ];
 }
-my $REAL_STORE        = "$REPO_ROOT/.ccpraxis-local-data/almanac";
-my $REAL_STORE_BEFORE = almanac_listing($REAL_STORE);
+
+my $HYG_PROJ  = mk_proj();                         # tempdir holding .git, forward-slash form
+my $HYG_DATA  = "$HYG_PROJ/.ccpraxis-local-data";  # THE temp CCPRAXIS_DATA_DIR root
+my $HYG_HOME  = mk_home();                         # HOME/USERPROFILE for the helper
+my $HYG_CTL   = nslash(tempdir(CLEANUP => 1));     # stop file + helper log; NOT under $HYG_DATA
+my $HYG_TOKEN = "$$-" . time();                    # per-run token, embedded in every helper title
+my $HYG_BSD   = nslash(tempdir(CLEANUP => 1));     # BUTLER_STATE_DIR for the helper's thread tickets
+my $HYG_THREAD = 'hyg-thread';                     # the one thread the helper writes task-kind records into
+# blueprint where-things-go package 02-thread-store: the flat tasklist is
+# retired; '/almanac/task' becomes the thread store's three locations
+# (Almanac::Thread's storage layout: thread/<name>.md, thread-tasks-<name>/,
+# thread-log-<name>/).
+my @HYG_OWNED = ("/almanac/thread", "/almanac/thread-tasks-$HYG_THREAD", "/almanac/thread-log-$HYG_THREAD",
+                 '/almanac/inbox', '/bug-reports');   # helper-owned subtrees
+
+make_path(map { "$HYG_DATA$_" } @HYG_OWNED);       # pre-create: ancestor dir rows stay stable
+$ENV{CCPRAXIS_DATA_DIR} = $HYG_DATA;               # process-wide, plain assignment, NOT local
+
+# Create the one thread the helper writes task-kind records into, once,
+# before the helper starts (package 03-thread-sessions ticket-gates the
+# `create` verb -- mint a matching ticket for this one-time call).
+{
+    local $ENV{BUTLER_STATE_DIR} = $HYG_BSD;
+    require $BPHOOK_PM_FOR_HYG unless grep { m{(?:^|/)BpHook\.pm$} } keys %INC;
+    BpHook::write_ticket(
+        { session_id => 'HYG-HELPER', tool_use_id => 'HYGSETUP',
+          transcript_path => undef, cwd => $HYG_PROJ },
+        'almanac-thread', ['create', $HYG_THREAD, '--root', $HYG_PROJ]);
+    my $rc = system($^X, "$ALMANAC_DIR/almanac-thread.pl", 'create', $HYG_THREAD, '--root', $HYG_PROJ);
+    diag("hygiene: thread create rc=" . ($rc >> 8)) if $rc;
+}
+
+my $HYG_BEFORE = hyg_unowned(almanac_listing($HYG_DATA));
+diag("hygiene: CCPRAXIS_DATA_DIR=$HYG_DATA token=$HYG_TOKEN");
+my $HYG_PID = hyg_start_helper();                  # spawned AFTER the BEFORE snapshot
+
+# hyg_stop_helper() is idempotent; this END reaps the helper before
+# File::Temp's own END removes the tempdirs (File::Temp was use'd first, so
+# its END runs last). Covers die/BAIL_OUT/an early exit too. $? is preserved
+# across the END so the test's own exit status is untouched.
+END { local $?; hyg_stop_helper() if defined &hyg_stop_helper }
+
+# hyg_unowned(\@listing) -> \@listing -- rows in almanac_listing's format
+# ("$rel\t$type\t$size\t$mtime"), filtered to drop any row whose $rel equals
+# an @HYG_OWNED entry or starts with one followed by '/'. The root row and
+# the '/almanac' row are always kept (neither is itself a listed entry).
+sub hyg_unowned {
+    my ($rows) = @_;
+    my @out;
+    for my $row (@$rows) {
+        my ($rel) = split /\t/, $row, 2;
+        $rel = '' unless defined $rel;
+        my $owned = 0;
+        for my $o (@HYG_OWNED) {
+            if ($rel eq $o || index($rel, "$o/") == 0) { $owned = 1; last }
+        }
+        push @out, $row unless $owned;
+    }
+    return \@out;
+}
+
+# hyg_owned_records() -> list of absolute paths to every plain record file
+# (basename matching /\A[^.]+\.md\z/, i.e. never *.lock, *.lock.holder,
+# *.tmp.<pid> or .store.lock) under $HYG_DATA . $_ for each @HYG_OWNED entry.
+sub hyg_owned_records {
+    require File::Find;
+    no warnings 'once';
+    my @out;
+    for my $owned (@HYG_OWNED) {
+        my $dir = "$HYG_DATA$owned";
+        next unless -d $dir;
+        File::Find::find({ no_chdir => 1, wanted => sub {
+            return unless -f $_;
+            push @out, $_ if basename($_) =~ /\A[^.]+\.md\z/;
+        } }, $dir);
+    }
+    return @out;
+}
+
+# hyg_helper_source() -> the self-contained perl program run as its own
+# process (via temp_source). argv: $ppid $proj $ctl $token $task_cli
+# $decision_cli $bug_cli $cap_seconds $bphook_pm $thread_name. Loops writing
+# one task (into the one pre-created thread $thread_name), one decision and
+# one bug report into $proj every ~0.25s, naming each
+# "hyg-helper $token <kind> $n", until the stop file appears, $ppid
+# (an MSYS pid, checked with kill 0 -- never getppid, which is 1 here)
+# disappears, or $cap_seconds elapses. Every CLI call is bounded by
+# `timeout 30` and names its target explicitly (--root / --project $proj).
+#
+# EDITED for blueprint where-things-go: the flat tasklist's CLI (almanac-
+# task.pl) is retired (package 02) -- $task_cli is now almanac-thread.pl and
+# the task-kind write is `add <thread_name> --root $proj --title ...` against
+# the thread created once by the parent before this helper started. package
+# 03-thread-sessions then hard ticket-gates every almanac-thread.pl write
+# verb (Decision 18 F6), so this helper mints a matching ticket for the
+# exact argv of each `add` call before spawning it (BUTLER_STATE_DIR is
+# already pinned in this process's env by the parent).
+sub hyg_helper_source {
+    return <<'HYGHELPER';
+use strict;
+use warnings;
+use Time::HiRes ();
+
+$| = 1;
+my ($ppid, $proj, $ctl, $token, $task_cli, $decision_cli, $bug_cli, $cap_seconds, $bphook_pm, $thread_name) = @ARGV;
+die "hyg-helper: missing argv\n" unless defined $cap_seconds && length $cap_seconds;
+
+require $bphook_pm unless grep { m{(?:^|/)BpHook\.pm$} } keys %INC;
+my $hyg_ticket_seq = 0;
+
+sub _run {
+    my (@cmd) = @_;
+    system(@cmd);
+    return $? == -1 ? -1 : ($? >> 8);
+}
+
+my $deadline = time() + $cap_seconds;
+my $n = 0;
+while (1) {
+    last if -e "$ctl/stop";
+    last if time() > $deadline;
+    last unless kill(0, $ppid);
+    $n++;
+    my @task_argv = ('add', $thread_name, '--root', $proj, '--title', "hyg-helper $token task $n");
+    BpHook::write_ticket(
+        { session_id => 'HYG-HELPER', tool_use_id => 'HYG' . (++$hyg_ticket_seq),
+          transcript_path => undef, cwd => $proj },
+        'almanac-thread', [ @task_argv ]);
+    my $rc1 = _run('timeout', '30', $^X, $task_cli, @task_argv);
+    print "round $n task rc=$rc1\n";
+    my $rc2 = _run('timeout', '30', $^X, $decision_cli, 'file', '--root', $proj,
+                   '--title', "hyg-helper $token decision $n");
+    print "round $n decision rc=$rc2\n";
+    my $rc3 = _run('timeout', '30', $^X, $bug_cli, 'file', '--project', $proj,
+                   '--title', "hyg-helper $token bug $n",
+                   '--body', 'hygiene helper record', '--severity', 'low', '--area', 'sandbox');
+    print "round $n bug rc=$rc3\n";
+    last if -e "$ctl/stop";
+    Time::HiRes::sleep(0.25);
+}
+print "stopped after $n rounds\n";
+exit 0;
+HYGHELPER
+}
+
+# hyg_start_helper() -> $pid -- fork+exec of hyg_helper_source(), with a
+# scrubbed env (own temp HOME, CCPRAXIS_DATA_DIR = $HYG_DATA, cwd = $HYG_PROJ)
+# so it can never reach the live repo's stores. stdout+stderr go only to
+# $HYG_CTL/helper.log (a real file, never an in-memory handle). The child
+# only execs or POSIX::_exit's: a plain exit/die would run Test::More's and
+# File::Temp's END blocks mid-run.
+sub hyg_start_helper {
+    my $script = temp_source(hyg_helper_source());
+    my $parent = $$;
+    my $pid = fork();
+    die "fixture setup: fork failed: $!" unless defined $pid;
+    if (!$pid) {
+        delete $ENV{$_} for @SCRUB_ENV;
+        $ENV{HOME} = $HYG_HOME;
+        $ENV{USERPROFILE} = $HYG_HOME;
+        $ENV{CCPRAXIS_DATA_DIR} = $HYG_DATA;
+        $ENV{BUTLER_STATE_DIR} = $HYG_BSD;   # package 03: the thread CLI's ticket gate needs this
+        chdir($HYG_PROJ) or POSIX::_exit(126);
+        open(STDIN,  '<', '/dev/null')          or POSIX::_exit(126);
+        open(STDOUT, '>', "$HYG_CTL/helper.log") or POSIX::_exit(126);
+        open(STDERR, '>&', \*STDOUT)            or POSIX::_exit(126);
+        { no warnings 'exec';
+          exec { $^X } $^X, $script, $parent, $HYG_PROJ, $HYG_CTL, $HYG_TOKEN,
+                 "$ALMANAC_DIR/almanac-thread.pl", "$ALMANAC_DIR/almanac-inbox.pl",
+                 "$ALMANAC_DIR/almanac-bug.pl", 3600, $BPHOOK_PM_FOR_HYG, $HYG_THREAD; }
+        POSIX::_exit(127);
+    }
+    return $pid;
+}
+
+# hyg_stop_helper() -> $status_text -- idempotent. Touches the stop file,
+# polls waitpid for up to 60s, SIGKILLs and reaps if the helper is still
+# alive after that.
+sub hyg_stop_helper {
+    return 'not running' unless $HYG_PID;
+    spew_raw("$HYG_CTL/stop", '');
+    my $waited = 0;
+    my $reaped = 0;
+    while ($waited < 60) {
+        my $r = waitpid($HYG_PID, POSIX::WNOHANG());
+        if ($r == $HYG_PID || $r == -1) { $reaped = 1; last }
+        Time::HiRes::sleep(0.1);
+        $waited += 0.1;
+    }
+    my $status_text;
+    if ($reaped) {
+        $status_text = "reaped cleanly, exit=" . ($? >> 8);
+    } else {
+        kill('KILL', $HYG_PID);
+        waitpid($HYG_PID, 0);
+        $status_text = "killed after 60s, exit=" . ($? >> 8);
+    }
+    $HYG_PID = 0;
+    return $status_text;
+}
 
 sub nslash { my ($p) = @_; $p =~ s{\\}{/}g; $p =~ s{/\z}{} if length($p) > 1; return $p }
 
@@ -490,25 +701,63 @@ sub seed_notes {
         }
     });
 }
-# seed_tasks($root, [status, title]...) -- appended in order, so rank order is
-# creation order.
-sub seed_tasks {
-    my ($root, @spec) = @_;
-    my @ids;
-    for my $t (@spec) {
-        my ($st, $title) = @$t;
-        my $rec = Almanac::Task::add(root => $root, title => $title // ('task ' . (++$fixture_seq)));
-        Almanac::Task::set_status($rec->{id}, $st, root => $root) if $st ne 'pending';
-        push @ids, $rec->{id};
-    }
-    return @ids;
+# seed_tasks -- DEAD per package 12-statusline-threads (Almanac::Task and the
+# flat tasklist/focus row it fed are retired, Decision 3). Left undefined
+# deliberately: every call site below is rewritten to seed_threads/
+# seed_one_thread instead, so a stray reintroduction of Almanac::Task::add
+# fails loudly (undefined sub) rather than silently reviving dead coverage.
+
+# seed_threads($root, $n_live, $n_handed_off, $n_archived) -- package
+# 12-statusline-threads: project.thread counts records in thread/ with state
+# live or handed-off; archived is excluded. Each thread is created empty (no
+# tasks), so Decision 37's auto-archive-when-all-done landmine never fires on
+# an EMPTY thread (thread_is_done requires at least one task).
+sub seed_threads {
+    my ($root, $n_live, $n_handed_off, $n_archived) = @_;
+    $n_live //= 0; $n_handed_off //= 0; $n_archived //= 0;
+    with_host_policy(sub {
+        for (1 .. $n_live) {
+            Almanac::Thread::create_thread('live-' . (++$fixture_seq), root => $root);
+        }
+        for (1 .. $n_handed_off) {
+            my $name = 'handed-' . (++$fixture_seq);
+            Almanac::Thread::create_thread($name, root => $root);
+            Almanac::Thread::record_event($name, 'handed-off', root => $root, reason => 'fixture handoff');
+        }
+        for (1 .. $n_archived) {
+            my $name = 'archived-' . (++$fixture_seq);
+            Almanac::Thread::create_thread($name, root => $root);
+            Almanac::Thread::archive($name, root => $root);
+        }
+    });
+}
+# seed_one_thread($root, $sid, [status, title]...) -- a single session-owned
+# live thread named "seeded-thread", with the given tasks appended in order
+# (so rank order is creation order), every one UNLINKED. "Add every task
+# before marking any done" (spec section 3, Decision 37's landmine): the
+# caller is responsible for passing specs in an order where the thread never
+# looks fully done mid-construction if that matters to it; the three callers
+# below each either have >=1 permanently-pending task or never mark anything
+# done at all, so none hit the landmine.
+sub seed_one_thread {
+    my ($root, $sid, @spec) = @_;
+    my $name = 'seeded-thread';
+    with_host_policy(sub {
+        Almanac::Thread::create_thread($name, root => $root, owner_kind => 'session', owner_id => $sid);
+        for my $t (@spec) {
+            my ($st, $title) = @$t;
+            my $rec = Almanac::Thread::add_task($name, root => $root, title => $title // ('task ' . (++$fixture_seq)));
+            Almanac::Thread::set_task_status($name, $rec->{id}, $st, root => $root) if defined($st) && $st ne 'pending';
+        }
+    });
+    return $name;
 }
 sub seed_decisions {
     my ($root, $n_unanswered, $n_answered) = @_;
-    Almanac::Decision::file(root => $root, title => 'decision ' . (++$fixture_seq)) for 1 .. $n_unanswered;
+    Almanac::Inbox::file(root => $root, title => 'decision ' . (++$fixture_seq)) for 1 .. $n_unanswered;
     for (1 .. $n_answered) {
-        my $rec = Almanac::Decision::file(root => $root, title => 'decision ' . (++$fixture_seq));
-        Almanac::Decision::answer($rec->{id}, root => $root, answer => 'yes, go ahead');
+        my $rec = Almanac::Inbox::file(root => $root, title => 'decision ' . (++$fixture_seq));
+        Almanac::Inbox::answer($rec->{id}, root => $root, answer => 'yes, go ahead');
     }
 }
 
@@ -528,7 +777,13 @@ sub write_snapshot { my ($home, $bytes) = @_; make_path("$home/.claude"); spew_r
 my $G_BLUEPRINT = encode('UTF-8', chr(0x29C9));
 my $G_TODO      = encode('UTF-8', chr(0x274F));
 my $G_NOTE      = encode('UTF-8', chr(0x2630));
-my $G_TASK      = encode('UTF-8', chr(0x25A3));
+my $G_TASK      = encode('UTF-8', chr(0x25A3));   # RETIRED glyph (package 12-statusline-threads): kept only for behaviour-8-style absence checks
+my $G_THREAD    = encode('UTF-8', chr(0x23E3));   # package 12-statusline-threads: replaces G_TASK as row 1's counter
+my $G_THR_FULL  = encode('UTF-8', chr(0x25B0));
+my $G_THR_EMPTY = encode('UTF-8', chr(0x25B1));
+my $G_THR_IDLE  = encode('UTF-8', chr(0x23F8));
+my $G_THR_NEXT  = encode('UTF-8', chr(0x2192));
+my $G_THR_BAR   = encode('UTF-8', chr(0x2502));
 my $G_FLAG      = encode('UTF-8', chr(0x2691));
 my $G_SILENCED  = encode('UTF-8', chr(0x2016));
 my $G_AGENTOFF  = encode('UTF-8', chr(0x2205));
@@ -1653,15 +1908,17 @@ my $SL_RAW = slurp_raw($STATUSLINE);
 (my $SL_LF = $SL_RAW) =~ s/\r\n/\n/g;
 
 # --- the shared fixtures: behaviours 1-6 -------------------------------------
-#   P_FULL: 5 open + 2 done todos; 2 notes; tasks 2 pending, 1 doing,
-#           1 blocked, 3 done, 1 obsoleted; decisions 2 unanswered, 1 answered.
-#   H_FULL: vault with 3 open + 1 done todos and 1 note.
+#   P_FULL: 5 open + 2 done todos; 2 notes; threads 1 live + 1 handed-off (P=2,
+#           package 12-statusline-threads AC13: the flat tasklist is retired,
+#           so this fixture counts threads, not tasks) + 1 archived (excluded);
+#           decisions 2 unanswered, 1 answered.
+#   H_FULL: vault with 3 open + 1 done todos and 1 note. No thread snapshot is
+#           written here, so the thread counter's global side is 0/omitted.
 my ($P_FULL, $P_EMPTY, $H_FULL, $H_EMPTY) = (mk_proj(), mk_proj(), mk_home(), mk_home());
 if ($ALMANAC_OK) {
     seed_todos('project', $P_FULL, 5, 2);
     seed_notes('project', $P_FULL, 2);
-    seed_tasks($P_FULL, ['pending'], ['pending'], ['doing'], ['blocked'],
-               ['done'], ['done'], ['done'], ['obsoleted']);
+    seed_threads($P_FULL, 1, 1, 1);
     seed_decisions($P_FULL, 2, 1);
     seed_todos('global', $H_FULL, 3, 1);
     seed_notes('global', $H_FULL, 1);
@@ -1714,23 +1971,25 @@ SKIP: {
         ok(run_ends_with($runs->[$ig], fg_sgr('text.muted')),   'AC-1: the global note count is in text.muted');
     }
 
-    # tasklist (behaviour 5): pending + doing + blocked = 4; project-only.
-    my $task = "$G_TASK 4";
-    is(counter_seg($vis, $G_TASK), $task,
-        'AC-1 (behaviour 5): tasks count pending+doing+blocked only -- "U+25A3 4" from 2/1/1, with 3 done and 1 obsoleted ignored')
+    # thread counter (package 12-statusline-threads AC7, behaviour 5 analogue):
+    # 1 live + 1 handed-off = 2; the 1 archived thread is excluded; no global
+    # snapshot -> no dot.
+    my $thread_seg = "$G_THREAD 2";
+    is(counter_seg($vis, $G_THREAD), $thread_seg,
+        'AC-1 (package 12-statusline-threads AC7): threads count live+handed-off only -- "U+23E3 2" from 1 live + 1 handed-off, with 1 archived ignored')
         or diag("  row 1 = [$vis]");
-    $i = index($vis, $task);
+    $i = index($vis, $thread_seg);
   SKIP: {
-        skip('the tasklist segment is not on row 1', 2) if $i < 0;
-        ok(run_ends_with($runs->[$i], fg_sgr('text.muted')), 'AC-1: the tasklist glyph is in text.muted');
-        ok(run_ends_with($runs->[$i + length($G_TASK) + 1], fg_sgr('text.primary')), 'AC-1: the task count is in text.primary');
+        skip('the thread segment is not on row 1', 2) if $i < 0;
+        ok(run_ends_with($runs->[$i], fg_sgr('text.muted')), 'AC-1: the thread glyph is in text.muted');
+        ok(run_ends_with($runs->[$i + length($G_THREAD) + 1], fg_sgr('text.primary')), 'AC-1: the thread count is in text.primary');
     }
 
-    # the segment order (Decision 1(a)): decisions, tasklist, todos, notes.
+    # the segment order (Decision 1(a)): decisions, thread, todos, notes.
     # Blueprints are absent in this fixture.
-    my ($ifl, $it, $in, $ik) = (index($vis, $G_FLAG), index($vis, $G_TODO), index($vis, $G_NOTE), index($vis, $G_TASK));
+    my ($ifl, $it, $in, $ik) = (index($vis, $G_FLAG), index($vis, $G_TODO), index($vis, $G_NOTE), index($vis, $G_THREAD));
     ok($ifl >= 0 && $ik > $ifl && $it > $ik && $in > $it,
-        'AC-1 (spec 2.3): the counters appear in the order decisions, tasklist, todos, notes');
+        'AC-1 (spec 2.3): the counters appear in the order decisions, thread, todos, notes');
 
     # pending decisions (behaviour 6): 2 unanswered, 1 answered. Decision 1(b):
     # the flag has left the marker field entirely and leads the counters
@@ -1752,20 +2011,20 @@ SKIP: {
     my $tc = with_host_policy(sub { Almanac::Todo::count(root => $P_FULL, home => $H_FULL) });
     my $np = scalar @{ with_host_policy(sub { Almanac::Note::open_store('project', root => $P_FULL)->ids }) };
     my $ng = scalar @{ with_host_policy(sub { Almanac::Note::open_store('global',  home => $H_FULL)->ids }) };
-    my $nt = scalar grep { my $s = $_->{fields}{status} // ''; $s eq 'pending' || $s eq 'doing' || $s eq 'blocked' }
-                    @{ Almanac::Task::list_tasks(root => $P_FULL) };
-    my $dc = Almanac::Decision::count(root => $P_FULL);
-    is_deeply([ $tc->{project}{open}, $tc->{global}{open}, $np, $ng, $nt, $dc->{project}{unanswered} ],
-              [ 5, 3, 2, 1, 4, 2 ],
-              'AC-3 (fixture precondition): the modules themselves count 5/3 open todos, 2/1 notes, 4 live tasks, 2 unanswered decisions');
+    my $nthr = scalar grep { my $s = $_->{state} // ''; $s eq 'live' || $s eq 'handed-off' }
+                    @{ with_host_policy(sub { Almanac::Thread::list_threads(root => $P_FULL) }) };
+    my $dc = Almanac::Inbox::count(root => $P_FULL);
+    is_deeply([ $tc->{project}{open}, $tc->{global}{open}, $np, $ng, $nthr, $dc->{project}{unanswered} ],
+              [ 5, 3, 2, 1, 2, 2 ],
+              'AC-3 (fixture precondition): the modules themselves count 5/3 open todos, 2/1 notes, 2 live-or-handed-off threads, 2 unanswered decisions');
     is(counter_seg($vis, $G_TODO), "$G_TODO $tc->{project}{open}$G_DOT$tc->{global}{open}",
         'AC-3: the rendered todo numbers equal Almanac::Todo::count open, project and global');
     is(counter_seg($vis, $G_NOTE), "$G_NOTE$np$G_DOT$ng",
         'AC-3: the rendered note numbers equal the note stores\' record totals, project and global');
-    is(counter_seg($vis, $G_TASK), "$G_TASK $nt",
-        'AC-3: the rendered task number equals the module\'s pending+doing+blocked count');
+    is(counter_seg($vis, $G_THREAD), "$G_THREAD $nthr",
+        'AC-3: the rendered thread number equals Almanac::Thread::list_threads\'s live+handed-off count');
     like($vis, qr/\Q$G_FLAG\E \Q$dc->{project}{unanswered}\E(?!\d)/,
-        'AC-3: the rendered decision number equals Almanac::Decision::count unanswered');
+        'AC-3: the rendered decision number equals Almanac::Inbox::count unanswered');
 }
 
 # ---------------------------------------------------------------------------
@@ -1786,14 +2045,15 @@ SKIP: {
         'AC-1/AC-2 (behaviour 3): empty project, vault 3 -> "U+274F 3", dimmed, no dot -- a zero project count renders no project digit and no dot')
         or diag("  row 1 = [$v3]");
     is(counter_seg($v3, $G_NOTE), "${G_NOTE}1", 'AC-1/AC-2 (behaviour 3): "U+2630 1", dimmed, no dot, no space');
-    is(index($out3, $G_TASK), -1, 'AC-2 (behaviour 3): the project-only tasklist counter renders nothing at 0');
+    is(index($out3, $G_THREAD), -1, 'AC-2 (behaviour 3): the project-only thread counter renders nothing at 0 (no thread, no snapshot)');
     is(index($out3, $G_FLAG), -1, 'AC-2 (behaviour 3): no pending-decisions glyph at 0');
 
     my ($out4, $rc4) = render(proj => $P_EMPTY, home => $H_EMPTY);
     is($rc4, 0, 'AC-2 setup (behaviour 4): every store empty still exits 0');
-    for my $g ([$G_TODO, 'U+274F'], [$G_NOTE, 'U+2630'], [$G_TASK, 'U+25A3'], [$G_FLAG, 'U+2691']) {
+    for my $g ([$G_TODO, 'U+274F'], [$G_NOTE, 'U+2630'], [$G_THREAD, 'U+23E3'], [$G_FLAG, 'U+2691']) {
         is(index($out4, $g->[0]), -1, "AC-2 (behaviour 4): with every store empty, $g->[1] appears nowhere -- a zero counter renders nothing");
     }
+    is(index($out4, $G_TASK), -1, 'AC-2 (package 12-statusline-threads behaviour 8): the retired U+25A3 tasklist glyph appears nowhere either');
 
     my $P_ANS = mk_proj();
     seed_decisions($P_ANS, 0, 1);
@@ -1953,13 +2213,13 @@ SKIP: {
     my $epos = index($SL_LF, $CTR_END);
     my $first_call;
     (my $code = $SL_LF) =~ s/^([ \t]*#[^\n]*)$/' ' x length($1)/mge;
-    while ($code =~ /\balmanac_(?:counts|focus)\s*\(/g) {
+    while ($code =~ /\balmanac_(?:counts|thread)\s*\(/g) {
         my $at = $-[0];
         next if $bpos >= 0 && $epos > $bpos && $at > $bpos && $at < $epos;
         $first_call = $at unless defined $first_call;
     }
     ok($epos > $bpos && $bpos >= 0 && defined($first_call) && $first_call > $epos,
-        'AC-8 (spec 2.2): the generated block ends before the first call of almanac_counts/almanac_focus');
+        'AC-8 (spec 2.2, package 12-statusline-threads AC12): the generated block ends before the first call of almanac_counts/almanac_thread');
 }
 
 # ---------------------------------------------------------------------------
@@ -1972,12 +2232,14 @@ SKIP: {
     ok(defined($payload) && $pl =~ /\S/ && !@f,
         'AC-9: the generated payload contains none of the spec 2.2 forbidden constructs (spawn, pipe/write open, use, require, do FILE)')
         or diag('  found: ' . join(', ', @f) . (defined $payload ? '' : ' (no generated block)'));
-    for my $name (qw(almanac_counts almanac_focus)) {
+    for my $name (qw(almanac_counts almanac_thread)) {
         my $body;
         if ($pl =~ /\bsub\s+\Q$name\E\b/g) { $body = _balanced($pl, pos($pl), '{', '}') }
-        ok(defined $body, "AC-9 (spec 2.2): the payload defines sub $name, the shared accessor");
+        ok(defined $body, "AC-9 (spec 2.2, package 12-statusline-threads AC12): the payload defines sub $name, the shared accessor");
         ok(defined($body) && $body =~ /\beval\s*\{/, "AC-9 (spec 2.2): $name wraps its body in eval, so it never dies to its caller");
     }
+    ok($pl !~ /\bsub\s+almanac_focus\b/,
+        'AC-9 (package 12-statusline-threads AC12): almanac_focus is GONE from the generated payload');
     my @top = grep { length && !/^\s/ } split /\n/, $pl;
     my @bad = grep { !/\A(?:sub\s+\w+|my\s*[\$(]|[})\]]+\s*;?\s*\z)/ } @top;
     ok(defined($payload) && !@bad,
@@ -2030,15 +2292,17 @@ SKIP: {
         'AC-10: outside the generated block, statusline.pl code never names claude-code-vault');
     my @calls = ($code =~ /\balmanac_counts\s*\(/g);
     is(scalar(@calls), 1, 'AC-10: almanac_counts has exactly one call site');
+    my @thread_calls = ($code =~ /\balmanac_thread\s*\(/g);
+    is(scalar(@thread_calls), 1, 'AC-10 (package 12-statusline-threads AC12): almanac_thread has exactly one call site');
 }
 
 # ---------------------------------------------------------------------------
 # AC-11 -- U+2691 through the shared accessor, fed by the real CLI.
 # ---------------------------------------------------------------------------
 {
-    my ($nb, $ne, $blk) = extract_between($SL_RAW, '# -- pending-decisions:begin --', '# -- pending-decisions:end --');
-    is($nb, 1, 'AC-11: "# -- pending-decisions:begin --" occurs exactly once');
-    is($ne, 1, 'AC-11: "# -- pending-decisions:end --" occurs exactly once');
+    my ($nb, $ne, $blk) = extract_between($SL_RAW, '# -- inbox:begin --', '# -- inbox:end --');
+    is($nb, 1, 'AC-11: "# -- inbox:begin --" occurs exactly once');
+    is($ne, 1, 'AC-11: "# -- inbox:end --" occurs exactly once');
     my $code = blank_comments(defined $blk ? $blk : '');
     like($code, qr/\balmanac_counts\s*\(/, 'AC-11: the code between the pending-decisions markers calls almanac_counts');
     my @f = forbidden_constructs($code);
@@ -2051,8 +2315,8 @@ SKIP: {
     skip('almanac modules did not load', 6) unless $ALMANAC_OK;
     my $P = mk_proj();
     make_path("$P/sub/dir");
-    my ($fo, $fe, $frc) = run_argv({ cwd => $P }, $^X, $DECISION_CLI, 'file', '--root', $P, '--title', 'Ship the counters?');
-    is($frc, 0, 'AC-11 (fixture): almanac-decision.pl file --root <P> exits 0') or diag("  stderr: $fe");
+    my ($fo, $fe, $frc) = run_argv({ cwd => $P }, $^X, $INBOX_CLI, 'file', '--root', $P, '--title', 'Ship the counters?');
+    is($frc, 0, 'AC-11 (fixture): almanac-inbox.pl file --root <P> exits 0') or diag("  stderr: $fe");
     my ($id) = $fo =~ /^id:\s*(\S+)/m;
 
     my ($out, $rc) = render(cwd => "$P/sub/dir");
@@ -2074,8 +2338,8 @@ SKIP: {
     is(index($outr, $G_FLAG), -1,
         'AC-11 (section 5): a relative current_dir renders no U+2691 -- it never falls back to the process cwd (which holds one)');
 
-    my ($ao, $ae, $arc) = run_argv({ cwd => $P }, $^X, $DECISION_CLI, 'answer', ($id // 'missing-id'), '--root', $P, '--answer', 'Yes, ship it');
-    is($arc, 0, 'AC-11 (fixture): almanac-decision.pl answer exits 0') or diag("  stderr: $ae");
+    my ($ao, $ae, $arc) = run_argv({ cwd => $P }, $^X, $INBOX_CLI, 'answer', ($id // 'missing-id'), '--root', $P, '--answer', 'Yes, ship it');
+    is($arc, 0, 'AC-11 (fixture): almanac-inbox.pl answer exits 0') or diag("  stderr: $ae");
     my ($out2) = render(cwd => "$P/sub/dir");
     is(index($out2, $G_FLAG), -1, 'AC-11 (behaviour 11): once the decision is answered, no U+2691 renders');
 }
@@ -2111,9 +2375,46 @@ SKIP: {
     my $before = slurp_raw($legacy);
     my ($out, $rc) = render(proj => $P);
     is($rc, 0, 'AC-12 (behaviour 12) setup: exits 0');
-    is(index($out, $G_FLAG), -1, 'AC-12 (behaviour 12): a legacy questions.md with no decision store renders no U+2691');
+    is(index($out, $G_FLAG), -1, 'AC-12 (behaviour 12): a legacy questions.md with no inbox store renders no U+2691');
     is(slurp_raw($legacy), $before, 'AC-12 (behaviour 12): the legacy file is byte-identical afterwards');
     ok(!-d "$P/.ccpraxis-local-data/almanac", 'AC-12 (behaviour 12): no almanac/ dir was created by the render');
+}
+
+# ---------------------------------------------------------------------------
+# AC26 (spec 01-inbox-rename, B15) -- an unmigrated project (A/decision only,
+# no A/inbox) still renders U+2691 N from the legacy dir's own unanswered
+# count; with BOTH dirs present the count is A/inbox's alone, never a sum.
+# ---------------------------------------------------------------------------
+SKIP: {
+    skip('almanac modules did not load', 2) unless $ALMANAC_OK;
+    my $P26 = mk_proj();
+    eval {
+        my $lstore = Almanac::Store->open(scope => 'project', type => 'decision', root => $P26);
+        $lstore->create(fields => { title => 'legacy unanswered', status => 'unanswered', created => '2024-01-01T00:00:00Z' },
+                         order => [qw(title status created)]);
+    };
+    my ($out26, $rc26) = render(proj => $P26);
+    is($rc26, 0, 'AC26 fixture: render over an unmigrated A/decision/ exits 0') or diag("  out: $out26");
+    like($out26, qr/\Q$G_FLAG\E\s*1(?!\d)/, 'AC26: an unmigrated project (A/decision only) still renders U+2691 1 from the legacy fallback');
+
+    # NOTE: this must NOT go through Almanac::Inbox::file() -- that's the
+    # single migrating accessor (spec 01-inbox-rename 2.1/2.2), and it
+    # auto-migrates A/decision into A/inbox on first use, which would merge
+    # the legacy record above into A/inbox rather than leaving two
+    # independent, unmerged dirs. Construct A/inbox directly via
+    # Almanac::Store->open(), the same way the A/decision fixture above does
+    # and the way almanac-inbox-rename.t's own AC16 half-migrated fixture
+    # does, so this test actually reaches the "both dirs present,
+    # unmerged" state instead of migrating past it.
+    eval {
+        my $istore = Almanac::Store->open(scope => 'project', type => 'inbox', root => $P26);
+        $istore->create(fields => { title => 'inbox unanswered', status => 'unanswered', created => '2024-01-01T00:00:00Z' },
+                         order => [qw(title status created)]);
+    };
+    my ($out26b, $rc26b) = render(proj => $P26);
+    is($rc26b, 0, 'AC26 fixture: render with both A/decision and A/inbox present exits 0') or diag("  out: $out26b");
+    like($out26b, qr/\Q$G_FLAG\E\s*1(?!\d)/,
+        'AC26: with both dirs present the count is A/inbox\'s alone (1), never a sum of both (2)');
 }
 
 # ---------------------------------------------------------------------------
@@ -2193,12 +2494,13 @@ SKIP: {
     my $P = mk_proj('fit-proj');
     seed_todos('project', $P, 1, 0);
     seed_notes('project', $P, 1);
-    seed_tasks($P, ['pending']);
+    seed_threads($P, 1, 0, 0);   # package 12-statusline-threads AC13: the thread-counter part replaces seed_tasks
     seed_decisions($P, 1, 0);
-    my $Q = mk_proj('focus-proj-fit');
-    my $long_title = 'T' . ('x' x 199);
-    seed_tasks($Q, ['doing', $long_title]);
-    Almanac::Task::focus(root => $P, session => $sid, tasklist => $Q);
+    # No attached thread here deliberately: the old focus-row elision
+    # sub-case this block used to carry moved to AC-17 below (thread-row
+    # presence/absence) and to plugins/sandbox/tests/t/statusline-thread-row.t
+    # (AC2, behaviour 30's deep-ladder-rung coverage) -- a replacement, not a
+    # deletion (spec AC13).
     my $H = mk_home();
     seed_todos('global', $H, 1, 0);
     seed_notes('global', $H, 1);
@@ -2208,7 +2510,6 @@ SKIP: {
     spew_raw("$state/continuity/off/$sid",
         JSON::PP->new->canonical->encode({ actor => 'agent', at => '2026-09-26T00:00:00Z',
                                             reason => 'paused for the operator', session_id => $sid }) . "\n");
-    my $full_row = "$G_TASK focus-proj-fit $G_DOT $long_title";
 
     for my $sb (0, 1) {
         my $surf = $sb ? 'sandbox' : 'host';
@@ -2224,7 +2525,7 @@ SKIP: {
                 or diag('  over budget: ' . join(' | ', map { 'row ' . ($_ + 1) . ' cost ' . row_cost($budgeted[$_]) . ' [' . strip_sgr($budgeted[$_]) . ']' } @over));
 
             my $v1 = strip_sgr($rows[0] // '');
-            my @present = map { index($v1, $_) >= 0 ? 1 : 0 } ($G_BLUEPRINT, $G_TODO, $G_NOTE, $G_TASK);
+            my @present = map { index($v1, $_) >= 0 ? 1 : 0 } ($G_BLUEPRINT, $G_TODO, $G_NOTE, $G_THREAD);
             my $n = 0; $n += $_ for @present;
             ok($n == 0 || $n == 4,
                 "AC-16 ($surf, cols=$cols): the counters segment is wholly present or wholly absent on row 1 (glyphs present: $n of 4)")
@@ -2232,16 +2533,8 @@ SKIP: {
             if ($n == 4) {
                 is(counter_seg($v1, $G_TODO), "$G_TODO 1${G_DOT}1", "AC-16 ($surf, cols=$cols): a present todos counter is complete");
                 is(counter_seg($v1, $G_NOTE), "${G_NOTE}1${G_DOT}1", "AC-16 ($surf, cols=$cols): a present notes counter is complete");
-                is(counter_seg($v1, $G_TASK), "$G_TASK 1",           "AC-16 ($surf, cols=$cols): a present tasklist counter is complete");
+                is(counter_seg($v1, $G_THREAD), "$G_THREAD 1",       "AC-16 ($surf, cols=$cols): a present thread counter is complete");
             }
-
-            my @tl = grep { index(strip_sgr($_), "$G_TASK ") == 0 } @rows;
-            is(scalar(@tl), 1, "AC-16 ($surf, cols=$cols): exactly one focused-tasklist row");
-            my $tv = strip_sgr($tl[0] // '');
-            like($tv, qr/>\z/, "AC-16 ($surf, cols=$cols): the 200-character current task is right-elided with '>'")
-                or diag("  tasklist row = [$tv]");
-            ok(length($tv) > 1 && index($full_row, substr($tv, 0, -1)) == 0,
-                "AC-16 ($surf, cols=$cols): what survives the elision is a prefix of the full tasklist row");
         }
     }
 
@@ -2260,10 +2553,18 @@ SKIP: {
 }
 
 # ---------------------------------------------------------------------------
-# AC-17 (behaviour 16) -- the focused-tasklist row.
+# AC-17 -- RETIRED per package 12-statusline-threads AC13: "AC-17 (focus row)
+# becomes thread-row presence/absence". The focused-tasklist row (U+25A3
+# <basename> . <current title>) no longer exists; Decision 12 replaces it with
+# the directory row leading with an attached thread. Full row-text/colour/
+# ladder coverage for the new thread row lives in
+# plugins/sandbox/tests/t/statusline-thread-row.t (AC1-AC5). What is kept
+# HERE, as the direct replacement for this AC's old row-count/presence
+# assertions, is behaviours 32 and 33 (no-thread fallback; row count host vs
+# sandbox) against a fresh thread fixture.
 # ---------------------------------------------------------------------------
 SKIP: {
-    skip('almanac modules did not load', 16) unless $ALMANAC_OK;
+    skip('almanac modules did not load', 10) unless $ALMANAC_OK;
     my $sid = 'sess-p10-focus';
     my $H = mk_home();
 
@@ -2271,71 +2572,59 @@ SKIP: {
     my @base_h = split /\n/, (render(proj => $PB, home => $H, sid => $sid))[0];
     my @base_s = split /\n/, (render(proj => $PB, home => $H, sid => $sid, sandbox => 1))[0];
 
-    # a focus record exists, but for ANOTHER session.
+    # a live thread exists, but owned by ANOTHER session -- behaviour 32.
     my $PN = mk_proj();
-    my $QN = mk_proj('someone-elses-tasks');
-    seed_tasks($QN, ['doing', 'not for this session']);
-    Almanac::Task::focus(root => $PN, session => 'sess-p10-someone-else', tasklist => $QN);
-    my @no = split /\n/, (render(proj => $PN, home => $H, sid => $sid))[0];
-    is(scalar(@no), scalar(@base_h), 'AC-17: no task-focus/<sid>.md for this session -> the row count equals the baseline');
-    is(scalar(grep { index(strip_sgr($_), "$G_TASK ") == 0 } @no), 0, 'AC-17: ...and no tasklist row is emitted');
+    with_host_policy(sub {
+        Almanac::Thread::create_thread('someone-elses-thread', root => $PN,
+            owner_kind => 'session', owner_id => 'sess-p10-someone-else');
+    });
+    my ($no_out) = render(proj => $PN, home => $H, sid => $sid);
+    my @no = split /\n/, $no_out;
+    is(scalar(@no), scalar(@base_h), 'AC-17 (behaviour 33): a thread owned by another session -> row count equals the baseline');
+    is(strip_sgr($no[-1] // ''), $PN, 'AC-17 (behaviour 32): ...and the last row (the directory row) is still today\'s unelided path_row, since no thread is attached to THIS session');
+    is(counter_seg(strip_sgr($no[0] // ''), $G_THREAD), "$G_THREAD 1",
+        'AC-17 (spec 2.1): ...but row 1\'s counter still counts the live thread, regardless of ownership -- project.thread and session attachment are different things');
 
-    # focus on Q, whose FIRST doing task in (rank, id) order is the café one.
+    # an attached thread, host vs sandbox row count (behaviour 33) -- the
+    # thread row replaces the path row IN PLACE on the host (same count) and
+    # ADDS one row in the sandbox (which otherwise has no directory row).
     my $P = mk_proj();
-    my $Q = mk_proj('focus-proj-Q');
-    my $current = "Refine the caf\x{e9} parser";
-    seed_tasks($Q, ['pending', 'not this pending one'], ['done', 'nor this done one'],
-                   ['doing', $current], ['doing', 'a later doing task']);
-    Almanac::Task::focus(root => $P, session => $sid, tasklist => $Q);
-    my $tl = Almanac::Task::focused(root => $P, session => $sid);
-    my ($name) = (defined $tl ? $tl : '') =~ m{([^/]+)\z};
-    is($name, 'focus-proj-Q', 'AC-17 (fixture precondition): the focus record names the tasklist whose basename is focus-proj-Q');
-    my $want = "$G_TASK " . encode('UTF-8', $name // '') . " $G_DOT " . encode('UTF-8', $current);
+    seed_one_thread($P, $sid, ['pending', 'first task']);
 
     my ($oh) = render(proj => $P, home => $H, sid => $sid);
     my @rh = split /\n/, $oh;
-    is(scalar(@rh), scalar(@base_h) + 1, 'AC-17 (host): focus adds exactly one row');
-    is(strip_sgr($rh[-2] // ''), $want,
-        'AC-17 (host): the extra row reads "U+25A3 <basename Q> . <first doing title>", UTF-8 encoded exactly once')
-        or diag('  rows: ' . join(' | ', map { strip_sgr($_) } @rh));
-    is(strip_sgr($rh[-1] // ''), $P, 'AC-17 (host): the last row is still the working directory');
-    is(index($oh, "\xC3\x83"), -1, 'AC-17 (section 5): no double-encoded UTF-8 anywhere in the output');
-    my $trow = $rh[-2] // '';
-    my $truns = sgr_runs($trow);
-    my $tvis = strip_sgr($trow);
-    my $ni = length($G_TASK) + 1;
-    my $di = $ni + length(encode('UTF-8', $name // '')) + 1;
-    my $ci = $di + length($G_DOT) + 1;
-    ok($tvis eq $want && run_ends_with($truns->[0], fg_sgr('text.muted')) && run_ends_with($truns->[$ni], fg_sgr('text.primary'))
-       && run_ends_with($truns->[$di - 1], fg_sgr('text.faint')) && run_ends_with($truns->[$ci], fg_sgr('text.primary')),
-        'AC-17 (spec 2.3): tasklist row colours -- glyph text.muted, name text.primary, " . " text.faint, current text.primary');
+    is(scalar(@rh), scalar(@base_h), 'AC-17 (behaviour 33, host): an attached thread does not change the row count -- replaced in place');
 
     my ($os) = render(proj => $P, home => $H, sid => $sid, sandbox => 1);
     my @rs = split /\n/, $os;
-    is(scalar(@rs), scalar(@base_s) + 1, 'AC-17 (sandbox): focus adds exactly one row');
-    is(strip_sgr($rs[-1] // ''), $want, 'AC-17 (sandbox): with no path row, the tasklist row is the last row');
+    is(scalar(@rs), scalar(@base_s) + 1, 'AC-17 (behaviour 33, sandbox): an attached thread adds exactly one row -- the last');
 
-    # spec 2.2: no doing task -> the name alone.
-    my $P2 = mk_proj();
-    my $Q2 = mk_proj('idle-tasks');
-    seed_tasks($Q2, ['pending', 'waiting'], ['blocked', 'stuck']);
-    Almanac::Task::focus(root => $P2, session => $sid, tasklist => $Q2);
-    my @r2 = split /\n/, (render(proj => $P2, home => $H, sid => $sid))[0];
-    is(strip_sgr($r2[-2] // ''), "$G_TASK idle-tasks", 'AC-17 (spec 2.2): a focused tasklist with no doing task renders "U+25A3 <name>" alone');
+    # a session id outside the id grammar -- behaviour 32. $P's thread is
+    # still live and still counted by project.thread (spec 2.1) regardless of
+    # the session id used to render -- only ATTACHMENT (step 1 of
+    # almanac_thread, spec 2.1) cares about the id grammar.
+    my ($bad_out) = render(proj => $P, home => $H, sid => '../sess-p10-focus');
+    my @bad_rows = split /\n/, $bad_out;
+    is(strip_sgr($bad_rows[-1] // ''), $P,
+        'AC-17 (behaviour 32): a session_id outside the id grammar -- the directory row falls back to the plain path_row');
+    is(counter_seg(strip_sgr($bad_rows[0] // ''), $G_THREAD), "$G_THREAD 1",
+        'AC-17 (spec 2.1): ...but row 1\'s counter still counts the live thread -- project.thread does not depend on session attachment');
 
-    # spec 2.2: a tasklist dir that no longer exists still yields the name.
-    my $P3 = mk_proj();
-    my $Q3 = mk_proj('vanished-tasks');
-    Almanac::Task::focus(root => $P3, session => $sid, tasklist => $Q3);
-    remove_tree($Q3);
-    ok(!-d $Q3, 'AC-17 (fixture precondition): the focused tasklist directory is gone');
-    my @r3 = split /\n/, (render(proj => $P3, home => $H, sid => $sid))[0];
-    is(strip_sgr($r3[-2] // ''), "$G_TASK vanished-tasks", 'AC-17 (spec 2.2): a focused tasklist dir that does not exist still renders its name');
-
-    # spec 2.2: a session id outside the id grammar never names a record.
-    my @r4 = split /\n/, (render(proj => $P, home => $H, sid => '../sess-p10-focus'))[0];
-    is(scalar(grep { index(strip_sgr($_), "$G_TASK ") == 0 } @r4), 0,
-        'AC-17 (spec 2.2): a session_id outside the id grammar renders no tasklist row');
+    # the handed-off state -- behaviour 32. almanac_thread's attachment step
+    # (spec 2.1 step 3) requires state exactly "live"; a handed-off thread
+    # never attaches. But project.thread (spec 2.1) counts live OR
+    # handed-off, so the row 1 counter still sees it.
+    my $PH = mk_proj();
+    with_host_policy(sub {
+        Almanac::Thread::create_thread('handoff-thread', root => $PH, owner_kind => 'session', owner_id => $sid);
+        Almanac::Thread::record_event('handoff-thread', 'handed-off', root => $PH, reason => 'moving on');
+    });
+    my ($ho_out) = render(proj => $PH, home => $H, sid => $sid);
+    my @ho_rows = split /\n/, $ho_out;
+    is(strip_sgr($ho_rows[-1] // ''), $PH,
+        'AC-17 (behaviour 32): a handed-off thread never attaches -- the directory row falls back to the plain path_row');
+    is(counter_seg(strip_sgr($ho_rows[0] // ''), $G_THREAD), "$G_THREAD 1",
+        'AC-17 (spec 2.1): ...but row 1\'s counter still counts the handed-off thread -- project.thread counts live and handed-off alike');
 }
 
 # ---------------------------------------------------------------------------
@@ -2352,9 +2641,34 @@ SKIP: {
     my $P = mk_proj();
     seed_todos('project', $P, 50, 0);
     seed_notes('project', $P, 50);
-    seed_tasks($P, map { ['pending'] } 1 .. 50);
-    Almanac::Decision::file(root => $P, title => "budget decision $_") for 1 .. 50;
-    Almanac::Task::focus(root => $P, session => $sid, tasklist => $P);
+    Almanac::Inbox::file(root => $P, title => "budget decision $_") for 1 .. 50;
+
+    # package 12-statusline-threads AC11 (re-seeded per the spec's own
+    # figure, since AC-18 "is AC11" per AC13): an attached thread of 50
+    # tasks -- 20 linked, each to its own ~6 KB ledger with a Pipeline
+    # section; 30 unlinked, mixed classes -- plus 10 other open threads in
+    # the project.
+    with_host_policy(sub {
+        Almanac::Thread::create_thread('budget-thread', root => $P, owner_kind => 'session', owner_id => $sid);
+        my $pad = '# padding line to bulk the ledger toward ~6 KB' x 24;   # ~1.1KB/line block
+        for my $i (1 .. 20) {
+            my $pkg = sprintf('%02d-budget', $i);
+            my $dir = "$P/.ccpraxis-local-data/blueprints/budget-bp/packages";
+            make_path($dir);
+            spew_raw("$dir/$pkg.md",
+                "---\nstatus: pending\n---\n\n## Pipeline\n\n- [ ] 1. Scout\n\n$pad\n$pad\n$pad\n$pad\n$pad\n");
+            Almanac::Thread::add_task('budget-thread', root => $P, link => "budget-bp/$pkg");
+        }
+        for my $i (1 .. 30) {
+            my $rec = Almanac::Thread::add_task('budget-thread', root => $P, title => "budget task $i");
+            my $status = ($i % 3 == 0) ? 'doing' : ($i % 3 == 1) ? 'blocked' : undef;
+            Almanac::Thread::set_task_status('budget-thread', $rec->{id}, $status, root => $P) if defined $status;
+        }
+        for my $i (1 .. 10) {
+            Almanac::Thread::create_thread('budget-other-' . $i, root => $P);
+        }
+    });
+
     my $H = mk_home();
     seed_todos('global', $H, 50, 0);
     seed_notes('global', $H, 50);
@@ -2376,7 +2690,7 @@ SKIP: {
     my $mean = sub { my $s = 0; $s += $_ for @_; return $s / scalar(@_) };
     my ($mp, $mb) = ($mean->(@pop), $mean->(@base));
     diag(sprintf('  AC-18: mean populated %.4fs, mean baseline %.4fs, added %.4fs over 20 alternating renders each', $mp, $mb, $mp - $mb));
-    cmp_ok($mp - $mb, '<', 0.050, 'AC-18: the mean added render cost of 50 records in every store is under 50 ms');
+    cmp_ok($mp - $mb, '<', 0.050, 'AC-18: the mean added render cost of a 50-task thread (20 linked, 30 unlinked) plus 10 other threads is under 50 ms');
 }
 
 # ---------------------------------------------------------------------------
@@ -2445,7 +2759,7 @@ SKIP: {
     }
 
     # The same rule reaches the decision counter, where a false U+2691 would
-    # tell the operator answers are waiting when almanac-decision.pl has none.
+    # tell the operator answers are waiting when almanac-inbox.pl has none.
     for my $case (
         [ 'unterminated decision',          "---\nid: d\nstatus: unanswered\n",            0 ],
         [ 'decision with status:unanswered', "---\nid: d\nstatus:unanswered\n---\n",       0 ],
@@ -2453,8 +2767,8 @@ SKIP: {
     ) {
         my ($label, $bytes, $want) = @$case;
         my $P = mk_proj();
-        make_path("$P/.ccpraxis-local-data/almanac/decision");
-        spew_raw("$P/.ccpraxis-local-data/almanac/decision/d.md", $bytes);
+        make_path("$P/.ccpraxis-local-data/almanac/inbox");
+        spew_raw("$P/.ccpraxis-local-data/almanac/inbox/d.md", $bytes);
         my ($out) = render(proj => $P, home => $H_EMPTY);
         my $has = ($out =~ /\Q$G_FLAG\E 1(?!\d)/) ? 1 : 0;
         is($has, $want, "Decision 121 parity ($label): U+2691 renders iff Almanac::Record accepts the record as unanswered");
@@ -2520,9 +2834,44 @@ SKIP: {
 }
 
 # ---------------------------------------------------------------------------
-# Hermeticity -- the real repo's almanac store is unchanged by this file.
+# Hermeticity -- this file's own CCPRAXIS_DATA_DIR.
 # ---------------------------------------------------------------------------
-is_deeply(almanac_listing($REAL_STORE), $REAL_STORE_BEFORE,
-    'hygiene: the real repo\'s .ccpraxis-local-data/almanac listing is unchanged by this whole file');
+my $hyg_stop = hyg_stop_helper();
+diag("hygiene helper: $hyg_stop");
+
+# H0 -- counter-fixture: the filter is not a blanket pass. package 02-
+# thread-store retires the flat tasklist; the "near-miss, word-boundary
+# only" probe moves from task/tasks to thread/threads for the same reason.
+is_deeply(hyg_unowned([ "\td\t0\t1", "/almanac\td\t0\t1", "/almanac/todo/x.md\tf\t1\t1",
+                         "/almanac/thread\td\t0\t1", "/almanac/thread/x.md\tf\t1\t1",
+                         "/almanac/inbox/y.md\tf\t1\t1", "/bug-reports/z.md\tf\t1\t1",
+                         "/almanac/threads/x.md\tf\t1\t1", "/blueprints/b/blueprint.md\tf\t1\t1" ]),
+          [ "\td\t0\t1", "/almanac\td\t0\t1", "/almanac/todo/x.md\tf\t1\t1",
+            "/almanac/threads/x.md\tf\t1\t1", "/blueprints/b/blueprint.md\tf\t1\t1" ],
+          'hygiene (counter-fixture): the helper-owned filter drops only its own subtrees');
+
+# H1 -- the helper really wrote, into this root, all three kinds
+my %hyg_n = map { my $p = $_; ($p => scalar(grep { index($_, "$HYG_DATA$p/") == 0 } hyg_owned_records())) } @HYG_OWNED;
+ok((grep { $hyg_n{$_} >= 1 } @HYG_OWNED) == @HYG_OWNED,
+   'hygiene: the background helper wrote task, decision and bug records into this file\'s CCPRAXIS_DATA_DIR')
+    or diag(join(' ', map { "$_=$hyg_n{$_}" } @HYG_OWNED) . "\n" . slurp_raw("$HYG_CTL/helper.log"));
+
+# H2 -- THE hygiene assertion (replaces the old $REAL_STORE check)
+is_deeply(hyg_unowned(almanac_listing($HYG_DATA)), $HYG_BEFORE,
+    'hygiene: outside the helper-owned subtrees, this file\'s CCPRAXIS_DATA_DIR listing is unchanged by this whole file');
+
+# H3 -- nothing but the helper wrote inside the helper-owned subtrees.
+# package 03-thread-sessions: the thread's own metadata record
+# (thread/$HYG_THREAD.md) and its one-time `created` log entry
+# (thread-log-$HYG_THREAD/00000001.md) are structural, written ONCE by this
+# file's own setup call before the helper starts -- they carry no
+# "hyg-helper $token ..." title and are expected, not foreign.
+my @hyg_foreign = grep {
+    $_ !~ m{/almanac/thread/\Q$HYG_THREAD\E\.md\z} && $_ !~ m{/almanac/thread-log-\Q$HYG_THREAD\E/}
+    && slurp_raw($_) !~ /^title: hyg-helper \Q$HYG_TOKEN\E (?:task|decision|bug) \d+\r?$/m
+} hyg_owned_records();
+is(scalar(@hyg_foreign), 0,
+   'hygiene: every record in the helper-owned subtrees was written by this run\'s helper')
+    or diag("  foreign: @hyg_foreign");
 
 done_testing();

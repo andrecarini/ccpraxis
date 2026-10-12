@@ -27,25 +27,33 @@ BEGIN {
 }
 
 # routes() -> \%table -- pure, no I/O. The verb lists are the closed sets
-# documented in each type script's own %VERBS (todo/note/task/decision) or
+# documented in each type script's own %VERBS (todo/note/task/inbox) or
 # $cmd eq chain (bug), restated here rather than derived at runtime so this
 # sub has no dependency on those scripts even loading cleanly.
 sub routes {
     return {
         todo     => { script => 'almanac-todo.pl',
-                      verbs  => [qw(create list show edit complete reopen delete count)] },
+                      verbs  => [qw(create list show edit complete reopen delete count promote)] },
         note     => { script => 'almanac-note.pl',
                       verbs  => [qw(create list show edit promote delete check-pointers)] },
-        task     => { script => 'almanac-task.pl',
-                      verbs  => [qw(add insert-at insert-before insert-after move-first
-                                    move-last reorder status edit list show focus focused
-                                    unfocus)] },
-        decision => { script => 'almanac-decision.pl',
+        thread   => { script => 'almanac-thread.pl',
+                      verbs  => [qw(create list show archive archive-if-done add edit move
+                                    reorder status add-packages event
+                                    attach detach switch take-over)] },
+        inbox    => { script => 'almanac-inbox.pl',
                       verbs  => [qw(file list show answer blocks)] },
         bug      => { script => 'almanac-bug.pl',
                       verbs  => [qw(file append update set-status takeover list collect verify)] },
         doctor   => { script => 'almanac-doctor.pl', verbs => undef },
     };
+}
+
+# retired_types() -> \%table -- a retired `almanac <type>` dispatch decision
+# pure sub, one entry per hard cutover (spec 2.6). Checked in run() before the
+# unknown-type check so a retired type gets its one-line pointer rather than
+# "unknown type".
+sub retired_types {
+    return { decision => 'almanac inbox', task => 'almanac thread' };
 }
 
 sub _types_line {
@@ -87,6 +95,12 @@ sub run {
         print STDERR _types_line($routes);
         return 2;
     }
+    my $retired = retired_types();
+    if (exists $retired->{$type}) {
+        print STDERR "almanac: 'almanac $type' is retired; use '$retired->{$type}' instead\n";
+        return 2;
+    }
+
     unless (exists $routes->{$type}) {
         print STDERR "almanac: unknown type '$type'\n";
         print STDERR _types_line($routes);

@@ -142,7 +142,7 @@ sub CF {
     return {
         blueprint => 'agent-telemetry', state => 'running',
         packages_done => 3, packages_total => 9, running_coordinators => 2,
-        decisions_waiting => 1, decisions_operator => 1, decisions_triage => 0,
+        escalations_waiting => 1, inbox_waiting => 1, triage_waiting => 0,
         current_package => undef, paused_manual => 0, paused_reason => undef,
         orchestrator_pid => 4242, orchestrator_alive => 1,
         orchestrator_started_at => $NOW - 8040,
@@ -1665,6 +1665,46 @@ sub golden_table_row {
                     'AC52: Theme::generated_block() equals the block embedded in statusline.pl -- adding one glyph changes no role, so unchanged');
             }
         }
+    }
+}
+
+# ===========================================================================
+# package 13-dashboard-threads (specs/13-dashboard-threads-spec.md S3
+# behaviour 14, AC7): the thread line's placement in _run_summary_lines, and
+# the byte-identical-without-a-thread regression guard.
+# ===========================================================================
+
+# --- regression: CF() (no `thread` key at all) renders BYTE-IDENTICALLY to
+# --- the pre-existing AC1 golden capture -- package 13 is additive only. ---
+{
+    my ($rows, $err) = call1('_run_summary_lines', [ CF() ], undef, 120, $NOW);
+    ok(!$err, 'package-13/B14 regression: _run_summary_lines(CF, ...) still does not die') or diag(" error: $err");
+    is(scalar(@{ $rows || [] }), 9, 'package-13/B14 regression: CF() (no thread key) still renders EXACTLY 9 rows -- no thread line silently injected');
+}
+
+# --- placement: a thread line appears immediately after the table row (CF
+# --- carries no paused-reason) and before the pre-existing tree rows. ------
+{
+    my $thread = {
+        name => 'zqx187-thread', state => 'live', done => 1, total => 2,
+        doing => [ { class => 'doing', kind => 'text', title => 'zqx187 doing task', waits_on => undef } ],
+        current => undef,
+        next    => undef,
+        owner   => { kind => 'none', id => undef, alive => undef, activity_at => undef, armed => 0 },
+    };
+    my $cf_with_thread = { %{ CF() }, thread => $thread };
+    my ($rows, $err) = call1('_run_summary_lines', [ $cf_with_thread ], undef, 120, $NOW);
+    ok(!$err, 'package-13/B14: _run_summary_lines does not die on a run carrying a thread') or diag(" error: $err");
+  SKIP: {
+        skip('no rows', 3) unless ref($rows) eq 'ARRAY' && @$rows;
+        is(scalar(@$rows), 10, 'package-13/B14: exactly one extra row appears (9 -> 10) when a thread is added, nothing else changes');
+        ok(row_text($rows->[0]) =~ /agent-telemetry/, 'package-13/B14 precondition: row 0 is still the unchanged table row');
+        like(row_text($rows->[1]), qr/zqx187-thread/, 'package-13/B14: the thread line is row 1 -- immediately after the table row (CF has no paused-reason line)');
+        # row 2 onward must be CF's pre-existing tree, shifted down by exactly
+        # one row (same AC1 golden text this file's own AC1 block already
+        # pins at rows[0..8] for the thread-less fixture).
+        is(row_pair($rows->[2])->[1], '  orchestrator  alive  2h14m',
+            'package-13/B14: row 2 is CF\'s pre-existing first tree row, shifted down by exactly one (thread line inserted at row 1, nothing else reordered)');
     }
 }
 

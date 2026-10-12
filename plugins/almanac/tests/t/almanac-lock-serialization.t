@@ -546,7 +546,7 @@ HOLDER14
         $calls++ while $line =~ /\bcas_write\s*\(/g;
         $defs++ if $line =~ /^\s*sub\s+cas_write\b/;
     }
-    is($calls, 3, 'AC-19: cas_write is called exactly three times');
+    is($calls, 4, 'AC-19: cas_write is called exactly four times');
     is($defs, 1, 'AC-19: cas_write is defined exactly once');
 
     if ($src =~ /^sub cas_write \{(.*?)^\}/ms) {
@@ -569,14 +569,17 @@ HOLDER14
     # Decision 36 / package 09: claim_report_path (verb => 'file') and
     # verify's tampered/unreadable re-check (verb => 'verify') both take a
     # real Almanac::Lock->acquire with no corresponding AlmanacBug::load --
-    # neither verb reads a report through load(). Classify every acquire
-    # site by its own verb=>'...' argument: the three mutating verbs
-    # (update/append/set-status) stay pinned above their load() exactly as
-    # before; 'file' and 'verify' are the two allowed extras; anything else
-    # is not permitted.
+    # neither verb reads a report through load(). Package 12 added a fourth
+    # mutating verb, 'takeover' (claiming a bug under triaging with a
+    # hook-issued ticket), with its own acquire() pinned above its load()
+    # just like the original three. Classify every acquire site by its own
+    # verb=>'...' argument: the four mutating verbs
+    # (update/append/set-status/takeover) stay pinned above their load();
+    # 'file' and 'verify' are the two allowed extras; anything else is not
+    # permitted.
     my (@mutating_acquire, @extra_acquire, @other_acquire);
     for my $i (@acquire_lines) {
-        if ($lines[$i] =~ /verb\s*=>\s*['"](?:update|append|set-status)['"]/) {
+        if ($lines[$i] =~ /verb\s*=>\s*['"](?:update|append|set-status|takeover)['"]/) {
             push @mutating_acquire, $i;
         } elsif ($lines[$i] =~ /verb\s*=>\s*['"](?:file|verify)['"]/) {
             push @extra_acquire, $i;
@@ -584,11 +587,11 @@ HOLDER14
             push @other_acquire, $i;
         }
     }
-    unless (ok(scalar(@other_acquire) == 0, 'AC-19: no acquire() site outside the five named verbs')) {
+    unless (ok(scalar(@other_acquire) == 0, 'AC-19: no acquire() site outside the six named verbs')) {
         diag("line " . ($_ + 1) . ": $lines[$_]") for @other_acquire;
     }
-    is(scalar(@mutating_acquire), 3,
-        'AC-19: Almanac::Lock->acquire appears exactly three times for the mutating verbs (update/append/set-status)');
+    is(scalar(@mutating_acquire), 4,
+        'AC-19: Almanac::Lock->acquire appears exactly four times for the mutating verbs (update/append/set-status/takeover)');
     is(scalar(@extra_acquire), 2,
         "AC-19: exactly two extra acquire sites, verb => 'file' (claim_report_path) and verb => 'verify' (verify's re-check)");
     ok((grep { $lines[$_] =~ /verb\s*=>\s*['"]file['"]/ } @extra_acquire),
@@ -596,9 +599,9 @@ HOLDER14
     ok((grep { $lines[$_] =~ /verb\s*=>\s*['"]verify['"]/ } @extra_acquire),
         "AC-19: one extra acquire site names verb => 'verify'");
 
-    my $all_above = (@mutating_acquire == 3 && @load_lines == 3) ? 1 : 0;
+    my $all_above = (@mutating_acquire == 4 && @load_lines == 4) ? 1 : 0;
     if ($all_above) {
-        for my $i (0 .. 2) {
+        for my $i (0 .. 3) {
             $all_above = 0 unless $mutating_acquire[$i] < $load_lines[$i];
         }
     }

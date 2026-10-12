@@ -102,7 +102,7 @@ my @EXPECTED = (
       ] },
     { id => 'auto-mode-denial-limits',
       description => 'Auto mode escalates to a blocking prompt after 3 consecutive or 20 total classifier denials.',
-      relied_by   => 'never-halt hooks (Decision 10): the 3-consecutive / 20-total escalation limits',
+      relied_by   => 'never-halt hooks (Decisions 10, 15): BpHook::DenialBreaker trips at $MAX_CONSECUTIVE=2 / $MAX_TOTAL=17, one below these limits ($AUTO_MODE_MAX_CONSECUTIVE / $AUTO_MODE_MAX_TOTAL)',
       found_in    => { version => '2.1.282', date => '2026-09-26' },
       signatures  => [
           { type => 'regex', value => 'maxConsecutive\s*:\s*3\s*,\s*maxTotal\s*:\s*20\b', example => 'maxConsecutive:3,maxTotal:20' },
@@ -122,6 +122,24 @@ my @EXPECTED = (
       relied_by   => 'global-config/settings.json disableWorkflows: true',
       found_in    => { version => '2.1.282', date => '2026-09-26' },
       signatures  => [ { type => 'regex', value => 'settings\.disableWorkflows\s*===\s*!0', example => 'settings.disableWorkflows===!0' } ] },
+    # never-halt package 07 (spec sec 8 C4, Decision 44): three entries the
+    # breaker newly relies on, appended after the original five, each with
+    # relied_by naming BpHook::DenialBreaker.
+    { id => 'auto-mode-safe-allowlist',
+      description => 'Auto mode skips the classifier for a tool on its static safe allowlist, logging that it is on the safe allowlist.',
+      relied_by   => 'never-halt hooks (Decision 15): BpHook::DenialBreaker\'s @CLASSIFIER_EXEMPT_TOOLS mirrors this allowlist (F3)',
+      found_in    => { version => '2.1.282', date => '2026-09-26' },
+      signatures  => [ { type => 'literal', value => 'tool is on the safe allowlist' } ] },
+    { id => 'bash-rule-trailing-wildcard',
+      description => 'A Bash permissions.allow rule body ending " *" also matches the command with that trailing word omitted.',
+      relied_by   => 'never-halt hooks (Decision 15): BpHook::DenialBreaker::allow_listed\'s wildcard-matching algorithm (F4)',
+      found_in    => { version => '2.1.282', date => '2026-09-26' },
+      signatures  => [ { type => 'literal', value => '.endsWith(" .*")' } ] },
+    { id => 'post-tool-use-failure-event',
+      description => 'PostToolUseFailure fires only after a tool call has started running, never for a permission denial.',
+      relied_by   => 'never-halt hooks (Decision 15): BpHook::DenialBreaker registers on PostToolUseFailure to reset its mirror (F5)',
+      found_in    => { version => '2.1.282', date => '2026-09-26' },
+      signatures  => [ { type => 'literal', value => 'hook_event_name:"PostToolUseFailure"' } ] },
 );
 
 # ---------------------------------------------------------------------------
@@ -541,24 +559,32 @@ AC6b: {
 }
 
 # ===========================================================================
-# AC6c — the shipped file has exactly the five ids, and their literal/regex
-# signature values match the spec table exactly.
+# AC6c — the shipped file has exactly the eight ids (never-halt 07, spec sec
+# 8 C4, adds three to the original five), and their literal/regex signature
+# values match the spec table exactly. The auto-mode-denial-limits entry's
+# relied_by is also pinned to the exact never-halt 07 text (spec sec 2.11),
+# and each of the three new entries' relied_by names BpHook::DenialBreaker.
 AC6c: {
     unless ($HAVE_DATA) {
-        ok(0, 'AC6c: the shipped file has the five expected ids, in order');
+        ok(0, 'AC6c: the shipped file has the eight expected ids, in order');
         ok(0, 'AC6c: the shipped literal and regex signature values match the spec table exactly');
+        ok(0, 'AC6c: auto-mode-denial-limits relied_by names BpHook::DenialBreaker and the $MAX_CONSECUTIVE/$MAX_TOTAL constants');
+        ok(0, 'AC6c: each of the three new never-halt 07 entries relied_by names BpHook::DenialBreaker');
         last AC6c;
     }
     my $data = read_json_file_raw($DATA);
     unless (ref $data eq 'HASH' && ref $data->{entries} eq 'ARRAY') {
-        ok(0, 'AC6c: the shipped file has the five expected ids, in order (blocked: file did not parse)');
+        ok(0, 'AC6c: the shipped file has the eight expected ids, in order (blocked: file did not parse)');
         ok(0, 'AC6c: the shipped literal and regex signature values match the spec table exactly (blocked)');
+        ok(0, 'AC6c: auto-mode-denial-limits relied_by names BpHook::DenialBreaker and the $MAX_CONSECUTIVE/$MAX_TOTAL constants (blocked)');
+        ok(0, 'AC6c: each of the three new never-halt 07 entries relied_by names BpHook::DenialBreaker (blocked)');
         last AC6c;
     }
     my @entries      = @{ $data->{entries} };
     my @ids          = map { $_->{id} // '' } @entries;
     my @expected_ids = map { $_->{id} } @EXPECTED;
-    ok(arrays_equal(\@ids, \@expected_ids), 'AC6c: the shipped file has exactly the five expected ids, in order')
+    is(scalar(@expected_ids), 8, 'AC6c precondition: this file\'s own fixture table has exactly eight expected ids');
+    ok(arrays_equal(\@ids, \@expected_ids), 'AC6c: the shipped file has exactly the eight expected ids, in order')
         or diag('  got: ' . join(',', @ids));
 
     my $sig_ok = 1;
@@ -578,6 +604,29 @@ AC6c: {
         }
     }
     ok($sig_ok, 'AC6c: literal and regex signature values match the spec table exactly, entry by entry');
+
+    my ($dl_got) = grep { ($_->{id} // '') eq 'auto-mode-denial-limits' } @entries;
+    my ($dl_exp) = grep { $_->{id} eq 'auto-mode-denial-limits' } @EXPECTED;
+    is(($dl_got->{relied_by} // ''), $dl_exp->{relied_by},
+       'AC6c: auto-mode-denial-limits relied_by equals the never-halt 07 text exactly (spec sec 2.11)')
+        if $dl_got && $dl_exp;
+    ok(0, 'AC6c: auto-mode-denial-limits relied_by equals the never-halt 07 text exactly (spec sec 2.11; entry missing)')
+        unless $dl_got && $dl_exp;
+
+    my @new_ids = qw(auto-mode-safe-allowlist bash-rule-trailing-wildcard post-tool-use-failure-event);
+    for my $id (@new_ids) {
+        my ($got) = grep { ($_->{id} // '') eq $id } @entries;
+        ok($got, "AC6c: the shipped file has the new never-halt 07 entry '$id'");
+        next unless $got;
+        like(($got->{relied_by} // ''), qr/BpHook::DenialBreaker/,
+            "AC6c: '$id' relied_by names BpHook::DenialBreaker");
+        is(ref $got->{signatures} eq 'ARRAY' ? scalar(@{ $got->{signatures} }) : 0, 1,
+            "AC6c: '$id' has exactly one signature");
+        if (ref $got->{signatures} eq 'ARRAY' && @{ $got->{signatures} }) {
+            my $sig = $got->{signatures}[0];
+            is(($sig->{type} // ''), 'literal', "AC6c: '$id' signature type is literal");
+        }
+    }
 }
 
 # ===========================================================================

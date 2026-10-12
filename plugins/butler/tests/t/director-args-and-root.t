@@ -14,6 +14,17 @@
 use strict;
 use warnings;
 BEGIN { $ENV{CCPRAXIS_NO_WAKELOCK} = 1 } # package 16 post-fix-batch (Decision 80): never a real wake-lock invocation here.
+# AC15 (08-blueprint-parks fix-batch, SF-3): pin ALMANAC_HOME to an isolated
+# tempdir before any production code loads (Decision 29) -- this file names
+# no ALMANAC_HOME today. Deliberately NOT re-pinning HOME/USERPROFILE here:
+# $RAW_HOST_HOME below (and the fixture override later in this file) depend
+# on reading the REAL host HOME before any override, which is the whole
+# point of the M1 regression a few lines down; pinning it this early would
+# make that check vacuous instead of hardening it.
+BEGIN {
+    require File::Temp;
+    $ENV{ALMANAC_HOME} = File::Temp::tempdir(CLEANUP => 1);
+}
 use FindBin qw($Bin);
 use Test::More;
 use File::Temp qw(tempdir tempfile);
@@ -1045,6 +1056,68 @@ SKIP: {
         or diag($die);
     is(scalar(@warnings), 0, 'AC22: the second require emits no warning (no "Subroutine ... redefined")')
         or diag(join("\n", @warnings));
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# B20 (08-blueprint-parks, AC13, DC1/DC3) — park's full refusal list: exit 2,
+# nothing written, in every one of these shapes. Written blind to the
+# rewritten park's implementation, directly from spec §3 observable B20.
+# ═══════════════════════════════════════════════════════════════════════
+sub append_fence {
+    my ($bp_dir, $status) = @_;
+    open my $fh, '>>:raw', "$bp_dir/blueprint.md" or die "append fence: $!";
+    print $fh "\n```\nstatus: $status\n```\n";
+    close $fh;
+}
+
+{
+    my @cases = (
+        { label => 'missing reason',       argv => ['park', 'bp-a'] },
+        { label => 'empty reason',         argv => ['park', 'bp-a', ''] },
+        { label => "reason with '#'",      argv => ['park', 'bp-a', 'bad#reason'] },
+        { label => "reason with '|'",      argv => ['park', 'bp-a', 'bad|reason'] },
+        { label => 'reason with a newline',argv => ['park', 'bp-a', "bad\nreason"] },
+        { label => 'reason over 200 bytes',argv => ['park', 'bp-a', ('x' x 201)] },
+    );
+    for my $c (@cases) {
+        my $F = tempdir(CLEANUP => 1); $F =~ s{\\}{/}g;
+        make_pending_bp_dir($F, 'bp-a');
+        my $before = snapshot_tree($F);
+        my ($rc, $out, $err) = capture_inproc($c->{argv}, { data_dir => $F });
+        is($rc, 2, "B20: $c->{label} exits 2");
+        is($out, '', "B20: $c->{label} -- STDOUT empty");
+        is_deeply(snapshot_tree($F), $before, "B20: $c->{label} -- tree unchanged, nothing written");
+    }
+}
+
+{   # a blueprint that is not on disk
+    my $F = tempdir(CLEANUP => 1); $F =~ s{\\}{/}g;
+    make_pending_bp_dir($F, 'bp-a');
+    my $before = snapshot_tree($F);
+    my ($rc, $out, $err) = capture_inproc(['park', 'ghost-bp', 'reason'], { data_dir => $F });
+    is($rc, 2, 'B20: a blueprint not on disk exits 2');
+    is_deeply(snapshot_tree($F), $before, 'B20: ...and the tree is unchanged');
+}
+
+{   # an archived blueprint
+    my $F = tempdir(CLEANUP => 1); $F =~ s{\\}{/}g;
+    my $bp = make_pending_bp_dir($F, 'bp-a');
+    append_fence($bp, 'archived');
+    my $before = snapshot_tree($F);
+    my ($rc, $out, $err) = capture_inproc(['park', 'bp-a', 'reason'], { data_dir => $F });
+    is($rc, 2, 'B20: an archived blueprint exits 2');
+    is_deeply(snapshot_tree($F), $before, 'B20: ...and the tree is unchanged (archived fence untouched)');
+}
+
+{   # --needs-operator with a data dir that is not <root>/.ccpraxis-local-data
+    # (this file's OWN fixture dirs from tempdir() are never named that, so
+    # this is the ordinary case, not a special one).
+    my $F = tempdir(CLEANUP => 1); $F =~ s{\\}{/}g;
+    make_pending_bp_dir($F, 'bp-a');
+    my $before = snapshot_tree($F);
+    my ($rc, $out, $err) = capture_inproc(['park', 'bp-a', '--needs-operator', 'reason'], { data_dir => $F });
+    is($rc, 2, 'B20: --needs-operator over a non-project-shaped data dir exits 2');
+    is_deeply(snapshot_tree($F), $before, 'B20: ...and the tree is unchanged (no inbox item, no park)');
 }
 
 done_testing();

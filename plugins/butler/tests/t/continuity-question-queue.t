@@ -43,17 +43,21 @@ use GuardHarness;
 my $CMD = "$BUTLER_SCRIPTS/butler-continuity.pl";
 my $GAO_PM = "$BUTLER_SCRIPTS/BpHook/Guards/GuardAskOperator.pm";
 (my $ALM_SCRIPTS = "$Bin/../../../almanac/scripts") =~ s{\\}{/}g;
-my $DECISION_PL = "$ALM_SCRIPTS/almanac-decision.pl";
+my $DECISION_PL = "$ALM_SCRIPTS/almanac-decision.pl";   # retired (spec 01-inbox-rename 2.6) -- kept only for Q-cutover checks
+my $INBOX_PL    = "$ALM_SCRIPTS/almanac-inbox.pl";
 (my $STATUSLINE = "$Bin/../../../../scripts/statusline.pl") =~ s{\\}{/}g;
 (my $REPO_ROOT = "$Bin/../../../..") =~ s{\\}{/}g;
 my $SKILL_MD = "$Bin/../../skills/continuity/SKILL.md";
 
 require "$BUTLER_SCRIPTS/BpHook.pm";
 require "$BUTLER_SCRIPTS/BpContinuityLease.pm";
+# spec 01-inbox-rename 2.7: this file's OWN fixtures/AD() helper still need
+# Almanac::Inbox directly (butler-continuity.pl itself no longer loads any
+# almanac store at all post-cutover) -- guarded, house not-yet-built pattern.
 {
     local $@;
-    do $DECISION_PL if -f $DECISION_PL;
-    diag("almanac-decision.pl failed to load: $@") if $@;
+    eval { require $INBOX_PL if -f $INBOX_PL; 1 }
+        or diag("almanac-inbox.pl failed to load: $@");
 }
 
 # ---------------------------------------------------------------------------
@@ -149,7 +153,8 @@ sub snapshot_dir {
 sub real_state_snapshot {
     return {
         guard    => snapshot_dir("$REPO_ROOT/.ccpraxis-local-data/.subagent-guard"),
-        decision => snapshot_dir("$REPO_ROOT/.ccpraxis-local-data/almanac/decision"),
+        decision => snapshot_dir("$REPO_ROOT/.ccpraxis-local-data/almanac/inbox"),
+        inbox    => snapshot_dir("$REPO_ROOT/.ccpraxis-local-data/almanac/inbox"),
     };
 }
 my $REAL_BEFORE = real_state_snapshot();
@@ -160,7 +165,7 @@ my $REAL_BEFORE = real_state_snapshot();
 # ---------------------------------------------------------------------------
 sub AD_list {
     my ($name, @args) = @_;
-    my $code; { no strict 'refs'; $code = \&{"Almanac::Decision::$name"} }
+    my $code; { no strict 'refs'; $code = \&{"Almanac::Inbox::$name"} }
     my @ret;
     my $ok = eval { @ret = $code->(@args); 1 };
     return $ok ? @ret : ();
@@ -311,202 +316,57 @@ sub run_statusline_q {
 }
 
 # ===========================================================================
-# Q1 -- ask filing a pending decision, from a project subdirectory, no
-# CLAUDE_PROJECT_DIR.
+# Q1-Q9 -- superseded by AC22 (spec 01-inbox-rename 2.6): ask/questions/answer
+# are retired. Each exits 1 with the exact one-line pointer at the equivalent
+# `almanac inbox` verb, BEFORE anything else runs: no record is filed/changed
+# in any almanac store, no legacy questions.md is written or absorbed, and a
+# project subdirectory / outside-cwd-with-CLAUDE_PROJECT_DIR invocation
+# behaves identically (the retirement check precedes root resolution).
 # ===========================================================================
 {
-    my $P = mk_project();
-    my $sub = "$P/sub/dir";
-    make_path($sub);
-    my ($out, $err, $rc) = run_cli({ ':cwd' => $sub }, 'ask', '--text', 'first q');
-    is($rc, 0, 'Q1: ask --text from a project subdirectory, no CLAUDE_PROJECT_DIR, exits 0') or diag("stderr: $err");
-    like($out, qr/^queued pending decision (\S+) \(1 waiting\) in .+$/, 'Q1: stdout matches the pinned shape');
-    my ($id) = $out =~ /^queued pending decision (\S+) /;
-    my $list = AD('list_decisions', root => $P);
-    my ($rec) = (ref $list eq 'ARRAY' && defined $id) ? grep { $_->{id} eq $id } @$list : ();
-    ok(defined $rec, 'Q1: the printed id is filed in P');
-    is(ref $rec eq 'HASH' ? $rec->{fields}{title} : undef, 'first q', 'Q1: title is "first q"');
-    is(ref $rec eq 'HASH' ? $rec->{fields}{status} : undef, 'unanswered', 'Q1: status is unanswered');
-}
-
-# ===========================================================================
-# Q2 -- run from a checked outside cwd with CLAUDE_PROJECT_DIR=P: filed in P,
-# the outside dir gains no .ccpraxis-local-data.
-# ===========================================================================
-{
-    my $P = mk_project();
-    my $OUTSIDE = outside_dir();
-    SKIP: {
-        skip 'Q2: could not construct a clean outside dir on this host (an ancestor already holds '
-           . '.git or .ccpraxis-local-data)', 3
-            unless defined $OUTSIDE;
-        my ($out, $err, $rc) = run_cli({ ':cwd' => $OUTSIDE, CLAUDE_PROJECT_DIR => $P }, 'ask', '--text', 'q2?');
-        is($rc, 0, 'Q2: ask from an outside cwd with CLAUDE_PROJECT_DIR set exits 0') or diag("stderr: $err");
-        my $list = AD('list_decisions', root => $P);
-        ok((ref $list eq 'ARRAY' && (grep { $_->{fields}{title} eq 'q2?' } @$list)), 'Q2: filed in P');
-        ok(!-d "$OUTSIDE/.ccpraxis-local-data", 'Q2: the outside dir gains no .ccpraxis-local-data');
+    my %RETIRED = (
+        ask       => 'almanac inbox file',
+        questions => 'almanac inbox list',
+        answer    => 'almanac inbox answer',
+    );
+    for my $verb (sort keys %RETIRED) {
+        my $P = mk_project();
+        my $sub = "$P/sub/dir";
+        make_path($sub);
+        my @extra = $verb eq 'ask'    ? ('--text', 'q one')
+                  : $verb eq 'answer' ? ('--id', 'x', '--answer', 'y')
+                  : ();
+        my ($out, $err, $rc) = run_cli({ ':cwd' => $sub }, $verb, @extra);
+        is($rc, 1, "AC22: butler-continuity $verb (from a project subdirectory) exits 1") or diag("stderr: $err");
+        is($out, '', "AC22: butler-continuity $verb -- stdout empty");
+        is($err, "butler-continuity: 'butler-continuity $verb' is retired; use '$RETIRED{$verb}' instead\n",
+            "AC22: butler-continuity $verb -- stderr is exactly the 2.6 line");
+        my $list = AD('list_items', root => $P);
+        is((ref $list eq 'ARRAY') ? scalar(@$list) : 0, 0, "AC22: butler-continuity $verb files nothing");
+        ok(!-e "$P/.ccpraxis-local-data/.subagent-guard/questions.md",
+           "AC22: butler-continuity $verb writes no legacy questions.md");
     }
-}
 
-# ===========================================================================
-# Q3 -- an embedded newline flattens to a single space; a non-ASCII title
-# round-trips exactly.
-# ===========================================================================
-{
-    my $P = mk_project();
-    my ($out, $err, $rc) = run_cli({ ':cwd' => $P }, 'ask', '--text', "line one\nline two");
-    is($rc, 0, 'Q3: ask with an embedded newline exits 0') or diag("stderr: $err");
-    my $list = AD('list_decisions', root => $P);
-    ok((ref $list eq 'ARRAY' && (grep { defined $_->{fields}{title} && $_->{fields}{title} eq 'line one line two' } @$list)),
-       'Q3: the newline is flattened to a single space in the title');
-
-    my $accented = "caf\x{e9} decis\x{e3}o?";
-    my $accented_bytes = Encode::encode('UTF-8', $accented);
-    run_cli({ ':cwd' => $P }, 'ask', '--text', $accented_bytes);
-    my $list2 = AD('list_decisions', root => $P);
-    ok((ref $list2 eq 'ARRAY'
-        && (grep { defined $_->{fields}{title} && $_->{fields}{title} eq $accented } @$list2)),
-       'Q3: a non-ASCII title round-trips character-for-character');
-}
-
-# ===========================================================================
-# Q4 -- a missing, empty or whitespace-only --text refuses; the count is
-# unchanged.
-# ===========================================================================
-{
-    my $P = mk_project();
-    for my $case ([[], 'missing --text'], [['--text', ''], 'empty --text'], [['--text', '   '], 'whitespace-only --text']) {
-        my ($extra, $label) = @$case;
-        my $before = AD('list_decisions', root => $P);
-        my $before_n = (ref $before eq 'ARRAY') ? scalar(@$before) : 0;
-        my ($out, $err, $rc) = run_cli({ ':cwd' => $P }, 'ask', @$extra);
-        is($rc, 1, "Q4: $label exits 1");
-        like($err, qr/^butler-continuity: ask needs --text/, "Q4: $label refuses with the pinned prefix");
-        my $after = AD('list_decisions', root => $P);
-        my $after_n = (ref $after eq 'ARRAY') ? scalar(@$after) : 0;
-        is($after_n, $before_n, "Q4: $label leaves the count unchanged");
-    }
-}
-
-# ===========================================================================
-# Q5 -- no questions.md anywhere the file used.
-# ===========================================================================
-{
-    my $P = mk_project();
-    run_cli({ ':cwd' => $P }, 'ask', '--text', 'q5a');
-    run_cli({ ':cwd' => $P }, 'ask', '--text', "q5b\nq5b line2");
-    ok(!-e "$P/.ccpraxis-local-data/.subagent-guard/questions.md", 'Q5: ask never writes questions.md');
-}
-
-# ===========================================================================
-# Q6 -- questions lists the unanswered decisions, then "<N> waiting in <P>";
-# an empty project prints only "0 waiting in ...".
-# ===========================================================================
-{
-    my $P = mk_project();
-    run_cli({ ':cwd' => $P }, 'ask', '--text', 'alpha?');
-    run_cli({ ':cwd' => $P }, 'ask', '--text', 'beta?');
-    my ($out, $err, $rc) = run_cli({ ':cwd' => $P }, 'questions');
-    is($rc, 0, 'Q6: questions exits 0') or diag("stderr: $err");
-    my @lines = split /\n/, $out;
-    my $last = pop @lines // '';
-    like($last, qr/^2 waiting in .+$/, 'Q6: the last line is "2 waiting in <project>"');
-    is(scalar(@lines), 2, 'Q6: two question lines precede the summary');
-    for my $l (@lines) {
-        like($l, qr/^- \S+ \[\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\] .+$/, 'Q6: line shape "- <id> [<created>] <title>"');
-    }
-    my @titles = sort map { /\] (.*)\z/ ? $1 : '' } @lines;
-    is_deeply(\@titles, ['alpha?', 'beta?'], 'Q6: the exact filed texts are listed');
-
-    my $EMPTY = mk_project();
-    my ($out2, $err2, $rc2) = run_cli({ ':cwd' => $EMPTY }, 'questions');
-    is($rc2, 0, 'Q6: an empty project also exits 0') or diag("stderr: $err2");
-    like($out2, qr/^0 waiting in /, 'Q6: an empty project prints "0 waiting in ..."');
-    is(scalar(split /\n/, $out2), 1, 'Q6: an empty project prints only that one line');
-}
-
-# ===========================================================================
-# Q7 -- answer marks a question answered and clears it from the listing.
-# ===========================================================================
-{
-    my $P = mk_project();
-    my ($out1, $err1) = run_cli({ ':cwd' => $P }, 'ask', '--text', 'to answer?');
-    my ($id) = $out1 =~ /^queued pending decision (\S+) /;
-    ok(defined $id, 'Q7 fixture: ask filed a question') or diag("stdout: $out1 stderr: $err1");
-    run_cli({ ':cwd' => $P }, 'ask', '--text', 'stays open?');
-
-    SKIP: {
-        skip 'Q7: no id to answer (ask did not file)', 5 unless defined $id;
-        my ($out, $err, $rc) = run_cli({ ':cwd' => $P }, 'answer', '--id', $id, '--answer', 'use v2');
-        is($rc, 0, 'Q7: answer exits 0') or diag("stderr: $err");
-        is($out, "answered $id: to answer?\n", 'Q7: stdout is the pinned answered line');
-
-        my $list = AD('list_decisions', root => $P);
-        my ($rec) = (ref $list eq 'ARRAY') ? grep { $_->{id} eq $id } @$list : ();
-        is(ref $rec eq 'HASH' ? $rec->{fields}{status} : undef, 'answered', 'Q7: the store shows it answered');
-        is(ref $rec eq 'HASH' ? $rec->{fields}{answer} : undef, 'use v2', 'Q7: with the given answer text');
-
-        my ($qout, $qerr, $qrc) = run_cli({ ':cwd' => $P }, 'questions');
-        unlike($qout, qr/\Q$id\E/, 'Q7: questions no longer lists the answered id (1 waiting)');
-    }
-}
-
-# ===========================================================================
-# Q8 -- answer's remaining branches: idempotent repeat, a different answer,
-# an unknown id, and missing flags -- each refuses cleanly, nothing changes.
-# ===========================================================================
-{
-    my $P = mk_project();
-    my ($out1) = run_cli({ ':cwd' => $P }, 'ask', '--text', 'q8?');
-    my ($id) = $out1 =~ /^queued pending decision (\S+) /;
-    ok(defined $id, 'Q8 fixture: ask filed a question');
-
-    SKIP: {
-        skip 'Q8: no id to answer', 8 unless defined $id;
-        run_cli({ ':cwd' => $P }, 'answer', '--id', $id, '--answer', 'go with A');
-
-        my ($out, $err, $rc) = run_cli({ ':cwd' => $P }, 'answer', '--id', $id, '--answer', 'go with A');
-        is($rc, 0, 'Q8: repeating the same answer exits 0');
-        is($out, "$id already answered; nothing changed\n", 'Q8: pinned no-op line');
-
-        my ($out2, $err2, $rc2) = run_cli({ ':cwd' => $P }, 'answer', '--id', $id, '--answer', 'go with B');
-        is($rc2, 1, 'Q8: a DIFFERENT answer exits 1');
-        is($err2, "butler-continuity: decision $id is already answered.\n", 'Q8: pinned refusal line');
-
-        my ($out3, $err3, $rc3) = run_cli({ ':cwd' => $P }, 'answer', '--id', 'no-such-id-q8', '--answer', 'x');
-        is($rc3, 1, 'Q8: an unknown id exits 1');
-        like($err3, qr/^butler-continuity: no pending decision no-such-id-q8 in .+\.\n?\z/, 'Q8: pinned not_found line');
-
-        my ($out4, $err4, $rc4) = run_cli({ ':cwd' => $P }, 'answer', '--id', $id);
-        is($rc4, 1, 'Q8: missing --answer exits 1');
-        like($err4, qr/^butler-continuity: answer needs --id <id> --answer /, 'Q8: pinned usage line (missing --answer)');
-
-        my $rec = AD('read_decision', $id, root => $P);
-        is(ref $rec eq 'HASH' ? $rec->{fields}{answer} : undef, 'go with A', 'Q8: the store answer is unchanged by any refusal');
-    }
-}
-
-# ===========================================================================
-# Q9 -- a seeded legacy file: questions lists its texts, and it is renamed.
-# ===========================================================================
-{
-    my $P = mk_project();
-    my $legacy_dir = "$P/.ccpraxis-local-data/.subagent-guard";
+    # a seeded legacy questions.md is never touched/absorbed by the retired
+    # 'questions' verb.
+    my $P9 = mk_project();
+    my $legacy_dir = "$P9/.ccpraxis-local-data/.subagent-guard";
     make_path($legacy_dir);
-    write_raw("$legacy_dir/questions.md", "- [2020-01-01T00:00:00Z] legacy one?\n- legacy two?\n");
-
-    my ($out, $err, $rc) = run_cli({ ':cwd' => $P }, 'questions');
-    is($rc, 0, 'Q9: questions exits 0 after a seeded legacy file') or diag("stderr: $err");
-    like($out, qr/legacy one\?/, 'Q9: the first legacy text is listed');
-    like($out, qr/legacy two\?/, 'Q9: the second legacy text is listed');
-    ok(!-e "$legacy_dir/questions.md", 'Q9: questions.md is gone');
-    ok(-f "$legacy_dir/questions.md.migrated", 'Q9: questions.md.migrated exists');
+    my $seed = "- [2020-01-01T00:00:00Z] legacy one?\n- legacy two?\n";
+    write_raw("$legacy_dir/questions.md", $seed);
+    my ($out9, $err9, $rc9) = run_cli({ ':cwd' => $P9 }, 'questions');
+    is($rc9, 1, 'AC22: butler-continuity questions over a seeded legacy file still exits 1');
+    is(slurp("$legacy_dir/questions.md"), $seed, 'AC22: the legacy file is byte-unchanged (never absorbed by the retired verb)');
+    ok(!-f "$legacy_dir/questions.md.migrated", 'AC22: no questions.md.migrated is created by the retired verb');
 }
 
 # ===========================================================================
 # Q10/Q13 -- an armed session's AskUserQuestion is denied, files one joined
-# decision in the payload-cwd project, stdout carries no "continue":false;
-# the question later appears in "questions" output from that project.
+# inbox item in the payload-cwd project (spec 01-inbox-rename AC17/AC29: deny
+# line 2 is "The question is filed as inbox item <id>."), stdout carries no
+# "continue":false; the question later appears in Almanac::Inbox's own
+# list_items for that project (the 'questions' verb no longer exists to
+# re-check it through the CLI, so this checks the store directly, per AC29).
 # ===========================================================================
 my ($Q10_PROJECT, $Q10_TITLE);
 {
@@ -520,12 +380,12 @@ my ($Q10_PROJECT, $Q10_TITLE);
     my @lines = split /\n/, $res->{err};
     pop @lines while @lines && $lines[-1] eq '';
     is(scalar(@lines), 4, 'Q10: stderr has 4 lines');
-    like($lines[1] // '', qr/^The question is filed as pending decision \S+\.$/, 'Q10: line 2 names the filed decision');
+    like($lines[1] // '', qr/^The question is filed as inbox item \S+\.$/, 'AC17/AC29: line 2 names the filed inbox item');
     unlike($res->{out}, qr/"continue":false/, 'Q10: stdout carries no "continue":false');
 
     $Q10_PROJECT = $P;
     $Q10_TITLE   = "Which DB? | Deploy t\x{e9}st?";
-    my $list = AD('list_decisions', root => $P);
+    my $list = AD('list_items', root => $P);
     ok((ref $list eq 'ARRAY'
         && (grep { defined $_->{fields}{title} && $_->{fields}{title} eq $Q10_TITLE } @$list)),
        'Q10: the two questions are joined by " | " into one filed title');
@@ -533,15 +393,11 @@ my ($Q10_PROJECT, $Q10_TITLE);
 {
     SKIP: {
         skip 'Q13: Q10 did not produce a project to re-check', 1 unless defined $Q10_PROJECT;
-        my ($out, $err, $rc) = run_cli({ ':cwd' => $Q10_PROJECT }, 'questions');
-        # slurp() reads ':raw' bytes; $Q10_TITLE is a decoded character
-        # string (it holds \x{e9}, not the two UTF-8 bytes that encode it).
-        # Decode the child's stdout the same way before comparing, so both
-        # sides are characters -- consistent with how AD()/list_decisions
-        # already hands back decoded characters everywhere else in this file.
-        my $out_text = eval { Encode::decode('UTF-8', $out) };
-        $out_text = $out unless defined $out_text;
-        like($out_text, qr/\Q$Q10_TITLE\E/, 'Q13: Q10\'s question appears in "questions" output from P with its exact title');
+        # the 'questions' CLI verb is retired (AC22) -- re-check the store
+        # directly instead of round-tripping it through a CLI call.
+        my $list = AD('list_items', root => $Q10_PROJECT);
+        ok((ref $list eq 'ARRAY' && (grep { defined $_->{fields}{title} && $_->{fields}{title} eq $Q10_TITLE } @$list)),
+           'Q13: Q10\'s joined question is present in Almanac::Inbox::list_items for P with its exact title');
     }
 }
 
@@ -555,7 +411,7 @@ my ($Q10_PROJECT, $Q10_TITLE);
     my $res = ao(payload(session_id => $sid, cwd => $P, questions => ['Proceed?']),
         env => { CLAUDE_PROJECT_DIR => $P, BP_LEDGER => '/x/ledger.md' });
     is($res->{rc}, 2, 'Q11: BP_LEDGER set, unarmed, denies');
-    my $list = AD('list_decisions', root => $P);
+    my $list = AD('list_items', root => $P);
     ok((ref $list eq 'ARRAY' && (grep { $_->{fields}{title} eq 'Proceed?' } @$list)), 'Q11: the question is filed');
 }
 
@@ -569,7 +425,7 @@ my ($Q10_PROJECT, $Q10_TITLE);
     my $sidA = 'q12-unarmed';
     my $sidB = 'q12-armed';
     ok(GuardHarness::arm($sidB, 'manual'), 'Q12 setup: session B armed');
-    my $before = AD('list_decisions', root => $P);
+    my $before = AD('list_items', root => $P);
     my $before_n = (ref $before eq 'ARRAY') ? scalar(@$before) : 0;
 
     my $res = ao(payload(session_id => $sidA, cwd => $P, questions => ['Anybody home?']),
@@ -578,7 +434,7 @@ my ($Q10_PROJECT, $Q10_TITLE);
     is($res->{out}, '', 'Q12: empty stdout');
     is($res->{err}, '', 'Q12: empty stderr');
 
-    my $after = AD('list_decisions', root => $P);
+    my $after = AD('list_items', root => $P);
     my $after_n = (ref $after eq 'ARRAY') ? scalar(@$after) : 0;
     is($after_n, $before_n, 'Q12: the decision count is unchanged');
 }
@@ -644,24 +500,31 @@ my ($Q10_PROJECT, $Q10_TITLE);
 }
 
 # ===========================================================================
-# Q17 -- neither butler-continuity.pl nor GuardAskOperator.pm mentions the
-# retired resolution machinery; both mention Almanac::Decision::.
+# Q17 -- spec 01-inbox-rename 2.6: butler-continuity.pl no longer loads ANY
+# almanac store at all (ask/questions/answer and their loader are deleted
+# entirely) -- it never mentions Almanac::Decision:: or Almanac::Inbox::.
+# GuardAskOperator.pm still files (AC17/AC29): it mentions Almanac::Inbox::,
+# never Almanac::Decision::, and neither file mentions the retired
+# resolution machinery.
 # ===========================================================================
 {
     my $cc_src  = -f $CMD    ? (slurp($CMD)    // '') : '';
     my $gao_src = -f $GAO_PM ? (slurp($GAO_PM) // '') : '';
     for my $pair ([ 'butler-continuity.pl', $cc_src ], [ 'GuardAskOperator.pm', $gao_src ]) {
         my ($label, $src) = @$pair;
-        for my $forbidden ('Almanac::Store', '.ccpraxis-local-data/almanac', '.subagent-guard', 'BP_PROJECT_ROOT') {
+        for my $forbidden ('Almanac::Store', '.ccpraxis-local-data/almanac', '.subagent-guard', 'BP_PROJECT_ROOT',
+                            'Almanac::Decision::') {
             unlike($src, qr/\Q$forbidden\E/, "Q17: $label never mentions $forbidden");
         }
-        like($src, qr/Almanac::Decision::/, "Q17: $label mentions Almanac::Decision::");
     }
+    like($gao_src, qr/Almanac::Inbox::/, 'AC17/AC29: GuardAskOperator.pm mentions Almanac::Inbox::');
 }
 
 # ===========================================================================
-# Q18 -- the continuity block of SKILL.md names all three verbs, within the
-# 40-non-blank-line budget.
+# Q18 -- spec 01-inbox-rename Appendix B: the continuity block's "Questions:"
+# line points at /almanac:inbox and `almanac inbox file --title '<question>'`
+# (never the retired ask/questions/answer verbs), within the 40-non-blank-
+# line budget.
 # ===========================================================================
 {
     my $src = -f $SKILL_MD ? (slurp($SKILL_MD) // '') : '';
@@ -674,14 +537,17 @@ my ($Q10_PROJECT, $Q10_TITLE);
     ok(defined($bi) && defined($ei) && $bi < $ei, 'Q18: the continuity block markers are present')
         or diag('markers not found in ' . $SKILL_MD);
     SKIP: {
-        skip 'Q18: block markers not found', 4 unless defined($bi) && defined($ei) && $bi < $ei;
+        skip 'Q18: block markers not found', 6 unless defined($bi) && defined($ei) && $bi < $ei;
         my @block = @lines[$bi + 1 .. $ei - 1];
         my $block_text = join("\n", @block);
         my $nonblank = grep { !/^\s*$/ } @block;
         cmp_ok($nonblank, '<=', 40, 'Q18: the continuity block has at most 40 non-blank lines');
-        like($block_text, qr/butler-continuity ask --text/, 'Q18: the block names ask --text');
-        like($block_text, qr/butler-continuity questions/, 'Q18: the block names questions');
-        like($block_text, qr/butler-continuity answer --id/, 'Q18: the block names answer --id');
+        like($block_text, qr/\/almanac:inbox/, 'Appendix B: the block names /almanac:inbox');
+        like($block_text, qr/almanac inbox file --title/, "Appendix B: the block names 'almanac inbox file --title'");
+        like($block_text, qr/\bkeep working\b/i, 'Appendix B: the block says to keep working');
+        unlike($block_text, qr/butler-continuity ask/, 'AC22: the block never names the retired "butler-continuity ask"');
+        unlike($block_text, qr/butler-continuity (?:questions|answer)/,
+            'AC22: the block never names the retired "butler-continuity questions/answer"');
     }
 }
 
@@ -801,7 +667,7 @@ my $FLAG_BYTES = Encode::encode('UTF-8', chr(0x2691));
 # unanswered" is not counted; stray/malformed entries are ignored.
 {
     my $P = mk_project();
-    my $dec_dir = "$P/.ccpraxis-local-data/almanac/decision";
+    my $dec_dir = "$P/.ccpraxis-local-data/almanac/inbox";
     make_path($dec_dir);
     write_raw("$dec_dir/x.md.tmp", "---\nstatus: unanswered\n---\n");
     write_raw("$dec_dir/.store.lock", "1\n");
@@ -844,18 +710,18 @@ my $FLAG_BYTES = Encode::encode('UTF-8', chr(0x2691));
 # S7 -- exactly one begin/end marker pair, no spawn/require/use/write inside.
 {
     my $src = -f $STATUSLINE ? (slurp($STATUSLINE) // '') : '';
-    my @begins = ($src =~ /pending-decisions:begin/g);
-    my @ends   = ($src =~ /pending-decisions:end/g);
-    is(scalar(@begins), 1, 'S7: exactly one pending-decisions:begin marker');
-    is(scalar(@ends), 1, 'S7: exactly one pending-decisions:end marker');
-    if ($src =~ /\Q# -- pending-decisions:begin --\E(.*?)\Q# -- pending-decisions:end --\E/s) {
+    my @begins = ($src =~ /inbox:begin/g);
+    my @ends   = ($src =~ /inbox:end/g);
+    is(scalar(@begins), 1, 'S7: exactly one inbox:begin marker');
+    is(scalar(@ends), 1, 'S7: exactly one inbox:end marker');
+    if ($src =~ /\Q# -- inbox:begin --\E(.*?)\Q# -- inbox:end --\E/s) {
         my $block = $1;
         unlike($block, qr/\bcmd_out\s*\(|\bspawn_detached\s*\(|\bsystem\s*\(|\bexec\s*\(|`|\bqx\b|\brequire\b|\buse\s+\w|open\s*\([^)]*\|/,
                'S7: the block contains no spawn/require/use/pipe-open');
         unlike($block, qr/open\s*\([^)]*(?:['"]>{1,2}['"]|['"]\+<['"])/,
                'S7: the block contains no write-mode open');
     } else {
-        fail('S7: could not locate the pending-decisions block text between the two markers');
+        fail('S7: could not locate the inbox block text between the two markers');
     }
     my @use_lines = ($src =~ /^\s*use\s+([A-Za-z0-9:_]+)/mg);
     my %allowed = map { $_ => 1 } qw(strict warnings JSON::PP Time::Piece File::Basename POSIX Encode constant Carp List::Util Scalar::Util);

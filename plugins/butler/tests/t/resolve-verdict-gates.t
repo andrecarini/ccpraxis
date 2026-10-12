@@ -56,7 +56,7 @@ use File::Spec ();
 
 my $ORCH_SCRIPT    = "$Bin/../../scripts/bp-orchestrator.pl";
 my $RESOLVE_SCRIPT = "$Bin/../../scripts/bp-resolve.pl";
-my $WAIT_SCRIPT     = "$Bin/../../scripts/bp-wait-for-decision.pl";
+my $WAIT_SCRIPT     = "$Bin/../../scripts/bp-wait-for-escalation.pl";
 
 require $ORCH_SCRIPT;   # BpOrch -- already exists, load unconditionally
 
@@ -151,7 +151,7 @@ run_group('GROUP V (pure gates)', sub {
 
     # V1: shape_ok -- a well-formed product verdict (no action key at all).
     {
-        my $v = { category => 'product', confidence => 'high', evidence => 'cites project rule' };
+        my $v = { category => 'product', confidence => 'high', evidence => 'cites project rule', product_question => 'Should we keep this behavior?' };
         my ($ok, $why) = BpResolve::verdict_shape_ok($v);
         ok($ok, 'V1: a product verdict with category+confidence+evidence and no action is shape_ok') or diag("why: " . ($why // '?'));
     }
@@ -217,7 +217,7 @@ run_group('GROUP V (pure gates)', sub {
     # V10: confidence_gate -- product, EVEN AT confidence=low, is tag-only (never act, never refuse
     # merely for being low-confidence -- product/operational categories are never actable regardless).
     {
-        my $v = { category => 'product', confidence => 'low', evidence => '' };
+        my $v = { category => 'product', confidence => 'low', evidence => '', product_question => 'Is this still the right default?' };
         is(BpResolve::confidence_gate($v), 'tag-only', 'V10: a product verdict is tag-only regardless of confidence (never act; never spuriously refused)');
     }
     # V11: confidence_gate -- category='unclassified' as a FINAL verdict value
@@ -327,7 +327,8 @@ run_group('A3 (AC5: Decision-5 Case A -- DI-seam/SMS-retirement verdict lands ta
     my ($id, $path, $filed) = file_decision($runs, pkg => $pkg, kind => 'stuck-package',
         category => 'unclassified',
         question => 'add DI seam for cidadao_meus_dados; do not add one for auth_recuperacao_sms_otp (SMS auth retired)');
-    my $verdict = { category => 'product', confidence => 'high', evidence => 'cites project rule -- SMS auth retired' };
+    my $verdict = { category => 'product', confidence => 'high', evidence => 'cites project rule -- SMS auth retired',
+                     product_question => 'Should the DI seam be added for cidadao_meus_dados but not auth_recuperacao_sms_otp?' };
     my $outcome = BpResolve::apply_verdict($verdict, $filed, $id,
         { bpdir => $bpdir, runs => $runs, bp => 'bp', log => "$runs/orchestrator.log" });
     is($outcome->{outcome}, 'tag-only', 'A3: Case A resolves to tag-only, not act');
@@ -339,6 +340,7 @@ run_group('A3 (AC5: Decision-5 Case A -- DI-seam/SMS-retirement verdict lands ta
     is($tagged->{confidence}, 'high', 'A3: confidence carried through');
     is($tagged->{question}, $filed->{question}, 'A3: the original question text is untouched');
     is($tagged->{created_at}, $filed->{created_at}, 'A3: created_at is untouched');
+    is($tagged->{product_question}, $verdict->{product_question}, 'A3: product_question is carried through onto the tagged record');
 });
 
 # A4 (AC5, Decision-5 Case B -- invisible AlertDialog): confidence=low,
@@ -353,7 +355,8 @@ run_group('A4 (AC5: Decision-5 Case B -- invisible-AlertDialog verdict lands tag
         category => 'unclassified',
         question => 'invisible AlertDialog -- capture artifact or real defect? coordinator could not determine and cannot run the discriminating experiment');
     my $verdict = { category => 'product', confidence => 'low',
-                     evidence => 'ledger already investigated and left this open; no citation resolves the specific dispute' };
+                     evidence => 'ledger already investigated and left this open; no citation resolves the specific dispute',
+                     product_question => 'Is the invisible AlertDialog a capture artifact or a real defect?' };
     my $outcome = BpResolve::apply_verdict($verdict, $filed, $id,
         { bpdir => $bpdir, runs => $runs, bp => 'bp', log => "$runs/orchestrator.log" });
     is($outcome->{outcome}, 'tag-only', 'A4: Case B resolves to tag-only, not act');
@@ -362,6 +365,7 @@ run_group('A4 (AC5: Decision-5 Case B -- invisible-AlertDialog verdict lands tag
     my $tagged = read_json(decision_path($runs, $id));
     is($tagged->{category}, 'product', 'A4: re-tagged category=product');
     is($tagged->{confidence}, 'low', 'A4: confidence=low is carried through honestly (not upgraded)');
+    is($tagged->{product_question}, $verdict->{product_question}, 'A4: product_question is carried through onto the tagged record');
 });
 
 # A5 (AC3(c) restated at the apply_verdict level): a verdict proposing

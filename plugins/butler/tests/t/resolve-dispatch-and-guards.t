@@ -41,7 +41,7 @@ use File::Path qw(make_path);
 my $ORCH_SCRIPT    = "$Bin/../../scripts/bp-orchestrator.pl";
 my $AGENT_FILE      = "$Bin/../../agents/bp-escalation-resolver.md";
 my $T115            = "$Bin/escalation-categories.t";
-my $WAIT_SCRIPT     = "$Bin/../../scripts/bp-wait-for-decision.pl";
+my $WAIT_SCRIPT     = "$Bin/../../scripts/bp-wait-for-escalation.pl";
 
 require $ORCH_SCRIPT;
 

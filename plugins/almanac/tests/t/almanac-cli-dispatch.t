@@ -41,13 +41,21 @@ delete local $ENV{ALMANAC_SURFACE};
 (my $S = "$Bin/../../scripts") =~ s{\\}{/}g;
 my $ALMANAC_PL  = "$S/almanac.pl";
 my $ALMANAC_ABOUT = "$S/almanac.pl.about";
+# OVERRIDDEN by blueprint where-things-go, package 02-thread-store (specs/
+# 02-thread-store-spec.md section 2.10): routes() drops the `task` key and
+# gains `thread`; `task` becomes a retired_types() pointer at `almanac
+# thread`. almanac-task.pl itself still exists (its library half survives
+# for old readers), so it is kept in %SCRIPT_OF only for the retirement
+# assertions below, never for an AC1/AC2 routing comparison.
 my %SCRIPT_OF = (
     todo     => "$S/almanac-todo.pl",
     note     => "$S/almanac-note.pl",
-    task     => "$S/almanac-task.pl",
-    decision => "$S/almanac-decision.pl",
+    thread   => "$S/almanac-thread.pl",
+    inbox    => "$S/almanac-inbox.pl",
     bug      => "$S/almanac-bug.pl",
 );
+my $TASK_PL = "$S/almanac-task.pl"; # retired CLI; library half still loaded by other scripts
+my $DECISION_PL = "$S/almanac-decision.pl";   # retired (spec 01-inbox-rename 2.6) -- used only by the AC20 cutover block
 for my $t (sort keys %SCRIPT_OF) {
     ok(-f $SCRIPT_OF{$t}, "precondition: $SCRIPT_OF{$t} exists (earlier package, already implemented)")
         or diag("missing $SCRIPT_OF{$t} -- every AC1 comparison against '$t' will fail for that reason");
@@ -183,8 +191,24 @@ fixture_ok('todo create', run_direct('todo', 'create', '--title', 'a todo', '--r
                          '--body', 'note body', '--root', $ROOT ]);
     fixture_ok('note create', $r);
 }
-fixture_ok('task add', run_direct('task', 'add', '--title', 'a task', '--root', $ROOT));
-fixture_ok('decision file', run_direct('decision', 'file', '--title', 'a decision', '--root', $ROOT));
+# ---------------------------------------------------------------------------
+# blueprint where-things-go, package 03-thread-sessions (Decision 18 F6): a
+# hard ticket gate lands on every almanac-thread.pl write verb. Mint one for
+# this fixture's 'thread create' call, keyed on the exact post-dispatch argv
+# almanac-thread.pl itself sees (run_direct strips the leading 'thread' type
+# word before invoking the script) -- same convention as thread-store.t.
+{
+    (my $CD_BUTLER_SCRIPTS = "$Bin/../../../butler/scripts") =~ s{\\}{/}g;
+    require "$CD_BUTLER_SCRIPTS/BpHook.pm" unless grep { m{(?:^|/)BpHook\.pm$} } keys %INC;
+    my $CD_BSD = tempdir(CLEANUP => 1); $CD_BSD =~ s{\\}{/}g;
+    local $ENV{BUTLER_STATE_DIR} = $CD_BSD;
+    BpHook::write_ticket(
+        { session_id => 'FIXTURE-SESSION', tool_use_id => 'FT-CD1',
+          transcript_path => undef, cwd => '/fixture' },
+        'almanac-thread', [ 'create', 'fixture-thread', '--root', $ROOT ]);
+    fixture_ok('thread create', run_direct('thread', 'create', 'fixture-thread', '--root', $ROOT));
+}
+fixture_ok('inbox file', run_direct('inbox', 'file', '--title', 'an inbox item', '--root', $ROOT));
 fixture_ok('bug file', run_direct('bug', 'file', '--project', $ROOT, '--title', 'a bug',
     '--severity', 'low', '--area', 'sandbox', '--body', 'a bug body'));
 
@@ -197,11 +221,11 @@ fixture_ok('bug file', run_direct('bug', 'file', '--project', $ROOT, '--title', 
     my %READ_ARGS = (
         todo     => [ 'list',                        '--root', $ROOT ],
         note     => [ 'list',                        '--root', $ROOT ],
-        task     => [ 'list',                        '--root', $ROOT ],
-        decision => [ 'list',                        '--root', $ROOT ],
+        thread   => [ 'list',                        '--root', $ROOT ],
+        inbox    => [ 'list',                        '--root', $ROOT ],
         bug      => [ 'list', '--project', $ROOT ],
     );
-    for my $type (qw(todo note task decision bug)) {
+    for my $type (qw(todo note thread inbox bug)) {
         my $direct  = run_direct($type, @{ $READ_ARGS{$type} });
         my $viadash = run_almanac($type, @{ $READ_ARGS{$type} });
         is($viadash->{stdout}, $direct->{stdout}, "AC1: almanac $type ... stdout equals the direct $type script run");
@@ -231,8 +255,8 @@ fixture_ok('bug file', run_direct('bug', 'file', '--project', $ROOT, '--title', 
         or diag('error: ' . ($@ // '(no routes() sub)'));
 
     if (ref($routes) eq 'HASH') {
-        is_deeply([ sort keys %$routes ], [qw(bug decision doctor note task todo)],
-            'AC2: routes() has exactly the keys bug decision doctor note task todo');
+        is_deeply([ sort keys %$routes ], [qw(bug doctor inbox note thread todo)],
+            'AC1/spec 2.10: routes() has exactly the keys bug doctor inbox note thread todo (task retired, thread added)');
 
         is(ref($routes->{doctor}), 'HASH', 'AC2: routes()->{doctor} is a hashref') or diag('not a hashref');
         is($routes->{doctor}{script}, 'almanac-doctor.pl', 'AC2: doctor routes to almanac-doctor.pl')
@@ -241,7 +265,7 @@ fixture_ok('bug file', run_direct('bug', 'file', '--project', $ROOT, '--title', 
             if ref($routes->{doctor}) eq 'HASH';
         ok(-f "$S/almanac-doctor.pl", 'AC2: almanac-doctor.pl exists beside almanac.pl');
 
-        for my $type (qw(todo note task decision)) {
+        for my $type (qw(todo note inbox)) {
             my $expected = extract_module_verbs($SCRIPT_OF{$type});
             ok(defined $expected, "AC2: extracted %VERBS qw(...) from $type\'s own source")
                 or diag("could not find the %VERBS = map {...} qw(...) idiom in $SCRIPT_OF{$type}");
@@ -252,6 +276,25 @@ fixture_ok('bug file', run_direct('bug', 'file', '--project', $ROOT, '--title', 
                 ok(-f "$S/$routes->{$type}{script}", "AC2: $type's script exists beside almanac.pl");
             } else {
                 fail("AC2: $type's routes() verbs set equals its own script's %VERBS set");
+            }
+        }
+
+        # thread (spec 2.10, EXTENDED by blueprint where-things-go package
+        # 03-thread-sessions, Decision 31: routes() gains attach/detach/
+        # switch/take-over): routes() hardcodes the verb list rather than
+        # deriving it from almanac-thread.pl's own source (it is not
+        # declared as a %VERBS = map {...} qw(...) idiom), so the expected
+        # set here is the spec's table 2.7 verb list, restated.
+        {
+            my @thread_expected = qw(create list show archive archive-if-done add edit move reorder status add-packages event attach detach switch take-over);
+            is($routes->{thread}{script}, 'almanac-thread.pl', 'AC2: thread routes to almanac-thread.pl')
+                if ref($routes->{thread}) eq 'HASH';
+            if (ref($routes->{thread}) eq 'HASH') {
+                is_deeply([ sort @{ $routes->{thread}{verbs} || [] } ], [ sort @thread_expected ],
+                    'AC2: thread\'s routes() verbs set equals the spec 2.7 verb table');
+                ok(-f "$S/$routes->{thread}{script}", 'AC2: thread\'s script exists beside almanac.pl');
+            } else {
+                fail('AC2: thread\'s routes() verbs set equals the spec 2.7 verb table');
             }
         }
 
@@ -266,7 +309,7 @@ fixture_ok('bug file', run_direct('bug', 'file', '--project', $ROOT, '--title', 
             fail('AC2: bug\'s routes() verbs set equals every $cmd eq literal in almanac-bug.pl');
         }
     } else {
-        fail('AC2: routes() has exactly the keys bug decision doctor note task todo');
+        fail('AC2: routes() has exactly the keys bug doctor inbox note thread todo');
     }
 }
 
@@ -315,10 +358,14 @@ fixture_ok('bug file', run_direct('bug', 'file', '--project', $ROOT, '--title', 
 # =============================================================================
 {
     my %TABLE_VERBS = (
-        todo     => [qw(create list show edit complete reopen delete count)],
+        # where-things-go package 02-thread-store, spec 2.10/2.11: routes()
+        # gains `promote` on todo (mirrors note's existing promote entry).
+        # package 03-thread-sessions (Decision 31) adds attach/detach/
+        # switch/take-over to thread.
+        todo     => [qw(create list show edit complete reopen delete count promote)],
         note     => [qw(create list show edit promote delete check-pointers)],
-        task     => [qw(add insert-at insert-before insert-after move-first move-last reorder status edit list show focus focused unfocus)],
-        decision => [qw(file list show answer blocks)],
+        thread   => [qw(create list show archive archive-if-done add edit move reorder status add-packages event attach detach switch take-over)],
+        inbox    => [qw(file list show answer blocks)],
         bug      => [qw(file append update set-status takeover list collect verify)],
     );
     for my $type (sort keys %TABLE_VERBS) {
@@ -342,13 +389,13 @@ fixture_ok('bug file', run_direct('bug', 'file', '--project', $ROOT, '--title', 
     my $res_none = run_almanac();
     is($res_none->{rc}, 2, 'AC5: almanac (no args) exits 2');
     is($res_none->{stdout}, '', 'AC5: almanac (no args) -- stdout empty');
-    is($res_none->{stderr}, "almanac: missing type\n" . "almanac types: bug decision doctor note task todo\n",
+    is($res_none->{stderr}, "almanac: missing type\n" . "almanac types: bug doctor inbox note thread todo\n",
         'AC5: almanac (no args) -- exact stderr message');
 
     my $res_zzz = run_almanac('zzz');
     is($res_zzz->{rc}, 2, 'AC5: almanac zzz exits 2');
     is($res_zzz->{stdout}, '', 'AC5: almanac zzz -- stdout empty');
-    is($res_zzz->{stderr}, "almanac: unknown type 'zzz'\n" . "almanac types: bug decision doctor note task todo\n",
+    is($res_zzz->{stderr}, "almanac: unknown type 'zzz'\n" . "almanac types: bug doctor inbox note thread todo\n",
         'AC5: almanac zzz -- exact stderr message');
 
     my $ROOT5 = mk_root();
@@ -357,7 +404,7 @@ fixture_ok('bug file', run_direct('bug', 'file', '--project', $ROOT, '--title', 
     is($res_noverb->{stdout}, '', 'AC5: almanac todo -- stdout empty');
     is($res_noverb->{stderr},
         "almanac: missing verb for 'almanac todo'\n"
-      . "almanac todo verbs: create list show edit complete reopen delete count\n",
+      . "almanac todo verbs: create list show edit complete reopen delete count promote\n",
         'AC5: almanac todo -- exact stderr message');
 
     my $res_flagverb = run_almanac('todo', '--json', '--root', $ROOT5);
@@ -365,7 +412,7 @@ fixture_ok('bug file', run_direct('bug', 'file', '--project', $ROOT, '--title', 
     is($res_flagverb->{stdout}, '', 'AC5: almanac todo --json -- stdout empty');
     is($res_flagverb->{stderr},
         "almanac: missing verb for 'almanac todo'\n"
-      . "almanac todo verbs: create list show edit complete reopen delete count\n",
+      . "almanac todo verbs: create list show edit complete reopen delete count promote\n",
         'AC5: almanac todo --json -- exact stderr message (a --flag is never mistaken for a verb)');
 }
 
@@ -412,6 +459,107 @@ fixture_ok('bug file', run_direct('bug', 'file', '--project', $ROOT, '--title', 
             'AC27: content is 1 to 120 characters',
         );
     }
+}
+
+# =============================================================================
+# AC2 (continued) -- retired_types() and the hard-cutover run() branch, spec
+# section 2.6: a retired type prints its one line and returns 2, spawning
+# nothing, BEFORE the unknown-type check.
+# =============================================================================
+{
+    my $retired = eval { Almanac::CLI::retired_types() };
+    is_deeply($retired, { decision => 'almanac inbox', task => 'almanac thread' },
+        'AC2/AC11 (spec 2.10): retired_types() returns exactly { decision => "almanac inbox", task => "almanac thread" }')
+        or diag('error: ' . ($@ // '(retired_types() missing or wrong shape)'));
+}
+
+# =============================================================================
+# AC11 (specs/02-thread-store-spec.md section 2.10, behaviour 18) --
+# `almanac task ...` is retired at the DISPATCHER level: exit 2, stderr
+# exactly the one-line pointer, stdout empty, nothing written under the
+# fixture root, and the hard-cutover branch fires BEFORE any attempt to spawn
+# almanac-task.pl (so this never depends on almanac-task.pl's own CLI
+# behaviour, which is tested directly in almanac-task-focus.t).
+# =============================================================================
+{
+    my $expect_line = "almanac: 'almanac task' is retired; use 'almanac thread' instead\n";
+    for my $case (
+        ['no args',        []],
+        ['list',           ['list']],
+        ['add --title x',  ['add', '--title', 'x']],
+        ['focus',          ['focus']],
+        ['bogus verb',     ['bogus']],
+    ) {
+        my ($label, $args) = @$case;
+        my $ROOTT = mk_root();
+        my @full = @$args ? (@$args, '--root', $ROOTT) : ('--root', $ROOTT);
+        my $res = @$args ? run_almanac('task', @full) : run_almanac('task');
+        is($res->{rc}, 2, "AC11: almanac task ($label) exits 2") or diag("stdout=$res->{stdout} stderr=$res->{stderr}");
+        is($res->{stdout}, '', "AC11: almanac task ($label) -- stdout empty");
+        is($res->{stderr}, $expect_line, "AC11: almanac task ($label) -- stderr is exactly the retirement pointer");
+        ok(!-d "$ROOTT/.ccpraxis-local-data", "AC11: almanac task ($label) wrote nothing under the fixture root");
+    }
+}
+
+# =============================================================================
+# AC20 (DC4) -- `almanac decision ...` is retired: exit 2, stderr exactly the
+# 2.6 line, stdout empty, nothing written under the fixture root.
+# =============================================================================
+{
+    my $expect_line = "almanac: 'almanac decision' is retired; use 'almanac inbox' instead\n";
+    for my $case (
+        ['no args',            []],
+        ['list',               ['list']],
+        ['file --title x',     ['file', '--title', 'x']],
+        ['bogus verb',         ['bogus']],
+    ) {
+        my ($label, $args) = @$case;
+        my $ROOT20 = mk_root();
+        my @full = @$args ? (@$args, '--root', $ROOT20) : ('--root', $ROOT20);
+        # "no args" must still mean no args AT ALL for `almanac decision`
+        # (the --root is only needed to pin down where nothing gets written).
+        my $res = @$args
+            ? run_almanac('decision', @full)
+            : run_almanac('decision');
+        is($res->{rc}, 2, "AC20: almanac decision ($label) exits 2") or diag("stdout=$res->{stdout} stderr=$res->{stderr}");
+        is($res->{stdout}, '', "AC20: almanac decision ($label) -- stdout empty");
+        is($res->{stderr}, $expect_line, "AC20: almanac decision ($label) -- stderr is exactly the 2.6 retirement line");
+        ok(!-d "$ROOT20/.ccpraxis-local-data", "AC20: almanac decision ($label) wrote nothing under the fixture root");
+    }
+}
+
+# =============================================================================
+# AC21 (DC4) -- `perl S/almanac-decision.pl ...` is retired directly, and a
+# require/do of it dies with the same line, leaving Almanac::Decision::file
+# undefined.
+# =============================================================================
+{
+    my $expect_line = "almanac: 'almanac-decision.pl' is retired; use 'almanac inbox' instead\n";
+    for my $case (
+        ['no args',        []],
+        ['list --root',    ['list']],
+        ['file --title x', ['file', '--title', 'x']],
+    ) {
+        my ($label, $args) = @$case;
+        my $ROOT21 = mk_root();
+        my $res = run_child([ $^X, $DECISION_PL, @$args, '--root', $ROOT21 ]);
+        is($res->{rc}, 2, "AC21: perl almanac-decision.pl ($label) exits 2") or diag("stdout=$res->{stdout} stderr=$res->{stderr}");
+        is($res->{stderr}, $expect_line, "AC21: perl almanac-decision.pl ($label) -- stderr is exactly the 2.6 line");
+        ok(!-d "$ROOT21/.ccpraxis-local-data", "AC21: perl almanac-decision.pl ($label) wrote nothing");
+    }
+
+    # `do FILE` deliberately does NOT re-throw a die past the `do` statement
+    # itself (it behaves like an inner eval: it sets $@ and returns undef,
+    # same as `eval { do FILE }` would) -- so `!eval { do $DECISION_PL; 1 }`
+    # can never observe a "died" outcome for ANY file, by Perl's own
+    # documented semantics. `require EXPR` of the same path DOES re-throw
+    # into an enclosing eval (verified empirically), which is the call form
+    # that actually exercises "dies" the way this assertion means it.
+    my $died = !eval { require $DECISION_PL; 1 };
+    my $err = $@;
+    ok($died, 'AC21: `require` of almanac-decision.pl dies') or diag('require did not die');
+    like($err, qr/\Q$expect_line\E/, 'AC21: ...with a message containing the 2.6 line') if $died;
+    ok(!defined(&Almanac::Decision::file), 'AC21: Almanac::Decision::file is undefined after the require');
 }
 
 # =============================================================================

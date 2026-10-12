@@ -65,9 +65,18 @@ and `runs/<pkg>.force-stop`.
 | hooks.json | PostToolUse | Task\|Agent\|Bash | context-ceiling.sh |
 | hooks.json | SubagentStop | (none) | track-dispatch.sh |
 | hooks.json | Stop | (none) | stop-gate.sh |
+| hooks.json | Notification | permission_prompt | record-prompt.sh |
+| hooks.json | PermissionDenied | (none) | record-denial.sh |
+| hooks.json | PreToolUse | (none) | denial-breaker.sh |
+| hooks.json | PreToolUse | (none) | ac-standdown-gate.sh |
+| hooks.json | PostToolUse | (none) | denial-breaker.sh |
+| hooks.json | PostToolUseFailure | (none) | denial-breaker.sh |
+| hooks.json | SessionStart | (none) | denial-breaker.sh |
+| hooks.json | UserPromptSubmit | (none) | arm-nudge-prompt.sh |
+| hooks.json | SessionStart | (none) | session-start-nudge.sh |
 | settings.json | PreToolUse | Bash | guard-git-mutations.sh (sec 2.2 settings form) |
 
-This is 18 hooks.json commands and 1 settings.json command, every one in the guarded registration form
+This is 27 hooks.json commands and 1 settings.json command, every one in the guarded registration form
 of spec 16's section 2.2 (`unset BASH_ENV; f=...; w=.../run-hook.sh; [ -f "$f" ] && [ -f "$w" ] || exit 0;
 bash -n "$f" && bash -n "$w" || exit 0; exec env -u SHELLOPTS bash "$f"`), so a missing or broken script
 or wrapper never blocks (RT-M1), and neither BASH_ENV nor SHELLOPTS reach the hook's own bash (RT-L7).
@@ -141,6 +150,10 @@ reason: Package 16 flattened this file from the pre-cutover staging tree's guard
 ### file: wait-shape-guard.sh
 verdict: keep
 reason: Package 16 flattened this file from the pre-cutover staging tree's guards sub-batch; it still denies the four polling pathologies for coordinators, with the repeat detector folded in from package 14's build.
+
+### file: ac-standdown-gate.sh
+verdict: keep
+reason: Package 11 (tooling-backlog) added this file; it denies every subagent tool call while an AC-loss stand-down is active, registered with no matcher so it runs for every tool. Exempts `SendMessage` and `SubagentHandback` (fix-batch H2) so a denied worker can still deliver the report its own denial text asks for -- the same two tools `BpHook::DenialBreaker`'s `@CLASSIFIER_EXEMPT_TOOLS` already exempts, for the identical reason. A marker older than `BpAcWatch::STALE_AFTER` (30 minutes) with no live monitor self-heals to phase `ac` instead of refusing forever (fix-batch H3).
 
 ### registration: hooks.json PreToolUse [Bash] guard-bash.sh
 verdict: keep
@@ -218,6 +231,62 @@ reason: The one Stop registration left in either file (Decision 5), in the guard
 verdict: keep
 reason: This repo keeps its unconditional protection against destructive git, run from the clone by $CLAUDE_PROJECT_DIR, now rewritten to the guarded 2.2 settings form by package 16's batch B.
 
+### file: record-denial.sh
+verdict: keep
+reason: Added by never-halt package 06; it records each auto-mode classifier denial to denials.jsonl for a driver or coordinator session, prints nothing and never blocks.
+
+### file: record-prompt.sh
+verdict: keep
+reason: Added by never-halt package 06; it records each permission prompt to prompts.jsonl for a driver or coordinator session, so the holder can wake the driver.
+
+### registration: hooks.json Notification [permission_prompt] record-prompt.sh
+verdict: keep
+reason: Registered on Notification with the permission_prompt matcher in the guarded 2.2 form; Notification output is discarded, so the hook only records.
+
+### registration: hooks.json PermissionDenied [] record-denial.sh
+verdict: keep
+reason: Registered without a matcher on PermissionDenied in the guarded 2.2 form; it prints nothing, so it never asks the model to retry.
+
+### file: denial-breaker.sh
+verdict: keep
+reason: Added by never-halt package 07; a deny-only circuit breaker that refuses a driver or coordinator agent's classifier-bound call once its auto-mode denial counts reach 2 consecutive or 17 total, and records per-call reset points on PostToolUse and PostToolUseFailure.
+
+### registration: hooks.json PreToolUse [] denial-breaker.sh
+verdict: keep
+reason: Registered without a matcher in the guarded 2.2 form; it denies or abstains, never emits a decision on stdout.
+
+### registration: hooks.json PreToolUse [] ac-standdown-gate.sh
+verdict: keep
+reason: Package 11 (tooling-backlog) added this registration with no matcher, so every tool call is checked, but the acstanddown env-only atom keeps it a pure bash no-op (no perl spawn) whenever the stand-down marker is absent.
+
+### registration: hooks.json PostToolUse [] denial-breaker.sh
+verdict: keep
+reason: Registered without a matcher in the guarded 2.2 form; it records the agent's reset point and prints nothing.
+
+### registration: hooks.json PostToolUseFailure [] denial-breaker.sh
+verdict: keep
+reason: Registered without a matcher in the guarded 2.2 form; an allowed call that fails still reset auto mode's consecutive count, so it records the same reset point and prints nothing.
+
+### registration: hooks.json SessionStart [] denial-breaker.sh
+verdict: keep
+reason: Added by never-halt package 07 (FIX-3); registered without a matcher in the guarded 2.2 form so it fires on every SessionStart, resetting the per-session total_since offset so a resumed session isn't permanently falsely tripped.
+
+### file: arm-nudge-prompt.sh
+verdict: keep
+reason: Added by never-halt package 11 (Decision 43, N3); pure bash, it records each operator prompt's epoch and suggests arming on an unarmed prompt that signals unattended work.
+
+### registration: hooks.json UserPromptSubmit [] arm-nudge-prompt.sh
+verdict: keep
+reason: Registered without a matcher on UserPromptSubmit in the guarded 2.2 form; it never blocks and prints at most one additionalContext line.
+
+### file: session-start-nudge.sh
+verdict: keep
+reason: Added by never-halt package 12 (Decision 43, N6 and N1-now); on an armed session's compact or resume it injects one line telling the agent to re-read its tasks or continue its held work.
+
+### registration: hooks.json SessionStart [] session-start-nudge.sh
+verdict: keep
+reason: Registered without a matcher on SessionStart in the guarded 2.2 form, beside denial-breaker.sh; it never blocks, writes nothing, and prints at most one additionalContext line.
+
 ## BpHook core API
 
 Package 03 builds `plugins/butler/scripts/BpHook.pm` and `plugins/butler/hooks/run-hook.sh`.
@@ -226,6 +295,12 @@ hook reads that answer through it, and none asks whether any drive is active in 
 was the defect behind bug 20260922-210421-0468. Everything below is tested in-process in
 `plugins/butler/tests/t/hook-core-api.t`, with `BUTLER_STATE_DIR` pointed at a tempdir and payloads
 passed as hashes (Decision 12).
+
+`BpHook::prompt_marker` (never-halt package 11) builds the path to the per-session prompt marker
+arm-nudge-prompt.sh writes, and `BpHook::last_prompt_epoch` and `BpHook::operator_off` are the
+readers of that marker's contents and of the off record's actor, used by the chart reminder's N5
+nudge to decide how long the session has gone without an operator message and whether an operator
+turned continuity off.
 
 ### Entry path and process budget
 
@@ -527,6 +602,7 @@ continuity/
   tickets/<k>/            command-binding tickets for one exact command.
   stop-tokens/            gate-minted stop tokens and one <sid>.current pointer per session.
   fork-ok/<sid>.json      package 19's one-shot fork override token, minted by butler-fork-ok.
+  prompted/<sid>          epoch of the session's last operator prompt (never-halt 11). Written in bash by arm-nudge-prompt.sh, read through BpHook::prompt_marker; not collected by gc_sessions.
   reasons.log             the Decision 7 reason log.
   hook-errors.log         internal errors caught by BpHook::main.
 ```
@@ -593,7 +669,7 @@ self-arm". For a manual session after the operator's own `/clear`, the operator 
 `/butler:continuity on`. After a carry-over, the carry-over skill prose tells the fresh session to run
 `butler-continuity on` when the work was armed. The old id's arm file is not a live session. It stays
 until its transcript is gone, and it stops holding the wake-lock once its transcript has gone an hour
-with no activity (Decision 53). No SessionStart or SessionEnd hook is registered.
+with no activity (Decision 53). Two SessionStart hooks are registered, and neither carries state across a new id: denial-breaker.sh (never-halt 07) moves its own per-agent counting offset, and session-start-nudge.sh (never-halt 12) speaks only on source compact or resume of an armed session, both of which keep the id. No SessionEnd hook is registered.
 
 **Wake-lock (Decision 18, Decision 53).** `BpContinuityLease.pm` (package 04, rewired by package 16) holds the lock
 while an armed session's transcript was written in the last hour. It no longer reads the old
@@ -776,6 +852,10 @@ end the turn, and record whether the holder is killed and whether its kill wakes
 result in 08's ledger. `plugins/butler/tests/t/fleet-holder-integration.t` exercises the gate and holder
 contract in-process for all three outcomes. The merged Bash guard exempts a command that is exactly one
 `butler-hold` invocation from the headless no-background rule.
+
+A holder also exits early, with exit code 3 and the single line `PROMPT <agent_id>: <message>`, when
+any prompt in its own session is recorded after the holder's start or latest extension (never-halt
+Decision 9; filtered on session_id alone, never agent_id — Decision 40).
 
 ## Reason log
 
@@ -1096,6 +1176,12 @@ next fork dispatch, and the guard denies again after it. Decision 3 applies thro
 | guard-ask-operator.sh | 4 | --pre ledger,armed : exits when BP_LEDGER is unset and armed/<session_id> is absent |
 | track-dispatch.sh | 1 | --pre ledger,driver : exits when BP_LEDGER is unset and the session is not an armed driver |
 | guard-fork.sh | 3 | --pre text:fork : exits when the payload text does not contain fork |
+| record-prompt.sh | 0 | --pre ledger,driver : exits when BP_LEDGER is unset and the session is not an armed driver |
+| record-denial.sh | 0 | --pre ledger,driver : exits when BP_LEDGER is unset and the session is not an armed driver |
+| denial-breaker.sh | 3 | --pre ledger,driver : exits when BP_LEDGER is unset and the session is not an armed driver |
+| arm-nudge-prompt.sh | 1 | no run-hook.sh and no --pre (pure bash, never starts perl) : exits when BP_LEDGER is set, the payload is not a main-thread UserPromptSubmit, or the prompt is a task-notification |
+| session-start-nudge.sh | 1 | --pre armed : exits when armed/<session_id> is absent |
+| ac-standdown-gate.sh | 2 | --pre acstanddown : exits when the AC-loss stand-down marker is absent (env-only, no session file read) |
 
 **Who each rule applies to.** A fork counts as a subagent everywhere.
 
@@ -1120,6 +1206,10 @@ next fork dispatch, and the guard denies again after it. Decision 3 applies thro
 - guard-ask-operator: coordinator, or any caller in an armed session.
 - track-dispatch: coordinator, and an armed driver's main thread.
 - guard-fork: every session and caller (Decision 64).
+- arm-nudge-prompt: the main thread's operator prompts only; a task-notification, a subagent payload
+  or a BP_LEDGER environment is skipped before anything is written.
+- session-start-nudge: the main thread of an armed, non-coordinator session, on source compact or
+  resume only; a subagent payload, a BP_LEDGER environment, or any other source is quiet.
 
 Behaviour kept by package 14, and which existing tests each rebuild re-expresses in
 `plugins/butler/tests/t/guards-remake-suite.t` (Decision 26: assertions about a Decision 6 override

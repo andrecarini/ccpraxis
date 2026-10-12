@@ -16,7 +16,7 @@
     {
       "id": "auto-mode-denial-limits",
       "description": "Auto mode escalates to a blocking prompt after 3 consecutive or 20 total classifier denials.",
-      "relied_by": "never-halt hooks (Decision 10): the 3-consecutive / 20-total escalation limits",
+      "relied_by": "never-halt hooks (Decisions 10, 15): BpHook::DenialBreaker trips at $MAX_CONSECUTIVE=2 / $MAX_TOTAL=17, one below these limits ($AUTO_MODE_MAX_CONSECUTIVE / $AUTO_MODE_MAX_TOTAL)",
       "found_in": { "version": "2.1.282", "date": "2026-09-26" },
       "signatures": [
         { "type": "regex", "value": "maxConsecutive\\s*:\\s*3\\s*,\\s*maxTotal\\s*:\\s*20\\b", "example": "maxConsecutive:3,maxTotal:20" }
@@ -47,6 +47,33 @@
       "found_in": { "version": "2.1.282", "date": "2026-09-26" },
       "signatures": [
         { "type": "regex", "value": "settings\\.disableWorkflows\\s*===\\s*!0", "example": "settings.disableWorkflows===!0" }
+      ]
+    },
+    {
+      "id": "auto-mode-safe-allowlist",
+      "description": "Auto mode skips the classifier for a tool on its static safe allowlist, logging that it is on the safe allowlist.",
+      "relied_by": "never-halt hooks (Decision 15): BpHook::DenialBreaker's @CLASSIFIER_EXEMPT_TOOLS mirrors this allowlist (F3)",
+      "found_in": { "version": "2.1.282", "date": "2026-09-26" },
+      "signatures": [
+        { "type": "literal", "value": "tool is on the safe allowlist" }
+      ]
+    },
+    {
+      "id": "bash-rule-trailing-wildcard",
+      "description": "A Bash permissions.allow rule body ending \" *\" also matches the command with that trailing word omitted.",
+      "relied_by": "never-halt hooks (Decision 15): BpHook::DenialBreaker::allow_listed's wildcard-matching algorithm (F4)",
+      "found_in": { "version": "2.1.282", "date": "2026-09-26" },
+      "signatures": [
+        { "type": "literal", "value": ".endsWith(\" .*\")" }
+      ]
+    },
+    {
+      "id": "post-tool-use-failure-event",
+      "description": "PostToolUseFailure fires only after a tool call has started running, never for a permission denial.",
+      "relied_by": "never-halt hooks (Decision 15): BpHook::DenialBreaker registers on PostToolUseFailure to reset its mirror (F5)",
+      "found_in": { "version": "2.1.282", "date": "2026-09-26" },
+      "signatures": [
+        { "type": "literal", "value": "hook_event_name:\"PostToolUseFailure\"" }
       ]
     }
   ]

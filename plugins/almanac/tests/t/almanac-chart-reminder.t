@@ -67,47 +67,48 @@ sub current_R {
     return '';
 }
 
-# reminder_prefix($n) / reminder_suffix($root) -- the two pieces of the
-# reminder text Decision 5 leaves untouched: the per-call "Tool call $n..."
-# line opening, and the almanac-task.pl command-line hint. Kept as separate
-# subs (rather than inlined into assert_reminder_text) so a caller can build
-# qr/^\Q$prefix\E/ / qr/\Q$suffix\E\z/ anchors around whatever the (regex-
-# checked, never hardcoded) middle sentence turns out to be.
-sub reminder_prefix { my ($n) = @_; return "Tool call $n in this session: chart your tasklist." }
-sub reminder_suffix { my ($root) = @_; return "  perl $root/scripts/almanac-task.pl focus | list | add --title '<step>' | status <id> doing|blocked|done" }
+# OVERRIDDEN by blueprint where-things-go, package 02-thread-store
+# (specs/02-thread-store-spec.md section 2.10, behaviour 22, AC15): the
+# almanac-records package 15 text above (Decision 5) is superseded by an
+# EXACT two-line text the architect pinned (caller question 1), no longer
+# tolerant-regex-matched -- "chart your tasklist"/"focused" become "chart
+# your thread"/"owns a live thread", and the command hint now names
+# almanac-thread.pl's verbs. reminder_prefix/suffix together are the WHOLE
+# reminder text now (two lines, nothing else).
+sub reminder_prefix { my ($n) = @_; return "Tool call $n in this session: chart your thread. Move your current steps through doing, blocked and done; add a task only for a new step of work." }
+sub reminder_suffix { my ($root) = @_; return "  perl $root/scripts/almanac-thread.pl list | show <thread> | add <thread> --title '<step>' | status <thread> <task> doing|blocked|done" }
 
-# assert_reminder_text($text, $n, $root, $label) -- Decision 5 / done
-# criterion 1 oracle for the reminder sentence:
-#   - $text starts with the unchanged per-call prefix and ends with the
-#     unchanged command-line suffix (the two anchors Decision 5 leaves
-#     alone);
-#   - it never contains "Record where the work stands" (done criterion 1,
-#     verbatim -- this is the retired sentence that produced status-log
-#     entries);
-#   - the replaced sentence, whatever its exact wording, tells the agent to
-#     move its current steps through doing, blocked and done (key clause 1
-#     of Decision 5), matched by a regex tolerant of "its/your/the",
-#     singular "step", and punctuation/ordering variation between the three
-#     status words;
-#   - and tells the agent to add a task only for a new step of work (key
-#     clause 2 of Decision 5), matched the same way.
-# Deliberately never pins one exact sentence: Decision 5 states the meaning
-# the new text must carry, not its bytes, and inventing a literal here would
-# make the test an echo of one implementer's phrasing rather than an oracle
-# for the decision.
+# OVERRIDDEN AGAIN by blueprint where-things-go, package 04-continuity-threads
+# (specs/04-continuity-threads-spec.md section 2.8, behaviour 18): when the
+# session is attached to a live thread <T> (not merely armed), the generic
+# "<thread>" placeholder is replaced by the real thread name in both lines.
+# "$gate" from arming ALONE (no attached thread) keeps the generic, unnamed
+# text above byte-identical (reminder_prefix/reminder_suffix are untouched).
+sub reminder_prefix_named { my ($n, $name) = @_; return "Tool call $n in this session: chart your thread $name. Move your current steps through doing, blocked and done; add a task only for a new step of work." }
+sub reminder_suffix_named { my ($root, $name) = @_; return "  perl $root/scripts/almanac-thread.pl show $name | add $name --title '<step>' | status $name <task> doing|blocked|done" }
+
+sub assert_reminder_text_named {
+    my ($text, $n, $root, $name, $label) = @_;
+    $text = '' unless defined $text;
+    my $prefix = reminder_prefix_named($n, $name);
+    my $suffix = reminder_suffix_named($root, $name);
+    is($text, "$prefix\n$suffix", "$label: is exactly the named-thread two-line reminder for '$name'");
+    return;
+}
+
+# assert_reminder_text($text, $n, $root, $label) -- AC15/behaviour 22 oracle:
+# the reminder is EXACTLY the two pinned lines (prefix line, then suffix
+# line), nothing more, nothing less.
 sub assert_reminder_text {
     my ($text, $n, $root, $label) = @_;
     $text = '' unless defined $text;
     my $prefix = reminder_prefix($n);
     my $suffix = reminder_suffix($root);
-    like($text, qr/^\Q$prefix\E/, "$label: starts with the unchanged 'Tool call $n...chart your tasklist.' prefix");
-    like($text, qr/\Q$suffix\E\z/, "$label: ends with the unchanged almanac-task.pl command-line hint");
+    like($text, qr/^\Q$prefix\E/, "$label: starts with the exact 'Tool call $n...chart your thread.' line");
+    like($text, qr/\Q$suffix\E\z/, "$label: ends with the exact almanac-thread.pl command-line hint");
+    unlike($text, qr/chart your tasklist/i, "$label: no longer says 'chart your tasklist' (retired package-15 wording)");
     unlike($text, qr/Record where the work stands/i,
-        "$label: no longer contains 'Record where the work stands' (done criterion 1)");
-    like($text, qr/\bmove\b[^.\n]{0,60}?\bstep(?:s)?\b[^.\n]{0,40}?\bthrough\b[^.\n]{0,60}?\bdoing\b[^.\n]{0,30}?\bblocked\b[^.\n]{0,30}?\bdone\b/is,
-        "$label: tells the agent to move its current steps through doing, blocked and done");
-    like($text, qr/\badd\b[^.\n]{0,20}?\btask\b[^.\n]{0,20}?\bonly\b[^.\n]{0,20}?\bfor\b[^.\n]{0,20}?(?:a\s+)?new\s+step\s+of\s+work\b/is,
-        "$label: tells the agent to add a task only for a new step of work");
+        "$label: no longer contains 'Record where the work stands'");
     return;
 }
 
@@ -283,11 +284,34 @@ sub decode_out {
     return eval { JSON::PP->new->decode($lines[0]) };
 }
 
+# do_focus($sid, $root) -- AC15/behaviour 22 override: "focused" (a task-
+# focus record) is retired; a session now "owns a live thread" instead. This
+# makes the session own one by creating a thread with that session as owner
+# (Almanac::Thread::owned_by_session's definition), via almanac-thread.pl
+# create --session <sid>. Kept under its old name so every existing R-xx/
+# AC-xx call site below is re-expressed with "owns a live thread" by this
+# one change, as AC15 requires, rather than by touching each site.
+#
+# EDITED for blueprint where-things-go, package 03-thread-sessions (Decision
+# 18 F6): the `create` verb is hard ticket-gated. do_focus pins its own
+# BUTLER_STATE_DIR (rather than depending on whatever the caller's ambient
+# %ENV happens to carry) and mints a matching ticket for the exact argv it
+# spawns, so this fixture keeps working once the gate lands -- pure
+# migration, not new behaviour.
 sub do_focus {
     my ($sid, $root) = @_;
     local %ENV = %ENV;
     delete $ENV{CLAUDE_CODE_SESSION_ID};
-    system(qq{perl "$ALM/scripts/almanac-task.pl" focus --session "$sid" --root "$root" > /dev/null 2>&1});
+    my $state = tempdir(CLEANUP => 1);
+    $state =~ s{\\}{/}g;
+    $ENV{BUTLER_STATE_DIR} = $state;
+    require "$BUTLER/scripts/BpHook.pm" unless grep { m{(?:^|/)BpHook\.pm$} } keys %INC;
+    our $DO_FOCUS_TICKET_SEQ;
+    BpHook::write_ticket(
+        { session_id => $sid, tool_use_id => 'DF' . (++$DO_FOCUS_TICKET_SEQ),
+          transcript_path => undef, cwd => $root },
+        'almanac-thread', ['create', 'owned-thread', '--session', $sid, '--root', $root]);
+    system(qq{perl "$ALM/scripts/almanac-thread.pl" create owned-thread --session "$sid" --root "$root" > /dev/null 2>&1});
     return $? >> 8;
 }
 
@@ -873,5 +897,297 @@ DRIVER
            'R-14: no real butler-state armed marker exists for that sid either');
     }
 }
+
+# =============================================================================
+# never-halt package 11-arming-nudges, N5 (DC3): AC-18..AC-25 of
+# .ccpraxis-local-data/blueprints/never-halt/specs/11-arming-nudges-spec.md
+# section 4. reminder-chart-tasklist.pl's N5 addition DOES NOT EXIST YET at
+# the time this block is written -- every assertion below is expected to
+# fail for exactly that reason, never a harness bug in this file.
+#
+# This block never relies on fire_reminder()'s own BP_*/CLAUDE_* scrub for
+# CCPRAXIS_ARM_NUDGE_MIN (fire_reminder only deletes BP_*/CLAUDE_* keys):
+# every case below explicitly deletes/sets CCPRAXIS_ARM_NUDGE_MIN itself.
+# =============================================================================
+
+# off_path/write_off/write_marker/nudged_path -- the N5 state-file formulas
+# from spec sec 1.3/2.5, built directly (not through BpHook, which this file
+# never requires) so these helpers work whether or not BpHook.pm has grown
+# its never-halt-11 additions yet.
+sub off_path   { my ($state, $sid) = @_; return "$state/continuity/off/$sid" }
+sub write_off {
+    my ($state, $sid, $actor) = @_;
+    make_path("$state/continuity/off");
+    open(my $fh, '>', off_path($state, $sid)) or die $!;
+    print {$fh} JSON::PP->new->encode({ actor => $actor });
+    close $fh;
+}
+sub write_marker {
+    my ($state, $sid, $epoch) = @_;
+    make_path("$state/continuity/prompted");
+    open(my $fh, '>', "$state/continuity/prompted/$sid") or die $!;
+    print {$fh} "$epoch\n";
+    close $fh;
+}
+sub nudged_path { my ($home, $sid) = @_; return "$home/.claude/almanac-state/chart-reminder/$sid.nudged" }
+
+# OVERRIDDEN by blueprint where-things-go, package 04-continuity-threads
+# (specs/04-continuity-threads-spec.md section 2.8): the N5 nudge now says
+# "arm and attach a thread" and names both CLI forms.
+sub n5_text { my ($n) = @_; return "No operator message for $n min and work continues. If this session should keep working without the operator, arm and attach a thread: butler-continuity on --new-thread <name> (or --thread <name> to resume one)" }
+sub n5_regex {
+    my (@ns) = @_;
+    my $alt = join('|', map { quotemeta(n5_text($_)) } @ns);
+    return qr/\A(?:$alt)\z/;
+}
+
+# scrub_arm_nudge_min($env) -- explicit CCPRAXIS_ARM_NUDGE_MIN deletion,
+# per this package's test-writer note: fire_reminder() only scrubs
+# BP_*/CLAUDE_*, so an ambient CCPRAXIS_ARM_NUDGE_MIN would otherwise leak
+# into every baseline case below.
+sub scrub_arm_nudge_min { my ($env) = @_; $env->{CCPRAXIS_ARM_NUDGE_MIN} = undef; return $env }
+
+# =============================================================================
+# AC-18 + AC-19 (B12, B13, B14): first fire at call 20, quiet through call
+# 40 (marker unchanged), fires again at call 60 once the marker is rewritten
+# stale again.
+# =============================================================================
+{
+    my $sid = fresh_sid();
+    my ($env, $home, $state, $proj) = base_env();
+    scrub_arm_nudge_min($env);
+    my $marker_epoch = time() - 31 * 60;
+    write_marker($state, $sid, $marker_epoch);
+
+    my $last;
+    for my $i (1 .. 20) {
+        $last = fire_reminder(mkpayload(sid => $sid, cwd => $proj), %$env);
+        is($last->{out}, '', "AC-18: call $i prints nothing") if $i < 20;
+    }
+    my $d = decode_out($last->{out});
+    ok(ref($d) eq 'HASH', 'AC-18: call 20 prints exactly one decodable JSON line')
+        or diag("stdout=[$last->{out}]");
+    if (ref($d) eq 'HASH') {
+        is($d->{hookSpecificOutput}{hookEventName}, 'PostToolUse', 'AC-18: call 20 hookEventName is PostToolUse');
+        like($d->{hookSpecificOutput}{additionalContext}, n5_regex(31, 32),
+            'AC-18: call 20 additionalContext matches the N5 text with N 31 or 32');
+    }
+    is($last->{err}, '', 'AC-18: call 20 stderr is empty');
+    is(slurp(nudged_path($home, $sid)), "$marker_epoch\n", 'AC-18: the .nudged file holds the marker epoch');
+
+    # AC-19: calls 21-39 quiet (marker unchanged), call 40 quiet too.
+    for my $i (21 .. 40) {
+        my $r = fire_reminder(mkpayload(sid => $sid, cwd => $proj), %$env);
+        is($r->{out}, '', "AC-19: call $i prints nothing (marker unchanged)");
+    }
+
+    # a new, later marker epoch -> fires again at the next 20th call (60).
+    my $marker_epoch2 = time() - 45 * 60;
+    write_marker($state, $sid, $marker_epoch2);
+    my $last60;
+    for my $i (41 .. 60) {
+        $last60 = fire_reminder(mkpayload(sid => $sid, cwd => $proj), %$env);
+        is($last60->{out}, '', "AC-19: call $i prints nothing") if $i < 60;
+    }
+    my $d60 = decode_out($last60->{out});
+    ok(ref($d60) eq 'HASH', 'AC-19: call 60 prints exactly one decodable JSON line')
+        or diag("stdout=[$last60->{out}]");
+    if (ref($d60) eq 'HASH') {
+        like($d60->{hookSpecificOutput}{additionalContext}, n5_regex(45, 46),
+            'AC-19: call 60 additionalContext matches the N5 text with N 45 or 46 (a new operator prompt nudges again)');
+    }
+}
+
+# =============================================================================
+# AC-20 (B15): quiet cases -- armed, judge, operator off, fresh marker,
+# missing marker, garbage marker. An agent off does NOT suppress it. Every
+# run: rc 0, stderr empty, 0 tickets left after call 20.
+# =============================================================================
+{
+    my %cases = (
+        armed => sub {
+            my ($env, $home, $state, $sid) = @_;
+            touch_armed($state, $sid);
+            write_marker($state, $sid, time() - 31 * 60);
+        },
+        judge => sub {
+            my ($env, $home, $state, $sid) = @_;
+            $env->{BP_LEDGER} = '1';
+            $env->{BP_ROLE}   = 'harvest-judge';
+            write_marker($state, $sid, time() - 31 * 60);
+        },
+        'operator off' => sub {
+            my ($env, $home, $state, $sid) = @_;
+            write_off($state, $sid, 'operator');
+            write_marker($state, $sid, time() - 31 * 60);
+        },
+        'fresh marker' => sub {
+            my ($env, $home, $state, $sid) = @_;
+            write_marker($state, $sid, time() - 5 * 60);
+        },
+        'absent marker' => sub {
+            my ($env, $home, $state, $sid) = @_;
+            # no marker written at all
+        },
+        'garbage marker' => sub {
+            my ($env, $home, $state, $sid) = @_;
+            make_path("$state/continuity/prompted");
+            open(my $fh, '>', "$state/continuity/prompted/$sid") or die $!;
+            print {$fh} "garbage\n";
+            close $fh;
+        },
+    );
+    for my $label (sort keys %cases) {
+        my $sid = fresh_sid();
+        my ($env, $home, $state, $proj) = base_env();
+        scrub_arm_nudge_min($env);
+        $cases{$label}->($env, $home, $state, $sid);
+        my $last;
+        for (1 .. 20) { $last = fire_reminder(mkpayload(sid => $sid, cwd => $proj), %$env) }
+        if ($label eq 'armed') {
+            isnt($last->{out}, '', "AC-20 [$label]: call 20 fires (armed makes gate true)");
+        } else {
+            is($last->{out}, '', "AC-20 [$label]: call 20 prints nothing");
+        }
+        is($last->{rc}, 0, "AC-20 [$label]: call 20 exits 0");
+        is($last->{err}, '', "AC-20 [$label]: call 20 stderr is empty");
+        is(scalar(ticket_names(ticket_dir($home, $sid))), 0, "AC-20 [$label]: 0 tickets remain after call 20");
+    }
+
+    # positive: an agent off does NOT suppress the nudge.
+    {
+        my $sid = fresh_sid();
+        my ($env, $home, $state, $proj) = base_env();
+        scrub_arm_nudge_min($env);
+        write_off($state, $sid, 'agent');
+        write_marker($state, $sid, time() - 31 * 60);
+        my $last;
+        for (1 .. 20) { $last = fire_reminder(mkpayload(sid => $sid, cwd => $proj), %$env) }
+        is($last->{rc}, 0, 'AC-20 [agent off]: call 20 exits 0');
+        is($last->{err}, '', 'AC-20 [agent off]: call 20 stderr is empty');
+        isnt($last->{out}, '', 'AC-20 [agent off]: call 20 prints the N5 line (agent off does not suppress it)');
+        is(scalar(ticket_names(ticket_dir($home, $sid))), 0, 'AC-20 [agent off]: 0 tickets remain after call 20');
+    }
+}
+
+# =============================================================================
+# AC-21 (B16): CCPRAXIS_ARM_NUDGE_MIN override. 5 with a 6-min marker fires
+# with N 6 or 7; 0/abc/1441/'' with a 6-min marker fall back to 30 (so a
+# 6-minute-old marker stays quiet).
+# =============================================================================
+{
+    my $sid = fresh_sid();
+    my ($env, $home, $state, $proj) = base_env();
+    $env->{CCPRAXIS_ARM_NUDGE_MIN} = 5;
+    write_marker($state, $sid, time() - 6 * 60);
+    my $last;
+    for (1 .. 20) { $last = fire_reminder(mkpayload(sid => $sid, cwd => $proj), %$env) }
+    my $d = decode_out($last->{out});
+    ok(ref($d) eq 'HASH', 'AC-21: CCPRAXIS_ARM_NUDGE_MIN=5 with a 6-min marker fires at call 20')
+        or diag("stdout=[$last->{out}]");
+    like($d->{hookSpecificOutput}{additionalContext}, n5_regex(6, 7),
+        'AC-21: N is 6 or 7') if ref($d) eq 'HASH';
+
+    for my $bad (0, 'abc', 1441, '') {
+        my $sid2 = fresh_sid();
+        my ($env2, $home2, $state2, $proj2) = base_env();
+        $env2->{CCPRAXIS_ARM_NUDGE_MIN} = $bad;
+        write_marker($state2, $sid2, time() - 6 * 60);
+        my $last2;
+        for (1 .. 20) { $last2 = fire_reminder(mkpayload(sid => $sid2, cwd => $proj2), %$env2) }
+        is($last2->{out}, '', "AC-21: CCPRAXIS_ARM_NUDGE_MIN='$bad' falls back to 30 -- a 6-min marker stays quiet");
+    }
+}
+
+# =============================================================================
+# AC-22 (B17): focused and unarmed with a stale marker -> one line, X (the
+# unchanged reminder text) + "\n" + the N5 line.
+# =============================================================================
+{
+    my $sid = fresh_sid();
+    my ($env, $home, $state, $proj) = base_env();
+    scrub_arm_nudge_min($env);
+    is(do_focus($sid, $proj), 0, 'AC-22 fixture: focus succeeds');
+    write_marker($state, $sid, time() - 31 * 60);
+    my $last;
+    for (1 .. 20) { $last = fire_reminder(mkpayload(sid => $sid, cwd => $proj), %$env) }
+    my $d = decode_out($last->{out});
+    ok(ref($d) eq 'HASH', 'AC-22: call 20 (focused, unarmed, stale marker) prints exactly one decodable JSON line')
+        or diag("stdout=[$last->{out}]");
+    if (ref($d) eq 'HASH') {
+        # The existing reminder text (X) already carries its own embedded
+        # "\n" (prefix sentence, then the almanac-task.pl hint line), so the
+        # N5 line -- always a single line with no embedded "\n" -- is
+        # recovered from the END of $ctx, not by splitting on the FIRST
+        # "\n".
+        my $ctx = $d->{hookSpecificOutput}{additionalContext} // '';
+        my ($x, $rest) = $ctx =~ /\A(.*)\n([^\n]*)\z/s;
+        # package 04-continuity-threads (behaviour 18): do_focus() attaches
+        # the session to thread "owned-thread" (Almanac::Thread::create with
+        # --session), so the reminder half now names that thread.
+        assert_reminder_text_named($x // $ctx, 20, $ALM, 'owned-thread', 'AC-22: the reminder half (X)');
+        like($rest // '', n5_regex(31, 32), 'AC-22: the N5 half follows one "\n"');
+    }
+}
+
+# =============================================================================
+# AC-23 (B18): a stale marker, R-12-style perl shim -- calls 1 and 19 launch
+# zero perl, call 20 launches exactly one, and call 20 printed the N5 line.
+# =============================================================================
+{
+    my $real_perl = (File::Spec->file_name_is_absolute($^X) && -x $^X) ? $^X
+                   : do { my $p = `bash -c "command -v perl"`; chomp $p; $p };
+    my $shim = tempdir(CLEANUP => 1);
+    open(my $pfh, '>', "$shim/perl") or die $!;
+    print {$pfh} "#!/usr/bin/env bash\nprintf 'perl %s\\n' \"\$\$\" >> \"\$SHIM_LOG\"\nexec \"$real_perl\" \"\$\@\"\n";
+    close $pfh;
+    chmod 0755, "$shim/perl";
+
+    my $sid = fresh_sid();
+    my ($env, $home, $state, $proj) = base_env();
+    scrub_arm_nudge_min($env);
+    write_marker($state, $sid, time() - 31 * 60);
+    my (undef, $log) = tempfile();
+    $env->{SHIM_LOG} = $log;
+    $env->{PATH} = "$shim:$ENV{PATH}";
+
+    my $last;
+    for my $i (1 .. 20) {
+        unlink $log;
+        $last = fire_reminder(mkpayload(sid => $sid, cwd => $proj), %$env);
+        my $count = () = ((slurp($log) // '') =~ /^perl /mg);
+        if ($i == 20) {
+            is($count, 1, 'AC-23: the firing call (20, stale marker) launches perl exactly once');
+            isnt($last->{out}, '', 'AC-23: ...and call 20 actually printed the N5 line');
+        } elsif ($i == 1 || $i == 19) {
+            is($count, 0, "AC-23: an ordinary call ($i) launches perl ZERO times");
+        }
+    }
+}
+
+# =============================================================================
+# AC-24 (B19): a stale marker, 19 main calls, then one subagent call (never
+# counted, never prints), then the 20th main call prints the N5 line.
+# =============================================================================
+{
+    my $sid = fresh_sid();
+    my ($env, $home, $state, $proj) = base_env();
+    scrub_arm_nudge_min($env);
+    write_marker($state, $sid, time() - 31 * 60);
+    for (1 .. 19) { fire_reminder(mkpayload(sid => $sid, cwd => $proj), %$env) }
+
+    my $sub_r = fire_reminder(mkpayload(sid => $sid, cwd => $proj, agent_id => 'sub-1'), %$env);
+    is($sub_r->{out}, '', 'AC-24: a subagent call prints nothing (not counted)');
+
+    my $r20 = fire_reminder(mkpayload(sid => $sid, cwd => $proj), %$env);
+    isnt($r20->{out}, '', 'AC-24: the next main call (the true 20th) prints the N5 line');
+}
+
+# =============================================================================
+# AC-25: static scan for R-12 (no spawn/fork/alarm) and R-11 (one <STDIN>)
+# is already asserted above, byte-identically, in the R-11 and R-12 blocks
+# of this same file -- no further assertion is needed here; this comment
+# exists only for traceability from the spec's AC numbering.
+# =============================================================================
 
 done_testing();

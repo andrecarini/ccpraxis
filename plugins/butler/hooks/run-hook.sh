@@ -65,10 +65,27 @@ _bp_env_only_clause() {
             ledger) ;;
             coordinator) ;;
             stopfile) ;;
+            acstanddown) ;;
             *) return 1 ;;
         esac
     done
     return 0
+}
+
+# _bp_ac_data_dir() -- package 11, spec 2.9: sets _BP_AC_DATA_DIR to
+# CCPRAXIS_DATA_DIR when absolute; otherwise CLAUDE_PROJECT_DIR +
+# /.ccpraxis-local-data; otherwise empty. A global, not a return value (no
+# $(...) anywhere in this file -- hook-core-spawn-budget.t's S6). Bash
+# builtins only; backslashes normalised as every other atom here does.
+_BP_AC_DATA_DIR=
+_bp_ac_data_dir() {
+    _BP_AC_DATA_DIR=
+    if [ -n "$CCPRAXIS_DATA_DIR" ] && _bp_is_abs "$CCPRAXIS_DATA_DIR"; then
+        _BP_AC_DATA_DIR=${CCPRAXIS_DATA_DIR//\\//}
+    elif [ -n "$CLAUDE_PROJECT_DIR" ]; then
+        local p=${CLAUDE_PROJECT_DIR//\\//}
+        _BP_AC_DATA_DIR="${p%/}/.ccpraxis-local-data"
+    fi
 }
 
 _bp_clause_holds() {
@@ -96,6 +113,12 @@ _bp_clause_holds() {
                     elif [ -n "$BP_PACKAGE" ] && [ -e "$BP_DIR/runs/$BP_PACKAGE.force-stop" ]; then
                         holds_any=1
                     fi
+                fi
+                ;;
+            acstanddown)
+                _bp_ac_data_dir
+                if [ -n "$_BP_AC_DATA_DIR" ] && [ -e "$_BP_AC_DATA_DIR/.drive-solo/ac-standdown.json" ]; then
+                    holds_any=1
                 fi
                 ;;
         esac

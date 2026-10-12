@@ -83,6 +83,7 @@ sub run {
         if (defined $root) {
             utime(undef, undef, "$root/armed/$sid");
         }
+        _reattach_thread($p);
         return 0;
     }
 
@@ -92,7 +93,31 @@ sub run {
         $opts{transcript_path} = $tp;
     }
     BpHook::arm($sid, %opts);
+    _reattach_thread($p);
     return 0;
+}
+
+# _reattach_thread($p) -- blueprint where-things-go, package 03-thread-
+# sessions, spec 2.10: calls Almanac::Thread::reattach on every director
+# call, using the payload's own cwd (never the process cwd or
+# CLAUDE_PROJECT_DIR). Never denies, never prints, never fails the hook,
+# ignores the result.
+sub _reattach_thread {
+    my ($p) = @_;
+    my $cwd = $p->{cwd};
+    return unless _is_plain_string($cwd) && length $cwd && -d BpHook::_to_bytes($cwd);
+    my $self_dir = __FILE__;
+    $self_dir =~ s{\\}{/}g;
+    $self_dir =~ s{/[^/]+\z}{};   # strip ArmOnEntry.pm -> .../BpHook
+    my $alm = "$self_dir/../../../almanac/scripts";
+    return unless -f "$alm/Almanac/Thread.pm";
+    local $@;
+    eval {
+        { local @INC = ($alm, @INC); require Almanac::Thread; }
+        Almanac::Thread::reattach(session => BpHook::session_id($p),
+            transcript => $p->{transcript_path}, source => 'arm-on-entry', cwd => $cwd);
+    };
+    return;
 }
 
 1;

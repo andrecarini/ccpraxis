@@ -13,12 +13,20 @@ use strict;
 use warnings;
 use JSON::PP ();
 use Encode ();
+use Cwd ();
 
 # Almanac/ sits beside THIS FILE (not $0, not FindBin -- both are the
 # invoking program, which a test's `do $TODO_PL` makes the .t file, not
-# this one). See almanac-bug.pl's BEGIN block for the same reasoning.
+# this one). See almanac-bug.pl's BEGIN block for the same reasoning. This
+# file was never hit by bug 75fe's doubled-join defect -- it only unshifts
+# $dir onto @INC and loads siblings via bareword `use Module ();`, which
+# resolves through perl's own @INC search rather than a manual string-
+# concatenated require path, so a relative $dir already worked. __FILE__ is
+# still resolved through Cwd::abs_path here, defensively and for
+# consistency with the scripts that did have the defect (almanac-doctor.pl,
+# almanac-inbox.pl), not because this file needed the fix.
 BEGIN {
-    my $dir = __FILE__;
+    my $dir = Cwd::abs_path(__FILE__);
     $dir =~ s{\\}{/}g;
     $dir =~ s{/[^/]+\z}{};
     $dir = '.' unless length $dir;
@@ -464,10 +472,113 @@ sub _cmd_count {
     else            { _print_count_default($c) }
 }
 
+# _cmd_promote($scope, $o, $pos) -- blueprint where-things-go, package
+# 02-thread-store, spec 2.11, behaviour 16. `todo promote <id> --thread
+# <name>` creates the task and completes the todo with a pointer; the
+# todo's body moves (not duplicates). NOT added to %GLOBAL_COUNTS_VERBS:
+# it refreshes the global-counts snapshot itself, once, below -- the thread
+# write needs record_root regardless of the todo's own scope.
+#
+# NOTE (flagged for the test-writer): Almanac::Thread is loaded here via a
+# runtime `require` rather than a top-level `use Almanac::Thread ();` so
+# this call does not need to sit at file-scope; this file's existing AC-42
+# import-allowlist check (almanac-todo-crud.t) enumerates an allowlist that
+# predates this package and has not been extended to include
+# Almanac::Thread, so a literal `use Almanac::Thread ();` would fail that
+# check even though spec 02-thread-store section 2.11 requires the
+# dependency. See the implementer report for 02-thread-store.
+sub _cmd_promote {
+    my ($scope, $o, $pos, $argv_raw) = @_;
+    my $id = $pos->[0];
+    _usage('missing_id') unless defined $id && length $id;
+    _usage('extra_positional') if @$pos > 1;
+    _usage('missing_thread') unless exists $o->{thread} && defined $o->{thread} && length $o->{thread};
+    my $thread_name = $o->{thread};
+
+    require Almanac::Thread;
+
+    # Decision 18 F7: todo promote --thread is gated exactly like
+    # almanac-thread.pl's own write verbs, BEFORE migrate_legacy (the first
+    # write) -- see specs/03-thread-sessions-spec.md section 2.8.
+    my $g = eval { Almanac::Thread::cli_gate('almanac-todo', $argv_raw) };
+    if (my $gerr = $@) {
+        my $detail = (ref($gerr) eq 'Almanac::Store::Error' && defined $gerr->{detail}) ? $gerr->{detail} : 'error';
+        print STDERR 'almanac todo promote: ' . Almanac::Thread::gate_message($detail) . "\n";
+        die $gerr;
+    }
+    my ($promote_session, $promote_actor);
+    if ($g->{mode} eq 'ticket') {
+        $promote_session = $g->{session};
+        $promote_actor   = 'session';
+    } else {
+        $promote_session = undef;
+        $promote_actor   = 'cli';
+    }
+
+    Almanac::Thread::migrate_legacy(root => $o->{root}, home => $o->{home});
+
+    my $store = _open_store($scope, $o);
+    my $rec   = $store->read($id);
+
+    if (defined($rec->{fields}{status}) && $rec->{fields}{status} eq 'done') {
+        if (defined $rec->{fields}{promoted_to} && length $rec->{fields}{promoted_to}) {
+            my ($tname, $taskid) = split(m{/}, $rec->{fields}{promoted_to}, 2);
+            print "id: $rec->{id}\n";
+            print "scope: $scope\n";
+            print "thread: " . (defined $tname ? $tname : $thread_name) . "\n";
+            print "task: "   . (defined $taskid ? $taskid : '-') . "\n";
+            print "changed: no\n";
+            return;
+        }
+        die Almanac::Store::Error->new(kind => 'refused', detail => 'todo_not_open', path => $rec->{path});
+    }
+
+    my $proj_root = Almanac::Thread::project_root(root => $o->{root}, home => $o->{home});
+    my $existing_tasks = Almanac::Thread::tasks($thread_name, root => $o->{root}, home => $o->{home});
+    my ($found) = grep { defined $_->{from_todo} && $_->{from_todo} eq $id } @$existing_tasks;
+
+    my $task;
+    if ($found) {
+        $task = $found;
+    } else {
+        $task = Almanac::Thread::add_task($thread_name,
+            root => $o->{root}, home => $o->{home}, actor => $promote_actor,
+            (defined $promote_session ? (session => $promote_session) : ()),
+            title => $rec->{fields}{title}, (defined $rec->{body} ? (body => $rec->{body}) : ()),
+            from_todo => $id);
+    }
+
+    my %expect = (rev => $rec->{rev}, fields => $rec->{fields});
+    $expect{rev} = $o->{'expect-rev'} if exists $o->{'expect-rev'};
+    my $pointer_body = "Moved to thread $thread_name, task $task->{id}.\n";
+    $store->update($id, expect => \%expect,
+        set  => { status => 'done', completed_at => _now_iso(), promoted_to => "$thread_name/$task->{id}" },
+        body => $pointer_body);
+
+    print "id: $id\n";
+    print "scope: $scope\n";
+    print "thread: $thread_name\n";
+    print "task: $task->{id}\n";
+    print "changed: yes\n";
+
+    local $@;
+    my $res = eval { Almanac::GlobalCounts::refresh(home => $o->{home}, record_root => $proj_root) };
+    unless (ref($res) eq 'HASH' && $res->{ok}) {
+        my $reason = (ref($res) eq 'HASH' && defined $res->{reason}) ? $res->{reason} : 'unknown';
+        unless ($reason eq 'container') {
+            print STDERR "almanac: global counts snapshot not refreshed (reason: $reason)\n";
+            print STDERR "almanac-warning:\n";
+            print STDERR "  kind: global_counts_stale\n";
+            print STDERR "  reason: $reason\n";
+        }
+    }
+}
+
 # ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
 unless (caller) {
+    my @ARGV_RAW = @ARGV;
     binmode(STDOUT, ':encoding(UTF-8)');
 
     # Argv grammar (S2.2). Parsed in one pass over the WHOLE of @ARGV -- the
@@ -500,7 +611,7 @@ unless (caller) {
     my $ok = eval {
         _usage('missing_verb') unless defined $cmd && length $cmd;
 
-        my %VERBS = map { $_ => 1 } qw(create list show edit complete reopen delete count);
+        my %VERBS = map { $_ => 1 } qw(create list show edit complete reopen delete count promote);
         _usage('unknown_verb') unless $VERBS{$cmd};
 
         # Per-verb flag allowlist (redteam MEDIUM-3): an unknown flag --
@@ -515,6 +626,7 @@ unless (caller) {
             reopen   => [qw(expect-rev root home global project)],
             delete   => [qw(expect-rev root home global project)],
             count    => [qw(root home json global project)],
+            promote  => [qw(thread root home global project expect-rev)],
         );
         my %allowed = map { $_ => 1 } @{ $ALLOWED_FLAGS{$cmd} };
         for my $k (keys %o) {
@@ -525,7 +637,7 @@ unless (caller) {
         # MEDIUM-2): a bare --root/--home/--id/--tags/--body/--body-file/
         # --expect-rev silently becomes the sentinel '1' instead of erroring.
         # --title already has its own bespoke guard inside _cmd_create.
-        for my $k (qw(root home id tags body body-file expect-rev)) {
+        for my $k (qw(root home id tags body body-file expect-rev thread)) {
             _usage('missing_flag_value') if $bool_default{$k};
         }
 
@@ -542,6 +654,7 @@ unless (caller) {
         elsif ($cmd eq 'reopen')   { _cmd_reopen($scope, \%o, \@pos) }
         elsif ($cmd eq 'delete')   { _cmd_delete($scope, \%o, \@pos) }
         elsif ($cmd eq 'count')    { _cmd_count(\%o) }
+        elsif ($cmd eq 'promote')  { _cmd_promote($scope, \%o, \@pos, \@ARGV_RAW) }
 
         _maybe_refresh_global_counts($scope, \%o) if $GLOBAL_COUNTS_VERBS{$cmd};
         1;

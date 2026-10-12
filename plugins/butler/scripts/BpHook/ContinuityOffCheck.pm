@@ -35,6 +35,12 @@ my $SELF_DIR;
 require "$SELF_DIR/../BpHook.pm"
     unless grep { m{(?:^|/)BpHook\.pm$} } keys %INC;
 
+# @THREAD_GATED -- blueprint where-things-go, package 03-thread-sessions,
+# spec 2.9/2.7: every almanac-thread.pl write verb, mirrored exactly from
+# that script's own @GATED_VERBS (parity-tested by continuity-off-check.t).
+our @THREAD_GATED = qw(create archive archive-if-done add edit move reorder status
+                       add-packages event attach detach switch take-over);
+
 # ---------------------------------------------------------------------------
 # run($p) -> 0, always. Never denies, never prints.
 # ---------------------------------------------------------------------------
@@ -93,14 +99,47 @@ sub run {
         next unless defined $v0 && ($v0 eq 'set-status' || $v0 eq 'takeover');
         BpHook::write_ticket($p, 'almanac-bug', $argv, operator => 0, background => $background);
     }
+    # almanac-thread / almanac-todo (package 03, Decision 18 F6/F7): every
+    # thread-write verb and `todo promote` need the caller's identity, for
+    # the same reason almanac-bug's claim does.
+    my %thread_gated = map { $_ => 1 } @THREAD_GATED;
+    for my $argv (BpHook::invocations($cmd, 'almanac-thread')) {
+        next if ref $argv ne 'ARRAY';
+        next if grep { !defined $_ } @$argv;
+        my $v0 = $argv->[0];
+        next unless defined $v0 && $thread_gated{$v0};
+        BpHook::write_ticket($p, 'almanac-thread', $argv, operator => 0, background => $background);
+    }
+    for my $argv (BpHook::invocations($cmd, 'almanac-todo')) {
+        next if ref $argv ne 'ARRAY';
+        next if grep { !defined $_ } @$argv;
+        my $v0 = $argv->[0];
+        next unless defined $v0 && $v0 eq 'promote';
+        BpHook::write_ticket($p, 'almanac-todo', $argv, operator => 0, background => $background);
+    }
+
     for my $argv (BpHook::invocations($cmd, 'almanac')) {
         next if ref $argv ne 'ARRAY';
         next if grep { !defined $_ } @$argv;
-        next unless defined $argv->[0] && $argv->[0] eq 'bug';
-        my $v1 = $argv->[1];
-        next unless defined $v1 && ($v1 eq 'set-status' || $v1 eq 'takeover');
-        BpHook::write_ticket($p, 'almanac-bug', [ @{$argv}[1 .. $#$argv] ],
-                              operator => 0, background => $background);
+        my $v0 = $argv->[0];
+        if (defined $v0 && $v0 eq 'bug') {
+            my $v1 = $argv->[1];
+            next unless defined $v1 && ($v1 eq 'set-status' || $v1 eq 'takeover');
+            BpHook::write_ticket($p, 'almanac-bug', [ @{$argv}[1 .. $#$argv] ],
+                                  operator => 0, background => $background);
+        }
+        elsif (defined $v0 && $v0 eq 'thread') {
+            my $v1 = $argv->[1];
+            next unless defined $v1 && $thread_gated{$v1};
+            BpHook::write_ticket($p, 'almanac-thread', [ @{$argv}[1 .. $#$argv] ],
+                                  operator => 0, background => $background);
+        }
+        elsif (defined $v0 && $v0 eq 'todo') {
+            my $v1 = $argv->[1];
+            next unless defined $v1 && $v1 eq 'promote';
+            BpHook::write_ticket($p, 'almanac-todo', [ @{$argv}[1 .. $#$argv] ],
+                                  operator => 0, background => $background);
+        }
     }
 
     return 0;

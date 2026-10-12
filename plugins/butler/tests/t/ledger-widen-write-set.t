@@ -121,4 +121,46 @@ subtest 'a widened test file joins test_paths too; a non-test path does not' => 
     is($vrc, 0, 'the ledger still validates') or diag($vout);
 };
 
+subtest 'inflight-conflict detection survives a non-ASCII data dir (bug 20261001-234949-c44b)' => sub {
+    # Regression for bp-ledger.pl's _widen_check_inflight_conflict: a non-ASCII
+    # byte in the data dir (e.g. this host's own accented "Andre" profile
+    # segment, here constructed in-fixture rather than relied on from the
+    # environment) must not cause the in-flight-overlap check to silently miss
+    # a real conflict. Full mechanism + additional cases:
+    # plugins/butler/tests/t/ledger-nonascii-writeset-conflict.t.
+    my $ACCENT   = "\x{c3}\x{a9}"; # raw UTF-8 bytes for e-acute (Andr\xC3\xA9)
+    my $root     = tempdir(CLEANUP => 1);
+    my $data_dir = "$root/Andr${ACCENT}-widen-test";
+    my $other_dir = "Andr${ACCENT}-other-bp";
+    make_path("$data_dir/blueprints/own-bp/packages");
+    make_path("$data_dir/blueprints/$other_dir/packages");
+    make_path("$data_dir/.drive-solo");
+
+    my $own_ledger = "$data_dir/blueprints/own-bp/packages/01-own.md";
+    my ($rc1, $out1) = run_cli('create', '--ledger', $own_ledger, '--package', '01-own',
+                                '--blueprint', 'own-bp', '--template', $TEMPLATE,
+                                '--write-set', 'src/a.pl:t/a.t');
+    die "fixture: own ledger create failed ($rc1): $out1" unless $rc1 == 0;
+    open my $bw, '>:raw', "$data_dir/blueprints/own-bp/blueprint.md" or die $!;
+    print $bw "# own-bp\n\n## Decisions\n\n| # | Decision | Decided by | Date |\n|---|---|---|---|\n"
+            . "| 7 | Re-scope: package 01 also ships src/shared.pl. | driver | 2026-10-03 |\n";
+    close $bw;
+
+    my $other_ledger = "$data_dir/blueprints/$other_dir/packages/02-other.md";
+    my ($rc2, $out2) = run_cli('create', '--ledger', $other_ledger, '--package', '02-other',
+                                '--blueprint', 'other-bp', '--template', $TEMPLATE,
+                                '--write-set', 'src/shared.pl:t/shared.t');
+    die "fixture: other ledger create failed ($rc2): $out2" unless $rc2 == 0;
+
+    open my $ifh, '>:raw', "$data_dir/.drive-solo/inflight.json" or die $!;
+    print $ifh qq({"packages":[{"blueprint":"other-bp","package":"02-other",)
+             . qq("ledger":"blueprints/$other_dir/packages/02-other.md"}]});
+    close $ifh;
+
+    my ($rc, $out) = run_cli('widen-write-set', '--ledger', $own_ledger, '--decision', '7',
+                              '--path', 'src/shared.pl');
+    is($rc, 3, 'refused with exit 3: a genuine overlap under a non-ASCII data dir is still caught') or diag($out);
+    like($out, qr/overlap in-flight.*other-bp\/02-other/, 'names the conflicting in-flight package') or diag($out);
+};
+
 done_testing();

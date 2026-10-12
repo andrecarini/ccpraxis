@@ -253,18 +253,30 @@ sub mk_ledger {
 # implementer renamed it for exactly this reason. Two test-writers then
 # reintroduced the antipattern as @SUMMARY_KEYS within a day. Count-free names
 # only.
+#
+# Widened 17 -> 19 by package 13-dashboard-threads (where-things-go,
+# Decision 58 / test_paths widening): this file is one of the "4
+# regression-floor tests outside [package 13's original] test_paths" package
+# 08's reviewer flagged as pinning RunState's closed key set -- it calls the
+# REAL RunState::summarize_dir (never a hand-built literal), so it goes red
+# for the WRONG reason (a stale key COUNT) the moment RunState starts
+# emitting `thread`/`thread_events`, unless widened here in lockstep with
+# t/run-state.t's own widening. This is a MECHANICAL widening only: it adds
+# the two new keys to the closed set so this file's OWN AC1/AC28 assertions
+# (package 04/05's own done criteria, unrelated to package 13) keep meaning
+# what they always meant, rather than failing on an unrelated struct change.
 my @SUMMARY_KEYS = qw(
     blueprint runs_dir state orchestrator_pid orchestrator_alive orchestrator_started_at
     paused_manual paused_reason packages_total packages_done current_package
-    running_coordinators decisions_waiting decisions_operator decisions_triage packages
-    run_agents
+    running_coordinators escalations_waiting inbox_waiting triage_waiting packages
+    run_agents thread thread_events
 );
 my @PKG_KEYS = qw(name status attempt attempt_cap step steps_pending next_action agents);
 
 sub assert_summary_keys {
     my ($s, $label) = @_;
     ok(is_hashref($s), "$label: summary is a hashref") or return;
-    is_deeply([ sort keys %$s ], [ sort @SUMMARY_KEYS ], "$label: AC1 -- exactly the 17 S2.1 keys, no more, no fewer");
+    is_deeply([ sort keys %$s ], [ sort @SUMMARY_KEYS ], "$label: AC1 -- exactly the 19 S2.1+package-13 keys, no more, no fewer");
 }
 
 sub assert_pkg_shape {

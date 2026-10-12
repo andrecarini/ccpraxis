@@ -89,8 +89,33 @@ my @EXPECT = (
     { event => 'PostToolUse', matcher => 'Task|Agent|Bash',                             file => 'context-ceiling.sh',          args => '' },
     { event => 'SubagentStop',matcher => '',                                            file => 'track-dispatch.sh',           args => '' },
     { event => 'Stop',        matcher => '',                                            file => 'stop-gate.sh',                args => '' },
+    # never-halt package 06 (Decision 9/40): Notification/PermissionDenied
+    # record-only hooks, registered through the same guarded 2.2 template.
+    { event => 'Notification',      matcher => 'permission_prompt', file => 'record-prompt.sh', args => '' },
+    { event => 'PermissionDenied',  matcher => '',                  file => 'record-denial.sh', args => '' },
+    # never-halt package 07 (Decision 15, spec sec 2.10): denial-breaker.sh is
+    # registered 4x, no matcher, one new PostToolUseFailure top-level key, plus
+    # a SessionStart registration (FIX-3) resetting the per-session
+    # total_since offset so a resumed session isn't permanently falsely
+    # tripped.
+    { event => 'PreToolUse',          matcher => '', file => 'denial-breaker.sh', args => '' },
+    { event => 'PostToolUse',         matcher => '', file => 'denial-breaker.sh', args => '' },
+    { event => 'PostToolUseFailure',  matcher => '', file => 'denial-breaker.sh', args => '' },
+    { event => 'SessionStart',        matcher => '', file => 'denial-breaker.sh', args => '' },
+    # never-halt package 11 (Decision 43, N3): a new UserPromptSubmit route,
+    # no matcher, guarded 2.2 template, arm-nudge-prompt.sh.
+    { event => 'UserPromptSubmit',    matcher => '', file => 'arm-nudge-prompt.sh', args => '' },
+    # never-halt package 12 (Decision 43, N6/N1-now): a second, matcher-less
+    # SessionStart group, after denial-breaker.sh's, guarded 2.2 template,
+    # session-start-nudge.sh.
+    { event => 'SessionStart',        matcher => '', file => 'session-start-nudge.sh', args => '' },
+    # package 11-ac-loss-clean-suspend-cycle (tooling-backlog blueprint, spec
+    # sec 2.9): a new matcher-less PreToolUse group, guarded 2.2 template,
+    # ac-standdown-gate.sh -- the PreToolUse guard that refuses subagent tool
+    # calls while an AC-loss stand-down is in effect.
+    { event => 'PreToolUse',          matcher => '', file => 'ac-standdown-gate.sh', args => '' },
 );
-is(scalar(@EXPECT), 18, 'sanity: this file\'s own sec 2.3 fixture table has 18 rows');
+is(scalar(@EXPECT), 27, 'sanity: this file\'s own sec 2.3 fixture table has 27 rows (never-halt 06 adds 2, never-halt 07 adds 4, never-halt 11 adds 1, never-halt 12 adds 1, tooling-backlog package 11 adds 1)');
 
 sub expect_key { my ($r) = @_; return join("\x1e", $r->{event}, $r->{matcher}, $r->{file}, $r->{args}) }
 
@@ -127,7 +152,7 @@ if (ref $doc eq 'HASH' && ref $doc->{hooks} eq 'HASH') {
 my @expect_keys = sort map { expect_key($_) } @EXPECT;
 my @actual_keys = sort map { expect_key($_) } @actual;
 is_deeply(\@actual_keys, \@expect_keys,
-    'B1a: hooks.json\'s (event, matcher, file, args) multiset equals sec 2.3 exactly (18 commands)')
+    'B1a: hooks.json\'s (event, matcher, file, args) multiset equals sec 2.3 exactly (27 commands)')
     or diag("actual:\n" . join("\n", @actual_keys) . "\nexpected:\n" . join("\n", @expect_keys));
 
 is(scalar(@template_mismatches), 0,

@@ -37,6 +37,18 @@ use File::Path qw(make_path);
 use File::Basename qw(dirname);
 use Cwd qw(abs_path);
 
+# AC15 (08-blueprint-parks fix-batch, SF-3): pin HOME/USERPROFILE/
+# ALMANAC_HOME to an isolated tempdir before any production code loads, so
+# a fixture call that is ever unticketed cannot reach the operator's real
+# vault (Decision 29). Pure hardening -- this file names none of these vars
+# today.
+BEGIN {
+    my $env_pin = File::Temp::tempdir(CLEANUP => 1);
+    $ENV{HOME}         = $env_pin;
+    $ENV{USERPROFILE}  = $env_pin;
+    $ENV{ALMANAC_HOME} = $env_pin;
+}
+
 my $DIR       = dirname(abs_path(do { (my $f = __FILE__) =~ s{\\}{/}g; $f }));
 my $SCRIPTS   = "$DIR/../../scripts";
 my $LIFECYCLE = "$SCRIPTS/bp-lifecycle.pl";
@@ -233,8 +245,8 @@ sub run_bp_blueprint {
     my ($rc3, undef, $err3) = run_bp_blueprint('set-meta', '--file', $f3,
                                                '--field', 'status', '--value', 'bogus');
     is($rc3, 3, 'AC1: a genuinely unrecognised value still exits 3 (arg_error)');
-    like($err3, qr/expected one of:\s*drafting, audited, archived/,
-        'AC1: the unrecognised-value message lists exactly the three authored words');
+    like($err3, qr/expected one of:\s*drafting, audited, parked, archived/,
+        'AC1: the unrecognised-value message lists exactly the four authored words');
     unlike($err3, qr/running,\s*done|done,\s*archived\s*$/,
         'AC1: the unrecognised-value message is not the old 5-word list');
 
@@ -259,8 +271,8 @@ sub run_bp_blueprint {
 # ============================================================================
 {
     my $src = slurp($BLUEPRINT);
-    like($src, qr/\@BP_LIFECYCLE_AUTHORED\s*=\s*qw\(\s*drafting\s+audited\s+archived\s*\)/,
-        'AC2: @BP_LIFECYCLE_AUTHORED is exactly (drafting audited archived)');
+    like($src, qr/\@BP_LIFECYCLE_AUTHORED\s*=\s*qw\(\s*drafting\s+audited\s+parked\s+archived\s*\)/,
+        'AC2: @BP_LIFECYCLE_AUTHORED is exactly (drafting audited parked archived)');
     like($src, qr/\@BP_LIFECYCLE_DERIVED\s*=\s*qw\(\s*running\s+done\s*\)/,
         'AC2: @BP_LIFECYCLE_DERIVED is exactly (running done)');
     unlike($src, qr/qw\(\s*drafting\s+audited\s+running\s+done\s+archived\s*\)/,
@@ -486,6 +498,74 @@ sub run_bp_blueprint {
 }
 
 # ============================================================================
+# AC9 (08-blueprint-parks, DC4) -- B11+B12: BpState accepts authored 'parked'
+# and it beats a live run; BpState::norm_bp_status('parked') normalizes
+# cleanly. Exercised through bp-lifecycle.pl's real reconcile call (the one
+# production call site, AC4 above), plus one direct in-process BpState call
+# for the "$alive_fn dies, and is never even reached" half of B11, which
+# needs a seam reconcile's own subprocess boundary cannot offer.
+# ============================================================================
+{
+    # B11(i): a live runs/.orchestrator marker + a genuinely alive pid still
+    # reports 'parked', not 'running' -- parked beats a live run.
+    my $root = tempdir(CLEANUP => 1);
+    my $dir  = make_blueprint($root, 'ac9-parked-live',
+        status   => 'parked',
+        marker   => "$$\n",     # our own pid: genuinely alive
+        packages => [ { pkg => '01-a', ledger => 'pending', table => 'pending' } ],
+    );
+    my ($rc, $data) = run_lifecycle('reconcile', '--blueprint', 'ac9-parked-live',
+                                    '--data-dir', $root, '--no-archive');
+    is($data->[0]{lifecycle}, 'parked',
+        'B11(i): authored parked beats a live, genuinely-alive orchestrator marker');
+}
+{
+    # B11(iii): authored parked + every package delivered still reports
+    # 'parked', never advanced to 'done'.
+    my $root = tempdir(CLEANUP => 1);
+    my $dir  = make_blueprint($root, 'ac9-parked-all-done',
+        status   => 'parked',
+        packages => [ { pkg => '01-a', ledger => 'done', table => 'done' } ],
+    );
+    my ($rc, $data) = run_lifecycle('reconcile', '--blueprint', 'ac9-parked-all-done',
+                                    '--data-dir', $root, '--no-archive');
+    is($data->[0]{lifecycle}, 'parked',
+        'B11(iii): authored parked + all-delivered still reports parked, never derived to done');
+}
+{
+    # B11(ii): $alive_fn is never even CALLED for a parked blueprint, so a
+    # probe that dies cannot change the answer. This needs BpState directly
+    # in-process (reconcile's own alive-check is bp-lifecycle.pl's real pid
+    # probe, not an injectable seam), so it is loaded here rather than only
+    # driven as a subprocess as the rest of this file does.
+    my $BPSTATE_LOADED = do { local $@; eval { require $BPSTATE }; !$@ };
+    SKIP: {
+        skip 'BpState.pm does not load', 2 unless $BPSTATE_LOADED;
+        my $root = tempdir(CLEANUP => 1);
+        my $dir  = make_blueprint($root, 'ac9-parked-dying-probe',
+            status   => 'parked',
+            marker   => "$$\n",
+            packages => [],
+        );
+        my $probe_called = 0;
+        my $dying_probe = sub { $probe_called++; die "this probe must never run for a parked blueprint\n"; };
+        my $got = eval { BpState::blueprint_lifecycle($dir, $dying_probe) };
+        my $die = $@;
+        is($got, 'parked', 'B11(ii): blueprint_lifecycle still returns parked even though $alive_fn would die');
+        is($probe_called, 0, 'B11(ii): $alive_fn is never called at all for an authored-parked blueprint');
+    }
+}
+{
+    # B12: BpState::norm_bp_status accepts 'parked' and rejects a near-miss.
+    my $BPSTATE_LOADED = do { local $@; eval { require $BPSTATE }; !$@ };
+    SKIP: {
+        skip 'BpState.pm does not load', 2 unless $BPSTATE_LOADED;
+        is(BpState::norm_bp_status('parked'), 'parked', "B12: norm_bp_status('parked') returns 'parked'");
+        is(BpState::norm_bp_status('not-parked'), '', "B12: norm_bp_status('not-parked') returns ''");
+    }
+}
+
+# ============================================================================
 # AC8 (DC8) -- templates/skills stop describing running/done as authored, and
 # read the reconciler's derived field instead of the raw metadata block.
 # ============================================================================
@@ -493,8 +573,12 @@ sub run_bp_blueprint {
     my $tmpl = slurp($TEMPLATE);
     ok(defined $tmpl, 'AC8: blueprint template exists') or diag("expected $TEMPLATE");
     if (defined $tmpl) {
-        like($tmpl, qr/status:\s*drafting\s+#\s*drafting\s*\|\s*audited\s*\|\s*archived\b/,
-            "AC8: the template's status: comment lists only drafting | audited | archived");
+        # 08-blueprint-parks (spec §2.10) adds 'parked' to this list; updated
+        # here (fixture/assertion correction, not new behavior for AC8 itself)
+        # so this pre-existing check reflects the new, correct template shape
+        # instead of permanently failing against a stale expectation.
+        like($tmpl, qr/status:\s*drafting\s+#\s*drafting\s*\|\s*audited\s*\|\s*parked\s*\|\s*archived\b/,
+            "AC8: the template's status: comment lists drafting | audited | parked | archived");
         unlike($tmpl, qr/#\s*drafting\s*\|\s*audited\s*\|\s*running\s*\|\s*done\s*\|\s*archived/,
             'AC8: the template no longer lists running/done as authored options in the same comment');
     }

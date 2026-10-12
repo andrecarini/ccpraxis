@@ -1067,28 +1067,28 @@ sub _one_run_summary_cells {
     # ONLY WHAT NEEDS THE OPERATOR (operator, 2026-08-28: "panel should only
     # show what actually needs me").
     #
-    # decisions_waiting is the TOTAL, and it counts two different things: the
-    # decisions a human must make, and the ones an automated resolver is
+    # escalations_waiting is the TOTAL, and it counts two different things: the
+    # escalations a human must answer, and the ones an automated resolver is
     # expected to triage. Showing the total meant the panel raised its hand for
     # work nobody needed to look at -- and the resolver's queue moving on its
     # own made the number tick down for no reason the operator could see.
     #
-    # decisions_operator is that split's human half. FALLING BACK to the total
+    # inbox_waiting is that split's human half. FALLING BACK to the total
     # when the split is absent is deliberate and matches launcher.pl's own
     # _count_needs_you: a summary written by an older RunState has no split, and
     # erring toward "the operator owns it" is the safe direction -- silently
     # reporting zero would hide real work.
-    my $waiting = defined($s->{decisions_operator})
-                ? _nonneg_int($s->{decisions_operator})
-                : _nonneg_int($s->{decisions_waiting});
+    my $waiting = defined($s->{inbox_waiting})
+                ? _nonneg_int($s->{inbox_waiting})
+                : _nonneg_int($s->{escalations_waiting});
 
-    # decisions_triage is the automated-resolver half of the same split
+    # triage_waiting is the automated-resolver half of the same split
     # (RunState.pm:724). It rides in the SAME cell as the waiting count --
     # not a new column -- so the two figures sit adjacent and are visible
     # together; see spec S2.2.1 for why a sixth column/new line were both
     # rejected. Its own word ("triage") and its own role (text.muted) keep
-    # it distinguishable from decisions_operator's "N waiting" span.
-    my $triage = _nonneg_int($s->{decisions_triage});
+    # it distinguishable from inbox_waiting's "N waiting" span.
+    my $triage = _nonneg_int($s->{triage_waiting});
 
     my @waiting_cell = ( {
         text => ($waiting > 0 ? sprintf('%d waiting', $waiting) : ''),
@@ -1134,6 +1134,150 @@ sub _current_package_line {
     my $cp = $s->{current_package};
     return undef unless defined $cp && !ref($cp) && length $cp;
     return [ { text => '  cur ' . substr($cp, 0, 200), role => 'text.primary' } ];
+}
+
+# ===========================================================================
+# package 13-dashboard-threads (specs/13-dashboard-threads-spec.md S2.3): the
+# thread line beneath a blueprint's table row, and the pure owner-liveness
+# verdict it renders. RunState reports only evidence (activity_at, armed,
+# orchestrator alive/0/undef); the live/dead/unowned/unknown JUDGEMENT is
+# made HERE, at draw time, from a caller-supplied $now -- RunState's own
+# purity contract forbids it from reading a clock itself.
+# ===========================================================================
+
+# thread_owner_status(\%thread, $now) -> 'live'|'dead'|'unowned'|'unknown'.
+# PUBLIC, pure, total (spec S2.3). The 3600/46800 thresholds restate
+# Almanac::SessionLive::$IDLE_SECONDS / $ARMED_SECONDS.
+sub thread_owner_status {
+    my ($thread, $now) = @_;
+    return 'unowned' unless ref($thread) eq 'HASH';
+    my $state = $thread->{state};
+    my $owner = (ref($thread->{owner}) eq 'HASH') ? $thread->{owner} : {};
+    my $kind  = $owner->{kind};
+    my $kind_ok = defined($kind) && ($kind eq 'session' || $kind eq 'orchestrator');
+    return 'unowned' if (defined($state) && $state eq 'handed-off') || !$kind_ok;
+
+    if ($kind eq 'orchestrator') {
+        my $alive = $owner->{alive};
+        return 'live' if defined($alive) && $alive == 1;
+        return 'dead' if defined($alive) && $alive == 0;
+        return 'unknown';
+    }
+
+    # session: idle = now - activity_at, clamped at 0 (a future activity_at,
+    # i.e. clock skew, must never read as a negative idle -- spec S5 "Clock
+    # skew. now < activity_at clamps idle to 0, which gives live").
+    return 'unknown' unless _epoch($now) && _epoch($owner->{activity_at});
+    my $idle = $now - $owner->{activity_at};
+    $idle = 0 if $idle < 0;
+    return 'live' if $idle <= 3600;
+    return 'live' if $owner->{armed} && $idle <= 46800;
+    return 'dead';
+}
+
+# _label_spans(\%label, $role) -> \@spans (private). One span, built per spec
+# S2.3 "Label text": a link label is "<blueprint>/<number> <step>", a text
+# label is its title. Every piece is bounded with _bound_display.
+sub _label_spans {
+    my ($label, $role) = @_;
+    return [] unless ref($label) eq 'HASH';
+    if (defined($label->{kind}) && $label->{kind} eq 'link') {
+        my $bp   = _bound_display($label->{blueprint}, 200);
+        my $num  = _bound_display($label->{number}, 200);
+        my $step = _bound_display($label->{step}, 200);
+        $bp   = '' unless defined $bp;
+        $num  = '' unless defined $num;
+        my $text = "$bp/$num";
+        $text .= " $step" if defined($step) && length($step);
+        return [ { text => $text, role => $role } ];
+    }
+    my $title = _bound_display($label->{title}, 200);
+    $title = '' unless defined $title;
+    return [ { text => $title, role => $role } ];
+}
+
+# _thread_line($s, $now) -> \@spans | undef (private surface, called fully
+# qualified by the test oracle). undef when $s->{thread} is not a HASH. Spec
+# S2.3's row, in order; no rendered colon anywhere (no-rendered-colons.t), and
+# nothing elided -- the row is meant to WRAP through the panel's ordinary
+# word wrap rather than being truncated.
+sub _thread_line {
+    my ($s, $now) = @_;
+    return undef unless ref($s) eq 'HASH';
+    my $th = $s->{thread};
+    return undef unless ref($th) eq 'HASH';
+
+    my @spans;
+    push @spans, { text => '  thread ', role => 'text.muted' };
+    my $name = _bound_display($th->{name}, 200);
+    push @spans, { text => $name, role => 'accent' } if defined($name) && length($name);
+
+    my $total = (defined($th->{total}) && !ref($th->{total}) && $th->{total} =~ /\A\d+\z/) ? $th->{total} + 0 : 0;
+    my $done  = (defined($th->{done})  && !ref($th->{done})  && $th->{done}  =~ /\A\d+\z/) ? $th->{done}  + 0 : 0;
+    my $w = ($total < 10) ? $total : 10;
+    if ($w > 0) {
+        my $f = int($done * $w / $total);
+        $f = $w if $f > $w;
+        my $full  = Theme::glyph('gauge.full');
+        my $empty = Theme::glyph('gauge.empty');
+        $full  = '' unless defined $full;
+        $empty = '' unless defined $empty;
+        push @spans, { text => ' ', role => 'text.muted' };
+        push @spans, { text => ($full  x $f),        role => 'accent' }     if $f > 0;
+        push @spans, { text => ($empty x ($w - $f)), role => 'text.faint' } if ($w - $f) > 0;
+    }
+    push @spans, { text => " $done/$total", role => 'text.primary' };
+
+    my $doing   = (ref($th->{doing}) eq 'ARRAY') ? $th->{doing} : [];
+    my $current = (ref($th->{current}) eq 'HASH') ? $th->{current} : undef;
+    if (@$doing) {
+        push @spans, { text => '  doing ', role => 'text.muted' };
+        push @spans, @{ _label_spans($doing->[0], 'text.primary') };
+        my $k = scalar(@$doing) - 1;
+        push @spans, { text => " +$k", role => 'text.muted' } if $k > 0;
+    }
+    elsif (defined($current) && defined($current->{class}) && $current->{class} eq 'blocked') {
+        push @spans, { text => '  blocked ', role => 'state.warn' };
+        push @spans, @{ _label_spans($current, 'text.primary') };
+        if ((!defined($current->{kind}) || $current->{kind} eq 'text')
+            && defined($current->{waits_on}) && length($current->{waits_on})) {
+            my $wo = _bound_display($current->{waits_on}, 200);
+            push @spans, { text => ' waiting on ' . (defined($wo) ? $wo : ''), role => 'text.muted' };
+        }
+    }
+    else {
+        push @spans, { text => '  idle', role => 'text.muted' };
+    }
+
+    my $next = (ref($th->{next}) eq 'HASH') ? $th->{next} : undef;
+    if (defined $next) {
+        push @spans, { text => '  next ', role => 'text.muted' };
+        push @spans, @{ _label_spans($next, 'text.muted') };
+    }
+
+    my $owner = (ref($th->{owner}) eq 'HASH') ? $th->{owner} : {};
+    my $kind_text = (defined($owner->{kind}) && length($owner->{kind})) ? $owner->{kind} : 'none';
+    my $status = thread_owner_status($th, $now);
+    if ($status eq 'live') {
+        push @spans, { text => "  $kind_text ", role => 'text.muted' };
+        push @spans, { text => 'live', role => 'state.ok' };
+    }
+    elsif ($status eq 'dead') {
+        push @spans, { text => "  $kind_text ", role => 'text.muted' };
+        push @spans, { text => 'dead', role => 'state.crit' };
+    }
+    elsif ($status eq 'unknown') {
+        push @spans, { text => "  $kind_text ", role => 'text.muted' };
+        push @spans, { text => 'unknown', role => 'text.muted' };
+    }
+    elsif (defined($th->{state}) && $th->{state} eq 'handed-off') {
+        push @spans, { text => '  handed off', role => 'state.warn' };
+    }
+    else {
+        push @spans, { text => '  unowned', role => 'text.muted' };
+    }
+
+    return \@spans;
 }
 
 # _paused_reason_line($s) -> a spans row, or undef.
@@ -1610,6 +1754,10 @@ sub _run_summary_lines {
         push @out, $rows->[$i] if defined $rows->[$i];
         my $reason = _paused_reason_line($summaries[$i]);
         push @out, $reason if $reason;
+        # package 13-dashboard-threads (spec S2.3 Placement): the thread line
+        # comes after the paused-reason line and before `cur`.
+        my $thread_line = _thread_line($summaries[$i], $now);
+        push @out, $thread_line if $thread_line;
         my $cur = _current_package_line($summaries[$i]);
         push @out, $cur if $cur;
         push @out, @{ _tree_lines($summaries[$i], $now, $width) };
@@ -1698,7 +1846,7 @@ sub _run_body {
     # operator at all.
     my $ny = (defined($state->{needs_you}) && !ref($state->{needs_you}) && $state->{needs_you} =~ /^\d+$/) ? $state->{needs_you} : 0;
     if ($ny > 0) {
-        my $ny_row = row({ label => 'needs you', value => count_of($ny, "decision") . " waiting", role => 'state.warn' });
+        my $ny_row = row({ label => 'needs you', value => count_of($ny, "escalation") . " waiting", role => 'state.warn' });
         push @lines, $ny_row if @$ny_row;
     }
 
@@ -2145,6 +2293,11 @@ sub _blueprints_row_plan {
         }
         my $reason = _paused_reason_line($summaries[$i]);
         push @entries, { spans => $reason, pri => 2, kind => 'partial', parent => $run_i } if $reason;
+        # package 13-dashboard-threads (spec S2.3 Placement): reuses the
+        # `partial` kind rather than inventing an eleventh one; not pre-wrapped,
+        # mirroring the `cur` line, so AC1's plan/body equivalence holds.
+        my $thread_line = _thread_line($summaries[$i], $now);
+        push @entries, { spans => $thread_line, pri => 2, kind => 'partial', parent => $run_i } if $thread_line;
         my $cur = _current_package_line($summaries[$i]);
         push @entries, { spans => $cur, pri => 5, kind => 'cur', parent => $run_i } if $cur;
         _tree_plan_rows(\@entries, $summaries[$i], $now, $width, $run_i);

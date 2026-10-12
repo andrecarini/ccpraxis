@@ -2,11 +2,11 @@
 # butler-continuity.pl -- the one command for Decision 1's arm and disarm
 # triggers (package 04 of blueprint hook-continuity-remake).
 #
-#   butler-continuity on      [--role driver|reporter]
+#   butler-continuity on (--new-thread <name> | --thread <name>) [--role driver]
+#   butler-continuity on      --role reporter
 #   butler-continuity off     [--reason '<2+ words>'] [--token <8 hex>]
 #   butler-continuity silence  --reason '<2+ words>'  [--token <8 hex>]
 #   butler-continuity status
-#   butler-continuity ask      --text '<question>'
 #
 # Contract: .ccpraxis-local-data/blueprints/hook-continuity-remake/specs/
 # 04-continuity-command-spec.md. Architecture: docs/hook-architecture.md
@@ -22,25 +22,14 @@ use warnings;
 use FindBin qw($Bin);
 use JSON::PP ();
 use POSIX qw(strftime);
+use Cwd ();
 
 require "$Bin/BpHook.pm"
     unless grep { m{(?:^|/)BpHook\.pm$} } keys %INC;
 require "$Bin/BpContinuityLease.pm"
     unless grep { m{(?:^|/)BpContinuityLease\.pm$} } keys %INC;
 
-my $USAGE = q{usage: butler-continuity on [--role driver|reporter] | off [--reason '<why>'] [--token T] | silence --reason '<why>' [--token T] (escape hatch: use sparingly) | status | ask --text '<question>' | questions | answer --id <id> --answer '<text>'};
-
-# Almanac::Decision -- loaded lazily, only for ask/questions/answer (Decision
-# 108, spec sec 2.3). No spawn; a missing almanac plugin is a legible refusal.
-my $ALMANAC_DECISION_PL;
-sub _load_almanac_decision {
-    return 1 if grep { m{(?:^|/)almanac-decision\.pl$} } keys %INC;
-    $ALMANAC_DECISION_PL = "$Bin/../../almanac/scripts/almanac-decision.pl";
-    return 0 unless -f $ALMANAC_DECISION_PL;
-    local $@;
-    my $ok = eval { require $ALMANAC_DECISION_PL; 1 };
-    return $ok ? 1 : 0;
-}
+my $USAGE = q{usage: butler-continuity on --new-thread <name> | on --thread <name> [--role driver] | on --role reporter | off [--reason '<why>'] [--token T] | silence --reason '<why>' [--token T] (escape hatch: use sparingly) | status};
 
 sub _bytes {
     my ($s) = @_;
@@ -174,6 +163,43 @@ sub plan_after_off {
     return;
 }
 
+# thread_pl_path() -- blueprint where-things-go package 04 (spec sec 2.1): the
+# <TP> used by the "on" chart-now hint, the "off" open-tasks listing and R13.
+# Cwd::abs_path of almanac-thread.pl beside butler's own scripts dir,
+# forward-slashed; undef when the almanac plugin is not installed beside this
+# one (AC-16: a standalone copy of plugins/butler/scripts/).
+sub thread_pl_path {
+    my $p = Cwd::abs_path("$Bin/../../almanac/scripts/almanac-thread.pl");
+    return undef unless defined $p && length $p;
+    return undef unless -f $p;
+    $p =~ s{\\}{/}g;
+    return $p;
+}
+
+# _almanac_present() -- true iff Almanac::Thread.pm sits beside the almanac
+# plugin's scripts dir, next to this one (spec sec 2.2).
+sub _almanac_present {
+    my $p = Cwd::abs_path("$Bin/../../almanac/scripts/Almanac/Thread.pm");
+    return (defined $p && -f $p) ? 1 : 0;
+}
+
+# _load_thread() -- loads Almanac::Thread by MODULE NAME (never a path), via
+# a temporary @INC entry, so %INC keeps the key 'Almanac/Thread.pm' and
+# nothing is loaded twice (spec sec 2.2). Dies on failure; callers wrap it.
+sub _load_thread {
+    my $dir = "$Bin/../../almanac/scripts";
+    local @INC = ($dir, @INC);
+    require Almanac::Thread;
+    return 1;
+}
+
+sub _err_first_line {
+    my ($e) = @_;
+    my $s = (defined $e && length("$e")) ? "$e" : 'unknown error';
+    $s =~ s/\r?\n.*$//s;
+    return $s;
+}
+
 sub lease_sync {
     return if $ENV{CCPRAXIS_NO_WAKELOCK};
     my $ldir = BpContinuityLease::legacy_dir();
@@ -194,16 +220,28 @@ my @argv0 = @ARGV;    # the untouched copy, ticket key material
 my @args  = @ARGV;
 
 my $verb = shift @args;
-usage_die() unless defined $verb && $verb =~ /^(?:on|off|silence|status|ask|questions|answer)$/;
+
+# Hard cutover (blueprint where-things-go, package 01-inbox-rename, Decision
+# 2/6): a second front door onto the same store is retired, one line naming
+# the replacement, before the verb whitelist, flag parsing, the coordinator
+# step or the state-root step ever run -- no ticket consumed, no state dir
+# touched.
+my %RETIRED_VERBS = (
+    ask       => 'almanac inbox file',
+    questions => 'almanac inbox list',
+    answer    => 'almanac inbox answer',
+);
+if (defined $verb && exists $RETIRED_VERBS{$verb}) {
+    refuse("'butler-continuity $verb' is retired; use '$RETIRED_VERBS{$verb}' instead");
+}
+
+usage_die() unless defined $verb && $verb =~ /^(?:on|off|silence|status)$/;
 
 my %allowed = (
-    on        => { role => 1 },
+    on        => { role => 1, 'new-thread' => 1, thread => 1 },
     off       => { reason => 1, token => 1 },
     silence   => { reason => 1, token => 1 },
     status    => {},
-    ask       => { text => 1 },
-    questions => {},
-    answer    => { id => 1, answer => 1 },
 );
 
 my %flags;
@@ -234,6 +272,16 @@ if ($verb eq 'off' || $verb eq 'silence') {
     }
 }
 
+# NEW (off): --reason at most 200 UTF-8 bytes once sanitized (spec 2.3 step
+# 1, R10), checked right after the existing two-word check.
+if ($verb eq 'off' && exists $flags{reason} && defined $flags{reason}) {
+    my $san = sanitize_text($flags{reason});
+    utf8::encode($san) if utf8::is_utf8($san);
+    if (length($san) > 200) {
+        refuse("--reason is at most 200 bytes; it goes into the thread log.");
+    }
+}
+
 if (exists $flags{token}) {
     if (!defined $flags{token} || $flags{token} !~ /^[0-9a-f]{8}$/) {
         refuse("--token takes the 8-character token from the stop message.");
@@ -246,16 +294,20 @@ if (exists $flags{role}) {
     }
 }
 
-if ($verb eq 'ask') {
-    if (!defined $flags{text} || sanitize_text($flags{text}) eq '') {
-        refuse("ask needs --text '<question>'.");
+# NEW (on): --new-thread/--thread validation that needs no session binding
+# (spec 2.3 step 1, R2-R4).
+if ($verb eq 'on') {
+    if (exists $flags{'new-thread'} && exists $flags{thread}) {
+        refuse("on takes --new-thread <name> or --thread <name>, not both.");
     }
-}
-
-if ($verb eq 'answer') {
-    if (!defined $flags{id} || !length $flags{id}
-        || !defined $flags{answer} || sanitize_text($flags{answer}) eq '') {
-        refuse("answer needs --id <id> --answer '<text>'.");
+    for my $fn (qw(new-thread thread)) {
+        if (exists $flags{$fn} && !defined $flags{$fn}) {
+            refuse("a thread name is 1-64 lowercase letters, digits and hyphens, starting with a letter or digit.");
+        }
+    }
+    if (exists $flags{role} && $flags{role} eq 'reporter'
+        && (exists $flags{'new-thread'} || exists $flags{thread})) {
+        refuse("a reporter only reads threads; arm it with butler-continuity on --role reporter alone.");
     }
 }
 
@@ -270,24 +322,49 @@ if (defined $ENV{BP_LEDGER} && length $ENV{BP_LEDGER}) {
         out("continuity is on by construction for a coordinator; nothing to do.\n");
         exit 0;
     }
-    # status and ask run normally.
+    # status runs normally.
 }
 
 # ---------------------------------------------------------------------------
-# Step 3: state root (every verb except ask).
+# Step 2b: thread argument rule (NEW, on only; still nothing consumed).
 # ---------------------------------------------------------------------------
-my $ROOT;
-if ($verb ne 'ask' && $verb ne 'questions' && $verb ne 'answer') {
-    $ROOT = BpHook::state_dir();
-    unless (defined $ROOT) {
-        refuse("no continuity state directory (set HOME, or an absolute BUTLER_STATE_DIR).");
+my ($ALMANAC_PRESENT, $ON_THREAD_MODE, $ON_THREAD_NAME, $ON_ALMANAC_ABSENT_WARN) = (0, undef, undef, 0);
+if ($verb eq 'on') {
+    $ALMANAC_PRESENT = _almanac_present();
+    my $role = $flags{role} // 'manual';
+    if (exists $flags{'new-thread'}) { $ON_THREAD_MODE = 'new';    $ON_THREAD_NAME = $flags{'new-thread'} }
+    elsif (exists $flags{thread})    { $ON_THREAD_MODE = 'resume'; $ON_THREAD_NAME = $flags{thread} }
+
+    if ($ALMANAC_PRESENT) {
+        my $loaded = eval { _load_thread(); 1 };
+        unless ($loaded) {
+            refuse("could not load the almanac thread library (" . _err_first_line($@) . ").");
+        }
+        if (defined $ON_THREAD_MODE && !Almanac::Thread::valid_name($ON_THREAD_NAME)) {
+            refuse("a thread name is 1-64 lowercase letters, digits and hyphens, starting with a letter or digit.");
+        }
+        if (!defined $ON_THREAD_MODE && $role ne 'reporter') {
+            refuse("on needs a thread: butler-continuity on --new-thread <name> starts one; "
+                . "butler-continuity on --thread <name> resumes a handed-off one or takes over one whose owner is dead.");
+        }
     }
+    else {
+        $ON_ALMANAC_ABSENT_WARN = 1 if defined $ON_THREAD_MODE;
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Step 3: state root.
+# ---------------------------------------------------------------------------
+my $ROOT = BpHook::state_dir();
+unless (defined $ROOT) {
+    refuse("no continuity state directory (set HOME, or an absolute BUTLER_STATE_DIR).");
 }
 
 # ---------------------------------------------------------------------------
 # Step 4: binding (on, off, silence, status).
 # ---------------------------------------------------------------------------
-my ($SID, $AID, $OPERATOR_TICKET, $PROJECT, $TRANSCRIPT_PATH);
+my ($SID, $AID, $OPERATOR_TICKET, $PROJECT, $TRANSCRIPT_PATH, $TICKET_CWD);
 
 if ($verb eq 'on' || $verb eq 'off' || $verb eq 'silence' || $verb eq 'status') {
     my $t = BpHook::take_ticket('butler-continuity', \@argv0);
@@ -298,6 +375,7 @@ if ($verb eq 'on' || $verb eq 'off' || $verb eq 'silence' || $verb eq 'status') 
         $OPERATOR_TICKET  = (JSON::PP::is_bool($t->{operator}) && $t->{operator}) ? 1 : 0;
         $TRANSCRIPT_PATH  = $t->{transcript_path};
         $PROJECT          = project_of($t->{cwd});
+        $TICKET_CWD       = (defined $t->{cwd} && length $t->{cwd}) ? $t->{cwd} : undef;
 
         if (exists $flags{token} && defined $flags{token}) {
             my $s2 = BpHook::take_stop_token($flags{token});    # always consumed when given
@@ -344,13 +422,378 @@ sub _refuse_binding {
 # ---------------------------------------------------------------------------
 my $S8 = defined $SID ? substr($SID, 0, 8) : '?';
 
+# ---------------------------------------------------------------------------
+# Thread helpers that close over $SID/$TICKET_CWD/$TRANSCRIPT_PATH/$S8/
+# $ON_ALMANAC_ABSENT_WARN -- must sit after those are bound (Step 4) above.
+# ---------------------------------------------------------------------------
+
+# _thread_opts() -- every Almanac::Thread call passes cwd => $TICKET_CWD when
+# defined and non-empty, else nothing (Store's own root resolution, spec
+# 2.2).
+sub _thread_opts {
+    my %o;
+    $o{cwd} = $TICKET_CWD if defined $TICKET_CWD && length $TICKET_CWD;
+    return %o;
+}
+
+# _find_attached_thread(%O) -- like Almanac::Thread::attached_thread, but
+# DIES on a store error instead of swallowing it into undef (Decision 38 S1).
+# attached_thread() wraps its whole body in eval and always returns undef on
+# any failure, so a single malformed thread record anywhere in the project
+# makes it indistinguishable from "this session has no thread". list_threads()
+# does not swallow: Store::list() dies on a malformed record. Mirror
+# attached_thread()'s own live/session/owner filter on top of that so callers
+# can tell "no thread" (clean return, possibly undef) from "could not tell"
+# (die) and react differently.
+sub _find_attached_thread {
+    my (%O) = @_;
+    my $list = Almanac::Thread::list_threads(%O, archived => 0);
+    my @names;
+    for my $h (@$list) {
+        next unless defined($h->{state}) && $h->{state} eq 'live'
+                 && defined($h->{owner_kind}) && $h->{owner_kind} eq 'session'
+                 && defined($h->{owner_id}) && $h->{owner_id} eq $SID;
+        push @names, $h->{name};
+    }
+    return undef unless @names;
+    @names = sort @names;
+    return $names[0];
+}
+
+# _err_paren($e) -- "<kind>[: <detail>]" for R12-shaped messages.
+sub _err_paren {
+    my ($e) = @_;
+    my $kind   = (ref $e && defined $e->{kind}) ? $e->{kind} : 'error';
+    my $detail = (ref $e && defined $e->{detail} && length $e->{detail}) ? $e->{detail} : undef;
+    return defined $detail ? "$kind: $detail" : $kind;
+}
+
+sub _r8_refuse {
+    my ($y) = @_;
+    $y = '?' unless defined $y;
+    refuse("this session is already attached to thread $y; re-arm on it with butler-continuity on --thread $y, or hand it off first with butler-continuity off --reason '<why>'");
+}
+
+# _attach_refuse($name, $e) -- translates an Almanac::Thread::attach() die
+# into the matching refusal (R7, R8, R9, R11, else R12). Never returns.
+sub _attach_refuse {
+    my ($name, $e) = @_;
+    my $kind = ref($e) ? $e->{kind} : '';
+    if ($kind eq 'not_found') {
+        refuse("no thread $name in this project; start it with butler-continuity on --new-thread $name");
+    }
+    my $detail = ref($e) ? $e->{detail} : undef;
+    my $cause  = ref($e) ? $e->{cause}  : undef;
+    if (defined $detail && $detail eq 'thread_archived') {
+        refuse("thread $name is archived; start a new one with butler-continuity on --new-thread <name>");
+    }
+    if (defined $detail && $detail eq 'already_attached') {
+        _r8_refuse($cause);
+    }
+    if (defined $detail && $detail eq 'owner_live') {
+        my $c = defined $cause ? $cause : '?';
+        refuse("thread $name belongs to $c, which is still live; it cannot be taken over until its owner hands it off or goes idle.");
+    }
+    refuse("could not attach thread $name (" . _err_paren($e) . ").");
+}
+
+# _on_new_thread($name) -- spec 2.4.1.
+sub _on_new_thread {
+    my ($name) = @_;
+    my %O = _thread_opts();
+    my $mine = eval { _find_attached_thread(%O) };
+    if (my $e = $@) {
+        # Decision 38 S1: the store could not be listed, so we cannot confirm
+        # this session has no existing attachment. Refuse rather than risk a
+        # second live attachment for the same session (the one-thread-per-
+        # session invariant attached_thread()'s own swallow-to-undef broke).
+        refuse("could not attach thread $name (" . _err_paren($e) . ").");
+    }
+    _r8_refuse($mine) if defined $mine;
+
+    my $existing = eval { Almanac::Thread::read_thread($name, %O) };
+    if (my $e = $@) {
+        unless (ref($e) && $e->{kind} eq 'not_found') {
+            refuse("could not attach thread $name (" . _err_paren($e) . ").");
+        }
+    }
+    else {
+        if (defined $existing->{state} && $existing->{state} eq 'archived') {
+            refuse("thread $name is archived; start a new one with butler-continuity on --new-thread <name>");
+        }
+        refuse("thread $name already exists; resume it with butler-continuity on --thread $name");
+    }
+
+    my %cargs = (owner_kind => 'session', owner_id => $SID, actor => 'session', session => $SID, %O);
+    $cargs{owner_transcript} = $TRANSCRIPT_PATH if defined $TRANSCRIPT_PATH && length $TRANSCRIPT_PATH;
+    my $th = eval { Almanac::Thread::create_thread($name, %cargs) };
+    if (my $e = $@) {
+        if (ref($e) && $e->{kind} eq 'exists') {
+            refuse("thread $name already exists; resume it with butler-continuity on --thread $name");
+        }
+        refuse("could not attach thread $name (" . _err_paren($e) . ").");
+    }
+    if ($th->{owner_kind} ne 'session' || $th->{owner_id} ne $SID) {
+        my $y = Almanac::Thread::attached_thread(session => $SID, %O);
+        _r8_refuse($y);
+    }
+    return { name => $name, mode => 'created' };
+}
+
+# _try_attach($name, %aargs) -- (1, $th, $changed) on success, (0, $e) on a
+# die (the error object).
+sub _try_attach {
+    my ($name, %aargs) = @_;
+    my ($th, $changed) = eval { Almanac::Thread::attach($name, %aargs) };
+    return (1, $th, $changed) unless $@;
+    return (0, $@);
+}
+
+# _on_resume_thread($name) -- spec 2.4.2.
+sub _on_resume_thread {
+    my ($name) = @_;
+    my %O = _thread_opts();
+    my %aargs = (session => $SID, actor => 'session', %O);
+    $aargs{transcript} = $TRANSCRIPT_PATH if defined $TRANSCRIPT_PATH && length $TRANSCRIPT_PATH;
+
+    my ($ok, $th, $changed) = _try_attach($name, %aargs);
+    my $from;
+    unless ($ok) {
+        my $e = $th;
+        my $detail = ref($e) ? $e->{detail} : undef;
+        _attach_refuse($name, $e) unless defined $detail && $detail eq 'owner_dead';
+        $from = ref($e) ? $e->{cause} : undef;
+
+        my ($th2, $ch2) = eval { Almanac::Thread::take_over($name, %aargs, reason => 'previous owner is no longer live') };
+        if (my $e2 = $@) {
+            my $d2 = ref($e2) ? $e2->{detail} : undef;
+            if (defined $d2 && $d2 eq 'not_owned') {
+                my ($ok3, $th3) = _try_attach($name, %aargs);
+                if ($ok3) {
+                    ($th, $changed, $from) = ($th3, 1, undef);
+                }
+                else {
+                    my $e3 = $th3;
+                    my $d3 = ref($e3) ? $e3->{detail} : undef;
+                    if (defined $d3 && $d3 eq 'owner_dead') {
+                        refuse("could not attach thread $name (refused: not_owned).");
+                    }
+                    _attach_refuse($name, $e3);
+                }
+            }
+            else {
+                _attach_refuse($name, $e2);
+            }
+        }
+        else {
+            ($th, $changed) = ($th2, 1);
+        }
+    }
+
+    refuse("thread $name is archived; start a new one with butler-continuity on --new-thread <name>")
+        if defined $th->{state} && $th->{state} eq 'archived';
+    my $mode = defined $from ? 'taken-over' : ($changed ? 'resumed' : 'already');
+    return { name => $name, mode => $mode, from => $from };
+}
+
+sub _on_thread {
+    my ($mode, $name) = @_;
+    return $mode eq 'new' ? _on_new_thread($name) : _on_resume_thread($name);
+}
+
+sub _on_output {
+    my ($role, $th) = @_;
+    unless (defined $th) {
+        out("continuity on for session $S8 (role $role).\n");
+        if ($ON_ALMANAC_ABSENT_WARN) {
+            binmode(STDERR, ':raw');
+            print STDERR "butler-continuity: warning: almanac is not installed beside butler; armed without a thread.\n";
+        }
+        return;
+    }
+    my $name = $th->{name};
+    out("continuity on for session $S8 (role $role, thread $name).\n");
+    my %LINE = (
+        created      => "Thread $name created and attached to this session.\n",
+        resumed      => "Thread $name resumed.\n",
+        already      => "Thread $name is already attached to this session.\n",
+        'taken-over' => "Thread $name taken over from " . (defined $th->{from} ? $th->{from} : '?') . "; its owner is no longer live.\n",
+    );
+    out($LINE{ $th->{mode} });
+    out("Chart thread $name now: add a task for each step still ahead and mark the current one doing.\n");
+    my $TP = thread_pl_path();
+    out("  perl \"$TP\" show $name | add $name --title '<step>' | status $name <id> doing|blocked|done\n") if defined $TP;
+    return;
+}
+
+# _r13_title($title) -- R13's own truncation rule (spec 2.7: 60 chars).
+sub _r13_title {
+    my ($t) = @_;
+    my $s = sanitize_text($t);
+    $s = substr($s, 0, 57) . '...' if length($s) > 60;
+    return $s;
+}
+
+# _off_doing_gate() -- spec 2.5 step 1. Returns ($T, $broken): $T is the
+# attached thread name or undef; $broken is 0 when nothing went wrong, 1 when
+# the thread library failed to load, and 2 when the library loaded but the
+# thread store could not be listed (Decision 38 S1 -- a genuine store error,
+# distinct from "this session has no thread"). Steps 1 and 4 are both skipped
+# for either non-zero $broken; the caller prints a warning for each case.
+# Refuses R13 directly (exits) when an unlinked task is doing.
+sub _off_doing_gate {
+    return (undef, 0) unless _almanac_present();
+    my $loaded = eval { _load_thread(); 1 };
+    return (undef, 1) unless $loaded;
+    my %O = _thread_opts();
+    my $T = eval { _find_attached_thread(%O) };
+    return (undef, 2) if $@;
+    return (undef, 0) unless defined $T;
+    my $list = eval { Almanac::Thread::tasks($T, %O) };
+    my @tasks = (!$@ && ref $list eq 'ARRAY') ? @$list : ();
+    my @doing = grep { !$_->{linked} && defined $_->{status} && $_->{status} eq 'doing' } @tasks;
+    if (@doing) {
+        my $TP = thread_pl_path();
+        # Decision 38 M1: $TP is raw bytes from Cwd::abs_path; $names below is
+        # built through _r13_title -> sanitize_text, which returns a decoded
+        # (UTF8-flagged) Perl string even for pure-ASCII content. Concatenating
+        # flagged text with raw high-bit bytes in one string upgrades the raw
+        # bytes by reinterpreting each one as its own Latin-1 codepoint, which
+        # refuse()'s final _bytes()/utf8::encode() then double-encodes -- same
+        # bug class as _status_thread_line's fix above. Decode a copy of $TP so
+        # the whole message stays in one (decoded) representation until the
+        # _bytes() boundary.
+        my $TPd = $TP;
+        utf8::decode($TPd) if defined $TPd;
+        my $tail = defined $TPd ? "perl \"$TPd\" status $T $doing[0]{id} done|pending|blocked"
+                                 : "almanac thread status $T $doing[0]{id} done|pending|blocked";
+        my $names = join('; ', map { "$_->{id} " . _r13_title($_->{title}) } @doing);
+        refuse("off refused: thread $T still has a task doing: $names. Set each one done, pending or blocked first ($tail), then run off again.");
+    }
+    return ($T, 0);
+}
+
+# _off_open_tasks($T) -- spec 2.5 step 5 (replaces the retired
+# _print_n7_off / almanac-task.pl listing).
+sub _off_open_tasks {
+    my ($T) = @_;
+    my %O = _thread_opts();
+    my $list = eval { Almanac::Thread::tasks($T, %O) };
+    return if $@ || ref $list ne 'ARRAY';
+    my %OPEN = (pending => 1, blocked => 1);
+    my @open = grep { !$_->{linked} && defined $_->{status} && $OPEN{ $_->{status} } } @$list;
+    return unless @open;
+    out("Still open in thread $T; chart any that are stale now:\n");
+    my $shown = 0;
+    for my $t (@open) {
+        last if $shown >= 10;
+        my $title = sanitize_text($t->{title});
+        $title = substr($title, 0, 77) . '...' if length($title) > 80;
+        out("  $t->{id} $t->{status} $title\n");
+        $shown++;
+    }
+    if (@open > 10) {
+        out('  ... and ' . (scalar(@open) - 10) . " more\n");
+    }
+    my $TP = thread_pl_path();
+    out("  perl \"$TP\" status $T <id> pending|blocked|done|obsoleted\n") if defined $TP;
+    return;
+}
+
+# _off_hand_off($T, $reason) -- spec 2.5 step 4. Does nothing when $T is
+# undef. A hand-off failure degrades to a warning only (exit code untouched).
+sub _off_hand_off {
+    my ($T, $reason) = @_;
+    return unless defined $T;
+    my %O = _thread_opts();
+    my $th = eval {
+        Almanac::Thread::record_event($T, 'handed-off', session => $SID, actor => 'session',
+            reason => $reason, require_owner_session => $SID, %O);
+    };
+    if (my $e = $@) {
+        binmode(STDERR, ':raw');
+        print STDERR _bytes("butler-continuity: warning: thread $T was not handed off (" . _err_paren($e) . ").") . "\n";
+        return;
+    }
+    if (defined $th->{state} && $th->{state} eq 'archived') {
+        out("Thread $T handed off and archived: all its tasks are done.\n");
+        return;
+    }
+    out("Thread $T handed off; the reason is in its log.\n");
+    _off_open_tasks($T);
+    return;
+}
+
+# _is_doing_task($t) -- status's own "doing" predicate (spec 2.6): unlinked
+# status doing, or linked status running/converging/reviewing.
+sub _is_doing_task {
+    my ($t) = @_;
+    return 0 unless ref $t eq 'HASH';
+    if ($t->{linked}) {
+        return (defined $t->{status}
+            && ($t->{status} eq 'running' || $t->{status} eq 'converging' || $t->{status} eq 'reviewing')) ? 1 : 0;
+    }
+    return (defined $t->{status} && $t->{status} eq 'doing') ? 1 : 0;
+}
+
+sub _task_label {
+    my ($t) = @_;
+    if ($t->{linked}) {
+        return defined $t->{link} ? $t->{link} : '?';
+    }
+    my $s = sanitize_text($t->{title});
+    $s = substr($s, 0, 37) . '...' if length($s) > 40;
+    return $s;
+}
+
+# _status_thread_line() -- spec 2.6.
+sub _status_thread_line {
+    return 'thread: unknown' unless _almanac_present();
+    my $loaded = eval { _load_thread(); 1 };
+    return 'thread: unknown' unless $loaded;
+    my %O = _thread_opts();
+    # Decision 38 S1: attached_thread() never dies (it wraps its whole body in
+    # eval and maps any store error to undef), so the die-check below used to
+    # be dead code and a genuine store error printed "thread: none" instead of
+    # "thread: unknown". _find_attached_thread() surfaces the die.
+    my $T = eval { _find_attached_thread(%O) };
+    return 'thread: unknown' if $@;
+    return 'thread: none' unless defined $T;
+    my $tasks = eval { Almanac::Thread::tasks($T, %O) };
+    return 'thread: unknown' if $@;
+    my @t = (ref $tasks eq 'ARRAY') ? @$tasks : ();
+    my $n = scalar @t;
+    my $d = scalar grep { Almanac::Thread::is_done_task($_) } @t;
+    my $f = $n ? int($d * 10 / $n) : 0;
+    my $FULL  = "\xe2\x96\xb0";
+    my $EMPTY = "\xe2\x96\xb1";
+    # Decode these raw UTF-8 bytes to proper (UTF8-flagged) characters before
+    # interpolating them with $T/$doing_label/$next_label below -- those
+    # already come back UTF8-flagged from Almanac::Thread (via Encode::decode,
+    # see sanitize_text()'s comment above) even for pure-ASCII content.
+    # Concatenating a flagged operand with flag-off high-bit bytes upgrades
+    # the raw bytes by reinterpreting each one as its own Latin-1 codepoint,
+    # which out()'s final utf8::encode() then double-encodes.
+    utf8::decode($FULL);
+    utf8::decode($EMPTY);
+    my $bar = ($FULL x $f) . ($EMPTY x (10 - $f));
+    my @doing     = grep { _is_doing_task($_) } @t;
+    my @nextable  = grep { defined $_->{status} && $_->{status} eq 'pending' } @t;
+    my $doing_label = @doing
+        ? _task_label($doing[0]) . (@doing > 1 ? ' (+' . (scalar(@doing) - 1) . ')' : '')
+        : '-';
+    my $next_label = @nextable ? _task_label($nextable[0]) : '-';
+    return "thread: $T $bar $d/$n  doing: $doing_label  next: $next_label";
+}
+
 if ($verb eq 'on') {
     my $role = $flags{role} // 'manual';
+    my $th = ($ALMANAC_PRESENT && defined $ON_THREAD_MODE) ? _on_thread($ON_THREAD_MODE, $ON_THREAD_NAME) : undef;
     my $ok = BpHook::arm($SID, role => $role, by => 'on', transcript_path => $TRANSCRIPT_PATH);
     unless ($ok) {
         refuse("could not write continuity state (" . (BpHook::last_error() // '') . ").");
     }
-    out("continuity on for session $S8 (role $role).\n");
+    _on_output($role, $th);
     lease_sync();
     exit 0;
 }
@@ -368,6 +811,8 @@ if ($verb eq 'off') {
         refuse("off needs --reason '<why>' unless the operator typed /butler:continuity off.");
     }
 
+    my ($T, $broken) = _off_doing_gate();
+
     my $was_armed = BpHook::is_armed($SID);
     my $plan_ldir   = BpContinuityLease::legacy_dir();
     my $live_before = defined $plan_ldir ? (BpContinuityLease::any_active($plan_ldir) ? 1 : 0) : 0;
@@ -379,6 +824,21 @@ if ($verb eq 'off') {
 
     my $note = $was_armed ? '' : '; was not armed';
     out("continuity off for session $S8 (actor $actor$note); reason logged.\n");
+    if ($broken && $broken == 1) {
+        binmode(STDERR, ':raw');
+        print STDERR "butler-continuity: warning: the almanac thread library did not load; no thread was handed off.\n";
+    }
+    elsif ($broken && $broken == 2) {
+        # Decision 38 S1: the store could not be listed, so we cannot confirm
+        # whether a thread is attached. Fail loud rather than silently
+        # disarming with no hand-off and no signal (the never-trap design is
+        # kept: the session still disarms; only the hand-off is skipped).
+        binmode(STDERR, ':raw');
+        print STDERR "butler-continuity: warning: the thread store could not be read; no thread was handed off.\n";
+    }
+    else {
+        _off_hand_off($T, $reason);
+    }
     unless ($logged) {
         binmode(STDERR, ':raw');
         print STDERR "butler-continuity: warning: reason log not written.\n";
@@ -481,6 +941,8 @@ if ($verb eq 'status') {
         push @lines, "session $S8: not armed";
     }
 
+    push @lines, _status_thread_line();
+
     my $h = BpHook::holder($SID);
     if (defined $h && BpHook::holder_live($SID, {})) {
         my $items = (ref $h->{items} eq 'ARRAY')
@@ -533,86 +995,6 @@ if ($verb eq 'status') {
     push @lines, "wake-lock: $wl";
 
     out(join("\n", @lines) . "\n");
-    exit 0;
-}
-
-if ($verb eq 'ask' || $verb eq 'questions' || $verb eq 'answer') {
-    unless (_load_almanac_decision()) {
-        refuse("almanac plugin not found ($ALMANAC_DECISION_PL).");
-    }
-}
-
-# _project_display() -- the project directory to show the operator, derived
-# from the open decision store's own root (which ends in one fixed suffix
-# component, then the almanac data directory) with those two trailing path
-# segments peeled off generically -- never by naming that data directory's
-# path literally in this file (Q17).
-sub _project_display {
-    my $root = eval { Almanac::Decision::open_decisions()->root };
-    return '-' unless defined $root && length $root;
-    $root =~ s{/[^/]+\z}{};
-    $root =~ s{/[^/]+\z}{};
-    return length($root) ? $root : '-';
-}
-
-if ($verb eq 'ask') {
-    my $title = sanitize_text($flags{text});
-
-    my $rec = eval { Almanac::Decision::file(title => $title) };
-    if (my $e = $@) {
-        my $kind = (ref $e && exists $e->{kind}) ? $e->{kind} : 'error';
-        refuse("cannot reach the decision store ($kind).");
-    }
-    my $list = eval { Almanac::Decision::list_decisions() } || [];
-    my $n = scalar(grep { defined $_->{fields}{status} && $_->{fields}{status} eq 'unanswered' } @$list);
-    my $project = _project_display();
-    out("queued pending decision $rec->{id} ($n waiting) in $project\n");
-    exit 0;
-}
-
-if ($verb eq 'questions') {
-    my $list = eval { Almanac::Decision::list_decisions() };
-    if (my $e = $@) {
-        my $kind = (ref $e && exists $e->{kind}) ? $e->{kind} : 'error';
-        refuse("cannot reach the decision store ($kind).");
-    }
-    $list = [] unless ref $list eq 'ARRAY';
-    my @unanswered = grep { defined $_->{fields}{status} && $_->{fields}{status} eq 'unanswered' } @$list;
-
-    my $project = _project_display();
-
-    my @lines;
-    for my $rec (@unanswered) {
-        my $title   = sanitize_text($rec->{fields}{title});
-        my $created = defined $rec->{fields}{created} ? $rec->{fields}{created} : '';
-        push @lines, "- $rec->{id} [$created] $title";
-    }
-    push @lines, scalar(@unanswered) . " waiting in $project";
-    out(join("\n", @lines) . "\n");
-    exit 0;
-}
-
-if ($verb eq 'answer') {
-    my $id  = $flags{id};
-    my $ans = sanitize_text($flags{answer});
-
-    my ($rec, $changed) = eval { Almanac::Decision::answer($id, answer => $ans) };
-    if (my $e = $@) {
-        my $kind = (ref $e && exists $e->{kind}) ? $e->{kind} : 'error';
-        if ($kind eq 'not_found') {
-            refuse("no pending decision $id in " . _project_display() . '.');
-        }
-        if ($kind eq 'usage' && ref($e) && defined($e->{detail}) && $e->{detail} eq 'already_answered') {
-            refuse("decision $id is already answered.");
-        }
-        refuse("cannot reach the decision store ($kind).");
-    }
-    if ($changed) {
-        out("answered $id: $rec->{fields}{title}\n");
-    }
-    else {
-        out("$id already answered; nothing changed\n");
-    }
     exit 0;
 }
 

@@ -49,7 +49,7 @@ use JSON::PP;
 use File::Temp qw(tempdir);
 use File::Path qw(make_path);
 
-my $script = "$Bin/../../scripts/bp-answer-decision.pl";
+my $script = "$Bin/../../scripts/bp-answer-escalation.pl";
 require $script;
 
 my $J = JSON::PP->new->canonical;

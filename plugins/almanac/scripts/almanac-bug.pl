@@ -58,21 +58,38 @@ use Cwd ();
 # directory. __FILE__ is this file wherever it was loaded from, so `perl -c`
 # from the repo root, `perl -c` from plugins/almanac/tests/, a CLI run and a
 # `do` all resolve the same module.
+# This BEGIN block was never hit by bug 75fe's doubled-join defect -- it
+# only unshifts $dir onto @INC and loads Almanac::Lock via bareword
+# `use Module ();`, which resolves through perl's own @INC search rather
+# than a manual string-concatenated require path, so a relative $dir
+# already worked. __FILE__ is still resolved through Cwd::abs_path here,
+# defensively and for consistency with the scripts that did have the
+# defect (almanac-doctor.pl, almanac-inbox.pl), not because this block
+# needed the fix. (almanac-bug.pl's separate _butler_module_path()
+# instance further down DID have the defect and is fixed for that reason
+# -- see the comment there.)
 BEGIN {
-    my $dir = __FILE__;
+    my $dir = Cwd::abs_path(__FILE__);
     $dir =~ s{\\}{/}g;
     $dir =~ s{/[^/]+\z}{};
     $dir = '.' unless length $dir;
     unshift @INC, $dir;
 }
 use Almanac::Lock ();
+use Almanac::SessionLive ();
+use Almanac::PackageLink ();
 
 # Set by _write_atomic on every failure, cleared at its entry. cas_write
 # reports it rather than a bare "write failed", so a rename that exhausted its
 # retry deadline is named as that.
 our $LAST_ERROR = '';
 
-our @STATES = qw(open triaging taken resolved declined);
+# RENAME (blueprint where-things-go, package 07-bug-lifecycle, Decision 8):
+# taken -> scheduled, resolved -> fixed, declined -> dropped. `scheduled`
+# carries a validated <blueprint>/<package> link (package 02's
+# Almanac::PackageLink); `fixed` is reached ONLY by reconcile, never by hand;
+# `dropped` requires a reason. See specs/07-bug-lifecycle-spec.md section 2.1.
+our @STATES = qw(open triaging scheduled fixed dropped);
 
 # Closed vocabulary for `severity`. `unknown` is IN it — it is the script's own
 # default (see `file`'s `$o{severity} // 'unknown'`), and an enum that rejected
@@ -80,19 +97,23 @@ our @STATES = qw(open triaging taken resolved declined);
 our @SEVERITIES = qw(low medium high blocker unknown);
 sub valid_severity { my ($s) = @_; return scalar grep { $_ eq $s } @SEVERITIES }
 our %NEXT = (
-    open     => [qw(triaging declined)],
-    triaging => [qw(taken open declined)],   # back to open = "not ready, keep editing"
-    taken    => [qw(resolved declined)],
-    resolved => [],
-    declined => [],
+    open      => [qw(triaging dropped)],
+    triaging  => [qw(scheduled open dropped)],   # back to open = "not ready, keep editing"
+    scheduled => [qw(fixed dropped)],
+    fixed     => [],
+    dropped   => [],
 );
 # Content is editable ONLY in these states.
 our %MUTABLE = (open => 1);
 # On-disk legacy name -> current name. Applied ONLY on read (AlmanacBug::load);
-# the bytes on disk are never batch-rewritten (spec sec 2.2).
-our %LEGACY_STATUS = (reviewing => 'triaging');
-# A triaging claim older than this (seconds) is stale (spec sec 2.6). 24h.
-our $CLAIM_STALE_SECONDS = 86400;
+# the bytes on disk are never batch-rewritten (spec sec 2.2). `taken` is
+# deliberately NOT here -- it cannot be mapped to `scheduled` without a
+# package link, so it is migrated by `reconcile`, never by a mere read.
+our %LEGACY_STATUS = (reviewing => 'triaging', resolved => 'fixed', declined => 'dropped');
+# A triaging claim's staleness is judged by Almanac::SessionLive (blueprint
+# where-things-go, package 03-thread-sessions, spec 2.11): transcript
+# activity within an idle threshold, or a longer armed threshold while an
+# arm record exists -- never by claimed_at age alone.
 
 sub _now { time }
 sub _iso { my @t = gmtime($_[0] // time);
@@ -239,7 +260,9 @@ sub _render {
     my @order = qw(id title status severity area project created_at updated_at
                    frozen_at content_sha256 claimant_session claimant_agent
                    claimant_transcript_path claimed_at
-                   taken_over_from taken_over_at taken_over_reason taken_at resolution);
+                   taken_over_from taken_over_at taken_over_reason taken_at package
+                   package_root scheduled_at fixed_at fixed_commit migrated_from
+                   resolution);
     my %seen;
     my @lines;
     # Structural backstop: no field value may carry \r or \n, regardless of
@@ -328,45 +351,14 @@ sub load {
     return $p;
 }
 
-# _transcript_visibility($path) -> ($root_visible, $file_exists)
-#
-# FIX (S2 / red-team M1, package 12 fix-batch): a recorded transcript_path is
-# an ABSOLUTE path captured by whichever process held the claim at claim time
-# (host or sandbox). Checking it from a DIFFERENT process (a sandbox checking
-# a host claim, or vice versa -- plugins/sandbox/scripts/launcher.pl's mount
-# scope never gives a container the host's transcripts, and never the
-# reverse) must not read "I cannot see it" as "it is gone": that is exactly
-# what made a live host claim read STALE from inside a sandbox, and `takeover`
-# then succeeded wrongly, stealing an active claim.
-#
-# The distinguishing signal is the transcript's ROOT directory (the
-# "<...>/projects" directory the session file sits two levels under -- see
-# BpSession::transcript_roots). A DIFFERENT mount scope means that whole root
-# does not exist from here at all. A genuinely deleted transcript, checked
-# from the SAME scope that wrote it, still has its root -- only the specific
-# file is gone. So: root missing -> indeterminate (caller falls back to the
-# age-only rule); root present but file missing -> genuinely stale.
-sub _transcript_visibility {
-    my ($path) = @_;
-    return (0, 0) unless defined $path && length $path;
-    (my $p = $path) =~ s{\\}{/}g;
-    (my $root = $p) =~ s{/[^/]+/[^/]+\z}{};
-    my $root_visible = length($root) && -d $root;
-    my $file_exists  = -f $path;
-    return ($root_visible, $file_exists);
-}
-
 # claim_state($fields, $now) -> undef | { stale => 0|1, reason => $str_or_undef }
 #
 # undef when the (already-migrated) status is not 'triaging'. Lives here, not
 # in almanac-doctor.pl, so doctor stays within its AC21 static constraints
-# (spec sec 2.6/2.9). Dies if BpSession.pm cannot be loaded for a LEGACY claim
-# (one recorded before claimant_transcript_path existed) -- there is no
-# age-only fallback for that case (spec sec 1.2): a claim's liveness is never
-# guessed by a process that has no way to check it at all. A claim that DOES
-# carry claimant_transcript_path never takes this path -- see
-# _transcript_visibility above for why an invisible root is not the same
-# finding as an absent file.
+# (spec sec 2.6/2.9). NEVER DIES (blueprint where-things-go, package
+# 03-thread-sessions, spec 2.11): staleness is judged entirely by
+# Almanac::SessionLive, which never loads butler and never dies, so a claim's
+# liveness is always answerable even with butler absent or unreachable.
 sub claim_state {
     my ($f, $now) = @_;
     return undef unless defined $f->{status} && $f->{status} eq 'triaging';
@@ -377,54 +369,53 @@ sub claim_state {
     }
 
     my $tpath = $f->{claimant_transcript_path};
-    if (defined $tpath && length $tpath) {
-        my ($root_visible, $file_exists) = _transcript_visibility($tpath);
-        if ($root_visible && !$file_exists) {
-            return { stale => 1, reason => "claimant session $csess has no transcript on this machine" };
-        }
-        # Root not visible from here -> indeterminate: fall through to the
-        # age-only rule below without consulting BpSession at all. Root
-        # visible and file present -> live by transcript; also fall through,
-        # so the age rule still applies on top (a transcript can be present
-        # and still 25h old).
-    }
-    else {
-        my $bpsession_path = _butler_module_path('BpSession.pm');
-        unless (defined $bpsession_path && -f $bpsession_path) {
-            die "cannot load butler's BpSession.pm ($bpsession_path): file not found\n";
-        }
-        unless (grep { m{(?:^|/)BpSession\.pm$} } keys %INC) {
-            my $ok = eval { require $bpsession_path; 1 };
-            die "cannot load butler's BpSession.pm ($bpsession_path): $@" unless $ok;
-        }
-        my $transcript = eval { BpSession::find_transcript($csess) };
-        if (!defined $transcript) {
-            return { stale => 1, reason => "claimant session $csess has no transcript on this machine" };
-        }
-    }
 
+    my $since;
     my $claimed_at = $f->{claimed_at};
-    my $claimed_epoch;
     if (defined $claimed_at && $claimed_at =~ /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})Z$/) {
-        $claimed_epoch = eval { require Time::Local; Time::Local::timegm($6, $5, $4, $3, $2 - 1, $1) };
-    }
-    unless (defined $claimed_epoch) {
-        return { stale => 1, reason => 'claimed_at missing or unreadable' };
+        $since = eval { require Time::Local; Time::Local::timegm($6, $5, $4, $3, $2 - 1, $1) };
     }
 
-    my $age = $now - $claimed_epoch;
-    if ($age > $CLAIM_STALE_SECONDS) {
-        return { stale => 1, reason => 'claim is ' . int($age / 3600) . 'h old (stale after 24h)' };
+    my $v = Almanac::SessionLive::judge(session => $csess, transcript_path => $tpath, since => $since, now => $now);
+
+    return { stale => 0 } if $v->{state} eq 'alive';
+    return { stale => 1, reason => 'claimed_at missing or unreadable' } if $v->{state} eq 'unknown';
+
+    my $basis = $v->{basis};
+    if ($basis eq 'no-transcript') {
+        return { stale => 1, reason => "claimant session $csess has no transcript on this machine" };
     }
-    return { stale => 0 };
+    if ($basis eq 'idle') {
+        my $n = int(($v->{idle} // 0) / 60);
+        my $i = int($Almanac::SessionLive::IDLE_SECONDS / 60);
+        return { stale => 1, reason => "claimant session $csess has been idle ${n}m (dead after ${i}m)" };
+    }
+    if ($basis eq 'armed-idle') {
+        my $n = int(($v->{idle} // 0) / 60);
+        my $a = int($Almanac::SessionLive::ARMED_SECONDS / 60);
+        return { stale => 1, reason => "claimant session $csess is armed but has been idle ${n}m (dead after ${a}m)" };
+    }
+    if ($basis eq 'since') {
+        my $n = int(($v->{idle} // 0) / 60);
+        my $a = int($Almanac::SessionLive::ARMED_SECONDS / 60);
+        return { stale => 1, reason => "claim is ${n}m old and its transcript is not visible here (dead after ${a}m)" };
+    }
+    if ($basis eq 'bad-session') {
+        return { stale => 1, reason => "claimant session $csess is not a valid session id" };
+    }
+    return { stale => 1, reason => 'claimed_at missing or unreadable' };
 }
 
 # _butler_module_path($basename) -> absolute path of a butler scripts module,
 # located from THIS FILE's own directory (spec sec 1.2), same technique the
-# BEGIN block above already uses for Almanac::Lock.
+# BEGIN block above already uses for Almanac::Lock. __FILE__ is resolved
+# through Cwd::abs_path first for the same reason as that BEGIN block: a
+# relative __FILE__ would leave this path relative too, and a later
+# `require $bphook_path` of a non-absolute, non-./-prefixed path is looked
+# up via @INC rather than cwd (bug 75fe's doubled-join shape).
 sub _butler_module_path {
     my ($basename) = @_;
-    my $dir = __FILE__;
+    my $dir = Cwd::abs_path(__FILE__);
     $dir =~ s{\\}{/}g;
     $dir =~ s{/[^/]+\z}{};
     $dir = '.' unless length $dir;
@@ -713,6 +704,271 @@ sub can_transition {
     return (1, '');
 }
 
+# =============================================================================
+# RECONCILE (blueprint where-things-go, package 07-bug-lifecycle, spec sec
+# 2.3/2.5-2.9). Everything below is read-only EXCEPT reconcile() and
+# _reconcile_report() themselves, which are the only writers added by this
+# package. report_root/link_root/package_verdict/ledger_commits/
+# migration_link never write, never die, take no lock -- almanac-doctor.pl
+# calls them directly (spec sec 2.11).
+# =============================================================================
+
+# report_root($report_path) -> the project root a report lives in: the path
+# with the trailing /.ccpraxis-local-data/bug-reports/<file>.md removed.
+sub report_root {
+    my ($report_path) = @_;
+    return undef unless defined $report_path;
+    (my $p = $report_path) =~ s{\\}{/}g;
+    $p =~ s{/\.ccpraxis-local-data/bug-reports/[^/]+\z}{};
+    return $p;
+}
+
+# link_root(\%fields, $report_path) -> $fields{package_root} when set, else
+# report_root($report_path) (spec sec 2.3, edge case 1).
+sub link_root {
+    my ($f, $report_path) = @_;
+    return $f->{package_root} if defined $f->{package_root} && length $f->{package_root};
+    return report_root($report_path);
+}
+
+# package_verdict(\%fields, $report_path) -> undef | \%v -- spec sec 2.3.
+# undef unless the report's status is 'scheduled'.
+sub package_verdict {
+    my ($f, $report_path) = @_;
+    return undef unless defined $f->{status} && $f->{status} eq 'scheduled';
+    my $root = link_root($f, $report_path);
+    my $link = $f->{package};
+    if (!defined $link || !length $link) {
+        return { link => $link, root => $root, ledger => undef, location => undef,
+                 status => undef, verdict => 'invalid' };
+    }
+    my $r = Almanac::PackageLink::resolve($link, root => $root);
+    my $verdict;
+    if ($r->{state} eq 'invalid') { $verdict = 'invalid' }
+    elsif ($r->{state} eq 'missing') { $verdict = 'missing' }
+    elsif (defined $r->{status} && grep { $r->{status} eq $_ } qw(done parked dropped)) { $verdict = $r->{status} }
+    else { $verdict = 'active' }
+    return { link => $link, root => $root, ledger => $r->{ledger}, location => $r->{location},
+             status => $r->{status}, verdict => $verdict };
+}
+
+# ledger_commits($ledger_path) -> @shas -- spec sec 2.6. Never dies; () on any
+# read failure, missing/empty '## Outputs' section, or no recognisable sha.
+sub ledger_commits {
+    my ($ledger_path) = @_;
+    my $raw = _read_file($ledger_path);
+    return () unless defined $raw;
+    my @lines = split /\r?\n/, $raw;
+    my $in_section = 0;
+    my (@shas, %seen);
+    for my $ln (@lines) {
+        if ($ln =~ /^##\s+Outputs\s*$/) { $in_section = 1; next }
+        if ($in_section && $ln =~ /^#{1,2}\s/) { $in_section = 0; next }
+        next unless $in_section;
+        if ($ln =~ /^\s*(?:[-*]\s+)?`?commit:\s*([0-9a-fA-F]{7,64})(?![0-9A-Za-z])/) {
+            my $sha = lc $1;
+            push @shas, $sha unless $seen{$sha}++;
+        }
+    }
+    return @shas;
+}
+
+# migration_link(\%fields, $root) -> ($link, undef) | (undef, $reason) -- spec
+# sec 2.7. Only meaningful when $fields{status} eq 'taken'. Source text is
+# $fields{resolution} only; the body is never parsed.
+sub migration_link {
+    my ($f, $root) = @_;
+    return (undef, 'its note names no package')
+        unless defined $f->{status} && $f->{status} eq 'taken';
+    my $note = $f->{resolution};
+    return (undef, 'its note names no package') unless defined $note && length $note;
+
+    my (@candidates, %seen_cand);
+    while ($note =~ /\bscheduled\s+as\s+([A-Za-z0-9][A-Za-z0-9._-]*)(?:\/|\s+)([A-Za-z0-9][A-Za-z0-9._-]*)/gi) {
+        my ($bp, $pkg) = ($1, $2);
+        $bp  =~ s/[._-]+\z//;
+        $pkg =~ s/[._-]+\z//;
+        my $candidate;
+        if ($pkg =~ /\A\d{1,3}\z/) {
+            my $ids = Almanac::PackageLink::package_ids($bp, root => $root)->{ids} // [];
+            my @m = grep { /\A(\d+)-/ && $1 == $pkg } @$ids;
+            $candidate = (@m == 1) ? "$bp/$m[0]" : "\0NUMBER_UNMATCHED\0$bp\0$pkg";
+        } else {
+            $candidate = "$bp/$pkg";
+        }
+        push @candidates, $candidate unless $seen_cand{$candidate}++;
+    }
+    return (undef, 'its note names no package') unless @candidates;
+    if (@candidates > 1) {
+        my @shown = map { my $c = $_; $c =~ s/\0NUMBER_UNMATCHED\0([^\0]+)\0([^\0]+)/$1 $2/; $c } @candidates;
+        return (undef, 'its note names more than one package (' . join(', ', @shown) . ')');
+    }
+    my $c = $candidates[0];
+    if ($c =~ /\A\0NUMBER_UNMATCHED\0([^\0]+)\0([^\0]+)\z/) {
+        return (undef, "its note names package number $2 of $1, which matches no single package there");
+    }
+    my $r = Almanac::PackageLink::resolve($c, root => $root);
+    if ($r->{state} eq 'invalid') {
+        return (undef, "its note names '$c', which is not a valid <blueprint>/<package> link");
+    }
+    if ($r->{state} eq 'missing') {
+        return (undef, "its note names $c, which resolves to no package ledger under $root");
+    }
+    return ($c, undef);
+}
+
+# flag_text(%o) -> text -- spec sec 2.8. %o: kind, id (the report's own id,
+# used for the embedded <id> in the suggested command), link, root, reason.
+sub flag_text {
+    my (%o) = @_;
+    my ($kind, $id, $link, $root, $reason) = @o{qw(kind id link root reason)};
+    if ($kind eq 'parked') {
+        return "PACKAGE PARKED: $link is parked -- this report will not be fixed by it until it "
+             . "is unparked; or drop it: almanac-bug.pl set-status $id --to dropped --note \"<why>\"";
+    }
+    if ($kind eq 'dropped') {
+        return "PACKAGE DROPPED: $link was dropped -- drop this report with a reason, or file a "
+             . "new one against the package that will fix it: almanac-bug.pl set-status $id --to "
+             . "dropped --note \"<why>\"";
+    }
+    if ($kind eq 'missing') {
+        return "PACKAGE MISSING: $link has no ledger under $root/.ccpraxis-local-data/blueprints/ "
+             . "or its _archive/";
+    }
+    if ($kind eq 'invalid') {
+        my $shown = (defined $link && length $link) ? $link : '';
+        return "PACKAGE LINK INVALID: '$shown' is not a <blueprint>/<package> link";
+    }
+    if ($kind eq 'done') {
+        return "PACKAGE DONE: $link is done but this report is not yet marked fixed -- run: "
+             . "almanac-bug.pl reconcile --project \"$root\"";
+    }
+    if ($kind eq 'unmigrated') {
+        return "UNMIGRATED: status 'taken' predates 'scheduled', and $reason -- schedule it by "
+             . "hand: almanac-bug.pl set-status $id --to scheduled --package <blueprint>/<package> --repair";
+    }
+    return '';
+}
+
+# _reconcile_candidate($rep) -> 1|0 -- spec sec 2.5 step 2. The on-disk status
+# (legacy_status, when present, else the already-mapped status) is one of
+# taken/resolved/declined, or the (mapped) status is scheduled.
+sub _reconcile_candidate {
+    my ($rep) = @_;
+    my $st = $rep->{legacy_status} // $rep->{fields}{status} // '';
+    return 1 if grep { $_ eq $st } qw(taken resolved declined);
+    return 1 if $st eq 'scheduled';
+    return 0;
+}
+
+# _reconcile_report($p, $root, \@changes, \@flags, \@busy) -- spec sec 2.5.
+# Does the migration + fix work for ONE report path, inside the caller's
+# eval. Never dies on purpose (every PackageLink/ledger call here already
+# never dies); a die here is a genuine bug and is left to propagate to the
+# caller's eval, which simply skips this report.
+sub _reconcile_report {
+    my ($p, $root, $changes, $flags, $busy) = @_;
+
+    my $pre = load($p);
+    return unless $pre;
+    return if $pre->{duplicate_key};
+    my ($pre_ok) = verify($pre);
+    return unless $pre_ok;
+    return unless _reconcile_candidate($pre);
+
+    my ($lock, $lock_err) = Almanac::Lock->acquire($p, verb => 'reconcile', timeout_ms => 0);
+    unless ($lock) {
+        push @$busy, { id => $pre->{fields}{id}, path => $p };
+        return;
+    }
+
+    my $rep = load($p);
+    unless ($rep && !$rep->{duplicate_key}) { $lock->release; return }
+    my ($ok) = verify($rep);
+    unless ($ok) { $lock->release; return }
+    unless (_reconcile_candidate($rep)) { $lock->release; return }
+
+    my $id  = $rep->{fields}{id};
+    my %f   = %{ $rep->{fields} };
+    my $on_disk = $rep->{legacy_status} // $f{status} // '';
+    my $now = _iso(time);
+    my $changed = 0;
+
+    if ($on_disk eq 'resolved') {
+        $f{status} = 'fixed';
+        $f{migrated_from} = 'resolved';
+        $changed = 1;
+        push @$changes, { id => $id, path => $p, from => 'resolved', to => 'fixed',
+                           package => undef, commits => [], migrated => 1 };
+    }
+    elsif ($on_disk eq 'declined') {
+        $f{status} = 'dropped';
+        $f{migrated_from} = 'declined';
+        $f{resolution} = 'migrated from declined (no reason recorded)'
+            unless defined $f{resolution} && $f{resolution} =~ /\S/;
+        $changed = 1;
+        push @$changes, { id => $id, path => $p, from => 'declined', to => 'dropped',
+                           package => undef, commits => [], migrated => 1 };
+    }
+    elsif ($on_disk eq 'taken') {
+        my ($link, $reason) = migration_link(\%f, $root);
+        if (defined $link) {
+            $f{status} = 'scheduled';
+            $f{package} = $link;
+            $f{package_root} = $root;
+            $f{scheduled_at} = $now;
+            $f{migrated_from} = 'taken';
+            $changed = 1;
+            push @$changes, { id => $id, path => $p, from => 'taken', to => 'scheduled',
+                               package => $link, commits => [], migrated => 1 };
+        }
+        else {
+            push @$flags, { id => $id, path => $p, kind => 'unmigrated',
+                             text => flag_text(kind => 'unmigrated', id => $id, reason => $reason) };
+        }
+    }
+
+    if (($f{status} // '') eq 'scheduled') {
+        my $v = package_verdict(\%f, $p);
+        if ($v && $v->{verdict} eq 'done') {
+            $f{status} = 'fixed';
+            $f{fixed_at} = $now;
+            my @commits = ledger_commits($v->{ledger});
+            $f{fixed_commit} = join(' ', @commits) if @commits;
+            $changed = 1;
+            push @$changes, { id => $id, path => $p, from => 'scheduled', to => 'fixed',
+                               package => $f{package}, commits => \@commits, migrated => 0 };
+        }
+        elsif ($v && grep { $v->{verdict} eq $_ } qw(parked dropped missing invalid)) {
+            push @$flags, { id => $id, path => $p, kind => $v->{verdict},
+                             text => flag_text(kind => $v->{verdict}, id => $id,
+                                                link => $v->{link}, root => $v->{root}) };
+        }
+        # 'active' -> nothing.
+    }
+
+    if ($changed) {
+        $f{updated_at} = $now;
+        my ($cas_ok) = cas_write($rep, _render(\%f, $rep->{body}));
+        push @$busy, { id => $id, path => $p } unless $cas_ok;
+    }
+    $lock->release;
+    return;
+}
+
+# reconcile($root) -> \%result -- spec sec 2.5/2.9. Scope is EXACTLY
+# list_reports_in($root) -- never another project's reports, never creates
+# anything but lock sidecars. Each report is handled inside its own eval so
+# one bad report cannot stop the rest.
+sub reconcile {
+    my ($root) = @_;
+    my (@changes, @flags, @busy);
+    for my $p (sort(list_reports_in($root))) {
+        eval { _reconcile_report($p, $root, \@changes, \@flags, \@busy) };
+    }
+    return { changes => \@changes, flags => \@flags, busy => \@busy };
+}
+
 package main;
 use strict;
 use warnings;
@@ -859,7 +1115,7 @@ sub _caller_identity {
     # transcript_path (S2 / red-team M1, package 12 fix-batch): recorded on
     # the claim so a LATER check of its liveness can tell "this transcript is
     # genuinely gone" apart from "this process cannot see that mount scope at
-    # all" -- see claim_state's and _transcript_visibility's headers. Not
+    # all" -- see claim_state's and Almanac::SessionLive::judge's headers. Not
     # validated beyond "a defined, non-ref, non-empty string" -- it is never a
     # CLI value, only ever what the hook ticket itself recorded (BpHook.pm's
     # write_ticket, from the PreToolUse payload), and _render's structural
@@ -893,6 +1149,22 @@ sub _claimant_mismatch_message {
     return "almanac-bug $verb: refused — '$id' is triaging and claimed by session $cs$agent_part "
          . "since $f->{claimed_at}; only the claimant may move it. If the claim is stale, "
          . "'almanac-bug.pl takeover $id' takes it over.\n";
+}
+
+# _refuse_if_tampered($verb, $id, $rep, $lock) -- spec sec 2.1. Verifies the
+# body digest of an already-loaded report and, on mismatch, refuses loudly
+# (naming the report and the verb) before the caller does anything else with
+# it. Returns only when the report is intact or not frozen; writes nothing,
+# under any path.
+sub _refuse_if_tampered {
+    my ($verb, $id, $rep, $lock) = @_;
+    my ($intact, $note) = AlmanacBug::verify($rep);
+    return if $intact;
+    print STDERR "almanac-bug $verb: refused — '$id' $note. Its body changed after it was "
+               . "frozen, outside this script; nothing was written. Run "
+               . "'almanac-bug.pl verify' to list every tampered report.\n";
+    $lock->release;
+    exit 2;
 }
 
 sub _slurp_arg {
@@ -941,6 +1213,16 @@ unless (caller) {
     # checked once here, uniformly, for every command -- not per-command.
     _reject_multiline($cmd || 'almanac-bug', 'project', $root);
     _reject_untrimmed($cmd || 'almanac-bug', 'project', $root);
+
+    # AUTOMATIC RECONCILE (spec sec 2.9): every verb that reads or writes a
+    # report reconciles THIS PROJECT'S reports first -- silently, writing
+    # nothing to STDOUT/STDERR and never affecting the verb's own exit code.
+    # Loading this script with `do`/`require` (tests, almanac-doctor.pl) never
+    # reaches this line at all, since it lives inside `unless (caller)`. The
+    # usage path (unknown/empty $cmd) does not reconcile.
+    if (grep { $cmd eq $_ } qw(file append update set-status takeover list collect verify)) {
+        eval { AlmanacBug::reconcile($root) };
+    }
 
     if ($cmd eq 'file') {
         my $title = $o{title} or die "almanac-bug file: --title is required\n";
@@ -1016,6 +1298,7 @@ unless (caller) {
         die "almanac-bug update: '$id' has MALFORMED: duplicate frontmatter key "
           . "'$rep->{duplicate_key}' — refusing to operate on a possibly-forged report\n"
             if $rep->{duplicate_key};
+        _refuse_if_tampered('update', $id, $rep, $lock);
         _race_test_hook($lock);
         my $st   = $rep->{fields}{status} // 'open';
         unless ($AlmanacBug::MUTABLE{$st}) {
@@ -1111,6 +1394,7 @@ unless (caller) {
         die "almanac-bug append: '$id' has MALFORMED: duplicate frontmatter key "
           . "'$rep->{duplicate_key}' — refusing to operate on a possibly-forged report\n"
             if $rep->{duplicate_key};
+        _refuse_if_tampered('append', $id, $rep, $lock);
         _race_test_hook($lock);
         my $st = $rep->{fields}{status} // 'open';
         unless ($AlmanacBug::MUTABLE{$st}) {
@@ -1154,6 +1438,45 @@ unless (caller) {
                        . "renamed: use --to triaging\n";
             exit 2;
         }
+        # spec sec 2.4 step 1 (blueprint where-things-go, package
+        # 07-bug-lifecycle, Decision 8): the three bug-lifecycle names
+        # retired by the taken/resolved/declined -> scheduled/fixed/dropped
+        # rename, each refused with its own hint, before anything else.
+        if ($to eq 'taken') {
+            print STDERR "almanac-bug set-status: unknown target state 'taken' -- it was "
+                       . "replaced: use --to scheduled --package <blueprint>/<package>\n";
+            exit 2;
+        }
+        if ($to eq 'resolved') {
+            print STDERR "almanac-bug set-status: unknown target state 'resolved' -- it was "
+                       . "replaced by 'fixed', which reconcile sets when the scheduled package "
+                       . "is done\n";
+            exit 2;
+        }
+        if ($to eq 'declined') {
+            print STDERR "almanac-bug set-status: unknown target state 'declined' -- it was "
+                       . "replaced: use --to dropped --note \"<reason>\"\n";
+            exit 2;
+        }
+
+        # spec sec 2.4 step 2: `fixed` is ALWAYS refused by hand -- with or
+        # without --repair, before the identity check, regardless of the
+        # report's current status. The legal edge scheduled -> fixed in %NEXT
+        # is exercised by reconcile only.
+        if ($to eq 'fixed') {
+            print STDERR "almanac-bug set-status: refused -- 'fixed' is set only by reconcile, "
+                       . "when the package a scheduled report names is done. Run "
+                       . "'almanac-bug.pl reconcile'.\n";
+            exit 2;
+        }
+
+        # spec sec 2.4 step 3: --package applies only to --to scheduled.
+        if (defined $o{package} && $to ne 'scheduled') {
+            print STDERR "almanac-bug set-status: --package applies only to --to scheduled\n";
+            exit 2;
+        }
+        _reject_multiline('set-status', 'package', $o{package}) if defined $o{package} && !ref $o{package};
+        _reject_untrimmed('set-status', 'package', $o{package}) if defined $o{package} && !ref $o{package};
 
         my $path = $find->($id) or die "almanac-bug set-status: no report '$id'\n";
 
@@ -1171,6 +1494,7 @@ unless (caller) {
         die "almanac-bug set-status: '$id' has MALFORMED: duplicate frontmatter key "
           . "'$rep->{duplicate_key}' — refusing to operate on a possibly-forged report\n"
             if $rep->{duplicate_key};
+        _refuse_if_tampered('set-status', $id, $rep, $lock);
         _race_test_hook($lock);
         _reject_multiline('set-status', 'note', $o{note}) if defined $o{note} && !ref $o{note};
         _reject_untrimmed('set-status', 'note', $o{note}) if defined $o{note} && !ref $o{note};
@@ -1236,6 +1560,46 @@ unless (caller) {
         }
         unless ($ok) { print STDERR "almanac-bug set-status: $why\n"; $lock->release; exit 2 }
 
+        # spec sec 2.4 step 5: target `scheduled` requires a --package that
+        # resolves to an existing ledger (live or _archive/), validated AFTER
+        # the transition is known legal, BEFORE any write.
+        my $pkg_link;
+        if ($to eq 'scheduled') {
+            $pkg_link = (defined $o{package} && !ref $o{package}) ? $o{package} : undef;
+            unless (defined $pkg_link && length $pkg_link) {
+                print STDERR "almanac-bug set-status: --to scheduled requires --package "
+                           . "<blueprint>/<package>\n";
+                $lock->release;
+                exit 2;
+            }
+            my ($bp, $pkg) = Almanac::PackageLink::parse($pkg_link);
+            unless (defined $bp) {
+                print STDERR "almanac-bug set-status: '$pkg_link' is not a <blueprint>/<package> link\n";
+                $lock->release;
+                exit 2;
+            }
+            my $r = Almanac::PackageLink::resolve($pkg_link, root => $root);
+            if ($r->{state} eq 'missing') {
+                print STDERR "almanac-bug set-status: refused -- $pkg_link resolves to no package "
+                           . "ledger under $root/.ccpraxis-local-data/blueprints/ (live or "
+                           . "_archive/). Run this from the project that owns the blueprint, or "
+                           . "pass --project <that root>.\n";
+                $lock->release;
+                exit 2;
+            }
+        }
+
+        # spec sec 2.4 step 6: target `dropped` requires a non-blank --note.
+        if ($to eq 'dropped') {
+            my $note = $o{note};
+            unless (defined $note && !ref($note) && $note =~ /\S/) {
+                print STDERR "almanac-bug set-status: --to dropped requires --note \"<reason>\" "
+                           . "(a dropped report must say why)\n";
+                $lock->release;
+                exit 2;
+            }
+        }
+
         my %f = %{ $rep->{fields} };
         my $now = AlmanacBug::_iso(time);
         $f{status} = $to;
@@ -1246,8 +1610,12 @@ unless (caller) {
             $f{content_sha256} //= AlmanacBug::body_digest($rep->{body});
             $f{frozen_at}      //= $now;
         }
-        $f{taken_at}   = $now       if $to eq 'taken' && !defined $f{taken_at};
         $f{resolution} = $o{note}   if defined $o{note} && !ref $o{note};
+        if ($to eq 'scheduled') {
+            $f{package}      = $pkg_link;
+            $f{package_root} = $root;
+            $f{scheduled_at} = $now;
+        }
 
         # Claim fields (spec sec 2.4 step 4). $id_who_or_msg is a hashref here
         # whenever $to eq 'triaging' -- the identity-required check above
@@ -1272,7 +1640,7 @@ unless (caller) {
             delete $f{taken_over_at};
             delete $f{taken_over_reason};
         }
-        # taken/declined from triaging: claim fields are KEPT untouched.
+        # scheduled/dropped from triaging: claim fields are KEPT untouched.
         my ($cas_ok, $cas_why) = AlmanacBug::cas_write($rep, AlmanacBug::_render(\%f, $rep->{body}));
         unless ($cas_ok) {
             print STDERR "almanac-bug set-status: refused — '$id' $cas_why. "
@@ -1282,7 +1650,42 @@ unless (caller) {
         }
 
         $lock->release;
-        print "$id: $from -> $to" . (($from_known ? '' : '  (repaired: previous status was outside the state machine)')) . "\n";
+        print "$id: $from -> $to"
+            . ($to eq 'scheduled' ? " (package $pkg_link)" : '')
+            . (($from_known ? '' : '  (repaired: previous status was outside the state machine)')) . "\n";
+        exit 0;
+    }
+
+    # reconcile [--project ROOT] (spec sec 2.9) -- calls AlmanacBug::reconcile
+    # ONCE (it is not also auto-run -- the grep list above names every OTHER
+    # verb, not this one) and prints its result. Exit 0 always: flags are not
+    # failures, and package 10's gatherer depends on that (Q25).
+    if ($cmd eq 'reconcile') {
+        my $res = AlmanacBug::reconcile($root);
+        for my $c (@{ $res->{changes} }) {
+            if ($c->{from} eq 'scheduled' && $c->{to} eq 'fixed') {
+                my $commit_part = @{ $c->{commits} }
+                    ? 'commit ' . join(' ', @{ $c->{commits} })
+                    : 'no commit recorded';
+                print "$c->{id}: scheduled -> fixed (package $c->{package}, $commit_part)\n";
+            }
+            elsif ($c->{from} eq 'taken') {
+                print "$c->{id}: taken -> scheduled (package $c->{package}, migrated)\n";
+            }
+            elsif ($c->{from} eq 'resolved') {
+                print "$c->{id}: resolved -> fixed (migrated)\n";
+            }
+            elsif ($c->{from} eq 'declined') {
+                print "$c->{id}: declined -> dropped (migrated)\n";
+            }
+        }
+        for my $fl (@{ $res->{flags} }) {
+            print "!! $fl->{id}: $fl->{text}\n";
+        }
+        for my $b (@{ $res->{busy} }) {
+            print "!! $b->{id}: busy (locked by another writer) -- not reconciled; re-run\n";
+        }
+        print 'reconciled ' . scalar(@{ $res->{changes} }) . " change(s) in $root\n";
         exit 0;
     }
 
@@ -1306,6 +1709,7 @@ unless (caller) {
         die "almanac-bug takeover: '$id' has MALFORMED: duplicate frontmatter key "
           . "'$rep->{duplicate_key}' — refusing to operate on a possibly-forged report\n"
             if $rep->{duplicate_key};
+        _refuse_if_tampered('takeover', $id, $rep, $lock);
         _race_test_hook($lock);
 
         my $f      = $rep->{fields};
@@ -1317,13 +1721,8 @@ unless (caller) {
             exit 2;
         }
 
-        # FIX (S1, package 12 fix-batch): claim_state can die (a legacy claim
-        # with no claimant_transcript_path, and butler's BpSession.pm missing
-        # or unloadable) -- that used to propagate uncaught, exiting 255 with
-        # no "refused" message at all. Same refusal style as every other exit
-        # here (print to STDERR, release the lock, exit 2) rather than a raw
-        # crash; the message names the same failure list/collect already
-        # surface for this exact die (see the `list`/`collect` loader above).
+        # claim_state (package 03-thread-sessions, spec 2.11) never dies; the
+        # eval here is kept defensive against any future change that does.
         my $cstate = eval { AlmanacBug::claim_state($f, time) };
         if (!defined $cstate && $@) {
             print STDERR "almanac-bug takeover: refused — cannot check claim liveness: $@";
@@ -1336,8 +1735,8 @@ unless (caller) {
             my $agent_part = (defined $ca && length $ca) ? " (agent $ca)" : '';
             print STDERR "almanac-bug takeover: refused — '$id' is claimed by session "
                        . "$cs$agent_part since $f->{claimed_at}, and that claim is live (its "
-                       . "transcript is present and it is under 24h old). Only a stale claim can "
-                       . "be taken over.\n";
+                       . "session shows transcript activity within the liveness threshold). "
+                       . "Only a stale claim can be taken over.\n";
             $lock->release;
             exit 2;
         }
@@ -1398,21 +1797,40 @@ unless (caller) {
             });
         }
         my @out;
+        my @tampered;   # [ id-or-path, path ] for every tampered report LOADED,
+                        # even one a --status filter would otherwise exclude
+                        # (spec sec 2.3) -- the digest check runs before the filter.
+        my @unreadable; # paths that look like a report (start with a frontmatter
+                        # envelope) but failed to load at all (red-team M2) --
+                        # distinct from a plain .md with no envelope, which is not
+                        # a report and stays quietly skipped, same as `verify`.
         for my $p (@paths) {
             next unless -f $p;
-            my $rep = $read_only_load->($p) or next;
+            my $rep = $read_only_load->($p);
+            unless ($rep) {
+                my $raw = AlmanacBug::_read_file($p);
+                push @unreadable, $p if defined $raw && $raw =~ /\A---\r?\n/;
+                next;
+            }
             my $f = $rep->{fields};
-            next if defined $o{status} && !ref $o{status} && ($f->{status}//'') ne $o{status};
             my $integrity;
             if ($rep->{duplicate_key}) {
                 # A duplicate key makes the frontmatter untrustworthy -- surface
-                # it, don't vanish the row, and skip the (irrelevant once this
-                # is set) digest check.
+                # it, don't vanish the row. FIX (red-team M1): this used to skip
+                # the digest check and never reach @tampered, so a --status
+                # filter could hide a tampered report behind the duplicate key.
+                # It is now pushed into the same summary as a real digest
+                # mismatch, with its own MALFORMED wording.
                 $integrity = "MALFORMED: duplicate frontmatter key '$rep->{duplicate_key}'";
+                push @tampered, [ $f->{id} // $p, $p ];
             } else {
                 my ($intact, $note) = AlmanacBug::verify($rep);
-                $integrity = $note unless $intact;
+                unless ($intact) {
+                    $integrity = $note;
+                    push @tampered, [ $f->{id} // $p, $p ];
+                }
             }
+            next if defined $o{status} && !ref $o{status} && ($f->{status}//'') ne $o{status};
             my %row = ( id=>$f->{id}, title=>$f->{title}, status=>$f->{status},
                         severity=>$f->{severity}, area=>$f->{area}, project=>$f->{project},
                         created_at=>$f->{created_at}, path=>$p,
@@ -1434,6 +1852,28 @@ unless (caller) {
                     $row{stale_claim} = $cstate->{reason};
                 }
             }
+            # DC2/DC4 surfacing (spec sec 2.10), computed read-only AFTER the
+            # automatic reconcile already ran at the top of this process.
+            if (($f->{status}//'') eq 'scheduled') {
+                $row{package} = $f->{package} if defined $f->{package};
+                my $v = AlmanacBug::package_verdict($f, $p);
+                if ($v && grep { $v->{verdict} eq $_ } qw(invalid missing done parked dropped)) {
+                    $row{package_problem} = $v->{verdict};
+                    $row{_flag_text} = AlmanacBug::flag_text(
+                        kind => $v->{verdict}, id => $f->{id}, link => $v->{link}, root => $v->{root});
+                }
+            }
+            elsif (($f->{status}//'') eq 'fixed' || ($f->{status}//'') eq 'dropped') {
+                $row{package} = $f->{package} if defined $f->{package};
+            }
+            elsif (($f->{status}//'') eq 'taken') {
+                my (undef, $reason) = AlmanacBug::migration_link($f, $root);
+                if (defined $reason) {
+                    $row{unmigrated} = $reason;
+                    $row{_flag_text} = AlmanacBug::flag_text(
+                        kind => 'unmigrated', id => $f->{id}, reason => $reason);
+                }
+            }
             push @out, \%row;
         }
         # ->utf8 ON THE ENCODE SIDE TOO, and it is not optional. known_projects
@@ -1447,7 +1887,10 @@ unless (caller) {
         # Decode and encode must be symmetric. This is the same hazard the
         # user-global CLAUDE.md records for registry values ("never re-encode
         # something already decoded"), arriving from the opposite direction.
-        if ($o{json}) { print JSON::PP->new->utf8->canonical->pretty->encode(\@out) }
+        if ($o{json}) {
+            my @json_out = map { my %r = %$_; delete $r{_flag_text}; \%r } @out;
+            print JSON::PP->new->utf8->canonical->pretty->encode(\@json_out);
+        }
         else {
             printf "%-22s %-10s %-9s %s\n", 'ID', 'STATUS', 'SEVERITY', 'TITLE';
             for my $r (@out) {
@@ -1466,6 +1909,10 @@ unless (caller) {
                         . "almanac-bug.pl takeover $r->{id}\n"
                         if defined $r->{stale_claim};
                 }
+                # DC2/DC4 (spec sec 2.10): a scheduled row whose package is
+                # invalid/missing/done/parked/dropped, or a leftover `taken`
+                # row that could not be migrated, prints its 2.8 flag text.
+                print "  !! $r->{_flag_text}\n" if defined $r->{_flag_text};
                 print  "  $r->{project}\n" if $cmd eq 'collect';
             }
             # FIX (defect 4, 20260911-225720-4c57): `list` used to print a
@@ -1484,6 +1931,28 @@ unless (caller) {
                     . "steward's backup registry -- a project that files ccpraxis bugs but is "
                     . "not registered for backup is excluded from this count (see any "
                     . "'skipped' warnings above for a registered root that could not be read).\n";
+            }
+            # Column-0 summary (spec sec 2.3), after the footer, one per
+            # tampered report LOADED -- including one a --status filter
+            # excluded from the rows above. Read verbs exit 0 regardless
+            # (B9): this is the loud flag, not a failure.
+            for my $t (@tampered) {
+                my ($tid, $tpath) = @$t;
+                print "!! TAMPERED: $tid -- its body no longer matches the sha256 recorded "
+                    . "when it was frozen ($tpath). set-status, takeover, update and append "
+                    . "refuse it; run 'almanac-bug.pl verify' for detail.\n";
+            }
+            # FIX (red-team M2): a report whose envelope is broken (unterminated
+            # '---' block, truncated/emptied file) used to vanish from every read
+            # surface -- no row, no TAMPERED, no trace at all. A file that merely
+            # has no frontmatter envelope is not a report and stays quietly
+            # skipped (same convention as `verify`'s "skipped" tally); one that
+            # DOES start with '---' but still failed to parse is surfaced here,
+            # loud, the same way a digest mismatch is.
+            for my $up (@unreadable) {
+                print "!! UNREADABLE: $up -- this starts with a frontmatter envelope but "
+                    . "could not be parsed (truncated, corrupted, or missing its closing "
+                    . "'---'); treat it as tampered until reviewed.\n";
             }
         }
         exit 0;
@@ -1624,23 +2093,32 @@ almanac-bug.pl — ccpraxis bug reports, one file per report.
         Add to the end of a report's body. Allowed ONLY while status is `open`. Use this to record progress — it cannot lose what is already there.
   update <id> (--body - | --body-file F) [--title T] [--severity S] [--replace]
         REPLACE a report's body. Allowed ONLY while status is `open`. Refuses when the existing body would be discarded unless --replace is given; there is no undo, as reports are gitignored.
-  set-status <id> --to <state> [--note N] [--repair]
-        open -> triaging -> taken -> resolved|declined  (triaging -> open to hand back)
+  set-status <id> --to <state> [--note N] [--package BP/PKG] [--repair]
+        open -> triaging -> scheduled -> fixed|dropped  (triaging -> open to hand back)
         Moving to `triaging` CLAIMS the report for the calling session (and agent, for a
         subagent) -- the identity comes from a butler hook ticket, never from a flag, and is
         required: run this from a Claude Code session with the butler plugin enabled, with the
         id and every argument written literally (no $variables). Only the claimant may then move
         it on or back to `open`; see `takeover` for a stale claim.
+        --to scheduled requires --package <blueprint>/<package>, validated against an existing
+        package ledger (live or archived). `fixed` can never be set by hand -- reconcile sets it
+        once the scheduled package is done. --to dropped requires --note "<reason>".
         --repair: ONLY for a report whose current status is not a known state (hand-written, or from before this machine existed). It cannot skip a legal transition between valid states. Put it last on the line.
         Leaving `open` FREEZES the body and records its sha256.
   takeover <id>
         Recovers a STALE triaging claim (no transcript for its claimant, or claimed over 24h ago)
         and records the calling session as the new claimant. Refused on a live claim or a report
         that is not triaging. Requires a hook ticket, exactly like set-status.
-  list [--status S] [--json]        reports in THIS PROJECT only; flags a stale triaging claim
-  collect [--status S] [--json]     reports across every project REGISTERED in steward's backup registry -- filing a bug and registering for backup are unrelated decisions, so an unregistered project is excluded, not scanned for; flags a stale triaging claim
+  reconcile [--project ROOT]
+        Moves every scheduled report in ROOT whose package is done to fixed, migrates any leftover
+        taken/resolved/declined report, and flags a scheduled report whose package is parked,
+        dropped or missing. Every OTHER verb already runs this first, silently, for its own
+        project -- this is the explicit, visible form. Idempotent; exits 0 always.
+  list [--status S] [--json]        reports in THIS PROJECT only; flags a stale triaging claim, and a scheduled/taken report needing attention
+  collect [--status S] [--json]     reports across every project REGISTERED in steward's backup registry -- filing a bug and registering for backup are unrelated decisions, so an unregistered project is excluded, not scanned for; flags a stale triaging claim, and a scheduled/taken report needing attention
   verify                            re-check every frozen body against its digest
 
+Every verb above reconciles THIS PROJECT's reports first (see `reconcile`).
 One report per file. Write only through this script — a PreToolUse hook denies direct edits to the reports directory.
 USAGE
     exit 3;

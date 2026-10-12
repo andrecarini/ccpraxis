@@ -123,6 +123,14 @@ sub run_fake_sweep {
     my $pid = fork();
     die "fork failed: $!" unless defined $pid;
     if ($pid == 0) {
+        # tooling-fixes 10 (Decision 28): delete the marker this test file's
+        # OWN process may itself have inherited from an enclosing sweep,
+        # before anything else runs -- this file's whole audit oracle (AC-2,
+        # AC-4, M4, M5, M6, M7) exists to exercise the REAL audit, and a
+        # sweep running this very file would otherwise leave
+        # CCPRAXIS_SWEEP_OWNS_AUDIT=1 armed, making the fake sweep below skip
+        # its own audit and go green for the wrong reason.
+        delete $ENV{CCPRAXIS_SWEEP_OWNS_AUDIT};
         for my $k (keys %$env) { $ENV{$k} = $env->{$k} }
         open(STDOUT, '>', $out_path) or POSIX::_exit(97);
         open(STDERR, '>', $err_path) or POSIX::_exit(98);
@@ -1032,6 +1040,7 @@ if ($^O =~ /^(MSWin32|cygwin|msys)$/) {
         my $pid = fork();
         die "fork failed: $!" unless defined $pid;
         if ($pid == 0) {
+            delete $ENV{CCPRAXIS_SWEEP_OWNS_AUDIT};   # tooling-fixes 10, for uniformity with run_fake_sweep above
             $ENV{HOME} = $outer_home;
             $ENV{FIXTURE_REPORT_DIR} = $report_dir;
             open(STDIN,  '<', '/dev/null');

@@ -59,6 +59,38 @@ my $REPO_ROOT = RunnerStateHarness::repo_root();
 
 my $BOUND = 20;   # seconds; every runner fixture below is 1 near-instant file
 
+# ---------------------------------------------------------------------------
+# make_green_lint_root() -- a committed git repo fixture holding three green
+# plugins/butler/tests/t/<name> lints, for CCPRAXIS_TEST_LINT_ROOT. Needed
+# because tooling-fixes 07 makes a --ledger run also run the three repo
+# lints: without this, AC-1/AC-2 below would run the real repo lints and
+# their file count/redness would depend on the real tree's state. See
+# .ccpraxis-local-data/blueprints/tooling-fixes/specs/
+# 07-validation-runs-repo-lints-spec.md section 4 "Regression".
+# ---------------------------------------------------------------------------
+my @LEDGER_FLAG_LINT_BASENAMES = qw(
+    test-naming-hygiene.t
+    tests-never-run-tests.t
+    turn-cap-consistency.t
+);
+
+sub make_green_lint_root {
+    my $root = tempdir(CLEANUP => 1);
+    (my $root_n = $root) =~ s{\\}{/}g;
+    my $dir = "$root_n/plugins/butler/tests/t";
+    make_path($dir);
+    for my $name (@LEDGER_FLAG_LINT_BASENAMES) {
+        open(my $fh, '>:raw', "$dir/$name") or die "cannot write $dir/$name: $!";
+        print {$fh} "#!/usr/bin/env perl\n# platform: any\nprint \"ok 1 - fixture pass\\n\";\nexit 0;\n";
+        close $fh;
+    }
+    system('git', '-C', $root_n, 'init', '-q') == 0 or die "git init failed in $root_n";
+    system('git', '-C', $root_n, 'add', '-A') == 0 or die "git add failed in $root_n";
+    system('git', '-C', $root_n, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'base') == 0
+        or die "git commit failed in $root_n";
+    return $root_n;
+}
+
 # =============================================================================
 # SECTION 1 -- scripts/run-tests.pl --ledger argv grammar (AC-1..AC-6)
 # =============================================================================
@@ -73,17 +105,20 @@ my $BOUND = 20;   # seconds; every runner fixture below is 1 near-instant file
     my $fixture = make_fixture_tree('quick-green.t' => green_source());
     my $ledger_path = File::Spec->catfile($fixture, 'tests', 't', 'quick-green.t');
     my $state_dir = tempdir(CLEANUP => 1);
+    my $lint_root = make_green_lint_root();
 
     my $res = run_runner_bounded(
         args    => ['--ledger', $ledger_path, $fixture],
-        env     => { CCPRAXIS_TEST_STATE_DIR => $state_dir },
+        env     => { CCPRAXIS_TEST_STATE_DIR => $state_dir, CCPRAXIS_TEST_LINT_ROOT => $lint_root },
         timeout => $BOUND,
     );
     is($res->{rc}, 0, 'AC-1: --ledger <existing file> <fixture dir> -> rc 0') or diag($res->{err});
     my @ledger_lines = grep { /^ledger: /m } split /\n/, $res->{out};
     is(scalar(@ledger_lines), 1, 'AC-1: exactly one "ledger: " line on stdout');
     like($res->{out}, qr/^ledger: \Q$ledger_path\E$/m, 'AC-1: the ledger line names the exact --ledger path');
-    like($res->{out}, qr/^1 files/m, 'AC-1: summary reports 1 file (the ledger path was not treated as a target)');
+    like($res->{out}, qr/^4 files/m,
+        'AC-1: summary reports 4 files (the target plus the three repo lints tooling-fixes 07 adds; '
+      . 'the ledger path itself was not treated as a target)');
 }
 
 # ---------------------------------------------------------------------------
@@ -93,15 +128,17 @@ my $BOUND = 20;   # seconds; every runner fixture below is 1 near-instant file
     my $fixture = make_fixture_tree('quick-green.t' => green_source());
     my $ledger_path = File::Spec->catfile($fixture, 'tests', 't', 'quick-green.t');
     my $state_dir = tempdir(CLEANUP => 1);
+    my $lint_root = make_green_lint_root();
 
     my $res = run_runner_bounded(
         args    => ["--ledger=$ledger_path", $fixture],
-        env     => { CCPRAXIS_TEST_STATE_DIR => $state_dir },
+        env     => { CCPRAXIS_TEST_STATE_DIR => $state_dir, CCPRAXIS_TEST_LINT_ROOT => $lint_root },
         timeout => $BOUND,
     );
     is($res->{rc}, 0, 'AC-2: --ledger=<existing file> <fixture dir> -> rc 0') or diag($res->{err});
     like($res->{out}, qr/^ledger: \Q$ledger_path\E$/m, 'AC-2: the ledger line names the exact --ledger= path');
-    like($res->{out}, qr/^1 files/m, 'AC-2: summary reports 1 file');
+    like($res->{out}, qr/^4 files/m,
+        'AC-2: summary reports 4 files (the target plus the three repo lints tooling-fixes 07 adds)');
 }
 
 # ---------------------------------------------------------------------------
@@ -284,6 +321,22 @@ sub write_ledger {
     make_path("$data_n/blueprints/$bp/packages");
     my $wsline = defined($ws_line) ? "write_set: $ws_line\n" : '';
     my $content = "---\npackage: $pkg\nblueprint: $bp\nstatus: running\n${wsline}---\n\n# x\n";
+    open(my $fh, '>:raw', "$data_n/blueprints/$bp/packages/$pkg.md") or die $!;
+    print {$fh} $content;
+    close $fh;
+}
+
+# write_ledger_tp($data_n, $bp, $pkg, $ws_line, $tp_line) -- package
+# 09-gb-h-residuals, spec sec 2.2/3.13 (Decision 36 N6): write_ledger() with
+# an ADDITIONAL test_paths: frontmatter line, needed by AC-40's A' fixture
+# (_ledger_scope_paths reads write_set AND test_paths; a missing test_paths:
+# key contributes nothing).
+sub write_ledger_tp {
+    my ($data_n, $bp, $pkg, $ws_line, $tp_line) = @_;
+    make_path("$data_n/blueprints/$bp/packages");
+    my $wsline = defined($ws_line) ? "write_set: $ws_line\n" : '';
+    my $tpline = defined($tp_line) ? "test_paths: $tp_line\n" : '';
+    my $content = "---\npackage: $pkg\nblueprint: $bp\nstatus: running\n${wsline}${tpline}---\n\n# x\n";
     open(my $fh, '>:raw', "$data_n/blueprints/$bp/packages/$pkg.md") or die $!;
     print {$fh} $content;
     close $fh;
@@ -1339,6 +1392,160 @@ SKIP: {
 
     my $res = gb(payload(cmd => "perl5.36.0 $ALPHA_T", session_id => $sid), CCPRAXIS_DATA_DIR => $data_n);
     is($res->{rc}, 0, 'AC-39 (non-vacuity): perl5.36.0, NO live writer -> allow');
+}
+
+# =============================================================================
+# Package 09-gb-h-residuals (specs/09-gb-h-residuals-spec.md). AC-40 onward.
+# WRITTEN BLIND TO THE IMPLEMENTATION, same convention as section 2 above:
+# _scoped_test_operand, _ledger_scope_paths, the lower-only
+# BP_GUARD_DEADLINE_SECONDS seam on _perl_test_run's OWN deadline, and the
+# D38 "mention alone" fix DO NOT EXIST YET at the time this block is
+# written -- every row below is expected RED until the implementer lands
+# it, EXCEPT where a comment says otherwise. This file's own running AC-N
+# numbering continues from AC-39; the spec's OWN "AC-13".."AC-15" labels
+# (specs/09-gb-h-residuals-spec.md sec 4) are cited alongside each AC-NN.
+# =============================================================================
+
+# ===========================================================================
+# AC-40 (spec AC-14, sec 3.13, Decision 36 N6) -- a scoped runner/bare-.t
+# operand must itself be a member of the NAMED package's test_paths or
+# write_set; naming A does not scope an operand belonging to some other
+# package.
+# ===========================================================================
+{
+    my $sid = 'ac40-sid';
+    my $data_n = setup_disjoint_b($sid);
+    assert_live_writer_precondition($data_n, $sid, 'AC-40');
+
+    my $rel = ledger_val($data_n, 'A');
+    my $pkg = $PKG{A}{pkg};
+    # Role is pinned, not left open-ended: setup_disjoint_b() always writes
+    # the live-writer marker/binding with subagent_type => 'bp-implementer'
+    # (see write_worker_marker/write_binding calls above), so the role token
+    # inside the parens is predictable here. The regex is anchored through
+    # end-of-line so it also pins the ") is in flight." tail -- a looser
+    # prefix-only match would pass even if the tail text drifted.
+    my $msg_re = qr/^BLOCKED \(validation interlock\): this test file is outside package \Q$pkg\E's test_paths\/write_set; a write-capable worker \(bp-implementer\) is in flight\.$/;
+
+    my $cmd1 = "perl scripts/run-tests.pl --ledger $rel plugins/fx/tests/t/beta.t";
+    my $res1 = gb(payload(cmd => $cmd1, session_id => $sid), CCPRAXIS_DATA_DIR => $data_n);
+    is($res1->{rc}, 2, 'AC-40 (spec AC-14, sec 3.13 row 1): --ledger relA names an operand outside A -> deny (today rc 0)') or diag("cmd: $cmd1");
+    my @l1 = deny_lines($res1->{err});
+    like($l1[0] // '', $msg_re,
+        'AC-40 (spec AC-14, sec 3.13 row 1): line 1 is the new N6 scoping message') or diag("err: $res1->{err}");
+    like($l1[1] // '', qr/^Not run: /,
+        'AC-40 (spec AC-14, sec 3.13 row 1): line 2 starts with "Not run: " (the existing retry line)') or diag("err: $res1->{err}");
+
+    my $cmd2 = "BP_VALIDATE_LEDGER=$rel perl plugins/fx/tests/t/beta.t";
+    my $res2 = gb(payload(cmd => $cmd2, session_id => $sid), CCPRAXIS_DATA_DIR => $data_n);
+    is($res2->{rc}, 2, 'AC-40 (spec AC-14, sec 3.13 row 2): BP_VALIDATE_LEDGER=relA perl beta.t -> deny (today rc 0)') or diag("cmd: $cmd2");
+    my @l2 = deny_lines($res2->{err});
+    like($l2[0] // '', $msg_re,
+        'AC-40 (spec AC-14, sec 3.13 row 2): line 1 is the new N6 scoping message') or diag("err: $res2->{err}");
+    like($l2[1] // '', qr/^Not run: /,
+        'AC-40 (spec AC-14, sec 3.13 row 2): line 2 starts with "Not run: " (the existing retry line)') or diag("err: $res2->{err}");
+
+    my $cmd3 = "perl scripts/run-tests.pl --ledger $rel plugins/fx/alpha/t/x.t";
+    my $res3 = gb(payload(cmd => $cmd3, session_id => $sid), CCPRAXIS_DATA_DIR => $data_n);
+    is($res3->{rc}, 0, 'AC-40 (spec AC-14, sec 3.13 row 3): operand under a write_set DIRECTORY -> allow') or diag("cmd: $cmd3");
+
+    # row 4 -- an A' fixture whose write_set does NOT list the operand, but
+    # whose test_paths does. A' must be in-flight too (same convention
+    # setup_a_inflight() already uses for A: named-ledger resolution needs
+    # the NAMED package listed in inflight.json), so this re-writes
+    # inflight.json to carry BOTH A and A' (B's own live-writer binding does
+    # not depend on inflight.json, so it is unaffected).
+    write_ledger_tp($data_n, 'fx-bp', 'pap-alpha2', 'plugins/fx/alpha/', 'plugins/fx/tests/t/alpha2.t');
+    write_inflight($data_n, [[$PKG{A}{bp}, $PKG{A}{pkg}], ['fx-bp', 'pap-alpha2']]);
+    my $rel_ap = basename($data_n) . '/blueprints/fx-bp/packages/pap-alpha2.md';
+    my $cmd4 = "perl scripts/run-tests.pl --ledger $rel_ap plugins/fx/tests/t/alpha2.t";
+    my $res4 = gb(payload(cmd => $cmd4, session_id => $sid), CCPRAXIS_DATA_DIR => $data_n);
+    is($res4->{rc}, 0, "AC-40 (spec AC-14, sec 3.13 row 4): operand is in A'" . "'s test_paths, not its write_set -> allow") or diag("cmd: $cmd4");
+
+    # row 5 -- the scoped operand itself given as an absolute path, under
+    # the root (dirname($data_n)).
+    my $root = dirname($data_n);
+    my $cmd5 = "perl scripts/run-tests.pl --ledger $rel $root/$ALPHA_T";
+    my $res5 = gb(payload(cmd => $cmd5, session_id => $sid), CCPRAXIS_DATA_DIR => $data_n);
+    is($res5->{rc}, 0, 'AC-40 (spec AC-14, sec 3.13 row 5): absolute operand under the root, naming A -> allow') or diag("cmd: $cmd5");
+}
+
+# ===========================================================================
+# AC-41 (spec AC-13, sec 3.2, Decision 36 N5) -- _perl_test_run's own
+# deadline, via _hyg_deadline_at(2), is lower-only (BP_GUARD_DEADLINE_SECONDS
+# can only shrink it) and fails CLOSED on expiry. Through run(), a deadline
+# hit with a live writer present is then denied by the validation interlock
+# (the command becomes "a test run" only because the deadline expired).
+# ===========================================================================
+{
+    require BpHook::Guards::GuardBash;
+    my $cmd = 'cat notes.t' . ('; :' x 2000);
+
+    {
+        local %ENV = %ENV;
+        delete $ENV{BP_GUARD_DEADLINE_SECONDS};
+        my $r0 = BpHook::Guards::GuardBash::_perl_test_run($cmd);
+        is($r0, 0, 'AC-41 (spec AC-13, sec 3.2 item 2): cat notes.t + 2000 "; :" segments, no seam -> _perl_test_run returns 0');
+    }
+    {
+        local %ENV = %ENV;
+        $ENV{BP_GUARD_DEADLINE_SECONDS} = '0.000001';
+        my $r1 = BpHook::Guards::GuardBash::_perl_test_run($cmd);
+        is($r1, 1, 'AC-41 (spec AC-13, sec 3.2 item 2): same command, tiny BP_GUARD_DEADLINE_SECONDS -> _perl_test_run returns 1 (fail closed; today: 0)');
+    }
+
+    my $sid = 'ac41-sid';
+    my $data_n = setup_disjoint_b($sid);
+    assert_live_writer_precondition($data_n, $sid, 'AC-41');
+
+    my $res_seam = gb(payload(cmd => $cmd, session_id => $sid),
+        CCPRAXIS_DATA_DIR => $data_n, BP_GUARD_DEADLINE_SECONDS => '0.000001');
+    is($res_seam->{rc}, 2, 'AC-41 (spec AC-13, sec 3.2 item 3): with the seam and a live writer -> deny through the interlock (today: allow)')
+        or diag("err: $res_seam->{err}");
+    like($res_seam->{err}, qr/validation interlock/, 'AC-41 (spec AC-13, sec 3.2 item 3): the deny names the validation interlock');
+
+    my $res_noseam = gb(payload(cmd => $cmd, session_id => $sid), CCPRAXIS_DATA_DIR => $data_n);
+    is($res_noseam->{rc}, 0, 'AC-41 (spec AC-13, sec 3.2 item 3): without the seam, the same command and live writer -> allow');
+}
+
+# ===========================================================================
+# AC-42 (spec AC-15, sec 3.14, Decision 38) -- an expansion script word whose
+# OWN raw text does not end in .t and is not exactly $NAME/${NAME} resolved
+# to a .t-/runner-shaped value must not count as a test run merely because
+# the command mentions ".t" somewhere else (e.g. inside a --text value).
+# ===========================================================================
+{
+    my $sid = 'ac42-sid';
+    my $data_n = setup_disjoint_b($sid);
+    assert_live_writer_precondition($data_n, $sid, 'AC-42');
+
+    my @allow_rows = (
+        [ q{perl "$S" add-decision --file X --text "see plugins/butler/tests/t/foo.t"} => q{quoted $S with no NAME=value for S anywhere; the .t text is only inside --text} ],
+        [ q{perl $S note --text plugins/butler/tests/t/foo.t}                          => q{bare $S with no NAME=value for S anywhere; the .t text is only a later operand} ],
+        [ q{S=plugins/butler/scripts/bp-blueprint.pl; perl "$S" note --text "x.t"}     => q{NAME=value gives S a non-.t-/non-runner-shaped value (bp-blueprint.pl)} ],
+    );
+    for my $r (@allow_rows) {
+        my ($cmd, $label) = @$r;
+        my $res = gb(payload(cmd => $cmd, session_id => $sid), CCPRAXIS_DATA_DIR => $data_n);
+        is($res->{rc}, 0, "AC-42 (spec AC-15, sec 3.14): $label -> allow (today: denied by mention alone)") or diag("cmd: $cmd");
+    }
+
+    my @deny_rows = (
+        [ q{D=plugins/fx/tests/t; perl "$D/alpha.t"}                        => q{the script word's OWN raw text "$D/alpha.t" ends in .t (quotes stripped), independent of D's value -> rule (a)} ],
+        [ q{R=scripts/run-tests.pl; perl "$R" plugins/fx/tests/t/alpha.t}   => q{script word is exactly "$R"; NAME=value gives R a runner-shaped value -> rule (b)} ],
+        # New pin (never-halt 09-gb-h-residuals, SHOULD-FIX): a segment's
+        # leading-assignment walk must check EVERY leading "NAME=value" word,
+        # not just the first. Here "X=1" is the first leading assignment and
+        # "S=plugins/fx/tests/t/a.t" is the second; before the fix only X=1
+        # was checked (and X has no bearing on the script word "$S"), so S's
+        # value was never consulted and this slipped through as allowed.
+        [ q{X=1 S=plugins/fx/tests/t/a.t; perl "$S"}                        => q{second leading NAME=value word (S) gives the script word "$S" a .t-shaped value -> rule (b)} ],
+    );
+    for my $r (@deny_rows) {
+        my ($cmd, $label) = @$r;
+        my $res = gb(payload(cmd => $cmd, session_id => $sid), CCPRAXIS_DATA_DIR => $data_n);
+        is($res->{rc}, 2, "AC-42 (spec AC-15, sec 3.14): $label -> deny (still a recognised test run)") or diag("cmd: $cmd");
+    }
 }
 
 done_testing();

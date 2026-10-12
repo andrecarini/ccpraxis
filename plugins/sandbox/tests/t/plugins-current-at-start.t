@@ -10,6 +10,13 @@
 # source-level check that README.md no longer claims the sandbox never
 # touches a plugin installed inside it.
 #
+# AC17 amended by tooling-fixes package 15 (Decision 46). Spec:
+# .ccpraxis-local-data/blueprints/tooling-fixes/specs/15-sandbox-only-plugin-updates-spec.md
+# section 2.13.1. FORCE_AUTOUPDATE_PLUGINS returns to the container settings
+# (the old AC17 pinned its absence); the new AC17e/f/g pin that no host-shared
+# marketplace can ever be flagged autoUpdate true despite the global gate
+# being open, and that the check is not vacuous.
+#
 # Isolation (AC15): HOME/USERPROFILE point at a throwaway root and PATH is
 # emptied BEFORE skills.pl is required, and every plugins_file/output/manifest
 # path used anywhere below lives under that one root. This file calls
@@ -872,8 +879,9 @@ for my $case (
 }
 
 # ===========================================================================
-# AC17 -- container settings.json: auto-update off, DISABLE_AUTOUPDATER
-# stays on, both claude-plugins-official plugins still user-enabled.
+# AC17 -- container settings.json: plugin auto-update gate open, gated per
+# marketplace; host-shared marketplaces never flagged (tooling-fixes package
+# 15, Decision 46, spec section 2.13.1).
 # ===========================================================================
 {
     my $settings_path = "$Bin/../../container/settings.json";
@@ -883,13 +891,225 @@ for my $case (
     close $fh;
     my $settings = JSON::PP->new->decode($bytes);
 
-    ok(!exists $settings->{env}{FORCE_AUTOUPDATE_PLUGINS},
-        'AC17: container settings.json no longer sets env.FORCE_AUTOUPDATE_PLUGINS');
-    is($settings->{env}{DISABLE_AUTOUPDATER}, '1', 'AC17: env.DISABLE_AUTOUPDATER stays "1"');
+    is($settings->{env}{FORCE_AUTOUPDATE_PLUGINS}, '1',
+        'AC17a: container settings.json sets env.FORCE_AUTOUPDATE_PLUGINS to "1"');
+    is($settings->{env}{DISABLE_AUTOUPDATER}, '1', 'AC17b: env.DISABLE_AUTOUPDATER stays "1"');
     ok($settings->{enabledPlugins}{'feature-dev@claude-plugins-official'},
-        'AC17: feature-dev@claude-plugins-official still user-enabled');
+        'AC17c: feature-dev@claude-plugins-official still user-enabled');
     ok($settings->{enabledPlugins}{'frontend-design@claude-plugins-official'},
-        'AC17: frontend-design@claude-plugins-official still user-enabled');
+        'AC17d: frontend-design@claude-plugins-official still user-enabled');
+
+    my $ekm = $settings->{extraKnownMarketplaces} // {};
+    is_deeply(
+        [ sort grep { ref $ekm->{$_} eq 'HASH' && exists $ekm->{$_}{autoUpdate} } keys %$ekm ],
+        [],
+        'AC17e: no extraKnownMarketplaces.*.autoUpdate key anywhere in container settings.json'
+    );
+}
+
+# ===========================================================================
+# AC17f/AC17g -- shared-marketplace fixture (tooling-fixes package 15,
+# Decision 46, spec section 2.13.1). A marketplace with any host-shared key
+# (selected this launch, host-refreshed, or a host install whose dir is
+# missing) must never come out autoUpdate true, even when the host side, the
+# prior container km output, and a stale sidecar all say true. AC17g is the
+# non-vacuity control: the same fixture, made unmixed, must flip to true.
+# ===========================================================================
+
+# Minimal inline version of the AC25 d0c9689-invariant predicate (the full,
+# reusable helper lives in sandbox-only-plugin-updates.t): a true-flagged
+# marketplace must hold no selected-or-host-installed registry key. Applied
+# here to claude-plugins-official specifically, per spec's "AC17f applies the
+# same predicate inline".
+sub ac17_invariant_ok {
+    my ($km_result, $label) = @_;
+    my $flag = $km_result->{'claude-plugins-official'}{autoUpdate};
+    ok(JSON::PP::is_bool($flag), "$label: claude-plugins-official.autoUpdate is a JSON boolean");
+    return $flag;
+}
+
+sub run_shared_marketplace_case {
+    my (%opt) = @_;    # label, selected, host_dir_present, prior_feature_dev
+    my $dir      = "$ISO_ROOT/ac17f-$opt{label}";
+    my $host_dir = "$dir/host";
+    my $L        = "$dir/launcher";
+    my $C        = "$dir/claude_home/plugins";
+    make_path($L);
+
+    my $hcache = "$host_dir/.claude/plugins/cache/claude-plugins-official/feature-dev/1.0.0";
+    write_tree($hcache, 'plugin.json' => "{\"name\":\"feature-dev\"}\n");
+    unless ($opt{host_dir_present}) {
+        require File::Path;
+        File::Path::remove_tree($hcache);
+    }
+
+    my $host_reg = "$host_dir/installed_plugins.json";
+    t_spew_raw($host_reg, { version => 2, plugins => {
+        'feature-dev@claude-plugins-official' => [ { scope => 'user', version => '1.0.0',
+            installPath => $hcache, installedAt => '2026-01-01T00:00:00Z', gitCommitSha => 'feat100' } ],
+    }});
+
+    t_spew_raw("$host_dir/known_marketplaces.json", {
+        'claude-plugins-official' => {
+            source => { source => 'github', repo => 'anthropics/claude-plugins-official' },
+            installLocation => "$host_dir/marketplaces/claude-plugins-official",
+            autoUpdate => JSON::PP::true,
+        },
+    });
+
+    write_tree("$host_dir/marketplaces/claude-plugins-official/plugins/feature-dev",
+        'plugin.json' => "{\"name\":\"feature-dev\",\"version\":\"1.0.0\"}\n");
+    t_spew_raw("$host_dir/marketplaces/claude-plugins-official/.claude-plugin/marketplace.json", {
+        plugins => [
+            { name => 'feature-dev', source => './plugins/feature-dev' },
+            { name => 'remote-x', source => { source => 'url', url => 'https://example.invalid/x.git' } },
+        ],
+    });
+
+    my $remote_x_record = [ { scope => 'user', version => '0.1.0',
+        installPath => '/root/.claude/plugins/cache/claude-plugins-official/remote-x/0.1.0',
+        installedAt => '2026-01-01T00:00:00Z' } ];
+    my %c_plugins = ( 'remote-x@claude-plugins-official' => $remote_x_record );
+    if ($opt{prior_feature_dev}) {
+        $c_plugins{'feature-dev@claude-plugins-official'} = [ { scope => 'user', version => '0.9.0',
+            installPath => '/root/.claude/plugins/cache/claude-plugins-official/feature-dev/0.9.0',
+            installedAt => '2025-12-01T00:00:00Z' } ];
+    }
+    my $out = "$C/installed_plugins.json";
+    t_spew_raw($out, { plugins => \%c_plugins });
+
+    my $km_out = "$C/known_marketplaces.json";
+    t_spew_raw($km_out, { 'claude-plugins-official' => {
+        source => { source => 'github', repo => 'anthropics/claude-plugins-official' },
+        autoUpdate => JSON::PP::true,
+    }});
+
+    my $plugins_manifest = "$L/plugins-manifest.json";    # no prior manifest -- never written
+    my $mkt_manifest     = "$L/mkt-manifest.json";
+    t_spew_raw("$L/.sandbox-autoupdate-marketplaces.json", ['claude-plugins-official']);    # stale
+
+    my $snap = "$dir/snap.json";
+    my $sel  = "$dir/sel.json";
+    if ($opt{selected}) {
+        t_spew_raw($snap, [ { key => 'feature-dev@claude-plugins-official', scope => 'user',
+            version => '1.0.0', install_path => $hcache } ]);
+        t_spew_raw($sel, { schema_version => 3, selected_plugins => ['feature-dev@claude-plugins-official'] });
+    } else {
+        t_spew_raw($snap, []);
+        t_spew_raw($sel, { schema_version => 3, selected_plugins => [] });
+    }
+
+    my @warnings;
+    {
+        local $SIG{__WARN__} = sub { push @warnings, $_[0] };
+        cmd_materialize_plugins(
+            selection_file => $sel, output => $out, manifest => $plugins_manifest,
+            plugins_snapshot => $snap, plugins_file => $host_reg, project_path => '/project',
+        );
+        cmd_materialize_known_marketplaces(
+            output => $km_out, manifest => $mkt_manifest, host_marketplaces => "$host_dir/known_marketplaces.json",
+        );
+    }
+
+    return {
+        plugins_result => t_slurp_utf8($out),
+        km_result      => t_slurp_utf8($km_out),
+        sidecar        => t_slurp_utf8("$L/.sandbox-autoupdate-marketplaces.json"),
+        warnings       => \@warnings,
+        remote_x_record => $remote_x_record,
+    };
+}
+
+for my $case (
+    { label => 'i-selected',    selected => 1, host_dir_present => 1, prior_feature_dev => 0,
+      expect_version => '1.0.0', expect_sha => 'feat100' },
+    { label => 'ii-host-refresh', selected => 0, host_dir_present => 1, prior_feature_dev => 1,
+      expect_version => '1.0.0', expect_sha => 'feat100' },
+    { label => 'iii-dir-missing', selected => 0, host_dir_present => 0, prior_feature_dev => 1,
+      expect_version => '0.9.0', expect_sha => undef },
+) {
+    my $r = run_shared_marketplace_case(%$case);
+
+    ok((ref($r->{sidecar}) eq 'ARRAY'), "AC17f ($case->{label}): sidecar decodes to an array");
+    ok(!(grep { $_ eq 'claude-plugins-official' } @{ $r->{sidecar} || [] }),
+        "AC17f ($case->{label}): sidecar does not contain claude-plugins-official");
+
+    my $flag = ac17_invariant_ok($r->{km_result}, "AC17f ($case->{label})");
+    ok(!$flag, "AC17f ($case->{label}): claude-plugins-official.autoUpdate is false despite host/prior/stale-sidecar true");
+
+    is_deeply($r->{plugins_result}{plugins}{'remote-x@claude-plugins-official'}, $r->{remote_x_record},
+        "AC17f ($case->{label}): remote-x\@claude-plugins-official record deep-equal to its input");
+
+    my $fd = $r->{plugins_result}{plugins}{'feature-dev@claude-plugins-official'}[0];
+    is($fd->{version}, $case->{expect_version}, "AC17f ($case->{label}): feature-dev version as stated for this case");
+    if (defined $case->{expect_sha}) {
+        is($fd->{gitCommitSha}, $case->{expect_sha}, "AC17f ($case->{label}): feature-dev gitCommitSha refreshed from the host");
+    }
+}
+
+# AC17g -- control: the same fixture shape, but feature-dev has no host
+# install and no container/selection record at all, making the marketplace
+# unmixed. Proves AC17f is not vacuous (a wrong implementation that always
+# emits false would fail here).
+{
+    my $dir      = "$ISO_ROOT/ac17g-control";
+    my $host_dir = "$dir/host";
+    my $L        = "$dir/launcher";
+    my $C        = "$dir/claude_home/plugins";
+    make_path($L);
+
+    my $host_reg = "$host_dir/installed_plugins.json";
+    t_spew_raw($host_reg, { version => 2, plugins => {} });    # no feature-dev host install
+
+    t_spew_raw("$host_dir/known_marketplaces.json", {
+        'claude-plugins-official' => {
+            source => { source => 'github', repo => 'anthropics/claude-plugins-official' },
+            autoUpdate => JSON::PP::true,
+        },
+    });
+    write_tree("$host_dir/marketplaces/claude-plugins-official/plugins/feature-dev", 'plugin.json' => "{}\n");
+    t_spew_raw("$host_dir/marketplaces/claude-plugins-official/.claude-plugin/marketplace.json", {
+        plugins => [
+            { name => 'feature-dev', source => './plugins/feature-dev' },
+            { name => 'remote-x', source => { source => 'url', url => 'https://example.invalid/x.git' } },
+        ],
+    });
+
+    my $remote_x_record = [ { scope => 'user', version => '0.1.0',
+        installPath => '/root/.claude/plugins/cache/claude-plugins-official/remote-x/0.1.0',
+        installedAt => '2026-01-01T00:00:00Z' } ];
+    my $out = "$C/installed_plugins.json";
+    t_spew_raw($out, { plugins => { 'remote-x@claude-plugins-official' => $remote_x_record } });    # no feature-dev key
+
+    my $km_out = "$C/known_marketplaces.json";
+    t_spew_raw($km_out, { 'claude-plugins-official' => {
+        source => { source => 'github', repo => 'anthropics/claude-plugins-official' },
+        autoUpdate => JSON::PP::false,
+    }});
+
+    my $plugins_manifest = "$L/plugins-manifest.json";
+    my $mkt_manifest     = "$L/mkt-manifest.json";
+
+    my $snap = "$dir/snap.json";
+    t_spew_raw($snap, []);
+    my $sel = "$dir/sel.json";
+    t_spew_raw($sel, { schema_version => 3, selected_plugins => [] });
+
+    cmd_materialize_plugins(
+        selection_file => $sel, output => $out, manifest => $plugins_manifest,
+        plugins_snapshot => $snap, plugins_file => $host_reg, project_path => '/project',
+    );
+    cmd_materialize_known_marketplaces(
+        output => $km_out, manifest => $mkt_manifest, host_marketplaces => "$host_dir/known_marketplaces.json",
+    );
+
+    my $sidecar = t_slurp_utf8("$L/.sandbox-autoupdate-marketplaces.json");
+    is_deeply($sidecar, ['claude-plugins-official'],
+        'AC17g (control): sidecar is exactly ["claude-plugins-official"] once the marketplace is unmixed');
+
+    my $km_result = t_slurp_utf8($km_out);
+    my $flag = ac17_invariant_ok($km_result, 'AC17g (control)');
+    ok($flag, 'AC17g (control): claude-plugins-official.autoUpdate is true once unmixed -- proves AC17f is not vacuous');
 }
 
 # ===========================================================================

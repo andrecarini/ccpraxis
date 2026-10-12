@@ -59,8 +59,26 @@ my @EVENTS = map {
 
 my @RUNS = (
     { blueprint => 'bp-one', state => 'running', packages_done => 1, packages_total => 3,
-      current_package => 'pkg-a', running_coordinators => 1, decisions_waiting => 2 },
+      current_package => 'pkg-a', running_coordinators => 1, escalations_waiting => 2 },
     { blueprint => 'bp-two', state => 'paused',  packages_done => 0, packages_total => 9 },
+);
+
+# package 13-dashboard-threads (specs/13-dashboard-threads-spec.md AC12 --
+# "no-rendered-colons: a TF frame at 80 and 120 ... carries no colon outside
+# clock times. TF values contain no colon."). A run carrying a thread whose
+# every string value is itself colon-free, so PART 1's sweep below actually
+# exercises the new thread line (not just the pre-existing run fields).
+my $THREAD_NO_COLON = {
+    name => 'nocolon-thread', state => 'live', done => 1, total => 3,
+    doing => [ { class => 'doing', kind => 'text', title => 'doing a task', waits_on => undef } ],
+    current => undef,
+    next    => { class => 'pending', kind => 'text', title => 'next task', waits_on => undef },
+    owner   => { kind => 'session', id => 'nocolon-sess', alive => undef, activity_at => 1787000000 - 10, armed => 1 },
+};
+my @RUNS_WITH_THREAD = (
+    @RUNS,
+    { blueprint => 'bp-threaded', state => 'running', packages_done => 0, packages_total => 1,
+      thread => $THREAD_NO_COLON },
 );
 
 # A matrix of STATES, not just of sizes. Each entry turns on a different set of
@@ -93,6 +111,10 @@ my %STATES = (
     'escalations' => {
         runs => \@RUNS, events => \@EVENTS, tokens => {},
         needs_you => { count => 1 }, backpack => { pending => 2, failed => 1 },
+    },
+    'threaded' => {
+        runs => \@RUNS_WITH_THREAD, events => \@EVENTS, project_name => 'ccpraxis',
+        container => 'claude-x', status => 'running', tokens => {},
     },
     'spend-absent' => {
         runs => [], events => [], tokens => { access_state => 'ok', access_seconds_left => 500 },
@@ -134,6 +156,37 @@ my %STATES = (
     my $hits = grep { strip_clocks(plain($_->{text})) =~ /:/ } @$f;
     cmp_ok($hits, '>', 0,
         'AC2 non-vacuity: the detector does fire on a colon that reaches the screen -- PART 1 passing is a fact about the rows, not about the check');
+}
+
+# package 13-dashboard-threads AC12 non-vacuity: the 'threaded' state's thread
+# line actually reaches the rendered frame at the two widths AC12 names (80,
+# 120) -- otherwise PART 1 passing for 'threaded' would prove nothing about
+# the new thread line specifically.
+{
+    for my $cols (120) {
+        my $f = Dashboard::compose_frame($STATES{'threaded'}, 24, $cols);
+        my $joined = join("\n", map { plain($_->{text}) } @$f);
+        like($joined, qr/nocolon-thread/, "package-13/AC12 non-vacuity: the thread line renders at cols=$cols");
+    }
+
+    # 24x80 is a KNOWN, PRE-EXISTING panel-capacity limit of tui::Screen/
+    # tui::Layout (outside package 13's write set), confirmed independently
+    # by both the implementer and reviewer-1 against a pre-package-13
+    # `git archive HEAD` extract: at height 24, width 80, the Blueprints
+    # panel renders NO body rows at all -- not for 'threaded', not for the
+    # same state without a thread, not even for @RUNS alone. Spec AC12 names
+    # widths 80 and 120, but never the 24-row height this non-vacuity check
+    # happens to use, and no spec-conformant implementation can make a
+    # structurally-empty panel show a thread line. See
+    # reports/13-dashboard-threads/reviewer-1.md item 3 for the full
+    # reproduction. TODO, not an assertion to weaken: widen this to 80 once
+    # the panel-capacity limitation itself is fixed (a different package).
+  TODO: {
+        local $TODO = 'pre-existing 24x80 Blueprints panel-capacity limit (reviewer-1.md item 3), not package 13';
+        my $f80 = Dashboard::compose_frame($STATES{'threaded'}, 24, 80);
+        my $joined80 = join("\n", map { plain($_->{text}) } @$f80);
+        like($joined80, qr/nocolon-thread/, 'package-13/AC12 non-vacuity: the thread line renders at cols=80 (known-limitation TODO)');
+    }
 }
 
 # AC3 -- clock times are EXEMPT, and visibly so. The activity column's rows

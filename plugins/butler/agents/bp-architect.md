@@ -36,4 +36,4 @@ The spec file at the given path, plus a **≤15-line** return: design in 3–5 l
 
 - No gold-plating: smallest design that passes the criteria.
 - No implementation. Signatures and pseudocode fragments at most.
-- Codebase is read-only; `Write` is for the spec file only.
+- Codebase is read-only; `Write` is for the spec file and your dispatch-contract report file.

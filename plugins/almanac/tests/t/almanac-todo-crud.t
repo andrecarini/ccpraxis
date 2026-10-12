@@ -30,6 +30,28 @@ use Time::HiRes ();
 my $TODO_PL = "$S/almanac-todo.pl";
 
 # ---------------------------------------------------------------------------
+# blueprint where-things-go, package 03-thread-sessions (Decision 18 F7):
+# `todo promote --thread` is hard ticket-gated. Every existing run_cli() call
+# below that happens to invoke `promote` now needs a matching ticket minted
+# for its EXACT argv first, or it will refuse `no_ticket` once the gate
+# lands -- this is pure test-fixture migration (not new behaviour); the new
+# package03 AC9 gate assertions are appended near the end of this file.
+# ---------------------------------------------------------------------------
+(my $TODO_BUTLER_SCRIPTS = "$Bin/../../../butler/scripts") =~ s{\\}{/}g;
+my $TODO_BPHOOK_PM = "$TODO_BUTLER_SCRIPTS/BpHook.pm";
+require $TODO_BPHOOK_PM unless grep { m{(?:^|/)BpHook\.pm$} } keys %INC;
+my $TODO_BSD = tempdir(CLEANUP => 1); $TODO_BSD =~ s{\\}{/}g;
+my $TODO_TICKET_SEQ = 0;
+sub mint_todo_ticket {
+    my (@argv) = @_;
+    local $ENV{BUTLER_STATE_DIR} = $TODO_BSD;
+    return BpHook::write_ticket(
+        { session_id => 'FIXTURE-TODO-SESSION', tool_use_id => 'FT' . (++$TODO_TICKET_SEQ),
+          transcript_path => undef, cwd => '/fixture' },
+        'almanac-todo', [ @argv ]);
+}
+
+# ---------------------------------------------------------------------------
 # scaffolding
 # ---------------------------------------------------------------------------
 sub slurp_raw {
@@ -80,6 +102,31 @@ sub read_all_lines {
     return @l;
 }
 
+# _safe_home_for_cli() -- a dedicated tempdir every CLI spawn in this file is
+# pinned to via ALMANAC_HOME/HOME/USERPROFILE. An explicit --home in @args
+# always wins over these env vars (Almanac::Store::_resolve_home checks
+# $opt{home} first), so this never changes behaviour for the global-scope
+# fixtures that already pass --home $H.. explicitly.
+#
+# It exists because `todo promote` (run via run_cli, spec 2.11) refreshes
+# the global-counts snapshot unconditionally -- "the thread write needs
+# record_root regardless of the todo's own scope" (almanac-todo.pl's own
+# comment on _cmd_promote) -- and almanac-thread.pl (run via run_thread_cli)
+# does the same on every mutating verb. Neither passes --home, so without
+# this pinning both resolve home from the real process environment. See
+# redteam-1.md S1 (where-things-go package 02-thread-store): this is exactly
+# how a prior run of this file wrote stale deleted-tempdir thread entries
+# into the operator's real ~/.claude/almanac-global-counts.json.
+my $SAFE_HOME_FOR_CLI;
+sub _safe_home_for_cli {
+    unless (defined $SAFE_HOME_FOR_CLI) {
+        my $d = tempdir(CLEANUP => 1);
+        $d =~ s{\\}{/}g;
+        $SAFE_HOME_FOR_CLI = $d;
+    }
+    return $SAFE_HOME_FOR_CLI;
+}
+
 # run_cli(@args) -> { rc, out, err }
 # Spawns a real perl process against almanac-todo.pl, capturing STDOUT and
 # STDERR to separate temp files (never an in-memory scalar reopen -- see
@@ -89,6 +136,11 @@ sub run_cli {
     my (undef, $outpath) = tempfile(UNLINK => 1);
     my (undef, $errpath) = tempfile(UNLINK => 1);
     my $argstr = join(' ', map { qq{"$_"} } @args);
+    local $ENV{ALMANAC_HOME} = _safe_home_for_cli();
+    local $ENV{HOME}         = _safe_home_for_cli();
+    local $ENV{USERPROFILE}  = _safe_home_for_cli();
+    local $ENV{BUTLER_STATE_DIR} = $TODO_BSD;
+    mint_todo_ticket(@args) if @args && $args[0] eq 'promote';
     system(qq{perl "$TODO_PL" $argstr > "$outpath" 2> "$errpath"});
     my $rc = $? >> 8;
     my $out = slurp_text($outpath);
@@ -253,6 +305,10 @@ ok(-f $TODO_PL, 'almanac-todo.pl exists at plugins/almanac/scripts/almanac-todo.
             qr/^\s*use\s+POSIX\b/,           qr/^\s*use\s+JSON::PP\b/,
             qr/^\s*use\s+Encode\b/,          qr/^\s*use\s+Almanac::Store\b/,
             qr/^\s*use\s+Almanac::Record\b/, qr/^\s*use\s+Almanac::GlobalCounts\b/,
+            # where-things-go package 02-thread-store (spec 2.11): `todo
+            # promote` needs Almanac::Thread; loaded as a runtime `require`
+            # (not a top-level `use`), matched here as either form.
+            qr/^\s*(use|require)\s+Almanac::Thread\b/,
         );
         my @bad_imports = grep { my $l = $_; !grep { $l =~ $_ } @allowed } @uses;
         unless (ok(@bad_imports == 0, 'AC-42: the file imports only from the S2.0 allowlist')) {
@@ -1182,6 +1238,187 @@ AC38CHILD
     is($r->{rc}, 2, 'B22: list --project --global exits 2');
     is(err_kind($r->{err}), 'usage', 'B22: ...with kind: usage');
     is(field2($r->{err}, 'detail'), 'scope_conflict', 'B22: ...and detail: scope_conflict');
+}
+
+# =============================================================================
+# AC9 (blueprint where-things-go, package 02-thread-store, specs/
+# 02-thread-store-spec.md section 2.11, behaviour 16) -- `todo promote <id>
+# --thread <name>` creates a task in the thread, completes the todo with a
+# pointer, and the body moves (not duplicates); re-running is a no-op;
+# promoting an already-completed open todo whose task already exists
+# (crash resume) reuses the task; `--thread` missing is a usage error;
+# promoting a done todo with no promoted_to refuses todo_not_open.
+# =============================================================================
+(my $THREAD_PL_FOR_TODO = "$S/almanac-thread.pl") =~ s{\\}{/}g;
+ok(-f $THREAD_PL_FOR_TODO, 'AC9 precondition: almanac-thread.pl exists (this package\'s own sibling script)')
+    or diag('not present yet -- every AC9 assertion below is expected to fail for exactly that reason');
+
+# run_thread_cli(@args) -- a real perl subprocess against almanac-thread.pl,
+# pinned to the same safe tempdir home as run_cli (see _safe_home_for_cli
+# above): every call here passes --root and never --home, and
+# almanac-thread.pl unconditionally refreshes the global-counts snapshot on
+# a mutating verb, so without this pinning the refresh resolves home from
+# the real process environment.
+sub run_thread_cli {
+    my (@args) = @_;
+    my (undef, $outpath) = tempfile(UNLINK => 1);
+    my (undef, $errpath) = tempfile(UNLINK => 1);
+    my $argstr = join(' ', map { qq{"$_"} } @args);
+    local $ENV{ALMANAC_HOME} = _safe_home_for_cli();
+    local $ENV{HOME}         = _safe_home_for_cli();
+    local $ENV{USERPROFILE}  = _safe_home_for_cli();
+    local $ENV{BUTLER_STATE_DIR} = $TODO_BSD;
+    # package 03-thread-sessions, Decision 18 F6: a hard ticket gate lands on
+    # every almanac-thread.pl write verb -- mint one for this exact argv so
+    # this file's AC9 (promote) fixture keeps working once that gate exists.
+    BpHook::write_ticket(
+        { session_id => 'FIXTURE-TODO-SESSION', tool_use_id => 'FT' . (++$TODO_TICKET_SEQ),
+          transcript_path => undef, cwd => '/fixture' },
+        'almanac-thread', [ @args ]);
+    system(qq{perl "$THREAD_PL_FOR_TODO" $argstr > "$outpath" 2> "$errpath"});
+    my $rc = $? >> 8;
+    return { rc => $rc, out => (slurp_text($outpath) // ''), err => (slurp_text($errpath) // '') };
+}
+sub thread_show_json {
+    my (@args) = @_;
+    my $r = run_thread_cli('show', @args, '--json');
+    return (decode_json_or_undef($r->{out}), $r);
+}
+
+{
+    my $ROOT9 = tempdir(CLEANUP => 1);
+    $ROOT9 =~ s{\\}{/}g;
+    run_thread_cli('create', 'promo-thread', '--root', $ROOT9);
+
+    my $rc0 = run_cli('create', '--title', 'Promote me', '--body', 'original body text', '--root', $ROOT9);
+    my $tid = field0($rc0->{out}, 'id');
+    ok(defined $tid, 'AC9 fixture: todo create succeeds') or diag("stderr: $rc0->{err}");
+
+    my $r1 = run_cli('promote', $tid, '--thread', 'promo-thread', '--root', $ROOT9);
+    is($r1->{rc}, 0, 'AC9: todo promote <id> --thread <name> exits 0') or diag("stderr: $r1->{err}");
+    is(field0($r1->{out}, 'thread'), 'promo-thread', 'AC9: result block carries thread: promo-thread');
+    is(field0($r1->{out}, 'changed'), 'yes', 'AC9: first promote: changed: yes');
+    my $task_id = field0($r1->{out}, 'task');
+    ok(defined $task_id && length $task_id, 'AC9: result block carries a non-empty task: id');
+
+    my ($todo_json) = show_json($tid, '--root', $ROOT9);
+    if (ref($todo_json) eq 'HASH') {
+        is($todo_json->{fields}{status}, 'done', 'AC9: the todo is completed (status: done)');
+        is($todo_json->{fields}{promoted_to}, "promo-thread/$task_id", 'AC9: promoted_to points at <thread>/<task>');
+        is($todo_json->{body}, "Moved to thread promo-thread, task $task_id.\n",
+            'AC9: the todo body is replaced by exactly the pointer line');
+    }
+
+    my ($thread_json) = thread_show_json('promo-thread', '--root', $ROOT9);
+    if (ref($thread_json) eq 'HASH') {
+        my ($task) = grep { $_->{id} eq $task_id } @{ $thread_json->{tasks} };
+        ok(defined $task, 'AC9: the thread holds a task with the returned id');
+        if ($task) {
+            is($task->{title}, 'Promote me', 'AC9: the task\'s title is the todo\'s title');
+            is($task->{body}, 'original body text', 'AC9: the task\'s body is byte-identical to the todo\'s original body');
+            is($task->{from_todo}, $tid, 'AC9: the task carries from_todo pointing at the todo id');
+        }
+    }
+
+    # re-running: no-op, changed: no, creates nothing new.
+    my $r2 = run_cli('promote', $tid, '--thread', 'promo-thread', '--root', $ROOT9);
+    is($r2->{rc}, 0, 'AC9: re-running promote on an already-promoted todo exits 0') or diag("stderr: $r2->{err}");
+    is(field0($r2->{out}, 'changed'), 'no', 'AC9: re-running promote: changed: no');
+    is(field0($r2->{out}, 'task'), $task_id, 'AC9: re-running promote reports the SAME task id');
+    my ($thread_json2) = thread_show_json('promo-thread', '--root', $ROOT9);
+    is(scalar(@{ $thread_json2->{tasks} }), 1, 'AC9: re-running promote created no second task')
+        if ref($thread_json2) eq 'HASH';
+}
+
+# AC9 -- crash resume: a task with from_todo already set exists in the
+# thread (as if a prior promote wrote the task but crashed before
+# completing the todo); a fresh promote call must reuse it, not duplicate.
+{
+    my $ROOT9b = tempdir(CLEANUP => 1);
+    $ROOT9b =~ s{\\}{/}g;
+    run_thread_cli('create', 'resume-thread', '--root', $ROOT9b);
+    my $rc0 = run_cli('create', '--title', 'Crash resume me', '--root', $ROOT9b);
+    my $tid = field0($rc0->{out}, 'id');
+    my $radd = run_thread_cli('add', 'resume-thread', '--title', 'Crash resume me', '--root', $ROOT9b);
+    # Thread.pm's add_task doesn't take --from-todo over the CLI per spec
+    # 2.7's table (only the library function does); the crash-resume case is
+    # therefore exercised by promote() itself finding the pre-existing link
+    # via the library seam, which this black-box CLI fixture cannot pre-seed
+    # without Almanac::Thread existing. The non-crash re-run case above
+    # (AC9: re-running promote...) already proves idempotency; this fixture
+    # is left as a precondition check so the gap is visible rather than
+    # silently skipped.
+    ok(-f "$S/Almanac/Thread.pm", 'AC9 crash-resume precondition: Almanac/Thread.pm exists to seed a from_todo task directly')
+        or diag('not present yet -- the true crash-resume fixture needs Thread.pm\'s add_task(from_todo=>...) seam');
+}
+
+# =============================================================================
+# AC9 -- --thread missing is a usage error; promoting an open todo succeeds;
+# promoting an already-done todo with no promoted_to refuses todo_not_open.
+# =============================================================================
+{
+    my $ROOT9c = tempdir(CLEANUP => 1);
+    $ROOT9c =~ s{\\}{/}g;
+    my $rc0 = run_cli('create', '--title', 'No thread flag', '--root', $ROOT9c);
+    my $tid = field0($rc0->{out}, 'id');
+    my $r = run_cli('promote', $tid, '--root', $ROOT9c);
+    is($r->{rc}, 2, 'AC9: promote with no --thread flag exits 2');
+    is(err_kind($r->{err}), 'usage', 'AC9: ...with kind: usage');
+    is(field2($r->{err}, 'detail'), 'missing_thread', 'AC9: ...and detail: missing_thread');
+
+    my $rc1 = run_cli('create', '--title', 'Already done, no promote', '--root', $ROOT9c);
+    my $tid2 = field0($rc1->{out}, 'id');
+    run_cli('complete', $tid2, '--root', $ROOT9c);
+    run_thread_cli('create', 'orphan-thread', '--root', $ROOT9c);
+    my $r2 = run_cli('promote', $tid2, '--thread', 'orphan-thread', '--root', $ROOT9c);
+    is($r2->{rc}, 2, 'AC9: promoting an already-done todo with no promoted_to exits 2');
+    is(err_kind($r2->{err}), 'refused', 'AC9: ...with kind: refused');
+    is(field2($r2->{err}, 'detail'), 'todo_not_open', 'AC9: ...and detail: todo_not_open');
+}
+
+# =============================================================================
+# package03 AC9 (blueprint where-things-go, package 03-thread-sessions,
+# specs/03-thread-sessions-spec.md section 2.8, behaviour 9) -- `todo
+# promote --thread` is ticket-gated exactly like almanac-thread.pl's own
+# write verbs: a subagent ticket is refused, the todo stays open, no task is
+# added; a main-session ticket succeeds and the task is created with the
+# ticket's session. NOT to be confused with the 02-thread-store AC9 above
+# (promote's own behavioural correctness).
+# =============================================================================
+{
+    my $ROOT9g = tempdir(CLEANUP => 1); $ROOT9g =~ s{\\}{/}g;
+    run_thread_cli('create', 'gate-thread', '--root', $ROOT9g);
+    my $rc0 = run_cli('create', '--title', 'Gate me (subagent)', '--root', $ROOT9g);
+    my $tid = field0($rc0->{out}, 'id');
+
+    my (undef, $outpath) = tempfile(UNLINK => 1);
+    my (undef, $errpath) = tempfile(UNLINK => 1);
+    my @argv = ('promote', $tid, '--thread', 'gate-thread', '--root', $ROOT9g);
+    {
+        local $ENV{BUTLER_STATE_DIR} = $TODO_BSD;
+        BpHook::write_ticket(
+            { session_id => 'GATE-SUB', tool_use_id => 'FT' . (++$TODO_TICKET_SEQ), agent_id => 'AG1',
+              transcript_path => undef, cwd => '/fixture' },
+            'almanac-todo', [ @argv ]);
+    }
+    my $argstr = join(' ', map { qq{"$_"} } @argv);
+    local $ENV{ALMANAC_HOME} = _safe_home_for_cli();
+    local $ENV{HOME}         = _safe_home_for_cli();
+    local $ENV{USERPROFILE}  = _safe_home_for_cli();
+    local $ENV{BUTLER_STATE_DIR} = $TODO_BSD;
+    system(qq{perl "$TODO_PL" $argstr > "$outpath" 2> "$errpath"});
+    my $rc_sub = $? >> 8;
+    my $err_sub = slurp_text($errpath) // '';
+    is($rc_sub, 2, 'package03 AC9: todo promote --thread with a subagent ticket exits 2');
+    like($err_sub, qr/subagent/i, 'package03 AC9: ...STDERR names the subagent rule');
+    my $r_check = run_cli('show', $tid, '--root', $ROOT9g);
+    unlike($r_check->{out}, qr/status:\s*done/, 'package03 AC9: the todo stays open after the refused subagent promote');
+    my ($tj) = thread_show_json('gate-thread', '--root', $ROOT9g);
+    is(scalar(@{ $tj->{tasks} // [] }), 0, 'package03 AC9: no task was added to the thread by the refused promote')
+        if ref($tj) eq 'HASH';
+
+    my $r_main = run_cli('promote', $tid, '--thread', 'gate-thread', '--root', $ROOT9g);
+    is($r_main->{rc}, 0, 'package03 AC9: the same promote from the main session succeeds') or diag($r_main->{err});
 }
 
 # =============================================================================

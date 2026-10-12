@@ -1,7 +1,7 @@
 #!/usr/bin/env perl
 # bp-resolve.pl — e03-autonomous-resolution: the deterministic apply-step for
 # bp-escalation-resolver's verdicts. Library + CLI, mirroring
-# bp-answer-decision.pl's own pure-function/CLI split (BpAnswer -> BpResolve).
+# bp-answer-escalation's own pure-function/CLI split (BpAnswer -> BpResolve).
 #
 # Governing rule (spec e03-autonomous-resolution-spec.md, stated once so it is
 # not diluted anywhere below): a run stops for the operator ONLY when there is
@@ -11,7 +11,7 @@
 # this asymmetry away.
 #
 # Provenance (DC2): two distinct on-disk records, never conflated with each
-# other or with bp-wait-for-decision.pl's UNRELATED classify_decision /
+# other or with bp-wait-for-escalation.pl's UNRELATED classify_decision /
 # autonomous_decision_record pair (b24-reporter-autonomy) --
 #   (a) in-place tag on the STILL-QUEUED runs/needs-you/<id>.json, when the
 #       resolver's verdict lands on category product/operator-action (including
@@ -64,6 +64,24 @@ my @OPERATOR_OWNED = qw(product operator-action);
 my %OPERATOR_OWNED = map { $_ => 1 } @OPERATOR_OWNED;
 sub _operator_owned { my ($c) = @_; return defined $c && $OPERATOR_OWNED{$c} ? 1 : 0 }
 
+# _has_visible_text($s) -> 1|0 -- PURE-ish (never dies, never mutates $s: it
+# only ever reads a COPY). redteam-1.md L3: true only if, after decoding real
+# UTF-8 bytes (undoing the JSON::PP flag quirk -- see BpOrch::_json_bytes'
+# header comment) and trimming every Unicode whitespace character PLUS the
+# zero-width/BOM format characters that Unicode does not classify as
+# whitespace but no renderer ever shows, at least one character remains.
+sub _has_visible_text {
+    my ($s) = @_;
+    return 0 unless defined $s && !ref $s;
+    require Encode;
+    my $bytes = $s;
+    utf8::downgrade($bytes, 1);
+    my $decoded = eval { Encode::decode('UTF-8', $bytes, Encode::FB_DEFAULT()) };
+    $decoded = $bytes unless defined $decoded;
+    $decoded =~ s/[\s\x{200B}-\x{200D}\x{2060}\x{FEFF}]+//g;
+    return length($decoded) ? 1 : 0;
+}
+
 # ---------------------------------------------------------------------------
 # verdict_shape_ok(\%verdict) -> (1|0, $why)   -- PURE, no I/O.
 # Required keys present per category:
@@ -95,6 +113,20 @@ sub verdict_shape_ok {
         for my $k (qw(confidence evidence)) {
             return (0, "missing required key '$k' for category=$cat") unless defined $v->{$k};
         }
+        # e06-fleet-inbox-bridge §2.6: product_question is REQUIRED for the
+        # operator-owned pair -- the inbox item's title/body (and, before
+        # that, this gate) depend on the resolver having actually phrased a
+        # product-level question rather than merely naming a category.
+        # redteam-1.md L3: `/\S/` alone accepts invisible-only Unicode (a
+        # lone NBSP or ZWSP) because \S only tests for "not a whitespace
+        # BYTE" against a JSON::PP-decoded string that is still raw bytes
+        # under a spurious utf8 flag (see BpOrch::_json_bytes). Decode for
+        # real, trim Unicode whitespace AND the zero-width/BOM format
+        # characters that are not whitespace but are still invisible, and
+        # require something remains.
+        my $pq = $v->{product_question};
+        return (0, "missing required key 'product_question' for category=$cat")
+            unless defined $pq && !ref($pq) && _has_visible_text($pq);
         return (1, undef);
     }
     if ($RESOLVER_OWNED{$cat}) {
@@ -118,7 +150,7 @@ sub verdict_in_bounds {
     return (0, 'verdict must be a hashref') unless ref $v eq 'HASH';
     my $act = $v->{action};
     if (defined $act && ($act eq 'accept' || $act eq 'drop')) {
-        return (0, "action='$act' is never permitted -- the resolver may never accept or drop a decision");
+        return (0, "action='$act' is never permitted -- the resolver may never accept or drop an escalation");
     }
     # Canonicalised, like the other two gates. Without this a legacy
     # 'operational' verdict passes verdict_shape_ok (which canonicalises) and
@@ -216,7 +248,7 @@ sub _rlog {
 # under any lock, before committing. The resolver judge's own wall-clock
 # budget is up to 1800s (BP_JUDGE_TIMEOUT_SECS) -- easily enough time for an
 # operator to independently answer the same decision via
-# bp-answer-decision.pl while the judge is still thinking. Per spec §2.1b,
+# bp-answer-escalation while the judge is still thinking. Per spec §2.1b,
 # the operator's own answer deletes runs/needs-you/<id>.json with no archive
 # entry -- THAT deletion is itself the record of what happened. Committing
 # the stale snapshot afterward silently UNDID the operator's own action
@@ -228,7 +260,7 @@ sub _rlog {
 # BpWrite::guarded_write), applied here rather than reinvented: lock ->
 # re-read the queue record -> compare to the snapshot the caller was handed
 # -> if it is GONE or has CHANGED, ABORT before any write. An operator's
-# disposal must win every race. bp-answer-decision.pl's own final unlink
+# disposal must win every race. bp-answer-escalation's own final unlink
 # (line ~682) does not itself take this lock -- that file is outside this
 # package's write set -- so this narrows the staleness window from the
 # resolver's full ~1800s wall-clock budget down to the few milliseconds
@@ -268,7 +300,7 @@ sub _with_qpath_lock {
 }
 
 # list-form system() with the child's stdout/stderr redirected around the
-# call -- the same discipline bp-answer-decision.pl's own
+# call -- the same discipline bp-answer-escalation's own
 # update_next_action_with_note already uses, for the same reason: a caller of
 # THIS module (the orchestrator's tick loop, or the CLI below) may itself be
 # parsing stdout as JSON, and a stray line from a shelled-out script must
@@ -292,9 +324,9 @@ sub _run_quiet {
 # ---------------------------------------------------------------------------
 # _dispatch_action(\%verdict, \%rec, $id, \%ctx) -> exit-code-shaped integer
 # (0 == succeeded). Reaches every one of the four bounded actions WITHOUT
-# editing bp-answer-decision.pl or bp-blueprint.pl -- invoking their existing,
+# editing bp-answer-escalation or bp-blueprint.pl -- invoking their existing,
 # already-shipped CLI surfaces (spec §2.3), the same reuse pattern
-# bp-answer-decision.pl already applies to bp-ledger.pl.
+# bp-answer-escalation already applies to bp-ledger.pl.
 # ---------------------------------------------------------------------------
 sub _dispatch_action {
     my ($verdict, $rec, $id, $ctx) = @_;
@@ -304,7 +336,7 @@ sub _dispatch_action {
     my $rationale = $verdict->{rationale} // '';
 
     if ($action eq 'relaunch') {
-        return _run_quiet($^X, "$SELF_DIR/bp-answer-decision.pl", $bp,
+        return _run_quiet($^X, "$SELF_DIR/bp-answer-escalation.pl", $bp,
             '--decision', $id, '--action', 'relaunch', '--note', $rationale, '--bp-dir', $bpdir);
     }
     if ($action eq 'widen-write-set') {
@@ -313,7 +345,7 @@ sub _dispatch_action {
         # $verdict->{evidence}, but the agent's own output contract documents
         # 'evidence' as a PROSE CITATION ("file:line, ledger section, or
         # Decisions row" -- bp-escalation-resolver.md), and
-        # bp-answer-decision.pl's --widen-write-set handler unconditionally
+        # bp-answer-escalation's --widen-write-set handler unconditionally
         # REJECTS any value containing a colon. A 'file:line' citation --
         # exactly the format the agent's own prompt suggests first -- made
         # this fail EVERY TIME for a fully compliant agent, with no forward
@@ -326,8 +358,8 @@ sub _dispatch_action {
         return 1 unless defined $path;
         $path =~ s/^\s+|\s+$//g;
         return 1 unless length $path;
-        return 1 if $path =~ /:/;   # same guard bp-answer-decision.pl enforces -- refuse here, don't shell out to fail there
-        return _run_quiet($^X, "$SELF_DIR/bp-answer-decision.pl", $bp,
+        return 1 if $path =~ /:/;   # same guard bp-answer-escalation enforces -- refuse here, don't shell out to fail there
+        return _run_quiet($^X, "$SELF_DIR/bp-answer-escalation.pl", $bp,
             '--decision', $id, '--widen-write-set', $path, '--bp-dir', $bpdir);
     }
     if ($action eq 'edit-depends-on') {
@@ -455,7 +487,10 @@ sub _bump_chronic_scoping_counter {
                 context    => "Most recent autonomous scoping resolution: $id"
                              . (length($verdict->{rationale} // '') ? " -- $verdict->{rationale}" : ''),
                 created_at => time,
-                category   => 'product',
+                # e06-fleet-inbox-bridge §2.6: unclassified, not product -- a
+                # mechanical site must not route straight to the operator;
+                # the resolver judges this one too (Decision 17 Q23).
+                category   => 'unclassified',
             }, $ctx->{bpdir});
         }
         1;
@@ -505,6 +540,11 @@ sub apply_verdict {
             $tagged{confidence}  = $verdict->{confidence};
             $tagged{evidence}    = $verdict->{evidence};
             $tagged{resolution}  = $verdict->{resolution} // $verdict->{rationale} // '';
+            # e06-fleet-inbox-bridge §2.6: carried onto the tagged record
+            # (trimmed) -- verdict_shape_ok already guaranteed it is defined
+            # and non-blank for this category.
+            (my $pq = $verdict->{product_question}) =~ s/\A\s+|\s+\z//g;
+            $tagged{product_question} = $pq;
             return _atomic_write_json($qpath, \%tagged);
         });
         if ($stale) {
@@ -711,7 +751,7 @@ unless (caller) {
     my $qpath = BpOrch::escalations_dir($runs) . "/$id.json";
     my $rec = BpOrch::_read_json($qpath);
     unless (ref $rec eq 'HASH') {
-        print STDERR "bp-resolve: queued decision not found or unreadable: $qpath\n"; exit 2;
+        print STDERR "bp-resolve: queued escalation not found or unreadable: $qpath\n"; exit 2;
     }
 
     my $outcome = BpResolve::apply_verdict($verdict, $rec, $id,

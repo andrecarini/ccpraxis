@@ -15,6 +15,18 @@ use File::Basename qw(basename dirname);
 use Cwd qw(abs_path);
 use Fcntl qw(:flock);
 
+# AC15 (08-blueprint-parks fix-batch, SF-3): pin HOME/USERPROFILE/
+# ALMANAC_HOME to an isolated tempdir before any production code loads, so
+# a fixture call that is ever unticketed cannot reach the operator's real
+# vault (Decision 29). Pure hardening -- this file names none of these vars
+# today.
+BEGIN {
+    my $env_pin = File::Temp::tempdir(CLEANUP => 1);
+    $ENV{HOME}         = $env_pin;
+    $ENV{USERPROFILE}  = $env_pin;
+    $ENV{ALMANAC_HOME} = $env_pin;
+}
+
 my $SCRIPT = "$Bin/../../scripts/bp-drive-next.pl";
 my $LOADED = do { local $@; eval { require $SCRIPT }; !$@ };
 

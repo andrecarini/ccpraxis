@@ -15,6 +15,7 @@ use warnings;
 use File::Path ();
 use JSON::PP ();
 use Time::HiRes ();
+use Encode ();
 use Almanac::Store ();
 use Almanac::Lock ();
 
@@ -58,10 +59,36 @@ sub compute {
     my $note_store = Almanac::Store->open(scope => 'global', type => 'note', home => $opt{home});
     my $note_list  = $note_store->list();
 
-    return {
+    my %out = (
         todo => { open => $open, done => $done, total => $total },
         note => { total => scalar(@$note_list) },
-    };
+    );
+
+    # thread.open (blueprint where-things-go, package 02-thread-store, spec
+    # 2.6): number of thread metadata records with state live|handed-off,
+    # across every root in %opt's roots. A root whose read dies contributes
+    # 0 and is skipped (never fails the whole refresh).
+    if (exists $opt{roots}) {
+        my $n = 0;
+        for my $root (@{ (ref $opt{roots} eq 'ARRAY') ? $opt{roots} : [] }) {
+            my $ok = eval {
+                my $thread_dir = "$root/.ccpraxis-local-data/almanac/thread";
+                if (-d $thread_dir) {
+                    my $store = Almanac::Store->open(scope => 'project', type => 'thread', root => $root);
+                    my $list = $store->list();
+                    for my $rec (@$list) {
+                        my $st = $rec->{fields}{state};
+                        $n++ if defined $st && ($st eq 'live' || $st eq 'handed-off');
+                    }
+                }
+                1;
+            };
+            # swallow: a root whose read dies contributes 0.
+        }
+        $out{thread} = { open => $n };
+    }
+
+    return \%out;
 }
 
 # ---------------------------------------------------------------------------
@@ -79,7 +106,26 @@ sub serialize {
             total => 0 + $counts->{todo}{total},
         },
     );
-    return JSON::PP->new->canonical(1)->encode(\%doc) . "\n";
+    if (ref $counts->{thread} eq 'HASH') {
+        my @projects;
+        if (ref $counts->{thread}{projects} eq 'ARRAY') {
+            for my $p (@{ $counts->{thread}{projects} }) {
+                next unless defined $p && length $p;
+                # Spec 2.6: path strings are decoded from UTF-8 bytes to
+                # characters before encoding (FB_CROAK); an undecodable path
+                # is dropped rather than corrupting or blanking the rest of
+                # the recorded roots. JSON::PP->new->utf8->encode below then
+                # re-encodes every string field (including the plain-ASCII
+                # ones) to UTF-8 bytes itself, so decoded characters are the
+                # correct input here, not raw bytes.
+                my $decoded = eval { Encode::decode('UTF-8', $p, Encode::FB_CROAK()) };
+                next unless defined $decoded;
+                push @projects, $decoded;
+            }
+        }
+        $doc{thread} = { open => 0 + $counts->{thread}{open}, projects => \@projects };
+    }
+    return JSON::PP->new->utf8->canonical(1)->encode(\%doc) . "\n";
 }
 
 sub _now_iso {
@@ -187,12 +233,117 @@ sub _read_snapshot_once {
     return undef unless ref($note) eq 'HASH';
     return undef unless _is_nonneg_int($note->{total});
 
+    # thread (blueprint where-things-go, package 02-thread-store, spec 2.6):
+    # optional. A malformed thread section is dropped entirely rather than
+    # failing the whole snapshot -- todo/note are the load-bearing counters
+    # every existing reader (statusline) depends on; thread is additive.
+    if (exists $decoded->{thread}) {
+        my $t = $decoded->{thread};
+        my $ok = (ref($t) eq 'HASH') && _is_nonneg_int($t->{open});
+        if ($ok && exists $t->{projects}) {
+            if (ref($t->{projects}) eq 'ARRAY') {
+                for my $p (@{ $t->{projects} }) {
+                    unless (defined $p && !ref($p) && length($p)) { $ok = 0; last }
+                }
+            }
+            else {
+                $ok = 0;
+            }
+        }
+        if ($ok && ref($t->{projects}) eq 'ARRAY') {
+            # JSON::PP->decode (no ->utf8, deliberately -- this reader works
+            # on raw bytes throughout) still utf8-flags a decoded string that
+            # contains a raw multi-byte UTF-8 sequence taken verbatim from
+            # the input text -- but it does so by reinterpreting EACH BYTE as
+            # its own Latin-1 code point (<=255) under that flag, not by
+            # decoding the sequence as UTF-8. utf8::encode would therefore
+            # RE-ENCODE each of those single-byte code points as its own
+            # multi-byte UTF-8 sequence -- double-encoding the original bytes
+            # (observed: C3 A9 -> C3 83 C2 A9). utf8::downgrade is the
+            # correct inverse here: every code point already fits in a byte,
+            # so it just clears the flag and hands back the original bytes
+            # unchanged. (A caller handing the flagged form to a filesystem
+            # call like Cwd::abs_path hits the Windows mis-upgrade corruption
+            # documented in Almanac::PackageLink::_byteify; this avoids ever
+            # producing that form in the first place.)
+            for my $p (@{ $t->{projects} }) {
+                utf8::downgrade($p, 1) if utf8::is_utf8($p);
+            }
+        }
+        delete $decoded->{thread} unless $ok;
+    }
+
     return $decoded;
 }
 
+# _byteify($s) -> raw UTF-8 bytes (never re-encodes an already-byte scalar).
+# See Almanac::PackageLink::_byteify for the Cwd::abs_path flip-flop this
+# guards against -- the same host quirk applies to every path handled here.
+sub _byteify {
+    my ($s) = @_;
+    return $s unless defined $s;
+    my $copy = $s;
+    utf8::encode($copy) if utf8::is_utf8($copy);
+    return $copy;
+}
+
+# _recorded_roots($path) -> \@roots -- the thread.projects list from the
+# CURRENT snapshot at $path, if any, as raw UTF-8 bytes. Read directly
+# (never through read_snapshot/_read_snapshot_once, which enforce the
+# generated_at/todo/note shape this helper does not need) -- an absent or
+# undecodable file simply contributes no prior roots.
+sub _recorded_roots {
+    my ($path) = @_;
+    return [] unless defined $path && -f $path;
+    open(my $fh, '<:raw', $path) or return [];
+    local $/;
+    my $bytes = <$fh>;
+    close $fh;
+    return [] unless defined $bytes && length $bytes;
+    my $decoded = eval { JSON::PP->new->utf8->decode($bytes) };
+    return [] unless ref($decoded) eq 'HASH';
+    my $t = $decoded->{thread};
+    return [] unless ref($t) eq 'HASH' && ref($t->{projects}) eq 'ARRAY';
+    my @out;
+    for my $p (@{ $t->{projects} }) {
+        next unless defined $p && !ref($p) && length $p;
+        push @out, _byteify($p);
+    }
+    return \@out;
+}
+
+# _registry_roots(%opt) -> \@roots -- every project path known to the
+# steward registry at <home>/.claude/claude-code-vault/.registry-local.json
+# (%opt: home). Never dies: an absent/malformed registry contributes no
+# roots.
+sub _registry_roots {
+    my (%opt) = @_;
+    my $home = Almanac::Store::_resolve_home(home => $opt{home});
+    my $path = "$home/.claude/claude-code-vault/.registry-local.json";
+    return [] unless -f $path;
+    open(my $fh, '<:raw', $path) or return [];
+    local $/;
+    my $bytes = <$fh>;
+    close $fh;
+    return [] unless defined $bytes && length $bytes;
+    my $decoded = eval { JSON::PP->new->utf8->decode($bytes) };
+    return [] unless ref($decoded) eq 'HASH' && ref($decoded->{projects}) eq 'HASH';
+    my @out;
+    for my $slug (keys %{ $decoded->{projects} }) {
+        my $p = $decoded->{projects}{$slug};
+        next unless ref($p) eq 'HASH' && defined $p->{path} && length $p->{path};
+        my $norm = $p->{path};
+        $norm =~ s{\\}{/}g;
+        $norm =~ s{/\z}{} if length($norm) > 1;
+        push @out, _byteify($norm);
+    }
+    return \@out;
+}
+
 # ---------------------------------------------------------------------------
-# refresh(%opt) -> \%result     (%opt: home, timeout_ms); never dies/prints/
-# exits. See spec 2.3's six-step algorithm.
+# refresh(%opt) -> \%result     (%opt: home, timeout_ms, record_root); never
+# dies/prints/exits. See spec 2.3's six-step algorithm; record_root is the
+# where-things-go/02-thread-store addition (spec 2.6).
 # ---------------------------------------------------------------------------
 sub refresh {
     my (%opt) = @_;
@@ -217,15 +368,59 @@ sub refresh {
         return { ok => 0, reason => $kind, path => $path };
     }
 
-    my $counts = eval { compute(%opt) };
+    # thread.{open,projects} (spec 2.6): fold record_root into the roots
+    # carried forward from the existing snapshot, drop anything no longer a
+    # real directory, then union in every root the steward registry knows
+    # about -- deduped by Almanac::Store::_canonical_path so a root reached
+    # both ways is counted (and listed) once.
+    my @recorded = @{ _recorded_roots($path) };
+    if (defined $opt{record_root} && length $opt{record_root}) {
+        my $rr = _byteify($opt{record_root});
+        my $rr_c = Almanac::Store::_canonical_path($rr);
+        @recorded = grep { Almanac::Store::_canonical_path($_) ne $rr_c } @recorded;
+        push @recorded, $rr;
+    }
+    @recorded = grep { -d $_ } @recorded;
+
+    my @registry = @{ _registry_roots(%opt) };
+    my %seen;
+    my @union;
+    for my $r (@recorded, @registry) {
+        next unless -d $r;
+        my $c = Almanac::Store::_canonical_path($r);
+        next if $seen{$c}++;
+        push @union, $r;
+    }
+
+    my $counts = eval { compute(%opt, roots => \@union) };
     if (my $err = $@) {
         $lock->release;
         my $kind = (ref($err) && defined $err->{kind}) ? $err->{kind} : 'io';
         return { ok => 0, reason => $kind, path => $path };
     }
+    $counts->{thread}{projects} = \@recorded;
 
+    # 4096-byte size budget (spec 2.6): evict from `projects` only, never
+    # from `open`. Registry-member entries are evicted first (oldest first,
+    # i.e. from the front of @recorded, since new entries are always
+    # appended at the end by the dedup/push above), then the oldest
+    # remaining entry of any kind, until the serialized snapshot fits.
+    my %is_registry = map { Almanac::Store::_canonical_path($_) => 1 } @registry;
     my $gen_at = _now_iso();
     my $bytes  = serialize($counts, $gen_at);
+    while (length($bytes) > 4096 && @{ $counts->{thread}{projects} }) {
+        my $projects = $counts->{thread}{projects};
+        my $victim_idx;
+        for my $i (0 .. $#$projects) {
+            if ($is_registry{ Almanac::Store::_canonical_path($projects->[$i]) }) {
+                $victim_idx = $i;
+                last;
+            }
+        }
+        $victim_idx = 0 unless defined $victim_idx;
+        splice(@$projects, $victim_idx, 1);
+        $bytes = serialize($counts, $gen_at);
+    }
 
     my ($wok, $werr) = Almanac::Lock::write_atomic($path, $bytes);
     $lock->release;

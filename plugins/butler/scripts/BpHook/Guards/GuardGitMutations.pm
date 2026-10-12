@@ -37,6 +37,10 @@ require "$SELF_DIR/Shell.pm"
 
 my $MASK_MAX = 8192;
 
+# Package 08 Amendment 1 (Decision 48), spec sec 2.1 P0a. Bounds the only
+# uncapped work _heredoc_write_only_outer does: the linear walk over $cmd.
+my $HEREDOC_WALK_MAX = 262144;
+
 # Odd-punctuation heredoc delimiter (line 294 of the source hook), and the
 # "unquoted heredoc opener" check (source line 246). Both operate per-line
 # (grep -E semantics), against the RAW command.
@@ -49,6 +53,327 @@ my $SHELLWORD_WORD_RE = qr/
   | (^|[;&|\s])(python|python3)[\s]+-c([\s]|$)
 /x;
 
+# Package 08 (guard-git-mutations-heredoc-false-positive). Allow-list of
+# simple commands a write-only heredoc command may be composed of; none of
+# these execute their arguments. Spec sec 2.1 P10.
+my %HEREDOC_ALLOWED_VERB = map { ($_ => 1) }
+    qw(cat mkdir ls wc head tail echo printf cd pwd true);
+
+# ---------------------------------------------------------------------------
+# _heredoc_walk($cmd) -> ($outer, \@openers) on success, or the empty list
+# () on refusal (Amendment 1, spec sec 2.1 W). A state machine similar in
+# its transitions to BpHook::Guards::Shell::strip_noise (none/squote/dquote/
+# heredoc -- the old "comment" state is gone, see R1 below), but its OUTPUT
+# differs: non-heredoc text is copied through unchanged (never masked), each
+# heredoc opener token is replaced by the same number of spaces, and every
+# heredoc body line plus its terminator line is removed entirely (newline
+# included); the newline ending the opener line is kept. One extension over
+# strip_noise: a final line with no trailing newline that equals the
+# delimiter also counts as terminated.
+#
+# Each element of @openers is a hashref: { delim, quoted, offset, line,
+# body, terminated }, where offset/line are positions in $outer.
+#
+# Refuses (returns ()), and stops the walk at once, on:
+#   R1: a '#' read in state 'none' (not inside a quote, heredoc body, or the
+#       second half of a backslash pair already consumed). Removes the old
+#       comment-state machine and its predecessor test entirely.
+#   R2: a '<<' read in state 'none' that is not a COMPLETE opener -- a
+#       non-empty delimiter, a matching closing quote if one was opened,
+#       then end-of-input or one of the boundary chars (space/tab/newline/
+#       ;/&/|/</>/(/)) immediately after. The walker never falls back to
+#       treating an incomplete '<<' as plain text.
+#
+# Linear time (S2): the outer line index of each opener comes from a
+# running newline counter updated by the $append closure below, never by
+# recounting $out.
+#
+# Pure. Never dies on purpose, never spawns a process.
+# ---------------------------------------------------------------------------
+sub _heredoc_walk {
+    my ($cmd) = @_;
+    my @c = split //, $cmd, -1;
+    my $n = scalar @c;
+    my $out = '';
+    my $nl_count = 0;
+    my $state = 'none'; # none | squote | dquote | heredoc
+    my ($hd_delim, $hd_quoted, $hd_tabs, $hd_pending) = ('', 0, 0, 0);
+    my @openers;
+    my $cur;      # record for the heredoc currently being read
+    my $line = ''; # raw text of the current heredoc line, no trailing \n
+    my $body = ''; # raw body text accumulated for $cur
+    my $i = 0;
+
+    my $append = sub {
+        my ($chunk) = @_;
+        $out .= $chunk;
+        $nl_count += ($chunk =~ tr/\n//);
+    };
+
+    while ($i < $n) {
+        my $ch = $c[$i];
+
+        if ($state eq 'heredoc') {
+            if ($ch eq "\n") {
+                my $chk = $line;
+                $chk =~ s/^\t+// if $hd_tabs;
+                if ($chk eq $hd_delim) {
+                    $cur->{terminated} = 1;
+                    $cur->{body} = $body;
+                    $state = 'none';
+                }
+                else {
+                    $body .= $line . "\n";
+                }
+                $line = '';
+                $i++;
+                next;
+            }
+            $line .= $ch;
+            $i++;
+            next;
+        }
+
+        if ($state eq 'squote') {
+            $append->($ch);
+            $state = 'none' if $ch eq "\x27";
+            $i++;
+            next;
+        }
+
+        if ($state eq 'dquote') {
+            if ($ch eq "\\" && $i + 1 < $n) {
+                $append->($ch . $c[$i + 1]);
+                $i += 2;
+                next;
+            }
+            if ($ch eq "\$" && $i + 1 < $n && $c[$i + 1] eq '(') {
+                my $depth = 1;
+                my $j = $i + 2;
+                my $buf = "\$(";
+                while ($j < $n && $depth > 0) {
+                    my $cj = $c[$j];
+                    $depth++ if $cj eq '(';
+                    $depth-- if $cj eq ')';
+                    $buf .= $cj;
+                    $j++;
+                }
+                $append->($buf);
+                $i = $j;
+                next;
+            }
+            if ($ch eq "\x60") {
+                my $j = $i + 1;
+                my $buf = "\x60";
+                while ($j < $n && $c[$j] ne "\x60") { $buf .= $c[$j]; $j++ }
+                if ($j < $n) { $buf .= $c[$j]; $j++ }
+                $append->($buf);
+                $i = $j;
+                next;
+            }
+            $append->($ch);
+            $state = 'none' if $ch eq q{"};
+            $i++;
+            next;
+        }
+
+        # state 'none'
+        if ($hd_pending && $ch eq "\n") {
+            $append->("\n");
+            $i++;
+            $state = 'heredoc';
+            $hd_pending = 0;
+            $line = '';
+            $body = '';
+            next;
+        }
+        if ($ch eq "\x27") { $state = 'squote'; $append->($ch); $i++; next }
+        if ($ch eq q{"})   { $state = 'dquote'; $append->($ch); $i++; next }
+        if ($ch eq "\\" && $i + 1 < $n) { $append->($ch . $c[$i + 1]); $i += 2; next }
+        if ($ch eq '#') {
+            return ();                                              # R1
+        }
+        if ($ch eq '<' && $i + 1 < $n && $c[$i + 1] eq '<') {
+            my $j = $i + 2;
+            my $tabs = 0;
+            if ($j < $n && $c[$j] eq '-') { $tabs = 1; $j++ }
+            $j++ while ($j < $n && $c[$j] =~ /[ \t]/);
+            my $q = '';
+            if ($j < $n && ($c[$j] eq "\x27" || $c[$j] eq q{"})) { $q = $c[$j]; $j++ }
+            my $delim = '';
+            $delim .= $c[$j++] while ($j < $n && $c[$j] =~ /[A-Za-z0-9_]/);
+            return () unless length($delim);                        # R2.1
+            if (length($q)) {
+                return () unless ($j < $n && $c[$j] eq $q);          # R2.2
+                $j++;
+            }
+            if ($j < $n) {
+                return () unless $c[$j] =~ /[ \t\n;&|<>()]/;         # R2.3
+            }
+            my $offset = length($out);
+            my $line_idx = $nl_count;
+            $append->(' ' x ($j - $i));
+            $i = $j;
+            $hd_delim  = $delim;
+            $hd_quoted = length($q) ? 1 : 0;
+            $hd_tabs   = $tabs;
+            $hd_pending = 1;
+            $cur = {
+                delim => $delim, quoted => $hd_quoted, offset => $offset,
+                line => $line_idx, body => '', terminated => 0,
+            };
+            push @openers, $cur;
+            next;
+        }
+        $append->($ch);
+        $i++;
+    }
+
+    if ($state eq 'heredoc') {
+        my $chk = $line;
+        $chk =~ s/^\t+// if $hd_tabs;
+        if ($chk eq $hd_delim) {
+            $cur->{terminated} = 1;
+            $cur->{body} = $body;
+        }
+        else {
+            $cur->{body} = $body . $line;
+        }
+    }
+
+    return ($out, \@openers);
+}
+
+# ---------------------------------------------------------------------------
+# _heredoc_segments($m) -> list of [start, end) half-open character ranges,
+# splitting $m at every top-level ';', '&', '|', '(', ')' or newline.
+# Whitespace-only ranges are kept here and filtered by the caller.
+# ---------------------------------------------------------------------------
+sub _heredoc_segments {
+    my ($m) = @_;
+    my @ranges;
+    my $len = length($m);
+    my $start = 0;
+    for (my $i = 0; $i < $len; $i++) {
+        my $ch = substr($m, $i, 1);
+        if ($ch eq ';' || $ch eq '&' || $ch eq '|' || $ch eq '(' || $ch eq ')' || $ch eq "\n") {
+            push @ranges, [$start, $i] if $i > $start;
+            $start = $i + 1;
+        }
+    }
+    push @ranges, [$start, $len] if $len > $start;
+    return @ranges;
+}
+
+sub _heredoc_segment_for {
+    my ($ranges, $offset) = @_;
+    for my $r (@$ranges) {
+        return $r if $offset >= $r->[0] && $offset < $r->[1];
+    }
+    return undef;
+}
+
+sub _heredoc_first_token {
+    my ($raw) = @_;
+    my ($tok) = $raw =~ /^\s*(\S+)/;
+    return $tok;
+}
+
+# ---------------------------------------------------------------------------
+# _heredoc_has_stdout_redirect($raw_seg, $m_seg) -> true iff $m_seg contains
+# a stdout redirect operator (">" or ">>", optionally "1>"/"1>>") at the
+# start of a token, followed (after optional raw spaces) by a non-empty
+# target whose first character is not '&', '(', '>' or '|'. Spec sec 2.1 P11.
+# ---------------------------------------------------------------------------
+sub _heredoc_has_stdout_redirect {
+    my ($raw_seg, $m_seg) = @_;
+    while ($m_seg =~ /(?:^|[\s])1?(>>?)/g) {
+        my $rest_start = pos($m_seg);
+        my $rest = substr($raw_seg, $rest_start);
+        $rest =~ s/^[ \t]+//;
+        next unless length($rest);
+        my $first = substr($rest, 0, 1);
+        return 1 unless $first =~ /[&(>|]/;
+    }
+    return 0;
+}
+
+# ---------------------------------------------------------------------------
+# _heredoc_write_only_outer($cmd) -> $outer | undef. Spec sec 2.1. Pure, no
+# I/O, never dies on purpose. undef means "no exemption, behave exactly as
+# today" (the fail-closed direction). A defined $outer is $cmd with every
+# heredoc body (and its opener token) cut out, ready to be re-scanned by the
+# existing, unchanged pipeline.
+# ---------------------------------------------------------------------------
+sub _heredoc_write_only_outer {
+    my ($cmd) = @_;
+    return undef unless defined $cmd && !ref($cmd);
+
+    return undef unless index($cmd, '<<') >= 0;                # P0
+    return undef if length($cmd) > $HEREDOC_WALK_MAX;           # P0a
+    return undef if index($cmd, "\r") >= 0;                     # P1
+    return undef if index($cmd, '<<<') >= 0;                    # P2
+    return undef if BpHook::Guards::Common::line_match($ODD_HD_DELIM_RE, $cmd); # P3
+
+    # P4 deleted (Amendment 1, M1/M4): R1 in _heredoc_walk refuses every
+    # case P4 caught (a none-state '#'), and P4 was the source of the
+    # uncapped strip_noise calls. The label stays retired.
+
+    my ($outer, $openers) = _heredoc_walk($cmd);                # W
+    return undef unless defined $outer;                         # walk refused (R1/R2)
+    return undef unless @$openers;                              # P5
+    return undef if grep { !$_->{terminated} } @$openers;        # P6
+
+    my %seen_line;
+    for my $o (@$openers) {                                     # P7
+        return undef if $seen_line{ $o->{line} }++;
+    }
+
+    return undef if index($outer, '$(') >= 0;                   # P8
+    return undef if index($outer, "\x60") >= 0;
+    return undef if index($outer, '<(') >= 0;
+    return undef if index($outer, '>(') >= 0;
+    return undef if index($outer, "\\") >= 0;                   # P8 (M2)
+    return undef if index($outer, '${') >= 0;                   # P8 (new)
+    return undef if index($outer, '$[') >= 0;                   # P8 (new)
+
+    for my $o (@$openers) {                                     # P9
+        next if $o->{quoted};
+        return undef if index($o->{body}, '$(') >= 0;
+        return undef if index($o->{body}, "\x60") >= 0;
+    }
+
+    for my $o (@$openers) {                                     # P9a (new)
+        next if $o->{quoted};
+        return undef if index($o->{body}, "\\\n") >= 0;
+    }
+
+    return undef if length($outer) > $MASK_MAX;                 # P-CAP (new)
+
+    my $m = BpHook::Guards::Shell::strip_noise($outer);         # S
+    return undef unless defined $m && length($m) == length($outer);
+    my @ranges = _heredoc_segments($m);
+
+    for my $r (@ranges) {                                       # P10
+        my $raw = substr($outer, $r->[0], $r->[1] - $r->[0]);
+        next unless $raw =~ /\S/;
+        my $tok = _heredoc_first_token($raw);
+        return undef unless defined $tok && $HEREDOC_ALLOWED_VERB{$tok};
+    }
+
+    for my $o (@$openers) {                                     # P11
+        my $seg = _heredoc_segment_for(\@ranges, $o->{offset});
+        return undef unless $seg;
+        my $raw_seg = substr($outer, $seg->[0], $seg->[1] - $seg->[0]);
+        my $tok = _heredoc_first_token($raw_seg);
+        return undef unless defined $tok && $tok eq 'cat';
+        my $m_seg = substr($m, $seg->[0], $seg->[1] - $seg->[0]);
+        return undef unless _heredoc_has_stdout_redirect($raw_seg, $m_seg);
+    }
+
+    return $outer;
+}
+
 # ---------------------------------------------------------------------------
 # _git_scan_target($cmd) -> ($scan, $raw_kind). Faithful port of
 # git_scan_target() in plugins/butler/hooks/guard-git-mutations.sh (lines
@@ -57,6 +382,14 @@ my $SHELLWORD_WORD_RE = qr/
 # ---------------------------------------------------------------------------
 sub _git_scan_target {
     my ($cmd) = @_;
+
+    # Package 08: a write-only heredoc (every heredoc terminated, allow-
+    # listed, never executed) is re-scanned with its bodies cut out, so the
+    # raw-fallback triggers below never see mutation-shaped text that only
+    # ever gets written to a file. See _heredoc_write_only_outer's own doc.
+    my $outer = _heredoc_write_only_outer($cmd);
+    return _git_scan_target($outer) if defined $outer;
+
     my $len = length($cmd);
 
     # 1. Over-long command: raw fallback without even walking it.

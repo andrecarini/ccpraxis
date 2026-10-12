@@ -31,6 +31,28 @@ my $BUG   = "$S/almanac-bug.pl";
 ok(-f $GUARD, 'guard-almanac-write.sh exists') or BAIL_OUT('hook missing');
 ok(-f $BUG,   'almanac-bug.pl exists')         or BAIL_OUT('script missing');
 
+# ---------------------------------------------------------------------------
+# blueprint where-things-go, package 03-thread-sessions (Decision 18 F6): a
+# hard ticket gate lands on every almanac-thread.pl write verb. Mint one for
+# the exact argv of every almanac-thread.pl call this file makes (lines ~637,
+# ~709) so those fixtures keep working once that gate exists -- pure
+# migration, not new behaviour. Also pins BUTLER_STATE_DIR to a tempdir
+# (AC15 hygiene): this file previously left it unset/ambient.
+# ---------------------------------------------------------------------------
+(my $WG_BUTLER_SCRIPTS = "$Bin/../../../butler/scripts") =~ s{\\}{/}g;
+require "$WG_BUTLER_SCRIPTS/BpHook.pm" unless grep { m{(?:^|/)BpHook\.pm$} } keys %INC;
+my $WG_BSD = tempdir(CLEANUP => 1); $WG_BSD =~ s{\\}{/}g;
+local $ENV{BUTLER_STATE_DIR} = $WG_BSD;
+my $WG_TICKET_SEQ = 0;
+sub _mint_thread_ticket_wg {
+    my (@argv) = @_;
+    local $ENV{BUTLER_STATE_DIR} = $WG_BSD;
+    BpHook::write_ticket(
+        { session_id => 'FIXTURE-SESSION', tool_use_id => 'FT' . (++$WG_TICKET_SEQ),
+          transcript_path => undef, cwd => '/fixture' },
+        'almanac-thread', [ @argv ]);
+}
+
 my $STORE_PM = "$S/Almanac/Store.pm";
 ok(-f $STORE_PM, 'Almanac::Store module file exists at plugins/almanac/scripts/Almanac/Store.pm')
     or diag('Almanac/Store.pm has not been widened with the seal yet -- every [S] assertion below '
@@ -104,12 +126,41 @@ sub ev {
     return { hook_event_name => 'PreToolUse', tool_name => $tool, tool_input => { $key => $path } };
 }
 
+# _safe_home_for_run_pl() -- a dedicated tempdir, created once and reused,
+# that every run_pl() spawn is pinned to via ALMANAC_HOME/HOME/USERPROFILE.
+# An explicit --home in @args always wins over these env vars
+# (Almanac::Store::_resolve_home checks $opt{home} first), so this never
+# changes behaviour for the AC13/AC14 global-scope calls that already pass
+# --home $home13 explicitly. It exists only to catch calls that pass neither
+# --global nor --home: today that is every project-scope almanac-thread.pl
+# call, whose add/create/archive verbs unconditionally refresh the global-
+# counts snapshot (unlike almanac-todo.pl/almanac-note.pl, which only
+# refresh in global scope) and would otherwise resolve home from the real
+# process environment -- see redteam-1.md S1 (where-things-go package
+# 02-thread-store): this is exactly how a prior run of this file wrote 3
+# stale deleted-tempdir thread entries into the operator's real
+# ~/.claude/almanac-global-counts.json.
+my $SAFE_HOME_FOR_RUN_PL;
+sub _safe_home_for_run_pl {
+    unless (defined $SAFE_HOME_FOR_RUN_PL) {
+        my $d = tempdir(CLEANUP => 1);
+        $d =~ s{\\}{/}g;
+        $SAFE_HOME_FOR_RUN_PL = $d;
+    }
+    return $SAFE_HOME_FOR_RUN_PL;
+}
+
 # run_pl($script, @args) -> { rc, out, err } -- a real perl subprocess.
 sub run_pl {
     my ($pl, @args) = @_;
     my (undef, $outpath) = tempfile('alm-XXXXXX', TMPDIR => 1);
     my (undef, $errpath) = tempfile('alm-XXXXXX', TMPDIR => 1);
     my $argstr = join(' ', map { qq{"$_"} } @args);
+    local $ENV{ALMANAC_HOME} = _safe_home_for_run_pl();
+    local $ENV{HOME}         = _safe_home_for_run_pl();
+    local $ENV{USERPROFILE}  = _safe_home_for_run_pl();
+    local $ENV{BUTLER_STATE_DIR} = $WG_BSD;
+    _mint_thread_ticket_wg(@args) if $pl =~ m{almanac-thread\.pl\z};
     system(qq{perl "$pl" $argstr > "$outpath" 2> "$errpath"});
     my $rc  = $? >> 8;
     my $out = slurp_text($outpath);
@@ -184,13 +235,19 @@ $SURFACE = 'host' unless defined $SURFACE;
 # =============================================================================
 # AC1 (DC1, DC2) -- every known/unknown type, every sidecar shape, every tool.
 # =============================================================================
+# AC12 (specs/02-thread-store-spec.md section 2.10): task and task-focus are
+# retired (the flat tasklist and focus no longer have their own CLI); the
+# guard's verb map now points BOTH at almanac-thread.pl, and thread /
+# thread-tasks-<name> / thread-log-<name> are new protected type-shapes that
+# also point at almanac-thread.pl.
 my %SCRIPT_FOR = (
-    todo => 'almanac-todo.pl', note => 'almanac-note.pl', task => 'almanac-task.pl',
-    'task-focus' => 'almanac-task.pl', decision => 'almanac-decision.pl',
+    todo => 'almanac-todo.pl', note => 'almanac-note.pl', task => 'almanac-thread.pl',
+    'task-focus' => 'almanac-thread.pl', decision => 'almanac-inbox.pl', inbox => 'almanac-inbox.pl',
+    thread => 'almanac-thread.pl', 'thread-tasks-foo' => 'almanac-thread.pl', 'thread-log-foo' => 'almanac-thread.pl',
 );
 sub script_for { my ($t) = @_; return $SCRIPT_FOR{$t} // "almanac-$t.pl" }
 
-my @PROJECT_TYPES = qw(todo note task task-focus decision zzz-future);
+my @PROJECT_TYPES = qw(todo note task task-focus decision inbox thread thread-tasks-foo thread-log-foo zzz-future);
 my @GLOBAL_TYPES  = qw(todo note zzz-future);
 
 for my $shape (
@@ -210,6 +267,32 @@ for my $shape (
             like($err, qr/\Q$script\E/, "AC1 [$label/$type/$tool]: stderr names $script");
             like($err, qr/\Q$id\E/, "AC1 [$label/$type/$tool]: stderr contains the id");
         }
+    }
+}
+
+# =============================================================================
+# AC12 (specs/02-thread-store-spec.md section 2.10) -- the verb-map "use:"
+# line names almanac-thread.pl (never almanac-task.pl) for task, task-focus,
+# thread, thread-tasks-<name> and thread-log-<name>, with the exact VERBS
+# text the spec pins for each.
+# =============================================================================
+{
+    my $base = '/c/Development/Someproject/.ccpraxis-local-data/almanac';
+    my %EXPECT_VERBS = (
+        'task'              => 'list (the flat tasklist and focus are retired; threads replace them)',
+        'task-focus'        => 'list (the flat tasklist and focus are retired; threads replace them)',
+        'thread'            => 'create | add | edit | move | reorder | status | archive | event',
+        'thread-tasks-foo'  => 'create | add | edit | move | reorder | status | archive | event',
+        'thread-log-foo'    => 'create | add | edit | move | reorder | status | archive | event',
+    );
+    for my $type (sort keys %EXPECT_VERBS) {
+        my $path = "$base/$type/rec-$type.md";
+        my (undef, $out, $err) = fire(ev('Edit', $path));
+        unlike($err, qr/almanac-task\.pl/, "AC12: [$type] denial never names almanac-task.pl");
+        like($err, qr/almanac-thread\.pl/, "AC12: [$type] denial names almanac-thread.pl");
+        like($err, qr{\Quse:        perl <ccpraxis>/plugins/almanac/scripts/almanac-thread.pl  $EXPECT_VERBS{$type}\E},
+            "AC12: [$type] 'use:' line has the exact pinned VERBS text")
+            or diag($err);
     }
 }
 
@@ -245,6 +328,7 @@ for my $shape (
         '/c/P/.ccpraxis-local-data/x/../almanac/task/x.md',
         '.ccpraxis-local-data/almanac/todo/x.md',
         '/workspace/.ccpraxis-local-data/almanac/decision/x.md',
+        '/workspace/.ccpraxis-local-data/almanac/inbox/x.md',
     );
     for my $p (@cases) {
         my ($rc) = fire(ev('Edit', $p));
@@ -568,18 +652,19 @@ for my $shape (
     is($r_note->{rc}, 0, 'AC13 fixture: project note created') or diag($r_note->{err});
     $created{note} = { id => field0($r_note->{out}, 'id') };
 
-    my $r_task = run_pl("$S/almanac-task.pl", 'add', '--title', 'AC13 task', '--root', $proj13);
-    is($r_task->{rc}, 0, 'AC13 fixture: project task created') or diag($r_task->{err});
-    $created{task} = { id => field0($r_task->{out}, 'id') };
+    # AC13/AC14 (specs/02-thread-store-spec.md section 2.10): the flat
+    # tasklist/focus CLI is retired, so this generic per-store-type verify
+    # fixture is repointed at a real thread (Store type 'thread', record id
+    # = the thread name) instead of task/task-focus -- AC1's path-shape
+    # coverage for task/task-focus is unaffected (above) and still exercises
+    # the guard directly against synthetic paths.
+    my $r_thread = run_pl("$S/almanac-thread.pl", 'create', 'ac13-thread', '--root', $proj13);
+    is($r_thread->{rc}, 0, 'AC13 fixture: project thread created') or diag($r_thread->{err});
+    $created{thread} = { id => 'ac13-thread' };
 
-    my $sess13 = 'ac13-session';
-    my $r_focus = run_pl("$S/almanac-task.pl", 'focus', '--root', $proj13, '--session', $sess13);
-    is($r_focus->{rc}, 0, 'AC13 fixture: project task-focus created (via focus)') or diag($r_focus->{err});
-    $created{'task-focus'} = { id => $sess13 };
-
-    my $r_dec = run_pl("$S/almanac-decision.pl", 'file', '--title', 'AC13 decision?', '--root', $proj13);
-    is($r_dec->{rc}, 0, 'AC13 fixture: project decision created') or diag($r_dec->{err});
-    $created{decision} = { id => field0($r_dec->{out}, 'id') };
+    my $r_dec = run_pl("$S/almanac-inbox.pl", 'file', '--title', 'AC13 inbox item?', '--root', $proj13);
+    is($r_dec->{rc}, 0, 'AC13 fixture: project inbox item created') or diag($r_dec->{err});
+    $created{inbox} = { id => field0($r_dec->{out}, 'id') };
 
     SKIP: {
         skip 'AC13: global scope unavailable on a container surface', 2 if $SURFACE eq 'container';
@@ -587,7 +672,7 @@ for my $shape (
         is($r_gtodo->{rc}, 0, 'AC13 fixture: global todo created') or diag($r_gtodo->{err});
         $created{'global-todo'} = { id => field0($r_gtodo->{out}, 'id') };
 
-        my $r_gnote = run_pl("$S/almanac-note.pl", 'create', '--title', 'AC13 global note', '--global', '--home', $home13);
+        my $r_gnote = run_pl("$S/almanac-note.pl", 'create', '--title', 'AC13 global note', '--covers', 'AC13 global note covers', '--global', '--home', $home13);
         is($r_gnote->{rc}, 0, 'AC13 fixture: global note created') or diag($r_gnote->{err});
         $created{'global-note'} = { id => field0($r_gnote->{out}, 'id') };
     }
@@ -598,7 +683,13 @@ for my $shape (
     ok(defined $rec_zzz, 'AC13 fixture: zzz-future record created') or diag("error: $@");
     $created{'zzz-future'} = { id => 'ac13-zzz' } if defined $rec_zzz;
 
-    my $expected_k = scalar(keys %created);
+    # where-things-go package 02-thread-store (3-stores-per-thread design,
+    # specs/02-thread-store-spec.md): creating one thread structurally also
+    # writes a thread-log-<name> record (the `created` log entry) alongside
+    # the thread record itself and its thread-tasks-<name> store (still
+    # empty here) -- %created only tracks one logical fixture per type, so
+    # the live-on-disk record count is one more than scalar(keys %created).
+    my $expected_k = scalar(keys %created) + 1;
 
     my ($rc_v0, $out_v0) = bugrun_verify($home13, '--project', $proj13);
     is($rc_v0, 0, 'AC13: verify --project exits 0 before any tamper') or diag($out_v0);
@@ -639,9 +730,8 @@ for my $shape (
     for my $m (
         ['todo',         'todo edit',       sub { run_pl("$S/almanac-todo.pl", 'edit', $created{todo}{id}, '--title', 'AC14 todo edited', '--root', $proj13) }],
         ['note',         'note edit',       sub { run_pl("$S/almanac-note.pl", 'edit', $created{note}{id}, '--title', 'AC14 note edited', '--root', $proj13) }],
-        ['task',         'task status',     sub { run_pl("$S/almanac-task.pl", 'status', $created{task}{id}, 'doing', '--root', $proj13) }],
-        ['task-focus',   'second focus',    sub { run_pl("$S/almanac-task.pl", 'focus', '--root', $proj13, '--session', $sess13) }],
-        ['decision',     'decision answer', sub { run_pl("$S/almanac-decision.pl", 'answer', $created{decision}{id}, '--answer', 'go ahead', '--root', $proj13) }],
+        ['thread',       'thread archive',  sub { run_pl("$S/almanac-thread.pl", 'archive', $created{thread}{id}, '--root', $proj13) }],
+        ['inbox',        'inbox answer',     sub { run_pl("$S/almanac-inbox.pl", 'answer', $created{inbox}{id}, '--answer', 'go ahead', '--root', $proj13) }],
     ) {
         my ($needs_type, $label, $code) = @$m;
         next unless defined $created{$needs_type}{id};
@@ -733,7 +823,7 @@ for my $shape (
     is($rc_f, 0, 'AC16 fixture: a bug report exists in project P') or diag($out_f);
     chomp(my $rpath = $out_f);
     my ($rid) = $rpath =~ m{/([^/]+)\.md$};
-    bugrun($home16, 'set-status', $rid, '--project', $proj16, '--to', 'declined');
+    bugrun($home16, 'set-status', $rid, '--project', $proj16, '--to', 'dropped', '--note', 'not reproducible');
     open($fh, '>>:raw', $rpath) or die $!;
     print {$fh} 'TAMPERED-BYTES';
     close $fh;

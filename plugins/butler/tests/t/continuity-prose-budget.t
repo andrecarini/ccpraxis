@@ -7,8 +7,10 @@
 # sweep across the whole file, required content per skill, and ordering for
 # the two skills whose block placement matters. Reads SKILL.next.md when
 # present, else falls back to the live SKILL.md, so it keeps working once
-# package 16 swaps the files in. Reads nothing else: no environment variable
-# except via FindBin, no process spawn, no network, no butler run state.
+# package 16 swaps the files in. Reads nothing else beyond the seven skill
+# files above and, for never-halt package 11's AC-34, global-config/
+# CLAUDE.md: no environment variable except via FindBin, no process spawn,
+# no network, no butler run state.
 #
 # Rule ids below (F, B, N, O, R, P, Q) are the spec's own letters, not
 # invented here -- see specs/15-skills-prose-spec.md section 2.4.
@@ -382,7 +384,18 @@ my %SKILLS = (
             'dispatch alone',
             '/butler:continuity off',
             'butler-continuity status',
-            'butler-continuity ask --text',
+            'almanac inbox file --title',   # spec 01-inbox-rename AC34: was 'butler-continuity ask --text'
+            # never-halt 11-arming-nudges (AC-33): the clause added to the
+            # "Output:" line and the new sentence after the self-arm
+            # triggers line, at the same 40-line budget.
+            'Hooks nudge toward arming',
+            'arming stays your call',
+            # package 04-continuity-threads (spec 2.10): the thread-attach forms
+            # and the hand-off/doing-gate language in the continuity block.
+            '--new-thread <name>',
+            '--thread <name>',
+            'hands the thread off',
+            'refuses while a task of the thread is doing',
         ],
         file_required => [],
         rule_q => undef,
@@ -400,6 +413,11 @@ my %SKILLS = (
             'butler-hold',
             'run_in_background: true',
             "butler-continuity off --reason '<what is done>'",
+            '`pause-long`',   # pkg10/never-halt AC-13: the off-line now also names pause-long
+            # package 04-continuity-threads (spec 2.10): the first-step thread
+            # arm and add-packages call.
+            'butler-continuity on --role driver --new-thread <name>',
+            'almanac thread add-packages',
         ],
         file_required => [
             '`in-flight`',
@@ -408,6 +426,11 @@ my %SKILLS = (
             'STOP ITERATING AND REPORT NOW',
             'bp-dispatch-log.pl start',
             'do not defer again',
+            '`pause-long`',   # pkg10/never-halt AC-13: the new action-table row
+            'until_iso',      # pkg10/never-halt AC-13: the new action's handoff-time field
+            # package 04-continuity-threads (spec 2.10): the done row's
+            # archive-if-done call.
+            'almanac thread archive-if-done',
         ],
         rule_q => \&rule_Q_drive_solo_violations,
     },
@@ -420,8 +443,12 @@ my %SKILLS = (
             'butler-hold',
             'butler-continuity silence --reason',
             'butler-continuity off --reason',
+            'no thread',   # package 04-continuity-threads (spec 2.10)
         ],
-        file_required => [],
+        file_required => [
+            'for debugging',        # package 04-continuity-threads (spec 2.10)
+            'almanac thread show',  # package 04-continuity-threads (spec 2.10)
+        ],
         rule_q => \&rule_Q_reporter_violations,
     },
     'coordinator-protocol' => {
@@ -474,6 +501,10 @@ my %SKILLS = (
             'butler-continuity status',
             'butler-continuity on',
             'Re-orient first',
+            # package 04-continuity-threads (spec 2.10): the resume form and
+            # the off-before-clear call.
+            'butler-continuity on --thread <that thread>',
+            'butler-continuity off --reason',
         ],
         file_required => [],
         rule_q => undef,
@@ -552,6 +583,170 @@ for my $skill_name (sort keys %SKILLS) {
             }
         }
     };
+}
+
+# ===========================================================================
+# package 10 (never-halt): the new `pause-long` row in drive-solo/SKILL.md,
+# and a non-regression pin on the pre-existing `pause` row.
+# Spec: .ccpraxis-local-data/blueprints/never-halt/specs/10-long-usage-pause-ends-session-spec.md
+#   AC-14 -- the pause-long row's own content (table-row check, new here).
+#   AC-15 -- the pause row stays byte-identical to its pre-change text.
+# ===========================================================================
+{
+    my $dir        = "$Bin/../../skills/drive-solo";
+    my $next_path  = "$dir/SKILL.next.md";
+    my $md_path    = "$dir/SKILL.md";
+    my $target     = -e $next_path ? $next_path : $md_path;
+    my $text       = _slurp($target);
+
+    unless (ok(defined $text, '(pkg10) AC-14/AC-15: drive-solo target file is readable')) {
+        done_testing();
+        exit;
+    }
+
+    my @lines = _lines_of($text);
+
+    # ── AC-14: exactly one pause-long row, with the required content ───────
+    my @pl_matches = grep { /^\|\s*`pause-long`/ } @lines;
+    is(scalar(@pl_matches), 1,
+        '(pkg10) AC-14: exactly one line matches /^\|\s*`pause-long`/');
+
+    SKIP: {
+        skip '(pkg10) AC-14: no pause-long row to inspect', 16 unless @pl_matches == 1;
+        my $row = $pl_matches[0];
+
+        for my $term (
+            'TaskStop', 'no background sleep', 'no holder', 'handoff',
+            '## Next action', 'attempt-log', 'git status', 'pending',
+            'decision', 're-invoke', 'until_iso', 'continuity off', 'last',
+            # fix-batch (reviewer S1/S2/N1, red-team L1/L2/L3): the row must
+            # also stop an already-running holder, ignore its late report,
+            # close each stopped worker's dispatch-log record, note any
+            # refused call behind a stop, explain why no report-first step,
+            # and state the report/continuity-off ordering unambiguously.
+            "holder's background task", 'ignore', 'after continuity is off',
+            'bp-dispatch-log.pl finish', 'interrupted',
+            'bp-denials summary', 'refused',
+            'needs a holder', 'same response turn',
+        ) {
+            ok(index(lc($row), lc($term)) >= 0,
+                "(pkg10) AC-14: the pause-long row mentions '$term' (case-insensitive)");
+        }
+
+        my $handoff_pos    = index(lc($row), 'handoff');
+        my $continuity_pos = index(lc($row), 'continuity off');
+        ok($handoff_pos >= 0 && $continuity_pos >= 0 && $handoff_pos < $continuity_pos,
+            '(pkg10) AC-14: "handoff" appears before "continuity off" in the row');
+
+        unlike($row, qr/butler-hold|butler-continuity|\bsilence/i,
+            '(pkg10) AC-14/E10: the row names no stop-machinery command directly '
+          . '(it points at "Continuity and dispatch" instead)');
+        unlike($row, qr/sleeps until/,
+            '(pkg10) AC-14: the row describes no background sleep');
+
+        my @cells = split /\|/, $row;
+        my $last_cell = $cells[-1] // '';
+        like($last_cell, qr/\(none/,
+            '(pkg10) AC-14: the last cell (Next director call) matches /\(none/');
+    }
+
+    # ── AC-15: the pre-existing pause row is byte-identical, unedited ──────
+    my $PINNED_PAUSE_ROW =
+        '| `pause` (reason=`usage`) | Wait **token-cheaply** until `action.until_epoch` with one '
+      . 'background Bash call that sleeps until that epoch, held as described in Continuity and '
+      . 'dispatch. Never busy-poll. | `next` again (after it finishes) |';
+
+    my @pause_matches = grep { /^\|\s*`pause` \(reason/ } @lines;
+    is(scalar(@pause_matches), 1,
+        '(pkg10) AC-15: exactly one line matches /^\|\s*`pause` \(reason/');
+    SKIP: {
+        skip '(pkg10) AC-15: no pause row to compare', 1 unless @pause_matches == 1;
+        (my $got = $pause_matches[0]) =~ s/\r\z//;
+        is($got, $PINNED_PAUSE_ROW,
+            '(pkg10) AC-15: the pause row is byte-identical to its pre-change text');
+    }
+
+    # ── fix-batch item L4 (red-team): "Never end a turn with nothing
+    # scheduled" named only two reasons a turn may end; pause-long is
+    # neither, so it must now be named as a third. Section-scoped (not the
+    # continuity block), so no budget constraint applies here.
+    my $heading_idx;
+    for my $i (0 .. $#lines) {
+        if ($lines[$i] =~ /^## Never end a turn with nothing scheduled\s*\z/) {
+            $heading_idx = $i; last;
+        }
+    }
+    ok(defined $heading_idx,
+        '(pkg10) L4: "## Never end a turn with nothing scheduled" heading is present');
+
+    SKIP: {
+        skip '(pkg10) L4: heading not found, cannot verify its section', 1
+            unless defined $heading_idx;
+        my $next_heading_idx;
+        for my $i ($heading_idx + 1 .. $#lines) {
+            if ($lines[$i] =~ /^## /) { $next_heading_idx = $i; last; }
+        }
+        my $section = join("\n", @lines[$heading_idx + 1 .. (defined $next_heading_idx ? $next_heading_idx - 1 : $#lines)]);
+        like($section, qr/pause-long/,
+            '(pkg10) L4: the "Never end a turn" section names pause-long as a legitimate way to end a turn');
+    }
+}
+
+# ===========================================================================
+# never-halt package 11-arming-nudges (DC5): AC-34 of
+# .ccpraxis-local-data/blueprints/never-halt/specs/11-arming-nudges-spec.md
+# section 4 -- global-config/CLAUDE.md carries the new "## Arming continuity
+# (butler)" section (sec 2.9), a pure insertion between "## Skill
+# Self-Invocation" and "## House rules learned across projects". DOES NOT
+# EXIST YET at the time this block is written -- expected to fail for
+# exactly that reason.
+# ===========================================================================
+{
+    my $path = "$Bin/../../../../global-config/CLAUDE.md";
+    ok(-e $path, '(AC-34) global-config/CLAUDE.md exists') or diag("missing: $path");
+
+    my $text = -e $path ? _slurp($path) : undef;
+    ok(defined $text, '(AC-34) global-config/CLAUDE.md is readable');
+
+  SKIP: {
+        skip '(AC-34) cannot inspect an unreadable file', 6 unless defined $text;
+        $text =~ s/\r\n/\n/g;
+        my @lines = split /\n/, $text;
+
+        my @heading_idx = grep { ($lines[$_] // '') eq '## Arming continuity (butler)' } (0 .. $#lines);
+        is(scalar(@heading_idx), 1, '(AC-34) exactly one line is "## Arming continuity (butler)"');
+
+      SKIP: {
+            skip '(AC-34) no heading to inspect further', 5 unless @heading_idx == 1;
+            my $hi = $heading_idx[0];
+
+            my @EXPECT_BULLETS = (
+                '- Arm with `butler-continuity on` before work that should go on without the operator: '
+              . 'they said "keep going", they are away or it runs overnight, or the work is unattended '
+              . 'and multi-step.',
+                '- Never arm for one interactive answer.',
+                '- Hooks nudge toward arming on such a prompt, and when work has gone on a long time with '
+              . 'no operator message. Nudges are advice; whether to arm stays your call.',
+            );
+
+            my @non_blank;
+            for my $i ($hi + 1 .. $#lines) {
+                next unless $lines[$i] =~ /\S/;
+                push @non_blank, $lines[$i];
+                last if @non_blank == 3;
+            }
+            is_deeply(\@non_blank, \@EXPECT_BULLETS,
+                '(AC-34) the three sec 2.9 bullet lines follow the heading as the next non-blank lines, byte-exact')
+                or diag(join("\n", @non_blank));
+
+            my @skill_idx = grep { ($lines[$_] // '') eq '## Skill Self-Invocation' } (0 .. $#lines);
+            my @house_idx = grep { ($lines[$_] // '') eq '## House rules learned across projects' } (0 .. $#lines);
+            ok(@skill_idx, '(AC-34) "## Skill Self-Invocation" is present');
+            ok(@house_idx, '(AC-34) "## House rules learned across projects" is present');
+            ok((@skill_idx && $hi > $skill_idx[0]), '(AC-34) the new heading sits after "## Skill Self-Invocation"');
+            ok((@house_idx && $hi < $house_idx[0]), '(AC-34) the new heading sits before "## House rules learned across projects"');
+        }
+    }
 }
 
 done_testing();

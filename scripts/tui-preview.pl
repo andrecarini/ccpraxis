@@ -327,9 +327,9 @@ sub synth_runs {
             packages_done            => ($i * 3) % 9,
             current_package          => $current,
             running_coordinators     => ($i % 3),
-            decisions_waiting        => ($i % 5 == 0) ? 1 : 0,
-            decisions_operator       => ($i + $phase) % 3,
-            decisions_triage         => ($i + $phase + 1) % 3,
+            escalations_waiting      => ($i % 5 == 0) ? 1 : 0,
+            inbox_waiting            => ($i + $phase) % 3,
+            triage_waiting           => ($i + $phase + 1) % 3,
             packages                 => $packages,
             run_agents               => $run_agents,
         };

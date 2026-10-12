@@ -177,11 +177,11 @@ sub width_of { return tui::Layout::display_width(text_of($_[0])) }
 # ===========================================================================
 my @RUNS = (
     { blueprint => 'ccpraxis-tooling-debt', state => 'running', packages_done => 5,  packages_total => 5,
-      current_package => 'd05-almanac-frontmatter-injection', running_coordinators => 2, decisions_waiting => 0 },
+      current_package => 'd05-almanac-frontmatter-injection', running_coordinators => 2, escalations_waiting => 0 },
     { blueprint => 'tui-operator-feedback', state => 'paused',  packages_done => 7,  packages_total => 10,
-      current_package => 't04-blueprints-table', running_coordinators => 0, decisions_waiting => 1 },
+      current_package => 't04-blueprints-table', running_coordinators => 0, escalations_waiting => 1 },
     { blueprint => 'gsa',                   state => 'done',    packages_done => 12, packages_total => 12,
-      running_coordinators => 0, decisions_waiting => 0 },
+      running_coordinators => 0, escalations_waiting => 0 },
 );
 
 sub panel_rows {

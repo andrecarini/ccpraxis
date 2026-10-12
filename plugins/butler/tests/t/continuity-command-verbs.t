@@ -31,6 +31,8 @@ use JSON::PP ();
 use Digest::SHA qw(sha1_hex);
 use POSIX qw(WNOHANG);
 use Time::HiRes qw(sleep);
+use Cwd ();
+use File::Copy qw(copy);
 
 my $S       = "$Bin/../../scripts";
 $S =~ s{\\}{/}g;
@@ -48,15 +50,77 @@ require "$S/BpHook.pm";   # package 03 -- real and already implemented
               . "implemented): $@");
 }
 
-require "$Bin/../../../almanac/scripts/almanac-decision.pl";
+# spec 01-inbox-rename 2.6: butler-continuity.pl itself no longer loads this
+# at all (ask/questions/answer are retired) -- this file's own `filed()`
+# verifier still wants Almanac::Inbox to confirm NOTHING was filed, so it
+# loads almanac-inbox.pl directly, guarded (house pattern: not yet built).
+{
+    local $@;
+    eval { require "$Bin/../../../almanac/scripts/almanac-inbox.pl"; 1 }
+        or diag("almanac-inbox.pl did not load (expected until package 01-inbox-rename "
+              . "renames it): $@");
+}
 
-# filed($root) -- the almanac decision store's own records for $root, per
-# package 09 (Decision 108). Returns [] rather than dying when the store has
-# never been opened for $root at all.
+# never-halt 11-arming-nudges (N7, spec sec 2.6): Almanac::Task. Retained for
+# any lingering direct call in this file; butler-continuity.pl itself no
+# longer loads it (package 04-continuity-threads spec 2.5 step 5 -- off's
+# task listing now reads Almanac::Thread, never Almanac::Task).
+require "$Bin/../../../almanac/scripts/almanac-task.pl";
+
+# task_pl_abs() -- the spec's own P: Cwd::abs_path of almanac-task.pl beside
+# butler's scripts dir, forward-slashed. Computed fresh each call (never a
+# frozen literal), matching the command's own Cwd::abs_path("$Bin/../../
+# almanac/scripts/almanac-task.pl") at spec sec 2.6.
+sub task_pl_abs {
+    my $p = Cwd::abs_path("$S/../../almanac/scripts/almanac-task.pl");
+    return undef unless defined $p;
+    $p =~ s{\\}{/}g;
+    return $p;
+}
+
+# package 04-continuity-threads (specs/04-continuity-threads-spec.md): the
+# thread library, loaded by module name so Almanac::Thread shares one %INC
+# key with anything else that loads it in this process.
+BEGIN {
+    my $dir = "$FindBin::Bin/../../../almanac/scripts";
+    $dir =~ s{\\}{/}g;
+    unshift @INC, $dir;
+}
+require Almanac::Thread;
+require Almanac::Store;
+
+# mark_task_done_direct($thread, $task_id, %opt) -- sets an unlinked task's
+# status to 'done' via Almanac::Store directly, NOT through
+# Almanac::Thread::set_task_status, so Thread.pm's own _archive_check never
+# runs and the thread does not auto-archive before the CLI call under test.
+# Spec section 3 behaviour 10: "unlinked `done` tasks made by direct Store
+# fixture" is the prescribed way to reach an all-done-but-still-live thread.
+sub mark_task_done_direct {
+    my ($thread, $id, %opt) = @_;
+    my $store = Almanac::Store->open(scope => 'project', type => Almanac::Thread::tasks_type($thread), root => $opt{root});
+    my $rec = $store->read($id);
+    $store->update($id, expect => { rev => $rec->{rev}, fields => $rec->{fields} }, set => { status => 'done' });
+}
+
+# thread_pl_abs() -- <TP> per the 04-continuity-threads spec: Cwd::abs_path
+# of almanac-thread.pl beside butler's scripts dir, forward-slashed.
+sub thread_pl_abs {
+    my $p = Cwd::abs_path("$S/../../almanac/scripts/almanac-thread.pl");
+    return undef unless defined $p;
+    $p =~ s{\\}{/}g;
+    return $p;
+}
+
+# filed($root) -- the almanac inbox store's own records for $root (spec
+# 01-inbox-rename; was the decision store, package 09/Decision 108). Returns
+# [] rather than dying when the store has never been opened for $root at all,
+# or when Almanac::Inbox is not yet loaded.
 sub filed {
     my ($root) = @_;
-    return [] unless -d "$root/.ccpraxis-local-data/almanac/decision";
-    return Almanac::Decision::list_decisions(root => $root);
+    return [] unless -d "$root/.ccpraxis-local-data/almanac/inbox";
+    return [] unless defined &Almanac::Inbox::list_items;
+    my $list = eval { Almanac::Inbox::list_items(root => $root) };
+    return (ref $list eq 'ARRAY') ? $list : [];
 }
 
 # ---------------------------------------------------------------------------
@@ -377,11 +441,15 @@ sub reasons_log_lines {
     fresh_state_dir();
     my $sid1 = sess_id('v1a');
     my $sid2 = sess_id('v1b');
-    write_ticket_argv($sid1, ['on']);
+    # package 04-continuity-threads (Decision 36): bare `on` now refuses R1
+    # (a thread is required). This block is about ticket BINDING, not thread
+    # attachment, so it arms via --role reporter, the one `on` form the spec
+    # exempts from the thread requirement.
+    write_ticket_argv($sid1, ['on', '--role', 'reporter']);
     write_ticket_argv($sid2, ['status']);
 
-    my ($out, $err, $rc) = run_cmd({}, 'on');
-    is($rc, 0, 'V1: on exits 0 for the ticketed session') or diag("stderr: $err");
+    my ($out, $err, $rc) = run_cmd({}, 'on', '--role', 'reporter');
+    is($rc, 0, 'V1: on --role reporter exits 0 for the ticketed session') or diag("stderr: $err");
     ok(-e state_root() . "/armed/$sid1", 'V1: on arms S1 (armed/S1 exists)');
     ok(!-e state_root() . "/armed/$sid2", 'V1: on touches no other session (armed/S2 absent)');
 }
@@ -406,10 +474,10 @@ sub reasons_log_lines {
 {
     fresh_state_dir();
     my $sid_leftover = sess_id('residual-leftover');
-    write_ticket_argv($sid_leftover, ['on']);
+    write_ticket_argv($sid_leftover, ['on', '--role', 'reporter']);
 
-    my ($out, $err, $rc) = run_cmd({}, 'on');
-    is($rc, 0, 'KNOWN LIMITATION: on exits 0 by binding to the only live ticket, no matter who ran it')
+    my ($out, $err, $rc) = run_cmd({}, 'on', '--role', 'reporter');
+    is($rc, 0, 'KNOWN LIMITATION: on --role reporter exits 0 by binding to the only live ticket, no matter who ran it')
         or diag("stderr: $err");
     ok(-e state_root() . "/armed/$sid_leftover",
        'KNOWN LIMITATION: the command armed the leftover ticket\'s session (documented, not required)');
@@ -427,9 +495,13 @@ sub reasons_log_lines {
     print {$fh} JSON::PP->new->encode({ session_id => $sid, actor => 'agent', reason => 'x y', at => iso_now() });
     close $fh;
 
-    write_ticket_argv($sid, ['on', '--role', 'driver']);
-    my ($out, $err, $rc) = run_cmd({}, 'on', '--role', 'driver');
-    is($rc, 0, 'V2: on --role driver exits 0') or diag("stderr: $err");
+    # package 04-continuity-threads: `on --role driver` is NOT the reporter
+    # exemption, so it needs a thread flag now too. This block is about
+    # role/off-clearing bookkeeping, not thread content, so --new-thread with
+    # a throwaway name is enough.
+    write_ticket_argv($sid, ['on', '--role', 'driver', '--new-thread', 'v2-thread']);
+    my ($out, $err, $rc) = run_cmd({}, 'on', '--role', 'driver', '--new-thread', 'v2-thread');
+    is($rc, 0, 'V2: on --role driver --new-thread exits 0') or diag("stderr: $err");
     ok(!-e "$root/off/$sid", 'V2: on clears off/S1 (Decision 36)');
     my $armed = read_json_file("$root/armed/$sid");
     is(ref $armed eq 'HASH' ? $armed->{role} : undef, 'driver', 'V2: armed/S1 records role:"driver"');
@@ -750,7 +822,12 @@ sub reasons_log_lines {
 # V11 -- a ticket carrying agent_id refuses on/off/silence (subagent line)
 # ===========================================================================
 {
-    for my $verb_argv (['on'], ['off', '--reason', 'a b'], ['silence', '--reason', 'a b']) {
+    # package 04-continuity-threads (spec 2.3, behaviour 14): the subagent
+    # refusal fires AFTER the thread-argument rule, so a bare `on` with
+    # agent_id would now hit R1 first instead of the subagent line -- give it
+    # a thread flag (--new-thread) so it reaches the subagent check, exactly
+    # as behaviour 14's own fixture does.
+    for my $verb_argv (['on', '--new-thread', 'v11-thread'], ['off', '--reason', 'a b'], ['silence', '--reason', 'a b']) {
         fresh_state_dir();
         my $sid = sess_id('v11' . join('', @$verb_argv));
         BpHook::arm($sid, role => 'manual', by => 'on') if $verb_argv->[0] ne 'on';
@@ -762,43 +839,60 @@ sub reasons_log_lines {
 }
 
 # ===========================================================================
-# V12: ask files a pending decision
-# V12: an embedded newline is flattened in the filed title
-#
-# Package 09 (Decision 108) re-points ask at the almanac decision store; the
-# line shape it used to prove is retired along with the legacy queue. The
-# store record itself is now the oracle instead: exactly one filed record,
-# with the exact title and the id ask printed, and no legacy questions.md.
+# V12 -- superseded by AC22 (spec 01-inbox-rename 2.6): `butler-continuity
+# ask|questions|answer` are retired, each exits 1 with a one-line pointer at
+# the equivalent `almanac inbox` verb, BEFORE any other step (ticket/state).
+# No record is filed in any almanac store; no legacy questions.md is written.
 # ===========================================================================
 {
-    my $proj_a = "$TMPROOT/askproj-a";
-    make_path("$proj_a/.ccpraxis-local-data");
+    my %RETIRED = (
+        ask       => 'almanac inbox file',
+        questions => 'almanac inbox list',
+        answer    => 'almanac inbox answer',
+    );
+    for my $verb (sort keys %RETIRED) {
+        my $proj_r = "$TMPROOT/retiredproj-$verb";
+        make_path("$proj_r/.ccpraxis-local-data");
+        my @extra_args = $verb eq 'ask'    ? ('--text', 'q one')
+                       : $verb eq 'answer' ? ('--id', 'x', '--answer', 'y')
+                       : ();
+        my ($out, $err, $rc) = run_cmd({ CLAUDE_PROJECT_DIR => $proj_r, ':cwd' => $proj_r }, $verb, @extra_args);
+        is($rc, 1, "AC22: butler-continuity $verb exits 1") or diag("stdout=$out stderr=$err");
+        is($out, '', "AC22: butler-continuity $verb -- stdout empty");
+        is($err, "butler-continuity: 'butler-continuity $verb' is retired; use '$RETIRED{$verb}' instead\n",
+            "AC22: butler-continuity $verb -- stderr is exactly the 2.6 retirement line");
+        my $recs = filed($proj_r);
+        is(scalar(@$recs), 0, "AC22: butler-continuity $verb files nothing in any almanac store");
+        ok(!-e "$proj_r/.ccpraxis-local-data/.subagent-guard/questions.md",
+           "AC22: butler-continuity $verb writes no legacy questions.md");
 
-    my ($outA, $errA, $rcA) = run_cmd({ CLAUDE_PROJECT_DIR => $proj_a, ':cwd' => $proj_a }, 'ask', '--text', 'q one');
-    is($rcA, 0, 'V12: butler-continuity ask exits 0') or diag("stderr: $errA");
-    like($outA, qr/^queued pending decision (\S+) \(1 waiting\) in /, 'V12: stdout matches the pinned shape');
-    my ($idA) = $outA =~ /^queued pending decision (\S+) /;
-
-    my $recsA = filed($proj_a);
-    is(scalar(@$recsA), 1, 'V12: ask files a pending decision (exactly one record)');
-    if (@$recsA) {
-        is($recsA->[0]{fields}{title}, 'q one', 'V12: the filed title is "q one"');
-        is($recsA->[0]{fields}{status}, 'unanswered', 'V12: the filed record is unanswered');
-        is($recsA->[0]{id}, $idA, 'V12: the filed id is the one ask printed');
+        # also exits 1 with BP_LEDGER set (per AC22, checked before the
+        # coordinator step too).
+        local $ENV{BP_LEDGER} = "$proj_r/fake-ledger.md";
+        my ($out2, $err2, $rc2) = run_cmd({ CLAUDE_PROJECT_DIR => $proj_r, ':cwd' => $proj_r }, $verb, @extra_args);
+        is($rc2, 1, "AC22: butler-continuity $verb (BP_LEDGER set) exits 1") or diag("stdout=$out2 stderr=$err2");
+        is($err2, "butler-continuity: 'butler-continuity $verb' is retired; use '$RETIRED{$verb}' instead\n",
+            "AC22: butler-continuity $verb (BP_LEDGER set) -- stderr is exactly the 2.6 line");
     }
-    ok(!-e "$proj_a/.ccpraxis-local-data/.subagent-guard/questions.md",
-       'V12: ask writes no legacy questions.md');
 
-    # embedded newline
-    my $proj_c = "$TMPROOT/askproj-c";
-    make_path("$proj_c/.ccpraxis-local-data");
-    run_cmd({ CLAUDE_PROJECT_DIR => $proj_c, ':cwd' => $proj_c }, 'ask', '--text', "line one\nline two");
+    # a bogus flag after the retired verb still retires first.
+    my $proj_bogus = "$TMPROOT/retiredproj-bogus";
+    make_path("$proj_bogus/.ccpraxis-local-data");
+    my ($outB, $errB, $rcB) = run_cmd({ CLAUDE_PROJECT_DIR => $proj_bogus, ':cwd' => $proj_bogus }, 'ask', '--bogus');
+    is($rcB, 1, 'AC22: butler-continuity ask --bogus still exits 1 (retired check runs before flag parsing)');
+    is($errB, "butler-continuity: 'butler-continuity ask' is retired; use 'almanac inbox file' instead\n",
+        'AC22: butler-continuity ask --bogus -- stderr is exactly the 2.6 line');
 
-    my $recsC = filed($proj_c);
-    is(scalar(@$recsC), 1, 'V12: an embedded newline is flattened in the filed title (one record)');
-    is($recsC->[0]{fields}{title}, 'line one line two',
-        'V12: an embedded newline is flattened to a single space in the filed title')
-        if @$recsC;
+    # AC23: the usage/error text for a genuinely unknown verb no longer
+    # mentions ask/questions/answer at all (spec 2.6: "$USAGE drops | ask
+    # --text '<question>' | questions | answer --id <id> --answer '<text>'").
+    my $proj_unk = "$TMPROOT/unknownverbproj";
+    make_path("$proj_unk/.ccpraxis-local-data");
+    my ($outU, $errU, $rcU) = run_cmd({ CLAUDE_PROJECT_DIR => $proj_unk, ':cwd' => $proj_unk }, 'zzz-unknown-verb');
+    isnt($rcU, 0, 'AC23 fixture: an unrecognized verb exits non-zero');
+    unlike($errU, qr/\bask\b/, 'AC23: the usage/error text for an unknown verb never mentions ask');
+    unlike($errU, qr/\bquestions\b/, 'AC23: ...or questions');
+    unlike($errU, qr/--answer\b/, 'AC23: ...or the --answer flag shape');
 }
 
 # ===========================================================================
@@ -823,11 +917,15 @@ sub reasons_log_lines {
     my ($out, $err, $rc) = run_cmd({}, 'status');
     is($rc, 0, 'V13: status exits 0') or diag("stderr: $err");
     my @lines = split /\n/, $out;
-    cmp_ok(scalar(@lines), '<=', 4, 'V13: status prints at most 4 lines');
+    # package 04-continuity-threads added a mandatory `thread:` line right
+    # after the session line (spec 2.6) -- every index below shifts by one,
+    # and the cap grows by one line.
+    cmp_ok(scalar(@lines), '<=', 5, 'V13: status prints at most 5 lines');
     like($lines[0] // '', qr/armed/, 'V13: line 1 matches armed');
-    like($lines[1] // '', qr/holder: running until.*item-a.*item-b/, 'V13: line 2 names both items');
-    like($lines[2] // '', qr/^silence:/, 'V13: line 3 starts silence:');
-    is($lines[3], 'wake-lock: disabled', 'V13: line 4 is wake-lock: disabled');
+    like($lines[1] // '', qr/^thread: /, 'V13: line 2 is the thread line');
+    like($lines[2] // '', qr/holder: running until.*item-a.*item-b/, 'V13: line 3 names both items');
+    like($lines[3] // '', qr/^silence:/, 'V13: line 4 starts silence:');
+    is($lines[4], 'wake-lock: disabled', 'V13: line 5 is wake-lock: disabled');
 
     # past deadline -> holder: none
     open my $fh2, '>', "$root/holder/$sid.json" or die $!;
@@ -837,14 +935,15 @@ sub reasons_log_lines {
     write_ticket_argv($sid, ['status']);
     my ($out2, $err2, $rc2) = run_cmd({}, 'status');
     my @lines2 = split /\n/, $out2;
-    is($lines2[1], 'holder: none', 'V13: a past deadline reports holder: none');
+    is($lines2[2], 'holder: none', 'V13: a past deadline reports holder: none');
 
-    # unarmed, no silence -> 3 lines, line 1 ends "not armed"
+    # unarmed, no silence -> 4 lines (session, thread, holder, wake-lock),
+    # line 1 ends "not armed"
     my $sid2 = sess_id('v13b');
     write_ticket_argv($sid2, ['status']);
     my ($out3, $err3, $rc3) = run_cmd({}, 'status');
     my @lines3 = split /\n/, $out3;
-    is(scalar(@lines3), 3, 'V13: unarmed with no silence prints 3 lines');
+    is(scalar(@lines3), 4, 'V13: unarmed with no silence prints 4 lines');
     like($lines3[0] // '', qr/not armed$/, 'V13: line 1 ends "not armed"');
 }
 
@@ -942,9 +1041,12 @@ sub reasons_log_lines {
     my $sid = sess_id('v16');
     my $reason = "revis\xc3\xa3o conclu\xc3\xadda ok";
 
-    write_ticket_argv($sid, ['on']);
-    my ($out1, $err1, $rc1) = run_cmd({ BUTLER_STATE_DIR => $andre_base }, 'on');
-    is($rc1, 0, 'V16: on succeeds under a state root containing André') or diag("stderr: $err1");
+    # package 04-continuity-threads: this block is about UTF-8 handling in
+    # the state root and the off reason, unrelated to thread attachment, so
+    # `on` arms via --role reporter (the thread-free exemption).
+    write_ticket_argv($sid, ['on', '--role', 'reporter']);
+    my ($out1, $err1, $rc1) = run_cmd({ BUTLER_STATE_DIR => $andre_base }, 'on', '--role', 'reporter');
+    is($rc1, 0, 'V16: on --role reporter succeeds under a state root containing André') or diag("stderr: $err1");
 
     write_ticket_argv($sid, ['off', '--reason', $reason]);
     my ($out2, $err2, $rc2) = run_cmd({ BUTLER_STATE_DIR => $andre_base }, 'off', '--reason', $reason);
@@ -962,9 +1064,13 @@ sub reasons_log_lines {
 {
     fresh_state_dir();
     my $sid = sess_id('v17');
-    write_ticket_argv($sid, ['on']);
-    my ($out, $err, $rc) = run_cmd({ BUTLER_STATE_DIR => 'relative/x' }, 'on');
-    is($rc, 1, 'V17: on with a relative BUTLER_STATE_DIR exits 1');
+    # package 04-continuity-threads: the new thread-argument rule (step 2b)
+    # runs BEFORE the state-root check (step 3), so a bare `on` would now hit
+    # R1 first. --role reporter is exempt from the thread rule and reaches
+    # the state-root check this test is actually about.
+    write_ticket_argv($sid, ['on', '--role', 'reporter']);
+    my ($out, $err, $rc) = run_cmd({ BUTLER_STATE_DIR => 'relative/x' }, 'on', '--role', 'reporter');
+    is($rc, 1, 'V17: on --role reporter with a relative BUTLER_STATE_DIR exits 1');
     like($err, qr/no continuity state directory/, 'V17: and names the missing state directory');
 }
 
@@ -974,7 +1080,9 @@ sub reasons_log_lines {
 {
     fresh_state_dir();
     my $sid = sess_id('v18');
-    my ($ok, $tuid, $p) = write_ticket_argv($sid, ['on']);
+    # package 04-continuity-threads: --role reporter, same reasoning as V17
+    # (this test is about ticket staleness/binding, not thread attachment).
+    my ($ok, $tuid, $p) = write_ticket_argv($sid, ['on', '--role', 'reporter']);
     my $tf = find_ticket_file($sid, $tuid);
     if (defined $tf) {
         # take_ticket()'s staleness check reads the JSON "at" field, not the
@@ -986,8 +1094,8 @@ sub reasons_log_lines {
         print {$fh} JSON::PP->new->encode($data) if $ok2;
         close $fh if $ok2;
     }
-    my ($out, $err, $rc) = run_cmd({}, 'on');
-    is($rc, 1, 'V18: on with a 60s-old ticket exits 1');
+    my ($out, $err, $rc) = run_cmd({}, 'on', '--role', 'reporter');
+    is($rc, 1, 'V18: on --role reporter with a 60s-old ticket exits 1');
     like($err, qr/no session binding for on/, 'V18: and names the on-binding line');
     ok(!-e state_root() . "/armed/$sid", 'V18: nothing was armed');
 }
@@ -998,10 +1106,12 @@ sub reasons_log_lines {
 for my $iter (1 .. 5) {
     fresh_state_dir();
     my $sid = sess_id('v19-' . $iter);
-    write_ticket_argv($sid, ['on']);
+    # package 04-continuity-threads: --role reporter, same reasoning as
+    # V17/V18 (this race is about ticket binding, not thread attachment).
+    write_ticket_argv($sid, ['on', '--role', 'reporter']);
     write_ticket_argv($sid, ['off', '--reason', 'a b']);
 
-    my ($pid1, $o1, $e1) = spawn_cmd({}, 'on');
+    my ($pid1, $o1, $e1) = spawn_cmd({}, 'on', '--role', 'reporter');
     my ($pid2, $o2, $e2) = spawn_cmd({}, 'off', '--reason', 'a b');
     push @KILL_PIDS, $pid1, $pid2;
     wait_cmd($pid1, $o1, $e1);
@@ -1150,8 +1260,10 @@ for my $iter (1 .. 5) {
     my ($out, $err, $rc) = run_cmd({}, 'status');
     is($rc, 0, 'R4-RVM1 (silence): status exits 0') or diag("stderr: $err");
     my @lines = split /\n/, $out;
-    cmp_ok(scalar(@lines), '<=', 4,
-           'R4-RVM1 (silence): status prints at most 4 lines even with a multi-line silence reason');
+    # package 04-continuity-threads added a mandatory `thread:` line (spec
+    # 2.6), so this armed+silenced case is now 5 lines, not 4.
+    cmp_ok(scalar(@lines), '<=', 5,
+           'R4-RVM1 (silence): status prints at most 5 lines even with a multi-line silence reason');
 }
 
 # ===========================================================================
@@ -1456,6 +1568,306 @@ sub run_oc_bounded {
     else {
         pass('R4-isolation: no real HOME/USERPROFILE was set to check (nothing to guard)');
     }
+}
+
+# ===========================================================================
+# never-halt package 11-arming-nudges, N7 (DC4): AC-26..AC-32 of
+# .ccpraxis-local-data/blueprints/never-halt/specs/11-arming-nudges-spec.md
+# section 4. The butler-continuity.pl N7 additions DO NOT EXIST YET at the
+# time this block is written -- every assertion below is expected to fail
+# for exactly that reason, never a harness bug in this file.
+# ===========================================================================
+
+sub s8 { my ($sid) = @_; return substr($sid, 0, 8) }
+
+# copy_tree($src, $dst) -- shallow recursive copy, core modules only (AC-31
+# needs a standalone copy of plugins/butler/scripts/ with no sibling
+# almanac plugin).
+sub copy_tree {
+    my ($src, $dst) = @_;
+    return unless -d $src;
+    make_path($dst);
+    my @stack = ('');
+    while (@stack) {
+        my $rel = pop @stack;
+        my $sdir = length($rel) ? "$src/$rel" : $src;
+        opendir(my $dh, $sdir) or next;
+        my @entries = readdir($dh);
+        closedir $dh;
+        for my $e (@entries) {
+            next if $e eq '.' || $e eq '..';
+            my $srel = length($rel) ? "$rel/$e" : $e;
+            my $sp = "$src/$srel";
+            my $dp = "$dst/$srel";
+            if (-d $sp) {
+                make_path($dp);
+                push @stack, $srel;
+            } else {
+                (my $ddir = $dp) =~ s{/[^/]+$}{};
+                make_path($ddir) if length $ddir;
+                copy($sp, $dp);
+            }
+        }
+    }
+}
+
+# run_cmd_at($cmd_path, $env_over, @args) -- V20-style direct subprocess
+# invocation against an ARBITRARY copy of butler-continuity.pl (AC-31 needs
+# to run a copy outside $CMD's own tree). Applies the SAME baseline
+# env/overlay contract as spawn_cmd()/run_cmd() above.
+sub run_cmd_at {
+    my ($cmd_path, $env_over, @args) = @_;
+    my (undef, $outfile) = tempfile();
+    my (undef, $errfile) = tempfile();
+    local %ENV = %ENV;
+    delete $ENV{$_} for grep { !/^CCPRAXIS_NO_WAKELOCK$/ && /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
+    $ENV{BUTLER_STATE_DIR}               = $CURRENT_STATE_BASE;
+    $ENV{CCPRAXIS_CONTINUITY_ACTIVE_DIR} = $LEGACY;
+    $ENV{CLAUDE_PROJECT_DIR}             = $PROJECT;
+    $ENV{CCPRAXIS_NO_WAKELOCK}           = 1;
+    for my $k (keys %$env_over) {
+        if (defined $env_over->{$k}) { $ENV{$k} = $env_over->{$k} } else { delete $ENV{$k} }
+    }
+    my @cmd = ($^X, $cmd_path, @args);
+    my $pid = fork();
+    die "fork: $!" unless defined $pid;
+    if ($pid == 0) {
+        open(STDOUT, '>', $outfile) or POSIX::_exit(126);
+        open(STDERR, '>', $errfile) or POSIX::_exit(126);
+        exec(@cmd);
+        POSIX::_exit(127);
+    }
+    push @KILL_PIDS, $pid;
+    my @r = wait_cmd($pid, $outfile, $errfile);
+    @KILL_PIDS = grep { $_ != $pid } @KILL_PIDS;
+    return @r;
+}
+
+# ===========================================================================
+# AC-26 (B20, REWRITTEN for package 04-continuity-threads): `on --new-thread`
+# prints the existing line, now naming the thread, the "Chart thread <T>"
+# line, and the perl almanac-thread.pl hint line. Same for `on --role driver
+# --new-thread`.
+# ===========================================================================
+{
+    my $TP = thread_pl_abs();
+    for my $case (['on --new-thread', 'manual', ['--new-thread', 'ac26-a']],
+                  ['on --role driver --new-thread', 'driver', ['--role', 'driver', '--new-thread', 'ac26-b']]) {
+        my ($label, $role, $extra) = @$case;
+        fresh_state_dir();
+        my $proj = "$TMPROOT/$role-ac26-proj";
+        make_path("$proj/.ccpraxis-local-data");
+        my $sid = sess_id('ac26' . $role);
+        my ($name) = grep { $_ ne '--new-thread' && $_ ne '--role' && $_ ne $role } @$extra;
+        write_ticket_argv($sid, ['on', @$extra], cwd => $proj);
+        my ($out, $err, $rc) = run_cmd({ CLAUDE_PROJECT_DIR => $proj, ':cwd' => $proj }, 'on', @$extra);
+        is($rc, 0, "AC-26 [$label]: exits 0") or diag("stderr: $err");
+        is($err, '', "AC-26 [$label]: stderr is empty");
+        my $expect = "continuity on for session " . s8($sid) . " (role $role, thread $name).\n"
+                   . "Thread $name created and attached to this session.\n"
+                   . "Chart thread $name now: add a task for each step still ahead and mark the current one doing.\n"
+                   . (defined $TP ? "  perl \"$TP\" show $name | add $name --title '<step>' | status $name <id> doing|blocked|done\n" : '');
+        is($out, $expect, "AC-26 [$label]: stdout is exactly the 2.4.3 \"created\" shape, naming the thread");
+    }
+}
+
+# ===========================================================================
+# AC-27 (B21, REWRITTEN): off with open tasks on an attached thread -- the
+# existing off line, the hand-off line, the header naming the thread, one
+# line per open (pending|blocked) unlinked task in task order (done/
+# obsoleted omitted; no doing task present, since a doing task would refuse
+# per R13), then the perl almanac-thread.pl status line.
+# ===========================================================================
+{
+    my $TP = thread_pl_abs();
+    fresh_state_dir();
+    my $sid = sess_id('ac27');
+    my $proj_ac27 = "$TMPROOT/ac27-proj";
+    make_path("$proj_ac27/.ccpraxis-local-data");
+    write_ticket_argv($sid, ['on', '--new-thread', 'ac27'], cwd => $proj_ac27);
+    run_cmd({ CLAUDE_PROJECT_DIR => $proj_ac27, ':cwd' => $proj_ac27 }, 'on', '--new-thread', 'ac27');
+
+    my %ids;
+    for my $title (qw(A B C D)) {
+        my $rec = eval { Almanac::Thread::add_task('ac27', title => $title, actor => 'session', root => $proj_ac27) };
+        $ids{$title} = (ref $rec eq 'HASH') ? $rec->{id} : undef;
+    }
+    my %status_for = (B => 'done', C => 'blocked', D => 'obsoleted');
+    for my $title (qw(B C D)) {
+        next unless defined $ids{$title};
+        eval { Almanac::Thread::set_task_status('ac27', $ids{$title}, $status_for{$title}, actor => 'session', root => $proj_ac27) };
+    }
+
+    write_ticket_argv($sid, ['off', '--reason', 'work all done'], cwd => $proj_ac27);
+    my ($out, $err, $rc) = run_cmd({ CLAUDE_PROJECT_DIR => $proj_ac27, ':cwd' => $proj_ac27 },
+        'off', '--reason', 'work all done');
+    is($rc, 0, 'AC-27: off --reason exits 0') or diag("stderr: $err");
+
+    my $expect = "continuity off for session " . s8($sid) . " (actor agent); reason logged.\n"
+               . "Thread ac27 handed off; the reason is in its log.\n"
+               . "Still open in thread ac27; chart any that are stale now:\n"
+               . "  " . ($ids{A} // '<id>') . " pending A\n"
+               . "  " . ($ids{C} // '<id>') . " blocked C\n"
+               . (defined $TP ? "  perl \"$TP\" status ac27 <id> pending|blocked|done|obsoleted\n" : '');
+    is($out, $expect, 'AC-27: stdout is exactly the off line, the hand-off line, the header, the open task lines (in order), then the perl status line');
+}
+
+# ===========================================================================
+# AC-28 (B22, REWRITTEN): more than 10 open (pending) unlinked tasks -> 10
+# task lines, "... and K more", the perl line. A 100-char title prints as 77
+# chars + "...".
+# ===========================================================================
+{
+    my $TP = thread_pl_abs();
+    fresh_state_dir();
+    my $sid = sess_id('ac28');
+    my $proj_ac28 = "$TMPROOT/ac28-proj";
+    make_path("$proj_ac28/.ccpraxis-local-data");
+    write_ticket_argv($sid, ['on', '--new-thread', 'ac28'], cwd => $proj_ac28);
+    run_cmd({ CLAUDE_PROJECT_DIR => $proj_ac28, ':cwd' => $proj_ac28 }, 'on', '--new-thread', 'ac28');
+
+    my @ids;
+    for my $i (1 .. 12) {
+        my $title = ($i == 1) ? ('x' x 100) : "task $i";
+        my $rec = eval { Almanac::Thread::add_task('ac28', title => $title, actor => 'session', root => $proj_ac28) };
+        push @ids, (ref $rec eq 'HASH') ? $rec->{id} : undef;
+    }
+
+    write_ticket_argv($sid, ['off', '--reason', 'checking the cap'], cwd => $proj_ac28);
+    my ($out, $err, $rc) = run_cmd({ CLAUDE_PROJECT_DIR => $proj_ac28, ':cwd' => $proj_ac28 },
+        'off', '--reason', 'checking the cap');
+    is($rc, 0, 'AC-28: off --reason exits 0') or diag("stderr: $err");
+
+    my @lines = split /\n/, $out;
+    is(scalar(grep { /^  \S+ pending / } @lines), 10, 'AC-28: exactly 10 task lines are printed');
+    ok((grep { /^  \.\.\. and 2 more$/ } @lines), 'AC-28: a "... and 2 more" line is printed (12 open - 10 shown = 2)');
+    if (defined $ids[0]) {
+        ok((grep { index($_, "  $ids[0] pending ") == 0 && index($_, 'x' x 77 . '...') > 0 } @lines),
+            'AC-28: the 100-x title prints as 77 x\'s + "..."');
+    }
+    if (defined $TP) {
+        ok((grep { $_ eq "  perl \"$TP\" status ac28 <id> pending|blocked|done|obsoleted" } @lines),
+            'AC-28: the perl status line is still the last line');
+    }
+}
+
+# ===========================================================================
+# AC-29 (B23, REWRITTEN): no open tasks on the attached thread -> nothing
+# printed beyond the off line and the hand-off line (spec 2.5 step 5: "None
+# -> print nothing more" -- there is no "no open tasks" sentence any more).
+# ===========================================================================
+{
+    # (a) the thread has no tasks at all.
+    {
+        fresh_state_dir();
+        my $sid = sess_id('ac29a');
+        my $proj_empty = "$TMPROOT/ac29a-proj";
+        make_path("$proj_empty/.ccpraxis-local-data");
+        write_ticket_argv($sid, ['on', '--new-thread', 'ac29a'], cwd => $proj_empty);
+        run_cmd({ CLAUDE_PROJECT_DIR => $proj_empty, ':cwd' => $proj_empty }, 'on', '--new-thread', 'ac29a');
+        write_ticket_argv($sid, ['off', '--reason', 'nothing to chart'], cwd => $proj_empty);
+        my ($out, $err, $rc) = run_cmd({ CLAUDE_PROJECT_DIR => $proj_empty, ':cwd' => $proj_empty },
+            'off', '--reason', 'nothing to chart');
+        is($rc, 0, 'AC-29a: off --reason exits 0') or diag("stderr: $err");
+        is($out, "continuity off for session " . s8($sid) . " (actor agent); reason logged.\n"
+               . "Thread ac29a handed off; the reason is in its log.\n",
+            'AC-29a: stdout is exactly the off line and the hand-off line, nothing more (no tasks at all)');
+    }
+    # (b) only done/obsoleted tasks -- none pending or blocked.
+    {
+        fresh_state_dir();
+        my $sid = sess_id('ac29b');
+        my $proj_ac29b = "$TMPROOT/ac29b-proj";
+        make_path("$proj_ac29b/.ccpraxis-local-data");
+        write_ticket_argv($sid, ['on', '--new-thread', 'ac29b'], cwd => $proj_ac29b);
+        run_cmd({ CLAUDE_PROJECT_DIR => $proj_ac29b, ':cwd' => $proj_ac29b }, 'on', '--new-thread', 'ac29b');
+        my $rec = eval { Almanac::Thread::add_task('ac29b', title => 'already finished', actor => 'session', root => $proj_ac29b) };
+        my $id  = (ref $rec eq 'HASH') ? $rec->{id} : undef;
+        # direct Store write (spec 3 behaviour 10): avoids Thread.pm's own
+        # _archive_check, which would otherwise archive the thread right
+        # here -- it is the only task at this point -- before the `off` call
+        # below is what's under test.
+        eval { mark_task_done_direct('ac29b', $id, root => $proj_ac29b) } if defined $id;
+        write_ticket_argv($sid, ['off', '--reason', 'all tasks done'], cwd => $proj_ac29b);
+        my ($out, $err, $rc) = run_cmd({ CLAUDE_PROJECT_DIR => $proj_ac29b, ':cwd' => $proj_ac29b },
+            'off', '--reason', 'all tasks done');
+        is($rc, 0, 'AC-29b: off --reason exits 0') or diag("stderr: $err");
+        # NOTE: a thread whose only task is done is also ALL-DONE (thread_is_done),
+        # so the hand-off itself archives it in the same call (behaviour 10) --
+        # this exercises BOTH "archived" (the second line) and "no open tasks"
+        # (nothing follows) at once.
+        is($out, "continuity off for session " . s8($sid) . " (actor agent); reason logged.\n"
+               . "Thread ac29b handed off and archived: all its tasks are done.\n",
+            'AC-29b: stdout is exactly the off line and the archived line, nothing more (only a done task)');
+    }
+}
+
+# ===========================================================================
+# AC-30 RETIRED (B24): the old mechanism this AC covered -- a session
+# "focused" via `almanac-task.pl focus` onto another project's flat tasklist
+# -- no longer exists (spec 2.5 step 5: `Almanac::Task`/`almanac-task.pl` are
+# no longer loaded by butler-continuity.pl at all). There is no replacement
+# "focus" concept to route around under the thread model: a thread's tasks
+# are read from whichever project root the ticket's own `cwd` resolves to
+# (Store's walk-up/CLAUDE_PROJECT_DIR rule, package 02), which every other
+# case in this file and in continuity-threads.t already exercises by always
+# pinning `cwd` explicitly. No assertion is invented here for a routing
+# table that package 04 deletes rather than re-expresses.
+# ===========================================================================
+
+# ===========================================================================
+# AC-31 (B25, REWRITTEN for `on`'s stdout; `off` unchanged): no almanac
+# plugin beside butler (scripts copied alone) -> `on` prints EXACTLY the
+# thread-free one-liner (spec 2.4.3: "Without a thread (reporter, or almanac
+# absent): exactly one line" -- no chart line at all now, unlike the
+# pre-package-04 behaviour); `off` prints the existing line only (no header,
+# no tasks, behaviour 15).
+# ===========================================================================
+{
+    my $iso_root = tempdir(CLEANUP => 1);
+    (my $iso = "$iso_root/butler") =~ s{\\}{/}g;
+    copy_tree("$Bin/../../scripts", "$iso/scripts");
+    ok(-f "$iso/scripts/butler-continuity.pl", 'AC-31 fixture: the copy carries butler-continuity.pl');
+    ok(!-e "$iso_root/almanac", 'AC-31 fixture: the isolated copy has no sibling almanac/ directory');
+    my $iso_cmd = "$iso/scripts/butler-continuity.pl";
+
+    fresh_state_dir();
+    my $sid_on = sess_id('ac31on');
+    write_ticket_argv($sid_on, ['on']);
+    my ($out_on, $err_on, $rc_on) = run_cmd_at($iso_cmd, {}, 'on');
+    is($rc_on, 0, 'AC-31: on (no sibling almanac) exits 0') or diag("stderr: $err_on");
+    is($out_on, "continuity on for session " . s8($sid_on) . " (role manual).\n",
+       'AC-31: on stdout is exactly the thread-free one-liner (no chart line at all)');
+
+    my $sid_off = sess_id('ac31off');
+    BpHook::arm($sid_off, role => 'manual', by => 'on');
+    write_ticket_argv($sid_off, ['off', '--reason', 'a b']);
+    my ($out_off, $err_off, $rc_off) = run_cmd_at($iso_cmd, {}, 'off', '--reason', 'a b');
+    is($rc_off, 0, 'AC-31: off (no sibling almanac) exits 0') or diag("stderr: $err_off");
+    is($out_off, "continuity off for session " . s8($sid_off) . " (actor agent); reason logged.\n",
+       'AC-31: off stdout is exactly the existing line only (no header, no task lines)');
+}
+
+# ===========================================================================
+# AC-32 (B26): V1-V20 and every other existing CV assertion already pass
+# unedited above (not re-asserted here). A non-operator off with no reason
+# still refuses rc 1 with empty stdout; the coordinator on still prints
+# exactly its nothing-to-do line.
+# ===========================================================================
+{
+    fresh_state_dir();
+    my $sid = sess_id('ac32off');
+    BpHook::arm($sid, role => 'manual', by => 'on');
+    write_ticket_argv($sid, ['off']);
+    my ($out, $err, $rc) = run_cmd({}, 'off');
+    is($rc, 1, 'AC-32: a non-operator off with no reason exits 1');
+    is($out, '', 'AC-32: ...with empty stdout');
+
+    my $sid2 = sess_id('ac32on');
+    my ($out2, $err2, $rc2) = run_cmd({ BP_LEDGER => '/x/ledger.md' }, 'on');
+    is($rc2, 0, 'AC-32: coordinator on exits 0');
+    is($out2, "continuity is on by construction for a coordinator; nothing to do.\n",
+        'AC-32: coordinator on stdout is exactly the nothing-to-do line');
 }
 
 done_testing();

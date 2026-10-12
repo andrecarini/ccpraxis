@@ -6,7 +6,7 @@
 blueprint: <kebab-name>
 created: <ISO date>
 last_updated: <ISO date>
-status: drafting        # drafting | audited | archived -- running/done are computed
+status: drafting        # drafting | audited | parked | archived -- running/done are computed
                          # (BpState::blueprint_lifecycle), never written here
 # worker_backend: claude              <!-- optional blueprint-level default; b32 -->
 # worker_models:                      <!-- optional blueprint-level default/per-role fallback ladder;

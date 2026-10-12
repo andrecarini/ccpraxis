@@ -244,11 +244,17 @@ sub tree_run {
         packages_done            => $o{packages_done}             // 0,
         current_package          => $o{current_package},
         running_coordinators     => $o{running_coordinators}      // 1,
-        decisions_waiting        => $o{decisions_waiting}         // 0,
-        decisions_operator       => $o{decisions_operator}        // 0,
-        decisions_triage         => $o{decisions_triage}          // 0,
+        escalations_waiting        => $o{escalations_waiting}         // 0,
+        inbox_waiting       => $o{inbox_waiting}        // 0,
+        triage_waiting         => $o{triage_waiting}          // 0,
         packages                 => $o{packages}                  // [],
         run_agents                => $o{run_agents}               // [],
+        # package 13-dashboard-threads (spec S2.2): always-present, additive.
+        # Default to "no thread" so every pre-existing caller of tree_run()
+        # keeps building byte-identical fixtures; only callers that pass
+        # `thread =>` exercise the new thread-line behaviour (AC16 below).
+        thread                   => $o{thread},
+        thread_events            => $o{thread_events}              // [],
     };
 }
 
@@ -309,7 +315,8 @@ sub tree_run_40pkg {
     my @run_agents;
     push @run_agents, mk_agent(id=>'rj', role=>'judge', worker_type=>'zqxt40-conformance-judge')
         unless $o{no_conformance_judge};
-    return tree_run(blueprint => 'zqx-run40pkg', packages => \@packages, run_agents => \@run_agents);
+    return tree_run(blueprint => ($o{blueprint} // 'zqx-run40pkg'), packages => \@packages,
+                     run_agents => \@run_agents, thread => $o{thread}, thread_events => $o{thread_events});
 }
 
 # runs_n($n) -- $n runs with NO tree (state=>solo, matching t/79's own
@@ -318,7 +325,7 @@ sub runs_n {
     my ($n) = @_;
     return [ map { { blueprint => "zqx-notree-$_", state => 'solo',
                       packages_done => 0, packages_total => 3, running_coordinators => 0,
-                      decisions_waiting => 0 } } (1 .. $n) ];
+                      escalations_waiting => 0 } } (1 .. $n) ];
 }
 
 # plan_total_cost($plan, $width) -> sum of _row_cost over every entry's
@@ -1594,8 +1601,8 @@ SKIP: {
             skip('no running element', 3) unless @running;
             my @RUN_KEYS = qw(blueprint runs_dir state orchestrator_pid orchestrator_alive
                 orchestrator_started_at paused_manual paused_reason packages_total packages_done
-                current_package running_coordinators decisions_waiting decisions_operator
-                decisions_triage packages run_agents);
+                current_package running_coordinators escalations_waiting inbox_waiting
+                triage_waiting packages run_agents);
             my $r = $running[0];
             is_deeply([ sort keys %$r ], [ sort @RUN_KEYS ], 'AC36: a running synth_runs element has EXACTLY the 17 S2.10 run-level keys (set equality)');
             my $pkgs = $r->{packages};
@@ -1723,8 +1730,8 @@ SKIP: {
         next unless ref($state) eq 'HASH' && ref($state->{runs}) eq 'ARRAY';
         for my $r (@{ $state->{runs} }) {
             next unless ref($r) eq 'HASH';
-            if (defined($r->{decisions_operator})) {
-                if ($r->{decisions_operator} > 0) { $has_op_gt0 //= $phase } else { $has_op_eq0 //= $phase }
+            if (defined($r->{inbox_waiting})) {
+                if ($r->{inbox_waiting} > 0) { $has_op_gt0 //= $phase } else { $has_op_eq0 //= $phase }
             }
             if (defined($r->{state}) && $r->{state} eq 'paused' && defined($r->{paused_reason}) && length($r->{paused_reason})) {
                 $has_paused //= $phase;
@@ -1746,8 +1753,8 @@ SKIP: {
     ok(exists $agent_counts{0}, 'AC40: some phase yields a package with 0 agents' . (exists $agent_counts{0} ? " (phase $agent_counts{0})" : ''));
     ok(exists $agent_counts{1}, 'AC40: some phase yields a package with exactly 1 agent' . (exists $agent_counts{1} ? " (phase $agent_counts{1})" : ''));
     ok((grep { $_ >= 4 } keys %agent_counts), 'AC40: some phase yields a package with >= 4 agents');
-    ok(defined($has_op_gt0), 'AC40: some phase yields decisions_operator > 0' . (defined($has_op_gt0) ? " (phase $has_op_gt0)" : ''));
-    ok(defined($has_op_eq0), 'AC40: some phase yields decisions_operator == 0' . (defined($has_op_eq0) ? " (phase $has_op_eq0)" : ''));
+    ok(defined($has_op_gt0), 'AC40: some phase yields inbox_waiting > 0' . (defined($has_op_gt0) ? " (phase $has_op_gt0)" : ''));
+    ok(defined($has_op_eq0), 'AC40: some phase yields inbox_waiting == 0' . (defined($has_op_eq0) ? " (phase $has_op_eq0)" : ''));
     ok(defined($has_conf_judge), 'AC40: some phase yields a live bp-conformance-judge in run_agents' . (defined($has_conf_judge) ? " (phase $has_conf_judge)" : ''));
     ok(defined($has_empty_run_agents), 'AC40: some phase yields an empty run_agents' . (defined($has_empty_run_agents) ? " (phase $has_empty_run_agents)" : ''));
     ok(defined($has_paused), 'AC40: some phase yields a paused run with a paused_reason' . (defined($has_paused) ? " (phase $has_paused)" : ''));
@@ -2001,5 +2008,110 @@ for my $case (
     }
 }
 
+
+# ===========================================================================
+# package 13-dashboard-threads (specs/13-dashboard-threads-spec.md S3
+# behaviour 16, AC11): the thread line is one atomic `partial`-kind, pri-2
+# plan entry (S2.3 "Placement"/"reuses partial rather than adding an
+# eleventh kind"), and it survives the row budget whenever its own run row
+# does and the budget has room for both -- exactly like the pre-existing
+# paused-reason partial row this package's thread line sits beside. AC1's
+# plan-is-the-body equivalence and AC2's closed 10-word kind vocabulary
+# (already including 'partial') must both keep holding on a plan that
+# contains one.
+# ===========================================================================
+{
+    my $thread = {
+        name => 'zqx13-thrln', state => 'live', done => 1, total => 3,
+        doing => [ { class => 'doing', kind => 'text', title => 'zqx13 doing task', waits_on => undef } ],
+        current => undef,
+        next    => { class => 'pending', kind => 'text', title => 'zqx13 next task', waits_on => undef },
+        owner   => { kind => 'session', id => 'zqx13-sess', alive => undef, activity_at => $NOW - 10, armed => 1 },
+    };
+    # NOTE (reviewer-1 finding 1): 'zqx13-runbp' and 'zqx13-thrln' are
+    # deliberately chosen so that NEITHER is a substring of the other --
+    # find_entry() matches by substring, and the previous nonces
+    # ('zqx13-threaded' / 'zqx13-thread') collided, so find_entry('zqx13-thread')
+    # always matched the run row (entry 0) first instead of the thread line.
+    my $s = base_state(runs => [ tree_run(blueprint => 'zqx13-runbp', thread => $thread) ]);
+    my ($plan, $eplan) = call1('_blueprints_row_plan', $s, 120);
+    ok(!$eplan, 'package-13/B16: _blueprints_row_plan does not die on a run carrying a thread') or diag(" error: $eplan");
+  SKIP: {
+        skip('no plan', 6) unless ref($plan) eq 'ARRAY' && @$plan;
+
+        # AC1 equivalence still holds: the plan's spans equal the body, with
+        # the thread line included.
+        my ($body, $ebody) = call1('_blueprints_body', $s, 120);
+        ok(!$ebody, 'package-13/B16: _blueprints_body does not die') or diag(" error: $ebody");
+        if (ref($body) eq 'ARRAY') {
+            my @spans = map { ref($_) eq 'HASH' ? $_->{spans} : undef } @$plan;
+            is_deeply(\@spans, $body, 'package-13/B16 (AC1): [ map {spans} @plan ] is_deeply _blueprints_body, with a thread line present');
+        } else {
+            fail('package-13/B16 (AC1): plan spans equal body, with a thread line present');
+        }
+
+        # The thread line itself: find the plan entry whose text names the
+        # thread (its name and 'doing'/'next' wording are distinctive nonces).
+        my ($idx, $entry) = find_entry($plan, 'zqx13-thrln');
+        ok(defined($idx), 'package-13/B16: a plan entry mentions the thread name zqx13-thrln') or diag(' plan: ' . join(' | ', map { row_text($_->{spans}) } @$plan));
+      SKIP: {
+            skip('thread entry not found', 3) unless defined $idx;
+            is($entry->{kind}, 'partial', 'package-13/B16: the thread-line entry reuses kind "partial" (no eleventh kind invented)');
+            is($entry->{pri}, 2, 'package-13/B16: the thread-line entry has pri 2 (S2.3 placement)');
+            ok(defined($entry->{parent}) && $entry->{parent} < $idx, 'package-13/B16: the thread-line entry has a defined parent index strictly before itself (the run row)');
+        }
+
+        # AC2's closed 10-word kind vocabulary (already including 'partial')
+        # keeps holding with a thread line in the plan.
+        my %KIND = map { $_ => 1 } qw(run partial cur overflow orchestrator package coordinator worker judge other);
+        my @bad_kind = grep { !(ref($plan->[$_]) eq 'HASH' && defined($plan->[$_]{kind}) && $KIND{$plan->[$_]{kind}}) } (0 .. $#$plan);
+        is(scalar(@bad_kind), 0, 'package-13/B16 (AC2): every plan entry kind is still one of the ten listed, with a thread line present')
+            or diag(' bad idx: ' . join(',', @bad_kind));
+    }
+
+    # The collapsing-budget half of B16: with the 40-package fixture PLUS a
+    # thread, and a budget that still has room for the run row and the
+    # thread line (but not everything), the thread line must survive.
+    my $s40 = base_state(runs => [ tree_run_40pkg(thread => $thread, blueprint => 'zqx13-runbp') ]);
+    my ($width) = call1('_blueprints_table_width', 120);
+    my ($plan40, $eplan40) = call1('_blueprints_row_plan', $s40, 120);
+    ok(!$eplan40, 'package-13/B16 (40pkg): _blueprints_row_plan does not die') or diag(" error: $eplan40");
+  SKIP: {
+        skip('no plan40', 2) unless ref($plan40) eq 'ARRAY' && @$plan40;
+        my ($run_idx) = find_entry($plan40, 'zqx13-runbp');
+        my ($thread_idx) = find_entry($plan40, 'zqx13-thrln');
+        ok(defined($run_idx) && defined($thread_idx), 'package-13/B16 (40pkg): both the run row and the thread line are present in the uncollapsed plan');
+      SKIP: {
+            skip('rows not found', 1) unless defined($run_idx) && defined($thread_idx);
+            # A budget costed as exactly the run row + the thread line (plus
+            # every entry at a LOWER pri number than the tree, since
+            # _select_rows admits by priority -- run=1, thread/paused=2, cur=5
+            # -- so a cap covering pri<=2 content always keeps both), PLUS the
+            # collapse-notice row's own cost: _blueprints_body (reviewer-1
+            # finding 5, DashboardScreen.pm's _blueprints_body) reserves that
+            # row FIRST, via `_select_rows($plan, $cap - $reserve, ...)`, before
+            # selecting anything else, whenever the plan's total cost exceeds
+            # $cap -- which it does here (40 packages). Omitting the reserve
+            # from $cap starves _select_rows of the one slot it needs to also
+            # keep the thread line, and the thread line drops. The reserve
+            # itself is MEASURED (never hardcoded), per this file's own
+            # fixture-discipline rule.
+            my $cap = 0;
+            for my $e (@$plan40) {
+                last if $e->{pri} > 2;
+                my ($c) = call1('_row_cost', $e->{spans}, $width);
+                $cap += ($c // 0);
+            }
+            my ($notice_spans) = call1('_collapse_notice', scalar(@$plan40));
+            my ($reserve) = call1('_row_cost', $notice_spans, $width);
+            $cap += ($reserve // 0);
+            $s40->{blueprint_body_rows} = $cap;
+            my ($body40, $err40) = call1('_blueprints_body', $s40, 120);
+            ok(!$err40, 'package-13/B16 (40pkg): _blueprints_body does not die with a pri<=2-plus-notice budget') or diag(" error: $err40");
+            my $body_text = join("\n", map { row_text($_) } @{ $body40 || [] });
+            like($body_text, qr/zqx13-thrln/, 'package-13/B16 (40pkg): the thread line survives a budget sized to cover its own run row + itself + the reserved collapse notice');
+        }
+    }
+}
 
 done_testing();

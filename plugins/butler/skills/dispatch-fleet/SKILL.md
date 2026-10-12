@@ -1,6 +1,6 @@
 ---
 name: dispatch-fleet
-description: Execute a blueprint as a headless multi-coordinator FLEET (sandbox-only) — start the deterministic, token-free orchestrator script that watches, launches, relaunches, governs usage, keeps the OAuth token alive, and auto-resumes, then hand off to /butler:reporter to observe and answer decisions. Use when the user wants to run, start, kick off, dispatch, or continue a blueprint unattended at scale, or after /blueprint:create when execution should begin. Idempotent start-or-continue (no separate resume). The host-safe single-session alternative is /butler:drive-solo.
+description: Execute a blueprint as a headless multi-coordinator FLEET (sandbox-only) — start the deterministic, token-free orchestrator script that watches, launches, relaunches, governs usage, keeps the OAuth token alive, and auto-resumes, then hand off to /butler:reporter to observe and answer escalations. Use when the user wants to run, start, kick off, dispatch, or continue a blueprint unattended at scale, or after /blueprint:create when execution should begin. Idempotent start-or-continue (no separate resume). The host-safe single-session alternative is /butler:drive-solo.
 argument-hint: <blueprint>
 ---
 
@@ -22,11 +22,11 @@ Sandbox-only: the fleet is detached `claude -p` coordinators (`setsid`/`nohup`/`
    ```
    bash "${CLAUDE_PLUGIN_ROOT}/scripts/bp-orchestrate.sh" $0
    ```
-   It is **idempotent start-or-continue**: it refuses on the host, detaches the deterministic orchestrator, and — if one is already live (its `runs/.orchestrator` marker PID is alive) — just reports that and exits. The orchestrator's own resume-sweep folds in warm/cold recovery of any interrupted coordinators, so there is **no separate resume verb**. If a prior run was torn down by a graceful-reap (e.g. the host slept and the container reaped it), a terminal `runs/.shutdown` marker can linger; since no live orchestrator holds the marker, dispatch treats it as stale and clears it on start so the fleet actually resumes instead of winding straight back down.
+   It is **idempotent start-or-continue**: it refuses on the host, detaches the deterministic orchestrator, and — if one is already live (its `runs/.orchestrator` marker PID is alive) — just reports that and exits. Starting the orchestrator also creates (or continues) the run's thread, `fleet-<blueprint>` (a numbered suffix such as `-2` when an earlier run's thread is archived or was taken over), owned by the orchestrator, with one linked task per package; it logs launched, paused, resumed, escalation-sent, answer-applied and finished, and archives once every package is done or dropped. `almanac thread show fleet-<blueprint>` reads it. The orchestrator's own resume-sweep folds in warm/cold recovery of any interrupted coordinators, so there is **no separate resume verb**. If a prior run was torn down by a graceful-reap (e.g. the host slept and the container reaped it), a terminal `runs/.shutdown` marker can linger; since no live orchestrator holds the marker, dispatch treats it as stale and clears it on start so the fleet actually resumes instead of winding straight back down.
 
 3. **Record the launch** in `blueprint.md`: set `status: running`, and refresh `last_updated` with `iso_now` (or `date -u +%Y-%m-%dT%H:%M:%SZ`) — do not write it from memory; you have no clock. (The per-package status rows are now maintained by the orchestrator + harvest-judge; you set the blueprint-level fields.)
 
-4. **Hand off to the reporter.** Tell the user the fleet is running **unattended** and that they observe progress and answer queued decisions via:
+4. **Hand off to the reporter.** Tell the user the fleet is running **unattended** and that they observe progress and answer queued escalations via:
    ```
    /butler:reporter $0
    ```

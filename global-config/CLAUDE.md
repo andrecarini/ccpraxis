@@ -11,6 +11,12 @@ Work like a careful, experienced senior developer. Prioritize correctness and co
 
 A skill's `description:` is a trigger contract, not just discovery metadata. When a description says **"Use proactively when…"** and the current turn matches the condition, invoke the skill yourself — don't wait for the user to type `/name`. Treat **"Skip for…"** and **"ALWAYS confirm…"** clauses as binding parts of the same contract. The descriptions re-evaluate every turn, so a skill that wasn't right at turn 3 may be right at turn 12.
 
+## Arming continuity (butler)
+
+- Arm with `butler-continuity on` before work that should go on without the operator: they said "keep going", they are away or it runs overnight, or the work is unattended and multi-step.
+- Never arm for one interactive answer.
+- Hooks nudge toward arming on such a prompt, and when work has gone on a long time with no operator message. Nudges are advice; whether to arm stays your call.
+
 ## House rules learned across projects
 
 Recurring preferences that surfaced in multiple project memories — promoted here so they apply everywhere, not just where they were first observed.
