@@ -90,8 +90,10 @@ REPORT
 Reach for `append` unless you genuinely mean to throw the old text away.
 
 Once it reaches `triaging` it is **frozen** — that is what lets a reviewer read it without you
-rewriting it underneath them, and what makes `taken` mean something. If you learn more after that,
-file a follow-up and reference the original id. The refusal message says so too.
+rewriting it underneath them, and what makes `scheduled` mean something. The full lifecycle from
+there is `open -> triaging -> scheduled -> fixed | dropped`: `fixed` happens automatically once the
+package it was scheduled against is done, and `dropped` always carries a reason. If you learn more
+after `triaging`, file a follow-up and reference the original id. The refusal message says so too.
 
 Check where things stand with `bug list`.
 
