@@ -196,12 +196,18 @@ ok(-f $INBOX_PL, 'precondition: almanac-inbox.pl exists at plugins/almanac/scrip
 # Cwd::abs_path(__FILE__) instead of a possibly-relative __FILE__), a
 # `require $TASK_PL;` line exists, and Cwd::abs_path is actually used to
 # resolve the sibling path (confirming the fix landed, not just a mention).
+#
+# SECOND AMENDMENT (2026-10-12): the pinned line now normalises separators
+# BEFORE abs_path, the shape turn-cap-consistency.t C9 requires of every source
+# (a raw `Cwd::abs_path(__FILE__)` is what C9 bans). The two oracles pinned
+# contradictory lines; AC5's intent -- __FILE__ resolved through abs_path,
+# never left relative -- is unchanged.
 # =============================================================================
 {
     my $EXPECT_BEGIN = <<'BLOCK';
 my $TASK_PL;
 BEGIN {
-    my $dir = Cwd::abs_path(__FILE__);
+    my $dir = do { (my $f = __FILE__) =~ s{\\}{/}g; Cwd::abs_path($f) // $f };
     $dir =~ s{\\}{/}g;
     $dir = ($dir =~ m{/}) ? ($dir =~ s{/[^/]+\z}{}r) : '.';
     unshift @INC, $dir;
@@ -213,7 +219,7 @@ BLOCK
         ok(index($src, $EXPECT_BEGIN) >= 0, 'AC5: the file contains the fixed BEGIN block verbatim (bug 20261001-184636-75fe fixed via Cwd::abs_path)')
             or diag('BEGIN block not found verbatim');
         like($src, qr/^require\s+\$TASK_PL;\s*$/m, 'AC5: the file contains a `require $TASK_PL;` line');
-        like($src, qr/Cwd::abs_path\(__FILE__\)/, 'AC5: the file resolves __FILE__ through Cwd::abs_path (the fix for bug 75fe)');
+        like($src, qr/\(my \$f = __FILE__\)[^\n]*Cwd::abs_path\(\$f\)/, 'AC5: the file resolves __FILE__ through Cwd::abs_path (the fix for bug 75fe)');
     } else {
         fail($_) for (
             'AC5: the file contains the fixed BEGIN block verbatim (bug 20261001-184636-75fe fixed via Cwd::abs_path)',

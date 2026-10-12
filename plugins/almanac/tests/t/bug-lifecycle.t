@@ -1,10 +1,10 @@
 #!/usr/bin/env perl
 # platform: any
-# ORACLE for blueprint where-things-go, package 07-bug-lifecycle. Derived
-# ONLY from .ccpraxis-local-data/blueprints/where-things-go/specs/
-# 07-bug-lifecycle-spec.md sections 2-5 (AC1-AC19) and the package ledger's
+# ORACLE for blueprint where-things-go, package 07 (the bug lifecycle). Derived
+# ONLY from package 07's spec under
+# .ccpraxis-local-data/blueprints/where-things-go/specs/, sections 2-5 (AC1-AC19) and the package ledger's
 # five done criteria -- NOT from reading almanac-bug.pl/almanac-doctor.pl's
-# bug-lifecycle code, which this package's write set has not written yet.
+# lifecycle code, which this package's write set has not written yet.
 # Almanac::PackageLink (package 02-thread-store, already landed) is named
 # explicitly by the spec as shared, read-only machinery this package sits on
 # top of, and is read here only to confirm fixture shapes, never edited.
@@ -143,7 +143,11 @@ sub mint_ticket {
 }
 sub run_as {
     my ($session, $agent, @args) = @_;
-    mint_ticket($session, $agent, @args);
+    # run() goes through a shell, which strips one layer of double quotes, so
+    # the ticket must be minted against the argv the subprocess RECEIVES --
+    # minting against the quoted Perl element made every quoted value
+    # (`--note "not reproducible"`) fail with "no hook ticket".
+    mint_ticket($session, $agent, map { (my $v = $_) =~ s{\A"(.*)"\z}{$1}s; $v } @args);
     return run(@args);
 }
 
@@ -231,7 +235,7 @@ sub mk_bug_raw {
        'DC1: triaging -> scheduled succeeds, by the claimant, with a valid --package');
     is(field_of($path, 'status'), 'scheduled', 'DC1: status is scheduled');
     is(field_of($path, 'package'), 'dc1bp/01-dc1', 'DC1: package link is recorded');
-    is(field_of($path, 'package_root'), $PROJ, 'DC1: package_root is the caller\'s root');
+    is(field_of($path, q{package_root}), AlmanacBug::_abs_root($PROJ), 'DC1: package_root is the caller\'s root');
     ok(defined field_of($path, 'scheduled_at'), 'DC1: scheduled_at is recorded');
 
     my ($rc_d, $out_d) = run('set-status', $id, '--project', $PROJ, '--to', 'dropped', '--note', '"wontfix"');
@@ -534,7 +538,7 @@ for my $case (
     run('list', '--project', $PROJ);
     is(field_of($path, 'status'), 'scheduled', 'DC4: taken (NN form) migrates to scheduled');
     is(field_of($path, 'package'), 'dc4nn/07-x', 'DC4: ...with the resolved package link');
-    is(field_of($path, 'package_root'), $PROJ, 'DC4: ...and package_root');
+    is(field_of($path, q{package_root}), AlmanacBug::_abs_root($PROJ), 'DC4: ...and package_root');
     is(field_of($path, 'migrated_from'), 'taken', 'DC4: ...and migrated_from is taken');
     ok(defined field_of($path, 'content_sha256'), 'DC4: content_sha256 is unchanged (still frozen)');
 
@@ -679,6 +683,39 @@ for my $case (
         'hygiene: the real ~/.claude/butler-state is untouched by this file');
     is_deeply($after_bugs, $HYGIENE_BEFORE_BUGS,
         'hygiene: the real repo .ccpraxis-local-data/bug-reports is untouched by this file');
+}
+
+# ---- a claim's transcript path is written as UTF-8, whatever it contains ----
+# The ticket is JSON, decoded to characters; the report is written :raw. A path
+# with a non-ASCII character (this machine's C:/Users/André/...) therefore
+# landed as a lone Latin-1 byte, and Almanac::Record refused every claimed
+# report as "not valid UTF-8" (almanac-record-format.t AC4, 2026-10-12).
+{
+    require Encode;
+    my $PROJ = new_project();
+    my (undef, $o) = run('file', '--project', $PROJ, '--title', '"utf8 transcript path"', '--body', '"b"');
+    chomp(my $path = $o);
+    my ($id) = $path =~ m{/([^/]+)\.md$};
+
+    my $sid = 'UTF8TP';
+    my $dir = "$CFG/projects/Andr\x{e9}";
+    my $transcript = "$dir/$sid.jsonl";
+    my @argv = ('set-status', $id, '--project', $PROJ, '--to', 'triaging');
+    {
+        local $ENV{BUTLER_STATE_DIR} = $BSD;
+        BpHook::write_ticket(
+            { session_id => $sid, tool_use_id => 'T' . (++$TICKET_SEQ),
+              transcript_path => $transcript, cwd => undef },
+            'almanac-bug', [ @argv ]) or die "fixture: could not write ticket\n";
+    }
+    my ($rc, $out) = run(@argv);
+    is($rc, 0, 'UTF8: the claim succeeds') or diag $out;
+
+    my $bytes = slurp_raw($path) // '';
+    ok(eval { Encode::decode('UTF-8', $bytes, Encode::FB_CROAK()); 1 },
+       'UTF8: the claimed report is valid UTF-8');
+    is(field_of($path, 'claimant_transcript_path'), Encode::encode('UTF-8', $transcript),
+       'UTF8: claimant_transcript_path is the path, UTF-8 encoded');
 }
 
 done_testing();

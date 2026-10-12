@@ -35,7 +35,7 @@ my ($DIR, $NOTE_PL, $BUG_PL);
 # require paths below (bug 20261001-184636-75fe): "Can't locate
 # plugins/almanac/scripts/almanac-note.pl in @INC".
 BEGIN {
-    $DIR = Cwd::abs_path(__FILE__);
+    $DIR = do { (my $f = __FILE__) =~ s{\\}{/}g; Cwd::abs_path($f) // $f };
     $DIR =~ s{\\}{/}g;
     # A bare filename (no '/' at all) has nothing for s{/[^/]+\z}{} to match,
     # which would otherwise leave $DIR equal to the script's own name.

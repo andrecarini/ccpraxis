@@ -604,7 +604,7 @@ sub _driver_post {
 # ---------------------------------------------------------------------------
 sub _handle_subagent_stop {
     my ($p) = @_;
-    return 0 if defined $ENV{BP_LEDGER} && length $ENV{BP_LEDGER}; # driver-only marker
+    return _coord_subagent_stop($p) if defined $ENV{BP_LEDGER} && length $ENV{BP_LEDGER};
     my $tuid = BpHook::Guards::Common::subagent_tool_use_id($p);
     return 0 unless defined $tuid;
 
@@ -623,6 +623,39 @@ sub _handle_subagent_stop {
     if (defined $rec->{session_id} && defined $sid && $rec->{session_id} eq $sid) {
         unlink $path;
     }
+    return 0;
+}
+
+# _coord_subagent_stop($p) -- the coordinator's completion path for a
+# backgrounded writer (bug 20261012-013358-1404). _coord_post leaves the
+# marker on an async Post, as it must; without this, nothing ever cleared it,
+# and it refused every test run in the package (and its siblings, through the
+# shared-tree interlock) until the 180-minute age-out. The marker holds only
+# the writer's type, and _coord_pre refuses a second writer while one is in
+# flight, so a type match identifies the dispatch. Only a direct child counts:
+# a worker's own nested subagent of the same type must not clear it.
+sub _coord_subagent_stop {
+    my ($p) = @_;
+    my $bp_dir = $ENV{BP_DIR};
+    return 0 unless defined $bp_dir && length $bp_dir;
+    my $role = $ENV{BP_ROLE};
+    return 0 if defined $role && $role ne '' && $role ne 'coordinator';
+    (my $bpdir_fs = $bp_dir) =~ tr{\\}{/};
+    $bpdir_fs =~ s{/+\z}{};
+    my $pkg = $ENV{BP_PACKAGE};
+    $pkg = 'pkg' unless defined $pkg && length $pkg;
+
+    my $meta = BpHook::Guards::Common::subagent_meta($p);
+    return 0 unless ref $meta eq 'HASH';
+    my $depth = $meta->{spawnDepth};
+    return 0 if defined $depth && !ref($depth) && $depth =~ /^\d+$/ && $depth > 1;
+    my $type = $meta->{agentType};
+    return 0 unless defined $type && !ref($type) && length $type;
+
+    my $marker = "$bpdir_fs/runs/$pkg.active-worker";
+    return 0 unless -f $marker;
+    my $cur = _read_bytes($marker);
+    unlink $marker if defined $cur && $cur eq $type;
     return 0;
 }
 

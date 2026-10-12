@@ -19,6 +19,7 @@ use warnings;
 use JSON::PP;
 use Time::Piece;
 use File::Basename;
+use Cwd ();    # the generated payload calls Cwd::abs_path but may not import (spec 2.2)
 use constant MIN_CWD_COLS     => 2;
 use constant MIN_PROJECT_COLS => 2;
 

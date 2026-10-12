@@ -69,7 +69,8 @@ use Cwd ();
 # instance further down DID have the defect and is fixed for that reason
 # -- see the comment there.)
 BEGIN {
-    my $dir = Cwd::abs_path(__FILE__);
+    (my $self = __FILE__) =~ s{\\}{/}g;
+    my $dir = Cwd::abs_path($self) // $self;
     $dir =~ s{\\}{/}g;
     $dir =~ s{/[^/]+\z}{};
     $dir = '.' unless length $dir;
@@ -420,7 +421,7 @@ sub claim_state {
 # up via @INC rather than cwd (bug 75fe's doubled-join shape).
 sub _butler_module_path {
     my ($basename) = @_;
-    my $dir = Cwd::abs_path(__FILE__);
+    my $dir = do { (my $f = __FILE__) =~ s{\\}{/}g; Cwd::abs_path($f) // $f };
     $dir =~ s{\\}{/}g;
     $dir =~ s{/[^/]+\z}{};
     $dir = '.' unless length $dir;
@@ -1143,6 +1144,11 @@ sub _caller_identity {
     # backstop still refuses it if it somehow carried a forbidden byte.
     my $tp = $t->{transcript_path};
     my $transcript_path = (defined $tp && !ref($tp) && length $tp) ? $tp : undef;
+    # The ticket is JSON, decoded to CHARACTERS; every report is written :raw,
+    # as bytes. Unencoded, a non-ASCII path (C:/Users/André/...) landed as a
+    # lone Latin-1 byte and Almanac::Record refused the whole report as invalid
+    # UTF-8 -- every claim on this machine (bug-lifecycle.t UTF8).
+    utf8::encode($transcript_path) if defined $transcript_path;
 
     return (1, { session => $sid, agent => $agent, transcript_path => $transcript_path });
 }

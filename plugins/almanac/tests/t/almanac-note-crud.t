@@ -28,6 +28,14 @@ use JSON::PP ();
 use Scalar::Util qw(refaddr);
 
 (my $S = "$Bin/../../scripts") =~ s{\\}{/}g;
+use lib "$Bin/../../scripts";
+require Almanac::Store;
+# where-things-go, package 09-notes-fixes: GLOBAL scope is deliberately
+# unavailable on a container surface (Almanac::Store's %SCOPE_POLICY,
+# Decision 7) -- every global-scope fixture below is SKIP-guarded on
+# $SURFACE eq 'container', mirroring almanac-write-guard-all-stores.t.
+my $SURFACE = eval { Almanac::Store::surface() };
+$SURFACE = 'host' unless defined $SURFACE;
 my $NOTE_PL = "$S/almanac-note.pl";
 
 # ---------------------------------------------------------------------------
@@ -1226,11 +1234,15 @@ my (%cp_fixtures);
     my $rp = run_cli('create', '--title', 'Same Title Both Scopes', '--root', $ROOT36);
     my $rg = run_cli('create', '--title', 'Same Title Both Scopes', '--covers', 'AC-36-global-covers', '--global', '--home', $HOME36);
     is($rp->{rc}, 0, 'AC-36 fixture: project create succeeds') or diag("stderr: $rp->{err}");
-    is($rg->{rc}, 0, 'AC-36 fixture: global create succeeds') or diag("stderr: $rg->{err}");
     my $pid = field0($rp->{out}, 'id');
-    my $gid = field0($rg->{out}, 'id');
-    ok(defined($pid) && defined($gid) && $pid ne $gid, 'AC-36: the project and global records have distinct ids')
-        or diag('pid=' . ($pid // '(undef)') . ' gid=' . ($gid // '(undef)'));
+    my $gid;
+    SKIP: {
+        skip 'AC-36 (global): global scope unavailable on a container surface', 2 if $SURFACE eq 'container';
+        is($rg->{rc}, 0, 'AC-36 fixture: global create succeeds') or diag("stderr: $rg->{err}");
+        $gid = field0($rg->{out}, 'id');
+        ok(defined($pid) && defined($gid) && $pid ne $gid, 'AC-36: the project and global records have distinct ids')
+            or diag('pid=' . ($pid // '(undef)') . ' gid=' . ($gid // '(undef)'));
+    }
 
     ok(-f "$PDIR36/" . ($pid // '(none)') . '.md', 'AC-36: the project record exists under the project Decision-2 dir') if defined $pid;
     ok(-f "$GDIR36/" . ($gid // '(none)') . '.md', 'AC-36: the global record exists under the global Decision-2 dir') if defined $gid;
@@ -1295,11 +1307,14 @@ my (%cp_fixtures);
     # --global 0 still selects global (presence, not truthiness)
     my $HOME45 = tempdir(CLEANUP => 1);
     $HOME45 =~ s{\\}{/}g;
-    my $r6 = run_cli('create', '--title', 'global via presence', '--covers', 'AC-45-global-covers', '--global', '0', '--home', $HOME45, '--root', $ROOT45);
-    is($r6->{rc}, 0, 'AC-45: create --global 0 --home <H> exits 0') or diag("stderr: $r6->{err}");
-    is(field0($r6->{out}, 'scope'), 'global', 'AC-45: --global 0 STILL selects the global scope (presence, not truthiness)');
-    my $GDIR45 = record_dir($HOME45, 'global');
-    is(scalar(list_md_files($GDIR45)), 1, 'AC-45: exactly one record was written under the GLOBAL dir, not project');
+    SKIP: {
+        skip 'AC-45 (--global presence): global scope unavailable on a container surface', 3 if $SURFACE eq 'container';
+        my $r6 = run_cli('create', '--title', 'global via presence', '--covers', 'AC-45-global-covers', '--global', '0', '--home', $HOME45, '--root', $ROOT45);
+        is($r6->{rc}, 0, 'AC-45: create --global 0 --home <H> exits 0') or diag("stderr: $r6->{err}");
+        is(field0($r6->{out}, 'scope'), 'global', 'AC-45: --global 0 STILL selects the global scope (presence, not truthiness)');
+        my $GDIR45 = record_dir($HOME45, 'global');
+        is(scalar(list_md_files($GDIR45)), 1, 'AC-45: exactly one record was written under the GLOBAL dir, not project');
+    }
 }
 
 # =============================================================================
@@ -1328,7 +1343,8 @@ my (%cp_fixtures);
 # AC-9 (covers)/B7 -- create --global without --covers: missing_covers,
 # nothing written.
 # -----------------------------------------------------------------------
-{
+SKIP: {
+    skip 'AC-9 (covers): global scope unavailable on a container surface', 7 if $SURFACE eq 'container';
     my $HOMEC9 = tempdir(CLEANUP => 1); $HOMEC9 =~ s{\\}{/}g;
     my $r = run_cli('create', '--title', 'No Covers', '--global', '--home', $HOMEC9);
     is($r->{rc}, 2, 'AC-9 (covers): create --global without --covers exits 2') or diag("stdout: $r->{out}\nstderr: $r->{err}");
@@ -1355,7 +1371,8 @@ my (%cp_fixtures);
 # AC-11 (covers)/B9 -- 201 bytes refused (byte count stated); 200 accepted
 # and stored untruncated.
 # -----------------------------------------------------------------------
-{
+SKIP: {
+    skip 'AC-11 (covers): global scope unavailable on a container surface', 7 if $SURFACE eq 'container';
     my $HOMEC11 = tempdir(CLEANUP => 1); $HOMEC11 =~ s{\\}{/}g;
     my $c201 = 'x' x 201;
     my $r1 = run_cli('create', '--title', 'Over Budget', '--covers', $c201, '--global', '--home', $HOMEC11);
@@ -1378,7 +1395,8 @@ my (%cp_fixtures);
 # AC-12 (covers)/B10 -- multibyte byte counting: 100xe (200 bytes)
 # accepted, 101xe (202 bytes) refused and the count is stated.
 # -----------------------------------------------------------------------
-{
+SKIP: {
+    skip 'AC-12 (covers): global scope unavailable on a container surface', 4 if $SURFACE eq 'container';
     my $HOMEC12 = tempdir(CLEANUP => 1); $HOMEC12 =~ s{\\}{/}g;
     my $e_ok  = "\x{e9}" x 100;   # 100 x 2-byte UTF-8 char = 200 bytes
     my $e_bad = "\x{e9}" x 101;   # 202 bytes
@@ -1396,7 +1414,8 @@ my (%cp_fixtures);
 # AC-13 (covers)/B11 -- --set covers= satisfies the requirement and is
 # budget-checked the same way as --covers.
 # -----------------------------------------------------------------------
-{
+SKIP: {
+    skip 'AC-13 (covers): global scope unavailable on a container surface', 4 if $SURFACE eq 'container';
     my $HOMEC13 = tempdir(CLEANUP => 1); $HOMEC13 =~ s{\\}{/}g;
     my $r1 = run_cli('create', '--title', 'Via Set', '--set', 'covers=via set value', '--global', '--home', $HOMEC13);
     is($r1->{rc}, 0, 'AC-13 (covers): --set covers=... satisfies the global covers requirement') or diag("stderr: $r1->{err}");
@@ -1413,7 +1432,8 @@ my (%cp_fixtures);
 # AC-14 (covers)/B12 -- edit over budget via --covers and via --set
 # covers=: refused with the byte count; rev and fields unchanged.
 # -----------------------------------------------------------------------
-{
+SKIP: {
+    skip 'AC-14 (covers): global scope unavailable on a container surface', 8 if $SURFACE eq 'container';
     my $HOMEC14 = tempdir(CLEANUP => 1); $HOMEC14 =~ s{\\}{/}g;
     my $r0 = run_cli('create', '--title', 'Edit Budget Fixture', '--covers', 'initial covers', '--global', '--home', $HOMEC14);
     is($r0->{rc}, 0, 'AC-14 (covers) fixture: global create succeeds') or diag("stderr: $r0->{err}");
@@ -1439,7 +1459,8 @@ my (%cp_fixtures);
 # AC-15 (covers)/B13 -- edit --unset covers on a global note is refused
 # missing_covers; record unchanged.
 # -----------------------------------------------------------------------
-{
+SKIP: {
+    skip 'AC-15 (covers): global scope unavailable on a container surface', 4 if $SURFACE eq 'container';
     my $HOMEC15 = tempdir(CLEANUP => 1); $HOMEC15 =~ s{\\}{/}g;
     my $r0 = run_cli('create', '--title', 'Unset Covers Fixture', '--covers', 'will be unset', '--global', '--home', $HOMEC15);
     my $id15 = field0($r0->{out}, 'id');
@@ -1460,22 +1481,25 @@ my (%cp_fixtures);
 # -----------------------------------------------------------------------
 {
     my $HOMEC16 = tempdir(CLEANUP => 1); $HOMEC16 =~ s{\\}{/}g;
-    # Build a "legacy" global note with NO covers at all by hand-tampering
-    # the on-disk frontmatter after a (covers-satisfying) create -- the CLI
-    # itself can never construct this shape going forward, which is exactly
-    # why it is a hand-made fixture rather than a plain create.
-    my $r0 = run_cli('create', '--title', 'Legacy Global', '--covers', 'temporary', '--global', '--home', $HOMEC16);
-    my $id16 = field0($r0->{out}, 'id');
-    ok(defined $id16, 'AC-16 (covers) fixture: global create succeeds') or diag("stderr: $r0->{err}");
-    my $GDIR16 = record_dir($HOMEC16, 'global');
-    remove_frontmatter_field("$GDIR16/$id16.md", 'covers');
-    my ($legacy_before) = show_json($id16, '--global', '--home', $HOMEC16);
-    ok(ref($legacy_before) eq 'HASH' && !exists($legacy_before->{fields}{covers}),
-        'AC-16 (covers) fixture: the legacy note now has no covers field at all');
+    SKIP: {
+        skip 'AC-16 (covers)/B14 (global): global scope unavailable on a container surface', 3 if $SURFACE eq 'container';
+        # Build a "legacy" global note with NO covers at all by hand-tampering
+        # the on-disk frontmatter after a (covers-satisfying) create -- the CLI
+        # itself can never construct this shape going forward, which is exactly
+        # why it is a hand-made fixture rather than a plain create.
+        my $r0 = run_cli('create', '--title', 'Legacy Global', '--covers', 'temporary', '--global', '--home', $HOMEC16);
+        my $id16 = field0($r0->{out}, 'id');
+        ok(defined $id16, 'AC-16 (covers) fixture: global create succeeds') or diag("stderr: $r0->{err}");
+        my $GDIR16 = record_dir($HOMEC16, 'global');
+        remove_frontmatter_field("$GDIR16/$id16.md", 'covers');
+        my ($legacy_before) = show_json($id16, '--global', '--home', $HOMEC16);
+        ok(ref($legacy_before) eq 'HASH' && !exists($legacy_before->{fields}{covers}),
+            'AC-16 (covers) fixture: the legacy note now has no covers field at all');
 
-    my $r1 = run_cli('edit', $id16, '--title', 'Legacy Global Edited', '--global', '--home', $HOMEC16);
-    is($r1->{rc}, 0, 'AC-16 (covers)/B14: editing a legacy covers-less global note (without touching covers) exits 0')
-        or diag("stderr: $r1->{err}");
+        my $r1 = run_cli('edit', $id16, '--title', 'Legacy Global Edited', '--global', '--home', $HOMEC16);
+        is($r1->{rc}, 0, 'AC-16 (covers)/B14: editing a legacy covers-less global note (without touching covers) exits 0')
+            or diag("stderr: $r1->{err}");
+    }
 
     my $ROOTC16 = tempdir(CLEANUP => 1); $ROOTC16 =~ s{\\}{/}g;
     my $big = 'p' x 300;

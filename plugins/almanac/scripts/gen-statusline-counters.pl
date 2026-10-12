@@ -22,6 +22,7 @@
 use strict;
 use warnings;
 use File::Basename ();
+use Cwd ();    # the payload it emits calls Cwd::abs_path; statusline.pl loads it
 BEGIN {
     # Separators FIRST, then dirname -- __FILE__ can carry backslashes on
     # Windows and dirname on a mixed-separator path misbehaves. Same shape as

@@ -453,7 +453,11 @@ my $NO_SHIM = 'PATH-shadowing `git` with an extensionless script does not take o
     ok(length $d,                'fix 7a: the failure still carries a usable detail line');
     unlike($d, qr/nonexistent-host/, 'fix 7a: the absolute host path is not copied into the log detail');
     unlike($d, qr/someone/,          'fix 7a: the host account name is not copied into the log detail');
-    like($d,  qr/not a git repository/, "fix 7a: git's own classification survives the redaction");
+    # Git words a dangling gitfile two ways across versions: "not a git
+    # repository" (older) and "gitfile does not point to a valid repository"
+    # (Git for Windows 2.5x). Either is git's own classification.
+    like($d,  qr/not a git repository|does not point to a valid repository/,
+         "fix 7a: git's own classification survives the redaction");
     ok(length($d) <= 200 && $d !~ /\n/, 'fix 7a: detail is still one line of at most 200 chars');
 }
 

@@ -897,6 +897,10 @@ sub normalize_description {
     my ($desc) = @_;
     return '' unless defined $desc;
     my $d = $desc;
+    # A skipped point's TAP line is `ok N # skip <reason>`, so the whole
+    # "description" is the directive; it asserts nothing (bug
+    # 20261012-014847-ded4).
+    $d =~ s/^\s*#\s*(?:SKIP|TODO)\b.*\z//is;
     $d =~ s/\s+#\s*(?:SKIP|TODO)\b.*\z//i;
     $d =~ s/\(.*\z//s;
     $d =~ s/\s+/ /g;

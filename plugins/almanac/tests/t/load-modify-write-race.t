@@ -228,31 +228,42 @@ HOOK
     my ($id) = $path =~ m{/([^/]+)\.md$};
 
     # First bring it to triaging for real (claimed by S1), then race two
-    # `taken` transitions off of it: the hook's call and the outer call.
-    # They would otherwise be byte-identical argv, but a ticket binds one
-    # exact argv, so the hook's call carries a distinguishing --note flag
-    # (not asserted on) purely so each gets its own ticket. Both are minted
-    # for session S1 (the claimant) so the claimant check passes for either.
+    # `scheduled` transitions off of it (RENAMED from `taken`, package
+    # 07-bug-lifecycle): the hook's call and the outer call. They would
+    # otherwise be byte-identical argv, but a ticket binds one exact argv, so
+    # the hook's call carries a distinguishing --note flag (not asserted on)
+    # purely so each gets its own ticket. Both are minted for session S1 (the
+    # claimant) so the claimant check passes for either. `scheduled` requires
+    # --package, validated against a real ledger, so both name the same
+    # valid link.
     run_as('S1', undef, 'set-status', $id, '--project', $SCRATCH, '--to', 'triaging');
     my $before_race = slurp($path);
 
-    mint_ticket('S1', undef, 'set-status', $id, '--project', $SCRATCH, '--to', 'taken',
-                '--note', 'race-hook');
-    my $hook = write_hook(id => $id, project => $SCRATCH, to => 'taken',
-                           extra => ['--note', 'race-hook']);
+    (my $pkg_dir = "$SCRATCH/.ccpraxis-local-data/blueprints/racebp/packages") =~ s{\\}{/}g;
+    make_path($pkg_dir);
+    open(my $pfh, '>:raw', "$pkg_dir/01-race.md") or die "fixture: cannot write package ledger: $!";
+    print {$pfh} "---\nstatus: running\n---\n";
+    close $pfh;
 
-    mint_ticket('S1', undef, 'set-status', $id, '--project', $SCRATCH, '--to', 'taken');
+    mint_ticket('S1', undef, 'set-status', $id, '--project', $SCRATCH, '--to', 'scheduled',
+                '--package', 'racebp/01-race', '--note', 'race-hook');
+    my $hook = write_hook(id => $id, project => $SCRATCH, to => 'scheduled',
+                           extra => ['--package', 'racebp/01-race', '--note', 'race-hook']);
+
+    mint_ticket('S1', undef, 'set-status', $id, '--project', $SCRATCH, '--to', 'scheduled',
+                '--package', 'racebp/01-race');
     my ($rc, $out) = run(hook => $hook,
-                          args => ['set-status', $id, '--project', $SCRATCH, '--to', 'taken']);
+                          args => ['set-status', $id, '--project', $SCRATCH, '--to', 'scheduled',
+                                   '--package', 'racebp/01-race']);
     unlink $hook;
 
     isnt($rc, 0, 'RACE2: the racing set-status ABORTS rather than double-applying/clobbering');
     like($out, qr/changed on disk/i, 'RACE2: the refusal names what happened');
 
-    is(raw_field($path, 'status'), 'taken',
+    is(raw_field($path, 'status'), 'scheduled',
        'RACE2: the hook\'s set-status (the one that actually landed first) is intact');
-    ok(defined raw_field($path, 'taken_at') && length raw_field($path, 'taken_at'),
-       'RACE2: taken_at was stamped by the surviving transition');
+    ok(defined raw_field($path, 'scheduled_at') && length raw_field($path, 'scheduled_at'),
+       'RACE2: scheduled_at was stamped by the surviving transition');
 }
 
 # =============================================================================

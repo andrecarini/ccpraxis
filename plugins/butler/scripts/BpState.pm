@@ -255,7 +255,7 @@ sub run_is_live {
 # prose logic, not verbatim source; package blueprint-park (08) adds rule 0):
 #   0. authored 'parked' beats everything, including a live run -- checked
 #      before run_is_live is even called, so $alive_fn is never invoked for
-#      a parked blueprint and its outcome (even a die) cannot change the
+#      a parked blueprint and its outcome (even an exception) cannot change the
 #      answer.
 #   1. a live run beats every other authored value, including archived.
 #   2. authored 'archived' beats the delivered computation (never

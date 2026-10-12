@@ -1438,6 +1438,18 @@ sub _scoped_test_operand {
             my $m = scalar @after_pool;
             while ($j < $m) {
                 my $w = $after_pool[$j];
+                # Redirects are not operands: the same REDIRECT DROP rule as
+                # _drop_redirects (an operator that is the whole token also
+                # takes its target token). Without it, "x.t > out.txt 2>&1"
+                # counted three positionals, the operand came back undef, and
+                # the driver's BP_VALIDATE_LEDGER scoping refused an in-scope
+                # file (bug 20261012-033433-4cba).
+                my $wraw = $w->{raw};
+                if (defined $wraw && $wraw =~ $REDIR_OP) {
+                    my $rest = substr($wraw, length($&));
+                    $j += ($rest eq '') ? 2 : 1;
+                    next;
+                }
                 my $lit = $w->{literal};
                 if (defined $lit && ($lit eq '--ledger' || $lit eq '--jobs')) { $j += 2; next }
                 my $probe = defined $lit ? $lit : $w->{raw};

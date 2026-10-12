@@ -26,7 +26,7 @@ use Cwd ();
 # consistency with the scripts that did have the defect (almanac-doctor.pl,
 # almanac-inbox.pl), not because this file needed the fix.
 BEGIN {
-    my $dir = Cwd::abs_path(__FILE__);
+    my $dir = do { (my $f = __FILE__) =~ s{\\}{/}g; Cwd::abs_path($f) // $f };
     $dir =~ s{\\}{/}g;
     $dir =~ s{/[^/]+\z}{};
     $dir = '.' unless length $dir;

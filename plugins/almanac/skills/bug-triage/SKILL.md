@@ -61,12 +61,12 @@ session.
 `scheduled` needs a package whose ledger exists, live or archived, under
 `.ccpraxis-local-data/blueprints/` — run the `set-status --to scheduled` call from the project that
 owns the blueprint (ledgers never name bugs; the link lives on the report). A scheduled report
-becomes `fixed` once its package ledger says `done`: every `almanac-bug.pl` call reconciles the
+becomes `fixed` once its package ledger says `done`: every `almanac bug` call reconciles the
 project's reports first, recording the package and, if the ledger's `## Outputs` section has a
 `commit: <sha>` line, the commit too. `list`/`collect` flag a scheduled report whose package is
 parked, dropped or missing, and a leftover `taken` report (from before this rename) that could not
 be migrated automatically. Run the explicit form with
-`perl "<ccpraxis>/plugins/almanac/scripts/almanac-bug.pl" reconcile` to reconcile on demand rather
+`perl "${CLAUDE_PLUGIN_ROOT}/scripts/almanac.pl" bug reconcile` to reconcile on demand rather
 than waiting for the next verb to do it silently.
 
 Existing `taken`/`resolved`/`declined` reports migrate automatically, on the next call: `resolved`
@@ -112,7 +112,7 @@ Then, in the same pass:
 - If the fix belongs to a blueprint package, schedule the report against it:
   `bug set-status <id> --to scheduled --package <blueprint>/<package>`, and write `commit: <sha>`
   under that package ledger's `## Outputs` section when the fix lands. The report becomes `fixed`
-  by itself, the next time any `almanac-bug.pl` call reconciles.
+  by itself, the next time any `almanac bug` call reconciles.
 - If the fix is an **in-place, ad-hoc fix with no blueprint package** — a small, direct patch made
   outside any package pipeline — move it straight from `triaging` to `fixed` by hand instead:
   `bug set-status <id> --to fixed --no-package --note "<what fixed it>"` (Decision 66). The note is

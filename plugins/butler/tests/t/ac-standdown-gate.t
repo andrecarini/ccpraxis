@@ -2,7 +2,7 @@
 # platform: any
 # ORACLE for package 11-ac-loss-clean-suspend-cycle (blueprint tooling-backlog),
 # AC-9 of .ccpraxis-local-data/blueprints/tooling-backlog/specs/
-# 11-ac-loss-clean-suspend-cycle-spec.md sec 2.9/3.6: the ac-standdown-gate
+# 11-ac-loss-clean-suspend-cycle-spec.md sec 2.9/3.6: the stand-down gate,
 # PreToolUse guard that denies every subagent tool call while stood down.
 #
 # Neither BpHook/Guards/AcStandDown.pm nor hooks/ac-standdown-gate.sh nor

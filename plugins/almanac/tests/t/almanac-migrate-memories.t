@@ -42,6 +42,14 @@ use Digest::SHA ();
 use POSIX ();
 
 (my $S = "$Bin/../../scripts") =~ s{\\}{/}g;
+use lib "$Bin/../../scripts";
+require Almanac::Store;
+# where-things-go, package 09-notes-fixes: GLOBAL scope is deliberately
+# unavailable on a container surface (Almanac::Store's %SCOPE_POLICY,
+# Decision 7) -- every global-scope fixture below is SKIP-guarded on
+# $SURFACE eq 'container', mirroring almanac-write-guard-all-stores.t.
+my $SURFACE = eval { Almanac::Store::surface() };
+$SURFACE = 'host' unless defined $SURFACE;
 my $MIGRATE_PL  = "$S/almanac-migrate-memories.pl";
 my $NOTE_PL     = "$S/almanac-note.pl";
 (my $PLUGIN_DIR = "$Bin/../..") =~ s{\\}{/}g;
@@ -664,8 +672,12 @@ sub snapshot_tree {
 
     # AC-1/AC-2/AC-3: verify each of the four kinds independently via
     # almanac-note.pl, never via the migration script's own report.
-    my ($glist) = list_json_global($HOME);
-    ok(ref($glist) eq 'ARRAY', 'AC-1: global list --json decodes after run');
+    my $glist = [];
+    SKIP: {
+        skip 'AC-1 (s2/global): global scope unavailable on a container surface', 1 if $SURFACE eq 'container';
+        ($glist) = list_json_global($HOME);
+        ok(ref($glist) eq 'ARRAY', 'AC-1: global list --json decodes after run');
+    }
     my ($plist1) = list_json_project($R1);
     ok(ref($plist1) eq 'ARRAY', 'AC-1: project list --json decodes for R1 after run');
 
@@ -681,21 +693,25 @@ sub snapshot_tree {
     );
     for my $k (sort keys %check) {
         my $c = $check{$k};
-        my @matches = note_by_migrated_from($c->{list}, $c->{key});
-        is(scalar(@matches), 1, "AC-1 ($k): exactly one note carries migrated_from == '$c->{key}'")
-            or diag('list: ' . JSON::PP->new->canonical->encode($c->{list} || []));
-        next unless @matches == 1;
-        my $note = $matches[0];
-        is($note->{audience}, 'internal', "AC-1 ($k): audience is internal");
-        my $target_path = target_abs($c->{anchor}, $note->{target});
-        ok(-f $target_path, "AC-2 ($k): <anchor>/<target> is a regular file")
-            or diag("expected: $target_path");
-        is(slurp_raw($target_path), slurp_raw($c->{src}), "AC-2 ($k): target bytes are byte-identical to the source");
-        is($note->{migrated_from}, $c->{key}, "AC-3 ($k): migrated_from equals the §2.4 key");
-        is($note->{tags}, $c->{tags}, "AC-3 ($k): tags is '$c->{tags}'");
-        my $expect_created = POSIX::strftime('%Y-%m-%dT%H:%M:%SZ', gmtime($c->{mtime}));
-        is($note->{created}, $expect_created, "AC-3 ($k): created equals the source mtime, ISO Z");
-        is($note->{title}, $c->{title}, "AC-5 ($k): title resolves via the §2.5 chain");
+        SKIP: {
+            skip "AC-1/AC-2/AC-3/AC-5 ($k/global): global scope unavailable on a container surface", 8
+                if ($k eq 's2' && $SURFACE eq 'container');
+            my @matches = note_by_migrated_from($c->{list}, $c->{key});
+            is(scalar(@matches), 1, "AC-1 ($k): exactly one note carries migrated_from == '$c->{key}'")
+                or diag('list: ' . JSON::PP->new->canonical->encode($c->{list} || []));
+            next unless @matches == 1;
+            my $note = $matches[0];
+            is($note->{audience}, 'internal', "AC-1 ($k): audience is internal");
+            my $target_path = target_abs($c->{anchor}, $note->{target});
+            ok(-f $target_path, "AC-2 ($k): <anchor>/<target> is a regular file")
+                or diag("expected: $target_path");
+            is(slurp_raw($target_path), slurp_raw($c->{src}), "AC-2 ($k): target bytes are byte-identical to the source");
+            is($note->{migrated_from}, $c->{key}, "AC-3 ($k): migrated_from equals the §2.4 key");
+            is($note->{tags}, $c->{tags}, "AC-3 ($k): tags is '$c->{tags}'");
+            my $expect_created = POSIX::strftime('%Y-%m-%dT%H:%M:%SZ', gmtime($c->{mtime}));
+            is($note->{created}, $expect_created, "AC-3 ($k): created equals the source mtime, ISO Z");
+            is($note->{title}, $c->{title}, "AC-5 ($k): title resolves via the §2.5 chain");
+        }
     }
 
     # AC-4: MEMORY.md never becomes a note, and note count == record count.
@@ -750,11 +766,18 @@ sub snapshot_tree {
     # =========================================================================
     # AC-13 (B9) -- source bytes and mtimes are unchanged after plan/run/run.
     # =========================================================================
-    for my $c (values %check) {
-        ok(-f $c->{src}, "AC-13: source '$c->{src}' still exists");
-        my @st = stat($c->{src});
-        is($st[9], $c->{mtime}, "AC-13: source '$c->{src}' mtime is unchanged")
-            if @st;
+    for my $k (sort keys %check) {
+        my $c = $check{$k};
+        SKIP: {
+            skip "AC-13 ($k/global): global scope unavailable on a container surface", 2
+                if ($k eq 's2' && $SURFACE eq 'container');
+            ok(-f $c->{src}, "AC-13: source file still exists") or diag("missing: $c->{src}");
+            my @st = stat($c->{src});
+            if (@st) {
+                is($st[9], $c->{mtime}, "AC-13: source file mtime is unchanged")
+                    or diag("path: $c->{src}");
+            }
+        }
     }
 }
 
@@ -1030,7 +1053,8 @@ sub snapshot_tree {
 # AC-14 -- render-index (B10): fresh, no-op re-run, emptying, zero-notes
 # create, project-note exclusion, malformed-note exclusion.
 # =============================================================================
-{
+SKIP: {
+    skip 'AC-14: global scope unavailable on a container surface', 24 if $SURFACE eq 'container';
     my $HOME = fresh_home();
     my $T = "$HOME/.claude/almanac-notes.md";
     ok(!-e $T, 'AC-14 fixture: the index target does not exist yet');
@@ -1118,7 +1142,8 @@ sub snapshot_tree {
         'AC-15 (foreign_content): $T is byte-identical after the refusal');
     is(slurp_raw("$HOME/.claude/CLAUDE.md"), $claude_before, 'AC-15 (foreign_content): the fixture CLAUDE.md is byte-identical');
 }
-{
+SKIP: {
+    skip 'AC-15 (hand_edited): global scope unavailable on a container surface', 8 if $SURFACE eq 'container';
     my $HOME = fresh_home();
     my $T = "$HOME/.claude/almanac-notes.md";
     write_file("$HOME/.claude/CLAUDE.md", "unrelated fixture content, never touched\n");

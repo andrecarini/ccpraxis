@@ -50,6 +50,11 @@ for my $f ($NOTE_PL, $TASK_PL, $DECISION_PL, $BUG_PL) {
 }
 
 require Almanac::Store;
+# Store.pm's Decision 7 blocks global scope outright on a container surface, so
+# a block that needs the doctor to read global records cannot run there; it is
+# skipped, as almanac-write-guard-all-stores.t does (bug 20261012-010917-f3a3).
+# Unguarded, the first global fixture died the whole file after 4 assertions.
+my $NO_GLOBAL = Almanac::Store::surface() eq 'container';
 require Almanac::Record;
 require Almanac::Lock;
 require Almanac::LegacyQueue;
@@ -236,7 +241,7 @@ sub run_doctor {
 # ---------------------------------------------------------------------------
 sub mk_store {
     my (%o) = @_; # scope, type, root|home
-    return Almanac::Store->open(scope => $o{scope}, type => $o{type}, root => $o{root}, home => $o{home});
+    return Almanac::Store->open(scope => $o{scope}, type => $o{type}, root => $o{root}, home => $o{home}, (defined $o{surface} ? (surface => $o{surface}) : ()));
 }
 sub mk_record {
     my (%o) = @_; # scope, type, root|home, fields, order, id
@@ -383,7 +388,8 @@ sub parse_findings {
 # both scopes, task-focus, a frozen bug report, lock sidecars naming exited
 # pids, and an already-migrated legacy file: no output, exit 0.
 # =============================================================================
-{
+SKIP: {
+    skip q{global scope is unavailable on a container surface (Store.pm Decision 7)}, 1 if $NO_GLOBAL;
     my $H6 = mk_root();
     my $P1 = mk_root();
     my $P2 = mk_root();
@@ -454,7 +460,8 @@ sub parse_findings {
 # AC7 (DC4, DC3, DC11) -- UNPARSEABLE with file+line, both scopes; a record
 # with two problems yields two ascending lines.
 # =============================================================================
-{
+SKIP: {
+    skip q{global scope is unavailable on a container surface (Store.pm Decision 7)}, 1 if $NO_GLOBAL;
     my $H7 = mk_root();
     my $P2 = mk_root();
     write_registry($H7, p2 => $P2);
@@ -539,7 +546,8 @@ sub parse_findings {
 # AC9 (DC5, DC3) -- dangling note pointers, project + global; an in_flight
 # note (promote_to set, destination present) is NOT reported.
 # =============================================================================
-{
+SKIP: {
+    skip q{global scope is unavailable on a container surface (Store.pm Decision 7)}, 1 if $NO_GLOBAL;
     my $H9 = mk_root();
     my $P9 = mk_root();
     my (undef, $prec) = mk_record(scope => 'project', type => 'note', root => $P9,
@@ -954,7 +962,8 @@ sub write_pkg_ledger {
 # AC11 (DC7) -- tamper detection across project todo, global note, a garbage
 # seal, and a frozen bug report; an unsealed record is not reported.
 # =============================================================================
-{
+SKIP: {
+    skip q{global scope is unavailable on a container surface (Store.pm Decision 7)}, 1 if $NO_GLOBAL;
     my $H11 = mk_root();
     my $P11 = mk_root();
 
@@ -1217,7 +1226,8 @@ my ($H15, $P15b_2, $legacy_p2, $legacy_home, $legacy_live);
 # except lock sidecars.
 # =============================================================================
 my (%ALL_EXPECT, $ALL_HOME, $ALL_P1, $ALL_LOCK_PID);
-{
+SKIP: {
+    skip q{global scope is unavailable on a container surface (Store.pm Decision 7)}, 1 if $NO_GLOBAL;
     $ALL_HOME = mk_root();
     $ALL_P1   = mk_root();
     write_registry($ALL_HOME, p1alt => alt_spelling($ALL_P1));
@@ -1766,7 +1776,8 @@ use File::Basename ();
 # AC24 (performance) -- 300 sealed records in P1: doctor exits 0, empty
 # stdout, within a 20s timeout.
 # =============================================================================
-{
+SKIP: {
+    skip q{global scope is unavailable on a container surface (Store.pm Decision 7)}, 1 if $NO_GLOBAL;
     my $H24 = mk_root();
     my $P24 = mk_root();
     my @decisions;
@@ -1834,7 +1845,7 @@ use File::Basename ();
 {
     my $H25 = mk_root();
     my $P25 = mk_root();
-    my (undef, $gnote) = mk_record(scope => 'global', type => 'note', home => $H25,
+    my (undef, $gnote) = mk_record(scope => 'global', type => 'note', home => $H25, surface => q{host},
         fields => { title => 'container global', audience => 'internal', target => 'x.md' }, order => [qw(title audience target)]);
     tamper_bytes($gnote->{path});
     my (undef, $pnote) = mk_record(scope => 'project', type => 'note', root => $P25,
