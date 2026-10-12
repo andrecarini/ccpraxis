@@ -546,7 +546,10 @@ HOLDER14
         $calls++ while $line =~ /\bcas_write\s*\(/g;
         $defs++ if $line =~ /^\s*sub\s+cas_write\b/;
     }
-    is($calls, 4, 'AC-19: cas_write is called exactly four times');
+    # Four mutating verbs, plus where-things-go package 07's reconcile, which
+    # rewrites a report's status under its own lock (see the 'reconcile'
+    # acquire site below).
+    is($calls, 5, 'AC-19: cas_write is called exactly five times (four mutating verbs + reconcile)');
     is($defs, 1, 'AC-19: cas_write is defined exactly once');
 
     if ($src =~ /^sub cas_write \{(.*?)^\}/ms) {
@@ -581,19 +584,29 @@ HOLDER14
     for my $i (@acquire_lines) {
         if ($lines[$i] =~ /verb\s*=>\s*['"](?:update|append|set-status|takeover)['"]/) {
             push @mutating_acquire, $i;
-        } elsif ($lines[$i] =~ /verb\s*=>\s*['"](?:file|verify)['"]/) {
+        } elsif ($lines[$i] =~ /verb\s*=>\s*['"](?:file|verify|reconcile)['"]/) {
             push @extra_acquire, $i;
         } else {
             push @other_acquire, $i;
         }
     }
-    unless (ok(scalar(@other_acquire) == 0, 'AC-19: no acquire() site outside the six named verbs')) {
+    unless (ok(scalar(@other_acquire) == 0, 'AC-19: no acquire() site outside the seven named verbs')) {
         diag("line " . ($_ + 1) . ": $lines[$_]") for @other_acquire;
     }
     is(scalar(@mutating_acquire), 4,
         'AC-19: Almanac::Lock->acquire appears exactly four times for the mutating verbs (update/append/set-status/takeover)');
-    is(scalar(@extra_acquire), 2,
-        "AC-19: exactly two extra acquire sites, verb => 'file' (claim_report_path) and verb => 'verify' (verify's re-check)");
+    is(scalar(@extra_acquire), 3,
+        "AC-19: exactly three extra acquire sites, verb => 'file' (claim_report_path), 'verify' (verify's re-check) and 'reconcile'");
+
+    # where-things-go package 07: reconcile runs before EVERY verb, so its lock
+    # must never wait (timeout_ms => 0, a busy report is skipped), and since its
+    # pre-lock load() is only a cheap filter, it must re-load under the lock
+    # before deciding anything -- otherwise it would write a stale view.
+    my ($rec_i) = grep { $lines[$_] =~ /verb\s*=>\s*['"]reconcile['"]/ } @extra_acquire;
+    ok(defined $rec_i && $lines[$rec_i] =~ /timeout_ms\s*=>\s*0\b/,
+        "AC-19: reconcile's acquire never waits (timeout_ms => 0)");
+    ok(defined $rec_i && (grep { $lines[$_] =~ /\bload\s*\(/ } ($rec_i + 1) .. ($rec_i + 8)),
+        "AC-19: reconcile re-loads the report under its lock");
     ok((grep { $lines[$_] =~ /verb\s*=>\s*['"]file['"]/ } @extra_acquire),
         "AC-19: one extra acquire site names verb => 'file'");
     ok((grep { $lines[$_] =~ /verb\s*=>\s*['"]verify['"]/ } @extra_acquire),
@@ -720,7 +733,20 @@ HOLDER14
     {
         local $SIG{PIPE} = 'IGNORE';
         if (open(my $ch, '|-', $cmd4)) {
-            Time::HiRes::sleep(0.8); # generous vs. a ~292ms process spawn + one small file read
+            # Wait until the child is INSIDE its window: it writes the lock's
+            # holder sidecar naming verb "update" on acquire, which comes after
+            # the automatic reconcile (where-things-go 07) and before load().
+            # A fixed 0.8s sleep raced that reconcile under a parallel sweep: the
+            # bypass then landed BEFORE load(), so there was nothing to detect
+            # and update rightly exited 0. Bounded at 20s; the short trailing
+            # sleep covers acquire -> load() -> the blocking STDIN read.
+            my $holder = "$path2.lock.holder";
+            my $deadline = Time::HiRes::time() + 20;
+            until (Time::HiRes::time() > $deadline) {
+                last if (slurp_or($holder) // '') =~ /"verb"\s*:\s*"update"/;
+                Time::HiRes::sleep(0.05);
+            }
+            Time::HiRes::sleep(0.3);
             open(my $bp2, '>>', $path2) or die "AC-22: cannot append to $path2: $!";
             print {$bp2} "BYPASS-WRITER-2\n";
             close $bp2;
