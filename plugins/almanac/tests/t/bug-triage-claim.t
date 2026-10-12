@@ -193,7 +193,11 @@ sub age_transcript {
 # @args (with a transcript), then spawns almanac-bug.pl with that same argv.
 sub run_as {
     my ($session, $agent, @args) = @_;
-    mint_ticket($session, $agent, @args);
+    # run() goes through a shell, which strips one layer of double quotes, so
+    # the ticket must be minted against the argv the subprocess RECEIVES --
+    # minting against the quoted Perl element made every quoted value
+    # (`--note "not reproducible"`) fail with "no hook ticket".
+    mint_ticket($session, $agent, map { (my $v = $_) =~ s{\A"(.*)"\z}{$1}s; $v } @args);
     return run(@args);
 }
 

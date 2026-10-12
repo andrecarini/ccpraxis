@@ -159,7 +159,11 @@ sub mint_ticket {
 # triaging.
 sub run_as {
     my ($session, $agent, @args) = @_;
-    mint_ticket($session, $agent, @args);
+    # run() goes through a shell, which strips one layer of double quotes, so
+    # the ticket must be minted against the argv the subprocess RECEIVES --
+    # minting against the quoted Perl element made every quoted value
+    # (`--note "not reproducible"`) fail with "no hook ticket".
+    mint_ticket($session, $agent, map { (my $v = $_) =~ s{\A"(.*)"\z}{$1}s; $v } @args);
     return run(@args);
 }
 
@@ -470,7 +474,12 @@ my $id3;
     $run2->('file', '--project', qq{"$P1"}, '--title', '"in project one"', '--body', '"b"');
     $run2->('file', '--project', qq{"$P3"}, '--title', '"in the spaced project"', '--body', '"b"');
 
-    my (undef, $out2) = $run2->('collect');
+    # --project names an empty, unregistered dir: without it the current
+    # project is the cwd -- the real repo during a sweep -- and collect, like
+    # every verb, reconciles that project's live reports first. It also keeps
+    # this assertion honest: P1 and P3 can only be found through the registry.
+    my $P0 = tempdir(CLEANUP => 1);
+    my (undef, $out2) = $run2->('collect', '--project', qq{"$P0"});
     like($out2, qr/in project one/,
          'collect finds a report via the registry, with no index anywhere');
     like($out2, qr/in the spaced project/,
