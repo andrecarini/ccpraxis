@@ -43,7 +43,7 @@ sub routes {
         inbox    => { script => 'almanac-inbox.pl',
                       verbs  => [qw(file list show answer blocks)] },
         bug      => { script => 'almanac-bug.pl',
-                      verbs  => [qw(file append update set-status takeover list collect verify)] },
+                      verbs  => [qw(file append update set-status takeover reconcile list collect verify)] },
         doctor   => { script => 'almanac-doctor.pl', verbs => undef },
     };
 }

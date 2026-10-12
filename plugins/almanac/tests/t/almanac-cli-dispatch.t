@@ -366,7 +366,7 @@ fixture_ok('bug file', run_direct('bug', 'file', '--project', $ROOT, '--title', 
         note     => [qw(create list show edit promote delete check-pointers)],
         thread   => [qw(create list show archive archive-if-done add edit move reorder status add-packages event attach detach switch take-over)],
         inbox    => [qw(file list show answer blocks)],
-        bug      => [qw(file append update set-status takeover list collect verify)],
+        bug      => [qw(file append update set-status takeover reconcile list collect verify)],
     );
     for my $type (sort keys %TABLE_VERBS) {
         my $FRESH_ROOT = mk_root();
