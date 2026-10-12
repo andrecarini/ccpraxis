@@ -92,8 +92,11 @@ Reach for `append` unless you genuinely mean to throw the old text away.
 Once it reaches `triaging` it is **frozen** — that is what lets a reviewer read it without you
 rewriting it underneath them, and what makes `scheduled` mean something. The full lifecycle from
 there is `open -> triaging -> scheduled -> fixed | dropped`: `fixed` happens automatically once the
-package it was scheduled against is done, and `dropped` always carries a reason. If you learn more
-after `triaging`, file a follow-up and reference the original id. The refusal message says so too.
+package it was scheduled against is done, and `dropped` always carries a reason. An in-place fix
+with no blueprint package goes straight from `triaging` to `fixed` by hand instead, via
+`--no-package --note "<what fixed it>"` (Decision 66) — see `bug-triage/SKILL.md`'s "Turning a
+report into a fix". If you learn more after `triaging`, file a follow-up and reference the
+original id. The refusal message says so too.
 
 Check where things stand with `bug list`.
 

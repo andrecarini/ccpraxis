@@ -87,8 +87,12 @@ our $LAST_ERROR = '';
 # RENAME (blueprint where-things-go, package 07-bug-lifecycle, Decision 8):
 # taken -> scheduled, resolved -> fixed, declined -> dropped. `scheduled`
 # carries a validated <blueprint>/<package> link (package 02's
-# Almanac::PackageLink); `fixed` is reached ONLY by reconcile, never by hand;
-# `dropped` requires a reason. See specs/07-bug-lifecycle-spec.md section 2.1.
+# Almanac::PackageLink); `fixed` is reached by reconcile (scheduled -> fixed)
+# or, as of Decision 66, by hand ONLY via `triaging -> fixed --no-package
+# --note "<...>"` for an in-place fix with no blueprint package (originally
+# named "Out of scope" in specs/07-bug-lifecycle-spec.md section 6, then
+# reopened by the operator); `dropped` requires a reason. See
+# specs/07-bug-lifecycle-spec.md section 2.1 and 2.13.
 our @STATES = qw(open triaging scheduled fixed dropped);
 
 # Closed vocabulary for `severity`. `unknown` is IN it — it is the script's own
@@ -98,7 +102,8 @@ our @SEVERITIES = qw(low medium high blocker unknown);
 sub valid_severity { my ($s) = @_; return scalar grep { $_ eq $s } @SEVERITIES }
 our %NEXT = (
     open      => [qw(triaging dropped)],
-    triaging  => [qw(scheduled open dropped)],   # back to open = "not ready, keep editing"
+    triaging  => [qw(scheduled open dropped fixed)],   # back to open = "not ready, keep editing"
+                                                        # fixed = in-place fix, --no-package only (Decision 66)
     scheduled => [qw(fixed dropped)],
     fixed     => [],
     dropped   => [],
@@ -261,8 +266,8 @@ sub _render {
                    frozen_at content_sha256 claimant_session claimant_agent
                    claimant_transcript_path claimed_at
                    taken_over_from taken_over_at taken_over_reason taken_at package
-                   package_root scheduled_at fixed_at fixed_commit migrated_from
-                   resolution);
+                   package_root scheduled_at fixed_at fixed_commit fixed_without_package
+                   migrated_from resolution);
     my %seen;
     my @lines;
     # Structural backstop: no field value may carry \r or \n, regardless of
@@ -1494,14 +1499,24 @@ unless (caller) {
             exit 2;
         }
 
-        # spec sec 2.4 step 2: `fixed` is ALWAYS refused by hand -- with or
-        # without --repair, before the identity check, regardless of the
-        # report's current status. The legal edge scheduled -> fixed in %NEXT
-        # is exercised by reconcile only.
-        if ($to eq 'fixed') {
-            print STDERR "almanac-bug set-status: refused -- 'fixed' is set only by reconcile, "
-                       . "when the package a scheduled report names is done. Run "
-                       . "'almanac-bug.pl reconcile'.\n";
+        # spec sec 2.4 step 2 / 2.13 (Decision 66): `fixed` is refused by hand
+        # UNLESS --no-package is given, for an in-place fix with no blueprint
+        # package. The legal edge scheduled -> fixed in %NEXT is exercised by
+        # reconcile only; the legal edge triaging -> fixed is exercised ONLY
+        # via this --no-package escape hatch, checked here before the
+        # identity check, regardless of the report's current status. (The
+        # --no-package value itself, and whether $from is actually triaging,
+        # is validated later, after the report loads -- can_transition
+        # refuses any other $from.)
+        if ($to eq 'fixed' && !$o{'no-package'}) {
+            print STDERR "almanac-bug set-status: refused -- 'fixed' is set by hand only "
+                       . "together with --no-package --note \"<what fixed it>\" (an in-place fix "
+                       . "with no blueprint package); otherwise reconcile sets it when a "
+                       . "scheduled report's package is done. Run 'almanac-bug.pl reconcile'.\n";
+            exit 2;
+        }
+        if (defined $o{'no-package'} && $to ne 'fixed') {
+            print STDERR "almanac-bug set-status: --no-package applies only to --to fixed\n";
             exit 2;
         }
 
@@ -1581,6 +1596,19 @@ unless (caller) {
         # the obvious guess). A guess would hide the drift that produced it, and
         # the operator is the one who knows which state the report actually
         # reached.
+        # Decision 66: --no-package reaches `fixed` ONLY from `triaging`, even
+        # though %NEXT{scheduled} also lists `fixed` -- that edge is reserved
+        # for reconcile. Without this, --no-package would let a hand call
+        # bypass a SCHEDULED report's package-done requirement too, which is
+        # exactly the shortcut reconcile exists to prevent.
+        if ($to eq 'fixed' && $o{'no-package'} && $from ne 'triaging') {
+            print STDERR "almanac-bug set-status: refused -- --no-package only applies from "
+                       . "triaging ('$id' is $from; a scheduled report fixes via reconcile once "
+                       . "its package is done)\n";
+            $lock->release;
+            exit 2;
+        }
+
         my $from_known = grep { $_ eq $from } @AlmanacBug::STATES;
         my ($ok, $why);
         if (!$from_known && $o{repair}) {
@@ -1635,6 +1663,20 @@ unless (caller) {
             }
         }
 
+        # spec sec 2.13 (Decision 66) step 6b: target `fixed` via --no-package
+        # requires a non-blank --note describing what fixed it -- the one
+        # piece of evidence reconcile would otherwise have supplied (a
+        # package link and its commits).
+        if ($to eq 'fixed' && $o{'no-package'}) {
+            my $note = $o{note};
+            unless (defined $note && !ref($note) && $note =~ /\S/) {
+                print STDERR "almanac-bug set-status: --to fixed --no-package requires "
+                           . "--note \"<what fixed it>\" (an in-place fix must say what)\n";
+                $lock->release;
+                exit 2;
+            }
+        }
+
         my %f = %{ $rep->{fields} };
         my $now = AlmanacBug::_iso(time);
         $f{status} = $to;
@@ -1650,6 +1692,10 @@ unless (caller) {
             $f{package}      = $pkg_link;
             $f{package_root} = AlmanacBug::_abs_root($root);
             $f{scheduled_at} = $now;
+        }
+        if ($to eq 'fixed' && $o{'no-package'}) {
+            $f{fixed_at} = $now;
+            $f{fixed_without_package} = 1;
         }
 
         # Claim fields (spec sec 2.4 step 4). $id_who_or_msg is a hashref here
@@ -1687,6 +1733,7 @@ unless (caller) {
         $lock->release;
         print "$id: $from -> $to"
             . ($to eq 'scheduled' ? " (package $pkg_link)" : '')
+            . (($to eq 'fixed' && $o{'no-package'}) ? " (no package -- in-place fix)" : '')
             . (($from_known ? '' : '  (repaired: previous status was outside the state machine)')) . "\n";
         exit 0;
     }
@@ -2165,16 +2212,19 @@ almanac-bug.pl — ccpraxis bug reports, one file per report.
         Add to the end of a report's body. Allowed ONLY while status is `open`. Use this to record progress — it cannot lose what is already there.
   update <id> (--body - | --body-file F) [--title T] [--severity S] [--replace]
         REPLACE a report's body. Allowed ONLY while status is `open`. Refuses when the existing body would be discarded unless --replace is given; there is no undo, as reports are gitignored.
-  set-status <id> --to <state> [--note N] [--package BP/PKG] [--repair]
-        open -> triaging -> scheduled -> fixed|dropped  (triaging -> open to hand back)
+  set-status <id> --to <state> [--note N] [--package BP/PKG] [--no-package] [--repair]
+        open -> triaging -> scheduled -> fixed|dropped  (triaging -> open to hand back;
+        triaging -> fixed via --no-package, below)
         Moving to `triaging` CLAIMS the report for the calling session (and agent, for a
         subagent) -- the identity comes from a butler hook ticket, never from a flag, and is
         required: run this from a Claude Code session with the butler plugin enabled, with the
         id and every argument written literally (no $variables). Only the claimant may then move
         it on or back to `open`; see `takeover` for a stale claim.
         --to scheduled requires --package <blueprint>/<package>, validated against an existing
-        package ledger (live or archived). `fixed` can never be set by hand -- reconcile sets it
-        once the scheduled package is done. --to dropped requires --note "<reason>".
+        package ledger (live or archived); reconcile sets `fixed` once that package is done.
+        `fixed` can also be set by hand directly from `triaging`, but ONLY together with
+        --no-package --note "<what fixed it>" -- for an in-place fix with no blueprint package
+        (Decision 66). --to dropped requires --note "<reason>".
         --repair: ONLY for a report whose current status is not a known state (hand-written, or from before this machine existed). It cannot skip a legal transition between valid states. Put it last on the line.
         Leaving `open` FREEZES the body and records its sha256.
   takeover <id>

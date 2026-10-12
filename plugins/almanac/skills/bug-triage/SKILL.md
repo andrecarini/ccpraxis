@@ -27,16 +27,22 @@ still match their digests, by re-reading each file from disk rather than trustin
 
 ```
 open  ->  triaging  ->  scheduled  ->  fixed | dropped
- |           |
- |           +-------->  open        (hand it back: "not ready, keep editing")
- +-------------------->  dropped     (with a reason)
+ |           |            |
+ |           |            +----->  fixed  (reconcile, once the package is done)
+ |           +-------->  open         (hand it back: "not ready, keep editing")
+ |           +-------->  fixed        (--no-package, an in-place fix with no package)
+ +-------------------->  dropped      (with a reason)
 ```
 
 `triaging -> dropped` is also legal — a report can be dropped without ever being scheduled.
+`triaging -> fixed` is legal too (Decision 66), but ONLY via `--no-package --note "<what fixed
+it>"` — see "An in-place fix with no package" below. `fixed` is never reachable by hand from
+`scheduled`: a scheduled report fixes only via reconcile, once its package is done.
 
 ```bash
 perl "${CLAUDE_PLUGIN_ROOT}/scripts/almanac.pl" bug set-status <id> --to triaging
 perl "${CLAUDE_PLUGIN_ROOT}/scripts/almanac.pl" bug set-status <id> --to scheduled --package <blueprint>/<package>
+perl "${CLAUDE_PLUGIN_ROOT}/scripts/almanac.pl" bug set-status <id> --to fixed --no-package --note "<what fixed it>"
 perl "${CLAUDE_PLUGIN_ROOT}/scripts/almanac.pl" bug set-status <id> --to dropped --note "<why>"
 perl "${CLAUDE_PLUGIN_ROOT}/scripts/almanac.pl" bug takeover <id>
 ```
@@ -54,12 +60,12 @@ session.
 
 `scheduled` needs a package whose ledger exists, live or archived, under
 `.ccpraxis-local-data/blueprints/` — run the `set-status --to scheduled` call from the project that
-owns the blueprint (ledgers never name bugs; the link lives on the report). `fixed` is never set by
-hand: every `almanac-bug.pl` call reconciles the project's reports first, and a scheduled report
-becomes `fixed` once its package ledger says `done`, recording the package and, if the ledger's
-`## Outputs` section has a `commit: <sha>` line, the commit too. `list`/`collect` flag a scheduled
-report whose package is parked, dropped or missing, and a leftover `taken` report (from before this
-rename) that could not be migrated automatically. Run the explicit form with
+owns the blueprint (ledgers never name bugs; the link lives on the report). A scheduled report
+becomes `fixed` once its package ledger says `done`: every `almanac-bug.pl` call reconciles the
+project's reports first, recording the package and, if the ledger's `## Outputs` section has a
+`commit: <sha>` line, the commit too. `list`/`collect` flag a scheduled report whose package is
+parked, dropped or missing, and a leftover `taken` report (from before this rename) that could not
+be migrated automatically. Run the explicit form with
 `perl "<ccpraxis>/plugins/almanac/scripts/almanac-bug.pl" reconcile` to reconcile on demand rather
 than waiting for the next verb to do it silently.
 
@@ -103,10 +109,16 @@ Then, in the same pass:
 - **Remember promotion.** A fix in this clone is inert until merged into `~/.claude/ccpraxis`. The
   reporter's sandbox is serving the *live install*, so until you promote, their next run hits the
   same defect and may re-file it.
-- Then schedule the report against the package doing the fix:
+- If the fix belongs to a blueprint package, schedule the report against it:
   `bug set-status <id> --to scheduled --package <blueprint>/<package>`, and write `commit: <sha>`
   under that package ledger's `## Outputs` section when the fix lands. The report becomes `fixed`
   by itself, the next time any `almanac-bug.pl` call reconciles.
+- If the fix is an **in-place, ad-hoc fix with no blueprint package** — a small, direct patch made
+  outside any package pipeline — move it straight from `triaging` to `fixed` by hand instead:
+  `bug set-status <id> --to fixed --no-package --note "<what fixed it>"` (Decision 66). The note is
+  the one piece of evidence reconcile would otherwise have supplied (a package link and its
+  commits), so say what actually fixed it. This edge is reachable only from `triaging` — it cannot
+  bypass a `scheduled` report's package-done requirement.
 
 Filing a new report, rather than triaging existing ones, is /almanac:bug-report; see
 `plugins/almanac/skills/bug-report/SKILL.md`.

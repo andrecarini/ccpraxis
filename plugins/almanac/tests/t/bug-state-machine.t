@@ -183,8 +183,11 @@ is_deeply(\@AlmanacBug::STATES, [qw(open triaging scheduled fixed dropped)],
     'AC1: @AlmanacBug::STATES is open triaging scheduled fixed dropped');
 ok(!exists $AlmanacBug::NEXT{reviewing}, 'AC1: %NEXT has no reviewing key');
 ok(!exists $AlmanacBug::NEXT{taken}, 'AC1: %NEXT has no taken key (retired)');
-is_deeply($AlmanacBug::NEXT{triaging}, [qw(scheduled open dropped)],
-    "AC1: \$NEXT{triaging} is scheduled open dropped");
+# Decision 66: triaging -> fixed is now a legal edge too, reachable ONLY via
+# --no-package --note (an in-place fix with no blueprint package) -- see
+# bug-lifecycle.t for that oracle.
+is_deeply($AlmanacBug::NEXT{triaging}, [qw(scheduled open dropped fixed)],
+    "AC1: \$NEXT{triaging} is scheduled open dropped fixed");
 is_deeply($AlmanacBug::NEXT{scheduled}, [qw(fixed dropped)],
     "AC1: \$NEXT{scheduled} is fixed dropped");
 is_deeply($AlmanacBug::NEXT{fixed}, [], "AC1: \$NEXT{fixed} is terminal (empty)");
@@ -303,13 +306,13 @@ unlike(body_of($path), qr/sneaky rewrite/, '...and the body is genuinely unchang
 #
 # RENAMED (package 07-bug-lifecycle): `resolved` is retired (AC5 above covers
 # its own refusal). The "you cannot skip the middle step" claim is now best
-# demonstrated by `fixed`, which can NEVER be reached by hand from ANY state
-# -- it is set only by reconcile (spec sec 2.4 step 2) -- so attempting it
-# from `triaging` is refused with that specific message, not "not a legal
-# transition".
+# demonstrated by `fixed`, which can be reached by hand from `triaging` ONLY
+# together with --no-package --note (Decision 66, bug-lifecycle.t's oracle);
+# bare --to fixed with no --no-package is refused with that specific message,
+# not "not a legal transition".
 my ($rc_bad, $out_bad) = run_as('S1', undef, 'set-status', $id, '--project', $PROJ, '--to', 'fixed');
-isnt($rc_bad, 0, 'triaging -> fixed is refused -- fixed is never set by hand (AC4)');
-like($out_bad, qr/is set only by reconcile/, '...and the refusal names reconcile');
+isnt($rc_bad, 0, 'triaging -> fixed (no --no-package) is refused -- fixed is never set by bare hand (AC4)');
+like($out_bad, qr/only.*together with --no-package/, '...and the refusal names --no-package');
 
 my ($rc_x) = run_as('S1', undef, 'set-status', $id, '--project', $PROJ, '--to', 'nonsense');
 isnt($rc_x, 0, 'an unknown state is refused');
@@ -328,8 +331,16 @@ ok(defined field_of($path, 'scheduled_at'), 'scheduled stamps scheduled_at');
 is(field_of($path, 'package'), 'smtest/01-smtest', 'scheduled records the package link');
 
 my ($rc_fixed_by_hand, $out_fixed_by_hand) = run('set-status', $id, '--project', $PROJ, '--to', 'fixed');
-isnt($rc_fixed_by_hand, 0, 'scheduled -> fixed by hand is refused -- fixed is set only by reconcile');
-like($out_fixed_by_hand, qr/is set only by reconcile/, '...and the refusal names reconcile');
+isnt($rc_fixed_by_hand, 0, 'scheduled -> fixed by hand (no --no-package) is refused -- fixed is set only by reconcile');
+like($out_fixed_by_hand, qr/only.*together with --no-package/, '...and the refusal names --no-package');
+
+# Decision 66: even WITH --no-package, `scheduled -> fixed` is refused --
+# the escape hatch is reserved for triaging only, so it cannot bypass a
+# scheduled report's package-done requirement.
+my ($rc_fixed_np, $out_fixed_np) = run('set-status', $id, '--project', $PROJ, '--to', 'fixed',
+                                        '--no-package', '--note', 'hand-fixed-anyway');
+isnt($rc_fixed_np, 0, 'scheduled -> fixed --no-package is ALSO refused -- the hatch is triaging-only');
+like($out_fixed_np, qr/--no-package only applies from triaging/, '...and the refusal names the restriction');
 
 is((run('set-status', $id, '--project', $PROJ, '--to', 'dropped', '--note', '"fixed in abc123"'))[0], 0,
    'scheduled -> dropped');
@@ -603,12 +614,12 @@ my $id3;
     my ($rc_bad) = run('set-status', $lid, '--project', $PROJ, '--to', 'bogus', '--repair');
     isnt($rc_bad, 0, 'repair: --repair still refuses an unknown target state');
 
-    # 3b. --repair cannot reach `fixed` either -- that refusal is unconditional
-    # (spec sec 2.4 step 2), regardless of how far outside the machine the
-    # report currently is.
+    # 3b. --repair cannot reach `fixed` without --no-package either -- that
+    # refusal is unconditional (spec sec 2.4 step 2), regardless of how far
+    # outside the machine the report currently is.
     my ($rc_fx, $out_fx) = run('set-status', $lid, '--project', $PROJ, '--to', 'fixed', '--repair');
-    isnt($rc_fx, 0, 'repair: --repair cannot reach fixed -- it is set only by reconcile');
-    like($out_fx, qr/is set only by reconcile/, 'repair: ...with the reconcile-only message');
+    isnt($rc_fx, 0, 'repair: --repair cannot reach bare fixed -- it needs --no-package or reconcile');
+    like($out_fx, qr/only.*together with --no-package/, 'repair: ...with the --no-package message');
 
     # 4. And it works.
     my ($rc_ok, $out_ok) = run('set-status', $lid, '--project', $PROJ,
