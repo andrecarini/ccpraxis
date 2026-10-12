@@ -69,7 +69,8 @@ use Cwd ();
 # instance further down DID have the defect and is fixed for that reason
 # -- see the comment there.)
 BEGIN {
-    my $dir = Cwd::abs_path(__FILE__);
+    (my $self = __FILE__) =~ s{\\}{/}g;
+    my $dir = Cwd::abs_path($self) // $self;
     $dir =~ s{\\}{/}g;
     $dir =~ s{/[^/]+\z}{};
     $dir = '.' unless length $dir;
@@ -420,7 +421,7 @@ sub claim_state {
 # up via @INC rather than cwd (bug 75fe's doubled-join shape).
 sub _butler_module_path {
     my ($basename) = @_;
-    my $dir = Cwd::abs_path(__FILE__);
+    my $dir = do { (my $f = __FILE__) =~ s{\\}{/}g; Cwd::abs_path($f) // $f };
     $dir =~ s{\\}{/}g;
     $dir =~ s{/[^/]+\z}{};
     $dir = '.' unless length $dir;

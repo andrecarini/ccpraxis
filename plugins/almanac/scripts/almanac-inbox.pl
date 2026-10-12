@@ -29,7 +29,7 @@ use Cwd ();
 # @INC").
 my $TASK_PL;
 BEGIN {
-    my $dir = Cwd::abs_path(__FILE__);
+    my $dir = do { (my $f = __FILE__) =~ s{\\}{/}g; Cwd::abs_path($f) // $f };
     $dir =~ s{\\}{/}g;
     $dir = ($dir =~ m{/}) ? ($dir =~ s{/[^/]+\z}{}r) : '.';
     unshift @INC, $dir;
