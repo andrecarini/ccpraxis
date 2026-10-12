@@ -692,7 +692,7 @@ for my $role (qw(manual driver reporter)) {
 # ===========================================================================
 # AC-23: hook-architecture.md no longer contains the stale "No SessionStart
 # or SessionEnd hook is registered." sentence; it contains the sec 2.6(6)
-# replacement sentence, and "This is 26 hooks.json commands".
+# replacement sentence, and "This is 27 hooks.json commands" (26 at never-halt 12; tooling-backlog 11 added ac-standdown-gate.sh).
 # ===========================================================================
 {
     ok(-f $DOC, 'AC-23 precondition: hook-architecture.md exists') or BAIL_OUT('hook-architecture.md missing');
@@ -702,8 +702,8 @@ for my $role (qw(manual driver reporter)) {
     my $replacement = 'Two SessionStart hooks are registered, and neither carries state across a new id: denial-breaker.sh (never-halt 07) moves its own per-agent counting offset, and session-start-nudge.sh (never-halt 12) speaks only on source compact or resume of an armed session, both of which keep the id. No SessionEnd hook is registered.';
     ok((index($text, $replacement) >= 0), 'AC-23: the sec 2.6(6) replacement sentence is present verbatim')
         or diag('doc does not contain the replacement sentence');
-    ok((index($text, 'This is 26 hooks.json commands') >= 0),
-        'AC-23: the doc\'s count sentence says "This is 26 hooks.json commands"');
+    ok((index($text, 'This is 27 hooks.json commands') >= 0),
+        'AC-23: the doc\'s count sentence says "This is 27 hooks.json commands"');
 }
 
 done_testing();

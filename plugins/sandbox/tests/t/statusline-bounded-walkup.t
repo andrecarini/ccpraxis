@@ -1,6 +1,6 @@
 #!/usr/bin/env perl
 # platform: windows
-# statusline-bounded-walkup.t -- the ORACLE for blueprint tooling-backlog,
+# The ORACLE for blueprint tooling-backlog,
 # package 01-statusline-bounded-walkup (specs/01-statusline-bounded-walkup-spec.md).
 #
 # Written BLIND to the generator's/statusline.pl's planned new code: this

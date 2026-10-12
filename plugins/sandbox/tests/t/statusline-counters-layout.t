@@ -731,7 +731,7 @@ SKIP: {
     (my $line143_nocr = $line143) =~ s/\r\z//;
     $line143 = $line143_nocr;
     my $want = "\x{25CB} HOST \x{FF5C} ccpraxis \x{FF5C} \x{2325} main \x{2191}3 \x{2193}22 \x{FF5C} "
-             . "\x{29C9}  2  \x{274F} 14";
+             . "\x{29C9} 2  \x{274F} 14";   # one space after the glyph: operator-ui-tweaks 04 (042ee6f)
     my $want_bytes = encode('UTF-8', $want);
     is($line143, $want_bytes, 'AC-13: README.md line 143 is byte-exact per spec 2.8')
         or diag("  got  = [$line143]\n  want = [$want_bytes]");

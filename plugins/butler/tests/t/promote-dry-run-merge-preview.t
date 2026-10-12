@@ -394,22 +394,11 @@ sub make_tf_fixture {
         if ref($decoded) eq 'HASH';
 }
 
-# ===========================================================================
-# AC-7: existing sibling promote suites stay green relative to their
-# pre-change baseline. Run each as a subprocess; judge by exit code and
-# absence of "not ok" lines in its TAP output. Regression guard: this must
-# hold both before and after the fix is applied to promote.pl.
-# ===========================================================================
-for my $sibling (qw(promote-syncs-global-config.t promote-drops-retired-keys.t promote-array-merge.t)) {
-    my $path = "$Bin/$sibling";
-  SKIP: {
-        skip "AC-7: $sibling not found", 2 unless -f $path;
-        my $out = `"$^X" "$path" 2>&1`;
-        my $exit = $? >> 8;
-        is($exit, 0, "AC-7: $sibling exits 0") or diag($out);
-        my @not_ok = ($out =~ /^not ok /mg);
-        is(scalar(@not_ok), 0, "AC-7: $sibling has zero 'not ok' lines") or diag($out);
-    }
-}
+# AC-7 (the sibling promote suites stay green) is NOT asserted here by running
+# them: a test never spawns a sibling .t as a "stays green" floor (Decision 11,
+# tests-never-run-tests.t). promote-syncs-global-config.t,
+# promote-drops-retired-keys.t and promote-array-merge.t run on their own in
+# every sweep; running them again from here only doubled their cost and made
+# this file's red mean "some other file is red".
 
 done_testing();

@@ -461,6 +461,20 @@ SKIP: {
         copy($f, $dest) or die "copy $f -> $dest: $!";
         chmod 0755, $dest if $dest =~ /\.sh$/;
     }
+    # Module subtrees too: bp-drive-next.pl requires scripts/BpHook/PromptWatch.pm,
+    # and a top-level *.pm glob never reached it, so the fixture shim died with
+    # "Can't locate .../BpHook/PromptWatch.pm" rather than testing resolution.
+    require File::Find;
+    require File::Path;
+    File::Find::find({ no_chdir => 1, wanted => sub {
+        return unless -f $_ && /\.pm\z/;
+        (my $rel = $_) =~ s{\A\Q$SCRIPTS\E/}{};
+        return unless $rel =~ m{/};                 # top level was copied above
+        my $dest = "$sscripts/$rel";
+        (my $ddir = $dest) =~ s{/[^/]+\z}{};
+        File::Path::make_path($ddir) unless -d $ddir;
+        copy($_, $dest) or die "copy $_ -> $dest: $!";
+    } }, $SCRIPTS);
 
     ok(-d "$sandbox/bin" && -d "$sandbox/scripts",
         'AC7: sandbox-shaped fixture directory built (bin/ + scripts/ siblings, different absolute path)');

@@ -1,10 +1,10 @@
 #!/usr/bin/env perl
 # platform: any
-# ORACLE for blueprint where-things-go, package 07-bug-lifecycle. Derived
-# ONLY from .ccpraxis-local-data/blueprints/where-things-go/specs/
-# 07-bug-lifecycle-spec.md sections 2-5 (AC1-AC19) and the package ledger's
+# ORACLE for blueprint where-things-go, package 07 (the bug lifecycle). Derived
+# ONLY from package 07's spec under
+# .ccpraxis-local-data/blueprints/where-things-go/specs/, sections 2-5 (AC1-AC19) and the package ledger's
 # five done criteria -- NOT from reading almanac-bug.pl/almanac-doctor.pl's
-# bug-lifecycle code, which this package's write set has not written yet.
+# lifecycle code, which this package's write set has not written yet.
 # Almanac::PackageLink (package 02-thread-store, already landed) is named
 # explicitly by the spec as shared, read-only machinery this package sits on
 # top of, and is read here only to confirm fixture shapes, never edited.
