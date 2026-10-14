@@ -41,7 +41,32 @@ our $ID = 'claude-sandbox';
 # Prefix of every container this launcher creates: <prefix>-<project>-<8 hex>.
 our $CONTAINER_PREFIX = 'claude';
 
+# Host names this launcher's containers must not reach. Each is pinned to
+# 0.0.0.0 in the container's /etc/hosts at create time (--add-host), so any
+# lookup inside the container lands nowhere. A guardrail, not a wall: root in
+# the container can edit /etc/hosts. Empty for ccpraxis; a fork fills it in.
+our @BLOCKED_HOSTS = ();
+
 # ---- derived ----------------------------------------------------------------
+
+# blocked_hosts() -> the valid entries of @BLOCKED_HOSTS, lowercased, in order,
+# without duplicates. Anything that is not a plain DNS name is dropped, so an
+# entry can never smuggle an extra argument into the container-create call.
+sub blocked_hosts {
+    my (%seen, @out);
+    for my $h (@BLOCKED_HOSTS) {
+        next unless defined $h;
+        my $l = lc $h;
+        next unless $l =~ /\A[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*\z/;
+        push @out, $l unless $seen{$l}++;
+    }
+    return @out;
+}
+
+# blocked_host_args() -> the container-create arguments for blocked_hosts().
+sub blocked_host_args {
+    return map { ('--add-host', "$_:0.0.0.0") } blocked_hosts();
+}
 
 sub hostname             { return $ID }
 sub wt_profile_name      { return $ID }

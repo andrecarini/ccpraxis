@@ -143,3 +143,8 @@ command builds its own image, names its own containers and serves the fork's plu
 colliding with `claude-sandbox`. The port allocator recognises every family's container names, so
 two launchers never hand out the same port block. Both share one Windows Terminal profile
 (`WtProfile.pm`), which is harmless: the content is identical.
+
+A fork can also list host names its containers must not reach in `@BLOCKED_HOSTS`; each is pinned
+to `0.0.0.0` in the container's `/etc/hosts` at create time (`--add-host`). Entries that are not
+plain DNS names are dropped. It is a guardrail, not a wall: root in the container can edit
+`/etc/hosts`. ccpraxis itself blocks nothing.

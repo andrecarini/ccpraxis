@@ -50,6 +50,20 @@ ok(!is_sandbox_container_name('postgres'), '... but not an unrelated container')
 ok(!is_sandbox_container_name('claude-proj-0123ABCD'), '... nor a name without the lowercase hash suffix');
 ok(!is_sandbox_container_name(undef), '... nor undef');
 
+# --- blocked hosts ----------------------------------------------------------
+
+is_deeply([SandboxIdentity::blocked_hosts()], [], 'ccpraxis blocks no hosts');
+is_deeply([SandboxIdentity::blocked_host_args()], [], '... so no --add-host arguments');
+{
+    local @SandboxIdentity::BLOCKED_HOSTS = ('API.Example.com', 'api.example.com', 'x.example.org',
+        '', undef, 'bad host', 'evil:1.2.3.4', '--privileged', '-x.example.com', 'a..b');
+    is_deeply([SandboxIdentity::blocked_hosts()], ['api.example.com', 'x.example.org'],
+        'blocked_hosts lowercases, dedups, and drops anything that is not a plain DNS name');
+    is_deeply([SandboxIdentity::blocked_host_args()],
+        ['--add-host', 'api.example.com:0.0.0.0', '--add-host', 'x.example.org:0.0.0.0'],
+        'blocked_host_args pins each to 0.0.0.0');
+}
+
 # --- directory_marketplace_source -------------------------------------------
 
 is(directory_marketplace_source('ccpraxis-local', '/somewhere/else/plugins'),
@@ -85,6 +99,8 @@ for my $script (qw(launcher.pl bootstrap.pl skills.pl)) {
         'launcher.pl routes the directory-marketplace bind through SandboxIdentity');
     like($src, qr{SandboxIdentity::is_sandbox_container_name\(\$name\)},
         'launcher.pl port scan uses the cross-identity container-name match');
+    like($src, qr{'--hostname', SandboxIdentity::hostname\(\),\s*\n(?:\s*#[^\n]*\n)*\s*SandboxIdentity::blocked_host_args\(\),},
+        'launcher.pl passes blocked_host_args into podman create');
 }
 {
     my $src = slurp("$Bin/../../scripts/RefusalMarker.pm");

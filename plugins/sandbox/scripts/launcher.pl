@@ -5042,6 +5042,9 @@ if (! _container_exists($CONTAINER_NAME)) {
             $PODMAN, 'create', '-it',
             '--name',     $CONTAINER_NAME,
             '--hostname', SandboxIdentity::hostname(),
+            # Hosts this launcher's identity must not reach (empty for
+            # ccpraxis); pinned to 0.0.0.0 in the container's /etc/hosts.
+            SandboxIdentity::blocked_host_args(),
             # Sandbox-marker env var that skill guards inside the container
             # key off (instead of fragile $HOME-path sniffing). Stable across
             # any future image-internal user/path changes.
