@@ -47,7 +47,22 @@ our $CONTAINER_PREFIX = 'claude';
 # the container can edit /etc/hosts. Empty for ccpraxis; a fork fills it in.
 our @BLOCKED_HOSTS = ();
 
+# Claude Code version baked into this launcher's image. undef (ccpraxis) means
+# follow the host: the image is built with whatever `claude --version` reports,
+# and a host update forces a rebuild. A fork that sets a version gets that
+# version, always, independent of the host.
+our $CLAUDE_VERSION;
+
 # ---- derived ----------------------------------------------------------------
+
+# claude_version($host_version) -> the version to build and record: the pinned
+# $CLAUDE_VERSION when set (and shaped like a version), else $host_version.
+sub claude_version {
+    my ($host) = @_;
+    return $CLAUDE_VERSION
+        if defined $CLAUDE_VERSION && $CLAUDE_VERSION =~ /\A\d+\.\d+\.\d+(?:[-.][0-9A-Za-z.]+)?\z/;
+    return $host;
+}
 
 # blocked_hosts() -> the valid entries of @BLOCKED_HOSTS, lowercased, in order,
 # without duplicates. Anything that is not a plain DNS name is dropped, so an

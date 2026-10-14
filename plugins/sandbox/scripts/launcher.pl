@@ -2276,6 +2276,11 @@ my $HOST_VERSION = '';
         $HOST_VERSION //= '';
     }
 }
+# A launcher identity may pin the version instead of following the host
+# (SandboxIdentity::claude_version). Everything below -- image build arg, tag,
+# the recorded container version and the version-skew rebuild -- then uses the
+# pinned version, so a host update never rebuilds a pinned sandbox.
+$HOST_VERSION = SandboxIdentity::claude_version($HOST_VERSION) // '';
 
 # =====================================================================
 # Hash helpers (MD5 via core Digest::MD5; no md5sum dependency)

@@ -440,6 +440,7 @@ if ($? == 0) {
     my $host_version = `claude --version 2>/dev/null`;
     chomp $host_version if defined $host_version;
     ($host_version) = split /\s+/, ($host_version // '');
+    $host_version = SandboxIdentity::claude_version($host_version);   # a pinned identity wins
     $host_version //= 'latest';
     my $rc = system($PODMAN, 'build',
         '--build-arg', "CLAUDE_VERSION=$host_version",

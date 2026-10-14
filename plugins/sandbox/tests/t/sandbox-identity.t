@@ -64,6 +64,21 @@ is_deeply([SandboxIdentity::blocked_host_args()], [], '... so no --add-host argu
         'blocked_host_args pins each to 0.0.0.0');
 }
 
+# --- pinned Claude Code version ---------------------------------------------
+
+ok(!defined $SandboxIdentity::CLAUDE_VERSION, 'ccpraxis does not pin Claude Code (follows the host)');
+is(SandboxIdentity::claude_version('2.1.300'), '2.1.300', 'unpinned: the host version is used');
+is(SandboxIdentity::claude_version(undef), undef, 'unpinned and no host version: undef');
+{
+    local $SandboxIdentity::CLAUDE_VERSION = '2.1.282';
+    is(SandboxIdentity::claude_version('2.1.300'), '2.1.282', 'pinned: the pin wins over the host');
+    is(SandboxIdentity::claude_version(undef), '2.1.282', 'pinned: no host claude needed');
+}
+{
+    local $SandboxIdentity::CLAUDE_VERSION = 'latest; rm -rf /';
+    is(SandboxIdentity::claude_version('2.1.300'), '2.1.300', 'a pin that is not a version string is ignored');
+}
+
 # --- directory_marketplace_source -------------------------------------------
 
 is(directory_marketplace_source('ccpraxis-local', '/somewhere/else/plugins'),
