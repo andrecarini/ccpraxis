@@ -303,3 +303,34 @@ ccpraxis install, so it still refuses to sandbox the live install in place even 
 the marketplace registry cannot be read and this guard's `ccpraxis-install` root is therefore
 missing. See `plugins/sandbox/docs/working-on-ccpraxis.md` for the clone workflow that refusal
 points you to.
+
+## 10. Refusal markers: a directory that refuses on its own
+
+The guard above protects paths ccpraxis knows about, plus your extra list. A **refusal marker** lets
+a directory protect itself, with no central list: put a plain file named `.claude-sandbox-refuse` in
+it. The check runs right after this guard, in `launcher.pl` and again in `bootstrap.pl` (which can be
+run on its own), before either writes anything under the project.
+
+**Where it is found.** For a launch target `T`, the launcher refuses if a marker is in `T` itself,
+in any directory above `T`, or in a directory up to two levels below `T`. The downward scan exists
+because sandboxing a parent bind-mounts the marked directory as well. It is bounded on purpose, so an
+ordinary launch never walks a whole tree: a marker deeper than two levels below the directory you
+launch from is **not** detected.
+
+**What it says.** The marker's text is the refusal message, printed after a header naming the target
+and the marker file. Whoever places the marker decides what the operator is told, for example which
+other command to use instead. An empty marker gets a generic message.
+
+**Letting one launcher through.** A line `allow-launcher: <id>` exempts the launcher whose identity
+is `<id>` from that one marker. This launcher's identity is `claude-sandbox`, set in one place
+(`$SandboxIdentity::ID` in `plugins/sandbox/scripts/SandboxIdentity.pm`), so a fork that ships its
+own launcher changes it there and lists its id in the markers it owns. Being exempt from one marker never exempts a launcher from another.
+
+```text
+allow-launcher: other-sandbox
+This tree is sandboxed with other-sandbox, not claude-sandbox.
+```
+
+Like the guard, there is no flag or environment variable that skips a marker. To launch there with
+`claude-sandbox`, remove the marker. Code: `plugins/sandbox/scripts/RefusalMarker.pm`; oracle:
+`plugins/sandbox/tests/t/refusal-marker.t`.

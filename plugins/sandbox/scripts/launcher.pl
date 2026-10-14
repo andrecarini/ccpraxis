@@ -47,6 +47,8 @@ BEGIN {
 use MountSpec qw(winify_path v_to_mount convert_v_to_mount);
 use CcpraxisWorkCopy qw(workcopy_route workcopy_refusal_outcome);
 use ProtectedPaths qw(path_relation protected_roots target_self_codes normalize_path);
+use RefusalMarker ();  # .claude-sandbox-refuse markers: refuse before anything is written
+use SandboxIdentity ();  # launcher identity + this checkout's own install root
 use LaunchLog ();   # B1: durable per-launch diagnostic log (next to us in scripts/)
 use Dashboard ();   # B2: the raw-ANSI TUI dashboard framework
 use WtProfile ();   # sandbox-wt-profile/02: [c]-press profile fragment ensure + name
@@ -248,7 +250,12 @@ sub home_dir {
 
 my $HOME              = home_dir();
 my $CLAUDE_HOST_CONFIG = "$HOME/.claude";
-my $SANDBOX_PLUGIN    = "$CLAUDE_HOST_CONFIG/ccpraxis/plugins/sandbox";
+# The sandbox plugin THIS launcher runs from (SandboxIdentity::install_root,
+# derived from this checkout), never a hard-coded ~/.claude/ccpraxis: a fork's
+# launcher must serve the fork's container template, statusline and scripts.
+my $INSTALL_ROOT      = SandboxIdentity::install_root();
+my $SANDBOX_PLUGIN    = "$INSTALL_ROOT/plugins/sandbox";
+my $IMAGE_LATEST      = SandboxIdentity::image_ref();
 my $CONTAINER_CONFIG  = "$SANDBOX_PLUGIN/container";
 my $SANDBOX_SKILLS_PL = "$SANDBOX_PLUGIN/scripts/skills.pl";
 my $SELECT_SESSION_PL = "$SANDBOX_PLUGIN/scripts/select-session.pl";
@@ -924,6 +931,18 @@ $CLAUDE_HOST_CONFIG = do {
         exit($pp->{exit_code} || 1);
     }
     # not refused -> fall through to the workcopy_route fail-safe (R2) below
+}
+
+# Refusal marker: a directory that must not be sandboxed by this launcher
+# carries a .claude-sandbox-refuse file whose text is the refusal message.
+# Checked here, before anything is written under the project. See
+# RefusalMarker.pm for the format and the search rules.
+{
+    my $hit = RefusalMarker::find_refusal($PROJECT_PATH);
+    if ($hit) {
+        print STDERR RefusalMarker::refusal_message($hit, $PROJECT_PATH), "\n";
+        exit 1;
+    }
 }
 
 {
@@ -1934,8 +1953,8 @@ sub ensure_ccpraxis_data_dir {
             chomp $name if defined $name;
             $name = '' unless defined $name;
             unless (length $name) {
-                $name = "claude-${PROJECT_NAME}-"
-                      . substr(md5_of_string($PROJECT_PATH), 0, 8);
+                $name = SandboxIdentity::container_name($PROJECT_NAME,
+                      substr(md5_of_string($PROJECT_PATH), 0, 8));
             }
             if (_container_exists($name)) {
                 my $st = `$PODMAN inspect --format '{{.State.Status}}' "$name" 2>/dev/null`;
@@ -2142,7 +2161,7 @@ if ($LAUNCH_MODE eq 'tui') {
     my %raw_seams = _launch_raw_sink_seams();
     $LAUNCH_HOST = tui::LaunchScreens::make_host(
         mode      => 'tui',
-        title     => "claude-sandbox: $PROJECT_NAME",
+        title     => "$SandboxIdentity::ID: $PROJECT_NAME",
         plain     => \&_launch_plain_sink,
         out       => sub { print STDOUT $_[0] },
         %raw_seams,
@@ -2439,8 +2458,8 @@ sub build_image {
     my $rc = _tee_system($PODMAN, 'build',
         '--build-arg', "CLAUDE_VERSION=${HOST_VERSION}",
         '--build-arg', "P02_SSH_HOST_KEYS_CACHEBUST=${ssh_host_keys_cachebust}",
-        '-t', "claude-sandbox:${HOST_VERSION}",
-        '-t', 'claude-sandbox:latest',
+        '-t', SandboxIdentity::image_ref($HOST_VERSION),
+        '-t', $IMAGE_LATEST,
         $CONTAINER_CONFIG);
     if ($rc != 0) {
         log_ev('image_build_failed', { exit => $rc >> 8 });
@@ -2536,11 +2555,11 @@ sub backpack_review {
 # question already lived, and the single build happens after the answer.
 my $IMAGE_EXISTS;
 {
-    my $build_lock = "$CLAUDE_HOST_CONFIG/ccpraxis/.locks/image-build";
+    my $build_lock = "$INSTALL_ROOT/.locks/image-build";
     File::Path::make_path(dirname($build_lock));
     my $got_build_lock = SandboxLock::acquire($build_lock, timeout => 600, windows => $WINDOWS_FAMILY);
     # fail-open: proceed even if !$got_build_lock
-    my $probe = `$PODMAN image inspect claude-sandbox:latest 2>&1`;
+    my $probe = `$PODMAN image inspect $IMAGE_LATEST 2>&1`;
     $IMAGE_EXISTS = ($? == 0) ? 1 : 0;
     SandboxLock::release($build_lock);
 
@@ -2572,7 +2591,7 @@ my $IMAGE_EXISTS;
         }
         # Reachable now -- re-probe, since the earlier answer was about a dead
         # socket rather than about the image.
-        `$PODMAN image inspect claude-sandbox:latest 2>&1`;
+        `$PODMAN image inspect $IMAGE_LATEST 2>&1`;
         $IMAGE_EXISTS = ($? == 0) ? 1 : 0;
     }
 }
@@ -3159,7 +3178,7 @@ sub _enumerate_inuse_host_ports {
     my @host_ports;
     for my $name (split /\s+/, $names_raw) {
         next unless length $name;
-        next unless $name =~ /^claude-.+-[0-9a-f]{8}$/;   # our sandbox naming
+        next unless SandboxIdentity::is_sandbox_container_name($name);   # any launcher's sandbox naming
         next if $name eq $self_name;
 
         # Read the CREATE-time published host ports via `podman inspect` — this is
@@ -3308,14 +3327,14 @@ my $do_rebuild = $PLAN->{rebuild};
 {
     my $need_build = $PLAN->{build_image};
     if ($need_build) {
-        my $build_lock = "$CLAUDE_HOST_CONFIG/ccpraxis/.locks/image-build";
+        my $build_lock = "$INSTALL_ROOT/.locks/image-build";
         File::Path::make_path(dirname($build_lock));
         SandboxLock::acquire($build_lock, timeout => 600, windows => $WINDOWS_FAMILY);
         # Re-check under the lock ONLY when this is a "missing image" build: a
         # concurrent launcher may have just built it, and a second identical
         # build helps nobody. An explicit rebuild always builds -- that is what
         # was asked for.
-        my $still_missing = do { `$PODMAN image inspect claude-sandbox:latest 2>&1`; $? != 0 };
+        my $still_missing = do { `$PODMAN image inspect $IMAGE_LATEST 2>&1`; $? != 0 };
         if ($do_rebuild || $still_missing) {
             _launch_stage_begin('image');
             build_image();
@@ -3349,7 +3368,7 @@ if ($do_rebuild) {
     # Regenerate container name.
     unlink "$LAUNCHER_DIR/container-name";
     my $path_hash = substr(md5_of_string($PROJECT_PATH), 0, 8);
-    $CONTAINER_NAME = "claude-${PROJECT_NAME}-${path_hash}";
+    $CONTAINER_NAME = SandboxIdentity::container_name($PROJECT_NAME, $path_hash);
     _write_file("$LAUNCHER_DIR/container-name", $CONTAINER_NAME);
 }
 
@@ -3684,7 +3703,7 @@ sub _container_name_for {
     $p = winify_path($p);
     my $n = lc(basename($p));
     $n =~ s/ /-/g;
-    return "claude-${n}-" . substr(md5_of_string($p), 0, 8);
+    return SandboxIdentity::container_name($n, substr(md5_of_string($p), 0, 8));
 }
 
 sub _copy_file {
@@ -3946,6 +3965,9 @@ if (-f "$HOST_PLUGINS_DIR/known_marketplaces.json") {
             next unless ($src->{source} // '') eq 'directory';
             my $host_path = $src->{path};
             next unless defined $host_path && length $host_path;
+            # ccpraxis-local is served from THIS launcher's own plugin tree (a no-op
+            # for the live install; a fork serves its own plugins). See SandboxIdentity.
+            $host_path = SandboxIdentity::directory_marketplace_source($name, $host_path);
             $host_path =~ s|\\|/|g;
             $host_path =~ s|/+$||;
             $host_path = winify_path($host_path);
@@ -4159,7 +4181,7 @@ if ($WINDOWS_FAMILY && $PODMAN =~ /podman/i) {
 
 my @BACKPACK_MOUNTS;
 {
-    my $backpack_dir = "$CLAUDE_HOST_CONFIG/ccpraxis/plugins/backpack";
+    my $backpack_dir = "$INSTALL_ROOT/plugins/backpack";
     if (-f "$backpack_dir/scripts/backpack.pl") {
         push @BACKPACK_MOUNTS, '-v',
             "$backpack_dir/scripts/backpack.pl:/root/.claude/backpack.pl:ro";
@@ -5019,7 +5041,7 @@ if (! _container_exists($CONTAINER_NAME)) {
         my @args = (
             $PODMAN, 'create', '-it',
             '--name',     $CONTAINER_NAME,
-            '--hostname', 'claude-sandbox',
+            '--hostname', SandboxIdentity::hostname(),
             # Sandbox-marker env var that skill guards inside the container
             # key off (instead of fragile $HOME-path sniffing). Stable across
             # any future image-internal user/path changes.
@@ -5082,7 +5104,7 @@ if (! _container_exists($CONTAINER_NAME)) {
         MountSpec::claude_home_create_args(
             claude_data  => $CLAUDE_DATA,
             launcher_dir => $LAUNCHER_DIR,
-            statusline   => "${CLAUDE_HOST_CONFIG}/ccpraxis/scripts/statusline.pl",
+            statusline   => "${INSTALL_ROOT}/scripts/statusline.pl",
             (defined &MountSpec::ensure_global_counts_file
                 ? (global_counts => "${CLAUDE_HOST_CONFIG}/almanac-global-counts.json") : ()),
         );
@@ -5090,7 +5112,7 @@ if (! _container_exists($CONTAINER_NAME)) {
         push @args, @PLUGIN_MOUNTS;
         push @args, @EXTRA_MOUNTS;
         push @args, @BACKPACK_MOUNTS;
-        push @args, 'claude-sandbox:latest';
+        push @args, $IMAGE_LATEST;
 
         # Rewrite every `-v HOST:CONTAINER[:opts]` pair into
         # `--mount type=bind,…` to defeat MSYS2's `:`-as-path-list mangling on
@@ -5218,7 +5240,7 @@ my @BACKPACK_APPROVED_ITEMS;
 my $BACKPACK_APPROVALS_FILE = "$LAUNCHER_DIR/backpack-approvals.json";
 my $BACKPACK_TRUST_FILE     = "$LAUNCHER_DIR/backpack-trusted-hash";  # legacy; migrated away on first run
 my $BACKPACK_HOST_FILE      = "$CLAUDE_DATA/backpack.json";
-my $BACKPACK_HOST_PL        = "$CLAUDE_HOST_CONFIG/ccpraxis/plugins/backpack/scripts/backpack.pl";
+my $BACKPACK_HOST_PL        = "$INSTALL_ROOT/plugins/backpack/scripts/backpack.pl";
 
 # >>> launch-emit:backpack:BEGIN
 if ($CONTAINER_WAS_CREATED && -f $BACKPACK_HOST_FILE) {

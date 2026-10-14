@@ -27,8 +27,18 @@
 use strict;
 use warnings;
 use File::Path qw(make_path);
-use File::Basename qw(basename);
+use File::Basename qw(basename dirname);
 use Cwd qw(abs_path);
+
+# Make the modules next to us (RefusalMarker, SandboxIdentity) loadable. Same strategy and reasons as
+# launcher.pl: __FILE__ with backslashes normalised, no FindBin, no abs_path.
+BEGIN {
+    my $here = __FILE__;
+    $here =~ s|\\|/|g;
+    unshift @INC, dirname($here);
+}
+use RefusalMarker ();
+use SandboxIdentity ();
 
 binmode STDOUT, ':raw';
 binmode STDERR, ':raw';
@@ -104,6 +114,16 @@ $PROJECT_PATH =~ s|\\|/|g;
 $PROJECT_PATH =~ s|/+$||;
 $PROJECT_PATH = winify_path($PROJECT_PATH);
 
+# Refusal marker: launcher.pl checks this too, but bootstrap can be run on its
+# own and creates files under the project, so it must refuse independently.
+{
+    my $hit = RefusalMarker::find_refusal($PROJECT_PATH);
+    if ($hit) {
+        print STDERR RefusalMarker::refusal_message($hit, $PROJECT_PATH), "\n";
+        exit 1;
+    }
+}
+
 # =====================================================================
 # Constants
 # =====================================================================
@@ -115,7 +135,10 @@ $HOME =~ s|/+$||;
 $HOME = winify_path($HOME);
 
 my $CLAUDE_HOST_CONFIG = "$HOME/.claude";
-my $SANDBOX_PLUGIN     = "$CLAUDE_HOST_CONFIG/ccpraxis/plugins/sandbox";
+# This checkout's own sandbox plugin, not a hard-coded ~/.claude/ccpraxis (see
+# SandboxIdentity.pm): a fork's bootstrap builds the fork's image.
+my $SANDBOX_PLUGIN     = SandboxIdentity::install_root() . "/plugins/sandbox";
+my $IMAGE_LATEST       = SandboxIdentity::image_ref();
 my $CONTAINER_CONFIG   = "$SANDBOX_PLUGIN/container";
 my $CCPRAXIS_INSTALL_PL = "$SANDBOX_PLUGIN/ccpraxis-install.pl";
 
@@ -409,9 +432,9 @@ log_step("Step 2/6: ensure $RUNTIME_NAME is reachable and the container image ex
     }
 }
 
-my $image_check = `$PODMAN image inspect claude-sandbox:latest 2>&1`;
+my $image_check = `$PODMAN image inspect $IMAGE_LATEST 2>&1`;
 if ($? == 0) {
-    log_skip("claude-sandbox:latest already built");
+    log_skip("$IMAGE_LATEST already built");
 } else {
     log_done("image missing — building (this can take a few minutes)");
     my $host_version = `claude --version 2>/dev/null`;
@@ -420,11 +443,11 @@ if ($? == 0) {
     $host_version //= 'latest';
     my $rc = system($PODMAN, 'build',
         '--build-arg', "CLAUDE_VERSION=$host_version",
-        '-t', "claude-sandbox:$host_version",
-        '-t', 'claude-sandbox:latest',
+        '-t', SandboxIdentity::image_ref($host_version),
+        '-t', $IMAGE_LATEST,
         $CONTAINER_CONFIG);
     die_bootstrap("$RUNTIME_NAME build failed (exit @{[$rc >> 8]})") if $rc != 0;
-    log_done("built claude-sandbox:$host_version + :latest");
+    log_done("built " . SandboxIdentity::image_ref($host_version) . " + :latest");
 }
 
 # =====================================================================

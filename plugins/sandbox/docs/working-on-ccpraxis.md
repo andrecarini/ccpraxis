@@ -122,3 +122,24 @@ the `sandbox-refuse-in-place` blueprint for the full reasoning.
   on a version mismatch and rebuilds. So any runtime risk tied to the bundled Claude/Bun version
   reaches the in-container butler fleet too. One caveat when comparing reports: the container runs
   Linux-x64 Bun against the host's Windows-x64, so platform-specific symptoms can differ.
+
+## The launcher serves the checkout it runs from
+
+`launcher.pl`, `bootstrap.pl` and `skills.pl` find their own tooling through
+`plugins/sandbox/scripts/SandboxIdentity.pm`, never through a hard-coded `~/.claude/ccpraxis`:
+
+- **`install_root()`** is the checkout the scripts were loaded from. The container template,
+  statusline, backpack scripts, custom `skills/` dir, the image-build lock and the `ccpraxis-local`
+  plugin tree bind-mounted into the container all come from it. Through the `claude-sandbox` shims
+  that is the live install, the same directory as before. Run `perl plugins/sandbox/scripts/launcher.pl`
+  straight from a clone and you get the clone's tooling.
+- **Identity** (`$ID`, `$CONTAINER_PREFIX`) names the image (`claude-sandbox:latest`), the
+  containers (`claude-<project>-<hash>`), the in-container hostname and the id presented to
+  refusal markers.
+
+This is what lets a **fork** ship a second launcher next to `claude-sandbox`: change the two
+identity lines in `SandboxIdentity.pm`, add shims that point at the fork's checkout, and the fork's
+command builds its own image, names its own containers and serves the fork's plugins, without
+colliding with `claude-sandbox`. The port allocator recognises every family's container names, so
+two launchers never hand out the same port block. Both share one Windows Terminal profile
+(`WtProfile.pm`), which is harmless: the content is identical.

@@ -32,6 +32,15 @@ use File::Spec;
 use POSIX qw(strftime);
 use Digest::SHA ();
 
+# Load SandboxIdentity from next to us (same approach as launcher.pl: __FILE__
+# with backslashes normalised, no FindBin, no abs_path).
+BEGIN {
+    my $here = __FILE__;
+    $here =~ s|\\|/|g;
+    unshift @INC, dirname($here);
+}
+use SandboxIdentity ();
+
 our $SCHEMA_VERSION = 3;
 
 # Where the host stores its plugin tree. Container mount target uses the same
@@ -362,6 +371,9 @@ sub skill_host_only_status {
             next unless ($entry->{source}{source} // '') eq 'directory';
             my $p = $entry->{source}{path};
             next unless defined $p && length $p;
+            # Same substitution the launcher's bind uses: ccpraxis-local is served
+            # from this checkout's own plugin tree (SandboxIdentity).
+            $p = SandboxIdentity::directory_marketplace_source($name, $p);
             $km_cache{$name} = normalize_path($p);
         }
     }
@@ -490,7 +502,7 @@ sub discover_skills {
 
     # Custom skills only. Plugin-shipped skills are now exposed by plugin
     # selection (see `discover_plugins`), not as individual skill mounts.
-    my $custom_dir = home() . "/.claude/ccpraxis/skills";
+    my $custom_dir = SandboxIdentity::install_root() . "/skills";   # this checkout's own skills
     if (-d $custom_dir) {
         if (opendir my $dh, $custom_dir) {
             for my $entry (sort grep { $_ !~ /^\.\.?$/ } map { from_fs($_) } readdir $dh) {

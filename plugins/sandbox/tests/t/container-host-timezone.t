@@ -792,6 +792,10 @@ for my $run_result ([1, ''], [-1, '']) {
         my $CLAUDE_DATA        = $tmp_cd;
         my $LAUNCHER_DIR       = $tmp_ld;
         my $CLAUDE_HOST_CONFIG = $tmp_hc;
+        # The statusline source is the launcher's own install root
+        # (SandboxIdentity::install_root), no longer a ~/.claude/ccpraxis literal;
+        # the fixture places that root where the literal used to point.
+        my $INSTALL_ROOT       = "$tmp_hc/ccpraxis";
         mkdir("$tmp_hc/ccpraxis");
         mkdir("$tmp_hc/ccpraxis/scripts");
         open(my $fh, '>', "$tmp_hc/ccpraxis/scripts/statusline.pl"); print $fh "1;\n"; close $fh;
