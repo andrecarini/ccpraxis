@@ -110,7 +110,7 @@ my $GB = 1024 ** 3;
 #   Activity     event count and per-row wrapping (1-3 rows each)
 #   Resources    present / partial / sampler-wait, and gauge values sweeping
 #                the full 0..100 so all four gauge.* bands appear
-#   Providers    logged in / logged out / unreadable
+#   Claude Code  logged in / logged out / unreadable
 #   Run          triage, backpack, keep-awake, busy lease, oauth
 #   header       project and container name lengths, status, spinner
 #   footer       needs_you, pending, footer_flash
@@ -381,15 +381,13 @@ sub synth_state {
     my $container  = $long_names ? 'claude-indocs-bacen-scraper-with-a-very-long-name-2c052ba3'
                                  : 'claude-ccpraxis-8f21ab3';
 
-    # Providers cycles through logged in / logged out / endpoint unreadable --
+    # Claude Code cycles through logged in / logged out / endpoint unreadable --
     # each a different number of rows.
     my $prov = int($phase / 13) % 3;
     my ($tokens, $spend);
     if ($prov == 0) {
         $tokens = { utilization => sweep($phase, 11, 0), resets_at => time + 3600 };
-        $spend  = { claude => { utilization => sweep($phase, 11, 0) },
-                    go     => { used => ($phase % 10), limit => 10 },
-                    zen    => { balance => 12.5 } };
+        $spend  = { claude => { utilization => sweep($phase, 11, 0) } };
     }
     elsif ($prov == 1) { $tokens = undef; $spend = undef }
     else               { $tokens = { utilization => undef }; $spend = { claude => {} } }
