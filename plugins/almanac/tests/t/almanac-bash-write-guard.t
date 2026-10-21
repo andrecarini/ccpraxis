@@ -16,6 +16,15 @@
 use strict;
 use warnings;
 use FindBin qw($Bin);
+
+# The guard names the almanac plugin dir it was run from, derived the way the
+# guard itself derives it (bash `cd && pwd` on its own hooks/ parent), with
+# the <ccpraxis> placeholder kept only as its fallback (commit caf888a).
+my $ALMDIR_RE = do {
+    my $d = `bash -c 'cd "\$1" && pwd' _ "$Bin/../.."`;
+    chomp $d;
+    length($d) ? qr{(?:\Q$d\E|<ccpraxis>/plugins/almanac)} : qr{<ccpraxis>/plugins/almanac};
+};
 use Test::More;
 use File::Temp qw(tempdir tempfile);
 use File::Path ();
@@ -226,7 +235,7 @@ my $G = q{unset BASH_ENV ; f="${CLAUDE_PLUGIN_ROOT}/hooks/guard-almanac-write.sh
     like($err, qr/almanac-bug\.pl set-status/, 'AC5: bug denial names almanac-bug.pl set-status');
     like($err, qr/20260813-010203-abcd/,       'AC5: bug denial names the id');
     ok((grep { $_ eq "  $R" } @lines), "AC6: a stderr line is exactly '  $R'") or diag($err);
-    ok((grep { /^\s*perl <ccpraxis>\/plugins\/almanac\/scripts\/almanac-bug\.pl update 20260813-010203-abcd --body -\s*$/ } @lines),
+    ok((grep { /^\s*perl $ALMDIR_RE\/scripts\/almanac-bug\.pl update 20260813-010203-abcd --body -\s*$/ } @lines),
        'AC6: the update line reads exactly "...update <id> --body -"') or diag($err);
 }
 {

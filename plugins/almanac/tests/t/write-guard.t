@@ -14,6 +14,15 @@
 use strict;
 use warnings;
 use FindBin qw($Bin);
+
+# The guard names the almanac plugin dir it was run from, derived the way the
+# guard itself derives it (bash `cd && pwd` on its own hooks/ parent), with
+# the <ccpraxis> placeholder kept only as its fallback (commit caf888a).
+my $ALMDIR_RE = do {
+    my $d = `bash -c 'cd "\$1" && pwd' _ "$Bin/../.."`;
+    chomp $d;
+    length($d) ? qr{(?:\Q$d\E|<ccpraxis>/plugins/almanac)} : qr{<ccpraxis>/plugins/almanac};
+};
 use Test::More;
 use File::Temp qw(tempdir tempfile);
 use JSON::PP;
@@ -66,7 +75,7 @@ for my $tool (qw(Edit Write MultiEdit NotebookEdit)) {
     ok((grep { $_ eq "  $R" } @lines),
         'M1/bug: a stderr line is exactly "  <path>" -- the path field lands in the path slot, not blank/shifted')
         or diag("stderr:\n$se");
-    ok((grep { /^\s*perl <ccpraxis>\/plugins\/almanac\/scripts\/almanac-bug\.pl update \Q$bug_id\E --body -\s*$/ } @lines),
+    ok((grep { /^\s*perl $ALMDIR_RE\/scripts\/almanac-bug\.pl update \Q$bug_id\E --body -\s*$/ } @lines),
         'M1/bug: the update line reads "...almanac-bug.pl update <id> --body -" exactly -- the id field '
       . 'lands in the id slot, never the path')
         or diag("stderr:\n$se");
