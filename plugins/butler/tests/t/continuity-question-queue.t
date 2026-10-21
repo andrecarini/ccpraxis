@@ -724,7 +724,9 @@ my $FLAG_BYTES = Encode::encode('UTF-8', chr(0x2691));
         fail('S7: could not locate the inbox block text between the two markers');
     }
     my @use_lines = ($src =~ /^\s*use\s+([A-Za-z0-9:_]+)/mg);
-    my %allowed = map { $_ => 1 } qw(strict warnings JSON::PP Time::Piece File::Basename POSIX Encode constant Carp List::Util Scalar::Util);
+    # Cwd: core perl, loaded at the top since 4fd54de because the generated
+    # payload calls Cwd::abs_path but may not import it itself.
+    my %allowed = map { $_ => 1 } qw(strict warnings JSON::PP Time::Piece File::Basename POSIX Encode constant Carp List::Util Scalar::Util Cwd);
     my @bad = grep { !$allowed{$_} } @use_lines;
     is_deeply(\@bad, [], 'S7: no use outside the AC-S3 allow-list');
 }

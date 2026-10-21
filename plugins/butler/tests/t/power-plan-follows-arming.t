@@ -1324,7 +1324,9 @@ subtest 'AC16: source checks' => sub {
     }
 
     # the S7 use allow-list (spec 2.4 / continuity-question-queue.t S7)
-    my %allow = map { $_ => 1 } qw(strict warnings JSON::PP Time::Piece File::Basename POSIX Encode constant Carp List::Util Scalar::Util);
+    # Same list as continuity-question-queue.t's S7, Cwd included (core perl,
+    # loaded at the top of statusline.pl since 4fd54de).
+    my %allow = map { $_ => 1 } qw(strict warnings JSON::PP Time::Piece File::Basename POSIX Encode constant Carp List::Util Scalar::Util Cwd);
     my @use_lines = ($sl_src =~ /^\s*use\s+([A-Za-z0-9:_]+)/mg);
     my @bad = grep { !$allow{$_} } @use_lines;
     is_deeply(\@bad, [], 'AC16: every "use" line in statusline.pl stays within the S7 allow-list') or diag(join(', ', @bad));
