@@ -1160,6 +1160,17 @@ esac
 
 IFS=$'\x1f' read -r _TAG KIND TOOL TYPE ID NPATH <<< "$OUT"
 
+# Where to point the operator: the almanac plugin this hook runs from (the
+# live install on the host, the marketplace mount in a sandbox), so the
+# command in a deny message can be run as printed. A hook invoked by a relative or
+# backslashed path falls back to the placeholder.
+ALMDIR="<ccpraxis>/plugins/almanac"
+case "$HOOKDIR" in
+  /*/hooks|[A-Za-z]:/*/hooks)
+    # Normalised (a caller may have spelled it with ..); deny path only.
+    _d=$(cd "${HOOKDIR%/hooks}" 2>/dev/null && pwd) && [ -n "$_d" ] && ALMDIR="$_d" ;;
+esac
+
 if [ "$KIND" = "bug" ]; then
   {
     echo "BLOCKED: $TOOL on a bug report. These are written only through almanac-bug.pl."
@@ -1169,13 +1180,13 @@ if [ "$KIND" = "bug" ]; then
     echo "A report's body is FROZEN once it leaves 'open' — that is what lets a reviewer read it without the filer rewriting it underneath them, and what makes 'taken' mean something. A direct edit would bypass both the state machine and the sha256 recorded at freeze time."
     echo
     echo "  While still open, revise it:"
-    echo "    perl <ccpraxis>/plugins/almanac/scripts/almanac-bug.pl update $ID --body -"
+    echo "    perl $ALMDIR/scripts/almanac-bug.pl update $ID --body -"
     echo
     echo "  Already triaging/taken? It is deliberately immutable. File a follow-up:"
-    echo "    perl <ccpraxis>/plugins/almanac/scripts/almanac-bug.pl file --title \"...\" --body -"
+    echo "    perl $ALMDIR/scripts/almanac-bug.pl file --title \"...\" --body -"
     echo
     if [[ "$TOOL" == Bash* ]]; then
-      echo "  Change its status:  perl <ccpraxis>/plugins/almanac/scripts/almanac-bug.pl set-status $ID --to <state>"
+      echo "  Change its status:  perl $ALMDIR/scripts/almanac-bug.pl set-status $ID --to <state>"
       echo
     fi
     echo "  Check state:  almanac-bug.pl list        (this project)"
@@ -1192,7 +1203,7 @@ if [ "$KIND" = "root" ]; then
     echo
     echo "Bug reports are written only through almanac-bug.pl (file | update | append | set-status), and almanac records only through their own scripts (almanac-todo.pl, almanac-note.pl, almanac-thread.pl, almanac-inbox.pl). Run the script verb for the record you meant, and use absolute paths instead of cd."
     echo
-    echo "Any write that did not go through the scripts is reported by:  perl <ccpraxis>/plugins/almanac/scripts/almanac-bug.pl verify"
+    echo "Any write that did not go through the scripts is reported by:  perl $ALMDIR/scripts/almanac-bug.pl verify"
   } >&2
   exit 2
 fi
@@ -1237,10 +1248,10 @@ fi
   if [ -n "$ID" ]; then
     echo "  record id:  $ID"
   fi
-  echo "  use:        perl <ccpraxis>/plugins/almanac/scripts/$SCRIPT  $VERBS"
+  echo "  use:        perl $ALMDIR/scripts/$SCRIPT  $VERBS"
   echo
   echo "A direct edit bypasses the store's lock, its compare-and-swap and its seal. Any write that did not go"
-  echo "through the script is reported by:  perl <ccpraxis>/plugins/almanac/scripts/almanac-bug.pl verify"
+  echo "through the script is reported by:  perl $ALMDIR/scripts/almanac-bug.pl verify"
 } >&2
 
 exit 2

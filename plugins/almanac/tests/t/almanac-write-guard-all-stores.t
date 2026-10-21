@@ -290,10 +290,18 @@ for my $shape (
         my (undef, $out, $err) = fire(ev('Edit', $path));
         unlike($err, qr/almanac-task\.pl/, "AC12: [$type] denial never names almanac-task.pl");
         like($err, qr/almanac-thread\.pl/, "AC12: [$type] denial names almanac-thread.pl");
-        like($err, qr{\Quse:        perl <ccpraxis>/plugins/almanac/scripts/almanac-thread.pl  $EXPECT_VERBS{$type}\E},
+        # The plugin dir is the one the hook ran from (or the <ccpraxis>
+        # placeholder when that cannot be told), so the command runs as printed.
+        like($err, qr{use:        perl \S+/plugins/almanac/scripts/almanac-thread\.pl  \Q$EXPECT_VERBS{$type}\E},
             "AC12: [$type] 'use:' line has the exact pinned VERBS text")
             or diag($err);
     }
+    # Run from an absolute path, the hook names ITS OWN plugin dir, normalised,
+    # never the <ccpraxis> placeholder, so the printed command runs as shown.
+    my (undef, undef, $err) = fire(ev('Edit', "$base/todo/rec-todo.md"));
+    my ($dir) = $err =~ m{use:\s+perl (\S+)/scripts/almanac-todo\.pl};
+    ok(defined $dir && $dir !~ /<ccpraxis>|\.\./ && -f "$dir/scripts/almanac-todo.pl",
+       'deny message names the real, normalised almanac plugin dir') or diag($err);
 }
 
 # =============================================================================
@@ -909,7 +917,7 @@ HOLDER
     ok(!(grep { /^\s*record id:/ } @lines),
         'M1/sidecar: NO "record id:" line appears -- a sidecar has no id, and the type must never leak into it')
         or diag("stderr:\n$err");
-    ok((grep { /^\s*use:\s+perl <ccpraxis>\/plugins\/almanac\/scripts\/almanac-todo\.pl\s+create \| edit \| complete \| reopen \| delete\s*$/ } @lines),
+    ok((grep { /^\s*use:\s+perl \S+\/plugins\/almanac\/scripts\/almanac-todo\.pl\s+create \| edit \| complete \| reopen \| delete\s*$/ } @lines),
         'M1/sidecar: the use: line names almanac-todo.pl with its REAL verbs, not shifted by the missing id field')
         or diag("stderr:\n$err");
 
