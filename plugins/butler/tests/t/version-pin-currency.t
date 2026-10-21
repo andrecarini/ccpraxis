@@ -320,14 +320,11 @@ ok($DEPS_LOADED, 'HARNESS: bp-deps-check.pl (source of %EOL) requires cleanly')
 
     my ($node_ver)     = ($cf // '') =~ /node-v(\d+\.\d+\.\d+)-linux-x64\.tar\.xz/;
     my ($pnpm_ver)     = ($cf // '') =~ /pnpm\@(\d+\.\d+\.\d+)/;
-    my ($opencode_ver) = ($cf // '') =~ /opencode-linux-x64\@(\d+\.\d+\.\d+)/;
 
     ok(defined $node_ver,     'C7 positive gate: a literal Node version pin was FOUND in the Containerfile')
         or diag('no node-vX.Y.Z-linux-x64.tar.xz literal found');
     ok(defined $pnpm_ver,     'C7 positive gate: a literal pnpm version pin was FOUND in the Containerfile')
         or diag('no pnpm@X.Y.Z literal found');
-    ok(defined $opencode_ver, 'C7 positive gate: a literal opencode-linux-x64 version pin was FOUND in the Containerfile')
-        or diag('no opencode-linux-x64@X.Y.Z literal found');
 
     # Negative: the Containerfile performs no version RESOLUTION at build time -- no invocation of
     # bp-pin.pl, no fetch of a registry's version LISTING endpoint, no `resolve` verb.
@@ -352,10 +349,9 @@ ok($DEPS_LOADED, 'HARNESS: bp-deps-check.pl (source of %EOL) requires cleanly')
             '11.17.0' => '2026-07-23T00:00:00Z',
             '11.20.0' => '2026-07-20T00:00:00Z',   # 14d old -- eligible, and NEWER than the pin
         },
-        'opencode-linux-x64' => { '1.18.7' => '2026-07-24T00:00:00Z' },
     ));
 
-    # A stale-pin Containerfile fixture: node + opencode match their newest eligible; pnpm is
+    # A stale-pin Containerfile fixture: node matches its newest eligible; pnpm is
     # pinned to 11.17.0 while 11.20.0 (also eligible) exists -- a confirmed, isolated drift.
     my $stale_cf = "$tmp/Containerfile.stale";
     write_file($stale_cf, <<'CF');
@@ -364,7 +360,6 @@ RUN curl -sSL https://nodejs.org/dist/v24.18.0/node-v24.18.0-linux-x64.tar.xz -o
     && tar -xf /tmp/node.tar.xz -C /tmp \
     && mv /tmp/node-v24.18.0-linux-x64 /opt/node24 \
     && npm install -g pnpm@11.17.0
-RUN PNPM_CONFIG_IGNORE_SCRIPTS=true pnpm add opencode-linux-x64@1.18.7
 CF
 
     my ($rc_stale, $out_stale, $err_stale) = run_cli($PIN_SCRIPT,
@@ -385,7 +380,6 @@ RUN curl -sSL https://nodejs.org/dist/v24.18.0/node-v24.18.0-linux-x64.tar.xz -o
     && tar -xf /tmp/node.tar.xz -C /tmp \
     && mv /tmp/node-v24.18.0-linux-x64 /opt/node24 \
     && npm install -g pnpm@11.20.0
-RUN PNPM_CONFIG_IGNORE_SCRIPTS=true pnpm add opencode-linux-x64@1.18.7
 CF
 
     my ($rc_current, $out_current, $err_current) = run_cli($PIN_SCRIPT,
@@ -436,7 +430,6 @@ CF
 FROM debian:bookworm-slim
 RUN curl -sSL https://nodejs.org/dist/v24.18.0/node-v24.18.0-linux-x64.tar.xz -o /tmp/node.tar.xz \
     && npm install -g pnpm@11.17.0
-RUN pnpm add opencode-linux-x64@1.18.7
 CF
 
     my ($rc3, $out3, $err3) = run_cli($PIN_SCRIPT,
@@ -475,7 +468,6 @@ RUN curl -sSL https://nodejs.org/dist/v24.18.0/node-v24.18.0-linux-x64.tar.xz -o
     && tar -xf /tmp/node.tar.xz -C /tmp \
     && mv /tmp/node-v24.18.0-linux-x64 /opt/node24 \
     && npm install -g pnpm@11.17.0
-RUN PNPM_CONFIG_IGNORE_SCRIPTS=true pnpm add opencode-linux-x64@1.18.7
 CF
 
     my $fetcher_path = "$tmp/pin-registry-fixture.json";
@@ -485,7 +477,6 @@ CF
             '11.17.0' => '2026-07-23T00:00:00Z',
             '11.20.0' => '2026-07-20T00:00:00Z',   # newer, eligible -- pnpm's pin (11.17.0) drifts
         },
-        'opencode-linux-x64' => { '1.18.7' => '2026-07-24T00:00:00Z' },
     ));
 
     my ($rc, $out, $err) = run_cli($PREFLIGHT_SCRIPT, [], {

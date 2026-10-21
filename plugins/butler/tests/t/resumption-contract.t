@@ -125,45 +125,10 @@ SKIP: {
     waitpid($live, 0);
 }
 
-# ── AC8 — the two guards share ONE implementation ─────────────────────────
-#
-# MIGRATED (package 03-retire-runstate, spec §5.1's resumption-contract.t
-# entry): bp-runstate.pl is DELETED, not merely edited, so it can no longer
-# be the subject of "uses the shared module" / "no longer carries its own
-# fingerprint implementation". Both assertions are repointed at the two
-# files that now load BpResumption.pm DIRECTLY (spec §2.2): butler-hold and
-# bp-worker.pl. Same intent, unweakened: "if anybody grew their own copy
-# again, this fails."
-#
-# Asserted structurally rather than by comparing behaviour: if either file
-# grew its own copy again, this fails, which is the whole point. The lesson
-# that cost a fix batch was that knowledge living in one file cannot be
-# reached from the other.
-{
-    # butler-hold -- REMOVED (reason DEL, package 16 batch E1): it is on the
-    # deletion list and gone. Trimmed to what bp-worker.pl uses, per the
-    # spec's own forward note. The behavior this protected -- nothing
-    # growing its own pid_alive/pid_fingerprint copy -- is unweakened below.
-    for my $f (['bp-worker.pl', "$SCRIPTS/bp-worker.pl"]) {
-        my ($name, $path) = @$f;
-        open my $fh, '<', $path or die "$path: $!";
-        local $/;
-        my $src = <$fh>;
-        close $fh;
-        like($src, qr/BpResumption/,
-             "AC8 MIGRATED: $name uses the shared resumption module");
-        unlike($src, qr/^[ \t]*sub[ \t]+pid_alive\b/m,
-               "AC8 MIGRATED: $name does not define its own sub pid_alive");
-        unlike($src, qr/^[ \t]*sub[ \t]+pid_fingerprint\b/m,
-               "AC8 MIGRATED: $name does not define its own sub pid_fingerprint");
-    }
-
-    # The stop-gate.sh block that used to close this AC8 -- REMOVED
-    # (reason DEL, package 16 batch B): stop-gate.sh is on the
-    # deletion list (Decision 5 collapses the Stop gate to the single
-    # stop-gate.sh) and has no successor that re-verifies resumption
-    # through the old resumption CLI's CLI; that role is not carried forward as a
-    # shell-side check any more.
-}
+# AC8 (the consumers of BpResumption.pm carry no pid_alive/pid_fingerprint
+# copy of their own) is retired with its last subject: bp-worker.pl went with
+# the OpenCode worker backend, and no script loads the module directly now.
+# The coordinator protocol still names BpResumption::pid_alive as a liveness
+# proof, which AC1-AC6 above keep honest.
 
 done_testing();

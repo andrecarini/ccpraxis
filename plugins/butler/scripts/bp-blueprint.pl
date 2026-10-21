@@ -1544,7 +1544,7 @@ sub op_set_decision {
 # rewrites `key: value` lines inside the fenced metadata block, and `set-section`
 # explicitly refuses structural sections and operates on `##` headings, not the H1.
 # Fence-aware (spec §2.2): both real blueprints carry single-`#`-prefixed COMMENT lines
-# (e.g. `# worker_backend: claude`) inside the fenced metadata block, which a naive `^#`
+# (e.g. `# owner: platform`) inside the fenced metadata block, which a naive `^#`
 # scan would miscount as extra H1 candidates and refuse on every real invocation.
 # Refuse-rather-than-guess on no H1 / H1 not on line 1 / more than one candidate --
 # matching this script's existing posture (add-package refuses a missing depends_on

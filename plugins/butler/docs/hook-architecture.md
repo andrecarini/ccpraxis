@@ -1319,11 +1319,9 @@ What package 16 changes rather than deletes, so the "exact list" above stays exa
 
 - Kept, with the reason: `plugins/butler/scripts/bp-watch-child.pl`, the fleet child parent that
   `bp-launch.sh` uses for exit status. It is not a watcher. `plugins/butler/scripts/BpResumption.pm`,
-  whose pid helpers `plugins/butler/scripts/bp-worker.pl` uses. `plugins/butler/scripts/BpSession.pm`,
+  whose `pid_alive` the coordinator protocol names as a liveness proof. `plugins/butler/scripts/BpSession.pm`,
   whose transcript discovery `plugins/butler/scripts/bp-feedback.pl` uses.
   `plugins/butler/scripts/BpContinuityLease.pm`, which 16 rewires to read the new store only.
-- `plugins/butler/scripts/bp-worker.pl` sources `hooks/lib.sh` for `marker_path`, `ledger_lock` and
-  `bp_active_stop_signal`. Package 16 inlines those three helpers there (Decision 34 widening).
 - Tests that keep running against a same-path successor or an updated file, where 16 fixes whatever
   goes red (Decision 34): `plugins/butler/tests/t/guard-bash-quote-strip.t`,
   `plugins/butler/tests/t/git-mutation-guard-reach.t`,
@@ -1339,8 +1337,7 @@ What package 16 changes rather than deletes, so the "exact list" above stays exa
   `plugins/butler/tests/t/hooks-selftest.t`, `plugins/butler/tests/t/hooks-json-route-registration.t`,
   `plugins/butler/tests/t/h01-settings-registration.t`, `plugins/sandbox/tests/t/settings-scope-split.t`,
   `plugins/butler/tests/t/hooks-reach-non-ccpraxis-project.t`,
-  `plugins/butler/tests/t/continuity-lease-liveness.t`, `plugins/butler/tests/t/resumption-contract.t`
-  (trimmed to what bp-worker.pl uses), and `plugins/butler/tests/t/bp-commands-on-path.t` (the
+  `plugins/butler/tests/t/continuity-lease-liveness.t`, `plugins/butler/tests/t/resumption-contract.t`, and `plugins/butler/tests/t/bp-commands-on-path.t` (the
   bp-watch.sh and bp-continuity.sh shims go).
 - Two tests would otherwise go quietly inert. `plugins/butler/tests/t/dispatch-write-path.t` does
   `skip_all` unless `hooks/lib.sh` exists, so after the deletion it is green by skipping. 16 re-points

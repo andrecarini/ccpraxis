@@ -46,7 +46,7 @@ my $WORKER_UID = 4242;
 my $WORKER_GID = 4242;
 
 # ---------------------------------------------------------------------------
-# Global state consulted by the signal handlers (mirrors bp-worker.pl's pattern:
+# Global state consulted by the signal handlers (the house pattern:
 # a signal mid-`run` must tear the jail down before exiting — section 3 item 5).
 # ---------------------------------------------------------------------------
 our $CHILD_PID        = undef;
@@ -77,7 +77,7 @@ sub _signal_teardown_and_exit {
 $SIG{TERM} = sub { _signal_teardown_and_exit('TERM') };
 $SIG{INT}  = sub { _signal_teardown_and_exit('INT') };
 $SIG{HUP}  = sub { _signal_teardown_and_exit('HUP') };
-# SIGKILL is unsurvivable (cannot be caught) — accepted degradation, as bp-worker.pl
+# SIGKILL is unsurvivable (cannot be caught) — accepted degradation, as the other supervisors
 # documents for the same reason. A killed-by-SIGKILL run leaves its jail behind for
 # the next dispatch's `teardown --package <pkg>` (or a manual sweep) to reclaim.
 

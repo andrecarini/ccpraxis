@@ -102,7 +102,7 @@ sub read_all_lines {
 # bare double quotes mangles any argument that itself contains a double
 # quote (D3's title `reply "A" or "B"` loses its quotes before perl ever
 # sees them) -- fork()+exec(LIST) hands argv straight to the OS with no
-# shell in between, exactly the discipline bp-worker.pl already uses for its
+# shell in between, the discipline this repo's process supervisors use for their
 # own child spawn. STDOUT/STDERR are reopened onto files in the CHILD only
 # (never an in-memory scalar, per CLAUDE.md's Windows landmine list; never
 # the parent's own STDOUT/STDERR, which stay untouched throughout).
@@ -734,7 +734,7 @@ do $INBOX_PL if -f $INBOX_PL;
 # =============================================================================
 # D7 -- section 3.2 item 7: filing never reads STDIN, never blocks. Real
 # process, STDIN connected to a pipe THIS test holds open and never writes.
-# House pattern per bp-worker.pl: fork()+exec()+waitpid(WNOHANG), never a
+# House pattern: fork()+exec()+waitpid(WNOHANG), never a
 # shell-level '&' (which this test cannot poll/kill deterministically).
 # =============================================================================
 my ($d7_out, $d7_err, $d7_status, $d7_reaped);

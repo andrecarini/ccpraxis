@@ -117,7 +117,7 @@ sub read_all_lines {
 # NEVER a shell string. A shell string built by quoting each argument with
 # bare double quotes mangles any argument that itself contains a double
 # quote -- fork()+exec(LIST) hands argv straight to the OS with no shell in
-# between, exactly the discipline bp-worker.pl already uses for its own
+# between, the discipline this repo's process supervisors use for their own
 # child spawn. STDOUT/STDERR are reopened onto files in the CHILD only
 # (never an in-memory scalar, per CLAUDE.md's Windows landmine list; the
 # parent's own STDOUT/STDERR stay untouched throughout).

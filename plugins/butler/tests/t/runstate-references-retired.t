@@ -10,7 +10,7 @@
 # package deletes) and not from any of the files this detector scans.
 #
 # WRITTEN BLIND TO ANY IMPLEMENTATION. bp-runstate.pl still exists on disk as
-# this file is written, and it is referenced from bp-watch.pl, bp-worker.pl,
+# this file is written, and it is referenced from bp-watch.pl,
 # guard-ask-operator.sh, bp-continuity.pl, three SKILL.md files, and several
 # .t files (per spec §2.9's own table). D1/D2 below are therefore EXPECTED
 # to report many hits until the implementer migrates every one of those

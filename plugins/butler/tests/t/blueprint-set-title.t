@@ -150,17 +150,17 @@ sub base_fixture {
     );
 }
 
-# Mirrors templates/blueprint.md:11-17 (quoted verbatim in the spec, §1): a fenced
-# metadata block containing single-`#`-prefixed OPTIONAL comment lines that a
+# A fenced metadata block (shape of templates/blueprint.md's metadata fence)
+# containing single-`#`-prefixed comment lines that a
 # fence-blind scan would miscount as extra H1 candidates. Genuine H1 on line 1.
 sub fence_fixture {
     return join("\n",
         '# <Blueprint Title>',
         '',
         '```',
-        '# worker_backend: claude              <!-- optional blueprint-level default; b32 -->',
-        '# worker_models:                      <!-- optional blueprint-level default/per-role fallback ladder;',
-        "#   b35. Same shape as the package-ledger key (see templates/package-ledger.md); Andr\xC3\xA9's.",
+        '# owner: platform                     <!-- optional blueprint-level comment -->',
+        '# notes:                              <!-- optional, may span lines;',
+        "#   continued comment line, still inside the fence; Andr\xC3\xA9's.",
         '```',
         '',
         '## Package status',
@@ -179,7 +179,7 @@ sub no_h1_fixture {
         '',
         "some prose with a non-ascii byte: Andr\xC3\xA9",
         '```',
-        '# worker_backend: claude',
+        '# owner: platform',
         '```',
         'trailing prose, still no real heading',
         '',

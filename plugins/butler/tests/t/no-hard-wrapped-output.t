@@ -14,7 +14,7 @@
 #             own fixture self-tests (one fixture per rule, a negative
 #             fixture, and the motivating launcher.pl fixture), then the
 #             real repo scan (DC1).
-#   PART B -- the 19 join-phrase checks the lint cannot see syntactically
+#   PART B -- the 18 join-phrase checks (J9 retired with bp-worker.pl) the lint cannot see syntactically
 #             (DC4, spec section 2.5).
 #   PART C -- the launcher's own emit path for the REBUILD REQUIRED message
 #             in plain and TUI mode (DC2), plus the runtime-wrapper removal
@@ -818,7 +818,7 @@ cmp_ok(scalar(@scan_files), '>=', 150,
 }
 
 # =============================================================================
-# PART B -- the 19 join-phrase checks (DC4, spec section 2.5). Each phrase
+# PART B -- the 18 join-phrase checks (J9 retired with bp-worker.pl) (DC4, spec section 2.5). Each phrase
 # must occur within one physical line of its file, byte-exact.
 # =============================================================================
 
@@ -839,8 +839,6 @@ my @JOIN_PHRASES = (
       '(default "chat", or "transcript" when --from-session supplied the body)' ],
     [ 'J8',  'plugins/butler/scripts/bp-usage-gate.pl',
       'resets_at_iso=<iso> estimated=<0|1>' ],
-    [ 'J9',  'plugins/butler/scripts/bp-worker.pl',
-      'per-dispatch copy of the OpenCode agent file' ],
     [ 'J10', 'plugins/steward/scripts/ccpraxis-helpers.pl',
       'to ~/.claude/skills/. Symlinks on Unix' ],
     [ 'J11', 'plugins/steward/scripts/ccpraxis-helpers.pl',
@@ -858,7 +856,7 @@ my @JOIN_PHRASES = (
       'test-platform-split, Decision 3): nothing' ],
 );
 
-is(scalar(@JOIN_PHRASES), 19, 'PART B setup: 19 join-phrase checks are registered (spec section 2.5)');   # shape-lint: intentional -- fixed inventory named by spec section 2.5, not a shared list other packages extend
+is(scalar(@JOIN_PHRASES), 18, 'PART B setup: 18 join-phrase checks are registered (spec section 2.5)');   # shape-lint: intentional -- fixed inventory named by spec section 2.5, not a shared list other packages extend
 
 for my $row (@JOIN_PHRASES) {
     my ($id, $relfile, $phrase) = @$row;

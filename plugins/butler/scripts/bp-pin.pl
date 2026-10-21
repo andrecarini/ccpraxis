@@ -45,7 +45,7 @@
 #     in for every pin `audit` needs to look up.
 #
 # Policies:
-#   latest-eligible      — newest version >= --min-age-days old (opencode, pnpm).
+#   latest-eligible      — newest version >= --min-age-days old (pnpm).
 #   latest-lts-eligible  — newest LTS line, non-EOL, >= --min-age-days old (node).
 #
 # require:  require "<path-to-this-file>";
@@ -316,8 +316,6 @@ our @PIN_SPEC = (
       pattern => qr/node-v([0-9][0-9.]*)-linux-x64\.tar\.xz/ },
     { package => 'pnpm',               policy => 'latest-eligible',
       pattern => qr/pnpm\@([0-9][0-9.]*)/ },
-    { package => 'opencode-linux-x64', policy => 'latest-eligible',
-      pattern => qr/opencode-linux-x64\@([0-9][0-9.]*)/ },
 );
 
 # _parse_pins($path) -> (\@pins, undef) | (undef, $error)

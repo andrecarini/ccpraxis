@@ -8,13 +8,6 @@ created: <ISO date>
 last_updated: <ISO date>
 status: drafting        # drafting | audited | parked | archived -- running/done are computed
                          # (BpState::blueprint_lifecycle), never written here
-# worker_backend: claude              <!-- optional blueprint-level default; b32 -->
-# worker_models:                      <!-- optional blueprint-level default/per-role fallback ladder;
-#   b35. Same shape as the package-ledger key (see templates/package-ledger.md); a package ledger's
-#   own worker_models: (role or default entry) always wins over this. Absent/empty falls through to
-#   the built-in (opencode/big-pickle). Never overloads `model:` (coordinator's Claude model).
-#   worker_models:
-#     default: [opencode/big-pickle]
 ```
 
 ## Objective

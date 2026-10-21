@@ -3,10 +3,11 @@
 #
 # WHY THIS EXISTS
 #
-# A turn cap lives in twelve places under three field names (`max_turns`,
-# `maxTurns`, `steps`). The copies drifted three separate times, silently:
+# A turn cap lives in several places under two field names (`max_turns`,
+# `maxTurns`). The copies drifted three separate times, silently:
 # b23 raised the authoring prose and missed both bp-scout.md AND the ledger
-# template; b49 raised the agent caps and missed the OpenCode `steps:` twins.
+# template; b49 raised the agent caps and missed the (since retired) OpenCode `steps:`
+# twins.
 #
 # Frontmatter cannot reference a variable, so a literal must physically exist in
 # each agent file -- true single-sourcing is impossible. What IS achievable is a
@@ -27,7 +28,7 @@
 #   bp-turn-caps.pl show  [--config C]
 #
 # SCOPE OF `sync`. It rewrites only DATA surfaces whose whole content is a
-# frontmatter/JSON field: agent `maxTurns:`, OpenCode `steps:`, and the two
+# frontmatter/JSON field: agent `maxTurns:` and the two
 # templates' `max_turns:`. It deliberately does NOT rewrite executable source
 # (bp-launch.sh, bp-orchestrator.pl, bp-judge.sh) -- a script that edits shell
 # and Perl by regex is a worse hazard than the drift it prevents. Those are
@@ -134,15 +135,6 @@ sub _surfaces {
         push @s, {
             surface => 'agent', file => $p, field => 'maxTurns',
             re => qr/^maxTurns:[ \t]*(\d+)[ \t]*$/m,
-            want => cap_for_role($cfg, $role), role => $role, writable => 1,
-        };
-    }
-
-    for my $p (sort glob("$root/plugins/butler/opencode/*.md")) {
-        my ($role) = $p =~ m{([^/]+)\.md$};
-        push @s, {
-            surface => 'opencode', file => $p, field => 'steps',
-            re => qr/^steps:[ \t]*(\d+)[ \t]*$/m,
             want => cap_for_role($cfg, $role), role => $role, writable => 1,
         };
     }

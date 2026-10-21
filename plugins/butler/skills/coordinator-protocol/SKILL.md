@@ -548,11 +548,8 @@ This has already cost one whole review pass: **eleven of eleven** dispatched wor
 |---|---|---|
 | `max_turns:` | **ledger** frontmatter | headless `claude -p` coordinators, via `bp-launch.sh` |
 | `maxTurns:` | **agent** frontmatter, `plugins/*/agents/<name>.md` | **Task subagents** — the workers you dispatch |
-| `steps:` | **OpenCode twin**, `plugins/butler/opencode/<name>.md` | the same worker under `worker_backend: opencode` |
 
-There are **three** of them, and the third is easy to miss entirely. `t/opencode-worker-runtime.t` keeps `steps:` derived from its Claude twin's `maxTurns:`, so changing a cap without syncing the twin turns that file red — deliberately.
-
-The first two differ only in case and separator. Raising one does **nothing** for the other, and that is not hypothetical: `b23` raised the ledger default 80 → 150 and wrote "`bp-scout` … default 40" into the authoring protocol while `bp-scout.md` kept `maxTurns: 15` — the very number that same paragraph calls known-starving — for another two months.
+The two differ only in case and separator. Raising one does **nothing** for the other, and that is not hypothetical: `b23` raised the ledger default 80 → 150 and wrote "`bp-scout` … default 40" into the authoring protocol while `bp-scout.md` kept `maxTurns: 15` — the very number that same paragraph calls known-starving — for another two months.
 
 - **Task exposes no per-dispatch turn override.** You cannot raise a cap from the dispatch call; the agent's own frontmatter is the only control point. So either the cap fits the scope, or the scope must fit the cap.
 - **A cap is a runaway backstop, NOT a budget.** This is the whole principle, and getting it wrong is what starved eleven workers. A cap only binds when the agent would otherwise still be working: an agent that finishes in 12 turns costs 12 turns whether its cap is 40 or 800. So a low cap buys you **nothing** on the runs that behave, and costs you the **entire dispatch** on the runs that don't — an asymmetry that always argues upward. Size the cap to stop a pathological loop, not to ration a healthy worker.
@@ -579,38 +576,6 @@ Correct caps do not fix this; any worker can still die. Therefore:
 - **Require the artifact early.** The dispatch prompt must tell the worker to create its report file *before* investigating and **append** as it goes. A death then leaves partial evidence instead of nothing.
 - **An empty or narration-shaped result is a FAILURE, not a finding of "nothing".** Treat it as a dead dispatch and redispatch per the rules above.
 - **Confirm the artifact exists on disk before accepting any worker's conclusion.** Never record "reviewed, no findings" on the strength of a returned message alone. If the file is absent or stub-sized, the work did not happen — whatever the message says.
-
-### Non-Claude worker backends (`bp-worker.pl`)
-
-Everything above describes the **default** path: `worker_backend:` unset means `claude`, and workers are dispatched via **Task** exactly as documented. If you have not configured a backend, nothing in this section applies to you and nothing has changed.
-
-When `worker_backend:` **is** set to something other than `claude`, dispatch that worker through **Bash** instead of Task:
-
-```
-plugins/butler/scripts/bp-worker.pl --worker <bp-name> --prompt-file <path> [--model M]
-```
-
-`<bp-name>` is the bare role — `scout`, `architect`, `test-writer`, `implementer`, `reviewer`, `redteam`, `ui-prober` — not the namespaced `butler:bp-*` form you pass to Task.
-
-The backend is resolved in exactly two places, in this order, falling back to the built-in default:
-
-1. `worker_backend:` in **your package ledger's** frontmatter — overrides for this package only.
-2. `worker_backend:` in **`blueprint.md`**'s metadata block — applies to every package in the blueprint.
-3. Built-in default: **`claude`**.
-
-An unrecognised value **fails loudly** (exit 4) rather than silently falling back — a typo must not quietly route your workers somewhere unintended.
-
-What does **not** change, and why it matters:
-
-- **The same one-write-capable-worker lock applies.** `bp-worker.pl` takes the *same* marker file `track-dispatch.sh` uses for Task workers, so the implementer/test-writer role split holds identically across both paths. A second write-capable dispatch while one is in flight exits **3** and writes nothing. You cannot evade the rule by switching backends.
-- **Read-only workers still run concurrently.** Scout, architect, reviewer and redteam take no marker on either path.
-- **The ≤15-line return contract still applies.** stdout is capped regardless of how much the worker emitted; the full text lands under `$BP_DIR/reports/$BP_PACKAGE/`, and the printed `report:` line names it.
-- **The dispatch log still gets its entry**, in the same format `track-dispatch.sh` writes for Task.
-- **A fleet stop is still honoured.** `bp-worker.pl` checks the stop signals itself and refuses (exit 5), because a subprocess bypasses the `PreToolUse` graceful-stop gate entirely. A stopped fleet does not keep spawning workers through this path.
-
-Exit codes: `0` ok · `2` usage · `3` a write-capable worker is already in flight · `4` unrecognised backend · `5` refused, fleet stop in force · `6` env contract not satisfied · `7` the backend itself exited non-zero · `8` backend binary not found.
-
-**Judges never port.** Harvest, conformance and resolve judges stay on Claude regardless of `worker_backend:`.
 
 ### Checking what is outstanding, without asserting the answer
 

@@ -18,7 +18,7 @@
 # for the full discussion of why the kill assertion alone cannot pin a
 # feature's total absence).
 #
-# Kill choreography mirrors plugins/butler/scripts/bp-worker.pl:40-58
+# Kill choreography is the house pattern
 # (TERM, brief grace, KILL, blocking waitpid). Every invocation of
 # scripts/run-tests.pl targets this file's own File::Temp fixture, never the
 # real plugins/*/tests/t/ tree, and every wait loop here is itself bounded.

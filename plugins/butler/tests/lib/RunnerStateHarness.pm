@@ -10,7 +10,7 @@ package RunnerStateHarness;
 # WHY A BOUNDED FORK+EXEC AND NOT system()/backticks: a hung child under
 # system() blocks the parent indefinitely with no way to reclaim control; a
 # forked child can be waited on with polling and killed (TERM, then KILL) the
-# same way plugins/butler/scripts/bp-worker.pl already does for its own
+# same way this repo's process supervisors do for their own
 # subprocess supervision.
 #
 # WHY REAL FILES AND NOT AN IN-MEMORY SCALAR FOR CAPTURED OUTPUT: reopening
@@ -162,7 +162,7 @@ sub spawn_runner {
 # reap_with_grace($pid, %opts) -> ($rc, $timed_out)
 # Polls WNOHANG up to opts{timeout} seconds (default 15). If still alive,
 # sends TERM, gives it opts{term_grace} seconds (default 2), then KILL and a
-# blocking waitpid. Mirrors plugins/butler/scripts/bp-worker.pl:40-58.
+# blocking waitpid.
 sub reap_with_grace {
     my ($pid, %opts) = @_;
     my $timeout    = $opts{timeout}    // 15;

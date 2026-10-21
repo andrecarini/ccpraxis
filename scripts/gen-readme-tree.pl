@@ -275,9 +275,7 @@ sub describe {
     # 3b. Agent definition — same frontmatter shape as SKILL.md, same reader.
     #     An agent's `description:` is its dispatch contract, so it is written
     #     with care and is exactly the one-liner this tree wants.
-    # `opencode/` holds the same agent definitions ported for another runner,
-    # with the same frontmatter -- same reader, same result.
-    if (!$is_dir && $rel =~ m{/(?:agents|opencode)/[^/]+\.md\z}) {
+    if (!$is_dir && $rel =~ m{/agents/[^/]+\.md\z}) {
         my $d = _read_skill_description($abs);
         return _first_sentence(trim($d), 80) if defined $d && length trim($d);
     }
