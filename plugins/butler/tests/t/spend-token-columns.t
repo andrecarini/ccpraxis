@@ -577,11 +577,12 @@ STUB
 };
 
 # ===========================================================================
-# TC11 (Decision 5, out of scope) -- snapshot is byte-identical.
+# TC11 (Decision 5, out of scope) -- snapshot is byte-identical (claude only since
+# the OpenCode go/zen providers were removed).
 # ===========================================================================
 subtest 'TC11: snapshot --offline writes the exact pre-change bytes, with or without NO_FETCH set' => sub {
     my $iso = iso_from_epoch(1790000000);
-    my $want = qq({"generated_at":"$iso","results":[{"provider":"claude","status":"absent"},{"provider":"go","status":"absent"},{"provider":"zen","status":"absent"}]});
+    my $want = qq({"generated_at":"$iso","results":[{"provider":"claude","status":"absent"}]});
 
     for my $case (['NO_FETCH set (this file\'s default)', 1], ['NO_FETCH unset', undef]) {
         my ($label, $nofetch) = @$case;

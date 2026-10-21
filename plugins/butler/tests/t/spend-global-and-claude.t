@@ -7,12 +7,11 @@
 #
 #   * Decision 11 -- the snapshot is RUN-SCOPED, so it cannot exist when no
 #     fleet run is active, which is the operator's normal state. Every figure
-#     in it (go's windows, zen's balance, claude's utilizations) describes the
-#     ACCOUNT, not the run that happened to poll for it, so the run scoping was
+#     in it (claude's plan utilizations) describes the ACCOUNT, not the run that happened to poll for it, so the run scoping was
 #     never meaningful for this data.
 #   * Decision 12 -- `claude` is NEVER FETCHED BY ANYTHING. bp-spend.pl's
-#     provider list is qw(go zen); nothing composes a claude entry; launcher.pl
-#     never invokes bp-usage-gate.pl. "Claude : no snapshot" was therefore
+#     provider list was qw(go zen); nothing composed a claude entry; launcher.pl
+#     never invoked bp-usage-gate.pl. "Claude : no snapshot" was therefore
 #     guaranteed on every launch since the panel shipped, and would have
 #     survived the format fix untouched.
 #
@@ -185,7 +184,9 @@ sub by_provider {
     my $osnap = slurp_json(File::Spec->catfile($o, 'spend.json'));
     my $oc = by_provider($osnap, 'claude');
     ok(defined $oc, 'AC14: claude appears in the offline snapshot at all -- it was previously absent from the provider list entirely');
-    is(($oc || {})->{status}, 'absent', 'AC14: and is recorded absent, alongside go and zen');
+    is(($oc || {})->{status}, 'absent', 'AC14: and is recorded absent');
+    is_deeply([ map { $_->{provider} } @{ ($osnap || {})->{results} || [] } ], ['claude'],
+        'AC14: claude is the ONLY provider -- the OpenCode go/zen rows are gone, not merely empty');
 }
 
 # AC15 -- the gate's exit code and single line map to a claude result.
@@ -224,7 +225,7 @@ for my $c (@GATE_CASES) {
 
     my $g = File::Spec->catdir($dir, 'g');
     my ($rc, $out) = run_spend('snapshot', '--global-dir', $g, '--now', 1787000000,
-                               '--gate-cmd', "$PERL $fake", '--no-opencode');
+                               '--gate-cmd', "$PERL $fake");
     my $snap = slurp_json(File::Spec->catfile($g, 'spend.json'));
     my $cl   = by_provider($snap, 'claude') || {};
 
@@ -247,8 +248,7 @@ for my $c (@GATE_CASES) {
 #
 # Widening @SNAPSHOT_RESULT_FIELDS to carry claude's utilizations is the one
 # change here that could weaken the property write_snapshot's whole design
-# exists for: the OpenCode session cookie is the broadest secret in the system
-# and must provably never reach a persisted file.
+# exists for: a credential must provably never reach a persisted file.
 # ===========================================================================
 {
     require $SPEND_PL;
@@ -276,6 +276,83 @@ for my $c (@GATE_CASES) {
     ok(!exists $cl->{cookie}, 'AC13: the top-level stray key is dropped');
     ok(!exists $cl->{five_hour}{cookie},
         'AC13: and so is a stray key smuggled INSIDE a whitelisted nested field -- the nested sub-field list is a whitelist too, not a passthrough');
+}
+
+# ===========================================================================
+# PART 6 -- the writer's own guarantees, carried over from the retired
+# multi-provider-spend.t (its C13 and C15) when the OpenCode providers went.
+# ===========================================================================
+
+# Round trip: ok, unknown and absent all survive the write with what the panel
+# needs from each -- the figures, the diagnostic, the status.
+{
+    require $SPEND_PL;
+    my $dir = tempdir(CLEANUP => 1);
+    my $p   = File::Spec->catfile($dir, 'spend.json');
+
+    BpSpend::write_snapshot(path => $p, now => 1787000000, results => [
+        { provider => 'claude', status => 'ok',
+          five_hour => { utilization => 0.25 }, seven_day => { utilization => 0.5 } },
+        { provider => 'claude-unknown', status => 'unknown',
+          diagnostic => 'telemetry-unreachable (gate exit 20)' },
+        { provider => 'claude-absent', status => 'absent' },
+    ]);
+    my $snap = slurp_json($p);
+    is(scalar(@{ ($snap || {})->{results} || [] }), 3, 'C13: all three of this fixture\'s results were written');
+    my $ok  = by_provider($snap, 'claude')         || {};
+    my $unk = by_provider($snap, 'claude-unknown') || {};
+    my $abs = by_provider($snap, 'claude-absent')  || {};
+    is($ok->{status}, 'ok', 'C13: an ok result keeps status=ok');
+    is($ok->{seven_day}{utilization}, 0.5, 'C13: and its figures');
+    is($unk->{status}, 'unknown', 'C13: an unknown result keeps status=unknown');
+    like($unk->{diagnostic} // '', qr/telemetry-unreachable/, 'C13: and its diagnostic');
+    is($abs->{status}, 'absent', 'C13: an absent result keeps status=absent');
+}
+
+# Atomic write: temp file in the same directory, then rename -- asserted by
+# behaviour (nothing left behind) and by structure (the rename is there).
+{
+    require $SPEND_PL;
+    my $dir = tempdir(CLEANUP => 1);
+    my $p   = File::Spec->catfile($dir, 'spend-atomic.json');
+    BpSpend::write_snapshot(path => $p, now => 1787000000,
+        results => [ { provider => 'claude', status => 'absent' } ]);
+    opendir(my $dh, $dir) or die $!;
+    my @entries = sort grep { !/^\.\.?$/ } readdir($dh);
+    closedir $dh;
+    is_deeply(\@entries, ['spend-atomic.json'],
+        'C15: after write_snapshot returns, the directory holds only the final file -- no temp file left behind');
+
+    my $src = do { open my $f, '<:raw', $SPEND_PL or die; local $/; <$f> };
+    my ($body) = $src =~ /sub\s+write_snapshot\b(.*?)(?=\nsub\s+\w|\z)/s;
+    like($body // '', qr/\brename\s*\(/, 'C15 structural: write_snapshot renames into place');
+    like($body // '', qr/\.tmp\./,       'C15 structural: from a temp path beside the destination');
+}
+
+# A fresh snapshot written before the OpenCode providers were removed may still
+# carry go/zen rows. Serving it to a new destination must carry claude forward
+# and nothing else.
+{
+    my $dir = tempdir(CLEANUP => 1);
+    my $r   = File::Spec->catdir($dir, 'run');
+    my $g   = File::Spec->catdir($dir, 'global');
+    mkdir $r or die $!;
+    my $legacy = File::Spec->catfile($r, 'spend.json');
+    open(my $fh, '>:raw', $legacy) or die $!;
+    print {$fh} JSON::PP->new->canonical->encode({ generated_at => '2026-08-17T00:00:00Z', results => [
+        { provider => 'claude', status => 'ok', five_hour => { utilization => 0.3 }, seven_day => { utilization => 0.4 } },
+        { provider => 'go',     status => 'unknown', diagnostic => 'legacy' },
+        { provider => 'zen',    status => 'absent' },
+    ] });
+    close $fh;
+    my $mtime = time;
+    utime($mtime, $mtime, $legacy);
+
+    my ($rc, $out) = run_spend('snapshot', '--run-dir', $r, '--global-dir', $g, '--now', $mtime, '--offline');
+    is($rc, 0, 'legacy reuse: the snapshot verb succeeds') or diag("  output: $out");
+    my $gsnap = slurp_json(File::Spec->catfile($g, 'spend.json'));
+    is_deeply([ map { $_->{provider} } @{ ($gsnap || {})->{results} || [] } ], ['claude'],
+        'legacy reuse: only the claude row is carried to the new destination');
 }
 
 done_testing();

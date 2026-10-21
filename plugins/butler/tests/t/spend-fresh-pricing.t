@@ -1070,7 +1070,6 @@ subtest 'FP16: every test_paths file reaching report-session/derive-session sets
         spend-token-columns.t spend-fresh-pricing.t spend-session-dispatch-hook.t
         spend-session-attribution.t spend-drive-solo-session.t spend-derived-from-transcripts.t
         spend-package-request-dedup.t spend-session-fast-reader.t spend-global-and-claude.t
-        multi-provider-spend.t
     );
     for my $f (@files) {
         my $path = File::Spec->catfile($Bin, $f);

@@ -224,11 +224,10 @@ sub chroot_bin {
 # the ENVIRONMENT — exec() inherits the parent's %ENV wholesale, and nothing in
 # this file has ever touched %ENV except to READ BP_PROJECT_ROOT/BP_WRITE_SET.
 #
-# That was harmless while b33's verified premise held: OpenCode needed no credential, so
-# there was no OpenCode secret anywhere to inherit. b36 breaks that premise. It puts a
-# whole-session opencode.ai browser cookie into the coordinator's environment, and a
-# coordinator that polls spend and then dispatches a jailed worker would hand the cookie
-# through verbatim. Spend polling is a coordinator concern; a worker never needs it.
+# b36 found the gap: a credential that lives in a coordinator's environment would be
+# handed to a jailed worker verbatim, and a worker never needs one. (The credential that
+# exposed it, the OpenCode spend cookie, went with the OpenCode providers; the boundary
+# stays because the next one would leak the same way.)
 #
 # ⚠ This is a DENYLIST, and a denylist does not generalise: the next secret added to a
 # coordinator's environment leaks by default, because the default here is "inherit". The
@@ -236,8 +235,6 @@ sub chroot_bin {
 # can see — real blast radius across every package — so it is a design decision that is
 # ESCALATED to the operator, not taken here. See the b36 ledger.
 our @JAIL_ENV_DENYLIST = qw(
-    OPENCODE_AUTH_COOKIE
-    OPENCODE_GO_AUTH_COOKIE
     GIT_SSH_COMMAND
     ANTHROPIC_API_KEY
     CLAUDE_CODE_OAUTH_TOKEN
@@ -367,7 +364,7 @@ our @JAIL_ENV_ALLOW_PREFIX = qw(
 );
 
 # Called in the forked child immediately before exec, so the parent's own environment is
-# untouched — the coordinator still needs the cookie to poll spend.
+# untouched — the coordinator keeps whatever credentials it legitimately holds.
 #
 # ORDER MATTERS: build from the allowlist first, then apply the denylist as a
 # subtractive pass. The second step is redundant for every name known today and

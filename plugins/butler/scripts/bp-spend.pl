@@ -1,44 +1,27 @@
 #!/usr/bin/env perl
-# bp-spend.pl — normalized OpenCode Go + Zen spend reader, plus the composed
-# audit-verdict, for b36-multi-provider-spend-governance.
+# bp-spend.pl — Claude spend: the account snapshot the dashboard renders, and
+# the token/cost derivations over transcripts.
 #
-# THE MECHANISM (spec §0): both providers publish spend ONLY on an authenticated
-# HTML page (opencode.ai/workspace/{id}/billing) — no API, no CLI subcommand, no
-# usage headers exist today. This file scrapes that page. It vendors NOTHING
-# from any reference implementation; the selectors below are this repo's own,
-# derived only from the fixture shape documented in the spec.
+# TWO HALVES, deliberately in one file:
 #
-# THE THREE BINDING RULES (spec §1), restated at the point they are enforced
-# below so a future editor cannot miss them while changing a regex:
+#   package BpSpend          the ACCOUNT snapshot. `snapshot` asks
+#                            bp-usage-gate.pl for the Claude plan utilizations
+#                            and persists them as spend.json, which
+#                            launcher.pl's _gather_spend reads. A reading that
+#                            cannot be taken is `unknown` with a diagnostic —
+#                            never a default, never a zero, never a guess.
+#   package BpSpend::Derive  the TRANSCRIPT derivations (derive-package,
+#                            derive-blueprint, derive-session, report-session):
+#                            token counts per type and an API-equivalent cost
+#                            from published prices. No credential, no account.
 #
-#   1. A parse failure NEVER becomes a number. Every extraction returns
-#      status => 'ok' with real figures, or status => 'unknown' with a
-#      diagnostic. Never a default, never a zero, never a guess.
-#   2. The cookie is a whole browser-session credential, broader than anything
-#      else this system handles. resolve_credential() refuses a group/world-
-#      readable fallback file outright, and nothing in this file ever places
-#      the cookie value into a diagnostic, a log field, or an exception string.
-#   3. No cadence of its own is published upstream, so this file enforces one:
-#      $CADENCE_TTL_SECONDS (a NAMED constant, never a bare literal at the call
-#      sites) plus a TTL cache. Failure direction is always "degrade to warn",
-#      never "manufacture a pause/block out of a network hiccup" — mirrors
-#      bp-deps-check.pl's binding invariant and b46's audit-vs-build split.
+# The snapshot once also carried OpenCode Go/Zen figures scraped from an
+# authenticated billing page. That reader went when ccpraxis became Claude Code
+# only. The field whitelist in write_snapshot outlived it and still decides what
+# may reach the persisted file.
 #
-# REVISIT TRIGGER (spec §3a, operator 2026-08-03): the scrape is a workaround,
-# not the destination. Every parse-failure diagnostic below therefore ends
-# with the revisit prompt — check whether OpenCode now publishes a documented
-# API, CLI subcommand, or usage header for Go/Zen quota BEFORE repairing the
-# scrape; if one exists, replace this reader rather than patch a regex.
-#
-# NO LIVE HTTP AT LOAD TIME. fetch() takes an injected `http` coderef seam
-# ($method, $url, \%headers) -> {status=>N, content=>STR}. Production code
-# only reaches for a real transport (bp-http.pl, the house's curl wrapper —
-# never HTTP::Tiny/LWP::UserAgent) lazily, inside the branch that actually
-# performs a live fetch, so the test suite never triggers it and neither
-# HTTP::Tiny nor LWP::UserAgent ever lands in %INC while it runs.
-#
-# mandated_means: bp-log.pl — every fetch attempt/outcome, when a log_path is
-# given, goes through the real BpLog::event(). Never a reimplementation.
+# mandated_means: bp-log.pl — timestamps go through the real BpLog. Never a
+# reimplementation.
 
 package BpSpend;
 use strict;
@@ -52,337 +35,27 @@ my $DIR = dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; abs_path($f) // $f });
 require "$DIR/bp-log.pl";   # mandated_means — loaded unconditionally, no HTTP inside it.
 
 # ---------------------------------------------------------------------------
-# Cadence floor (spec §1.3). NAMED constant — referenced by variable at every
-# call site below, never re-typed as a bare literal seconds figure.
+# Cadence floor for the snapshot verb. NAMED constant -- referenced by variable
+# at every call site below, never re-typed as a bare literal seconds figure.
 # ---------------------------------------------------------------------------
-our $CADENCE_TTL_SECONDS = 900;   # 15 minutes: a billing dashboard, not a meter.
-
-my %WINDOW_KEY = ('5h' => 'five_hour', 'Weekly' => 'weekly', 'Monthly' => 'monthly');
-
-# ---------------------------------------------------------------------------
-# _revisit_diagnostic($why) -> the parse-failure diagnostic, always carrying
-# the §3a revisit prompt so nobody who reads it can miss the question.
-# ---------------------------------------------------------------------------
-sub _revisit_diagnostic {
-    my ($why) = @_;
-    return "$why. Before repairing the scrape, check whether OpenCode now "
-         . "publishes a documented API, CLI subcommand, or usage header for "
-         . "Go/Zen quota -- if it does, replace this reader rather than fix it.";
-}
-
-# ---------------------------------------------------------------------------
-# parse_go($html) -> pure, no I/O.
-#   ok:      { status => 'ok', five_hour=>{used,limit}, weekly=>{...}, monthly=>{...} }
-#   unknown: { status => 'unknown', diagnostic => $str }
-# ---------------------------------------------------------------------------
-sub parse_go {
-    my ($html) = @_;
-    $html = '' unless defined $html;
-
-    my %found;
-    while ($html =~ /<div\s+class="quota-window"\s+data-window="([^"]+)">(.*?)<\/div>/gs) {
-        my ($label, $block) = ($1, $2);
-        if ($block =~ /<span\s+class="quota-used">\s*\$?([\d.]+)\s*<\/span>\s*\/\s*<span\s+class="quota-limit">\s*\$?([\d.]+)\s*<\/span>/s) {
-            $found{$label} = { used => $1 + 0, limit => $2 + 0 };
-        }
-    }
-
-    my @missing = grep { !$found{$_} } qw(5h Weekly Monthly);
-    if (@missing) {
-        return {
-            status     => 'unknown',
-            diagnostic => _revisit_diagnostic(
-                "Go quota-window selector (div.quota-window[data-window]/span.quota-used"
-                . "+span.quota-limit) did not yield figures for: " . join(', ', @missing)
-            ),
-        };
-    }
-
-    return {
-        status    => 'ok',
-        five_hour => $found{'5h'},
-        weekly    => $found{'Weekly'},
-        monthly   => $found{'Monthly'},
-    };
-}
-
-# ---------------------------------------------------------------------------
-# parse_zen($html) -> pure, no I/O.
-#   ok:      { status => 'ok', balance => N, budget => N|undef }
-#   unknown: { status => 'unknown', diagnostic => $str }
-# ---------------------------------------------------------------------------
-sub parse_zen {
-    my ($html) = @_;
-    $html = '' unless defined $html;
-
-    my $balance;
-    if ($html =~ /<div\s+class="billing-balance">.*?<span\s+class="balance-value">\s*\$?([\d.]+)\s*<\/span>.*?<\/div>/s) {
-        $balance = $1;
-    }
-
-    unless (defined $balance) {
-        return {
-            status     => 'unknown',
-            diagnostic => _revisit_diagnostic(
-                "Zen billing-balance selector (div.billing-balance span.balance-value) "
-                . "did not yield a recognisable balance"
-            ),
-        };
-    }
-
-    my $budget;
-    if ($html =~ /<div\s+class="billing-budget">.*?<span\s+class="budget-value">\s*\$?([\d.]+)\s*<\/span>.*?<\/div>/s) {
-        $budget = $1;
-    }
-
-    return { status => 'ok', balance => $balance, budget => $budget };
-}
-
-# ---------------------------------------------------------------------------
-# resolve_credential(%opts) -> file-only (spec b36-reopen §1: the env path is
-# REMOVED as a supported input, deliberately -- not merely unused. See the
-# reopen spec's ruling: bp-jail.pl performs no environment isolation, exec()
-# inherits %ENV wholesale, so a cookie that is never IN %ENV cannot leak via
-# the jail. env_var/env are still accepted opts for call-site compatibility
-# but are NEVER consulted -- resolution is file-only, unconditionally.
-#   opts: env_var => NAME (ignored), env => \%ENV (ignored), fallback_path => PATH
-#   ok:  { ok => 1, cookie => $str, source => 'file' }
-#   fail:{ ok => 0, reason => 'missing'|'insecure-file', detail => $str }
-# A group/world-readable fallback file is refused outright, naming the path
-# and the required mode (0600) — never silently read.
-# ---------------------------------------------------------------------------
-sub resolve_credential {
-    my (%opts) = @_;
-    my $fallback_path = $opts{fallback_path};
-
-    if (defined $fallback_path && -e $fallback_path) {
-        my @st = stat($fallback_path);
-        my $mode = @st ? ($st[2] & 07777) : undef;
-        if (defined $mode && ($mode & 0077)) {
-            return {
-                ok     => 0,
-                reason => 'insecure-file',
-                detail => sprintf(
-                    "credential file %s is group/world-readable (mode %04o); refusing "
-                    . "to read a session cookie from it -- required mode is 0600 "
-                    . "(chmod 0600 %s)",
-                    $fallback_path, $mode, $fallback_path
-                ),
-            };
-        }
-
-        my $raw = do {
-            local $/;
-            open my $fh, '<', $fallback_path
-                or return { ok => 0, reason => 'missing', detail => "cannot open $fallback_path: $!" };
-            <$fh>;
-        };
-        my $data = eval { JSON::PP->new->decode($raw) };
-        if (ref $data eq 'HASH' && defined $data->{cookie} && length $data->{cookie}) {
-            return { ok => 1, cookie => $data->{cookie}, source => 'file' };
-        }
-        return { ok => 0, reason => 'missing', detail => "credential file $fallback_path did not contain a usable 'cookie' field" };
-    }
-
-    return {
-        ok     => 0,
-        reason => 'missing',
-        detail => "no credential found: "
-                . (defined $fallback_path ? "no usable fallback file at $fallback_path" : "no fallback file configured"),
-    };
-}
-
-sub _looks_like_login_redirect {
-    my ($content) = @_;
-    return 0 unless defined $content;
-    return $content =~ /sign\s*in\s*to\s*opencode|action\s*=\s*"\/login"|please\s*sign\s*in/i ? 1 : 0;
-}
-
-# ---------------------------------------------------------------------------
-# fetch(%opts) -> the normalized reader + cadence + credential + parse,
-# composed. Returns the same shape as parse_go/parse_zen, with a 'provider'
-# key stamped on.
-#
-#   opts: provider => 'go'|'zen',
-#         http     => CODEREF($method,$url,\%hdrs)->{status,content},
-#         now      => epoch,
-#         cache    => \%hashref (mutated, shared across calls, keyed by provider,
-#                     enforces the $CADENCE_TTL_SECONDS floor),
-#         credential => { cookie => $str }  -- OR --
-#         env_var / fallback_path (resolved via resolve_credential),
-#         log_path => optional; every attempt/outcome logged via BpLog::event.
-# ---------------------------------------------------------------------------
-sub fetch {
-    my (%opts) = @_;
-    my $provider = $opts{provider} // 'unknown';
-    my $now      = defined $opts{now} ? $opts{now} : time;
-    my $cache    = $opts{cache} // {};
-    my $log_path = $opts{log_path};
-
-    my $_log = sub {
-        my ($outcome, $extra) = @_;
-        return unless defined $log_path;
-        my %fields = (provider => $provider, outcome => $outcome, %{ $extra || {} });
-        # NEVER include the credential/cookie here (spec §1.2) -- deliberately
-        # not forwarded into %fields anywhere on this path.
-        eval { BpLog::event($log_path, 'spend_fetch', \%fields, $now) };
-    };
-
-    # --- cadence floor: served from cache inside the TTL window, no I/O at all. ---
-    if (exists $cache->{$provider}
-        && defined $cache->{$provider}{fetched_at}
-        && ($now - $cache->{$provider}{fetched_at}) < $CADENCE_TTL_SECONDS) {
-        $_log->('cached', { status => $cache->{$provider}{result}{status} });
-        return $cache->{$provider}{result};
-    }
-
-    # --- credential resolution ---
-    my $cred;
-    if (ref $opts{credential} eq 'HASH' && defined $opts{credential}{cookie}) {
-        $cred = { ok => 1, cookie => $opts{credential}{cookie}, source => 'provided' };
-    } else {
-        $cred = resolve_credential(
-            env_var       => $opts{env_var},
-            env           => $opts{env},
-            fallback_path => $opts{fallback_path},
-        );
-    }
-
-    unless ($cred->{ok}) {
-        # THREE STATES, not two (ledger done-criterion 1). A provider that was
-        # never configured at all is ABSENT -- there is no meter to read, and
-        # saying "unknown" about it would be a claim we cannot support and would
-        # drag the composed verdict to unknown for a provider the operator never
-        # asked us to govern.
-        #
-        # `missing` means no env var AND no usable fallback file: nobody
-        # configured this provider. Anything else (notably `insecure-file`, a
-        # credential that EXISTS but which we refuse to read) means the provider
-        # IS configured and we could not read its meter -- that is genuinely
-        # unknown, and must keep propagating as such.
-        #
-        # Neither ever becomes a number. Absent is not zero-spent.
-        my $absent = (($cred->{reason} // '') eq 'missing') ? 1 : 0;
-        my $status = $absent ? 'absent' : 'unknown';
-        my $result = {
-            status     => $status,
-            provider   => $provider,
-            diagnostic => $absent
-                ? "provider not configured: $cred->{detail}"
-                : "credential unavailable ($cred->{reason}): $cred->{detail}",
-        };
-        $cache->{$provider} = { fetched_at => $now, result => $result };
-        $_log->('credential-unavailable', { status => $status, reason => $cred->{reason} });
-        return $result;
-    }
-
-    # --- transport: injected seam, or (lazily, only here) the house curl wrapper. ---
-    my $http = $opts{http};
-    unless (defined $http) {
-        require "$DIR/bp-http.pl";   # lazy: never touched by the test suite's injected-seam paths.
-        $http = sub {
-            my ($method, $url, $hdrs) = @_;
-            return BpHttp::request($method, $url, $hdrs);
-        };
-    }
-
-    my $workspace_env = $provider eq 'go' ? 'OPENCODE_GO_WORKSPACE_ID' : 'OPENCODE_WORKSPACE_ID';
-    my $workspace_id  = $opts{workspace_id} // $ENV{$workspace_env} // 'unknown';
-    my $url = "https://opencode.ai/workspace/$workspace_id/billing";
-
-    my $res = eval { $http->('GET', $url, { Cookie => "session=" . $cred->{cookie} }) };
-    if ($@) {
-        my $err = $@;
-        $err =~ s/\s+$//;
-        my $result = {
-            status     => 'unknown',
-            provider   => $provider,
-            diagnostic => _revisit_diagnostic("network transport failed (caught, not a crash): $err"),
-        };
-        $cache->{$provider} = { fetched_at => $now, result => $result };
-        $_log->('transport-error', { status => 'unknown' });
-        return $result;
-    }
-
-    my $status  = ref($res) eq 'HASH' ? ($res->{status} // 0) : 0;
-    my $content = ref($res) eq 'HASH' ? ($res->{content} // '') : '';
-
-    my $result;
-    if ($status == 401) {
-        $result = {
-            status     => 'unknown',
-            provider   => $provider,
-            diagnostic => "cookie rejected (401 unauthorized) -- re-copy the cookie from your opencode.ai session and try again.",
-        };
-    } elsif ($status == 200 && _looks_like_login_redirect($content)) {
-        $result = {
-            status     => 'unknown',
-            provider   => $provider,
-            diagnostic => "session rejected (redirected to sign-in) -- re-copy the cookie from your opencode.ai session and try again.",
-        };
-    } elsif ($status == 200) {
-        my $parsed = $provider eq 'zen' ? parse_zen($content) : parse_go($content);
-        $result = { %$parsed, provider => $provider };
-    } else {
-        $result = {
-            status     => 'unknown',
-            provider   => $provider,
-            diagnostic => _revisit_diagnostic("network problem reaching the billing page (status=$status)"),
-        };
-    }
-
-    $cache->{$provider} = { fetched_at => $now, result => $result };
-    $_log->('fetched', { status => $result->{status}, http_status => $status });
-    return $result;
-}
-
-# ---------------------------------------------------------------------------
-# verdict(@results) -> composes N provider results into ONE decision.
-#   { action => 'ok'|'unknown', reason => $str }
-# ANY 'unknown' result propagates: overall action is 'unknown', NEVER 'ok',
-# and NEVER coerced into a pause/block -- this is a WARN/audit path (spec
-# §1.3, bp-deps-check.pl's binding invariant).
-# ---------------------------------------------------------------------------
-sub verdict {
-    my @results = @_;
-    # ABSENT providers are skipped, not counted as unknown: nobody configured
-    # them, so there is no meter to be uncertain about, and letting an
-    # unconfigured provider drag the whole verdict to unknown would make the
-    # default (Zen is off by default) permanently unknown for every operator.
-    # Absent is still never zero -- it simply does not participate.
-    @results = grep { !(ref($_) eq 'HASH' && (($_->{status} // '') eq 'absent')) } @results;
-    my @unknown = grep { ref($_) eq 'HASH' && (($_->{status} // '') eq 'unknown') } @results;
-
-    if (@unknown) {
-        my @who = map { $_->{provider} // '?' } @unknown;
-        return {
-            action => 'unknown',
-            reason => 'one or more providers unreadable (never coerced to a pause): ' . join(', ', @who),
-        };
-    }
-
-    return { action => 'ok', reason => 'all providers reporting real figures' };
-}
+our $CADENCE_TTL_SECONDS = 900;   # 15 minutes: an account meter, not a live gauge.
 
 # ---------------------------------------------------------------------------
 # write_snapshot(%opts) -> persists the composed spend snapshot so the TUI
 # (launcher.pl's _gather_spend) can render without fetching (b36-reopen §2).
 #
-#   opts: path       => PATH (final destination, e.g. "<active run>/spend.json"),
-#         results    => \@results (each shaped like fetch()'s own return value),
-#         credential => \%opt (OPTIONAL -- accepted only so a caller that still
-#                      has the credential struct in scope cannot accidentally
-#                      leak it in; it is NEVER read, NEVER serialised, below),
+#   opts: path       => PATH (final destination, e.g. "<global dir>/spend.json"),
+#         results    => \@results (each shaped like claude_from_gate()'s return),
 #         now        => epoch (defaults to time).
 #
 # ⚠ REDACTION IS THE BINDING CONSTRAINT (spec §2.1). This sub NEVER serialises
 # a raw result hash -- it builds each snapshot row from an explicit FIELD
-# WHITELIST (provider/status/five_hour/weekly/monthly/balance/budget/
-# diagnostic). Anything else on a result -- a stray `cookie` key, a `_debug`
-# sub-hash carrying request headers, whatever a careless composer bolted on --
-# is dropped on the floor, not merely "not forwarded" but never even looked
-# at for the write. This is what makes the redaction structural rather than
-# a matter of remembering not to pass the credential in.
+# WHITELIST (provider/status/five_hour/seven_day/diagnostic). Anything else on a
+# result -- a stray token, a `_debug` sub-hash carrying request headers,
+# whatever a careless composer bolted on -- is dropped on the floor, not merely
+# "not forwarded" but never even looked at for the write. This is what makes the
+# redaction structural rather than a matter of remembering not to pass a
+# credential in.
 #
 # Atomic: write to a temp file in the SAME directory as $path, then rename()
 # over the final path -- a reader can never observe a half-written file. That
@@ -395,9 +68,9 @@ sub verdict {
 #
 # THE ACTUAL GUARANTEE IS THE FIELD WHITELIST, a few lines below. Every persisted
 # row is built from an explicit list, so a secret cannot reach this file by being
-# added to a struct upstream -- the OpenCode session cookie, the broadest secret
-# in the system, provably never appears here. That is what is doing the work the
-# mode used to get credit for.
+# added to a struct upstream -- the Claude OAuth token bp-usage-gate.pl handles
+# never appears here. That is what is doing the work the mode used to get credit
+# for.
 #
 # This distinction is stated at length ON PURPOSE. The header previously read
 # "Mode 0600 from creation", full stop, and a future reader deciding whether some
@@ -413,20 +86,16 @@ sub verdict {
 # asserts the honest property (the global destination is no more permissive than
 # the run-dir one) rather than an absolute mode that cannot hold here.
 # ---------------------------------------------------------------------------
-my @SNAPSHOT_RESULT_FIELDS = qw(provider status five_hour seven_day weekly monthly balance budget diagnostic);
+my @SNAPSHOT_RESULT_FIELDS = qw(provider status five_hour seven_day diagnostic);
 
-# The nested sub-fields a whitelisted field may carry. `used`/`limit` are go's
-# window shape; `utilization` is claude's (t02, blueprint Decision 12 -- claude
-# became a fetched provider, and without this its figures were stripped on
-# write and the panel read `unreadable` for a brand new reason).
+# The nested sub-fields a whitelisted window may carry: claude's `utilization`
+# (t02, blueprint Decision 12).
 #
-# STILL A WHITELIST, and that is the point. Widening it is the one change in
-# t02 that could weaken the property this whole sub exists for: the OpenCode
-# session cookie is the broadest secret in the system and must provably never
-# reach a persisted file. So the new field is NAMED, never `%$v` -- a stray key
-# smuggled inside a whitelisted nested field is dropped exactly as before.
-# t/171's AC13 asserts that directly, at top level and nested.
-my @SNAPSHOT_NESTED_FIELDS = qw(used limit utilization);
+# STILL A WHITELIST, and that is the point: a credential must provably never
+# reach a persisted file. So the field is NAMED, never `%$v` -- a stray key
+# smuggled inside a whitelisted nested field is dropped like any other.
+# spend-global-and-claude.t's AC13 asserts that directly, at top level and nested.
+my @SNAPSHOT_NESTED_FIELDS = qw(utilization);
 
 sub _whitelist_result {
     my ($r) = @_;
@@ -436,7 +105,7 @@ sub _whitelist_result {
         next unless exists $r->{$f};
         my $v = $r->{$f};
         if (ref($v) eq 'HASH') {
-            # five_hour/seven_day/weekly/monthly are the only nested shapes
+            # five_hour/seven_day are the only nested shapes
             # this file ever produces -- whitelist their sub-fields only, so an
             # unexpected nested key (e.g. a smuggled credential) can never ride
             # along even inside a field that IS on the list.
@@ -489,11 +158,7 @@ sub write_snapshot {
 # so the mapping is testable without credentials, without a network, and
 # without a fork.
 #
-# WHY A SUBPROCESS AND NOT A REIMPLEMENTATION (blueprint Decision 12). Until
-# t02, `claude` was never fetched by ANYTHING -- this file's provider list was
-# qw(go zen) and nothing else composed a claude entry -- so the TUI's
-# "Claude : no snapshot" was structural, guaranteed on every launch since the
-# panel shipped, and would have survived the format fix untouched.
+# WHY A SUBPROCESS AND NOT A REIMPLEMENTATION (blueprint Decision 12).
 # bp-usage-gate.pl already reads ~/.claude/.credentials.json, enforces a
 # token-life floor, and polls api.anthropic.com/api/oauth/usage with the right
 # oauth beta header. Duplicating that here would fork the handling of the
@@ -513,9 +178,7 @@ sub write_snapshot {
 #
 # Anything else -- including a ZERO exit with an unparseable line -- is
 # `unknown` with a diagnostic. `unknown` is never `absent` and never zero: a
-# provider configured enough to have failed is reported as having failed. That
-# rule already governs go and zen here; this extends it rather than inventing
-# a policy.
+# provider configured enough to have failed is reported as having failed.
 sub claude_from_gate {
     my ($line, $exit) = @_;
     $line = '' unless defined $line && !ref $line;
@@ -2154,8 +1817,8 @@ use Cwd qw(abs_path);
 # list_records/read_record/log_dir take the repo root, not the data root, and
 # are never called (out of scope, spec §6).
 my $DISPATCH_DIR = dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; abs_path($f) // $f });
-# Soft require: bp-orchestrator.pl, bp-spend-auth.pl and the launcher's spend
-# sampler all load bp-spend.pl at their own load time, so a compile failure in
+# Soft require: the launcher's spend sampler and the session reports
+# load bp-spend.pl at their own load time, so a compile failure in
 # bp-dispatch-log.pl must not take them down too. $DISPATCH_DEFAULT_BUDGET_FALLBACK
 # below covers the anomaly path where this failed or the upstream constant is
 # missing/renamed; the NORMAL path still reads
@@ -2881,20 +2544,19 @@ my $PKG_ID_RE = qr/^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
 # render on any real fleet -- and the reader's `-f` guard plus its swallowing
 # `eval` made that permanent breakage look exactly like "no data yet".
 #
-#   bp-spend.pl snapshot --run-dir DIR [--offline] [--now EPOCH] [--log PATH]
+#   bp-spend.pl snapshot [--run-dir DIR] [--global-dir DIR] [--offline] [--now EPOCH]
 #
-# Writes DIR/spend.json -- the exact path launcher.pl's _gather_spend reads.
+# Writes <DIR>/spend.json for each DIR given -- launcher.pl's _gather_spend reads
+# the global copy.
 # Exit 0 wrote (or served a still-fresh snapshot) - 2 usage - 4 I/O.
 #
-# CADENCE ACROSS PROCESSES. fetch()'s TTL cache is in-process and therefore
-# useless to a CLI that exits, so this re-derives the floor from the EXISTING
-# snapshot's generated_at. That makes the verb safe to call on any tick: inside
+# CADENCE ACROSS PROCESSES. A CLI that exits keeps no cache, so this derives
+# the floor from the EXISTING snapshot's mtime. That makes the verb safe to call on any tick: inside
 # $CADENCE_TTL_SECONDS it is a stat plus a read and makes no network call at
-# all. Without this, wiring it to a frequent loop would hammer the providers --
-# the cadence floor would exist in the library and be bypassed by its only
-# caller.
+# all. Without this, wiring it to a frequent loop would poll the usage endpoint
+# on every tick.
 #
-# --offline performs no fetch and records every provider as `absent`. It exists
+# --offline performs no fetch and records claude as `absent`. It exists
 # so the write path can be exercised deterministically (no credentials, no
 # network) -- the check that would have caught the original defect.
 # ===========================================================================
@@ -2909,18 +2571,10 @@ unless (caller) {
         elsif ($a eq '--global-dir')        { $opt{global_dir} = shift @ARGV }
         elsif ($a =~ /^--now=(.*)$/)        { $opt{now}        = $1 }
         elsif ($a eq '--now')               { $opt{now}        = shift @ARGV }
-        elsif ($a =~ /^--log=(.*)$/)        { $opt{log}        = $1 }
-        elsif ($a eq '--log')               { $opt{log}        = shift @ARGV }
         elsif ($a =~ /^--gate-cmd=(.*)$/)   { $opt{gate_cmd}   = $1 }
         elsif ($a eq '--gate-cmd')          { $opt{gate_cmd}   = shift @ARGV }
         elsif ($a =~ /^--pkg=(.*)$/)        { $opt{pkg}        = $1 }
         elsif ($a eq '--pkg')               { $opt{pkg}        = shift @ARGV }
-        # --no-opencode fetches claude ONLY. Like --gate-cmd it exists for the
-        # test suite: without it, exercising the claude mapping would reach out
-        # to the real OpenCode providers on every case, which is both slow and
-        # a poll of the operator's actual account for no reason. Production
-        # never passes it.
-        elsif ($a eq '--no-opencode')       { $opt{no_opencode} = 1 }
         elsif ($a eq '--offline')           { $opt{offline}    = 1 }
         elsif ($a eq '--force')             { $opt{force}      = 1 }
         elsif ($a =~ /^--session=(.*)$/)    { $opt{session}    = $1 }
@@ -3301,7 +2955,7 @@ unless (caller) {
 
     if ($verb ne 'snapshot') {
         print STDERR "usage: bp-spend.pl snapshot [--run-dir DIR] [--global-dir DIR] [--offline]\n"
-                   . "                            [--force] [--now EPOCH] [--log PATH]\n"
+                   . "                            [--force] [--now EPOCH]\n"
                    . "       bp-spend.pl derive-package --run-dir DIR --pkg PKG [--offline] [--now EPOCH]\n"
                    . "       bp-spend.pl derive-blueprint --run-dir DIR [--offline] [--now EPOCH]\n"
                    . "       bp-spend.pl derive-session --session PATH [--since T] [--until T] [--now EPOCH] [--json]\n"
@@ -3310,8 +2964,8 @@ unless (caller) {
     }
 
     # AT LEAST ONE DESTINATION, not specifically --run-dir. Blueprint Decision
-    # 11: every figure in this snapshot -- go's windows, zen's balance,
-    # claude's utilizations -- describes the ACCOUNT, not the run that happened
+    # 11: every figure in this snapshot -- claude's plan utilizations --
+    # describes the ACCOUNT, not the run that happened
     # to poll for it. Requiring a run directory scoped an account fact to a run
     # and made it unreadable in exactly the state the operator is normally in:
     # no fleet run active. The run copy keeps being written when asked for, so
@@ -3363,34 +3017,21 @@ unless (caller) {
             close $fh;
             JSON::PP->new->decode($raw);
         };
-        @results = (ref($prev) eq 'HASH' && ref($prev->{results}) eq 'ARRAY')
-                 ? @{ $prev->{results} } : ();
+        # Only claude rows are carried forward. A snapshot written before the
+        # OpenCode providers were removed may still hold go/zen rows, and
+        # copying it to a new destination would keep them alive for no reader.
+        @results = grep { ref($_) eq 'HASH' && ($_->{provider} // '') eq 'claude' }
+                   ((ref($prev) eq 'HASH' && ref($prev->{results}) eq 'ARRAY')
+                    ? @{ $prev->{results} } : ());
     }
     elsif ($opt{offline}) {
-        # claude joins go and zen here. Until t02 it was absent from this list
-        # entirely, which is why the TUI's "Claude : no snapshot" was
-        # structural rather than a data gap (blueprint Decision 12).
-        @results = map { { provider => $_, status => 'absent' } } qw(claude go zen);
+        # --offline spawns nothing and records claude as absent (blueprint
+        # Decision 12: claude is always present in the snapshot, so the panel's
+        # "no snapshot" means no file, never a missing provider).
+        @results = ({ provider => 'claude', status => 'absent' });
     }
     else {
-        # claude first: it is the provider the operator named, and a failure in
-        # the OpenCode fetches must not cost it.
         push @results, _fetch_claude($opt{gate_cmd});
-
-        unless ($opt{no_opencode}) {
-            my %cache;
-            for my $p (qw(go zen)) {
-                my $r = eval {
-                    BpSpend::fetch(provider => $p, now => $now, cache => \%cache,
-                                   log_path => $opt{log});
-                };
-                # A provider that blows up must not lose the whole snapshot: record
-                # it as unknown (never zero, never absent -- it IS configured enough
-                # to have failed) and keep going.
-                push @results, (ref $r eq 'HASH') ? $r
-                             : { provider => $p, status => 'unknown' };
-            }
-        }
     }
 
     my @written;

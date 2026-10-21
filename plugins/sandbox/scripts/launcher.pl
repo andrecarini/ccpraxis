@@ -1014,7 +1014,7 @@ my $RESOURCES_SAMPLER_PID     = "$SAMPLER_TMPDIR/resources-sampler.pid";
 # Deliberately the same state dir as every snapshot above rather than a new
 # location: this is not a new concept. What IS new is that spend has one at
 # all. It previously lived only at <fleet run>/spend.json, which scoped an
-# ACCOUNT fact -- go's windows, zen's balance, claude's utilizations all
+# ACCOUNT fact -- claude's plan utilizations
 # describe the account, not the run that polled for it -- to a run, and so made
 # it unreadable in exactly the state the operator is normally in.
 my $SPEND_GLOBAL_DIR          = $LAUNCHER_DIR;
@@ -8867,50 +8867,35 @@ sub _gather_orchestrator_events {
 
 # _gather_spend($runs) -> \%info | undef (b37-spend-surfaces).
 #
-# Reads a spend snapshot the butler run has ALREADY persisted and hands it to
-# SpendPanel::status for rendering. Mirrors _gather_orchestrator_events: locate
-# the active run, read one host-visible file, degrade to nothing on any failure.
+# Reads the spend snapshot the spend sampler has ALREADY persisted and hands it
+# to SpendPanel::status for rendering: read one host-visible file, degrade to
+# nothing on any failure. $runs is accepted for call-site symmetry with the
+# other gatherers and is not consulted -- see "ONE COPY" below.
 #
 # ⚠ THIS DELIBERATELY MAKES NO NETWORK CALL, and that is the load-bearing
-# decision rather than an omission. BpSpend::fetch reaches for bp-http.pl, the
-# house curl wrapper — a SUBPROCESS, i.e. a fork, and this runs on the dashboard
-# render tick. s17 has just spent an entire package REMOVING the one recurring
-# fork from this path, on the very platform where forking is already failing
-# ("Can't fork, trying again in 5 seconds"). Re-introducing a network fork here
-# would undo that and could block the TUI for the length of a timeout.
+# decision rather than an omission. Polling the usage endpoint means running
+# bp-usage-gate.pl -- a SUBPROCESS, i.e. a fork, and this runs on the dashboard
+# render tick. s17 spent an entire package REMOVING the one recurring fork from
+# this path, on the very platform where forking is already failing ("Can't
+# fork, trying again in 5 seconds"). Re-introducing a network fork here would
+# undo that and could block the TUI for the length of a timeout.
 #
-# So the launcher is a READER only. The fleet polls on its own cadence — b36
-# already owns the cadence floor and the TTL cache — and the TUI renders
-# whatever it last wrote.
+# So the launcher's render path is a READER only. The spend sampler polls on
+# its own cadence (bp-spend.pl's snapshot verb owns the floor) and the TUI
+# renders whatever it last wrote.
 #
-# ⚠ KNOWN GAP, ESCALATED, NOT PAPERED OVER: b36 does not currently WRITE such a
-# snapshot. It emits `spend_fetch` events through BpLog (outcome and status, not
-# figures) and returns its struct in-process to its caller. Until b36 persists
-# one, this returns undef and the Spend panel is simply ABSENT — never wrong,
-# never a fabricated zero. Deciding that artifact's location, lifecycle and
-# redaction belongs to b36, whose defining constraint is that the OpenCode
-# session cookie is the broadest secret in the system: a persisted spend
-# snapshot must provably never carry it. That is not a call to make inside a
-# rendering package. See the b37 ledger.
+# ONE COPY: the global one. A fleet run used to write its own <run>/spend.json
+# and this preferred it, but that copy only ever carried the OpenCode Go/Zen
+# providers, never claude, so preferring it blanked the Claude figures for the
+# length of every run. The run-scoped writer went with the OpenCode providers.
+# A run directory left over from before still holds such a file, which is why
+# it is not even consulted as a fallback.
 sub _gather_spend {
     my ($runs) = @_;
     my $info;
     eval {
-        # RESOLUTION ORDER (t02, blueprint Decision 11): the active run's copy
-        # first, then the run-independent one. Preferring the run copy keeps a
-        # driven fleet's own figures authoritative for that fleet; falling back
-        # to the global copy is what makes the panel work at all when the
-        # operator is not in a run -- which is nearly always.
-        my @candidates = grep { ref($_) eq 'HASH' && defined $_->{runs_dir} } @{ $runs || [] };
-        my ($active) = grep { ($_->{state} || '') eq 'running' } @candidates;
-        ($active) = grep { ($_->{state} || '') eq 'paused' } @candidates if !$active;
-
-        my @paths;
-        push @paths, "$active->{runs_dir}/spend.json" if $active;
-        push @paths, "$SPEND_GLOBAL_DIR/spend.json";
-
-        my ($snap) = grep { -f $_ } @paths;
-        return unless defined $snap;
+        my $snap = "$SPEND_GLOBAL_DIR/spend.json";
+        return unless -f $snap;
 
         my $raw = do { local $/; open my $fh, '<:raw', $snap or return; <$fh> };
         return unless defined $raw && length $raw;
@@ -8921,9 +8906,9 @@ sub _gather_spend {
         # figures still read "absent". write_snapshot persists an ARRAY under
         # `results`, each element keyed by a `provider` FIELD; SpendPanel::status
         # indexes its argument by provider NAME. This line used to hand the
-        # decoded file straight in, so $spend->{go} was always undef and every
-        # provider degraded no matter what had been fetched. See
-        # SpendPanel::from_snapshot's own comment for the measurement.
+        # decoded file straight in, so every provider degraded no matter what
+        # had been fetched. See SpendPanel::from_snapshot's own comment for the
+        # measurement.
         $info = SpendPanel::status(SpendPanel::from_snapshot($persisted), time);
         1;
     } or do { $info = undef };     # any failure -> no panel, dashboard still renders
