@@ -984,14 +984,6 @@ our $RUN_MAX_ROWS = 3;
 # _run_state_role($state) -> the S2.10a role for a run-summary state span.
 my %RUN_STATE_ROLE = ( running => 'good', paused => 'warn', parked => 'warn', idle => 'muted' );
 
-# ===========================================================================
-# b37-spend-surfaces: renders SpendPanel's already-computed status() \%info
-# struct. Dashboard.pm does NOT load the SpendPanel module (no use/require,
-# no module-qualified call anywhere in this file) -- exactly the TokenInfo/
-# _token_lines split.
-# PRIVATE, pure, mirrors _token_lines' style. Never dies for any input.
-# ===========================================================================
-
 # _status_alert(\%state) -> a one-line banner string when the container is no
 # longer running or no longer reachable, else undef. This drives the "dashboard
 # stays open after the container dies" behavior: the loop no longer exits on

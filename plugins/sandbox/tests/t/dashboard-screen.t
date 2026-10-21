@@ -311,7 +311,8 @@ sub _row_violations {
 # (AC-L2, used below) -- leaving stale titles here would not fail any test
 # today but would make that detector blind to a regression touching only
 # the new titles.
-my @KNOWN_PANEL_TITLES = ('Run', 'Blueprints', 'Resources', 'Providers', 'Recent activity');
+# Providers was renamed Claude Code when ccpraxis became Claude Code only.
+my @KNOWN_PANEL_TITLES = ('Run', 'Blueprints', 'Resources', 'Claude Code', 'Recent activity');
 sub _panel_title_hits_in_row {
     my ($text) = @_;
     return 0 unless defined $text;

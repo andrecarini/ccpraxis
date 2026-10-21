@@ -350,7 +350,7 @@ for my $cols (@WIDE) {
     like($all, qr/Run/,        "AC13: cols=$cols -- Run survives the split");
     like($all, qr/Blueprints/, "AC13: cols=$cols -- Blueprints survives the split");
     like($all, qr/Resources/,  "AC13: cols=$cols -- Resources survives the split");
-    like($all, qr/Providers/,  "AC13: cols=$cols -- Providers survives the split");
+    like($all, qr/Claude Code/, "AC13: cols=$cols -- Claude Code survives the split");
 }
 
 # AC14 -- the three-line cap, THROUGH THE REAL DASHBOARD rather than only

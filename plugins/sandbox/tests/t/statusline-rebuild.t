@@ -1584,12 +1584,6 @@ sub glyph_cols_disagreements {
     my $NOW = 1785800000;
     my $spend = {
         claude      => { status => 'ok', five_hour => { utilization => 0.10 }, seven_day => { utilization => 0.05 } },
-        go          => { status => 'ok',
-                         five_hour => { used => 1,  limit => 12 },
-                         weekly    => { used => 3,  limit => 30 },
-                         monthly   => { used => 60, limit => 60 } },
-        zen         => { status => 'ok', balance => 42, budget => 100 },
-        zen_enabled => 1,
     };
 
     sub run_bp {

@@ -44,9 +44,6 @@ sub strip_clocks {
 }
 
 my $SPEND = SpendPanel::status(SpendPanel::from_snapshot({ results => [
-    { provider => 'go',     status => 'ok', five_hour => { used => 42, limit => 100 },
-                                            weekly    => { used => 300, limit => 1000 } },
-    { provider => 'zen',    status => 'ok', balance => '12.34', budget => '50.00' },
     { provider => 'claude', status => 'ok', five_hour => { utilization => 0.42 },
                                             seven_day => { utilization => 0.9 } },
 ] }), 1787000000);

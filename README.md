@@ -193,9 +193,8 @@ host ram      ━─────────  10%    2.7 GB used |  24.6 GB free
 host disk     ━━━───────  28%   76.6 GB used | 197.0 GB free | 273.6 GB total
 host cpu      ━━━━━━━━━─  85%
 
-─ Providers ────────────────────────────────────────────────────────────────────
-Claude Code
-  access      expires in 7h17m
+─ Claude Code ──────────────────────────────────────────────────────────────────
+access        expires in 7h17m
  the resources sampler has not written a snapshot for 4 minutes  [d] dismiss
  host disk above 90% -- podman image pulls will start failing  [d] dismiss
 ────────────────────────────────────────────────────────────────────────────────

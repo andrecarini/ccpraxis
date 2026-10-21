@@ -8,13 +8,13 @@ are seven of them today: `_gather_runs`, `_gather_backpack`, `_gather_oauth_expi
 is the doctrine every one of them — and any adapter added later — must follow, plus the mechanics of
 how that doctrine is enforced.
 
-The worked example is `_gather_spend` (launcher.pl:4711, header comment at launcher.pl:4684-4710). Its
-comment already states the rule this whole document generalises, almost word for word: *"THIS
-DELIBERATELY MAKES NO NETWORK CALL … BpSpend::fetch reaches for bp-http.pl … a SUBPROCESS, i.e. a
-fork, and this runs on the dashboard render tick … So the launcher is a READER only. The fleet polls
-on its own cadence … and the TUI renders whatever it last wrote."* `_gather_spend` reads one
-host-visible file that some other process (the butler run) has already written, and degrades to
-absent — never a fabricated number — when that file does not exist yet. Every rule below is that
+The worked example is `_gather_spend` in launcher.pl. Its header comment already states the rule
+this whole document generalises, almost word for word: *"THIS DELIBERATELY MAKES NO NETWORK CALL …
+Polling the usage endpoint means running bp-usage-gate.pl -- a SUBPROCESS, i.e. a fork, and this
+runs on the dashboard render tick … So the launcher's render path is a READER only. The spend
+sampler polls on its own cadence … and the TUI renders whatever it last wrote."* `_gather_spend`
+reads one host-visible file that another process (the spend sampler) has already written, and
+degrades to absent — never a fabricated number — when that file does not exist yet. Every rule below is that
 same idea, spelled out so it applies uniformly rather than living as one comment on one sub.
 
 The counter-example, and the reason this document exists rather than being unnecessary, is

@@ -239,8 +239,8 @@ sub gutter {
 }
 
 # pad_label($label, $width) -> a label padded to $width plus the separator.
-# For the narrower, ad-hoc gutters in the Providers panel, which do not use
-# LABEL_GUTTER's width but must use the same separator.
+# For a narrower, ad-hoc gutter that does not use LABEL_GUTTER's width but
+# must use the same separator (row()'s gutter_width).
 sub pad_label {
     my ($label, $width) = @_;
     $label = '' if !defined $label;
@@ -296,12 +296,11 @@ sub row {
 
     return [] if !$force && is_absent($plain);
 
-    # `gutter_width` NARROWS THE LABEL COLUMN FOR AN INDENTED ROW. The Providers
-    # panel nests its facts under a provider heading, and that indent used to
-    # push its VALUES two columns right of every other panel's -- see
-    # _FACT_GUTTER for the full reasoning. A row that spends N columns on an
-    # indent asks for a label column N narrower, and its values land in the one
-    # shared column again. Absent, the row pays the full LABEL_GUTTER, which is
+    # `gutter_width` NARROWS THE LABEL COLUMN FOR AN INDENTED ROW. The old
+    # Providers panel nested its facts under a provider heading, and that indent
+    # pushed its VALUES two columns right of every other panel's. A row that
+    # spends N columns on an indent asks for a label column N narrower, and its
+    # values land in the one shared column again. Absent, the row pays the full LABEL_GUTTER, which is
     # every other call site.
     my $gw = $spec{gutter_width};
     my $label_text = (defined($gw) && !ref($gw) && $gw =~ /^\d+$/)
@@ -469,7 +468,7 @@ sub sampler_wait_spans {
 #
 # Returning an empty list rather than an empty string is deliberate: a span
 # with no text still occupies a row, which is the row this exists to reclaim.
-# The caller must therefore test before pushing -- see providers_lines.
+# The caller must therefore test before pushing -- see _claude_code_body.
 sub spend_wait_spans {
     my ($fact) = @_;
 
@@ -1867,10 +1866,10 @@ sub _run_body {
 
     # THE 'oauth' ROW IS GONE (operator, 2026-08-28). It rendered only when
     # $state->{tokens} was absent, and said the same thing -- through the same
-    # _fmt_oauth_like formatter -- that Providers' Claude Code "access" row
+    # _fmt_oauth_like formatter -- that the Claude Code panel's "access" row
     # says. Two credential facts in two panels, told apart only by which one
     # happened to have data. The fallback now feeds that row instead; see
-    # _claude_code_block's $oauth_fallback.
+    # _claude_code_body's $oauth_fallback.
 
     # THE PODMAN INSTALLATION FACTS CLOSE THE PANEL (operator, 2026-08-27).
     # `machine` and `podman` describe the runtime this panel's runs execute in,
@@ -1887,7 +1886,7 @@ sub _run_body {
 # t01-providers-panel, criteria 6/7). Relocated from the tail of _run_body:
 # the row budget that used to bound Run (run_rows_max) is renamed
 # blueprint_rows_max (D5) and now bounds THIS panel, never Run. Blueprints is
-# unconditionally present (D4, same reasoning as Resources/Providers), so an
+# unconditionally present (D4, same reasoning as Resources/Claude Code), so an
 # empty/absent/non-array $state->{runs} renders one honest no-data line
 # rather than an empty panel.
 # ===========================================================================
@@ -2012,7 +2011,7 @@ sub _blueprints_capacity {
     # mark, padded on the right to the panel's content width. So a real
     # probe row's composed text always begins with the mark AT COLUMN 0.
     # Nothing else on the frame can: the header's own text always leads
-    # with the literal 'ccpraxis sandbox', every Run/Providers/Resources
+    # with the literal 'ccpraxis sandbox', every Run/Claude Code/Resources
     # body row leads with a fixed label column before any state-derived
     # value, and the side column (Activity) is always joined AFTER the
     # main region's own text, which is itself padded to full width -- so
@@ -2825,9 +2824,8 @@ sub _resources_body {
 }
 
 # ===========================================================================
-# The Spend panel body -- ported from the legacy Dashboard _spend_lines
-# family (Theme roles instead of legacy ones; no Dashboard reference,
-# AC-P4).
+# The usage value -- ported from the legacy Dashboard _spend_lines family
+# (Theme roles instead of legacy ones; no Dashboard reference, AC-P4).
 # ===========================================================================
 sub _spend_state_style {
     my ($state) = @_;
@@ -2866,165 +2864,48 @@ sub _spend_claude_spans {
     return (\@spans, 1);
 }
 
-sub _spend_go_spans {
-    my ($g) = @_;
-    $g = {} unless ref($g) eq 'HASH';
-    my $state = (defined($g->{state}) && $g->{state} =~ /^(?:absent|unreadable|exhausted|ok)$/) ? $g->{state} : 'absent';
-    my ($role, $key) = _spend_state_style($state);
-    my @spans = ( { text => _status_glyph($key) . ' ', role => $role } );
-    if ($state eq 'absent') {
-        push @spans, { text => 'not configured', role => 'text.muted' };
-    } elsif ($state eq 'unreadable') {
-        my $diag = (defined($g->{diagnostic}) && !ref($g->{diagnostic}) && length($g->{diagnostic})) ? $g->{diagnostic} : 'meter unreadable';
-        push @spans, { text => "unreadable -- $diag", role => 'state.crit' };
-        return (\@spans, 1);
-    } else {
-        my @parts;
-        for my $w (ref($g->{windows}) eq 'ARRAY' ? @{ $g->{windows} } : ()) {
-            next unless ref($w) eq 'HASH' && defined $w->{name} && defined $w->{text};
-            my $tag = $w->{name} eq 'weekly' ? 'Wk' : $w->{name} eq 'monthly' ? 'Mo' : '5h';
-            # Fix batch (package 06, red-team finding, latent/low): guard
-            # non-numeric $w->{fraction} before the numeric comparison --
-            # a non-numeric value would warn under `use warnings` and
-            # mis-compare instead of degrading to "not exhausted".
-            my $exhausted_here = defined($w->{fraction}) && !ref($w->{fraction})
-                && $w->{fraction} =~ /^-?\d+(?:\.\d+)?$/ && $w->{fraction} >= 1;
-            push @parts, ($exhausted_here ? "$tag $w->{text} EXHAUSTED" : "$tag $w->{text}");
-        }
-        push @spans, { text => (@parts ? join('  ', @parts) : 'no windows reported'),
-                       role => ($state eq 'exhausted' ? 'state.crit' : 'text.primary') };
-    }
-    return (\@spans, 0);
-}
-
-sub _spend_zen_spans {
-    my ($z) = @_;
-    $z = {} unless ref($z) eq 'HASH';
-    my $state = (defined($z->{state}) && $z->{state} =~ /^(?:disabled|absent|unreadable|exhausted|ok)$/) ? $z->{state} : 'disabled';
-    my ($role, $key) = _spend_state_style($state);
-    my @spans = ( { text => _status_glyph($key) . ' ', role => $role } );
-    if ($state eq 'disabled') {
-        push @spans, { text => 'disabled', role => 'text.muted' };
-    } elsif ($state eq 'absent') {
-        push @spans, { text => 'not configured', role => 'text.muted' };
-    } elsif ($state eq 'unreadable') {
-        my $diag = (defined($z->{diagnostic}) && !ref($z->{diagnostic}) && length($z->{diagnostic})) ? $z->{diagnostic} : 'meter unreadable';
-        push @spans, { text => "unreadable -- $diag", role => 'state.crit' };
-        return (\@spans, 1);
-    } else {
-        my $bal = (defined($z->{balance_text}) && !ref($z->{balance_text})) ? $z->{balance_text} : 'n/a';
-        my $bud = (defined($z->{budget_text}) && !ref($z->{budget_text})) ? " / $z->{budget_text}" : '';
-        my $pct = (defined($z->{fraction}) && !ref($z->{fraction}) && $z->{fraction} =~ /^-?\d+(?:\.\d+)?$/)
-                ? sprintf(' (%d%%)', int($z->{fraction} * 100 + 0.5)) : '';
-        my $txt = "$bal$bud$pct" . ($state eq 'exhausted' ? ' EXHAUSTED' : '');
-        push @spans, { text => $txt, role => ($state eq 'exhausted' ? 'state.crit' : 'text.primary') };
-    }
-    return (\@spans, 0);
-}
-
-# ===========================================================================
-# _providers_body(\%state, $cols) -- the Providers panel body (package
-# t01-providers-panel, criterion 2). Replaces the old _token_body/_spend_body/
-# _spend_unavailable_body trio with ONE builder that nests each provider's
-# facts under its own heading, so which provider a fact belongs to is
-# discoverable from the frame itself (the operator's actual complaint --
-# ambiguity of referent -- not merely screen economy).
-#
-# Referent clarity is mechanical (Behavior 3): a heading line carries no
-# ' : ' label-gutter and is indented LESS than the fact rows nested beneath
-# it (_HEADING_INDENT < _FACT_INDENT), so a reader (and a test) can tell a
-# heading from a fact by shape alone, never just by position.
-#
-# refresh-exp (TUI-03) has no successor row anywhere below -- it is gone, not
-# relocated. refreshed folds into access as ONE row (TUI-04): the same
-# _fmt_oauth_like/access-state text, plus the last-refreshed duration
-# appended to the SAME row when last_refreshed_age is defined -- both changes
-# land in this one builder, not as two sequential edits (criteria 3 and 4).
-#
-# The 'nearest' row (D1, criterion 5) is unchanged in wording/logic from the
-# old _spend_body :777-792 above, but is now unshifted PANEL-LEVEL, outside
-# every provider block -- it summarises a cross-provider fact, so nesting it
-# under any one provider would misattribute it (reintroducing the exact
-# ambiguity this package removes).
-# ===========================================================================
-use constant _HEADING_INDENT => 0;
-use constant _FACT_INDENT    => 2;
-
-# THE NESTING INDENT MUST NOT MOVE THE VALUE COLUMN (operator, 2026-08-25):
-#
-#     backpack      5 items, 5 pending  [b]      <- Run
-#     snapshot      fresh, 15s old, ...          <- Resources
-#       access        expires in 7h21m, ...      <- Providers, two columns out
-#
-# Every other panel puts a value at column LABEL_GUTTER + GUTTER_SEP. Providers
-# paid that in full and then added _FACT_INDENT on top, so its values -- and
-# only its values -- sat two columns right of the rest of the screen.
-#
-# The indent itself is NOT the thing to remove. It is what makes a fact's
-# referent mechanical rather than positional: a heading is indented LESS than
-# the facts beneath it (_HEADING_INDENT < _FACT_INDENT), which is the shape
-# t/79's Behavior 3 checks and which exists because the operator could not tell
-# which provider a figure belonged to. Flattening the nesting to fix the
-# alignment would trade one complaint straight back for the other.
-#
-# So the indent is spent out of the LABEL column instead of on top of it: a row
-# indented by _FACT_INDENT asks for a label column that much narrower, and lands
-# its value in the same column as everything else. The nesting is still visible
-# -- the LABELS are still indented, which is what the eye follows -- while the
-# values line up across the whole screen.
-use constant _FACT_GUTTER => LABEL_GUTTER() - _FACT_INDENT();
-
-sub _indent_line {
-    my ($n, $line) = @_;
-    return $line unless ref($line) eq 'ARRAY' && @$line;
-    return [ { text => (' ' x $n), role => 'text.primary' }, @$line ];
-}
-
-# _fact_line(\%row_spec) -> ONE indented, value-aligned Providers fact row (or
-# [] when row() suppresses it). The single place _FACT_INDENT and _FACT_GUTTER
-# are paired, so the two can never drift apart into a misalignment.
-sub _fact_line {
-    my ($spec) = @_;
-    return _indent_line(_FACT_INDENT(), row({ %$spec, gutter_width => _FACT_GUTTER() }));
-}
-
-sub _provider_heading {
-    my ($text) = @_;
-    return _indent_line(_HEADING_INDENT(), [ { text => $text, role => 'accent' } ]);
-}
-
 sub _clip_line {
     my ($line, $protect, $w) = @_;
     return $line if $protect || tui::Frame::spans_width($line) <= $w;
     return tui::Frame::fit_spans($line, $w);
 }
 
-# The three provider blocks below share one wording change from t02.
+# ===========================================================================
+# _claude_code_body(\%state, $cols) -- the Claude Code panel body: the
+# credential (access, refresh), the account, and plan usage.
 #
-# Each used to render "Claude : no snapshot" / "Go     : no snapshot" /
-# "Zen    : no snapshot" when no snapshot existed. Three problems in one
-# string, and the operator's report quoted it:
+# HISTORY, because the shape is a reduction rather than a design from scratch.
+# This was the "Providers" panel (package t01-providers-panel), which nested
+# each provider's facts under its own heading -- Claude Code, then OpenCode with
+# Go and Zen -- and set the two blocks side by side on a wide terminal. The
+# nesting existed so a reader could tell which provider a figure belonged to.
+# ccpraxis is Claude Code only now, so there is one provider, the panel title
+# names it, and a heading repeating the title would be the redundancy the
+# nesting was built to avoid. The facts therefore sit at the shared label
+# column like every other panel's, with no indent and no narrowed gutter.
 #
-#   1. It repeated the provider name that the heading immediately above it
-#      already gives, padded into a column that exists nowhere else.
-#   2. "no snapshot" describes OUR plumbing, not the account. It reads as
-#      though the provider was asked and had nothing to say. In fact nothing
-#      had asked -- claude was never fetched by anything at all, and the
-#      persisted snapshot the other two came from was in a format the reader
-#      could not parse (blueprint Decisions 10 and 12).
-#   3. It carried a colon in the VALUE, which Decision 2 rules out. (The label
-#      gutter's own colon is a separate matter and belongs to t05-no-colons.)
+# refresh-exp (TUI-03) has no successor row -- it is gone, not relocated.
+# refreshed folds into access as ONE row (TUI-04): the access-state text plus
+# the last-refreshed duration, when last_refreshed_age is defined.
 #
-# "not collected yet" says the true thing -- nothing has been gathered for this
-# provider -- and the panel-level sentence below says WHY, once, instead of
-# three times. The row is kept rather than dropped so the panel's height does
-# not change when figures arrive.
-sub _claude_code_block {
-    my ($tokens, $claude_spend, $spend_present, $w, $oauth_fallback) = @_;
-    my $t = (ref($tokens) eq 'HASH') ? $tokens : {};
-    my @lines = ( _provider_heading('Claude Code') );
+# "not collected yet" (t02). The usage row used to render "Claude : no
+# snapshot" when no snapshot existed: it repeated the provider name, described
+# our plumbing rather than the account, and carried a colon in the VALUE
+# (Decision 2). "not collected yet" says the true thing, and the panel-level
+# sentence at the end says WHY, once. The row is kept rather than dropped so the
+# panel's height does not change when figures arrive.
+# ===========================================================================
+sub _claude_code_body {
+    my ($state, $cols) = @_;
+    $state = {} unless ref($state) eq 'HASH';
+    my $w = (defined($cols) && !ref($cols) && $cols =~ /^\d+(?:\.\d+)?$/ && $cols > 0) ? int($cols) : 80;
+    my $spend = (ref($state->{spend}) eq 'HASH') ? $state->{spend} : undef;
+    my $t = (ref($state->{tokens}) eq 'HASH') ? $state->{tokens} : {};
+    my $oauth_fallback = $state->{oauth_remaining};
 
-    # THE OAUTH EXPIRY LIVES HERE NOW, not in a separate Run row.
+    my @lines;
+
+    # THE OAUTH EXPIRY LIVES HERE, not in a separate Run row.
     #
     # Run carried an 'oauth' row rendered ONLY when $state->{tokens} was absent
     # -- a fallback from before this panel existed, using this very formatter
@@ -3035,7 +2916,7 @@ sub _claude_code_block {
     #
     # So the fallback feeds the row that already exists. When the token facts
     # are present nothing changes; when they are not, this row shows the raw
-    # credential expiry instead of Run growing a row about a provider.
+    # credential expiry instead of Run growing a row about the credential.
     my $access_state = defined($t->{access_state}) ? $t->{access_state} : 'absent';
     my $sec = ($access_state eq 'absent') ? undef : $t->{access_seconds_left};
     $sec = $oauth_fallback
@@ -3044,7 +2925,7 @@ sub _claude_code_block {
     if (defined $t->{last_refreshed_age}) {
         push @access_spans, { text => ', refreshed ' . fmt_duration($t->{last_refreshed_age}) . ' ago', role => 'text.primary' };
     }
-    my $access_row = _fact_line({ label => 'access', value => \@access_spans, force => 1 });
+    my $access_row = row({ label => 'access', value => \@access_spans, force => 1 });
     push @lines, $access_row if @$access_row;
 
     my @refresh_spans;
@@ -3054,7 +2935,7 @@ sub _claude_code_block {
     } else {
         @refresh_spans = ( { text => 'absent', role => 'state.crit' } );
     }
-    my $refresh_row = _fact_line({ label => 'refresh', value => \@refresh_spans, force => 1 });
+    my $refresh_row = row({ label => 'refresh', value => \@refresh_spans, force => 1 });
     push @lines, $refresh_row if @$refresh_row;
 
     my @present;
@@ -3062,207 +2943,20 @@ sub _claude_code_block {
         push @present, $t->{$k} if defined($t->{$k}) && !ref($t->{$k}) && length($t->{$k});
     }
     if (@present) {
-        my $acc_row = _fact_line({ label => 'account', value => [ { text => join(' / ', @present), role => 'text.primary' } ] });
+        my $acc_row = row({ label => 'account', value => [ { text => join(' / ', @present), role => 'text.primary' } ] });
         push @lines, $acc_row if @$acc_row;
     }
 
-    push @lines, _spend_fact_row('usage', \&_spend_claude_spans, $claude_spend, $spend_present, $w);
-
-    return \@lines;
-}
-
-# _spend_fact_row($label, $builder, $data, $present, $w) -> ONE indented,
-# label-gutter-aligned line.
-#
-# THE ALIGNMENT BUG THIS FIXES. The spend line was the only row in the panel
-# that did not use the shared label gutter. access/refresh/account are built
-# with row(), which pads to LABEL_GUTTER; the spend line was built by hand as
-# glyph + pad_label('Claude', 6) + value, a narrower ad-hoc column. So the
-# operator saw
-#
-#     account       max / default_claude_max_20x
-#     x Claude   unreadable -- usage endpoint unreadable
-#
-# with the two values starting in different places. The provider name in that
-# row was redundant anyway -- the heading directly above it already says
-# "Claude Code" -- and the comment above _claude_code_block has said since t02
-# that it "repeated the provider name that the heading immediately above it
-# already gives, padded into a column that exists nowhere else". It was removed
-# from the wording and left in the layout.
-#
-# Now every row in the panel goes through row(), so there is ONE column, and
-# the status glyph leads the VALUE rather than the line -- which also stops the
-# glyph from shifting the text after it by a variable amount.
-sub _spend_fact_row {
-    my ($label, $builder, $data, $present, $w) = @_;
-    my @value;
-    if ($present) {
-        my ($spans, $protect) = $builder->($data);
-        @value = @$spans;
-        # Clipping happens BEFORE the indent, so it must build the row itself
-        # rather than go through _fact_line -- the gutter width is still the
-        # nested one, which is the whole point of the pairing.
-        my $line = row({ label => $label, value => \@value, gutter_width => _FACT_GUTTER() });
-        return _indent_line(_FACT_INDENT(), _clip_line($line, $protect, $w));
-    }
-    @value = ( { text => _status_glyph('warn') . ' ', role => 'state.warn' },
-               { text => 'not collected yet', role => 'text.muted' } );
-    return _fact_line({ label => $label, value => \@value });
-}
-
-# ONE "OpenCode" GROUP, with Go and Zen as facts inside it.
-#
-# They were two top-level provider blocks -- "OpenCode Go" and "OpenCode Zen" --
-# each with a heading and one fact beneath it, four lines to say two things, and
-# both headings repeating the word the reader already read. They are two
-# products of one provider, so they nest under it: the shared word is said once,
-# the two facts align with each other and with everything else in the panel, and
-# the panel gets two rows of its height back.
-sub _opencode_block {
-    my ($go_spend, $zen_spend, $spend_present, $w) = @_;
-    return [
-        _provider_heading('OpenCode'),
-        _spend_fact_row('Go',  \&_spend_go_spans,  $go_spend,  $spend_present, $w),
-        _spend_fact_row('Zen', \&_spend_zen_spans, $zen_spend, $spend_present, $w),
-    ];
-}
-
-# _PROVIDER_GAP -- the gutter between the two provider blocks. Two columns: one
-# is too tight to read as a separation, three wastes width the blocks want.
-use constant _PROVIDER_GAP => 2;
-
-# _PROVIDER_MIN_COLS -- the width ONE provider block needs before the two can be
-# placed side by side.
-#
-# MEASURED, and the first version was badly wrong. It gated on
-# tui::Meter::min_width() (75), which is the width a RESOURCES GAUGE ROW needs
-# -- a label, a ten-cell bar, a percent and a used/free/total triple. A provider
-# block has none of those. Measured at a generous width, the Claude Code block's
-# widest line is 55 columns and OpenCode's is 30.
-#
-# The wrong gate demanded a 152-column panel for a pairing that fits in 112, so
-# Providers rendered STACKED at every realistic terminal size -- eight rows
-# where four would do. That was the direct cause of Blueprints being dropped
-# entirely on a 24-row terminal: the rows Providers did not need were the rows
-# Blueprints did.
-#
-# 56, not 55: one column of slack so the wider block is not flush against the
-# gutter.
-use constant _PROVIDER_MIN_COLS => 56;
-
-# _side_by_side(\@left, \@right, $lw, $rw) -> \@lines -- two blocks of spans
-# joined into one column of rows, each side fitted to its own width.
-#
-# The lists are almost never the same length, so the shorter one is padded with
-# blank rows rather than the join stopping early -- stopping early would silently
-# DROP the longer provider's tail, which is a data loss that looks like a layout
-# choice.
-#
-# Fitting is delegated to tui::Frame::fit_spans, which both pads and clips to an
-# exact width. Doing it by hand would mean re-deriving display widths that
-# already have one implementation, and getting that wrong is how a row ends up
-# one column too long and wraps the whole panel.
-# _block_width(\@lines) -> the widest rendered line in a block of span rows.
-# The natural width of a column, so two columns can be sized to their content.
-sub _block_width {
-    my ($lines) = @_;
-    return 0 if ref($lines) ne 'ARRAY';
-    my $max = 0;
-    for my $l (@$lines) {
-        next if ref($l) ne 'ARRAY';
-        my $w = tui::Frame::spans_width($l);
-        $max = $w if $w > $max;
-    }
-    return $max;
-}
-
-sub _side_by_side {
-    my ($left, $right, $lw, $rw) = @_;
-    $left  = [] if ref($left)  ne 'ARRAY';
-    $right = [] if ref($right) ne 'ARRAY';
-    my $n = (@$left > @$right) ? scalar(@$left) : scalar(@$right);
-    my @out;
-    for my $i (0 .. $n - 1) {
-        my @row;
-        push @row, @{ tui::Frame::fit_spans($left->[$i]  || [], $lw, 'text.primary') };
-        push @row, { text => ' ' x _PROVIDER_GAP(), role => 'text.primary' };
-        push @row, @{ tui::Frame::fit_spans($right->[$i] || [], $rw, 'text.primary') };
-        push @out, \@row;
-    }
-    return \@out;
-}
-
-sub _providers_body {
-    my ($state, $cols) = @_;
-    $state = {} unless ref($state) eq 'HASH';
-    my $w = (defined($cols) && !ref($cols) && $cols =~ /^\d+(?:\.\d+)?$/ && $cols > 0) ? int($cols) : 80;
-    my $spend = (ref($state->{spend}) eq 'HASH') ? $state->{spend} : undef;
-
-    my @lines;
-
-    # THE 'nearest' ROW IS GONE (operator request, 2026-08-25).
-    #
-    # It named the provider/window closest to exhaustion and its percentage --
-    # every part of which the per-provider rows immediately below already say,
-    # in the same panel, usually two lines down. A summary row sitting directly
-    # above the thing it summarises is not a summary, it is a repetition, and
-    # it cost a row of the tallest panel on the screen.
-    #
-    # It was also the most visible casualty of the utilization bug fixed in
-    # SpendPanel this same commit: claude's fraction was stored as 0..100 while
-    # every other provider's is 0..1, so the "nearest exhaustion" sort ranked
-    # claude first unconditionally. The row was reporting a ranking that could
-    # not have been anything else.
-    #
-    # $spend->{priority} is still computed and is now correct; nothing else
-    # consumed this row, so only the rendering goes.
-
-    # THE TWO PROVIDERS SIT SIDE BY SIDE (operator, 2026-08-27: "On Providers,
-    # put Claude Code and OpenCode side by side instead of one under the
-    # other"). They are peers -- two accounts, the same kinds of fact -- so
-    # stacking them made the panel twice as tall as it needed to be and implied
-    # a precedence that does not exist.
-    #
-    # Each block is composed at its OWN half-width, not at $w, or a block would
-    # lay itself out for a panel twice as wide as the space it is about to be
-    # fitted into. Below the two-column breakpoint they stay stacked: two
-    # half-columns of a narrow panel is worse than a tall panel.
-    my $half = int(($w - _PROVIDER_GAP()) / 2);
-    if ($half >= _PROVIDER_MIN_COLS()) {
-        my $cc = _claude_code_block($state->{tokens}, $spend ? $spend->{claude} : undef,
-                                    $spend ? 1 : 0, $half, $state->{oauth_remaining});
-        my $oc = _opencode_block($spend ? $spend->{go}  : undef,
-                                 $spend ? $spend->{zen} : undef,
-                                 $spend ? 1 : 0, $half);
-
-        # COLUMNS ARE SIZED TO THEIR CONTENT, NOT TO HALF THE PANEL.
-        #
-        # Splitting 50/50 put OpenCode at the panel's midpoint however wide the
-        # panel got: on a 170-column Providers panel, Claude Code's ~55 columns
-        # of content sat next to thirty columns of nothing, and OpenCode began
-        # at column 85. The operator's words: "the OpenCode one is all the way
-        # to the right... it looks ugly."
-        #
-        # Two adjacent columns, each as wide as it needs to be, with a fixed
-        # gutter, is what makes them read as a pair. The panel's leftover width
-        # stays empty on the RIGHT, where empty space is unremarkable, instead
-        # of being inserted between two things that belong together.
-        my $lw = _block_width($cc);
-        my $rw = _block_width($oc);
-        # Never wider than the panel: if content genuinely needs more than there
-        # is, fall back to sharing what exists rather than overflowing.
-        if ($lw + _PROVIDER_GAP() + $rw > $w) {
-            $lw = $half;
-            $rw = $w - $half - _PROVIDER_GAP();
-        }
-        push @lines, @{ _side_by_side($cc, $oc, $lw, $rw) };
-    }
-    else {
-        push @lines, @{ _claude_code_block($state->{tokens}, $spend ? $spend->{claude} : undef,
-                                           $spend ? 1 : 0, $w, $state->{oauth_remaining}) };
-        push @lines, @{ _opencode_block($spend ? $spend->{go}  : undef,
-                                        $spend ? $spend->{zen} : undef,
-                                        $spend ? 1 : 0, $w) };
+    # usage: the status glyph leads the VALUE, not the line, so it cannot shift
+    # the text after it by a variable amount, and the value starts in the same
+    # column as every other row's.
+    if ($spend) {
+        my ($spans, $protect) = _spend_claude_spans($spend->{claude});
+        push @lines, _clip_line(row({ label => 'usage', value => $spans }), $protect, $w);
+    } else {
+        push @lines, row({ label => 'usage', value => [
+            { text => _status_glyph('warn') . ' ', role => 'state.warn' },
+            { text => 'not collected yet', role => 'text.muted' } ] });
     }
 
     # (t11's hot-reload rows are a BANNER, not a panel row -- see
@@ -3274,18 +2968,14 @@ sub _providers_body {
     # This used to read "a run is active but has not written runs/spend.json
     # yet" or "no active run to report spend for" -- and the operator's report
     # quoted the second one. Both named a RUN as the missing thing. Under
-    # blueprint Decision 11 that is the wrong absence: every figure here (go's
-    # windows, zen's balance, claude's utilizations) describes the ACCOUNT, and
-    # a snapshot is now written whether or not a fleet run exists. So "no
-    # active run" stopped being a reason and became a non sequitur -- accurate,
-    # and useless, which is exactly what the operator said about it.
+    # blueprint Decision 11 that is the wrong absence: the usage figures
+    # describe the ACCOUNT, and a snapshot is written whether or not a fleet run
+    # exists. What replaces it is the sampler's own state, in the same
+    # vocabulary t01 established for the resources panel next door.
     #
-    # What replaces it is the sampler's own state, in the same vocabulary t01
-    # established for the resources panel next door.
     # PUSHED ONLY WHEN IT HAS SOMETHING TO SAY. spend_wait_spans returns an
     # empty list for the ordinary "still collecting" case (see its header), and
-    # pushing that would put a blank row where the sentence used to be -- which
-    # costs exactly what removing the sentence was meant to save.
+    # pushing that would put a blank row where the sentence used to be.
     unless ($spend) {
         my $wait = spend_wait_spans($state->{spend_sampler});
         push @lines, $wait if ref($wait) eq 'ARRAY' && @$wait;
@@ -3297,8 +2987,9 @@ sub _providers_body {
 # ===========================================================================
 # panels(\%state, $cols) -- the panel set (spec S2.4.3, criteria 2 and 6).
 # The Sandbox panel is dissolved: project/container reach the header,
-# oauth reaches Providers' Claude Code block when tokens are present or Run
-# when absent (never both, never neither), heartbeat/uptime move to Run.
+# oauth reaches the Claude Code panel's access row whether or not token facts
+# are present (Run's fallback oauth row is gone -- see _run_body), and
+# heartbeat/uptime move to Run.
 #
 # BLUEPRINTS IS ALWAYS PRESENT, a sibling of Run (package t01-providers-panel,
 # criterion 6/D4) -- the blueprint-run list used to live inside Run's own
@@ -3315,10 +3006,11 @@ sub panels {
     # consecutive panels into bands, so the order here IS the arrangement:
     #
     #     Run | Resources          -- paired, side by side
-    #     Providers                -- full width
+    #     Claude Code              -- full width
     #     Blueprints               -- full width, and takes the leftover height
     #
-    # Blueprints moved out from directly under Run to below Providers, and
+    # Blueprints moved out from directly under Run to below Claude Code (then
+    # named Providers), and
     # Resources moved up to sit beside Run.
     # Run declares a minimum too, and it has to. Now that a band can be split
     # UNEVENLY to satisfy a neighbour's min_cols, a panel that declares nothing
@@ -3357,23 +3049,21 @@ sub panels {
                      min_cols => tui::Meter::min_width() };
     }
 
-    # PROVIDERS IS ALWAYS PRESENT (renamed from Spend, package
-    # t01-providers-panel, criterion 1). It used to be omitted whenever no
-    # snapshot had been read, which is ALWAYS -- the fleet writes its spend
-    # figures to its own log and returns them in-process, and has never
-    # persisted the runs/spend.json this reads. So a panel the operator relied
-    # on had silently not existed for the life of the feature, and its
-    # absence was indistinguishable from "this launch has no runs".
+    # CLAUDE CODE IS ALWAYS PRESENT (was Spend, then Providers -- package
+    # t01-providers-panel, criterion 1 -- and named for its one provider once
+    # ccpraxis became Claude Code only). It used to be omitted whenever no
+    # snapshot had been read, so a panel the operator relied on had silently
+    # not existed for the life of the feature, and its absence was
+    # indistinguishable from "this launch has no runs".
     #
     # Absent-vs-empty was a real decision (never fabricate a zero) and it is
-    # kept: what changes is that "we have no figures" is now SAID, in the panel,
-    # instead of being expressed by the panel not being there. A missing panel
-    # is not an honest absence -- it is no statement at all.
+    # kept: "we have no figures" is SAID, in the panel, instead of being
+    # expressed by the panel not being there. A missing panel is not an honest
+    # absence -- it is no statement at all.
     #
-    # It also now carries Claude Code's token facts (Token panel merged in,
-    # criterion 2) nested under their own heading, alongside the OpenCode
-    # Go/Zen spend facts each under theirs -- see _providers_body.
-    push @out, { title => 'Providers', lines => _providers_body($state, $cols),
+    # It carries the token facts too (Token panel merged in, criterion 2) --
+    # see _claude_code_body.
+    push @out, { title => 'Claude Code', lines => _claude_code_body($state, $cols),
                  min_cols => tui::Meter::min_width(), full_width => 1 };
 
     # BLUEPRINTS IS FULL WIDTH AND CARRIES THE FLEX (operator, 2026-08-27: "Move
@@ -3789,7 +3479,8 @@ sub screen {
     # width to make a layout decision made that decision for a region wider than
     # the one it lands in.
     #
-    # Providers made it visible and the preview harness is what showed it: at a
+    # The Providers panel (now Claude Code) made it visible and the preview
+    # harness is what showed it: at a
     # 200-column terminal it split its two provider blocks to fit a 200-wide
     # panel, was rendered into 134, and every joined row overflowed and wrapped
     # -- turning a clean two-column panel into interleaved fragments. Composing

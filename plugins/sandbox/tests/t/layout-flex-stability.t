@@ -172,8 +172,8 @@ sub blank_tail {
 # and writes its first snapshot seconds later. While its key was undef the panel
 # did not exist at all, so it materialised mid-session and pushed everything
 # after it down -- a scheduled reflow a few seconds into every launch. Same for
-# Providers (t01-providers-panel's successor to Spend, whose snapshot is never
-# written at all today), and for Blueprints (t01's new sibling panel for the
+# the Claude Code panel (successor to Spend, then Providers, whose snapshot
+# may not have been written yet), and for Blueprints (t01's new sibling panel for the
 # blueprint-run list, unconditional for the identical reason -- D4).
 #
 # RETARGETED (package t01-providers-panel, spec §6): the panel title `Spend`
@@ -183,12 +183,15 @@ sub blank_tail {
 # correction) closing the gap this package opens: it is now equally
 # unconditional (D4) and this is exactly the oracle that would catch a
 # future regression reintroducing a conditional panel.
+#
+# RETARGETED AGAIN: `Providers` became `Claude Code` when ccpraxis became Claude
+# Code only. The claim is unchanged.
 # ============================================================================
 {
     my $g_absent = geometry(Dashboard::compose_frame(state(), 40, 110));
     like($g_absent, qr/Resources/,  'the Resources panel exists BEFORE the sampler has written anything');
-    like($g_absent, qr/Providers/,  'the Providers panel exists even though no spend snapshot is ever written today');
-    like($g_absent, qr/Blueprints/, 'the Blueprints panel exists even with zero blueprint runs (D4: unconditional like Resources/Providers)');
+    like($g_absent, qr/Claude Code/, 'the Claude Code panel exists even before any spend snapshot is read');
+    like($g_absent, qr/Blueprints/, 'the Blueprints panel exists even with zero blueprint runs (D4: unconditional like Resources/Claude Code)');
 
     my $f = Dashboard::compose_frame(state(), 40, 110);
     my $txt = join("\n", map { plain($_) } @$f);
@@ -209,7 +212,7 @@ sub blank_tail {
     # have. The alternation is deliberately narrow rather than a bare /./, so a
     # panel that silently stopped saying anything cannot pass it.
     like($txt, qr/not collected yet|collecting - no figures yet|FAILED - spend sampler|STALLED - spend sampler/,
-        'and Providers states the absence rather than expressing it by being missing (D6 footnote preserved; wording replaced by t02)');
+        'and Claude Code states the absence rather than expressing it by being missing (D6 footnote preserved; wording replaced by t02)');
     unlike($txt, qr/\b0\.0\b|\b0%/,
         'neither fabricates a zero -- absent-vs-empty is preserved, only how it is communicated changed');
 }

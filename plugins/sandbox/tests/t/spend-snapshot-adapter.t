@@ -14,6 +14,10 @@
 # true for the fleet path too, which is why "spend has never been persisted"
 # was an incomplete diagnosis: persistence alone would not have worked.
 #
+# The snapshot carried OpenCode Go and Zen rows too until ccpraxis became
+# Claude Code only. Their figures are gone from these fixtures; what remains
+# about them is that a leftover snapshot's go/zen rows are dropped.
+#
 # Conventions honoured from this suite (t/44's header states them):
 #   * launcher.pl is NEVER require'd -- source-text slurp + regex only, plus
 #     `perl -c` in a subprocess. PART 3's assertions are therefore WEAKER than
@@ -45,8 +49,18 @@ ok(length($LSRC) > 0, 'launcher.pl was read as source text');
 my $WRITER_FORMAT = {
     generated_at => '2026-08-17T20:53:20Z',
     results      => [
-        { provider => 'go',     status => 'ok', five_hour => { used => 42,  limit => 100 },
-                                                weekly    => { used => 300, limit => 1000 } },
+        { provider => 'claude', status => 'ok', five_hour => { utilization => 0.42 },
+                                                seven_day => { utilization => 0.9 } },
+    ],
+};
+
+# A snapshot written before the OpenCode providers were removed: go and zen
+# rows beside claude's. Such files still exist on disk (a run directory, or a
+# global copy younger than the cadence floor), so the reader must cope.
+my $LEGACY_FORMAT = {
+    generated_at => '2026-08-17T20:53:20Z',
+    results      => [
+        { provider => 'go',     status => 'ok', five_hour => { used => 42,  limit => 100 } },
         { provider => 'zen',    status => 'ok', balance => '12.34', budget => '50.00' },
         { provider => 'claude', status => 'ok', five_hour => { utilization => 0.42 },
                                                 seven_day => { utilization => 0.9 } },
@@ -54,11 +68,8 @@ my $WRITER_FORMAT = {
 };
 
 # ===========================================================================
-# PART 1 -- SpendPanel::from_snapshot: the translation that was designed and
-# never built. SpendPanel.pm's own header already names the intended composer
-# ("composed by launcher.pl from BpSpend::fetch() for go/zen, and from
-# bp-usage-gate.pl's own $parsed for claude"), so this is the missing piece of
-# a stated design, not a new one.
+# PART 1 -- SpendPanel::from_snapshot: the translation between the writer's
+# array and the keyed shape status() indexes.
 # ===========================================================================
 my $HAS_ADAPTER = $SP_OK && SpendPanel->can('from_snapshot') ? 1 : 0;
 ok($HAS_ADAPTER, 'SpendPanel::from_snapshot exists');
@@ -69,61 +80,52 @@ ok($HAS_ADAPTER, 'SpendPanel::from_snapshot exists');
 # tell a reader WHAT is wrong -- never runs. A red file should still say
 # everything it knows.
 SKIP: {
-    skip 'SpendPanel::from_snapshot is not implemented', 15 unless $HAS_ADAPTER;
+    skip 'SpendPanel::from_snapshot is not implemented', 10 unless $HAS_ADAPTER;
 
     my $spend = eval { SpendPanel::from_snapshot($WRITER_FORMAT) };
     is(ref($spend), 'HASH', 'AC1: from_snapshot returns a hash for a writer-format snapshot')
         or diag("  died: $@");
 
     SKIP: {
-        skip 'no hash returned', 5 unless ref($spend) eq 'HASH';
-        is(ref($spend->{go}),  'HASH', 'AC1: go is reachable by KEY, which is what status() indexes');
-        is(ref($spend->{zen}), 'HASH', 'AC1: zen is reachable by key');
-        is($spend->{go}{five_hour}{used},  42,      'AC1: go figures survive the translation intact');
-        is($spend->{zen}{balance},         '12.34', 'AC1: zen figures survive the translation intact');
+        skip 'no hash returned', 2 unless ref($spend) eq 'HASH';
+        is(ref($spend->{claude}), 'HASH', 'AC1: claude is reachable by KEY, which is what status() indexes');
         is($spend->{claude}{five_hour}{utilization}, 0.42, 'AC1: claude utilizations survive the translation intact');
     }
 
     # THE END-TO-END PROOF, and the assertion this whole package turns on.
-    # Before the adapter these same figures produced go=absent, zen=disabled,
-    # claude=unreadable -- verified from disk, and indistinguishable from
-    # "nothing was ever fetched".
+    # Before the adapter these same figures produced claude=unreadable --
+    # verified from disk, and indistinguishable from "nothing was ever fetched".
     my $info = eval { SpendPanel::status(SpendPanel::from_snapshot($WRITER_FORMAT), 1787000000) };
     SKIP: {
-        skip 'status() did not return', 3 unless ref($info) eq 'HASH';
-        is($info->{go}{state},     'ok', 'AC1: real go figures render as ok, not absent');
-        is($info->{zen}{state},    'ok', 'AC1: real zen figures render as ok, not disabled');
+        skip 'status() did not return', 1 unless ref($info) eq 'HASH';
         is($info->{claude}{state}, 'ok', 'AC1: real claude figures render as ok, not unreadable');
     }
 
-    # AC2 -- an unrecognised provider is DROPPED, never guessed at. A snapshot
-    # written by a newer bp-spend.pl must not be able to inject a key here.
+    # AC2 -- an unrecognised provider is DROPPED, never guessed at. go and zen
+    # are now unrecognised too: a legacy snapshot's rows must not reach status().
     my $odd = SpendPanel::from_snapshot({ results => [
-        { provider => 'go', status => 'ok' },
+        { provider => 'claude', status => 'ok' },
         { provider => 'gemini', status => 'ok' },
         { status => 'ok' },                       # no provider at all
     ] });
     ok(!exists $odd->{gemini}, 'AC2: an unrecognised provider is dropped rather than carried through');
-    is(scalar(grep { $_ ne 'zen_enabled' } keys %$odd), 1,
+    is_deeply([ sort keys %$odd ], ['claude'],
         'AC2: only the recognised provider survives -- a result with no provider adds nothing');
 
-    # AC3 -- a provider ABSENT from results must be ABSENT from the output.
+    my $legacy = SpendPanel::from_snapshot($LEGACY_FORMAT);
+    is_deeply([ sort keys %$legacy ], ['claude'],
+        'AC2: a legacy snapshot\'s go and zen rows are dropped, claude kept');
+    my $legacy_info = SpendPanel::status($legacy, 1787000000);
+    is_deeply([ sort keys %$legacy_info ], [qw(claude priority)],
+        'AC2: and status() of it describes claude only -- no go/zen entries for a renderer to show');
+
+    # AC3 -- claude ABSENT from results must be ABSENT from the output.
     # Materialising it as {} would be a different statement: status() reads a
     # missing key and a present-but-empty hash differently, and an empty hash
     # says "we looked and found nothing" where undef says "we never looked".
     my $partial = SpendPanel::from_snapshot({ results => [ { provider => 'go', status => 'ok' } ] });
-    ok(!exists $partial->{zen},    'AC3: a provider missing from results is not materialised as an empty hash');
-    ok(!exists $partial->{claude}, 'AC3: the same for claude');
-
-    # AC4 -- zen_enabled. This key never appears in the persisted format, and
-    # defaulting it to 0 renders a successfully-fetched zen as `disabled`,
-    # which is exactly the wrong word for "we have figures".
-    is(SpendPanel::from_snapshot({ results => [ { provider => 'zen', status => 'ok' } ] })->{zen_enabled}, 1,
-        'AC4: a non-absent zen result enables the zen meter');
-    is(SpendPanel::from_snapshot({ results => [ { provider => 'zen', status => 'absent' } ] })->{zen_enabled}, 0,
-        'AC4: an absent zen result leaves it disabled');
-    is(SpendPanel::from_snapshot({ results => [] })->{zen_enabled}, 0,
-        'AC4: no zen result at all leaves it disabled');
+    ok(!exists $partial->{claude}, 'AC3: a provider missing from results is not materialised as an empty hash');
+    is(scalar(keys %$partial), 0, 'AC3: and nothing else is materialised in its place');
 }
 
 # ===========================================================================
@@ -156,6 +158,14 @@ like($LSRC, qr/SpendPanel::from_snapshot/,
     'AC10 (source-text): _gather_spend translates the persisted snapshot instead of passing it straight to status()');
 like($LSRC, qr/_spend_global_snapshot|global_dir|spend_sampler/,
     'AC11 (source-text): a run-independent spend path exists, so the panel is not empty whenever no fleet run is active');
+{
+    my ($gather) = $LSRC =~ /\nsub _gather_spend \{(.*?)\n\}\n/s;
+    ok(defined $gather, 'AC11b setup (source-text): _gather_spend\'s body was found');
+    like($gather // '', qr/\$SPEND_GLOBAL_DIR\/spend\.json/,
+        'AC11b (source-text): _gather_spend reads the global snapshot');
+    unlike($gather // '', qr/runs_dir\}\/spend\.json/,
+        'AC11b (source-text): and never a run directory\'s spend.json -- that copy only ever carried go/zen, so preferring it blanked claude for the length of every run');
+}
 like($LSRC, qr/spend_sampler_forked/,
     'AC12 (source-text): the spend sampler fork event is named for what a fork establishes -- a process exists');
 unlike($LSRC, qr/log_ev\(\s*'spend_sampler_started'/,

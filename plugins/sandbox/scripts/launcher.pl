@@ -54,7 +54,7 @@ use Dashboard ();   # B2: the raw-ANSI TUI dashboard framework
 use WtProfile ();   # sandbox-wt-profile/02: [c]-press profile fragment ensure + name
 use HostTz ();      # sandbox-session-ux/01: host-timezone detection for the session exec
 use TokenInfo ();   # s08: pure access/refresh token status struct for the dashboard
-use SpendPanel ();  # b37: pure Claude/Go/Zen spend status struct for the dashboard
+use SpendPanel ();  # b37: pure Claude spend status struct for the dashboard
                     # (the LAUNCHER loads it and computes; Dashboard.pm renders the
                     # already-computed struct and must never load it — same split
                     # TokenInfo has, and t/spend-panel asserts both halves)

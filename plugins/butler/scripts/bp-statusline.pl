@@ -3,7 +3,7 @@
 # Claude Code's statusline. A plain filter script (stdin JSON -> stdout
 # bytes, one line), following the same convention as this repo's existing
 # scripts/statusline.pl (stdin JSON in, rendered bytes out), but this is a
-# NEW, DIFFERENT file: it renders b36/b37's spend struct, not context/plan
+# NEW, DIFFERENT file: it renders b37's spend struct, not context/plan
 # usage.
 #
 # Input (stdin, JSON): { spend => \%spend, now => N, width => N }
@@ -140,8 +140,8 @@ if (@$priority && ref($priority->[0]) eq 'HASH') {
     push @spans, { text => encode('UTF-8', "$provider/$window $pct "), role => 'accent' };
 }
 
-# 2. One glyph+letter per provider, in declared order.
-for my $spec ([ 'claude', 'C' ], [ 'go', 'G' ], [ 'zen', 'Z' ]) {
+# 2. One glyph+letter for the provider (claude; the OpenCode go/zen pair is gone).
+for my $spec ([ 'claude', 'C' ]) {
     my ($key, $abbr) = @$spec;
     my $sub = (ref($info->{$key}) eq 'HASH') ? $info->{$key} : {};
     my $state = (defined $sub->{state} && !ref $sub->{state}) ? $sub->{state} : 'absent';

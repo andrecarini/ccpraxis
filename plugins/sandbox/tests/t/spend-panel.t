@@ -13,7 +13,7 @@
 # never a raw Perl exception escaping this file.
 #
 # INVENTED CONTRACT (the test-writer's job, same discipline
-# t/multi-provider-spend.t applied to bp-spend.pl before it existed). The
+# the since-retired t/multi-provider-spend.t applied to bp-spend.pl). The
 # spec pins the PURITY rules, the STATES, and the ACCEPTANCE CRITERIA, but not
 # exact sub names/signatures for a brand new module -- so this oracle invents
 # a minimal, TokenInfo.pm-shaped contract and documents it here so implementer
@@ -23,13 +23,12 @@
 #
 #     SpendPanel::status(\%spend, $now) -> \%info
 #
-#     \%spend (the input, composed by launcher.pl from BpSpend::fetch() for
-#     go/zen -- spec S0 -- and from bp-usage-gate.pl's own $parsed for claude,
-#     which the spec S2 names as a third meter this panel must show even
-#     though b36 does not produce it):
+#     \%spend (the input, SpendPanel::from_snapshot's output over the snapshot
+#     bp-spend.pl writes from bp-usage-gate.pl's reading):
 #       claude => { status => 'ok'|'unknown',
 #                   five_hour => { utilization => 0..100 } | undef,
 #                   seven_day => { utilization => 0..100 } | undef,
+#                   diagnostic => $str | undef }
 #
 # UTILIZATION IS AN INTEGER PERCENT, NOT A FRACTION. This header declared
 # 0..1 and every fixture below followed it, which is exactly why SpendPanel
@@ -40,38 +39,24 @@
 # bp-orchestrator compares it directly against ceilings of 85 and 90 -- values
 # a 0..1 fraction could never reach. The operator's live screen showed 2500%
 # and 1800%, i.e. 25 and 18.
-#                   diagnostic => $str | undef }
-#       go     => { status => 'ok'|'unknown'|'absent',
-#                   five_hour|weekly|monthly => { used => N, limit => N } | undef,
-#                   diagnostic => $str | undef }
-#       zen    => { status => 'ok'|'unknown'|'absent',
-#                   balance => N | undef, budget => N | undef,
-#                   diagnostic => $str | undef }
-#       zen_enabled => 0 | 1   -- operator toggle, independent of zen.status
 #
 #     \%info (the output, render-ready but NOT yet spans -- exactly the
 #     TokenInfo::status()/Dashboard::_token_lines split the spec S1 mandates):
 #       claude => { state => 'ok'|'unreadable',
 #                   windows => [ { name=>'five_hour'|'seven_day', fraction=>N, text=>STR }, ... ] }
-#       go     => { state => 'absent'|'unreadable'|'exhausted'|'ok',
-#                   windows => [ { name=>'five_hour'|'weekly'|'monthly', used=>N, limit=>N,
-#                                  fraction=>N, text=>'$N.NN / $N.NN' }, ... ],
-#                   diagnostic => $str | undef }
-#       zen    => { state => 'disabled'|'absent'|'unreadable'|'exhausted'|'ok',
-#                   balance_text => STR|undef, budget_text => STR|undef,
-#                   fraction => N|undef, diagnostic => $str|undef }
-#       priority => [ { provider=>'claude'|'go'|'zen', window=>NAME, fraction=>N }, ... ]
-#                   -- every window with a defined fraction and state 'ok',
-#                   stable-sorted by fraction DESCENDING (nearest exhaustion
-#                   first); ties keep NATURAL declared order: claude/five_hour,
-#                   claude/seven_day, go/five_hour, go/weekly, go/monthly,
-#                   zen/balance. This is what makes C6 assertable: "nearest
-#                   exhaustion first" needs a concrete, sortable field, and
-#                   "the natural order when nothing is tight" needs a concrete
-#                   tie-break, or C6's paired gate cannot be told apart from
-#                   an implementation that just always emits the same order.
-#     'exhausted' is DERIVED here (spec S0.1): status eq 'ok' AND some window's
-#     fraction >= 1.0. Never a b36 status.
+#       priority => [ { provider=>'claude', window=>NAME, fraction=>N }, ... ]
+#                   -- every window with a defined fraction, stable-sorted by
+#                   fraction DESCENDING (nearest exhaustion first); ties keep
+#                   the declared order five_hour, seven_day. This is what makes
+#                   C6 assertable: "nearest exhaustion first" needs a concrete,
+#                   sortable field, and "the natural order when nothing is
+#                   tight" needs a concrete tie-break, or C6's paired gate
+#                   cannot be told apart from an implementation that just
+#                   always emits the same order.
+#
+# The contract also covered OpenCode Go and Zen (money windows, a balance, a
+# derived 'exhausted' state, a zen_enabled toggle). Those providers were
+# removed when ccpraxis became Claude Code only, and their assertions with them.
 #
 #   package Dashboard (plugins/sandbox/scripts/Dashboard.pm), spend wiring:
 #     Dashboard::_spend_lines(\%info, $cols) -> \@lines   (array of span-lines,
@@ -88,14 +73,10 @@
 #     fit_spans-style whole-glyph-drop rule -- never mid-glyph, never by raw
 #     `length`.
 #
-# MANDATORY VACUITY GATES (spec's own standing rule, C4/C6 explicitly):
-#   - C4: a genuinely-zero REAL figure (status ok, used=>0) DOES render as
-#     '$0' in the SAME run that proves unconfigured/unreadable/exhausted never
-#     do -- otherwise "never print $0" would pass against an implementation
-#     that never prints $0 at all.
-#   - C6: the near-exhaustion fixture surfaces the tight window first, AND a
-#     comfortable-everywhere fixture surfaces the NATURAL (non-monthly-first)
-#     order in the same run -- otherwise "always show monthly" would pass.
+# MANDATORY VACUITY GATE (spec's own standing rule, C6 explicitly): the
+# near-exhaustion fixture surfaces the tight window first, AND an equal-windows
+# fixture surfaces the NATURAL order in the same run -- otherwise "always show
+# the same window" would pass.
 #
 # NO SKIP whose condition is the failure state. Absence is always a FAILURE,
 # never a skip (house rule, restated because it has fired 3x in this
@@ -134,8 +115,7 @@ sub slurp {
 }
 
 # try_call($desc, $coderef) -> ($result_arrayref | undef, $err | undef).
-# Never lets a missing sub/package take the whole file down (house idiom,
-# t/multi-provider-spend.t).
+# Never lets a missing sub/package take the whole file down (house idiom).
 sub try_call {
     my ($desc, $code) = @_;
     my @out;
@@ -152,26 +132,6 @@ sub try_call {
 sub fixture_claude_comfortable { return { status => 'ok', five_hour => { utilization => 10 }, seven_day => { utilization => 5 } } }
 sub fixture_claude_unreadable  { return { status => 'unknown', diagnostic => 'usage endpoint unreachable' } }
 
-sub fixture_go_ok {
-    my (%over) = @_;
-    return {
-        status    => 'ok',
-        five_hour => { used => 1,  limit => 12 },
-        weekly    => { used => 3,  limit => 30 },
-        monthly   => { used => 6,  limit => 60 },
-        %over,
-    };
-}
-sub fixture_go_absent     { return { status => 'absent',  diagnostic => 'provider not configured: no credential found' } }
-sub fixture_go_unreadable { return { status => 'unknown', diagnostic => 'credential unavailable (insecure-file): credential file /x/y is group/world-readable (mode 0644); refusing to read a session cookie from it -- required mode is 0600 (chmod 0600 /x/y). Before repairing the scrape, check whether OpenCode now publishes a documented API, CLI subcommand, or usage header for Go/Zen quota -- if it does, replace this reader rather than fix it.' } }
-sub fixture_go_exhausted_monthly {
-    return fixture_go_ok(monthly => { used => 60, limit => 60 });
-}
-sub fixture_go_zero { return fixture_go_ok(five_hour => { used => 0, limit => 12 }) }
-
-sub fixture_zen_ok        { return { status => 'ok', balance => 42, budget => 100 } }
-sub fixture_zen_absent    { return { status => 'absent',  diagnostic => 'provider not configured: no credential found' } }
-sub fixture_zen_unreadable { return { status => 'unknown', diagnostic => 'session rejected (redirected to sign-in) -- re-copy the cookie from your opencode.ai session and try again.' } }
 
 my %HOSTILE = (
     'undef'                 => undef,
@@ -270,7 +230,7 @@ ok($DASHBOARD_LOADED, 'HARNESS: Dashboard.pm requires cleanly as a module')
     for my $label (sort keys %HOSTILE) {
         my $now = $HOSTILE{$label};
         my ($out, $err) = try_call("SpendPanel::status(<well-formed>, <$label>)",
-            sub { SpendPanel::status({ go => fixture_go_ok() }, $now) });
+            sub { SpendPanel::status({ claude => fixture_claude_comfortable() }, $now) });
         ok(!defined $err, "C2: SpendPanel::status(well-formed spend, now=<$label>) never dies")
             or diag($err);
     }
@@ -282,7 +242,7 @@ ok($DASHBOARD_LOADED, 'HARNESS: Dashboard.pm requires cleanly as a module')
     # that dies on everything except never being reached (i.e. this proves
     # the sub is actually callable and productive, not merely absent).
     my ($ok_out, $ok_err) = try_call('SpendPanel::status(well-formed, NOW_EPOCH)',
-        sub { SpendPanel::status({ claude => fixture_claude_comfortable(), go => fixture_go_ok(), zen => fixture_zen_ok(), zen_enabled => 1 }, NOW_EPOCH) });
+        sub { SpendPanel::status({ claude => fixture_claude_comfortable() }, NOW_EPOCH) });
     ok(!defined $ok_err, 'C2 (non-vacuity): well-formed call does not die either')
         or diag($ok_err);
     is(ref(($ok_out || [])->[0]), 'HASH', 'C2 (non-vacuity): well-formed call returns a hashref') if $ok_out;
@@ -310,39 +270,38 @@ sub lines_text {
 
 # ===========================================================================
 # C6 -- nearest-exhaustion first. Paired gate: all-comfortable -> natural
-# order (not "always monthly").
+# order (not "always the same window").
+#
+# Claude-only since the OpenCode go/zen providers were removed: the ranking is
+# now between claude's two windows, which is still a real ranking -- the
+# statusline headline reads priority->[0].
 # ===========================================================================
 {
-    # Tight fixture: comfortable 5-hour, nearly-exhausted monthly.
+    # Tight fixture: comfortable 5-hour, nearly-exhausted 7-day.
     my $spend_tight = {
-        claude => fixture_claude_comfortable(),
-        go     => fixture_go_ok(five_hour => { used => 1, limit => 12 }, monthly => { used => 59, limit => 60 }),
-        zen_enabled => 0,
+        claude => { status => 'ok', five_hour => { utilization => 10 }, seven_day => { utilization => 95 } },
     };
     my ($info_tight, $err_tight) = build_info($spend_tight);
     if (defined $info_tight && ref($info_tight->{priority}) eq 'ARRAY' && @{ $info_tight->{priority} }) {
         my $top = $info_tight->{priority}[0];
-        is($top->{provider}, 'go',      'C6: near-exhausted-monthly fixture -> top priority provider is go');
-        is($top->{window},   'monthly', 'C6: near-exhausted-monthly fixture -> top priority window is monthly');
+        is($top->{provider}, 'claude',    'C6: near-exhausted-7d fixture -> top priority provider is claude');
+        is($top->{window},   'seven_day', 'C6: near-exhausted-7d fixture -> top priority window is seven_day');
     } else {
-        fail('C6: near-exhausted-monthly fixture surfaces monthly first [priority list unusable]');
-        fail('C6: near-exhausted-monthly fixture surfaces monthly first (window) [priority list unusable]');
+        fail('C6: near-exhausted-7d fixture surfaces seven_day first [priority list unusable]');
+        fail('C6: near-exhausted-7d fixture surfaces seven_day first (window) [priority list unusable]');
     }
 
-    # Paired gate: everything comfortable and roughly EQUAL -> natural
-    # (declared) order, not hardcoded "always monthly".
+    # Paired gate: both windows EQUAL -> natural (declared) order, five_hour
+    # first, not a hardcoded "always seven_day".
     my $spend_calm = {
         claude => { status => 'ok', five_hour => { utilization => 10 }, seven_day => { utilization => 10 } },
-        go     => fixture_go_ok(five_hour => { used => 1, limit => 12 }, weekly => { used => 2.5, limit => 30 }, monthly => { used => 5, limit => 60 }),
-        zen_enabled => 0,
     };
     my ($info_calm, $err_calm) = build_info($spend_calm);
     if (defined $info_calm && ref($info_calm->{priority}) eq 'ARRAY' && @{ $info_calm->{priority} }) {
-        my $top_calm = $info_calm->{priority}[0];
-        my $is_monthly_first = ($top_calm->{provider} eq 'go' && $top_calm->{window} eq 'monthly') ? 1 : 0;
-        is($is_monthly_first, 0, 'C6 (paired gate): all-comfortable fixture does NOT always surface monthly first');
+        is($info_calm->{priority}[0]{window}, 'five_hour',
+            'C6 (paired gate): equal windows keep the declared order -- the tight case above is not hardcoded');
     } else {
-        fail('C6 (paired gate): all-comfortable fixture does not always surface monthly first [priority list unusable]');
+        fail('C6 (paired gate): equal windows keep the declared order [priority list unusable]');
     }
 }
 
@@ -368,10 +327,7 @@ sub lines_text {
         # UTF-8 byte at the very end of the output).
         my $tempdir = tempdir(CLEANUP => 1);
         my $spend_glyph = {
-            claude => fixture_claude_comfortable(),
-            go     => fixture_go_exhausted_monthly(),   # forces a status glyph/marker
-            zen    => fixture_zen_ok(),
-            zen_enabled => 1,
+            claude => fixture_claude_comfortable(),   # a status glyph plus a headline
         };
         my $payload = encode_json({ spend => $spend_glyph, now => NOW_EPOCH, width => 10 });
         my ($fh, $infile) = tempfile(DIR => $tempdir);
@@ -425,45 +381,40 @@ sub lines_text {
 # ===========================================================================
 # C6b -- THE EXHAUSTION BOUNDARY. Added by the coordinator after finding, by
 # direct execution, that a provider dropped OUT of the nearest-exhaustion
-# ranking at the exact moment it became exhausted: _priority admitted only
-# state 'ok', and hitting a limit flips the state to 'exhausted'. Exactly
-# backwards -- criterion 6 exists to surface the window closest to its limit,
-# and a window AT its limit is the closest possible.
+# ranking at the exact moment it became exhausted. Exactly backwards --
+# criterion 6 exists to surface the window closest to its limit, and a window
+# AT its limit is the closest possible.
 #
-# C6 above never caught it because its fixture is "nearly exhausted" (58/60),
-# which is still state 'ok'. The bug lives only at used >= limit. This asserts
-# the boundary and just past it.
+# The provider that exposed it (OpenCode Go, whose state flipped to
+# 'exhausted') is gone; the property is asserted on claude's windows at, and
+# just past, 100%.
 # ===========================================================================
 {
-    my $claude_low = { status => 'ok', five_hour => { utilization => 10 } };
-
-    for my $case ([58, 'go', 'below the limit (still ok)'],
-                   [60, 'go', 'exactly AT the limit'],
-                   [61, 'go', 'past the limit']) {
-        my ($used, $want_provider, $label) = @$case;
-        my $spend = { zen_enabled => 0,
-                       claude => $claude_low,
-                       go     => { status => 'ok', monthly => { used => $used, limit => 60 } },
-                       zen    => { status => 'absent' } };
+    for my $case ([99, 'below the limit'], [100, 'exactly AT the limit'], [101, 'past the limit']) {
+        my ($u, $label) = @$case;
+        my $spend = { claude => { status => 'ok', five_hour => { utilization => $u },
+                                                  seven_day => { utilization => 50 } } };
         my ($info, $err) = build_info($spend);
         my $top = (ref $info eq 'HASH' && ref $info->{priority} eq 'ARRAY' && @{ $info->{priority} })
                     ? $info->{priority}[0] : undef;
-        is(($top ? $top->{provider} : undef), $want_provider,
-           "C6b: with go/monthly $label, the nearest-exhaustion entry is still GO -- "
-         . "an exhausted provider must not vanish from the ranking");
+        is(($top ? $top->{window} : undef), 'five_hour',
+           "C6b: with five_hour $label, it is still the nearest-exhaustion entry -- "
+         . "a window at its limit must not vanish from the ranking");
     }
 
-    # VACUITY GATE: when go is genuinely the comfortable one, claude wins. So
-    # this is not an implementation that simply always answers 'go'.
-    my $spend_flip = { zen_enabled => 0,
-                        claude => { status => 'ok', five_hour => { utilization => 99 } },
-                        go     => { status => 'ok', monthly => { used => 1, limit => 60 } },
-                        zen    => { status => 'absent' } };
-    my ($info_flip) = build_info($spend_flip);
+    # VACUITY GATE: when seven_day is the tighter one, it wins. So this is not
+    # an implementation that simply always answers five_hour.
+    my ($info_flip) = build_info({ claude => { status => 'ok', five_hour => { utilization => 1 },
+                                                               seven_day => { utilization => 99 } } });
     my $top_flip = (ref $info_flip eq 'HASH' && ref $info_flip->{priority} eq 'ARRAY'
                      && @{ $info_flip->{priority} }) ? $info_flip->{priority}[0] : undef;
-    is(($top_flip ? $top_flip->{provider} : undef), 'claude',
-       'C6b VACUITY GATE: when claude is the tighter meter it wins -- the ranking is real, not hardcoded to go');
+    is(($top_flip ? $top_flip->{window} : undef), 'seven_day',
+       'C6b VACUITY GATE: when seven_day is the tighter window it wins -- the ranking is real');
+
+    # An unreadable reading has no windows to rank, and must not invent any.
+    my ($info_bad) = build_info({ claude => { status => 'unknown', diagnostic => 'x' } });
+    is_deeply((ref $info_bad eq 'HASH' ? $info_bad->{priority} : undef), [],
+       'C6b: an unreadable claude reading contributes nothing to the ranking');
 }
 
 done_testing();
