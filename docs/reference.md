@@ -160,6 +160,13 @@ The canonical entry point is the **`claude-sandbox` host launcher**. The global 
 
 Container names are deterministic per project path (hash-based), stored in `.ccpraxis-local-data/claude-home/.launcher/container-name`.
 
+**Where the launcher refuses to start.** Before writing anything under the project, `launcher.pl` and `bootstrap.pl` run two checks, and either one stops the launch:
+
+- **Protected paths.** A project directory that overlaps anything Claude Code has installed: the Claude home (`~/.claude`), every installed marketplace, and the live ccpraxis install. You can add your own paths in `~/.claude/ccpraxis-protected-paths.json`.
+- **Refusal markers.** A plain file named `.claude-sandbox-refuse` lets a directory protect itself, with no central list. It counts if it sits in the launch directory, in any directory above it, or up to two levels below it (sandboxing a parent would mount the marked folder too). The launcher prints the marker's own text as the reason, so whoever places it decides what you're told; an empty marker gets a generic message. A line `allow-launcher: <id>` exempts one named launcher, which is how a fork with its own launcher identity can still use a marked tree. Remove the file to allow `claude-sandbox` there again.
+
+Neither check has an override flag or environment variable. Details: [plugins/sandbox/docs/protected-paths.md](../plugins/sandbox/docs/protected-paths.md), sections 1-2 (protected paths) and 10 (markers).
+
 The container runs `claude --dangerously-skip-permissions` as root — full autonomy inside the sandbox. With rootless Podman, container root is mapped to the unprivileged host user via the kernel's user namespace, so files written to `/project` come out owned by the host user (no chown dance) and a container escape lands as the unprivileged host user, not host root. Docker Desktop uses a similar VM-isolation model on Windows/macOS. The container-specific `CLAUDE.md` tells Claude it can install and run anything, while still enforcing supply chain rules.
 
 **Mounts:**
