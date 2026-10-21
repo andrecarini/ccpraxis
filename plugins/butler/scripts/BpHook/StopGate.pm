@@ -37,6 +37,13 @@ eval {
         unless grep { m{(?:^|/)BpContinuityLease\.pm$} } keys %INC;
 };
 
+# Break-glass constants (see the BREAK GLASS section below run()).
+our $REFUSAL_CAP         = 5;    # consecutive refusals, nothing succeeding, before the gate yields
+our $BREAK_GLASS_HINT_AT = 2;    # refusals in a row before the Write-tool escape is offered
+
+my %BREAK_GLASS_ACTION = (silence => 1, off => 1);
+my %SHELL_TOOL         = (Bash => 1, PowerShell => 1);
+
 # ---------------------------------------------------------------------------
 # run($p, @args) -> 0 | 2. @args is ignored. Decision table (spec sec 2.3).
 # ---------------------------------------------------------------------------
@@ -55,6 +62,12 @@ sub run {
     my $sid = BpHook::session_id($p);
     return 0 unless defined $sid;
 
+    # G2b: the break-glass file is read BEFORE G3, because it names the token
+    # G3 is about to revoke. Always consumed, valid or not, so a stale file can
+    # never act on a later stop. Acted on only below, once the session is known
+    # to be an armed interactive one.
+    my ($bg, $bg_why) = eval { _take_break_glass($sid, $p) };
+
     # G3: always, once G1/G2 pass -- the previous turn's token dies here.
     BpHook::revoke_stop_token($sid);
 
@@ -67,7 +80,21 @@ sub run {
     return 0 if $role eq 'judge';
 
     # G6: not armed -> allow.
-    return 0 unless BpHook::is_armed($sid);
+    unless (BpHook::is_armed($sid)) {
+        eval { _clear_streak($sid) };
+        return 0;
+    }
+
+    # G6b: a valid break-glass request (see _take_break_glass) lets this stop
+    # through, and for `off` disarms first, exactly as the shell commands would.
+    if ($bg) {
+        eval { _clear_streak($sid) };
+        if ($bg->{action} eq 'off') {
+            BpHook::disarm($sid, actor => 'agent', reason => "break-glass: $bg->{reason}");
+        }
+        eval { BpHook::log_reason($sid, 'agent', "break-glass-$bg->{action}", $bg->{reason}, $p->{cwd}) };
+        return 0;
+    }
 
     # G7: armed -- refresh the wake-lock lease's activity marker, and make
     # sure the lease refresher is actually running (F4, red-team M2: the
@@ -91,17 +118,58 @@ sub run {
     # to strand a LATER, unrelated stop once the holder is gone.
     if (BpHook::holder_live($sid, $p)) {
         BpHook::take_silence($sid);
+        eval { _clear_streak($sid) };
         return 0;
     }
 
     # G9: exactly one silence lets exactly one stop through.
-    return 0 if BpHook::take_silence($sid);
+    if (BpHook::take_silence($sid)) {
+        eval { _clear_streak($sid) };
+        return 0;
+    }
+
+    # G9b: THE REFUSAL CAP (bug 20261021-202419-bf19). Every escape above is a
+    # shell command; a session whose shell is broken (a PreToolUse hook that
+    # errors on every call, say) cannot run any of them, and was refused more
+    # than a hundred times in a row before a human noticed. So this stop would
+    # be the Nth consecutive refusal with no tool call succeeding in between,
+    # the gate stops refusing, and says why in the reasons log and
+    # hook-errors.log. Inert without a readable transcript: then there is no
+    # way to tell "stuck" from "busy", and the cap must not guess.
+    my ($streak, $shell_failed) = eval { _bump_streak($sid, $p) };
+    $streak //= 0;
+    if ($streak >= $REFUSAL_CAP) {
+        eval { _clear_streak($sid) };
+        my $why = "refusal cap: $streak consecutive refusals with no tool call succeeding in between";
+        eval { BpHook::log_reason($sid, 'gate', 'refusal-cap', $why, $p->{cwd}) };
+        warn "stop-gate: $why; letting the stop through (session $sid)\n";
+        return 0;
+    }
 
     # G10: token storage failure -> allow, logged via warn (-> hook-errors.log).
     my $t = BpHook::mint_stop_token($sid, $p);
     unless (defined $t) {
         warn "stop-gate: could not store a stop token\n";
+        eval { _clear_streak($sid) };
         return 0;
+    }
+
+    # The break-glass lines are offered only once the shell paths have visibly
+    # failed: a shell tool call errored since the last refusal, or this is not
+    # the first refusal in a row with nothing succeeding. A healthy session
+    # never sees them, so they cannot become the habitual way out.
+    my @glass;
+    if ($shell_failed || $streak >= $BREAK_GLASS_HINT_AT || defined $bg_why) {
+        my ($path) = _break_glass_paths($sid, $p);
+        push @glass, "The break-glass file was not used: $bg_why" if defined $bg_why;
+        if (defined $path) {
+            push @glass,
+                "No shell command can run? Last resort: create this file with the Write tool:",
+                "  " . _display_path($path),
+                "  containing {\"token\":\"$t\",\"action\":\"silence\",\"reason\":\"<why this stop>\"}",
+                "  (\"action\":\"off\" instead when all work is done).",
+                "After $REFUSAL_CAP refusals in a row with no tool call succeeding, the gate lets the stop through by itself.";
+        }
     }
 
     # G11 (spec 38 sec 2.3, Decision 128): the text is built from the
@@ -121,6 +189,9 @@ sub run {
             "  butler-hold --token $t " . join(' ', @shown),
             "If that work is no longer needed and everything is done, turn continuity off, as a Bash tool call:",
             "  butler-continuity off --reason '<what is done>' --token $t",
+            # No break-glass offer here. While work runs the way out is a
+            # hold (Decision 128), and a session that cannot hold still
+            # reaches the refusal cap, or the idle text once the work ends.
         );
     }
     return BpHook::deny(
@@ -131,7 +202,186 @@ sub run {
         "  butler-continuity off --reason '<what is done>' --token $t",
         "Escape hatch, only when a stop is truly necessary, e.g. to talk with an operator who is present:",
         "  butler-continuity silence --reason '<why this stop>' --token $t",
+        @glass,
     );
+}
+
+# ---------------------------------------------------------------------------
+# BREAK GLASS (bug 20261021-202419-bf19, operator decision 2026-10-21): two
+# last-resort ways past the gate for a session whose own tooling is broken.
+#
+#   1. The refusal cap (G9b): $REFUSAL_CAP consecutive refusals with no tool
+#      call succeeding in between, and the gate lets the stop through. Needs
+#      nothing from the stuck session.
+#   2. The break-glass file (G2b/G6b): a silence or off request written with
+#      the Write tool, which keeps working when the shell does not. It must
+#      carry the token the last refusal printed, so it is exactly as bound to
+#      this session and this turn as the shell commands are.
+# ---------------------------------------------------------------------------
+# _break_glass_paths($sid, $p) -> the candidate file paths, preferred first.
+# The project's .ccpraxis-local-data is preferred because the Write tool can
+# reach it without touching ~/.claude, which Claude Code guards; the state dir
+# is the fallback for a project that has none.
+sub _break_glass_paths {
+    my ($sid, $p) = @_;
+    my @paths;
+    my $dd = eval { BpHook::data_dir($p) };
+    push @paths, "$dd/butler-break-glass/$sid.json" if defined $dd && length $dd;
+    my $root = BpHook::state_dir();
+    push @paths, "$root/break-glass/$sid.json" if defined $root && length $root;
+    return @paths;
+}
+
+# _display_path($path) -> the path in the form the Write tool accepts. Under
+# Git-for-Windows a HOME-derived path reads /c/Users/...; a native tool wants
+# C:/Users/....
+sub _display_path {
+    my ($path) = @_;
+    (my $d = $path) =~ s{\\}{/}g;
+    $d =~ s{^/([A-Za-z])/}{uc($1) . ':/'}e if $^O =~ /^(?:msys|cygwin|MSWin32)$/;
+    return $d;
+}
+
+# _take_break_glass($sid, $p) -> ({action, reason}, undef) for a valid request,
+# (undef, $why) for a file that existed but was refused, () when there is none.
+# Every candidate file found is unlinked, valid or not.
+sub _take_break_glass {
+    my ($sid, $p) = @_;
+    my @found = grep { -f $_ } _break_glass_paths($sid, $p);
+    return () unless @found;
+
+    my $data;
+    for my $f (@found) {
+        $data //= _read_json_file($f);
+        unlink $f;
+    }
+
+    my $root = BpHook::state_dir();
+    my $current;
+    if (defined $root && open(my $fh, '<:raw', "$root/stop-tokens/$sid.current")) {
+        local $/;
+        $current = <$fh>;
+        close $fh;
+        $current =~ s/\s+\z// if defined $current;
+    }
+
+    return (undef, 'it is not a JSON object') unless ref $data eq 'HASH';
+    my ($tok, $act, $why) = @{$data}{qw(token action reason)};
+    return (undef, 'no stop is pending for this session') unless defined $current && length $current;
+    return (undef, 'its token is not the one the last refusal printed')
+        unless defined $tok && !ref $tok && $tok eq $current;
+    return (undef, 'its action must be "silence" or "off"')
+        unless defined $act && !ref $act && $BREAK_GLASS_ACTION{$act};
+    return (undef, 'its reason must be at least two words')
+        unless defined $why && !ref $why && scalar(split(' ', $why)) >= 2;
+    $why = substr($why, 0, 200);
+    $why =~ s/[\x00-\x1f\x7f]/ /g;
+    return ({ action => $act, reason => $why }, undef);
+}
+
+# _read_json_file($path) -> the decoded JSON, or undef for a missing, unreadable
+# or malformed file. Never dies.
+sub _read_json_file {
+    my ($path) = @_;
+    open(my $fh, '<:raw', $path) or return undef;
+    local $/;
+    my $raw = <$fh>;
+    close $fh;
+    return undef unless defined $raw;
+    return eval { JSON::PP->new->utf8->decode($raw) };
+}
+
+sub _streak_path {
+    my ($sid) = @_;
+    my $root = BpHook::state_dir();
+    return undef unless defined $root;
+    return "$root/stop-refusals/$sid";
+}
+
+sub _clear_streak {
+    my ($sid) = @_;
+    my $path = _streak_path($sid);
+    unlink $path if defined $path;
+    return;
+}
+
+# _bump_streak($sid, $p) -> ($count, $shell_failed). $count is how many
+# refusals in a row this one would make with no tool call succeeding in
+# between; $shell_failed is whether a Bash or PowerShell call errored during
+# that run of refusals. (0, 0) when the transcript cannot be read, which keeps
+# the cap and the break-glass hint inert rather than guessing.
+#
+# Only the transcript bytes appended since the previous refusal are read, so
+# the cost is one turn's worth of JSONL, never the whole session.
+sub _bump_streak {
+    my ($sid, $p) = @_;
+    my $tp = $p->{transcript_path};
+    return (0, 0) unless defined $tp && !ref $tp && length $tp && -f $tp;
+    my $size = -s $tp;
+    return (0, 0) unless defined $size;
+    my $path = _streak_path($sid);
+    return (0, 0) unless defined $path;
+
+    my $prev = _read_json_file($path);
+    my ($count, $shell_failed) = (1, 0);
+    if (ref $prev eq 'HASH' && defined $prev->{offset} && $prev->{offset} =~ /^\d+$/
+        && $prev->{offset} <= $size && defined $prev->{count} && $prev->{count} =~ /^\d+$/)
+    {
+        my ($any_ok, $shell_err) = _scan_tool_results($tp, $prev->{offset});
+        if ($any_ok) {
+            $count = 1;
+        }
+        else {
+            $count = $prev->{count} + 1;
+            $shell_failed = ($prev->{shell_failed} || $shell_err) ? 1 : 0;
+        }
+        $shell_failed ||= $shell_err;
+    }
+
+    my $dir = $path;
+    $dir =~ s{/[^/]*$}{};
+    unless (-d $dir) { eval { require File::Path; File::Path::make_path($dir) } }
+    if (open(my $fh, '>:raw', "$path.tmp.$$")) {
+        print {$fh} JSON::PP->new->canonical->encode(
+            { count => $count, offset => $size, shell_failed => $shell_failed ? 1 : 0 }) . "\n";
+        close $fh;
+        rename("$path.tmp.$$", $path) or unlink "$path.tmp.$$";
+    }
+    return ($count, $shell_failed);
+}
+
+# _scan_tool_results($transcript, $offset) -> ($any_ok, $shell_failed) over
+# the JSONL lines from $offset to the end. A tool_result without is_error is a
+# success; one with is_error whose tool_use was Bash or PowerShell is a failed
+# shell call. Lines that do not decode are skipped.
+sub _scan_tool_results {
+    my ($tp, $offset) = @_;
+    open(my $fh, '<:raw', $tp) or return (0, 0);
+    seek($fh, $offset, 0);
+    my (%name_of, $any_ok, $shell_failed);
+    while (my $line = <$fh>) {
+        next unless $line =~ /"tool_(?:use|result)"/;
+        my $rec = eval { JSON::PP->new->utf8->decode($line) };
+        next unless ref $rec eq 'HASH' && ref $rec->{message} eq 'HASH';
+        my $content = $rec->{message}{content};
+        next unless ref $content eq 'ARRAY';
+        for my $c (@$content) {
+            next unless ref $c eq 'HASH' && defined $c->{type};
+            if ($c->{type} eq 'tool_use' && defined $c->{id}) {
+                $name_of{$c->{id}} = $c->{name};
+            }
+            elsif ($c->{type} eq 'tool_result') {
+                my $err = $c->{is_error} ? 1 : 0;
+                if (!$err) { $any_ok = 1 }
+                else {
+                    my $n = defined $c->{tool_use_id} ? $name_of{$c->{tool_use_id}} : undef;
+                    $shell_failed = 1 if defined $n && $SHELL_TOOL{$n};
+                }
+            }
+        }
+    }
+    close $fh;
+    return ($any_ok ? 1 : 0, $shell_failed ? 1 : 0);
 }
 
 # ---------------------------------------------------------------------------

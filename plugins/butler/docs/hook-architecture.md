@@ -890,8 +890,9 @@ statusline badge (package 10) reads the per-session `off/` and `silence/` files,
 ## Stop gate denial text
 
 One Stop hook (Decision 5): `plugins/butler/hooks/stop-gate.sh`, logic in
-`plugins/butler/scripts/BpHook/StopGate.pm` (package 06). The only ways past it are a live holder, or
-the off and silence commands, each with a reason (Decision 1, Decision 6). The text is built from the
+`plugins/butler/scripts/BpHook/StopGate.pm` (package 06). The ways past it are a live holder, or
+the off and silence commands, each with a reason (Decision 1, Decision 6), plus the two break-glass
+last resorts described under "Break glass" below. The text is built from the
 session's running work (Decision 128). Exact text when an armed non-coordinator session stops with no
 live holder, no silence and nothing running (Decision 8: at most 8 lines, the three commands, nothing
 else, no history). `<token>` is replaced by the token this denial minted, in all four places:
@@ -950,6 +951,7 @@ Otherwise finish or park the ledger: status done|blocked|parked, a concrete '## 
 ```
 if hook_event_name(p) ne 'Stop' or agent_id(p) defined -> allow   (never mints)
 sid = session_id(p)                      ; undef -> allow
+bg = take_break_glass(sid, p)            ; G2b: read and unlink, BEFORE the token it names dies
 revoke_stop_token(sid)                   ; the previous turn's token dies here
 if role is coordinator:
     runs/<pkg>.force-stop exists         -> unlink, allow
@@ -960,15 +962,17 @@ if role is coordinator:
     holder_live(sid, p)                  -> allow   (coordinator rule: running subagent held)
     deny(coordinator text, mint_stop_token(sid))
 if role is judge                         -> allow
-if not is_armed(sid)                     -> allow
+if not is_armed(sid)                     -> clear streak, allow
+if bg valid                              -> clear streak, disarm if action off, log, allow  (G6b)
 touch armed/<sid>                        ; activity for the wake-lock lease
 clear_running_snapshot(sid)              ; G7b: the snapshot describes only the latest Stop
-holder_live(sid, p)                      -> allow   (checked first, so a silence is not wasted)
-take_silence(sid)                        -> allow   (consumed by exactly this stop)
+holder_live(sid, p)                      -> clear streak, allow   (checked first, so a silence is not wasted)
+take_silence(sid)                        -> clear streak, allow   (consumed by exactly this stop)
+streak = bump_streak(sid, p)             ; G9b: >= REFUSAL_CAP -> clear, log, allow
 t = mint_stop_token(sid)                 ; undef -> allow, one hook-errors.log line
 work = running_work(sid, p)              ; G11
 if work: set_running_snapshot(sid, work) ; deny(running text with t)
-else:    deny(idle text with t)
+else:    deny(idle text with t, plus the break-glass lines when offered)
 ```
 
 `stop_hook_active` is never read. It resets after a wake and is not a block counter (harness-facts
@@ -976,6 +980,52 @@ else:    deny(idle text with t)
 file that survives would let more than one stop through. If the gate cannot store a token, it allows
 the stop rather than print a denial whose way out would not work. The same holds for any exception:
 the gate fails open.
+
+### Break glass
+
+Bug `20261021-202419-bf19`: a session armed with continuity lost its shell, because a PreToolUse
+hook pointed at a deleted script and failed every Bash and PowerShell call. Every way past the gate
+is a shell command, so it refused more than a hundred stops in a row before a human noticed. The
+operator's ruling (2026-10-21) was both of the following, as last resorts for when the tooling
+itself is broken:
+
+- **Refusal cap** (G9b). `$BpHook::StopGate::REFUSAL_CAP` (5) consecutive refusals with no tool
+  call succeeding in between, and the gate lets the stop through. It writes a `refusal-cap` line to
+  `reasons.log` and one to `hook-errors.log`, and does not disarm: the next stop starts a fresh
+  streak. The streak lives in `stop-refusals/<sid>` as `{count, offset, shell_failed}`; each
+  would-be refusal reads only the transcript bytes appended since `offset`. Any `tool_result`
+  without `is_error` resets the count to 1. A failed result whose `tool_use` was Bash or PowerShell
+  sets `shell_failed`. Without a readable `transcript_path` the cap is inert, because "stuck" cannot
+  be told from "busy". It counts in the running-work branch too, so a stale running record cannot
+  loop forever. A live holder, a silence, a break-glass file or a disarm clears the streak.
+- **Break-glass file** (G2b, G6b). A silence or off request written with the Write tool, which
+  keeps working when the shell does not, at
+  `<project>/.ccpraxis-local-data/butler-break-glass/<sid>.json`. When the project has no data
+  directory it goes at `<state>/break-glass/<sid>.json` instead, because Claude Code guards writes
+  under `~/.claude` and the project path is the one more likely to be writable. The contents are
+  `{"token":"<token>","action":"silence"|"off","reason":"<two words or more>"}`, and the token must
+  be the one the last refusal printed, so the file is exactly as bound to this session and turn as
+  the shell commands are. The gate reads it before revoking that token and unlinks it whether or
+  not it is valid, so a stale file never acts on a later stop. A refused file is named, with its
+  reason, in the next refusal.
+
+The idle refusal offers the file only once the shell has visibly failed: a shell call errored since
+the previous refusal, or this is at least the `$BREAK_GLASS_HINT_AT` (2) refusal in a row with
+nothing succeeding. A healthy session never sees it, so it cannot become the habitual way out.
+The idle text is 7 lines without them, 12 with them, and 13 when a refused file is named, which
+is why stop-gate.sh's budget below is 13 rather than Decision 8's 8.
+The running-work refusal never offers it: while work runs the way out is a hold (Decision 128), and
+a session that cannot hold still reaches the cap. The lines appended to the idle text are:
+
+```
+No shell command can run? Last resort: create this file with the Write tool:
+  <path>
+  containing {"token":"<token>","action":"silence","reason":"<why this stop>"}
+  ("action":"off" instead when all work is done).
+After 5 refusals in a row with no tool call succeeding, the gate lets the stop through by itself.
+```
+
+Oracle: `plugins/butler/tests/t/stop-gate-break-glass.t`.
 
 ## Operator off versus agent off
 
@@ -1161,7 +1211,7 @@ disable path for the guard -- it records a one-shot, logged override that is con
 next fork dispatch, and the guard denies again after it. Decision 3 applies throughout: every
 "armed" below is THIS session's `armed/<session_id>`, never "any session in the project".
 
-| stop-gate.sh | 7 | --pre ledger,armed : exits when BP_LEDGER is unset and armed/<session_id> is absent |
+| stop-gate.sh | 13 | --pre ledger,armed : exits when BP_LEDGER is unset and armed/<session_id> is absent |
 | arm-on-entry.sh | 1 | --pre text:bp-drive-next : exits when the payload text does not contain bp-drive-next |
 | continuity-off-check.sh | 0 | --pre text:butler-continuity,text:butler-hold,text:butler-fork-ok,text:almanac : exits when the payload text contains none of the four names |
 | bind-dispatch.sh | 6 | --pre ledger,driver : exits when BP_LEDGER is unset and the session is not an armed driver |
