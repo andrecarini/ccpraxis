@@ -434,14 +434,24 @@ sub _bounded_walk {
 
 # resolve_project_root(%opt) -> $abs_path      (%opt: cwd => $dir)
 #
-# Precedence, first hit wins: (1) the bounded walk-up (_bounded_walk, above)
+# Precedence, first hit wins: (0) $ENV{ALMANAC_PROJECT_ROOT}, when it names
+# an existing directory; (1) the bounded walk-up (_bounded_walk, above)
 # from cwd for a dir holding .ccpraxis-local-data or .git; (2)
 # $ENV{CLAUDE_PROJECT_DIR}; (3) the starting directory itself. The walk is
 # deliberately ahead of CLAUDE_PROJECT_DIR (DC8): a subdirectory must resolve
 # to the same root as the project root itself, and an unset env var is not
 # an answer.
+#
+# (0) exists for a project that is a folder of git repos: the walk stops at
+# the first .git, so a record written from <project>/<repo> would land
+# inside that repo (where it could be committed and pushed with it) instead
+# of in the one project store. Setting ALMANAC_PROJECT_ROOT=<project> keeps
+# every record in one place. A pinned path that is not a directory is
+# ignored rather than created.
 sub resolve_project_root {
     my (%opt) = @_;
+    my $pin = $ENV{ALMANAC_PROJECT_ROOT};
+    return _canonical_path(_fold_drive_form($pin)) if defined $pin && length $pin && -d $pin;
     my $cwd = (defined $opt{cwd} && length $opt{cwd}) ? $opt{cwd} : Cwd::getcwd();
     $cwd = _fold_drive_form($cwd);
 
