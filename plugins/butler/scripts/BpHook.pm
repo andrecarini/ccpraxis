@@ -29,6 +29,8 @@ use File::Basename qw(dirname);
 use Cwd ();
 use B qw(svref_2object SVp_POK);
 use Time::HiRes ();
+use POSIX ();
+use File::Spec ();
 
 # never-halt 09-gb-h-residuals (spec sec 2.1, E1): the wall-clock stamp for
 # "hook process start", taken as the FIRST statement of main() and local'd
@@ -1262,6 +1264,155 @@ sub take_disarm_otp {
         gate_result => { thread => $gr->{thread}, broken => $gr->{broken} },
     };
     return ($rec, undef);
+}
+
+# --------------------------------------------------------------- stop bug --
+# judged-continuity-disarm package 06 (spec sec 2.1): the ONE place that
+# spawns almanac-bug.pl. Both the emergency-stop verb and the Stop gate's
+# break-glass off call this. select()-polled, never alarm (measured note,
+# bp-ledger.pl:100-107): a real fork via `open($fh, '-|')` with no LIST.
+
+our $BUG_FILE_TIMEOUT = 10;
+
+# _flat_bug_text($s) -- the title/body/area sanitizer (spec 2.1 step 4):
+# decode if needed, fold every control/separator byte to a space, collapse
+# runs of whitespace, trim both ends.
+sub _flat_bug_text {
+    my ($s) = @_;
+    return '' unless defined $s;
+    my $v = _decode_maybe($s);
+    $v =~ s/[\x00-\x1f\x7f-\x9f\x{2028}\x{2029}]/ /g;
+    $v =~ s/\s+/ /g;
+    $v =~ s/^\s+|\s+\z//g;
+    return $v;
+}
+
+# _bug_fail_result($err) -- the shared {id=>undef, error=>$err, note=>...}
+# shape (spec 2.1 step 7): the note is the error, flattened and cut to at
+# most 100 characters.
+sub _bug_fail_result {
+    my ($err) = @_;
+    my $e = (defined $err && length("$err")) ? "$err" : 'unknown error';
+    my $cut = _flat_bug_text($e);
+    $cut = substr($cut, 0, 97) . '...' if length($cut) > 100;
+    return { id => undef, error => $e, note => "bug report: FAILED ($cut)" };
+}
+
+# _file_stop_bug_inner(%o) -- file_stop_bug's body, called inside file_stop_
+# bug's own eval. Returns the result hash on every predictable path; a die
+# here (an unexpected internal failure) is caught by the caller.
+sub _file_stop_bug_inner {
+    my (%o) = @_;
+    my $source  = $o{source};
+    my $session = $o{session};
+    my $actor   = $o{actor};
+    my $reason  = $o{reason};
+    die "file_stop_bug: bad args\n"
+        unless defined $source && length($source)
+            && defined $session && length($session)
+            && defined $actor && length($actor)
+            && defined $reason && length($reason);
+
+    # Step 1: the goal, read BEFORE any disarm (disarm unlinks this file).
+    my $goal = '(no goal recorded)';
+    my $root_state = state_dir();
+    if (defined $root_state) {
+        my $rec = _read_json("$root_state/armed/$session");
+        if (ref $rec eq 'HASH' && defined $rec->{goal} && !ref($rec->{goal}) && length($rec->{goal})) {
+            $goal = $rec->{goal};
+        }
+    }
+
+    # Step 2: project root.
+    my $dd = data_dir({ cwd => $o{cwd} });
+    return _bug_fail_result('no project data directory to file the bug report in')
+        unless defined $dd;
+    (my $root = $dd) =~ s{/\.ccpraxis-local-data/?$}{};
+
+    # Step 3: script.
+    my $pl = "$SELF_DIR/../../almanac/scripts/almanac-bug.pl";
+    return _bug_fail_result('almanac is not installed beside butler (no almanac-bug.pl)')
+        unless -f $pl;
+
+    # Step 4: compose.
+    my $title = _flat_bug_text("$source: $reason");
+    my $body  = "Filed automatically by $source for session $session (actor $actor).\n\n"
+              . "Reason: " . _flat_bug_text($reason) . "\n\n"
+              . "Session goal: " . _flat_bug_text($goal) . "\n";
+    my $area = (defined $o{area} && length(_flat_bug_text($o{area})))
+        ? _flat_bug_text($o{area}) : 'butler';
+
+    my @argv = ($^X, $pl, 'file', '--project', _to_bytes($root),
+        '--title', _utf8_bytes($title), '--body', _utf8_bytes($body),
+        '--severity', 'high', '--area', _utf8_bytes($area));
+
+    # Step 5: spawn (house pattern, bp-ledger.pl:114-149).
+    my $pid = open(my $fh, '-|');
+    return _bug_fail_result("could not start almanac-bug.pl: $!") unless defined $pid;
+    if ($pid == 0) {
+        open(STDIN, '<', File::Spec->devnull);
+        open(STDERR, '>&STDOUT');
+        exec(@argv);
+        POSIX::_exit(126);
+    }
+
+    my $out = '';
+    my $deadline = time() + $BUG_FILE_TIMEOUT;
+    my $timed_out = 0;
+    while (1) {
+        my $remaining = $deadline - time();
+        if ($remaining <= 0) { $timed_out = 1; last }
+        my $rin = '';
+        vec($rin, fileno($fh), 1) = 1;
+        my $wait = $remaining > 1 ? 1 : $remaining;
+        my $nfound = select($rin, undef, undef, $wait);
+        if ($nfound && $nfound > 0) {
+            my $buf;
+            my $n = sysread($fh, $buf, 65536);
+            last unless defined $n && $n > 0;    # EOF or read error -> child is done
+            $out .= $buf;
+        }
+    }
+
+    if ($timed_out) {
+        eval { kill('KILL', $pid) };
+        eval { waitpid($pid, 0) };
+        eval { close($fh) };
+        return _bug_fail_result('almanac-bug.pl timed out after 10s');
+    }
+
+    close($fh);
+    waitpid($pid, 0);
+    my $code = (defined $? ? $? : 0) >> 8;
+
+    my @lines;
+    for my $l (split /\n/, $out) {
+        $l =~ s/\s+\z//;
+        push @lines, $l if length $l;
+    }
+
+    if ($code == 0) {
+        if (@lines && $lines[-1] =~ m{([^/\\]+)\.md\z}) {
+            my $id = $1;
+            return { id => $id, error => undef, note => "bug report: $id" };
+        }
+        return _bug_fail_result('almanac-bug.pl printed no report path');
+    }
+
+    my $err = @lines ? $lines[0] : "almanac-bug.pl exited $code";
+    return _bug_fail_result($err);
+}
+
+# file_stop_bug(%o) -- spec 2.1. Never dies: the whole body runs inside
+# eval, and a die becomes error => <first line of $@>. Exactly one of
+# `id` and `error` is defined on return.
+sub file_stop_bug {
+    my (%o) = @_;
+    my $res = eval { _file_stop_bug_inner(%o) };
+    return $res if ref $res eq 'HASH' && (defined $res->{id} || defined $res->{error});
+    my $e = (defined $@ && length("$@")) ? "$@" : 'unknown error';
+    $e =~ s/\r?\n.*\z//s;
+    return _bug_fail_result($e);
 }
 
 # ----------------------------------------------------------- invocations ---
