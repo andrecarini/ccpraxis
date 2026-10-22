@@ -27,12 +27,30 @@ use FindBin qw($Bin);
 use File::Temp qw(tempdir tempfile);
 use File::Path qw(make_path);
 use JSON::PP ();
+use Cwd ();
 
 (my $S = "$Bin/../../scripts") =~ s{\\}{/}g;
+
+# AC8 self-check (DC7, package 06-emergency-stop): the repo's REAL
+# bug-reports store, snapshotted now and again at the very end of this
+# file. Every filing assertion below (AC14, AC15) reads only a per-world
+# tempdir store (CCPRAXIS_DATA_DIR, set per-world by with_env()); this list
+# proves none of them leaked into the operator's real store.
+(my $REPO_ROOT = Cwd::abs_path("$Bin/../../../../")) =~ s{\\}{/}g;
+my $REAL_STORE = "$REPO_ROOT/.ccpraxis-local-data/bug-reports";
+sub real_store_snapshot {
+    return () unless -d $REAL_STORE;
+    opendir(my $dh, $REAL_STORE) or return ();
+    my @f = sort grep { /\.md\z/ } readdir($dh);
+    closedir $dh;
+    return @f;
+}
+my @AC8_BEFORE = real_store_snapshot();
 
 delete $ENV{$_} for grep { !/^CCPRAXIS_NO_WAKELOCK$/ && /^(?:BP_|CCPRAXIS_|CLAUDE_|BUTLER_)/ } keys %ENV;
 my $HOME_TMP = tempdir(CLEANUP => 1);
 $ENV{HOME} = $ENV{USERPROFILE} = "$HOME_TMP/decoy-home";
+$ENV{ALMANAC_HOME} = $ENV{HOME};
 make_path($ENV{HOME});
 
 require "$S/BpHook.pm";
@@ -119,6 +137,30 @@ sub stop {
 sub token_of { my ($r) = @_; return $r->{err} =~ /Stop token: ([0-9a-f]{8})/ ? $1 : undef }
 sub armed    { my ($w) = @_; return with_env($w, sub { BpHook::is_armed($w->{sid}) }) }
 sub reasons  { my ($w) = @_; return slurp("$w->{root}/continuity/reasons.log") }
+
+# store_dir_for($w) -- the bug-reports store for this world's project data
+# dir (package 06-emergency-stop, Decision 26/AC14-16). Undef for a
+# no_data_dir world: there is no project store to file into at all.
+sub store_dir_for {
+    my ($w) = @_;
+    return undef if $w->{no_data};
+    return "$w->{data}/bug-reports";
+}
+sub store_snapshot_for {
+    my ($w) = @_;
+    my $dir = store_dir_for($w);
+    return () unless defined $dir && -d $dir;
+    opendir(my $dh, $dir) or return ();
+    my @f = sort grep { /\.md\z/ } readdir($dh);
+    closedir $dh;
+    return @f;
+}
+sub reasons_line_for {
+    my ($w, $tag) = @_;
+    my @lines = split /\n/, reasons($w);
+    my ($line) = grep { /\t\Q$tag\E\t/ } @lines;
+    return $line;
+}
 
 sub write_glass {
     my ($w, %f) = @_;
@@ -215,21 +257,89 @@ sub write_glass {
     my $w = world();
     my $t = token_of(stop($w));
     ok(defined $t, 'GLASS setup: a refusal minted a token');
+    my @before = store_snapshot_for($w);
     my $f = write_glass($w, token => $t, action => 'silence', reason => 'shell is broken, talking to operator');
     is(stop($w)->{rc}, 0, 'GLASS silence: a valid file lets the stop through');
     ok(!-e $f, 'GLASS silence: the file is consumed');
     ok(armed($w), 'GLASS silence: continuity stays on');
     like(reasons($w), qr/\tbreak-glass-silence\t.*shell is broken/, 'GLASS silence: logged with its reason');
     is(stop($w)->{rc}, 2, 'GLASS silence: one stop only -- the next is refused again');
+    # AC16 (no regression): silence is Decision 26's untouched path -- it
+    # files no bug report at all.
+    is_deeply([ store_snapshot_for($w) ], \@before, 'AC16: GLASS silence files no report (store has no new *.md)');
 }
 {
+    # AC14 (Decision 26): the pre-existing assertion below (off record
+    # carries "break-glass: all work done here") MUST stay byte-for-byte --
+    # it is the spec's own pin. Everything after it is new (AC14's bug-
+    # report-shape additions).
     my $w = world();
     my $t = token_of(stop($w));
+    my @before = store_snapshot_for($w);
     write_glass($w, token => $t, action => 'off', reason => 'all work done here');
     is(stop($w)->{rc}, 0, 'GLASS off: a valid file lets the stop through');
     ok(!armed($w), 'GLASS off: and continuity is off');
     like(slurp("$w->{root}/continuity/off/$w->{sid}"), qr/break-glass: all work done here/,
         'GLASS off: the off record carries the reason');
+
+    my @new = grep { my $x = $_; !grep { $_ eq $x } @before } store_snapshot_for($w);
+    is(scalar(@new), 1, 'AC14: exactly one new bug report was filed for the break-glass off') or diag("new=@new");
+    my ($id) = ($new[0] // '') =~ /^(.*)\.md\z/;
+
+    if (defined $id) {
+        my $report = slurp(store_dir_for($w) . "/$new[0]");
+        like($report, qr/^title: break-glass-off: all work done here$/m, 'AC14: report title');
+        like($report, qr/^severity: high$/m, 'AC14: report severity is high');
+        like($report, qr/^area: butler$/m, 'AC14: report area is butler');
+        like($report, qr/^Reason: all work done here$/m, 'AC14: report body has the reason line');
+        like($report, qr/^Session goal: /m, 'AC14: report body has a session-goal line');
+    }
+
+    my $offrec = slurp("$w->{root}/continuity/off/$w->{sid}");
+    like($offrec, qr/break-glass: all work done here; bug report: \S+/, 'AC14: the off reason ends in "; bug report: <id>"');
+
+    my $line = reasons_line_for($w, 'break-glass-off');
+    ok(defined $line, 'AC14: a break-glass-off reasons.log line exists');
+    like($line // '', qr/all work done here; bug report: \S+$/, 'AC14: and its text ends in "; bug report: <id>"')
+        if defined $line;
+}
+
+# ===========================================================================
+# AC15 (Decision 26, DC6 shape) -- break-glass off when filing fails: the
+# Stop is still allowed and the session is still disarmed; the failure is
+# visible in the captured stderr (warn) and in the off record.
+# ===========================================================================
+{
+    my $w = world();
+    my $t = token_of(stop($w));
+    my $dir = store_dir_for($w);
+    make_path($w->{data});
+    open(my $fh, '>', $dir) or die "create $dir as a file: $!";
+    print {$fh} "occupied\n";
+    close $fh;
+
+    write_glass($w, token => $t, action => 'off', reason => 'filing will fail here');
+    my $r = stop($w);
+    is($r->{rc}, 0, 'AC15: the Stop is still allowed when filing fails');
+    ok(!armed($w), 'AC15: and the session is still disarmed');
+    like($r->{err}, qr/stop-gate: break-glass off: bug report NOT filed \(/,
+        'AC15: captured stderr names the NOT-filed warning');
+
+    my $offrec = slurp("$w->{root}/continuity/off/$w->{sid}");
+    like($offrec, qr/bug report: FAILED \(/, 'AC15: the off record contains the FAILED note');
+}
+
+# AC15 (no project data dir at all): the error is the exact
+# "no project data directory" line (B14's last bullet).
+{
+    my $w = world(no_data_dir => 1);
+    my $t = token_of(stop($w));
+    write_glass($w, token => $t, action => 'off', reason => 'no data dir at all here');
+    my $r = stop($w);
+    is($r->{rc}, 0, 'AC15 (no data dir): the Stop is still allowed');
+    ok(!armed($w), 'AC15 (no data dir): and the session is still disarmed');
+    like($r->{err}, qr/no project data directory to file the bug report in/,
+        'AC15 (no data dir): the exact file_stop_bug error names the missing project data dir');
 }
 {
     my $w = world(no_data_dir => 1);
@@ -323,6 +433,15 @@ for my $case (
     is($n, 1, 'GC: the session whose transcript is gone is collected');
     ok(!-e $streak, 'GC: its stop-refusals record is removed');
     ok(!-e $glass,  'GC: its state-dir break-glass file is removed');
+}
+
+# ===========================================================================
+# AC8 (DC7, package 06-emergency-stop) -- the repo's REAL bug-reports store
+# is unchanged end to end.
+# ===========================================================================
+{
+    my @after = real_store_snapshot();
+    is_deeply(\@after, \@AC8_BEFORE, 'AC8: the real repo bug-reports store is unchanged by this file');
 }
 
 done_testing();
