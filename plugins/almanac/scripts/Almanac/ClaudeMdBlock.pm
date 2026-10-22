@@ -83,6 +83,39 @@ sub _neutralize_structural {
     return $s;
 }
 
+# _neutralize_imports($v) -- todo 20261002-005241-39730000. The rendered
+# block lands in ~/.claude/almanac-notes.md, which ~/.claude/CLAUDE.md
+# @-imports, and Claude Code follows @path imports recursively from inside an
+# imported file ("Imported files can recursively import other files, with a
+# maximum depth of four hops", code.claude.com/docs/en/memory). Title and
+# covers text reaches that file with no human review, so an "@~/.ssh/x" in a
+# note's covers would be pulled into every session's context. The same page:
+# "Import parsing skips Markdown code spans" -- so each @token outside an
+# existing code span is wrapped in one, keeping the text readable and inert.
+# An "@" glued to a preceding word character (user@example.com) is no import
+# and is left alone.
+sub _neutralize_imports {
+    my ($v) = @_;
+    return $v unless defined $v && index($v, '@') >= 0;
+    my $out = '';
+    # Alternate: an existing code span (kept verbatim), or plain text up to
+    # the next backtick. An unmatched backtick run becomes "'" (as
+    # _neutralize_structural does for title/target): left in place it could
+    # pair with a span added here and re-expose the token between them.
+    while (length $v) {
+        if ($v =~ s/\A((`+)[^`].*?(?<!`)\2(?!`))//s) {
+            $out .= $1;   # a complete code span: already inert
+        } elsif ($v =~ s/\A(`+)//) {
+            $out .= "'" x length($1);
+        } else {
+            $v =~ s/\A([^`]+)//;
+            (my $text = $1) =~ s/(?<![A-Za-z0-9._%+\-])(\@[^\s`]+)/`$1`/g;
+            $out .= $text;
+        }
+    }
+    return $out;
+}
+
 # _hash_payload($payload) -- sha256_hex of the payload's UTF-8 bytes. When
 # $payload is a raw byte string (Encode::is_utf8 false -- e.g. read directly
 # off disk by apply_file/remove_block_file, fix-batch C-1/HIGH-2), it is
@@ -204,10 +237,13 @@ sub render_block {
         # bound (block size ~ note count, not note content length).
         # MEDIUM-7: neutralise before truncating, so the fields that could
         # forge entry structure never reach render, at any length.
-        my $title  = _truncate_covers(_neutralize_structural($e->{title}), $budget);
+        # Import neutralising runs AFTER truncation: a cut through a code
+        # span it had added would leave an unclosed backtick, and the @token
+        # behind it live again. (The target is already inside a code span.)
+        my $title  = _neutralize_imports(_truncate_covers(_neutralize_structural($e->{title}), $budget));
         my $target = _truncate_covers(_neutralize_structural($e->{target}), $budget);
         my $covers_disp = (defined $e->{covers} && length $e->{covers})
-                         ? _truncate_covers($e->{covers}, $budget)
+                         ? _neutralize_imports(_truncate_covers($e->{covers}, $budget))
                          : '-';
         $payload .= "- **$title** ($e->{audience}) -- `$target`\n  $covers_disp\n";
     }
