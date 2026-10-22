@@ -52,6 +52,23 @@ sub _to_bytes {
     return $v;
 }
 
+# _sid_bytes($sid) -> $sid as a byte string. A session id is validated as
+# ASCII-only, but callers routinely pass one read back out of a decoded record
+# (Almanac::Record decodes every field, so a thread's owner_id is utf8-FLAGGED
+# even when pure ASCII). Interpolating a flagged string into a raw-byte path
+# upgrades the path's non-ASCII bytes as Latin-1 ("C3 A9" -> "C3 83 C2 A9"
+# on disk), so on a non-ASCII profile path (this host's own) the transcript, the arm
+# record and the subagents dir all silently go missing and a live session
+# reads dead (todo 20261002-125337-de8b0000). Same bug class as
+# orchestrator_live's _to_bytes join; callers validate before calling this.
+sub _sid_bytes {
+    my ($sid) = @_;
+    return undef unless defined $sid;
+    my $v = "$sid";
+    utf8::encode($v) if utf8::is_utf8($v);
+    return $v;
+}
+
 sub _read_bytes {
     my ($path) = @_;
     open(my $fh, '<:raw', $path) or return undef;
@@ -131,6 +148,7 @@ sub butler_state_dir {
 sub arm_record {
     my ($sid, %o) = @_;
     return undef unless defined $sid && $sid =~ /\A[A-Za-z0-9_-]{1,128}\z/;
+    $sid = _sid_bytes($sid);
     my $present = exists $o{butler_present} ? ($o{butler_present} ? 1 : 0) : butler_present();
     return undef unless $present;
     my $bsd = butler_state_dir();
@@ -148,6 +166,7 @@ sub find_transcript {
     my ($sid) = @_;
     return (undef, 0) unless defined $sid && length $sid;
     return (undef, 0) if $sid =~ /[\/\\\x00]/;
+    $sid = _sid_bytes($sid);
 
     my @roots;
     {
@@ -202,6 +221,7 @@ sub judge {
     unless (defined $session && $session =~ /\A[A-Za-z0-9_-]{1,128}\z/) {
         return { state => 'dead', basis => 'bad-session', armed => 0, idle => undef, transcript_path => undef };
     }
+    $session = _sid_bytes($session);
 
     my $bp = exists $a{butler_present} ? ($a{butler_present} ? 1 : 0) : butler_present();
     my $arm = arm_record($session, butler_present => $bp);
