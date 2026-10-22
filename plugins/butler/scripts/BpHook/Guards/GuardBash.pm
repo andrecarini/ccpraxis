@@ -1103,8 +1103,18 @@ sub _neutralize_perl_syntax_checks {
 }
 
 # tree-wide scan (b), shared by the coordinator and driver branches.
+#
+# $scope (optional) = { paths => \@caller_scope, full_sweep => 0|1 }. When the
+# caller's own scope resolved and the run is not a full sweep, a live writer
+# whose ledger write_set resolves and does not overlap the caller's scope is
+# skipped, exactly as the same-blueprint path skips a disjoint writer (B-4).
+# Without it every writer in every blueprint blocked every test run: with two
+# fleets in one tree, nearly every run of one fleet collided with whatever
+# the other had in flight (where-things-go/10 vs judged-continuity-disarm/02,
+# 2026-10-22). An unresolvable foreign write_set, an unresolved caller scope
+# and a full sweep all keep the old, conservative deny.
 sub _tree_check {
-    my ($p, $cmd, $data, $root, $self, $stale_min) = @_;
+    my ($p, $cmd, $data, $root, $self, $stale_min, $scope) = @_;
     return undef unless defined $data && length $data && -d $data;
     return undef unless defined $root && length $root && -d $root;
 
@@ -1166,6 +1176,11 @@ sub _tree_check {
         my $pkg = basename($c);
         $pkg =~ s/\.active-worker$//;
         my $bpname = basename(dirname(dirname($c)));
+        if (ref $scope eq 'HASH' && ref $scope->{paths} eq 'ARRAY' && !$scope->{full_sweep}
+            && _valid_member_name($bpname) && _valid_member_name($pkg)) {
+            my $fws = _read_ledger_write_set($data, $bpname, $pkg);
+            next if defined $fws && !write_sets_overlap($scope->{paths}, $fws);
+        }
         return [
             $role,
             _sanitize($bpname, 64),
@@ -1866,7 +1881,25 @@ sub _gb_d {
             my $root = $parent;
             my $self = "$root/" . basename($bp_dir_n) . "/runs/$pkg.active-worker";
             my $data = dirname($root);
-            my $found = _tree_check($p, $cmd, $data, $root, $self, $stale_min);
+            # Write-set scoping applies only to a run of exactly one test file
+            # inside this package's own write_set/test_paths (the driver's
+            # Decision 36 N6 rule): which file runs is what decides what gets
+            # read, so a multi-file run, a sweep or a foreign test file keeps
+            # the tree-wide deny.
+            my $own_bp = basename($bp_dir_n);
+            my $scope;
+            if (_valid_member_name($own_bp) && _valid_member_name($pkg) && !_is_full_sweep_runner($cmd)) {
+                my $paths = _ledger_scope_paths($data, $own_bp, $pkg);
+                my $operand = _scoped_test_operand($cmd);
+                # _scoped_test_operand reads segment 0 only; "perl mine.t &&
+                # perl theirs.t" must not scope on mine.t alone.
+                my @segs = eval { BpHook::_segments($cmd) };
+                $operand = undef if !@segs || grep { _validation_shaped($_) } @segs[1 .. $#segs];
+                $scope = { paths => $paths, full_sweep => 0 }
+                    if defined $paths && @$paths && defined $operand
+                    && _operand_in_scope($operand, $data, $paths);
+            }
+            my $found = _tree_check($p, $cmd, $data, $root, $self, $stale_min, $scope);
             if (defined $found) {
                 my ($role, $bpname, $pkgname) = @$found;
                 return [
