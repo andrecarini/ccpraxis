@@ -1665,8 +1665,9 @@ sub recent_events {
 # package 13-dashboard-threads (specs/13-dashboard-threads-spec.md S2.4): the
 # thread-log-event surface that gets interleaved into the activity feed built
 # above. RunState carries each project's thread_events on every `runs`
-# element (the only channel from RunState to Dashboard without touching
-# launcher.pl, which is outside this package's write set).
+# element, and launcher.pl's gather also passes them on their own
+# (`thread_events`, from RunState::summarize's out parameter) so a project
+# with no blueprint summary still gets them -- see thread_event_carriers.
 # ===========================================================================
 
 our $THREAD_FEED_MAX     = 10;    # same bound as the fleet source (recent_events' default $n)
@@ -1749,6 +1750,9 @@ sub thread_event_rows {
         for my $ev (@{ $r->{thread_events} }) {
             next unless ref($ev) eq 'HASH';
             next unless _thread_epoch_ok($ev->{epoch});
+            # reviewer N2: a carrier element with no usable event name would
+            # warn in the body interpolation and the %COUNTERPART lookup.
+            next unless defined($ev->{event}) && !ref($ev->{event}) && length($ev->{event});
             my $thread = $ev->{thread};
             my $id     = $ev->{id};
             next unless defined($thread) && !ref($thread) && defined($id) && !ref($id);
@@ -1785,6 +1789,37 @@ sub thread_event_rows {
                           thread => $ev->{thread}, id => $ev->{id} };
     }
     return \@records;
+}
+
+# _fleet_thread(\@runs) -> ($known, $thread_name|undef) (private, pure). The
+# run whose orchestrator.log feeds the activity panel, chosen exactly as
+# launcher.pl's _gather_orchestrator_events chooses it, and the name of the
+# thread RunState attached to it. $known is 0 when no such run exists.
+sub _fleet_thread {
+    my ($runs) = @_;
+    return (0, undef) unless ref($runs) eq 'ARRAY';
+    my @c = grep { ref($_) eq 'HASH' && defined($_->{runs_dir}) } @$runs;
+    my $st = sub { my $v = $_[0]{state}; (defined($v) && !ref($v)) ? $v : '' };
+    my ($active) = grep { $st->($_) eq 'running' } @c;
+    ($active) = grep { $st->($_) eq 'paused' } @c unless $active;
+    return (0, undef) unless $active;
+    my $th = $active->{thread};
+    my $name = (ref($th) eq 'HASH' && defined($th->{name}) && !ref($th->{name})) ? $th->{name} : undef;
+    return (1, $name);
+}
+
+# thread_event_carriers(\%gathered) -> \@carriers (PUBLIC, pure, total). The
+# \@runs argument merge_thread_events takes, built from one gather: every run
+# summary, then one synthetic carrier { thread_events => ... } holding the
+# gather's project-level `thread_events` when that is an ARRAY. The synthetic
+# carrier is what makes thread activity visible for a project with no
+# blueprint summary at all. Non-HASH input gives [].
+sub thread_event_carriers {
+    my ($g) = @_;
+    return [] unless ref($g) eq 'HASH';
+    my @c = (ref($g->{runs}) eq 'ARRAY') ? @{ $g->{runs} } : ();
+    push @c, { thread_events => $g->{thread_events} } if ref($g->{thread_events}) eq 'ARRAY';
+    return \@c;
 }
 
 # merge_thread_events(\@events, \@runs, $localtime_fn, $now) -> \@merged
@@ -1834,11 +1869,23 @@ sub merge_thread_events {
             push @candidates, { idx => $i, kind => $kind, key => $key };
         }
 
+        # redteam L2: the fleet rows all come from ONE run -- the one
+        # launcher.pl's _gather_orchestrator_events picks (a run with a
+        # runs_dir, 'running' first, else 'paused'). Only that run's own
+        # thread can be the other half of one of its rows; matching on kind
+        # alone let thread A's `launched` swallow blueprint B's
+        # orchestrator_start. When no such run is identifiable among \@runs,
+        # the kind-only match stands (nothing narrower is knowable).
+        my ($fleet_known, $fleet_thread) = _fleet_thread($runs);
+
         my %consumed;
         my @surviving_R;
         for my $rec (@$R) {
             my $counterpart = $COUNTERPART{ $rec->{event} };
             if (!defined $counterpart) { push @surviving_R, $rec; next; }
+            if ($fleet_known && !(defined($fleet_thread) && $rec->{thread} eq $fleet_thread)) {
+                push @surviving_R, $rec; next;
+            }
             my $rk = row_time_key($rec->{row});
             if (!defined $rk) { push @surviving_R, $rec; next; }
 
@@ -3473,7 +3520,14 @@ sub run {
                     # thread-log rows get slotted into the activity feed here,
                     # wrapped in eval with the old assignment as the fallback --
                     # a failure in the merge must never blank the feed.
-                    my $merged_events = eval { merge_thread_events($base->{events} || [], $base->{runs}, undef, $t) };
+                    # The carriers are every run summary PLUS the gather's own
+                    # project-level thread_events: a project with no blueprint
+                    # summary has nothing else to carry them (todo
+                    # 20261002-193830-34ac0000). thread_event_rows dedups by
+                    # thread/id, so the overlap with the summaries is free.
+                    my $merged_events = eval {
+                        merge_thread_events($base->{events} || [], thread_event_carriers($base), undef, $t)
+                    };
                     @all_events = (ref($merged_events) eq 'ARRAY') ? @$merged_events : @{ $base->{events} || [] };   # chronological
                     $activity_offset = 0 if $activity_offset < 0;
                     $last_state = $t;

@@ -281,12 +281,78 @@ sub _synth_run_agents {
                 started_at => SYNTH_NOW() - 600, budget_seconds => 1800, stale_after_seconds => 7200 } ];
 }
 
+# synth_thread($i, $phase) -> \%thread | undef, and synth_thread_events($phase)
+# -> \@events: the package-13 thread surface (RunState's `thread` run key and
+# its project-level `thread_events`), shapes copied from RunState's own
+# thread_out / _thread_events_for rather than invented. Every running run gets
+# a thread; the owner cycles through live / dead / unowned with $phase, and the
+# current task alternates between a text task, a blocked one with a waits-on,
+# and a link to a package, so every branch of the thread line is reachable.
+# Times hang off SYNTH_NOW, never the clock.
+sub synth_thread {
+    my ($i, $phase) = @_;
+    my $name = ('drive-tooling', 'fleet-run', 'where-things-go')[ $i % 3 ];
+    my $mode = ($i + $phase) % 3;
+    my @doing = $mode == 0
+        ? ({ class => 'doing', kind => 'text', title => 'retire the old continuity gate and its tests', waits_on => undef })
+        : ();
+    my $current = $mode == 1
+        ? { class => 'blocked', kind => 'text', title => 'pick the default font for the new window',
+            waits_on => 'operator answer in the inbox' }
+        : { class => 'pending', kind => 'link', blueprint => 'where-things-go', number => '13', step => 'review' };
+    my $owner_mode = int($phase / 7 + $i) % 3;
+    my $owner = $owner_mode == 0 ? { kind => 'orchestrator', id => 'where-things-go', alive => 1, activity_at => undef, armed => 1 }
+              : $owner_mode == 1 ? { kind => 'orchestrator', id => 'where-things-go', alive => 0, activity_at => undef, armed => 0 }
+              :                    { kind => 'session', id => 'synthetic-session', alive => undef,
+                                     activity_at => SYNTH_NOW() - 60 * ($phase % 50), armed => 1 };
+    return {
+        name    => $name,
+        state   => 'live',
+        done    => ($i + $phase) % 7,
+        total   => 7,
+        doing   => \@doing,
+        current => @doing ? undef : $current,
+        next    => { class => 'pending', kind => 'text', title => 'write the follow-up todo for the wrap finding', waits_on => undef },
+        owner   => $owner,
+    };
+}
+
+sub synth_thread_events {
+    my ($phase) = @_;
+    my @kinds = (
+        { event => 'launched' },
+        { event => 'task-status', task => '20261003-000403', from => 'pending', to => 'doing' },
+        { event => 'paused', reason => 'usage-window' },
+        { event => 'task-status', task => '20261002-193830', from => 'doing', to => 'done' },
+        { event => 'resumed' },
+        { event => 'task-status', task => '20261002-235037', from => 'doing', to => 'blocked' },
+    );
+    my $n = 1 + ($phase % scalar(@kinds));
+    my @out;
+    for my $k (0 .. $n - 1) {
+        my $epoch = SYNTH_NOW() - 60 * (7 * ($n - $k) + ($phase % 5));
+        my ($s, $mi, $h, $d, $mo, $y) = gmtime($epoch);
+        push @out, {
+            thread => 'drive-tooling', id => sprintf('%08d', $k + 1),
+            at => sprintf('%04d-%02d-%02dT%02d:%02d:%02dZ', $y + 1900, $mo + 1, $d, $h, $mi, $s),
+            epoch => $epoch, actor => 'driver', session => undef,
+            task => undef, from => undef, to => undef, reason => undef,
+            %{ $kinds[$k] },
+        };
+    }
+    return \@out;
+}
+
+# synth_localtime($epoch) -> localtime-shaped list, in UTC: the preview's
+# feed timestamps must not depend on the host's zone (AC42 reproducibility).
+sub synth_localtime { return gmtime($_[0]) }
+
 # synth_runs($n, $phase) -> \@runs. Field names taken from the shipped
 # struct, never guessed -- a first pass that invented {name}/{pct} rendered
 # every row as "? running 0/0 pkg", a preview that looked plausible and
 # showed nothing (this file's own long-standing warning, package 07's own
 # repeat of it at ten times the struct size). EVERY element (running or not)
-# carries the full 17-key run-level struct (S2.10) -- simpler than
+# carries the full 19-key run-level struct (S2.10 + package 13) -- simpler than
 # maintaining two shapes, and nothing downstream distinguishes them; a
 # non-running element's packages/run_agents are simply empty, which is what
 # the real gate (_tree_lines: state eq 'running') already requires for a
@@ -332,6 +398,8 @@ sub synth_runs {
             triage_waiting           => ($i + $phase + 1) % 3,
             packages                 => $packages,
             run_agents               => $run_agents,
+            thread                   => $running ? synth_thread($i, $phase) : undef,
+            thread_events            => synth_thread_events($phase),
         };
     }
     return \@out;
@@ -418,8 +486,8 @@ sub synth_state {
         # own cadence), so they are separate here.
         title_spinner_idx => $phase % Theme::SPINNER_FRAMES(),
         resources        => synth_resources($phase),
-        events           => synth_events($phase),
         runs             => synth_runs($n_runs, $phase),
+        thread_events    => synth_thread_events($phase),
         backpack         => { items => ($phase % 8), pending => ($phase % 5) },
         oauth_remaining  => 7 * 3600 + 21 * 60 - ($phase * 60),
         tokens           => $tokens,
@@ -428,6 +496,17 @@ sub synth_state {
         needs_you        => int($phase / 11) % 3,
         pending          => int($phase / 3) % 4,
     );
+
+    # The activity feed goes through the SAME thread-event merge Dashboard::run
+    # applies to every gather, so thread-log rows interleave (and dedup against
+    # fleet rows) exactly as they would live. The fallback is the bare feed, as
+    # in Dashboard::run: a merge failure must never blank the panel.
+    my $fleet  = synth_events($phase);
+    my $merged = eval {
+        Dashboard::merge_thread_events($fleet, Dashboard::thread_event_carriers(\%st),
+                                       \&synth_localtime, SYNTH_NOW())
+    };
+    $st{events} = (ref($merged) eq 'ARRAY') ? $merged : $fleet;
 
     # BANNERS ARE THE BIGGEST SIZE EVENT ON THE SCREEN -- each one pushes the
     # whole panel grid down a row (or several, once it wraps), so a layout that

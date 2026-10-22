@@ -1602,9 +1602,10 @@ SKIP: {
             my @RUN_KEYS = qw(blueprint runs_dir state orchestrator_pid orchestrator_alive
                 orchestrator_started_at paused_manual paused_reason packages_total packages_done
                 current_package running_coordinators escalations_waiting inbox_waiting
-                triage_waiting packages run_agents);
+                triage_waiting packages run_agents
+                thread thread_events);   # package 13 added the 18th/19th keys to RunState's struct
             my $r = $running[0];
-            is_deeply([ sort keys %$r ], [ sort @RUN_KEYS ], 'AC36: a running synth_runs element has EXACTLY the 17 S2.10 run-level keys (set equality)');
+            is_deeply([ sort keys %$r ], [ sort @RUN_KEYS ], 'AC36: a running synth_runs element has EXACTLY the 19 run-level keys RunState emits (set equality)');
             my $pkgs = $r->{packages};
             ok(ref($pkgs) eq 'ARRAY' && @$pkgs, 'AC36 precondition: the running element carries a non-empty packages array');
           SKIP: {

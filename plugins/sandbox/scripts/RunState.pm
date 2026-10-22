@@ -39,9 +39,9 @@ package RunState;
 use strict;
 use warnings;
 use JSON::PP ();
-use Time::Local ();   # pure UTC arithmetic only (Time::Local::timegm), eval-wrapped below -- this
-                       # module reads no clock, so every epoch this file ever produces comes from a
-                       # byte already on disk (a log record's own `at:` field), never from "now".
+# No Time::Local: this module reads no clock, and Time::Local calls one at load
+# (redteam L1). Every epoch this file produces comes from a byte already on disk
+# (a log record's own `at:` field) via _utc_epoch's plain arithmetic.
 
 our $MAX_REGISTRY_BYTES = 4 * 1024 * 1024;   # 4 MiB, mirrors SessionFilter
 our $MAX_LEDGER_BYTES   = 65536;             # 64 KiB of a package ledger is plenty for frontmatter
@@ -1032,6 +1032,15 @@ sub _project_root {
     return $1;
 }
 
+# %THREAD_EVENT_OK -- restates Almanac::Thread's @EVENTS exactly (the only
+# event names Almanac's writer accepts). A thread-log record naming anything
+# else did not come from that writer and is not surfaced.
+# dashboard-threads-followups.t
+# pins the two lists equal.
+our @THREAD_EVENTS = qw(created attached detached handed-off taken-over paused resumed archived
+                        task-status launched escalation-sent answer-applied finished);
+my %THREAD_EVENT_OK = map { $_ => 1 } @THREAD_EVENTS;
+
 # _valid_thread_name($name) -> 0|1 (private)
 #
 # Restates Almanac::Thread::valid_name exactly.
@@ -1194,6 +1203,7 @@ sub _pipeline_step_word {
         next if length($line) > 1024;
         if ($line =~ /\A[ \t]*-[ \t]*\[([ xX])\][ \t]*(\d{1,2})\.[ \t]+(\S+)/) {
             my ($mark, $num, $word) = ($1, $2, $3);
+            $num = 0 + $num;   # reviewer N3: "01." and "1." are one step, as statusline.pl reads it
             next if exists $entry{$num};
             $entry{$num} = [ ($mark eq 'x' || $mark eq 'X') ? 1 : 0, $word ];
         }
@@ -1246,6 +1256,10 @@ sub _link_resolve {
     my $archived_path = "$bdir/_archive/$bp/packages/$pkg.md";
 
     my $ledger;
+    # The !-l is a deliberate divergence from Almanac::PackageLink::resolve and
+    # statusline.pl's restatement (reviewer N4): this module never follows a
+    # symlink into data it renders, so a symlinked ledger reads `missing` here
+    # where those read it `ok`.
     if    (-f $live_path     && !-l $live_path)     { $ledger = $live_path; }
     elsif (-f $archived_path && !-l $archived_path) { $ledger = $archived_path; }
     else {
@@ -1390,8 +1404,9 @@ sub _build_owner {
 # _thread_build($project_root, $blueprints_root, $name, \%fields, \%cache, \$link_budget)
 #   -> \%thread | undef (private)
 #
-# undef means "skip this thread entirely" (an over-cap task set, spec S2.2
-# step 4). Otherwise: name/done/total/doing/current/next/owner/driven, where
+# Never undef in practice: an over-cap task set (spec S2.2 step 4) yields a
+# degraded thread with no progress and a "not read" label, never a skip.
+# Otherwise: name/done/total/doing/current/next/owner/driven, where
 # `driven` is the set of blueprint names this thread's own tasks + its
 # `blueprints` field name (spec S2.2 step 5) -- `state` is added by the
 # caller, which already has it from the thread record.
@@ -1420,7 +1435,25 @@ sub _thread_build {
             closedir $dh;
         }
     }
-    return undef if scalar(@raw_ids) > $MAX_THREAD_TASKS;
+    # Over the cap the task set is not read at all (the abuse case the cap
+    # exists for), but the THREAD stays: dropping it used to make a thread
+    # vanish from the dashboard once it accumulated its 513th task, with
+    # another thread silently taking its line (redteam L6). It keeps its
+    # owner and its `blueprints` claim, and says why its progress is absent.
+    if (scalar(@raw_ids) > $MAX_THREAD_TASKS) {
+        my %driven_cap;
+        if (defined($fields->{blueprints}) && length($fields->{blueprints})) {
+            $driven_cap{$_} = 1 for split /,/, $fields->{blueprints};
+        }
+        return {
+            name => $name, done => 0, total => 0, doing => [],
+            current => { class => 'blocked', kind => 'text',
+                         title => "over $MAX_THREAD_TASKS tasks, not read", waits_on => undef },
+            next => undef,
+            owner => _build_owner($blueprints_root, $project_root, $fields),
+            driven => \%driven_cap,
+        };
+    }
 
     my @candidates;
     for my $pair (@raw_ids) {
@@ -1513,7 +1546,31 @@ sub _thread_build {
     };
 }
 
-# _thread_events_for(\%kept) -> \@events (private). Spec S2.2 step 7:
+# _utc_epoch($year, $month, $day, $hour, $min, $sec) -> Int | undef (private,
+# pure). Seconds since 1970-01-01T00:00:00Z for a UTC civil instant, by the
+# days-from-civil algorithm (proleptic Gregorian). undef for any field that is
+# not a non-negative integer, a year before 1970, or an instant that does not
+# exist (month 13, Feb 30, hour 24, minute or second 60).
+sub _utc_epoch {
+    my ($y, $mo, $d, $h, $mi, $s) = @_;
+    for my $v ($y, $mo, $d, $h, $mi, $s) {
+        return undef unless defined($v) && !ref($v) && $v =~ /\A\d{1,4}\z/;
+    }
+    ($y, $mo, $d, $h, $mi, $s) = map { $_ + 0 } ($y, $mo, $d, $h, $mi, $s);
+    return undef if $y < 1970 || $mo < 1 || $mo > 12 || $h > 23 || $mi > 59 || $s > 59;
+    my $leap = (($y % 4 == 0) && ($y % 100 != 0)) || ($y % 400 == 0);
+    my @dim = (31, $leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31);
+    return undef if $d < 1 || $d > $dim[$mo - 1];
+    my $yy  = ($mo <= 2) ? $y - 1 : $y;
+    my $era = int($yy / 400);
+    my $yoe = $yy - $era * 400;
+    my $doy = int((153 * ($mo > 2 ? $mo - 3 : $mo + 9) + 2) / 5) + $d - 1;
+    my $doe = $yoe * 365 + int($yoe / 4) - int($yoe / 100) + $doy;
+    my $days = $era * 146097 + $doe - 719468;
+    return $days * 86400 + $h * 3600 + $mi * 60 + $s;
+}
+
+# _thread_events_for(\%kept, $project_root) -> \@events (private). Spec S2.2 step 7:
 # project-level, the newest $MAX_THREAD_EVENTS entries across every kept
 # thread, ascending by (epoch, thread, id).
 sub _thread_events_for {
@@ -1551,20 +1608,20 @@ sub _thread_events_for {
             my $f = _parse_record($blob);
             next unless ref($f) eq 'HASH';
             my $event = $f->{event};
-            next unless defined($event) && length($event);
+            # Only Almanac's own event vocabulary (redteam L3): the feed styles
+            # rows by event name, so a free-form name like `x_dead` would pick
+            # up crit styling and raise a false alarm.
+            next unless defined($event) && $THREAD_EVENT_OK{$event};
             my $at = $f->{at};
             next unless defined($at) && $at =~ /\A(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)Z\z/;
             my ($yr, $mo, $dy, $h, $mi, $s) = ($1, $2, $3, $4, $5, $6);
-            # S2 fix: pass the 4-digit year as is. timegm($y - 1900) feeds
-            # Time::Local its rolling-century heuristic (meant for 2-digit
-            # years), so 1970 - 1900 = 70 is read back as 2070, not 1970
-            # (measured: Time::Local::timegm(0,0,0,1,0,70) == 3155760000).
-            # Reject anything before 1970 outright rather than let the same
-            # heuristic silently reinterpret it.
-            next if ($yr + 0) < 1970;
-            local $@;
-            my $epoch = eval { Time::Local::timegm($s, $mi, $h, $dy, $mo - 1, $yr) };
-            next if $@ || !defined($epoch);
+            # Plain civil-date arithmetic (_utc_epoch), not Time::Local:
+            # loading Time::Local calls the clock at module load, which broke
+            # this module's "reads no clock" contract (redteam L1), and its
+            # timegm reads years through a rolling-century heuristic (S2).
+            # Anything before 1970 or not a real calendar instant is skipped.
+            my $epoch = _utc_epoch($yr, $mo, $dy, $h, $mi, $s);
+            next unless defined $epoch;
             # M3 fix: a thread record the container controls can set `at:`
             # to any future timestamp; without a ceiling it would sort as
             # the newest event forever and permanently occupy a slot in the
@@ -1935,7 +1992,7 @@ sub summarize_dir {
     # "a runs/.shutdown marker exists". $run_over, computed above, is derived
     # from the run markers only and is NOT recomputed here: escalations/
     # inbox/triage waiting counts stay exactly what the same fixture reports
-    # under any other authored value. No new key -- the 17-key set is closed.
+    # under any other authored value. No new key -- the run-level key set is closed (19 keys since package 13).
     $state = 'parked' if _bp_authored_parked($blueprint_dir);
     # The queue directory was renamed needs-you -> escalations: the old name
     # claimed the operator owns every record, and most are resolver-owned.
@@ -1982,6 +2039,16 @@ sub summarize_dir {
             next    => (ref($chosen->{next})    eq 'HASH') ? { %{ $chosen->{next} } }    : undef,
             owner   => (ref($chosen->{owner})   eq 'HASH') ? { %{ $chosen->{owner} } }   : undef,
         };
+        # redteam L4: an orchestrator owner's `alive` was read from the
+        # .orchestrator marker of the blueprint the owner id names. On THIS
+        # blueprint's line that says nothing unless it is this blueprint, so
+        # a thread owned by another blueprint's orchestrator renders its
+        # liveness as unknown rather than borrowing that one's "live".
+        my $o = $thread_out->{owner};
+        if (ref($o) eq 'HASH' && defined($o->{kind}) && $o->{kind} eq 'orchestrator'
+            && !(defined($o->{id}) && !ref($o->{id}) && defined($bp_name) && $o->{id} eq $bp_name)) {
+            $o->{alive} = undef;
+        }
     }
     my $thread_events_src = (ref($tidx) eq 'HASH' && ref($tidx->{events}) eq 'ARRAY') ? $tidx->{events} : [];
     my $thread_events_out = [ map { { %$_ } } @$thread_events_src ];
@@ -2023,8 +2090,17 @@ sub summarize_dir {
 # than each blueprint re-enumerating and re-opening the same records --
 # without this, an 11-run dashboard would pay the opendir + up-to-512
 # head-reads eleven times per 10s gather tick instead of once.
+#
+# summarize($root, \%extra) -- the optional second argument is an OUT
+# parameter: when it is a HASH ref, $extra->{thread_events} receives a fresh
+# deep copy of the PROJECT-level thread_events (the same list every summary
+# also carries), filled even when no blueprint yields a summary. That is the
+# only way thread activity reaches the dashboard for a project with no
+# blueprint on it (todo 20261002-193830-34ac0000): the per-summary copies need
+# a summary to ride on. An out parameter rather than a new return shape, so
+# every existing caller keeps its arrayref and the index is still built once.
 sub summarize {
-    my ($root) = @_;
+    my ($root, $extra) = @_;
     my $idx = _dispatch_index(_dispatch_dir($root));
     # package 13-dashboard-threads (spec S2.2): the thread index is built
     # ONCE here too, same reasoning as the dispatch index above.
@@ -2033,6 +2109,10 @@ sub summarize {
     for my $dir (blueprint_dirs($root)) {
         my $s = summarize_dir($dir, $idx, $tidx);
         push @out, $s if defined $s;
+    }
+    if (ref($extra) eq 'HASH') {
+        my $src = (ref($tidx) eq 'HASH' && ref($tidx->{events}) eq 'ARRAY') ? $tidx->{events} : [];
+        $extra->{thread_events} = [ map { { %$_ } } @$src ];
     }
     return \@out;
 }

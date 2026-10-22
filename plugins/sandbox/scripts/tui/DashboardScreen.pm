@@ -1158,8 +1158,8 @@ sub thread_owner_status {
 
     if ($kind eq 'orchestrator') {
         my $alive = $owner->{alive};
-        return 'live' if defined($alive) && $alive == 1;
-        return 'dead' if defined($alive) && $alive == 0;
+        return 'live' if defined($alive) && !ref($alive) && "$alive" eq '1';
+        return 'dead' if defined($alive) && !ref($alive) && "$alive" eq '0';
         return 'unknown';
     }
 
