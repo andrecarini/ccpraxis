@@ -2001,6 +2001,11 @@ sub _gb_d {
                                 my $pkgname = _sanitize($w_resolved->{package}, 64);
                                 return [
                                     "BLOCKED (validation interlock): package $pkgname of blueprint $bpname has a write-capable worker ($role_writer) in flight whose write set overlaps yours; this run could report a false red.",
+                                    # A coordinator that read only the line
+                                    # above parked its package as needing a
+                                    # human (judged-continuity-disarm/01,
+                                    # 2026-10-22): say what to do.
+                                    "This clears when that worker finishes. It is not a reason to park or block: do other work meanwhile, or record the pending run in ## Next action, keep the ledger running, and retry after your own next worker returns.",
                                     $cmd_line,
                                 ];
                             }
