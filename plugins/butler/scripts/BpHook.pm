@@ -364,6 +364,7 @@ sub arm {
     }
     my $by = $opts{by};
     unless (defined $by && $by =~ /^[a-z][a-z0-9-]{0,31}$/) { _set_error('bad role'); return 0 }
+    if (defined $opts{goal} && ref $opts{goal}) { _set_error('bad goal'); return 0 }
     my $root = state_dir();
     unless (defined $root) { _set_error('no state root'); return 0 }
     my $lockdir = "$root/armlock";
@@ -382,8 +383,19 @@ sub arm {
         _set_error('off');
         return 0;
     }
+    my $goal;
+    if (defined $opts{goal} && length $opts{goal}) {
+        $goal = _decode_maybe($opts{goal});
+    }
+    else {
+        my $prior = _read_json("$root/armed/$sid");
+        if (ref $prior eq 'HASH' && defined $prior->{goal} && !ref $prior->{goal} && length $prior->{goal}) {
+            $goal = $prior->{goal};
+        }
+    }
     my $rec = { session_id => $sid, role => $role, by => $by, at => _iso_now() };
     if (defined $opts{transcript_path}) { $rec->{transcript_path} = _to_json_path($opts{transcript_path}) }
+    if (defined $goal) { $rec->{goal} = $goal }
     my $ok = _write_json_atomic("$root/armed/$sid", $rec);
     if ($ok && $by eq 'on') { unlink($offpath) }
     flock($lockfh, LOCK_UN);

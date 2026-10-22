@@ -2,8 +2,8 @@
 # butler-continuity.pl -- the one command for Decision 1's arm and disarm
 # triggers (package 04 of blueprint hook-continuity-remake).
 #
-#   butler-continuity on (--new-thread <name> | --thread <name>) [--role driver]
-#   butler-continuity on      --role reporter
+#   butler-continuity on (--new-thread <name> | --thread <name>) [--role driver] --goal '<what this session is for>'
+#   butler-continuity on      --role reporter [--goal '<...>']
 #   butler-continuity off     [--reason '<2+ words>'] [--token <8 hex>]
 #   butler-continuity silence  --reason '<2+ words>'  [--token <8 hex>]
 #   butler-continuity status
@@ -29,7 +29,7 @@ require "$Bin/BpHook.pm"
 require "$Bin/BpContinuityLease.pm"
     unless grep { m{(?:^|/)BpContinuityLease\.pm$} } keys %INC;
 
-my $USAGE = q{usage: butler-continuity on --new-thread <name> | on --thread <name> [--role driver] | on --role reporter | off [--reason '<why>'] [--token T] | silence --reason '<why>' [--token T] (escape hatch: use sparingly) | status};
+my $USAGE = q{usage: butler-continuity on --new-thread <name> | on --thread <name> [--role driver] --goal '<what this session is for>' | on --role reporter [--goal '<...>'] | off [--reason '<why>'] [--token T] | silence --reason '<why>' [--token T] (escape hatch: use sparingly) | status};
 
 sub _bytes {
     my ($s) = @_;
@@ -238,7 +238,7 @@ if (defined $verb && exists $RETIRED_VERBS{$verb}) {
 usage_die() unless defined $verb && $verb =~ /^(?:on|off|silence|status)$/;
 
 my %allowed = (
-    on        => { role => 1, 'new-thread' => 1, thread => 1 },
+    on        => { role => 1, 'new-thread' => 1, thread => 1, goal => 1 },
     off       => { reason => 1, token => 1 },
     silence   => { reason => 1, token => 1 },
     status    => {},
@@ -350,6 +350,29 @@ if ($verb eq 'on') {
     }
     else {
         $ON_ALMANAC_ABSENT_WARN = 1 if defined $ON_THREAD_MODE;
+    }
+}
+
+# Step 2c: --goal (on only; blueprint judged-continuity-disarm pkg 01,
+# Decisions 5/17). After the coordinator exit and the thread rule; still
+# nothing consumed.
+my $ON_GOAL;    # sanitized goal text, or undef when no --goal was given
+if ($verb eq 'on') {
+    my $role = $flags{role} // 'manual';
+    if (!exists $flags{goal}) {
+        refuse("on needs --goal '<what this session is for>': it is stored with the arm so a later stop can be checked against it. If the operator asked for this session to be armed, paraphrase their request; if you are arming on your own initiative, state your own rationale.") if $role ne 'reporter';
+    }
+    else {
+        if (!defined $flags{goal} || visible_word_count($flags{goal}) < 2) {
+            refuse("--goal needs at least two words saying what this session is for.");
+        }
+        my $san = sanitize_text($flags{goal});
+        my $b = $san;
+        utf8::encode($b) if utf8::is_utf8($b);
+        if (length($b) > 200) {
+            refuse("--goal is at most 200 bytes; it goes into the arm record.");
+        }
+        $ON_GOAL = $san;
     }
 }
 
@@ -793,7 +816,7 @@ sub _status_thread_line {
 if ($verb eq 'on') {
     my $role = $flags{role} // 'manual';
     my $th = ($ALMANAC_PRESENT && defined $ON_THREAD_MODE) ? _on_thread($ON_THREAD_MODE, $ON_THREAD_NAME) : undef;
-    my $ok = BpHook::arm($SID, role => $role, by => 'on', transcript_path => $TRANSCRIPT_PATH);
+    my $ok = BpHook::arm($SID, role => $role, by => 'on', transcript_path => $TRANSCRIPT_PATH, goal => $ON_GOAL);
     unless ($ok) {
         refuse("could not write continuity state (" . (BpHook::last_error() // '') . ").");
     }
@@ -930,6 +953,9 @@ if ($verb eq 'status') {
         $role = 'unknown' unless length $role;
         $at   = 'unknown' unless length $at;
         push @lines, "session $S8: armed (role $role, since $at)";
+        my $goal = (ref $d eq 'HASH' && defined $d->{goal} && !ref $d->{goal}) ? sanitize_text($d->{goal}) : '';
+        $goal = '(no goal recorded)' unless length $goal;
+        push @lines, "goal: $goal";
     }
     elsif (-e "$ROOT/off/$SID") {
         my $d = read_json_file("$ROOT/off/$SID");
