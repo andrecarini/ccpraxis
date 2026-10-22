@@ -2109,6 +2109,18 @@ sub _run_capturing_stderr {
     return ($exit, $err);
 }
 
+# _flock_bounded_secs($fh, $secs) -> 1 locked | 0 not within $secs. LOCK_NB
+# polling: a plain LOCK_EX never times out.
+sub _flock_bounded_secs {
+    my ($fh, $secs) = @_;
+    my $deadline = time + $secs;
+    until (eval { flock($fh, LOCK_EX | LOCK_NB) }) {
+        return 0 if time >= $deadline;
+        select(undef, undef, undef, 0.05);
+    }
+    return 1;
+}
+
 # _park_item_open($items, $bp) -> $item|undef: the first OPEN park item for
 # $bp (spec §2.2 step 4's definition, reused by both the director and
 # bp-blueprint.pl's unpark hook): fields.link eq $bp, fields.status eq
@@ -2209,6 +2221,27 @@ sub _cmd_park {
     # needs-operator (spec §2.3 step 6): file one item, unless one is already
     # open. Exit 3 on a filing failure -- the status stays parked either way.
     if ($needs_operator) {
+        # L4(b) (redteam, todo 20261002-185449-c3eb0000): two concurrent
+        # `park --needs-operator` calls each ran list -> check -> file with no
+        # lock around the sequence, so both could file an item. The sequence
+        # now runs under blueprint.md's own lock -- the one bp-blueprint.pl's
+        # run_write holds while an unpark closes park items -- so it is
+        # serialised against other filers AND against an unpark: if an unpark
+        # got in first, the blueprint no longer reads parked under the lock
+        # and nothing is filed at all. Bounded wait; on expiry this is the
+        # same exit-3 "already parked, re-run to retry filing" as any other
+        # filing failure.
+        my $plk;
+        unless (open($plk, '>', "$bpmd.lock") && _flock_bounded_secs($plk, 10)) {
+            close $plk if $plk;
+            print STDERR "bp-drive-next park: could not lock $bpmd.lock to file the inbox item for '$bp'\n";
+            print STDERR "'$bp' is already parked; re-run the same command to retry filing it.\n";
+            return 3;
+        }
+        unless (_bp_parked($bpdir)) {
+            close $plk;     # unparked meanwhile: nothing left to ask the operator
+            return 0;
+        }
         my $filed_item;
         my $ok = eval {
             my $items = Almanac::Inbox::list_items(root => $root);
@@ -2219,6 +2252,7 @@ sub _cmd_park {
             }
             1;
         };
+        close $plk;   # releases the lock; the L4(c) re-check below needs none
         unless ($ok) {
             (my $msg = $@) =~ s/\s+\z//;
             print STDERR "bp-drive-next park: could not file the inbox item for '$bp': $msg\n";
@@ -2302,6 +2336,21 @@ sub _sanitize_migrate_reason {
 sub _migrate_parks_json {
     my ($data, $dsdir, $opts) = @_;
     my $file = "$dsdir/parks.json";
+    return () unless -e $file;
+
+    # L1 second half (redteam, todo 20261002-185449-c3eb0000): two director
+    # invocations could both decode the file; one finished, unlinked it, and
+    # the operator then unparked a blueprint -- while the other, still on its
+    # stale in-memory list, re-parked it. The whole read -> park -> unlink
+    # sequence now runs under one lock, and the file's existence is checked
+    # again once it is held: a caller that waited finds the file gone and
+    # has nothing to migrate. The lock is released when $mlk goes out of
+    # scope (every return below). Bounded wait; on expiry the call fails
+    # closed like any other migration failure.
+    my $mlk;
+    unless (open($mlk, '>', "$dsdir/parks.migrate.lock") && _flock_bounded_secs($mlk, 10)) {
+        return ("could not lock $dsdir/parks.migrate.lock for the legacy park migration");
+    }
     return () unless -e $file;
 
     # Decoded WITH ->utf8 (unlike every other JSON reader in this file): the
