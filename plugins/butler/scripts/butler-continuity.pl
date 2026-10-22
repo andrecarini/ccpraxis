@@ -857,6 +857,7 @@ sub _complete_disarm {
     my $was_armed = BpHook::is_armed($SID);
     my $plan_ldir   = BpContinuityLease::legacy_dir();
     my $live_before = defined $plan_ldir ? (BpContinuityLease::any_active($plan_ldir) ? 1 : 0) : 0;
+    warn "DBGTRACE plan_ldir=" . ($plan_ldir // '<undef>') . " live_before=$live_before\n" if $ENV{DBGTRACE};
     my $ok = BpHook::disarm($SID, actor => $actor, reason => $reason);
     unless ($ok) {
         refuse("could not write continuity state (" . (BpHook::last_error() // '') . ").");
