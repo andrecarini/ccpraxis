@@ -843,9 +843,24 @@ sub inbox_link_for {
 
 # inbox_resolve_link($runs, $bp, $link) -> \%r. Spec §2.1. Never dies, never
 # writes. r.state: foreign | found | gone | ambiguous | unreadable.
+# _link_bytes($link) -> $link as UTF-8 bytes. Almanac::Inbox::list_items
+# decodes frontmatter, so a link comes back with the utf8 flag on even when it
+# is pure ASCII; joined onto a raw-byte $runs path holding "Andr\xc3\xa9",
+# perl upgrades the path as Latin-1 and -f then stats a double-encoded name
+# that does not exist (bug 20261022-152805-0f35). Every site that builds a
+# path from, or compares a blueprint name against, a link takes it through
+# here first.
+sub _link_bytes {
+    my ($s) = @_;
+    return $s unless defined $s && !ref $s && utf8::is_utf8($s);
+    utf8::encode($s);
+    return $s;
+}
+
 sub inbox_resolve_link {
     my ($runs, $bp, $link) = @_;
     return { state => 'foreign' } unless defined $link && !ref $link;
+    $link = _link_bytes($link);
     my @segs = split m{/}, $link, -1;
     return { state => 'foreign' } unless @segs == 3 && defined $bp && $segs[0] eq $bp;
     my ($seg1, $seg2, $seg3) = @segs;
@@ -908,6 +923,7 @@ sub _inbox_bridge_scrub_utf8 {
 # whose linked escalation file is gone.
 sub _orphan_close_reason {
     my ($runs, $link) = @_;
+    $link = _link_bytes($link);
     my @segs = split m{/}, $link, -1;
     my $seg3 = $segs[2];
     return "linked escalation $link no longer exists" unless defined $seg3 && length $seg3;
@@ -961,7 +977,7 @@ sub inbox_close_orphans {
     eval {
         my $items = Almanac::Inbox::list_items(root => $ctx->{root});
         for my $item (@$items) {
-            my $link = $item->{fields}{link};
+            my $link = _link_bytes($item->{fields}{link});
             next unless defined $link;
             my @segs = split m{/}, $link, -1;
             next unless @segs == 3 && $segs[0] eq $ctx->{bp};
@@ -1169,13 +1185,13 @@ sub _inbox_bridge_tick {
     my $inbox_ok = eval {
         my $items = Almanac::Inbox::list_items(root => $ctx->{root});
         my @mine = sort { $a->{id} cmp $b->{id} } grep {
-            my $link = $_->{fields}{link};
+            my $link = _link_bytes($_->{fields}{link});
             defined $link && (split(m{/}, $link, -1))[0] eq $bp
                 && scalar(split(m{/}, $link, -1)) == 3
                 && !exists $_->{fields}{closed_at}
         } @$items;
         for my $item (@mine) {
-            my $link = $item->{fields}{link};
+            my $link = _link_bytes($item->{fields}{link});
             my $r = inbox_resolve_link($runs, $bp, $link);
             my $state = $r->{state};
             if ($state eq 'ambiguous') {
