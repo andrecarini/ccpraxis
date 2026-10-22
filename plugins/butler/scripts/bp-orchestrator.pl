@@ -1168,6 +1168,25 @@ sub _inbox_bridge_tick {
             my $rec = _read_json("$dir/$id.json");
             next unless ref $rec eq 'HASH';
             next if $SETTLE_EXEMPT{ $rec->{kind} // '' };
+            # A 'remediation-exhausted' dag-stall names its blockers; once none
+            # of them is blocked or parked any more the graph is moving again
+            # and the question is moot. Nothing withdrew it before, so a stall
+            # that cleared itself sat "awaiting_human" and kept the conformance
+            # judge skipped (where-things-go, 2026-10-22). An 'unresolvable'
+            # stall (a cycle, a missing package) is structural and stays.
+            if (($rec->{kind} // '') eq 'dag-stalled') {
+                my $ctxr = ref $rec->{context} eq 'HASH' ? $rec->{context} : {};
+                next unless ($ctxr->{class} // '') eq 'remediation-exhausted';
+                my @blockers = grep { defined && length }
+                    map { ref $_ eq 'HASH' ? $_->{blocker} : undef } @{ ref $ctxr->{blockers} eq 'ARRAY' ? $ctxr->{blockers} : [] };
+                next unless @blockers;
+                next if grep { !exists $status->{$_} || lc($status->{$_} // '') =~ /\A(?:blocked|parked)\z/ } @blockers;
+                if (archive_settled_escalation($runs, $id, $rec, 'dependency graph progressing again: '
+                        . join(', ', @blockers) . ' no longer blocked or parked')) {
+                    _log($log, 'escalation_settled', { escalation => $id, package => '_dag', status => 'unstalled' });
+                }
+                next;
+            }
             my $pkg = $rec->{package};
             next unless defined $pkg && exists $status->{$pkg};
             my $st = lc($status->{$pkg} // '');
@@ -6682,9 +6701,14 @@ sub _dag_decision {
         package    => '_dag',
         blueprint  => $bp,
         kind       => 'dag-stalled',
-        question   => "The blueprint's dependency graph cannot progress: $n unresolvable dependency "
-                    . "problem(s). No package can launch until the graph resolves. Fix blueprint.md's "
-                    . "depends_on column (or drop the affected packages), then answer this escalation.",
+        question   => ($class eq 'remediation-exhausted'
+            ? "The blueprint's dependency graph cannot progress: $n blocked or parked package(s) ("
+              . join(', ', map { $_->{blocker} } @{ $r->{blockers} }) . ") hold up their dependents and "
+              . "automatic remediation is exhausted. Unblock them, re-scope them, or drop them; this "
+              . "escalation settles itself once none of them is blocked or parked."
+            : "The blueprint's dependency graph cannot progress: $n unresolvable dependency "
+              . "problem(s). No package can launch until the graph resolves. Fix blueprint.md's "
+              . "depends_on column (or drop the affected packages), then answer this escalation."),
         context    => {
             class        => $class,          # 'unresolvable' | 'remediation-exhausted'
             unresolvable => $r->{unresolvable},

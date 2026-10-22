@@ -1169,4 +1169,50 @@ run_group('RT06-REDM1c (redteam-1.md M1): the posthumous self-accept -- a forged
 sub explain_outcome { my ($o) = @_; return 'outcome=' . ($o->{outcome} // '?'); }
 sub explain_items   { my ($its) = @_; return 'items=' . scalar(@$its) . ' links=' . join(',', map { $_->{fields}{link} // '?' } @$its); }
 
+# ---------------------------------------------------------------------------
+# A 'remediation-exhausted' dag-stall settles itself once none of its
+# blockers is blocked or parked (where-things-go, 2026-10-22: the stall
+# outlived its cause and kept the conformance judge skipped as
+# awaiting_human). An 'unresolvable' stall never auto-settles.
+# ---------------------------------------------------------------------------
+{
+    my ($P, $bpdir, $bp) = mk_project();
+    my $runs = "$bpdir/runs";
+    write_ledger($bpdir, 'p10', 'parked', bp => $bp);
+    my ($id) = file_escalation($runs, pkg => '_dag', bp => $bp, kind => 'dag-stalled', category => 'scoping',
+        context => { class => 'remediation-exhausted', unresolvable => [],
+                     blockers => [ { blocker => 'p10', blocker_status => 'parked', dependents => ['p11'] } ] });
+    my ($ctx) = setup_ctx(bp => $bp, bpdir => $bpdir, runs => $runs);
+
+    tick_bridge($ctx, status => { p10 => 'parked', p11 => 'pending' });
+    ok(-f decision_path($runs, $id), 'dag-stall: still queued while its blocker is parked');
+
+    tick_bridge($ctx, status => { p10 => 'blocked', p11 => 'pending' });
+    ok(-f decision_path($runs, $id), 'dag-stall: still queued while its blocker is blocked');
+
+    tick_bridge($ctx, status => { p10 => 'done', p11 => 'pending' });
+    ok(!-e decision_path($runs, $id), 'dag-stall: settled once the blocker is done');
+    my $arc = read_json(archive_path($runs, $id));
+    like(($arc && $arc->{reason}) // '', qr/progressing again: p10/, 'dag-stall: archived with the reason');
+}
+{
+    my ($P, $bpdir, $bp) = mk_project();
+    my $runs = "$bpdir/runs";
+    my ($id) = file_escalation($runs, pkg => '_dag', bp => $bp, kind => 'dag-stalled', category => 'scoping',
+        context => { class => 'remediation-exhausted', unresolvable => [],
+                     blockers => [ { blocker => 'gone-pkg', blocker_status => 'parked', dependents => [] } ] });
+    my ($ctx) = setup_ctx(bp => $bp, bpdir => $bpdir, runs => $runs);
+    tick_bridge($ctx, status => { other => 'done' });
+    ok(-f decision_path($runs, $id), 'dag-stall: a blocker missing from the status map does not settle it');
+}
+{
+    my ($P, $bpdir, $bp) = mk_project();
+    my $runs = "$bpdir/runs";
+    my ($id) = file_escalation($runs, pkg => '_dag', bp => $bp, kind => 'dag-stalled', category => 'scoping',
+        context => { class => 'unresolvable', unresolvable => [ { code => 'cycle' } ], blockers => [] });
+    my ($ctx) = setup_ctx(bp => $bp, bpdir => $bpdir, runs => $runs);
+    tick_bridge($ctx, status => { a => 'done', b => 'done' });
+    ok(-f decision_path($runs, $id), 'dag-stall: an unresolvable (structural) stall never auto-settles');
+}
+
 done_testing();
