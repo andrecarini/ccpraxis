@@ -1383,8 +1383,12 @@ sub _file_stop_bug_inner {
         return _bug_fail_result('almanac-bug.pl timed out after 10s');
     }
 
+    # close() on a piped filehandle already waits for the child and sets $?
+    # (perlfunc close); a second explicit waitpid($pid, 0) on an already-
+    # reaped pid returns -1 and clobbers $? to -1, which previously turned
+    # every successful fill into a false "exited 255" failure. $? is read
+    # immediately after close(), before anything else can touch it.
     close($fh);
-    waitpid($pid, 0);
     my $code = (defined $? ? $? : 0) >> 8;
 
     my @lines;
