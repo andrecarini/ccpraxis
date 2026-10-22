@@ -1,0 +1,21 @@
+#!/bin/bash
+# almanac -- extensionless shim for the almanac.pl dispatcher. All logic lives in
+# ../scripts/almanac.pl; this only locates it and execs it.
+#
+# Claude Code puts every enabled plugin's bin/ on the Bash tool's PATH, and the
+# skills (continuity, inbox, drive-solo) and butler's ticket hook both speak the
+# bare `almanac <store> <verb>` form. Without this file that form failed with
+# exit 127 (bug 20261014-131539-49bb).
+if [ -z "${BASH_VERSION:-}" ]; then exec bash "$0" "$@"; fi
+
+set -e
+
+BIN_DIR=$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+SCRIPT="$BIN_DIR/../scripts/almanac.pl"
+
+if [ ! -f "$SCRIPT" ]; then
+  echo "almanac: almanac.pl not found."
+  exit 1
+fi
+
+exec perl "$SCRIPT" "$@"

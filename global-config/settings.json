@@ -187,6 +187,7 @@
       "command" : "f=\"$HOME/.claude/ccpraxis/scripts/statusline.pl\"; [ -f \"$f\" ] || exit 0; exec perl \"$f\"",
       "type" : "command"
    },
+   "syncClaudeAiSkills" : false,
    "timeFormat" : "24-hour",
    "tui" : "fullscreen",
    "useAutoModeDuringPlan" : true,
