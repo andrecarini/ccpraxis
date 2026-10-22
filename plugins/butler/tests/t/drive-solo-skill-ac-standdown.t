@@ -45,6 +45,12 @@ $src //= '';
 # on disk at the time this oracle was written (2026-10-03, pre-package-11).
 # This byte sequence must still be found, unchanged, after the package adds
 # its new action-table rows elsewhere in the file.
+#
+# Amended 2026-10-22 (bug 20261012-033139-8c07): the stand-down and resume
+# commands moved from the action-table rows INTO this block, because
+# continuity-prose-budget.t rule O requires every continuity command to live
+# inside it (one source for the wording). The two last lines are that move,
+# not drift; the rows now point here.
 # ===========================================================================
 my $CONTINUITY_BLOCK = <<'BLOCK';
 <!-- continuity:begin -->
@@ -57,6 +63,8 @@ Before a turn ends with background workers or a pause running: `butler-hold <id>
 When the holder exits, act on its report and hold again for ids still running.
 At `done`, at `pause-long`, or when the operator says stop: `butler-continuity off --reason '<what is done>'`.
 A denied stop prints commands carrying a stop token; run them as printed.
+On `ac-stand-down`, step (c): `butler-continuity off --reason 'AC power lost: stood down until AC returns'`; if it refuses because a thread task is `doing`, set that task `pending` and run it again. Never `butler-hold` the AC monitor: continuity is off.
+When the AC monitor exits 0 or 2: `butler-continuity on --thread <your thread> --role driver`, then `next`.
 <!-- continuity:end -->
 BLOCK
 # Normalize line endings before comparing (the fixture above is LF-only).
