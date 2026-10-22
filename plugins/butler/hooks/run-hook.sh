@@ -88,6 +88,37 @@ _bp_ac_data_dir() {
     fi
 }
 
+# _bp_ac_phase_inactive <state-file> -- L6 (todo 20261003-004707-628d0000,
+# redteam-1): a marker left behind with ac-state.json in phase ac, grace or
+# reconnected (e.g. the session ended after the monitor's exit 0 without a
+# resume) is one guard_active() always answers 0 for, so starting perl for
+# it on every tool call is pure cost. Succeeds only when the state file is a
+# single well-formed-looking JSON object line whose phase is one of those
+# three; any other case -- missing, unreadable, odd-shaped, an active phase
+# -- fails, so perl runs and BpAcWatch::guard_active() decides (it fails
+# closed on an undecodable state). A JSON string value cannot contain the
+# unescaped needle, so only the real top-level key can match. Builtins only.
+_bp_ac_phase_inactive() {
+    local f=$1 line= extra=
+    [ -f "$f" ] || return 1
+    { IFS= read -r line; IFS= read -r extra; } 2>/dev/null < "$f"
+    [ -z "$extra" ] || return 1
+    case $line in
+        '{'*'}') ;;
+        *) return 1 ;;
+    esac
+    case $line in
+        *'"phase":"ac"'*) return 0 ;;
+    esac
+    case $line in
+        *'"phase":"grace"'*) return 0 ;;
+    esac
+    case $line in
+        *'"phase":"reconnected"'*) return 0 ;;
+    esac
+    return 1
+}
+
 _bp_clause_holds() {
     local clause=$1 atom holds_any=0
     if [ -z "$clause" ]; then
@@ -118,7 +149,7 @@ _bp_clause_holds() {
             acstanddown)
                 _bp_ac_data_dir
                 if [ -n "$_BP_AC_DATA_DIR" ] && [ -e "$_BP_AC_DATA_DIR/.drive-solo/ac-standdown.json" ]; then
-                    holds_any=1
+                    _bp_ac_phase_inactive "$_BP_AC_DATA_DIR/.drive-solo/ac-state.json" || holds_any=1
                 fi
                 ;;
         esac

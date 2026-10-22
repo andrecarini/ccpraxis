@@ -48,11 +48,17 @@ sub run {
     my $agent_id = BpHook::agent_id($p);
     my $tool = $p->{tool_name};
 
-    # GateShutdown's own rule: a bad payload or a missing tool_name fails
-    # CLOSED under an active signal, regardless of whether agent_id is even
-    # readable -- an unparseable payload has no reliable agent_id either, so
-    # "no tool_name from a subagent" and "payload unparseable" collapse to
-    # the same deny (spec 2.9's fail-closed bullet).
+    # L4 (todo 20261003-004707-628d0000, redteam-1): a payload that parsed
+    # and carries no agent_id is a genuine main-session call, and spec 2.9
+    # scopes fail-closed to subagents -- the main session must stay able to
+    # run `bp-ac-watch.pl clear` and `butler-continuity on` while stood
+    # down, even if its own tool_name is somehow missing.
+    return 0 if BpHook::payload_ok() && !defined $agent_id;
+
+    # GateShutdown's own rule otherwise: an unparseable payload (which has
+    # no reliable agent_id either) or a subagent call with no usable
+    # tool_name fails CLOSED under an active signal (spec 2.9's fail-closed
+    # bullet).
     if (!BpHook::payload_ok() || !defined $tool || ref($tool) || !length $tool) {
         my $aid_for_log = defined $agent_id ? $agent_id : '?';
         BpAcWatch::log_event($data_dir, 'guard', 'STANDDOWN-DENIED', { agent => $aid_for_log, tool => '-' },
@@ -60,8 +66,6 @@ sub run {
         return BpHook::deny(BpHook::Guards::Common::fit($L1), BpHook::Guards::Common::fit($L2),
             BpHook::Guards::Common::fit($L3));
     }
-
-    return 0 unless defined $agent_id;   # a genuine main-session call always passes.
 
     # H2 (fix-batch, reviewer-1/redteam-1): exempt the report/communication
     # tools -- same exact pair, same reason, as

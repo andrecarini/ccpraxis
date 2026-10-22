@@ -36,6 +36,11 @@ use constant UNKNOWN_LIMIT => 10;
 # short of "forever".
 use constant STALE_AFTER   => 30 * MONITOR_TICK;
 
+# How long guard_active()'s self-heal waits for ac-state.lock. It runs inside
+# a PreToolUse hook, so it must stay short; every legitimate holder keeps the
+# lock for a few file operations only.
+use constant GUARD_LOCK_TIMEOUT => 2;
+
 # ---------------------------------------------------------------------------
 # small path / io helpers
 # ---------------------------------------------------------------------------
@@ -277,7 +282,11 @@ sub probe_source {
     return 'unknown' unless ref $r eq 'HASH' && defined $r->{status} && $r->{status} eq 'ok';
     my $parsed = eval { BpPowerJournal::parse_probe($r->{out}) };
     return 'unknown' unless ref $parsed eq 'HASH';
-    return 'unknown' if defined $parsed->{status} && $parsed->{status} ne 'ok';
+    # L8 (redteam-1): parse_probe's overall status is "partial" whenever ANY
+    # other probe part (plan, cs, ka) failed, but power_source is only ever
+    # ac/dc when the power part itself succeeded (err.power absent; see
+    # BpPowerJournal::parse_probe). So a valid power reading is used
+    # regardless of the overall status rather than discarded as unknown.
     my $ps = $parsed->{power_source};
     return (defined $ps && ($ps eq 'ac' || $ps eq 'dc')) ? $ps : 'unknown';
 }
@@ -335,6 +344,23 @@ sub clear {
 # log_event -- 2.2. The only writer of ac-cycle.log.
 # ---------------------------------------------------------------------------
 
+# L5 (redteam-1): the characters log_event never lets into a log line --
+# C0 controls, DEL, C1 controls (incl. NEL U+0085) and the Unicode line and
+# paragraph separators.
+my $LOG_CTRL = qr/[\x00-\x1f\x7f-\x9f\x{2028}\x{2029}]/;
+
+# _log_chars($s) -- a byte string that is valid UTF-8 is decoded to
+# characters first, so the C1 range above matches real C1 code points and
+# never the continuation bytes of an ordinary UTF-8 character (e.g. the 0x94
+# inside an em dash). A string that is not valid UTF-8 is left as is (its
+# bytes then read as Latin-1, where 0x80-0x9f ARE the C1 controls).
+sub _log_chars {
+    my ($s) = @_;
+    return $s if utf8::is_utf8($s) || $s !~ /[\x80-\xff]/;
+    my $copy = $s;
+    return utf8::decode($copy) ? $copy : $s;
+}
+
 sub log_event {
     my ($data_dir, $src, $event, $kv, $reason) = @_;
     return 0 unless defined $data_dir && length $data_dir;
@@ -342,7 +368,8 @@ sub log_event {
     $kv = {} unless ref $kv eq 'HASH';
     $src = '-' unless defined $src && length $src;
     $reason = '-' unless defined $reason && length $reason;
-    $reason =~ s/[\x00-\x1f\x7f]/ /g;
+    $reason = _log_chars($reason);
+    $reason =~ s/$LOG_CTRL/ /g;
     $reason =~ s/^\s+|\s+$//g;
     $reason = '-' unless length $reason;
 
@@ -351,8 +378,11 @@ sub log_event {
     for my $k (sort keys %$kv) {
         my $v = $kv->{$k};
         $v = '-' unless defined $v && length("$v");
-        $v = "$v";
-        $v =~ s/\s+/_/g;
+        $v = _log_chars("$v");
+        # L5 (redteam-1): flatten every control/separator character, not only
+        # \s -- an ESC or NUL in an unvalidated payload field (tool=) used to
+        # reach the log and replay as a terminal escape under `cat`.
+        $v =~ s/(?:\s|$LOG_CTRL)+/_/g;
         push @parts, "$k=$v";
     }
     my $line = sprintf('%s %s %s %s -- %s', _iso_utc($now), _iso_local($now), $event, join(' ', @parts), $reason);
@@ -432,7 +462,13 @@ sub observe {
     my $interval = _probe_interval();
     my $probed = 0;
     my $reading = $peek->{source} // 'unknown';
-    if ($force || ($now - ($peek->{probed_at} // 0)) >= $interval) {
+    # L2 (redteam-1): a probed_at in the FUTURE (the clock stepped back, an
+    # RTC reset after a dead battery, or a forged state) is stale, not
+    # fresh -- otherwise `now - probed_at < interval` holds until the clock
+    # catches up and AC loss goes undetected for that whole time.
+    my $probed_at = $peek->{probed_at};
+    $probed_at = 0 unless defined $probed_at && !ref($probed_at) && $probed_at =~ /\A-?\d+(?:\.\d+)?\z/;
+    if ($force || $probed_at > $now || ($now - $probed_at) >= $interval) {
         $reading = probe_source(%o);
         $probed = 1;
     }
@@ -717,9 +753,20 @@ sub guard_active {
     my ($data_dir) = @_;
     my $marker_path = _marker_path($data_dir);
     return 0 unless -e $marker_path;
-    my $state = _read_state($data_dir);
-    my $phase = $state->{phase} // 'ac';
-    return 0 unless ($phase eq 'expired' || $phase eq 'standing-down' || $phase eq 'monitoring');
+
+    # L1 (todo 20261003-004707-628d0000, redteam-1): the guard fails CLOSED
+    # under a present marker. _read_state() maps an undecodable, unreadable
+    # or missing ac-state.json to the default phase "ac", which used to let
+    # a corrupt or momentarily unopenable state file (a sharing violation
+    # mid-rename) wave every subagent call through. Here only a state that
+    # actually decodes to a JSON object with a non-active phase disarms the
+    # guard; anything else counts as active (the H3 staleness self-heal and
+    # `bp-ac-watch.pl clear` below remain the way out).
+    my $raw = _read_json(_state_path($data_dir));
+    if (ref $raw eq 'HASH' && !ref $raw->{phase}) {
+        my $phase = $raw->{phase} // 'ac';
+        return 0 unless ($phase eq 'expired' || $phase eq 'standing-down' || $phase eq 'monitoring');
+    }
 
     # H3 (fix-batch, redteam-1): nothing resumes a stand-down whose session
     # or monitor died (or that was simply abandoned) -- left alone, this
@@ -732,14 +779,32 @@ sub guard_active {
     # something.
     my @mst = stat($marker_path);
     my $marker_age = @mst ? (time() - $mst[9]) : 0;
-    if ($marker_age > STALE_AFTER && !monitor_live($data_dir)) {
+    return 1 unless $marker_age > STALE_AFTER && !monitor_live($data_dir);
+
+    # The self-heal is a read-modify-write of ac-state.json like every other,
+    # so it takes ac-state.lock too (it was the one unlocked state write).
+    # Safe from the PreToolUse path: the guard is a fresh process that holds
+    # no other ac-* lock, monitor_live() is a non-blocking probe of a
+    # DIFFERENT lock (ac-monitor.lock), and no lock holder waits on anything
+    # the guard holds -- so there is no re-entry and no lock-order cycle. The
+    # wait is bounded by GUARD_LOCK_TIMEOUT. If the lock cannot be taken in
+    # time, this call is allowed without writing anything (the marker was
+    # already judged stale, which was always an allow) and the heal itself
+    # is retried on the next tool call. The staleness is re-checked under
+    # the lock, since a resume or a fresh stand-down may have raced in.
+    my $outcome = _with_state_lock($data_dir, GUARD_LOCK_TIMEOUT, sub {
+        my @st = stat($marker_path);
+        return 'gone' unless @st;
+        my $age = time() - $st[9];
+        return 'fresh' unless $age > STALE_AFTER && !monitor_live($data_dir);
         unlink $marker_path;
         _write_state($data_dir, _default_state());
-        log_event($data_dir, 'guard', 'MARKER-CLEARED', { marker_age_s => int($marker_age) },
+        log_event($data_dir, 'guard', 'MARKER-CLEARED', { marker_age_s => int($age) },
             'stale stand-down marker with no live monitor; self-healing to ac');
-        return 0;
-    }
-    return 1;
+        return 'healed';
+    });
+    return 0 unless defined $outcome;   # lock unavailable: allow, heal later.
+    return ($outcome eq 'fresh') ? 1 : 0;
 }
 
 # ---------------------------------------------------------------------------
