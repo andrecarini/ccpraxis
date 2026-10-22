@@ -949,16 +949,47 @@ sub off_env {
     like($src, qr/BpPowerPlan::reconcile/, 'AC17: butler-continuity.pl references BpPowerPlan::reconcile');
     like($src, qr/why\s*=>\s*'continuity-off'/, "AC17: the reconcile call passes why => 'continuity-off'");
 
-    # no OTHER verb block (on/silence/status) calls plan_after_off/reconcile.
-    for my $verb_marker (qr/if\s*\(\s*\$verb\s+eq\s+'on'\s*\)\s*\{/,
-                          qr/if\s*\(\s*\$verb\s+eq\s+'silence'\s*\)\s*\{/) {
-        if ($src =~ /$verb_marker(.{0,2000}?)\n\}\n/s) {
-            my $block = $1;
-            unlike($block, qr/plan_after_off|BpPowerPlan::reconcile/,
-                'AC17: a non-off verb block does not call plan_after_off/reconcile');
+    # no OTHER verb block (on/silence) calls plan_after_off/reconcile.
+    #
+    # The script has more than one top-level "if ($verb eq 'on') {" block
+    # (argument validation early on, the dispatch that arms much later), so
+    # EVERY top-level block for the verb is checked, not just the first one
+    # found (todo 20261002-113836-37200000: the old single match checked the
+    # validation block and never saw the dispatch block; the 'silence'
+    # marker, unanchored, matched inside an earlier "elsif" instead).
+    # Blocks are top-level, i.e. the "if" starts a line and the block ends
+    # at the first "}" alone on a line. The dispatch block (the one that
+    # arms / that checks running work before silencing) must be among those
+    # checked, so the check cannot pass vacuously. Every top-level 'on'
+    # block also keeps the 2000-char shape the where-things-go 04 spec
+    # (sec 2.3) holds it to; the silence block has no such limit.
+    for my $v (['on',      qr/BpHook::arm\(/,           2000],
+               ['silence', qr/BpHook::running_snapshot\(/, undef]) {
+        my ($verb, $dispatch_re, $cap) = @$v;
+        my @blocks;
+        my $unclosed = 0;
+        while ($src =~ /^if\s*\(\s*\$verb\s+eq\s+'\Q$verb\E'\s*\)\s*\{/mg) {
+            my $from = pos($src);
+            if (substr($src, $from) =~ /\A(.*?)\n\}\n/s) {
+                push @blocks, $1;
+            }
+            else {
+                $unclosed++;
+            }
         }
-        else {
-            fail('AC17: could not locate the verb block to check (regex needs updating against the real source)');
+        is($unclosed, 0, "AC17: every top-level '$verb' block is locatable (ends at a '}' alone on a line)")
+            or diag('the block-end shape needs updating against the real source');
+        if (defined $cap) {
+            my @long = grep { length($_) > $cap } @blocks;
+            is(scalar(@long), 0, "AC17: every top-level '$verb' block is at most $cap chars")
+                or diag('block lengths: ' . join(', ', map { length } @blocks));
+        }
+        ok(scalar(grep { /$dispatch_re/ } @blocks),
+            "AC17: the '$verb' dispatch block is among the blocks checked")
+            or diag('found ' . scalar(@blocks) . " top-level '$verb' block(s), none matching $dispatch_re");
+        for my $block (@blocks) {
+            unlike($block, qr/plan_after_off|BpPowerPlan::reconcile/,
+                "AC17: a top-level '$verb' block does not call plan_after_off/reconcile");
         }
     }
 

@@ -54,7 +54,12 @@ sub tickets { my ($st) = @_; return sort(bsd_glob("$st/tickets/*/*.json")) }
                            add-packages event attach detach switch take-over);
     my $gated_ref = eval {
         local @INC = ("$ALMANAC_DIR/scripts", "$BUTLER_DIR/scripts", @INC);
-        require "$BUTLER_DIR/scripts/BpHook/ContinuityOffCheck.pm" unless grep { m{(?:^|/)ContinuityOffCheck\.pm$} } keys %INC;
+        # A relative require path is searched in @INC, never the cwd, so a
+        # relative $BUTLER_DIR (perl plugins/butler/tests/t/this.t, as the
+        # runner invokes it) needs the ./ to load at all.
+        my $mod = "$BUTLER_DIR/scripts/BpHook/ContinuityOffCheck.pm";
+        $mod = "./$mod" unless $mod =~ m{^(?:/|[A-Za-z]:|\.{1,2}/)};
+        require $mod unless grep { m{(?:^|/)ContinuityOffCheck\.pm$} } keys %INC;
         no strict 'refs';
         \@BpHook::ContinuityOffCheck::THREAD_GATED;
     };
