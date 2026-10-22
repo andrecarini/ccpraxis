@@ -217,6 +217,18 @@ sub find_thread_lock {
     my ($raw2, $to2) = BpOrch::_run_bounded([ $^X, '-e', 'exit 3' ], 30);
     is($to2, 0, '4189: a child that exits in time is not a timeout');
     is($raw2 >> 8, 3, '4189: its exit status comes back $?-shaped');
+
+    # Review of ad710f5: the timeout must take the child's descendants down
+    # too. The child forks a grandchild that would write a marker after 4s,
+    # then blocks; the 1s ceiling must kill both before the marker appears.
+    my $dir = File::Temp::tempdir(CLEANUP => 1);
+    my $marker = "$dir/grandchild-wrote";
+    my $script = 'my $m = shift; my $p = fork; if (defined $p && $p == 0) '
+               . '{ sleep 4; open my $f, ">", $m; print $f "x"; exit 0 } sleep 60';
+    my ($raw3, $to3) = BpOrch::_run_bounded([ $^X, '-e', $script, $marker ], 1);
+    is($to3, 1, '4189: a child with a grandchild still times out');
+    Time::HiRes::sleep(5);
+    ok(!-e $marker, '4189: the grandchild was killed with its process group, not left writing');
 }
 
 # ===========================================================================

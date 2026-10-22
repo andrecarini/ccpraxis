@@ -3683,11 +3683,16 @@ sub _dispatch_log {
     return;
 }
 
-# _run_bounded(\@cmd, $timeout_s) -> ($raw_status, $timed_out).
+# _run_bounded(\@cmd, $timeout_s) -> ($raw_status, $timed_out, $fork_failed).
 # A list-form system() with a wall-clock ceiling: fork+exec, then poll
-# waitpid(WNOHANG); past the deadline the child gets TERM, then KILL two
-# seconds later, and is reaped. $raw_status is $?-shaped (-1 when the child
-# could not be forked or exec'd). Polling rather than alarm(): bp-ledger.pl's
+# waitpid(WNOHANG); past the deadline the child's whole process group gets
+# TERM, then KILL two seconds later, and the child is reaped. The child
+# leads its own process group (setpgrp before exec), so a grandchild it is
+# blocked on (bp-answer-escalation.pl runs bp-ledger.pl through system())
+# dies with it instead of writing on after the caller has moved on.
+# $raw_status is $?-shaped (-1 when the child could not be forked or
+# exec'd); $fork_failed is 1 only when fork itself failed, a transient
+# condition the caller retries rather than reports as a failed answer. Polling rather than alarm(): bp-ledger.pl's
 # own measurement on this host is that SIGALRM does not reliably interrupt a
 # blocking wait. The child inherits this process's STDOUT/STDERR as they are
 # at the call, so a caller's devnull redirect still applies. The exec'ing
@@ -3697,8 +3702,9 @@ sub _run_bounded {
     my ($cmd, $timeout_s) = @_;
     require Time::HiRes;
     my $pid = fork();
-    return (-1, 0) unless defined $pid;
+    return (-1, 0, 1) unless defined $pid;
     if ($pid == 0) {
+        eval { setpgrp(0, 0) };
         { no warnings 'exec'; exec { $cmd->[0] } @$cmd; }
         POSIX::_exit(127);
     }
@@ -3710,13 +3716,18 @@ sub _run_bounded {
         last if Time::HiRes::time() >= $deadline;
         Time::HiRes::sleep(0.1);
     }
-    kill 'TERM', $pid;
+    # Signal the group; if the child had not yet reached setpgrp there is no
+    # such group, so signal the child itself.
+    kill('TERM', -$pid) or kill('TERM', $pid);
     my $grace = Time::HiRes::time() + 2;
     while (Time::HiRes::time() < $grace) {
-        return (-1, 1) if waitpid($pid, POSIX::WNOHANG()) == $pid;
+        if (waitpid($pid, POSIX::WNOHANG()) == $pid) {
+            kill('KILL', -$pid);    # stragglers in the group, if any
+            return (-1, 1);
+        }
         Time::HiRes::sleep(0.1);
     }
-    kill 'KILL', $pid;
+    kill('KILL', -$pid) or kill('KILL', $pid);
     waitpid($pid, 0);
     return (-1, 1);
 }
@@ -4252,7 +4263,7 @@ sub run {
         # hang it. A timed-out answer is reported as 6 too: the bridge keeps
         # the answered item open and retries next tick, and every step of an
         # answer is idempotent, so a retry after a kill converges.
-        my ($raw, $timed_out) = _run_bounded(
+        my ($raw, $timed_out, $fork_failed) = _run_bounded(
             [ $^X, "$DIR/bp-answer-escalation.pl", $bp, '--decision', $a->{id}, '--action', $a->{action},
               (defined $note_arg ? ('--note', $note_arg) : ()), '--bp-dir', $bpdir ],
             $answer_timeout);
@@ -4260,6 +4271,10 @@ sub run {
         close $so; close $se;
         if ($timed_out) {
             _log($log, 'answer_escalation_timeout', { escalation => $a->{id}, timeout_s => $answer_timeout });
+            return 6;
+        }
+        if ($fork_failed) {
+            _log($log, 'answer_escalation_fork_failed', { escalation => $a->{id} });
             return 6;
         }
         return 1 if $raw == -1;
