@@ -105,19 +105,28 @@ sub run {
     my %src_ok = map { $_ => 1 } qw(startup resume clear compact);
     my $src = (_is_plain_string($src_raw) && $src_ok{$src_raw}) ? $src_raw : 'startup';
 
+    # The payload is JSON-decoded, so a non-ASCII cwd comes back utf8-
+    # flagged even though its bytes are identical to the real path on
+    # disk. Every filesystem walk downstream (project root resolution,
+    # Gather's own root check) mis-stats a flagged string -- downgrade
+    # once here, at the one place this hook receives it from the payload,
+    # rather than chasing every call site that stats it later.
+    my $cwd = $p->{cwd};
+    utf8::downgrade($cwd, 1) if defined $cwd;
+
     eval {
         require $ALMANAC_THREAD_PM;
         Almanac::Thread::reattach(
             session    => $sid,
             transcript => $p->{transcript_path},
             source     => $src,
-            cwd        => $p->{cwd},
+            cwd        => $cwd,
         );
     };
 
     my $digest = eval {
         require $ALMANAC_GATHER_PM;
-        Almanac::Gather::digest(cwd => $p->{cwd});
+        Almanac::Gather::digest(cwd => $cwd);
     };
     $digest = '' unless defined $digest;
 

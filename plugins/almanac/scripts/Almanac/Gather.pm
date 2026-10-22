@@ -594,9 +594,18 @@ sub _gather_project {
     my (%opt) = @_;
     my $root = $opt{root};
     if (defined $root && length $root) {
+        # A caller that round-tripped $root through JSON decode (a hook's
+        # payload cwd, a gathered project's own root echoed back) carries
+        # the utf8 flag even when the bytes are plain ASCII-plus-UTF8; -d
+        # on that flagged string mis-stats a non-ASCII path even though it
+        # is character-for-character identical to the real one. Same bug
+        # class as _registry_roots() above -- downgrade before the first
+        # filesystem touch.
+        utf8::downgrade($root, 1);
         _usage('bad_root') unless -d $root;
     } else {
         $root = eval { Almanac::Thread::project_root(cwd => $opt{cwd}) };
+        utf8::downgrade($root, 1) if defined $root;
         _usage('missing_root') unless defined $root && length $root && -d $root;
     }
 
@@ -857,6 +866,7 @@ sub digest {
     my (%opt) = @_;
     my $text = eval {
         my $root = defined $opt{root} ? $opt{root} : Almanac::Thread::project_root(cwd => $opt{cwd});
+        utf8::downgrade($root, 1) if defined $root;
         my $proj = gather(mode => 'project', root => $root, refresh => 1);
         my $all  = gather(mode => 'all', sections => ['threads', 'inbox'], exclude => [$root]);
         my $other = other_projects_line($all);
