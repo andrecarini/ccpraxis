@@ -290,6 +290,13 @@ sub _decode_choices {
 sub _inbox_rationale {
     my ($root, $link) = @_;
     return undef unless defined $link && length $link;
+    # $link comes back utf8-flagged from Almanac::Record::read_file's whole-
+    # file Encode::decode even when it is pure ASCII; concatenating a
+    # flagged segment onto $root's raw UTF-8 bytes (a non-ASCII project
+    # root) corrupts the byte sequence on stringification -- same bug class
+    # as _registry_roots()/_gather_project() above. Downgrade before it
+    # ever reaches a path.
+    utf8::downgrade($link, 1);
     my @segs = split m{/}, $link, -1;
     return undef unless @segs == 3;
     my ($bp, $pkg, $id) = @segs;
