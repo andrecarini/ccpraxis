@@ -557,8 +557,21 @@ sub _run_sweep {
         open(STDIN, '<', '/dev/null') or close(STDIN);
         exec(@cmd) or POSIX::_exit(127);
     }
-    local $/;
-    my $out = <$fh>;
+    # reviewer-2-confirm MF-2: a die that unwinds this read (the digest
+    # timeout alarm, propagating from SessionStartNudge.pm through a
+    # rethrow at the per-sweep call site below) must not leave the forked
+    # sweep child running. Catch locally just long enough to best-effort
+    # TERM the child, then re-die the SAME error -- never let a failed kill
+    # mask the real one.
+    my $out = eval {
+        local $/;
+        <$fh>;
+    };
+    if (my $err = $@) {
+        eval { kill('TERM', $pid) } if defined $pid && $pid > 0;
+        close $fh;
+        die $err;
+    }
     close $fh;
     my $rc = ($? == -1) ? -1 : ($? >> 8);
     return { exit => $rc, stdout => (defined $out ? $out : '') };
@@ -570,6 +583,12 @@ sub _run_refresh {
 
     my $rec = eval { _load_bug() or die "almanac-bug.pl is not loadable\n"; AlmanacBug::reconcile($root) };
     if (my $err = $@) {
+        # reviewer-2-confirm MF-2: the digest timeout alarm's own die must
+        # escape this eval immediately rather than being recorded as a
+        # per-item error and falling through to the sweep loop below --
+        # otherwise the time budget stops only the reconcile call and the
+        # rest of the digest keeps running with no alarm left armed.
+        die $err if $err eq "digest timed out\n";
         $refresh->{reconcile} = { ran => JSON::PP::false, changes => 0, flags => 0, busy => 0, error => _errstr($err) };
         push @$errors, { section => 'refresh', error => _errstr($err) };
     } elsif (ref $rec eq 'HASH') {
@@ -596,6 +615,10 @@ sub _run_refresh {
         my $entry = { blueprint => $name, ran => JSON::PP::true, exit => undef, result => undef, error => undef };
         my $out = eval { _run_sweep($bpdir) };
         if (my $err = $@) {
+            # reviewer-2-confirm MF-2: rethrow the digest timeout immediately
+            # instead of recording it and moving on to the next blueprint's
+            # sweep -- see the matching note on the reconcile eval above.
+            die $err if $err eq "digest timed out\n";
             $entry->{ran} = JSON::PP::false;
             $entry->{error} = _errstr($err);
         } else {
@@ -718,6 +741,10 @@ sub _gather_project {
     for my $s (@{ $opt{sections} }) {
         my $v = eval { _section_value($s, $root, $opt{since}) };
         if (my $err = $@) {
+            # reviewer-2-confirm MF-2: same rethrow rule as the two refresh
+            # evals above -- a timed-out section must not be swallowed and
+            # the loop continued onto the remaining sections.
+            die $err if $err eq "digest timed out\n";
             $result{$s} = _section_default($s);
             push @errors, { section => $s, error => _errstr($err) };
         } else {
@@ -774,6 +801,11 @@ sub _gather_all {
         }
         my $proj = eval { _gather_project(%opt, root => $root, refresh => 0) };
         if (my $err = $@) {
+            # reviewer-2-confirm MF-2: same rethrow rule -- digest() also
+            # gathers mode=>'all' for other_projects_line(), so a timeout
+            # here must not be swallowed and the loop continued onto the
+            # next registered project.
+            die $err if $err eq "digest timed out\n";
             push @errors, { section => 'registry', error => _errstr($err) };
             next;
         }
@@ -964,16 +996,35 @@ sub digest {
         $root = _fs_bytes($root) if defined $root;
         # redteam M2: render_digest only ever reads threads/todos/blueprints/
         # inbox/notes/bugs(tampered)/errors -- never fleet_runs or commits.
-        # Gathering those too (the full @SECTIONS default) costs real wall-
-        # clock (a sweep spawn per blueprint with runs/, for fleet_runs'
-        # sake alone) for data the digest never prints.
+        # Trimming the sections list to just those does NOT change how many
+        # per-blueprint sweeps _run_refresh spawns (reviewer-2-confirm N-1:
+        # that happens earlier, during refresh, for every blueprint with a
+        # runs/ directory, regardless of which sections are requested).
+        # What it buys is skipping the per-section GATHER work for the
+        # sections nobody renders here -- fleet_runs' own escalations walk
+        # and git spawn, and commits' own git-log spawn -- for data the
+        # digest never prints.
         my $proj = gather(mode => 'project', root => $root, refresh => 1,
             sections => [qw(threads inbox todos bugs blueprints notes)]);
         my $all  = gather(mode => 'all', sections => ['threads', 'inbox'], exclude => [$root]);
         my $other = other_projects_line($all);
         render_digest($proj, other_line => $other);
     };
-    return (defined $text && !$@) ? $text : '';
+    return '' unless defined $text && !$@;
+    # reviewer-2-confirm SF-1: render_digest assembles its result from a mix
+    # of already-decoded CHARACTER fragments (thread/todo/note titles, via
+    # Almanac::Record's own decode) and the project root, which is a
+    # character string too (_gather_project runs it through
+    # _decode_if_bytes before storing it in root => ...). Encode exactly
+    # ONCE, here, at the boundary, so every caller -- the CLI's raw `print`
+    # (almanac-gather.pl, no output encoding layer) and BpHook::context's
+    # own _decode_maybe (a no-op on an already-byte string) -- gets a
+    # single, correctly-encoded UTF-8 byte string either way, instead of
+    # the CLI emitting a flagged character string through an unencoded
+    # filehandle (which truncates each multi-byte codepoint to its low
+    # byte, corrupting the output).
+    utf8::encode($text) if utf8::is_utf8($text);
+    return $text;
 }
 
 1;
