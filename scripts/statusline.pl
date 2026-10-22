@@ -130,12 +130,13 @@ my $WARN    = rgb('state.warn');
 my $CRIT    = rgb('state.crit');
 my $SEP     = " ${RULE}\x{FF5C}${R} ";
 
-# Theme's 'thread.blocked' codepoint (Decision 54: U+229D CIRCLED DASH, a
-# reversible stand-in for Decision 12's U+26D4, which fails the no-colour-
-# emoji guards). Named once here so a future swap touches exactly the three
-# places that need the literal: this constant, %GLYPH_COLS below and the
-# render site in thread_row -- never a fourth hard-coded \x{229D} (review N5).
-my $G_BLOCKED = "\x{229D}";
+# Theme's 'thread.blocked' codepoint (U+2715 MULTIPLICATION X, operator
+# 2026-10-22; it replaced Decision 54's U+229D, itself a stand-in for
+# Decision 12's U+26D4, which fails the no-colour-emoji guards). Named once
+# here so a future swap touches exactly the three places that need the
+# literal: this constant, %GLYPH_COLS below and the render site in
+# thread_row -- never a fourth hard-coded literal (review N5).
+my $G_BLOCKED = "\x{2715}";
 
 # ── Display width ────────────────────────────────────────────
 # %GLYPH_COLS declares the display width of every non-single-column glyph

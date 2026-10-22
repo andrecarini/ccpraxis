@@ -521,11 +521,12 @@ sub _glyphs_data {
         # Decision 54: Decision 12 / design 9 named U+26D4 (NO ENTRY) for the
         # blocked glyph, but U+26D4 is Emoji_Presentation=Yes and fails the
         # no-colour-emoji guards (statusline-rebuild.t AC-E1/AC-G1,
-        # theme-tokens.t B-E5). Substituted with U+229D CIRCLED DASH: not an
-        # emoji, East-Asian-neutral, reads as "no entry" in monochrome. Tests
+        # theme-tokens.t B-E5). Substituted with U+229D CIRCLED DASH, then by
+        # operator decision (2026-10-22) with U+2715 MULTIPLICATION X: not an
+        # emoji (U+2716 is; U+2715 is not), East-Asian-neutral. Tests
         # read this codepoint from Theme::glyphs() at runtime and never pin
         # it (spec 2.4).
-        'thread.blocked'  => { cp => 0x229D, desc => 'circled dash, the current thread task is blocked' },
+        'thread.blocked'  => { cp => 0x2715, desc => 'multiplication x, the current thread task is blocked' },
         'arrow.right'     => { cp => 0x2192, desc => 'rightwards arrow, the attached thread\'s next task' },
         # The Decision 7 badge. 'agentoff' has no hyphen because glyph names
         # are dot-separated lowercase alphanumerics (Decision 119).

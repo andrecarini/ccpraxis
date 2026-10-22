@@ -1549,9 +1549,9 @@ is_deeply(Theme::x256_rgb(196), [255, 0, 0],     'x256_rgb(196) == [255,0,0] (B-
         # absent in the block right after this table, never required here.
         # The six glyphs below replace it: the row-1 thread counter and the
         # thread directory row's bar/doing/next/idle glyphs. thread.blocked
-        # is deliberately NOT in this table: its codepoint is U+229D by
-        # Decision 54 (a non-emoji substitution for the originally-named
-        # U+26D4), and spec 2.4 requires every test to read it from
+        # is deliberately NOT in this table: its codepoint is U+2715 (operator,
+        # 2026-10-22; earlier U+229D by Decision 54, both non-emoji
+        # substitutions for the originally-named U+26D4), and spec 2.4 requires every test to read it from
         # Theme::glyphs() at runtime rather than hard-code it -- pinning it
         # here would defeat that.
         'icon.threads'    => { cp => 0x23E3, width => 1 },
