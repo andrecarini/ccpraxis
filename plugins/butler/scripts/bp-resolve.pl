@@ -794,6 +794,17 @@ unless (caller) {
     my $qpath = BpOrch::escalations_dir($runs) . "/$id.json";
     my $rec = BpOrch::_read_json($qpath);
     unless (ref $rec eq 'HASH') {
+        # The package can settle while its resolver is still deciding: the
+        # coordinator finishes, S1 archives the escalation, then the verdict
+        # arrives for a record that is gone (where-things-go/10, 2026-10-22,
+        # logged as escalation_resolve_apply_failed rc 512). Settled is the
+        # outcome the verdict was working toward, so that is moot, not a
+        # failure. A record missing with no archive is still an error.
+        if (!-e $qpath && -f "$runs/resolved-escalations/$id.json") {
+            BpOrch::_log("$runs/orchestrator.log", 'escalation_resolve_apply_moot',
+                { decision => $id, why => 'already-settled' });
+            exit 0;
+        }
         print STDERR "bp-resolve: queued escalation not found or unreadable: $qpath\n"; exit 2;
     }
 

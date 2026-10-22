@@ -64,4 +64,31 @@ is(BpResolve::_relaunch_already_holds(mk_bp(status => 'parked', pid => 'garbage'
     is($rc, 0, 'a moot relaunch is reported applied without running bp-answer-escalation');
 }
 
+# The package settled while its resolver was deciding: the queued record is
+# archived under resolved-escalations/ by the time the verdict is applied
+# (where-things-go/10, 2026-10-22). That is moot (exit 0, logged), while a
+# record that is missing with no archive is still an error (exit 2).
+{
+    my $bpdir = mk_bp(status => 'done');
+    make_path("$bpdir/runs/escalations", "$bpdir/runs/resolved-escalations");
+    my $vf = "$bpdir/verdict.json";
+    open(my $vh, '>', $vf) or die "fixture: $!";
+    print {$vh} '{"action":"relaunch","rationale":"x"}';
+    close $vh;
+    open(my $ah, '>', "$bpdir/runs/resolved-escalations/p1--abc.json") or die "fixture: $!";
+    print {$ah} '{"original":{"package":"p1"},"resolved_by":"auto-settle","reason":"package reached done"}';
+    close $ah;
+
+    my $run = sub {
+        my ($dec) = @_;
+        system($^X, $RESOLVE, 'b', '--apply-verdict', $vf, '--decision', $dec, '--bp-dir', $bpdir);
+        return $? >> 8;
+    };
+    is($run->('p1--abc'), 0, 'an escalation already settled to resolved-escalations/ is a moot apply (exit 0)');
+    my $log = '';
+    if (open(my $lh, '<', "$bpdir/runs/orchestrator.log")) { local $/; $log = <$lh>; close $lh; }
+    like($log, qr/"type":"escalation_resolve_apply_moot"/, 'and the moot apply is logged');
+    is($run->('p1--never'), 2, 'a record missing with no archive is still an error (exit 2)');
+}
+
 done_testing();
