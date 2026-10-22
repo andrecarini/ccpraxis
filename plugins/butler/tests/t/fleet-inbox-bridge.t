@@ -84,6 +84,16 @@ sub write_file {
     (my $d = $p) =~ s{[\\/][^\\/]+$}{};
     make_path($d) unless -d $d;
     open my $fh, '>:raw', $p or die "write $p: $!";
+    # A fixture holding a character above U+00FF used to print through the
+    # raw layer with a "Wide character in print" warning (perl then emits
+    # the string's internal UTF-8 bytes). Encode exactly those strings
+    # explicitly: the bytes on disk are identical, minus the STDERR noise.
+    # A string with no character above U+00FF is left alone, so its bytes
+    # are unchanged too (latin-1 range, one byte per character).
+    if (utf8::is_utf8($c) && $c =~ /[^\x00-\xff]/) {
+        require Encode;
+        $c = Encode::encode('UTF-8', $c);
+    }
     print $fh $c;
     close $fh;
 }

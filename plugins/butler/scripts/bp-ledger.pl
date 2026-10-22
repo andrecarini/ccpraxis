@@ -1489,12 +1489,40 @@ sub ledger_pipeline_items {
 # The shared five-op algorithm (spec §2.3, steps 1..10).
 # =====================================================================================
 
+# _run_op_lock($lk, $sub, $path, $lockpath) -- takes run_op's exclusive lock.
+# Blocking by default, exactly as before. BP_LEDGER_LOCK_TIMEOUT=<seconds>
+# (positive integer) opts a caller into a BOUNDED wait instead: on expiry it
+# exits through io_error (exit 4) with a message starting "lock-timeout:", so
+# a caller that must never wedge on a stuck holder can tell this apart from
+# any other I/O failure. bp-answer-escalation.pl sets it (todo
+# 20261002-153740-41890000): that script runs synchronously inside the
+# orchestrator's tick loop, and a blocking wait here froze the whole fleet,
+# token keeper included. Coordinators never set it, so their ops still wait
+# for the lock however long it is held.
+sub _run_op_lock {
+    my ($lk, $sub, $path, $lockpath) = @_;
+    my $t = $ENV{BP_LEDGER_LOCK_TIMEOUT};
+    unless (defined $t && $t =~ /\A\d+\z/ && $t > 0) {
+        flock($lk, LOCK_EX) or io_error($sub, $path, "cannot acquire lock on $lockpath: $!");
+        return;
+    }
+    my $deadline = time + $t;
+    until (flock($lk, LOCK_EX | LOCK_NB)) {
+        if (time >= $deadline) {
+            close $lk;
+            io_error($sub, $path, "lock-timeout: could not acquire $lockpath within ${t}s");
+        }
+        select(undef, undef, undef, 0.05);
+    }
+    return;
+}
+
 sub run_op {
     my ($sub, $path, $splice_cb, $post_cb) = @_;
 
     my $lockpath = "$path.lock";
     open(my $lk, '>', $lockpath) or io_error($sub, $path, "cannot open lock file $lockpath: $!");
-    flock($lk, LOCK_EX) or io_error($sub, $path, "cannot acquire lock on $lockpath: $!");
+    _run_op_lock($lk, $sub, $path, $lockpath);
 
     my $orig;
     {

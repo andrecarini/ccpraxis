@@ -259,6 +259,14 @@ sub canonical_category {
 # never by Thread.pm, which does not check the flock itself.
 # ===========================================================================
 
+# Fleet-thread bounds and escalation-id hygiene -- see _fleet_thread_tick and
+# _fleet_thread_scan for the why (todos 489b0000, 72f40000, 74f30000). `our`
+# so a test can tighten them.
+our $FLEET_THREAD_LOCK_TIMEOUT_MS = 1000;
+our $FLEET_THREAD_TICK_BUDGET_S   = 5;
+our $FLEET_ESC_ID_RE              = qr/\A[A-Za-z0-9._-]{1,128}\z/;
+our $FLEET_ESC_MAX_BYTES          = 1024 * 1024;
+
 # fleet_thread_name($bp) -> "fleet-<slug>", NEVER dies. Spec §2.2.
 sub fleet_thread_name {
     my ($bp) = @_;
@@ -323,6 +331,16 @@ sub _fleet_thread_err {
         return length($s) ? $s : 'error';
     };
     return defined $out ? $out : 'error';
+}
+
+# _fleet_thread_lock_timeout($err) -> 1 if $err is an Almanac lock-timeout
+# error (Almanac::Store::Error kind lock_timeout), else 0. Never dies.
+sub _fleet_thread_lock_timeout {
+    my ($err) = @_;
+    my $r = eval {
+        (Scalar::Util::reftype($err) // '') eq 'HASH' && ($err->{kind} // '') eq 'lock_timeout' ? 1 : 0;
+    };
+    return $r ? 1 : 0;
 }
 
 # _fleet_thread_setup(\%a) -> \%ctx | undef. a: blueprint, bp_dir, runs, log.
@@ -423,6 +441,10 @@ sub _fleet_thread_setup {
                 next unless defined $reason && length $reason;
                 my ($tok) = split ' ', $reason, 2;
                 next unless defined $tok && length $tok;
+                # todo 72f40000: only a token that is a whole valid id can be
+                # one this orchestrator logged (_fleet_thread_scan refuses
+                # anything else), so a truncated or foreign token never seeds.
+                next unless $tok =~ $FLEET_ESC_ID_RE;
                 if ($e->{event} eq 'escalation-sent') { $ctx->{sent}{$tok} = 1; }
                 elsif ($e->{event} eq 'answer-applied') { $applied{$tok} = 1; }
             }
@@ -463,6 +485,21 @@ sub _fleet_thread_setup {
 
         # 7.
         _log($log, 'fleet_thread', { thread => $name, created => ($created ? 1 : 0) });
+
+        # 8 (todo d7f70000): observe the escalations already queued at
+        # startup, before the first tick's inbox bridge can answer one of
+        # them unseen. Same scan, same bounds as a tick.
+        eval {
+            require Time::HiRes;
+            my $lock_ms = $FLEET_THREAD_LOCK_TIMEOUT_MS;
+            my $inh = $ENV{ALMANAC_LOCK_TIMEOUT_MS};
+            local $ENV{ALMANAC_LOCK_TIMEOUT_MS} =
+                (defined $inh && $inh =~ /\A\d+\z/ && $inh < $lock_ms) ? $inh : $lock_ms;
+            my $t0 = Time::HiRes::time();
+            $ctx->{scan_deferred} = 0;
+            _fleet_thread_scan($ctx, sub { (Time::HiRes::time() - $t0) >= $FLEET_THREAD_TICK_BUDGET_S });
+            1;
+        } or _log($log, 'fleet_thread_error', { op => 'seed_scan', error => _fleet_thread_err($@) });
         1;
     };
     if ($@) {
@@ -479,6 +516,34 @@ sub _fleet_thread_tick {
     my ($ctx, $t) = @_;
     return unless $ctx;
     return if $ctx->{dead};
+    # todo 20261002-135330-489b0000 (pkg05 redteam MEDIUM-3): every
+    # Almanac::Thread write takes the thread's Almanac::Lock, whose default
+    # wait is 10s, and flock has no staleness -- so a burst of N escalations
+    # behind a suspended/hung lock holder stalled this tick for ~N x 10s
+    # before PAUSE GATING, the watchdog and the launch section ever ran.
+    # Two bounds, both per tick:
+    #   - each lock wait is capped at $FLEET_THREAD_LOCK_TIMEOUT_MS, passed
+    #     through Almanac::Lock's own ALMANAC_LOCK_TIMEOUT_MS (explicit opt >
+    #     env > default there; `local`, so nothing outside this sub sees it,
+    #     and a SMALLER inherited value is kept);
+    #   - once $FLEET_THREAD_TICK_BUDGET_S of wall clock is spent, no further
+    #     write is attempted this tick. Skipped work is left UNMARKED (an id
+    #     not added to `sent`, an id kept in `open`, a pause transition or
+    #     package-set change not recorded in ctx) so the next tick retries it.
+    # A write that hit a LOCK TIMEOUT is likewise left for the next tick (that
+    # is contention, and both bounds above cap its cost); a write that failed
+    # any other way is still marked done, as before, so one bad record cannot
+    # cost the budget on every tick forever.
+    require Time::HiRes;
+    my $lock_ms = $ctx->{lock_timeout_ms} // $FLEET_THREAD_LOCK_TIMEOUT_MS;
+    my $inh = $ENV{ALMANAC_LOCK_TIMEOUT_MS};
+    local $ENV{ALMANAC_LOCK_TIMEOUT_MS} =
+        (defined $inh && $inh =~ /\A\d+\z/ && $inh < $lock_ms) ? $inh : $lock_ms;
+    my $budget = $ctx->{tick_budget_s} // $FLEET_THREAD_TICK_BUDGET_S;
+    my $t0 = Time::HiRes::time();
+    my $spent = sub { (Time::HiRes::time() - $t0) >= $budget };
+    my $deferred = 0;
+    $ctx->{scan_deferred} = 0;
     eval {
         my $name = $ctx->{name};
         my $root = $ctx->{root};
@@ -508,35 +573,10 @@ sub _fleet_thread_tick {
         }
 
         # 1. Escalation scan.
-        my $dir = escalations_dir($runs);
-        my @present;
-        if (defined $dir && length $dir && -d $dir) {
-            if (opendir(my $dh, $dir)) {
-                @present = grep { /\.json\z/ && !/^\./ && -f "$dir/$_" } readdir $dh;
-                closedir $dh;
-                s/\.json\z// for @present;
-                @present = sort @present;
-            }
-        }
-        for my $id (@present) {
-            next if $ctx->{sent}{$id};
-            my $rec = _read_json("$dir/$id.json");
-            my $cat = (ref $rec eq 'HASH') ? canonical_category($rec->{category}) : undef;
-            my $operator_owned = (!defined $cat || $cat eq '' || !$RESOLVER_TRIAGEABLE{$cat}) ? 1 : 0;
-            next unless $operator_owned;
-            my $kind = (ref $rec eq 'HASH' && defined $rec->{kind} && length $rec->{kind}) ? $rec->{kind} : '-';
-            my $catdisp = (defined $cat && length $cat) ? $cat : '-';
-            eval {
-                Almanac::Thread::record_event($name, 'escalation-sent',
-                    reason => fleet_thread_reason("$id $kind $catdisp"),
-                    actor => 'orchestrator', root => $root);
-                1;
-            } or _log($log, 'fleet_thread_error', { op => 'escalation-sent', error => _fleet_thread_err($@) });
-            $ctx->{sent}{$id} = 1;
-            $ctx->{open}{$id} = 1;
-        }
+        my @present = _fleet_thread_scan($ctx, $spent);
 
-        # 2. Answers.
+        # 2. Answers. An id whose write is skipped because the budget is
+        # spent stays in `open`, so the next tick retries it.
         my %present_set = map { $_ => 1 } @present;
         for my $id (sort keys %{ $ctx->{open} }) {
             next if $present_set{$id};
@@ -544,13 +584,20 @@ sub _fleet_thread_tick {
                 delete $ctx->{open}{$id};
                 next;
             }
-            eval {
+            if ($spent->()) { $deferred++; next; }
+            my $ok = eval {
                 Almanac::Thread::record_event($name, 'answer-applied',
                     reason => fleet_thread_reason($id), actor => 'orchestrator', root => $root);
                 1;
-            } or _log($log, 'fleet_thread_error', { op => 'answer-applied', error => _fleet_thread_err($@) });
+            };
+            unless ($ok) {
+                my $err = $@;
+                if (_fleet_thread_lock_timeout($err)) { $deferred++; next; }   # retried next tick
+                _log($log, 'fleet_thread_error', { op => 'answer-applied', error => _fleet_thread_err($err) });
+            }
             delete $ctx->{open}{$id};
         }
+        $deferred += $ctx->{scan_deferred} // 0;
 
         # 3. Pause transition. LOW-1: a restart into an already-expired timed
         # pause must not log `paused` here only to auto-resume a moment later
@@ -561,7 +608,15 @@ sub _fleet_thread_tick {
         my $about_to_autoresume = $now_paused
             && !$t->{paused}{manual}
             && resume_ready($t->{paused}, $t->{now} // time);
-        if ($now_paused && !$ctx->{paused} && !$about_to_autoresume) {
+        my $transition = ($now_paused && !$ctx->{paused} && !$about_to_autoresume)
+                      || (!$now_paused && $ctx->{paused});
+        my $pause_deferred = 0;
+        if ($transition && $spent->()) {
+            # Budget spent: leave ctx paused as it was, so the next tick
+            # still sees (and records) this transition.
+            $deferred++;
+            $pause_deferred = 1;
+        } elsif ($now_paused && !$ctx->{paused} && !$about_to_autoresume) {
             eval {
                 Almanac::Thread::record_event($name, 'paused',
                     reason => fleet_thread_reason($t->{paused}{reason}),
@@ -577,21 +632,121 @@ sub _fleet_thread_tick {
         # Leave ctx paused unchanged on the suppressed-emission tick, so the
         # tick that actually clears .paused a moment later (same gating pass)
         # does not see a paused->unpaused transition and log a lone `resumed`.
-        $ctx->{paused} = $now_paused unless $about_to_autoresume;
+        $ctx->{paused} = $now_paused unless $about_to_autoresume || $pause_deferred;
 
         # 4. New packages.
         my $sig = join("\n", sort keys %{ $t->{meta} || {} });
-        if (defined $ctx->{sig} && $ctx->{sig} ne $sig) {
-            eval {
-                Almanac::Thread::add_packages($name, [$bp], root => $root, actor => 'orchestrator');
-                1;
-            } or _log($log, 'fleet_thread_error', { op => 'add_packages', error => _fleet_thread_err($@) });
+        if (defined $ctx->{sig} && $ctx->{sig} ne $sig && $spent->()) {
+            $deferred++;            # keep the old sig: next tick retries
+        } else {
+            if (defined $ctx->{sig} && $ctx->{sig} ne $sig) {
+                eval {
+                    Almanac::Thread::add_packages($name, [$bp], root => $root, actor => 'orchestrator');
+                    1;
+                } or _log($log, 'fleet_thread_error', { op => 'add_packages', error => _fleet_thread_err($@) });
+            }
+            $ctx->{sig} = $sig;
         }
-        $ctx->{sig} = $sig;
         1;
     };
     _log($ctx->{log}, 'fleet_thread_error', { op => 'tick', error => _fleet_thread_err($@) }) if $@;
+    # One log line when deferral STARTS, not one per tick for as long as a
+    # wedged holder lasts; cleared once a tick completes everything.
+    if ($deferred) {
+        _log($ctx->{log}, 'fleet_thread_deferred', { pending => $deferred, budget_s => $budget })
+            unless $ctx->{deferring};
+        $ctx->{deferring} = 1;
+    } else {
+        $ctx->{deferring} = 0;
+    }
     return;
+}
+
+# _fleet_thread_scan(\%ctx, $spent) -> @present (sorted escalation ids on
+# disk). Step 1 of a tick, also run once at the end of setup (todo
+# 20261002-153740-d7f70000): an escalation queued BEFORE this orchestrator
+# started and answered on its first tick used to vanish unobserved, because
+# the inbox bridge's tick runs before this one and `open` was seeded only from
+# the thread log -- so no escalation-sent and no answer-applied were ever
+# logged for it. Scanning at setup puts it in `sent`/`open` first.
+#
+# Per id not yet sent:
+#   - the id must match $FLEET_ESC_ID_RE (todo 20261002-135330-72f40000):
+#     the restart seed reads an id back as the FIRST whitespace token of a
+#     logged reason, and fleet_thread_reason truncates at 200 bytes, so an id
+#     with whitespace/control characters or one too long to survive the
+#     round trip would be re-logged after every restart (or seed a prefix of
+#     itself that suppresses a real id). Every id this file mints
+#     (<safe_pkg>--<hex>) matches; anything else is a foreign file, skipped
+#     and logged once.
+#   - classification is cached by (mtime, size, inode) (todo
+#     20261002-135330-74f30000): a triage-owned record used to be fully
+#     re-read and JSON-decoded every tick for as long as it existed. It is
+#     re-read only when the file changes -- which is exactly when a resolver
+#     re-tag can make it operator-owned. A record over $FLEET_ESC_MAX_BYTES
+#     is not read at all and is treated like an unreadable one.
+#   - an operator-owned id gets its escalation-sent write only while the
+#     tick budget lasts; otherwise it stays unsent for the next tick.
+sub _fleet_thread_scan {
+    my ($ctx, $spent) = @_;
+    my $name = $ctx->{name};
+    my $root = $ctx->{root};
+    my $log  = $ctx->{log};
+    my $dir  = escalations_dir($ctx->{runs});
+    my @present;
+    if (defined $dir && length $dir && -d $dir) {
+        if (opendir(my $dh, $dir)) {
+            @present = grep { /\.json\z/ && !/^\./ && -f "$dir/$_" } readdir $dh;
+            closedir $dh;
+            s/\.json\z// for @present;
+            @present = sort @present;
+        }
+    }
+    my $cache = $ctx->{owned_cache} ||= {};
+    my %live = map { $_ => 1 } @present;
+    delete $cache->{$_} for grep { !$live{$_} } keys %$cache;
+    for my $id (@present) {
+        next if $ctx->{sent}{$id};
+        unless ($id =~ $FLEET_ESC_ID_RE) {
+            unless ($ctx->{bad_id_logged}{$id}++) {
+                _log($log, 'fleet_thread_error', { op => 'escalation-scan',
+                    error => 'skipped an escalation file whose id is not a valid escalation id' });
+            }
+            next;
+        }
+        my $path = "$dir/$id.json";
+        my @st = stat($path);
+        my $sig = @st ? join(':', $st[9], $st[7], $st[1]) : '';
+        my $c = $cache->{$id};
+        next if $c && $c->{sig} eq $sig && !$c->{operator_owned};
+        my $rec = (@st && $st[7] <= $FLEET_ESC_MAX_BYTES) ? _read_json($path) : undef;
+        my $cat = (ref $rec eq 'HASH') ? canonical_category($rec->{category}) : undef;
+        my $operator_owned = (!defined $cat || $cat eq '' || !$RESOLVER_TRIAGEABLE{$cat}) ? 1 : 0;
+        $cache->{$id} = { sig => $sig, operator_owned => $operator_owned };
+        next unless $operator_owned;
+        if ($spent->()) { $ctx->{scan_deferred}++; next; }
+        my $kind = (ref $rec eq 'HASH' && defined $rec->{kind} && length $rec->{kind}) ? $rec->{kind} : '-';
+        my $catdisp = (defined $cat && length $cat) ? $cat : '-';
+        my $ok = eval {
+            Almanac::Thread::record_event($name, 'escalation-sent',
+                reason => fleet_thread_reason("$id $kind $catdisp"),
+                actor => 'orchestrator', root => $root);
+            1;
+        };
+        unless ($ok) {
+            my $err = $@;
+            # A lock timeout is contention, not a bad record: leave the id
+            # unsent so the next tick retries it (the per-call cap and the
+            # tick budget bound what that costs). Any other failure is
+            # logged and marked sent, so one bad record cannot spend the
+            # budget every tick.
+            if (_fleet_thread_lock_timeout($err)) { $ctx->{scan_deferred}++; next; }
+            _log($log, 'fleet_thread_error', { op => 'escalation-sent', error => _fleet_thread_err($err) });
+        }
+        $ctx->{sent}{$id} = 1;
+        $ctx->{open}{$id} = 1;
+    }
+    return @present;
 }
 
 # _fleet_thread_end(\%ctx, $complete) -> (nothing). Spec §2.6. NEVER dies.
@@ -916,16 +1071,27 @@ sub _inbox_bridge_log_error {
 # same test S3 uses to decide whether to file an item, reused by S2 to decide
 # whether an answered item's action may be authorized (shared, not duplicated,
 # per N9).
+#
+# $paused (optional, the current runs/.paused payload): todo
+# 20261002-153740-ed3a0000 extends F2 to a turn-starved record while a MANUAL
+# pause holds. turn-starved is filed `scoping` together with that pause, and
+# escalation-resolve dispatch sits after PAUSE GATING, so the resolver can
+# never reach it -- the same resolver-unreachable gap F2 exists for (blueprint
+# Decision 45). The full design note is on bp-answer-escalation.pl's
+# _lift_turn_starved_pause, which is the other half (answering it resumes).
 sub _inbox_bridge_eligible_now {
-    my ($rec, $reg, $tun) = @_;
+    my ($rec, $reg, $tun, $paused) = @_;
     return (0, 0, undef) unless ref $rec eq 'HASH';
     my $pkg = $rec->{package};
     my $cat = canonical_category($rec->{category});
     my $f1  = defined($cat) && $INBOX_OWNED{$cat} ? 1 : 0;
+    my $starved_under_pause = (($rec->{kind} // '') eq 'turn-starved'
+                               && ref $paused eq 'HASH' && $paused->{manual}) ? 1 : 0;
     # N6: guard the registry lookup on `defined $pkg` -- an undef $pkg must
     # never autovivify $reg->{undef} nor trip an "uninitialized" warning.
     my $f2  = (defined($cat) && $RESOLVER_TRIAGEABLE{$cat}
                   && ( (defined $pkg && $pkg eq '_fleet')
+                       || $starved_under_pause
                        || (defined $pkg && (($reg->{$pkg}{escalation_spawn_fail} // 0) >= ($tun->{judge_spawn_cap} // 3))) )) ? 1 : 0;
     return ($f1, $f2, $cat);
 }
@@ -938,6 +1104,10 @@ sub _inbox_bridge_choices_for {
     return 'resume' if $fam eq 'fleet';
     return undef unless $fam eq 'package';
     return undef if defined $pkg && $pkg =~ /^_/;
+    # todo ed3a0000: a turn-starved item exists only because its resolver is
+    # unreachable behind the manual pause; not-mine would hand it straight
+    # back to that resolver (and F2 would re-file it), so it is not offered.
+    return 'relaunch,accept,drop' if defined $kind && $kind eq 'turn-starved';
     return 'relaunch,accept,drop,not-mine';
 }
 
@@ -971,6 +1141,8 @@ sub _inbox_bridge_tick {
     my $reg    = $t->{reg}       || {};
     my $tun    = $t->{tunables}  || {};
     my $answer = $t->{answer};
+    # todo ed3a0000: F2 needs the current pause (see _inbox_bridge_eligible_now).
+    my $paused = exists $t->{paused} ? $t->{paused} : read_paused($runs);
 
     # S1 -- settle: archive the escalation of a done/dropped package. No
     # almanac access in this step.
@@ -1043,7 +1215,7 @@ sub _inbox_bridge_tick {
                 # item. The item is left exactly as it is (not closed): it
                 # still "covers" the escalation, so S3 must not pile a second
                 # item on top of it.
-                my ($f1_now, $f2_now) = _inbox_bridge_eligible_now($r->{rec}, $reg, $tun);
+                my ($f1_now, $f2_now) = _inbox_bridge_eligible_now($r->{rec}, $reg, $tun, $paused);
                 my $expected_choices = _inbox_bridge_choices_for(
                     (ref $r->{rec} eq 'HASH' ? $r->{rec}{package} : undef),
                     (ref $r->{rec} eq 'HASH' ? $r->{rec}{kind}    : undef));
@@ -1124,7 +1296,7 @@ sub _inbox_bridge_tick {
             my $rec = _read_json("$dir/$id.json");
             next unless ref $rec eq 'HASH';
             my $pkg = $rec->{package};
-            my ($f1, $f2, $cat) = _inbox_bridge_eligible_now($rec, $reg, $tun);
+            my ($f1, $f2, $cat) = _inbox_bridge_eligible_now($rec, $reg, $tun, $paused);
             next unless $f1 || $f2;
 
             my $kind = $rec->{kind};
@@ -3511,6 +3683,44 @@ sub _dispatch_log {
     return;
 }
 
+# _run_bounded(\@cmd, $timeout_s) -> ($raw_status, $timed_out).
+# A list-form system() with a wall-clock ceiling: fork+exec, then poll
+# waitpid(WNOHANG); past the deadline the child gets TERM, then KILL two
+# seconds later, and is reaped. $raw_status is $?-shaped (-1 when the child
+# could not be forked or exec'd). Polling rather than alarm(): bp-ledger.pl's
+# own measurement on this host is that SIGALRM does not reliably interrupt a
+# blocking wait. The child inherits this process's STDOUT/STDERR as they are
+# at the call, so a caller's devnull redirect still applies. The exec'ing
+# child leaves through POSIX::_exit on failure, so none of this process's
+# END blocks or destructors (the run marker!) ever run twice.
+sub _run_bounded {
+    my ($cmd, $timeout_s) = @_;
+    require Time::HiRes;
+    my $pid = fork();
+    return (-1, 0) unless defined $pid;
+    if ($pid == 0) {
+        { no warnings 'exec'; exec { $cmd->[0] } @$cmd; }
+        POSIX::_exit(127);
+    }
+    my $deadline = Time::HiRes::time() + $timeout_s;
+    while (1) {
+        my $w = waitpid($pid, POSIX::WNOHANG());
+        return ($?, 0) if $w == $pid;
+        return (-1, 0) if $w < 0;
+        last if Time::HiRes::time() >= $deadline;
+        Time::HiRes::sleep(0.1);
+    }
+    kill 'TERM', $pid;
+    my $grace = Time::HiRes::time() + 2;
+    while (Time::HiRes::time() < $grace) {
+        return (-1, 1) if waitpid($pid, POSIX::WNOHANG()) == $pid;
+        Time::HiRes::sleep(0.1);
+    }
+    kill 'KILL', $pid;
+    waitpid($pid, 0);
+    return (-1, 1);
+}
+
 # --- runs/.orchestrator marker (PID + flock; held for the run's lifetime).
 sub acquire_marker {
     my ($path) = @_;
@@ -3732,6 +3942,8 @@ sub _tunables_base {
         default_max_turns   => $ENV{BP_DEFAULT_MAX_TURNS}   // 800, # b01: turn budget when the ledger states none
         broken_env_thresh   => $ENV{BP_BROKEN_ENV_THRESH}   // 3,  # b01: consecutive exec-not-found launches -> broken-env
         turn_starved_thresh => $ENV{BP_TURN_STARVED_THRESH} // 3,  # b01: consecutive fruitless turn exhaustions -> turn-starved
+        broken_env_probe    => $ENV{BP_BROKEN_ENV_PROBE_SECS} // 300, # todo 1dba0000: seconds between broken-env self-checks
+        broken_env_retries  => $ENV{BP_BROKEN_ENV_RETRIES}    // 3,   # todo 1dba0000: self-check auto-resumes per orchestrator run
         ckpt_int            => $ENV{BP_CHECKPOINT_INTERVAL} // 300, # b02: seconds between periodic WIP checkpoints
         creds_bo_base => $ENV{BP_CREDS_BACKOFF_BASE_SECS} // 60,   # b03: 1st creds re-poll delay
         creds_bo_mult => $ENV{BP_CREDS_BACKOFF_MULT}      // 2,    # b03: geometric factor
@@ -4002,6 +4214,22 @@ sub run {
     # redirected to the null device around the call (the _run_quiet
     # discipline bp-resolve.pl uses, reimplemented locally -- BpResolve is
     # not loaded here).
+    # todo 20261002-143634-1dba0000: the broken-env self-check (see the
+    # BROKEN-ENV SELF-CHECK block in the tick). Probes exactly what the
+    # DEFAULT launch closure needs: a readable bp-launch.sh and an exec'able
+    # bash. With an INJECTED launch closure (tests/simulation) there is no
+    # real launcher to probe, so the self-check is off unless a probe is
+    # injected too. Returns (1, undef) healthy | (0, $why).
+    my $env_probe = $opt->{env_probe} || ($opt->{launch} ? undef : sub {
+        return (0, "bp-launch.sh not found/readable at $DIR") unless -r "$DIR/bp-launch.sh";
+        my $rc = system('bash', '-c', 'exit 0');
+        return (0, "bash could not be executed: $!") if $rc == -1;
+        return $rc == 0 ? (1, undef) : (0, 'bash exited ' . ($rc >> 8));
+    });
+    my %benv = (autoresumes => 0, last_probe => 0, exhausted_logged => 0);
+
+    my $answer_timeout = (defined $opt->{answer_timeout} && $opt->{answer_timeout} =~ /\A\d+\z/ && $opt->{answer_timeout} > 0)
+        ? $opt->{answer_timeout} : 120;
     my $answer_escalation = $opt->{answer_escalation} || sub {
         my ($a) = @_;
         my $devnull = File::Spec->devnull;
@@ -4017,11 +4245,23 @@ sub run {
         require Encode;
         my $note_arg = $a->{note};
         $note_arg = Encode::encode('UTF-8', $note_arg) if defined $note_arg && utf8::is_utf8($note_arg);
-        system($^X, "$DIR/bp-answer-escalation.pl", $bp, '--decision', $a->{id}, '--action', $a->{action},
-            (defined $note_arg ? ('--note', $note_arg) : ()), '--bp-dir', $bpdir);
-        my $raw = $?;
+        # todo 20261002-153740-41890000: this runs synchronously inside the
+        # tick loop, so it must never block for long. bp-answer-escalation.pl
+        # now bounds every lock wait of its own (exit 6 = deferred), and this
+        # wall-clock ceiling is the backstop for anything else that could
+        # hang it. A timed-out answer is reported as 6 too: the bridge keeps
+        # the answered item open and retries next tick, and every step of an
+        # answer is idempotent, so a retry after a kill converges.
+        my ($raw, $timed_out) = _run_bounded(
+            [ $^X, "$DIR/bp-answer-escalation.pl", $bp, '--decision', $a->{id}, '--action', $a->{action},
+              (defined $note_arg ? ('--note', $note_arg) : ()), '--bp-dir', $bpdir ],
+            $answer_timeout);
         open(STDOUT, '>&', $so); open(STDERR, '>&', $se);
         close $so; close $se;
+        if ($timed_out) {
+            _log($log, 'answer_escalation_timeout', { escalation => $a->{id}, timeout_s => $answer_timeout });
+            return 6;
+        }
         return 1 if $raw == -1;
         my $code = $raw >> 8;
         return $code if $code;
@@ -4395,12 +4635,69 @@ sub run {
             # _tunables() re-read above still sees the operator's real environment.
             local $ENV{BP_MAX_PARALLEL} = $t->{max_par} // 2;
 
+            # ---- BROKEN-ENV SELF-CHECK (todo 20261002-143634-1dba0000) ----
+            # A broken-env trip used to reach only the operator (blueprint
+            # Decision 45's F2 fallback): the escalation-resolver can never
+            # see a _fleet record (its dispatch iterates real packages, runs
+            # after PAUSE GATING, and bp-judge.sh needs a ledger). Routing it
+            # there would not help anyway: the resolver is a read-only LLM
+            # judge with no way to probe an environment, and it is itself
+            # launched through bash -- the very thing a broken-env trip says
+            # cannot be exec'd. So the "real retry/diagnose pass" Decision 45
+            # deferred is done HERE, deterministically: while a broken-env
+            # manual pause holds, re-probe the launch prerequisites every
+            # broken_env_probe seconds; when they pass, lift the pause and
+            # archive the broken-env escalation (the bridge then closes its
+            # inbox item, reason included). At most broken_env_retries
+            # auto-resumes per orchestrator run: an environment that keeps
+            # breaking stays paused for the operator, exactly as before, once
+            # the budget is spent. A pause with any other reason is never
+            # touched, and the F2 inbox item is still filed meanwhile.
+            if ($env_probe && !$shutdown && $paused && $paused->{manual}
+                    && ($paused->{reason} // '') =~ /\Abroken-env/) {
+                my $cap   = $t->{broken_env_retries} // 3;
+                my $every = $t->{broken_env_probe}   // 300;
+                if ($benv{autoresumes} >= $cap) {
+                    _log($log, 'broken_env_selfcheck_exhausted', { autoresumes => $benv{autoresumes}, cap => $cap })
+                        unless $benv{exhausted_logged}++;
+                } else {
+                    my $since = $paused->{created_at} // $now;
+                    $since = $benv{last_probe} if $benv{last_probe} > $since;
+                    if ($now - $since >= $every) {
+                        $benv{last_probe} = $now;
+                        my ($healthy, $why) = $env_probe->();
+                        if ($healthy) {
+                            $benv{autoresumes}++;
+                            my $n = $benv{autoresumes};
+                            clear_pause($runs);
+                            my $edir = escalations_dir($runs);
+                            if (defined $edir && opendir(my $edh, $edir)) {
+                                for my $f (sort grep { /\.json\z/ } readdir $edh) {
+                                    my $rec = _read_json("$edir/$f");
+                                    next unless ref $rec eq 'HASH' && ($rec->{kind} // '') eq 'broken-env'
+                                             && ($rec->{package} // '') eq '_fleet';
+                                    (my $eid = $f) =~ s/\.json\z//i;
+                                    archive_settled_escalation($runs, $eid, $rec,
+                                        "environment self-check passed (bash and bp-launch.sh can be executed again); "
+                                      . "the run resumed by itself, auto-resume $n of $cap");
+                                }
+                                closedir $edh;
+                            }
+                            _log($log, 'auto_resume', { reason => 'broken-env-selfcheck', attempt => $n, cap => $cap });
+                            $paused = undef;
+                        } else {
+                            _log($log, 'broken_env_selfcheck', { healthy => 0, detail => $why });
+                        }
+                    }
+                }
+            }
+
             # 06-fleet-inbox-bridge: runs every tick, paused ticks included,
             # immediately before 05's fleet-thread tick (spec §2.4) -- so a
             # closed/applied escalation this pass is visible to 05's own tick
             # in the SAME tick.
             my $inbox_applied = $bctx ? _inbox_bridge_tick($bctx, { status => $status, reg => read_registry($runs),
-                tunables => $t, answer => $answer_escalation }) : 0;
+                tunables => $t, answer => $answer_escalation, paused => $paused }) : 0;
             # review-1.md M1: an applied answer (relaunch/reset/accept/drop)
             # flips the ledger and/or unlinks the escalation file THROUGH A
             # SUBPROCESS -- $meta/$status/$att/$pid/$sid and $paused were
@@ -4419,6 +4716,15 @@ sub run {
             # included, after the token keeper and usage poll have refreshed
             # $paused (spec §2.5) and before PAUSE GATING's early `next`.
             _fleet_thread_tick($fctx, { paused => $paused, meta => $meta, now => $now }) if $fctx;
+
+            # todo 20261002-135330-489b0000: $STOP was only checked at the top
+            # of the loop, so a SIGTERM that landed while the two ticks above
+            # were waiting on locks or a subprocess still ran the whole rest of
+            # this tick (launches included) before the loop noticed -- and a
+            # reaper with a short grace then SIGKILLed it mid-tick, skipping
+            # release_marker and the keep-awake 'settled'. Both ticks are now
+            # bounded; this makes the stop take effect as soon as they return.
+            last if $STOP;
 
             # ---- PAUSE GATING: maybe auto-resume; never launch while paused ----
             my $resume_pending = ($paused && !$paused->{manual}) ? 1 : 0;
@@ -5838,8 +6144,13 @@ sub run {
                 _enter_pause_manual($runs, $log, 'broken-env: launcher could not be executed',
                     { package => '_fleet', blueprint => $bp, kind => 'broken-env', category => 'unclassified',
                       question => "The launcher could not be executed $n times in a row — the run environment is broken "
-                                . '(missing bash, missing bp-launch.sh, or a bad mount). Fix it, then resume the run '
-                                . 'by deleting runs/.paused (`rm runs/.paused`) — this pause is manual and will not lift on its own.',
+                                . '(missing bash, missing bp-launch.sh, or a bad mount). '
+                                . ($env_probe
+                                    ? 'The orchestrator re-checks bash and bp-launch.sh every ' . ($t->{broken_env_probe} // 300)
+                                      . 's and resumes by itself if they work again (at most ' . ($t->{broken_env_retries} // 3)
+                                      . ' times per run). Otherwise fix it, then '
+                                    : 'Fix it, then ')
+                                . 'resume the run by deleting runs/.paused (`rm runs/.paused`).',
                       context  => "exec of 'bash $DIR/bp-launch.sh' failed on $n consecutive launch attempts; last errno: $errno",
                       created_at => $now });
                 $exec_fail_streak = 0;
@@ -6513,7 +6824,15 @@ sub remediation_step {
                 next unless ref $ex eq 'HASH';
                 next unless ($ex->{package} // '') eq '_remediation'
                          && ($ex->{kind}    // '') eq 'remediation-escalation';
-                unlink "$ny/$f";
+                # Archived, not a bare unlink (todo 20261002-135330-8ff50000):
+                # the fleet thread reads "gone with no archive entry" as
+                # answered, and a resolver may have re-tagged this record
+                # operator-owned -- withdrawing stale content is not an
+                # answer. A failed archive still withdraws it, as before.
+                (my $xid = $f) =~ s/\.json\z//i;
+                archive_settled_escalation($runs, $xid, $ex,
+                    'withdrawn: no remediation findings are outstanding any more')
+                    or unlink "$ny/$f";
             }
             closedir $dh;
         }

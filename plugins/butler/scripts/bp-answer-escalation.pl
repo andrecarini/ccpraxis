@@ -204,9 +204,51 @@ use warnings;
 use File::Basename qw(dirname);
 use Cwd qw(abs_path);
 use File::Spec ();
-use Fcntl qw(LOCK_EX LOCK_UN);
+use Fcntl qw(LOCK_EX LOCK_UN LOCK_NB);
 
 my $DIR = dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; abs_path($f) // $f });
+
+# Lock-wait budget for this script's OWN lock sites (todo
+# 20261002-153740-41890000). The orchestrator's inbox bridge runs this script
+# synchronously inside its tick loop, so a blocking flock against a stuck or
+# suspended holder froze the whole fleet -- token keeper included, so tokens
+# could lapse fleet-wide. Every wait is now bounded; on expiry the answer is
+# refused with exit 6 and `refused: lock-timeout`, which the bridge already
+# treats as "deferred, retry next tick" and a human sees as "try again".
+# BP_ANSWER_LOCK_TIMEOUT (seconds, positive integer) overrides the default.
+# 10s matches BpWrite's own default ($BpWrite::LOCK_TIMEOUT_SECS) and
+# bp-resolve.pl's _with_qpath_lock, the other writers of the same files.
+our $LOCK_WAIT_SECS = 10;
+sub _lock_wait_secs {
+    my $e = $ENV{BP_ANSWER_LOCK_TIMEOUT};
+    return $e + 0 if defined $e && $e =~ /\A\d+\z/ && $e > 0;
+    return $LOCK_WAIT_SECS;
+}
+
+# _flock_bounded($fh) -> 1 (locked) | 0 (budget spent). LOCK_NB polling, the
+# same shape as BpWrite::_guarded_write: a plain LOCK_EX has no timeout, and
+# alarm() is not a reliable interrupt for a blocked flock on this host.
+sub _flock_bounded {
+    my ($fh) = @_;
+    my $deadline = time + _lock_wait_secs();
+    until (flock($fh, LOCK_EX | LOCK_NB)) {
+        return 0 if time >= $deadline;
+        select(undef, undef, undef, 0.05);
+    }
+    return 1;
+}
+
+# _refuse_lock_timeout($pkg, $kind, $family, $action) -- never returns. The
+# same exit-6 JSON shape every other refusal in the CLI prints on stdout.
+sub _refuse_lock_timeout {
+    my ($pkg, $kind, $family, $action) = @_;
+    require JSON::PP;
+    print JSON::PP->new->canonical->pretty->encode({
+        ok => JSON::PP::false(), package => $pkg, kind => $kind,
+        family => $family, action => $action, refused => 'lock-timeout',
+    });
+    exit 6;
+}
 require "$DIR/bp-orchestrator.pl";   # reuse BpOrch atomic ledger/registry/pause writers
 
 # bp-ledger.pl (b17 1.2) declares no `package` of its own, so requiring it installs
@@ -272,13 +314,16 @@ sub widen_write_set {
 # ledger outright for `--action drop`. Kept as a plain, locked, in-this-file writer
 # instead; t/69's own oracle (C3) also pins this file to exactly ONE raw ">:raw"
 # writer, guarding against write-set widening growing a second independent one.
+#
+# Returns 'lock-timeout' when the ledger lock could not be taken within
+# _lock_wait_secs() (nothing written); undef otherwise, as before.
 sub append_human_decision {
     my ($bpdir, $pkg, $note, $action) = @_;
     return unless defined $note && length $note;
     my $f = "$bpdir/packages/$pkg.md";
     my $lock_p = BpWrite::lock_path($f);
     open(my $lk, '>', $lock_p) or return;
-    flock($lk, LOCK_EX) or do { close $lk; return };
+    unless (_flock_bounded($lk)) { close $lk; return 'lock-timeout'; }
     open my $r, '<:raw', $f or do { flock($lk, LOCK_UN); close $lk; return };
     local $/; my $txt = <$r>; close $r;
     unless (defined $txt) { flock($lk, LOCK_UN); close $lk; return; }
@@ -332,17 +377,36 @@ sub update_next_action_with_note {
     # tests do) would see that line spliced into what must stay pure JSON on stdout.
     # A rejection here is a silent no-op for Next-action delivery, not a fatal error --
     # the audit record (append_human_decision, above) already landed regardless.
+    #
+    # The child's stderr goes to a temp file rather than the null device so a
+    # BOUNDED lock wait (BP_LEDGER_LOCK_TIMEOUT, exported below) can be told
+    # apart from a validation rejection: a lock timeout returns 'lock-timeout'
+    # and the caller defers the whole answer (exit 6) instead of reporting
+    # next_action_updated=false. Nothing from that file is ever printed.
     my $devnull = File::Spec->devnull;
+    require File::Temp;
+    my ($efh, $epath) = eval { File::Temp::tempfile('bp-answer-XXXXXX', TMPDIR => 1, UNLINK => 0) };
+    close $efh if $efh;
+    my $errdst = defined $epath ? $epath : $devnull;
     my ($saved_out, $saved_err);
     open($saved_out, '>&', \*STDOUT) or return 0;
     open($saved_err, '>&', \*STDERR) or return 0;
     open(STDOUT, '>', $devnull) or do { open(STDOUT, '>&', $saved_out); return 0; };
-    open(STDERR, '>', $devnull) or do { open(STDOUT, '>&', $saved_out); open(STDERR, '>&', $saved_err); return 0; };
-    system($^X, $ledger_pl, 'set-next-action', '--ledger', $ledger, '--body', $body);
+    open(STDERR, '>', $errdst) or do { open(STDOUT, '>&', $saved_out); open(STDERR, '>&', $saved_err); return 0; };
+    {
+        local $ENV{BP_LEDGER_LOCK_TIMEOUT} = _lock_wait_secs();
+        system($^X, $ledger_pl, 'set-next-action', '--ledger', $ledger, '--body', $body);
+    }
     my $rc = $?;
     open(STDOUT, '>&', $saved_out);
     open(STDERR, '>&', $saved_err);
     close $saved_out; close $saved_err;
+    my $err = '';
+    if (defined $epath) {
+        if (open my $r, '<', $epath) { local $/; $err = <$r> // ''; close $r; }
+        unlink $epath;
+    }
+    return 'lock-timeout' if $rc != 0 && $err =~ /lock-timeout:/;
     return ($rc == 0) ? 1 : 0;
 }
 
@@ -399,7 +463,19 @@ sub clear_pkg_decisions {
     for my $f (@files) {
         my $rec = BpOrch::_read_json("$d/$f");
         next unless ref $rec eq 'HASH' && defined $rec->{package} && $rec->{package} eq $pkg;
-        $n++ if unlink "$d/$f";
+        # Archive, never a bare unlink (todo 20261002-135330-8ff50000): the
+        # fleet thread treats "escalation gone with no archive entry" as
+        # ANSWERED and logs answer-applied for it. These siblings were
+        # cleared by a package-wide --package answer, not answered one by one, so they
+        # get a resolved-escalations record saying so. If the archive write
+        # itself fails the record is still removed, as before -- the reset
+        # must not leave stale decisions queued for a package it just reset.
+        (my $id = $f) =~ s/\.json\z//i;
+        if (BpOrch::archive_settled_escalation($runs, $id, $rec, "cleared by a direct --package answer for $pkg")) {
+            $n++;
+        } elsif (unlink "$d/$f") {
+            $n++;
+        }
     }
     return $n;
 }
@@ -414,7 +490,10 @@ sub requeue_not_mine {
     my ($file, $note, $runs) = @_;
     my $lock_p = "$file.lock";
     open(my $lk, '>', $lock_p) or return 0;
-    unless (flock($lk, LOCK_EX)) { close $lk; return 0; }
+    # Bounded (todo 41890000): a stuck holder of "$file.lock" (bp-resolve.pl's
+    # apply_verdict takes the same lock) must not wedge the caller. A failure
+    # here is already exit 6 at the call site -- retried next tick.
+    unless (_flock_bounded($lk)) { close $lk; return 0; }
     my $pkg;
     my $ok = eval {
         my $rec = BpOrch::_read_json($file);
@@ -578,6 +657,67 @@ sub _log_pseudo_ack {
     eval { BpOrch::_log("$runs/orchestrator.log", 'pseudo_package_acknowledge',
         { package => $pkg, kind => $kind, note => $note }); 1 };
     return;
+}
+
+# _queued_kind_for($runs, $pkg, $kind) -> 1|0: is any escalation of $kind
+# queued for $pkg ($pkg undef = for any package)?
+sub _queued_kind_for {
+    my ($runs, $pkg, $kind) = @_;
+    my $d = BpOrch::escalations_dir($runs);
+    return 0 unless defined $d && -d $d;
+    opendir(my $h, $d) or return 0;
+    my @files = grep { /\.json\z/ } readdir $h;
+    closedir $h;
+    for my $f (@files) {
+        my $rec = BpOrch::_read_json("$d/$f");
+        next unless ref $rec eq 'HASH' && ($rec->{kind} // '') eq $kind;
+        return 1 if !defined $pkg || (defined $rec->{package} && $rec->{package} eq $pkg);
+    }
+    return 0;
+}
+
+# _lift_turn_starved_pause($runs, $pkg) -> 1 (pause cleared) | 0.
+#
+# DESIGN CALL for todo 20261002-153740-ed3a0000 (pkg06 review S6), made to
+# match how todo 20261002-143634-1dba0000 / blueprint Decision 45's F2 rule
+# handle the same structural gap:
+#
+#   turn-starved is filed `scoping` (resolver-triageable) TOGETHER WITH a
+#   fleet-wide MANUAL pause, and escalation-resolve dispatch runs after
+#   PAUSE GATING -- so the resolver can never reach the record while the
+#   pause it caused holds, and F1 never fires (the category never becomes
+#   product/operator-action). The record reached nobody: Decision 7's "the
+#   fleet reaches the operator without a reporter" did not hold for it.
+#
+#   Resolution, in two halves:
+#   (1) bp-orchestrator.pl's _inbox_bridge_eligible_now extends F2: a
+#       turn-starved record under a manual pause is resolver-unreachable for
+#       the same reason a _fleet record is, so it goes straight to the inbox
+#       (choices relaunch/accept/drop -- not-mine is withheld, since it would
+#       only hand the record back to a resolver that cannot run while paused).
+#   (2) HERE: an answer that settles the LAST queued turn-starved escalation
+#       also lifts the turn-starved pause, so answering from the inbox (or
+#       this CLI) actually resumes the fleet. Before this, a package-family
+#       answer never touched .paused and the run stayed halted until someone
+#       ran `rm runs/.paused` by hand.
+#
+#   The fleet-wide pause itself (b01 AC-18) is deliberately KEPT: replacing
+#   it with a package-only park would change what the operator sees on
+#   turn-starvation (the rest of the fleet would keep running), which no
+#   blueprint decision covers. Only a pause whose reason is turn-starved is
+#   ever lifted here, and only once no turn-starved record remains queued --
+#   _enter_pause_manual keeps the FIRST manual reason, so with two starved
+#   packages the pause names one of them while both records are queued.
+#   Any other manual pause (reauth, contract-drift, broken-env) is untouched.
+sub _lift_turn_starved_pause {
+    my ($runs, $pkg) = @_;
+    my $p = BpOrch::read_paused($runs);
+    return 0 unless ref $p eq 'HASH' && $p->{manual} && ($p->{reason} // '') =~ /\Aturn-starved: /;
+    return 0 if _queued_kind_for($runs, undef, 'turn-starved');
+    BpOrch::clear_pause($runs);
+    eval { BpOrch::_log("$runs/orchestrator.log", 'turn_starved_pause_lifted',
+        { package => $pkg, reason => $p->{reason} }); 1 };
+    return 1;
 }
 
 unless (caller) {
@@ -855,6 +995,9 @@ unless (caller) {
         unless (defined $pkg && length $pkg && -f "$bpdir/packages/$pkg.md") {
             print STDERR "bp-answer-escalation: package ledger not found for '" . ($pkg // '') . "'\n"; exit 2;
         }
+        # Bounded ledger lock (todo 41890000): run_op exits 4 with a
+        # "lock-timeout:" message instead of waiting forever on a stuck holder.
+        local $ENV{BP_LEDGER_LOCK_TIMEOUT} = _lock_wait_secs();
         widen_write_set("$bpdir/packages/$pkg.md", $trimmed);   # never returns
     }
 
@@ -947,7 +1090,11 @@ unless (caller) {
         # the `if $plan->{relaunch}` gate that silently dropped it for those two
         # (defect 4, the worst-shaped of the four: exit 0, note vanished, no warning)
         # is gone. append_human_decision() itself already no-ops when $note is undef.
-        append_human_decision($bpdir, $pkg, $note, $plan->{action});
+        # Bounded lock (todo 41890000): this is the FIRST ledger write of the
+        # answer, so a lock timeout here defers with nothing written at all.
+        my $ah = append_human_decision($bpdir, $pkg, $note, $plan->{action});
+        _refuse_lock_timeout($pkg, $kind, $plan->{family}, $plan->{action})
+            if defined $ah && $ah eq 'lock-timeout';
         # b18: put the answer where the resume prompt actually points (see
         # update_next_action_with_note's own header) -- must run for every action
         # that carries a note (relaunch/reset/accept/drop alike), matching b17's
@@ -963,6 +1110,14 @@ unless (caller) {
         # script's combined output and parse stdout as JSON, so any stderr line -- including
         # our own -- would corrupt what it is meant to warn about.
         $next_action_updated = update_next_action_with_note($bpdir, $pkg, $note, $plan->{action});
+        # A lock timeout on the ledger (todo 41890000) defers the whole answer
+        # rather than reporting next_action_updated=false: the audit block
+        # above has landed, but both writers are idempotent (the audit block
+        # replaces any prior one, set-next-action replaces the section), so
+        # the retry next tick converges to exactly one copy of each. Status,
+        # registry and the queued decision are still untouched here.
+        _refuse_lock_timeout($pkg, $kind, $plan->{family}, $plan->{action})
+            if defined $next_action_updated && $next_action_updated eq 'lock-timeout';
         # a01/S1+S1b: the ledger write and the registry write are both now guarded
         # (BpWrite::guarded_write) -- the ledger write additionally refuses while the
         # registry-recorded coordinator pid is alive, UNLESS this plan already
@@ -1039,16 +1194,26 @@ unless (caller) {
         BpOrch::clear_pause($runs);
     }
 
+    # todo 20261002-153740-ed3a0000: does this answer settle a turn-starved
+    # escalation? Decided BEFORE the queue is cleared below (direct --package
+    # mode clears every record of the package, so afterwards there is nothing
+    # left to look at).
+    my $answers_starved = ($plan->{family} eq 'package' && !$plan->{pseudo})
+        && ((defined $kind && $kind eq 'turn-starved')
+            || (!defined $file && _queued_kind_for($runs, $pkg, 'turn-starved')));
+
     # Clear the queue: the single answered decision (decision mode), else every
     # queued decision for this package (direct package mode).
     if (defined $file) { unlink $file; $cleared = 1; }
     elsif ($plan->{family} eq 'package') { $cleared = clear_pkg_decisions($runs, $pkg); }
 
+    my $lifted = $answers_starved ? _lift_turn_starved_pause($runs, $pkg) : 0;
+
     print JSON::PP->new->canonical->pretty->encode({
         ok => JSON::PP::true(), package => $pkg, kind => $kind,
         family => $plan->{family}, action => $plan->{action},
         ledger_status => $plan->{ledger_status},
-        cleared_pause => ($plan->{clear_pause} ? JSON::PP::true() : JSON::PP::false()),
+        cleared_pause => (($plan->{clear_pause} || $lifted) ? JSON::PP::true() : JSON::PP::false()),
         superseded => $superseded, decisions_cleared => $cleared,
         # b18: absent when no --note was given. When one was, this says whether the
         # OPERATIVE copy reached `## Next action` -- the section a resuming coordinator
