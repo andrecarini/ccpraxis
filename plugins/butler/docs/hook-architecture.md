@@ -281,11 +281,11 @@ reason: Registered without a matcher on UserPromptSubmit in the guarded 2.2 form
 
 ### file: session-start-nudge.sh
 verdict: keep
-reason: Added by never-halt package 12 (Decision 43, N6 and N1-now); on an armed session's compact or resume it injects one line telling the agent to re-read its tasks or continue its held work.
+reason: Added by never-halt package 12 (Decision 43, N6 and N1-now), extended by blueprint where-things-go package 10 (specs/10-gatherer-and-digest-spec.md sec 2.6): SessionStart runs one route on every source: re-attach, then the project digest, then the armed nudges.
 
 ### registration: hooks.json SessionStart [] session-start-nudge.sh
 verdict: keep
-reason: Registered without a matcher on SessionStart in the guarded 2.2 form, beside denial-breaker.sh; it never blocks, writes nothing, and prints at most one additionalContext line.
+reason: Registered without a matcher on SessionStart in the guarded 2.2 form, beside denial-breaker.sh; it never blocks, writes nothing, and prints at most one additionalContext line, on every source armed or not.
 
 ## BpHook core API
 
@@ -669,7 +669,7 @@ self-arm". For a manual session after the operator's own `/clear`, the operator 
 `/butler:continuity on`. After a carry-over, the carry-over skill prose tells the fresh session to run
 `butler-continuity on` when the work was armed. The old id's arm file is not a live session. It stays
 until its transcript is gone, and it stops holding the wake-lock once its transcript has gone an hour
-with no activity (Decision 53). Two SessionStart hooks are registered, and neither carries state across a new id: denial-breaker.sh (never-halt 07) moves its own per-agent counting offset, and session-start-nudge.sh (never-halt 12) speaks only on source compact or resume of an armed session, both of which keep the id. No SessionEnd hook is registered.
+with no activity (Decision 53). Two SessionStart hooks are registered, and neither carries state across a new id: denial-breaker.sh (never-halt 07) moves its own per-agent counting offset, and session-start-nudge.sh (blueprint where-things-go, package 10) runs its one route on every source, both of which keep the id. SessionStart runs one route on every source: re-attach, then the project digest, then the armed nudges. No SessionEnd hook is registered.
 
 **Wake-lock (Decision 18, Decision 53).** `BpContinuityLease.pm` (package 04, rewired by package 16) holds the lock
 while an armed session's transcript was written in the last hour. It no longer reads the old
@@ -1230,7 +1230,7 @@ next fork dispatch, and the guard denies again after it. Decision 3 applies thro
 | record-denial.sh | 0 | --pre ledger,driver : exits when BP_LEDGER is unset and the session is not an armed driver |
 | denial-breaker.sh | 3 | --pre ledger,driver : exits when BP_LEDGER is unset and the session is not an armed driver |
 | arm-nudge-prompt.sh | 1 | no run-hook.sh and no --pre (pure bash, never starts perl) : exits when BP_LEDGER is set, the payload is not a main-thread UserPromptSubmit, or the prompt is a task-notification |
-| session-start-nudge.sh | 1 | --pre armed : exits when armed/<session_id> is absent |
+| session-start-nudge.sh | 1 | no --pre (runs on every source, armed or not) : exits only when [ -f run-hook.sh ] fails |
 | ac-standdown-gate.sh | 2 | --pre acstanddown : exits when the AC-loss stand-down marker is absent (env-only, no session file read) |
 
 **Who each rule applies to.** A fork counts as a subagent everywhere.
@@ -1258,13 +1258,15 @@ next fork dispatch, and the guard denies again after it. Decision 3 applies thro
 - guard-fork: every session and caller (Decision 64).
 - arm-nudge-prompt: the main thread's operator prompts only; a task-notification, a subagent payload
   or a BP_LEDGER environment is skipped before anything is written.
-- session-start-nudge: the main thread of an armed, non-coordinator session, on source compact or
-  resume only; a subagent payload, a BP_LEDGER environment, or any other source is quiet.
+- session-start-nudge: every main-thread session, on every source (startup, resume, clear, compact),
+  armed or not -- it always re-attaches and prints the project digest; the never-halt-12 nudge text
+  itself still only speaks on an armed session's compact or resume. A subagent payload or a
+  BP_LEDGER environment is quiet.
 
-Behaviour kept by package 14, and which existing tests each rebuild re-expresses in
-`plugins/butler/tests/t/guards-remake-suite.t` (Decision 26: assertions about a Decision 6 override
-are exempt and listed in 14's ledger). Merged guards run each old rule behind its old applicability
-test, inside one process:
+Behaviour kept by package 14, and which existing tests each rebuild re-expresses in the
+`plugins/butler/tests/t/guards-remake-*.t` family (one file per merged guard; Decision 26:
+assertions about a Decision 6 override are exempt and listed in 14's ledger). Merged guards run
+each old rule behind its old applicability test, inside one process:
 
 - guard-bash.sh: coordinator denials (git checkout, switch, restore, reset, clean, rebase, merge,
   commit, push and stash except list/show; rm -rf outside /tmp, BP_DIR and screenshots; deploys;
