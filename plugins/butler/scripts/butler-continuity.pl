@@ -367,9 +367,9 @@ if ($verb eq 'on') {
             refuse("--goal needs at least two words saying what this session is for.");
         }
         my $san = sanitize_text($flags{goal});
-        my $b = $san;
-        utf8::encode($b) if utf8::is_utf8($b);
-        if (length($b) > 200) {
+        my $goal_bytes = $san;
+        utf8::encode($goal_bytes) if utf8::is_utf8($goal_bytes);
+        if (length($goal_bytes) > 200) {
             refuse("--goal is at most 200 bytes; it goes into the arm record.");
         }
         $ON_GOAL = $san;

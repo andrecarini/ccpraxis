@@ -364,9 +364,9 @@ sub arm {
     }
     my $by = $opts{by};
     unless (defined $by && $by =~ /^[a-z][a-z0-9-]{0,31}$/) { _set_error('bad role'); return 0 }
-    if (defined $opts{goal} && ref $opts{goal}) { _set_error('bad goal'); return 0 }
     my $root = state_dir();
     unless (defined $root) { _set_error('no state root'); return 0 }
+    if (defined $opts{goal} && ref $opts{goal}) { _set_error('bad goal'); return 0 }
     my $lockdir = "$root/armlock";
     eval { require File::Path; File::Path::make_path($lockdir) };
     my $lockpath = "$lockdir/$sid";
