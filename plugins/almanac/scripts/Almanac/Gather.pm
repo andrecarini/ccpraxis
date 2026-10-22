@@ -66,6 +66,22 @@ sub _now_iso {
         $t[5] + 1900, $t[4] + 1, $t[3], $t[2], $t[1], $t[0]);
 }
 
+sub _fs_bytes {
+    my ($s) = @_;
+    return $s unless defined $s;
+    utf8::encode($s) if utf8::is_utf8($s);
+    return $s;
+}
+
+sub _decode_if_bytes {
+    my ($s) = @_;
+    return $s unless defined $s && !ref $s;
+    return $s if utf8::is_utf8($s);
+    my $copy = $s;
+    utf8::decode($copy);
+    return $copy;
+}
+
 sub _basename {
     my ($root) = @_;
     return '' unless defined $root;
