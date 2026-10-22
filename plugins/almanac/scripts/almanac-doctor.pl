@@ -623,6 +623,8 @@ sub scan {
                 };
             }
         }
+
+        push @findings, _stale_park_findings($P);
     }
 
     my $home = $ENV{ALMANAC_HOME};
@@ -687,6 +689,71 @@ sub format_finding {
 }
 
 # _parse_args(@argv) -> (1, $root|undef) | (0, undef)
+# _stale_park_findings($root) -> @findings (class STALE-PARK, num 15).
+# bp-blueprint.pl's unpark hook closes a blueprint's park item BEFORE it
+# rewrites blueprint.md's status (the order that makes a retry safe). A hard
+# crash between the two leaves blueprint.md saying parked while its park
+# item reads closed by that very hook with "left parked": the operator's only
+# signal is gone and nothing drives the blueprint again (where-things-go pkg08
+# red team L3, todo 20261002-185449-c3eb0000). Flagged when a non-archived
+# blueprint is parked, none of its park items is still unanswered, and the
+# newest one was closed by 'bp-blueprint.pl set-meta'.
+#
+# Read-only and Almanac::Inbox-free (see the header): item files are read
+# with Almanac::Record::read_file directly, never through the inbox library.
+sub _stale_park_findings {
+    my ($P) = @_;
+    my @out;
+    require Almanac::PackageLink;
+    my $bpdir = Almanac::PackageLink::blueprints_dir(root => $P);
+    return () unless defined $bpdir;
+    (my $inbox = $bpdir) =~ s{/blueprints\z}{/almanac/inbox};
+    return () unless -d $bpdir && -d $inbox;
+
+    opendir(my $dh, $bpdir) or return ();
+    my @bps = sort grep { !/^[._]/ && -f "$bpdir/$_/blueprint.md" } readdir $dh;
+    closedir $dh;
+
+    # blueprint.md's status is read with PackageLink's first-block reader,
+    # so this file adds no frontmatter parser of its own (AC21/AC23).
+    my @parked;
+    for my $bp (@bps) {
+        my $status = Almanac::PackageLink::_fm_get("$bpdir/$bp/blueprint.md", 'status');
+        next unless defined $status;
+        $status =~ s/\s*#.*\z//;
+        push @parked, $bp if $status eq 'parked';
+    }
+    return () unless @parked;
+
+    opendir(my $ih, $inbox) or return ();
+    my @files = grep { /\.md\z/ } readdir $ih;
+    closedir $ih;
+    my %by_bp;
+    for my $f (@files) {
+        my $rec = eval { Almanac::Record::read_file("$inbox/$f") } or next;
+        my $fl = $rec->{fields} || {};
+        my $link = $fl->{link};
+        next unless defined $link && grep { $_ eq $link } @parked;
+        next unless defined $fl->{title} && $fl->{title} =~ /^Blueprint \Q$link\E parked:/;
+        push @{ $by_bp{$link} }, { %$fl, _path => "$inbox/$f" };
+    }
+
+    my $root_c = _decode_maybe($P);
+    for my $bp (@parked) {
+        my $items = $by_bp{$bp} or next;   # parked with no item ever filed: not this finding
+        next if grep { ($_->{status} // '') eq 'unanswered' } @$items;
+        my ($newest) = sort { ($b->{closed_at} // $b->{created} // '') cmp ($a->{closed_at} // $a->{created} // '') } @$items;
+        next unless ($newest->{closed_by} // '') eq 'bp-blueprint.pl set-meta';
+        push @out, {
+            class  => 'STALE-PARK', num => 15, scope => 'project', type => 'inbox', id => $bp,
+            path   => _decode_maybe($newest->{_path}), line => undef,
+            detail => "blueprint $bp is still parked, but its park item was closed as if it had left parked (an interrupted unpark)",
+            repair => qq(finish the unpark: perl <ccpraxis>/plugins/butler/scripts/bp-blueprint.pl set-meta --file "$root_c/.ccpraxis-local-data/blueprints/$bp/blueprint.md" --field status --value <its status before the park>, or re-park it with bp-drive-next.pl park),
+        };
+    }
+    return @out;
+}
+
 sub _parse_args {
     my (@argv) = @_;
     return (1, undef) unless @argv;
