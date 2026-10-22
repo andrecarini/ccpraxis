@@ -7,6 +7,7 @@
 #   butler-continuity off     [--reason '<2+ words>'] [--token <8 hex>]
 #   butler-continuity off-confirm --otp <otp> --justification '<2+ words>'
 #   butler-continuity silence  --reason '<2+ words>'  [--token <8 hex>]
+#   butler-continuity emergency-stop --reason '<2+ words>' [--area <area>]
 #   butler-continuity status
 #
 # Contract: .ccpraxis-local-data/blueprints/hook-continuity-remake/specs/
@@ -30,7 +31,7 @@ require "$Bin/BpHook.pm"
 require "$Bin/BpContinuityLease.pm"
     unless grep { m{(?:^|/)BpContinuityLease\.pm$} } keys %INC;
 
-my $USAGE = q{usage: butler-continuity on --new-thread <name> | on --thread <name> [--role driver] --goal '<what this session is for>' | on --role reporter [--goal '<...>'] | off [--reason '<why>'] [--token T] | off-confirm --otp <otp> --justification '<2+ words>' | silence --reason '<why>' [--token T] (escape hatch: use sparingly) | status};
+my $USAGE = q{usage: butler-continuity on --new-thread <name> | on --thread <name> [--role driver] --goal '<what this session is for>' | on --role reporter [--goal '<...>'] | off [--reason '<why>'] [--token T] | off-confirm --otp <otp> --justification '<2+ words>' | silence --reason '<why>' [--token T] (escape hatch: use sparingly) | emergency-stop --reason '<why>' [--area <area>] (only for a genuine defect in ccpraxis, Claude Code or another system that leaves no choice but to stop; never for finished work; files a bug report) | status};
 
 sub _bytes {
     my ($s) = @_;
@@ -236,7 +237,7 @@ if (defined $verb && exists $RETIRED_VERBS{$verb}) {
     refuse("'butler-continuity $verb' is retired; use '$RETIRED_VERBS{$verb}' instead");
 }
 
-usage_die() unless defined $verb && $verb =~ /^(?:on|off|off-confirm|silence|status)$/;
+usage_die() unless defined $verb && $verb =~ /^(?:on|off|off-confirm|silence|status|emergency-stop)$/;
 
 my %allowed = (
     on           => { role => 1, 'new-thread' => 1, thread => 1, goal => 1 },
@@ -244,6 +245,7 @@ my %allowed = (
     'off-confirm' => { otp => 1, justification => 1 },
     silence      => { reason => 1, token => 1 },
     status       => {},
+    'emergency-stop' => { reason => 1, area => 1 },
 );
 
 my %flags;
@@ -263,25 +265,38 @@ while (@args) {
 # ---------------------------------------------------------------------------
 # Step 1: validation. Nothing is consumed or written.
 # ---------------------------------------------------------------------------
-if ($verb eq 'off' || $verb eq 'silence') {
+if ($verb eq 'off' || $verb eq 'silence' || $verb eq 'emergency-stop') {
     if (exists $flags{reason}) {
         if (!defined $flags{reason} || visible_word_count($flags{reason}) < 2) {
             refuse("--reason needs at least two words saying why.");
         }
     }
-    elsif ($verb eq 'silence') {
+    elsif ($verb eq 'silence' || $verb eq 'emergency-stop') {
         refuse("--reason needs at least two words saying why.");
     }
 }
 
 # NEW (off): --reason at most 200 UTF-8 bytes once sanitized (spec 2.3 step
-# 1, R10), checked right after the existing two-word check.
-if ($verb eq 'off' && exists $flags{reason} && defined $flags{reason}) {
+# 1, R10), checked right after the existing two-word check. emergency-stop
+# (judged-continuity-disarm pkg 06) shares the same shape.
+my $EMERGENCY_STOP_AREA;
+if (($verb eq 'off' || $verb eq 'emergency-stop') && exists $flags{reason} && defined $flags{reason}) {
     my $san = sanitize_text($flags{reason});
     utf8::encode($san) if utf8::is_utf8($san);
     if (length($san) > 200) {
         refuse("--reason is at most 200 bytes; it goes into the thread log.");
     }
+}
+
+# NEW (emergency-stop): --area, a short one-line area name (spec 2.2 d).
+if ($verb eq 'emergency-stop' && exists $flags{area}) {
+    my $a = defined $flags{area} ? sanitize_text($flags{area}) : '';
+    my $a_bytes = $a;
+    utf8::encode($a_bytes) if utf8::is_utf8($a_bytes);
+    if (!length($a) || length($a_bytes) > 64 || $a =~ /^-/) {
+        refuse("--area takes a short one-line area name, e.g. butler, sandbox or claude-code.");
+    }
+    $EMERGENCY_STOP_AREA = $a;
 }
 
 # NEW (off-confirm): --justification / --otp validation (spec 2.2.1).
@@ -341,7 +356,11 @@ if (defined $ENV{BP_LEDGER} && length $ENV{BP_LEDGER}) {
         out("continuity is on by construction for a coordinator; nothing to do.\n");
         exit 0;
     }
-    # status runs normally.
+    # status runs normally. emergency-stop (Decision 21) is deliberately NOT
+    # in the refusal list above: it falls through like status, so a
+    # coordinator session can still file a bug report and record it, just
+    # without turning continuity off (its own verb handler below never calls
+    # disarm for a coordinator).
 }
 
 # ---------------------------------------------------------------------------
@@ -408,7 +427,8 @@ unless (defined $ROOT) {
 # ---------------------------------------------------------------------------
 my ($SID, $AID, $OPERATOR_TICKET, $PROJECT, $TRANSCRIPT_PATH, $TICKET_CWD);
 
-if ($verb eq 'on' || $verb eq 'off' || $verb eq 'off-confirm' || $verb eq 'silence' || $verb eq 'status') {
+if ($verb eq 'on' || $verb eq 'off' || $verb eq 'off-confirm' || $verb eq 'silence' || $verb eq 'status'
+    || $verb eq 'emergency-stop') {
     my $t = BpHook::take_ticket('butler-continuity', \@argv0);
 
     if (ref $t eq 'HASH') {
@@ -442,7 +462,8 @@ if ($verb eq 'on' || $verb eq 'off' || $verb eq 'off-confirm' || $verb eq 'silen
         _refuse_binding();
     }
 
-    if (($verb eq 'on' || $verb eq 'off' || $verb eq 'off-confirm' || $verb eq 'silence') && defined $AID) {
+    if (($verb eq 'on' || $verb eq 'off' || $verb eq 'off-confirm' || $verb eq 'silence' || $verb eq 'emergency-stop')
+        && defined $AID) {
         refuse("only the main session changes continuity; a subagent may not.");
     }
 }
@@ -454,7 +475,7 @@ sub _refuse_binding {
     elsif ($verb eq 'status') {
         refuse("no session binding for status; run it again as a plain Bash tool call.");
     }
-    elsif ($verb eq 'off-confirm') {
+    elsif ($verb eq 'off-confirm' || $verb eq 'emergency-stop') {
         refuse("no session binding; run it again as a plain Bash tool call with arguments in single quotes.");
     }
     else {
@@ -686,14 +707,21 @@ sub _r13_title {
 # distinct from "this session has no thread"). Steps 1 and 4 are both skipped
 # for either non-zero $broken; the caller prints a warning for each case.
 # Refuses R13 directly (exits) when an unlinked task is doing.
-sub _off_doing_gate {
+# _disarm_thread() -> ($T, $broken): the attached thread and the library/store
+# status, with NO doing-task check. Same ($T, $broken) contract as _off_doing_gate.
+sub _disarm_thread {
     return (undef, 0) unless _almanac_present();
-    my $loaded = eval { _load_thread(); 1 };
-    return (undef, 1) unless $loaded;
+    return (undef, 1) unless eval { _load_thread(); 1 };
     my %O = _thread_opts();
     my $T = eval { _find_attached_thread(%O) };
     return (undef, 2) if $@;
-    return (undef, 0) unless defined $T;
+    return ($T, 0);
+}
+
+sub _off_doing_gate {
+    my ($T, $broken) = _disarm_thread();
+    return ($T, $broken) if $broken || !defined $T;
+    my %O = _thread_opts();
     my $list = eval { Almanac::Thread::tasks($T, %O) };
     my @tasks = (!$@ && ref $list eq 'ARRAY') ? @$list : ();
     my @doing = grep { !$_->{linked} && defined $_->{status} && $_->{status} eq 'doing' } @tasks;
@@ -853,15 +881,17 @@ if ($verb eq 'on') {
 # drift (spec sec 2.2.3's explicit recommendation). Never returns a value the
 # caller needs; callers exit 0 themselves right after calling it.
 sub _complete_disarm {
-    my ($actor, $reason, $T, $broken) = @_;
+    my ($actor, $reason, $T, $broken, %o) = @_;
+    my $tag    = $o{tag}    // 'off';
+    my $logged_text = $o{logged} // $reason;
     my $was_armed = BpHook::is_armed($SID);
     my $plan_ldir   = BpContinuityLease::legacy_dir();
     my $live_before = defined $plan_ldir ? (BpContinuityLease::any_active($plan_ldir) ? 1 : 0) : 0;
-    my $ok = BpHook::disarm($SID, actor => $actor, reason => $reason);
+    my $ok = BpHook::disarm($SID, actor => $actor, reason => $logged_text);
     unless ($ok) {
         refuse("could not write continuity state (" . (BpHook::last_error() // '') . ").");
     }
-    my $logged = BpHook::log_reason($SID, $actor, 'off', $reason, $PROJECT);
+    my $logged = BpHook::log_reason($SID, $actor, $tag, $logged_text, $PROJECT);
 
     my $note = $was_armed ? '' : '; was not armed';
     out("continuity off for session $S8 (actor $actor$note); reason logged.\n");
@@ -964,6 +994,52 @@ if ($verb eq 'off-confirm') {
         $broken = 1 unless _almanac_present() && eval { _load_thread(); 1 };
     }
     _complete_disarm($actor, $reason, $T, $broken);
+    exit 0;
+}
+
+# emergency-stop (judged-continuity-disarm pkg 06, spec 2.2 j, Decisions 10,
+# 15, 16, 21, 26): one unjudged call that stops a session for a genuine
+# defect, filing a mechanical bug report through BpHook::file_stop_bug so
+# the call is never an unaudited bypass. mint_disarm_otp is never called on
+# either path. On the coordinator path, BpHook::disarm, _disarm_thread,
+# _off_hand_off, lease_sync and plan_after_off are NOT called.
+if ($verb eq 'emergency-stop') {
+    my $coord  = (defined $ENV{BP_LEDGER} && length $ENV{BP_LEDGER}) ? 1 : 0;
+    my $actor  = $coord ? 'coordinator' : ($OPERATOR_TICKET ? 'operator' : 'agent');
+    my $reason = sanitize_text($flags{reason});
+    my $area   = defined $EMERGENCY_STOP_AREA ? $EMERGENCY_STOP_AREA : 'butler';
+
+    my $bug = BpHook::file_stop_bug(source => 'emergency-stop', session => $SID, actor => $actor,
+                                    reason => $reason, area => $area, cwd => $TICKET_CWD);
+    my $logged = "$reason; $bug->{note}";
+
+    my $bug_line = sub {
+        if (defined $bug->{id}) {
+            out("emergency-stop: bug report $bug->{id} filed (severity high, area $area).\n");
+        }
+        else {
+            binmode(STDERR, ':raw');
+            print STDERR _bytes("butler-continuity: WARNING: emergency-stop could not file its bug report "
+                . "($bug->{error}). Continuing without it; file the defect by hand with almanac-bug.pl file.") . "\n";
+        }
+    };
+
+    if ($coord) {
+        my $ok = BpHook::log_reason($SID, $actor, 'emergency-stop', $logged, $PROJECT);
+        out("emergency-stop recorded for coordinator session $S8; continuity was NOT turned off. "
+            . "A coordinator stops only when its ledger is terminal: set its status to blocked or "
+            . "parked with a concrete '## Next action', then stop.\n");
+        $bug_line->();
+        unless ($ok) {
+            binmode(STDERR, ':raw');
+            print STDERR "butler-continuity: warning: reason log not written.\n";
+        }
+        exit 0;
+    }
+
+    my ($T, $broken) = _disarm_thread();               # NO doing-task check
+    _complete_disarm($actor, $reason, $T, $broken, tag => 'emergency-stop', logged => $logged);
+    $bug_line->();
     exit 0;
 }
 

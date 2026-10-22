@@ -7,11 +7,13 @@
 # message budgets"). Additive only (Decision 19): nothing here is
 # registered; package 16 registers stop-gate.sh.
 #
-# run($p) never calls exit, never spawns a process, and uses only BpHook's
-# documented API plus core perl. Any internal die/exception propagates to
-# BpHook::main, which logs it and allows (fail open); a condition this
-# module itself treats as an internal failure is reported with
-# warn "stop-gate: ...\n" instead of a die, for the same reason.
+# run($p) never calls exit and uses only BpHook's documented API plus core
+# perl. It never spawns a process, except that a break-glass `off` files one
+# bug report through BpHook::file_stop_bug (a single almanac-bug.pl child,
+# bounded at 10s). Any internal die/exception propagates to BpHook::main,
+# which logs it and allows (fail open); a condition this module itself
+# treats as an internal failure is reported with warn "stop-gate: ...\n"
+# instead of a die, for the same reason.
 package BpHook::StopGate;
 use strict;
 use warnings;
@@ -89,10 +91,21 @@ sub run {
     # through, and for `off` disarms first, exactly as the shell commands would.
     if ($bg) {
         eval { _clear_streak($sid) };
+        my $text = $bg->{reason};
         if ($bg->{action} eq 'off') {
-            BpHook::disarm($sid, actor => 'agent', reason => "break-glass: $bg->{reason}");
+            my $bug = eval { BpHook::file_stop_bug(source => 'break-glass-off', session => $sid,
+                                 actor => 'agent', reason => $bg->{reason}, area => 'butler',
+                                 cwd => $p->{cwd}) };
+            unless (ref $bug eq 'HASH') {    # belt and braces: file_stop_bug never dies
+                (my $e = $@ || 'unknown error') =~ s/\r?\n.*\z//s;
+                $bug = { id => undef, error => $e, note => "bug report: FAILED ($e)" };
+            }
+            warn "stop-gate: break-glass off: bug report NOT filed ($bug->{error}); disarming anyway\n"
+                unless defined $bug->{id};
+            $text = "$bg->{reason}; $bug->{note}";
+            BpHook::disarm($sid, actor => 'agent', reason => "break-glass: $text");
         }
-        eval { BpHook::log_reason($sid, 'agent', "break-glass-$bg->{action}", $bg->{reason}, $p->{cwd}) };
+        eval { BpHook::log_reason($sid, 'agent', "break-glass-$bg->{action}", $text, $p->{cwd}) };
         return 0;
     }
 
