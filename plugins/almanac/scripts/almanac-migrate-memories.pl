@@ -145,8 +145,10 @@ sub _enc {
 # ---------------------------------------------------------------------------
 sub _spawn_note_pl {
     my ($note_pl, @argv) = @_;
-    my ($out_fh, $out_path) = File::Temp::tempfile();
-    my ($err_fh, $err_path) = File::Temp::tempfile();
+    # UNLINK => 1: removed at exit (a bare tempfile() is never removed, and
+    # this file deliberately contains no unlink of its own -- AC-18).
+    my ($out_fh, $out_path) = File::Temp::tempfile(UNLINK => 1);
+    my ($err_fh, $err_path) = File::Temp::tempfile(UNLINK => 1);
     close $out_fh;
     close $err_fh;
     my $pid = fork();
@@ -156,11 +158,27 @@ sub _spawn_note_pl {
         open(STDERR, '>', $err_path) or CORE::exit(126);
         exec($^X, $note_pl, @argv) or CORE::exit(127);
     }
-    waitpid($pid, 0);
-    my $rc = $? >> 8;
+    my $waited = waitpid($pid, 0);
+    my $status = $?;
+    # `$? >> 8` alone is 0 for a child killed by a signal, so a killed
+    # `list` read as success with empty output -- and render-index then
+    # wrote an EMPTY note index on a global note mutation (todo
+    # 20261002-005241-1bbb0000; almanac-note.pl's own helper had the same
+    # bug, fixed in where-things-go 09 M1). Map a signal death to the shell
+    # convention 128+N, and a lost child to 255, so only a real exit 0 is 0.
+    my $rc;
+    if ($waited != $pid || $status == -1) { $rc = 255 }
+    elsif ($status & 127)                  { $rc = 128 + ($status & 127) }
+    else                                   { $rc = $status >> 8 }
     my ($out, undef) = _read_bytes($out_path);
     my ($err, undef) = _read_bytes($err_path);
-    return ($rc, (defined $out ? $out : ''), (defined $err ? $err : ''));
+    $err = '' unless defined $err;
+    if ($rc != 0 && !length $err) {
+        $err = "almanac-migrate-memories: almanac-note.pl "
+             . (($status != -1 && ($status & 127)) ? 'was killed by signal ' . ($status & 127) : "exited $rc")
+             . " with no error output\n";
+    }
+    return ($rc, (defined $out ? $out : ''), $err);
 }
 
 sub _note_pl_path {
