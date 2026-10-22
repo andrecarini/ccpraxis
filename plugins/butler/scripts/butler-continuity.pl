@@ -5,6 +5,7 @@
 #   butler-continuity on (--new-thread <name> | --thread <name>) [--role driver] --goal '<what this session is for>'
 #   butler-continuity on      --role reporter [--goal '<...>']
 #   butler-continuity off     [--reason '<2+ words>'] [--token <8 hex>]
+#   butler-continuity off-confirm --otp <otp> --justification '<2+ words>'
 #   butler-continuity silence  --reason '<2+ words>'  [--token <8 hex>]
 #   butler-continuity status
 #
@@ -29,7 +30,7 @@ require "$Bin/BpHook.pm"
 require "$Bin/BpContinuityLease.pm"
     unless grep { m{(?:^|/)BpContinuityLease\.pm$} } keys %INC;
 
-my $USAGE = q{usage: butler-continuity on --new-thread <name> | on --thread <name> [--role driver] --goal '<what this session is for>' | on --role reporter [--goal '<...>'] | off [--reason '<why>'] [--token T] | silence --reason '<why>' [--token T] (escape hatch: use sparingly) | status};
+my $USAGE = q{usage: butler-continuity on --new-thread <name> | on --thread <name> [--role driver] --goal '<what this session is for>' | on --role reporter [--goal '<...>'] | off [--reason '<why>'] [--token T] | off-confirm --otp <otp> --justification '<2+ words>' | silence --reason '<why>' [--token T] (escape hatch: use sparingly) | status};
 
 sub _bytes {
     my ($s) = @_;
@@ -235,13 +236,14 @@ if (defined $verb && exists $RETIRED_VERBS{$verb}) {
     refuse("'butler-continuity $verb' is retired; use '$RETIRED_VERBS{$verb}' instead");
 }
 
-usage_die() unless defined $verb && $verb =~ /^(?:on|off|silence|status)$/;
+usage_die() unless defined $verb && $verb =~ /^(?:on|off|off-confirm|silence|status)$/;
 
 my %allowed = (
-    on        => { role => 1, 'new-thread' => 1, thread => 1, goal => 1 },
-    off       => { reason => 1, token => 1 },
-    silence   => { reason => 1, token => 1 },
-    status    => {},
+    on           => { role => 1, 'new-thread' => 1, thread => 1, goal => 1 },
+    off          => { reason => 1, token => 1 },
+    'off-confirm' => { otp => 1, justification => 1 },
+    silence      => { reason => 1, token => 1 },
+    status       => {},
 );
 
 my %flags;
@@ -282,6 +284,23 @@ if ($verb eq 'off' && exists $flags{reason} && defined $flags{reason}) {
     }
 }
 
+# NEW (off-confirm): --justification / --otp validation (spec 2.2.1).
+# Nothing consumed. Order: justification word count, justification length,
+# otp shape.
+if ($verb eq 'off-confirm') {
+    if (!exists $flags{justification} || !defined $flags{justification} || visible_word_count($flags{justification}) < 2) {
+        refuse("--justification needs at least two words saying why the work is done.");
+    }
+    my $jsan = sanitize_text($flags{justification});
+    utf8::encode($jsan) if utf8::is_utf8($jsan);
+    if (length($jsan) > 200) {
+        refuse("--justification is at most 200 bytes.");
+    }
+    if (!exists $flags{otp} || !defined $flags{otp} || $flags{otp} !~ /^[0-9a-f]{8}$/) {
+        refuse("--otp takes the 8-character code printed by off.");
+    }
+}
+
 if (exists $flags{token}) {
     if (!defined $flags{token} || $flags{token} !~ /^[0-9a-f]{8}$/) {
         refuse("--token takes the 8-character token from the stop message.");
@@ -315,7 +334,7 @@ if ($verb eq 'on') {
 # Step 2: coordinator (Decision 25).
 # ---------------------------------------------------------------------------
 if (defined $ENV{BP_LEDGER} && length $ENV{BP_LEDGER}) {
-    if ($verb eq 'off' || $verb eq 'silence') {
+    if ($verb eq 'off' || $verb eq 'off-confirm' || $verb eq 'silence') {
         refuse("a coordinator cannot turn continuity off; it stops when its ledger is terminal.");
     }
     if ($verb eq 'on') {
@@ -389,7 +408,7 @@ unless (defined $ROOT) {
 # ---------------------------------------------------------------------------
 my ($SID, $AID, $OPERATOR_TICKET, $PROJECT, $TRANSCRIPT_PATH, $TICKET_CWD);
 
-if ($verb eq 'on' || $verb eq 'off' || $verb eq 'silence' || $verb eq 'status') {
+if ($verb eq 'on' || $verb eq 'off' || $verb eq 'off-confirm' || $verb eq 'silence' || $verb eq 'status') {
     my $t = BpHook::take_ticket('butler-continuity', \@argv0);
 
     if (ref $t eq 'HASH') {
@@ -423,7 +442,7 @@ if ($verb eq 'on' || $verb eq 'off' || $verb eq 'silence' || $verb eq 'status') 
         _refuse_binding();
     }
 
-    if (($verb eq 'on' || $verb eq 'off' || $verb eq 'silence') && defined $AID) {
+    if (($verb eq 'on' || $verb eq 'off' || $verb eq 'off-confirm' || $verb eq 'silence') && defined $AID) {
         refuse("only the main session changes continuity; a subagent may not.");
     }
 }
@@ -434,6 +453,9 @@ sub _refuse_binding {
     }
     elsif ($verb eq 'status') {
         refuse("no session binding for status; run it again as a plain Bash tool call.");
+    }
+    elsif ($verb eq 'off-confirm') {
+        refuse("no session binding; run it again as a plain Bash tool call with arguments in single quotes.");
     }
     else {
         refuse("no session binding; use the --token from the stop message, or quote arguments in single quotes.");
@@ -825,21 +847,13 @@ if ($verb eq 'on') {
     exit 0;
 }
 
-if ($verb eq 'off') {
-    my $actor = $OPERATOR_TICKET ? 'operator' : 'agent';
-    my $reason;
-    if (exists $flags{reason}) {
-        $reason = sanitize_text($flags{reason});
-    }
-    elsif ($actor eq 'operator') {
-        $reason = '(operator)';
-    }
-    else {
-        refuse("off needs --reason '<why>' unless the operator typed /butler:continuity off.");
-    }
-
-    my ($T, $broken) = _off_doing_gate();
-
+# _complete_disarm($actor, $reason, $T, $broken) -- spec 2.2.2/2.2.3: today's
+# :843-876 disarm/hand-off/lease/plan logic, factored into one sub shared by
+# the operator `off` path and the new `off-confirm` path, so they cannot
+# drift (spec sec 2.2.3's explicit recommendation). Never returns a value the
+# caller needs; callers exit 0 themselves right after calling it.
+sub _complete_disarm {
+    my ($actor, $reason, $T, $broken) = @_;
     my $was_armed = BpHook::is_armed($SID);
     my $plan_ldir   = BpContinuityLease::legacy_dir();
     my $live_before = defined $plan_ldir ? (BpContinuityLease::any_active($plan_ldir) ? 1 : 0) : 0;
@@ -873,6 +887,83 @@ if ($verb eq 'off') {
     lease_sync();
     plan_after_off($plan_ldir)
         if $live_before && defined $plan_ldir && !BpContinuityLease::any_active($plan_ldir);
+    return;
+}
+
+if ($verb eq 'off') {
+    my $actor = $OPERATOR_TICKET ? 'operator' : 'agent';
+    my $reason;
+    if (exists $flags{reason}) {
+        $reason = sanitize_text($flags{reason});
+    }
+    elsif ($actor eq 'operator') {
+        $reason = '(operator)';
+    }
+    else {
+        refuse("off needs --reason '<why>' unless the operator typed /butler:continuity off.");
+    }
+
+    my ($T, $broken) = _off_doing_gate();
+
+    if ($actor eq 'operator') {
+        # Decision 4: the operator path is unchanged -- disarms in one call,
+        # never mints, never prints an OTP.
+        _complete_disarm($actor, $reason, $T, $broken);
+        exit 0;
+    }
+
+    # Agent actor (judged-continuity-disarm pkg 02, spec sec 2.2.2): mint a
+    # single-use disarm OTP carrying the sanitized reason and the gate
+    # result, and refuse. The caller runs off-confirm to actually disarm.
+    my $otp = BpHook::mint_disarm_otp($SID, reason => $reason, gate_result => { thread => $T, broken => $broken });
+    refuse("could not mint a disarm code (" . (BpHook::last_error() // '') . ").") unless defined $otp;
+
+    # Goal line: read exactly as status does (:956-958).
+    my $goal = '';
+    {
+        my $d = read_json_file("$ROOT/armed/$SID");
+        $goal = (ref $d eq 'HASH' && defined $d->{goal} && !ref $d->{goal}) ? sanitize_text($d->{goal}) : '';
+    }
+    $goal = '(no goal recorded)' unless length $goal;
+
+    binmode(STDERR, ':raw');
+    print STDERR _bytes(join('',
+        "butler-continuity: off not done yet: disarming takes two steps, and continuity is unchanged for session $S8.\n",
+        "Disarm is right only when the goal below is met, or this session can no longer advance it (every remaining step needs the operator or is blocked) and no actionable work is left.\n",
+        "It is NOT right for: waiting on an operator answer (file the question and keep working), pausing between steps, or stopping after one slice while more remains.\n",
+        "goal: $goal\n",
+        "reason: $reason\n",
+        "To disarm, run this within 15 minutes:\n",
+        "  butler-continuity off-confirm --otp $otp --justification '<how the goal is met, or why this session cannot advance it>'\n"));
+    exit 1;
+}
+
+if ($verb eq 'off-confirm') {
+    my ($rec, $code) = BpHook::take_disarm_otp($flags{otp}, $SID);
+    unless ($rec) {
+        my %MSG = (
+            'no-live-otp'     => "no disarm code is live for this session; run butler-continuity off --reason '<why>' first.",
+            'unknown'         => "that code is not live (wrong, already used, or replaced by a later off); run off again for a fresh one.",
+            'superseded'      => "that code is not live (replaced by a later off); run off again for a fresh one.",
+            'foreign-session' => "that code belongs to another session.",
+            'expired'         => "that code expired (15 minutes); run off again for a fresh one.",
+        );
+        my $msg = $MSG{ defined $code ? $code : '' };
+        $msg = "could not claim the code (" . (defined $code ? $code : 'unknown') . ")." unless defined $msg;
+        refuse($msg);
+    }
+
+    my $actor  = 'agent';    # off-confirm has no operator path.
+    my $reason = sanitize_text($rec->{reason});
+    my $T      = (ref $rec->{gate_result} eq 'HASH') ? $rec->{gate_result}{thread} : undef;
+    my $broken = (ref $rec->{gate_result} eq 'HASH') ? $rec->{gate_result}{broken} : 0;
+    if (!$broken && defined $T) {
+        # The gate was not re-run (Decision 18): load the thread lib here so
+        # a library that failed to load between off and off-confirm still
+        # degrades to the existing warning rather than a wrong hand-off.
+        $broken = 1 unless _almanac_present() && eval { _load_thread(); 1 };
+    }
+    _complete_disarm($actor, $reason, $T, $broken);
     exit 0;
 }
 

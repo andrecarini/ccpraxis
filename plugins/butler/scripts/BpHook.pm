@@ -431,6 +431,7 @@ sub disarm {
     unlink("$root/running/$sid");
     unlink("$root/holder/$sid.json");
     revoke_stop_token($sid);
+    revoke_disarm_otp($sid);
     my $rec = { session_id => $sid, actor => $actor, reason => _decode_maybe($reason), at => _iso_now() };
     if (defined $tp) { $rec->{transcript_path} = $tp }
     my $ok = _write_json_atomic("$root/off/$sid", $rec);
@@ -811,6 +812,7 @@ sub gc_sessions {
         unlink("$root/stop-refusals/$sid");
         unlink("$root/break-glass/$sid.json");
         revoke_stop_token($sid);
+        revoke_disarm_otp($sid);
         flock($lockfh, LOCK_UN);
         close $lockfh;
         unlink("$root/armlock/$sid");
@@ -1097,6 +1099,169 @@ sub take_stop_token {
     }
     unlink($claimed);
     return $ok ? $sid : undef;
+}
+
+# ------------------------------------------------------------ disarm OTPs --
+# judged-continuity-disarm package 02 (spec sec 2.1): mirrors the stop-token
+# trio above structurally, but stores the sanitized --reason and the gate
+# result on the OTP record so off-confirm can replay today's hand-off logic
+# without re-running the gate.
+
+our $DISARM_OTP_TTL = 900;
+
+sub _write_current_disarm_otp {
+    my ($root, $sid, $otp) = @_;
+    my $dir = "$root/disarm-otps";
+    unless (-d $dir) { eval { require File::Path; File::Path::make_path($dir) } }
+    my $tmp = "$dir/.$sid.current.tmp.$$";
+    open(my $fh, '>:raw', $tmp) or return 0;
+    my $ok = print {$fh} "$otp\n";
+    $ok &&= close($fh);
+    unless ($ok) { unlink $tmp; return 0 }
+    return 1 if rename($tmp, "$dir/$sid.current");
+    unlink $tmp;
+    return 0;
+}
+
+sub mint_disarm_otp {
+    my ($sid, %opts) = @_;
+    _clear_error();
+    unless (defined $sid && !ref($sid) && $sid =~ $SID_RE) { _set_error('bad session id'); return undef }
+    my $reason = $opts{reason};
+    unless (defined $reason && !ref($reason) && length($reason)) { _set_error('bad args'); return undef }
+    my $gate_result = $opts{gate_result};
+    unless (ref $gate_result eq 'HASH') { _set_error('bad args'); return undef }
+    my $broken = $gate_result->{broken};
+    unless (defined $broken && !ref($broken) && ($broken eq '0' || $broken eq '1' || $broken eq '2')) {
+        _set_error('bad args');
+        return undef;
+    }
+    my $thread = $gate_result->{thread};
+    if (defined $thread) {
+        unless (!ref($thread) && length($thread)) { _set_error('bad args'); return undef }
+    }
+    my $root = state_dir();
+    unless (defined $root) { _set_error('no state root'); return undef }
+
+    revoke_disarm_otp($sid);
+
+    my $dir = "$root/disarm-otps";
+    eval { require File::Path; File::Path::make_path($dir) };
+    my ($otp, $created);
+    for (1 .. 5) {
+        $otp = _rand_token();
+        if (sysopen(my $fh, "$dir/$otp", O_WRONLY | O_CREAT | O_EXCL)) {
+            binmode($fh, ':raw');
+            my $rec = {
+                session_id  => $sid,
+                minted_at   => time(),
+                reason      => _decode_maybe($reason),
+                gate_result => { thread => $thread, broken => $broken + 0 },
+            };
+            my $json = JSON::PP->new->utf8->canonical->encode($rec);
+            my $ok = print {$fh} $json . "\n";
+            $ok &&= close($fh);
+            unless ($ok) { unlink "$dir/$otp"; next }
+            $created = 1;
+            last;
+        }
+    }
+    unless ($created) { _set_error('io: could not create otp file'); return undef }
+    unless (_write_current_disarm_otp($root, $sid, $otp)) {
+        unlink "$dir/$otp";
+        _set_error('io: write failed');
+        return undef;
+    }
+    return $otp;
+}
+
+sub revoke_disarm_otp {
+    my ($sid) = @_;
+    return 0 unless defined $sid && $sid =~ $SID_RE;
+    my $root = state_dir();
+    return 0 unless defined $root;
+    my $cur_path = "$root/disarm-otps/$sid.current";
+    my $removed_otp = 0;
+    if (open(my $fh, '<:raw', $cur_path)) {
+        local $/;
+        my $t = <$fh>;
+        close $fh;
+        if (defined $t) {
+            $t =~ s/\s+$//;
+            if ($t =~ $TOKEN_RE) {
+                $removed_otp = unlink("$root/disarm-otps/$t") ? 1 : 0;
+            }
+        }
+    }
+    my $removed_cur = unlink($cur_path) ? 1 : 0;
+    return ($removed_otp || $removed_cur) ? 1 : 0;
+}
+
+sub take_disarm_otp {
+    my ($otp, $sid) = @_;
+    return (undef, 'malformed') unless defined $otp && !ref($otp) && $otp =~ $TOKEN_RE;
+    return (undef, 'malformed') unless defined $sid && !ref($sid) && $sid =~ $SID_RE;
+    my $root = state_dir();
+    return (undef, 'no-state-root') unless defined $root;
+    my $dir = "$root/disarm-otps";
+    my $path = "$dir/$otp";
+    my $claimed = "$path.taken.$$";
+    unless (rename($path, $claimed)) {
+        return (undef, (-e "$dir/$sid.current") ? 'unknown' : 'no-live-otp');
+    }
+
+    # Consumed from here: the .taken.$$ file is unlinked before returning,
+    # on every remaining path.
+    my $data = _read_json($claimed);
+    unlink($claimed);
+
+    unless (ref $data eq 'HASH'
+        && defined $data->{session_id} && !ref($data->{session_id}) && $data->{session_id} =~ $SID_RE
+        && defined $data->{minted_at} && !ref($data->{minted_at}) && $data->{minted_at} =~ /^-?\d+$/) {
+        return (undef, 'corrupt');
+    }
+
+    if ($data->{session_id} ne $sid) {
+        return (undef, 'foreign-session');
+    }
+
+    my $lockfh = _open_armlock($root, $sid);
+    return (undef, 'lock-timeout') unless $lockfh;
+    unless (_flock_with_timeout($lockfh, 10)) {
+        close $lockfh;
+        return (undef, 'lock-timeout');
+    }
+
+    my $cur_path = "$dir/$sid.current";
+    my $cur;
+    if (open(my $fh, '<:raw', $cur_path)) {
+        local $/;
+        $cur = <$fh>;
+        close $fh;
+        if (defined $cur) { $cur =~ s/\s+$// }
+    }
+    my $code;
+    if (!defined $cur || $cur ne $otp) {
+        $code = 'superseded';
+    }
+    else {
+        unlink($cur_path);
+        if (time() - $data->{minted_at} > $DISARM_OTP_TTL) {
+            $code = 'expired';
+        }
+    }
+    flock($lockfh, LOCK_UN);
+    close $lockfh;
+    return (undef, $code) if defined $code;
+
+    my $gr = (ref $data->{gate_result} eq 'HASH') ? $data->{gate_result} : {};
+    my $rec = {
+        session_id  => $data->{session_id},
+        minted_at   => $data->{minted_at},
+        reason      => $data->{reason},
+        gate_result => { thread => $gr->{thread}, broken => $gr->{broken} },
+    };
+    return ($rec, undef);
 }
 
 # ----------------------------------------------------------- invocations ---
