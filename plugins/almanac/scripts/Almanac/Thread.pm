@@ -880,6 +880,8 @@ my %GATE_MESSAGES = (
     bad_ticket        => 'refused -- the hook ticket for this command names no valid session. Nothing was written.',
     butler_unloadable => 'refused -- butler is installed but its BpHook.pm could not be loaded. Nothing was written.',
     session_mismatch  => 'refused -- --session names a different session than the one running this command. Nothing was written.',
+    fleet_worker_writer => 'refused -- a fleet worker (coordinator or judge) may not write a thread; the orchestrator owns the fleet thread. Nothing was written.',
+    reporter_writer   => 'refused -- a reporter-role session is read-only and may not write a thread. Nothing was written.',
 );
 
 sub gate_message {
@@ -918,6 +920,22 @@ sub cli_gate {
     my $aid = $t->{agent_id};
     if (defined $aid && !ref($aid) && $aid ne '') {
         _refused('subagent_writer', undef, $aid);
+    }
+
+    # Role (todos 20261002-113836-620a0000, 20261002-093433-aa780000). A
+    # headless fleet worker (BP_LEDGER in its environment, which this
+    # process inherits from the worker's Bash tool) has no agent_id, so it
+    # passed the check above as a main session; the orchestrator writes the
+    # fleet thread through Almanac::Thread directly, never through this CLI,
+    # so no worker needs it. A reporter-role session is read-only by its
+    # skill's own contract ("never attaches to or writes" a thread), and
+    # --role reporter is what skips the attach requirement on arming.
+    my $role = eval { BpHook::role({ session_id => $sid }) };
+    if (defined $role && ($role eq 'coordinator' || $role eq 'judge')) {
+        _refused('fleet_worker_writer', undef, $role);
+    }
+    if (defined $role && $role eq 'reporter') {
+        _refused('reporter_writer', undef);
     }
 
     return { mode => 'ticket', session => $sid, transcript_path => _fold_bytes($t->{transcript_path}) };

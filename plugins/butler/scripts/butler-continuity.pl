@@ -708,7 +708,11 @@ sub _off_hand_off {
     my %O = _thread_opts();
     my $th = eval {
         Almanac::Thread::record_event($T, 'handed-off', session => $SID, actor => 'session',
-            reason => $reason, require_owner_session => $SID, %O);
+            reason => $reason, require_owner_session => $SID,
+            # Re-checked under the thread lock: off's own doing-task refusal
+            # runs unlocked, so a task set doing in between would otherwise
+            # be handed off mid-work (pkg04 review S3).
+            require_no_doing => 1, %O);
     };
     if (my $e = $@) {
         binmode(STDERR, ':raw');

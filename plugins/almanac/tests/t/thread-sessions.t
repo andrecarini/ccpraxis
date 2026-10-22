@@ -553,6 +553,19 @@ SKIP: {
     my $rmain = run_as('MAIN1', undef, 'attach', 'g1', '--root', $ROOT);
     is($rmain->{rc}, 0, 'AC8: the main session succeeds') or diag($rmain->{err});
 
+    # Todo 20261002-093433-aa780000: a headless fleet worker has no
+    # agent_id, so only its BP_LEDGER/BP_ROLE environment marks it.
+    for my $case (['coordinator', undef], ['judge', 'harvest']) {
+        my ($label, $bp_role) = @$case;
+        local $ENV{BP_LEDGER} = '/nonexistent/packages/p.md';
+        local $ENV{BP_ROLE}   = $bp_role if defined $bp_role;
+        my $before_w = slurp_raw(thread_meta_path($ROOT, 'g1'));
+        my $rw = run_as('FLEET1', undef, 'detach', 'g1', '--root', $ROOT);
+        is($rw->{rc}, 2, "fleet worker ($label): a thread write is refused");
+        is(field2($rw->{err}, 'detail'), 'fleet_worker_writer', "fleet worker ($label): detail: fleet_worker_writer");
+        is(slurp_raw(thread_meta_path($ROOT, 'g1')), $before_w, "fleet worker ($label): nothing changed");
+    }
+
     seed_create($ROOT, 'g2');
     my $rno = run_cli('attach', 'g2', '--root', $ROOT); # no ticket minted at all
     is($rno->{rc}, 2, 'AC8: no ticket at all is refused');
