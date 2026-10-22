@@ -432,6 +432,9 @@ my $STALE_SECS = 180 * 60; # default CCPRAXIS_VALIDATION_STALE_MIN
     like($res->{err}, qr/bp-implementer/, 'GB-10: the message names the sanitised writer role');
     like($res->{err}, qr/other-bp/,       'GB-10: the message names the sanitised blueprint');
     like($res->{err}, qr/op1/,            'GB-10: the message names the sanitised package');
+    # where-things-go/10 parked on this refusal, 2026-10-22.
+    like($res->{err}, qr/not a reason to park or block/,
+        'GB-10: the tree refusal says waiting is not a reason to park');
 
     write_coordinator_marker($other_bp, 'op1', 'bp-implementer');
     utime(time() - $STALE_SECS - 60, time() - $STALE_SECS - 60, "$other_bp/runs/op1.active-worker");

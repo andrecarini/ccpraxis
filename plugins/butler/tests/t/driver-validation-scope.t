@@ -847,6 +847,7 @@ SKIP: {
     my $res = gb(payload(cmd => named_a_cmd($data_n), session_id => $sid), CCPRAXIS_DATA_DIR => $data_n);
     is($res->{rc}, 2, 'AC-15: fresh coordinator tree marker present -> deny');
     like($res->{err}, qr/BLOCKED \(tree interlock\)/, 'AC-15: message carries the tree-interlock label');
+    like($res->{err}, qr/not a reason to park or block/, 'AC-15: message says waiting is not a reason to park');
 }
 
 # ===========================================================================

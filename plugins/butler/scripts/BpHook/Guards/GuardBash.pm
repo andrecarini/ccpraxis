@@ -1813,15 +1813,31 @@ sub _is_full_sweep_runner {
     return 0;
 }
 
+# Every interlock refusal clears on its own. Coordinators that read only the
+# BLOCKED line parked their packages as needing a human
+# (judged-continuity-disarm/01 on the overlap text, where-things-go/10 on the
+# tree text, 2026-10-22), so the Not-run line says what to do instead. A
+# refusal is held to two lines (AC-2) of at most 160 chars (Common::fit), and
+# line 2 must start "Not run: " (AC-40), so the echoed command is shortened
+# to fit and the guidance is never the part that gets cut.
+sub _not_run_line {
+    my ($cmd, $who, $stale_min) = @_;
+    my $tail = "; not a reason to park or block: retry when $who worker returns (marker ages out after $stale_min min).";
+    my $room = 160 - length('Not run: ') - length($tail);
+    $room = 20 if $room < 20;
+    my $echo = defined $cmd ? $cmd : '';
+    $echo =~ tr/\r\n\t/   /;
+    $echo = substr($echo, 0, $room - 3) . '...' if length($echo) > $room;
+    return "Not run: $echo$tail";
+}
+
 sub _gb_d {
     my ($p, $cmd) = @_;
     return undef unless _validation_shaped($cmd);
 
     my $stale_min = _stale_min();
-    my $cmd_line = 'Not run: ' . BpHook::Guards::Common::echo_cmd($cmd)
-        . "; retry when the worker returns (marker ages out after $stale_min min).";
-    my $tree_cmd_line = 'Not run: ' . BpHook::Guards::Common::echo_cmd($cmd)
-        . "; retry when that worker returns (marker ages out after $stale_min min).";
+    my $cmd_line      = _not_run_line($cmd, 'the',  $stale_min);
+    my $tree_cmd_line = _not_run_line($cmd, 'that', $stale_min);
 
     my $ledger = $ENV{BP_LEDGER};
     my $bp_dir = $ENV{BP_DIR};
@@ -2001,11 +2017,6 @@ sub _gb_d {
                                 my $pkgname = _sanitize($w_resolved->{package}, 64);
                                 return [
                                     "BLOCKED (validation interlock): package $pkgname of blueprint $bpname has a write-capable worker ($role_writer) in flight whose write set overlaps yours; this run could report a false red.",
-                                    # A coordinator that read only the line
-                                    # above parked its package as needing a
-                                    # human (judged-continuity-disarm/01,
-                                    # 2026-10-22): say what to do.
-                                    "This clears when that worker finishes. It is not a reason to park or block: do other work meanwhile, or record the pending run in ## Next action, keep the ledger running, and retry after your own next worker returns.",
                                     $cmd_line,
                                 ];
                             }

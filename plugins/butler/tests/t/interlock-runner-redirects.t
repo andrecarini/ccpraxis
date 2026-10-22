@@ -401,7 +401,7 @@ my @AC4_SUFFIXES = (
     like($res1->{err}, qr/\Q$overlap_line\E/, 'AC-7: exact overlap line (post-fit, per spec sec 2.4)');
     # 2026-10-22: a coordinator given only the line above parked its package
     # as awaiting a human; the refusal now says what to do instead.
-    like($res1->{err}, qr/It is not a reason to park or block/,
+    like($res1->{err}, qr/not a reason to park or block/,
         'overlap refusal tells the caller to wait, not to park');
 
     my $res2 = gb(
