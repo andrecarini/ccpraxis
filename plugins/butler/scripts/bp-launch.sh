@@ -126,6 +126,19 @@ ATTEMPT=$(registry_get "$BP_NAME" "$PKG" attempt); ATTEMPT=$(( ${ATTEMPT:-0} + 1
   export BP_WRITE_SET="$WRITE_SET" BP_TEST_PATHS="$TEST_PATHS"
   export BP_REPORT_DIR="$BPDIR/reports/$PKG"
   export BP_ROLE="coordinator"
+  # The coordinator waits on background workers by ending its turn on a held
+  # subagent (coordinator-protocol "Waiting on a background subagent").
+  # `claude -p` does keep the process open for background work at the end of
+  # a turn, but only for CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS of continuous
+  # idle waiting, 600000 (10 min) by default; past it, it prints "Background
+  # tasks still running after 600s; terminating", kills every worker, and
+  # exits 0. An architect or test-writer routinely runs longer, so every such
+  # wait ended in a dead coordinator and a killed worker (bug
+  # 20261022-104840-4600). 0 waits indefinitely: a hung worker is still
+  # caught by the orchestrator's own liveness and turn checks, which watch
+  # this log, and the holder bounds its own wait at 50 minutes.
+  # BP_PRINT_BG_WAIT_CEILING_MS overrides it for one launch.
+  export CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS="${BP_PRINT_BG_WAIT_CEILING_MS:-0}"
   # Batch C (spec 16-cutover 2.8): the old concurrency-switch condition is
   # gone -- bin/ is always on PATH, and the missing-butler-hold warning
   # always fires when the file is missing or not executable. That switch's

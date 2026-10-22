@@ -846,6 +846,7 @@ if [ -n "${FAKE_ENVLOG:-}" ]; then
     echo "BUTLER_CONCURRENCY=${BUTLER_CONCURRENCY-<unset>}"
     echo "PATH=$PATH"
     echo "BUTLER_HOLD=$(command -v butler-hold 2>/dev/null || echo '<none>')"
+    echo "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=${CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS-<unset>}"
   } > "$FAKE_ENVLOG"
 fi
 printf '{"type":"system","subtype":"init","session_id":"fake-sid-%s"}\n' "$$"
@@ -947,6 +948,10 @@ SKIP: {
     like($envlog1 // '', qr/^PATH=\Q$plugin_root_pwd\E\/bin:/m, 'AC-2: child PATH starts with "<plugin>/bin:"');
     like($envlog1 // '', qr{^BUTLER_HOLD=\Q$plugin_root_pwd\E/bin/butler-hold$}m,
         'AC-2: "command -v butler-hold" names <plugin>/bin/butler-hold') or diag("envlog: " . ($envlog1 // '(none)'));
+    # Bug 20261022-104840-4600: `claude -p` kills held background workers
+    # after 600s of idle waiting unless this is set; 0 waits indefinitely.
+    like($envlog1 // '', qr/^CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0$/m,
+        'bug 4600: the coordinator runs with no background-wait ceiling (CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0)');
 
     my $dispatch1 = slurp("$bp1/dispatch/p.md");
 
