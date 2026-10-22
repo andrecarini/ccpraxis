@@ -66,6 +66,16 @@ sub _now_iso {
         $t[5] + 1900, $t[4] + 1, $t[3], $t[2], $t[1], $t[0]);
 }
 
+# _fs_bytes($s) -- the correct answer to "this path may or may not carry
+# perl's internal utf8 flag; make it a definite byte string for a syscall or
+# for concatenation with other byte strings". Encode-if-flagged, NOT
+# utf8::downgrade: downgrade only works when the string's internal
+# representation already happens to be pure Latin-1-range bytes, and
+# CORRUPTS genuinely multi-byte UTF-8 content (this package's own
+# spec-mandated "André" fixture) instead of normalizing it. Mirrors
+# BpHook.pm::_to_bytes and Almanac::PackageLink.pm:96's own
+# utf8::encode-if-flagged rule. See blueprint where-things-go, package
+# 10-gatherer-and-digest, reviewer M1-M3 / redteam H1 findings.
 sub _fs_bytes {
     my ($s) = @_;
     return $s unless defined $s;
@@ -73,6 +83,13 @@ sub _fs_bytes {
     return $s;
 }
 
+# _decode_if_bytes($s) -- the JSON/text-rendering counterpart: a value that
+# is definitely a byte string (readdir/basename output, an unflagged root)
+# but needs to be a proper decoded character string before it is
+# concatenated with other already-decoded fields (Almanac::Record's output)
+# or handed to JSON::PP->utf8->encode (which assumes its input is
+# characters, and otherwise double-encodes valid UTF-8 bytes). A no-op on a
+# string that is already flagged, or that is not valid UTF-8.
 sub _decode_if_bytes {
     my ($s) = @_;
     return $s unless defined $s && !ref $s;
@@ -158,6 +175,10 @@ sub _list_blueprint_names {
 # BpState's own ledger-reading rule rather than Almanac::Record's grammar).
 sub _plain_frontmatter_get {
     my ($path, $key) = @_;
+    # redteam M2: a FIFO at this path (another project's linked ledger, or
+    # an attacker-controlled one in all mode) would hang open()/<$fh> on a
+    # plain read. -f refuses anything that is not a regular file.
+    return undef unless -f $path;
     open(my $fh, '<:raw', $path) or return undef;
     local $/;
     my $c = <$fh>;
@@ -174,6 +195,11 @@ sub _plain_frontmatter_get {
 
 sub _authored_frontmatter_value {
     my ($bpmd, $key) = @_;
+    # redteam M2: BpState::bp_meta_get (outside this package's write set)
+    # does its own unconditional open/read with no -f guard; refuse a
+    # non-regular-file path here, before either reader touches it, rather
+    # than hang on a FIFO.
+    return undef unless -f $bpmd;
     my $v = _load_bpstate() ? BpState::bp_meta_get($bpmd, $key) : undef;
     return $v if defined $v;
     return _plain_frontmatter_get($bpmd, $key);
@@ -310,9 +336,9 @@ sub _inbox_rationale {
     # file Encode::decode even when it is pure ASCII; concatenating a
     # flagged segment onto $root's raw UTF-8 bytes (a non-ASCII project
     # root) corrupts the byte sequence on stringification -- same bug class
-    # as _registry_roots()/_gather_project() above. Downgrade before it
-    # ever reaches a path.
-    utf8::downgrade($link, 1);
+    # as _registry_roots()/_gather_project() above. Encode to bytes (see
+    # _fs_bytes) before it ever reaches a path.
+    $link = _fs_bytes($link);
     my @segs = split m{/}, $link, -1;
     return undef unless @segs == 3;
     my ($bp, $pkg, $id) = @segs;
@@ -483,7 +509,8 @@ sub _section_fleet_runs {
             }
             closedir $dh;
         }
-        push @out, { blueprint => $name, state => $state, orchestrator_alive => ($alive ? 1 : 0),
+        push @out, { blueprint => $name, state => $state,
+            orchestrator_alive => ($alive ? JSON::PP::true : JSON::PP::false),
             escalations => \@esc };
     }
     return \@out;
@@ -543,28 +570,33 @@ sub _run_refresh {
 
     my $rec = eval { _load_bug() or die "almanac-bug.pl is not loadable\n"; AlmanacBug::reconcile($root) };
     if (my $err = $@) {
-        $refresh->{reconcile} = { ran => 0, changes => 0, flags => 0, busy => 0, error => _errstr($err) };
+        $refresh->{reconcile} = { ran => JSON::PP::false, changes => 0, flags => 0, busy => 0, error => _errstr($err) };
         push @$errors, { section => 'refresh', error => _errstr($err) };
     } elsif (ref $rec eq 'HASH') {
         $refresh->{reconcile} = {
-            ran => 1,
+            ran => JSON::PP::true,
             changes => (ref $rec->{changes} eq 'ARRAY' ? scalar(@{ $rec->{changes} }) : 0),
             flags   => (ref $rec->{flags}   eq 'ARRAY' ? scalar(@{ $rec->{flags} })   : 0),
             busy    => (ref $rec->{busy}    eq 'ARRAY' ? scalar(@{ $rec->{busy} })    : 0),
             error => undef,
         };
     } else {
-        $refresh->{reconcile} = { ran => 0, changes => 0, flags => 0, busy => 0, error => 'reconcile returned no result' };
+        $refresh->{reconcile} = { ran => JSON::PP::false, changes => 0, flags => 0, busy => 0, error => 'reconcile returned no result' };
+        # S4: a refresh failure must surface in the top-level errors[], not
+        # only in the (easy to miss) per-entry error field -- otherwise
+        # "Digest incomplete: refresh" never appears for exactly the case
+        # the refresh exists to prevent (a stale view shown as current).
+        push @$errors, { section => 'refresh', error => $refresh->{reconcile}{error} };
     }
 
     my $bdir = "$root/.ccpraxis-local-data/blueprints";
     for my $name (sort(_list_blueprint_names($bdir))) {
         my $bpdir = "$bdir/$name";
         next unless -d "$bpdir/runs";
-        my $entry = { blueprint => $name, ran => 1, exit => undef, result => undef, error => undef };
+        my $entry = { blueprint => $name, ran => JSON::PP::true, exit => undef, result => undef, error => undef };
         my $out = eval { _run_sweep($bpdir) };
         if (my $err = $@) {
-            $entry->{ran} = 0;
+            $entry->{ran} = JSON::PP::false;
             $entry->{error} = _errstr($err);
         } else {
             $entry->{exit} = $out->{exit};
@@ -577,6 +609,10 @@ sub _run_refresh {
             }
         }
         push @{ $refresh->{sweeps} }, $entry;
+        # S4: same rule for the per-blueprint sweep -- any entry.error means
+        # that blueprint's escalations/inbox are stale, surface it.
+        push @$errors, { section => 'refresh', error => "$name: $entry->{error}" }
+            if defined $entry->{error};
     }
     return $refresh;
 }
@@ -622,25 +658,39 @@ sub _gather_project {
         # the utf8 flag even when the bytes are plain ASCII-plus-UTF8; -d
         # on that flagged string mis-stats a non-ASCII path even though it
         # is character-for-character identical to the real one. Same bug
-        # class as _registry_roots() above -- downgrade before the first
-        # filesystem touch.
-        utf8::downgrade($root, 1);
+        # class as _registry_roots() above -- encode to bytes (see
+        # _fs_bytes) before the first filesystem touch.
+        $root = _fs_bytes($root);
         _usage('bad_root') unless -d $root;
     } else {
         $root = eval { Almanac::Thread::project_root(cwd => $opt{cwd}) };
-        utf8::downgrade($root, 1) if defined $root;
+        $root = _fs_bytes($root) if defined $root;
         _usage('missing_root') unless defined $root && length $root && -d $root;
     }
 
     my @errors;
     my %result = (
-        schema => 1, mode => 'project', root => $root, generated_at => _now_iso(),
+        schema => 1, mode => 'project', root => _decode_if_bytes($root), generated_at => _now_iso(),
         refresh => undef,
     );
 
     my $do_refresh = exists $opt{refresh} ? ($opt{refresh} ? 1 : 0) : 1;
     if ($do_refresh) {
-        $result{refresh} = _run_refresh($root, \@errors);
+        # redteam H1 (defense in depth): if the launching session's project
+        # directory is known (CLAUDE_PROJECT_DIR, set by Claude Code), a
+        # resolved $root that disagrees with it is a misresolved cwd (a
+        # non-ASCII path component mis-stepping up to a parent project, or a
+        # stale cwd after a Bash `cd`). Skip the two mutating refresh calls
+        # rather than risk reconciling/sweeping the wrong project; record
+        # the skip in errors[] instead of dying.
+        my $anchor = $ENV{CLAUDE_PROJECT_DIR};
+        if (defined $anchor && length $anchor
+            && _fs_bytes($anchor) ne _fs_bytes($root)) {
+            push @errors, { section => 'refresh',
+                error => "skipped: resolved root does not match CLAUDE_PROJECT_DIR" };
+        } else {
+            $result{refresh} = _run_refresh($root, \@errors);
+        }
     }
 
     for my $s (@{ $opt{sections} }) {
@@ -671,9 +721,9 @@ sub _registry_roots {
         # and in every _gather_project it feeds) stats the wrong bytes even
         # though it's the same characters -- same class of bug as
         # bp-orchestrator.pl's _json_bytes() already guards against
-        # elsewhere. Downgrade to raw bytes before it ever reaches a
-        # filesystem call.
-        utf8::downgrade($r, 1) if defined $r;
+        # elsewhere. Encode to bytes (see _fs_bytes) before it ever reaches
+        # a filesystem call.
+        $r = _fs_bytes($r) if defined $r;
         my $c = AlmanacBug::canonical_root($r);
         next if $seen{$c}++;
         push @out, $r;
@@ -741,8 +791,8 @@ sub _render_threads {
     my @out = ('Threads:');
     for my $th (@$items) {
         my $bar = $th->{bar} // { done => 0, total => 0 };
-        my $line = sprintf('  %s [%s, %s] %d/%d', $th->{name}, $th->{state}, $th->{liveness},
-            $bar->{done}, $bar->{total});
+        my $line = sprintf('  %s [%s, %s] %d/%d', $th->{name} // '', $th->{state} // '', $th->{liveness} // '',
+            $bar->{done} // 0, $bar->{total} // 0);
         if (@{ $th->{doing} // [] }) {
             $line .= '  doing: ' . join('; ', @{ $th->{doing} });
         }
@@ -889,8 +939,14 @@ sub digest {
     my (%opt) = @_;
     my $text = eval {
         my $root = defined $opt{root} ? $opt{root} : Almanac::Thread::project_root(cwd => $opt{cwd});
-        utf8::downgrade($root, 1) if defined $root;
-        my $proj = gather(mode => 'project', root => $root, refresh => 1);
+        $root = _fs_bytes($root) if defined $root;
+        # redteam M2: render_digest only ever reads threads/todos/blueprints/
+        # inbox/notes/bugs(tampered)/errors -- never fleet_runs or commits.
+        # Gathering those too (the full @SECTIONS default) costs real wall-
+        # clock (a sweep spawn per blueprint with runs/, for fleet_runs'
+        # sake alone) for data the digest never prints.
+        my $proj = gather(mode => 'project', root => $root, refresh => 1,
+            sections => [qw(threads inbox todos bugs blueprints notes)]);
         my $all  = gather(mode => 'all', sections => ['threads', 'inbox'], exclude => [$root]);
         my $other = other_projects_line($all);
         render_digest($proj, other_line => $other);

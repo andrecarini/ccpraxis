@@ -5,17 +5,25 @@
 # armed, re-read your task list" and N1-now "resumed while armed, continue
 # or turn continuity off"). One shim (session-start-nudge.sh) registered on
 # SessionStart, matcher-less, beside denial-breaker.sh. It now fires on every
-# source (startup, resume, clear, compact), armed or not: run($p) re-attaches
-# the session's thread ownership first (Almanac::Thread::reattach), then
-# prints the project digest (Almanac::Gather::digest), then the never-halt-12
-# armed nudges below (lines($p)) -- all through one BpHook::context call, in
-# that fixed order (sec 2.6).
+# source (startup, resume, clear, compact), armed or not: the emitted TEXT is
+# always, in this fixed order (sec 2.6): the project digest
+# (Almanac::Gather::digest), then the never-halt-12 armed nudges (lines($p)).
+# Internally, run($p) COMPUTES lines($p) first and Almanac::Thread::reattach
+# second, both before the (budgeted) digest call -- redteam M2: the nudges
+# are the never-halt safety signal and must not be delayed or lost just
+# because the digest (reconcile + per-blueprint sweeps) is slow, and the
+# digest is wrapped in an 8s alarm so a pathological digest (e.g. a FIFO
+# somewhere under a blueprint.md path) cannot hang the hook. All three
+# outputs are joined through one BpHook::context call.
 #
 # lines($p, $now) is a pure function (one -e stat aside, via BpHook::is_armed)
-# returning the context lines for this SessionStart; () means quiet. run($p)
-# wraps reattach/digest/lines in eval and emits at most one additionalContext
-# line through BpHook::context. Never writes a file, never dies outward,
-# never returns non-zero.
+# returning the context lines for this SessionStart; () means quiet, and on
+# its own never writes a file. run($p) wraps reattach/digest/lines in eval
+# and emits at most one additionalContext line through BpHook::context;
+# run() itself DOES write, through reattach (thread ownership) and through
+# digest's two project-mode refresh calls (AlmanacBug::reconcile, the
+# bp-answer-escalation.pl sweep) -- see hook-architecture.md's route table.
+# Never dies outward, never returns non-zero.
 package BpHook::SessionStartNudge;
 use strict;
 use warnings;
@@ -78,13 +86,15 @@ sub lines {
 }
 
 # run($p, @ignored) -> 0, always. The one SessionStart route (sec 2.6): same
-# guards as lines(), then (1) Almanac::Thread::reattach, (2)
-# Almanac::Gather::digest, (3) the never-halt-12 armed nudges (lines($p)),
-# all through one BpHook::context call, in that fixed order. Runs on every
-# source (startup, resume, clear, compact), armed or not -- only step 3 is
-# gated on arming, inside lines() itself. Never dies outward: each step is
-# individually eval'd, so a reattach/digest failure still lets the nudges
-# (or nothing) through.
+# guards as lines(), then COMPUTES (1) the never-halt-12 armed nudges
+# (lines($p)), (2) Almanac::Thread::reattach, (3) Almanac::Gather::digest
+# (under an 8s alarm budget) -- in that order (redteam M2: nudges first, so
+# a slow/hung digest never delays or loses them) -- but EMITS them through
+# one BpHook::context call in the fixed text order sec 2.6 requires: digest,
+# then nudges. Runs on every source (startup, resume, clear, compact), armed
+# or not -- only the nudges are gated on arming, inside lines() itself.
+# Never dies outward: each step is individually eval'd, so a reattach/digest
+# failure still lets the nudges (or nothing) through.
 sub run {
     my ($p) = @_;
 
@@ -108,11 +118,26 @@ sub run {
     # The payload is JSON-decoded, so a non-ASCII cwd comes back utf8-
     # flagged even though its bytes are identical to the real path on
     # disk. Every filesystem walk downstream (project root resolution,
-    # Gather's own root check) mis-stats a flagged string -- downgrade
-    # once here, at the one place this hook receives it from the payload,
-    # rather than chasing every call site that stats it later.
+    # Gather's own root check) mis-stats a flagged string unless it is
+    # turned into a definite byte string first. encode-if-flagged, NOT
+    # utf8::downgrade -- downgrade corrupts genuinely multi-byte UTF-8
+    # content (this package's own "André" fixture) instead of normalizing
+    # it; see BpHook.pm::_to_bytes / Almanac::PackageLink.pm:96 for the
+    # established rule, and blueprint where-things-go, package
+    # 10-gatherer-and-digest, reviewer M2 / redteam H1 for why downgrade
+    # was wrong here.
     my $cwd = $p->{cwd};
-    utf8::downgrade($cwd, 1) if defined $cwd;
+    if (defined $cwd && !ref $cwd) {
+        utf8::encode($cwd) if utf8::is_utf8($cwd);
+    }
+
+    # redteam M2: compute the never-halt-12 armed nudges BEFORE the digest,
+    # not after. They are the never-halt safety signal for a compacted/
+    # resumed armed session, and must not be lost or delayed just because
+    # the digest (reattach + reconcile + per-blueprint sweeps) is slow or
+    # hung.
+    my @nudge = eval { lines($p) };
+    @nudge = () if $@;
 
     eval {
         require $ALMANAC_THREAD_PM;
@@ -124,14 +149,21 @@ sub run {
         );
     };
 
-    my $digest = eval {
-        require $ALMANAC_GATHER_PM;
-        Almanac::Gather::digest(cwd => $cwd);
+    # redteam M2: bound the digest (reconcile + sweeps, in-process filesystem
+    # reads, possibly a FIFO somewhere under a blueprint.md path) with a time
+    # budget well inside the registered 15s hook timeout, so a pathological
+    # digest cannot hang the hook or take the nudges above down with it.
+    my $digest = '';
+    eval {
+        local $SIG{ALRM} = sub { die "digest timed out\n" };
+        my $prev = alarm(8);
+        my $d = eval {
+            require $ALMANAC_GATHER_PM;
+            Almanac::Gather::digest(cwd => $cwd);
+        };
+        alarm($prev // 0);
+        $digest = $d if defined $d && !$@;
     };
-    $digest = '' unless defined $digest;
-
-    my @nudge = eval { lines($p) };
-    @nudge = () if $@;
 
     my @parts = grep { length } ($digest, @nudge);
     BpHook::context(join("\n", @parts)) if @parts;

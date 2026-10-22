@@ -285,7 +285,7 @@ reason: Added by never-halt package 12 (Decision 43, N6 and N1-now), extended by
 
 ### registration: hooks.json SessionStart [] session-start-nudge.sh
 verdict: keep
-reason: Registered without a matcher on SessionStart in the guarded 2.2 form, beside denial-breaker.sh; it never blocks, writes nothing, and prints at most one additionalContext line, on every source armed or not.
+reason: Registered without a matcher on SessionStart in the guarded 2.2 form, beside denial-breaker.sh; it never blocks and prints at most one additionalContext line, on every source armed or not. It is no longer write-free: the route writes only through Almanac::Thread::reattach (thread ownership) and through the project digest's two refresh calls (AlmanacBug::reconcile, the bp-answer-escalation.pl sweep) -- see specs/10-gatherer-and-digest-spec.md sec 2.6.
 
 ## BpHook core API
 
@@ -669,7 +669,7 @@ self-arm". For a manual session after the operator's own `/clear`, the operator 
 `/butler:continuity on`. After a carry-over, the carry-over skill prose tells the fresh session to run
 `butler-continuity on` when the work was armed. The old id's arm file is not a live session. It stays
 until its transcript is gone, and it stops holding the wake-lock once its transcript has gone an hour
-with no activity (Decision 53). Two SessionStart hooks are registered, and neither carries state across a new id: denial-breaker.sh (never-halt 07) moves its own per-agent counting offset, and session-start-nudge.sh (blueprint where-things-go, package 10) runs its one route on every source, both of which keep the id. SessionStart runs one route on every source: re-attach, then the project digest, then the armed nudges. No SessionEnd hook is registered.
+with no activity (Decision 53). Two SessionStart hooks are registered, and neither carries state across a new id: denial-breaker.sh (never-halt 07) moves its own per-agent counting offset, and session-start-nudge.sh (blueprint where-things-go, package 10), both of which keep the id. SessionStart runs one route on every source: re-attach, then the project digest, then the armed nudges. No SessionEnd hook is registered.
 
 **Wake-lock (Decision 18, Decision 53).** `BpContinuityLease.pm` (package 04, rewired by package 16) holds the lock
 while an armed session's transcript was written in the last hour. It no longer reads the old
