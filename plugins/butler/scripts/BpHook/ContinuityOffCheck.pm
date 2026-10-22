@@ -6,6 +6,9 @@
 # 12-bug-claimant-and-triaging -- this module is the one and only ticket
 # writer for all four names), and tells an operator-typed
 # `/butler:continuity off` apart from anything an agent could produce.
+# `emergency-stop` (blueprint judged-continuity-disarm, package 06) is also
+# recognized here; its operator flag is always false (only `off`'s branch
+# computes operator_off()).
 #
 # Contract: .ccpraxis-local-data/blueprints/hook-continuity-remake/specs/
 # 04-continuity-command-spec.md SS2.3/2.4; 28-fork-guard-bash-cost-spec.md
@@ -67,7 +70,8 @@ sub run {
             if ($name eq 'butler-continuity') {
                 my $v0 = $argv->[0];
                 next unless defined $v0
-                    && ($v0 eq 'on' || $v0 eq 'off' || $v0 eq 'off-confirm' || $v0 eq 'silence' || $v0 eq 'status');
+                    && ($v0 eq 'on' || $v0 eq 'off' || $v0 eq 'off-confirm' || $v0 eq 'silence' || $v0 eq 'status'
+                        || $v0 eq 'emergency-stop');
             }
 
             my $operator = 0;
