@@ -6215,6 +6215,13 @@ sub run {
             unless ($shutdown) {
                 my $queued = queued_decision_pkgs($runs);
                 for my $pkg (orphan_escalations($meta, $status, $queued)) {
+                    # The package's escalation is already with the resolver:
+                    # its queued record is triage-owned (so not in $queued),
+                    # and the park persists until the verdict is applied.
+                    # Filing again on every tick in between made a duplicate
+                    # that re-fired the resolver each minute (2026-10-22).
+                    next if defined judge_inflight($runs, 'escalation-resolve', $pkg)
+                         || -e "$runs/escalation-resolve/$pkg.decision";
                     my $st = $status->{$pkg} // '';
                     my $next = ledger_next_action($bpdir, $pkg);
                     _log($log, 'orphan_escalation', { package => $pkg, status => $st,

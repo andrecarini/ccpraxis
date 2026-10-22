@@ -321,6 +321,34 @@ sub _run_quiet {
     return $ec || 1;
 }
 
+# _relaunch_already_holds($bpdir, $pkg) -> reason string | undef.
+# 'pending' when the ledger already reads pending (what a relaunch writes);
+# 'coordinator-live' when runs/<pkg>.pid names a live process. This script
+# runs beside the orchestrator in the same pid namespace (the sandbox), so a
+# kill-0 probe on that pid is meaningful here. undef when neither holds, or
+# when the ledger cannot be read: a relaunch then proceeds as before.
+sub _relaunch_already_holds {
+    my ($bpdir, $pkg) = @_;
+    return undef unless defined $bpdir && length $bpdir;
+    if (open(my $fh, '<', "$bpdir/packages/$pkg.md")) {
+        my ($dashes, $status) = (0, undef);
+        while (my $line = <$fh>) {
+            if ($line =~ /\A-{3}\s*\z/) { last if ++$dashes == 2; next; }
+            if ($dashes == 1 && $line =~ /\Astatus:\s*([A-Za-z-]+)/) { $status = $1; last; }
+        }
+        close $fh;
+        return 'pending' if defined $status && $status eq 'pending';
+    }
+    if (open(my $pf, '<', "$bpdir/runs/$pkg.pid")) {
+        my $pid = <$pf>;
+        close $pf;
+        if (defined $pid && $pid =~ /\A\s*([1-9]\d{0,9})\s*\z/) {
+            return 'coordinator-live' if kill(0, $1);
+        }
+    }
+    return undef;
+}
+
 # ---------------------------------------------------------------------------
 # _dispatch_action(\%verdict, \%rec, $id, \%ctx) -> exit-code-shaped integer
 # (0 == succeeded). Reaches every one of the four bounded actions WITHOUT
@@ -336,6 +364,21 @@ sub _dispatch_action {
     my $rationale = $verdict->{rationale} // '';
 
     if ($action eq 'relaunch') {
+        # Already relaunched: a duplicate escalation for the same stop (the
+        # orchestrator re-filed an orphan escalation while the first was with
+        # the resolver, 2026-10-22) must settle, not retry every tick. A live
+        # coordinator means a relaunch would kill working code, and a pending
+        # ledger is exactly what a relaunch produces; either way the desired
+        # state already holds.
+        my $pkg = ref $rec eq 'HASH' ? $rec->{package} : undef;
+        if (defined $pkg && $pkg =~ /\A[A-Za-z0-9._-]+\z/) {
+            my $why = _relaunch_already_holds($bpdir, $pkg);
+            if (defined $why) {
+                _rlog($ctx->{log}, 'escalation_resolve_relaunch_moot', { decision => $id, package => $pkg, why => $why })
+                    if $ctx->{log};
+                return 0;
+            }
+        }
         return _run_quiet($^X, "$SELF_DIR/bp-answer-escalation.pl", $bp,
             '--decision', $id, '--action', 'relaunch', '--note', $rationale, '--bp-dir', $bpdir);
     }
