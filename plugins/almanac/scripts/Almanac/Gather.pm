@@ -683,9 +683,31 @@ sub _gather_project {
         # stale cwd after a Bash `cd`). Skip the two mutating refresh calls
         # rather than risk reconciling/sweeping the wrong project; record
         # the skip in errors[] instead of dying.
+        #
+        # reviewer-2-confirm MF-1: raw string equality on $anchor/$root is
+        # wrong -- it flags a trailing slash, a symlink to the same real
+        # directory, or a session launched in a (marker-less) subdirectory
+        # of the project root as a "mismatch", even though all three are the
+        # SAME project. Canonicalise both sides through
+        # AlmanacBug::canonical_root (abs_path + drive-letter/trailing-slash
+        # normalisation; already loaded via _load_bug for the bugs section)
+        # before comparing, and treat the anchor as a match whenever it IS
+        # $root or lies anywhere under it -- a subdirectory launch is
+        # legitimate. The attack shape this guard exists for is the inverse:
+        # $root resolves to a strict ANCESTOR of the anchor's own project
+        # (i.e. the anchor is not under $root at all), which still trips it.
         my $anchor = $ENV{CLAUDE_PROJECT_DIR};
-        if (defined $anchor && length $anchor
-            && _fs_bytes($anchor) ne _fs_bytes($root)) {
+        my $mismatch = 0;
+        if (defined $anchor && length $anchor) {
+            _load_bug();
+            my $canon_anchor = _load_bug() ? AlmanacBug::canonical_root(_fs_bytes($anchor)) : _fs_bytes($anchor);
+            my $canon_root   = _load_bug() ? AlmanacBug::canonical_root(_fs_bytes($root))   : _fs_bytes($root);
+            if ($canon_anchor ne $canon_root
+                && index($canon_anchor, "$canon_root/") != 0) {
+                $mismatch = 1;
+            }
+        }
+        if ($mismatch) {
             push @errors, { section => 'refresh',
                 error => "skipped: resolved root does not match CLAUDE_PROJECT_DIR" };
         } else {
