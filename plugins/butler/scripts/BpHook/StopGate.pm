@@ -324,8 +324,14 @@ sub _bump_streak {
 
     my $prev = _read_json_file($path);
     my ($count, $shell_failed) = (1, 0);
+    # The offset is only meaningful in the file it was measured in: a record
+    # from another transcript (a resumed or relocated session), or one whose
+    # offset is past the end (a truncated transcript), starts a fresh streak
+    # rather than scanning the wrong bytes. A record from before the
+    # transcript was stored has no path and is still honoured.
     if (ref $prev eq 'HASH' && defined $prev->{offset} && $prev->{offset} =~ /^\d+$/
-        && $prev->{offset} <= $size && defined $prev->{count} && $prev->{count} =~ /^\d+$/)
+        && $prev->{offset} <= $size && defined $prev->{count} && $prev->{count} =~ /^\d+$/
+        && (!defined $prev->{transcript} || $prev->{transcript} eq $tp))
     {
         my ($any_ok, $shell_err) = _scan_tool_results($tp, $prev->{offset});
         if ($any_ok) {
@@ -342,8 +348,12 @@ sub _bump_streak {
     $dir =~ s{/[^/]*$}{};
     unless (-d $dir) { eval { require File::Path; File::Path::make_path($dir) } }
     if (open(my $fh, '>:raw', "$path.tmp.$$")) {
-        print {$fh} JSON::PP->new->canonical->encode(
-            { count => $count, offset => $size, shell_failed => $shell_failed ? 1 : 0 }) . "\n";
+        # ->utf8 on both sides (_read_json_file decodes with ->utf8), so the
+        # stored transcript path round-trips to the same string whether the
+        # payload gave it as characters or as bytes (a non-ASCII user dir).
+        print {$fh} JSON::PP->new->utf8->canonical->encode(
+            { count => $count, offset => $size, shell_failed => $shell_failed ? 1 : 0,
+              transcript => $tp }) . "\n";
         close $fh;
         rename("$path.tmp.$$", $path) or unlink "$path.tmp.$$";
     }

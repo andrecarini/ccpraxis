@@ -280,4 +280,49 @@ for my $case (
     ok(!-e $f, 'GLASS unarmed: and a leftover file is removed');
 }
 
+# ===========================================================================
+# ROTATED / TRUNCATED -- the streak's byte offset belongs to one transcript
+# file. A different transcript (a resumed or relocated session) or one cut
+# shorter than the offset starts a fresh streak; scanning the wrong bytes
+# must never be what tips the gate over the cap.
+# ===========================================================================
+{
+    my $w = world();
+    stop($w) for 1 .. $CAP - 1;                  # one refusal short of the cap
+    my $other = "$w->{tp}.rotated.jsonl";
+    spew_append($other, ('{"type":"user","message":{"role":"user","content":"padding"}}') x 50);
+    ok(-s $other > -s $w->{tp}, 'ROTATED setup: the other transcript is longer than the stored offset');
+    $w->{tp} = $other;
+    is(stop($w)->{rc}, 2, 'ROTATED: a stop under another transcript path starts a fresh streak, not the capped one');
+    my $rec = JSON::PP->new->utf8->decode(slurp("$w->{root}/continuity/stop-refusals/$w->{sid}"));
+    is($rec->{count}, 1, 'ROTATED: the streak record restarted at 1');
+    is($rec->{transcript}, $other, 'ROTATED: and now names the transcript it measured');
+}
+{
+    my $w = world();
+    stop($w) for 1 .. $CAP - 1;
+    open(my $fh, '>:raw', $w->{tp}) or die;      # truncated below the stored offset
+    close $fh;
+    is(stop($w)->{rc}, 2, 'TRUNCATED: a transcript shorter than the stored offset starts a fresh streak');
+}
+
+# ===========================================================================
+# GC -- a session that ends mid-streak leaves its streak record and a
+# state-dir break-glass file behind; gc_sessions removes them with the rest
+# of that session's state once its transcript is gone.
+# ===========================================================================
+{
+    my $w = world(no_data_dir => 1);
+    with_env($w, sub { BpHook::arm($w->{sid}, role => 'manual', by => 'on', transcript_path => $w->{tp}) });
+    stop($w);
+    my $streak = "$w->{root}/continuity/stop-refusals/$w->{sid}";
+    ok(-e $streak, 'GC setup: a refusal left a streak record');
+    my $glass = write_glass($w, token => 'deadbeef', action => 'off', reason => 'never read back');
+    unlink $w->{tp} or die "unlink transcript: $!";
+    my $n = with_env($w, sub { BpHook::gc_sessions() });
+    is($n, 1, 'GC: the session whose transcript is gone is collected');
+    ok(!-e $streak, 'GC: its stop-refusals record is removed');
+    ok(!-e $glass,  'GC: its state-dir break-glass file is removed');
+}
+
 done_testing();

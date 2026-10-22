@@ -792,6 +792,12 @@ sub gc_sessions {
         unlink("$root/silence/$sid");
         unlink("$root/running/$sid");
         unlink("$root/holder/$sid.json");
+        # The Stop gate's break-glass state (StopGate.pm): the refusal streak
+        # and the state-dir fallback request file. Both are per-session and
+        # only ever cleared by that session's own later Stop, so a session
+        # that ends mid-streak would otherwise leave them forever.
+        unlink("$root/stop-refusals/$sid");
+        unlink("$root/break-glass/$sid.json");
         revoke_stop_token($sid);
         flock($lockfh, LOCK_UN);
         close $lockfh;
