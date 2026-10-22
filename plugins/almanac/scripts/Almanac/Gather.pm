@@ -634,6 +634,14 @@ sub _registry_roots {
     my %seen;
     my @out;
     for my $r (@raw) {
+        # known_projects() decodes the registry JSON, so a non-ASCII root
+        # comes back utf8-flagged. A flagged string passed to -d/-f (below,
+        # and in every _gather_project it feeds) stats the wrong bytes even
+        # though it's the same characters -- same class of bug as
+        # bp-orchestrator.pl's _json_bytes() already guards against
+        # elsewhere. Downgrade to raw bytes before it ever reaches a
+        # filesystem call.
+        utf8::downgrade($r, 1) if defined $r;
         my $c = AlmanacBug::canonical_root($r);
         next if $seen{$c}++;
         push @out, $r;
