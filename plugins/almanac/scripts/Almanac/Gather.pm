@@ -524,8 +524,10 @@ sub _run_refresh {
         push @$errors, { section => 'refresh', error => _errstr($err) };
     } elsif (ref $rec eq 'HASH') {
         $refresh->{reconcile} = {
-            ran => 1, changes => scalar(@{ $rec->{changes} // [] }),
-            flags => scalar(@{ $rec->{flags} // [] }), busy => scalar(@{ $rec->{busy} // [] }),
+            ran => 1,
+            changes => (ref $rec->{changes} eq 'ARRAY' ? scalar(@{ $rec->{changes} }) : 0),
+            flags   => (ref $rec->{flags}   eq 'ARRAY' ? scalar(@{ $rec->{flags} })   : 0),
+            busy    => (ref $rec->{busy}    eq 'ARRAY' ? scalar(@{ $rec->{busy} })    : 0),
             error => undef,
         };
     } else {
