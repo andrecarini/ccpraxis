@@ -5988,6 +5988,7 @@ sub enter_dashboard {
     my $cached_tokens           = undef;   # s08: TokenInfo struct
     my $cached_resources        = undef;   # s09/03: the reader's return value. undef means the detached sampler has not written a snapshot yet (or fork() failed) -- the panel is deliberately absent, never undef-as-a-bug.
     my $cached_runs             = [];      # s10: RunState::summarize struct, initialised to [] so the "runs" key is never undef
+    my $cached_thread_events    = [];      # project-level thread-log events, independent of any blueprint summary
     my $last_inspect            = 0;
     my $last_console_check      = 0;       # sandbox-launcher-lifecycle 01: stamp for the console-liveness throttle
     my $last_resources          = 0;       # s09: stamp for the throttled probe cadence
@@ -6326,7 +6327,10 @@ sub enter_dashboard {
                 $cached_backpack   = _gather_backpack($bp_host_file, $bp_appr_file);  # B4
                 $cached_oauth_expires_at = _gather_oauth_expiry();
                 $cached_tokens = _gather_tokens();
-                $cached_runs   = _gather_runs($PROJECT_PATH);   # s10
+                my %runs_extra;
+                $cached_runs   = _gather_runs($PROJECT_PATH, \%runs_extra);   # s10
+                $cached_thread_events = ref($runs_extra{thread_events}) eq 'ARRAY'
+                                      ? $runs_extra{thread_events} : [];
                 # s12: the podman-machine reading, refreshed on THIS throttled
                 # round rather than per-tick -- it shells out to `podman machine
                 # list`, which is as expensive as the inspect above, so putting
@@ -6516,6 +6520,11 @@ sub enter_dashboard {
                 # figures" can say WHY rather than naming the wrong absence.
                 spend_sampler    => $spend_sampler_fact,
                 runs             => $cached_runs,
+                # The project's thread-log events, carried on their own so a
+                # project with no blueprint summary still shows thread activity
+                # (each summary's thread_events is the same list; Dashboard::run
+                # unions both, deduped by thread/id).
+                thread_events    => $cached_thread_events,
                 # b37-spend-surfaces: undef when no run has persisted a spend
                 # snapshot, and Dashboard::build_panels then omits the Spend
                 # panel entirely rather than rendering an empty or zeroed one.
@@ -7108,6 +7117,15 @@ sub _keepawake_start {
     # fallback lease rather than trusting a wrong identity.
     my $owner_winpid = _keepawake_owner_winpid();
     my @owner_args = defined $owner_winpid ? ('-OwnerWinPid', $owner_winpid) : ();
+    # -OwnerStartedBeforeTicks: our own clock, read now, while we (the owner)
+    # are certainly alive and before the fork. If we die before the helper
+    # pins our WINPID and Windows hands it to a new process, that process was
+    # created after this reading and the helper rejects it (keep-awake.ps1,
+    # started-after-spawn) instead of pinning an impostor. Pure arithmetic --
+    # no process is spawned for it.
+    require Time::HiRes;   # core
+    my $owner_ticks = defined $owner_winpid ? KeepAwake::filetime_ticks(Time::HiRes::time()) : undef;
+    push @owner_args, '-OwnerStartedBeforeTicks', $owner_ticks if defined $owner_ticks;
     my $pid = fork();
     if (!defined $pid) {
         log_ev('keepawake_start_failed', { reason => "fork: $!" });
@@ -7126,9 +7144,11 @@ sub _keepawake_start {
             or do { POSIX::_exit(127); };
     }
     log_ev('keepawake_started', { pid => $pid,
-        owner_winpid => (defined $owner_winpid ? $owner_winpid : 'none') });
+        owner_winpid => (defined $owner_winpid ? $owner_winpid : 'none'),
+        owner_started_before => (defined $owner_ticks ? $owner_ticks : 'none') });
     return $pid;
 }
+
 
 # _keepawake_owner_winpid() -> positive WINDOWS pid of this process | undef.
 # Cygwin/MSYS exposes the native pid at /proc/<msys-pid>/winpid (measured on
@@ -7242,9 +7262,11 @@ sub _count_needs_you {
 # reads, so it rides the same 10s cadence as _count_needs_you/_gather_backpack/
 # _gather_tokens above -- deliberately NOT the slower Resources::should_sample
 # cadence, which exists to throttle expensive podman-exec probes (s10).
+# \%extra (optional) is RunState::summarize's out parameter: it receives the
+# project-level thread_events, filled even when no blueprint yields a summary.
 sub _gather_runs {
-    my ($project) = @_;
-    return RunState::summarize("$project/.ccpraxis-local-data/blueprints");
+    my ($project, $extra) = @_;
+    return RunState::summarize("$project/.ccpraxis-local-data/blueprints", $extra);
 }
 
 # _gather_backpack($bp_file, $appr_file) -> { total, approved, items=>[{key,

@@ -202,6 +202,8 @@ sub spawn {
     my $ps1 = helper_path();
     unless (-f $ps1) { die "keep-awake helper missing: $ps1\n" }
     require POSIX;
+    # Read in the PARENT, before fork: see owner_started_before.
+    my $owner_ticks = owner_started_before($owner);
     my $pid = fork();
     die "fork: $!\n" unless defined $pid;
     if ($pid == 0) {
@@ -231,6 +233,7 @@ sub spawn {
         my @extra;
         if (defined $owner->{owner_winpid} && $owner->{owner_winpid} =~ /^[1-9]\d*$/) {
             push @extra, '-OwnerWinPid', $owner->{owner_winpid};
+            push @extra, '-OwnerStartedBeforeTicks', $owner_ticks if defined $owner_ticks;
         }
         my $clean_desc = owner_desc_clean($owner->{owner_desc});
         push @extra, '-OwnerDesc', $clean_desc if defined $clean_desc;
@@ -265,6 +268,35 @@ sub winpid_of {
 }
 
 sub self_winpid { return winpid_of($$) }
+
+# owner_started_before(\%owner, $self_winpid?, $now?) -> FILETIME ticks string | undef
+#
+# The bound keep-awake.ps1 -OwnerStartedBeforeTicks checks the pinned owner
+# against: our own clock reading, as UTC FILETIME ticks, taken in the parent
+# before fork. If the owner dies before the helper pins its WINPID and Windows
+# reuses that WINPID, the new holder was created after this reading and the
+# helper rejects it rather than pinning an impostor (todo
+# 20261002-002528-33130000).
+#
+# Only for a self-owned helper (owner_winpid is our own WINPID): "now" in a
+# process that is alive is a valid upper bound on its own start, but says
+# nothing about a foreign pid. Pure arithmetic, no spawn: asking PowerShell
+# for the owner's exact start time (-OwnerStartTicks) instead puts a
+# powershell.exe on the handover path, which was measured, against a control
+# run, to break lease-refresher-hygiene.t's timing bounds under load.
+sub owner_started_before {
+    my ($owner, $self, $now) = @_;
+    return undef unless ref $owner eq 'HASH';
+    my $w = $owner->{owner_winpid};
+    return undef unless defined $w && $w =~ /^[1-9]\d{0,9}$/;
+    $self //= self_winpid();
+    return undef unless defined $self && "$self" eq "$w";
+    unless (defined $now) { require Time::HiRes; $now = Time::HiRes::time() }
+    return undef unless !ref($now) && $now =~ /\A\d+(?:\.\d+)?\z/;
+    # Same arithmetic as KeepAwake::filetime_ticks (sandbox); restated rather
+    # than required across plugins for one line.
+    return sprintf('%.0f', ($now + 11644473600) * 10_000_000);
+}
 
 # owner_desc_clean($s) -> string | undef -- sanitises an owner description so
 # neither MSYS2 argv conversion nor Windows argv quoting can alter it: no ':',

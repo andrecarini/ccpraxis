@@ -218,4 +218,24 @@ sub orphan_is_ours {
     return index(lc($cmdline), lc($marker)) >= 0 ? 1 : 0;
 }
 
+# filetime_ticks($unix_seconds) -> decimal string | undef
+#   UTC FILETIME ticks (100ns units since 1601-01-01) for a Unix time, as
+#   keep-awake.ps1's -OwnerStartedBeforeTicks expects. Pure arithmetic: no
+#   process is spawned (asking Windows for the owner's exact start time costs a
+#   powershell.exe on the spawn path, measured to slow helper handover enough
+#   to break lease-refresher-hygiene.t under load). Fractional
+#   seconds are kept to 100ns resolution as far as a double allows; the helper
+#   applies a 2s slack, so the rounding never matters. undef for anything that
+#   is not a non-negative number.
+#
+#   CALLER CONTRACT: pass your own clock reading, taken while the owner is
+#   certainly alive and before forking the helper -- for a self-owned helper,
+#   simply "now" in the parent. A WINPID reused after the owner dies belongs to
+#   a process created after that reading, which the helper then rejects.
+sub filetime_ticks {
+    my ($t) = @_;
+    return undef unless defined($t) && !ref($t) && $t =~ /\A\d+(?:\.\d+)?\z/;
+    return sprintf('%.0f', ($t + 11644473600) * 10_000_000);
+}
+
 1;

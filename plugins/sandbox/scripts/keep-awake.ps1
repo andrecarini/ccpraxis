@@ -136,6 +136,17 @@
 # for the same identity question, routed through the same seam,
 # Get-KaOwnerStartTicks, which also accepts a test-only override via
 # -SimulateOwnerStartTicksFile.
+#
+# -OwnerStartedBeforeTicks: the same race closed WITHOUT the caller having to
+# ask Windows for the owner's start time (which costs a powershell.exe spawn
+# on the caller's spawn path -- measured to break lease-refresher-hygiene.t's
+# handover bounds under load). The caller passes its OWN clock reading, as UTC
+# FILETIME ticks, taken while the owner is certainly alive and before it
+# forks us. A WINPID reused after the owner died belongs to a process CREATED
+# after that death, so after this reading; the real owner was created before
+# it. So an owner whose start is later than this bound (plus a 2s slack for
+# clock-precision differences) is rejected as OWNER-UNVERIFIABLE
+# reason=started-after-spawn. 0 (the default) means no bound was supplied.
 [CmdletBinding()]
 param(
     [string]$PidFile,
@@ -147,7 +158,8 @@ param(
     [switch]$SimulatePowerRequestFailure,
     [switch]$SimulatePowerRequestException,
     [long]$OwnerStartTicks = 0,              # owner's StartTime.ToFileTimeUtc(); 0 = not supplied
-    [string]$SimulateOwnerStartTicksFile = '' # TEST-ONLY seam: see Get-KaOwnerStartTicks
+    [string]$SimulateOwnerStartTicksFile = '', # TEST-ONLY seam: see Get-KaOwnerStartTicks
+    [long]$OwnerStartedBeforeTicks = 0       # caller's UTC FILETIME clock at spawn; 0 = not supplied
 )
 $ErrorActionPreference = 'Stop'
 
@@ -354,6 +366,8 @@ if ($PollSeconds  -lt 5)    { $PollSeconds  = 5 }
 if ($LeaseSeconds -gt 0 -and $PollSeconds -gt $LeaseSeconds) { $PollSeconds = $LeaseSeconds }
 if ($OwnerWinPid  -lt 0)    { $OwnerWinPid  = 0 }
 if ($OwnerStartTicks -lt 0) { $OwnerStartTicks = 0 }
+if ($OwnerStartedBeforeTicks -lt 0) { $OwnerStartedBeforeTicks = 0 }
+$KaStartSlackTicks = [long]20000000   # 2s, in 100ns FILETIME ticks
 
 # One log line per event: an exception message can be multi-line (and localised).
 function ConvertTo-KaOneLine {
@@ -429,6 +443,12 @@ if ($OwnerWinPid -gt 0) {
             # package fixes), or a test seam is simulating exactly that.
             # Reject rather than silently pinning an impostor.
             Write-KaLog 'OWNER-UNVERIFIABLE' ("winpid={0} reason=start-time-mismatch expected={1} actual={2} {3}" -f $OwnerWinPid, $OwnerStartTicks, $startTicks, $unverifiedTail)
+            try { $p.Dispose() } catch {}
+        } elseif ($OwnerStartedBeforeTicks -gt 0 -and $startTicks -gt ($OwnerStartedBeforeTicks + $KaStartSlackTicks)) {
+            # Created after the caller's own clock reading at spawn time, so
+            # it cannot be the process that read that clock: the WINPID was
+            # reused between the owner dying and this pin.
+            Write-KaLog 'OWNER-UNVERIFIABLE' ("winpid={0} reason=started-after-spawn bound={1} actual={2} {3}" -f $OwnerWinPid, $OwnerStartedBeforeTicks, $startTicks, $unverifiedTail)
             try { $p.Dispose() } catch {}
         } elseif ($startTicks -gt $selfStartTicks) {
             # A process that began after us cannot be the one that spawned us:
