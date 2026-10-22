@@ -2870,6 +2870,38 @@ sub pid_alive {
     return 1;
 }
 
+# foreign_live_count($runs) -> live coordinators registered by the OTHER
+# blueprints beside this one. bp-launch.sh enforces BP_MAX_PARALLEL across
+# every blueprint (bp-lib.sh count_running_global), but the slot checks here
+# counted only this blueprint's @live. With two fleets running, a slot that
+# looked free here made bp-launch exit 3 every tick, and each refused attempt
+# was logged as a fresh coordinator_death plus two launch_failed lines
+# (where-things-go/10, 2026-10-22). Same rule as count_running_global: a
+# registry row whose pid is alive.
+sub foreign_live_count {
+    my ($runs) = @_;
+    return 0 unless defined $runs && length $runs;
+    my $bpdir = dirname($runs);
+    my $root  = dirname($bpdir);
+    (my $own = $bpdir) =~ s{.*[\\/]}{};
+    # Only a real <data>/blueprints/<bp> layout has siblings worth counting,
+    # the same set count_running_global globs; a test fixture under an
+    # arbitrary temp root never borrows its neighbours.
+    return 0 unless $root =~ m{(?:^|[\\/])blueprints\z};
+    opendir(my $dh, $root) or return 0;
+    my @others = grep { !/^\./ && $_ ne $own } readdir $dh;
+    closedir $dh;
+    my $n = 0;
+    for my $other (@others) {
+        my $r = _read_json("$root/$other/runs/registry.json");
+        next unless ref $r eq 'HASH' && ref $r->{packages} eq 'HASH';
+        for my $row (values %{ $r->{packages} }) {
+            $n++ if ref $row eq 'HASH' && pid_alive($row->{pid});
+        }
+    }
+    return $n;
+}
+
 # best-effort kill of a (setsid) coordinator and its process group.
 sub kill_pid {
     my ($pid) = @_;
@@ -5616,6 +5648,7 @@ sub run {
 
             # ---- WATCH + WATCHDOG (assess each non-terminal launched package) ----
             my @live;     # packages occupying a coordinator slot now
+            my $foreign_live = foreign_live_count($runs);   # other blueprints' share of the global cap
             my %starved;  # packages parked as turn-starved THIS tick: the pause
                           # gate stops launches from tick N+1, so hold them out of
                           # this tick's launchable set too (§3 B8.4 "do not relaunch").
@@ -5847,7 +5880,7 @@ sub run {
                             _log($log, 'relaunch_deferred', { package => $pkg,
                                 reason => ($use_death_bo ? 'death_backoff' : 'min_interval'),
                                 since_last => $now - $last, min_relaunch => $min_gap });
-                        } elsif (@live < $t->{max_par}) {
+                        } elsif (@live + $foreign_live < $t->{max_par}) {
                             # This tick is genuinely about to attempt a relaunch (or, for
                             # a death past the cap, escalate INSTEAD of one) -- the one
                             # point where a death is actually counted.
@@ -6164,7 +6197,7 @@ sub run {
 
             # ---- LAUNCH newly-ready packages into free slots (event-driven) ----
             unless ($shutdown) {
-                my $slots = cap_slots(scalar @live, $t->{max_par});
+                my $slots = cap_slots(scalar(@live) + $foreign_live, $t->{max_par});
                 if ($slots > 0) {
                     # Harvest gate (#15): in gate mode a 'done' package whose harvest
                     # verdict isn't 'pass' is demoted to 'harvesting' so it does NOT yet
