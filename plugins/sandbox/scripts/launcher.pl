@@ -142,6 +142,10 @@ sub _pid_alive {
 # launcher.pl:4111's quiet_probe also calls RunState::summarize directly and
 # must not depend on _gather_runs having run first.
 $RunState::PID_ALIVE = \&_pid_alive;
+# RunState reads no clock of its own; with one injected it judges a
+# container-written orchestrator marker by runs/orchestrator.log freshness
+# instead of probing a Linux pid on the Windows host.
+$RunState::NOW = sub { time };
 
 use BackpackApproval ();  # #21: per-item, machine-local backpack approval memory
 use BackpackReview ();    # #21: the I/O-seam-injected interactive approval walk

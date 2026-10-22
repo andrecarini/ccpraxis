@@ -3749,9 +3749,39 @@ sub acquire_marker {
         truncate($fh, 0) or die "bp-orchestrator: marker write: $!";
         seek($fh, 0, 0) or die "bp-orchestrator: marker write: $!";
         { my $pid_line = "$$\n"; defined(syswrite($fh, $pid_line)) or die "bp-orchestrator: marker write: $!"; }
+        write_marker_side($path);
         return $fh;                       # keep open to hold the lock
     }
     return undef;
+}
+
+# --- runs/.orchestrator-side.json: which pid namespace wrote the marker.
+# The marker's pid is only meaningful in the namespace that produced it, and
+# the host-side dashboard (sandbox RunState.pm) reads markers a container
+# wrote. The record lives in a SIDECAR because every existing reader takes
+# the marker itself as digits only (BpState::marker_pid strips whitespace and
+# rejects anything else; bp-status.sh and bp-orchestrate.sh tr -dc 0-9), so
+# any extra content in the marker would break them. Best effort: a failure
+# here never stops the run -- a reader without a sidecar treats the side as
+# unknown and judges liveness by runs/orchestrator.log freshness instead.
+# Written while the marker's flock is held; removed before it is released.
+sub marker_side_path { my ($marker) = @_; return "$marker-side.json"; }
+sub write_marker_side {
+    my ($marker) = @_;
+    eval {
+        my $side = (-e '/run/.containerenv' || -e '/.dockerenv') ? 'container' : 'host';
+        my $host = eval { require Sys::Hostname; Sys::Hostname::hostname() };
+        my $rec = { v => 1, pid => $$, side => $side,
+                    host => ((defined $host && length $host) ? "$host" : undef) };
+        my $path = marker_side_path($marker);
+        my $tmp  = "$path.$$.tmp";
+        open(my $sfh, '>', $tmp) or die "open: $!";
+        print {$sfh} JSON::PP->new->canonical->encode($rec), "\n" or die "write: $!";
+        close($sfh) or die "close: $!";
+        rename($tmp, $path) or do { my $e = $!; unlink $tmp; die "rename: $e" };
+        1;
+    } or warn "bp-orchestrator: could not record the marker's side (" . ($@ =~ s/\s+\z//r) . "); readers will treat it as unknown\n";
+    return;
 }
 sub read_marker_pid {
     my ($path) = @_;
@@ -3760,6 +3790,9 @@ sub read_marker_pid {
 }
 sub release_marker {
     my ($fh, $path) = @_;
+    # The side record goes first, while the flock is still held, so it can
+    # never delete the record of an orchestrator that starts right after.
+    unlink marker_side_path($path) if $fh && defined $path;
     if ($fh) { flock($fh, LOCK_UN); close $fh; }
     unlink $path if defined $path;
 }

@@ -289,6 +289,105 @@ sub _orchestrator_pid {
     return ($blob =~ /\A(\d{1,10})(?!\d)/) ? ($1 + 0) : undef;
 }
 
+# ---------------------------------------------------------------------------
+# Orchestrator liveness across pid namespaces (todo 20261002-235037-d62e0000
+# L5). The dashboard runs on the HOST, but a fleet orchestrator normally runs
+# in the sandbox CONTAINER, so the pid in runs/.orchestrator is a container
+# pid. Probing it on the host can hit an unrelated host/MSYS process with the
+# same number and read as live (project CLAUDE.md, "A pid is only meaningful
+# in the namespace that produced it"). bp-orchestrator.pl therefore records
+# which side wrote the marker in a sidecar, runs/.orchestrator-side.json
+# ({v, pid, side: host|container, host}); the marker itself stays a bare pid
+# because BpState::marker_pid, bp-status.sh and bp-orchestrate.sh all read it
+# as digits only. A pid is probed only for a marker written on the host side
+# when this reader is on the host too; anything else is judged by the
+# freshness of runs/orchestrator.log, which a live orchestrator appends a
+# busy_lease_tick line to on every tick (~10s).
+# ---------------------------------------------------------------------------
+
+# Seconds within which runs/orchestrator.log counts as written by a live
+# orchestrator: nine ticks of margin over the 10s cadence.
+our $ORCH_LOG_FRESH_SECONDS = 90;
+# A log mtime this far in the FUTURE (host vs container clock skew) still
+# counts as fresh; further than that, the timestamp is not trusted at all.
+our $ORCH_LOG_FUTURE_SLACK_SECONDS = 300;
+
+# $NOW: CODE ref | undef. The wall clock, injected by the caller exactly like
+# $PID_ALIVE (this module reads no clock itself). Without it, log freshness
+# cannot be judged and the answer degrades to unknown (see below).
+our $NOW;
+
+# _reader_in_container() -> 1|0 (private). The same two root markers
+# BpContinuityLease::in_container and Almanac::Store::surface use. Two
+# existence tests of fixed paths -- the one place this module looks outside
+# the root it is handed, read-only, and it opens nothing.
+sub _reader_in_container {
+    return 1 if -e '/run/.containerenv';
+    return 1 if -e '/.dockerenv';
+    return 0;
+}
+
+# _orchestrator_side($runs_dir, $pid) -> 'host' | 'container' | undef
+# (private). undef ("unknown side") for a missing, oversized, malformed or
+# hostile sidecar, and for one whose pid is not the marker's pid (a sidecar
+# left behind by an earlier run is not evidence about this one).
+sub _orchestrator_side {
+    my ($runs_dir, $pid) = @_;
+    return undef unless defined $runs_dir && defined $pid;
+    my $blob = _read_capped("$runs_dir/.orchestrator-side.json", $MAX_MARKER_BYTES);
+    return undef unless defined $blob;
+    local $@;
+    my $d = eval { JSON::PP->new->decode($blob) };
+    return undef unless ref($d) eq 'HASH';
+    my ($side, $spid) = ($d->{side}, $d->{pid});
+    return undef unless defined $spid && !ref($spid) && $spid =~ /\A\d{1,10}\z/ && $spid == $pid;
+    return undef unless defined $side && !ref($side) && ($side eq 'host' || $side eq 'container');
+    return $side;
+}
+
+# _orchestrator_log_fresh($runs_dir) -> 1 (fresh) | 0 (stale) | undef
+# (private; undef = cannot tell: no injected clock, a clock that fails, no
+# log, or a log timestamp too far in the future to trust).
+sub _orchestrator_log_fresh {
+    my ($runs_dir) = @_;
+    return undef unless defined $runs_dir && ref($NOW) eq 'CODE';
+    local $@;
+    my $now = eval { $NOW->() };
+    return undef unless defined $now && !ref($now) && $now =~ /\A\d+(?:\.\d+)?\z/;
+    my $mtime = _mtime("$runs_dir/orchestrator.log");
+    return undef unless defined $mtime;
+    my $age = $now - $mtime;
+    return undef if $age < -$ORCH_LOG_FUTURE_SLACK_SECONDS;
+    return ($age <= $ORCH_LOG_FRESH_SECONDS) ? 1 : 0;
+}
+
+# _orchestrator_alive($runs_dir, $pid) -> 1 | 0 | undef (private). At most
+# ONE $PID_ALIVE call (AC9: no second probe).
+#   host-written marker, host reader       -> the pid probe, as before
+#   otherwise, orchestrator.log fresh       -> 1
+#   container-written (or host-written read
+#   from inside a container), log not fresh -> 0 only on a prober "dead"
+#                                              (launcher.pl's prober answers
+#                                              0 only from its census of the
+#                                              container's own pids), never a
+#                                              prober "alive"; else undef
+#   unknown side (a marker from before the
+#   sidecar), log present but stale         -> same as the line above
+#   unknown side, freshness unjudgeable     -> the pid probe, as before (no
+#                                              clock injected, or no log at
+#                                              all: nothing better to go on)
+sub _orchestrator_alive {
+    my ($runs_dir, $pid) = @_;
+    return undef unless defined $pid;
+    my $side = _orchestrator_side($runs_dir, $pid);
+    return _pid_state($pid) if defined $side && $side eq 'host' && !_reader_in_container();
+    my $fresh = _orchestrator_log_fresh($runs_dir);
+    return 1 if $fresh;
+    my $probe = _pid_state($pid);
+    return $probe if !defined $side && !defined $fresh;
+    return (defined $probe && !$probe) ? 0 : undef;
+}
+
 # _paused_info($path) -> ($paused_manual, $paused_reason) (private)
 #
 # $paused_manual is 1 iff the (capped) file decodes as a HASH whose 'manual'
@@ -1313,7 +1412,8 @@ sub _build_owner {
     if ($kind eq 'orchestrator') {
         if (defined($id) && _valid_link_part($id)) {
             my $marker = "$blueprints_root/$id/runs/.orchestrator";
-            $owner{alive} = (-e $marker && !-l $marker) ? _pid_state(_orchestrator_pid($marker)) : 0;
+            $owner{alive} = (-e $marker && !-l $marker)
+                ? _orchestrator_alive("$blueprints_root/$id/runs", _orchestrator_pid($marker)) : 0;
         }
         return \%owner;
     }
@@ -1939,7 +2039,7 @@ sub summarize_dir {
     my $has_orch     = $has_runs && -e "$runs_dir/.orchestrator";
 
     my $orchestrator_pid = $has_runs ? _orchestrator_pid("$runs_dir/.orchestrator") : undef;
-    my $alive = _pid_state($orchestrator_pid);
+    my $alive = _orchestrator_alive($runs_dir, $orchestrator_pid);
     my $dead  = (defined($alive) && !$alive) ? 1 : 0;   # ONLY a positive "checked and dead"
 
     my $state = $has_shutdown                        ? 'parked'
