@@ -56,7 +56,7 @@ containment check you actually have.
 
 **Every structured change to your ledger goes through `plugins/butler/scripts/bp-ledger.pl`.** Free-form `Edit`/`Write` on the ledger is how it gets corrupted: a whole-file rewrite has truncated a ledger to zero bytes in this repo, and hand-edits have landed entries inside fenced code blocks, forged ticked checkboxes, and silently dropped sections. The API is deterministic, atomic (temp + rename), locked, and refuses rather than guesses.
 
-The seven operations:
+The eight operations:
 
 ```
 bp-ledger.pl set-status       --ledger P --status S
@@ -64,6 +64,7 @@ bp-ledger.pl tick-step        --ledger P --step N
 bp-ledger.pl append-attempt   --ledger P (--text T | --text-file F | --text -)
 bp-ledger.pl set-next-action  --ledger P --body B
 bp-ledger.pl add-output       --ledger P --text T
+bp-ledger.pl set-escalation   --ledger P (--text T | --text-file F | --text -)
 bp-ledger.pl rotate           --ledger P [--keep N] [--budget BYTES] [--dry-run]
 bp-ledger.pl validate         (--ledger P | --stdin | --payload)
 ```
@@ -78,11 +79,12 @@ Why each op exists rather than an `Edit`:
 - **`tick-step`** only ever ticks inside `## Pipeline`, so no op can emit a `- [x]` anywhere else.
 - **`set-next-action`** replaces the `## Next action` body wholesale — the one section that is meant to be rewritten.
 - **`add-output`** appends to `## Outputs`, replacing a `_(none yet)_` placeholder if that is all that is there.
+- **`set-escalation`** replaces the `## Escalation` body: what decision or re-scope a `blocked` or `parked` package needs. The orchestrator, the escalation resolver and the reporter read it.
 - **`rotate`** moves stale `## Decisions & attempt log` entries out to `reports/ledger-history/<pkg>.md` (a path derived from your ledger's own `.../packages/<pkg>.md` shape — never guess a different location: `bp-resume-sweep.sh` and `bp-status.sh` glob `packages/*.md`, so history must never land there or it gets enumerated as a bogus package). See "Context budget" below for when and why to run it.
 
 **What no op may touch, and neither may you:** `## Dispatch log (auto)` is hook-maintained and never agent-edited. `mandated_means:` has no op and none may be added — rewriting the requirement to match what you built is the one move that defeats the whole mechanism.
 
-Prose sections the API does not model (`## Scope`, `## Inputs`, and your own narrative) are still yours to write with `Edit` — but anchor on a unique string, never rewrite the whole file.
+A direct `Edit` or `Write` of a ledger is refused outright by the write guard, so there is no prose section left to hand-edit. `## Scope`, `## Done criteria`, `## Inputs` and `## Out of scope` change only through `bp-ledger.pl set-section` (a rescope, Decision 84); your own narrative goes in `append-attempt` entries.
 
 ### The `TOOLING-BUG-FILED:` marker
 
@@ -621,7 +623,7 @@ If the ledger shows prior progress when you start: this is a resumption. Verify 
 
 ## Terminal ritual
 
-Before stopping: re-run validation from disk one final time, complete `## Outputs` (every artifact + validation evidence), set status (`done`, or `blocked`/`parked` with Escalation + Next action filled), refresh `last_updated`, then stop. For `blocked`: state what is blocked, what was tried, and the single decision or re-scope needed — the orchestrator reads only that section and acts on it.
+Before stopping: re-run validation from disk one final time, complete `## Outputs` (every artifact + validation evidence), set status (`done`, or `blocked`/`parked` with `## Escalation` filled via `set-escalation` and `## Next action` via `set-next-action`), refresh `last_updated`, then stop. For `blocked`: state what is blocked, what was tried, and the single decision or re-scope needed — the orchestrator reads only that section and acts on it.
 
 ## Graceful stop (orchestrator-initiated)
 
@@ -657,9 +659,9 @@ orchestrator itself uses:
 - **`context-ceiling.sh`** (`PreToolUse` on `Task`/`Bash`) — at or above the **hard** ceiling,
   this is the mandatory **flush**: it denies `Task` dispatch outright and denies any `Bash` command
   that isn't exactly flush work. The allow-list is `bp-ledger.pl set-status|set-next-action|
-  tick-step|append-attempt|add-output|validate` and `bp-dispatch-log.pl outstanding` — `Read`,
-  `Edit`, `Grep` and `Write` are never gated by this hook at all, so you can still write the
-  `## Escalation` prose and re-read your ledger freely. The flush is capped at **5 turns**: use them
+  tick-step|append-attempt|add-output|set-escalation|validate` and `bp-dispatch-log.pl outstanding` — `Read`,
+  `Edit`, `Grep` and `Write` are never gated by this hook at all, so you can still re-read your ledger freely, and `set-escalation` writes the
+  `## Escalation` prose. The flush is capped at **5 turns**: use them
   to run the scoped `bp-dispatch-log.pl outstanding` check, write a concrete `## Next action` with
   `bp-ledger.pl set-next-action`, leave `status:` non-terminal, and stop — exactly the same stop
   shape as the usage/telemetry pause above (`## Graceful stop (orchestrator-initiated)`, "Usage /

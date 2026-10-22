@@ -646,4 +646,49 @@ subtest 'set-test-paths is the recovery path for a file a plain widen-write-set 
     is($vrc, 0, 'validate passes') or diag($vout);
 };
 
+# ===========================================================================
+# set-escalation (bug 20261022-115951-2e6f): set-section still refuses
+# Escalation, so this is the one sanctioned writer of that section. The
+# template heading carries a suffix ("## Escalation (when status: blocked)").
+# ===========================================================================
+
+sub escalation_body {
+    my ($bytes) = @_;
+    return $1 if $bytes =~ /^## Escalation[^\n]*\n(.*?)(?=\n## |\z)/ms;
+    return undef;
+}
+
+subtest 'set-escalation replaces the Escalation body and the ledger still validates' => sub {
+    my $l = fixture_for_section();
+    my $text = "Blocked on the tree interlock.\nNeeds: nothing from the operator; retry after 02 lands.";
+    my ($rc, $out) = run_cli('set-escalation', '--ledger', $l, '--text', $text);
+    is($rc, 0, 'exit 0') or diag($out);
+    my $body = escalation_body(slurp($l));
+    like($body, qr/\A\s*\QBlocked on the tree interlock.\E\nNeeds: nothing/, 'the new body is in place');
+    unlike($body, qr/What is blocked, what was tried/, 'the template placeholder is gone');
+    my ($vrc, $vout) = run_cli('validate', '--ledger', $l);
+    is($vrc, 0, 'validate passes') or diag($vout);
+};
+
+for my $case (
+    ['a heading line',       "Fine first line.\n## Pipeline"],
+    ['a forged checkbox',    "- [x] done, honest"],
+    ['only whitespace',      "  \n  "],
+) {
+    my ($what, $text) = @$case;
+    subtest "set-escalation refuses $what and leaves the ledger byte-identical" => sub {
+        my $l = fixture_for_section();
+        my $before = slurp($l);
+        my ($rc, $out) = run_cli('set-escalation', '--ledger', $l, '--text', $text);
+        is($rc, 3, 'exit 3 (argument fault)') or diag($out);
+        is(slurp($l), $before, 'ledger byte-identical');
+    };
+}
+
+subtest 'set-section still refuses Escalation' => sub {
+    my $l = fixture_for_section();
+    my ($rc, $out) = run_cli('set-section', '--ledger', $l, '--section', 'Escalation', '--text', 'x');
+    is($rc, 3, 'exit 3') or diag($out);
+};
+
 done_testing();

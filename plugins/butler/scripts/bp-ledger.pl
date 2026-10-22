@@ -32,8 +32,8 @@
 # the body of exactly
 # one of Scope/Done criteria/Inputs/Out of scope, leaving the frontmatter byte-
 # identical; every other heading is refused (Pipeline/Decisions & attempt log/Next
-# action each already have a dedicated verb; Outputs/Escalation are simply outside the
-# allow-list). `widen-write-set --edit-target` widens write_set only, never test_paths
+# action each already have a dedicated verb, as do Outputs (add-output) and Escalation
+# (set-escalation)). `widen-write-set --edit-target` widens write_set only, never test_paths
 # (task 25's "a widened test file also joins test_paths" behaviour is unchanged
 # without the flag).
 #
@@ -2462,7 +2462,7 @@ sub op_set_checks {
 # identical (unlike every other mutating verb here, which is free to bump
 # last_updated). Every other heading is refused: Pipeline / Decisions & attempt log /
 # Next action already have their own dedicated verb (tick-step / append-attempt /
-# set-next-action), and Outputs / Escalation are simply outside the allow-list.
+# set-next-action), as do Outputs (add-output) and Escalation (set-escalation).
 # =====================================================================================
 
 my @SET_SECTION_ALLOWED = ('Scope', 'Done criteria', 'Inputs', 'Out of scope');
@@ -2497,6 +2497,36 @@ sub op_set_section {
     my $text = get_freetext_arg(sub => 'set-section', opt => \%opt, primary => 'text', filekey => 'text-file');
 
     run_op('set-section', $opt{ledger}, sub { return splice_set_section($_[0], $opt{section}, $text) });
+}
+
+# `set-escalation` -- replace the BODY of ## Escalation. The coordinator protocol
+# has a blocked/parked coordinator fill it, and the orchestrator, resolver and
+# reporter read it, but direct Edit of a ledger is refused (GuardBlueprintWrite)
+# and set-section deliberately excludes it, so before this verb there was no
+# sanctioned way to write it (bug 20261022-115951-2e6f).
+sub op_set_escalation {
+    my @args = @_;
+    my %opt;
+    my $ok;
+    { local $SIG{__WARN__} = sub { };
+      $ok = GetOptionsFromArray(\@args, \%opt, 'ledger=s', 'text=s', 'text-file=s'); }
+    arg_error('set-escalation', 'unrecognised option') unless $ok;
+    arg_error('set-escalation', 'unexpected extra arguments: ' . join(' ', @args)) if @args;
+    arg_error('set-escalation', 'missing required --ledger') unless defined $opt{ledger};
+    my $text = get_freetext_arg(sub => 'set-escalation', opt => \%opt, primary => 'text', filekey => 'text-file');
+    $text =~ s/\s+\z//;
+    arg_error('set-escalation', 'the --text is empty after stripping trailing whitespace') if $text eq '';
+    my @lines = split(/\n/, $text, -1);
+    if (grep { /^\s*-\s*\[[xX]\]/ } @lines) {
+        arg_error('set-escalation',
+            "the --text must not contain a line matching '- [x]' (would forge the orchestrator's ledger_checkboxes "
+          . 'progress signal)');
+    }
+    if (grep { /^#{1,2}\s/ } @lines) {
+        arg_error('set-escalation',
+            "the --text must not contain a '#' or '##' heading line (it would end the Escalation section early)");
+    }
+    run_op('set-escalation', $opt{ledger}, sub { return splice_set_section($_[0], 'Escalation', $text) });
 }
 
 sub op_add_output {
@@ -3690,6 +3720,7 @@ my %DISPATCH = (
     'tick-step'        => \&op_tick_step,
     'set-next-action'  => \&op_set_next_action,
     'add-output'       => \&op_add_output,
+    'set-escalation'   => \&op_set_escalation,
     'widen-write-set'  => \&op_widen_write_set,
     'set-write-set'    => \&op_set_write_set,
     'set-test-paths'   => \&op_set_test_paths,

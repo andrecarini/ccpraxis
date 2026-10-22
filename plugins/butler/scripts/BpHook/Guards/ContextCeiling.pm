@@ -127,7 +127,7 @@ sub _flush_segments {
     return @segs;
 }
 
-my $LEDGER_VERB_RE = qr{^\s*(?:perl\s+)?(?:[^\s]*/)?bp-ledger\.pl\s+(?:set-status|set-next-action|tick-step|append-attempt|add-output|validate)(?:\s|$)};
+my $LEDGER_VERB_RE = qr{^\s*(?:perl\s+)?(?:[^\s]*/)?bp-ledger\.pl\s+(?:set-status|set-next-action|tick-step|append-attempt|add-output|set-escalation|validate)(?:\s|$)};
 my $DISPATCH_VERB_RE = qr{^\s*(?:perl\s+)?(?:[^\s]*/)?bp-dispatch-log\.pl\s+outstanding(?:\s|$)};
 
 sub _is_flush_work {
@@ -228,7 +228,7 @@ sub _run_pre {
 
     my $l1 = "BLOCKED: context flush (~$n tokens >= hard $hard). $x";
     my $l2 = ($turns <= 5)
-        ? "Flush turn $turns of 5: only bp-ledger.pl set-status|set-next-action|tick-step|append-attempt|add-output|validate or bp-dispatch-log.pl outstanding may run."
+        ? "Flush turn $turns of 5: only bp-ledger.pl set-status|set-next-action|tick-step|append-attempt|add-output|set-escalation|validate or bp-dispatch-log.pl outstanding."
         : "Flush turn $turns is past the permitted 5 and was logged to runs/<pkg>.ctx-flush-overrun.log; set status: blocked with a filled '## Escalation', then stop.";
     return BpHook::deny($l1, $l2);
 }

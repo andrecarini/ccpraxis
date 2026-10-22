@@ -223,7 +223,7 @@ sub spec_echo_cmd {
 # The mandated messages (spec sec 3.8), byte-exact.
 # ---------------------------------------------------------------------------
 sub deny_l1     { my ($n, $hard, $x) = @_; return "BLOCKED: context flush (~$n tokens >= hard $hard). $x" }
-sub deny_l2_cap { my ($turns) = @_; return "Flush turn $turns of 5: only bp-ledger.pl set-status|set-next-action|tick-step|append-attempt|add-output|validate or bp-dispatch-log.pl outstanding may run." }
+sub deny_l2_cap { my ($turns) = @_; return "Flush turn $turns of 5: only bp-ledger.pl set-status|set-next-action|tick-step|append-attempt|add-output|set-escalation|validate or bp-dispatch-log.pl outstanding." }
 sub deny_l2_over{ my ($turns) = @_; return "Flush turn $turns is past the permitted 5 and was logged to runs/<pkg>.ctx-flush-overrun.log; set status: blocked with a filled '## Escalation', then stop." }
 sub deny_full   { my ($n, $hard, $x, $turns) = @_; return deny_l1($n, $hard, $x) . "\n" . ($turns <= 5 ? deny_l2_cap($turns) : deny_l2_over($turns)) . "\n" }
 
@@ -337,11 +337,12 @@ for my $tokens (10_000, 300_000) {
         'bp-ledger.pl tick-step --ledger L --step 2',
         'bp-ledger.pl append-attempt --ledger L --text t',
         'bp-ledger.pl add-output --ledger L --text t',
+        'bp-ledger.pl set-escalation --ledger L --text t',
         'bp-ledger.pl validate --ledger L',
         'perl /p/scripts/bp-dispatch-log.pl outstanding --blueprint b --package p',
         'bp-ledger.pl set-next-action --ledger L --body "x" && bp-ledger.pl set-status --ledger L --status parked',
     );   # shape-lint: intentional -- counts a corpus THIS test builds a few lines above, asserted so the loop that follows can never pass vacuously over an empty list; not the shape of a shared artifact.
-    is(scalar(@flush), 8, 'CC-3 setup: eight flush-procedure corpus commands');
+    is(scalar(@flush), 9, 'CC-3 setup: nine flush-procedure corpus commands');
     my ($env, $bp_dir) = fresh_cc_env();
     write_transcript($bp_dir, $env->{BP_PACKAGE}, 400_000);
     my $expect_turn = 0;
