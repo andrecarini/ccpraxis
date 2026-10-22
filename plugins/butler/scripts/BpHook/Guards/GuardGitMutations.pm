@@ -44,8 +44,14 @@ my $HEREDOC_WALK_MAX = 262144;
 # Odd-punctuation heredoc delimiter (line 294 of the source hook), and the
 # "unquoted heredoc opener" check (source line 246). Both operate per-line
 # (grep -E semantics), against the RAW command.
-my $UNQUOTED_HD_OPENER_RE = qr/<<-?[ \t]*([^'"]|$)/;
-my $ODD_HD_DELIM_RE = qr/<<-?[ \t]*([^A-Za-z0-9_'" \t]|'[A-Za-z0-9_]*[^A-Za-z0-9_']|"[A-Za-z0-9_]*[^A-Za-z0-9_"]|[A-Za-z0-9_]*[^A-Za-z0-9_'" \t])/;
+#
+# The '-' of a '<<-' opener is matched possessively (-?+). With a plain -?
+# the engine could skip the '-' and then match it as the "odd" first char of
+# the delimiter, so every '<<-EOF' heredoc was treated as an odd delimiter
+# and raw-scanned (its body mentions denied as if executed), and every
+# '<<-'EOF'' opener read as unquoted.
+my $UNQUOTED_HD_OPENER_RE = qr/<<-?+[ \t]*([^'"]|$)/;
+my $ODD_HD_DELIM_RE = qr/<<-?+[ \t]*([^A-Za-z0-9_'" \t]|'[A-Za-z0-9_]*[^A-Za-z0-9_']|"[A-Za-z0-9_]*[^A-Za-z0-9_"]|[A-Za-z0-9_]*[^A-Za-z0-9_'" \t])/;
 
 my $SHELLWORD_WORD_RE = qr/
     (^|[;&|\s])(bash|sh|zsh|ksh|dash|eval|xargs)([\s]|$)
@@ -83,6 +89,15 @@ my %HEREDOC_ALLOWED_VERB = map { ($_ => 1) }
 #       then end-of-input or one of the boundary chars (space/tab/newline/
 #       ;/&/|/</>/(/)) immediately after. The walker never falls back to
 #       treating an incomplete '<<' as plain text.
+#   R3: '((', '${' or '$[' read in state 'none'. Inside arithmetic and
+#       parameter expansion bash reads '<<' as a shift or as literal text,
+#       never as a heredoc opener, so a walker that cannot see where those
+#       contexts end must not claim to know where bodies are (todo
+#       20261002-003205-fb7e0000).
+#
+# %opt: hash_plain => 1 reads a none-state '#' as an ordinary character
+# instead of refusing (R1). Only for _heredoc_openers_strict, whose caller
+# has already proved that no '#' changes how the command parses.
 #
 # Linear time (S2): the outer line index of each opener comes from a
 # running newline counter updated by the $append closure below, never by
@@ -91,7 +106,7 @@ my %HEREDOC_ALLOWED_VERB = map { ($_ => 1) }
 # Pure. Never dies on purpose, never spawns a process.
 # ---------------------------------------------------------------------------
 sub _heredoc_walk {
-    my ($cmd) = @_;
+    my ($cmd, %opt) = @_;
     my @c = split //, $cmd, -1;
     my $n = scalar @c;
     my $out = '';
@@ -190,8 +205,13 @@ sub _heredoc_walk {
         if ($ch eq "\x27") { $state = 'squote'; $append->($ch); $i++; next }
         if ($ch eq q{"})   { $state = 'dquote'; $append->($ch); $i++; next }
         if ($ch eq "\\" && $i + 1 < $n) { $append->($ch . $c[$i + 1]); $i += 2; next }
-        if ($ch eq '#') {
+        if ($ch eq '#' && !$opt{hash_plain}) {
             return ();                                              # R1
+        }
+        if ($i + 1 < $n
+            && (($ch eq '(' && $c[$i + 1] eq '(')
+                || ($ch eq '$' && ($c[$i + 1] eq '{' || $c[$i + 1] eq '[')))) {
+            return ();                                              # R3
         }
         if ($ch eq '<' && $i + 1 < $n && $c[$i + 1] eq '<') {
             my $j = $i + 2;
@@ -375,6 +395,24 @@ sub _heredoc_write_only_outer {
 }
 
 # ---------------------------------------------------------------------------
+# _heredoc_openers_strict($cmd) -> true iff every '<<' outside quotes and
+# heredoc bodies is a complete opener whose delimiter Shell::strip_noise
+# reads the same way bash does (R2), and none sits in an arithmetic or
+# parameter-expansion context (R3). The heredoc branch of _git_scan_target
+# masks bodies with strip_noise, which skips an empty delimiter, stops the
+# delimiter word at a quote ('EOF'x, EOF"x", E'OF') and treats every '<<'
+# as an opener. Each of those lets it mask, as body, lines bash executes.
+# A false return sends the command to the raw fallback (todo
+# 20261002-003205-fb7e0000). Only called once backslashes are ruled out
+# and any '#' is proved inert, so '#' is read as a plain character here.
+# ---------------------------------------------------------------------------
+sub _heredoc_openers_strict {
+    my ($cmd) = @_;
+    my ($outer) = _heredoc_walk($cmd, hash_plain => 1);
+    return defined $outer ? 1 : 0;
+}
+
+# ---------------------------------------------------------------------------
 # _git_scan_target($cmd) -> ($scan, $raw_kind). Faithful port of
 # git_scan_target() in plugins/butler/hooks/guard-git-mutations.sh (lines
 # 97-453), operating on Perl characters instead of bash's byte string, with
@@ -444,6 +482,9 @@ sub _git_scan_target {
             if ($a ne $b) {
                 return ($cmd, 'escape');
             }
+        }
+        if (!_heredoc_openers_strict($cmd)) {
+            return ($cmd, 'escape');
         }
         if (BpHook::Guards::Common::line_match(qr/\x60|\$\(/, $hd_stripped)) {
             return ($cmd, 'carrier');
@@ -548,9 +589,18 @@ sub _git_scan_target {
     return ($out, 'masked');
 }
 
+# The raw-fallback kinds (escape/toolong/unbalanced) scan the unmasked
+# command because the walk could not prove where quotes, comments and
+# carriers are, and in that case the step-4 shellword check never runs
+# either. They take the broadest anchor, so a mutation behind a quote or a
+# backtick still counts: before, `bash -c "git stash" # note` and
+# `x=\`git stash\` # note` were allowed, because the '#' forced the raw
+# fallback and its anchor ignored the quote and the backtick.
 sub _anchor_for {
     my ($reason) = @_;
-    return '(^|[;&|\s\'"\x60({])' if $reason eq 'shellword';
+    return '(^|[;&|\s\'"\x60({])'
+        if $reason eq 'shellword' || $reason eq 'escape'
+        || $reason eq 'toolong'   || $reason eq 'unbalanced';
     return '(^|[;&|\s\x60({])'    if $reason eq 'carrier';
     return '(^|[;&|\s({])';
 }
