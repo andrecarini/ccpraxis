@@ -583,6 +583,14 @@ sub scan {
                         repair => qq(restore the ledger, or almanac thread archive $f->{thread} --root "$root_c"),
                     };
                 }
+                elsif ($f->{kind} eq 'link_invalid') {
+                    push @findings, {
+                        class  => 'BAD-LINK', num => 12, scope => 'project', type => 'thread', id => $id,
+                        path   => _decode_maybe($f->{path}), line => undef,
+                        detail => "link $f->{link} is not a valid <blueprint>/<package> link",
+                        repair => qq(almanac thread archive $f->{thread} --root "$root_c"),
+                    };
+                }
                 elsif ($f->{kind} eq 'link_parked') {
                     push @findings, {
                         class  => 'BAD-LINK', num => 12, scope => 'project', type => 'thread', id => $id,

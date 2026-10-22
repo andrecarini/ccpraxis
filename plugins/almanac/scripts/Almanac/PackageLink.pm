@@ -13,6 +13,33 @@ our $VERSION = '1.0';
 
 our @STATUSES = qw(pending running converging reviewing done blocked parked dropped);
 
+# valid_segment($s) -> 1|0 -- one side of a link, per parse()'s grammar.
+sub valid_segment {
+    my ($p) = @_;
+    return 0 unless defined $p && length $p;
+    return 0 if length($p) > 128;
+    return 0 unless $p =~ /\A[A-Za-z0-9][A-Za-z0-9._-]*\z/;
+    return 0 if $p =~ /\.\./;
+    return 1;
+}
+
+# link_key($link) -> the spelling two links are compared by for "is this
+# package already linked?". On a case-insensitive, trailing-dot-stripping
+# filesystem (NTFS: MSWin32/cygwin/msys perls), "BP/01-x" and "bp./01-x"
+# resolve to the SAME ledger, so comparing the raw strings let one package
+# be linked twice (where-things-go pkg02 redteam N3). Elsewhere the raw
+# string is the key: those spellings are distinct ledgers there.
+our $FOLD_CASE = ($^O =~ /\A(?:MSWin32|cygwin|msys)\z/) ? 1 : 0;
+sub link_key {
+    my ($link) = @_;
+    return undef unless defined $link;
+    my $k = "$link";
+    return $k unless $FOLD_CASE;
+    $k = lc $k;
+    $k =~ s{\.+(?=/|\z)}{}g;
+    return $k;
+}
+
 # parse($link) -> ($bp, $pkg) | ()   -- grammar: exactly one '/'; each side
 # matches \A[A-Za-z0-9][A-Za-z0-9._-]*\z, at most 128 chars, contains no '..'.
 sub parse {
@@ -22,10 +49,7 @@ sub parse {
     return () unless @parts == 2;
     my ($bp, $pkg) = @parts;
     for my $p ($bp, $pkg) {
-        return () unless defined $p && length $p;
-        return () if length($p) > 128;
-        return () unless $p =~ /\A[A-Za-z0-9][A-Za-z0-9._-]*\z/;
-        return () if $p =~ /\.\./;
+        return () unless valid_segment($p);
     }
     return ($bp, $pkg);
 }
@@ -173,6 +197,11 @@ sub package_ids {
         next if $f =~ /\.lock\z/i;
         next unless -f "$dir/$f";
         (my $id = $f) =~ s/\.md\z//i;
+        # Only ids a link can name (pkg02 review S6 / redteam N4): a
+        # README.md, a name with spaces or non-ASCII, or one containing
+        # ".." would be linked as "$bp/$id", which resolve() then reports
+        # 'invalid' forever -- blocking auto-archive with no way to clear it.
+        next unless valid_segment($id);
         push @ids, $id;
     }
     closedir $dh;

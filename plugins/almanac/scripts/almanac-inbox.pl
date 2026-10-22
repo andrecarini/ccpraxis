@@ -409,12 +409,20 @@ sub blocked_tasks {
     # is skipped (its blocked_on is not a live field there, matching
     # check_refs); archived threads are included, since an archived
     # thread's task can still name a real blocked_on.
+    my @unreadable;
     my $thread_ok = eval {
         require Almanac::Thread;
         my $threads = Almanac::Thread::list_threads(%opt, archived => 1);
         for my $trec (@$threads) {
             my $tname = $trec->{name};
-            my $ttasks = Almanac::Thread::tasks($tname, %opt);
+            # Per-thread isolation (pkg02 review S5): one thread whose task
+            # store cannot be read used to blank the whole report. Skip it,
+            # and name it, rather than hide every other thread's blocks.
+            my $ttasks = eval { Almanac::Thread::tasks($tname, %opt) };
+            unless (ref $ttasks eq 'ARRAY') {
+                push @unreadable, $tname;
+                next;
+            }
             for my $tk (@$ttasks) {
                 next if defined $tk->{link};
                 my $bo = $tk->{blocked_on};
@@ -442,6 +450,7 @@ sub blocked_tasks {
     $report->{reason}    = 'ok';
     $report->{tasks}      = \@tasks;
     $report->{dangling}   = \@dangling;
+    $report->{unreadable_threads} = \@unreadable if @unreadable;
     return $report;
 }
 
@@ -498,6 +507,7 @@ sub _print_traversal {
         }
         print "blocked_total: "  . scalar(@{ $report->{tasks} })    . "\n";
         print "dangling_total: " . scalar(@{ $report->{dangling} }) . "\n";
+        print "unreadable_thread: $_\n" for @{ $report->{unreadable_threads} || [] };
     } else {
         print "blocked_total: 0\n";
         print "dangling_total: 0\n";
@@ -518,6 +528,7 @@ sub _print_traversal_json {
         tasks_reason    => $report->{reason},
         blocked         => \@blocked,
     );
+    $out{unreadable_threads} = $report->{unreadable_threads} if $report->{unreadable_threads};
     print JSON::PP->new->canonical(1)->encode(\%out);
 }
 

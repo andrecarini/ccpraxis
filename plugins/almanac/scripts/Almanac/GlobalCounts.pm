@@ -75,7 +75,12 @@ sub compute {
                 my $thread_dir = "$root/.ccpraxis-local-data/almanac/thread";
                 if (-d $thread_dir) {
                     my $store = Almanac::Store->open(scope => 'project', type => 'thread', root => $root);
-                    my $list = $store->list();
+                    # Recovery-free read (pkg02 redteam S5): list() runs
+                    # recover(), a WRITE, so counting threads from project A
+                    # could roll back a journal in project B's store. A count
+                    # needs no recovery -- Store::list's own note: a record
+                    # is valid whichever of its two ranks it holds.
+                    my $list = $store->_list_records();
                     for my $rec (@$list) {
                         my $st = $rec->{fields}{state};
                         $n++ if defined $st && ($st eq 'live' || $st eq 'handed-off');
@@ -296,10 +301,13 @@ sub _recorded_roots {
     my ($path) = @_;
     return [] unless defined $path && -f $path;
     open(my $fh, '<:raw', $path) or return [];
-    local $/;
-    my $bytes = <$fh>;
+    # Bounded read (pkg02 redteam S5): this writer never produces more than
+    # 4096 bytes, so anything far larger is hand-grown and contributes no
+    # prior roots rather than an unbounded parse under the lock.
+    my $bytes = '';
+    my $n = read($fh, $bytes, 65537);
     close $fh;
-    return [] unless defined $bytes && length $bytes;
+    return [] unless defined $n && $n >= 1 && $n <= 65536;
     my $decoded = eval { JSON::PP->new->utf8->decode($bytes) };
     return [] unless ref($decoded) eq 'HASH';
     my $t = $decoded->{thread};
@@ -311,6 +319,25 @@ sub _recorded_roots {
     }
     return \@out;
 }
+
+# _root_key($p) -> the dedup key for a project root. Almanac::Store::
+# _canonical_path keeps the case it was given (Cwd::abs_path does on this
+# host), so on a case-insensitive filesystem "C:/Dev/x" and "c:/dev/x"
+# counted one project twice (pkg02 redteam S4). Fold case there.
+our $FOLD_CASE = ($^O =~ /\A(?:MSWin32|cygwin|msys)\z/) ? 1 : 0;
+sub _root_key {
+    my ($p) = @_;
+    my $c = Almanac::Store::_canonical_path($p);
+    return $c unless $FOLD_CASE && defined $c;
+    return lc $c;
+}
+
+# Upper bound on the roots one refresh visits (pkg02 redteam S5). refresh
+# runs synchronously, under the global-counts lock, on every host-side
+# thread write, and each root costs a -d plus a full thread-store list; an
+# unbounded registry (or a dead UNC path in it) made that cost unbounded.
+# Recorded roots (projects that actually had thread writes) are kept first.
+our $MAX_ROOTS = 256;
 
 # _registry_roots(%opt) -> \@roots -- every project path known to the
 # steward registry at <home>/.claude/claude-code-vault/.registry-local.json
@@ -376,19 +403,32 @@ sub refresh {
     my @recorded = @{ _recorded_roots($path) };
     if (defined $opt{record_root} && length $opt{record_root}) {
         my $rr = _byteify($opt{record_root});
-        my $rr_c = Almanac::Store::_canonical_path($rr);
-        @recorded = grep { Almanac::Store::_canonical_path($_) ne $rr_c } @recorded;
+        my $rr_c = _root_key($rr);
+        @recorded = grep { _root_key($_) ne $rr_c } @recorded;
         push @recorded, $rr;
     }
+    # Newest last; keep at most $MAX_ROOTS, dropping the oldest. Collapse
+    # case/spelling variants a pre-fix snapshot may already carry (keeping
+    # the newest spelling) before the -d probes, so each is paid once.
+    {
+        my (%kseen, @dedup);
+        for my $r (reverse @recorded) {
+            next if $kseen{ _root_key($r) }++;
+            unshift @dedup, $r;
+        }
+        @recorded = @dedup;
+    }
+    splice(@recorded, 0, @recorded - $MAX_ROOTS) if @recorded > $MAX_ROOTS;
     @recorded = grep { -d $_ } @recorded;
 
     my @registry = @{ _registry_roots(%opt) };
     my %seen;
     my @union;
     for my $r (@recorded, @registry) {
-        next unless -d $r;
-        my $c = Almanac::Store::_canonical_path($r);
+        last if @union >= $MAX_ROOTS;
+        my $c = _root_key($r);
         next if $seen{$c}++;
+        next unless -d $r;
         push @union, $r;
     }
 
@@ -405,14 +445,14 @@ sub refresh {
     # i.e. from the front of @recorded, since new entries are always
     # appended at the end by the dedup/push above), then the oldest
     # remaining entry of any kind, until the serialized snapshot fits.
-    my %is_registry = map { Almanac::Store::_canonical_path($_) => 1 } @registry;
+    my %is_registry = map { _root_key($_) => 1 } @registry;
     my $gen_at = _now_iso();
     my $bytes  = serialize($counts, $gen_at);
     while (length($bytes) > 4096 && @{ $counts->{thread}{projects} }) {
         my $projects = $counts->{thread}{projects};
         my $victim_idx;
         for my $i (0 .. $#$projects) {
-            if ($is_registry{ Almanac::Store::_canonical_path($projects->[$i]) }) {
+            if ($is_registry{ _root_key($projects->[$i]) }) {
                 $victim_idx = $i;
                 last;
             }

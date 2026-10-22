@@ -835,11 +835,18 @@ sub reattach {
                 my %set = (owner_kind => 'session', owner_id => $n, attached_at => _now_iso());
                 $set{owner_transcript} = _fold_bytes($tn) if defined $tn && length $tn;
                 my %expect = (rev => $trec->{rev}, fields => $trec->{fields});
-                $tstore->update($x_name, expect => \%expect, set => \%set);
-                $Almanac::Thread::WRITES++;
+                # Write-ahead (pkg03 redteam S5): reattach runs inside a
+                # time-boxed hook that can be killed. Logging AFTER the owner
+                # update left a window where ownership changed with no audit
+                # entry at all. Logged first, a kill in between leaves an
+                # entry whose change did not land -- visible (owner_id still
+                # disagrees with the log) and self-healing, since the next
+                # reattach finds the same dead owner and redoes it.
                 _append_log($x_name, 'taken-over', root => $opt{root}, home => $opt{home}, cwd => $opt{cwd},
                     session => $n, actor => 'session', from => "session:$p", to => "session:$n",
                     reason => "re-attached after $src");
+                $tstore->update($x_name, expect => \%expect, set => \%set);
+                $Almanac::Thread::WRITES++;
                 _archive_check($x_name, root => $opt{root}, home => $opt{home}, cwd => $opt{cwd});
                 $final = { result => 'attached', thread => $x_name, from => $p };
                 1;
@@ -979,6 +986,12 @@ sub check_health {
                 if ($r->{state} eq 'missing') {
                     push @findings, { kind => 'link_missing', thread => $name, task => $rec->{id},
                         link => $f->{link}, status => 'missing', path => $rec->{path} };
+                } elsif ($r->{state} eq 'invalid') {
+                    # A link the grammar rejects can never resolve, so it blocks
+                    # auto-archive forever; it used to be reported nowhere
+                    # (pkg02 review S6).
+                    push @findings, { kind => 'link_invalid', thread => $name, task => $rec->{id},
+                        link => $f->{link}, status => 'invalid', path => $rec->{path} };
                 } elsif ($r->{state} eq 'ok' && $r->{location} eq 'live' && $r->{status} eq 'parked') {
                     push @findings, { kind => 'link_parked', thread => $name, task => $rec->{id},
                         link => $f->{link}, status => 'parked', path => $rec->{path} };
@@ -1036,11 +1049,20 @@ sub _archive_check {
     return if $trec->{fields}{state} eq 'archived';
     return unless thread_is_done($name, %opt);
     my %expect = (rev => $trec->{rev}, fields => $trec->{fields});
-    eval {
+    my $archived = eval {
         $tstore->update($name, expect => \%expect, set => { state => 'archived', archived_at => _now_iso() });
         $Almanac::Thread::WRITES++;
-        _append_log($name, 'archived', %opt);
+        1;
     };
+    return unless $archived;   # lost a race or the store refused: nothing changed, nothing to log
+    # The log append is its own step (redteam N1): the archive above has
+    # already happened, so a failed append must not be swallowed together
+    # with it -- that would leave an archived thread whose log never says so,
+    # with no trace anywhere. Report it; the archive itself stands.
+    unless (eval { _append_log($name, 'archived', %opt); 1 }) {
+        my $why = _err_reason($@);
+        warn "almanac thread: $name archived, but its 'archived' log entry could not be written ($why)\n";
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -1128,8 +1150,9 @@ sub add_task {
             my $r = Almanac::PackageLink::resolve($opt{link}, root => $root);
             _refused('link_missing', $trec->{path}) unless $r->{state} eq 'ok';
             my $existing = $store->list();
+            my $want = Almanac::PackageLink::link_key($opt{link});
             for my $e (@$existing) {
-                if (defined $e->{fields}{link} && $e->{fields}{link} eq $opt{link}) {
+                if (defined $e->{fields}{link} && Almanac::PackageLink::link_key($e->{fields}{link}) eq $want) {
                     _refused('link_exists', $trec->{path});
                 }
             }
@@ -1403,17 +1426,17 @@ sub add_packages {
 
         my $store = _tasks_store($name, %opt);
         my $existing = $store->list();
-        my %have_links = map { (defined $_->{fields}{link} ? ($_->{fields}{link} => 1) : ()) } @$existing;
+        my %have_links = map { (defined $_->{fields}{link} ? (Almanac::PackageLink::link_key($_->{fields}{link}) => 1) : ()) } @$existing;
 
         my @added_tasks;
         for my $bp (@bps) {
             for my $pkg (@{ $pkg_cache{$bp}{ids} }) {
                 my $link = "$bp/$pkg";
-                next if $have_links{$link};
+                next if $have_links{ Almanac::PackageLink::link_key($link) };
                 my $rec = $store->insert_last(fields => { title => $link, created => _now_iso(), link => $link },
                     order => [qw(title created link)]);
                 $Almanac::Thread::WRITES++;
-                $have_links{$link} = 1;
+                $have_links{ Almanac::PackageLink::link_key($link) } = 1;
                 push @added_tasks, _task_hash($rec, %opt, _thread_name => $name);
             }
         }
@@ -1480,6 +1503,16 @@ sub record_event {
                 my $i = defined $trec->{fields}{owner_id}   ? $trec->{fields}{owner_id}   : '-';
                 _refused('not_owner', $trec->{path}, "$k:$i");
             }
+        }
+
+        # require_no_doing (pkg04 review S3): the same gate detach applies,
+        # taken here UNDER the thread lock. butler-continuity.pl's `off`
+        # checked for a doing task with no lock before calling this, so a
+        # task set doing in between was handed off mid-work. Opt-in, like
+        # require_owner_session: existing callers are unaffected.
+        if ($opt{require_no_doing}) {
+            my $doing = _doing_unlinked_tasks($name, %opt);
+            _refused('task_doing', $trec->{path}, join(',', @$doing)) if @$doing;
         }
 
         my %set;
@@ -1586,7 +1619,36 @@ sub _migrate_partition {
     my $ok = eval {
         my $store = _tasks_store($name, %opt);
         for my $rec (@$list) {
-            next if $store->exists($rec->{id});
+            if ($store->exists($rec->{id})) {
+                # An earlier run copied this record and then failed to delete
+                # the source (e.g. the CAS delete lost to a concurrent edit).
+                # The source is authoritative: every thread verb is refused
+                # (read-only ones only warn) while migration keeps failing,
+                # so the copy cannot have been edited since, while the source
+                # can. Bring the copy up to date before the delete below
+                # removes the source, rather than silently dropping the edit
+                # (pkg02 redteam N2).
+                my $cur = $store->read($rec->{id});
+                my (%set, @unset);
+                for my $k (qw(title created status blocked_on)) {
+                    my ($want, $have) = ($rec->{fields}{$k}, $cur->{fields}{$k});
+                    if (defined $want) {
+                        $set{$k} = $want unless defined $have && $have eq $want;
+                    } elsif (defined $have) {
+                        push @unset, $k;
+                    }
+                }
+                my $want_body = defined $rec->{body} ? $rec->{body} : '';
+                my $have_body = defined $cur->{body} ? $cur->{body} : '';
+                my $body_diff = ($want_body ne $have_body) ? 1 : 0;
+                if (%set || @unset || $body_diff) {
+                    my %expect = (rev => $cur->{rev}, fields => $cur->{fields});
+                    $store->update($rec->{id}, expect => \%expect, set => \%set, unset => \@unset,
+                        ($body_diff ? (body => $want_body) : ()));
+                    $Almanac::Thread::WRITES++;
+                }
+                next;
+            }
             my %fields = (title => $rec->{fields}{title}, created => $rec->{fields}{created},
                           status => $rec->{fields}{status});
             my @order = qw(title created status);
@@ -1687,6 +1749,28 @@ sub migrate_legacy {
                         _append_log('legacy-tasklist-open', 'handed-off',
                             root => $opt{root}, home => $opt{home}, cwd => $opt{cwd},
                             actor => 'migration', reason => 'migrated from the flat tasklist');
+                    }
+                    1;
+                };
+                my $e2 = $@; $lock2->release; die $e2 unless $ok2;
+            }
+            elsif ($trec->{fields}{state} eq 'archived') {
+                # Open tasks written to the flat tasklist AFTER an earlier
+                # migration (by a writer still on the flat-store library)
+                # were just copied into an archived thread, where no agent
+                # looks (pkg02 redteam N2). Hand the thread back out so they
+                # are seen; the archive check re-archives it once they close.
+                my $lock2 = _acquire_thread_lock('legacy-tasklist-open', %opt);
+                my $ok2 = eval {
+                    my $trec2 = $tstore->read('legacy-tasklist-open');
+                    if ($trec2->{fields}{state} eq 'archived') {
+                        my %expect = (rev => $trec2->{rev}, fields => $trec2->{fields});
+                        $tstore->update('legacy-tasklist-open', expect => \%expect,
+                            set => { state => 'handed-off' }, unset => ['archived_at']);
+                        $Almanac::Thread::WRITES++;
+                        _append_log('legacy-tasklist-open', 'handed-off',
+                            root => $opt{root}, home => $opt{home}, cwd => $opt{cwd},
+                            actor => 'migration', reason => 'late flat-tasklist tasks migrated into an archived thread');
                     }
                     1;
                 };

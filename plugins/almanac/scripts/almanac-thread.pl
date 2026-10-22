@@ -105,7 +105,10 @@ sub _print_task_result {
 
 sub _task_counts {
     my ($name, $o) = @_;
-    my $tasks = Almanac::Thread::tasks($name, root => $o->{root}, home => $o->{home});
+    # (undef, undef) when this thread's tasks cannot be read, so one bad
+    # thread does not fail `list` for all of them (pkg02 redteam S6).
+    my $tasks = eval { Almanac::Thread::tasks($name, root => $o->{root}, home => $o->{home}) };
+    return (undef, undef) unless ref $tasks eq 'ARRAY';
     my $done = 0;
     $done++ for grep { Almanac::Thread::is_done_task($_) } @$tasks;
     return ($done, scalar(@$tasks));
@@ -118,7 +121,7 @@ sub _print_list_default {
         print "thread: $h->{name}\n";
         print "  state: $h->{state}\n";
         print "  owner: $h->{owner_kind}:$h->{owner_id}\n";
-        print "  tasks: $done/$total\n";
+        print "  tasks: " . (defined $total ? "$done/$total" : 'unreadable') . "\n";
         print "  blueprints: " . (@{ $h->{blueprints} } ? join(',', @{ $h->{blueprints} }) : '-') . "\n";
     }
     print "total: " . scalar(@$list) . "\n";
@@ -406,7 +409,23 @@ unless (caller) {
             ($sess, $actor) = _resolve_session_and_actor(\%o);
         }
 
-        Almanac::Thread::migrate_legacy(root => $o{root}, home => $o{home});
+        # A failing legacy migration used to refuse EVERY verb, so one bad
+        # flat-tasklist record left the project with no thread CLI at all,
+        # not even a way to look (pkg02 redteam S3). The read-only verbs now
+        # carry on with the refusal (which names its cause) as a warning;
+        # every writing verb still refuses, so nothing is written on top of
+        # a half-migrated store.
+        if ($cmd eq 'list' || $cmd eq 'show') {
+            unless (eval { Almanac::Thread::migrate_legacy(root => $o{root}, home => $o{home}); 1 }) {
+                my $merr = $@;
+                my $cause = (ref $merr && defined $merr->{cause}) ? $merr->{cause}
+                          : (ref $merr && defined $merr->{kind})  ? $merr->{kind} : "$merr";
+                $cause =~ s/\s+\z//;
+                print STDERR "almanac thread: warning: legacy tasklist migration failed ($cause); showing threads as they are\n";
+            }
+        } else {
+            Almanac::Thread::migrate_legacy(root => $o{root}, home => $o{home});
+        }
 
         if ($cmd eq 'create') {
             my $name = shift @pos;
@@ -424,8 +443,18 @@ unless (caller) {
             my $all = Almanac::Thread::list_threads(root => $o{root}, home => $o{home}, archived => 1);
             for my $h (@$all) {
                 next if $h->{state} eq 'archived';
-                Almanac::Thread::archive_if_done($h->{name},
-                    root => $o{root}, home => $o{home}, session => $sess, actor => $actor);
+                # Per-thread isolation (pkg02 redteam S6): one thread whose
+                # tasks or linked ledgers cannot be read must not take `list`
+                # down for every other thread. Doctor reports the broken one.
+                unless (eval {
+                    Almanac::Thread::archive_if_done($h->{name},
+                        root => $o{root}, home => $o{home}, session => $sess, actor => $actor);
+                    1;
+                }) {
+                    my $aerr = $@;
+                    my $why = (ref $aerr && defined $aerr->{kind}) ? $aerr->{kind} : 'error';
+                    print STDERR "almanac thread: warning: could not check whether thread $h->{name} is done ($why); run almanac doctor\n";
+                }
             }
             my $list = Almanac::Thread::list_threads(
                 root => $o{root}, home => $o{home}, archived => ($o{archived} ? 1 : 0));
