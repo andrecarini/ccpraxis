@@ -110,6 +110,7 @@
       "command" : "perl \"$HOME/.claude/statusline.pl\"",
       "type" : "command"
    },
+   "syncClaudeAiSkills" : false,
    "timeFormat" : "24-hour",
    "tui" : "fullscreen",
    "worktree" : {

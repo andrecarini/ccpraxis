@@ -879,6 +879,11 @@ sub assert_baseline_preserved {
         'disableAgentView'                        => 1,
         'disableWorkflows'                        => 1,
         'env.CLAUDE_CODE_TICKLISH_WHISPER'        => 1,
+        # 2026-10-22 -- operator answer to inbox 20261001-004728
+        # (operator-ui-tweaks 03): stop syncing the skills enabled on
+        # claude.ai into Claude Code. Both surfaces: the sandbox signs in
+        # to the same account and would sync them just the same.
+        'syncClaudeAiSkills'                      => 1,
     );
     my @unexpected = grep {
         !exists $baseline_flat->{$_} && !$permitted_additions{$_}
