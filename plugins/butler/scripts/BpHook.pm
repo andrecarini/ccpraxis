@@ -1352,8 +1352,10 @@ sub _file_stop_bug_inner {
     if ($pid == 0) {
         open(STDIN, '<', File::Spec->devnull);
         open(STDERR, '>&STDOUT');
-        exec(@argv);
-        POSIX::_exit(126);
+        # "exec ... or" -- a separate statement after exec draws perl's
+        # "Statement unlikely to be reached" compile warning, which every
+        # hook loading this module would then print.
+        exec(@argv) or POSIX::_exit(126);
     }
 
     my $out = '';
