@@ -774,16 +774,20 @@ in order: (1) if `ext_seq` advanced since its last report, one coalesced line
 `<T> extended until <D>; added: <ids>` (or `; no new ids`); (2) for every id in `items` whose status
 (evidence below) is now `finished`, under the lock, one line each
 `<T> finished: <id>; still waiting on: <remaining ids>` (or `: nothing`), and those ids are removed
-from `items` (never from `held`) so `butler-continuity status` stops listing them; a quiet tick (no
+from `items` (never from `held`) so `butler-continuity status` stops listing them. An id that has
+read `unknown` (below) for QUIET, two ticks, is pruned the same way with the line
+`<T> dropped, nothing shows it running: <id>; still waiting on: ...`: a made-up id would otherwise
+let every stop through for the whole hold (todo 20261023-082209-24290000). A quiet tick (no
 extension, no finish) writes nothing, so the record file stays byte-identical. It exits when
 `items` is empty after pruning, or at the deadline, or when the record is gone (`off`) or carries
 another token (superseded), or on SIGTERM/SIGINT/SIGHUP.
 
 **Exit.** It prints `<T> released: <reason>` where `<reason>` is exactly one of `deadline reached`,
-`every held item finished`, `continuity is off`, `superseded by another holder`, `killed by a
+`every held item finished`, `every held item finished or was never seen` (when at least one
+id was dropped as unknown), `continuity is off`, `superseded by another holder`, `killed by a
 signal`, then one line per id of `held` (fallback `items`, for a record written before this field
-existed), in `held` order, and exits. On `deadline reached` or `every held item finished` it removes
-the record first. On `continuity is off` or `superseded by another holder` the record is already
+existed), in `held` order, and exits. On `deadline reached` or either `every held item ...` reason it
+removes the record first. On `continuity is off` or `superseded by another holder` the record is already
 gone or already someone else's. On SIGTERM/SIGINT/SIGHUP it exits 143 and leaves the record in
 place: the pid check makes the record dead for an interactive session, and a headless coordinator
 keeps the record it needs (see Headless coordinators). Item lines:
@@ -805,7 +809,8 @@ cached output file) changed within QUIET, two ticks (60 s). A crashed agent with
 held until the deadline, because a quiet file alone never makes an item finished. A **task** item keeps the plain rule: finished when the
 latest notification naming it has a terminal status. "Still running" carries the newest activity
 mtime; for a background task it is the mtime of its output file when that path appears in the
-transcript. An id that resolves to neither is `unknown`, and the command never fails on it. The scan
+transcript. An id that resolves to neither is `unknown`, and the command never fails on it; the running holder
+drops it after QUIET (above). The scan
 is linear: lines without the id are skipped, and each marker is checked by one anchored match.
 
 **Liveness at Stop**, `holder_live($sid, $p)`. Coordinator and non-coordinator sessions diverge here

@@ -73,7 +73,7 @@ Run these as plain Bash tool calls, arguments in single quotes.
   Call it once, when a turn ends with work running -- not after every dispatch and not for ids already held. The running holder prints its own
   line at each extension, each id finishing, and on release; the extending call's own foreground line only says it extended and exits.
   A denied stop prints a stop token; run the commands it prints with `--token <token>` exactly as printed. The holder counts only while one of
-  its ids is still running. On release it wakes the session and prints each id as `<id> finished`, `<id> still running (last activity <time>)`
+  its ids is still running; an id nothing shows running is dropped after a minute. On release it wakes the session and prints each id as `<id> finished`, `<id> still running (last activity <time>)`
   or `<id> unknown`. Act on that, then hold again only for ids still running.
 - **New session id:** after `/clear` or a carry-over, the session is unarmed — run `butler-continuity on --thread <name> --goal '<...>'` again
   (disarm with both steps before a `/clear`, or the old id still owns the thread). `--resume` keeps the arm.

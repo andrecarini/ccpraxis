@@ -598,11 +598,11 @@ sub coverage_failures {
             my $n = scalar @$body;
             push @f, "[C8] fenced block has $n lines (need 3-8)" if $n < 3 || $n > 8;
             my $joined = join("\n", @$body);
-            for my $req ('butler-hold', 'butler-continuity off --reason', 'butler-continuity silence --reason') {
+            for my $req ('butler-hold', 'butler-continuity off --reason', 'butler-continuity emergency-stop --reason') {
                 push @f, "[C8] H6 fenced block missing required text '$req'"
                     unless index($joined, $req) >= 0;
             }
-            for my $bad (qw(stop-ok bp-watch bp-continuity run-finished force-stop STOP_OK MAX_BLOCKS)) {
+            for my $bad (qw(stop-ok bp-watch bp-continuity run-finished force-stop STOP_OK MAX_BLOCKS silence)) {
                 push @f, "[C8] H6 fenced block contains forbidden text '$bad'"
                     if index($joined, $bad) >= 0;
             }
@@ -612,7 +612,7 @@ sub coverage_failures {
     # C9: H2 required substrings.
     if (defined $h2) {
         my $lc = lc $h2;
-        for my $sub ('payload', 'coordinator', 'driver', 'reporter', 'manual', 'fork', 'arm', 'holder', 'silence', '[ -f') {
+        for my $sub ('payload', 'coordinator', 'driver', 'reporter', 'manual', 'fork', 'arm', 'holder', 'disarm_otp', '[ -f') {
             push @f, "[C9] H2 missing required substring '$sub'" unless index($lc, lc $sub) >= 0;
         }
     }
@@ -843,8 +843,8 @@ reason: the stop registration folds into the same surviving guard as the file it
 The core parses the payload once. The payload's session_id decides the role: coordinator,
 driver, reporter or manual. A fork is a subagent dispatched for unrelated work; it must never
 inherit the driver's arm state. Each perl hook is registered guarded as
-`[ -f "$f" ] || exit 0; exec perl "$f"`, so a missing script never blocks. The holder and its
-silence token are read through this core (Decision 2, Decision 3, Decision 12, Decision 20,
+`[ -f "$f" ] || exit 0; exec perl "$f"`, so a missing script never blocks. The holder and the
+disarm_otp record are read through this core (Decision 2, Decision 3, Decision 12, Decision 20,
 Decision 33, Decision 46).
 
 ## Arm state storage and format
@@ -863,7 +863,7 @@ holder-reinvocation: replace
 
 ## Reason log
 
-Every off and silence reason is appended here (Decision 7).
+Every off and emergency-stop reason is appended here (Decision 7).
 
 reason-log: plugins/fixture/state/reason.log
 
@@ -874,7 +874,7 @@ The gate's denial is at most 8 lines (Decision 1, Decision 6, Decision 8):
 ```
 Run `butler-hold` first.
 Then `butler-continuity off --reason "<why>"`.
-Or `butler-continuity silence --reason "<why>"` for one turn.
+Or `butler-continuity emergency-stop --reason "<defect>"` for a real defect.
 ```
 
 ## Operator off versus agent off
@@ -1225,10 +1225,10 @@ sub has_failure_like {
     ok(has_failure_like(\@f1, '[C8]', 'need 3-8'), 'AC8: a 9+-line fenced block fails [C8]');
 
     my $m2 = mutate_doc($fx, sub {
-        delete_line($_[0], qr/^Or `butler-continuity silence --reason "<why>"` for one turn\.$/);
+        delete_line($_[0], qr/^Or `butler-continuity emergency-stop --reason "<defect>"` for a real defect.$/);
     });
     my @f2 = coverage_failures($m2);
-    ok(has_failure_like(\@f2, '[C8]', "'butler-continuity silence --reason'"), 'AC8: a block missing "silence --reason" fails [C8]');
+    ok(has_failure_like(\@f2, '[C8]', "'butler-continuity emergency-stop --reason'"), 'AC8: a block missing "emergency-stop --reason" fails [C8]');
 
     my $m3 = mutate_doc($fx, sub {
         replace_line($_[0],
@@ -1533,6 +1533,52 @@ sub has_failure_like {
     ok(scalar(@failures) == 0,
         'AC17: the real tree is green under coverage_failures (today\'s only allowed exception is the missing DOC)');
     diag($_) for @failures;
+}
+
+# ===========================================================================
+# AC-20 (blueprint where-things-go, package 10-gatherer-and-digest spec
+# sec 4): narrower, dedicated checks on top of AC17's whole-tree sweep above
+# -- every backticked repo path cited in the real hook-architecture.md
+# exists on disk, and the H9 "Guard message budgets and early exits" row for
+# session-start-nudge.sh (which package 10 edits the prose of, but must
+# leave numerically well-formed) still has a numeric N and a non-empty
+# early-exit condition.
+# ===========================================================================
+{
+    my $real_doc = "$ROOT/plugins/butler/docs/hook-architecture.md";
+    ok(-f $real_doc, 'AC-20 precondition: plugins/butler/docs/hook-architecture.md exists')
+        or BAIL_OUT('hook-architecture.md missing');
+    my $text = read_utf8($real_doc);
+    ok(defined $text, 'AC-20 precondition: hook-architecture.md is readable as UTF-8')
+        or BAIL_OUT('hook-architecture.md unreadable');
+
+    my %seen_token;
+    my @missing_backtick_paths;
+    while ($text =~ /`((?:plugins|skills|scripts)\/[^\s`<>*]+\.(?:sh|pl|pm|t|md|json))`/g) {
+        my $token = $1;
+        next if $seen_token{$token}++;
+        push @missing_backtick_paths, $token unless -e "$ROOT/$token";
+    }
+    is(scalar(@missing_backtick_paths), 0,
+        'AC-20: every backticked repo path in the real hook-architecture.md exists on disk')
+        or diag(join("\n", @missing_backtick_paths));
+
+    my $h9 = extract_section($text, 'Guard message budgets and early exits');
+    ok(defined $h9, 'AC-20 precondition: the "Guard message budgets and early exits" (H9) section exists')
+        or BAIL_OUT('H9 section missing from hook-architecture.md');
+    SKIP: {
+        skip 'AC-20: H9 section missing, cannot find its session-start-nudge.sh row', 2 unless defined $h9;
+        my ($row) = grep { $_->[0] eq 'session-start-nudge.sh' } parse_pipe_rows($h9, 3);
+        ok(defined $row, 'AC-20: the H9 row for session-start-nudge.sh is present')
+            or diag('no H9 row named session-start-nudge.sh');
+        SKIP: {
+            skip 'AC-20: no session-start-nudge.sh H9 row to check the shape of', 1 unless defined $row;
+            my (undef, $n, $cond) = @$row;
+            ok($n =~ /^\d+$/ && length(trim($cond // '')),
+                "AC-20: the session-start-nudge.sh H9 row keeps a numeric N ('$n') and a non-empty condition")
+                or diag("N='" . ($n // '') . "' condition='" . ($cond // '') . "'");
+        }
+    }
 }
 
 done_testing();
