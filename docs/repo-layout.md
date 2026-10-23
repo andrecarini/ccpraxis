@@ -54,7 +54,7 @@ ccpraxis/
 │   │   ├── scripts/                                             # Implementation scripts
 │   │   │   ├── Almanac/
 │   │   │   │   ├── ClaudeMdBlock.pm                             # Renders the note directory as a hashed block between markers and detects hand-edits and conflicts
-│   │   │   │   ├── Gather.pm                                    # Gathers threads, inbox, todos, bugs, blueprints, fleet runs, notes and commits for one project or every registered project, and renders the SessionStart digest text
+│   │   │   │   ├── Gather.pm                                    # Gathers threads, inbox, todos, bugs, blueprints, runs, notes and commits; renders the SessionStart digest
 │   │   │   │   ├── GlobalCounts.pm                              # Recounts global todos and notes after each global mutation into one read-only-mounted counts file
 │   │   │   │   ├── LegacyQueue.pm                               # Absorbs a legacy subagent-guard question queue into project inbox items, then renames it
 │   │   │   │   ├── Lock.pm                                      # Bounded exclusive flock on a sidecar <file>.lock, polled to a deadline; never unlinks a lock file
