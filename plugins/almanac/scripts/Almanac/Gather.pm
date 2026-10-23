@@ -7,6 +7,8 @@ package Almanac::Gather;
 # parked-reason reader documented inline below (a deliberate, narrow
 # deviation from calling BpState::blueprint_lifecycle/bp_meta_get
 # literally -- see _authored_frontmatter_value's header comment).
+# Package 11-sitrep-commands (additive only) added a `severity` field on bug
+# entries plus the global_todos() and thread_log_since() functions below.
 use strict;
 use warnings;
 use Cwd ();
@@ -433,6 +435,7 @@ sub _section_bugs {
         push @{ $by_state{$st} }, {
             id => $rep->{fields}{id}, title => $rep->{fields}{title},
             filed => $rep->{fields}{created_at}, closed => $closed,
+            severity => $rep->{fields}{severity},
         };
     }
     return { by_state => \%by_state, tampered => \@tampered, unreadable => $unreadable };
@@ -1025,6 +1028,77 @@ sub digest {
     # byte, corrupting the output).
     utf8::encode($text) if utf8::is_utf8($text);
     return $text;
+}
+
+# ---------------------------------------------------------------------------
+# package 11-sitrep-commands additions (additive only -- see header comment).
+# ---------------------------------------------------------------------------
+
+# global_todos(%opt) -> \%result (spec 11, sec 2.4 G2).
+# %opt: surface (host|container, passed to Almanac::Store->open), home
+# (passed likewise). Read-only: forces the global scope's writable policy
+# off for the call so list() never runs recovery (Store.pm:930). Never dies.
+sub global_todos {
+    my (%opt) = @_;
+    local $Almanac::Store::SCOPE_POLICY{host}{global}{writable}      = 0;
+    local $Almanac::Store::SCOPE_POLICY{container}{global}{writable} = 0;
+
+    my $store = eval {
+        Almanac::Store->open(scope => 'global', type => 'todo',
+            surface => $opt{surface}, home => $opt{home});
+    };
+    if (my $err = $@) {
+        if (ref($err) && eval { $err->isa('Almanac::Store::Error') } && ($err->{kind} // '') eq 'scope_unavailable') {
+            return { available => 0, reason => $err->{reason}, items => [] };
+        }
+        return { available => 0, reason => _errstr($err), items => [] };
+    }
+
+    my $list = eval { $store->list };
+    if (my $err = $@) {
+        if (ref($err) && eval { $err->isa('Almanac::Store::Error') } && ($err->{kind} // '') eq 'scope_unavailable') {
+            return { available => 0, reason => $err->{reason}, items => [] };
+        }
+        return { available => 0, reason => _errstr($err), items => [] };
+    }
+
+    my @out;
+    for my $rec (@$list) {
+        my $f = $rec->{fields};
+        next unless defined($f->{status}) && $f->{status} eq 'open';
+        push @out, { id => $rec->{id}, title => $f->{title}, tags => $f->{tags}, created => $f->{created} };
+    }
+    @out = sort { (($a->{created} // '') cmp ($b->{created} // '')) || ($a->{id} cmp $b->{id}) } @out;
+    return { available => 1, reason => undef, items => \@out };
+}
+
+# thread_log_since(%opt) -> \@entries (spec 11, sec 2.4 G3).
+# %opt: root (required, existing directory), since (required,
+# YYYY-MM-DDTHH:MM:SSZ). Missing/invalid either -> dies with a usage error.
+# Read-only.
+sub thread_log_since {
+    my (%opt) = @_;
+    _usage('missing_root') unless defined($opt{root}) && length($opt{root}) && -d _fs_bytes($opt{root});
+    _usage('missing_since') unless defined($opt{since}) && $opt{since} =~ /\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\z/;
+
+    my $root  = _fs_bytes($opt{root});
+    my $since = $opt{since};
+    my $list  = Almanac::Thread::list_threads(root => $root, archived => 1);
+    my @out;
+    for my $h (@$list) {
+        my $log = Almanac::Thread::log_entries($h->{name}, root => $root);
+        for my $e (@$log) {
+            next unless defined $e->{at};
+            next unless $e->{at} gt $since;
+            push @out, {
+                thread => $h->{name}, id => $e->{id}, at => $e->{at}, session => $e->{session},
+                actor => $e->{actor}, event => $e->{event}, task => $e->{task},
+                from => $e->{from}, to => $e->{to}, reason => $e->{reason},
+            };
+        }
+    }
+    @out = sort { ($a->{at} cmp $b->{at}) || ($a->{thread} cmp $b->{thread}) || ($a->{id} cmp $b->{id}) } @out;
+    return \@out;
 }
 
 1;
