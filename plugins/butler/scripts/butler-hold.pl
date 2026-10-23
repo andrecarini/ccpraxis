@@ -367,6 +367,39 @@ sub resolve_output_path_in_tail {
 # resolution hides it.
 my %SEEN;
 
+# An id that stays `unknown` is pruned like a finished one, after QUIET:
+# nothing the transcript, the subagent dir or an output file shows stands
+# behind it, so holding it would let every stop through for the full hold on
+# a name alone (red-team SF-2, judged-continuity-disarm/05, todo
+# 20261023-082209-24290000). QUIET is the grace for a just-dispatched id whose
+# evidence has not reached disk yet. Pruning one only wakes the session early.
+my %UNKNOWN_SINCE;
+
+# item_gone($record, $id, $tail) -> 'finished' | 'unseen' | undef.
+sub item_gone {
+    my ($record, $id, $tail) = @_;
+    my $st = item_status($record, $id, $tail, \%SEEN)->{status};
+    if ($st ne 'unknown') {
+        delete $UNKNOWN_SINCE{$id};
+        return $st eq 'finished' ? 'finished' : undef;
+    }
+    my $grace = unseen_grace_seconds();
+    return undef unless defined $grace;
+    my $now = time();
+    $UNKNOWN_SINCE{$id} //= $now;
+    return ($now - $UNKNOWN_SINCE{$id} >= $grace) ? 'unseen' : undef;
+}
+
+# unseen_grace_seconds() -> QUIET, or in test mode BUTLER_HOLD_TEST_UNSEEN_GRACE
+# (undef when unset). Most holder fixtures hold bare made-up ids to exercise
+# other behaviour, so test mode opts in to the prune rather than out of it.
+sub unseen_grace_seconds {
+    return 2 * tick_seconds() unless _test_mode_enabled();
+    my $v = $ENV{BUTLER_HOLD_TEST_UNSEEN_GRACE};
+    return undef unless defined $v && $v =~ /^[0-9]+(?:\.[0-9]+)?$/;
+    return $v + 0;
+}
+
 # item_status($record, $id, $tail, $seen) -> {status=>'finished'|'running'|'unknown', mtime=>epoch?}
 #
 # A subagent item (subagents/agent-<id>.jsonl or .meta.json exists) is
@@ -937,6 +970,7 @@ my $last_valid = $rec;
 # so this starts at 0); @last_items is items as of the last read or write.
 my $last_seq = $rec->{ext_seq} // 0;
 my @last_items = @{ (ref $rec->{items} eq 'ARRAY') ? $rec->{items} : [] };
+my $dropped_unseen = 0;
 
 # never-halt package 06: the in-memory byte offset into $PROMPTS, seeded
 # from this BECOME's own prompts_offset (undef/OFF -> 0; never read before
@@ -1099,7 +1133,7 @@ while (1) {
     my $t1 = time();
     my $items_ref = (ref $rp->{items} eq 'ARRAY') ? $rp->{items} : [];
     my $tail = read_tail($rp->{transcript_path});
-    my @finished_ids = grep { item_status($rp, $_, $tail, \%SEEN)->{status} eq 'finished' } @$items_ref;
+    my @finished_ids = grep { defined item_gone($rp, $_, $tail) } @$items_ref;
     my $deadline_due = ($t1 >= $rp->{deadline});
 
     next unless @finished_ids || $deadline_due || !@$items_ref;
@@ -1139,21 +1173,28 @@ while (1) {
 
     my $items2 = (ref $rp2->{items} eq 'ARRAY') ? $rp2->{items} : [];
     my $tail2 = read_tail($rp2->{transcript_path});
-    my @finished2 = grep { item_status($rp2, $_, $tail2, \%SEEN)->{status} eq 'finished' } @$items2;
+    my %gone2;
+    for my $id (@$items2) {
+        my $g = item_gone($rp2, $id, $tail2);
+        $gone2{$id} = $g if defined $g;
+    }
+    my @finished2 = grep { exists $gone2{$_} } @$items2;
 
     my $prune_write_failed = 0;
     if (@finished2) {
-        my %fin = map { $_ => 1 } @finished2;
-        my @remaining = grep { !$fin{$_} } @$items2;
+        my @remaining = grep { !exists $gone2{$_} } @$items2;
         my $rec2 = { %$rp2 };
         $rec2->{items} = \@remaining;
         my $ok = write_record_atomic($RECORD_PATH, $rec2);
         if ($ok) {
             my $waiting_str = @remaining ? join(', ', @remaining) : 'nothing';
             for my $fid (@finished2) {
-                out_line(sprintf('%s finished: %s; still waiting on: %s',
-                    BpHook::local_utc_hhmm(int(time())), $fid, $waiting_str));
+                my $what = $gone2{$fid} eq 'finished' ? 'finished'
+                         : 'dropped, nothing shows it running';
+                out_line(sprintf('%s %s: %s; still waiting on: %s',
+                    BpHook::local_utc_hhmm(int(time())), $what, $fid, $waiting_str));
             }
+            $dropped_unseen = 1 if grep { $_ eq q{unseen} } values %gone2;
             @last_items = @remaining;
             $last_valid = $rec2;
             $items2 = \@remaining;
@@ -1176,7 +1217,8 @@ while (1) {
     if ($now_empty) {
         unlink($RECORD_PATH);
         unlock_and_close($lfh2);
-        end_report('every held item finished', $last_valid, 0);
+        end_report($dropped_unseen ? 'every held item finished or was never seen' : 'every held item finished',
+                   $last_valid, 0);
     }
     elsif ($deadline_now) {
         unlink($RECORD_PATH);
