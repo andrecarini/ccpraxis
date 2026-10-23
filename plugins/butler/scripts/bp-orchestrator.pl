@@ -6181,8 +6181,21 @@ sub run {
                 $ckpt{$pkg} = { at => $now, snap => $cur };
 
                 my $st_str = $status->{$pkg} // '';
+                # A package's test_paths are its own work too (the oracle its
+                # harvest judges). Staging only write_set left every test file
+                # of judged-continuity-disarm 01-06 and where-things-go/14
+                # uncommitted after both blueprints finished.
+                # Appended raw, minus entries write_set already names, so a
+                # ledger with no extra test paths passes write_set unchanged.
+                my $ckpt_paths = $meta->{$pkg}{write_set} // '';
+                {
+                    my %in_ws = map { s/\A\s+|\s+\z//gr => 1 } split /:/, $ckpt_paths;
+                    my @extra = grep { length && !$in_ws{$_} }
+                                map { s/\A\s+|\s+\z//gr } split /:/, (ledger_fm($bpdir, $pkg, 'test_paths') // '');
+                    $ckpt_paths = join(':', grep { length } $ckpt_paths, @extra) if @extra;
+                }
                 my $res = eval { $checkpoint->({ pkg => $pkg, trigger => $trigger,
-                    write_set => ($meta->{$pkg}{write_set} // ''), status => $st_str,
+                    write_set => $ckpt_paths, status => $st_str,
                     step => $cur->{checkboxes}, now => $now }) };
                 my $ex = $@;
                 # Both _log calls are eval-wrapped (mirroring :629-634): BpLog::event

@@ -700,6 +700,21 @@ my $WS_RAW   = 'src/live/:docs/live.md';        # a RAW ledger string, colon and
     is(hv($c, 'step'),      2,             'AC-18 args carry step = the ticked-checkbox count');
     is(hv($c, 'now'),       $NOW + 100,    'AC-18 args carry now = the injected clock for that tick');
 
+    # test_paths the write set does not already name ride along: a package's
+    # oracle is its work too, and staging write_set alone left every test file
+    # of two finished blueprints uncommitted (2026-10-23).
+    my $dir3 = mk_bp([['livep', '-', 'in-progress', $WS_RAW, 2]], $LIVE_REG);
+    {
+        my $lp = "$dir3/packages/livep.md";
+        open my $in, '<', $lp or die "$lp: $!"; local $/; my $txt = <$in>; close $in;
+        $txt =~ s{^test_paths: .*$}{test_paths: t/live.t:docs/live.md}m or die 'no test_paths line';
+        spit($lp, $txt);
+    }
+    my $r3 = drive(dir => $dir3, stop => 2, step => 100, tunables => tun($dir3, ckpt_int => 5),
+                   on_tick => sub { grow_jsonl($_[0], 'livep', $_[2]) });
+    is(hv($r3->{calls}[0] || {}, 'write_set'), "$WS_RAW:t/live.t",
+       'AC-18 test_paths not already in write_set are appended to the checkpoint paths, once');
+
     # ... and a run whose ticks all stay below seed + ckpt_int commits nothing,
     # even though the coordinator's jsonl keeps growing (jsonl_size is NOT a trigger).
     my $dir2 = mk_bp([['livep', '-', 'in-progress', $WS_RAW, 2]], $LIVE_REG);
