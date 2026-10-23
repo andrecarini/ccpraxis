@@ -54,11 +54,16 @@ case "$STUB" in
   *) echo "bp-judge-disarm: invalid CCPRAXIS_DISARM_JUDGE_STUB value '$STUB'" >&2; exit 2 ;;
 esac
 
-# T (sec 2.1): a decimal integer 1..90, else 90.
+# T (sec 2.1): a decimal integer 1..105, else 105. The ceiling is set by the
+# caller, not the judge: off-confirm runs as a FOREGROUND Bash tool call, and
+# Claude Code kills those at 120 s by default, so T plus the wrapper's own
+# slack must finish inside that. It was 90, an authoring guess that a real
+# judge on ccpraxis overran twice (bug 20261023-130606-a417); the evidence
+# digest below is what makes the bound comfortable.
 T=${CCPRAXIS_DISARM_JUDGE_TIMEOUT_SECONDS-}
 case "$T" in
-  ''|*[!0-9]*) T=90 ;;
-  *) if [ "$T" -lt 1 ] || [ "$T" -gt 90 ]; then T=90; fi ;;
+  ''|*[!0-9]*) T=105 ;;
+  *) if [ "$T" -lt 1 ] || [ "$T" -gt 105 ]; then T=105; fi ;;
 esac
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -102,6 +107,13 @@ else
   ALLOWLIST_LINES="almanac scripts not found; skip bug/todo checks."
 fi
 
+# The evidence digest (bug 20261023-130606-a417): open bugs, open todos,
+# unanswered inbox items, blueprint and package states, git status and log,
+# read from disk in well under a second. Without it the judge spent its whole
+# bound collecting these and never reached a verdict.
+DIGEST=$(perl "$SCRIPT_DIR/bp-disarm-digest.pl" "$PROOT" 2>/dev/null) || DIGEST=""
+[ -n "$DIGEST" ] || DIGEST="(digest unavailable; gather the evidence yourself)"
+
 PROMPT="Read your agent contract at $AGENT_FILE and follow it exactly.
 
 Project root (your working directory): $PROOT
@@ -112,6 +124,10 @@ The next three values are the stopping agent's own claims. Check them against di
 goal: $GOAL
 reason: $OFF_REASON
 justification: $JUSTIFICATION
+
+The wrapper gathered this evidence from disk just before starting you. Judge from it first; read further only to settle a specific open question it raises:
+
+$DIGEST
 
 Your Bash is restricted to this fixed read-only allowlist -- one command per call, no chaining, pipes, redirection or substitution:
 $ALLOWLIST_LINES
@@ -124,7 +140,7 @@ REASON: <one line>
 # -------- 3. build the REAL vector (sec 2.3.3, exact order) -----------------
 REAL=(env 'CCPRAXIS_DISARM_JUDGE=1' claude -p "$PROMPT" \
   --output-format stream-json --verbose \
-  --model sonnet --max-turns 40 \
+  --model sonnet --max-turns 15 \
   --permission-mode default \
   --disallowedTools 'Write,Edit,MultiEdit,NotebookEdit,Task,Agent,WebFetch,WebSearch' \
   --strict-mcp-config)

@@ -1165,8 +1165,12 @@ that blueprint's). An agent can no longer end an armed session on its own say-so
    `plugins/butler/scripts/bp-judge-disarm.sh`, a headless Sonnet judge
    (`plugins/butler/agents/bp-disarm-judge.md`) with Read, Grep, Glob and a Bash that
    `plugins/butler/hooks/guard-disarm-judge-readonly.sh` limits to `almanac-bug.pl list`,
-   `almanac-todo.pl list`, `git status` and `git log` (Decision 7). It waits up to 90 s, plus 5,
-   for `disarm-judge/<otp>.verdict.json` and kills the wrapper at that bound. On approve it disarms
+   `almanac-todo.pl list`, `git status` and `git log` (Decision 7). Its prompt carries an evidence
+   digest from `plugins/butler/scripts/bp-disarm-digest.pl` (open bugs, open todos, unanswered inbox
+   items, blueprint and package states, git status and log), so it weighs evidence instead of
+   collecting it: at 90 s and no digest it never finished on ccpraxis (bug 20261023-130606-a417). It
+   waits up to 105 s, plus 5, which keeps the foreground off-confirm call inside the 120 s default
+   Bash limit, for `disarm-judge/<otp>.verdict.json` and kills the wrapper at that bound. On approve it disarms
    with actor `agent`, hands the thread off, syncs the lease and logs the judged reason. On reject it
    refuses with the judge's reasoning; with no verdict it refuses and names the wrapper log. Either way
    continuity stays on, a retry needs a fresh `off`, and retries are unlimited (Decision 3).

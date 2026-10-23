@@ -1042,8 +1042,11 @@ sub _judge_disarm {
     # T (sec 2.1): same validation as the wrapper applies to its own copy of
     # this var, so the two processes always agree.
     my $traw = $ENV{CCPRAXIS_DISARM_JUDGE_TIMEOUT_SECONDS};
-    my $T = 90;
-    if (defined $traw && $traw =~ /^[0-9]+$/ && $traw >= 1 && $traw <= 90) {
+    # 105, not more: off-confirm is a foreground Bash tool call, which Claude
+    # Code kills at 120 s by default, and the wait below adds 5 s of slack
+    # (bug 20261023-130606-a417 for why it is no longer 90).
+    my $T = 105;
+    if (defined $traw && $traw =~ /^[0-9]+$/ && $traw >= 1 && $traw <= 105) {
         $T = $traw + 0;
     }
 
