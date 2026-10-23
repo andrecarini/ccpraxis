@@ -1026,8 +1026,29 @@ sub claim_check {
     ($t, $ledger) = $grown_from->(['a', 'b'], ['a', 'renamed b']);
     ($rc, $out, $err) = run_pl(['tick-step', '--ledger', $ledger, '--step', '5']);
     is($rc, 0, 'shrink notice: tick-step 5 still succeeds on a shrunk oracle');
-    like($err, qr/oracle SHRANK since step 3.*1 description\(s\) gone.*a reaccept does not clear a shrink/s,
-        'shrink notice: a renamed description is reported as a shrink no reaccept clears');
+    like($err, qr/oracle SHRANK since step 3.*1 description\(s\) gone: b\b.*--reaccept-oracle/s,
+        'shrink notice: a renamed description is reported as a shrink, naming it and the reaccept that settles it');
+
+    # Operator ruling 2026-10-23: a reaccept that names the vanished description
+    # settles the shrink.
+    run_pl(['set-status', '--ledger', $ledger, '--status', 'done']);
+    my (undef, undef, undef, $r_before) = claim_check($ledger);
+    ok(scalar(grep { ($_->{code} // '') eq 'ORACLE_SHRANK' } @{ $r_before->{findings} || [] }),
+        'shrink settle: control -- the unaccepted rename gates as ORACLE_SHRANK');
+    ($rc, $out, $err) = run_pl(['tick-step', '--ledger', $ledger, '--step', '5',
+                                '--reaccept-oracle', fwd($t), '--reaccept-reason', 'b renamed to "renamed b"']);
+    is($rc, 0, 'shrink settle: the reaccept re-tick succeeds');
+    my (undef, undef, undef, $r_after) = claim_check($ledger);
+    ok(!grep({ ($_->{code} // '') =~ /^ORACLE_/ } @{ $r_after->{findings} || [] }),
+        'shrink settle: a reaccept naming the vanished description clears the shrink');
+
+    # A removal the reaccept did not see still gates: reaccept, then lose another
+    # description and re-record step 5 without a new reaccept.
+    $replace->($t, gen_tap_fixture(['renamed b']));
+    run_pl(['tick-step', '--ledger', $ledger, '--step', '5']);
+    my (undef, undef, undef, $r_late) = claim_check($ledger);
+    ok(scalar(grep { ($_->{code} // '') eq 'ORACLE_SHRANK' } @{ $r_late->{findings} || [] }),
+        'shrink settle: a later removal the reaccept did not name still gates');
 
     ($t, $ledger) = $grown_from->(['a', 'b'], ['a', 'b']);
     ($rc, $out, $err) = run_pl(['tick-step', '--ledger', $ledger, '--step', '5']);

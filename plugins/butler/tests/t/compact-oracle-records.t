@@ -549,8 +549,11 @@ my $AC2_LEDGER;
 }
 
 # =====================================================================================
-# AC-5: same as AC-4b but SHRUNK (an assertion removed) -- ORACLE_SHRANK still fires despite
-# the reaccept (Decision 6(3)).
+# AC-5: same as AC-4b but SHRUNK (an assertion removed). Decision 6(3) had ORACLE_SHRANK fire
+# despite any reaccept; the operator overruled that on 2026-10-23 (renamed and replaced
+# descriptions gated packages forever). A reaccept recorded against this exact state names
+# the vanished descriptions and the new count in its delta, so it now settles the shrink;
+# completion-claim-integrity.t covers a removal the reaccept did NOT see still gating.
 # =====================================================================================
 {
     my $t = gen_tap_fixture(['ac5 one', 'ac5 two', 'ac5 three']);
@@ -566,7 +569,9 @@ my $AC2_LEDGER;
     my (undef, undef, undef, $report) = claim_check($ledger);
     ok($report, 'AC-5: claim-check produced a decodable report');
     my ($f) = $report ? grep { $_->{code} eq 'ORACLE_SHRANK' } @{ $report->{findings} || [] } : ();
-    ok($f, 'AC-5: ORACLE_SHRANK still fires for a shrunk step-5 record even carrying a reaccept');
+    ok(!$f, 'AC-5: a reaccept recorded against the shrunk state settles ORACLE_SHRANK (operator ruling 2026-10-23)');
+    my ($pentry) = $report ? grep { ($_->{path} // '') eq $seg } @{ $report->{oracle}{paths} || [] } : ();
+    is($pentry && $pentry->{verdict}, 'reaccepted', 'AC-5: and the path verdict is "reaccepted"');
 }
 
 # =====================================================================================

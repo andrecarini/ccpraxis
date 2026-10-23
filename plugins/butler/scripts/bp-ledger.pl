@@ -1890,6 +1890,31 @@ sub op_tick_step {
     });
 }
 
+# _reaccept_covers_shrink($r5, $delta, $comparable) -> 0|1. A shrink is
+# settled only by a step-5 reaccept, with a reason, whose OWN recorded delta
+# names every description that vanished (so the reaccept was made knowing
+# exactly what went) and, when the assertion count fell, recorded that same
+# resulting count. A shrink the reaccept did not see -- a later removal, or
+# a reaccept recorded against a different state -- still gates.
+sub _reaccept_covers_shrink {
+    my ($r5, $delta, $comparable) = @_;
+    return 0 unless ref $r5 eq 'HASH' && ref $r5->{reaccept} eq 'HASH';
+    my $ra = $r5->{reaccept};
+    return 0 unless defined $ra->{reason} && $ra->{reason} =~ /\S/;
+    my $rd = ref $ra->{delta} eq 'HASH' ? $ra->{delta} : {};
+    if ($comparable) {
+        my %named = map { $_ => 1 } @{ ref $rd->{descriptions_removed} eq 'ARRAY' ? $rd->{descriptions_removed} : [] };
+        for my $gone (@{ ref $delta->{descriptions_removed} eq 'ARRAY' ? $delta->{descriptions_removed} : [] }) {
+            return 0 unless $named{$gone};
+        }
+    }
+    if (defined $delta->{assertions_after} && defined $delta->{assertions_before}
+        && $delta->{assertions_after} < $delta->{assertions_before}) {
+        return 0 unless defined $rd->{assertions_after} && $rd->{assertions_after} == $delta->{assertions_after};
+    }
+    return 1;
+}
+
 # _oracle_change_notice($path, $step3, $identity) -> $text | undef. Mirrors
 # claim-check's own classification (op_claim_check): a vanished description
 # or fewer assertions is a shrink, which no reaccept clears; any other
@@ -1906,9 +1931,9 @@ sub _oracle_change_notice {
     my $a5 = $id->{assertions} // 0;
     if ($a5 < $a3 || @removed) {
         return "$path: the oracle SHRANK since step 3 (assertions $a3 -> $a5, "
-             . scalar(@removed) . " description(s) gone). claim-check will gate this package and a reaccept "
-             . "does not clear a shrink: restore the vanished assertions (a renamed description counts as "
-             . "vanished), then tick step 5 again.";
+             . scalar(@removed) . " description(s) gone: " . join('; ', @removed) . "). claim-check will gate "
+             . "this package unless you restore them or, if the removal is intended (a rename or a replaced "
+             . "check), tick step 5 again with --reaccept-oracle $path --reaccept-reason '<why each went>'.";
     }
     my $desc_changed = $comparable ? scalar(@added) : (($r3->{descriptions_sha256} // '') ne ($id->{descriptions_sha256} // ''));
     my $changed = $desc_changed || $a3 != $a5 || (($r3->{sha256} // '') ne ($id->{sha256} // ''));
@@ -2698,10 +2723,20 @@ sub op_claim_check {
                 my $shrank = ($r5->{assertions} < $r3->{assertions})
                           || ($comparable && scalar(@{ $delta->{descriptions_removed} }) > 0);
 
-                if ($shrank) {
+                if ($shrank && _reaccept_covers_shrink($r5, $delta, $comparable)) {
+                    # Operator ruling 2026-10-23: a reaccept that NAMES every
+                    # vanished description (and, for a lower count, recorded
+                    # that same count) settles the shrink. Before this, no
+                    # reaccept could clear one, so a renamed or replaced
+                    # description gated its package forever and relaunches
+                    # looped (judged-continuity-disarm/06).
+                    $verdict = 'reaccepted';
+                }
+                elsif ($shrank) {
                     $verdict = 'shrunk';
                     push @findings, { code => 'ORACLE_SHRANK', path => $path, step => undef, delta => $delta,
-                        detail => sprintf('%s: assertions %d -> %d (or a description vanished)',
+                        detail => sprintf('%s: assertions %d -> %d (or a description vanished); a step-5 '
+                                        . 'reaccept naming the vanished descriptions settles it',
                                            $path, $r3->{assertions}, $r5->{assertions}) };
                 }
                 elsif (!$identical) {
