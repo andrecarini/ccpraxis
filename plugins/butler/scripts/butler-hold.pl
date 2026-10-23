@@ -778,6 +778,13 @@ if ($DEFERRED_TOKEN_CHECK && ($is_alive || $BACKGROUND)) {
 
 if ($is_alive) {
     # -------------------------------------------------------------- EXTEND
+    # Red-team H1, extend half: the extending call is a different process, so
+    # its own stdout says nothing about the running holder's task id. The
+    # holder records that id at become; an extend naming it would hold the
+    # holder on itself until the deadline.
+    if (defined $existing->{self_task} && grep { $_ eq $existing->{self_task} } @ITEMS) {
+        refuse('a holder cannot hold itself.');
+    }
     my @merged = @{ (ref $existing->{items} eq 'ARRAY') ? $existing->{items} : [] };
     my %have = map { $_ => 1 } @merged;
     my @new_ids;
@@ -829,6 +836,7 @@ if ($is_alive) {
         deadline        => $new_deadline,
         transcript_path => $tp,
     };
+    $rec->{self_task} = $existing->{self_task} if defined $existing->{self_task};
 
     # never-halt package 06, Decision 11 (10): re-base the extending
     # process's prompts_offset to its OWN watching state at the moment of
@@ -906,6 +914,7 @@ my $rec = {
     deadline        => $now + $HOLD,
     transcript_path => $tp,
 };
+$rec->{self_task} = $SELF_TASK_ID if defined $SELF_TASK_ID;
 $rec->{prompts_offset} = $prompt_off if $WATCHING;
 
 BpHook::log_reason($SID, 'butler-hold', 'hold', join(', ', @ITEMS));
