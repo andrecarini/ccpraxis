@@ -32,6 +32,10 @@ require "$Bin/BpContinuityLease.pm"
 
 my $USAGE = q{usage: butler-continuity on --new-thread <name> | on --thread <name> [--role driver] --goal '<what this session is for>' | on --role reporter [--goal '<...>'] | off [--reason '<why>'] [--token T] | off-confirm --otp <otp> --justification '<2+ words>' | emergency-stop --reason '<why>' [--area <area>] (only for a genuine defect in ccpraxis, Claude Code or another system that leaves no choice but to stop; never for finished work; files a bug report) | status};
 
+# Shared by the Decision-9 silence refusal below and Step 2's "a coordinator
+# cannot turn continuity off" check further down.
+my $COORDINATOR_OFF_REFUSAL = "a coordinator cannot turn continuity off; it stops when its ledger is terminal.";
+
 sub _bytes {
     my ($s) = @_;
     return '' unless defined $s;
@@ -98,9 +102,8 @@ sub sanitize_text {
 }
 
 # visible_word_count($s) -- word count over sanitize_text($s), counting only
-# runs of \p{L}/\p{N}. Stricter than word_count() above (which the core's
-# _word_count mirrors), so nothing this command accepts can ever be a reason
-# the core's own two-word rule would refuse.
+# runs of \p{L}/\p{N}. Stricter than word_count() above, so control/
+# invisible-only reasons never pass.
 sub visible_word_count {
     my ($s) = @_;
     return 0 unless defined $s;
@@ -242,7 +245,6 @@ if (defined $verb && exists $RETIRED_VERBS{$verb}) {
 # no ticket or stop-token consumption, no state-dir access, no reasons.log
 # line, for any argv beginning with silence -- this check runs before the
 # verb whitelist, the coordinator step and the state-root step.
-my $COORDINATOR_OFF_REFUSAL = "a coordinator cannot turn continuity off; it stops when its ledger is terminal.";
 if (defined $verb && $verb eq 'silence') {
     refuse($COORDINATOR_OFF_REFUSAL) if defined $ENV{BP_LEDGER} && length $ENV{BP_LEDGER};
     refuse("'butler-continuity silence' is removed: an armed session does not end a turn to wait for the operator. "
@@ -284,7 +286,7 @@ if ($verb eq 'off' || $verb eq 'emergency-stop') {
             refuse("--reason needs at least two words saying why.");
         }
     }
-    elsif ($verb eq 'emergency-stop') {
+    elsif ($verb ne 'off') {   # emergency-stop requires --reason
         refuse("--reason needs at least two words saying why.");
     }
 }

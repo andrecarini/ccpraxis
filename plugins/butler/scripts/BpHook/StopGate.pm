@@ -87,25 +87,22 @@ sub run {
         return 0;
     }
 
-    # G6b: a valid break-glass request (see _take_break_glass) lets this stop
-    # through, and for `off` disarms first, exactly as the shell commands would.
+    # G6b: a valid break-glass off request (see _take_break_glass) disarms
+    # (filing a bug, as emergency-stop does) and lets this stop through.
     if ($bg) {
         eval { _clear_streak($sid) };
-        my $text = $bg->{reason};
-        if ($bg->{action} eq 'off') {
-            my $bug = eval { BpHook::file_stop_bug(source => 'break-glass-off', session => $sid,
-                                 actor => 'agent', reason => $bg->{reason}, area => 'butler',
-                                 cwd => $p->{cwd}) };
-            unless (ref $bug eq 'HASH') {    # belt and braces: file_stop_bug never dies
-                (my $e = $@ || 'unknown error') =~ s/\r?\n.*\z//s;
-                $bug = { id => undef, error => $e, note => "bug report: FAILED ($e)" };
-            }
-            warn "stop-gate: break-glass off: bug report NOT filed ($bug->{error}); disarming anyway\n"
-                unless defined $bug->{id};
-            $text = "$bg->{reason}; $bug->{note}";
-            BpHook::disarm($sid, actor => 'agent', reason => "break-glass: $text");
+        my $bug = eval { BpHook::file_stop_bug(source => 'break-glass-off', session => $sid,
+                             actor => 'agent', reason => $bg->{reason}, area => 'butler',
+                             cwd => $p->{cwd}) };
+        unless (ref $bug eq 'HASH') {    # belt and braces: file_stop_bug never dies
+            (my $e = $@ || 'unknown error') =~ s/\r?\n.*\z//s;
+            $bug = { id => undef, error => $e, note => "bug report: FAILED ($e)" };
         }
-        eval { BpHook::log_reason($sid, 'agent', "break-glass-$bg->{action}", $text, $p->{cwd}) };
+        warn "stop-gate: break-glass off: bug report NOT filed ($bug->{error}); disarming anyway\n"
+            unless defined $bug->{id};
+        my $text = "$bg->{reason}; $bug->{note}";
+        BpHook::disarm($sid, actor => 'agent', reason => "break-glass: $text");
+        eval { BpHook::log_reason($sid, 'agent', 'break-glass-off', $text, $p->{cwd}) };
         return 0;
     }
 
@@ -120,7 +117,7 @@ sub run {
     # G7b (spec 38 sec 2.3): the running-work snapshot describes only the
     # latest Stop; every armed interactive Stop drops the previous one
     # before deciding. A failed unlink leaves at worst a stale snapshot
-    # (harmless: it is read-only evidence for the RUNNING text), never a
+    # (harmless: nothing reads it to decide a stop), never a
     # changed verdict.
     eval { BpHook::clear_running_snapshot($sid) };
 
