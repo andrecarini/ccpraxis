@@ -103,8 +103,10 @@ sub world {
     spew_append($tp, '{"type":"user","message":{"role":"user","content":"start"}}');
     my $sid = 'bg-' . (++$SEQ);
     my $w = { root => $root, data => $data, tp => $tp, sid => $sid, no_data => $o{no_data_dir} };
-    with_env($w, sub { BpHook::arm($sid, role => 'manual', by => 'arm-on-entry') or die 'arm failed' })
-        unless $o{unarmed};
+    with_env($w, sub {
+        BpHook::arm($sid, role => 'manual', by => 'arm-on-entry',
+            (defined $o{goal} ? (goal => $o{goal}) : ())) or die 'arm failed'
+    }) unless $o{unarmed};
     return $w;
 }
 
@@ -273,7 +275,7 @@ sub write_glass {
     # carries "break-glass: all work done here") MUST stay byte-for-byte --
     # it is the spec's own pin. Everything after it is new (AC14's bug-
     # report-shape additions).
-    my $w = world();
+    my $w = world(goal => 'glass goal here');
     my $t = token_of(stop($w));
     my @before = store_snapshot_for($w);
     write_glass($w, token => $t, action => 'off', reason => 'all work done here');
@@ -292,7 +294,8 @@ sub write_glass {
         like($report, qr/^severity: high$/m, 'AC14: report severity is high');
         like($report, qr/^area: butler$/m, 'AC14: report area is butler');
         like($report, qr/^Reason: all work done here$/m, 'AC14: report body has the reason line');
-        like($report, qr/^Session goal: /m, 'AC14: report body has a session-goal line');
+        like($report, qr/^Session goal: glass goal here$/m,
+            'AC14: report body has the session-goal line, proving the goal was read before disarm');
     }
 
     my $offrec = slurp("$w->{root}/continuity/off/$w->{sid}");
