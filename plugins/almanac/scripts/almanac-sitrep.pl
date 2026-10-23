@@ -11,6 +11,7 @@ use JSON::PP ();
 use POSIX ();
 use Time::Local ();
 use File::Path ();
+use Fcntl ();
 
 BEGIN {
     my $self = __FILE__;
@@ -50,10 +51,24 @@ sub _basename {
 sub _errstr {
     my ($err) = @_;
     return 'unknown error' unless defined $err;
-    my $s = "$err";
+    my $s = Almanac::Gather::_decode_if_bytes("$err");
     $s =~ s/\s+\z//;
     $s =~ s/[\r\n]+/ /g;
     return length($s) ? $s : 'unknown error';
+}
+
+# _clean($s) -- F3: neutralise control/escape characters in free-text
+# fields read from another project's stores (inbox question, parked
+# reason, thread/task titles, todo titles, bug titles) before they are
+# interpolated into the report. Replaces C0 controls, DEL and the 0x9b
+# "single shift 3" byte (used as an alternate CSI introducer in some
+# terminals) with a visible placeholder, so a hostile/hand-edited store
+# cannot inject ANSI/OSC escapes or fake newline-delimited report rows.
+sub _clean {
+    my ($s) = @_;
+    return $s unless defined $s;
+    $s =~ s/[\x00-\x1f\x7f\x{9b}]/ /g;
+    return $s;
 }
 
 sub _iso_of {
@@ -88,19 +103,62 @@ sub _read_snapshot {
     return (undef, 'unreadable') unless defined $doc->{schema} && $doc->{schema} == 1;
     return (undef, 'unreadable')
         unless defined $doc->{generated_at} && $doc->{generated_at} =~ /\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\z/;
+    # F2: the regex above only checks shape, not calendar validity (month
+    # 13, hour 99 match it); confirm it actually parses before trusting it.
+    return (undef, 'unreadable') unless defined eval { _epoch_of_iso($doc->{generated_at}) };
+    # F2: every later consumer dereferences packages/inbox/usage as HASHes
+    # without checking -- a wrongly-typed but syntactically valid snapshot
+    # must be treated as unreadable (and so overwritten) rather than
+    # crashing every subsequent /sitrep run.
+    return (undef, 'unreadable')
+        if exists($doc->{packages}) && defined($doc->{packages}) && ref($doc->{packages}) ne 'HASH';
+    if (ref($doc->{packages}) eq 'HASH') {
+        for my $v (values %{ $doc->{packages} }) {
+            return (undef, 'unreadable') if ref($v) ne 'HASH';
+        }
+    }
+    return (undef, 'unreadable')
+        if exists($doc->{inbox}) && defined($doc->{inbox}) && ref($doc->{inbox}) ne 'HASH';
+    return (undef, 'unreadable')
+        if exists($doc->{usage}) && defined($doc->{usage}) && ref($doc->{usage}) ne 'HASH';
     return ($doc, 'ok');
 }
 
 sub _write_snapshot {
     my ($root, $doc) = @_;
     my $dir = _fs_bytes("$root/.ccpraxis-local-data/sitrep");
-    File::Path::make_path($dir);
+    # F1: a hostile/hand-edited project tree can make the data dir (or the
+    # sitrep dir itself) a symlink to steer our writes anywhere on disk.
+    # Refuse rather than follow it.
+    my $data_dir = _fs_bytes("$root/.ccpraxis-local-data");
+    die "refusing to write: $data_dir is a symlink\n" if -l $data_dir;
+    die "refusing to write: $dir is a symlink\n" if -l $dir;
+    File::Path::make_path($dir, { error => \my $mkerr });
+    if (@{ $mkerr // [] } || !-d $dir) {
+        my @msgs = map { my %h = %$_; join(': ', values %h) } @{ $mkerr // [] };
+        die "cannot create $dir: " . (@msgs ? _errstr(join('; ', @msgs)) : "$!") . "\n";
+    }
+    die "refusing to write: $dir is a symlink\n" if -l $dir;
     my $path = "$dir/last.json";
     my $tmp = "$path.tmp.$$";
-    open(my $fh, '>:raw', $tmp) or die "cannot write $tmp: $!\n";
-    print {$fh} JSON::PP->new->utf8->canonical->encode($doc);
-    close($fh) or die "cannot write $tmp: $!\n";
-    rename($tmp, $path) or die "cannot rename $tmp to $path: $!\n";
+    # F1: O_EXCL refuses to open through an existing symlink or regular
+    # file planted at this predictable name (PIDs are a small, predictable
+    # range), instead of truncating whatever it points at.
+    my $fh;
+    sysopen($fh, $tmp, Fcntl::O_WRONLY() | Fcntl::O_CREAT() | Fcntl::O_EXCL())
+        or die "cannot write $tmp: $!\n";
+    binmode($fh);
+    my $ok = eval {
+        print {$fh} JSON::PP->new->utf8->canonical->encode($doc);
+        close($fh) or die "cannot write $tmp: $!\n";
+        rename($tmp, $path) or die "cannot rename $tmp to $path: $!\n";
+        1;
+    };
+    unless ($ok) {
+        my $err = $@;
+        unlink $tmp;
+        die $err;
+    }
     return 1;
 }
 
@@ -210,7 +268,7 @@ sub _spend_lines {
     }
     my $doc = eval { BpSpend::Derive::report_session(%opts) };
     if (my $err = $@) {
-        my ($first) = split /\n/, "$err";
+        my ($first) = split /\n/, Almanac::Gather::_decode_if_bytes("$err");
         return ("  spend unavailable: $first");
     }
 
@@ -226,9 +284,15 @@ sub _spend_lines {
         $sub_tokens += $row->{tokens};
         my $role = defined($row->{role}) ? $row->{role} : 'unknown';
         $by_role{$role} += $row->{tokens};
-        my $key = (defined($row->{blueprint}) && $row->{blueprint} ne $BpSpend::Derive::UNATTRIBUTED_LABEL
-                   && defined($row->{package}))
-            ? "$row->{blueprint}/$row->{package}" : 'unattributed';
+        # F5: bp-spend.pl is loaded at runtime via require, so the compiler
+        # only ever sees this name once and warns "used only once" on every
+        # run; it is not a typo. no warnings silences just this reference.
+        my $key = do {
+            no warnings 'once';
+            (defined($row->{blueprint}) && $row->{blueprint} ne $BpSpend::Derive::UNATTRIBUTED_LABEL
+                       && defined($row->{package}))
+                ? "$row->{blueprint}/$row->{package}" : 'unattributed';
+        };
         $by_pkg{$key}{tokens} = ($by_pkg{$key}{tokens} // 0) + $row->{tokens};
     }
 
@@ -305,7 +369,7 @@ sub _render_blueprints_section {
     for my $b (@$list) {
         my $p = $b->{packages} // { done => 0, total => 0, status => {} };
         my $line = "  $b->{name}  $b->{state}  $p->{done}/$p->{total}";
-        $line .= '  parked: ' . (defined($b->{parked_reason}) ? $b->{parked_reason} : '')
+        $line .= '  parked: ' . _clean(defined($b->{parked_reason}) ? $b->{parked_reason} : '')
             if defined($b->{state}) && $b->{state} eq 'parked';
         push @lines, $line;
         my %by_status;
@@ -336,7 +400,7 @@ sub _render_threads_section {
         }
         for my $task (@{ $th->{tasks} // [] }) {
             my $status = defined($task->{status}) ? $task->{status} : '-';
-            my $base = "    $task->{position}. [$status] $task->{title}";
+            my $base = "    " . ($task->{position} // '-') . ". [$status] " . _clean($task->{title} // '');
             if (defined($task->{link}) && length($task->{link})) {
                 my $tag = (defined($task->{link_state}) && $task->{link_state} eq 'ok')
                     ? $task->{location} : $task->{link_state};
@@ -356,7 +420,7 @@ sub _render_todos_section {
     my $list = $todos // [];
     unless (@$list) { push @lines, '  (none)'; return @lines }
     for my $t (@$list) {
-        my $line = "  $t->{id}  $t->{title}";
+        my $line = "  $t->{id}  " . _clean($t->{title} // '');
         $line .= "  [$t->{tags}]" if defined($t->{tags}) && length($t->{tags});
         push @lines, $line;
     }
@@ -369,7 +433,7 @@ sub _render_inbox_section {
     my $list = $items // [];
     unless (@$list) { push @lines, '  (none)'; return @lines }
     for my $it (@$list) {
-        push @lines, "  $it->{id}  $it->{question}";
+        push @lines, "  $it->{id}  " . _clean($it->{question} // '');
         if (defined($it->{body}) && length($it->{body})) {
             push @lines, "    $_" for split /\n/, $it->{body};
         }
@@ -428,7 +492,7 @@ sub _render_bugs_section {
     for my $st (@BUG_OPEN_STATES) {
         for my $bug (@{ $bs->{$st} // [] }) {
             my $sev = (defined($bug->{severity}) && length($bug->{severity})) ? $bug->{severity} : '-';
-            push @open_rows, "    $bug->{id}  $st  $sev  $bug->{title}";
+            push @open_rows, "    $bug->{id}  $st  $sev  " . _clean($bug->{title} // '');
         }
     }
     push @lines, (@open_rows ? @open_rows : ('  (none)'));
@@ -439,7 +503,7 @@ sub _render_bugs_section {
         for my $st (@BUG_ALL_STATES) {
             for my $bug (@{ $bs->{$st} // [] }) {
                 next unless defined($bug->{filed}) && $bug->{filed} ge $prev->{generated_at};
-                push @opened, "    $bug->{id}  $st  $bug->{title}";
+                push @opened, "    $bug->{id}  $st  " . _clean($bug->{title} // '');
             }
         }
         push @lines, (@opened ? @opened : ('  (none)'));
@@ -449,7 +513,7 @@ sub _render_bugs_section {
         for my $st (qw(fixed dropped)) {
             for my $bug (@{ $bs->{$st} // [] }) {
                 next unless defined($bug->{closed}) && $bug->{closed} ge $prev->{generated_at};
-                push @closed, "    $bug->{id}  $st  $bug->{title}";
+                push @closed, "    $bug->{id}  $st  " . _clean($bug->{title} // '');
             }
         }
         push @lines, (@closed ? @closed : ('  (none)'));
@@ -465,6 +529,13 @@ sub _render_bugs_section {
     return @lines;
 }
 
+# project_report(%opt) -- /sitrep, spec section 2.1. Options: root (skip
+# resolution), cwd (passed through to Almanac::Thread::project_root() when
+# root is not given -- the default root per spec 2.1 is
+# project_root(cwd => cwd), so this is how a caller that is not actually
+# running from the project directory still resolves correctly), now
+# (epoch, for deterministic tests), refresh (default on), write_snapshot
+# (default on), gate_script (path override), session_id, transcript.
 sub project_report {
     my (%opt) = @_;
     my $root = (defined($opt{root}) && length($opt{root}))
@@ -489,7 +560,6 @@ sub project_report {
     $gather_opt{since} = $since if defined $since;
     my $r = Almanac::Gather::gather(%gather_opt);
 
-    my $log_rows_undef = !defined $since;
     my @log_rows;
     my $log_err;
     if (defined $since) {
@@ -510,7 +580,8 @@ sub project_report {
     }
 
     my $butler_loaded = _load_butler();
-    my $reading = _gate_reading($gate_script, $butler_loaded);
+    my $reading = eval { _gate_reading($gate_script, $butler_loaded) }
+        // { status => 'unknown', diagnostic => 'gate unavailable' };
     my @spend_lines = _spend_lines(
         root => $root, transcript => $opt{transcript}, session_id => $session_id,
         since => $since, now => $now, butler_loaded => $butler_loaded,
@@ -532,21 +603,45 @@ sub project_report {
     } else {
         push @lines, "  since $prev->{generated_at}";
         push @lines, '  Packages:';
-        my @pkg_rows = _packages_diff_rows($prev, $r);
-        push @lines, (@pkg_rows ? @pkg_rows : ('  (none)'));
+        # M1: a failed blueprints read means $r->{blueprints} is the empty
+        # default, not "no packages" -- diffing against the previous
+        # snapshot would fabricate "every package moved to (gone)". Say so
+        # instead of diffing.
+        if (_errors_has($r->{errors}, 'blueprints')) {
+            push @lines, '    unavailable: blueprints could not be read';
+        } else {
+            my @pkg_rows = _packages_diff_rows($prev, $r);
+            push @lines, (@pkg_rows ? @pkg_rows : ('  (none)'));
+        }
 
-        my %cur_inbox = map { $_->{id} => $_->{question} } @{ $r->{inbox} // [] };
-        my %prev_inbox = %{ $prev->{inbox} // {} };
-        push @lines, '  Inbox added:';
-        my @added = map { "    $_  $cur_inbox{$_}" } sort grep { !exists $prev_inbox{$_} } keys %cur_inbox;
-        push @lines, (@added ? @added : ('  (none)'));
-        push @lines, '  Inbox answered:';
-        my @answered = map { "    $_  $prev_inbox{$_}" } sort grep { !exists $cur_inbox{$_} } keys %prev_inbox;
-        push @lines, (@answered ? @answered : ('  (none)'));
+        # M1: same reasoning for inbox -- a failed read must not render as
+        # "every previous inbox id was just answered".
+        if (_errors_has($r->{errors}, 'inbox')) {
+            push @lines, '  Inbox added:';
+            push @lines, '    unavailable: inbox could not be read';
+            push @lines, '  Inbox answered:';
+            push @lines, '    unavailable: inbox could not be read';
+        } else {
+            my %cur_inbox = map { $_->{id} => $_->{question} } @{ $r->{inbox} // [] };
+            my %prev_inbox = %{ $prev->{inbox} // {} };
+            push @lines, '  Inbox added:';
+            my @added = map { "    $_  " . _clean($cur_inbox{$_} // '') } sort grep { !exists $prev_inbox{$_} } keys %cur_inbox;
+            push @lines, (@added ? @added : ('  (none)'));
+            push @lines, '  Inbox answered:';
+            my @answered = map { "    $_  " . _clean($prev_inbox{$_} // '') } sort grep { !exists $cur_inbox{$_} } keys %prev_inbox;
+            push @lines, (@answered ? @answered : ('  (none)'));
+        }
 
         push @lines, '  Commits:';
-        my @commit_rows = map { '    ' . substr($_->{sha}, 0, 7) . "  $_->{subject}" } @{ $r->{commits} // [] };
-        push @lines, (@commit_rows ? @commit_rows : ('  (none)'));
+        # M1: also guards the non-git-project case, where Gather dies "git
+        # log failed" and the section used to print the misleading
+        # "(none)" rather than naming the failure.
+        if (_errors_has($r->{errors}, 'commits')) {
+            push @lines, '    unavailable: commits could not be read';
+        } else {
+            my @commit_rows = map { '    ' . substr($_->{sha}, 0, 7) . "  $_->{subject}" } @{ $r->{commits} // [] };
+            push @lines, (@commit_rows ? @commit_rows : ('  (none)'));
+        }
 
         push @lines, '  Thread log:';
         if (defined $log_err) {
@@ -602,9 +697,18 @@ sub project_report {
             inbox        => $inbox_doc,
             usage        => (defined($usage_doc) ? $usage_doc : JSON::PP::null),
         };
-        my $ok = eval { _write_snapshot($root, $doc); 1 };
-        unless ($ok) {
-            $text .= 'Snapshot not written: ' . _errstr($@) . "\n";
+        # F4: Gather's own redteam-H1 guard skipped the mutating refresh
+        # because the resolved root did not match CLAUDE_PROJECT_DIR (a
+        # misresolved cwd that stepped up into a parent project). Writing
+        # our snapshot there anyway would be exactly the cross-project
+        # local-state write that guard exists to prevent.
+        if (_errors_has($r->{errors}, 'refresh')) {
+            $text .= 'Snapshot not written: root does not match CLAUDE_PROJECT_DIR' . "\n";
+        } else {
+            my $ok = eval { _write_snapshot($root, $doc); 1 };
+            unless ($ok) {
+                $text .= 'Snapshot not written: ' . _errstr($@) . "\n";
+            }
         }
     }
 
@@ -623,7 +727,7 @@ sub _project_view {
     for my $b (@{ $p->{blueprints} // [] }) {
         next if defined($b->{state}) && ($b->{state} eq 'archived' || $b->{state} eq 'done');
         my $statuses = $b->{packages}{status} // {};
-        my @nondone = sort grep { $statuses->{$_} ne 'done' && $statuses->{$_} ne 'dropped' } keys %$statuses;
+        my @nondone = sort grep { ($statuses->{$_} // '') ne 'done' && ($statuses->{$_} // '') ne 'dropped' } keys %$statuses;
         next unless @nondone;
         push @bps, { b => $b, nondone => \@nondone, statuses => $statuses };
     }
@@ -648,9 +752,16 @@ sub _project_view {
         }
     }
 
+    # B2: a project whose inbox/blueprints/threads/todos/bugs section
+    # failed to read (store corrupt, almanac-bug.pl/BpState unloadable,
+    # blueprint dir unreadable) carries that failure on the PROJECT's own
+    # errors[] (Gather's _gather_project), separate from _gather_all's
+    # top-level registry-only errors[]. Carry it through so the caller can
+    # tell "read failed" from "genuinely nothing pending" instead of
+    # defaulting both to an empty section.
     return {
         root => $p->{root}, inbox => \@inbox, bps => \@bps, threads => \@threads,
-        todos => \@todos, bugs => \@bugs,
+        todos => \@todos, bugs => \@bugs, errors => $p->{errors} // [],
     };
 }
 
@@ -683,7 +794,7 @@ sub pending_report {
     for my $v (@views) {
         next unless @{ $v->{inbox} };
         push @inbox_block, "  $v->{name}:";
-        push @inbox_block, map { "    $_->{id}  $_->{question}" } @{ $v->{inbox} };
+        push @inbox_block, map { "    $_->{id}  " . _clean($_->{question} // '') } @{ $v->{inbox} };
     }
     push @lines, (@inbox_block ? @inbox_block : ('  (none)'));
 
@@ -697,7 +808,7 @@ sub pending_report {
             my $b = $entry->{b};
             my $p = $b->{packages} // { done => 0, total => 0 };
             my $line = "    $b->{name}  $b->{state}  $p->{done}/$p->{total}";
-            $line .= '  parked: ' . (defined($b->{parked_reason}) ? $b->{parked_reason} : '')
+            $line .= '  parked: ' . _clean(defined($b->{parked_reason}) ? $b->{parked_reason} : '')
                 if defined($b->{state}) && $b->{state} eq 'parked';
             push @bp_block, $line;
             my %by_status;
@@ -721,7 +832,7 @@ sub pending_report {
             push @th_block, "    $th->{name}  [$th->{state}]  $bar->{done}/$bar->{total}";
             for my $task (@{ $entry->{open_tasks} }) {
                 my $status = defined($task->{status}) ? $task->{status} : '-';
-                push @th_block, "      $task->{position}. [$status] $task->{title}";
+                push @th_block, "      " . ($task->{position} // '-') . ". [$status] " . _clean($task->{title} // '');
             }
         }
     }
@@ -733,18 +844,18 @@ sub pending_report {
         next unless @{ $v->{todos} };
         push @lines, "  $v->{name}:";
         for my $t (@{ $v->{todos} }) {
-            my $line = "    $t->{id}  $t->{title}";
+            my $line = "    $t->{id}  " . _clean($t->{title} // '');
             $line .= "  [$t->{tags}]" if defined($t->{tags}) && length($t->{tags});
             push @lines, $line;
         }
     }
     if (!$g->{available}) {
-        push @lines, '  global: unavailable here (' . (defined($g->{reason}) ? $g->{reason} : 'unknown') . ')';
+        push @lines, '  global: unavailable here (' . (defined($g->{reason}) ? _errstr($g->{reason}) : 'unknown') . ')';
     } elsif (!@{ $g->{items} // [] }) {
         push @lines, '  global: (none)';
     } else {
         push @lines, '  global:';
-        push @lines, map { "    $_->{id}  $_->{title}" } @{ $g->{items} };
+        push @lines, map { "    $_->{id}  " . _clean($_->{title} // '') } @{ $g->{items} };
     }
 
     # == Open bugs ==
@@ -754,22 +865,42 @@ sub pending_report {
         for my $entry (@{ $v->{bugs} }) {
             my $bug = $entry->{bug};
             my $sev = (defined($bug->{severity}) && length($bug->{severity})) ? $bug->{severity} : '-';
-            push @bug_rows, "  $v->{name}  $bug->{id}  $sev  $bug->{title}";
+            push @bug_rows, "  $v->{name}  $bug->{id}  $sev  " . _clean($bug->{title} // '');
         }
     }
     push @lines, (@bug_rows ? @bug_rows : ('  (none)'));
 
     # == Clear ==
+    # B2: a project whose inbox/blueprints/threads/todos/bugs section
+    # failed to read looks identical, here, to one that genuinely has
+    # nothing pending -- both leave every $v->{...} array empty. Q8 is a
+    # positive claim ("nothing pending"); making that claim from a read
+    # that failed is wrong, so such a project is reported as unknown
+    # rather than clear.
     push @lines, '== Clear ==';
     my @clear;
+    my @per_project_errors;
     for my $v (@views) {
         next if @{ $v->{inbox} } || @{ $v->{bps} } || @{ $v->{threads} } || @{ $v->{todos} } || @{ $v->{bugs} };
-        push @clear, "  $v->{name}  clear -- nothing pending";
+        my @bad_sections = sort grep {
+            my $s = $_;
+            grep { $_ eq $s } qw(inbox blueprints threads todos bugs)
+        } map { $_->{section} } @{ $v->{errors} // [] };
+        if (@bad_sections) {
+            push @clear, "  $v->{name}  unknown -- could not read: " . join(', ', @bad_sections);
+            for my $e (@{ $v->{errors} // [] }) {
+                next unless grep { $_ eq $e->{section} } @bad_sections;
+                push @per_project_errors, "$v->{name}: $e->{section} (" . _errstr($e->{error}) . ')';
+            }
+        } else {
+            push @clear, "  $v->{name}  clear -- nothing pending";
+        }
     }
     push @lines, (@clear ? @clear : ('  (none)'));
 
     {
         my @msgs = map { $_->{error} } grep { defined($_->{error}) && length($_->{error}) } @{ $all->{errors} // [] };
+        push @msgs, @per_project_errors;
         push @lines, 'Incomplete: ' . join('; ', @msgs) if @msgs;
     }
 
