@@ -399,7 +399,12 @@ sub arm {
     if (defined $opts{transcript_path}) { $rec->{transcript_path} = _to_json_path($opts{transcript_path}) }
     if (defined $goal) { $rec->{goal} = $goal }
     my $ok = _write_json_atomic("$root/armed/$sid", $rec);
-    if ($ok && $by eq 'on') { unlink($offpath) }
+    # An explicit `on` starts a new arm, so a disarm OTP minted under the old
+    # one is revoked: otherwise off-confirm could end the new arm on a reason
+    # written for the previous one (judged-continuity-disarm/02 red-team L3).
+    # Director re-arms (by ne 'on') keep it, since they can land between a
+    # legitimate `off` and its `off-confirm`.
+    if ($ok && $by eq 'on') { unlink($offpath); revoke_disarm_otp($sid) }
     flock($lockfh, LOCK_UN);
     close $lockfh;
     unless ($ok) { _set_error('io: write failed'); return 0 }
