@@ -995,7 +995,7 @@ sub monitor_loop {
             $unknown_count = 0;
             log_event($data_dir, 'monitor', 'MONITOR-EXIT', { reason => 'ac-restored' }, 'AC restored; exiting the monitor');
             $out_cb->(sprintf(
-                'AC restored at %s. Resume: butler-continuity on --thread <your thread> --role driver, then bp-drive-next.pl next.',
+                'AC restored at %s. Resume: butler-continuity on --thread <your thread> --role driver --goal \'<what this run is for>\', then bp-drive-next.pl next.',
                 _iso_utc($t_now)));
             $rc = 0;
             last TICK;
@@ -1013,7 +1013,7 @@ sub monitor_loop {
                 log_event($data_dir, 'monitor', 'MONITOR-EXIT', { reason => 'probe-failed' },
                     'ten consecutive unknown probe readings; resuming fail-open');
                 $out_cb->(sprintf(
-                    'AC probe failed %d times in a row; resuming fail-open. Resume: butler-continuity on --thread <your thread> --role driver, then bp-drive-next.pl next.',
+                    'AC probe failed %d times in a row; resuming fail-open. Resume: butler-continuity on --thread <your thread> --role driver --goal \'<what this run is for>\', then bp-drive-next.pl next.',
                     UNKNOWN_LIMIT));
                 $rc = 2;
                 last TICK;

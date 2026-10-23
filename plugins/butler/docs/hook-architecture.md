@@ -7,11 +7,12 @@ implemented by packages 03-16. Package 16 owns this file and its coverage test
 The system in one paragraph: every hook is a short shell file that execs one wrapper, and the wrapper
 either exits in bash (the hook does not apply to this session) or execs one perl process that loads
 `BpHook.pm` inside an exit-0 guard and parses the payload once. Continuity is one per-session file,
-written by three commands and one hook. The Stop gate blocks only when that file exists and there is
-no live holder and no silence. When it blocks, the agent sees 7 lines, or 5 without the silence line
-while work is running, and those lines carry a single-use stop token the gate itself minted. With
-that token, `butler-hold`, `butler-continuity off` and `butler-continuity silence` work even if every
-other hook has failed. There are no override files.
+written by `butler-continuity` and one hook. The Stop gate blocks only when that file exists and there
+is no live holder. When it blocks, the agent sees 5 lines, and those lines carry a single-use stop
+token the gate itself minted. With that token, `butler-hold` and `butler-continuity off` work even if
+every other hook has failed. An agent's `off` never disarms by itself: it mints a disarm code, and
+`butler-continuity off-confirm` disarms only once a read-only judge approves (see "Judged disarm").
+There are no override files.
 
 ## Harness facts and what they decided
 
@@ -25,7 +26,7 @@ Evidence: `plugins/butler/docs/harness-facts.md` (Claude Code 2.1.280). Each fac
 | (c) `agent-<id>.meta.json` exists before a background subagent's first PreToolUse. Foreground dispatch was not measured | Write guards resolve a subagent's package through `meta.json` `toolUseId`. An unresolvable binding with two or more packages in flight is refused, not widened. |
 | (d) `/clear` allocates a new `session_id`. `--resume` and headless `/compact` keep it. In-process env behaviour is open (D-1..D-3) | All state is keyed by the payload `session_id`. No component reads `$CLAUDE_CODE_SESSION_ID`. Commands learn their session from a hook-written ticket or a gate-minted stop token. |
 | (e) Background Bash (normal exit or killed) and background Agent completions wake an idle interactive session. A killed task is reported as `failed with exit code 143`. Headless `-p` kills a running background Bash a few seconds after its final result | The holder is a background Bash task whose exit at the deadline is the wake-up. Re-invocation extends, never replaces. A headless coordinator's holder counts only alongside a running background subagent (see Holder protocol). |
-| (f) Stop exit 2 feeds stderr back as a synthetic user message and forces a paid turn. `stop_hook_active` is not a counter. No retry cap was observed | The denial is 7 lines. The gate never keys on `stop_hook_active`. There is no block cap (Decisions 6 and 45). The way out that depends on no other hook is the stop token (see Constraint conflicts). |
+| (f) Stop exit 2 feeds stderr back as a synthetic user message and forces a paid turn. `stop_hook_active` is not a counter. No retry cap was observed | The denial is 6 lines. The gate never keys on `stop_hook_active`. There is no block cap (Decisions 6 and 45). The way out that depends on no other hook is the stop token (see Constraint conflicts). |
 | (g) Bash hook floor ~30.6 ms, one perl parse adds ~47 ms | Every hook has a bash-only early exit that spawns nothing, and env-only prefilters run before stdin is read. Decision 33's target is ~131 ms for the applies path. |
 | (h) In one headless run each, `.claude/settings.json` hot-reloaded and plugin `hooks.json` did not | Settings changes land in the same commit as the files they point at. The no-shim verdict rests on exit 127 being non-blocking; (h) only supports it (see Shims). |
 | Method: `--max-turns` is absent from `claude --help` in 2.1.280 | Nothing in this design relies on a turn cap, for coordinators or anyone else. |
@@ -401,10 +402,10 @@ agent_id($p)                  -> undef when the payload has no agent_id (main th
                                  subagent is calling; '?' is never used to build a path.
 role($p)                      -> 'coordinator' | 'judge' | 'driver' | 'reporter' | 'manual'.
 is_armed($sid)                -> true for a coordinator; else armed/<sid> exists. No age test.
-arm($sid, role=>R, by=>B, transcript_path=>T)  -> under flock armlock/<sid>: writes armed/<sid>,
-                                 removes off/<sid> only when B is 'on'.
-disarm($sid, actor=>A, reason=>T) -> under flock armlock/<sid>: removes armed/<sid>, silence/<sid>,
-                                 running/<sid>, holder/<sid>.json and the session's stop token;
+arm($sid, role=>R, by=>B, transcript_path=>T, goal=>G)  -> under flock armlock/<sid>: writes armed/<sid>
+                                 with goal G (no G keeps the stored goal), removes off/<sid> only when B is 'on'.
+disarm($sid, actor=>A, reason=>T) -> under flock armlock/<sid>: removes armed/<sid>, running/<sid>,
+                                 holder/<sid>.json, the session's stop token and its live disarm code;
                                  writes off/<sid>.
 latest_is_off($sid)           -> off/<sid> exists (Decision 36).
 set_silence($sid, reason=>T)  -> writes silence/<sid>. Only butler-continuity.pl calls it.

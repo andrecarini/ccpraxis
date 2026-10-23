@@ -48,7 +48,7 @@ my $ALMANAC_GATHER_PM = "$SELF_DIR/../../../almanac/scripts/Almanac/Gather.pm";
 # sec 2.2 -- pinned text, byte-exact.
 # ---------------------------------------------------------------------------
 our $COMPACT_TEXT  = 'Compacted while continuity is armed: re-read your task list, and the ledger of any package you are driving, before the next step.';
-our $RESUME_FORMAT = "Resumed at %s while continuity is armed: continue the held work, or turn continuity off with a reason: butler-continuity off --reason '<why>'";
+our $RESUME_FORMAT = "Resumed at %s while continuity is armed: continue the held work, or start the two-step disarm: butler-continuity off --reason '<why>'";
 
 sub _is_plain_string {
     my ($v) = @_;

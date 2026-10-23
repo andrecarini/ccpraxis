@@ -214,7 +214,7 @@ sub _n5_nudge {
     return undef if defined $r && $r == $e;
 
     my $mins = int($age / 60);
-    my $text = "No operator message for $mins min and work continues. If this session should keep working without the operator, arm and attach a thread: butler-continuity on --new-thread <name> (or --thread <name> to resume one)";
+    my $text = "No operator message for $mins min and work continues. If this session should keep working without the operator, arm and attach a thread: butler-continuity on --new-thread <name> --goal '<what this session is for>' (or --thread <name> to resume one)";
     return { text => $text, epoch => $e };
 }
 

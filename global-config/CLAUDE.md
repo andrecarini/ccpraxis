@@ -13,7 +13,7 @@ A skill's `description:` is a trigger contract, not just discovery metadata. Whe
 
 ## Arming continuity (butler)
 
-- Arm with `butler-continuity on` before work that should go on without the operator: they said "keep going", they are away or it runs overnight, or the work is unattended and multi-step.
+- Arm with `butler-continuity on --new-thread <name> --goal '<what this is for>'` before work that should go on without the operator: they said "keep going", they are away or it runs overnight, or the work is unattended and multi-step.
 - Never arm for one interactive answer.
 - Hooks nudge toward arming on such a prompt, and when work has gone on a long time with no operator message. Nudges are advice; whether to arm stays your call.
 
