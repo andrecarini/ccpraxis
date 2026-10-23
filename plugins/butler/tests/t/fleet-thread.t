@@ -530,8 +530,9 @@ sub log_events {
 # a parked package.
 # ===========================================================================
 {
-    # 6a: both ledgers done/dropped before the first run -> archives at setup;
-    # log is created, archived, launched, finished.
+    # 6a: both ledgers done/dropped before the first run -> the run finishes
+    # on its first tick and the thread archives then: created, launched,
+    # finished, archived.
     my ($P, $bpdir, $bp) = mk_fleet(bp => 'fx3',
         pkgs => [ { name=>'01-a', status=>'done' }, { name=>'02-b', status=>'dropped' } ],
         registry => { '01-a' => { harvest => 'pass' } }, conformance_verdict => 1);
@@ -550,11 +551,11 @@ sub log_events {
     ok(defined $th, 'AC5a: thread fleet-fx3 exists');
   SKIP: {
         skip('AC5a: no thread to inspect', 2) unless defined $th;
-        is($th->{state}, 'archived', 'AC5a: both-terminal-before-first-run archives at setup');
+        is($th->{state}, 'archived', 'AC5a: both-terminal-before-first-run archives once that first run finishes');
         my $log = log_safe('fleet-fx3', $P);
         my @ev = map { $_->{event} } @$log;
-        is_deeply(\@ev, [qw(created archived launched finished)],
-            'AC5a: log is created, archived, launched, finished (finished allowed on archived)');
+        is_deeply(\@ev, [qw(created launched finished archived)],
+            'AC5a: log is created, launched, finished, archived -- a fleet thread archives only once its run finished (bug 20261023-031444-9176)');
     }
 
     # behaviour 9 (second half): "same when fleet-fx is archived" -- a fresh
@@ -609,9 +610,11 @@ sub log_events {
 }
 
 # ===========================================================================
-# AC5 continued -- behaviour 6b: archive at the end of a tick that does NOT
-# finish the run (a harvest judge stays in flight, so run_complete is false
-# and _fleet_thread_end takes the archive_if_done branch instead of finished).
+# AC5 continued -- behaviour 6b, REVERSED by bug 20261023-031444-9176: a tick
+# that does NOT finish the run (a harvest judge stays in flight, so
+# run_complete is false) never archives, even with every package terminal. A
+# harvest audit can still reopen a done package, and an archived thread
+# refuses the pauses and resumes that follow.
 # ===========================================================================
 {
     my ($P, $bpdir, $bp) = mk_fleet(bp => 'fx14',
@@ -648,12 +651,19 @@ sub log_events {
     ok(defined $th, 'behaviour6b: thread fleet-fx14 exists');
   SKIP: {
         skip('behaviour6b: no thread to inspect', 2) unless defined $th;
-        is($th->{state}, 'archived',
-            'behaviour6b: the thread archives once both packages are terminal, even though the run stays open');
+        is($th->{state}, 'live',
+            'behaviour6b: the thread stays live while the run is open, even though both packages are terminal (bug 20261023-031444-9176)');
         my $log = log_safe('fleet-fx14', $P);
         ok(!(grep { $_->{event} eq 'finished' } @$log),
-            'behaviour6b: no "finished" was logged (the run did not complete; archive came from archive_if_done)')
+            'behaviour6b: no "finished" was logged (the run did not complete)')
             or diag('log: ' . $J->encode($log));
+        # The second trigger: every almanac-thread.pl verb sweeps
+        # archive_if_done over all live threads, from any session.
+        eval { Almanac::Thread::archive_if_done('fleet-fx14', root => $P, actor => 'cli'); 1 }
+            or diag("archive_if_done died: $@");
+        my $th2 = read_thread_safe('fleet-fx14', $P);
+        is($th2 && $th2->{state}, 'live',
+            'behaviour6b: a CLI archive_if_done sweep does not archive an unfinished fleet thread either');
     }
 }
 
@@ -899,16 +909,17 @@ sub log_events {
     my ($P, $bpdir, $bp) = mk_fleet(bp => 'fx16',
         pkgs => [ { name=>'01-a', status=>'done' }, { name=>'02-b', status=>'dropped' } ],
         registry => { '01-a' => { harvest => 'pass' } }, conformance_verdict => 1);
-    # Both packages terminal from the start -> the thread archives at setup
-    # (behaviour 6a). An in-flight harvest judge for 01-a keeps the run open
-    # past the first tick, so a later pause transition can fire against the
-    # now-archived thread.
+    # An in-flight harvest judge for 01-a keeps the run open past the first
+    # tick. An open run no longer archives on its own (bug
+    # 20261023-031444-9176), so the thread is archived by hand at tick 1, and
+    # the pause transition that follows fires against an archived thread.
     write_file("$bpdir/runs/harvest/01-a.inflight", time . "\n");
 
     my $tick = 0;
     my $sleep = sub {
         $tick++;
         if ($tick == 1) {
+            Almanac::Thread::archive('fleet-fx16', root => $P, actor => 'cli', reason => 'test forces a refused write');
             write_json("$bpdir/runs/.paused", { reason=>'usage', manual=>0, relaunch_at=>time + 1_000_000_000 });
         } elsif ($tick == 2) {
             die "behaviour12: stop after tick 2\n";
@@ -933,7 +944,7 @@ sub log_events {
 
     my $th = read_thread_safe('fleet-fx16', $P);
     ok(defined $th, 'behaviour12: thread fleet-fx16 exists');
-    is($th->{state}, 'archived', 'behaviour12: the thread stayed archived (already so at setup)') if defined $th;
+    is($th->{state}, 'archived', 'behaviour12: the thread stayed archived (archived by hand at tick 1)') if defined $th;
 
     my @ferrs = grep { $_->{type} eq 'fleet_thread_error' } @{ log_events($bpdir) };
     my ($ferr) = grep { ($_->{op} // '') eq 'paused' } @ferrs;

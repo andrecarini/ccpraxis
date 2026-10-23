@@ -778,17 +778,17 @@ sub _fleet_thread_end {
             }
         }
 
+        # Only a complete run touches the thread here. Every package reading
+        # done is not the end of a run (a harvest audit can still reopen one),
+        # so Thread.pm archives a fleet thread only after this `finished`;
+        # the per-tick archive_if_done that used to run on an open run
+        # archived where-things-go's thread mid-run (bug 20261023-031444-9176).
         if ($complete) {
             eval {
                 Almanac::Thread::record_event($name, 'finished', reason => 'run complete',
                     actor => 'orchestrator', root => $root);
                 1;
             } or _log($log, 'fleet_thread_error', { op => 'finished', error => _fleet_thread_err($@) });
-        } else {
-            eval {
-                Almanac::Thread::archive_if_done($name, root => $root, actor => 'orchestrator');
-                1;
-            } or _log($log, 'fleet_thread_error', { op => 'archive_if_done', error => _fleet_thread_err($@) });
         }
         1;
     };

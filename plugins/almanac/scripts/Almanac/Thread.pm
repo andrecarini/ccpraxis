@@ -1059,6 +1059,26 @@ sub _append_log {
     $Almanac::Thread::WRITES++;
 }
 
+# _auto_archive_ok($name, \%fields, %opt) -> 1|0. A fleet thread (owner_kind
+# orchestrator) archives on its own only once its run has finished: the
+# newest run-lifecycle event in its log must be `finished`. Every package
+# task reading done is not enough, because a harvest audit can reopen a done
+# package afterwards; where-things-go's thread was archived the second its
+# last task read done, and every later pause and resume was refused (bug
+# 20261023-031444-9176). Other threads keep the all-tasks-done rule.
+sub _auto_archive_ok {
+    my ($name, $fields, %opt) = @_;
+    return 1 unless ref $fields eq 'HASH' && ($fields->{owner_kind} // '') eq 'orchestrator';
+    my $log = eval { log_entries($name, %opt) };
+    return 0 unless ref $log eq 'ARRAY';
+    for my $e (reverse @$log) {
+        my $ev = $e->{event} // '';
+        next unless $ev =~ /\A(?:launched|paused|resumed|finished)\z/;
+        return $ev eq 'finished' ? 1 : 0;
+    }
+    return 0;
+}
+
 sub _archive_check {
     my ($name, %opt) = @_;
     my $tstore = _thread_store(%opt);
@@ -1066,6 +1086,7 @@ sub _archive_check {
     return if $@;
     return if $trec->{fields}{state} eq 'archived';
     return unless thread_is_done($name, %opt);
+    return unless _auto_archive_ok($name, $trec->{fields}, %opt);
     my %expect = (rev => $trec->{rev}, fields => $trec->{fields});
     my $archived = eval {
         $tstore->update($name, expect => \%expect, set => { state => 'archived', archived_at => _now_iso() });
@@ -1598,6 +1619,7 @@ sub archive_if_done {
     my $trec0 = $tstore0->read($name);
     return (_thread_hash($trec0), 0) if $trec0->{fields}{state} eq 'archived';
     return (_thread_hash($trec0), 0) unless thread_is_done($name, %opt);
+    return (_thread_hash($trec0), 0) unless _auto_archive_ok($name, $trec0->{fields}, %opt);
 
     my $lock = _acquire_thread_lock($name, %opt);
     my ($thread, $changed);
@@ -1607,7 +1629,7 @@ sub archive_if_done {
         if ($trec->{fields}{state} eq 'archived') {
             $thread = _thread_hash($trec); $changed = 0; return 1;
         }
-        if (thread_is_done($name, %opt)) {
+        if (thread_is_done($name, %opt) && _auto_archive_ok($name, $trec->{fields}, %opt)) {
             my %expect = (rev => $trec->{rev}, fields => $trec->{fields});
             my $new = $tstore->update($name, expect => \%expect, set => { state => 'archived', archived_at => _now_iso() });
             $Almanac::Thread::WRITES++;
