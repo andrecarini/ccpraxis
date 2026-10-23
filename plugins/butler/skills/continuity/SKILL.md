@@ -50,19 +50,14 @@ Run these as plain Bash tool calls, arguments in single quotes.
   `/butler:continuity off`. If it refuses, the agent started the off itself and needs a `--reason`.
 - **Output:** `on` prints `continuity on for session <sid> (role <role>, thread <name>)` and a line to chart that thread. `off` prints
   `continuity off for session <sid> (actor ...); reason logged`, then that the thread was handed off. `status` prints an armed/off/not
-  armed line, a `thread:` line (name, bar, doing, next), a `holder:` line, an optional `silence:` line, and a `wake-lock:` line. `silence`
-  prints `continuity silenced for one stop of session <sid>; reason logged`.
+  armed line, a `thread:` line (name, bar, doing, next), a `holder:` line, and a `wake-lock:` line.
 - **Self-arm triggers:** arm and attach a thread (`butler-continuity on --new-thread <name>`) before starting background work you expect to
   outlive the turn, or before unattended multi-step work — for example when the operator is away
   or said "keep going". Do not self-arm for one interactive answer. Hooks nudge toward arming; arming stays your call.
 - **Off** (`butler-continuity off --reason '<what is done>'`) is right only when all work is done
   or the operator ended it. It hands the thread off with the reason in its log, and refuses while a task of the thread is doing: set each done, pending or blocked first. It stays off until an explicit `on`; a later director call does not
   re-arm it. A persistent process nobody is waiting on (a dev server, `tail -f`) is not work to hold; if nothing else is pending, off with a reason is the right move.
-- **Silence** (`butler-continuity silence --reason '<why this stop>'`) is an escape hatch: use it
-  sparingly, only when a stop is truly necessary, e.g. to talk with an operator who is present or to
-  wait for the operator's answer. It lets one stop through; the gate applies again next stop. It is
-  not offered while work is running, and refuses then: hold the work instead.
-- **A reason** is at least two words (at most 200 bytes for off) and says what is done (off) or why this stop (silence). Quote
+- **A reason** is at least two words (at most 200 bytes for off) and says what is done. Quote
   it in single quotes; it is logged for the operator.
 - **Holder:** `butler-hold <id> [<id> ...]` with `run_in_background: true`, but only when
   `butler-continuity status` shows `holder: none`. Ids are the agent id a background dispatch
@@ -79,9 +74,9 @@ Run these as plain Bash tool calls, arguments in single quotes.
   only for ids still running.
 - **New session id:** after `/clear` or a carry-over, the session is unarmed — run
   `butler-continuity on --thread <name>` again (hand the thread off with off before a `/clear`, or the old id still owns it). `--resume` keeps the arm.
-- **Questions:** file one with `/almanac:inbox` (`almanac inbox file --title '<question>'`) and
+- **Questions:** never end a turn to wait for the operator. File one with `/almanac:inbox` (`almanac inbox file --title '<question>'`) and
   keep working; the operator answers it there, from any session.
-- **Subagents:** cannot turn continuity on, off or silence it, or hold; those refuse.
+- **Subagents:** cannot turn continuity on or off, or hold; those refuse.
 <!-- continuity:end -->
 
 ## If you have a question for the operator

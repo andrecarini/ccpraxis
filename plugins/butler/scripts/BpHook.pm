@@ -649,8 +649,8 @@ sub _valid_work {
 }
 
 # running/<sid> exists iff the latest armed, non-coordinator Stop of the
-# session was denied while work was running (spec 38 sec 2.2). The Stop
-# gate writes it; `butler-continuity silence` reads it.
+# session was denied while work was running (spec 38 sec 2.2). The gate
+# writes and clears it.
 sub set_running_snapshot {
     my ($sid, $work) = @_;
     return 0 unless defined $sid && $sid =~ $SID_RE;
@@ -752,7 +752,6 @@ sub gc_sessions {
         unless (_flock_with_timeout($lockfh, 10)) { close $lockfh; next }
         unlink("$root/armed/$sid");
         unlink("$root/off/$sid");
-        unlink("$root/silence/$sid");
         unlink("$root/running/$sid");
         unlink("$root/holder/$sid.json");
         # The Stop gate's break-glass state (StopGate.pm): the refusal streak

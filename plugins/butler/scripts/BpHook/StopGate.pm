@@ -43,7 +43,7 @@ eval {
 our $REFUSAL_CAP         = 5;    # consecutive refusals, nothing succeeding, before the gate yields
 our $BREAK_GLASS_HINT_AT = 2;    # refusals in a row before the Write-tool escape is offered
 
-my %BREAK_GLASS_ACTION = (silence => 1, off => 1);
+my %BREAK_GLASS_ACTION = (off => 1);
 my %SHELL_TOOL         = (Bash => 1, PowerShell => 1);
 
 # ---------------------------------------------------------------------------
@@ -119,24 +119,13 @@ sub run {
 
     # G7b (spec 38 sec 2.3): the running-work snapshot describes only the
     # latest Stop; every armed interactive Stop drops the previous one
-    # before deciding. A failed unlink leaves at worst a stale snapshot,
-    # which only makes `silence` point at hold; never a changed verdict.
+    # before deciding. A failed unlink leaves at worst a stale snapshot
+    # (harmless: it is read-only evidence for the RUNNING text), never a
+    # changed verdict.
     eval { BpHook::clear_running_snapshot($sid) };
 
-    # G8: a live own holder allows. Decision 50 (R6-H1, supersedes the
-    # original spec S11): silence is ONE-TURN -- the very next Stop of this
-    # session consumes an outstanding silence whether or not it was needed
-    # to allow the stop. A silence never outlives the turn it was taken
-    # for, so it is discarded here too, before returning, rather than left
-    # to strand a LATER, unrelated stop once the holder is gone.
+    # G8: a live own holder allows.
     if (BpHook::holder_live($sid, $p)) {
-        BpHook::take_silence($sid);
-        eval { _clear_streak($sid) };
-        return 0;
-    }
-
-    # G9: exactly one silence lets exactly one stop through.
-    if (BpHook::take_silence($sid)) {
         eval { _clear_streak($sid) };
         return 0;
     }
@@ -179,17 +168,15 @@ sub run {
             push @glass,
                 "No shell command can run? Last resort: create this file with the Write tool:",
                 "  " . _display_path($path),
-                "  containing {\"token\":\"$t\",\"action\":\"silence\",\"reason\":\"<why this stop>\"}",
-                "  (\"action\":\"off\" instead when all work is done).",
+                "  containing {\"token\":\"$t\",\"action\":\"off\",\"reason\":\"<what is done>\"}",
+                "  (only when all work is done: it turns continuity off and files a bug report).",
                 "After $REFUSAL_CAP refusals in a row with no tool call succeeding, the gate lets the stop through by itself.";
         }
     }
 
     # G11 (spec 38 sec 2.3, Decision 128): the text is built from the
-    # session's running work. While work runs, silence is not offered at
-    # all: the RUNNING text names the work and offers hold, or off when it
-    # is no longer needed. Only an idle session sees the silence escape
-    # hatch.
+    # session's running work. While work runs, the RUNNING text names the
+    # work and offers hold, or off when it is no longer needed.
     my @work = BpHook::running_work($sid, $p);
     if (@work) {
         eval { BpHook::set_running_snapshot($sid, \@work) };
@@ -213,8 +200,6 @@ sub run {
         "  butler-hold --token $t <id> [<id> ...]",
         "All work done? Turn continuity off, as a Bash tool call:",
         "  butler-continuity off --reason '<what is done>' --token $t",
-        "Escape hatch, only when a stop is truly necessary, e.g. to talk with an operator who is present:",
-        "  butler-continuity silence --reason '<why this stop>' --token $t",
         @glass,
     );
 }
@@ -226,8 +211,8 @@ sub run {
 #   1. The refusal cap (G9b): $REFUSAL_CAP consecutive refusals with no tool
 #      call succeeding in between, and the gate lets the stop through. Needs
 #      nothing from the stuck session.
-#   2. The break-glass file (G2b/G6b): a silence or off request written with
-#      the Write tool, which keeps working when the shell does not. It must
+#   2. The break-glass file (G2b/G6b): an off request written with the Write
+#      tool, which keeps working when the shell does not. It must
 #      carry the token the last refusal printed, so it is exactly as bound to
 #      this session and this turn as the shell commands are.
 # ---------------------------------------------------------------------------
@@ -283,7 +268,11 @@ sub _take_break_glass {
     return (undef, 'no stop is pending for this session') unless defined $current && length $current;
     return (undef, 'its token is not the one the last refusal printed')
         unless defined $tok && !ref $tok && $tok eq $current;
-    return (undef, 'its action must be "silence" or "off"')
+    return (undef, 'its action "silence" is removed: an armed session does not end a turn to wait for the operator. '
+            . 'File the question with almanac inbox file and keep working; if nothing can proceed, use "action":"off". '
+            . 'See "If you have a question for the operator" in plugins/butler/skills/continuity/SKILL.md')
+        if defined $act && !ref $act && $act eq 'silence';
+    return (undef, 'its action must be "off"')
         unless defined $act && !ref $act && $BREAK_GLASS_ACTION{$act};
     return (undef, 'its reason must be at least two words')
         unless defined $why && !ref $why && scalar(split(' ', $why)) >= 2;

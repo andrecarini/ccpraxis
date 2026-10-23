@@ -70,7 +70,7 @@ sub run {
             if ($name eq 'butler-continuity') {
                 my $v0 = $argv->[0];
                 next unless defined $v0
-                    && ($v0 eq 'on' || $v0 eq 'off' || $v0 eq 'off-confirm' || $v0 eq 'silence' || $v0 eq 'status'
+                    && ($v0 eq 'on' || $v0 eq 'off' || $v0 eq 'off-confirm' || $v0 eq 'status'
                         || $v0 eq 'emergency-stop');
             }
 
